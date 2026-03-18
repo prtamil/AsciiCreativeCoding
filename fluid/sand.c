@@ -580,6 +580,23 @@ int main(void)
             sim_accum -= tick_ns;
         }
 
+        /*
+         * ── render interpolation alpha ────────────────────────────
+         *
+         * sim_accum is the leftover nanoseconds after draining all
+         * complete ticks — how far we are into the next tick that
+         * has not fired yet.
+         *
+         * alpha = sim_accum / tick_ns  ∈ [0.0, 1.0)
+         *
+         * Sand cells snap to integer grid positions so alpha is not
+         * used in the draw call, but it is computed here for
+         * structural consistency and future sub-cell interpolation.
+         */
+        float alpha = (float)sim_accum / (float)tick_ns;
+        (void)alpha;
+
+        /* ── FPS counter ─────────────────────────────────────────── */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS*NS_PER_MS) {
@@ -589,15 +606,16 @@ int main(void)
             fps_accum   = 0;
         }
 
+        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+        int64_t elapsed = clock_ns()-frame_time+dt;
+        clock_sleep_ns(NS_PER_SEC/60 - elapsed);
+
         screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
         screen_present();
 
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;
-
-        int64_t elapsed = clock_ns()-frame_time+dt;
-        clock_sleep_ns(NS_PER_SEC/60 - elapsed);
     }
 
     scene_free(&app->scene);

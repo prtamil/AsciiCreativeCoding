@@ -721,6 +721,8 @@ int main(void)
             scene_tick(&app->scene, dt_sec);
             sim_accum -= tick_ns;
         }
+        float alpha = (float)sim_accum / (float)tick_ns;
+        (void)alpha;
 
         /* ── render ──────────────────────────────────────────────── */
         scene_render(&app->scene);
@@ -735,6 +737,10 @@ int main(void)
             fps_accum   = 0;
         }
 
+        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+        int64_t elapsed = clock_ns() - frame_time + dt;
+        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
         /* ── draw + present ──────────────────────────────────────── */
         screen_draw(&app->screen, &app->scene, fps_display);
         screen_present();
@@ -743,10 +749,6 @@ int main(void)
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;
-
-        /* ── frame cap ───────────────────────────────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
     }
 
     scene_free(&app->scene);

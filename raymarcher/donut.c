@@ -573,10 +573,13 @@ int main(void)
             torus_tick(&app->torus, dt_sec);
             sim_accum -= tick_ns;
         }
+        float alpha = (float)sim_accum / (float)tick_ns;
+        (void)alpha;
 
-        /* ── render + HUD ───────────────────────────────────────── */
+        /* ── render ──────────────────────────────────────────────── */
         torus_render(&app->torus);
 
+        /* ── HUD counter ─────────────────────────────────────────── */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -585,6 +588,12 @@ int main(void)
             frame_count = 0;
             fps_accum   = 0;
         }
+
+        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+        int64_t elapsed = clock_ns() - frame_time + dt;
+        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
+        /* ── draw + present ──────────────────────────────────────── */
         screen_draw(&app->screen, &app->torus, fps_display);
         screen_present();
 
@@ -592,10 +601,6 @@ int main(void)
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;
-
-        /* ── frame cap ───────────────────────────────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
     }
 
     screen_free(&app->screen);

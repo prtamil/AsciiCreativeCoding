@@ -957,6 +957,8 @@ int main(void)
         float   dts =(float)tick/(float)NS_PER_SEC;
         sa+=dt;
         while(sa>=tick){ scene_tick(&app->scene,dts); sa-=tick; }
+        float alpha=(float)sa/(float)tick;
+        (void)alpha;
 
         scene_render(&app->scene);
 
@@ -966,14 +968,15 @@ int main(void)
             fc=0; fa=0;
         }
 
+        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+        int64_t el=clock_ns()-ft+dt;
+        clock_sleep_ns(NS_PER_SEC/60-el);
+
         screen_draw(&app->screen,&app->scene,fpsd,app->sim_fps);
         screen_present();
 
         int ch=getch();
         if(ch!=ERR&&!app_handle_key(app,ch)) app->running=0;
-
-        int64_t el=clock_ns()-ft+dt;
-        clock_sleep_ns(NS_PER_SEC/60-el);
     }
 
     scene_free(&app->scene);

@@ -643,10 +643,10 @@ int main(void)
             }
             sim_accum -= tick_ns;
         }
+        float alpha = (float)sim_accum / (float)tick_ns;
+        (void)alpha;
 
-        /* ── render + HUD ────────────────────────────────────────── */
-        screen_draw_blast(&app->screen, &app->blast);
-
+        /* ── HUD counter ─────────────────────────────────────────── */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -655,21 +655,23 @@ int main(void)
             frame_count = 0;
             fps_accum   = 0;
         }
+
+        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+        int64_t elapsed = clock_ns() - frame_time + dt;
+        int64_t budget  = NS_PER_SEC / 60;
+        clock_sleep_ns(budget - elapsed);
+
+        /* ── render + HUD ────────────────────────────────────────── */
+        screen_draw_blast(&app->screen, &app->blast);
         screen_draw_hud(&app->screen, fps_display,
                          app->sim_fps, app->blast.frame,
                          app->blast.theme, app->blast.shape);
-
         screen_present();
 
         /* ── input ───────────────────────────────────────────────── */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;
-
-        /* ── frame cap ───────────────────────────────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        int64_t budget  = NS_PER_SEC / 60;
-        clock_sleep_ns(budget - elapsed);
     }
 
     blast_free(&app->blast);

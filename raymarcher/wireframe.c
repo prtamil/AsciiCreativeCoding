@@ -33,7 +33,7 @@
  *   §6  canvas    — heap-allocated terminal-size framebuffer + Bresenham
  *   §7  shapes    — vertex/edge tables for all four shapes
  *   §8  scene     — active shape, rotation, tick, render, draw
- *   §9  screen    — double WINDOW buffer + HUD overlay
+ *   §9  screen    — single stdscr, ncurses internal double buffer
  *   §10 app       — dt loop, input, resize, cleanup
  */
 

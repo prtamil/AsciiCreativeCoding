@@ -4,12 +4,12 @@
  * Features:
  *   - Single-threaded, no pthreads
  *   - ncurses internal double buffer (stdscr / doupdate) — no flicker
- *   - dt (delta-time) loop drives simulation speed independently of CPU
+ *   - dt (delta-time) loop drives simulation speed independently of CPU, render capped at 60 fps
  *   - RENDER INTERPOLATION: column scroll positions are alpha-projected
  *     between ticks so motion is silky smooth at any sim speed
  *   - ASCII characters only — no UTF-8 / Japanese glyphs
  *   - No background attribute — characters dissolve into black naturally
- *   - SIGWINCH resize: rebuilds windows + rain to new terminal dimensions
+ *   - SIGWINCH resize: rebuilds rain to new terminal dimensions
  *   - Speed control:   ] = faster   [ = slower
  *   - Density control: = = more     - = fewer columns
  *   - Theme cycling:   t = next theme (green / amber / blue / white)

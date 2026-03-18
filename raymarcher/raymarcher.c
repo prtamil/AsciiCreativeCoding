@@ -23,7 +23,7 @@
  *   §5  raymarch    — SDF, march loop, Phong shading  (pure math, no ncurses)
  *   §6  canvas      — virtual low-res framebuffer + upscale to terminal
  *   §7  scene       — owns canvas + animation state + tick + render + draw
- *   §8  screen      — double WINDOW buffer + HUD overlay
+ *   §8  screen      — single stdscr, ncurses internal double buffer
  *   §9  app         — dt loop, input, resize, cleanup
  */
 

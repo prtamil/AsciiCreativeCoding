@@ -6,8 +6,8 @@
  *   - Single stdscr, ncurses internal double buffer — no flicker
  *   - typeahead(-1) — no mid-flush input polling, no tearing
  *   - HUD written into stdscr after blast (always on top)
- *   - dt (delta-time) loop drives playback speed independently of CPU
- *   - SIGWINCH resize: rebuilds windows + restarts blast
+ *   - dt (delta-time) loop drives playback speed independently of CPU, render capped at 60 fps
+ *   - SIGWINCH resize: rebuilds scene + restarts blast
  *   - Speed control:   ] = faster   [ = slower
  *   - Restart:         r = replay from frame 0
  *   - Clean signal / atexit teardown — terminal always restored

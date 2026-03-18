@@ -32,7 +32,7 @@
  *   §5  field     — vector field grid; evolve; sample
  *   §6  particle  — one tracer particle; spawn; tick; trail
  *   §7  scene     — particle pool + field + tick + draw
- *   §8  screen    — double WINDOW buffer + HUD overlay
+ *   §8  screen    — single stdscr, ncurses internal double buffer
  *   §9  app       — dt loop, input, resize, cleanup
  */
 

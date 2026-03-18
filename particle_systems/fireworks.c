@@ -3,10 +3,9 @@
  *
  * Features:
  *   - Single-threaded, no pthreads
- *   - Double WINDOW buffer (back/front) swapped every frame — no flicker
- *   - Separate overlay WINDOW for HUD (FPS + live counts)
- *   - dt (delta-time) loop — physics runs at fixed SIM_FPS, render unlimited
- *   - SIGWINCH resize: rebuilds windows + show to new terminal dimensions
+ *   - Single stdscr, ncurses internal double buffer — no flicker
+ *   - dt (delta-time) loop — physics runs at fixed SIM_FPS, render capped at 60 fps
+ *   - SIGWINCH resize: rebuilds show to new terminal dimensions
  *   - Speed control:   ] = faster   [ = slower
  *   - Rocket control:  = = more     - = fewer rockets
  *   - Clean signal / atexit teardown — terminal always restored
@@ -27,7 +26,7 @@
  *   §4  particle — one spark emitted by an explosion
  *   §5  rocket   — one ascending rocket + its particle burst
  *   §6  show     — rocket pool + simulation tick
- *   §7  screen   — double WINDOW buffer + HUD overlay window
+ *   §7  screen   — single stdscr, ncurses internal double buffer
  *   §8  app      — dt loop, input, resize, cleanup
  */
 

@@ -3,8 +3,7 @@
  *
  * Original algorithm by Andy Sloane (donut.c / a1k0n.net),
  * rewritten in the framework used by matrix_rain / burst / kaboom:
- *   - Double WINDOW buffer — no flicker
- *   - Separate HUD WINDOW overlay (FPS + rotation angles)
+ *   - Single stdscr, ncurses internal double buffer — no flicker
  *   - dt-based rotation — speed is frame-rate independent
  *   - SIGWINCH resize — torus recentres to new terminal dimensions
  *   - Speed control:   ] faster   [ slower
@@ -27,7 +26,7 @@
  *   §2  clock   — monotonic nanosecond clock + sleep
  *   §3  color   — luminance color pairs; 256-color with 8-color fallback
  *   §4  torus   — geometry, zbuffer, framebuffer, tick, draw
- *   §5  screen  — double WINDOW buffer + HUD overlay
+ *   §5  screen  — single stdscr, ncurses internal double buffer
  *   §6  app     — dt loop, input, resize, cleanup
  */
 

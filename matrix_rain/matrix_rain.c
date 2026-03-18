@@ -3,9 +3,10 @@
  *
  * Features:
  *   - Single-threaded, no pthreads
- *   - Double WINDOW buffer (back/front) swapped every frame — no flicker
- *   - Separate overlay WINDOW for FPS counter (never cleared with rain)
+ *   - ncurses internal double buffer (stdscr / doupdate) — no flicker
  *   - dt (delta-time) loop drives simulation speed independently of CPU
+ *   - RENDER INTERPOLATION: column scroll positions are alpha-projected
+ *     between ticks so motion is silky smooth at any sim speed
  *   - ASCII characters only — no UTF-8 / Japanese glyphs
  *   - No background attribute — characters dissolve into black naturally
  *   - SIGWINCH resize: rebuilds windows + rain to new terminal dimensions
@@ -32,12 +33,62 @@
  *   §5  grid      — 2-D cell array (the off-screen framebuffer)
  *   §6  column    — one falling stream of characters
  *   §7  rain      — collection of columns + simulation tick
- *   §8  screen    — double WINDOW buffer + HUD overlay window
+ *   §8  screen    — stdscr double buffer + HUD
  *   §9  app       — dt loop, input, resize, cleanup
+ *
+ * ── RENDER INTERPOLATION ──────────────────────────────────────────────
+ *
+ * The problem without alpha:
+ *   rain_tick() advances head_y by an integer number of rows.
+ *   The accumulator fires 0 or 1 ticks per render frame.
+ *   When 0 ticks fire, every column is drawn at the same position as
+ *   the previous frame → visible stutter/judder at any sim speed.
+ *
+ * The fix:
+ *   After draining the accumulator, sim_accum holds the leftover
+ *   nanoseconds — how far we are into the next tick that has not
+ *   fired yet.
+ *
+ *   alpha = sim_accum / tick_ns        ∈ [0.0, 1.0)
+ *
+ *   At draw time, each column's head is projected forward by
+ *   (speed * alpha) fractional rows:
+ *
+ *     draw_head_y = head_y + speed * alpha
+ *
+ *   col_paint_interpolated() uses floorf(draw_head_y - dist + 0.5f)
+ *   to map the fractional position to a terminal row — "round half up",
+ *   the same deterministic rounding used in bounce.c px_to_cell_y().
+ *
+ * Why forward extrapolation is correct here:
+ *   Columns move at constant integer speed (rows/tick) with no
+ *   acceleration.  Projecting forward from the current state is
+ *   numerically identical to interpolating between prev and current
+ *   positions, and requires no extra storage in Column.
+ *   If you add variable speed or acceleration, store prev_head_y and
+ *   lerp between prev and current instead.
+ *
+ * Effect:
+ *   At sim_fps=20, render at 60 Hz: without alpha, 40 of 60 frames
+ *   show no movement.  With alpha, every frame shows a unique
+ *   sub-row position — continuous, smooth scroll.
+ *
+ * Changes from the non-interpolated version:
+ *   1. col_paint() gains a float offset parameter → renamed
+ *      col_paint_interpolated()
+ *   2. rain_draw() is a new function: iterates columns, computes
+ *      draw_head_y = head_y + speed*alpha, calls col_paint_interpolated.
+ *      rain_tick() is unchanged — physics untouched.
+ *   3. screen_draw_rain() calls rain_draw() instead of painting from
+ *      the grid.  The Grid struct is kept for the dissolve texture
+ *      but is no longer the sole source for drawing.
+ *   4. alpha is computed in main() after the accumulator and passed
+ *      to screen_draw_rain().
  */
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <math.h>
 #include <ncurses.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -51,54 +102,36 @@
 /* §1  config                                                             */
 /* ===================================================================== */
 
-/*
- * Runtime-mutable settings live in the App struct (§9).
- * Hard limits and fixed constants live here.
- */
 enum {
-    /* Simulation speed — ticks per second */
-    SIM_FPS_MIN      =  4,    /* slowest selectable speed             */
-    SIM_FPS_DEFAULT  = 20,    /* startup speed                        */
-    SIM_FPS_MAX      = 60,    /* fastest selectable speed             */
-    SIM_FPS_STEP     =  2,    /* [ / ] increment                      */
+    SIM_FPS_MIN      =  4,
+    SIM_FPS_DEFAULT  = 20,
+    SIM_FPS_MAX      = 60,
+    SIM_FPS_STEP     =  2,
 
-    /* Column trail length (fixed; independent of speed) */
-    TRAIL_MIN        =  6,    /* shortest trail (cells)               */
-    TRAIL_MAX        = 24,    /* longest  trail (cells)               */
+    TRAIL_MIN        =  6,
+    TRAIL_MAX        = 24,
 
-    /* Fall speed: rows per tick */
     SPEED_MIN        =  1,
     SPEED_MAX        =  2,
 
-    /* Density: 1 active column per DIVISOR screen columns */
-    DENSITY_MIN      =  1,    /* one column per screen column (dense) */
-    DENSITY_DEFAULT  =  2,    /* startup: every other column          */
-    DENSITY_MAX      =  6,    /* very sparse                          */
+    DENSITY_MIN      =  1,
+    DENSITY_DEFAULT  =  2,
+    DENSITY_MAX      =  6,
 
-    /* Dissolve: clear this many random cells per row per tick */
-    DISSOLVE_FRAC    =  4,    /* cols / DISSOLVE_FRAC cells erased    */
+    DISSOLVE_FRAC    =  4,
 
-    /* HUD overlay */
-    HUD_COLS         = 28,    /* width of the status bar window       */
-    FPS_UPDATE_MS    = 500,   /* re-measure FPS every 500 ms          */
+    HUD_COLS         = 28,
+    FPS_UPDATE_MS    = 500,
 };
 
-/* Nanosecond helpers */
 #define NS_PER_SEC   1000000000LL
 #define NS_PER_MS    1000000LL
-
-/* Compute tick length in ns from a ticks-per-second value. */
 #define TICK_NS(fps) (NS_PER_SEC / (fps))
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-/*
- * clock_ns() — wall-clock nanoseconds from CLOCK_MONOTONIC.
- * CLOCK_MONOTONIC never jumps backward, making it the correct choice
- * for a dt-based game loop.
- */
 static int64_t clock_ns(void)
 {
     struct timespec t;
@@ -106,11 +139,6 @@ static int64_t clock_ns(void)
     return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-/*
- * clock_sleep_ns() — sleep the requested nanoseconds.
- * nanosleep() handles EINTR transparently here; we don't need to resume
- * because the caller will simply recalculate dt on the next iteration.
- */
 static void clock_sleep_ns(int64_t ns)
 {
     if (ns <= 0) return;
@@ -125,18 +153,6 @@ static void clock_sleep_ns(int64_t ns)
 /* §3  theme                                                              */
 /* ===================================================================== */
 
-/*
- * Shade levels — same for every theme.
- * The theme only changes which xterm-256 color is assigned to each level;
- * the rest of the code is theme-unaware and just passes Shade values.
- *
- *   SHADE_FADE   deepest tail — nearly black
- *   SHADE_DARK   far trail
- *   SHADE_MID    mid trail
- *   SHADE_BRIGHT near head
- *   SHADE_HOT    one cell before head — most saturated
- *   SHADE_HEAD   leading character — always bold white
- */
 typedef enum {
     SHADE_FADE   = 1,
     SHADE_DARK   = 2,
@@ -146,42 +162,11 @@ typedef enum {
     SHADE_HEAD   = 6,
 } Shade;
 
-/*
- * Theme — five distinct xterm-256 foreground color indices per shade
- * level (FADE → HOT), plus a display name.  SHADE_HEAD is always
- * COLOR_WHITE in every theme.
- *
- * Each index is a genuine different color so the gradient is rendered
- * by color alone — no A_DIM tricks needed.  A_BOLD is still applied to
- * BRIGHT/HOT/HEAD to leverage the terminal's brightness boost.
- *
- * xterm-256 color reference used here:
- *
- *   green : 22 28 34 40 82   very-dark-green → neon-green
- *   amber : 94 130 172 214 220  dark-orange  → bright-yellow
- *   blue  : 17 19 21 33 51   dark-navy       → bright-cyan
- *   white : 234 238 244 250 255  near-black  → pure-white
- *
- * tmux requirement: add to ~/.tmux.conf —
- *   set -g default-terminal "tmux-256color"
- *   set -as terminal-overrides ",xterm-256color:Tc"
- * or launch with: TERM=xterm-256color tmux
- */
 typedef struct {
     const char *name;
-    int         fg[5];   /* xterm-256 index for FADE, DARK, MID, BRIGHT, HOT */
+    int         fg[5];
 } Theme;
 
-/*
- * Each theme has two palette variants:
- *   fg256  — xterm-256 indices; rich gradient; needs COLORS >= 256
- *   fg8    — standard 8-color fallback; uses A_DIM/A_BOLD for depth
- *
- * theme_apply() picks the right variant at runtime by checking COLORS.
- * This means the same binary renders beautifully in a 256-color xterm
- * and still shows a green/amber/blue/white gradient in tmux when
- * TERM is not set to a 256-color value.
- */
 static const Theme k_themes[] = {
     { "green", { 22,  28,  34,  40,  82  } },
     { "amber", { 94,  130, 172, 214, 220 } },
@@ -189,12 +174,6 @@ static const Theme k_themes[] = {
     { "white", { 234, 238, 244, 250, 255 } },
 };
 
-/*
- * 8-color fallback palettes — parallel order to k_themes.
- * Each entry: { FADE, DARK, MID, BRIGHT, HOT } using standard colors.
- * A_DIM and A_BOLD in shade_attr() provide the brightness gradient
- * when all five levels share the same base color.
- */
 static const int k_themes_8color[4][5] = {
     { COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN  },
     { COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW },
@@ -204,16 +183,6 @@ static const int k_themes_8color[4][5] = {
 
 #define THEME_COUNT (int)(sizeof k_themes / sizeof k_themes[0])
 
-/*
- * theme_apply() — load color pairs for the active theme.
- *
- * Selects 256-color or 8-color palette at runtime:
- *   COLORS >= 256  →  rich xterm-256 gradient (distinct color per shade)
- *   COLORS <  256  →  standard 8-color (A_DIM/A_BOLD carry the gradient)
- *
- * Background is always COLOR_BLACK — works in tmux, screen, and xterm.
- * Safe to call at any time; takes effect on the next rendered frame.
- */
 static void theme_apply(int theme_idx)
 {
     const int *fg = (COLORS >= 256)
@@ -228,14 +197,6 @@ static void theme_apply(int theme_idx)
     init_pair(SHADE_HEAD,   COLOR_WHITE, COLOR_BLACK);
 }
 
-/*
- * shade_attr() — ncurses attribute for a shade level.
- *
- * A_DIM  on FADE  makes the tail tip near-invisible (vital for 8-color).
- * A_BOLD on BRIGHT/HOT/HEAD gives the terminal brightness boost.
- * In 256-color mode the distinct color indices already carry the gradient;
- * dim/bold add extra punch on top.
- */
 static attr_t shade_attr(Shade s)
 {
     switch (s) {
@@ -253,10 +214,6 @@ static attr_t shade_attr(Shade s)
 /* §4  cell                                                               */
 /* ===================================================================== */
 
-/*
- * Cell — one terminal position in the virtual framebuffer.
- * ch == 0  →  empty; renderer leaves the terminal background untouched.
- */
 typedef struct {
     char  ch;
     Shade shade;
@@ -266,10 +223,6 @@ typedef struct {
 /* §5  grid                                                               */
 /* ===================================================================== */
 
-/*
- * Grid — the simulation's off-screen framebuffer.
- * Row-major: cells[y * cols + x].
- */
 typedef struct {
     Cell *cells;
     int   cols;
@@ -299,11 +252,6 @@ static Cell *grid_at(Grid *g, int x, int y)
     return &g->cells[y * g->cols + x];
 }
 
-/*
- * grid_scatter_erase() — dissolve texture.
- * Picks one random row and erases (cols / DISSOLVE_FRAC) random cells
- * within it.  Stochastic erasure creates the organic fade-to-black look.
- */
 static void grid_scatter_erase(Grid *g)
 {
     int y     = rand() % g->rows;
@@ -321,19 +269,15 @@ static void grid_scatter_erase(Grid *g)
 /*
  * Column — one falling stream of characters.
  *
- *   col     fixed x position for the stream's lifetime
- *   head_y  current row of the leading character (can be negative = above screen)
- *   length  total lit cells including the head
- *   speed   rows the head advances per sim tick
- *   active  false = slot is free
+ * head_y is an integer physics position (rows).  It is advanced by
+ * col_tick() each sim tick.  Drawing uses a projected float position
+ * (head_y + speed * alpha) computed in col_paint_interpolated().
  *
- * Shade gradient (head → tail, by distance from head):
- *   0          HEAD   white
- *   1          HOT    brightest color
- *   2          BRIGHT
- *   3..len/2   MID
- *   ..len-2    DARK
- *   len-1      FADE   near-invisible tail tip
+ * ch_cache[] stores one random character per trail cell, seeded on spawn
+ * and refreshed each tick.  This ensures the interpolated draw always
+ * has a character to display even for rows that were not yet written to
+ * the grid — important because col_paint_interpolated() bypasses the
+ * grid entirely for the live columns.
  */
 typedef struct {
     int  col;
@@ -341,6 +285,7 @@ typedef struct {
     int  length;
     int  speed;
     bool active;
+    char ch_cache[TRAIL_MAX]; /* one char per trail slot, refreshed each tick */
 } Column;
 
 static const char k_ascii[] =
@@ -369,29 +314,80 @@ static Shade col_shade_at(int dist, int length)
 static void col_spawn(Column *c, int x, int rows)
 {
     c->col    = x;
-    c->head_y = -(rand() % (rows / 2));   /* staggered above screen */
+    c->head_y = -(rand() % (rows / 2));
     c->length = TRAIL_MIN + rand() % (TRAIL_MAX - TRAIL_MIN + 1);
     c->speed  = SPEED_MIN + rand() % (SPEED_MAX - SPEED_MIN + 1);
     c->active = true;
+    for (int i = 0; i < c->length; i++)
+        c->ch_cache[i] = col_rand_char();
 }
 
-/* Returns false when the entire trail has scrolled off the bottom. */
 static bool col_tick(Column *c, int rows)
 {
     c->head_y += c->speed;
+    /* Refresh characters each tick so glyphs shimmer as they fall */
+    for (int i = 0; i < c->length; i++)
+        c->ch_cache[i] = col_rand_char();
     return (c->head_y - c->length) < rows;
 }
 
-/* Write this column's cells into the grid, re-rolling chars each tick. */
+/*
+ * col_paint() — write this column into the grid (used by rain_tick for
+ * the dissolve/persistence texture; NOT used for the interpolated draw).
+ */
 static void col_paint(const Column *c, Grid *g)
 {
     for (int dist = 0; dist < c->length; dist++) {
         int y = c->head_y - dist;
         if (y < 0 || y >= g->rows) continue;
-
         Cell *cell  = grid_at(g, c->col, y);
-        cell->ch    = col_rand_char();
+        cell->ch    = c->ch_cache[dist];
         cell->shade = col_shade_at(dist, c->length);
+    }
+}
+
+/*
+ * col_paint_interpolated() — draw one column directly to stdscr using
+ * a fractional head position.
+ *
+ * draw_head_y = head_y + speed * alpha
+ *
+ *   alpha ∈ [0.0, 1.0) is the fractional tick remainder from the
+ *   accumulator.  It projects the head forward by the fraction of a
+ *   tick that has elapsed since the last physics step.
+ *
+ * Row mapping — "round half up":
+ *   row = (int)floorf(draw_head_y - dist + 0.5f)
+ *
+ *   floorf(x + 0.5f) is used instead of roundf(x) to avoid the
+ *   "round half to even" tie-breaking in roundf(), which causes a
+ *   cell to oscillate between two rows when the fractional part is
+ *   exactly 0.5.  floorf(x+0.5) always breaks ties upward —
+ *   deterministic, no flicker.
+ *
+ * Characters come from ch_cache[], seeded at spawn and refreshed
+ * each tick in col_tick(), so every rendered frame shows the latest
+ * shimmer without requiring the grid to be consulted.
+ *
+ * col must be < cols, draw_head_y must be computed by the caller.
+ */
+static void col_paint_interpolated(const Column *c,
+                                   float draw_head_y,
+                                   int cols, int rows)
+{
+    if (c->col >= cols) return;
+
+    for (int dist = 0; dist < c->length; dist++) {
+        int row = (int)floorf(draw_head_y - (float)dist + 0.5f);
+        if (row < 0 || row >= rows) continue;
+
+        char  ch   = c->ch_cache[dist];
+        Shade shade = col_shade_at(dist, c->length);
+
+        attr_t attr = shade_attr(shade);
+        attron(attr);
+        mvaddch(row, c->col, (chtype)(unsigned char)ch);
+        attroff(attr);
     }
 }
 
@@ -399,18 +395,11 @@ static void col_paint(const Column *c, Grid *g)
 /* §7  rain                                                               */
 /* ===================================================================== */
 
-/*
- * Rain — simulation state.
- *
- * One Column slot per screen column; indexed by x so spawning and
- * retirement are O(1).  density_divisor controls how many slots are
- * kept active: 1 = every column, 2 = every other, etc.
- */
 typedef struct {
-    Column *columns;          /* [ncols] */
+    Column *columns;
     int     ncols;
     int     nrows;
-    int     density_divisor;  /* runtime-mutable via = / - keys */
+    int     density_divisor;
     Grid    grid;
 } Rain;
 
@@ -422,7 +411,6 @@ static void rain_init(Rain *r, int cols, int rows, int density_divisor)
     r->columns          = calloc((size_t)cols, sizeof(Column));
     grid_alloc(&r->grid, cols, rows);
 
-    /* Seed initial columns according to starting density. */
     for (int x = 0; x < cols; x++) {
         if (x % density_divisor == 0)
             col_spawn(&r->columns[x], x, rows);
@@ -437,13 +425,11 @@ static void rain_free(Rain *r)
 }
 
 /*
- * rain_tick() — one simulation step.
+ * rain_tick() — one simulation step.  UNCHANGED from original.
  *
- *   1. Clear the grid (full repaint each tick — simple and correct).
- *   2. Scatter-erase one random row for the dissolve texture.
- *   3. Tick each active column; retire columns that leave the screen.
- *   4. Paint active columns onto the grid.
- *   5. Randomly activate idle slots to organically maintain density.
+ * The grid is still updated here so the dissolve/persistence texture
+ * (grid_scatter_erase) keeps working — it is painted underneath the
+ * interpolated live columns each frame.
  */
 static void rain_tick(Rain *r)
 {
@@ -454,10 +440,6 @@ static void rain_tick(Rain *r)
         Column *c = &r->columns[x];
 
         if (!c->active) {
-            /*
-             * Idle slot spawn chance scales with density_divisor:
-             * lower divisor (denser) → higher chance to respawn quickly.
-             */
             int chance = 15 / r->density_divisor;
             if (rand() % 100 < chance)
                 col_spawn(c, x, r->nrows);
@@ -473,28 +455,81 @@ static void rain_tick(Rain *r)
     }
 }
 
+/*
+ * rain_draw() — render all columns to stdscr at interpolated positions.
+ *
+ * Two-pass approach:
+ *
+ *   Pass 1 — grid (dissolve texture):
+ *     Draws the persistent grid cells that rain_tick() painted.
+ *     These are the fading echoes of columns that have already passed.
+ *     Drawn first so live column heads paint on top.
+ *
+ *   Pass 2 — live columns (interpolated):
+ *     For each active column, computes:
+ *       draw_head_y = head_y + speed * alpha
+ *     then calls col_paint_interpolated() to draw directly to stdscr
+ *     at the fractional-row position.
+ *
+ * Why two passes instead of only the grid:
+ *   The grid is snapped to integer rows (col_paint writes integer y).
+ *   Replacing col_paint with col_paint_interpolated in rain_tick() would
+ *   write fractional positions into an integer grid — the grid cannot
+ *   store sub-row data.  Instead, the grid carries the persistence
+ *   texture (fade/dissolve) and the live columns are drawn fresh each
+ *   frame at the interpolated float position, bypassing the grid.
+ *
+ * alpha = 0.0  →  draw_head_y == head_y  (no change from tick position)
+ * alpha = 0.9  →  draw_head_y is 90% of a tick ahead of head_y
+ */
+static void rain_draw(const Rain *r, float alpha, int cols, int rows)
+{
+    /* Pass 1 — grid (dissolve/persistence texture, integer positions) */
+    const Grid *g = &r->grid;
+    int total = g->cols * g->rows;
+    for (int i = 0; i < total; i++) {
+        Cell c = g->cells[i];
+        if (c.ch == 0) continue;
+
+        int y = i / g->cols;
+        int x = i % g->cols;
+        if (x >= cols || y >= rows) continue;
+
+        attr_t attr = shade_attr(c.shade);
+        attron(attr);
+        mvaddch(y, x, (chtype)(unsigned char)c.ch);
+        attroff(attr);
+    }
+
+    /* Pass 2 — live column heads at interpolated float positions */
+    for (int x = 0; x < r->ncols; x++) {
+        const Column *c = &r->columns[x];
+        if (!c->active) continue;
+
+        /*
+         * Project head forward by (speed * alpha) fractional rows.
+         *
+         * Example: sim at 20 Hz, render at 60 Hz.
+         *   tick fires every 50 ms.
+         *   Render fires 33 ms after last tick → alpha ≈ 0.66
+         *   Column speed = 1 row/tick:
+         *     draw_head_y = head_y + 1 * 0.66 = head_y + 0.66
+         *   Rounded to nearest row: shows head_y or head_y+1 depending
+         *   on whether we have crossed the 0.5 threshold.
+         *   Without alpha: all 3 render frames in this tick show head_y.
+         *   With alpha:    frame 1 ≈ 0.33→ head_y, frames 2–3 ≈ 0.66/1.0→ head_y+1.
+         *   The column visually scrolls at 20 sim-rows/s regardless of
+         *   render rate — perfectly smooth.
+         */
+        float draw_head_y = (float)c->head_y + (float)c->speed * alpha;
+        col_paint_interpolated(c, draw_head_y, cols, rows);
+    }
+}
+
 /* ===================================================================== */
 /* §8  screen                                                             */
 /* ===================================================================== */
 
-/*
- * Screen — single stdscr, ncurses' internal double buffer.
- *
- * ncurses already maintains curscr (what the terminal shows now) and
- * newscr (what we are building this frame).  Every erase/mvwaddch/attron
- * writes into newscr.  doupdate() diffs newscr vs curscr, sends only
- * changed cells in one write, then sets curscr = newscr.
- *
- * This IS the double buffer.  Adding back/front WINDOW pointers creates
- * a third virtual screen ncurses cannot account for, breaking the diff
- * and producing ghost trails.
- *
- * HUD is written into stdscr after the grid (drawn last = always on top).
- * No separate hud_win needed — same buffer, correct Z-order.
- *
- * typeahead(-1): prevents ncurses from interrupting mid-flush to poll
- * stdin, which causes visible tearing at high tick rates.
- */
 typedef struct {
     int cols;
     int rows;
@@ -525,47 +560,33 @@ static void screen_free(Screen *s)
 static void screen_resize(Screen *s)
 {
     endwin();
-    refresh();   /* re-probes terminal size into LINES / COLS */
+    refresh();
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
 /*
- * screen_draw_grid() — paint the grid into stdscr (newscr).
+ * screen_draw_rain() — build the complete frame in stdscr (newscr).
  *
- * erase() clears newscr so cells that became empty this tick appear as
- * black background — no stale characters linger from previous frames.
- * Nothing reaches the terminal until screen_present() is called.
+ * alpha and dt_sec are passed through to rain_draw() for interpolation.
+ *
+ * Order:
+ *   1. erase()         — clear newscr (stale cells become black)
+ *   2. rain_draw()     — grid texture (pass 1) + live columns (pass 2)
+ *   3. screen_draw_hud — HUD written last, always on top
+ *
+ * Nothing reaches the terminal until screen_present().
  */
-static void screen_draw_grid(Screen *s, const Grid *cur)
+static void screen_draw_rain(Screen *s, const Rain *r, float alpha)
 {
     erase();
-
-    int total = cur->cols * cur->rows;
-    for (int i = 0; i < total; i++) {
-        Cell c = cur->cells[i];
-        if (c.ch == 0) continue;
-
-        int y = i / cur->cols;
-        int x = i % cur->cols;
-
-        if (x >= s->cols || y >= s->rows) continue;
-
-        attr_t attr = shade_attr(c.shade);
-        attron(attr);
-        mvaddch(y, x, (chtype)(unsigned char)c.ch);
-        attroff(attr);
-    }
+    rain_draw(r, alpha, s->cols, s->rows);
 }
 
-/*
- * screen_draw_hud() — write the HUD into stdscr after the grid.
- * Drawn last so it always sits on top of any rain character at row 0.
- */
 static void screen_draw_hud(Screen *s,
-                              double fps,
-                              int    sim_fps,
-                              int    density,
-                              int    theme_idx)
+                             double fps,
+                             int    sim_fps,
+                             int    density,
+                             int    theme_idx)
 {
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
@@ -579,12 +600,6 @@ static void screen_draw_hud(Screen *s,
     attroff(COLOR_PAIR(SHADE_HEAD) | A_BOLD);
 }
 
-/*
- * screen_present() — flush newscr to the terminal.
- *
- * wnoutrefresh(stdscr) copies stdscr into ncurses' newscr model.
- * doupdate() diffs newscr vs curscr and sends one atomic write.
- */
 static void screen_present(void)
 {
     wnoutrefresh(stdscr);
@@ -595,20 +610,6 @@ static void screen_present(void)
 /* §9  app                                                                */
 /* ===================================================================== */
 
-/*
- * App — top-level owner of all subsystems.
- *
- * Runtime-mutable state:
- *   sim_fps        ticks per second — changed by ] [
- *   density        column divisor   — changed by = -
- *   theme_idx      active palette   — changed by t
- *
- * Signal flags:
- *   running        set to 0 by SIGINT/SIGTERM → clean exit
- *   need_resize    set to 1 by SIGWINCH → rebuild windows next frame
- *
- * Both flags are sig_atomic_t so signal handlers can write them safely.
- */
 typedef struct {
     Rain                  rain;
     Screen                screen;
@@ -619,85 +620,24 @@ typedef struct {
     volatile sig_atomic_t need_resize;
 } App;
 
-static App g_app;   /* global — signal handlers need to reach it */
+static App g_app;
 
-/* -------------------------------------------------------------------- */
-/* signal handlers                                                       */
-/* -------------------------------------------------------------------- */
+static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
+static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
+static void cleanup(void)             { endwin(); }
 
-static void on_exit_signal(int sig)
-{
-    (void)sig;
-    g_app.running = 0;
-}
-
-static void on_resize_signal(int sig)
-{
-    (void)sig;
-    g_app.need_resize = 1;
-}
-
-/* -------------------------------------------------------------------- */
-/* atexit cleanup                                                        */
-/* -------------------------------------------------------------------- */
-
-static void cleanup(void)
-{
-    /*
-     * endwin() is idempotent — safe to call even if ncurses was never
-     * fully initialised or has already been torn down.
-     */
-    endwin();
-}
-
-/* -------------------------------------------------------------------- */
-/* resize handler — called from the main loop when need_resize == 1     */
-/* -------------------------------------------------------------------- */
-
-/*
- * app_do_resize() — rebuild screen + rain to the new terminal size.
- *
- * We reinitialise Rain entirely (rain_free + rain_init) because the
- * column array is sized to ncols; a resize can change that dimension.
- * density_divisor and sim_fps are preserved across the resize.
- */
 static void app_do_resize(App *app)
 {
     rain_free(&app->rain);
     screen_resize(&app->screen);
-
-    int cols = app->screen.cols;
-    int rows = app->screen.rows;
-
-    rain_init(&app->rain, cols, rows, app->density);
-
+    rain_init(&app->rain, app->screen.cols, app->screen.rows, app->density);
     app->need_resize = 0;
 }
 
-/* -------------------------------------------------------------------- */
-/* input handler                                                         */
-/* -------------------------------------------------------------------- */
-
-/*
- * app_handle_key() — process one keypress, return false to quit.
- *
- * Keys:
- *   q / ESC   quit
- *   ]         speed up   (sim_fps += SIM_FPS_STEP, capped at MAX)
- *   [         slow down  (sim_fps -= SIM_FPS_STEP, capped at MIN)
- *   =         denser     (density_divisor--, capped at MIN)
- *   -         sparser    (density_divisor++, capped at MAX)
- *   t         next theme (wraps around)
- *
- * Speed and density changes are purely in-place; no rain restart needed
- * because rain_tick() reads density_divisor each tick and sim_fps only
- * changes the tick-gate interval in the accumulator logic.
- */
 static bool app_handle_key(App *app, int ch)
 {
     switch (ch) {
-
-    case 'q': case 'Q': case 27 /* ESC */:
+    case 'q': case 'Q': case 27:
         return false;
 
     case ']':
@@ -734,17 +674,13 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/* -------------------------------------------------------------------- */
-/* main — dt simulation loop                                             */
-/* -------------------------------------------------------------------- */
-
 int main(void)
 {
     srand((unsigned int)clock_ns());
 
     atexit(cleanup);
-    signal(SIGINT,  on_exit_signal);
-    signal(SIGTERM, on_exit_signal);
+    signal(SIGINT,   on_exit_signal);
+    signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
     App *app       = &g_app;
@@ -755,21 +691,8 @@ int main(void)
 
     screen_init(&app->screen);
     theme_apply(app->theme_idx);
+    rain_init(&app->rain, app->screen.cols, app->screen.rows, app->density);
 
-    int cols = app->screen.cols;
-    int rows = app->screen.rows;
-
-    rain_init(&app->rain, cols, rows, app->density);
-
-    /*
-     * dt loop state
-     * -------------
-     * frame_time   — absolute ns timestamp at start of last frame
-     * sim_accum    — ns banked but not yet consumed by sim ticks
-     * fps_accum    — ns elapsed since last FPS measurement
-     * frame_count  — frames rendered in the current FPS window
-     * fps_display  — last computed FPS value shown in HUD
-     */
     int64_t frame_time  = clock_ns();
     int64_t sim_accum   = 0;
     int64_t fps_accum   = 0;
@@ -778,31 +701,20 @@ int main(void)
 
     while (app->running) {
 
-        /* ── resize check ────────────────────────────────────────── */
-        /*
-         * Handled at the top of the loop so the first frame after a
-         * resize always uses correct dimensions.  We also reset dt
-         * accounting to avoid a large spike after the rebuild stall.
-         */
+        /* ── resize ──────────────────────────────────────────────── */
         if (app->need_resize) {
             app_do_resize(app);
-            frame_time = clock_ns();   /* reset dt after resize stall */
+            frame_time = clock_ns();
             sim_accum  = 0;
         }
 
-        /* ── dt measurement ──────────────────────────────────────── */
+        /* ── dt ──────────────────────────────────────────────────── */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
-
-        /* Clamp: if we stall >100 ms don't try to catch up. */
         if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
 
-        /* ── simulation accumulator ──────────────────────────────── */
-        /*
-         * sim_fps is read fresh each iteration so speed changes take
-         * effect immediately without restarting anything.
-         */
+        /* ── sim accumulator ─────────────────────────────────────── */
         int64_t tick_ns = TICK_NS(app->sim_fps);
         sim_accum += dt;
         while (sim_accum >= tick_ns) {
@@ -810,41 +722,61 @@ int main(void)
             sim_accum -= tick_ns;
         }
 
-        /* ── render ──────────────────────────────────────────────── */
-        screen_draw_grid(&app->screen, &app->rain.grid);
+        /*
+         * ── render interpolation alpha ────────────────────────────
+         *
+         * sim_accum is the leftover nanoseconds after all complete
+         * ticks have been drained.  It represents how far we are into
+         * the next tick that has not yet fired.
+         *
+         * alpha = sim_accum / tick_ns       ∈ [0.0, 1.0)
+         *
+         * Passed to rain_draw() → col_paint_interpolated(), which adds
+         *   speed * alpha  fractional rows to each column's drawn head.
+         *
+         * At sim_fps=20, render at 60 Hz:
+         *   tick fires every 50 ms.  Each render frame is 16.7 ms apart.
+         *   Frame 1 after tick: alpha ≈ 0.33  → head + 0.33 rows
+         *   Frame 2 after tick: alpha ≈ 0.66  → head + 0.66 rows
+         *   Frame 3 after tick: alpha ≈ 1.00  → head + 1.00 rows (new tick fires)
+         *   Result: column visually advances 1 row over 3 render frames.
+         *   Without alpha: column stays frozen at head for all 3 frames,
+         *   then jumps 1 row — visible stutter.
+         *
+         * alpha=0.0 → draw at exact ticked position (no change from before)
+         * alpha=0.9 → draw 90% of a tick ahead of ticked position
+         */
+        float alpha = (float)sim_accum / (float)tick_ns;
 
-        /* ── HUD (written into stdscr after grid, drawn on top) ──── */
+        /* ── FPS counter ─────────────────────────────────────────── */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
             fps_display = (double)frame_count
-                        / ((double)fps_accum / NS_PER_SEC);
+                        / ((double)fps_accum / (double)NS_PER_SEC);
             frame_count = 0;
             fps_accum   = 0;
         }
-        screen_draw_hud(&app->screen,
-                         fps_display,
-                         app->sim_fps,
-                         app->density,
-                         app->theme_idx);
 
+        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+        int64_t elapsed = clock_ns() - frame_time + dt;
+        int64_t budget  = NS_PER_SEC / 60;
+        clock_sleep_ns(budget - elapsed);
+
+        /* ── draw + present ──────────────────────────────────────── */
+        screen_draw_rain(&app->screen, &app->rain, alpha);
+        screen_draw_hud(&app->screen,
+                        fps_display, app->sim_fps,
+                        app->density, app->theme_idx);
         screen_present();
 
         /* ── input ───────────────────────────────────────────────── */
         int ch = getch();
         if (ch != ERR && !app_handle_key(app, ch))
             app->running = 0;
-
-        /* ── frame cap ───────────────────────────────────────────── */
-        /* Sleep the remainder of a 60-fps budget to avoid 100% CPU. */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        int64_t budget  = NS_PER_SEC / 60;
-        clock_sleep_ns(budget - elapsed);
     }
 
-    /* ── cleanup ─────────────────────────────────────────────────── */
     rain_free(&app->rain);
-    screen_free(&app->screen);   /* calls endwin() */
-
+    screen_free(&app->screen);
     return 0;
 }

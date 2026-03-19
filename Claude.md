@@ -4,11 +4,23 @@
 ```bash
 gcc -std=c11 -O2 -Wall -Wextra bounce.c      -o bounce      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra matrix_rain.c -o matrix_rain -lncurses -lm
+
+# raster demos
+gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raster/cube_raster.c     -o cube     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raster/sphere_raster.c   -o sphere   -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raster/displace_raster.c -o displace -lncurses -lm
 ```
 
 ## Files
 - `bounce.c`      — bouncing balls, smooth terminal-aware physics
 - `matrix_rain.c` — Matrix-style falling character rain
+
+### raster/
+- `torus_raster.c`    — UV torus, 4 shaders (phong/toon/normals/wireframe)
+- `cube_raster.c`     — unit cube with flat normals, same 4 shaders + zoom/cull toggle
+- `sphere_raster.c`   — UV sphere, same 4 shaders + zoom/cull toggle
+- `displace_raster.c` — UV sphere with real-time vertex displacement (ripple/wave/pulse/spiky)
 
 ---
 
@@ -112,6 +124,66 @@ gcc -std=c11 -O2 -Wall -Wextra matrix_rain.c -o matrix_rain -lncurses -lm
 ### Wall Bounce
 - Clamp position to `[0, max_px]` / `[0, max_py]` and flip velocity component
 - `max_px = pw(cols) - 1`, `max_py = ph(rows) - 1`
+
+---
+
+---
+
+## raster/*.c — Software Rasterizer
+
+### Pipeline
+Each raster file is a self-contained software renderer:
+```
+tessellate_*()  →  scene_tick()  →  pipeline_draw_mesh()  →  fb_blit()
+                   (rotate MVP)      for each triangle:
+                                       vert shader  (VSIn → VSOut)
+                                       clip/NDC/screen
+                                       back-face cull
+                                       rasterize (barycentric)
+                                       z-test
+                                       frag shader  (FSIn → FSOut)
+                                       luma → dither → Paul Bourke char → cbuf
+```
+
+### ShaderProgram — split vert_uni / frag_uni (segfault fix)
+All four raster files use:
+```c
+typedef struct {
+    VertShaderFn  vert;
+    FragShaderFn  frag;
+    const void   *vert_uni;   /* passed to vert() */
+    const void   *frag_uni;   /* passed to frag() */
+} ShaderProgram;
+```
+**Why split:** the vertex and fragment shaders can require different uniform struct types.
+In `displace_raster.c`, `vert_displace` needs `DisplaceUniforms` (has `disp_fn`, `time`,
+`amplitude`, `frequency`) while `frag_toon` needs `ToonUniforms` (has `bands`). A single
+`void *uniforms` pointer cannot satisfy both — whichever shader receives the wrong type
+will cast it and read garbage, causing a segfault when it dereferences a null function
+pointer or out-of-range field.
+
+The split was applied to **all four raster files** for consistency:
+
+| Shader | vert_uni | frag_uni |
+|---|---|---|
+| phong   | `&s->uni`      | `&s->uni`      |
+| toon    | `&s->uni`      | `&s->toon_uni` |
+| normals | `&s->uni`      | `&s->uni`      |
+| wire    | `&s->uni`      | `&s->uni`      |
+
+For toon: `vert_uni = &s->uni` (vert shader only needs `Uniforms`); `frag_uni = &s->toon_uni`
+(`frag_toon` needs `ToonUniforms.bands`). `ToonUniforms` leads with `Uniforms base` so the
+vert shader's `(const Uniforms*)vert_uni` cast is safe (zero-offset rule).
+
+### Framebuffer
+- `zbuf[cols*rows]` — float depth buffer, cleared to `FLT_MAX`
+- `cbuf[cols*rows]` — `Cell{ch, color_pair, bold}`, blitted to stdscr each frame
+- `luma_to_cell(luma, px, py)` — Bayer 4×4 ordered dither → Paul Bourke ASCII ramp + 7-color palette
+
+### Displacement (displace_raster.c only)
+- 4 modes (ripple/wave/pulse/spiky) — each a pure `float fn(Vec3, time, amp, freq)`
+- Normal recomputation via central difference: sample displacement at `pos ± eps*T` and `pos ± eps*B`, reconstruct displaced tangent vectors, take cross product
+- `DisplaceUniforms` extends `Uniforms` with `disp_fn`, `time`, `amplitude`, `frequency`, `mode`
 
 ---
 

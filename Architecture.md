@@ -25,6 +25,13 @@ Reference implementation: `basics/bounce_ball.c`
 9. [Main Loop — Annotated Walk-through](#9-main-loop--annotated-walk-through)
 10. [Signal Handling and Cleanup](#10-signal-handling-and-cleanup)
 11. [Adding a New Animation](#11-adding-a-new-animation)
+12. [Software Rasterizer — raster/*.c](#12-software-rasterizer--rasterc)
+    - [Pipeline Overview](#pipeline-overview)
+    - [ShaderProgram and the Split Uniform Fix](#shaderprogram-and-the-split-uniform-fix)
+    - [Framebuffer](#framebuffer)
+    - [Mesh and Tessellation](#mesh-and-tessellation)
+    - [Vertex and Fragment Shaders](#vertex-and-fragment-shaders)
+    - [Displacement (displace_raster.c)](#displacement-displace_rasterc)
 
 ---
 
@@ -667,6 +674,156 @@ Follow this checklist to add a new file to the project:
 9. **Main loop** — follow the exact order: resize → dt → accumulator → alpha → FPS counter → **sleep** → draw → present → input. Do not move the sleep.
 
 10. **Build line** — `gcc -std=c11 -O2 -Wall -Wextra yourfile.c -o yourname -lncurses -lm`
+
+---
+
+---
+
+## 12. Software Rasterizer — raster/*.c
+
+The `raster/` folder contains four self-contained software rasterizers that render 3-D geometry into the ncurses terminal using ASCII characters. They share an identical pipeline; only the mesh and (for `displace_raster.c`) the shader set differ.
+
+Files:
+
+| File | Primitive | Notes |
+|---|---|---|
+| `torus_raster.c`    | UV torus  | 4 shaders, always-on back-face cull |
+| `cube_raster.c`     | Unit cube | 4 shaders, toggleable cull, zoom |
+| `sphere_raster.c`   | UV sphere | 4 shaders, toggleable cull, zoom |
+| `displace_raster.c` | UV sphere | 4 displacement modes, 4 shaders, zoom |
+
+### Pipeline Overview
+
+```
+tessellate_*()          — build Vertex/Triangle arrays once at init
+    ↓
+scene_tick()            — rotate model matrix, recompute MVP each frame
+    ↓
+pipeline_draw_mesh()    — for every triangle:
+    vert shader              VSIn → VSOut   (model → clip space)
+    clip reject              all 3 verts behind near plane → skip
+    perspective divide       clip → NDC → screen cell coords
+    back-face cull           2-D signed area ≤ 0 → skip
+    bounding box             clamp to [0,cols-1] × [0,rows-1]
+    rasterize                for each cell in bbox:
+        barycentric test         outside triangle → skip
+        z-interpolate            z-test against zbuf → skip if farther
+        interpolate VSOut        world_pos, world_nrm, u, v, custom[4]
+        frag shader              FSIn → FSOut
+        luma → dither → cbuf
+    ↓
+fb_blit()               — cbuf → stdscr → doupdate
+```
+
+### ShaderProgram and the Split Uniform Fix
+
+All four raster files define:
+
+```c
+typedef struct {
+    VertShaderFn  vert;
+    FragShaderFn  frag;
+    const void   *vert_uni;   /* passed to vert() */
+    const void   *frag_uni;   /* passed to frag() */
+} ShaderProgram;
+```
+
+**Why two uniform pointers instead of one:**
+
+The vertex and fragment shaders can require *different* uniform struct types. In `displace_raster.c`, `vert_displace` needs `DisplaceUniforms` (contains `disp_fn`, `time`, `amplitude`, `frequency`) while `frag_toon` needs `ToonUniforms` (contains `bands`). With a single `void *uniforms` pointer, one of the two shaders would receive a pointer to the wrong struct. When it casts and dereferences it — for example, calling `du->disp_fn(...)` where `disp_fn` is at a byte offset that lies inside `ToonUniforms.bands` — the result is a null or garbage function pointer and an immediate segfault.
+
+The fix is a separate pointer per shader stage. The pipeline passes each pointer only to the shader that owns it:
+
+```c
+/* pipeline_draw_mesh — vertex stage */
+sh->vert(&in, &vo[vi], sh->vert_uni);
+
+/* pipeline_draw_mesh — fragment stage */
+sh->frag(&fsin, &fsout, sh->frag_uni);
+```
+
+`scene_build_shader` sets both pointers appropriately for each shader combination:
+
+| Active shader | `vert_uni`     | `frag_uni`        |
+|---|---|---|
+| phong         | `&s->uni`      | `&s->uni`         |
+| toon          | `&s->uni`      | `&s->toon_uni`    |
+| normals       | `&s->uni`      | `&s->uni`         |
+| wireframe     | `&s->uni`      | `&s->uni`         |
+
+For the toon case, `vert_uni = &s->uni` (the vertex shader only needs `Uniforms`) and `frag_uni = &s->toon_uni` (`frag_toon` needs `ToonUniforms.bands`). This is safe because `ToonUniforms` leads with `Uniforms base` as its first member, so `(const Uniforms *)vert_uni` is a valid alias — zero-offset rule.
+
+This fix was applied to all four raster files even though only `displace_raster.c` strictly requires it, to prevent the same class of crash if shaders are ever extended.
+
+### Framebuffer
+
+```c
+typedef struct { float *zbuf; Cell *cbuf; int cols, rows; } Framebuffer;
+typedef struct { char ch; int color_pair; bool bold; } Cell;
+```
+
+- `zbuf[cols*rows]` — float depth buffer, initialised to `FLT_MAX` each frame
+- `cbuf[cols*rows]` — output cell buffer, written to `stdscr` by `fb_blit()`
+- `luma_to_cell(luma, px, py)` — Bayer 4×4 ordered dither maps `[0,1]` luminance to a Paul Bourke ASCII density character and one of 7 ncurses color pairs
+
+### Mesh and Tessellation
+
+```c
+typedef struct { Vec3 pos; Vec3 normal; float u,v; } Vertex;
+typedef struct { int v[3]; } Triangle;
+typedef struct { Vertex *verts; int nvert; Triangle *tris; int ntri; } Mesh;
+```
+
+Each `tessellate_*()` function allocates and fills `Vertex` and `Triangle` arrays once at startup. The pipeline indexes into `mesh->verts` using `tri->v[vi]` — all indices are guaranteed in-bounds by the tessellation loop construction.
+
+### Vertex and Fragment Shaders
+
+Shaders are plain C functions accessed through function pointers:
+
+```c
+typedef void (*VertShaderFn)(const VSIn *in,  VSOut *out, const void *uni);
+typedef void (*FragShaderFn)(const FSIn *in,  FSOut *out, const void *uni);
+```
+
+**Vertex shaders** — transform model-space position to clip space, output world-space position and normal for lighting:
+- `vert_default` — standard MVP transform (torus/cube/sphere)
+- `vert_normals` — same + packs world normal into `custom[0..2]`
+- `vert_wire`    — same + pipeline injects barycentric coords into `custom[0..2]`
+- `vert_displace` — displaces position along normal before transforming (displace only)
+
+**Fragment shaders:**
+- `frag_phong`   — Blinn-Phong + gamma correction
+- `frag_toon`    — quantised diffuse (N bands) + hard specular threshold
+- `frag_normals` — world normal → RGB (debug view)
+- `frag_wire`    — `min(custom[0..2])` edge distance → discard interior, draw edge
+
+**`custom[4]`** in `VSOut`/`FSIn` is a general-purpose interpolated payload. Each shader pair uses it differently:
+- phong/toon — unused
+- normals    — `custom[0..2]` = world normal components
+- wireframe  — `custom[0..2]` = per-vertex barycentric identity vector `(1,0,0)/(0,1,0)/(0,0,1)`; after barycentric interpolation across the triangle, `min(custom[])` is the distance to the nearest edge
+
+### Displacement (displace_raster.c)
+
+Four displacement modes, each a pure function `float fn(Vec3 pos, float time, float amp, float freq)`:
+
+| Mode   | Formula |
+|---|---|
+| RIPPLE | `sin(time + r*freq) * amp * taper`  — concentric rings from equator |
+| WAVE   | `sin(time + x*f + y*f + z*f) * amp` — diagonal travelling wave |
+| PULSE  | `breathe * amp * exp(-r*falloff)`   — whole sphere breathes |
+| SPIKY  | `pow(|sin(x*f)*sin(y*f)*sin(z*f)|, 0.6) * amp` — spiky ball |
+
+After displacing `pos += N * d`, the surface normal must be recomputed. The method is central difference:
+
+```
+d_t = displace(pos + eps*T) - displace(pos - eps*T)   ← finite diff along tangent T
+d_b = displace(pos + eps*B) - displace(pos - eps*B)   ← finite diff along bitangent B
+T'  = T*(2*eps) + N*d_t    ← displaced tangent vector
+B'  = B*(2*eps) + N*d_b    ← displaced bitangent vector
+N'  = normalize(cross(T', B'))
+```
+
+`DisplaceUniforms` extends `Uniforms` with `disp_fn`, `time`, `amplitude`, `frequency`, `mode`. It leads with `Uniforms base` so `&disp_uni` casts cleanly to `const Uniforms *` inside fragment shaders that only need the base lighting fields.
 
 ---
 

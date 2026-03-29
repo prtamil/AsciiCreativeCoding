@@ -32,6 +32,22 @@ Reference implementation: `basics/bounce_ball.c`
     - [Mesh and Tessellation](#mesh-and-tessellation)
     - [Vertex and Fragment Shaders](#vertex-and-fragment-shaders)
     - [Displacement (displace_raster.c)](#displacement-displace_rasterc)
+13. [Cellular Automata — fire.c, aafire_port.c, sand.c](#13-cellular-automata--firec-aafire_portc-sandc)
+14. [Flow Field — flowfield.c](#14-flow-field--flowfieldc)
+15. [Flocking Simulation — flocking.c](#15-flocking-simulation--flockingc)
+16. [Bonsai Tree — bonsai.c](#16-bonsai-tree--bonsaic)
+17. [Constellation — constellation.c](#17-constellation--constellationc)
+18. [Raymarchers and Donut — raymarcher/*.c](#18-raymarchers-and-donut--raymarcherc)
+    - [donut.c — Parametric Torus](#donutc--parametric-torus-no-mesh-no-sdf)
+    - [wireframe.c — 3-D Projected Edges](#wireframec--3-d-projected-edges)
+    - [SDF Sphere-Marcher Pipeline](#sdf-sphere-marcher-pipeline)
+    - [Primitive Composition](#primitive-composition-raymarcher_primitivesc)
+19. [Particle State Machines — fireworks.c, brust.c, kaboom.c](#19-particle-state-machines--fireworksc-brustc-kaboomc)
+    - [fireworks.c — Three-State Rocket](#fireworksc--three-state-rocket)
+    - [brust.c — Staggered Burst Waves](#brustc--staggered-burst-waves)
+    - [kaboom.c — Deterministic LCG Explosions](#kaboomc--deterministic-lcg-explosions)
+20. [Matrix Rain — matrix_rain.c](#20-matrix-rain--matrix_rainc)
+21. [Documentation Files Reference](#21-documentation-files-reference)
 
 ---
 
@@ -1055,6 +1071,226 @@ No pipeline, no barycentric interpolation, no z-buffer — just parametric evalu
 ### wireframe.c — 3-D Projected Edges
 
 `wireframe.c` draws a cube's 12 edges by projecting the 8 vertices to screen space and connecting them with Bresenham lines. Character at each Bresenham step is selected by slope (`/`, `\`, `-`, `|`). Arrow keys rotate the model matrix in real time.
+
+### SDF Sphere-Marcher Pipeline
+
+`raymarcher.c`, `raymarcher_cube.c`, and `raymarcher_primitives.c` are sphere-marching SDF renderers. There is no mesh, no triangle rasterisation, no tessellation — geometry is defined implicitly by a Signed Distance Function.
+
+**SDF rendering loop (per screen cell):**
+
+```
+For each cell (cx, cy):
+  ro = camera origin (world space)
+  rd = normalize(view_matrix * (cx, cy, focal_length))
+  t  = 0.0
+  for MAX_STEPS iterations:
+      p = ro + t * rd
+      d = sdf(p)           ← closest distance to any surface
+      if d < HIT_EPSILON → hit at p
+      if t > MAX_DIST    → miss (background)
+      t += d             ← safe to step this far without crossing a surface
+  if hit:
+      N = finite_diff_normal(p)
+      luma = blinn_phong(N, rd, light_dir)
+      luma = pow(luma, 1/2.2)    ← gamma correction
+      ch = bourke_ramp[luma]
+      color_pair = grey_ramp_pair[luma]
+      mvaddch(cy, cx, ch) with pair
+```
+
+**Finite-difference normal** (used in cube and primitives):
+```c
+vec3 normal(vec3 p) {
+    float eps = 0.001f;
+    return normalize((vec3){
+        sdf(p + (eps,0,0)) - sdf(p - (eps,0,0)),
+        sdf(p + (0,eps,0)) - sdf(p - (0,eps,0)),
+        sdf(p + (0,0,eps)) - sdf(p - (0,0,eps)),
+    });
+}
+```
+6 extra SDF calls per hit point — more expensive than analytic normals but works for any SDF without derivation.
+
+**Shadow ray:** After computing the surface normal, a secondary march is launched from `p + N*eps` toward the light source. If it hits before reaching the light, the point is in shadow and diffuse is set to 0. This doubles the SDF call count for lit points but produces hard shadows with no additional geometry.
+
+**Gamma correction:** `pow(luma, 1/2.2)` compensates for the non-linear luminance response of terminal color indices. Without it, the grey ramp appears weighted toward the bright end — shadows are too light.
+
+**Output path:** Unlike the raster files, the raymarchers do NOT use an intermediate `cbuf[]`. Each cell is computed and written to ncurses directly inside the march loop. There is no depth buffer — each ray tests only one pixel and the result is written immediately.
+
+### Primitive Composition (raymarcher_primitives.c)
+
+`raymarcher_primitives.c` composites multiple SDF shapes using set operations:
+
+| Operation | SDF formula | Result |
+|---|---|---|
+| Union | `min(sdf_a, sdf_b)` | Both shapes visible |
+| Intersection | `max(sdf_a, sdf_b)` | Only overlapping volume |
+| Subtraction | `max(-sdf_a, sdf_b)` | B with A carved out |
+| Smooth union | `smin(sdf_a, sdf_b, k)` | Blended merge |
+
+Each primitive returns both a distance and a material ID. The march tracks which material's ID is returned at the closest distance — this maps to a different color pair for each primitive in the scene.
+
+```
+Primitives in scene: sphere, box, torus, capsule, cone
+Each has its own init_pair → different grey shade
+```
+
+The `smin` (smooth minimum) function blends two SDFs within radius `k`, producing organic-looking merged surfaces without any mesh boolean operations.
+
+---
+
+## 19. Particle State Machines — fireworks.c, brust.c, kaboom.c
+
+### fireworks.c — Three-State Rocket
+
+`fireworks.c` implements a two-level state machine: rockets and their particles each have independent states.
+
+**Rocket states:**
+
+```
+IDLE ──(launch trigger)──→ RISING ──(apex reached)──→ EXPLODED ──(all particles dead)──→ IDLE
+```
+
+- `IDLE`: rocket is dormant, waiting for a timer or trigger
+- `RISING`: rocket position integrates upward each tick with `vy -= gravity * dt`; drawn as `'|'` with `A_BOLD`
+- `EXPLODED`: rocket spawns N particles in a radial burst; rocket itself is hidden; state persists while any particle has `life > 0`
+
+**Particle lifecycle:**
+```
+spawn: position = rocket apex, velocity = random radial
+each tick: px += vx*dt; py += vy*dt; vy += gravity*dt; vx *= drag; life -= decay
+draw: A_BOLD when life > 0.6; A_DIM when life < 0.2; base otherwise
+```
+
+Each particle holds an independent color from the 7 spectral pairs — not inherited from the rocket.
+
+### brust.c — Staggered Burst Waves
+
+`brust.c` differs from `fireworks.c` in two architectural ways:
+
+1. **Staggered waves** — particles are not all spawned at t=0. Each wave has a `spawn_delay` offset, creating a multi-ring explosion that expands over time rather than all at once.
+
+2. **Persistent scorch** — a `scorch[]` array accumulates footprint cells from past bursts. Every frame the scorch array is iterated and drawn with `A_DIM` before drawing active particles. The scorch array is never cleared — it is an unbounded accumulation (capped by `MAX_SCORCH` at compile time).
+
+```
+Each explosion frame:
+  1. Draw scorch[] with A_DIM (persistent from all past bursts)
+  2. Draw flash cross (center * + 4 cardinals +) with A_BOLD — frame 0 only
+  3. Draw active particles life-gated brightness
+  4. Add to scorch[] any particles that just died
+```
+
+`ASPECT = 2.0f` is applied directly in cell-space x-coordinates when spawning particles — no pixel space, just multiply particle x-velocity by 2 to compensate for non-square cells.
+
+### kaboom.c — Deterministic LCG Explosions
+
+`kaboom.c` separates rendering into a pre-render phase and a blit phase:
+
+```
+blast_render_frame(blast, frame_idx) → Cell cbuf[rows*cols]
+    for each active element in the blast shape:
+        compute (cx, cy) from frame_idx + element properties
+        cbuf[cy*cols + cx] = {ch, color_id}
+
+blast_draw(cbuf, rows, cols)
+    for each non-empty Cell in cbuf:
+        attron(COLOR_PAIR(cell.color_id))
+        mvaddch(cy, cx, cell.ch)
+        attroff(...)
+```
+
+**LCG determinism:** The blast shape is generated from a seed via a Linear Congruential Generator. Same seed → identical explosion every invocation. This allows replaying the same explosion without storing its output.
+
+**3-D blob z-depth coloring:** Blob elements are computed in 3-D space and projected. Z-depth selects both the character and the color:
+- Far (z > 0.8×persp): `'.'` in `COL_BLOB_F` (faded)
+- Mid: `'o'` in `COL_BLOB_M`
+- Near (z < 0.2×persp): `'@'` in `COL_BLOB_N` (intense)
+
+**6 blast themes** each define `flash_chars[]` and `wave_chars[]` strings. The wave character at each ring is selected by `wave_chars[ring_variant % len]` — different themes produce visually distinct blast shapes from the same geometry.
+
+---
+
+## 20. Matrix Rain — matrix_rain.c
+
+### Two-Pass Rendering Architecture
+
+`matrix_rain.c` splits each frame into two distinct rendering passes because no single pass can produce both the persistent fade texture and the smooth head motion simultaneously.
+
+```
+screen_draw():
+  erase()
+  ① pass_grid(alpha)      — draw persistent grid cells
+  ② pass_heads(alpha)     — draw interpolated column heads
+  HUD
+  doupdate()
+```
+
+**Pass 1 — Grid texture:**
+
+The `grid[rows][cols]` array is a simulation-level persistence texture. Each cell stores a shade value (0 = empty, 1–6 = FADE to BRIGHT). The simulation tick `grid_scatter_erase()` stochastically decrements shade values each tick. Pass 1 iterates all non-zero grid cells and draws them with `shade_attr(shade)`:
+
+```c
+for each (r, c) where grid[r][c] != 0:
+    attron(shade_attr(grid[r][c]))
+    mvaddch(r, c, glyph_for(grid[r][c]))
+    attroff(...)
+```
+
+**Pass 2 — Interpolated column heads:**
+
+Each active column has a float `head_y` that advances each tick by `speed`. For rendering, the head position is forward-extrapolated:
+
+```c
+draw_head_y = col->head_y + col->speed * alpha;
+int draw_row = (int)floorf(draw_head_y + 0.5f);  /* round-half-up */
+```
+
+The head character is drawn at `draw_row` with `HEAD` shade (`A_BOLD`). Cells directly below the head get progressively dimmer shades in the same pass — this is what produces the bright-tip-with-fading-tail look.
+
+### Theme System
+
+`matrix_rain.c` supports 5 themes, hot-swapped at runtime by calling `theme_apply(idx)`. Each theme re-registers all 6 color pairs with new xterm-256 indices. The pair numbers used in draw code do not change — only the colors behind them change:
+
+```c
+void theme_apply(int t) {
+    const Theme *th = &k_themes[t];
+    init_pair(1, th->fade_col,   COLOR_BLACK);
+    init_pair(2, th->dark_col,   COLOR_BLACK);
+    init_pair(3, th->mid_col,    COLOR_BLACK);
+    init_pair(4, th->bright_col, COLOR_BLACK);
+    init_pair(5, th->hot_col,    COLOR_BLACK);
+    init_pair(6, th->head_col,   COLOR_BLACK);
+}
+```
+
+Theme swap takes effect immediately on the next `doupdate()` — there is no transition frame.
+
+### Shade Gradient
+
+The 6-level `Shade` enum maps directly to a `shade_attr()` function that returns a combined `attr_t`:
+
+| Shade | Attribute | Visual |
+|---|---|---|
+| FADE | `A_DIM` | Barely visible tail residue |
+| DARK | base | Dark mid trail |
+| MID | base | Normal trail |
+| BRIGHT | `A_BOLD` | Bright trail near head |
+| HOT | `A_BOLD` | Very bright, close to head |
+| HEAD | `A_BOLD` | Sharpest character, leading edge |
+
+The same pair number can produce three brightness tiers (dim / base / bold) — tripling the apparent gradient resolution with no extra color pairs.
+
+---
+
+## 21. Documentation Files Reference
+
+| File | Purpose |
+|---|---|
+| `Architecture.md` | Framework design, loop mechanics, coordinate model, per-subsystem deep dives |
+| `Claude.md` | Build commands for all 24 files; brief per-file description |
+| `Master.md` | Long-form essays on algorithms, physics, and visual techniques |
+| `Visual.md` | ncurses field guide: 48 numbered entries covering every ncurses technique with What/Why/How explanations and code |
+| `NCURSES_TECHNIQUES.md` | Per-file ncurses technique matrix: which techniques each of the 24 C files uses, with a quick-reference table and inverse lookup index |
 
 ---
 

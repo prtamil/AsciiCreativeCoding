@@ -16,6 +16,11 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [A6 typeahead(-1) — Preventing Mid-flush Input Poll](#a6-typeahead-1--preventing-mid-flush-input-poll)
 - [A7 nodelay & Non-blocking Input](#a7-nodelay--non-blocking-input)
 - [A8 SIGWINCH — Terminal Resize](#a8-sigwinch--terminal-resize)
+- [A9 use_default_colors — Transparent Terminal Background](#a9-use_default_colors--transparent-terminal-background)
+- [A10 ACS Line-drawing Characters](#a10-acs-line-drawing-characters)
+- [A11 (chtype)(unsigned char) — Sign-extension Guard](#a11-chtypeunsigned-char--sign-extension-guard)
+- [A12 attr_t — Composing Color + Attribute in One Variable](#a12-attr_t--composing-color--attribute-in-one-variable)
+- [A13 Dynamic Color — Re-registering Pairs Mid-animation](#a13-dynamic-color--re-registering-pairs-mid-animation)
 
 ### B — Timing & Loop Architecture
 - [B1 Monotonic Clock — clock_gettime(CLOCK_MONOTONIC)](#b1-monotonic-clock--clock_gettimeclock_monotonic)
@@ -63,6 +68,9 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [G4 Luminance — Perceptual RGB Weighting](#g4-luminance--perceptual-rgb-weighting)
 - [G5 Gamma Correction](#g5-gamma-correction)
 - [G6 Directional Characters — Arrow & Line Glyphs](#g6-directional-characters--arrow--line-glyphs)
+- [G7 Stippled Lines — Distance-fade Bresenham](#g7-stippled-lines--distance-fade-bresenham)
+- [G8 cell_used Grid — Line Deduplication](#g8-cell_used-grid--line-deduplication)
+- [G9 Scorch Mark Persistence](#g9-scorch-mark-persistence)
 
 ### H — 3D Math
 - [H1 Vec3 / Vec4 — Inline Struct Math](#h1-vec3--vec4--inline-struct-math)
@@ -124,6 +132,19 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [M5 void* Uniform Casting — Type-safe Shader Interface](#m5-void-uniform-casting--type-safe-shader-interface)
 - [M6 memset for Zero-init](#m6-memset-for-zero-init)
 - [M7 size_t Casts in malloc](#m7-size_t-casts-in-malloc)
+
+### N — Flocking & Collective Behaviour
+- [N1 Classic Boids — Separation / Alignment / Cohesion](#n1-classic-boids--separation--alignment--cohesion)
+- [N2 Vicsek Model — Noise-driven Phase Transition](#n2-vicsek-model--noise-driven-phase-transition)
+- [N3 Leader Chase](#n3-leader-chase)
+- [N4 Orbit Formation](#n4-orbit-formation)
+- [N5 Predator-Prey](#n5-predator-prey)
+- [N6 Toroidal Topology — Wrap-around Physics](#n6-toroidal-topology--wrap-around-physics)
+
+### O — Procedural Growth
+- [O1 Recursive Branch Growth — Bonsai](#o1-recursive-branch-growth--bonsai)
+- [O2 Branch Type State Machine](#o2-branch-type-state-machine)
+- [O3 Leaf Scatter](#o3-leaf-scatter)
 
 ---
 
@@ -552,6 +573,191 @@ Shader functions accept `const void *uni` and cast it to the specific struct the
 #### M7 size_t Casts in malloc
 `malloc((size_t)(n) * sizeof(T))` — the `size_t` cast is critical when `n` is a signed `int`. If `n` is large, `n * sizeof(T)` overflows `int` (signed integer overflow is undefined behaviour in C) before the implicit conversion to `size_t` happens. Casting first makes the multiplication happen in unsigned 64-bit, preventing both UB and silent underallocation.
 *Files: all raster files, `flowfield.c`, `sand.c`*
+
+---
+
+---
+
+### A9 use_default_colors — Transparent Terminal Background
+
+`use_default_colors()` (called immediately after `start_color()`) allows `-1` to be passed as the background color in `init_pair`. A pair with background `-1` uses the terminal emulator's own background — transparent, image, blur, whatever it is. Without calling `use_default_colors()` first, a `-1` background silently defaults to `COLOR_BLACK`.
+*Files: `bonsai.c`, `matrix_rain.c`*
+
+#### A10 ACS Line-drawing Characters
+
+ncurses provides portable box-drawing glyphs through `ACS_*` macros: `ACS_ULCORNER` (┌), `ACS_URCORNER` (┐), `ACS_LLCORNER` (└), `ACS_LRCORNER` (┘), `ACS_HLINE` (─), `ACS_VLINE` (│). On VT100 terminals they activate the alternate character set; on modern UTF-8 terminals they emit Unicode box-drawing code points. Always prefer `ACS_*` over hardcoded characters for maximum terminal compatibility.
+*Files: `bonsai.c` (message panel)*
+
+#### A11 (chtype)(unsigned char) — Sign-extension Guard
+
+`char` is signed on most platforms. High-value ASCII characters (128–255) have bit 7 set. When cast directly to `chtype` (unsigned long), they sign-extend to large values that ncurses interprets as attribute flags, producing garbage rendering. The fix is a double cast: `(chtype)(unsigned char)ch` — `unsigned char` zero-extends to 8 bits, then `chtype` preserves that non-negative value. Every `mvwaddch` call in this project uses this cast.
+*Files: all files*
+
+#### A12 attr_t — Composing Color + Attribute in One Variable
+
+```c
+attr_t attr = COLOR_PAIR(p->hue);
+if (p->life > 0.65f) attr |= A_BOLD;
+```
+
+Building the attribute bitmask into an `attr_t` variable before calling `attron()` allows conditional logic without nested calls. The result is passed as a single OR to `wattron(w, attr)`. All attribute flags (`A_BOLD`, `A_DIM`, `A_REVERSE`, `A_UNDERLINE`, `A_BLINK`, `A_ITALIC`) live in the upper bits of the `chtype`/`attr_t` word; `COLOR_PAIR(n)` occupies a different bit region, so the OR is always safe.
+*Files: `brust.c`, `aafire_port.c`, `constellation.c`*
+
+#### A13 Dynamic Color — Re-registering Pairs Mid-animation
+
+`init_pair()` can be called at any time during the animation loop, not just during initialization. The new colors take effect on the next `doupdate()`. `flocking.c` uses this to implement a cosine palette that smoothly cycles all three flock colors by computing new RGB values each tick and re-registering the corresponding pair:
+
+```c
+/* xterm-256 color cube: index = 16 + 36*r + 6*g + b, r/g/b in [0,5] */
+int cube_idx = 16 + 36*ri + 6*gi + bi;
+init_pair(pair_num, cube_idx, COLOR_BLACK);
+```
+
+This is the only way to animate color in ncurses without changing the scene content — the pair mapping changes while the character data stays the same.
+*Files: `flocking.c`*
+
+---
+
+### G7 Stippled Lines — Distance-fade Bresenham
+
+A stippled line draws only every Nth pixel of a Bresenham line, controlled by a `stipple` parameter:
+
+```c
+if (step_count % stipple == 0) { /* draw this cell */ }
+step_count++;
+```
+
+`stipple = 1` draws every cell (solid), `stipple = 2` draws every other cell (dotted). `constellation.c` uses this to encode connection distance: close star pairs get bold solid lines, far pairs get dimmer dotted lines. The effect reads as continuous fading even though ncurses has no alpha blending — it exploits the fact that the eye integrates the density of a dotted line into a perceived brightness.
+*Files: `constellation.c`*
+
+#### G8 cell_used Grid — Line Deduplication
+
+When multiple Bresenham lines cross the same terminal cell, the last writer wins — producing a jumbled mix of line characters in dense regions. `constellation.c` prevents this with a per-frame boolean VLA:
+
+```c
+bool cell_used[rows][cols];   /* stack-allocated, zeroed each frame */
+memset(cell_used, 0, sizeof cell_used);
+/* In Bresenham loop: */
+if (!cell_used[y][x]) { draw(y, x, ch); cell_used[y][x] = true; }
+```
+
+The first line to visit a cell claims it; all others silently skip. Dense connection clusters render as smooth individual lines rather than a chaotic character pile.
+*Files: `constellation.c`*
+
+#### G9 Scorch Mark Persistence
+
+`brust.c` maintains a `scorch[]` array that persists between explosion cycles. When a particle lands, its character and position are saved into the scorch array. Each frame, scorch marks are drawn with `A_DIM` (faded appearance) before drawing active particles. This creates visual history without any image compositing — the screen accumulates past explosions as progressively dimmer marks.
+*Files: `brust.c`*
+
+---
+
+### N — Flocking & Collective Behaviour
+
+#### N1 Classic Boids — Separation / Alignment / Cohesion
+
+Reynolds' three rules, each computed over neighbors within `PERCEPTION_RADIUS`:
+
+- **Separation** — steer away from neighbors that are too close (`dist < SEPARATION_RADIUS`). Force magnitude grows as `1/dist` so it spikes near contact.
+- **Alignment** — accumulate the average velocity of all neighbors; steer toward that average direction.
+- **Cohesion** — compute the centroid of all neighbors; steer toward it.
+
+The three force vectors are combined with independent weights (`SEP_WEIGHT`, `ALG_WEIGHT`, `COH_WEIGHT`). The boid's steering force is added to its velocity, then clamped to `MAX_SPEED`.
+*Files: `flocking.c`*
+
+#### N2 Vicsek Model — Noise-driven Phase Transition
+
+The Vicsek model is a minimal self-propulsion model that exhibits a phase transition between ordered (flock) and disordered (swarm) states as noise increases:
+
+```
+θ_i(t+1) = <θ_neighbors>(t) + η × ξ
+```
+
+where `<θ_neighbors>` is the average heading of all boids within radius, `η` is the noise amplitude, and `ξ` is uniform `[−π, π]` noise. As `η` increases beyond a critical value, the global order parameter (average heading alignment) collapses from 1 to 0 — the flock fragments. Adjustable with `n/m` keys.
+*Files: `flocking.c`*
+
+#### N3 Leader Chase
+
+Each follower computes the toroidal vector to its flock leader and steers toward it with a proportional force. The proportionality constant controls responsiveness — too high produces jitter, too low produces a slow drift. The leader itself wanders using a random-walk heading perturbation each tick.
+*Files: `flocking.c`*
+
+#### N4 Orbit Formation
+
+Followers maintain a target angular position on a ring of radius `ORBIT_RADIUS` around the leader. Each tick, the target angle advances by a fixed angular velocity, so followers circle the leader in formation. The steering force is proportional to the distance from the follower's current position to its target position on the ring.
+*Files: `flocking.c`*
+
+#### N5 Predator-Prey
+
+Flock 0 is the predator: its steering force targets the nearest boid from flocks 1–2. Flocks 1–2 are prey: each of their boids computes the toroidal vector to flock 0's leader and steers away from it. The same perception radius governs both chase and flee decisions. When the predator is far, prey runs Classic Boids internally.
+*Files: `flocking.c`*
+
+#### N6 Toroidal Topology — Wrap-around Physics
+
+All flocking modes use toroidal (wrap-around) boundaries instead of elastic wall bounces. Position wraps:
+
+```c
+if (b->px < 0)       b->px += max_px;
+if (b->px > max_px)  b->px -= max_px;
+```
+
+Distance and steering use the shortest toroidal path:
+
+```c
+float d = a - b;
+if (d >  max * 0.5f) d -= max;
+if (d < -max * 0.5f) d += max;
+```
+
+This produces `|d| ≤ max/2`, the correct shortest-path distance across the wrap boundary. All neighbor detection, cohesion, and proximity brightness depend on this function — using raw `a - b` would produce wrong steering forces for boids near opposite edges.
+*Files: `flocking.c`*
+
+---
+
+### O — Procedural Growth
+
+#### O1 Recursive Branch Growth — Bonsai
+
+`bonsai.c` grows a tree one step per tick from a pool of active branches. Each branch struct carries `(x, y, dx, dy, life, type, color)`. Each tick, `branch_step()` draws the character at `(y, x)` (chosen by slope), optionally spawns child branches when life crosses a threshold, and decrements life. Branches with `life ≤ 0` are retired.
+
+The character drawn at each step is chosen by the slope of `(dx, dy)`:
+```c
+if      (fabs(dx) < fabs(dy) / 2)  ch = '|';
+else if (fabs(dy) < fabs(dx) / 2)  ch = '-';
+else if (dx * dy > 0)               ch = '\\';
+else                                ch = '/';
+```
+
+Growth simulation runs at `SIM_FPS`; each sim tick produces one step per active branch — visually one character per branch per tick.
+*Files: `bonsai.c`*
+
+#### O2 Branch Type State Machine
+
+Four branch types drive different wander and branching behaviour:
+
+| Type | Tendency | Branch Spawning |
+|---|---|---|
+| `TRUNK` | Upward, moderate wander | Spawns `SHOOT` branches frequently |
+| `SHOOT` | Outward / upward diagonal | Spawns `DYING` at low life |
+| `DYING` | Gravitational sag | No new branches |
+| `DEAD` | No wander | No branches |
+
+Type is set at spawn and never changes. The type-specific code path is a simple `switch(b->type)` in `branch_step()`. Five overall tree styles (`RANDOM`, `DWARF`, `WEEPING`, `SPARSE`, `BAMBOO`) adjust the initial parameters and spawning thresholds.
+*Files: `bonsai.c`*
+
+#### O3 Leaf Scatter
+
+When a branch exhausts its life, `leaf_scatter()` places leaf characters in a Gaussian blob around the tip:
+
+```c
+for (int i = 0; i < n_leaves; i++) {
+    int lx = tip_x + (int)(gaussian() * LEAF_SPREAD);
+    int ly = tip_y + (int)(gaussian() * LEAF_SPREAD / 2.0f);
+    /* half spread on Y — terminal cells are taller than wide */
+    draw_char(ly, lx, leaf_char(), COLOR_PAIR(leaf_color) | A_BOLD);
+}
+```
+
+The Y spread is halved because terminal cells are twice as tall as wide — equal pixel spread requires half as many cell rows as columns. Leaf chars are drawn with `A_BOLD` to appear lighter and more delicate than branch chars.
+*Files: `bonsai.c`*
 
 ---
 

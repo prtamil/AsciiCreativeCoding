@@ -1,138 +1,134 @@
 # Terminal Demos — ncurses C Projects
 
 ## Build
-```bash
-gcc -std=c11 -O2 -Wall -Wextra bounce.c      -o bounce      -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra matrix_rain.c -o matrix_rain -lncurses -lm
 
-# raster demos
+```bash
+# ── basics ───────────────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra ncurses_basics/tst_lines_cols.c  -o tst_lines_cols  -lncurses
+gcc -std=c11 -O2 -Wall -Wextra ncurses_basics/aspect_ratio.c    -o aspect_ratio    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra ncurses_basics/spring_pendulum.c -o spring_pendulum -lncurses -lm
+
+# ── misc ─────────────────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra misc/bounce_ball.c  -o bounce  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra misc/bonsai.c       -o bonsai  -lncurses -lm
+
+# ── matrix ───────────────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra matrix_rain/matrix_rain.c -o matrix_rain -lncurses -lm
+
+# ── particle systems ─────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra particle_systems/fire.c         -o fire         -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra particle_systems/aafire_port.c  -o aafire        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra particle_systems/fireworks.c    -o fireworks     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra particle_systems/brust.c        -o brust         -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra particle_systems/kaboom.c       -o kaboom        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra particle_systems/constellation.c -o constellation -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra particle_systems/flocking.c     -o flocking      -lncurses -lm
+
+# ── fluid / grid sims ────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra fluid/sand.c       -o sand      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/flowfield.c  -o flowfield -lncurses -lm
+
+# ── raster (software rasterizer) ─────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raster/cube_raster.c     -o cube     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raster/sphere_raster.c   -o sphere   -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raster/displace_raster.c -o displace -lncurses -lm
+
+# ── raymarcher / 3-D ─────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/donut.c                -o donut       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/wireframe.c            -o wireframe   -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c           -o raymarcher  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_cube.c      -o ray_cube    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  -lncurses -lm
 ```
 
+---
+
 ## Files
-- `bounce.c`      — bouncing balls, smooth terminal-aware physics
-- `matrix_rain.c` — Matrix-style falling character rain
+
+### ncurses_basics/
+- `tst_lines_cols.c`    — print terminal `LINES` × `COLS` using `printw` / `refresh`
+- `aspect_ratio.c`      — draw a correct-looking circle using `newwin` + 2× x-scaling
+- `spring_pendulum.c`   — Lagrangian spring-pendulum with Bresenham spring coil and render lerp
+
+### misc/
+- `bounce_ball.c`       — **reference implementation** — bouncing balls with pixel-space physics, fixed-timestep accumulator, render interpolation (alpha), SIGWINCH resize
+- `bonsai.c`            — growing bonsai tree: recursive branch growth, 5 tree types, pot styles, message panel with ACS box-drawing chars, `use_default_colors`
+
+### matrix_rain/
+- `matrix_rain.c`       — Matrix-style falling character rain: two-pass draw, theme system, render interpolation for smooth column-head scrolling
+
+### particle_systems/
+- `fire.c`              — Doom-style fire CA: heat diffusion, Floyd-Steinberg dithering, 6 auto-cycling color themes, wind and gravity controls
+- `aafire_port.c`       — aalib fire variant: 5-neighbour CA, per-row decay LUT, 9-step `attr_t` brightness gradient
+- `fireworks.c`         — rocket fireworks: IDLE → RISING → EXPLODED state machine, particle pool, gravity + drag
+- `brust.c`             — random explosion bursts: staggered particle waves, scorch mark persistence, `A_DIM` residue rendering
+- `kaboom.c`            — deterministic LCG explosions: same seed → same explosion shape, color-ring blast zones
+- `constellation.c`     — star constellation: Bresenham stippled lines with `cell_used[][]` dedup, proximity `A_BOLD`, `prev/cur` lerp interpolation
+- `flocking.c`          — boid flocking: 5 algorithms (classic boids, leader chase, Vicsek, orbit, predator-prey), toroidal wrap, cosine palette color cycling, `A_BOLD` proximity halo
+
+### fluid/
+- `sand.c`              — falling sand CA: gravity + diagonal fallback + wind drift, Fisher-Yates column shuffle, per-grain age coloring
+- `flowfield.c`         — Perlin noise flow field: 3-octave fBm, bilinear field sampling, 8-direction arrow glyphs, ring-buffer particle trails
 
 ### raster/
-- `torus_raster.c`    — UV torus, 4 shaders (phong/toon/normals/wireframe)
-- `cube_raster.c`     — unit cube with flat normals, same 4 shaders + zoom/cull toggle
-- `sphere_raster.c`   — UV sphere, same 4 shaders + zoom/cull toggle
-- `displace_raster.c` — UV sphere with real-time vertex displacement (ripple/wave/pulse/spiky)
+- `torus_raster.c`      — UV torus, 4 shaders (phong / toon / normals / wireframe), always-on back-face cull
+- `cube_raster.c`       — unit cube, flat normals, same 4 shaders + toggleable cull + zoom
+- `sphere_raster.c`     — UV sphere, same 4 shaders + toggleable cull + zoom
+- `displace_raster.c`   — UV sphere with real-time vertex displacement (ripple / wave / pulse / spiky), central-difference normal recomputation
+
+### raymarcher/
+- `donut.c`             — parametric torus (no mesh): trigonometric projection, depth sort, luminance → grey pair
+- `wireframe.c`         — wireframe cube via Bresenham 3-D projected edges, arrow-key rotation, slope-to-char line drawing
+- `raymarcher.c`        — sphere-marching SDF raymarcher: sphere + plane, Blinn-Phong, gamma correction
+- `raymarcher_cube.c`   — SDF box raymarcher: finite-difference normal, shadow ray
+- `raymarcher_primitives.c` — multiple SDF primitives (sphere, box, torus, capsule, cone…) composited with `min`/`max`
 
 ---
 
-## Core Architecture (both files)
+## Core Architecture (all animation files)
 
-### Coordinate / Physics Model (bounce.c)
-- Physics lives entirely in **pixel space** — one unit = one physical pixel
-- Terminal cells are ~2× taller than wide; pixel space compensates:
-  - `CELL_W = 8`, `CELL_H = 16`
-  - pixel width  = `cols * CELL_W`
-  - pixel height = `rows * CELL_H`
-- Ball position (`px`, `py`) and velocity (`vx`, `vy`) are always floats in pixel space
-- **One conversion point only**: `px_to_cell_x/y()` in `scene_draw()` — nowhere else
-- `floorf(px / CELL_W + 0.5f)` used for rounding — "round half up", not `roundf()`
-  (avoids banker's rounding oscillation at cell boundaries)
+### Coordinate / Physics Model
+- Physics lives in **pixel space** — `CELL_W=8`, `CELL_H=16` sub-pixels per cell
+- **One conversion point**: `px_to_cell_x/y()` in `scene_draw()` — nowhere else
+- Simulations working in cell space (fire, sand, matrix_rain, flowfield) omit `§4 coords` entirely
 
-### Simulation Loop (both files)
-- Fixed-timestep accumulator pattern:
-  ```c
-  sim_accum += dt;
-  while (sim_accum >= tick_ns) {
-      scene_tick / rain_tick(...);
-      sim_accum -= tick_ns;
-  }
-  ```
-- `dt` clamped to 100 ms to prevent spiral-of-death after stalls
-- Render frame cap: sleep to target 60 fps render rate
-- `sim_fps` and render fps are independent — sim can run at 20 Hz while rendering at 60 Hz
+### Simulation Loop
+- Fixed-timestep accumulator: `sim_accum += dt; while (sim_accum >= tick_ns) { tick(); sim_accum -= tick_ns; }`
+- `dt` capped at 100 ms to prevent spiral-of-death
+- Render frame cap: **sleep BEFORE terminal I/O** — stable regardless of terminal write time
+- `sim_fps` and render fps are independent
 
-### Render Interpolation — alpha (both files)
-- After draining the accumulator, `sim_accum` = leftover ns into the next unfired tick
-- `alpha = (float)sim_accum / (float)tick_ns`  ∈ [0.0, 1.0)
-- **bounce.c**: draw position projected forward:
-  ```c
-  draw_px = b->px + b->vx * alpha * dt_sec;
-  draw_py = b->py + b->vy * alpha * dt_sec;
-  ```
-- **matrix_rain.c**: column head projected forward:
-  ```c
-  draw_head_y = (float)c->head_y + (float)c->speed * alpha;
-  ```
-  then `row = (int)floorf(draw_head_y - dist + 0.5f)`
-- Physics state (`px`, `py`, `head_y`) is **never modified** by interpolation — draw only
-- Forward extrapolation is correct for constant-velocity / integer-speed motion;
-  if acceleration is added, switch to storing `prev_pos` and lerping between prev and current
+### Render Interpolation — alpha
+- `alpha = sim_accum / tick_ns` ∈ [0.0, 1.0)
+- Constant-velocity: forward extrapolation `draw_pos = pos + vel * alpha * dt`
+- Non-linear forces: lerp `draw_pos = prev + (cur - prev) * alpha`
 
-### ncurses Rendering (both files)
-- **Single `stdscr` buffer** — no back/front WINDOW pair
-- ncurses internally maintains `curscr` (current) and `newscr` (target)
-- Frame sequence every render:
-  ```
-  erase()              — clear newscr
-  draw balls/rain      — write into newscr
-  draw HUD             — written last, always on top
-  wnoutrefresh(stdscr) — mark newscr ready, no terminal I/O yet
-  doupdate()           — one atomic diff write to terminal fd
-  ```
-- `typeahead(-1)` — prevents ncurses interrupting mid-flush to poll stdin
-- Adding a second WINDOW breaks ncurses' diff accuracy → ghost trails
+### ncurses Rendering
+- Single `stdscr` — ncurses `curscr/newscr` IS the double buffer; no manual WINDOW pair
+- Frame sequence: `erase() → draw scene → draw HUD → wnoutrefresh(stdscr) → doupdate()`
+- `typeahead(-1)` — atomic diff write, no tearing
+- `erase()` not `clear()` — no full-screen retransmit every frame
 
-### Signal Handling (both files)
-- `SIGINT` / `SIGTERM` → set `running = 0` (clean exit)
-- `SIGWINCH` → set `need_resize = 1` (handled at top of main loop)
-- `atexit(cleanup)` calls `endwin()` — terminal always restored even on crash
-- Resize resets `frame_time` and `sim_accum` to avoid dt spike after rebuild stall
+### Section Layout (§1–§8 or §1–§10 for complex files)
+- `§1 config` — all tunable constants, `TICK_NS`, `CELL_W/H`
+- `§2 clock` — `clock_ns()` (`CLOCK_MONOTONIC`) + `clock_sleep_ns()`
+- `§3 color` — `color_init()`, 256-color with 8-color fallback
+- `§4 coords` — `pw/ph/px_to_cell_x/y` (omitted in cell-space sims)
+- `§5 physics` — simulation struct + tick function (no ncurses)
+- `§6 scene` — owns physics objects; `scene_tick` + `scene_draw(alpha)`
+- `§7 screen` — `screen_init/draw/present/resize`
+- `§8 app` — `App` struct, `volatile sig_atomic_t` flags, main loop
+
+### Signal Handling
+- `SIGINT/SIGTERM` → `running = 0`; `SIGWINCH` → `need_resize = 1`
+- Flags are `volatile sig_atomic_t` — compiler cannot cache, reads are atomic
+- `atexit(cleanup)` calls `endwin()` — terminal always restored
 
 ---
 
-## matrix_rain.c Specifics
+## raster/*.c — Software Rasterizer Pipeline
 
-### Two-pass Draw (interpolated render)
-- **Pass 1 — grid**: persistent dissolve/fade texture from `rain_tick()`; integer positions
-- **Pass 2 — live columns**: drawn directly to `stdscr` via `col_paint_interpolated()`
-  at float `draw_head_y`; bypasses the grid entirely
-- Grid still exists for `grid_scatter_erase()` — stochastic per-row erasure gives
-  the organic fade-to-black look; without it columns vanish instantly
-
-### Column
-- `head_y` is integer physics position; only the draw function uses float projection
-- `ch_cache[TRAIL_MAX]` — characters seeded at spawn, refreshed each `col_tick()`
-  so `col_paint_interpolated()` always has glyphs without consulting the grid
-- Shade gradient by `dist` from head: HEAD → HOT → BRIGHT → MID → DARK → FADE
-
-### Themes
-- 4 themes: green / amber / blue / white
-- 256-color: distinct xterm-256 index per shade level (rich gradient)
-- 8-color fallback: same base color, `A_DIM` / `A_BOLD` carry the gradient
-- `theme_apply()` selects palette at runtime via `COLORS >= 256` check
-
----
-
-## bounce.c Specifics
-
-### Speed / Smoothness Rule
-- `SPEED_MIN = 300 px/s`, `SPEED_MAX = 600 px/s`
-- Minimum speed formula: `SPEED_MIN >= CELL_H * SIM_FPS / 4 = 240`
-  (ensures balls cross cell boundaries often enough to avoid staircase)
-- Velocity direction: rejection-sample unit vector → isotropic angle distribution
-  (separate random `vx`/`vy` skews toward diagonal — don't do that)
-
-### Wall Bounce
-- Clamp position to `[0, max_px]` / `[0, max_py]` and flip velocity component
-- `max_px = pw(cols) - 1`, `max_py = ph(rows) - 1`
-
----
-
----
-
-## raster/*.c — Software Rasterizer
-
-### Pipeline
-Each raster file is a self-contained software renderer:
 ```
 tessellate_*()  →  scene_tick()  →  pipeline_draw_mesh()  →  fb_blit()
                    (rotate MVP)      for each triangle:
@@ -142,55 +138,19 @@ tessellate_*()  →  scene_tick()  →  pipeline_draw_mesh()  →  fb_blit()
                                        rasterize (barycentric)
                                        z-test
                                        frag shader  (FSIn → FSOut)
-                                       luma → dither → Paul Bourke char → cbuf
+                                       luma → Bayer dither → Bourke char → cbuf
 ```
 
-### ShaderProgram — split vert_uni / frag_uni (segfault fix)
-All four raster files use:
-```c
-typedef struct {
-    VertShaderFn  vert;
-    FragShaderFn  frag;
-    const void   *vert_uni;   /* passed to vert() */
-    const void   *frag_uni;   /* passed to frag() */
-} ShaderProgram;
-```
-**Why split:** the vertex and fragment shaders can require different uniform struct types.
-In `displace_raster.c`, `vert_displace` needs `DisplaceUniforms` (has `disp_fn`, `time`,
-`amplitude`, `frequency`) while `frag_toon` needs `ToonUniforms` (has `bands`). A single
-`void *uniforms` pointer cannot satisfy both — whichever shader receives the wrong type
-will cast it and read garbage, causing a segfault when it dereferences a null function
-pointer or out-of-range field.
-
-The split was applied to **all four raster files** for consistency:
-
-| Shader | vert_uni | frag_uni |
-|---|---|---|
-| phong   | `&s->uni`      | `&s->uni`      |
-| toon    | `&s->uni`      | `&s->toon_uni` |
-| normals | `&s->uni`      | `&s->uni`      |
-| wire    | `&s->uni`      | `&s->uni`      |
-
-For toon: `vert_uni = &s->uni` (vert shader only needs `Uniforms`); `frag_uni = &s->toon_uni`
-(`frag_toon` needs `ToonUniforms.bands`). `ToonUniforms` leads with `Uniforms base` so the
-vert shader's `(const Uniforms*)vert_uni` cast is safe (zero-offset rule).
-
-### Framebuffer
-- `zbuf[cols*rows]` — float depth buffer, cleared to `FLT_MAX`
-- `cbuf[cols*rows]` — `Cell{ch, color_pair, bold}`, blitted to stdscr each frame
-- `luma_to_cell(luma, px, py)` — Bayer 4×4 ordered dither → Paul Bourke ASCII ramp + 7-color palette
-
-### Displacement (displace_raster.c only)
-- 4 modes (ripple/wave/pulse/spiky) — each a pure `float fn(Vec3, time, amp, freq)`
-- Normal recomputation via central difference: sample displacement at `pos ± eps*T` and `pos ± eps*B`, reconstruct displaced tangent vectors, take cross product
-- `DisplaceUniforms` extends `Uniforms` with `disp_fn`, `time`, `amplitude`, `frequency`, `mode`
+- **Split `vert_uni / frag_uni`** in `ShaderProgram` — prevents segfault when vert and frag shaders need different uniform struct types
+- **`cbuf[]`** intermediate framebuffer — rendering math is fully decoupled from ncurses I/O; `fb_blit()` is the sole boundary
+- **`zbuf[]`** float depth buffer — initialised to `FLT_MAX`, z-test per cell
 
 ---
 
 ## Coding Conventions
-- Comments explain **why**, not just what — especially non-obvious physics/rounding choices
-- Every tunable constant lives in `§1 config` as an enum or `#define`
-- Functions are small and single-purpose; data flows in one direction
-- No dynamic allocation after init except `rain_init()` column/grid arrays
+- Comments explain **why** — especially non-obvious physics/rounding choices
+- Every tunable constant in `§1 config` as enum or `#define`
+- No dynamic allocation after init (except initial `malloc` in tessellate/flowfield/sand)
 - `sig_atomic_t` for all signal-written flags
+- `(chtype)(unsigned char)ch` double cast on every `mvaddch` — prevents sign-extension corruption
 - C11, `-Wall -Wextra` clean

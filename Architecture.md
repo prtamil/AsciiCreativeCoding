@@ -827,4 +827,235 @@ N'  = normalize(cross(T', B'))
 
 ---
 
-*This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `basics/bounce_ball.c`.*
+## 13. Cellular Automata — fire.c, aafire_port.c, sand.c
+
+### Doom Fire — Heat Diffusion CA
+
+`fire.c` models fire as a 2-D heat grid `[rows × cols]`:
+
+```
+Bottom row: held at MAX_HEAT (fuel line, arch-shaped, wind-offset each tick)
+Every other cell:
+  heat[y][x] = (heat[y+1][x-1] + heat[y+1][x] + heat[y+1][x+1] + heat[y+1][rand_neighbour]) / 4
+             - decay
+```
+
+The seeded bottom row uses an arch shape: `heat = MAX_HEAT * sin(π * x / cols)^0.6`. Wind is implemented by offsetting the arch centre each tick, making flames lean.
+
+**Rendering pipeline:**
+```
+heat[][] → Floyd-Steinberg dithering → perceptual LUT → color LUT → mvaddch
+```
+
+The Floyd-Steinberg pass works on a scratch copy of the heat grid (`heat_work`). After quantization, the rounding error is distributed to four unprocessed neighbours. This produces smooth gradients without the regular pattern of ordered dithering.
+
+### aafire 5-Neighbour CA
+
+`aafire_port.c` samples five neighbours instead of three:
+
+```c
+heat[y][x] = (heat[y+1][x-1] + heat[y+1][x] + heat[y+1][x+1]
+              + heat[y+2][x-1] + heat[y+2][x+1]) / 5 - minus[y]
+```
+
+The two extra terms (`y+2` row) make the flame rise slower and form rounder blobs. `minus[y]` is a precomputed per-row decay LUT — stronger decay near the top, weaker at the bottom — normalised to the terminal height so flame height is consistent at any terminal size.
+
+### Falling Sand — Gravity CA
+
+`sand.c` processes cells bottom-to-top (critical: top-to-bottom would let grains teleport multiple cells in one pass):
+
+```
+For each grain at (y, x):
+  try fall straight down   → (y+1, x)
+  if blocked, try diagonal → (y+1, x±1)  — direction randomised each grain
+  if blocked, try wind drift → (y, x±1)
+  otherwise: stationary
+```
+
+Fisher-Yates shuffle is applied to the column scan order each tick to remove the left/right scan bias that otherwise makes all sand pile to one side.
+
+---
+
+## 14. Flow Field — flowfield.c
+
+### Architecture
+
+`flowfield.c` is a particle system driven by a Perlin noise vector field:
+
+```
+noise_init()           — build 256-element permutation table
+scene_init()           — allocate particle pool + angle grid
+each tick:
+  field_update(time)   — resample noise at each grid cell → angle[y][x]
+  particle_tick(p)     — bilinear-sample angle at float position,
+                         apply velocity, age, wrap/respawn
+scene_draw(alpha)      — draw particles at interpolated position,
+                         choose direction char from velocity angle
+```
+
+### Perlin Noise to Flow Vector
+
+Two noise samples at offset coordinates produce independent noise values; `atan2` converts them to a direction angle:
+
+```c
+float nx = perlin2d(x * freq + 0, y * freq + 0, time * 0.3f);
+float ny = perlin2d(x * freq + 100, y * freq + 100, time * 0.3f);
+angle[y][x] = atan2f(ny, nx);
+```
+
+3 octaves of fBm are summed (each doubling frequency, halving amplitude) before computing the angle, giving the field fine-grained detail without high-frequency noise at large scales.
+
+### Bilinear Field Sampling
+
+Particles are at float positions; the angle grid is integer-indexed. Bilinear interpolation samples smoothly between grid cells:
+
+```c
+float angle = lerp(lerp(grid[y0][x0], grid[y0][x1], fx),
+                   lerp(grid[y1][x0], grid[y1][x1], fx), fy);
+```
+
+Without this, particles would snap between discrete angle values every time they cross a grid cell boundary — visible as sudden direction changes.
+
+### Ring Buffer Trails
+
+Each particle maintains a ring buffer of its last N positions. The draw function iterates the ring from newest to oldest, drawing older positions dimmer. The head index advances each tick overwriting the oldest entry — O(1) per tick, no shifting.
+
+---
+
+## 15. Flocking Simulation — flocking.c
+
+### Algorithm Modes
+
+Five algorithms are runtime-switchable via the `mode` enum:
+
+| Mode | Rule |
+|---|---|
+| Classic Boids | Separation (repel close neighbors) + Alignment (match average heading) + Cohesion (steer toward center of mass) |
+| Leader Chase | Each follower steers directly toward its flock leader with a proportional velocity term |
+| Vicsek | Align heading to average heading of neighbors within radius + add Gaussian noise; emergent phase transition |
+| Orbit Formation | Followers maintain a fixed radius ring around the leader; angular position advances each tick |
+| Predator-Prey | Flock 0 (predator) chases nearest other-flock boid; flocks 1–2 flee from flock 0's leader |
+
+All modes run with the same physics integration (semi-implicit Euler) and toroidal boundary.
+
+### Toroidal Topology
+
+Boids wrap around screen edges instead of bouncing. Distance and steering calculations use toroidal shortest-path:
+
+```c
+static float toroidal_delta(float a, float b, float max)
+{
+    float d = a - b;
+    if (d >  max * 0.5f) d -= max;
+    if (d < -max * 0.5f) d += max;
+    return d;
+}
+```
+
+This produces `|d| ≤ max/2` — the shortest path across the wrap boundary. All neighbor detection, cohesion, alignment, and proximity brightness use this function.
+
+### Cosine Palette Color Cycling
+
+Flock colors rotate smoothly over time by re-registering ncurses color pairs mid-animation with the cosine palette formula:
+
+```
+c(t) = 0.5 + 0.5 × cos(2π × (t/period + phase))
+```
+
+Three independent phase offsets give independent RGB channels that cycle through perceptually balanced hues. The result is remapped to the xterm-256 color cube (`16 + 36r + 6g + b`, r/g/b ∈ [0,5]).
+
+---
+
+## 16. Bonsai Tree — bonsai.c
+
+### Branch Growth Algorithm
+
+Each branch is a struct with position, direction `(dx, dy)`, remaining life, and type. One growth tick = one step per active branch:
+
+```c
+void branch_step(Branch *b, Scene *sc)
+{
+    /* Wander: perturb dx/dy by random amount each step */
+    /* Branch: when life crosses threshold, spawn child branches */
+    /* Type-specific rules:
+       trunk   — mostly upward, wide wander
+       dying   — stronger gravity (curves down)
+       dead    — no new branches, straight
+       leafing — short horizontal bursts */
+    draw_char_at(b->y, b->x, branch_char(b->dx, b->dy), b->color);
+}
+```
+
+Character selection uses the same slope-to-char mapping as spring_pendulum.c: `|`, `-`, `/`, `\` based on the ratio `|dx| / |dy|`.
+
+### Leaf Scatter
+
+After a branch dies (life reaches 0), `leaf_scatter()` places leaf characters in a random radius around the tip position. Leaf chars are chosen from a configurable set and drawn with `A_BOLD` for a lighter look.
+
+### Message Box with ACS Characters
+
+The message panel is drawn using ncurses' portable box-drawing characters (`ACS_ULCORNER`, `ACS_HLINE`, `ACS_VLINE`, `ACS_LLCORNER`, etc.) — always correct regardless of terminal encoding.
+
+```c
+attron(COLOR_PAIR(6) | A_BOLD);
+mvaddch(by, bx, ACS_ULCORNER);
+for (int i = 1; i < box_w-1; i++) mvaddch(by, bx+i, ACS_HLINE);
+mvaddch(by, bx + box_w - 1, ACS_URCORNER);
+/* ... sides and bottom ... */
+attroff(COLOR_PAIR(6) | A_BOLD);
+```
+
+`use_default_colors()` + `-1` background makes branches appear over transparent terminal backgrounds.
+
+---
+
+## 17. Constellation — constellation.c
+
+### Interpolation: `prev/cur` Lerp
+
+Stars store both previous and current positions. The draw function lerps between them:
+
+```c
+draw_px = s->prev_px + (s->px - s->prev_px) * alpha;
+draw_py = s->prev_py + (s->py - s->prev_py) * alpha;
+```
+
+This is true interpolation (not forward extrapolation) because star velocities are too small for extrapolation to be numerically identical to lerp.
+
+### Connection Line Rendering
+
+Connection lines are drawn with stippling and `A_BOLD` based on distance ratio:
+- `< 0.50` → bold solid line (close, bright)
+- `< 0.75` → normal solid line (medium)
+- `< 1.00` → normal stipple-2 line (far, dotted)
+
+A `bool cell_used[rows][cols]` VLA prevents multiple lines from overwriting each other in dense regions — the first line to visit a cell claims it.
+
+---
+
+## 18. Raymarchers and Donut — raymarcher/*.c
+
+### donut.c — Parametric Torus (No Mesh, No SDF)
+
+`donut.c` computes the torus directly from trigonometry each frame:
+
+```
+For (θ, φ) over (0, 2π):
+  x = (R + r·cosφ)·cosθ
+  y = r·sinφ
+  z = (R + r·cosφ)·sinθ
+  Apply two rotation matrices A, B (the tumble)
+  Project to screen with perspective
+  Compute N·L for luminance
+  Sort by depth, paint character
+```
+
+No pipeline, no barycentric interpolation, no z-buffer — just parametric evaluation + depth sort. It is a direct port of the classic "donut.c" algorithm.
+
+### wireframe.c — 3-D Projected Edges
+
+`wireframe.c` draws a cube's 12 edges by projecting the 8 vertices to screen space and connecting them with Bresenham lines. Character at each Bresenham step is selected by slope (`/`, `\`, `-`, `|`). Arrow keys rotate the model matrix in real time.
+
+---
+
+*This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `misc/bounce_ball.c`.*

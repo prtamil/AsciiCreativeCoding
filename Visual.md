@@ -81,6 +81,12 @@ Organised as a field guide: what the call does, why it matters, where it appears
 
 #### V1.1 Standard Initialization Sequence
 
+**What it is:** A fixed sequence of ncurses setup calls that must happen once at program start before any drawing or input.
+
+**What we achieve:** A fully controlled terminal session — hidden cursor, immediate key delivery, no echoed input, and stable frame output without tearing.
+
+**How:** Each call builds on the previous. `initscr()` creates `stdscr` and puts the tty into raw mode. `noecho()` stops typed characters appearing on screen. `cbreak()` delivers keys immediately without Enter. `curs_set(0)` hides the blinking cursor. `nodelay(TRUE)` makes `getch()` return instantly when no key is waiting. `keypad(TRUE)` translates arrow-key escape sequences into integer constants. `typeahead(-1)` prevents ncurses from interrupting its output mid-write to poll stdin. Getting the order wrong crashes or silently breaks one of these properties.
+
 Every file in this project boots ncurses in the same order inside `screen_init()`:
 
 ```c
@@ -107,6 +113,12 @@ Order matters:
 
 #### V1.2 `endwin()` and `atexit` Cleanup
 
+**What it is:** A cleanup hook that restores the terminal to its original state when the program exits by any means.
+
+**What we achieve:** When the animation exits — whether normally, via `Ctrl+C`, or from `exit()` called deep inside the code — the shell is left in a working state with echo enabled, the cursor visible, and raw mode off. Without this, the terminal becomes unusable after the program ends.
+
+**How:** We register a one-line cleanup function with `atexit()`. The C runtime calls all `atexit` functions automatically when `exit()` is called or when `main()` returns. Signal handlers set `running = 0` and let the main loop exit cleanly through `main()`, which then fires `atexit`. The combination of `atexit` + `SIGINT` handler + `SIGTERM` handler covers every normal exit path.
+
 ```c
 static void cleanup(void) { endwin(); }
 // ...
@@ -127,6 +139,12 @@ It does NOT run on `SIGKILL`, `abort()`, or hardware faults — but those are un
 ---
 
 #### V1.3 `use_default_colors()` — Transparent Background
+
+**What it is:** An opt-in extension that unlocks `-1` as a valid background color in `init_pair`, meaning "use whatever the terminal's own background is."
+
+**What we achieve:** Characters float over the terminal's native background — whether that's a solid color, a wallpaper image, or a blur effect — instead of forcing a solid ncurses-controlled fill on every cell.
+
+**How:** After `start_color()`, call `use_default_colors()` once. This registers the ISO 6429 SGR 49 escape code (reset background to default) as the `-1` value. Now `init_pair(1, 130, -1)` means "foreground colour 130, transparent background." Files that want a solid black background deliberately omit this call and use `COLOR_BLACK` explicitly.
 
 ```c
 start_color();
@@ -150,6 +168,12 @@ Without `use_default_colors()`, `-1` is invalid and `init_pair` silently uses `C
 
 #### V1.4 `cbreak()` vs `raw()`
 
+**What it is:** Two modes that make keys available immediately (without waiting for Enter), but differ in how they handle control sequences like `Ctrl+C`.
+
+**What we achieve:** With `cbreak()`, pressing `Ctrl+C` still generates `SIGINT`, letting the signal handler set `running = 0` for a clean, orderly exit. With `raw()`, `Ctrl+C` arrives as raw character 3 — no signal, no cleanup path unless you handle character 3 yourself.
+
+**How:** `cbreak()` disables line buffering (so keys arrive immediately) but leaves signal processing intact. `raw()` disables both line buffering and signal processing — every keystroke, including control codes, goes directly to the application. All animation files use `cbreak()`. Only `aspect_ratio.c` uses `raw()` as a deliberate learning example.
+
 Both modes deliver keypresses immediately without waiting for Enter. The difference:
 
 | Mode | Ctrl+C | Ctrl+Z | Ctrl+\ |
@@ -167,6 +191,12 @@ All animation files use `cbreak()` — they want `Ctrl+C` to trigger `SIGINT →
 
 #### V2.1 `curscr` / `newscr` — The Built-in Buffer Pair
 
+**What it is:** ncurses' automatic double-buffer — two internal virtual screens that are always present, whether you know about them or not.
+
+**What we achieve:** Only the cells that actually changed between frames are transmitted to the terminal. This eliminates full-screen flicker and keeps terminal I/O volume proportional to animation activity rather than screen size.
+
+**How:** Every `mvaddch`, `attron`, and `erase` call writes into `newscr` — the frame being built this tick. Nothing reaches the terminal. When `doupdate()` is called, ncurses computes the diff `newscr − curscr`, sends only the changed cells as minimal escape codes, then updates `curscr = newscr`. You cannot opt out of this mechanism — it is created by `initscr()` and exists for the entire session.
+
 ncurses maintains two virtual screens internally at all times:
 
 ```
@@ -183,6 +213,12 @@ This is always present. You cannot opt out of it. The buffer pair is not created
 ---
 
 #### V2.2 `erase()` vs `clear()` — Never Use `clear()` in a Loop
+
+**What it is:** Two calls that both "blank the screen," but with very different consequences for how much data is sent to the terminal each frame.
+
+**What we achieve:** With `erase()`, the diff engine still works — only genuinely changed cells are transmitted. With `clear()`, every single cell is marked as changed and the entire screen is retransmitted every frame, doubling I/O and causing full-screen flicker at 60fps.
+
+**How:** `erase()` resets ncurses' internal `newscr` buffer to spaces — it writes nothing to the terminal itself. The diff engine then sees only cells that changed from the previous frame. `clear()` does the same reset but also schedules a `\e[2J` (clear screen) escape on the next `doupdate()`, forcing a full repaint. Always use `erase()` in animation loops.
 
 | Call | What it does | Terminal I/O |
 |---|---|---|
@@ -203,6 +239,12 @@ This is always present. You cannot opt out of it. The buffer pair is not created
 
 #### V2.3 `wnoutrefresh` + `doupdate` — The Two-Phase Flush
 
+**What it is:** The two-step process that moves content from ncurses' internal buffer to the actual terminal. Staging and committing are separated into distinct calls.
+
+**What we achieve:** A single, atomic terminal write per frame. With the two-step form the intent is explicit and the code is ready for multi-window compositing without changing the flush logic.
+
+**How:** `wnoutrefresh(stdscr)` stages the window's content into ncurses' internal `newscr` — still no terminal I/O. `doupdate()` then computes `newscr − curscr` and sends the diff in one write. The combined `wrefresh(w)` = `wnoutrefresh(w)` + `doupdate()` — functionally equivalent for a single window, but the split form is used throughout this project for clarity.
+
 ```c
 /* screen_present() — one call per frame */
 wnoutrefresh(stdscr);   /* stage stdscr → ncurses' internal newscr */
@@ -220,6 +262,12 @@ The whole project always uses the split form to document that the two phases are
 ---
 
 #### V2.4 Why Manual Front/Back Windows Break the Diff Engine
+
+**What it is:** An explanation of why the "two-window double buffer" pattern — a common beginner approach — produces ghost trails and tearing instead of clean animation.
+
+**What we achieve (by avoiding this):** The diff engine works correctly, transmitting only genuinely changed cells. Ghost trails and the visual noise from spurious overwrites disappear.
+
+**How the bug works:** When you copy a "back" window into a "front" window and refresh the front, ncurses compares the front window against `curscr` — not against your back window. Every cell of the front now looks "changed" even if the content didn't change, so the entire screen is retransmitted. The correct model: write everything directly into `stdscr`. ncurses' own `curscr/newscr` pair is the double buffer — you do not need to build one yourself.
 
 A common ncurses animation mistake:
 
@@ -244,6 +292,12 @@ The `aspect_ratio.c` basic example does use `newwin()` as a learning exercise, b
 ---
 
 #### V2.5 Framebuffer-to-ncurses: `cbuf` → `fb_blit()`
+
+**What it is:** An intermediate plain-C array (`cbuf[]`) that the 3D rasteriser pipeline writes into instead of calling ncurses directly. A single `fb_blit()` function at the end of the frame transfers it to ncurses.
+
+**What we achieve:** Complete separation between rendering math and terminal I/O. The rasteriser, z-test, and shader code can run as pure arithmetic with no ncurses state entangled in the loops. All ncurses calls are batched into one clean pass at the boundary.
+
+**How:** Each pipeline stage (vertex shader → rasterise → z-test → fragment shader) writes `Cell {ch, color_pair, bold}` entries into `cbuf[cols*rows]` and float depth values into `zbuf[]`. After the full frame is built, `fb_blit()` iterates `cbuf`, skips cells where `ch == 0` (empty — not covered by any triangle), and calls `attron` + `mvaddch` + `attroff` for each visible cell. The entire ncurses API surface is just those three calls, in one function.
 
 All raster files use an intermediate CPU framebuffer rather than writing directly to ncurses during rasterization:
 
@@ -283,6 +337,12 @@ static void fb_blit(const Framebuffer *fb)
 
 #### V3.1 Color Pairs — `init_pair` / `COLOR_PAIR`
 
+**What it is:** ncurses' color system. You cannot set a foreground color alone — you must register a numbered pair of (foreground, background) colors first, then activate that pair number before drawing.
+
+**What we achieve:** Named, reusable color combinations. By giving each color combination a number, draw code can just say `COLOR_PAIR(3)` without repeating the RGB values, and changing a theme only requires re-registering pair numbers once.
+
+**How:** At startup, call `init_pair(n, fg_color, bg_color)` for each combination you need (pairs are numbered from 1). During drawing, `attron(COLOR_PAIR(n))` activates pair n; `mvaddch` writes in that color; `attroff(COLOR_PAIR(n))` restores default. The number of available pairs is `COLOR_PAIRS` — typically 256 on modern terminals.
+
 ncurses does not allow setting foreground color alone. Every colored character requires a registered color pair:
 
 ```c
@@ -305,6 +365,12 @@ attroff(COLOR_PAIR(1) | A_BOLD);
 ---
 
 #### V3.2 256-Color vs 8-Color Fallback Pattern
+
+**What it is:** A runtime branch inside `color_init()` that registers rich xterm-256 palette indices when available, or falls back to the 8 named ANSI colors on limited terminals.
+
+**What we achieve:** The same compiled binary works correctly on a modern `xterm-256color` terminal and a basic 8-color SSH session. The animation degrades gracefully — fewer gradient steps, but the same visual intent.
+
+**How:** Check `COLORS >= 256` after `start_color()`. If true, register specific xterm-256 index numbers (196 for bright red, 208 for orange, etc.). If false, map to the closest named color (`COLOR_RED`, `COLOR_YELLOW`, etc.). The pair numbers used in draw code stay the same — only the init branch differs.
 
 Every file uses the same pattern to support both terminal types:
 
@@ -336,6 +402,12 @@ The check is at runtime so the same binary runs in `xterm-256color`, `tmux` (whe
 
 #### V3.3 xterm-256 Palette Index Reference
 
+**What it is:** A map of which specific xterm-256 color indices appear in this project and the reasoning behind each choice.
+
+**What we achieve:** Consistent, readable colors across animations. Picking the wrong index — say, a low-luminance blue on a black background — produces characters that are nearly invisible. Knowing the palette avoids this.
+
+**How:** The 256-color space has three regions: indices 0–15 are the 8+8 ANSI named colors; 16–231 are a 6×6×6 RGB cube (index = 16 + 36r + 6g + b, r/g/b ∈ 0–5); 232–255 are 24 grey steps from near-black to white. This project uses the cube for vivid hues and the grey ramp for luminance gradients in raymarchers.
+
 Specific indices used across this project (all with `COLOR_BLACK` background):
 
 | Index | Approximate Color | Used For |
@@ -363,6 +435,12 @@ Blue-purples sit in the low-luminance zone of the 256-color cube — on black ba
 
 #### V3.4 `use_default_colors()` + Background `-1`
 
+**What it is:** The color-pair companion to V1.3 — using `-1` as the background argument in `init_pair` to make character backgrounds transparent.
+
+**What we achieve:** Each character's background cell shows whatever the terminal was already displaying — a custom color, image, or translucent blur — instead of a solid ncurses-controlled color block.
+
+**How:** After calling `use_default_colors()`, the value `-1` becomes valid as the background in `init_pair`. It maps to the ISO 6429 SGR 49 "default background" escape code. Only `bonsai.c` and `matrix_rain.c` use this — fire, raster, and physics demos want a solid black background and omit `use_default_colors()` entirely.
+
 ```c
 start_color();
 use_default_colors();
@@ -378,6 +456,12 @@ The `-1` background argument to `init_pair` means "the terminal's own background
 ---
 
 #### V3.5 Grey Ramp for Luminance Gradients
+
+**What it is:** Eight ncurses color pairs registered to evenly-spaced grey shades from the xterm-256 grey ramp (indices 232–255), used as a luminance scale for 3D rendering.
+
+**What we achieve:** Smooth apparent brightness gradients across lit 3D surfaces — dark shadows through mid tones to bright highlights — using only color pairs and no special graphics hardware.
+
+**How:** The xterm-256 grey ramp has 24 steps (232 = nearly black, 255 = white). We pick every 3rd step (235, 238, 241, 244, 247, 250, 253, 255) to get 8 evenly spaced levels. Each gets one `init_pair`. When the shader computes a luminance value for a surface point, it maps it to a pair index 1–8 and draws the character in that grey. Combined with the ASCII density ramp, this gives two independent brightness axes per cell.
 
 Raymarchers and the donut renderer map continuous luminance values to a sequence of grey pairs:
 
@@ -407,6 +491,12 @@ if (COLORS < 256) {
 
 #### V3.6 `attr_t` — Combining Pair and Attribute Flags
 
+**What it is:** ncurses' attribute type — a single integer that encodes both the color pair number and any style flags (`A_BOLD`, `A_DIM`, `A_REVERSE`, etc.) combined by bitwise OR.
+
+**What we achieve:** One-call attribute activation. Instead of `attron(COLOR_PAIR(n))` then `attron(A_BOLD)` separately, we build the combined value in a variable first, then pass it to `attron()` in a single call. Conditional attributes (e.g., bold only when `life > 0.65`) become a simple `if` before the draw.
+
+**How:** `COLOR_PAIR(n)` returns the pair encoded in the high bits of `attr_t`. `A_BOLD` and other flags occupy separate bit positions. Bitwise OR combines them: `attr_t a = COLOR_PAIR(3) | A_BOLD`. Pass `a` to `attron(a)` and `attroff(a)`. The exact bit layout is internal to ncurses — always use the macros, never hardcode bit values.
+
 ```c
 attr_t attr = COLOR_PAIR(p->hue);
 if (p->life > 0.65f) attr |= A_BOLD;
@@ -421,6 +511,12 @@ Building the attr into a variable before the draw call keeps the rendering code 
 ---
 
 #### V3.7 A_BOLD / A_DIM as Brightness Tiers
+
+**What it is:** Using `A_BOLD` and `A_DIM` not for font weight but as brightness modifiers — a feature of almost all terminal emulators where these flags shift the foreground color lighter or darker.
+
+**What we achieve:** Three visible brightness levels from a single color pair at zero extra cost: `A_DIM` (faded/old), base (normal), `A_BOLD` (bright/hot). This triples the apparent gradient resolution on both 8-color and 256-color terminals.
+
+**How:** Apply `A_BOLD` or `A_DIM` to the `attr_t` based on a simulation property — particle life, distance to leader, heat level, etc. For example: `if (p->life > 0.6) attr |= A_BOLD; else if (p->life < 0.2) attr |= A_DIM;`. The terminal emulator maps `A_BOLD` to a brighter variant of the foreground color and `A_DIM` to a dimmer one. Most terminal emulators honor both flags; `A_DIM` falls back gracefully on those that don't.
 
 On both 8-color and 256-color terminals:
 - `A_BOLD` makes the foreground color brighter (not actually bold font in most terminal emulators).
@@ -440,6 +536,12 @@ This gives three brightness tiers per color pair at zero extra cost — useful f
 ---
 
 #### V3.8 Dynamic Color Update — Cosine Palette (flocking.c)
+
+**What it is:** Calling `init_pair()` during the animation loop — not just at startup — to continuously re-register color pairs with new colors, animating the palette itself rather than just the characters.
+
+**What we achieve:** Flock colors smoothly cycle through the full hue spectrum over time. The boids change color continuously without any change to how they are drawn — only the registered color behind `COLOR_PAIR(n)` changes.
+
+**How:** A cosine formula generates RGB values that sweep through [0,1] smoothly: `r = 0.5 + 0.5*cos(2π*(t/period + phase_r))`. The float is mapped to the xterm-256 6×6×6 cube: `cube_idx = 16 + 36*ri + 6*gi + bi` where each channel is quantized to 0–5. `init_pair(pair_num, cube_idx, COLOR_BLACK)` is called every N frames. ncurses takes effect on the next `doupdate()`. Different RGB phase offsets per flock give each flock a different color trajectory.
 
 `flocking.c` rotates flock colors over time by periodically updating the ncurses color pair registrations:
 
@@ -468,6 +570,12 @@ The xterm-256 color cube occupies indices 16–231: `16 + 36r + 6g + b` where r,
 
 #### V4.1 `mvwaddch` — The Core Write Call
 
+**What it is:** The fundamental ncurses call that writes one character to a specific position in a window. Every visible character in every animation ultimately reaches the screen through this call (or `mvaddch`, its `stdscr` shorthand).
+
+**What we achieve:** Writing a single character at an exact (row, col) position with the current active attribute. Nothing is actually sent to the terminal yet — the character goes into `newscr`, and `doupdate()` later transmits it.
+
+**How:** `mvwaddch(window, row, col, ch)` — note the argument order is `(y, x)`, row before column, the opposite of most graphics APIs. `mvaddch(row, col, ch)` is the shorthand that always targets `stdscr`. The character must be double-cast `(chtype)(unsigned char)ch` to prevent sign-extension bugs (see V4.2). Call `attron()` before and `attroff()` after to control its color and style.
+
 ```c
 mvwaddch(w, row, col, (chtype)(unsigned char)ch);
 ```
@@ -481,6 +589,12 @@ mvwaddch(w, row, col, (chtype)(unsigned char)ch);
 ---
 
 #### V4.2 `(chtype)(unsigned char)` Double Cast
+
+**What it is:** A mandatory two-step type cast applied to every character before passing it to `mvaddch` — `(chtype)(unsigned char)ch` — that prevents two distinct corruption bugs caused by C's implicit integer promotion rules.
+
+**What we achieve:** The character value stays in the range 0–255 and never accidentally activates ncurses attribute flag bits. Without this, high-value ASCII characters (128–255) produce garbage output: wrong colors, wrong characters, or random attribute activation.
+
+**How:** `char` is signed on most platforms. A value like `'\xAF'` (175) has its sign bit set. When it's implicitly widened to `chtype` (an `unsigned long`), C sign-extends it to a large negative-looking value — for example `0xFFFFFFAF`. The upper bytes of `chtype` are ncurses attribute bits, so this accidentally activates whatever attributes those bits represent. The fix: `(unsigned char)ch` first zero-extends the value to 8 bits (0x00...00AF), then `(chtype)` widens it safely. One cast alone is not sufficient.
 
 ```c
 mvwaddch(w, cy, cx, (chtype)(unsigned char)ch);
@@ -499,6 +613,12 @@ This double cast appears throughout the project and prevents two distinct bugs:
 ---
 
 #### V4.3 `wattron` / `wattroff` vs `attron` / `attroff`
+
+**What it is:** Two families of attribute activation calls — `w`-prefixed variants for named `WINDOW*` objects, and plain variants that always target `stdscr`. They do the same thing; the difference is which window's attribute state they modify.
+
+**What we achieve:** Colored and styled characters. Attributes must be activated before each character write and deactivated after — ncurses carries attribute state forward, so a missing `attroff` makes all subsequent characters in the frame inherit the attribute.
+
+**How:** `attron(COLOR_PAIR(n) | A_BOLD)` activates the pair and bold flag on `stdscr`. `wattron(w, ...)` does the same on window `w`. In this project, scene draw functions that accept `WINDOW *w` use the `w`-forms; HUD functions that always write to `stdscr` use the plain forms. Every `attron` must be paired with a matching `attroff` using the same argument — otherwise the attribute leaks into subsequent draws.
 
 ```c
 /* Window-specific (for scene_draw functions that accept WINDOW*) */
@@ -521,6 +641,12 @@ The `w`-prefixed versions apply to any `WINDOW*`; the unprefixed versions always
 ---
 
 #### V4.4 `mvprintw` for HUD Text
+
+**What it is:** The ncurses equivalent of `printf` that also positions the cursor first — it moves to (row, col) and writes formatted text in one call.
+
+**What we achieve:** A fixed HUD overlay — FPS counter, mode name, key hints — positioned at a specific corner of the screen, drawn after all scene content so it always appears on top.
+
+**How:** Format the HUD string into a fixed-size buffer with `snprintf` first (never write directly with format args that could contain user data). Then call `mvprintw(row, col, "%s", buf)` with `attron`/`attroff` brackets. The HUD is always written last in `screen_draw()` so it overwrites any scene character at the same cell position. Right-align to `cols - HUD_COLS` so it adapts to terminal width.
 
 ```c
 char buf[HUD_COLS + 1];
@@ -545,6 +671,12 @@ The HUD always uses:
 ---
 
 #### V4.5 ACS Line-Drawing Characters
+
+**What it is:** A set of ncurses macros (`ACS_ULCORNER`, `ACS_HLINE`, `ACS_VLINE`, etc.) that map to the terminal's own line-drawing character set at runtime — clean box-drawing characters without hardcoding Unicode.
+
+**What we achieve:** Portable, visually clean borders and box outlines. On modern UTF-8 terminals these render as Unicode box-drawing characters (┌ ─ ┐ │ └ ┘). On legacy VT100 terminals they use the alternate character set. Plain ASCII (`+`, `-`, `|`) looks crude by comparison.
+
+**How:** Use `ACS_*` macros directly in `mvaddch` — they expand to the correct terminal-specific `chtype` value. `bonsai.c` builds its message panel border by drawing the four corners, then filling the top and bottom edges with `ACS_HLINE` in a loop, and drawing left/right edges with `ACS_VLINE`. No Unicode literals, no terminal detection needed.
 
 ncurses provides terminal-portable box-drawing characters through the `ACS_*` macros. Used in `bonsai.c` for the message panel box:
 
@@ -575,6 +707,12 @@ Available symbols used here: `ACS_ULCORNER`, `ACS_URCORNER`, `ACS_LLCORNER`, `AC
 
 #### V4.6 Paul Bourke ASCII Density Ramp
 
+**What it is:** A 92-character string where characters are ordered from visually lightest (space, nearly invisible) to visually heaviest (`@`, maximum ink coverage). Mapping a float luminance value to an index in this string gives an ASCII "greyscale pixel."
+
+**What we achieve:** Brightness variation encoded purely through character choice. A fire flame, a 3D lit surface, or a raymarched sphere can show shading and gradients using only ASCII characters — no color required, though color is added on top for richer results.
+
+**How:** Given a luminance `luma ∈ [0.0, 1.0]`, compute `idx = (int)(luma * 91)` and draw `k_bourke[idx]`. The string is ordered so low indices are sparse (light, few pixels lit) and high indices are dense (dark, many pixels lit). Combined with the grey-ramp color pairs, this gives two independent brightness axes: character density and color shade.
+
 ```c
 static const char k_bourke[] =
     " `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
@@ -593,6 +731,12 @@ Together they provide ~700 distinguishable brightness levels in a single termina
 ---
 
 #### V4.7 Directional Characters — Velocity to Glyph
+
+**What it is:** Choosing the character to draw based on the direction of an object's velocity, so the glyph itself points where the object is moving.
+
+**What we achieve:** At a glance you can see which way every boid, arrow, or particle is heading. The simulation state is visible in the character itself, not just its position.
+
+**How:** Compute the heading angle with `atan2(vy, vx)`. Quantize it into octants by dividing by π/4. Look up the corresponding character in a small array. For ncurses, negate `vy` first because row 0 is at the top (y increases downward), opposite to the mathematical convention where y increases upward. Unicode arrow glyphs (`→↗↑…`) are used in `flowfield.c` via `addwstr`; ASCII approximations (`>v<^`) are used in `flocking.c` for portability.
 
 Two files map velocity direction to a glyph that visually indicates the direction of motion:
 
@@ -629,6 +773,12 @@ else                         ch = '|';
 
 #### V4.8 Branch/Slope Characters — Angle to `/`, `\`, `|`, `-`
 
+**What it is:** Selecting the best-fitting ASCII character for each step of a line based on the local slope, so that diagonal, horizontal, and vertical segments look distinct and physically plausible.
+
+**What we achieve:** Lines that look like real objects — wire, a spring coil, tree branches — rather than a sequence of identical characters. A diagonal drawn with all `-` looks wrong; drawn with a mix of `-`, `\`, `/`, and `|` it reads as a physical line.
+
+**How:** During Bresenham line traversal, track the step direction at each cell (step in X only, Y only, or both diagonals). Map each case to a character: X-only → `-`, Y-only → `|`, both with same sign → `\`, both with opposite sign → `/`. The threshold between "mostly horizontal" and "diagonal" is tuned by comparing `abs(dx)` against `abs(dy)/2`.
+
 `spring_pendulum.c` and `bonsai.c` use slope-to-character mapping for drawing lines that look like wire or branches:
 
 ```c
@@ -648,6 +798,12 @@ This makes drawn lines look like physical structures (wire, wood) rather than se
 ### V5 — Visual Effects Techniques
 
 #### V5.1 Draw Order / Z-Ordering — Last Write Wins
+
+**What it is:** The terminal's implicit depth model — there is no z-buffer or alpha blending. When two objects occupy the same cell, whichever one calls `mvaddch` last is what appears.
+
+**What we achieve:** Correct visual layering: background behind foreground, foreground behind HUD. By controlling draw order we control which elements are always visible and which can be hidden behind others.
+
+**How:** Draw everything in order from back to front. Background elements first, physics objects second, HUD last. The HUD written at the end of `screen_draw()` will always overwrite any scene character at the same position. `spring_pendulum.c` documents its 6-layer draw order explicitly: support bar → wire stubs → coil lines → coil nodes (overwrite lines) → bob (overwrite nodes).
 
 ncurses cells are overwritten in place — there is no blending, transparency, or compositing. The last `mvaddch` call to a given (row, col) wins. This is the only form of "depth sorting" available in a terminal.
 
@@ -672,6 +828,12 @@ Convention in this project:
 
 #### V5.2 HUD Always On Top
 
+**What it is:** A draw-order guarantee: the HUD is always written last in the frame, ensuring it overwrites any scene content at the same cell position.
+
+**What we achieve:** The FPS counter, mode display, and key hints remain readable at all times, regardless of what the animation draws in the same screen region.
+
+**How:** In `screen_draw()`, call `scene_draw()` first (fills `newscr` with animation content), then write the HUD text. Since last write wins, the HUD characters are what actually appear. The HUD is placed at row 0 right-aligned, a position that most animations leave mostly empty. `bonsai.c` additionally writes a second HUD row at `rows - 1`.
+
 The HUD (FPS counter, mode display, key hints) must always be readable regardless of what the animation draws. The pattern:
 
 ```c
@@ -695,6 +857,12 @@ Row 0, column `cols - HUD_COLS` is a standard HUD position — top-right corner,
 ---
 
 #### V5.3 Two-Pass Rendering (matrix_rain.c)
+
+**What it is:** Splitting a single frame's draw into two sequential passes that serve different visual purposes — a persistence/fade layer and a motion/interpolation layer — because no single pass can do both correctly.
+
+**What we achieve:** Matrix rain where the fading trail texture decays organically and the leading column head moves with sub-cell smoothness. Neither is possible with a single-pass approach.
+
+**How:** Pass 1 iterates the `grid[row][col]` array — a persistent simulation-level texture that tracks each cell's fade state. Cells that are fading are drawn with their current shade attribute. Pass 2 draws each active column's head character at a float position computed from `head_y + speed * alpha` (render interpolation). The head's row is rounded to the nearest cell but the fractional position drives the interpolation, giving the appearance of motion between cells.
 
 `matrix_rain.c` draws each frame in two distinct passes:
 
@@ -725,6 +893,12 @@ The grid handles the organic "fade to black" tail texture via stochastic `grid_s
 ---
 
 #### V5.4 Stippled Bresenham Lines — Distance Fade (constellation.c)
+
+**What it is:** Drawing only every Nth cell along a Bresenham line, leaving gaps between drawn cells to make the line appear sparser and therefore visually fainter.
+
+**What we achieve:** Three apparent levels of connection strength between stars — bright solid lines for nearby pairs, normal solid lines for mid-range, dotted lines for distant pairs — without any actual opacity or blending support in the terminal.
+
+**How:** Maintain a `step_count` integer during Bresenham traversal. Only call `mvaddch` when `step_count % stipple == 0`. `stipple = 1` draws every cell (solid line); `stipple = 2` draws every other cell (dotted). Combined with `A_BOLD` for close connections and normal for far, this gives six distinct visual states across just two parameters.
 
 `constellation.c` draws connection lines between stars with visual "distance fade" using stippling — drawing only every Nth cell along the Bresenham line:
 
@@ -758,6 +932,12 @@ This gives three visual "bands" of connection strength using only two parameters
 
 #### V5.5 `cell_used[][]` Grid — Preventing Line Overdraw
 
+**What it is:** A per-frame boolean grid that tracks which screen cells have already been claimed by a line this frame, preventing subsequent lines from overwriting them.
+
+**What we achieve:** Clean-looking line intersections. Without this, every Bresenham step overwrites the previous line's character at shared cells, producing a confusing tangle of collision characters at intersection points.
+
+**How:** Declare `bool cell_used[rows][cols]` on the stack (a VLA — `rows` and `cols` are runtime values) and `memset` it to zero at the start of each frame's line drawing. In the Bresenham loop, before calling `mvaddch`, check `if (!cell_used[y][x])`. If the cell is free, draw and set `cell_used[y][x] = true`. If already claimed, skip it. The first line to reach a cell wins — its character is preserved cleanly.
+
 When multiple connection lines pass through the same screen region, they would overwrite each other's characters every Bresenham step, producing a visually noisy "knot" of mixed characters.
 
 `constellation.c` prevents this with a per-frame `bool cell_used[rows][cols]`:
@@ -780,6 +960,12 @@ The array is stack-allocated each frame (VLA — `rows` and `cols` are runtime v
 ---
 
 #### V5.6 Proximity Brightness — `A_BOLD` by Distance (flocking.c)
+
+**What it is:** Using `A_BOLD` as a brightness halo around a flock leader — followers near the leader draw bold (brighter), followers farther away draw normal.
+
+**What we achieve:** A visible "attraction" effect. The leader appears surrounded by a glowing cluster that thins out toward the edges of the flock. This conveys the social structure of the simulation without any additional geometry or color pairs.
+
+**How:** Compute the toroidal shortest-path distance between follower and leader (toroidal because the simulation wraps at screen edges — a follower near the right edge and a leader near the left edge are actually close). Divide by `PERCEPTION_RADIUS` to get a ratio 0–1. If ratio < 0.35, return `A_BOLD`; otherwise `A_NORMAL`. OR this into the attribute before drawing. The toroidal distance calculation is essential — without it, cross-edge proximity produces incorrect dim results.
 
 Followers in the same flock glow brighter when they are near their leader:
 
@@ -805,6 +991,12 @@ The toroidal distance is essential: without it, followers that are physically cl
 
 #### V5.7 Bayer 4×4 Ordered Dithering → ASCII Density
 
+**What it is:** Adding a small, spatially-varying offset to a luminance value before quantizing it to an ASCII character, so that the rounding error at each quantization step forms a regular halftone pattern rather than a flat banding artefact.
+
+**What we achieve:** Smooth apparent gradients across 3D surfaces. Without dithering, a surface that varies from 0.4 to 0.5 luminance would snap to the same ASCII character — appearing as a flat band. With Bayer dithering it shows a fine 4×4 dot pattern that the eye reads as a smooth gradient.
+
+**How:** The Bayer matrix is a fixed 4×4 array of threshold values ranging from 0 to 15/16, arranged so their spatial distribution is maximally even. Before looking up the ASCII character, add `(bayer[py % 4][px % 4] - 0.5) * amplitude` to `luma`, clamp to [0,1], then index the Bourke ramp. The amplitude (0.15 in this project) is tuned: too large gives a noisy dotted look, too small gives banding.
+
 Before mapping luminance to an ASCII character, a position-dependent threshold is added:
 
 ```c
@@ -827,6 +1019,12 @@ The `& 3` (modulo 4) selects the matrix entry by cell position. The dither ampli
 ---
 
 #### V5.8 Floyd-Steinberg Error Diffusion → ASCII (fire.c)
+
+**What it is:** A dithering algorithm that tracks the rounding error from each quantized cell and distributes it to unprocessed neighboring cells using weighted fractions (7/16, 3/16, 5/16, 1/16), spreading the error naturally through the image.
+
+**What we achieve:** Smooth, organic-looking heat gradients without a regular repeating pattern. Flame tongues and heat pools look naturally shaped. The error "flows" along the gradient direction, producing results that feel physically continuous rather than spatially patterned like Bayer dithering.
+
+**How:** Process the heat grid top-to-bottom, left-to-right. For each cell, quantize to the nearest ASCII ramp level, compute the error (original − quantized), and add weighted fractions of that error to the right, lower-left, below, and lower-right neighbors (the classical Floyd-Steinberg 4-neighbor kernel). Work on a copy of the heat array so modifications don't corrupt cells that haven't been processed yet. More expensive than Bayer (requires a working copy), but produces more organic results for flame-shaped data.
 
 `fire.c` and `aafire_port.c` use Floyd-Steinberg error diffusion instead of ordered dithering for smoother heat gradients:
 
@@ -858,6 +1056,12 @@ The 7-3-5-1 weight distribution "spends" rounding error across adjacent cells, p
 
 #### V5.9 Luminance-to-Color Mapping
 
+**What it is:** Using the same luminance value that picks an ASCII character to also pick a color pair from a warm-to-cool sequence, so bright areas appear warm (red/yellow) and shadow areas appear cool (blue/magenta).
+
+**What we achieve:** Approximate real-world light source color temperature with minimal code. A lit 3D surface feels more physically believable when highlights are warm and shadows are cool, even on an ASCII terminal.
+
+**How:** After computing `dithered_luma`, multiply by the number of color pairs and clamp: `cp = clamp(1 + (int)(luma * 6), 1, 7)`. Pairs 1–3 are warm (red, orange, yellow), pairs 4–5 are neutral (green), pairs 6–7 are cool (blue, magenta). High luminance → low pair index (warm); low luminance → high pair index (cool). The same `luma` is separately used to index the Bourke ramp for the character.
+
 Raster files map the computed luminance value to both a character AND a color pair simultaneously, using luminance to select the warm-to-cool color progression:
 
 ```c
@@ -875,6 +1079,12 @@ Color pair mapping: `1`=bright red (warm), `4`=green (neutral), `7`=magenta (coo
 ---
 
 #### V5.10 Scorch Mark Accumulation (brust.c)
+
+**What it is:** A simulation-level persistence array that stores the footprint of past explosions and redraws them every frame as dimmed residue below the live particles.
+
+**What we achieve:** A screen that accumulates a history of all past explosions. Each new burst leaves a faded mark that remains visible through subsequent bursts, creating a sense of continuity and physical consequence.
+
+**How:** On each explosion, append the affected cell positions and characters to a `scorch[]` array. Every frame, before drawing active particles, iterate `scorch[]` and draw each entry with `COLOR_PAIR(C_ORANGE) | A_DIM`. Since `erase()` clears `newscr` each frame, scorch must be actively redrawn every frame — the persistence lives in the simulation array, not in ncurses state. `A_DIM` makes it visibly fainter than the live particles drawn on top.
 
 `brust.c` maintains a persistent `scorch[]` array that survives across burst cycles — past explosions leave marks on the ground:
 
@@ -900,6 +1110,12 @@ wattroff(w, COLOR_PAIR(C_ORANGE) | A_DIM);
 
 #### V6.1 `nodelay` — Non-blocking Input
 
+**What it is:** A mode flag that makes `getch()` return `ERR` immediately when no key is pending, instead of blocking the thread until one arrives.
+
+**What we achieve:** An animation loop that runs continuously at the target frame rate regardless of whether the user is pressing keys. Without this, the loop freezes every frame waiting for input.
+
+**How:** Call `nodelay(stdscr, TRUE)` once in `screen_init()`. In the main loop, call `getch()` and check the return value: `ERR` means no key pending (continue the frame), any other value is a key code. Process the key if needed and move on. Only one key is drained per `getch()` call — if the user presses multiple keys quickly, they queue up and are processed one per frame.
+
 ```c
 nodelay(stdscr, TRUE);
 ```
@@ -921,6 +1137,12 @@ if (ch != ERR && !app_handle_key(app, ch))
 
 #### V6.2 `keypad(stdscr, TRUE)` — Function and Arrow Keys
 
+**What it is:** A mode that makes ncurses intercept multi-byte escape sequences from arrow keys and function keys, delivering them as single integer constants (`KEY_UP`, `KEY_LEFT`, `KEY_F(1)`, etc.) instead of raw escape bytes.
+
+**What we achieve:** Simple, readable key handling. A single `switch(ch)` covers all keys — arrows, function keys, and regular characters — without needing to manually parse multi-byte sequences.
+
+**How:** Arrow keys send `\e[A` (up), `\e[B` (down), etc. to the terminal. Without `keypad(TRUE)`, these arrive as three separate characters. `keypad(stdscr, TRUE)` tells ncurses to watch for these sequences and replace them with the `KEY_*` integer constants before delivering to `getch()`. The same `getch()` call handles both a letter press (`'q'`) and an arrow key (`KEY_UP`).
+
 ```c
 keypad(stdscr, TRUE);
 ```
@@ -936,6 +1158,12 @@ Without this, arrow keys and function keys arrive as multi-character escape sequ
 
 #### V6.3 `typeahead(-1)` — Prevent Mid-flush Poll
 
+**What it is:** A call that disables ncurses' built-in behavior of interrupting its output write to check for pending input mid-flush.
+
+**What we achieve:** Tear-free frame output. The entire diff from `doupdate()` is written to the terminal in one uninterrupted burst. Without this, a busy frame (many cells changed) gets split into multiple partial writes with stdin polls in between, and the terminal shows a visually torn partial frame.
+
+**How:** By default, `typeahead(fd)` tells ncurses to poll `fd` for input during output. `typeahead(-1)` disables the feature entirely — no polling at all during `doupdate()`. Input events are still collected; they're just handled on the next `getch()` call instead of mid-write. No input is lost — only the interrupt timing changes.
+
 ```c
 typeahead(-1);
 ```
@@ -950,6 +1178,12 @@ By default ncurses interrupts its output stream mid-flush to poll stdin for pend
 
 #### V6.4 `noecho()` — Suppress Key Echo
 
+**What it is:** A mode that stops the terminal from automatically printing typed characters to the screen as the user presses keys.
+
+**What we achieve:** A clean animation display. Without `noecho()`, pressing `q` to quit would print the letter `q` into the animation, corrupting it. Every key press would leave a visible character on screen.
+
+**How:** One call at startup: `noecho()`. From that point on, every keystroke goes silently into ncurses' input queue but is not echoed to the display. The program decides what to display — the terminal does not do it automatically.
+
 ```c
 noecho();
 ```
@@ -961,6 +1195,12 @@ Prevents typed characters from appearing in the terminal as the user presses key
 ---
 
 #### V6.5 `curs_set(0)` — Hide the Cursor
+
+**What it is:** A call that hides the terminal cursor for the duration of the program.
+
+**What we achieve:** A distraction-free animation. The terminal cursor is a blinking block that moves to the position of every `mvaddch` call. During a frame, `mvaddch` is called hundreds of times across arbitrary positions — the cursor visibly jumps around the entire screen. Hiding it eliminates this visual noise entirely.
+
+**How:** `curs_set(0)` at startup hides the cursor. `curs_set(1)` would show it again, but that's not needed since `endwin()` on exit restores the terminal to its original cursor state automatically.
 
 ```c
 curs_set(0);
@@ -977,6 +1217,12 @@ Without this, the terminal cursor is left at the position of the last `mvaddch` 
 ### V7 — Signal Handling & Resize
 
 #### V7.1 `SIGWINCH` — Terminal Resize Signal
+
+**What it is:** A POSIX signal sent by the OS to the process whenever the terminal window is resized. Without handling it, the animation continues drawing to the old dimensions after the user resizes.
+
+**What we achieve:** Correct behavior after a resize — the animation adapts to the new terminal dimensions within one frame, reallocating any size-dependent buffers and re-querying rows/cols.
+
+**How:** Install a signal handler that only sets a `volatile sig_atomic_t need_resize = 1` flag — no ncurses calls in the handler since they're not async-signal-safe. In the main loop, check the flag at the top of each iteration. When set, clear it and call `screen_resize()` (the `endwin → refresh → getmaxyx` sequence). Reset `frame_time` and `sim_accum` after resizing to avoid a large `dt` spike from the resize latency.
 
 The OS sends `SIGWINCH` when the terminal emulator window is resized. The project handles it with the flag pattern:
 
@@ -1003,6 +1249,12 @@ The actual resize work (`endwin → refresh → getmaxyx → scene_reinit`) happ
 
 #### V7.2 `volatile sig_atomic_t` — Signal-safe Flags
 
+**What it is:** The only C type the standard guarantees can be safely written by a signal handler and read by the main thread without a data race or missed update.
+
+**What we achieve:** Signal handlers that correctly communicate with the main loop. Without `volatile`, the compiler may cache `running` in a register and the main loop never sees the update. Without `sig_atomic_t`, the read/write might be non-atomic on some architectures, producing torn values.
+
+**How:** Declare both `running` and `need_resize` as `volatile sig_atomic_t` in the `App` struct. The `volatile` keyword forces every read to go to memory — the optimizer cannot keep a cached copy in a register. `sig_atomic_t` guarantees atomic read/write from a signal handler context. In practice this is almost always `int`, but relying on that would be undefined behavior.
+
 ```c
 typedef struct {
     /* ... */
@@ -1020,6 +1272,12 @@ typedef struct {
 ---
 
 #### V7.3 `endwin() → refresh() → getmaxyx()` Resize Sequence
+
+**What it is:** The three-step sequence required to make ncurses pick up new terminal dimensions after a resize event. Each step is necessary; skipping any one causes the dimensions to remain stale.
+
+**What we achieve:** After the user resizes the terminal, `rows` and `cols` reflect the actual new size within one frame. The animation then reallocates size-dependent buffers and draws correctly in the new dimensions.
+
+**How:** `endwin()` puts the terminal back into normal (non-ncurses) mode, allowing the OS to update the tty's internal window size struct. `refresh()` re-enters ncurses mode, during which ncurses queries the OS for the current terminal size and updates its internal `LINES`/`COLS`. Only after this call does `getmaxyx(stdscr, rows, cols)` return the new values. Without `endwin() + refresh()`, `LINES` and `COLS` retain the pre-resize values indefinitely.
 
 ```c
 static void screen_resize(Screen *s)
@@ -1039,6 +1297,12 @@ Without `endwin() + refresh()`, the stored `rows/cols` never update and the anim
 ---
 
 #### V7.4 `atexit(cleanup)` — Guaranteed Terminal Restore
+
+**What it is:** Registering a cleanup function with the C runtime so it fires automatically on every normal exit path, guaranteeing `endwin()` is always called.
+
+**What we achieve:** The shell is never left in a broken state after the animation exits. Without this, a crash or an `exit()` from deep inside the code would leave the terminal in raw/noecho mode — the shell prompt wouldn't echo input and `Ctrl+C` wouldn't work.
+
+**How:** `atexit(cleanup)` registers a function pointer. The C runtime calls all registered `atexit` functions in reverse-registration order when `exit()` is called or when `main()` returns. Signal handlers set `running = 0` and let the main loop fall through `main()` normally, which triggers `atexit`. The three-line combination — `atexit` + `SIGINT` handler + `SIGTERM` handler — covers all realistic exit scenarios. `SIGKILL` cannot be caught, but terminal emulators reset the tty when the child process dies anyway.
 
 ```c
 static void cleanup(void) { endwin(); }
@@ -1068,6 +1332,12 @@ The three-line combination (`atexit` + `SIGINT` + `SIGTERM`) means `endwin()` ru
 
 #### V8.1 Sleep Before Render — Stable Frame Cap
 
+**What it is:** Placing the frame-rate sleep budget at the beginning of the frame's I/O phase, before `doupdate()`, so that unpredictable terminal write time cannot destabilize the frame cap.
+
+**What we achieve:** A stable 60fps cap regardless of how many cells changed this frame or how fast the terminal can process escape codes. The sleep absorbs any per-frame jitter from physics computation; terminal write runs in whatever time remains.
+
+**How:** Measure `elapsed` = time spent on physics this tick. Sleep `16ms − elapsed` before any terminal I/O. Then call `screen_draw()` and `doupdate()`. Since the sleep is done, the terminal write runs without time pressure. If `doupdate()` takes 5ms on a busy frame, the next physics tick starts slightly late — but the cap remains stable because the sleep already happened. The naive opposite (sleep after `doupdate()`) must budget for `doupdate()` time, which varies per frame and produces erratic fps.
+
 ```c
 /* CORRECT ORDER in the main loop */
 
@@ -1093,6 +1363,12 @@ By sleeping first (measuring only physics computation), the terminal write is "f
 
 #### V8.2 `getmaxyx` vs `LINES`/`COLS`
 
+**What it is:** Two ways to read the terminal dimensions after `refresh()` — `getmaxyx(stdscr, rows, cols)` reads from the window struct directly; `LINES` and `COLS` are global variables that ncurses updates.
+
+**What we achieve:** Accurate terminal dimensions at any time. Both give the same values for `stdscr` after a resize cycle, but `getmaxyx` is preferred because it explicitly names the window being queried and is portable if sub-windows are ever added.
+
+**How:** After calling `endwin() + refresh()` during a resize, both `LINES`/`COLS` and `getmaxyx` will reflect the new size. In `tst_lines_cols.c` the globals are used for simplicity; all animation files use `getmaxyx` for clarity of intent.
+
 ```c
 /* Preferred — window's actual current dimensions */
 getmaxyx(stdscr, s->rows, s->cols);
@@ -1115,6 +1391,12 @@ Both are equivalent for `stdscr` after `refresh()`. This project always uses `ge
 
 #### V8.3 `CLOCK_MONOTONIC` — No NTP Jumps
 
+**What it is:** A hardware-based clock that only moves forward and is completely unaffected by system clock adjustments (NTP sync, `date` command, timezone changes).
+
+**What we achieve:** Stable `dt` values every frame. Physics simulations compute `dt = now − last_frame`. If the system clock jumps forward or back (NTP sync mid-animation, manual clock set), `dt` becomes huge and the simulation explodes — particles fly off screen, springs go infinite. `CLOCK_MONOTONIC` makes this impossible.
+
+**How:** Use `clock_gettime(CLOCK_MONOTONIC, &t)` instead of `CLOCK_REALTIME` for all timing. Add a `dt` cap (`if (dt > 100ms) dt = 100ms`) as a second defense against the one case `CLOCK_MONOTONIC` cannot help with: the process being suspended by the OS (debugger, `SIGSTOP`, sleep) and resumed.
+
 ```c
 static int64_t clock_ns(void)
 {
@@ -1133,6 +1415,12 @@ The `dt` cap (`if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS`) handles the one 
 ---
 
 #### V8.4 Common ncurses Bugs and How This Project Avoids Them
+
+**What it is:** A consolidated reference of the bugs you will reliably encounter when writing ncurses animations from scratch — each one a real failure mode that has been deliberately addressed by a specific technique in this project.
+
+**What we achieve:** By recognizing each bug pattern, you can diagnose display corruption, freezes, and terminal corruption quickly and apply the corresponding fix rather than debugging the symptom.
+
+**How:** Each row maps a visible symptom to its root cause and the specific technique this project uses to prevent it. Use this table as a diagnostic starting point when something looks wrong.
 
 | Bug | Cause | Fix Applied |
 |---|---|---|

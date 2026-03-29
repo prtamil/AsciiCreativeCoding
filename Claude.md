@@ -22,7 +22,9 @@ gcc -std=c11 -O2 -Wall -Wextra particle_systems/fireworks.c    -o fireworks     
 gcc -std=c11 -O2 -Wall -Wextra particle_systems/brust.c        -o brust         -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra particle_systems/kaboom.c       -o kaboom        -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra particle_systems/constellation.c -o constellation -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra particle_systems/flocking.c     -o flocking      -lncurses -lm
+
+# ── flocking ─────────────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra flocking/flocking.c             -o flocking      -lncurses -lm
 
 # ── fluid / grid sims ────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fluid/sand.c       -o sand      -lncurses -lm
@@ -65,7 +67,9 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  
 - `brust.c`             — random explosion bursts: staggered particle waves, scorch mark persistence, `A_DIM` residue rendering
 - `kaboom.c`            — deterministic LCG explosions: same seed → same explosion shape, color-ring blast zones
 - `constellation.c`     — star constellation: Bresenham stippled lines with `cell_used[][]` dedup, proximity `A_BOLD`, `prev/cur` lerp interpolation
-- `flocking.c`          — boid flocking: 5 algorithms (classic boids, leader chase, Vicsek, orbit, predator-prey), toroidal wrap, cosine palette color cycling, `A_BOLD` proximity halo
+
+### flocking/
+- `flocking.c`          — boid flocking: 3 flock groups, 5 switchable modes (classic boids, leader chase, Vicsek, orbit, predator-prey), toroidal wrap, cosine palette color cycling, `A_BOLD` proximity halo
 
 ### fluid/
 - `sand.c`              — falling sand CA: gravity + diagonal fallback + wind drift, Fisher-Yates column shuffle, per-grain age coloring
@@ -154,3 +158,14 @@ tessellate_*()  →  scene_tick()  →  pipeline_draw_mesh()  →  fb_blit()
 - `sig_atomic_t` for all signal-written flags
 - `(chtype)(unsigned char)ch` double cast on every `mvaddch` — prevents sign-extension corruption
 - C11, `-Wall -Wextra` clean
+
+---
+
+## Documentation
+
+| File | Contents |
+|---|---|
+| `documentation/Architecture.md` | Framework design, loop mechanics, coordinate model, per-subsystem deep dives |
+| `documentation/Master.md` | Long-form essays on algorithms, physics, and visual techniques |
+| `documentation/Visual.md` | ncurses field guide — V1–V9 covering every ncurses technique (What/Why/How + code); V9 per-file reference; Quick-Reference Matrix; Technique Index |
+| `documentation/COLOR.md` | 17 color tricks across all C files — mechanism, exact code pattern, visual effect |

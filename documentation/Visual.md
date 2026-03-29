@@ -12,6 +12,7 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [V1.2 `endwin()` and `atexit` Cleanup](#v12-endwin-and-atexit-cleanup)
 - [V1.3 `use_default_colors()` — Transparent Background](#v13-use_default_colors--transparent-background)
 - [V1.4 `cbreak()` vs `raw()`](#v14-cbreak-vs-raw)
+- [V1.5 Monochrome Mode — Omitting `start_color()`](#v15-monochrome-mode--omitting-start_color)
 
 ### V2 — Double Buffer Mechanics
 - [V2.1 `curscr` / `newscr` — The Built-in Buffer Pair](#v21-curscr--newscr--the-built-in-buffer-pair)
@@ -19,6 +20,7 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [V2.3 `wnoutrefresh` + `doupdate` — The Two-Phase Flush](#v23-wnoutrefresh--doupdate--the-two-phase-flush)
 - [V2.4 Why Manual Front/Back Windows Break the Diff Engine](#v24-why-manual-frontback-windows-break-the-diff-engine)
 - [V2.5 Framebuffer-to-ncurses: `cbuf` → `fb_blit()`](#v25-framebuffer-to-ncurses-cbuf--fb_blit)
+- [V2.6 Diff-based Selective Clearing — No `erase()`](#v26-diff-based-selective-clearing--no-erase)
 
 ### V3 — Color System
 - [V3.1 Color Pairs — `init_pair` / `COLOR_PAIR`](#v31-color-pairs--init_pair--color_pair)
@@ -29,6 +31,10 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [V3.6 `attr_t` — Combining Pair and Attribute Flags](#v36-attr_t--combining-pair-and-attribute-flags)
 - [V3.7 A_BOLD / A_DIM as Brightness Tiers](#v37-a_bold--a_dim-as-brightness-tiers)
 - [V3.8 Dynamic Color Update — Cosine Palette (flocking.c)](#v38-dynamic-color-update--cosine-palette-flockingc)
+- [V3.9 Shade Enum → Composite `attr_t` Gradient](#v39-shade-enum--composite-attr_t-gradient)
+- [V3.10 Encapsulated Theme Struct](#v310-encapsulated-theme-struct)
+- [V3.11 Life-gated `A_BOLD` / `A_DIM`](#v311-life-gated-a_bold--a_dim)
+- [V3.12 Role-named Color IDs](#v312-role-named-color-ids)
 
 ### V4 — Character Output
 - [V4.1 `mvwaddch` — The Core Write Call](#v41-mvwaddch--the-core-write-call)
@@ -39,6 +45,7 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [V4.6 Paul Bourke ASCII Density Ramp](#v46-paul-bourke-ascii-density-ramp)
 - [V4.7 Directional Characters — Velocity to Glyph](#v47-directional-characters--velocity-to-glyph)
 - [V4.8 Branch/Slope Characters — Angle to `/`, `\`, `|`, `-`](#v48-branchslope-characters--angle-to----)
+- [V4.9 Unicode Multi-byte Glyphs via `addwstr`](#v49-unicode-multi-byte-glyphs-via-addwstr)
 
 ### V5 — Visual Effects Techniques
 - [V5.1 Draw Order / Z-Ordering — Last Write Wins](#v51-draw-order--z-ordering--last-write-wins)
@@ -51,6 +58,12 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [V5.8 Floyd-Steinberg Error Diffusion → ASCII (fire.c)](#v58-floyd-steinberg-error-diffusion--ascii-firec)
 - [V5.9 Luminance-to-Color Mapping](#v59-luminance-to-color-mapping)
 - [V5.10 Scorch Mark Accumulation (brust.c)](#v510-scorch-mark-accumulation-brustc)
+- [V5.11 Flash Cross-pattern — Instant Impact Indicator](#v511-flash-cross-pattern--instant-impact-indicator)
+- [V5.12 Z-depth → Character + Color Selection](#v512-z-depth--character--color-selection)
+- [V5.13 Dual-factor Visual Function](#v513-dual-factor-visual-function)
+- [V5.14 Ring-buffer Trail Coloring](#v514-ring-buffer-trail-coloring)
+- [V5.15 `luma_to_cell` — Dither + Ramp + Color in One Call](#v515-luma_to_cell--dither--ramp--color-in-one-call)
+- [V5.16 Depth Sort — Painter's Algorithm](#v516-depth-sort--painters-algorithm)
 
 ### V6 — Input Handling
 - [V6.1 `nodelay` — Non-blocking Input](#v61-nodelay--non-blocking-input)
@@ -70,6 +83,36 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [V8.2 `getmaxyx` vs `LINES`/`COLS`](#v82-getmaxyx-vs-linescols)
 - [V8.3 `CLOCK_MONOTONIC` — No NTP Jumps](#v83-clock_monotonic--no-ntp-jumps)
 - [V8.4 Common ncurses Bugs and How This Project Avoids Them](#v84-common-ncurses-bugs-and-how-this-project-avoids-them)
+
+### V9 — Per-File Technique Reference
+- [tst_lines_cols.c](#tst_lines_colsc)
+- [aspect_ratio.c](#aspect_ratioc)
+- [bounce_ball.c](#bounce_ballc)
+- [spring_pendulum.c](#spring_pendulumc)
+- [matrix_rain.c](#matrix_rainc)
+- [fire.c](#firec)
+- [aafire_port.c](#aafire_portc)
+- [fireworks.c](#fireworksc)
+- [brust.c](#brustc)
+- [kaboom.c](#kaboomc)
+- [constellation.c](#constellationc)
+- [flocking.c](#flockingc)
+- [sand.c](#sandc)
+- [flowfield.c](#flowfieldc)
+- [torus_raster.c](#torus_rasterc)
+- [cube_raster.c](#cube_rasterc)
+- [sphere_raster.c](#sphere_rasterc)
+- [displace_raster.c](#displace_rasterc)
+- [donut.c](#donutc)
+- [wireframe.c](#wireframec)
+- [raymarcher.c](#raymarcherc)
+- [raymarcher_cube.c](#raymarcher_cubec)
+- [raymarcher_primitives.c](#raymarcher_primitivesc)
+- [bonsai.c](#bonsaic)
+
+### Reference Tables
+- [Quick-Reference Matrix](#quick-reference-matrix)
+- [Technique Index](#technique-index)
 
 ---
 
@@ -184,6 +227,32 @@ Both modes deliver keypresses immediately without waiting for Enter. The differe
 All animation files use `cbreak()` — they want `Ctrl+C` to trigger `SIGINT → on_exit_signal → running=0` for a clean exit. The `aspect_ratio.c` basic example uses `raw()` instead (no signal handling needed there).
 
 *Files: `cbreak()` in all animation files; `raw()` in `aspect_ratio.c`*
+
+---
+
+#### V1.5 Monochrome Mode — Omitting `start_color()`
+
+**What it is:** Running ncurses without calling `start_color()` at all, producing a program that uses only the default terminal foreground and background.
+
+**What we achieve:** The absolute minimal render setup — no color registration, no pair management, no attribute logic. Every `mvaddch` writes in the terminal's default color.
+
+**How:** Simply omit `start_color()` from the init sequence. `COLOR_PAIR`, `init_pair`, `attron` with color attributes — none of these are called. `wireframe.c` uses this: its entire visual effect comes from choosing the right slope character (`/`, `\`, `-`, `|`) per Bresenham step. No color adds anything to that effect, so it's cleanly absent.
+
+```c
+/* wireframe.c init — no start_color(), no color pairs */
+initscr();
+noecho();
+cbreak();
+curs_set(0);
+nodelay(stdscr, TRUE);
+keypad(stdscr, TRUE);
+typeahead(-1);
+/* start_color() deliberately omitted */
+```
+
+**When to use:** Any animation whose effect is entirely shape/character-based and gains nothing from color. Forces simplicity.
+
+*Files: `wireframe.c`*
 
 ---
 
@@ -330,6 +399,31 @@ static void fb_blit(const Framebuffer *fb)
 - The pipeline stays pure C arithmetic; ncurses state changes are batched and localized.
 
 *Files: all raster files (`torus_raster.c`, `cube_raster.c`, `sphere_raster.c`, `displace_raster.c`)*
+
+---
+
+#### V2.6 Diff-based Selective Clearing — No `erase()`
+
+**What it is:** An alternative to `erase()` that clears only the cells that were non-empty last frame and are now empty — rather than wiping the entire screen buffer unconditionally.
+
+**What we achieve:** Minimum terminal write volume. For sparse animations (fire that covers ~30% of the screen), a full `erase()` marks every cell as changed even if 70% of them were already empty. Selective clearing writes only the cells that actually transitioned from visible to empty.
+
+**How:** Maintain a `prev[rows*cols]` snapshot copied from the heat buffer each frame. At the start of each frame, for every cell where `prev[i] > 0` and the new value is `0`, call `mvaddch(y, x, ' ')` to explicitly blank that cell. Draw all non-zero cells normally. After drawing, `memcpy(prev, bmap, ...)` snapshots the new state for next frame.
+
+```c
+/* aafire_port.c — diff-based clear instead of erase() */
+for (int i = 0; i < rows * cols; i++) {
+    if (prev[i] > 0 && bmap[i] == 0) {
+        mvaddch(i / cols, i % cols, ' ');   /* blank only changed-to-empty cells */
+    }
+}
+/* draw non-zero cells normally, then: */
+memcpy(prev, bmap, (size_t)(rows * cols) * sizeof *bmap);
+```
+
+**Trade-off:** More bookkeeping (one extra buffer, one extra loop) in exchange for fewer escape codes sent per frame. Worth it when the animation covers a small fraction of the terminal. Not worth it for animations that fill the whole screen every frame.
+
+*Files: `aafire_port.c`*
 
 ---
 
@@ -566,6 +660,132 @@ The xterm-256 color cube occupies indices 16–231: `16 + 36r + 6g + b` where r,
 
 ---
 
+#### V3.9 Shade Enum → Composite `attr_t` Gradient
+
+**What it is:** Mapping a small enum of named brightness levels to a combined `attr_t` value in a single lookup function, so draw code uses readable level names instead of raw attribute arithmetic.
+
+**What we achieve:** A multi-level brightness gradient (e.g. six distinct visual intensities) with clean, readable draw code. The entire gradient is defined in one place; draw code just calls `shade_attr(level)`.
+
+**How:** Define an enum with named levels (`FADE`, `DARK`, `MID`, `BRIGHT`, `HOT`, `HEAD`). Write `shade_attr(Shade s)` that returns the appropriate `COLOR_PAIR(n) | attr_flag`. The function handles the A_DIM/base/A_BOLD split internally. In the render loop, just call `shade_attr(grid[r][c])` — no attribute arithmetic at the call site.
+
+```c
+/* matrix_rain.c */
+typedef enum { SHADE_FADE, SHADE_DARK, SHADE_MID,
+               SHADE_BRIGHT, SHADE_HOT, SHADE_HEAD } Shade;
+
+static attr_t shade_attr(Shade s) {
+    switch (s) {
+        case SHADE_FADE:   return COLOR_PAIR(1) | A_DIM;
+        case SHADE_DARK:   return COLOR_PAIR(2);
+        case SHADE_MID:    return COLOR_PAIR(3);
+        case SHADE_BRIGHT: return COLOR_PAIR(4) | A_BOLD;
+        case SHADE_HOT:    return COLOR_PAIR(5) | A_BOLD;
+        case SHADE_HEAD:   return COLOR_PAIR(6) | A_BOLD;
+    }
+    return COLOR_PAIR(1);
+}
+```
+
+**How to apply:** Use when you have 4+ brightness levels and want the draw code to stay readable. One enum change updates the entire gradient.
+
+*Files: `matrix_rain.c`*
+
+---
+
+#### V3.10 Encapsulated Theme Struct
+
+**What it is:** Bundling all color indices and attributes for one visual style into a struct, so switching themes is a single pointer swap rather than scattered `init_pair` calls throughout the code.
+
+**What we achieve:** Clean theme switching — six fire palettes (fire, ice, plasma, nova, poison, gold) each with 9 ramp levels, all switchable at runtime with no draw-code changes. New themes are added by adding a struct literal; nothing else changes.
+
+**How:** Define a struct with arrays for every per-level property. Write a `theme_apply(idx)` function that iterates the struct and calls `init_pair()` for each level. Draw code references pair numbers that never change — only the colors behind them change.
+
+```c
+/* fire.c */
+typedef struct {
+    int fg256[RAMP_N];   /* xterm-256 index per ramp level */
+    int fg8[RAMP_N];     /* 8-color fallback per level */
+    int attr8[RAMP_N];   /* A_DIM/0/A_BOLD per level for 8-color */
+} FireTheme;
+
+static const FireTheme k_themes[6] = {
+    { {232,52,88,124,160,196,202,214,231}, ... },  /* fire  */
+    { {232,17,19,21,27,33,51,123,231},     ... },  /* ice   */
+    /* ... */
+};
+
+static void theme_apply(int t) {
+    const FireTheme *th = &k_themes[t];
+    for (int i = 0; i < RAMP_N; i++)
+        init_pair(CP_BASE + i, th->fg256[i], COLOR_BLACK);
+}
+```
+
+**How to apply:** Any animation with multiple color palettes. Keep all palette data in the struct; keep all pair numbers as constants; only `theme_apply()` touches `init_pair()`.
+
+*Files: `fire.c`, `aafire_port.c`*
+
+---
+
+#### V3.11 Life-gated `A_BOLD` / `A_DIM`
+
+**What it is:** Driving a particle's brightness attribute directly from its remaining lifetime — bold when freshly spawned, normal in mid-life, dim as it approaches death.
+
+**What we achieve:** Particles that visually "burn out" — they flare brightly at spawn, settle to normal brightness, then fade to a dim ember before disappearing. Three apparent brightness states from one color pair, zero extra pairs.
+
+**How:** Evaluate the particle's `life` float (1.0 = fresh, 0.0 = dead) against two thresholds before the draw call. OR the appropriate flag into the pair attribute.
+
+```c
+/* fireworks.c — two-threshold full lifecycle */
+attr_t attr = COLOR_PAIR(p->color);
+if      (p->life > 0.6f) attr |= A_BOLD;
+else if (p->life < 0.2f) attr |= A_DIM;
+/* between 0.2 and 0.6: base brightness */
+attron(attr);
+mvaddch(py, px, (chtype)(unsigned char)p->ch);
+attroff(attr);
+
+/* brust.c — single-threshold simpler lifecycle */
+attr_t attr = COLOR_PAIR(p->color);
+if (p->life > 0.65f) attr |= A_BOLD;
+/* dead particles handled by scorch[] system with A_DIM separately */
+```
+
+**How to apply:** Use two thresholds for a smooth three-stage lifecycle (fireworks). Use one threshold when the "dead" stage is handled by a separate system (brust.c scorch marks). The scorch system draws dead footprints with `A_DIM` independently, so the live particles don't need the low-life dim stage.
+
+*Files: `fireworks.c`, `brust.c`*
+
+---
+
+#### V3.12 Role-named Color IDs
+
+**What it is:** Defining color pair identifiers by their semantic role in the scene rather than by number — `COL_BLOB_FAR`, `COL_BLOB_NEAR`, `COL_FLASH`, `COL_HUD` instead of `COLOR_PAIR(1)` through `COLOR_PAIR(6)`.
+
+**What we achieve:** Draw code that reads like a description of the scene. `attron(COLOR_PAIR(COL_FLASH))` tells you what is being drawn; `attron(COLOR_PAIR(4))` does not. Adding a new role is an enum addition; renumbering pairs never breaks draw code.
+
+**How:** Define an enum of role names. Map each role to a pair number in `color_init()`. Use the enum constants everywhere in draw code. Never use raw pair numbers after initialization.
+
+```c
+/* kaboom.c */
+typedef enum {
+    COL_BLOB_F = 1,  /* far blob — faded    */
+    COL_BLOB_M,      /* mid blob            */
+    COL_BLOB_N,      /* near blob — intense */
+    COL_FLASH,       /* initial flash       */
+    COL_RING,        /* wave rings          */
+    COL_HUD,         /* HUD — always yellow */
+} ColorID;
+
+/* color_init() — HUD pair registered unconditionally outside theme block */
+init_pair(COL_HUD, 226, COLOR_BLACK);   /* yellow, never changes with theme */
+```
+
+**How to apply:** Especially valuable in files with multiple rendering layers (flash, waves, blob, HUD) that each need distinct visual treatment. The HUD-always-one-color pattern (registered outside the theme block) is a direct consequence: the HUD pair is excluded from theme cycling so it stays readable regardless of blast color.
+
+*Files: `kaboom.c`*
+
+---
+
 ### V4 — Character Output
 
 #### V4.1 `mvwaddch` — The Core Write Call
@@ -792,6 +1012,29 @@ else                              ch = '/';    /* negative slope    */
 This makes drawn lines look like physical structures (wire, wood) rather than sequences of a single character. The threshold ratios (here `abs(dx) < abs(dy)/2`) determine the angular range where each character is preferred — widening the threshold makes the diagonal characters appear more, narrowing it makes `|` and `-` dominate.
 
 *Files: `spring_pendulum.c`, `bonsai.c`, `wireframe.c`*
+
+---
+
+#### V4.9 Unicode Multi-byte Glyphs via `addwstr`
+
+**What it is:** Writing multi-byte UTF-8 characters (Unicode arrows, box glyphs, etc.) to the terminal by using `addwstr`/`mvaddwstr` instead of `mvaddch`, which only handles single-byte characters.
+
+**What we achieve:** Visually precise direction indicators — `→ ↗ ↑ ↖ ← ↙ ↓ ↘` genuinely point the way particles are flowing. ASCII approximations (`> ^ < v`) work but look cruder.
+
+**How:** Store direction strings as `const wchar_t *dirs[8]`. Move to position with `move(y, x)` then call `addwstr(dirs[octant])`. The terminal must be in a UTF-8 locale for multi-byte sequences to render correctly — `setlocale(LC_ALL, "")` at program start enables this. `mvadd_wch` or `mvaddwstr` handle the sequence without manual byte splitting.
+
+```c
+/* flowfield.c */
+static const char *k_dirs[8] = { "→","↗","↑","↖","←","↙","↓","↘" };
+
+int octant = (int)((atan2f(-vy, vx) + (float)M_PI) / ((float)M_PI / 4.0f)) % 8;
+move(draw_row, draw_col);
+addstr(k_dirs[octant]);   /* addstr handles UTF-8 byte sequences */
+```
+
+**How to apply:** Use when the direction itself is the primary visual information (flow fields, vector visualizations). Fall back to ASCII arrow chars (`>v<^`) if the terminal locale is uncertain or for simpler needs (flocking.c uses ASCII per-flock char sets for portability).
+
+*Files: `flowfield.c`*
 
 ---
 
@@ -1103,6 +1346,179 @@ wattroff(w, COLOR_PAIR(C_ORANGE) | A_DIM);
 `A_DIM` makes the scorch appear faded relative to active particles. New scorch entries are added on each explosion; old ones persist. This creates visual continuity between bursts — the screen accumulates a history of all past explosions without requiring image compositing.
 
 *Files: `brust.c`*
+
+---
+
+#### V5.11 Flash Cross-pattern — Instant Impact Indicator
+
+**What it is:** Drawing a `'*'` at an explosion center and `'+'` at the four cardinal neighbors simultaneously — five cells that form a cross shape — all in one bold color. The pattern lasts exactly one frame.
+
+**What we achieve:** An unambiguous "hit here" signal that the eye catches instantly. One cross drawn with `A_BOLD` is more legible than a single character and creates the feeling of a physical impact without any particle simulation at the moment of detonation.
+
+**How:** Draw the center first, then four offset writes. No loop needed — five `mvwaddch` calls. Apply once at the exact tick the explosion triggers, not in subsequent ticks.
+
+```c
+/* brust.c — flash cross drawn at explosion tick only */
+wattron(w, COLOR_PAIR(C_YELLOW) | A_BOLD);
+mvwaddch(w, cy,   cx,   '*');   /* center */
+mvwaddch(w, cy-1, cx,   '+');   /* north  */
+mvwaddch(w, cy+1, cx,   '+');   /* south  */
+mvwaddch(w, cy,   cx-1, '+');   /* west   */
+mvwaddch(w, cy,   cx+1, '+');   /* east   */
+wattroff(w, COLOR_PAIR(C_YELLOW) | A_BOLD);
+```
+
+**How to apply:** Any explosion or impact event. Combine with a particle burst for full effect: cross on frame 0, particles from frame 1 onward.
+
+*Files: `brust.c`*
+
+---
+
+#### V5.12 Z-depth → Character + Color Selection
+
+**What it is:** Using a 3D point's projected depth value to simultaneously select both the ASCII character (sparse for far, dense for near) and the color pair (faded for far, intense for near), giving a single-pass depth-shading effect with no z-buffer.
+
+**What we achieve:** A particle blob that reads as three-dimensional — distant elements look dotted and dim, close elements look heavy and bright. No depth sorting or z-buffer is needed because each element independently encodes its own depth.
+
+**How:** Compute `bz` (the z-coordinate in projected space). Compare against two percentage thresholds of the perspective distance `persp`. Use a three-way branch to pick char and pair.
+
+```c
+/* kaboom.c — 3D blob element rendering */
+float bz = blob_z_at(angle, radius);
+char ch; int col;
+if      (bz > persp * 0.8f) { ch = '.'; col = COL_BLOB_F; }  /* far   */
+else if (bz > persp * 0.2f) { ch = 'o'; col = COL_BLOB_M; }  /* mid   */
+else                         { ch = '@'; col = COL_BLOB_N; }  /* near  */
+```
+
+**How to apply:** Works for any particle system where elements span a z-range. The character ramp (`.` → `o` → `@`) leverages Bourke density intuition: sparse dots for distant, heavy symbols for close. Adjust the 0.8/0.2 thresholds to control how quickly depth is expressed.
+
+*Files: `kaboom.c`*
+
+---
+
+#### V5.13 Dual-factor Visual Function
+
+**What it is:** A single function that takes two orthogonal simulation properties (age AND neighbor count) and writes both the display character AND the attribute through output pointers — encoding two independent dimensions of information in one character cell.
+
+**What we achieve:** A grain of sand that simultaneously communicates how old it is (via character) and how compacted it is (via brightness). No other code in the draw path handles the mapping; it is centralized and easy to tune.
+
+**How:** The function accepts two inputs and two output pointers. Character selection uses one input; attribute selection uses the other. The call site is minimal — just pass both simulation values and receive the render spec.
+
+```c
+/* sand.c */
+static void grain_visual(int age, int neighbor_count,
+                          char *ch_out, attr_t *attr_out) {
+    /* age controls character density: sparse when young, dense when settled */
+    static const char k_levels[] = "`" ".oO0#";
+    int ci = age < (int)(sizeof k_levels - 1) ? age : (int)(sizeof k_levels - 2);
+    *ch_out  = k_levels[ci];
+    /* neighbor_count controls brightness: isolated = bold, packed = normal */
+    *attr_out = COLOR_PAIR(CP_GRAIN) | (neighbor_count < 2 ? A_BOLD : 0);
+}
+
+/* call site: */
+char ch; attr_t attr;
+grain_visual(g->age, g->neighbors, &ch, &attr);
+attron(attr);
+mvaddch(g->row, g->col, (chtype)(unsigned char)ch);
+attroff(attr);
+```
+
+**How to apply:** Use whenever a simulation object has two independent visual dimensions worth encoding. Centralizing both mappings in one function means changing the visual representation requires touching only one place.
+
+*Files: `sand.c`*
+
+---
+
+#### V5.14 Ring-buffer Trail Coloring
+
+**What it is:** Storing a particle's last N positions in a ring buffer, then iterating from newest to oldest during draw — assigning progressively higher (dimmer) pair indices to older positions.
+
+**What we achieve:** Trails that visually fade from bright (recent) to dim (old), encoding the particle's recent history as a color gradient behind it. The ring buffer ensures constant O(1) memory and O(N) draw per particle regardless of trail length.
+
+**How:** Each particle keeps a `trail[]` array with a `head` index. Each tick, advance `head` and overwrite the oldest entry. In draw, iterate `i` from 0 to trail_length−1: position at `(head - i + N) % N` gets pair `1 + i` (lower index = newer = brighter).
+
+```c
+/* flowfield.c */
+for (int i = 0; i < TRAIL_LEN; i++) {
+    int ti = (p->head - i + TRAIL_LEN) % TRAIL_LEN;
+    if (!p->trail_active[ti]) continue;
+    attron(COLOR_PAIR(1 + i));   /* 1=newest/brightest, TRAIL_LEN=oldest/dimmest */
+    mvaddch(p->trail[ti].row, p->trail[ti].col, '.');
+    attroff(COLOR_PAIR(1 + i));
+}
+```
+
+**How to apply:** Allocate N color pairs where pair 1 is the brightest and pair N is the dimmest (or use `A_DIM` for the oldest). Register them once at init. The ring buffer ensures the draw cost is exactly N calls per particle regardless of how long the trail has been running.
+
+*Files: `flowfield.c`*
+
+---
+
+#### V5.15 `luma_to_cell` — Dither + Ramp + Color in One Call
+
+**What it is:** A single function that converts a float luminance value into a complete `Cell {ch, color_pair, bold}` struct by chaining Bayer dithering → Bourke ramp lookup → warm-to-cool pair selection in sequence.
+
+**What we achieve:** All luminance-to-display-output logic in one function. Every place in the pipeline that needs to convert a shading result to a drawable cell calls the same function — consistent, testable, easy to tune.
+
+**How:** Apply the Bayer threshold offset, clamp, look up the Bourke character, compute the warm-to-cool pair index (high luma = warm = low index; low luma = cool = high index), set bold for bright fragments, pack into Cell.
+
+```c
+/* torus_raster.c / raster files */
+static Cell luma_to_cell(float luma, int px, int py)
+{
+    /* 1. Bayer 4×4 ordered dither */
+    float d = luma + (k_bayer[py & 3][px & 3] - 0.5f) * 0.15f;
+    d = fmaxf(0.0f, fminf(1.0f, d));
+
+    /* 2. Bourke ramp → character */
+    char ch = k_bourke[(int)(d * (BOURKE_LEN - 1))];
+
+    /* 3. Warm-to-cool pair: high luma → pair 1 (red/warm), low → pair 7 (cool) */
+    int cp = 1 + (int)(d * 6.0f);
+    if (cp > 7) cp = 7;
+
+    /* 4. Bold for bright fragments */
+    bool bold = d > 0.6f;
+
+    return (Cell){ ch, cp, bold };
+}
+```
+
+**How to apply:** Call from the fragment shader or rasterizer inner loop. Centralizing the conversion means changing dither strength, ramp length, or color mapping requires editing one function — the pipeline is untouched.
+
+*Files: `torus_raster.c`, `cube_raster.c`, `sphere_raster.c`, `displace_raster.c`*
+
+---
+
+#### V5.16 Depth Sort — Painter's Algorithm
+
+**What it is:** Computing all renderable points for a frame into a buffer, sorting them by depth (back to front), then drawing in that order so nearer points naturally overwrite farther ones.
+
+**What we achieve:** Correct overlap without a z-buffer. Since each parametric point maps to a screen cell and only one character can occupy a cell, sorting ensures the front-most character always wins without per-cell depth comparison.
+
+**How:** For each `(θ, φ)` sample: compute the 3D point, apply rotations, project to screen, compute luminance. Store `(cx, cy, depth, char, pair)` in a flat array. Sort descending by depth (farthest first). Iterate and call `mvaddch` — later writes (closer) overwrite earlier (farther).
+
+```c
+/* donut.c — parametric torus depth sort */
+/* 1. Compute all points */
+for each (theta, phi):
+    compute (x, y, z) after rotation
+    project to (cx, cy)
+    points[n++] = { cx, cy, z, luma_char, pair };
+
+/* 2. Sort farthest-first */
+qsort(points, n, sizeof *points, cmp_depth_desc);
+
+/* 3. Draw — closer points overwrite farther */
+for (int i = 0; i < n; i++)
+    mvaddch(points[i].cy, points[i].cx, points[i].ch);
+```
+
+**When to use vs z-buffer:** Depth sort is simpler to implement and works well for single continuous surfaces (torus, sphere) where the point count is small and each point maps to one unique cell. Z-buffer (zbuf[] array) is better for triangle rasterization where many triangles may cover the same cell and sorting all fragments is impractical.
+
+*Files: `donut.c`*
 
 ---
 
@@ -1440,4 +1856,446 @@ The `dt` cap (`if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS`) handles the one 
 
 ---
 
-*This document captures every ncurses-specific pattern from all 24 C files in this repository. For the simulation algorithms and physics, see Master.md. For the overall loop architecture, see Architecture.md.*
+---
+
+## V9 — Per-File Technique Reference
+
+Each entry lists the unique techniques used by that file. Techniques already documented in V1–V8 are referenced by section; file-specific patterns are explained inline.
+
+---
+
+### tst_lines_cols.c
+*Minimal LINES/COLS demo — the simplest possible ncurses program.*
+
+**LINES / COLS globals** — `initscr()` sets the globals `LINES` and `COLS` to terminal dimensions. Read them directly: `printw("rows=%d cols=%d", LINES, COLS)`. No function call needed. Animation files prefer `getmaxyx` (→ V8.2) for explicit window querying.
+
+**`printw` / `refresh()`** — `printw` writes into `newscr` at the current cursor; `refresh()` = `wnoutrefresh(stdscr)` + `doupdate()` in one call. Simplest possible text output pattern.
+
+**Blocking `getch()`** — without `nodelay(TRUE)`, `getch()` halts until a key is pressed. Used here intentionally to pause the program after printing. All animation files use `nodelay(TRUE)` (→ V6.1) to prevent this.
+
+**No signal handling, no `start_color()`** — every line is essential, every safety mechanism is absent. Teaching baseline.
+
+---
+
+### aspect_ratio.c
+*Demonstrates correct circle drawing by compensating for non-square terminal cells.*
+
+**`newwin(rows, cols, 0, 0)`** — creates a `WINDOW*` separate from `stdscr`. All draw calls use `w`-prefixed forms (`wmove`, `waddch`, etc.). Animation files avoid this pattern (→ V2.4); it is used here as a teaching example.
+
+**`wbkgd(win, COLOR_PAIR(1))`** — sets the background attribute for an entire window. Every cleared cell gets this attribute. Called once after `newwin`; subsequent `werase()` fills with it automatically.
+
+**`werase(win)` / `wrefresh(win)`** — `werase` clears the window buffer; `wrefresh` = `wnoutrefresh(win)` + `doupdate()`. Animation files always use the split form (→ V2.3).
+
+**`raw()` instead of `cbreak()`** (→ V1.4) — intentional: no signal handling, Ctrl+C arrives as character 3.
+
+**Aspect x×2 correction** — circle drawn with `x = cx + r * 2 * cos(angle)`, `y = cy + r * sin(angle)`. Multiplying x by 2 compensates for cells being ~2× taller than wide, making the circle visually round.
+
+---
+
+### misc/bounce_ball.c
+*Reference implementation — the canonical animation skeleton every other file follows.*
+
+**7 spectral color pairs** — red(196), orange(208), yellow(226), green(46), cyan(51), blue(21), magenta(201). The canonical set reused across fireworks, constellation, brust, kaboom.
+
+**`wattron / mvwaddch / wattroff` bracket** — attribute active only for one `mvwaddch` call; prevents color leaking. Reference example for the bracket pattern (→ V4.3).
+
+**`(chtype)(unsigned char)ch` double cast** (→ V4.2) — documented with an inline comment explaining sign extension. Only file to explain it in-source.
+
+**Pixel-space physics with `floorf` round-half-up** (→ Architecture.md §4) — `CELL_W=8`, `CELL_H=16`; `px_to_cell_x = floorf(px/CELL_W + 0.5f)`.
+
+**Forward render interpolation (alpha)** (→ Architecture.md §4) — `draw_px = b->px + b->vx * alpha * dt_sec`.
+
+---
+
+### ncurses_basics/spring_pendulum.c
+*Lagrangian spring-pendulum with Bresenham coil rendering and layered draw order.*
+
+**Semantic color pair names** — `CP_BAR`, `CP_WIRE`, `CP_SPRING`, `CP_BALL`, `CP_HUD` constants instead of bare indices. `wattron(w, CP_SPRING)` conveys intent; `wattron(w, COLOR_PAIR(3))` does not.
+
+**6-layer explicit draw order** (→ V5.1) — bar → wire stubs → coil lines → coil nodes → bob. Each layer overwrites the previous. Documented in source comments.
+
+**Slope char from Bresenham step direction** (→ V4.8) — one ternary per step: `(sx&&sy) ? (sx==sy?'\\':'/') : sx?'-':'|'`.
+
+**`prev_r`/`prev_theta` lerp for non-linear physics** (→ Architecture.md §4) — store prev before tick, lerp in draw: `draw_r = prev_r + (r - prev_r) * alpha`.
+
+---
+
+### matrix_rain/matrix_rain.c
+*Matrix rain with 6-shade gradient, transparent background, and hot-swappable themes.*
+
+**`use_default_colors()` + pair `-1` background** (→ V1.3, V3.4) — rain floats over terminal wallpaper.
+
+**6-shade `Shade` enum → composite `attr_t`** (→ V3.9) — `FADE/DARK/MID/BRIGHT/HOT/HEAD` mapped by `shade_attr()`.
+
+**Runtime theme swap** (→ V3.10 pattern) — `theme_apply(idx)` re-registers 6 pairs; draw code unchanged.
+
+**Two-pass rendering** (→ V5.3) — Pass 1: persistent grid texture. Pass 2: interpolated float head positions.
+
+**Float head with `floorf(y + 0.5f)`** — `draw_row = (int)floorf(draw_head_y + 0.5f)`. Deterministic cell assignment without banker's rounding oscillation.
+
+---
+
+### particle_systems/fire.c
+*Doom-style fire CA with 9-level ASCII ramp, Floyd-Steinberg dithering, auto-cycling themes.*
+
+**9-level ramp `" .:+x*X#@"`** — sparse (cold) to dense (hot). `heat → index 0–8 → ramp[index]`.
+
+**`FireTheme` struct** (→ V3.10) — 6 themes (fire/ice/plasma/nova/poison/gold), each with `fg256[9]`, `fg8[9]`, `attr8[9]`.
+
+**Auto-cycling themes** — `cycle_tick` increments each sim tick; at threshold, advances theme and calls `theme_apply()`.
+
+**Floyd-Steinberg dithering** (→ V5.8) — on a scratch copy of the heat grid before ramp lookup.
+
+**Per-cell `attron`/`attroff`** — each cell sets its own attribute independently; no global attribute state between cells.
+
+**Non-uniform LUT breaks** — `{0.000, 0.080, 0.180, 0.290, 0.390, 0.500, 0.620, 0.750, 0.900}` — clustered in 0.3–0.75 where flame curvature is most perceptually important.
+
+---
+
+### particle_systems/aafire_port.c
+*aalib fire variant — minimises terminal write volume using diff-based clearing.*
+
+**Diff-based clearing** (→ V2.6) — no `erase()`; only cells that transition from visible to empty receive a space character.
+
+**`memcpy(prev, bmap, ...)` snapshot** — copied after drawing, not before. Snapshot after ensures the diff compares the actual drawn state.
+
+**5-neighbour CA** — `(y+1,x-1), (y+1,x), (y+1,x+1), (y+2,x-1), (y+2,x+1)` averaged. Produces rounder, slower-rising blobs vs. fire.c's 4-neighbour spikes.
+
+**Per-row decay LUT** — `minus[y] = max_decay * y / rows`. Faster decay near top (flame tips die), slower at bottom (fuel zone). Self-normalizes to any terminal height.
+
+---
+
+### particle_systems/fireworks.c
+*Rocket fireworks with three-state machine and life-gated brightness.*
+
+**7 spectral pairs** — canonical set (196/208/226/46/51/21/201). Same 7 pairs reused in brust, kaboom, constellation.
+
+**Life-gated `A_BOLD` / `A_DIM`** (→ V3.11) — two thresholds: 0.6 and 0.2.
+
+**`attr_t` OR accumulation** (→ V3.6) — build `attr_t attr = COLOR_PAIR(n); if (cond) attr |= A_BOLD;` before the draw call.
+
+**Rocket always bold** — `COLOR_PAIR(r->color) | A_BOLD` hardcoded for the rising rocket. Always the brightest element while ascending.
+
+**Independent particle colors** — `p->color = 1 + rand() % 7` at spawn. No color inheritance from parent rocket; explosions burst multicolored.
+
+---
+
+### particle_systems/brust.c
+*Staggered explosion bursts with scorch persistence and flash cross-pattern.*
+
+**Flash cross-pattern** (→ V5.11) — `'*'` center + `'+'` four cardinals, `COLOR_PAIR(C_YELLOW)|A_BOLD`, frame 0 only.
+
+**Scorch persistence with `A_DIM`** (→ V5.10) — `scorch[]` array redrawn every frame before active particles.
+
+**Life-gated brightness (single threshold)** (→ V3.11) — `life > 0.65 → A_BOLD`; scorch handles the dying-particle visual separately.
+
+**`ASPECT=2.0f` in cell space** — `vx *= ASPECT` at particle spawn. Circular burst without full pixel-space physics — acceptable because burst spread is random anyway.
+
+---
+
+### particle_systems/kaboom.c
+*Deterministic LCG explosions with pre-rendered Cell arrays and 3D blob z-depth coloring.*
+
+**`Cell{ch, ColorID}` pre-render buffer** — `blast_render_frame()` fills `Cell cbuf[]` with no ncurses calls. `blast_draw()` blits it. Complete separation of geometry from I/O.
+
+**6 blast theme structs** — `flash_chars[]` and `wave_chars[]` per theme. `ch = theme->wave_chars[ring_variant % len]`. Same geometry, different glyphs.
+
+**3D blob z-depth → char + color** (→ V5.12) — far: `'.'`/`COL_BLOB_F`; mid: `'o'`/`COL_BLOB_M`; near: `'@'`/`COL_BLOB_N`.
+
+**Role-named color IDs** (→ V3.12) — `COL_BLOB_F`, `COL_FLASH`, `COL_HUD` enum. HUD always registered yellow outside the theme block.
+
+**LCG seed determinism** — `lcg_next = seed * 1664525 + 1013904223`. Same seed → same explosion every invocation.
+
+---
+
+### particle_systems/constellation.c
+*Star constellation with stippled Bresenham lines, cell deduplication, proximity brightness.*
+
+**`prev_px`/`prev_py` lerp** — `draw_px = prev_px + (px - prev_px) * alpha`. True interpolation (not extrapolation) — star velocities are non-linear.
+
+**Distance-ratio attribute + stipple** (→ V5.4) — `ratio < 0.50 → A_BOLD, stipple=1`; `ratio < 0.75 → normal, stipple=1`; `ratio < 1.00 → normal, stipple=2`.
+
+**`bool cell_used[rows][cols]` VLA** (→ V5.5) — stack-allocated per frame, zeroed with `memset`. First line to a cell claims it.
+
+---
+
+### flocking/flocking.c
+*Boid flocking with 5 switchable modes, cosine palette cycling, proximity brightness.*
+
+**Cosine palette → xterm-256 cube** (→ V3.8) — `init_pair()` called every N frames mid-loop with new cube index.
+
+**`follower_brightness()` toroidal halo** (→ V5.6) — `ratio = toroidal_dist / PERCEPTION_RADIUS; return ratio < 0.35f ? A_BOLD : A_NORMAL`.
+
+**Per-flock velocity char sets** — `k_boid_chars[3][8]`: each flock has its own 8 octant characters. Flocks remain visually distinct even when boids overlap.
+
+```c
+int octant = (int)((atan2f(-vy, vx) + M_PI) / (M_PI/4)) % 8;
+char ch = k_boid_chars[flock_id][octant];
+```
+
+---
+
+### fluid/sand.c
+*Falling sand CA with dual-factor grain visuals and keyboard-controlled emitter.*
+
+**`grain_visual(age, nb, &ch, &attr)`** (→ V5.13) — dual-factor: age → character density; neighbor count → A_BOLD.
+
+**6 visual levels** — `` ` . o O 0 # `` from sparse (freshly fallen) to dense (compacted). Index advances with age.
+
+**Source indicator `'|'`** — always drawn at emitter position with `CP_SOURCE|A_BOLD` regardless of whether grains are currently falling. No state check needed.
+
+**Wind arrow glyph** — pick arrow from `"←↙↓↘→↗↑↖"` by wind direction; draw at HUD corner with `CP_WIND`. Immediate visual feedback without text.
+
+**Fisher-Yates column shuffle** — column scan order randomized each tick. Removes left-to-right bias that otherwise piles sand asymmetrically.
+
+---
+
+### fluid/flowfield.c
+*Perlin noise flow field with 4 visual themes, Unicode arrows, ring-buffer trails.*
+
+**8 pairs, 4 runtime themes** — RAINBOW (8 hue octants), CYAN fade, GREEN fade, WHITE/grey. `color_apply_theme(t)` re-registers all 8 pairs. Same pair numbers; colors change.
+
+**`angle_to_pair(angle)` — hue or age** — in RAINBOW: `pair = 1 + octant` (velocity direction → hue). In mono: `pair = 1 + trail_age_index` (time → brightness). Two completely different uses of the same 8 pairs, switched by theme.
+
+**Unicode arrows via `addwstr`** (→ V4.9) — `const char *k_dirs[8]` = `{"→","↗","↑","↖","←","↙","↓","↘"}`.
+
+**Ring-buffer trail coloring** (→ V5.14) — newest position gets pair 1 (brightest), oldest gets pair 8 (dimmest).
+
+---
+
+### raster/torus_raster.c
+*UV torus rasterizer — establishes the shared raster pipeline pattern.*
+
+**`Cell{ch, color_pair, bold}` + `cbuf[]`** (→ V2.5) — all raster math writes to the intermediate buffer; only `fb_blit()` touches ncurses.
+
+**`zbuf[]` float depth buffer** — `FLT_MAX` each frame; write only when `frag_z < zbuf[idx]`.
+
+**`luma_to_cell(luma, px, py)`** (→ V5.15) — Bayer dither → Bourke char → warm-to-cool pair, all in one call.
+
+**7 warm-to-cool pairs** — pair 1 = red(196, bright/warm), pair 4 = green(neutral), pair 7 = magenta(201, dim/cool). High luma → warm; low luma → cool.
+
+**Back-face cull always-on** — `dot(face_normal, view_dir) < 0 → skip`. Torus appears solid from outside.
+
+---
+
+### raster/cube_raster.c
+*Unit cube rasterizer — same pipeline, adds toggleable cull and zoom.*
+
+**Toggleable back-face cull `'c'`** — `cull_enabled` boolean flipped on keypress. Toggle lets you see inside the cube (cull off = inside-out rendering).
+
+**Zoom via `'+'/'-'` adjusting FOV** — `fov` constant scales perspective matrix each frame. Interactive zoom with zero geometry changes.
+
+**Same `cbuf`/`zbuf`/`fb_blit` pipeline** (→ V2.5) — demonstrates the pipeline handles different geometry with no changes to the ncurses output layer.
+
+---
+
+### raster/sphere_raster.c
+*UV sphere rasterizer — same pipeline, UV lat/lon tessellation.*
+
+**Same `cbuf`/`zbuf`/`fb_blit` pipeline** (→ V2.5) — same as torus and cube; only `tessellate_sphere()` differs.
+
+**UV tessellation** — `x = sin(lat)*cos(lon)`, `y = cos(lat)`, `z = sin(lat)*sin(lon)`. Nested loops over `lat ∈ [0,π]`, `lon ∈ [0,2π]`. UV `(u,v) = (lon/2π, lat/π)`.
+
+---
+
+### raster/displace_raster.c
+*UV sphere with real-time vertex displacement — the most complex raster file.*
+
+**Vertex displacement modes via function pointer** — `float (*disp_fn)(Vec3 pos, float t, float amp, float freq)`. `'d'` key cycles `mode_idx`. Four modes: RIPPLE, WAVE, PULSE, SPIKY. Swap with no mesh or pipeline changes.
+
+**Central-difference normal recomputation** — after displacing a vertex, normals are recomputed: `d_t = disp(pos+eps*T) - disp(pos-eps*T)`, then `T' = T*(2*eps) + N*d_t`, `N' = normalize(cross(T',B'))`. Without this, shading looks wrong on the deformed surface.
+
+**Same `cbuf`/`zbuf`/`fb_blit` pipeline** (→ V2.5) — displacement is entirely in `tessellate_displace()`; `fb_blit()` unchanged.
+
+---
+
+### raymarcher/donut.c
+*Parametric torus — no mesh, no SDF, no intermediate framebuffer.*
+
+**No intermediate framebuffer** — each computed screen point calls `mvaddch` directly inside the render loop. Simplest possible 3D render path. Works because each parametric `(θ,φ)` point maps to a unique screen cell.
+
+**8 grey-ramp pairs (235, 238, 241, 244, 247, 250, 253, 255)** (→ V3.5) — evenly spaced grey levels; `N·L` dot product maps to pair 1–8.
+
+**8-color fallback** — when `COLORS < 256`: `pair_idx < 3 → A_DIM`; `pair_idx > 5 → A_BOLD`. Three apparent brightness tiers from one `COLOR_WHITE` pair (→ V3.7).
+
+**Depth sort — painter's algorithm** (→ V5.16) — all points buffered, sorted by `z` descending, drawn back-to-front.
+
+---
+
+### raymarcher/wireframe.c
+*Wireframe cube — Bresenham projected edges, slope characters, monochrome.*
+
+**Bresenham projected edges** — project 8 cube vertices to screen; connect 12 edges with Bresenham. Character at each step selected by slope direction (→ V4.8).
+
+**Arrow key rotation** — `KEY_UP/DOWN/LEFT/RIGHT` accumulate rotation angles each frame. `nodelay(TRUE)` (→ V6.1) means rotation advances only while a key is held.
+
+**Monochrome — no `start_color()`** (→ V1.5) — all output uses terminal default. The entire visual is slope-character-based; color adds nothing.
+
+---
+
+### raymarcher/raymarcher.c
+*Sphere-marching SDF raymarcher — sphere + plane, Blinn-Phong, soft shadow.*
+
+**8 grey-ramp pairs + gamma correction** (→ V3.5) — `luma_gamma = powf(raw_luma, 1/2.2f)` before pair index lookup.
+
+**Blinn-Phong → luma → grey pair** — `H = normalize(L + V)`; `specular = pow(max(dot(N,H),0), 32)`; `luma = kd*diffuse + ks*specular`; pair = `1 + (int)(luma * 7)`.
+
+**`cbuf[]`/`fb_blit()` pattern** (→ V2.5) — unlike donut.c, the march loop writes to `cbuf`; `fb_blit()` is the sole ncurses boundary.
+
+**Shadow ray** — secondary march from `p + N*eps` toward light. If it hits before the light, multiply diffuse by 0. Hard shadows at the cost of 2× SDF evaluations per lit pixel.
+
+---
+
+### raymarcher/raymarcher_cube.c
+*SDF box raymarcher — adds finite-difference normals over raymarcher.c.*
+
+**Finite-difference SDF normals** — `N = normalize( (sdf(p+ε,0,0)-sdf(p-ε,0,0), sdf(p+0,ε,0)-sdf(p-0,ε,0), sdf(p+0,0,ε)-sdf(p-0,0,ε)) )`. 6 extra SDF calls per hit; works for any SDF without analytic gradient derivation.
+
+**Same grey-ramp + gamma + cbuf** (→ V3.5, V2.5) — identical output pipeline; only SDF function and normal method differ.
+
+---
+
+### raymarcher/raymarcher_primitives.c
+*Multiple SDF primitives composited with min/max/smin, per-primitive material colors.*
+
+**`min`/`max` SDF composition** — union = `min(a,b)`; intersection = `max(a,b)`; subtraction = `max(-a,b)`; smooth union = `smin(a,b,k)`.
+
+**Per-primitive material color** — `map(p)` returns both distance and material ID. Material ID maps to a grey-ramp pair: sphere → light grey (pair 8), box → mid grey, torus → dark grey, etc.
+
+**`cbuf[]` with per-material pair** (→ V2.5) — `cbuf[idx] = { ch, mat_id_to_pair[mat_id], bold }`. `fb_blit()` automatically uses the right pair per cell.
+
+---
+
+### misc/bonsai.c
+*Growing bonsai tree with recursive branch growth, transparent background, ACS borders.*
+
+**`use_default_colors()` + `-1` background** (→ V1.3, V3.4) — branches float over the terminal's native background.
+
+**ACS line-drawing chars for message box** (→ V4.5) — `ACS_ULCORNER`, `ACS_HLINE`, `ACS_VLINE`, etc. Portable box border on any terminal encoding.
+
+**Branch boldness via conditional OR** — `attr_t a = COLOR_PAIR(cp) | (bold ? A_BOLD : 0)`. Older/thicker branches draw bold; young/thin ones at base brightness.
+
+**Slope chars per branch direction** (→ V4.8) — `abs(dx) < abs(dy)/2 → '|'`; `abs(dy) < abs(dx)/2 → '-'`; `dx*dy > 0 → '\\'`; else `'/'`.
+
+**Dual HUD rows** — `mvprintw(0, hx, ...)` for top bar; `mvprintw(rows-1, 0, ...)` for bottom bar. More status without crowding either edge.
+
+**Message panel scrolling text** — `snprintf(buf, box_w-1, "%s", msg)` pre-clips to box width; `mvprintw(by+1, bx+1, "%s", buf)` inside ACS border.
+
+---
+
+## Quick-Reference Matrix
+
+`✓` = technique present. `—` = not used.
+
+| File | erase() | diff-clear | cbuf+zbuf | grey-ramp | Bayer | F-Stein | theme-swap | use_default | ACS | Unicode |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| tst_lines_cols | — | — | — | — | — | — | — | — | — | — |
+| aspect_ratio | wbkgd | — | — | — | — | — | — | — | — | — |
+| bounce_ball | ✓ | — | — | — | — | — | — | — | — | — |
+| spring_pendulum | ✓ | — | — | — | — | — | — | — | — | — |
+| matrix_rain | ✓ | — | — | — | — | — | ✓ | ✓ | — | — |
+| fire | ✓ | — | — | — | — | ✓ | ✓ | — | — | — |
+| aafire_port | — | ✓ | — | — | — | ✓ | ✓ | — | — | — |
+| fireworks | ✓ | — | — | — | — | — | — | — | — | — |
+| brust | ✓ | — | — | — | — | — | — | — | — | — |
+| kaboom | ✓ | — | ✓* | — | — | — | ✓ | — | — | — |
+| constellation | ✓ | — | — | — | — | — | — | — | — | — |
+| flocking | ✓ | — | — | — | — | — | ✓ | — | — | — |
+| sand | ✓ | — | — | — | — | — | — | — | — | — |
+| flowfield | ✓ | — | — | — | — | — | ✓ | — | — | ✓ |
+| torus_raster | ✓ | — | ✓ | — | ✓ | — | — | — | — | — |
+| cube_raster | ✓ | — | ✓ | — | ✓ | — | — | — | — | — |
+| sphere_raster | ✓ | — | ✓ | — | ✓ | — | — | — | — | — |
+| displace_raster | ✓ | — | ✓ | — | ✓ | — | — | — | — | — |
+| donut | ✓ | — | — | ✓ | — | — | — | — | — | — |
+| wireframe | ✓ | — | — | — | — | — | — | — | — | — |
+| raymarcher | ✓ | — | ✓ | ✓ | — | — | — | — | — | — |
+| raymarcher_cube | ✓ | — | ✓ | ✓ | — | — | — | — | — | — |
+| raymarcher_prims | ✓ | — | ✓ | ✓ | — | — | — | — | — | — |
+| bonsai | ✓ | — | — | — | — | — | — | ✓ | ✓ | — |
+
+\* kaboom uses a `Cell[]` pre-render buffer (→ V2.5 pattern) not a `zbuf[]`.
+
+**Column key:**
+- `erase()` — standard per-frame full erase (V2.2)
+- `diff-clear` — selective cell erase, no full `erase()` (V2.6)
+- `cbuf+zbuf` — intermediate framebuffer + depth buffer, `fb_blit()` as sole ncurses boundary (V2.5)
+- `grey-ramp` — xterm-256 grey pairs 235–255 (V3.5)
+- `Bayer` — 4×4 ordered dithering (V5.7)
+- `F-Stein` — Floyd-Steinberg error diffusion (V5.8)
+- `theme-swap` — runtime `init_pair()` re-registration (V3.10)
+- `use_default` — `use_default_colors()` for transparent background (V1.3)
+- `ACS` — ACS line-drawing characters (V4.5)
+- `Unicode` — `addwstr` for multi-byte glyphs (V4.9)
+
+---
+
+## Technique Index
+
+| Technique | V-section | Files |
+|---|---|---|
+| Standard init sequence | V1.1 | all |
+| `endwin()` + `atexit` cleanup | V1.2 | all |
+| `use_default_colors()` transparent bg | V1.3 / V3.4 | matrix_rain, bonsai |
+| `cbreak()` vs `raw()` | V1.4 | all (cbreak); aspect_ratio (raw) |
+| Monochrome — no `start_color()` | V1.5 | wireframe |
+| `curscr`/`newscr` double buffer | V2.1 | all |
+| `erase()` vs `clear()` | V2.2 | all |
+| `wnoutrefresh` + `doupdate` | V2.3 | all |
+| Avoid manual front/back windows | V2.4 | all (avoid); aspect_ratio (example) |
+| `cbuf[]` + `fb_blit()` framebuffer | V2.5 | torus/cube/sphere/displace_raster, raymarcher* |
+| Diff-based selective clearing | V2.6 | aafire_port |
+| Color pairs — `init_pair`/`COLOR_PAIR` | V3.1 | all |
+| 256-color vs 8-color fallback | V3.2 | all |
+| xterm-256 palette index reference | V3.3 | all color files |
+| `-1` background for transparency | V3.4 | matrix_rain, bonsai |
+| Grey ramp 235–255 for luminance | V3.5 | donut, raymarcher* |
+| `attr_t` OR accumulation | V3.6 | all |
+| `A_BOLD`/`A_DIM` brightness tiers | V3.7 | all |
+| Cosine palette cycling | V3.8 | flocking |
+| Shade enum → composite `attr_t` | V3.9 | matrix_rain |
+| Encapsulated theme struct | V3.10 | fire, aafire_port |
+| Life-gated `A_BOLD`/`A_DIM` | V3.11 | fireworks, brust |
+| Role-named color IDs | V3.12 | kaboom |
+| `mvwaddch` core write call | V4.1 | all |
+| `(chtype)(unsigned char)` double cast | V4.2 | all |
+| `wattron`/`wattroff` bracket | V4.3 | all |
+| `mvprintw` HUD text | V4.4 | all |
+| ACS line-drawing chars | V4.5 | bonsai |
+| Paul Bourke 92-char ramp | V4.6 | rasters, raymarchers, fire |
+| Directional velocity → glyph | V4.7 | flowfield, flocking |
+| Slope chars `/\|-` | V4.8 | spring_pendulum, bonsai, wireframe |
+| Unicode glyphs via `addwstr` | V4.9 | flowfield |
+| Draw order — last write wins | V5.1 | all |
+| HUD always on top | V5.2 | all |
+| Two-pass rendering | V5.3 | matrix_rain |
+| Stippled Bresenham distance fade | V5.4 | constellation |
+| `cell_used[][]` line deduplication | V5.5 | constellation |
+| Proximity brightness `A_BOLD` | V5.6 | flocking |
+| Bayer 4×4 ordered dithering | V5.7 | rasters |
+| Floyd-Steinberg error diffusion | V5.8 | fire, aafire_port |
+| Luminance → warm-to-cool color | V5.9 | rasters |
+| Scorch mark accumulation | V5.10 | brust |
+| Flash cross-pattern | V5.11 | brust |
+| Z-depth → char + color | V5.12 | kaboom |
+| Dual-factor visual function | V5.13 | sand |
+| Ring-buffer trail coloring | V5.14 | flowfield |
+| `luma_to_cell` dither+ramp+color | V5.15 | rasters |
+| Depth sort — painter's algorithm | V5.16 | donut |
+| `nodelay` non-blocking input | V6.1 | all |
+| `keypad` arrow/function keys | V6.2 | all |
+| `typeahead(-1)` atomic write | V6.3 | all |
+| `noecho` suppress key echo | V6.4 | all |
+| `curs_set(0)` hide cursor | V6.5 | all |
+| `SIGWINCH` resize signal | V7.1 | all |
+| `volatile sig_atomic_t` flags | V7.2 | all |
+| `endwin→refresh→getmaxyx` sequence | V7.3 | all |
+| `atexit(cleanup)` guaranteed restore | V7.4 | all |
+| Sleep before render | V8.1 | all |
+| `getmaxyx` vs `LINES`/`COLS` | V8.2 | all |
+| `CLOCK_MONOTONIC` no NTP jumps | V8.3 | all |
+| Common ncurses bugs reference | V8.4 | — |
+
+---
+
+*This document is the single reference for all ncurses techniques used across the 24 C files in this project. For simulation algorithms and physics, see Master.md. For the overall loop architecture, see Architecture.md. For color-specific techniques, see COLOR.md.*

@@ -263,7 +263,116 @@ static const char k_ramp[] = " .:+x*X#@";
 
 ---
 
-## 13. xterm-256 Palette Index Reference
+## 13. Velocity/Angle-to-Color Mapping
+
+**Where:** flowfield.c
+
+**How it works:**
+In RAINBOW theme, the particle's velocity direction is mapped to a hue pair index. `atan2(-vy, vx)` returns the angle in `[-π, π]`; adding `π` shifts to `[0, 2π]`; dividing by `π/4` gives an octant index 0–7. Each octant maps to one of 8 color pairs registered to hues spanning the spectrum. In mono themes (CYAN, GREEN, WHITE), the same 8 pairs are instead used for trail age: index 1 = newest/brightest, index 8 = oldest/dimmest. The two uses are mutually exclusive and switched per theme.
+
+```c
+/* RAINBOW theme: angle → octant → hue pair */
+int octant = (int)((atan2f(-vy, vx) + M_PI) / (M_PI / 4.0f)) % 8;
+int pair   = 1 + octant;          /* pairs 1..8 = 8 hue sectors */
+
+/* Mono theme: trail position index → brightness pair */
+int pair = 1 + trail_age_index;   /* 1=newest/bright, 8=oldest/dim */
+```
+
+**Effect:** In RAINBOW mode the particle head points in one of 8 directions and its color matches its direction — a rotating color wheel where the hue literally tells you where the flow is going. In mono mode the trail fades from bright to dim as it ages, encoding time as color.
+
+---
+
+## 14. Normal-to-Luminance Surface Shading
+
+**Where:** sphere_raster.c, cube_raster.c, torus_raster.c, displace_raster.c
+
+**How it works:**
+The rasterizer pipeline maps 3D surface normals to displayed characters and colors through a three-step chain:
+
+1. **Normal → luminance via dot product:** `luma = max(0, dot(N, L))` (Lambertian diffuse, where `L` is the normalised light direction). Optional Blinn-Phong specular `(max(0, dot(N, H))^shininess)` is added for highlights.
+2. **Luminance → gamma correction:** `luma_corrected = pow(luma, 1/2.2)` maps linear light to the perceptually uniform display value.
+3. **Corrected luminance → character + color pair (dual axis):** The same float drives two independent outputs:
+   - `idx = (int)(luma * BOURKE_LEN)` → `k_bourke[idx]` — character density encodes brightness
+   - `cp = 1 + (int)(luma * 6)` → warm-to-cool pair (1=red → 7=magenta) — color hue encodes brightness
+
+```c
+/* luma_to_cell() in torus_raster.c */
+float d = luma + (k_bayer[py & 3][px & 3] - 0.5f) * 0.15f;   /* Bayer dither */
+d = fmaxf(0.0f, fminf(1.0f, d));
+int  idx  = (int)(d * (BOURKE_LEN - 1));
+char ch   = k_bourke[idx];
+int  cp   = 1 + (int)(d * 6.0f);                               /* 1–7 warm→cool */
+bool bold = d > 0.6f;
+return (Cell){ ch, cp, bold };
+```
+
+**Effect:** A 3D surface gets two independent brightness signals per cell — one from the character's ink density and one from its color hue — giving approximately 700 distinguishable brightness levels in a single terminal cell. Lit areas appear warm/yellowish; shadow areas appear cool/blueish; matching the color temperature of real light sources.
+
+---
+
+## 15. Per-Primitive Material Colors
+
+**Where:** raymarcher/raymarcher_primitives.c
+
+**How it works:**
+The sphere-marching loop tracks which SDF primitive returned the closest distance at the current hit point. Each primitive is assigned a material ID; the ID maps to a distinct grey-ramp color pair. This lets multiple objects in the scene render at different luminance levels using only the existing 8-pair grey ramp — no additional color registration is needed.
+
+```c
+/* map() returns both distance and material ID */
+if (d_sphere < min_d) { min_d = d_sphere; mat_id = MAT_SPHERE; }
+if (d_box    < min_d) { min_d = d_box;    mat_id = MAT_BOX;    }
+/* ... */
+
+/* cbuf stores the material → fb_blit uses it as pair index */
+cbuf[idx] = (Cell){ ch, mat_id_to_pair[mat_id], bold };
+```
+
+**Material → pair mapping:**
+| Material | Pair | Grey shade | Appearance |
+|----------|------|-----------|------------|
+| MAT_SPHERE | 8 | 255 (white) | Brightest |
+| MAT_BOX | 6 | 250 | Mid-light |
+| MAT_TORUS | 4 | 244 | Mid |
+| MAT_CAPSULE | 2 | 238 | Dark |
+| MAT_CONE | 1 | 235 | Darkest |
+
+**Effect:** Each SDF primitive renders in a visually distinct shade, making the composition legible at a glance without any mesh or UV system — just a one-integer material tag per ray hit.
+
+---
+
+## 16. Color Pair Allocation Reference
+
+**How it works:**
+ncurses reserves pair 0 as the default (unmodifiable), giving 255 usable pairs (1–255 on most terminals; `COLOR_PAIRS` at runtime). None of the animations in this project approach this limit. Pairs are allocated contiguously from 1.
+
+**Pair counts per animation:**
+
+| File | Pairs allocated | Purpose |
+|------|----------------|---------|
+| fire.c | 9 (+ theme re-use) | 9-level heat ramp, re-registered per theme |
+| aafire_port.c | 9 | Same as fire.c |
+| matrix_rain.c | 6 | 6 shade levels (FADE→HEAD) |
+| flocking.c | 3 | One per flock, re-registered every N frames |
+| constellation.c | 7 | Spectral hues |
+| fireworks.c | 7 | Spectral hues |
+| brust.c | 7 | Spectral hues |
+| kaboom.c | 7 | Role-named pairs (blob far/mid/near, flash, ring, HUD) |
+| donut.c | 8 | Grey ramp 235–255 |
+| raymarcher*.c | 8 | Grey ramp 235–255 |
+| torus/cube/sphere/displace_raster.c | 7 | Warm-to-cool luminance |
+| flowfield.c | 8 | 8 hue/age levels |
+| sand.c | 4 | Grain density levels |
+| bonsai.c | 6 | Brown trunk, branches, leaf shades |
+| matrix_rain.c | 6 | 6 shade levels per theme |
+
+**Dynamic re-registration:** Several animations call `init_pair()` mid-loop. This is safe — ncurses applies the new color on the next `doupdate()`. The pair number itself does not change, only the color behind it. There is no risk of "stale" pair handles.
+
+**8-color terminal note:** When `COLORS < 256`, xterm-256 indices are not available. All files use the `if (COLORS >= 256)` fallback that registers standard `COLOR_*` constants instead. The pair numbers stay the same; only the registered color differs.
+
+---
+
+## 17. xterm-256 Palette Index Reference
 
 **How it works:**
 The xterm-256 color space has three regions:

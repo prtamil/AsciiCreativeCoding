@@ -1291,6 +1291,7 @@ The same pair number can produce three brightness tiers (dim / base / bold) — 
 | `Master.md` | Long-form essays on algorithms, physics, and visual techniques |
 | `Visual.md` | ncurses field guide: 48 numbered entries covering every ncurses technique with What/Why/How explanations and code |
 | `NCURSES_TECHNIQUES.md` | Per-file ncurses technique matrix: which techniques each of the 24 C files uses, with a quick-reference table and inverse lookup index |
+| `COLOR.md` | Color technique reference: 17 entries covering every color trick used across the C files — how it works, the exact code pattern, and the visual effect |
 
 ---
 

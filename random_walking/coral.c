@@ -127,40 +127,45 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Coral depth palette — dark at the roots, bright at the tips.
+ * Coral depth palette — all vivid, visible on black.
+ * Bottom → top: red → violet → yellow → green → teal → lemon-green
  *
- * COL_CORAL_1  deepest / substrate  — dark brown-red
- * COL_CORAL_6  highest tips         — bright white
+ *  COL_CORAL_1  roots   — coral red       xterm 203  #ff5f5f
+ *  COL_CORAL_2  base    — violet          xterm 207  #ff5fff
+ *  COL_CORAL_3  mid     — bright yellow   xterm 226  #ffff00
+ *  COL_CORAL_4  upper   — lime green      xterm 118  #87ff00
+ *  COL_CORAL_5  high    — teal            xterm  86  #5fffd7
+ *  COL_CORAL_6  tips    — lemon green     xterm 154  #afff00
  */
 typedef enum {
-    COL_CORAL_1 = 1,   /* substrate — dark brown                      */
-    COL_CORAL_2 = 2,   /* deep coral — dark red                       */
-    COL_CORAL_3 = 3,   /* mid coral — coral red / orange              */
-    COL_CORAL_4 = 4,   /* upper mid — orange                          */
-    COL_CORAL_5 = 5,   /* upper — bright yellow                       */
-    COL_CORAL_6 = 6,   /* tips — bright white                         */
-    COL_WALKER  = 7,   /* dim dots for drifting walkers               */
+    COL_CORAL_1 = 1,   /* roots — coral red                           */
+    COL_CORAL_2 = 2,   /* base  — violet                              */
+    COL_CORAL_3 = 3,   /* mid   — bright yellow                       */
+    COL_CORAL_4 = 4,   /* upper — lime green                          */
+    COL_CORAL_5 = 5,   /* high  — teal                                */
+    COL_CORAL_6 = 6,   /* tips  — lemon green                         */
+    COL_WALKER  = 7,   /* drifting particles                          */
 } ColorID;
 
 static void color_init(void)
 {
     start_color();
     if (COLORS >= 256) {
-        init_pair(COL_CORAL_1,  52, COLOR_BLACK);   /* dark brown-red  */
-        init_pair(COL_CORAL_2, 124, COLOR_BLACK);   /* medium red      */
-        init_pair(COL_CORAL_3, 196, COLOR_BLACK);   /* bright red      */
-        init_pair(COL_CORAL_4, 208, COLOR_BLACK);   /* orange          */
-        init_pair(COL_CORAL_5, 226, COLOR_BLACK);   /* bright yellow   */
-        init_pair(COL_CORAL_6, 231, COLOR_BLACK);   /* white           */
-        init_pair(COL_WALKER,  238, COLOR_BLACK);   /* dark grey       */
+        init_pair(COL_CORAL_1, 203, COLOR_BLACK);   /* coral red      */
+        init_pair(COL_CORAL_2, 207, COLOR_BLACK);   /* violet         */
+        init_pair(COL_CORAL_3, 226, COLOR_BLACK);   /* bright yellow  */
+        init_pair(COL_CORAL_4, 118, COLOR_BLACK);   /* lime green     */
+        init_pair(COL_CORAL_5,  86, COLOR_BLACK);   /* teal           */
+        init_pair(COL_CORAL_6, 154, COLOR_BLACK);   /* lemon green    */
+        init_pair(COL_WALKER,  251, COLOR_BLACK);   /* light grey     */
     } else {
-        init_pair(COL_CORAL_1, COLOR_RED,    COLOR_BLACK);
-        init_pair(COL_CORAL_2, COLOR_RED,    COLOR_BLACK);
-        init_pair(COL_CORAL_3, COLOR_RED,    COLOR_BLACK);
-        init_pair(COL_CORAL_4, COLOR_YELLOW, COLOR_BLACK);
-        init_pair(COL_CORAL_5, COLOR_YELLOW, COLOR_BLACK);
-        init_pair(COL_CORAL_6, COLOR_WHITE,  COLOR_BLACK);
-        init_pair(COL_WALKER,  COLOR_WHITE,  COLOR_BLACK);
+        init_pair(COL_CORAL_1, COLOR_RED,     COLOR_BLACK);
+        init_pair(COL_CORAL_2, COLOR_MAGENTA, COLOR_BLACK);
+        init_pair(COL_CORAL_3, COLOR_YELLOW,  COLOR_BLACK);
+        init_pair(COL_CORAL_4, COLOR_GREEN,   COLOR_BLACK);
+        init_pair(COL_CORAL_5, COLOR_CYAN,    COLOR_BLACK);
+        init_pair(COL_CORAL_6, COLOR_GREEN,   COLOR_BLACK);
+        init_pair(COL_WALKER,  COLOR_WHITE,   COLOR_BLACK);
     }
 }
 
@@ -281,8 +286,7 @@ static void grid_draw(const Grid *g, WINDOW *w)
             uint8_t col = g->cells[cy][cx];
             if (col == 0) continue;
             attr_t attr = COLOR_PAIR((int)col);
-            if      (col >= 5) attr |= A_BOLD;
-            else if (col <= 1) attr |= A_DIM;
+            if (col >= 5) attr |= A_BOLD;   /* teal + lemon tips extra bright */
             wattron(w, attr);
             mvwaddch(w, cy, cx, grid_char_for_col(col));
             wattroff(w, attr);

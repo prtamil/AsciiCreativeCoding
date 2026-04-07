@@ -146,6 +146,17 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [O2 Branch Type State Machine](#o2-branch-type-state-machine)
 - [O3 Leaf Scatter](#o3-leaf-scatter)
 
+### P — Fractal Systems
+- [P1 Diffusion-Limited Aggregation (DLA)](#p1-diffusion-limited-aggregation-dla)
+- [P2 D6 Hexagonal Symmetry with Aspect Correction](#p2-d6-hexagonal-symmetry-with-aspect-correction)
+- [P3 Anisotropic DLA — Directional Sticking](#p3-anisotropic-dla--directional-sticking)
+- [P4 Chaos Game / Iterated Function System (IFS)](#p4-chaos-game--iterated-function-system-ifs)
+- [P5 Barnsley Fern — 4-Transform IFS](#p5-barnsley-fern--4-transform-ifs)
+- [P6 Escape-time Iteration — Julia and Mandelbrot Sets](#p6-escape-time-iteration--julia-and-mandelbrot-sets)
+- [P7 Fisher-Yates Random Pixel Reveal](#p7-fisher-yates-random-pixel-reveal)
+- [P8 Koch Snowflake — Midpoint Subdivision](#p8-koch-snowflake--midpoint-subdivision)
+- [P9 Recursive Tip Branching — Lightning](#p9-recursive-tip-branching--lightning)
+
 ---
 
 ## Essays
@@ -758,6 +769,165 @@ for (int i = 0; i < n_leaves; i++) {
 
 The Y spread is halved because terminal cells are twice as tall as wide — equal pixel spread requires half as many cell rows as columns. Leaf chars are drawn with `A_BOLD` to appear lighter and more delicate than branch chars.
 *Files: `bonsai.c`*
+
+---
+
+---
+
+### P — Fractal Systems
+
+#### P1 Diffusion-Limited Aggregation (DLA)
+
+DLA simulates the formation of fractal crystal structures. A seed cell is frozen at the centre. Random walkers are released one at a time and each takes a random walk until it lands adjacent to a frozen cell, at which point it freezes and extends the aggregate. Repeating this millions of times produces a branching, dendritic structure whose fractal dimension is approximately 1.71.
+
+The terminal grid stores a `uint8_t` color index per cell (0 = empty). Walker movement is one cell per tick in a random cardinal (or diagonal) direction. The adjacency check scans the 4 or 8 neighbours of the walker's current cell.
+
+Key design decisions:
+- **Respawn radius** — if a walker escapes beyond `max_dist + SPAWN_MARGIN` it is teleported to a random point on the spawn circle. This prevents walkers from wandering away forever.
+- **N_WALKERS concurrent** — running multiple walkers simultaneously speeds up growth without changing the statistical fractal dimension.
+- **Sticking probability < 1.0** — probabilistic sticking (coral.c) smooths the branches and allows side growth.
+
+*Files: `snowflake.c`, `coral.c`*
+
+#### P2 D6 Hexagonal Symmetry with Aspect Correction
+
+Snowflakes have D6 symmetry: 6-fold rotational symmetry plus a reflection axis. `snowflake.c` enforces this by freezing all 12 D6 images of every new point simultaneously. When a walker freezes at `(col, row)`:
+
+```
+for k in 0..5:           /* 6 rotations */
+    for mirror in [+1,-1]: /* 2 reflections */
+        plot D6-image of (col, row)
+```
+
+Terminal cells are non-square. A naïve integer rotation mixes cell-space distances with Euclidean angles, distorting the symmetry. The fix:
+
+1. Convert displacement to Euclidean: `dy_e = dy / ASPECT_R`
+2. Apply 2-D rotation in Euclidean space
+3. Convert result back to cell space: `new_row = cy + ry_e * ASPECT_R`
+
+Only after this correction do the 6 rotated images appear truly 60° apart on screen.
+
+*Files: `snowflake.c`*
+
+#### P3 Anisotropic DLA — Directional Sticking
+
+Standard DLA is isotropic — branches grow equally in all directions. `coral.c` breaks this by making sticking probability depend on the relative direction of the approaching walker:
+
+```c
+float stick_prob;
+if      (dy == -1) stick_prob = 0.90f;  /* walker came from above  */
+else if (dy ==  0) stick_prob = 0.40f;  /* walker came from side   */
+else               stick_prob = 0.10f;  /* walker came from below  */
+if ((float)rand() / RAND_MAX > stick_prob) continue;  /* skip */
+```
+
+Walkers approaching from above stick with 90% probability (downward-growing branches are easy to cap). Walkers approaching from the sides stick at 40% (side branches form but are selective). Walkers from below rarely stick at 10% (almost no downward growth). Combined with a downward walker drift and 8 bottom seeds, the result is upward-growing coral branches.
+
+*Files: `coral.c`*
+
+#### P4 Chaos Game / Iterated Function System (IFS)
+
+An IFS is a finite set of affine transforms. The chaos game applies a randomly chosen transform to the current point at each step. After a warm-up period (to move the point onto the attractor), plotting each subsequent point traces the fractal attractor of the IFS.
+
+For the Sierpinski triangle the three transforms are `T_i(x,y) = ((x + V_i.x)/2, (y + V_i.y)/2)` — midpoint between the current point and vertex `i`. After 20 warm-up steps (discarded), the orbit never leaves the attractor. Color tracks the index of the last chosen transform, giving each sub-triangle its own hue.
+
+The attractor is reached because each transform is contractive (Lipschitz constant 0.5). Banach's fixed-point theorem guarantees that repeated application converges to the unique fixed-point set — the Sierpinski triangle.
+
+*Files: `sierpinski.c`, `fern.c`*
+
+#### P5 Barnsley Fern — 4-Transform IFS
+
+The Barnsley Fern uses four affine transforms with non-uniform probabilities:
+
+| Transform | Probability | Effect |
+|-----------|-------------|--------|
+| `f1` stem  | 1%          | Maps everything to a thin vertical stem |
+| `f2` main  | 85%         | Self-similarity — maps fern to slightly smaller fern |
+| `f3` left  | 7%          | Maps to lower-left leaflet |
+| `f4` right | 7%          | Maps to lower-right leaflet |
+
+The 85% main transform creates the recursive self-similarity: each frond looks like the whole fern at a smaller scale. The two 7% transforms add the alternating side leaflets. The 1% stem maps to the base midrib.
+
+The fern's natural coordinate space spans `x ∈ [−2.5, 2.5]`, `y ∈ [0, 10]` — a 4:1 aspect in math units. On a terminal with ASPECT_R=2, naive uniform scaling would produce a fern only ~9 columns wide. Independent x/y scales map fern math space to a comfortable fraction of the terminal:
+
+```c
+scale_y = (rows - 3) / (y_max - y_min)
+scale_x = cols * 0.45 / (x_max - x_min)
+```
+
+*Files: `fern.c`*
+
+#### P6 Escape-time Iteration — Julia and Mandelbrot Sets
+
+Both sets use the iteration `z_n+1 = z_n² + c` in the complex plane. The two parameters differ:
+
+| Set       | `z₀`         | `c`            |
+|-----------|--------------|----------------|
+| Julia     | pixel coord  | fixed constant |
+| Mandelbrot | 0           | pixel coord    |
+
+A point is in the set if `|z_n|` never exceeds 2 for all n. In practice, the iteration stops at MAX_ITER and the escape ratio `frac = iter / MAX_ITER` is used for coloring.
+
+The escape-time coloring maps `frac` to color bands:
+- Points that escape quickly (high `frac`) are near the boundary — these receive the brightest colors.
+- Points deep inside the set (low `frac`) remain black.
+- The transition bands create the characteristic halo of color around the set boundary.
+
+Julia sets visualise the filled Julia set for a particular `c`. Different `c` values produce dramatically different shapes: `c = −0.7 + 0.27i` gives the Douady rabbit, `c = −0.8 + 0.156i` gives a dendrite, `c = −0.7269 + 0.1889i` gives a seahorse.
+
+*Files: `julia.c`, `mandelbrot.c`*
+
+#### P7 Fisher-Yates Random Pixel Reveal
+
+Computing all pixels in row-major order produces a visible scan line that sweeps downward — aesthetically poor. The Fisher-Yates (Knuth) shuffle produces a uniformly random permutation of all pixel indices:
+
+```c
+for (int i = n - 1; i > 0; i--) {
+    int j = rand() % (i + 1);
+    int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+}
+```
+
+Each tick, `PIXELS_PER_TICK` pixels from the shuffled order are computed and plotted. The fractal appears to materialise from scattered noise — far more visually engaging than a scan line. The shuffle is O(n) at init and O(1) per pixel during draw.
+
+The shuffled index array is stored in the Grid struct: `order[GRID_ROWS_MAX * GRID_COLS_MAX]`. At ~80×300 = 24,000 entries × 4 bytes = 96 KB — large enough to declare as a static global, avoiding stack overflow.
+
+*Files: `julia.c`, `mandelbrot.c`*
+
+#### P8 Koch Snowflake — Midpoint Subdivision
+
+The Koch snowflake is constructed by iteratively replacing each segment with four sub-segments. Given segment P→Q:
+
+1. A = P + (Q−P)/3
+2. B = P + 2(Q−P)/3
+3. M = A + R(+60°)(B−A)   ← the outward bump
+
+`R(+60°)` is the 2-D rotation matrix for 60°:
+```
+[ cos60  -sin60 ]   [ 0.5    -0.866 ]
+[ sin60   cos60 ] = [ 0.866   0.5   ]
+```
+
+The choice of R(+60°) vs R(−60°) determines whether M is inside or outside the original triangle. With a clockwise-wound starting triangle and R(+60°), M lies on the outside on all three edges, producing the canonical outward bumps.
+
+Level n has 3 × 4ⁿ segments. Level 5 has 3072 segments, each 1/243 of the circumradius. Bresenham rasterizes each segment to the terminal grid as a single-cell-wide path. At level 5 many segments are sub-pixel, producing single-cell marks — which is fine; the shape is still recognizable.
+
+*Files: `koch.c`*
+
+#### P9 Recursive Tip Branching — Lightning
+
+Lightning grows as a fractal binary tree rather than a random walk. Each active tip carries a `lean` bias (integer ∈ {−2, −1, 0, 1, 2}) that persists across steps. Each tick:
+
+1. The tip advances one row downward
+2. Column offset = lean / 2 (rounded), so lean ±2 gives ±1 cell/step diagonal
+3. Character selected by movement direction: `|` straight, `/` lean left, `\` lean right
+4. After `MIN_FORK_STEPS` steps, with probability `FORK_PROB`, the tip forks into two children with lean ± 1
+
+This produces a fractal binary tree that spreads as it descends — each child's lean diverges from the parent by ±1, so branches spread apart at a controlled rate. The structure is deterministic given a seed but visually complex enough to look organic.
+
+The glow halo is generated at draw time (not stored in the grid): for each frozen cell, Manhattan neighbors at distance 1 and 2 are drawn with dim attributes if they are empty.
+
+*Files: `lightning.c`*
 
 ---
 

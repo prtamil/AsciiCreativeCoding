@@ -2183,6 +2183,116 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
+### fractal_random/snowflake.c
+*DLA crystal with D6 6-fold symmetry and distance-based coloring.*
+
+**12-way simultaneous freeze** — when a walker freezes, all 12 D6 images (6 rotations × 2 reflections) are frozen atomically via `grid_freeze_symmetric()`. Each image is computed by rotating the displacement vector in Euclidean space and converting back to cell space.
+
+**ASPECT_R=2 rotation correction** (→ V8.2 analogue for geometry) — `dy_e = dy / ASPECT_R` before rotation, `ry_e * ASPECT_R` after. Without this, the six rotated images are not 60° apart in physical pixels.
+
+**Distance-based 6-color gradient** — `frac = dist / max_dist` maps to COL_ICE_1..6 (white tips → pale ice → bright cyan → medium teal → ocean blue → light blue core). `max_dist` updates as the crystal grows, stretching the gradient.
+
+**Context-sensitive draw characters** — `grid_char_at()` scans the 8 neighbours of each frozen cell and picks `*` `|` `-` `+` `/` `\` based on which neighbors are occupied. Isolated cells get `*`; horizontal runs get `-`; vertical runs get `|`; junctions get `+`.
+
+**Walker visibility** — active walkers drawn as xterm 75 (sky blue) `·` with no A_DIM, ensuring the random walk is visible against the black background.
+
+---
+
+### fractal_random/coral.c
+*Anisotropic DLA with 8 bottom seeds and directional sticking.*
+
+**Bottom-seeded 8-seed init** — 8 evenly spaced cells along the bottom row are frozen at startup, giving the growth multiple independent nucleation points that merge into a connected coral structure.
+
+**Downward walker drift** — walkers spawn at the top and move with 50% downward bias. Combined with directional sticking (above=0.90, side=0.40, below=0.10), branches grow upward like coral polyps.
+
+**Height-based color banding** — frozen cells are colored by their row: bottom rows get COL_CORAL_1 (coral red), upper rows cycle through violet, yellow, lime, teal, lemon. Six vivid pairs, all 256-color with 8-color fallback.
+
+**Auto-reset on max height** — `scene_tick()` checks if the tallest frozen branch has reached `rows / 4` and resets the scene, keeping the animation cycling.
+
+---
+
+### fractal_random/sierpinski.c
+*Sierpinski triangle via chaos game (IFS).*
+
+**Three-vertex IFS** — `ifs_step()` picks one of three vertices uniformly at random and moves the current point halfway toward it. After 20 warm-up iterations (discarded), all subsequent points lie on the attractor.
+
+**Vertex color tracking** — the color of each plotted point is `which + 1` where `which` is the last chosen vertex index. This partitions the triangle into three colored sub-triangles (cyan/yellow/magenta), with the same tricolor pattern repeating at every scale.
+
+**N_PER_TICK=500, TOTAL_ITERS=50000** — builds the triangle gradually over ~100 ticks. `DONE_PAUSE_TICKS=90` holds the completed triangle for ~3 s before resetting.
+
+**Equilateral scaling** — `scale_x = scale_y × ASPECT_R` ensures the triangle looks equilateral on non-square terminal cells. `x_off` centers it horizontally.
+
+---
+
+### fractal_random/fern.c
+*Barnsley Fern via 4-transform IFS.*
+
+**4-transform weighted IFS** — each `ifs_step()` picks a transform by cumulative probability (1%, 86%, 93%, 100% cutpoints). The `(a,b,c,d,e,f)` matrix plus probability is stored in a `static const IFSTransform` array.
+
+**Independent x/y scale** — fern y/x aspect ≈ 4:1 in math space. Separate `scale_y` and `scale_x` (cols × 0.45 / x_range) map to a comfortable terminal width without squashing.
+
+**N_PER_TICK=400, TOTAL_ITERS=80000** — denser point cloud than sierpinski for a fuller-looking fern. 20 warm-up iterations before plotting begin.
+
+**Green gradient 5 pairs** — points are colored by which transform produced them: stem=40 (medium green), main=76 (bright green), left=118 (lime), right=154 (yellow-lime), tips=190 (lemon).
+
+---
+
+### fractal_random/julia.c
+*Julia set with Fisher-Yates random pixel reveal and 6 preset cycling.*
+
+**Fisher-Yates shuffled order** (→ V5 new technique) — `grid_shuffle()` fills `order[0..n-1]` then does a Fisher-Yates shuffle. `pixel_idx` advances PIXELS_PER_TICK per tick, revealing pixels in random order. Image materialises from scattered noise.
+
+**6 presets cycle automatically** — on reset, `preset_idx` advances. Presets vary `cr`, `ci` (the fixed complex constant c). HUD shows preset name with `mvprintw`.
+
+**Fire palette** — COL_INSIDE=231 (white), COL_C2=226 (yellow), COL_C3=208 (orange), COL_C4=196 (red), COL_C5=124 (dark red). Slow-escape pixels (near boundary) are bright; fast-escape pixels are dim outer halos.
+
+**MAX_ITER=128, PIXELS_PER_TICK=60** — complete reveal in ~40 s per preset. `im_half=1.3f`; `re_half = im_half × cols/rows / ASPECT_R` for correct aspect.
+
+---
+
+### fractal_random/mandelbrot.c
+*Mandelbrot set with zoom presets and electric neon palette.*
+
+**re_center / im_center in Grid** — unlike julia.c (always centred at origin), the mandelbrot grid carries `re_center`, `im_center`, `zoom` to map each pixel to the correct complex coordinate for each preset.
+
+**6 zoom presets** — from full set (zoom=1.3) through seahorse valley (0.15), deep spiral (0.02), mini mandelbrot (0.08). Each preset selects a visually interesting region of the Mandelbrot set.
+
+**Electric neon palette** — COL_INSIDE=201 (magenta), COL_C2=226 (yellow), COL_C3=82 (lime), COL_C4=51 (cyan), COL_C5=141 (purple). Contrasts with julia.c's fire scheme; makes the two files visually distinct.
+
+**MAX_ITER=256** — higher than julia.c for finer boundary detail, especially in deep zoom presets.
+
+---
+
+### fractal_random/koch.c
+*Koch snowflake — recursive midpoint subdivision with Bresenham rasterization.*
+
+**Recursive segment buffer** — `subdivide(segs, n)` uses static globals `g_seg_buf[]`/`g_seg_n`. Level n has 3×4ⁿ segments; level 5 has 3072. MAX_SEGS=4096 covers all levels.
+
+**Adaptive segs_per_tick** — `segs_per_tick = n_segs / 60 + 1` gives approximately 2 s per level regardless of segment count. Level 1 draws all 12 segments in one tick; level 5 draws ~51 per tick.
+
+**Bresenham rasterization** — `rasterize_seg()` uses integer Bresenham to paint single-cell-wide lines. Each segment receives a color from a 5-color gradient (cyan→teal→lime→yellow→white) indexed by draw order.
+
+**Level cycling 1→5** — on completing each level, `HOLD_TICKS=45` ticks pause before clearing and moving to the next level. After level 5, wraps back to 1.
+
+**Keys: r=restart, n=next level** — in addition to standard q/p/[/].
+
+---
+
+### fractal_random/lightning.c
+*Fractal binary-tree lightning with glow halo and depth coloring.*
+
+**Tip struct with lean bias** — each active tip carries `row`, `col`, `lean` (−2..2), `steps_since_fork`. `lean/2` (rounded) gives the column delta per step. Lean persists, so branches travel diagonally at a consistent angle.
+
+**Fork probability after MIN_FORK_STEPS** — after a minimum step count, each tip independently tests `rand() % 100 < FORK_PROB`. On fork, two child tips inherit `lean ± 1`. This produces the spreading binary-tree structure.
+
+**State machine ST_GROWING → ST_STRIKING → ST_FADING** — ensures the bolt grows fully before fading, giving a brief "flash" hold at full extension.
+
+**Glow halo at draw time** — `draw_glow()` iterates Manhattan neighbors of radius 1 and 2 around each frozen cell; empty neighbors get dim overlay characters (`|`, `.`). Drawn before the bolt itself so the bolt overwrites the halo at bolt positions.
+
+**Depth color** — `row < rows/3` = xterm 45 (light blue), `row < 2*rows/3` = xterm 51 (teal), else xterm 231 (white). Bolt reads as energetic at the top, incandescent at ground strike.
+
+---
+
 ## Quick-Reference Matrix
 
 `✓` = technique present. `—` = not used.
@@ -2213,6 +2323,14 @@ char ch = k_boid_chars[flock_id][octant];
 | raymarcher_cube | ✓ | — | ✓ | ✓ | — | — | — | — | — | — |
 | raymarcher_prims | ✓ | — | ✓ | ✓ | — | — | — | — | — | — |
 | bonsai | ✓ | — | — | — | — | — | — | ✓ | ✓ | — |
+| snowflake | ✓ | — | — | — | — | — | — | — | — | — |
+| coral | ✓ | — | — | — | — | — | — | — | — | — |
+| sierpinski | ✓ | — | — | — | — | — | — | — | — | — |
+| fern | ✓ | — | — | — | — | — | — | — | — | — |
+| julia | ✓ | — | — | — | — | — | — | — | — | — |
+| mandelbrot | ✓ | — | — | — | — | — | — | — | — | — |
+| koch | ✓ | — | — | — | — | — | — | — | — | — |
+| lightning | ✓ | — | — | — | — | — | — | — | — | — |
 
 \* kaboom uses a `Cell[]` pre-render buffer (→ V2.5 pattern) not a `zbuf[]`.
 
@@ -2291,6 +2409,21 @@ char ch = k_boid_chars[flock_id][octant];
 | `volatile sig_atomic_t` flags | V7.2 | all |
 | `endwin→refresh→getmaxyx` sequence | V7.3 | all |
 | `atexit(cleanup)` guaranteed restore | V7.4 | all |
+| DLA walker + freeze | — (see Architecture §22) | snowflake, coral |
+| D6 12-way symmetric freeze | — (see Architecture §22) | snowflake |
+| Distance-based color gradient | — (see COLOR §18) | snowflake |
+| Context-sensitive draw chars | — (see Architecture §22) | snowflake |
+| Anisotropic sticking probability | — (see Architecture §22) | coral |
+| IFS chaos game | — (see Architecture §22) | sierpinski, fern |
+| IFS vertex color tracking | — (see COLOR §20) | sierpinski, fern |
+| Escape-time band coloring | — (see COLOR §19) | julia, mandelbrot |
+| Fisher-Yates random pixel reveal | — (see Architecture §22) | julia, mandelbrot |
+| Koch midpoint subdivision | — (see Architecture §22) | koch |
+| Adaptive segs_per_tick | — (see Architecture §22) | koch |
+| Bresenham segment rasterization | — (see Architecture §22) | koch |
+| Recursive tip branching | — (see Architecture §22) | lightning |
+| Depth-position coloring | — (see COLOR §21) | lightning, koch |
+| Glow halo at draw time | — (see Architecture §22) | lightning |
 | Sleep before render | V8.1 | all |
 | `getmaxyx` vs `LINES`/`COLS` | V8.2 | all |
 | `CLOCK_MONOTONIC` no NTP jumps | V8.3 | all |
@@ -2298,4 +2431,4 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-*This document is the single reference for all ncurses techniques used across the 24 C files in this project. For simulation algorithms and physics, see Master.md. For the overall loop architecture, see Architecture.md. For color-specific techniques, see COLOR.md.*
+*This document is the single reference for all ncurses techniques used across the C files in this project (24 original + 8 fractal_random = 32 files). For fractal algorithms and IFS theory, see Master.md §P. For the overall loop architecture and fractal-specific subsystems, see Architecture.md §22. For color-specific techniques including escape-time and distance-based coloring, see COLOR.md.*

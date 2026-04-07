@@ -30,6 +30,16 @@ gcc -std=c11 -O2 -Wall -Wextra flocking/flocking.c             -o flocking      
 gcc -std=c11 -O2 -Wall -Wextra fluid/sand.c       -o sand      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/flowfield.c  -o flowfield -lncurses -lm
 
+# ── fractal / random growth ───────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/snowflake.c  -o snowflake  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/coral.c      -o coral      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/sierpinski.c -o sierpinski -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/fern.c       -o fern       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/julia.c      -o julia      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/mandelbrot.c -o mandelbrot -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/koch.c       -o koch       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/lightning.c  -o lightning  -lncurses -lm
+
 # ── raster (software rasterizer) ─────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raster/cube_raster.c     -o cube     -lncurses -lm
@@ -74,6 +84,16 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  
 ### fluid/
 - `sand.c`              — falling sand CA: gravity + diagonal fallback + wind drift, Fisher-Yates column shuffle, per-grain age coloring
 - `flowfield.c`         — Perlin noise flow field: 3-octave fBm, bilinear field sampling, 8-direction arrow glyphs, ring-buffer particle trails
+
+### fractal_random/
+- `snowflake.c`    — DLA crystal with D6 6-fold symmetry; 12-way simultaneous freeze; distance-based 6-color ice palette (light-blue core → teal → white tips); context-sensitive chars (`*` `|` `-` `+` `/` `\`)
+- `coral.c`        — anisotropic DLA: 8 bottom seeds, top-spawned walkers with downward bias; direction-dependent sticking probability; vivid coral/violet/yellow/lime/teal palette; auto-reset when tallest branch hits top quarter
+- `sierpinski.c`   — Sierpinski triangle via chaos game (IFS): 3 vertices, random vertex → move halfway; N_PER_TICK=500, TOTAL_ITERS=50000; color by last chosen vertex (cyan/yellow/magenta); held then reset
+- `fern.c`         — Barnsley Fern: 4-transform IFS (stem 1%, main 85%, left 7%, right 7%); N_PER_TICK=400, TOTAL_ITERS=80000; independent x/y scale to correct aspect; green gradient palette
+- `julia.c`        — Julia set with Fisher-Yates random pixel reveal; 6 presets cycling (rabbit, spiral, dendrite, flame, seahorse, basilica); fire palette (white→yellow→orange→red); PIXELS_PER_TICK=60, MAX_ITER=128
+- `mandelbrot.c`   — Mandelbrot set (z₀=0, z→z²+c); same Fisher-Yates fill as julia.c; 6 zoom presets including deep spirals; electric neon palette (magenta/purple/cyan/lime/yellow); MAX_ITER=256
+- `koch.c`         — Koch snowflake: recursive midpoint subdivision; levels 1–5 cycle; Bresenham rasterization; adaptive segs_per_tick for ~2 s per level; 5-color vivid gradient (cyan→teal→lime→yellow→white)
+- `lightning.c`    — fractal branching lightning: recursive tip branching (not DLA); tips grow downward with persistent lean bias, fork after MIN_FORK_STEPS; glow halo radius 2; color by depth (light-blue → teal → white); state machine ST_GROWING → ST_STRIKING → ST_FADING
 
 ### raster/
 - `torus_raster.c`      — UV torus, 4 shaders (phong / toon / normals / wireframe), always-on back-face cull
@@ -165,7 +185,7 @@ tessellate_*()  →  scene_tick()  →  pipeline_draw_mesh()  →  fb_blit()
 
 | File | Contents |
 |---|---|
-| `documentation/Architecture.md` | Framework design, loop mechanics, coordinate model, per-subsystem deep dives |
-| `documentation/Master.md` | Long-form essays on algorithms, physics, and visual techniques |
-| `documentation/Visual.md` | ncurses field guide — V1–V9 covering every ncurses technique (What/Why/How + code); V9 per-file reference; Quick-Reference Matrix; Technique Index |
-| `documentation/COLOR.md` | 17 color tricks across all C files — mechanism, exact code pattern, visual effect |
+| `documentation/Architecture.md` | Framework design, loop mechanics, coordinate model, per-subsystem deep dives including DLA, IFS, Julia/Mandelbrot, Koch, Lightning |
+| `documentation/Master.md` | Long-form essays on algorithms, physics, and visual techniques; section K covers fractal systems |
+| `documentation/Visual.md` | ncurses field guide — V1–V9 covering every ncurses technique (What/Why/How + code); V9 per-file reference including all fractal_random files; Quick-Reference Matrix; Technique Index |
+| `documentation/COLOR.md` | Color tricks across all C files — mechanism, exact code pattern, visual effect; includes fractal palettes, escape-time coloring, distance-based coloring |

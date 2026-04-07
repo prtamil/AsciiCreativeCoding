@@ -364,11 +364,120 @@ ncurses reserves pair 0 as the default (unmodifiable), giving 255 usable pairs (
 | flowfield.c | 8 | 8 hue/age levels |
 | sand.c | 4 | Grain density levels |
 | bonsai.c | 6 | Brown trunk, branches, leaf shades |
-| matrix_rain.c | 6 | 6 shade levels per theme |
+| snowflake.c | 7 | 6 ice gradient pairs + 1 walker pair |
+| coral.c | 7 | 6 vivid coral pairs + 1 walker pair |
+| sierpinski.c | 4 | 3 vertex colors + 1 HUD |
+| fern.c | 6 | 5 green-gradient transform colors + 1 HUD |
+| julia.c | 6 | Fire palette: white→yellow→orange→red + HUD |
+| mandelbrot.c | 6 | Neon palette: magenta→yellow→lime→cyan→purple + HUD |
+| koch.c | 6 | 5-color vivid gradient (cyan→teal→lime→yellow→white) + HUD |
+| lightning.c | 5 | 3 depth bands + 2 glow/halo pairs |
 
 **Dynamic re-registration:** Several animations call `init_pair()` mid-loop. This is safe — ncurses applies the new color on the next `doupdate()`. The pair number itself does not change, only the color behind it. There is no risk of "stale" pair handles.
 
 **8-color terminal note:** When `COLORS < 256`, xterm-256 indices are not available. All files use the `if (COLORS >= 256)` fallback that registers standard `COLOR_*` constants instead. The pair numbers stay the same; only the registered color differs.
+
+---
+
+## 18. Distance-based Coloring (Snowflake)
+
+**Where:** snowflake.c
+
+**How it works:**
+At freeze time, the Euclidean distance from the crystal centre to the new cell is computed. This distance is divided into bands that map to six color pairs, forming a gradient from inner core to outer tips:
+
+```c
+float frac = dist / g->max_dist;   /* 0 = centre, 1 = outermost tip */
+
+if      (frac < 0.15f) color = COL_ICE_6;  /* 117 light blue  — core  */
+else if (frac < 0.30f) color = COL_ICE_5;  /* 38  ocean blue           */
+else if (frac < 0.50f) color = COL_ICE_4;  /* 44  medium teal          */
+else if (frac < 0.65f) color = COL_ICE_3;  /* 51  bright cyan          */
+else if (frac < 0.80f) color = COL_ICE_2;  /* 195 pale ice             */
+else                   color = COL_ICE_1;  /* 231 white — tips         */
+```
+
+`max_dist` is updated incrementally as new cells freeze, so the color scale stretches as the crystal grows: inner cells are remapped to progressively lighter colors as outer cells push `max_dist` larger.
+
+**Effect:** The crystal reads as a physical object — cold blue at the dense core, icy white at the sharp outer tips. Color conveys spatial depth without any 3-D computation.
+
+---
+
+## 19. Escape-time Band Coloring (Julia / Mandelbrot)
+
+**Where:** julia.c, mandelbrot.c
+
+**How it works:**
+The escape-time iteration runs until `|z|² > 4` or `MAX_ITER` is reached. The fractional escape ratio `frac = iter / MAX_ITER` is mapped to discrete color bands:
+
+```c
+static ColorID escape_color(int iter, int max_iter) {
+    float frac = (float)iter / (float)max_iter;
+    if (frac < THRESHOLD)  return COL_BG;    /* inside set, background */
+    if (frac < 0.30f)      return COL_C2;    /* slow escape — bright   */
+    if (frac < 0.55f)      return COL_C3;
+    if (frac < 0.75f)      return COL_C4;
+    return                        COL_C5;    /* fast escape — dim      */
+}
+```
+
+Pixels that escape slowly are those near the boundary of the set — they receive the most vivid colors. Pixels deep inside the set never escape and remain the background color. Pixels that escape quickly (far outside) get the dimmest colors, forming the dark outer halo.
+
+`julia.c` uses a fire palette (white→yellow→orange→red); `mandelbrot.c` uses an electric neon palette (magenta→yellow→lime→cyan→purple). The two files keep the same `escape_color()` logic but register different xterm-256 indices for COL_C2..C5.
+
+**Effect:** The fractal boundary is highlighted by the densest color bands. The image reads "hot at the edge, cold inside" (julia fire) or "electric boundary on dark space" (mandelbrot neon).
+
+---
+
+## 20. IFS Vertex Coloring (Sierpinski / Fern)
+
+**Where:** sierpinski.c, fern.c
+
+**How it works:**
+In the chaos game, every iteration picks one transform from the IFS table. The index of the chosen transform is used directly as the plot color. For the Sierpinski triangle (3 transforms → 3 colors):
+
+```c
+int v = rand() % 3;            /* chosen vertex 0, 1, or 2 */
+*which = v;
+/* ... caller: */
+grid_plot(&grid, fx, fy, (uint8_t)(which + 1));  /* color pair 1, 2, or 3 */
+```
+
+Because each transform maps the attractor to a specific sub-region, the color partitions the fractal into self-similar colored sub-triangles. The bottom-left sub-triangle is always cyan, bottom-right is yellow, top is magenta — and the same three-color pattern repeats at every scale.
+
+For `fern.c` the color is fixed per transform (stem=green, main=bright-green, left=lime, right=yellow-lime). The coloring reveals which transform generated each point, making the fern's self-similar structure visible.
+
+**Effect:** IFS vertex coloring reveals the algebraic structure of the fractal — the sub-regions generated by each transform are visually separated, giving insight into how the IFS builds the attractor.
+
+---
+
+## 21. Depth-position Coloring (Koch / Lightning)
+
+**Where:** koch.c, lightning.c
+
+**How it works:**
+Color is assigned based on the index or position of the element being drawn, creating a gradient across the structure.
+
+In `koch.c`, each line segment receives a color from a gradient palette indexed by `seg_draw_index / n_segs`:
+
+```c
+int ci = (int)((float)seg_idx / (float)n_segs * (N_COLORS - 1));
+attr_t attr = COLOR_PAIR(color_ids[ci]) | A_BOLD;
+```
+
+This makes early-drawn segments (the original triangle edges) one color and late-drawn segments (the fine tips) another color — producing a radial gradient from inside to outside.
+
+In `lightning.c`, color is assigned by the row of each frozen cell:
+
+```c
+int top_third    = g->rows / 3;
+int bottom_third = 2 * g->rows / 3;
+if      (row < top_third)    color = COL_BOLT_TOP;    /* xterm 45 light blue */
+else if (row < bottom_third) color = COL_BOLT_MID;    /* xterm 51 teal       */
+else                         color = COL_BOLT_BOT;    /* xterm 231 white     */
+```
+
+**Effect:** The lightning bolt reads as a physical discharge — blue at the cloud, whitening toward the ground where energy is dissipated. The Koch snowflake reads as an architectural structure — base in one hue, fine detail in another.
 
 ---
 
@@ -383,17 +492,33 @@ The xterm-256 color space has three regions:
 Specific indices are chosen for maximum visibility on black backgrounds.
 
 **Commonly used indices in this project:**
-| Index | Color            | Used in               |
-|-------|------------------|-----------------------|
-| 196   | Bright red       | fire, fireworks       |
-| 202   | Fire orange      | fire themes           |
-| 214   | Amber            | fire, gold theme      |
-| 226   | Bright yellow    | fire, gold theme      |
-| 46    | Matrix green     | nova theme, matrix    |
-| 51    | Bright cyan      | ice theme             |
-| 33    | Dodger blue      | flocking              |
-| 201   | Hot magenta      | plasma theme          |
-| 232   | Near-black       | theme backgrounds     |
-| 235–255 | Grey ramp steps | donut, rasters      |
+| Index | Color            | Used in                              |
+|-------|------------------|--------------------------------------|
+| 196   | Bright red       | fire, fireworks                      |
+| 202   | Fire orange      | fire themes                          |
+| 214   | Amber            | fire, gold theme                     |
+| 226   | Bright yellow    | fire, gold theme; julia, mandelbrot  |
+| 208   | Orange           | julia fire palette                   |
+| 124   | Dark red         | julia fire palette (outer)           |
+| 231   | White            | julia bright interior; lightning bot |
+| 201   | Hot magenta      | plasma theme; mandelbrot inside      |
+| 141   | Light purple     | mandelbrot outer band                |
+| 82    | Lime green       | mandelbrot band                      |
+| 118   | Bright lime      | fern; koch; coral                    |
+| 154   | Yellow-lime      | fern tip; coral                      |
+| 46    | Matrix green     | nova theme, matrix                   |
+| 51    | Bright cyan      | ice theme; koch; snowflake mid       |
+| 87    | Electric cyan    | sierpinski vertex 1                  |
+| 207   | Hot magenta      | sierpinski vertex 3                  |
+| 117   | Light blue       | snowflake core                       |
+| 195   | Pale ice         | snowflake mid-outer                  |
+| 44    | Medium teal      | snowflake teal band                  |
+| 38    | Ocean blue       | snowflake inner-mid                  |
+| 45    | Sky blue         | lightning top; snowflake walker      |
+| 33    | Dodger blue      | flocking                             |
+| 203   | Coral red        | coral aggregate layer 1              |
+| 86    | Teal-cyan        | coral; koch level 2                  |
+| 232   | Near-black       | theme backgrounds                    |
+| 235–255 | Grey ramp steps | donut, rasters                    |
 
 **Effect:** Predictable, terminal-portable colors without relying on named color constants that vary by terminal theme.

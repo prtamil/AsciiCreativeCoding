@@ -121,18 +121,17 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * CMY triad — cyan / yellow / magenta — one per IFS vertex.
- * These three are evenly spaced on the color wheel and maximally
- * distinct, making the three fractal regions immediately readable.
+ * Vivid triad — one bright color per IFS vertex, evenly spaced on the
+ * color wheel.  All three are clearly visible on black.
  *
- *   COL_V1  51   #00ffff  cyan     — bottom-left sub-triangle
- *   COL_V2  226  #ffff00  yellow   — bottom-right sub-triangle
- *   COL_V3  201  #ff00ff  magenta  — top sub-triangle
+ *   COL_V1   87   #5fffff  electric cyan   — bottom-left sub-triangle
+ *   COL_V2  226   #ffff00  bright yellow   — bottom-right sub-triangle
+ *   COL_V3  207   #ff5fff  hot magenta     — top sub-triangle
  */
 typedef enum {
-    COL_V1  = 1,   /* bottom-left  — cyan    */
-    COL_V2  = 2,   /* bottom-right — yellow  */
-    COL_V3  = 3,   /* top          — magenta */
+    COL_V1  = 1,   /* bottom-left  — electric cyan  */
+    COL_V2  = 2,   /* bottom-right — bright yellow  */
+    COL_V3  = 3,   /* top          — hot magenta    */
     COL_HUD = 4,
 } ColorID;
 
@@ -140,10 +139,10 @@ static void color_init(void)
 {
     start_color();
     if (COLORS >= 256) {
-        init_pair(COL_V1,   51, COLOR_BLACK);   /* cyan    */
-        init_pair(COL_V2,  226, COLOR_BLACK);   /* yellow  */
-        init_pair(COL_V3,  201, COLOR_BLACK);   /* magenta */
-        init_pair(COL_HUD,  51, COLOR_BLACK);
+        init_pair(COL_V1,   87, COLOR_BLACK);   /* electric cyan  */
+        init_pair(COL_V2,  226, COLOR_BLACK);   /* bright yellow  */
+        init_pair(COL_V3,  207, COLOR_BLACK);   /* hot magenta    */
+        init_pair(COL_HUD,  87, COLOR_BLACK);
     } else {
         init_pair(COL_V1,  COLOR_CYAN,    COLOR_BLACK);
         init_pair(COL_V2,  COLOR_YELLOW,  COLOR_BLACK);

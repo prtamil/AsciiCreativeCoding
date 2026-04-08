@@ -38,7 +38,11 @@ gcc -std=c11 -O2 -Wall -Wextra fractal_random/fern.c       -o fern       -lncurs
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/julia.c      -o julia      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/mandelbrot.c -o mandelbrot -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/koch.c       -o koch       -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra fractal_random/lightning.c  -o lightning  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/lightning.c    -o lightning    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/buddhabrot.c  -o buddhabrot   -lncurses -lm
+
+# ── artistic ──────────────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra Artistic/bat.c               -o bat          -lncurses -lm
 
 # ── raster (software rasterizer) ─────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
@@ -94,6 +98,10 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  
 - `mandelbrot.c`   — Mandelbrot set (z₀=0, z→z²+c); same Fisher-Yates fill as julia.c; 6 zoom presets including deep spirals; electric neon palette (magenta/purple/cyan/lime/yellow); MAX_ITER=256
 - `koch.c`         — Koch snowflake: recursive midpoint subdivision; levels 1–5 cycle; Bresenham rasterization; adaptive segs_per_tick for ~2 s per level; 5-color vivid gradient (cyan→teal→lime→yellow→white)
 - `lightning.c`    — fractal branching lightning: recursive tip branching (not DLA); tips grow downward with persistent lean bias, fork after MIN_FORK_STEPS; glow halo radius 2; color by depth (light-blue → teal → white); state machine ST_GROWING → ST_STRIKING → ST_FADING
+- `buddhabrot.c`   — Buddhabrot density accumulator: two-pass orbit sampling (escape test then trace); 5 presets (buddha 500/2000, anti 100/500/1000); log-normalized density→color (mode-aware floor: 0.05 buddha / 0.25 anti); purple→white nebula palette
+
+### Artistic/
+- `bat.c`          — ASCII bat swarms in Pascal-triangle formation: 3 groups × (n_rows+1)(n_rows+2)/2 bats each; `+`/`-` resize rows 1–6 live; wing animation `/−\−`; 6 preset launch angles; staggered group launch; light-purple/cyan/pink groups
 
 ### raster/
 - `torus_raster.c`      — UV torus, 4 shaders (phong / toon / normals / wireframe), always-on back-face cull
@@ -185,7 +193,7 @@ tessellate_*()  →  scene_tick()  →  pipeline_draw_mesh()  →  fb_blit()
 
 | File | Contents |
 |---|---|
-| `documentation/Architecture.md` | Framework design, loop mechanics, coordinate model, per-subsystem deep dives including DLA, IFS, Julia/Mandelbrot, Koch, Lightning |
-| `documentation/Master.md` | Long-form essays on algorithms, physics, and visual techniques; section K covers fractal systems |
-| `documentation/Visual.md` | ncurses field guide — V1–V9 covering every ncurses technique (What/Why/How + code); V9 per-file reference including all fractal_random files; Quick-Reference Matrix; Technique Index |
-| `documentation/COLOR.md` | Color tricks across all C files — mechanism, exact code pattern, visual effect; includes fractal palettes, escape-time coloring, distance-based coloring |
+| `documentation/Architecture.md` | Framework design, loop mechanics, coordinate model, per-subsystem deep dives including DLA, IFS, Julia/Mandelbrot, Koch, Lightning, Buddhabrot, bat swarms |
+| `documentation/Master.md` | Long-form essays on algorithms, physics, and visual techniques; section P covers fractal systems including Buddhabrot |
+| `documentation/Visual.md` | ncurses field guide — V1–V9 covering every ncurses technique (What/Why/How + code); V9 per-file reference including all fractal_random files, bat.c; Quick-Reference Matrix; Technique Index |
+| `documentation/COLOR.md` | Color tricks across all C files — mechanism, exact code pattern, visual effect; includes fractal palettes, escape-time coloring, distance-based coloring, Buddhabrot density coloring |

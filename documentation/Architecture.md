@@ -1482,6 +1482,55 @@ Glow is a Manhattan-radius-2 halo drawn around every frozen cell:
 
 Color by row depth: top third = light blue (xterm 45), middle = teal (51), bottom = white (231). Active tips are drawn as `!` bright white to show the wavefront.
 
+### Buddhabrot Density Accumulator — buddhabrot.c
+
+`buddhabrot.c` renders orbital trajectories of the Mandelbrot iteration as a 2-D density map. Unlike escape-time renderers that color each pixel by how quickly c escapes, the Buddhabrot accumulates visit counts: every orbit point that lands within the display region increments `counts[row][col]`.
+
+**Two-pass sampling per tick:**
+
+```
+Pass 1 — escape test:  iterate z→z²+c, record whether |z|>2 within max_iter
+Pass 2 — orbit trace:  if mode condition met, iterate again, ++counts[row][col]
+```
+
+This avoids storing orbit buffers. Pass 1 is cheap; Pass 2 only runs for qualifying samples.
+
+**Cardioid/bulb rejection (Buddha mode only):**
+```c
+float q = (cr-0.25f)*(cr-0.25f) + ci*ci;
+if (q*(q+cr-0.25f) < 0.25f*ci*ci) return;   /* main cardioid */
+if ((cr+1.0f)*(cr+1.0f)+ci*ci < 0.0625f)    return;   /* period-2 bulb */
+```
+
+**Mode-aware log normalization:**
+Anti-mode creates extreme dynamic range (attractor cells: millions of hits; transient cells: 1–5 hits). `t = log(1+count)/log(1+max_count)` compresses this. The invisible floor is mode-dependent:
+- Buddha: floor=0.05 (preserve low-density orbital structure)
+- Anti: floor=0.25 (suppress transient noise dots)
+
+**Grid struct** holds a static `uint32_t counts[80][300]` buffer (~96 KB). `max_count` is tracked incrementally — updated whenever a cell's count exceeds the current maximum.
+
+**Five presets:** buddha-500, buddha-2000, anti-100, anti-500, anti-1000. After TOTAL_SAMPLES=150000 the image holds briefly then advances to the next preset.
+
+### Pascal-Triangle Formation Flying — bat.c
+
+`bat.c` is an artistic demo with three groups of ASCII bats flying outward from the terminal centre. Each group uses a filled Pascal-triangle formation.
+
+**Formation layout:**
+Row r contains r+1 bats. Total bats for n_rows = (n_rows+1)*(n_rows+2)/2. Flat index k maps to row and position via triangular-number inverse:
+```c
+int r = 0;
+while ((r+1)*(r+2)/2 <= k) r++;
+int pos = k - r*(r+1)/2;
+*along = -(float)r * LAG_PX;
+*perp  = ((float)pos - (float)r * 0.5f) * SPREAD_PX;
+```
+
+**World-space rotation:** formation offsets (along/perp) are rotated into world space using the group's flight angle. Leader sits at apex (along=perp=0); row 1 has two bats at ±SPREAD_PX/2 perpendicular; row 2 has three at −SPREAD_PX, 0, +SPREAD_PX; and so on.
+
+**Live resize:** `+`/`-` keys change n_rows (1–6) while groups fly. New bats are placed at `leader_px + along*cos(angle) - perp*sin(angle)` without interrupting motion.
+
+**Wing animation:** four-frame cycle per group (`/`, `-`, `\`, `-`) advances each tick. All bats in a group share the same phase, giving a synchronized flap.
+
 ---
 
 *This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `misc/bounce_ball.c`.*

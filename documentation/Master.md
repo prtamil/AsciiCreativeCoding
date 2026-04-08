@@ -156,6 +156,8 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [P7 Fisher-Yates Random Pixel Reveal](#p7-fisher-yates-random-pixel-reveal)
 - [P8 Koch Snowflake — Midpoint Subdivision](#p8-koch-snowflake--midpoint-subdivision)
 - [P9 Recursive Tip Branching — Lightning](#p9-recursive-tip-branching--lightning)
+- [P10 Buddhabrot — Density Accumulator Fractal](#p10-buddhabrot--density-accumulator-fractal)
+- [P11 Pascal-Triangle Bat Swarms — Artistic Formation Flying](#p11-pascal-triangle-bat-swarms--artistic-formation-flying)
 
 ---
 
@@ -928,6 +930,74 @@ This produces a fractal binary tree that spreads as it descends — each child's
 The glow halo is generated at draw time (not stored in the grid): for each frozen cell, Manhattan neighbors at distance 1 and 2 are drawn with dim attributes if they are empty.
 
 *Files: `lightning.c`*
+
+#### P10 Buddhabrot — Density Accumulator Fractal
+
+The Buddhabrot is a rendering of the Mandelbrot iteration that illuminates orbital trajectories rather than escape-time values. For each randomly sampled complex number c that escapes (|z| exceeds 2 within max_iter steps), every point visited by its orbit is projected onto a 2-D hit-count grid. Cells traversed by many orbits accumulate large counts and glow brightest in the final image — producing a figure that resembles a seated Buddha.
+
+**Two-pass sampling:**
+
+```
+Pass 1 (escape test):  iterate z→z²+c from z=0; record whether c escapes
+Pass 2 (orbit trace):  if condition met, iterate again and increment counts[row][col]
+```
+
+The two-pass design avoids allocating an orbit buffer. Pass 1 is cheap (just a boolean result); pass 2 is only run for orbits that satisfy the mode condition.
+
+**Anti-Buddhabrot** traces orbits that do NOT escape (bounded orbits), illuminating the Mandelbrot interior structure rather than the outer filaments.
+
+**Cardioid/bulb pre-rejection** skips samples inside the main cardioid and period-2 bulb in Buddha mode — these never escape, so they waste iterations without contributing:
+
+```c
+float q = (cr - 0.25f) * (cr - 0.25f) + ci * ci;
+if (q * (q + cr - 0.25f) < 0.25f * ci * ci) return;  /* cardioid */
+if ((cr+1.0f)*(cr+1.0f) + ci*ci < 0.0625f)   return;  /* period-2 bulb */
+```
+
+**Dynamic range problem and log normalization:**
+Anti-mode attractor cells accumulate up to `max_iter × accepted_samples` hits (millions). With sqrt normalization, every transient cell (count=1) maps to sqrt(1/10⁶)≈0.001 — still in the first visible band — causing dots scattered across a blank screen. Log normalization `t = log(1+count)/log(1+max_count)` compresses this: a transient cell with count=1 maps to log(2)/log(10⁶+1)≈0.035, below the invisible floor.
+
+**Mode-aware invisible floor:**
+Buddha mode has far lower max_count, so the floor is kept low (0.05) to preserve fine structure. Anti mode uses a high floor (0.25) to suppress noise dots:
+
+```c
+float floor = anti ? 0.25f : 0.05f;
+if (t < floor) return 0;  /* invisible */
+```
+
+**Five presets:** buddha 500, buddha 2000 (outer filaments), anti 100, anti 500, anti 1000 (interior complexity). Each preset accumulates TOTAL_SAMPLES=150000 random samples then holds for DONE_PAUSE_TICKS before cycling.
+
+*Files: `buddhabrot.c`*
+
+#### P11 Pascal-Triangle Bat Swarms — Artistic Formation Flying
+
+`bat.c` renders three groups of ASCII bats flying outward from the terminal centre in formation. Each group is a filled Pascal triangle with the leader at the apex and subsequent rows filling with increasing numbers of bats.
+
+**Formation indexing (bat_form_offset):**
+Given flat bat index k, row r is the largest r where r*(r+1)/2 ≤ k:
+- Row 0: 1 bat (leader)
+- Row 1: 2 bats
+- Row r: r+1 bats
+- Total for n_rows rows: (n_rows+1)*(n_rows+2)/2
+
+Position within the formation is computed as:
+```c
+int r = 0;
+while ((r+1)*(r+2)/2 <= k) r++;
+int pos = k - r*(r+1)/2;
+*along = -(float)r * LAG_PX;           /* behind leader */
+*perp  = ((float)pos - (float)r * 0.5f) * SPREAD_PX;  /* left-right spread */
+```
+
+The along/perp offsets are rotated into world space using the group's flight angle: `world_x = along*cos(angle) - perp*sin(angle)`.
+
+**Wing animation:** four-frame cycle `/ - \ -` for left wing, mirrored for right wing. Body character is always `o`. The wing phase advances each tick for all bats in a group simultaneously.
+
+**Live resize:** `+`/`-` keys change n_rows (1–6). New bats are placed in formation relative to the current leader position without interrupting flight. Maximum bats per group = (6+1)*(6+2)/2 = 28.
+
+**Three groups** with staggered launch (30 ticks apart) and distinct colors: light purple (xterm 141), electric cyan (xterm 87), pink-magenta (xterm 213). Six preset launch angles (330°, 210°, 90°, 45°, 135°, 270°) distribute groups in different directions each cycle.
+
+*Files: `bat.c`*
 
 ---
 

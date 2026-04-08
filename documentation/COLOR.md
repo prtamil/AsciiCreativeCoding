@@ -481,6 +481,41 @@ else                         color = COL_BOLT_BOT;    /* xterm 231 white     */
 
 ---
 
+## 22. Density-Accumulator Coloring (Buddhabrot)
+
+**Where:** buddhabrot.c
+
+**How it works:**
+The Buddhabrot builds a `uint32_t counts[rows][cols]` hit-count grid. Every orbit point increments its cell's counter. At draw time, each non-zero cell is mapped to one of five color bands using log-normalized density.
+
+**Log normalization:**
+```c
+float t = logf(1.0f + (float)count)
+        / logf(1.0f + (float)max_count);
+```
+`log(1+x)` compresses the extreme dynamic range: anti-mode attractor cells accumulate millions of hits while transient cells get 1–5. With sqrt normalization, `sqrt(1/10⁶) ≈ 0.001` still falls in the lowest visible band — producing scattered dots across a blank screen. With log, the same cell maps to ≈0.035 — below the invisible floor.
+
+**Mode-aware invisible floor:**
+```c
+float floor = anti ? 0.25f : 0.05f;
+if (t < floor) return 0;   /* draw nothing */
+```
+Anti-mode uses a high floor (0.25) because its max_count is enormous. Buddha mode uses a low floor (0.05) to keep fine orbital structure visible.
+
+**Five-level nebula palette** — purple→white gradient maps orbital density to perceived luminosity:
+
+| Band | t range | xterm index | Color | Char |
+|------|---------|-------------|-------|------|
+| C1 | 0.05–0.45 (buddha) / 0.25–0.45 (anti) | 55 | Dark blue-purple | `.` |
+| C2 | 0.45–0.62 | 93 | Violet | `:` |
+| C3 | 0.62–0.78 | 141 | Light purple | `+` |
+| C4 | 0.78–0.90 | 183 | Lavender-pink | `#` |
+| C5 | ≥ 0.90 | 231 | White (bold) | `@` |
+
+**Effect:** The completed image resembles a luminous nebula — sparse orbital filaments in dark purple, dense orbital crossings in white. Anti-mode produces a bright interior attractor surrounded by radiating structure.
+
+---
+
 ## 17. xterm-256 Palette Index Reference
 
 **How it works:**
@@ -516,6 +551,10 @@ Specific indices are chosen for maximum visibility on black backgrounds.
 | 38    | Ocean blue       | snowflake inner-mid                  |
 | 45    | Sky blue         | lightning top; snowflake walker      |
 | 33    | Dodger blue      | flocking                             |
+| 55    | Dark blue-purple | buddhabrot band 1 (lowest density)   |
+| 93    | Violet           | buddhabrot band 2                    |
+| 183   | Lavender-pink    | buddhabrot band 4                    |
+| 213   | Pink-magenta     | bat group 2                          |
 | 203   | Coral red        | coral aggregate layer 1              |
 | 86    | Teal-cyan        | coral; koch level 2                  |
 | 232   | Near-black       | theme backgrounds                    |

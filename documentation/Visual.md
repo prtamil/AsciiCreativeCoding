@@ -2293,6 +2293,40 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
+### fractal_random/buddhabrot.c
+*Buddhabrot density accumulator — orbital trajectory heatmap, purple→white nebula palette.*
+
+**Two-pass orbit sampling** — Pass 1 tests whether c escapes within max_iter steps. Pass 2 (only for qualifying samples) re-iterates and increments `counts[row][col]` for each orbit point inside the display region. No orbit buffer is allocated; the two-pass design re-derives the orbit cheaply.
+
+**Anti-Buddhabrot mode** — same algorithm but traces orbits that do NOT escape (bounded/interior orbits). Reveals the interior structure of the Mandelbrot set as a dense attractor pattern.
+
+**Log normalization with mode-aware floor** — `t = log(1+count)/log(1+max_count)`. Anti mode uses floor=0.25 to suppress the scattered dots caused by transient cells with count=1 against a max_count of millions. Buddha mode uses floor=0.05 to preserve low-density orbital detail:
+```c
+float floor = anti ? 0.25f : 0.05f;
+if (t < floor) return 0;   /* invisible */
+```
+
+**Five presets cycling automatically** — buddha-500, buddha-2000, anti-100, anti-500, anti-1000. After TOTAL_SAMPLES=150000 the image pauses then advances. `n` / `r` skips to next preset immediately.
+
+**Nebula color palette** — five levels: dark blue-purple (55) → violet (93) → light purple (141) → lavender-pink (183) → white bold (231). Characters: `.` `:` `+` `#` `@`.
+
+---
+
+### Artistic/bat.c
+*Three groups of ASCII bats in Pascal-triangle formation flying outward from centre.*
+
+**Pascal-triangle formation** — row r has r+1 bats; total = (n_rows+1)*(n_rows+2)/2. Flat index k maps to row/position via triangular-number inverse (`bat_form_offset`). Leader sits at apex; each successive row spreads wider by SPREAD_PX per slot.
+
+**`+` / `-` live resize** — changes n_rows (1–6) while groups are in flight. New bats are placed at the correct formation position relative to the current leader without interrupting motion. Maximum 28 bats per group (n_rows=6).
+
+**Wing animation** — four-frame cycle: `/`, `-`, `\`, `-` for the left wing; mirrored for the right. All bats in a group share the same phase tick, giving synchronized flapping.
+
+**Three groups, staggered launch** — groups launch 30 ticks apart (STAGGER_TICKS). Colors: group 0 = xterm 141 (light purple), group 1 = xterm 87 (electric cyan), group 2 = xterm 213 (pink-magenta). Six preset angles (330°/210°/90°/45°/135°/270°) distribute flight directions each cycle.
+
+**Keys: `+`/`-` bat rows, `r`/`n` reset/next** — in addition to standard `q`/`p`/`[`/`]`.
+
+---
+
 ## Quick-Reference Matrix
 
 `✓` = technique present. `—` = not used.
@@ -2331,6 +2365,8 @@ char ch = k_boid_chars[flock_id][octant];
 | mandelbrot | ✓ | — | — | — | — | — | — | — | — | — |
 | koch | ✓ | — | — | — | — | — | — | — | — | — |
 | lightning | ✓ | — | — | — | — | — | — | — | — | — |
+| buddhabrot | ✓ | — | — | — | — | — | — | — | — | — |
+| bat | ✓ | — | — | — | — | — | — | — | — | — |
 
 \* kaboom uses a `Cell[]` pre-render buffer (→ V2.5 pattern) not a `zbuf[]`.
 
@@ -2424,6 +2460,12 @@ char ch = k_boid_chars[flock_id][octant];
 | Recursive tip branching | — (see Architecture §22) | lightning |
 | Depth-position coloring | — (see COLOR §21) | lightning, koch |
 | Glow halo at draw time | — (see Architecture §22) | lightning |
+| Two-pass orbit sampling | — (see Architecture §22) | buddhabrot |
+| Log density normalization | — (see COLOR §22) | buddhabrot |
+| Mode-aware invisible floor | — (see COLOR §22) | buddhabrot |
+| Pascal-triangle formation index | — (see Architecture §22) | bat |
+| Formation world-space rotation | — (see Architecture §22) | bat |
+| Synchronized wing animation | — | bat |
 | Sleep before render | V8.1 | all |
 | `getmaxyx` vs `LINES`/`COLS` | V8.2 | all |
 | `CLOCK_MONOTONIC` no NTP jumps | V8.3 | all |
@@ -2431,4 +2473,4 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-*This document is the single reference for all ncurses techniques used across the C files in this project (24 original + 8 fractal_random = 32 files). For fractal algorithms and IFS theory, see Master.md §P. For the overall loop architecture and fractal-specific subsystems, see Architecture.md §22. For color-specific techniques including escape-time and distance-based coloring, see COLOR.md.*
+*This document is the single reference for all ncurses techniques used across the C files in this project (24 original + 9 fractal_random + 1 Artistic = 34 files). For fractal algorithms and IFS theory, see Master.md §P. For the overall loop architecture and fractal-specific subsystems, see Architecture.md §22. For color-specific techniques including escape-time, distance-based, and density-accumulator coloring, see COLOR.md.*

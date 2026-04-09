@@ -9,8 +9,9 @@ gcc -std=c11 -O2 -Wall -Wextra ncurses_basics/aspect_ratio.c    -o aspect_ratio 
 gcc -std=c11 -O2 -Wall -Wextra ncurses_basics/spring_pendulum.c -o spring_pendulum -lncurses -lm
 
 # ── misc ─────────────────────────────────────────────────────────────────
-gcc -std=c11 -O2 -Wall -Wextra misc/bounce_ball.c  -o bounce  -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra misc/bonsai.c       -o bonsai  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra misc/bounce_ball.c       -o bounce          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra misc/bonsai.c            -o bonsai          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra misc/double_pendulum.c   -o double_pendulum -lncurses -lm
 
 # ── matrix ───────────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra matrix_rain/matrix_rain.c -o matrix_rain -lncurses -lm
@@ -43,6 +44,7 @@ gcc -std=c11 -O2 -Wall -Wextra fractal_random/buddhabrot.c  -o buddhabrot   -lnc
 
 # ── artistic ──────────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra Artistic/bat.c               -o bat          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra Artistic/2stroke.c           -o 2stroke      -lncurses -lm
 
 # ── raster (software rasterizer) ─────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
@@ -70,6 +72,7 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  
 ### misc/
 - `bounce_ball.c`       — **reference implementation** — bouncing balls with pixel-space physics, fixed-timestep accumulator, render interpolation (alpha), SIGWINCH resize
 - `bonsai.c`            — growing bonsai tree: recursive branch growth, 5 tree types, pot styles, message panel with ACS box-drawing chars, `use_default_colors`
+- `double_pendulum.c`   — double pendulum with RK4 integration demonstrating chaos: ghost pendulum (θ₁+ε), 500-slot trail ring buffer, divergence HUD metric; COMPRESSION/POWER/EXHAUST phases
 
 ### matrix_rain/
 - `matrix_rain.c`       — Matrix-style falling character rain: two-pass draw, theme system, render interpolation for smooth column-head scrolling
@@ -102,6 +105,7 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  
 
 ### Artistic/
 - `bat.c`          — ASCII bat swarms in Pascal-triangle formation: 3 groups × (n_rows+1)(n_rows+2)/2 bats each; `+`/`-` resize rows 1–6 live; wing animation `/−\−`; 6 preset launch angles; staggered group launch; light-purple/cyan/pink groups
+- `2stroke.c`      — 2-stroke engine cross-section: slider-crank kinematics (piston/rod/crankshaft), exhaust and transfer port open/close, spark at TDC, phase labels COMPRESSION/IGNITION/POWER/EXHAUST/SCAVENGING; `] [` RPM control
 
 ### raster/
 - `torus_raster.c`      — UV torus, 4 shaders (phong / toon / normals / wireframe), always-on back-face cull

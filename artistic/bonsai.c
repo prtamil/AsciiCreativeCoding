@@ -173,25 +173,39 @@ static const char *k_pot_names[] = { "big", "small", "none" };
 
 /*
  * Pot art — drawn centred at (cx, base_row).
- * POT_BIG matches cbonsai's original big base.
- * POT_SMALL is a minimal one-liner.
+ *
+ * All strings in each array share the same maxw so draw_pot's
+ * left-edge calculation (lx = cx - maxw/2) keeps every line
+ * visually centred.  Each row's wall characters sit at the
+ * same column positions as the rows above and below.
+ *
+ * POT_BIG  (17-char max, walls at col 1 and col 16):
+ *   row 0  __ rim top  __ (cols 2-15, inset 1 from walls)
+ *   row 1  /  rim arc  \  (cols 1-16, outermost)
+ *   row 2  |  body     |  (cols 1-16, same as rim arc)
+ *   row 3  |  body     |
+ *   row 4  \_ base arc_/  (cols 2-15, inset 1, tapers inward)
+ *
+ * POT_SMALL (10-char max, walls at col 0 and col 9):
+ *   row 0   _ rim top _   (cols 1-8, inset 1)
+ *   row 1  /  body    \   (cols 0-9, outermost)
+ *   row 2  |  body    |   (cols 0-9)
+ *   row 3  \_ base   _/   (cols 1-8, inset 1)
  */
 static const char *k_pot_big[] = {
-    "         :",
-    "        .:.",
-    "       .:  :.",
-    "      .:    :.",
-    "  ___.:______:___",
-    " /          \\",
-    "|            |",
-    " \\__________/",
+    "  ______________",
+    " /              \\",
+    " |              |",
+    " |              |",
+    "  \\____________/",
     NULL
 };
 
 static const char *k_pot_small[] = {
-    "   :.",
-    " .:  :.",
-    ".:    :.",
+    " ________",
+    "/        \\",
+    "|        |",
+    " \\______/",
     NULL
 };
 
@@ -223,7 +237,7 @@ static int draw_pot(int cx, int rows, PotType type)
     }
     attroff(COLOR_PAIR(5) | A_BOLD);
 
-    return top_row - 1;   /* row just above pot top = trunk base */
+    return top_row;   /* trunk initialises here; first draw lands at top_row-1 (rim-adjacent) */
 }
 
 /* ===================================================================== */
@@ -707,7 +721,7 @@ typedef struct {
     /* regrow wait state */
     int64_t   wait_accum;   /* ns accumulated waiting after tree done   */
 
-    /* where trunk starts (row above pot top) */
+    /* trunk init row = pot's top row; first drawn char lands one row above */
     int       trunk_base_y;
     int       trunk_cx;     /* centre x */
 } Scene;

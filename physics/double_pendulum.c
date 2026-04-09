@@ -100,9 +100,11 @@ enum {
 
 /*
  * ARM_LEN_FRAC — each arm is this fraction of the pixel-space height.
- * 0.26 × ph(rows) gives ~20 cells per arm on a 50-row terminal.
+ * Pivot is at screen centre, so worst-case reach is 2×arm upward or
+ * downward.  0.22 × ph keeps the full swing within ~44 % of half-height
+ * on each side — visible on any typical terminal.
  */
-#define ARM_LEN_FRAC    0.26f
+#define ARM_LEN_FRAC    0.22f
 #define GRAVITY_PX      2000.0f
 
 /*
@@ -292,7 +294,7 @@ static void dpend_init(DPend *p, int cols, int rows,
                        float t1_deg, float t2_deg, float w1, float w2)
 {
     p->pivot_px = (float)pw(cols) * 0.5f;
-    p->pivot_py = (float)CELL_H * 1.5f;      /* 1.5 cells from top row   */
+    p->pivot_py = (float)ph(rows) * 0.5f;    /* centre of screen         */
     p->arm_len  = (float)ph(rows) * ARM_LEN_FRAC;
 
     p->s = (State){
@@ -413,7 +415,7 @@ static void draw_line(int x0, int y0, int x1, int y1,
     int err = dx - dy;
 
     for (;;) {
-        if (x0 >= 0 && x0 < cols && y0 > 0 && y0 < rows) {
+        if (x0 >= 0 && x0 < cols && y0 >= 0 && y0 < rows) {
             int  e2     = 2 * err;
             bool step_x = (e2 > -dy);
             bool step_y = (e2 <  dx);
@@ -464,11 +466,14 @@ static void scene_draw(const Scene *s, float alpha)
     int b_cx   = px_to_cell_x(bx);
     int b_cy   = px_to_cell_y(by);
 
-    /* ── 1. top bar ────────────────────────────────────────────────── */
-    attron(COLOR_PAIR(CP_BAR) | A_BOLD);
-    for (int x = 0; x < cols; x++) mvaddch(0, x, '=');
-    if (piv_cx >= 0 && piv_cx < cols) mvaddch(0, piv_cx, 'v');
-    attroff(COLOR_PAIR(CP_BAR) | A_BOLD);
+    /* ── 1. pivot marker (centre of screen) ───────────────────────── */
+    if (piv_cx >= 1 && piv_cx < cols - 1 && piv_cy >= 0 && piv_cy < rows) {
+        attron(COLOR_PAIR(CP_BAR) | A_BOLD);
+        mvaddch(piv_cy, piv_cx - 1, '[');
+        mvaddch(piv_cy, piv_cx,     '+');
+        mvaddch(piv_cy, piv_cx + 1, ']');
+        attroff(COLOR_PAIR(CP_BAR) | A_BOLD);
+    }
 
     /* ── 2. trail ──────────────────────────────────────────────────── */
     if (s->show_trail && s->trail.count > 0) {
@@ -485,7 +490,7 @@ static void scene_draw(const Scene *s, float alpha)
             int idx = (start + i) % TRAIL_LEN;
             int cx  = px_to_cell_x(s->trail.px[idx]);
             int cy  = px_to_cell_y(s->trail.py[idx]);
-            if (cx < 0 || cx >= cols || cy <= 0 || cy >= rows) continue;
+            if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
 
             float age = (float)i / (float)draw;   /* 0=oldest, 1=newest */
             int   cp;

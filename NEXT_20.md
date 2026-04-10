@@ -72,65 +72,34 @@ Slowly erode the heightmap each tick (thermal weathering) so mountains crumble t
 
 ## artistic/
 
-### 10. `cellular_automata_1d.c` — Wolfram 1-D Elementary CA
-256 rules on a 1-cell-wide row; new rows scroll upward filling the screen.
-Rule 110 is Turing-complete; Rule 30 is cryptographic randomness; Rule 90 is Sierpinski.
-Preset bank cycles through the most visually striking rules automatically.
-Interactive: type any rule number 0–255 to switch instantly.
-**Challenge:** mapping binary rule output to a scrolling terminal buffer without full erase; colour by rule-class (periodic / chaotic / complex / fractal).
-
-### 11. `lissajous.c` — Harmonograph / Lissajous
+### 10. `lissajous.c` — Harmonograph / Lissajous
 Two perpendicular damped oscillators; frequency ratio and phase drift slowly.
 Trace the evolving parametric knot — figure-8s, stars, petals, spirals in sequence.
 Auto-cycle through rational frequency ratios (1:1, 2:3, 3:4, 3:5 …).
 **Challenge:** slow enough phase drift to reveal each shape fully before transitioning.
 
-### 12. `aurora.c` — Aurora Borealis
+### 11. `aurora.c` — Aurora Borealis
 Layered fBm noise bands scrolling horizontally, 3–5 vertical curtain columns.
 Green/cyan core, purple/pink fringes, brightness shimmer from a second noise octave.
 Star field background (static dots).  Pure colour-art — no physics.
 **Challenge:** multi-layer noise blending in 256-color pairs without banding artefacts.
 
-### 13. `voronoi.c` — Animated Voronoi
+### 12. `voronoi.c` — Animated Voronoi
 20–30 seed points moving with slow Brownian drift.
 Each cell coloured by seed index; cell boundaries drawn with `·` dots.
 Seeds "bounce" off edges.  Optional: Fortune's algorithm HUD showing sweep line.
 **Challenge:** per-frame brute-force nearest-seed search fast enough at terminal resolution.
 
-### 14. `spirograph.c` — Spirograph (Hypotrochoid / Epitrochoid)
+### 13. `spirograph.c` — Spirograph (Hypotrochoid / Epitrochoid)
 Parametric r, R, d with slow parameter drift.  Multiple simultaneous curves
 in different colors, slightly out of phase.  Fade old curves so new ones emerge.
 **Challenge:** smooth Bresenham rasterization of the dense parametric curve without gaps.
-
-### 15. `cymatics.c` — Chladni Figures
-2-D standing-wave modes: Z(x,y) = cos(mπx)cos(nπy) − cos(nπx)cos(mπy).
-Near-zero regions are the nodal lines — draw them as solid chars, rest empty.
-Cycle through (m,n) pairs; animate the transition by interpolating the field.
-**Challenge:** smooth zero-crossing detection for clean nodal line rendering.
-
-### 16. `string_art.c` — Mathematical String Art
-N nails evenly spaced on a circle; threads connect nail i to nail (i×k) mod N.
-Slowly increment k — star polygons morph through cardioids, nephroid, epicycloids.
-Multiple overlapping thread sets in contrasting colours; fade old threads as k advances.
-**Challenge:** Bresenham line deduplication so overlapping threads don't blow out brightness; smooth k-drift timing.
 
 ---
 
 ## misc/
 
-### 17. `life.c` — Conway's Game of Life + Variants
-Auto-seed known patterns (glider gun, R-pentomino, Gosper gun).
-Key-cycle through rule variants: Conway B3/S23, HighLife B36/S23, Seeds B2/S,
-Morley B368/S245.  Population histogram scrolls at bottom.
-**Challenge:** rule-string parser so any Bx/Sy variant works without code changes.
-
-### 18. `langton.c` — Langton's Ant + Turmites
-Classic 2-state ant (RL rule) produces highway after ~10 000 steps.
-Extend to multi-colour turmites (LLRR, RLR, …) — each makes a distinct pattern.
-Show multiple ants simultaneously in different colors.
-**Challenge:** toroidal wrap; fast enough to run 10 k steps per rendered frame.
-
-### 19. `sort_vis.c` — Sorting Algorithm Visualiser
+### 14. `sort_vis.c` — Sorting Algorithm Visualiser
 Animated vertical bar chart.  Algorithms: bubble, insertion, selection, merge,
 quicksort, heapsort, radix.  Color: unsorted grey → comparison cyan → swap red → sorted green.
 Key-cycle algorithms; speed control.  Step counter and comparison count HUD.
@@ -140,7 +109,7 @@ Key-cycle algorithms; speed control.  Step counter and comparison count HUD.
 
 ## raymarcher/
 
-### 20. `metaballs.c` — SDF Metaballs + Blending
+### 15. `metaballs.c` — SDF Metaballs + Blending
 5–8 metaballs moving on Lissajous paths; smooth-min SDF blending (k-factor).
 Phong shading + soft shadows.  Vary k live to morph between separate spheres
 and fully merged blob.  Color by surface curvature.
@@ -152,13 +121,13 @@ and fully merged blob.  Color by surface curvature.
 
 | Priority | File | Reason |
 |---|---|---|
-| 1 | `lorenz.c`               | Natural companion to double_pendulum; iconic shape |
-| 2 | `cellular_automata_1d.c` | Instant visual payoff; trivial loop, stunning variety across 256 rules |
-| 3 | `life.c`                 | Classic that's missing; fast to implement |
-| 4 | `nbody.c`                | Extends double_pendulum physics folder nicely |
-| 5 | `terrain.c`              | Diamond-square is short; striking contour output |
-| 6 | `aurora.c`               | Pure artistic; no physics, just colour layering |
-| 7 | `sandpile.c`             | Short, surprising, fits fractal_random folder |
-| 8 | `string_art.c`           | Minimal code, hypnotic morphing shapes |
-| 9 | `cloth.c`                | Most complex physics; save for after simpler ones |
-| 10 | `metaballs.c`           | Extends raymarcher folder naturally |
+| 1 | `lorenz.c`     | Natural companion to double_pendulum; iconic shape |
+| 2 | `nbody.c`      | Extends double_pendulum physics folder nicely |
+| 3 | `terrain.c`    | Diamond-square is short; striking contour output |
+| 4 | `aurora.c`     | Pure artistic; no physics, just colour layering |
+| 5 | `sandpile.c`   | Short, surprising, fits fractal_random folder |
+| 6 | `lissajous.c`  | Natural companion to epicycles and string_art |
+| 7 | `spirograph.c` | Similar to lissajous, easy after it |
+| 8 | `sort_vis.c`   | Educational; visually satisfying |
+| 9 | `cloth.c`      | Most complex physics; save for after simpler ones |
+| 10 | `metaballs.c` | Extends raymarcher folder naturally |

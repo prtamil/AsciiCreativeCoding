@@ -2327,6 +2327,134 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
+### fluid/wave.c
+*FDTD 2-D wave equation with five togglable point sources.*
+
+**Triple-buffer FDTD** — `u_prev`, `u_cur`, `u_new` planes rotate each step. Explicit scheme: `u_new = 2·u_cur − u_prev + c²·∇²u_cur`. CFL stability: `c = 0.45` (max safe ≈ 0.707). Per-step damping factor dissipates energy.
+
+**Signed amplitude → 9-level ramp** — Negative (troughs) map to cool/dim colors; near-zero maps to blank; positive (crests) map to warm/bright colors. The sign distinction makes interference fringes immediately readable.
+
+**Five sources, offset frequencies** — Each source oscillates at a slightly different frequency. Beating between adjacent pairs creates slowly shifting interference patterns. Keys `1`–`5` toggle each source independently.
+
+**Dynamic theme** — 4 themes, re-register color pairs on `t` keypress (→ V3.10).
+
+---
+
+### fluid/reaction_diffusion.c
+*Gray-Scott two-chemical reaction-diffusion: spots, stripes, coral, worms.*
+
+**9-point isotropic Laplacian** — `∇²u ≈ 0.20·(N+S+E+W) + 0.05·(NE+NW+SE+SW) − u`. More rotationally symmetric than the 4-point stencil, producing rounder spots and stripes.
+
+**Dual-grid ping-pong** — `grid[0]` and `grid[1]` alternate as read/write each step. Active index flips between 0 and 1. This ensures all cells read the same generation (simultaneous update, not sequential).
+
+**Color by V concentration** — The V channel (catalyst) is mapped through a theme palette. High V = pattern; low V = background. Multiple themes swap the palette live.
+
+**600-step warm-up** — Pre-computed before first display so patterns are already developed at startup, not just seeds.
+
+---
+
+### physics/double_pendulum.c
+*Chaotic double pendulum with ghost trajectory and fading trail.*
+
+**RK4 integration** — 4th-order Runge-Kutta for the Lagrangian equations of motion. Lower-order integrators (Euler, Verlet) accumulate phase errors on the Lyapunov time-scale that look identical to real chaos — RK4 keeps the simulation honest for longer.
+
+**Ghost trajectory** — A second pendulum starts with `θ₁ + GHOST_EPSILON` offset. Both are identical at first; after ~3–5 s they diverge completely, demonstrating sensitive dependence on initial conditions. The HUD shows the angular separation.
+
+**Ring-buffer trail with warm-to-cool fade** — Recent trail positions render bright red/orange; older positions fade to dim grey. Same ring-buffer pattern as flowfield.c (→ V5.14), but with a warm-to-cool color gradient instead of age-based alpha.
+
+**Subpixel pivot** — The pivot point is at screen center in pixel space; bob positions are converted to terminal cells at draw time.
+
+---
+
+### artistic/epicycles.c
+*DFT of parametric shapes animated as a chain of rotating arms.*
+
+**DFT arm chain** — Shape sampled into N=256 complex points, DFT computed, coefficients sorted by amplitude (largest first). At angle φ, each arm contributes `(|Z[n]|/N)·exp(i·(freq_n·φ + arg Z[n]))`. Arms are chained from the pivot; the tip traces the original shape.
+
+**Auto-add to show convergence** — Every `AUTO_ADD_FRAMES = 12` frames one more epicycle is added. Starting with 1 arm and slowly growing to all 256 shows how Fourier series builds up a shape from pure sinusoids.
+
+**Subpixel coordinates** — `CELL_W = 8` sub-pixel space (same as flocking.c → §4 coords). Arm positions stored in pixel space, divided by `CELL_W`/`CELL_H` at draw time for isotropic proportions.
+
+**Orbit circles** — The `N_CIRCLES` largest arms draw their orbit as `·` dots when toggled with `c`. Clarifies why specific shapes emerge from the harmonic chain.
+
+---
+
+### artistic/leaf_fall.c
+*Procedural ASCII tree followed by matrix-rain leaf fall.*
+
+**ST_DISPLAY / ST_FALLING / ST_RESET state machine** — Three states with distinct tick rates. `spc` skips the current state. Each new tree uses fresh random parameters so no two trees are identical.
+
+**Recursive branching** — Trunk drawn bottom-up; branches grown from a stack (`BSTACK`) with heading angle, length, depth. At each node the tree probabilistically splits into two sub-branches with randomised spread. Leaves placed at terminal tips.
+
+**Matrix-rain leaf fall** — Each leaf column has a white `*` head moving downward at `FALL_NS` rate with a 7-character green trail behind it. Same two-pass structure as matrix_rain.c (→ V5.3). Columns stagger their start by a random delay (`MAX_START_DELAY`) for organic appearance.
+
+---
+
+### artistic/string_art.c
+*Mathematical string art: N nails on a circle, threads connect i → round(i·k) mod N.*
+
+**k-multiplier thread art** — Multiplier `k` drifts continuously. At integer k values cardioid (k=2), nephroid (k=3), deltoid (k=4), astroid (k=5) emerge. Speed modulates near integers (`mult = 0.15 + 1.70·(dist²·4)`) so named shapes hold long enough to read.
+
+**Slope-based thread characters** — Each thread line uses one of `-`, `|`, `/`, `\` chosen by visual slope with aspect correction: `vs = |dy·2/dx|`; `vs < 0.577` → `-`; `vs > 1.732` → `|`; else sign-correct `/` or `\`. Makes individual threads look like actual lines rather than scatter.
+
+**Circle rim + nail markers** — `RIM_STEPS = 2000` points draw the circle as `·`. Nails drawn as bold `o` on top. Provides clear visual landmarks for the geometry.
+
+**12-step rainbow** — Fixed 256-color cycle covering spectrum. Thread `i` uses `CP_T0 + (i % 12)`, giving each nail its own hue.
+
+---
+
+### artistic/cellular_automata_1d.c
+*Wolfram elementary rules animated as a build-down pattern.*
+
+**3-neighbor bitmask rule** — `next[c] = (rule >> ((l<<2)|(m<<1)|r)) & 1`. The 8-bit rule number directly encodes the 8 possible 3-neighbor combinations. Any of the 256 rules can be set live by typing a number.
+
+**Build-down animation** — Pattern builds from row 0 downward; `g_gen` tracks how many rows are visible. `ST_BUILD` adds one row per `g_delay` ticks; `ST_PAUSE` (90 ticks, ~3 s) holds the complete pattern before resetting.
+
+**A_REVERSE title bar in class color** — Row 0 shows rule name and number in `attron(COLOR_PAIR(cp) | A_BOLD | A_REVERSE)`. The background block in the class color immediately identifies whether the rule is fixed/periodic/chaotic/complex/fractal without obscuring the CA grid.
+
+**Live digit input** — Typing 1–3 digits accumulates a rule number, applying immediately after 3 digits or Enter. Lets the user explore any Wolfram rule without cycling through presets.
+
+---
+
+### artistic/life.c
+*Conway's Game of Life and five rule variants with population histogram.*
+
+**B/S bitmask rules** — `uint16_t birth` and `uint16_t survive` where bit N is set if neighbor count N triggers the event. Testing: `(mask >> n) & 1`. Adding a new rule requires only two bitmask literals; the step function is rule-agnostic.
+
+**Double-buffered grid swap** — `g_grid[2][MAX_ROWS][MAX_COLS]`. After computing the next generation into buffer `1 - g_buf`, `g_buf` flips. The step function always reads from `g_buf` and writes to `1 - g_buf`.
+
+**Dynamic color per rule** — `color_apply()` re-registers `CP_LIVE` with the current rule's 256-color index when the rule changes (→ V3.13 dynamic color re-registration). Each of the 6 rules gets a distinct hue.
+
+**Population histogram** — `HIST_LEN = 512` ring buffer stores per-generation counts. Bottom 3 rows render as a bar chart growing upward: `level = pop/max_pop · HIST_ROWS · 2`. Shows oscillations, extinction events, and the transition to stable configurations.
+
+---
+
+### artistic/langton.c
+*Langton's Ant and multi-colour turmites: rule-string-driven ant automata.*
+
+**Rule string as cell-state turn sequence** — `rule[s % g_n_colors]` gives the turn ('R' or 'L') for a cell in state `s`. After turning, the cell advances: `(state + 1) % g_n_colors`. "RL" is the classic 2-state Langton's ant; "LLRR", "LRRL" etc. produce more complex structures.
+
+**Modulo-4 direction cycling** — Four directions (N/E/S/W). Turn right: `(dir + 1) % 4`. Turn left: `(dir + 3) % 4` (equivalent to `(dir - 1 + 4) % 4`). Toroidal wrap on move: `(r + DR[dir] + g_rows) % g_rows`.
+
+**Multi-ant shared grid** — 1–3 ants share the same `g_grid`. They interact because each reads and modifies the same cell states. Produces emergent structures not seen with a single ant.
+
+**High step rate** — `STEPS_DEF = 200` ant steps per frame; `+`/`-` doubles/halves up to `STEPS_MAX = 2000`. Needed because the classic "RL" highway requires ~10,000 steps to emerge.
+
+---
+
+### artistic/cymatics.c
+*Chladni nodal-line figures with morph animation between 20 modes.*
+
+**Chladni formula** — `Z(x,y) = cos(m·π·x)·cos(n·π·y) − cos(n·π·x)·cos(m·π·y)` where `(x,y) ∈ [0,1]`. Nodal lines where `Z ≈ 0` are where sand collects on a vibrating plate. 20 mode pairs `(m,n)` with `1 ≤ m < n ≤ 7`.
+
+**Blended morph** — `z = (1−t)·z1 + t·z2` where `t` advances `MORPH_SPEED = 0.025f` per tick. Smooth transition between modes takes ~1.3 s. After morphing, `ST_HOLD` pauses for 4 s (120 ticks) before the next morph.
+
+**Nodal glow bands** — Five threshold bands around the nodal line use progressively fainter characters (`@#*+.`). Cells beyond `|Z| ≥ 0.40` are blank. The innermost band (`|Z| < 0.04`) is white `CP_NODE`; outer bands are colored by sign (CP_POS vs CP_NEG).
+
+**Four themes** — Classic/Ocean/Ember/Neon. Each theme has different `CP_POS` and `CP_NEG` color pairs. `color_init()` re-registers all pairs on theme change (→ V3.10).
+
+---
+
 ## Quick-Reference Matrix
 
 `✓` = technique present. `—` = not used.
@@ -2367,6 +2495,16 @@ if (t < floor) return 0;   /* invisible */
 | lightning | ✓ | — | — | — | — | — | — | — | — | — |
 | buddhabrot | ✓ | — | — | — | — | — | — | — | — | — |
 | bat | ✓ | — | — | — | — | — | — | — | — | — |
+| wave | ✓ | — | — | — | — | — | ✓ | ✓ | — | — |
+| reaction_diffusion | ✓ | — | — | — | — | — | ✓ | ✓ | — | — |
+| double_pendulum | ✓ | — | — | — | — | — | — | ✓ | — | — |
+| epicycles | ✓ | — | — | — | — | — | — | ✓ | — | — |
+| leaf_fall | ✓ | — | — | — | — | — | — | ✓ | — | — |
+| string_art | ✓ | — | — | — | — | — | — | ✓ | — | — |
+| cellular_automata_1d | ✓ | — | — | — | — | — | — | ✓ | — | — |
+| life | ✓ | — | — | — | — | — | ✓ | ✓ | — | — |
+| langton | ✓ | — | — | — | — | — | — | — | — | — |
+| cymatics | ✓ | — | — | — | — | — | ✓ | ✓ | — | — |
 
 \* kaboom uses a `Cell[]` pre-render buffer (→ V2.5 pattern) not a `zbuf[]`.
 
@@ -2466,6 +2604,22 @@ if (t < floor) return 0;   /* invisible */
 | Pascal-triangle formation index | — (see Architecture §22) | bat |
 | Formation world-space rotation | — (see Architecture §22) | bat |
 | Synchronized wing animation | — | bat |
+| FDTD triple-buffer signed ramp | — (see Architecture §23) | wave |
+| Gray-Scott dual-grid ping-pong | — (see Architecture §24) | reaction_diffusion |
+| 9-point isotropic Laplacian | — (see Architecture §24) | reaction_diffusion |
+| RK4 integration + ghost trajectory | — (see Architecture §25) | double_pendulum |
+| DFT epicycle arm chain | — (see Architecture §26) | epicycles |
+| Build-down CA animation | — (see Architecture §29) | cellular_automata_1d |
+| B/S bitmask cellular automaton | — (see Architecture §30) | life |
+| Dynamic color per rule switch | V3.13 | life, wave, reaction_diffusion, cymatics |
+| Population histogram ring buffer | — (see Architecture §30) | life |
+| Rule-string turmite ant | — (see Architecture §31) | langton |
+| Chladni nodal-glow band rendering | — (see Architecture §32) | cymatics |
+| ST_HOLD / ST_MORPH blended morph | — (see Architecture §32) | cymatics |
+| k-multiplier thread art | — (see Architecture §28) | string_art |
+| Slope chars via aspect-corrected gradient | V4.8 | string_art, spring_pendulum, bonsai |
+| A_REVERSE title bar in class color | — | cellular_automata_1d |
+| Matrix-rain leaf fall with stagger | V5.3 | leaf_fall |
 | Sleep before render | V8.1 | all |
 | `getmaxyx` vs `LINES`/`COLS` | V8.2 | all |
 | `CLOCK_MONOTONIC` no NTP jumps | V8.3 | all |

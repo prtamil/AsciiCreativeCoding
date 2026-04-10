@@ -49,6 +49,11 @@ gcc -std=c11 -O2 -Wall -Wextra Artistic/bat.c               -o bat          -lnc
 gcc -std=c11 -O2 -Wall -Wextra Artistic/2stroke.c           -o 2stroke      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/leaf_fall.c         -o leaf_fall    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/epicycles.c         -o epicycles    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/string_art.c        -o string_art          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/cellular_automata_1d.c -o cellular_automata_1d -lncurses
+gcc -std=c11 -O2 -Wall -Wextra artistic/life.c                -o life                -lncurses
+gcc -std=c11 -O2 -Wall -Wextra artistic/langton.c             -o langton             -lncurses
+gcc -std=c11 -O2 -Wall -Wextra artistic/cymatics.c            -o cymatics            -lncurses -lm
 
 # ── raster (software rasterizer) ─────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
@@ -113,7 +118,12 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  
 - `bat.c`          — ASCII bat swarms in Pascal-triangle formation: 3 groups × (n_rows+1)(n_rows+2)/2 bats each; `+`/`-` resize rows 1–6 live; wing animation `/−\−`; 6 preset launch angles; staggered group launch; light-purple/cyan/pink groups
 - `2stroke.c`      — 2-stroke engine cross-section: slider-crank kinematics (piston/rod/crankshaft), exhaust and transfer port open/close, spark at TDC, phase labels COMPRESSION/IGNITION/POWER/EXHAUST/SCAVENGING; `] [` RPM control
 - `leaf_fall.c`    — ASCII tree with matrix-rain leaf fall
-- `epicycles.c`    — Fourier epicycles: DFT of parametric shape (heart/star/trefoil/fig-8/butterfly), sorted-by-amplitude arm chain, auto-adds epicycles to show convergence; orbit circles, colour-faded trail: recursive branching (depth 7, spread ±0.5 rad), elliptical foliage clusters; DISPLAY → FALLING → RESET state machine; per-leaf start-delay stagger, white head + green trail (TRAIL_LEN=7), new algorithmically varied tree each cycle
+- `epicycles.c`    — Fourier epicycles: DFT of parametric shape (heart/star/trefoil/fig-8/butterfly), sorted-by-amplitude arm chain, auto-adds epicycles to show convergence; orbit circles, colour-faded trail
+- `string_art.c`  — Mathematical string art: N=200 nails on circle, threads connect i→round(i×k) mod N, k drifts 2→7.5 morphing cardioid/nephroid/deltoid/astroid; rainbow thread colors (12-step palette), visible nail markers (o), circle rim (·), [/] nail count presets 6–200
+- `cellular_automata_1d.c` — Wolfram 1-D elementary CA: 17 preset rules (30/90/110/18/150…), builds top-down row-by-row, 5 Wolfram classes color-coded, auto-cycle, type any rule 0–255+Enter
+- `life.c`    — Conway's Game of Life + 5 rule variants (HighLife/Day&Night/Seeds/Morley/2×2), 6-colour palette, Gosper gun/glider/acorn/R-pentomino seeds, 3-row scrolling population histogram
+- `langton.c` — Langton's Ant + 7 multi-colour turmite rules (RL/LR/LLRR/RLR/LRRL…), 1–3 simultaneous ants, cell states colour-coded, ant shown as bold @
+- `cymatics.c` — Chladni figures: Z=cos(mπx)cos(nπy)−cos(nπx)cos(mπy), 20 (m,n) modes, nodal lines rendered with glow chars (@#*+.), smooth morph animation between modes, 4 colour themes
 
 ### raster/
 - `torus_raster.c`      — UV torus, 4 shaders (phong / toon / normals / wireframe), always-on back-face cull

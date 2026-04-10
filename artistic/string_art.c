@@ -1,8 +1,8 @@
 /*
  * string_art.c — Mathematical String Art
  *
- * N nails evenly spaced on a circle; threads connect nail i to nail
- * round(i × k) mod N.  k drifts slowly through [2, 7.5]:
+ * N nails on a visible circle; threads connect nail i → round(i×k) mod N.
+ * k drifts slowly through [2, 7.5]:
  *
  *   k ≈ 2  →  Cardioid       (1 cusp)
  *   k ≈ 3  →  Nephroid       (2 cusps)
@@ -11,19 +11,25 @@
  *   k ≈ 6  →  5-Epicycloid
  *   k ≈ 7  →  6-Epicycloid
  *
- * Three thread sets (phase-offset by 0.18) drawn in separate colours;
- * where sets overlap the cell brightens to white.  A float density
- * buffer fades each frame — threads linger like long-exposure photography.
+ * Rendering:
+ *   ·         circle rim  (the "board" the nails are pinned to)
+ *   o  bold   nail        (white, drawn on top of rim and threads)
+ *   - | / \   thread      (slope-based char; each nail gets its own colour
+ *                          cycling through a 12-step rainbow palette)
+ *
+ * k slows near integer values so each named shape dwells for a few seconds.
+ *
+ * Nail count presets ([ / ]):  6  8  12  16  20  30  60  90  120  200
+ * With few nails each thread is individually visible; with 200 nails the
+ * dense envelope traces the curve boundary.
  *
  * Keys:
  *   q / Q     quit
  *   space     pause / resume
- *   r / R     reset  (k → 2, clear density)
- *   + / =     increase k speed  × 1.5
- *   - / _     decrease k speed  ÷ 1.5
- *   f         decrease fade  (trails linger longer)
- *   F         increase fade  (trails clear faster)
- *   t / T     next colour theme
+ *   r / R     reset  (k → 2)
+ *   [ / ]     fewer / more nails  (steps through preset list)
+ *   + / =     increase k drift speed  × 1.5
+ *   - / _     decrease k drift speed  ÷ 1.5
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra artistic/string_art.c \
@@ -48,46 +54,44 @@
 
 /* ── §1 config ───────────────────────────────────────────────────────── */
 
-#define TICK_NS       33333333LL  /* ~30 fps                              */
-#define N_NAILS       200         /* nails on circle                      */
-#define K_START       2.0f        /* lowest k (cardioid)                  */
-#define K_END         7.5f        /* highest k before wrap                */
-#define K_SPEED_DEF   0.0015f     /* k increment per tick                 */
-#define K_SPEED_MIN   0.0002f
-#define K_SPEED_MAX   0.020f
-#define N_SETS        3           /* overlapping thread sets              */
-#define FADE_DEF      0.900f      /* density multiplied by this each tick */
-#define FADE_MIN      0.700f
-#define FADE_MAX      0.995f
-#define ADD_PER_HIT   0.050f      /* density added per Bresenham pixel    */
-#define CELL_W        8           /* pixel sub-cells per terminal column  */
-#define CELL_H        16          /* pixel sub-cells per terminal row     */
+#define TICK_NS       33333333LL   /* ~30 fps                             */
+#define N_NAILS_MAX   200
+#define K_START       2.0f
+#define K_END         7.5f
+#define K_SPEED_DEF   0.0008f      /* k increment per tick at full speed  */
+#define K_SPEED_MIN   0.0001f
+#define K_SPEED_MAX   0.010f
+#define CELL_W        8
+#define CELL_H        16
 #define MAX_ROWS      128
 #define MAX_COLS      320
+#define RIM_STEPS     2000         /* sample points for circle rim        */
 
-/* phase offsets between the three sets */
-static const float K_OFF[N_SETS] = { 0.00f, 0.18f, 0.36f };
+/* Thread colour pairs occupy slots CP_T0 … CP_T0+N_TCOLS-1.
+ * Non-thread pairs sit below that range. */
+#define N_TCOLS  12
+#define CP_T0    10
 
-/* color-pair IDs */
-enum { CP_BG = 1, CP_S0, CP_S1, CP_S2, CP_BRIGHT, CP_HUD };
-
-/* 4 themes: [theme][set_index] → 256-color fg  (8-color fallback below) */
-static const short THEMES[4][N_SETS] = {
-    {  51, 213, 226 },   /* cyan / magenta / yellow  — classic */
-    { 196, 208, 220 },   /* red  / orange  / gold    — fire    */
-    {  45,  75, 123 },   /* sky  / indigo  / navy    — ice     */
-    {  82, 201,  46 },   /* lime / violet  / green   — neon    */
+/* 12-step rainbow (256-color) */
+static const short TCOL_256[N_TCOLS] = {
+    196, 202, 208, 214, 226, 154, 46, 51, 45, 27, 93, 201
 };
-static const char * const THEME_NAMES[] = { "Classic", "Fire", "Ice", "Neon" };
-#define N_THEMES 4
+/* 8-color fallback cycle */
+static const short TCOL_8[N_TCOLS] = {
+    COLOR_RED, COLOR_RED, COLOR_YELLOW, COLOR_YELLOW,
+    COLOR_YELLOW, COLOR_GREEN, COLOR_GREEN, COLOR_CYAN,
+    COLOR_CYAN, COLOR_BLUE, COLOR_MAGENTA, COLOR_MAGENTA
+};
 
-/* density-to-character ramp (low → high density) */
-static const char RAMP[] = " .:-=+*#@";
-#define RAMP_N ((int)(sizeof(RAMP) - 1))
+enum { CP_RIM = 1, CP_NAIL = 2, CP_HUD = 3 };
+
+/* available nail counts */
+static const int NAIL_PRESETS[] = { 6, 8, 12, 16, 20, 30, 60, 90, 120, 200 };
+#define N_PRESETS  ((int)(sizeof(NAIL_PRESETS) / sizeof(NAIL_PRESETS[0])))
 
 static const char *shape_name(float k)
 {
-    switch ((int)(k + 0.15f)) {
+    switch ((int)(k + 0.12f)) {
         case 2:  return "Cardioid";
         case 3:  return "Nephroid";
         case 4:  return "Deltoid";
@@ -106,7 +110,6 @@ static long long clock_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
-
 static void clock_sleep_ns(long long ns)
 {
     if (ns <= 0) return;
@@ -116,50 +119,45 @@ static void clock_sleep_ns(long long ns)
 
 /* ── §3 color ────────────────────────────────────────────────────────── */
 
-static int g_theme = 0;
-
 static void color_init(void)
 {
     start_color();
     use_default_colors();
-    init_pair(CP_BG,     -1,                                  -1);
-    init_pair(CP_BRIGHT, (COLORS >= 256) ? 231 : COLOR_WHITE, -1);
-    init_pair(CP_HUD,    (COLORS >= 256) ?  82 : COLOR_GREEN, -1);
-}
-
-static void theme_apply(void)
-{
     if (COLORS >= 256) {
-        init_pair(CP_S0, THEMES[g_theme][0], -1);
-        init_pair(CP_S1, THEMES[g_theme][1], -1);
-        init_pair(CP_S2, THEMES[g_theme][2], -1);
+        init_pair(CP_RIM,  245, -1);  /* mid-grey rim  */
+        init_pair(CP_NAIL, 231, -1);  /* white nails   */
+        init_pair(CP_HUD,   82, -1);  /* green HUD     */
+        for (int i = 0; i < N_TCOLS; i++)
+            init_pair(CP_T0 + i, TCOL_256[i], -1);
     } else {
-        static const short fb[N_SETS] =
-            { COLOR_CYAN, COLOR_MAGENTA, COLOR_YELLOW };
-        init_pair(CP_S0, fb[0], -1);
-        init_pair(CP_S1, fb[1], -1);
-        init_pair(CP_S2, fb[2], -1);
+        init_pair(CP_RIM,  COLOR_WHITE,  -1);
+        init_pair(CP_NAIL, COLOR_YELLOW, -1);
+        init_pair(CP_HUD,  COLOR_GREEN,  -1);
+        for (int i = 0; i < N_TCOLS; i++)
+            init_pair(CP_T0 + i, TCOL_8[i], -1);
     }
 }
 
 /* ── §4 coords ───────────────────────────────────────────────────────── */
 
-static int g_nail_cx[N_NAILS];   /* cell-space nail positions */
-static int g_nail_cy[N_NAILS];
-static int g_rows, g_cols;
+static int   g_nail_cx[N_NAILS_MAX];
+static int   g_nail_cy[N_NAILS_MAX];
+static int   g_rows, g_cols;
+static float g_r_px, g_cx_px, g_cy_px;
+static int   g_n_nails;
 
-static void compute_nails(int rows, int cols)
+static void compute_nails(int rows, int cols, int n)
 {
-    g_rows = rows;
-    g_cols = cols;
-    /* pixel-space circle → maps to an on-screen circle (aspect-correct) */
-    float r_px  = fminf((float)cols * CELL_W, (float)rows * CELL_H) * 0.44f;
-    float cx_px = (float)cols * CELL_W * 0.5f;
-    float cy_px = (float)rows * CELL_H * 0.5f;
-    for (int i = 0; i < N_NAILS; i++) {
-        float a  = 2.0f * (float)M_PI * i / N_NAILS;
-        int   cx = (int)(cx_px + r_px * cosf(a)) / CELL_W;
-        int   cy = (int)(cy_px + r_px * sinf(a)) / CELL_H;
+    g_rows    = rows;
+    g_cols    = cols;
+    g_n_nails = n;
+    g_r_px    = fminf((float)cols * CELL_W, (float)rows * CELL_H) * 0.44f;
+    g_cx_px   = (float)cols * CELL_W * 0.5f;
+    g_cy_px   = (float)rows * CELL_H * 0.5f;
+    for (int i = 0; i < n; i++) {
+        float a  = 2.0f * (float)M_PI * i / n;
+        int   cx = (int)(g_cx_px + g_r_px * cosf(a)) / CELL_W;
+        int   cy = (int)(g_cy_px + g_r_px * sinf(a)) / CELL_H;
         g_nail_cx[i] = cx < 0 ? 0 : cx >= cols ? cols - 1 : cx;
         g_nail_cy[i] = cy < 0 ? 0 : cy >= rows ? rows - 1 : cy;
     }
@@ -167,38 +165,10 @@ static void compute_nails(int rows, int cols)
 
 /* ── §5 simulation ───────────────────────────────────────────────────── */
 
-/* per-set float density grid; values in [0, 1] */
-static float g_dens[N_SETS][MAX_ROWS * MAX_COLS];
-
-#define DIDX(r, c)  ((r) * g_cols + (c))
-
-/*
- * Add 'val' to every cell on the Bresenham segment (x0,y0)→(x1,y1).
- * Unsigned cast trick: negative coords → large unsigned → fails < check.
- */
-static void bres_add(float *buf, int x0, int y0, int x1, int y1, float val)
-{
-    int dx =  abs(x1 - x0), sx = (x0 < x1) ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
-    for (;;) {
-        if ((unsigned)x0 < (unsigned)g_cols &&
-            (unsigned)y0 < (unsigned)g_rows) {
-            float *p = &buf[DIDX(y0, x0)];
-            *p += val;
-            if (*p > 1.0f) *p = 1.0f;
-        }
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
-    }
-}
-
 static float g_k;
 static float g_k_speed;
-static float g_fade;
 static int   g_paused;
+static int   g_nail_preset;
 
 static float wrap_k(float k)
 {
@@ -210,74 +180,93 @@ static float wrap_k(float k)
 
 static void sim_init(void)
 {
-    g_k       = K_START;
-    g_k_speed = K_SPEED_DEF;
-    g_fade    = FADE_DEF;
-    g_paused  = 0;
-    memset(g_dens, 0, sizeof(g_dens));
+    g_k          = K_START;
+    g_k_speed    = K_SPEED_DEF;
+    g_paused     = 0;
+    g_nail_preset = N_PRESETS - 1;  /* start at 200 nails */
 }
 
 static void sim_tick(void)
 {
     if (g_paused) return;
-
-    g_k = wrap_k(g_k + g_k_speed);
-
-    /* fade all density buffers */
-    int total = g_rows * g_cols;
-    for (int s = 0; s < N_SETS; s++)
-        for (int i = 0; i < total; i++)
-            g_dens[s][i] *= g_fade;
-
-    /* draw threads for each set */
-    for (int s = 0; s < N_SETS; s++) {
-        float k = wrap_k(g_k + K_OFF[s]);
-        for (int i = 0; i < N_NAILS; i++) {
-            /* roundf gives smoother morphing between integer-k shapes */
-            int j = (int)roundf((float)i * k) % N_NAILS;
-            if (j < 0) j += N_NAILS;
-            bres_add(g_dens[s],
-                     g_nail_cx[i], g_nail_cy[i],
-                     g_nail_cx[j], g_nail_cy[j],
-                     ADD_PER_HIT);
-        }
-    }
+    /*
+     * Speed modulation: slowest at integer k (0.15×) so named shapes
+     * are visible long enough to read.  dist ∈ [0, 0.5].
+     */
+    float dist = fabsf(g_k - roundf(g_k));
+    float mult = 0.15f + 1.70f * (dist * dist * 4.0f);
+    if (mult > 1.0f) mult = 1.0f;
+    g_k = wrap_k(g_k + g_k_speed * mult);
 }
 
 /* ── §6 scene ────────────────────────────────────────────────────────── */
 
-static const int SET_CP[N_SETS] = { CP_S0, CP_S1, CP_S2 };
+/*
+ * One character represents each thread based on its visual slope.
+ * dy is multiplied by 2 to account for 2:1 cell aspect ratio so that
+ * a "visual 45°" line is classified correctly.
+ */
+static char thread_char(int x0, int y0, int x1, int y1)
+{
+    int dx = x1 - x0, dy = y1 - y0;
+    if (dx == 0 && dy == 0) return '+';
+    float vs = (dx != 0) ? fabsf((float)dy * 2.0f / (float)dx) : 1e9f;
+    if (vs < 0.577f) return '-';
+    if (vs > 1.732f) return '|';
+    return ((dx > 0) == (dy > 0)) ? '\\' : '/';
+}
+
+static void bres_draw(int x0, int y0, int x1, int y1, chtype ch)
+{
+    int dx =  abs(x1 - x0), sx = (x0 < x1) ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = (y0 < y1) ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        if ((unsigned)x0 < (unsigned)g_cols &&
+            (unsigned)y0 < (unsigned)g_rows)
+            mvaddch(y0, x0, ch);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
 
 static void scene_draw(void)
 {
-    for (int r = 0; r < g_rows; r++) {
-        for (int c = 0; c < g_cols - 1; c++) {
-            float d[N_SETS];
-            float dmax = 0.0f;
-            int   smax = 0;
-            int   n_hot = 0;
+    int n = g_n_nails;
 
-            for (int s = 0; s < N_SETS; s++) {
-                d[s] = g_dens[s][DIDX(r, c)];
-                if (d[s] > dmax) { dmax = d[s]; smax = s; }
-            }
-
-            if (dmax < 0.015f) { mvaddch(r, c, ' '); continue; }
-
-            /* cell is "hot" for a set if its density is ≥ 45% of the max */
-            for (int s = 0; s < N_SETS; s++)
-                if (d[s] >= dmax * 0.45f) n_hot++;
-
-            /* overlap of 2+ sets → white; single-set → that set's colour */
-            int cp = (n_hot > 1) ? CP_BRIGHT : SET_CP[smax];
-            int ci = (int)(dmax * (float)(RAMP_N - 1) + 0.5f);
-            if (ci >= RAMP_N) ci = RAMP_N - 1;
-
-            attron(COLOR_PAIR(cp));
-            mvaddch(r, c, (chtype)(unsigned char)RAMP[ci]);
-            attroff(COLOR_PAIR(cp));
-        }
+    /* ── 1. threads (underneath nails) ──────────────────────────────── */
+    for (int i = 0; i < n; i++) {
+        int j = (int)roundf((float)i * g_k) % n;
+        if (j < 0) j += n;
+        chtype ch = (chtype)(unsigned char)
+                    thread_char(g_nail_cx[i], g_nail_cy[i],
+                                g_nail_cx[j], g_nail_cy[j]);
+        /* each nail index gets its own colour from the 12-step rainbow */
+        attron(COLOR_PAIR(CP_T0 + i % N_TCOLS));
+        bres_draw(g_nail_cx[i], g_nail_cy[i],
+                  g_nail_cx[j], g_nail_cy[j], ch);
+        attroff(COLOR_PAIR(CP_T0 + i % N_TCOLS));
     }
+
+    /* ── 2. circle rim (overdraw threads at boundary) ────────────────── */
+    attron(COLOR_PAIR(CP_RIM) | A_DIM);
+    for (int a = 0; a < RIM_STEPS; a++) {
+        float angle = 2.0f * (float)M_PI * a / RIM_STEPS;
+        int cx = (int)(g_cx_px + g_r_px * cosf(angle)) / CELL_W;
+        int cy = (int)(g_cy_px + g_r_px * sinf(angle)) / CELL_H;
+        if ((unsigned)cx < (unsigned)g_cols &&
+            (unsigned)cy < (unsigned)g_rows)
+            mvaddch(cy, cx, '.');
+    }
+    attroff(COLOR_PAIR(CP_RIM) | A_DIM);
+
+    /* ── 3. nails (bright white, on top of everything) ───────────────── */
+    attron(COLOR_PAIR(CP_NAIL) | A_BOLD);
+    for (int i = 0; i < n; i++)
+        mvaddch(g_nail_cy[i], g_nail_cx[i], 'o');
+    attroff(COLOR_PAIR(CP_NAIL) | A_BOLD);
 }
 
 static void scene_hud(void)
@@ -285,12 +274,11 @@ static void scene_hud(void)
     if (g_rows < 2) return;
     attron(COLOR_PAIR(CP_HUD));
     mvprintw(g_rows - 1, 0,
-             " k=%.3f [%-12s] spd=%.4f fade=%.2f %s theme=%-7s"
-             "  spc:pause r:reset +/-:spd f/F:fade t:theme q:quit ",
-             (double)g_k, shape_name(g_k),
-             (double)g_k_speed, (double)g_fade,
-             g_paused ? "PAUSED" : "      ",
-             THEME_NAMES[g_theme]);
+             " k=%.3f [%-12s] nails=%3d  spd=%.4f  %s"
+             "  spc:pause  r:reset  [/]:nails  +/-:spd  q:quit ",
+             (double)g_k, shape_name(g_k), g_n_nails,
+             (double)g_k_speed,
+             g_paused ? "PAUSED" : "      ");
     attroff(COLOR_PAIR(CP_HUD));
 }
 
@@ -306,7 +294,6 @@ static void screen_init(void)
     curs_set(0);
     typeahead(-1);
     color_init();
-    theme_apply();
 }
 
 static void screen_resize(void)
@@ -315,8 +302,7 @@ static void screen_resize(void)
     getmaxyx(stdscr, rows, cols);
     if (rows > MAX_ROWS) rows = MAX_ROWS;
     if (cols > MAX_COLS) cols = MAX_COLS;
-    compute_nails(rows, cols);
-    memset(g_dens, 0, sizeof(g_dens));
+    compute_nails(rows, cols, NAIL_PRESETS[g_nail_preset]);
     erase();
 }
 
@@ -330,7 +316,6 @@ static void sig_handler(int sig)
     if (sig == SIGWINCH) g_need_resize = 1;
     else                 g_running     = 0;
 }
-
 static void cleanup(void) { endwin(); }
 
 int main(void)
@@ -341,8 +326,8 @@ int main(void)
     atexit(cleanup);
 
     screen_init();
+    sim_init();         /* sets g_nail_preset before screen_resize uses it */
     screen_resize();
-    sim_init();
 
     long long next = clock_ns();
 
@@ -357,12 +342,9 @@ int main(void)
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
-            case 'q': case 'Q': g_running = 0;  break;
-            case ' ':           g_paused ^= 1;  break;
-            case 'r': case 'R':
-                memset(g_dens, 0, sizeof(g_dens));
-                g_k = K_START;
-                break;
+            case 'q': case 'Q': g_running = 0; break;
+            case ' ':           g_paused ^= 1; break;
+            case 'r': case 'R': g_k = K_START; break;
             case '+': case '=':
                 g_k_speed *= 1.5f;
                 if (g_k_speed > K_SPEED_MAX) g_k_speed = K_SPEED_MAX;
@@ -371,23 +353,22 @@ int main(void)
                 g_k_speed /= 1.5f;
                 if (g_k_speed < K_SPEED_MIN) g_k_speed = K_SPEED_MIN;
                 break;
-            case 'f':
-                g_fade -= 0.02f;
-                if (g_fade < FADE_MIN) g_fade = FADE_MIN;
+            case ']':
+                if (g_nail_preset < N_PRESETS - 1) {
+                    g_nail_preset++;
+                    compute_nails(g_rows, g_cols, NAIL_PRESETS[g_nail_preset]);
+                }
                 break;
-            case 'F':
-                g_fade += 0.02f;
-                if (g_fade > FADE_MAX) g_fade = FADE_MAX;
-                break;
-            case 't': case 'T':
-                g_theme = (g_theme + 1) % N_THEMES;
-                theme_apply();
+            case '[':
+                if (g_nail_preset > 0) {
+                    g_nail_preset--;
+                    compute_nails(g_rows, g_cols, NAIL_PRESETS[g_nail_preset]);
+                }
                 break;
             }
         }
 
         sim_tick();
-
         erase();
         scene_draw();
         scene_hud();
@@ -397,6 +378,5 @@ int main(void)
         next += TICK_NS;
         clock_sleep_ns(next - clock_ns());
     }
-
     return 0;
 }

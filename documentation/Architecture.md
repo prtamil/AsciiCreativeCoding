@@ -1533,4 +1533,289 @@ int pos = k - r*(r+1)/2;
 
 ---
 
+## 23. FDTD Wave Equation — fluid/wave.c
+
+`wave.c` simulates the scalar 2-D wave equation on the terminal grid with five togglable oscillating sources.
+
+**Three-buffer FDTD:**
+Each step uses three planes: `u_prev`, `u_cur`, `u_new`. The explicit finite-difference scheme:
+```
+u_new[r][c] = 2·u_cur[r][c] − u_prev[r][c]
+            + c² · (u[r+1][c]+u[r-1][c]+u[r][c+1]+u[r][c-1] − 4·u[r][c])
+```
+After computing `u_new`, the buffers rotate: `u_prev ← u_cur`, `u_cur ← u_new`. CFL stability requires `c·√2 ≤ 1`; the code uses `c = 0.45` for a comfortable margin.
+
+**Signed amplitude → 9-level ramp:**
+The wave amplitude is real-valued and signed. Negative values (troughs) map to cool/dim colours; near-zero maps to blank (background shows through); positive values (crests) map to warm/bright colours. This gives the interference fringes immediate visual depth.
+
+**Five sources with offset frequencies:**
+Each of the five point sources drives a sinusoidal oscillation at a slightly different frequency (e.g. 0.10, 0.11, 0.12 …). Beating between adjacent sources creates slowly shifting fringe patterns. Any source can be toggled on/off with keys `1`–`5`.
+
+**Damping:**
+A per-step damping factor `DAMP` (default ≈ 0.993) multiplies `u_cur` after each step. Without damping the grid would saturate; too much damping kills patterns immediately.
+
+---
+
+## 24. Gray-Scott Reaction-Diffusion — fluid/reaction_diffusion.c
+
+`reaction_diffusion.c` implements the Gray-Scott model — two chemicals U and V that react and diffuse.
+
+**The equations:**
+```
+dU/dt = Du·∇²U  −  U·V²  +  f·(1−U)
+dV/dt = Dv·∇²V  +  U·V²  −  (f+k)·V
+```
+U is the substrate (starts at 1, replenished by feed rate `f`). V is the catalyst (starts near 0, removed by kill rate `k`). The nonlinear term `U·V²` drives pattern formation.
+
+**9-point isotropic Laplacian:**
+```
+∇²u ≈ 0.20·(N+S+E+W) + 0.05·(NE+NW+SE+SW) − u
+```
+This is more rotationally symmetric than the 4-point stencil, producing rounder spots and stripes.
+
+**Dual-grid ping-pong:**
+Two grids `grid[0]` and `grid[1]` alternate as read and write each step. The active index `g_cur` flips between 0 and 1. This ensures simultaneous update — every cell reads the same generation.
+
+**Parameter presets:**
+Small shifts in (f, k) produce radically different patterns. The 7 presets span the known regime map:
+| Preset | f | k | Visual |
+|---|---|---|---|
+| Mitosis | 0.0367 | 0.0649 | dividing spots |
+| Coral | 0.0545 | 0.0620 | branching coral |
+| Stripes | 0.0300 | 0.0570 | zebra stripes |
+| Worms | 0.0780 | 0.0610 | writhing worms |
+| Maze | 0.0290 | 0.0570 | labyrinth |
+| Bubbles | 0.0980 | 0.0570 | expanding rings |
+| Solitons | 0.0250 | 0.0500 | stable moving blobs |
+
+**Warm-up:** 600 steps are pre-computed before the first frame so patterns are already developed at startup.
+
+---
+
+## 25. Chaotic Double Pendulum — physics/double_pendulum.c
+
+`double_pendulum.c` integrates the exact Lagrangian equations of motion for a double pendulum (equal masses, equal arm lengths).
+
+**Equations of motion:**
+Let `δ = θ₁ − θ₂`, `D = 3 − cos 2δ` (always ≥ 2, never singular):
+```
+θ₁'' = [−3g sin θ₁ − g sin(θ₁−2θ₂) − 2 sin δ (ω₂²L + ω₁²L cos δ)] / (L·D)
+θ₂'' = [2 sin δ (2ω₁²L + 2g cos θ₁ + ω₂²L cos δ)] / (L·D)
+```
+
+**RK4 integration:**
+4th-order Runge-Kutta is used rather than Euler or Verlet. On chaotic trajectories, lower-order integrators accumulate phase errors on the Lyapunov time-scale (~3–5 s) that are visually indistinguishable from genuine chaos — RK4 keeps the simulation honest for longer.
+
+**Ghost pendulum for chaos demonstration:**
+A dim second pendulum starts with `θ₁ + GHOST_EPSILON` (a tiny offset). Both trajectories are identical at first; after ~3–5 s they diverge completely. The HUD shows the angular separation growing exponentially, making Lyapunov sensitivity tangible.
+
+**Ring-buffer trail:**
+The second bob traces a `TRAIL_LEN`-entry ring buffer of past positions. The most recent entries render in bright red/orange; older entries fade to dim grey. This reveals the complex attractor geometry.
+
+---
+
+## 26. Fourier Epicycles — artistic/epicycles.c
+
+`epicycles.c` computes the DFT of a sampled parametric path and animates the rotating arm chain whose tip traces the original shape.
+
+**Algorithm:**
+1. Sample the chosen shape into `N_SAMPLES = 256` complex points `z[k]`.
+2. Compute DFT: `Z[n] = Σ_k z[k]·exp(−2πi·n·k/N)`
+3. Sort coefficients by amplitude `|Z[n]|/N` (largest arm first).
+4. Animate: at angle `φ`, arm `n` contributes `(|Z[n]|/N) · exp(i·(freq_n·φ + arg Z[n]))`, chained from the pivot.
+5. Auto-add one epicycle every `AUTO_ADD_FRAMES` to show convergence from a single arm to the full shape.
+
+**Five shapes:** Heart, Star, Trefoil, Figure-8, Butterfly — sampled as parametric `(x(t), y(t))` curves over `[0, 2π]`.
+
+**Subpixel coordinates:**
+Same `CELL_W=8` subpixel scheme as in flocking.c — arm tip positions are stored in pixel space and divided by `CELL_W`/`CELL_H` at draw time so diagonal arms look proportional on the terminal.
+
+**Orbit circles:**
+The `N_CIRCLES` largest-amplitude arms draw their orbit circles as faint `·` dots. Toggled with `c`. Seeing the circles clarifies why certain shapes emerge from the harmonic chain.
+
+---
+
+## 27. Leaf Fall — artistic/leaf_fall.c
+
+`leaf_fall.c` draws a procedural ASCII tree, then rains its leaves down in matrix-rain style before resetting with a new tree.
+
+**State machine:**
+```
+ST_DISPLAY (2.5 s) → ST_FALLING (until all leaves settle) → ST_RESET (0.7 s) → new tree
+```
+Each state has its own tick rate. `spc` skips the current state.
+
+**Recursive tree generation:**
+The trunk is drawn as a vertical stack of `|` characters. Branches are grown recursively from tip to base using a branching stack (`BSTACK`). Each branch has a heading angle, length, and depth. At each node the tree probabilistically splits into two sub-branches with slightly randomised spread angles. Leaves are placed at terminal branch tips.
+
+**Matrix-rain leaf fall:**
+Each leaf column has a `head` position (white `*` character) moving downward at `FALL_NS` rate and a trail of `TRAIL_LEN = 7` green characters fading behind it. Columns start with a staggered delay (`MAX_START_DELAY` ticks) so the fall looks organic rather than synchronized. Once the head reaches the bottom the column turns off.
+
+**Algorithmic variation:**
+Each new tree uses fresh random parameters for trunk height (45–65% of screen), spread angle, and branch-length ratio. No two trees look identical.
+
+---
+
+## 28. String Art — artistic/string_art.c
+
+`string_art.c` recreates the mathematical string art technique: N nails on a circle, connected by threads using a multiplier rule.
+
+**Thread mathematics:**
+For multiplier `k`, thread `i` connects nail `i` to nail `round(i·k) mod N`. As `k` varies continuously, distinct shapes emerge at rational `k` values:
+- `k = 2` → cardioid
+- `k = 3` → nephroid
+- `k = 4` → deltoid
+- `k = 5` → astroid
+
+**Speed modulation near integers:**
+The drift speed of `k` is modulated so `k` slows dramatically as it approaches integer values, then accelerates through the irrational region. This ensures each named shape is visible long enough to appreciate:
+```c
+float dist = fabsf(g_k - roundf(g_k));
+float mult = 0.15f + 1.70f * (dist * dist * 4.0f);
+g_k += K_SPEED * mult;
+```
+
+**Slope-based thread characters:**
+Each thread is drawn as a straight line using `mvaddch`. The character is chosen by the visual slope of the thread with aspect correction (`vs = |dy * 2 / dx|`):
+- `vs < 0.577` → `-`
+- `vs > 1.732` → `|`
+- else sign-correct `/` or `\`
+
+**Circle rim and nail markers:**
+`RIM_STEPS = 2000` sample points draw the circle as `·` characters. Nails are drawn as bold `o` on top of the rim. This gives the user clear visual landmarks.
+
+**Rainbow palette:**
+12 fixed 256-colour indices cover the spectrum. Thread `i` uses `CP_T0 + (i % N_TCOLS)`, giving each nail its own color in the rainbow cycle.
+
+---
+
+## 29. 1-D Wolfram Cellular Automata — artistic/cellular_automata_1d.c
+
+`cellular_automata_1d.c` animates all 256 Wolfram elementary rules as a build-down pattern that grows from a single cell at the top.
+
+**Rule encoding:**
+For a cell with left neighbour `l`, itself `m`, right neighbour `r`:
+```c
+next[c] = (rule >> ((l<<2) | (m<<1) | r)) & 1
+```
+The 8-bit rule number encodes the 8 possible 3-neighbor combinations.
+
+**Build-down animation:**
+Instead of scrolling, the CA pattern builds from row 0 downward. The current generation `g_gen` determines how many rows are visible. State machine:
+- `ST_BUILD`: advance one row per `g_delay` ticks
+- `ST_PAUSE` (`PAUSE_TICKS = 90`, ~3 s): hold the complete pattern before resetting to the next rule
+
+**17 presets in 5 Wolfram classes:**
+| Class | Color | Rules |
+|---|---|---|
+| Fixed | grey 244 | 0, 255 |
+| Periodic | cyan 51 | 90, 18, 150, 60 |
+| Chaotic | orange 202 | 30, 45, 22 |
+| Complex | green 82 | 110, 54, 105, 106 |
+| Fractal | yellow 226 | 90, 57, 73, 99, 126 |
+
+**Title bar:**
+Row 0 shows the rule name and number in `A_REVERSE` with the class color, immediately identifying the pattern type without obscuring the CA grid.
+
+**Live digit input:**
+Typing 1–3 digits accumulates a rule number. After 3 digits (or pressing Enter) the rule applies immediately, allowing any of the 256 rules to be explored without cycling.
+
+---
+
+## 30. Conway's Game of Life + Variants — artistic/life.c
+
+`life.c` runs Conway's Game of Life and five rule variants on a toroidal grid with a population histogram.
+
+**B/S bitmask rule encoding:**
+Each rule is stored as two `uint16_t` values — `birth` and `survive` — where bit N is set if the count N triggers the transition:
+```c
+uint16_t bit = (uint16_t)(1u << n);   // n = neighbor count
+uint8_t nxt  = cur ? ((survive & bit) ? 1 : 0)
+                   : ((birth   & bit) ? 1 : 0);
+```
+This makes adding new rules trivial: just specify which neighbor counts trigger birth and survival.
+
+**Six rules:**
+| Rule | Birth | Survive | Character |
+|---|---|---|---|
+| Conway | 3 | 2,3 | classic |
+| HighLife | 3,6 | 2,3 | glider self-replication |
+| Day&Night | 3,6,7,8 | 3,4,6,7,8 | symmetric alive/dead |
+| Seeds | 2 | — | explosive growth |
+| Morley | 3,6,8 | 2,4,5 | chaotic structures |
+| 2×2 | 3,6 | 1,2,5 | tiling block growth |
+
+**Double-buffered grid:**
+`g_grid[2][MAX_ROWS][MAX_COLS]` — `g_buf` indexes the active buffer, `1 - g_buf` is the next. After computing the next generation, `g_buf` flips. The old buffer becomes the write target for the following step.
+
+**Gosper glider gun:**
+The 36-cell pattern is hardcoded as `static const int GG[][2]` coordinates. Placed at offset `(g_ca_rows/4, 5)` to leave room for gliders to travel right.
+
+**Population histogram:**
+A `HIST_LEN = 512` entry ring buffer stores population counts. The bottom 3 rows of the screen render as a bar chart: bars grow upward, normalised to `[0, HIST_ROWS]`. This shows population oscillations and the transition to extinction.
+
+---
+
+## 31. Langton's Ant + Turmites — artistic/langton.c
+
+`langton.c` simulates Langton's Ant and multi-colour turmites: automata where an ant walks a grid, changes cell states, and turns based on a rule string.
+
+**Rule string encoding:**
+The rule is a string of `R` and `L` characters. When the ant is on a cell in state `s`, it reads `rule[s % g_n_colors]` to determine turn direction. After turning, the cell advances to state `(s+1) % g_n_colors`. This generalises Langton's classic two-state rule to any number of colours.
+
+**Ant step:**
+```c
+char turn  = g_rule[state % g_n_colors];
+ant->dir = (turn == 'R') ? (ant->dir + 1) % 4   // clockwise
+                         : (ant->dir + 3) % 4;   // counter-clockwise
+g_grid[ant->r][ant->c] = (state + 1) % g_n_colors;
+ant->r = (ant->r + DR[ant->dir] + g_rows) % g_rows;  // toroidal wrap
+ant->c = (ant->c + DC[ant->dir] + g_cols) % g_cols;
+```
+
+**Multiple ants:**
+1–3 ants share the same grid. They interact because they read and modify the same cell states. This produces emergent structures not seen with a single ant. Ants start spread across the grid at (0.5, 0.5), (0.35, 0.35), (0.65, 0.65) of the terminal dimensions.
+
+**Speed:**
+`STEPS_DEF = 200` ant steps per frame, doubling/halving with `+`/`-` up to `STEPS_MAX = 2000`. The classic "RL" rule requires ~10,000 steps before the highway emerges, so fast stepping is essential.
+
+---
+
+## 32. Chladni Figures — artistic/cymatics.c
+
+`cymatics.c` animates Chladni nodal-line patterns — the standing-wave figures seen when sand collects on a vibrating plate.
+
+**Formula:**
+For mode `(m, n)` at normalized coordinates `(x, y) ∈ [0,1]`:
+```
+Z(x,y) = cos(m·π·x)·cos(n·π·y) − cos(n·π·x)·cos(m·π·y)
+```
+Nodal lines are where `Z ≈ 0`; antinodes are where `|Z|` is large.
+
+**20 mode pairs:**
+All `(m, n)` pairs with `1 ≤ m < n ≤ 7` — 20 distinct patterns from the simple (1,2) cross to the complex (6,7) lattice.
+
+**Morphing animation:**
+Instead of hard-cutting between modes, the `Z` value blends linearly:
+```c
+z = (1.0f - g_t) * z1 + g_t * z2   /* g_t advances 0 → 1 */
+```
+`MORPH_SPEED = 0.025f` per tick (~1.3 s morph). After morphing completes, the state returns to `ST_HOLD` for `HOLD_TICKS = 120` (~4 s) before the next morph.
+
+**Nodal glow rendering:**
+Rather than binary nodal/antinode rendering, five distance bands around the nodal line use progressively fainter characters:
+```
+|Z| < 0.04  →  '@'  (bright, CP_NODE white)
+|Z| < 0.10  →  '#'  (bold)
+|Z| < 0.18  →  '*'
+|Z| < 0.28  →  '+'
+|Z| < 0.40  →  '.'
+```
+Cells beyond 0.40 are blank. The `+` and `−` antinode regions are colored differently (CP_POS vs CP_NEG), while the nodal band is always white.
+
+**Four themes:**
+Classic (cyan/red), Ocean (blue/teal), Ember (orange/dark-red), Neon (green/magenta). Theme changes re-register color pairs live.
+
+---
+
 *This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `misc/bounce_ball.c`.*

@@ -43,6 +43,7 @@ gcc -std=c11 -O2 -Wall -Wextra fractal_random/mandelbrot.c -o mandelbrot -lncurs
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/koch.c       -o koch       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/lightning.c    -o lightning    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/buddhabrot.c  -o buddhabrot   -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/sandpile.c    -o sandpile     -lncurses
 
 # ── artistic ──────────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra Artistic/bat.c               -o bat          -lncurses -lm
@@ -54,6 +55,7 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/cellular_automata_1d.c -o cellular_autom
 gcc -std=c11 -O2 -Wall -Wextra artistic/life.c                -o life                -lncurses
 gcc -std=c11 -O2 -Wall -Wextra artistic/langton.c             -o langton             -lncurses
 gcc -std=c11 -O2 -Wall -Wextra artistic/cymatics.c            -o cymatics            -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/wator.c               -o wator               -lncurses
 
 # ── raster (software rasterizer) ─────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm

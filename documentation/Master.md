@@ -1001,4 +1001,76 @@ The along/perp offsets are rotated into world space using the group's flight ang
 
 ---
 
+#### P12 Wa-Tor Predator-Prey Simulation
+
+`wator.c` simulates Alexander Dewdney's Wa-Tor ocean. Fish breed and drift randomly; sharks hunt fish and starve without food. The interaction produces emergent Lotka-Volterra-style population oscillations visible in a dual histogram at the bottom of the screen.
+
+**Grid state:** Four `uint8_t` arrays: `g_type` (EMPTY/FISH/SHARK), `g_breed` (age or breed counter), `g_hunger` (shark starvation timer), `g_moved` (double-process guard). `g_moved[r][c] = 1` is set when an entity moves into or acts on that cell; the cell is skipped when encountered again in the same tick's processing loop.
+
+**Fisher-Yates processing order:** All `rows × cols` indices are shuffled before each tick. Without shuffling, top-left processing order creates directional movement bias — fish drift right/down preferentially. The shuffle makes movement statistically isotropic at O(n) cost per tick.
+
+**Fish step:** increment age; find random empty neighbour; move there (mark `g_moved`); if age ≥ `FISH_BREED`, leave newborn at origin (not destination — newborn won't act this tick since origin was already processed).
+
+**Shark step:** increment breed and hunger; if `hunger > SHARK_STARVE`, die; else prefer fish neighbours (eat, reset hunger) over empty neighbours (just move); if `breed ≥ SHARK_BREED`, spawn child at origin.
+
+**Key insight:** Placing children at the origin (departure cell) rather than the destination (arrival cell) is the rule that prevents newborns from acting in the same tick as they are born — origin was already processed, destination may not have been.
+
+*Files: `artistic/wator.c`*
+
+---
+
+#### P13 Abelian Sandpile — Self-Organised Criticality
+
+`sandpile.c` implements the Bak-Tang-Wiesenfeld model: grains drop one at a time onto the centre; any cell with ≥ 4 grains topples (loses 4, gives 1 to each cardinal neighbour). Avalanches propagate via BFS until the grid is stable.
+
+**BFS queue with `g_inq` deduplication:**
+```c
+static void enq(int r, int c) {
+    if (g_inq[r][c]) return;
+    g_inq[r][c] = 1;
+    g_qr[g_qtail] = r; g_qc[g_qtail] = c;
+    g_qtail = (g_qtail + 1) % QMAX;
+}
+```
+Without `g_inq`, a cell receiving grains from 4 neighbours could be enqueued 4 times and topple 4 times erroneously. The circular queue fits in `QMAX = MAX_ROWS × MAX_COLS + 1` slots.
+
+**Two avalanche modes:**
+- Instant (`full=1`): `while (g_qhead != g_qtail) { ... }` — drain to completion. Many drops per frame; watch the fractal grow.
+- Vis (`full=0`): `break` after one topple. One topple per video frame — watch the cascade propagate cell by cell in red.
+
+**Critical bug history:** An earlier `wave_end = g_qtail` snapshot caused the loop to exit after processing only the initial queue contents. Cells enqueued *during* toppling were abandoned — the cascade never propagated beyond one ring from centre. Fixed by removing the snapshot.
+
+**Emergent fractal:** After millions of drops the stable pattern develops 4-fold quasi-crystalline symmetry. Avalanche size distribution follows a power law — the system self-tunes to criticality.
+
+*Files: `fractal_random/sandpile.c`*
+
+---
+
+#### P14 SDF Metaballs — Smooth-Min Raymarching
+
+`metaballs.c` renders 6 spheres whose SDFs are blended via polynomial smooth-min. The blended SDF creates a smooth organic surface that merges and separates as the balls orbit. Phong shading with soft shadows; surface curvature drives the color theme mapping.
+
+**Scene SDF:**
+```c
+float sdf_scene(Vec3 p, ...) {
+    float d = sdf_ball(p, centers[0], radii[0]);
+    for (int i = 1; i < N_BALLS; i++)
+        d = smin(d, sdf_ball(p, centers[i], radii[i]), k_blend);
+    return d;
+}
+```
+`smin(a, b, k) = min(a,b) − h²·k/4` where `h = max(k−|a−b|, 0)/k`. Small `k` ≈ hard min (separate spheres); large `k` ≈ wide merging neck (blob).
+
+**Tetrahedron normal (4 SDF evaluations):** Samples SDF at 4 tetrahedron vertices `(±e,±e,±e)`. Gradient components: `nx = f0−f1−f2+f3`, `ny = −f0+f1−f2+f3`, `nz = −f0−f1+f2+f3`. Equivalent accuracy to 6-point central differences with 33% fewer evaluations.
+
+**Curvature = Laplacian of SDF:** 7-point stencil, `CURV_EPS = 0.06`. At a sphere surface (r≈0.55): Laplacian ≈ 3.6 → `CURV_SCALE=0.25` → band 7 (warm). At a flat merged saddle: Laplacian ≈ 0 → band 0 (cool). Color shows the geometric structure even when the character shading is uniform.
+
+**Soft shadows:** March a secondary ray toward the light; accumulate `min(sk·h/t)`. A ray grazing an occluder produces a small ratio → dark penumbra. `SHADOW_K = 8.0f` sets shadow softness.
+
+**2×2 canvas block:** `CELL_W=2, CELL_H=2` renders each canvas pixel as a 2×2 terminal block. Reduces pixel count 4×. Aspect correction `phys_aspect = (h·2·2)/(w·2) = 2h/w` compensates for non-square terminal characters.
+
+*Files: `raymarcher/metaballs.c`*
+
+---
+
 *Read the code, run the programs, change one constant at a time. That is how it becomes yours.*

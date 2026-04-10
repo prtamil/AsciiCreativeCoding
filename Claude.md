@@ -69,6 +69,7 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/wireframe.c            -o wireframe   
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c           -o raymarcher  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_cube.c      -o ray_cube    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -lncurses -lm
 ```
 
 ---

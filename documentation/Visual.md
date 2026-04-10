@@ -109,6 +109,9 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [raymarcher_cube.c](#raymarcher_cubec)
 - [raymarcher_primitives.c](#raymarcher_primitivesc)
 - [bonsai.c](#bonsaic)
+- [wator.c](#watorc)
+- [sandpile.c](#sandpilec)
+- [metaballs.c](#metaballsc)
 
 ### Reference Tables
 - [Quick-Reference Matrix](#quick-reference-matrix)
@@ -2455,6 +2458,41 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
+### artistic/wator.c
+*Wa-Tor predator-prey ocean with fish/shark population oscillations.*
+
+**`g_moved[][]` double-process guard** — When a shark moves to a cell (or eats a fish there), `g_moved[r][c] = 1`. Later in the same tick, the entity at that cell is skipped if `g_moved` is set. Without this, a shark moved by the shuffled order could act twice — once at origin, once at destination — per tick.
+
+**Fisher-Yates shuffle** — All `rows × cols` cell indices are shuffled before processing each tick. Unshuffled top-left processing order would make fish drift right/down preferentially. The shuffle is O(n) at tick start; the skip of EMPTY cells is O(1) per index.
+
+**Dual-panel histogram** — 4-row bottom strip: upper 2 rows = fish (cyan, scale=max_pop/2), lower 2 rows = sharks (red, scale=max_pop/10). Fish scale is 5× coarser than sharks because fish vastly outnumber sharks at stable equilibrium.
+
+---
+
+### fractal_random/sandpile.c
+*Bak-Tang-Wiesenfeld Abelian Sandpile with self-organised criticality.*
+
+**BFS avalanche with `g_inq[]` dedup** — Unstable cells enqueued via `enq(r,c)` which guards with `if (g_inq[r][c]) return`. The circular queue head/tail allows re-enqueueing of the same cell in a later wave without overflow. `QMAX = MAX_ROWS × MAX_COLS + 1` — one extra slot for the circular boundary condition.
+
+**Vis mode** — `avalanche_step(full=0)` breaks after one topple. The caller renders between calls, showing the cascade propagate cell by cell in bright red. `avalanche_step(full=1)` drains to empty — the full cascade completes before the next frame.
+
+**Curvature-like coloring** — Grain count 0–3 maps to `' ' '.' '+' '#'` with colors dim-blue / green / bright-gold. The visual gradient encodes how close each cell is to instability — the near-critical ring of `#` cells surrounding the centre is the self-organised critical state made visible.
+
+---
+
+### raymarcher/metaballs.c
+*6 SDF metaballs on Lissajous orbits, smooth-min blending, curvature coloring.*
+
+**`smin(a,b,k)` polynomial blend** — `h = max(k − |a−b|, 0) / k`. Blend term `h²·k/4` extends the isosurface beyond either sphere when `|a−b| < k`. Small `k` ≈ hard min (separate balls); large `k` ≈ merged blob. Adjust live with `j`/`k` keys.
+
+**Tetrahedron normal** — 4 SDF evaluations at `(±e,±e,±e)` vertices recover the gradient: `nx = f0−f1−f2+f3`, `ny = −f0+f1−f2+f3`, `nz = −f0−f1+f2+f3`. Saves 33% over 6-point central differences with no accuracy loss.
+
+**Curvature coloring** — 7-point Laplacian stencil (6 neighbours + centre, `eps=CURV_EPS=0.06`): high curvature (sphere peaks) → high band → warm hue; low curvature (merged saddle) → low band → cool hue. 4 themes × 8 bands = 32 `init_pair` calls at startup; theme switch requires no re-registration.
+
+**2×2 block canvas** — `CELL_W=2, CELL_H=2` renders each canvas pixel as a 2×2 terminal block. Aspect-corrects via `phys_aspect = (ch·CELL_H·CELL_ASPECT)/(cw·CELL_W)`. Reduces per-frame pixel count 4× for a more comfortable frame rate despite the heavy SDF math.
+
+---
+
 ## Quick-Reference Matrix
 
 `✓` = technique present. `—` = not used.
@@ -2505,6 +2543,9 @@ if (t < floor) return 0;   /* invisible */
 | life | ✓ | — | — | — | — | — | ✓ | ✓ | — | — |
 | langton | ✓ | — | — | — | — | — | — | — | — | — |
 | cymatics | ✓ | — | — | — | — | — | ✓ | ✓ | — | — |
+| wator | ✓ | — | — | — | — | — | — | — | — | — |
+| sandpile | ✓ | — | — | — | — | — | — | — | — | — |
+| metaballs | ✓ | — | ✓ | — | — | — | ✓ | ✓ | — | — |
 
 \* kaboom uses a `Cell[]` pre-render buffer (→ V2.5 pattern) not a `zbuf[]`.
 
@@ -2616,6 +2657,15 @@ if (t < floor) return 0;   /* invisible */
 | Rule-string turmite ant | — (see Architecture §31) | langton |
 | Chladni nodal-glow band rendering | — (see Architecture §32) | cymatics |
 | ST_HOLD / ST_MORPH blended morph | — (see Architecture §32) | cymatics |
+| Fisher-Yates shuffle + g_moved guard | — (see Architecture §33) | wator |
+| Dual fish/shark histogram panels | — (see Architecture §33) | wator |
+| BFS queue + g_inq dedup | — (see Architecture §34) | sandpile |
+| Instant vs vis avalanche mode | — (see Architecture §34) | sandpile |
+| Polynomial smooth-min SDF blend | — (see Architecture §35) | metaballs |
+| Tetrahedron 4-point normal | — (see Architecture §35) | metaballs |
+| Laplacian curvature coloring | — (see Architecture §35) | metaballs |
+| Soft shadow penumbra (sk·h/t) | — (see Architecture §35) | metaballs |
+| 2×2 block canvas downsampling | — (see Architecture §35) | metaballs |
 | k-multiplier thread art | — (see Architecture §28) | string_art |
 | Slope chars via aspect-corrected gradient | V4.8 | string_art, spring_pendulum, bonsai |
 | A_REVERSE title bar in class color | — | cellular_automata_1d |

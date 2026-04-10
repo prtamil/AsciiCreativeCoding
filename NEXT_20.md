@@ -124,19 +124,9 @@ magnetisation.  Keys raise/lower T so the phase transition is observable live.
 
 ---
 
-## raymarcher/
-
-### 17. `metaballs.c` — SDF Metaballs + Blending
-5–8 metaballs moving on Lissajous paths; smooth-min SDF blending (k-factor).
-Phong shading + soft shadows.  Vary k live to morph between separate spheres
-and fully merged blob.  Color by surface curvature.
-**Challenge:** smooth-min derivative for correct normals; soft-shadow ray offset tuning.
-
----
-
 ## fractal_random/ (additional)
 
-### 18. `l_system.c` — L-System Fractal Plants
+### 17. `l_system.c` — L-System Fractal Plants
 String-rewriting L-system with turtle-graphics interpretation.
 Five presets: Dragon Curve, Hilbert Curve, Sierpinski Arrow, Branching Plant, Koch Island.
 Each preset shows one iteration at a time, building the fractal generation by generation.
@@ -144,7 +134,7 @@ Color by recursion depth.
 **Challenge:** variable-length string budget (exponential growth); fitting the turtle path
 within terminal bounds by auto-scaling the step length per generation.
 
-### 19. `automaton_2d.c` — Larger-than-Life / Extended CA
+### 18. `automaton_2d.c` — Larger-than-Life / Extended CA
 Generalised 2-D cellular automaton: configurable neighbourhood radius R (1–5),
 count thresholds, and state count.  Radius-2 rules produce exotic crystal structures,
 spirals, and moving "blobs" impossible in standard GoL.  Presets: Bosco's rule,
@@ -176,5 +166,4 @@ toroidal edge handling.
 | 15 | `navier_stokes.c` | Stable fluid; most complex fluid sim; save for after wave.c experience |
 | 16 | `gyroscope.c`     | Euler rotation equations; builds on double_pendulum RK4 |
 | 17 | `cloth.c`         | Most complex physics; Jakobsen constraint solver |
-| 18 | `metaballs.c`     | SDF raymarching; smooth-min blending |
-| 19 | `automaton_2d.c`  | Extends life.c; larger neighbourhood = new pattern classes |
+| 18 | `automaton_2d.c`  | Extends life.c; larger neighbourhood = new pattern classes |

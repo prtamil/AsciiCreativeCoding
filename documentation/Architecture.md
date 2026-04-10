@@ -1818,4 +1818,74 @@ Classic (cyan/red), Ocean (blue/teal), Ember (orange/dark-red), Neon (green/mage
 
 ---
 
+---
+
+## 33. Wa-Tor Predator-Prey — artistic/wator.c
+
+`wator.c` simulates Alexander Dewdney's 1984 Wa-Tor ocean: fish and sharks on a toroidal grid with local breed/starve rules producing global population oscillations.
+
+**Grid state:** Four `uint8_t` arrays per cell — `g_type` (EMPTY/FISH/SHARK), `g_breed` (age counter), `g_hunger` (shark starvation counter), `g_moved` (double-process guard).
+
+**Processing order:** All cell indices are shuffled with Fisher-Yates before processing each tick. Without shuffling, creatures always move right/down first, creating directional bias patterns. The shuffle makes movement isotropic.
+
+**`g_moved` guard:** When a shark moves to (nr,nc) and eats the fish there, `g_moved[nr][nc] = 1`. Later in the same tick, when the shuffled order reaches that cell index, the shark's entry is skipped — preventing it from acting twice in one frame.
+
+**Fish step:** `age++` → find random empty neighbour → move (set `g_moved[dest] = 1`) → if old enough, leave newborn at origin (not destination, so newborn doesn't act same tick).
+
+**Shark step:** `breed++; hunger++` → die if `hunger > SHARK_STARVE` → else find fish neighbour (eat, reset hunger, set `g_moved`) → else find empty neighbour (move) → if `breed >= SHARK_BREED`, spawn child at origin.
+
+**Dual histogram:** 4 bottom rows split into 2-row fish panel (cyan, scale = max_pop/2) and 2-row shark panel (red, scale = max_pop/10). Ring buffer stores last `g_cols` population samples for scrolling history. Shark scale compressed 5× because shark counts are far lower.
+
+---
+
+## 34. Abelian Sandpile — fractal_random/sandpile.c
+
+`sandpile.c` drops grains one at a time onto the centre of a grid. Any cell with ≥ 4 grains topples: loses 4 grains, gives 1 to each cardinal neighbour. Cascades propagate via BFS until the grid is stable.
+
+**BFS avalanche queue:**
+```c
+static int     g_qr[QMAX], g_qc[QMAX];
+static uint8_t g_inq[MAX_ROWS][MAX_COLS];
+static int     g_qhead, g_qtail;
+```
+`g_inq[]` deduplication ensures each cell enters the queue at most once per avalanche pass. `QMAX = MAX_ROWS × MAX_COLS + 1` (circular queue).
+
+**`avalanche_step(full)` modes:**
+- `full=1`: drain the queue to completion → entire cascade runs in one call (instant mode).
+- `full=0`: process one cell then `break` → one topple per video frame (vis mode, toggle with `v`).
+
+**wave_end bug:** The original code set `wave_end = g_qtail` at entry and looped only until `g_qhead == wave_end`. This missed cells enqueued *during* toppling — the cascade died after one ring. Fixed by looping on `g_qhead != g_qtail` with no snapshot.
+
+**Coloring:** `GRAIN_CH[4] = {' ', '.', '+', '#'}` — blank, dim-blue, green, bright-gold for 0–3 grains. Unstable cells (≥4, visible only in vis mode) drawn as bright-red `*`. Drop point marked `@` when empty.
+
+**Self-organised criticality:** After millions of grains the long-run stable pattern develops intricate fractal/quasi-crystalline 4-fold symmetry. Avalanche sizes follow a power-law distribution — most are tiny, occasionally one crosses the entire pile.
+
+---
+
+## 35. SDF Metaballs — raymarcher/metaballs.c
+
+`metaballs.c` raymarchess a scene of 6 smooth-min-blended spheres on Lissajous orbits, with Phong shading, soft shadows, and curvature coloring.
+
+**Smooth-min (polynomial, C¹):**
+```c
+float smin(float a, float b, float k) {
+    float h = fmaxf(k - fabsf(a - b), 0.0f) / k;
+    return fminf(a, b) - h * h * k * 0.25f;
+}
+```
+`k` is the blend radius. `k → 0`: hard min (separate spheres). Large `k`: wide neck (merged blob). The `h²·k/4` term widens the isosurface beyond either individual sphere.
+
+**Tetrahedron normal (4 SDF evaluations vs 6):**
+4 vertices `(±e,±e,±e)` sample the SDF and are combined to extract the gradient. Each output component uses `+f0 -f1 -f2 +f3` (or permutations) — exactly 4 evaluations for a full 3D gradient.
+
+**Curvature coloring:** Laplacian of the SDF via 7-point stencil (6 neighbours + centre). For a sphere of radius r, Laplacian = 2/r ≈ 3.6 at the surface → maps to high band (warm color). Flat merged saddles → low band (cool color). 4 themes × 8 curvature bands = 32 color pairs initialised at startup.
+
+**Soft shadows:** March from surface toward light; track `min(sk·h/t)` along the ray. Close-approach ratio gives penumbra shading. `SHADOW_K = 8.0f` controls hardness.
+
+**Canvas downsampling (CELL_W=2, CELL_H=2):** Each canvas pixel covers 2×2 terminal cells. Reduces pixel count 4× while maintaining visual quality. Aspect correction: `phys_aspect = (ch·CELL_H·CELL_ASPECT) / (cw·CELL_W)` applied to vertical ray component.
+
+**Lissajous orbits:** Ball i at position `(RX·sin(A[i]·t+PX[i]), RY·sin(B[i]·t+PY[i]), RZ·cos(C[i]·t))`. Phase offsets `PX[i] = i·2π/6` spread balls evenly at t=0. Different A/B/C frequencies per ball prevent synchronization.
+
+---
+
 *This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `misc/bounce_ball.c`.*

@@ -81,9 +81,11 @@ enum {
 /* Heat range — physics lives in [0, MAX_HEAT] */
 #define MAX_HEAT      1.0f
 
-/* Decay per tick — strong variance creates ragged spire tops */
-#define DECAY_BASE    0.040f
-#define DECAY_RAND    0.060f   /* wide random range = irregular flame height */
+/* Decay is computed dynamically in grid_tick() based on screen height
+ * so the average flame peak always reaches ~half the terminal height.
+ * These are kept only as fallback lower bounds. */
+#define DECAY_BASE_MIN  0.010f
+#define DECAY_RAND_MIN  0.015f
 
 /* Wind max offset per tick (cells/tick) */
 #define WIND_MAX      3
@@ -301,7 +303,7 @@ static attr_t ramp_attr(int i, int theme)
  *   For each cell (x, y) from y=rows-2 down to y=0:
  *     rand_x = x + random(-1, 0, +1)   (spread left/right randomly)
  *     src    = heat[(y+1) * cols + clamp(rand_x)]
- *     decay  = DECAY_BASE + rand() * DECAY_RAND
+ *     decay  = d_base + rand() * d_rand   (computed per-tick from screen height)
  *     heat[y * cols + x] = max(0, src - decay)
  *
  * The bottom row (y = rows-1) is the fuel row — held at MAX_HEAT
@@ -372,7 +374,7 @@ static void grid_init(Grid *g, int cols, int rows, int theme)
  *   squared to make the edges steeper — it rises quickly from zero
  *   then plateaus across the middle, giving the bonfire dome silhouette.
  *
- *   A 10% margin on each side keeps the flame away from the terminal
+ *   A 4% margin on each side keeps the flame away from the terminal
  *   edges so it reads as free-floating rather than edge-constrained.
  *
  *   warmup multiplier: clamps the arch to 0→1 over the first 80 ticks
@@ -400,8 +402,8 @@ static bool grid_tick(Grid *g)
 
     /* Arch fuel seeding */
     int fy = rows - 1;
-    /* 10% margin each side keeps flame off terminal edges */
-    float margin = cols * 0.10f;
+    /* 4% margin each side — wider flame while keeping a sliver of padding */
+    float margin = cols * 0.04f;
     float span   = (float)cols - 2.f * margin;
 
     for (int x = 0; x < cols; x++) {
@@ -427,7 +429,19 @@ static bool grid_tick(Grid *g)
         h[fy * cols + x] = MAX_HEAT * g->fuel * arch * jitter * warmup_scale;
     }
 
-    /* Propagate heat upward — Doom 3-neighbour rule, unchanged */
+    /* Decay scaled so average flame peak ≈ half the screen height.
+     * Linear model: heat after n rows = MAX_HEAT - n * avg_decay.
+     * Setting n = rows*0.75 → avg_decay = MAX_HEAT / (rows*0.75).
+     * Split: base = 0.55 * avg, rand_range = 0.90 * avg (adds avg 0.45).
+     * The wide random range preserves the ragged, organic spire tops. */
+    float target  = (float)rows * 0.75f;
+    float avg_d   = (target > 1.f) ? (MAX_HEAT / target) : MAX_HEAT;
+    float d_base  = avg_d * 0.55f;
+    float d_rand  = avg_d * 0.90f;
+    if (d_base < DECAY_BASE_MIN) d_base = DECAY_BASE_MIN;
+    if (d_rand < DECAY_RAND_MIN) d_rand = DECAY_RAND_MIN;
+
+    /* Propagate heat upward — Doom 3-neighbour rule */
     for (int y = 0; y < rows - 1; y++) {
         for (int x = 0; x < cols; x++) {
             int rx = x + (rand() % 3) - 1;
@@ -435,7 +449,7 @@ static bool grid_tick(Grid *g)
             if (rx >= cols) rx = cols - 1;
 
             float src   = h[(y + 1) * cols + rx];
-            float decay = DECAY_BASE + ((float)rand() / RAND_MAX) * DECAY_RAND;
+            float decay = d_base + ((float)rand() / RAND_MAX) * d_rand;
             float v     = src - decay;
             h[y * cols + x] = v < 0.f ? 0.f : v;
         }

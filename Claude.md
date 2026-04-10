@@ -28,8 +28,10 @@ gcc -std=c11 -O2 -Wall -Wextra particle_systems/constellation.c -o constellation
 gcc -std=c11 -O2 -Wall -Wextra flocking/flocking.c             -o flocking      -lncurses -lm
 
 # ── fluid / grid sims ────────────────────────────────────────────────────
-gcc -std=c11 -O2 -Wall -Wextra fluid/sand.c       -o sand      -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra fluid/flowfield.c  -o flowfield -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/sand.c                    -o sand                -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/flowfield.c               -o flowfield           -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/reaction_diffusion.c      -o reaction_diffusion  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/wave.c                    -o wave                -lncurses -lm
 
 # ── fractal / random growth ───────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/snowflake.c  -o snowflake  -lncurses -lm
@@ -46,6 +48,7 @@ gcc -std=c11 -O2 -Wall -Wextra fractal_random/buddhabrot.c  -o buddhabrot   -lnc
 gcc -std=c11 -O2 -Wall -Wextra Artistic/bat.c               -o bat          -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra Artistic/2stroke.c           -o 2stroke      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/leaf_fall.c         -o leaf_fall    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/epicycles.c         -o epicycles    -lncurses -lm
 
 # ── raster (software rasterizer) ─────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
@@ -90,7 +93,9 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  
 - `flocking.c`          — boid flocking: 3 flock groups, 5 switchable modes (classic boids, leader chase, Vicsek, orbit, predator-prey), toroidal wrap, cosine palette color cycling, `A_BOLD` proximity halo
 
 ### fluid/
-- `sand.c`              — falling sand CA: gravity + diagonal fallback + wind drift, Fisher-Yates column shuffle, per-grain age coloring
+- `sand.c`                  — falling sand CA
+- `reaction_diffusion.c`   — Gray-Scott model: 7 presets (Mitosis/Coral/Stripes/Worms/Maze/Bubbles/Solitons), 9-point isotropic Laplacian, 4 colour themes (ocean/forest/magma/violet), 600-step warmup pre-run, auto-cycle theme
+- `wave.c`                 — FDTD 2-D wave equation: 5 oscillating sources (keys 1–5 toggle), Gaussian impulse (p), interference fringes + boundary reflections, 9-level signed amplitude display, 4 colour themes (water/lava/plasma/matrix), CFL-stable c=0.45
 - `flowfield.c`         — Perlin noise flow field: 3-octave fBm, bilinear field sampling, 8-direction arrow glyphs, ring-buffer particle trails
 
 ### fractal_random/
@@ -107,7 +112,8 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  
 ### Artistic/
 - `bat.c`          — ASCII bat swarms in Pascal-triangle formation: 3 groups × (n_rows+1)(n_rows+2)/2 bats each; `+`/`-` resize rows 1–6 live; wing animation `/−\−`; 6 preset launch angles; staggered group launch; light-purple/cyan/pink groups
 - `2stroke.c`      — 2-stroke engine cross-section: slider-crank kinematics (piston/rod/crankshaft), exhaust and transfer port open/close, spark at TDC, phase labels COMPRESSION/IGNITION/POWER/EXHAUST/SCAVENGING; `] [` RPM control
-- `leaf_fall.c`    — ASCII tree with matrix-rain leaf fall: recursive branching (depth 7, spread ±0.5 rad), elliptical foliage clusters; DISPLAY → FALLING → RESET state machine; per-leaf start-delay stagger, white head + green trail (TRAIL_LEN=7), new algorithmically varied tree each cycle
+- `leaf_fall.c`    — ASCII tree with matrix-rain leaf fall
+- `epicycles.c`    — Fourier epicycles: DFT of parametric shape (heart/star/trefoil/fig-8/butterfly), sorted-by-amplitude arm chain, auto-adds epicycles to show convergence; orbit circles, colour-faded trail: recursive branching (depth 7, spread ±0.5 rad), elliptical foliage clusters; DISPLAY → FALLING → RESET state machine; per-leaf start-delay stagger, white head + green trail (TRAIL_LEN=7), new algorithmically varied tree each cycle
 
 ### raster/
 - `torus_raster.c`      — UV torus, 4 shaders (phong / toon / normals / wireframe), always-on back-face cull

@@ -66,30 +66,24 @@ Slowly erode the heightmap each tick (thermal weathering) so mountains crumble t
 
 ## artistic/
 
-### 9. `lissajous.c` — Harmonograph / Lissajous
-Two perpendicular damped oscillators; frequency ratio and phase drift slowly.
-Trace the evolving parametric knot — figure-8s, stars, petals, spirals in sequence.
-Auto-cycle through rational frequency ratios (1:1, 2:3, 3:4, 3:5 …).
-**Challenge:** slow enough phase drift to reveal each shape fully before transitioning.
-
-### 10. `aurora.c` — Aurora Borealis
+### 9. `aurora.c` — Aurora Borealis
 Layered fBm noise bands scrolling horizontally, 3–5 vertical curtain columns.
 Green/cyan core, purple/pink fringes, brightness shimmer from a second noise octave.
 Star field background (static dots).  Pure colour-art — no physics.
 **Challenge:** multi-layer noise blending in 256-color pairs without banding artefacts.
 
-### 11. `voronoi.c` — Animated Voronoi
+### 10. `voronoi.c` — Animated Voronoi
 20–30 seed points moving with slow Brownian drift.
 Each cell coloured by seed index; cell boundaries drawn with `·` dots.
 Seeds "bounce" off edges.  Optional: Fortune's algorithm HUD showing sweep line.
 **Challenge:** per-frame brute-force nearest-seed search fast enough at terminal resolution.
 
-### 12. `spirograph.c` — Spirograph (Hypotrochoid / Epitrochoid)
+### 11. `spirograph.c` — Spirograph (Hypotrochoid / Epitrochoid)
 Parametric r, R, d with slow parameter drift.  Multiple simultaneous curves
 in different colors, slightly out of phase.  Fade old curves so new ones emerge.
 **Challenge:** smooth Bresenham rasterization of the dense parametric curve without gaps.
 
-### 13. `plasma.c` — Plasma / Colour Wave
+### 12. `plasma.c` — Plasma / Colour Wave
 Classic demoscene plasma: sum of sinusoids evaluated at each terminal cell and mapped
 through a cycling 256-colour palette.  No physics — just `sin(x·f1 + t) + sin(y·f2 + t) + …`
 summed and palette-indexed.  Frequency knobs and palette themes cycle with keys.
@@ -101,20 +95,20 @@ distinct rather than all washing into the same blob.
 
 ## misc/
 
-### 14. `sort_vis.c` — Sorting Algorithm Visualiser
+### 13. `sort_vis.c` — Sorting Algorithm Visualiser
 Animated vertical bar chart.  Algorithms: bubble, insertion, selection, merge,
 quicksort, heapsort, radix.  Color: unsorted grey → comparison cyan → swap red → sorted green.
 Key-cycle algorithms; speed control.  Step counter and comparison count HUD.
 **Challenge:** coroutine-style stepper so each algorithm yields one comparison/swap per tick.
 
-### 15. `maze.c` — Maze Generation + Solve
+### 14. `maze.c` — Maze Generation + Solve
 Recursive-backtracker DFS generates the maze wall by wall — watch the frontier advance.
 Once complete, BFS/A* animates the solution path in a contrasting colour.
 Presets: small fast maze vs large slow maze.  Reset re-generates with new random seed.
 **Challenge:** encoding walls as edge bits (4 bits per cell) to avoid a separate wall grid;
 smooth cell-by-cell draw during generation without full redraw each frame.
 
-### 16. `ising.c` — Ising Model (Magnetic Phase Transition)
+### 15. `ising.c` — Ising Model (Magnetic Phase Transition)
 Each cell is a spin: `+1` (up) or `−1` (down).  Monte Carlo Metropolis algorithm flips
 spins according to the Boltzmann factor `exp(−ΔE / kT)`.  At high T spins are random
 noise; cool below the critical temperature T_c and magnetic domains spontaneously form —
@@ -126,7 +120,7 @@ magnetisation.  Keys raise/lower T so the phase transition is observable live.
 
 ## fractal_random/ (additional)
 
-### 17. `l_system.c` — L-System Fractal Plants
+### 16. `l_system.c` — L-System Fractal Plants
 String-rewriting L-system with turtle-graphics interpretation.
 Five presets: Dragon Curve, Hilbert Curve, Sierpinski Arrow, Branching Plant, Koch Island.
 Each preset shows one iteration at a time, building the fractal generation by generation.
@@ -134,7 +128,7 @@ Color by recursion depth.
 **Challenge:** variable-length string budget (exponential growth); fitting the turtle path
 within terminal bounds by auto-scaling the step length per generation.
 
-### 18. `automaton_2d.c` — Larger-than-Life / Extended CA
+### 17. `automaton_2d.c` — Larger-than-Life / Extended CA
 Generalised 2-D cellular automaton: configurable neighbourhood radius R (1–5),
 count thresholds, and state count.  Radius-2 rules produce exotic crystal structures,
 spirals, and moving "blobs" impossible in standard GoL.  Presets: Bosco's rule,
@@ -154,16 +148,15 @@ toroidal edge handling.
 | 3  | `terrain.c`       | Diamond-square is short; striking contour output |
 | 4  | `aurora.c`        | Pure artistic; no physics, just colour layering |
 | 5  | `plasma.c`        | Simplest possible; pure sin-sum palette — good warmup |
-| 6  | `lissajous.c`     | Natural companion to epicycles and string_art |
-| 7  | `spirograph.c`    | Similar to lissajous, easy after it |
-| 8  | `sort_vis.c`      | Educational; visually satisfying |
-| 9  | `maze.c`          | Wall-bit encoding + BFS solve; self-contained |
-| 10 | `ising.c`         | Monte Carlo Metropolis; striking phase transition |
-| 11 | `voronoi.c`       | Brute-force nearest-seed; tractable at terminal resolution |
-| 12 | `penrose.c`       | Aperiodic tiling; recursive substitution |
-| 13 | `l_system.c`      | String rewriting + turtle graphics; builds on fractal folder |
-| 14 | `lenia.c`         | Continuous Game of Life; builds on life.c knowledge |
-| 15 | `navier_stokes.c` | Stable fluid; most complex fluid sim; save for after wave.c experience |
-| 16 | `gyroscope.c`     | Euler rotation equations; builds on double_pendulum RK4 |
-| 17 | `cloth.c`         | Most complex physics; Jakobsen constraint solver |
-| 18 | `automaton_2d.c`  | Extends life.c; larger neighbourhood = new pattern classes |
+| 6  | `spirograph.c`    | Parametric curves; natural follow-on after lissajous |
+| 7  | `sort_vis.c`      | Educational; visually satisfying |
+| 8  | `maze.c`          | Wall-bit encoding + BFS solve; self-contained |
+| 9  | `ising.c`         | Monte Carlo Metropolis; striking phase transition |
+| 10 | `voronoi.c`       | Brute-force nearest-seed; tractable at terminal resolution |
+| 11 | `penrose.c`       | Aperiodic tiling; recursive substitution |
+| 12 | `l_system.c`      | String rewriting + turtle graphics; builds on fractal folder |
+| 13 | `lenia.c`         | Continuous Game of Life; builds on life.c knowledge |
+| 14 | `navier_stokes.c` | Stable fluid; most complex fluid sim; save for after wave.c experience |
+| 15 | `gyroscope.c`     | Euler rotation equations; builds on double_pendulum RK4 |
+| 16 | `cloth.c`         | Most complex physics; Jakobsen constraint solver |
+| 17 | `automaton_2d.c`  | Extends life.c; larger neighbourhood = new pattern classes |

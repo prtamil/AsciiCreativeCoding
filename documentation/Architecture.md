@@ -58,6 +58,17 @@ Reference implementation: `basics/bounce_ball.c`
     - [Fisher-Yates Random Pixel Reveal](#fisher-yates-random-pixel-reveal)
     - [Koch Snowflake — koch.c](#koch-snowflake--kochc)
     - [Recursive Tip Branching — lightning.c](#recursive-tip-branching--lightningc)
+37. [Physics Simulations — physics/](#37-physics-simulations--physics)
+    - [Lorenz Strange Attractor — lorenz.c](#lorenz-strange-attractor--lorenzc)
+    - [N-Body Gravity — nbody.c](#n-body-gravity--nbodyc)
+    - [Spring-Mass Cloth — cloth.c](#spring-mass-cloth--clothc)
+38. [Artistic Effects — artistic/](#38-artistic-effects--artistic)
+    - [Aurora Borealis — aurora.c](#aurora-borealis--aurorac)
+    - [Animated Voronoi — voronoi.c](#animated-voronoi--voronoic)
+    - [Spirograph — spirograph.c](#spirograph--spirographc)
+    - [Plasma — plasma.c](#plasma--plasmac)
+39. [Penrose Tiling — fractal_random/penrose.c](#39-penrose-tiling--fractal_randompenrosec)
+40. [Diamond-Square Terrain — fractal_random/terrain.c](#40-diamond-square-terrain--fractal_randomterrainc)
 
 ---
 
@@ -1885,6 +1896,289 @@ float smin(float a, float b, float k) {
 **Canvas downsampling (CELL_W=2, CELL_H=2):** Each canvas pixel covers 2×2 terminal cells. Reduces pixel count 4× while maintaining visual quality. Aspect correction: `phys_aspect = (ch·CELL_H·CELL_ASPECT) / (cw·CELL_W)` applied to vertical ray component.
 
 **Lissajous orbits:** Ball i at position `(RX·sin(A[i]·t+PX[i]), RY·sin(B[i]·t+PY[i]), RZ·cos(C[i]·t))`. Phase offsets `PX[i] = i·2π/6` spread balls evenly at t=0. Different A/B/C frequencies per ball prevent synchronization.
+
+---
+
+## 36. Harmonograph / Lissajous — artistic/lissajous.c
+
+`lissajous.c` draws an exponentially decaying dual-oscillator parametric curve (harmonograph) that morphs through figure-8s, trefoils, stars, and spirals as phase drifts.
+
+**Parametric equations:**
+```
+x(t) = sin(fx·t + phase) · exp(−decay·t)
+y(t) = sin(fy·t)         · exp(−decay·t)
+```
+`T_MAX = N_LOOPS·2π/min(fx,fy)` — always N_LOOPS=4 full cycles of the slower oscillator regardless of ratio. `DECAY = DECAY_TOTAL/T_MAX` — amplitude reaches ~1% at T_MAX for every ratio.
+
+**Age-based rendering:** Iterates `i = N_CURVE_PTS-1 → 0` (oldest inner loops first, newest outer loops last). `age = i/(N-1)`: 0 = newest (full amplitude, outermost, brightest '#'), 1 = oldest (tiny amplitude, innermost, dimmest '.'). Newest overwrites shared cells, so the outer bright ring always wins.
+
+**Phase dwell mechanism:** Symmetric Lissajous figures occur at phase multiples of `π/max(fx,fy)`. Drift is multiplied by `DWELL_SPEED=0.25` near each key phase, linearly ramping back to 1× within `DWELL_WIDTH=0.25` of the period:
+```c
+float kp   = (float)M_PI / fmaxf(fx, fy);
+float pm   = fmodf(phase_x, kp);
+float d    = fminf(pm, kp - pm);
+float frac = d / (kp * DWELL_WIDTH);
+float mul  = DWELL_SPEED + (1.0f - DWELL_SPEED) * fminf(frac, 1.0f);
+```
+This lets each named shape (Figure-8, Trefoil, Star…) dwell visibly before transitioning.
+
+**Auto-ratio cycling:** After phase_x accumulates 2π, the ratio index advances and phase resets to 0. Eight ratios cycle in order: 1:2, 2:3, 3:4, 1:3, 3:5, 2:5, 4:5, 1:4.
+
+**4 themes × 4 brightness levels = 16 color pairs + 1 HUD pair:**
+- Level 0 = outermost (age≈0) → brightest character '#' + A_BOLD
+- Level 3 = innermost (age≈1) → dimmest character '.'
+- Themes: Golden (226,220,136,94), Ice (51,38,23,17), Ember (231,208,196,88), Neon (118,82,28,22)
+
+---
+
+---
+
+## 37. Physics Simulations — physics/
+
+### Lorenz Strange Attractor — lorenz.c
+
+Integrates the three Lorenz ODEs with RK4 and projects the 3-D trajectory onto a 2-D terminal view that auto-rotates.
+
+**ODEs:** `ẋ = σ(y−x)`, `ẏ = x(ρ−z)−y`, `ż = xy−βz` with σ=10, ρ=28, β=8/3. These canonical parameters produce the famous butterfly attractor.
+
+**RK4 integration:** Each tick advances the state vector (x,y,z) by `DT_PHYS` using four slope evaluations — essential because the Lorenz system is stiff and Euler diverges in the chaotic region.
+
+**3-D → 2-D projection:** The attractor is rotated by a slowly advancing `view_angle` around the Z axis: `px = x·cos(a) − y·sin(a)`, `py = x·sin(a) + y·cos(a)`. No perspective; orthographic projection is sufficient because the attractor has no depth ordering issues.
+
+**Ring-buffer trail:** 1500-slot circular buffer stores past (x,y) pixel positions. Drawn from oldest (dim) to newest (bright) so the age gradient shows direction of travel. Color: red (newest) → orange → yellow → grey (oldest).
+
+**Ghost trajectory:** A second integrator starts with a tiny ε offset. Lyapunov divergence makes the two paths separate exponentially — visible on screen as a magenta ghost that starts co-located then drifts away, demonstrating chaos sensitivity.
+
+*Files: `physics/lorenz.c`*
+
+---
+
+### N-Body Gravity — nbody.c
+
+20 point masses under mutual softened gravity, Verlet integrated, with trails showing orbital history.
+
+**Softened gravity:** `F = G·m_i·m_j / (r² + ε²)` prevents singularities when two bodies pass close. ε=4 px keeps forces bounded while still allowing tight orbits and slingshot events.
+
+**Verlet integration (O(n²) force loop):**
+```c
+for each body i:
+    ax = ay = 0
+    for each body j ≠ i:
+        dx = x[j]-x[i], dy = y[j]-y[i]
+        r2 = dx*dx + dy*dy + EPS*EPS
+        f  = G * m[j] / (r2 * sqrtf(r2))
+        ax += f*dx; ay += f*dy
+    vx[i] += ax*dt; vy[i] += ay*dt
+    x[i]  += vx[i]*dt; y[i] += vy[i]*dt
+```
+
+**Trail ring buffer:** 200 positions per body. Color fades: body color → dim → very dim. The trail shows orbital curvature, slingshot hyperbola, figure-8 etc.
+
+**Optional central black hole:** A fixed massive body (50× normal mass) at screen centre creates a stable attractor with satellite orbits.
+
+*Files: `physics/nbody.c`*
+
+---
+
+### Spring-Mass Cloth — cloth.c
+
+`CLOTH_W × CLOTH_H` grid of masses connected by structural, shear, and bend springs. Top row pinned; gravity and wind perturb the free nodes.
+
+**Physics: explicit spring forces + symplectic Euler.**
+The original Verlet + Jakobsen (position-based constraints) approach was abandoned because sequential constraint projection propagates pin corrections through the entire cloth in one pass, eliminating all deformation regardless of force magnitude.
+
+Force-based integration:
+```c
+/* 1. Spring force for each spring (a,b): */
+dx = x[b]-x[a]; dy = y[b]-y[a];
+dist = sqrtf(dx*dx + dy*dy);
+stretch = dist - rest;
+nx = dx/dist; ny = dy/dist;
+vrel = (vx[b]-vx[a])*nx + (vy[b]-vy[a])*ny;
+F = k*stretch + kd*vrel;   /* Hooke + damping */
+ax[a] += F*nx/mass; ay[a] += F*ny/mass;
+ax[b] -= F*nx/mass; ay[b] -= F*ny/mass;
+
+/* 2. Symplectic Euler: */
+vx[i] += ax[i]*dt; vy[i] += ay[i]*dt;
+vx[i] *= DAMP; vy[i] *= DAMP;   /* global velocity damping */
+x[i]  += vx[i]*dt; y[i] += vy[i]*dt;
+```
+
+**Spring constants:** K_STRUCT=400, K_SHEAR=100, K_BEND=40 (stiffness); KD_STRUCT=4, KD_SHEAR=2, KD_BEND=0.5 (damping). DAMP=0.9993 per tick.
+
+**Render interpolation:** Each node stores a render snapshot `(rx,ry)` taken after the previous tick. Drawing lerps `draw = rx + (x−rx)*alpha` for smooth sub-tick motion.
+
+**Modes:** `hanging` (top-row pinned, gravity down), `flag` (left-column pinned, wind rightward), `hammock` (two corner pins, gravity down).
+
+*Files: `physics/cloth.c`*
+
+---
+
+## 38. Artistic Effects — artistic/
+
+### Aurora Borealis — aurora.c
+
+Per-cell sinusoidal curtains with a vertical envelope, coloured by row position. No physics — purely mathematical.
+
+**Per-cell formula:**
+```
+x = col/cols × 2π
+y = row / (rows × AURORA_FRAC)       // 0=top, 1=bottom of aurora band
+
+primary = sin(x·1.5 + t·0.20) × cos(y·3 + t·0.50 + x·0.25)
+shimmer = cos(x·2.3 − t·0.15 + 1.0) × sin(y·5 + t·0.80 + x·0.40 + 2.5)
+v       = primary·0.60 + shimmer·0.40    // combined, ∈ [−1,1]
+v       = v·0.5 + 0.5                    // normalise to [0,1]
+env     = sin(π·y)                        // 0 at top/bottom, 1 at midpoint
+intensity = v × env
+```
+
+**Color zones by row fraction:** `y < 0.25` → magenta (fringe), `y < 0.55` → cyan (core), `y ≥ 0.55` → green (base). A_BOLD for high intensity, A_DIM for low.
+
+**Characters by intensity:** `.` < 0.20, `:` < 0.40, `|` < 0.65, `!` < 0.82, `|` (bold) above.
+
+**Deterministic star hash:** `h = col·1234597 ^ row·987659; h ^= h>>13; h *= 0x5bd1e995; h ^= h>>15`. If `(h & 0xFF) < STAR_THRESH` the cell is a star. Char chosen from `h>>8`, color from `h>>10`. Zero storage, no flicker.
+
+*Files: `artistic/aurora.c`*
+
+---
+
+### Animated Voronoi — voronoi.c
+
+24 seed points drift with Langevin Brownian motion. Each terminal cell is colored by its nearest seed (brute-force O(N) per cell per frame).
+
+**Langevin motion (self-limiting drift):**
+```c
+vx += (-DAMP*vx + NOISE*randf()) * dt
+```
+`DAMP=2.0` s⁻¹ limits terminal speed. `NOISE=60` px/s² provides the random kick. Seeds bounce elastically off screen edges.
+
+**Per-cell nearest-seed:** For each cell compute pixel-space Euclidean distance to all 24 seeds. Track `d1` (nearest) and `d2` (second nearest):
+- `d1 < SEED_PX=12` → draw `O` A_BOLD (seed marker)
+- `d2 - d1 < BORDER_PX=15` → draw `+` (cell boundary)
+- else → draw `.` A_DIM (cell interior)
+
+**Color:** Each seed has a fixed color pair (cycling through 6 pairs mod 6). Interior cells use the seed's color. Boundary cells use the average or seed color at A_DIM.
+
+*Files: `artistic/voronoi.c`*
+
+---
+
+### Spirograph — spirograph.c
+
+Three simultaneous hypotrochoid curves with slowly drifting parameters, rendered onto a float canvas that decays each tick.
+
+**Hypotrochoid parametric equations:**
+```
+x = (R−r)·cos(t) + d·cos((R−r)/r · t)
+y = (R−r)·sin(t) − d·sin((R−r)/r · t)
+```
+`R` = outer radius, `r` = inner radius, `d` = pen offset from inner circle centre.
+
+**Parameter drift:** `r` oscillates as `r_base + r_amp·sin(drift)`. `drift` advances at `DRIFT_RATE·dt` per tick, slowly morphing the curve shape between different petal/star counts.
+
+**Float canvas:** `canvas[MAX_ROWS][MAX_COLS]` stores per-cell intensity as float. Each tick: `canvas[row][col] *= FADE=0.985` (exponential decay). New curve points add 1.0. Intensity mapped to 5 brightness levels (`' '` `.` `:` `|` `@`).
+
+**Three curves:** different `(R,r,d)` triples with phase offsets; cyan, magenta, yellow color pairs. Advancing `t` by `DELTA_T=0.08` per tick, `TRACE_STEPS=60` points traced per curve per tick for dense fill.
+
+*Files: `artistic/spirograph.c`*
+
+---
+
+### Plasma — plasma.c
+
+Classic demoscene plasma: sum of four sinusoids evaluated per terminal cell, mapped through a cycling 256-color palette.
+
+**Plasma value per cell:**
+```c
+v = sin(col*f1 + t*s1)
+  + sin(row*f2 + t*s2)
+  + sin((col+row)*f3 + t*s3)
+  + sin(dist*f4 + t*s4)   // dist = distance from screen centre
+```
+Normalized to [0,1] then shifted by `fmod(time*CYCLE_HZ, 1.0)` for palette cycling.
+
+**4 frequency presets** (`FreqPreset` struct with f1–f4 spatial, s1–s4 speed):
+- `gentle` — slow large waves
+- `energetic` — faster medium waves
+- `grand` — very slow large-scale waves
+- `turbulent` — fast overlapping waves
+
+**4 color themes** — each has 14 `PalEntry {pair, attr, ch}` entries. Characters: ` ` `.` `:` `+` `*` `#` etc. progress with intensity. Themes: rainbow, fire, ice, neon.
+
+**Keys:** `space` pause, `p` cycle palette, `f` cycle frequency preset, `]`/`[` sim Hz.
+
+*Files: `artistic/plasma.c`*
+
+---
+
+## 39. Penrose Tiling — fractal_random/penrose.c
+
+Computes a P3 Penrose rhombus tiling per terminal cell using de Bruijn's pentagrid duality. No tile storage — O(1) per cell.
+
+**De Bruijn pentagrid method:**
+Five families of parallel lines. Family j has direction `e_j = (cos(2πj/5), sin(2πj/5))`. For a point (wx,wy) in pentagrid unit space:
+```c
+k[j] = floor(wx * COS5[j] + wy * SIN5[j])
+S    = k[0] + k[1] + k[2] + k[3] + k[4]
+```
+Parity of S determines tile type: `S even → thick rhombus (72°)`, `S odd → thin rhombus (36°)`. Adjacent tiles always differ in S parity (crossing any grid line changes S by ±1), so thick and thin tiles only ever border each other.
+
+**Aspect ratio correction:** Terminal cells are `CELL_H/CELL_W ≈ 2× taller` than wide. Cell (col,row) is mapped to pixel offset `(col·CELL_W, row·CELL_H)` before projecting to the pentagrid, keeping rhombus proportions correct.
+
+**Animation:** The pixel frame rotates at `ROTATE_SPEED=0.04` rad/s. The tiling has 5-fold symmetry (period = 2π/5 ≈ 72°) but is globally aperiodic — no configuration ever repeats.
+
+**Tile edge detection:** The fractional part of each projection `frac(k[j] proj)` measures distance to the nearest grid line. If `min_dist < BORDER=0.15`, the cell is on a tile edge and a directional line character is drawn:
+```c
+ang = 2π·j/5 + π/2 − view_angle   // grid line angle on screen
+// Fold to [0,π) then pick: '-' '/' '|' '\'
+```
+
+**Interior fill:** `*` A_BOLD in warm gold/amber (thick), `.` in cool cyan/blue (thin). A hash `abs(k[0]·3+k[1]·7+k[2]·11+k[3]·13+k[4]·17) % 3` selects 1 of 3 color shades per type.
+
+**Color pairs 8–12:** penrose-specific — gold (220), amber (214), aqua (87), lavender (147), pale yellow (228).
+
+**Scale:** `SCALE_PX=80` → each rhombus side is 10 terminal columns wide so tile shapes are clearly legible.
+
+*Files: `fractal_random/penrose.c`*
+
+---
+
+## 40. Diamond-Square Terrain — fractal_random/terrain.c
+
+Generates a fractal heightmap via diamond-square midpoint displacement, erodes it with thermal weathering, then renders ASCII elevation contours via bilinear interpolation.
+
+**Diamond-square algorithm** on a `(2^N+1) × (2^N+1)` grid (N=6, GRID=65):
+
+*Diamond step:* For each square of side `step`, set the centre to the average of the four corners plus a random displacement `±scale`. *Square step:* For each diamond, set the edge midpoint to the average of the four diamond points plus `±scale`. After each full iteration: `scale *= ROUGHNESS=0.60`.
+
+After generation: normalize to [0,1] by subtracting min and dividing by range.
+
+**Thermal weathering erosion** (2 passes per tick, 4 neighbours):
+```c
+diff = h[y][x] - h[ny][nx]
+if (diff > TALUS=0.022):
+    move = EROSION_RATE=0.0012 * (diff - TALUS)
+    h[y][x]   -= move
+    h[ny][nx] += move
+```
+Material flows downhill when slope exceeds the `TALUS` angle. Mountains slowly crumble into plains over time.
+
+**Bilinear interpolation:** The 65×65 grid is mapped to any terminal size. For cell (col,row), compute fractional grid position `(gx,gy)`, read the four surrounding grid heights, and interpolate: `h = h00·(1−fx)(1−fy) + h10·fx(1−fy) + h01·(1−fx)·fy + h11·fx·fy`. This eliminates blocky cell-size quantization artifacts.
+
+**7 contour levels:**
+| Height | Char | Color |
+|---|---|---|
+| < 0.15 | `~` | blue dim |
+| < 0.28 | `~` | blue |
+| < 0.42 | `.` | yellow dim |
+| < 0.57 | `-` | green |
+| < 0.72 | `^` | green bold |
+| < 0.88 | `#` | orange |
+| ≥ 0.88 | `*` | cyan bold |
+
+*Files: `fractal_random/terrain.c`*
 
 ---
 

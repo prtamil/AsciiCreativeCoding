@@ -112,6 +112,7 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [wator.c](#watorc)
 - [sandpile.c](#sandpilec)
 - [metaballs.c](#metaballsc)
+- [lissajous.c](#lissajousc)
 
 ### Reference Tables
 - [Quick-Reference Matrix](#quick-reference-matrix)
@@ -2493,6 +2494,19 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
+### artistic/lissajous.c
+*Harmonograph: two damped oscillators, phase drifts, morphing Lissajous figures.*
+
+**Age-based rendering** — iterates `i = N_CURVE_PTS-1 → 0` (oldest inner first, newest outer last). `age = i/(N-1)`: 0=newest → level 0 (brightest `#`, `A_BOLD`), 1=oldest → level 3 (dimmest `.`). Newest overwrites shared cells so the bright outer ring always wins.
+
+**Phase dwell** — `key_period = π / max(fx, fy)`. Near each symmetric phase (where the figure closes on itself), drift is multiplied by `DWELL_SPEED=0.25` and linearly ramps back to 1× within `DWELL_WIDTH=0.25` of the period. Each named figure dwells visibly before transitioning.
+
+**T_MAX / DECAY normalization** — `T_MAX = N_LOOPS·2π/min(fx,fy)` always gives 4 complete cycles of the slower oscillator. `DECAY = DECAY_TOTAL/T_MAX` so amplitude reaches ~1% at T_MAX for every ratio — consistent spiral depth regardless of frequency pair.
+
+**4 themes × 4 levels** — 16 `init_pair` calls + 1 HUD pair. Theme cycling is a single integer increment; no re-registration needed.
+
+---
+
 ## Quick-Reference Matrix
 
 `✓` = technique present. `—` = not used.
@@ -2546,6 +2560,7 @@ if (t < floor) return 0;   /* invisible */
 | wator | ✓ | — | — | — | — | — | — | — | — | — |
 | sandpile | ✓ | — | — | — | — | — | — | — | — | — |
 | metaballs | ✓ | — | ✓ | — | — | — | ✓ | ✓ | — | — |
+| lissajous | ✓ | — | — | — | — | — | ✓ | ✓ | — | — |
 
 \* kaboom uses a `Cell[]` pre-render buffer (→ V2.5 pattern) not a `zbuf[]`.
 
@@ -2666,6 +2681,10 @@ if (t < floor) return 0;   /* invisible */
 | Laplacian curvature coloring | — (see Architecture §35) | metaballs |
 | Soft shadow penumbra (sk·h/t) | — (see Architecture §35) | metaballs |
 | 2×2 block canvas downsampling | — (see Architecture §35) | metaballs |
+| Damped oscillator parametric curve | — (see Architecture §36) | lissajous |
+| Phase dwell (symmetric Lissajous) | — (see Architecture §36) | lissajous |
+| Age-based brightness decay rendering | — (see Architecture §36) | lissajous |
+| T_MAX / DECAY ratio normalization | — (see Architecture §36) | lissajous |
 | k-multiplier thread art | — (see Architecture §28) | string_art |
 | Slope chars via aspect-corrected gradient | V4.8 | string_art, spring_pendulum, bonsai |
 | A_REVERSE title bar in class color | — | cellular_automata_1d |
@@ -2674,7 +2693,24 @@ if (t < floor) return 0;   /* invisible */
 | `getmaxyx` vs `LINES`/`COLS` | V8.2 | all |
 | `CLOCK_MONOTONIC` no NTP jumps | V8.3 | all |
 | Common ncurses bugs reference | V8.4 | — |
+| De Bruijn pentagrid O(1) tile lookup | — (see Architecture §39) | penrose |
+| Pentagrid edge detection + directional chars | — (see Architecture §39) | penrose |
+| Diamond-square heightmap generation | — (see Architecture §40) | terrain |
+| Thermal weathering erosion | — (see Architecture §40) | terrain |
+| Bilinear interp grid → terminal | — (see Architecture §40) | terrain |
+| Sinusoidal aurora curtains + envelope | — (see Architecture §38) | aurora |
+| Deterministic star hash (no storage) | — (see Architecture §38) | aurora |
+| Demoscene plasma sin-sum + palette cycle | — (see Architecture §38) | plasma |
+| Hypotrochoid parametric curve | — (see Architecture §38) | spirograph |
+| Float canvas exponential decay trail | — (see Architecture §38) | spirograph |
+| Langevin Brownian seed motion | — (see Architecture §38) | voronoi |
+| d2−d1 Voronoi edge detection | — (see Architecture §38) | voronoi |
+| Explicit spring forces + symplectic Euler | — (see Architecture §37, Master §R1) | cloth |
+| Jakobsen constraint failure with pins | — (see Master §R1) | cloth |
+| Softened N-body gravity Verlet | — (see Architecture §37, Master §R2) | nbody |
+| Lorenz RK4 + ghost trajectory chaos demo | — (see Architecture §37, Master §R3) | lorenz |
+| Rotating orthographic 3-D projection | — (see Architecture §37) | lorenz |
 
 ---
 
-*This document is the single reference for all ncurses techniques used across the C files in this project (24 original + 9 fractal_random + 1 Artistic = 34 files). For fractal algorithms and IFS theory, see Master.md §P. For the overall loop architecture and fractal-specific subsystems, see Architecture.md §22. For color-specific techniques including escape-time, distance-based, and density-accumulator coloring, see COLOR.md.*
+*This document is the single reference for all ncurses techniques used across the C files in this project. For fractal algorithms and IFS theory, see Master.md §P and §Q. For the overall loop architecture and subsystem details, see Architecture.md. For color-specific techniques, see COLOR.md.*

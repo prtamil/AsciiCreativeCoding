@@ -1,0 +1,525 @@
+/*
+ * terrain.c — Fractal Terrain (Diamond-Square)
+ *
+ * Generates a 65×65 heightmap (2^6+1 grid) with the diamond-square midpoint
+ * displacement algorithm, renders it as ASCII elevation contours scaled to
+ * the terminal, and slowly erodes it each tick with thermal weathering.
+ *
+ * DIAMOND-SQUARE ALGORITHM
+ * ─────────────────────────
+ * Iteratively bisects each square:
+ *
+ *   Diamond step  — centre of each size×size square:
+ *     h[y+h][x+h] = avg(4 corners) + random × scale
+ *
+ *   Square  step  — midpoint of each diamond edge:
+ *     h[y][x] = avg(up to 4 diamond neighbours) + random × scale
+ *
+ *   scale *= ROUGHNESS each iteration.
+ *   After generation, normalise [lo, hi] → [0, 1] so the full contour
+ *   range is always visible regardless of random seed.
+ *
+ * THERMAL WEATHERING EROSION
+ * ──────────────────────────
+ * Each tick, ERODE_PASSES sweeps of all cells:
+ *   diff = h[y][x] − h[ny][nx]
+ *   if diff > TALUS:
+ *     move = RATE × (diff − TALUS)
+ *     h[y][x]   -= move      ← material falls off steep slope
+ *     h[ny][nx] += move      ← deposited at base
+ * Gentle slopes (diff ≤ TALUS) are stable; peaks erode to plains over time.
+ *
+ * HEIGHT → CONTOUR MAPPING
+ * ─────────────────────────
+ *   < 0.20  '~'  deep water    blue dim
+ *   < 0.30  '~'  water         blue
+ *   < 0.40  '.'  lowland       yellow dim
+ *   < 0.52  '-'  foothills     green
+ *   < 0.65  '^'  slopes        green bold
+ *   < 0.78  '#'  peaks         orange
+ *   ≥ 0.78  '*'  snowcap       cyan bold
+ *
+ * Display is bilinearly interpolated from the 65×65 grid to fit any terminal.
+ *
+ * Keys:
+ *   q/ESC quit   space pause/resume   r regenerate   e toggle erosion
+ *   ] / [   sim Hz up / down
+ *
+ * Build:
+ *   gcc -std=c11 -O2 -Wall -Wextra terrain.c -o terrain -lncurses -lm
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <math.h>
+#include <ncurses.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdio.h>
+
+/* ===================================================================== */
+/* §1  config                                                             */
+/* ===================================================================== */
+
+enum {
+    SIM_FPS_MIN     = 10,
+    SIM_FPS_DEFAULT = 60,
+    SIM_FPS_MAX     = 120,
+    SIM_FPS_STEP    = 10,
+    FPS_UPDATE_MS   = 500,
+    N_COLORS        = 7,
+
+    GRID_N          = 6,                  /* grid exponent: 2^6 = 64       */
+    GRID            = (1 << GRID_N) + 1,  /* 65 × 65 heightmap             */
+};
+
+#define NS_PER_SEC   1000000000LL
+#define NS_PER_MS    1000000LL
+#define TICK_NS(f)   (NS_PER_SEC / (f))
+
+/*
+ * ROUGHNESS — scale multiplier per iteration (0 = very smooth, 1 = fractal noise).
+ * 0.60 gives natural-looking mid-frequency mountains.
+ */
+#define ROUGHNESS    0.60f
+
+/*
+ * TALUS — maximum stable height difference between adjacent cells.
+ * Cells steeper than TALUS erode.
+ */
+#define TALUS        0.022f
+
+/*
+ * EROSION_RATE — fraction of excess slope moved per cell per pass.
+ * At 60 Hz × ERODE_PASSES=2 per tick: steady, visible erosion over minutes.
+ */
+#define EROSION_RATE 0.0012f
+#define ERODE_PASSES 2
+
+/* ===================================================================== */
+/* §2  clock                                                              */
+/* ===================================================================== */
+
+static int64_t clock_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+}
+
+static void clock_sleep_ns(int64_t ns)
+{
+    if (ns <= 0) return;
+    struct timespec req = {
+        .tv_sec  = (time_t)(ns / NS_PER_SEC),
+        .tv_nsec = (long)(ns % NS_PER_SEC),
+    };
+    nanosleep(&req, NULL);
+}
+
+/* ===================================================================== */
+/* §3  color                                                              */
+/* ===================================================================== */
+
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+    if (COLORS >= 256) {
+        init_pair(1, 196, COLOR_BLACK);   /* red     */
+        init_pair(2, 208, COLOR_BLACK);   /* orange  */
+        init_pair(3, 226, COLOR_BLACK);   /* yellow  */
+        init_pair(4,  46, COLOR_BLACK);   /* green   */
+        init_pair(5,  51, COLOR_BLACK);   /* cyan    */
+        init_pair(6,  21, COLOR_BLACK);   /* blue    */
+        init_pair(7, 201, COLOR_BLACK);   /* magenta */
+    } else {
+        init_pair(1, COLOR_RED,     COLOR_BLACK);
+        init_pair(2, COLOR_RED,     COLOR_BLACK);
+        init_pair(3, COLOR_YELLOW,  COLOR_BLACK);
+        init_pair(4, COLOR_GREEN,   COLOR_BLACK);
+        init_pair(5, COLOR_CYAN,    COLOR_BLACK);
+        init_pair(6, COLOR_BLUE,    COLOR_BLACK);
+        init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
+    }
+}
+
+/* ===================================================================== */
+/* §4  coords — terrain works in grid space; bilinear maps to terminal    */
+/* ===================================================================== */
+
+/* ===================================================================== */
+/* §5  entity — Terrain                                                   */
+/* ===================================================================== */
+
+typedef struct {
+    float hmap[GRID][GRID];   /* heightmap values ∈ [0, 1]              */
+    bool  paused;
+    bool  erode;
+    int   erode_count;        /* number of erosion sweeps applied so far */
+} Terrain;
+
+/* ── RNG helpers ────────────────────────────────────────────────────── */
+
+static float randf01(void) { return (float)rand() / (float)RAND_MAX; }
+static float randf11(void) { return randf01() * 2.0f - 1.0f; }
+
+static float clampf(float v, float lo, float hi)
+{
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+/* ── Diamond-Square generation ──────────────────────────────────────── */
+
+/*
+ * terrain_generate — fill hmap with a fresh diamond-square heightmap.
+ *
+ * Algorithm outline:
+ *   stride starts at GRID-1 (= 64) and halves each iteration.
+ *   Diamond step: for each stride×stride square, fill its centre.
+ *   Square  step: for each rotated half-square (diamond), fill its centre.
+ *   scale *= ROUGHNESS each iteration to reduce displacement amplitude.
+ *   After generation, normalise so heights span exactly [0, 1].
+ */
+static void terrain_generate(Terrain *t)
+{
+    float (*h)[GRID] = t->hmap;
+
+    /* Seed four corners */
+    h[0][0]              = randf01();
+    h[0][GRID - 1]       = randf01();
+    h[GRID - 1][0]       = randf01();
+    h[GRID - 1][GRID - 1] = randf01();
+
+    float scale = 0.5f;
+
+    for (int stride = GRID - 1; stride > 1; stride >>= 1) {
+        int half = stride >> 1;
+
+        /* ── Diamond step: fill centre of every stride×stride square ── */
+        for (int y = 0; y < GRID - 1; y += stride) {
+            for (int x = 0; x < GRID - 1; x += stride) {
+                float avg = (h[y][x]          + h[y][x + stride]
+                           + h[y + stride][x] + h[y + stride][x + stride])
+                           * 0.25f;
+                h[y + half][x + half] =
+                    clampf(avg + randf11() * scale, 0.0f, 1.0f);
+            }
+        }
+
+        /* ── Square step: fill midpoints of every diamond ── */
+        for (int y = 0; y < GRID; y += half) {
+            /* Alternate x starting column per row to hit only diamond midpoints */
+            for (int x = ((y / half) & 1) ? 0 : half; x < GRID; x += stride) {
+                float sum = 0.0f;
+                int   cnt = 0;
+                if (y >= half)       { sum += h[y - half][x]; cnt++; }
+                if (y + half < GRID) { sum += h[y + half][x]; cnt++; }
+                if (x >= half)       { sum += h[y][x - half]; cnt++; }
+                if (x + half < GRID) { sum += h[y][x + half]; cnt++; }
+                h[y][x] = clampf(sum / (float)cnt + randf11() * scale,
+                                 0.0f, 1.0f);
+            }
+        }
+
+        scale *= ROUGHNESS;
+    }
+
+    /* Normalise: map [lo, hi] → [0, 1] so full contour range is visible */
+    float lo = 1.0f, hi = 0.0f;
+    for (int y = 0; y < GRID; y++)
+        for (int x = 0; x < GRID; x++) {
+            if (h[y][x] < lo) lo = h[y][x];
+            if (h[y][x] > hi) hi = h[y][x];
+        }
+    float range = hi - lo;
+    if (range > 1e-4f)
+        for (int y = 0; y < GRID; y++)
+            for (int x = 0; x < GRID; x++)
+                h[y][x] = (h[y][x] - lo) / range;
+
+    t->erode_count = 0;
+}
+
+/* ── Thermal weathering ─────────────────────────────────────────────── */
+
+static void terrain_erode(Terrain *t)
+{
+    float (*h)[GRID] = t->hmap;
+    static const int DX[4] = { 1, -1,  0,  0 };
+    static const int DY[4] = { 0,  0,  1, -1 };
+
+    for (int pass = 0; pass < ERODE_PASSES; pass++) {
+        for (int y = 0; y < GRID; y++) {
+            for (int x = 0; x < GRID; x++) {
+                for (int d = 0; d < 4; d++) {
+                    int nx = x + DX[d];
+                    int ny = y + DY[d];
+                    if (nx < 0 || nx >= GRID || ny < 0 || ny >= GRID) continue;
+                    float diff = h[y][x] - h[ny][nx];
+                    if (diff > TALUS) {
+                        float move = EROSION_RATE * (diff - TALUS);
+                        h[y][x]   -= move;
+                        h[ny][nx] += move;
+                    }
+                }
+            }
+        }
+    }
+    t->erode_count++;
+}
+
+static void terrain_init(Terrain *t)
+{
+    memset(t, 0, sizeof *t);
+    t->erode = true;
+    terrain_generate(t);
+}
+
+static void terrain_tick(Terrain *t)
+{
+    if (t->paused) return;
+    if (t->erode)  terrain_erode(t);
+}
+
+/* ── Drawing ────────────────────────────────────────────────────────── */
+
+/*
+ * terrain_draw — bilinearly sample the 65×65 heightmap onto the terminal.
+ *
+ * For each terminal cell we compute its corresponding fractional grid
+ * coordinate and bilinearly interpolate the four surrounding heightmap
+ * values.  This produces smooth, band-free contours at any terminal size.
+ */
+static void terrain_draw(const Terrain *t, WINDOW *w, int cols, int rows)
+{
+    if (cols < 2 || rows < 3) return;
+
+    for (int row = 1; row < rows - 1; row++) {
+
+        /* terminal row → fractional grid y */
+        float gy_f = (float)(row - 1) / (float)(rows - 2) * (float)(GRID - 1);
+        int   gy   = (int)gy_f;
+        if (gy > GRID - 2) gy = GRID - 2;
+        float ty = gy_f - (float)gy;
+
+        for (int col = 0; col < cols; col++) {
+
+            /* terminal col → fractional grid x */
+            float gx_f = (float)col / (float)(cols - 1) * (float)(GRID - 1);
+            int   gx   = (int)gx_f;
+            if (gx > GRID - 2) gx = GRID - 2;
+            float tx = gx_f - (float)gx;
+
+            /* Bilinear interpolation of the four surrounding grid points */
+            float v = t->hmap[gy    ][gx    ] * (1.0f - tx) * (1.0f - ty)
+                    + t->hmap[gy    ][gx + 1] * tx           * (1.0f - ty)
+                    + t->hmap[gy + 1][gx    ] * (1.0f - tx) * ty
+                    + t->hmap[gy + 1][gx + 1] * tx           * ty;
+
+            /* Map height value to contour level */
+            int   pair;
+            chtype attr;
+            char  ch;
+
+            if      (v < 0.20f) { pair = 6; attr = A_DIM;   ch = '~'; }
+            else if (v < 0.30f) { pair = 6; attr = 0;        ch = '~'; }
+            else if (v < 0.40f) { pair = 3; attr = A_DIM;   ch = '.'; }
+            else if (v < 0.52f) { pair = 4; attr = 0;        ch = '-'; }
+            else if (v < 0.65f) { pair = 4; attr = A_BOLD;  ch = '^'; }
+            else if (v < 0.78f) { pair = 2; attr = 0;        ch = '#'; }
+            else                { pair = 5; attr = A_BOLD;  ch = '*'; }
+
+            wattron(w, COLOR_PAIR(pair) | attr);
+            mvwaddch(w, row, col, (chtype)(unsigned char)ch);
+            wattroff(w, COLOR_PAIR(pair) | attr);
+        }
+    }
+}
+
+/* ===================================================================== */
+/* §6  scene                                                              */
+/* ===================================================================== */
+
+typedef struct { Terrain terrain; } Scene;
+
+static void scene_init(Scene *s, int cols, int rows)
+{
+    (void)cols; (void)rows;
+    memset(s, 0, sizeof *s);
+    terrain_init(&s->terrain);
+}
+
+static void scene_tick(Scene *s, float dt, int cols, int rows)
+{
+    (void)dt; (void)cols; (void)rows;
+    terrain_tick(&s->terrain);
+}
+
+static void scene_draw(const Scene *s, WINDOW *w,
+                       int cols, int rows, float alpha, float dt_sec)
+{
+    (void)alpha; (void)dt_sec;
+    terrain_draw(&s->terrain, w, cols, rows);
+}
+
+/* ===================================================================== */
+/* §7  screen                                                             */
+/* ===================================================================== */
+
+typedef struct { int cols, rows; } Screen;
+
+static void screen_init(Screen *s)
+{
+    initscr(); noecho(); cbreak(); curs_set(0);
+    nodelay(stdscr, TRUE); keypad(stdscr, TRUE); typeahead(-1);
+    color_init();
+    getmaxyx(stdscr, s->rows, s->cols);
+}
+
+static void screen_free(Screen *s) { (void)s; endwin(); }
+
+static void screen_draw(Screen *s, const Scene *sc,
+                        double fps, int sim_fps, float alpha, float dt_sec)
+{
+    erase();
+    scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
+
+    const Terrain *t = &sc->terrain;
+    char buf[80];
+    snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  erode:%s (%d)  %s ",
+             fps, sim_fps,
+             t->erode ? "on " : "off", t->erode_count,
+             t->paused ? "PAUSED" : "");
+    int hx = s->cols - (int)strlen(buf);
+    if (hx < 0) hx = 0;
+    attron(COLOR_PAIR(3) | A_BOLD);
+    mvprintw(0, hx, "%s", buf);
+    attroff(COLOR_PAIR(3) | A_BOLD);
+
+    attron(COLOR_PAIR(4) | A_BOLD);
+    mvprintw(0, 1, " TERRAIN ");
+    attroff(COLOR_PAIR(4) | A_BOLD);
+
+    attron(COLOR_PAIR(6) | A_DIM);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  spc:pause  r:regenerate  e:erosion  [/]:Hz ");
+    attroff(COLOR_PAIR(6) | A_DIM);
+}
+
+static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+
+/* ===================================================================== */
+/* §8  app                                                                */
+/* ===================================================================== */
+
+typedef struct {
+    Scene                 scene;
+    Screen                screen;
+    int                   sim_fps;
+    volatile sig_atomic_t running;
+    volatile sig_atomic_t need_resize;
+} App;
+
+static App g_app;
+
+static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
+static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
+static void cleanup(void)             { endwin(); }
+
+static bool app_handle_key(App *app, int ch)
+{
+    Terrain *t = &app->scene.terrain;
+    switch (ch) {
+    case 'q': case 'Q': case 27: return false;
+    case ' ': t->paused = !t->paused; break;
+    case 'r': case 'R': terrain_generate(t); break;
+    case 'e': case 'E': t->erode = !t->erode; break;
+    case ']':
+        app->sim_fps += SIM_FPS_STEP;
+        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
+        break;
+    case '[':
+        app->sim_fps -= SIM_FPS_STEP;
+        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
+        break;
+    default: break;
+    }
+    return true;
+}
+
+int main(void)
+{
+    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+    atexit(cleanup);
+    signal(SIGINT,   on_exit_signal);
+    signal(SIGTERM,  on_exit_signal);
+    signal(SIGWINCH, on_resize_signal);
+
+    App *app     = &g_app;
+    app->running = 1;
+    app->sim_fps = SIM_FPS_DEFAULT;
+
+    screen_init(&app->screen);
+    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+
+    int64_t frame_time  = clock_ns();
+    int64_t sim_accum   = 0;
+    int64_t fps_accum   = 0;
+    int     frame_count = 0;
+    double  fps_display = 0.0;
+
+    while (app->running) {
+        if (app->need_resize) {
+            endwin(); refresh();
+            getmaxyx(stdscr, app->screen.rows, app->screen.cols);
+            app->need_resize = 0;
+            frame_time = clock_ns();
+            sim_accum  = 0;
+        }
+
+        int64_t now = clock_ns();
+        int64_t dt  = now - frame_time;
+        frame_time  = now;
+        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+
+        int64_t tick_ns = TICK_NS(app->sim_fps);
+        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+
+        sim_accum += dt;
+        while (sim_accum >= tick_ns) {
+            scene_tick(&app->scene, dt_sec,
+                       app->screen.cols, app->screen.rows);
+            sim_accum -= tick_ns;
+        }
+
+        float alpha = (float)sim_accum / (float)tick_ns;
+
+        frame_count++;
+        fps_accum += dt;
+        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+            fps_display = (double)frame_count
+                        / ((double)fps_accum / (double)NS_PER_SEC);
+            frame_count = 0;
+            fps_accum   = 0;
+        }
+
+        int64_t elapsed = clock_ns() - frame_time + dt;
+        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
+        screen_draw(&app->screen, &app->scene,
+                    fps_display, app->sim_fps, alpha, dt_sec);
+        screen_present();
+
+        int ch = getch();
+        if (ch != ERR && !app_handle_key(app, ch))
+            app->running = 0;
+    }
+
+    screen_free(&app->screen);
+    return 0;
+}

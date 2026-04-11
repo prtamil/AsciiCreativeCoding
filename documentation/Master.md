@@ -158,6 +158,19 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [P9 Recursive Tip Branching — Lightning](#p9-recursive-tip-branching--lightning)
 - [P10 Buddhabrot — Density Accumulator Fractal](#p10-buddhabrot--density-accumulator-fractal)
 - [P11 Pascal-Triangle Bat Swarms — Artistic Formation Flying](#p11-pascal-triangle-bat-swarms--artistic-formation-flying)
+- [P12 De Bruijn Pentagrid — Penrose Tiling](#p12-de-bruijn-pentagrid--penrose-tiling)
+- [P13 Diamond-Square Heightmap + Thermal Erosion](#p13-diamond-square-heightmap--thermal-erosion)
+
+### Q — Artistic / Signal-Based Effects
+- [Q1 Sinusoidal Aurora Curtains](#q1-sinusoidal-aurora-curtains)
+- [Q2 Demoscene Plasma — Sin-Sum Palette Cycling](#q2-demoscene-plasma--sin-sum-palette-cycling)
+- [Q3 Hypotrochoid Spirograph with Float Canvas Decay](#q3-hypotrochoid-spirograph-with-float-canvas-decay)
+- [Q4 Voronoi with Langevin Brownian Seeds](#q4-voronoi-with-langevin-brownian-seeds)
+
+### R — Force-Based Physics
+- [R1 Explicit Spring Forces + Symplectic Euler (Cloth)](#r1-explicit-spring-forces--symplectic-euler-cloth)
+- [R2 Softened N-Body Gravity + Verlet](#r2-softened-n-body-gravity--verlet)
+- [R3 Lorenz Strange Attractor — RK4 + 3-D Projection](#r3-lorenz-strange-attractor--rk4--3-d-projection)
 
 ---
 
@@ -1070,6 +1083,124 @@ float sdf_scene(Vec3 p, ...) {
 **2×2 canvas block:** `CELL_W=2, CELL_H=2` renders each canvas pixel as a 2×2 terminal block. Reduces pixel count 4×. Aspect correction `phys_aspect = (h·2·2)/(w·2) = 2h/w` compensates for non-square terminal characters.
 
 *Files: `raymarcher/metaballs.c`*
+
+---
+
+---
+
+#### P12 De Bruijn Pentagrid — Penrose Tiling
+
+`penrose.c` uses de Bruijn's algebraic duality to identify which Penrose rhombus contains each terminal cell in O(1), without storing any tiles.
+
+**Five families of parallel lines:** Family j has direction `e_j = (cos(2πj/5), sin(2πj/5))`. For point (wx,wy) in pentagrid space: `k_j = floor(wx·cos_j + wy·sin_j)`. The 5-tuple (k_0…k_4) uniquely identifies which rhombus contains the point.
+
+**Tile type from parity:** `S = Σ k_j`. Even S → thick rhombus (72°). Odd S → thin rhombus (36°). Crossing any grid line flips S parity, so thick and thin always alternate across every edge.
+
+**Edge detection:** `frac(proj_j) ∈ [0,1)`. Distance to grid line = `min(frac, 1−frac)`. If the minimum across all five families is below BORDER=0.15, draw a directional line char whose angle = `2π·j/5 + π/2 − view_angle`.
+
+**Color hash:** `h = abs(k_0·3 + k_1·7 + k_2·11 + k_3·13 + k_4·17) % 3`. Since adjacent tiles are always opposite type, same-type color collisions never cause invisible boundaries.
+
+*Files: `fractal_random/penrose.c`*
+
+---
+
+#### P13 Diamond-Square Heightmap + Thermal Erosion
+
+`terrain.c` builds a fractal landscape via midpoint displacement, then erodes it with thermal weathering.
+
+**Diamond-square:** Alternate diamond step (square centres) and square step (edge midpoints). Each step adds `rand()*scale`; `scale *= ROUGHNESS=0.60` per level. Result: statistically self-similar heightmap where high-frequency roughness is proportional to elevation change.
+
+**Thermal weathering:** `diff = h[y][x] − h[ny][nx]`. If `diff > TALUS`, move `EROSION_RATE*(diff−TALUS)` from high to low cell. Simulates granular material sliding when slope exceeds angle-of-repose. Run multiple passes per tick; mountains slowly smooth to plains.
+
+**Bilinear interpolation** maps the fixed 65×65 grid to any terminal size without blocky nearest-neighbor artifacts.
+
+*Files: `fractal_random/terrain.c`*
+
+---
+
+### Q — Artistic / Signal-Based Effects
+
+#### Q1 Sinusoidal Aurora Curtains
+
+Two-octave sinusoidal curtains with a vertical sine envelope render the northern-lights effect in `aurora.c`.
+
+**Formula:** `primary = sin(x·1.5+t·0.2)·cos(y·3+t·0.5+x·0.25)`, `shimmer = cos(x·2.3−t·0.15)·sin(y·5+t·0.8+x·0.4)`, `v = primary·0.6 + shimmer·0.4`. Multiplied by `env = sin(π·y)` to suppress curtain at top and bottom edges. Two octaves break the regularity and create natural shimmer.
+
+**Deterministic star hash:** `h = col·1234597 ^ row·987659; h ^= h>>13; h *= 0x5bd1e995; h ^= h>>15`. Zero storage, no flicker.
+
+*Files: `artistic/aurora.c`*
+
+---
+
+#### Q2 Demoscene Plasma — Sin-Sum Palette Cycling
+
+`plasma.c` sums four sinusoids per cell (horizontal, vertical, diagonal, radial) and maps through a cycling palette. Adding `fmod(time·CYCLE_HZ, 1.0)` to the normalized value before palette lookup shifts colors without changing the spatial pattern — zero physics.
+
+*Files: `artistic/plasma.c`*
+
+---
+
+#### Q3 Hypotrochoid Spirograph with Float Canvas Decay
+
+`spirograph.c` traces `x=(R−r)·cos(t)+d·cos((R−r)/r·t)`, `y=(R−r)·sin(t)−d·sin((R−r)/r·t)` onto a float canvas that decays by `FADE=0.985` per tick. No ring buffer needed — the canvas itself is the trail. Parameter drift slowly changes the petal count.
+
+*Files: `artistic/spirograph.c`*
+
+---
+
+#### Q4 Voronoi with Langevin Brownian Seeds
+
+`voronoi.c` moves seeds via `v += (−DAMP·v + NOISE·ξ)·dt` (Langevin dynamics). Per-cell nearest-seed search tracks d1 and d2; `d2−d1 < BORDER_PX` identifies Voronoi edges without Fortune's algorithm.
+
+*Files: `artistic/voronoi.c`*
+
+---
+
+### R — Force-Based Physics
+
+#### R1 Explicit Spring Forces + Symplectic Euler (Cloth)
+
+**Why Jakobsen fails with pins:** Sequential constraint projection propagates pin corrections through the entire cloth, eliminating deformation. Force-based integration cannot be "corrected away."
+
+**Spring force:** `F = k·stretch + kd·v_rel` where `v_rel = dot(v_b − v_a, n)`. Symplectic Euler: `v += a·dt; v *= DAMP; x += v·dt`.
+
+*Files: `physics/cloth.c`*
+
+---
+
+#### R2 Softened N-Body Gravity + Verlet
+
+**Softened gravity:** `F = G·m_i·m_j / (r² + ε²)^(3/2)`. ε² prevents singularities at close approach. O(n²) force loop, n=20 bodies, Velocity Verlet integration.
+
+*Files: `physics/nbody.c`*
+
+---
+
+#### R3 Lorenz Strange Attractor — RK4 + 3-D Projection
+
+**RK4** keeps the trajectory on the attractor without time-step reduction (Euler diverges due to chaos sensitivity). **Ghost trajectory** starts at x+ε=0.001 offset; exponential divergence on the Lyapunov time-scale (~1.1 s) is rendered in a contrasting color. **Orthographic rotation** `px = x·cos(a) − y·sin(a)` reveals 3-D structure without a projection matrix.
+
+*Files: `physics/lorenz.c`*
+
+---
+
+### P15 — Harmonograph / Lissajous (`artistic/lissajous.c`)
+
+`lissajous.c` draws two perpendicular damped oscillators whose phase drifts slowly, morphing the parametric figure through figure-8s, trefoils, stars, and spirals.
+
+**Equations:** `x(t) = sin(fx·t + phase)·exp(−decay·t)`, `y(t) = sin(fy·t)·exp(−decay·t)`. `T_MAX = N_LOOPS·2π/min(fx,fy)` so every ratio runs exactly 4 cycles of the slower oscillator. `DECAY = DECAY_TOTAL/T_MAX` — always 1% amplitude at T_MAX.
+
+**Age rendering:** Draws oldest inner loops (dim `.`) first, newest outer loops (bright `#`) last. Newest overwrites shared cells. `age = i/(N-1)` where 0=newest → level 0, 1=oldest → level 3.
+
+**Phase dwell:** `key_period = π/max(fx,fy)`. Near each symmetric phase, drift is multiplied to 0.25× and ramps linearly back to 1× over DWELL_WIDTH=0.25 of the period. After 2π phase sweep the ratio auto-advances.
+
+**8 frequency ratios:** 1:2 Figure-8, 2:3 Trefoil, 3:4 Star, 1:3 Clover, 3:5 Pentagram, 2:5 Five-petal, 4:5 Crown, 1:4 Eye.
+
+**Keys:** `space` pause, `n`/`p` next/prev ratio, `+`/`-` drift speed, `c` theme, `q` quit.
+
+**Build:** `gcc -std=c11 -O2 -Wall -Wextra artistic/lissajous.c -o lissajous -lncurses -lm`
+
+*Files: `artistic/lissajous.c`*
 
 ---
 

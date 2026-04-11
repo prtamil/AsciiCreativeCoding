@@ -45,6 +45,15 @@ gcc -std=c11 -O2 -Wall -Wextra fractal_random/lightning.c    -o lightning    -ln
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/buddhabrot.c  -o buddhabrot   -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/sandpile.c    -o sandpile     -lncurses
 
+# ── physics ──────────────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra physics/lorenz.c             -o lorenz       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/nbody.c              -o nbody        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/cloth.c              -o cloth        -lncurses -lm
+
+# ── fractal / random growth (new) ────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/penrose.c     -o penrose      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/terrain.c     -o terrain      -lncurses -lm
+
 # ── artistic ──────────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra Artistic/bat.c               -o bat          -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra Artistic/2stroke.c           -o 2stroke      -lncurses -lm
@@ -56,6 +65,11 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/life.c                -o life           
 gcc -std=c11 -O2 -Wall -Wextra artistic/langton.c             -o langton             -lncurses
 gcc -std=c11 -O2 -Wall -Wextra artistic/cymatics.c            -o cymatics            -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/wator.c               -o wator               -lncurses
+gcc -std=c11 -O2 -Wall -Wextra artistic/lissajous.c           -o lissajous           -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/aurora.c              -o aurora              -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/voronoi.c             -o voronoi             -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/spirograph.c          -o spirograph          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/plasma.c              -o plasma              -lncurses -lm
 
 # ── raster (software rasterizer) ─────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
@@ -106,7 +120,14 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 - `wave.c`                 — FDTD 2-D wave equation: 5 oscillating sources (keys 1–5 toggle), Gaussian impulse (p), interference fringes + boundary reflections, 9-level signed amplitude display, 4 colour themes (water/lava/plasma/matrix), CFL-stable c=0.45
 - `flowfield.c`         — Perlin noise flow field: 3-octave fBm, bilinear field sampling, 8-direction arrow glyphs, ring-buffer particle trails
 
+### physics/
+- `lorenz.c`       — Lorenz strange attractor: RK4 integration, rotating orthographic 3-D→2-D projection, 1500-slot ring-buffer trail (red→grey), ghost trajectory showing Lyapunov chaos divergence
+- `nbody.c`        — N-body gravity: 20 point masses, softened 1/r² (ε=4 px), Velocity Verlet, per-body 200-slot color-faded trails, optional central black hole
+- `cloth.c`        — Spring-mass cloth: explicit spring forces (Hooke + velocity damping), symplectic Euler, 3 modes (hanging/flag/hammock), render lerp for smooth sub-tick motion
+
 ### fractal_random/
+- `penrose.c`      — Penrose P3 rhombus tiling: de Bruijn pentagrid duality, O(1) per cell, parity-based thick/thin distinction, pentagrid edge detection for visible tile outlines (|/\-), slow rotation, 256-color warm/cool palette
+- `terrain.c`      — Diamond-square fractal terrain: 65×65 heightmap, ROUGHNESS=0.60, thermal weathering erosion (TALUS=0.022), bilinear interpolation to any terminal size, 7 ASCII contour levels (~.−^#*)
 - `snowflake.c`    — DLA crystal with D6 6-fold symmetry; 12-way simultaneous freeze; distance-based 6-color ice palette (light-blue core → teal → white tips); context-sensitive chars (`*` `|` `-` `+` `/` `\`)
 - `coral.c`        — anisotropic DLA: 8 bottom seeds, top-spawned walkers with downward bias; direction-dependent sticking probability; vivid coral/violet/yellow/lime/teal palette; auto-reset when tallest branch hits top quarter
 - `sierpinski.c`   — Sierpinski triangle via chaos game (IFS): 3 vertices, random vertex → move halfway; N_PER_TICK=500, TOTAL_ITERS=50000; color by last chosen vertex (cyan/yellow/magenta); held then reset
@@ -126,7 +147,11 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 - `cellular_automata_1d.c` — Wolfram 1-D elementary CA: 17 preset rules (30/90/110/18/150…), builds top-down row-by-row, 5 Wolfram classes color-coded, auto-cycle, type any rule 0–255+Enter
 - `life.c`    — Conway's Game of Life + 5 rule variants (HighLife/Day&Night/Seeds/Morley/2×2), 6-colour palette, Gosper gun/glider/acorn/R-pentomino seeds, 3-row scrolling population histogram
 - `langton.c` — Langton's Ant + 7 multi-colour turmite rules (RL/LR/LLRR/RLR/LRRL…), 1–3 simultaneous ants, cell states colour-coded, ant shown as bold @
-- `cymatics.c` — Chladni figures: Z=cos(mπx)cos(nπy)−cos(nπx)cos(mπy), 20 (m,n) modes, nodal lines rendered with glow chars (@#*+.), smooth morph animation between modes, 4 colour themes
+- `cymatics.c`  — Chladni figures: Z=cos(mπx)cos(nπy)−cos(nπx)cos(mπy), 20 (m,n) modes, nodal lines rendered with glow chars (@#*+.), smooth morph animation between modes, 4 colour themes
+- `aurora.c`    — Aurora borealis: two-octave sinusoidal curtains with vertical sine envelope, color zones by row fraction (magenta fringe/cyan core/green base), deterministic star hash (no storage, no flicker)
+- `voronoi.c`   — Animated Voronoi: 24 seeds with Langevin Brownian motion (DAMP=2, NOISE=60), brute-force O(N) nearest-seed per cell, d2−d1 edge detection, seed bounce off walls
+- `spirograph.c` — Spirograph: 3 simultaneous hypotrochoids with parameter drift, float canvas decay (FADE=0.985), 5 intensity levels, cyan/magenta/yellow curves
+- `plasma.c`    — Demoscene plasma: 4-component sin-sum (horizontal/vertical/diagonal/radial), palette cycling via time-offset, 4 frequency presets (gentle/energetic/grand/turbulent), 4 color themes, 14 PalEntry levels each
 
 ### raster/
 - `torus_raster.c`      — UV torus, 4 shaders (phong / toon / normals / wireframe), always-on back-face cull
@@ -218,7 +243,7 @@ tessellate_*()  →  scene_tick()  →  pipeline_draw_mesh()  →  fb_blit()
 
 | File | Contents |
 |---|---|
-| `documentation/Architecture.md` | Framework design, loop mechanics, coordinate model, per-subsystem deep dives including DLA, IFS, Julia/Mandelbrot, Koch, Lightning, Buddhabrot, bat swarms |
-| `documentation/Master.md` | Long-form essays on algorithms, physics, and visual techniques; section P covers fractal systems including Buddhabrot |
-| `documentation/Visual.md` | ncurses field guide — V1–V9 covering every ncurses technique (What/Why/How + code); V9 per-file reference including all fractal_random files, bat.c; Quick-Reference Matrix; Technique Index |
+| `documentation/Architecture.md` | Framework design, loop mechanics, coordinate model, per-subsystem deep dives; §37 physics (lorenz/nbody/cloth), §38 artistic (aurora/voronoi/spirograph/plasma), §39 penrose tiling, §40 diamond-square terrain |
+| `documentation/Master.md` | Long-form essays on algorithms, physics, and visual techniques; §P fractal systems, §Q artistic/signal effects (aurora/plasma/spirograph/voronoi), §R force-based physics (cloth/nbody/lorenz) |
+| `documentation/Visual.md` | ncurses field guide — V1–V9 covering every ncurses technique (What/Why/How + code); Quick-Reference Matrix and Technique Index covering all files |
 | `documentation/COLOR.md` | Color tricks across all C files — mechanism, exact code pattern, visual effect; includes fractal palettes, escape-time coloring, distance-based coloring, Buddhabrot density coloring |

@@ -7,41 +7,33 @@ Each entry notes the core algorithm, what makes it visually distinct, and the ke
 
 ## physics/
 
-### 1. `lorenz.c` — Lorenz Strange Attractor
-Integrate the three Lorenz ODEs (σ=10, ρ=28, β=8/3) with RK4.
-Project the 3-D trajectory onto 2-D with a slow auto-rotating view angle.
-Ring-buffer trail fades red→orange→grey.  Second ghost trajectory (ε offset)
-diverges on the Lyapunov time-scale — companion piece to double_pendulum chaos.
-**Challenge:** aspect-correct 3-D→2-D projection; rotation without distorting the attractor shape.
+### 1. `pendulum_wave.c` — Pendulum Wave
+N=15 pendulums with lengths chosen so periods are harmonically related: `L_n = L / (1 + n·k)`.
+At t=0 all swing in phase; they gradually drift into beautiful wave patterns, then "clap" back to sync.
+Each pendulum is a colored vertical line; collective patterns emerge from pure phase arithmetic.
+**Challenge:** choosing the period ratios so the resync time is ~60 s and intermediate patterns are striking.
 
-### 2. `nbody.c` — N-Body Gravity
-15–30 point masses with Verlet integration, softened 1/r² gravity.
-Trails reveal orbital paths, slingshot ejections, figure-8 solutions.
-Optional: fixed central black-hole mass.
-**Challenge:** O(n²) force loop fast enough at 30 fps; softening ε prevents singularities.
-
-### 3. `cloth.c` — Spring-Mass Cloth
-Grid of masses connected by structural + shear + bend springs.
-Top row pinned; gravity + wind perturbation.  Verlet + constraint relaxation.
-Fold lines, billowing, and corner tucks emerge naturally.
-**Challenge:** position-based constraint solver (Jakobsen) stable at large timesteps.
-
-### 4. `gyroscope.c` — Spinning Top / Euler Equations
-Rigid body torque-free precession via Euler's rotation equations.
-Draw the body frame axes rotating around the angular momentum vector.
-Optionally add gravity-driven nutation — the wobble tightens as spin increases.
-**Challenge:** integrating SO(3) rotation matrix without drift; Gram-Schmidt re-orthogonalisation.
+### 2. `elastic_collision.c` — Hard Sphere Billiards
+20–40 discs with randomised radii and velocities bouncing off walls and each other.
+Perfectly elastic collisions (kinetic energy + momentum conserved); color shifts on impact to highlight the transfer.
+Shows Maxwell–Boltzmann velocity distribution emerging spontaneously.
+**Challenge:** broad-phase spatial hashing to avoid O(n²) pair checks at every tick.
 
 ---
 
 ## fluid/
 
-### 5. `navier_stokes.c` — Stable Fluid (Jos Stam)
+### 3. `navier_stokes.c` — Stable Fluid (Jos Stam)
 Velocity + density grid, advect-project scheme.  Inject dye with key presses.
 Vortices, swirls, and diffusion emerge.  Arrow-key "wind" source.
 **Challenge:** pressure-projection Poisson solve via Gauss-Seidel; advection without artificial dissipation.
 
-### 6. `lenia.c` — Lenia (Continuous Life)
+### 4. `sph.c` — Smoothed Particle Hydrodynamics
+80–120 particles as fluid parcels; pressure and viscosity computed from kernel-weighted neighbours.
+Particles pile up, slosh, and form droplets under gravity.  Mouse-key impulse injects momentum.
+**Challenge:** SPH kernel (cubic spline), neighbour search via cell grid, tuning rest density to prevent jitter.
+
+### 5. `lenia.c` — Lenia (Continuous Life)
 Continuous-state, continuous-time generalisation of Game of Life.
 Convolution kernel + growth function; smooth, organic "creatures" move and divide.
 **Challenge:** efficient 2-D convolution at terminal resolution; kernel/growth parameter UI.
@@ -50,46 +42,51 @@ Convolution kernel + growth function; smooth, organic "creatures" move and divid
 
 ## fractal_random/
 
-### 7. `penrose.c` — Penrose Tiling (P3 Rhombus)
-Recursive substitution inflation of thick + thin rhombus tiles.
-Aperiodic — never repeats.  Slowly zoom in, revealing self-similarity at every scale.
-Color by tile type and generation depth.
-**Challenge:** substitution rule coded as edge-midpoint subdivision; zoom without integer rounding gaps.
+### 6. `bifurcation.c` — Logistic Map Bifurcation Diagram
+Sweep r from 2.4 → 4.0; for each r run 500 warmup iterations then plot the next 300 x-values.
+The classic period-doubling cascade and Feigenbaum universality emerge as a branching tree.
+Scroll left/right to zoom into the fractal structure at the edge of chaos.
+**Challenge:** fitting 1600 r-values across terminal columns; suppressing transient iterations cleanly.
 
-### 8. `terrain.c` — Fractal Terrain (Diamond-Square)
-Diamond-square midpoint displacement on a 2^n+1 grid.
-Render as ASCII elevation contours: `·` lowland → `-` foothills → `^` peaks → `*` snowcap.
-Slowly erode the heightmap each tick (thermal weathering) so mountains crumble to plains.
-**Challenge:** wrapping the algorithm for seamless tiling; mapping float heights to discrete contour bands without ugly banding.
+### 7. `newton_fractal.c` — Newton's Method Fractal
+Apply Newton's root-finding iteration to z^4 − 1 = 0 in the complex plane.
+Basin boundaries form a fractal — zoom reveals infinite self-similar cusps.
+Color by which root the iteration converged to; brightness by convergence speed.
+**Challenge:** smooth coloring between basins; zoom without banding at the boundary.
+
+### 8. `burning_ship.c` — Burning Ship Fractal
+Same escape-time iteration as Mandelbrot but with `z → (|Re(z)| + i|Im(z)|)² + c`.
+The absolute value folds the plane, creating a ship-like hull structure and flame-shaped filaments.
+Color with a fire palette; slow zoom into the ship's "deck" region.
+**Challenge:** the asymmetry (no left-right symmetry) means the interesting region must be found by panning.
+
+### 9. `strange_attractor.c` — Point Density Attractor
+Clifford / de Jong / Ikeda attractor: iterate a 2-D map millions of times, accumulate hit counts in a density grid.
+Log-normalize and map density to a nebula palette (black → blue → white).
+Cycle through 6 named attractors with key presses; smooth crossfade between parameter sets.
+**Challenge:** density accumulation in a fixed integer grid; log normalization without clipping bright cores.
 
 ---
 
 ## artistic/
 
-### 9. `aurora.c` — Aurora Borealis
-Layered fBm noise bands scrolling horizontally, 3–5 vertical curtain columns.
-Green/cyan core, purple/pink fringes, brightness shimmer from a second noise octave.
-Star field background (static dots).  Pure colour-art — no physics.
-**Challenge:** multi-layer noise blending in 256-color pairs without banding artefacts.
+### 10. `ant_colony.c` — Pheromone Stigmergy
+50 ants wander, lay pheromone trails, and follow gradients toward food sources.
+Pheromone evaporates over time; shortest paths emerge from collective reinforcement.
+Two food sources visible simultaneously; watch separate trails compete then merge.
+**Challenge:** pheromone grid deposit/evaporate without per-cell allocation; bias random walk toward gradient.
 
-### 10. `voronoi.c` — Animated Voronoi
-20–30 seed points moving with slow Brownian drift.
-Each cell coloured by seed index; cell boundaries drawn with `·` dots.
-Seeds "bounce" off edges.  Optional: Fortune's algorithm HUD showing sweep line.
-**Challenge:** per-frame brute-force nearest-seed search fast enough at terminal resolution.
+### 11. `fourier_draw.c` — Fourier Epicycle Reconstruction
+Precomputed DFT of a parametric closed path (star, trefoil, batman, figure-8…).
+Draw the full epicycle arm chain rotating in real time, trailing the reconstructed curve.
+Cycle the number of arms from 1 → N to show convergence live.
+**Challenge:** matching epicycles.c architecture but with path-specific DFT coefficients rather than shape IFS.
 
-### 11. `spirograph.c` — Spirograph (Hypotrochoid / Epitrochoid)
-Parametric r, R, d with slow parameter drift.  Multiple simultaneous curves
-in different colors, slightly out of phase.  Fade old curves so new ones emerge.
-**Challenge:** smooth Bresenham rasterization of the dense parametric curve without gaps.
-
-### 12. `plasma.c` — Plasma / Colour Wave
-Classic demoscene plasma: sum of sinusoids evaluated at each terminal cell and mapped
-through a cycling 256-colour palette.  No physics — just `sin(x·f1 + t) + sin(y·f2 + t) + …`
-summed and palette-indexed.  Frequency knobs and palette themes cycle with keys.
-Visually hypnotic; trivially cheap to compute.
-**Challenge:** smooth cycling palette without banding; multiple frequency combos that look
-distinct rather than all washing into the same blob.
+### 12. `reaction_wave.c` — FitzHugh-Nagumo Excitable Media
+Two-variable PDE on the terminal grid: activator u and inhibitor v.
+Trigger a point impulse → expanding ring wave. Wrong parameters → spiral wave rotating forever.
+4 presets: target rings, spiral pair, chaos, plane wave.
+**Challenge:** FitzHugh-Nagumo PDE stability (explicit Euler needs dt < 0.1); stacking with Gray-Scott color theme code.
 
 ---
 
@@ -109,33 +106,40 @@ Presets: small fast maze vs large slow maze.  Reset re-generates with new random
 smooth cell-by-cell draw during generation without full redraw each frame.
 
 ### 15. `ising.c` — Ising Model (Magnetic Phase Transition)
-Each cell is a spin: `+1` (up) or `−1` (down).  Monte Carlo Metropolis algorithm flips
-spins according to the Boltzmann factor `exp(−ΔE / kT)`.  At high T spins are random
-noise; cool below the critical temperature T_c and magnetic domains spontaneously form —
-regions of aligned spins growing to fill the screen.  HUD shows temperature and mean
-magnetisation.  Keys raise/lower T so the phase transition is observable live.
+Each cell is a spin: `+1` (up) or `−1` (down).  Monte Carlo Metropolis flips spins
+according to `exp(−ΔE / kT)`.  At high T spins are random noise; cool below T_c and
+magnetic domains spontaneously form.  HUD shows temperature and mean magnetisation.
 **Challenge:** efficient neighbour-energy calculation; finding T_c for the terminal aspect ratio.
 
----
+### 16. `schrodinger.c` — 1-D Quantum Wavefunction
+Split-operator FFT method: evolve ψ under H = −ℏ²/2m · ∂²/∂x² + V(x).
+Gaussian wave-packet tunnels through a finite barrier; reflection/transmission coefficients shown live.
+Color real part blue, imaginary part red, |ψ|² white; probability density fills the screen.
+**Challenge:** split-operator requires FFT forward/inverse each tick; normalization drift over long runs.
 
-## fractal_random/ (additional)
+### 17. `perlin_landscape.c` — Perlin Terrain Flythrough
+Raycast a 2-D Perlin heightmap column by column: for each screen column cast a ray and find the
+max-angle intersection, drawing sky above and terrain below with depth-based fog.
+Camera drifts forward automatically; `←→` steer, `↑↓` altitude.
+**Challenge:** ray–heightmap intersection without a full SDF; horizon-only draw per column avoids overdraw.
 
-### 16. `l_system.c` — L-System Fractal Plants
-String-rewriting L-system with turtle-graphics interpretation.
-Five presets: Dragon Curve, Hilbert Curve, Sierpinski Arrow, Branching Plant, Koch Island.
-Each preset shows one iteration at a time, building the fractal generation by generation.
-Color by recursion depth.
-**Challenge:** variable-length string budget (exponential growth); fitting the turtle path
-within terminal bounds by auto-scaling the step length per generation.
+### 18. `graph_search.c` — Animated Pathfinding
+Random planar graph of 60–80 nodes with visible edges.  Run BFS, DFS, or A* live:
+frontier nodes pulse cyan, visited grey, shortest path red.  Key switches between algorithms.
+Side-by-side mode shows BFS and A* expanding simultaneously for direct comparison.
+**Challenge:** force-directed layout to space nodes legibly; priority queue for A* without dynamic alloc.
 
-### 17. `automaton_2d.c` — Larger-than-Life / Extended CA
-Generalised 2-D cellular automaton: configurable neighbourhood radius R (1–5),
-count thresholds, and state count.  Radius-2 rules produce exotic crystal structures,
-spirals, and moving "blobs" impossible in standard GoL.  Presets: Bosco's rule,
-Larger-than-Life Vote, Snowflakes, Moving Bands.
-Color by cell state (0..N-1) using 256-colour palette.
-**Challenge:** efficient summing of R×R neighbourhood for large R without O(R²) per cell;
-toroidal edge handling.
+### 19. `network_sim.c` — SIR Epidemic on a Small-World Network
+100 nodes on a Watts–Strogatz ring with p=0.1 rewiring; nodes are S (white), I (red), R (green).
+One infected seed spreads via edge contacts with probability β; recovered nodes are immune.
+R0 = β/γ HUD; `↑↓` tune β live and watch epidemic fade vs explode.
+**Challenge:** Watts–Strogatz rewiring at init; per-edge stochastic contact without O(E) per tick.
+
+### 20. `ca_music.c` — Musical Cellular Automaton
+Rule-110 or Langton's Ant drives a 1-D pitch row: live cells select a scale note, dead cells rest.
+ANSI escape codes trigger the terminal bell on beat — produces generative rhythmic music.
+Visualise the automaton grid while audio plays; `t` changes tempo, `s` changes scale.
+**Challenge:** mapping CA state to musical rhythm without audio library; timer alignment for beat-accurate bell.
 
 ---
 
@@ -143,20 +147,23 @@ toroidal edge handling.
 
 | Priority | File | Reason |
 |---|---|---|
-| 1  | `lorenz.c`        | Natural companion to double_pendulum; iconic attractor shape |
-| 2  | `nbody.c`         | Extends physics folder; Verlet gravity well-understood |
-| 3  | `terrain.c`       | Diamond-square is short; striking contour output |
-| 4  | `aurora.c`        | Pure artistic; no physics, just colour layering |
-| 5  | `plasma.c`        | Simplest possible; pure sin-sum palette — good warmup |
-| 6  | `spirograph.c`    | Parametric curves; natural follow-on after lissajous |
-| 7  | `sort_vis.c`      | Educational; visually satisfying |
-| 8  | `maze.c`          | Wall-bit encoding + BFS solve; self-contained |
-| 9  | `ising.c`         | Monte Carlo Metropolis; striking phase transition |
-| 10 | `voronoi.c`       | Brute-force nearest-seed; tractable at terminal resolution |
-| 11 | `penrose.c`       | Aperiodic tiling; recursive substitution |
-| 12 | `l_system.c`      | String rewriting + turtle graphics; builds on fractal folder |
-| 13 | `lenia.c`         | Continuous Game of Life; builds on life.c knowledge |
-| 14 | `navier_stokes.c` | Stable fluid; most complex fluid sim; save for after wave.c experience |
-| 15 | `gyroscope.c`     | Euler rotation equations; builds on double_pendulum RK4 |
-| 16 | `cloth.c`         | Most complex physics; Jakobsen constraint solver |
-| 17 | `automaton_2d.c`  | Extends life.c; larger neighbourhood = new pattern classes |
+| 1  | `bifurcation.c`    | Short — 1-D map; direct companion to lorenz.c chaos |
+| 2  | `sort_vis.c`       | Educational; visually satisfying; straightforward |
+| 3  | `maze.c`           | Wall-bit encoding + BFS solve; self-contained |
+| 4  | `pendulum_wave.c`  | Natural companion to double_pendulum; phase math only |
+| 5  | `burning_ship.c`   | Trivial extension of mandelbrot.c |
+| 6  | `newton_fractal.c` | Escape-time with complex Newton; builds on julia.c |
+| 7  | `strange_attractor.c` | Density accumulator; builds on buddhabrot.c pattern |
+| 8  | `ising.c`          | Monte Carlo Metropolis; striking phase transition |
+| 9  | `ant_colony.c`     | Pheromone stigmergy; builds on langton.c knowledge |
+| 10 | `fourier_draw.c`   | Extends epicycles.c with path-specific DFT |
+| 11 | `elastic_collision.c` | Spatial hashing + collision response |
+| 12 | `reaction_wave.c`  | FitzHugh-Nagumo; builds on reaction_diffusion.c |
+| 13 | `graph_search.c`   | Force-directed layout + BFS/A* animation |
+| 14 | `sph.c`            | Particle-based fluid; complements navier_stokes |
+| 15 | `lenia.c`          | Continuous Game of Life; builds on life.c knowledge |
+| 16 | `navier_stokes.c`  | Stable fluid; most complex fluid sim |
+| 17 | `perlin_landscape.c` | Raycasting heightmap; new rendering technique |
+| 18 | `network_sim.c`    | SIR epidemic; small-world graph construction |
+| 19 | `schrodinger.c`    | FFT split-operator; requires complex arithmetic |
+| 20 | `ca_music.c`       | Terminal bell timing; most experimental |

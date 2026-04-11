@@ -26,12 +26,15 @@ gcc -std=c11 -O2 -Wall -Wextra particle_systems/constellation.c -o constellation
 
 # ── flocking ─────────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra flocking/flocking.c             -o flocking      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra flocking/shepherd.c             -o shepherd      -lncurses -lm
 
 # ── fluid / grid sims ────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fluid/sand.c                    -o sand                -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/flowfield.c               -o flowfield           -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/reaction_diffusion.c      -o reaction_diffusion  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/wave.c                    -o wave                -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/navier_stokes.c           -o navier_stokes       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/lenia.c                   -o lenia               -lncurses -lm
 
 # ── fractal / random growth ───────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/snowflake.c  -o snowflake  -lncurses -lm
@@ -46,13 +49,22 @@ gcc -std=c11 -O2 -Wall -Wextra fractal_random/buddhabrot.c  -o buddhabrot   -lnc
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/sandpile.c    -o sandpile     -lncurses
 
 # ── physics ──────────────────────────────────────────────────────────────
-gcc -std=c11 -O2 -Wall -Wextra physics/lorenz.c             -o lorenz       -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra physics/nbody.c              -o nbody        -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra physics/cloth.c              -o cloth        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/lorenz.c             -o lorenz            -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/nbody.c              -o nbody             -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/cloth.c              -o cloth             -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/pendulum_wave.c      -o pendulum_wave     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/elastic_collision.c  -o elastic_collision -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/orbit_3body.c        -o orbit_3body       -lncurses -lm
 
 # ── fractal / random growth (new) ────────────────────────────────────────
-gcc -std=c11 -O2 -Wall -Wextra fractal_random/penrose.c     -o penrose      -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra fractal_random/terrain.c     -o terrain      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/penrose.c        -o penrose          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/terrain.c        -o terrain          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/bifurcation.c    -o bifurcation      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/burning_ship.c   -o burning_ship     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/newton_fractal.c -o newton_fractal   -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/strange_attractor.c -o strange_attractor -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/dragon_curve.c   -o dragon_curve     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/apollonian.c     -o apollonian       -lncurses -lm
 
 # ── artistic ──────────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra Artistic/bat.c               -o bat          -lncurses -lm
@@ -70,6 +82,23 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/aurora.c              -o aurora         
 gcc -std=c11 -O2 -Wall -Wextra artistic/voronoi.c             -o voronoi             -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/spirograph.c          -o spirograph          -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/plasma.c              -o plasma              -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/fourier_draw.c        -o fourier_draw  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/ant_colony.c          -o ant_colony    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/reaction_wave.c       -o reaction_wave -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/graph_search.c        -o graph_search  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/network_sim.c         -o network_sim   -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/wave_2d.c             -o wave_2d       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/hex_life.c            -o hex_life      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/boids_3d.c            -o boids_3d      -lncurses -lm
+
+# ── misc (extended) ───────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra misc/sort_vis.c           -o sort_vis          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra misc/maze.c               -o maze              -lncurses
+gcc -std=c11 -O2 -Wall -Wextra misc/ising.c              -o ising             -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra misc/schrodinger.c        -o schrodinger       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra misc/perlin_landscape.c   -o perlin_landscape  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra misc/convex_hull.c        -o convex_hull       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra misc/ca_music.c           -o ca_music          -lncurses -lm
 
 # ── raster (software rasterizer) ─────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
@@ -113,17 +142,23 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 
 ### flocking/
 - `flocking.c`          — boid flocking: 3 flock groups, 5 switchable modes (classic boids, leader chase, Vicsek, orbit, predator-prey), toroidal wrap, cosine palette color cycling, `A_BOLD` proximity halo
+- `shepherd.c`          — shepherd herding sim: user-controlled `#` shepherd moves with arrow keys; sheep flock with boids (separation+alignment+cohesion) and flee when shepherd enters FLEE_RADIUS; sheep chars `o`(calm) `<>^v/\`(moving) `O`(fleeing); bounced boundaries so sheep can be cornered; dotted flee-radius ring toggle (`f`)
 
 ### fluid/
 - `sand.c`                  — falling sand CA
 - `reaction_diffusion.c`   — Gray-Scott model: 7 presets (Mitosis/Coral/Stripes/Worms/Maze/Bubbles/Solitons), 9-point isotropic Laplacian, 4 colour themes (ocean/forest/magma/violet), 600-step warmup pre-run, auto-cycle theme
 - `wave.c`                 — FDTD 2-D wave equation: 5 oscillating sources (keys 1–5 toggle), Gaussian impulse (p), interference fringes + boundary reflections, 9-level signed amplitude display, 4 colour themes (water/lava/plasma/matrix), CFL-stable c=0.45
 - `flowfield.c`         — Perlin noise flow field: 3-octave fBm, bilinear field sampling, 8-direction arrow glyphs, ring-buffer particle trails
+- `navier_stokes.c`     — Jos Stam stable fluid: velocity+density N×N grid, Gauss-Seidel diffuse (warm-start), semi-Lagrangian advect, divergence-free project; two counter-rotating auto-emitters; dynamic density normalization; 3 dye colors; arrow-key wind; pre-warmed 80 steps at startup
+- `lenia.c`             — continuous Game of Life: convolution kernel + growth function, smooth organic creatures, multiple presets
 
 ### physics/
-- `lorenz.c`       — Lorenz strange attractor: RK4 integration, rotating orthographic 3-D→2-D projection, 1500-slot ring-buffer trail (red→grey), ghost trajectory showing Lyapunov chaos divergence
-- `nbody.c`        — N-body gravity: 20 point masses, softened 1/r² (ε=4 px), Velocity Verlet, per-body 200-slot color-faded trails, optional central black hole
-- `cloth.c`        — Spring-mass cloth: explicit spring forces (Hooke + velocity damping), symplectic Euler, 3 modes (hanging/flag/hammock), render lerp for smooth sub-tick motion
+- `lorenz.c`            — Lorenz strange attractor: RK4 integration, rotating orthographic 3-D→2-D projection, 1500-slot ring-buffer trail (red→grey), ghost trajectory showing Lyapunov chaos divergence
+- `nbody.c`             — N-body gravity: 20 point masses, softened 1/r² (ε=4 px), Velocity Verlet, per-body 200-slot color-faded trails, optional central black hole
+- `cloth.c`             — Spring-mass cloth: explicit spring forces (Hooke + velocity damping), symplectic Euler, 3 modes (hanging/flag/hammock), render lerp for smooth sub-tick motion
+- `pendulum_wave.c`     — N=15 pendulums with harmonically-related lengths; ω_n=2π(N_base+n)/T_sync; ropes drawn as diagonal lines (`|` `/` `\`) from pivot to displaced bob; 15-step rainbow palette; amplitude and resync controls
+- `elastic_collision.c` — hard-sphere billiards: 20–40 discs, perfectly elastic collisions (momentum+KE conserved), spatial-hash broad phase, Maxwell–Boltzmann velocity distribution emerges; color flashes on impact
+- `orbit_3body.c`       — three-body gravity: Velocity Verlet, figure-8 stable orbit initial conditions, perturbation key → chaos; speed-colored fading trails (blue slow → white fast)
 
 ### fractal_random/
 - `penrose.c`      — Penrose P3 rhombus tiling: de Bruijn pentagrid duality, O(1) per cell, parity-based thick/thin distinction, pentagrid edge detection for visible tile outlines (|/\-), slow rotation, 256-color warm/cool palette
@@ -136,7 +171,11 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 - `mandelbrot.c`   — Mandelbrot set (z₀=0, z→z²+c); same Fisher-Yates fill as julia.c; 6 zoom presets including deep spirals; electric neon palette (magenta/purple/cyan/lime/yellow); MAX_ITER=256
 - `koch.c`         — Koch snowflake: recursive midpoint subdivision; levels 1–5 cycle; Bresenham rasterization; adaptive segs_per_tick for ~2 s per level; 5-color vivid gradient (cyan→teal→lime→yellow→white)
 - `lightning.c`    — fractal branching lightning: recursive tip branching (not DLA); tips grow downward with persistent lean bias, fork after MIN_FORK_STEPS; glow halo radius 2; color by depth (light-blue → teal → white); state machine ST_GROWING → ST_STRIKING → ST_FADING
-- `buddhabrot.c`   — Buddhabrot density accumulator: two-pass orbit sampling (escape test then trace); 5 presets (buddha 500/2000, anti 100/500/1000); log-normalized density→color (mode-aware floor: 0.05 buddha / 0.25 anti); purple→white nebula palette
+- `buddhabrot.c`        — Buddhabrot density accumulator: two-pass orbit sampling (escape test then trace); 5 presets (buddha 500/2000, anti 100/500/1000); log-normalized density→color (mode-aware floor: 0.05 buddha / 0.25 anti); purple→white nebula palette
+- `newton_fractal.c`    — Newton's method on z⁴−1=0; basin coloring by root (4 colors) + brightness by convergence speed; zoom presets
+- `strange_attractor.c` — Clifford/de Jong/Ikeda point-density attractor; 6 named attractors; log-normalized hit-count grid; nebula palette (black→blue→white)
+- `dragon_curve.c`      — paper-folding dragon curve L-system; iterative string rewrite; generation-depth rainbow coloring; per-turn animation
+- `apollonian.c`        — Apollonian gasket: Descartes circle theorem recursive circle packing; depth-based fire palette; clips circles smaller than one cell
 
 ### Artistic/
 - `bat.c`          — ASCII bat swarms in Pascal-triangle formation: 3 groups × (n_rows+1)(n_rows+2)/2 bats each; `+`/`-` resize rows 1–6 live; wing animation `/−\−`; 6 preset launch angles; staggered group launch; light-purple/cyan/pink groups
@@ -152,6 +191,18 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 - `voronoi.c`   — Animated Voronoi: 24 seeds with Langevin Brownian motion (DAMP=2, NOISE=60), brute-force O(N) nearest-seed per cell, d2−d1 edge detection, seed bounce off walls
 - `spirograph.c` — Spirograph: 3 simultaneous hypotrochoids with parameter drift, float canvas decay (FADE=0.985), 5 intensity levels, cyan/magenta/yellow curves
 - `plasma.c`    — Demoscene plasma: 4-component sin-sum (horizontal/vertical/diagonal/radial), palette cycling via time-offset, 4 frequency presets (gentle/energetic/grand/turbulent), 4 color themes, 14 PalEntry levels each
+- `wave_2d.c`   — 2-D scalar wave equation (∂²u/∂t²=c²∇²u): point sources emit circular wavefronts, multiple sources interfere; CFL-stable explicit Euler; signed amplitude color map (blue/black/white)
+- `hex_life.c`  — Game of Life on hexagonal grid (offset-row layout, 6 neighbours); rule B2/S34; multiple rule presets; hex→terminal column mapping
+- `boids_3d.c`  — Reynolds boids in 3-D pixel space with perspective projection; rotating camera; depth cues via character density (`.` far → `@` near)
+
+### misc/
+- `sort_vis.c`          — sorting visualiser: 5 algorithms (bubble/insertion/selection/quicksort/heapsort) as animated vertical bar chart; one operation per tick; grey/cyan/red/green color states; comparison + swap counters
+- `maze.c`              — recursive-backtracker DFS maze generation; BFS/A* animated solve path; wall-bit encoding (4 bits per cell); small/large presets
+- `ising.c`             — 2-D Ising model: Monte Carlo Metropolis spin flips; `exp(−ΔE/kT)` acceptance; phase transition at T_c; magnetisation HUD; interactive temperature control
+- `schrodinger.c`       — 1-D Schrödinger equation: Crank-Nicolson tridiagonal solver (Thomas algorithm); Gaussian wave-packet; 4 presets (free/barrier/harmonic/double-slit); absorbing walls; |ψ|² display
+- `perlin_landscape.c`  — 2-D parallax scrolling landscape: 3 terrain layers (far/mid/near) at speeds 0.12×/0.38×/1.0×; 5-octave fBm Perlin noise per layer; painter's algorithm; deterministic stars; arrow-key speed/direction
+- `convex_hull.c`       — animated convex hull: Graham scan + Jarvis march running simultaneously; point scatter with force-directed placement; one step per frame; hull-edge draw with HUD comparison counts
+- `ca_music.c`          — musical cellular automaton: 8 CA rules (110/30/90/150…); beat cursor sweeps width; live cells ring terminal bell (`\a`) on beat; 5 scales; tempo control; 7-color rainbow display
 
 ### raster/
 - `torus_raster.c`      — UV torus, 4 shaders (phong / toon / normals / wireframe), always-on back-face cull

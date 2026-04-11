@@ -1,0 +1,104 @@
+# Concept: Ant Colony Optimization (ACO)
+
+## Pass 1 — Understanding
+
+### Core Idea
+Ants find shortest paths through stigmergy: they deposit pheromone on paths they travel. Shorter paths accumulate more pheromone (ants return faster) and attract more ants. Longer paths evaporate. The colony converges on the near-optimal path without any central coordination.
+
+### Mental Model
+Imagine 100 ants leaving a nest and randomly exploring. Each lays a scent trail. Ants that find food and return quickly deposit fresh pheromone before the older pheromone evaporates. Other ants preferentially follow stronger trails. Over time, the shortest path gets the strongest trail and all ants converge to it.
+
+### Key Equations
+Pheromone update:
+```
+τ_ij(t+1) = (1-ρ) · τ_ij(t) + Σ_k Δτ_ij^k
+```
+Where ρ is evaporation rate and Δτ^k = Q/L_k if ant k used edge (i,j), else 0.
+
+Probability of ant k choosing edge (i,j):
+```
+P(i→j) = [τ_ij^α · η_ij^β] / Σ_l [τ_il^α · η_il^β]
+```
+Where η_ij = 1/distance (heuristic), α controls pheromone weight, β controls heuristic weight.
+
+### Data Structures
+- Grid or graph: nodes with x,y positions
+- `pheromone[N][N]`: float matrix, pheromone on each edge
+- `ants[M]`: {current_node, visited[], path_length}
+- `best_path[]`: shortest tour found so far
+
+### Non-Obvious Decisions
+- **Evaporation is essential**: Without evaporation, pheromone only accumulates and the system never forgets bad paths. ρ≈0.1 is typical.
+- **α and β trade-off**: High α means ants blindly follow existing trails (exploitation). High β means they prefer short edges (exploration). Balance: α=1, β=2–5.
+- **Elitist update**: Deposit extra pheromone on the best-ever solution each iteration. Helps convergence.
+- **Visual**: Show pheromone intensity as ASCII density on the grid edges. Watch trails form and strengthen over time.
+
+### Key Constants
+| Name | Typical | Role |
+|------|---------|------|
+| M | 10–50 | number of ants |
+| ρ | 0.1–0.5 | evaporation rate |
+| α | 1.0 | pheromone importance |
+| β | 2.0–5.0 | heuristic importance |
+| Q | 100 | pheromone deposit constant |
+| τ₀ | 0.1 | initial pheromone level |
+
+### Open Questions
+- What happens when α=0? (pure greedy, no learning)
+- What happens when β=0? (pure pheromone following, no distance heuristic)
+- ACO on a dynamic graph where edge costs change mid-simulation?
+
+---
+
+## Pass 2 — Implementation
+
+### Pseudocode
+```
+init():
+    pheromone[i][j] = TAU0 for all edges
+    place ants at random start nodes
+
+ant_tour(ant):
+    visited = {start}
+    path = [start]
+    current = start
+    while not all nodes visited:
+        probs = []
+        for each unvisited neighbor j:
+            p = pheromone[current][j]^ALPHA * (1/dist[current][j])^BETA
+            probs.append((j, p))
+        normalize probs
+        next = random_choice(probs)
+        path.append(next); visited.add(next); current=next
+    return path, total_length(path)
+
+update_pheromones(all_tours):
+    pheromone[i][j] *= (1 - RHO)   # evaporate
+    for tour, length in all_tours:
+        for each edge (i,j) in tour:
+            pheromone[i][j] += Q / length
+
+main_loop():
+    each iteration:
+        tours = [ant_tour(ant) for ant in ants]
+        update_pheromones(tours)
+        update_best(tours)
+        draw_pheromone_grid()
+        draw_best_path()
+```
+
+### Module Map
+```
+§1 config    — N_CITIES, M_ANTS, RHO, ALPHA, BETA, Q
+§2 init      — random city placement, pheromone init
+§3 ants      — ant_tour(), probability calculation
+§4 update    — evaporate(), deposit(), elitist update
+§5 draw      — pheromone intensity → ASCII, best path highlight
+§6 app       — main loop (iterations), keys (speed, reset, params)
+```
+
+### Data Flow
+```
+cities + pheromone → ants probabilistic tours → update pheromone
+→ pheromone matrix → density display + best path overlay
+```

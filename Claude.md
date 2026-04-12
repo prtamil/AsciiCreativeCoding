@@ -14,7 +14,10 @@ gcc -std=c11 -O2 -Wall -Wextra misc/bonsai.c            -o bonsai          -lncu
 gcc -std=c11 -O2 -Wall -Wextra misc/double_pendulum.c   -o double_pendulum -lncurses -lm
 
 # ── matrix ───────────────────────────────────────────────────────────────
-gcc -std=c11 -O2 -Wall -Wextra matrix_rain/matrix_rain.c -o matrix_rain -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra matrix_rain/matrix_rain.c     -o matrix_rain     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra matrix_rain/pulsar_rain.c     -o pulsar_rain     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra matrix_rain/sun_rain.c        -o sun_rain        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra matrix_rain/fireworks_rain.c  -o fireworks_rain  -lncurses -lm
 
 # ── particle systems ─────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra particle_systems/fire.c         -o fire         -lncurses -lm
@@ -89,10 +92,10 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/graph_search.c        -o graph_search  -
 gcc -std=c11 -O2 -Wall -Wextra artistic/network_sim.c         -o network_sim   -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/wave_2d.c             -o wave_2d       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/hex_life.c            -o hex_life      -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra artistic/boids_3d.c            -o boids_3d      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/jellyfish.c           -o jellyfish     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/xrayswarm.c           -o xrayswarm     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/gear.c                -o gear          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/railwaymap.c          -o railwaymap    -lncurses -lm
 
 # ── misc (extended) ───────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra misc/sort_vis.c           -o sort_vis          -lncurses -lm
@@ -134,6 +137,9 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 
 ### matrix_rain/
 - `matrix_rain.c`       — Matrix-style falling character rain: two-pass draw, theme system, render interpolation for smooth column-head scrolling
+- `pulsar_rain.c`       — Rotating pulsar neutron-star: N evenly-spaced beams (1–16) sweep continuously; each leaves a 16-slot angular wake of fading matrix chars across 80 radial samples; '@' core always drawn last; +/- spin, [ ] beam count, t theme, r reset
+- `sun_rain.c`          — Matrix Rain Sun: single '@' core at centre, 180 independent radial solar-wind streams (2° per ray) shoot outward continuously; random stagger offsets give stochastic beam field; ri < 1.0 clip preserves centre char; 5 themes; t r
+- `fireworks_rain.c`   — Fireworks with matrix-rain arc trails: rockets explode at apex, each of 72 sparks grows a 16-slot position-history trail; characters shimmer 75 % per tick; head=white/bold, trail fades by color pair; 5 themes (vivid/matrix/fire/ice/plasma) remap all 7 spark color pairs; ] [ = - t
 
 ### particle_systems/
 - `fire.c`              — Doom-style fire CA: heat diffusion, Floyd-Steinberg dithering, 6 auto-cycling color themes, wind and gravity controls
@@ -196,10 +202,10 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 - `plasma.c`    — Demoscene plasma: 4-component sin-sum (horizontal/vertical/diagonal/radial), palette cycling via time-offset, 4 frequency presets (gentle/energetic/grand/turbulent), 4 color themes, 14 PalEntry levels each
 - `wave_2d.c`   — 2-D scalar wave equation (∂²u/∂t²=c²∇²u): point sources emit circular wavefronts, multiple sources interfere; CFL-stable explicit Euler; signed amplitude color map (blue/black/white)
 - `hex_life.c`  — Game of Life on hexagonal grid (offset-row layout, 6 neighbours); rule B2/S34; multiple rule presets; hex→terminal column mapping
-- `boids_3d.c`  — Reynolds boids in 3-D pixel space with perspective projection; rotating camera; depth cues via character density (`.` far → `@` near)
 - `jellyfish.c` — bioluminescent jellyfish: four-state physics pulse (IDLE sink → CONTRACT jet → GLIDE coast → EXPAND bloom); asymmetric bell deformation (width via `head_f`, height via `crown_f`); tentacle inertia lag + wave_scale gating; 8 color variants; +/− jellyfish count
 - `xrayswarm.c` — multi-swarm pulsating X-ray rays: workers radiate from fixed queen (DIVERGE), park at screen edge (PAUSE), retrace exact path back to origin (CONVERGE); locked queen coords; 4-pass rendering (DIM/MID/BRIGHT/HEAD) across all swarms prevents trail cancellation
 - `gear.c` — wireframe rotating gear with themed sparks: polar proximity edge detection (hub ring/spokes/tooth sides/arcs), tangential surface-velocity emission (tang_v = ω×R×TANG_SCALE), speed-proportional emission rate, 7-stage cooling gradient, 10 named 256-color themes (FIRE/MATRIX/PLASMA/NOVA/POISON/OCEAN/GOLD/NEON/ARCTIC/LAVA); t/T cycles themes live via init_pair re-binding
+- `railwaymap.c` — procedural transit map: H/V/Z line templates on a 6×4 logical grid; stations emerge at every grid node; canvas-based ACS junction detection (h_cp+v_cp → ACS_PLUS); interchange nodes where ≥2 lines share a position; 10 color themes; r:new map
 
 ### misc/
 - `sort_vis.c`          — sorting visualiser: 5 algorithms (bubble/insertion/selection/quicksort/heapsort) as animated vertical bar chart; one operation per tick; grey/cyan/red/green color states; comparison + swap counters

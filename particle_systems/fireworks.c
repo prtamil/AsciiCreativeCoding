@@ -89,8 +89,16 @@ enum {
 #define NS_PER_MS     1000000LL
 #define TICK_NS(fps)  (NS_PER_SEC / (fps))
 
-/* Gravity in rows/sec^2 (positive = downward) */
-#define GRAVITY       9.8f
+/*
+ * ROCKET_DRAG — deceleration applied to ascending rockets (rows/sec²).
+ *   Controls apex height; 9.8 spreads explosions across the upper screen.
+ *
+ * GRAVITY — downward acceleration on each spark after explosion.
+ *   Lower than ROCKET_DRAG so particles spread in all directions before
+ *   gravity pulls them down.
+ */
+#define ROCKET_DRAG   9.8f
+#define GRAVITY       4.0f
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -336,7 +344,7 @@ static void rocket_tick(Rocket *r, float dt_sec, int cols, int rows)
 
     case RS_RISING:
         r->y  += r->vy * dt_sec * 6.0f;
-        r->vy += GRAVITY * dt_sec * 0.5f;   /* gentle drag slows ascent */
+        r->vy += ROCKET_DRAG * dt_sec * 0.5f;   /* decelerate to apex */
 
         /* Explode at apex (vy crosses zero) or if it exits top. */
         if (r->vy >= 0.0f || r->y < 2.0f) {

@@ -9,7 +9,7 @@
   ╚═════╝    ╚══════╝  terminal as canvas
 ```
 
-92 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+95 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 ---
 
@@ -79,7 +79,6 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `displace_raster` | Real-time vertex displacement, central-difference normal recompute |
 | `donut` | Parametric torus projection — the original spinning donut |
 | `wireframe` | 3D Bresenham edge projection, slope-to-character line drawing |
-| `boids_3d` | Reynolds flocking in 3D — perspective projection, depth-cued characters |
 
 ### Emergent Systems
 | Program | Algorithm |
@@ -116,6 +115,8 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `jellyfish` | Physics pulse locomotion — IDLE sink → CONTRACT jet → GLIDE coast → EXPAND bloom; asymmetric bell (width × height axes); tentacle inertia lag |
 | `xrayswarm` | Multi-swarm radial pulse — DIVERGE → PAUSE → CONVERGE; workers park at screen edge, retrace exact origin path; 4-pass rendering prevents trail cancellation |
 | `gear` | Wireframe rotating gear — proximity-based edge detection, tangential surface-velocity sparks, speed-proportional emission, 10 color themes (fire/matrix/plasma/nova/poison/ocean/gold/neon/arctic/lava) |
+| `railwaymap` | Procedural transit map — H/V/Z grid-aligned line templates, canvas-based ACS junction detection, station interchange, 10 themes |
+| `fireworks_rain` | Fireworks with matrix-rain arc trails — each of 72 sparks per explosion grows a 16-slot position-history trail; chars shimmer 75 % per tick; 5 themes (vivid/matrix/fire/ice/plasma) remap all spark color pairs; `t` cycles theme |
 
 ### Algorithms
 | Program | Algorithm |
@@ -197,7 +198,7 @@ See `Claude.md` for the complete build list.
     ├── Claude.md          — complete build reference
     └── learning/
         ├── ROADMAP.md         — 6-tier study order, 2-year plan
-        └── concept_*.md       — 89 deep-dive concept files
+        └── concept_*.md       — 93 deep-dive concept files
                                  (math → pseudocode → implementation notes)
 ```
 
@@ -205,7 +206,7 @@ See `Claude.md` for the complete build list.
 
 ## Documentation
 
-`documentation/learning/` contains 91 concept files — one per program. Each file has two passes:
+`documentation/learning/` contains 93 concept files — one per program. Each file has two passes:
 
 - **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
 - **Pass 2** — pseudocode, module map, data flow diagram, core loop

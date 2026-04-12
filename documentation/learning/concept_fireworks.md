@@ -69,6 +69,15 @@ Gravity adds to vy each tick. The rocket starts with negative vy (upward). When 
 ### Vertical velocity squash: `vy = sinf(angle) * speed * 0.5f`
 The particle spread is a 2D circle in physics, but the terminal is non-square (cells are taller than wide). Squashing vy by 0.5 makes the burst look circular on screen.
 
+### Split gravity: ROCKET_DRAG vs GRAVITY
+Originally a single `GRAVITY = 9.8f` constant controlled both rocket deceleration (how high the rocket climbs) and particle fall after explosion. The problem: lowering GRAVITY to give particles more upward spread also made rockets decelerate too slowly, causing every rocket to reach the very top of the screen before exploding — all bursts appeared in one narrow strip at the top.
+
+The fix is two separate constants:
+- `ROCKET_DRAG = 9.8f` — applied as `r->vy += ROCKET_DRAG * dt_sec * 0.5` in rocket_tick. Controls apex height independently of particle physics.
+- `GRAVITY = 4.0f` — applied to each particle after explosion. Lower value gives upward sparks enough hang time to visibly rise, producing a near-spherical burst rather than a downward triangle.
+
+This decoupling is a general principle: simulation layers that share a physical concept (gravity) may still need independent tuning constants because they operate at different scales and timescales.
+
 ### Multi-color bursts
 Every particle gets an independent random color. This is different from having one color per rocket — the multi-color explosion looks richer.
 
@@ -102,7 +111,8 @@ IDLE ──(fuse reaches 0)──→ RISING
 | `PARTICLES_PER_BURST` | 80 | More sparks per explosion; heavier CPU |
 | `ROCKETS_DEFAULT` | 6 | More simultaneous rockets |
 | `LAUNCH_SPEED_MIN/MAX` | 3–8 rows/s | Higher = rockets reach greater heights |
-| `GRAVITY` | 9.8 rows/s² | Higher = quicker apex, shorter flights |
+| `ROCKET_DRAG` | 9.8 rows/s² | Higher = quicker apex, rockets explode lower on screen |
+| `GRAVITY` | 4.0 rows/s² | Higher = particles fall faster, downward triangle shape; lower = near-spherical burst |
 | fuse range | 0.5–2.5s | Longer wait between launches |
 
 ---
@@ -123,7 +133,7 @@ IDLE ──(fuse reaches 0)──→ RISING
 
 | Section | Purpose |
 |---|---|
-| §1 config | SIM_FPS, ROCKETS_MIN/DEFAULT/MAX, PARTICLES_PER_BURST=80, GRAVITY=9.8, LAUNCH_SPEED_MIN/MAX |
+| §1 config | SIM_FPS, ROCKETS_MIN/DEFAULT/MAX, PARTICLES_PER_BURST=80, ROCKET_DRAG=9.8, GRAVITY=4.0, LAUNCH_SPEED_MIN/MAX |
 | §2 clock | `clock_ns()`, `clock_sleep_ns()` |
 | §3 color | 7 ColorID enum pairs (RED..MAGENTA); `color_rand()` |
 | §4 particle | `Particle` struct; `particle_burst()` — spawn radial burst; `particle_tick()` — physics; `particle_draw()` — life→brightness |
@@ -147,7 +157,7 @@ show_tick():
       │
       ├── RISING:
       │     y += vy * dt_sec * 6.0
-      │     vy += GRAVITY * dt_sec * 0.5   ← gentle drag
+      │     vy += ROCKET_DRAG * dt_sec * 0.5   ← rocket deceleration
       │     if vy >= 0 or y < 2:
       │       particle_burst(particles, 80, x, y)
       │       state = EXPLODED
@@ -156,7 +166,7 @@ show_tick():
             for each particle: particle_tick()
               x += vx * dt_sec * 8
               y += vy * dt_sec * 8
-              vy += GRAVITY * dt_sec
+              vy += GRAVITY * dt_sec   ← particle gravity (4.0, not ROCKET_DRAG)
               life -= decay
               if life <= 0: active = false
             if no particles alive:
@@ -244,7 +254,7 @@ Steps:
 - **RS_IDLE**: fuse--; if fuse <= 0: rocket_launch()
 - **RS_RISING**:
   1. y += vy * dt_sec * 6.0
-  2. vy += GRAVITY * dt_sec * 0.5 (gentler than particle gravity)
+  2. vy += ROCKET_DRAG * dt_sec * 0.5 (separate from particle GRAVITY)
   3. If vy >= 0 or y < 2:
      - particle_burst(particles, 80, x, y)
      - state = RS_EXPLODED

@@ -1,6 +1,6 @@
 # Learning Roadmap — ASCII Creative Coding
 
-92 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
+95 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
 and the 2-year breakdown. Do not skip layers.
 
 ---
@@ -44,6 +44,10 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `xrayswarm.c` | Multi-swarm pulse locomotion | radial velocity, converge/diverge state machine |
 | `jellyfish.c` | Physics-based pulse locomotion | jet propulsion, exponential drag, asymmetric bell deformation |
 | `gear.c` | Wireframe gear + themed sparks | polar proximity edge detection, tangential surface velocity, 256-color theme switching |
+| `pulsar_rain.c` | Rotating pulsar neutron star | N-beam lighthouse sweep (1–16), angular wake cache, pre-computed trig reuse across radii, render interpolation |
+| `sun_rain.c` | Matrix rain sun | circular clip mask, radial solar wind streams, parametric border ring with rotating wave |
+| `railwaymap.c` | Procedural transit map | H/V/Z line templates on 6×4 logical grid, canvas ACS junction detection, interchange nodes |
+| `fireworks_rain.c` | Fireworks + matrix arc trails | position-history trail, oldest-first draw, split ROCKET_DRAG/GRAVITY, per-particle gravity variance, 5-theme color pair remapping |
 
 ---
 
@@ -114,7 +118,6 @@ Requires linear algebra and graphics pipeline understanding.
 | `cube_raster.c` | Shader pipeline | vert/frag shaders, back-face cull |
 | `sphere_raster.c` | UV mapping | spherical coordinates |
 | `displace_raster.c` | Vertex displacement | central-difference normals |
-| `boids_3d.c` | 3D flocking | 3D vectors, perspective projection |
 | `penrose.c` | Aperiodic tiling | de Bruijn pentagrid duality |
 
 ---

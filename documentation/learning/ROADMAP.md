@@ -1,6 +1,6 @@
 # Learning Roadmap — ASCII Creative Coding
 
-91 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
+92 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
 and the 2-year breakdown. Do not skip layers.
 
 ---
@@ -43,6 +43,7 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `cymatics.c` | Chladni figures | 2D standing wave nodes |
 | `xrayswarm.c` | Multi-swarm pulse locomotion | radial velocity, converge/diverge state machine |
 | `jellyfish.c` | Physics-based pulse locomotion | jet propulsion, exponential drag, asymmetric bell deformation |
+| `gear.c` | Wireframe gear + themed sparks | polar proximity edge detection, tangential surface velocity, 256-color theme switching |
 
 ---
 

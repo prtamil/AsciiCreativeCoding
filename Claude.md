@@ -92,6 +92,7 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/hex_life.c            -o hex_life      -
 gcc -std=c11 -O2 -Wall -Wextra artistic/boids_3d.c            -o boids_3d      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/jellyfish.c           -o jellyfish     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/xrayswarm.c           -o xrayswarm     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/gear.c                -o gear          -lncurses -lm
 
 # ── misc (extended) ───────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra misc/sort_vis.c           -o sort_vis          -lncurses -lm
@@ -198,6 +199,7 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 - `boids_3d.c`  — Reynolds boids in 3-D pixel space with perspective projection; rotating camera; depth cues via character density (`.` far → `@` near)
 - `jellyfish.c` — bioluminescent jellyfish: four-state physics pulse (IDLE sink → CONTRACT jet → GLIDE coast → EXPAND bloom); asymmetric bell deformation (width via `head_f`, height via `crown_f`); tentacle inertia lag + wave_scale gating; 8 color variants; +/− jellyfish count
 - `xrayswarm.c` — multi-swarm pulsating X-ray rays: workers radiate from fixed queen (DIVERGE), park at screen edge (PAUSE), retrace exact path back to origin (CONVERGE); locked queen coords; 4-pass rendering (DIM/MID/BRIGHT/HEAD) across all swarms prevents trail cancellation
+- `gear.c` — wireframe rotating gear with themed sparks: polar proximity edge detection (hub ring/spokes/tooth sides/arcs), tangential surface-velocity emission (tang_v = ω×R×TANG_SCALE), speed-proportional emission rate, 7-stage cooling gradient, 10 named 256-color themes (FIRE/MATRIX/PLASMA/NOVA/POISON/OCEAN/GOLD/NEON/ARCTIC/LAVA); t/T cycles themes live via init_pair re-binding
 
 ### misc/
 - `sort_vis.c`          — sorting visualiser: 5 algorithms (bubble/insertion/selection/quicksort/heapsort) as animated vertical bar chart; one operation per tick; grey/cyan/red/green color states; comparison + swap counters

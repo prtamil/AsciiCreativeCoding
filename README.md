@@ -9,7 +9,7 @@
   ╚═════╝    ╚══════╝  terminal as canvas
 ```
 
-91 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+92 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 ---
 
@@ -115,6 +115,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 |---------|-----------|
 | `jellyfish` | Physics pulse locomotion — IDLE sink → CONTRACT jet → GLIDE coast → EXPAND bloom; asymmetric bell (width × height axes); tentacle inertia lag |
 | `xrayswarm` | Multi-swarm radial pulse — DIVERGE → PAUSE → CONVERGE; workers park at screen edge, retrace exact origin path; 4-pass rendering prevents trail cancellation |
+| `gear` | Wireframe rotating gear — proximity-based edge detection, tangential surface-velocity sparks, speed-proportional emission, 10 color themes (fire/matrix/plasma/nova/poison/ocean/gold/neon/arctic/lava) |
 
 ### Algorithms
 | Program | Algorithm |

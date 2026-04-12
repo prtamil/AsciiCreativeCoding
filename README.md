@@ -9,7 +9,7 @@
   ╚═════╝    ╚══════╝  terminal as canvas
 ```
 
-89 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+91 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 ---
 
@@ -110,6 +110,12 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `penrose` | de Bruijn pentagrid duality — aperiodic tiling, slow rotation |
 | `terrain` | Diamond-square heightmap — thermal erosion, 7 contour levels |
 
+### Artistic / Biological
+| Program | Algorithm |
+|---------|-----------|
+| `jellyfish` | Physics pulse locomotion — IDLE sink → CONTRACT jet → GLIDE coast → EXPAND bloom; asymmetric bell (width × height axes); tentacle inertia lag |
+| `xrayswarm` | Multi-swarm radial pulse — DIVERGE → PAUSE → CONVERGE; workers park at screen edge, retrace exact origin path; 4-pass rendering prevents trail cancellation |
+
 ### Algorithms
 | Program | Algorithm |
 |---------|-----------|
@@ -198,7 +204,7 @@ See `Claude.md` for the complete build list.
 
 ## Documentation
 
-`documentation/learning/` contains 89 concept files — one per program. Each file has two passes:
+`documentation/learning/` contains 91 concept files — one per program. Each file has two passes:
 
 - **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
 - **Pass 2** — pseudocode, module map, data flow diagram, core loop

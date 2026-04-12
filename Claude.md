@@ -90,6 +90,8 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/network_sim.c         -o network_sim   -
 gcc -std=c11 -O2 -Wall -Wextra artistic/wave_2d.c             -o wave_2d       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/hex_life.c            -o hex_life      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/boids_3d.c            -o boids_3d      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/jellyfish.c           -o jellyfish     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/xrayswarm.c           -o xrayswarm     -lncurses -lm
 
 # ── misc (extended) ───────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra misc/sort_vis.c           -o sort_vis          -lncurses -lm
@@ -194,6 +196,8 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 - `wave_2d.c`   — 2-D scalar wave equation (∂²u/∂t²=c²∇²u): point sources emit circular wavefronts, multiple sources interfere; CFL-stable explicit Euler; signed amplitude color map (blue/black/white)
 - `hex_life.c`  — Game of Life on hexagonal grid (offset-row layout, 6 neighbours); rule B2/S34; multiple rule presets; hex→terminal column mapping
 - `boids_3d.c`  — Reynolds boids in 3-D pixel space with perspective projection; rotating camera; depth cues via character density (`.` far → `@` near)
+- `jellyfish.c` — bioluminescent jellyfish: four-state physics pulse (IDLE sink → CONTRACT jet → GLIDE coast → EXPAND bloom); asymmetric bell deformation (width via `head_f`, height via `crown_f`); tentacle inertia lag + wave_scale gating; 8 color variants; +/− jellyfish count
+- `xrayswarm.c` — multi-swarm pulsating X-ray rays: workers radiate from fixed queen (DIVERGE), park at screen edge (PAUSE), retrace exact path back to origin (CONVERGE); locked queen coords; 4-pass rendering (DIM/MID/BRIGHT/HEAD) across all swarms prevents trail cancellation
 
 ### misc/
 - `sort_vis.c`          — sorting visualiser: 5 algorithms (bubble/insertion/selection/quicksort/heapsort) as animated vertical bar chart; one operation per tick; grey/cyan/red/green color states; comparison + swap counters

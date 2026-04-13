@@ -30,6 +30,7 @@
  * Keys:
  *   q / ESC   quit
  *   r / n     skip to next preset immediately
+ *   t / T     cycle color theme (10 themes)
  *   ] [       faster / slower simulation
  *   p / spc   pause / resume
  *
@@ -73,11 +74,12 @@ enum {
     DONE_PAUSE_TICKS =  90,    /* ticks to hold completed view (~3 s)    */
     N_PRESETS        =   6,
     N_COLORS         =   5,
+    N_THEMES         =  10,
 
     GRID_ROWS_MAX    =  80,
     GRID_COLS_MAX    = 300,
 
-    HUD_COLS         =  56,
+    HUD_COLS         =  72,
     FPS_UPDATE_MS    = 500,
 };
 
@@ -90,6 +92,43 @@ enum {
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS   1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
+
+/*
+ * Theme — five 256-color indices for the five content pairs
+ *   c[0] = COL_INSIDE  (fractal body)
+ *   c[1] = COL_C2      (outermost visible escape band)
+ *   c[2] = COL_C3      (mid-outer band)
+ *   c[3] = COL_C4      (mid-inner band)
+ *   c[4] = COL_C5      (nearest to body)
+ *   hud  = HUD text color
+ *
+ * 8-color fallbacks use the c8[] / hud8 fields.
+ *
+ * Gradient reads inside → body glows hot, halo fades outward.
+ */
+typedef struct {
+    const char *name;
+    int c[5];    /* 256-color: INSIDE, C2, C3, C4, C5 */
+    int c8[5];   /* 8-color fallback                   */
+    int hud;     /* 256-color HUD fg                   */
+    int hud8;    /* 8-color HUD fg                     */
+} Theme;
+
+static const Theme k_themes[N_THEMES] = {
+    /*              name       INSIDE  C2    C3    C4    C5    hud   (8-color fallbacks)                     hud8 */
+    { "Electric", {201, 226,  82,  51, 141},  {COLOR_MAGENTA,COLOR_YELLOW,COLOR_GREEN,COLOR_CYAN,COLOR_CYAN},   87, COLOR_CYAN    },
+    { "Matrix",   { 46,  22,  28,  34, 118},  {COLOR_GREEN,  COLOR_GREEN, COLOR_GREEN,COLOR_GREEN,COLOR_GREEN},  46, COLOR_GREEN   },
+    { "Nova",     {231,  17,  21,  39, 117},  {COLOR_WHITE,  COLOR_BLUE,  COLOR_BLUE, COLOR_CYAN, COLOR_CYAN},   51, COLOR_CYAN    },
+    { "Poison",   { 82,  22, 100, 148, 190},  {COLOR_GREEN,  COLOR_GREEN, COLOR_GREEN,COLOR_YELLOW,COLOR_YELLOW},154,COLOR_YELLOW  },
+    { "Ocean",    {159,  17,  18,  24,  38},  {COLOR_CYAN,   COLOR_BLUE,  COLOR_BLUE, COLOR_CYAN, COLOR_CYAN},   39, COLOR_CYAN    },
+    { "Fire",     {231,  52,  88, 196, 214},  {COLOR_WHITE,  COLOR_RED,   COLOR_RED,  COLOR_YELLOW,COLOR_YELLOW},208,COLOR_YELLOW  },
+    { "Gold",     {231,  52,  94, 136, 220},  {COLOR_WHITE,  COLOR_RED,   COLOR_YELLOW,COLOR_YELLOW,COLOR_YELLOW},226,COLOR_YELLOW },
+    { "Ice",      {231,  16,  23,  30, 159},  {COLOR_WHITE,  COLOR_BLUE,  COLOR_BLUE, COLOR_CYAN, COLOR_CYAN},  123, COLOR_CYAN    },
+    { "Nebula",   {231,  55,  93, 141, 183},  {COLOR_WHITE,  COLOR_MAGENTA,COLOR_CYAN,COLOR_CYAN,COLOR_CYAN},    87, COLOR_CYAN    },
+    { "Lava",     {226,  52, 124, 208, 220},  {COLOR_YELLOW, COLOR_RED,   COLOR_RED,  COLOR_YELLOW,COLOR_YELLOW},214,COLOR_YELLOW  },
+};
+
+static int g_theme = 0;
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -137,24 +176,30 @@ typedef enum {
     COL_HUD    = 6,
 } ColorID;
 
+static void theme_apply(int t)
+{
+    const Theme *th = &k_themes[t];
+    if (COLORS >= 256) {
+        init_pair(COL_INSIDE, th->c[0], COLOR_BLACK);
+        init_pair(COL_C2,     th->c[1], COLOR_BLACK);
+        init_pair(COL_C3,     th->c[2], COLOR_BLACK);
+        init_pair(COL_C4,     th->c[3], COLOR_BLACK);
+        init_pair(COL_C5,     th->c[4], COLOR_BLACK);
+        init_pair(COL_HUD,    th->hud,  COLOR_BLACK);
+    } else {
+        init_pair(COL_INSIDE, th->c8[0], COLOR_BLACK);
+        init_pair(COL_C2,     th->c8[1], COLOR_BLACK);
+        init_pair(COL_C3,     th->c8[2], COLOR_BLACK);
+        init_pair(COL_C4,     th->c8[3], COLOR_BLACK);
+        init_pair(COL_C5,     th->c8[4], COLOR_BLACK);
+        init_pair(COL_HUD,    th->hud8,  COLOR_BLACK);
+    }
+}
+
 static void color_init(void)
 {
     start_color();
-    if (COLORS >= 256) {
-        init_pair(COL_INSIDE, 201, COLOR_BLACK);   /* magenta      */
-        init_pair(COL_C2,    226, COLOR_BLACK);    /* yellow       */
-        init_pair(COL_C3,     82, COLOR_BLACK);    /* lime green   */
-        init_pair(COL_C4,     51, COLOR_BLACK);    /* bright cyan  */
-        init_pair(COL_C5,    141, COLOR_BLACK);    /* light purple */
-        init_pair(COL_HUD,    87, COLOR_BLACK);    /* cyan hud     */
-    } else {
-        init_pair(COL_INSIDE, COLOR_MAGENTA, COLOR_BLACK);
-        init_pair(COL_C2,     COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(COL_C3,     COLOR_GREEN,   COLOR_BLACK);
-        init_pair(COL_C4,     COLOR_CYAN,    COLOR_BLACK);
-        init_pair(COL_C5,     COLOR_CYAN,    COLOR_BLACK);
-        init_pair(COL_HUD,    COLOR_CYAN,    COLOR_BLACK);
-    }
+    theme_apply(g_theme);
 }
 
 /* ===================================================================== */
@@ -388,8 +433,9 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps)
 
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
-             "%5.1f fps  %-16s  %3d%%  spd:%d",
-             fps, k_presets[g->preset].name, pct, sim_fps);
+             "%5.1f fps  %-16s  %3d%%  spd:%d  t:%s",
+             fps, k_presets[g->preset].name, pct, sim_fps,
+             k_themes[g_theme].name);
     int hx = s->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(COL_HUD) | A_BOLD);
@@ -433,6 +479,11 @@ static bool app_handle_key(App *app, int ch)
     case 'r': case 'R': case 'n': case 'N':
         grid_init(&app->scene.grid, app->screen.cols, app->screen.rows,
                   (app->scene.grid.preset + 1) % N_PRESETS);
+        break;
+
+    case 't': case 'T':
+        g_theme = (g_theme + 1) % N_THEMES;
+        theme_apply(g_theme);
         break;
 
     case 'p': case 'P': case ' ':

@@ -152,6 +152,7 @@ static void color_init(void)
         init_pair(10,  87, COLOR_BLACK);   /* aqua         */
         init_pair(11, 147, COLOR_BLACK);   /* lavender     */
         init_pair(12, 228, COLOR_BLACK);   /* pale yellow  */
+        init_pair(13, 226, COLOR_BLACK);   /* yellow — HUD */
     } else {
         init_pair(1,  COLOR_RED,     COLOR_BLACK);
         init_pair(2,  COLOR_RED,     COLOR_BLACK);
@@ -165,6 +166,7 @@ static void color_init(void)
         init_pair(10, COLOR_CYAN,    COLOR_BLACK);
         init_pair(11, COLOR_MAGENTA, COLOR_BLACK);
         init_pair(12, COLOR_YELLOW,  COLOR_BLACK);
+        init_pair(13, COLOR_YELLOW,  COLOR_BLACK);   /* HUD */
     }
 }
 
@@ -388,11 +390,11 @@ static void screen_draw(Screen *s, const Scene *sc,
     mvprintw(0, 1, " PENROSE P3 ");
     attroff(COLOR_PAIR(5) | A_BOLD);
 
-    attron(COLOR_PAIR(6) | A_DIM);
+    attron(COLOR_PAIR(13) | A_BOLD);
     mvprintw(s->rows - 1, 0,
              " q:quit  spc:pause  r:reset angle  [/]:Hz "
              "  *=thick(gold)  .=thin(cyan)  |/\\-=edges ");
-    attroff(COLOR_PAIR(6) | A_DIM);
+    attroff(COLOR_PAIR(13) | A_BOLD);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }

@@ -102,7 +102,7 @@ static void color_init(void)
         init_pair(CP_R4D,  22, -1);   /* dark green  */
         init_pair(CP_R4B,  46, -1);   /* bright green*/
         init_pair(CP_SET, COLOR_BLACK, COLOR_BLACK);
-        init_pair(CP_HUD, 244, -1);
+        init_pair(CP_HUD, 226, -1);
     } else {
         init_pair(CP_R1D, COLOR_RED,     -1);
         init_pair(CP_R1B, COLOR_RED,     -1);
@@ -113,7 +113,7 @@ static void color_init(void)
         init_pair(CP_R4D, COLOR_GREEN,   -1);
         init_pair(CP_R4B, COLOR_GREEN,   -1);
         init_pair(CP_SET, COLOR_BLACK, COLOR_BLACK);
-        init_pair(CP_HUD, COLOR_WHITE, -1);
+        init_pair(CP_HUD, COLOR_YELLOW, -1);
     }
 }
 

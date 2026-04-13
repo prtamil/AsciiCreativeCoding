@@ -23,6 +23,7 @@
  * Keys:
  *   q / ESC   quit
  *   r         reset immediately
+ *   t         cycle color theme (10 themes)
  *   ] [       faster / slower simulation
  *   p / spc   pause / resume
  *
@@ -69,8 +70,9 @@ enum {
     GRID_ROWS_MAX    =  80,
     GRID_COLS_MAX    = 300,
 
-    HUD_COLS         =  46,
+    HUD_COLS         =  60,
     FPS_UPDATE_MS    = 500,
+    N_THEMES         =  10,
 };
 
 /*
@@ -95,6 +97,36 @@ enum {
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS   1000000LL
 #define TICK_NS(f)  (NS_PER_SEC / (f))
+
+/*
+ * Theme — three vertex colors + HUD.
+ *   c[0] = COL_V1 (bottom-left sub-triangle)
+ *   c[1] = COL_V2 (bottom-right sub-triangle)
+ *   c[2] = COL_V3 (top sub-triangle)
+ *   c[3] = COL_HUD
+ * Each trio should be visually distinct so the three sub-triangles read
+ * clearly at any scale of the fractal's self-similarity.
+ */
+typedef struct {
+    const char *name;
+    int c[4];    /* 256-color */
+    int c8[4];   /* 8-color fallback */
+} Theme;
+
+static const Theme k_themes[N_THEMES] = {
+    { "Electric", {  87, 226, 207,  87 }, { COLOR_CYAN,    COLOR_YELLOW,  COLOR_MAGENTA, COLOR_CYAN    } },
+    { "Matrix",   {  46, 118, 231,  46 }, { COLOR_GREEN,   COLOR_GREEN,   COLOR_WHITE,   COLOR_GREEN   } },
+    { "Nova",     {  51,  39, 231,  51 }, { COLOR_CYAN,    COLOR_BLUE,    COLOR_WHITE,   COLOR_CYAN    } },
+    { "Poison",   {  82, 190, 154,  82 }, { COLOR_GREEN,   COLOR_YELLOW,  COLOR_GREEN,   COLOR_GREEN   } },
+    { "Ocean",    {  45,  33,  38,  45 }, { COLOR_CYAN,    COLOR_BLUE,    COLOR_CYAN,    COLOR_CYAN    } },
+    { "Fire",     { 196, 208, 226, 208 }, { COLOR_RED,     COLOR_YELLOW,  COLOR_YELLOW,  COLOR_YELLOW  } },
+    { "Gold",     { 214, 220, 231, 220 }, { COLOR_YELLOW,  COLOR_YELLOW,  COLOR_WHITE,   COLOR_YELLOW  } },
+    { "Ice",      { 159, 123, 231, 123 }, { COLOR_CYAN,    COLOR_CYAN,    COLOR_WHITE,   COLOR_CYAN    } },
+    { "Nebula",   {  93, 201,  87,  87 }, { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_CYAN,    COLOR_CYAN    } },
+    { "Lava",     { 196, 214, 208, 214 }, { COLOR_RED,     COLOR_YELLOW,  COLOR_RED,     COLOR_YELLOW  } },
+};
+
+static int g_theme = 0;
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -136,20 +168,26 @@ typedef enum {
     COL_HUD = 4,
 } ColorID;
 
+static void theme_apply(int t)
+{
+    const Theme *th = &k_themes[t];
+    if (COLORS >= 256) {
+        init_pair(COL_V1,  th->c[0], COLOR_BLACK);
+        init_pair(COL_V2,  th->c[1], COLOR_BLACK);
+        init_pair(COL_V3,  th->c[2], COLOR_BLACK);
+        init_pair(COL_HUD, th->c[3], COLOR_BLACK);
+    } else {
+        init_pair(COL_V1,  th->c8[0], COLOR_BLACK);
+        init_pair(COL_V2,  th->c8[1], COLOR_BLACK);
+        init_pair(COL_V3,  th->c8[2], COLOR_BLACK);
+        init_pair(COL_HUD, th->c8[3], COLOR_BLACK);
+    }
+}
+
 static void color_init(void)
 {
     start_color();
-    if (COLORS >= 256) {
-        init_pair(COL_V1,   87, COLOR_BLACK);   /* electric cyan  */
-        init_pair(COL_V2,  226, COLOR_BLACK);   /* bright yellow  */
-        init_pair(COL_V3,  207, COLOR_BLACK);   /* hot magenta    */
-        init_pair(COL_HUD,  87, COLOR_BLACK);
-    } else {
-        init_pair(COL_V1,  COLOR_CYAN,    COLOR_BLACK);
-        init_pair(COL_V2,  COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(COL_V3,  COLOR_MAGENTA, COLOR_BLACK);
-        init_pair(COL_HUD, COLOR_CYAN,    COLOR_BLACK);
-    }
+    theme_apply(g_theme);
 }
 
 /* ===================================================================== */
@@ -332,8 +370,8 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps)
     if (pct > 100) pct = 100;
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
-             "%5.1f fps  pts:%-6d  %3d%%  spd:%d",
-             fps, sc->iter_count, pct, sim_fps);
+             "%5.1f fps  pts:%-6d  %3d%%  spd:%d  t:%s",
+             fps, sc->iter_count, pct, sim_fps, k_themes[g_theme].name);
     int hx = s->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(COL_HUD) | A_BOLD);
@@ -375,6 +413,11 @@ static bool app_handle_key(App *app, int ch)
 
     case 'r': case 'R':
         scene_init(&app->scene, app->screen.cols, app->screen.rows);
+        break;
+
+    case 't': case 'T':
+        g_theme = (g_theme + 1) % N_THEMES;
+        theme_apply(g_theme);
         break;
 
     case 'p': case 'P': case ' ':

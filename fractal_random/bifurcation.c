@@ -81,14 +81,14 @@ static void color_init(void)
         init_pair(CP_G,   46, -1);   /* green               */
         init_pair(CP_Y,  226, -1);   /* yellow              */
         init_pair(CP_R,  196, -1);   /* red    — high x     */
-        init_pair(CP_HUD,244, -1);   /* grey   — HUD text   */
+        init_pair(CP_HUD, 226, -1);   /* grey   — HUD text   */
     } else {
         init_pair(CP_B,   COLOR_BLUE,   -1);
         init_pair(CP_C,   COLOR_CYAN,   -1);
         init_pair(CP_G,   COLOR_GREEN,  -1);
         init_pair(CP_Y,   COLOR_YELLOW, -1);
         init_pair(CP_R,   COLOR_RED,    -1);
-        init_pair(CP_HUD, COLOR_WHITE,  -1);
+        init_pair(CP_HUD, COLOR_YELLOW, -1);
     }
 }
 

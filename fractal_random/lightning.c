@@ -83,7 +83,7 @@ enum {
     MAX_TIPS        =  64,   /* max simultaneous growing branch tips    */
 
     /* Fork timing */
-    MIN_FORK_STEPS  =   4,   /* a tip must grow this many cells first   */
+    MIN_FORK_STEPS  =   2,   /* a tip must grow this many cells first   */
 
     /* Glow */
     GLOW_RADIUS     =   2,   /* Manhattan radius of ambient halo        */
@@ -106,10 +106,10 @@ enum {
  *
  * These are tunable at runtime with + / - keys (FORK_PCT only).
  */
-#define LEAN_PCT_DEFAULT    38
-#define FORK_PCT_DEFAULT    12
-#define FORK_PCT_MIN         4
-#define FORK_PCT_MAX        28
+#define LEAN_PCT_DEFAULT    60
+#define FORK_PCT_DEFAULT    30
+#define FORK_PCT_MIN         8
+#define FORK_PCT_MAX        50
 
 #define NS_PER_SEC   1000000000LL
 #define NS_PER_MS    1000000LL
@@ -442,9 +442,10 @@ static void scene_start_bolt(Scene *s, int cols, int rows)
     memset(s->tips, 0, sizeof s->tips);
     s->n_tips = 0;
 
-    /* Initial tip at seed with a small random lean */
-    int init_lean = (rand() % 3) - 1;   /* -1, 0, or +1 */
-    scene_add_tip(s, seed_x, 0, init_lean);
+    /* Three initial tips spread left/center/right — no single root stem */
+    scene_add_tip(s, seed_x, 0, -1);
+    scene_add_tip(s, seed_x, 0,  0);
+    scene_add_tip(s, seed_x, 0, +1);
 
     s->state        = ST_GROWING;
     s->flash_timer  = 0;

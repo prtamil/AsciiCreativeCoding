@@ -138,6 +138,7 @@ static void color_init(void)
         init_pair(5,  51, COLOR_BLACK);   /* cyan    */
         init_pair(6,  21, COLOR_BLACK);   /* blue    */
         init_pair(7, 201, COLOR_BLACK);   /* magenta */
+        init_pair(8, 226, COLOR_BLACK);   /* yellow  — HUD */
     } else {
         init_pair(1, COLOR_RED,     COLOR_BLACK);
         init_pair(2, COLOR_RED,     COLOR_BLACK);
@@ -146,6 +147,7 @@ static void color_init(void)
         init_pair(5, COLOR_CYAN,    COLOR_BLACK);
         init_pair(6, COLOR_BLUE,    COLOR_BLACK);
         init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
+        init_pair(8, COLOR_YELLOW,  COLOR_BLACK);   /* HUD */
     }
 }
 
@@ -406,10 +408,10 @@ static void screen_draw(Screen *s, const Scene *sc,
     mvprintw(0, 1, " TERRAIN ");
     attroff(COLOR_PAIR(4) | A_BOLD);
 
-    attron(COLOR_PAIR(6) | A_DIM);
+    attron(COLOR_PAIR(8) | A_BOLD);
     mvprintw(s->rows - 1, 0,
              " q:quit  spc:pause  r:regenerate  e:erosion  [/]:Hz ");
-    attroff(COLOR_PAIR(6) | A_DIM);
+    attroff(COLOR_PAIR(8) | A_BOLD);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }

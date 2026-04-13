@@ -41,9 +41,11 @@
 #define RENDER_NS        (1000000000LL / 15)   /* 15 fps for visibility */
 
 enum {
-    CP_DEAD = 1,   /* dead cell — dark bg       */
-    CP_LIVE,       /* live cell — cyan           */
-    CP_NEW,        /* just born — bright white   */
+    CP_DEAD = 1,   /* dead   — dark dot, outlines hex grid */
+    CP_AGE0,       /* newborn (age 0)  — bright yellow     */
+    CP_AGE1,       /* young  (age 1-4) — bright cyan       */
+    CP_AGE2,       /* mature (age 5-14)— teal              */
+    CP_AGE3,       /* elder  (age 15+) — dark blue-green   */
     CP_HUD,
 };
 
@@ -74,15 +76,19 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_DEAD, 236, 236);   /* dark grey on dark grey */
-        init_pair(CP_LIVE,  51, -1);    /* cyan                   */
-        init_pair(CP_NEW,  231, -1);    /* bright white           */
-        init_pair(CP_HUD,  244, -1);
+        init_pair(CP_DEAD, 234,   -1);   /* near-black dot, no background */
+        init_pair(CP_AGE0, 226,   -1);   /* bright yellow  — newborn   */
+        init_pair(CP_AGE1,  51,   -1);   /* bright cyan    — young     */
+        init_pair(CP_AGE2,  37,   -1);   /* medium teal    — mature    */
+        init_pair(CP_AGE3,  23,   -1);   /* dark blue-green — elder    */
+        init_pair(CP_HUD,  232,  250);   /* dark text on silver bar    */
     } else {
-        init_pair(CP_DEAD, COLOR_BLACK, COLOR_BLACK);
-        init_pair(CP_LIVE, COLOR_CYAN,  -1);
-        init_pair(CP_NEW,  COLOR_WHITE, -1);
-        init_pair(CP_HUD,  COLOR_WHITE, -1);
+        init_pair(CP_DEAD, COLOR_BLACK,  -1);
+        init_pair(CP_AGE0, COLOR_YELLOW, -1);
+        init_pair(CP_AGE1, COLOR_CYAN,   -1);
+        init_pair(CP_AGE2, COLOR_CYAN,   -1);
+        init_pair(CP_AGE3, COLOR_BLUE,   -1);
+        init_pair(CP_HUD,  COLOR_BLACK,  COLOR_WHITE);
     }
 }
 
@@ -96,6 +102,8 @@ static void color_init(void)
  */
 static signed char g_grid[GRID_H_MAX][GRID_W_MAX];
 static signed char g_next[GRID_H_MAX][GRID_W_MAX];
+static unsigned char g_age [GRID_H_MAX][GRID_W_MAX]; /* generations alive */
+static unsigned char g_anext[GRID_H_MAX][GRID_W_MAX];
 static int g_gh, g_gw;
 static long long g_gen = 0;
 
@@ -123,14 +131,22 @@ static void grid_step(void)
         for (int c = 0; c < g_gw; c++) {
             int n = hex_count(r, c);
             int alive = (g_grid[r][c] != 0);
-            if (alive)
-                g_next[r][c] = (n == 3 || n == 4) ? 1 : 0;
-            else
-                g_next[r][c] = (n == 2) ? 2 : 0;   /* 2 = newborn */
+            if (alive && (n == 3 || n == 4)) {
+                g_next[r][c]  = 1;
+                /* cap age at 255 to avoid overflow */
+                g_anext[r][c] = g_age[r][c] < 255 ? g_age[r][c] + 1 : 255;
+            } else if (!alive && n == 2) {
+                g_next[r][c]  = 1;
+                g_anext[r][c] = 0;   /* newborn */
+            } else {
+                g_next[r][c]  = 0;
+                g_anext[r][c] = 0;
+            }
         }
     }
     g_gen++;
-    memcpy(g_grid, g_next, sizeof g_grid);
+    memcpy(g_grid, g_next,  sizeof g_grid);
+    memcpy(g_age,  g_anext, sizeof g_age);
 }
 
 static void grid_random(int density_pct)
@@ -138,12 +154,14 @@ static void grid_random(int density_pct)
     for (int r = 0; r < g_gh; r++)
         for (int c = 0; c < g_gw; c++)
             g_grid[r][c] = (rand() % 100 < density_pct) ? 1 : 0;
+    memset(g_age, 0, sizeof g_age);
     g_gen = 0;
 }
 
 static void grid_clear(void)
 {
     memset(g_grid, 0, sizeof g_grid);
+    memset(g_age,  0, sizeof g_age);
     g_gen = 0;
 }
 
@@ -179,34 +197,61 @@ static void count_live(void)
             if (g_grid[r][c]) g_live++;
 }
 
+/* Each hex cell is 2 terminal columns wide.
+ * Even rows: cell c starts at col c*2.
+ * Odd  rows: cell c starts at col c*2 + 1.
+ * This 1-column stagger creates proper hexagonal tiling.
+ *
+ * Age → character + colour:
+ *   age 0  (newborn) : <> bright yellow
+ *   age 1–4 (young)  : () bright cyan
+ *   age 5–14 (mature): [] teal
+ *   age 15+ (elder)  : -- dim blue-green
+ *   dead             : .  dark dot — outlines the hex lattice
+ */
 static void scene_draw(void)
 {
     for (int r = 0; r < g_gh && r + HUD_ROWS < g_rows; r++) {
-        int offset = r & 1;   /* odd rows shifted right by 1 */
+        int offset = r & 1;   /* odd rows shift right 1 col */
         for (int c = 0; c < g_gw; c++) {
-            int sc = c + offset;
+            int sc = c * 2 + offset;
             int sr = r + HUD_ROWS;
-            if (sc >= g_cols) continue;
+            if (sc + 1 >= g_cols) break;
 
-            signed char v = g_grid[r][c];
-            int cp; chtype ch;
-            if (v == 0)      { cp = CP_DEAD; ch = '.'; }
-            else if (v == 2) { cp = CP_NEW;  ch = '#'; }
-            else             { cp = CP_LIVE; ch = 'o'; }
-
-            attron(COLOR_PAIR(cp) | (v == 2 ? A_BOLD : 0));
-            mvaddch(sr, sc, ch);
-            attroff(COLOR_PAIR(cp) | A_BOLD);
+            signed char alive = g_grid[r][c];
+            if (!alive) {
+                /* dead: dim dot marks the hex vertex — shows grid structure */
+                attron(COLOR_PAIR(CP_DEAD) | A_DIM);
+                mvaddch(sr, sc,   '.');
+                mvaddch(sr, sc+1, ' ');
+                attroff(COLOR_PAIR(CP_DEAD) | A_DIM);
+            } else {
+                unsigned char age = g_age[r][c];
+                int    cp;
+                attr_t at;
+                char   l, ri;
+                if (age == 0)       { cp = CP_AGE0; at = A_BOLD; l = '<'; ri = '>'; }
+                else if (age < 5)   { cp = CP_AGE1; at = A_BOLD; l = '('; ri = ')'; }
+                else if (age < 15)  { cp = CP_AGE2; at = 0;      l = '['; ri = ']'; }
+                else                { cp = CP_AGE3; at = A_DIM;  l = '-'; ri = '-'; }
+                attron(COLOR_PAIR(cp) | at);
+                mvaddch(sr, sc,   (chtype)(unsigned char)l);
+                mvaddch(sr, sc+1, (chtype)(unsigned char)ri);
+                attroff(COLOR_PAIR(cp) | at);
+            }
         }
     }
 
+    /* HUD — silver bar at top */
     attron(COLOR_PAIR(CP_HUD));
-    mvprintw(0, 0,
-        " HexLife B2/S34  q:quit  spc:random  p:pause  r:reset  1-5:presets  +/-:speed");
-    mvprintw(1, 0,
-        " gen:%lld  live:%lld  speed:%dx  %s",
-        (long long)g_gen, g_live, g_speed,
-        g_paused ? "PAUSED" : "running");
+    for (int c = 0; c < g_cols; c++) mvaddch(0, c, ' ');
+    mvprintw(0, 1,
+        "HexLife B2/S34  q:quit  spc:random  p:pause  r:reset  1-5:density  +/-:speed"
+        "  gen:%lld  live:%lld  %s",
+        (long long)g_gen, g_live, g_paused ? "[PAUSED]" : "");
+    for (int c = 0; c < g_cols; c++) mvaddch(1, c, ' ');
+    mvprintw(1, 1,
+        "<> newborn   () young   [] mature   -- elder   .  dead");
     attroff(COLOR_PAIR(CP_HUD));
 }
 
@@ -240,7 +285,7 @@ int main(void)
     getmaxyx(stdscr, rows, cols);
     g_rows = rows; g_cols = cols;
     g_gh = (rows - HUD_ROWS) < GRID_H_MAX ? (rows - HUD_ROWS) : GRID_H_MAX;
-    g_gw = (cols - 1) < GRID_W_MAX ? (cols - 1) : GRID_W_MAX;
+    g_gw = ((cols - 2) / 2) < GRID_W_MAX ? ((cols - 2) / 2) : GRID_W_MAX;
 
     grid_random(35);
 
@@ -252,7 +297,7 @@ int main(void)
             getmaxyx(stdscr, rows, cols);
             g_rows = rows; g_cols = cols;
             g_gh = (rows - HUD_ROWS) < GRID_H_MAX ? (rows - HUD_ROWS) : GRID_H_MAX;
-            g_gw = (cols - 1) < GRID_W_MAX ? (cols - 1) : GRID_W_MAX;
+            g_gw = ((cols - 2) / 2) < GRID_W_MAX ? ((cols - 2) / 2) : GRID_W_MAX;
             grid_random(35);
         }
 

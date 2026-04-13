@@ -113,7 +113,7 @@ static void color_init(void)
         init_pair(CP_F3,  208, -1);   /* orange       */
         init_pair(CP_F4,  226, -1);   /* yellow       */
         init_pair(CP_F5,  231, -1);   /* bright white */
-        init_pair(CP_HUD, 244, -1);   /* grey         */
+        init_pair(CP_HUD, 226, -1);   /* grey         */
     } else {
         init_pair(CP_SET, COLOR_BLACK, COLOR_BLACK);
         init_pair(CP_F1,  COLOR_RED,    -1);
@@ -121,7 +121,7 @@ static void color_init(void)
         init_pair(CP_F3,  COLOR_YELLOW, -1);
         init_pair(CP_F4,  COLOR_YELLOW, -1);
         init_pair(CP_F5,  COLOR_WHITE,  -1);
-        init_pair(CP_HUD, COLOR_WHITE,  -1);
+        init_pair(CP_HUD, COLOR_YELLOW, -1);
     }
 }
 

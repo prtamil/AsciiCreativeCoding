@@ -13,7 +13,7 @@
  * Painter's algorithm: sky → far → mid → near (each overwrites).
  * Stars are scattered deterministically in the upper sky.
  *
- * Keys: q quit  p pause  r reset  ← → speed / direction  +/- noise zoom
+ * Keys: q quit  p pause  r reset  ← → speed / direction  +/- noise zoom  t theme
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra misc/perlin_landscape.c \
@@ -80,8 +80,90 @@ enum {
     CP_NEAR_E,        /* near edge      */
     CP_NEAR_F,        /* near fill      */
     CP_NEAR_B,        /* near base      */
-    CP_HUD
+    CP_HUD,
+    N_CP = CP_HUD
 };
+
+#define N_THEMES 10
+
+/*
+ * Theme — foreground colors for all 10 terrain pairs + HUD.
+ * Background is always -1 (terminal default) so the sky stays transparent.
+ *
+ * c[0..9]: sky_hi, sky_lo, star, far_e, far_f, mid_e, mid_f, near_e, near_f, near_b
+ * c8[]   : 8-color fallback (same slots)
+ */
+typedef struct {
+    const char *name;
+    int c[10];   /* 256-color foregrounds */
+    int c8[10];  /* 8-color fallbacks     */
+    int hud;     /* 256-color HUD fg      */
+    int hud8;    /* 8-color HUD fg        */
+} Theme;
+
+static const Theme k_themes[N_THEMES] = {
+    { "Classic",
+      { 17,  18, 250,  24,  17,  22,  22,  34,  28,  22 },
+      { COLOR_BLUE, COLOR_CYAN,  COLOR_WHITE, COLOR_BLUE,  COLOR_BLUE,
+        COLOR_GREEN,COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN },
+      226, COLOR_YELLOW },
+
+    { "Matrix",
+      { 16,  22,  46,  28,  22,  34,  28,  46,  34,  22 },
+      { COLOR_BLACK,COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
+        COLOR_GREEN, COLOR_GREEN,COLOR_GREEN, COLOR_GREEN, COLOR_GREEN },
+       46, COLOR_GREEN },
+
+    { "Nova",
+      { 17,  18, 231,  39,  17,  21,  17,  51,  39,  21 },
+      { COLOR_BLUE, COLOR_BLUE,  COLOR_WHITE, COLOR_CYAN,  COLOR_BLUE,
+        COLOR_CYAN,  COLOR_BLUE, COLOR_CYAN,  COLOR_CYAN,  COLOR_BLUE },
+       51, COLOR_CYAN },
+
+    { "Poison",
+      { 16,  22, 190, 100,  22, 148, 100, 190, 148, 100 },
+      { COLOR_BLACK,COLOR_GREEN, COLOR_YELLOW,COLOR_GREEN, COLOR_GREEN,
+        COLOR_YELLOW,COLOR_GREEN,COLOR_YELLOW,COLOR_YELLOW,COLOR_GREEN },
+      154, COLOR_YELLOW },
+
+    { "Ocean",
+      { 17,  24, 231,  38,  18,  30,  24,  45,  38,  30 },
+      { COLOR_BLUE, COLOR_CYAN,  COLOR_WHITE, COLOR_CYAN,  COLOR_BLUE,
+        COLOR_CYAN,  COLOR_CYAN, COLOR_CYAN,  COLOR_CYAN,  COLOR_CYAN },
+       39, COLOR_CYAN },
+
+    { "Fire",
+      { 52,  88, 226, 196,  88, 208, 196, 226, 214, 208 },
+      { COLOR_RED,  COLOR_RED,   COLOR_YELLOW,COLOR_RED,   COLOR_RED,
+        COLOR_YELLOW,COLOR_RED,  COLOR_YELLOW,COLOR_YELLOW,COLOR_RED },
+      208, COLOR_YELLOW },
+
+    { "Gold",
+      { 17,  52, 231,  94,  52, 136,  94, 220, 136,  94 },
+      { COLOR_BLUE, COLOR_RED,   COLOR_WHITE, COLOR_YELLOW,COLOR_RED,
+        COLOR_YELLOW,COLOR_YELLOW,COLOR_YELLOW,COLOR_YELLOW,COLOR_YELLOW },
+      226, COLOR_YELLOW },
+
+    { "Ice",
+      { 16,  17, 231,  30,  17,  23,  17, 159,  30,  23 },
+      { COLOR_BLACK,COLOR_BLUE,  COLOR_WHITE, COLOR_CYAN,  COLOR_BLUE,
+        COLOR_BLUE,  COLOR_BLUE, COLOR_CYAN,  COLOR_CYAN,  COLOR_BLUE },
+      123, COLOR_CYAN },
+
+    { "Nebula",
+      { 16,  54, 183,  93,  54,  55,  54, 141,  93,  55 },
+      { COLOR_BLACK,COLOR_MAGENTA,COLOR_WHITE,COLOR_MAGENTA,COLOR_MAGENTA,
+        COLOR_MAGENTA,COLOR_MAGENTA,COLOR_CYAN,COLOR_MAGENTA,COLOR_MAGENTA },
+       87, COLOR_CYAN },
+
+    { "Lava",
+      { 52,  88, 226, 124,  52, 196, 124, 214, 196, 124 },
+      { COLOR_RED,  COLOR_RED,   COLOR_YELLOW,COLOR_RED,   COLOR_RED,
+        COLOR_RED,   COLOR_RED,  COLOR_YELLOW,COLOR_RED,   COLOR_RED },
+      214, COLOR_YELLOW },
+};
+
+static int g_theme = 0;
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -105,35 +187,42 @@ static void clock_sleep_ns(long long ns)
 /* §3  color                                                              */
 /* ===================================================================== */
 
+static void theme_apply(int t)
+{
+    const Theme *th = &k_themes[t];
+    /* All terrain pairs use -1 background so the sky stays transparent */
+    if (COLORS >= 256) {
+        init_pair(CP_SKY_HI, th->c[0], -1);
+        init_pair(CP_SKY_LO, th->c[1], -1);
+        init_pair(CP_STAR,   th->c[2], -1);
+        init_pair(CP_FAR_E,  th->c[3], -1);
+        init_pair(CP_FAR_F,  th->c[4], -1);
+        init_pair(CP_MID_E,  th->c[5], -1);
+        init_pair(CP_MID_F,  th->c[6], -1);
+        init_pair(CP_NEAR_E, th->c[7], -1);
+        init_pair(CP_NEAR_F, th->c[8], -1);
+        init_pair(CP_NEAR_B, th->c[9], -1);
+        init_pair(CP_HUD,    th->hud,  -1);
+    } else {
+        init_pair(CP_SKY_HI, th->c8[0], -1);
+        init_pair(CP_SKY_LO, th->c8[1], -1);
+        init_pair(CP_STAR,   th->c8[2], -1);
+        init_pair(CP_FAR_E,  th->c8[3], -1);
+        init_pair(CP_FAR_F,  th->c8[4], -1);
+        init_pair(CP_MID_E,  th->c8[5], -1);
+        init_pair(CP_MID_F,  th->c8[6], -1);
+        init_pair(CP_NEAR_E, th->c8[7], -1);
+        init_pair(CP_NEAR_F, th->c8[8], -1);
+        init_pair(CP_NEAR_B, th->c8[9], -1);
+        init_pair(CP_HUD,    th->hud8,  -1);
+    }
+}
+
 static void color_init(void)
 {
     start_color();
     use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(CP_SKY_HI, 17,  -1);  /* deep navy      */
-        init_pair(CP_SKY_LO, 18,  -1);  /* dark blue      */
-        init_pair(CP_STAR,  250,  -1);  /* light grey     */
-        init_pair(CP_FAR_E,  24,  -1);  /* steel blue edge */
-        init_pair(CP_FAR_F,  17,  -1);  /* dark navy fill  */
-        init_pair(CP_MID_E,  22,  -1);  /* dark green edge */
-        init_pair(CP_MID_F,  22,  -1);  /* dark green fill */
-        init_pair(CP_NEAR_E, 34,  -1);  /* bright green edge */
-        init_pair(CP_NEAR_F, 28,  -1);  /* medium green    */
-        init_pair(CP_NEAR_B, 22,  -1);  /* deep green base */
-        init_pair(CP_HUD,   244,  -1);
-    } else {
-        init_pair(CP_SKY_HI, COLOR_BLUE,   -1);
-        init_pair(CP_SKY_LO, COLOR_CYAN,   -1);
-        init_pair(CP_STAR,   COLOR_WHITE,  -1);
-        init_pair(CP_FAR_E,  COLOR_BLUE,   -1);
-        init_pair(CP_FAR_F,  COLOR_BLUE,   -1);
-        init_pair(CP_MID_E,  COLOR_GREEN,  -1);
-        init_pair(CP_MID_F,  COLOR_GREEN,  -1);
-        init_pair(CP_NEAR_E, COLOR_GREEN,  -1);
-        init_pair(CP_NEAR_F, COLOR_GREEN,  -1);
-        init_pair(CP_NEAR_B, COLOR_GREEN,  -1);
-        init_pair(CP_HUD,    COLOR_WHITE,  -1);
-    }
+    theme_apply(g_theme);
 }
 
 /* ===================================================================== */
@@ -297,10 +386,11 @@ static void scene_draw(void)
 
     attron(COLOR_PAIR(CP_HUD));
     mvprintw(0, 0,
-        " Landscape  q:quit  p:pause  r:reset  ←/→:speed+dir  +/-:zoom");
+        " Landscape  q:quit  p:pause  r:reset  ←/→:speed+dir  +/-:zoom  t:theme");
     mvprintw(1, 0,
-        " scroll=%.0f  speed=%.2f  zoom=%.1fx  %s",
+        " scroll=%.0f  speed=%.2f  zoom=%.1fx  t:%s  %s",
         (double)g_scroll, (double)g_speed, (double)g_freq,
+        k_themes[g_theme].name,
         g_paused ? "PAUSED" : "scrolling");
     attroff(COLOR_PAIR(CP_HUD));
 }
@@ -357,6 +447,10 @@ int main(void)
             g_freq *= 1.25f; if (g_freq > 8.f) g_freq = 8.f; break;
         case '-':
             g_freq *= 0.8f; if (g_freq < 0.125f) g_freq = 0.125f; break;
+        case 't': case 'T':
+            g_theme = (g_theme + 1) % N_THEMES;
+            theme_apply(g_theme);
+            break;
         default: break;
         }
 

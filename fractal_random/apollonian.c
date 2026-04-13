@@ -26,6 +26,9 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #include <ncurses.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -74,7 +77,7 @@ static void clock_sleep_ns(long long ns)
 }
 
 /* ===================================================================== */
-/* §3  color — fire palette: deep=dark, outer=bright                      */
+/* §3  color — rainbow spectrum: depth 1=yellow … 7=red                   */
 /* ===================================================================== */
 
 static void color_init(void)
@@ -82,23 +85,23 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_D1,  88, -1);   /* dark red     — deepest  */
-        init_pair(CP_D2, 124, -1);
-        init_pair(CP_D3, 196, -1);
-        init_pair(CP_D4, 202, -1);
-        init_pair(CP_D5, 208, -1);
-        init_pair(CP_D6, 226, -1);
-        init_pair(CP_D7, 231, -1);   /* white        — shallowest */
-        init_pair(CP_HUD,244, -1);
+        init_pair(CP_D1, 226, -1);   /* bright yellow  — depth 1 (outermost) */
+        init_pair(CP_D2, 118, -1);   /* lime green     — depth 2             */
+        init_pair(CP_D3,  51, -1);   /* bright cyan    — depth 3             */
+        init_pair(CP_D4,  33, -1);   /* dodger blue    — depth 4             */
+        init_pair(CP_D5,  93, -1);   /* purple         — depth 5             */
+        init_pair(CP_D6, 201, -1);   /* magenta        — depth 6             */
+        init_pair(CP_D7, 196, -1);   /* red            — depth 7 (deepest)   */
+        init_pair(CP_HUD,232, 250);  /* dark on silver — HUD bar             */
     } else {
-        init_pair(CP_D1, COLOR_RED,    -1);
-        init_pair(CP_D2, COLOR_RED,    -1);
-        init_pair(CP_D3, COLOR_YELLOW, -1);
-        init_pair(CP_D4, COLOR_YELLOW, -1);
-        init_pair(CP_D5, COLOR_WHITE,  -1);
-        init_pair(CP_D6, COLOR_WHITE,  -1);
-        init_pair(CP_D7, COLOR_WHITE,  -1);
-        init_pair(CP_HUD,COLOR_WHITE,  -1);
+        init_pair(CP_D1, COLOR_YELLOW,  -1);
+        init_pair(CP_D2, COLOR_GREEN,   -1);
+        init_pair(CP_D3, COLOR_CYAN,    -1);
+        init_pair(CP_D4, COLOR_BLUE,    -1);
+        init_pair(CP_D5, COLOR_MAGENTA, -1);
+        init_pair(CP_D6, COLOR_RED,     -1);
+        init_pair(CP_D7, COLOR_RED,     -1);
+        init_pair(CP_HUD,COLOR_BLACK,   COLOR_WHITE);
     }
 }
 
@@ -107,7 +110,7 @@ static void color_init(void)
 /* ===================================================================== */
 
 /* Complex square root of (ax + i·ay) */
-static void csqrt(float ax, float ay, float *rx, float *ry)
+static void complex_sqrt(float ax, float ay, float *rx, float *ry)
 {
     float r = sqrtf(sqrtf(ax*ax + ay*ay));
     float theta = atan2f(ay, ax) * 0.5f;
@@ -160,7 +163,7 @@ static bool add_circle(int i1, int i2, int i3, int sign, int depth)
     float prody = p12y + p23y + p31y;
 
     float sqx, sqy;
-    csqrt(prodx, prody, &sqx, &sqy);
+    complex_sqrt(prodx, prody, &sqx, &sqy);
 
     float kz4x = sumx + sign * 2.f * sqx;
     float kz4y = sumy + sign * 2.f * sqy;
@@ -258,47 +261,62 @@ static int gasket_to_row(float y)
     return (int)((-y + 1.f) * 0.5f * (g_rows - HUD_ROWS - 1)) + HUD_ROWS;
 }
 
+/* Aspect-corrected tangent character for a point at angle theta on an
+ * ellipse with horizontal radius r_col and vertical radius r_row=r_col/2.
+ * Tangent in screen space: (dx, dy) = (-r_col*sin θ,  r_row*cos θ).     */
+static char circle_char(float theta)
+{
+    float dx = -sinf(theta);
+    float dy =  0.5f * cosf(theta);   /* 0.5 = r_row/r_col aspect factor */
+    float ax = fabsf(dx), ay = fabsf(dy);
+    if (ay > ax * 1.73f) return '|';
+    if (ax > ay * 1.73f) return '-';
+    return (dx * dy > 0.f) ? '\\' : '/';
+}
+
 static void draw_circle(const Circle *c)
 {
-    if (c->k <= 0.f) return;  /* skip outer circle */
+    if (c->k <= 0.f) return;  /* skip outer bounding circle */
+
     float r_sim  = 1.f / c->k;
     float cx_sim = c->zx / c->k;
     float cy_sim = c->zy / c->k;
 
-    int cx_col = gasket_to_col(cx_sim);
-    int cy_row = gasket_to_row(cy_sim);
+    int   cx_col = gasket_to_col(cx_sim);
+    int   cy_row = gasket_to_row(cy_sim);
+    float r_col  = r_sim * (float)(g_cols - 2) * 0.5f;
+    float r_row  = r_col * 0.5f;   /* 2:1 cell aspect ratio */
 
-    /* radius in terminal columns (aspect: 1 col ≈ 2 rows) */
-    float r_col = r_sim * (float)(g_cols - 2) * 0.5f;
-    float r_row = r_col * 0.5f;   /* terminal cell 2:1 aspect */
+    int    d    = c->depth < 1 ? 1 : c->depth > 7 ? 7 : c->depth;
+    attr_t bold = (d <= 2) ? A_BOLD : 0;   /* outer rings bolder */
+    attron(COLOR_PAIR(d) | bold);
 
     if (r_col < 0.5f) {
-        /* Too small to draw a circle: just a dot */
+        /* sub-pixel — single dot at centre */
         if (cy_row >= HUD_ROWS && cy_row < g_rows &&
-            cx_col >= 0 && cx_col < g_cols) {
-            int d = c->depth < 1 ? 1 : c->depth > 7 ? 7 : c->depth;
-            attron(COLOR_PAIR(d));
+            cx_col >= 0 && cx_col < g_cols)
             mvaddch(cy_row, cx_col, '.');
-            attroff(COLOR_PAIR(d));
+
+    } else if (r_col < 1.5f) {
+        /* tiny circle — compact glyph */
+        if (cy_row >= HUD_ROWS && cy_row < g_rows &&
+            cx_col >= 0 && cx_col < g_cols)
+            mvaddch(cy_row, cx_col, d <= 3 ? 'o' : '.');
+
+    } else {
+        /* full circle — slope-based outline chars for smooth appearance */
+        int n_steps = (int)(2.f * (float)M_PI * r_col * 2.5f) + 8;
+        if (n_steps > 512) n_steps = 512;
+        for (int s = 0; s < n_steps; s++) {
+            float theta = 2.f * (float)M_PI * (float)s / (float)n_steps;
+            int col = cx_col + (int)(r_col * cosf(theta) + 0.5f);
+            int row = cy_row + (int)(r_row * sinf(theta) + 0.5f);
+            if (row >= HUD_ROWS && row < g_rows && col >= 0 && col < g_cols)
+                mvaddch(row, col, (chtype)(unsigned char)circle_char(theta));
         }
-        return;
     }
 
-    int d = c->depth < 1 ? 1 : c->depth > 7 ? 7 : c->depth;
-    attron(COLOR_PAIR(d));
-
-    /* Draw ellipse outline (aspect-corrected circle) */
-    int n_steps = (int)(2.f * 3.14159f * r_col * 2.f) + 4;
-    if (n_steps > 360) n_steps = 360;
-    for (int s = 0; s < n_steps; s++) {
-        float theta = 2.f * 3.14159f * (float)s / (float)n_steps;
-        int col = cx_col + (int)(r_col * cosf(theta) + 0.5f);
-        int row = cy_row + (int)(r_row * sinf(theta) + 0.5f);
-        if (row >= HUD_ROWS && row < g_rows && col >= 0 && col < g_cols)
-            mvaddch(row, col, 'o');
-    }
-
-    attroff(COLOR_PAIR(d));
+    attroff(COLOR_PAIR(d) | bold);
 }
 
 static void scene_draw(void)
@@ -306,13 +324,17 @@ static void scene_draw(void)
     for (int i = 0; i < g_n_circles; i++)
         draw_circle(&g_circles[i]);
 
+    /* silver HUD bar */
     attron(COLOR_PAIR(CP_HUD));
-    mvprintw(0, 0,
-        " Apollonian  q:quit  p:pause  r:restart  +/-:depth  1/2/3:presets");
-    mvprintw(1, 0,
-        " circles:%d  depth_max:%d  tasks:%d  %s",
-        g_n_circles, g_depth_max, g_task_top,
-        g_done ? "complete" : (g_paused ? "PAUSED" : "building"));
+    for (int c = 0; c < g_cols; c++) mvaddch(0, c, ' ');
+    mvprintw(0, 1,
+        "Apollonian Gasket  q:quit  p:pause  r:restart  +/-:depth(%d)  "
+        "1/2/3:presets  circles:%d  %s",
+        g_depth_max, g_n_circles,
+        g_done ? "complete" : (g_paused ? "PAUSED" : "building..."));
+    for (int c = 0; c < g_cols; c++) mvaddch(1, c, ' ');
+    mvprintw(1, 1,
+        "depth:  1 yellow   2 lime   3 cyan   4 blue   5 purple   6 magenta   7 red");
     attroff(COLOR_PAIR(CP_HUD));
 }
 

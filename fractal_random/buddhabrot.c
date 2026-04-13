@@ -144,18 +144,9 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  color & themes                                                     */
 /* ===================================================================== */
 
-/*
- * Nebula palette — five density levels from near-invisible to peak.
- *
- *   COL_C1   55   dark blue-purple   (sparse pixels barely visible)
- *   COL_C2   93   violet
- *   COL_C3  141   light purple
- *   COL_C4  183   lavender-pink
- *   COL_C5  231   white  (peak — bold)
- */
 typedef enum {
     COL_C1  = 1,
     COL_C2  = 2,
@@ -165,16 +156,43 @@ typedef enum {
     COL_HUD = 6,
 } ColorID;
 
+/* Five density levels (sparse → peak) + HUD accent */
+typedef struct {
+    const char *name;
+    int c[5];   /* xterm-256 colours for COL_C1..COL_C5 */
+    int hud;    /* HUD accent colour */
+} Theme;
+
+#define N_THEMES 8
+static const Theme k_themes[N_THEMES] = {
+/*          name         C1    C2    C3    C4    C5   hud */
+/* 0 */ { "Nebula",   {  55,   93,  141,  183,  231 },  87 },
+/* 1 */ { "Matrix",   {  22,   28,   34,   46,   82 },  46 },
+/* 2 */ { "Nova",     {  17,   21,   39,  117,  231 },  51 },
+/* 3 */ { "Poison",   {  22,  100,  148,  190,  226 }, 154 },
+/* 4 */ { "Ocean",    {  17,   18,   24,   38,  159 },  39 },
+/* 5 */ { "Fire",     {  52,   88,  196,  214,  226 }, 208 },
+/* 6 */ { "Gold",     {  52,   94,  136,  220,  231 }, 226 },
+/* 7 */ { "Ice",      {  16,   23,   30,  159,  231 }, 123 },
+};
+
+static int g_theme = 0;
+
+static void theme_apply(int t)
+{
+    const Theme *th = &k_themes[t];
+    if (COLORS >= 256) {
+        for (int i = 0; i < 5; i++)
+            init_pair(COL_C1 + i, th->c[i], COLOR_BLACK);
+        init_pair(COL_HUD, th->hud, COLOR_BLACK);
+    }
+}
+
 static void color_init(void)
 {
     start_color();
     if (COLORS >= 256) {
-        init_pair(COL_C1,   55, COLOR_BLACK);   /* dark blue-purple */
-        init_pair(COL_C2,   93, COLOR_BLACK);   /* violet           */
-        init_pair(COL_C3,  141, COLOR_BLACK);   /* light purple     */
-        init_pair(COL_C4,  183, COLOR_BLACK);   /* lavender-pink    */
-        init_pair(COL_C5,  231, COLOR_BLACK);   /* white            */
-        init_pair(COL_HUD,  87, COLOR_BLACK);   /* cyan HUD         */
+        theme_apply(g_theme);
     } else {
         init_pair(COL_C1,  COLOR_BLUE,    COLOR_BLACK);
         init_pair(COL_C2,  COLOR_MAGENTA, COLOR_BLACK);
@@ -501,11 +519,12 @@ static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps)
             : 100;
     if (pct > 100) pct = 100;
 
-    char buf[HUD_COLS + 1];
+    char buf[HUD_COLS + 32];
     snprintf(buf, sizeof buf,
-             "%5.1f fps  %-11s  %3d%%  spd:%d",
-             fps, k_presets[sc->grid.preset].name, pct, sim_fps);
-    int hx = s->cols - (int)strlen(buf);
+             "%5.1f fps  %-11s  %3d%%  spd:%d  t:%s",
+             fps, k_presets[sc->grid.preset].name, pct, sim_fps,
+             k_themes[g_theme].name);
+    int hx = s->cols - (int)strlen(buf) - 1;
     if (hx < 0) hx = 0;
     attron(COLOR_PAIR(COL_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
@@ -559,6 +578,13 @@ static bool app_handle_key(App *app, int ch)
         break;
     case '[':
         if (app->sim_fps > SIM_FPS_MIN) app->sim_fps -= SIM_FPS_STEP;
+        break;
+
+    case 't': case 'T':
+        if (COLORS >= 256) {
+            g_theme = (g_theme + 1) % N_THEMES;
+            theme_apply(g_theme);
+        }
         break;
 
     default: break;

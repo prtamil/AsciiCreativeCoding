@@ -83,14 +83,14 @@ static void color_init(void)
         init_pair(CP_D2,  27, -1);   /* med blue        */
         init_pair(CP_D3,  51, -1);   /* cyan            */
         init_pair(CP_D4, 231, -1);   /* white           */
-        init_pair(CP_HUD,244, -1);
+        init_pair(CP_HUD, 226, -1);
     } else {
         init_pair(CP_D0, COLOR_BLUE,   -1);
         init_pair(CP_D1, COLOR_BLUE,   -1);
         init_pair(CP_D2, COLOR_CYAN,   -1);
         init_pair(CP_D3, COLOR_CYAN,   -1);
         init_pair(CP_D4, COLOR_WHITE,  -1);
-        init_pair(CP_HUD,COLOR_WHITE,  -1);
+        init_pair(CP_HUD, COLOR_YELLOW, -1);
     }
 }
 

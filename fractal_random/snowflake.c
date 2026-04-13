@@ -63,7 +63,7 @@ enum {
     SIM_FPS_STEP    =  5,
 
     WALKER_MIN      =   5,
-    WALKER_DEFAULT  =  60,   /* fewer needed: each stick creates 12 cells */
+    WALKER_DEFAULT  =  80,   /* fewer needed: each stick creates 12 cells */
     WALKER_MAX      = 200,
 
     GRID_ROWS_MAX   =  80,
@@ -77,9 +77,10 @@ enum {
 
 /*
  * STICK_PROB — probability a walker sticks on first contact.
+ * 0.55 → thicker, denser arms with rounded edges.
  * 0.90 → sparse, spiky fractal arms (classic DLA morphology).
  */
-#define STICK_PROB  0.90f
+#define STICK_PROB  0.55f
 
 /*
  * ASPECT_R — terminal cell height / width.
@@ -297,23 +298,23 @@ static chtype grid_cell_char(const Grid *g, int cx, int cy)
     if (card == 0 && !(NE || NW || SE || SW))
         return (chtype)'*';
 
-    /* Junctions (3+ cardinal connections) */
+    /* Junctions (3+ cardinal connections) — solid block */
     if (card >= 3)
-        return (chtype)'+';
+        return (chtype)'#';
 
-    /* Aligned cardinal pairs */
+    /* Aligned cardinal pairs — thicker arm segments */
     if (N && S && !E && !W) return (chtype)'|';
-    if (E && W && !N && !S) return (chtype)'-';
+    if (E && W && !N && !S) return (chtype)'=';
 
     /* Single cardinal connection → arm end segment */
     if (card == 1) {
         if (N || S) return (chtype)'|';
-        return (chtype)'-';
+        return (chtype)'=';
     }
 
     /* Two misaligned cardinals → corner junction */
     if (card == 2)
-        return (chtype)'+';
+        return (chtype)'#';
 
     /* Diagonal-only connections */
     bool fwd  = NE || SW;
@@ -321,7 +322,7 @@ static chtype grid_cell_char(const Grid *g, int cx, int cy)
     if (fwd  && !back) return (chtype)'/';
     if (back && !fwd)  return (chtype)'\\';
 
-    return (chtype)'+';
+    return (chtype)'#';
 }
 
 static void grid_init(Grid *g, int cols, int rows)
@@ -343,14 +344,44 @@ static void grid_init(Grid *g, int cols, int rows)
 
 static void grid_draw(const Grid *g, WINDOW *w)
 {
+    /*
+     * Pass 1 — glow halo.
+     *
+     * For every frozen cell, paint its empty 8-neighbours with a dim ':'
+     * in the same color band.  This makes each arm appear ~3 cells thick
+     * visually even though the frozen structure is 1 cell wide.  Frozen
+     * cells drawn in pass 2 overwrite any glow character underneath.
+     */
+    for (int cy = 0; cy < g->rows; cy++) {
+        for (int cx = 0; cx < g->cols; cx++) {
+            uint8_t col = g->cells[cy][cx];
+            if (col == 0) continue;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = cx + dx, ny = cy + dy;
+                    if (nx < 0 || nx >= g->cols) continue;
+                    if (ny < 0 || ny >= g->rows) continue;
+                    if (g->cells[ny][nx] != 0) continue;   /* frozen wins */
+                    wattron(w, COLOR_PAIR((int)col) | A_DIM);
+                    mvwaddch(w, ny, nx, (chtype)':');
+                    wattroff(w, COLOR_PAIR((int)col) | A_DIM);
+                }
+            }
+        }
+    }
+
+    /*
+     * Pass 2 — frozen crystal cells on top of the halo.
+     * Tips (col 1, white) and core (col 6, light blue) rendered bold;
+     * middle teal bands at normal intensity.
+     */
     for (int cy = 0; cy < g->rows; cy++) {
         for (int cx = 0; cx < g->cols; cx++) {
             uint8_t col = g->cells[cy][cx];
             if (col == 0) continue;
 
             attr_t attr = COLOR_PAIR((int)col);
-            /* tips (white) and core (light blue) both glow bright;
-             * teal middle zone renders at normal intensity             */
             if (col <= 2 || col == 6) attr |= A_BOLD;
 
             wattron(w, attr);

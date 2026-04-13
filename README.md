@@ -9,7 +9,7 @@
   ╚═════╝    ╚══════╝  terminal as canvas
 ```
 
-95 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+96 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 ---
 
@@ -117,6 +117,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `gear` | Wireframe rotating gear — proximity-based edge detection, tangential surface-velocity sparks, speed-proportional emission, 10 color themes (fire/matrix/plasma/nova/poison/ocean/gold/neon/arctic/lava) |
 | `railwaymap` | Procedural transit map — H/V/Z grid-aligned line templates, canvas-based ACS junction detection, station interchange, 10 themes |
 | `fireworks_rain` | Fireworks with matrix-rain arc trails — each of 72 sparks per explosion grows a 16-slot position-history trail; chars shimmer 75 % per tick; 5 themes (vivid/matrix/fire/ice/plasma) remap all spark color pairs; `t` cycles theme |
+| `blackhole` | Gargantua 3D (Interstellar) — exact Schwarzschild null geodesics via RK4, precomputed lensing table; photon ring from min-radius tracking, primary + secondary disk images, relativistic Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift; dynamic clip radius scales with cam_dist; 11 themes (interstellar/matrix/nova/ocean/poison/fire/plasma/gold/arctic/lava/mono); `+/-` zoom |
 
 ### Algorithms
 | Program | Algorithm |

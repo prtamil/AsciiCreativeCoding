@@ -1,6 +1,6 @@
 # Learning Roadmap — ASCII Creative Coding
 
-96 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
+100 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
 and the 2-year breakdown. Do not skip layers.
 
 ---
@@ -120,6 +120,10 @@ Requires linear algebra and graphics pipeline understanding.
 | `sphere_raster.c` | UV mapping | spherical coordinates |
 | `displace_raster.c` | Vertex displacement | central-difference normals |
 | `penrose.c` | Aperiodic tiling | de Bruijn pentagrid duality |
+| `sphere_raytrace.c` | Analytic ray tracing | quadratic ray-sphere, 3-point Phong, Fresnel, 256-color |
+| `cube_raytrace.c` | Analytic ray tracing | AABB slab method, inverse-rotation transform, face normals, wireframe |
+| `torus_raytrace.c` | Analytic ray tracing | quartic via sampling+bisection, gradient normal, Horner evaluation |
+| `capsule_raytrace.c` | Analytic ray tracing | cylinder+sphere-cap decomposition, axial projection normal, inverse-rotation transform |
 
 ---
 

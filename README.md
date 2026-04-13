@@ -9,7 +9,7 @@
   ╚═════╝    ╚══════╝  terminal as canvas
 ```
 
-96 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+100 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 ---
 
@@ -79,6 +79,14 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `displace_raster` | Real-time vertex displacement, central-difference normal recompute |
 | `donut` | Parametric torus projection — the original spinning donut |
 | `wireframe` | 3D Bresenham edge projection, slope-to-character line drawing |
+
+### Analytic Ray Tracing
+| Program | Algorithm |
+|---------|-----------|
+| `sphere_raytrace` | Quadratic ray-sphere — orbiting camera, 3-point Phong, Fresnel glass mode, 256-color, 6 themes |
+| `cube_raytrace` | AABB slab method — inverse-rotation ray transform, face-normal colour, pixel-perfect wireframe, 6 themes |
+| `torus_raytrace` | Quartic intersection (sampling + bisection) — ring in XZ plane, gradient normal, Fresnel, 6 themes |
+| `capsule_raytrace` | Cylinder + hemisphere caps — axial projection body normal, cap sphere normal, inverse-rotation transform, 6 themes |
 
 ### Emergent Systems
 | Program | Algorithm |
@@ -194,12 +202,13 @@ See `Claude.md` for the complete build list.
 ├── physics/           — Lorenz, N-body, cloth, pendulums
 ├── raster/            — software rasterizer (torus, cube, sphere)
 ├── raymarcher/        — SDF ray marching
+├── raytracing/        — analytic ray tracing (sphere, cube, torus)
 ├── ncurses_basics/    — framework reference implementations
 └── documentation/
     ├── Claude.md          — complete build reference
     └── learning/
         ├── ROADMAP.md         — 6-tier study order, 2-year plan
-        └── concept_*.md       — 93 deep-dive concept files
+        └── concept_*.md       — 96 deep-dive concept files
                                  (math → pseudocode → implementation notes)
 ```
 
@@ -207,7 +216,7 @@ See `Claude.md` for the complete build list.
 
 ## Documentation
 
-`documentation/learning/` contains 93 concept files — one per program. Each file has two passes:
+`documentation/learning/` contains 97 concept files — one per program. Each file has two passes:
 
 - **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
 - **Pass 2** — pseudocode, module map, data flow diagram, core loop

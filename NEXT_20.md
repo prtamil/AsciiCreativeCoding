@@ -23,7 +23,7 @@ Ideas ranked by learning value and visual payoff. Each builds on existing projec
 | 6 | `bubble_chamber.c` | physics/ | Charged particles curving in a magnetic field — particle tracks with decay | Lorentz force (v × B), exponential trail fade, track curvature |
 | 7 | ~~`chain.c`~~ | physics/ | Hanging chain + swinging rope — verlet constraint solver | Position-based dynamics, distance constraints, iterative projection | **DONE** |
 | 8 | `fluid_sph.c` | fluid/ | Smoothed Particle Hydrodynamics — 2D particle fluid with pressure and viscosity | SPH density, pressure gradient, viscosity term, neighbour search |
-| 9 | ~~`rigid_body.c`~~ | physics/ | 2D rigid body with angular momentum — collisions + rotation | Moment of inertia, angular impulse, separating-axis collision test | **DONE** |
+| 9 | ~~`rigid_body.c`~~ | physics/ | 2D rigid body collisions — cubes + spheres, AABB detection, gravity, sleep | AABB overlap, circle-AABB closest-point, impulse resolution, Coulomb friction, Baumgarte, sleep counter | **DONE** |
 | 10 | ~~`soft_body.c`~~ | physics/ | Jelly blob — spring lattice with surface tension | Spring-mass mesh, surface rendering, pressure term for volume conservation | **DONE** |
 
 ---

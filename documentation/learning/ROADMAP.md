@@ -71,7 +71,7 @@ Introduces differential equations and numerical integration.
 | `gyroscope.c` | Rigid body | Euler angles, torque |
 | `magnetic_field.c` | Electromagnetism | Biot-Savart superposition, RK4 streamline tracing, aspect-corrected vector field |
 | `chain.c` | Position-Based Dynamics | Verlet prediction, iterative distance-constraint projection, tension coloring, wave propagation |
-| `rigid_body.c` | 2D rigid body collisions + rotation | Moment of inertia, SAT rect-rect, impulse `j=-(1+e)·vRel·n/denom`, Baumgarte correction |
+| `rigid_body.c` | 2D rigid body collisions (AABB) | AABB overlap (min-axis normal), circle-AABB closest-point, impulse `j=(1+e)·vn/(1/mA+1/mB)`, Coulomb friction, Baumgarte positional correction, sleep counter |
 | `soft_body.c` | Jelly blob — spring-mass mesh + pressure | Hooke springs (structural/shear/bending), shoelace area, pressure force on boundary edges, symplectic Euler |
 
 ---

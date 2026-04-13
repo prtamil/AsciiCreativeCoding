@@ -11,6 +11,9 @@
 
 100 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
+All simulations share a unified architecture and fixed-timestep physics loop.
+Each program can be studied independently or as part of the full simulation framework.
+
 ---
 
 ## What This Is

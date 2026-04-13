@@ -63,6 +63,9 @@ Reference implementation: `basics/bounce_ball.c`
     - [Lorenz Strange Attractor — lorenz.c](#lorenz-strange-attractor--lorenzc)
     - [N-Body Gravity — nbody.c](#n-body-gravity--nbodyc)
     - [Spring-Mass Cloth — cloth.c](#spring-mass-cloth--clothc)
+    - [Magnetic Field Lines — magnetic_field.c](#magnetic-field-lines--magnetic_fieldc)
+    - [Hanging Chain — chain.c](#hanging-chain--chainc)
+    - [Slime Mold — slime_mold.c](#slime-mold--slime_moldc)
 38. [Artistic Effects — artistic/ & geometry/](#38-artistic-effects--artistic)
     - [Aurora Borealis — aurora.c](#aurora-borealis--aurorac)
     - [Animated Voronoi — voronoi.c](#animated-voronoi--voronoic)
@@ -70,6 +73,8 @@ Reference implementation: `basics/bounce_ball.c`
     - [Plasma — plasma.c](#plasma--plasmac)
 39. [Penrose Tiling — fractal_random/penrose.c](#39-penrose-tiling--fractal_randompenrosec)
 40. [Diamond-Square Terrain — fractal_random/terrain.c](#40-diamond-square-terrain--fractal_randomterrainc)
+41. [Forest Fire CA — misc/forest_fire.c](#41-forest-fire-ca--miscforest_firec)
+42. [Lattice Gas — fluid/lattice_gas.c](#42-lattice-gas--fluidlattice_gasc)
 
 ---
 
@@ -1709,6 +1714,38 @@ The `N_CIRCLES` largest-amplitude arms draw their orbit circles as faint `·` do
 
 ---
 
+## 26b. Fourier Art — artistic/fourier_art.c
+
+`fourier_art.c` extends the epicycle concept to user-drawn paths. Instead of preset mathematical shapes, the user draws any curve on screen with cursor keys; the DFT of that path drives the epicycle animation.
+
+**Two-state machine:**
+```
+STATE_DRAW  ─── ENTER/g ──► STATE_PLAY
+              ◄── r ─────────
+```
+
+**DRAW mode:** Cursor `@` moves with arrow keys / WASD. Each movement records the new `(col, row)` position into a raw buffer (up to RAW_MAX=8192 points). Visited cells display as `.` dots. The HUD shows a live point count.
+
+**Arc-length resampling (`resample_and_center`):**
+Raw cursor positions are unevenly spaced — fast movement creates long gaps, slow movement clusters many points. To get a clean DFT, the path is resampled to exactly `N_SAMPLES=256` equally arc-length-spaced complex points:
+1. Compute cumulative arc length along the raw path.
+2. Walk `k = 0..255`, target `s_k = k/256 × total_arc`.
+3. Binary-search for the raw segment containing `s_k`, linearly interpolate.
+4. Subtract the centroid so the path is centered at the origin.
+
+**Scale fitting:** After resampling and centering, `max_r` is the furthest point from the origin. `g_scale = 0.40 × min(screen_width, screen_height) / max_r` fits the reconstruction inside 40% of the screen.
+
+**PLAY mode:** Identical to `epicycles.c` — sorted epicycles, auto-add convergence, Bresenham arm lines, orbit circles, colour-graded trail. The pivot is fixed at screen centre (the centroid of the drawn path maps here).
+
+**Key difference from epicycles.c:**
+- Source of samples: user input vs. parametric formula
+- Arc-length resampling step (epicycles.c samples at uniform parameter t, which is fine for smooth shapes but wrong for a cursor path where t ≠ arc-length)
+- No preset cycling; `r` returns to DRAW mode to draw a new path
+
+*Files: `artistic/fourier_art.c`*
+
+---
+
 ## 27. Leaf Fall — artistic/leaf_fall.c
 
 `leaf_fall.c` draws a procedural ASCII tree, then rains its leaves down in matrix-rain style before resetting with a new tree.
@@ -2078,6 +2115,127 @@ x[i]  += vx[i]*dt; y[i] += vy[i]*dt;
 
 ---
 
+### Magnetic Field Lines — magnetic_field.c
+
+Visualises the static 2D magnetic field of 1–4 bar magnets (dipoles). Each dipole is modelled as a pair of equal-and-opposite magnetic monopoles. The field at any point is the Coulomb superposition:
+
+```
+B(r) = Σ_i  q_i · (r − r_i) / |r − r_i|³
+```
+
+with SOFT=0.8 cell-unit softening to avoid the singularity at each pole centre.
+
+**Streamline tracing:** N_SEEDS=16 field lines are seeded on a small circle around every North pole. Each line is traced by 4th-order RK4 integration along the normalised B direction. At each step the local field vector is sampled four times (standard RK4 k1–k4) and averaged. The integrated direction is then mapped to a line character (`-`, `|`, `/`, `\`) or an arrow (`>`, `v`, `<`, `^`) every ARR_STRIDE=18 steps to show field orientation.
+
+**Aspect correction:** Terminal cells are ~2× taller than wide. All y-components in `field_at()` are scaled by ASPECT_R=2.0 before computing distance, then divided back when returning B_y. This makes circular field patterns look circular rather than elliptical.
+
+**Incremental reveal:** All lines are traced at scene initialisation. `lines_traced` starts at 0 and increments by `lines_per_tick` each tick, so lines appear to draw themselves progressively.
+
+**Presets:**
+| # | Name | Description |
+|---|---|---|
+| 0 | Dipole | Single bar magnet — closed loops from N to S |
+| 1 | Quadrupole | Two orthogonal dipoles — X-type saddle null point at centre |
+| 2 | Attract | Two magnets with opposite poles facing — dense convergent lines between them |
+| 3 | Repel | Two magnets with same poles facing — divergent lines, null point between |
+
+**Color by proximity:** Lines are coloured bright (CP_LINE_BRT) near the seed pole, fading to dim (CP_LINE_DIM) farther away — simulates field strength falloff.
+
+*Files: `physics/magnetic_field.c`*
+
+---
+
+### Hanging Chain — chain.c
+
+`chain.c` simulates a chain of point masses using **Position-Based Dynamics (PBD)** — a fundamentally different approach from the explicit spring forces in `cloth.c`.
+
+**Algorithm per sub-step:**
+```
+1. Verlet predict (free nodes only):
+     vx = (x - ox) * DAMP
+     new_x = x + vx + wind * dt²
+     new_y = y + vy + GRAVITY * dt²
+     ox = x;  x = new_x          (velocity is implicit in (x - ox))
+
+2. Constraint projection (N_ITER iterations):
+     for each link (a, b):
+       d  = b.pos − a.pos
+       dist = |d|
+       corr_ratio = (dist − rest) / dist
+       if both free:  a += 0.5 * corr_ratio * d
+                      b -= 0.5 * corr_ratio * d
+       if a pinned:   b -= corr_ratio * d
+       if b pinned:   a += corr_ratio * d
+```
+
+**Why PBD instead of springs:** Spring forces require a stiffness constant `k`; for a stiff chain, `k` must be large, which drives explicit Euler unstable (requires tiny dt). PBD enforces constraints geometrically — it moves nodes to satisfy the length constraint directly. The result is unconditionally stable at any stiffness; more iterations → stiffer chain, not instability.
+
+**Tension coloring:** Each link is coloured by `stretch = |dist − rest| / rest`:
+- Cyan (CP_LINK_LO): relaxed (stretch < 4%)
+- Yellow (CP_LINK_MID): mildly stretched (4–12%)
+- Red (CP_LINK_HI): very stretched (> 12%)
+
+During fast swings, the outermost links carry the most centripetal load and turn red; the middle links stay cyan. This makes the tension distribution visually legible.
+
+**Presets:**
+| # | Name | Physics | Visual signature |
+|---|---|---|---|
+| 0 | Hanging | Top pinned, wind oscillates | Chain sways left-right, catenoid shape |
+| 1 | Pendulum | Top pinned, 60° initial angle | Swings with wave patterns in the tail |
+| 2 | Bridge | Both ends pinned, catenary sag | Bounces under vertical wind gusts |
+| 3 | Wave | Top node driven sinusoidally | Traveling waves reflect at free bottom; standing wave modes emerge |
+
+**Wave physics (preset 3):** The top node's position is set to `anchor_x + A·sin(ω·t)` before each sub-step. Wave speed in a hanging chain varies with depth: `c(y) ∝ √(T(y)/μ)` where tension `T(y)` is highest at the top. This dispersion means high-frequency components travel faster — the chain acts as a dispersive medium, and at certain driver frequencies a standing wave pattern locks in.
+
+*Files: `physics/chain.c`*
+
+---
+
+### Slime Mold — fluid/slime_mold.c
+
+`slime_mold.c` implements the **Jeff Jones (2010) Physarum polycephalum** agent model. Individual agents sense their chemical trail environment, turn toward the strongest signal, move, and deposit more trail. The trail diffuses and decays on a grid. From these simple local rules, the colony self-organises into a network topology that empirically approximates minimum Steiner trees — the same structure real slime molds use to connect food sources.
+
+**Agent update (per tick, per agent):**
+```
+sense at (x,y) + SENSOR_DIST × (angle ± SENSOR_ANGLE) — 3 positions
+  FL = trail_sample(forward-left)
+  F  = trail_sample(forward)
+  FR = trail_sample(forward-right)
+if F ≥ FL and F ≥ FR: keep angle
+elif FL > FR:          angle -= ROTATE_ANGLE
+elif FR > FL:          angle += ROTATE_ANGLE
+else:                  angle ±= ROTATE_ANGLE (random)
+x += cos(angle) × STEP_SIZE
+y += sin(angle) × STEP_SIZE
+trail_deposit(x, y, DEPOSIT × food_bonus_if_near_food)
+```
+
+**Trail grid update (double-buffered):**
+```
+for each cell (r, c):
+    avg = (3×3 neighbourhood sum) / 9
+    buf[r][c] = (trail[r][c] × (1−DIFFUSE_W) + avg × DIFFUSE_W) × (1−DECAY)
+memcpy(trail, buf)
+```
+
+Double buffering is critical: without a separate write buffer, cells at the top of the grid get averaged using already-updated neighbour values while cells at the bottom still use stale values, breaking the diffusion symmetry.
+
+**Food sources:** Three food positions per preset deposit a FOOD_MIN_TRAIL floor and give agents a FOOD_BONUS=6× deposit multiplier when within FOOD_RADIUS pixels. This biases the network toward connecting food sources while letting the colony self-route the paths between them.
+
+**Sensor constants (Jones 2010 defaults):**
+- `SENSOR_ANGLE = π/4` (45°) — wide enough to discriminate left/right clearly
+- `SENSOR_DIST = 4.0` — samples ahead of the agent's current cell
+- `ROTATE_ANGLE = π/4` — one 45° step per tick; smaller values → gradual arcs
+- `STEP_SIZE = 1.0` — one grid cell per tick
+
+**Visualization:** Trail intensity mapped to 5 characters: `' '` → `'.'` → `'+'` → `'x'` → `'#'` → `'@'`. Food source cells display `'*'`. Five themes (Physarum, Cyan, Neon, Forest, Lava) each define 5 colour pairs for the intensity levels.
+
+**Why emergent networks?** Each agent follows its own trail and the trails of its neighbours. High-traffic paths reinforce themselves (positive feedback). Low-traffic paths decay away (negative feedback). The result is a sparse, efficient network — the same mathematical structure that graph theorists spend NP-hard compute time trying to find.
+
+*Files: `fluid/slime_mold.c`*
+
+---
+
 ## 38. Artistic Effects — artistic/ & geometry/
 
 ### Aurora Borealis — aurora.c
@@ -2242,6 +2400,161 @@ Material flows downhill when slope exceeds the `TALUS` angle. Mountains slowly c
 | ≥ 0.88 | `*` | cyan bold |
 
 *Files: `fractal_random/terrain.c`*
+
+---
+
+---
+
+## 41. Forest Fire CA — misc/forest_fire.c
+
+Implements the **Drossel-Schwabl (1992)** 3-state probabilistic cellular automaton modelling forest fire ecology. Each cell is EMPTY, TREE, or FIRE; all cells update simultaneously based on two parameters: `p` (growth probability) and `f` (lightning probability).
+
+**Update rules (applied synchronously via double-buffer):**
+```
+FIRE  → EMPTY                              (burns out in one tick)
+TREE  → FIRE    if any 4-neighbour is FIRE (fire spreads)
+TREE  → FIRE    with probability f          (lightning)
+TREE  → TREE    otherwise
+EMPTY → TREE    with probability p          (regrowth)
+EMPTY → EMPTY   otherwise
+```
+
+**Self-organised criticality:** At the critical ratio `p/f`, the distribution of fire sizes follows a power law `P(s) ∝ s^{−τ}` with `τ ≈ 1.19`. The system self-tunes to the edge of criticality — large fires are rare but possible at any scale, without any tuning of parameters. This is the same mechanism behind earthquake size distributions, solar flares, and species extinction events.
+
+**Why the ratio matters, not the individual values:**
+- Large `p/f` → trees grow faster than lightning ignites them → large dense clusters accumulate → catastrophic fires consume everything at once
+- Small `p/f` → fires arrive before clusters grow large → small frequent fires, sparse landscape
+- Critical `p/f` → cluster size distribution spans all scales simultaneously
+
+**Double-buffer update:** Like Game of Life, `g_grid` stores the current state and `g_next` receives all computed next states before being memcpy'd back. Without this, a FIRE cell that burns out on the left side of the grid could no longer spread rightward — the state change would be visible mid-sweep.
+
+**Flickering fire visualization:** FIRE cells alternate between `'*'` (CP_FIRE2, bright) and `','` (CP_FIRE1, dim) based on `(row + col + tick) & 1`. This checkerboard parity combined with frame advance creates a natural flicker without any random call per cell at draw time.
+
+**Ash trail:** When FIRE → EMPTY, `g_ash[r][c] = 1` is set. The draw pass renders ash cells as `'.'` in CP_ASH (dark grey) for one tick. This gives the forest a burned-scar memory that fades after one frame, making fire propagation direction visually legible.
+
+**Preset 3 (Smoulder):** Enables 8-neighbour fire spread (diagonal cells included). This doubles the possible spread directions, producing rounder fire fronts and slower smouldering expansion compared to the sharp diamond-shaped fronts of 4-neighbour spread.
+
+*Files: `misc/forest_fire.c`*
+
+---
+
+---
+
+## 42. Lattice Gas — fluid/lattice_gas.c
+
+`lattice_gas.c` implements the **FHP-I model** (Frisch, Hasslacher & Pomeau, *PRL* 1986), the first cellular automaton proven to reproduce the Navier-Stokes equations at large scales. Particles live on a hexagonal lattice, one per direction per cell, encoded as bits 0–5 of a `uint8_t`.
+
+**Hex direction encoding:**
+```
+bit 0 = E,  bit 1 = NE,  bit 2 = NW
+bit 3 = W,  bit 4 = SW,  bit 5 = SE
+Opposite of direction d: (d+3) % 6
+```
+
+**Two-phase update (collision then streaming):**
+
+*Collision* — apply a 64-entry lookup table `g_col[parity][state]` that conserves particle count and momentum. Only five 6-bit patterns have non-trivial collisions:
+```
+Head-on 2-particle (ambiguous — resolved by (row+col)&1 parity):
+  0x09 (E+W)   → 0x12 (NE+SW) [even] | 0x24 (NW+SE) [odd]
+  0x12 (NE+SW) → 0x24         [even] | 0x09          [odd]
+  0x24 (NW+SE) → 0x09         [even] | 0x12           [odd]
+3-particle symmetric (unique rotation, no ambiguity):
+  0x15 (E+NW+SW) → 0x2A (NE+W+SE)
+  0x2A (NE+W+SE) → 0x15 (E+NW+SW)
+All 59 remaining patterns: identity
+```
+
+*Streaming* — each particle moves to the hex neighbour in its direction (double-buffered into `g_buf`). Particles hitting a wall bounce back: direction reverses to `(d+3)%6`, particle stays at source cell. Grid edges wrap toroidally.
+
+**Why the spatial parity alternation resolves head-on collisions:**
+The three head-on pairs all share the same ambiguity (rotate CW or CCW?). Choosing based on `(r+c)&1` alternates between CW and CCW on a checkerboard pattern. This prevents the simulation from developing spurious global chirality — if all cells always chose CW, the fluid would systematically rotate, breaking the isotropy required for Navier-Stokes.
+
+**Inlet condition:** After each collision+stream cycle, before the next one, the left column is seeded: each non-wall cell in column 0 has its East bit forced to 1 with probability `g_inlet_prob`. This drives a left-to-right flow. The right column wraps toroidally (particles exiting right re-enter left), creating a recirculating channel.
+
+**Visualization:**
+```
+Character encodes density (popcount):  ' '(0) '.'(1) ':'(2) '-'(3) '+'(4) '#'(5) '@'(6)
+Colour encodes horizontal momentum ×2:  E=+2, NE=+1, NW=-1, W=-2, SW=-1, SE=+1
+  mx2 ≤ -3: CP_MW2 (cold)    strong westward
+  mx2 < 0:  CP_MW1            weak westward
+  mx2 = 0:  CP_MID            neutral
+  mx2 > 0:  CP_ME1/ME2 (warm) eastward
+```
+
+**Aspect ratio correction for obstacles:** Terminal cells are ~2× taller than wide. The cylinder preset checks `dx² + (dy×ASPECT_R)² < R²` with `ASPECT_R=2.0`, so the ellipse in cell coordinates appears circular on screen.
+
+**Why Navier-Stokes emerges:** At the coarse-grained level, the particle density and momentum obey continuity and momentum-conservation equations. The collision rules are designed so that the momentum flux tensor is isotropic (the hexagonal lattice has the minimum symmetry required), which gives the correct viscous stress tensor. The kinematic viscosity is ν ≈ 1/(6d(1−d)) where d is the mean occupation per direction — controlled by the inlet density.
+
+*Files: `fluid/lattice_gas.c`*
+
+---
+
+## 43. Galaxy — artistic/galaxy.c
+
+`galaxy.c` simulates a **spiral galaxy** using 3000 stars in exact circular orbits under a flat rotation curve. The spiral structure emerges entirely from the initial placement of stars on logarithmic spiral arms combined with differential rotation.
+
+### Flat Rotation Curve
+
+Real spiral galaxies have nearly constant tangential speed at all radii (the "rotation curve problem"). We encode this directly:
+
+```
+v_circ = V0 = const  →  ω(r) = V0 / r
+```
+
+Because ω is larger at small r, inner stars complete orbits faster than outer ones. This **differential rotation** slowly winds the arms up — exactly the phenomenon real astrophysicists study.
+
+### Logarithmic Spiral Initialization
+
+Each arm k has stars placed at:
+```
+θ = (k × 2π/N_ARMS) + WINDING × ln(r / r_min) + scatter
+```
+This is the equation of a logarithmic spiral: `r = r_min × exp((θ − θ_start) / WINDING)`. Stars start coherent on the arm; differential rotation deforms them over hundreds of ticks.
+
+### Brightness Accumulator Grid
+
+Instead of rendering individual star positions, stars are accumulated into a floating-point grid `g_bright[ROWS][COLS]`:
+
+```c
+g_bright[sy][sx] += 1.0f / g_steps;   /* weight normalised per frame */
+```
+
+Once per rendered frame, the grid is multiplied by `DECAY = 0.82`:
+```c
+g_bright[r][c] *= DECAY;              /* exponential fade trail */
+```
+
+The **steady-state** brightness for a cell receiving f stars/frame is:
+```
+B_ss = f / (1 − DECAY) = f × 5.56
+```
+Dense regions (bulge: many stars) saturate high; sparse regions (halo) stay dim. Both the character and colour are picked from the normalised brightness `b / b_max`.
+
+### Galaxy Zones (Colour)
+
+Screen distance from centre determines the colour zone, regardless of which stars currently occupy the cell:
+
+```c
+float rn = sqrt(dx²/rx² + dy²/ry²);
+cp = (rn < 0.10) ? CP_CORE : (rn < 0.65) ? CP_DISK : CP_HALO;
+```
+
+Aspect-ratio correction (`ry = rx * 0.5`) makes the galaxy appear circular on terminals where cells are ~2× taller than wide.
+
+### Population Breakdown
+
+| Group | Count | Initialisation |
+|---|---|---|
+| Bulge | 600 | `r ~ |Gaussian(0, 0.07)|`, θ random |
+| Arms  | 2100 | log-spiral arms, scatter ±ARM_SCATTER |
+| Halo  | 300  | r ~ Uniform(0.35, 1.05), θ random |
+
+### Keys
+
+`a/A` cycle 2→3→4 arms (resets); `+/-` orbit speed; `t/T` theme; `r` reset; `p` pause.
+
+*Files: `artistic/galaxy.c`*
 
 ---
 

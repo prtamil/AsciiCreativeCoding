@@ -49,6 +49,8 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `railwaymap.c` | Procedural transit map | H/V/Z line templates on 6×4 logical grid, canvas ACS junction detection, interchange nodes |
 | `fireworks_rain.c` | Fireworks + matrix arc trails | position-history trail, oldest-first draw, split ROCKET_DRAG/GRAVITY, per-particle gravity variance, 5-theme color pair remapping |
 | `matrix_snowflake.c` | Matrix rain + live DLA crystal | two-simulation layering (rain background / DLA foreground), D6 symmetry with aspect correction, proximity-spawn DLA optimisation, flash/reset lifecycle, 5 themes |
+| `fourier_art.c` | User-drawn path → Fourier epicycles | DRAW→PLAY state machine, arc-length resampling, O(N²) DFT, amplitude-sorted epicycle chain, auto-add convergence |
+| `galaxy.c` | Spiral galaxy — differential rotation | flat rotation curve ω=v₀/r, logarithmic spiral arm init, brightness accumulator + frame decay, radial colour zones |
 
 ---
 
@@ -67,6 +69,10 @@ Introduces differential equations and numerical integration.
 | `elastic_collision.c` | Billiards | momentum + KE conservation |
 | `orbit_3body.c` | Three-body | Verlet, figure-8 IC |
 | `gyroscope.c` | Rigid body | Euler angles, torque |
+| `magnetic_field.c` | Electromagnetism | Biot-Savart superposition, RK4 streamline tracing, aspect-corrected vector field |
+| `chain.c` | Position-Based Dynamics | Verlet prediction, iterative distance-constraint projection, tension coloring, wave propagation |
+| `rigid_body.c` | 2D rigid body collisions + rotation | Moment of inertia, SAT rect-rect, impulse `j=-(1+e)·vRel·n/denom`, Baumgarte correction |
+| `soft_body.c` | Jelly blob — spring-mass mesh + pressure | Hooke springs (structural/shear/bending), shoelace area, pressure force on boundary edges, symplectic Euler |
 
 ---
 
@@ -75,6 +81,7 @@ Requires partial differential equations and numerical stability.
 
 | File | Subject | Key Math |
 |---|---|---|
+| `lattice_gas.c` | FHP-I lattice gas | 6-dir bit-packed hex, collision lookup table, streaming + bounce-back, Navier-Stokes emerges |
 | `wave.c` | 1D/2D wave PDE | FDTD, CFL condition |
 | `wave_2d.c` | 2D wave PDE | Huygens, interference |
 | `reaction_diffusion.c` | Gray-Scott | Laplacian, diffusion |
@@ -144,6 +151,8 @@ Agent-based simulation, graph algorithms, complex systems.
 | `maze.c` | Graph algorithms | DFS generation, BFS solve |
 | `convex_hull.c` | Computational geom | Graham scan, Jarvis march |
 | `sort_vis.c` | Algorithms | bubble/insertion/selection/quick/heap |
+| `forest_fire.c` | Drossel-Schwabl CA | 3-state probabilistic update, neighbour spread + lightning, SOC power-law fire sizes |
+| `slime_mold.c` | Physarum agent model | Jeff Jones (2010) sense-rotate-move-deposit, trail diffusion + decay, emergent Steiner networks |
 
 ---
 

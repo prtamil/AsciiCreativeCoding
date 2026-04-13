@@ -31,6 +31,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 ### Fluid Dynamics
 | Program | Algorithm |
 |---------|-----------|
+| `lattice_gas` | FHP-I lattice gas — 6-direction bit-packed hex grid; 64-entry collision lookup (head-on 2-particle + symmetric 3-particle); streaming with bounce-back walls; momentum-colored display; 4 presets (cylinder/double-slit/channel/free), 5 themes |
 | `navier_stokes` | Jos Stam stable fluid — Gauss-Seidel diffusion, semi-Lagrangian advection, divergence-free projection |
 | `reaction_diffusion` | Gray-Scott model — 7 species presets (Mitosis, Coral, Stripes, Maze…) |
 | `lenia` | Continuous Game of Life — smooth kernel convolution, organic moving creatures |
@@ -52,6 +53,10 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `ising` | 2D Ising model — Metropolis MCMC spin flips, exp(−ΔE/kT) acceptance, phase transition at T_c |
 | `schrodinger` | 1D Schrödinger — Crank-Nicolson tridiagonal (Thomas algorithm), tunneling, 4 presets |
 | `blackhole` | Gargantua 3D (Interstellar) — exact Schwarzschild null geodesics via RK4, precomputed lensing table; photon ring from min-radius tracking, primary + secondary disk images, relativistic Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift; dynamic clip radius scales with cam_dist; 11 themes; `+/-` zoom |
+| `magnetic_field` | 2D dipole field lines — Biot-Savart superposition of magnetic monopoles, RK4 streamline tracing from N-pole seeds, 4 presets (Dipole/Quadrupole/Attract/Repel), incremental reveal animation, 5 themes |
+| `chain` | Hanging chain & swinging rope — Position-Based Dynamics (Verlet + iterative distance-constraint projection), tension-coloured links, 4 presets (Hanging/Pendulum/Bridge/Wave), trail ring-buffer, 5 themes |
+| `rigid_body` | 2D rigid body physics — circles + rectangles with full angular momentum; circle-circle (distance), circle-rect (closest-point), rect-rect (SAT 4-axis); impulse resolution `j=−(1+e)·vRel·n/denom`; Baumgarte positional correction; 4 presets (Drop/Billiard/Dominoes/Chaos), 5 themes |
+| `soft_body` | Jelly blob — 7×7 spring-mass mesh; structural + shear + bending springs (Hooke + velocity damping); Newtonian pressure from shoelace area vs target; scan-line fill rendering; symplectic Euler integration; 4 presets (Blob/Heavy/Bouncy/Two), 5 themes |
 
 ### Fractals & Chaos
 | Program | Algorithm |
@@ -103,6 +108,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `ant_colony` | Pheromone ACO — stigmergic path optimization |
 | `wator` | Wa-Tor predator-prey ecosystem |
 | `network_sim` | SIR epidemic + spring-force graph layout |
+| `slime_mold` | Physarum polycephalum — Jeff Jones (2010) agent model; 3-sensor sense→rotate→move→deposit loop; double-buffered trail diffusion + decay; emergent minimum Steiner tree networks connecting food sources; 4 presets, 5 themes |
 
 ### Geometry
 | Program | Algorithm |
@@ -120,6 +126,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | Program | Algorithm |
 |---------|-----------|
 | `epicycles` | DFT epicycles — sorted-by-amplitude arm chain, convergence animation |
+| `fourier_art` | User-drawn path → Fourier reconstruction — draw any shape with cursor keys, arc-length resample to 256 pts, O(N²) DFT, epicycle arm chain replay with auto-add convergence, 5 themes |
 | `cymatics` | Chladni figures — 2D standing wave nodal lines, 20 modes |
 | `plasma` | Demoscene: 4-component sin-sum, palette cycling |
 | `aurora` | Multi-octave sinusoidal curtains, deterministic star hash |
@@ -130,6 +137,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 ### Artistic / Biological
 | Program | Algorithm |
 |---------|-----------|
+| `galaxy` | Spiral galaxy — 3000 stars in circular orbits with flat rotation curve (ω = v₀/r); logarithmic spiral arm initialization; brightness accumulator grid with per-frame decay creates natural trails; normalised density → char (`.,:oO0@`); radial colour zones (core/disk/halo); 2–4 arms, 5 themes |
 | `jellyfish` | Physics pulse locomotion — IDLE sink → CONTRACT jet → GLIDE coast → EXPAND bloom; asymmetric bell (width × height axes); tentacle inertia lag |
 | `xrayswarm` | Multi-swarm radial pulse — DIVERGE → PAUSE → CONVERGE; workers park at screen edge, retrace exact origin path; 4-pass rendering prevents trail cancellation |
 | `gear` | Wireframe rotating gear — proximity-based edge detection, tangential surface-velocity sparks, speed-proportional emission, 10 color themes (fire/matrix/plasma/nova/poison/ocean/gold/neon/arctic/lava) |
@@ -143,6 +151,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `sort_vis` | 5 sort algorithms — animated bar chart, comparison+swap counters |
 | `maze` | DFS generation + BFS/A* animated solve |
 | `graph_search` | BFS/DFS/A* on grid — animated frontier expansion |
+| `forest_fire` | Drossel-Schwabl CA — 3-state (EMPTY/TREE/FIRE) probabilistic update; neighbour-spread + lightning ignition; ratio p/f controls cluster size and self-organised criticality; 4-way/8-way spread, 4 presets, 5 themes |
 
 ---
 

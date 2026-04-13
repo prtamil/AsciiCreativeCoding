@@ -8,10 +8,10 @@ Ideas ranked by learning value and visual payoff. Each builds on existing projec
 
 | # | Name | Folder | Concept | Key Technique |
 |---|---|---|---|---|
-| 1 | `galaxy.c` | artistic/ | Spiral galaxy — stars orbit a central mass with Newtonian gravity + bar arm pattern | Polar spiral parametric, N-body simplified, particle trail with lifetime fade |
+| 1 | ~~`galaxy.c`~~ | artistic/ | Spiral galaxy — stars orbit a central mass with Newtonian gravity + bar arm pattern | Polar spiral parametric, N-body simplified, particle trail with lifetime fade | **DONE** |
 | 2 | `sand_art.c` | artistic/ | Sand falling through a rotating hourglass — gravity CA + rotating obstacle | Falling sand CA + angle-driven gravity vector, collision geometry |
-| 3 | `fourier_art.c` | artistic/ | Real-time Fourier drawing — user traces a path, DFT computes epicycles that redraw it | DFT on sampled path, epicycle arm chain sorted by amplitude |
-| 4 | `magnetic_field.c` | physics/ | 2D magnetic field lines from configurable dipoles — streamline tracing | Vector field integration, Biot-Savart for discrete charges |
+| 3 | ~~`fourier_art.c`~~ | artistic/ | Real-time Fourier drawing — user traces a path, DFT computes epicycles that redraw it | DFT on sampled path, epicycle arm chain sorted by amplitude | **DONE** |
+| 4 | ~~`magnetic_field.c`~~ | physics/ | 2D magnetic field lines from configurable dipoles — streamline tracing | Vector field integration, Biot-Savart for discrete charges | **DONE** |
 | 5 | `wave_interference.c` | fluid/ | N point sources radiating in a tank — real-time amplitude sum with color map | FDTD or analytic sum, signed amplitude → color gradient |
 
 ---
@@ -21,10 +21,10 @@ Ideas ranked by learning value and visual payoff. Each builds on existing projec
 | # | Name | Folder | Concept | Key Technique |
 |---|---|---|---|---|
 | 6 | `bubble_chamber.c` | physics/ | Charged particles curving in a magnetic field — particle tracks with decay | Lorentz force (v × B), exponential trail fade, track curvature |
-| 7 | `chain.c` | physics/ | Hanging chain + swinging rope — verlet constraint solver | Position-based dynamics, distance constraints, iterative projection |
+| 7 | ~~`chain.c`~~ | physics/ | Hanging chain + swinging rope — verlet constraint solver | Position-based dynamics, distance constraints, iterative projection | **DONE** |
 | 8 | `fluid_sph.c` | fluid/ | Smoothed Particle Hydrodynamics — 2D particle fluid with pressure and viscosity | SPH density, pressure gradient, viscosity term, neighbour search |
-| 9 | `rigid_body.c` | physics/ | 2D rigid body with angular momentum — collisions + rotation | Moment of inertia, angular impulse, separating-axis collision test |
-| 10 | `soft_body.c` | physics/ | Jelly blob — spring lattice with surface tension | Spring-mass mesh, surface rendering, pressure term for volume conservation |
+| 9 | ~~`rigid_body.c`~~ | physics/ | 2D rigid body with angular momentum — collisions + rotation | Moment of inertia, angular impulse, separating-axis collision test | **DONE** |
+| 10 | ~~`soft_body.c`~~ | physics/ | Jelly blob — spring lattice with surface tension | Spring-mass mesh, surface rendering, pressure term for volume conservation | **DONE** |
 
 ---
 
@@ -44,10 +44,10 @@ Ideas ranked by learning value and visual payoff. Each builds on existing projec
 
 | # | Name | Folder | Concept | Key Technique |
 |---|---|---|---|---|
-| 16 | `slime_mold.c` | fluid/ | Physarum polycephalum — agent-based slime that creates optimal networks | Agent sensors (3-direction sample), deposit trail, diffuse + decay trail grid |
+| 16 | ~~`slime_mold.c`~~ | fluid/ | Physarum polycephalum — agent-based slime that creates optimal networks | Agent sensors (3-direction sample), deposit trail, diffuse + decay trail grid | **DONE** |
 | 17 | `vote_ca.c` | misc/ | Voter model / Schelling segregation — cells adopt neighbour majority state | Majority rule CA, threshold-based update, spatial opinion dynamics |
-| 18 | `forest_fire.c` | misc/ | Forest fire cellular automaton — tree growth + lightning ignition + fire spread | 3-state CA (empty/tree/fire), probabilistic growth and ignition rates |
-| 19 | `lattice_gas.c` | fluid/ | FHP lattice gas automaton — particle collisions on hexagonal lattice | 6-direction bit-coded state, collision lookup table, Frisch-Hasslacher-Pomeau rules |
+| 18 | ~~`forest_fire.c`~~ | misc/ | Forest fire cellular automaton — tree growth + lightning ignition + fire spread | 3-state CA (empty/tree/fire), probabilistic growth and ignition rates | **DONE** |
+| 19 | ~~`lattice_gas.c`~~ | fluid/ | FHP lattice gas automaton — particle collisions on hexagonal lattice | 6-direction bit-coded state, collision lookup table, Frisch-Hasslacher-Pomeau rules | **DONE** |
 | 20 | `excitable.c` | fluid/ | Greenberg-Hastings excitable medium — rotating spiral waves, 3 states | 3-state CA (resting/excited/refractory), spiral wave nucleation |
 
 ---

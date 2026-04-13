@@ -40,6 +40,8 @@ gcc -std=c11 -O2 -Wall -Wextra fluid/wave_2d.c                 -o wave_2d       
 gcc -std=c11 -O2 -Wall -Wextra fluid/reaction_wave.c           -o reaction_wave       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/navier_stokes.c           -o navier_stokes       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/lenia.c                   -o lenia               -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/slime_mold.c              -o slime_mold          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/lattice_gas.c             -o lattice_gas         -lncurses -lm
 
 # ── fractal / random growth ───────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/snowflake.c  -o snowflake  -lncurses -lm
@@ -65,6 +67,8 @@ gcc -std=c11 -O2 -Wall -Wextra physics/orbit_3body.c        -o orbit_3body      
 gcc -std=c11 -O2 -Wall -Wextra physics/ising.c              -o ising             -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/schrodinger.c        -o schrodinger       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/blackhole.c          -o blackhole         -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/magnetic_field.c     -o magnetic_field    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/chain.c              -o chain             -lncurses -lm
 
 # ── fractal / random growth (new) ────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/penrose.c           -o penrose           -lncurses -lm
@@ -91,6 +95,8 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/wator.c               -o wator          
 gcc -std=c11 -O2 -Wall -Wextra artistic/aurora.c              -o aurora              -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/plasma.c              -o plasma              -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/fourier_draw.c        -o fourier_draw  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/fourier_art.c         -o fourier_art   -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra misc/forest_fire.c             -o forest_fire   -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/ant_colony.c          -o ant_colony    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/graph_search.c        -o graph_search  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/network_sim.c         -o network_sim   -lncurses -lm
@@ -98,7 +104,10 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/hex_life.c            -o hex_life      -
 gcc -std=c11 -O2 -Wall -Wextra artistic/jellyfish.c           -o jellyfish     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/xrayswarm.c           -o xrayswarm     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/gear.c                -o gear          -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra artistic/railwaymap.c          -o railwaymap    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/railwaymap.c          -o railwaymap    -lncurses
+gcc -std=c11 -O2 -Wall -Wextra artistic/galaxy.c              -o galaxy        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/rigid_body.c           -o rigid_body    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/soft_body.c            -o soft_body     -lncurses -lm -lm
 
 # ── raytracing ───────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raytracing/sphere_raytrace.c   -o sphere_raytrace   -lncurses -lm

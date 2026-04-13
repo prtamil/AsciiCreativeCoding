@@ -1896,7 +1896,7 @@ Each entry lists the unique techniques used by that file. Techniques already doc
 
 ---
 
-### misc/bounce_ball.c
+### physics/bounce_ball.c
 *Reference implementation — the canonical animation skeleton every other file follows.*
 
 **7 spectral color pairs** — red(196), orange(208), yellow(226), green(46), cyan(51), blue(21), magenta(201). The canonical set reused across fireworks, constellation, brust, kaboom.
@@ -2170,7 +2170,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### misc/bonsai.c
+### artistic/bonsai.c
 *Growing bonsai tree with recursive branch growth, transparent background, ACS borders.*
 
 **`use_default_colors()` + `-1` background** (→ V1.3, V3.4) — branches float over the terminal's native background.
@@ -2394,7 +2394,7 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
-### artistic/string_art.c
+### geometry/string_art.c
 *Mathematical string art: N nails on a circle, threads connect i → round(i·k) mod N.*
 
 **k-multiplier thread art** — Multiplier `k` drifts continuously. At integer k values cardioid (k=2), nephroid (k=3), deltoid (k=4), astroid (k=5) emerge. Speed modulates near integers (`mult = 0.15 + 1.70·(dist²·4)`) so named shapes hold long enough to read.
@@ -2494,7 +2494,7 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
-### artistic/lissajous.c
+### geometry/lissajous.c
 *Harmonograph: two damped oscillators, phase drifts, morphing Lissajous figures.*
 
 **Age-based rendering** — iterates `i = N_CURVE_PTS-1 → 0` (oldest inner first, newest outer last). `age = i/(N-1)`: 0=newest → level 0 (brightest `#`, `A_BOLD`), 1=oldest → level 3 (dimmest `.`). Newest overwrites shared cells so the bright outer ring always wins.

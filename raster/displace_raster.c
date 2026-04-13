@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * displace_raster.c  —  ncurses software rasterizer, vertex displacement demo
  *

@@ -1,4 +1,4 @@
-# Pass 1 — artistic/string_art.c: Mathematical String Art
+# Pass 1 — geometry/string_art.c: Mathematical String Art
 
 ## Core Idea
 

@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * wave_2d.c — 2-D Wave Equation / Huygens Interference
  *

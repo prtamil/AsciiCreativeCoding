@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * graph_search.c — Animated BFS / DFS / A* Pathfinding
  *

@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * gyroscope.c — Spinning Top / Euler Equations
  *

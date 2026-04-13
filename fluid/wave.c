@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * wave.c  —  2-D wave equation interference patterns
  *

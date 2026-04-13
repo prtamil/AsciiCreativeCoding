@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * epicycles.c — Fourier epicycles: DFT of a parametric path → animated
  *               rotating arm chain whose tip traces the original shape.

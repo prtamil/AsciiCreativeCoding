@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * cymatics.c — Chladni Figures (2-D Standing-Wave Nodal Patterns)
  *

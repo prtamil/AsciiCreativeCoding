@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * fern.c  —  Barnsley Fern IFS fractal, animated point-by-point
  *

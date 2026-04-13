@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * cube.c  —  ncurses raymarched ASCII spinning cube
  *

@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * bounce.c  —  ncurses bouncing balls, smooth terminal-aware motion
  *

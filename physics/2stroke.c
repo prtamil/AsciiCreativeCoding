@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * 2stroke.c  —  2-stroke engine cross-section animation
  *

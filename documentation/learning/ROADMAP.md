@@ -48,7 +48,6 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `sun_rain.c` | Matrix rain sun | circular clip mask, radial solar wind streams, parametric border ring with rotating wave |
 | `railwaymap.c` | Procedural transit map | H/V/Z line templates on 6×4 logical grid, canvas ACS junction detection, interchange nodes |
 | `fireworks_rain.c` | Fireworks + matrix arc trails | position-history trail, oldest-first draw, split ROCKET_DRAG/GRAVITY, per-particle gravity variance, 5-theme color pair remapping |
-| `blackhole.c` | Gargantua 3D (Interstellar) | Schwarzschild null geodesics (RK4), precomputed lensing table, min-radius photon ring, equatorial-plane sign-change disk detection (primary + secondary images), relativistic Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift, dynamic FOV clip, 11 colour themes |
 
 ---
 
@@ -124,6 +123,7 @@ Requires linear algebra and graphics pipeline understanding.
 | `cube_raytrace.c` | Analytic ray tracing | AABB slab method, inverse-rotation transform, face normals, wireframe |
 | `torus_raytrace.c` | Analytic ray tracing | quartic via sampling+bisection, gradient normal, Horner evaluation |
 | `capsule_raytrace.c` | Analytic ray tracing | cylinder+sphere-cap decomposition, axial projection normal, inverse-rotation transform |
+| `blackhole.c` | GR null-geodesic raytracer | Schwarzschild metric (RK4), precomputed lensing table, photon ring, Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift, 11 themes |
 
 ---
 

@@ -35,6 +35,8 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `reaction_diffusion` | Gray-Scott model — 7 species presets (Mitosis, Coral, Stripes, Maze…) |
 | `lenia` | Continuous Game of Life — smooth kernel convolution, organic moving creatures |
 | `wave` | FDTD 2D wave PDE — CFL-stable, 5 interference sources, 4 color themes |
+| `wave_2d` | 2D scalar wave PDE — Huygens interference, multiple point sources, signed amplitude colour map |
+| `reaction_wave` | FitzHugh-Nagumo excitable medium — activator/inhibitor PDE, spiral waves, 4 color themes |
 | `flowfield` | Perlin fBm vector field — bilinear sampling, 8-direction particle trails |
 
 ### Physics
@@ -47,7 +49,9 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `orbit_3body` | Figure-8 stable orbit → chaos on perturbation |
 | `pendulum_wave` | 15 harmonic pendulums — analytic ω_n, re-sync at T=60s |
 | `elastic_collision` | Hard-sphere billiards — Maxwell-Boltzmann distribution emerges |
-| `schrodinger` | 1D Schrödinger — Crank-Nicolson tridiagonal (Thomas algorithm), tunneling |
+| `ising` | 2D Ising model — Metropolis MCMC spin flips, exp(−ΔE/kT) acceptance, phase transition at T_c |
+| `schrodinger` | 1D Schrödinger — Crank-Nicolson tridiagonal (Thomas algorithm), tunneling, 4 presets |
+| `blackhole` | Gargantua 3D (Interstellar) — exact Schwarzschild null geodesics via RK4, precomputed lensing table; photon ring from min-radius tracking, primary + secondary disk images, relativistic Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift; dynamic clip radius scales with cam_dist; 11 themes; `+/-` zoom |
 
 ### Fractals & Chaos
 | Program | Algorithm |
@@ -97,28 +101,31 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `flocking` | Reynolds boids — 5 modes (classic/leader/Vicsek/orbit/predator-prey) |
 | `shepherd` | User-controlled herding — flee force, panic zone, flee-radius ring |
 | `ant_colony` | Pheromone ACO — stigmergic path optimization |
-| `voronoi` | Brute-force nearest-neighbor, Langevin seed motion, d2−d1 edge detection |
 | `wator` | Wa-Tor predator-prey ecosystem |
 | `network_sim` | SIR epidemic + spring-force graph layout |
 
-### Statistical Mechanics & Quantum
+### Geometry
 | Program | Algorithm |
 |---------|-----------|
-| `ising` | Metropolis MCMC — precomputed acceptance table, phase transition at T_c |
-| `schrodinger` | Crank-Nicolson — unitary evolution, Gaussian wave packet, quantum tunneling |
+| `rect_grid` | Rectangular character grid — per-cell random rate, dual sinusoidal colour waves, 6 themes |
+| `polar_grid` | Polar character grid — concentric rings, alternating rotation, colour by ring, 6 themes |
+| `hex_grid` | Hexagonal character grid — offset-row tiling, cube-coordinate ring distance for colour bands |
+| `lissajous` | Harmonograph/Lissajous — two damped perpendicular oscillators, phase drift |
+| `spirograph` | Hypotrochoid parametric curves — 3 simultaneous with parameter drift |
+| `string_art` | Modular arithmetic i→⌊i×k⌋ mod N, morphing cardioid/nephroid/astroid |
+| `voronoi` | Brute-force nearest-neighbor, Langevin seed motion, d2−d1 edge detection |
+| `convex_hull` | Graham scan + Jarvis march — simultaneous race |
 
 ### Mathematical Art
 | Program | Algorithm |
 |---------|-----------|
 | `epicycles` | DFT epicycles — sorted-by-amplitude arm chain, convergence animation |
-| `spirograph` | Hypotrochoid parametric curves — 3 simultaneous with parameter drift |
-| `lissajous` | Phase-locked sin/cos figures |
-| `string_art` | Modular arithmetic i→⌊i×k⌋ mod N, morphing cardioid/nephroid/astroid |
 | `cymatics` | Chladni figures — 2D standing wave nodal lines, 20 modes |
 | `plasma` | Demoscene: 4-component sin-sum, palette cycling |
 | `aurora` | Multi-octave sinusoidal curtains, deterministic star hash |
 | `penrose` | de Bruijn pentagrid duality — aperiodic tiling, slow rotation |
 | `terrain` | Diamond-square heightmap — thermal erosion, 7 contour levels |
+| `perlin_landscape` | Perlin fBm — 3 parallax terrain layers, 5-octave noise, painter's algorithm |
 
 ### Artistic / Biological
 | Program | Algorithm |
@@ -128,14 +135,12 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `gear` | Wireframe rotating gear — proximity-based edge detection, tangential surface-velocity sparks, speed-proportional emission, 10 color themes (fire/matrix/plasma/nova/poison/ocean/gold/neon/arctic/lava) |
 | `railwaymap` | Procedural transit map — H/V/Z grid-aligned line templates, canvas-based ACS junction detection, station interchange, 10 themes |
 | `fireworks_rain` | Fireworks with matrix-rain arc trails — each of 72 sparks per explosion grows a 16-slot position-history trail; chars shimmer 75 % per tick; 5 themes (vivid/matrix/fire/ice/plasma) remap all spark color pairs; `t` cycles theme |
-| `blackhole` | Gargantua 3D (Interstellar) — exact Schwarzschild null geodesics via RK4, precomputed lensing table; photon ring from min-radius tracking, primary + secondary disk images, relativistic Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift; dynamic clip radius scales with cam_dist; 11 themes (interstellar/matrix/nova/ocean/poison/fire/plasma/gold/arctic/lava/mono); `+/-` zoom |
 
 ### Algorithms
 | Program | Algorithm |
 |---------|-----------|
 | `sort_vis` | 5 sort algorithms — animated bar chart, comparison+swap counters |
 | `maze` | DFS generation + BFS/A* animated solve |
-| `convex_hull` | Graham scan + Jarvis march — simultaneous race |
 | `graph_search` | BFS/DFS/A* on grid — animated frontier expansion |
 
 ---
@@ -170,7 +175,7 @@ gcc -std=c11 -O2 -Wall -Wextra fluid/navier_stokes.c      -o navier_stokes  -lnc
 gcc -std=c11 -O2 -Wall -Wextra physics/lorenz.c            -o lorenz         -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/mandelbrot.c -o mandelbrot     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c     -o raymarcher     -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra misc/schrodinger.c          -o schrodinger    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/schrodinger.c       -o schrodinger    -lncurses -lm
 ```
 
 See `Claude.md` for the complete build list.
@@ -196,16 +201,17 @@ See `Claude.md` for the complete build list.
 ```
 .
 ├── artistic/          — parametric art, CA, L-systems, visual math
-├── fluid/             — Navier-Stokes, Gray-Scott, wave PDE, Lenia
+├── fluid/             — Navier-Stokes, Gray-Scott, wave PDE, FitzHugh-Nagumo, Lenia
 ├── flocking/          — Reynolds boids, shepherd herding
-├── fractal_random/    — Mandelbrot, Julia, Newton, Apollonian, terrain
+├── fractal_random/    — Mandelbrot, Julia, Newton, Apollonian, terrain, Perlin landscape
+├── geometry/          — parametric curves, grids, computational geometry (lissajous, voronoi, convex hull…)
 ├── matrix_rain/       — Matrix rain
-├── misc/              — Schrödinger, Ising, sorting, maze, Perlin
+├── misc/              — sorting, maze, CA music
 ├── particle_systems/  — fire, fireworks, explosions
-├── physics/           — Lorenz, N-body, cloth, pendulums
+├── physics/           — Lorenz, N-body, cloth, pendulums, Ising, Schrödinger, Schwarzschild black hole
 ├── raster/            — software rasterizer (torus, cube, sphere)
 ├── raymarcher/        — SDF ray marching
-├── raytracing/        — analytic ray tracing (sphere, cube, torus)
+├── raytracing/        — analytic ray tracing (sphere, cube, torus, capsule)
 ├── ncurses_basics/    — framework reference implementations
 └── documentation/
     ├── Claude.md          — complete build reference

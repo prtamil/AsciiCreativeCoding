@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * reaction_diffusion.c  —  Gray-Scott reaction-diffusion Turing patterns
  *

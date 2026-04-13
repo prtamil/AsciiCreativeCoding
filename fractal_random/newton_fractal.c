@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * newton_fractal.c — Newton's Method Fractal  (z⁴ − 1 = 0)
  *

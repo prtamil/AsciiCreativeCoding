@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * cellular_automata_1d.c — Wolfram 1-D Elementary Cellular Automaton
  *

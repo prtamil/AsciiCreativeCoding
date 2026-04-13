@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * julia.c  —  Julia set fractal, animated random-pixel fill
  *

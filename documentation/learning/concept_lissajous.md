@@ -1,4 +1,4 @@
-# Pass 1 — artistic/lissajous.c: Harmonograph / Lissajous Figures
+# Pass 1 — geometry/lissajous.c: Harmonograph / Lissajous Figures
 
 ## Core Idea
 

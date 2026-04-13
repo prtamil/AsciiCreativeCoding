@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * orbit_3body.c — Three-Body Gravitational Orbits
  *

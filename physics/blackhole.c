@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * blackhole.c — Gargantua: 3D Schwarzschild null-geodesic ray tracer
  *

@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * automaton_2d.c — Larger-than-Life / Extended 2-D Cellular Automaton
  *

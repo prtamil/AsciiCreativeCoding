@@ -62,7 +62,7 @@ Reference implementation: `basics/bounce_ball.c`
     - [Lorenz Strange Attractor — lorenz.c](#lorenz-strange-attractor--lorenzc)
     - [N-Body Gravity — nbody.c](#n-body-gravity--nbodyc)
     - [Spring-Mass Cloth — cloth.c](#spring-mass-cloth--clothc)
-38. [Artistic Effects — artistic/](#38-artistic-effects--artistic)
+38. [Artistic Effects — artistic/ & geometry/](#38-artistic-effects--artistic)
     - [Aurora Borealis — aurora.c](#aurora-borealis--aurorac)
     - [Animated Voronoi — voronoi.c](#animated-voronoi--voronoic)
     - [Spirograph — spirograph.c](#spirograph--spirographc)
@@ -1667,7 +1667,7 @@ Each new tree uses fresh random parameters for trunk height (45–65% of screen)
 
 ---
 
-## 28. String Art — artistic/string_art.c
+## 28. String Art — geometry/string_art.c
 
 `string_art.c` recreates the mathematical string art technique: N nails on a circle, connected by threads using a multiplier rule.
 
@@ -1899,7 +1899,7 @@ float smin(float a, float b, float k) {
 
 ---
 
-## 36. Harmonograph / Lissajous — artistic/lissajous.c
+## 36. Harmonograph / Lissajous — geometry/lissajous.c
 
 `lissajous.c` draws an exponentially decaying dual-oscillator parametric curve (harmonograph) that morphs through figure-8s, trefoils, stars, and spirals as phase drifts.
 
@@ -2015,7 +2015,7 @@ x[i]  += vx[i]*dt; y[i] += vy[i]*dt;
 
 ---
 
-## 38. Artistic Effects — artistic/
+## 38. Artistic Effects — artistic/ & geometry/
 
 ### Aurora Borealis — aurora.c
 
@@ -2061,7 +2061,7 @@ vx += (-DAMP*vx + NOISE*randf()) * dt
 
 **Color:** Each seed has a fixed color pair (cycling through 6 pairs mod 6). Interior cells use the seed's color. Boundary cells use the average or seed color at A_DIM.
 
-*Files: `artistic/voronoi.c`*
+*Files: `geometry/voronoi.c`*
 
 ---
 
@@ -2082,7 +2082,7 @@ y = (R−r)·sin(t) − d·sin((R−r)/r · t)
 
 **Three curves:** different `(R,r,d)` triples with phase offsets; cyan, magenta, yellow color pairs. Advancing `t` by `DELTA_T=0.08` per tick, `TRACE_STEPS=60` points traced per curve per tick for dense fill.
 
-*Files: `artistic/spirograph.c`*
+*Files: `geometry/spirograph.c`*
 
 ---
 
@@ -2182,4 +2182,4 @@ Material flows downhill when slope exceeds the `TALUS` angle. Mountains slowly c
 
 ---
 
-*This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `misc/bounce_ball.c`.*
+*This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `physics/bounce_ball.c`.*

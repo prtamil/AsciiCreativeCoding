@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * bat.c  —  groups of ASCII bats erupting from the screen centre into the dark
  *

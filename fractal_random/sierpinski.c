@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * sierpinski.c  —  Sierpinski triangle via the chaos game (IFS)
  *

@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * network_sim.c — SIR epidemic on a Watts-Strogatz small-world network
  *

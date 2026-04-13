@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /* leaf_fall.c — ASCII tree with matrix-rain leaf fall
  *
  * States: DISPLAY (2.5 s static tree) → FALLING (matrix-rain leaf drop)

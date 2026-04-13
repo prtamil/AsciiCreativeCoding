@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * snowflake.c  —  DLA fractal crystal with D6 (6-fold) symmetry
  *

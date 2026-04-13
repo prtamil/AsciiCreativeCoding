@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * railwaymap.c — complex transit-map network  (10–15 interconnected lines)
  *

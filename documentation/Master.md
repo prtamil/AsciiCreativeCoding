@@ -1144,7 +1144,7 @@ Two-octave sinusoidal curtains with a vertical sine envelope render the northern
 
 `spirograph.c` traces `x=(R−r)·cos(t)+d·cos((R−r)/r·t)`, `y=(R−r)·sin(t)−d·sin((R−r)/r·t)` onto a float canvas that decays by `FADE=0.985` per tick. No ring buffer needed — the canvas itself is the trail. Parameter drift slowly changes the petal count.
 
-*Files: `artistic/spirograph.c`*
+*Files: `geometry/spirograph.c`*
 
 ---
 
@@ -1152,7 +1152,7 @@ Two-octave sinusoidal curtains with a vertical sine envelope render the northern
 
 `voronoi.c` moves seeds via `v += (−DAMP·v + NOISE·ξ)·dt` (Langevin dynamics). Per-cell nearest-seed search tracks d1 and d2; `d2−d1 < BORDER_PX` identifies Voronoi edges without Fortune's algorithm.
 
-*Files: `artistic/voronoi.c`*
+*Files: `geometry/voronoi.c`*
 
 ---
 
@@ -1184,7 +1184,7 @@ Two-octave sinusoidal curtains with a vertical sine envelope render the northern
 
 ---
 
-### P15 — Harmonograph / Lissajous (`artistic/lissajous.c`)
+### P15 — Harmonograph / Lissajous (`geometry/lissajous.c`)
 
 `lissajous.c` draws two perpendicular damped oscillators whose phase drifts slowly, morphing the parametric figure through figure-8s, trefoils, stars, and spirals.
 
@@ -1198,9 +1198,9 @@ Two-octave sinusoidal curtains with a vertical sine envelope render the northern
 
 **Keys:** `space` pause, `n`/`p` next/prev ratio, `+`/`-` drift speed, `c` theme, `q` quit.
 
-**Build:** `gcc -std=c11 -O2 -Wall -Wextra artistic/lissajous.c -o lissajous -lncurses -lm`
+**Build:** `gcc -std=c11 -O2 -Wall -Wextra geometry/lissajous.c -o lissajous -lncurses -lm`
 
-*Files: `artistic/lissajous.c`*
+*Files: `geometry/lissajous.c`*
 
 ---
 

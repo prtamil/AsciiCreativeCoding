@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * sphere.c  —  ncurses raymarched ASCII sphere
  *

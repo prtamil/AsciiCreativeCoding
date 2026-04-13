@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * fireworks_rain.c  —  ncurses fireworks with matrix-rain arc trails
  *

@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * langton.c — Langton's Ant and Multi-Colour Turmites
  *

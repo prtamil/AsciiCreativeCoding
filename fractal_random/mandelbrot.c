@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
  * mandelbrot.c  —  Mandelbrot set fractal, animated random-pixel fill
  *

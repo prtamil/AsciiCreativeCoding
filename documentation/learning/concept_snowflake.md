@@ -59,8 +59,11 @@ DLA normally grows asymmetrically — random chance determines which direction e
 ### Why pixel-space coordinates for walkers?
 The terminal has non-square cells (CELL_H=16, CELL_W=8 — roughly 2:1 aspect). A walker moving in cell-space at 45° would travel a diagonal that looks far steeper than 45° visually. Physics in pixel space with `CELL_W=8, CELL_H=16` makes the Euclidean distances isotropic: a diagonal walker really does travel 45° visually.
 
-### STICK_PROB = 0.90 — why not 1.0?
-At 100% sticking probability, DLA produces very sparse, thin fractal arms with no branching — every walker that even touches the aggregate immediately freezes, and no walkers ever reach inner regions. At 0.90, 10% of contacts are rejected, so walkers sometimes slide along surfaces and reach deeper positions, producing slightly denser and more branched crystal structure.
+### STICK_PROB = 0.55 — why not 1.0?
+At 100% sticking probability, DLA produces very sparse, thin fractal arms with no branching — every walker that even touches the aggregate immediately freezes, and no walkers ever reach inner regions. At 0.55, nearly half of all contacts are rejected, so walkers slide along arm surfaces and penetrate deeper before freezing. This produces significantly thicker, denser arms with rounded edges — closer to the appearance of a real ice crystal than the sparse fractal produced by high stick probability.
+
+### Glow halo — two-pass draw
+The crystal arms are 1 cell wide structurally, but visually appear thin on a terminal. A two-pass draw solves this: Pass 1 paints a dim `:` on every empty 8-neighbor of every frozen cell (using the frozen cell's own color band), creating a soft halo. Pass 2 draws the frozen cells themselves on top. The result makes each arm appear ~3 cells wide visually without changing the DLA aggregate at all — purely a rendering trick.
 
 ### Distance-based color gradient
 Color is assigned once at freeze time using Euclidean distance from center. Deep navy (xterm 117) at the core transitions through ocean blue (38), teal (44), pale ice (195), and bright white (231) at the tips. This means old frozen cells (near center) are always dark and recently frozen cells (tips) are always bright — the gradient reads naturally as depth.
@@ -82,8 +85,8 @@ There is no DONE hold state; on auto-fill the scene resets immediately.
 
 | Constant | Default | Effect if changed |
 |---|---|---|
-| `STICK_PROB` | 0.90 | Lower = denser, more branched arms; higher = sparser, spikier |
-| `WALKER_DEFAULT` | 60 | More = faster growth; fewer needed than basic DLA due to 12-way freeze |
+| `STICK_PROB` | 0.55 | Lower = denser, thicker arms (walkers bounce more); higher = sparser, spikier fractal |
+| `WALKER_DEFAULT` | 80 | More = faster growth; fewer needed than basic DLA due to 12-way freeze |
 | `WALKER_MAX` | 200 | Upper bound for `+` key |
 | `N_ICE_COLORS` | 6 | Number of distance color bands |
 | `SIM_FPS_DEFAULT` | 30 | Ticks per second; lower = slower visible growth |

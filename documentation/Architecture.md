@@ -47,6 +47,7 @@ Reference implementation: `basics/bounce_ball.c`
     - [brust.c — Staggered Burst Waves](#brustc--staggered-burst-waves)
     - [kaboom.c — Deterministic LCG Explosions](#kaboomc--deterministic-lcg-explosions)
 20. [Matrix Rain — matrix_rain.c](#20-matrix-rain--matrix_rainc)
+20b. [Matrix Snowflake — matrix_snowflake.c](#20b-matrix-snowflake--matrix_snowflakec)
 21. [Documentation Files Reference](#21-documentation-files-reference)
 22. [Fractal / Random Growth — fractal_random/](#22-fractal--random-growth--fractal_random)
     - [DLA — snowflake.c and coral.c](#dla--snowflakec-and-coralc)
@@ -1300,6 +1301,68 @@ The 6-level `Shade` enum maps directly to a `shade_attr()` function that returns
 | HEAD | `A_BOLD` | Sharpest character, leading edge |
 
 The same pair number can produce three brightness tiers (dim / base / bold) — tripling the apparent gradient resolution with no extra color pairs.
+
+---
+
+## 20b. Matrix Snowflake — matrix_snowflake.c
+
+Two independent real-time simulations rendered on one screen, each drawn in its own layer.
+
+### Two-Layer Architecture
+
+```
+Layer 1 (background): Matrix rain
+  — g_streams[COLS_MAX]: one RainStream per column (head float, trail, speed)
+  — g_rain_ch[ROWS_MAX][COLS_MAX]: persistent char buffer, randomised near heads
+  — rain_draw() skips cells where crystal.cells[r][c] != 0
+
+Layer 2 (foreground): DLA crystal
+  — Crystal.cells[ROWS_MAX][COLS_MAX]: 0=empty, n=color-pair-ID
+  — xtal_draw() two-pass: glow halo (Pass 1), frozen cells (Pass 2)
+  — crystal always drawn after rain so it is always on top (last-write-wins)
+```
+
+### Proximity-Spawn DLA Optimisation
+
+Classic DLA spawns walkers at screen edges. On a 200-column terminal, expected random-walk distance from edge to center ≈ O((cols/2)²) steps. At 60 walkers × 30fps this could take minutes before growth starts.
+
+Fix: spawn walkers on a circle at radius `max_frozen_dist + 8` around the crystal center. Walker only needs to travel ~8 cells to reach the crystal, regardless of terminal size.
+
+```c
+float angle = rand_float * 2 * PI;
+int nc = cx0 + roundf(cosf(angle) * spawn_r);
+int nr = cy0 + roundf(sinf(angle) * spawn_r / ASPECT_R);
+```
+
+ASPECT_R divides the row component so the spawn ring is circular in Euclidean space (not elliptical in terminal space).
+
+### Crystal Lifecycle State Machine
+
+```
+STATE_GROW: rain_tick + walkers_tick each frame
+    │
+    │  max_frozen_dist >= trigger_dist (88% of max_dist)
+    ▼
+STATE_FLASH: all frozen cells → bold white '*', 28 frames
+    │
+    │  flash_tick == 0
+    ▼
+scene_reset(): xtal_init + walkers_init   (rain never resets)
+    │
+    └──────────────────────────────► STATE_GROW
+```
+
+### Rain Char Buffer
+
+`g_rain_ch[ROWS_MAX][COLS_MAX]` stores the current character at every terminal cell. Updated each tick:
+- Near stream head (depth 0–2): 67% chance of new random char per cell → fast head flicker
+- Ambient: 4% of all cells randomised → background shimmer in idle regions
+
+This decouples char update rate from stream position and avoids re-computing chars at draw time.
+
+### D6 Symmetry
+
+Identical to snowflake.c — see section 22. The same `CA6[]`/`SA6[]` tables and `xtal_freeze_symmetric()` function are used. 12 positions frozen per walker stick event (6 rotations × 2 reflections) with ASPECT_R=2.0 coordinate correction.
 
 ---
 

@@ -135,6 +135,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `gear` | Wireframe rotating gear — proximity-based edge detection, tangential surface-velocity sparks, speed-proportional emission, 10 color themes (fire/matrix/plasma/nova/poison/ocean/gold/neon/arctic/lava) |
 | `railwaymap` | Procedural transit map — H/V/Z grid-aligned line templates, canvas-based ACS junction detection, station interchange, 10 themes |
 | `fireworks_rain` | Fireworks with matrix-rain arc trails — each of 72 sparks per explosion grows a 16-slot position-history trail; chars shimmer 75 % per tick; 5 themes (vivid/matrix/fire/ice/plasma) remap all spark color pairs; `t` cycles theme |
+| `matrix_snowflake` | Matrix rain + live DLA snowflake — two real simulations on one screen: classic digital rain in the background; a D6-symmetric DLA ice crystal grows from the center in the foreground, freezing 12 symmetric positions per walker stick event; crystal flashes white on completion then resets; 5 themes (Classic/Inferno/Nebula/Toxic/Gold) |
 
 ### Algorithms
 | Program | Algorithm |
@@ -205,7 +206,7 @@ See `Claude.md` for the complete build list.
 ├── flocking/          — Reynolds boids, shepherd herding
 ├── fractal_random/    — Mandelbrot, Julia, Newton, Apollonian, terrain, Perlin landscape
 ├── geometry/          — parametric curves, grids, computational geometry (lissajous, voronoi, convex hull…)
-├── matrix_rain/       — Matrix rain
+├── matrix_rain/       — Matrix rain variants (classic rain, DLA snowflake hybrid)
 ├── misc/              — sorting, maze, CA music
 ├── particle_systems/  — fire, fireworks, explosions
 ├── physics/           — Lorenz, N-body, cloth, pendulums, Ising, Schrödinger, Schwarzschild black hole

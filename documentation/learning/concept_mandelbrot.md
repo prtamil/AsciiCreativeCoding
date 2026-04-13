@@ -95,6 +95,25 @@ COMPUTING → HOLDING → (next preset, reset)
 | `N_PRESETS` | 6 | Six zoom windows |
 | `N_COLORS` | 5 | Color bands (not counting "inside") |
 
+## Themes (t key)
+
+10 themes cycle with `t`/`T`. Each theme remaps 5 content color pairs (COL_INSIDE, COL_C2..C5) and 1 HUD pair using `theme_apply(int t)`. Themes are chosen to highlight different aspects of the set — cold themes read the boundary as geological, warm themes read it as thermal, dark themes emphasize depth:
+
+| Theme | Character | Inside color | Outer ring |
+|---|---|---|---|
+| Electric | High-contrast neon | Purple | Yellow/cyan |
+| Matrix | Green gradient | Dark green | Bright green |
+| Nova | Blue-white cold | Dark blue | White |
+| Poison | Green-yellow toxic | Olive | Lime |
+| Ocean | Blue-cyan deep | Navy | Cyan |
+| Fire | Red-orange thermal | Dark red | Yellow |
+| Gold | Yellow-orange warm | Brown | White |
+| Ice | Cyan-white cold | Steel | White |
+| Nebula | Purple-magenta | Dark purple | Cyan |
+| Lava | Red-orange volcanic | Dark red | Orange |
+
+The Theme struct holds `c[5]` (256-color) and `c8[5]` (8-color fallback) for the 5 content pairs, plus `hud` and `hud8` for the status bar. `theme_apply()` calls `init_pair()` for all 6 pairs and takes effect on the next rendered frame.
+
 ## Open Questions for Pass 3
 
 - Is the cardioid/bulb optimization implemented in mandelbrot.c? (It is used in buddhabrot.c.)

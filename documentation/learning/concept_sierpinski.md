@@ -88,6 +88,25 @@ DRAWING ──── iters_done >= TOTAL_ITERS ────► HOLDING (done_tic
 | `TOTAL_ITERS` | 50000 | More = denser/finer detail; fewer = sparser |
 | `DONE_PAUSE_TICKS` | 90 | ~3 s at 30fps; hold time before reset |
 
+## Themes (t key)
+
+10 themes cycle with `t`/`T`. Each theme assigns distinct colors to the 3 vertices (V1, V2, V3) plus HUD, chosen so the three sub-triangles are always visually distinct:
+
+| Theme | V1 | V2 | V3 | Character |
+|---|---|---|---|---|
+| Electric | 87 (cyan) | 226 (yellow) | 207 (magenta) | High contrast neon |
+| Matrix | 46 (bright green) | 118 (lime) | 231 (white) | Monochrome green |
+| Nova | 51 (cyan) | 39 (sky blue) | 231 (white) | Cold blue tones |
+| Poison | 82 (lime) | 190 (yellow-green) | 154 (medium green) | Toxic green |
+| Ocean | 45 (bright cyan) | 33 (blue) | 38 (teal) | Deep water |
+| Fire | 196 (red) | 208 (orange) | 226 (yellow) | Flame gradient |
+| Gold | 214 (orange) | 220 (gold) | 231 (white) | Metallic warm |
+| Ice | 159 (light cyan) | 123 (light blue) | 231 (white) | Frost |
+| Nebula | 93 (purple) | 201 (magenta) | 87 (cyan) | Space |
+| Lava | 196 (red) | 214 (orange) | 208 (dark orange) | Volcanic |
+
+The HUD color matches V1 to keep the status bar in the same palette family.
+
 ## Open Questions for Pass 3
 
 - Does the code warm up by initializing x,y to one of the vertices, or does it run a fixed number of discarded iterations first?

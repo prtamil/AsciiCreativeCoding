@@ -48,6 +48,7 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `sun_rain.c` | Matrix rain sun | circular clip mask, radial solar wind streams, parametric border ring with rotating wave |
 | `railwaymap.c` | Procedural transit map | H/V/Z line templates on 6×4 logical grid, canvas ACS junction detection, interchange nodes |
 | `fireworks_rain.c` | Fireworks + matrix arc trails | position-history trail, oldest-first draw, split ROCKET_DRAG/GRAVITY, per-particle gravity variance, 5-theme color pair remapping |
+| `matrix_snowflake.c` | Matrix rain + live DLA crystal | two-simulation layering (rain background / DLA foreground), D6 symmetry with aspect correction, proximity-spawn DLA optimisation, flash/reset lifecycle, 5 themes |
 
 ---
 

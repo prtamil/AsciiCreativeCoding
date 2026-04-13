@@ -90,3 +90,18 @@ The toppling rule is symmetric: each topple distributes to all 4 cardinal neighb
 | QMAX | Avalanche queue capacity (MAX_ROWS × MAX_COLS + 1) |
 | GRAIN_CH[4] | Characters for grain counts 0–3 |
 | TICK_NS | Frame duration (~30 fps) |
+
+## View Modes (s / S key)
+
+Three display modes cycle with the `s`/`S` key:
+
+- **SPLIT** (default): top 60% shows the top-down grid view, a separator line, bottom 40% shows the side profile histogram
+- **TOP**: full screen top-down grid — fractal pattern in full resolution
+- **SIDE**: full screen side histogram — see the grain distribution across all columns
+
+### Side View — Fixed-Scale Histogram
+Each bar in the side view represents the total grain count summed down all rows of that column. The bar height is `col_sum * view_height / max_possible` where `max_possible = g_ca_rows * 3` (fixed scale — maximum possible sum if every cell holds 3 grains). This fixed scale is critical: if the scale were dynamic (normalised to the current max column sum), the bars would look the same shape even as the pile grows. With the fixed scale, bars visually grow from zero as grains accumulate, giving genuine feedback on pile growth.
+
+## Themes (t key)
+
+10 vivid themes, each with 4 content color pairs (G1, G2, G3, TOPPLE) plus HUD. All colors are chosen from bright regions of the xterm-256 palette — no dark or muted tones. Themes: Electric (39/51/226/201), Matrix (28/46/118/82), Nova (21/39/117/231), Poison (100/148/190/82), Ocean (24/38/45/159), Fire (196/208/226/231), Gold (136/178/220/231), Ice (30/45/159/231), Nebula (93/141/183/231), Lava (124/196/214/226).

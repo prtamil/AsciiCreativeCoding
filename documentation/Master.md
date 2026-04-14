@@ -88,6 +88,11 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [I2 Sphere Marching Loop](#i2-sphere-marching-loop)
 - [I3 SDF Normal via Finite Difference](#i3-sdf-normal-via-finite-difference)
 - [I4 SDF Primitives — Sphere, Box, Torus](#i4-sdf-primitives--sphere-box-torus)
+- [I5 Mandelbulb Distance Estimator](#i5-mandelbulb-distance-estimator)
+- [I6 Smooth Escape-time Coloring](#i6-smooth-escape-time-coloring)
+- [I7 Orbit Trap Coloring](#i7-orbit-trap-coloring)
+- [I8 Near-miss Glow via min_d Tracking](#i8-near-miss-glow-via-min_d-tracking)
+- [I9 Progressive ROWS_PER_TICK Rendering](#i9-progressive-rows_per_tick-rendering)
 
 ### J — Software Rasterization
 - [J1 Mesh — Vertex & Triangle Arrays](#j1-mesh--vertex--triangle-arrays)
@@ -107,12 +112,18 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [J15 Vertex Displacement](#j15-vertex-displacement)
 - [J16 Central Difference Normal Recomputation](#j16-central-difference-normal-recomputation)
 - [J17 Tangent Basis Construction](#j17-tangent-basis-construction)
+- [J18 Sphere Projection Tessellation (Implicit Surface → Mesh)](#j18-sphere-projection-tessellation-implicit-surface--mesh)
+- [J19 rgb_to_cell — Full-color Framebuffer via 216-color Cube](#j19-rgb_to_cell--full-color-framebuffer-via-216-color-cube)
+- [J20 HSV → RGB for Fragment Shaders](#j20-hsv--rgb-for-fragment-shaders)
 
 ### K — Shading Models
 - [K1 Blinn-Phong Shading](#k1-blinn-phong-shading)
 - [K2 Toon / Cel Shading — Banded Diffuse](#k2-toon--cel-shading--banded-diffuse)
 - [K3 Normal Visualisation Shader](#k3-normal-visualisation-shader)
 - [K4 Parametric Torus Lighting (Donut)](#k4-parametric-torus-lighting-donut)
+- [K5 3-Point Lighting Setup — Key + Fill + Rim](#k5-3-point-lighting-setup--key--fill--rim)
+- [K6 Depth Visualization Shader — View-space Depth → Color](#k6-depth-visualization-shader--view-space-depth--color)
+- [K7 Hue-Depth Encoding — Escape Time → Rainbow](#k7-hue-depth-encoding--escape-time--rainbow)
 
 ### L — Algorithms & Data Structures
 - [L1 Bresenham Line Algorithm](#l1-bresenham-line-algorithm)
@@ -184,6 +195,16 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [T1 Analytic Wave Interference — Phase Precomputation](#t1-analytic-wave-interference--phase-precomputation)
 - [T2 Lyapunov Exponent — Alternating Logistic Map](#t2-lyapunov-exponent--alternating-logistic-map)
 - [T3 DBM Laplace Growth — Gauss-Seidel + φ^η](#t3-dbm-laplace-growth--gauss-seidel--φη)
+
+### U — Path Tracing & Global Illumination
+- [U1 Monte Carlo Path Tracing](#u1-monte-carlo-path-tracing)
+- [U2 Lambertian BRDF + Cosine Hemisphere Sampling](#u2-lambertian-brdf--cosine-hemisphere-sampling)
+- [U3 Russian Roulette — Unbiased Path Termination](#u3-russian-roulette--unbiased-path-termination)
+- [U4 Progressive Accumulator — Convergent Rendering](#u4-progressive-accumulator--convergent-rendering)
+- [U5 Reinhard Tone Mapping](#u5-reinhard-tone-mapping)
+- [U6 xorshift32 — Decorrelated Per-pixel RNG](#u6-xorshift32--decorrelated-per-pixel-rng)
+- [U7 Cornell Box — Standard Path Tracing Scene](#u7-cornell-box--standard-path-tracing-scene)
+- [U8 Axis-aligned Quad Intersection](#u8-axis-aligned-quad-intersection)
 
 ---
 
@@ -1465,6 +1486,116 @@ The key difference from pure DLA (random walker) is that the Laplace field `φ` 
 **Build:** `gcc -std=c11 -O2 -Wall -Wextra geometry/lissajous.c -o lissajous -lncurses -lm`
 
 *Files: `geometry/lissajous.c`*
+
+---
+
+---
+
+### I — Raymarching & SDF (new entries)
+
+#### I5 Mandelbulb Distance Estimator
+The Mandelbulb extends Mandelbrot iteration to 3D using spherical power: `z^p → r^p · (sin(pθ)cos(pφ), sin(pθ)sin(pφ), cos(pθ))` then `z += c`. The distance estimator tracks the derivative magnitude `dr = p · r^(p-1) · dr + 1` alongside the iteration, giving `DE = 0.5 · log(r) · r / dr`. When `dr` is large the surface is far; when small the march is close. Power 8 gives the classic 8-fold symmetric Mandelbulb; powers 2–12 sweep from sphere to full fractal.
+*Files: `raymarcher/mandelbulb_explorer.c`, `raymarcher/mandelbulb_raymarcher.c`, `raster/mandelbulb_raster.c`*
+
+#### I6 Smooth Escape-time Coloring
+Integer escape count `i` produces harsh banding where adjacent iteration shells have discrete color jumps. The continuous formula: `mu = i + 1 − log(log(|z|)/log(bail)) / log(power)`. The `log(log(|z|))` term measures how far past the bailout the orbit was, interpolating continuously between integer counts. `mu ∈ ℝ` produces smooth color gradients across depth shells.
+*Files: `raymarcher/mandelbulb_explorer.c`, `raymarcher/mandelbulb_raymarcher.c`*
+
+#### I7 Orbit Trap Coloring
+During Mandelbulb iteration, track the minimum distance from any orbit point to a geometric object: `trap = min(trap, |z.y|)` (distance to XY plane). Points where the orbit stayed close to the trap get a different hue from points where it diverged widely. Orbit traps reveal the internal structure of the attractor basin, creating the characteristic "tentacle" and "pod" coloring visible on the surface.
+*Files: `raymarcher/mandelbulb_explorer.c`*
+
+#### I8 Near-miss Glow via min_d Tracking
+During sphere marching, track the minimum DE value ever reached: `min_d = min(min_d, d)`. When the ray misses but came close (`min_d < GLOW_RANGE`), `glow_str = (1 − min_d/GLOW_RANGE)^3`. Pixels with glow_str > 0 receive a dim edge glow character — a halo around the fractal silhouette. This requires no extra DE calls; the march loop records min_d for free.
+*Files: `raymarcher/mandelbulb_explorer.c`, `raymarcher/mandelbulb_raymarcher.c`*
+
+#### I9 Progressive ROWS_PER_TICK Rendering
+Raymarching the full screen at 60 fps is too slow for complex fractals. Progressive rendering processes `ROWS_PER_TICK=4` rows per frame, maintaining UI responsiveness. A `g_stable` buffer holds the last complete frame, displayed while the new scan sweeps from top to bottom. `g_dirty=true` (set on user input) resets the scan row; morph mode avoids setting dirty so the radar-sweep scan becomes visible as an animation effect.
+*Files: `raymarcher/mandelbulb_explorer.c`*
+
+---
+
+### J — Software Rasterization (new entries)
+
+#### J18 Sphere Projection Tessellation (Implicit Surface → Mesh)
+For surfaces with no analytic parametrisation (Mandelbulb, metaballs), tessellate by projecting inward from a UV sphere: for each `(θ, φ)` direction, march from `r=1.5` inward until `DE < HIT_EPS`. Record the first hit point as a mesh vertex with position, SDF-gradient normal, and smooth iteration value. Connect valid neighboring vertices into quads → triangles. This captures the outer surface skin only — concavities and interior structure are invisible. The trade-off vs raymarching: faster per-frame render, fewer visual features.
+*Files: `raster/mandelbulb_raster.c`*
+
+#### J19 rgb_to_cell — Full-color Framebuffer via 216-color Cube
+`luma_to_cell` (cube_raster.c) maps luminance → one of 7 fixed color pairs, losing hue information. `rgb_to_cell` initialises all 216 xterm color pairs (16+r×36+g×6+b, r/g/b ∈ 0..5) and maps fragment RGB to the nearest cube entry. The Bourke density ramp still controls the character from luminance; the color pair now faithfully represents the fragment's actual hue. Required for normals shader (6-hue visualisation), hue-depth shader, and any fragment output with meaningful color content.
+*Files: `raster/mandelbulb_raster.c`*
+
+#### J20 HSV → RGB for Fragment Shaders
+`hsv_to_rgb(h, s, v)` converts a hue angle `h∈[0,1)` to RGB. `h × 6` selects one of 6 hue sectors; fractional part `f` interpolates within the sector. `p = v(1−s)`, `q = v(1−sf)`, `t = v(1−s(1−f))` are the three mixing values. Used to create smooth rainbow gradients from scalar values (escape time → hue, normal azimuth → hue, depth → hue). Placing this in §2 math keeps it available to all three fragment shaders.
+*Files: `raster/mandelbulb_raster.c`*
+
+---
+
+### K — Shading Models (new entries)
+
+#### K5 3-Point Lighting Setup — Key + Fill + Rim
+Standard film/game lighting rig with three independent lights:
+- **Key** (strong, warm, animated sweep): main source of diffuse + specular. `0.65 × diffuse + 0.55 × specular`
+- **Fill** (weak, cool, opposite side): prevents the shadow side from being pure black. `0.22 × diffuse` only.
+- **Rim** (narrow, from behind): creates a bright edge on the silhouette, separating object from background. `0.18 × diffuse + 0.65 × specular` with low shininess (exponent 10) for broad rim highlight.
+Sum = `ambient + key_diffuse + key_spec + fill_diffuse + rim_diffuse + rim_spec`. Each light uses its own color to enable warm/cool contrast.
+*Files: `raymarcher/mandelbulb_explorer.c`*
+
+#### K6 Depth Visualization Shader — View-space Depth → Color
+The vertex shader computes view-space depth: `custom[0] = length(world_pos − cam_pos)`. The fragment shader normalizes to `[cam_dist − 1.5, cam_dist + 1.5]` and maps `depth_t ∈ [0,1]` to a color gradient (near=warm, far=cool). Combined with the Bourke ramp for characters, this creates a depth fog effect that reveals the 3D structure of any mesh without lighting computation. Useful for debugging mesh geometry.
+*Files: `raster/mandelbulb_raster.c`*
+
+#### K7 Hue-Depth Encoding — Escape Time → Rainbow
+In `mandelbulb_raymarcher.c`, the sole visual signal is hue: `smooth → hue pair`. The 30-step rainbow (red→orange→yellow→green→cyan→blue→magenta→back) cycles `COLOR_BANDS` times across the `[0,1]` smooth range. High bands = many thin color rings per depth shell; low bands = broad color regions. All characters are `'.'` — no brightness gradient. This design deliberately removes every visual cue except hue, exposing how much spatial structure is encoded in escape-time alone.
+*Files: `raymarcher/mandelbulb_raymarcher.c`*
+
+---
+
+### U — Path Tracing & Global Illumination
+
+#### U1 Monte Carlo Path Tracing
+A **path tracer** solves the rendering equation `L_o = L_e + ∫ L_i · f_r · cosθ dω` by Monte Carlo sampling: fire one ray per pixel, bounce it randomly, accumulate radiance from emissive hits. The estimate is unbiased — more samples converge to the exact ground-truth image. Key phenomena that emerge automatically: soft shadows (area light sampling), color bleeding (diffuse inter-reflection), ambient occlusion (geometry occlusion), caustics (specular → diffuse paths).
+*Files: `raytracing/path_tracer.c`*
+
+#### U2 Lambertian BRDF + Cosine Hemisphere Sampling
+For Lambertian BRDF `f_r = ρ/π` and cosine-weighted hemisphere PDF `p(ω) = cosθ/π`, the Monte Carlo weight simplifies: `f_r · cosθ / p = (ρ/π) · cosθ / (cosθ/π) = ρ`. The π and cosθ cancel — `throughput *= albedo` is the complete update. Malley's method generates cosine-weighted samples: uniform disk sample `(r1,r2)` → azimuth `φ=2πr1`, elevation `sinθ=√r2`, `cosθ=√(1−r2)`, transform to world space via ONB around N.
+*Files: `raytracing/path_tracer.c`*
+
+#### U3 Russian Roulette — Unbiased Path Termination
+Fixed-depth truncation misses deep indirect light (biased). Russian roulette terminates at any depth `d ≥ RR_DEPTH` with probability `1 − p` where `p = max(throughput)`. Surviving paths compensate with `throughput /= p`. Unbiased proof: `E[contribution] = (contribution × p) / p = contribution`. Dim paths (near-zero throughput, small p) are more likely to die — exactly correct since they contribute negligibly even if they survive.
+*Files: `raytracing/path_tracer.c`*
+
+#### U4 Progressive Accumulator — Convergent Rendering
+`g_accum[y][x][3]` stores the running sum of radiance samples. Each frame adds `SPP_PER_FRAME` jittered samples (sub-pixel random offset = free anti-aliasing). Display = `accum / samples` after tone-mapping. The image evolves from white noise → recognizable structure (16 samples) → converged (512+ samples). Reset on resize (`memset+0`) or user request. Auto-stop at `ACCUM_CAP=8192` since convergence past that is imperceptible at ASCII resolution.
+*Files: `raytracing/path_tracer.c`*
+
+#### U5 Reinhard Tone Mapping
+Raw path-traced radiance is unbounded (`[0, ∞)`). Reinhard compresses per channel: `L_display = L / (1 + L)`. Properties: passes 0→0, maps 1→0.5, asymptotes to 1 as L→∞. Follow with gamma encode `L^(1/2.2)` for perceptual sRGB. Filmic alternatives (Hejl-Dawson, ACES) give more dramatic contrast but Reinhard is sufficient for terminal resolution. The light emission of 15 W·sr⁻¹ compresses to `15/16 ≈ 0.94` — near-white as intended.
+*Files: `raytracing/path_tracer.c`*
+
+#### U6 xorshift32 — Decorrelated Per-pixel RNG
+```c
+static Rng rng_seed(int px, int py, int frame) {
+    uint32_t s = px*1973 + py*9277 + frame*26699 + 1;
+    s ^= s<<13; s ^= s>>7; s ^= s<<17;
+    return s ? s : 1u;
+}
+```
+Independent per-pixel seeds prevent correlated noise (bands, streaks). The hash mixes pixel coordinates and frame index — adjacent pixels and adjacent frames get unrelated initial states. Three warm-up xorshift steps break up any regularities in the hash output. The `s ? s : 1` guard prevents the all-zero state (xorshift(0) = 0 forever).
+*Files: `raytracing/path_tracer.c`*
+
+#### U7 Cornell Box — Standard Path Tracing Scene
+The Cornell Box is the benchmark for global illumination algorithms: red left wall, green right wall, white floor/ceiling/back, small overhead area light. Designed to show: color bleeding (red/green walls tint white surfaces), soft shadows (finite area light), and indirect illumination (ceiling lit by floor reflections). Two spheres with distinct colors add inter-object color bleeding. Any path tracer that renders the Cornell Box correctly handles all first-order global illumination effects.
+*Files: `raytracing/path_tracer.c`*
+
+#### U8 Axis-aligned Quad Intersection
+```c
+t = (pos_axis − ray.o[axis]) / ray.d[axis]
+hit.u = ray.o[u_axis] + t × ray.d[u_axis]   check ∈ [lo[0], hi[0]]
+hit.v = ray.o[v_axis] + t × ray.d[v_axis]   check ∈ [lo[1], hi[1]]
+```
+One-dimensional solve on the fixed axis, then two bound checks. Normal is always flipped to face the incoming ray: if `rd[axis] > 0` → normal = `-axis_dir`. This guarantees hemisphere sampling is always away from the surface, regardless of which side the ray enters from. The light quad at `y=0.98` tests before the ceiling at `y=1.0` (smaller t) so rays see the light first in its footprint.
+*Files: `raytracing/path_tracer.c`*
 
 ---
 

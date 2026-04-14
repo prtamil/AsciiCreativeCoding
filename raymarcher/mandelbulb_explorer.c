@@ -17,6 +17,7 @@
  *   z / Z       zoom in / out (camera distance)
  *   a           toggle auto-zoom fly-in
  *   f           toggle fast mode (fewer march steps)
+ *   n           toggle clean mode (char from N·L, no shadow/AO — shows inner structure)
  *   o           toggle ambient occlusion
  *   s           toggle soft shadows
  *   r           reset camera
@@ -58,6 +59,72 @@
 /* ===================================================================== */
 /* §1  config                                                             */
 /* ===================================================================== */
+/*
+ * §T  Terminal Rendering Techniques  (reference — see application sites)
+ * -----------------------------------------------------------------------
+ * A terminal cell is a large, coarse pixel: ~8 visible brightness levels,
+ * 2:1 aspect ratio, no anti-aliasing, ~30 fps budget.  Each technique below
+ * solves one specific constraint imposed by that environment.
+ *
+ * T.1  SURFACE SMOOTHING           constant: MB_HIT_EPS = 0.003
+ *      Small HIT_EPS lets rays hit micro-bumps smaller than one terminal cell.
+ *      Raising it merges sub-cell detail into the nearest visible patch,
+ *      smoothing the silhouette and eliminating speckling at the surface edge.
+ *
+ * T.2  NORMAL LOW-PASS FILTER      constant: H = 0.010  (in mb_normal)
+ *      Central-differences with a tiny H captures every micro-bump; the per-
+ *      cell normal field swings wildly → TV-static shading.  H = 0.010
+ *      averages the DE over a patch roughly one cell wide so the normal is
+ *      smooth at terminal-cell granularity.
+ *
+ * T.8  SHADOW FLOOR                constant: 0.15f  (in mb_shadow)
+ *      Soft shadow returning 0 kills diffuse + specular entirely → pitch-black
+ *      cells in occluded regions.  A floor of 0.15 keeps shadows dark while
+ *      always leaving some character visible (never the space char).
+ *
+ * T.9  8-CHAR RAMP                 ramp: " .:=+*#@"  (in k_ramp)
+ *      Longer ramps include ambiguous pairs (:≈;, x≈X) that look identical in
+ *      most terminal fonts.  These 8 chars are maximally distinct at arm's
+ *      length; every adjacent step is clearly a different density level.
+ *
+ * T.10 STABLE BUFFER               buffers: g_fbuf + g_stable
+ *      Progressive rendering fills g_fbuf row-by-row.  Reading unfinished rows
+ *      directly shows a harsh black scan-line split.  g_stable holds the last
+ *      complete frame; canvas_draw blends fresh rows (g_fbuf) with the previous
+ *      frame (g_stable) so the animation is visually continuous with no band.
+ *
+ * T.11 CAMERA SNAPSHOT             state: g_snap_*  (in scene_render)
+ *      Auto-orbit increments cam_phi every tick; if camera basis is rebuilt
+ *      mid-pass, rows rendered at different times see different cameras →
+ *      geometry shears horizontally.  Capturing the basis once at row 0 and
+ *      reusing it for every row gives one consistent view per full pass.
+ *
+ * T.12 CLEAN MODE                  toggle: 'n' key  (Scene.clean_mode)
+ *      Shadow + AO applied to char selection hide inner surfaces — occluded
+ *      regions collapse to the space char regardless of fractal depth.  Clean
+ *      mode switches the char source to raw N·L (unmodified by shadow or AO)
+ *      so every surface patch is equally legible; colour pair still encodes
+ *      depth via smooth-iter.
+ *
+ * T.13 NEAR-MISS GLOW              constant: GLOW_THRESH = 0.04
+ *      Rays that barely miss the fractal leave a hard-cut silhouette edge.
+ *      Tracking min_d during the march and drawing a corona char when
+ *      min_d < GLOW_THRESH creates a luminous halo around the boundary.
+ *
+ * T.14 ASPECT CORRECTION           constant: CELL_ASPECT = 2.0
+ *      Terminal cells are ~2× taller than wide; without correction the scene
+ *      renders squished vertically.  phys_aspect = (ch·CELL_ASPECT)/cw scales
+ *      the vertical FOV component so the Mandelbulb is spherical, not oblate.
+ *
+ * T.15 GAMMA ENCODE                constant: GAMMA_EXP = 0.4545f
+ *      Phong luma is computed in linear light space.  Terminal emulators and
+ *      human vision work in perceptual (sRGB) space where equal steps look
+ *      equal.  Mapping linear luma directly to the 8-char ramp clusters most
+ *      pixels in the bottom three chars — mid-tones look flat.  Applying
+ *      luma^(1/2.2) before ramp mapping distributes brightness evenly across
+ *      all 8 chars.  Applied only in canvas_draw (display transform) so
+ *      PixCell.luma stays linear for any future compositing.
+ */
 
 enum {
     SIM_FPS         = 30,
@@ -77,29 +144,29 @@ static inline int canvas_h_from_rows(int r) { return r / CELL_H; }
 #define CANVAS_MAX_W  400
 #define CANVAS_MAX_H  120
 
-/* Raymarching */
+/* ── Raymarching geometry ─────────────────────────────────────────────── */
 #define MB_MAX_STEPS_FULL   80
 #define MB_MAX_STEPS_FAST   40
-#define MB_HIT_EPS          0.0015f
+#define MB_HIT_EPS          0.003f  /* T.1  surface smoothing: raise to kill sub-cell aliasing */
 #define MB_MAX_DIST         5.0f
-#define MB_MAX_ITER         12      /* DE bailout iterations            */
-#define MB_MAX_ITER_AUX     6       /* normal / AO / shadow  (cheaper)  */
-#define MB_BAIL             2.0f    /* escape radius                    */
+#define MB_MAX_ITER         12      /* DE bailout iterations (main march)       */
+#define MB_MAX_ITER_AUX     6       /* cheaper limit for normal / AO / shadow   */
+#define MB_BAIL             2.0f    /* escape radius                            */
 
-/* Near-miss edge glow */
-#define GLOW_THRESH  0.04f          /* DE < this → glow pixel           */
+/* ── Near-miss glow ───────────────────────────────────────────────────── */
+#define GLOW_THRESH  0.04f          /* T.13 DE < this → luminous corona pixel   */
 
-/* Soft shadow */
-#define SH_STEPS    24
-#define SH_K        8.0f
-#define SH_MIN_T    0.02f
+/* ── Soft shadow ──────────────────────────────────────────────────────── */
+#define SH_STEPS    24              /* march steps for penumbra ray             */
+#define SH_K        8.0f            /* sharpness: higher = harder shadow edge   */
+#define SH_MIN_T    0.02f           /* start offset to avoid self-intersection  */
 
-/* Ambient occlusion */
+/* ── Ambient occlusion ────────────────────────────────────────────────── */
 #define AO_SAMPLES  5
 #define AO_STEP     0.08f
 #define AO_DECAY    0.7f
 
-/* Camera defaults */
+/* ── Camera defaults ──────────────────────────────────────────────────── */
 #define CAM_DIST_DEFAULT   2.8f
 #define CAM_DIST_MIN       1.4f
 #define CAM_DIST_MAX       6.0f
@@ -115,41 +182,40 @@ static inline int canvas_h_from_rows(int r) { return r / CELL_H; }
 #define CAM_SPD_MAX        4.0f
 #define FOV_HALF_TAN       0.55f
 
-/* Lighting */
-#define LIGHT_X   1.8f
+/* ── Lighting ─────────────────────────────────────────────────────────── */
+#define LIGHT_X   1.8f    /* key light position (front-right-above)           */
 #define LIGHT_Y   2.2f
 #define LIGHT_Z   2.0f
-/* Rim light direction (unit vector toward scene — normalised below) */
-#define RIM_X    -1.0f
+#define RIM_X    -1.0f    /* rim / fill light direction (back-left-below)     */
 #define RIM_Y    -0.5f
 #define RIM_Z    -0.8f
-#define RIM_STR   0.22f   /* rim contribution scale                   */
+#define RIM_STR   0.30f   /* rim diffuse weight: back/side illumination       */
 
-/* Phong */
-#define KA   0.10f
-#define KD   0.72f
-#define KS   0.42f
-#define SHIN 32.0f
+/* ── Phong shading ────────────────────────────────────────────────────── */
+/* KA is NOT multiplied by AO — ambient is a global constant so even
+   fully-occluded cavity pixels always have KA = 0.25 brightness and
+   never collapse to a space character.  AO only darkens the diffuse term. */
+#define KA   0.25f   /* ambient baseline — guaranteed minimum visibility      */
+#define KD   0.72f   /* diffuse                                               */
+#define KS   0.20f   /* specular: low — micro-facets make high KS noisy      */
+#define SHIN 48.0f   /* shininess: tight spot, avoids specular smearing       */
 
-/* Power */
+/* ── Display ──────────────────────────────────────────────────────────── */
+#define GAMMA_EXP  0.4545f  /* T.15  sRGB gamma (1/2.2): linear luma → perceptual ramp */
+
+/* ── Fractal power ────────────────────────────────────────────────────── */
 #define MB_POWER_DEFAULT   8
 #define MB_POWER_MIN       2
 #define MB_POWER_MAX      16
 
-/* Power morph */
-#define MORPH_SPD   0.22f   /* rad/sec of sine wave                    */
-#define MORPH_LO    2.0f
-#define MORPH_HI    8.0f
-
-/* Smooth coloring: colour bands across iteration depth */
-#define COLOR_BANDS     2.0f   /* full palette cycles visible at once  */
-#define COLOR_PHASE_SPD 0.35f  /* palette rotation speed (pairs/sec)   */
-
-/* Progressive rendering */
-#define ROWS_PER_TICK   8    /* rows per frame; 8 = ~2× faster pass than 4  */
-
-/* Starfield */
-#define NSTARS  200
+/* ── Animation ────────────────────────────────────────────────────────── */
+#define MORPH_SPD       0.22f  /* power morph: rad/s of sine oscillation       */
+#define MORPH_LO        2.0f   /* power morph: lower bound                     */
+#define MORPH_HI        8.0f   /* power morph: upper bound                     */
+#define COLOR_BANDS     2.0f   /* palette: full cycles visible at once         */
+#define COLOR_PHASE_SPD 0.35f  /* palette: rotation speed (colour pairs/sec)   */
+#define ROWS_PER_TICK   8      /* T.10/T.11 progressive: rows rendered per tick */
+#define NSTARS          200    /* starfield background particle count           */
 
 /* Trap types */
 typedef enum { TRAP_POINT = 0, TRAP_PLANE, TRAP_RING, TRAP_N } TrapType;
@@ -165,35 +231,69 @@ typedef struct {
     int fg8[GRAD_N];
 } Theme;
 
+/*
+ * Each theme maps 8 color pairs → fractal depth shells.  Pair 1 = outermost
+ * (escaped early, low smooth), pair 8 = innermost (escaped late).
+ *
+ * All themes span ≥ 3 distinct hue families so adjacent shells show clearly
+ * different colors — not just different brightness of the same hue.
+ *
+ * 256-color values use the xterm-256 cube: index = 16 + 36·r + 6·g + b
+ * (r,g,b ∈ 0..5).  The 8-color fallback uses the 8 ANSI colors.
+ */
 static const Theme k_themes[] = {
-    { "Plasma",
-      {17, 18, 54, 91, 128, 165, 201, 207},
-      {COLOR_BLUE, COLOR_BLUE, COLOR_MAGENTA, COLOR_MAGENTA,
-       COLOR_RED,  COLOR_RED,  COLOR_YELLOW,  COLOR_WHITE} },
-    { "Fire",
-      {232, 52, 88, 124, 160, 196, 202, 226},
-      {COLOR_BLACK, COLOR_RED,    COLOR_RED,    COLOR_RED,
-       COLOR_YELLOW,COLOR_YELLOW, COLOR_WHITE,  COLOR_WHITE} },
-    { "Ice",
-      {17, 18, 24, 31, 39, 45, 51, 231},
-      {COLOR_BLUE, COLOR_BLUE, COLOR_CYAN, COLOR_CYAN,
-       COLOR_CYAN, COLOR_WHITE,COLOR_WHITE,COLOR_WHITE} },
-    { "Gold",
-      {52, 94, 136, 178, 214, 220, 226, 231},
-      {COLOR_RED,   COLOR_RED,    COLOR_YELLOW, COLOR_YELLOW,
-       COLOR_YELLOW,COLOR_WHITE,  COLOR_WHITE,  COLOR_WHITE} },
-    { "Alien",
-      {22, 28, 34, 40, 46, 82, 118, 154},
-      {COLOR_BLACK, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
-       COLOR_GREEN, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE} },
-    { "Neon",
-      {22, 46, 51, 45, 39, 33, 27, 21},
-      {COLOR_GREEN, COLOR_GREEN, COLOR_CYAN, COLOR_CYAN,
-       COLOR_CYAN,  COLOR_BLUE,  COLOR_BLUE, COLOR_BLUE} },
-    { "Sunset",
-      {52, 124, 196, 202, 208, 214, 220, 226},
-      {COLOR_RED,   COLOR_RED,    COLOR_RED,   COLOR_YELLOW,
-       COLOR_YELLOW,COLOR_YELLOW, COLOR_WHITE, COLOR_WHITE} },
+    { "Nebula",
+      /* deep navy → electric blue → violet → magenta → crimson → orange → amber → white */
+      {17, 21, 93, 165, 196, 208, 220, 231},
+      {COLOR_BLUE, COLOR_BLUE,    COLOR_MAGENTA, COLOR_MAGENTA,
+       COLOR_RED,  COLOR_YELLOW,  COLOR_YELLOW,  COLOR_WHITE} },
+
+    { "Aurora",
+      /* vivid blue → azure → teal-green → pure green → bright green → lime → chartreuse → yellow */
+      {21, 45, 48, 46, 82, 118, 154, 226},
+      {COLOR_BLUE,  COLOR_CYAN,   COLOR_CYAN,    COLOR_GREEN,
+       COLOR_GREEN, COLOR_GREEN,  COLOR_YELLOW,  COLOR_YELLOW} },
+
+    { "Inferno",
+      /* black → dark purple → deep magenta → crimson-red → red → orange → amber → yellow */
+      {16, 53, 89, 161, 196, 202, 214, 226},
+      {COLOR_BLACK,   COLOR_MAGENTA, COLOR_MAGENTA, COLOR_RED,
+       COLOR_RED,     COLOR_RED,     COLOR_YELLOW,  COLOR_YELLOW} },
+
+    { "Spectrum",
+      /* full hue wheel — each shell a clearly distinct colour */
+      /* red → orange → yellow → green → cyan → blue → violet → magenta */
+      {196, 208, 226, 46, 51, 21, 129, 201},
+      {COLOR_RED,   COLOR_YELLOW, COLOR_YELLOW, COLOR_GREEN,
+       COLOR_CYAN,  COLOR_BLUE,   COLOR_MAGENTA,COLOR_MAGENTA} },
+
+    { "Toxic",
+      /* dark green → acid green → lime → yellow → amber → orange → red → hot pink */
+      {22, 34, 118, 226, 220, 208, 196, 201},
+      {COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN, COLOR_YELLOW,
+       COLOR_YELLOW, COLOR_RED,    COLOR_RED,   COLOR_MAGENTA} },
+
+    { "Dusk",
+      /* midnight navy → indigo → purple → violet → pink → coral → amber → gold */
+      {18, 57, 93, 129, 164, 205, 214, 220},
+      {COLOR_BLUE,    COLOR_BLUE,    COLOR_MAGENTA, COLOR_MAGENTA,
+       COLOR_RED,     COLOR_RED,     COLOR_YELLOW,  COLOR_YELLOW} },
+
+    { "Abyss",
+      /* near-black → dark navy → royal blue → deep teal → cyan → seafoam → lime → pale gold */
+      {16, 17, 20, 37, 51, 80, 154, 220},
+      {COLOR_BLACK, COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,
+       COLOR_CYAN,  COLOR_GREEN, COLOR_GREEN, COLOR_YELLOW} },
+
+    { "Prism",
+      /* Full hue sweep using only light/medium-bright values — no dark colors.
+       * Every entry has cube components (r,g,b) with min ≥ 2, so all 8 pairs
+       * are clearly legible on a black background.
+       * coral → peach-orange → pale yellow → chartreuse → mint → sky-cyan → sky-blue → orchid */
+      {210, 216, 228, 155, 157, 159, 153, 219},
+      /* 210=(5,2,2) 216=(5,3,2) 228=(5,5,2) 155=(3,5,1) 157=(3,5,3) 159=(3,5,5) 153=(3,4,5) 219=(5,3,5) */
+      {COLOR_RED,    COLOR_RED,    COLOR_YELLOW, COLOR_GREEN,
+       COLOR_GREEN,  COLOR_CYAN,   COLOR_CYAN,   COLOR_MAGENTA} },
 };
 #define THEME_N (int)(sizeof k_themes / sizeof k_themes[0])
 
@@ -370,7 +470,7 @@ static float mb_de(Vec3 pos, float power, int max_iter,
  */
 static Vec3 mb_normal(Vec3 p, float power, TrapType trap_type)
 {
-    const float H = 0.002f;
+    const float H = 0.010f;  /* T.2  normal low-pass filter — large H smooths per-cell normals */
     float dt, ds;
     float dx = mb_de(v3(p.x+H,p.y,p.z), power, MB_MAX_ITER_AUX, &dt, trap_type, NULL)
              - mb_de(v3(p.x-H,p.y,p.z), power, MB_MAX_ITER_AUX, &ds, trap_type, NULL);
@@ -393,7 +493,7 @@ static float mb_shadow(Vec3 ro, Vec3 rd, float power, TrapType trap_type)
     for (int i = 0; i < SH_STEPS && t < MB_MAX_DIST; i++) {
         Vec3  p = v3add(ro, v3mul(rd, t));
         float d = mb_de(p, power, MB_MAX_ITER_AUX, &dt, trap_type, NULL);
-        if (d < MB_HIT_EPS * 0.5f) return 0.05f;
+        if (d < MB_HIT_EPS * 0.5f) return 0.15f;  /* T.8  shadow floor: dark but not invisible */
         float pen = SH_K * d / t;
         if (pen < sh) sh = pen;
         t += d * 0.8f;
@@ -462,15 +562,21 @@ static float mb_march(Vec3 ro, Vec3 rd, float power, int max_steps,
 /* ===================================================================== */
 
 /*
- * PixCell — per-pixel data stored in g_fbuf.
- *   luma     [0,1] — Phong brightness (key + rim + AO + shadow)
- *   smooth   [0,1] — smooth iteration count → drives colour pair
- *   trap     [0,1] — orbit trap value (modulates bold/dim)
- *   hit            — ray hit the fractal surface
- *   glow_str [0,1] — near-miss intensity (>0 means edge glow)
+ * PixCell — one rendered cell stored in g_fbuf / g_stable.
+ *
+ *   luma     — Phong brightness in linear light space [0, 1].
+ *              Key + rim + AO + shadow combined.  Gamma-encoded at draw time.
+ *   ndl      — raw N·L with no shadow or AO applied.
+ *              Clean mode (T.12) uses this so inner surfaces are always legible.
+ *   smooth   — smooth iteration count [0, 1].  Maps to a colour pair so
+ *              the fractal's concentric depth layers get distinct colours.
+ *   trap     — orbit trap proximity [0, 1].  Used only for bold highlighting.
+ *   hit      — true if the ray reached the fractal surface.
+ *   glow_str — near-miss intensity (T.13).  > 0 means draw a corona char.
  */
 typedef struct {
     float luma;
+    float ndl;
     float smooth;
     float trap;
     bool  hit;
@@ -492,11 +598,12 @@ static bool g_dirty      = true;
 static Vec3 g_snap_cam, g_snap_fwd, g_snap_right, g_snap_up;
 
 /*
- * Character ramp — 14 levels (space = background, @ = max brightness).
- * Hit pixels always show at least '.' so shadowed regions remain visible.
+ * T.9  8-level char ramp — every step is visually distinct at arm's length:
+ *   ' '=0  '.'=1  ':'=2  '='=3  '+'=4  '*'=5  '#'=6  '@'=7
+ * Hit pixels clamp to ri ≥ 1 so the minimum visible char is always '.'.
  */
-static const char k_ramp[] = " .`,:;+*=xX#$@";
-#define RAMP_N (int)(sizeof k_ramp - 1)
+static const char k_ramp[] = " .:=+*#@";
+#define RAMP_N (int)(sizeof k_ramp - 1)   /* = 8 */
 
 /* Starfield — initialised once with a fixed seed */
 static struct { int x, y; int bri; } g_stars[NSTARS];
@@ -515,25 +622,33 @@ static void stars_init(int cw, int ch)
 }
 
 /*
- * mb_cast_pixel() — cast one ray; returns filled PixCell.
+ * mb_cast_pixel() — cast one ray; returns a filled PixCell.
  *
- * Two-light Phong:
- *   Key light:  front-right-above  → full diffuse + specular + shadow
- *   Rim light:  back-left-below    → dim diffuse only, no shadow
+ * Two shading modes (toggled by Scene.use_lighting, key 'l'):
  *
- * Aspect correction follows raymarcher.c §4b:
- *   phys_aspect = (canvas_h * CELL_ASPECT) / canvas_w
- *   rd = normalise(u·FOV·right + v·FOV·phys_aspect·up + fwd)
+ *   Phong mode  (use_lighting=true, default):
+ *     Key light (front-right-above) + rim light (back-left-below).
+ *     Gives strong 3-D depth cues via diffuse gradient and specular highlight.
+ *     Shadow and AO darken occluded regions; KA = 0.25 ensures cavity pixels
+ *     never collapse to the space character.
+ *
+ *   N·V mode  (use_lighting=false):
+ *     Brightness = N·V: how directly the surface faces the camera.
+ *     No fixed light direction → no global brightness gradient.
+ *     Fractal structural signals (orbit trap, smooth-iter colour, AO) become
+ *     the dominant visual cues.  Useful for studying inner structure.
+ *
+ * Both modes share: AO (darkens occluded cavities), glow tracking (T.13).
  */
 static PixCell mb_cast_pixel(int px, int py, int cw, int ch,
                               Vec3 cam_pos, Vec3 fwd, Vec3 right, Vec3 up,
                               float power, int max_steps,
-                              bool do_shadow, bool do_ao,
+                              bool do_shadow, bool do_ao, bool use_lighting,
                               TrapType trap_type)
 {
     float u =  ((float)px + 0.5f) / (float)cw * 2.0f - 1.0f;
     float v = -((float)py + 0.5f) / (float)ch * 2.0f + 1.0f;
-    float phys_aspect = ((float)ch * CELL_ASPECT) / (float)cw;
+    float phys_aspect = ((float)ch * CELL_ASPECT) / (float)cw; /* T.14 aspect fix */
 
     Vec3 rd = v3norm(
         v3add(v3add(
@@ -545,7 +660,7 @@ static PixCell mb_cast_pixel(int px, int py, int cw, int ch,
     float t = mb_march(cam_pos, rd, power, max_steps,
                        &trap, &smooth, &glow_str, trap_type);
 
-    PixCell cell = {0.0f, smooth, trap, false, glow_str};
+    PixCell cell = {0.0f, 0.0f, smooth, trap, false, glow_str};
 
     if (t < 0.0f) return cell;   /* miss (glow_str may be > 0) */
 
@@ -557,28 +672,50 @@ static PixCell mb_cast_pixel(int px, int py, int cw, int ch,
     Vec3 N   = mb_normal(hit, power, trap_type);
     Vec3 V   = v3norm(v3sub(cam_pos, hit));
 
-    /* Key light */
-    Vec3  L1   = v3norm(v3sub(v3(LIGHT_X, LIGHT_Y, LIGHT_Z), hit));
-    float ndl1 = fmaxf(0.0f, v3dot(N, L1));
-    Vec3  R1   = v3sub(v3mul(N, 2.0f * ndl1), L1);
-    float spec = powf(fmaxf(0.0f, v3dot(R1, V)), SHIN);
+    float ndv = fmaxf(0.0f, v3dot(N, V));
 
-    float sh = 1.0f;
-    if (do_shadow) {
-        Vec3 sro = v3add(hit, v3mul(N, 0.006f));
-        sh = mb_shadow(sro, L1, power, trap_type);
-    }
-
-    /* Rim / fill light — opposite side, no specular, no shadow */
-    Vec3  L2   = v3norm(v3(RIM_X, RIM_Y, RIM_Z));
-    float ndl2 = fmaxf(0.0f, v3dot(N, L2));
-
+    /* AO (T.3): darken diffuse in concave cavities.
+     * KA is NOT multiplied by ao — ambient is a constant floor so even
+     * fully-occluded pixels always show at least KA = 0.25 brightness
+     * and never collapse to the background space character. */
     float ao = 1.0f;
     if (do_ao) ao = mb_ao(hit, N, power, trap_type);
 
-    float luma = KA * ao
-               + (KD * ndl1 + KS * spec) * sh * ao
-               + RIM_STR * KD * ndl2 * ao;
+    float luma;
+    if (use_lighting) {
+        /* ── Phong mode: key light (front-right-above) + rim (back-left-below) ── */
+        Vec3  L1   = v3norm(v3sub(v3(LIGHT_X, LIGHT_Y, LIGHT_Z), hit));
+        float ndl1 = fmaxf(0.0f, v3dot(N, L1));
+        Vec3  R1   = v3sub(v3mul(N, 2.0f * ndl1), L1);
+        float spec = powf(fmaxf(0.0f, v3dot(R1, V)), SHIN);
+
+        /* Soft shadow (T.8): penumbra from key light; SHADOW_FLOOR prevents
+         * fully-shadowed surfaces going pitch-black. */
+        float sh = 1.0f;
+        if (do_shadow) {
+            Vec3 sro = v3add(hit, v3mul(N, 0.006f));
+            sh = mb_shadow(sro, L1, power, trap_type);
+        }
+
+        /* Rim light: separates dark surfaces from the background by catching
+         * backlit edges — no shadow ray, always present. */
+        Vec3  L2   = v3norm(v3(RIM_X, RIM_Y, RIM_Z));
+        float ndl2 = fmaxf(0.0f, v3dot(N, L2));
+
+        cell.ndl = ndl1;   /* T.12 clean mode uses raw N·L (no shadow/AO) */
+        luma = KA
+             + (KD * ndl1 + KS * spec) * sh * ao
+             + RIM_STR * KD * ndl2;
+    } else {
+        /* ── N·V mode: surface-facing-camera brightness, no external light ── */
+        /* N·V peaks at 1 when a surface faces the camera, falls to 0 at
+         * grazing edges.  Without a fixed light direction there is no global
+         * brightness gradient competing with the fractal's structural signals
+         * (orbit trap bands, smooth-iter colour rings, AO cavities). */
+        cell.ndl = ndv;    /* T.12 clean mode reuses N·V as the raw signal */
+        luma = KA + KD * ndv * ao;
+    }
+
     cell.luma = luma > 1.0f ? 1.0f : luma;
     return cell;
 }
@@ -590,7 +727,7 @@ static PixCell mb_cast_pixel(int px, int py, int cw, int ch,
 static bool canvas_render_rows(int cw, int ch,
                                 Vec3 cam_pos, Vec3 fwd, Vec3 right, Vec3 up,
                                 float power, int max_steps,
-                                bool do_shadow, bool do_ao,
+                                bool do_shadow, bool do_ao, bool use_lighting,
                                 TrapType trap_type)
 {
     for (int k = 0; k < ROWS_PER_TICK; k++) {
@@ -599,12 +736,12 @@ static bool canvas_render_rows(int cw, int ch,
             g_fbuf[py][px] = mb_cast_pixel(px, py, cw, ch,
                                             cam_pos, fwd, right, up,
                                             power, max_steps,
-                                            do_shadow, do_ao, trap_type);
+                                            do_shadow, do_ao, use_lighting,
+                                            trap_type);
         }
         if (++g_render_row >= ch) {
             g_render_row = 0;
-            /* pass complete — save as stable frame shown while next pass renders */
-            memcpy(g_stable, g_fbuf, sizeof g_stable);
+            memcpy(g_stable, g_fbuf, sizeof g_stable); /* T.10 stable buffer: save complete frame */
             return true;
         }
     }
@@ -625,7 +762,7 @@ static bool canvas_render_rows(int cw, int ch,
  *   bold        ← close orbit trap (trap < 0.35) or near max brightness
  */
 static void canvas_draw(int cw, int ch, int cols, int rows,
-                         int color_offset_unused)
+                         int color_offset_unused, bool clean_mode)
 {
     (void)color_offset_unused;  /* g_color_offset is global — used in mb_color_pair */
 
@@ -651,12 +788,7 @@ static void canvas_draw(int cw, int ch, int cols, int rows,
     /* ── 2 & 3. Fractal pixels ────────────────────────────────────── */
     for (int vy = 0; vy < ch && vy < CANVAS_MAX_H; vy++) {
         for (int vx = 0; vx < cw && vx < CANVAS_MAX_W; vx++) {
-            /*
-             * Rows already rendered this pass come from g_fbuf (fresh data).
-             * Rows not yet rendered come from g_stable (last complete frame).
-             * Effect: top portion shows new data, bottom shows previous frame —
-             * no black half, no hard scan-line, animation feels continuous.
-             */
+            /* T.10 stable buffer: fresh rows from g_fbuf, pending rows from g_stable */
             PixCell *cell = (vy < g_render_row)
                           ? &g_fbuf[vy][vx]
                           : &g_stable[vy][vx];
@@ -677,17 +809,42 @@ static void canvas_draw(int cw, int ch, int cols, int rows,
                 else                 ch_c = '.';
 
             } else {
-                /* Hit pixel: char from luma, colour from smooth iter */
-                int ri = (int)(cell->luma * (float)(RAMP_N - 1) + 0.5f);
-                if (ri < 0)        ri = 0;
-                if (ri >= RAMP_N)  ri = RAMP_N - 1;
-                if (ri == 0)       ri = 1;   /* always show at least '.' */
+                /*
+                 * Display pipeline — Phong luma → char density + colour pair.
+                 *
+                 * Step 1  T.15  Gamma encode  luma^(1/2.2): Phong produces
+                 *               linear brightness; the terminal ramp is
+                 *               perceptual.  Without gamma the top 3 chars
+                 *               (@#*) are crammed with bright values while
+                 *               the bottom chars ( .:=) lie nearly empty.
+                 *
+                 * Step 2  T.12  Clean mode branch — bypass shadow/AO when
+                 *               the user wants to see inner structure clearly.
+                 *               Raw N·L (or N·V) is already stored in ndl.
+                 *
+                 * Step 3        Map [0,1] signal → ramp index → char.
+                 *               ri clamped to [1, RAMP_N-1] so hit pixels
+                 *               always show at least '.' and never the space.
+                 */
+
+                /* Step 1 — T.15  gamma encode: Phong is linear; terminal is perceptual */
+                float luma_g = powf(cell->luma, GAMMA_EXP);
+                float ndl_g  = powf(cell->ndl,  GAMMA_EXP);
+
+                /* Step 2 — T.12  clean mode: raw N·L/N·V, unaffected by shadow or AO */
+                float sig = clean_mode ? ndl_g : luma_g;
+
+                /* Step 3 — quantise to 8-char ramp (T.9); always ≥ '.' on a hit */
+                int ri = (int)(sig * (float)(RAMP_N - 1) + 0.5f);
+                if (ri < 1)       ri = 1;
+                if (ri >= RAMP_N) ri = RAMP_N - 1;
                 ch_c = k_ramp[ri];
 
                 int  pair = mb_color_pair(cell->smooth);
-                attr = COLOR_PAIR(pair);
-                /* close trap or bright surface → bold for extra pop */
-                if (cell->trap < 0.35f || ri >= RAMP_N - 2) attr |= A_BOLD;
+                /* A_BOLD on every hit pixel: ncurses A_NORMAL renders colour pairs
+                 * at ~60% terminal intensity.  ri encodes brightness; bold = full
+                 * colour saturation so the palette reads at its intended depth. */
+                attr = COLOR_PAIR(pair) | A_BOLD;
             }
 
             for (int by = 0; by < CELL_H; by++) {
@@ -734,6 +891,13 @@ typedef struct {
     bool     morph_mode;
     float    morph_phase;   /* drives sine wave for power oscillation   */
 
+    /* clean mode: char from raw N·L/N·V, no shadow/AO — full inner visibility */
+    bool     clean_mode;
+
+    /* lighting mode: false = N·V view-facing (fractal structure visible, default)
+     *                true  = Phong key+rim+shadow (classic 3-D lighting)        */
+    bool     use_lighting;
+
     float    time;
 } Scene;
 
@@ -767,8 +931,9 @@ static void scene_init(Scene *s, int cols, int rows)
     s->cam_theta  = CAM_THETA_DEFAULT;
     s->cam_phi    = CAM_PHI_DEFAULT;
     s->orbit_spd  = CAM_ORBIT_SPD;
-    s->do_shadow  = true;
-    s->do_ao      = true;
+    s->do_shadow    = false;      /* no key light by default */
+    s->do_ao        = true;
+    s->use_lighting = true;       /* Phong mode default: key+rim lights, shadow, AO */
     memset(g_fbuf, 0, sizeof g_fbuf);
     stars_init(s->cw, s->ch);
     g_render_row  = 0;
@@ -820,39 +985,27 @@ static void scene_tick(Scene *s, float dt)
 
 static void scene_render(Scene *s)
 {
-    /*
-     * Dirty: an explicit parameter change (key press, resize) — restart
-     * the pass immediately so the user sees the new state from row 0.
-     * The stable buffer fills the bottom until the new pass catches up.
-     */
+    /* T.10 stable buffer: dirty restart clears g_fbuf; g_stable fills the gap */
     if (g_dirty) {
         g_render_row = 0;
         memset(g_fbuf, 0, sizeof(PixCell) * (size_t)s->ch * CANVAS_MAX_W);
         g_dirty = false;
     }
 
-    /*
-     * Camera snapshot: capture the camera basis ONCE at the start of each
-     * pass (g_render_row == 0) and reuse it for every row in that pass.
-     *
-     * Without this, auto-orbit moves cam_phi every tick, so rows rendered
-     * at different ticks within one pass have different cameras → horizontal
-     * shear bands. With the snapshot every row in a pass shares one camera
-     * and the complete frame is geometrically consistent.
-     */
+    /* T.11 camera snapshot: freeze basis once per pass so all rows share one camera */
     if (g_render_row == 0)
         scene_camera(s, &g_snap_cam, &g_snap_fwd, &g_snap_right, &g_snap_up);
 
     canvas_render_rows(s->cw, s->ch,
                        g_snap_cam, g_snap_fwd, g_snap_right, g_snap_up,
                        s->power, s->max_steps,
-                       s->do_shadow, s->do_ao,
+                       s->do_shadow, s->do_ao, s->use_lighting,
                        s->trap_type);
 }
 
 static void scene_draw(const Scene *s, int cols, int rows)
 {
-    canvas_draw(s->cw, s->ch, cols, rows, g_color_offset);
+    canvas_draw(s->cw, s->ch, cols, rows, g_color_offset, s->clean_mode);
 }
 
 /* ===================================================================== */
@@ -906,17 +1059,19 @@ static void screen_draw(Screen *sc, const Scene *s, double fps)
              fps, s->cw, s->ch, g_render_row, s->ch);
     mvprintw(sc->rows - 2, 0,
              "power:%.1f  trap:%-5s  theme:%-6s  dist:%.2f  orb:%.2f"
-             "  %s%s%s%s%s",
+             "  %s%s%s%s%s%s%s",
              s->power, trap_name(s->trap_type),
              k_themes[g_theme_idx].name,
              s->cam_dist, s->orbit_spd,
-             s->do_shadow ? "SH " : "   ",
-             s->do_ao     ? "AO " : "   ",
-             s->fast_mode ? "FAST "  : "     ",
-             s->auto_zoom ? "ZOOM "  : "     ",
-             s->morph_mode? "MORPH"  : "     ");
+             s->use_lighting ? "LIT " : "NV  ",
+             s->do_shadow    ? "SH "  : "   ",
+             s->do_ao        ? "AO "  : "   ",
+             s->fast_mode    ? "FAST " : "     ",
+             s->auto_zoom    ? "ZOOM " : "     ",
+             s->morph_mode   ? "MORPH" : "     ",
+             s->clean_mode   ? " CLN"  : "    ");
     mvprintw(sc->rows - 1, 0,
-             "q:quit spc:pause arrows:orbit p/P:power m:morph "
+             "q:quit spc:pause arrows:orbit p/P:power m:morph n:clean l:light "
              "t:trap c:theme z/Z:dist a:zoom o:AO s:shad f:fast r:reset []:spd");
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
@@ -1014,8 +1169,22 @@ static bool app_handle_key(App *app, int ch)
         s->fast_mode = !s->fast_mode;
         s->max_steps = s->fast_mode ? MB_MAX_STEPS_FAST : MB_MAX_STEPS_FULL;
         dirty = true;                                           break;
+    case 'n':
+        /* clean mode: char from raw N·L, no shadow/AO applied.
+         * Every surface equally legible — reveals inner fractal structure. */
+        s->clean_mode = !s->clean_mode;
+        /* no g_dirty — clean_mode only affects draw, not render */
+        break;
+    case 'l':
+        s->use_lighting = !s->use_lighting;
+        /* shadow only meaningful with a light source */
+        if (!s->use_lighting) s->do_shadow = false;
+        dirty = true;                                           break;
     case 'o':  s->do_ao     = !s->do_ao;     dirty = true;     break;
-    case 's':  s->do_shadow = !s->do_shadow; dirty = true;     break;
+    case 's':
+        /* shadow only applies in Phong mode */
+        if (s->use_lighting) { s->do_shadow = !s->do_shadow; dirty = true; }
+        break;
 
     case '[':
         s->orbit_spd /= CAM_SPD_STEP;

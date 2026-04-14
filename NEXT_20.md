@@ -1,71 +1,29 @@
-# Next 20 Programs
+# Next 6 Programs
 
 Ideas ranked by learning value and visual payoff. Each builds on existing project knowledge.
 
 ---
 
-## Tier 1 — Visual Math / Particle Art
+## Programs
 
 | # | Name | Folder | Concept | Key Technique |
 |---|---|---|---|---|
-| 1 | ~~`galaxy.c`~~ | artistic/ | Spiral galaxy — stars orbit a central mass with Newtonian gravity + bar arm pattern | Polar spiral parametric, N-body simplified, particle trail with lifetime fade | **DONE** |
-| 2 | ~~`sand_art.c`~~ | artistic/ | Sand falling through a rotating hourglass — gravity CA + rotating obstacle | Falling sand CA + angle-driven gravity vector, collision geometry | **DONE** |
-| 3 | ~~`fourier_art.c`~~ | artistic/ | Real-time Fourier drawing — user traces a path, DFT computes epicycles that redraw it | DFT on sampled path, epicycle arm chain sorted by amplitude | **DONE** |
-| 4 | ~~`magnetic_field.c`~~ | physics/ | 2D magnetic field lines from configurable dipoles — streamline tracing | Vector field integration, Biot-Savart for discrete charges | **DONE** |
-| 5 | ~~`wave_interference.c`~~ | fluid/ | N point sources radiating in a tank — real-time amplitude sum with color map | Analytic sinusoidal sum, precomputed k·r table, signed 8-level color ramp | **DONE** |
-
----
-
-## Tier 2 — Physics Simulations
-
-| # | Name | Folder | Concept | Key Technique |
-|---|---|---|---|---|
-| 6 | ~~`bubble_chamber.c`~~ | physics/ | Charged particles curving in a magnetic field — particle tracks with decay | Lorentz force (v × B), exponential trail fade, track curvature | **DONE** |
-| 7 | ~~`chain.c`~~ | physics/ | Hanging chain + swinging rope — verlet constraint solver | Position-based dynamics, distance constraints, iterative projection | **DONE** |
-| 8 | `fluid_sph.c` | fluid/ | Smoothed Particle Hydrodynamics — 2D particle fluid with pressure and viscosity | SPH density, pressure gradient, viscosity term, neighbour search |
-| 9 | ~~`rigid_body.c`~~ | physics/ | 2D rigid body — cubes + spheres, unified AABB, no penetration | Aspect-corrected sphere AABB `(hw=r,hh=2r)`; two-pass solver: positional correction always + velocity impulse when approaching; adaptive restitution; Coulomb friction; spawn check; sleep | **DONE** |
-| 10 | ~~`soft_body.c`~~ | physics/ | Jelly blob — spring lattice with surface tension | Spring-mass mesh, surface rendering, pressure term for volume conservation | **DONE** |
-
----
-
-## Tier 3 — Fractals & Chaos
-
-| # | Name | Folder | Concept | Key Technique |
-|---|---|---|---|---|
-| 11 | ~~`julia_explorer.c`~~ | fractal_random/ | Interactive Julia set explorer — arrow keys move the c parameter in real time | Split-screen: Mandelbrot map (left, precomputed) + Julia (right, per-frame); crosshair on Mandelbrot; auto-wander; zoom; 5 themes | **DONE** |
-| 12 | ~~`barnsley.c`~~ | fractal_random/ | Full Barnsley IFS system — multiple transforms with arbitrary affine matrices | IFS transform table, probability-weighted random selection, chaos game; 5 presets (Fern/Sierpinski/Levy/Dragon/Tree); hit-accumulator grid with log-density render | **DONE** |
-| 13 | ~~`diffusion_map.c`~~ | fractal_random/ | DLA without symmetry — particles random-walk until touching cluster | On-lattice DLA with launch circle + kill radius; Eden toggle mode; age-gradient coloring; 5 themes | **DONE** |
-| 14 | ~~`tree_la.c`~~ | fractal_random/ | Lightning-tree fractal — dielectric breakdown model (DBM) for lightning branches | Gauss-Seidel Laplace relaxation; frontier weighted by φ^η; 3 presets (Tree/Lightning/Coral); eta control | **DONE** |
-| 15 | ~~`lyapunov.c`~~ | fractal_random/ | Lyapunov fractal — parameter space of a logistic map with alternating parameters | Alternating a/b sequences; λ per pixel; signed color map (blue=stable, red=chaos); progressive row render; 6 sequences | **DONE** |
-
----
-
-## Tier 4 — Emergent & Cellular Systems
-
-| # | Name | Folder | Concept | Key Technique |
-|---|---|---|---|---|
-| 16 | ~~`slime_mold.c`~~ | fluid/ | Physarum polycephalum — agent-based slime that creates optimal networks | Agent sensors (3-direction sample), deposit trail, diffuse + decay trail grid | **DONE** |
-| 17 | `vote_ca.c` | misc/ | Voter model / Schelling segregation — cells adopt neighbour majority state | Majority rule CA, threshold-based update, spatial opinion dynamics |
-| 18 | ~~`forest_fire.c`~~ | misc/ | Forest fire cellular automaton — tree growth + lightning ignition + fire spread | 3-state CA (empty/tree/fire), probabilistic growth and ignition rates | **DONE** |
-| 19 | ~~`lattice_gas.c`~~ | fluid/ | FHP lattice gas automaton — particle collisions on hexagonal lattice | 6-direction bit-coded state, collision lookup table, Frisch-Hasslacher-Pomeau rules | **DONE** |
-| 20 | ~~`excitable.c`~~ | fluid/ | Greenberg-Hastings excitable medium — rotating spiral waves, 3 states | 3-state CA (resting/excited/refractory), spiral wave nucleation | **DONE** |
+| 1 |  |  |  |  |
+| 2 |  |  |  |  |
+| 3 |  |  |  |  |
+| 4 |  |  |  |  |
+| 5 |  |  |  |  |
+| 6 |  |  |  |  |
 
 ---
 
 ## Progress
 
-**Done (18/20):** galaxy, sand_art, fourier_art, magnetic_field, bubble_chamber, chain, rigid_body,
-soft_body, slime_mold, forest_fire, lattice_gas, excitable, wave_interference, julia_explorer,
-barnsley, diffusion_map, tree_la, lyapunov
+**Done (0/6):**
 
-**Remaining (2):** fluid_sph, vote_ca
+**Remaining (6):**
 
 ---
 
 ## Notes
 
-- **fluid_sph.c** is the hardest — requires neighbour search (spatial hashing) and tuned pressure constants; attempt after navier_stokes.c is understood.
-- **julia_explorer.c** is a quick add-on to the existing julia.c — incremental recompute only for changed c parameter.
-- **tree_la.c** extends any existing lightning-branch code with a Laplace-like probability field (DBM model) for more realistic branching.
-- **barnsley.c** and **lyapunov.c** are standalone fractal renderers — low complexity, high visual payoff.
-- **vote_ca.c** (Schelling segregation) is a simple 2-state majority-rule CA — easiest remaining item.

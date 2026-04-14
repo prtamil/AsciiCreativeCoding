@@ -13,7 +13,7 @@
  *
  * The HUD shows temperature and mean magnetisation |⟨s⟩|.
  *
- * Keys: q quit  ↑↓ temperature  p pause  r randomise  h hot  c cold
+ * Keys: q quit  ↑↓ temperature  p pause  r randomise  h hot  c cold  t/T theme
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra misc/ising.c \
@@ -38,6 +38,7 @@
 #define GRID_W_MAX  200
 #define GRID_H_MAX   60
 #define HUD_ROWS      2
+#define N_THEMES     10
 
 #define T_INIT   3.0f   /* start hot                 */
 #define T_CRIT   2.269f /* 2D Ising critical temp    */
@@ -49,7 +50,7 @@
 #define FLIPS_PER_CELL   50
 #define RENDER_NS  (1000000000LL / 30)
 
-enum { CP_UP=1, CP_DN, CP_CRIT, CP_HUD };
+enum { CP_UP=1, CP_DN, CP_HUD };
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -70,24 +71,64 @@ static void clock_sleep_ns(long long ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  color / theme                                                      */
 /* ===================================================================== */
+
+typedef struct {
+    const char *name;
+    short  up_fg,  dn_fg;    /* 256-color foreground for each spin state */
+    short  up_fg8, dn_fg8;   /* 8-color fallback                         */
+    chtype up_ch,  dn_ch;    /* character drawn for each spin state       */
+} Theme;
+
+/*
+ * 10 themes — color pairs and characters give each lattice its identity.
+ *
+ *  Matrix  — phosphor green on black, classic CRT look
+ *  Nova    — white stars scattered across a deep-purple void
+ *  Mono    — pure greyscale, minimal
+ *  Fire    — orange flame flickering over dark ember
+ *  Ocean   — cyan ripple on deep navy
+ *  Void    — hot-magenta pinpoints in absolute black
+ *  Amber   — warm yellow on dark brown
+ *  Neon    — hot pink on dark purple, cyberpunk
+ *  Ice     — pale blue on cold navy
+ *  Plasma  — red-hot against electric blue
+ */
+static const Theme k_themes[N_THEMES] = {
+/*  name      up256  dn256  up8            dn8           up_ch  dn_ch */
+  { "Matrix",    46,    22, COLOR_GREEN,   COLOR_GREEN,  '#',   '.'  },
+  { "Nova",     231,    57, COLOR_WHITE,   COLOR_BLUE,   '*',   ' '  },
+  { "Mono",     231,   238, COLOR_WHITE,   COLOR_BLACK,  '#',   '.'  },
+  { "Fire",     214,    88, COLOR_YELLOW,  COLOR_RED,    '^',   '.'  },
+  { "Ocean",     51,    17, COLOR_CYAN,    COLOR_BLUE,   '~',   '-'  },
+  { "Void",     201,    16, COLOR_MAGENTA, COLOR_BLACK,  '@',   ' '  },
+  { "Amber",    226,    94, COLOR_YELLOW,  COLOR_RED,    '#',   '.'  },
+  { "Neon",     199,    54, COLOR_MAGENTA, COLOR_BLUE,   '+',   '-'  },
+  { "Ice",      159,    25, COLOR_CYAN,    COLOR_BLUE,   '*',   '.'  },
+  { "Plasma",   196,    21, COLOR_RED,     COLOR_BLUE,   '#',   '.'  },
+};
+
+static int g_theme = 0;
+
+static void theme_apply(int ti)
+{
+    const Theme *t = &k_themes[ti];
+    if (COLORS >= 256) {
+        init_pair(CP_UP, t->up_fg, -1);
+        init_pair(CP_DN, t->dn_fg, -1);
+    } else {
+        init_pair(CP_UP, t->up_fg8, -1);
+        init_pair(CP_DN, t->dn_fg8, -1);
+    }
+}
 
 static void color_init(void)
 {
     start_color();
     use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(CP_UP,   231, -1);   /* bright white — spin up   */
-        init_pair(CP_DN,    17, -1);   /* dark blue    — spin down */
-        init_pair(CP_CRIT, 208, -1);   /* orange       — near Tc   */
-        init_pair(CP_HUD,  244, -1);
-    } else {
-        init_pair(CP_UP,   COLOR_WHITE, -1);
-        init_pair(CP_DN,   COLOR_BLUE,  -1);
-        init_pair(CP_CRIT, COLOR_YELLOW,-1);
-        init_pair(CP_HUD,  COLOR_WHITE, -1);
-    }
+    init_pair(CP_HUD, COLORS >= 256 ? 244 : COLOR_WHITE, -1);
+    theme_apply(g_theme);
 }
 
 /* ===================================================================== */
@@ -162,12 +203,13 @@ static float magnetisation(void)
 
 static void scene_draw(void)
 {
+    const Theme *th = &k_themes[g_theme];
     for (int r = 0; r < g_gh && r+HUD_ROWS < g_rows; r++) {
         for (int c = 0; c < g_gw && c < g_cols; c++) {
-            int cp;
+            int    cp;
             chtype ch;
-            if (g_spin[r][c] > 0) { cp = CP_UP; ch = '#'; }
-            else                   { cp = CP_DN; ch = '.'; }
+            if (g_spin[r][c] > 0) { cp = CP_UP; ch = th->up_ch; }
+            else                   { cp = CP_DN; ch = th->dn_ch; }
             attron(COLOR_PAIR(cp));
             mvaddch(r + HUD_ROWS, c, ch);
             attroff(COLOR_PAIR(cp));
@@ -179,12 +221,13 @@ static void scene_draw(void)
 
     attron(COLOR_PAIR(CP_HUD));
     mvprintw(0, 0,
-        " Ising Model  q:quit  ↑↓:temperature  p:pause  r:random  h:hot  c:cold");
+        " Ising  q:quit  ↑↓:temp  p:pause  r:random  h:hot  c:cold  t/T:theme");
     mvprintw(1, 0,
-        " T=%.3f (Tc=%.3f %s)  |M|=%.4f  sweeps:%lld  %s",
+        " T=%.3f (Tc=%.3f %s)  |M|=%.4f  sweeps:%lld  [%s]  %s",
         g_temp, T_CRIT,
         tc_dist < 0.1f ? "≈Tc" : (g_temp < T_CRIT ? "ordered" : "disordered"),
         m, g_sweeps,
+        k_themes[g_theme].name,
         g_paused ? "PAUSED" : "running");
     attroff(COLOR_PAIR(CP_HUD));
 }
@@ -253,6 +296,14 @@ int main(void)
             g_temp -= T_STEP;
             if (g_temp < T_MIN) g_temp = T_MIN;
             boltz_update();
+            break;
+        case 't':
+            g_theme = (g_theme + 1) % N_THEMES;
+            theme_apply(g_theme);
+            break;
+        case 'T':
+            g_theme = (g_theme + N_THEMES - 1) % N_THEMES;
+            theme_apply(g_theme);
             break;
         default: break;
         }

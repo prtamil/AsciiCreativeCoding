@@ -2,33 +2,48 @@
 /*
  * rigid_body.c — 2D Rigid Body Simulation (no rotation)
  *
- * Three body types: floor (fixed boundary), cube (AABB rect), sphere (circle).
- * Nothing penetrates anything. Gravity pulls all dynamic bodies down.
- * Bodies collide, exchange momentum with friction, and eventually sleep.
+ * Bodies: cube (AABB rectangle) · sphere (circle drawn, AABB physics)
+ * Implicit floor at bottom of screen.  Nothing penetrates anything.
  *
- * Collision detection:
- *   cube-cube    — AABB overlap, minimum-penetration axis
- *   sphere-sphere— circle distance vs sum of radii
- *   cube-sphere  — closest point on AABB to sphere center
- *   body-floor   — boundary clamp + velocity reflection
- *   body-walls   — same for left / right / ceiling
+ * Why AABB for spheres?
+ *   Terminal chars are ~2× taller than wide.  The sphere is drawn as a
+ *   circle with visual radius r (cols) × r (rows).  Its physics AABB is
+ *   hw=r, hh=2r so that the bounding box aligns with the drawing exactly.
+ *   Old circle-distance check used radius r for both axes → detected
+ *   collision only when bodies were already r rows deep into each other.
  *
- * Collision resolution:
- *   Normal impulse  j  = (1+e)·vn / (1/mA + 1/mB)
- *   Coulomb friction   |jt| ≤ μ·j  on the contact tangent
- *   Baumgarte positional correction for body-body pairs
- *   Sleep: SLEEP_FRAMES consecutive low-speed frames → frozen
+ * Collision detection: AABB overlap (minimum-penetration axis)
+ * — same function for cube-cube, sphere-sphere, cube-sphere —
  *
- * Keys:
- *   c  add cube      s  add sphere    x  remove last body
- *   r  reset         p  pause/resume  g  toggle gravity
- *   e/E restitution  t/T theme        q  quit
+ * Resolution — two separate passes per iteration:
+ *   Pass A  positional correction  (ALWAYS, even when separating)
+ *     corr = max(depth-SLOP, 0) * BAUMGARTE / (imA+imB)
+ *     This is the critical fix: the old code only corrected positions when
+ *     bodies were approaching (vn>0).  Bodies that spawned overlapping or
+ *     that had zero relative velocity on the contact axis were never pushed
+ *     apart and fell through each other.
+ *   Pass B  velocity impulse  (only when approaching, vn>0)
+ *     j = (1+e_eff)*vn / (imA+imB)
+ *     e_eff = (vn > REST_THRESH) ? e : 0   ← no micro-bounce at rest
+ *     Coulomb friction |jt| ≤ μ·j
  *
- * Build:
+ * Floor / wall: full snap + impulse (no fraction — hard boundary)
+ *   Runs for ALL bodies (sleeping included) to counter Baumgarte drift.
+ *
+ * Spawn: 8-attempt overlap check, reject if no clear spot found.
+ *
+ * Sleep  SLEEP_FRAMES quiet frames → frozen.  Woken by impulse > WAKE_IMP
+ *        or by positional correction > WAKE_IMP.
+ *
+ * Keys  c add cube  s add sphere  x remove last  r reset
+ *       p pause     g gravity     e/E restitution
+ *       t/T theme   q quit
+ *
+ * Build
  *   gcc -std=c11 -O2 -Wall -Wextra physics/rigid_body.c -o rigid_body -lncurses -lm
  *
- * Sections: §1 config  §2 clock  §3 color  §4 body  §5 framebuf
- *           §6 physics  §7 scene  §8 draw  §9 screen  §10 app
+ * Sections  §1 config  §2 clock  §3 color  §4 body  §5 framebuf
+ *           §6 physics §7 scene  §8 draw   §9 screen §10 app
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -45,29 +60,41 @@
 /* §1  config                                                             */
 /* ===================================================================== */
 
-#define ROWS_MAX      128
-#define COLS_MAX      512
-#define MAX_BODIES     30
-#define N_THEMES        5
+#define ROWS_MAX     128
+#define COLS_MAX     512
+#define MAX_BODIES    32
+#define N_THEMES       5
 
-#define GRAVITY       0.04f   /* physics units / step²  (downward) */
-#define REST_DEF      0.35f   /* coefficient of restitution */
-#define REST_STEP     0.05f
-#define FRICTION      0.30f   /* Coulomb μ */
-#define DAMPING       0.992f  /* per-step linear damping */
-#define MAX_SPEED     20.0f   /* velocity cap — prevents tunneling */
-#define BAUMGARTE     0.40f   /* positional correction fraction */
-#define SLOP          0.30f   /* penetration allowed before Baumgarte fires */
-#define SLEEP_VEL     0.06f   /* speed below which sleep counter increments */
-#define SLEEP_FRAMES   18     /* frames of quiet before body sleeps */
-#define WAKE_IMP      0.04f   /* minimum impulse that wakes a sleeping body */
+/* physics */
+#define GRAVITY      0.05f   /* downward accel per step                     */
+#define REST_DEF     0.35f   /* default coefficient of restitution           */
+#define REST_STEP    0.05f
+#define FRICTION     0.35f   /* Coulomb μ                                    */
+#define DAMPING      0.991f  /* per-step velocity multiplier                 */
+#define MAX_SPEED    22.0f   /* velocity cap (tunneling prevention)          */
 
-#define CUBE_HW       7.0f    /* cube half-width  (physics units) */
-#define CUBE_HH       5.0f    /* cube half-height */
-#define SPH_R         5.0f    /* sphere radius */
-#define DENSITY       0.008f  /* mass = DENSITY × area */
+/* solver */
+#define SOLVER_ITERS  10     /* iterations per step — higher = stiffer stack */
+#define BAUMGARTE    0.50f   /* positional correction fraction (per iter)    */
+#define SLOP         0.05f   /* penetration allowed before correction fires  */
+#define REST_THRESH  0.20f   /* approach speed below this → e_eff = 0       */
+/*                             kills micro-bounce when bodies settle          */
 
-#define SIM_FPS        20
+/* sleep */
+#define SLEEP_VEL    0.07f   /* speed below which sleep counter ticks        */
+#define SLEEP_FRAMES   30    /* consecutive quiet frames before sleep        */
+#define WAKE_IMP     0.05f   /* min impulse / corr that wakes sleeping body  */
+
+/* body sizes (physics units; terminal cell ratio ≈ 1 col : 2 rows)        */
+#define CUBE_HW      7.0f    /* cube half-width                              */
+#define CUBE_HH      5.0f    /* cube half-height                             */
+#define SPH_R        4.0f    /* sphere visual radius in cols AND rows        */
+/*                             sphere AABB: hw=SPH_R, hh=2*SPH_R            */
+
+#define DENSITY      0.008f  /* mass = DENSITY × AABB area (4·hw·hh)        */
+
+/* timing */
+#define SIM_FPS       20
 #define NS_PER_S  1000000000LL
 
 /* ===================================================================== */
@@ -76,7 +103,8 @@
 
 static int64_t clock_ns(void)
 {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * NS_PER_S + t.tv_nsec;
 }
 static void sleep_ns(int64_t d)
@@ -90,8 +118,8 @@ static void sleep_ns(int64_t d)
 /* §3  color / theme                                                      */
 /* ===================================================================== */
 
-#define CP_FLOOR   9
-#define CP_HUD    10
+#define CP_FLOOR  9
+#define CP_HUD   10
 
 static const struct { short c[6]; const char *name; } k_themes[N_THEMES] = {
     {{ 196, 214, 226,  46,  51, 129 }, "Vivid"  },
@@ -100,7 +128,8 @@ static const struct { short c[6]; const char *name; } k_themes[N_THEMES] = {
     {{  46,  82, 118, 154, 190, 226 }, "Matrix" },
     {{  51,  45,  39,  33,  27,  21 }, "Ocean"  },
 };
-static bool g_256; static int g_theme = 0;
+static bool g_256;
+static int  g_theme = 0;
 
 static void theme_apply(int ti)
 {
@@ -118,52 +147,55 @@ static void theme_apply(int ti)
 
 typedef enum { KIND_CUBE = 0, KIND_SPHERE } Kind;
 
+/*
+ * hw / hh are the AABB half-extents used for ALL physics.
+ *   cube  : hw=CUBE_HW, hh=CUBE_HH
+ *   sphere: hw=SPH_R,   hh=2*SPH_R   (aspect-corrected for terminal)
+ */
 typedef struct {
     Kind  kind;
-    float x, y;        /* center, physics coords (y increases downward) */
+    float x, y;        /* center; physics y increases downward          */
     float vx, vy;
-    float hw, hh;      /* cube: half-extents;  sphere: hw == hh == radius */
-    float mass, imass; /* imass = 1/mass */
-    int   cp;          /* ncurses color pair */
+    float hw, hh;      /* AABB half-extents                             */
+    float mass, imass;
+    int   cp;          /* ncurses color pair                            */
     int   sleep_cnt;
     bool  sleeping;
 } Body;
 
 static Body  g_b[MAX_BODIES];
 static int   g_nb     = 0;
-static int   g_ncubes = 0;   /* cumulative, for color cycling */
+static int   g_ncubes = 0;
 static int   g_nsphs  = 0;
 static float g_rest   = REST_DEF;
 static bool  g_grav   = true;
 static bool  g_paused = false;
 static long  g_tick   = 0;
+static int   g_rows, g_cols;
 
-static int g_rows, g_cols;
-
-/* World dimensions in physics units */
 static inline float WW(void) { return (float)g_cols; }
 static inline float WH(void) { return (float)((g_rows - 3) * 2); }
 
-/* Physics → screen */
 static inline int pcol(float x) { return (int)(x + 0.5f); }
 static inline int prow(float y) { return (int)(y * 0.5f + 0.5f); }
 
-/* XorShift RNG */
 static uint32_t g_rng = 0xDEAD1234u;
 static float rng_f(void)
 {
-    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5;
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
     return (float)(g_rng >> 8) / (float)(1u << 24);
 }
 
 static void body_init_mass(Body *b)
 {
-    float area = (b->kind == KIND_CUBE)
-               ? 4.f * b->hw * b->hh
-               : 3.14159265f * b->hw * b->hw;
+    float area = 4.f * b->hw * b->hh;   /* AABB area */
     b->mass  = area * DENSITY;
     b->imass = 1.f / b->mass;
 }
+
+static void body_wake(Body *b) { b->sleeping = false; b->sleep_cnt = 0; }
 
 /* ===================================================================== */
 /* §5  framebuffer                                                        */
@@ -173,17 +205,17 @@ static char g_fb [ROWS_MAX][COLS_MAX];
 static int  g_fcp[ROWS_MAX][COLS_MAX];
 
 static void fb_clear(void)
-{ memset(g_fb, 0, sizeof g_fb); memset(g_fcp, 0, sizeof g_fcp); }
-
+{
+    memset(g_fb,  0, sizeof g_fb);
+    memset(g_fcp, 0, sizeof g_fcp);
+}
 static void fb_put(int r, int c, char ch, int cp)
 {
     if (r < 0 || r >= g_rows - 3 || c < 0 || c >= g_cols) return;
-    g_fb[r][c] = ch; g_fcp[r][c] = cp;
+    g_fb[r][c] = ch;  g_fcp[r][c] = cp;
 }
-
 static void fb_hline(int r, int x0, int x1, char ch, int cp)
 { for (int x = x0; x <= x1; x++) fb_put(r, x, ch, cp); }
-
 static void fb_vline(int c, int y0, int y1, char ch, int cp)
 { for (int y = y0; y <= y1; y++) fb_put(y, c, ch, cp); }
 
@@ -192,76 +224,76 @@ static void fb_flush(void)
     for (int r = 0; r < g_rows - 3; r++)
         for (int c = 0; c < g_cols; c++) {
             if (!g_fb[r][c]) continue;
-            attron(COLOR_PAIR(g_fcp[r][c]) | A_BOLD);
+            attron (COLOR_PAIR(g_fcp[r][c]) | A_BOLD);
             mvaddch(r, c, (chtype)g_fb[r][c]);
             attroff(COLOR_PAIR(g_fcp[r][c]) | A_BOLD);
         }
-}
-
-static void draw_body(const Body *b)
-{
-    int cp = b->cp;
-    if (b->kind == KIND_SPHERE) {
-        float r = b->hw;
-        int steps = (int)(2.f * 3.14159265f * r) + 8;
-        for (int i = 0; i < steps; i++) {
-            float a = i * 2.f * 3.14159265f / steps;
-            /* multiply sin by 2 so the drawn ellipse looks circular on screen
-               because prow maps y/2 → each physics y-unit is half a row     */
-            fb_put(prow(b->y + r * 2.f * sinf(a)), pcol(b->x + r * cosf(a)), 'O', cp);
-        }
-        fb_put(prow(b->y), pcol(b->x), '+', cp);
-    } else {
-        int x0 = pcol(b->x - b->hw), x1 = pcol(b->x + b->hw);
-        int y0 = prow(b->y - b->hh), y1 = prow(b->y + b->hh);
-        fb_hline(y0, x0, x1, '#', cp);
-        fb_hline(y1, x0, x1, '#', cp);
-        fb_vline(x0, y0, y1, '#', cp);
-        fb_vline(x1, y0, y1, '#', cp);
-        fb_put(prow(b->y), pcol(b->x), '+', cp);
-    }
 }
 
 /* ===================================================================== */
 /* §6  physics                                                            */
 /* ===================================================================== */
 
-/* Wake a sleeping body. */
-static void body_wake(Body *b) { b->sleeping = false; b->sleep_cnt = 0; }
-
 /*
- * impulse() — core collision resolver used by every collision pair.
+ * col_bodies() — AABB overlap test + two-pass resolution.
  *
- * a, b   : colliding bodies (b == NULL means fixed surface).
- * nx, ny : unit contact normal pointing FROM a TOWARD b (or surface).
- * depth  : penetration depth (used for Baumgarte; pass 0 if already corrected).
- * e      : coefficient of restitution.
+ * Pass A — positional correction (ALWAYS, even when bodies are separating)
+ *   This is the critical fix over the previous version.  The old code had
+ *   Baumgarte inside the velocity function, guarded by (vn > 0).  Bodies
+ *   that overlapped but had the same velocity (vn=0) were never pushed
+ *   apart; they fell together as a merged mass.
+ *   Now positional correction runs unconditionally whenever depth > SLOP.
  *
- * Applies:
- *   1. Normal impulse  j = (1+e)·vn / (ima + imb)
- *   2. Coulomb friction tangent impulse
- *   3. Baumgarte positional correction (skipped when depth ≤ SLOP)
+ * Pass B — velocity impulse (only when approaching: vn > 0)
+ *   j = (1+e_eff)*vn / (imA+imB)
+ *   Adaptive restitution: e_eff = (vn > REST_THRESH) ? e : 0
+ *   → at gravity-scale speeds, e_eff=0, impulse cancels vy exactly,
+ *     no micro-bounce.
+ *   Coulomb friction on tangent: |jt| ≤ μ·j
+ *
+ * n = (nx,ny) points from a toward b.
  */
-static void impulse(Body *a, Body *b,
-                    float nx, float ny, float depth, float e)
+static void col_bodies(Body *a, Body *b)
 {
-    float vax = a->vx, vay = a->vy;
-    float vbx = b ? b->vx : 0.f, vby = b ? b->vy : 0.f;
-    float dvx = vax - vbx, dvy = vay - vby;
-    float vn  = dvx * nx + dvy * ny;
-    if (vn <= 0.f) return;  /* bodies already separating */
+    float ox = (a->hw + b->hw) - fabsf(b->x - a->x);
+    float oy = (a->hh + b->hh) - fabsf(b->y - a->y);
+    if (ox <= 0.f || oy <= 0.f) return;      /* no overlap */
 
-    float imb   = b ? b->imass : 0.f;
+    float nx, ny, depth;
+    if (ox < oy) {
+        nx = (b->x > a->x) ? 1.f : -1.f;  ny = 0.f;  depth = ox;
+    } else {
+        nx = 0.f;  ny = (b->y > a->y) ? 1.f : -1.f;  depth = oy;
+    }
+
+    float imb   = b->imass;
     float denom = a->imass + imb;
     if (denom < 1e-12f) return;
 
-    /* ── normal impulse ── */
-    float jn = (1.f + e) * vn / denom;
-    if (jn > WAKE_IMP) { body_wake(a); if (b) body_wake(b); }
-    a->vx -= nx * jn * a->imass;  a->vy -= ny * jn * a->imass;
-    if (b) { b->vx += nx * jn * b->imass; b->vy += ny * jn * b->imass; }
+    /* ── Pass A: positional correction (always) ─────────────────── */
+    float corr = fmaxf(depth - SLOP, 0.f) * BAUMGARTE / denom;
+    if (corr > 0.f) {
+        float ca = corr * a->imass;
+        float cb = corr * imb;
+        a->x -= nx * ca;  a->y -= ny * ca;
+        b->x += nx * cb;  b->y += ny * cb;
+        if (ca > WAKE_IMP) body_wake(a);
+        if (cb > WAKE_IMP) body_wake(b);
+    }
 
-    /* ── Coulomb friction on tangent (uses pre-impulse relative vel) ── */
+    /* ── Pass B: velocity impulse (approaching only) ─────────────── */
+    float dvx = a->vx - b->vx,  dvy = a->vy - b->vy;
+    float vn  = dvx * nx + dvy * ny;
+    if (vn <= 0.f) return;                    /* separating — skip */
+
+    float e_eff = (vn > REST_THRESH) ? g_rest : 0.f;
+    float jn    = (1.f + e_eff) * vn / denom;
+    if (jn > WAKE_IMP) { body_wake(a); body_wake(b); }
+
+    a->vx -= nx * jn * a->imass;  a->vy -= ny * jn * a->imass;
+    b->vx += nx * jn * imb;       b->vy += ny * jn * imb;
+
+    /* Coulomb friction */
     float tx = -ny, ty = nx;
     float vt = dvx * tx + dvy * ty;
     float jt = -vt / denom;
@@ -269,145 +301,113 @@ static void impulse(Body *a, Body *b,
     if (jt >  mx) jt =  mx;
     if (jt < -mx) jt = -mx;
     a->vx += tx * jt * a->imass;  a->vy += ty * jt * a->imass;
-    if (b) { b->vx -= tx * jt * b->imass; b->vy -= ty * jt * b->imass; }
-
-    /* ── Baumgarte positional correction ── */
-    float corr = fmaxf(depth - SLOP, 0.f) * BAUMGARTE / denom;
-    a->x -= nx * corr * a->imass;  a->y -= ny * corr * a->imass;
-    if (b) { b->x += nx * corr * b->imass; b->y += ny * corr * b->imass; }
+    b->vx -= tx * jt * imb;       b->vy -= ty * jt * imb;
 }
 
-/* ── cube-cube (AABB overlap) ──────────────────────────────────────── */
-static void col_cc(Body *a, Body *b)
-{
-    float ox = (a->hw + b->hw) - fabsf(b->x - a->x);
-    float oy = (a->hh + b->hh) - fabsf(b->y - a->y);
-    if (ox <= 0.f || oy <= 0.f) return;
-    float nx, ny, depth;
-    if (ox < oy) { nx = (b->x > a->x) ? 1.f : -1.f; ny = 0.f;  depth = ox; }
-    else         { nx = 0.f; ny = (b->y > a->y) ? 1.f : -1.f;   depth = oy; }
-    impulse(a, b, nx, ny, depth, g_rest);
-}
-
-/* ── sphere-sphere (circle distance) ───────────────────────────────── */
-static void col_ss(Body *a, Body *b)
-{
-    float dx = b->x - a->x, dy = b->y - a->y;
-    float dist2 = dx * dx + dy * dy;
-    float sum   = a->hw + b->hw;   /* sum of radii */
-    if (dist2 >= sum * sum) return;
-    float dist = sqrtf(dist2);
-    float nx, ny;
-    if (dist < 1e-6f) { nx = 1.f; ny = 0.f; }
-    else { nx = dx / dist; ny = dy / dist; }
-    impulse(a, b, nx, ny, sum - dist, g_rest);
-}
-
-/* ── cube-sphere (closest point on AABB to sphere center) ──────────── */
-static void col_cs(Body *cube, Body *sph)
-{
-    /* closest point on cube AABB */
-    float cx = fmaxf(cube->x - cube->hw, fminf(cube->x + cube->hw, sph->x));
-    float cy = fmaxf(cube->y - cube->hh, fminf(cube->y + cube->hh, sph->y));
-    float dx = sph->x - cx, dy = sph->y - cy;
-    float dist2 = dx * dx + dy * dy;
-    float r = sph->hw;
-    if (dist2 >= r * r) return;
-
-    float dist = sqrtf(dist2);
-    float nx, ny, depth;
-    if (dist < 1e-6f) {
-        /* sphere center inside cube — push out along minimum axis */
-        float px = cube->hw - fabsf(sph->x - cube->x);
-        float py = cube->hh - fabsf(sph->y - cube->y);
-        if (px < py) { nx = (sph->x > cube->x) ? 1.f : -1.f; ny = 0.f; depth = px + r; }
-        else         { nx = 0.f; ny = (sph->y > cube->y) ? 1.f : -1.f; depth = py + r; }
-    } else {
-        nx = dx / dist; ny = dy / dist; depth = r - dist;
-    }
-    /* n points from cube toward sphere → impulse(cube, sph, n) */
-    impulse(cube, sph, nx, ny, depth, g_rest);
-}
-
-/* ── body vs floor (bottom wall) ───────────────────────────────────── */
+/*
+ * col_floor() — hard floor at y = WH().
+ * Snaps position fully (no fraction) then resolves velocity.
+ * Runs for ALL bodies so Baumgarte drift can't push sleeping bodies below.
+ */
 static void col_floor(Body *b)
 {
-    float wh   = WH();
-    float bot  = b->y + (b->kind == KIND_SPHERE ? b->hw : b->hh);
-    float depth = bot - wh;
-    if (depth <= 0.f) return;
-    /* correct position, then resolve with n=(0,1) toward floor */
-    if (b->kind == KIND_SPHERE) b->y = wh - b->hw;
-    else                        b->y = wh - b->hh;
-    impulse(b, NULL, 0.f, 1.f, 0.f, g_rest);  /* depth=0: position already fixed */
+    float wh  = WH();
+    float bot = b->y + b->hh;
+    if (bot <= wh) return;
+    b->y = wh - b->hh;                      /* full snap — no fraction */
+
+    /* velocity: cancel downward component only */
+    if (b->vy <= 0.f) return;
+    float e_eff = (b->vy > REST_THRESH) ? g_rest : 0.f;
+    b->vy = -b->vy * e_eff;
+    b->vx *= (1.f - FRICTION * (1.f + e_eff));   /* floor friction */
+    if (fabsf(b->vx) < SLEEP_VEL) b->vx = 0.f;
 }
 
-/* ── body vs side walls and ceiling ─────────────────────────────────── */
+/*
+ * col_walls() — left wall, right wall, ceiling.
+ * Same snap pattern as col_floor.
+ */
 static void col_walls(Body *b)
 {
-    float ww  = WW();
-    float ext = (b->kind == KIND_SPHERE) ? b->hw : b->hw; /* same formula */
+    float ww = WW();
 
-    /* left wall: n=(-1,0) from body toward left */
-    if (b->x - ext < 0.f) {
-        b->x = ext;
-        impulse(b, NULL, -1.f, 0.f, 0.f, g_rest);
+    /* left */
+    if (b->x - b->hw < 0.f) {
+        b->x = b->hw;
+        if (b->vx < 0.f) {
+            float e_eff = (fabsf(b->vx) > REST_THRESH) ? g_rest : 0.f;
+            b->vx = -b->vx * e_eff;
+        }
     }
-    /* right wall: n=(1,0) */
-    if (b->x + ext > ww) {
-        b->x = ww - ext;
-        impulse(b, NULL, 1.f, 0.f, 0.f, g_rest);
+    /* right */
+    if (b->x + b->hw > ww) {
+        b->x = ww - b->hw;
+        if (b->vx > 0.f) {
+            float e_eff = (fabsf(b->vx) > REST_THRESH) ? g_rest : 0.f;
+            b->vx = -b->vx * e_eff;
+        }
     }
-    /* ceiling: n=(0,-1) from body toward ceiling */
-    float top = b->y - (b->kind == KIND_SPHERE ? b->hw : b->hh);
-    if (top < 0.f) {
-        if (b->kind == KIND_SPHERE) b->y = b->hw;
-        else                        b->y = b->hh;
-        impulse(b, NULL, 0.f, -1.f, 0.f, g_rest);
+    /* ceiling */
+    if (b->y - b->hh < 0.f) {
+        b->y = b->hh;
+        if (b->vy < 0.f) {
+            float e_eff = (fabsf(b->vy) > REST_THRESH) ? g_rest : 0.f;
+            b->vy = -b->vy * e_eff;
+        }
     }
 }
 
-/* ── main simulation step ───────────────────────────────────────────── */
+/*
+ * scene_step() — one simulation tick.
+ *
+ *  1  Gravity (awake bodies only).
+ *  2  Integrate + damping + speed cap.
+ *  3  Body-body solver: SOLVER_ITERS × (col_bodies for all pairs).
+ *  4  Floor + wall snap for ALL bodies (sleeping included).
+ *  5  Sleep counter update.
+ */
 static void scene_step(void)
 {
-    /* 1. Gravity */
+    /* 1. gravity */
     if (g_grav)
         for (int i = 0; i < g_nb; i++)
             if (!g_b[i].sleeping)
                 g_b[i].vy += GRAVITY;
 
-    /* 2. Integrate + damping + speed cap */
+    /* 2. integrate + damping + cap */
     for (int i = 0; i < g_nb; i++) {
         Body *b = &g_b[i];
         if (b->sleeping) continue;
-        b->x += b->vx;  b->y += b->vy;
-        b->vx *= DAMPING; b->vy *= DAMPING;
+        b->x += b->vx;
+        b->y += b->vy;
+        b->vx *= DAMPING;
+        b->vy *= DAMPING;
         float spd = sqrtf(b->vx * b->vx + b->vy * b->vy);
-        if (spd > MAX_SPEED) { float s = MAX_SPEED / spd; b->vx *= s; b->vy *= s; }
+        if (spd > MAX_SPEED) {
+            float s = MAX_SPEED / spd;
+            b->vx *= s;  b->vy *= s;
+        }
     }
 
-    /* 3. Body-body collisions (3 iterations for stacked bodies) */
-    for (int iter = 0; iter < 3; iter++)
-        for (int i = 0; i < g_nb; i++)
+    /* 3. body-body — multiple iterations to resolve stacks */
+    for (int iter = 0; iter < SOLVER_ITERS; iter++) {
+        for (int i = 0; i < g_nb; i++) {
             for (int j = i + 1; j < g_nb; j++) {
-                Body *a = &g_b[i], *b = &g_b[j];
-                if (a->sleeping && b->sleeping) continue;
-                if      (a->kind==KIND_CUBE   && b->kind==KIND_CUBE)   col_cc(a, b);
-                else if (a->kind==KIND_SPHERE && b->kind==KIND_SPHERE) col_ss(a, b);
-                else if (a->kind==KIND_CUBE   && b->kind==KIND_SPHERE) col_cs(a, b);
-                else                                                    col_cs(b, a);
+                Body *a = &g_b[i], *bj = &g_b[j];
+                if (a->sleeping && bj->sleeping) continue;
+                col_bodies(a, bj);
             }
+        }
+    }
 
-    /* 4. Floor and wall boundaries (skip sleeping — no gravity means no new penetration) */
+    /* 4. boundaries — ALL bodies (sleeping too, to counter Baumgarte drift) */
     for (int i = 0; i < g_nb; i++) {
-        if (g_b[i].sleeping) continue;
         col_floor(&g_b[i]);
         col_walls(&g_b[i]);
     }
 
-    /* 5. Sleep counter:
-     *    Increment while speed < SLEEP_VEL; freeze after SLEEP_FRAMES frames.
-     *    Bodies are woken inside impulse() when j > WAKE_IMP. */
+    /* 5. sleep counter */
     for (int i = 0; i < g_nb; i++) {
         Body *b = &g_b[i];
         if (b->sleeping) continue;
@@ -415,7 +415,7 @@ static void scene_step(void)
         if (spd < SLEEP_VEL) {
             if (++b->sleep_cnt >= SLEEP_FRAMES) {
                 b->vx = b->vy = 0.f;
-                b->sleeping = true;
+                b->sleeping   = true;
             }
         } else {
             b->sleep_cnt = 0;
@@ -429,21 +429,45 @@ static void scene_step(void)
 /* §7  scene management                                                   */
 /* ===================================================================== */
 
+/*
+ * aabb_overlaps_any() — true if candidate overlaps any existing body.
+ * Used at spawn time to reject or reposition new bodies.
+ */
+static bool aabb_overlaps_any(const Body *c)
+{
+    for (int i = 0; i < g_nb; i++) {
+        const Body *b = &g_b[i];
+        if ((c->hw + b->hw) > fabsf(c->x - b->x) &&
+            (c->hh + b->hh) > fabsf(c->y - b->y))
+            return true;
+    }
+    return false;
+}
+
 static bool scene_add_cube(void)
 {
     if (g_nb >= MAX_BODIES) return false;
-    float ww = WW();
-    float hw = CUBE_HW, hh = CUBE_HH;
-    float x  = ww * (0.15f + rng_f() * 0.70f);
-    if (x < hw + 1.f) x = hw + 1.f;
-    if (x > ww - hw - 1.f) x = ww - hw - 1.f;
+    float ww = WW(), hw = CUBE_HW, hh = CUBE_HH;
+
     Body b = {0};
     b.kind = KIND_CUBE;
-    b.x = x;  b.y = hh + 1.f;   /* near top */
-    b.vx = (rng_f() - 0.5f) * 2.f;
-    b.hw = hw; b.hh = hh;
-    b.cp = 1 + (g_ncubes % 6);
+    b.hw   = hw;  b.hh = hh;
+    b.cp   = 1 + (g_ncubes % 6);
     body_init_mass(&b);
+
+    /* try up to 8 random x positions; skip if overlaps existing body */
+    bool placed = false;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        float x = ww * (0.10f + rng_f() * 0.80f);
+        if (x < hw + 1.f)      x = hw + 1.f;
+        if (x > ww - hw - 1.f) x = ww - hw - 1.f;
+        b.x = x;
+        b.y = hh + 1.f;
+        if (!aabb_overlaps_any(&b)) { placed = true; break; }
+    }
+    if (!placed) return false;
+
+    b.vx = (rng_f() - 0.5f) * 2.f;
     g_b[g_nb++] = b;
     g_ncubes++;
     return true;
@@ -453,17 +477,27 @@ static bool scene_add_sphere(void)
 {
     if (g_nb >= MAX_BODIES) return false;
     float ww = WW();
-    float r  = SPH_R;
-    float x  = ww * (0.15f + rng_f() * 0.70f);
-    if (x < r + 1.f) x = r + 1.f;
-    if (x > ww - r - 1.f) x = ww - r - 1.f;
+    float hw  = SPH_R;
+    float hh  = 2.f * SPH_R;   /* aspect-corrected: visual y-radius = 2r */
+
     Body b = {0};
     b.kind = KIND_SPHERE;
-    b.x = x;  b.y = r + 1.f;   /* near top */
-    b.vx = (rng_f() - 0.5f) * 2.f;
-    b.hw = b.hh = r;
-    b.cp = 1 + (g_nsphs % 6);
+    b.hw   = hw;  b.hh = hh;
+    b.cp   = 1 + (g_nsphs % 6);
     body_init_mass(&b);
+
+    bool placed = false;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        float x = ww * (0.10f + rng_f() * 0.80f);
+        if (x < hw + 1.f)      x = hw + 1.f;
+        if (x > ww - hw - 1.f) x = ww - hw - 1.f;
+        b.x = x;
+        b.y = hh + 1.f;
+        if (!aabb_overlaps_any(&b)) { placed = true; break; }
+    }
+    if (!placed) return false;
+
+    b.vx = (rng_f() - 0.5f) * 2.f;
     g_b[g_nb++] = b;
     g_nsphs++;
     return true;
@@ -474,32 +508,74 @@ static void scene_remove_last(void)
 
 static void scene_init(void)
 {
-    g_nb = g_ncubes = g_nsphs = 0; g_tick = 0;
-    g_rng = (uint32_t)time(NULL) ^ 0xDEAD1234u;
+    g_nb = g_ncubes = g_nsphs = 0;
+    g_tick = 0;
+    g_rng  = (uint32_t)time(NULL) ^ 0xDEAD1234u;
+
     float ww = WW(), wh = WH();
 
-    /* one cube resting on the floor */
+    /* cube pre-placed at rest on floor */
     Body c = {0};
-    c.kind = KIND_CUBE; c.x = ww * 0.5f; c.y = wh - CUBE_HH;
-    c.hw = CUBE_HW; c.hh = CUBE_HH; c.cp = 1;
+    c.kind     = KIND_CUBE;
+    c.x        = ww * 0.50f;
+    c.y        = wh - CUBE_HH;
+    c.hw       = CUBE_HW;  c.hh = CUBE_HH;
+    c.cp       = 1;
+    c.sleeping = true;
     body_init_mass(&c);
-    g_b[g_nb++] = c; g_ncubes++;
+    g_b[g_nb++] = c;
+    g_ncubes++;
 
-    /* one sphere at the top, falling toward the cube */
+    /* sphere dropping from top */
     Body s = {0};
-    s.kind = KIND_SPHERE; s.x = ww * 0.5f; s.y = SPH_R + 1.f;
-    s.hw = s.hh = SPH_R; s.cp = 4;
+    s.kind = KIND_SPHERE;
+    s.x    = ww * 0.50f;
+    s.hw   = SPH_R;
+    s.hh   = 2.f * SPH_R;
+    s.y    = s.hh + 1.f;
+    s.cp   = 4;
     body_init_mass(&s);
-    g_b[g_nb++] = s; g_nsphs++;
+    g_b[g_nb++] = s;
+    g_nsphs++;
 }
 
 /* ===================================================================== */
 /* §8  draw                                                               */
 /* ===================================================================== */
 
+/*
+ * Sphere is drawn using hw (x) and hh (y) so the ellipse matches the
+ * AABB exactly.  prow(y + hh*sin) = (y + 2r*sin) / 2 → r rows from
+ * center on screen.  pcol(x + hw*cos) = x + r cols from center.
+ * The result is a circle of radius r on screen, matching the physics box.
+ */
+static void draw_body(const Body *b)
+{
+    int cp = b->cp;
+    if (b->kind == KIND_SPHERE) {
+        float rx = b->hw, ry = b->hh;
+        int steps = (int)(2.f * 3.14159265f * rx) + 8;
+        for (int i = 0; i < steps; i++) {
+            float a = i * 2.f * 3.14159265f / steps;
+            fb_put(prow(b->y + ry * sinf(a)),
+                   pcol(b->x + rx * cosf(a)), 'O', cp);
+        }
+        fb_put(prow(b->y), pcol(b->x), '+', cp);
+    } else {
+        int x0 = pcol(b->x - b->hw), x1 = pcol(b->x + b->hw);
+        int y0 = prow(b->y - b->hh), y1 = prow(b->y + b->hh);
+        fb_hline(y0, x0, x1, '#', cp);
+        fb_hline(y1, x0, x1, '#', cp);
+        fb_vline(x0, y0, y1, '#', cp);
+        fb_vline(x1, y0, y1, '#', cp);
+        fb_put(prow(b->y), pcol(b->x), '+', cp);
+    }
+}
+
 static void scene_draw(void)
 {
-    erase(); fb_clear();
+    erase();
+    fb_clear();
 
     /* floor line */
     int floor_row = prow(WH());
@@ -507,17 +583,15 @@ static void scene_draw(void)
     for (int c = 0; c < g_cols; c++) mvaddch(floor_row, c, '=');
     attroff(COLOR_PAIR(CP_FLOOR));
 
-    /* bodies */
     for (int i = 0; i < g_nb; i++) draw_body(&g_b[i]);
     fb_flush();
 
-    /* HUD — count live bodies */
     int nc = 0, ns = 0;
     for (int i = 0; i < g_nb; i++) {
-        if (g_b[i].kind == KIND_CUBE)   nc++;
-        else                             ns++;
+        if (g_b[i].kind == KIND_CUBE) nc++; else ns++;
     }
     int rows; { int cc; getmaxyx(stdscr, rows, cc); (void)cc; }
+
     attron(COLOR_PAIR(CP_HUD) | A_BOLD);
     mvprintw(rows - 2, 0,
         " [c]cube [s]sphere [x]del  cubes:%-2d spheres:%-2d /%-2d"
@@ -526,6 +600,7 @@ static void scene_draw(void)
         g_grav ? "on " : "off", g_tick,
         k_themes[g_theme].name, g_paused ? "[PAUSED]" : "");
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+
     attron(COLOR_PAIR(CP_HUD));
     mvaddstr(rows - 1, 0,
         "  [e/E]restitution  [g]gravity  [t/T]theme  [r]reset  [p]pause  [q]quit");
@@ -579,19 +654,20 @@ int main(void)
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
-            case 'q': case 27: g_quit   = 1;                     break;
-            case 'p': case ' ': g_paused = !g_paused;             break;
-            case 'r': scene_init();                               break;
-            case 'c': scene_add_cube();                           break;
-            case 's': scene_add_sphere();                         break;
-            case 'x': scene_remove_last();                        break;
-            case 'g': g_grav = !g_grav;                           break;
-            case 'e': if (g_rest < 0.95f) g_rest += REST_STEP;   break;
-            case 'E': if (g_rest > 0.05f) g_rest -= REST_STEP;   break;
+            case 'q': case 27: g_quit   = 1;                              break;
+            case 'p': case ' ': g_paused = !g_paused;                     break;
+            case 'r': scene_init();                                        break;
+            case 'c': scene_add_cube();                                    break;
+            case 's': scene_add_sphere();                                  break;
+            case 'x': scene_remove_last();                                 break;
+            case 'g': g_grav = !g_grav;                                    break;
+            case 'e': if (g_rest < 0.95f) g_rest += REST_STEP;            break;
+            case 'E': if (g_rest > 0.05f) g_rest -= REST_STEP;            break;
             case 't': g_theme=(g_theme+1)%N_THEMES; theme_apply(g_theme); break;
             case 'T': g_theme=(g_theme+N_THEMES-1)%N_THEMES; theme_apply(g_theme); break;
             }
         }
+
         if (g_resize) { screen_resize(); scene_init(); }
 
         int64_t now = clock_ns();
@@ -600,8 +676,11 @@ int main(void)
             next = now + NS_PER_S / SIM_FPS;
         }
         scene_draw();
-        wnoutrefresh(stdscr); doupdate();
+        wnoutrefresh(stdscr);
+        doupdate();
         sleep_ns(next - clock_ns() - 1000000LL);
     }
-    endwin(); return 0;
+
+    endwin();
+    return 0;
 }

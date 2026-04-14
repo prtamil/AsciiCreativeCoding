@@ -92,6 +92,8 @@ typedef struct {
     bool    started;
     bool    done;
     int16_t start_delay;   /* ticks before fall begins */
+    int16_t fall_period;   /* ticks between row advances: 1=fast 2=med 3=slow */
+    int16_t fall_sub;      /* tick counter within current period */
 } Leaf;
 
 static Leaf  g_leaves[MAX_LEAVES];
@@ -132,6 +134,8 @@ static void add_leaf(int r, int c, char ch) {
         .started     = false,
         .done        = false,
         .start_delay = (int16_t)(lcg() % MAX_START_DELAY),
+        .fall_period = (int16_t)(1 + (int)(lcg() % 3)),  /* 1=fast 2=med 3=slow */
+        .fall_sub    = 0,
     };
 }
 
@@ -286,8 +290,11 @@ static void fall_tick(void) {
             if (g_fall_tick >= lf->start_delay) lf->started = true;
             else continue;
         }
-        lf->head_row++;
-        if (lf->head_row > (int16_t)(g_rows + TRAIL_LEN)) lf->done = true;
+        if (++lf->fall_sub >= lf->fall_period) {
+            lf->fall_sub = 0;
+            lf->head_row++;
+            if (lf->head_row > (int16_t)(g_rows + TRAIL_LEN)) lf->done = true;
+        }
     }
 }
 

@@ -38,6 +38,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `wave` | FDTD 2D wave PDE — CFL-stable, 5 interference sources, 4 color themes |
 | `wave_2d` | 2D scalar wave PDE — Huygens interference, multiple point sources, signed amplitude colour map |
 | `reaction_wave` | FitzHugh-Nagumo excitable medium — activator/inhibitor PDE, spiral waves, 4 color themes |
+| `excitable` | Greenberg-Hastings N-state CA — resting/excited/refractory rule; 4 presets (Spiral/Double/Rings/Chaos); N adjustable 5–20 controls refractory depth and wave spacing; broken-front spiral nucleation; radially periodic IC for target rings; 5 themes; `spc` manual pulse |
 | `flowfield` | Perlin fBm vector field — bilinear sampling, 8-direction particle trails |
 
 ### Physics
@@ -54,8 +55,9 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `schrodinger` | 1D Schrödinger — Crank-Nicolson tridiagonal (Thomas algorithm), tunneling, 4 presets |
 | `blackhole` | Gargantua 3D (Interstellar) — exact Schwarzschild null geodesics via RK4, precomputed lensing table; photon ring from min-radius tracking, primary + secondary disk images, relativistic Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift; dynamic clip radius scales with cam_dist; 11 themes; `+/-` zoom |
 | `magnetic_field` | 2D dipole field lines — Biot-Savart superposition of magnetic monopoles, RK4 streamline tracing from N-pole seeds, 4 presets (Dipole/Quadrupole/Attract/Repel), incremental reveal animation, 5 themes |
+| `bubble_chamber` | Charged particles in a magnetic field — Lorentz force via exact velocity rotation R(ω), ionisation drag spirals orbits inward; 5 particle types (e⁻ e⁺ μ π p) with tuned q/m for visible curvature; age-faded trail ring buffers; `n` burst from centre, `e` burst from edge, `b/B` field strength, `Space` flip field, `t/T` particle type |
 | `chain` | Hanging chain & swinging rope — Position-Based Dynamics (Verlet + iterative distance-constraint projection), tension-coloured links, 4 presets (Hanging/Pendulum/Bridge/Wave), trail ring-buffer, 5 themes |
-| `rigid_body` | 2D rigid body physics — cubes + spheres with AABB collision; cube-cube (min-axis overlap), sphere-sphere (distance), cube-sphere (closest-point on AABB); unified impulse resolver `j=(1+e)·vn/(imA+imB)`, Coulomb friction, Baumgarte positional correction, sleep-counter resting; `c` add cube, `s` add sphere, `x` remove last, `r` reset |
+| `rigid_body` | 2D rigid body physics — cubes + spheres, all pairs resolved with single AABB overlap function; spheres use aspect-corrected AABB `hw=r, hh=2r` to match terminal cell ratio; two-pass resolution: positional correction always fires (fixes overlap even when `vn=0`), velocity impulse only when approaching; adaptive restitution `e_eff=0` at low speed kills floor micro-bounce; spawn overlap check; sleep counter; `c` add cube, `s` add sphere, `x` remove last, `r` reset |
 | `soft_body` | Jelly blob — 7×7 spring-mass mesh; structural + shear + bending springs (Hooke + velocity damping); Newtonian pressure from shoelace area vs target; scan-line fill rendering; symplectic Euler integration; 4 presets (Blob/Heavy/Bouncy/Two), 5 themes |
 
 ### Fractals & Chaos
@@ -144,7 +146,6 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `railwaymap` | Procedural transit map — H/V/Z grid-aligned line templates, canvas-based ACS junction detection, station interchange, 10 themes |
 | `fireworks_rain` | Fireworks with matrix-rain arc trails — each of 72 sparks per explosion grows a 16-slot position-history trail; chars shimmer 75 % per tick; 5 themes (vivid/matrix/fire/ice/plasma) remap all spark color pairs; `t` cycles theme |
 | `matrix_snowflake` | Matrix rain + live DLA snowflake — two real simulations on one screen: classic digital rain in the background; a D6-symmetric DLA ice crystal grows from the center in the foreground, freezing 12 symmetric positions per walker stick event; crystal flashes white on completion then resets; 5 themes (Classic/Inferno/Nebula/Toxic/Gold) |
-
 ### Algorithms
 | Program | Algorithm |
 |---------|-----------|

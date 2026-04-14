@@ -3,88 +3,195 @@
 ## Pass 1 — Understanding
 
 ### Core Idea
-Cubes and spheres fall under gravity, collide with each other and with the floor, exchange momentum, and eventually come to rest. Nothing penetrates anything. The simulation uses axis-aligned shapes (no rotation) so collision detection stays cheap and numerically stable.
+Cubes and spheres fall under gravity, collide with each other and with the
+floor, exchange momentum with friction, and eventually come to rest. Nothing
+penetrates anything. No rotation — shapes are axis-aligned so collision
+detection is fast and numerically stable.
 
 ### Mental Model
-Imagine a box of wooden blocks and rubber balls dropped onto a table. Each hit transfers speed along the contact line (the normal), while friction slows the sliding. Objects that barely move for several frames "fall asleep" — they freeze in place until something bumps them hard enough to wake them.
+A box of wooden blocks and rubber balls dropped onto a table. Each hit
+transfers speed along the contact line (the normal). Friction slows sliding.
+Objects that barely move for several frames "fall asleep" — they freeze until
+something bumps them hard enough to wake them.
 
-### Three Body Types
-- **Floor** — implicit boundary at the bottom; infinite mass, never moves.
-- **Cube** — AABB rectangle with half-extents `(hw, hh)`.
-- **Sphere** — circle with radius `r` (stored as `hw = hh = r`).
+---
 
-### Collision Detection
-| Pair | Method |
-|---|---|
-| cube ↔ cube | AABB overlap on each axis; smallest overlap gives penetration depth and normal |
-| sphere ↔ sphere | distance between centers vs sum of radii |
-| cube ↔ sphere | clamp sphere center to cube AABB → closest point; distance to sphere center vs radius |
-| body ↔ floor/walls | compare AABB / circle bottom/top/sides to boundary |
-
-AABB overlap formula for cube-cube:
-```
-overlap_x = (hw_a + hw_b) - |cx_b - cx_a|
-overlap_y = (hh_a + hh_b) - |cy_b - cy_a|
-if overlap_x <= 0 or overlap_y <= 0: no collision
-normal = axis with smaller overlap (minimum-penetration axis)
-```
-
-Closest-point cube-sphere:
-```
-cx = clamp(sphere.x,  cube.x - cube.hw,  cube.x + cube.hw)
-cy = clamp(sphere.y,  cube.y - cube.hh,  cube.y + cube.hh)
-depth = sphere.r - distance(sphere.center, (cx, cy))
-```
-
-### Impulse Resolution
-All collision types feed into one `impulse(a, b, nx, ny, depth, e)` function.
-The normal `(nx, ny)` points **from a toward b**.
+### The Terminal Aspect-Ratio Problem
+Terminal character cells are approximately **2 × taller than wide** (one row
+≈ two columns of height). This forces a coordinate system choice:
 
 ```
-vn = dot(vel_a - vel_b, n)      ← relative velocity along normal
-if vn <= 0: separating, skip
-
-j = (1 + e) * vn / (1/m_a + 1/m_b)   ← normal impulse magnitude
-
-vel_a -= n * j / m_a            ← a pushed away from b
-vel_b += n * j / m_b            ← b pushed away from a
+physics unit  =  1 column  =  0.5 rows
+prow(y) = y / 2   (convert physics y to screen row)
+pcol(x) = x       (1:1)
 ```
 
-For a fixed surface (floor, wall) `b = NULL` and `1/m_b = 0`.
+A sphere of visual radius `r` (meaning `r` columns wide, `r` rows tall) has:
+- x-extent: `r` physics units each side
+- y-extent: `2r` physics units each side (because `prow` halves it back)
 
-### Coulomb Friction
-Applied on the tangent `t = (-ny, nx)` using the pre-impulse relative velocity:
+So the sphere's **physics AABB** must be `hw = r, hh = 2r`.
+
+Using `hw = hh = r` (the "obvious" choice) means collision detects when
+centers are `2r` apart — but visually the drawn circles don't touch until
+centers are `4r` apart. The bodies appear to overlap by `r` rows at the
+moment physics fires. This was the bug in earlier versions.
+
+---
+
+### Collision Detection — Unified AABB
+
+Every body (cube or sphere) has an AABB `(hw, hh)`. A single function
+handles all pairs:
+
+```
+cube:   hw = CUBE_HW,   hh = CUBE_HH
+sphere: hw = SPH_R,     hh = 2 * SPH_R   ← aspect-corrected
+```
+
+**AABB overlap test:**
+```
+ox = (hw_a + hw_b) - |cx_b - cx_a|
+oy = (hh_a + hh_b) - |cy_b - cy_a|
+if ox <= 0 or oy <= 0: no collision
+
+minimum-penetration axis:
+  if ox < oy:  normal = (±1, 0),  depth = ox
+  else:        normal = (0, ±1),  depth = oy
+```
+Sign of normal is chosen so it points **from a toward b**.
+
+This one test covers cube-cube, sphere-sphere, and cube-sphere correctly.
+The sphere's AABB already encodes the visual shape — no special case needed.
+
+**Floor and walls** use the same `hw/hh` extents:
+- floor fires when `y + hh > WH()` → snaps body to `y = WH() - hh`
+- left wall fires when `x - hw < 0` → snaps to `x = hw`
+- right wall fires when `x + hw > WW()` → snaps to `x = WW() - hw`
+- ceiling fires when `y - hh < 0` → snaps to `y = hh`
+
+---
+
+### Resolution — Two-Pass Per Iteration
+
+This is the design decision that eliminates visible overlap. The old
+approach put Baumgarte inside the velocity function, guarded by `vn > 0`.
+When two bodies had the same velocity on the contact axis (`vn = 0`), they
+fell together as a merged mass — nothing pushed them apart.
+
+**Pass A — positional correction (always)**
+```
+corr = max(depth - SLOP, 0) * BAUMGARTE / (imA + imB)
+pos_a -= n * corr * imA
+pos_b += n * corr * imB
+```
+Runs even when bodies are separating. Wakes sleeping bodies if pushed
+significantly (`corr * imass > WAKE_IMP`).
+
+**Pass B — velocity impulse (only when approaching: vn > 0)**
+```
+vn = dot(vel_a - vel_b, n)
+if vn <= 0: skip
+
+e_eff = (vn > REST_THRESH) ? e : 0    ← adaptive restitution
+j = (1 + e_eff) * vn / (imA + imB)
+
+vel_a -= n * j * imA
+vel_b += n * j * imB
+```
+
+**Adaptive restitution** (`e_eff`): at gravity-scale approach speeds (`vn`
+small), `e_eff = 0`. The impulse exactly cancels the incoming velocity
+instead of bouncing. Without this, gravity → tiny `vn` → tiny bounce → next
+frame → repeat forever (the floor jitter bug).
+
+**Coulomb friction** on the tangent `t = (-ny, nx)`:
 ```
 vt = dot(vel_a - vel_b, t)
-jt = -vt / (1/m_a + 1/m_b)
-jt = clamp(jt, -mu*j, +mu*j)   ← Coulomb cone
+jt = clamp(-vt / (imA+imB),  -μ·j,  +μ·j)
 ```
-This prevents friction from accelerating objects: it can only slow sliding.
+Clamping to the Coulomb cone `|jt| ≤ μ·j` ensures friction can only slow
+sliding, never accelerate it.
 
-### Baumgarte Positional Correction
-Impulse alone doesn't fully fix overlapping bodies (floating point drift accumulates). Baumgarte adds a small position nudge each frame:
+---
+
+### Floor and Wall Resolution
+
+Floor/walls use **full position snap** (not a fraction), then resolve
+velocity directly — no Baumgarte fraction needed since position is already
+exact:
+
+```c
+col_floor:
+  b->y = WH() - b->hh         /* full snap */
+  if vy > 0:
+    e_eff = (vy > REST_THRESH) ? e : 0
+    vy = -vy * e_eff           /* reflect or stop */
+    vx *= (1 - friction)       /* floor friction */
 ```
-corr = max(depth - SLOP, 0) * BAUMGARTE / (1/m_a + 1/m_b)
-pos_a -= n * corr / m_a
-pos_b += n * corr / m_b
-```
-`SLOP` is a small allowed overlap (0.30 units) to prevent jitter from over-correction.
+
+Floor and wall checks run for **all bodies every step, including sleeping
+ones**. Sleeping bodies have zero velocity so the velocity block returns
+immediately; only the position clamp matters. This prevents Baumgarte
+corrections from body-body pairs sinking sleeping bodies below the floor.
+
+---
 
 ### Sleep System
-Keeps the simulation stable when objects come to rest:
-- Each body has a `sleep_cnt` integer and a `sleeping` flag.
-- Every frame, if `|vel| < SLEEP_VEL`, increment `sleep_cnt`; otherwise reset to 0.
-- When `sleep_cnt >= SLEEP_FRAMES`, mark the body as sleeping.
-- Sleeping bodies skip gravity and integration.
-- Any collision with impulse `> WAKE_IMP` wakes the body.
-- Body-body pairs where **both** are sleeping skip collision entirely.
+```
+every frame (non-sleeping body):
+  if |vel| < SLEEP_VEL:
+    sleep_cnt++
+    if sleep_cnt >= SLEEP_FRAMES: freeze (vx=vy=0, sleeping=true)
+  else:
+    sleep_cnt = 0
+
+woken when:
+  velocity impulse j > WAKE_IMP, OR
+  positional correction corr*imass > WAKE_IMP
+```
+
+Both-sleeping body pairs skip the solver entirely.
+
+---
+
+### Spawn Overlap Check
+New bodies try up to 8 random x positions at the top of the screen. If all
+positions overlap an existing body's AABB, the spawn is rejected. This
+prevents bodies from starting fully nested (which the solver would need many
+frames to resolve).
+
+---
 
 ### Non-Obvious Decisions
-- **No rotation**: AABB collision only works for axis-aligned shapes. Skipping rotation removes the need for SAT on arbitrary orientations, eliminates angular momentum state, and makes the math much cleaner. Most "stacking" demos don't visually need it.
-- **Normal direction convention**: `impulse(a, b, n)` requires n to point from `a` toward `b`. This means `vn = dot(va - vb, n) > 0` is "approaching" — the impulse sign then works out without negation.
-- **3 solver iterations**: Running the body-body collision loop 3 times per step reduces stacking penetration accumulation. More iterations → stiffer stack at the cost of CPU.
-- **SLOP threshold**: Without it, every tiny overlap triggers a Baumgarte nudge, causing visible jitter on resting contacts. The slop absorbs numerical noise below 0.30 units.
-- **Velocity cap**: Dense stacking can blow up impulses across multiple iterations. Capping `|vel| <= MAX_SPEED` prevents tunneling at the cost of energy conservation under stress.
+
+- **Unified AABB for spheres**: Spheres could use circle-distance detection
+  but that ignores the terminal y-scale. Giving spheres `hh = 2*hw` and
+  using the same AABB test as cubes is simpler and more accurate on screen.
+
+- **Separate positional correction from velocity impulse**: The key insight
+  is that position overlap and velocity direction are independent problems.
+  A body can be overlapping while moving away (`vn < 0`). Old code skipped
+  correction in that case. Separating them means overlap is always resolved
+  regardless of velocity.
+
+- **`e_eff = 0` at low speed**: Without this, every frame gravity adds a
+  tiny `vy`, floor fires, impulse bounces with `e>0`, body moves up, gravity
+  pulls it down, repeat. This creates infinite micro-jitter at rest. Setting
+  `e_eff = 0` when `vn < REST_THRESH` makes the impulse cancel `vy` exactly.
+
+- **Floor runs for sleeping bodies**: Sleeping bodies skip gravity and
+  integration — but Baumgarte in body-body collisions can still move them.
+  If a sleeping cube is on the floor and an active body pushes it down via
+  Baumgarte, the floor check corrects the position back without waking it.
+
+- **SLOP = 0.05**: Small allowed penetration before correction fires. Removes
+  jitter from floating-point noise at resting contacts (without it, every
+  frame has a tiny depth > 0 and triggers correction in both directions).
+
+- **10 solver iterations**: With N stacked bodies, resolving the bottom pair
+  propagates up through the stack. More iterations → stack settles faster.
+  6 iterations left residual drift visible over many frames.
 
 ---
 
@@ -92,30 +199,30 @@ Keeps the simulation stable when objects come to rest:
 
 ### Module Map
 ```
-§1  config     — constants: GRAVITY, FRICTION, SLEEP_VEL, CUBE_HW, etc.
-§2  clock      — monotonic timer for fixed-FPS loop
+§1  config     — GRAVITY, FRICTION, BAUMGARTE, SLOP, REST_THRESH, SPH_R, etc.
+§2  clock      — monotonic ns timer for fixed-FPS loop
 §3  color      — 5 themes × ncurses color-pair init
-§4  body       — Body struct (kind, x, y, vx, vy, hw, hh, mass, imass, sleep)
-§5  framebuf   — char + attr double buffer → ncurses batch render
-§6  physics    — impulse(), col_cc(), col_ss(), col_cs(), col_floor(), col_walls()
-§7  scene      — scene_add_cube(), scene_add_sphere(), scene_step()
-§8  draw       — draw_body() fills framebuf with '#' (cube) or 'O' (sphere)
-§9  screen     — flush_screen(), draw_hud()
-§10 app        — main(), input handling, game loop
+§4  body       — Body struct; body_init_mass(); body_wake(); rng_f()
+§5  framebuf   — char+attr double buffer → ncurses batch render
+§6  physics    — col_bodies(), col_floor(), col_walls(), scene_step()
+§7  scene      — aabb_overlaps_any(), scene_add_cube/sphere(), scene_init()
+§8  draw       — draw_body() → framebuf ('#' cube, 'O' sphere)
+§9  screen     — screen_init(), screen_resize(), signal handlers
+§10 app        — main(): input loop, fixed-timestep game loop
 ```
 
 ### Data Flow per Frame
 ```
-1. Input → add/remove body or toggle settings
+1. Input → add/remove body, toggle settings
 2. scene_step():
-   a. Apply gravity to all non-sleeping bodies
-   b. Integrate velocity → position, apply damping, cap speed
-   c. 3 iterations of body-body collision (col_cc / col_ss / col_cs)
-   d. col_floor() + col_walls() for each non-sleeping body
-   e. Update sleep counters
+   a. Gravity to all non-sleeping bodies
+   b. Integrate velocity → position; damping; speed cap
+   c. SOLVER_ITERS × (col_bodies for all non-both-sleeping pairs)
+   d. col_floor() + col_walls() for ALL bodies (sleeping too)
+   e. Sleep counter update
 3. draw_body() for each body → framebuf
-4. flush_screen() → ncurses batch update
-5. Sleep until next frame
+4. fb_flush() + doupdate() → terminal
+5. sleep_ns() until next frame
 ```
 
 ### Body Struct
@@ -124,37 +231,45 @@ typedef enum { KIND_CUBE = 0, KIND_SPHERE } Kind;
 
 typedef struct {
     Kind  kind;
-    float x, y;        /* center, physics coords (y increases downward) */
+    float x, y;        /* center; y increases downward (physics coords)  */
     float vx, vy;
-    float hw, hh;      /* cube: half-extents;  sphere: hw == hh == radius */
-    float mass, imass; /* imass = 1/mass, 0 for fixed bodies */
-    int   cp;          /* ncurses color pair */
+    float hw, hh;      /* AABB half-extents (aspect-corrected)           */
+                       /* cube: hw=CUBE_HW, hh=CUBE_HH                  */
+                       /* sphere: hw=SPH_R, hh=2*SPH_R                  */
+    float mass, imass;
+    int   cp;          /* ncurses color pair                             */
     int   sleep_cnt;
     bool  sleeping;
 } Body;
 ```
 
-### Key Constants
+### Key Constants (actual values in code)
 | Constant | Value | Role |
 |---|---|---|
-| `GRAVITY` | 0.04 | downward acceleration per step² |
+| `GRAVITY` | 0.05 | downward accel per step |
 | `REST_DEF` | 0.35 | default coefficient of restitution |
-| `FRICTION` | 0.30 | Coulomb μ |
-| `DAMPING` | 0.992 | per-step velocity multiplier |
-| `MAX_SPEED` | 20.0 | velocity cap (tunneling prevention) |
-| `BAUMGARTE` | 0.40 | positional correction fraction per step |
-| `SLOP` | 0.30 | penetration before correction fires |
-| `SLEEP_VEL` | 0.06 | speed threshold for sleep increment |
-| `SLEEP_FRAMES` | 18 | quiet frames before body sleeps |
-| `WAKE_IMP` | 0.04 | impulse needed to wake a sleeping body |
+| `FRICTION` | 0.35 | Coulomb μ |
+| `DAMPING` | 0.991 | per-step velocity multiplier |
+| `MAX_SPEED` | 22.0 | velocity cap (tunneling prevention) |
+| `SOLVER_ITERS` | 10 | body-body iterations per step |
+| `BAUMGARTE` | 0.50 | positional correction fraction |
+| `SLOP` | 0.05 | penetration allowed before Baumgarte fires |
+| `REST_THRESH` | 0.20 | approach speed below this → `e_eff = 0` |
+| `SLEEP_VEL` | 0.07 | speed threshold for sleep counter |
+| `SLEEP_FRAMES` | 30 | quiet frames before body sleeps |
+| `WAKE_IMP` | 0.05 | min impulse/corr to wake sleeping body |
 | `CUBE_HW / HH` | 7 / 5 | cube half-extents |
-| `SPH_R` | 5.0 | sphere radius |
-| `MAX_BODIES` | 30 | scene capacity |
+| `SPH_R` | 4.0 | sphere visual radius (cols and rows) |
+| `MAX_BODIES` | 32 | scene capacity |
 
-### Physics Coordinate System
-- Origin top-left, x increases right, y increases **downward** (ncurses convention).
-- Gravity adds to `vy` each step (positive = downward).
-- Floor is at `y = screen_height - HUD_HEIGHT`. Bodies rest with their bottom edge on this line.
+### Sphere Drawing vs Physics AABB
+```
+draw:   x offset = hw * cos(a)    → r columns from center
+        y offset = hh * sin(a)    → 2r physics units = r rows via prow()
+physics AABB: hw = r, hh = 2r
+
+result: drawn circle exactly fits the physics bounding box on screen
+```
 
 ### Build
 ```
@@ -164,12 +279,12 @@ gcc -std=c11 -O2 -Wall -Wextra physics/rigid_body.c -o rigid_body -lncurses -lm
 ### Keys
 | Key | Action |
 |---|---|
-| `c` | add cube at random x position |
-| `s` | add sphere at random x position |
+| `c` | add cube (spawn-checks for clear position) |
+| `s` | add sphere (same) |
 | `x` | remove last body |
 | `r` | reset scene |
-| `p` | pause / resume |
+| `p` / `Space` | pause / resume |
 | `g` | toggle gravity |
-| `e` / `E` | decrease / increase restitution |
-| `t` / `T` | cycle theme |
-| `q` | quit |
+| `e` / `E` | increase / decrease restitution |
+| `t` / `T` | cycle theme forward / backward |
+| `q` / `Esc` | quit |

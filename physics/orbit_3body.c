@@ -11,7 +11,7 @@
  *
  * G = M = 1.  Time step dt = 0.001 normalised units.
  *
- * Keys: q quit  p pause  r reset  x perturb  +/- trail length  SPACE zoom
+ * Keys: q quit  p pause  r reset  x perturb  +/- trail  SPACE zoom  [/] speed
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra physics/orbit_3body.c \
@@ -40,7 +40,8 @@
 #define MASS      1.0f
 #define SOFTENING 0.02f     /* softening to prevent singularity */
 #define DT        0.001f    /* integration time step            */
-#define STEPS_PER_FRAME  8
+#define STEPS_MIN   1
+#define STEPS_MAX  64
 
 #define TRAIL_MAX   200
 #define RENDER_NS   (1000000000LL / 60)
@@ -201,7 +202,8 @@ static void record_trail(void)
 
 static int  g_rows, g_cols;
 static bool g_paused;
-static float g_zoom = 1.0f;
+static float g_zoom  = 1.0f;
+static int   g_steps = 8;     /* physics steps executed per display frame */
 
 /* Map sim coord to terminal cell */
 static int sim_to_col(float sx)
@@ -251,10 +253,10 @@ static void scene_draw(void)
 
     attron(COLOR_PAIR(CP_HUD));
     mvprintw(0, 0,
-        " 3Body  q:quit  p:pause  r:reset  x:perturb  +/-:trail  spc:zoom");
+        " 3Body  q:quit  p:pause  r:reset  x:perturb  +/-:trail  spc:zoom  [/]:speed");
     mvprintw(1, 0,
-        " t=%.2f  zoom=%.1f  trail=%d  %s  %s",
-        g_sim_time, g_zoom, g_trail_len,
+        " t=%.2f  zoom=%.1f  trail=%d  speed=%dx  %s  %s",
+        g_sim_time, g_zoom, g_trail_len, g_steps,
         g_perturbed ? "[PERTURBED-CHAOTIC]" : "[figure-8]",
         g_paused ? "PAUSED" : "running");
     attroff(COLOR_PAIR(CP_HUD));
@@ -319,6 +321,12 @@ int main(void)
             g_trail_len -= 20; if (g_trail_len < 10) g_trail_len = 10; break;
         case ' ':
             g_zoom = (g_zoom < 1.5f) ? 2.0f : 1.0f; break;
+        case ']':
+            if (g_steps < STEPS_MAX) g_steps *= 2;
+            break;
+        case '[':
+            if (g_steps > STEPS_MIN) g_steps /= 2;
+            break;
         default: break;
         }
 
@@ -327,7 +335,7 @@ int main(void)
         frame_time = now;
 
         if (!g_paused) {
-            for (int s = 0; s < STEPS_PER_FRAME; s++) physics_step();
+            for (int s = 0; s < g_steps; s++) physics_step();
             if (++trail_timer >= 2) { record_trail(); trail_timer = 0; }
         }
 

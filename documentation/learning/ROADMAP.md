@@ -51,7 +51,6 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `matrix_snowflake.c` | Matrix rain + live DLA crystal | two-simulation layering (rain background / DLA foreground), D6 symmetry with aspect correction, proximity-spawn DLA optimisation, flash/reset lifecycle, 5 themes |
 | `fourier_art.c` | User-drawn path → Fourier epicycles | DRAW→PLAY state machine, arc-length resampling, O(N²) DFT, amplitude-sorted epicycle chain, auto-add convergence |
 | `galaxy.c` | Spiral galaxy — differential rotation | flat rotation curve ω=v₀/r, logarithmic spiral arm init, brightness accumulator + frame decay, radial colour zones |
-
 ---
 
 ## Tier 2 — Simulation Basics (2–3 months)
@@ -71,7 +70,7 @@ Introduces differential equations and numerical integration.
 | `gyroscope.c` | Rigid body | Euler angles, torque |
 | `magnetic_field.c` | Electromagnetism | Biot-Savart superposition, RK4 streamline tracing, aspect-corrected vector field |
 | `chain.c` | Position-Based Dynamics | Verlet prediction, iterative distance-constraint projection, tension coloring, wave propagation |
-| `rigid_body.c` | 2D rigid body collisions (AABB) | AABB overlap (min-axis normal), circle-AABB closest-point, impulse `j=(1+e)·vn/(1/mA+1/mB)`, Coulomb friction, Baumgarte positional correction, sleep counter |
+| `rigid_body.c` | 2D rigid body collisions — unified AABB | Single `col_bodies()` for all pairs; sphere AABB `hw=r, hh=2r` (terminal aspect fix); two-pass: Baumgarte always + velocity impulse when approaching; adaptive `e_eff`; Coulomb friction; spawn overlap check; sleep counter |
 | `soft_body.c` | Jelly blob — spring-mass mesh + pressure | Hooke springs (structural/shear/bending), shoelace area, pressure force on boundary edges, symplectic Euler |
 
 ---

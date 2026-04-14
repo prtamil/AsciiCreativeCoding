@@ -372,6 +372,15 @@ ncurses reserves pair 0 as the default (unmodifiable), giving 255 usable pairs (
 | mandelbrot.c | 6 | Neon palette: magenta→yellow→lime→cyan→purple + HUD |
 | koch.c | 6 | 5-color vivid gradient (cyan→teal→lime→yellow→white) + HUD |
 | lightning.c | 5 | 3 depth bands + 2 glow/halo pairs |
+| wave_interference.c | 8 | CP_N3..CP_P3 signed ramp + CP_HUD |
+| led_number_morph.c | 12 | CP_D0..CP_D9 digit hues + CP_HUD + CP_OFF |
+| particle_number_morph.c | 12 | CP_D0..CP_D9 digit hues + CP_HUD + CP_IDLE |
+| julia_explorer.c | 7 | 5 escape-time bands + CP_HUD + CP_XH crosshair |
+| barnsley.c | 6 | 4 log-density levels + CP_HUD + CP_WALK |
+| diffusion_map.c | 7 | 5 age-gradient levels + CP_HUD + CP_WALK |
+| tree_la.c | 7 | 5 phi-gradient levels + CP_HUD + CP_WALK |
+| lyapunov.c | 8 | CP_BG + CP_S1..S3 (blue stable) + CP_C1..C3 (red chaotic) + CP_HUD |
+| barnes_hut.c | 8 | CP_HUD + CP_L1..CP_L5 glow/speed + CP_TREE + CP_BH |
 
 **Dynamic re-registration:** Several animations call `init_pair()` mid-loop. This is safe — ncurses applies the new color on the next `doupdate()`. The pair number itself does not change, only the color behind it. There is no risk of "stale" pair handles.
 
@@ -561,3 +570,141 @@ Specific indices are chosen for maximum visibility on black backgrounds.
 | 235–255 | Grey ramp steps | donut, rasters                    |
 
 **Effect:** Predictable, terminal-portable colors without relying on named color constants that vary by terminal theme.
+
+---
+
+## 23. Signed 8-Level Color Ramp (Wave Interference)
+
+**Where:** fluid/wave_interference.c
+
+**How it works:**
+The superposition of N waves produces a value in `[-N, +N]`. This signed range is mapped to 8 color pairs: 3 for negative pressure (blue cold), 1 neutral, and 3 for positive pressure (red hot), plus a white peak.
+
+```c
+enum { CP_N3=1, CP_N2, CP_N1, CP_Z, CP_P1, CP_P2, CP_P3, CP_HUD };
+
+/* Map normalised value in [-1,+1] to pair */
+int val_to_pair(float v) {
+    if      (v < -0.60f) return CP_N3;
+    else if (v < -0.20f) return CP_N2;
+    else if (v < -0.02f) return CP_N1;
+    else if (v <  0.02f) return CP_Z;
+    else if (v <  0.20f) return CP_P1;
+    else if (v <  0.60f) return CP_P2;
+    else                 return CP_P3;
+}
+```
+
+Phase is precomputed once per source per cell: `g_phase[s][r][c] = k * dist(source, cell)` where `k = 2π/wavelength`. Per frame: `sum = Σ cos(g_phase[s][r][c] - omega*t)`, normalised by N sources, mapped to the 8-level ramp.
+
+**Effect:** Constructive interference nodes glow red/white; destructive nodes glow deep blue. The standing wave pattern is immediately legible from color alone.
+
+---
+
+## 24. Log-Density Accumulator Coloring (Barnsley / DLA)
+
+**Where:** fractal_random/barnsley.c, fractal_random/diffusion_map.c, fractal_random/tree_la.c
+
+**How it works:**
+Each cell accumulates an integer hit count. Log-normalisation compresses the extreme dynamic range (attractor hot-spots receive millions of hits while transient cells receive 1–5):
+
+```c
+float t = logf(1.0f + (float)count)
+        / logf(1.0f + (float)max_count);
+```
+
+The normalised value maps to 4 character levels: `. : + @` (density ramp), each assigned a distinct color pair.
+
+For diffusion_map.c and tree_la.c, age (in ticks since a cell was added) replaces hit count — old cells are bright, new cells are dim — creating a gradient that shows growth history.
+
+**Effect:** Log normalization makes both rare filaments and dense cores visible simultaneously. Without it, the vast range in hit counts forces a binary (present/absent) rendering.
+
+---
+
+## 25. Lyapunov Fractal — Dual-Palette Signed Value
+
+**Where:** fractal_random/lyapunov.c
+
+**How it works:**
+Each pixel is a point `(a, b)` in parameter space of the logistic map. The Lyapunov exponent `λ = (1/N)·Σ ln|r(1−2xₙ)|` is computed; its sign determines stability.
+
+Two separate 3-level palettes are used for the two sign cases:
+
+```c
+/* λ < 0 → stable: blue gradient */
+enum { CP_BG, CP_S1, CP_S2, CP_S3, CP_C1, CP_C2, CP_C3, CP_HUD };
+
+float mag = fabsf(lambda) / lambda_max;
+int lvl = (int)(mag * 2.9f);   /* 0..2 */
+int pair = (lambda < 0) ? (CP_S1 + lvl) : (CP_C1 + lvl);
+```
+
+Stable regions (λ < 0): dark→medium→bright blue. Chaotic regions (λ > 0): dark→medium→bright red. The boundary `λ = 0` appears as the exact color transition.
+
+**Effect:** The Lyapunov fractal reads as a map of order vs chaos. Blue = the logistic map converges to a fixed point or cycle. Red = it diverges into chaotic behaviour. The boundary is the fractal.
+
+---
+
+## 26. Glow Accumulator + Speed-Normalized Body Coloring (Barnes-Hut)
+
+**Where:** physics/barnes_hut.c
+
+**How it works:**
+Two layers are rendered per frame:
+
+**Layer 1 — Glow accumulator.** Each frame every active body increments `g_bright[row][col]`. The entire grid decays by `DECAY = 0.93` per render frame. This creates orbital trails that persist for ~60 frames.
+
+```c
+g_bright[cr][cc] += 1.0f;           /* accumulate */
+g_bright[r][c]   *= DECAY;          /* decay every render */
+/* render " . : o O @ " ramp from normalised brightness */
+```
+
+**Layer 2 — Direct body glyphs.** After the glow layer, every active body is drawn at its current pixel position with a character and color determined by its speed relative to the rolling maximum:
+
+```c
+float norm = spd / g_v_max;         /* 0=still, 1=fastest body */
+
+if      (norm > 0.80f) { pair = CP_L5; ch = '*'; }  /* blazing fast */
+else if (norm > 0.55f) { pair = CP_L4; ch = '+'; }
+else if (norm > 0.30f) { pair = CP_L3; ch = 'o'; }
+else if (norm > 0.10f) { pair = CP_L2; ch = '.'; }
+else                   { pair = CP_L1; ch = ','; }  /* nearly still */
+```
+
+`g_v_max` decays by 0.9995× per tick so the scale adapts to current dynamics — after a burst of ejections the scale re-anchors to the surviving population.
+
+**Effect:** Glow layer shows orbital structure; direct glyphs ensure bodies are always visible even when moving fast. Speed coloring reveals velocity gradients — Keplerian disk shows cold outer bodies, hot fast inner bodies.
+
+---
+
+## 27. Encapsulated Theme Struct with Special-Role Pairs
+
+**Where:** physics/barnes_hut.c, fluid/wave_interference.c, artistic/led_number_morph.c
+
+**How it works:**
+When a simulation needs both a 5-level ramp AND one or more semantically distinct pairs (e.g. quadtree overlay, central body highlight, HUD), the theme struct stores all of them:
+
+```c
+typedef struct {
+    const char *name;
+    int hi256[5];    /* CP_L1..CP_L5 in 256-color mode */
+    int hi8[5];      /* CP_L1..CP_L5 in 8-color mode */
+    int tree256;     /* CP_TREE — quadtree grid lines */
+    int tree8;
+    int bh256;       /* CP_BH  — central black hole glyph */
+    int bh8;
+} Theme;
+
+static void color_init(int theme) {
+    const Theme *th = &k_themes[theme];
+    for (int i = 0; i < 5; i++)
+        init_pair(CP_L1 + i, th->hi256[i], -1);
+    init_pair(CP_TREE, th->tree256, -1);
+    init_pair(CP_BH,   th->bh256,  -1);
+}
+```
+
+Switching themes calls `color_init(new_theme)` which re-registers all pairs — the pair numbers never change, only the registered colors. This means `COLOR_PAIR(CP_BH)` keeps working; the terminal just sees a new color behind the same handle.
+
+**Effect:** All color semantics are concentrated in one struct per theme. Adding a new theme is one line in the `k_themes` array. The rendering code is color-agnostic.

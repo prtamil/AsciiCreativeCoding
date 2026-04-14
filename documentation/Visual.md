@@ -113,6 +113,15 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [sandpile.c](#sandpilec)
 - [metaballs.c](#metaballsc)
 - [lissajous.c](#lissajousc)
+- [wave_interference.c](#wave_interferencec)
+- [led_number_morph.c](#led_number_morphc)
+- [particle_number_morph.c](#particle_number_morphc)
+- [julia_explorer.c](#julia_explorerc)
+- [barnsley.c](#barnsleyc)
+- [diffusion_map.c](#diffusion_mapc)
+- [tree_la.c](#tree_lac)
+- [lyapunov.c](#lyapunovc)
+- [barnes_hut.c](#barnes_hutc)
 
 ### Reference Tables
 - [Quick-Reference Matrix](#quick-reference-matrix)
@@ -2710,6 +2719,100 @@ if (t < floor) return 0;   /* invisible */
 | Softened N-body gravity Verlet | — (see Architecture §37, Master §R2) | nbody |
 | Lorenz RK4 + ghost trajectory chaos demo | — (see Architecture §37, Master §R3) | lorenz |
 | Rotating orthographic 3-D projection | — (see Architecture §37) | lorenz |
+| Phase precomputation k·r → g_phase[][] | — (see Master §T1) | wave_interference |
+| Signed 8-level color ramp CP_N3..CP_P3 | COLOR §23 | wave_interference |
+| 7-segment bitmask + particle ownership | — (see Architecture §46) | led_number_morph |
+| Spring SPRING_K=9/DAMP=5.5 per segment | — (see Architecture §46) | led_number_morph |
+| Greedy NN assignment + smoothstep LERP | — (see Architecture §47) | particle_number_morph |
+| Origin snapshot ox/oy at morph start | — (see Architecture §47) | particle_number_morph |
+| Mandelbrot precompute + live Julia split | — (see Architecture §48) | julia_explorer |
+| Auto-wander ellipse orbit c-param | — (see Architecture §48) | julia_explorer |
+| IFS chaos game + log-density accumulator | COLOR §24 | barnsley |
+| Aspect-corrected launch circle | — (see Architecture §49) | diffusion_map |
+| Eden frontier scan toggle | — (see Architecture §50) | diffusion_map |
+| Gauss-Seidel φ + phi^eta frontier growth | — (see Master §T3) | tree_la |
+| Lyapunov exponent alternating logistic map | — (see Master §T2) | lyapunov |
+| int8_t signed bucket encoding | — (see Master §T2) | lyapunov |
+| Dual-palette signed value (blue/red) | COLOR §25 | lyapunov |
+| Barnes-Hut quadtree s/d<θ criterion | — (see Master §S1) | barnes_hut |
+| Static node pool O(1) reset | — (see Master §S3) | barnes_hut |
+| Keplerian orbit initialization | — (see Master §S4) | barnes_hut |
+| Brightness accumulator DECAY=0.93 | — (see Master §S5) | barnes_hut |
+| Speed-normalized body color v/v_max | — (see Master §S6, COLOR §26) | barnes_hut |
+| Anchor body (central BH, no integration) | — (see Architecture §44) | barnes_hut |
+| Quadtree overlay ACS_HLINE/VLINE depth≤3 | — (see Architecture §44) | barnes_hut |
+
+---
+
+### wave_interference.c
+
+**Analytic superposition of N point sources.** Phase `g_phase[s][r][c] = k·dist(src_s, cell)` is precomputed. Each frame evaluates `sum = Σ cos(phase − ωt)` and maps the signed result to an 8-level ramp (CP_N3..CP_P3). No FDTD — purely analytic.
+
+**Key techniques:** Phase precomputation (§T1), signed 8-level ramp (COLOR §23), CELL_W=8/CELL_H=16 in distance calculation for pixel-space accuracy.
+
+---
+
+### led_number_morph.c
+
+**7-segment LED with particle physics.** Each segment owns exactly N_PER_SEG=24 particles permanently. Particles spring toward their segment's target positions (SPRING_K=9, DAMP=5.5, ζ≈0.92 slightly underdamped). On digit change, segments are toggled on/off; idle particles spring to a parking position off-screen.
+
+**Key techniques:** Bitmask `k_seg_mask[10]` encodes which of 7 segments are lit per digit. Orientation-aware character selection: horizontal segments use `-`, vertical use `|`. Spring force: `F = k·(target−pos) − damp·vel`.
+
+---
+
+### particle_number_morph.c
+
+**Bitmap font morphing via greedy nearest-neighbour LERP.** A 9×7 binary font is expanded to a sub-grid of particles (up to 3×4 per font pixel, ≤500 total). On digit change, each target position is assigned the closest unassigned particle (greedy NN, O(n²)). Positions are then linearly interpolated with `smoothstep(t) = t²(3−2t)`. Origin `ox/oy` is snapshotted at assignment time so interrupted morphs start from wherever each particle currently is.
+
+**Key techniques:** Greedy NN assignment, smoothstep easing, origin snapshot (see Architecture §47), hold timer fires only after morph_t≥1.0.
+
+---
+
+### julia_explorer.c
+
+**Interactive split-screen Julia/Mandelbrot.** Left panel holds a precomputed Mandelbrot buffer `g_mbuf[80][150]`. Right panel recomputes the Julia set every frame for the current c-parameter (crosshair position). Arrow keys / HJKL move the crosshair; auto-wander orbits the Mandelbrot boundary ellipse at WANDER_R=0.72.
+
+**Key techniques:** Precomputed static buffer for the expensive Mandelbrot set, per-frame Julia recompute, dynamic panel widths `g_mw/g_jw` that recompute on resize.
+
+---
+
+### barnsley.c
+
+**IFS chaos game with log-density rendering.** 5 presets (Barnsley Fern, Sierpinski, Lévy C, Dragon, Fractal Tree) each define 4–6 affine transforms with cumulative probability weights. An LCG selects transforms; hits accumulate in a uint32_t grid; `log(1+count)/log(1+max)` normalises the range; 4 characters `. : + @` map to the normalised levels.
+
+**Key techniques:** Cumulative probability transform selection, log-density normalisation (COLOR §24), y-flip in grid mapping (IFS coordinates are bottom-up), hit cap at 60,000 to prevent integer overflow.
+
+---
+
+### diffusion_map.c
+
+**DLA with Eden toggle.** Particles launch from a circle of radius `R_launch = 1.1×max_extent`, walk randomly, and stick when adjacent to the aggregate. Eden mode bypasses the random walk and samples the frontier directly. Age at freeze time is stored in `uint16_t age[][]`; modulo 65536 wraps to create a cyclic gradient across the structure.
+
+**Key techniques:** Aspect-corrected launch (`x=cos·R, y=sin·R·0.5` for screen-circular launch), kill radius at `2×R_launch`, Eden O(rows×cols) frontier scan, age-gradient coloring.
+
+---
+
+### tree_la.c
+
+**DBM Laplacian fractal growth.** Gauss-Seidel iteration solves Laplace's equation (`φ[r][c] = 0.25·(N+S+E+W)`) for the voltage field. Growth probability ∝ `φ^η` at each frontier cell. `η=1` gives DLA-like diffuse trees; `η=4` gives sharp lightning-like branches. Neumann boundary conditions at side walls prevent artificial reflection.
+
+**Key techniques:** Gauss-Seidel relaxation, `φ^η` weighted frontier selection, Neumann BCs `φ[r][0]=φ[r][1]`, φ immediately zeroed after cell addition.
+
+---
+
+### lyapunov.c
+
+**Lyapunov fractal via alternating logistic map.** Each pixel `(a,b)` computes the Lyapunov exponent of the logistic map alternating between parameters a and b. `λ<0` (stable) → blue gradient; `λ>0` (chaotic) → red gradient. Progressive row rendering gives visual feedback during computation.
+
+**Key techniques:** `int8_t` signed bucket encoding (×32 scale), dual-palette signed value (COLOR §25), b-axis inverted (top=low b, bottom=high b) to match standard Lyapunov fractal orientation.
+
+---
+
+### barnes_hut.c
+
+**Barnes-Hut O(N log N) gravity with dual-layer rendering.** A quadtree is rebuilt every tick from a static pool; force traversal applies the `s/d < θ=0.5` opening angle criterion. Rendering has two layers: (1) a brightness accumulator glow (DECAY=0.93) that persists orbital trails, and (2) direct body glyphs colored by `spd/v_max`. Body 0 in the galaxy preset is a fixed central anchor.
+
+**Key techniques:** Static node pool O(1) reset, incremental COM update, Keplerian initialization, dual-layer rendering (glow + direct), rolling v_max with slow decay, quadtree overlay at depth≤3 (ACS_HLINE/ACS_VLINE/ACS_PLUS), `anchor` flag to skip integration on the central BH.
 
 ---
 

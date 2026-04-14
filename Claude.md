@@ -106,6 +106,7 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/xrayswarm.c           -o xrayswarm     -
 gcc -std=c11 -O2 -Wall -Wextra artistic/gear.c                -o gear          -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/railwaymap.c          -o railwaymap    -lncurses
 gcc -std=c11 -O2 -Wall -Wextra artistic/galaxy.c              -o galaxy        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/barnes_hut.c           -o barnes_hut    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/rigid_body.c           -o rigid_body    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/soft_body.c            -o soft_body     -lncurses -lm -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/bubble_chamber.c       -o bubble_chamber -lncurses -lm

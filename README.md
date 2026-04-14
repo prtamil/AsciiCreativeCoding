@@ -60,6 +60,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `chain` | Hanging chain & swinging rope — Position-Based Dynamics (Verlet + iterative distance-constraint projection), tension-coloured links, 4 presets (Hanging/Pendulum/Bridge/Wave), trail ring-buffer, 5 themes |
 | `rigid_body` | 2D rigid body physics — cubes + spheres, all pairs resolved with single AABB overlap function; spheres use aspect-corrected AABB `hw=r, hh=2r` to match terminal cell ratio; two-pass resolution: positional correction always fires (fixes overlap even when `vn=0`), velocity impulse only when approaching; adaptive restitution `e_eff=0` at low speed kills floor micro-bounce; spawn overlap check; sleep counter; `c` add cube, `s` add sphere, `x` remove last, `r` reset |
 | `soft_body` | Jelly blob — 7×7 spring-mass mesh; structural + shear + bending springs (Hooke + velocity damping); Newtonian pressure from shoelace area vs target; scan-line fill rendering; symplectic Euler integration; 4 presets (Blob/Heavy/Bouncy/Two), 5 themes |
+| `barnes_hut` | Barnes–Hut O(N log N) gravity — 800-body galaxy with quadtree force approximation (s/d < θ=0.5 criterion); static node pool (no malloc); flat rotation curve disk via M_enc∝r; Box-Muller Gaussian bulge; logarithmic spiral arms; brightness accumulator glow with DECAY=0.84; quadtree overlay (depth ≤ 3); 3 presets (Galaxy/Cluster/Binary), 5 themes |
 
 ### Fractals & Chaos
 | Program | Algorithm |

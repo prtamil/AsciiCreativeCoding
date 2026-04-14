@@ -172,6 +172,19 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [R2 Softened N-Body Gravity + Verlet](#r2-softened-n-body-gravity--verlet)
 - [R3 Lorenz Strange Attractor — RK4 + 3-D Projection](#r3-lorenz-strange-attractor--rk4--3-d-projection)
 
+### S — Barnes-Hut & Galaxy Simulation
+- [S1 Barnes-Hut Quadtree — O(N log N) Gravity](#s1-barnes-hut-quadtree--on-log-n-gravity)
+- [S2 Incremental Centre-of-Mass Update](#s2-incremental-centre-of-mass-update)
+- [S3 Static Node Pool — No malloc](#s3-static-node-pool--no-malloc)
+- [S4 Keplerian Orbit Initialization](#s4-keplerian-orbit-initialization)
+- [S5 Brightness Accumulator + Glow Decay](#s5-brightness-accumulator--glow-decay)
+- [S6 Speed-Normalized Color Mapping](#s6-speed-normalized-color-mapping)
+
+### T — Wave Physics & Signal Analysis
+- [T1 Analytic Wave Interference — Phase Precomputation](#t1-analytic-wave-interference--phase-precomputation)
+- [T2 Lyapunov Exponent — Alternating Logistic Map](#t2-lyapunov-exponent--alternating-logistic-map)
+- [T3 DBM Laplace Growth — Gauss-Seidel + φ^η](#t3-dbm-laplace-growth--gauss-seidel--φη)
+
 ---
 
 ## Essays
@@ -1181,6 +1194,257 @@ Two-octave sinusoidal curtains with a vertical sine envelope render the northern
 **RK4** keeps the trajectory on the attractor without time-step reduction (Euler diverges due to chaos sensitivity). **Ghost trajectory** starts at x+ε=0.001 offset; exponential divergence on the Lyapunov time-scale (~1.1 s) is rendered in a contrasting color. **Orthographic rotation** `px = x·cos(a) − y·sin(a)` reveals 3-D structure without a projection matrix.
 
 *Files: `physics/lorenz.c`*
+
+---
+
+---
+
+### S — Barnes-Hut & Galaxy Simulation
+
+#### S1 Barnes-Hut Quadtree — O(N log N) Gravity
+
+**The problem:** Computing gravity naively requires O(N²) force pairs — every body pulls on every other. For N=400 that's 160,000 evaluations per tick; for N=10,000 it's 100 million.
+
+**The key insight:** A group of bodies that is small and far away produces nearly the same gravitational effect as a single point mass located at their centre of mass. The Barnes-Hut algorithm quantifies "small and far" with the **opening angle criterion**:
+
+```
+s / d < θ   →  treat the group as one point mass
+s / d ≥ θ   →  recurse into children
+```
+
+where `s` = side length of the quadtree cell, `d` = distance to the cell's centre of mass, and `θ ≈ 0.5` is the accuracy threshold.
+
+**Algorithm:**
+1. Build a quadtree over all bodies (O(N log N))
+2. For each body i, traverse the tree: at each node, apply the opening angle test to decide whether to approximate or recurse
+3. Integrate velocities and positions
+
+The quadtree is rebuilt from scratch every tick using a static pool (see S3). This is cheaper than incremental updates because rebuilding is O(N log N) pool-writes and incremental rebalancing would require complex bookkeeping.
+
+```c
+/* Force traversal */
+void qt_force(int ni, int bi, float *fx, float *fy) {
+    QNode *n = &pool[ni];
+    if (n->body_idx == bi) return;          /* skip self at leaf */
+
+    float s = n->x1 - n->x0;               /* cell side */
+    float d = dist(n->cx, n->cy, bodies[bi].px, bodies[bi].py);
+
+    if (s/d < THETA || is_leaf(n)) {
+        /* Single point-mass approximation */
+        apply_gravity(bi, n->total_mass, n->cx, n->cy, fx, fy);
+    } else {
+        for (int c = 0; c < 4; c++)
+            qt_force(n->child[c], bi, fx, fy);
+    }
+}
+```
+
+**Complexity:** O(N log N) average case. Each body visits O(log N) nodes in the well-separated regime. The actual cost depends on θ and on how clustered the bodies are.
+
+*Files: `physics/barnes_hut.c`, `physics/nbody.c` (O(N²) for comparison)*
+
+---
+
+#### S2 Incremental Centre-of-Mass Update
+
+When inserting body `b` into a tree node that already holds mass M at centre (cx, cy):
+
+```c
+float new_mass = n->total_mass + b->mass;
+n->cx = (n->cx * n->total_mass + b->px * b->mass) / new_mass;
+n->cy = (n->cy * n->total_mass + b->py * b->mass) / new_mass;
+n->total_mass = new_mass;
+```
+
+This is the **weighted average** formula applied incrementally. It runs on every node from root to leaf during insertion. After all N bodies are inserted, every internal node's `(cx, cy)` correctly reflects the centre of mass of all bodies in its subtree — computed in a single pass with no post-processing.
+
+**Why this is exact:** The two-body weighted average `(m₁·x₁ + m₂·x₂)/(m₁+m₂)` is algebraically equivalent to the full sum `Σmᵢxᵢ / Σmᵢ` when applied cumulatively. The incremental form handles arbitrary insertion order.
+
+*Files: `physics/barnes_hut.c`*
+
+---
+
+#### S3 Static Node Pool — No malloc
+
+```c
+static QNode g_pool[NODE_POOL_MAX];   /* 16,000 nodes */
+static int   g_pool_top = 0;
+
+static int qt_alloc(...) {
+    return g_pool_top++;              /* O(1) allocation */
+}
+
+/* Reset: */
+g_pool_top = 0;                       /* O(1) — "frees" everything */
+```
+
+The pool is reset by setting `g_pool_top = 0`. All previous nodes are logically freed in a single write. This is safe because the entire tree is rebuilt from scratch each tick — no node persists across ticks.
+
+**Capacity bound:** Each body insertion creates at most 4 new nodes (when splitting a leaf that held one body into 4 children and re-inserting both). For N=800: worst case ≈ 800×4 = 3200 nodes, well within the 16,000 cap.
+
+**Why not malloc:** A single `malloc(sizeof(QNode))` per node at 60 Hz × 16,000 nodes/tick = 960,000 allocations/second. The heap overhead (lock contention, fragmentation, bookkeeping) would dominate the simulation cost. The static pool has zero overhead.
+
+*Files: `physics/barnes_hut.c`*
+
+---
+
+#### S4 Keplerian Orbit Initialization
+
+For a body orbiting a dominant central mass M_c, the circular orbit speed at radius r is:
+
+```
+v_kep = sqrt(G · M_c / r)
+```
+
+This comes from equating centripetal acceleration `v²/r` to gravitational acceleration `G·M_c/r²`.
+
+In the galaxy preset, body 0 is a massive anchor (mass = N×3). All other bodies are placed at random radii and given Keplerian tangential velocity:
+
+```c
+float v_kep = sqrtf(g_G * M_bh / r);
+float nx = -(py - cy) / r;   /* tangential unit vector (CCW) */
+float ny =  (px - cx) / r;
+body.vx = nx * v_kep;
+body.vy = ny * v_kep;
+```
+
+**Differential rotation:** Inner bodies (small r) have shorter orbital period T = 2πr/v_kep = 2πr/√(GM/r) = 2π√(r³/GM). At r=0.1R, T is 1/√1000 ≈ 3% of the outer orbit period. This differential means inner bodies lap outer bodies, naturally winding any initial spiral pattern over time.
+
+**Small eccentricity scatter:** A ±6% random perturbation to v_kep makes orbits slightly elliptical. This prevents the disk from looking artificially rigid and produces the precessing ellipse patterns characteristic of real stellar disks.
+
+*Files: `physics/barnes_hut.c`, `artistic/galaxy.c`*
+
+---
+
+#### S5 Brightness Accumulator + Glow Decay
+
+A float grid `g_bright[ROWS][COLS]` accumulates brightness from bodies and decays exponentially each render frame:
+
+```c
+/* Accumulate: each body increments its cell */
+g_bright[row][col] += 1.0f;
+
+/* Decay: every render frame */
+g_bright[r][c] *= DECAY;   /* DECAY = 0.93 */
+
+/* Steady-state: cell with f bodies/frame reaches B_ss = f/(1-DECAY) = 14.3 */
+```
+
+The max brightness at any cell is tracked each frame for normalisation: `norm = b / b_max`. This means the brightest cell always renders as the top character regardless of absolute body count — the ramp auto-scales to the current density.
+
+**Decay timescale:** `DECAY=0.93` → half-life ≈ `ln(0.5)/ln(0.93) ≈ 9.5` render frames. At 30fps, a single body visit fades over ~0.3 seconds. Orbital trails (bodies visiting a cell repeatedly) maintain steady brightness.
+
+**Difference from galaxy.c:** `galaxy.c` uses `DECAY=0.82` (half-life ~3.5 frames) because it has 3000 stars visiting cells densely and needs faster fade to prevent saturation. `barnes_hut.c` uses `DECAY=0.93` because bodies are sparse and slow decay keeps orbital paths visible.
+
+*Files: `physics/barnes_hut.c`, `artistic/galaxy.c`*
+
+---
+
+#### S6 Speed-Normalized Color Mapping
+
+To make body velocities visible, colors are mapped from speed relative to the rolling maximum:
+
+```c
+static float g_v_max = 1.0f;
+
+/* After each tick: */
+float spd = hypotf(body.vx, body.vy);
+if (spd > g_v_max) g_v_max = spd;
+g_v_max *= 0.9995f;   /* slow decay so colormap adapts */
+
+/* In draw: */
+float norm = spd / g_v_max;
+int pair = (norm > 0.80f) ? CP_L5 :   /* blazing */
+           (norm > 0.55f) ? CP_L4 :
+           (norm > 0.30f) ? CP_L3 :
+           (norm > 0.10f) ? CP_L2 : CP_L1;  /* nearly still */
+```
+
+The rolling max with slow decay (`×0.9995` per tick = −3% per second) ensures the full color range is used even when dynamics slow down. Without decay, a single high-speed ejection early in the simulation would fix g_v_max high for the entire run, making all subsequent bodies appear dim.
+
+*Files: `physics/barnes_hut.c`*
+
+---
+
+### T — Wave Physics & Signal Analysis
+
+#### T1 Analytic Wave Interference — Phase Precomputation
+
+**Problem:** Computing `Σ A·cos(k·rᵢⱼ − ωt)` per cell per frame is expensive if `k·rᵢⱼ` is recomputed each frame.
+
+**Solution:** Precompute `g_phase[s][row][col] = k · dist(source_s, cell)` once at startup (or on source move). Each frame only evaluates `cos(g_phase[s][r][c] − ω·t)`:
+
+```c
+/* Precompute (once per source position change) */
+for each source s:
+    for each cell (r,c):
+        float dx = (c * CELL_W) - source[s].px;
+        float dy = (r * CELL_H) - source[s].py;
+        g_phase[s][r][c] = K * sqrtf(dx*dx + dy*dy);
+
+/* Per frame (fast) */
+float sum = 0;
+for each source s:
+    sum += cosf(g_phase[s][r][c] - omega * t);
+sum /= n_sources;   /* normalise to [-1,+1] */
+```
+
+The per-cell cost drops from `sqrt + mul + cos` to just `cos + sub` per source per frame.
+
+**Signed 8-level ramp:** `sum ∈ [-1,+1]` maps to 8 color pairs: 3 negative (blue), 1 neutral, 3 positive (red), 1 white peak. This directly visualises the wave physics — destructive interference = blue, constructive = red/white.
+
+*Files: `fluid/wave_interference.c`*
+
+---
+
+#### T2 Lyapunov Exponent — Alternating Logistic Map
+
+The **logistic map** `xₙ₊₁ = r·xₙ·(1−xₙ)` transitions from stable fixed points (r < 3) to period doubling (3 < r < 3.57) to chaos (r > 3.57) as r increases.
+
+The **Lyapunov exponent** `λ = (1/N) Σ ln|f'(xₙ)| = (1/N) Σ ln|r(1−2xₙ)|` measures the average rate of divergence of nearby trajectories:
+- λ < 0: trajectories converge → **stable** (fixed point or cycle)
+- λ = 0: bifurcation boundary
+- λ > 0: trajectories diverge → **chaos**
+
+The **Lyapunov fractal** assigns each pixel `(a, b)` as a parameter set: the logistic map alternates between rate `a` and rate `b` in the sequence AABBA or ABABAB (specified per preset). Each pixel computes λ for its (a,b) pair.
+
+```c
+/* For pixel at (a, b): */
+float x = 0.5f;
+float lambda = 0.0f;
+for (int n = 0; n < ITER; n++) {
+    float r = (seq[n % seq_len] == 'A') ? a : b;
+    x = r * x * (1.0f - x);
+    float deriv = fabsf(r * (1.0f - 2.0f*x));
+    if (deriv > 0) lambda += logf(deriv);
+}
+lambda /= ITER;
+```
+
+**int8_t bucket encoding:** The computed λ is stored as a signed 8-bit integer (×32 scale) rather than a float, saving 4× memory and enabling fast palette lookup via sign bit.
+
+*Files: `fractal_random/lyapunov.c`*
+
+---
+
+#### T3 DBM Laplace Growth — Gauss-Seidel + φ^η
+
+**Dielectric Breakdown Model (DBM):** Models lightning, dendritic crystal growth, and Laplacian fractal growth. A voltage field `φ` satisfies Laplace's equation `∇²φ = 0` (Gauss-Seidel iteration). Growth probability at each frontier cell is proportional to `φ^η` — higher η produces thinner, more branchy structures (η=1: DLA-like, η=∞: straight line to the electrode).
+
+**Algorithm:**
+1. Set `φ=1` at top row (electrode), `φ=0` at aggregate cells (conductor)
+2. Iterate Gauss-Seidel: `φ[r][c] = 0.25·(φ[r-1][c] + φ[r+1][c] + φ[r][c-1] + φ[r][c+1])` for all non-boundary, non-aggregate cells
+3. Find all frontier cells (empty cells adjacent to aggregate)
+4. Select one frontier cell with probability ∝ `φ[r][c]^η`
+5. Add it to aggregate; set `φ[r][c] = 0`
+6. Repeat
+
+The key difference from pure DLA (random walker) is that the Laplace field `φ` is computed explicitly — growth follows the electric field gradient rather than random diffusion, giving sharper branching patterns.
+
+**Neumann boundary conditions:** Side walls get `∂φ/∂n = 0` (no flux): `φ[r][0] = φ[r][1]`, `φ[r][cols-1] = φ[r][cols-2]`. This lets the field bend naturally around obstacles without artificial reflection.
+
+*Files: `fractal_random/tree_la.c`*
 
 ---
 

@@ -75,6 +75,16 @@ Reference implementation: `basics/bounce_ball.c`
 40. [Diamond-Square Terrain — fractal_random/terrain.c](#40-diamond-square-terrain--fractal_randomterrainc)
 41. [Forest Fire CA — misc/forest_fire.c](#41-forest-fire-ca--miscforest_firec)
 42. [Lattice Gas — fluid/lattice_gas.c](#42-lattice-gas--fluidlattice_gasc)
+43. [Galaxy — artistic/galaxy.c](#43-galaxy--artisticgalaxyc)
+44. [Barnes-Hut — physics/barnes_hut.c](#44-barnes-hut--physicsbarnes_hutc)
+45. [Analytic Wave Interference — fluid/wave_interference.c](#45-analytic-wave-interference--fluidwave_interferencec)
+46. [7-Segment LED Morph — artistic/led_number_morph.c](#46-7-segment-led-morph--artisticled_number_morphc)
+47. [Particle Number Morph — artistic/particle_number_morph.c](#47-particle-number-morph--artisticparticle_number_morphc)
+48. [Julia Explorer — fractal_random/julia_explorer.c](#48-julia-explorer--fractal_randomjulia_explorerc)
+49. [IFS Chaos Game — fractal_random/barnsley.c](#49-ifs-chaos-game--fractal_randombarnsleyc)
+50. [DLA Extended — fractal_random/diffusion_map.c](#50-dla-extended--fractal_randomdiffusion_mapc)
+51. [DBM Tree — fractal_random/tree_la.c](#51-dbm-tree--fractal_randomtree_lac)
+52. [Lyapunov Fractal — fractal_random/lyapunov.c](#52-lyapunov-fractal--fractal_randomlyapunovc)
 
 ---
 
@@ -2555,6 +2565,266 @@ Aspect-ratio correction (`ry = rx * 0.5`) makes the galaxy appear circular on te
 `a/A` cycle 2→3→4 arms (resets); `+/-` orbit speed; `t/T` theme; `r` reset; `p` pause.
 
 *Files: `artistic/galaxy.c`*
+
+---
+
+## 44. Barnes-Hut — physics/barnes_hut.c
+
+O(N log N) Barnes-Hut gravity with up to 800 bodies. A quadtree is rebuilt every physics tick from a static pool; direct body glyphs overlay a glow accumulator for clear visual feedback.
+
+### Quadtree Build and Force Traversal
+
+The tree is rebuilt from scratch each tick — `g_pool_top = 0` resets the 16,000-node static pool in O(1). Insertion updates the centre-of-mass incrementally on every node from root to leaf. Force traversal applies `s/d < θ=0.5`: if the cell is small and far, treat it as a single point mass; otherwise recurse into four children.
+
+```c
+/* Incremental COM update on insert */
+float nm = n->total_mass + b->mass;
+n->cx = (n->cx * n->total_mass + b->px * b->mass) / nm;
+n->total_mass = nm;
+
+/* Force criterion */
+float s = n->x1 - n->x0;
+if (s/d < THETA || is_leaf(n))
+    apply_gravity_from_node(bi, n);   /* treat as point mass */
+else
+    for (c in 0..3) qt_force(child[c], bi, fx, fy);
+```
+
+### Galaxy Preset — Central BH + Keplerian Disk
+
+Body 0 is a central black hole (`mass = N×3`, `anchor=true` — skipped in integration). Bodies 1..N−1 are placed at random radii and given Keplerian velocities `v = sqrt(G·M_bh/r)`. Differential rotation (inner bodies orbit faster) naturally shears the disk into spiral patterns over a few orbital periods.
+
+### Dual-Layer Rendering
+
+**Layer 1 — Glow grid:** Each body increments `g_bright[row][col]`. Grid decays by 0.93 per render frame. Normalised by `b_max` → character ramp `.,+oO`.
+
+**Layer 2 — Direct body glyphs:** Every active body is drawn at its current cell with a character and color determined by `spd/g_v_max`: dim `,` (still) → bright `*` (fast). Drawn on top of the glow. Bodies are always visible regardless of speed.
+
+### Quadtree Overlay
+
+`'o'` key toggles ACS_HLINE/ACS_VLINE grid lines at depth ≤ 3 (≤ 64 cells). Below depth 3 the lines would obscure bodies; the `(cx1-cx0) < 2` guard prevents drawing lines inside sub-cell nodes.
+
+### Keys
+
+`q` quit, `p`/`space` pause, `r` reset, `1/2/3` preset, `t/T` theme, `o` overlay, `f` 4× fast-forward, `+/-` bodies, `g/G` gravity.
+
+**Build:** `gcc -std=c11 -O2 -Wall -Wextra physics/barnes_hut.c -o barnes_hut -lncurses -lm`
+
+*Files: `physics/barnes_hut.c`*
+
+---
+
+## 45. Analytic Wave Interference — fluid/wave_interference.c
+
+Superposition of N sinusoidal point sources computed analytically — no FDTD grid, no time stepping of fields. Each source contributes `A·cos(k·r − ωt)`.
+
+### Phase Precomputation
+
+The spatial phase `k·r` is constant for a fixed source position. It is precomputed once into `g_phase[s][row][col]` when sources are placed or moved:
+
+```c
+float dx = (float)(c * CELL_W) - src.px;
+float dy = (float)(r * CELL_H) - src.py;
+g_phase[s][r][c] = K * sqrtf(dx*dx + dy*dy);
+```
+
+Per frame, each cell evaluates only `Σ cos(g_phase[s][r][c] − ω·t)` — one subtraction and one `cosf` per source per cell. The result in `[-1,+1]` maps to the signed 8-level ramp CP_N3..CP_P3.
+
+### Presets
+
+| Preset | Sources | Pattern |
+|--------|---------|---------|
+| Double slit | 2 in-phase point sources | Young's double-slit fringes |
+| Ring | 6 evenly-spaced circular | Star interference |
+| Linear | 4 evenly-spaced horizontal | Directional beam |
+| Standing wave | 2 opposing phase sources | Nodes and antinodes |
+
+*Files: `fluid/wave_interference.c`*
+
+---
+
+## 46. 7-Segment LED Morph — artistic/led_number_morph.c
+
+168 particles (7 segments × 24 particles each) animate between digit shapes using spring physics. Each particle permanently belongs to one segment and springs toward that segment's on/off target.
+
+### Segment Bitmask
+
+```c
+/* k_seg_mask[d] = bitmask of which 7 segments are active for digit d */
+static const uint8_t k_seg_mask[10] = {
+    0x3F, 0x06, 0x5B, 0x4F, 0x66,   /* 0–4 */
+    0x6D, 0x7D, 0x07, 0x7F, 0x6F,   /* 5–9 */
+};
+```
+
+On digit change, each segment checks its bit; `on=true` parks particles at the segment's displayed positions, `on=false` parks them at a collapsed centre point.
+
+### Spring Physics
+
+Each particle: `F = SPRING_K·(target−pos) − DAMP·vel`. With SPRING_K=9, DAMP=5.5, the damping ratio ζ = DAMP/(2·sqrt(SPRING_K)) ≈ 0.92 — slightly underdamped, producing a small overshoot visible as a bounce at each digit transition.
+
+### Orientation-Aware Characters
+
+Horizontal segments use `─` (or `-`), vertical segments use `│` (or `|`). The segment orientation is stored in `k_seg_orient[]`; the draw function selects the character at render time, never at physics time.
+
+*Files: `artistic/led_number_morph.c`*
+
+---
+
+## 47. Particle Number Morph — artistic/particle_number_morph.c
+
+Up to 500 particles morph between bitmap font digits using greedy nearest-neighbour assignment and smoothstep LERP.
+
+### Bitmap Font Expansion
+
+A 9-row × 7-column binary font defines each digit. Each `#` pixel is expanded to a sub-grid of `ppr × ppc` particles (up to 3×4), scaled to terminal size. All 10 digit target grids are precomputed once at startup into `g_targets[10][N_PARTS]`.
+
+### Greedy Nearest-Neighbour Assignment
+
+On digit change, each of the new digit's `n_targets` positions is assigned the closest unassigned particle. O(n_targets × N_PARTS) ≈ 234,000 comparisons — runs in < 1ms. Unassigned particles are marked inactive and lerp to the centre (emerge/vanish effect).
+
+### Smoothstep LERP + Origin Snapshot
+
+```c
+float st = t*t*(3.0f - 2.0f*t);          /* smoothstep */
+p.x = p.ox + st * (p.tx - p.ox);         /* lerp from snapshot */
+```
+
+`ox/oy` is snapshotted at `digit_assign()` time — wherever the particle currently is (possibly mid-previous-morph). This means rapid digit changes produce smooth continuous motion rather than teleporting to the last digit's final position.
+
+*Files: `artistic/particle_number_morph.c`*
+
+---
+
+## 48. Julia Explorer — fractal_random/julia_explorer.c
+
+Split-screen interactive Julia/Mandelbrot explorer. Left panel: precomputed Mandelbrot map (computed once at startup, reused every frame). Right panel: Julia set for the current complex parameter c (recomputed every frame).
+
+### Precomputed Mandelbrot Buffer
+
+`g_mbuf[ROWS][COLS_M]` stores escape iteration counts for the Mandelbrot view at startup. The left panel renders from this buffer every frame at zero recomputation cost. Resize triggers a single recompute.
+
+### Live Julia Panel
+
+The right panel recomputes the Julia set for the current c each frame. The Julia iteration `z → z² + c` is the same as Mandelbrot but with fixed c and varying z₀ (pixel coordinates). Dynamic panel widths `g_mw / g_jw` rebalance on resize so both panels always show correctly aspect-corrected views.
+
+### Auto-Wander
+
+When auto-wander is active, c traces an ellipse near the Mandelbrot boundary:
+```c
+c.re = WANDER_R * cosf(wander_angle);
+c.im = WANDER_R * WANDER_YSHRK * sinf(wander_angle);
+```
+`WANDER_R=0.72` places the ellipse in the bulge-arm junction — the most visually rich part of the Mandelbrot boundary.
+
+*Files: `fractal_random/julia_explorer.c`*
+
+---
+
+## 49. IFS Chaos Game — fractal_random/barnsley.c
+
+Five IFS presets (Barnsley Fern, Sierpinski Triangle, Lévy C Curve, Dragon Curve, Fractal Tree) rendered via the chaos game with log-density accumulation.
+
+### Cumulative Probability Transform Selection
+
+Each preset defines transforms with associated probabilities. Selection uses cumulative thresholds against a uniform random float — O(1) lookup for up to 6 transforms:
+
+```c
+float r = rng_f();
+int t = 0;
+while (r > cum_prob[t]) t++;
+/* Apply transform t */
+```
+
+### Log-Density Rendering
+
+```c
+float norm = logf(1.0f + (float)hits[r][c])
+           / logf(1.0f + (float)max_hits);
+```
+
+Maps the wide dynamic range (1 hit to millions) to [0,1]. Four character levels: `. : + @`. The y-axis is flipped: grid row 0 corresponds to `y_max`, row ROWS-1 to `y_min` (IFS attractors are defined in a coordinate system where y increases upward).
+
+*Files: `fractal_random/barnsley.c`*
+
+---
+
+## 50. DLA Extended — fractal_random/diffusion_map.c
+
+Diffusion-Limited Aggregation (DLA) with Eden mode toggle and age-gradient coloring. Tip-enhancement biases growth toward the frontier's sharpest protrusions.
+
+### Tip Enhancement
+
+The stick probability for a walker adjacent to the aggregate depends on how many aggregate neighbours the candidate cell has. More aggregate neighbours → lower priority (interior) vs fewer neighbours → higher priority (tips). This produces denser branching than pure DLA.
+
+### Eden Mode
+
+Instead of simulating a random walk, Eden mode directly samples a random frontier cell (BFS queue of aggregate-adjacent empty cells) and adds it. This fills space uniformly, producing compact rounded shapes vs DLA's fractal branches. The toggle lets you switch mid-growth.
+
+### Age Gradient
+
+Each cell records its freeze tick as `uint16_t age`. Since age increases monotonically and wraps at 65536, old structures appear in one color and new growth in another — the structure's growth history is visible as a hue gradient.
+
+*Files: `fractal_random/diffusion_map.c`*
+
+---
+
+## 51. DBM Tree — fractal_random/tree_la.c
+
+Dielectric Breakdown Model: Laplace's equation controls fractal tree/lightning growth. Higher `η` exponent produces thinner, more branched structures.
+
+### Gauss-Seidel Relaxation
+
+The voltage field `φ` satisfies `∇²φ = 0`. Gauss-Seidel iterates until convergence (typically 50–200 passes per growth step depending on grid size):
+
+```c
+for (int r = 1; r < rows-1; r++)
+    for (int c = 1; c < cols-1; c++)
+        if (!aggregate[r][c])
+            phi[r][c] = 0.25f*(phi[r-1][c]+phi[r+1][c]+phi[r][c-1]+phi[r][c+1]);
+```
+
+### φ^η Frontier Selection
+
+Frontier cells are sampled with probability proportional to `phi[r][c]^eta`. Implementation: compute `sum = Σ phi^eta` over all frontier cells, then draw a random float in `[0, sum]` and walk the frontier until the cumulative weight exceeds the draw.
+
+### Visual Encoding
+
+`φ` value at each cell → color pair (high φ near electrode = bright; low φ deep in tree = dim). The gradient visualises the current electric field, showing where new growth is likely.
+
+*Files: `fractal_random/tree_la.c`*
+
+---
+
+## 52. Lyapunov Fractal — fractal_random/lyapunov.c
+
+Each pixel `(a, b)` in a 2D parameter space computes the Lyapunov exponent of the logistic map alternating between rates a and b.
+
+### Progressive Row Rendering
+
+Computing all pixels in one frame stalls the terminal for hundreds of milliseconds. Instead, `N_ROWS_PER_FRAME` rows are computed per frame, with the rest drawn from a cached `int8_t g_lya[ROWS][COLS]` buffer. Pressing `r` clears the buffer and restarts computation top-to-bottom.
+
+### int8_t Bucket Encoding
+
+The computed float λ (typically in `[-3, +3]`) is scaled by 32 and clamped to `[-127, +127]`, stored as `int8_t`. This is 4× more memory-efficient than float and enables fast sign-based palette lookup:
+
+```c
+int8_t bkt = (int8_t)clamp(lambda * 32.0f, -127.0f, 127.0f);
+int pair, lvl;
+if (bkt < 0) {                            /* stable: blue */
+    lvl  = (int)((-bkt) * 3 / 128);
+    pair = CP_S1 + lvl;
+} else {                                  /* chaotic: red */
+    lvl  = (int)(bkt * 3 / 128);
+    pair = CP_C1 + lvl;
+}
+```
+
+### Axis Orientation
+
+The b-axis is inverted: row 0 = `b_max`, row ROWS-1 = `b_min`. This matches the standard Lyapunov fractal orientation where the "Zircon City" structure appears in the upper-left quadrant.
+
+*Files: `fractal_random/lyapunov.c`*
 
 ---
 

@@ -36,9 +36,9 @@ Sleep before render. erase → scene_draw → HUD → wnoutrefresh → doupdate.
 
 ## Progress
 
-**Done (0/6):**
+**Done (1/6):** barnes_hut
 
-**Remaining (6):** lbm, fluid_sph, fem_solid, rigid_body_rot, barnes_hut, maxwell_fdtd
+**Remaining (5):** lbm, fluid_sph, fem_solid, rigid_body_rot, maxwell_fdtd
 
 ---
 

@@ -9,7 +9,7 @@
   ╚═════╝    ╚══════╝  terminal as canvas
 ```
 
-100 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+127 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -39,6 +39,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `wave_2d` | 2D scalar wave PDE — Huygens interference, multiple point sources, signed amplitude colour map |
 | `reaction_wave` | FitzHugh-Nagumo excitable medium — activator/inhibitor PDE, spiral waves, 4 color themes |
 | `excitable` | Greenberg-Hastings N-state CA — resting/excited/refractory rule; 4 presets (Spiral/Double/Rings/Chaos); N adjustable 5–20 controls refractory depth and wave spacing; broken-front spiral nucleation; radially periodic IC for target rings; 5 themes; `spc` manual pulse |
+| `wave_interference` | Analytic N-source wave interference — precomputed k·r phase table, aspect-corrected pixel distance, 8-level signed amplitude colour ramp; 4 presets (Double Slit/Ripple Tank/Beat/Radial); 5 themes; interactive source move/add/delete, ω and λ control |
 | `flowfield` | Perlin fBm vector field — bilinear sampling, 8-direction particle trails |
 
 ### Physics
@@ -64,6 +65,11 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | Program | Algorithm |
 |---------|-----------|
 | `mandelbrot` / `julia` | Escape-time iteration, Fisher-Yates random reveal, 6 zoom presets |
+| `julia_explorer` | Interactive Julia explorer — split screen: Mandelbrot map (left, precomputed) with crosshair, Julia set (right, per-frame recompute); arrow keys / HJKL move c; auto-wander orbits the Mandelbrot boundary; z/Z zoom Julia view; 5 themes |
+| `barnsley` | IFS chaos game — 5 presets (Barnsley Fern/Sierpinski/Levy C/Dragon/Fractal Tree); probability-weighted affine transform selection; log-density hit accumulator rendered with 4 char levels; 5 themes |
+| `diffusion_map` | Diffusion-Limited Aggregation — on-lattice random walk with launch circle + kill radius; Eden growth toggle (direct frontier pick); age-gradient coloring 5 levels; 5 themes (Coral/Ice/Lava/Plasma/Mono) |
+| `tree_la` | Dielectric Breakdown Model — Gauss-Seidel Laplace relaxation, frontier growth probability ∝ φ^η; 3 presets (Tree/Lightning/Coral); live η control with `e`/`E` |
+| `lyapunov` | Lyapunov fractal — alternating a/b logistic map sequences per pixel; λ sign determines stability (blue=stable, red=chaos); progressive row rendering; 6 sequences; 2 themes |
 | `buddhabrot` | Two-pass orbit density accumulation, log-normalized nebula palette |
 | `newton_fractal` | Complex Newton-Raphson on z⁴−1, basin coloring |
 | `strange_attractor` | Clifford/de Jong/Ikeda density maps, log-normalized hit grid |
@@ -146,6 +152,8 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `railwaymap` | Procedural transit map — H/V/Z grid-aligned line templates, canvas-based ACS junction detection, station interchange, 10 themes |
 | `fireworks_rain` | Fireworks with matrix-rain arc trails — each of 72 sparks per explosion grows a 16-slot position-history trail; chars shimmer 75 % per tick; 5 themes (vivid/matrix/fire/ice/plasma) remap all spark color pairs; `t` cycles theme |
 | `matrix_snowflake` | Matrix rain + live DLA snowflake — two real simulations on one screen: classic digital rain in the background; a D6-symmetric DLA ice crystal grows from the center in the foreground, freezing 12 symmetric positions per walker stick event; crystal flashes white on completion then resets; 5 themes (Classic/Inferno/Nebula/Toxic/Gold) |
+| `led_number_morph` | Particle digit morphing — 168 particles form a scaled 7-segment LED display; particles belong permanently to one segment and spring to their targets when the segment is lit, drift to centre when dark; orientation-aware chars ('-' horizontal, '|' vertical) for formed segments; scales with terminal height; 5 themes with per-digit colours; `n` skip, `]`/`[` speed |
+| `particle_number_morph` | Solid filled particle morphing — up to 500 particles densely pack the full interior of a 9×7 bitmap font digit; greedy nearest-neighbour matching routes every particle to its closest target; positions lerp with smoothstep easing (no spring/velocity) for a clean deterministic glide; idle particles glide to centre and vanish; `f`/`F` morph speed, `]`/`[` hold time; 5 themes |
 ### Algorithms
 | Program | Algorithm |
 |---------|-----------|

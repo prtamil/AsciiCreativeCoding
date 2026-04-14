@@ -108,6 +108,17 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/railwaymap.c          -o railwaymap    -
 gcc -std=c11 -O2 -Wall -Wextra artistic/galaxy.c              -o galaxy        -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/rigid_body.c           -o rigid_body    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/soft_body.c            -o soft_body     -lncurses -lm -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/bubble_chamber.c       -o bubble_chamber -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/wave_interference.c      -o wave_interference -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/excitable.c              -o excitable      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/lattice_gas.c            -o lattice_gas    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/julia_explorer.c -o julia_explorer -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/barnsley.c       -o barnsley       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/diffusion_map.c  -o diffusion_map  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/tree_la.c        -o tree_la        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/lyapunov.c       -o lyapunov       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/led_number_morph.c    -o led_number_morph    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/particle_number_morph.c -o particle_number_morph -lncurses -lm
 
 # ── raytracing ───────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raytracing/sphere_raytrace.c   -o sphere_raytrace   -lncurses -lm

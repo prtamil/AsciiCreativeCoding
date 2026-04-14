@@ -12,7 +12,7 @@ Ideas ranked by learning value and visual payoff. Each builds on existing projec
 | 2 | ~~`sand_art.c`~~ | artistic/ | Sand falling through a rotating hourglass — gravity CA + rotating obstacle | Falling sand CA + angle-driven gravity vector, collision geometry | **DONE** |
 | 3 | ~~`fourier_art.c`~~ | artistic/ | Real-time Fourier drawing — user traces a path, DFT computes epicycles that redraw it | DFT on sampled path, epicycle arm chain sorted by amplitude | **DONE** |
 | 4 | ~~`magnetic_field.c`~~ | physics/ | 2D magnetic field lines from configurable dipoles — streamline tracing | Vector field integration, Biot-Savart for discrete charges | **DONE** |
-| 5 | `wave_interference.c` | fluid/ | N point sources radiating in a tank — real-time amplitude sum with color map | FDTD or analytic sum, signed amplitude → color gradient |
+| 5 | ~~`wave_interference.c`~~ | fluid/ | N point sources radiating in a tank — real-time amplitude sum with color map | Analytic sinusoidal sum, precomputed k·r table, signed 8-level color ramp | **DONE** |
 
 ---
 
@@ -32,11 +32,11 @@ Ideas ranked by learning value and visual payoff. Each builds on existing projec
 
 | # | Name | Folder | Concept | Key Technique |
 |---|---|---|---|---|
-| 11 | `julia_explorer.c` | fractal_random/ | Interactive Julia set explorer — arrow keys move the c parameter in real time | Same julia escape-time code, but c updates live and grid recomputes incrementally |
-| 12 | `barnsley.c` | fractal_random/ | Full Barnsley IFS system — multiple transforms with arbitrary affine matrices | IFS transform table, probability-weighted random selection, chaos game |
-| 13 | `diffusion_map.c` | fractal_random/ | Eden growth model — cells grow from a seed by random attachment (no symmetry) | Simple DLA without symmetry, natural blob morphology |
-| 14 | `tree_la.c` | fractal_random/ | Lightning-tree fractal — dielectric breakdown model (DBM) for lightning branches | DBM probability field (Laplace-like), probabilistic attachment, recursive branching |
-| 15 | `lyapunov.c` | fractal_random/ | Lyapunov fractal — parameter space of a logistic map with alternating parameters | Alternating a/b sequences, Lyapunov exponent per pixel, signed color map |
+| 11 | ~~`julia_explorer.c`~~ | fractal_random/ | Interactive Julia set explorer — arrow keys move the c parameter in real time | Split-screen: Mandelbrot map (left, precomputed) + Julia (right, per-frame); crosshair on Mandelbrot; auto-wander; zoom; 5 themes | **DONE** |
+| 12 | ~~`barnsley.c`~~ | fractal_random/ | Full Barnsley IFS system — multiple transforms with arbitrary affine matrices | IFS transform table, probability-weighted random selection, chaos game; 5 presets (Fern/Sierpinski/Levy/Dragon/Tree); hit-accumulator grid with log-density render | **DONE** |
+| 13 | ~~`diffusion_map.c`~~ | fractal_random/ | DLA without symmetry — particles random-walk until touching cluster | On-lattice DLA with launch circle + kill radius; Eden toggle mode; age-gradient coloring; 5 themes | **DONE** |
+| 14 | ~~`tree_la.c`~~ | fractal_random/ | Lightning-tree fractal — dielectric breakdown model (DBM) for lightning branches | Gauss-Seidel Laplace relaxation; frontier weighted by φ^η; 3 presets (Tree/Lightning/Coral); eta control | **DONE** |
+| 15 | ~~`lyapunov.c`~~ | fractal_random/ | Lyapunov fractal — parameter space of a logistic map with alternating parameters | Alternating a/b sequences; λ per pixel; signed color map (blue=stable, red=chaos); progressive row render; 6 sequences | **DONE** |
 
 ---
 
@@ -54,10 +54,11 @@ Ideas ranked by learning value and visual payoff. Each builds on existing projec
 
 ## Progress
 
-**Done (12/20):** galaxy, sand_art, fourier_art, magnetic_field, bubble_chamber, chain, rigid_body,
-soft_body, slime_mold, forest_fire, lattice_gas, excitable
+**Done (18/20):** galaxy, sand_art, fourier_art, magnetic_field, bubble_chamber, chain, rigid_body,
+soft_body, slime_mold, forest_fire, lattice_gas, excitable, wave_interference, julia_explorer,
+barnsley, diffusion_map, tree_la, lyapunov
 
-**Remaining (8):** wave_interference, fluid_sph, julia_explorer, barnsley, diffusion_map, tree_la, lyapunov, vote_ca
+**Remaining (2):** fluid_sph, vote_ca
 
 ---
 

@@ -110,7 +110,7 @@ static inline int canvas_h_from_rows(int rows) { return rows / CELL_H; }
 #define SPHERE_R_DEFAULT  1.1f
 #define SIZE_STEP         1.15f
 #define SIZE_MIN          0.2f
-#define SIZE_MAX          3.0f
+#define SIZE_MAXX          3.0f
 
 /* Light orbit (radians/sec) */
 #define LIGHT_SPD_DEFAULT 0.8f
@@ -625,7 +625,7 @@ static bool app_handle_key(App *app, int ch)
 
     case '=': case '+':
         s->sphere_r *= SIZE_STEP;
-        if (s->sphere_r > SIZE_MAX) s->sphere_r = SIZE_MAX;
+        if (s->sphere_r > SIZE_MAXX) s->sphere_r = SIZE_MAXX;
         break;
     case '-':
         s->sphere_r /= SIZE_STEP;

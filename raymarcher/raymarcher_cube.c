@@ -103,7 +103,7 @@ static inline int canvas_h_from_rows(int rows) { return rows / CELL_H; }
 #define CUBE_H_DEFAULT  0.9f    /* cube half-size (world units)         */
 #define SIZE_STEP       1.15f
 #define SIZE_MIN        0.15f
-#define SIZE_MAX        2.5f
+#define SIZE_MAXX        2.5f
 
 /* ---- rotation ---- */
 #define ROT_X_DEFAULT   0.7f    /* radians/sec around X axis            */
@@ -657,7 +657,7 @@ static bool app_handle_key(App *app, int ch)
 
     case '=': case '+':
         s->cube_h *= SIZE_STEP;
-        if (s->cube_h > SIZE_MAX) s->cube_h = SIZE_MAX;
+        if (s->cube_h > SIZE_MAXX) s->cube_h = SIZE_MAXX;
         break;
     case '-':
         s->cube_h /= SIZE_STEP;

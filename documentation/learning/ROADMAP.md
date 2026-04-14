@@ -132,8 +132,8 @@ Requires linear algebra and graphics pipeline understanding.
 | `capsule_raytrace.c` | Analytic ray tracing | cylinder+sphere-cap decomposition, axial projection normal, inverse-rotation transform |
 | `blackhole.c` | GR null-geodesic raytracer | Schwarzschild metric (RK4), precomputed lensing table, photon ring, Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift, 11 themes |
 | `mandelbulb_explorer.c` | 3D fractal raymarcher | spherical power DE, smooth coloring, orbit traps, AO, soft shadows, progressive rendering, 8 multi-hue themes |
-| `mandelbulb_raymarcher.c` | Hue-depth fractal (no lighting) | 30-step rainbow hue from escape time, COLOR_BANDS cycling, uniform '.' character, near-miss glow |
 | `mandelbulb_raster.c` | Fractal rasterization | sphere projection tessellation, HSV fragment shaders, rgb_to_cell 216-color, frag_phong_hue / frag_normals / frag_depth_hue |
+| `sdf_gallery.c` | SDF composition gallery | boolean ops min/max, smin polynomial blend, twist pre-warp, domain repetition, 5 scenes, 3 lighting modes (N·V/Phong/Flat), gamma-encoded Bourke ramp, bright hue-varying themes |
 | `path_tracer.c` | Monte Carlo path tracing | Lambertian BRDF, cosine hemisphere sampling (Malley), Russian roulette, progressive accumulator, Reinhard tone map, Cornell Box, xorshift32 RNG |
 
 ---

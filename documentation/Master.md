@@ -71,6 +71,7 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [G7 Stippled Lines — Distance-fade Bresenham](#g7-stippled-lines--distance-fade-bresenham)
 - [G8 cell_used Grid — Line Deduplication](#g8-cell_used-grid--line-deduplication)
 - [G9 Scorch Mark Persistence](#g9-scorch-mark-persistence)
+- [G10 Bright Hue-varying Theme Palette](#g10-bright-hue-varying-theme-palette)
 
 ### H — 3D Math
 - [H1 Vec3 / Vec4 — Inline Struct Math](#h1-vec3--vec4--inline-struct-math)
@@ -93,6 +94,10 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [I7 Orbit Trap Coloring](#i7-orbit-trap-coloring)
 - [I8 Near-miss Glow via min_d Tracking](#i8-near-miss-glow-via-min_d-tracking)
 - [I9 Progressive ROWS_PER_TICK Rendering](#i9-progressive-rows_per_tick-rendering)
+- [I10 SDF Boolean Operations — Union, Intersection, Subtraction](#i10-sdf-boolean-operations--union-intersection-subtraction)
+- [I11 Smooth Union — Polynomial smin Blend](#i11-smooth-union--polynomial-smin-blend)
+- [I12 Twist Deformation — Pre-warp Before SDF Evaluation](#i12-twist-deformation--pre-warp-before-sdf-evaluation)
+- [I13 Domain Repetition — Infinite Lattice from One Primitive](#i13-domain-repetition--infinite-lattice-from-one-primitive)
 
 ### J — Software Rasterization
 - [J1 Mesh — Vertex & Triangle Arrays](#j1-mesh--vertex--triangle-arrays)
@@ -123,7 +128,7 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [K4 Parametric Torus Lighting (Donut)](#k4-parametric-torus-lighting-donut)
 - [K5 3-Point Lighting Setup — Key + Fill + Rim](#k5-3-point-lighting-setup--key--fill--rim)
 - [K6 Depth Visualization Shader — View-space Depth → Color](#k6-depth-visualization-shader--view-space-depth--color)
-- [K7 Hue-Depth Encoding — Escape Time → Rainbow](#k7-hue-depth-encoding--escape-time--rainbow)
+- [K7 Three Lighting Modes — N·V / Phong / Flat](#k7-three-lighting-modes--nv--phong--flat)
 
 ### L — Algorithms & Data Structures
 - [L1 Bresenham Line Algorithm](#l1-bresenham-line-algorithm)
@@ -403,8 +408,8 @@ Human eyes are most sensitive to green and least to blue. Converting colour to b
 *Files: all raster files*
 
 #### G5 Gamma Correction
-Display hardware applies a nonlinear transfer function (gamma ≈ 2.2) to the stored color value. Working in linear light (as Phong shading does) and outputting without correction makes the image look too dark. Applying `pow(value, 1/2.2)` before output converts linear light to gamma-encoded display values and restores the correct perceptual brightness.
-*Files: all raster files, `raymarcher.c`*
+Display hardware applies a nonlinear transfer function (gamma ≈ 2.2) to the stored color value. Working in linear light (as Phong shading does) and outputting without correction makes the image look too dark. Applying `pow(value, 1/2.2)` before output converts linear light to gamma-encoded display values and restores the correct perceptual brightness. In terminal renderers the same principle applies to Bourke char selection: without `pow(luma, 0.45)` before the ramp index calculation, linear luma values cluster in the top 2–3 chars and the lower density chars are rarely used, collapsing perceived contrast.
+*Files: all raster files, `raymarcher.c`, `raymarcher/sdf_gallery.c`*
 
 #### G6 Directional Characters — Arrow & Line Glyphs
 In `flowfield.c` the particle head character is chosen by the angle of motion: `→ ↗ ↑ ↖ ← ↙ ↓ ↘`. Dividing `atan2(vy,vx)` by `π/4` and rounding to the nearest octant indexes into an 8-character array. In `spring_pendulum.c` the spring is drawn with `/`, `\`, `|`, `-` chosen by the local segment slope.
@@ -708,6 +713,23 @@ The first line to visit a cell claims it; all others silently skip. Dense connec
 
 `brust.c` maintains a `scorch[]` array that persists between explosion cycles. When a particle lands, its character and position are saved into the scorch array. Each frame, scorch marks are drawn with `A_DIM` (faded appearance) before drawing active particles. This creates visual history without any image compositing — the screen accumulates past explosions as progressively dimmer marks.
 *Files: `brust.c`*
+
+#### G10 Bright Hue-varying Theme Palette
+
+A theme palette that ramps from **dark to bright** within one hue has a fatal flaw on dark terminals: the low-gradient steps are near-black and invisible against the background. The scene appears partially rendered even when correct.
+
+The fix: make every palette entry a vivid, saturated color by ensuring at least one RGB channel sits at 4 or 5 in the xterm-256 cube (`color = 16 + 36r + 6g + b`, r/g/b ∈ 0–5). Vary **hue** across the gradient instead of brightness. Every step is readable; the theme's identity comes from its hue family (fire=red-orange, arctic=cyan-blue, etc.).
+
+```c
+/* Bad: dark → light of one hue — low steps invisible */
+{17, 18, 19, 20, 27, 33, 45, 159}  /* near-black blues at indices 0-3 */
+
+/* Good: hue varies, all steps bright */
+{51, 87, 123, 159, 153, 189, 225, 231}  /* cyan→sky→lavender→white, all visible */
+```
+
+Verification: decode any xterm-256 index to RGB: `r=(c-16)/36`, `g=((c-16)%36)/6`, `b=(c-16)%6`. An entry is "bright enough" when `max(r,g,b) >= 4`.
+*Files: `raymarcher/sdf_gallery.c`, `raymarcher/mandelbulb_explorer.c`*
 
 ---
 
@@ -1495,11 +1517,11 @@ The key difference from pure DLA (random walker) is that the Laplace field `φ` 
 
 #### I5 Mandelbulb Distance Estimator
 The Mandelbulb extends Mandelbrot iteration to 3D using spherical power: `z^p → r^p · (sin(pθ)cos(pφ), sin(pθ)sin(pφ), cos(pθ))` then `z += c`. The distance estimator tracks the derivative magnitude `dr = p · r^(p-1) · dr + 1` alongside the iteration, giving `DE = 0.5 · log(r) · r / dr`. When `dr` is large the surface is far; when small the march is close. Power 8 gives the classic 8-fold symmetric Mandelbulb; powers 2–12 sweep from sphere to full fractal.
-*Files: `raymarcher/mandelbulb_explorer.c`, `raymarcher/mandelbulb_raymarcher.c`, `raster/mandelbulb_raster.c`*
+*Files: `raymarcher/mandelbulb_explorer.c`, `raster/mandelbulb_raster.c`*
 
 #### I6 Smooth Escape-time Coloring
 Integer escape count `i` produces harsh banding where adjacent iteration shells have discrete color jumps. The continuous formula: `mu = i + 1 − log(log(|z|)/log(bail)) / log(power)`. The `log(log(|z|))` term measures how far past the bailout the orbit was, interpolating continuously between integer counts. `mu ∈ ℝ` produces smooth color gradients across depth shells.
-*Files: `raymarcher/mandelbulb_explorer.c`, `raymarcher/mandelbulb_raymarcher.c`*
+*Files: `raymarcher/mandelbulb_explorer.c`*
 
 #### I7 Orbit Trap Coloring
 During Mandelbulb iteration, track the minimum distance from any orbit point to a geometric object: `trap = min(trap, |z.y|)` (distance to XY plane). Points where the orbit stayed close to the trap get a different hue from points where it diverged widely. Orbit traps reveal the internal structure of the attractor basin, creating the characteristic "tentacle" and "pod" coloring visible on the surface.
@@ -1507,11 +1529,32 @@ During Mandelbulb iteration, track the minimum distance from any orbit point to 
 
 #### I8 Near-miss Glow via min_d Tracking
 During sphere marching, track the minimum DE value ever reached: `min_d = min(min_d, d)`. When the ray misses but came close (`min_d < GLOW_RANGE`), `glow_str = (1 − min_d/GLOW_RANGE)^3`. Pixels with glow_str > 0 receive a dim edge glow character — a halo around the fractal silhouette. This requires no extra DE calls; the march loop records min_d for free.
-*Files: `raymarcher/mandelbulb_explorer.c`, `raymarcher/mandelbulb_raymarcher.c`*
+*Files: `raymarcher/mandelbulb_explorer.c`*
 
 #### I9 Progressive ROWS_PER_TICK Rendering
 Raymarching the full screen at 60 fps is too slow for complex fractals. Progressive rendering processes `ROWS_PER_TICK=4` rows per frame, maintaining UI responsiveness. A `g_stable` buffer holds the last complete frame, displayed while the new scan sweeps from top to bottom. `g_dirty=true` (set on user input) resets the scan row; morph mode avoids setting dirty so the radar-sweep scan becomes visible as an animation effect.
-*Files: `raymarcher/mandelbulb_explorer.c`*
+*Files: `raymarcher/mandelbulb_explorer.c`, `raymarcher/sdf_gallery.c`*
+
+#### I10 SDF Boolean Operations — Union, Intersection, Subtraction
+Three operations combine any two SDFs `a` and `b` into compound geometry:
+- **Union** `min(a, b)` — the closest surface; merges two objects into one.
+- **Intersection** `max(a, b)` — only the region where both overlap; carves away everything outside both.
+- **Subtraction** `max(a, -b)` — A minus B; drills B-shaped holes into A.
+
+These operations compose freely — any SDF expression can replace `a` or `b`, enabling arbitrarily complex Boolean trees with zero mesh bookkeeping.
+*Files: `raymarcher/sdf_gallery.c`*
+
+#### I11 Smooth Union — Polynomial smin Blend
+Hard `min(a,b)` creates a sharp crease where two surfaces meet, visible as a crisp edge even at terminal resolution. The polynomial smooth minimum `smin(a, b, k) = min(a,b) − h²·k/4` where `h = max(k − |a−b|, 0) / k` blends the two fields within a transition band of width `k`. At the blend boundary both fields are pulled toward each other, creating a rounded neck or merge region. `k = 0` recovers hard min; `k = 0.1` is a subtle join; `k = 1.0` produces a bulgy organic merge. Used in scene5_sculpt to assemble an organic figure: the SDF for each body part is a simple primitive, smin welds them into continuous skin.
+*Files: `raymarcher/sdf_gallery.c`*
+
+#### I12 Twist Deformation — Pre-warp Before SDF Evaluation
+Applying a rotation to the query point `p` before evaluating an SDF deforms the shape in world space. Twist rotates the xz-plane by an angle proportional to height: `p.xz = rot2(p.y · k) · p.xz`. The same box SDF evaluated on this twisted `p` produces a twisted box. Important caveat: the twist operation stretches the metric — distances become locally inaccurate by a factor proportional to the twist rate. The march step must be made conservative (e.g. `0.60×` instead of `0.85×`) to avoid stepping through thin geometry.
+*Files: `raymarcher/sdf_gallery.c`*
+
+#### I13 Domain Repetition — Infinite Lattice from One Primitive
+`p_rep = p − cell · round(p / cell)` maps any query point to the nearest cell center, effectively tiling the primitive at period `cell` in that axis. This costs one SDF evaluation regardless of how many copies are visible. The lighting and shadow rays must use the original (unrepeated) `p` for light direction; repeating the light direction as well would give different shadows per copy. Only the SDF evaluation inside `sdf_march` sees the repeated `p`.
+*Files: `raymarcher/sdf_gallery.c`*
 
 ---
 
@@ -1539,15 +1582,26 @@ Standard film/game lighting rig with three independent lights:
 - **Fill** (weak, cool, opposite side): prevents the shadow side from being pure black. `0.22 × diffuse` only.
 - **Rim** (narrow, from behind): creates a bright edge on the silhouette, separating object from background. `0.18 × diffuse + 0.65 × specular` with low shininess (exponent 10) for broad rim highlight.
 Sum = `ambient + key_diffuse + key_spec + fill_diffuse + rim_diffuse + rim_spec`. Each light uses its own color to enable warm/cool contrast.
-*Files: `raymarcher/mandelbulb_explorer.c`*
+*Files: `raymarcher/mandelbulb_explorer.c`, `raymarcher/sdf_gallery.c`*
 
 #### K6 Depth Visualization Shader — View-space Depth → Color
 The vertex shader computes view-space depth: `custom[0] = length(world_pos − cam_pos)`. The fragment shader normalizes to `[cam_dist − 1.5, cam_dist + 1.5]` and maps `depth_t ∈ [0,1]` to a color gradient (near=warm, far=cool). Combined with the Bourke ramp for characters, this creates a depth fog effect that reveals the 3D structure of any mesh without lighting computation. Useful for debugging mesh geometry.
 *Files: `raster/mandelbulb_raster.c`*
 
-#### K7 Hue-Depth Encoding — Escape Time → Rainbow
-In `mandelbulb_raymarcher.c`, the sole visual signal is hue: `smooth → hue pair`. The 30-step rainbow (red→orange→yellow→green→cyan→blue→magenta→back) cycles `COLOR_BANDS` times across the `[0,1]` smooth range. High bands = many thin color rings per depth shell; low bands = broad color regions. All characters are `'.'` — no brightness gradient. This design deliberately removes every visual cue except hue, exposing how much spatial structure is encoded in escape-time alone.
-*Files: `raymarcher/mandelbulb_raymarcher.c`*
+#### K7 Three Lighting Modes — N·V / Phong / Flat
+A single integer `light_mode` switches between three shading strategies, cycled at runtime with the `l` key:
+
+- **N·V (`light_mode=0`)**: `luma = KA + KD·dot(N,V)·ao`. Brightness = how directly the surface faces the camera. No global light direction means no competing brightness gradient — the material color (theme `col` field) becomes the dominant visual signal. Best for understanding shape.
+- **Phong (`light_mode=1`)**: Full 3-point rig with shadow and AO. Best for cinematic presentation and depth reading.
+- **Flat (`light_mode=2`)**: Returns `1.0` immediately. Every hit pixel gets the densest Bourke char; only the theme hue varies. No shadow or AO computation — fastest render. Useful for inspecting the color distribution across a scene without lighting distraction.
+
+The implementation short-circuits early:
+```c
+if (light_mode == 2) return 1.0f;               /* Flat: no computation */
+if (light_mode == 0) { return KA + KD*ndv*ao; } /* N·V: no light direction */
+/* else: full Phong */
+```
+*Files: `raymarcher/sdf_gallery.c`*
 
 ---
 

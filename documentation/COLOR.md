@@ -708,3 +708,45 @@ static void color_init(int theme) {
 Switching themes calls `color_init(new_theme)` which re-registers all pairs — the pair numbers never change, only the registered colors. This means `COLOR_PAIR(CP_BH)` keeps working; the terminal just sees a new color behind the same handle.
 
 **Effect:** All color semantics are concentrated in one struct per theme. Adding a new theme is one line in the `k_themes` array. The rendering code is color-agnostic.
+
+---
+
+## 16. Bright Hue-varying Theme Palette (Raymarcher)
+
+**Where:** `raymarcher/sdf_gallery.c`
+
+**Problem:** A palette that ramps from dark to bright within one hue has invisible low-gradient steps on a dark terminal background. When the scene's `col` field maps to those steps, parts of the geometry appear unrendered.
+
+**Solution:** Keep every palette entry at full saturation — vary **hue** across the gradient instead of brightness.
+
+```c
+/* Bad: dark-to-bright in one hue — low steps invisible on dark bg */
+{17, 18, 19, 20, 27, 33, 45, 159}   /* indices 0-3 are near-black */
+
+/* Good: hue varies, all steps vivid */
+{51, 87, 123, 159, 153, 189, 225, 231}  /* cyan→sky→lavender→white */
+```
+
+**Verification rule:** decode any xterm-256 index to RGB components:
+```
+r = (color - 16) / 36
+g = ((color - 16) % 36) / 6
+b = (color - 16) % 6
+```
+A color is "bright enough" when `max(r, g, b) >= 4`. Entries with `max < 4` will appear
+dark or invisible against a black background.
+
+**xterm-256 bright reference points:**
+| Index | RGB (0-5) | Appearance |
+|-------|-----------|------------|
+| 46  | (0,5,0) | saturated green |
+| 51  | (0,5,5) | saturated cyan |
+| 196 | (5,0,0) | saturated red |
+| 201 | (5,0,5) | saturated magenta |
+| 214 | (5,3,0) | bright orange |
+| 226 | (5,5,0) | bright yellow |
+| 231 | (5,5,5) | white |
+
+**Effect:** Every gradient step is readable at all times. Theme identity comes from
+hue family (fire=red/orange, arctic=cyan/blue) rather than the dark-end color,
+which was invisible anyway.

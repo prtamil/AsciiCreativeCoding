@@ -70,7 +70,7 @@ Azimuth angle (0→360°) maps to full hue cycle; Y component of normal controls
 
 ### frag_depth_hue
 
-Pure escape-time → hue, no lighting. This shader makes the rasterized Mandelbulb directly comparable to `mandelbulb_raymarcher.c`:
+Pure escape-time → hue, no lighting. Encodes depth purely as rainbow hue with no brightness gradient:
 
 ```c
 float hue = fmodf(in->custom[0] * u->hue_bands, 1.0f);

@@ -38,6 +38,30 @@
  *   §10 app       — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Wireframe rendering via vertex transformation and line drawing.
+ *                  For each edge: transform both endpoints, project to screen,
+ *                  draw a line using Bresenham's algorithm.
+ *                  No Z-buffer: edges are drawn regardless of depth (wireframe).
+ *                  Back-face culling: for each face, if the normal dotted with
+ *                  the view direction is positive → facing away → don't draw.
+ *
+ * Math           : Perspective projection from 3D camera space to 2D screen:
+ *                    col = (x / z) × f_x + cx
+ *                    row = (y / z) × f_y + cy
+ *                  where f_x, f_y are focal lengths and (cx, cy) is the
+ *                  principal point (screen centre).  Larger f → more telephoto.
+ *                  Rotation applied via 3×3 matrix from two Euler angles.
+ *                  Aspect correction: y component scaled by CELL_W/CELL_H so
+ *                  circles appear circular on non-square cells.
+ *
+ * Rendering      : Bresenham line drawing: integer-only incremental line algorithm.
+ *                  No floating point in the inner loop — increments dx/dy by
+ *                  the dominant axis direction, accumulates error, and steps
+ *                  the minor axis when error exceeds 0.5.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

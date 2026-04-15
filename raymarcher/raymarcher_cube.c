@@ -33,6 +33,27 @@
  *   §9  app         — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : SDF raymarching with a box SDF (cube primitive).
+ *                  Box SDF formula (Quilez): for a box with half-extents b:
+ *                    d = |p| − b    (component-wise absolute value)
+ *                    sdf = length(max(d, 0)) + min(max(d.x, d.y, d.z), 0)
+ *                  The first term handles outside distance; the second handles
+ *                  inside (negative = inside the box).
+ *
+ * Math           : The cube's 6 faces have normals ±(1,0,0), ±(0,1,0), ±(0,0,1).
+ *                  Normal estimation via finite-difference gradient is exact here
+ *                  because the box SDF is piecewise linear.
+ *                  Rotation: 3×3 rotation matrix built from Euler angles A, B.
+ *                  Point p in world space → box space: p' = R^T · p.
+ *
+ * Rendering      : Block-upscaled virtual canvas (VIRT_W × VIRT_H) avoids
+ *                  the non-square cell aspect problem.  Each virtual pixel maps
+ *                  to (BLOCK_W × BLOCK_H) terminal cells.  Resolution is a
+ *                  trade-off: lower VIRT → faster render, larger pixelated blocks.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

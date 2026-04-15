@@ -27,6 +27,28 @@
  *           §5 sdf     §6 canvas §7 scene  §8 screen  §9 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : SDF raymarching with smooth-min blending of multiple SDFs.
+ *                  Each metaball has its own SDF (sphere).  The scene SDF is:
+ *                    scene_sdf = smin(sdf_0, smin(sdf_1, ... sdf_n))
+ *                  where smin is the polynomial smooth minimum that blends SDFs
+ *                  into a single smooth surface near contact regions.
+ *
+ * Math           : Polynomial smooth-min (Quilez, 2013):
+ *                    smin(a, b, k) = a−h²·k/4  when  h = clamp(0.5+(b−a)/(2k), 0, 1)
+ *                  Parameter k controls blend radius: small k → sharp join, large → merged.
+ *                  At k=0: exact minimum (hard Boolean union).
+ *                  Normal estimation: finite difference of scene_sdf in x,y,z:
+ *                    n ≈ (sdf(p+ε,p,p) − sdf(p−ε,p,p), ...) / (2ε)
+ *
+ * Rendering      : Phong shading model:
+ *                    colour = ambient + diffuse·(N·L) + specular·(R·V)^shininess
+ *                  where R = 2(N·L)N−L is the reflection direction.
+ *                  Curvature colouring: Laplacian of SDF ≈ mean curvature →
+ *                  hot hue for high-curvature tips, cool for flat merged regions.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

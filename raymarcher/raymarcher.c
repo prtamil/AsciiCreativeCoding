@@ -28,6 +28,28 @@
  *   §9  app         — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Sphere tracing (SDF raymarching) — safe stepping.
+ *                  A ray is cast from the camera through each pixel.
+ *                  At each step: evaluate the scene SDF at the current ray
+ *                  position p.  The SDF returns the exact distance to the
+ *                  nearest surface.  Advance the ray by this distance.
+ *                  This guarantees no surface overshoot (sphere tracing).
+ *
+ * Math           : For a sphere at origin with radius R:
+ *                    SDF(p) = |p| − R
+ *                  Normal at surface: N = normalise(∇SDF) = p/|p| (exact for sphere).
+ *                  Phong shading: I = kd·(N·L) + ks·(R·V)^n + ka
+ *                  The ray terminates when SDF(p) < HIT_EPS (surface hit) or
+ *                  total distance exceeds MAX_DIST (miss).
+ *
+ * Rendering      : Virtual canvas at low resolution (VIRT_W × VIRT_H) is
+ *                  block-upscaled to the terminal — each virtual pixel maps
+ *                  to a small block of terminal cells.  This keeps the sphere
+ *                  round despite non-square terminal cells.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

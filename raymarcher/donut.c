@@ -31,6 +31,32 @@
  *   §6  app     — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic torus rasterization (not raymarching).
+ *                  For each point on the torus surface, the 3D position is
+ *                  computed from (θ, φ) parameters, rotated by two Euler
+ *                  angles, then projected to screen space.  The depth buffer
+ *                  (z-buffer) resolves visibility between overlapping surface points.
+ *
+ * Math           : Torus parametric equation:
+ *                    x = (R + r·cos φ) cos θ
+ *                    y = (R + r·cos φ) sin θ
+ *                    z =  r · sin φ
+ *                  Surface normal: n = (cos φ cos θ, cos φ sin θ, sin φ).
+ *                  Lighting: L·N dot product with Phong specular: (R·V)^shininess.
+ *                  Luminance mapped to ASCII ramp ".,:;+=xX$&@#".
+ *
+ * Rendering      : Z-buffer (depth buffer): each pixel stores the depth of the
+ *                  nearest surface point seen so far.  Rasterization proceeds
+ *                  in order of increasing depth — further points overwrite the
+ *                  buffer only if they are closer than the current stored depth.
+ *
+ * Performance    : O(N_THETA × N_PHI) per frame — proportional to the number
+ *                  of surface samples, not the terminal resolution.  Terminal
+ *                  aspect (CELL_H / CELL_W ≈ 2) compensates in the projection.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

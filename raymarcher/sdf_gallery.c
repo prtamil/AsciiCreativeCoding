@@ -38,6 +38,32 @@
  *   §9  app       — state, main loop, input, ncurses
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : SDF composition gallery — showcasing five SDF operations.
+ *
+ *                  1. Smooth union: smin(d1, d2, k) — blends two SDFs into a
+ *                     single connected surface with a controllable blend radius k.
+ *
+ *                  2. Boolean CSG (Constructive Solid Geometry):
+ *                     union = min(d1, d2), intersection = max(d1, d2),
+ *                     subtraction = max(d1, −d2).  These are exact set operations
+ *                     on SDFs — union/intersection require no parameter k.
+ *
+ *                  3. Twist deformation: modify the input point before evaluating
+ *                     the SDF.  p.yz rotated by angle θ ∝ p.x (twist).
+ *                     Domain deformation violates the Lipschitz condition so the
+ *                     SDF is no longer a true signed distance — a "relaxation factor"
+ *                     (0.5) is applied to prevent overshoot.
+ *
+ *                  4. Domain repetition: p = mod(p, cell_size) − cell_size/2.
+ *                     Evaluating SDF at the remapped p produces an infinite periodic
+ *                     grid from a single primitive's SDF.
+ *
+ *                  5. smin-based organic sculpting: composing many simple primitives
+ *                     with smooth-min produces blob-like organic shapes.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

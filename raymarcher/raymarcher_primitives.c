@@ -41,6 +41,30 @@
  *  §11  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : SDF primitive gallery — 17 analytical SDFs from Inigo Quilez.
+ *                  Each SDF is an exact (or near-exact) signed distance function
+ *                  for a geometric primitive.  Common building blocks:
+ *
+ *                  Sphere: sdf = |p| − R
+ *                  Box: sdf = length(max(|p|−b, 0)) + min(max_component(|p|−b), 0)
+ *                  Torus: sdf = length(vec2(length(p.xz)−R, p.y)) − r
+ *                  Capsule: sdf = distance_to_line_segment(p, a, b) − r
+ *
+ * Math           : SDF composition via smooth-min and Boolean operations:
+ *                  These SDFs are the "atoms" of constructive solid geometry.
+ *                  Any scene can be described as a tree of SDF operations.
+ *                  The SDF of a union is min(d1, d2); the Lipschitz constant
+ *                  of min(f, g) is max(Lip(f), Lip(g)) ≤ 1, so raymarching
+ *                  is still convergent for Boolean combinations.
+ *
+ * Rendering      : Two-axis continuous rotation ensures every face, edge,
+ *                  and vertex is visible without user interaction.
+ *                  All 17 primitives use the same shading pipeline — only
+ *                  the SDF function differs between primitives.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

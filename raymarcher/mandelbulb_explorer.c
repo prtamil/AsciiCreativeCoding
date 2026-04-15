@@ -40,6 +40,30 @@
  *   §9  app         — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : SDF raymarching on the Mandelbulb — a 3D fractal.
+ *                  The Mandelbulb SDF is estimated (not exact) by tracking
+ *                  the derivative of the iteration to bound the distance:
+ *                    dr = n·|z|^(n-1)·dr + 1   (derivative accumulation)
+ *                    SDF ≈ 0.5·log(|z|)·|z|/dr  (distance lower bound)
+ *                  The ray marches along this lower bound, guaranteed not to
+ *                  overshoot the surface (within numerical precision).
+ *
+ * Math           : Mandelbulb iteration (power n):
+ *                    z ← z^n + c,  z^n in spherical coords:
+ *                    r^n, θ→n·θ, φ→n·φ  (de Lagrange extension of z²+c to 3D)
+ *                  The surface is defined by: orbit of 0 under z←z^n+c remains bounded.
+ *                  At n=2: tends toward a sphere (no fractal).
+ *                  At n=8: the "classic" Mandelbulb with bulbous fractal surface.
+ *
+ * Rendering      : Phong shading: N = normalised gradient of SDF at surface.
+ *                  Soft shadows: a second march toward the light; minimum SDF
+ *                  along the ray determines shadow softness.
+ *                  AO (ambient occlusion): short marches along the normal
+ *                  estimate how much open space exists above the surface.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

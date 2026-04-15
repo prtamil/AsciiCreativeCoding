@@ -32,6 +32,14 @@ row = i * (some vertical step)
 - **Terminal display**: A hex grid in terminal looks like alternating offset rows of characters. Every other row is shifted one column. Use spaces between cells for visual clarity.
 - **Rule discovery**: Hex Life rule B2/S34 produces "gliders" (different shape). B2/S2 is explosive. B3/S5 creates stable blocks.
 
+## From the Source
+
+**Algorithm:** Conway's Game of Life adapted for a hexagonal grid. Each cell has 6 neighbours (vs 8 for square grids). Rule B2/S34: born on exactly 2 live neighbours, survives on 3 or 4 live neighbours. Uses double-buffering: write next generation to the inactive buffer, then swap — O(rows × cols) per step.
+
+**Physics:** Hexagonal CA rules produce qualitatively different behaviour than square-grid Life: the B2/S34 rule creates stable oscillators and gliders unique to the hex topology. 6-neighbour symmetry eliminates diagonal artefacts present in square-grid CAs (more isotropic diffusion of patterns).
+
+**Data-structure:** Flat 2-D array with uint8_t age field. Offset-rows layout: odd rows shifted right by 0.5 cells visually. Neighbour coordinates differ for even vs odd rows (two lookup tables, one per parity). Age-based colour: newborn → yellow, young → cyan, mature → teal, elder → dark.
+
 ### Key Constants
 | Name | Role |
 |------|------|

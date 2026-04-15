@@ -83,6 +83,7 @@ No state machine. Continuous CA. One boolean flag for paused.
 
 ## From the Source
 
+**Physics/References:** Original aafire by Jakub Olszak, 1999, part of aalib 1.4 — the ASCII art rendering library. The CA and decay table design are faithful to the original aalib source.
 **Algorithm:** 5-neighbour CA: `(x-1,y+1), (x,y+1), (x+1,y+1)` (one row below) plus `(x-1,y+2), (x+1,y+2)` (two rows below, no centre). The two-row lookahead gives vertical inertia — rounder blob flames vs Doom's 3-neighbour sharp spires. Edge cells clamp to nearest valid column rather than wrapping.
 
 **Math:** Decay table: `table[i] = (i > minus) ? (i - minus) / 5 : 0` where `minus = 800 / rows` (min 1). Dividing by 5 averages the 5 neighbours back to [0,255]; subtracting `minus` before the division is what provides per-row cooling. MAXTABLE = 1280 = 5 × 256 covers the maximum possible neighbour sum.

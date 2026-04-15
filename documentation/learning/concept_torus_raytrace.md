@@ -182,6 +182,14 @@ convergent within the bracket.  For 40 iterations convergence speed is irrelevan
 
 ---
 
+## From the Source
+
+**Math:** The torus normal formula written in the source as `N = normalise(p − R · normalise(p.xz × (0,1)))` is equivalent to the ring-point subtraction form in the concept file. The `p.xz × (0,1)` term produces the XZ projection of p, giving `normalise(p.xz)` as the direction to the ring centre — the cross-product notation is an alternative way to write the same operation.
+
+**Rendering:** The shading pipeline (Phong + Fresnel) is **identical** to sphere_raytrace.c — the quartic root finder is the only code that is torus-specific. Everything else (lighting, modes, rotation transform) is shared. This makes the torus a clean extension exercise: replace one function, get a new shape.
+
+---
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect |
@@ -219,16 +227,6 @@ The 2.4 ratio matches the Interstellar torus aesthetic.
 4. Extend the XZ-plane normal formula to an arbitrarily oriented torus: the ring
    axis direction is stored as a unit vector `axis`.  Derive the general formula
    for `ring_pt` and `N` in terms of `axis` and `P`.
-
----
-
-## From the Source
-
-**Algorithm:** Analytic ray-torus intersection (quartic polynomial root-finding). Substituting ray `ro + t·rd` into the torus equation `(√(x²+z²)−R)² + y² = r²` produces a degree-4 polynomial in t. The full quartic is found by algebra, then solved numerically.
-
-**Math:** Quartic: `t⁴ + At³ + Bt² + Ct + D = 0`. Solution: evaluate the polynomial at sample points, then bisect to find roots (avoids unstable Ferrari formula). Sample count vs. accuracy trade-off: more samples find all real roots but at higher cost. Surface normal at hit point p on torus with major radius R: `N = normalise(p − R · normalise(p.xz × (0,1)))`.
-
-**Rendering:** Phong + Fresnel (same as sphere_raytrace.c), showing that the shading pipeline is decoupled from the intersection test. The quartic solver is the only torus-specific code.
 
 ---
 

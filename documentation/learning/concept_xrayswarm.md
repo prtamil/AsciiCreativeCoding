@@ -95,6 +95,16 @@ Early versions had the queen wander; workers returned to where the queen current
 
 ---
 
+## From the Source
+
+**Algorithm:** Swarm simulation with a 4-phase state machine per swarm: DIVERGE (workers shoot outward), PAUSE, CONVERGE (workers fly inward), second PAUSE. Queen wanders with smooth Ornstein-Uhlenbeck-like bounded random-walk steering (`QUEEN_JITTER=35.0`, `QUEEN_DAMP=0.96`). Worker headings locked at DIVERGE start; held fixed during flight (`WORK_JITTER=4.0`, `WORK_DAMP=0.994`).
+
+**Data-structure:** Per-worker ring buffer of `TRAIL_LEN=48` past positions. Older trail positions drawn at decreasing brightness. Buffer is a circular array with head pointer — O(1) append. N_WORKERS=20 per swarm, N_SWARMS_MAX=5.
+
+**Physics:** Phase durations: DIVERGE_DUR=3.5 s, CONVERGE_DUR=3.5 s, PAUSE_DUR=0.7 s. Arrival threshold: ARRIVE_DIST=40 px. CONVERGE homing correction: `CONVERGE_STEER=5.0` per second (proportional steering toward locked queen). Worker speed: WORK_SPEED=380 px/s; queen speed: QUEEN_SPEED=80 px/s.
+
+---
+
 # Pass 2 — Pseudocode, Module Map, Data Flow
 
 ## Module Map

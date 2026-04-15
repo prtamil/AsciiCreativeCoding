@@ -28,6 +28,14 @@ Normalize v to [0,1], then map to a cyclic palette.
 - **Multiple waves = richness**: A single sine wave gives a boring gradient. Three or more overlapping waves create the complex interference pattern.
 - **ASCII terminal limitation**: You can only use ~16 color pairs. Map the continuous value to these pairs. Use different characters (space, `.`, `:`, `#`) to add another density dimension.
 
+## From the Source
+
+**Algorithm:** Analytic plasma — no state grid, no simulation. Classic demoscene technique (Commodore 64 era, ~1990s). Each frame `v(col,row,t)` is computed as a sum of 4 sine waves. The radial term `sin(√(dx²+(2·dy)²)·f4)` creates circular ripples centred on screen; the factor 2 on dy corrects for terminal cell aspect ratio (cells taller than wide).
+
+**Math:** Normalization: `v_norm = (v + 4) / 8` — 4 unit-amplitude waves → sum ∈ [-4, 4]. Sinusoidal RGB palette: `r = 0.5 + 0.5·cos(2π(t + 0.0))`, `g = 0.5 + 0.5·cos(2π(t + 0.33))`, `b = 0.5 + 0.5·cos(2π(t + 0.67))` — evenly-spaced phase offsets produce full-spectrum hue cycle. Palette phase cycles at `CYCLE_HZ=0.20` Hz. N_PAL=14 entries per theme, N_THEMES=4, N_FREQ_PRESETS=4.
+
+---
+
 ### Key Constants
 | Name | Role |
 |------|------|
@@ -88,3 +96,4 @@ draw(t):
 t → per-pixel plasma_value(col,row,t) → [0,1]
 → palette_color (hue cycling) + density_char → screen
 ```
+

@@ -118,6 +118,14 @@ Normals need small `eps` for accuracy — too large blurs sharp features. Curvat
 ### Why is the light path not keyframe-animated?
 A slowly orbiting light on a smooth sinusoidal path `(4cos(t), 2sin(0.45t)+2.5, 3.5)` keeps the shading dynamic without the distraction of sharp directional changes. The 0.45 frequency mismatch on the vertical component prevents the light from returning to the same position too quickly.
 
+## From the Source
+
+**Algorithm:** SDF raymarching with smooth-min blending. Each metaball is a sphere SDF; the scene SDF is `smin(sdf_0, smin(sdf_1, ... sdf_n))` applied iteratively. The polynomial smooth-min (Quilez, 2013) blends surfaces near contact without the C∞ smooth-min's `exp`/`log` cost (~10× slower).
+
+**Math:** Polynomial smooth-min (Quilez, 2013): `smin(a, b, k) = a − h²·k/4` when `h = clamp(0.5 + (b−a)/(2k), 0, 1)`. At k=0: exact minimum (hard Boolean union). At k=4.0: fully merged. Normal estimation uses central finite differences: `n ≈ (sdf(p+ε,p,p) − sdf(p−ε,p,p), ...) / (2ε)`. Phong shading: `colour = ambient + diffuse·(N·L) + specular·(R·V)^shininess` where `R = 2(N·L)N−L`. Curvature coloring uses Laplacian of SDF (6-neighbor central difference, CURV_EPS=0.06).
+
+**Performance:** NORM_EPS=0.004 (small for accuracy); CURV_EPS=0.06 (larger — second-order quantity, only 8 discrete color bands needed). Each canvas pixel: RM_MAX_STEPS=64 march steps + 4 normal samples + curvature + SHADOW_STEPS=16. CELL_W=CELL_H=2 → 4× fewer pixels.
+
 ## Key Constants
 
 | Constant | Effect |
@@ -128,17 +136,3 @@ A slowly orbiting light on a smooth sinusoidal path `(4cos(t), 2sin(0.45t)+2.5, 
 | CURV_SCALE | Laplacian → [0,1] normalisation factor |
 | SHADOW_K | Soft shadow sharpness (higher = harder edge) |
 | ORBIT_RX/RY/RZ | Lissajous orbit radii in world space |
-
----
-
-## From the Source
-
-**Algorithm:** SDF raymarching with smooth-min blending of multiple SDFs. Each metaball has its own SDF (sphere). The scene SDF is: `scene_sdf = smin(sdf_0, smin(sdf_1, ... sdf_n))` where smin is the polynomial smooth minimum that blends SDFs into a single smooth surface near contact regions.
-
-**Math:** Polynomial smooth-min (Quilez, 2013):
-`smin(a, b, k) = a − h²·k/4` when `h = clamp(0.5 + (b−a)/(2k), 0, 1)`.
-Parameter k controls blend radius: small k → sharp join, large → merged. At k=0: exact minimum (hard Boolean union). Normal estimation: finite difference of scene_sdf in x,y,z: `n ≈ (sdf(p+ε,p,p) − sdf(p−ε,p,p), ...) / (2ε)`.
-
-**Rendering:** Phong shading model: `colour = ambient + diffuse·(N·L) + specular·(R·V)^shininess` where `R = 2(N·L)N−L` is the reflection direction. Curvature coloring: Laplacian of SDF ≈ mean curvature → hot hue for high-curvature tips, cool for flat merged regions.
-
-**References:** Polynomial smooth-min: Inigo Quilez (2013), "Smooth Minimum" (iquilezles.org).

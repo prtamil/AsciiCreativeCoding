@@ -107,6 +107,16 @@ for (int refl = 0; refl < 2; refl++) {
 }
 ```
 
+## From the Source
+
+**Algorithm:** `STICK_PROB=0.35` — probability a walker sticks on contact. Low value (0.35) means walkers bounce many times before freezing, producing thicker, rounder arms. High value (0.90) → sparse spiky fractal. Walker spawn radius = `max_frozen_dist + 8` (current crystal boundary + 8-cell buffer), not screen edges — keeps growth fast throughout.
+
+**Math:** `ASPECT_R=2.0` terminal cell height/width ratio. Applied in two places: (1) spawn ring: `nr = cy0 + roundf(sinf(angle) * spawn_r / ASPECT_R)` — makes spawn ring circular not elliptical; (2) D6 symmetry rotation: `dy_e = dy / ASPECT_R` before rotation, `nr = cy0 + roundf(ry_e * ASPECT_R)` after — ensures rotations are performed in Euclidean space. DLA fractal dimension ≈ 1.71.
+
+**Performance:** `g_rain_ch[ROWS_MAX][COLS_MAX]` (24,000 bytes) stores one char per cell: head cells flickered at ~67% chance per tick, all cells at ~4% ambient. Walker sticking check: scans 8 neighbours O(1) per walker per tick. Multiple concurrent walkers (`WALKER_DEFAULT=12`, adjustable with +/-) speed growth at cost of less ideal DLA statistics.
+
+**Rendering:** Two draw layers: rain first (`rain_draw` skips frozen cells), crystal second. Crystal color pairs use `COLOR_BLACK` background (opaque) while rain uses transparent terminal background — ensures frozen cells fully occlude rain beneath them. Flash on completion: `FLASH_FRAMES=28` frames (~0.9 s at 30 fps) of bold white `*` for all frozen cells, then `scene_reset()` — rain continues uninterrupted.
+
 ## Key Constants
 
 | Constant | Default | Effect if changed |

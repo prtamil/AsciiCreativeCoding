@@ -113,6 +113,16 @@ The spark is shown whenever the phase is IGNITE (θ within IGNITE_WINDOW = 0.3 r
 ### Drawing order handles port occlusion
 The port gap in the cylinder wall is drawn unconditionally when ex_open (or tr_open) is true.  The piston is drawn afterward and overwrites wall positions at piston rows.  Since ex_open is only true when crown_row > port_row (piston is entirely below the port), the piston never overwrites the port gap — occlusion is correct without explicit checks.
 
+## From the Source
+
+**Algorithm:** Phase detection by crank angle range comparison. `fmod(theta + 2π, 2π)` keeps angle in [0, 2π). Each phase boundary (port open/close) is a fixed angle derived from the engine geometry defined in the config section.
+
+**Engineering:** Slider-crank mechanism converts rotary crank motion to linear piston motion. Given crank angle θ, crank radius R, and connecting rod length L, the wrist-pin position from crank centre: `y_wrist = R·cos θ + √(L² − R²·sin²θ)`. This is exact geometry — no approximation needed.
+
+**Rendering:** Pure ASCII character art using box-drawing and line characters. No texture or shading — structure conveyed entirely by character choice (`|`, `-`, `+`, `#`, etc.).
+
+---
+
 ## Key Constants
 
 | Constant | Value | Effect if changed |

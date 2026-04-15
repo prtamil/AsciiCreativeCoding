@@ -132,6 +132,16 @@ Prey followers:
   [predator enters PREY_FLEE_RADIUS] → boids rules + flee impulse away from predator
 ```
 
+## From the Source
+
+**Algorithm:** Five switchable modes sharing one code path: Classic Boids (Reynolds 1987), Leader Chase, Vicsek (1995), Orbit Formation, Predator-Prey. Vicsek order parameter φ = |Σv̂_i|/N ∈ [0,1]; 0 = disordered, 1 = perfect alignment. In Vicsek steer, `self` is always included (sum starts with `sum_vx = b->vx, count=1`) before scanning neighbours.
+
+**Math:** Cosine palette: `r,g,b = 0.5 + 0.5·cos(2π(t + phase))` cycles hue slowly while keeping three flocks visually distinct. Orbit tangential speed = `ORBIT_RADIUS × ORBIT_SPEED = 120 × 1.4 = 168 px/s`; boid max speed 280 px/s — followers always fast enough to catch their moving slot. Rejection-sample unit vector at spawn: pick `(dx,dy)` from `[-1,1]²`, reject if outside unit circle, normalize — avoids latitude bias from angle-based sampling.
+
+**Physics:** All boids in isotropic pixel space: `CELL_W=8` sub-pixels wide, `CELL_H=16` sub-pixels tall per terminal cell. Two-stage update: Stage 1 reads all old positions to compute new velocities; Stage 2 writes all velocities simultaneously — prevents update-order bias. Toroidal wrap, not bounce: every boid always has potential neighbours in all directions.
+
+**Performance:** `floorf(x + 0.5f)` instead of `roundf` for pixel→cell conversion — breaks the round-half-even tie to prevent per-frame cell oscillation flicker. Render interpolation: `draw_px = px + vx * alpha * dt_sec` projects each boid forward to its fractional-tick position.
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect of increasing |

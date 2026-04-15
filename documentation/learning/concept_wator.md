@@ -88,6 +88,14 @@ Shuffling all `rows × cols` indices and skipping EMPTY cells is simpler and equ
 - `SHARK_STARVE` controls predator pressure. Too low (lenient) → fish survive, sharks dominate, fish collapse, sharks collapse. Too high (strict) → sharks die before cycling begins.
 - The interesting dynamics live in a narrow parameter band. The defaults (`FISH_BREED=3`, `SHARK_STARVE=4`) produce visible oscillations in most terminal sizes.
 
+## From the Source
+
+**Algorithm:** Wa-Tor predator-prey cellular automaton (Dewdney, A.K., "Computer Recreations", Scientific American, 1984). Shuffled update uses Fisher-Yates on the active cell list — equivalent to random-order asynchronous update, which better models spatial competition than top-left sequential scan.
+
+**Physics:** Lotka-Volterra dynamics emerge: fish and shark populations oscillate with a phase lag (fish peak before shark peak). Parameter space: low FISH_BREED + high SHARK_BREED → shark overpopulation and collapse; opposite → shark starvation. Stable cycles exist in a narrow band around FISH_BREED=3, SHARK_STARVE=4.
+
+**Data-structure:** Grid stored as parallel `uint8_t` arrays: `g_type[r][c]`, `g_breed[r][c]`, `g_hunger[r][c]`, `g_moved[r][c]`. Active cell array rebuilt O(rows×cols) each tick; Fisher-Yates shuffle is O(N_active). Population history ring buffer HIST_LEN=512 for the dual bar chart. MAX_ROWS=128, MAX_COLS=320.
+
 ## Key Constants
 
 | Constant | Effect |

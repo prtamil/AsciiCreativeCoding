@@ -168,6 +168,14 @@ making 3D objects pop on a dark terminal.
 
 ---
 
+## From the Source
+
+**Algorithm:** The full quadratic form uses `b = 2·(rd · oc)` with `oc = ro − c`, giving discriminant `b²−4ac`. The concept file uses the optimized half-b form (`b' = rd·ro`, discriminant `b'²−c`) which absorbs the factor of 2 — both are equivalent but the source form is the canonical textbook version.
+
+**Rendering:** Each terminal cell fires exactly **one** ray (no anti-aliasing). Luminance is mapped to ASCII ramp `".+*#@"` — the specific 5-character density set used. The Phong model: `I = ka + kd·max(N·L,0) + ks·max(R_v·V,0)^shininess` where `R_v = 2(N·L)N − L`.
+
+---
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect |
@@ -200,17 +208,6 @@ making 3D objects pop on a dark terminal.
 4. The rim light uses exponent 10 (vs 52 for key).  Derive the visual half-angle
    of a Phong specular lobe as a function of the exponent.  At what exponent does
    the rim light look "diffuse" vs "specular"?
-
----
-
-## From the Source
-
-**Algorithm:** Analytic ray-sphere intersection — exact, no marching steps. For ray `ro + t·rd` and sphere centre c radius R:
-`|ro + t·rd − c|² = R²` expands to quadratic `a·t² + b·t + c = 0` where `a = |rd|² = 1`, `b = 2·(rd · oc)`, `c = |oc|² − R²`. Discriminant `= b²−4ac`; if < 0: miss; else `t = (−b ± √disc) / 2a`.
-
-**Math:** Surface normal at hit point p: `N = (p − c) / R` (unit outward). Phong model: `I = ka + kd·max(N·L, 0) + ks·max(R_v·V, 0)^shininess` where `R_v = 2(N·L)N − L`. Fresnel approximation (Schlick): `F = F0 + (1−F0)·(1−N·V)^5` — models view-angle-dependent reflectance of dielectrics.
-
-**Rendering:** Each terminal cell fires exactly one ray (no anti-aliasing). Three-point lighting: warm key + cool fill + bright rim. Luminance mapped to ASCII ramp `".+*#@"` — brighter → denser char.
 
 ---
 

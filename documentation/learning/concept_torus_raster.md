@@ -90,6 +90,16 @@ No state machine. Continuous rotation. One boolean: `paused`.
 
 ---
 
+## From the Source
+
+**Algorithm:** Software rasterization pipeline (GPU-pipeline emulation in C). The 7-stage pipeline runs every frame: (1) tessellate mesh once at init; (2) vertex shader: object→world→clip space; (3) perspective divide: clip → NDC → screen; (4) back-face culling; (5) rasterize bounding box with barycentric test; (6) Z-test against float z-buffer; (7) fragment shader: Phong/toon/normal/wireframe.
+
+**Math:** Barycentric coordinates `(λ₀, λ₁, λ₂)`: `λᵢ = signed_area(edge_i) / total_area`. All λ ∈ [0,1] and sum to 1 iff inside the triangle. **Perspective-correct interpolation** requires interpolating `z⁻¹` and then dividing — linear interpolation in screen space is not perspective-correct.
+
+**Performance:** Z-buffer resolves occlusion without sorting triangles. Back-face culling halves triangle count for closed meshes. **Function pointers** (`vert_shader`, `frag_shader`) allow swapping all 4 shader pairs without changing the pipeline structure.
+
+---
+
 ## Key Constants
 
 | Constant | Default | Effect |

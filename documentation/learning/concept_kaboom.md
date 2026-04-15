@@ -121,6 +121,16 @@ DONE:
 
 ---
 
+## From the Source
+
+**Algorithm:** Deterministic LCG PRNG: `s = s * 1488248101LL + 981577151LL; return (s%65536 - 32768) / 32768.0`. Static state `s` starts at 1 — same blob positions every run. The `prng()` is called both by `blob_init_pool()` and `blast_render_frame()` (wave noise uses the same LCG sequence), so the per-frame noise pattern is also deterministic.
+
+**Math:** Blob placement on unit sphere: generate random `(bx,by,bz)` via `prng()`, normalize: `br = sqrt(bx²+by²+bz²); blob.x = (bx/br)*(1.3+0.2*prng())`. y pre-squashed by 0.5 at init time. Lobe formula: `lobe = 1 + ripple * cos(petal_n * angle)` where angle = `atan2(y*2+0.01, x+0.01)` — the `*2` and offset prevent atan2 singularity at origin. Radial wave: `r = sqrt(x²+4y²) * (0.5 + prng()/3 * lobe * 0.3)`; `4y²` compensates for cell aspect ratio.
+
+**Physics:** Blob scale: `i0 = frame - 6; bx_screen = blob.x * i0 * blob_speed`. Perspective projection: `cx = cols/2 + bx*persp/(bz+persp)`. Three depth zones by `bz` vs `persp`: far (`.` dim) / mid (`o` normal) / near (`@` bright) — no z-buffer, just categorical buckets.
+
+**Performance:** `cells[cols*rows]` array rebuilt from scratch each frame — all visible layers computed fresh. No incremental update. Fixed pool of 800 blobs computed once at init.
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect |

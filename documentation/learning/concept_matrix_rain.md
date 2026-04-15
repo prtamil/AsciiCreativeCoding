@@ -122,6 +122,16 @@ There is no explicit enum — `active` bool + the tick logic handles it. An inac
 
 The Rain simulation itself has no state machine — it is a pure tick function.
 
+## From the Source
+
+**Algorithm:** Column-per-stream: each terminal column x has exactly one `Column` slot (indexed as `columns[x]`). Inactive slots do a random spawn check each tick: `chance = 15 / density_divisor`. `col_tick()` refreshes the entire `ch_cache[0..length]` on every tick — all characters in all active trails shimmer, not just the head. `grid_scatter_erase()`: picks one random row, zeros `cols/DISSOLVE_FRAC` random cells in it — chaotic, non-uniform dissolve.
+
+**Rendering:** Two-pass draw: Pass 1 draws the grid (integer positions, persistent dissolve texture). Pass 2 draws live column heads at fractional positions directly to stdscr, bypassing the grid — these are the only cells that carry sub-row position information. `col_paint_interpolated`: `row = floorf(draw_head_y - dist + 0.5f)` — "round half up" deterministic rounding.
+
+**Performance:** Columns start with `head_y` set to a negative value (above the visible screen) so streams "fall in" from above rather than popping on mid-screen. The grid is fully cleared (`grid_clear`) and re-painted each tick — not diffed. This keeps column chars in sync with `ch_cache` and avoids stale character ghosts when a column respawns.
+
+**Data-structure:** `ch_cache[TRAIL_MAX]` (24 entries) is always allocated at maximum trail length; only the first `c->length` entries are used. `density_divisor` controls both spacing (only `x % divisor == 0` columns spawn) and spawn rate (`chance = 15/divisor`) so denser settings fill faster.
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect if changed |

@@ -35,6 +35,16 @@ BFS/DFS have no cost function — all edges have equal weight.
 - **Animate the search frontier**: Show `visited` cells growing in real time. BFS looks like a wavefront; DFS looks like a snake.
 - **Path reconstruction**: Store `parent[node] = previous_node` during exploration. Backtrack from goal to start to get the path.
 
+## From the Source
+
+**Algorithm:** Three graph search algorithms animated side-by-side: BFS (queue-based, level-by-level, O(V+E)), DFS (stack-based, explores deeply before backtracking, O(V+E)), A* (priority queue min-heap, f(n)=g(n)+h(n), optimal with admissible heuristic, O((V+E) log V)).
+
+**Data-structure:** Adjacency list graph (N=40 nodes, planar-ish random edges). Spring-repulsion layout (Fruchterman-Reingold): nodes repel like charged particles, edges attract like springs, until equilibrium — purely for visual legibility.
+
+**Math:** Fruchterman-Reingold layout: repulsive force ∝ k²/d, attractive force ∝ d²/k, where k = √(area/N) is the ideal edge length. Converges in O(iterations × (V²+E)). A* heuristic h(n) = **Euclidean distance** (not Manhattan): admissible since it never overestimates the straight-line distance between nodes laid out in 2D space.
+
+---
+
 ### Key Constants
 | Name | Role |
 |------|------|

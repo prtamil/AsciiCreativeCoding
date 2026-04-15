@@ -150,6 +150,16 @@ Rather than dynamic allocation, a fixed array of 1500 Spark structs is scanned f
 
 ---
 
+## From the Source
+
+**Algorithm:** Analytic polar gear geometry — no mesh storage. The gear outline is computed each frame by iterating polar angle steps and testing proximity to three geometric features (hub ring, spokes, tooth sides) using THRESH_CIRC=7.5 px, THRESH_SIDE=4.0 px, THRESH_SPOKE=3.8 px. Geometry is regenerated each frame from the current rotation angle.
+
+**Math:** Involute tooth approximated as a trapezoid in polar coordinates. `phase = fmod(ang_local × N_TEETH / 2π, 1.0)`; `in_tooth = (phase < TOOTH_DUTY=0.42)`. Tangential surface velocity: `v_tip = GEAR_R_OUTER × ω` (ω in rad/s). Spark initial velocity ≈ v_tip direction + KICK_MIN=35 to KICK_MAX=120 px/s radial + SCATTER=55 px/s. Exponential drag: `v *= exp(-DRAG × dt)` — exact solution to `dv/dt = -k·v`, frame-rate independent.
+
+**Data-structure:** Spark pool — fixed array of MAX_SPARKS=1500 structs scanned for `life <= 0` slots. O(N) per frame. Emission rate scales with ω: `total_rate = SPARK_BASE_RATE × (rot_speed / ROT_BASE) × spark_density`. GEAR_R_OUTER=88 px, GEAR_R_INNER=64 px, GEAR_R_HUB=22 px, N_TEETH=10.
+
+---
+
 # Pass 2 — Pseudocode, Module Map, Data Flow
 
 ## Module Map

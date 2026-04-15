@@ -131,6 +131,16 @@ The state machine drives `bell_open` in a single normalised range [MIN_OPEN, 1.0
 
 ---
 
+## From the Source
+
+**Algorithm:** State-machine locomotion — 4 states: IDLE (passive sinking), CONTRACT (jet thrust), GLIDE (coast on momentum), EXPAND (bell re-opens). Bell shape is a parametric ellipse with time-varying radii; tentacles follow a segmented-chain follower model. Contract: 0.19 s (fast ease-out). Glide: 0.38 s. Expand: 0.68 s (slow ease-in). IDLE randomised to 0.55–1.1 s.
+
+**Physics:** Jet propulsion: impulse `JET_THRUST=190 px/s` upward applied at peak CONTRACT. Buoyancy modelled as reduced effective gravity — `GRAVITY=30.0 px/s²` downward during IDLE only. GLIDE decay: `vy *= expf(-DRAG_VY=2.4 × dt)` — exact solution to `dv/dt = -k·v`, frame-rate independent. Bell geometry: BELL_RX_BASE=72 px (horizontal), BELL_RY_BASE=144 px (vertical). Cell-aspect correction: CELL_H/CELL_W=2.0 to produce circular bell on screen.
+
+**Math:** head_f remap stretches body-width range from [MIN_OPEN=0.85, 1.0] to [HEAD_MIN_OPEN=0.85, 1.0] in the source constants, but the concept notes show HEAD_MIN_OPEN effectively mapped to 0.42 in the remap logic. Tentacle velocity lag: `lag = -vy × TENT_LAG=0.09 × depth`. Smoothstep: `t²(3-2t)`. Contract curve: `1-(1-t)²`.
+
+---
+
 # Pass 2 — Pseudocode, Module Map, Data Flow
 
 ## Module Map

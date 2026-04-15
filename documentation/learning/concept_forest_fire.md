@@ -132,6 +132,16 @@ PER TICK:
     TREE → '^'
 ```
 
+## From the Source
+
+**Algorithm:** Drossel-Schwabl (1992) three-state synchronous CA. Double-buffer pattern: all next-gen states computed from current gen before any are applied — identical to Conway GoL.
+
+**Physics:** Self-organised criticality (Bak, Tang, Wiesenfeld 1987): at the critical ratio p/f, fire cluster sizes follow `P(s) ∝ s^(−τ)`, τ ≈ 1.19. Analogous to earthquakes (Gutenberg-Richter law) and real forest fires — no characteristic scale, system self-tunes to critical point without external parameter adjustment.
+
+**Math:** Spread kernel choice: 4-neighbour (von Neumann neighbourhood) vs 8-neighbour (Moore neighbourhood). Moore neighbourhood raises effective contagion rate and changes fire-front isotropy; same p/f produces larger fires in 8-neighbour mode.
+
+**Performance:** O(rows × cols) per tick. Per-cell RNG uses xorshift32 (3 XOR+shift ops) — faster than `rand()` and avoids platform-specific RAND_MAX=32767 precision limits. Float conversion: `(rng >> 8) / (1 << 24)` gives 24-bit uniform [0, 1).
+
 ## Key Constants
 
 | Constant | Default | Effect if changed |

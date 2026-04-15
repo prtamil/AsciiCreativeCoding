@@ -114,6 +114,16 @@ The `r` key resets physics (angle, cache) but passes the current `n_beams` into 
 
 ---
 
+## From the Source
+
+**Algorithm:** N-beam spacing: `step = 2π / n_beams; beam_b_angle = draw_angle + b × step` for b ∈ {0..n_beams-1}. Beams share one `cache[N_RADII][WAKE_LEN+1]` array — two beams at same `(ri,k)` show the same char but at completely different screen positions. Shimmer: ~75% of cache entries replaced each tick (`rand()%4 != 0`).
+
+**Math:** `ASPECT=0.45` baked into `sw[k] = sin(wa) * ASPECT` so all row positions use `r × sw[k]` — no per-cell trig. Isotropic radius: `max_r = sqrt((cols/2)² + (rows/2/ASPECT)²) × 1.05` — beams reach all four corners and look visually circular. Wake arc = `WAKE_LEN × WAKE_STEP = 16 × 0.05 = 0.8 rad ≈ 46°` total angular trail.
+
+**Performance:** Per beam per frame: only `WAKE_LEN+1 = 17` trig calls (one per wake slot direction vector). Each of `N_RADII=80` radial samples reuses those pre-computed `cw[k], sw[k]` pairs. Total: 34 trig calls for 2 beams vs 1360 without pre-computation. Draw order: `k = WAKE_LEN` down to `0` (dim→bright) so the bright head overwrites dim slots at cells where inner radii overlap.
+
+**Rendering:** Core `@` drawn last — always on top of all beams. `pulsar_init` preserves `n_beams` across resize and reset (passed in, not re-defaulted). At high N (≥12), adjacent wakes overlap by 16° and the later-drawn beam overwrites earlier ones — creates a dense merged-corona effect.
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect of changing |

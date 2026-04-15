@@ -178,8 +178,13 @@ Path tracing converges as `1/√N` — halving noise requires 4× more samples. 
 
 ## From the Source
 
-**Algorithm:** Russian roulette termination probability is `(1 − max_colour_component)` — the termination chance is highest for dim paths (small max channel), exactly matching where savings are greatest. Surviving paths are boosted by `1/p` to preserve an unbiased estimator.
+**Algorithm:** Unidirectional Monte Carlo path tracing. For each pixel, cast a ray. At each surface hit: (1) check if hit surface is a light — if so, accumulate; (2) sample a random new direction from the cosine-weighted hemisphere around the surface normal; (3) recurse with that direction. Russian roulette termination: at each bounce, terminate with probability `(1 − max_colour_component)`; scale surviving rays. This gives unbiased termination with finite expected depth.
 
-**Math:** The cosine-weighted hemisphere sampling angles are: `θ = arccos(√(1−u))`, `φ = 2π·v` where `u, v` are uniform `[0,1)`. This importance-samples the Lambertian BRDF `f_r = ρ/π`, causing the `cosθ` and `π` factors to cancel so the per-bounce weight collapses to simply `throughput *= albedo`.
+**Math:** Monte Carlo rendering equation (Kajiya 1986):
+`L_o(p,ω_o) = L_e(p,ω_o) + ∫ f_r·L_i·(ω_i·n)·dω_i`
+Cosine-weighted hemisphere sampling: generate (u,v) uniform, `θ = arccos(√(1−u))`, `φ = 2π·v`. This importance-samples the Lambertian BRDF `f_r = ρ/π`, cancelling the cosine factor for simpler accumulation. Progressive rendering: average accumulates as 1/N, converging to ground truth (variance ∝ 1/N) with each additional sample.
 
-**Rendering:** The Cornell box is chosen specifically because it exercises **indirect diffuse illumination** (colour bleeding from red/green walls onto white surfaces) — the key advantage of path tracing over direct-only methods such as Phong. Reinhard tone mapping `L/(1+L)` compresses the unbounded HDR accumulator into `[0,1)` before gamma encoding.
+**Rendering:** Reinhard tone mapping: `L_out = L/(1+L)` compresses HDR values. The Cornell box exercises indirect diffuse illumination (colour bleeding from red/green walls) — the key advantage of path tracing over direct-only methods.
+
+**References:** Kajiya (1986), "The Rendering Equation", SIGGRAPH proceedings.
+

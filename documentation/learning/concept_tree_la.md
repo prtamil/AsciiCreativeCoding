@@ -146,3 +146,4 @@ Adding one cell per frame lets the Gauss-Seidel relaxation keep up: 8 passes is 
 - How do N_RELAX passes affect the fractal dimension? More passes → more accurate field → stronger tip enhancement. Does this change the Hausdorff dimension?
 - The DBM on a hexagonal grid should produce 6-fold symmetric structures (like snowflakes). How would you extend the adjacency and BC code for a hex grid?
 - Can you visualise φ directly as a background gradient beneath the tree? This would show the "energy landscape" the tree is growing through.
+

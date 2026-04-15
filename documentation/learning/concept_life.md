@@ -70,6 +70,16 @@ Some patterns take thousands of generations to develop interesting structure. Ru
 ### Why toroidal (wraparound) boundary?
 Absorbing boundaries (cells outside the grid are always dead) create artificial edge effects — gliders die at edges, patterns near edges behave differently. Toroidal topology means every cell has exactly 8 neighbours and the grid is homogeneous.
 
+## From the Source
+
+**Algorithm:** Conway's Game of Life and variants using B/S rule bitmasks. Birth/survival encoded as bit N = 1 in a uint16 mask where N is the neighbour count (0–8). This allows checking any rule with a single bitshift: born = (birth>>n)&1. Double-buffered toroidal grid; update is O(rows × cols).
+
+**Physics:** Emergent complexity from local rules (Conway, 1970): despite only two states and 9 neighbour values, Life supports stable structures (still-lifes), oscillators, spaceships (gliders), and Turing-complete computation. The Gosper gun produces an infinite glider stream with period 30.
+
+**Data-structure:** Population histogram ring buffer — last HIST_LEN generation counts stored; drawn as a 3-row bar chart using a 4-level block character ramp (▁▂▄█).
+
+**Performance:** Per-step cost: O(rows × cols) neighbour-count evaluation. Steps per frame adjustable (1–16) to allow fast-forward to interesting evolved states.
+
 ## Key Constants
 
 | Constant | Effect |

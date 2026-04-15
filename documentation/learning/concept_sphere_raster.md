@@ -47,6 +47,16 @@ No state machine. Continuous rotation. One boolean: `paused`.
 
 ---
 
+## From the Source
+
+**Algorithm:** Same software rasterization pipeline as torus_raster.c. The sphere is the canonical smooth-shading demo: per-vertex normals = normalised vertex positions (unit sphere). Interpolated across the face using barycentric coordinates → continuous Phong highlight across triangle boundaries.
+
+**Math:** UV sphere tessellation: for `u ∈ [0, 2π]` and `v ∈ [0, π]`: `x = sin(v)·cos(u), y = cos(v), z = sin(v)·sin(u)`. `TESS_U` rings × `TESS_V` stacks gives `2 × TESS_U × TESS_V` triangles. Poles require triangle fans (degenerate quads).
+
+**Performance:** The sphere tessellation is fixed at init; no re-tessellation per frame (unlike displace_raster.c which recomputes vertices every frame). Smooth normals reduce visual artifacts when triangle count is low — a UV sphere looks smooth with just 16×16 tessellation.
+
+---
+
 ## Key Constants
 
 | Constant | Default | Effect |

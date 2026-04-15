@@ -163,6 +163,14 @@ The cost: when a segment turns off, all 24 of its particles must migrate to the 
 
 Speed `sqrt(vx²+vy²)` is momentarily zero at the start of movement (before the spring pulls), which would incorrectly show the particle as "formed" during the first frame. Distance `|pos - target|` is always meaningful: large = in flight, small = formed.
 
+## From the Source
+
+**Algorithm:** Spring-mass particle morphing — per tick: apply spring force `F = k·(target − pos)`, integrate velocity with damping, update position. Particles assigned to inactive segments drift toward segment centre (aggregation behaviour). Segment targets evenly spaced when active. Digit display scales to ~65% of terminal height, recomputed on each resize.
+
+**Math:** 7-segment encoding: digit → bitmask lookup. Critical damping condition: `b = 2√(k·m)`. In code: SPRING_K and DAMP chosen near this condition for smooth, slightly underdamped arrival. Digit aspect: `g_dw ≈ g_dh × 1.1` because physical 7-segment ratio ≈ 0.55 × terminal cell aspect ratio of 2.0. Segment orientation array: `k_seg_horiz[N_SEGS] = {1,0,0,1,0,0,1}` (A,D,G horizontal; B,C,E,F vertical).
+
+**Data-structure:** All 168 particles (N_SEGS=7 × N_PER_SEG=24) in a flat array `g_parts[N_PARTS]`. Permanent segment ownership: `int seg` field never changes. No matching algorithm needed on digit change — direct target reassignment per segment.
+
 ## Open Questions for Pass 3
 
 - What SPRING_K / DAMP ratio produces the most aesthetically pleasing morph? Plot settling time vs `ζ = DAMP / (2√SPRING_K)` for `ζ` in [0.5, 1.5].

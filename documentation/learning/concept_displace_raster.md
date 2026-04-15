@@ -86,6 +86,22 @@ No state machine. Continuous animation. One boolean: `paused`.
 
 ---
 
+## From the Source
+
+**Algorithm:** Vertex displacement shader — modifies mesh geometry per-frame. Unlike cube/sphere/torus_raster.c (fixed mesh), vertex positions are re-calculated each frame by displacing the base sphere vertices along their normals.
+
+**Math:** Displacement: `p' = p + N · f(p, t)` where f is the mode function.
+- RIPPLE: `f = A·sin(ω·t + k·|p.xz|)` — cylindrical wave from equator.
+- WAVE: `f = A·sin(ω·t + k·p.x + k·p.y)` — diagonal plane wave.
+- PULSE: `f = A·sin(ω·t) · exp(−γ·|p.y|)` — breathing along y-axis.
+- SPIKY: `f = |sin(kx·p.x)·sin(ky·p.y)·sin(kz·p.z)|` — sharp spikes.
+
+Normal recomputation (central difference): `N_new = normalise(∂p'/∂u × ∂p'/∂v)` — sampling the displacement at 4 nearby tangent points gives the correct normal for the deformed surface.
+
+**Performance:** O(N_verts) displacement per frame. Normal recomputation is the expensive step: **4 extra displacement evaluations per vertex** (one per tangent direction sample), making each vertex shader call 5× as expensive as a simple evaluation.
+
+---
+
 ## Key Constants
 
 | Constant | Default | Effect |

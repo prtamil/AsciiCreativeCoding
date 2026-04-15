@@ -34,6 +34,14 @@ Shepherd movement: direct velocity control via arrow keys (no physics, instant r
 - **Flee radius visualization**: Draw a dotted ring (toggle with 'f' key) showing the shepherd's influence range. Helps the user learn the effective herding distance.
 - **Sheep character**: Calm=`o`, moving (directional)=`<>^v`, fleeing=`O`. Quick visual feedback on individual sheep state.
 
+### From the Source
+
+**Algorithm:** Sheep use Classic Boids (separation + alignment + cohesion) plus a flee force when shepherd is within `FLEE_RADIUS=180 px`. Flee force uses inverse-distance weighting — `F ∝ 1/r` from the C source (`flee_dir / sdist`), not inverse-square as in the concept. Panic boost at `PANIC_RADIUS=70 px` (not 60 px as in concept). `W_FLEE=7.0` — must dominate cohesion so sheep actually scatter.
+
+**Physics:** Sheep have two speed modes: cruise (`SHEEP_SPEED=200 px/s`, ±25% variation) and flee (`SHEEP_SPEED_FLEE ≈ 1.5× cruise`). Shepherd moves at `SHEPHERD_SPEED=320 px/s` — faster than sheep so the user can catch them. Both run in isotropic pixel space `CELL_W=8, CELL_H=16`. Sheep bounce off walls (`BOUNCE_DAMP=0.6` velocity damping), not wrap — makes sheep cornerable for herding.
+
+**Rendering:** Sheep character selected from 8-direction glyph table based on velocity heading (`o < > ^ v / \`); bold+red when fleeing (`O`). Flee-radius ring: optional dashed circle drawn around shepherd with `'·'` characters at `FLEE_RADIUS/CELL_W` column units, scaled by `CELL_W/CELL_H` in the row direction for correct aspect ratio.
+
 ### Key Constants
 | Name | Value | Role |
 |------|-------|------|

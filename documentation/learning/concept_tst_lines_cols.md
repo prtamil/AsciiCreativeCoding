@@ -32,6 +32,14 @@ These are ncurses global variables (or macros wrapping them) that are set when `
 ## State Machines
 Not applicable. This program has a single linear execution path — no loops, no states.
 
+## From the Source
+
+**Algorithm:** After `initscr()`, ncurses sets the global `LINES` (row count) and `COLS` (column count) to the current terminal size. These are the primary way to make layouts responsive.
+
+**Data-structure:** `getmaxyx(stdscr, rows, cols)` is the per-window equivalent of `LINES`/`COLS` and is safer in multi-window programs. The source comment explicitly notes this distinction.
+
+---
+
 ## Key Constants and What Tuning Them Does
 No tunable constants. The program reads whatever the terminal reports.
 

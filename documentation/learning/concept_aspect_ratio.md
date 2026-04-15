@@ -59,6 +59,14 @@ No state machine. The only "state" is whether the user has pressed 'q'. If yes, 
    |__(key != 'q')_|
 ```
 
+## From the Source
+
+**Algorithm:** Draw a circle with `x = center_x + radius * 2 * cos(angle)`, `y = center_y + radius * sin(angle)`. The factor of 2 on x compensates for the ≈1:2 column:row aspect ratio of terminal cells, making the rendered shape appear circular rather than a tall ellipse.
+
+**Rendering:** The source notes this is the foundation of all isotropic drawing in the project: scaling x by 2 (or equivalently y by 0.5) is the canonical fix applied across every simulation that draws circles or physics in terminal space.
+
+---
+
 ## Key Constants and What Tuning Them Does
 | Constant / Variable | Default | Effect of changing |
 |---------------------|---------|-------------------|

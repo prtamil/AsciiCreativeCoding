@@ -61,6 +61,16 @@ Long enough to see the trailing smear (making each column look like a falling st
 ### Why stagger start delays?
 Without staggering, all columns would start falling at the same moment, looking like an animation artifact. The stagger makes the fall look like leaves loosening and drifting one by one.
 
+## From the Source
+
+**Algorithm:** Two-phase animation: stochastic recursive tree growth using a branching stack (`BSTACK_MAX=512`) for iterative DFS — avoids stack overflow from deep recursion. Then matrix-rain-style leaf fall where each leaf column streams downward with a white head and green trail. Branch characters chosen by angle: `|` near-vertical, `/\` diagonal, `-` near-horizontal.
+
+**Physics:** Leaf fall runs at `FALL_NS=55ms` per step (~18 fps) — slower than the 30 fps render tick. `MAX_START_DELAY=80` ticks stagger the fall so leaves drop in waves rather than simultaneously. Trail drawn by remembering last `TRAIL_LEN=7` row positions per leaf column.
+
+**Data-structure:** Leaf pool: `MAX_LEAVES=4096` structs of `(col, row, delay)`. Tree drawn into a virtual grid `GRID_ROWS=128 × GRID_COLS=320` before being projected to the actual terminal. `TRUNK_H_MIN=0.45 / TRUNK_H_MAX=0.65` randomises trunk height fraction each tree for visual variety. `BRANCH_SPREAD=0.50 rad` is the angle jitter range at each branch fork.
+
+**State machine:** DISPLAY (2.5 s, `DISPLAY_NS`) → FALLING (all heads reach bottom) → RESET (0.7 s, `RESET_NS`) → new tree. `spc` immediately skips to the next state.
+
 ## Key Constants
 
 | Constant | Effect |

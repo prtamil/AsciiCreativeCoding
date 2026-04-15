@@ -108,7 +108,7 @@ IDLE ──(fuse reaches 0)──→ RISING
 
 **Algorithm:** Apex detection uses `vy >= 0.0f` (vertical velocity crossing zero). Rocket ascent: `r->vy += ROCKET_DRAG * dt_sec * 0.5` — the 0.5 factor halves the drag so the rocket reaches higher before apex. `ROCKET_DRAG = 9.8` and `GRAVITY = 4.0` are separate constants: ROCKET_DRAG controls apex height; GRAVITY controls how fast sparks fall after explosion.
 
-**Physics:** Particle spread: angle evenly spaced over 2π as `(i/count)*2π + rand()*0.3` (small jitter), speed uniform in [1.5, 5.0]. Vertical velocity squashed: `vy = sin(angle)*speed*0.5` to compensate for non-square terminal cells. `particle_tick`: `x += vx*dt*8; y += vy*dt*8` — the ×8 scale converts the normalized speed to terminal columns/rows.
+**Physics:** Spark speeds are Gaussian-distributed (not uniform). Integration uses explicit Euler: `vel.y += GRAVITY × dt`, `pos += vel × dt` each tick. This is the first-order forward-Euler method — simple and sufficient for short-lived particles. Vertical velocity squashed: `vy = sin(angle)*speed*0.5` to compensate for non-square terminal cells.
 
 **Data-structure:** `particles[PARTICLES_PER_BURST]` is a fixed array embedded directly in each `Rocket` struct. `Show` owns `rockets[MAX_ROCKETS]` as a flat array. Both are in the global `g_app` in BSS — no heap allocation in the simulation hot path. Inactive rocket slots beyond `active_rockets` are parked with `fuse = INT32_MAX/2`.
 

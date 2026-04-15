@@ -371,8 +371,8 @@ The figure rotates at `t * 0.38` rad/s so all four arms are visible over one orb
 
 1. **Smooth union:** `smin(d1, d2, k)` — blends two SDFs into a single connected surface with a controllable blend radius k.
 2. **Boolean CSG:** union = `min(d1, d2)`, intersection = `max(d1, d2)`, subtraction = `max(d1, −d2)`. Exact set operations on SDFs — union/intersection require no parameter k.
-3. **Twist deformation:** rotate `p.yz` by angle θ ∝ p.x (twist). Domain deformation violates the Lipschitz condition so the SDF is no longer a true signed distance — a relaxation factor (0.5) is applied to prevent overshoot.
+3. **Twist deformation:** rotate `p.xz` by angle θ ∝ p.y (twist around the Y axis). Domain deformation violates the Lipschitz condition so the SDF is no longer a true signed distance — the march step is reduced to `MARCH_TW = 0.60` (vs the standard `MARCH_STEP = 0.85`) to prevent overshoot.
 4. **Domain repetition:** `p = mod(p, cell_size) − cell_size/2`. Evaluating SDF at the remapped p produces an infinite periodic grid from a single primitive's SDF.
 5. **smin-based organic sculpting:** composing many simple primitives with smooth-min produces blob-like organic shapes.
 
-**References:** `wireframe.c` in the raymarcher directory (not geometry/) provides the wire-rendering pipeline; SDF primitives and smooth-min follow Inigo Quilez's reference implementations.
+**Rendering:** The gallery uses a **stable double-buffer** scheme: `g_fbuf` fills row-by-row while `g_stable` holds the last complete frame. Unfinished rows always show from `g_stable` so the scan frontier is invisible to the user.

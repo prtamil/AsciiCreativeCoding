@@ -29,6 +29,16 @@ An array of bars of different heights. Watch them move around as the algorithm r
 - **Variable speed**: Let user press +/- to change how many steps per frame.
 - **Statistics**: Count total comparisons and swaps per run. Display side-by-side with the bar chart.
 
+## From the Source
+
+**Algorithm:** Five sorting algorithms animated one-operation-per-tick: Bubble sort (O(n²), stable, adjacent swaps), Insertion sort (O(n²) shifts, stable, builds sorted prefix), Selection sort (O(n²) comparisons, O(n) swaps, not stable), Quicksort (O(n log n) average, Lomuto partition: pivot = last element), Heapsort (O(n log n) worst-case, in-place, not stable — max-heap built in O(n), then extracted).
+
+**Data-structure:** Coroutine-style iterators: each algorithm is implemented as a state machine (struct + step function) that advances exactly one compare-or-swap per call. This allows the animation loop to run at a user-controlled rate without threads.
+
+**Rendering:** Vertical bar chart: element value → bar height in `#` characters. Colour encodes operation state: grey=unsorted, yellow=currently comparing, red=just swapped, green=sorted (in final position). N_ELEMS=48 bars fill a typical 80-column terminal.
+
+---
+
 ### Key Constants
 | Name | Role |
 |------|------|

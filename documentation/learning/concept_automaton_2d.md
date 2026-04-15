@@ -34,6 +34,16 @@ Each cell is a pixel. Every tick, count how many of its 8 neighbors are "on." Ap
 - **Multi-state rules**: Some rules use 3+ states. Example: "dying" state where a cell fades over several generations (Wireworld uses 4 states).
 - **Encode birth/survival as bitmask**: `birth_mask = 0b001000000` means B3. Check: `if (birth_mask >> neighbor_count) & 1`.
 
+## From the Source
+
+**Algorithm:** Extended 2-D Cellular Automaton (Larger-than-Life / LtL). Generalises Conway's Game of Life to radius R > 1. Neighbourhood count = number of alive cells in a (2R+1)² square. Birth/survive thresholds are range-based (B_min..B_max, S_min..S_max) rather than bitmasks. Multi-state dying trail: state N-1 = fully alive; states 1..N-2 = "dying" (decay by 1 each generation, do not count as alive neighbours); state 0 = dead.
+
+**Math:** Key optimisation: 2-D prefix sum (summed area table). Naïve O((2R+1)²) sum per cell becomes O(1) per cell after O(W×H) table construction: P[r][c] = grid[r][c] + P[r-1][c] + P[r][c-1] − P[r-1][c-1]. Rectangle sum (r0,c0)→(r1,c1): P[r1][c1] − P[r0-1][c1] − P[r1][c0-1] + P[r0-1][c0-1]. At R=5: naïve=121 additions per cell; prefix=1 lookup (121× faster).
+
+**Performance:** O(W×H) per generation with prefix-sum optimisation. Without it: O(W×H×R²); at R=5, W=200, H=50 → 1.2M vs 10K ops.
+
+**Data-structure:** Toroidal wrapping implemented by padding the grid with R-wide copies on all sides before building the prefix sum — eliminates all per-cell boundary branches in the hot loop.
+
 ### Key Constants
 | Name | Role |
 |------|------|

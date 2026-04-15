@@ -32,6 +32,14 @@ Roughness H (Hurst exponent) controls terrain type:
 - **Hydraulic erosion**: Add erosion pass after generation: water flows downhill carrying sediment, deposits at flat areas. Softens the terrain realistically.
 - **Color by height bands**: snow (peaks), rock (mid-high), grass (mid), beach (low), water (below sea level).
 
+## From the Source
+
+**Algorithm:** Diamond-Square algorithm combined with thermal weathering erosion — a 2D analogue of midpoint displacement. Diamond step: centre of each square = mean of 4 corners + random(amplitude). Square step: edge midpoints = mean of 2 opposing corners + mean of 2 adjacent diamonds + random(amplitude). Amplitude halved each iteration → fractal terrain.
+
+**Math:** Diamond-Square produces 1/f^(2H) power spectrum where H is the Hurst exponent. With ROUGHNESS=0.60 → H≈0.5 (standard Brownian surface, "white" terrain). Thermal erosion rule: if slope > TALUS (0.022), move `EROSION_RATE × (slope − TALUS)` material downhill per pass. This rounds peaks and fills valleys, mimicking real geological weathering. Grid size: GRID_N=6 → 65×65 (2^6+1) heightmap. Contour lines use marching squares on the interior.
+
+**Performance:** EROSION_RATE=0.0012, ERODE_PASSES=2 per tick at 60 fps gives steady, visible erosion over minutes of runtime.
+
 ### Key Constants
 | Name | Role |
 |------|------|
@@ -93,10 +101,3 @@ seed corners → diamond_square → heightmap[N+1][N+1]
 → normalize → (optional erosion) → height bands → ASCII render
 ```
 
-## From the Source
-
-**Algorithm:** Diamond-Square algorithm for fractal terrain generation, combined with thermal weathering erosion simulation. Diamond-Square is a 2D analogue of midpoint displacement. Step 1 (diamond): centre of each square = mean of 4 corners + random(amplitude). Step 2 (square): edge midpoints = mean of 2 opposing corners + mean of 2 adjacent diamonds + random(amplitude). Amplitude halved each iteration → fractal terrain.
-
-**Math:** Diamond-Square produces 1/f^(2H) power spectrum where H is the Hurst exponent. With amplitude_factor=0.5 (ROUGHNESS=0.60f in code) → H≈0.5 (standard Brownian surface). Thermal erosion rule: if slope > TALUS threshold (0.022f), move `RATE × (slope − TALUS)` material downhill. This rounds peaks and fills valleys, mimicking real geological weathering.
-
-**Performance:** GRID_N=6 → GRID=65×65 heightmap (2^6+1). Contour lines drawn at regular height intervals using marching squares on the interior, producing topographic map style. EROSION_RATE=0.0012f, ERODE_PASSES=2. SIM_FPS_DEFAULT=60.

@@ -41,6 +41,42 @@
  *           §6 scene   §7 screen §8 app
  */
 
+/* ── CONCEPTS ────────────────────────────────────────────────────────── *
+ *
+ * Algorithm     : Position-Based Dynamics (PBD / XPBD)
+ *                 Instead of integrating forces to get acceleration and then
+ *                 velocity, PBD works directly on positions.  Each constraint
+ *                 (link length) is projected to satisfaction by moving the
+ *                 endpoints.  Repeating N_ITER times → stiffer chain.
+ *
+ * Physics        : Verlet integration + constraint projection
+ *                 Velocity is implicit: v ≈ (x_current − x_prev) / dt.
+ *                 There is no explicit velocity variable — damping multiplies
+ *                 the positional delta before the predict step.
+ *
+ * Math           : Constraint projection formula (per link):
+ *                 correction = (|d| − rest) / |d|  ·  d_vector
+ *                 Each free endpoint absorbs half the correction (equal
+ *                 mass assumption).  A pinned node absorbs none (infinite
+ *                 mass).
+ *
+ * Performance    : Sub-stepping (SUB_STEPS=8) divides dt into 8 smaller
+ *                 steps.  Each sub-step runs the full constraint loop.
+ *                 This improves stability for stiff constraints without
+ *                 shrinking the render frame rate or using an implicit
+ *                 (matrix-solving) integrator.  Cost: O(N · I · S) per
+ *                 frame where N=nodes, I=iterations, S=sub-steps.
+ *
+ * Stability      : PBD is unconditionally stable — no spring constant to
+ *                 blow up.  Stiffness is purely iteration count, not a
+ *                 numerical parameter.  More iterations → stiffer rope,
+ *                 but each iteration is just a few multiplies.
+ *
+ * Data-structure : Ring-buffer trail (TRAIL_LEN entries) for the last
+ *                 free node.  Oldest entry is trail_head wrapped by modulo
+ *                 arithmetic — no shifts needed.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
@@ -61,36 +97,67 @@
 /* ===================================================================== */
 
 enum {
-    SIM_FPS_DEFAULT = 60,
+    SIM_FPS_DEFAULT = 60,   /* target render/sim rate (frames per second)  */
     SIM_FPS_MIN     = 10,
     SIM_FPS_MAX     = 120,
     SIM_FPS_STEP    = 10,
 
     N_NODES_MAX     = 32,   /* max chain nodes (including anchor nodes)    */
-    N_NODES_DEF     = 24,   /* default node count                          */
-    N_ITER_DEF      = 20,   /* default constraint iterations per sub-step  */
+    N_NODES_DEF     = 24,   /* default node count; more → smoother but     */
+                            /* O(N) constraint passes per sub-step         */
+    N_ITER_DEF      = 20,   /* constraint iterations per sub-step:         */
+                            /* more → stiffer rope, no instability risk    */
     N_ITER_MIN      =  5,
     N_ITER_MAX      = 60,
-    SUB_STEPS       =  8,   /* physics sub-steps per sim tick              */
+    SUB_STEPS       =  8,   /* physics sub-steps per rendered frame:       */
+                            /* effective dt = frame_dt / SUB_STEPS         */
+                            /* smaller sub-dt → more accurate constraint   */
+                            /* projection without changing display fps     */
 
-    TRAIL_LEN       = 90,   /* ring-buffer trail for the bottom node       */
+    TRAIL_LEN       = 90,   /* ring-buffer trail depth for bottom node;    */
+                            /* at 60 fps ≈ 1.5 s of history               */
     N_PRESETS       =  4,
     N_THEMES        =  5,
 };
 
-#define NS_PER_SEC  1000000000LL
-#define TICK_NS(f)  (NS_PER_SEC / (f))
+#define NS_PER_SEC  1000000000LL          /* nanoseconds in one second      */
+#define TICK_NS(f)  (NS_PER_SEC / (f))    /* nanoseconds per frame at fps f */
 
+/* Terminal cell dimensions in pixels (ncurses coordinate space).
+ * CELL_W × CELL_H is the logical pixel size of one character cell.
+ * CELL_H / CELL_W ≈ 2 because typical monospace fonts are taller than wide.
+ * All physics runs in pixel-space; px_to_cx / px_to_cy convert to cells.*/
 #define CELL_W   8
 #define CELL_H  16
 
-#define GRAVITY     380.f   /* downward acceleration px/s²                 */
-#define DAMP        0.997f  /* velocity retention per sub-step             */
-#define WIND_FREQ   0.35f   /* wind oscillation rate (Hz)                  */
+/* GRAVITY: downward acceleration in terminal pixel-space (px/s²).
+ * Real gravity = 9.81 m/s².  If we define 1 m ≡ CELL_H px (≈ one cell
+ * height), then a screen of 40 cells ≈ 40 m — too slow visually.
+ * Chosen empirically so the chain sways at a pleasing rate on a typical
+ * 80-row terminal.  Scale: ~38.7 px per "metre", giving 9.81×38.7 ≈ 380. */
+#define GRAVITY     380.f
 
-/* Wave preset driver */
-#define WAVE_FREQ   1.8f    /* driver oscillation (Hz)                     */
-#define WAVE_AMPL  22.f     /* driver amplitude (pixels)                   */
+/* DAMP: fraction of velocity kept after each sub-step (dimensionless 0–1).
+ * Applied as: velocity *= DAMP each sub-step (via positional delta).
+ * At SUB_STEPS=8 and 60 fps: 0.997^(8×60) ≈ 0.30 per second — gentle
+ * energy drain that prevents perpetual oscillation without overdamping. */
+#define DAMP        0.997f
+
+/* WIND_FREQ: frequency of the sinusoidal wind force (Hz).
+ * 0.35 Hz ≈ one full left-right cycle every 2.9 s — slow enough to look
+ * like natural wind gusts rather than rapid mechanical oscillation.       */
+#define WIND_FREQ   0.35f
+
+/* Wave preset driver parameters */
+/* WAVE_FREQ: driven frequency of the top anchor node (Hz).
+ * 1.8 Hz was tuned to fall near the second normal mode of a 24-node chain
+ * at the default tension, producing visible standing-wave patterns.       */
+#define WAVE_FREQ   1.8f
+
+/* WAVE_AMPL: peak horizontal displacement of the driven anchor (pixels).
+ * At CELL_W=8 this is ~2.75 character columns — large enough to see the
+ * wave without the chain folding over itself.                             */
+#define WAVE_AMPL  22.f
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -210,11 +277,24 @@ static void color_init(void)
 /* §4  coords                                                             */
 /* ===================================================================== */
 
+/* Convert pixel-space coordinates to terminal cell coordinates.
+ * + 0.5f performs nearest-cell rounding (equivalent to floorf(x + 0.5)). */
 static inline int px_to_cx(float px) { return (int)(px / CELL_W + 0.5f); }
 static inline int px_to_cy(float py) { return (int)(py / CELL_H + 0.5f); }
 
 /* ===================================================================== */
-/* §5  physics — Position-Based Dynamics chain                           */
+/* §5  physics — Position-Based Dynamics (PBD) chain                    */
+/*                                                                       */
+/* Integration loop per frame:                                           */
+/*   for each sub-step s in [0, SUB_STEPS):                              */
+/*     1. Verlet predict  : x_pred = x + (x − x_old)·DAMP + g·dt²      */
+/*     2. Project constraints (N_ITER passes over all links)             */
+/*     3. Implicit velocity: v = (x_pred − x_old) / dt  (Verlet gives   */
+/*        this for free — no explicit v variable needed)                 */
+/*     4. Advance: x_old = x;  x = x_pred                               */
+/*                                                                       */
+/* Pinned nodes have infinite effective mass: their position is fixed    */
+/* externally each tick; the projection step skips their correction.     */
 /* ===================================================================== */
 
 typedef struct {
@@ -284,28 +364,38 @@ static void seg_draw(int x0, int y0, int x1, int y1,
 static void chain_pbd_step(Chain *c, float dt)
 {
     int   N   = c->n_nodes;
-    float dt2 = dt * dt;
+    float dt2 = dt * dt;    /* dt² appears in the force→position term: Δx = a·dt² */
     float wind_force = c->wind_on
         ? c->wind_str * sinf(c->wind_phase)
         : 0.f;
 
-    /* 1. Verlet predict for free nodes */
+    /* ── Step 1: Verlet predict ──────────────────────────────────────
+     * x_pred = x + (x − x_old)·DAMP + a·dt²
+     * (x − x_old) is the velocity from the last step, multiplied by DAMP
+     * to introduce drag.  Gravity and wind are external accelerations.   */
     for (int i = 0; i < N; i++) {
         ChainNode *n = &c->nodes[i];
-        if (n->pinned) continue;
+        if (n->pinned) continue;    /* pinned nodes are moved externally */
 
-        float vx  = (n->x - n->ox) * DAMP;
-        float vy  = (n->y - n->oy) * DAMP;
+        float vx  = (n->x - n->ox) * DAMP;   /* damped positional velocity x */
+        float vy  = (n->y - n->oy) * DAMP;   /* damped positional velocity y */
         float new_x = n->x + vx + wind_force * dt2;
-        float new_y = n->y + vy + GRAVITY * dt2;
+        float new_y = n->y + vy + GRAVITY * dt2;   /* gravity is +y (downward) */
 
-        n->ox = n->x;
+        n->ox = n->x;       /* save current as "old" for next step */
         n->oy = n->y;
         n->x  = new_x;
         n->y  = new_y;
     }
 
-    /* 2. Constraint projection — iterate to enforce link lengths */
+    /* ── Step 2: Constraint projection ──────────────────────────────
+     * For each link (a, b):
+     *   d     = b.pos − a.pos          (vector from a to b)
+     *   dist  = |d|                    (current length)
+     *   inv   = (dist − rest) / dist   (normalised violation; dimensionless)
+     *   corr  = inv · d                (full correction vector)
+     * Each free endpoint absorbs half (equal mass assumption).
+     * Running this N_ITER times converges toward the exact constraint.    */
     for (int iter = 0; iter < c->n_iter; iter++) {
         for (int i = 0; i < N - 1; i++) {
             ChainNode *a = &c->nodes[i];
@@ -314,24 +404,22 @@ static void chain_pbd_step(Chain *c, float dt)
             float dx   = b->x - a->x;
             float dy   = b->y - a->y;
             float dist = sqrtf(dx * dx + dy * dy);
-            if (dist < 1e-6f) continue;
+            if (dist < 1e-6f) continue;   /* skip degenerate zero-length links */
 
-            /*
-             * corr_x / corr_y: the full correction vector to eliminate
-             * the constraint violation. Each free endpoint gets half;
-             * pinned endpoints get none (zero-mass constraint).
-             */
+            /* inv: how much the link overshoots its rest length, per unit length.
+             * Positive → too long; negative → compressed (rare with gravity).  */
             float inv  = (dist - c->link_rest) / dist;
-            float cx   = inv * dx;
-            float cy   = inv * dy;
+            float cx   = inv * dx;    /* correction vector, x component */
+            float cy   = inv * dy;    /* correction vector, y component */
 
             if (a->pinned && b->pinned) {
-                continue;
+                continue;                           /* both fixed: nothing to do */
             } else if (a->pinned) {
-                b->x -= cx; b->y -= cy;
+                b->x -= cx; b->y -= cy;             /* b carries full correction */
             } else if (b->pinned) {
-                a->x += cx; a->y += cy;
+                a->x += cx; a->y += cy;             /* a carries full correction */
             } else {
+                /* split equally: both nodes have the same mass (1) */
                 a->x += 0.5f * cx; a->y += 0.5f * cy;
                 b->x -= 0.5f * cx; b->y -= 0.5f * cy;
             }
@@ -400,8 +488,11 @@ static void chain_draw(const Chain *c, int cols, int rows)
         int cx  = px_to_cx(c->trail_px[idx]);
         int cy  = px_to_cy(c->trail_py[idx]);
         if (cx < 0 || cx >= cols || cy < 1 || cy >= rows - 1) continue;
+        /* age: 0 = oldest trail entry, 1 = most recent.
+         * Entries in the newest 40% get a bold '*'; older ones get '.'.
+         * This creates a fading tail effect without storing per-entry alpha. */
         float age  = (float)i / (float)(c->trail_cnt > 1 ? c->trail_cnt : 1);
-        bool  new_  = (age > 0.6f);
+        bool  new_  = (age > 0.6f);    /* newest 40% of trail is bright */
         attron(COLOR_PAIR(CP_TRAIL) | (new_ ? A_BOLD : 0));
         mvaddch(cy, cx, new_ ? '*' : '.');
         attroff(COLOR_PAIR(CP_TRAIL) | (new_ ? A_BOLD : 0));
@@ -415,14 +506,18 @@ static void chain_draw(const Chain *c, int cols, int rows)
         int ax = px_to_cx(a->x), ay = px_to_cy(a->y);
         int bx = px_to_cx(b->x), by = px_to_cy(b->y);
 
-        /* tension color: compare actual to rest length */
+        /* tension color: compare actual length to rest length.
+         * stretch = |dist − rest| / rest  (dimensionless strain, 0–∞).
+         * Thresholds tuned so < 4% strain looks relaxed, 4–12% is mid,
+         * > 12% looks taut — mimics how a real rope changes colour under load.
+         * +0.001f guards against division by zero for degenerate zero-length links. */
         float dx   = b->x - a->x, dy = b->y - a->y;
         float dist = sqrtf(dx*dx + dy*dy);
         float stretch = fabsf(dist - c->link_rest) / (c->link_rest + 0.001f);
 
-        int cp = (stretch < 0.04f) ? CP_LINK_LO
-               : (stretch < 0.12f) ? CP_LINK_MID
-               :                     CP_LINK_HI;
+        int cp = (stretch < 0.04f) ? CP_LINK_LO    /* < 4%  strain → relaxed   */
+               : (stretch < 0.12f) ? CP_LINK_MID   /* 4–12% strain → stretched */
+               :                     CP_LINK_HI;   /* > 12% strain → taut      */
 
         seg_draw(ax, ay, bx, by, cols, rows, COLOR_PAIR(cp) | A_BOLD);
     }
@@ -446,7 +541,13 @@ static void chain_draw(const Chain *c, int cols, int rows)
 }
 
 /* ===================================================================== */
-/* §6  scene — presets & lifecycle                                        */
+/* §6  scene — preset initialisation & lifecycle                         */
+/*                                                                       */
+/* Each preset places the chain nodes at specific initial positions and  */
+/* pins selected nodes.  The physics §5 then evolves the system forward. */
+/*                                                                       */
+/* Preset geometry is expressed as fractions of screen dimensions so the */
+/* simulation looks proportional regardless of terminal size.            */
 /* ===================================================================== */
 
 static int  g_rows, g_cols;
@@ -514,7 +615,9 @@ static void preset_pendulum(Chain *c)
     c->wind_on  = false;
     c->preset   = 1;
 
-    float angle = (float)M_PI / 3.f;   /* 60° from vertical */
+    float angle = (float)M_PI / 3.f;   /* 60° from vertical (π/3 radians)
+                                         * Large enough angle for dramatic
+                                         * swing without going past horizontal */
     float sin_a = sinf(angle), cos_a = cosf(angle);
 
     for (int i = 0; i < N; i++) {
@@ -537,7 +640,10 @@ static void preset_bridge(Chain *c)
     float ax      = (float)g_cols * CELL_W * 0.175f;
     float ay      = (float)g_rows * CELL_H * 0.28f;
     int   N       = N_NODES_DEF;
-    /* rest slightly longer than straight distance → produces catenary sag */
+    /* rest 25% longer than the straight-line distance between anchors:
+     * Catenary physics: a chain longer than the span must sag.  The
+     * extra 25% of length has to go somewhere — it forms a parabolic
+     * (approximately catenary) droop.  More excess → deeper sag.        */
     float rest    = span * 1.25f / (float)(N - 1);
 
     chain_init_common(c, N, rest);
@@ -731,7 +837,11 @@ int main(void)
         int64_t t_now  = clock_ns();
         int64_t t_used = t_now - t_last;
         t_last = t_now;
-        if (t_used > 100000000LL) t_used = 100000000LL;  /* cap 100ms */
+        /* Cap dt at 100 ms (= 10 fps equivalent).
+         * If the process was suspended (e.g., Ctrl-Z, terminal resize storm),
+         * t_used could be seconds.  Feeding that into the physics would
+         * launch nodes off-screen.  100 ms is a safe upper bound.          */
+        if (t_used > 100000000LL) t_used = 100000000LL;  /* 100 ms cap */
 
         float dt = (float)t_used * 1e-9f;
         chain_tick(&g_chain, dt);

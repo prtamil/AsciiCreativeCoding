@@ -41,6 +41,39 @@
  *   gcc -std=c11 -O2 -Wall -Wextra nbody.c -o nbody -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Velocity Verlet (Störmer-Verlet) integration.
+ *                  2nd-order symplectic integrator — conserves a modified
+ *                  Hamiltonian (energy drifts only by round-off, not by
+ *                  accumulating phase error like explicit Euler).
+ *                  x_new = x + v·dt + ½·a·dt²
+ *                  a_new = F(x_new)/m
+ *                  v_new = v + ½·(a + a_new)·dt
+ *
+ * Physics        : Softened Newtonian gravity.
+ *                  Real 1/r² force → singularity when r→0.  Softening ε
+ *                  (SOFT2 = ε²) limits force magnitude at close approach,
+ *                  modelling extended mass distributions or simply
+ *                  preventing numerical blow-up.  The force becomes:
+ *                  F = G·m₁·m₂·r / (r² + ε²)^(3/2)
+ *
+ * Performance    : O(N²) force computation each sub-step (brute force).
+ *                  For N≤32 this is fast; N-body above ~1000 would need
+ *                  Barnes-Hut (O(N log N)) or FMM (O(N)).
+ *                  SUB_STEPS=4 improves accuracy without changing display fps.
+ *
+ * Math           : Figure-8 choreography (Chenciner & Montgomery, 2000).
+ *                  An exact periodic solution where 3 equal masses chase
+ *                  each other around a figure-8 curve.  Initial conditions
+ *                  in natural units (G=1, m=1) are rescaled to pixel space
+ *                  using dimensional analysis.
+ *
+ * Data-structure : Per-body ring-buffer trails; each body stores its own
+ *                  TRAIL_LEN positions.  Memory: 32 bodies × 150 × 8 B
+ *                  = 38 KB — fits easily in L1 cache for small N.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
@@ -79,15 +112,28 @@ enum {
 #define NS_PER_MS    1000000LL
 #define TICK_NS(f)   (NS_PER_SEC / (f))
 
-/* Gravity constant (pixel³ / (mass · s²)) */
+/* G_CONST: gravitational constant in pixel-space units (px³ / (mass · s²)).
+ * In SI: G = 6.67×10⁻¹¹ N·m²/kg².  Here we define G empirically so that
+ * two unit-mass bodies 200 px apart produce a visually interesting orbital
+ * period of a few seconds.  Circular orbit period: T = 2π√(r³/GM).
+ * At r=200 px, T = 2π√(8e6/5e5) ≈ 2π·4 ≈ 25 s — gentle galactic timescale. */
 #define G_CONST      500000.0f
-/* Softening squared (pixels²) — prevents singularity */
+
+/* SOFT2: softening length squared (ε² in pixels²).  ε = 40 px.
+ * Without softening, two bodies passing within 1 px would produce
+ * force ∝ 1/r² → ∞, flinging them off-screen.
+ * ε = 40 px is ~5% of a typical 800 px wide screen — suppresses
+ * singularity at close approach while leaving distant gravity accurate.  */
 #define SOFT2        (40.0f * 40.0f)
 
-/* Figure-8 length scale (pixels from screen centre) */
+/* F8_SCALE: natural length unit for the figure-8 choreography (pixels).
+ * The published ICs use G=1, m=1.  F8_SCALE converts natural length → pixels.
+ * Time and velocity scales are derived from F8_SCALE and G_CONST via
+ * dimensional analysis: t_scale = sqrt(L³/G), v_scale = L/t_scale.       */
 #define F8_SCALE     150.0f
 
-/* Bounds multiplier: deactivate body if |pos| > EJECT_FACTOR × screen */
+/* EJECT_FACTOR: body deactivated when |pos| > EJECT_FACTOR × screen half-size.
+ * 2.5 gives a buffer zone outside the visible area before discarding.     */
 #define EJECT_FACTOR 2.5f
 
 /* Cell dimensions for pixel↔cell conversion */
@@ -198,7 +244,13 @@ typedef struct {
     int   preset;
 } NBody;
 
-/* ── Force computation O(n²) ───────────────────────────────────────── */
+/* ── Force computation O(N²) ──────────────────────────────────────────
+ * Each pair (i,j) is visited once (j > i); Newton's 3rd law gives the
+ * equal-and-opposite force on j for free — halves the work vs. naive N².
+ * Softened force magnitude:  G·m₁·m₂ / (r² + ε²)  in direction r̂.
+ * Acceleration:  a = F/m  →  a_i = G·m_j·r̂ / (r²+ε²) (direction term).
+ * The r in the denominator comes from dividing the direction vector (dx,dy)/r
+ * by r² for the force magnitude: combined as G / (r²·r) = G / r³.        */
 
 static void nbody_forces(Body *bodies, int n)
 {
@@ -210,11 +262,12 @@ static void nbody_forces(Body *bodies, int n)
         if (!bodies[i].active) continue;
         for (int j = i + 1; j < n; j++) {
             if (!bodies[j].active) continue;
-            float dx  = bodies[j].x - bodies[i].x;
+            float dx  = bodies[j].x - bodies[i].x;    /* displacement i→j */
             float dy  = bodies[j].y - bodies[i].y;
-            float r2  = dx*dx + dy*dy + SOFT2;
+            float r2  = dx*dx + dy*dy + SOFT2;         /* softened r²       */
             float r   = sqrtf(r2);
-            float inv = G_CONST / (r2 * r);   /* G / r³ */
+            float inv = G_CONST / (r2 * r);            /* G / (r²+ε²)^(3/2) */
+            /* Newton's 3rd law: apply equal and opposite accelerations */
             bodies[i].ax += inv * bodies[j].mass * dx;
             bodies[i].ay += inv * bodies[j].mass * dy;
             bodies[j].ax -= inv * bodies[i].mass * dx;
@@ -300,6 +353,10 @@ static void preset_galaxy(NBody *nb, int cols, int rows)
         float dy = b->y - cy;
         float r  = sqrtf(dx*dx + dy*dy);
         if (r < 1.0f) { b->vx = 0; b->vy = 0; continue; }
+        /* Circular orbit speed: v = √(GM/r).
+         * Multiply by 0.75 to under-circularise slightly: bodies will follow
+         * mildly elliptical orbits, making the simulation look more dynamic
+         * than a rigid disc.  Full circular (1.0) → nearly perfect rotation. */
         float v = sqrtf(G_CONST * total_mass / r) * 0.75f;
         b->vx = -dy / r * v;
         b->vy =  dx / r * v;
@@ -355,7 +412,9 @@ static void preset_blackhole(NBody *nb, int cols, int rows)
         b->thead = 0; b->tcount = 0;
         b->ax = 0; b->ay = 0;
 
-        /* circular orbit around central mass */
+        /* Circular orbit velocity v = √(GM_central/r).
+         * 0.98 ≈ nearly circular: slight inward pull keeps orbits from
+         * instantly escaping while allowing gradual precession.          */
         float v = sqrtf(G_CONST * bh->mass / r) * 0.98f;
         float dx = b->x - cx, dy = b->y - cy;
         b->vx = -dy / r * v;
@@ -480,6 +539,9 @@ static void nbody_draw(const NBody *nb, WINDOW *w, int cols, int rows)
 
         /* draw body */
         if (cx >= 0 && cx < cols && cy >= 1 && cy < rows - 1) {
+            /* Glyph chosen by mass: heavier → larger character.
+             * '@' > 50: black hole / giant mass (pixel density max).
+             * 'O' > 3:  medium star.  'o' > 1.5: light star.  '*': minimal mass. */
             char ch;
             if (b->mass > 50.0f)     ch = '@';
             else if (b->mass > 3.0f) ch = 'O';

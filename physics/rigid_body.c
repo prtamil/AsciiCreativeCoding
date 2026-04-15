@@ -46,6 +46,30 @@
  *           §6 physics §7 scene  §8 draw   §9 screen §10 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Iterative impulse-based collision resolution (Baumgarte).
+ *                  SOLVER_ITERS constraint solver passes per step.
+ *                  Each pass: detect overlap, apply positional correction
+ *                  (Baumgarte stabilisation) then velocity impulse.
+ *
+ * Physics        : 2D rigid-body mechanics with restitution and friction.
+ *                  Restitution (REST_DEF=0.35): e=0 → perfectly inelastic
+ *                  (no bounce); e=1 → perfectly elastic (infinite bounce).
+ *                  Friction (FRICTION=0.35): Coulomb model |jt| ≤ μ·jn.
+ *                  REST_THRESH: micro-bounce suppression below 0.20 px/step.
+ *
+ * Engineering    : SLOP (allowed penetration depth before correction fires).
+ *                  Without slop, tiny floating-point penetrations cause
+ *                  constant jitter.  SLOP=0.05 px absorbs numerical noise
+ *                  while still resolving real overlap.
+ *                  BAUMGARTE (0.50): fraction of penetration corrected each
+ *                  iteration.  1.0 → sharp but can overshoot; 0.5 is stable.
+ *
+ * Sleep system   : Bodies sleeping for SLEEP_FRAMES quiet frames are frozen.
+ *                  Saves CPU; woken by impulse or position correction > WAKE_IMP.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>
@@ -66,18 +90,54 @@
 #define N_THEMES       5
 
 /* physics */
-#define GRAVITY      0.05f   /* downward accel per step                     */
-#define REST_DEF     0.35f   /* default coefficient of restitution           */
+/* GRAVITY: downward acceleration per physics step (cell units/step²).
+ * This simulation runs in cell-space rather than pixel-space.
+ * 0.05 cell/step² at ~60 Hz means terminal velocity of roughly
+ * MAX_SPEED/DAMPING ≈ 2.5 cells/step — one cell per 2 frames at max.    */
+#define GRAVITY      0.05f
+
+/* REST_DEF: coefficient of restitution (0=inelastic, 1=elastic).
+ * 0.35 produces lively but not bouncy behaviour — similar to a rubber ball
+ * on concrete.  Above ~0.8 stacked objects become unstable (energy injection). */
+#define REST_DEF     0.35f
 #define REST_STEP    0.05f
-#define FRICTION     0.35f   /* Coulomb μ                                    */
-#define DAMPING      0.991f  /* per-step velocity multiplier                 */
-#define MAX_SPEED    22.0f   /* velocity cap (tunneling prevention)          */
+
+/* FRICTION: Coulomb friction coefficient μ.
+ * Tangential impulse is clamped to μ × normal impulse.
+ * 0.35 ≈ rubber on wood — noticeable but not sticky.                      */
+#define FRICTION     0.35f
+
+/* DAMPING: velocity retained per step (dimensionless, 0–1).
+ * 0.991^60 ≈ 0.58 per second — bodies slow down noticeably, preventing
+ * infinite sliding on a frictionless floor.                               */
+#define DAMPING      0.991f
+
+/* MAX_SPEED: velocity cap (cell units/step).
+ * Prevents tunnelling: at 22 cells/step a body crosses a 1-cell wall in
+ * < 1 step → missed collision.  Capping ensures no body moves more than
+ * a fraction of its own size per step.                                    */
+#define MAX_SPEED    22.0f
 
 /* solver */
-#define SOLVER_ITERS  10     /* iterations per step — higher = stiffer stack */
-#define BAUMGARTE    0.50f   /* positional correction fraction (per iter)    */
-#define SLOP         0.05f   /* penetration allowed before correction fires  */
-#define REST_THRESH  0.20f   /* approach speed below this → e_eff = 0       */
+/* SOLVER_ITERS: constraint solver passes per step.
+ * More passes → stiffer stacking but more CPU.  10 is a good balance for
+ * 2D bodies; 3D rigid-body engines typically use 4–20.                    */
+#define SOLVER_ITERS  10
+
+/* BAUMGARTE: fraction of penetration resolved per constraint iteration.
+ * Named after Joachim Baumgarte (1972) who introduced this stabilisation.
+ * 0.5 → each pass removes half the remaining penetration; stable but gradual. */
+#define BAUMGARTE    0.50f
+
+/* SLOP: penetration depth below which no correction fires (dead-zone).
+ * Without slop, tiny float-precision overlaps cause constant jitter.
+ * 0.05 cells ≈ sub-pixel — absorbs numerical noise without visible drift. */
+#define SLOP         0.05f
+
+/* REST_THRESH: approach speed below which restitution is set to zero.
+ * Prevents micro-bounce ("sleeping" at contact): bodies resting on the
+ * floor don't vibrate due to tiny velocity noise.                         */
+#define REST_THRESH  0.20f
 /*                             kills micro-bounce when bodies settle          */
 
 /* sleep */

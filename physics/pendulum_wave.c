@@ -23,6 +23,32 @@
  * §1 config  §2 clock  §3 color  §4 physics  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic (not numerical) integration.
+ *                  Each pendulum is a simple harmonic oscillator with
+ *                  θ_n(t) = amp · sin(ω_n · t).  No Runge-Kutta needed —
+ *                  the exact solution is just a sine function evaluated at t.
+ *                  This is possible because small-angle approximation:
+ *                    θ'' ≈ −(g/L)·θ  →  ω = √(g/L)
+ *
+ * Physics        : Length-frequency relation.
+ *                  Longer pendulum → lower ω → slower swing.
+ *                  Pendulum n has ω_n = 2π(N_BASE+n)/T_SYNC.
+ *                  From ω = √(g/L): L_n = g/ω_n².  All pendulums at t=0
+ *                  are in phase; over time they drift to produce waves,
+ *                  spirals, and other patterns.  At t=T_SYNC they all
+ *                  complete an integer number of full cycles — perfect resync.
+ *
+ * Math           : Lissajous-like interference between harmonic oscillators
+ *                  with frequencies in arithmetic progression.  The "clap"
+ *                  resync at T_SYNC is a consequence of the integer-ratio
+ *                  design: each pendulum's period divides T_SYNC exactly.
+ *
+ * Performance    : O(N) per frame — each pendulum is just one sinf() call.
+ *                  No spring forces, no constraint iterations needed.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -38,10 +64,26 @@
 /* §1  config                                                             */
 /* ===================================================================== */
 
-#define N_PEND       15         /* number of pendulums           */
-#define N_BASE       40         /* lowest oscillation count      */
-#define T_SYNC       60.0f      /* resync period (seconds)       */
-#define AMP_INIT     0.70f      /* initial amplitude (0..1)      */
+#define N_PEND       15         /* number of pendulums (sweet spot: enough for
+                                  * rich wave patterns, few enough to all be visible) */
+
+/* N_BASE: oscillation count for the slowest pendulum over T_SYNC seconds.
+ * Pendulum n completes (N_BASE+n) full cycles in T_SYNC.
+ * N_BASE=40 means the slowest pendulum does 40 cycles in 60 s → ω=4.19 rad/s.
+ * Choosing a large N_BASE (relative to N_PEND=15) keeps the frequencies
+ * closely spaced → the wave patterns develop slowly and elegantly.        */
+#define N_BASE       40
+
+/* T_SYNC: time (seconds) until all pendulums return to perfect phase alignment.
+ * All ω_n are integer multiples of 2π/T_SYNC, so at t=T_SYNC:
+ * ω_n · T_SYNC = 2π·(N_BASE+n) — an exact integer number of full cycles.
+ * 60 s is long enough to see many wave forms before the resync "clap".    */
+#define T_SYNC       60.0f
+
+/* AMP_INIT: initial swing amplitude as a fraction of the column width.
+ * 0.70 → each bob swings ±70% of its column band.
+ * Higher → more dramatic but bobs of adjacent pendulums may overlap.      */
+#define AMP_INIT     0.70f
 #define AMP_STEP     0.05f
 
 #define SIM_DT       (1.0f / 60.0f)   /* sim step (seconds)   */

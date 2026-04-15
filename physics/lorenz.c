@@ -48,6 +48,33 @@
  *   gcc -std=c11 -O2 -Wall -Wextra lorenz.c -o lorenz -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : RK4 integration of a 3-variable ODE system.
+ *                  The Lorenz system is autonomous (no explicit time):
+ *                  dx/dt = f(x,y,z), so each RK4 step uses only the
+ *                  current state, not wall-clock time.  Step size L_H is
+ *                  fixed in Lorenz-time units regardless of display fps.
+ *
+ * Physics/Math   : Strange attractor / deterministic chaos.
+ *                  Originally derived by Edward Lorenz (1963) from a
+ *                  simplified model of atmospheric convection.
+ *                  σ (sigma) = Prandtl number (viscosity/thermal diffusivity).
+ *                  ρ (rho)   = Rayleigh number ratio (buoyancy vs. diffusion).
+ *                  β (beta)  = geometric factor for the convection cell.
+ *                  At σ=10, ρ=28, β=8/3 the system has a strange attractor:
+ *                  bounded but never repeating, with Lyapunov exponent λ≈0.9.
+ *
+ * Rendering      : Orthographic projection with azimuth φ and elevation θ.
+ *                  The 3D point (x,y,z) is rotated around the z-axis by φ,
+ *                  then the (ry, z) plane is tilted by θ to produce screen
+ *                  coordinates.  ASPECT compensates for non-square cell ratio.
+ *
+ * Data-structure : Ring-buffer trail (TRAIL_LEN=2500 points) per trajectory.
+ *                  At 60 fps × 8 sub-steps = 480 points/s, 2500 ≈ 5.2 s of
+ *                  trajectory history — enough to show the full butterfly shape.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
@@ -83,12 +110,27 @@ enum {
 #define NS_PER_MS    1000000LL
 #define TICK_NS(f)   (NS_PER_SEC / (f))
 
-/* Lorenz parameters */
+/* Lorenz system parameters — classic "chaotic" values:
+ * σ=10 (Prandtl ≈ air), ρ=28 (Rayleigh just above onset of turbulence),
+ * β=8/3 (geometry factor for a square convection cell).
+ * Changing any of these shifts the system between periodic, quasi-periodic,
+ * and chaotic regimes.  ρ < 1 → all trajectories converge to origin.
+ * ρ ≈ 24.74 → onset of chaos.  ρ > 28 → fully developed butterfly attractor. */
 #define L_SIGMA   10.0f
 #define L_RHO     28.0f
 #define L_BETA    (8.0f / 3.0f)
-#define L_H       0.005f    /* RK4 step (Lorenz time units)                */
-#define GHOST_EPS 0.01f     /* initial ε-separation for ghost trajectory   */
+
+/* L_H: fixed RK4 step in Lorenz time units.
+ * At h=0.005 the RK4 global error is O(h⁴) ≈ 6×10⁻¹⁰ per step — far
+ * below float precision over the first 10 s.  Larger h (e.g. 0.02) causes
+ * the trajectory to visibly drift off the true attractor.                 */
+#define L_H       0.005f
+
+/* GHOST_EPS: initial x-offset for the shadow trajectory (Lorenz units).
+ * 0.01 in a space of radius ~30 is 0.03% — typical of measurement error.
+ * Lyapunov exponent λ≈0.9 → the gap doubles every ~0.77 Lorenz-time,
+ * reaching attractor scale (sep ≈ 30) after ~37 doublings ≈ 10 real-s.  */
+#define GHOST_EPS 0.01f
 
 /* View */
 #define CELL_W  8
@@ -324,8 +366,14 @@ static void lorenz_draw_trail(const Trail *t, bool is_ghost,
         last_row = row;
 
         chtype attr;
+        /* Age-based colour ramp (age=0 newest, age=1 oldest):
+         * 0–15%  → red bold    (fresh trajectory, just drawn)
+         * 15–30% → red         (recent)
+         * 30–55% → orange      (mid-age)
+         * 55–75% → dim yellow  (old)
+         * 75–100%→ dim default (ancient, fading into background)          */
         if (is_ghost) {
-            attr = COLOR_PAIR(7) | A_DIM;
+            attr = COLOR_PAIR(7) | A_DIM;    /* ghost always dim magenta */
         } else if (age < 0.15f) {
             attr = COLOR_PAIR(1) | A_BOLD;
         } else if (age < 0.30f) {

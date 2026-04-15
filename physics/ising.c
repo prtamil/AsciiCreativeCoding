@@ -22,6 +22,36 @@
  * §1 config  §2 clock  §3 color  §4 grid  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Metropolis Monte Carlo (MCMC).
+ *                  Randomly propose a spin flip; accept with probability
+ *                  P = min(1, exp(−ΔE / kT)).  Over many steps this
+ *                  samples the Boltzmann distribution at temperature T.
+ *                  Not a physics simulation in real-time — it's a
+ *                  statistical sampler converging toward thermal equilibrium.
+ *
+ * Physics        : 2D Ising model of ferromagnetism.
+ *                  Each spin s = ±1 interacts with nearest neighbours.
+ *                  ΔE = 2·s·(sum of 4 neighbours) — the energy cost of
+ *                  flipping one spin given its environment.
+ *                  Below T_crit ≈ 2.269 (in units where J=k_B=1),
+ *                  large aligned domains spontaneously appear —
+ *                  a textbook example of a 2nd-order phase transition.
+ *
+ * Math           : ΔE formula exploits the fact that the Hamiltonian is
+ *                  a sum of pairwise products: H = −J·Σ s_i·s_j.
+ *                  Flipping spin i changes H by 2·J·s_i·Σ_nbr s_j.
+ *                  For J=1 this is ΔE = 2·s·Σ_nbr (values ±4, ±8, ±16
+ *                  depending on alignment with 4 neighbours).
+ *
+ * Performance    : FLIPS_PER_CELL attempts per grid cell per frame.
+ *                  Each attempt is just one expf() and a random comparison.
+ *                  At 200×60=12000 cells, 50 attempts each = 600k flips/frame
+ *                  at 30 fps ≈ 18M flip attempts/s — fast enough to see
+ *                  domain formation in real-time.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>
@@ -40,13 +70,25 @@
 #define HUD_ROWS      2
 #define N_THEMES     10
 
-#define T_INIT   3.0f   /* start hot                 */
-#define T_CRIT   2.269f /* 2D Ising critical temp    */
-#define T_MIN    0.1f
-#define T_MAX    5.0f
-#define T_STEP   0.05f
+/* T_INIT: starting temperature (in units where J = k_B = 1).
+ * 3.0 > T_CRIT → starts in the disordered (paramagnetic) phase.
+ * The user can cool down with ↓ to watch domain nucleation occur.         */
+#define T_INIT   3.0f
 
-/* Flips per frame — proportional to grid size so rate is cells/step */
+/* T_CRIT: 2D Ising critical temperature = 2 / ln(1 + √2) ≈ 2.2692.
+ * Exact analytical result by Lars Onsager (1944).
+ * Above T_CRIT: spins disordered, net magnetisation ≈ 0.
+ * Below T_CRIT: long-range order forms, |⟨s⟩| → 1 as T → 0.
+ * At T_CRIT exactly: scale-free domain structure (fractal-like).          */
+#define T_CRIT   2.269f
+
+#define T_MIN    0.1f    /* avoid T→0 where exp() arguments → ∞             */
+#define T_MAX    5.0f
+#define T_STEP   0.05f   /* temperature adjustment per keypress              */
+
+/* FLIPS_PER_CELL: Metropolis attempts per cell per frame.
+ * Higher → faster equilibration but more CPU.  50 attempts/cell/frame at
+ * 30 fps = 1500 attempts/cell/s — enough to see domain dynamics clearly.  */
 #define FLIPS_PER_CELL   50
 #define RENDER_NS  (1000000000LL / 30)
 

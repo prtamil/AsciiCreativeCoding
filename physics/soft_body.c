@@ -27,6 +27,29 @@
  *           §5 physics  §6 collision  §7 scene  §8 draw  §9 screen  §10 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Position-Based Dynamics (PBD) — same algorithm as chain.c
+ *                  but applied to a 2D mesh of nodes forming a soft body.
+ *                  Constraints: structural (keep nodes at rest distance),
+ *                  shear (diagonal links), and volume (area preservation).
+ *
+ * Physics        : Soft-body deformation via spring-like constraints.
+ *                  Unlike explicit spring forces (which require tuning k for
+ *                  stability), PBD constraints are projected geometrically.
+ *                  STRUCT_K=1.0 → full structural correction each iteration;
+ *                  SHEAR_K=0.8 → 80% of shear correction → softer diagonal feel.
+ *
+ * Collision      : PBD inter-body collision using boundary polygon test.
+ *                  For each node of body A that penetrates body B's convex hull,
+ *                  push A's node outward and B's nearest edge nodes inward
+ *                  (Newton's 3rd law in position space).
+ *
+ * Performance    : COLL_ITERS=2 collision iterations per physics step.
+ *                  PBD_ITERS=6 constraint iterations.  Cost: O(N²×COLL_ITERS×PBD_ITERS)
+ *                  per frame.  At 16 blobs × 50 nodes ≈ feasible on modern hardware.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

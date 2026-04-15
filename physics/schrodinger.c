@@ -30,6 +30,31 @@
  * §1 config  §2 clock  §3 color  §4 wavefunction  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Crank-Nicolson finite-difference scheme.
+ *                  Averages the explicit and implicit Euler steps to give
+ *                  an unconditionally stable, 2nd-order-in-time method.
+ *                  Results in a tridiagonal complex linear system per step,
+ *                  solved with the Thomas algorithm O(N) — not O(N³).
+ *
+ * Physics        : Quantum mechanics, wave-particle duality.
+ *                  ψ(x,t) is complex-valued; |ψ|² is the probability density.
+ *                  The wavefunction spreads (Re, Im oscillate), reflects off
+ *                  walls, and tunnels through barriers with probability
+ *                  T ≈ exp(−2κd) where κ = √(2m(V−E))/ℏ.
+ *
+ * Math           : Natural units ℏ = m = 1 simplify the Hamiltonian:
+ *                  H = −½ d²/dx² + V(x).
+ *                  DX and DT are in these dimensionless units.
+ *                  The Thomas algorithm (LU decomposition of tridiagonal
+ *                  matrix) gives the next ψ in O(N) operations.
+ *
+ * Performance    : N_GRID=512 points × STEPS_PER_FRAME=20 solves per frame.
+ *                  Each solve is O(N), so total: O(10240) mults per frame —
+ *                  easily runs at 30 fps even on a single core.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -46,18 +71,40 @@
 /* §1  config                                                             */
 /* ===================================================================== */
 
-#define N_GRID   512       /* number of spatial grid points (power of 2) */
+/* N_GRID: spatial grid points.  Power of 2 enables future FFT-based solvers.
+ * 512 gives DX=1/511 ≈ 0.002 — fine enough to resolve typical Gaussian
+ * wave packets (σ ≈ 0.05) with ~25 points per standard deviation.        */
+#define N_GRID   512
 #define X_MIN    0.f
 #define X_MAX    1.f
-#define DX       ((X_MAX - X_MIN) / (float)(N_GRID - 1))
-#define DT       0.0002f   /* time step (in natural units ℏ=m=1)          */
+#define DX       ((X_MAX - X_MIN) / (float)(N_GRID - 1))  /* ≈ 0.002 (dimensionless) */
+
+/* DT: time step in natural units (ℏ=m=1).
+ * Crank-Nicolson is unconditionally stable for any DT, but large DT causes
+ * phase errors.  DT=0.0002 keeps the numerical dispersion < 1% over 1000 steps
+ * for wave packets with k ≈ 50 (momentum).                                */
+#define DT       0.0002f
+
+/* STEPS_PER_FRAME: solver passes per rendered frame.
+ * At 30 fps and DT=0.0002, one second of display = 30×20 = 600 time units.
+ * The wave packet traverses the domain in ~T=1/(k/(2π)) ≈ 0.13 time units,
+ * so the animation completes a traversal in ~0.22 s of display time.      */
 #define STEPS_PER_FRAME 20
 
+/* Natural units: ℏ=1, m=1 reduce H = −ℏ²/(2m)·d²/dx² + V(x) to H = −½·d²/dx² + V(x).
+ * All energies, velocities, and potentials are in these dimensionless units. */
 #define HBAR     1.f
 #define MASS     1.f
 
-/* Potential barrier height (in energy units) */
+/* V_BARRIER: finite rectangular barrier height (energy units).
+ * Wave energy E ≈ k²/2 ≈ 50²/2 = 1250 (for default k=50).
+ * V_BARRIER=2000 > E → classically forbidden; quantum tunnelling occurs.
+ * Transmission T ≈ exp(−2κd) where κ=√(2(V−E)) and d = barrier width.   */
 #define V_BARRIER  2000.f
+
+/* V_WALL: hard wall potential (effectively infinite compared to wave energy).
+ * Used for the double-slit walls and domain boundaries.
+ * V_WALL >> V_BARRIER ensures walls are fully reflective.                 */
 #define V_WALL    50000.f
 
 #define RENDER_NS   (1000000000LL / 30)

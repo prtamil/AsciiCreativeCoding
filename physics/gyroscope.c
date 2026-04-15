@@ -87,6 +87,34 @@
  *   gcc -std=c11 -O2 -Wall -Wextra gyroscope.c -o gyroscope -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : RK4 integration of a 7-component state vector.
+ *                  [ωx, ωy, ωz] — angular velocity in body frame (rad/s)
+ *                  [qw, qx, qy, qz] — orientation quaternion (unit length)
+ *                  RK4 is used because Euler equations are nonlinear:
+ *                  the cross-products (I₂−I₃)ωy·ωz etc. make the ODE stiff.
+ *
+ * Physics        : Euler's equations of rigid-body rotation.
+ *                  In the body frame (principal axes), the inertia tensor
+ *                  is diagonal with eigenvalues I₁, I₂, I₃.
+ *                  The intermediate-axis theorem: rotation near the
+ *                  SMALLEST or LARGEST inertia axis is stable; rotation
+ *                  near the MIDDLE inertia axis is unstable (Dzhanibekov).
+ *
+ * Math           : Quaternion orientation tracking.
+ *                  A quaternion q = (qw, qx, qy, qz) with |q|=1 encodes
+ *                  3-D rotation without gimbal lock or singularities.
+ *                  The rotation matrix R(q) is derived analytically.
+ *                  After each RK4 step q is re-normalised: q /= |q|.
+ *                  Gram-Schmidt re-orthogonalises the extracted axes to
+ *                  prevent floating-point accumulation errors.
+ *
+ * Rendering      : Orthographic projection of 3D wireframe (ring + axes).
+ *                  ASPECT = CELL_W/CELL_H ≈ 0.5 compensates for non-square
+ *                  terminal cells so circles appear round not elliptical.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

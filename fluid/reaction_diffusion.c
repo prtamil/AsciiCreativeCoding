@@ -40,6 +40,42 @@
  *            §6 screen  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Explicit (Forward) Euler integration of a PDE system.
+ *                  Each cell advances by one time-step DT=1.0 per tick.
+ *                  Stability requires: DT · Du / dx² < 0.25 (CFL condition).
+ *                  With dx=1 cell and DU=0.20, the stability bound is 1.25 —
+ *                  so DT=1.0 is safely within the stable region.
+ *
+ * Physics/Chem   : Turing instability (Alan Turing, 1952).
+ *                  Two chemicals with different diffusion rates (Du > Dv)
+ *                  plus a nonlinear reaction (U·V²) can spontaneously break
+ *                  spatial symmetry and form stable patterns.  The type of
+ *                  pattern (spots, stripes, labyrinth) depends on feed rate f
+ *                  and kill rate k — the parameter space is the Gray-Scott map.
+ *
+ * Math           : 9-point isotropic Laplacian (Fornberg-style stencil).
+ *                  Cardinal (N/S/E/W) weight = 0.20.
+ *                  Diagonal (NE/NW/SE/SW) weight = 0.05.
+ *                  Centre = −1 (so the stencil sums to 0 over a flat field).
+ *                  This is more isotropic than the simple 4-point stencil;
+ *                  it reduces the "diamond" artefacts visible in spot presets.
+ *
+ * Nonlinear term : U·V² is the "autocatalytic" reaction — V catalyses its
+ *                  own production by consuming U.  This creates the
+ *                  activator-inhibitor dynamics needed for pattern formation.
+ *
+ * Performance    : Double-buffering (u/v ← u2/v2 swap) avoids read-write
+ *                  aliasing within a single step.  All arithmetic stays
+ *                  in float, fitting a row in cache at moderate widths.
+ *                  STEPS_DEFAULT=16 sim steps per render frame trades
+ *                  visual smoothness for pattern evolution speed.
+ *
+ * Data-structure : Two flat float arrays (row-major) per chemical; one pair
+ *                  for reading, one for writing, swapped each step.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
@@ -56,17 +92,52 @@
 /* §1  config                                                             */
 /* ===================================================================== */
 
+/* DU: diffusion rate of U (substrate/feed chemical).
+ * Higher diffusion → U spreads faster, smoothing out concentration gradients.
+ * Gray-Scott requires Du > Dv for Turing instability; if they were equal,
+ * no patterns would form — the system would reach a uniform steady state.  */
 #define DU              0.20f
+
+/* DV: diffusion rate of V (catalyst/pattern chemical).
+ * V diffuses half as fast as U.  This asymmetry is the engine of pattern
+ * formation: V builds up locally (slow diffusion) while U is replenished
+ * from a distance (fast diffusion), creating a activator-inhibitor loop.  */
 #define DV              0.10f
-#define DT              1.00f       /* explicit Euler timestep              */
-#define STEPS_DEFAULT     16        /* sim steps per render frame           */
+
+/* DT: explicit Euler timestep (dimensionless, in units of grid cells).
+ * CFL stability bound for the diffusion term: DT · DU / dx² < 0.25.
+ * With dx=1: max DT = 0.25/0.20 = 1.25, so DT=1.0 has a 25% safety margin. */
+#define DT              1.00f
+
+/* STEPS_DEFAULT: Gray-Scott simulation steps computed per rendered frame.
+ * More steps → patterns evolve faster visually; fewer → slow morphing.
+ * 16 gives a balanced speed on a 80×24 terminal at 30 fps.               */
+#define STEPS_DEFAULT     16
 #define STEPS_MIN          1
 #define STEPS_MAX         64
 #define STEPS_STEP         4
-#define WARMUP_STEPS     600        /* pre-run before first frame           */
-#define SEED_HALF          3        /* half-size of seed square (cells)     */
-#define AUTO_CYCLE_FRAMES 800       /* frames before auto-switching theme   */
-#define V_DISPLAY_SCALE   2.2f      /* stretch V for display contrast       */
+
+/* WARMUP_STEPS: simulation steps run before the first frame is shown.
+ * At t=0 the grid is mostly U=1, V=0 with tiny seed blobs — visually
+ * uninteresting.  600 steps (≈37 render-frames worth) advances the
+ * pattern into the self-organised regime before the user sees anything. */
+#define WARMUP_STEPS     600
+
+/* SEED_HALF: half-width (in cells) of each square seed blob.
+ * A 7×7 (SEED_HALF=3) blob of V=1 is large enough to seed a stable
+ * reaction front without being so large it dominates the grid.          */
+#define SEED_HALF          3
+
+/* AUTO_CYCLE_FRAMES: rendered frames between automatic colour theme changes.
+ * At 30 fps this is ≈26 s per theme — long enough to appreciate the
+ * pattern before the palette rotates.                                   */
+#define AUTO_CYCLE_FRAMES 800
+
+/* V_DISPLAY_SCALE: contrast stretch applied to V before the ASCII ramp.
+ * Peak V in the self-organised state is typically 0.3–0.5, not 1.0.
+ * Multiplying by 2.2 maps that range to ~0.66–1.1 → uses the full ramp.
+ * Without this, the simulation would only ever show the dim lower ramp chars. */
+#define V_DISPLAY_SCALE   2.2f
 
 #define RAMP_N   8
 #define CP_BASE  1                  /* color pairs: CP_BASE … CP_BASE+N-1  */
@@ -85,14 +156,20 @@ typedef struct {
     int         n_seeds;    /* number of seed blobs                        */
 } Preset;
 
+/* Gray-Scott (f, k) parameter pairs.
+ * f  = feed rate: rate at which U is replenished (& V is diluted).
+ * k  = kill rate: rate at which V is removed on top of the dilution.
+ * Small changes in (f, k) cross phase boundaries and produce wildly
+ * different morphologies — this is the hallmark of Turing bifurcations.
+ * Values from Pearson (1993) "Complex Patterns in a Simple System".     */
 static const Preset k_presets[] = {
-    { "Mitosis",   0.0367f, 0.0649f, 4 },  /* spots that divide          */
-    { "Coral",     0.0545f, 0.0630f, 5 },  /* branching coral growth     */
-    { "Stripes",   0.0600f, 0.0620f, 3 },  /* labyrinthine stripes       */
-    { "Worms",     0.0620f, 0.0610f, 6 },  /* winding worm tendrils      */
-    { "Maze",      0.0290f, 0.0570f, 8 },  /* fine maze texture          */
-    { "Bubbles",   0.0940f, 0.0590f, 3 },  /* round bubble lattice       */
-    { "Solitons",  0.0250f, 0.0500f, 4 },  /* drifting soliton blobs     */
+    { "Mitosis",   0.0367f, 0.0649f, 4 },  /* spots that periodically divide */
+    { "Coral",     0.0545f, 0.0630f, 5 },  /* branching coral-like growth    */
+    { "Stripes",   0.0600f, 0.0620f, 3 },  /* labyrinthine stripe patterns   */
+    { "Worms",     0.0620f, 0.0610f, 6 },  /* winding worm tendrils          */
+    { "Maze",      0.0290f, 0.0570f, 8 },  /* fine-grained maze texture      */
+    { "Bubbles",   0.0940f, 0.0590f, 3 },  /* stable round bubble lattice    */
+    { "Solitons",  0.0250f, 0.0500f, 4 },  /* slowly drifting soliton blobs  */
 };
 #define N_PRESETS (int)(sizeof k_presets / sizeof k_presets[0])
 
@@ -117,21 +194,25 @@ static void clock_sleep_ns(int64_t ns)
 /* §3  theme + rendering                                                  */
 /* ===================================================================== */
 
-/*
- * ASCII ramp: 8 levels ordered by visual density.
- * Mapped to scaled V in [0, 1].
- */
+/* ASCII ramp: 8 characters ordered by visual ink density (lightest → darkest).
+ * Mapped to the V concentration scaled by V_DISPLAY_SCALE.
+ * This is a grayscale approximation using character pixel density:
+ * ' ' has 0% ink; '@' has ~80% ink at typical terminal font sizes.       */
 static const char k_ramp[RAMP_N] = { ' ', '.', ':', '-', '+', '*', '#', '@' };
 
+/* Threshold values for each ramp character.
+ * A cell uses character i if its scaled-V value falls in [k_breaks[i], k_breaks[i+1]).
+ * Spacing is slightly non-uniform to give more visual separation in the
+ * most common mid-range concentration values (0.3–0.7 after scaling).   */
 static const float k_breaks[RAMP_N] = {
-    0.00f,  /* ' ' background      */
-    0.10f,  /* '.' faint           */
-    0.24f,  /* ':' low             */
-    0.38f,  /* '-' mid-low         */
-    0.52f,  /* '+' mid             */
-    0.65f,  /* '*' mid-high        */
-    0.78f,  /* '#' hot             */
-    0.90f,  /* '@' peak            */
+    0.00f,  /* ' ' background: V ≈ 0 (pure U region, no catalyst)     */
+    0.10f,  /* '.' faint:      V barely present — reaction front edge  */
+    0.24f,  /* ':' low:        weakly active zone                      */
+    0.38f,  /* '-' mid-low:    transition into pattern interior         */
+    0.52f,  /* '+' mid:        pattern body                            */
+    0.65f,  /* '*' mid-high:   dense catalyst concentration            */
+    0.78f,  /* '#' hot:        near-peak V                             */
+    0.90f,  /* '@' peak:       highest V values (spot/stripe centres)  */
 };
 
 static int ramp_idx(float v)
@@ -272,39 +353,51 @@ static void grid_drop_seed(Grid *g, int cx, int cy)
 }
 
 /*
- * grid_tick() — one Gray-Scott step with the 9-point isotropic Laplacian.
+ * grid_tick() — one explicit-Euler Gray-Scott step.
  *
- * 9-point stencil weights (sum = 0 by construction):
- *   cardinal neighbours (N/S/E/W):    0.20
- *   diagonal neighbours (NE/NW/…):    0.05
- *   centre:                          −1.00
+ * PDE update (per cell):
+ *   dU/dt = Du·∇²U  −  U·V²           +  f·(1−U)
+ *              ↑diffusion  ↑consumption     ↑replenishment
  *
- * This gives more isotropic diffusion than the 4-point stencil, suppressing
- * the grid-aligned artefacts that appear in spots and stripes presets.
+ *   dV/dt = Dv·∇²V  +  U·V²           −  (f+k)·V
+ *              ↑diffusion  ↑autocatalysis    ↑decay+dilution
+ *
+ * Laplacian (9-point isotropic stencil, weights sum to 0):
+ *   L(u) = 0.20·(N+S+E+W) + 0.05·(NE+NW+SE+SW) − u
+ *
+ *   Cardinal weight 0.20, diagonal weight 0.05: ratio 4:1 gives
+ *   second-order isotropy; the simple 4-point stencil has first-order
+ *   only and shows diamond-shaped artefacts at low concentrations.
+ *
+ * Periodic boundary conditions (wrap-around) via modular index.
+ * Double-buffer swap at the end avoids in-place aliasing.
  */
 static void grid_tick(Grid *g)
 {
     int   cols = g->cols, rows = g->rows;
-    float f    = k_presets[g->preset].f;
-    float k    = k_presets[g->preset].k;
+    float f    = k_presets[g->preset].f;   /* feed rate from current preset  */
+    float k    = k_presets[g->preset].k;   /* kill rate from current preset  */
 
     for (int y = 0; y < rows; y++) {
-        int ym = (y == 0)       ? rows-1 : y-1;
-        int yp = (y == rows-1)  ? 0      : y+1;
+        int ym = (y == 0)       ? rows-1 : y-1;   /* wrap-around top    */
+        int yp = (y == rows-1)  ? 0      : y+1;   /* wrap-around bottom */
         for (int x = 0; x < cols; x++) {
-            int xm = (x == 0)      ? cols-1 : x-1;
-            int xp = (x == cols-1) ? 0      : x+1;
+            int xm = (x == 0)      ? cols-1 : x-1;   /* wrap-around left  */
+            int xp = (x == cols-1) ? 0      : x+1;   /* wrap-around right */
 
             int i = y*cols + x;
             float u = g->u[i], v = g->v[i];
 
+            /* 9-point isotropic Laplacian for U:
+             * cardinal (N,S,E,W) weighted 0.20; diagonals (NE,NW,SE,SW) 0.05; centre −1 */
             float Lu =
-                0.20f * (g->u[y*cols+xp]  + g->u[y*cols+xm]  +
-                         g->u[yp*cols+x]  + g->u[ym*cols+x])
-              + 0.05f * (g->u[yp*cols+xp] + g->u[yp*cols+xm] +
-                         g->u[ym*cols+xp] + g->u[ym*cols+xm])
-              - u;
+                0.20f * (g->u[y*cols+xp]  + g->u[y*cols+xm]  +   /* E + W */
+                         g->u[yp*cols+x]  + g->u[ym*cols+x])      /* S + N */
+              + 0.05f * (g->u[yp*cols+xp] + g->u[yp*cols+xm] +   /* SE+SW */
+                         g->u[ym*cols+xp] + g->u[ym*cols+xm])     /* NE+NW */
+              - u;                                                  /* centre */
 
+            /* same stencil for V */
             float Lv =
                 0.20f * (g->v[y*cols+xp]  + g->v[y*cols+xm]  +
                          g->v[yp*cols+x]  + g->v[ym*cols+x])
@@ -312,16 +405,17 @@ static void grid_tick(Grid *g)
                          g->v[ym*cols+xp] + g->v[ym*cols+xm])
               - v;
 
-            float uvv = u * v * v;
+            float uvv = u * v * v;      /* autocatalytic term U·V² (shared by both eqs) */
             float nu  = u + DT * (DU*Lu - uvv + f*(1.f - u));
             float nv  = v + DT * (DV*Lv + uvv - (f + k)*v);
 
+            /* clamp to [0,1]: concentrations are bounded; Euler can overshoot */
             g->u2[i] = nu < 0.f ? 0.f : nu > 1.f ? 1.f : nu;
             g->v2[i] = nv < 0.f ? 0.f : nv > 1.f ? 1.f : nv;
         }
     }
 
-    /* swap current ↔ scratch */
+    /* swap current ↔ scratch buffers (O(1) pointer swap, no copy) */
     float *tmp;
     tmp = g->u;  g->u = g->u2;  g->u2 = tmp;
     tmp = g->v;  g->v = g->v2;  g->v2 = tmp;
@@ -549,6 +643,11 @@ int main(void)
         }
 
         int64_t now = clock_ns(), dt = now - ft; ft = now;
+        /* Cap frame delta at 100 ms.  If the process was backgrounded,
+         * resized, or the machine stalled, dt could be arbitrarily large.
+         * Gray-Scott uses a fixed DT per tick, not wall-clock time, so
+         * only the FPS counter would be wrong — but we still cap to keep
+         * the fps display meaningful after a pause.                       */
         if (dt > 100*NS_PER_MS) dt = 100*NS_PER_MS;
 
         fc++; fa += dt;

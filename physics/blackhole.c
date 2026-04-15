@@ -28,6 +28,35 @@
  *   i / k     tilt up/down  (rebuild lensing table)
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Backwards ray tracing + lookup table.
+ *                  Each pixel shoots a null geodesic BACKWARDS from the
+ *                  camera; if it hits the disk → disk colour; horizon → black.
+ *                  Computing 900 RK4 steps per ray × all pixels live would be
+ *                  too slow for animation.  Instead a lensing table maps
+ *                  (camera_theta, camera_phi) → (impact_type, disk_radius)
+ *                  computed once at startup, then looked up each frame.
+ *
+ * Physics        : General relativity — Schwarzschild null geodesics.
+ *                  In geometric units c=G=1, r_s=2M=1:
+ *                    Event horizon: r = 1 (r_s)
+ *                    Photon sphere: r = 1.5 (r_s)  — unstable circular photon orbit
+ *                    ISCO:          r = 3 (r_s)    — innermost stable circular orbit
+ *                    (accretion disk starts at ISCO, so DISK_IN = 3)
+ *                  Geodesic equation in 3D: d²pos/dλ² = −(3/2)h²·pos/r⁵
+ *                  where h = pos × vel (specific angular momentum, conserved).
+ *
+ * Astrophysics   : Doppler beaming (relativistic).
+ *                  Disk material orbits at Keplerian speed v = √(M/(2r)).
+ *                  Approaching side blueshifts (brighter); receding side
+ *                  redshifts (dimmer).  Beaming factor D = [(1+β)/(1−β)]^(3/2).
+ *
+ * ASPECT=0.47    : Measured empirically for this terminal font.
+ *                  (≠ 0.50 from CELL_W/CELL_H ratio — physical pixels differ.)
+ *                  Ensures the event horizon appears circular, not oval.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <math.h>
@@ -47,11 +76,17 @@
 #define RENDER_FPS   60
 #define ASPECT       0.47f      /* terminal cell h / w                    */
 
-/* Schwarzschild geometry  (r_s = 1 units)                                 */
-#define BH_R         1.0f       /* event horizon  (= r_s)                 */
-#define PHOTON_R     1.5f       /* photon sphere                          */
-#define DISK_IN      3.0f       /* ISCO – inner disk edge                 */
-#define DISK_OUT     12.0f      /* outer disk edge                        */
+/* Schwarzschild geometry in units where r_s = 1 (Schwarzschild radius).
+ * All lengths are dimensionless multiples of r_s = 2GM/c².               */
+#define BH_R         1.0f   /* event horizon radius: r = r_s (= 2GM/c²)   */
+#define PHOTON_R     1.5f   /* photon sphere: r = 3/2 · r_s.  Unstable
+                              * circular orbit — photons here spiral in or out;
+                              * gives the bright ring visible around the shadow. */
+#define DISK_IN      3.0f   /* ISCO (innermost stable circular orbit): r = 3·r_s.
+                              * Timelike (massive particle) orbits below r=3 are
+                              * unstable → material plunges into horizon.
+                              * The accretion disk begins here, not at r=1.       */
+#define DISK_OUT     12.0f  /* outer disk edge (arbitrary, visually tuned).      */
 
 /* camera — tilt is fixed; size is runtime-adjustable                      */
 #define TILT_DEG      5.0f      /* fixed inclination above equatorial plane */

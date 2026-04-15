@@ -70,7 +70,7 @@
  *   r         randomise all balls
  *   ]  [      faster / slower simulation
  *
- * Build:
+ * Build (this comment block is already the CONCEPTS section — see above).
  *   gcc -std=c11 -O2 -Wall -Wextra bounce.c -o bounce -lncurses -lm
  *
  * Sections

@@ -52,6 +52,33 @@
  *   gcc -std=c11 -O2 -Wall -Wextra cloth.c -o cloth -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Explicit spring-mass simulation with symplectic Euler.
+ *                  "Symplectic" means velocity is updated before position:
+ *                    vel_new = vel + F/m · dt  (update velocity first)
+ *                    pos_new = pos + vel_new · dt  (use new velocity)
+ *                  This preserves the Hamiltonian structure — no long-term
+ *                  energy drift (unlike pure explicit Euler where energy
+ *                  grows unboundedly without damping).
+ *
+ * Physics        : Hooke's law spring force + relative-velocity damping.
+ *                  Three spring types build in the mechanical response:
+ *                  - Structural: resists stretching/compression (strong)
+ *                  - Shear:      resists diagonal deformation (medium)
+ *                  - Bend:       resists out-of-plane bending (weak)
+ *                  Without bend springs, cloth wrinkles freely; with strong
+ *                  bend springs it becomes stiff fabric.
+ *
+ * Stability      : Symplectic Euler stability bound: k·dt² < 2.
+ *                  At sub-step dt ≈ 2 ms, max k ≈ 462000 px/s² — all
+ *                  spring constants are far below this limit.
+ *
+ * Performance    : SUB_STEPS=8 divides each frame into 8 mini-steps.
+ *                  Cost: O(N_SPRINGS) per sub-step = O(CLOTH_W×CLOTH_H×6)
+ *                  per frame.  At 30×18 nodes ≈ 3240 spring force evals/frame.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
@@ -104,9 +131,17 @@ enum {
 #define REST_H   (CELL_W * NODE_GAP)    /* horizontal rest length (px) */
 #define REST_V   (CELL_H * NODE_GAP)    /* vertical rest length (px)   */
 
-/* Physics constants */
-#define GRAVITY      200.0f    /* downward acceleration (px/s²)            */
-#define WIND_FREQ    0.40f     /* wind oscillation frequency (Hz)          */
+/* GRAVITY: downward acceleration in pixel space (px/s²).
+ * Lower than chain.c (380) because cloth has many nodes resisting the
+ * fall — too high a value causes the top-row springs to overshoot
+ * violently before damping.  200 gives natural drape.                     */
+#define GRAVITY      200.0f
+
+/* WIND_FREQ: sinusoidal wind oscillation rate (Hz).
+ * 0.40 Hz ≈ 2.5 s per cycle — slow enough to produce cloth flutter
+ * rather than rapid shaking.  Combine with preset wind strengths for
+ * different feel per preset.                                               */
+#define WIND_FREQ    0.40f
 
 /*
  * DAMP — velocity retention per sub-step.

@@ -46,6 +46,31 @@
  *   §8  app     (main loop, input, resize)
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Engineering    : Slider-crank mechanism.
+ *                  Converts rotary crank motion to linear piston motion.
+ *                  Given crank angle θ and crank radius R, connecting rod
+ *                  length L, the piston position from crank centre:
+ *                    y_wrist = R·cos θ + √(L² − R²·sin²θ)
+ *                  This is exact geometry — no approximation needed here.
+ *
+ * Thermodynamics : 2-stroke engine cycle (one power stroke per revolution).
+ *                  Unlike 4-stroke, intake+exhaust happen simultaneously
+ *                  during scavenging (both ports open near BDC).
+ *                  Key events are port opening angles, derived from
+ *                  geometry: port uncovers when piston crown drops below it.
+ *
+ * Algorithm      : Phase detection by crank angle range comparison.
+ *                  fmod(theta + 2π, 2π) keeps angle in [0, 2π).
+ *                  Each phase boundary (port open/close) is a fixed angle
+ *                  derived from the engine geometry defined in §1.
+ *
+ * Rendering      : Pure ASCII character art using box-drawing and line chars.
+ *                  No texture or shading — structure conveyed entirely by
+ *                  character choice ('|', '-', '+', '#', etc.).
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

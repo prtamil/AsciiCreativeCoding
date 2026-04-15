@@ -57,6 +57,31 @@
  *   §8  app       — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Symplectic (semi-implicit) Euler integration.
+ *                  Update velocities ṙ, θ̇ from accelerations r̈, θ̈ first,
+ *                  then update positions r, θ using the new velocities.
+ *                  This "leapfrog" ordering conserves a modified Hamiltonian
+ *                  — no secular energy drift unlike explicit Euler.
+ *
+ * Physics        : Spring pendulum — two coupled oscillators.
+ *                  Pendulum mode ω_pend = √(g/r₀) (like a rigid pendulum).
+ *                  Spring mode   ω_spring = √(k/m).
+ *                  At ω_spring ≈ 2·ω_pend (the 2:1 parametric resonance):
+ *                  energy flows periodically between the two modes —
+ *                  the bob traces a spirograph-like rosette before reversing.
+ *
+ * Math           : Polar-coordinate Lagrangian equations of motion.
+ *                  Coriolis-like term 2·ṙ·θ̇/r in θ̈ comes from the
+ *                  non-inertial polar frame (centripetal acceleration).
+ *
+ * Rendering      : Render-interpolation (alpha).
+ *                  Sim runs at 120 Hz; display at ~60 Hz.  Between sim steps
+ *                  the angles/lengths are linearly interpolated by alpha,
+ *                  giving smooth motion without running physics at 120 Hz.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
@@ -125,8 +150,17 @@ enum {
 #define REST_LEN_FRAC      0.40f
 
 /* Initial conditions */
-#define INIT_THETA_DEG    40.0f   /* starting angle from vertical (deg)   */
-#define INIT_R_STRETCH     1.15f  /* r_start = r₀ × this factor           */
+/* INIT_THETA_DEG: starting angle from vertical (degrees).
+ * 40° is well inside the small-angle regime (where sin θ ≈ θ), so the
+ * pendulum mode behaves nearly sinusoidally.  Larger angles → nonlinear
+ * corrections → less regular energy exchange patterns.                    */
+#define INIT_THETA_DEG    40.0f
+
+/* INIT_R_STRETCH: r_start = r₀ × 1.15 → spring starts 15% stretched.
+ * Without initial spring deformation the system starts in the pendulum-only
+ * mode and never excites the spring mode.  15% stretch seeds the coupling
+ * between modes without making the initial orbit look unnatural.          */
+#define INIT_R_STRETCH     1.15f
 
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS   1000000LL

@@ -20,6 +20,30 @@
  * §1 config  §2 clock  §3 color  §4 physics  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Velocity Verlet (same as nbody.c) in natural units G=M=1.
+ *                  DT=0.001 in natural time units — small enough that the
+ *                  figure-8 orbit stays visually stable for many minutes.
+ *
+ * Physics        : Three-body problem / gravitational choreography.
+ *                  Unlike two-body (always an ellipse), three-body is
+ *                  generally chaotic — no closed-form solution exists.
+ *                  The figure-8 is one of the rare periodic solutions
+ *                  (Chenciner-Montgomery 2000).  Adding perturbation ('x')
+ *                  breaks the symmetry and reveals the underlying chaos.
+ *
+ * Math           : Figure-8 initial conditions in normalised units.
+ *                  The exact ICs were found by numerical minimisation of the
+ *                  action integral (not by analytical derivation).
+ *                  Positions form a symmetric figure-8; all three bodies
+ *                  have the same orbit, offset by 1/3 of the period.
+ *
+ * Performance    : O(N²)=O(9) force pairs — trivial.  The STEPS variable
+ *                  controls how many Verlet steps run per rendered frame,
+ *                  trading simulation speed against visual smoothness.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>
@@ -36,10 +60,19 @@
 #define CELL_W    8
 #define CELL_H   16
 
-#define G_CONST   1.0f
-#define MASS      1.0f
-#define SOFTENING 0.02f     /* softening to prevent singularity */
-#define DT        0.001f    /* integration time step            */
+#define G_CONST   1.0f    /* gravitational constant (natural units) */
+#define MASS      1.0f    /* each body's mass (natural units)       */
+
+/* SOFTENING: prevents force singularity at close approach (like nbody.c).
+ * 0.02 natural length units — bodies must get within ~2% of the system
+ * scale before softening engages; normal figure-8 gaps are ~0.5 units.   */
+#define SOFTENING 0.02f
+
+/* DT: time step in natural units.
+ * Figure-8 period T ≈ 6.3259 natural time units.
+ * At DT=0.001, one period = 6326 steps.  Each step costs O(9) flops.
+ * Larger DT → the figure-8 slowly precesses and eventually escapes.      */
+#define DT        0.001f
 #define STEPS_MIN   1
 #define STEPS_MAX  64
 

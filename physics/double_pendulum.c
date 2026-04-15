@@ -57,6 +57,41 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : 4th-order Runge-Kutta (RK4) integration.
+ *                  The equations of motion are derived from the Lagrangian
+ *                  (energy minimisation formulation), reducing to four
+ *                  coupled ODEs for (θ₁, θ₂, ω₁, ω₂).  RK4 evaluates the
+ *                  derivative at four intermediate points per step, giving
+ *                  O(dt⁵) local error vs. O(dt²) for symplectic Euler.
+ *                  For a chaotic system this matters: phase errors grow at
+ *                  rate e^(λt) where λ ≈ 1/s is the Lyapunov exponent.
+ *                  Lower-order integrators lose tracking within 2–3 s.
+ *
+ * Physics        : Chaos / sensitive dependence on initial conditions.
+ *                  The ghost pendulum (GHOST_EPSILON offset on θ₁) starts
+ *                  indistinguishably close to the primary.  After ~3–5 s
+ *                  (one Lyapunov time) the two trajectories diverge visibly
+ *                  — a direct demonstration that tiny measurement errors
+ *                  become arbitrarily large, making long-term prediction
+ *                  impossible for chaotic systems.
+ *
+ * Math           : Lagrangian mechanics / Euler-Lagrange equations.
+ *                  L = T − V where T is kinetic energy, V is potential.
+ *                  For m₁=m₂=1, L₁=L₂=L:
+ *                    D = 3 − cos 2(θ₁−θ₂) ≥ 2  (denominator, never zero)
+ *                  Derived angular accelerations α₁, α₂ are in state_deriv().
+ *
+ * Performance    : Render-interpolation (alpha).  The sim runs at 300 Hz
+ *                  (sim_fps), the display at ~60 Hz.  Between sim ticks the
+ *                  angles are linearly interpolated by alpha ∈ [0,1], giving
+ *                  smooth motion without needing 300-Hz rendering.
+ *
+ * Data-structure : Ring-buffer trail (TRAIL_LEN positions) iterated from
+ *                  oldest to newest by offset arithmetic — no shifting.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
@@ -78,18 +113,23 @@
 /* ===================================================================== */
 
 enum {
-    SIM_FPS_DEFAULT =  300,   /* RK4 needs small dt for chaotic accuracy   */
+    /* 300 Hz sim gives dt ≈ 3.3 ms per RK4 step.
+     * The double pendulum has Lyapunov exponent λ ≈ 1/s.
+     * RK4 global error O(dt⁴) ≈ (3.3e-3)⁴ ≈ 1e-10 per step — negligible
+     * for the few-second time-scales we simulate.  Lower fps → visible
+     * divergence from the true trajectory in just 2–3 seconds.          */
+    SIM_FPS_DEFAULT =  300,
     SIM_FPS_MIN     =   60,
     SIM_FPS_MAX     =  600,
     SIM_FPS_STEP    =   60,
 
-    TRAIL_LEN       =  500,   /* ring-buffer capacity (positions)          */
-    TRAIL_DEF       =  360,   /* entries drawn by default                  */
+    TRAIL_LEN       =  500,   /* ring-buffer capacity (max trail positions)    */
+    TRAIL_DEF       =  360,   /* positions drawn by default (newest 360)       */
     TRAIL_MIN       =   20,
     TRAIL_STEP      =   20,
 
-    HUD_COLS        =   64,
-    FPS_UPDATE_MS   =  500,
+    HUD_COLS        =   64,   /* fixed-width HUD string length                 */
+    FPS_UPDATE_MS   =  500,   /* FPS display refresh interval (ms)             */
 };
 
 /*
@@ -105,21 +145,29 @@ enum {
  * downward.  0.22 × ph keeps the full swing within ~44 % of half-height
  * on each side — visible on any typical terminal.
  */
-#define ARM_LEN_FRAC    0.22f
+#define ARM_LEN_FRAC    0.22f   /* each arm = 22% of pixel-space height.
+                                  * At 0.22: full vertical swing (both arms down) covers
+                                  * 44% of the screen → clear margin on all sides.      */
+
+/* GRAVITY_PX: acceleration in terminal pixel-space (px/s²).
+ * Real gravity 9.81 m/s².  If 1 screen height ≈ 640 px (40 rows × CELL_H=16),
+ * and we want one free-fall across the half-screen to take ~0.8 s (visually
+ * engaging), then: 320 px = ½ · g · 0.8² → g ≈ 1000 px/s².
+ * 2000 was chosen empirically for a faster, more dramatic swing.                */
 #define GRAVITY_PX      2000.0f
 
 /*
- * Starting angles (degrees from straight-down vertical).
- * 120° / 120° — both arms nearly horizontal with plenty of energy;
- * produces chaotic motion almost immediately.
+ * Starting angles (degrees from straight-down vertical, y-axis down).
+ * 120° ≈ each arm 30° past horizontal — high energy, chaotic onset ~1 s.
+ * Lower angle (e.g. 90°) → slower, more regular motion; 150°+ → immediate chaos.
  */
 #define INIT_T1_DEG     120.0f
 #define INIT_T2_DEG     120.0f
 
-/*
- * GHOST_EPSILON — initial θ₁ offset for the ghost pendulum (radians).
- * ~0.057° perturbation; divergence becomes visible in ~3–5 s.
- */
+/* GHOST_EPSILON: initial θ₁ perturbation for the ghost pendulum (radians).
+ * 0.001 rad ≈ 0.057° — within typical angle-measurement precision.
+ * Demonstrates that chaos is not an artifact of large errors: even this
+ * nanoscopic difference grows exponentially and dominates in ~3–5 s.     */
 #define GHOST_EPSILON   0.001f
 
 #define NS_PER_SEC  1000000000LL
@@ -258,17 +306,26 @@ static State state_deriv(State s, float L, float g)
 /*
  * rk4_step() — one classical 4th-order Runge-Kutta step.
  *
- * Error is O(dt⁵) per step, O(dt⁴) globally — a much tighter bound
- * than symplectic Euler's O(dt²), which matters here because chaotic
- * sensitivity amplifies phase errors exponentially.
+ * RK4 evaluates the ODE derivative at four points (k1–k4) per step:
+ *   k1 = f(s)                      — derivative at start
+ *   k2 = f(s + dt/2 · k1)          — midpoint using k1 estimate
+ *   k3 = f(s + dt/2 · k2)          — midpoint using k2 (corrected)
+ *   k4 = f(s + dt   · k3)          — endpoint estimate
+ *
+ * Final update: s_new = s + (dt/6)·(k1 + 2·k2 + 2·k3 + k4)
+ * Simpson's-rule weights (1:2:2:1) give 4th-order accuracy.
+ *
+ * Global error: O(dt⁴); symplectic Euler would give O(dt), which is
+ * 10,000× worse for our dt ≈ 3 ms — chaotic divergence in seconds.
  */
 static State rk4_step(State s, float L, float g, float dt)
 {
-    State k1 = state_deriv(s,                         L, g);
-    State k2 = state_deriv(state_step(s, 0.5f*dt, k1), L, g);
-    State k3 = state_deriv(state_step(s, 0.5f*dt, k2), L, g);
-    State k4 = state_deriv(state_step(s, dt,       k3), L, g);
+    State k1 = state_deriv(s,                          L, g);   /* slope at start         */
+    State k2 = state_deriv(state_step(s, 0.5f*dt, k1), L, g);  /* slope at midpoint (k1) */
+    State k3 = state_deriv(state_step(s, 0.5f*dt, k2), L, g);  /* slope at midpoint (k2) */
+    State k4 = state_deriv(state_step(s, dt,       k3), L, g);  /* slope at endpoint      */
 
+    /* weighted average: Simpson's rule applied to each DOF */
     return (State){
         s.t1 + dt/6.0f*(k1.t1 + 2.0f*k2.t1 + 2.0f*k3.t1 + k4.t1),
         s.t2 + dt/6.0f*(k1.t2 + 2.0f*k2.t2 + 2.0f*k3.t2 + k4.t2),
@@ -493,12 +550,16 @@ static void scene_draw(const Scene *s, float alpha)
             int cy  = px_to_cell_y(s->trail.py[idx]);
             if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
 
+            /* age: 0=oldest entry, 1=most recent entry.
+             * Three brightness tiers: newest 30% → bright red 'o';
+             * middle 35% → orange '.'; oldest 35% → dim grey ','.
+             * Gives a visually fading tail without per-entry alpha. */
             float age = (float)i / (float)draw;   /* 0=oldest, 1=newest */
             int   cp;
             chtype ch;
-            if      (age > 0.70f) { cp = CP_TR1; ch = 'o'; }
-            else if (age > 0.35f) { cp = CP_TR2; ch = '.'; }
-            else                  { cp = CP_TR3; ch = ','; }
+            if      (age > 0.70f) { cp = CP_TR1; ch = 'o'; }   /* newest 30%  */
+            else if (age > 0.35f) { cp = CP_TR2; ch = '.'; }   /* middle 35%  */
+            else                  { cp = CP_TR3; ch = ','; }   /* oldest 35%  */
 
             attron(COLOR_PAIR(cp));
             mvaddch(cy, cx, ch);

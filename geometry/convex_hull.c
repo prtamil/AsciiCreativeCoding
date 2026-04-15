@@ -20,6 +20,32 @@
  * §1 config  §2 clock  §3 color  §4 algorithms  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Two classic convex hull algorithms compared side-by-side:
+ *
+ *                  Graham scan — O(N log N):
+ *                    1. Find the lowest-y (rightmost if tie) point as pivot.
+ *                    2. Sort remaining points by polar angle from pivot.
+ *                    3. Sweep: push points onto a stack; pop when the last
+ *                       three points make a clockwise (non-left) turn.
+ *                    Cross-product sign determines turn direction:
+ *                    (B−A) × (C−A) < 0 → clockwise (not on hull).
+ *
+ *                  Jarvis march (gift-wrapping) — O(N·h), h=hull points:
+ *                    Repeatedly find the most counter-clockwise point from
+ *                    the current hull point until we return to the start.
+ *                    Faster than Graham scan when h ≪ N (few hull points).
+ *
+ * Math           : The cross product (A→B) × (A→C) = (Bx−Ax)(Cy−Ay) −
+ *                  (By−Ay)(Cx−Ax) determines winding direction and is the
+ *                  foundation of all computational geometry primitives.
+ *
+ * Performance    : Graham scan is O(N log N) due to the sort step.
+ *                  The stack sweep is O(N) — each point is pushed/popped ≤ once.
+ *                  Jarvis march O(N·h): at worst O(N²) but optimal for small h.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

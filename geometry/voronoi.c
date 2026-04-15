@@ -31,6 +31,28 @@
  *   gcc -std=c11 -O2 -Wall -Wextra voronoi.c -o voronoi -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Brute-force Voronoi diagram — O(cells × seeds) per frame.
+ *                  For each cell, scan all seeds and find the nearest.
+ *                  Efficient for small N (N_SEEDS ≤ 30); for larger N, a
+ *                  Fortune's sweep-line algorithm gives O(N log N).
+ *
+ * Math           : The Voronoi diagram partitions the plane into regions where
+ *                  each region is the set of points closer to one seed than all
+ *                  others.  The dual graph of the Voronoi diagram is the Delaunay
+ *                  triangulation (every Voronoi edge connects the circumcentres
+ *                  of two Delaunay triangles).
+ *                  Border detection: cell is a border cell when the distance to
+ *                  the nearest seed and second-nearest differ by less than BORDER_PX.
+ *                  This approximates the Voronoi edge without exact line computation.
+ *
+ * Physics        : Seeds move under the Langevin equation:
+ *                    dv/dt = −γ·v + σ·ξ  (ξ = white noise)
+ *                  This is Ornstein-Uhlenbeck process — Brownian motion with
+ *                  mean-reverting velocity (terminal speed = NOISE/DAMP).
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

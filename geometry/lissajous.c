@@ -37,6 +37,29 @@
  * Sections: §1 config  §2 clock  §3 color  §4 sim  §5 scene  §6 screen  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Parametric curve tracing with decaying amplitude.
+ *                  The Lissajous figure is traced analytically (no ODE) by
+ *                  evaluating the closed-form parametric equations at each t.
+ *                  A decaying exponential envelope ensures the spiral converges
+ *                  to the centre, giving finite total length.
+ *
+ * Math           : Lissajous figures x(t) = A sin(fx·t + φ), y(t) = B sin(fy·t).
+ *                  Ratio fx:fy rational → closed curve (repeats exactly).
+ *                  The figure has fx·fy/gcd(fx,fy) lobes and is symmetric about
+ *                  both axes when φ=0.  Phase offset φ = π/2 → rotated figure.
+ *                  With damping: x = sin(fx·t + φ) · e^(-λt)
+ *                  The decay λ is set so amplitude ≈ 1% at T_MAX:
+ *                    λ = ln(100) / T_MAX ≈ 4.6 / T_MAX
+ *
+ * Rendering      : The full curve is redrawn each frame (not accumulated).
+ *                  Four brightness levels map to the four decay loops:
+ *                  newest (largest amplitude) = brightest, innermost = dimmest.
+ *                  Phase drifts slowly to cycle through all Lissajous shapes
+ *                  for the current frequency ratio.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

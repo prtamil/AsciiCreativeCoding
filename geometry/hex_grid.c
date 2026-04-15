@@ -21,6 +21,27 @@
  *   q / ESC  quit
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Hexagonal grid rendering with offset-row layout.
+ *                  Hexagons tile the plane with perfect packing efficiency
+ *                  (6 neighbours, same area as square grid but more isotropic).
+ *                  Offset-row layout: odd rows shifted right by half a hex width.
+ *                  This is the "pointy-top hexagon" orientation used in games.
+ *
+ * Math           : Ring distance from centre hex:
+ *                  For offset hex coordinates, the ring distance (number of
+ *                  hex steps from center) requires converting to "cube coordinates"
+ *                  (3-axis system where x+y+z=0) for clean distance formula:
+ *                    d = max(|cx|, |cy|, |cz|) in cube coords.
+ *                  Here approximated by concentric ring assignment.
+ *
+ * Rendering      : Color assigned by ring distance → concentric colour bands.
+ *                  Each cell has an independent random character-change timer.
+ *                  The visual "breathing" effect is an emergent property of
+ *                  many independent random timers with different periods.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <stdlib.h>

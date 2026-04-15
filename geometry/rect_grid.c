@@ -19,6 +19,24 @@
  *   q / ESC  quit
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Two independent sinusoidal colour waves traversing a flat grid.
+ *                  Each cell's colour is driven by two spatial sine waves:
+ *                    wave1 = sin(k1·col + ω1·t),  wave2 = sin(k2·row + ω2·t)
+ *                  The superposition creates a moving moiré-like pattern.
+ *
+ * Math           : Two-wave beat: when k1 ≈ k2 but ω1 ≠ ω2, the standing-wave
+ *                  envelope moves slowly while the carrier oscillates quickly —
+ *                  the same beat phenomenon as two tuning forks nearly in tune.
+ *                  Different wave speeds (ω1/k1 ≠ ω2/k2) produce shear patterns.
+ *
+ * Rendering      : Per-cell timer drives random character changes; the timer
+ *                  interval is drawn from a uniform range, so change events are
+ *                  a Poisson process with mean rate 1/avg_interval.  The colour
+ *                  wave is computed analytically each frame — no accumulation.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <math.h>

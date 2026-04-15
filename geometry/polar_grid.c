@@ -22,6 +22,28 @@
  *   q / ESC  quit
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Polar coordinate grid with per-ring differential rotation.
+ *                  Each ring rotates at a different angular velocity — alternating
+ *                  clockwise/counterclockwise — creating a mesmerising gear-like
+ *                  visual.  This demonstrates coordinate system transforms:
+ *                  (ring, spoke) → (r, θ) → (x, y) → (col, row).
+ *
+ * Math           : Polar → Cartesian → terminal coordinates:
+ *                    x = r · cos(θ + ω_ring · t)  [in pixels]
+ *                    y = r · sin(θ + ω_ring · t)  [in pixels]
+ *                    col = x / CELL_W + centre_col
+ *                    row = y / CELL_H + centre_row
+ *                  CELL_H / CELL_W ≈ 2: rows are compressed relative to columns,
+ *                  so the radial distance uses r_y = r × (CELL_W / CELL_H) for
+ *                  circular appearance despite non-square cells.
+ *
+ * Rendering      : Ring index maps to colour pair (concentric colour bands).
+ *                  Characters at each cell change independently; adjacent cells
+ *                  on the same ring change at similar rates (ring "breathing").
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <math.h>

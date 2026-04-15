@@ -40,6 +40,28 @@
  *   gcc -std=c11 -O2 -Wall -Wextra spirograph.c -o spirograph -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Parametric curve tracing with a float canvas + fade.
+ *                  Rather than drawing discrete points, each curve advances
+ *                  T_STEPS_PER_FRAME timesteps per tick, writing brightness
+ *                  values to a float canvas.  The canvas decays by FADE_RATE
+ *                  per tick, creating the fading trail effect.
+ *
+ * Math           : Hypotrochoid parametric equations:
+ *                    x(t) = (R−r)·cos(t) + d·cos((R−r)/r · t)
+ *                    y(t) = (R−r)·sin(t) − d·sin((R−r)/r · t)
+ *                  The curve closes when (R−r)/r = p/q (rational ratio).
+ *                  With p=3, q=1: deltoid (3-cusp astroid).
+ *                  Irrational ratios → the curve never closes (dense in annulus).
+ *                  Pen distance d controls petal amplitude: d<(R−r) → inside,
+ *                  d>(R−r) → outside → loops at each reversal point.
+ *
+ * Rendering      : Three simultaneous curves with different r values.
+ *                  r drifts sinusoidally (DRIFT_RATE), creating continuous
+ *                  morphing between distinct petal patterns without keystrokes.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

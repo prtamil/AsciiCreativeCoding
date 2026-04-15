@@ -40,6 +40,28 @@
  *           §6 scene   §7 screen §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : String-art envelope construction using modular arithmetic.
+ *                  N nails evenly spaced on a circle.  Thread i connects nail i
+ *                  to nail (round(i × k)) mod N.  As i sweeps 0..N-1, the set
+ *                  of N chords forms the envelope of a family of lines.
+ *
+ * Math           : The envelope of the family of chords nail_i → nail_{k·i mod N}
+ *                  is a hypocycloid / epicycloid depending on k:
+ *                    k=2: cardioid (1 cusp)         k=3: nephroid (2 cusps)
+ *                    k=4: deltoid  (3 cusps)         k=5: astroid  (4 cusps)
+ *                  This is the Fourier series connection: the cardioid appears
+ *                  in complex power series and the Mandelbrot set's main body
+ *                  is bounded by the same curve.
+ *                  Non-integer k creates transitional (blended) shapes between
+ *                  the named curves, giving the smooth drift animation.
+ *
+ * Rendering      : Chord endpoints mapped from polar (angle = 2πi/N) to terminal
+ *                  coordinates with aspect correction.  Character for each chord
+ *                  selected by slope: |dy/dx| < 0.5 → '-', > 2 → '|', else '/' '\\'.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

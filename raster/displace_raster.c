@@ -63,6 +63,28 @@
  *   §10 app           dt loop · input · resize · cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Vertex displacement shader — modifies mesh geometry per-frame.
+ *                  Unlike cube/sphere/torus_raster.c (fixed mesh), here the
+ *                  vertex positions are re-calculated each frame by displacing
+ *                  the base sphere vertices along their normals.
+ *
+ * Math           : Displacement: p' = p + N · f(p, t)  where f is the mode function.
+ *                  RIPPLE: f = A·sin(ω·t + k·|p.xz|) — cylindrical wave from equator.
+ *                  WAVE:   f = A·sin(ω·t + k·p.x + k·p.y) — diagonal plane wave.
+ *                  PULSE:  f = A·sin(ω·t) · exp(−γ·|p.y|) — breathing along y-axis.
+ *                  SPIKY:  f = |sin(kx·p.x)·sin(ky·p.y)·sin(kz·p.z)| — sharp spikes.
+ *
+ *                  Normal recomputation (central difference):
+ *                    N_new = normalise(∂p'/∂u × ∂p'/∂v)
+ *                  where ∂p'/∂u ≈ (displaced(u+ε,v) − displaced(u−ε,v)) / (2ε).
+ *                  This ensures shading remains correct for the deformed surface.
+ *
+ * Performance    : O(N_verts) displacement per frame.  Normal recomputation is
+ *                  the expensive step: 4 extra displacement evaluations per vertex.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

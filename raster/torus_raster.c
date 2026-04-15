@@ -52,6 +52,30 @@
  *   §9  app          dt loop · input · resize · cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Software rasterization pipeline (GPU-pipeline emulation in C).
+ *                  The full pipeline runs every frame:
+ *                  1. Tessellate mesh into triangles (done once at init).
+ *                  2. Vertex shader: transform each vertex from object→world→clip space.
+ *                  3. Perspective divide: clip → NDC → screen coordinates.
+ *                  4. Back-face culling: discard triangles facing away from camera.
+ *                  5. Rasterization: iterate over bounding box, test barycentric coords.
+ *                  6. Z-test: per-fragment depth comparison against float z-buffer.
+ *                  7. Fragment shader: Phong/toon/normal/wireframe shading.
+ *
+ * Math           : Barycentric coordinates (λ₀, λ₁, λ₂) for point p in triangle:
+ *                    Area test: λᵢ = signed_area(edge_i) / total_area
+ *                  All λ ∈ [0,1] and sum to 1 iff inside the triangle.
+ *                  Used to interpolate normals and attributes across the face.
+ *                  Perspective-correct interpolation: interpolate z⁻¹, then divide.
+ *
+ * Performance    : Z-buffer resolves occlusion without sorting triangles.
+ *                  Back-face culling halves the triangle count for closed meshes.
+ *                  Function pointers (vert_shader, frag_shader) allow swapping
+ *                  shaders without changing the pipeline structure.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

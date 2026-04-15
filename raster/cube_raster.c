@@ -39,6 +39,28 @@
  *   §9  app          dt loop · input · resize · cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Same software rasterization pipeline as torus_raster.c.
+ *                  The cube demonstrates flat normals (per-face, not per-vertex).
+ *                  Each face has a single outward normal; vertices at shared
+ *                  edges are duplicated (3 vertices per face corner) to allow
+ *                  distinct normals from each face's perspective.
+ *
+ * Math           : Flat normals: N is constant across each face = one of
+ *                  ±(1,0,0), ±(0,1,0), ±(0,0,1) in model space.
+ *                  Smooth vs flat normals: smooth normals are averaged at shared
+ *                  vertices (good for organic shapes); flat normals show the
+ *                  polyhedron facets (good for hard-surface models like the cube).
+ *                  Toon shading: quantise the diffuse term to 3 bands —
+ *                  the dramatic band at 50% simulates cel-shading.
+ *
+ * Rendering      : Wireframe mode via barycentric edge detection: when any
+ *                  barycentric coordinate < WIRE_THRESHOLD, draw as edge colour.
+ *                  This avoids separate edge rendering; the wireframe emerges from
+ *                  the rasterisation loop itself.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

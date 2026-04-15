@@ -28,6 +28,28 @@
  *   q / ESC   quit
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic ray-capsule intersection — decomposed into
+ *                  two sub-problems:
+ *                  1. Infinite cylinder test (quadratic in t after projecting
+ *                     out the axial component of the ray/capsule vectors).
+ *                  2. Hemisphere cap tests (sphere quadratics at each endpoint).
+ *                  The minimum positive t among valid hits is the surface hit.
+ *
+ * Math           : Cylinder intersection: project ray and cylinder axis onto
+ *                  the plane perpendicular to the axis.  The resulting 2D
+ *                  ray-circle problem is a standard quadratic.
+ *                  Axial bounds check: the body t is only valid if the hit
+ *                  point's axial projection falls within [0, height].
+ *                  Cap normals: (p − endpoint) / r (sphere normal at each cap).
+ *
+ * Rendering      : Mode cycling (phong / normals / fresnel / depth) shows how
+ *                  the same intersection test feeds different shading algorithms.
+ *                  Normal mode renders N as an RGB vector — a diagnostic tool
+ *                  for verifying correct normal orientation at body/cap boundaries.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <math.h>

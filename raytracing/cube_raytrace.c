@@ -22,6 +22,28 @@
  *   q / ESC   quit
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic ray-box intersection via slab method.
+ *                  A box (AABB = axis-aligned bounding box) is the intersection
+ *                  of 3 pairs of parallel planes ("slabs").  For each axis i:
+ *                    t_near_i = (box_min_i − ro_i) / rd_i
+ *                    t_far_i  = (box_max_i − ro_i) / rd_i
+ *                  t_enter = max(t_near_x, t_near_y, t_near_z)
+ *                  t_exit  = min(t_far_x,  t_far_y,  t_far_z)
+ *                  If t_enter ≤ t_exit and t_exit > 0: hit.
+ *
+ * Math           : Object space transform: before intersecting, transform the
+ *                  ray by the inverse of the box's world transform (Rx·Ry matrix).
+ *                  This allows the box to rotate while keeping the intersection
+ *                  math axis-aligned.  Hit face: the axis whose t_near is largest.
+ *                  Normal for each face: ±(1,0,0), ±(0,1,0), ±(0,0,1).
+ *
+ * Rendering      : Wireframe mode: draw thick coloured dots at edge-proximity
+ *                  (|u| > WIRE_THRESH || |v| > WIRE_THRESH in face UV space).
+ *                  Depth mode: map hit distance to cool → warm colour ramp.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <math.h>

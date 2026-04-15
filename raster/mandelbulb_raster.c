@@ -48,6 +48,30 @@
  *   §9  app / main
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Hybrid mesh-based Mandelbulb rendering.
+ *                  Meshing: for each UV-sphere direction, march a ray inward
+ *                  from outside to find where the Mandelbulb SDF ≈ 0.
+ *                  This is a one-time O(TESS_U × TESS_V × MAX_MARCH) cost.
+ *                  Rendering: project the resulting triangle mesh through the
+ *                  standard rasterization pipeline — O(N_tris) per frame.
+ *
+ * Math           : Mandelbulb SDF (estimated, not exact):
+ *                    iterate z ← z^n + c; accumulate dr = n·|z|^(n-1)·dr + 1
+ *                    return 0.5·log(|z|)·|z| / dr  (distance lower bound)
+ *                  The meshed surface is only the outermost "skin" — concave
+ *                  cavities and interior structure are not captured.
+ *                  This is the fundamental limitation of rasterisation vs SDF
+ *                  raymarching: rasterisation requires explicit surface geometry.
+ *
+ * Trade-offs     : Rasterizer approach:
+ *                  PRO: once meshed, rendering is O(N_tris) per frame — much
+ *                       faster than re-raymarching every pixel every frame.
+ *                  CON: meshing captures only the outermost surface; interior
+ *                       detail (holes, overhangs) is lost.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

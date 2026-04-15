@@ -36,6 +36,33 @@
  * ─────────────────────────────────────────────────────────────────────
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Unidirectional Monte Carlo path tracing.
+ *                  For each pixel, cast a ray.  At each surface hit:
+ *                  1. Check if the hit surface is a light — if so, accumulate.
+ *                  2. Sample a random new direction from the cosine-weighted
+ *                     hemisphere around the surface normal.
+ *                  3. Recurse with that direction.
+ *                  Russian roulette termination: at each bounce, terminate with
+ *                  probability (1 − max_colour_component); scale surviving rays.
+ *                  This gives unbiased termination with finite expected depth.
+ *
+ * Math           : Monte Carlo rendering equation (Kajiya 1986):
+ *                    L_o(p,ω_o) = L_e(p,ω_o) + ∫ f_r·L_i·(ω_i·n)·dω_i
+ *                  Cosine-weighted hemisphere sampling: generate (u,v) uniform,
+ *                    θ = arccos(√(1−u)),  φ = 2π·v
+ *                  This importance-samples the Lambertian BRDF f_r = ρ/π,
+ *                  cancelling the cosine factor for simpler accumulation.
+ *                  Progressive rendering: average accumulates as 1/N, converging
+ *                  to ground truth (variance ∝ 1/N) with each additional sample.
+ *
+ * Rendering      : Reinhard tone mapping: L_out = L/(1+L) compresses HDR values.
+ *                  The Cornell box is chosen because it exercises indirect diffuse
+ *                  illumination (colour bleeding from red/green walls) — the key
+ *                  advantage of path tracing over direct-only methods.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <math.h>

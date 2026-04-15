@@ -22,6 +22,28 @@
  *   q / ESC   quit
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic ray-sphere intersection — exact, no marching steps.
+ *                  For ray ro + t·rd and sphere centre c radius R:
+ *                    |ro + t·rd − c|² = R²
+ *                  Expands to quadratic: a·t² + b·t + c = 0
+ *                    a = |rd|² = 1 (unit direction)
+ *                    b = 2·(rd · oc)  where oc = ro − c
+ *                    c = |oc|² − R²
+ *                  discriminant = b²−4ac; if < 0: miss; else t = (−b ± √disc) / 2a.
+ *
+ * Math           : Surface normal at hit point p: N = (p − c) / R (unit outward).
+ *                  Phong model: I = ka + kd·max(N·L, 0) + ks·max(R_v·V, 0)^shininess
+ *                  where R_v = 2(N·L)N − L (reflection direction).
+ *                  Fresnel approximation (Schlick): F = F0 + (1−F0)·(1−N·V)^5
+ *                  models the view-angle-dependent reflectance of dielectrics.
+ *
+ * Rendering      : Each terminal cell fires exactly one ray (no anti-aliasing).
+ *                  Three-point lighting: warm key + cool fill + bright rim.
+ *                  Luminance mapped to ASCII ramp ".+*#@" — brighter → denser char.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <math.h>

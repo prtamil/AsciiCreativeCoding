@@ -28,6 +28,26 @@
  *   q / ESC   quit
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic ray-torus intersection (quartic polynomial root-finding).
+ *                  Substituting ray ro + t·rd into the torus equation
+ *                  (√(x²+z²)−R)² + y² = r² produces a degree-4 polynomial in t.
+ *                  The full quartic is found by algebra, then solved numerically.
+ *
+ * Math           : Quartic: t⁴ + At³ + Bt² + Ct + D = 0.
+ *                  Solution: evaluate the polynomial at sample points, then
+ *                  bisect to find roots (avoids unstable Ferrari formula).
+ *                  Sample count vs. accuracy trade-off: more samples find all
+ *                  real roots but at higher cost.
+ *                  Surface normal at hit point p on torus with major radius R:
+ *                    N = normalise(p − R · normalise(p.xz × (0,1)))
+ *
+ * Rendering      : Phong + Fresnel (same as sphere_raytrace.c), showing that
+ *                  the shading pipeline is decoupled from the intersection test.
+ *                  The quartic solver is the only torus-specific code.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <math.h>

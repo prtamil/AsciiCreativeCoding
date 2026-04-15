@@ -35,6 +35,32 @@
  * §1 config  §2 clock  §3 color  §4 graph  §5 SIR  §6 draw  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : SIR (Susceptible-Infected-Recovered) epidemic model on
+ *                  a Watts-Strogatz small-world network.
+ *                  Per tick: each I node infects each S neighbour with
+ *                  probability β; each I node recovers with probability γ.
+ *                  R0 = β·⟨k⟩/γ: epidemic spreads when R0 > 1.
+ *
+ * Data-structure : Watts-Strogatz construction: start with a K=4 ring graph
+ *                  (each node connected to K/2 nearest neighbours on each
+ *                  side); rewire each edge with probability p=0.15, replacing
+ *                  target with a random node.  Rewired "shortcut" edges create
+ *                  the small-world property: short average path length + high
+ *                  clustering coefficient.
+ *
+ * Math           : SIR basic reproduction number: R0 = β·⟨k⟩/γ where
+ *                  ⟨k⟩ is the mean degree.  Epidemic threshold R0=1 marks
+ *                  the phase transition between extinction and outbreak.
+ *                  Node positions on ring: θ_i = 2πi/N, placed in a circle.
+ *
+ * Rendering      : Split display: left panel shows network ring with node
+ *                  colours (S=grey, I=red, R=green) and edges; right panel
+ *                  shows scrolling stacked epidemic curve bar chart.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

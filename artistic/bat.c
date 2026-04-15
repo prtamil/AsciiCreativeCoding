@@ -58,6 +58,30 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : V-formation particle system with triangular row layout.
+ *                  Row r contains r+1 bats; total bats = (n+1)(n+2)/2
+ *                  (triangular number).  Each bat's position is computed
+ *                  analytically from group heading angle, row index, and
+ *                  column index — no physics integration, pure kinematics.
+ *
+ * Data-structure : Fixed-size group array; each group stores heading (angle),
+ *                  position, state (FLYING / RESPAWNING), and n_rows.  Bats
+ *                  within a group are reconstructed each frame from group
+ *                  state, avoiding per-bat storage for the formation shape.
+ *
+ * Math           : Row r, column c bat offset from leader:
+ *                    dx = c·SPACING_X − r·SPACING_X/2  (fan-out)
+ *                    dy = r·SPACING_Y                   (depth behind leader)
+ *                  Rotation matrix applied to (dx,dy) using group heading θ.
+ *
+ * Rendering      : 4-frame wing cycle (0→up, 1→level, 2→down, 3→level)
+ *                  implemented as a triangle wave index: frame%4 maps to
+ *                  one of 3 ASCII bat shapes.  Leader drawn bold.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

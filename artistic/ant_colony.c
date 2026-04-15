@@ -28,6 +28,31 @@
  * §6 scene   §7 screen §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Ant Colony Optimisation (ACO) — stigmergic path finding.
+ *                  Ants deposit pheromone on their paths; the pheromone
+ *                  biases future ants toward shorter paths (more traversals =
+ *                  more pheromone per unit time on the shorter path).
+ *                  This positive feedback (autocatalysis) drives the colony
+ *                  to converge on the shortest route without any global knowledge.
+ *
+ * Biology        : Models Deneubourg et al. (1990) double-bridge experiment.
+ *                  Real ants communicate via volatile chemicals; the "memory"
+ *                  of the colony lives in the environment (pheromone field),
+ *                  not in any individual ant.  This is stigmergy: indirect
+ *                  coordination through environment modification.
+ *
+ * Math           : Pheromone update: τ ← τ × (1 − ρ) + Δτ  (evaporation + deposition).
+ *                  Path selection: P(cell) ∝ τ^α × η^β  (pheromone × distance heuristic).
+ *                  ACO is a metaheuristic for NP-hard combinatorial optimisation
+ *                  (travelling salesman, vehicle routing).
+ *
+ * Performance    : O(N_ants × grid_area) per tick for pheromone sensing.
+ *                  The 8-directional movement and pheromone grid makes this
+ *                  more visual but less mathematically rigorous than graph ACO.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

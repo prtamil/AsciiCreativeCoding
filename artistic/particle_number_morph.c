@@ -39,6 +39,30 @@
  * §7  app / main
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Greedy nearest-neighbour bipartite matching + LERP morph.
+ *                  On digit change: build target set for new digit; for each
+ *                  particle, find closest unassigned target (O(P·T) greedy
+ *                  scan); then linearly interpolate position from snapshot
+ *                  to target over MORPH_FRAMES frames using smoothstep easing.
+ *
+ * Math           : Smoothstep easing: f(t) = 3t² − 2t³, t ∈ [0,1].
+ *                  Produces S-curve acceleration at start and deceleration at
+ *                  end — more visually pleasing than linear interpolation.
+ *                  Bitmap font: 9-row × 7-col bitmap; each '#' pixel expanded
+ *                  to a sub-grid of particles scaled to terminal dimensions.
+ *
+ * Performance    : Greedy matching is O(P·T) per digit change but only runs
+ *                  once per transition (not per frame).  Per-frame cost is
+ *                  O(P) position update + draw — cheap at P≤500.
+ *
+ * Rendering      : Particle colour based on proximity to target: settled
+ *                  particles show theme colour; particles in flight fade
+ *                  through a gradient based on interpolation progress t.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

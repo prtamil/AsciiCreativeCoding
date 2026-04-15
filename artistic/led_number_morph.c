@@ -33,6 +33,33 @@
  * §7  app / main
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Spring-mass particle morphing — each particle has a
+ *                  target position on the active digit's 7-segment layout.
+ *                  Per tick: apply spring force F = k·(target − pos),
+ *                  integrate velocity with damping, update position.
+ *                  Particles assigned to inactive segments drift toward
+ *                  segment centre (aggregation behaviour).
+ *
+ * Math           : 7-segment encoding: each digit 0–9 activates a subset
+ *                  of 7 named segments (top, tl, tr, mid, bl, br, bot).
+ *                  Segment lookup table maps digit → bitmask.  Particles are
+ *                  permanently bound to one segment and distributed evenly
+ *                  along its length when that segment is active.
+ *
+ * Physics        : Overdamped spring: critical damping chosen so particles
+ *                  reach their targets smoothly without overshoot.
+ *                  Damping coefficient b chosen near 2√(k·m) (critical
+ *                  damping condition).
+ *
+ * Rendering      : Particles in horizontal segments drawn as '─', vertical
+ *                  as '│'; particles in flight (off-segment) as '+' or '.'.
+ *                  Digit size scales with terminal height so the display fills
+ *                  ~65% of available rows — recomputed on each resize.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

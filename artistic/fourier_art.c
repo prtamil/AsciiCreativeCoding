@@ -38,6 +38,33 @@
  * Sections: §1 config  §2 clock  §3 color  §4 dft  §5 scene  §6 screen  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Interactive path-recording → DFT epicycle reconstruction.
+ *                  User traces a free-form path; on ENTER the path is
+ *                  resampled to N_SAMPLES points using arc-length
+ *                  parameterisation (uniform spacing along the drawn curve),
+ *                  then an O(N²) DFT converts it to epicycle coefficients.
+ *
+ * Math           : Arc-length resampling: cumulative chord-length distances
+ *                  are computed, then uniform sample positions are mapped
+ *                  back to original points via linear interpolation.  This
+ *                  ensures the DFT receives uniform-time samples regardless
+ *                  of how fast the user drew, eliminating velocity artefacts.
+ *                  DFT of complex path: z[k] = x[k] + i·y[k]; Z[n] gives
+ *                  the n-th epicycle amplitude and initial phase.
+ *
+ * Performance    : DFT is computed once (O(N²)) at draw-time, not per frame.
+ *                  Per-frame cost is O(N_active) arm chain evaluations.
+ *                  RAW_MAX=8192 points buffered during draw; resampled to
+ *                  N_SAMPLES=256 before DFT to bound computation.
+ *
+ * Rendering      : Dual-mode: DRAW mode (cursor + recorded trail) and PLAY
+ *                  mode (epicycle arm chain + reconstructed tip trail).
+ *                  Orbit circles toggled with 'c' show each arm's radius.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

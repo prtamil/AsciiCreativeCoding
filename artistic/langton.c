@@ -42,6 +42,31 @@
  *           §6 screen  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Langton's Ant — a 2-D Turing machine on a grid.
+ *                  State: ant position, heading (N/E/S/W), cell colours.
+ *                  Each step: read cell colour → turn (R or L per rule char)
+ *                  → increment cell colour (mod N_colours) → step forward.
+ *                  Generalised multi-colour variant: rule string of length K
+ *                  means K colours; rule[i] is turn direction for colour i.
+ *
+ * Physics        : Emergent order from local rules: with rule "RL", the ant
+ *                  appears chaotic for ~10 000 steps, then spontaneously
+ *                  builds a periodic "highway" — a striking example of
+ *                  emergence: complex global structure from simple local rules.
+ *
+ * Math           : The ant's state space is (position, heading, grid) —
+ *                  theoretically infinite but bounded by toroidal wraparound.
+ *                  The system is deterministic and reversible (time-reversal
+ *                  = swap R↔L in rule).  Highway period = 104 steps (RL rule).
+ *
+ * Performance    : Steps per frame configurable (1–2000) so user can skip
+ *                  ahead past the chaotic phase to observe the highway.
+ *                  O(steps_per_frame) per tick; grid update is O(1) per step.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

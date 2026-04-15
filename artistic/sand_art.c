@@ -34,6 +34,31 @@
  *   [5] sand    [6] scene  [7] app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Falling-sand cellular automaton with flippable gravity.
+ *                  Each tick, cells scanned away from gravity direction
+ *                  (bottom-to-top for downward gravity, top-to-bottom for
+ *                  upward) so each grain moves at most once per frame.
+ *                  Movement priority: forward > diagonal-left > diagonal-right
+ *                  (diagonals randomised to avoid left-bias).
+ *
+ * Physics        : Angle of repose emerges naturally from the diagonal
+ *                  movement rule: grains slide diagonally only when blocked
+ *                  directly, creating stable slopes at ~45° — the sand's
+ *                  natural angle of repose for this CA rule set.
+ *
+ * Math           : Hourglass geometry: neck width at row y computed as
+ *                  linear interpolation between full width and NECK_W.
+ *                  Container mask built once at startup; sand particles
+ *                  check the mask before moving to stay inside the shape.
+ *
+ * Data-structure : Grid of uint8_t cells: 0=empty, 1–5=sand colour layers.
+ *                  Hourglass mask: uint8_t array, 1=accessible, 0=wall.
+ *                  No particle structs — cellular automaton is grid-native.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <signal.h>

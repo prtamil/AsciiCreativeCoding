@@ -32,6 +32,29 @@
  * Sections: §1 config  §2 clock  §3 color  §4 galaxy  §5 draw  §6 screen  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Kinematic circular orbit simulation — no N-body gravity.
+ *                  Each star is placed on a logarithmic spiral arm at init
+ *                  with a fixed angular speed ω = v_tan / radius.  Each
+ *                  tick: θ += ω × dt.  Position = (r·cos θ, r·sin θ).
+ *
+ * Physics        : Flat rotation curve: all stars orbit at the same
+ *                  tangential speed v_tan regardless of radius (like real
+ *                  spiral galaxies, explained by dark matter halos).
+ *                  Differential rotation: ω ∝ 1/r → inner stars orbit
+ *                  faster → arms wind up over time (winding problem).
+ *
+ * Math           : Logarithmic spiral: r = a·exp(b·θ), so θ = ln(r/a)/b.
+ *                  Stars seeded along N_ARMS arms at equal r-intervals;
+ *                  their initial θ values are staggered by 2π/N_ARMS.
+ *
+ * Rendering      : Stars projected to screen (r,θ) → (col,row) with aspect
+ *                  correction.  Density → glyph ramp (. , : o O 0 @).
+ *                  Radial zone (CORE/DISK/HALO) determines colour pair.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

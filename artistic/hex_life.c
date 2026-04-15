@@ -21,6 +21,31 @@
  * §1 config  §2 clock  §3 color  §4 grid  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Conway's Game of Life adapted for a hexagonal grid.
+ *                  Each cell has 6 neighbours (vs 8 for square grids).
+ *                  Rule B2/S34: born on 2 live neighbours, survives on 3–4.
+ *                  Uses double-buffering: write next generation to the
+ *                  inactive buffer, then swap — O(rows × cols) per step.
+ *
+ * Data-structure : Flat 2-D array with uint8_t age field.  Offset-rows
+ *                  layout: odd rows shifted right by 0.5 cells visually.
+ *                  Neighbour coordinates differ for even vs odd rows (two
+ *                  lookup tables, one per parity).
+ *
+ * Physics        : Hexagonal CA rules produce qualitatively different
+ *                  behaviour than square-grid Life: the B2/S34 rule creates
+ *                  stable oscillators and gliders unique to the hex topology.
+ *                  6-neighbour symmetry eliminates diagonal artefacts present
+ *                  in square-grid CAs (more isotropic diffusion of patterns).
+ *
+ * Rendering      : Age-based colour: newborn → yellow, young → cyan,
+ *                  mature → teal, elder → dark.  Dead cells shown as dim
+ *                  dots to visualise the hex grid structure.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <signal.h>

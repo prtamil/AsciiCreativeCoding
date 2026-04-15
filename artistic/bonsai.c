@@ -54,6 +54,31 @@
  *   §10 app           — dt loop, input, SIGWINCH, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Stochastic recursive tree generation (cbonsai algorithm).
+ *                  Each branch step chooses direction using weighted random
+ *                  selection based on branch age ("life") and tree type.
+ *                  Branches spawn child branches when life crosses thresholds,
+ *                  producing natural-looking asymmetric growth without L-systems.
+ *
+ * Data-structure : Branch pool — flat array of branch structs (position, life,
+ *                  type, age).  Active branches are processed FIFO each tick.
+ *                  Pool size is bounded by MAX_BRANCHES to prevent unbounded
+ *                  memory use during long-lived infinite-mode runs.
+ *
+ * Rendering      : Branch character selected from a lookup table based on
+ *                  branch direction and age; leaf characters scattered at
+ *                  branch tips when life falls below LEAF_THRESH.
+ *                  256-colour palette with 8-colour fallback; pot drawn
+ *                  with box-drawing characters.
+ *
+ * Randomness     : Seeded with time(NULL) by default; 'r' key re-seeds for
+ *                  a new tree.  Seed is displayed in the HUD so interesting
+ *                  trees can be reproduced.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

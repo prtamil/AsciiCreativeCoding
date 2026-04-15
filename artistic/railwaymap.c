@@ -25,6 +25,28 @@
  * §6 draw    §7 screen §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Procedural transit map generation using path templates.
+ *                  Lines are built from 5 path templates (H_FULL, V_FULL,
+ *                  Z_SHAPE, REV_Z, DOUBLE_Z) routed through an 8×6 logical
+ *                  grid.  Interchange stations detected by counting how many
+ *                  lines share a grid node (O(lines × path_length) scan).
+ *
+ * Data-structure : Canvas — flat 2D array of cell descriptors storing which
+ *                  H-line and V-line (if any) pass through each terminal cell.
+ *                  At render time: 0 lines → space, 1 H-line → ACS_HLINE,
+ *                  1 V-line → ACS_VLINE, both → ACS_PLUS (cross symbol).
+ *                  Animated trains stored as a pool of (line, progress)
+ *                  structs; progress advances along the line's path.
+ *
+ * Math           : Grid node → terminal cell mapping: linear interpolation
+ *                  between left/right margins and top/bottom margins so the
+ *                  map fills the terminal regardless of size.  Station name
+ *                  placement rotated 90° for vertical lines.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <curses.h>
 #include <signal.h>

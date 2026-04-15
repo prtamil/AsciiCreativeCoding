@@ -7,6 +7,28 @@
  * Keys: q quit | p pause | r reset | +/- launch rate | Space salvo
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Homing missile simulation with proportional navigation.
+ *                  Each rocket steers toward a target using a turn rate
+ *                  (TURN_RATE) that bends the velocity vector each tick.
+ *                  Lateral wobble (WOBBLE_AMP × sin(WOBBLE_FREQ × t)) adds
+ *                  visual realism to the flight path.
+ *
+ * Physics        : Rocket speed increases from ROCKET_SPEED0 toward
+ *                  ROCKET_SPEEDMAX each frame (acceleration phase).
+ *                  Trajectory is integrated with explicit Euler:
+ *                    pos += vel × dt;  vel direction bent by TURN_RATE.
+ *
+ * Rendering      : Rocket orientation mapped to one of 8 ASCII direction
+ *                  chars (▲↗→↘▼↙←↖); trail stored as fixed-length ring
+ *                  buffer (TRAIL_LEN=30) of past positions drawn at
+ *                  decreasing brightness to show motion blur.
+ *                  Explosion sparks are simple ballistic particles with
+ *                  gravity applied each tick.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ── §1 config ───────────────────────────────────────────────────────────── */
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>

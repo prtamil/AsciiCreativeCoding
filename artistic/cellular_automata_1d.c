@@ -37,6 +37,33 @@
  *           §6 screen  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Wolfram Elementary Cellular Automaton (ECA).
+ *                  A 1-D binary row evolves by applying an 8-bit lookup
+ *                  table (the rule): each cell's new state depends on
+ *                  itself and its two neighbours → 2³=8 neighbourhood
+ *                  configurations → 256 possible rules (Wolfram 1983).
+ *
+ * Math           : Rule encoding: the 3-bit neighbourhood (left, center,
+ *                  right) is treated as a binary number 0–7; the rule's
+ *                  n-th bit gives the new center state for neighbourhood n.
+ *                  Example: Rule 110 = 0b01101110 → bit[n] = (110>>n)&1.
+ *
+ * Physics        : Wolfram classes:
+ *                  Class 1 (Fixed)    — all initial conditions → same state
+ *                  Class 2 (Periodic) — stable or periodic patterns
+ *                  Class 3 (Chaotic)  — pseudo-random, sensitive to init
+ *                  Class 4 (Complex)  — localised propagating structures
+ *                  Class 5 (Fractal)  — Sierpinski-like self-similarity
+ *                  Rule 110 is Class 4 and is Turing-complete (Cook 2004).
+ *
+ * Performance    : Each row update is O(cols) — single pass with bitwise
+ *                  neighbourhood extraction.  No double buffer needed since
+ *                  rows are computed top-to-bottom from the previous row only.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

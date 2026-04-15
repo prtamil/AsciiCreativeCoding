@@ -37,6 +37,33 @@
  * Sections: §1 config  §2 clock  §3 fft  §4 signal  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Cooley-Tukey radix-2 DIT (Decimation-In-Time) FFT.
+ *                  Recursively splits the N-point DFT into two N/2-point
+ *                  DFTs of even- and odd-indexed samples, then combines
+ *                  with twiddle factors W_N^k = exp(-2πi·k/N).
+ *                  Complexity: O(N log₂ N) multiplications vs O(N²) for
+ *                  the naive DFT — for N=128: 896 vs 16384 operations.
+ *
+ * Math           : DFT linearity: sum of sinusoids → sum of delta spikes
+ *                  in the frequency domain.  |X[k]| is the amplitude of
+ *                  the k-th harmonic; arg(X[k]) is its phase.  The display
+ *                  shows only the magnitude spectrum (one-sided: bins 0…N/2).
+ *                  Parseval's theorem: Σ|x[n]|² = (1/N)·Σ|X[k]|² — total
+ *                  power is conserved between domains.
+ *
+ * Performance    : N_FFT must be a power of 2 for the radix-2 butterfly.
+ *                  In-place bit-reversal permutation reorders samples before
+ *                  the butterfly stages, requiring no auxiliary buffer.
+ *
+ * Rendering      : Two-panel layout: time domain (top) and frequency domain
+ *                  (bottom), both as vertical bar charts drawn column-by-
+ *                  column.  Bar heights are normalised to panel height each
+ *                  frame so the display auto-scales with terminal size.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

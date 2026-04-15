@@ -7,6 +7,28 @@
  * Keys: q quit | p pause | r reset | +/- speed | Space trigger breach
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Segmented worm body using a chain-of-circles (Conga)
+ *                  follower model.  Each segment follows the previous:
+ *                    if dist(seg[i], seg[i-1]) > SEG_LEN, move seg[i]
+ *                    toward seg[i-1] until separation == SEG_LEN.
+ *                  The head drives; the body follows with O(N_SEGS) updates.
+ *
+ * Math           : Underground path: sinusoidal oscillation
+ *                    y = surface_row + SWIM_DEPTH + SWIM_AMP·sin(SWIM_FREQ·x)
+ *                  Breach arc: parabolic trajectory above the surface —
+ *                    apex at BREACH_HEIGHT rows, spanning BREACH_SPAN cols.
+ *                  Terrain surface: procedural height map built from a sum
+ *                  of low-frequency cosine waves to mimic sand dunes.
+ *
+ * Rendering      : Body segments drawn with direction-dependent ASCII chars
+ *                  (─ │ ╱ ╲ for horizontal/vertical/diagonal).  Head has
+ *                  a multi-row open-mouth sprite during breach.  Sand ripples
+ *                  expand radially at RIPPLE_SPEED cols/s after each breach.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ── §1 config ───────────────────────────────────────────────────────────── */
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>

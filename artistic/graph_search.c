@@ -30,6 +30,30 @@
  * §7 scene   §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Three graph search algorithms animated side-by-side:
+ *                  BFS  — queue-based; expands level-by-level; guarantees
+ *                         shortest path by hop count.  O(V+E).
+ *                  DFS  — stack-based; explores deeply before backtracking;
+ *                         finds a path but not necessarily the shortest. O(V+E).
+ *                  A*   — priority queue (min-heap); f(n)=g(n)+h(n) where
+ *                         g=cost-so-far, h=Euclidean distance to goal.
+ *                         Optimal with admissible heuristic.  O((V+E) log V).
+ *
+ * Data-structure : Adjacency list graph (N=40 nodes, planar-ish random edges).
+ *                  Spring-repulsion layout (Fruchterman-Reingold): nodes repel
+ *                  like charged particles, edges attract like springs, until
+ *                  equilibrium — purely for visual legibility.
+ *
+ * Math           : Fruchterman-Reingold layout: repulsive force ∝ k²/d,
+ *                  attractive force ∝ d²/k, where k = √(area/N) is the
+ *                  ideal edge length.  Converges in O(iterations × (V²+E)).
+ *                  A* heuristic h(n) = Euclidean distance: admissible since
+ *                  it never overestimates straight-line distance.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

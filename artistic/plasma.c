@@ -23,6 +23,30 @@
  *   gcc -std=c11 -O2 -Wall -Wextra plasma.c -o plasma -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic plasma — no state grid, no simulation.
+ *                  Each frame: v(col,row,t) computed as a sum of 4 sine
+ *                  waves at varying spatial frequencies and time speeds.
+ *                  The radial term sin(√(dx²+(2·dy)²)·f4) creates circular
+ *                  ripples centred on the screen; the factor 2 on dy corrects
+ *                  for terminal cell aspect ratio (cells taller than wide).
+ *
+ * Math           : Classic demoscene technique (Commodore 64 era, ~1990s).
+ *                  Superposition of travelling sinusoidal waves produces
+ *                  interference patterns.  Phase offset rotates at CYCLE_HZ
+ *                  Hz, causing the colour palette to cycle continuously.
+ *                  Normalise v to [0,1]: v_norm = (v + 4) / 8 (4 waves
+ *                  with amplitude ≤1 each → sum ∈ [-4, 4]).
+ *
+ * Rendering      : v_norm mapped through a 256-entry colour palette built
+ *                  from sinusoidal RGB components (each colour component a
+ *                  different phase of the same frequency → smooth hue cycle).
+ *                  256-colour terminal required for smooth gradients; 8-colour
+ *                  fallback uses colour pair cycling.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

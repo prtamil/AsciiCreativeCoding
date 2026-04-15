@@ -29,6 +29,28 @@
  *   gcc -std=c11 -O2 -Wall -Wextra aurora.c -o aurora -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic wave superposition — no state grid.
+ *                  Each frame evaluates brightness and colour analytically at
+ *                  every cell from layered sinusoidal functions.  No time-stepping
+ *                  accumulation; previous frame state is not used.
+ *
+ * Math           : Aurora formula per cell (col, row):
+ *                    x = col / cols × 2π    (0 → 2π across width)
+ *                    amp1(col, t) = sin(x + t·s1)   (primary wave)
+ *                    amp2(col, t) = sin(2x + t·s2)  (harmonic)
+ *                    height envelope H = sin(row/rows × π) (curtain boundary)
+ *                  Layering multiple octaves at different speeds creates the
+ *                  shimmering, non-repeating aurora appearance.
+ *
+ * Rendering      : Cell brightness modulates both character and colour:
+ *                  dim cells show '.' through the aurora; bright cells show
+ *                  '|' ':' '¦' characters mimicking vertical curtain streaks.
+ *                  Deterministic hash for star background:
+ *                    star = (col*1003 + row*997 + col*row) % STAR_DENSITY == 0
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

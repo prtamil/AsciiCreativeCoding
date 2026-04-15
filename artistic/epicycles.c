@@ -32,6 +32,32 @@
  *            §6 scene   §7 screen §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Discrete Fourier Transform (DFT) of a complex path.
+ *                  A 2-D curve is encoded as z[k] = x[k] + i·y[k].  The
+ *                  DFT Z[n] = Σ_k z[k]·exp(-2πi·n·k/N) decomposes the curve
+ *                  into N rotating phasors (epicycles).  Sorting by |Z[n]|
+ *                  gives the greedy best-N approximation at each step.
+ *
+ * Math           : Each DFT bin Z[n] defines a circle of radius |Z[n]|/N
+ *                  rotating at angular frequency n rev/cycle with initial
+ *                  phase arg(Z[n]).  Chaining these circles reproduces the
+ *                  original path exactly when all N arms are active
+ *                  (Fourier completeness).  Convergence speed depends on
+ *                  signal smoothness: smooth curves need fewer arms than
+ *                  curves with sharp corners (Gibbs phenomenon).
+ *
+ * Performance    : DFT is O(N²) computed once on shape change; per-frame
+ *                  cost is O(N_active) arm evaluations + O(TRAIL_LEN)
+ *                  trail draw — both negligible at N≤256.
+ *
+ * Rendering      : Arm chain drawn with ncurses mvaddch; trail stored in
+ *                  a ring buffer (TRAIL_LEN entries) so only the most recent
+ *                  600 tip positions are kept — O(1) append and draw.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

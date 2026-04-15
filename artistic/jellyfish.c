@@ -18,6 +18,32 @@
  * §6 draw    §7 screen §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : State-machine locomotion — each jellyfish cycles through
+ *                  4 states: IDLE (passive sinking), CONTRACT (jet thrust),
+ *                  GLIDE (coast on momentum), EXPAND (bell re-opens).
+ *                  Bell shape is a parametric ellipse with time-varying
+ *                  radii; tentacles follow the segmented-chain follower model.
+ *
+ * Physics        : Jet propulsion: impulse applied during CONTRACT phase
+ *                  adds upward velocity; gravity pulls downward every tick.
+ *                  Buoyancy (net upward force) modelled as reduced effective
+ *                  gravity (g_eff < g_real) so the jellyfish drifts upward
+ *                  when contracting and sinks slowly otherwise.
+ *
+ * Math           : Bell outline: ellipse r(θ) with BELL_RX_BASE (horizontal)
+ *                  and BELL_RY_BASE (vertical) radii, both scaled by the
+ *                  contraction factor c(t) ∈ [0.5, 1.0].
+ *                  Cell-aspect correction: CELL_W=8, CELL_H=16 → x scaled
+ *                  by CELL_H/CELL_W = 2.0 to produce a circular bell.
+ *
+ * Rendering      : Bell drawn as a filled half-ellipse; tentacles as chains
+ *                  of chars (│ ╲ ╱ ─) based on segment slope.  Bioluminescent
+ *                  glow achieved by colour-cycling the bell edge and tips.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

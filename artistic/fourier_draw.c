@@ -30,6 +30,34 @@
  *     power fraction.
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : DFT epicycle reconstruction with ghost overlay and
+ *                  Parseval energy bar.  Shapes defined as sampled point
+ *                  arrays (polygons + closed parametric curves) to expose
+ *                  Gibbs-phenomenon ringing at discontinuities.
+ *
+ * Math           : Gibbs phenomenon: the partial Fourier sum of a
+ *                  discontinuous signal overshoots by ~9% at each jump,
+ *                  regardless of how many terms are added.  Visible on the
+ *                  Square and Arrow shapes at corners.
+ *                  Parseval's theorem: total power = Σ|Z[n]|²/N².
+ *                  Sorting epicycles by |Z[n]| and accumulating power gives
+ *                  a greedy energy-optimal partial reconstruction; the energy
+ *                  bar displays this cumulative fraction (0→1).
+ *                  Cell-aspect correction: terminal cells are taller than
+ *                  wide (CELL_W/CELL_H ratio), so x-coordinates are scaled
+ *                  before DFT to produce a visually undistorted shape.
+ *
+ * Performance    : DFT O(N²) computed once per shape change.  Per-frame:
+ *                  O(N_active) arm evaluations + O(TRAIL_LEN) trail draw.
+ *
+ * Rendering      : Ghost path: the original sample points drawn at low
+ *                  brightness so the viewer can compare reconstruction
+ *                  accuracy as epicycle count increases.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

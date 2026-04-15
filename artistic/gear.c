@@ -26,6 +26,31 @@
  * §6 entity  §7 draw   §8 screen §9 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic polar gear geometry + particle system sparks.
+ *                  Gear outline computed each frame from N_TEETH tooth
+ *                  definitions (outer radius, inner radius, hub) using polar
+ *                  angle stepping.  No mesh storage — geometry is regenerated
+ *                  each frame from the current rotation angle.
+ *
+ * Math           : Involute gear tooth approximated as trapezoid in polar
+ *                  coordinates.  Tooth tip position at angle α:
+ *                    (x,y) = GEAR_R_OUTER × (cos α, sin α)
+ *                  Tangential surface velocity at tooth tip:
+ *                    v_tip = GEAR_R_OUTER × ω  (ω = angular speed rad/s)
+ *                  Spark initial velocity ≈ v_tip direction + random spread.
+ *
+ * Rendering      : Cell-aspect correction: CELL_W=8, CELL_H=16 → pixels are
+ *                  taller than wide, so x-coordinates are divided by
+ *                  (CELL_W/CELL_H)=0.5 to make the gear appear circular.
+ *                  Gear outline drawn with Bresenham-style cell mapping.
+ *
+ * Data-structure : Spark pool — fixed array of N_SPARKS_MAX structs with
+ *                  active flag.  O(N) per frame; emission rate scales with ω.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

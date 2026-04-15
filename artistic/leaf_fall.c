@@ -9,6 +9,30 @@
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra artistic/leaf_fall.c -o leaf_fall -lncurses -lm
  */
+
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Two-phase animation: (1) stochastic recursive tree growth
+ *                  using a branching stack (iterative DFS), then (2) matrix-
+ *                  rain-style leaf fall where each leaf column streams downward
+ *                  with a white head and green trail.
+ *
+ * Data-structure : Leaf pool (MAX_LEAVES=4096) of (col, row, delay) structs.
+ *                  Each leaf is assigned to a column of the rendered tree;
+ *                  start delay staggers the fall so leaves drop in waves.
+ *                  Trail drawn by remembering last TRAIL_LEN=7 row positions.
+ *
+ * Rendering      : Tree drawn into a virtual grid (GRID_ROWS×GRID_COLS) using
+ *                  recursive branching with angle jitter (BRANCH_SPREAD=0.50
+ *                  radians range); leaf chars scattered at branch tips.
+ *                  FALL_NS=55 ms per step → ~18 fps fall rate, slower than
+ *                  the 30 fps render tick for smooth trailing effect.
+ *
+ * State machine  : DISPLAY → FALLING → RESET → (new tree) in a cycle.
+ *                  Each state has a fixed time budget (DISPLAY_NS=2.5 s,
+ *                  RESET_NS=0.7 s) measured with CLOCK_MONOTONIC timestamps.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <math.h>

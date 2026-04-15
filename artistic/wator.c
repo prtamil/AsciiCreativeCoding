@@ -49,6 +49,31 @@
  *           §6 scene   §7 screen §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Wa-Tor predator-prey cellular automaton (Dewdney 1984).
+ *                  Fish and sharks are simulated on a toroidal grid with
+ *                  age-based breeding and hunger-based shark death.
+ *                  Shuffled update (Fisher-Yates on active cell list) removes
+ *                  directional bias — equivalent to random-order asynchronous
+ *                  update, which better models spatial competition.
+ *
+ * Physics        : Lotka-Volterra dynamics emerge: fish and shark populations
+ *                  oscillate with a phase lag (fish peak before shark peak).
+ *                  Parameter space: low FISH_BREED + high SHARK_BREED →
+ *                  shark overpopulation and collapse; opposite → shark
+ *                  starvation.  Stable cycles exist in a narrow parameter band.
+ *
+ * Data-structure : Grid of uint16_t cells encoding (type, age, hunger) in
+ *                  bitfields.  Active cell array rebuilt each tick by scanning
+ *                  the grid O(rows×cols); Fisher-Yates shuffle is O(N_active).
+ *                  moved[] flag (parallel uint8 grid) prevents double-processing.
+ *
+ * Rendering      : Population history ring buffer (HIST_LEN entries); drawn
+ *                  as a 4-row dual bar chart: fish above, sharks below.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

@@ -23,6 +23,32 @@
  * §6 scene    §7 screen  §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Swarm simulation with 4-phase state machine per worker.
+ *                  DIVERGE: workers shoot outward from queen along fixed
+ *                  headings; PAUSE (retract): workers brake and hold; then
+ *                  CONVERGE: workers fly back toward queen; second PAUSE;
+ *                  repeat.  Queen wanders with smooth Brownian-like steering.
+ *
+ * Data-structure : Per-worker ring buffer of TRAIL_LEN=48 past positions.
+ *                  Older trail positions drawn at decreasing brightness,
+ *                  creating the long fading ray appearance.  Buffer is a
+ *                  circular array with head pointer — O(1) append.
+ *
+ * Physics        : Queen steering: each tick a small random angle δθ is
+ *                  added to the heading, bounded to avoid tight circles
+ *                  (Ornstein-Uhlenbeck-like bounded random walk).
+ *                  Worker heading locked to outward direction from queen
+ *                  at the start of DIVERGE; held fixed during flight.
+ *
+ * Rendering      : Cell-aspect correction: CELL_W=8, CELL_H=16 — worker
+ *                  pixel positions are divided by (CELL_H/CELL_W) in y to
+ *                  produce equal angular spacing on screen.  Trail chars
+ *                  selected from brightness ramp based on trail age.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

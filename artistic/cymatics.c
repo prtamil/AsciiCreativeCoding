@@ -39,6 +39,26 @@
  *           §6 screen  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic Chladni figure computation — no simulation, no PDE.
+ *                  The nodal pattern is computed by evaluating the 2D mode shape
+ *                  function at every cell and testing if |Z| < threshold.
+ *
+ * Physics        : Chladni figures (Ernst Chladni, 1787): when a plate vibrates
+ *                  at a resonant frequency, sand on the plate migrates to nodal
+ *                  lines (where displacement = 0).  The mode (m,n) describes
+ *                  how many half-wavelengths fit in each direction.
+ *
+ * Math           : Square plate mode shape function:
+ *                    Z(x,y) = cos(m·π·x)·cos(n·π·y) − cos(n·π·x)·cos(m·π·y)
+ *                  Nodal lines are where Z(x,y) = 0.  The cos−cos structure
+ *                  comes from satisfying Neumann boundary conditions (free edge).
+ *                  Resonant frequency: f_mn ∝ √(m² + n²) — Pythagorean relationship.
+ *                  Modes with m=n are degenerate: Z=0 everywhere (trivial solution);
+ *                  interesting patterns require m ≠ n.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

@@ -6,12 +6,12 @@
 # ── basics ───────────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra ncurses_basics/tst_lines_cols.c  -o tst_lines_cols  -lncurses
 gcc -std=c11 -O2 -Wall -Wextra ncurses_basics/aspect_ratio.c    -o aspect_ratio    -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra ncurses_basics/spring_pendulum.c -o spring_pendulum -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/spring_pendulum.c    -o spring_pendulum -lncurses -lm
 
 # ── misc ─────────────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra misc/sort_vis.c          -o sort_vis        -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra misc/maze.c              -o maze            -lncurses
-gcc -std=c11 -O2 -Wall -Wextra misc/ca_music.c          -o ca_music        -lncurses -lm
+
 
 # ── matrix ───────────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra matrix_rain/matrix_rain.c     -o matrix_rain     -lncurses -lm
@@ -78,13 +78,14 @@ gcc -std=c11 -O2 -Wall -Wextra fractal_random/bifurcation.c    -o bifurcation   
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/burning_ship.c   -o burning_ship     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/newton_fractal.c -o newton_fractal   -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/strange_attractor.c -o strange_attractor -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra fractal_random/dragon_curve.c   -o dragon_curve     -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra fractal_random/apollonian.c     -o apollonian       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/dragon_curve.c      -o dragon_curve     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/apollonian.c        -o apollonian       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fractal_random/l_system.c          -o l_system         -lncurses -lm
 
 # ── artistic ──────────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra artistic/bonsai.c            -o bonsai       -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra Artistic/bat.c               -o bat          -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra Artistic/2stroke.c           -o 2stroke      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/bat.c                -o bat          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/2stroke.c             -o 2stroke      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/leaf_fall.c         -o leaf_fall    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/epicycles.c         -o epicycles    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/cellular_automata_1d.c -o cellular_automata_1d -lncurses
@@ -96,6 +97,7 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/aurora.c              -o aurora         
 gcc -std=c11 -O2 -Wall -Wextra artistic/plasma.c              -o plasma              -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/fourier_draw.c        -o fourier_draw  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/fourier_art.c         -o fourier_art   -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/fft_vis.c             -o fft_vis       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra misc/forest_fire.c             -o forest_fire   -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/ant_colony.c          -o ant_colony    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/graph_search.c        -o graph_search  -lncurses -lm
@@ -108,11 +110,14 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/railwaymap.c          -o railwaymap    -
 gcc -std=c11 -O2 -Wall -Wextra artistic/galaxy.c              -o galaxy        -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/barnes_hut.c           -o barnes_hut    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/rigid_body.c           -o rigid_body    -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra physics/soft_body.c            -o soft_body     -lncurses -lm -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/soft_body.c            -o soft_body      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/bubble_chamber.c       -o bubble_chamber -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/gyroscope.c            -o gyroscope      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/wave_interference.c      -o wave_interference -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/excitable.c              -o excitable      -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/lattice_gas.c            -o lattice_gas    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/fluid_sph.c              -o fluid_sph      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/marching_squares.c       -o marching_squares -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/julia_explorer.c -o julia_explorer -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/barnsley.c       -o barnsley       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/diffusion_map.c  -o diffusion_map  -lncurses -lm
@@ -120,6 +125,9 @@ gcc -std=c11 -O2 -Wall -Wextra fractal_random/tree_la.c        -o tree_la       
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/lyapunov.c       -o lyapunov       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/led_number_morph.c    -o led_number_morph    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/particle_number_morph.c -o particle_number_morph -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/dune_rocket.c         -o dune_rocket    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/dune_sandworm.c       -o dune_sandworm  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/sand_art.c            -o sand_art       -lncurses -lm
 
 # ── raytracing ───────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raytracing/sphere_raytrace.c   -o sphere_raytrace   -lncurses -lm
@@ -141,7 +149,8 @@ gcc -std=c11 -O2 -Wall -Wextra geometry/convex_hull.c  -o convex_hull -lncurses 
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raster/cube_raster.c     -o cube     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raster/sphere_raster.c   -o sphere   -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra raster/displace_raster.c -o displace -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raster/displace_raster.c    -o displace          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raster/mandelbulb_raster.c  -o mandelbulb_raster -lncurses -lm
 
 # ── raymarcher / 3-D ─────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/donut.c                -o donut       -lncurses -lm
@@ -149,7 +158,10 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/wireframe.c            -o wireframe   
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c           -o raymarcher  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_cube.c      -o ray_cube    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs         -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/sdf_gallery.c          -o sdf_gallery       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/mandelbulb_explorer.c  -o mandelbulb        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer       -lncurses -lm
 ```
 
 ---
@@ -164,8 +176,6 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 ### misc/
 - `sort_vis.c`  — sorting visualiser: 5 algorithms (bubble/insertion/selection/quicksort/heapsort) as animated vertical bar chart; one operation per tick; grey/cyan/red/green color states; comparison + swap counters
 - `maze.c`      — recursive-backtracker DFS maze generation; BFS/A* animated solve path; wall-bit encoding (4 bits per cell); small/large presets
-- `ca_music.c`  — musical cellular automaton: 8 CA rules (110/30/90/150…); beat cursor sweeps width; live cells ring terminal bell (`\a`) on beat; 5 scales; tempo control; 7-color rainbow display
-
 ### matrix_rain/
 - `matrix_rain.c`       — Matrix-style falling character rain: two-pass draw, theme system, render interpolation for smooth column-head scrolling
 - `pulsar_rain.c`       — Rotating pulsar neutron-star: N evenly-spaced beams (1–16) sweep continuously; each leaves a 16-slot angular wake of fading matrix chars across 80 radial samples; '@' core always drawn last; +/- spin, [ ] beam count, t theme, r reset
@@ -246,8 +256,6 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs  -
 ### misc/
 - `sort_vis.c`  — sorting visualiser: 5 algorithms (bubble/insertion/selection/quicksort/heapsort) as animated vertical bar chart; one operation per tick; grey/cyan/red/green color states; comparison + swap counters
 - `maze.c`      — recursive-backtracker DFS maze generation; BFS/A* animated solve path; wall-bit encoding (4 bits per cell); small/large presets
-- `ca_music.c`  — musical cellular automaton: 8 CA rules (110/30/90/150…); beat cursor sweeps width; live cells ring terminal bell (`\a`) on beat; 5 scales; tempo control; 7-color rainbow display
-
 ### geometry/
 - `rect_grid.c`   — rectangular character grid: full terminal covered in chars at independent random rates; two sinusoidal colour waves (different freq) wash across; 6 themes; 4 speed presets
 - `polar_grid.c`  — polar/radial character grid: N_RINGS=10 concentric rings rotating at individual speeds (alternating dir); chars at ring-spoke intersections change randomly; colour fades inward→outward; 6 themes

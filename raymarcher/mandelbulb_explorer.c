@@ -145,12 +145,12 @@ static inline int canvas_h_from_rows(int r) { return r / CELL_H; }
 #define CANVAS_MAX_H  120
 
 /* ── Raymarching geometry ─────────────────────────────────────────────── */
-#define MB_MAX_STEPS_FULL   80
+#define MB_MAX_STEPS_FULL  100      /* was 80  — more budget reaches deeper surface features    */
 #define MB_MAX_STEPS_FAST   40
-#define MB_HIT_EPS          0.003f  /* T.1  surface smoothing: raise to kill sub-cell aliasing */
+#define MB_HIT_EPS          0.002f  /* was 0.003 — tighter hit gives sharper silhouette         */
 #define MB_MAX_DIST         5.0f
-#define MB_MAX_ITER         12      /* DE bailout iterations (main march)       */
-#define MB_MAX_ITER_AUX     6       /* cheaper limit for normal / AO / shadow   */
+#define MB_MAX_ITER         16      /* was 12  — more iterations = more accurate DE surface      */
+#define MB_MAX_ITER_AUX      8      /* was  6  — better normals, AO, shadows                    */
 #define MB_BAIL             2.0f    /* escape radius                            */
 
 /* ── Near-miss glow ───────────────────────────────────────────────────── */
@@ -212,8 +212,8 @@ static inline int canvas_h_from_rows(int r) { return r / CELL_H; }
 #define MORPH_SPD       0.22f  /* power morph: rad/s of sine oscillation       */
 #define MORPH_LO        2.0f   /* power morph: lower bound                     */
 #define MORPH_HI        8.0f   /* power morph: upper bound                     */
-#define COLOR_BANDS     2.0f   /* palette: full cycles visible at once         */
-#define COLOR_PHASE_SPD 0.35f  /* palette: rotation speed (colour pairs/sec)   */
+#define COLOR_BANDS     1.0f   /* palette: full cycles visible at once         */
+#define COLOR_PHASE_SPD 0.0f   /* no automatic palette rotation                */
 #define ROWS_PER_TICK   8      /* T.10/T.11 progressive: rows rendered per tick */
 #define NSTARS          200    /* starfield background particle count           */
 
@@ -242,58 +242,70 @@ typedef struct {
  * (r,g,b ∈ 0..5).  The 8-color fallback uses the 8 ANSI colors.
  */
 static const Theme k_themes[] = {
-    { "Nebula",
-      /* deep navy → electric blue → violet → magenta → crimson → orange → amber → white */
-      {17, 21, 93, 165, 196, 208, 220, 231},
-      {COLOR_BLUE, COLOR_BLUE,    COLOR_MAGENTA, COLOR_MAGENTA,
-       COLOR_RED,  COLOR_YELLOW,  COLOR_YELLOW,  COLOR_WHITE} },
+    { "Matrix",
+      /* dark forest → emerald → pure green → lime → yellow-green → pale mint.
+       * No near-black: outer shells visible as deep forest green.
+       * Hue shifts green→lime across depth so ridges read differently to cavities. */
+      {28, 34, 40, 46, 82, 118, 154, 120},
+      /*   (0,2,0)  (0,3,0)  (0,4,0)  (0,5,0)  (1,5,0)  (2,5,0)  (3,5,0)  (2,5,2) */
+      {COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
+       COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_WHITE} },
 
-    { "Aurora",
-      /* vivid blue → azure → teal-green → pure green → bright green → lime → chartreuse → yellow */
-      {21, 45, 48, 46, 82, 118, 154, 226},
-      {COLOR_BLUE,  COLOR_CYAN,   COLOR_CYAN,    COLOR_GREEN,
-       COLOR_GREEN, COLOR_GREEN,  COLOR_YELLOW,  COLOR_YELLOW} },
+    { "Nova",
+      /* deep blue → royal blue → azure → sky blue → cyan → pale cyan → ice.
+       * Hue drifts blue→cyan: surface ridges glow cyan, deep shells stay blue. */
+      {27, 33, 39, 45, 51, 87, 123, 195},
+      /*   (0,1,5)  (0,2,5)  (0,3,5)  (0,4,5)  (0,5,5)  (1,5,5)  (2,4,5)  (4,5,5) */
+      {COLOR_BLUE, COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,
+       COLOR_CYAN, COLOR_CYAN,  COLOR_CYAN,  COLOR_WHITE} },
 
-    { "Inferno",
-      /* black → dark purple → deep magenta → crimson-red → red → orange → amber → yellow */
-      {16, 53, 89, 161, 196, 202, 214, 226},
-      {COLOR_BLACK,   COLOR_MAGENTA, COLOR_MAGENTA, COLOR_RED,
-       COLOR_RED,     COLOR_RED,     COLOR_YELLOW,  COLOR_YELLOW} },
+    { "Fire",
+      /* dark crimson → red → hot red → orange-red → orange → amber → yellow → pale gold.
+       * Starts at visible dark red (not black); deep grooves crimson, ridges burn yellow. */
+      {124, 160, 196, 202, 208, 214, 220, 229},
+      /*    (3,0,0)  (4,0,0)  (5,0,0)  (5,1,0)  (5,2,0)  (5,3,0)  (5,4,0)  (5,5,3) */
+      {COLOR_RED,    COLOR_RED,    COLOR_RED,    COLOR_RED,
+       COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW} },
 
-    { "Spectrum",
-      /* full hue wheel — each shell a clearly distinct colour */
-      /* red → orange → yellow → green → cyan → blue → violet → magenta */
-      {196, 208, 226, 46, 51, 21, 129, 201},
-      {COLOR_RED,   COLOR_YELLOW, COLOR_YELLOW, COLOR_GREEN,
-       COLOR_CYAN,  COLOR_BLUE,   COLOR_MAGENTA,COLOR_MAGENTA} },
+    { "Ice",
+      /* dark teal → teal → bright teal → cyan → pale cyan → ice blue → near-white.
+       * No black at all; cool progression from deep ocean floor to polar ice. */
+      {30, 37, 44, 51, 87, 123, 159, 195},
+      /*   (0,2,2)  (0,3,3)  (0,4,4)  (0,5,5)  (1,5,5)  (2,4,5)  (3,5,5)  (4,5,5) */
+      {COLOR_CYAN, COLOR_CYAN, COLOR_CYAN,  COLOR_CYAN,
+       COLOR_CYAN, COLOR_CYAN, COLOR_WHITE, COLOR_WHITE} },
 
-    { "Toxic",
-      /* dark green → acid green → lime → yellow → amber → orange → red → hot pink */
-      {22, 34, 118, 226, 220, 208, 196, 201},
-      {COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN, COLOR_YELLOW,
-       COLOR_YELLOW, COLOR_RED,    COLOR_RED,   COLOR_MAGENTA} },
+    { "Gold",
+      /* dark orange → burnt orange → orange → amber → yellow-amber → pale gold.
+       * Warm metallic; deep cavities glow dark copper, bright ridges shine gold. */
+      {130, 136, 172, 178, 214, 220, 226, 229},
+      /*    (3,1,0)  (3,2,0)  (4,2,0)  (4,3,0)  (5,3,0)  (5,4,0)  (5,5,0)  (5,5,3) */
+      {COLOR_RED,    COLOR_RED,    COLOR_RED,    COLOR_YELLOW,
+       COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE} },
 
-    { "Dusk",
-      /* midnight navy → indigo → purple → violet → pink → coral → amber → gold */
-      {18, 57, 93, 129, 164, 205, 214, 220},
-      {COLOR_BLUE,    COLOR_BLUE,    COLOR_MAGENTA, COLOR_MAGENTA,
-       COLOR_RED,     COLOR_RED,     COLOR_YELLOW,  COLOR_YELLOW} },
+    { "Violet",
+      /* dark purple → medium purple → violet → bright violet → magenta → pale orchid.
+       * Hue shifts purple→magenta: deep structure is violet, surface blooms magenta. */
+      {54, 91, 129, 165, 207, 213, 219, 225},
+      /*   (1,0,2)  (2,0,3)  (3,0,5)  (4,0,5)  (5,1,5)  (5,2,5)  (5,3,5)  (5,4,5) */
+      {COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA,
+       COLOR_MAGENTA, COLOR_RED,     COLOR_RED,     COLOR_WHITE} },
 
-    { "Abyss",
-      /* near-black → dark navy → royal blue → deep teal → cyan → seafoam → lime → pale gold */
-      {16, 17, 20, 37, 51, 80, 154, 220},
-      {COLOR_BLACK, COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,
-       COLOR_CYAN,  COLOR_GREEN, COLOR_GREEN, COLOR_YELLOW} },
+    { "Mono",
+      /* dark grey → mid grey → light grey → near-white → white.
+       * Best for reading fractal structure; zero hue distraction.
+       * Starts dark-grey (not black) so outer shells remain visible. */
+      {237, 240, 243, 246, 249, 251, 253, 231},
+      {COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE,
+       COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE} },
 
-    { "Prism",
-      /* Full hue sweep using only light/medium-bright values — no dark colors.
-       * Every entry has cube components (r,g,b) with min ≥ 2, so all 8 pairs
-       * are clearly legible on a black background.
-       * coral → peach-orange → pale yellow → chartreuse → mint → sky-cyan → sky-blue → orchid */
-      {210, 216, 228, 155, 157, 159, 153, 219},
-      /* 210=(5,2,2) 216=(5,3,2) 228=(5,5,2) 155=(3,5,1) 157=(3,5,3) 159=(3,5,5) 153=(3,4,5) 219=(5,3,5) */
-      {COLOR_RED,    COLOR_RED,    COLOR_YELLOW, COLOR_GREEN,
-       COLOR_GREEN,  COLOR_CYAN,   COLOR_CYAN,   COLOR_MAGENTA} },
+    { "Plasma",
+      /* dark magenta → hot pink → coral → orange → amber → yellow → pale cream.
+       * A warm neon arc: feels like a plasma discharge coiling through the fractal. */
+      {125, 162, 168, 204, 209, 215, 221, 229},
+      /*    (3,0,3)  (4,0,2) ... warm pink progression */
+      {COLOR_MAGENTA, COLOR_MAGENTA, COLOR_RED,    COLOR_RED,
+       COLOR_RED,     COLOR_YELLOW,  COLOR_YELLOW, COLOR_WHITE} },
 };
 #define THEME_N (int)(sizeof k_themes / sizeof k_themes[0])
 
@@ -335,9 +347,9 @@ static void color_init_theme(void)
     const Theme *th = &k_themes[g_theme_idx];
     for (int i = 0; i < GRAD_N; i++) {
         if (COLORS >= 256)
-            init_pair(i + 1, th->fg256[i], COLOR_BLACK);
+            init_pair(i + 1, th->fg256[i], -1);   /* -1 = transparent background */
         else
-            init_pair(i + 1, th->fg8[i], COLOR_BLACK);
+            init_pair(i + 1, th->fg8[i], -1);
     }
     /* Star pair — dim grey */
     if (COLORS >= 256) init_pair(CP_STAR, 240, -1);
@@ -359,9 +371,12 @@ static void color_init_theme(void)
  */
 static int mb_color_pair(float smooth)
 {
-    float banded = smooth * (float)GRAD_N * COLOR_BANDS;
-    int   idx    = (int)banded % GRAD_N;
+    /* Map smooth [0,1] linearly across the palette once.
+     * g_color_offset gently shifts the starting hue over time.
+     * Clamp to [0, GRAD_N-1] — no wrapping, no repeated bands. */
+    int idx = (int)(smooth * (float)(GRAD_N - 1) + 0.5f);
     if (idx < 0) idx = 0;
+    if (idx >= GRAD_N) idx = GRAD_N - 1;
     idx = (idx + g_color_offset + GRAD_N * 16) % GRAD_N;
     return idx + 1;
 }
@@ -465,20 +480,34 @@ static float mb_de(Vec3 pos, float power, int max_iter,
 }
 
 /*
- * mb_normal() — surface normal via central differences (6 DE calls).
- * Uses MB_MAX_ITER_AUX iterations for speed.
+ * mb_normal() — surface normal via tetrahedral method (4 DE calls).
+ *
+ * Central differences use 6 evaluations: ±H along each axis.
+ * The tetrahedral method (Inigo Quilez) uses 4 evaluations at the
+ * vertices of a regular tetrahedron inscribed in the sample sphere:
+ *   k1=(+1,-1,-1)  k2=(-1,-1,+1)  k3=(-1,+1,-1)  k4=(+1,+1,+1)
+ *   ∇f ≈ k1·f(p+H·k1) + k2·f(p+H·k2) + k3·f(p+H·k3) + k4·f(p+H·k4)
+ *
+ * Two fewer DE calls per hit pixel.  Also avoids the mixed-partial
+ * cancellation error that central differences accumulate when the
+ * function varies in two axes simultaneously — gives slightly cleaner
+ * normals at concave creases on the fractal surface.
+ *
+ * H = 0.010 kept from T.2: calibrated for terminal-cell granularity.
  */
 static Vec3 mb_normal(Vec3 p, float power, TrapType trap_type)
 {
-    const float H = 0.010f;  /* T.2  normal low-pass filter — large H smooths per-cell normals */
-    float dt, ds;
-    float dx = mb_de(v3(p.x+H,p.y,p.z), power, MB_MAX_ITER_AUX, &dt, trap_type, NULL)
-             - mb_de(v3(p.x-H,p.y,p.z), power, MB_MAX_ITER_AUX, &ds, trap_type, NULL);
-    float dy = mb_de(v3(p.x,p.y+H,p.z), power, MB_MAX_ITER_AUX, &dt, trap_type, NULL)
-             - mb_de(v3(p.x,p.y-H,p.z), power, MB_MAX_ITER_AUX, &ds, trap_type, NULL);
-    float dz = mb_de(v3(p.x,p.y,p.z+H), power, MB_MAX_ITER_AUX, &dt, trap_type, NULL)
-             - mb_de(v3(p.x,p.y,p.z-H), power, MB_MAX_ITER_AUX, &ds, trap_type, NULL);
-    return v3norm(v3(dx, dy, dz));
+    const float H = 0.010f;
+    float dt;
+    float d1 = mb_de(v3(p.x+H, p.y-H, p.z-H), power, MB_MAX_ITER_AUX, &dt, trap_type, NULL);
+    float d2 = mb_de(v3(p.x-H, p.y-H, p.z+H), power, MB_MAX_ITER_AUX, &dt, trap_type, NULL);
+    float d3 = mb_de(v3(p.x-H, p.y+H, p.z-H), power, MB_MAX_ITER_AUX, &dt, trap_type, NULL);
+    float d4 = mb_de(v3(p.x+H, p.y+H, p.z+H), power, MB_MAX_ITER_AUX, &dt, trap_type, NULL);
+    return v3norm(v3(
+         d1 - d2 - d3 + d4,   /* k1.x k2.x k3.x k4.x = +1 -1 -1 +1 */
+        -d1 - d2 + d3 + d4,   /* k1.y k2.y k3.y k4.y = -1 -1 +1 +1 */
+        -d1 + d2 - d3 + d4    /* k1.z k2.z k3.z k4.z = -1 +1 -1 +1 */
+    ));
 }
 
 /*
@@ -640,14 +669,22 @@ static void stars_init(int cw, int ch)
  *
  * Both modes share: AO (darkens occluded cavities), glow tracking (T.13).
  */
+/*
+ * mb_cast_pixel() — cast one ray.
+ *
+ * ox, oy: sub-pixel jitter offset in cell fractions [-0.5, +0.5].
+ * Pass 0,0 for a centred single-sample ray.
+ * Pass ±0.25 in a 2×2 grid pattern for supersampled calls.
+ */
 static PixCell mb_cast_pixel(int px, int py, int cw, int ch,
                               Vec3 cam_pos, Vec3 fwd, Vec3 right, Vec3 up,
                               float power, int max_steps,
                               bool do_shadow, bool do_ao, bool use_lighting,
-                              TrapType trap_type)
+                              TrapType trap_type,
+                              float ox, float oy)
 {
-    float u =  ((float)px + 0.5f) / (float)cw * 2.0f - 1.0f;
-    float v = -((float)py + 0.5f) / (float)ch * 2.0f + 1.0f;
+    float u =  ((float)px + 0.5f + ox) / (float)cw * 2.0f - 1.0f;
+    float v = -((float)py + 0.5f + oy) / (float)ch * 2.0f + 1.0f;
     float phys_aspect = ((float)ch * CELL_ASPECT) / (float)cw; /* T.14 aspect fix */
 
     Vec3 rd = v3norm(
@@ -721,27 +758,77 @@ static PixCell mb_cast_pixel(int px, int py, int cw, int ch,
 }
 
 /*
+ * mb_cast_pixel_ss() — 2×2 jittered supersampling.
+ *
+ * Casts 4 rays at sub-pixel offsets (±0.25 cell fractions) and averages
+ * luma, ndl, smooth, and trap.  hit = true if any sample hit.
+ * glow_str = maximum glow across samples.
+ *
+ * Cost: 4× more DE calls per cell.  Benefit: edges between fractal and
+ * background are averaged across 4 sub-rays → smooth silhouette instead
+ * of hard block boundary.  Interior cells converge quickly.
+ */
+static PixCell mb_cast_pixel_ss(int px, int py, int cw, int ch,
+                                 Vec3 cam_pos, Vec3 fwd, Vec3 right, Vec3 up,
+                                 float power, int max_steps,
+                                 bool do_shadow, bool do_ao, bool use_lighting,
+                                 TrapType trap_type)
+{
+    static const float jx[4] = {-0.25f,  0.25f, -0.25f,  0.25f};
+    static const float jy[4] = {-0.25f, -0.25f,  0.25f,  0.25f};
+
+    PixCell acc = {0};
+    int hits = 0;
+    for (int s = 0; s < 4; s++) {
+        PixCell c = mb_cast_pixel(px, py, cw, ch,
+                                   cam_pos, fwd, right, up,
+                                   power, max_steps,
+                                   do_shadow, do_ao, use_lighting,
+                                   trap_type, jx[s], jy[s]);
+        acc.luma     += c.luma;
+        acc.ndl      += c.ndl;
+        acc.smooth   += c.smooth;
+        acc.trap     += c.trap;
+        if (c.hit) hits++;
+        if (c.glow_str > acc.glow_str) acc.glow_str = c.glow_str;
+    }
+    acc.luma   *= 0.25f;
+    acc.ndl    *= 0.25f;
+    acc.smooth *= 0.25f;
+    acc.trap   *= 0.25f;
+    acc.hit     = (hits > 0);
+    return acc;
+}
+
+/*
  * canvas_render_rows() — render ROWS_PER_TICK rows into g_fbuf.
  * Progressive: wraps at ch; returns true on full-frame completion.
+ * use_ss: when true each cell casts 4 jittered rays (2×2 supersampling).
  */
 static bool canvas_render_rows(int cw, int ch,
                                 Vec3 cam_pos, Vec3 fwd, Vec3 right, Vec3 up,
                                 float power, int max_steps,
                                 bool do_shadow, bool do_ao, bool use_lighting,
-                                TrapType trap_type)
+                                TrapType trap_type, bool use_ss)
 {
     for (int k = 0; k < ROWS_PER_TICK; k++) {
         int py = g_render_row;
         for (int px = 0; px < cw; px++) {
-            g_fbuf[py][px] = mb_cast_pixel(px, py, cw, ch,
-                                            cam_pos, fwd, right, up,
-                                            power, max_steps,
-                                            do_shadow, do_ao, use_lighting,
-                                            trap_type);
+            g_fbuf[py][px] = use_ss
+                ? mb_cast_pixel_ss(px, py, cw, ch,
+                                   cam_pos, fwd, right, up,
+                                   power, max_steps,
+                                   do_shadow, do_ao, use_lighting,
+                                   trap_type)
+                : mb_cast_pixel(px, py, cw, ch,
+                                cam_pos, fwd, right, up,
+                                power, max_steps,
+                                do_shadow, do_ao, use_lighting,
+                                trap_type, 0.0f, 0.0f);
         }
         if (++g_render_row >= ch) {
             g_render_row = 0;
-            memcpy(g_stable, g_fbuf, sizeof g_stable); /* T.10 stable buffer: save complete frame */
+            memcpy(g_stable, g_fbuf, sizeof g_stable); /* T.10 stable buffer */
             return true;
         }
     }
@@ -898,6 +985,9 @@ typedef struct {
      *                true  = Phong key+rim+shadow (classic 3-D lighting)        */
     bool     use_lighting;
 
+    /* 2×2 supersampling: 4 jittered rays per cell → smooth silhouette edges */
+    bool     use_ss;
+
     float    time;
 } Scene;
 
@@ -1000,7 +1090,7 @@ static void scene_render(Scene *s)
                        g_snap_cam, g_snap_fwd, g_snap_right, g_snap_up,
                        s->power, s->max_steps,
                        s->do_shadow, s->do_ao, s->use_lighting,
-                       s->trap_type);
+                       s->trap_type, s->use_ss);
 }
 
 static void scene_draw(const Scene *s, int cols, int rows)
@@ -1059,7 +1149,7 @@ static void screen_draw(Screen *sc, const Scene *s, double fps)
              fps, s->cw, s->ch, g_render_row, s->ch);
     mvprintw(sc->rows - 2, 0,
              "power:%.1f  trap:%-5s  theme:%-6s  dist:%.2f  orb:%.2f"
-             "  %s%s%s%s%s%s%s",
+             "  %s%s%s%s%s%s%s%s",
              s->power, trap_name(s->trap_type),
              k_themes[g_theme_idx].name,
              s->cam_dist, s->orbit_spd,
@@ -1069,10 +1159,11 @@ static void screen_draw(Screen *sc, const Scene *s, double fps)
              s->fast_mode    ? "FAST " : "     ",
              s->auto_zoom    ? "ZOOM " : "     ",
              s->morph_mode   ? "MORPH" : "     ",
-             s->clean_mode   ? " CLN"  : "    ");
+             s->clean_mode   ? " CLN"  : "    ",
+             s->use_ss       ? " SS"   : "   ");
     mvprintw(sc->rows - 1, 0,
              "q:quit spc:pause arrows:orbit p/P:power m:morph n:clean l:light "
-             "t:trap c:theme z/Z:dist a:zoom o:AO s:shad f:fast r:reset []:spd");
+             "t:trap c:theme z/Z:dist a:zoom o:AO s:shad f:fast x:SS r:reset []:spd");
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
@@ -1184,6 +1275,11 @@ static bool app_handle_key(App *app, int ch)
     case 's':
         /* shadow only applies in Phong mode */
         if (s->use_lighting) { s->do_shadow = !s->do_shadow; dirty = true; }
+        break;
+    case 'x':
+        /* 2×2 supersampling: 4× cost, smooth silhouette edges */
+        s->use_ss = !s->use_ss;
+        dirty = true;
         break;
 
     case '[':

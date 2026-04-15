@@ -9,7 +9,7 @@
    ╚═╝     ╚══════╝  ╚═╝  ╚═╝  ╚═╝     ╚═╝    blackhole.c  terminal as canvas
 ```
 
-127 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+130 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -40,6 +40,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `reaction_wave` | FitzHugh-Nagumo excitable medium — activator/inhibitor PDE, spiral waves, 4 color themes |
 | `excitable` | Greenberg-Hastings N-state CA — resting/excited/refractory rule; 4 presets (Spiral/Double/Rings/Chaos); N adjustable 5–20 controls refractory depth and wave spacing; broken-front spiral nucleation; radially periodic IC for target rings; 5 themes; `spc` manual pulse |
 | `wave_interference` | Analytic N-source wave interference — precomputed k·r phase table, aspect-corrected pixel distance, 8-level signed amplitude colour ramp; 4 presets (Double Slit/Ripple Tank/Beat/Radial); 5 themes; interactive source move/add/delete, ω and λ control |
+| `fluid_sph` | SPH particle fluid — kernel density estimation, pressure + viscosity forces, symplectic Euler, O(N·k) spatial grid, 5 scenes, 8 themes |
 | `flowfield` | Perlin fBm vector field — bilinear sampling, 8-direction particle trails |
 
 ### Physics
@@ -61,6 +62,9 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `rigid_body` | 2D rigid body physics — cubes + spheres, all pairs resolved with single AABB overlap function; spheres use aspect-corrected AABB `hw=r, hh=2r` to match terminal cell ratio; two-pass resolution: positional correction always fires (fixes overlap even when `vn=0`), velocity impulse only when approaching; adaptive restitution `e_eff=0` at low speed kills floor micro-bounce; spawn overlap check; sleep counter; `c` add cube, `s` add sphere, `x` remove last, `r` reset |
 | `soft_body` | Jelly blob — 7×7 spring-mass mesh; structural + shear + bending springs (Hooke + velocity damping); Newtonian pressure from shoelace area vs target; scan-line fill rendering; symplectic Euler integration; 4 presets (Blob/Heavy/Bouncy/Two), 5 themes |
 | `barnes_hut` | Barnes–Hut O(N log N) gravity — 800-body galaxy with quadtree force approximation (s/d < θ=0.5 criterion); static node pool (no malloc); flat rotation curve disk via M_enc∝r; Box-Muller Gaussian bulge; logarithmic spiral arms; brightness accumulator glow with DECAY=0.84; quadtree overlay (depth ≤ 3); 3 presets (Galaxy/Cluster/Binary), 5 themes |
+| `gyroscope` | 3D rigid-body gyroscope — quaternion orientation (no gimbal lock), Gram-Schmidt re-ortho safeguard; 3 presets: Euler's Top (torque-free symmetric, angular momentum cone), Gravity Top (precession + nutation, wobble tightens with spin), Dzhanibekov (asymmetric torque-free, flip instability) |
+| `spring_pendulum` | Spring pendulum — Lagrangian polar-coordinate EOM (r, θ); energy exchange resonance when ω_spring ≈ 2×ω_pendulum; rosette path tracing |
+| `2stroke` | 2-stroke engine animation — slider-crank kinematics; crank/connecting-rod/piston geometry per θ; exhaust + transfer ports open/close; TDC spark; real-time cycle phase label |
 
 ### Fractals & Chaos
 | Program | Algorithm |
@@ -77,6 +81,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `burning_ship` | Modified Mandelbrot with abs() trick |
 | `bifurcation` | Logistic map, Feigenbaum period-doubling route to chaos |
 | `apollonian` | Descartes' circle theorem, recursive circle packing |
+| `l_system` | General L-system — 5 presets (Dragon Curve, Hilbert Curve, Sierpinski Arrow, Branching Plant, Koch Snowflake); string rewrite production rules; turtle graphics rendering; generation-by-generation growth animation |
 | `lorenz` | Strange attractor — RK4, rotating projection |
 
 ### Cellular Automata & Life
@@ -95,6 +100,9 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `raymarcher` | Sphere-marching SDF — Blinn-Phong, gamma correction |
 | `raymarcher_cube` | SDF box — finite-difference normals, shadow ray |
 | `raymarcher_primitives` | SDF boolean composition (min/max) — sphere/box/torus/capsule/cone |
+| `sdf_gallery` | SDF composition gallery — 5 scenes: smooth-union blend, boolean ops, twist deformation, domain repetition, organic sculpt; 3 lighting modes (N·V / Phong / Flat); 5 themes |
+| `mandelbulb_explorer` | 3D Mandelbulb raymarcher — spherical-power DE, tetrahedral normals, smooth-iter coloring, orbit traps, AO, soft shadows, progressive rendering, 2×2 supersampling toggle, 8 themes |
+| `mandelbulb_raster` | Mandelbulb rasterizer — UV-sphere tessellation (~1800 triangles) built once at startup; MVP + z-buffer; per-vertex smooth-iter + normal; HSV fragment shaders; 4 shader modes (hue/normals/depth/Phong) |
 | `torus_raster` | UV rasterizer — Phong/toon/normal/wireframe shaders, back-face cull |
 | `cube_raster` / `sphere_raster` | Full software rasterizer pipeline |
 | `displace_raster` | Real-time vertex displacement, central-difference normal recompute |
@@ -108,6 +116,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `cube_raytrace` | AABB slab method — inverse-rotation ray transform, face-normal colour, pixel-perfect wireframe, 6 themes |
 | `torus_raytrace` | Quartic intersection (sampling + bisection) — ring in XZ plane, gradient normal, Fresnel, 6 themes |
 | `capsule_raytrace` | Cylinder + hemisphere caps — axial projection body normal, cap sphere normal, inverse-rotation transform, 6 themes |
+| `path_tracer` | Monte Carlo path tracer — Lambertian BRDF, cosine hemisphere sampling (Malley's method), Russian roulette termination, progressive per-pixel accumulator, Reinhard tone map + gamma, Cornell Box scene with color bleeding |
 
 ### Emergent Systems
 | Program | Algorithm |
@@ -136,6 +145,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 |---------|-----------|
 | `epicycles` | DFT epicycles — sorted-by-amplitude arm chain, convergence animation |
 | `fourier_art` | User-drawn path → Fourier reconstruction — draw any shape with cursor keys, arc-length resample to 256 pts, O(N²) DFT, epicycle arm chain replay with auto-add convergence, 5 themes |
+| `fft_vis` | Cooley-Tukey FFT visualiser — bit-reversal permutation, radix-2 butterfly O(N log N), live time-domain + frequency-domain dual panel, twiddle factors W_N^k = exp(−2πik/N), 3-component sine mixer |
 | `cymatics` | Chladni figures — 2D standing wave nodal lines, 20 modes |
 | `plasma` | Demoscene: 4-component sin-sum, palette cycling |
 | `aurora` | Multi-octave sinusoidal curtains, deterministic star hash |
@@ -155,6 +165,9 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `matrix_snowflake` | Matrix rain + live DLA snowflake — two real simulations on one screen: classic digital rain in the background; a D6-symmetric DLA ice crystal grows from the center in the foreground, freezing 12 symmetric positions per walker stick event; crystal flashes white on completion then resets; 5 themes (Classic/Inferno/Nebula/Toxic/Gold) |
 | `led_number_morph` | Particle digit morphing — 168 particles form a scaled 7-segment LED display; particles belong permanently to one segment and spring to their targets when the segment is lit, drift to centre when dark; orientation-aware chars ('-' horizontal, '|' vertical) for formed segments; scales with terminal height; 5 themes with per-digit colours; `n` skip, `]`/`[` speed |
 | `particle_number_morph` | Solid filled particle morphing — up to 500 particles densely pack the full interior of a 9×7 bitmap font digit; greedy nearest-neighbour matching routes every particle to its closest target; positions lerp with smoothstep easing (no spring/velocity) for a clean deterministic glide; idle particles glide to centre and vanish; `f`/`F` morph speed, `]`/`[` hold time; 5 themes |
+| `dune_rocket` | Dune-universe rocket launch — particle exhaust trails, `+/-` launch rate, `Space` salvo burst |
+| `dune_sandworm` | Dune sandworm — sinusoidal body locomotion, surface breach animation, `Space` trigger breach, `+/-` speed |
+| `sand_art` | Hourglass sand art — 5-layer coloured falling-sand CA; gravity-flip on `Space`; scan sweeps away from gravity so grains never move twice per tick; `R` pour fresh layers |
 ### Algorithms
 | Program | Algorithm |
 |---------|-----------|
@@ -226,7 +239,7 @@ See `Claude.md` for the complete build list.
 ├── fractal_random/    — Mandelbrot, Julia, Newton, Apollonian, terrain, Perlin landscape
 ├── geometry/          — parametric curves, grids, computational geometry (lissajous, voronoi, convex hull…)
 ├── matrix_rain/       — Matrix rain variants (classic rain, DLA snowflake hybrid)
-├── misc/              — sorting, maze, CA music
+├── misc/              — sorting, maze, forest fire
 ├── particle_systems/  — fire, fireworks, explosions
 ├── physics/           — Lorenz, N-body, cloth, pendulums, Ising, Schrödinger, Schwarzschild black hole
 ├── raster/            — software rasterizer (torus, cube, sphere)
@@ -237,7 +250,7 @@ See `Claude.md` for the complete build list.
     ├── Claude.md          — complete build reference
     └── learning/
         ├── ROADMAP.md         — 6-tier study order, 2-year plan
-        └── concept_*.md       — 96 deep-dive concept files
+        └── concept_*.md       — 101 deep-dive concept files
                                  (math → pseudocode → implementation notes)
 ```
 
@@ -245,7 +258,7 @@ See `Claude.md` for the complete build list.
 
 ## Documentation
 
-`documentation/learning/` contains 97 concept files — one per program. Each file has two passes:
+`documentation/learning/` contains 101 concept files — one per program. Each file has two passes:
 
 - **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
 - **Pass 2** — pseudocode, module map, data flow diagram, core loop

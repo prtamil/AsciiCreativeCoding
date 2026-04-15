@@ -51,6 +51,8 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `matrix_snowflake.c` | Matrix rain + live DLA crystal | two-simulation layering (rain background / DLA foreground), D6 symmetry with aspect correction, proximity-spawn DLA optimisation, flash/reset lifecycle, 5 themes |
 | `fourier_art.c` | User-drawn path → Fourier epicycles | DRAW→PLAY state machine, arc-length resampling, O(N²) DFT, amplitude-sorted epicycle chain, auto-add convergence |
 | `galaxy.c` | Spiral galaxy — differential rotation | flat rotation curve ω=v₀/r, logarithmic spiral arm init, brightness accumulator + frame decay, radial colour zones |
+| `fft_vis.c` | Cooley-Tukey FFT visualiser | bit-reversal permutation, radix-2 butterfly O(N log N), time vs frequency panel, twiddle factors W_N^k = exp(-2πik/N) |
+
 ---
 
 ## Tier 2 — Simulation Basics (2–3 months)
@@ -88,6 +90,8 @@ Requires partial differential equations and numerical stability.
 | `flowfield.c` | Vector field | fBm Perlin noise |
 | `navier_stokes.c` | Stable fluid | Gauss-Seidel, projection, advection |
 | `lenia.c` | Continuous GoL | convolution kernel, growth fn |
+| `marching_squares.c` | Isosurface extraction | 16-case 4-bit lookup, linear edge interpolation, metaball scalar field |
+| `fluid_sph.c` | SPH particle fluid | kernel density estimation (w=(d/H−1)²), pressure + viscosity forces, symplectic Euler, O(N·k) linked-list spatial grid |
 
 ---
 

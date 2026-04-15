@@ -37,6 +37,33 @@
  * §1 config  §2 clock  §3 color  §4 physics  §5 scene  §6 draw  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Exact rotation integration for charged particle motion.
+ *                  Instead of Euler-approximating the Lorentz force (which
+ *                  introduces spiral drift errors), each step applies an exact
+ *                  2D rotation matrix R(ω·dt) to the velocity vector.
+ *                  This preserves the orbital radius exactly (no energy drift)
+ *                  — a key advantage over naive force integration for circular motion.
+ *
+ * Physics        : Lorentz force in a uniform B-field (perpendicular to screen):
+ *                    F = q · v × B  → angular velocity ω = (q/m) · B
+ *                  The cyclotron radius r = |v| / |ω| = m·|v| / (q·B).
+ *                  Higher q/m → tighter curve (electrons), lower → gentle arc (protons).
+ *                  Ionisation energy loss: |v| multiplied by (1−DRAG) each step →
+ *                  the orbit spirals inward as the particle slows, exactly like
+ *                  real bubble chamber tracks photographed in particle physics labs.
+ *
+ * Math           : Rotation matrix application:
+ *                    v_x' = v_x · cos(ω) − v_y · sin(ω)
+ *                    v_y' = v_x · sin(ω) + v_y · cos(ω)
+ *                  Each particle stores a ring-buffer of TRAIL_LEN=300 positions;
+ *                  the head index advances each step, overwriting the oldest.
+ *
+ * Performance    : STEPS_PER_FRAME=4 sub-steps smooth the curvature at 30fps.
+ *                  Cost: O(MAX_PARTICLES × TRAIL_LEN) drawing + O(MAX_PARTICLES) physics.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>
@@ -62,10 +89,13 @@
 #define B_STEP        0.1f
 
 /* particle motion */
-#define V_SPAWN       2.2f    /* initial speed (physics units / step)       */
-#define V_SPREAD      0.4f    /* ± random fraction of V_SPAWN               */
-#define DRAG          0.003f  /* fractional speed lost per step (ionisation)*/
-#define SPEED_DEAD    0.22f   /* particle "stops" below this speed          */
+#define V_SPAWN       2.2f    /* initial speed in cell/step; at STEPS_PER_FRAME=4,
+                                * electron (qm=0.20, B=1.0) cyclotron radius ≈ 11 cells */
+#define V_SPREAD      0.4f    /* ±40% speed variation for visual spread of radii        */
+#define DRAG          0.003f  /* 0.3% speed loss per step (ionisation); particle covers
+                                * ~1/0.003 ≈ 333 steps before halving — trails ~1000 px */
+#define SPEED_DEAD    0.22f   /* stop when radius < 1 cell (V/ω < 1); prevents
+                                * particles spinning invisibly in a single cell         */
 
 /* spawn */
 #define BURST_MIN      2      /* particles per burst                        */

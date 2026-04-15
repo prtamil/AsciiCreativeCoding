@@ -44,6 +44,35 @@
  * Sections: §1 config  §2 clock  §3 color  §4 hex  §5 grid  §6 draw  §7 screen  §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : FHP-I Lattice Gas Automaton (Frisch, Hasslacher, Pomeau 1986).
+ *                  A cellular automaton where each cell holds 6 bits —
+ *                  one per hexagonal lattice direction (0–5).  Each tick:
+ *                    1. COLLISION: particles in same cell swap according to
+ *                       lookup table that conserves mass and momentum.
+ *                    2. STREAMING: each particle hops one cell in its direction.
+ *
+ * Physics        : Emergent hydrodynamics.
+ *                  The H-theorem guarantees that many FHP particles, averaged
+ *                  over many cells, obey the Navier-Stokes equations.
+ *                  This is a proof that macroscopic fluid behaviour arises
+ *                  purely from microscopic conservation laws — no explicit PDEs.
+ *                  The hexagonal grid removes velocity-space anisotropy that
+ *                  afflicted earlier square-lattice gas models.
+ *
+ * Rendering      : 3×3 spatial averaging before display.
+ *                  Individual cells are binary (particle or no particle), too
+ *                  noisy to show macroscopic flow.  Averaging over 9 cells
+ *                  gives the local particle density ρ and mean momentum ⟨p⟩.
+ *                  These map to color (velocity direction) and character
+ *                  (density level) for smooth visualisation.
+ *
+ * Performance    : O(W×H) per step — one lookup per cell.  The collision
+ *                  table is precomputed at init.  Very cache-friendly since
+ *                  each cell is a single byte.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <signal.h>

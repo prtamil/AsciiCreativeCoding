@@ -28,6 +28,35 @@
  * §1 config  §2 clock  §3 color  §4 grid  §5 presets  §6 scene  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Explicit (Forward) Euler integration of a 2-variable PDE.
+ *                  Each tick: compute Laplacian ∇²u with a 5-point stencil,
+ *                  evaluate reaction terms, update u and v from du/dt and dv/dt.
+ *                  Unlike Gray-Scott (autocatalytic), FitzHugh-Nagumo has a
+ *                  single nonlinear term (u³) making it analytically tractable.
+ *
+ * Physics/Biology: Models cardiac action potentials (Hodgkin-Huxley simplified).
+ *                  u = membrane voltage (fast activator, fires then spikes).
+ *                  v = recovery variable (slow inhibitor, restores resting state).
+ *                  A stimulus above threshold triggers a full action potential;
+ *                  the refractory period (v recovery) prevents back-propagation —
+ *                  this is why heart-muscle waves travel as rings, not balls.
+ *
+ * Math           : FitzHugh-Nagumo equations (1961/1962):
+ *                    du/dt = u − u³/3 − v + D·∇²u + I
+ *                    dv/dt = ε·(u + a − b·v)
+ *                  Fixed point: u* ≈ −1.2, v* ≈ −0.625 (resting state).
+ *                  Stability requires: FN_DT · FN_D / dx² < 0.25 (CFL).
+ *                  FN_EPS = 0.08 sets the v/u time-scale ratio; small ε →
+ *                  slow inhibitor → longer action potential duration.
+ *
+ * Performance    : STEPS_PER_FRAME=8 sub-steps maintain CFL stability while
+ *                  displaying at 30 fps. Without sub-stepping, a single
+ *                  larger dt would violate CFL and produce NaN or blow-up.
+ *                  O(W×H) per step with a fixed 5-point Laplacian stencil.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -47,18 +76,25 @@
 /* ===================================================================== */
 
 /* FitzHugh-Nagumo parameters (excitable regime) */
-#define FN_A    0.70f   /* threshold shift                       */
-#define FN_B    0.80f   /* inhibitor feedback                    */
-#define FN_EPS  0.08f   /* ratio of time scales (slow inhibitor) */
-#define FN_D    0.10f   /* activator diffusion coefficient        */
-#define FN_DT   0.04f   /* explicit Euler timestep               */
+#define FN_A    0.70f   /* threshold shift: sets resting u* position;
+                         * higher a → more negative rest potential       */
+#define FN_B    0.80f   /* inhibitor feedback strength; b < 1 gives
+                         * oscillatory solutions, b ≥ 1 gives excitable  */
+#define FN_EPS  0.08f   /* v/u time-scale ratio (ε ≪ 1 = slow inhibitor);
+                         * 0.08 → v relaxes ~12× slower than u           */
+#define FN_D    0.10f   /* activator diffusion; only u diffuses (v fixed);
+                         * controls wave speed: faster D → wider faster rings */
+#define FN_DT   0.04f   /* explicit Euler timestep; CFL limit: DT·D < 0.25
+                         * with dx=1 → max DT=2.5; 0.04 gives ample margin */
 
 /* Resting-state fixed point (u* satisfies bu*³/3 − (b−1)u* = a) */
 #define U_REST  (-1.20f)
-#define V_REST  (-0.625f)
-#define U_KICK   2.00f   /* value injected for a suprathreshold stimulus */
+#define V_REST  (-0.625f)   /* V_REST = (U_REST + FN_A) / FN_B = 0.1/0.8 ≈ computed */
+#define U_KICK   2.00f      /* suprathreshold kick: U_KICK >> U_REST ensures the
+                              * stimulus is well above the activation threshold      */
 
-#define STEPS_PER_FRAME  8    /* sim steps per rendered frame              */
+#define STEPS_PER_FRAME  8    /* sub-steps per rendered frame; keeps the effective
+                                * dt = FN_DT/1 small while rendering at 30 fps      */
 #define RENDER_NS        (1000000000LL / 30)
 
 #define GRID_W_MAX  320

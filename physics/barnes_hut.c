@@ -55,6 +55,34 @@
  *   gcc -std=c11 -O2 -Wall -Wextra physics/barnes_hut.c -o barnes_hut -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Barnes-Hut tree-code (Barnes & Hut, 1986).
+ *                  Reduces N-body gravitational force from O(N²) to O(N log N)
+ *                  by grouping distant bodies into their centre-of-mass using a
+ *                  quadtree.  The approximation criterion θ (opening angle):
+ *                    if s/d < θ → accept the node as a point mass
+ *                    else       → recurse into children
+ *                  Smaller θ → more accurate, more expensive; θ=0 → exact O(N²).
+ *
+ * Physics        : Softened Newtonian gravity:
+ *                    F = G · mᵢ · Mⱼ / (d² + ε²)^(3/2)  (in 2-D pixel space)
+ *                  Softening ε² prevents singularities at close approach (r→0).
+ *                  Galaxy preset uses Keplerian IC: v_orbit = √(G·M_central / r)
+ *                  so each body starts in a circular orbit — differential rotation
+ *                  then winds the disk into spiral arms over time.
+ *
+ * Data-structure : Quadtree with a pre-allocated node pool (NODE_POOL_MAX nodes).
+ *                  Pool avoids dynamic malloc per node; rebuilt each tick.
+ *                  Leaves store one body index; internal nodes store aggregated
+ *                  (total_mass, cx, cy) = centre of mass of all bodies below.
+ *
+ * Performance    : Typical cost at N=400: ~O(400 × log₂400 × θ_factor) ≈ 3600
+ *                  force evaluations vs 400² / 2 = 80000 for brute force.
+ *                  QT_MAX_DEPTH=32 caps recursion; NODE_POOL_MAX=16000 supports
+ *                  up to 800 bodies in a well-distributed quadtree.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
@@ -101,7 +129,8 @@ enum {
 #define CELL_W          8
 #define CELL_H          16
 
-#define G_DEF           12.0f
+#define G_DEF           12.0f   /* gravitational constant in pixel² units; tuned so
+                                  * galaxy-disk bodies orbit in ~10–20 seconds on screen */
 #define G_STEP          2.0f
 #define G_MIN           1.0f
 #define G_MAX           200.0f

@@ -29,6 +29,30 @@
  * §1 config  §2 clock  §3 color  §4 grid  §5 sources  §6 draw  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : FDTD (Finite-Difference Time-Domain) — explicit Euler.
+ *                  Second-order in both space and time:
+ *                    u[t+1] = 2u[t] − u[t−1] + C²·(u[t]_E + u[t]_W
+ *                                               + u[t]_N + u[t]_S − 4u[t])
+ *                  Requires TWO time levels (t and t−1) stored — hence two
+ *                  alternating grids g0, g1.
+ *
+ * Physics        : Wave equation, Huygens' principle.
+ *                  Every point on a wavefront acts as a new point source.
+ *                  Multiple point sources produce interference: the grid
+ *                  visualises constructive/destructive interference directly.
+ *
+ * Stability      : 2D CFL condition: c·dt/h·√2 < 1.
+ *                  Here C² = (c·dt/h)² = 0.16 → C·√2 = 0.566 < 1 ✓.
+ *                  Exceeding the CFL limit (e.g. C²=0.5) causes exponential
+ *                  blow-up within a few steps.
+ *
+ * Sponge layer   : BORDER_W cells at the edges absorb outgoing waves.
+ *                  Without absorption, waves reflect at the boundary and
+ *                  create a standing-wave "box" mode.  Sponge damps them.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>
@@ -46,14 +70,31 @@
 #define GRID_H_MAX  100
 #define HUD_ROWS      2
 
-#define C2         0.16f    /* (c·dt/h)²: CFL = 0.40, stable in 2D ✓ */
-#define DAMP       0.999f   /* per-step global damping                 */
-#define BORDER_W   4        /* sponge-layer width (cells)              */
-#define BORDER_DAMP 0.80f   /* damping factor at sponge cells          */
+/* C2: (c·dt/h)² where c=wave speed, dt=time step, h=cell spacing.
+ * Value 0.16 = 0.4² → CFL = c·dt/h = 0.4.  2D stability needs CFL·√2 < 1
+ * → 0.4·1.41 = 0.566 < 1 ✓.  C2=0.5 would give CFL·√2=1.0 (marginal). */
+#define C2         0.16f
 
+/* DAMP: per-step global amplitude decay factor (0–1).
+ * 0.999^1000 ≈ 0.37 → waves lose 63% amplitude in 1000 steps.
+ * Models energy loss (real fluids dissipate wave energy slowly).          */
+#define DAMP       0.999f
+
+/* Sponge/PML (Perfectly Matched Layer) absorbing boundary:
+ * BORDER_W cells at edges are extra-damped to kill reflections.
+ * BORDER_DAMP=0.80: each step in the sponge retains only 80% amplitude,
+ * so a 4-cell-wide sponge reduces amplitude by 0.8^4 = 0.41.             */
+#define BORDER_W   4
+#define BORDER_DAMP 0.80f
+
+/* IMPULSE_AMP: amplitude of a SPACE-key point impulse (arbitrary units).  */
 #define IMPULSE_AMP  4.0f
+
+/* OSC_AMP: oscillating source amplitude; OSC_FREQ: cycles per step (rad).
+ * At OSC_FREQ=0.20 rad/step, one full cycle = 2π/0.20 ≈ 31 steps.
+ * At 30 fps × STEPS_PER_FRAME=4, that's ~0.26 s per wave period.         */
 #define OSC_AMP      0.50f
-#define OSC_FREQ     0.20f  /* oscillator frequency (radians/step)     */
+#define OSC_FREQ     0.20f
 
 #define STEPS_PER_FRAME  4
 #define RENDER_NS        (1000000000LL / 30)

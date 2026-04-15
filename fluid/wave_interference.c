@@ -38,6 +38,32 @@
  * §1 config  §2 clock  §3 color  §4 sources  §5 presets  §6 draw  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Analytic (closed-form) superposition — no PDE integration.
+ *                  Unlike FDTD wave.c, there is no grid state and no stability
+ *                  condition.  Each frame recomputes u(x,y,t) = Σ sin(ωt − kr + φ)
+ *                  directly, so the result is exact and can be paused/resumed
+ *                  without losing transient warmup time.
+ *
+ * Physics        : Cylindrical waves (Huygens' principle).  Each source emits:
+ *                    u_i = A · sin(ω_i · t − k_i · r_i + φ_i)
+ *                  where k_i = 2π / λ_i is the wave number.  Superposition
+ *                  (linear wave equation) gives the total field u = Σ u_i.
+ *                  Constructive interference (crests adding): u ≈ N·A.
+ *                  Destructive interference (cancellation): u ≈ 0.
+ *
+ * Math           : Phase precomputation: the spatial phase term k·r is computed
+ *                  once per source per grid cell into a precomputed array.
+ *                  Per frame cost = N_sources × W × H × sinf() calls.
+ *                  Aspect correction: r uses pixel-space distance
+ *                  (CELL_W=8, CELL_H=16) so waves appear circular on screen.
+ *
+ * Performance    : Fully analytic — no time-stepping means no CFL constraints.
+ *                  Phase precomputation amortises the distance calculation;
+ *                  per-frame cost O(N_SRC × W × H) with a single sinf() per cell.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>
@@ -61,8 +87,10 @@
 
 /* Source defaults */
 #define N_SRC_MAX    8
-#define OMEGA_DEF    0.15f   /* rad/frame — 1 cycle ≈ 42 frames ≈ 1.4 s  */
-#define LAMBDA_DEF  20.0f   /* wavelength in terminal columns              */
+#define OMEGA_DEF    0.15f   /* angular frequency; 1 cycle = 2π/0.15 ≈ 42 frames ≈ 1.4s
+                              * at 30fps; tuned so waves visually resemble water ripples */
+#define LAMBDA_DEF  20.0f   /* wavelength in terminal columns; k = 2π/LAMBDA_DEF ≈ 0.31;
+                              * shorter wavelength → tighter fringes               */
 #define OMEGA_STEP   0.01f
 #define LAMBDA_STEP  2.0f
 #define LAMBDA_MIN   6.0f

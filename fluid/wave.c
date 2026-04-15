@@ -42,6 +42,31 @@
  *            §6 scene   §7 screen §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : FDTD (Finite Difference Time Domain) integration of the
+ *                  scalar 2-D wave equation using the 2nd-order explicit scheme.
+ *                  Unlike the wave_2d.c sponge-boundary variant, this one uses
+ *                  multiple independent oscillating sources that drive the field
+ *                  continuously, creating persistent standing/travelling waves.
+ *
+ * Physics        : ∂²u/∂t² = c²·∇²u — the classical wave equation.
+ *                  Discretised: u_new = 2u − u_prev + c²·(u_N + u_S + u_E + u_W − 4u)
+ *                  Each of the 5 point sources runs at a slightly different
+ *                  frequency, producing beat patterns and slowly drifting
+ *                  interference fringes between adjacent source pairs.
+ *
+ * Math           : CFL stability condition for 2-D: c · √2 ≤ 1 → c ≤ 0.707.
+ *                  C_SPEED = 0.45 gives CFL number = 0.45·√2 ≈ 0.636.
+ *                  Energy dissipation: multiply by DAMPING_DEFAULT = 0.993 per tick.
+ *                  Without damping, energy accumulates until numerical overflow.
+ *
+ * Performance    : O(W×H) per step.  STEPS_DEFAULT=4 sub-steps per render
+ *                  frame advance the simulation faster without changing CFL.
+ *                  The grid uses three flat arrays (prev/cur/new) for cache
+ *                  efficiency; 2D index is y*W + x (row-major).
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -61,23 +86,28 @@
 /* §1  config                                                             */
 /* ===================================================================== */
 
-#define C_SPEED         0.45f    /* wave speed — CFL: c·√2 ≤ 1            */
-#define C_SQ            (C_SPEED * C_SPEED)
-#define DAMPING_DEFAULT 0.993f   /* per-tick energy loss                   */
+#define C_SPEED         0.45f    /* wave speed in cells/tick; CFL: c·√2 ≤ 1
+                                  * → c ≤ 0.707; 0.45 gives CFL=0.636 (stable) */
+#define C_SQ            (C_SPEED * C_SPEED)   /* precomputed for the FDTD update  */
+#define DAMPING_DEFAULT 0.993f   /* per-tick amplitude retention; 0.993^(4×30)=0.70
+                                  * per second — gentle energy drain without
+                                  * over-damping the visible interference pattern */
 #define DAMPING_STEP    0.002f
-#define DAMPING_MIN     0.960f
-#define DAMPING_MAX     0.999f
+#define DAMPING_MIN     0.960f   /* 0.960^120 ≈ 0.007 — heavy absorption        */
+#define DAMPING_MAX     0.999f   /* near-lossless — energy builds slowly         */
 
-#define STEPS_DEFAULT   4        /* sim steps per render frame             */
+#define STEPS_DEFAULT   4        /* sim sub-steps per render frame; higher values
+                                  * give faster-travelling waves on screen       */
 #define STEPS_MIN       1
 #define STEPS_MAX       16
 #define STEPS_STEP      1
 
-#define SOURCE_AMP      3.0f     /* oscillating source amplitude           */
-#define IMPULSE_AMP     6.0f     /* single-tap impulse amplitude           */
-#define IMPULSE_RADIUS  3        /* cells                                  */
+#define SOURCE_AMP      3.0f     /* oscillating source amplitude in field units  */
+#define IMPULSE_AMP     6.0f     /* single-tap amplitude; 2× source for visibility */
+#define IMPULSE_RADIUS  3        /* cells around tap that get initialised         */
 
-#define MAX_AMP         4.0f     /* display normalisation ceiling          */
+#define MAX_AMP         4.0f     /* display ceiling for normalisation: u/MAX_AMP
+                                  * maps field amplitude to the 8-level colour ramp */
 #define ZERO_BAND       0.04f    /* |u/MAX_AMP| below this → blank         */
 
 #define N_LEVELS        4        /* ramp levels per sign (trough / crest)  */

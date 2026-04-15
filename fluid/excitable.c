@@ -31,6 +31,35 @@
  * §1 config  §2 clock  §3 color  §4 grid  §5 presets  §6 draw  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Greenberg-Hastings automaton (1978).
+ *                  A discrete 3-state CA extended to N states:
+ *                  - State 0 (resting): can be excited by an excited neighbour
+ *                  - State 1 (excited): fires; excites 4-von Neumann neighbours
+ *                  - States 2..N-1 (refractory): cycling back to resting
+ *                  Rule is purely local — each cell looks only at its 4 neighbours.
+ *
+ * Biology        : Models excitable media like cardiac muscle and neural tissue.
+ *                  The refractory period (states 2..N-1) prevents a wave from
+ *                  re-exciting cells it just passed through — this is why
+ *                  electrical waves in the heart travel as ordered rings rather
+ *                  than spreading chaotically in all directions.
+ *                  Spirals emerge from broken wave fronts: the open end of the
+ *                  front finds susceptible (resting) cells to its side and curls.
+ *
+ * Math           : N (total states) tunes two competing timescales:
+ *                    - Excitation time: fixed at 1 step
+ *                    - Refractory period: N−2 steps
+ *                  Small N (N=5): refractory period=3 steps → dense fast waves.
+ *                  Large N (N=20): refractory period=18 steps → sparse slow waves.
+ *
+ * Performance    : O(W×H) per step.  Double-buffering (cur/nxt arrays) ensures
+ *                  each cell's next state depends on the current-tick neighbours
+ *                  only, not mid-tick updates.  STEP_NS = 1/15s independent of
+ *                  RENDER_NS = 1/30s so the CA runs at half display rate.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>
@@ -47,12 +76,13 @@
 #define GRID_H_MAX  120
 #define GRID_W_MAX  360
 
-#define N_MIN         5    /* minimum refractory depth */
-#define N_MAX        20    /* maximum — also max color pairs allocated */
-#define N_DEF        12    /* default */
+#define N_MIN         5    /* N=5: refractory period = 3 steps (dense fast spirals)  */
+#define N_MAX        20    /* N=20: refractory period = 18 steps (sparse slow waves) */
+#define N_DEF        12    /* N=12: refractory = 10 steps; good balance of density   */
 
-#define RENDER_NS  (1000000000LL / 30)   /* display: 30 fps  */
-#define STEP_NS    (1000000000LL / 15)   /* CA step: 15 /sec */
+#define RENDER_NS  (1000000000LL / 30)   /* display: 30 fps                        */
+#define STEP_NS    (1000000000LL / 15)   /* CA step: 15 steps/sec = 1 step per 2 frames;
+                                          * slower than render so motion is smooth   */
 #define HUD_ROWS    2
 #define N_THEMES    5
 

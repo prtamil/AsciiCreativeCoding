@@ -37,6 +37,34 @@
  *   §9  app       — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Flow field visualisation via particle tracing.
+ *                  A vector field V(x,y) is sampled by hundreds of particles
+ *                  that each move one step per tick in the direction V gives.
+ *                  This is Lagrangian particle advection: dx/dt = V(x,t).
+ *                  Particles leave fading trail marks on the grid, building up
+ *                  a visual record of the flow structure (streamlines).
+ *
+ * Math           : Vector field from layered Perlin noise:
+ *                    angle(x,y,t) = Σ_octave noise(x·f^i, y·f^i, t·f^i) × A^i
+ *                  The angle drives a unit vector (cos θ, sin θ).
+ *                  Layered octaves (each ×f frequency, ×A amplitude) create
+ *                  fractal turbulence — broad low-frequency swirls with
+ *                  fine-detail perturbations superimposed.
+ *
+ * Data-structure : Each particle stores a ring buffer of TRAIL_LEN recent
+ *                  positions.  On each tick the oldest position is evicted and
+ *                  the new position is pushed, making trail management O(1).
+ *                  The particle lifetime counter respawns dead particles at a
+ *                  random location to maintain a steady visual density.
+ *
+ * Performance    : O(N_PARTICLES × TRAIL_LEN) drawing + O(W×H) field update.
+ *                  Perlin noise is the bottleneck: W×H noise evaluations per
+ *                  field rebuild. FIELD_EVOLVE_SPEED controls how often the
+ *                  field is rebuilt — lower rates amortise the rebuild cost.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

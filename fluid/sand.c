@@ -50,6 +50,38 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Cellular Automaton (CA) with probabilistic update order.
+ *                  Rules applied bottom-to-top (row y = rows-1 → 0) so grains
+ *                  that fell this tick don't cascade infinitely in one step.
+ *                  Column order is shuffled each row to prevent directional bias
+ *                  (without shuffling, sand would always prefer the left diagonal).
+ *
+ * Physics        : Models angle of repose — the maximum slope stable sand can
+ *                  maintain before avalanching.  The two-diagonal CA rule
+ *                  approximates this: a grain slides diagonally if the cell
+ *                  directly below is blocked, creating ~45° pile slopes.
+ *                  Real dry sand angle of repose ≈ 30–35°; CA gives ~45° because
+ *                  only one diagonal is checked at a time (no multi-step sliding).
+ *
+ * Wind           : Probabilistic horizontal drift for unsettled grains
+ *                  (age < AGE_SMALL).  P(drift) = |wind| / WIND_PROB_DEN.
+ *                  Only young grains drift — settled sand is too heavy to move,
+ *                  matching the physical model of light airborne particles.
+ *
+ * Performance    : O(W×H) per tick. The `moved[]` flag array prevents double-
+ *                  processing; without it a grain could move multiple cells per
+ *                  tick. Per-tick scratch arrays (nxt, nxt_age) avoid in-place
+ *                  mutation during the scan (double-buffering pattern).
+ *
+ * Visual model   : Per-grain age (stationary ticks) encodes visual compaction.
+ *                  Age resets to 0 on any movement. This gives a natural visual
+ *                  where freshly fallen grains glow bright and gradually darken
+ *                  as they become buried — analogous to porosity decreasing under
+ *                  compressive weight in real granular materials.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>
@@ -79,15 +111,22 @@ enum {
     SOURCE_W_MIN     =  1,
     SOURCE_W_MAX     = 30,
 
-    WIND_MAX         =  3,   /* max wind strength                        */
+    WIND_MAX         =  3,   /* max wind strength (1=gentle drift, 3=strong gale) */
 
-    /* Age thresholds — stationary ticks before next visual level */
+    /* Age thresholds — stationary ticks before advancing to next visual level.
+     * At 30 fps: AGE_DOT=3 ticks ≈ 0.1s (airborne → landed),
+     *            AGE_SMALL=12 ticks ≈ 0.4s (landed → settling),
+     *            AGE_MID=30 ticks ≈ 1.0s (settling → settled surface),
+     *            AGE_PACK=60 ticks ≈ 2.0s (settled → compressed mid),
+     *            AGE_DENSE=120 ticks ≈ 4.0s (compressed → dense base).
+     * Longer thresholds at deeper levels mimic real sand compaction:
+     * surface grains re-arrange quickly; deep grains are locked in place. */
     AGE_DOT    =   3,
     AGE_SMALL  =  12,
     AGE_MID    =  30,
     AGE_PACK   =  60,
     AGE_DENSE  = 120,
-    AGE_MAX    = 200,
+    AGE_MAX    = 200,   /* cap: prevents uint8 overflow (200 < 255)          */
 };
 
 #define NS_PER_SEC    1000000000LL

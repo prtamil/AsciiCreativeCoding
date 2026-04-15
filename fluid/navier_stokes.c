@@ -22,6 +22,31 @@
  * §1 config  §2 clock  §3 color  §4 fluid  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Jos Stam's "Stable Fluids" (SIGGRAPH 1999).
+ *                  Operator-splitting approach: separately handles diffusion,
+ *                  projection (divergence removal), and advection.
+ *                  Each sub-step is unconditionally stable → no CFL limit.
+ *
+ * Physics        : Incompressible Navier-Stokes equations:
+ *                    ∂u/∂t = −(u·∇)u + ν∇²u + f    (momentum)
+ *                    ∇·u = 0                          (incompressibility)
+ *                  The projection step enforces ∇·u=0 via a Poisson solve
+ *                  for the pressure correction field.
+ *
+ * Math           : Gauss-Seidel iteration solves both the diffusion and
+ *                  pressure Poisson systems.  ITER=16 is enough for the
+ *                  grid size N=80: residual decays geometrically per pass.
+ *                  Semi-Lagrangian advection (back-trace + bilinear interp)
+ *                  is first-order accurate but unconditionally stable for
+ *                  large dt — the key advantage over explicit methods.
+ *
+ * Performance    : O(N²·ITER) per frame for an N×N grid.
+ *                  At N=80, ITER=16: ~100k operations per step, trivial at 30 fps.
+ *                  Larger ITER → less "leaky" incompressibility, more CPU.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>
@@ -35,13 +60,20 @@
 /* §1  config                                                             */
 /* ===================================================================== */
 
-#define N       80      /* grid cells per side (N×N internal, with 2 ghost cols) */
-#define ITER    16      /* Gauss-Seidel iterations */
-#define DT      0.05f
-#define DIFF    0.0001f /* diffusion coefficient (viscosity) */
-#define VISC_INIT 0.00001f
-#define FORCE   50.f
-#define SOURCE  50.f
+#define N       80      /* grid cells per side.  N=80 fits most terminals;
+                          * total cells = N²=6400 (fast for 30 fps at ITER=16). */
+#define ITER    16      /* Gauss-Seidel iterations for diffusion and projection.
+                          * More → less divergence leakage but more CPU.         */
+#define DT      0.05f   /* simulation time step (arbitrary units).
+                          * Stable Fluids is unconditionally stable: no CFL bound.
+                          * Larger DT → more "smeared" advection (numerical diffusion). */
+#define DIFF    0.0001f /* background diffusion coefficient (passive scalar).
+                          * Very small so dye blobs persist for visual appeal.   */
+#define VISC_INIT 0.00001f /* initial kinematic viscosity ν.
+                             * Water ≈ 1e-6 m²/s; air ≈ 1.5e-5 m²/s.
+                             * Here units are grid²/step — set low so vortices persist. */
+#define FORCE   50.f    /* arrow-key velocity injection strength (grid/step).    */
+#define SOURCE  50.f    /* SPACE dye injection density (arbitrary dye units).    */
 
 #define RENDER_NS   (1000000000LL / 30)
 #define HUD_ROWS    2

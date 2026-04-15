@@ -39,6 +39,32 @@
  * Sections: §1 config  §2 clock  §3 field  §4 marching  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Marching Squares — the 2-D analogue of Marching Cubes (Lorensen
+ *                  & Cline, 1987).  Classifies each 2×2 cell of the scalar field
+ *                  by a 4-bit index (inside/outside per corner), looks up which
+ *                  of the 16 possible edge-crossing patterns applies, then draws
+ *                  an ASCII character at each crossing position.
+ *
+ * Math           : Metaball potential field: f(x,y) = Σ A_i / r_i²
+ *                  where r_i = distance from point (x,y) to source i.
+ *                  This is the gravitational potential of multiple point masses.
+ *                  When f(x,y) = threshold, the iso-contour is the locus of
+ *                  equal potential — it encircles sources and merges blobs when
+ *                  sources are close enough (classic "organic" metaball look).
+ *
+ * Rendering      : Terminal cells are ~2× taller than wide (ASPECT=0.5).
+ *                  The field is sampled at (col × ASPECT, row) in world space
+ *                  to correct for this and produce circular blobs on screen.
+ *
+ * Performance    : O(W×H) per frame.  The scalar field is re-evaluated at every
+ *                  grid corner each frame (N_BLOBS × W × H evaluations).
+ *                  No caching because blob positions change every frame.
+ *                  Multi-level mode draws 5 iso-contours with one pass over the
+ *                  same pre-evaluated corner values.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -58,18 +84,23 @@
 /* §1  config                                                             */
 /* ===================================================================== */
 
-#define N_BLOBS       4        /* number of metaball sources              */
-#define BLOB_R        0.28f    /* blob influence radius (world units)     */
-#define THRESH_DEF    0.20f    /* default iso-threshold (field ∈ [0,1])   */
+#define N_BLOBS       4        /* 4 metaball sources; more blobs → richer topology  */
+#define BLOB_R        0.28f    /* blob influence radius in normalised [0,1] coords;
+                                * at 0.28 blobs merge and separate as they orbit    */
+#define THRESH_DEF    0.20f    /* iso-threshold in normalised field units;
+                                * lower → more area enclosed (fatter blobs)         */
 #define THRESH_STEP   0.02f
 #define THRESH_MIN    0.02f
 #define THRESH_MAX    0.95f
-#define RENDER_FPS    20
+#define RENDER_FPS    20       /* 20fps for marching squares — computation is heavier
+                                * than simple CA; N_BLOBS × W × H field evaluations */
 #define RENDER_NS    (1000000000LL / RENDER_FPS)
 #define N_THEMES      4
-#define N_LEVELS      5        /* number of iso-levels in multi mode      */
+#define N_LEVELS      5        /* iso-levels in multi mode spaced 0.15 apart in [0,1] */
 
-/* Aspect correction: terminal cells are ~2× taller than wide */
+/* Aspect correction: terminal cells are ~2× taller than wide (CELL_H/CELL_W = 16/8 = 2).
+ * Multiplying x by 0.5 before evaluating f(x,y) compresses the field horizontally,
+ * making circular blobs appear circular on screen despite the non-square cells. */
 #define ASPECT        0.5f
 
 /* ===================================================================== */

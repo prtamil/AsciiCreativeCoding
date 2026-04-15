@@ -54,6 +54,38 @@
  *           §6 scene   §7 screen §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Agent-based simulation — emergent behaviour from local rules.
+ *                  No global coordinator; network topology arises purely from
+ *                  the sense→rotate→move→deposit loop repeated N_AGENTS times
+ *                  per tick. The trail grid mediates indirect communication
+ *                  (stigmergy): agents respond to paths left by earlier agents.
+ *
+ * Biology        : Models Physarum polycephalum (Jeff Jones, 2010).
+ *                  Real slime mold spans food sources with tubular networks that
+ *                  approximate minimum Steiner trees — surprisingly close to
+ *                  optimal transport graphs.  The model captures this using only
+ *                  three sensor readings and a random tie-break rule.
+ *
+ * Math           : Diffusion step is a lerp toward a 3×3 box average:
+ *                    trail' = lerp(trail, avg_3×3(trail), DIFFUSE_W)
+ *                  This is a discrete approximation of the heat equation
+ *                  (∂u/∂t = D·∇²u).  DIFFUSE_W controls the effective
+ *                  diffusion coefficient D.
+ *                  Decay: trail' *= (1 − DECAY_RATE) per tick — exponential
+ *                  fade without diffusion would give trail lifetime ≈ 1/DECAY.
+ *
+ * Performance    : O(N_AGENTS + W×H) per tick.  The trail grid update is the
+ *                  bottleneck: 512×128 ≈ 65K cells × 9-neighbour sum per cell
+ *                  ≈ 590K ops per tick.  Agents cost N_AGENTS × ~15 ops each.
+ *
+ * Data-structure : Two float arrays (g_trail / g_buf) for double-buffering.
+ *                  Agents read and deposit into g_trail; the grid update reads
+ *                  g_trail → writes g_buf → copies back.  This prevents mid-tick
+ *                  positional feedback (a grain reading its own fresh deposit).
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
@@ -77,28 +109,37 @@
 #define COLS_MAX        512
 
 /* Agent population */
-#define N_AGENTS_DEF   2000
-#define N_AGENTS_MIN    200
-#define N_AGENTS_MAX   6000
+#define N_AGENTS_DEF   2000  /* default agent count; 2000 fills ~200×60 grid visually */
+#define N_AGENTS_MIN    200  /* below this, tubes fail to form (too sparse)            */
+#define N_AGENTS_MAX   6000  /* above this, cost > 30fps on typical hardware           */
 #define N_AGENTS_STEP   200
 
 /* Physarum sensor parameters (Jones 2010) */
-#define SENSOR_ANGLE  ((float)M_PI / 4.0f)   /* ±45° from heading      */
-#define SENSOR_DIST    4.0f                   /* cells ahead             */
-#define ROTATE_ANGLE  ((float)M_PI / 4.0f)   /* 45° turn per step       */
-#define STEP_SIZE      1.0f                   /* cells moved per tick    */
+#define SENSOR_ANGLE  ((float)M_PI / 4.0f)   /* ±45° from heading; Jones found 45°
+                                               * gives crisp tubes without over-steering */
+#define SENSOR_DIST    4.0f                   /* cells ahead; smaller→tighter curves,
+                                               * larger→straighter long-range tubes      */
+#define ROTATE_ANGLE  ((float)M_PI / 4.0f)   /* 45° abrupt turn per step — discrete
+                                               * steering; fractional angles give blurry
+                                               * diffuse blobs instead of tubes          */
+#define STEP_SIZE      1.0f                   /* cells moved per tick (1 = one cell)    */
 
 /* Trail parameters */
-#define DEPOSIT_DEF    5.0f    /* trail deposited per agent per tick      */
-#define MAX_TRAIL     100.0f   /* concentration ceiling                   */
-#define DECAY_DEF      0.08f   /* fraction removed per tick               */
-#define DIFFUSE_DEF    0.35f   /* lerp weight toward 3×3 neighbour avg    */
+#define DEPOSIT_DEF    5.0f    /* trail concentration added per agent tick; scales
+                                * with FOOD_BONUS near food sources                    */
+#define MAX_TRAIL     100.0f   /* saturation ceiling; prevents overflow and keeps
+                                * concentration mapping in [0,100] for display         */
+#define DECAY_DEF      0.08f   /* 8% removed per tick → trail lifetime ≈ 1/0.08 = 12.5
+                                * ticks at 30fps ≈ 0.4s half-life without diffusion    */
+#define DIFFUSE_DEF    0.35f   /* lerp weight toward 3×3 average; higher→smoother but
+                                * more blurry network (tubes lose sharp boundaries)    */
 
 /* Food sources */
 #define N_FOOD          3
-#define FOOD_RADIUS     3.0f   /* detection radius (cells)                */
-#define FOOD_BONUS      6.0f   /* deposit multiplier near food            */
-#define FOOD_MIN_TRAIL 30.0f   /* food cells always kept at this floor    */
+#define FOOD_RADIUS     3.0f   /* detection radius in cells (about 3 character widths) */
+#define FOOD_BONUS      6.0f   /* ×6 deposit near food → strong attractor gradient     */
+#define FOOD_MIN_TRAIL 30.0f   /* floor concentration at food cells; prevents food
+                                * sites from fading after most agents move away        */
 
 /* Simulation */
 #define SIM_FPS_DEF    30

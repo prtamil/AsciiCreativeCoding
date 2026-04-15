@@ -36,6 +36,37 @@
  *           §6 scene   §7 screen §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Smoothed Particle Hydrodynamics (SPH) — a Lagrangian
+ *                  meshless method.  Each particle represents a fluid parcel.
+ *                  Density and pressure are estimated by summing contributions
+ *                  from neighbouring particles within the smoothing radius H.
+ *                  No grid is required; the fluid is described entirely by
+ *                  particle positions and velocities.
+ *
+ * Physics        : Tait equation of state: pressure force proportional to
+ *                  (ρᵢ + ρⱼ − 2·ρ_rest).  This is a simplified compressible
+ *                  approximation — real water is nearly incompressible, but SPH
+ *                  enforces incompressibility through a stiff pressure response.
+ *                  Viscosity force: (vᵢ − vⱼ) · V_K smooths velocity differences,
+ *                  preventing particle interpenetration under shear.
+ *
+ * Math           : Kernel w = (H − r) / H for r < H, 0 otherwise (tent function).
+ *                  Density ρᵢ = Σⱼ w²; pressure force along i→j = w·(ρ_rest−ρᵢ−ρⱼ).
+ *                  Negative pressure (ρ < ρ_rest) would pull particles together —
+ *                  this is the surface tension analogue in this simplified model.
+ *
+ * Performance    : Naïve O(N²) pair search replaced by a spatial hash grid (GCELL).
+ *                  GCELL ≥ SMOOTH_RADIUS ensures all neighbours within kernel
+ *                  radius lie in the 3×3 surrounding grid cells.
+ *                  Typical speedup: N / avg_neighbours ≈ 800/15 ≈ 50×.
+ *
+ * Integration    : Symplectic Euler: v += a·dt, x += v·dt (velocity before position).
+ *                  More energy-conserving than standard Euler for oscillatory
+ *                  particle systems; keeps fluid from exploding at stiff contacts.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -57,14 +88,21 @@
 
 #define MAX_PARTICLES   5000
 
-/* SPH constants — kept identical to original */
-#define SMOOTH_RADIUS   2.2
-#define PRESSURE_K      0.04
-#define VISCOSITY_K     0.03
-#define GRAVITY_G       0.08
-#define WALL_DAMPING    0.6
-#define SPH_DT          0.12    /* fixed physics timestep (original DT)  */
-#define REST_SUM        6.0     /* target ρᵢ + ρⱼ at equilibrium         */
+/* SPH constants — tuned for stable visual simulation in cell space */
+#define SMOOTH_RADIUS   2.2    /* kernel support radius H in cell units; particles
+                                * further than H contribute zero kernel weight      */
+#define PRESSURE_K      0.04   /* pressure stiffness; higher → stiffer fluid but
+                                * risks instability (oscillation) at large dt       */
+#define VISCOSITY_K     0.03   /* velocity damping between particle pairs; prevents
+                                * unphysical interpenetration under fast shear      */
+#define GRAVITY_G       0.08   /* gravitational acceleration in cell/step²; low
+                                * value keeps particles from tunnelling through floor */
+#define WALL_DAMPING    0.6    /* velocity retention on wall bounce; 0.6 = 60%
+                                * kinetic energy kept → moderately inelastic walls  */
+#define SPH_DT          0.12   /* fixed physics timestep; Courant condition:
+                                * DT < SMOOTH_RADIUS / v_max; 0.12 works up to ~18 cells/s */
+#define REST_SUM        6.0    /* target density sum ρᵢ + ρⱼ at rest equilibrium;
+                                * pressure = 0 when density matches this value      */
 
 /*
  * Spatial grid for O(N) neighbour search.

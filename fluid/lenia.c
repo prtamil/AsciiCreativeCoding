@@ -29,6 +29,33 @@
  * §1 config  §2 clock  §3 color  §4 kernel  §5 grid  §6 draw  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Continuous cellular automaton with convolution kernel.
+ *                  Each step: convolve the state grid with kernel K (weighted
+ *                  ring), evaluate growth function G, apply update rule.
+ *                  Naïve O(W·H·πR²) convolution — for R=13 and a 200×60 grid
+ *                  that's ~6M ops per step.
+ *
+ * Physics/Biology: Lenia (Bert Wang-Chak Chan, 2019).
+ *                  A continuous generalisation of Conway's Game of Life.
+ *                  The ring kernel captures "neighbourhood density at radius R"
+ *                  — analogous to how a biological cell senses chemical
+ *                  gradients from nearby cells.  Self-organisation emerges
+ *                  from the tension between growth (G>0.5) and decay (G<0.5).
+ *
+ * Math           : Growth function G(x) = exp(−(x−μ)²/(2σ²)).
+ *                  This is a Gaussian centred at μ.  When the kernel
+ *                  convolution result matches μ exactly, G=1 and the cell
+ *                  grows toward 1.  Far from μ, G→0 and the cell decays.
+ *                  The parameter pair (μ, σ) defines a "species" of creature.
+ *
+ * Performance    : The convolution sums weights from all cells within
+ *                  radius R.  Normalised so total kernel weight = 1.
+ *                  Pre-building the kernel O(R²) once amortises the cost
+ *                  across all (W×H) cells per step.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

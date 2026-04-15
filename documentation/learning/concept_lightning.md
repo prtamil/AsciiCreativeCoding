@@ -119,6 +119,14 @@ ST_STRIKING ──── strike_ticks >= STRIKE_TICKS ────┘
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app.scene.grid.cells[GRID_ROWS_MAX][GRID_COLS_MAX]` | `uint8_t[80][300]` | ~24 KB | Frozen bolt channel: encodes direction and depth colour per cell |
+| `g_app.scene.grid.glow[GRID_ROWS_MAX][GRID_COLS_MAX]` | `uint8_t[80][300]` | ~24 KB | Ambient halo level (0=none, 1=outer, 2=inner) per cell |
+| `g_app.scene.tips[MAX_TIPS]` | `Tip[64]` | ~1 KB | Pool of active and inactive growing branch tips |
+
 # Pass 2 — lightning: Pseudocode
 
 ## Module Map

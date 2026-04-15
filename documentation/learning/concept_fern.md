@@ -114,6 +114,16 @@ Identical to sierpinski.c.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_hits[GRID_ROWS_MAX][GRID_COLS_MAX]` | `uint8_t[]` | ~24 KB | presence grid: 1 if any IFS point landed in this cell |
+| `g_col[GRID_ROWS_MAX][GRID_COLS_MAX]` | `uint8_t[]` | ~24 KB | color index per cell (encodes height/y-value) |
+| `g_cx`, `g_cy` | `float` | scalar | current IFS orbit point in math space |
+| `GRID_ROWS_MAX`, `GRID_COLS_MAX` | constants | N/A | maximum grid size (80 × 300) |
+| `CELL_W`, `CELL_H` | `int` constants | N/A | pixel-per-cell aspect ratio (8 × 16) for IFS coordinate mapping |
+
 # Pass 2 — fern: Pseudocode
 
 ## Module Map

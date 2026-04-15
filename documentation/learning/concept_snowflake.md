@@ -108,6 +108,15 @@ There is no DONE hold state; on auto-fill the scene resets immediately.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `scene.grid.cells[80][300]` | `uint8_t[80][300]` | ~24 KB | crystal lattice; value encodes distance-based color band |
+| `scene.walkers[200]` | `Walker[200]` | ~2 KB | active DLA random-walk particles (cx, cy, active flag) |
+| `scene.grid.frozen_count` | `int` | 4 B | total frozen cells in crystal |
+| `scene.grid.cx0`, `scene.grid.cy0` | `int` | 8 B | grid center for D6 symmetry mapping |
+
 # Pass 2 — snowflake: Pseudocode
 
 ## Module Map

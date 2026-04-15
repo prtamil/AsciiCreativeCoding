@@ -376,3 +376,11 @@ The figure rotates at `t * 0.38` rad/s so all four arms are visible over one orb
 5. **smin-based organic sculpting:** composing many simple primitives with smooth-min produces blob-like organic shapes.
 
 **Rendering:** The gallery uses a **stable double-buffer** scheme: `g_fbuf` fills row-by-row while `g_stable` holds the last complete frame. Unfinished rows always show from `g_stable` so the scan frontier is invisible to the user.
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_fbuf[CANVAS_MAX_H][CANVAS_MAX_W]` | `Pixel[55][220]` | ~48 KB | Working framebuffer filled row-by-row each progressive render pass |
+| `g_stable[CANVAS_MAX_H][CANVAS_MAX_W]` | `Pixel[55][220]` | ~48 KB | Last fully-rendered frame shown while the next pass is in progress |
+| `k_palette[N_THEMES][GRAD_N]` | `short[5][8]` | 80 B | 256-color indices for the 5 colour themes × 8 gradient steps |

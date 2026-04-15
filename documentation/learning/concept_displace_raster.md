@@ -124,6 +124,18 @@ Normal recomputation (central difference): `N_new = normalise(∂p'/∂u × ∂p
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `VSIn` / `VSOut` / `FSIn` / `FSOut` | `typedef struct` | ~40–64 B each | shader I/O types: vertex → fragment pipeline |
+| `Uniforms` (struct) | `typedef struct` | ~200 B | MVP matrices, light, camera, displacement time `t` |
+| `g_zbuf[rows×cols]` | `float[]` | ~80 KB | per-cell z-buffer for depth testing |
+| `g_cbuf[rows×cols]` | `Vec3[]` | ~240 KB | per-cell colour accumulator |
+| `CD_EPS` | `float` constant | N/A | central-difference epsilon for normal recompute (0.03 × SPHERE_R) |
+| `TESS_U`, `TESS_V` | `int` constants | N/A | UV sphere tessellation (48 × 32 = 3072 triangles) |
+| `k_bayer[4][4]` | `float[16]` | 64 B | Bayer dither matrix for ASCII density ramp |
+
 # Pass 2 — displace_raster: Pseudocode
 
 ## Module Map

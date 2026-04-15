@@ -59,6 +59,13 @@ Shepherd movement: direct velocity control via arrow keys (no physics, instant r
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_sheep[N_SHEEP_MAX]` | `Sheep[60]` | ~1.4 KB | sheep boid pool |
+| `g_shep` | `Shepherd` | 20 B | player-controlled shepherd position |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

@@ -66,6 +66,14 @@ The curve closes when `(R−r)/r = p/q` (rational ratio). With p=3, q=1: deltoid
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app.scene.sg.canvas[MAX_ROWS][MAX_COLS]` | `float[80][240]` | ~75 KB | Per-cell brightness [0,1] for the fading trail |
+| `g_app.scene.sg.cpair[MAX_ROWS][MAX_COLS]` | `int[80][240]` | ~75 KB | Per-cell colour pair index matching last-written curve |
+| `g_app.scene.sg.curves[N_CURVES]` | `Curve[3]` | ~72 B | R, r, d, phase, drift, and colour for each hypotrochoid |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

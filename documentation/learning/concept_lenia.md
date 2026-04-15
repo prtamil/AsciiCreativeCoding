@@ -55,6 +55,19 @@ Where K is a ring-shaped kernel (exponential shell) and μ,σ parameterize the g
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_u[GRID_H_MAX][GRID_W_MAX]` | `float[60][200]` | ~47 KB | current cell state u ∈ [0,1] |
+| `g_u2[GRID_H_MAX][GRID_W_MAX]` | `float[60][200]` | ~47 KB | scratch buffer for next-step values |
+| `g_kw[(2R+1)²]` | `float[1681]` | ~7 KB | normalised ring-kernel weights |
+| `g_kdr[(2R+1)²]` | `int[1681]` | ~7 KB | kernel row offsets |
+| `g_kdc[(2R+1)²]` | `int[1681]` | ~7 KB | kernel column offsets |
+| `g_kn` | `int` | 4 B | number of active kernel entries after threshold pruning |
+
+---
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

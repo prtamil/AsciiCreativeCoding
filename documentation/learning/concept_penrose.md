@@ -43,6 +43,16 @@ Subdivision (inflation/deflation):
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_angle` | `float` | scalar | current rotation angle of the view (advances at ROTATE_SPEED) |
+| `SCALE_PX` | `float` constant | N/A | pixels per pentagrid unit (80); each rhombus spans ~10 columns |
+| `BORDER` | `float` constant | N/A | distance from grid line drawn as tile edge (0.15 pentagrid units) |
+| `ROTATE_SPEED` | `float` constant | N/A | view rotation rate (0.04 rad/s; full 5-fold period ≈ 31 s) |
+| `CELL_W`, `CELL_H` | `int` constants | N/A | pixel-per-cell (8 × 16) for aspect-correct pentagrid projection |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode (subdivision method)

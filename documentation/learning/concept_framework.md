@@ -75,6 +75,17 @@ Every file follows this sectioned structure:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `KeySlot` (struct) | `typedef struct` | ~16 B | char, rate (changes/sec), timer accumulator |
+| `g_slots[KEY_LEN]` | `KeySlot[26]` | ~416 B | 26 character slots; each cycles independently |
+| `KEY_LEN` | `int` constant | N/A | number of key display slots (26 = one per letter) |
+| `RATE_MIN`, `RATE_MAX` | `float` constants | N/A | slot cycle speed range (4–28 changes/sec) |
+| `SIM_FPS_DEFAULT` | `int` constant | N/A | physics update rate (60 Hz) |
+| `CELL_W`, `CELL_H` | `int` constants | N/A | pixel-per-cell (8 × 16) for aspect-correct pixel space |
+
 ## Pass 2 — Implementation
 
 ### Standard Main Structure

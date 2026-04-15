@@ -56,6 +56,15 @@ age_delta ≤  5    '@' bold   (CP_A0 — newest)
 
 This creates a living gradient: the growing tips glow bright while old interior cells fade to dim characters.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_grid[80][300]` | `uint8_t[80][300]` | ~24 KB | DLA cluster cells: 0=empty, 1=frozen |
+| `g_age[80][300]` | `uint16_t[80][300]` | ~47 KB | frame number when each cell joined (for age-gradient color) |
+| `g_cx`, `g_cy` | `int` | 8 B | grid center coordinates |
+| `g_radius` | `int` | 4 B | Chebyshev radius of cluster (used for launch/kill circle) |
+
 ## Data Structures
 
 ```c

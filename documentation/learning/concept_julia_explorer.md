@@ -132,6 +132,17 @@ Arrow keys move c by `FINE_STEP = 0.015` — small enough to explore detail near
 
 Zooming the Julia view rescales the imaginary half-range `g_j_im_half` by `J_ZOOM_IN = 0.85` per keypress. The real half-range follows via aspect correction. The Mandelbrot panel is unaffected — you always see the full Mandelbrot map, and zoom only affects the Julia display.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_mbuf[GRID_ROWS_MAX][GRID_COLS_MAX/2]` | `uint8_t[]` | ~12 KB | precomputed Mandelbrot color levels (0..7); left panel cache |
+| `g_rows`, `g_cols`, `g_mw`, `g_jw` | `int` | scalar | terminal dimensions and panel widths |
+| `g_cr`, `g_ci` | `float` | scalar | selected Julia parameter c = cr + ci·i (crosshair position) |
+| `g_j_im_half` | `float` | scalar | Julia view imaginary half-range; z/Z keys adjust (default 1.5) |
+| `MAX_ITER` | `int` constant | N/A | iteration cap for both panels (128) |
+| `WANDER_SPEED` | `float` constant | N/A | auto-wander angular velocity (0.006 rad/frame ≈ 35 s orbit) |
+
 ## From the Source
 
 **Algorithm:** Split-screen interactive fractal explorer. Left panel (Mandelbrot): computed once at start/resize and cached — O(W/2 × H × MAX_ITER) up-front. Right panel (Julia): recomputed every frame from the current c position — O(W/2 × H × MAX_ITER) per frame. This trade-off makes Mandelbrot navigation smooth (no per-frame cost) while Julia responds instantly to c changes.

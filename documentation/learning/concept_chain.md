@@ -194,6 +194,17 @@ CONSTRAINT ITERATION:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_chain` | `Chain` | ~5 KB | entire chain state (nodes, trail, wind, preset) |
+| `g_chain.nodes[N_NODES_MAX]` | `ChainNode[32]` | ~512 B | current + previous positions + pinned flag per node |
+| `g_chain.trail_px/py[TRAIL_LEN]` | `float[90]` × 2 | 720 B | ring-buffer trail of last free node pixel positions |
+| `g_rows`, `g_cols` | `int` | 8 B | terminal dimensions, updated on resize |
+| `g_sim_fps` | `int` | 4 B | current simulation rate (Hz) |
+| `g_quit_flag`, `g_resize_flag` | `volatile sig_atomic_t` | 8 B | signal flags for SIGINT/SIGWINCH |
+
 # Pass 2 — chain: Pseudocode
 
 ## Module Map

@@ -211,6 +211,12 @@ making 3D objects pop on a dark terminal.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_themes[]` | `const Theme[6]` | ~288 B | Per-theme diffuse, specular, and three light colour vectors |
+
 # Pass 2 — sphere_raytrace.c: Pseudocode
 
 ## Module Map

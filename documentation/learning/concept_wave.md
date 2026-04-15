@@ -80,3 +80,14 @@ The amplitude is real-valued and can be positive or negative. Rendering both sig
 **Math:** CFL stability: C_SPEED=0.45 gives CFL number = 0.45·√2 ≈ 0.636 (not just "comfortable margin" — the exact value). Energy dissipation: DAMPING_DEFAULT=0.993 per tick; without damping, energy accumulates until numerical overflow.
 
 **Performance:** O(W×H) per step. STEPS_DEFAULT=4 sub-steps per render frame advance the simulation faster without changing CFL. Grid uses three flat arrays (prev/cur/new) for cache efficiency; 2D index is y*W + x (row-major).
+
+---
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `Grid.curr` | `float*` (malloc'd, cols×rows) | ~20 KB at 256×20 | current wave amplitude |
+| `Grid.prev` | `float*` (malloc'd, cols×rows) | ~20 KB | previous-step amplitude (FDTD needs t and t−1) |
+| `Grid.next` | `float*` (malloc'd, cols×rows) | ~20 KB | scratch for next-step; rotated into curr after each step |
+| `g_sources[N_SOURCES]` | `Source[5]` | ~60 B | fractional positions, frequencies, phases, active flags |

@@ -59,6 +59,18 @@ vx2=−0.93240737, vy2=−0.86473146
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_x[3]`, `g_y[3]` | `float[3]` × 2 | 24 B | positions of the three bodies (natural units) |
+| `g_vx[3]`, `g_vy[3]` | `float[3]` × 2 | 24 B | velocities of the three bodies |
+| `g_ax[3]`, `g_ay[3]` | `float[3]` × 2 | 24 B | accelerations (updated by compute_accel each step) |
+| `g_tx[3][TRAIL_MAX]`, `g_ty[3][TRAIL_MAX]` | `float[3][200]` × 2 | 4.8 KB | per-body trail ring-buffers of natural-unit positions |
+| `g_trail_head`, `g_trail_len` | `int` | 8 B | trail ring-buffer write index and draw length |
+| `g_sim_time` | `float` | 4 B | accumulated simulation time in natural units |
+| `g_zoom`, `g_steps` | `float` / `int` | 8 B | view zoom factor and physics steps per rendered frame |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

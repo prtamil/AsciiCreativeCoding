@@ -115,6 +115,17 @@ DRAWING ──── seg_draw_index >= n_segs ────► HOLDING (done_tick
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_segs[MAX_SEGS]` | `struct{float x1,y1,x2,y2}[4096]` | ~64 KB | current-level segment endpoints in normalised coordinate space |
+| `g_n_segs` | `int` | scalar | segment count for current level (3 × 4^level) |
+| `g_draw_idx` | `int` | scalar | index of next segment to draw (animated reveal) |
+| `MAX_SEGS` | `int` constant | N/A | segment array capacity (4096; level 5 needs 3072) |
+| `MAX_LEVEL` | `int` constant | N/A | highest detail level (5) |
+| `ASPECT_R` | `float` constant | N/A | cell height/width ratio (2.0) for circular snowflake |
+
 # Pass 2 — koch: Pseudocode
 
 ## Module Map

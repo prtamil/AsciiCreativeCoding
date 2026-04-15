@@ -52,6 +52,15 @@ row = i * (some vertical step)
 - Convert to axial coordinates — does the neighbor computation simplify?
 - What happens with the "majority rule": born if >3 neighbors, survive if >2?
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_grid[GRID_H_MAX][GRID_W_MAX]` | `int8[60][200]` | ~12 KB | current generation live/dead state |
+| `g_next[GRID_H_MAX][GRID_W_MAX]` | `int8[60][200]` | ~12 KB | next generation scratch buffer |
+| `g_age[GRID_H_MAX][GRID_W_MAX]` | `uint8[60][200]` | ~12 KB | generations a cell has been continuously alive |
+| `g_anext[GRID_H_MAX][GRID_W_MAX]` | `uint8[60][200]` | ~12 KB | next-generation age scratch buffer |
+
 ---
 
 ## Pass 2 — Implementation

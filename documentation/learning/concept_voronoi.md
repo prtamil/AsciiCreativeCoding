@@ -56,6 +56,13 @@ Fortune's algorithm: O(N log N) sweep line, but for ASCII terminal:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app` | `App` | ~400 B | Top-level singleton holding scene, screen, sim_fps, and signal flags |
+| `g_app.scene.voronoi.seeds[N_SEEDS]` | `Seed[24]` | ~384 B | Position, velocity, and colour pair for each Voronoi seed |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

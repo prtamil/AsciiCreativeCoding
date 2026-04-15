@@ -117,6 +117,15 @@ No state machine. Purely continuous physics. One boolean: paused.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `scene.stars[80]` | `Star[80]` | ~2 KB | moving star particles with position, velocity, color |
+| `scene.dpx[80]`, `scene.dpy[80]` | `float[80]` | ~640 B | pixel-space draw positions for lerp interpolation |
+| `scene.dcx[80]`, `scene.dcy[80]` | `int[80]` | ~640 B | terminal cell positions for edge-draw hit-test |
+| `g_app` | `App` | ~4 KB | top-level state: scene, screen, running flags |
+
 # Pass 2 — constellation: Pseudocode
 
 ## Module Map

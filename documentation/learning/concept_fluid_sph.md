@@ -99,6 +99,17 @@ Standard SPH suppresses cohesion (no negative pressure) for stability. This impl
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_p[MAX_PARTICLES]` | `Particle[5000]` | ~320 KB | particle positions, velocities, accelerations, densities |
+| `g_ghead[GMAX_H][GMAX_W]` | `int[22][90]` | ~8 KB | spatial hash grid — head index of linked list per cell |
+| `g_gnext[MAX_PARTICLES]` | `int[5000]` | ~20 KB | next-particle link in spatial grid cell chain |
+| `g_n` | `int` | 4 B | active particle count |
+
+---
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

@@ -59,6 +59,18 @@ BFS/DFS have no cost function — all edges have equal weight.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_px[N_NODES]`, `g_py[N_NODES]` | `float[40]` | 320 B | pixel-space positions of each node |
+| `g_adj[N_NODES][N_NODES]` | `bool[40][40]` | 1600 B | adjacency matrix (symmetric); true if edge exists |
+| `N_NODES` | `int` constant | N/A | graph size (40 nodes) |
+| `K_CONNECT` | `int` constant | N/A | each node connected to K=3 nearest neighbours |
+| `SETTLE_ITERS` | `int` constant | N/A | force-directed layout iterations at startup (250) |
+| `g_src`, `g_goal` | `int` | scalar | source and goal node indices (farthest pair) |
+| `NodeState` | `typedef enum` | scalar | UNVIS / FRONTIER / VISITED / PATH_NODE / SRC / GOAL |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

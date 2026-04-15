@@ -464,6 +464,13 @@ exactly how close to the photon sphere each ray came.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_table[MAX_ROWS][MAX_COLS]` | `Cell[256][512]` | ~10 MB | lensing lookup table: impact type + disk radius per screen pixel |
+| `g_run`, `g_resize` | `volatile sig_atomic_t` | 8 B | signal flags for quit and resize |
+
 # Pass 2 — blackhole.c: Pseudocode
 
 ## Module Map

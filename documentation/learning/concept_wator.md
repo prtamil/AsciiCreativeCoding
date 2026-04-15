@@ -10,6 +10,17 @@ Picture a coral reef as a grid. Each cell is either empty, contains a fish, or c
 
 The simulation is "Lotka-Volterra on a grid": fish population grows unchecked until sharks multiply and crash it. Then sharks starve, fish recover, and the cycle repeats. With the right parameters you can lock this oscillation into a stable limit cycle visible as alternating cyan/red waves in the population histogram.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_type[128][320]` | `uint8_t[128][320]` | ~40 KB | cell entity: EMPTY, FISH, or SHARK |
+| `g_breed[128][320]` | `uint8_t[128][320]` | ~40 KB | fish: age counter; shark: ticks-since-last-breed |
+| `g_hunger[128][320]` | `uint8_t[128][320]` | ~40 KB | shark: ticks since last meal (starve at SHARK_STARVE=4) |
+| `g_moved[128][320]` | `uint8_t[128][320]` | ~40 KB | deduplication guard: 1 if entity already acted this tick |
+| `g_order[40960]` | `int[40960]` | ~160 KB | Fisher-Yates shuffled flat cell indices for random processing order |
+| `g_fish_hist[512]`, `g_shark_hist[512]` | `long[512]` | ~8 KB | ring-buffer population history for histogram panel |
+
 ## Grid State
 
 Four `uint8_t` arrays, one per cell property:

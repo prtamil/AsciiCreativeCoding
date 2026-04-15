@@ -137,6 +137,18 @@ The sphere projection mesh has a consistent winding convention. If the winding a
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| mesh vertex array | `VSIn[]` | ~200 KB | tessellated Mandelbulb surface (NLAT=28 × NLON=56 ≈ 1800 triangles × 3 vertices) |
+| `g_zbuf[rows×cols]` | `float[]` | ~80 KB | per-cell depth buffer for hidden-surface removal |
+| `g_cbuf[rows×cols]` | `Vec3[]` | ~240 KB | per-cell colour accumulator; blitted to ncurses each frame |
+| `NLAT`, `NLON` | `int` constants | N/A | UV sphere tessellation for mesh (28 latitude × 56 longitude) |
+| `MB_BAIL` | `float` constant | N/A | Mandelbulb escape radius (8.0) |
+| `MB_POWER_DEFAULT` | `int` constant | N/A | default fractal power n=8; changing it rebuilds the mesh |
+| `k_bayer[4][4]` | `float[16]` | 64 B | Bayer dither matrix for ASCII density ramp |
+
 ## From the Source
 
 **Algorithm:** Hybrid mesh-based Mandelbulb rendering. Meshing: for each UV-sphere direction, march a ray inward from outside to find where the Mandelbulb SDF ≈ 0. This is a one-time O(TESS_U × TESS_V × MAX_MARCH) cost. Rendering: project the resulting triangle mesh through the standard rasterization pipeline — O(N_tris) per frame.

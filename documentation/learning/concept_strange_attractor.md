@@ -50,6 +50,17 @@ Parameters a,b,c,d ∈ [−3,3] each give a completely different shape.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_density[GRID_H_MAX][GRID_W_MAX]` | `uint32_t[]` | ~128 KB | visit count per cell; log-normalised for display brightness |
+| `g_max_density` | `uint32_t` | scalar | running maximum count; used to normalise brightness each frame |
+| `g_x`, `g_y` | `double` | scalar | current attractor orbit position |
+| `GRID_W_MAX`, `GRID_H_MAX` | constants | N/A | maximum density grid size (320 × 100) |
+| `ITERS_PER_FRAME` | `int` constant | N/A | orbit samples added per frame (200,000) |
+| `WARMUP_ITERS` | `int` constant | N/A | initial transient iterations discarded (5,000) |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

@@ -193,3 +193,13 @@ Linear lerp (`x = ox + t*(tx-ox)`) has a visible jerk at t=0 (instant velocity c
 **Math:** Smoothstep easing: f(t) = 3t² − 2t³, t ∈ [0,1]. Produces S-curve acceleration at start and deceleration at end — more visually pleasing than linear interpolation. Bitmap font: 9-row × 7-col bitmap; each '#' pixel expanded to a sub-grid of particles scaled to terminal dimensions.
 
 **Performance:** Greedy matching is O(P·T) per digit change but only runs once per transition (not per frame). Per-frame cost is O(P) position update + draw — cheap at P≤500.
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_parts[N_PARTS]` | `Particle[500]` (x,y,ox,oy,tx,ty,active) | ~14 KB | particle pool with current, origin, and target positions |
+| `g_dtx[10][N_PARTS]` | `float[10][500]` | ~20 KB | precomputed target x positions for each digit |
+| `g_dty[10][N_PARTS]` | `float[10][500]` | ~20 KB | precomputed target y positions for each digit |
+| `g_dtn[10]` | `int[10]` | 40 B | number of active target points per digit |
+| `g_morph_t` | `float` | 4 B | lerp progress [0, 1]; 0 = just triggered, 1 = done |

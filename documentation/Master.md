@@ -46,6 +46,14 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [D6 Lifetime & Exponential Decay](#d6-lifetime--exponential-decay)
 - [D7 Particle Pool — Fixed Array, No Allocation](#d7-particle-pool--fixed-array-no-allocation)
 - [D8 State Machines in Physics Objects](#d8-state-machines-in-physics-objects)
+- [D9 Impulse-based Elastic Collision Resolution](#d9-impulse-based-elastic-collision-resolution)
+- [D10 Lorentz Force — Exact Rotation Integration](#d10-lorentz-force--exact-rotation-integration)
+- [D11 Euler Equations for Rigid-Body Rotation — Quaternion Tracking](#d11-euler-equations-for-rigid-body-rotation--quaternion-tracking)
+- [D12 Three-Body Choreography — Figure-8 Orbit](#d12-three-body-choreography--figure-8-orbit)
+- [D13 Pendulum Wave — Analytic Harmonic Superposition](#d13-pendulum-wave--analytic-harmonic-superposition)
+- [D14 Slider-Crank Kinematics — Engine Cycle Simulation](#d14-slider-crank-kinematics--engine-cycle-simulation)
+- [D15 Baumgarte Stabilised Rigid-Body Collision](#d15-baumgarte-stabilised-rigid-body-collision)
+- [D16 Quantum Wavepacket — Crank-Nicolson / Thomas Algorithm](#d16-quantum-wavepacket--crank-nicolson--thomas-algorithm)
 
 ### E — Cellular Automata & Grid Simulations
 - [E1 Falling Sand — Gravity CA](#e1-falling-sand--gravity-ca)
@@ -53,6 +61,10 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [E3 aafire 5-Neighbour CA](#e3-aafire-5-neighbour-ca)
 - [E4 Processing Order & Artefact Suppression](#e4-processing-order--artefact-suppression)
 - [E5 Stochastic Rules](#e5-stochastic-rules)
+- [E6 Hexagonal Grid CA — Offset-Row Neighbour Addressing](#e6-hexagonal-grid-ca--offset-row-neighbour-addressing)
+- [E7 Lenia — Continuous CA with Ring Kernel](#e7-lenia--continuous-ca-with-ring-kernel)
+- [E8 Greenberg-Hastings Excitable Media CA](#e8-greenberg-hastings-excitable-media-ca)
+- [E9 Marching Squares — Scalar Field Contour Extraction](#e9-marching-squares--scalar-field-contour-extraction)
 
 ### F — Noise & Procedural Generation
 - [F1 Perlin Noise — Permutation Table & Smoothstep](#f1-perlin-noise--permutation-table--smoothstep)
@@ -98,6 +110,8 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [I11 Smooth Union — Polynomial smin Blend](#i11-smooth-union--polynomial-smin-blend)
 - [I12 Twist Deformation — Pre-warp Before SDF Evaluation](#i12-twist-deformation--pre-warp-before-sdf-evaluation)
 - [I13 Domain Repetition — Infinite Lattice from One Primitive](#i13-domain-repetition--infinite-lattice-from-one-primitive)
+- [I14 Analytic Ray-Capsule Intersection](#i14-analytic-ray-capsule-intersection)
+- [I15 Quartic Torus Ray Intersection — Sampling + Bisection](#i15-quartic-torus-ray-intersection--sampling--bisection)
 
 ### J — Software Rasterization
 - [J1 Mesh — Vertex & Triangle Arrays](#j1-mesh--vertex--triangle-arrays)
@@ -139,6 +153,11 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [L6 Callback / Function Pointer Patterns](#l6-callback--function-pointer-patterns)
 - [L7 Lookup Table (LUT)](#l7-lookup-table-lut)
 - [L8 Bilinear Interpolation](#l8-bilinear-interpolation)
+- [L9 Graham Scan & Jarvis March — Convex Hull](#l9-graham-scan--jarvis-march--convex-hull)
+- [L10 BFS / DFS / A* Graph Search](#l10-bfs--dfs--a-graph-search)
+- [L11 DFS Maze Generation — Recursive Backtracker](#l11-dfs-maze-generation--recursive-backtracker)
+- [L12 Sorting Algorithm Step-Iterator — Coroutine Pattern](#l12-sorting-algorithm-step-iterator--coroutine-pattern)
+- [L13 Hexagonal Grid Coordinate Systems](#l13-hexagonal-grid-coordinate-systems)
 
 ### M — Systems Programming
 - [M1 Signal Handling — sig_atomic_t](#m1-signal-handling--sig_atomic_t)
@@ -156,6 +175,8 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [N4 Orbit Formation](#n4-orbit-formation)
 - [N5 Predator-Prey](#n5-predator-prey)
 - [N6 Toroidal Topology — Wrap-around Physics](#n6-toroidal-topology--wrap-around-physics)
+- [N7 Shepherd / Herding — Flee Force with Panic Boost](#n7-shepherd--herding--flee-force-with-panic-boost)
+- [N8 Ant Colony Optimization — Stigmergic Pheromone Trails](#n8-ant-colony-optimization--stigmergic-pheromone-trails)
 
 ### O — Procedural Growth
 - [O1 Recursive Branch Growth — Bonsai](#o1-recursive-branch-growth--bonsai)
@@ -176,12 +197,22 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [P11 Pascal-Triangle Bat Swarms — Artistic Formation Flying](#p11-pascal-triangle-bat-swarms--artistic-formation-flying)
 - [P12 De Bruijn Pentagrid — Penrose Tiling](#p12-de-bruijn-pentagrid--penrose-tiling)
 - [P13 Diamond-Square Heightmap + Thermal Erosion](#p13-diamond-square-heightmap--thermal-erosion)
+- [P16 Apollonian Gasket — Descartes Circle Theorem](#p16-apollonian-gasket--descartes-circle-theorem)
+- [P17 Logistic Map Bifurcation Diagram — Feigenbaum Scaling](#p17-logistic-map-bifurcation-diagram--feigenbaum-scaling)
+- [P18 Burning Ship Fractal — Absolute-Value Fold](#p18-burning-ship-fractal--absolute-value-fold)
+- [P19 Dragon Curve — Paper-Folding Sequence](#p19-dragon-curve--paper-folding-sequence)
+- [P20 Newton Fractal — Basin of Attraction Coloring](#p20-newton-fractal--basin-of-attraction-coloring)
+- [P21 Strange Attractors — Density-Map Rendering](#p21-strange-attractors--density-map-rendering)
+- [P22 Perlin Noise Landscape — Parallax Terrain Scrolling](#p22-perlin-noise-landscape--parallax-terrain-scrolling)
+- [P23 Involute Gear Tooth Geometry](#p23-involute-gear-tooth-geometry)
 
 ### Q — Artistic / Signal-Based Effects
 - [Q1 Sinusoidal Aurora Curtains](#q1-sinusoidal-aurora-curtains)
 - [Q2 Demoscene Plasma — Sin-Sum Palette Cycling](#q2-demoscene-plasma--sin-sum-palette-cycling)
 - [Q3 Hypotrochoid Spirograph with Float Canvas Decay](#q3-hypotrochoid-spirograph-with-float-canvas-decay)
 - [Q4 Voronoi with Langevin Brownian Seeds](#q4-voronoi-with-langevin-brownian-seeds)
+- [Q5 Cooley-Tukey Radix-2 FFT Visualizer](#q5-cooley-tukey-radix-2-fft-visualizer)
+- [Q6 DFT Epicycles — Fourier Drawing Replay](#q6-dft-epicycles--fourier-drawing-replay)
 
 ### R — Force-Based Physics
 - [R1 Explicit Spring Forces + Symplectic Euler (Cloth)](#r1-explicit-spring-forces--symplectic-euler-cloth)
@@ -200,6 +231,9 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [T1 Analytic Wave Interference — Phase Precomputation](#t1-analytic-wave-interference--phase-precomputation)
 - [T2 Lyapunov Exponent — Alternating Logistic Map](#t2-lyapunov-exponent--alternating-logistic-map)
 - [T3 DBM Laplace Growth — Gauss-Seidel + φ^η](#t3-dbm-laplace-growth--gauss-seidel--φη)
+- [T4 2D Wave Equation — FDTD with Sponge Boundaries](#t4-2d-wave-equation--fdtd-with-sponge-boundaries)
+- [T5 Navier-Stokes Stable Fluids — Stam's Method](#t5-navier-stokes-stable-fluids--stams-method)
+- [T6 FitzHugh-Nagumo Reaction-Diffusion — Excitable Media](#t6-fitzhugh-nagumo-reaction-diffusion--excitable-media)
 
 ### U — Path Tracing & Global Illumination
 - [U1 Monte Carlo Path Tracing](#u1-monte-carlo-path-tracing)
@@ -1650,6 +1684,481 @@ hit.v = ray.o[v_axis] + t × ray.d[v_axis]   check ∈ [lo[1], hi[1]]
 ```
 One-dimensional solve on the fixed axis, then two bound checks. Normal is always flipped to face the incoming ray: if `rd[axis] > 0` → normal = `-axis_dir`. This guarantees hemisphere sampling is always away from the surface, regardless of which side the ray enters from. The light quad at `y=0.98` tests before the ceiling at `y=1.0` (smaller t) so rays see the light first in its footprint.
 *Files: `raytracing/path_tracer.c`*
+
+---
+
+---
+
+### D — Physics Simulation (new entries)
+
+#### D9 Impulse-based Elastic Collision Resolution
+
+Two discs are approaching when the dot product of their relative velocity along the collision normal is positive: `vn = dot(va - vb, n) > 0`. Applying an impulse `J = (1 + e) · vn / (1/ma + 1/mb)` along the normal simultaneously adjusts both velocities while conserving momentum and kinetic energy. The restitution coefficient `e = 1` gives perfectly elastic collisions; `e < 1` dissipates energy.
+
+Penetration is a separate problem from velocity. Before resolving velocity, separate the overlapping bodies by pushing each along the normal by `overlap/2 / (1/ma + 1/mb)`. Doing this separation first and then resolving velocity — rather than encoding penetration correction inside the velocity update — means the impulse only fires when the bodies are genuinely approaching, preventing false bounces on already-separating pairs.
+
+Equal-mass collisions along the normal reduce to swapping the normal velocity components exactly. Non-equal masses cause the lighter body to deflect more — matching billiard-ball intuition where a cue ball deflects when striking a heavier ball.
+*Files: `physics/elastic_collision.c`*
+
+---
+
+#### D10 Lorentz Force — Exact Rotation Integration
+
+A charged particle in a uniform magnetic field perpendicular to the screen experiences the Lorentz force `F = q v × B`, which continuously deflects the velocity perpendicular to itself — producing circular orbits. The cyclotron radius is `r = m|v| / (qB)`: high charge-to-mass ratio (electrons) → tight spirals; low ratio (protons) → gentle arcs.
+
+Naive Euler integration (`v += F·dt`) computes the force using the velocity at the start of the step, then updates. This introduces a systematic error that inflates the orbit radius each step — the particle spirals outward rather than maintaining a circle. The fix is to apply an exact 2D rotation matrix `R(ω·dt)` to the velocity each step, where `ω = (q/m)·B`:
+
+```c
+float c = cosf(omega * dt);
+float s = sinf(omega * dt);
+float vx_new = vx * c - vy * s;
+float vy_new = vx * s + vy * c;
+```
+
+This preserves `|v|` exactly. Ionisation energy loss (the drag that makes bubble-chamber tracks spiral inward) is added afterward as a multiplicative speed reduction: `|v| *= (1 - DRAG)`. The combined effect — exact rotation plus shrinking speed — produces the logarithmic inward spiral that characterises real particle tracks.
+*Files: `physics/bubble_chamber.c`*
+
+---
+
+#### D11 Euler Equations for Rigid-Body Rotation — Quaternion Tracking
+
+A free rigid body with three unequal principal moments of inertia (`I1, I2, I3`) obeys Euler's equations in the body frame:
+
+```
+I1·ω̇x = (I2 - I3)·ωy·ωz
+I2·ω̇y = (I3 - I1)·ωz·ωx
+I3·ω̇z = (I1 - I2)·ωx·ωy
+```
+
+These are nonlinear (the right-hand side contains products of angular velocities), so RK4 integration is used to keep the trajectory on the attractor. A key result is the intermediate-axis theorem: rotation near the axis of smallest or largest inertia is stable, but rotation near the middle-inertia axis is unstable — a perturbation grows exponentially, producing the tumbling "Dzhanibekov effect."
+
+Orientation is tracked as a unit quaternion `q = (qw, qx, qy, qz)`. The quaternion derivative is `q̇ = 0.5 · q ⊗ (0, ω)` where `(0, ω)` is a pure quaternion from the body-frame angular velocity. After each RK4 step the quaternion is re-normalised (`q /= |q|`) and the world-space rotation matrix is extracted from it. This avoids gimbal lock (which Euler angles suffer at `θ = 0`) and the accumulated drift that rotation-matrix integration has.
+*Files: `physics/gyroscope.c`*
+
+---
+
+#### D12 Three-Body Choreography — Figure-8 Orbit
+
+The three-body problem has no general closed-form solution. Specific initial conditions discovered numerically produce periodic "choreographies" — orbits where all three equal-mass bodies traverse the same closed curve at 120° phase offsets. The figure-8 solution (Chenciner and Montgomery, 2000) is the most famous: three bodies chase each other around a figure-8 path forever.
+
+The initial conditions must be specified to high precision (five or more significant figures) because the orbit is only marginally stable — small perturbations cause the bodies to diverge on the Lyapunov timescale. RK4 with small `dt = 0.001` in natural units preserves the orbit for hundreds of visible periods; Velocity Verlet at the same step size drifts and eventually breaks the choreography.
+
+The centre-of-mass frame correction — subtracting the mean velocity each step — keeps the simulation centred on screen. Without it, momentum imbalance from floating-point rounding causes the whole system to drift off screen over time. The `x` key in the implementation adds a random perturbation to one body, instantly revealing the underlying chaotic dynamics hiding beneath the symmetric orbit.
+*Files: `physics/orbit_3body.c`*
+
+---
+
+#### D13 Pendulum Wave — Analytic Harmonic Superposition
+
+N pendulums are assigned lengths such that pendulum `n` completes exactly `(N_BASE + n)` full oscillations in a fixed synchronisation period `T_SYNC`. The angular frequency is `ω_n = 2π(N_BASE + n) / T_SYNC` and position is the exact analytic solution `θ_n(t) = A · sin(ω_n · t)` — no numerical integration required. Each pendulum is an independent harmonic oscillator with a known exact solution.
+
+Because consecutive pendulums differ by exactly one oscillation per `T_SYNC`, at `t = T_SYNC` all pendulums have completed an integer number of cycles and are perfectly back in phase — the "clap" resync. At intermediate times the superposition of N slightly-different frequencies creates travelling waves, standing waves, and apparent spirals depending on how close `t` is to simple fractions of `T_SYNC`.
+
+The key rendering detail is drawing the string as a sloped line from the pivot to the bob using slope-appropriate characters (`|`, `/`, `\`), not as a vertical column. Drawing a vertical column makes the string appear to disappear while only the bob moves — the sloped line gives the correct visual impression of the pendulum's angle.
+*Files: `physics/pendulum_wave.c`*
+
+---
+
+#### D14 Slider-Crank Kinematics — Engine Cycle Simulation
+
+The slider-crank mechanism converts rotary crank motion to linear piston motion. Given crank angle `θ`, crank radius `R`, and connecting rod length `L`, the wrist-pin row in cell space is:
+
+```
+rod_vert = sqrt(L² - (R·sin(θ))²)
+wrist_row = crank_centre_row - R·cos(θ) - rod_vert
+```
+
+This is exact geometry with no small-angle approximation. Port timing (when the exhaust and transfer ports open and close) is derived directly from the piston crown position rather than from a separate lookup table: `ex_open = (crown_row > engine_top + EX_PORT_OFF)`. This keeps timing numerically consistent with the drawn geometry at any engine speed.
+
+A 2-stroke cycle completes its five phases in a single crankshaft revolution: compression → ignition (TDC spark) → power stroke → exhaust port opens (burned gas escapes) → transfer port opens (fresh mixture scavenges cylinder). Detecting the current phase from crank angle and port state drives character and color changes for the gas above the piston, exhaust flow, and transfer flow — an animated cross-section that teaches engine thermodynamics entirely through ASCII character choices.
+*Files: `physics/2stroke.c`*
+
+---
+
+#### D15 Baumgarte Stabilised Rigid-Body Collision
+
+Iterative impulse resolution with Baumgarte position correction is the industry-standard method for 2D/3D rigid-body engines. Each solver iteration consists of two passes for every overlapping pair:
+
+**Pass A — positional correction (always):** Move overlapping bodies apart by a fraction of the penetration depth: `corr = max(depth - SLOP, 0) × BAUMGARTE / (imA + imB)`. The SLOP constant (≈0.05 px) allows a tiny tolerated penetration that absorbs floating-point noise at resting contacts without triggering correction every frame. BAUMGARTE (≈0.5) spreads the correction over multiple frames for stability.
+
+**Pass B — velocity impulse (only when approaching):** Compute the normal relative velocity `vn = dot(va - vb, n)`. If `vn ≤ 0` the bodies are already separating — skip. Otherwise apply `j = (1 + e_eff)·vn / (imA + imB)`. Adaptive restitution: when `vn < REST_THRESH` (gravity-scale approach speed), set `e_eff = 0` to exactly cancel the incoming velocity instead of bouncing — this eliminates the floor-jitter bug where gravity generates infinite micro-bounces at rest.
+
+Running `SOLVER_ITERS = 10` passes propagates contact corrections through stacked bodies (resolving the bottom pair propagates upward through the stack). A sleep system (freezing bodies whose speed stays below `SLEEP_VEL` for `SLEEP_FRAMES` frames) eliminates CPU cost for settled stacks.
+*Files: `physics/rigid_body.c`*
+
+---
+
+#### D16 Quantum Wavepacket — Crank-Nicolson / Thomas Algorithm
+
+The time-dependent Schrödinger equation `iℏ∂ψ/∂t = −(ℏ²/2m)∂²ψ/∂x² + V(x)ψ` is solved with the Crank-Nicolson finite-difference scheme. Averaging the explicit and implicit Euler steps produces a system `(I + iHdt/2)ψⁿ⁺¹ = (I − iHdt/2)ψⁿ` where `H` is the discrete Hamiltonian matrix. This scheme is unconditionally stable and exactly unitary — the L2 norm `Σ|ψ|²` is preserved to machine precision regardless of timestep size.
+
+The resulting linear system is tridiagonal (three diagonals, because the Hamiltonian only couples each grid point to its two neighbours). The Thomas algorithm (forward elimination then back-substitution) solves it in O(N) operations rather than O(N³) for a general matrix. Initial state is a Gaussian wave packet `ψ₀(x) = exp(−((x−x₀)/σ)²/2) · exp(ik₀x)` — a particle localised at `x₀` with momentum `ℏk₀`.
+
+Quantum tunnelling is visible when the packet encounters a potential barrier `V > E`. The transmitted amplitude is `T ≈ exp(−2κd)` where `κ = √(2m(V−E))/ℏ` and `d` is barrier width. Absorbing boundaries (multiplying `ψ` by a smooth damping function near the edges) suppress reflections from the grid walls that would otherwise contaminate the physics.
+*Files: `physics/schrodinger.c`*
+
+---
+
+### E — Cellular Automata & Grid Simulations (new entries)
+
+#### E6 Hexagonal Grid CA — Offset-Row Neighbour Addressing
+
+A hexagonal grid stored as a 2D rectangular array uses the offset-row convention: even rows align to column centres; odd rows are shifted half a cell to the right. This means the six neighbours of cell `(i, j)` depend on the row parity:
+
+```c
+/* Even row i */
+int nbr_even[6][2] = {{-1,0},{-1,1},{0,-1},{0,1},{1,0},{1,1}};
+/* Odd row i */
+int nbr_odd[6][2]  = {{-1,-1},{-1,0},{0,-1},{0,1},{1,-1},{1,0}};
+```
+
+The rule bitmask is indexed by neighbour count `n ∈ {0..6}`: `(BIRTH_MASK >> n) & 1` for dead cells, `(SURVIVE_MASK >> n) & 1` for live cells. This compact representation makes it trivial to explore the 2⁷ × 2⁷ rule space. The B2/S34 rule produces gliders and stable oscillators with qualitatively different shapes than square-grid Life — the 6-neighbour topology is more isotropic, eliminating diagonal propagation artefacts. On screen, alternate rows are displayed offset by one column, so the character grid visually matches the honeycomb geometry.
+*Files: `artistic/hex_life.c`*
+
+---
+
+#### E7 Lenia — Continuous CA with Ring Kernel
+
+Lenia generalises Conway's Game of Life to continuous values, time, and space. Each cell holds a real value `u ∈ [0,1]`. The neighbourhood is a ring-shaped kernel `K` — a bump function `exp(4 - 4/(r(1-r)))` evaluated at normalised radius `r = dist/R`, which is zero inside and outside a thin annular shell. The update rule:
+
+```
+U(x,t) = K ⊛ A(·,t)                  ← convolution (sensing)
+G(u)   = 2·exp(-((u-μ)/σ)²) - 1      ← growth function (Gaussian bell)
+A(x,t+dt) = clamp(A + dt·G(U), 0, 1) ← state update
+```
+
+The growth function `G` reaches +1 when the local density matches the species parameter `μ` exactly, and falls to −1 when density is too low or too high. This "sweet-spot" mechanism produces self-organising creatures analogous to biological cells responding to chemical gradient cues.
+
+Precomputing the kernel once as a flat list of (row-offset, col-offset, weight) triples amortises the O(R²) cost and enables cache-friendly inner loops. Different parameter pairs `(μ, σ, R)` define distinct "species": the Orbium (μ=0.15, σ=0.015, R=13) moves coherently like a glider; the Aquarium produces a rich soup of interacting blobs.
+*Files: `fluid/lenia.c`*
+
+---
+
+#### E8 Greenberg-Hastings Excitable Media CA
+
+The Greenberg-Hastings model is a three-state CA (resting → excited → refractory → resting) that produces spiral waves, target patterns, and travelling wave trains. A resting cell becomes excited if it has at least one excited neighbour. An excited cell immediately enters the refractory state. A refractory cell returns to resting after a fixed recovery time.
+
+The FitzHugh-Nagumo variant used in `reaction_wave.c` extends this to continuous values with two coupled PDE fields: activator `u` (fast membrane voltage) and inhibitor `v` (slow recovery variable). The activator has a cubic nonlinearity `u³/3` that creates the excitation threshold; the inhibitor rises after each spike and suppresses re-excitation during the refractory period. Diffusion via the 5-point Laplacian stencil spreads the wavefront spatially.
+
+Spiral waves require a broken wavefront for initiation: create a planar wave, then make a section of the medium refractory (blocking that half). The free end of the planar wave curls into a rotating spiral. Once established, spirals are self-sustaining — they do not require continuous external forcing, and two counter-rotating spirals can annihilate each other on contact.
+*Files: `fluid/excitable.c`, `fluid/reaction_wave.c`*
+
+---
+
+#### E9 Marching Squares — Scalar Field Contour Extraction
+
+Marching Squares extracts iso-contours from a 2D scalar field by classifying each 2×2 cell of grid corners by a 4-bit index: each bit is 1 if that corner's value exceeds the threshold, 0 otherwise. The 16 possible patterns are handled by a precomputed lookup table that specifies which edges the contour must cross. Edge crossings are linearly interpolated:
+
+```
+t = (threshold − f_a) / (f_b − f_a)
+crossing = a + t · (b − a)
+```
+
+Two ambiguous cases exist (patterns 5 and 10 — diagonally opposite corners both inside) where the topology is underdetermined. The standard disambiguation tests the field value at the cell centre to decide which of two possible contour topologies applies.
+
+For ASCII rendering, the crossing direction (the slope of the line segment through the cell) maps to a character: nearly horizontal → `─`, nearly vertical → `│`, diagonals → `/` `\`, corners → `+`. The metaball potential field `f(x,y) = Σ Aᵢ / rᵢ²` (gravitational potential of multiple point masses) is the canonical test signal — two nearby blobs produce an organic "peanut" contour that merges into a single blob as they approach.
+*Files: `fluid/marching_squares.c`*
+
+---
+
+### L — Algorithms & Data Structures (new entries)
+
+#### L9 Graham Scan & Jarvis March — Convex Hull
+
+The convex hull of N points is the smallest convex polygon containing all points. Two classic algorithms offer different complexity profiles:
+
+**Graham scan (O(N log N)):** Choose the lowest-leftmost point as pivot. Sort remaining points by polar angle from the pivot. Sweep through the sorted list maintaining a stack — pop the top whenever the last three points form a clockwise (non-left) turn (cross product ≤ 0), then push the new point. The stack contains the hull in CCW order.
+
+**Jarvis march / gift wrapping (O(N·h)):** Start at the leftmost point. At each step, find the most counter-clockwise point from the current hull vertex by comparing all pairs with the cross product. Add it and advance. Stop when the hull closes. Optimal when `h ≪ N`; degrades to O(N²) when all points are on the hull.
+
+The cross product `(A→B) × (A→C) = (Bx−Ax)(Cy−Ay) − (By−Ay)(Cx−Ax)` is the foundation of all computational geometry predicates: positive → left turn (CCW), zero → collinear, negative → right turn (CW). Floating-point near-collinear points may give wrong signs — robust implementations use exact arithmetic or add a small epsilon to the comparison.
+*Files: `geometry/convex_hull.c`*
+
+---
+
+#### L10 BFS / DFS / A* Graph Search
+
+Three graph traversal algorithms with distinct data structures drive their frontier expansions: BFS uses a FIFO queue (first discovered = first expanded), producing level-by-level wavefronts that guarantee shortest paths in unweighted graphs. DFS uses a LIFO stack (most recently discovered = first expanded), following one path as deep as possible before backtracking — efficient for reachability but not for shortest paths. A* uses a min-heap keyed by `f(n) = g(n) + h(n)` where `g` is the known cost from start and `h` is an admissible heuristic — it expands the node with the lowest estimated total cost first, finding optimal paths with far fewer expansions than BFS in practice.
+
+For grid graphs, the Manhattan distance heuristic `h = |nx − gx| + |ny − gy|` is admissible (never overestimates) for 4-directional movement. Euclidean distance is admissible for 8-directional or graph-node layouts. When `h = 0`, A* degenerates to Dijkstra's algorithm. When `h` overestimates, the path may be suboptimal but finds it faster.
+
+Force-directed layout (Fruchterman-Reingold) positions graph nodes by simulating repulsive forces between all pairs and attractive spring forces along edges: `F_repel ∝ k²/d`, `F_attract ∝ d²/k`, where `k = √(area/N)`. Iterating to equilibrium produces visually legible layouts where connected nodes cluster and unconnected nodes separate.
+*Files: `artistic/graph_search.c`*
+
+---
+
+#### L11 DFS Maze Generation — Recursive Backtracker
+
+A perfect maze (exactly one path between any two cells) is a spanning tree of the grid graph. The recursive backtracker builds it with DFS: start at a random cell, mark it visited, randomly choose an unvisited neighbour, remove the wall between them, and recurse. When all neighbours are visited, backtrack. The process terminates when every cell has been visited.
+
+Walls are stored as a 4-bit bitmask per cell (N=1, E=2, S=4, W=8). Carving a wall clears the corresponding bit in the current cell and sets the opposite bit in the neighbour — ensuring symmetric representation. Animated generation processes `GEN_STEPS` DFS steps per frame so the maze grows visibly. BFS solving is then run on the completed maze, using the carved-wall bitmask as the adjacency test: a move from `(r,c)` to `(r-1,c)` is valid if `walls[r][c] & N`.
+
+DFS mazes have long winding corridors with few dead ends — they are visually "river-like." Wilson's algorithm produces uniformly random spanning trees (all spanning trees equally likely), producing mazes with shorter average path lengths and more dead ends.
+*Files: `misc/maze.c`*
+
+---
+
+#### L12 Sorting Algorithm Step-Iterator — Coroutine Pattern
+
+Sorting algorithms are naturally sequential: the algorithm runs to completion in one pass. Visualization requires pausing after each comparison or swap. The standard approach avoids threads or setjmp coroutines by implementing each algorithm as a state machine struct with a `step()` function that advances exactly one operation:
+
+```c
+typedef struct { int phase, i, j; /* algorithm state */ } SortState;
+bool bubble_step(SortState *s, int *arr, int n); /* returns false when done */
+```
+
+The outer animation loop calls `step()` at a controlled rate, updating `highlight[cmp1, cmp2]` to show the currently active pair in a contrasting color. This gives the user control over animation speed (steps per frame) without restructuring the algorithm itself. Each of the five algorithms (bubble, insertion, selection, quicksort with explicit stack, heapsort) is a separate state machine — they can run concurrently in split-screen mode since each has independent state.
+*Files: `misc/sort_vis.c`*
+
+---
+
+#### L13 Hexagonal Grid Coordinate Systems
+
+Hexagonal grids have three common coordinate systems. **Offset coordinates** (used in `hex_life.c` and `hex_grid.c`) store cells in a rectangular 2D array with alternate rows shifted — easy to store but awkward for neighbour arithmetic that depends on row parity. **Axial / cube coordinates** use three axes `(q, r, s)` with the constraint `q + r + s = 0`, allowing all six neighbours to be expressed as constant offsets regardless of position: the six directions are `(±1,∓1,0)`, `(±1,0,∓1)`, `(0,±1,∓1)`. Ring distance is `max(|q|,|r|,|s|)`.
+
+Converting between axial and screen coordinates: `screen_col = q + (r - (r & 1)) / 2`, `screen_row = r`. The terminal aspect correction applies: a hexagonal "circle" of radius `R` in axial space appears on screen as an ellipse of width `2R` columns and `R` rows, because cells are twice as tall as wide. Scaling axial `q` by `CELL_H / CELL_W ≈ 2` before screen conversion produces visually round hex grids.
+*Files: `geometry/hex_grid.c`, `artistic/hex_life.c`*
+
+---
+
+### N — Flocking & Collective Behaviour (new entries)
+
+#### N7 Shepherd / Herding — Flee Force with Panic Boost
+
+The herding simulation adds a user-controlled shepherd to the Classic Boids model. Sheep experience five combined forces: the three standard Boids forces (separation, alignment, cohesion) plus a flee force from the shepherd and a boundary containment force. The flee force uses inverse-distance weighting: `F_flee = (pos_sheep − pos_shepherd) / dist` so nearby shepherds produce overwhelming repulsion while distant ones are barely felt.
+
+A panic zone at `PANIC_RADIUS < FLEE_RADIUS` triples the flee weight — sheep sprint when the shepherd is close. This creates two behavioural modes: gentle steering (shepherd at medium range) and panicked scattering (shepherd closes in). The combination of cohesion (which tries to keep sheep together) and flee (which pushes them apart) produces the realistic oscillation where a flock partly stays together and partly scatters when a sheepdog approaches.
+
+Sheep use elastic wall bounces (velocity component reflected) rather than toroidal wrap. This makes them cornerable — the flock can be funnelled through an opening, which is the fundamental herding technique. Toroidal wrap would let sheep escape through walls, making herding impossible.
+*Files: `flocking/shepherd.c`*
+
+---
+
+#### N8 Ant Colony Optimization — Stigmergic Pheromone Trails
+
+Ant Colony Optimization (ACO) solves combinatorial optimisation problems by simulating how ants collectively find shortest paths through indirect environmental communication (stigmergy). Each ant deposits pheromone on its path; future ants prefer paths with stronger pheromone. Shorter paths are traversed more frequently, accumulate pheromone faster, and attract exponentially more ants — a positive feedback loop that converges on near-optimal routes.
+
+The pheromone update rule is: `τ(t+1) = (1-ρ)·τ(t) + Σ Δτᵏ` where `ρ` is the evaporation rate and `Δτᵏ = Q/L_k` for each ant that used the edge. Evaporation is essential — without it, pheromone only accumulates and the system cannot forget suboptimal paths. Movement probability is `P(i→j) ∝ τᵢⱼᵅ · ηᵢⱼᵝ` where `η = 1/distance` is the heuristic and `α, β` control the exploitation/exploration balance.
+
+The terminal implementation uses a 2D grid rather than a complete graph, making ant movement visual: trails form as visible density gradients in the pheromone field. The pheromone concentration at each cell maps directly to the Bourke ASCII density ramp — denser trails appear as denser characters, making the path selection dynamics directly observable.
+*Files: `artistic/ant_colony.c`*
+
+---
+
+### P — Fractal Systems (new entries)
+
+#### P16 Apollonian Gasket — Descartes Circle Theorem
+
+An Apollonian gasket is a fractal generated by starting with three mutually tangent circles and recursively filling every gap with the unique circle tangent to all three boundary circles. The key is Descartes' Circle Theorem: if four mutually tangent circles have curvatures `k₁, k₂, k₃, k₄` (curvature = 1/radius, negative for the outer enclosing circle), then:
+
+```
+(k₁ + k₂ + k₃ + k₄)² = 2(k₁² + k₂² + k₃² + k₄²)
+```
+
+Solving for `k₄`: `k₄ = k₁ + k₂ + k₃ ± 2√(k₁k₂ + k₂k₃ + k₃k₁)`. The complex Descartes theorem gives the new circle centre directly: `k₄z₄ = k₁z₁ + k₂z₂ + k₃z₃ ± 2√(k₁k₂z₁z₂ + k₂k₃z₂z₃ + k₃k₁z₃z₁)`. Two solutions exist — one is the already-known circle, the other is the new circle.
+
+The integer Apollonian gasket starting configuration `(k = −1, 2, 2, 3)` keeps all curvatures integer throughout the recursion — a number-theoretic curiosity. Circle count grows as `3^depth`; the recursion terminates when the resulting radius falls below one pixel. Terminal rendering draws each circle as a ring of characters at positions satisfying `||P − centre|| − radius| < 0.7 px`, with terminal aspect correction applied to the radius test in the row direction.
+*Files: `fractal_random/apollonian.c`*
+
+---
+
+#### P17 Logistic Map Bifurcation Diagram — Feigenbaum Scaling
+
+The logistic map `xₙ₊₁ = r·xₙ·(1−xₙ)` models population dynamics. As `r` increases from 2.5 to 4, the long-term attractor undergoes period-doubling bifurcations: a single fixed point at `r < 3`, period-2 orbit at `r ≈ 3`, period-4 at `r ≈ 3.449`, period-8 at `r ≈ 3.544`, accumulating at `r∞ ≈ 3.5699456...` (onset of chaos). The Feigenbaum constant `δ ≈ 4.669` is the ratio of successive bifurcation intervals — universal across all unimodal maps, not just the logistic map.
+
+The diagram is computed column by column: for each column mapped to a value of `r`, run `WARMUP = 500` transient iterations to reach the attractor, then plot the next `PLOT = 300` values as dots. No array storage is needed — `mvaddch` plots each value directly. The diagram reveals self-similar structure: the same bifurcation tree reappears inside the chaotic regions, scaled by `δ` at each level.
+
+Auto-zoom scrolls the viewport toward `r∞`, progressively revealing the self-similar structure at finer and finer scales. Panning and zooming are implemented by adjusting the `r_min, r_max` bounds — each zoom doubles the resolution of the displayed bifurcation tree.
+*Files: `fractal_random/bifurcation.c`*
+
+---
+
+#### P18 Burning Ship Fractal — Absolute-Value Fold
+
+The Burning Ship fractal modifies the Mandelbrot iteration `z ← z² + c` with one change: before squaring, take the absolute value of both real and imaginary components: `z ← (|Re(z)| + i|Im(z)|)² + c`. Expanded: `Re_new = Re² − Im² + Re(c)`, `Im_new = 2|Re|·|Im| + Im(c)`. The `|Im|` term forces the imaginary component positive after every step, breaking the left-right symmetry and creating asymmetric "flame" shapes rather than Mandelbrot's symmetric bulbs.
+
+Negating the imaginary axis before display (`cy = −(py − centre_y) × scale`) flips the image so the characteristic ship silhouette appears hull-down (the way the name derives from the fractal's appearance). Smooth colouring applies the same fractional escape formula as the Mandelbrot set: `mu = iter + 1 − log₂(log₂|z|)`, producing smooth gradients across escape-time iso-shells.
+
+Geometrically the `|·|` operation reflects the complex plane into the first quadrant before each squaring. This is topologically a fold — the Julia sets become asymmetric and the main cardioid transforms into the pointed ship hull with mast and flames. Self-similar miniature copies of the ship appear along the boundary at ever smaller scales, as in the Mandelbrot set.
+*Files: `fractal_random/burning_ship.c`*
+
+---
+
+#### P19 Dragon Curve — Paper-Folding Sequence
+
+The dragon curve is the fractal traced when you fold a strip of paper in half repeatedly in the same direction and then unfold it so every crease is exactly 90°. After `n` folds the strip has `2ⁿ` segments and `2ⁿ − 1` turns. The turn sequence is computed without storing the full string using the paper-folding bit trick: turn `i` (1-indexed) is RIGHT if `((i & -i) << 1) & i` is non-zero, LEFT otherwise. This extracts whether the bit above the lowest-set-bit of `i` is 1.
+
+The sequence obeys a self-similar recursive structure: the turn sequence for generation `n+1` is `T_n R complement-reverse(T_n)` — insert a RIGHT turn in the middle and append a reversed, complemented copy of the previous sequence. This construction proves that the dragon curve never self-intersects: each turn is uniquely determined and no segment is ever revisited.
+
+Four copies of the dragon curve rotated by 0°, 90°, 180°, 270° tile the plane without gaps or overlaps — it is a rep-tile of order 4. Terminal rendering uses Bresenham line drawing for each segment, choosing `/`, `\`, `|`, `−` by the segment slope direction, with aspect correction applied to horizontal steps (`×CELL_H/CELL_W`) to prevent circles becoming ellipses.
+*Files: `fractal_random/dragon_curve.c`*
+
+---
+
+#### P20 Newton Fractal — Basin of Attraction Coloring
+
+Newton's method for root-finding applied per-pixel in the complex plane creates a fractal boundary between basins of attraction. For a polynomial `f(z)`, the iteration `z ← z − f(z)/f′(z)` converges to one of the polynomial's roots for most starting points. The basin of attraction of root `rᵢ` is the set of starting points that converge to `rᵢ`. The boundaries between basins are infinitely intricate — no matter how fine the zoom, the boundary remains fractal.
+
+For `f(z) = z⁴ − 1` (four roots at `±1, ±i`), each root's basin is colored with a distinct hue; brightness encodes convergence speed (fewer iterations → lighter). Points near basin boundaries converge slowly and appear dark — these are the fractal edges where the iteration visits many roots before settling. Near a critical point (where `f′(z) ≈ 0`), the iteration takes a huge step and may converge to a completely different root than a nearby pixel.
+
+Damped Newton (`z -= α·f(z)/f′(z)` with `α < 1`) slows convergence and exposes finer boundary structure. The four roots of unity form a 4-fold symmetric fractal; the basins have fractal dimension between 1 and 2 — they are neither curves nor areas but something in between.
+*Files: `fractal_random/newton_fractal.c`*
+
+---
+
+#### P21 Strange Attractors — Density-Map Rendering
+
+Strange attractors (Clifford, de Jong, Lorenz projected to 2D) are visualised by iterating the attractor map for millions of steps and accumulating visit counts in a density grid rather than plotting each point directly. The Clifford map: `x′ = sin(a·y) + c·cos(a·x)`, `y′ = sin(b·x) + d·cos(b·y)`. Different parameter sets `(a, b, c, d)` produce completely different shapes — from simple loops to intricate filamentary structures.
+
+Log normalisation is essential: `brightness = log(1 + count) / log(1 + max_count)`. The spine of the attractor accumulates counts orders of magnitude higher than outlying filaments. Linear normalisation makes the spine pure white and filaments invisible; log normalisation compresses the dynamic range so both are visible simultaneously.
+
+Warm-up iterations (first 5000 discarded) move the orbit onto the attractor before plotting begins. The invariant measure of a strange attractor has multi-fractal structure — different regions have different fractal dimensions. This is visible in the density map as regions of varying texture density. Interactive parameter sliders let the user explore the parameter space and watch the attractor shape morph continuously between configurations.
+*Files: `fractal_random/strange_attractor.c`*
+
+---
+
+#### P22 Perlin Noise Landscape — Parallax Terrain Scrolling
+
+Fractional Brownian Motion (fBm) terrain is constructed by summing `OCTAVES` independent Perlin noise samples at doubling frequencies and halving amplitudes: `h(x) = Σ (0.5ᵏ · noise(2ᵏ · x))`. Low-frequency octaves provide the large-scale ridge structure; high-frequency octaves add fine detail. The result has a 1/f power spectrum — the same statistical self-similarity found in real terrain.
+
+Parallax scrolling simulates depth perception by scrolling each layer at a speed proportional to its perceived distance. Background mountains (slowest, lowest frequency, brightest) scroll at 12% of camera speed; midground hills at 38%; foreground terrain (fastest, highest frequency, darkest) at 100%. Drawing layers back-to-front ensures near terrain occludes far terrain naturally. The color scheme encodes altitude: water (blue) → plains (green) → hills (yellow) → peaks (white).
+
+The camera scrolls by advancing the noise sample coordinate: `x_sample = col × FREQ_SCALE + g_scroll`. Because Perlin noise is defined everywhere on the real line, there is no tiling seam — the landscape can scroll indefinitely without repetition (until floating-point precision is exhausted at large `g_scroll` values, typically after many minutes).
+*Files: `fractal_random/perlin_landscape.c`*
+
+---
+
+#### P23 Involute Gear Tooth Geometry
+
+An involute gear tooth profile is derived from the involute of the base circle: the curve traced by the end of a taut string unwound from the circle. Parametrically: `x = r·(cos(t) + t·sin(t))`, `y = r·(sin(t) − t·cos(t))`. This geometry ensures that meshing gears maintain a constant velocity ratio — the contact point moves along a fixed pressure line regardless of where in the mesh cycle the teeth are. For ASCII rendering, the gear is not drawn with the full involute profile; instead the tooth boundaries are approximated as radial line segments and circular arcs, which are close enough to the involute at terminal resolution.
+
+Sparks emitted from tooth tips carry the tangential surface velocity `v_tang = −sin(θ) × ω × R` where `θ` is the tooth tip angle and `ω` is the angular velocity. At low `ω` sparks fly nearly radially; at high `ω` the tangential component dominates and sparks sweep in wide arcs that track the rotation direction. This is a physically accurate model of grinding sparks — the same phenomenon seen on angle grinders and lathes.
+
+Wireframe rendering without rasterization: each terminal cell is tested for proximity to circular arc or radial edge features using polar coordinates `(rad, ang)`. Circle arcs use `|rad − R_target| < THRESH_CIRC`; radial edges use the angle from the nearest tooth centre. This avoids any polygon rasterization — the gear is defined by distance-to-feature inequalities evaluated per-cell.
+*Files: `artistic/gear.c`*
+
+---
+
+### Q — Artistic / Signal-Based Effects (new entries)
+
+#### Q5 Cooley-Tukey Radix-2 FFT Visualizer
+
+The Cooley-Tukey FFT recursively splits an N-point DFT into two N/2-point DFTs of even- and odd-indexed samples, then combines them with twiddle factors `W_N^k = exp(−2πik/N)`:
+
+```
+X[k]     = E[k] + W_N^k · O[k]     k = 0 … N/2−1
+X[k+N/2] = E[k] − W_N^k · O[k]
+```
+
+The iterative bottom-up implementation avoids stack overhead. Input samples are reordered by bit-reversal permutation first (so index `n` appears at position `bit_reverse(n)`), then the butterfly stages process groups of increasing span `m = 2, 4, 8, …, N`. Complexity: O(N log₂ N) vs O(N²) for the naive DFT — for N=256 that is 2048 vs 65536 multiplications.
+
+Only the first N/2 bins are displayed (the upper half are complex conjugates of the lower half for real-valued inputs — the Nyquist theorem). Bin `k` represents frequency `k·f_sample/N`. Adding a pure sine of frequency `f` to the signal produces a spike at bin `f` — the DFT is linear, so a sum of three sines produces three spikes. Spectral leakage appears when a sine frequency falls between two bins: energy "leaks" into adjacent bins and the spike becomes a wide lobe. Multiplying the input by a window function (Hann, Hamming) reduces leakage at the cost of frequency resolution.
+*Files: `artistic/fft_vis.c`*
+
+---
+
+#### Q6 DFT Epicycles — Fourier Drawing Replay
+
+Any closed 2D curve sampled at N points can be decomposed into N complex DFT coefficients, each representing a rotating circle (epicycle) with frequency `n`, amplitude `|Z[n]|/N`, and initial phase `arg(Z[n])`. Treating each point `(x_k, y_k)` as a complex number `z_k = x_k + iy_k`, the DFT is:
+
+```
+Z[n] = Σ_{k=0}^{N-1} z[k] · exp(−2πikn/N)
+```
+
+Reconstruction at time `t ∈ [0,1]` is `z(t) = Σ_n (Z[n]/N)·exp(2πint)` — the sum of N rotating arms. Sorting arms by decreasing amplitude `|Z[n]|` gives the energy-optimal partial approximation: the first `M` arms reconstruct the dominant shape, successive arms add finer detail. Parseval's theorem ensures the cumulative power fraction `Σ_{k=0}^{M} |Z[k]|² / Σ |Z[k]|²` rises monotonically from 0 to 1 as `M` increases.
+
+The Gibbs phenomenon is visible on shapes with sharp corners (squares, arrows): the partial Fourier sum overshoots the true value by approximately 9% at each discontinuity, regardless of how many terms are included. This overshoot does not decrease with more terms — it merely concentrates into a narrower spike. Aspect correction is applied to the `x` coordinates before the DFT so the reconstructed shape appears undistorted on the non-square terminal grid.
+*Files: `artistic/fourier_draw.c`*
+
+---
+
+### T — Wave Physics & Signal Analysis (new entries)
+
+#### T4 2D Wave Equation — FDTD with Sponge Boundaries
+
+The 2D wave equation `∂²u/∂t² = c²∇²u` is discretized with the second-order FDTD stencil:
+
+```
+u[t+1][i][j] = 2u[t][i][j] − u[t−1][i][j]
+             + C²·(u[t][i+1][j] + u[t][i−1][j]
+                  + u[t][i][j+1] + u[t][i][j-1] − 4u[t][i][j])
+             − DAMP·(u[t][i][j] − u[t−1][i][j])
+```
+
+The CFL stability condition for 2D is `c·dt/dx ≤ 1/√2`. Violating it causes exponential blow-up within a few steps. Only two time levels (`t` and `t−1`) are needed despite the second-order time derivative — the stencil computes `t+1` from both, then the old `t−1` buffer is overwritten with `t+1`.
+
+A sponge (absorbing) boundary layer at the grid edges suppresses reflections that would otherwise create a standing-wave "box mode." Within `BORDER_W` cells of each edge, the damping coefficient ramps up from zero at the interior boundary to a maximum at the wall. This is far simpler to implement than a Perfectly Matched Layer (PML) and sufficient for terminal-resolution wave visualisation. Point sources are driven as `u[row][col] += A·sin(2π·f·t)`, creating circular wave-fronts; multiple sources create interference patterns where constructive and destructive interference alternate spatially.
+*Files: `fluid/wave_2d.c`*
+
+---
+
+#### T5 Navier-Stokes Stable Fluids — Stam's Method
+
+Jos Stam's "Stable Fluids" (SIGGRAPH 1999) simulates incompressible viscous flow by operator-splitting each timestep into four sub-steps, each of which is unconditionally stable regardless of timestep size:
+
+1. **Add forces:** `v += f · dt`
+2. **Diffuse:** `(I − ν∇²)v_new = v` — solved with Gauss-Seidel iteration on the implicit system. Unconditionally stable because the implicit system always has a solution.
+3. **Advect:** `v(x, t+dt) = v(x − v·dt, t)` — semi-Lagrangian back-tracing. Sample the field at the back-traced position with bilinear interpolation. Unconditionally stable because it is a sampling operation, not an extrapolation.
+4. **Project:** Solve the Poisson equation `∇²p = ∇·v` with Gauss-Seidel, then subtract `∇p` from velocity. This enforces incompressibility (`∇·v = 0`).
+
+The density field (dye/smoke) follows the same diffuse+advect steps without the project step. Dynamic normalisation (`display = density / max_density`) prevents the display from going blank as dye concentrations change. Gauss-Seidel with `ITER = 16` iterations gives acceptable incompressibility for N = 80: residual decays geometrically per pass and the visual error is imperceptible.
+*Files: `fluid/navier_stokes.c`*
+
+---
+
+#### T6 FitzHugh-Nagumo Reaction-Diffusion — Excitable Media
+
+The FitzHugh-Nagumo equations model excitable media such as cardiac muscle and nerve axons. Two coupled PDEs govern a fast activator `u` (membrane voltage analogue) and a slow inhibitor `v` (recovery variable):
+
+```
+∂u/∂t = u − u³/3 − v + D∇²u   ← fast, cubic nonlinearity creates threshold
+∂v/∂t = ε·(u + a − b·v)       ← slow recovery
+```
+
+The cubic term `u³/3` creates the excitation threshold: small perturbations decay back to rest; perturbations above threshold trigger a full spike. The inhibitor `v` rises after each spike (refractory period) and prevents re-excitation — this is why action potentials travel as one-way waves rather than reflecting back. The `ε ≪ 1` timescale ratio makes `v` much slower than `u`, producing the characteristic fast-rise, slow-decay shape of an action potential.
+
+Explicit Euler integration with `STEPS_PER_FRAME = 8` sub-steps maintains the CFL stability condition `DT·D/dx² < 0.25` while displaying at 30 fps. Spiral waves initiate from a broken planar wavefront: create a horizontal wave then make the lower half of the medium refractory. The free end curls into a rotating spiral that sustains itself indefinitely. Two counter-rotating spirals that collide annihilate each other — a direct simulation of cardiac re-entry arrhythmia termination.
+*Files: `fluid/reaction_wave.c`, `fluid/excitable.c`*
+
+---
+
+### I — Raytracing (new entries)
+
+#### I14 Analytic Ray-Capsule Intersection
+
+A capsule is a cylinder capped at each end by a hemisphere. The analytic intersection decomposes into two sub-problems solved sequentially. First, project out the axial component of the ray to reduce to a 2D problem:
+
+```
+ba = cb − ca      (axis vector)
+a  = baba − bard²  (baba = |ba|², bard = dot(ba,rd))
+b  = baba·dot(rd,oa) − baoa·bard
+c  = baba·(|oa|² − r²) − baoa²
+h  = b² − a·c
+```
+
+If `h < 0`, the ray misses the infinite cylinder and both caps. Otherwise, candidate body hit at `t = (−b − √h)/a`. The body hit is valid if the axial coordinate `y = baoa + t·bard` satisfies `0 < y < baba` (between the two cap planes). If the body misses, try the hemisphere at the corresponding endpoint using a standard sphere quadratic. The body-to-cap normal transition is `C¹` continuous: at the seam the radial body normal and the hemispherical cap normal are equal.
+
+The key optimisation is that if `h < 0` (cylinder miss), no cap can be hit — caps are always geometrically inside the cylinder's lateral extent. This early-exit saves two square roots on the common miss path. The same inverse-rotation-matrix trick used in `cube_raytrace.c` transforms the ray into object space so the capsule axis is always aligned with Y — no general axis-handling is needed.
+*Files: `raytracing/capsule_raytrace.c`*
+
+---
+
+#### I15 Quartic Torus Ray Intersection — Sampling + Bisection
+
+Substituting the ray `P(t) = ro + t·rd` into the torus implicit equation `(√(x²+z²) − R)² + y² = r²` and expanding produces a quartic polynomial in `t`:
+
+```
+t⁴ + A·t³ + B·t² + C·t + D = 0
+A = 4·dot(rd,ro)
+B = 4·dot(rd,ro)² + 2·C₀ − 4R²·(rdx² + rdz²)
+C = 4·dot(rd,ro)·C₀ − 8R²·(rdx·rox + rdz·roz)
+D = C₀² − 4R²·(rox² + roz²)    where C₀ = |ro|² + R² − r²
+```
+
+Rather than Ferrari's analytic quartic solver (numerically unstable near degenerate cases), a hybrid sampling+bisection approach is used: evaluate the quartic via Horner's method `t(t(t(t+A)+B)+C)+D` at 256 equally-spaced points in `[ε, T_MAX]`; detect sign changes; bisect 40 times in each bracketed interval to locate the root to sub-floating-point precision. This is robust, predictable, and fast enough for terminal frame rates.
+
+The surface normal at hit point `P` is the gradient of the implicit function: `N = normalize(P − R·normalize(P_xz))` where `P_xz = (P.x, 0, P.z)` is the XZ projection. Geometrically, `R·normalize(P_xz)` is the nearest point on the ring centreline — the normal points radially outward from that centre-line point, which is the "outward tube direction" at any surface location.
+*Files: `raytracing/torus_raytrace.c`*
 
 ---
 

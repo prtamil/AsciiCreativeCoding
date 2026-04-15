@@ -68,3 +68,14 @@ A complex number `x + i·y` represents a 2-D point. Multiplying by `exp(iθ)` ro
 | AUTO_ADD_FRAMES | Fewer → faster convergence demo; more → more time to appreciate each stage |
 | SHAPE_SCALE | Fraction of terminal size for the shape; too large → epicycles go off-screen |
 | N_CIRCLES | How many orbit circles are drawn when toggled on |
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_epics[N_SAMPLES]` | `Epicycle[256]` | ~3 KB | DFT coefficients sorted by descending amplitude |
+| `g_trail` | `Trail` (px/py float[600], head, count) | ~5 KB | ring buffer of tip path positions |
+| `g_tips_px[N_SAMPLES+1]` | `float[257]` | ~1 KB | arm chain x positions in pixel space |
+| `g_tips_py[N_SAMPLES+1]` | `float[257]` | ~1 KB | arm chain y positions in pixel space |
+| `g_phi` | `float` | 4 B | current animation angle [0, 2π) |
+| `g_n_active` | `int` | 4 B | number of epicycle arms currently animated |

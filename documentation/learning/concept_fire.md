@@ -143,6 +143,14 @@ theme 0 (fire) ──── 300 ticks ────► theme 1 (ice) ────
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `heat[rows*cols]` | `float[]` | ~40 KB | current heat values for the CA |
+| `prev_heat[rows*cols]` | `float[]` | ~40 KB | last-drawn heat for diff-based clearing |
+| `dither[rows*cols]` | `float[]` | ~40 KB | Floyd-Steinberg dither working buffer |
+
 # Pass 2 — fire: Pseudocode
 
 ## Module Map

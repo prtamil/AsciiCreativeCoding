@@ -252,6 +252,12 @@ resolution.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_themes[]` | `const Theme[6]` | ~288 B | Per-theme diffuse, specular, and three light colour vectors |
+
 # Pass 2 — capsule_raytrace.c: Pseudocode
 
 ## Module Map

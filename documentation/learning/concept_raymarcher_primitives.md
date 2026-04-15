@@ -130,6 +130,14 @@ No state machine. Continuous tumble animation. One boolean: `paused`.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app.scene.canvas.intensity` | `float*` (heap, cols×rows) | ~varies | Raw per-pixel intensity from the march loop |
+| `g_app.scene.canvas.pixels` | `int*` (heap, cols×rows) | ~varies | Per-pixel ramp index after tone mapping (or CANVAS_MISS) |
+| `k_prims[N_PRIMS]` | `Prim[17]` | ~varies | SDF function pointer + name + parameter defaults for each primitive |
+
 # Pass 2 — raymarcher_primitives: Pseudocode
 
 ## Module Map

@@ -63,6 +63,19 @@ Critical temperature (2D Ising): `Tc = 2J / (k_B · ln(1+√2)) ≈ 2.269 J/k_B`
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_spin[GRID_H_MAX][GRID_W_MAX]` | `signed char[60][200]` | 12 KB | spin lattice: +1 (up) or −1 (down) per cell |
+| `g_boltz[3]` | `float[3]` | 12 B | precomputed Boltzmann acceptance factors for ΔE = 4, 8 |
+| `g_temp` | `float` | 4 B | current simulation temperature (in units J = k_B = 1) |
+| `g_sweeps` | `long long` | 8 B | total Monte Carlo sweep count for HUD |
+| `g_gh`, `g_gw` | `int` | 8 B | active grid dimensions (capped at terminal size) |
+| `g_rows`, `g_cols` | `int` | 8 B | terminal dimensions |
+| `g_theme` | `int` | 4 B | index into k_themes table |
+| `g_paused`, `g_quit`, `g_resize` | `bool` / `sig_atomic_t` | 12 B | control flags |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

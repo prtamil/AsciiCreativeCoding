@@ -160,6 +160,13 @@ Rather than dynamic allocation, a fixed array of 1500 Spark structs is scanned f
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `scene.gear.sparks[1500]` | `Spark[1500]` | ~30 KB | particle pool; life<=0 means dead slot |
+| `scene.gear` | `Gear` | ~30 KB | single gear: center, angle, rot_speed, density, spark pool |
+
 # Pass 2 — Pseudocode, Module Map, Data Flow
 
 ## Module Map

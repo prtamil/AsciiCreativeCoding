@@ -57,6 +57,17 @@ dv/dt = u - v
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_u[GRID_H_MAX][GRID_W_MAX]` | `float[100][320]` | ~125 KB | activator u (membrane voltage analogue) |
+| `g_v[GRID_H_MAX][GRID_W_MAX]` | `float[100][320]` | ~125 KB | inhibitor v (recovery variable) |
+| `g_u2[GRID_H_MAX][GRID_W_MAX]` | `float[100][320]` | ~125 KB | scratch buffer for next u |
+| `g_v2[GRID_H_MAX][GRID_W_MAX]` | `float[100][320]` | ~125 KB | scratch buffer for next v |
+
+---
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

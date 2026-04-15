@@ -56,6 +56,17 @@ separate each ball by overlap/2 along n̂
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_disc[N_DISCS]` | `Disc[25]` | ~600 B | center, velocity, radius, mass, flash timer per disc |
+| `g_pw`, `g_ph` | `float` | 8 B | pixel-space world width and height |
+| `g_coll_total` | `long long` | 8 B | cumulative collision count displayed in HUD |
+| `g_rows`, `g_cols` | `int` | 8 B | terminal dimensions |
+| `g_paused`, `g_speed` | `bool` / `int` | 8 B | simulation pause flag and speed multiplier |
+| `g_quit`, `g_resize` | `volatile sig_atomic_t` | 8 B | signal flags |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

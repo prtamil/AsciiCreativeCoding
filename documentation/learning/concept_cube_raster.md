@@ -93,6 +93,18 @@ No state machine. Continuous rotation. One boolean: `paused`.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `VSIn` (struct) | `typedef struct` | 32 B | vertex input: position Vec3, normal Vec3, u/v floats |
+| `VSOut` (struct) | `typedef struct` | 64 B | vertex output: clip_pos Vec4, world_pos/nrm Vec3, custom[4] |
+| `FSIn` / `FSOut` | `typedef struct` | ~40 B | fragment input (interpolated VSOut) / output (color Vec3, discard) |
+| `Uniforms` (struct) | `typedef struct` | ~200 B | MVP matrices, light pos/col, camera pos, shininess |
+| `g_zbuf[rows×cols]` | `float[]` | ~80 KB | per-cell depth buffer for hidden-surface removal |
+| `g_cbuf[rows×cols]` | `Vec3[]` | ~240 KB | per-cell colour buffer; blitted to ncurses each frame |
+| `k_bayer[4][4]` | `float[16]` | 64 B | Bayer ordered-dither matrix for ASCII density mapping |
+
 # Pass 2 — cube_raster: Pseudocode
 
 ## Module Map

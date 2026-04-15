@@ -56,6 +56,15 @@ Each cell is a pixel. Every tick, count how many of its 8 neighbors are "on." Ap
 - Find a glider pattern in Life. What is its period?
 - Try B3/S23 with a random starting density — what density gives max complexity?
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_grid[2][MAX_ROWS][MAX_COLS]` | `uint8[2][128][320]` | ~82 KB | double-buffered toroidal cell grid |
+| `g_pop_hist[HIST_LEN]` | `long[512]` | ~4 KB | ring buffer of per-generation population counts |
+| `g_buf` | `int` | 4 B | index of active grid buffer (0 or 1) |
+| `g_rule_idx` | `int` | 4 B | index into RULES[] selecting the current B/S rule |
+
 ---
 
 ## Pass 2 — Implementation

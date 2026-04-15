@@ -249,6 +249,13 @@ Surface normal: `n = (cos φ cos θ, cos φ sin θ, sin φ)`. Lighting: L·N dot
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app.torus.zbuf[TORUS_CELLS]` | `float[512×256]` | ~512 KB | Per-cell reciprocal depth (1/z) for visibility resolution |
+| `g_app.torus.outbuf[TORUS_CELLS]` | `char[512×256]` | ~128 KB | Per-cell ASCII luminance character for blitting to stdscr |
+
 # Pass 2 — donut.c: Pseudocode
 
 ## Module Map

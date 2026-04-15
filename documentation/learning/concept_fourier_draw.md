@@ -58,6 +58,17 @@ Each term `Z[n]/N · e^{2πi·n·t}` is a rotating circle with:
 - Why are negative frequencies needed for non-symmetric shapes?
 - Try drawing your name with mouse input, then replay with epicycles
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_epics[N_SAMPLES]` | `Epicycle[256]` | ~3 KB | DFT coefficients sorted by amplitude |
+| `g_ghost[N_SAMPLES]` | `Cplx[256]` | ~2 KB | original shape samples for ghost overlay |
+| `g_cum_energy[N_SAMPLES]` | `float[256]` | ~1 KB | cumulative Parseval power fraction per arm |
+| `g_trail` | `Trail` (px/py float[512], head, count) | ~4 KB | ring buffer of tip path positions |
+| `g_tips_px[N_SAMPLES+1]` | `float[257]` | ~1 KB | arm chain x positions in pixel space |
+| `g_tips_py[N_SAMPLES+1]` | `float[257]` | ~1 KB | arm chain y positions in pixel space |
+
 ---
 
 ## Pass 2 — Implementation

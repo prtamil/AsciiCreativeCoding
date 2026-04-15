@@ -101,6 +101,12 @@ No state machine. Continuous animation. One boolean: `paused`.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app.scene.canvas.pixels` | `int*` (heap, cols×rows) | ~varies | Per-pixel ramp index or CANVAS_MISS for each frame |
+
 # Pass 2 — raymarcher: Pseudocode
 
 ## Module Map

@@ -58,6 +58,15 @@ Where η_ij = 1/distance (heuristic), α controls pheromone weight, β controls 
 - What happens when β=0? (pure pheromone following, no distance heuristic)
 - ACO on a dynamic graph where edge costs change mid-simulation?
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_ph[GRID_H_MAX][GRID_W_MAX]` | `float[100][320]` | ~128 KB | pheromone concentration per grid cell |
+| `g_ants[N_ANTS]` | `Ant[50]` | ~800 B | ant positions, directions, and states |
+| `g_food_row[2]`, `g_food_col[2]` | `int[2]` × 2 | 16 B | coordinates of the two food sources |
+| `g_nest_row`, `g_nest_col` | `int` × 2 | 8 B | coordinates of the nest |
+
 ---
 
 ## Pass 2 — Implementation

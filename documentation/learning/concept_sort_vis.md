@@ -53,6 +53,15 @@ An array of bars of different heights. Watch them move around as the algorithm r
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_arr[48]` | `int[48]` | 192 B | array being sorted; visualized as bar heights |
+| `g_qlo[128]`, `g_qhi[128]` | `int[128]` | ~1 KB | quicksort stack: low/high bounds per pending partition |
+| `g_cmp1`, `g_cmp2` | `int` | 8 B | indices currently being compared (highlighted red) |
+| `g_swp1`, `g_swp2` | `int` | 8 B | indices just swapped (highlighted blue) |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

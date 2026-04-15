@@ -90,6 +90,17 @@ The exact nodal line `|z| = 0` would be a 1-pixel-thick line, nearly invisible a
 | NODAL_THRESH | Inner band threshold; smaller → thinner bright core |
 | N_MODES | Total number of mode pairs (20 for m<n≤7) |
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `MODES[][2]` | `int[20][2]` | 160 B | all (m,n) mode pairs with 1 ≤ m < n ≤ 7 (20 entries) |
+| `g_mode` | `int` | scalar | index into MODES array for current Chladni figure |
+| `g_morph_t` | `float` | scalar | blend factor [0,1] between current and next mode |
+| `NODAL_THRESH` | `float` constant | N/A | |Z| threshold for nodal line glow (0.04) |
+| `MORPH_SPEED` | `float` constant | N/A | t increment per tick (~1.3 s total morph at 30 fps) |
+| `HOLD_TICKS` | `int` constant | N/A | ticks before morphing starts (~4 s at 30 fps) |
+
 ## From the Source
 
 **Physics/References:** Ernst Chladni, 1787 — the first systematic study of vibration patterns on plates. These are called Chladni figures after him.

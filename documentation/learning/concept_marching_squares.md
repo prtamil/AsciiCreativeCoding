@@ -72,6 +72,15 @@ Two ambiguous cases exist (case 5 and case 10 — checkerboard pattern) where tw
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_blobs[N_BLOBS]` | `Blob[4]` | ~80 B | metaball positions, velocities, strengths |
+| `fld[256][128]` | `float[256][128]` (local in `app_draw`) | ~128 KB | corner field values sampled once per frame before marching |
+
+---
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

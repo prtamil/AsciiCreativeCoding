@@ -58,6 +58,16 @@ Euler angles:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app` | `App` | ~5 KB | top-level container: scene (Gyro) + screen + control flags |
+| `g_app.scene.gyro` | `Gyro` | ~4 KB | angular velocity, quaternion, derived axes, angular momentum, trail |
+| `Gyro.omega[3]` | `float[3]` | 12 B | angular velocity in body frame (rad/s) |
+| `Gyro.quat[4]` | `float[4]` | 16 B | orientation quaternion (re-normalised each step) |
+| `Gyro.trail[TRAIL_LEN]` | `TrailPt[300]` | ~2.4 KB | ring-buffer of polhode tip screen positions |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

@@ -92,3 +92,12 @@ Fourier series connection: the cardioid appears in complex power series, and the
 | K_SPEED | Base drift speed of k per frame |
 | RIM_STEPS | More → smoother circle rim |
 | N_TCOLS (12) | Color cycle length; fewer → more visible repetition |
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_nail_cx[N_NAILS_MAX]` | `int[200]` | 800 B | Screen column coordinate of each nail |
+| `g_nail_cy[N_NAILS_MAX]` | `int[200]` | 800 B | Screen row coordinate of each nail |
+| `g_k` | `float` | 4 B | Current multiplier k driving nail→nail thread mapping |
+| `g_k_speed` | `float` | 4 B | Drift speed of k per tick |

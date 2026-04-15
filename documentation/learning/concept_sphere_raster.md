@@ -80,6 +80,18 @@ No state machine. Continuous rotation. One boolean: `paused`.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `VSIn` / `VSOut` / `FSIn` / `FSOut` | `typedef struct` | ~40–64 B each | shader I/O types for the vertex → fragment pipeline |
+| `Uniforms` (struct) | `typedef struct` | ~200 B | MVP matrices, normal matrix, light pos/col, camera pos |
+| `g_zbuf[rows×cols]` | `float[]` | ~80 KB | per-cell depth buffer for hidden-surface removal |
+| `g_cbuf[rows×cols]` | `Vec3[]` | ~240 KB | per-cell colour accumulator; blitted to ncurses each frame |
+| `TESS_U`, `TESS_V` | `int` constants | N/A | UV sphere tessellation (36 longitude × 24 latitude = 1728 triangles) |
+| `SPHERE_R` | `float` constant | N/A | sphere radius (1.0); fits well at CAM_DIST=2.6 with FOV=55° |
+| `k_bayer[4][4]` | `float[16]` | 64 B | Bayer ordered-dither matrix for ASCII density ramp |
+
 # Pass 2 — sphere_raster: Pseudocode
 
 ## Module Map

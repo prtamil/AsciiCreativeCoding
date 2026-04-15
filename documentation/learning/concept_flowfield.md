@@ -128,6 +128,16 @@ No state machine. Continuous simulation. Only boolean: `paused`. Dead particles 
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `Field.angles` | `float*` (malloc'd, cols×rows) | ~30 KB at 300×25 | flow angle (radians) per cell; recomputed from noise each tick |
+| `Scene.pool[PARTICLES_MAX]` | `Particle[800]` | ~150 KB | particle positions, trail ring buffers, speeds, lifetimes |
+| `perm[512]` | `uint8_t[512]` | 512 B | Perlin noise permutation table; initialised once from RNG |
+
+---
+
 # Pass 2 — flowfield: Pseudocode
 
 ## Module Map

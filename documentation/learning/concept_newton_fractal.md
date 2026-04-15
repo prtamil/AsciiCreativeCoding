@@ -50,6 +50,17 @@ Roots of z³-1 = (1, e^{2πi/3}, e^{4πi/3}).
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `MAX_ITER` | `int` constant | N/A | Newton iteration cap per pixel (64) |
+| `TOL` | `float` constant | N/A | convergence tolerance |z − root| < TOL (1e-5) |
+| `x_min`, `x_max`, `y_min`, `y_max` | `float` (view state) | scalar | current complex plane viewport for pan/zoom |
+| `ROOT_ZOOM[4][4]` | `float[4][4]` | 64 B | preset zoom windows centred on each of the 4 roots |
+| `ZOOM_FACTOR` | `float` constant | N/A | zoom step per keypress (1.30×) |
+| `PAN_FRAC` | `float` constant | N/A | pan fraction of current viewport width per keypress (0.15) |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

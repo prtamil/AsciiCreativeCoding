@@ -56,6 +56,15 @@ x += v · dt
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app` | `App` | ~50 KB | top-level container: scene + screen + control flags |
+| `g_app.scene.cloth` | `Cloth` | ~47 KB | nodes[540] + springs[3240] + state |
+| `Cloth.nodes[CLOTH_N]` | `Node[540]` | ~17 KB | position, velocity, render-snapshot, pinned flag per node |
+| `Cloth.springs[MAX_SPRINGS]` | `Spring[3240]` | ~52 KB | endpoint indices, rest length, stiffness, damping per spring |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

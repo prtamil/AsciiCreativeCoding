@@ -129,6 +129,15 @@ No state machine. Continuous CA. One boolean flag for paused.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `bmap[cols*(rows+2)]` | `uint8_t[]` | ~10 KB | heat bitmap (visible rows + 2 fuel rows) |
+| `prev[cols*rows]` | `uint8_t[]` | ~10 KB | previous frame for diff-based clearing |
+| `dither[cols*rows]` | `float[]` | ~40 KB | Floyd-Steinberg dither working buffer |
+| `table[MAXTABLE]` | `uint32_t[1280]` | 5 KB | decay lookup: sum-of-5-neighbours → new heat |
+
 # Pass 2 — aafire_port: Pseudocode
 
 ## Module Map

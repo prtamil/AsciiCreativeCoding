@@ -51,6 +51,14 @@ Normalize v to [0,1], then map to a cyclic palette.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `THEMES[4][14]` | `PalEntry[4][14]` | ~560 B | per-theme palette: 14 character/color/attr entries |
+| `FREQ_PRESETS[4]` | `FreqPreset[4]` | ~160 B | four spatial frequency and time-speed presets |
+| `scene.plasma` | `Plasma` | ~16 B | active state: time accumulator, freq preset, theme, paused flag |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

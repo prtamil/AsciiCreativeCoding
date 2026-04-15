@@ -46,6 +46,17 @@ Color by escape time (how many iterations before |z|>2).
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `MAX_ITER` | `int` constant | N/A | iteration cap before declaring inside the set (96) |
+| `x_min`, `x_max`, `y_min`, `y_max` | `float` (view state) | scalar | current complex plane viewport; pan/zoom modify these |
+| `INIT_X_MIN` … `INIT_Y_MAX` | `float` constants | N/A | default full-fractal view (−2.6 to 1.4 real, −2.0 to 0.8 imag) |
+| `SHIP_X_MIN` … `SHIP_Y_MAX` | `float` constants | N/A | preset zoom to the characteristic ship hull region |
+| `ZOOM_FACTOR` | `float` constant | N/A | zoom step per keypress (1.30×) |
+| `CELL_W`, `CELL_H` | `int` constants | N/A | pixel-per-cell aspect ratio (8 wide, 16 tall) for correct fractal proportions |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

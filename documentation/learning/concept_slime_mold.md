@@ -164,6 +164,17 @@ Per tick (regardless of preset):
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_trail[ROWS_MAX][COLS_MAX]` | `float[128][512]` | 256 KB | pheromone trail concentration; agents read and deposit here |
+| `g_buf[ROWS_MAX][COLS_MAX]` | `float[128][512]` | 256 KB | diffusion workspace; trail_update writes here then swaps |
+| `g_agents` | `Agent*` (malloc'd) | ~24 KB at 2000 agents | agent positions (x,y) and heading angle |
+| `g_food[N_FOOD]` | `FoodSrc[3]` | 24 B | food source positions; attract agents and floor trail |
+
+---
+
 # Pass 2 — slime_mold: Pseudocode
 
 ## Module Map

@@ -137,6 +137,13 @@ IDLE ──(fuse reaches 0)──→ RISING
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `rockets[MAX_ROCKETS]` | `Rocket[20]` | ~48 KB | object pool of ascending rockets |
+| `rockets[i].particles[PARTICLES_PER_BURST]` | `Particle[80]` | 2.4 KB each | per-rocket spark pool for one explosion |
+
 # Pass 2 — fireworks: Pseudocode
 
 ## Module Map

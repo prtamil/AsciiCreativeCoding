@@ -63,6 +63,17 @@ Normalization: `Σ_x ρ(x,t)·dx = 1` should be conserved.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_re[N_GRID]`, `g_im[N_GRID]` | `float[512]` × 2 | 4 KB each | real and imaginary parts of the wavefunction ψ |
+| `g_V[N_GRID]` | `float[512]` | 2 KB | potential energy array V(x) for the current preset |
+| `g_cx_tmp[N_GRID]`, `g_cx_cp[N_GRID]` | `Cx[512]` × 2 | 8 KB each | Thomas algorithm workspace (complex forward-sweep arrays) |
+| `g_k0` | `float` | 4 B | initial wavenumber controlling wave packet energy |
+| `g_preset` | `int` | 4 B | active preset index (free/barrier/harmonic/double-slit) |
+| `g_rows`, `g_cols` | `int` | 8 B | terminal dimensions |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

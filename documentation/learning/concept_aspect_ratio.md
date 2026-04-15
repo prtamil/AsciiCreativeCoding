@@ -84,6 +84,15 @@ No state machine. The only "state" is whether the user has pressed 'q'. If yes, 
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `center_x`, `center_y` | `int` | scalar | screen centre column and row |
+| `radius` | `int` | scalar | circle radius in row-units before aspect scaling |
+| `win` | `WINDOW *` | N/A | ncurses window used for double-buffer erase/refresh |
+| `angle` | `double` | scalar | loop variable iterating 0..2π in steps of 0.1 rad |
+
 # Pass 2 — aspect_ratio: Pseudocode
 
 ## Module Map

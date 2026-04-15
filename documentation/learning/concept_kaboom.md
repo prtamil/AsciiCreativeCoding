@@ -153,6 +153,13 @@ DONE:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `blobs[NUM_BLOBS]` | `Blob[800]` | ~19 KB | 3-D debris particle pool (x,y,z doubles) |
+| `cells[cols*rows]` | `Cell[]` | ~20 KB | per-cell framebuffer (char + color) |
+
 # Pass 2 — kaboom: Pseudocode
 
 ## Module Map

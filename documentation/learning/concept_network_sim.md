@@ -57,6 +57,20 @@ Scale-free (Barabási-Albert): new nodes attach preferentially to high-degree no
 
 **Data-structure:** Watts-Strogatz construction: start with a K=4 ring graph (each node connected to K/2 nearest neighbours on each side); rewire each edge with probability p=0.15, replacing the target with a random node. Rewired "shortcut" edges create the small-world property: short average path length + high clustering coefficient.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_adj[N_NODES][N_NODES]` | `bool[40][40]` | ~1.6 KB | adjacency matrix of the Watts-Strogatz graph |
+| `g_rewired[N_NODES][N_NODES]` | `bool[40][40]` | ~1.6 KB | flags edges that were rewired (shortcut edges) |
+| `g_node_px[N_NODES]` | `float[40]` | 160 B | x pixel positions of nodes on ring layout |
+| `g_node_py[N_NODES]` | `float[40]` | 160 B | y pixel positions of nodes on ring layout |
+| `g_state[N_NODES]` | `SIR[40]` | 160 B | current S/I/R state per node |
+| `g_flash[N_NODES]` | `int[40]` | 160 B | countdown ticks for newly-infected flash |
+| `g_hist_s[HIST_LEN]` | `int[500]` | ~2 KB | rolling S count history for epidemic curve |
+| `g_hist_i[HIST_LEN]` | `int[500]` | ~2 KB | rolling I count history for epidemic curve |
+| `g_hist_r[HIST_LEN]` | `int[500]` | ~2 KB | rolling R count history for epidemic curve |
+
 ---
 
 ## Pass 2 — Implementation

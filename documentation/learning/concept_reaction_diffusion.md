@@ -76,3 +76,15 @@ Starting from a uniform state takes many seconds before patterns form. A seed bl
 **Physics/References:** Turing instability (Alan Turing, 1952). Two chemicals with different diffusion rates (Du > Dv) plus a nonlinear autocatalytic reaction (U·V²) can spontaneously break spatial symmetry. The U·V² term means V catalyses its own production by consuming U — this activator-inhibitor dynamic is required for pattern formation. The (f,k) parameter space is the Gray-Scott map.
 
 **Performance:** Double-buffering (u/v ← u2/v2 swap) avoids read-write aliasing within a single step. All arithmetic stays in float, fitting a row in cache at moderate widths. STEPS_DEFAULT=16 sim steps per render frame trades visual smoothness for pattern evolution speed. Data structure: two flat float arrays (row-major) per chemical; one pair for reading, one for writing, swapped each step.
+
+---
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `Grid.u` | `float*` (malloc'd, cols×rows) | ~20 KB at 256×20 | substrate U concentration (current read buffer) |
+| `Grid.v` | `float*` (malloc'd, cols×rows) | ~20 KB | catalyst V concentration (current read buffer) |
+| `Grid.u2` | `float*` (malloc'd, cols×rows) | ~20 KB | scratch buffer for next U; swapped with u after each step |
+| `Grid.v2` | `float*` (malloc'd, cols×rows) | ~20 KB | scratch buffer for next V; swapped with v after each step |
+| `k_presets[N_PRESETS]` | `Preset[7]` | ~280 B | (f, k, n_seeds) parameter sets defining the seven pattern regimes |

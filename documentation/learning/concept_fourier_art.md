@@ -163,6 +163,18 @@ if phi ≥ 2π: phi -= 2π; trail_clear()    // one full cycle complete
 | 3 | Ocean | Teal/blue | Cyan gradient |
 | 4 | Matrix | Green shades | Lime gradient |
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_epics[N_SAMPLES]` | `Epicycle[256]` | ~3 KB | DFT coefficients sorted by amplitude |
+| `g_raw_px[RAW_MAX]` | `float[8192]` | 32 KB | raw x cursor positions during draw mode |
+| `g_raw_py[RAW_MAX]` | `float[8192]` | 32 KB | raw y cursor positions during draw mode |
+| `g_drawn[ROWS_MAX][COLS_MAX]` | `uint8[128][512]` | 64 KB | painted cells for draw-mode display |
+| `g_trail` | `Trail` (px/py float[600], head, count) | ~5 KB | ring buffer of tip path positions |
+| `g_tips_px[N_SAMPLES+1]` | `float[257]` | ~1 KB | arm chain x positions in pixel space |
+| `g_tips_py[N_SAMPLES+1]` | `float[257]` | ~1 KB | arm chain y positions in pixel space |
+
 ---
 
 # Pass 2 — fourier_art: Pseudocode

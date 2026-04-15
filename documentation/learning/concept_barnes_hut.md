@@ -237,3 +237,16 @@ The quadtree at depth 0 is one rectangle (the full screen). Depth 1 = 4 quadrant
 **Performance:** Typical cost at N=400: ~O(400 × log₂400 × θ_factor) ≈ 3600 force evaluations vs 400² / 2 = 80000 for brute force. QT_MAX_DEPTH=32 caps recursion; NODE_POOL_MAX=16000 supports up to 800 bodies in a well-distributed quadtree.
 
 **Data-structure:** Quadtree with a pre-allocated node pool (NODE_POOL_MAX nodes). Pool avoids dynamic malloc per node; rebuilt each tick. Leaves store one body index; internal nodes store aggregated (total_mass, cx, cy) = centre of mass of all bodies below.
+
+---
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_bodies[N_BODIES_MAX]` | `Body[800]` | ~22 KB | position, velocity, mass, active/anchor flags per body |
+| `g_pool[NODE_POOL_MAX]` | `QNode[16000]` | ~896 KB | static quadtree node pool; reset by zeroing g_pool_top each tick |
+| `g_bright[GRID_ROWS_MAX][GRID_COLS_MAX]` | `float[120][400]` | ~192 KB | per-cell brightness accumulator for glow/trail rendering |
+| `g_n_bodies` | `int` | 4 B | active body count (user-adjustable) |
+| `g_G` | `float` | 4 B | gravitational constant (tunable) |
+| `g_v_max` | `float` | 4 B | rolling maximum speed for color mapping |

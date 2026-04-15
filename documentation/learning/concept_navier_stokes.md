@@ -58,6 +58,19 @@ Density field follows same diffuse+advect (no projection).
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `u[SZ]` | `float[(N+2)²]` | ~27 KB | x-velocity field (N=80, SZ=6724 cells) |
+| `v[SZ]` | `float[(N+2)²]` | ~27 KB | y-velocity field |
+| `u_prev[SZ]` | `float[(N+2)²]` | ~27 KB | previous x-velocity; scratch for diffuse/project |
+| `v_prev[SZ]` | `float[(N+2)²]` | ~27 KB | previous y-velocity; scratch for diffuse/project |
+| `dens[SZ]` | `float[(N+2)²]` | ~27 KB | dye density (passive scalar advected by velocity) |
+| `dens_prev[SZ]` | `float[(N+2)²]` | ~27 KB | previous dye density; scratch for diffuse step |
+
+---
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

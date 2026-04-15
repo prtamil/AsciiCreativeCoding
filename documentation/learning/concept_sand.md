@@ -181,6 +181,19 @@ Any grain that moves in a tick has its age reset to 0 regardless of how old it w
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `Grid.cur` | `uint8_t*` (malloc'd, cols×rows) | ~20 KB at 200×100 | current sand grid: 0=empty, 1=grain |
+| `Grid.nxt` | `uint8_t*` (malloc'd) | ~20 KB | next-state double-buffer; swapped after each tick |
+| `Grid.age` | `uint8_t*` (malloc'd) | ~20 KB | per-grain stationary-tick counter; drives visual character |
+| `Grid.nxt_age` | `uint8_t*` (malloc'd) | ~20 KB | next-state age buffer |
+| `Grid.moved` | `bool*` (malloc'd) | ~20 KB | per-cell processed flag; prevents double-moving grains |
+| `Source` | `struct { int col, w; bool on; }` | 12 B | emitter position, width, and on/off state |
+
+---
+
 # Pass 2 — sand: Pseudocode
 
 ## Module Map

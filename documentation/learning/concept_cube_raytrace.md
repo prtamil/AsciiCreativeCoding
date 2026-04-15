@@ -189,6 +189,12 @@ back faces are never visible — culling adds a branch with no benefit.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_themes[]` | `const Theme[6]` | ~288 B | Per-theme diffuse, specular, and three light colour vectors |
+
 # Pass 2 — cube_raytrace.c: Pseudocode
 
 ## Module Map

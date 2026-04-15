@@ -162,6 +162,18 @@ The derivative update formula is `dr = p · r^(p-1) · dr + 1`. Using `r^p` inst
 
 Power 2 gives a smooth blob (all real values, Mandelbrot limit). Power 8 gives the classic Mandelbulb with 8-fold rotational symmetry and the characteristic "tentacles" and pods. Powers 3–7 and 9–12 give different symmetries; power morphing (interpolating between 2 and 12) shows a smooth deformation between simple sphere and full fractal complexity.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_fbuf[CANVAS_MAX_H][CANVAS_MAX_W]` | `PixCell[]` | ~960 KB | framebuffer being filled progressively (luma + color pair) |
+| `g_stable[CANVAS_MAX_H][CANVAS_MAX_W]` | `PixCell[]` | ~960 KB | last complete frame; shown while g_fbuf is being refilled |
+| `CANVAS_MAX_W`, `CANVAS_MAX_H` | constants | N/A | maximum canvas size (400 × 120 cells) |
+| `MB_MAX_STEPS_FULL` | `int` constant | N/A | max march steps per ray in full mode (100) |
+| `MB_HIT_EPS` | `float` constant | N/A | surface hit threshold (0.002); tighter = sharper silhouette |
+| `MB_MAX_ITER` | `int` constant | N/A | Mandelbulb DE iterations (16); controls surface accuracy |
+| `MB_POWER_DEFAULT` | `int` constant | N/A | default fractal power n=8 (classic Mandelbulb) |
+
 ## From the Source
 
 **Algorithm:** SDF raymarching on the Mandelbulb — a 3D fractal. The Mandelbulb SDF is estimated (not exact) by tracking the derivative of the iteration to bound the distance: `dr = n·|z|^(n-1)·dr + 1` (derivative accumulation); `SDF ≈ 0.5·log(|z|)·|z|/dr` (distance lower bound). The ray marches along this lower bound, guaranteed not to overshoot the surface (within numerical precision).

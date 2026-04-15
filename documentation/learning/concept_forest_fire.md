@@ -165,6 +165,17 @@ PER TICK:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_cur[ROWS_MAX][COLS_MAX]` | `uint8_t[]` | ~64 KB | current generation cell states (EMPTY=0, TREE=1, FIRE=2) |
+| `g_nxt[ROWS_MAX][COLS_MAX]` | `uint8_t[]` | ~64 KB | next generation buffer (double-buffer synchronous update) |
+| `ROWS_MAX`, `COLS_MAX` | constants | N/A | maximum grid size (128 × 512) |
+| `P_GROW_DEF` | `float` constant | N/A | default regrowth probability p = 0.030 |
+| `P_FIRE_DEF` | `float` constant | N/A | default lightning probability f = 0.0002 |
+| `g_p_grow`, `g_p_fire` | `float` | scalar | current p and f values; adjusted with g/l keys |
+
 # Pass 2 — forest_fire: Pseudocode
 
 ## Module Map

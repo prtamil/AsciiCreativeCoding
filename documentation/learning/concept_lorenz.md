@@ -52,6 +52,16 @@ Classic parameters: σ=10, ρ=28, β=8/3.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app` | `App` | ~120 KB | top-level container: scene (Lorenz) + screen + control flags |
+| `g_app.scene.lorenz` | `Lorenz` | ~120 KB | main + ghost trajectory state + trails + view angles |
+| `Lorenz.mt` / `Lorenz.gt` | `Trail` (x/y/z + head/count) | ~60 KB each | ring-buffer of TRAIL_LEN=2500 Lorenz-space points per trajectory |
+| `Lorenz.mx/my/mz`, `gx/gy/gz` | `float` × 6 | 24 B | current positions of main and ghost trajectories |
+| `Lorenz.phi`, `theta` | `float` × 2 | 8 B | azimuth and elevation for orthographic projection |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

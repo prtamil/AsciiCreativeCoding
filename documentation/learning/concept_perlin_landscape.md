@@ -50,6 +50,17 @@ Parallax scrolling: layer k scrolls at `speed_k = base_speed / (k+1)`.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_scroll` | `float` | scalar | horizontal camera offset advancing each frame (in noise units) |
+| `g_speed` | `float` | scalar | scroll speed in terminal columns per frame (default 0.6) |
+| `g_freq` | `float` | scalar | noise frequency zoom multiplier (1.0 = default zoom) |
+| `BASE_FREQ_FAR/MID/NEAR` | `float` constants | N/A | per-layer noise frequency (0.009 / 0.018 / 0.040) |
+| `SCROLL_FAR/MID/NEAR` | `float` constants | N/A | per-layer parallax speed fraction (0.12 / 0.38 / 1.00) |
+| `BASE_FAR/MID/NEAR`, `AMP_FAR/MID/NEAR` | `float` constants | N/A | terrain baseline and amplitude fractions of screen height |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

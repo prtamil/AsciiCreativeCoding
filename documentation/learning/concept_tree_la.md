@@ -140,6 +140,17 @@ Adding one cell per frame lets the Gauss-Seidel relaxation keep up: 8 passes is 
 
 **References:** Niemeyer, L., Pietronero, L. & Wiesmann, H.J. (1984) — original DBM paper.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_tree[ROWS_MAX][COLS_MAX]` | `uint8_t[]` | ~24 KB | 1 if cell is in the grown tree (grounded conductor), 0 otherwise |
+| `g_phi[ROWS_MAX][COLS_MAX]` | `float[]` | ~96 KB | Laplace electric potential [0,1]; re-solved each growth step |
+| `g_age[ROWS_MAX][COLS_MAX]` | `uint16_t[]` | ~48 KB | growth step at which each cell joined the tree (for age-coloring) |
+| `g_eta` | `float` | scalar | growth exponent η; high = jagged fractal, low = compact blob |
+| `N_RELAX` | `int` constant | N/A | Gauss-Seidel passes per growth step (8) |
+| `N_GROW` | `int` constant | N/A | new cells added to tree per frame (1) |
+
 ## Open Questions for Pass 3
 
 - At what value of η does the tree transition from fractal to needle-like? Measure branch count vs η.

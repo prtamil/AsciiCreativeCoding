@@ -105,6 +105,14 @@ Early versions had the queen wander; workers returned to where the queen current
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `scene.swarms[5]` | `Swarm[5]` | ~44 KB | each swarm: 1 queen + 20 workers, each Bug has TRAIL_LEN=48 position history |
+| `scene.n_swarms` | `int` | 4 B | active swarm count (1..N_SWARMS_MAX=5) |
+| `g_app` | `App` | ~200 KB | top-level state wrapping scene (swarms dominate) |
+
 # Pass 2 — Pseudocode, Module Map, Data Flow
 
 ## Module Map

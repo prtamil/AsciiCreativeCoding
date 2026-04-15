@@ -47,6 +47,17 @@ turn_i = (((i & -i) << 1) & i) ? LEFT : RIGHT
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_turns[MAX_SEGS]` | `int8_t[8191]` | ~8 KB | turn sequence: +1=right, −1=left; built once per generation |
+| `g_pts[MAX_PTS]` | `struct{float x,y}[8192]` | ~64 KB | vertex positions in normalized coordinate space |
+| `g_n_segs` | `int` | scalar | total segments for current generation (up to 8191) |
+| `g_draw_idx` | `int` | scalar | index of next segment to draw (animated reveal) |
+| `N_GEN_MAX` | `int` constant | N/A | maximum generation (13); 2^13−1 = 8191 segments |
+| `SPEED_DEFAULT` | `int` constant | N/A | segments drawn per frame (default 8) |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

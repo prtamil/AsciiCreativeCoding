@@ -191,6 +191,17 @@ Rather than open inflow/outflow boundaries (which require special logic), the gr
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_grid[ROWS_MAX][COLS_MAX]` | `uint8_t[128][512]` | 64 KB | 6-bit particle state per cell (one bit per hex direction) |
+| `g_buf[ROWS_MAX][COLS_MAX]` | `uint8_t[128][512]` | 64 KB | streaming double-buffer; written during stream, swapped after |
+| `g_wall[ROWS_MAX][COLS_MAX]` | `bool[128][512]` | 64 KB | solid obstacle mask; walls bounce particles back |
+| `g_col[2][64]` | `uint8_t[2][64]` | 128 B | precomputed FHP-I collision lookup tables (parity 0 and 1) |
+
+---
+
 # Pass 2 — lattice_gas: Pseudocode
 
 ## Module Map

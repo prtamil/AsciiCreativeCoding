@@ -153,6 +153,14 @@ The Rain simulation itself has no state machine — it is a pure tick function.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `columns[ncols]` | `Column[]` | ~24 KB | one falling stream per terminal column |
+| `columns[i].ch_cache[TRAIL_MAX]` | `char[24]` | 24 B each | cached shimmer chars for interpolated draw |
+| `grid.cells[cols*rows]` | `Cell[]` | ~20 KB | off-screen char+shade grid for dissolve texture |
+
 # Pass 2 — matrix_rain.c: Pseudocode
 
 ## Module Map

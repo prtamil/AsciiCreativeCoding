@@ -103,6 +103,14 @@ if (all particles settled):
 
 "Settled" means `|pos - target| < SETTLE_THRESH` for all particles. The hold gives the viewer time to read the digit before it morphs.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_parts[168]` | `Particle[168]` | ~5 KB | all spring particles: 7 segs × 24 per seg, each owns one segment permanently |
+| `g_rows`, `g_cols` | `int` | 8 B | terminal dimensions (used to recompute digit bounding box) |
+| `g_dh`, `g_dw` | `int` | 8 B | digit bounding box in terminal cells (recalculated on resize) |
+
 ## Data Structures
 
 ```c

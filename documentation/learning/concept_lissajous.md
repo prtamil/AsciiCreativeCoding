@@ -126,3 +126,10 @@ The ramp occupies ±25% of the key period on either side of a symmetric phase. T
 | DWELL_WIDTH | Fraction of key period to ramp drift (0.25) |
 | CELL_ASPECT | Physical char height/width ratio (2.0) |
 | AMP_FRAC | Fraction of screen half-size used (0.92) |
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `k_theme[N_THEMES][N_LEVELS]` | `int[4][4]` | 64 B | 256-color indices for 4 themes × 4 brightness levels |
+| `k_ratio[N_RATIOS][2]` | `float[8][2]` | 64 B | Rational frequency pairs (fx, fy) for the 8 named figures |

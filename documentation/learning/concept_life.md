@@ -88,3 +88,12 @@ Absorbing boundaries (cells outside the grid are always dead) create artificial 
 | HIST_LEN | Ring buffer length for population history |
 | HIST_ROWS | Screen rows used by histogram bar chart |
 | STEPS_MAX | Maximum generations per frame (speed ceiling) |
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_grid[2][MAX_ROWS][MAX_COLS]` | `uint8[2][128][320]` | ~82 KB | double-buffered toroidal cell grid |
+| `g_pop_hist[HIST_LEN]` | `long[512]` | ~4 KB | ring buffer of per-generation live cell counts |
+| `g_buf` | `int` | 4 B | active buffer index (0 or 1) |
+| `g_rule_idx` | `int` | 4 B | index into RULES[] selecting the active B/S rule |

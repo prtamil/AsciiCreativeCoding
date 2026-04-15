@@ -61,6 +61,17 @@ BFS solving:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_walls[MAZE_H_MAX][MAZE_W_MAX]` | `unsigned char[]` | ~2 KB | wall bitmask per cell (N=1, E=2, S=4, W=8); 0=open |
+| `g_vis[MAZE_H_MAX][MAZE_W_MAX]` | `unsigned char[]` | ~2 KB | visited flag for DFS generation |
+| `g_dfs[MAZE_H_MAX * MAZE_W_MAX]` | `struct{int r,c}[]` | ~4 KB | DFS backtrack stack |
+| `MAZE_W_MAX`, `MAZE_H_MAX` | constants | N/A | maximum maze size (90 × 23 cells) |
+| `GEN_STEPS` | `int` constant | N/A | DFS steps per frame during animated generation (4) |
+| `SOL_STEPS` | `int` constant | N/A | BFS steps per frame during animated solve (16) |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

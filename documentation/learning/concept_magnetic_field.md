@@ -140,6 +140,15 @@ DONE: lines_traced >= n_lines → hold 3s → next preset → scene_init
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `scene` | `Scene` | ~4 MB | monopoles, dipoles, all traced field lines, animation state |
+| `Scene.mp[MAX_MONOPOLES]` | `Monopole[8]` | ~96 B | charge + cell position for each magnetic pole |
+| `Scene.dp[MAX_DIPOLES]` | `Dipole[4]` | ~64 B | north/south pole positions + color for each bar magnet |
+| `Scene.lines[MAX_LINES]` | `FieldLine[64]` | ~3.8 MB | traced RK4 streamline steps: col/row/char/color per step |
+
 # Pass 2 — magnetic_field: Pseudocode
 
 ## Module Map

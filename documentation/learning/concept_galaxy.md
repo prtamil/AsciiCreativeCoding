@@ -161,6 +161,18 @@ The steady-state brightness depends on DECAY, g_steps, g_speed, and star distrib
 
 Stars from different populations (bulge, arm, halo) mix after many orbits. A bulge star can orbit out to disk radii. Tagging colour by star origin would produce wrong colours for displaced stars. Screen-radius colouring always matches the physical expectation (inner = hot/bright, outer = cool/dim).
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `Star` (struct) | `typedef struct` | 12 B | radius `r`, angle `theta`, angular velocity `omega` |
+| `g_stars[N_STARS]` | `Star[3000]` | ~36 KB | all stars; omega = V0/r set at init, theta updated each tick |
+| `g_bright[ROWS_MAX][COLS_MAX]` | `float[]` | ~26 KB | brightness accumulator; decays by DECAY=0.82 each frame |
+| `N_STARS` | `int` constant | N/A | total star count (3000) |
+| `V0_DEF` | `float` constant | N/A | flat rotation curve speed (0.006 normalised-radius/step) |
+| `DECAY` | `float` constant | N/A | per-frame brightness decay factor (0.82) for trail effect |
+| `WINDING` | `float` constant | N/A | logarithmic spiral tightness parameter (1.0) |
+
 ## Open Questions for Pass 3
 
 - What is the arm **winding time** — how many ticks until the arms decohere into rings? Measure by computing the azimuthal entropy of the star distribution.

@@ -127,6 +127,17 @@ ACCUMULATING ──── samples_done >= TOTAL_SAMPLES ────► HOLDING 
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_counts[GRID_ROWS_MAX][GRID_COLS_MAX]` | `uint32_t[]` | ~96 KB | density accumulator — incremented for each orbit visit |
+| `g_max_count` | `uint32_t` | scalar | running maximum count; used to normalise display brightness |
+| `SAMPLES_PER_TICK` | `int` constant | N/A | random c values tested per tick (800) |
+| `TOTAL_SAMPLES` | `int` constant | N/A | samples before cycling to next preset (150,000) |
+| `GRID_ROWS_MAX`, `GRID_COLS_MAX` | constants | N/A | maximum grid size (80 × 300) |
+| `BuddhMode` | `typedef enum` | scalar | MODE_BUDDHA (escaping orbits) vs MODE_ANTI (bounded) |
+
 # Pass 2 — buddhabrot: Pseudocode
 
 ## Module Map

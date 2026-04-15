@@ -118,6 +118,17 @@ COMPUTING ──── all pixels done ────► HOLDING (done_ticks++)
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_grid[GRID_ROWS_MAX][GRID_COLS_MAX]` | `uint8_t[]` | ~24 KB | computed color level per cell (0=uncomputed, 1–5=gradient) |
+| `g_order[GRID_ROWS_MAX * GRID_COLS_MAX]` | `int[]` | ~96 KB | shuffled pixel index permutation for random reveal order |
+| `g_draw_pos` | `int` | scalar | current position in g_order; advances by PIXELS_PER_TICK each tick |
+| `PIXELS_PER_TICK` | `int` constant | N/A | pixels computed per simulation tick (60) |
+| `MAX_ITER` | `int` constant | N/A | Julia iteration cap (128) |
+| `ASPECT_R` | `float` constant | N/A | cell height/width ratio (2.0) for correct fractal proportions |
+
 # Pass 2 — julia: Pseudocode
 
 ## Module Map

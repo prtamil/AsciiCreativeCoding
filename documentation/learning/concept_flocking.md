@@ -173,6 +173,14 @@ Prey followers:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `flocks[FLOCKS]` | `Flock[3]` | ~5 KB | three independent flock groups |
+| `flocks[i].leader` | `Boid` | 20 B | wandering flock leader |
+| `flocks[i].followers[FOLLOWERS_MAX]` | `Boid[20]` | 400 B each | follower boid pool per flock |
+
 # Pass 2 — flocking.c: Pseudocode
 
 ## Module Map

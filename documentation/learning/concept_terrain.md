@@ -55,6 +55,13 @@ Roughness H (Hurst exponent) controls terrain type:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `scene.terrain.hmap[65][65]` | `float[65][65]` | ~17 KB | diamond-square heightmap normalized to [0,1] |
+| `scene.terrain` | `Terrain` | ~17 KB | entire terrain state: heightmap plus generation parameters |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

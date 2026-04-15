@@ -172,6 +172,19 @@ There is no explicit state machine. The Pulsar struct is a single continuous sta
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_beam_angle` | `float` | scalar | current beam rotation angle (radians); advances by spin each tick |
+| `g_spin` | `float` | scalar | angular velocity in rad/tick (default SPIN_DEF=0.15) |
+| `g_n_beams` | `int` | scalar | active beam count (1–16, default 2) evenly spaced at 360°/N |
+| `char_cache[N_RADII][WAKE_LEN+1]` | `char[]` | ~1.4 KB | matrix characters; ~75% randomised each tick for shimmer |
+| `N_RADII` | `int` constant | N/A | radial samples along each beam (80) |
+| `WAKE_LEN` | `int` constant | N/A | angular wake depth in slots behind head (16) |
+| `WAKE_STEP` | `float` constant | N/A | angular gap between wake slots in radians (0.05) |
+| `ASPECT` | `float` constant | N/A | row/column aspect correction for beam position (0.45) |
+
 # Pass 2 — pulsar_rain.c: Pseudocode
 
 ## Module Map

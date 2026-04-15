@@ -58,6 +58,15 @@ v      = v_half + a·dt/2
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app` | `App` | ~40 KB | top-level container: scene (NBody) + screen + control flags |
+| `g_app.scene.nbody` | `NBody` | ~38 KB | bodies array + state flags + preset |
+| `NBody.bodies[MAX_BODIES]` | `Body[32]` | ~38 KB | position, velocity, acceleration, mass, trail ring-buffer per body |
+| `Body.tx/ty[TRAIL_LEN]` | `float[150]` × 2 | 1.2 KB per body | per-body trail ring-buffer of pixel positions |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

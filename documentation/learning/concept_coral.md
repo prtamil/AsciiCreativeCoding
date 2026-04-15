@@ -103,6 +103,15 @@ No explicit state machine. The auto-reset is triggered by a row threshold, not a
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `scene.grid.cells[80][300]` | `uint8_t[80][300]` | ~24 KB | frozen/empty grid; value encodes depth-based color |
+| `scene.walkers[400]` | `Walker[400]` | ~5 KB | active random-walk particles (cx, cy, active flag) |
+| `scene.grid.frozen_count` | `int` | 4 B | total cells that have frozen into the coral |
+| `scene.grid.tallest_row` | `int` | 4 B | lowest row index reached — used for auto-reset trigger |
+
 # Pass 2 — coral: Pseudocode
 
 ## Module Map

@@ -188,3 +188,10 @@ Cosine-weighted hemisphere sampling: generate (u,v) uniform, `θ = arccos(√(1�
 
 **References:** Kajiya (1986), "The Rendering Equation", SIGGRAPH proceedings.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_accum[MAX_H][MAX_W][3]` | `float[100][320][3]` | ~384 KB | Per-pixel RGB accumulator for progressive path tracing |
+| `g_samples` | `int` | 4 B | Total samples accumulated so far (used to compute the running average) |
+| `k_mats[]` | `const Mat[6]` | ~144 B | Material albedo and emission for the 6 Cornell box surfaces |

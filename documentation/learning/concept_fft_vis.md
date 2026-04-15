@@ -67,6 +67,17 @@ double X_mag[N/2];       // frequency-domain magnitudes
 
 **Performance:** N_FFT must be a power of 2 for the radix-2 butterfly. In-place bit-reversal permutation reorders samples before the butterfly stages, requiring no auxiliary buffer.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_noise[N_FFT]` | `float[128]` | 512 B | white noise burst added to signal |
+| `a.re[N_FFT]` | `float[128]` | 512 B | FFT real part (in-place) |
+| `a.im[N_FFT]` | `float[128]` | 512 B | FFT imaginary part (in-place) |
+| `a.sig[N_FFT]` | `float[128]` | 512 B | composite time-domain signal |
+| `a.mag[N_FFT/2]` | `float[64]` | 256 B | magnitude spectrum (Nyquist bins) |
+| `a.comps[N_COMPS]` | `Comp[3]` | 24 B | sine component frequency/amplitude/toggle |
+
 ---
 
 ## Pass 2 — Implementation

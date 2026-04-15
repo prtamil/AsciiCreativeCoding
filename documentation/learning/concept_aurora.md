@@ -54,6 +54,13 @@ Where:
 - Can you add a star field behind the aurora using random static dots?
 - The real aurora has magnetic field line structure. Can you visualize that?
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `a.time` | `float` | 4 B | monotonically advancing animation time parameter |
+| `a.paused` | `bool` | 1 B | pauses time advancement when true |
+
 ---
 
 ## Pass 2 — Implementation

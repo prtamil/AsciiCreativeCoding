@@ -205,6 +205,18 @@ frames to resolve).
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_b[MAX_BODIES]` | `Body[32]` | ~1.5 KB | position, velocity, AABB half-extents, mass, color, sleep state |
+| `g_fb[ROWS_MAX][COLS_MAX]` | `char[128][512]` | 64 KB | character framebuffer for body outlines |
+| `g_fcp[ROWS_MAX][COLS_MAX]` | `int[128][512]` | 256 KB | color-pair framebuffer parallel to g_fb |
+| `g_nb`, `g_ncubes`, `g_nsphs` | `int` | 12 B | live body count and per-type spawn counters |
+| `g_rest`, `g_grav`, `g_paused` | `float` / `bool` × 2 | 12 B | restitution coefficient, gravity toggle, pause flag |
+| `g_rows`, `g_cols` | `int` | 8 B | terminal dimensions |
+| `g_rng` | `uint32_t` | 4 B | XorShift RNG state for body placement |
+
 ## Pass 2 — Implementation
 
 ### Module Map

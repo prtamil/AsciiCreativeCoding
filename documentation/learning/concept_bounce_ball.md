@@ -186,6 +186,13 @@ Balls have no discrete states — they are always either moving (vx, vy non-zero
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app` | `App` | ~1.5 KB | top-level container: scene + screen + control flags |
+| `g_app.scene.balls[BALLS_MAX]` | `Ball[20]` | ~480 B | pixel position, velocity, color, character per ball |
+
 # Pass 2 — bounce_ball: Pseudocode
 
 ## Module Map

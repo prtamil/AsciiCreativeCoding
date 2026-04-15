@@ -159,3 +159,13 @@ The alternative — storing one `g_phase[row][col]` array per cell and summing s
 **Math:** Phase precomputation: k·r computed once per source per grid cell. Per-frame cost = N_sources × W × H × sinf() calls. Aspect correction uses CELL_W=8, CELL_H=16 (standard 80×25 VT100 terminal pixel dimensions) so waves appear circular on screen.
 
 **Performance:** Phase stored per source (g_phase[s][row][col]) allows rebuilding only one source's table when that source changes, leaving other sources' tables intact. Static preallocation: g_phase[8][100][300] × 4 bytes = 960 KB — fits in static storage without malloc complexity.
+
+---
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_src[N_SRC_MAX]` | `Source[8]` | ~128 B | source positions, ω, λ, phase, active flag |
+| `g_kp[N_SRC_MAX][GRID_H_MAX][GRID_W_MAX]` | `float[8][100][300]` | ~960 KB | precomputed spatial phase table k·r − φ per source per cell |
+| `g_time` | `float` | 4 B | simulation time (advances each frame when unpaused) |

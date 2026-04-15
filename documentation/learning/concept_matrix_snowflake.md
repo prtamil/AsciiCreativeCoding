@@ -158,6 +158,14 @@ STATE_GROW ───────────────────────
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `xtal.cells[ROWS_MAX][COLS_MAX]` | `uint8_t[80][300]` | ~24 KB | DLA crystal grid: 0=empty, n=color-pair id |
+| `g_streams[COLS_MAX]` | `RainStream[300]` | ~5 KB | one rain stream per terminal column |
+| `g_rain_ch[ROWS_MAX][COLS_MAX]` | `char[80][300]` | ~24 KB | shimmering character cache for rain |
+
 # Pass 2 — matrix_snowflake: Pseudocode
 
 ## Module Map

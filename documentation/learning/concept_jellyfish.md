@@ -141,6 +141,14 @@ The state machine drives `bell_open` in a single normalised range [MIN_OPEN, 1.0
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `scene.jellies[8]` | `Jellyfish[8]` | ~2 KB | per-jellyfish physics: position, velocity, bell state, tentacle phases |
+| `scene.n_jellies` | `int` | 4 B | active jellyfish count (1..N_JELLIES_MAX=8) |
+| `g_app` | `App` | ~4 KB | top-level state: scene, screen dimensions, run/resize flags |
+
 # Pass 2 — Pseudocode, Module Map, Data Flow
 
 ## Module Map

@@ -65,6 +65,17 @@ cross(O, A, B) = (A.x-O.x)*(B.y-O.y) - (A.y-O.y)*(B.x-O.x)
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_pts[N_POINTS]` | `Point[40]` | ~320 B | XY coordinates of the 40 random input points |
+| `g_gs_sorted[N_POINTS]` | `int[40]` | 160 B | Graham scan: point indices sorted by polar angle |
+| `g_gs_stack[N_POINTS]` | `int[40]` | 160 B | Graham scan: convex hull stack during sweep |
+| `g_jv_hull[N_POINTS+1]` | `int[41]` | 164 B | Jarvis march: confirmed hull vertex indices |
+| `g_pivot` | `int` | 4 B | Index of lowest-leftmost point used as Graham origin |
+| `g_jv_start` | `int` | 4 B | Index of leftmost point used as Jarvis start |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

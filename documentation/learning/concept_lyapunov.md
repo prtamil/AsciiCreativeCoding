@@ -147,6 +147,18 @@ For most sequences in `[2.5, 4.0]²`, λ stays within this range. Points with |�
 
 **References:** Markus-Lyapunov fractal named after Mario Markus (1990 publication on the fractal boundary between order and chaos in the logistic parameter plane).
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_lev[GRID_ROWS_MAX][GRID_COLS_MAX]` | `int8_t[]` | ~24 KB | encoded Lyapunov level per cell; −127 = uncomputed |
+| `g_cur_row` | `int` | scalar | next row to compute in progressive top-to-bottom rendering |
+| `g_seq_idx` | `int` | scalar | index into k_sequences[] for current symbol sequence |
+| `g_done_frames` | `int` | scalar | frames held since render complete (for auto-advance) |
+| `WARMUP_ITERS` | `int` constant | N/A | transient iterations discarded before measuring λ (100) |
+| `LYAP_ITERS` | `int` constant | N/A | iteration count for λ measurement per pixel (200) |
+| `ROWS_PER_FRAME` | `int` constant | N/A | rows computed per frame for progressive rendering (2) |
+
 ## Open Questions for Pass 3
 
 - What is the **Hausdorff dimension** of the stable/chaotic boundary? It is conjectured to be fractal (between 1 and 2). Measure by counting boundary pixels at different resolutions.

@@ -140,6 +140,14 @@ paused = false  ←→  paused = true
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app` | `App` | ~1 KB | top-level container: scene + screen + control flags |
+| `g_app.scene.pend` | `Pendulum` | ~48 B | polar state (r, θ, ṙ, θ̇), prev-tick snapshot, pivot, rest length, damping |
+| `g_app.scene` | `Scene` | ~56 B | owns Pendulum + terminal size + paused flag |
+
 # Pass 2 — spring_pendulum: Pseudocode
 
 ## Module Map

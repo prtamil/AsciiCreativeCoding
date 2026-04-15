@@ -85,6 +85,65 @@ Reference implementation: `basics/bounce_ball.c`
 50. [DLA Extended — fractal_random/diffusion_map.c](#50-dla-extended--fractal_randomdiffusion_mapc)
 51. [DBM Tree — fractal_random/tree_la.c](#51-dbm-tree--fractal_randomtree_lac)
 52. [Lyapunov Fractal — fractal_random/lyapunov.c](#52-lyapunov-fractal--fractal_randomlyapunovc)
+53. [Ant Colony Optimization — artistic/ant_colony.c](#53-ant-colony-optimization--artisticant_colonyc)
+54. [Dune Rocket — artistic/dune_rocket.c](#54-dune-rocket--artisticdune_rocketc)
+55. [Dune Sandworm — artistic/dune_sandworm.c](#55-dune-sandworm--artisticdune_sandwormc)
+56. [FFT Visualiser — artistic/fft_vis.c](#56-fft-visualiser--artisticfft_visc)
+57. [Fourier Draw — artistic/fourier_draw.c](#57-fourier-draw--artisticfourier_drawc)
+58. [Gear — artistic/gear.c](#58-gear--artisticgearc)
+59. [Graph Search — artistic/graph_search.c](#59-graph-search--artisticgraph_searchc)
+60. [Hex Life — artistic/hex_life.c](#60-hex-life--artistichex_lifec)
+61. [Jellyfish — artistic/jellyfish.c](#61-jellyfish--artisticjellyfish)
+62. [Network SIR Simulation — artistic/network_sim.c](#62-network-sir-simulation--artisticnetwork_simc)
+63. [Railway Map — artistic/railwaymap.c](#63-railway-map--artisticrailwaymapc)
+64. [Sand Art — artistic/sand_art.c](#64-sand-art--artisticsand_artc)
+65. [X-Ray Swarm — artistic/xrayswarm.c](#65-x-ray-swarm--artisticxrayswarm)
+66. [Shepherd Herding — flocking/shepherd.c](#66-shepherd-herding--flockingshepherdc)
+67. [Excitable Medium — fluid/excitable.c](#67-excitable-medium--fluidexcitablec)
+68. [SPH Fluid — fluid/fluid_sph.c](#68-sph-fluid--fluidfluid_sphc)
+69. [Lenia — fluid/lenia.c](#69-lenia--fluidleniac)
+70. [Marching Squares — fluid/marching_squares.c](#70-marching-squares--fluidmarching_squaresc)
+71. [Stable Fluids (Navier-Stokes) — fluid/navier_stokes.c](#71-stable-fluids-navier-stokes--fluidnavier_stokesc)
+72. [FitzHugh-Nagumo Reaction Wave — fluid/reaction_wave.c](#72-fitzhugh-nagumo-reaction-wave--fluidreaction_wavec)
+73. [2-D Wave Equation — fluid/wave_2d.c](#73-2-d-wave-equation--fluidwave_2dc)
+74. [Apollonian Gasket — fractal_random/apollonian.c](#74-apollonian-gasket--fractal_randomapolonianc)
+75. [2-D Cellular Automaton (LtL) — fractal_random/automaton_2d.c](#75-2-d-cellular-automaton-ltl--fractal_randomautomaton_2dc)
+76. [Bifurcation Diagram — fractal_random/bifurcation.c](#76-bifurcation-diagram--fractal_randombifurcationc)
+77. [Burning Ship Fractal — fractal_random/burning_ship.c](#77-burning-ship-fractal--fractal_randomburning_shipc)
+78. [Dragon Curve — fractal_random/dragon_curve.c](#78-dragon-curve--fractal_randomdragon_curvec)
+79. [L-System — fractal_random/l_system.c](#79-l-system--fractal_randoml_systemc)
+80. [Newton Fractal — fractal_random/newton_fractal.c](#80-newton-fractal--fractal_randomnewton_fractalc)
+81. [Perlin Landscape — fractal_random/perlin_landscape.c](#81-perlin-landscape--fractal_randomperlin_landscapec)
+82. [Strange Attractor — fractal_random/strange_attractor.c](#82-strange-attractor--fractal_randomstrange_attractorc)
+83. [Convex Hull — geometry/convex_hull.c](#83-convex-hull--geometryconvex_hullc)
+84. [Hex Grid — geometry/hex_grid.c](#84-hex-grid--geometryhex_gridc)
+85. [Polar Grid — geometry/polar_grid.c](#85-polar-grid--geometrypolar_gridc)
+86. [Rect Grid — geometry/rect_grid.c](#86-rect-grid--geometryrect_gridc)
+87. [Fireworks Rain — matrix_rain/fireworks_rain.c](#87-fireworks-rain--matrix_rainfireworks_rainc)
+88. [Pulsar Rain — matrix_rain/pulsar_rain.c](#88-pulsar-rain--matrix_rainpulsar_rainc)
+89. [Sun Rain — matrix_rain/sun_rain.c](#89-sun-rain--matrix_rainsun_rainc)
+90. [Maze — misc/maze.c](#90-maze--miscmazec)
+91. [Sort Visualiser — misc/sort_vis.c](#91-sort-visualiser--miscsort_visc)
+92. [Aspect Ratio Demo — ncurses_basics/aspect_ratio.c](#92-aspect-ratio-demo--ncurses_basicsaspect_ratioc)
+93. [Lines and Cols Query — ncurses_basics/tst_lines_cols.c](#93-lines-and-cols-query--ncurses_basicstst_lines_colsc)
+94. [2-Stroke Engine — physics/2stroke.c](#94-2-stroke-engine--physics2strokec)
+95. [Black Hole — physics/blackhole.c](#95-black-hole--physicsblackholec)
+96. [Bubble Chamber — physics/bubble_chamber.c](#96-bubble-chamber--physicsbubble_chamberc)
+97. [Elastic Collision — physics/elastic_collision.c](#97-elastic-collision--physicselastic_collisionc)
+98. [Gyroscope — physics/gyroscope.c](#98-gyroscope--physicsgyroscopec)
+99. [Three-Body Orbit — physics/orbit_3body.c](#99-three-body-orbit--physicsorbit_3bodyc)
+100. [Pendulum Wave — physics/pendulum_wave.c](#100-pendulum-wave--physicspendulum_wavec)
+101. [Rigid Body — physics/rigid_body.c](#101-rigid-body--physicsrigid_bodyc)
+102. [Schrödinger Equation — physics/schrodinger.c](#102-schrödinger-equation--physicsschrodingerc)
+103. [Soft Body (PBD) — physics/soft_body.c](#103-soft-body-pbd--physicssoft_bodyc)
+104. [Mandelbulb Rasterizer — raster/mandelbulb_raster.c](#104-mandelbulb-rasterizer--rastermandelbulb_rasterc)
+105. [Mandelbulb Explorer — raymarcher/mandelbulb_explorer.c](#105-mandelbulb-explorer--raymarchermandelbulb_explorerc)
+106. [SDF Gallery — raymarcher/sdf_gallery.c](#106-sdf-gallery--raymarchersdf_galleryc)
+107. [Capsule Raytrace — raytracing/capsule_raytrace.c](#107-capsule-raytrace--raytracingtcapsule_raytracec)
+108. [Cube Raytrace — raytracing/cube_raytrace.c](#108-cube-raytrace--raytracingcube_raytracec)
+109. [Path Tracer — raytracing/path_tracer.c](#109-path-tracer--raytracingpath_tracerc)
+110. [Sphere Raytrace — raytracing/sphere_raytrace.c](#110-sphere-raytrace--raytracing-sphere_raytracec)
+111. [Torus Raytrace — raytracing/torus_raytrace.c](#111-torus-raytrace--raytracingtorus_raytracec)
 
 ---
 
@@ -2827,5 +2886,835 @@ The b-axis is inverted: row 0 = `b_max`, row ROWS-1 = `b_min`. This matches the 
 *Files: `fractal_random/lyapunov.c`*
 
 ---
+
+## 53. Ant Colony Optimization — artistic/ant_colony.c
+
+Stigmergic pathfinding on an 8-directional grid. Ants deposit pheromone on traversed cells; shorter paths accumulate stronger trails before evaporation erases them. The colony converges to the near-optimal path without central coordination.
+
+### Pheromone Dynamics
+
+Each tick: `τ ← τ × (1 − ρ) + Δτ`. Every ant that uses a cell deposits `Q / L_k` pheromone proportional to how short its total path was. The evaporation rate `ρ ≈ 0.1` prevents runaway accumulation on early suboptimal paths.
+
+### Probabilistic Movement
+
+An ant at cell i chooses neighbour j with probability `P(i→j) ∝ τ_ij^α × η_ij^β`, where `η_ij = 1/distance` is a heuristic and `α, β` balance exploitation vs. exploration. The implementation uses 8-directional grid movement (not a graph), making it visual but less rigorous than classical graph-based ACO.
+
+The pheromone field `g_ph[GRID_H][GRID_W]` (float, ~128 KB) is the colony's shared memory. Two food sources and one nest define the pathfinding goal. O(N_ants × grid_area) per tick.
+
+*Files: `artistic/ant_colony.c`*
+
+---
+
+## 54. Dune Rocket — artistic/dune_rocket.c
+
+Homing missile simulation set in the Dune universe. Harkonnen rockets launch from a ship at the top of the screen and steer toward Arrakis ground targets using proportional navigation, each leaving a 30-position ring-buffer trail.
+
+### Proportional Navigation
+
+Each tick the rocket's velocity direction is bent toward the target by `TURN_RATE` radians per second: the velocity vector is rotated by `arctan2(cross, dot)` clamped to the turn budget. A sinusoidal lateral wobble `WOBBLE_AMP × sin(WOBBLE_FREQ × t)` is added for visual realism. Speed ramps from `ROCKET_SPEED0` to `ROCKET_SPEEDMAX` (acceleration phase).
+
+### Trail and Explosion
+
+The trail is a fixed-length ring buffer of past positions drawn at decreasing brightness (motion blur). On impact, ballistic explosion sparks are spawned: simple particles with gravity integrated by explicit Euler. Rocket orientation is mapped to one of eight ASCII direction glyphs (`▲ ↗ → ↘ ▼ ↙ ← ↖`).
+
+*Files: `artistic/dune_rocket.c`*
+
+---
+
+## 55. Dune Sandworm — artistic/dune_sandworm.c
+
+Arrakis sandworm simulation using a segmented-chain (Conga) follower model. The head drives along a sinusoidal underground path; each of N_SEGS=50 body segments follows its predecessor when separation exceeds SEG_LEN.
+
+### Body Chain Kinematics
+
+Underground path: `y = surface_row + SWIM_DEPTH + SWIM_AMP × sin(SWIM_FREQ × x)`. Breach arc: parabolic trajectory above the surface reaching BREACH_HEIGHT rows at the apex. After each breach, sand ripples expand radially at RIPPLE_SPEED cols/s. The terrain surface is a procedural height map from summed low-frequency cosine waves.
+
+### Rendering
+
+Segment direction determines the ASCII character: `─ │ ╱ ╲` for horizontal, vertical, or diagonal movement. The head displays a multi-row open-mouth sprite during breach. Up to MAX_WORMS=8 independent worms share the same screen.
+
+*Files: `artistic/dune_sandworm.c`*
+
+---
+
+## 56. FFT Visualiser — artistic/fft_vis.c
+
+Side-by-side display of a composite sine signal (top panel) and its frequency-domain magnitude spectrum (bottom panel), computed with a Cooley-Tukey radix-2 DIT FFT.
+
+### Cooley-Tukey Butterfly
+
+N_FFT=128 (power of 2). The iterative bottom-up butterfly avoids O(log N) stack depth. Bit-reversal permutation reorders samples in-place before the `log₂(N)` butterfly stages. Each stage doubles the butterfly span m and rotates by twiddle factor `W_m = exp(−2πi/m)`. Complexity O(N log N) vs. O(N²) naive DFT.
+
+### Display
+
+Three user-tunable sine components (frequency, amplitude, on/off toggle) are summed to build the signal each frame. Magnitudes `|X[k]| / (N/2)` for k = 0…N/2−1 are displayed as a bar chart; the N/2 bins above Nyquist are symmetric conjugates and are omitted. A white-noise burst can be injected to show broadband excitation.
+
+*Files: `artistic/fft_vis.c`*
+
+---
+
+## 57. Fourier Draw — artistic/fourier_draw.c
+
+DFT epicycle reconstruction: any closed curve is decomposed into rotating arms via the Discrete Fourier Transform, then reconstructed by animating those arms in order of decreasing magnitude.
+
+### DFT and Epicycle Sort
+
+Shape samples `z[k] = x[k] + i·y[k]` are transformed with the O(N²) DFT (computed once per shape change). Coefficients are sorted by magnitude descending — largest circles first — so the partial sum converges quickly and the sort order is energy-optimal (Parseval greedy).
+
+### Trail and Ghost Overlay
+
+A ring buffer `g_trail` (length 512) stores the tip path of the last arm; this is the reconstructed shape gradually appearing. A ghost overlay `g_ghost` draws the original sample points for comparison. Cell-aspect correction scales x-coordinates before the DFT so the result appears undistorted on non-square terminal cells. A Parseval energy bar shows the cumulative power fraction of displayed arms.
+
+*Files: `artistic/fourier_draw.c`*
+
+---
+
+## 58. Gear — artistic/gear.c
+
+A rotating wireframe gear with physically correct tangential spark emission. The gear outline is computed analytically each frame from polar proximity tests — no mesh, no rasterization.
+
+### Analytic Wireframe
+
+Each terminal cell's center is tested against three geometric features in local polar coordinates: hub ring, spokes, and tooth sides. Proximity thresholds (THRESH_CIRC=7.5 px, THRESH_SIDE=4.0 px, THRESH_SPOKE=3.8 px) determine which feature is drawn. `line_char(angle)` maps the local tangent or radial direction to `- \ | /`. Tooth phase: `phase = fmod(ang_local × N_TEETH / 2π, 1.0)` with `TOOTH_DUTY=0.42`.
+
+### Tangential Spark Physics
+
+Emission rate scales with angular velocity: `total_rate = SPARK_BASE_RATE × (rot_speed / ROT_BASE) × spark_density`. At birth, `tang_vx = −sin(tip_ang) × rot_speed × R_OUTER × TANG_SCALE`. At high speed (20 rad/s) the tangential velocity (880 px/s) dominates the radial kick (35–120 px/s), producing dramatic spiral arcs. Drag uses the exact solution `vx *= exp(−DRAG × dt)`, which is frame-rate independent. Ten named color themes remap all nine spark color pairs simultaneously via `init_pair()`.
+
+*Files: `artistic/gear.c`*
+
+---
+
+## 59. Graph Search — artistic/graph_search.c
+
+Three graph search algorithms (BFS, DFS, A*) animated step-by-step on a 40-node planar-ish random graph laid out with the Fruchterman-Reingold spring-repulsion algorithm.
+
+### Layout and Algorithms
+
+Force-directed layout: nodes repel with force ∝ k²/d and edges attract with force ∝ d²/k, where k = √(area/N). BFS uses a queue (shortest path by hop count, O(V+E)); DFS uses a stack (finds a path but not necessarily shortest, O(V+E)); A* uses a min-heap with Euclidean heuristic h(n) (admissible, optimal, O((V+E) log V)).
+
+Source and goal are chosen as the farthest-apart pair. Node colors encode state: white=unvisited, cyan=frontier, dark-grey=visited, green=source, red=goal, yellow=final path.
+
+*Files: `artistic/graph_search.c`*
+
+---
+
+## 60. Hex Life — artistic/hex_life.c
+
+Conway's Game of Life adapted to a hexagonal grid. Each cell has 6 neighbors (offset-row layout) rather than 8. Rule B2/S34 produces qualitatively different behavior — more isotropic growth, different oscillators and gliders.
+
+### Hex Neighbor Lookup
+
+Two neighbor offset tables, one per row parity (even/odd offset rows). Double-buffering: `g_grid` and `g_next` store current and next generation; `g_age` and `g_anext` track how many consecutive generations a cell has been alive. Age drives a color gradient: newborn→yellow, young→cyan, mature→teal, elder→dark.
+
+### Rule Application
+
+For each cell, count 6 neighbors. Apply: dead cell with exactly 2 live neighbors → born (B2); live cell with 3 or 4 live neighbors → survives (S34). The 6-neighbor symmetry eliminates the diagonal artifacts of square-grid CAs and makes boundary patterns more isotropic.
+
+*Files: `artistic/hex_life.c`*
+
+---
+
+## 61. Jellyfish — artistic/jellyfish.c
+
+Physics-based bioluminescent jellyfish with a four-state locomotion model. Up to 8 jellies drift upward through the terminal using jet propulsion driven by a state machine.
+
+### Four-State Physics
+
+`IDLE → CONTRACT → GLIDE → EXPAND → IDLE`. IDLE: bell fully open, passive sink under GRAVITY=30 px/s². CONTRACT (0.19 s, fast ease-out): bell squeezes to 42% width; at completion `vy = −JET_THRUST=190 px/s` burst upward. GLIDE (0.38 s): bell held closed, `vy *= exp(−DRAG_VY × dt)` exact exponential decay. EXPAND (0.68 s, smoothstep): bell re-opens.
+
+### Bell Rendering
+
+Two independently controlled axes: `head_f` (horizontal width, remapped from `bell_open` to [0.42, 1.0]) and `crown_f` (apex height, `0.88 + 0.12 × crown_f` limit). Scan-line ellipse renders the upper half-ellipse with five row zones: closing roof, rounded crown, sides, lower body, rim. Three tentacles (N_TENTACLES=3, TENTACLE_SEGS=20) hang below using a travelling sine wave gated by `wave_scale`; velocity lag `−vy × TENT_LAG × depth` streams tentacles behind fast motion.
+
+*Files: `artistic/jellyfish.c`*
+
+---
+
+## 62. Network SIR Simulation — artistic/network_sim.c
+
+SIR epidemic model on a Watts-Strogatz small-world network. Split display: left panel shows N=40 nodes colored by state (S/I/R) on a ring layout; right panel shows a scrolling stacked epidemic curve over time.
+
+### Watts-Strogatz Construction
+
+Start with a K=4 ring graph; rewire each edge with probability p=0.15 to a random node. This creates the small-world property: short average path length and high clustering coefficient. Rewired shortcut edges are highlighted when infection spreads through them.
+
+### SIR Dynamics
+
+Per tick: each infected node infects each susceptible neighbor with probability β; each infected node recovers with probability γ. Basic reproduction number R₀ = β·⟨k⟩/γ — epidemic spreads when R₀ > 1. Arrow keys adjust β and γ live; the epidemic curve reacts immediately.
+
+*Files: `artistic/network_sim.c`*
+
+---
+
+## 63. Railway Map — artistic/railwaymap.c
+
+Procedural transit map generator. Lines are built from five path templates (H_FULL, V_FULL, Z_SHAPE, REV_Z, DOUBLE_Z) routed through an 8×6 logical grid. Stations emerge at every grid node; nodes shared by two or more lines become interchange stations rendered as `O`.
+
+### Canvas Rendering
+
+A flat 2D canvas of cell descriptors records which H-line and V-line pass through each terminal cell. At render time: 0 lines → space, 1 H-line → ACS_HLINE, 1 V-line → ACS_VLINE, both → ACS_PLUS. Grid node → terminal cell mapping uses linear interpolation between margin bounds so the map fills any terminal size. Station names are placed perpendicular to the line direction.
+
+Animated trains are a pool of (line, progress) structs; progress advances along the line's waypoint path each tick. New maps are generated on demand with `r`.
+
+*Files: `artistic/railwaymap.c`*
+
+---
+
+## 64. Sand Art — artistic/sand_art.c
+
+Falling-sand cellular automaton inside a centred hourglass shape with flippable gravity. Five colored sand layers fill the top bulb and fall through the narrow neck into the bottom bulb.
+
+### CA Rule and Geometry
+
+Grid of `uint8_t` cells (0=empty, 1–5=sand color). Each tick, cells are scanned away from the gravity direction (bottom-to-top for downward gravity) so each grain moves at most once per frame. Movement priority: forward (toward gravity) > diagonal-left > diagonal-right (diagonals randomised to avoid left-bias). A hourglass mask built at startup defines accessible cells; sand checks the mask before moving.
+
+The angle of repose (~45°) emerges naturally from the diagonal movement rule — grains slide diagonally only when blocked directly. Pressing Space flips gravity direction; sand avalanches back through the neck.
+
+*Files: `artistic/sand_art.c`*
+
+---
+
+## 65. X-Ray Swarm — artistic/xrayswarm.c
+
+Up to 5 swarms of particles, each with a wandering queen and workers that shoot outward as long fading rays. Workers cycle through a 4-phase state machine: DIVERGE → PAUSE → CONVERGE → PAUSE → repeat.
+
+### Trail and Phase Machine
+
+Each worker carries a TRAIL_LEN=48 position ring buffer. Older trail positions are drawn at decreasing brightness, creating a long fading ray appearance. The heading is locked to the outward direction from the queen at the start of DIVERGE and held fixed during flight. Queen steering is an Ornstein-Uhlenbeck-like bounded random walk: each tick a small random angle δθ is added to heading, bounded to avoid tight circles.
+
+Cell-aspect correction (CELL_W=8, CELL_H=16) ensures equal angular spacing on screen. Multiple swarms can be added/removed at runtime.
+
+*Files: `artistic/xrayswarm.c`*
+
+---
+
+## 66. Shepherd Herding — flocking/shepherd.c
+
+Interactive boid herding simulation. A flock of sheep uses Classic Boids rules (separation, alignment, cohesion) plus a flee force when the player-controlled shepherd comes within FLEE_RADIUS pixels.
+
+### Boids Plus Flee
+
+Flee force overrides cohesion so panicking sheep disperse rather than cluster. Sheep speed has two modes: cruise (SHEEP_SPEED) and flee (SHEEP_SPEED_FLEE ≈ 1.5× cruise). The shepherd moves at fixed speed (SHEPHERD_SPEED px/s) driven by held arrow keys. Both operate in isotropic pixel space with CELL_W=8, CELL_H=16 aspect correction.
+
+Sheep characters are selected from an 8-direction glyph table (`o < > ^ v / \`) based on velocity heading; bold red when fleeing. An optional dashed circle around the shepherd shows the panic zone radius.
+
+*Files: `flocking/shepherd.c`*
+
+---
+
+## 67. Excitable Medium — fluid/excitable.c
+
+Greenberg-Hastings N-state cellular automaton modeling excitable media such as cardiac muscle. State 0 = resting; state 1 = excited; states 2..N-1 = refractory.
+
+### Update Rule
+
+Von Neumann neighborhood (4 orthogonal neighbors), periodic boundary. Rule: `if cell==0 AND any neighbour==1 → cell=1`; `if cell>0 → cell=(cell+1) % N`. The refractory period N−2 steps prevents a wave from re-exciting cells it just passed through, producing ordered ring waves. Spirals emerge from broken wave fronts: the open end curls into susceptible cells.
+
+### Presets
+
+Four initial conditions: SPIRAL (broken wave front curling into rotation), DOUBLE (two counter-rotating spirals), RINGS (radially periodic concentric targets), CHAOS (5% random seeding → turbulent multi-spiral). Double-buffering ensures each cell's next state depends only on current-tick neighbors. STEP_NS = 1/15 s, RENDER_NS = 1/30 s — CA runs at half display rate.
+
+*Files: `fluid/excitable.c`*
+
+---
+
+## 68. SPH Fluid — fluid/fluid_sph.c
+
+Smoothed Particle Hydrodynamics simulation. Particles carry mass, position, velocity, and pressure; density is estimated by summing a kernel function over neighbors. Five scene loaders (blob, rect, fountain, collision, rain) initialize different configurations.
+
+### Kernel and Forces
+
+Kernel: `w(d) = (d/H − 1)²` for d < H (SMOOTH_RADIUS=2.2), zero otherwise. Density: `ρᵢ = Σⱼ w(dᵢⱼ)`. Pressure force: `w(dᵢⱼ) × (ρᵢ + ρⱼ − 2ρ₀) × K_pressure / ρᵢ` — the sign of `(ρᵢ+ρⱼ−2ρ₀)` handles both repulsion (overcrowded) and cohesion (underdense) in one expression. Viscosity: `(vⱼ − vᵢ) × K_viscosity × w(dᵢⱼ)`. Integration: symplectic Euler (velocity before position) for better energy conservation.
+
+### Spatial Hash Grid
+
+GCELL=3 ≥ SMOOTH_RADIUS=2.2 ensures all neighbors within H lie in the 3×3 surrounding cells. Linked lists per cell (`g_ghead`, `g_gnext`) reduce neighbor search from O(N²) to O(N·k) where k≈15 average neighbors — approximately 50× speedup at N=600.
+
+*Files: `fluid/fluid_sph.c`*
+
+---
+
+## 69. Lenia — fluid/lenia.c
+
+Continuous cellular automaton generalizing Conway's Life to real-valued states and smooth ring kernels. Each step: convolve state grid with kernel K, apply growth function G, update state.
+
+### Kernel and Growth
+
+Ring kernel K: nonzero only in an annular ring at radius R, using the bump function `exp(4 − 4/(r(1−r)))`. Normalized so total weight = 1. Growth function: `G(u) = 2·exp(−((u−μ)/σ)²) − 1` (a Gaussian centered at μ). Update: `A(x, t+dt) = clamp(A(x,t) + dt·G(U(x,t)), 0, 1)`.
+
+The parameter pair (μ, σ) defines a "species." Preset creatures — Orbium (μ=0.15, σ=0.015, R=13), Aquarium (μ=0.26, σ=0.036, R=10), Scutium (μ=0.17, σ=0.015, R=8) — exhibit autonomous locomotion and division. The kernel is precomputed as a sparse list of (dr, dc, weight) entries after threshold pruning, stored in `g_kw`/`g_kdr`/`g_kdc`. Toroidal boundaries avoid edge artifacts.
+
+*Files: `fluid/lenia.c`*
+
+---
+
+## 70. Marching Squares — fluid/marching_squares.c
+
+2-D isosurface extraction (the 2-D analogue of Marching Cubes). Extracts contours from a metaball scalar field using a 16-case lookup table driven by 4-bit corner classification.
+
+### Algorithm
+
+For each 2×2 cell of grid corners: classify each corner as inside (f > threshold) or outside → 4-bit index → look up which edges the contour crosses → linearly interpolate crossing position along each edge → draw ASCII character. The 16 cases cover all possible inside/outside combinations; cases 0 and 15 produce no contour.
+
+### Scalar Field
+
+Metaball potential: `f(x,y) = Σ Aᵢ / ((x−cxᵢ)² + (y−cyᵢ)²)` — inverse-square wells from moving blob sources. The field is sampled at `(col × ASPECT, row)` with ASPECT=0.5 to correct for non-square terminal cells, producing circular blobs. Multiple iso-levels can be drawn simultaneously with different characters.
+
+*Files: `fluid/marching_squares.c`*
+
+---
+
+## 71. Stable Fluids (Navier-Stokes) — fluid/navier_stokes.c
+
+Jos Stam's "Stable Fluids" (SIGGRAPH 1999) on an N=80 grid. Operator-splitting separates diffusion, projection, and advection into individually unconditionally stable sub-steps.
+
+### Pipeline
+
+Per frame: (1) add forces/dye sources; (2) diffuse velocity with Gauss-Seidel (ITER=16 passes); (3) project to divergence-free field via Poisson solve (Gauss-Seidel again); (4) semi-Lagrangian advection (back-trace + bilinear interpolation); (5) project again. The projection enforces ∇·u=0 by computing a pressure correction field.
+
+Semi-Lagrangian advection is first-order accurate but unconditionally stable for large dt — there is no CFL constraint. Arrow keys inject a velocity source at screen center; Space drops a dye blob. O(N²·ITER) per frame; at N=80, ITER=16: ~100k operations per step, trivial at 30 fps.
+
+*Files: `fluid/navier_stokes.c`*
+
+---
+
+## 72. FitzHugh-Nagumo Reaction Wave — fluid/reaction_wave.c
+
+Two-variable PDE on the terminal grid modeling cardiac action potentials. `u` is the fast membrane voltage activator; `v` is the slow recovery inhibitor.
+
+### Equations and Stability
+
+`du/dt = u − u³/3 − v + D·∇²u + I`; `dv/dt = ε·(u + a − b·v)`. Fixed point: u* ≈ −1.2, v* ≈ −0.625 (resting state). The Laplacian uses a 5-point stencil; explicit Euler requires STEPS_PER_FRAME=8 sub-steps to satisfy the CFL condition `FN_DT · FN_D / dx² < 0.25`. A suprathreshold stimulus kicks `u` upward; the refractory period (v recovery) prevents back-propagation, producing ordered ring waves.
+
+Four presets: TARGET RINGS, DOUBLE (collision/annihilation), SPIRAL (rotating spiral from broken ring), PLANE WAVE (sweeping front). Unlike Gray-Scott, FitzHugh-Nagumo has a single nonlinear term (u³) making it analytically tractable.
+
+*Files: `fluid/reaction_wave.c`*
+
+---
+
+## 73. 2-D Wave Equation — fluid/wave_2d.c
+
+FDTD (Finite-Difference Time-Domain) solver for the scalar wave equation `∂²u/∂t² = c²·∇²u`. Uses explicit Euler with two alternating time-level grids.
+
+### Discretization and Stability
+
+Update: `u[t+1] = 2u[t] − u[t−1] + C²·(uE + uW + uN + uS − 4u[t])` where C² = (c·dt/h)² = 0.16. 2-D CFL condition: C·√2 < 1 → 0.566 < 1 (stable). Two time levels (t and t−1) are required and stored in alternating grids `g0` and `g1`.
+
+Point sources (Space) emit Gaussian impulses; five persistent oscillating sources (keys 1–5) create standing-wave interference patterns. A sponge layer of BORDER_W cells at the edges damps outgoing waves with multiplicative damping — without it, boundary reflections create a "box mode" standing wave. Color maps: negative u → blue, zero → black, positive → white.
+
+*Files: `fluid/wave_2d.c`*
+
+---
+
+## 74. Apollonian Gasket — fractal_random/apollonian.c
+
+Recursive circle-packing via Descartes' Circle Theorem. Starting from three mutually tangent circles, the unique fourth tangent circle is found and the process recurses into each of the three new gaps.
+
+### Descartes Theorem
+
+`(k₁+k₂+k₃+k₄)² = 2(k₁²+k₂²+k₃²+k₄²)` where k = 1/radius (negative for the enclosing circle). Solution: `k₄ = k₁+k₂+k₃ ± 2√(k₁k₂+k₂k₃+k₃k₁)`. Center found via the complex Descartes formula: `z₄ = (k₁z₁+k₂z₂+k₃z₃ ± 2√(k₁k₂z₁z₂+…)) / k₄`. Starting pack k = (−1, 2, 2, 3) is the unique integer Apollonian gasket.
+
+Recursion terminates when the resulting circle is smaller than one pixel on screen. Circle count grows as 3^depth; DEPTH_MAX=7 gives ~6500 circles. Circles are drawn progressively (one per frame) so the gasket builds up visually. Terminal aspect correction ASPECT_R scales the radius when converting to cell coordinates.
+
+*Files: `fractal_random/apollonian.c`*
+
+---
+
+## 75. 2-D Cellular Automaton (LtL) — fractal_random/automaton_2d.c
+
+Extended 2-D Cellular Automaton implementing Larger-than-Life (LtL). Generalizes Conway's Life to radius R > 1: the neighborhood count is the number of alive cells in a (2R+1)² square. Birth/survive thresholds are range-based rather than bitmasks; multi-state dying trails decay over N−1 generations.
+
+### Prefix Sum Optimization
+
+A 2-D summed area table makes each neighborhood count O(1) after O(W×H) table construction: `P[r][c] = grid[r][c] + P[r-1][c] + P[r][c-1] − P[r-1][c-1]`. Rectangle sum in O(1): `P[r1][c1] − P[r0-1][c1] − P[r1][c0-1] + P[r0-1][c0-1]`. At R=5: naïve 121 additions per cell vs. 1 lookup — 121× speedup.
+
+Toroidal wrapping is implemented by padding the grid with R-wide copies on all sides before building the prefix sum, eliminating all per-cell boundary branches. A population history ring buffer `g_pop_hist[512]` is displayed as a time-series graph.
+
+*Files: `fractal_random/automaton_2d.c`*
+
+---
+
+## 76. Bifurcation Diagram — fractal_random/bifurcation.c
+
+Logistic map bifurcation diagram: `x_{n+1} = r·xₙ·(1−xₙ)`. Each screen column maps to a distinct r value. After WARMUP transient iterations, PLOT values are plotted as colored dots showing the attractor.
+
+### Period-Doubling and Auto-Zoom
+
+For r < 3: converges to a fixed point. At r ≈ 3.0: period-2 bifurcation. Each bifurcation point satisfies `r_{n+1} − r_n → 1/δ` where δ = 4.669… is Feigenbaum's universal constant. Onset of chaos at r ≈ 3.5699 (accumulation point). Auto-zoom scrolls r toward r∞ = 3.5699 each frame, continuously revealing self-similar copies of the diagram. Color encodes x value: blue (low) → cyan → green → yellow → red (high). O(W × (WARMUP + PLOT)) per diagram redraw; each column is independent.
+
+*Files: `fractal_random/bifurcation.c`*
+
+---
+
+## 77. Burning Ship Fractal — fractal_random/burning_ship.c
+
+Escape-time fractal identical to Mandelbrot except the real and imaginary parts are forced positive before each squaring: `z ← (|Re(z)| + i|Im(z)|)² + c`.
+
+### Absolute-Value Fold
+
+Expanding: `Re_new = Re(z)² − Im(z)² + Re(c)`, `Im_new = 2|Re(z)|·|Im(z)| + Im(c)`. The `|Im|` term forces the imaginary component positive after each step, breaking Mandelbrot's 4-fold symmetry and creating the characteristic "ship" shape with mast-like spires and downward-pointing flames. The most detailed region is near c ≈ −1.77 − 0.04i.
+
+Smooth coloring via fractional escape count: `t = iter + 1 − log₂(log₂|z|)` removes the banding of integer escape counts. A fire palette maps escape speed to color: inside-set → black, slow escape → dark red, fast → yellow/white. Pan and zoom support with a fly-to preset.
+
+*Files: `fractal_random/burning_ship.c`*
+
+---
+
+## 78. Dragon Curve — fractal_random/dragon_curve.c
+
+Paper-folding Dragon Curve constructed by iterative right-folding. The turn sequence for generation n: `T_n = T_{n-1}  R  reverse_complement(T_{n-1})` where reverse_complement flips L↔R and reverses order.
+
+### Growth and Rendering
+
+After n folds: 2ⁿ−1 turns, 2ⁿ segments. Gen 13 → 8192 segments. The path never self-intersects (proven); four copies at 0°/90°/180°/270° tile the plane without overlap (rep-tile of order 4). Segments are drawn one per frame using turtle graphics — F=forward, R/L=turn. Color encodes position in the sequence (age of segment), producing a visual record of the folding hierarchy. Aspect correction: horizontal steps are scaled by CELL_W/CELL_H ≈ 0.5 to keep the curve isotropic on non-square terminal cells.
+
+*Files: `fractal_random/dragon_curve.c`*
+
+---
+
+## 79. L-System — fractal_random/l_system.c
+
+String-rewriting Lindenmayer system with turtle-graphics rendering. Each generation replaces every variable in the string with a production rule; the resulting string is executed by a turtle (F=forward, +=left, −=right, [=push, ]=pop).
+
+### String Rewriting
+
+Each rewrite step scans the current string and concatenates productions into a scratch buffer — O(|string| × max_rule_length) copies. String length grows exponentially: for the Dragon Curve rule the length doubles each generation. MAX_STR=1 MB covers Koch gen 6 (~490 K), Hilbert gen 6 (~490 K), Branching Plant gen 7. STACK_MAX=128 for branch nesting depth.
+
+Eight presets: Koch, Sierpinski, Plant, Dragon, Hilbert, and others. A bounding-box pre-pass walks the turtle without drawing to find the extent, then scale and center. Aspect correction uses `(STEP_PX_COL, STEP_PX_ROW)` accounting for CELL_W/CELL_H to keep branches isotropic.
+
+*Files: `fractal_random/l_system.c`*
+
+---
+
+## 80. Newton Fractal — fractal_random/newton_fractal.c
+
+Per-pixel Newton's method for `f(z) = z⁴ − 1`. Each point in the complex plane is iterated `z ← z − f(z)/f′(z) = (3z⁴+1)/(4z³)` until convergence to one of the four roots (1, −1, i, −i).
+
+### Basin Coloring
+
+Color encodes which root converged to (four hues); brightness encodes convergence speed (fewer iterations → lighter). Slow convergence occurs near basin boundaries where f(z) ≈ 0, causing large Newton steps and chaotic basin-switching. Non-converging points (cycles or divergence) → black. Convergence tolerance TOL=1e-5, MAX_ITER=64. Pan/zoom with four presets that zoom to each root's basin boundary.
+
+*Files: `fractal_random/newton_fractal.c`*
+
+---
+
+## 81. Perlin Landscape — fractal_random/perlin_landscape.c
+
+Three-layer parallax landscape with fractal Brownian motion terrain. The three layers (far/mid/near) scroll at different speeds, creating an illusion of depth.
+
+### Fractal Brownian Motion
+
+Height: `h(x) = Σ_k noise(x·fᵏ) / Aᵏ` with frequency ratio f=2 and amplitude ratio A=0.5 over OCTAVES=6 octaves. Perlin noise uses pseudo-random gradient vectors at integer lattice points, dotted with offset vectors, then smoothly interpolated with the fade function `6t⁵−15t⁴+10t³` (C² continuous). Hurst exponent H=1 (standard fBm). The scrolling camera advances the noise time parameter, giving a fly-over effect.
+
+Height bins map to terrain types (water/plains/hills/peaks). Stars are scattered deterministically in the upper sky using a hash of the column index. Painter's algorithm: sky → far → mid → near (each layer overwrites the previous).
+
+*Files: `fractal_random/perlin_landscape.c`*
+
+---
+
+## 82. Strange Attractor — fractal_random/strange_attractor.c
+
+Point-density rendering of 2-D chaotic attractors. A point is iterated for many steps under the attractor map; visit counts accumulate in a density grid, which is log-normalized and mapped to a nebula palette.
+
+### Attractors and Density Rendering
+
+Six named attractors (Clifford-A, de Jong-B, Marek-C, Svensson, Bedhead, Rampe). All use the Clifford family: `x' = sin(a·y)+c·cos(a·x)`, `y' = sin(b·x)+d·cos(b·y)` except Bedhead which uses its own formula. Log density coloring: `brightness ∝ log(1+count)/log(1+max_count)`. Without log scaling, the densest "spine" would dominate and outlying filaments would be invisible. ITERS_PER_FRAME iterations per tick accumulate into the density grid; the image converges over time.
+
+*Files: `fractal_random/strange_attractor.c`*
+
+---
+
+## 83. Convex Hull — geometry/convex_hull.c
+
+Two convex hull algorithms compared side-by-side on 40 random points: Graham scan (O(N log N)) and Jarvis march / gift-wrapping (O(N·h)).
+
+### Graham Scan vs. Jarvis March
+
+Graham scan: find lowest-rightmost pivot, sort other points by polar angle, sweep a stack popping whenever the cross product indicates a clockwise (non-left) turn: `(B−A)×(C−A) < 0`. Each point is pushed and popped at most once — O(N) sweep after O(N log N) sort. Jarvis march: from the leftmost point, repeatedly find the most counter-clockwise next point. Optimal when h ≪ N; worst case O(N²) when all points are on the hull.
+
+Cross product: `(Ax−Ox)(By−Oy)−(Ay−Oy)(Bx−Ox)`. Points are drawn as dots; hull edges as lines; hull vertices highlighted as `O`.
+
+*Files: `geometry/convex_hull.c`*
+
+---
+
+## 84. Hex Grid — geometry/hex_grid.c
+
+Hexagonal character grid with offset-row layout (pointy-top hexagons). Characters are placed at hex centers; color is assigned by ring distance from the center hex, creating concentric color bands. Each character changes at an independent random rate.
+
+### Layout and Ring Distance
+
+Offset-row layout: odd rows shifted right by HEX_DX/2 columns. Ring distance is approximated by concentric ring assignment (converting to cube coordinates for the exact formula). Six themes (fire, matrix, ice, plasma, gold, mono) map ring indices to color pairs. The "breathing" effect — cells shimmering at different rates — is an emergent property of many independent random timers.
+
+*Files: `geometry/hex_grid.c`*
+
+---
+
+## 85. Polar Grid — geometry/polar_grid.c
+
+Polar/radial character grid: characters at the intersections of concentric rings and radial spokes. Each ring rotates at its own angular speed (alternating direction), creating a gear-like visual.
+
+### Differential Rotation
+
+Each ring has an independent angular velocity; adjacent rings alternate clockwise/counter-clockwise. Position: `col = cx + r·cos(θ + ω_ring·t)`, `row = cy + r·sin(θ + ω_ring·t) × (CELL_W/CELL_H)`. The CELL_H/CELL_W ≈ 2 correction produces circular rings despite non-square cells. Color assigned by ring index (concentric bands). Characters at each cell change independently with per-cell random timers.
+
+*Files: `geometry/polar_grid.c`*
+
+---
+
+## 86. Rect Grid — geometry/rect_grid.c
+
+Full-screen rectangular character grid with two independent sinusoidal color waves. Every terminal cell flips its character at a random rate; color is driven by two spatial sine waves traversing the grid.
+
+### Wave Superposition
+
+`wave1 = sin(k1·col + ω1·t)`, `wave2 = sin(k2·row + ω2·t)`. The superposition creates a moving moiré-like pattern. When k1 ≈ k2 but ω1 ≠ ω2, a slowly-moving beat envelope appears. Per-cell random character change is a Poisson process with mean rate 1/avg_interval. Color is computed analytically each frame from the two wave values — no accumulation. Six themes and four speed presets.
+
+*Files: `geometry/rect_grid.c`*
+
+---
+
+## 87. Fireworks Rain — matrix_rain/fireworks_rain.c
+
+Extends the fireworks rocket state machine with matrix-rain arc trails. Each spark carries a TRAIL_LEN=16 position history; the trail is rendered as shimmering matrix-rain characters following the exact parabolic arc.
+
+### Trail History
+
+Update order is critical: (1) shift `trail[1..]` = `trail[0..]`; (2) store current `(cx, cy)` into `trail[0]`; (3) advance physics. So `trail[0]` always holds the position from one tick ago — the actual arc, not the next position. `trail_fill` ramps from 0 to TRAIL_LEN as the particle moves, growing organically from the burst point.
+
+### Physics Split
+
+Two separate gravity constants solve a conflict: ROCKET_DRAG=9.8 decelerates rockets quickly so they explode at varied screen heights; GRAVITY=4.0 with per-particle variance `g = GRAVITY × (0.8 + rand × 0.4)` gives particles enough upward momentum for a circular burst shape. Removing the vertical squash (`vy = sin(angle)×speed` without ×0.5) produces a true circular burst. Five themes remap the seven spark color pairs; CP_WHITE (pair 8) is always white regardless of theme.
+
+*Files: `matrix_rain/fireworks_rain.c`*
+
+---
+
+## 88. Pulsar Rain — matrix_rain/pulsar_rain.c
+
+Rotating neutron star (pulsar) with N evenly-spaced matrix-rain beams sweeping from a central `@` core. Each beam leaves a 46° angular wake of fading characters.
+
+### Wake Rendering
+
+Wake slot k=0 is the bright leading edge; k=WAKE_LEN=16 is the dim tail. Each slot is WAKE_STEP=0.05 rad behind the previous. Per beam per frame: only WAKE_LEN+1=17 trig calls (one per wake slot direction vector `cw[k], sw[k]=sin(wa)×ASPECT`). Each of N_RADII=80 radial samples reuses those pre-computed values — 34 trig calls for 2 beams vs. 1360 without pre-computation.
+
+Render interpolation: `draw_angle = beam_angle + spin × alpha` extrapolates the beam's exact sub-tick position. At N=12, adjacent wakes overlap by 16° producing a dense merged-corona effect. The core `@` is drawn last — always on top of all beams. Five themes (green/amber/blue/plasma/fire).
+
+*Files: `matrix_rain/pulsar_rain.c`*
+
+---
+
+## 89. Sun Rain — matrix_rain/sun_rain.c
+
+180 radial streams of matrix characters emanating from a central `@` at evenly spaced angles. Each stream has a staggered phase offset so beams appear at different distances from the core, producing a stochastic solar-wind field.
+
+### Isotropic Coordinates
+
+Stream direction angle `θ = k×π/90` for k=0…179. Position: `col = cx + r·cos_a`, `row = cy + r·sin_a` where `sin_a = sin(θ)×ASPECT` (ASPECT=0.45) is baked in at ray init — no per-position trig. Render interpolation: `draw_r_off = r_off + speed × alpha` for smooth 60 fps motion at 20 Hz physics. Characters shimmer by ~75% random replacement each tick. Five themes remap stream colors.
+
+*Files: `matrix_rain/sun_rain.c`*
+
+---
+
+## 90. Maze — misc/maze.c
+
+Recursive-backtracker DFS maze generation with animated BFS solve. A W×H grid of cells with 4-bit wall bitmasks (N=1, E=2, S=4, W=8) is carved into a perfect maze (spanning tree), then solved for the shortest path.
+
+### Generation and Solve
+
+DFS: maintain a stack of visited cells; pick a random unvisited neighbor, carve the wall between them (clear bit in current + set opposite bit in neighbor), push. Backtrack when no unvisited neighbors remain. GEN_STEPS=4 DFS steps per frame for animated generation.
+
+BFS solve: flood-fill from entrance level-by-level; first reach of exit = shortest path. Parent array reconstructs the path backward. SOL_STEPS=16 BFS steps per frame for animated solve. Display: 2×2 terminal pixels per maze cell → (2W+1)×(2H+1) terminal cells total.
+
+*Files: `misc/maze.c`*
+
+---
+
+## 91. Sort Visualiser — misc/sort_vis.c
+
+Five sorting algorithms animated as a vertical bar chart: Bubble, Insertion, Selection, Quicksort (Lomuto), and Heapsort. Exactly one compare-or-swap is executed per tick.
+
+### Coroutine-Style Iterators
+
+Each algorithm is implemented as a state machine (struct + step function) that advances one operation per call, enabling the animation loop to run at user-controlled rate without threads. Color encodes operation state: grey=unsorted, yellow=comparing, red=just swapped, green=in final sorted position. N_ELEMS=48 bars. Complexity reference: Bubble/Insertion/Selection O(n²); Quicksort O(n log n) average (Lomuto partition: pivot=last element); Heapsort O(n log n) worst-case (max-heap built in O(n), extracted in O(n log n)).
+
+*Files: `misc/sort_vis.c`*
+
+---
+
+## 92. Aspect Ratio Demo — ncurses_basics/aspect_ratio.c
+
+Minimal demonstration of terminal cell-aspect correction. Draws a circle that appears visually circular despite non-square terminal cells.
+
+Terminal cells are typically ~2× taller than wide. Drawing `x = r·cos(θ)`, `y = r·sin(θ)` directly produces an ellipse. The fix scales x by 2: `x = cx + radius × 2 × cos(angle)`. This is the foundation of all isotropic drawing in the project. The demo uses a simple spin loop with getch() to hold the display; it is deliberately minimal — no fixed timestep, no ncurses color.
+
+*Files: `ncurses_basics/aspect_ratio.c`*
+
+---
+
+## 93. Lines and Cols Query — ncurses_basics/tst_lines_cols.c
+
+Minimal ncurses demo: queries and displays terminal dimensions using the `LINES` and `COLS` globals set by `initscr()`.
+
+After `initscr()`, ncurses sets the global `LINES` (row count) and `COLS` (column count) to the current terminal size. `getmaxyx(stdscr, rows, cols)` is the per-window equivalent and is safer in multi-window programs. The program prints the dimensions with `printw()`, calls `refresh()`, waits for a keypress, then exits with `endwin()`. The entire file is under 15 lines — it exists purely to demonstrate the query API.
+
+*Files: `ncurses_basics/tst_lines_cols.c`*
+
+---
+
+## 94. 2-Stroke Engine — physics/2stroke.c
+
+Cross-section animation of a 2-stroke internal combustion engine. The crank angle θ advances each tick via slider-crank kinematics; the piston, connecting rod, and crankshaft are redrawn each frame.
+
+### Slider-Crank Kinematics
+
+Piston position from crank center: `y_wrist = R·cos θ + √(L² − R²·sin²θ)` (exact, not approximated). Crank radius CRANK_R=4, connecting rod CONROD_L=9. The 2-stroke cycle phase is determined by θ: exhaust port uncovers at ~75°, transfer port at ~90°, BDC at 180°, ports close on compression stroke, TDC spark at 0°. Each phase is labeled and port visibility is toggled by comparing θ to port-open thresholds.
+
+The HUD shows RPM; `]/[` keys adjust speed. Rendering uses ASCII line-drawing primitives for the cylinder walls, piston rectangle, and connecting rod line.
+
+*Files: `physics/2stroke.c`*
+
+---
+
+## 95. Black Hole — physics/blackhole.c
+
+Physically accurate Schwarzschild black hole ray tracer. A lensing table maps each screen pixel to its ray outcome (disk hit, horizon, escape) by integrating null geodesics backward in time with RK4 — computed once at startup, then used for fast per-frame rendering.
+
+### Geodesic Integration
+
+Null geodesic acceleration in 3-D Cartesian embedding: `d²pos/dλ² = −(3/2)·|pos×vel|²·pos/|pos|⁵`. RK4 with adaptive step size `ds = clamp(r×0.05, 0.003, 0.10)`. Each ray also tracks `min_r` (closest approach) — rays that grazed the photon sphere (r=1.5 r_s) produce the photon ring via `ring_b = exp(−(min_r−1.5)×2.4)`.
+
+### Doppler and Accretion
+
+Disk material orbits at Keplerian speed `v_orb = √(M/(2r))`. Relativistic Doppler beaming: `D = [(1+β)/(1−β)]^(3/2)`. At ISCO (r=3 r_s): D_max ≈ 6.8× (bright side) vs D_min ≈ 0.15× (dim side). Combined brightness: `D × g × radial_profile × texture` where g = √(1−1/r) is gravitational redshift. 11 named themes; camera distance is runtime-adjustable (triggers lensing rebuild).
+
+*Files: `physics/blackhole.c`*
+
+---
+
+## 96. Bubble Chamber — physics/bubble_chamber.c
+
+Charged particles in a uniform magnetic field (B perpendicular to screen) leaving spiral ionization tracks as they lose energy, mimicking real bubble chamber photographs.
+
+### Exact Rotation Integration
+
+Instead of Euler-approximating the Lorentz force, each step applies an exact 2-D rotation matrix `R(ω·dt)` to the velocity vector: `v_x' = vx·cos(ω)−vy·sin(ω)`, `v_y' = vx·sin(ω)+vy·cos(ω)`. This preserves orbital radius exactly (no energy drift). Ionization drag: `|v| *= (1−DRAG)` each step — orbits spiral inward as the particle slows.
+
+Five particle types (e⁻, e⁺, μ, π, p) with different q/m ratios produce visually distinct curvatures. Each particle stores a ring buffer of TRAIL_LEN=300 positions drawn with age-faded characters (`O * + .`). The field direction can be flipped at runtime; field strength is adjustable.
+
+*Files: `physics/bubble_chamber.c`*
+
+---
+
+## 97. Elastic Collision — physics/elastic_collision.c
+
+Impulse-based elastic collision simulation. N_DISCS=25 colored discs bounce off each other and the walls with conservation of momentum and kinetic energy.
+
+### Impulse Resolution
+
+For each overlapping pair, a single impulse along the collision normal simultaneously satisfies non-penetration and elastic restitution: `J = 2·m₁·m₂/(m₁+m₂) · Δv·n̂`. Velocities updated: `v₁ -= J/m₁·n̂`, `v₂ += J/m₂·n̂`. Positional correction: `overlap = (r₁+r₂−d)/2` pushed along n̂. The check `dot(rel_v, n̂) >= 0` skips pairs that are already separating. Mass model: `mass = r²` (uniform-density 2-D disc). O(N²) pair checks per tick — acceptable for N=25.
+
+*Files: `physics/elastic_collision.c`*
+
+---
+
+## 98. Gyroscope — physics/gyroscope.c
+
+Free rigid body rotation with quaternion orientation tracking. Demonstrates the Dzhanibekov effect (intermediate-axis theorem): rotation near the middle principal axis is unstable.
+
+### Euler's Equations and Quaternion Integration
+
+State vector: [ωx, ωy, ωz] in body frame + [qw, qx, qy, qz] quaternion. Euler's equations (nonlinear): `I₁·dωx/dt = (I₂−I₃)·ωy·ωz`, etc. RK4 integration (SUB_STEPS=8 per tick) handles the stiffness. After each step, q is re-normalized: `q /= |q|`; the extracted axes are Gram-Schmidt re-orthogonalized to prevent floating-point drift.
+
+The polhode tip (angular momentum vector in body frame) is drawn as a ring-buffer trail `g_app.scene.gyro.trail[TRAIL_LEN=300]`. Orthographic projection of the 3-D wireframe (ring + axes) to 2-D with ASPECT=CELL_W/CELL_H ≈ 0.5 for circular appearance.
+
+*Files: `physics/gyroscope.c`*
+
+---
+
+## 99. Three-Body Orbit — physics/orbit_3body.c
+
+Three equal masses under mutual Newtonian gravity, integrated with Velocity Verlet in natural units G=M=1. Defaults to the stable figure-8 choreography (Chenciner-Montgomery 2000).
+
+### Figure-8 and Chaos
+
+The figure-8 initial conditions were found by numerical minimization of the action integral. All three bodies share the same orbit offset by 1/3 of the period. DT=0.001 (natural time units); STEPS per frame controls simulation vs. display speed tradeoff. O(N²)=O(9) force pairs — trivial. Key `x` adds a random perturbation, breaking the symmetry and revealing the underlying chaos (sensitivity to initial conditions).
+
+Trail color encodes speed: slow → blue, fast → white. Trails fade with age; TRAIL_LEN is user-adjustable at runtime. Zoom and pan supported.
+
+*Files: `physics/orbit_3body.c`*
+
+---
+
+## 100. Pendulum Wave — physics/pendulum_wave.c
+
+N=15 pendulums with lengths chosen so pendulum n completes (N_BASE + n) full oscillations in T_SYNC seconds, creating a synchrony-drift-resynchrony cycle.
+
+### Analytic Integration
+
+`θ_n(t) = amp × sin(ω_n × t)` — exact solution to the small-angle approximation `θ'' ≈ −(g/L)·θ`. No numerical integrator needed; each frame is one `sinf()` call per pendulum. Length-frequency relation: `L_n = g/ω_n²`. At t=0 all are in phase; over T_SYNC they drift through waves, spirals, and other Lissajous-like patterns, then "clap" back to perfect synchrony because each pendulum completes an integer number of full cycles in exactly T_SYNC.
+
+Color cycles through the rainbow across the pendulum array. Each pendulum is drawn as a vertical string of `|` chars with a colored bob `O` at the displaced position.
+
+*Files: `physics/pendulum_wave.c`*
+
+---
+
+## 101. Rigid Body — physics/rigid_body.c
+
+2-D rigid-body simulation with AABB collision detection, Baumgarte positional correction, velocity impulse with restitution, and Coulomb friction. Supports cubes (AABB) and spheres (drawn as circles, physics as AABB).
+
+### Two-Pass Resolution
+
+Each solver iteration: Pass A — positional correction (always applied, even when separating): `corr = max(depth−SLOP, 0) × BAUMGARTE / (imA+imB)`. This fixes the critical bug where bodies spawning overlapping were never pushed apart. Pass B — velocity impulse (only when approaching): `j = (1+e_eff)×vn / (imA+imB)` with micro-bounce suppression `e_eff=0` below REST_THRESH.
+
+Floor and walls use full snap + impulse with no fraction. Sleeping: SLEEP_FRAMES quiet frames → frozen; woken by impulse or positional correction > WAKE_IMP. AABB for spheres: `hw=r, hh=2r` matches the drawn circle's screen extent (terminal cells are ~2× taller than wide).
+
+*Files: `physics/rigid_body.c`*
+
+---
+
+## 102. Schrödinger Equation — physics/schrodinger.c
+
+1-D quantum wavefunction evolution under the time-dependent Schrödinger equation, discretized with the Crank-Nicolson scheme (unconditionally stable, 2nd-order in time).
+
+### Crank-Nicolson and Thomas Algorithm
+
+`(I + iΔt/2·H)·ψ(t+Δt) = (I − iΔt/2·H)·ψ(t)`. The Hamiltonian `H = −½d²/dx² + V(x)` (natural units ℏ=m=1) discretized with a 5-point stencil produces a tridiagonal complex linear system solved with the Thomas algorithm O(N) per step — not O(N³). N_GRID=512, STEPS_PER_FRAME=20 sub-steps: ~10240 complex multiplications per frame, easily 30 fps.
+
+Four presets: free Gaussian packet, finite barrier (quantum tunneling), harmonic well (bouncing packet), double slit (interference). Display: blue=Re(ψ), red=Im(ψ), white=|ψ|² (probability density). Bottom row shows the potential V(x).
+
+*Files: `physics/schrodinger.c`*
+
+---
+
+## 103. Soft Body (PBD) — physics/soft_body.c
+
+Position-Based Dynamics soft-body simulation. Multiple soft cubes and spheres with full pairwise collision, handled by a generic boundary-polygon test covering all shape combinations.
+
+### PBD Constraint Projection
+
+Verlet predict → project distance constraints × PBD_ITERS=6 → clamp walls. Constraints: structural (keep nodes at rest distance, STRUCT_K=1.0), shear (diagonal links, SHEAR_K=0.8), volume (area preservation). PBD is unconditionally stable; stiffness is controlled by iteration count, not spring constant.
+
+Inter-body collision: for each node of body A penetrating body B's convex hull, push A's node outward by depth/2 along nearest-edge normal, and push B's two nearest boundary nodes inward by depth/4 each (Newton's 3rd law in position space). COLL_ITERS=2 collision passes per physics step.
+
+*Files: `physics/soft_body.c`*
+
+---
+
+## 104. Mandelbulb Rasterizer — raster/mandelbulb_raster.c
+
+Hybrid mesh-based Mandelbulb rendering. The fractal surface is tessellated into a triangle mesh at startup via sphere projection, then rendered through the standard software rasterization pipeline each frame.
+
+### Sphere Projection Tessellation
+
+For each (lat θ, lon φ) point on a UV sphere (NLAT=28, NLON=56), march inward from r=1.5 until the Mandelbulb SDF falls below MB_HIT_EPS — the first crossing is a surface vertex. Valid adjacent vertices are connected into quads → 2 triangles. This captures only the outermost surface shell; concave cavities and re-entrant surfaces are invisible. The tessellation runs in O(NLAT×NLON×MAX_MARCH); NLON=2×NLAT keeps UV cell aspect approximately square.
+
+### Fragment Shaders
+
+Three modes: `frag_phong_hue` (Blinn-Phong + HSV color from smooth escape time), `frag_normals` (surface normal → azimuth hue + Y-component brightness), `frag_depth_hue` (pure escape-time → rainbow hue). Full-color framebuffer using a 12-hue terminal color pair set; luminance drives the Bourke ASCII density ramp with Bayer dithering.
+
+*Files: `raster/mandelbulb_raster.c`*
+
+---
+
+## 105. Mandelbulb Explorer — raymarcher/mandelbulb_explorer.c
+
+3-D Mandelbulb fractal rendered by sphere marching a distance estimator (DE). Each pixel follows a null-geodesic-style march until the DE falls below HIT_EPS, then shading is computed using SDF-gradient normals, ambient occlusion, and soft shadows.
+
+### Distance Estimator
+
+Mandelbulb DE (Iñigo Quílez formula): iterate `z ← z^p + c` in spherical coordinates tracking derivative `dr = p·r^(p-1)·dr + 1`. Return `0.5·log(r)·r/dr`. Smooth escape count: `μ = iter + 1 − log(log(|z|)/log(bail))/log(power)` removes hard color bands. The power parameter p is runtime-adjustable (default p=8); changing it rebuilds nothing — the march re-evaluates the DE each frame.
+
+### Shading
+
+Ambient occlusion: sample the DE at several offsets along the normal and compare to expected distances — closer-than-expected → occluded. Soft shadows: march from the hit point toward each light; if the march passes close to geometry, the shadow is soft. A rotating camera orbits the bulb; multiple themes map escape time to palettes.
+
+*Files: `raymarcher/mandelbulb_explorer.c`*
+
+---
+
+## 106. SDF Gallery — raymarcher/sdf_gallery.c
+
+Five raymarched scenes demonstrating SDF composition techniques: smooth union, boolean CSG, twist deformation, domain repetition, and organic sculpting.
+
+### SDF Operations
+
+Smooth union: `smin(d1, d2, k)` — blends two SDFs into a connected surface with controllable blend radius k. Boolean CSG: `union=min(d1,d2)`, `intersection=max(d1,d2)`, `subtraction=max(d1,−d2)` — exact set operations. Twist: rotate input point `p.yz` by angle ∝ p.x before evaluating the SDF; domain deformation violates the Lipschitz condition so a relaxation factor (0.5) prevents overshoot. Domain repetition: `p = mod(p, cell_size) − cell_size/2` produces an infinite periodic field from a single primitive evaluation.
+
+Progressive render: the framebuffer is filled over multiple frames; partially computed frames are displayed immediately. Features: soft shadows, ambient occlusion, three-point lighting, five themes, three lighting modes.
+
+*Files: `raymarcher/sdf_gallery.c`*
+
+---
+
+## 107. Capsule Raytrace — raytracing/capsule_raytrace.c
+
+Analytic ray-capsule intersection using the Íñigo Quílez decomposition: cylinder body test (quadratic after projecting out the axial component) followed by hemisphere cap tests (sphere quadratics) at each endpoint.
+
+### Intersection Algorithm
+
+Let `ba = cb − ca` (axis), `oa = ro − ca`. Project out axial component: `a = |ba|² − (ba·rd)²`, `b = |ba|²·(rd·oa)−(ba·oa)·(ba·rd)`, `c = |ba|²·(|oa|²−r²)−(ba·oa)²`. Discriminant `h = b²−a·c`. Body hit if `t > ε` and axial position `y = (ba·oa) + t·(ba·rd) ∈ (0, |ba|²)`. If body misses (y out of range), try cap sphere at `ca` or `cb` using `oc = oa` or `oc = oa − ba`. If `h < 0` (infinite cylinder missed), skip both caps.
+
+Body normal: strip axial component from `(P − ca)`. Cap normal: `normalize(oc + t·rd)`. Normal transition at the seam is C¹ continuous. Four rendering modes (Phong, normals, Fresnel, depth); six themes.
+
+*Files: `raytracing/capsule_raytrace.c`*
+
+---
+
+## 108. Cube Raytrace — raytracing/cube_raytrace.c
+
+Analytic ray-AABB intersection using the slab method. The cube tumbles via a rotation matrix applied to the ray (inverse transform), not to the geometry.
+
+### Slab Method
+
+For each axis: compute entry/exit times `t_near_i = (−s−ro_i)/rd_i`, `t_far_i = (s−ro_i)/rd_i`. Overall entry = max of entries, overall exit = min of exits. Hit if `t_near ≤ t_far` and `t_far > 0`. The axis that produced `t_near` (recorded during the loop as `near_ax`) is the face the ray actually hit — exact, no post-hoc inference. Normal sign: `(rd_i > 0) ? −1 : +1`.
+
+### Wireframe Mode
+
+After intersection, the two "free" coordinates on the hit face give edge distance: `min(s−|u|, s−|v|)/s`. If below WIRE_THRESH=0.055, draw edge; otherwise skip (interior transparent). Produces pixel-perfect lines analytically — no rasterization artifacts. Four rendering modes (Phong, normals, wireframe, depth); six themes.
+
+*Files: `raytracing/cube_raytrace.c`*
+
+---
+
+## 109. Path Tracer — raytracing/path_tracer.c
+
+Unidirectional Monte Carlo path tracer rendering a Cornell Box. Each frame adds SPP samples to a per-pixel accumulator; the displayed image is `accumulator / sample_count`, converging from noisy to clean over ~512 samples.
+
+### Path Tracing Algorithm
+
+For each pixel: cast a ray; at each surface hit, sample a random new direction from the cosine-weighted hemisphere around the surface normal (`θ = arccos(√(1−u))`, `φ = 2π·v`). Accumulate emitted radiance. Russian roulette termination: at each bounce, terminate with probability `1 − max_color_component`; scale surviving rays to preserve unbiasedness. Cosine-weighted sampling importance-samples the Lambertian BRDF `f_r = ρ/π`, cancelling the cosine factor for simpler accumulation.
+
+Reinhard tone mapping: `L_out = L/(1+L)`. 216-color xterm cube palette; luminance → Bourke ASCII density ramp. Scene: red/green/white Cornell walls, warm overhead light, two colored spheres.
+
+*Files: `raytracing/path_tracer.c`*
+
+---
+
+## 110. Sphere Raytrace — raytracing/sphere_raytrace.c
+
+Analytic ray-sphere intersection. Each terminal cell fires one ray; the quadratic ray-sphere equation is solved exactly. Three-point lighting (warm key, cool fill, bright rim) and four rendering modes.
+
+### Quadratic Intersection
+
+`a=|rd|²=1`, `b=2(rd·oc)` (oc = ro − center), `c=|oc|²−R²`. Discriminant `b²−4c`; miss if negative. Surface normal: `N = (P − center) / R`. Phong: `I = ka + kd·max(N·L,0) + ks·max(R_v·V,0)^shininess`. Fresnel (Schlick): `F = F0 + (1−F0)·(1−N·V)^5`. Six themes (gold, ice, crimson, emerald, amethyst, neon). Four modes: Phong, normals, Fresnel, depth. Camera orbits the sphere; zoom adjustable at runtime.
+
+*Files: `raytracing/sphere_raytrace.c`*
+
+---
+
+## 111. Torus Raytrace — raytracing/torus_raytrace.c
+
+Analytic ray-torus intersection via quartic polynomial root-finding. The torus lies in the XZ plane; substituting the ray into `(√(x²+z²)−R)² + y² = r²` yields a degree-4 polynomial in t.
+
+### Quartic Solver
+
+Coefficients A, B, C, D are derived by algebra from the torus equation. Rather than the unstable Ferrari formula, roots are found by evaluating the polynomial at sample points, then bisecting sign-change intervals to locate each real root. The minimum positive root is the front surface hit. Surface normal at hit point p: `N = normalize(p − R·normalize(p.xz × (0,1)))` (strips the Y component and points radially from the nearest ring axis point).
+
+Same inverse-ray-transform approach as cube and capsule: rotate the ray into object space, intersect the axis-aligned torus, transform the normal back. Four rendering modes (Phong, normals, Fresnel, depth); six themes (titanium, solar, cobalt, forest, rose, chrome).
+
+*Files: `raytracing/torus_raytrace.c`*
 
 *This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `physics/bounce_ball.c`.*

@@ -89,3 +89,12 @@ Multi-colour rules ("LLRR", "LRRL" etc.) produce much richer patterns than two-s
 | STEPS_MAX | Step count ceiling for + key |
 | MAX_COLORS | Maximum cell states (8); limits rule string length |
 | MAX_ANTS | Maximum simultaneous ants (3) |
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_grid[MAX_ROWS][MAX_COLS]` | `uint8[128][320]` | ~40 KB | cell-state grid (0 = colour 0, 1..N-1 = other colours) |
+| `g_ants[MAX_ANTS]` | `Ant[3]` (row, col, dir) | ~36 B | position and heading of each ant |
+| `g_rule` | `const char *` | 8 B | rule string (e.g. "RL") encoding turn direction per colour |
+| `g_total_steps` | `long long` | 8 B | cumulative steps taken since last reset |

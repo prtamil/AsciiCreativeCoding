@@ -86,3 +86,12 @@ The presets are a starting point, but part of the joy of cellular automata is ex
 | PAUSE_TICKS | How long the complete pattern is held before advancing |
 | g_ca_rows | Number of grid rows = screen rows − 2 (title bar + HUD) |
 | DELAY_DEF | Default delay; adjustable with +/- |
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_grid[MAX_ROWS][MAX_COLS]` | `uint8[128][320]` | ~40 KB | 2-D grid storing each generation as a row |
+| `g_rule` | `int` | 4 B | current Wolfram rule number (0–255) |
+| `g_gen` | `int` | 4 B | highest computed generation (current row index) |
+| `g_idig[3]` | `int[3]` | 12 B | digit input buffer for typing a rule number |

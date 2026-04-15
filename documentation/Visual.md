@@ -2816,4 +2816,255 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
+---
+
+### V5 — Visual Effects Techniques (continued)
+
+#### V5.17 Marching Squares — 16-Case Contour Character Selection
+
+**What it is:** A technique that draws iso-contours of a scalar field by classifying each 2×2 cell of grid corners as inside/outside and selecting a slope character that visually matches the crossing direction.
+
+**What we achieve:** Smooth-looking contour lines drawn purely in ASCII — without any GPU or image buffer — that accurately follow the zero-crossing of the field. Multiple iso-levels can be drawn in a single pass over the same pre-sampled corner values.
+
+**How:** For each 2×2 cell of grid corners, each corner is classified as inside (`f > threshold`) or outside (`f ≤ threshold`). The four bits form a 4-bit index (0–15) into a 16-entry edge table that specifies which of the four cell edges are crossed. A second table maps the same index to the ASCII character that best represents the local tangent direction:
+
+| Edge pair crossed | Character |
+|---|---|
+| top + bottom | `\|` |
+| left + right | `-` |
+| top + right  | `\` |
+| top + left   | `/` |
+| bottom + right | `\` |
+| bottom + left  | `/` |
+| saddle (all 4) | `X` |
+
+```c
+static char case_char(int idx)
+{
+    static const char tbl[16] = {
+        ' ',  /* 0000 all outside      */
+        '/',  /* 0001 BL: left+bottom  */
+        '\\', /* 0010 BR: bottom+right */
+        '-',  /* 0011 left+right       */
+        '\\', /* 0100 TR: right+top    */
+        'X',  /* 0101 saddle           */
+        '|',  /* 0110 top+bottom       */
+        '/',  /* 0111 top+left         */
+        /* ... symmetric for bits 8-15 */
+    };
+    return tbl[idx & 0xf];
+}
+```
+
+Multi-level mode draws N iso-contours by running the same per-cell loop once per threshold level, all reading from the same pre-sampled corner array — O(W×H×N_LEVELS) rather than O(N_LEVELS × W × H) separate field evaluations.
+
+*Files: `fluid/marching_squares.c`*
+
+---
+
+#### V5.18 Aspect-Corrected Ellipse Rendering for Circle Drawing
+
+**What it is:** When drawing parametric circles in terminal space, the radius must be scaled differently for the horizontal and vertical axes to compensate for non-square character cells.
+
+**What we achieve:** Circles in physical-pixel space (what the user sees) rather than character-cell space, where a circular object would otherwise appear as a vertically stretched oval.
+
+**How:** Terminal cells are typically 2× taller than wide. When converting a simulation-space circle of radius `r` to screen coordinates, the vertical radius in rows is `r_row = r_col × 0.5`. The same correction applies when choosing the slope character at each point on the outline: the tangent direction uses the corrected aspect to decide between `|`, `-`, `/`, and `\`:
+
+```c
+/* In apollonian.c — aspect-corrected tangent character */
+static char circle_char(float theta)
+{
+    float dx = -sinf(theta);
+    float dy =  0.5f * cosf(theta);   /* 0.5 = r_row/r_col aspect factor */
+    float ax = fabsf(dx), ay = fabsf(dy);
+    if (ay > ax * 1.73f) return '|';
+    if (ax > ay * 1.73f) return '-';
+    return (dx * dy > 0.f) ? '\\' : '/';
+}
+
+/* Draw the ellipse outline */
+float r_col = r_sim * (float)(g_cols - 2) * 0.5f;
+float r_row = r_col * 0.5f;   /* 2:1 cell aspect ratio */
+for (int s = 0; s < n_steps; s++) {
+    float theta = 2.f * M_PI * s / n_steps;
+    int col = cx_col + (int)(r_col * cosf(theta) + 0.5f);
+    int row = cy_row + (int)(r_row * sinf(theta) + 0.5f);
+    mvaddch(row, col, (chtype)(unsigned char)circle_char(theta));
+}
+```
+
+For sub-pixel circles (radius < 1.5 cols), fall back to a single center dot rather than attempting to render an outline that would collapse to noise.
+
+*Files: `fractal_random/apollonian.c`*
+
+---
+
+#### V5.19 Two-Panel Split Layout — Time Domain / Frequency Domain
+
+**What it is:** Dividing the terminal vertically into two equal panels, each rendering a different view of the same data (signal and its FFT spectrum), with separate baseline references.
+
+**What we achieve:** A live dual-view visualization where both panels auto-scale to terminal height, keeping the display meaningful as the window resizes. Positive and negative bar segments grow in opposite directions from a shared baseline.
+
+**How:** The screen is split at the midpoint. Each panel has a `base` row (the zero line) and a `panel_h` in rows. For the time-domain panel, positive samples grow upward from the base; negative samples grow downward. For the frequency-domain panel, all magnitudes grow upward from the bottom baseline. Both panels normalize their peak value each frame so the tallest bar always fills the panel:
+
+```c
+int panel_h  = (LINES - 4) / 2;
+int time_mid = 1 + panel_h;          /* baseline row for time panel  */
+int freq_base= time_mid + 2 + panel_h; /* baseline row for freq panel  */
+
+/* positive bar: grow up from baseline */
+for (int dy = 0; dy < h; dy++) {
+    int row = positive ? (base - dy) : (base + dy + 1);
+    attron(COLOR_PAIR(cp));
+    mvaddch(row, x, positive ? '|' : '.');
+    attroff(COLOR_PAIR(cp));
+}
+```
+
+The frequency panel uses two color pairs: one for bins below half panel height (`CP_FLOW`) and a brighter one for tall bins (`CP_FHIGH`), creating a visual emphasis on dominant frequencies without requiring per-bin color registration.
+
+*Files: `artistic/fft_vis.c`*
+
+---
+
+#### V5.20 Scan-line Bell Shape — Parametric Ellipse with Zone-Based Characters
+
+**What it is:** Rendering a filled ellipse outline by scanning rows and computing the left and right edge columns from the ellipse equation, then selecting different border characters based on the normalized row position within the ellipse.
+
+**What we achieve:** A convincing jellyfish bell shape entirely from ASCII characters, where the character at each edge position changes to give a sense of curvature — flat at the rim, rounded in the mid-section, and arched at the crown.
+
+**How:** For each row `r` within the ellipse's bounding box, the y-offset `ny = (py - cy) / Ry` is computed. The horizontal edge at that row is `Rx × sqrt(1 - ny²)`. The border character is chosen by `abs_ny` zones:
+
+```c
+/* zone-based character selection in jellyfish.c */
+chtype lch, rch;
+if      (abs_ny > 0.40f) { lch = '/';  rch = '\\'; }  /* upper sides */
+else if (abs_ny > 0.14f) { lch = '(';  rch = ')';  }  /* mid bulge   */
+else                     { lch = '~';  rch = '~';  }  /* rim         */
+
+/* crown region: flat top */
+if (abs_ny > 0.88f) {
+    for (int c = cl; c <= cr; c++) mvwaddch(win, r, c, '_');
+}
+
+/* interior translucent dots only in outer annulus r² > 0.60 */
+float r2 = nx * nx + ny * ny;
+if (r2 < 0.60f) continue;   /* skip dense inner region */
+mvwaddch(win, r, c, '.');
+```
+
+The tentacles additionally use state-machine wave amplitude (`wave_scale`) to stream straight during the jet glide phase and sway freely during idle — the same sinusoidal formula, amplitude-gated by the animation state.
+
+*Files: `artistic/jellyfish.c`*
+
+---
+
+#### V5.21 Precomputed Lensing Table — Separate Physics and Render Rates
+
+**What it is:** Computing expensive per-pixel ray integration once at startup into a lookup table, then rendering animation frames at full speed by reading that table with only cheap per-frame arithmetic.
+
+**What we achieve:** A physically accurate black hole visualization at 60 fps despite each pixel requiring up to 900 RK4 integration steps. The table lookup separates the O(pixels × steps) cost (paid once) from the per-frame O(pixels) render cost.
+
+**How:** At startup, for every terminal cell `(row, col)`, a backward null geodesic is integrated through the Schwarzschild spacetime. The result (horizon hit, disk hit, or escaped with escape angles) is stored in `g_table[row][col]`. Each frame, the table is read and only fast arithmetic — Keplerian Doppler beaming, gravitational redshift, disk rotation angle — is applied:
+
+```c
+/* Startup: fill lensing table (slow — pays once) */
+g_table[row][col] = ray_trace(cam, dir);   /* up to 900 RK4 steps */
+
+/* Per frame: look up and apply Doppler + rotation (fast) */
+const Cell *c = &g_table[row][col];
+float phi   = c->disk_phi + disk_angle;    /* add cumulative disk spin */
+float v_orb = sqrtf(0.5f / c->disk_r);    /* Keplerian orbital speed  */
+float beta  = -v_orb * cosf(phi) * cos_tilt;
+float D     = powf((1.f+beta)/(1.f-beta), 1.5f);  /* Doppler beaming  */
+```
+
+A progress bar drawn directly to `stdscr` during the build phase (using `wnoutrefresh` + `doupdate` per row stripe) shows percent completion without requiring a separate thread.
+
+*Files: `artistic/blackhole.c`*
+
+---
+
+#### V5.22 Offset-Row Hex Grid Layout
+
+**What it is:** Placing characters at the vertices of a hexagonal tiling by offsetting every odd row right by half the column spacing, producing a "pointy-top hexagon" layout.
+
+**What we achieve:** Denser, more visually isotropic packing than a square grid — each cell appears to have 6 neighbours rather than 4, which makes patterns feel more organic.
+
+**How:** The screen position of hex cell `(hx, hy)` is:
+
+```c
+int col = hx * HEX_DX + (hy & 1) * (HEX_DX / 2);
+int row = hy * HEX_DY;
+```
+
+The aspect constants `HEX_DX=4, HEX_DY=2` are chosen so that `HEX_DY / HEX_DX = 0.5`, which — multiplied by the terminal cell aspect ratio (cell_w/cell_h ≈ 0.47) — gives a physical ratio close to the ideal `√3/2 ≈ 0.866` for regular hexagons.
+
+Ring distance from the centre hex uses the cube-coordinate Chebyshev formula (offset layout → cube coordinates → `max(|dq|, |dr|, |ds|)`), which maps cleanly to concentric color bands:
+
+```c
+static int hex_dist(int hx1, int hy1, int hx2, int hy2) {
+    int q1 = hx1 - (hy1 - (hy1 & 1)) / 2;
+    int r1 = hy1;
+    int q2 = hx2 - (hy2 - (hy2 & 1)) / 2;
+    int r2 = hy2;
+    int dq = q1-q2, dr = r1-r2, ds = dq+dr;
+    return max(abs(dq), max(abs(dr), abs(ds)));  /* cube Chebyshev */
+}
+int band = hex_dist(hx, hy, cx, cy) % N_BAND_COLORS;
+```
+
+*Files: `geometry/hex_grid.c`*
+
+---
+
+#### V5.23 Coroutine-Style Sort Visualizer — One Operation Per Tick
+
+**What it is:** Implementing sorting algorithms as state-machine iterators that advance exactly one comparison or swap per call, allowing the animation loop to control speed independently of the algorithm's structure.
+
+**What we achieve:** Any sorting algorithm — bubble sort, heapsort, quicksort — can be animated at any user-set speed without requiring threads, continuations, or algorithm modification. Swapped and compared indices are recorded as global state and drawn with different colors each frame.
+
+**How:** Each algorithm is a struct of iteration state plus a `step()` function returning 0 (more work) or 1 (done). The animation loop calls `step()` N times per frame based on a speed slider, then redraws:
+
+```c
+/* per-tick state update */
+g_cmp1 = g_bj; g_cmp2 = g_bj + 1;   /* indices being compared this tick */
+if (g_arr[g_bj] > g_arr[g_bj+1]) arr_swap(g_bj, g_bj+1);
+
+/* draw: color by operation state */
+int cp;
+if      (i == g_swp1 || i == g_swp2) cp = CP_SWP;   /* red   */
+else if (i == g_cmp1 || i == g_cmp2) cp = CP_CMP;   /* cyan  */
+else if (g_done)                      cp = CP_SORT;  /* green */
+else                                  cp = CP_NORM;  /* grey  */
+```
+
+The `A_BOLD` attribute is added only to swapped bars (`CP_SWP | A_BOLD`), making the swap operation visually "louder" than a comparison without requiring a fifth color pair.
+
+*Files: `misc/sort_vis.c`*
+
+---
+
+#### V5.24 Maze 2×2 Sub-pixel Expansion — Foreground/Background Pair Rendering
+
+**What it is:** Expanding each logical maze cell into a 2×2 block of terminal cells, using foreground/background color pairs (not just foreground) to distinguish walls, open passages, and the solution path.
+
+**What we achieve:** Maze walls appear as solid filled blocks (both foreground and background set to the same dark color) rather than outline characters, making the maze structure immediately legible. The BFS solution path is drawn in a visually distinct color that appears as a continuous channel.
+
+**How:** Wall cells use `init_pair(CP_WALL, 232, 232)` — black-on-black — so `' '` fills as a solid dark block. Open cells use `init_pair(CP_CELL, 255, 235)` — white text on dark grey — so any character drawn there appears light. The solution path uses a colored background:
+
+```c
+init_pair(CP_WALL,      232, 232);   /* black on black — solid wall    */
+init_pair(CP_CELL,      255, 235);   /* white on dark grey — passage   */
+init_pair(CP_FRONT,     226,  94);   /* yellow on brown — gen frontier */
+init_pair(CP_PATH,       51,  17);   /* cyan on dark blue — BFS path   */
+init_pair(CP_DONE_PATH, 231,  22);   /* white on green — final solution*/
+```
+
+The 2×2 expansion maps maze coordinate `(r, c)` to screen coordinates `(2r+1, 2c+1)` for the cell center, with walls at the odd rows/columns between cells.
+
+*Files: `misc/maze.c`*
+
+---
+
 *This document is the single reference for all ncurses techniques used across the C files in this project. For fractal algorithms and IFS theory, see Master.md §P and §Q. For the overall loop architecture and subsystem details, see Architecture.md. For color-specific techniques, see COLOR.md.*

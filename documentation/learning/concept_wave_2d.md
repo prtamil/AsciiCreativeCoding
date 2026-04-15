@@ -59,6 +59,18 @@ CFL stability condition: `c·dt/dx ≤ 1/√2` (2D).
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_u[GRID_H_MAX][GRID_W_MAX]` | `float[100][320]` | ~125 KB | current wave amplitude field |
+| `g_up[GRID_H_MAX][GRID_W_MAX]` | `float[100][320]` | ~125 KB | previous-step field (FDTD needs t and t−1) |
+| `g_u2[GRID_H_MAX][GRID_W_MAX]` | `float[100][320]` | ~125 KB | scratch buffer for next-step computation |
+| `g_src[N_SOURCES]` | `Source[5]` | ~60 B | oscillating source positions, phases, active flags |
+| `g_step` | `long long` | 8 B | global tick counter shown in HUD |
+
+---
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

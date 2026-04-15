@@ -127,6 +127,17 @@ One iteration per frame at 30 fps would take minutes to fill the attractor. Runn
 
 **Performance:** Density grid used rather than drawing individual points — accumulates hit counts per cell and log-normalises for display. LCG random number generator (`g_lcg * 1664525 + 1013904223`) with cap at HITS_CAP=60,000 (uint16_t headroom). ITERS_DEFAULT=8000 per frame fills the fern visibly in about 1 second.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `Transform` (struct) | `typedef struct` | 28 B | affine coefficients a–f plus cumulative probability `cum` |
+| `Preset` (struct) | `typedef struct` | ~120 B | name, n_transforms, 4 transforms, view extents |
+| `g_hits[GRID_ROWS_MAX][GRID_COLS_MAX]` | `uint16_t[]` | ~48 KB | hit accumulator; capped at HITS_CAP=60,000 |
+| `g_cx`, `g_cy` | `float` | scalar | current orbit position in IFS coordinate space |
+| `g_lcg` | `uint32_t` | scalar | LCG RNG state; advances each iteration |
+| `GRID_ROWS_MAX`, `GRID_COLS_MAX` | constants | N/A | maximum grid size (80 × 300) |
+
 ## Open Questions for Pass 3
 
 - What is the **Hausdorff dimension** of each attractor? The Barnsley fern's theoretical value is ≈1.86. Measure it by box-counting on the hit grid.

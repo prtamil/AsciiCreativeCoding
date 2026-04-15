@@ -124,6 +124,17 @@ The HUD color matches V1 to keep the status bar in the same palette family.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_grid[GRID_ROWS_MAX][GRID_COLS_MAX]` | `uint8_t[]` | ~24 KB | color index per cell (0=empty, 1–3 by last chosen vertex) |
+| `g_cx`, `g_cy` | `float` | scalar | current IFS orbit point in normalized triangle space |
+| `g_last_v` | `int` | scalar | index of last chosen vertex (0–2); drives coloring |
+| `GRID_ROWS_MAX`, `GRID_COLS_MAX` | constants | N/A | maximum grid size (80 × 300) |
+| `N_PER_TICK` | `int` constant | N/A | IFS iterations per simulation tick (500) |
+| `TOTAL_ITERS` | `int` constant | N/A | total iterations before auto-reset (50,000) |
+
 # Pass 2 — sierpinski: Pseudocode
 
 ## Module Map

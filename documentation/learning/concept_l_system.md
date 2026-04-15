@@ -51,6 +51,14 @@ Turtle interpretation:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `ls.cur[1MB]` | `char *` (heap) | ~1 MB | current generation string (null-terminated) |
+| `ls.nxt[1MB]` | `char *` (heap) | ~1 MB | rewrite scratch buffer for next generation |
+| `PRESETS[N_PRESETS]` | `Preset[8]` | ~2 KB | axiom, rule table, angle, max_gen per L-system variant |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

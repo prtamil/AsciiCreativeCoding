@@ -243,6 +243,15 @@ where `f_x`, `f_y` are focal lengths and `(cx, cy)` is the principal point (scre
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app` | `App` | ~varies | Top-level singleton holding scene, screen, sim_fps, and signal flags |
+| `g_app.scene.shapes[SHAPE_COUNT]` | `Shape[4]` | ~150 KB | Vertex and edge tables for cube, sphere, pyramid, and torus |
+| `g_app.scene.canvas.ch` | `char*` (heap, cols×rows) | ~15 KB | Per-cell character for the current rendered frame |
+| `g_app.scene.canvas.col` | `ShapeColor*` (heap, cols×rows) | ~15 KB | Per-cell colour pair index |
+
 # Pass 2 — wireframe: Pseudocode
 
 ## Module Map

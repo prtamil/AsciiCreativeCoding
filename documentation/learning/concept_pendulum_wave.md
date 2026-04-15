@@ -52,6 +52,17 @@ The length is implicit: `L_n = g / ω_n²` (not needed if using ω_n directly).
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_omega[N_PEND]` | `float[15]` | 60 B | precomputed angular frequency for each pendulum |
+| `g_time` | `float` | 4 B | elapsed simulation time (seconds), drives all θ_n(t) |
+| `g_amp` | `float` | 4 B | current swing amplitude fraction (user-adjustable) |
+| `g_rows`, `g_cols` | `int` | 8 B | terminal dimensions |
+| `g_paused` | `bool` | 1 B | simulation pause flag |
+| `g_quit`, `g_resize` | `volatile sig_atomic_t` | 8 B | signal flags |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

@@ -136,3 +136,12 @@ A slowly orbiting light on a smooth sinusoidal path `(4cos(t), 2sin(0.45t)+2.5, 
 | CURV_SCALE | Laplacian → [0,1] normalisation factor |
 | SHADOW_K | Soft shadow sharpness (higher = harder edge) |
 | ORBIT_RX/RY/RZ | Lissajous orbit radii in world space |
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `BALL_A/B/C[6]` | `const float[6]` | ~72 B | Lissajous frequency coefficients per axis per ball |
+| `BALL_PX/PY[6]` | `const float[6]` | ~48 B | initial phase offsets to spread balls at t=0 |
+| `BALL_R[6]` | `const float[6]` | ~24 B | SDF sphere radius per ball |
+| `k_theme_colors[4][8]` | `const int[4][8]` | ~128 B | curvature band → color pair index per theme |

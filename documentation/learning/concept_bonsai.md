@@ -181,6 +181,17 @@ Each tree type has a different biased random walk:
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `Branch` (struct) | `typedef struct` | ~24 B | position (x,y), life remaining, type, age counter |
+| `g_pool[BRANCH_MAX]` | `Branch[1024]` | ~24 KB | flat branch pool; processed FIFO each growth tick |
+| `LIFE_DEFAULT` | `int` constant | N/A | steps a trunk branch lives (120) |
+| `MULT_DEFAULT` | `int` constant | N/A | branching multiplier 0–20 (default 8) |
+| `BRANCH_MAX` | `int` constant | N/A | branch pool capacity (1024) prevents unbounded growth |
+| `GROW_FPS_DEFAULT` | `int` constant | N/A | growth steps per second (default 30) |
+
 # Pass 2 — bonsai: Pseudocode
 
 ## Module Map

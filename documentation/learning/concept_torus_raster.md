@@ -124,6 +124,16 @@ No state machine. Continuous rotation. One boolean: `paused`.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app.scene.mesh.verts` | `Vertex*` (heap, TESS_U×TESS_V vertices) | ~30 KB | Per-vertex position, normal, and UV for the tessellated torus |
+| `g_app.scene.mesh.tris` | `Triangle*` (heap, TESS_U×TESS_V×2 triangles) | ~12 KB | Triangle index triples into the vertex array |
+| `g_app.fb.zbuf` | `float*` (heap, cols×rows) | ~varies | Per-fragment depth for z-test (FLT_MAX = empty) |
+| `g_app.fb.cbuf` | `Cell*` (heap, cols×rows) | ~varies | Per-cell character and colour pair ready for blitting |
+| `k_bayer[4][4]` | `const float[4][4]` | 64 B | 4×4 ordered dither matrix for softening ramp banding |
+
 # Pass 2 — torus_raster: Pseudocode
 
 ## Module Map

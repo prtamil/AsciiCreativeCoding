@@ -51,6 +51,14 @@ No tunable constants. The program reads whatever the terminal reports.
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `LINES` | `int` (ncurses global) | scalar | terminal row count set by `initscr()`; read-only after init |
+| `COLS` | `int` (ncurses global) | scalar | terminal column count set by `initscr()`; read-only after init |
+| `stdscr` | `WINDOW *` (ncurses global) | N/A | default full-screen window created by `initscr()` |
+
 # Pass 2 — tst_lines_cols: Pseudocode
 
 ## Module Map

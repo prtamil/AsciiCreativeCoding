@@ -178,6 +178,13 @@ The cache is a flat array of shimmer chars. `cache[i]` is used for `trail[i]`. T
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `rockets[MAX_ROCKETS]` | `Rocket[16]` | ~230 KB | object pool of rockets with matrix-trail sparks |
+| `rockets[i].particles[PARTICLES_PER_BURST]` | `MatrixParticle[72]` | ~14 KB each | spark pool with TRAIL_LEN=16 position history |
+
 # Pass 2 — fireworks_rain.c: Pseudocode
 
 ## Module Map

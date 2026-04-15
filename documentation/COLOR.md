@@ -750,3 +750,351 @@ dark or invisible against a black background.
 **Effect:** Every gradient step is readable at all times. Theme identity comes from
 hue family (fire=red/orange, arctic=cyan/blue) rather than the dark-end color,
 which was invisible anyway.
+
+---
+
+## 28. Root-Basin Coloring with Convergence-Speed Brightness (Newton Fractal)
+
+**Where:** `fractal_random/newton_fractal.c`
+
+**How it works:**
+Newton's method for `f(z) = z⁴ − 1` converges to one of four roots: +1, −1, +i, −i. Each root is assigned a hue family (red, blue, yellow, green). Within each hue, two color pairs are used: one dark and one bright. The convergence speed `t = n_iter / MAX_ITER` selects which:
+
+```c
+/* two pairs per root: dark (D) and bright (B) */
+enum {
+    CP_R1D = 1,  /* root +1  dark red    */
+    CP_R1B,      /* root +1  bright red  */
+    CP_R2D,      /* root -1  dark blue   */
+    CP_R2B,      /* root -1  bright blue */
+    /* ... */
+};
+
+static void map_color(int root, int n, int *cp_out, chtype *ch_out) {
+    float t = (float)n / (float)MAX_ITER;
+    int bright = (t < 0.25f);           /* fast convergence = bright */
+    *cp_out = CP_R1D + root * 2 + (bright ? 1 : 0);
+
+    if      (t < 0.15f) *ch_out = '.';  /* slowest converge near boundary */
+    else if (t < 0.40f) *ch_out = ':';
+    else if (t < 0.70f) *ch_out = '+';
+    else                *ch_out = '#';  /* fastest converge = dense char   */
+}
+```
+
+The inversion relationship: fast convergence (low `t`) maps to bright colors and sparse characters (`.`), while slow convergence near basin boundaries maps to dark colors and dense characters (`#`). This makes the fractal boundary — where convergence is most uncertain — appear as a vivid dark-outlined fractal structure.
+
+**Effect:** Four-color basin map with internal shading. The basin interiors show gradient structure (where Newton converges in fewer steps) while the boundary fractal is highlighted by the darkest colors and densest characters.
+
+---
+
+## 29. Continuous-State CA — 5-Level Color Quantization (Lenia)
+
+**Where:** `fluid/lenia.c`
+
+**How it works:**
+The Lenia automaton produces a continuous float state `u ∈ [0, 1]` per cell. Rather than mapping this to a grey ramp, it is quantized into 5 blue-spectrum pairs spanning dark navy to white, paired with increasing-density characters. Cells with `u < 0.05` are skipped entirely (transparent background), keeping the display sparse and readable:
+
+```c
+if      (u < 0.05f) continue;          /* invisible — background shows */
+else if (u < 0.20f) { cp = CP_U0; ch = '.'; }   /* dark navy   */
+else if (u < 0.40f) { cp = CP_U1; ch = ':'; }   /* blue        */
+else if (u < 0.60f) { cp = CP_U2; ch = '+'; }   /* cyan        */
+else if (u < 0.80f) { cp = CP_U3; ch = '*'; }   /* pale cyan   */
+else                { cp = CP_U4; ch = '#'; }   /* white       */
+
+/* Color pairs: navy→blue→cyan→pale-cyan→white */
+init_pair(CP_U0,  17, -1);   /* dark navy  */
+init_pair(CP_U1,  27, -1);   /* blue       */
+init_pair(CP_U2,  51, -1);   /* cyan       */
+init_pair(CP_U3, 195, -1);   /* pale cyan  */
+init_pair(CP_U4, 231, -1);   /* white      */
+```
+
+Both character density and color advance together through the same threshold boundaries — `.` at the faintest and `#` at the brightest — giving two independent visual channels that reinforce each other.
+
+**Effect:** Living "creatures" appear as bright white-cyan cores fading to dark navy edges over a transparent background, matching the bioluminescent aesthetic of the Lenia biology paper.
+
+---
+
+## 30. Multi-Component Physics Coloring — Role-Semantic Pair Assignment (Schrödinger)
+
+**Where:** `physics/schrodinger.c`
+
+**How it works:**
+When a simulation has several physically distinct quantities that must be visually separable, each quantity gets its own color pair with a role name rather than a numeric index. For the 1-D Schrödinger equation, four quantities are displayed simultaneously:
+
+```c
+enum { CP_RE=1, CP_IM, CP_PROB, CP_VPOT, CP_HUD };
+
+init_pair(CP_RE,   27, -1);   /* blue   — Re(ψ)  real part      */
+init_pair(CP_IM,  196, -1);   /* red    — Im(ψ)  imaginary part */
+init_pair(CP_PROB,231, -1);   /* white  — |ψ|²   probability density */
+init_pair(CP_VPOT,220, -1);   /* yellow — V(x)   potential energy    */
+```
+
+The rendering draws all four in a single column pass:
+- `|ψ|²` as a vertical white bar chart growing upward from the midline
+- `Re(ψ)` as a blue dot at the signed-amplitude row
+- `Im(ψ)` as a red dot at its signed-amplitude row
+- `V(x)` as a yellow bar at the bottom
+
+Because `Re`, `Im`, and `|ψ|²` are drawn at different rows for the same column, they do not overwrite each other — the last write at each cell wins, so `|ψ|²` is drawn first (background) and `Re`/`Im` dots are drawn on top.
+
+**Effect:** All three wavefunction components are simultaneously visible on screen. Blue and red oscillate together (the complex phasor rotation); white shows the probability envelope; yellow shows the potential barrier, all without any intermediate buffer or separate window.
+
+---
+
+## 31. Iso-Level Hue Shift — Progressive Color Stepping Per Contour (Marching Squares)
+
+**Where:** `fluid/marching_squares.c`
+
+**How it works:**
+In multi-level mode, the marching squares algorithm draws N iso-contours at evenly spaced threshold values. Rather than reusing the same color pair for all levels, each level's color pair is dynamically registered with an xterm-256 index offset from the theme base color. This produces a spectrum of contours with distinct hues without pre-allocating N theme-specific pairs:
+
+```c
+/* evenly spaced levels from thresh*0.3 up to thresh*0.95 */
+float t = a->thresh * (0.3f + lv * 0.15f);
+
+/* dynamic hue shift: each level gets +6 index steps */
+short col = (short)(theme_contour[a->theme] + lv * 6);
+init_pair(10 + (short)lv, col, 16);   /* pairs 10..14 overwritten each frame */
+attron(COLOR_PAIR(10 + lv));
+mvaddch(gy, gx, c);
+attroff(COLOR_PAIR(10 + lv));
+```
+
+The base theme indices are chosen at saturated, well-spaced xterm-256 positions (51 cyan, 196 red, 46 green, 201 magenta). Adding `lv * 6` to the base index steps through nearby hues in the 6×6×6 color cube, keeping the theme family while varying the level.
+
+**Effect:** Each iso-contour ring appears in a slightly different hue, creating a topographic-map look that reveals the depth structure of the potential field. The fill inside the innermost contour is drawn with a faint backtick character in `CP_INSIDE`, giving density without clutter.
+
+---
+
+## 32. Particle-Type Color Struct — Physics Properties Co-Located with Color (Bubble Chamber)
+
+**Where:** `physics/bubble_chamber.c`
+
+**How it works:**
+Rather than separately managing physics parameters and color indices, each particle type is defined as a single struct that co-locates the charge/mass ratio, display symbol, and both 256-color and 8-color fallback indices. Color pairs are registered in a loop directly from this table:
+
+```c
+typedef struct {
+    const char *name;
+    const char *symbol;
+    float       qm;       /* charge/mass ratio — determines curl direction */
+    short       c256;     /* xterm-256 foreground                          */
+    short       c8;       /* 8-color fallback                              */
+} PType;
+
+static const PType k_types[N_TYPES] = {
+    { "electron", "e-", -0.200f,  51, COLOR_BLUE   },   /* tight cyan spirals  */
+    { "positron", "e+", +0.200f, 196, COLOR_RED    },   /* tight red spirals   */
+    { "muon",     "mu", -0.070f,  46, COLOR_GREEN  },   /* medium green arc    */
+    { "pion",     "pi", +0.045f, 226, COLOR_YELLOW },   /* wide yellow arc     */
+    { "proton",   "p ", +0.022f, 159, COLOR_CYAN   },   /* barely curves, cyan */
+};
+
+for (int i = 0; i < N_TYPES; i++) {
+    short fg = g_256color ? k_types[i].c256 : k_types[i].c8;
+    init_pair(1 + i, fg, -1);
+}
+```
+
+The color then directly encodes physics: opposite `qm` signs produce opposite curl directions, and the color distinguishes electron (cyan, tight) from positron (red, tight) and proton (pale cyan, almost straight).
+
+**Trail age fading** uses the same pair but with attribute stepping — `A_BOLD` for fresh track, normal for mid-age, and the track is simply omitted for `age >= 0.80`:
+
+```c
+if      (age < 0.25f) { ch = '*'; attr |= A_BOLD; }
+else if (age < 0.55f) { ch = '+'; }
+else                  { ch = '.'; }
+/* age >= 0.80: break — rest of trail not drawn */
+```
+
+**Effect:** Each particle type is immediately identifiable by color and curl direction. Trail age is encoded in character density without additional pair registration.
+
+---
+
+## 33. Recursive Depth Rainbow — Hue Encodes Fractal Nesting Level (Apollonian Gasket)
+
+**Where:** `fractal_random/apollonian.c`
+
+**How it works:**
+Each circle in the Apollonian gasket is generated at a recursion depth 1–7. The color pair is assigned directly from the depth, cycling through a full hue spectrum from yellow (outermost, depth 1) to red (deepest, depth 7):
+
+```c
+init_pair(CP_D1, 226, -1);   /* bright yellow — depth 1 (outermost) */
+init_pair(CP_D2, 118, -1);   /* lime green    — depth 2             */
+init_pair(CP_D3,  51, -1);   /* bright cyan   — depth 3             */
+init_pair(CP_D4,  33, -1);   /* dodger blue   — depth 4             */
+init_pair(CP_D5,  93, -1);   /* purple        — depth 5             */
+init_pair(CP_D6, 201, -1);   /* magenta       — depth 6             */
+init_pair(CP_D7, 196, -1);   /* red           — depth 7 (deepest)   */
+
+/* At draw time: clamp depth to [1,7] and select bold for outer rings */
+int d    = c->depth < 1 ? 1 : c->depth > 7 ? 7 : c->depth;
+attr_t bold = (d <= 2) ? A_BOLD : 0;   /* larger outer circles bolder */
+attron(COLOR_PAIR(d) | bold);
+```
+
+Sub-pixel circles (radius < 0.5 cols) are drawn as a single `.` dot; tiny circles (radius < 1.5 cols) as `o` or `.` depending on depth; full circles draw their outline using slope characters. This avoids spending rendering budget on circles too small to show their outline.
+
+**Effect:** The fractal's self-similar nesting structure is immediately legible — the same color sequence (yellow→green→cyan→blue→purple→magenta→red) repeats at every zoom level, revealing the recursive construction.
+
+---
+
+## 34. Doppler + Gravitational Redshift Color (Black Hole Accretion Disk)
+
+**Where:** `artistic/blackhole.c`
+
+**How it works:**
+The brightness of each disk pixel is computed from three multiplicative physical factors: relativistic Doppler beaming, gravitational redshift, and a radial temperature profile. This combined brightness then drives both the character selected and the color pair:
+
+```c
+/* Keplerian Doppler beaming: approaching side → D > 1 (brighter) */
+float v_orb = sqrtf(0.5f / disk_r);
+float beta  = -v_orb * cosf(phi) * cos_tilt;
+float D     = powf((1.f+beta)/(1.f-beta), 1.5f);
+
+/* Gravitational redshift: inner disk dims near horizon */
+float g = sqrtf(fmaxf(0.01f, 1.f - 1.f / disk_r));
+
+/* Radial temperature + ISCO spike */
+float dr   = disk_r - DISK_IN;
+float isco = expf(-dr * dr * 0.65f);   /* spike at innermost stable orbit */
+float rad  = powf(1.f - 0.86f * r_n, 2.2f) + 0.65f * isco;
+
+/* Spiral texture co-rotating with disk */
+float tex = 1.f + 0.18f * sinf(disk_phi * 5.f - disk_angle * 4.f);
+
+float bright = clamp(D * g * rad * tex, 0.f, 1.f);
+
+/* bright → color pair (inner=hot, outer=cool) */
+if      (bright > 0.85f) { cp = CP_RING; a = A_BOLD; }
+else if (bright > 0.67f) { cp = CP_HOT;              }
+else if (bright > 0.50f) { cp = CP_WARM;             }
+else if (bright > 0.33f) { cp = CP_MID;              }
+else if (bright > 0.17f) { cp = CP_COOL;             }
+else                     { cp = CP_DIM;              }
+```
+
+The theme system supports 11 named palettes (interstellar, matrix, nova, ocean, etc.), each defining the six foreground colors for CP_RING through CP_DIM. Switching themes re-registers all six pairs, keeping the same brightness logic but changing the color family.
+
+**Effect:** The approaching side of the accretion disk is dramatically brighter (Doppler boost up to 4×), gravitational redshift dims the innermost disk, and the ISCO spike creates a bright ring at the innermost stable orbit. All visible on a character terminal with no GPU.
+
+---
+
+## 35. Hex-Band Concentric Color — 8-Level Radial Palette with Cube Distance (Hex Grid)
+
+**Where:** `geometry/hex_grid.c`
+
+**How it works:**
+All color pairs for all themes are registered at startup in a 2D table `g_pal[N_THEMES][N_BAND_COLORS]`. The pair index for any hex cell is computed as `PAIR(theme, band) = theme * N_BAND_COLORS + band + 1`. This means switching themes requires no `init_pair` calls — only the draw call changes which pair index it uses:
+
+```c
+#define PAIR(t, b)  ((t) * N_BAND_COLORS + (b) + 1)
+
+/* All 48 pairs registered once at startup */
+for (int t = 0; t < N_THEMES; t++)
+    for (int b = 0; b < N_BAND_COLORS; b++)
+        init_pair(PAIR(t, b), g_pal[t][b], -1);
+
+/* At draw time: select band from cube distance, theme from UI state */
+int dist = hex_dist(hx, hy, cx_hex, cy_hex);
+int band = dist % N_BAND_COLORS;
+attron(COLOR_PAIR(PAIR(theme, band)));
+```
+
+The 8-band fire palette (`{231, 226, 220, 214, 208, 202, 196, 160}`) runs from white at the center to dark red at the outermost band — the inner rings glow brightest, fading outward. The modulo wraps distance: hex cells at distance 8 restart the same color as distance 0, creating repeating concentric rings at large grids.
+
+**Effect:** Theme switching is instantaneous (no init_pair calls needed at runtime). The concentric ring pattern is an automatic consequence of the cube-distance metric — no explicit ring list is maintained.
+
+---
+
+## 36. HSV-to-RGB Fragment Shader — Iteration Depth as Hue (Mandelbulb Raster)
+
+**Where:** `raster/mandelbulb_raster.c`
+
+**How it works:**
+The Mandelbulb surface has a "smooth" iteration count stored per vertex at mesh time. In the fragment shader, this smooth value drives a full HSV-to-RGB conversion: hue cycles through the spectrum N times across the smooth range, while value (brightness) comes from Blinn-Phong lighting. The two signals are orthogonal — depth determines hue, lighting determines brightness:
+
+```c
+static Vec3 hsv_to_rgb(float h, float s, float v)
+{
+    h *= 6.0f;
+    int   i = (int)h;
+    float f = h - (float)i;
+    float p = v * (1.0f - s);
+    float q = v * (1.0f - s * f);
+    float t = v * (1.0f - s * (1.0f - f));
+    switch (i % 6) {
+    case 0: return v3(v, t, p);
+    case 1: return v3(q, v, p);
+    /* ... */
+    }
+}
+
+/* In the fragment shader */
+float hue  = fmodf(smooth * hue_bands, 1.0f);   /* N cycles across surface */
+float luma = 0.10f + 0.72f * diffuse + 0.28f * specular;
+Vec3  c    = hsv_to_rgb(hue, 0.82f, luma);
+/* gamma encode before mapping to xterm-256 */
+c.x = powf(c.x, 1.f / 2.2f);
+```
+
+The RGB float output is then quantized to the nearest xterm-256 6×6×6 cube index: `16 + 36*r + 6*g + b` where r, g, b ∈ [0, 5]. This is a 12-pair HUE_N=12 setup registered at startup (one pair per 30° hue step), not a per-pixel `init_pair` call.
+
+**Effect:** Concentric depth shells of the Mandelbulb appear in different hues, giving the surface structure a "geologic strata" appearance — the viewer can see which features belong to the same iteration-depth shell, even as lighting varies. Adjustable `hue_bands` from 1–5 controls how many full spectrum cycles span the surface.
+
+---
+
+## 37. Algorithm-State Color Encoding — 4-Role Palette for Sort Visualization
+
+**Where:** `misc/sort_vis.c`
+
+**How it works:**
+Rather than a gradient or continuous scale, the sort visualizer uses exactly four color roles, each representing the current algorithmic state of a bar in the array. The color assignments are mutually exclusive and applied per-column each frame:
+
+```c
+enum { CP_NORM=1, CP_CMP, CP_SWP, CP_SORT, CP_HUD };
+
+init_pair(CP_NORM, 250, -1);   /* grey  — unsorted, not active     */
+init_pair(CP_CMP,   51, -1);   /* cyan  — currently being compared */
+init_pair(CP_SWP,  196, -1);   /* red   — just swapped this tick   */
+init_pair(CP_SORT,  46, -1);   /* green — permanently sorted       */
+
+int cp;
+if      (i == g_swp1 || i == g_swp2) cp = CP_SWP;
+else if (i == g_cmp1 || i == g_cmp2) cp = CP_CMP;
+else if (g_done)                      cp = CP_SORT;
+else                                  cp = CP_NORM;
+
+/* A_BOLD on swapped bars makes the swap visually louder than a compare */
+attron(COLOR_PAIR(cp) | (cp == CP_SWP ? A_BOLD : 0));
+```
+
+Only two indices (`g_cmp1`, `g_cmp2`) and two swap indices (`g_swp1`, `g_swp2`) are tracked. They are reset to -1 at the start of each step so only the current operation is highlighted — preventing stale highlights from persisting across ticks.
+
+**Effect:** The eye immediately reads the algorithm's progress: grey mass (unsorted), cyan pair (comparing), red flash (swap), growing green region (sorted prefix). The algorithm's behaviour is legible even without reading the HUD counter.
+
+---
+
+## 38. Foreground + Background Both Set — Solid Fill for Maze Walls
+
+**Where:** `misc/maze.c`
+
+**How it works:**
+In most ncurses animations, only the foreground color is set and the background is left transparent (`-1`). The maze visualizer intentionally sets both foreground and background for wall cells, creating solid filled blocks that visually read as thick walls rather than outlined lines. The solution path similarly uses a colored background to appear as a channel carved through space:
+
+```c
+init_pair(CP_WALL,      232, 232);   /* black on black — impenetrable wall */
+init_pair(CP_CELL,      255, 235);   /* white fg, dark grey bg — open cell */
+init_pair(CP_PATH,       51,  17);   /* cyan fg, dark blue bg — BFS path   */
+init_pair(CP_DONE_PATH, 231,  22);   /* white fg, green bg — final path    */
+```
+
+The wall rendering draws space characters `' '` with the black-on-black pair, producing a block that visually matches the terminal background but is explicitly colored — important for terminals that don't inherit a white background.
+
+**When to use:** Any visualization where structural regions (walls, barriers, backgrounds) should read as solid fills rather than drawn outlines. Setting both fg and bg to the same color is the minimal "block fill" technique.
+
+**Effect:** The maze reads immediately as a physical structure — dark solid walls, light open passages, and a glowing blue-green solution path, without any box-drawing characters or Unicode blocks.

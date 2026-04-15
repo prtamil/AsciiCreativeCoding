@@ -137,6 +137,19 @@ The port gap in the cylinder wall is drawn unconditionally when ex_open (or tr_o
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `Engine` (struct) | `typedef struct` | ~40 B | crank angle θ, piston position, phase, RPM state |
+| `theta` | `float` | scalar | crank angle in radians; advances each tick |
+| `piston_row` | `int` | scalar | current crown row, computed from slider-crank kinematics |
+| `phase` | `enum` | scalar | IGNITION / POWER / EXHAUST / SCAVENGING / COMPRESSION |
+| `CRANK_R`, `CONROD_L` | `int` constants | N/A | engine geometry: crank radius (4 cells), rod length (9 cells) |
+| `CYL_IHW` | `int` constant | N/A | cylinder bore inner half-width (6 cells) |
+| `EX_PORT_OFF`, `TR_PORT_OFF` | `int` constants | N/A | row offsets at which exhaust (6) and transfer (7) ports open |
+| `scene` (struct) | composite | ~100 B | owns Engine + HUD state; tick advances θ by RPM·dt |
+
 # Pass 2 — 2stroke: Pseudocode
 
 ## Module Map

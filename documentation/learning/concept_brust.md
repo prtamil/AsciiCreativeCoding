@@ -151,6 +151,14 @@ BS_LIVE
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `bursts[BURSTS_MAX]` | `Burst[16]` | ~21 KB | object pool of burst explosions |
+| `bursts[i].parts[PARTICLES]` | `Particle[48]` | ~1.3 KB each | per-burst spark pool |
+| `scorch[cols*rows]` | `char[]` | ~10 KB | persistent scorch mark grid |
+
 # Pass 2 — brust: Pseudocode
 
 ## Module Map

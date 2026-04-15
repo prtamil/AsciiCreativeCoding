@@ -111,6 +111,12 @@ The first term handles outside distance; the second handles inside (negative = i
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app.scene.canvas.pixels` | `int*` (heap, cols×rows) | ~varies | Per-pixel ramp index or CANVAS_MISS for each frame |
+
 # Pass 2 — raymarcher_cube: Pseudocode
 
 ## Module Map

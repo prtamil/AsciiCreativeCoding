@@ -102,6 +102,17 @@ Three display modes cycle with the `s`/`S` key:
 ### Side View — Fixed-Scale Histogram
 Each bar in the side view represents the total grain count summed down all rows of that column. The bar height is `col_sum * view_height / max_possible` where `max_possible = g_ca_rows * 3` (fixed scale — maximum possible sum if every cell holds 3 grains). This fixed scale is critical: if the scale were dynamic (normalised to the current max column sum), the bars would look the same shape even as the pile grows. With the fixed scale, bars visually grow from zero as grains accumulate, giving genuine feedback on pile growth.
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_grid[MAX_ROWS][MAX_COLS]` | `uint8_t[]` | ~40 KB | grain count per cell (0–3 stable, ≥4 toppling) |
+| `g_queue[QMAX]` | `struct{int r,c}[]` | ~320 KB | BFS avalanche queue (circular); QMAX = MAX_ROWS×MAX_COLS+1 |
+| `MAX_ROWS`, `MAX_COLS` | constants | N/A | maximum grid size (128 × 320) |
+| `DROPS_DEF` | `int` constant | N/A | grain drops per frame at startup (10) |
+| `DROPS_MAX` | `int` constant | N/A | maximum drops per frame (500) |
+| `g_drops` | `int` | scalar | current drops-per-frame setting |
+
 ## From the Source
 
 **Algorithm:** Abelian Sandpile Model (Bak, Tang & Wiesenfeld, 1987). A grain is dropped on a chosen cell. If any cell has ≥ 4 grains, it "topples": loses 4 grains and gives 1 to each of its 4 (von Neumann) neighbours. Toppling can cascade into an "avalanche" affecting many cells.

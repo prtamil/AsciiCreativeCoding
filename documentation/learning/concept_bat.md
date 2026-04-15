@@ -131,6 +131,16 @@ LAUNCHING (launch_ticks > 0) ──── countdown ────► FLYING
 - When a group resets after going off-screen, is the angle chosen sequentially from the preset table or randomly?
 - Is the wing character drawn using mvwaddch three times (left, body, right) or with a string write?
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_groups[N_GROUPS]` | `Group[3]` | ~840 B | per-group state: heading, position, bats array |
+| `g_groups[i].bats[MAX_BATS]` | `Bat[28]` | ~336 B each | pixel position and wing phase per bat in group |
+| `g_groups[i].angle` | `float` | 4 B | current flight heading in radians |
+| `g_groups[i].vx`, `g_groups[i].vy` | `float` × 2 | 8 B | velocity vector in pixels/second |
+| `g_groups[i].n_rows` | `int` | 4 B | number of formation rows (1–6) |
+
 ---
 
 # Pass 2 — bat: Pseudocode

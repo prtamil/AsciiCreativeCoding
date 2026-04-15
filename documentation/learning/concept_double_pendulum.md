@@ -72,3 +72,13 @@ For a double pendulum the effective mass matrix determinant determines D. Since 
 **Performance:** RK4 global error O(dt⁴) ≈ (3.3e-3)⁴ ≈ 1e-10 per step at 300 Hz sim rate — negligible for few-second time-scales. At 300 Hz, dt ≈ 3.3 ms per RK4 step.
 
 **Physics/References:** The ghost pendulum (GHOST_EPSILON offset on θ₁) starts indistinguishably close to the primary. After ~3–5 s (one Lyapunov time) the two trajectories diverge visibly — a direct demonstration that tiny measurement errors become arbitrarily large. Ring-buffer trail (TRAIL_LEN positions) iterated from oldest to newest by offset arithmetic — no shifting.
+
+---
+
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `g_app` | `App` | ~10 KB | top-level container: scene (DPend × 2 + Trail) + screen + control flags |
+| `g_app.scene.primary` / `.ghost` | `DPend` | ~40 B each | RK4 state (t1, t2, ω1, ω2), prev-tick angles, pivot, arm length |
+| `g_app.scene.trail` | `Trail` | ~4 KB | ring-buffer of TRAIL_LEN=500 end-bob pixel positions |

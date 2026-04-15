@@ -43,6 +43,17 @@ Feigenbaum constant: ratio of consecutive period-doubling intervals converges to
 
 ---
 
+# Structure
+
+| Symbol | Type | Size | Role |
+|--------|------|------|------|
+| `WARMUP` | `int` constant | N/A | transient iterations discarded per column (500) |
+| `PLOT` | `int` constant | N/A | attractor values plotted per column (300) |
+| `r_min`, `r_max` | `float` (view state) | scalar | current visible r-parameter range; pan/zoom adjust these |
+| `FEIGENBAUM_R` | `float` constant | N/A | accumulation point r∞ = 3.5699 (target of auto-zoom) |
+| `ZOOM_FACTOR` | `float` constant | N/A | zoom step per keypress (1.25×) |
+| `HUD_ROWS` | `int` constant | N/A | rows reserved at top for status display (3) |
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

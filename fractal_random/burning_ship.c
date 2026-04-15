@@ -26,6 +26,28 @@
  * §1 config  §2 clock  §3 color  §4 fractal  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Escape-time iteration — identical to Mandelbrot except
+ *                  for the absolute-value fold applied before each squaring.
+ *                  This "folding" maps the complex plane to the first quadrant
+ *                  before squaring, breaking the 4-fold symmetry of Mandelbrot
+ *                  and creating the distinctive ship/flame asymmetry.
+ *
+ * Math           : Iteration: z ← (|Re(z)| + i|Im(z)|)² + c
+ *                  Expanding: Re_new = Re(z)² − Im(z)² + Re(c)
+ *                             Im_new = 2|Re(z)|·|Im(z)| + Im(c)
+ *                  The |Im| term forces the imaginary component positive after
+ *                  each step, creating downward-pointing flames rather than
+ *                  Mandelbrot's symmetric bulbs.
+ *                  Escape condition: |z|² > 4 (equivalent to |z| > 2).
+ *
+ * Rendering      : Smooth colouring via fractional escape count:
+ *                    t = iter + 1 − log₂(log₂|z|)
+ *                  This removes the "banding" of integer escape counts and
+ *                  produces smooth colour gradients across the boundary.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

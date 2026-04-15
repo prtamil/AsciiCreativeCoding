@@ -50,6 +50,29 @@
  *   gcc -std=c11 -O2 -Wall -Wextra terrain.c -o terrain -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Diamond-Square algorithm for fractal terrain generation,
+ *                  combined with thermal weathering erosion simulation.
+ *                  Diamond-Square: a 2D analogue of midpoint displacement.
+ *                  Step 1 (diamond): centre of each square = mean of 4 corners
+ *                    + random(amplitude).
+ *                  Step 2 (square): edge midpoints = mean of 2 opposing corners
+ *                    + mean of 2 adjacent diamonds + random(amplitude).
+ *                  Amplitude halved each iteration → fractal terrain.
+ *
+ * Math           : Diamond-Square produces 1/f^(2H) power spectrum where H is
+ *                  the Hurst exponent.  With amplitude_factor=0.5 → H≈0.5
+ *                  (standard Brownian surface, "white" terrain).
+ *                  Thermal erosion rule: if slope > TALUS threshold, move
+ *                  RATE × (slope − TALUS) material downhill.  This rounds peaks
+ *                  and fills valleys, mimicking real geological weathering.
+ *
+ * Rendering      : Height-mapped to terrain types (water/plains/hills/rock/snow).
+ *                  Contour lines drawn at regular height intervals using marching
+ *                  squares on the interior, producing topographic map style.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

@@ -53,6 +53,28 @@
  *   gcc -std=c11 -O2 -Wall -Wextra penrose.c -o penrose -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : De Bruijn dual/pentagrid method for Penrose P3 rhombuses.
+ *                  Rather than recursive deflation (splitting tiles), this
+ *                  method projects a 5D integer lattice onto 2D via five
+ *                  directions e_j = (cos 2πj/5, sin 2πj/5).  Each rhombus
+ *                  corresponds to a pair of grid lines from two directions.
+ *
+ * Math           : A Penrose tiling is quasiperiodic: non-periodic but with
+ *                  long-range order (well-defined diffraction peaks).  The
+ *                  "inflation" symmetry: each tile can be subdivided into
+ *                  φ² smaller tiles of the same two types (φ = golden ratio ≈ 1.618).
+ *                  Ratio of thick:thin rhombus counts → φ as tiling grows.
+ *                  No translational periodicity, but 5-fold local symmetry.
+ *
+ * Rendering      : Each terminal cell is classified by its 5-integer k-tuple
+ *                  (which pentagrid lines it sits between).  Adjacent cells
+ *                  in the same tile share the same tuple → same colour.
+ *                  Animation shifts the phase offsets φ_j slowly, morphing
+ *                  the tiling continuously without breaking its quasiperiodic structure.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

@@ -44,6 +44,29 @@
  *   §10 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Two aggregation modes in one file:
+ *                  DLA (Diffusion-Limited Aggregation, Witten & Sander 1981):
+ *                    Particles launched from a ring, random-walk until they
+ *                    touch the cluster.  Tip-screening effect: tips extend
+ *                    further from the centre and capture walkers preferentially,
+ *                    creating fractal branching with D ≈ 1.7 in 2D.
+ *                  Eden model: directly attach a random frontier cell.
+ *                    No diffusion → no tip screening → compact, rounder shapes
+ *                    (D → 2 as cluster grows; no fractal structure at large scales).
+ *
+ * Math           : DLA fractal dimension D ≈ 1.71 in 2D.
+ *                  Cluster radius R ~ N^(1/D) where N = number of particles.
+ *                  Comparison between modes in the same code illustrates how
+ *                  diffusion (randomness in the approach path) is necessary for
+ *                  fractal self-similar morphology.
+ *
+ * Performance    : DLA walker cost: O(R²) expected random-walk steps per particle
+ *                  (hitting probability from radius 2R to R ≈ 1/(log R) in 2D).
+ *                  Eden mode: O(frontier size) per particle — much faster.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

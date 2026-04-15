@@ -49,6 +49,27 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Escape-time algorithm with random pixel order.
+ *                  The Mandelbrot set M = {c ∈ ℂ : orbit of 0 under z→z²+c
+ *                  remains bounded}.  Per-pixel: start z=0, iterate z←z²+c;
+ *                  if |z|>2 at step k, colour by k (escape time).
+ *
+ * Math           : The escape condition |z| > 2 is sufficient because if |z| > 2
+ *                  then the orbit diverges to ∞.  Equivalent test: Re(z)²+Im(z)² > 4.
+ *                  Interior of M (bounded orbits) is coloured uniformly.
+ *                  Period-1 bulb (main cardioid): converges to fixed point;
+ *                  period-2 bulb (left circle): oscillates between 2 values.
+ *                  The boundary of M has Hausdorff dimension = 2 (Brooks & Matelski,
+ *                  Mandelbrot 1980).  M is connected (Douady & Hubbard, 1982).
+ *
+ * Performance    : Pre-shuffled random pixel order: reveals fractal uniformly
+ *                  across the screen rather than scan-line by scan-line.
+ *                  Cost per pixel: O(MAX_ITER) worst case, O(1) for fast-escape
+ *                  pixels far from the boundary.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

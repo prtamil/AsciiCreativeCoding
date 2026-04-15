@@ -42,6 +42,26 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Chaos game IFS with 3 attractors (vertices of a triangle).
+ *                  At each step: pick a random vertex, move halfway from the
+ *                  current point toward it, plot the result.  After a transient,
+ *                  the orbit traces out the Sierpinski triangle exactly.
+ *
+ * Math           : The Sierpinski triangle is a self-similar set with
+ *                  Hausdorff dimension D = log(3)/log(2) ≈ 1.585.
+ *                  It has zero 2D area (Lebesgue measure 0) but non-zero
+ *                  fractal measure.  The chaos game converges because the
+ *                  IFS {T₁, T₂, T₃} where T_i(x) = (x + v_i)/2 are
+ *                  contractions with ratio 1/2, combined contractivity < 1.
+ *
+ * Alternative view: Binary encoding — a point is in the Sierpinski triangle
+ *                  iff in the base-2 representation of its coordinates, no
+ *                  column has both bits = 1 simultaneously (Pascal's triangle
+ *                  mod 2 connection: cell (n,k) is in if C(n,k) is odd).
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

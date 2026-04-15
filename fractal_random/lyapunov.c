@@ -38,6 +38,29 @@
  *   §7  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Lyapunov exponent measurement via logistic map iteration.
+ *                  For each pixel (a, b), iterate the logistic map using a
+ *                  sequence string that alternates between r=a and r=b:
+ *                    x_{n+1} = r_n · xₙ · (1−xₙ)
+ *                  The Lyapunov exponent λ = (1/N) Σ ln|df/dx| = (1/N) Σ ln|r(1−2x)|
+ *                  measures the average rate of divergence of nearby trajectories.
+ *
+ * Math           : λ < 0: stable (orbit converges to a fixed point or cycle).
+ *                  λ = 0: bifurcation boundary (marginally stable).
+ *                  λ > 0: chaotic (nearby orbits diverge exponentially at rate eˡ).
+ *                  The fractal boundary between stable (blue) and chaotic (red)
+ *                  regions is the "Markus-Lyapunov fractal" (Markus, 1990).
+ *                  Different symbol sequences (AB, AAB, AABAB …) produce different
+ *                  fractal patterns because the alternation pattern of r_a and r_b
+ *                  changes the effective "average" dynamics.
+ *
+ * Performance    : Two rows per frame (progressive rendering), so the image builds
+ *                  top-to-bottom in ~H/2 frames.  N_TRANSIENT iterations are
+ *                  discarded before measuring λ to remove initial-condition effects.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

@@ -52,6 +52,29 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Anisotropic Diffusion-Limited Aggregation (DLA).
+ *                  Standard DLA: a random walker sticks to the aggregate with
+ *                  probability 1.0 regardless of contact direction.
+ *                  Anisotropic DLA: the sticking probability depends on the
+ *                  direction of contact — high for upward growth (coral tip
+ *                  absorbing nutrients falling from above), low for downward.
+ *
+ * Physics        : The directional probabilities model real coral and crystal
+ *                  growth: nutrients diffuse from above, so upward-facing surfaces
+ *                  have higher capture probability.  This selects upward-growing
+ *                  branches, creating the characteristic columnar morphology.
+ *                  The gravity-biased walk (50% down, 20% up) models sinking
+ *                  nutrient particles rather than symmetric diffusion.
+ *
+ * Math           : In standard DLA, the fractal dimension D ≈ 1.7 in 2D.
+ *                  Anisotropy shifts D — stronger upward bias → more elongated,
+ *                  less branchy aggregate with higher effective D in the vertical.
+ *                  The aggregate is "scale-free": branching density is constant
+ *                  at every magnification (self-similar fractal structure).
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

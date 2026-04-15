@@ -53,6 +53,28 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Iterative edge-replacement (segment subdivision).
+ *                  At each level, every existing segment is replaced by 4 shorter
+ *                  segments:  A→P, P→M, M→Q, Q→B  where M is the equilateral
+ *                  bump peak.  No recursion stack needed: segments are stored in
+ *                  a flat array and a new array is generated each level.
+ *
+ * Math           : After n levels:
+ *                  - Segment count: 3 × 4ⁿ (starts with triangle = 3 segments)
+ *                  - Segment length: (1/3)ⁿ of original edge
+ *                  - Total perimeter: (4/3)ⁿ × original → ∞ as n → ∞
+ *                  - Area enclosed: converges to (2/5) × area of original triangle
+ *                  Fractal dimension: D = log(4)/log(3) ≈ 1.26 (more than a curve,
+ *                  less than a surface).
+ *
+ * Rendering      : Segments drawn one per frame as an animated "drawing" effect.
+ *                  The bump peak M is computed by rotating the direction vector
+ *                  by ±60° (equilateral triangle geometry).
+ *                  ASPECT_R corrects for non-square terminal cells.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

@@ -24,6 +24,32 @@
  * §1 config  §2 clock  §3 color  §4 descartes  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Recursive circle-packing via Descartes' Circle Theorem.
+ *                  Given three mutually-tangent circles with curvatures k₁,k₂,k₃
+ *                  (curvature = 1/radius), the fourth tangent circle satisfies:
+ *                    (k₁+k₂+k₃+k₄)² = 2(k₁²+k₂²+k₃²+k₄²)
+ *                  Solving: k₄ = k₁+k₂+k₃ ± 2√(k₁k₂+k₂k₃+k₃k₁)
+ *                  There are two solutions; one is the already-known circle.
+ *
+ * Math           : Complex Descartes theorem gives the centre directly:
+ *                    z₄ = (k₁z₁+k₂z₂+k₃z₃ ± 2√(k₁k₂z₁z₂+…)) / k₄
+ *                  Outer circle has negative curvature (k < 0): it contains
+ *                  all others.  Starting pack k = (−1, 2, 2, 3) is the unique
+ *                  integer Apollonian gasket.  Recursion terminates when the
+ *                  resulting circle is smaller than one pixel on screen.
+ *
+ * Data-structure : Recursive DFS — for each new circle, recurse on all
+ *                  three triple-combinations formed with its two parents and
+ *                  the grandparent.  Depth-limit prevents infinite recursion.
+ *
+ * Performance    : Circle count grows as 3^depth; depth=8 gives ~6500 circles.
+ *                  Progressively drawn (one circle per frame) so the gasket
+ *                  builds up visually. Terminal aspect correction ASPECT_R
+ *                  scales the radius when converting to cell coordinates.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #ifndef M_PI

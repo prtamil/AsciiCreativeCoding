@@ -28,6 +28,33 @@
  * §1 config  §2 clock  §3 color  §4 attractor  §5 density  §6 draw  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Density-map rendering of strange attractor trajectories.
+ *                  A point is iterated for many steps under the attractor map.
+ *                  Rather than drawing each point directly (which would just
+ *                  produce scattered dots), a density grid accumulates visit
+ *                  counts.  Log-normalised density is then mapped to a palette.
+ *
+ * Physics/Math   : Several 2D and 3D autonomous ODE systems:
+ *                  - Clifford: x' = sin(a·y)+c·cos(a·x), y' = sin(b·x)+d·cos(b·y)
+ *                  - Peter de Jong: similar polynomial form
+ *                  - Tinkerbell: complex quadratic map
+ *                  - Lorenz (projected 3D → 2D)
+ *                  All exhibit sensitivity to initial conditions (chaos):
+ *                  nearby trajectories diverge exponentially, producing the
+ *                  intricate filamentary structure of the attractor.
+ *
+ * Rendering      : Log density coloring: brightness ∝ log(1 + count)/log(1 + max).
+ *                  Log scaling prevents the densest regions from washing out all
+ *                  detail — without it, the "spine" of the attractor would be
+ *                  solid white while outlying filaments remained invisible.
+ *
+ * Performance    : ITERS_PER_FRAME iterations per tick, accumulating into the
+ *                  density grid.  The image converges as more iterations are added.
+ *                  Density grid is normalised and redrawn each frame.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

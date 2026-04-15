@@ -57,6 +57,28 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Recursive binary-tree branching with persistent lean bias.
+ *                  Each active tip moves one cell downward each tick, leaning
+ *                  ±1 column per MIN_FORK_STEPS steps.  After MIN_FORK_STEPS,
+ *                  a tip may fork — producing two child tips with bias ±1 from
+ *                  parent's bias.  This is NOT a DLA simulation; there are no
+ *                  random walkers — only the branching probability is stochastic.
+ *
+ * Math           : A tip with lean bias b traces a path offset by ±b cells
+ *                  per row descended.  After d rows, the tip is at column
+ *                  c₀ ± b·d.  With uniform branching, the horizontal spread of
+ *                  tips grows as O(d) — creating a roughly triangular shape.
+ *                  The path width (cells visited) is a fractal between 1 and 2D:
+ *                  single-cell-wide paths with unlimited branching have D ≈ 1.5.
+ *
+ * Visual         : The shockwave (striking phase) expands as a Manhattan-radius
+ *                  ring from the lowest strike point, fading over time.
+ *                  Characters encode direction: '|' straight, '/' '\\' leaning.
+ *                  Color depth (row / total_rows) maps top-to-bottom: blue→teal→white.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

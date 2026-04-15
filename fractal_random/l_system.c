@@ -82,6 +82,28 @@
  *   gcc -std=c11 -O2 -Wall -Wextra l_system.c -o l_system -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : String-rewriting L-system with turtle-graphics rendering.
+ *                  Each generation replaces every variable in the string using
+ *                  a production rule table.  The resulting string is then
+ *                  "executed" by a turtle: F=forward, +=turn_left, -=turn_right,
+ *                  [=push_state, ]=pop_state.
+ *
+ * Math           : L-systems (Lindenmayer, 1968) were invented to model plant
+ *                  cell division.  The string length grows exponentially with
+ *                  generation: |L_n| = |L_{n-1}| × avg_expansion_factor.
+ *                  For the Dragon Curve rule F→F+G, G→F-G: |L_n| = 2ⁿ.
+ *                  The limit object (infinite generation) of space-filling L-systems
+ *                  (Hilbert, Peano) has Hausdorff dimension = 2 (fills area).
+ *
+ * Performance    : String length limits: most presets cap at generation 8-12.
+ *                  The string is stored in a dynamic buffer; each rewrite step
+ *                  O(|string| × max_rule_length) copies characters.
+ *                  Aspect correction: forward step is (STEP_PX_COL, STEP_PX_ROW)
+ *                  accounting for CELL_W/CELL_H ratio to keep branches isotropic.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

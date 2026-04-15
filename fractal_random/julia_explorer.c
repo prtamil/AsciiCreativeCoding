@@ -39,6 +39,28 @@
  *   §7  app / main
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Split-screen interactive fractal explorer.
+ *                  Left panel (Mandelbrot): computed once at start/resize and
+ *                  cached — O(W/2 × H × MAX_ITER) up-front.
+ *                  Right panel (Julia): recomputed every frame from the
+ *                  current c position — O(W/2 × H × MAX_ITER) per frame.
+ *                  This trade-off makes Mandelbrot navigation smooth (no
+ *                  per-frame cost) while Julia responds instantly to c changes.
+ *
+ * Math           : Mandelbrot/Julia duality made interactive: moving the
+ *                  crosshair on the Mandelbrot panel changes c, which changes
+ *                  the Julia set — demonstrating that every Mandelbrot coordinate
+ *                  "encodes" a distinct Julia topology.
+ *                  Auto-wander: c orbits an ellipse in the complex plane, tracing
+ *                  a path through many different Julia topologies automatically.
+ *
+ * Performance    : Julia panel is rendered per-frame — full W/2 × H pixel loop.
+ *                  At 30fps and 80×40 Julia panel: 3200 pixels × 128 max-iter =
+ *                  409,600 iterations/frame — feasible in C without parallelism.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

@@ -44,6 +44,33 @@
  *   §10 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Dielectric Breakdown Model (DBM, Niemeyer et al. 1984).
+ *                  A Laplace equation (∇²φ = 0) is solved over the grid;
+ *                  the growing tree structure is a grounded conductor (φ=0).
+ *                  At each step, one frontier cell is chosen to join the tree
+ *                  with probability ∝ φ(x,y)^η.
+ *
+ * Math           : The Laplace equation ∇²φ = 0 is solved iteratively via
+ *                  Gauss-Seidel relaxation:
+ *                    φ_{k+1}(i,j) = (φ(i±1,j) + φ(i,j±1)) / 4
+ *                  (5-point stencil, repeated until convergence).
+ *                  At η=1: reduces to DLA (diffusion = Laplace potential).
+ *                  At η→∞: growth concentrates only at the highest-φ tip →
+ *                  a single straight needle (no branching).
+ *                  At η=0: growth is uniform → Eden-model-like compact blob.
+ *
+ * Physics        : Models dielectric breakdown (lightning channels through
+ *                  insulating material), electrodeposition, and solidification
+ *                  from a supercooled melt — all governed by Laplace/diffusion
+ *                  equations near a growing, absorbing boundary.
+ *
+ * Performance    : Gauss-Seidel iterations per growth step is the bottleneck.
+ *                  Fewer iterations → faster but less accurate φ → growth bias.
+ *                  The frontier set is stored explicitly for O(1) sampling.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

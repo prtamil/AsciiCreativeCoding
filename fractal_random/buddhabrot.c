@@ -58,6 +58,30 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Orbit tracing — a sampling-based density estimator.
+ *                  Two-pass approach per sample c:
+ *                  Pass 1 (quick): iterate z→z²+c to check if c escapes.
+ *                  Pass 2 (trace): if c escapes, re-iterate and increment
+ *                  a density counter at every orbit point that falls in-bounds.
+ *                  This is fundamentally different from escape-time rendering:
+ *                  escape-time asks "how long until escape?"; Buddhabrot asks
+ *                  "which cells do escaping orbits visit?".
+ *
+ * Math           : The Anti-Buddhabrot uses bounded (non-escaping) orbits.
+ *                  The Nebulabrot weights by iteration count: high-iter orbits
+ *                  contribute more, emphasising the near-boundary detail.
+ *                  Cardioid skip: main cardioid satisfies |c − (z²−z)| < |z|;
+ *                  period-2 bulb: |(c + 1.25)| < 0.25.  Skipping these avoids
+ *                  the densest (most boring) samples that never escape.
+ *
+ * Performance    : The image converges stochastically as more samples accumulate.
+ *                  TOTAL_SAMPLES controls when the display cycles to the next preset.
+ *                  O(MAX_ITER) per sample in the worst case (near-boundary orbits).
+ *                  Density grid is log-normalised each draw: brightness ∝ log(count).
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

@@ -39,6 +39,29 @@
  *           §6 scene   §7 screen §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Abelian Sandpile Model (Bak, Tang & Wiesenfeld, 1987).
+ *                  A grain is dropped on a chosen cell.  If any cell has
+ *                  ≥ 4 grains, it "topples": loses 4 grains and gives 1 to
+ *                  each of its 4 (von Neumann) neighbours.  Toppling can
+ *                  cascade into an "avalanche" affecting many cells.
+ *
+ * Physics/Math   : The sandpile is a canonical example of Self-Organised
+ *                  Criticality (SOC): without any tuning, the system
+ *                  spontaneously evolves to a critical state where avalanche
+ *                  size distributions follow a power law P(s) ∝ s^(−τ) with
+ *                  τ ≈ 1.0 for 2D abelian sandpile.
+ *                  "Abelian" means the final state is independent of the order
+ *                  in which topplings are processed — a deep mathematical
+ *                  property proved by Dhar (1990).
+ *
+ * Performance    : O(avalanche_size) per grain drop.  Average avalanche size
+ *                  grows as the pile approaches the critical state.  At
+ *                  criticality, large avalanches are rare but unbounded —
+ *                  the expected cost per drop diverges logarithmically.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

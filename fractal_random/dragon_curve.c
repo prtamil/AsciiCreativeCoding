@@ -24,6 +24,30 @@
  * §1 config  §2 clock  §3 color  §4 curve  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Paper-folding sequence construction.
+ *                  The turn sequence for generation n is:
+ *                    T_n = T_{n-1}  R  reverse-complement(T_{n-1})
+ *                  where R=right-turn and reverse-complement flips L↔R and
+ *                  reverses order.  This can also be derived by looking at
+ *                  the n-th bit of the folding number via: turn(k) = R if
+ *                  k / (highest_bit) has the bit pattern ...100...
+ *
+ * Math           : After n folds the sequence has 2ⁿ−1 turns and 2ⁿ segments.
+ *                  Gen 13 → 8191 turns, 8192 segments.  The path never
+ *                  self-intersects (proven: each segment is unique).
+ *                  Tiles the plane when continued: 4 copies of the dragon
+ *                  curve at rotations 0°/90°/180°/270° fill the plane without
+ *                  overlap, making it a rep-tile of order 4.
+ *
+ * Rendering      : Segments drawn one per frame using turtle graphics.
+ *                  Color encodes position in the sequence (age of segment),
+ *                  producing a visual record of the folding hierarchy.
+ *                  Aspect correction: terminal cells are 2× taller than wide,
+ *                  so horizontal steps are scaled by CELL_W/CELL_H ≈ 0.5.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

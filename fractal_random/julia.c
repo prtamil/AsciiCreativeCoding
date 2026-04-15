@@ -43,6 +43,29 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Escape-time algorithm — per-pixel iteration until escape.
+ *                  Unlike Mandelbrot where c varies per pixel and z₀=0,
+ *                  Julia sets fix c globally and vary the starting point z₀
+ *                  (= the pixel coordinate).  Each pixel tests whether the orbit
+ *                  starting at z₀ under f(z) = z² + c remains bounded.
+ *
+ * Math           : Julia-Mandelbrot duality: the Julia set J(c) is connected
+ *                  if and only if c ∈ M (the Mandelbrot set).
+ *                  Near the boundary of M, the corresponding Julia set has the
+ *                  most intricate, near-fractal structure.  Well inside M: filled
+ *                  Julia is a simply-connected blob.  Outside M: disconnected dust.
+ *
+ * Rendering      : Random pixel order (shuffled permutation) — each frame reveals
+ *                  PIXELS_PER_FRAME more cells.  This avoids the stale scan-line
+ *                  look: the fractal materialises everywhere simultaneously, making
+ *                  the incomplete drawing more visually interesting.
+ *
+ * Performance    : Pre-shuffled index array costs O(W×H) memory but makes each
+ *                  tick O(PIXELS_PER_FRAME) — deterministic cost.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

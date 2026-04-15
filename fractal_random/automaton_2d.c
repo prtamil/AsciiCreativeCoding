@@ -97,6 +97,29 @@
  *   gcc -std=c11 -O2 -Wall -Wextra automaton_2d.c -o automaton_2d -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Extended 2-D Cellular Automaton (Larger-than-Life / LtL).
+ *                  Generalises Conway's Game of Life to radius R > 1.
+ *                  Neighbourhood count = number of alive cells in a (2R+1)²
+ *                  square.  Birth/survive thresholds are tunable per preset.
+ *
+ * Math           : Key optimisation: 2-D prefix sum (summed area table).
+ *                  Naïve O((2R+1)²) sum per cell becomes O(1) per cell after
+ *                  O(W×H) table construction:
+ *                    P[r][c] = grid[r][c] + P[r-1][c] + P[r][c-1] − P[r-1][c-1]
+ *                  Rectangle sum (r0,c0)→(r1,c1):
+ *                    P[r1][c1] − P[r0-1][c1] − P[r1][c0-1] + P[r0-1][c0-1]
+ *                  At R=5: naïve=121 additions; prefix=1 lookup (121× faster).
+ *
+ * Data-structure : Double-buffered grid arrays (cur/nxt) for simultaneous
+ *                  update: all next-state values computed from cur, then swap.
+ *                  The prefix sum array P must be rebuilt each generation.
+ *
+ * Performance    : O(W×H) per generation with prefix-sum optimisation.
+ *                  Without it: O(W×H×R²); at R=5, W=200, H=50 → 1.2M vs 10K ops.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

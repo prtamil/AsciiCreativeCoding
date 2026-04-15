@@ -47,6 +47,27 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : IFS chaos game — single-point iteration.
+ *                  Unlike barnsley.c which uses a density grid, fern.c
+ *                  plots each individual point as it is generated, so you
+ *                  can watch the attractor emerge point-by-point from noise.
+ *
+ * Math           : The four affine maps have a combined contractivity ≤ 0.85.
+ *                  Collage theorem: the IFS attractor is the unique compact set
+ *                  K satisfying K = T₁(K) ∪ T₂(K) ∪ T₃(K) ∪ T₄(K).
+ *                  Probability assignment: p_i ∝ |det(A_i)| ensures the density
+ *                  of plotted points is proportional to the "area" each map covers.
+ *                  T₁ (stem): det = 0 × 0.16 − 0 × 0 = 0, so p₁=0.01 (flat map).
+ *                  T₂ (leaflets): det ≈ 0.85 × 0.85 − 0.04² ≈ 0.72, so p₂=0.85.
+ *
+ * Rendering      : Color by height (y value in IFS space) maps naturally to
+ *                  botanical structure: dark roots, bright leaf tips.
+ *                  The IFS coordinate range is scaled and offset to fill the
+ *                  terminal — aspect correction for CELL_W / CELL_H ratio.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

@@ -23,6 +23,28 @@
  * §1 config  §2 clock  §3 color  §4 diagram  §5 screen  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Logistic map iteration with parameter scanning.
+ *                  For each column, r is set to a distinct value from a range.
+ *                  WARMUP transient iterations are discarded (transient removal);
+ *                  the next PLOT values are plotted — these are on the attractor.
+ *
+ * Math           : The logistic map x_{n+1} = r·xₙ·(1−xₙ) models population
+ *                  dynamics.  For r < 3: converges to a fixed point.
+ *                  r ≈ 3.0: period-2 bifurcation (oscillates between two values).
+ *                  Each bifurcation point r_n satisfies r_{n+1} − r_n →
+ *                  1/δ where δ = 4.669... is Feigenbaum's constant (universal
+ *                  across all unimodal maps, not just the logistic map).
+ *                  At r ≈ 3.5699: accumulation point — onset of chaos.
+ *                  For r > 4: all trajectories diverge (outside [0,1]).
+ *
+ * Performance    : O(W × (WARMUP + PLOT)) per diagram redraw.
+ *                  Each column is independent (embarrassingly parallel).
+ *                  Auto-zoom scrolls r toward r∞ = 3.5699 so self-similar
+ *                  copies of the bifurcation diagram are continuously revealed.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

@@ -41,6 +41,28 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Chaos game (IFS attractor via random iteration).
+ *                  Rather than recursively subdividing regions, the attractor
+ *                  is found by iterating: pick a random transform, apply it to
+ *                  the current point, plot the result.  After discarding the
+ *                  first few transient iterates (burn-in), the orbit is on
+ *                  the attractor.  Due to Barnsley's theorem: any IFS with
+ *                  a contractivity condition < 1 has a unique compact attractor.
+ *
+ * Math           : Each transform is an affine map T_i(x,y) = A_i·[x,y]ᵀ + b_i
+ *                  where A_i is a 2×2 matrix.  The probability p_i of choosing
+ *                  transform i should be proportional to |det(A_i)| for uniform
+ *                  density across the attractor parts.  For the Barnsley fern,
+ *                  stem (T₁, tiny |det|) needs only p₁=1% while main leaflets
+ *                  (T₂, |det|≈0.85) need p₂=85%.
+ *
+ * Data-structure : Density grid: rather than drawing individual points,
+ *                  accumulate hit counts per cell and log-normalise for display.
+ *                  This allows millions of points per pixel with graceful saturation.
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

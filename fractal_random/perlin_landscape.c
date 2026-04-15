@@ -22,6 +22,28 @@
  * §1 config  §2 clock  §3 color  §4 noise  §5 terrain  §6 draw  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Fractal terrain via layered (octave) Perlin noise.
+ *                  Height h(x,y) = Σ_k noise(x·fᵏ, y·fᵏ) / Aᵏ
+ *                  Each octave contributes higher spatial frequency at lower
+ *                  amplitude.  The result is a 1/f noise spectrum — the same
+ *                  power-law that real terrain height maps exhibit.
+ *
+ * Math           : Perlin noise (Ken Perlin, 1985):
+ *                  - Divide space into integer grid cells
+ *                  - Assign a pseudo-random gradient vector to each corner
+ *                  - Dot gradient with offset from corner
+ *                  - Smoothly interpolate using fade function 6t⁵−15t⁴+10t³
+ *                    (C² continuous, 2nd derivative = 0 at t=0 and t=1)
+ *                  With OCTAVES=6, frequency ratio f=2, amplitude ratio A=0.5:
+ *                  Hurst exponent H = 1 (standard fBm).
+ *
+ * Rendering      : Camera scrolls left in time (the noise time parameter
+ *                  increases), giving the illusion of flying over landscape.
+ *                  Height bins map to terrain types (water/plains/hills/peaks).
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

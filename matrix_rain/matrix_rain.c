@@ -87,6 +87,32 @@
  *      to screen_draw_rain().
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Column-per-stream rain with render interpolation.
+ *                  Each column has a head position (head_y), speed
+ *                  (rows/tick), and trail length.  Physics tick advances
+ *                  head_y by speed; chars in the trail shimmer by random
+ *                  re-assignment each tick.
+ *
+ * Rendering      : Sub-tick render interpolation: alpha = sim_accum/tick_ns
+ *                  projects head_y forward by speed×alpha fractional rows
+ *                  each render frame.  This gives smooth 60 fps scrolling
+ *                  even when physics runs at 15–30 Hz.
+ *                  Forward extrapolation is exact here because speed is
+ *                  constant (no acceleration); variable-speed streams
+ *                  would need LERP between prev and current position.
+ *
+ * Data-structure : Off-screen grid (§5) stores char + shade per cell;
+ *                  used for the "dissolve" texture when a column tail
+ *                  passes through.  Columns are the authoritative source
+ *                  for draw positions; grid just provides cached characters.
+ *
+ * Performance    : O(cols × trail_len) per render frame — each cell drawn
+ *                  at most once.  Char randomisation bounded to trail length.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

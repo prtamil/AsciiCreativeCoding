@@ -50,6 +50,28 @@
  *   §7  app    — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Doom-style fire cellular automaton (Fabien Sanglard, 2013).
+ *                  Each cell updated each tick:
+ *                    heat[y][x] = (sum of 3 neighbours one row below + random) / 4
+ *                               − decay
+ *                  3 neighbours: (x−1, y+1), (x, y+1), (x+1, y+1) with horizontal
+ *                  jitter creating the characteristic sideways flicker.
+ *
+ * Physics        : Heat diffuses upward from the fuel row (bottom).  Each step
+ *                  loses `decay` units of heat — models convective cooling.
+ *                  Wind: fuel row shifted by ±1 cell/tick, biasing flame lean.
+ *
+ * Rendering      : Floyd-Steinberg dithering converts float heat to a char index,
+ *                  reducing banding artefacts when quantising to N_RAMP chars.
+ *                  Perceptual LUT maps char index to colour pair — hotter chars
+ *                  get brighter/whiter colours; cooler chars get dark reds/blues.
+ *                  Gamma correction: v = pow(v/255, 1/2.2) before dithering
+ *                  maps physics heat to human-perceived brightness.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

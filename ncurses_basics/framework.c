@@ -45,6 +45,30 @@
  *   gcc -std=c11 -O2 -Wall -Wextra framework.c -o framework -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Reference framework template demonstrating the canonical
+ *                  pattern used by all animations in this project:
+ *                  fixed-step physics accumulator + render interpolation.
+ *
+ * Data-structure : Fixed-step accumulator: sim_accum += dt each frame;
+ *                  drain in SIM_TICK_NS steps: while (accum ≥ tick) {
+ *                  sim_tick(); accum -= tick; }  This decouples physics
+ *                  rate from render rate — physics always runs at the same
+ *                  speed regardless of CPU or render load.
+ *
+ * Rendering      : Sub-tick interpolation: alpha = sim_accum/tick_ns ∈ [0,1).
+ *                  Entity draw positions lerp between prev and current
+ *                  simulated positions at alpha, giving smooth motion at
+ *                  any render rate without modifying physics.
+ *
+ * Performance    : ncurses double-buffer: erase → draw → wnoutrefresh →
+ *                  doupdate().  doupdate() sends only changed cells to the
+ *                  terminal (diff), minimising write latency and flicker.
+ *                  Render capped at TARGET_FPS using CLOCK_MONOTONIC sleep.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

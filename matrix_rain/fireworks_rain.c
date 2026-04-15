@@ -47,6 +47,26 @@
  *   §8  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Rocket particle system (fireworks.c) composited with
+ *                  matrix-rain arc trails.  Each spark owns a TRAIL_LEN-slot
+ *                  position history ring buffer.  Each tick: push current
+ *                  position into history, advance physics, re-randomise
+ *                  ~75% of cached trail chars (matrix shimmer effect).
+ *
+ * Physics        : Spark trajectory: explicit Euler with gravity.
+ *                  Trail history stores (col, row) snapshots; the most
+ *                  recent TRAIL_LEN positions trace the exact parabolic arc.
+ *
+ * Rendering      : Draw order: oldest trail slot → newest → live head.
+ *                  Older slots drawn first so the brighter head overwrites
+ *                  them at cells where positions coincide (near burst centre).
+ *                  Brightness gradient: head=white bold; tail[0–2]=bold;
+ *                  tail[3…N/2]=normal; tail[N/2+1…]=dim.  Life < 0.25 → all dim.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

@@ -24,6 +24,26 @@
  * §1 config  §2 clock  §3 color  §4 coords  §5 sheep  §6 shepherd  §7 scene  §8 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Interactive boid herding — sheep use Classic Boids rules
+ *                  (separation, alignment, cohesion) plus a flee force when
+ *                  the shepherd is within FLEE_RADIUS pixels.  Flee overrides
+ *                  cohesion so panicking sheep disperse, not cluster.
+ *
+ * Physics        : Sheep speed has two modes: cruise (SHEEP_SPEED) and flee
+ *                  (SHEEP_SPEED_FLEE ≈ 1.5× cruise).  Speed clamped each tick.
+ *                  Shepherd moves at fixed speed (SHEPHERD_SPEED pixels/s)
+ *                  driven by held arrow key direction.  Both run in isotropic
+ *                  pixel space with CELL_W=8, CELL_H=16 aspect correction.
+ *
+ * Rendering      : Sheep character selected from 8-direction glyph table
+ *                  (o < > ^ v / \) based on velocity heading; bold+red
+ *                  when fleeing.  Flee-radius ring optionally drawn around
+ *                  shepherd as a dashed circle to show the panic zone.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _GNU_SOURCE
 #include <math.h>
 #include <ncurses.h>

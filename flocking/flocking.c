@@ -38,6 +38,33 @@
  *   gcc -std=c11 -O2 -Wall -Wextra flocking.c -o flocking -lncurses -lm
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Five switchable flocking algorithms:
+ *                  1. Classic Boids (Reynolds 1987) — separation (avoid
+ *                     crowding), alignment (steer toward average heading),
+ *                     cohesion (steer toward average position).
+ *                  2. Leader Chase — followers home on leader position.
+ *                  3. Vicsek model (Vicsek 1995) — align to average heading
+ *                     of neighbours within radius, add noise angle η.
+ *                  4. Orbit Formation — followers maintain ring radius around
+ *                     leader with angular spacing enforced by angular springs.
+ *                  5. Predator-Prey — flock 0 hunts; flocks 1–2 flee.
+ *
+ * Physics        : All boids run in isotropic square pixel space
+ *                  (CELL_W×CELL_H sub-pixels per terminal cell) to prevent
+ *                  the taller-than-wide cell aspect ratio from distorting
+ *                  neighbour distances and force magnitudes.
+ *                  Velocity integration: explicit Euler; speed clamped each tick.
+ *                  Toroidal topology: positions wrap at screen edges.
+ *
+ * Math           : Vicsek order parameter: φ = |Σ v̂_i| / N ∈ [0,1];
+ *                  0 = disordered, 1 = perfect alignment.
+ *                  Colour: cosine palette r,g,b = 0.5 + 0.5·cos(2π(t + phase))
+ *                  cycles hue slowly while keeping three flocks distinct.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /*
  * _GNU_SOURCE exposes M_PI from <math.h>.
  * _POSIX_C_SOURCE alone does not include M_PI (it is a POSIX extension).

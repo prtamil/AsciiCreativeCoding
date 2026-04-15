@@ -67,6 +67,28 @@
  *   §7  app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : aafire cellular automaton (Olszak 1999, aalib 1.4).
+ *                  Each cell updated from 5 neighbours (3 from one row below,
+ *                  2 from two rows below) vs Doom's 3-neighbour approach.
+ *                  Decay table: table[i] = max(0, (i − 800/rows) / 5).
+ *                  5-neighbour average + extra vertical reach produces rounder
+ *                  blob-like flames (vertical inertia) vs Doom's sharp spires.
+ *
+ * Physics        : Heat diffuses upward from the fuel row.  The arch-shaped
+ *                  fuel seeding (sweeping i1/i2 counters) creates a tall
+ *                  rounded flame dome rather than a flat bottom edge.
+ *                  "Warm-up": base heat grows with frame counter `height`,
+ *                  so flames start small and grow to full intensity.
+ *
+ * Rendering      : Floyd-Steinberg dithering on the float heat grid reduces
+ *                  visible banding when mapping to the ASCII char palette.
+ *                  Perceptual LUT: heat → ramp index chosen to match human
+ *                  perceived brightness rather than linear heat value.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

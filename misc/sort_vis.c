@@ -24,6 +24,31 @@
  * §1 config  §2 clock  §3 color  §4 sort  §5 draw  §6 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Five sorting algorithms animated one-operation-per-tick:
+ *                  Bubble sort   — O(n²) comparisons; stable; adjacent swaps.
+ *                  Insertion sort — O(n²) shifts; stable; builds sorted prefix.
+ *                  Selection sort — O(n²) comparisons; O(n) swaps; not stable.
+ *                  Quicksort      — O(n log n) average; Lomuto partition:
+ *                                   pivot = last element; partition in-place.
+ *                  Heapsort       — O(n log n) worst-case; in-place; not stable.
+ *                                   Max-heap built in O(n), then extracted.
+ *
+ * Data-structure : Coroutine-style iterators: each algorithm is implemented
+ *                  as a state machine (struct + step function) that advances
+ *                  exactly one compare-or-swap per call.  This allows the
+ *                  animation loop to run at a user-controlled rate without
+ *                  threads.
+ *
+ * Rendering      : Vertical bar chart: element value → bar height in '#'
+ *                  characters.  Colour encodes operation state:
+ *                  grey=unsorted, yellow=currently comparing, red=just swapped,
+ *                  green=sorted (in final position).  N_ELEMS=48 bars fill
+ *                  a typical 80-column terminal with room for bar heights.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <signal.h>

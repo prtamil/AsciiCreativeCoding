@@ -18,6 +18,30 @@
  * §1 config  §2 clock  §3 color  §4 maze  §5 solve  §6 draw  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Recursive-backtracker DFS maze generation (Wilson 1996).
+ *                  Maintains a stack of visited cells; at each step, if
+ *                  unvisited neighbours exist, choose one randomly, carve the
+ *                  wall between them, and push.  If no unvisited neighbours,
+ *                  pop (backtrack).  Produces uniform-random spanning trees.
+ *
+ * Data-structure : Wall encoding: 4-bit bitmask per cell (N=1, E=2, S=4, W=8).
+ *                  Carving a wall clears the bit in the current cell AND sets
+ *                  the opposite bit in the neighbour (symmetric representation).
+ *                  Display: 2×2 terminal pixels per maze cell, so a W×H maze
+ *                  occupies (2W+1) × (2H+1) terminal cells.
+ *
+ * Math           : BFS solve: shortest path in number of cells (unweighted).
+ *                  BFS on the wall-encoded graph: neighbours reachable if the
+ *                  corresponding wall bit is 0.  Parent array reconstructs path.
+ *
+ * Performance    : GEN_STEPS=4 DFS steps per frame (animated generation);
+ *                  SOL_STEPS=16 BFS steps per frame (animated solve).
+ *                  Generation: O(W×H) total.  Solve BFS: O(W×H) total.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <signal.h>

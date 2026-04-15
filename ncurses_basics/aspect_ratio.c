@@ -1,4 +1,13 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
+/*
+ * aspect_ratio.c — Minimal demo: drawing a circle with terminal cell-aspect correction.
+ *
+ * CONCEPT: Terminal cells are taller than wide (typical ratio ≈ 1:2 col:row).
+ * Drawing a circle with x = r·cos(θ), y = r·sin(θ) produces an ellipse on screen.
+ * Fix: scale x by 2 (or equivalently scale y by 0.5) so that the rendered shape
+ * appears circular to the eye.  This is the foundation of all isotropic drawing
+ * in this project.
+ */
 #include <ncurses.h>
 #include <math.h>
 

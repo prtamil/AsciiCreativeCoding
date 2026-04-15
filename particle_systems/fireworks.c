@@ -31,6 +31,31 @@
  *   §8  app      — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Two-phase rocket + burst particle system.
+ *                  Phase 1 (LAUNCH): rocket ascends with upward velocity and
+ *                  gravity deceleration; trail particles emitted each tick.
+ *                  Phase 2 (BURST): at apex, N_SPARKS sparks emitted radially
+ *                  at random angles with random speeds (uniform distribution
+ *                  over angle, Gaussian-distributed speed).
+ *
+ * Physics        : Explicit Euler integration each tick:
+ *                    vel.y += GRAVITY × dt;  pos += vel × dt
+ *                  Sparks also have drag (vel *= DRAG each step) to slow down
+ *                  after emission and hang in the air before falling.
+ *                  Rocket apex detected when vy changes sign (peak of arc).
+ *
+ * Data-structure : Rocket pool — flat array of MAX_ROCKETS structs.
+ *                  Each rocket owns a fixed-size spark array (N_SPARKS).
+ *                  Object pool pattern: slots recycled when rocket finishes.
+ *
+ * Rendering      : Rocket drawn as '|' with A_BOLD; trail as '*'; sparks as
+ *                  '.' / '*' / '+' based on age.  Colour pair selected per
+ *                  rocket at launch time from a 7-colour palette.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /* M_PI is not guaranteed by C99/C11 — define it explicitly. */

@@ -46,6 +46,31 @@
  * Sections: §1 config  §2 clock  §3 color  §4 grid  §5 scene  §6 screen  §7 app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Drossel-Schwabl probabilistic cellular automaton (1992).
+ *                  Three-state (EMPTY, TREE, FIRE) synchronous update:
+ *                  all next-gen states computed from current gen before
+ *                  any are applied (double-buffer pattern).
+ *
+ * Physics        : Self-organised criticality (Bak, Tang, Wiesenfeld 1987):
+ *                  at the critical ratio p/f, fire cluster sizes follow a
+ *                  power law P(s) ∝ s^(-τ), τ ≈ 1.19 — no characteristic
+ *                  scale, analogous to earthquakes (Gutenberg-Richter law).
+ *                  The system self-tunes to the critical point without
+ *                  external parameter adjustment.
+ *
+ * Math           : p/f ratio controls average cluster size before ignition.
+ *                  Large p/f → trees grow faster than lightning strikes →
+ *                  dense contiguous clusters → catastrophic fires.
+ *                  The 4-neighbour (von Neumann) vs 8-neighbour (Moore)
+ *                  spread kernel affects isotropy of fire propagation.
+ *
+ * Performance    : Double-buffer grid O(rows×cols) per tick.  Probabilistic
+ *                  tests use rand()/RAND_MAX — per-cell O(1) random number.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

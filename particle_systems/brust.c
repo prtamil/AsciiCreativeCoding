@@ -28,6 +28,30 @@
  *   §8  app      — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Particle burst system with scorch mark persistence.
+ *                  Each burst emits N_PARTICLES sparks in random directions;
+ *                  each spark has velocity, colour, and lifetime.  Scorch marks
+ *                  are written to a separate grid that persists across bursts.
+ *
+ * Physics        : Spark trajectory: explicit Euler integration — pos += vel×dt,
+ *                  vel *= DRAG (per-step speed retention).  Gravity added to vy
+ *                  each tick: vy += GRAVITY×dt.  Spark fades (alpha decreases)
+ *                  as lifetime runs down.
+ *
+ * Data-structure : Burst pool — fixed array of MAX_BURSTS burst structs, each
+ *                  owning N_PARTICLES spark structs.  Active bursts processed
+ *                  each tick; inactive slots reused (object pool pattern).
+ *                  Scorch grid: 2-D char array persisting brightest char hit
+ *                  at each cell — cleared on 'r' key.
+ *
+ * Rendering      : Sparks rendered at decreasing brightness as they age.
+ *                  Scorch marks use dim attribute.  Multiple bursts overlap
+ *                  at different ages, creating layered explosion fields.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

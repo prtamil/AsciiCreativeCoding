@@ -32,6 +32,28 @@
  *   §7  app     — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : 3-D debris particle system projected to 2-D terminal.
+ *                  Each blob has (x, y, z) position and velocity in 3-D
+ *                  space.  Per tick: vel.z += GRAVITY_Z; pos += vel×dt.
+ *                  Perspective projection: screen_x = x / z, screen_y = y / z.
+ *
+ * Math           : Perspective (pin-hole camera) projection: objects farther
+ *                  away (larger z) appear smaller.  Depth sorting not needed
+ *                  for an explosion since fragments don't occlude each other.
+ *                  Rotation matrix applied to initial velocity vectors to
+ *                  produce the radial burst pattern in 3-D.
+ *
+ * Performance    : Fixed-size blob pool (N_BLOBS) allocated once; no dynamic
+ *                  memory.  dt loop: sim runs at SIM_FPS, render capped at 60 fps.
+ *
+ * Rendering      : Blob character selected from a set based on z-depth
+ *                  (farther → smaller char); brightness decreases with age.
+ *                  Frame buffer written to terminal in a single pass each frame.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

@@ -36,6 +36,32 @@
  *   [5] rain    [6] walkers [7] scene  [8] app
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : DLA (Diffusion-Limited Aggregation) crystal growth with
+ *                  D6 hexagonal symmetry, layered over matrix rain.
+ *                  DLA: random-walk particles that aggregate on contact with
+ *                  the existing crystal — produces dendritic fractal shapes.
+ *                  D6 symmetry: when a walker sticks, all 12 symmetry-related
+ *                  positions (6 rotations × 2 reflections) are frozen
+ *                  simultaneously → perfect snowflake hexagonal symmetry.
+ *
+ * Math           : DLA fractal dimension ≈ 1.71 (between line and plane).
+ *                  D6 symmetry group: rotation by 60° and reflection across
+ *                  the x-axis generate all 12 positions from a single hit.
+ *
+ * Performance    : Multiple concurrent walkers (adjustable with +/-) speed
+ *                  up growth at the cost of less ideal DLA statistics.
+ *                  Crystal growth check: O(walkers) per tick; sticking check
+ *                  scans 8 neighbours O(1) per walker per tick.
+ *
+ * Rendering      : Two layers: matrix rain (background) and DLA crystal
+ *                  (foreground).  Frozen cells rendered on top of rain chars
+ *                  using theme-coloured bold characters.  Crystal flash on
+ *                  completion: all frozen cells drawn bright white for 1 s.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

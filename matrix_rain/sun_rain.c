@@ -47,6 +47,28 @@
  * §7  app / main
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : 180 radial streams emanating from screen centre.
+ *                  Each ray has a direction angle θ = k×π/90 for k=0…179
+ *                  and a phase offset for staggered appearance.  Rays move
+ *                  at constant speed outward; characters along each ray
+ *                  shimmer by random re-assignment each tick.
+ *
+ * Math           : Isotropic coordinate system: x is in column units,
+ *                  y is compressed by ASPECT=0.45 to compensate for terminal
+ *                  cells being taller than wide.  Baked once at ray init:
+ *                    cos_a = cos(θ);   sin_a = sin(θ) × ASPECT
+ *                  Per-sample computation:  col = cx + ri×cos_a
+ *                                           row = cy + ri×sin_a
+ *
+ * Rendering      : Render interpolation: draw_r_off = r_off + speed×alpha
+ *                  gives sub-tick smooth radial motion at 60 fps display
+ *                  even with 20 Hz physics.  Forward extrapolation exact
+ *                  because speed is constant (no acceleration).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

@@ -54,6 +54,31 @@
  * §6  app / main
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Rotating beam simulation with angular wake.
+ *                  beam_angle advances by spin×dt each tick.  Render
+ *                  interpolation: draw_angle = beam_angle + spin×alpha
+ *                  projects the beam to its fractional-tick position,
+ *                  giving smooth 60 fps rotation at 20 Hz physics.
+ *
+ * Physics        : Lighthouse model: two beams 180° apart sweep continuously.
+ *                  Additional beams added with ']' key are evenly distributed
+ *                  at 360°/N_beams angular spacing.
+ *
+ * Performance    : Only (WAKE_LEN+1) trig calls per beam per frame (one
+ *                  per wake slot direction vector).  Each radial sample then
+ *                  uses pre-computed cos/sin — no per-cell trig.
+ *                  Char cache: N_RADII × (WAKE_LEN+1) entries; ~75%
+ *                  randomised per tick for the matrix shimmer effect.
+ *
+ * Rendering      : Brightness ramp: HOT (head) → BRIGHT → MID → DARK → FADE
+ *                  across WAKE_LEN angular slots.  Draw order: dim slots first,
+ *                  then bright — so head always wins at cell overlaps.
+ *                  Core '@' drawn last, always on top of all beams.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

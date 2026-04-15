@@ -55,6 +55,31 @@
  *   §8  app      — dt loop, input, resize, cleanup
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Star wander (Ornstein-Uhlenbeck) + proximity-graph line drawing.
+ *                  Each star applies a small random velocity increment (wander)
+ *                  bounded to prevent runaway speed.  For each pair of stars
+ *                  within CONNECT_DIST pixels, a line is drawn with slope-matched
+ *                  characters and distance-based stippling.
+ *
+ * Physics        : Wander: each tick, velocity perturbed by small random
+ *                  δvx, δvy bounded at WANDER_FORCE; speed capped at SPEED_MAX.
+ *                  Stars bounce off screen edges with velocity reflection.
+ *
+ * Rendering      : Render interpolation: draw position lerped between previous
+ *                  and current tick position at sub-frame alpha — prevents
+ *                  jitter when render rate ≠ sim rate.  Thin-line Bresenham:
+ *                  one cell per major-axis step to avoid doubled diagonal chars.
+ *                  Line brightness: ratio < 0.50 → bold; ratio < 0.75 → normal;
+ *                  ratio < 1.00 → stippled (every 2nd cell drawn).
+ *
+ * Math           : Slope character selection from pixel-space angle:
+ *                  0–22.5° → '─'; 22.5–67.5° → '╲'/'╱'; 67.5–90° → '│'.
+ *                  CONNECT_DIST in pixels; aspect-corrected before comparison.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

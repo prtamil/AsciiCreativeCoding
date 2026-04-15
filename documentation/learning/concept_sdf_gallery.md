@@ -362,3 +362,17 @@ No mesh, no UV, no topology management.
 
 `col` = height-based gradient so head and arms read different theme colors from the body.
 The figure rotates at `t * 0.38` rad/s so all four arms are visible over one orbit.
+
+---
+
+## From the Source
+
+**Algorithm:** SDF composition gallery — showcasing five distinct SDF operations in five named scenes.
+
+1. **Smooth union:** `smin(d1, d2, k)` — blends two SDFs into a single connected surface with a controllable blend radius k.
+2. **Boolean CSG:** union = `min(d1, d2)`, intersection = `max(d1, d2)`, subtraction = `max(d1, −d2)`. Exact set operations on SDFs — union/intersection require no parameter k.
+3. **Twist deformation:** rotate `p.yz` by angle θ ∝ p.x (twist). Domain deformation violates the Lipschitz condition so the SDF is no longer a true signed distance — a relaxation factor (0.5) is applied to prevent overshoot.
+4. **Domain repetition:** `p = mod(p, cell_size) − cell_size/2`. Evaluating SDF at the remapped p produces an infinite periodic grid from a single primitive's SDF.
+5. **smin-based organic sculpting:** composing many simple primitives with smooth-min produces blob-like organic shapes.
+
+**References:** `wireframe.c` in the raymarcher directory (not geometry/) provides the wire-rendering pipeline; SDF primitives and smooth-min follow Inigo Quilez's reference implementations.

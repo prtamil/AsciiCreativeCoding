@@ -49,6 +49,14 @@ Scale-free (Barabási-Albert): new nodes attach preferentially to high-degree no
 - How does clustering coefficient affect epidemic spread?
 - Can you identify the "super-spreader" nodes (highest degree)?
 
+## From the Source
+
+**Algorithm:** SIR (Susceptible-Infected-Recovered) epidemic model on a Watts-Strogatz small-world network. Per tick: each I node infects each S neighbour with probability β; each I node recovers with probability γ.
+
+**Math:** Basic reproduction number: R₀ = β·⟨k⟩/γ where ⟨k⟩ is the mean degree. Epidemic threshold R₀=1 marks the phase transition between extinction and outbreak. Node positions on ring: θ_i = 2πi/N, placed in a circle.
+
+**Data-structure:** Watts-Strogatz construction: start with a K=4 ring graph (each node connected to K/2 nearest neighbours on each side); rewire each edge with probability p=0.15, replacing the target with a random node. Rewired "shortcut" edges create the small-world property: short average path length + high clustering coefficient.
+
 ---
 
 ## Pass 2 — Implementation

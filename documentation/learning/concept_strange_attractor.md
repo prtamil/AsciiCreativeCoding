@@ -90,3 +90,11 @@ normalize_and_draw():
 → log-normalize → map to ASCII density chars → draw once
 (redraw only when parameters change)
 ```
+
+## From the Source
+
+**Algorithm:** Density-map rendering of strange attractor trajectories. A point is iterated for many steps under the attractor map. Rather than drawing each point directly, a density grid accumulates visit counts. Log-normalised density is then mapped to a palette.
+
+**Math:** Several 2D and 3D autonomous ODE systems: Clifford: `x' = sin(a·y)+c·cos(a·x)`, `y' = sin(b·x)+d·cos(b·y)`. Peter de Jong: similar polynomial form. Tinkerbell: complex quadratic map. Lorenz (projected 3D → 2D). All exhibit sensitivity to initial conditions (chaos): nearby trajectories diverge exponentially, producing the intricate filamentary structure of the attractor.
+
+**Performance:** ITERS_PER_FRAME=200,000 iterations per tick, WARMUP_ITERS=5000 discarded transient. Log density coloring: `brightness ∝ log(1 + count)/log(1 + max)`. Log scaling prevents the densest regions from washing out all detail — without it, the "spine" of the attractor would be solid white while outlying filaments remained invisible.

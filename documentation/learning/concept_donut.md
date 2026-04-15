@@ -229,6 +229,26 @@ Signal states:
 
 ---
 
+## From the Source
+
+**Algorithm:** Analytic torus rasterization (not raymarching). For each point on the torus surface, the 3D position is computed from (θ, φ) parameters, rotated by two Euler angles, then projected to screen space. The depth buffer (z-buffer) resolves visibility between overlapping surface points.
+
+**Math:** Torus parametric equation:
+```
+x = (R + r·cos φ) cos θ
+y = (R + r·cos φ) sin θ
+z =  r · sin φ
+```
+Surface normal: `n = (cos φ cos θ, cos φ sin θ, sin φ)`. Lighting: L·N dot product with Phong specular: `(R·V)^shininess`. Luminance mapped to ASCII ramp `".,:;+=xX$&@#"`.
+
+**Rendering:** Z-buffer (depth buffer): each pixel stores the depth of the nearest surface point. Rasterization proceeds by scanning (θ, φ) — further points overwrite only if closer than current stored depth.
+
+**Performance:** O(N_THETA × N_PHI) per frame — proportional to the number of surface samples, not terminal resolution. Terminal aspect (CELL_H / CELL_W ≈ 2) compensates in the projection.
+
+**References:** Original algorithm by Andy Sloane (donut.c / a1k0n.net); this file is a rewrite in the ncurses dt-based framework.
+
+---
+
 # Pass 2 — donut.c: Pseudocode
 
 ## Module Map

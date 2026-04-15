@@ -115,6 +115,16 @@ Chebyshev distance `max(|dr|, |dc|)` is the natural grid metric: it equals the n
 
 With n_walkers=10 this is 10× full-grid scans per frame. At 80×300 = 24,000 cells this is 240,000 comparisons per frame — fast enough at 30 fps. A more efficient approach would maintain a frontier list, but the simple scan is easier to reason about and fits the grid size.
 
+## From the Source
+
+**Algorithm:** Two aggregation modes. DLA (Diffusion-Limited Aggregation, Witten & Sander 1981): Particles launched from a ring, random-walk until they touch the cluster. Tip-screening effect: tips extend further from the centre and capture walkers preferentially, creating fractal branching with D ≈ 1.7 in 2D. Eden model: directly attach a random frontier cell. No diffusion → no tip screening → compact, rounder shapes (D → 2 as cluster grows; no fractal structure at large scales).
+
+**Math:** DLA fractal dimension D ≈ 1.71 in 2D. Cluster radius `R ~ N^(1/D)` where N = number of particles. Comparison between modes in the same code illustrates how diffusion (randomness in the approach path) is necessary for fractal self-similar morphology.
+
+**Performance:** DLA walker cost: O(R²) expected random-walk steps per particle (hitting probability from radius 2R to R ≈ 1/(log R) in 2D). Eden mode: O(frontier size) per particle — much faster. MAX_STEPS=500 per walker; LAUNCH_PAD=3 launch circle offset. Chebyshev radius used for bounding computation.
+
+**References:** Witten, T.A. & Sander, L.M. (1981) — original DLA paper.
+
 ## Open Questions for Pass 3
 
 - Measure the **fractal dimension** by box-counting: count how many boxes of side L are needed to cover the cluster, for L = 1, 2, 4, 8... Should converge to ≈1.71 for true DLA.

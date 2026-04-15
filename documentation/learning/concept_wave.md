@@ -72,3 +72,11 @@ The amplitude is real-valued and can be positive or negative. Rendering both sig
 | DAMP | ≈ 0.993 | Lower → faster decay; higher → patterns persist longer |
 | Source freq offsets | ~0.01–0.02 | Larger → faster phase drift; smaller → nearly static pattern |
 | STEPS_PER_FRAME | 1–8 | Higher → simulation runs faster relative to wall clock |
+
+## From the Source
+
+**Algorithm:** Unlike the wave_2d.c sponge-boundary variant, this file uses multiple independent oscillating sources that drive the field continuously, creating persistent standing/travelling waves. FDTD 2nd-order explicit scheme.
+
+**Math:** CFL stability: C_SPEED=0.45 gives CFL number = 0.45·√2 ≈ 0.636 (not just "comfortable margin" — the exact value). Energy dissipation: DAMPING_DEFAULT=0.993 per tick; without damping, energy accumulates until numerical overflow.
+
+**Performance:** O(W×H) per step. STEPS_DEFAULT=4 sub-steps per render frame advance the simulation faster without changing CFL. Grid uses three flat arrays (prev/cur/new) for cache efficiency; 2D index is y*W + x (row-major).

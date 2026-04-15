@@ -108,6 +108,14 @@ COMPUTING ──── all pixels done ────► HOLDING (done_ticks++)
 - When the terminal is resized, is the shuffle array reallocated and re-shuffled, or is the existing permutation truncated?
 - Why are the preset viewport windows different sizes? Is seahorse valley zoomed in more than the full set?
 
+## From the Source
+
+**Algorithm:** Escape-time algorithm — per-pixel iteration until escape. Unlike Mandelbrot where c varies per pixel and z₀=0, Julia sets fix c globally and vary the starting point z₀ (= the pixel coordinate). Pre-shuffled index array costs O(W×H) memory but makes each tick O(PIXELS_PER_FRAME) — deterministic cost.
+
+**Math:** Julia-Mandelbrot duality: the Julia set J(c) is connected if and only if c ∈ M (the Mandelbrot set). Near the boundary of M, the corresponding Julia set has the most intricate, near-fractal structure. Well inside M: filled Julia is a simply-connected blob. Outside M: disconnected dust.
+
+**Performance:** PIXELS_PER_TICK=60 pixels computed per simulation tick. Each tick O(PIXELS_PER_TICK) — reveals fractal uniformly everywhere simultaneously, making incomplete drawing more visually interesting than scan-line order.
+
 ---
 
 # Pass 2 — julia: Pseudocode

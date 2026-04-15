@@ -121,6 +121,16 @@ The Theme struct holds `c[5]` (256-color) and `c8[5]` (8-color fallback) for the
 - How are the color band thresholds chosen — fixed iteration counts or relative to MAX_ITER?
 - When zoomed deep into a region (mini Mandelbrot preset), does the floating-point precision of `float` cause visible artifacts?
 
+## From the Source
+
+**Algorithm:** Pre-shuffled random pixel order via Fisher-Yates permutation — reveals the fractal uniformly across the screen rather than scan-line by scan-line. Cost per pixel: O(MAX_ITER) worst case, O(1) for fast-escape pixels far from the boundary.
+
+**Math:** The escape condition `|z| > 2` is sufficient because if `|z| > 2` then the orbit diverges to ∞. Equivalent test: `Re(z)² + Im(z)² > 4`. The boundary of M has Hausdorff dimension = 2 (Brooks & Matelski, Mandelbrot 1980). M is connected (Douady & Hubbard, 1982). Period-1 bulb (main cardioid): converges to fixed point; period-2 bulb (left circle): oscillates between 2 values.
+
+**Performance:** PIXELS_PER_TICK=60 pixels computed per simulation tick. The pre-shuffled index array costs O(W×H) memory but makes each tick O(PIXELS_PER_TICK) — deterministic cost.
+
+**References:** Brooks & Matelski (Hausdorff dimension = 2, 1978 manuscript); Mandelbrot (1980); Douady & Hubbard (connectedness proof, 1982).
+
 ---
 
 # Pass 2 — mandelbrot: Pseudocode

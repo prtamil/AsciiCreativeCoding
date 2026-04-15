@@ -162,6 +162,14 @@ The derivative update formula is `dr = p · r^(p-1) · dr + 1`. Using `r^p` inst
 
 Power 2 gives a smooth blob (all real values, Mandelbrot limit). Power 8 gives the classic Mandelbulb with 8-fold rotational symmetry and the characteristic "tentacles" and pods. Powers 3–7 and 9–12 give different symmetries; power morphing (interpolating between 2 and 12) shows a smooth deformation between simple sphere and full fractal complexity.
 
+## From the Source
+
+**Algorithm:** SDF raymarching on the Mandelbulb — a 3D fractal. The Mandelbulb SDF is estimated (not exact) by tracking the derivative of the iteration to bound the distance: `dr = n·|z|^(n-1)·dr + 1` (derivative accumulation); `SDF ≈ 0.5·log(|z|)·|z|/dr` (distance lower bound). The ray marches along this lower bound, guaranteed not to overshoot the surface (within numerical precision).
+
+**Math:** Mandelbulb iteration (power n): `z ← z^n + c`, where `z^n` in spherical coords: `r^n, θ→n·θ, φ→n·φ` (de Lagrange extension of z²+c to 3D). The surface is defined by: orbit of 0 under z←z^n+c remains bounded. At n=2: tends toward a sphere (no fractal). At n=8: the "classic" Mandelbulb with bulbous fractal surface. Terminal rendering techniques documented in §T: T.1 surface smoothing (MB_HIT_EPS=0.003), T.2 normal low-pass filter (H=0.010), T.8 shadow floor (0.15f), T.9 8-char ramp `" .:=+*#@"`, T.10 stable buffer (g_fbuf + g_stable), T.11 camera snapshot (g_snap_*).
+
+**Performance:** Phong shading: N = normalised gradient of SDF at surface. Soft shadows: a second march toward the light; minimum SDF along the ray determines shadow softness. AO (ambient occlusion): short marches along the normal estimate how much open space exists above the surface. ROWS_PER_TICK=4 rows rendered per frame for progressive display.
+
 ### Why 24 auxiliary iterations for normals?
 
 Normal computation calls `mb_de` 6 times (central differences). Using the full `MAX_ITER=100` iterations for each would cost 600 iterations per pixel hit for normals alone. 24 iterations captures the coarse structure well enough for a smooth normal while keeping frame time reasonable. For thin features, higher iteration count would be needed for accuracy.

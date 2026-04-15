@@ -43,6 +43,16 @@ Where K is a ring-shaped kernel (exponential shell) and μ,σ parameterize the g
 - Can you find parameters that produce orbium (the moving creature)?
 - How does periodic boundary condition differ from zero-padding?
 
+## From the Source
+
+**Algorithm:** Continuous cellular automaton with convolution kernel. Each step: convolve state grid with kernel K (weighted ring), evaluate growth function G, apply update rule. Naïve O(W·H·πR²) convolution — for R=13 and a 200×60 grid that's ~6M ops per step.
+
+**Math:** Growth function G(x) = exp(−(x−μ)²/(2σ²)) — a Gaussian centred at μ. When the kernel convolution result matches μ exactly, G=1 and the cell grows toward 1. Far from μ, G→0 and the cell decays. The parameter pair (μ, σ) defines a "species" of creature. The ring kernel captures "neighbourhood density at radius R" — analogous to how a biological cell senses chemical gradients.
+
+**Physics/References:** Lenia (Bert Wang-Chak Chan, 2019). A continuous generalisation of Conway's Game of Life. Self-organisation emerges from the tension between growth (G>0.5) and decay (G<0.5).
+
+**Performance:** Pre-building the kernel O(R²) once amortises cost across all W×H cells per step. Normalised so total kernel weight = 1. Preset creatures: Orbium (μ=0.15, σ=0.015, R=13), Aquarium (μ=0.26, σ=0.036, R=10), Scutium (μ=0.17, σ=0.015, R=8).
+
 ---
 
 ## Pass 2 — Implementation

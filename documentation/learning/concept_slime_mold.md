@@ -1,5 +1,17 @@
 # Pass 1 — slime_mold.c: Physarum polycephalum via Jeff Jones (2010)
 
+## From the Source
+
+**Algorithm:** Agent-based simulation — emergent behaviour from local rules. The trail grid mediates indirect communication (stigmergy): agents respond to paths left by earlier agents. No global coordinator; network topology arises purely from the sense→rotate→move→deposit loop.
+
+**Math:** Diffusion step is a lerp toward a 3×3 box average (trail' = lerp(trail, avg_3×3(trail), DIFFUSE_W)) — a discrete approximation of the heat equation (∂u/∂t = D·∇²u). Decay: trail' *= (1 − DECAY_RATE) per tick; without diffusion, trail lifetime ≈ 1/DECAY ticks. At DECAY=0.08: lifetime ≈ 12.5 ticks ≈ 0.4 s half-life at 30 fps.
+
+**Performance:** O(N_AGENTS + W×H) per tick. Trail grid update is the bottleneck: 512×128 ≈ 65K cells × 9-neighbour sum ≈ 590K ops per tick. Agents cost N_AGENTS × ~15 ops each. Two float arrays (g_trail/g_buf) for double-buffering: agents deposit into g_trail; grid update reads g_trail → writes g_buf → copies back, preventing mid-tick positional feedback.
+
+**Physics/References:** Jeff Jones (2010) — *Characteristics of Pattern Formation and Evolution in Approximations of Physarum Transport Networks*, Artificial Life 16(2), 127–153. The model captures near-optimal Steiner tree topology using only three sensor readings and a random tie-break rule.
+
+---
+
 ## Core Idea
 
 A colony of 2000 agents moves through a 2D grid, each following three simple rules:

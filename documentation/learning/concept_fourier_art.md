@@ -132,6 +132,14 @@ each frame: phi += 2π/CYCLE_FRAMES
 if phi ≥ 2π: phi -= 2π; trail_clear()    // one full cycle complete
 ```
 
+## From the Source
+
+**Algorithm:** Interactive path-recording → DFT epicycle reconstruction. User traces a free-form path; on ENTER the path is resampled to N_SAMPLES points using arc-length parameterisation (uniform spacing along the drawn curve), then an O(N²) DFT converts it to epicycle coefficients.
+
+**Math:** Arc-length resampling: cumulative chord-length distances are computed, then uniform sample positions are mapped back to original points via linear interpolation. This ensures the DFT receives uniform-time samples regardless of how fast the user drew, eliminating velocity artefacts. DFT of complex path: z[k] = x[k] + i·y[k]; Z[n] gives the n-th epicycle amplitude and initial phase.
+
+**Performance:** DFT is computed once (O(N²)) at draw-time, not per frame. Per-frame cost is O(N_active) arm chain evaluations. RAW_MAX=8192 points buffered during draw; resampled to N_SAMPLES=256 before DFT to bound computation.
+
 ## Key Constants
 
 | Constant | Default | Effect if changed |

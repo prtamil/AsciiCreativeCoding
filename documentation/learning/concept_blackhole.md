@@ -1,5 +1,15 @@
 # Pass 1 — blackhole.c: Gargantua 3D (Schwarzschild geodesic ray tracer)
 
+## From the Source
+
+**Algorithm:** Backwards ray tracing + lookup table. Each pixel shoots a null geodesic BACKWARDS from the camera; if it hits the disk → disk colour; horizon → black. Computing 900 RK4 steps per ray × all pixels live would be too slow for animation. Instead a lensing table maps (camera_theta, camera_phi) → (impact_type, disk_radius) computed once at startup, then looked up each frame.
+
+**Physics/References:** General relativity — Schwarzschild null geodesics. In geometric units c=G=1, r_s=2M=1: Event horizon: r = 1 (r_s); Photon sphere: r = 1.5 (r_s) — unstable circular photon orbit; ISCO: r = 3 (r_s) — innermost stable circular orbit (accretion disk starts at ISCO, so DISK_IN = 3). Geodesic equation in 3D: `d²pos/dλ² = −(3/2)h²·pos/r⁵` where h = pos × vel (specific angular momentum, conserved).
+
+**Math:** Doppler beaming (relativistic). Disk material orbits at Keplerian speed `v = √(M/(2r))`. Approaching side blueshifts (brighter); receding side redshifts (dimmer). Beaming factor `D = [(1+β)/(1−β)]^(3/2)`.
+
+**Performance:** ASPECT=0.47 measured empirically for this terminal font (≠ 0.50 from CELL_W/CELL_H ratio — physical pixels differ). Ensures the event horizon appears circular, not oval.
+
 ## Core Idea
 
 Renders a physically accurate 3D Schwarzschild black hole — the same physics used

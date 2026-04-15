@@ -70,3 +70,11 @@ for col in 0..cols:
 column → r value → iterate (warmup then plot)
 → x values → screen row → mvaddch
 ```
+
+## From the Source
+
+**Algorithm:** Logistic map iteration with parameter scanning. For each column, r is set to a distinct value from a range. WARMUP=500 transient iterations are discarded; the next PLOT=300 values are plotted — these are on the attractor.
+
+**Math:** The logistic map `x_{n+1} = r·xₙ·(1−xₙ)` models population dynamics. For r < 3: converges to a fixed point. r ≈ 3.0: period-2 bifurcation. Each bifurcation point r_n satisfies `r_{n+1} − r_n → 1/δ` where `δ = 4.669...` is Feigenbaum's constant (universal across all unimodal maps, not just the logistic map). At r ≈ 3.5699: accumulation point — onset of chaos. For r > 4: all trajectories diverge. The constant `FEIGENBAUM_R = 3.5699456718695f` is embedded in the source.
+
+**Performance:** O(W × (WARMUP + PLOT)) per diagram redraw. Each column is independent (embarrassingly parallel). Auto-zoom scrolls r toward r∞ = 3.5699 so self-similar copies of the bifurcation diagram are continuously revealed.

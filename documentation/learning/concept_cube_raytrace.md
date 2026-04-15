@@ -181,6 +181,14 @@ back faces are never visible — culling adds a branch with no benefit.
 
 ---
 
+## From the Source
+
+**Algorithm:** The hit face is identified as whichever axis produced the largest t_near — recorded during the slab loop, not inferred post-hoc from the hit point coordinates (which would cause floating-point noise at face boundaries). The normal sign is determined as `(rd_i > 0) ? −1 : +1` on that axis.
+
+**Rendering:** Wireframe edge condition in face UV space uses an OR test: `|u| > WIRE_THRESH || |v| > WIRE_THRESH` — pixels near *either* free-coordinate boundary are drawn as edges. Depth mode maps hit distance to a **cool → warm colour ramp** (hue-encoded, not greyscale).
+
+---
+
 # Pass 2 — cube_raytrace.c: Pseudocode
 
 ## Module Map

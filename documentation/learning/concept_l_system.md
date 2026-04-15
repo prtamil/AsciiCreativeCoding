@@ -103,3 +103,13 @@ axiom + rules + ORDER → generate string
 → turtle_bounds → scale/offset
 → draw_turtle → line segments → screen
 ```
+
+## From the Source
+
+**Algorithm:** String-rewriting L-system with turtle-graphics rendering. Each generation replaces every variable in the string using a production rule table. The resulting string is then "executed" by a turtle: F=forward, +=turn_left, -=turn_right, [=push_state, ]=pop_state.
+
+**Math:** L-systems (Lindenmayer, 1968) were invented to model plant cell division. The string length grows exponentially with generation: `|L_n| = |L_{n-1}| × avg_expansion_factor`. For the Dragon Curve rule F→F+G, G→F-G: `|L_n| = 2ⁿ`. The limit object (infinite generation) of space-filling L-systems (Hilbert, Peano) has Hausdorff dimension = 2 (fills area).
+
+**Performance:** String length limit MAX_STR=1 MB (covers Koch gen 6 ~490 K, Hilbert gen 6 ~490 K, Branching Plant gen 7). The string is stored in a dynamic buffer; each rewrite step O(|string| × max_rule_length) copies characters. Aspect correction: forward step is (STEP_PX_COL, STEP_PX_ROW) accounting for CELL_W/CELL_H ratio to keep branches isotropic. STACK_MAX=128 for maximum branch nesting depth.
+
+**References:** Lindenmayer, A. (1968) — original L-system paper modeling plant cell division.

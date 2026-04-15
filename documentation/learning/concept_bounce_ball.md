@@ -1,5 +1,15 @@
 # Pass 1 — bounce_ball: Reference implementation of smooth terminal physics animation
 
+## From the Source
+
+**Algorithm:** Physics runs in square pixel space, not cell space. Two coordinate spaces with one conversion point: PIXEL SPACE (physics lives here — square grid, one unit = one physical pixel approximately; Width = cols × CELL_W, Height = rows × CELL_H) and CELL SPACE (drawing happens here — `cell_x = pixel_x / CELL_W`, `cell_y = pixel_y / CELL_H`). With this, 1 pixel/tick is the same physical distance in X and Y.
+
+**Math:** Render interpolation (alpha): `alpha = sim_accum / tick_ns ∈ [0.0, 1.0)`. Draw position: `draw_px = ball.px + ball.vx * alpha * dt_sec`. This is technically extrapolation (predict forward from last known state). For constant-velocity balls with elastic wall bounces, forward extrapolation is numerically identical to interpolation and requires no extra storage. If you add acceleration or non-linear forces, switch to storing prev_px/prev_py and lerp between them.
+
+**Performance:** Fixed-timestep accumulator. Physics always runs at exactly `sim_fps` Hz regardless of render frame timing. After draining the accumulator, `sim_accum` holds leftover time. `alpha = sim_accum / tick_ns` gives the render interpolation factor.
+
+**Data-structure:** Ball struct contains only pixel-space data (px, py, vx, vy, color, ch) — zero knowledge of columns or rows. Scene is a flat pool with no dynamic allocation.
+
 ## Core Idea
 Multiple balls bounce around the terminal with physically correct isotropic motion. The central insight is that physics must never run in terminal cell coordinates — cells are not square, so cell-space physics produces distorted motion. Instead, physics runs in a square "pixel space" and only the final drawing step converts to cell coordinates. The program also interpolates between physics ticks so rendered positions smoothly match wall-clock time, eliminating micro-stutter.
 

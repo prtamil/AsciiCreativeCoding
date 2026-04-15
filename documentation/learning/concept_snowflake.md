@@ -98,6 +98,14 @@ There is no DONE hold state; on auto-fill the scene resets immediately.
 - Walker respawn: are walkers spawned uniformly along all four edges, or biased toward certain edges?
 - How does the topology character selection handle the case where a newly frozen cell is deep inside the aggregate (surrounded on all sides)?
 
+## From the Source
+
+**Algorithm:** DLA with 6-fold (D6) symmetry constraint. Each walker's trajectory is computed only for one of 6 symmetric sectors. When it sticks, 5 mirror copies are placed simultaneously. This enforces hexagonal symmetry throughout the growth, unlike diffusion_map.c which grows freely in any direction.
+
+**Math:** D6 symmetry group: 6 rotations × (π/3 each) + 6 reflections. The aggregate remains invariant under all 12 symmetry operations. Fractal dimension of DLA in 2D ≈ 1.71; with D6 symmetry the 6 arms grow independently but share the same statistical properties. STICK_PROB=0.55 → thicker, denser arms with rounded edges. 0.90 → sparse, spiky fractal arms (classic DLA morphology).
+
+**Physics:** Real snow crystal formation: water vapour condenses on a dust nucleation site and diffuses outward. The hexagonal symmetry comes from the molecular geometry of ice (H₂O ice Ih). DLA with D6 symmetry captures this growth morphology — the branching and tip-screening effects produce the characteristic dendritic snowflake arms.
+
 ---
 
 # Pass 2 — snowflake: Pseudocode

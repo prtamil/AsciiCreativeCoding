@@ -132,6 +132,14 @@ Arrow keys move c by `FINE_STEP = 0.015` — small enough to explore detail near
 
 Zooming the Julia view rescales the imaginary half-range `g_j_im_half` by `J_ZOOM_IN = 0.85` per keypress. The real half-range follows via aspect correction. The Mandelbrot panel is unaffected — you always see the full Mandelbrot map, and zoom only affects the Julia display.
 
+## From the Source
+
+**Algorithm:** Split-screen interactive fractal explorer. Left panel (Mandelbrot): computed once at start/resize and cached — O(W/2 × H × MAX_ITER) up-front. Right panel (Julia): recomputed every frame from the current c position — O(W/2 × H × MAX_ITER) per frame. This trade-off makes Mandelbrot navigation smooth (no per-frame cost) while Julia responds instantly to c changes.
+
+**Math:** Auto-wander: c orbits an ellipse in the complex plane (`WANDER_R=0.72`, `WANDER_YSHRK=0.65`, `WANDER_SPEED=0.006 rad/frame ≈ 35 s per orbit at 30 fps`), tracing a path through many different Julia topologies automatically. The squish keeps c off the real axis, exposing more varied morphologies.
+
+**Performance:** Julia panel rendered per-frame — full W/2 × H pixel loop. At 30fps and 80×40 Julia panel: 3200 pixels × 128 max-iter = 409,600 iterations/frame — feasible in C without parallelism.
+
 ## Open Questions for Pass 3
 
 - At what resolution does the Julia set become indistinguishable from noise near the boundary? This is related to the fact that the boundary of the Mandelbrot set is nowhere differentiable.

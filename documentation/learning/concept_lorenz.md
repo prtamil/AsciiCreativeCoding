@@ -40,6 +40,16 @@ Classic parameters: σ=10, ρ=28, β=8/3.
 - Try σ=14, ρ=28 — different wing geometry
 - What is the Lyapunov exponent for classic parameters?
 
+## From the Source
+
+**Algorithm:** RK4 integration of a 3-variable ODE system. The Lorenz system is autonomous (no explicit time): `dx/dt = f(x,y,z)`, so each RK4 step uses only the current state, not wall-clock time. Step size L_H is fixed in Lorenz-time units regardless of display fps.
+
+**Physics/References:** Originally derived by Edward Lorenz (1963) from a simplified model of atmospheric convection. σ (sigma) = Prandtl number (viscosity/thermal diffusivity). ρ (rho) = Rayleigh number ratio (buoyancy vs. diffusion). β (beta) = geometric factor for the convection cell. At σ=10, ρ=28, β=8/3 the system has a strange attractor: bounded but never repeating, with Lyapunov exponent λ ≈ 0.9.
+
+**Math:** Orthographic projection with azimuth φ and elevation θ. The 3D point (x,y,z) is rotated around the z-axis by φ, then the (ry, z) plane is tilted by θ to produce screen coordinates. ASPECT compensates for non-square cell ratio.
+
+**Data-structure:** Ring-buffer trail (TRAIL_LEN=2500 points) per trajectory. At 60 fps × 8 sub-steps = 480 points/s, 2500 ≈ 5.2 s of trajectory history — enough to show the full butterfly shape.
+
 ---
 
 ## Pass 2 — Implementation

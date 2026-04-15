@@ -49,6 +49,14 @@ CFL stability condition: `c·dt/dx ≤ 1/√2` (2D).
 - Two point sources separated by λ — where are the interference maxima?
 - How does the Huygens' principle explain why waves wrap around corners?
 
+## From the Source
+
+**Algorithm:** FDTD explicit Euler, second-order in both space and time: u[t+1] = 2u[t] − u[t−1] + C²·(u_E + u_W + u_N + u_S − 4u). Requires two time levels (t and t−1) — hence two alternating grids g0, g1 (not three).
+
+**Math:** C² = (c·dt/h)² = 0.16 → C·√2 = 0.566 < 1 (2D CFL satisfied). Explicitly: c=0.40, dt=1, h=1. C2=0.5 would give CFL·√2=1.0 (marginal); exceeding the CFL limit causes exponential blow-up within a few steps. DAMP: 0.999^1000 ≈ 0.37 → waves lose 63% amplitude in 1000 steps.
+
+**Physics/References:** Sponge layer — BORDER_W cells at the edges absorb outgoing waves. Without absorption, waves reflect at the boundary and create a standing-wave "box" mode. This is different from the Dirichlet (u=0) reflecting boundary described in the non-obvious decisions section above.
+
 ---
 
 ## Pass 2 — Implementation

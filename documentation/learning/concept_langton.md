@@ -71,6 +71,16 @@ Without wrap-around, ants eventually walk off the edge and the program would nee
 ### Why colour cells rather than just flip?
 Multi-colour rules ("LLRR", "LRRL" etc.) produce much richer patterns than two-state rules. The generalisation to n-colour turmites was discovered independently after Langton's original work and produces qualitatively different emergent structures.
 
+## From the Source
+
+**Algorithm:** Langton's Ant — a 2-D Turing machine on a grid. Generalised multi-colour variant: rule string of length K means K colours; rule[i] is the turn direction for colour i.
+
+**Math:** The ant's state space is (position, heading, grid) — theoretically infinite but bounded by toroidal wraparound. The system is deterministic and reversible (time-reversal = swap R↔L in rule). The RL highway has period = 104 steps.
+
+**Physics:** Emergent order from local rules: with rule "RL", the ant appears chaotic for ~10,000 steps, then spontaneously builds a periodic "highway" — a striking example of emergence: complex global structure from simple local rules.
+
+**Performance:** O(steps_per_frame) per tick; grid update is O(1) per step.
+
 ## Key Constants
 
 | Constant | Effect |

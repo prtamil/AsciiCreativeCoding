@@ -37,6 +37,14 @@ Each term `Z[n]/N · e^{2πi·n·t}` is a rotating circle with:
 - **Complex DFT**: Treat each (x,y) point as a complex number x+iy. The DFT output contains both positive and negative frequencies — both are needed to reconstruct asymmetric shapes.
 - **Trail**: Draw the path traced by the last arm tip as a line. This is the reconstructed shape gradually appearing.
 
+## From the Source
+
+**Algorithm:** DFT epicycle reconstruction with ghost overlay and Parseval energy bar. Shapes are defined as sampled point arrays (polygons + closed parametric curves) rather than smooth formulas, which deliberately exposes Gibbs-phenomenon ringing at discontinuities.
+
+**Math:** Gibbs phenomenon: the partial Fourier sum of a discontinuous signal overshoots by ~9% at each jump, regardless of how many terms are added — visible on the Square and Arrow shapes at corners. Parseval's theorem: total power = Σ|Z[n]|²/N². Sorting epicycles by |Z[n]| and accumulating power gives a greedy energy-optimal partial reconstruction; an energy bar displays the cumulative fraction (0→1). Cell-aspect correction: terminal cells are taller than wide (CELL_W/CELL_H ratio), so x-coordinates are scaled before DFT to produce a visually undistorted shape.
+
+**Performance:** DFT O(N²) computed once per shape change. Per-frame: O(N_active) arm evaluations + O(TRAIL_LEN) trail draw.
+
 ### Key Constants
 | Name | Role |
 |------|------|

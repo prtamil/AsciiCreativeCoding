@@ -85,6 +85,16 @@ No state machine. Purely continuous physics. One boolean: paused.
 
 ---
 
+## From the Source
+
+**Algorithm:** Star motion uses an Ornstein-Uhlenbeck-like wander — each tick velocity is perturbed by a small random `δvx, δvy` bounded at `WANDER_FORCE`, with speed capped at `SPEED_MAX`. This is the same mean-reverting bounded random walk used to model Brownian motion with a restoring force.
+
+**Math:** Slope character selection uses pixel-space angle thresholds: 0–22.5° → `─`; 22.5–67.5° → `╲` or `╱`; 67.5–90° → `│`. Connection distance `CONNECT_DIST` is measured in pixels and aspect-corrected before comparison. The O(n²) pair loop for connection lines is the performance bottleneck.
+
+**Rendering:** Staircase rule intentionally relaxed for drift speed (SPEED_MIN=50 px/s is below the rule's 240 px/s threshold). Wander force keeps motion non-axis-aligned to reduce staircase visibility; lerp interpolation eliminates sub-cell jitter between ticks.
+
+---
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect of increasing |

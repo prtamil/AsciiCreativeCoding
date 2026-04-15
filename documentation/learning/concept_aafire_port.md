@@ -81,6 +81,18 @@ No state machine. Continuous CA. One boolean flag for paused.
 
 ---
 
+## From the Source
+
+**Algorithm:** 5-neighbour CA: `(x-1,y+1), (x,y+1), (x+1,y+1)` (one row below) plus `(x-1,y+2), (x+1,y+2)` (two rows below, no centre). The two-row lookahead gives vertical inertia — rounder blob flames vs Doom's 3-neighbour sharp spires. Edge cells clamp to nearest valid column rather than wrapping.
+
+**Math:** Decay table: `table[i] = (i > minus) ? (i - minus) / 5 : 0` where `minus = 800 / rows` (min 1). Dividing by 5 averages the 5 neighbours back to [0,255]; subtracting `minus` before the division is what provides per-row cooling. MAXTABLE = 1280 = 5 × 256 covers the maximum possible neighbour sum.
+
+**Physics:** Arch seeding uses two linear counters: `i1` starts at 1 and counts up by 4; `i2` starts at `4*cols+1` and counts down by 4. `min(i1, i2)` forms an arch — tall in the middle, zero at edges — with no `sin()` call. Within each burst of up to 6 cells, `last1` does a random walk of ±2, writing to both fuel rows. `height` (frame counter) clamps the arch cap to `min(arch, height)`, producing a cold-start warm-up.
+
+**Performance:** All 1280 possible neighbour sums are precomputed once into `table[]` at init and again on every resize. `firemain()` inner loop is a single array lookup — zero arithmetic per cell. `gentable()` must be called whenever `rows` changes because `minus = 800 / rows`.
+
+**Data-structure:** `bmap` is `cols × (rows+2)` uint8 — the 2 extra rows are the fuel rows. `prev[]` uint8 holds the previous drawn frame for diff-based clearing (only cells that went hot→cold get a space written). `dither[]` float is a scratch buffer rebuilt each render frame for Floyd-Steinberg.
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect |

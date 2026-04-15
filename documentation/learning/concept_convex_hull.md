@@ -52,6 +52,19 @@ cross(O, A, B) = (A.x-O.x)*(B.y-O.y) - (A.y-O.y)*(B.x-O.x)
 
 ---
 
+## From the Source
+
+**Algorithm:** Two algorithms compared side-by-side — Graham scan and Jarvis march (gift-wrapping).
+- Graham scan: pivot is the lowest-y (rightmost on tie) point. Sort by polar angle. Sweep stack — pop when cross-product sign indicates a clockwise (non-left) turn: `(B−A) × (C−A) < 0`.
+- Jarvis march: repeatedly find the most counter-clockwise point from the current hull vertex. Optimal when `h ≪ N`.
+
+**Math:** Cross product formula (foundation of all computational geometry primitives):
+`(A→B) × (A→C) = (Bx−Ax)(Cy−Ay) − (By−Ay)(Cx−Ax)`
+
+**Performance:** Graham scan O(N log N) — dominated by sort; stack sweep is O(N) since each point is pushed/popped at most once. Jarvis march O(N·h): worst case O(N²) when all points are on the hull, optimal for small h.
+
+---
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

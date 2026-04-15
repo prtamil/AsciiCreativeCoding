@@ -6,6 +6,18 @@ A 2D vector field computed from layered Perlin noise drives hundreds of tracer p
 
 ---
 
+## From the Source
+
+**Algorithm:** Flow field visualisation via particle tracing — Lagrangian particle advection: dx/dt = V(x,t). Particles leave fading trail marks on the grid, building up a visual record of the flow structure (streamlines).
+
+**Math:** Vector field from layered Perlin noise: angle(x,y,t) = Σ_octave noise(x·f^i, y·f^i, t·f^i) × A^i. The angle drives a unit vector (cos θ, sin θ). Layered octaves (each ×f frequency, ×A amplitude) create fractal turbulence — broad low-frequency swirls with fine-detail perturbations superimposed.
+
+**Data-structure:** Each particle stores a ring buffer of TRAIL_LEN recent positions. On each tick the oldest position is evicted and the new position pushed — O(1) trail management. Particle lifetime counter respawns dead particles at a random location to maintain steady visual density.
+
+**Performance:** O(N_PARTICLES × TRAIL_LEN) drawing + O(W×H) field update. Perlin noise is the bottleneck: W×H noise evaluations per field rebuild. FIELD_EVOLVE_SPEED controls how often the field is rebuilt — lower rates amortise the rebuild cost.
+
+---
+
 ## The Mental Model
 
 Imagine every terminal cell has a tiny arrow showing which direction the "wind" is blowing at that point. The arrows change slowly over time (the noise field evolves). Hundreds of tracer particles follow the wind, leaving fading trails behind them: `.,+~*` from dim-to-bright, with a directional arrow character at the head.

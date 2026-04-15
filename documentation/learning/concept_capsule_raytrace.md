@@ -201,6 +201,16 @@ two-second interval looks the same.  Equal speeds produce a circular
 
 ---
 
+## From the Source
+
+**Algorithm:** Analytic ray-capsule intersection — decomposed into two sub-problems: (1) infinite cylinder test (quadratic in t after projecting out the axial component of the ray/capsule vectors); (2) hemisphere cap tests (sphere quadratics at each endpoint). The minimum positive t among valid hits is the surface hit.
+
+**Math:** Cylinder intersection: project ray and cylinder axis onto the plane perpendicular to the axis. The resulting 2D ray-circle problem is a standard quadratic. Axial bounds check: the body t is only valid if the hit point's axial projection falls within `[0, height]`. Cap normals: `(p − endpoint) / r` (sphere normal at each cap).
+
+**Rendering:** Mode cycling (phong / normals / fresnel / depth) shows how the same intersection test feeds different shading algorithms. Normal mode renders N as an RGB vector — a diagnostic tool for verifying correct normal orientation at body/cap boundaries.
+
+---
+
 ## Key Constants and What Tuning Them Does
 
 | Constant   | Default   | Effect |

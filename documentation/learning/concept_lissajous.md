@@ -104,6 +104,16 @@ Applying the same phase shift to both oscillators is equivalent to a time shift 
 ### Why `DWELL_WIDTH = 0.25`?
 The ramp occupies ±25% of the key period on either side of a symmetric phase. Too wide and the drift never reaches full speed. Too narrow and the transition is abrupt. 0.25 gives roughly half the inter-key interval at half speed, which feels natural at 30 fps.
 
+## From the Source
+
+**Algorithm:** Parametric curve tracing with decaying amplitude. The Lissajous figure is traced analytically (no ODE) by evaluating closed-form parametric equations at each t. A decaying exponential envelope ensures the spiral converges to centre, giving finite total length.
+
+**Math:** `x(t) = sin(fx·t + φ) · e^(−λt)`, `y(t) = sin(fy·t) · e^(−λt)`. Ratio `fx:fy` rational → closed curve. Decay formula: `λ = ln(100) / T_MAX ≈ 4.6 / T_MAX` so amplitude ≈ 1% at T_MAX.
+
+**Rendering:** Full curve redrawn each frame (not accumulated). Four brightness levels map to the four decay loops: newest (largest amplitude) = brightest, innermost = dimmest. Phase drifts slowly to cycle through all Lissajous shapes for the current frequency ratio.
+
+---
+
 ## Key Constants
 
 | Constant | Effect |

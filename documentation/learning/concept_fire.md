@@ -110,6 +110,16 @@ theme 0 (fire) ──── 300 ticks ────► theme 1 (ice) ────
                or 't' key at any time
 ```
 
+## From the Source
+
+**Algorithm:** Doom 3-neighbour rule: for each cell `(x, y)`, a random horizontal offset `rx = x + rand()%3 - 1` is applied, then `src = heat[(y+1)*cols + clamp(rx)]`. Only one cell is sampled (not averaged), and the randomness is in the source address, not the result — this is why flames sway rather than rising straight.
+
+**Math:** Decay is computed per-tick from screen height: `target = rows × 0.75; avg_d = MAX_HEAT / target`. Split: `d_base = avg_d × 0.55; d_rand = avg_d × 0.90`. This ensures the average flame peak always reaches ~75% of screen height regardless of terminal size. Floor-bounded by `DECAY_BASE_MIN=0.010` and `DECAY_RAND_MIN=0.015`.
+
+**Physics:** Arch fuel seeding: `t = (x - margin - wind_acc) / span` where margin=4%, span=92% of cols. `arch = (min(t, 1-t) × 2)²` — squared to steepen the edge rise. Wind shifts the arch sampling position by `wind_acc` each tick (cyclic, resets if `>= cols`). `warmup_scale = min(tick / 80, 1.0)` ramps the fuel from 0→1 over first 80 ticks.
+
+**Performance:** Diff-based clearing: `prev_heat` stores what was drawn last frame; cold cells that were also cold last frame get no write at all. After `grid_draw()`, `heat ↔ prev_heat` pointers are swapped, then `memcpy(heat, prev_heat)` re-seeds heat for next tick — one memcpy instead of two.
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect if changed |

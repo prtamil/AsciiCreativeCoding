@@ -90,3 +90,11 @@ render():
 pixel (px,py) → screen_to_complex → newton_iterate
 → (root_index, iters) → color + brightness → terminal char
 ```
+
+## From the Source
+
+**Algorithm:** Newton's method for root-finding applied per-pixel: `z ← z − f(z)/f′(z)`. Each pixel starts at a different initial complex value z₀. The iteration converges (usually) to one of the roots of f.
+
+**Math:** For f(z) = z⁴ − 1 (as implemented): `f′(z) = 4z³`, `z_new = z − (z⁴−1)/(4z³) = (3z⁴+1)/(4z³)`. The four roots are `z = 1, −1, i, −i` (4th roots of unity). The basin of attraction of each root is the set of starting points that converge to it. The boundaries between basins are a fractal — infinitely complex near each root.
+
+**Performance:** Non-converging (cycles or divergence) → black. Brightness encodes convergence speed (fewer iterations → lighter) — slower convergence occurs near basin boundaries where the function is near zero, so Newton steps are huge. MAX_ITER=64, TOL=1e-5f. Per-root zoom presets at roots `+1, −1, +i, −i`.

@@ -11,6 +11,16 @@ From these two rules, the macroscopic behaviour of the fluid (density, velocity,
 
 Reference: Frisch, Hasslacher & Pomeau, *Physical Review Letters* 56(14):1505–1508, 1986.
 
+## From the Source
+
+**Algorithm:** FHP-I Lattice Gas Automaton. Each cell holds 6 bits — one per hexagonal lattice direction (0–5). Per tick: (1) COLLISION — particles in same cell swap via lookup table conserving mass and momentum; (2) STREAMING — each particle hops one cell in its direction. One lookup per cell; very cache-friendly since each cell is a single byte.
+
+**Physics/References:** The H-theorem guarantees that many FHP particles, averaged over many cells, obey the Navier-Stokes equations. This is a proof that macroscopic fluid behaviour arises purely from microscopic conservation laws — no explicit PDEs. The hexagonal grid removes velocity-space anisotropy that afflicted earlier square-lattice gas models.
+
+**Rendering:** 3×3 spatial averaging before display. Individual cells are binary (particle or no particle) — too noisy to show macroscopic flow. Averaging over 9 cells gives local particle density ρ and mean momentum ⟨p⟩, which map to color (velocity direction) and character (density level) for smooth visualisation.
+
+**Performance:** O(W×H) per step — one lookup per cell. The collision table is precomputed at init.
+
 ## The Mental Model
 
 ### Why hex, not square?

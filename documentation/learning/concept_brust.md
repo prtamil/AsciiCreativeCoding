@@ -117,6 +117,16 @@ BS_LIVE
 
 ---
 
+## From the Source
+
+**Algorithm:** Particle burst with scorch persistence. Each burst emits `N_PARTICLES=48` sparks in 4 waves (delay stagger). Scorch marks written to a separate heap-allocated `char scorch[cols*rows]` array via a `scorch_cb` function pointer — keeps `Burst` struct decoupled from `Field`. Scorch persists until `r` key (`memset` to 0).
+
+**Physics:** Friction model (no gravity): `vx *= 0.82; vy *= 0.82` each tick — exponential decay. Position stored as `cx + rx*ASPECT`, `cy + ry` where `rx/ry` is displacement from the fixed center. `ASPECT=2.0` applied at draw time (multiplied onto horizontal displacement) to compensate for non-square terminal cells.
+
+**Data-structure:** Wave delay: `wave = i % 4; delay = (wave * MAX_DELAY) / (waves-1)` gives delays [0, ~1, ~3, 5] ticks. Particles in wave 0 start at tick 0; wave 3 starts after `MAX_DELAY=5` ticks. The BS_FLASH state is exactly one tick — the single-frame `*` + `+` cross flash that gives the ignition impression before BS_LIVE begins.
+
+**Rendering:** Scorch layer drawn first (dim orange A_DIM), then active bursts drawn on top. BS_FLASH: bold yellow `*` at centre + `+` on four cardinal neighbors. BS_LIVE: brightness from life — `> 0.65 → A_BOLD`.
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect |

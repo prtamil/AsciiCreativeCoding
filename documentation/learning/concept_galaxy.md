@@ -168,3 +168,15 @@ Stars from different populations (bulge, arm, halo) mix after many orbits. A bul
 - What happens with `N_ARMS = 3` or `4`? Real galaxies have 2 or 4 arms most commonly — why?
 - Add a **density wave**: a rotating oval potential that stars feel as they pass through. This would maintain arm coherence indefinitely. What minimum amplitude prevents wind-up?
 - The `WINDING` parameter sets the initial spiral geometry. What values of WINDING produce the most visually stable arms (slowest to wind up)?
+
+---
+
+## From the Source
+
+**Algorithm:** Kinematic circular orbit simulation — no N-body gravity. Each star is placed on a logarithmic spiral arm at init with a fixed angular speed ω = v_tan / radius. Each tick: θ += ω × dt. Position = (r·cos θ, r·sin θ).
+
+**Physics:** Flat rotation curve: all stars orbit at the same tangential speed v_tan regardless of radius (like real spiral galaxies, explained by dark matter halos). Differential rotation: ω ∝ 1/r → inner stars orbit faster → arms wind up over time (the classic winding problem).
+
+**Math:** Logarithmic spiral: r = a·exp(b·θ), so θ = ln(r/a)/b. Stars seeded along N_ARMS arms at equal r-intervals; their initial θ values are staggered by 2π/N_ARMS.
+
+**Rendering:** Stars projected to screen (r, θ) → (col, row) with aspect correction. Density → glyph ramp (`. , : o O 0 @`). Radial zone (CORE/DISK/HALO) determines colour pair.

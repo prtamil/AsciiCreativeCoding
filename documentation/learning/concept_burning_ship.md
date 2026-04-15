@@ -84,3 +84,11 @@ escape_color(iter, x, y) → char, color_pair:
 pixel (px,py) → complex c → iterate (abs trick) → escape iter
 → smooth color → terminal char + color pair → screen
 ```
+
+## From the Source
+
+**Algorithm:** Escape-time iteration — identical to Mandelbrot except for the absolute-value fold applied before each squaring. This "folding" maps the complex plane to the first quadrant before squaring, breaking the 4-fold symmetry of Mandelbrot and creating the distinctive ship/flame asymmetry.
+
+**Math:** Iteration: `z ← (|Re(z)| + i|Im(z)|)² + c`. Expanding: `Re_new = Re(z)² − Im(z)² + Re(c)`, `Im_new = 2|Re(z)|·|Im(z)| + Im(c)`. The `|Im|` term forces the imaginary component positive after each step, creating downward-pointing flames rather than Mandelbrot's symmetric bulbs. Escape condition: `|z|² > 4` (equivalent to `|z| > 2`).
+
+**Performance:** Smooth colouring via fractional escape count: `t = iter + 1 − log₂(log₂|z|)`. This removes the "banding" of integer escape counts and produces smooth colour gradients across the boundary. Coordinate note: `burning_ship_iter()` negates ci before iterating to flip the image vertically so the ship appears hull-down.

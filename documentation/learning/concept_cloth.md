@@ -46,6 +46,14 @@ x += v · dt
 - How does the cloth change with gravity pointing sideways?
 - Why does increasing stiffness without reducing dt cause explosion?
 
+## From the Source
+
+**Algorithm:** Explicit spring-mass simulation with symplectic Euler. "Symplectic" means velocity is updated before position: `vel_new = vel + F/m · dt` (velocity first), then `pos_new = pos + vel_new · dt` (use new velocity). This preserves the Hamiltonian structure — no long-term energy drift unlike pure explicit Euler where energy grows unboundedly without damping.
+
+**Physics:** Hooke's law spring force + relative-velocity damping. Three spring types build in the mechanical response: Structural (resists stretching/compression, strong), Shear (resists diagonal deformation, medium), Bend (resists out-of-plane bending, weak). Without bend springs, cloth wrinkles freely; with strong bend springs it becomes stiff fabric.
+
+**Performance:** Symplectic Euler stability bound: k·dt² < 2. At sub-step dt ≈ 2 ms, max k ≈ 462000 px/s² — all spring constants are far below this limit. SUB_STEPS = 8 divides each frame into 8 mini-steps. Cost: O(N_SPRINGS) per sub-step = O(CLOTH_W × CLOTH_H × 6) per frame. At 30×18 nodes ≈ 3240 spring force evals/frame.
+
 ---
 
 ## Pass 2 — Implementation

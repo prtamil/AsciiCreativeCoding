@@ -227,3 +227,13 @@ Velocity Verlet is 2nd-order (nbody.c uses it). For Barnes–Hut with many bodie
 ### Overlay at depth ≤ 3
 
 The quadtree at depth 0 is one rectangle (the full screen). Depth 1 = 4 quadrants. Depth 2 = 16 cells. Depth 3 = 64 cells. At depth 4 (256 cells) the lines are so dense they obscure the bodies. The `min 2×2 cells` guard prevents drawing a line inside a single-cell node where it would overwrite body characters.
+
+## From the Source
+
+**Algorithm:** Barnes-Hut tree-code (Barnes & Hut, 1986). Reduces N-body gravitational force from O(N²) to O(N log N) by grouping distant bodies into their centre-of-mass using a quadtree. The approximation criterion θ (opening angle): if s/d < θ → accept the node as a point mass; else → recurse into children. Smaller θ → more accurate, more expensive; θ=0 → exact O(N²).
+
+**Physics:** Softened Newtonian gravity: `F = G · mᵢ · Mⱼ / (d² + ε²)^(3/2)` (in 2-D pixel space). Galaxy preset uses Keplerian IC: `v_orbit = √(G·M_central / r)` so each body starts in a circular orbit — differential rotation then winds the disk into spiral arms over time.
+
+**Performance:** Typical cost at N=400: ~O(400 × log₂400 × θ_factor) ≈ 3600 force evaluations vs 400² / 2 = 80000 for brute force. QT_MAX_DEPTH=32 caps recursion; NODE_POOL_MAX=16000 supports up to 800 bodies in a well-distributed quadtree.
+
+**Data-structure:** Quadtree with a pre-allocated node pool (NODE_POOL_MAX nodes). Pool avoids dynamic malloc per node; rebuilt each tick. Leaves store one body index; internal nodes store aggregated (total_mass, cx, cy) = centre of mass of all bodies below.

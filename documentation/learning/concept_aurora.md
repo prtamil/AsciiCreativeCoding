@@ -31,6 +31,16 @@ Where:
 - **Phase drift**: Each octave has a different drift rate `φ_k`. This makes the curtain appear to breathe and shift rather than oscillate mechanically.
 - **Transparency effect**: Use dim/normal/bold attributes for inner, mid, and bright regions of the curtain.
 
+## From the Source
+
+**Algorithm:** Analytic wave superposition — stateless. Each frame evaluates brightness and color analytically at every cell. No time-stepping accumulation; previous frame state is not used. This contrasts with grid-based simulation approaches.
+
+**Math:** Aurora formula per cell (col, row): `x = col / cols × 2π`; primary wave `amp1 = sin(x + t·s1)`; harmonic `amp2 = sin(2x + t·s2)`; height envelope `H = sin(row/rows × π)` (curtain boundary). The two sine components run at different time speeds `s1`, `s2`, creating the non-repeating shimmering appearance.
+
+**Data-structure:** Star background uses a deterministic hash instead of a stored array: `star = (col×1003 + row×997 + col×row) % STAR_DENSITY == 0`. Threshold is `STAR_THRESH = 5` out of 256 (~2% of background cells). Zero memory overhead for the star field.
+
+---
+
 ### Key Constants
 | Name | Role |
 |------|------|
@@ -97,3 +107,4 @@ main_loop:
 t → per-band per-row: sum octave sines → curtain column
 → brightness falloff → char + color + attribute → screen
 ```
+

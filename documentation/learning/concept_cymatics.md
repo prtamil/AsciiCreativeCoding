@@ -89,3 +89,9 @@ The exact nodal line `|z| = 0` would be a 1-pixel-thick line, nearly invisible a
 | HOLD_TICKS | How long each figure is displayed before morphing |
 | NODAL_THRESH | Inner band threshold; smaller → thinner bright core |
 | N_MODES | Total number of mode pairs (20 for m<n≤7) |
+
+## From the Source
+
+**Physics/References:** Ernst Chladni, 1787 — the first systematic study of vibration patterns on plates. These are called Chladni figures after him.
+**Math:** Resonant frequency scales as `f_mn ∝ √(m² + n²)`. Boundary condition is Neumann (free edge): the normal derivative of displacement is zero at the plate boundary — the plate is free to vibrate, not clamped. The case `m = n` gives `Z = 0` everywhere — a degenerate trivial solution with no pattern.
+**Algorithm:** The formula `Z(x,y) = cos(mπx)cos(nπy) − cos(nπx)cos(mπy)` is evaluated per pixel; the nodal glow bands are fixed thresholds on `|Z|`.

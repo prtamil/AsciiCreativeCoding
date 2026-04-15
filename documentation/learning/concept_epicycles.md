@@ -49,6 +49,16 @@ A complex number `x + i·y` represents a 2-D point. Multiplying by `exp(iθ)` ro
 ### Why 256 samples?
 256 is a power of 2, making FFT computation efficient if needed. For the visual output, 256 points gives enough resolution for smooth curve reconstruction at typical terminal sizes.
 
+## From the Source
+
+**Algorithm:** Discrete Fourier Transform (DFT) of a complex path. A 2-D curve is encoded as z[k] = x[k] + i·y[k]. The DFT Z[n] = Σ_k z[k]·exp(-2πi·n·k/N) decomposes the curve into N rotating phasors (epicycles). Sorting by |Z[n]| gives the greedy best-N approximation at each step.
+
+**Math:** Each DFT bin Z[n] defines a circle of radius |Z[n]|/N rotating at angular frequency n rev/cycle with initial phase arg(Z[n]). Chaining these circles reproduces the original path exactly when all N arms are active (Fourier completeness). Convergence speed depends on signal smoothness: smooth curves need fewer arms than curves with sharp corners (Gibbs phenomenon).
+
+**Performance:** DFT is O(N²) computed once on shape change; per-frame cost is O(N_active) arm evaluations + O(TRAIL_LEN) trail draw — both negligible at N≤256.
+
+**Data-structure:** Trail stored in a ring buffer (TRAIL_LEN entries) so only the most recent 600 tip positions are kept — O(1) append and draw.
+
 ## Key Constants
 
 | Constant | Effect |

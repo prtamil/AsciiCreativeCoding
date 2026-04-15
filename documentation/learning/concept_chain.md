@@ -155,6 +155,18 @@ CONSTRAINT ITERATION:
    bottom-to-top on the next — coverage is from both ends)
 ```
 
+## From the Source
+
+**Algorithm:** Position-Based Dynamics (PBD / XPBD). Constraint projection formula: `correction = (|d| − rest) / |d| · d_vector`. Each free endpoint absorbs half the correction (equal mass assumption); a pinned node absorbs none (infinite mass).
+
+**Math:** Velocity is implicit — no explicit velocity variable. Damping multiplies the positional delta before the predict step: `vx = (x − ox) * DAMP`.
+
+**Performance:** Cost is O(N · I · S) per frame where N = nodes, I = iterations (N_ITER), S = sub-steps (SUB_STEPS = 8). Each sub-step runs the full constraint loop, improving stability for stiff constraints without shrinking the render frame rate or using an implicit (matrix-solving) integrator.
+
+**Physics/References:** PBD is unconditionally stable — no spring constant to blow up. Stiffness is purely iteration count, not a numerical parameter. More iterations → stiffer rope, but each iteration is just a few multiplies.
+
+**Data-structure:** Ring-buffer trail (TRAIL_LEN entries) for the last free node. Oldest entry is `trail_head` wrapped by modulo arithmetic — no shifts needed.
+
 ## Key Constants
 
 | Constant | Default | Effect if changed |

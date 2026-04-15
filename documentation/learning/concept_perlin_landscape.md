@@ -103,3 +103,13 @@ main_loop():
 t → per-layer offset_x → per-column fbm(x) → height profile
 → fill column from height down → back-to-front draw → screen
 ```
+
+## From the Source
+
+**Algorithm:** Fractal terrain via layered (octave) Perlin noise. Height `h(x,y) = Σ_k noise(x·fᵏ, y·fᵏ) / Aᵏ`. Each octave contributes higher spatial frequency at lower amplitude. The result is a 1/f noise spectrum — the same power-law that real terrain height maps exhibit.
+
+**Math:** Perlin noise (Ken Perlin, 1985): divide space into integer grid cells; assign a pseudo-random gradient vector to each corner; dot gradient with offset from corner; smoothly interpolate using fade function `6t⁵−15t⁴+10t³` (C² continuous, 2nd derivative = 0 at t=0 and t=1). With OCTAVES=6, frequency ratio f=2, amplitude ratio A=0.5: Hurst exponent H = 1 (standard fBm).
+
+**Performance:** Camera scrolls left in time (the noise time parameter increases), giving the illusion of flying over landscape. Parallax layers: SCROLL_FAR=0.12, SCROLL_MID=0.38, SCROLL_NEAR=1.00 (fraction of camera speed). Height bins map to terrain types (water/plains/hills/peaks). g_speed default=0.6 terminal columns per frame.
+
+**References:** Perlin, K. (1985) — original Perlin noise paper (SIGGRAPH).

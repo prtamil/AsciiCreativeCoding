@@ -33,6 +33,16 @@ Where η_ij = 1/distance (heuristic), α controls pheromone weight, β controls 
 - **Elitist update**: Deposit extra pheromone on the best-ever solution each iteration. Helps convergence.
 - **Visual**: Show pheromone intensity as ASCII density on the grid edges. Watch trails form and strengthen over time.
 
+## From the Source
+
+**Algorithm:** Stigmergic path finding — models the Deneubourg et al. (1990) double-bridge experiment. The colony memory lives in the pheromone field (the environment), not in any individual ant. This is the canonical definition of stigmergy: indirect coordination through environment modification. ACO is a metaheuristic for NP-hard combinatorial optimisation (travelling salesman, vehicle routing).
+
+**Math:** This implementation uses 8-directional movement on a grid (not a graph), making it more visual but less mathematically rigorous than classical graph-based ACO. Pheromone update: `τ ← τ × (1 − ρ) + Δτ`. Path selection: `P(cell) ∝ τ^α × η^β`.
+
+**Performance:** O(N_ants × grid_area) per tick for pheromone sensing over the 8-connected neighborhood.
+
+---
+
 ### Key Constants
 | Name | Typical | Role |
 |------|---------|------|
@@ -102,3 +112,4 @@ main_loop():
 cities + pheromone → ants probabilistic tours → update pheromone
 → pheromone matrix → density display + best path overlay
 ```
+

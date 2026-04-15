@@ -114,6 +114,14 @@ The HUD color matches V1 to keep the status bar in the same palette family.
 - Is the `.` character hardcoded or is there a character table like in julia.c?
 - If two IFS iterations land on the same cell (different vertices), which color wins — first or last?
 
+## From the Source
+
+**Algorithm:** Chaos game IFS with 3 attractors (vertices of a triangle). At each step: pick a random vertex, move halfway from the current point toward it, plot the result. After a transient, the orbit traces out the Sierpinski triangle exactly.
+
+**Math:** The Sierpinski triangle is a self-similar set with Hausdorff dimension D = log(3)/log(2) ≈ 1.585. It has zero 2D area (Lebesgue measure 0) but non-zero fractal measure. The IFS `{T₁, T₂, T₃}` where `T_i(x) = (x + v_i)/2` are contractions with ratio 1/2, combined contractivity < 1. Alternative binary view: a point is in the Sierpinski triangle iff in the base-2 representation of its coordinates, no column has both bits = 1 simultaneously (Pascal's triangle mod 2 connection: cell (n,k) is in if C(n,k) is odd).
+
+**Performance:** N_PER_TICK=500 IFS iterations per tick, TOTAL_ITERS=50,000 before reset. Vertex positions define an equilateral triangle: V1=(0,0), V2=(1,0), V3=(0.5, √3/2 ≈ 0.866). ASPECT_R=2.0 ensures the triangle looks equilateral rather than squashed.
+
 ---
 
 # Pass 2 — sierpinski: Pseudocode

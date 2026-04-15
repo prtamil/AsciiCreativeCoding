@@ -51,6 +51,16 @@ Normalization: `Σ_x ρ(x,t)·dx = 1` should be conserved.
 - What happens to the wave packet when V(x) is a harmonic potential?
 - Verify: does total norm Σ|ψ|²·dx remain constant throughout simulation?
 
+## From the Source
+
+**Algorithm:** Crank-Nicolson finite-difference scheme. Averages the explicit and implicit Euler steps to give an unconditionally stable, 2nd-order-in-time method. Results in a tridiagonal complex linear system per step, solved with the Thomas algorithm O(N) — not O(N³).
+
+**Physics:** Quantum mechanics, wave-particle duality. ψ(x,t) is complex-valued; |ψ|² is the probability density. The wavefunction spreads (Re, Im oscillate), reflects off walls, and tunnels through barriers with probability `T ≈ exp(−2κd)` where `κ = √(2m(V−E))/ℏ`.
+
+**Math:** Natural units ℏ = m = 1 simplify the Hamiltonian: `H = −½ d²/dx² + V(x)`. DX and DT are in these dimensionless units. The Thomas algorithm (LU decomposition of tridiagonal matrix) gives the next ψ in O(N) operations.
+
+**Performance:** N_GRID=512 points × STEPS_PER_FRAME=20 solves per frame. Each solve is O(N), so total: O(10240) mults per frame — easily runs at 30 fps even on a single core.
+
 ---
 
 ## Pass 2 — Implementation

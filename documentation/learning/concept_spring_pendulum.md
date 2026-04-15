@@ -128,6 +128,16 @@ paused = false  ←→  paused = true
 5. Why does `r` need clamping? What would happen at `r → 0`?
 6. Try `DAMPING = 0` (no friction) — does the motion stay bounded?
 
+## From the Source
+
+**Algorithm:** Symplectic (semi-implicit) Euler integration. Update velocities ṙ, θ̇ from accelerations r̈, θ̈ first, then update positions r, θ using the new velocities. This "leapfrog" ordering conserves a modified Hamiltonian — no secular energy drift unlike explicit Euler.
+
+**Physics:** Spring pendulum — two coupled oscillators. Pendulum mode `ω_pend = √(g/r₀)` (like a rigid pendulum). Spring mode `ω_spring = √(k/m)`. At ω_spring ≈ 2·ω_pend (the 2:1 parametric resonance): energy flows periodically between the two modes — the bob traces a spirograph-like rosette before reversing.
+
+**Math:** Polar-coordinate Lagrangian equations of motion. Coriolis-like term `2·ṙ·θ̇/r` in θ̈ comes from the non-inertial polar frame (centripetal acceleration).
+
+**Performance:** Sim runs at 120 Hz; display at ~60 Hz. Between sim steps the angles/lengths are linearly interpolated by alpha, giving smooth motion without running physics at 120 Hz (render-interpolation).
+
 ---
 
 # Pass 2 — spring_pendulum: Pseudocode

@@ -72,6 +72,18 @@ For non-integer k, `i × k` is a float. Rounding to the nearest nail gives a cle
 ### Why `×2` in the aspect correction?
 Most terminals have cells approximately 2:1 height/width ratio. A pixel-space slope of 1.0 (45° geometrically) appears at 2.0 in screen coordinates. The correction maps: geometric 1:1 → screen 1:2, so the character thresholds (0.577 and 1.732 = tan 30° and tan 60°) define equal 60° sectors of apparent angle.
 
+## From the Source
+
+**Algorithm:** String-art envelope construction using modular arithmetic. N nails evenly spaced on a circle. Thread `i` connects nail `i` to nail `round(i × k) mod N`. As `i` sweeps `0..N-1`, the set of N chords forms the envelope of a family of lines.
+
+**Math:** The envelope of chords `nail_i → nail_{k·i mod N}` is a hypocycloid/epicycloid depending on k:
+- k=2: cardioid (1 cusp), k=3: nephroid (2 cusps), k=4: deltoid (3 cusps), k=5: astroid (4 cusps)
+Fourier series connection: the cardioid appears in complex power series, and the Mandelbrot set's main body is bounded by the same curve. Non-integer k creates transitional (blended) shapes between named curves, giving the smooth drift animation.
+
+**Rendering:** Chord endpoints mapped from polar (`angle = 2πi/N`) to terminal coordinates with aspect correction. Character for each chord selected by slope: `|dy/dx| < 0.5` → `'-'`, `> 2` → `'|'`, else `'/'` or `'\\'`.
+
+---
+
 ## Key Constants
 
 | Constant | Effect |

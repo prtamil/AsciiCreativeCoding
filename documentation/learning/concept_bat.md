@@ -102,6 +102,16 @@ LAUNCHING (launch_ticks > 0) ──── countdown ────► FLYING
      └──── leader exits screen bounds ─────────────────┘ (new angle, reset)
 ```
 
+## From the Source
+
+**Algorithm:** V-formation particle system with purely kinematic (not physics-integrated) bat positions. Each bat's world position is analytically reconstructed from group heading angle, row index, and column index every frame — no per-bat position storage for the formation shape itself.
+
+**Math:** Row `r`, column `c` bat offset from leader: `dx = c·SPACING_X − r·SPACING_X/2` (fan-out), `dy = r·SPACING_Y` (depth behind leader). A 2D rotation matrix then applies the group heading θ to place bats in world space. Wing cycle: `WING_CYCLE = 36` ticks @ 60 fps ≈ 0.6 s per flap ≈ 1.7 Hz. Group pause at center: `PAUSE_TICKS = 55` ticks before re-launch.
+
+**Data-structure:** Bats within a group are reconstructed each frame from group state. Only the leader position and group heading are stored persistently — per-bat positions are derived values, not stored state.
+
+---
+
 ## Key Constants
 
 | Constant | Default | Effect if changed |

@@ -46,6 +46,16 @@ v      = v_half + a·dt/2
 - Try figure-8 initial conditions: three equal masses
 - What happens when you add a fourth body to a stable three-body orbit?
 
+## From the Source
+
+**Algorithm:** Velocity Verlet (Störmer-Verlet) integration. 2nd-order symplectic integrator — conserves a modified Hamiltonian (energy drifts only by round-off, not by accumulating phase error like explicit Euler). Full formula: `x_new = x + v·dt + ½·a·dt²`, then `a_new = F(x_new)/m`, then `v_new = v + ½·(a + a_new)·dt`.
+
+**Physics:** Softened Newtonian gravity. Real 1/r² force → singularity when r→0. Softening ε (SOFT2 = ε²) limits force magnitude at close approach, modelling extended mass distributions or preventing numerical blow-up. The softened force: `F = G·m₁·m₂·r / (r² + ε²)^(3/2)`.
+
+**Performance:** O(N²) force computation each sub-step (brute force). For N≤32 this is fast; N-body above ~1000 would need Barnes-Hut O(N log N) or FMM O(N). SUB_STEPS=4 improves accuracy without changing display fps.
+
+**Physics/References:** Figure-8 choreography (Chenciner & Montgomery, 2000). An exact periodic solution where 3 equal masses chase each other around a figure-8 curve. Initial conditions in natural units (G=1, m=1) are rescaled to pixel space using dimensional analysis. Per-body ring-buffer trails: 32 bodies × 150 × 8 B = 38 KB — fits easily in L1 cache for small N.
+
 ---
 
 ## Pass 2 — Implementation

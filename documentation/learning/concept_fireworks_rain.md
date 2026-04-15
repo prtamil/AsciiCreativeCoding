@@ -144,6 +144,16 @@ The cache is a flat array of shimmer chars. `cache[i]` is used for `trail[i]`. T
 
 ---
 
+## From the Source
+
+**Algorithm:** Trail history update order is critical: (1) shift `trail[1..]` = `trail[0..]`; (2) store current `(cx, cy)` into `trail[0]`; (3) advance `cx/cy` via physics. This means `trail[0]` always holds the position from one tick ago — the actual arc the particle traveled, not the next position.
+
+**Physics:** Per-particle gravity variance: `g = GRAVITY × (0.8 + rand()/RAND_MAX × 0.4)` so `g ∈ [3.2, 4.8]`. Sparks launched at the same angle diverge over time — organic burst. No vertical squash (`vy = sin(angle)*speed` without the ×0.5 from fireworks.c), giving true circular burst shape.
+
+**Data-structure:** Each `MatrixParticle` is ~180 bytes (two `float[16]` trail arrays + `char[16]` cache + scalars). `App` contains `Show` contains `rockets[16]` each with `MatrixParticle[72]` ≈ 207 KB total in BSS (global `g_app`), not the stack. `trail_fill` ramps from 0 to TRAIL_LEN as the particle moves — trail grows organically from the burst point.
+
+**Rendering:** Shimmer: ~75% of `cache[]` chars replaced each tick (`rand()%4 != 0`). `cache[i]` is used for `trail[i]` — the char at a position is purely random, visual identity comes from brightness only. Theme: `CP_WHITE` (pair 8, always white) for the live head regardless of theme; pairs 1–7 remapped per theme.
+
 ## Key Constants and What Tuning Them Does
 
 | Constant | Default | Effect of changing |

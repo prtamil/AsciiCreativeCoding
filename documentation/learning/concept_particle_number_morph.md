@@ -185,3 +185,11 @@ Linear lerp (`x = ox + t*(tx-ox)`) has a visible jerk at t=0 (instant velocity c
 - Can the morph be **interrupted mid-transition** and redirected to a third digit? The snapshot mechanism already supports this — the `ox/oy` captures the current position, so a new `digit_assign()` would restart from wherever particles currently are.
 - What font resolution (ppr × ppc sub-grid) is needed before the particle grid becomes indistinguishable from a solid filled region? At what terminal size does 500 particles become insufficient?
 - Add a **velocity-based character selection**: use the instantaneous velocity `|dx/dt| = |tx-ox| × smoothstep'(t) / morph_frames` to select characters — fast-moving particles show `'.'`, slow ones show `'@'`, reversing the current scheme to simulate motion blur.
+
+## From the Source
+
+**Algorithm:** Greedy nearest-neighbour bipartite matching + LERP morph. On digit change: build target set for new digit; for each particle, find closest unassigned target (O(P·T) greedy scan); then linearly interpolate position from snapshot to target over MORPH_FRAMES frames using smoothstep easing.
+
+**Math:** Smoothstep easing: f(t) = 3t² − 2t³, t ∈ [0,1]. Produces S-curve acceleration at start and deceleration at end — more visually pleasing than linear interpolation. Bitmap font: 9-row × 7-col bitmap; each '#' pixel expanded to a sub-grid of particles scaled to terminal dimensions.
+
+**Performance:** Greedy matching is O(P·T) per digit change but only runs once per transition (not per frame). Per-frame cost is O(P) position update + draw — cheap at P≤500.

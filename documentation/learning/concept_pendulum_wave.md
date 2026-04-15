@@ -40,6 +40,16 @@ The length is implicit: `L_n = g / ω_n²` (not needed if using ω_n directly).
 - What if N_BASE varied non-linearly? (frequency ratios change pattern)
 - Can you show the pendulum lengths visually as different string lengths?
 
+## From the Source
+
+**Algorithm:** Analytic (not numerical) integration. Each pendulum is a simple harmonic oscillator with `θ_n(t) = amp · sin(ω_n · t)`. No Runge-Kutta needed — the exact solution is just a sine function evaluated at t. This is possible because small-angle approximation: `θ'' ≈ −(g/L)·θ → ω = √(g/L)`.
+
+**Physics:** Length-frequency relation. Pendulum n has `ω_n = 2π(N_BASE+n)/T_SYNC`. From ω = √(g/L): `L_n = g/ω_n²`. All pendulums at t=0 are in phase; over time they drift to produce waves, spirals, and other patterns. At t=T_SYNC they all complete an integer number of full cycles — perfect resync.
+
+**Math:** Lissajous-like interference between harmonic oscillators with frequencies in arithmetic progression. The "clap" resync at T_SYNC is a consequence of the integer-ratio design: each pendulum's period divides T_SYNC exactly.
+
+**Performance:** O(N) per frame — each pendulum is just one sinf() call. No spring forces, no constraint iterations needed.
+
 ---
 
 ## Pass 2 — Implementation

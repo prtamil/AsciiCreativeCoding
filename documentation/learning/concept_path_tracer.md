@@ -173,3 +173,13 @@ Path tracing converges as `1/√N` — halving noise requires 4× more samples. 
 - High SPP/frame: converges faster visually but fps drops; terminal becomes unresponsive at 8+ SPP
 - Low SPP/frame: 30 fps maintained, image visibly noisy for longer  
 - Default 2 SPP: reasonable balance — 60 samples/sec, converges in ~8 seconds
+
+---
+
+## From the Source
+
+**Algorithm:** Russian roulette termination probability is `(1 − max_colour_component)` — the termination chance is highest for dim paths (small max channel), exactly matching where savings are greatest. Surviving paths are boosted by `1/p` to preserve an unbiased estimator.
+
+**Math:** The cosine-weighted hemisphere sampling angles are: `θ = arccos(√(1−u))`, `φ = 2π·v` where `u, v` are uniform `[0,1)`. This importance-samples the Lambertian BRDF `f_r = ρ/π`, causing the `cosθ` and `π` factors to cancel so the per-bounce weight collapses to simply `throughput *= albedo`.
+
+**Rendering:** The Cornell box is chosen specifically because it exercises **indirect diffuse illumination** (colour bleeding from red/green walls onto white surfaces) — the key advantage of path tracing over direct-only methods such as Phong. Reinhard tone mapping `L/(1+L)` compresses the unbounded HDR accumulator into `[0,1)` before gamma encoding.

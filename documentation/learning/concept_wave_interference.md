@@ -149,3 +149,13 @@ The alternative — storing one `g_phase[row][col]` array per cell and summing s
 - Implement **smooth contour drawing**: instead of per-cell filled characters, draw only cells where `|u| ≈ threshold` to show nodal lines (zeros of the wave field).
 - The beat pattern (Δω preset) shows a moving envelope. Does the envelope speed match the theoretical group velocity `v_g = dω/dk`? Measure it.
 - Add a **phase slider** for source i to demonstrate coherence effects: shifting one source's φ by π should flip constructive/destructive interference.
+
+## From the Source
+
+**Algorithm:** Fully analytic (closed-form) superposition — no PDE integration, no grid state, no stability condition. Unlike FDTD wave.c, the result is exact and can be paused/resumed without losing transient warmup time. Each frame recomputes u(x,y,t) = Σ sin(ωt − kr + φ) directly.
+
+**Physics/References:** Cylindrical waves (Huygens' principle). Constructive interference (crests adding): u ≈ N·A. Destructive (cancellation): u ≈ 0.
+
+**Math:** Phase precomputation: k·r computed once per source per grid cell. Per-frame cost = N_sources × W × H × sinf() calls. Aspect correction uses CELL_W=8, CELL_H=16 (standard 80×25 VT100 terminal pixel dimensions) so waves appear circular on screen.
+
+**Performance:** Phase stored per source (g_phase[s][row][col]) allows rebuilding only one source's table when that source changes, leaving other sources' tables intact. Static preallocation: g_phase[8][100][300] × 4 bytes = 960 KB — fits in static storage without malloc complexity.

@@ -87,6 +87,16 @@ Standard SPH suppresses cohesion (no negative pressure) for stability. This impl
 4. Why does symplectic Euler conserve energy approximately but regular Euler does not?
 5. How would you implement an incompressible SPH variant (PCISPH or DFSPH)?
 
+## From the Source
+
+**Algorithm:** Smoothed Particle Hydrodynamics (SPH) — a Lagrangian meshless method. No grid required; fluid described entirely by particle positions and velocities. Naïve O(N²) pair search replaced by a spatial hash grid (GCELL). GCELL ≥ SMOOTH_RADIUS ensures all neighbours within kernel radius lie in 3×3 surrounding grid cells. Typical speedup: N / avg_neighbours ≈ 800/15 ≈ 50×.
+
+**Physics/References:** Tait equation of state: pressure force proportional to (ρᵢ + ρⱼ − 2·ρ_rest). This is a simplified compressible approximation — real water is nearly incompressible, but SPH enforces incompressibility through a stiff pressure response. Viscosity force: (vᵢ − vⱼ) · V_K smooths velocity differences, preventing particle interpenetration under shear. Negative pressure (ρ < ρ_rest) pulls particles together — the surface tension analogue in this simplified model.
+
+**Math:** Kernel w = (H − r) / H for r < H (tent/linear function). Density ρᵢ = Σⱼ w²; pressure force along i→j = w·(ρ_rest − ρᵢ − ρⱼ).
+
+**Integration:** Symplectic Euler: v += a·dt, x += v·dt (velocity before position). More energy-conserving than standard Euler for oscillatory particle systems; keeps fluid from exploding at stiff contacts.
+
 ---
 
 ## Pass 2 — Implementation

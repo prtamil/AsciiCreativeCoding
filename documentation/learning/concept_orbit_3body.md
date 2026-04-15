@@ -47,6 +47,16 @@ vx2=−0.93240737, vy2=−0.86473146
 - What are the five Lagrange points and which are stable?
 - Try 4 bodies with figure-8 IC — what happens?
 
+## From the Source
+
+**Algorithm:** Velocity Verlet (same as nbody.c) in natural units G=M=1. DT=0.001 in natural time units — small enough that the figure-8 orbit stays visually stable for many minutes.
+
+**Physics/References:** Three-body problem / gravitational choreography. Unlike two-body (always an ellipse), three-body is generally chaotic — no closed-form solution exists. The figure-8 is one of the rare periodic solutions (Chenciner-Montgomery 2000). Adding perturbation ('x') breaks the symmetry and reveals the underlying chaos.
+
+**Math:** Figure-8 initial conditions in normalised units. The exact ICs were found by numerical minimisation of the action integral (not by analytical derivation). Figure-8 period T ≈ 6.3259 natural time units. At DT=0.001, one period = 6326 steps. Each step costs O(9) flops. Larger DT → the figure-8 slowly precesses and eventually escapes.
+
+**Performance:** O(N²)=O(9) force pairs — trivial. The STEPS variable controls how many Verlet steps run per rendered frame, trading simulation speed against visual smoothness.
+
 ---
 
 ## Pass 2 — Implementation

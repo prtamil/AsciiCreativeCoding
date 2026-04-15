@@ -51,6 +51,21 @@ Where: R=outer radius, r=inner radius, d=pen distance from inner center, t∈[0,
 
 ---
 
+## From the Source
+
+**Algorithm:** Parametric curve tracing with a float canvas and fade. Each curve advances `T_STEPS_PER_FRAME` timesteps per tick, writing brightness values to a float canvas. The canvas decays by `FADE_RATE` per tick, creating a fading trail effect.
+
+**Math:** Hypotrochoid parametric equations exactly as implemented:
+```
+x(t) = (R−r)·cos(t) + d·cos((R−r)/r · t)
+y(t) = (R−r)·sin(t) − d·sin((R−r)/r · t)
+```
+The curve closes when `(R−r)/r = p/q` (rational ratio). With p=3, q=1: deltoid (3-cusp astroid). Irrational ratios → curve never closes (dense in annulus). Pen distance `d` controls petal amplitude: `d < (R−r)` → inside, `d > (R−r)` → loops at each reversal point.
+
+**Rendering:** Three simultaneous curves with different `r` values. `r` drifts sinusoidally (`DRIFT_RATE`), creating continuous morphing between distinct petal patterns without keystrokes.
+
+---
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

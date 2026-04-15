@@ -92,3 +92,11 @@ diamond_square(grid, N):
 seed corners → diamond_square → heightmap[N+1][N+1]
 → normalize → (optional erosion) → height bands → ASCII render
 ```
+
+## From the Source
+
+**Algorithm:** Diamond-Square algorithm for fractal terrain generation, combined with thermal weathering erosion simulation. Diamond-Square is a 2D analogue of midpoint displacement. Step 1 (diamond): centre of each square = mean of 4 corners + random(amplitude). Step 2 (square): edge midpoints = mean of 2 opposing corners + mean of 2 adjacent diamonds + random(amplitude). Amplitude halved each iteration → fractal terrain.
+
+**Math:** Diamond-Square produces 1/f^(2H) power spectrum where H is the Hurst exponent. With amplitude_factor=0.5 (ROUGHNESS=0.60f in code) → H≈0.5 (standard Brownian surface). Thermal erosion rule: if slope > TALUS threshold (0.022f), move `RATE × (slope − TALUS)` material downhill. This rounds peaks and fills valleys, mimicking real geological weathering.
+
+**Performance:** GRID_N=6 → GRID=65×65 heightmap (2^6+1). Contour lines drawn at regular height intervals using marching squares on the interior, producing topographic map style. EROSION_RATE=0.0012f, ERODE_PASSES=2. SIM_FPS_DEFAULT=60.

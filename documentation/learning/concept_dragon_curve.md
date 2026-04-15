@@ -92,3 +92,11 @@ render(path, scale, offset):
 ORDER → turn sequence (bit trick) → turtle path
 → bounding box → scale/center transform → draw line segments
 ```
+
+## From the Source
+
+**Algorithm:** Paper-folding sequence construction. The turn sequence for generation n is: `T_n = T_{n-1}  R  reverse-complement(T_{n-1})` where R=right-turn and reverse-complement flips L↔R and reverses order.
+
+**Math:** After n folds the sequence has `2ⁿ−1` turns and `2ⁿ` segments. Gen 13 → 8191 turns, 8192 segments (N_GEN_MAX=13, MAX_SEGS=8191). The path never self-intersects (proven: each segment is unique). Tiles the plane: 4 copies of the dragon curve at rotations 0°/90°/180°/270° fill the plane without overlap, making it a rep-tile of order 4.
+
+**Performance:** Segments drawn one per frame using turtle graphics. Color encodes position in the sequence (age of segment), producing a visual record of the folding hierarchy. Aspect correction: terminal cells are 2× taller than wide, so horizontal steps are scaled by CELL_W/CELL_H ≈ 0.5.

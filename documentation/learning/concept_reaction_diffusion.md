@@ -66,3 +66,13 @@ Starting from a uniform state takes many seconds before patterns form. A seed bl
 | f | Feed rate; too high → U oversaturates; too low → V dies out |
 | k | Kill rate; tiny shifts move between completely different pattern regimes |
 | STEPS_PER_FRAME | Controls simulation vs display speed tradeoff |
+
+## From the Source
+
+**Algorithm:** Explicit (Forward) Euler integration. Each cell advances by DT=1.0 per tick. Stability requires DT · Du / dx² < 0.25 (CFL). With dx=1 cell and Du=0.20, the stability bound is 1.25 — DT=1.0 is safely within the stable region.
+
+**Math:** The 9-point isotropic Laplacian is a Fornberg-style stencil: cardinal (N/S/E/W) weight=0.20, diagonal (NE/NW/SE/SW) weight=0.05, centre=−1. The stencil sums to 0 over a flat field. This reduces the "diamond" artefacts visible in spot presets compared to the 4-point stencil.
+
+**Physics/References:** Turing instability (Alan Turing, 1952). Two chemicals with different diffusion rates (Du > Dv) plus a nonlinear autocatalytic reaction (U·V²) can spontaneously break spatial symmetry. The U·V² term means V catalyses its own production by consuming U — this activator-inhibitor dynamic is required for pattern formation. The (f,k) parameter space is the Gray-Scott map.
+
+**Performance:** Double-buffering (u/v ← u2/v2 swap) avoids read-write aliasing within a single step. All arithmetic stays in float, fitting a row in cache at moderate widths. STEPS_DEFAULT=16 sim steps per render frame trades visual smoothness for pattern evolution speed. Data structure: two flat float arrays (row-major) per chemical; one pair for reading, one for writing, swapped each step.

@@ -51,6 +51,16 @@ Critical temperature (2D Ising): `Tc = 2J / (k_B · ln(1+√2)) ≈ 2.269 J/k_B`
 - Show the specific heat C = <E²>-<E>² / (kT²) as a function of T — does it peak at Tc?
 - Try the Ising model on a triangular lattice — different Tc?
 
+## From the Source
+
+**Algorithm:** Metropolis Monte Carlo (MCMC). Randomly propose a spin flip; accept with probability `P = min(1, exp(−ΔE / kT))`. Over many steps this samples the Boltzmann distribution at temperature T. Not a physics simulation in real-time — it is a statistical sampler converging toward thermal equilibrium.
+
+**Physics:** 2D Ising model of ferromagnetism. Each spin s = ±1 interacts with nearest neighbours. `ΔE = 2·s·(sum of 4 neighbours)` — the energy cost of flipping one spin given its environment. Below T_crit ≈ 2.269 (in units where J=k_B=1), large aligned domains spontaneously appear — a textbook example of a 2nd-order phase transition. T_CRIT = 2 / ln(1 + √2) ≈ 2.2692 — exact analytical result by Lars Onsager (1944).
+
+**Math:** ΔE formula exploits the fact that the Hamiltonian is a sum of pairwise products: H = −J·Σ s_i·s_j. Flipping spin i changes H by `2·J·s_i·Σ_nbr s_j`. For J=1 this is ΔE = 2·s·Σ_nbr (values ±4, ±8, ±16 depending on alignment with 4 neighbours).
+
+**Performance:** FLIPS_PER_CELL attempts per grid cell per frame. At 200×60=12000 cells, 50 attempts each = 600k flips/frame at 30 fps ≈ 18M flip attempts/s — fast enough to see domain formation in real-time.
+
 ---
 
 ## Pass 2 — Implementation

@@ -102,6 +102,16 @@ Three display modes cycle with the `s`/`S` key:
 ### Side View — Fixed-Scale Histogram
 Each bar in the side view represents the total grain count summed down all rows of that column. The bar height is `col_sum * view_height / max_possible` where `max_possible = g_ca_rows * 3` (fixed scale — maximum possible sum if every cell holds 3 grains). This fixed scale is critical: if the scale were dynamic (normalised to the current max column sum), the bars would look the same shape even as the pile grows. With the fixed scale, bars visually grow from zero as grains accumulate, giving genuine feedback on pile growth.
 
+## From the Source
+
+**Algorithm:** Abelian Sandpile Model (Bak, Tang & Wiesenfeld, 1987). A grain is dropped on a chosen cell. If any cell has ≥ 4 grains, it "topples": loses 4 grains and gives 1 to each of its 4 (von Neumann) neighbours. Toppling can cascade into an "avalanche" affecting many cells.
+
+**Math:** The sandpile is a canonical example of Self-Organised Criticality (SOC): without any tuning, the system spontaneously evolves to a critical state where avalanche size distributions follow a power law `P(s) ∝ s^(−τ)` with τ ≈ 1.0 for 2D abelian sandpile. "Abelian" means the final state is independent of the order in which topplings are processed — a deep mathematical property proved by Dhar (1990).
+
+**Performance:** O(avalanche_size) per grain drop. Average avalanche size grows as the pile approaches the critical state. At criticality, large avalanches are rare but unbounded — the expected cost per drop diverges logarithmically. DROPS_DEF=10 grain drops per frame (default), DROPS_MAX=500 maximum.
+
+**References:** Bak, Tang & Wiesenfeld (1987) — original SOC / sandpile paper; Dhar (1990) — proof of the abelian property.
+
 ## Themes (t key)
 
 10 vivid themes, each with 4 content color pairs (G1, G2, G3, TOPPLE) plus HUD. All colors are chosen from bright regions of the xterm-256 palette — no dark or muted tones. Themes: Electric (39/51/226/201), Matrix (28/46/118/82), Nova (21/39/117/231), Poison (100/148/190/82), Ocean (24/38/45/159), Fire (196/208/226/231), Gold (136/178/220/231), Ice (30/45/159/231), Nebula (93/141/183/231), Lava (124/196/214/226).

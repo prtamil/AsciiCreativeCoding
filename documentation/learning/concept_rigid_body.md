@@ -8,6 +8,16 @@ floor, exchange momentum with friction, and eventually come to rest. Nothing
 penetrates anything. No rotation — shapes are axis-aligned so collision
 detection is fast and numerically stable.
 
+## From the Source
+
+**Algorithm:** Iterative impulse-based collision resolution (Baumgarte). SOLVER_ITERS constraint solver passes per step. Each pass: detect overlap, apply positional correction (Baumgarte stabilisation) then velocity impulse.
+
+**Physics:** 2D rigid-body mechanics with restitution and friction. Restitution (REST_DEF=0.35): e=0 → perfectly inelastic (no bounce); e=1 → perfectly elastic (infinite bounce). Friction (FRICTION=0.35): Coulomb model |jt| ≤ μ·jn. REST_THRESH: micro-bounce suppression below 0.20 px/step.
+
+**Math:** SLOP (allowed penetration depth before correction fires) = 0.05 px — absorbs floating-point noise while still resolving real overlap. BAUMGARTE (0.50): fraction of penetration corrected each iteration. 1.0 → sharp but can overshoot; 0.5 is stable.
+
+**Performance:** Sleep system — bodies sleeping for SLEEP_FRAMES quiet frames are frozen. Saves CPU; woken by impulse or position correction > WAKE_IMP.
+
 ### Mental Model
 A box of wooden blocks and rubber balls dropped onto a table. Each hit
 transfers speed along the contact line (the normal). Friction slows sliding.

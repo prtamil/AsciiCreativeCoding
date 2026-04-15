@@ -128,6 +128,18 @@ This sets the derivative dφ/dx = 0 at the left/right walls, meaning the field "
 
 Adding one cell per frame lets the Gauss-Seidel relaxation keep up: 8 passes is sufficient to re-equilibrate the field after a single new grounded point is added near the existing tree. Adding 10 cells per frame would require proportionally more relaxation passes to stay accurate, and the growth pattern would be less fractal (more Eden-like) because the field would lag behind the actual tree shape.
 
+## From the Source
+
+**Algorithm:** Dielectric Breakdown Model (DBM, Niemeyer et al. 1984). A Laplace equation `∇²φ = 0` is solved over the grid; the growing tree structure is a grounded conductor (φ=0). At each step, one frontier cell is chosen to join the tree with probability `∝ φ(x,y)^η`.
+
+**Math:** The Laplace equation `∇²φ = 0` is solved iteratively via Gauss-Seidel relaxation: `φ_{k+1}(i,j) = (φ(i±1,j) + φ(i,j±1)) / 4` (5-point stencil, repeated until convergence). At η=1: reduces to DLA (diffusion = Laplace potential). At η→∞: growth concentrates only at the highest-φ tip → a single straight needle (no branching). At η=0: growth is uniform → Eden-model-like compact blob. Default values: Tree η=1.5, Lightning η=2.5, Coral η=2.0.
+
+**Physics:** Models dielectric breakdown (lightning channels through insulating material), electrodeposition, and solidification from a supercooled melt — all governed by Laplace/diffusion equations near a growing, absorbing boundary.
+
+**Performance:** N_RELAX=8 Gauss-Seidel passes per growth step is the bottleneck. Fewer iterations → faster but less accurate φ → growth bias. The frontier set is stored explicitly for O(1) sampling. N_GROW=1 new cell per frame.
+
+**References:** Niemeyer, L., Pietronero, L. & Wiesmann, H.J. (1984) — original DBM paper.
+
 ## Open Questions for Pass 3
 
 - At what value of η does the tree transition from fractal to needle-like? Measure branch count vs η.

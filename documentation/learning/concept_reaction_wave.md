@@ -45,6 +45,16 @@ dv/dt = u - v
 - What happens when you increase D? (faster wave propagation)
 - Can two spiral waves annihilate each other?
 
+## From the Source
+
+**Algorithm:** Explicit (Forward) Euler integration of a 2-variable PDE. Each tick: compute Laplacian ∇²u with a 5-point stencil, evaluate reaction terms, update u and v from du/dt and dv/dt. Unlike Gray-Scott (autocatalytic), FitzHugh-Nagumo has a single nonlinear term (u³) making it analytically tractable.
+
+**Physics/References:** FitzHugh-Nagumo equations (1961/1962). Models cardiac action potentials (Hodgkin-Huxley simplified). u = membrane voltage (fast activator); v = recovery variable (slow inhibitor, restores resting state). Fixed point: u* ≈ −1.2, v* ≈ −0.625 (resting state). A stimulus above threshold triggers a full action potential; the refractory period (v recovery) prevents back-propagation — this is why heart-muscle waves travel as rings, not balls. FN_EPS=0.08 sets the v/u time-scale ratio; small ε → slow inhibitor → longer action potential duration.
+
+**Math:** CFL stability: FN_DT · FN_D / dx² < 0.25.
+
+**Performance:** STEPS_PER_FRAME=8 sub-steps maintain CFL stability while displaying at 30 fps. Without sub-stepping, a single larger dt would violate CFL and produce NaN or blow-up. O(W×H) per step with a fixed 5-point Laplacian stencil.
+
 ---
 
 ## Pass 2 — Implementation

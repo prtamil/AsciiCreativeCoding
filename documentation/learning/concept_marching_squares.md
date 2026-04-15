@@ -48,6 +48,16 @@ Two ambiguous cases exist (case 5 and case 10 — checkerboard pattern) where tw
 - Characters chosen from `|`, `−`, `/`, `\`, `+`, `X`, `.` based on which edges cross and at what angle — gives a directional line appearance instead of a uniform dot
 - Contour character can optionally use the interpolated position to pick a sub-cell character (half-step precision with `▌`, `▐`, `▀`, `▄`)
 
+## From the Source
+
+**Algorithm:** Marching Squares — the 2-D analogue of Marching Cubes (Lorensen & Cline, 1987). Classifies each 2×2 cell by a 4-bit index (inside/outside per corner), looks up which of the 16 possible edge-crossing patterns applies, then draws an ASCII character at each crossing position.
+
+**Math:** Metaball potential field: f(x,y) = Σ A_i / r_i² where r_i = distance from point (x,y) to source i. This is the gravitational potential of multiple point masses. When f(x,y) = threshold, the iso-contour is the locus of equal potential — it encircles sources and merges blobs when sources are close enough (classic "organic" metaball look).
+
+**Rendering:** Terminal cells are ~2× taller than wide (ASPECT=0.5). The field is sampled at (col × ASPECT, row) in world space to correct for this and produce circular blobs on screen.
+
+**Performance:** O(W×H) per frame. The scalar field is re-evaluated at every grid corner each frame (N_BLOBS × W × H evaluations). No caching because blob positions change every frame. Multi-level mode draws 5 iso-contours with one pass over the same pre-evaluated corner values.
+
 ### Non-Obvious Design Decisions
 - **Why terminal cells instead of sub-pixel grid?** Sub-cell grids (2×2 or 4×4 per character) give finer resolution but require more computation. Character-aligned grid is the simplest approach and fast enough for real-time.
 - **Why linear interpolation?** It's the standard and gives C0-continuous contours (no kinks at cell boundaries). Cubic interpolation would give C1 (smooth normals) but isn't needed for ASCII output.

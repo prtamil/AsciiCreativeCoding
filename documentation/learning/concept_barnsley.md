@@ -119,6 +119,14 @@ Screen rows increase downward; IFS coordinates have y increasing upward. The `y_
 
 One iteration per frame at 30 fps would take minutes to fill the attractor. Running 8,000 iterations per frame fills the fern visibly in about 1 second and continues building density smoothly.
 
+## From the Source
+
+**Algorithm:** Chaos game (IFS attractor via random iteration). Rather than recursively subdividing regions, the attractor is found by iterating: pick a random transform, apply it to the current point, plot the result. After discarding the first few transient iterates (burn-in), the orbit is on the attractor. Due to Barnsley's theorem: any IFS with a contractivity condition < 1 has a unique compact attractor.
+
+**Math:** Each transform is an affine map `T_i(x,y) = A_i·[x,y]ᵀ + b_i` where A_i is a 2×2 matrix. The probability p_i of choosing transform i should be proportional to `|det(A_i)|` for uniform density across the attractor parts. For the Barnsley fern, stem (T₁, tiny |det|) needs only p₁=1% while main leaflets (T₂, |det|≈0.85) need p₂=85%.
+
+**Performance:** Density grid used rather than drawing individual points — accumulates hit counts per cell and log-normalises for display. LCG random number generator (`g_lcg * 1664525 + 1013904223`) with cap at HITS_CAP=60,000 (uint16_t headroom). ITERS_DEFAULT=8000 per frame fills the fern visibly in about 1 second.
+
 ## Open Questions for Pass 3
 
 - What is the **Hausdorff dimension** of each attractor? The Barnsley fern's theoretical value is ≈1.86. Measure it by box-counting on the hit grid.

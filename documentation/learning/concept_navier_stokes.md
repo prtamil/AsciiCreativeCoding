@@ -46,6 +46,16 @@ Density field follows same diffuse+advect (no projection).
 - What visual effect does increasing VISC have?
 - Why does the projection step need boundary handling?
 
+## From the Source
+
+**Algorithm:** Jos Stam's "Stable Fluids" (SIGGRAPH 1999). Operator-splitting approach: separately handles diffusion, projection (divergence removal), and advection. Each sub-step is unconditionally stable — no CFL limit.
+
+**Physics/References:** Incompressible Navier-Stokes: ∂u/∂t = −(u·∇)u + ν∇²u + f (momentum); ∇·u = 0 (incompressibility). The projection step enforces ∇·u=0 via a Poisson solve for the pressure correction field. Kinematic viscosity reference: water ≈ 1e-6 m²/s; air ≈ 1.5e-5 m²/s; VISC_INIT=1e-5 in grid²/step units so vortices persist visually.
+
+**Math:** Gauss-Seidel solves both diffusion and pressure Poisson systems. ITER=16 is enough for N=80: residual decays geometrically per pass. Semi-Lagrangian advection (back-trace + bilinear interp) is first-order accurate but unconditionally stable for large dt.
+
+**Performance:** O(N²·ITER) per frame. At N=80, ITER=16: ~100k operations per step, trivial at 30 fps. Larger ITER → less "leaky" incompressibility, more CPU. Grid size N=80 fits most terminals; total cells = N²=6400.
+
 ---
 
 ## Pass 2 — Implementation

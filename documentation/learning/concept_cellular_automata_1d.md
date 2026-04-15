@@ -68,6 +68,16 @@ Many rules produce boring results (all dead, all alive, simple stripes). The 17 
 ### Why live digit input for custom rules?
 The presets are a starting point, but part of the joy of cellular automata is exploring. Allowing any rule number 0–255 to be entered directly invites experimentation.
 
+## From the Source
+
+**Algorithm:** Wolfram Elementary Cellular Automaton (ECA), introduced by Stephen Wolfram (1983). A 1-D binary row evolves by applying an 8-bit lookup table (the rule): each cell's new state depends on itself and its two neighbours — 2³=8 neighbourhood configurations → 256 possible rules.
+
+**Math:** Rule encoding: the 3-bit neighbourhood (left, center, right) is treated as a binary number 0–7; the rule's n-th bit gives the new center state for neighbourhood n. Example: Rule 110 = 0b01101110 → bit[n] = (110>>n)&1.
+
+**Physics:** Rule 110 is Wolfram Class 4 and is Turing-complete (Cook, 2004).
+
+**Performance:** Each row update is O(cols) — single pass with bitwise neighbourhood extraction. No double buffer needed since rows are computed top-to-bottom from the previous row only.
+
 ## Key Constants
 
 | Constant | Effect |

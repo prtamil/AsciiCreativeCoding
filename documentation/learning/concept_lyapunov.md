@@ -137,6 +137,16 @@ Once x leaves (0,1) it diverges to ±∞ in subsequent steps. Detecting this ear
 
 For most sequences in `[2.5, 4.0]²`, λ stays within this range. Points with |λ| > 4 are near degenerate fixed points or escaped orbits — marking them black (level 0) removes visual noise at the corners and lets the interesting structure fill the frame.
 
+## From the Source
+
+**Algorithm:** Lyapunov exponent measurement via logistic map iteration. For each pixel (a, b), iterate the logistic map using a sequence string that alternates between r=a and r=b: `x_{n+1} = r_n · xₙ · (1−xₙ)`. The Lyapunov exponent `λ = (1/N) Σ ln|df/dx| = (1/N) Σ ln|r(1−2x)|` measures the average rate of divergence of nearby trajectories.
+
+**Math:** λ < 0: stable (orbit converges to a fixed point or cycle). λ = 0: bifurcation boundary (marginally stable). λ > 0: chaotic (nearby orbits diverge exponentially at rate eˡ). The fractal boundary between stable (blue) and chaotic (red) regions is the "Markus-Lyapunov fractal" (Markus, 1990). Different symbol sequences (AB, AAB, AABAB …) produce different fractal patterns because the alternation pattern of r_a and r_b changes the effective "average" dynamics.
+
+**Performance:** Two rows per frame (ROWS_PER_FRAME=2) progressive rendering, so the image builds top-to-bottom in ~H/2 frames. N_TRANSIENT=100 iterations are discarded before measuring λ to remove initial-condition effects. LYAP_ITERS=200 steps accumulated per pixel.
+
+**References:** Markus-Lyapunov fractal named after Mario Markus (1990 publication on the fractal boundary between order and chaos in the logistic parameter plane).
+
 ## Open Questions for Pass 3
 
 - What is the **Hausdorff dimension** of the stable/chaotic boundary? It is conjectured to be fractal (between 1 and 2). Measure by counting boundary pixels at different resolutions.

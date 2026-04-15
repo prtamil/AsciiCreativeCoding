@@ -117,6 +117,14 @@ ACCUMULATING ──── samples_done >= TOTAL_SAMPLES ────► HOLDING 
 - How exactly are re_range_inv and im_range_inv precomputed — are they simply 1/(re_max - re_min)?
 - Does TOTAL_SAMPLES count all random samples (including rejected ones in pass 1) or only accepted ones?
 
+## From the Source
+
+**Algorithm:** Two-pass orbit tracing — a sampling-based density estimator. Pass 1 (quick): iterate z→z²+c to check if c escapes. Pass 2 (trace): if c escapes, re-iterate and increment a density counter at every orbit point that falls in-bounds. Fundamentally different from escape-time rendering: escape-time asks "how long until escape?"; Buddhabrot asks "which cells do escaping orbits visit?".
+
+**Math:** Cardioid skip: main cardioid satisfies `|c − (z²−z)| < |z|`; period-2 bulb: `|(c + 1.25)| < 0.25`. Skipping these avoids the densest (most boring) samples that never escape. The Anti-Buddhabrot uses bounded (non-escaping) orbits. The Nebulabrot weights by iteration count: high-iter orbits contribute more, emphasising near-boundary detail.
+
+**Performance:** O(MAX_ITER) per sample in the worst case (near-boundary orbits). Density grid is log-normalised each draw: brightness ∝ log(count). Image converges stochastically as more samples accumulate; TOTAL_SAMPLES=150,000 controls when the display cycles to the next preset.
+
 ---
 
 # Pass 2 — buddhabrot: Pseudocode

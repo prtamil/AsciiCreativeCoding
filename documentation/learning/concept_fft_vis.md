@@ -59,6 +59,14 @@ double X_mag[N/2];       // frequency-domain magnitudes
 4. How would you implement a real-time audio FFT using this same butterfly?
 5. What is the Nyquist limit and why can you only display N/2 bins?
 
+## From the Source
+
+**Algorithm:** Cooley-Tukey radix-2 DIT (Decimation-In-Time) FFT. Recursively splits the N-point DFT into two N/2-point DFTs of even- and odd-indexed samples, then combines with twiddle factors W_N^k = exp(-2πi·k/N). Complexity: O(N log₂ N) multiplications vs O(N²) for the naive DFT — for N=128: 896 vs 16,384 operations.
+
+**Math:** DFT linearity: sum of sinusoids → sum of delta spikes in the frequency domain. Parseval's theorem: Σ|x[n]|² = (1/N)·Σ|X[k]|² — total power is conserved between time and frequency domains.
+
+**Performance:** N_FFT must be a power of 2 for the radix-2 butterfly. In-place bit-reversal permutation reorders samples before the butterfly stages, requiring no auxiliary buffer.
+
 ---
 
 ## Pass 2 — Implementation

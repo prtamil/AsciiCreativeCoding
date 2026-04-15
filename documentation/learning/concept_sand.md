@@ -1,5 +1,17 @@
 # Pass 1 — sand.c: Cellular automaton falling sand simulation with age-based visuals and wind
 
+## From the Source
+
+**Algorithm:** Cellular Automaton (CA) with probabilistic update order. Rules applied bottom-to-top (row y = rows-1 → 0) so grains that fell this tick don't cascade infinitely in one step. Column order is shuffled each row (Fisher-Yates) to prevent directional bias — without shuffling, sand would always prefer the left diagonal.
+
+**Physics:** Models angle of repose — the maximum slope stable sand can maintain before avalanching. The two-diagonal CA rule approximates this: a grain slides diagonally if the cell directly below is blocked, creating ~45° pile slopes. Real dry sand angle of repose ≈ 30–35°; CA gives ~45° because only one diagonal is checked at a time (no multi-step sliding).
+
+**Wind:** Probabilistic horizontal drift for unsettled grains (age < AGE_SMALL). P(drift) = |wind| / WIND_PROB_DEN. Only young grains drift — settled sand is too heavy to move, matching the physical model of light airborne particles.
+
+**Performance:** O(W×H) per tick. The `moved[]` flag array prevents double-processing; without it a grain could move multiple cells per tick. Per-tick scratch arrays (nxt, nxt_age) avoid in-place mutation during the scan (double-buffering pattern). Per-grain age (stationary ticks) encodes visual compaction; age resets to 0 on any movement.
+
+---
+
 ## Core Idea
 
 A 2D grid of cells, each either empty or containing one grain of sand. Every tick, each grain tries to fall downward following simple physics rules. Grains that have been sitting still for a long time change their visual appearance from bright individual specks to dark compressed mass, simulating compaction over time. A wind force can make airborne grains drift sideways.

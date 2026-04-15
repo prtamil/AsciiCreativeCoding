@@ -93,6 +93,14 @@ No explicit state machine. The auto-reset is triggered by a row threshold, not a
 - When multiple direction contacts occur simultaneously (a corner), which probability is used?
 - Does the auto-reset preserve seed positions or randomize them?
 
+## From the Source
+
+**Algorithm:** Anisotropic Diffusion-Limited Aggregation (DLA). Standard DLA: a random walker sticks to the aggregate with probability 1.0 regardless of contact direction. Anisotropic DLA: the sticking probability depends on the direction of contact — high for upward growth (coral tip absorbing nutrients falling from above), low for downward.
+
+**Math:** In standard DLA, the fractal dimension D ≈ 1.7 in 2D. Anisotropy shifts D — stronger upward bias → more elongated, less branchy aggregate with higher effective D in the vertical. The aggregate is "scale-free": branching density is constant at every magnification (self-similar fractal structure). Sticking probabilities: STICK_P_BELOW=0.90 (frozen cell directly below walker), STICK_P_SIDE=0.40 (to the left or right), STICK_P_ABOVE=0.10 (directly above walker).
+
+**Physics:** The directional probabilities model real coral and crystal growth: nutrients diffuse from above, so upward-facing surfaces have higher capture probability. The gravity-biased walk (50% down, 20% up) models sinking nutrient particles rather than symmetric diffusion.
+
 ---
 
 # Pass 2 — coral: Pseudocode

@@ -105,6 +105,14 @@ DRAWING ──── seg_draw_index >= n_segs ────► HOLDING (done_tick
 - Does the code reset to level 1 on resize, or continue from the current level?
 - At level 5, many segments are sub-pixel. How does Bresenham handle a segment shorter than one cell — does it produce one cell mark or zero?
 
+## From the Source
+
+**Algorithm:** Iterative edge-replacement (segment subdivision). At each level, every existing segment is replaced by 4 shorter segments: A→P, P→M, M→Q, Q→B where M is the equilateral bump peak. No recursion stack needed: segments are stored in a flat array and a new array is generated each level.
+
+**Math:** After n levels: segment count = `3 × 4ⁿ` (starts with triangle = 3 segments); segment length = `(1/3)ⁿ` of original edge; total perimeter = `(4/3)ⁿ × original → ∞` as n → ∞; area enclosed converges to `(2/5) × area of original triangle`. Fractal dimension: `D = log(4)/log(3) ≈ 1.26` (more than a curve, less than a surface). Precomputed constants: SIN60=0.8660254f, COS60=0.5f.
+
+**Performance:** MAX_SEGS=4096 (level 5 → 3 × 4⁵ = 3072; 4096 gives safe margin). Segments drawn one per frame as an animated "drawing" effect. The bump peak M is computed by rotating the direction vector by ±60° (equilateral triangle geometry). ASPECT_R corrects for non-square terminal cells.
+
 ---
 
 # Pass 2 — koch: Pseudocode

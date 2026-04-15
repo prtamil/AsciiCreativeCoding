@@ -44,6 +44,16 @@ separate each ball by overlap/2 along n̂
 - Add a "heavy ball" with 10× mass — what changes?
 - Show the collision normal vector as a drawn line during impact
 
+## From the Source
+
+**Algorithm:** Impulse-based elastic collision resolution. For each overlapping pair, a single impulse along the collision normal simultaneously adjusts both velocities so the constraint (non-penetration + elastic restitution) is satisfied in one step.
+
+**Physics:** Conservation laws for elastic collisions: (1) Conservation of momentum: m₁v₁ + m₂v₂ = const; (2) Conservation of kinetic energy: ½m₁v₁² + ½m₂v₂² = const. Combined, for collision along normal n̂: `impulse J = 2·m₁·m₂/(m₁+m₂) · Δv·n̂`. Velocities updated: `v₁ -= J/m₁·n̂`; `v₂ += J/m₂·n̂`.
+
+**Performance:** O(N²) pair checks per tick — acceptable for N=25. For N>100 broad-phase (spatial hash or sweep-and-prune) would reduce to O(N) average checks.
+
+**Physics:** Mass model: mass = r² (area of 2D disc × uniform density). Heavier discs (larger radius) deflect smaller ones more, matching intuition about billiard balls.
+
 ---
 
 ## Pass 2 — Implementation

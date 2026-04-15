@@ -46,6 +46,16 @@ Fortune's algorithm: O(N log N) sweep line, but for ASCII terminal:
 
 ---
 
+## From the Source
+
+**Algorithm:** Brute-force Voronoi — O(cells × seeds) per frame. Efficient for small N (N_SEEDS ≤ 30); for larger N, Fortune's sweep-line algorithm gives O(N log N).
+
+**Math:** The dual graph of the Voronoi diagram is the Delaunay triangulation — every Voronoi edge connects the circumcentres of two Delaunay triangles. Border detection: a cell is a border cell when the distances to the nearest seed and second-nearest seed differ by less than `BORDER_PX`. This approximates the Voronoi edge without exact line computation.
+
+**Physics:** Seeds move under the Langevin equation: `dv/dt = −γ·v + σ·ξ` (ξ = white noise). This is the Ornstein-Uhlenbeck process — Brownian motion with mean-reverting velocity. Terminal speed = NOISE/DAMP.
+
+---
+
 ## Pass 2 — Implementation
 
 ### Pseudocode

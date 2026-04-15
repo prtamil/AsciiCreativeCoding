@@ -214,3 +214,13 @@ for each monopole i:
 - Are 16 seeds per pole enough to cover the full angular fan, or do diagonal angles produce visible gaps?
 - Does the aspect correction hold at very non-square terminal dimensions (e.g., 200×24)?
 - Is SEED_R=1.2 always outside the softening zone, or does it clip for large SOFT values?
+
+## From the Source
+
+**Algorithm:** RK4 streamline integration of a vector field. A field line is a curve always tangent to B(r). Starting at seed points near the positive poles, RK4 integrates `dx/ds = B(x)/|B(x)|` (unit step along B). Step size RK4_H=0.35 cells balances visual resolution against the cost of 600 RK4 steps per line.
+
+**Physics:** Magnetic dipole field (monopole approximation). A bar magnet is modelled as two equal-and-opposite magnetic charges (monopoles) at its ends. Each monopole contributes B ∝ q·r̂/r² (Coulomb-like). The total field is the vector superposition. This is the dipole approximation valid for r >> dipole length.
+
+**Math:** Null points (where B=0) occur between opposing poles. Integration halts near null points (B_MIN threshold) because the step direction becomes numerically unstable (dividing by |B| → ∞ near B=0).
+
+**Performance:** Lines traced progressively (LINES_PER_TICK per frame). This keeps the UI responsive during tracing — each tick draws a few more lines rather than blocking for seconds.

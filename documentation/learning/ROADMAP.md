@@ -77,6 +77,25 @@ Introduces differential equations and numerical integration.
 
 ---
 
+## Tier 2.5 — Character Animation (2–3 months)
+**Prerequisites: Tier 2 (Verlet integration, spring-mass, constraint solvers).**
+Bridges kinematic geometry with the physics patterns from Tier 2. Introduces articulated bodies, procedural locomotion, and constraint-based simulation at the character scale.
+
+| File | Subject | Key Math |
+|---|---|---|
+| `snake_forward_kinematics.c` | Circular trail-buffer FK, bead rendering, 10 themes | Sinusoidal heading, ring-buffer position chain |
+| `snake_inverse_kinematics.c` | IK head steering with FK body | Multi-harmonic wandering target, trail-buffer FK |
+| `fk_centipede.c` | Trail-buffer FK body + stateless sinusoidal FK legs | Contralateral antiphase gait, phase-offset per leg pair |
+| `fk_tentacle_forest.c` | Pure stateless sinusoidal FK, multi-tentacle scene | Per-tentacle phase/frequency/amplitude parameters |
+| `fk_medusa.c` | Bell oscillation FK + trailing tentacle FK | Radial bell deformation, cascaded FK chains |
+| `ik_arm_reach.c` | FABRIK iterative IK (2-pass solver) | Forward/backward reaching passes, Lissajous target path |
+| `ik_spider.c` | 2-joint analytical IK, procedural stepping | Law of cosines, step trigger + lerp, trail-buffer body |
+| `ik_tentacle_seek.c` | FABRIK on seeking tentacles | Wandering target, per-segment reach tolerance |
+| `ragdoll_figure.c` | Verlet ragdoll skeleton | Verlet integration, iterative distance-constraint projection |
+| `ragdoll_ropes.c` | Verlet rope chains, multi-rope sway | Damping, phase-offset anchors, constraint relaxation |
+
+---
+
 ## Tier 3 — Fluid and Continuous Systems (3–4 months)
 Requires partial differential equations and numerical stability.
 
@@ -179,10 +198,11 @@ Agent-based simulation, graph algorithms, complex systems.
 |---|---|---|
 | Month 1–2 | Framework + Tier 1 | Rewrite 5 Tier 1 files from scratch |
 | Month 3–5 | Tier 2 | Understand RK4, Verlet; rewrite lorenz from paper |
-| Month 6–9 | Tier 3 | Implement Gray-Scott and Navier-Stokes from equations alone |
-| Month 10–14 | Tier 4 | Derive Crank-Nicolson; implement Ising from Metropolis paper |
-| Month 15–18 | Tier 5 | Build a software rasterizer from scratch |
-| Month 19–24 | Combine + Create | Your own topic, your own algorithm |
+| Month 6–8 | Tier 2.5 — Character Animation | Implement FK chain from scratch; solve a 2-joint IK analytically; build a Verlet ragdoll |
+| Month 9–12 | Tier 3 | Implement Gray-Scott and Navier-Stokes from equations alone |
+| Month 13–17 | Tier 4 | Derive Crank-Nicolson; implement Ising from Metropolis paper |
+| Month 18–21 | Tier 5 | Build a software rasterizer from scratch |
+| Month 22–24 | Combine + Create | Your own topic, your own algorithm |
 
 ---
 
@@ -192,6 +212,7 @@ Agent-based simulation, graph algorithms, complex systems.
 |---|---|
 | 1 | *The Nature of Code* — Daniel Shiffman |
 | 2 | *Physics-Based Animation* — Kenny Erleben |
+| 2.5 | *Computer Animation: Algorithms and Techniques* — Rick Parent |
 | 3 | *Fluid Simulation for Computer Graphics* — Robert Bridson |
 | 4 | *Statistical Mechanics* — Reif; *Quantum Mechanics* — Griffiths |
 | 5 | *Real-Time Rendering* — Akenine-Möller |

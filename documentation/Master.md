@@ -1799,6 +1799,53 @@ Quantum tunnelling is visible when the packet encounters a potential barrier `V 
 
 ---
 
+#### D17 Tripod Gait FSM — Timer + Landing Condition
+
+A hexapod's six legs split into two groups that alternate stepping. The gait state machine advances a `phase_timer` each tick and transitions only when two conditions are both true: `phase_timer ≥ PHASE_DURATION` and every leg in the current stepping group has landed (`stepping[i] == false` for all three). The dual condition is essential: at low speeds a foot may still be swinging when the timer expires; at high speeds the timer may not expire before all feet land. Requiring both prevents mid-air group launches.
+
+On transition, the new group's legs snapshot their current positions as `foot_old`, compute a new `step_target = rest_target(hip, i)` (hip offset plus forward lookahead), and set `stepping = true`. The step animation advances `step_t ∈ [0,1]` each tick at rate `dt / STEP_DURATION`. Horizontal progress uses `smoothstep(step_t)` for ease-in/ease-out; vertical arc uses `−STEP_HEIGHT × sin(π × step_t)` on the raw `step_t` for a symmetric bell curve.
+
+*Files: `animation/hexpod_tripod.c`*
+
+---
+
+#### D18 Two-Joint Analytical IK — Law of Cosines
+
+Given hip H and foot T with femur length U and tibia length L:
+
+1. `dist = clamp(|T−H|, |U−L|+1, U+L−1)` — project to reachable shell
+2. `base = atan2(dy, dx)` — polar angle from hip to foot
+3. `cos_h = (dist² + U² − L²) / (2·dist·U)` — law of cosines for the hip angle
+4. `ah = acos(clamp(cos_h, −1, 1))` — hip half-angle
+5. Knee angle: `base − ah` (left legs, knee bends outward above body) or `base + ah` (right legs, knee bends outward below body)
+6. `knee = hip + U × (cos(knee_angle), sin(knee_angle))`
+
+The `clamp` before `acos` prevents NaN when floating-point rounding pushes `cos_h` outside `[−1, 1]`. The sign choice (subtract vs. add `ah`) controls which side of the hip-foot line the knee sits on; this must match the physical anatomy — legs on opposite sides of the body need opposite signs.
+
+The key insight for rotation-invariant IK: the sign convention is fixed relative to the leg's side (left/right), not relative to world axes. For any body heading the left knee always bends in the correct outward direction because `base` already encodes the current hip-to-foot angle in world space.
+
+*Files: `animation/hexpod_tripod.c`, `animation/ik_spider.c`*
+
+---
+
+#### D19 Angular Interpolation — Short-Arc Heading Steering
+
+Directly adding `(target − current) × rate` to a heading angle fails when the angles cross the ±π branch cut: a 350° → 10° turn computes a −340° difference instead of the correct +20°. The fix is to normalise the difference to `[−π, π]` before clamping:
+
+```c
+float diff = target - current;
+while (diff >  M_PI) diff -= 2*M_PI;
+while (diff < -M_PI) diff += 2*M_PI;
+float turn = clamp(diff, -RATE*dt, RATE*dt);
+current += turn;
+```
+
+The `while` loops (not `if`) handle the rare case where multiple full revolutions accumulate. The clamped turn rate ensures the robot turns gradually regardless of how large the target change is — pressing the opposite arrow key produces a smooth U-turn rather than an instant snap. The same normalisation is needed when alpha-lerping heading in the render layer.
+
+*Files: `animation/hexpod_tripod.c`*
+
+---
+
 ### E — Cellular Automata & Grid Simulations (new entries)
 
 #### E6 Hexagonal Grid CA — Offset-Row Neighbour Addressing

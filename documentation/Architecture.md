@@ -3717,4 +3717,47 @@ Same inverse-ray-transform approach as cube and capsule: rotate the ray into obj
 
 *Files: `raytracing/torus_raytrace.c`*
 
+---
+
+## 112. Hexapod Tripod Walker — animation/hexpod_tripod.c
+
+Six-legged robot that walks across the terminal in any direction using a **tripod gait** and **per-leg 2-joint analytical IK**. The body is a rigid rectangle; the robot steers via arrow keys with gradual angular interpolation, and wraps toroidally at all four screen edges.
+
+### Tripod Gait Architecture
+
+Six legs are statically assigned to two interlocked groups:
+
+- **Group A** = {0 left-front, 3 right-mid, 4 left-rear}
+- **Group B** = {1 right-front, 2 left-mid, 5 right-rear}
+
+Each group forms a support triangle. While one triangle swings, the other three planted feet hold the body stable — the robot never has fewer than three ground contacts. The transition FSM requires two simultaneous conditions before switching groups: `phase_timer ≥ PHASE_DURATION` AND every leg in the current group has landed. This prevents switching while a foot is still in the air at slow speeds where `PHASE_DURATION` expires before `STEP_DURATION`.
+
+Each swinging foot follows a parabolic arc: horizontal position uses `smoothstep` ease between `foot_old` and `step_target`; vertical offset uses `−STEP_HEIGHT × sin(π × step_t)` with the raw (un-eased) `step_t`, giving a symmetric bell curve rather than a front-weighted or back-weighted lift.
+
+### 2-Joint Analytical IK Pipeline
+
+Given hip H and foot target T:
+
+1. `dist = clamp(|T−H|, |U−L|+1, U+L−1)` — clamp to reachable range
+2. `base = atan2(T.y−H.y, T.x−H.x)` — direction to target
+3. Law of cosines: `cos_h = (dist² + U² − L²) / (2·dist·U)`, `ah = acos(cos_h)`
+4. Left legs (even index): `knee_angle = base − ah` → knee bends toward −y (outward up)
+5. Right legs (odd index): `knee_angle = base + ah` → knee bends toward +y (outward down)
+
+The sign convention is **opposite** to `ik_spider.c`. In the spider the hips extend along a sinusoidal heading so the knee must flip around the heading vector. In the hexapod the hips extend perpendicular to the body axis (±y), so the signs are reversed for correct outward knee bend.
+
+### Heading-Based Rotation System
+
+All hip attachment positions and rest foot targets are defined in body-local space (body faces +x). `rotate2d(v, heading)` transforms them to world space each tick. This means the same static tables `HIP_LOCAL_X/Y` and `REST_FORWARD/SIDE` work for any heading — no per-direction special cases. The render layer performs a short-arc heading lerp between `prev_heading` and `heading` using the same ±π normalization trick to avoid a visual snap when heading crosses ±π.
+
+### Stretch-Snap Mechanism
+
+After a toroidal edge wrap or rapid turn, the hip can teleport away from a planted foot. If `|hip − foot| > UPPER_LEN + LOWER_LEN − 2`, the IK solver would receive an out-of-reach target and clamp artificially. The stretch-snap check runs after every hip recompute: it teleports the foot to `rest_target()` immediately (no swing animation) so the solver always receives a valid target. This prevents the one-frame "stretched leg" artifact.
+
+### Sub-tick Alpha Interpolation
+
+Physics runs at 60 Hz in a fixed-step accumulator. Between ticks, `alpha = sim_accum / tick_ns` linearly interpolates all positions (`prev_*` → current) before drawing. Heading uses short-arc lerp: `bh = prev_heading + normalize(heading − prev_heading) × alpha`. This decouples render frame rate from physics rate, producing smooth motion even at low sim Hz settings.
+
+*Files: `animation/hexpod_tripod.c`*
+
 *This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `physics/bounce_ball.c`.*

@@ -9,7 +9,7 @@
    ╚═╝     ╚══════╝  ╚═╝  ╚═╝  ╚═╝     ╚═╝    blackhole.c  terminal as canvas
 ```
 
-130 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+146 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -153,6 +153,16 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `terrain` | Diamond-square heightmap — thermal erosion, 7 contour levels |
 | `perlin_landscape` | Perlin fBm — 3 parallax terrain layers, 5-octave noise, painter's algorithm |
 
+### Animation & Kinematics
+| Program | Algorithm |
+|---------|-----------|
+| `hexpod_tripod` | 6-legged robot — tripod gait (alternating support triangles), 2-joint analytical IK (law of cosines), 4-direction steering with angular interpolation, toroidal wrap |
+| `ik_spider` | IK spider — sinusoidal body locomotion, 2-joint IK per limb, step-trigger gait |
+| `ik_arm_reach` | 2-joint arm — mouse-driven IK reach with elbow-side toggle |
+| `ragdoll_figure` | Ragdoll stick figure — constraint-projected Verlet joints, momentum carry-over |
+| `snake_inverse_kinematics` | FABRIK inverse kinematics snake — iterative forward/backward reach solver |
+| `fk_centipede` | Centipede — forward kinematics body chain, leg phase offsets |
+
 ### Artistic / Biological
 | Program | Algorithm |
 |---------|-----------|
@@ -245,6 +255,7 @@ See `Claude.md` for the complete build list.
 ├── raster/            — software rasterizer (torus, cube, sphere)
 ├── raymarcher/        — SDF ray marching
 ├── raytracing/        — analytic ray tracing (sphere, cube, torus, capsule)
+├── animation/         — kinematics, IK solvers, legged locomotion
 ├── ncurses_basics/    — framework reference implementations
 └── documentation/
     ├── Claude.md          — complete build reference

@@ -1097,4 +1097,52 @@ The wall rendering draws space characters `' '` with the black-on-black pair, pr
 
 **When to use:** Any visualization where structural regions (walls, barriers, backgrounds) should read as solid fills rather than drawn outlines. Setting both fg and bg to the same color is the minimal "block fill" technique.
 
+---
+
+## 39. Role-Based Pair Semantics — Robot/Mechanical Palette
+
+**Where:** `animation/hexpod_tripod.c`
+
+**How it works:**
+Each color pair is assigned a fixed semantic role rather than a free color slot. This means the Theme struct just stores one color per role, and swapping themes changes all eight pairs simultaneously with a single `theme_apply()` call — the rendering code never changes.
+
+The seven roles used in the hexapod:
+
+| Pair | Role | Visual purpose |
+|------|------|----------------|
+| 1 | body frame | Rectangle edges, cross-braces, hip markers |
+| 2 | femur | Hip → knee segment lines |
+| 3 | tibia | Knee → foot segment lines |
+| 4 | planted foot | `*` marker — bright accent, high contrast |
+| 5 | stepping foot | `o` marker — dim, in-flight / transient |
+| 6 | knee joint | `o` marker — bold, structural mid-joint |
+| 7 | reserved | Unused; available for floor grid or debug |
+| 8 | HUD | Status bar text — always high contrast |
+
+```c
+typedef struct {
+    const char *name;
+    int col[N_PAIRS];   /* foreground color index per role (pairs 1–7) */
+    int hud;            /* pair 8 foreground */
+} Theme;
+
+static const Theme THEMES[N_THEMES] = {
+    /* name     body  femur  tibia  plant  step   knee  rsvd  hud  */
+    {"Steel",  {245,  67,   75,   46,  214,  231,  238}, 226},
+    {"Cobalt", {237,  27,   39,   46,  208,  231,  236}, 226},
+    {"Copper", {242, 130,  172,   46,  214,  231,  238}, 220},
+    {"Toxin",  {234,  34,   40,   46,   82,  231,  237},  46},
+    {"Ember",  {239, 130,  136,   46,  208,  231,  238}, 208},
+    {"Ghost",  {240, 251,  254,   46,  252,  255,  238}, 253},
+    {"Neon",   {235,  93,  201,   46,  226,  255,  237}, 197},
+    {"Ocean",  {234,  27,   51,   46,   51,  231,  237},  51},
+};
+```
+
+The planted-foot pair (4) is always 256-color green (46) across every theme — it must be immediately visible regardless of which theme is active, since spotting which feet are down is the primary visual feedback for the gait.
+
+**Design principle:** Assign roles before choosing colors. The question "what does this color communicate?" (planted/stepping/structural) is answered once in the role assignment; the per-theme colors then just tune aesthetics without breaking communication.
+
+**When to use:** Any simulation with multiple visually distinct element classes that need to remain perceptually separable across all themes. Separating "what this color means" (role) from "what this color is" (palette) makes theme switching trivially safe.
+
 **Effect:** The maze reads immediately as a physical structure — dark solid walls, light open passages, and a glowing blue-green solution path, without any box-drawing characters or Unicode blocks.

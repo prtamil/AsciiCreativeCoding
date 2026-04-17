@@ -70,7 +70,8 @@
  * Keys:
  *   q / ESC       quit
  *   space         pause / resume
- *   ↑ / ↓         move speed faster / slower
+ *   arrow keys    steer in 4 directions (gradual turn)
+ *   w / s         speed faster / slower
  *   [/]           raise / lower simulation Hz
  *
  * Build:
@@ -159,8 +160,7 @@ enum {
 #define BODY_SPEED        45.0f   /* head translation speed, px/s          */
 #define BODY_SPEED_MIN    10.0f
 #define BODY_SPEED_MAX   200.0f
-#define TURN_AMP          0.40f   /* sinusoidal turn amplitude, rad/s      */
-#define TURN_FREQ         0.50f   /* sinusoidal turn frequency, rad/s      */
+#define TURN_RATE          2.5f   /* rad/s — steering rate toward target heading */
 
 /* IK leg geometry */
 #define UPPER_LEN         50.0f   /* hip-to-knee segment length, px        */
@@ -432,7 +432,8 @@ typedef struct {
     int   trail_head, trail_count;
     Vec2  body_joint[N_BODY_SEGS + 1];
     Vec2  prev_body[N_BODY_SEGS + 1];
-    float heading, wave_time;
+    float heading;          /* current direction (rad, 0=right)    */
+    float target_heading;   /* desired direction set by arrow keys  */
     float move_speed;
 
     /* ── legs ── */
@@ -496,21 +497,19 @@ static Vec2 trail_sample(const Spider *sp, float dist)
 /* ── §5c  body motion ──────────────────────────────────────────────── */
 
 /*
- * move_body() — advance sinusoidal heading + translate body_joint[0].
+ * move_body() — steer heading toward target_heading + translate body_joint[0].
  *
- * Same algorithm as move_head() in snake_forward_kinematics.c:
- *   1. Advance wave_time by dt.
- *   2. Integrate sinusoidal turn rate into heading.
- *   3. Translate body_joint[0] along heading at move_speed.
- *   4. Toroidal wrap at screen pixel boundaries.
- *   5. Push body_joint[0] into the trail.
+ *   1. Normalise angular diff to [−π, π] (short-arc) and clamp to TURN_RATE.
+ *   2. Translate body_joint[0] along current heading at move_speed.
+ *   3. Toroidal wrap at screen pixel boundaries.
+ *   4. Push body_joint[0] into the trail.
  */
 static void move_body(Spider *sp, float dt, int cols, int rows)
 {
-    sp->wave_time += dt;
-
-    float turn = TURN_AMP * sinf(TURN_FREQ * sp->wave_time);
-    sp->heading += turn * dt;
+    float diff = sp->target_heading - sp->heading;
+    while (diff >  (float)M_PI) diff -= 2.0f * (float)M_PI;
+    while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
+    sp->heading += clampf(diff, -TURN_RATE * dt, TURN_RATE * dt);
 
     float wpx = (float)(cols * CELL_W);
     float hpx = (float)(rows * CELL_H);
@@ -960,10 +959,10 @@ static void scene_init(Scene *sc, int cols, int rows)
     memset(sc, 0, sizeof *sc);
     Spider *sp = &sc->spider;
 
-    sp->move_speed = BODY_SPEED;
-    sp->heading    = (float)M_PI / 8.0f;   /* slightly south-east */
-    sp->wave_time  = (float)M_PI * 0.5f;   /* start mid-phase (already curving) */
-    sp->hip_dist   = (float)(rows * CELL_H) * HIP_DIST_FACTOR;
+    sp->move_speed     = BODY_SPEED;
+    sp->heading        = 0.0f;   /* start facing right */
+    sp->target_heading = 0.0f;
+    sp->hip_dist       = (float)(rows * CELL_H) * HIP_DIST_FACTOR;
     sp->paused     = false;
     sp->theme_idx  = 0;
 
@@ -1095,9 +1094,17 @@ static void screen_draw(Screen *s, const Scene *sc,
     float step_hz = count_step_hz(sp, (float)sim_fps);
 
     char buf[HUD_COLS + 1];
+    float deg = sp->heading * (180.0f / (float)M_PI);
+    while (deg <    0.0f) deg += 360.0f;
+    while (deg >= 360.0f) deg -= 360.0f;
+    const char *dir_arrow =
+        (deg < 45.0f || deg >= 315.0f) ? ">" :
+        (deg < 135.0f)                  ? "v" :
+        (deg < 225.0f)                  ? "<" : "^";
+
     snprintf(buf, sizeof buf,
-             " IK-SPIDER  spd:%.0f  step:%.0fHz  [%s]  %s  %.1ffps  %dHz ",
-             sp->move_speed, step_hz,
+             " IK-SPIDER  dir:%s  spd:%.0f  step:%.0fHz  [%s]  %s  %.1ffps  %dHz ",
+             dir_arrow, sp->move_speed, step_hz,
              THEMES[sp->theme_idx].name,
              sp->paused ? "PAUSED" : "crawling",
              fps, sim_fps);
@@ -1110,7 +1117,7 @@ static void screen_draw(Screen *s, const Scene *sc,
 
     attron(COLOR_PAIR(HUD_PAIR) | A_BOLD);
     mvprintw(s->rows - 1, 0,
-             " q:quit  spc:pause  w/s:speed  t:theme  [/]:Hz ");
+             " q:quit  spc:pause  arrows:steer  w/s:speed  t:theme  [/]:Hz ");
     attroff(COLOR_PAIR(HUD_PAIR) | A_BOLD);
 }
 
@@ -1155,7 +1162,8 @@ static void app_do_resize(App *app)
  * KEY MAP:
  *   q / Q / ESC   quit
  *   space         pause / resume
- *   ↑ / ↓         move speed ×1.20 / ÷1.20
+ *   arrow keys    steer — set target_heading; body turns gradually
+ *   w / s         speed ×1.25 / ÷1.25
  *   ] / [         sim Hz + / - SIM_FPS_STEP
  */
 static bool app_handle_key(App *app, int ch)
@@ -1165,11 +1173,16 @@ static bool app_handle_key(App *app, int ch)
     case 'q': case 'Q': case 27: return false;
     case ' ': sp->paused = !sp->paused; break;
 
-    case 'w': case KEY_UP:
+    case KEY_RIGHT: sp->target_heading =  0.0f;                break;
+    case KEY_DOWN:  sp->target_heading =  (float)M_PI * 0.5f; break;
+    case KEY_LEFT:  sp->target_heading =  (float)M_PI;        break;
+    case KEY_UP:    sp->target_heading = -(float)M_PI * 0.5f; break;
+
+    case 'w':
         sp->move_speed *= 1.25f;
         if (sp->move_speed > BODY_SPEED_MAX) sp->move_speed = BODY_SPEED_MAX;
         break;
-    case 's': case KEY_DOWN:
+    case 's':
         sp->move_speed /= 1.25f;
         if (sp->move_speed < BODY_SPEED_MIN) sp->move_speed = BODY_SPEED_MIN;
         break;

@@ -3067,4 +3067,76 @@ The 2×2 expansion maps maze coordinate `(r, c)` to screen coordinates `(2r+1, 2
 
 ---
 
+#### V5.25 Direction-Character Line Rendering — `seg_glyph` + `draw_leg_line`
+
+**What it is:** Drawing a line segment between two pixel-space points using slope-appropriate ASCII characters (`-`, `\`, `|`, `/`) sampled at regular intervals along the segment.
+
+**What we achieve:** Leg segments and body edges appear as continuous strokes even though the terminal is a sparse character grid. The character choice encodes the local slope so the eye perceives a line, not a dotted sequence of identical glyphs.
+
+**How:**
+
+```c
+static chtype seg_glyph(float dx, float dy)
+{
+    float ang = atan2f(-dy, dx);          /* −dy: screen +y is down  */
+    float deg = fmodf(..., 180.0f);       /* fold to [0, 180) — symmetry */
+    if (deg < 22.5 || deg >= 157.5) return '-';
+    if (deg < 67.5)                  return '\\';
+    if (deg < 112.5)                 return '|';
+    return                           '/';
+}
+
+static void draw_leg_line(WINDOW *w, Vec2 a, Vec2 b, int pair, attr_t attr, ...)
+{
+    int nsteps = (int)ceilf(len / DRAW_LEG_STEP_PX) + 1;
+    for (int t = 0; t <= nsteps; t++) {
+        float u  = (float)t / nsteps;
+        int cx = px_to_cell_x(a.x + dx*u);
+        int cy = px_to_cell_y(a.y + dy*u);
+        if (cx == prev_cx && cy == prev_cy) continue;   /* skip duplicate cells */
+        mvwaddch(w, cy, cx, glyph | COLOR_PAIR(pair) | attr);
+    }
+}
+```
+
+`atan2f(-dy, dx)` negates `dy` because screen +y is downward but mathematical +y is upward; the angle needs to be computed in math convention so the character mapping makes visual sense. The duplicate-cell skip (`prev_cx == cx && prev_cy == cy`) prevents writing the same cell twice when the step size is smaller than one cell, which would waste ncurses operations.
+
+**Draw order matters:** leg lines are drawn first, then joint markers (`*`, `o`) are drawn on top. This ensures joints are always visible even when the line passes through the same cell.
+
+*Files: `animation/hexpod_tripod.c`, `animation/ik_spider.c`*
+
+---
+
+#### V5.26 Rotated Body Rectangle via `rotate2d`
+
+**What it is:** Drawing a rigid rectangle (four edges + two cross-braces) at an arbitrary heading by rotating the four corner offsets from body center before drawing.
+
+**What we achieve:** The body visually tracks the robot's heading — it rotates as the robot steers — without any special-cased per-direction draw logic.
+
+**How:**
+
+```c
+float bhl = BODY_LEN * 0.5f, bhw = BODY_HALF_W;
+Vec2 tl = { bx + rotate2d({-bhl, -bhw}, bh).x,
+             by + rotate2d({-bhl, -bhw}, bh).y };
+Vec2 tr = { bx + rotate2d({ bhl, -bhw}, bh).x, ... };
+Vec2 bl = { bx + rotate2d({-bhl,  bhw}, bh).x, ... };
+Vec2 br = { bx + rotate2d({ bhl,  bhw}, bh).x, ... };
+
+draw_leg_line(w, tl, tr, 1, A_BOLD, ...);   /* top edge    */
+draw_leg_line(w, bl, br, 1, A_BOLD, ...);   /* bottom edge */
+draw_leg_line(w, tl, bl, 1, A_BOLD, ...);   /* left edge   */
+draw_leg_line(w, tr, br, 1, A_BOLD, ...);   /* right edge  */
+draw_leg_line(w, tl, br, 1, A_DIM,  ...);   /* cross-brace */
+draw_leg_line(w, tr, bl, 1, A_DIM,  ...);   /* cross-brace */
+```
+
+The interpolated heading `bh` used here is the alpha-lerped value `prev_heading + hdiff * alpha` (with short-arc normalization), so the rectangle smoothly rotates sub-tick rather than snapping. The cross-braces use `A_DIM` to read as internal structure rather than external edge — a cheap per-attribute visual layer.
+
+**Why this generalises:** Any rigid shape (triangle, hexagon, oriented capsule) can be drawn this way. Compute body-local corner offsets once; call `rotate2d(corner, heading)` at draw time. No branch for each direction — one code path handles all headings.
+
+*Files: `animation/hexpod_tripod.c`*
+
+---
+
 *This document is the single reference for all ncurses techniques used across the C files in this project. For fractal algorithms and IFS theory, see Master.md §P and §Q. For the overall loop architecture and subsystem details, see Architecture.md. For color-specific techniques, see COLOR.md.*

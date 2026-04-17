@@ -1,6 +1,6 @@
 # Learning Roadmap — ASCII Creative Coding
 
-100 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
+146 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
 and the 2-year breakdown. Do not skip layers.
 
 ---
@@ -89,7 +89,8 @@ Bridges kinematic geometry with the physics patterns from Tier 2. Introduces art
 | `fk_tentacle_forest.c` | Pure stateless sinusoidal FK, multi-tentacle scene | Per-tentacle phase/frequency/amplitude parameters |
 | `fk_medusa.c` | Bell oscillation FK + trailing tentacle FK | Radial bell deformation, cascaded FK chains |
 | `ik_arm_reach.c` | FABRIK iterative IK (2-pass solver) | Forward/backward reaching passes, Lissajous target path |
-| `ik_spider.c` | 2-joint analytical IK, procedural stepping | Law of cosines, step trigger + lerp, trail-buffer body |
+| `ik_spider.c` | 2-joint analytical IK, procedural stepping, arrow-key steering | Law of cosines, step trigger + lerp, trail-buffer body, short-arc heading interpolation |
+| `hexpod_tripod.c` | 6-legged robot: timer-based tripod gait + 2-joint IK, 4-dir steering | Law of cosines IK, parabolic foot arc, angular interpolation, rotate2d body-local → world |
 | `ik_tentacle_seek.c` | FABRIK on seeking tentacles | Wandering target, per-segment reach tolerance |
 | `ragdoll_figure.c` | Verlet ragdoll skeleton | Verlet integration, iterative distance-constraint projection |
 | `ragdoll_ropes.c` | Verlet rope chains, multi-rope sway | Damping, phase-offset anchors, constraint relaxation |

@@ -129,6 +129,19 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/dune_rocket.c         -o dune_rocket    
 gcc -std=c11 -O2 -Wall -Wextra artistic/dune_sandworm.c       -o dune_sandworm  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/sand_art.c            -o sand_art       -lncurses -lm
 
+# ── animation / kinematics ───────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra animation/hexpod_tripod.c           -o hexpod_tripod           -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra animation/ik_spider.c               -o ik_spider               -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra animation/ik_arm_reach.c            -o ik_arm_reach            -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra animation/ik_tentacle_seek.c        -o ik_tentacle_seek        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra animation/snake_forward_kinematics.c -o snake_forward_kinematics -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra animation/snake_inverse_kinematics.c -o snake_inverse_kinematics -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra animation/ragdoll_figure.c          -o ragdoll_figure          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra animation/ragdoll_ropes.c           -o ragdoll_ropes           -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra animation/fk_centipede.c            -o fk_centipede            -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra animation/fk_medusa.c               -o fk_medusa               -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra animation/fk_tentacle_forest.c      -o fk_tentacle_forest      -lncurses -lm
+
 # ── raytracing ───────────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raytracing/sphere_raytrace.c   -o sphere_raytrace   -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raytracing/cube_raytrace.c     -o cube_raytrace     -lncurses -lm
@@ -167,6 +180,19 @@ gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer 
 ---
 
 ## Files
+
+### animation/
+- `hexpod_tripod.c`           — 6-legged robot: tripod gait (alternating 3-leg support triangles), 2-joint law-of-cosines IK per leg, 4-direction arrow-key steering with angular interpolation, toroidal 4-edge wrap, 8 robot-themed palettes, stretch-snap on wrap/turn
+- `ik_spider.c`               — 6-legged spider: trail-buffer FK body, 2-joint IK legs, drift-triggered tripod gait, 4-direction arrow-key steering (TURN_RATE=2.5 rad/s), 10 arachnid palettes
+- `ik_arm_reach.c`            — 2-joint IK arm reaching to cursor: elbow-side toggle, reach constraint visualisation
+- `ik_tentacle_seek.c`        — FABRIK iterative IK tentacle seeking a moving target
+- `snake_forward_kinematics.c` — trail-buffer FK snake: sinusoidal body locomotion, bead-chain rendering
+- `snake_inverse_kinematics.c` — FABRIK IK snake: iterative forward/backward reach solver
+- `ragdoll_figure.c`          — ragdoll stick figure: constraint-projected Verlet joints, momentum carry-over, keyboard impulses
+- `ragdoll_ropes.c`           — ragdoll rope chains: multi-segment Verlet with distance constraints
+- `fk_centipede.c`            — centipede: FK body chain, per-leg phase offsets, sinusoidal gait
+- `fk_medusa.c`               — medusa jellyfish: FK tentacle tree with pulsing bell
+- `fk_tentacle_forest.c`      — forest of FK tentacles: wind-driven sinusoidal sway, rooted chains
 
 ### ncurses_basics/
 - `tst_lines_cols.c`    — print terminal `LINES` × `COLS` using `printw` / `refresh`

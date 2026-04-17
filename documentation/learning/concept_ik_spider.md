@@ -12,7 +12,7 @@
 
 ## Core Idea
 
-A 6-legged spider crawls autonomously across the terminal. The body uses trail-buffer FK to follow a sinusoidal curved path — the head position is pushed into a ring buffer each tick, and each body segment is placed at the appropriate arc-length distance behind the head. Each of the 6 legs independently uses 2-joint analytical IK (law of cosines) to reach a computed step target. Legs step in an alternating tripod gait that automatically adapts to the spider's speed.
+A 6-legged spider crawls across the terminal in a direction set by arrow keys. The body uses trail-buffer FK — the head position is pushed into a ring buffer each tick, and each body segment is placed at the appropriate arc-length distance behind the head. The spider steers by gradually rotating its heading toward a `target_heading` (set by arrow keys) at `TURN_RATE` rad/s, using short-arc normalisation so turns across ±π are always the short way round. Each of the 6 legs independently uses 2-joint analytical IK (law of cosines) to reach a computed step target. Legs step in an alternating tripod gait that automatically adapts to the spider's speed.
 
 The key difference from ik_arm_reach.c: IK here is analytical (one formula, exact, no iteration) because each leg has exactly 2 joints. For 2-joint chains, the law of cosines gives a closed-form solution with two cases (elbow-up or elbow-down) chosen by the left/right body side.
 
@@ -32,7 +32,7 @@ trail_count            — valid entries; <= TRAIL_CAP
 body_joint[N_BODY_SEGS+1] — 7 joint positions (0=head, 1..6=body segments)
 prev_body[]            — snapshot at tick start for alpha lerp
 heading                — current body heading in radians (forward direction)
-wave_time              — accumulated time for sinusoidal turn rate
+target_heading         — desired heading set by arrow keys (spider turns toward this)
 move_speed             — head translation speed in pixels/s
 
 hip[N_LEGS]            — world-space hip positions (attached to body)
@@ -95,7 +95,7 @@ Each iteration of the main loop:
 3. **Physics accumulator.** `sim_accum += dt`. While `sim_accum >= tick_ns`:
    - Snapshot `prev_body`, `prev_hip`, `prev_knee`, `prev_foot`.
    - If paused: return early (lerp freezes cleanly).
-   - `move_body()`: advance `wave_time`, integrate sinusoidal turn rate into `heading`, translate body_joint[0] along heading, toroidal wrap at screen edges, push to trail.
+   - `move_body()`: interpolate `heading` toward `target_heading` at `TURN_RATE` rad/s (short-arc normalised), translate body_joint[0] along heading, toroidal wrap at screen edges, push to trail.
    - `compute_body_joints()`: place body_joint[1..N_BODY_SEGS] via `trail_sample()` at arc-length offsets.
    - `compute_hips()`: attach each hip to its body point; offset laterally by `hip_dist` perpendicular to local body forward.
    - `update_steps()`: check step triggers; start or advance step animations; recompute IK for all legs.
@@ -209,8 +209,9 @@ Result: while A steps → B is planted (3-point ground contact)
 |-----|--------|
 | q / ESC | exit |
 | space | toggle paused |
-| ↑ | increase move_speed (up to BODY_SPEED_MAX=200 px/s) |
-| ↓ | decrease move_speed (down to BODY_SPEED_MIN=10 px/s) |
+| ← / → / ↑ / ↓ | set target_heading (left=π, right=0, up=−π/2, down=π/2); spider turns gradually |
+| w | increase move_speed (up to BODY_SPEED_MAX=200 px/s) |
+| s | decrease move_speed (down to BODY_SPEED_MIN=10 px/s) |
 | t | cycle colour theme forward |
 | ] | increase sim_fps by SIM_FPS_STEP |
 | [ | decrease sim_fps by SIM_FPS_STEP |
@@ -226,7 +227,7 @@ Result: while A steps → B is planted (3-point ground contact)
 | STEP_DURATION | 0.22 s | One step takes this long. Shorter: faster, more mechanical. Longer: more graceful but lags behind body at high speed. |
 | STEP_REACH_FACTOR | 0.68 | Ideal foot reach = (UPPER+LOWER) × factor. 0.68 × 94 ≈ 64 px. Larger: feet plant further away, wider stance. |
 | BODY_SPEED | 45 px/s | Head translation speed. Increase: feet step more often, gait adapts. Beyond ~100 px/s step animations can't keep up. |
-| TURN_AMP / TURN_FREQ | 0.40 / 0.50 rad | Sinusoidal turning: heading += TURN_AMP × sin(TURN_FREQ × wave_time) × dt. Higher amp: tighter curves. Lower freq: longer, lazier turns. |
+| TURN_RATE | 2.5 rad/s | How fast heading rotates toward target_heading. Higher: snappier turns. Lower: slow, sweeping turns. At 2.5 rad/s a 180° reversal completes in ~1.25 s. |
 | N_BODY_SEGS | 6 | Body length = N_BODY_SEGS × BODY_SEG_LEN (6×20=120 px). More segs: longer body, more trail history needed. |
 | HIP_DIST_FACTOR | 0.06 | Hip offset = rows×CELL_H × factor. Increase: legs emanate further from body centre, wider spider. |
 | DRAW_STEP_PX | 5 px | Body bead fill density. DRAW_LEG_STEP_PX=8 px (=CELL_W) for legs — one char per cell column. |
@@ -297,8 +298,8 @@ while sim_accum >= tick_ns:
     ├── snapshot prev_body, prev_hip, prev_knee, prev_foot
     │
     ├── move_body(dt):
-    │     wave_time += dt
-    │     heading  += TURN_AMP × sin(TURN_FREQ × wave_time) × dt
+    │     diff = target_heading − heading; normalise to [−π, π]
+    │     heading += clamp(diff, −TURN_RATE×dt, TURN_RATE×dt)
     │     body_joint[0] += move_speed × (cos heading, sin heading) × dt
     │     toroidal wrap (body_joint[0] stays in [0, W) × [0, H))
     │     trail_push(body_joint[0])
@@ -366,12 +367,12 @@ Steps:
 5. If dist > total trail length: return oldest entry (tail end of trail)
 
 ### move_body(spider, dt, cols, rows)
-Purpose: advance sinusoidal heading, translate body_joint[0], wrap, push trail.
+Purpose: steer heading toward target_heading, translate body_joint[0], wrap, push trail.
 Steps:
-1. `wave_time += dt`
-2. `heading += TURN_AMP × sin(TURN_FREQ × wave_time) × dt`
+1. `diff = target_heading − heading`; normalise diff to [−π, π] (while loops)
+2. `heading += clamp(diff, −TURN_RATE×dt, TURN_RATE×dt)`
 3. `body_joint[0] += move_speed × (cos(heading), sin(heading)) × dt`
-4. Wrap x: if x < 0: x += W; if x >= W: x -= W (toroidal, not bounce)
+4. Toroidal wrap (all 4 edges): x, y stay in [0, W) × [0, H)
 5. `trail_push(body_joint[0])`
 
 ### compute_hips(spider)
@@ -469,7 +470,7 @@ main loop (while running):
 
   8. input:
      ch = getch()
-     dispatch: q=quit, space=pause, up/down=speed, t=theme, [/]=sim_fps
+     dispatch: q=quit, space=pause, arrows=steer, w/s=speed, t=theme, [/]=sim_fps
 
 cleanup:
   endwin()

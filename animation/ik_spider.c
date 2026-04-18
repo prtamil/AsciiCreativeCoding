@@ -107,9 +107,10 @@
  *   sub-tick alpha lerp for smooth rendering.
  *
  * Rendering:
- *   Legs drawn as segmented lines (hip→knee→foot) with angle glyphs.
- *   Body drawn as a dense chain of glyphs, tail→head.  Feet: 'X' when
- *   planted, 'o' when lifting.  Body head: directional arrow '@'.
+ *   Legs drawn as segmented chain lines (hip→knee→foot): alternating
+ *   direction char and '.' gives -.-.- / |.|.| / \.\.\  feel per angle.
+ *   Knee: 'o' joint node.  Feet: '*' planted, '.' lifting.
+ *   Body drawn as a dense bead chain, tail→head.  Head: directional arrow.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -765,7 +766,6 @@ static chtype head_glyph(float heading)
 
 /*
  * seg_glyph() — direction char for a vector (dx,dy): - \ | /
- * Used for leg segments so they look like angular limbs.
  */
 static chtype seg_glyph(float dx, float dy)
 {
@@ -781,9 +781,13 @@ static chtype seg_glyph(float dx, float dy)
 }
 
 /*
- * draw_leg_line() — dense direction-char line for a single leg segment.
- * Uses \ | / - glyphs so each leg reads as a crisp angled limb.
- * Independent prev_cx/prev_cy per call (each segment is its own line).
+ * draw_leg_line() — segmented-limb line for a leg segment.
+ *
+ * Alternates direction char and '.' so each segment reads as a chain:
+ *   horizontal  →  -.-.-.-
+ *   vertical    →  |.|.|.|
+ *   diagonal    →  \.\.\.\  or  /./././
+ * This gives an organic arthropod-limb feel in pure ASCII.
  */
 static void draw_leg_line(WINDOW *w,
                           Vec2 a, Vec2 b,
@@ -798,6 +802,7 @@ static void draw_leg_line(WINDOW *w,
     chtype glyph  = seg_glyph(dx, dy);
     int    nsteps = (int)ceilf(len / DRAW_LEG_STEP_PX) + 1;
     int    prev_cx = -9999, prev_cy = -9999;
+    int    phase   = 0;
 
     for (int t = 0; t <= nsteps; t++) {
         float u  = (float)t / (float)nsteps;
@@ -808,9 +813,11 @@ static void draw_leg_line(WINDOW *w,
         prev_cx = cx; prev_cy = cy;
         if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
 
+        chtype ch = (phase & 1) ? (chtype)'.' : glyph;
         wattron(w, COLOR_PAIR(pair) | attr);
-        mvwaddch(w, cy, cx, glyph);
+        mvwaddch(w, cy, cx, ch);
         wattroff(w, COLOR_PAIR(pair) | attr);
+        phase++;
     }
 }
 
@@ -881,15 +888,15 @@ static void render_spider(const Spider *sp, WINDOW *w,
         r_foot[i] = vec2_lerp(sp->prev_foot[i], sp->foot_pos[i], alpha);
     }
 
-    /* 1. Legs — direction-char lines (\ | / -), single colour pair 3 */
+    /* 1. Legs — Unicode box-drawing lines (─ ╲ │ ╱), bold for crispness */
     for (int i = 0; i < N_LEGS; i++) {
-        draw_leg_line(w, r_hip[i],  r_knee[i], 3, A_NORMAL, cols, rows);
-        draw_leg_line(w, r_knee[i], r_foot[i], 3, A_NORMAL, cols, rows);
+        draw_leg_line(w, r_hip[i],  r_knee[i], 3, A_BOLD, cols, rows);
+        draw_leg_line(w, r_knee[i], r_foot[i], 3, A_BOLD, cols, rows);
     }
 
     /* 2. Leg joint nodes on top */
     for (int i = 0; i < N_LEGS; i++) {
-        /* Knee: 'o' bold — articulation point visible against the line chars */
+        /* Knee: 'o' bold — joint node, contrasts with '.' beads on limb */
         int kx = px_to_cell_x(r_knee[i].x);
         int ky = px_to_cell_y(r_knee[i].y);
         if (kx >= 0 && kx < cols && ky >= 0 && ky < rows) {
@@ -898,13 +905,13 @@ static void render_spider(const Spider *sp, WINDOW *w,
             wattroff(w, COLOR_PAIR(3) | A_BOLD);
         }
 
-        /* Foot: '*' planted (pair 6 bold), 'o' stepping (pair 7 dim) */
+        /* Foot: '*' planted (pair 6 bold), '.' stepping (pair 7 dim) */
         int fx = px_to_cell_x(r_foot[i].x);
         int fy = px_to_cell_y(r_foot[i].y);
         if (fx >= 0 && fx < cols && fy >= 0 && fy < rows) {
             if (sp->stepping[i]) {
                 wattron(w, COLOR_PAIR(7) | A_DIM);
-                mvwaddch(w, fy, fx, (chtype)'o');
+                mvwaddch(w, fy, fx, (chtype)'.');
                 wattroff(w, COLOR_PAIR(7) | A_DIM);
             } else {
                 wattron(w, COLOR_PAIR(6) | A_BOLD);

@@ -70,6 +70,9 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [F1 Perlin Noise — Permutation Table & Smoothstep](#f1-perlin-noise--permutation-table--smoothstep)
 - [F2 Octave Layering (Fractal Brownian Motion)](#f2-octave-layering-fractal-brownian-motion)
 - [F3 Flow Field from Noise](#f3-flow-field-from-noise)
+- [F4 Curl Noise — Divergence-Free Vector Fields](#f4-curl-noise--divergence-free-vector-fields)
+- [F5 Biot-Savart Vortex Lattice](#f5-biot-savart-vortex-lattice)
+- [F6 Pre-Baked Cosine Palette → 16 Color Pairs](#f6-pre-baked-cosine-palette--16-color-pairs)
 - [F4 LCG — Deterministic Pseudo-random Numbers](#f4-lcg--deterministic-pseudo-random-numbers)
 - [F5 Rejection Sampling — Isotropic Random Direction](#f5-rejection-sampling--isotropic-random-direction)
 
@@ -399,7 +402,7 @@ Scanning top-to-bottom in a falling CA lets grains move multiple cells in a sing
 
 #### E5 Stochastic Rules
 Adding `rand() % 2` to decide which diagonal direction to try, or whether to scatter a fire cell, gives organic variation with almost no code. Deterministic rules produce repetitive, crystalline patterns; a single random branch breaks the symmetry and makes the simulation look alive.
-*Files: `sand.c`, `fire.c`, `aafire_port.c`, `flowfield.c`*
+*Files: `sand.c`, `fire.c`, `aafire_port.c`, `flowfield.c`, `complex_flowfield.c`*
 
 ---
 
@@ -407,15 +410,27 @@ Adding `rand() % 2` to decide which diagonal direction to try, or whether to sca
 
 #### F1 Perlin Noise — Permutation Table & Smoothstep
 Ken Perlin's classic algorithm hashes integer grid corners using a 256-element permutation table, then blends the four corner contributions using a smoothstep curve (`6t⁵ - 15t⁴ + 10t³`). The result is a continuous, band-limited noise signal that looks natural — unlike `rand()` which has no spatial coherence.
-*Files: `flowfield.c`*
+*Files: `flowfield.c`, `complex_flowfield.c`*
 
 #### F2 Octave Layering (Fractal Brownian Motion)
-Summing multiple noise samples at increasing frequencies (`freq × 2ⁿ`) and decreasing amplitudes (`amp × 0.5ⁿ`) builds fractal detail. Two octaves give smooth hills; four give terrain with boulders; eight give bark texture. This project uses three octaves for the flow field angle, balancing detail against computation.
-*Files: `flowfield.c`*
+Summing multiple noise samples at increasing frequencies (`freq × 2ⁿ`) and decreasing amplitudes (`amp × 0.5ⁿ`) builds fractal detail. Two octaves give smooth hills; four give terrain with boulders; eight give bark texture. This project uses three octaves for the flow field angle, balancing detail against computation. `complex_flowfield.c` also uses multi-octave fBm for the curl noise scalar potential.
+*Files: `flowfield.c`, `complex_flowfield.c`*
 
 #### F3 Flow Field from Noise
 Sample two independent noise fields at offset coordinates to get `(vx, vy)`, then `atan2(vy, vx)` gives an angle. Placing this angle at every grid cell builds a vector field that is spatially smooth but visually complex. Particles that follow the field produce curved, organic-looking trails.
-*Files: `flowfield.c`*
+*Files: `flowfield.c`, `complex_flowfield.c`*
+
+#### F4 Curl Noise — Divergence-Free Vector Fields
+Build a scalar potential ψ(x,y,t) from noise. The 2-D curl of a scalar field is a divergence-free vector field: `Vx = ∂ψ/∂y`, `Vy = −∂ψ/∂x`. Approximate with central differences: `Vx ≈ (ψ(x, y+ε) − ψ(x, y−ε)) / 2ε`. Divergence-free means `∂Vx/∂x + ∂Vy/∂y = 0` everywhere — no sources or sinks. Particles orbit indefinitely without clustering or dispersing, producing looping smoke-like motion that plain angle noise cannot achieve.
+*Files: `complex_flowfield.c`*
+
+#### F5 Biot-Savart Vortex Lattice
+N point vortices each contribute a velocity at any grid cell via the 2-D Biot-Savart law: `Vx += S·(−dy)/(r²+ε)`, `Vy += S·dx/(r²+ε)`. Superimposing N vortices with alternating positive (CCW) and negative (CW) strengths creates complex whirlpool interference. The `ε` (VORT_EPS) term regularises the singularity at the vortex centre — without it, cells at exactly the vortex position receive infinite velocity. Placing vortices on a slowly rotating ring makes the pattern evolve continuously.
+*Files: `complex_flowfield.c`, `particle_systems/smoke.c`*
+
+#### F6 Pre-Baked Cosine Palette → 16 Color Pairs
+The cosine palette formula `color(t) = a + b·cos(2π·(c·t+d))` generates smooth complementary hue gradients from just four 3-vectors per theme. Rather than calling `init_pair()` every frame (as `flocking.c` does), `complex_flowfield.c` calls it once at theme-change time for 16 evenly-spaced `t` values, registering all 16 color pairs upfront. Particles then select a pair by mapping their flow angle to `t ∈ [0,1]` — no per-frame color registration, no flicker. The `cos_to_xterm256()` function maps each float RGB triple to the xterm-256 color cube: `16 + 36·r5 + 6·g5 + b5` where each channel is rounded to the nearest of 6 discrete levels.
+*Files: `complex_flowfield.c`*
 
 #### F4 LCG — Deterministic Pseudo-random Numbers
 A Linear Congruential Generator (`state = state × A + C mod 2³²`) produces a deterministic sequence from a seed. `kaboom.c` uses it so that the same seed always produces the same explosion shape — useful for pre-generating animation frames or making effects reproducible.
@@ -450,8 +465,8 @@ Display hardware applies a nonlinear transfer function (gamma ≈ 2.2) to the st
 *Files: all raster files, `raymarcher.c`, `raymarcher/sdf_gallery.c`*
 
 #### G6 Directional Characters — Arrow & Line Glyphs
-In `flowfield.c` the particle head character is chosen by the angle of motion: `→ ↗ ↑ ↖ ← ↙ ↓ ↘`. Dividing `atan2(vy,vx)` by `π/4` and rounding to the nearest octant indexes into an 8-character array. In `spring_pendulum.c` the spring is drawn with `/`, `\`, `|`, `-` chosen by the local segment slope.
-*Files: `flowfield.c`, `spring_pendulum.c`, `wireframe.c`*
+In `flowfield.c` the particle head character is chosen by the angle of motion: `→ ↗ ↑ ↖ ← ↙ ↓ ↘`. Dividing `atan2(vy,vx)` by `π/4` and rounding to the nearest octant indexes into an 8-character array. `complex_flowfield.c` uses the same technique for both particle heads and the background colormap — every cell shows the flow direction glyph colored by the cosine palette. In `spring_pendulum.c` the spring is drawn with `/`, `\`, `|`, `-` chosen by the local segment slope.
+*Files: `flowfield.c`, `complex_flowfield.c`, `spring_pendulum.c`, `wireframe.c`*
 
 ---
 
@@ -619,7 +634,7 @@ Draws a line between two integer grid points by incrementally tracking the sub-p
 
 #### L2 Ring Buffer
 A fixed-size array with `head` and `tail` indices that wrap modulo the array size. `matrix_rain.c` uses a ring buffer for each column's trail: the `head` index advances each tick, overwriting the oldest entry. Reading backwards from head gives the trail in order from newest to oldest without any shifting or allocation.
-*Files: `matrix_rain.c`, `flowfield.c`*
+*Files: `matrix_rain.c`, `flowfield.c`, `complex_flowfield.c`*
 
 #### L3 Z-buffer / Depth Sort
 Both the z-buffer (raster) and z-sorting (donut) solve the visibility problem: when multiple objects project onto the same pixel, which one is in front? The z-buffer stores per-pixel depth and discards farther fragments. The donut sorts all lit points by depth and iterates front-to-back, painting over earlier results with closer ones.
@@ -642,8 +657,8 @@ Precomputing an array of results and indexing into it at runtime turns repeated 
 *Files: `fire.c`, `aafire_port.c`, `raymarcher.c`*
 
 #### L8 Bilinear Interpolation
-Sampling a 2D grid at a non-integer position by weighting the four surrounding grid cells: `lerp(lerp(top-left, top-right, fx), lerp(bottom-left, bottom-right, fx), fy)`. `flowfield.c` uses bilinear interpolation to sample the noise field between grid points, producing a smooth continuous velocity field rather than a blocky step function.
-*Files: `flowfield.c`*
+Sampling a 2D grid at a non-integer position by weighting the four surrounding grid cells: `lerp(lerp(top-left, top-right, fx), lerp(bottom-left, bottom-right, fx), fy)`. `flowfield.c` and `complex_flowfield.c` both use bilinear interpolation to sample the angle grid at continuous particle positions, producing smooth velocity fields rather than blocky step functions.
+*Files: `flowfield.c`, `complex_flowfield.c`*
 
 ---
 
@@ -675,7 +690,7 @@ Shader functions accept `const void *uni` and cast it to the specific struct the
 
 #### M7 size_t Casts in malloc
 `malloc((size_t)(n) * sizeof(T))` — the `size_t` cast is critical when `n` is a signed `int`. If `n` is large, `n * sizeof(T)` overflows `int` (signed integer overflow is undefined behaviour in C) before the implicit conversion to `size_t` happens. Casting first makes the multiplication happen in unsigned 64-bit, preventing both UB and silent underallocation.
-*Files: all raster files, `flowfield.c`, `sand.c`*
+*Files: all raster files, `flowfield.c`, `complex_flowfield.c`, `sand.c`*
 
 ---
 

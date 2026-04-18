@@ -33,7 +33,7 @@ Reference implementation: `basics/bounce_ball.c`
     - [Vertex and Fragment Shaders](#vertex-and-fragment-shaders)
     - [Displacement (displace_raster.c)](#displacement-displace_rasterc)
 13. [Cellular Automata & Particle Grid Sims — fire.c, smoke.c, aafire_port.c, sand.c](#13-cellular-automata--firec-smokec-aafire_portc-sandc)
-14. [Flow Field — flowfield.c](#14-flow-field--flowfieldc)
+14. [Flow Field — flowfield.c, complex_flowfield.c](#14-flow-field--flowfieldc-complex_flowfieldc)
 15. [Flocking Simulation — flocking.c](#15-flocking-simulation--flockingc)
 16. [Bonsai Tree — bonsai.c](#16-bonsai-tree--bonsaic)
 17. [Constellation — constellation.c](#17-constellation--constellationc)
@@ -1047,11 +1047,15 @@ Fisher-Yates shuffle is applied to the column scan order each tick to remove the
 
 ---
 
-## 14. Flow Field — flowfield.c
+## 14. Flow Field — flowfield.c, complex_flowfield.c
 
-### Architecture
+Both files share the same fundamental architecture: a 2-D angle grid is computed each tick, particles sample it via bilinear interpolation, and trails are drawn with direction glyphs. They differ in the variety of field generators and the sophistication of the color system.
 
-`flowfield.c` is a particle system driven by a Perlin noise vector field:
+---
+
+### flowfield.c — Single Perlin noise field
+
+#### Architecture
 
 ```
 noise_init()           — build 256-element permutation table
@@ -1064,7 +1068,7 @@ scene_draw(alpha)      — draw particles at interpolated position,
                          choose direction char from velocity angle
 ```
 
-### Perlin Noise to Flow Vector
+#### Perlin Noise to Flow Vector
 
 Two noise samples at offset coordinates produce independent noise values; `atan2` converts them to a direction angle:
 
@@ -1076,7 +1080,7 @@ angle[y][x] = atan2f(ny, nx);
 
 3 octaves of fBm are summed (each doubling frequency, halving amplitude) before computing the angle, giving the field fine-grained detail without high-frequency noise at large scales.
 
-### Bilinear Field Sampling
+#### Bilinear Field Sampling
 
 Particles are at float positions; the angle grid is integer-indexed. Bilinear interpolation samples smoothly between grid cells:
 
@@ -1087,9 +1091,91 @@ float angle = lerp(lerp(grid[y0][x0], grid[y0][x1], fx),
 
 Without this, particles would snap between discrete angle values every time they cross a grid cell boundary — visible as sudden direction changes.
 
-### Ring Buffer Trails
+#### Ring Buffer Trails
 
 Each particle maintains a ring buffer of its last N positions. The draw function iterates the ring from newest to oldest, drawing older positions dimmer. The head index advances each tick overwriting the oldest entry — O(1) per tick, no shifting.
+
+---
+
+### complex_flowfield.c — Four field types, cosine palettes, colormap mode
+
+#### Architecture
+
+```
+noise_init()         — 256-element permutation table (same as flowfield.c)
+scene_init()         — allocate angle grid + particle pool + vortex state
+color_apply_theme()  — pre-bake 16 cosine palette samples into ncurses pairs
+each tick:
+  field_tick()       — dispatch to active field type → angle[y*cols+x]
+  particle_tick(p)   — bilinear-sample, move, update head_pair from angle
+scene_draw()         — background mode → particle trails
+```
+
+#### Four Field Types (cycle with 'a')
+
+| Type | Generator | Visual character |
+|------|-----------|-----------------|
+| 0 Curl noise | Central-difference curl of scalar fBm: `Vx=∂ψ/∂y`, `Vy=−∂ψ/∂x` | Divergence-free, no sources/sinks, infinite looping |
+| 1 Vortex lattice | 6 Biot-Savart point vortices on an orbiting ring, alternating CCW/CW | Spinning whirlpool patterns |
+| 2 Sine lattice | `Vx=sin(x·fx+t)+sin(y·fy−t·0.7)`, `Vy=cos(x·fx−t·0.5)+cos(y·fy+t·0.3)` | Standing-wave interference |
+| 3 Radial spiral | Polar: tangential + pulsing radial `W·sin(t)·cos(θ)` | Breathing galaxy spiral |
+
+#### Curl Noise — Divergence-Free Field
+
+A scalar potential ψ(x,y,t) is built from layered Perlin noise. The curl of this scalar field gives a 2-D divergence-free vector field:
+
+```c
+float dn = noise_fbm(x,     y + eps, t, octaves);
+float ds = noise_fbm(x,     y - eps, t, octaves);
+float de = noise_fbm(x+eps, y,       t, octaves);
+float dw = noise_fbm(x-eps, y,       t, octaves);
+Vx =  (dn - ds) / (2 * eps);   /* +∂ψ/∂y */
+Vy = -(de - dw) / (2 * eps);   /* −∂ψ/∂x */
+```
+
+Divergence-free means `∂Vx/∂x + ∂Vy/∂y = 0` everywhere — no cells act as sources or sinks. Particles orbit indefinitely without clustering or dispersing, producing the looping smoke-like motion that pure angle noise cannot achieve.
+
+#### Vortex Lattice — Biot-Savart
+
+N_VORT=6 vortices sit on a ring that rotates VORT_ORB_SPD rad/tick. At each cell, velocity is the superposition of all vortex contributions:
+
+```c
+for (int i = 0; i < N_VORT; i++) {
+    float dx  = x - vort_cx[i];
+    float dy  = (y - vort_cy[i]) / CELL_AR;   /* visual-pixel correction */
+    float r2  = dx*dx + dy*dy + VORT_EPS;
+    float str = (i % 2 == 0) ? +VORT_STRENGTH : -VORT_STRENGTH;
+    vx += str * (-dy) / r2;
+    vy += str * ( dx) / r2;
+}
+```
+
+`CELL_AR=0.5` corrects `dy` to visual-pixel space so orbits appear circular on screen despite terminal characters being taller than wide. `VORT_EPS=5.0` softens the singularity over ~2-cell radius.
+
+#### Cosine Palette — 16 Pre-Baked Color Pairs
+
+Instead of hardcoding 8 xterm color indices per theme, `complex_flowfield.c` uses the cosine palette formula to generate 16 pairs at theme-change time:
+
+```c
+/* color(t) = a + b * cos(2π * (c*t + d)) */
+for (int i = 0; i < 16; i++) {
+    float t  = (float)i / 15.f;          /* evenly spaced t ∈ [0,1] */
+    int   fg = cos_to_xterm256(theme, t); /* → 16 + 36r + 6g + b     */
+    init_pair(CP_BASE + i, fg, COLOR_BLACK);
+}
+```
+
+Particles map their movement angle to a pair index: `angle_to_pair(angle) = CP_BASE + (int)(normalized_angle * 16) % 16`. The palette is a smooth hue cycle so adjacent angle directions get visually complementary colors rather than arbitrary jumps.
+
+#### Three Background Modes (cycle with 'v')
+
+| Mode | What is drawn | Visual effect |
+|------|--------------|---------------|
+| 0 blank | Nothing | Dark canvas, trail geometry only |
+| 1 arrows | Dim `>^<v/\` glyphs tinted by palette | Wind-map aesthetic |
+| 2 colormap | Bold direction glyphs, every cell colored by angle→palette | Full-screen procedurally generated art |
+
+In colormap mode the entire terminal is painted with the cosine-palette hues corresponding to the local flow angle. Switching field type or theme completely transforms the image. Particle trails drawn on top at `A_BOLD` remain clearly visible.
 
 ---
 

@@ -35,6 +35,7 @@ gcc -std=c11 -O2 -Wall -Wextra flocking/shepherd.c             -o shepherd      
 # ── fluid / grid sims ────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fluid/sand.c                    -o sand                -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/flowfield.c               -o flowfield           -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/complex_flowfield.c       -o complex_flowfield   -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/reaction_diffusion.c      -o reaction_diffusion  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/wave.c                    -o wave                -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/wave_2d.c                 -o wave_2d             -lncurses -lm
@@ -129,6 +130,7 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/particle_number_morph.c -o particle_numb
 gcc -std=c11 -O2 -Wall -Wextra artistic/dune_rocket.c         -o dune_rocket    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/dune_sandworm.c       -o dune_sandworm  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/sand_art.c            -o sand_art       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra artistic/dna.c                 -o dna            -lncurses -lm
 
 # ── animation / kinematics ───────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra animation/hexpod_tripod.c           -o hexpod_tripod           -lncurses -lm
@@ -229,6 +231,7 @@ gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer 
 - `wave_2d.c`              — 2-D scalar wave equation (∂²u/∂t²=c²∇²u): point sources emit circular wavefronts, multiple sources interfere; CFL-stable explicit Euler; signed amplitude colour map (blue/black/white)
 - `reaction_wave.c`        — FitzHugh-Nagumo excitable medium: two-variable activator/inhibitor PDE on terminal grid; spiral waves, target waves; 4 colour themes; interactive stimulus injection
 - `flowfield.c`         — Perlin noise flow field: 3-octave fBm, bilinear field sampling, 8-direction arrow glyphs, ring-buffer particle trails
+- `complex_flowfield.c` — 4-mode flow field visualiser: curl noise (divergence-free), vortex lattice (Biot-Savart), sine lattice (wave interference), radial spiral (galaxy); 6 cosine-palette themes (a+b·cos(2π(ct+d)) → xterm-256 cube, 16 color pairs); 3 background modes (blank/arrows/colormap); reset key `r`; particle trails with brightness ramp; §1-§9 layout
 - `navier_stokes.c`     — Jos Stam stable fluid: velocity+density N×N grid, Gauss-Seidel diffuse (warm-start), semi-Lagrangian advect, divergence-free project; two counter-rotating auto-emitters; dynamic density normalization; 3 dye colors; arrow-key wind; pre-warmed 80 steps at startup
 - `lenia.c`             — continuous Game of Life: convolution kernel + growth function, smooth organic creatures, multiple presets
 

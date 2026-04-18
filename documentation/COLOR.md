@@ -277,9 +277,9 @@ static const char k_ramp[] = " .:+x*X#@";
 
 ## 13. Velocity/Angle-to-Color Mapping
 
-**Where:** flowfield.c
+**Where:** `flowfield.c`, `complex_flowfield.c`
 
-**How it works:**
+**How it works — flowfield.c (8 pairs, 4 fixed themes):**
 In RAINBOW theme, the particle's velocity direction is mapped to a hue pair index. `atan2(-vy, vx)` returns the angle in `[-π, π]`; adding `π` shifts to `[0, 2π]`; dividing by `π/4` gives an octant index 0–7. Each octant maps to one of 8 color pairs registered to hues spanning the spectrum. In mono themes (CYAN, GREEN, WHITE), the same 8 pairs are instead used for trail age: index 1 = newest/brightest, index 8 = oldest/dimmest. The two uses are mutually exclusive and switched per theme.
 
 ```c
@@ -292,6 +292,37 @@ int pair = 1 + trail_age_index;   /* 1=newest/bright, 8=oldest/dim */
 ```
 
 **Effect:** In RAINBOW mode the particle head points in one of 8 directions and its color matches its direction — a rotating color wheel where the hue literally tells you where the flow is going. In mono mode the trail fades from bright to dim as it ages, encoding time as color.
+
+---
+
+## 13b. Pre-Baked Cosine Palette — Angle-to-Color (complex_flowfield.c)
+
+**Where:** `complex_flowfield.c`
+
+**How it works:**
+`complex_flowfield.c` replaces the fixed 8-color per-theme arrays with a cosine palette pre-baked into 16 color pairs at theme-change time. The cosine formula `color(t) = a + b·cos(2π·(c·t + d))` is evaluated at 16 evenly-spaced `t` values and each result is mapped to an xterm-256 cube index:
+
+```c
+/* Pre-bake 16 pairs for the active theme */
+for (int i = 0; i < 16; i++) {
+    float t  = (float)i / 15.f;          /* t ∈ [0, 1] */
+    float rf = a[0] + b[0] * cosf(2.f*M_PI*(c[0]*t + d[0]));  /* clamped */
+    float gf = a[1] + b[1] * cosf(2.f*M_PI*(c[1]*t + d[1]));
+    float bf = a[2] + b[2] * cosf(2.f*M_PI*(c[2]*t + d[2]));
+    int fg = 16 + 36*(int)(rf*5+.5f) + 6*(int)(gf*5+.5f) + (int)(bf*5+.5f);
+    init_pair(CP_BASE + i, fg, COLOR_BLACK);
+}
+
+/* Runtime: normalize angle to t, select pair */
+float t    = (angle < 0.f ? angle + 2.f*M_PI : angle) / (2.f*M_PI);
+int   pair = CP_BASE + (int)(t * 16) % 16;
+```
+
+Six themes are defined as `CosTheme { a[3], b[3], c[3], d[3], name }` structs — **cosmic** (violet→cyan→magenta), **ember** (red→orange→gold), **ocean** (navy→teal→cyan), **neon** (green→pink→violet), **sunset** (purple→crimson→amber), **mono** (silver-blue gradient).
+
+**Key difference from flocking.c:** `flocking.c` calls `init_pair()` every N animation frames to continuously animate the palette (real-time color cycling). `complex_flowfield.c` calls it once per theme change only — the palette is static between theme changes. The angle-to-pair mapping means adjacent flow directions always get adjacent palette colors, so the full-screen colormap (bg_mode 2) shows a smooth hue gradient that exactly mirrors the flow topology.
+
+**Effect:** In colormap mode (`v` key), every terminal cell is colored by its local flow angle via the cosine palette, producing a full-screen procedurally generated image. Switching field type or theme completely transforms the picture. Particle trails drawn on top at `A_BOLD` remain visible over the colormap background.
 
 ---
 
@@ -374,6 +405,7 @@ ncurses reserves pair 0 as the default (unmodifiable), giving 255 usable pairs (
 | raymarcher*.c | 8 | Grey ramp 235–255 |
 | torus/cube/sphere/displace_raster.c | 7 | Warm-to-cool luminance |
 | flowfield.c | 8 | 8 hue/age levels |
+| complex_flowfield.c | 16 | 16-step cosine palette, pre-baked at theme change; angle→pair at runtime |
 | sand.c | 4 | Grain density levels |
 | bonsai.c | 6 | Brown trunk, branches, leaf shades |
 | snowflake.c | 7 | 6 ice gradient pairs + 1 walker pair |

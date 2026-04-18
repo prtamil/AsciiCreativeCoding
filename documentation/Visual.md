@@ -669,7 +669,9 @@ init_pair(pair_num, cube_idx, COLOR_BLACK);   /* re-register pair mid-animation 
 
 The xterm-256 color cube occupies indices 16–231: `16 + 36r + 6g + b` where r,g,b ∈ [0,5]. Calling `init_pair()` during the animation loop is allowed — it takes effect on the next `doupdate()`. The cosine formula guarantees all RGB values stay in [0,1] and produces smoothly cycling, perceptually balanced hues.
 
-*Files: `flocking.c`*
+`complex_flowfield.c` uses the same cosine formula and xterm-256 cube mapping but registers all 16 pairs **once at theme-change time** rather than every N frames. The six themes are `CosTheme` structs with per-channel `a, b, c, d` parameters. Angle-to-pair mapping at runtime selects the pre-registered pair that corresponds to the particle's movement direction — no `init_pair()` cost per frame.
+
+*Files: `flocking.c`, `complex_flowfield.c`*
 
 ---
 
@@ -2073,6 +2075,21 @@ char ch = k_boid_chars[flock_id][octant];
 **Unicode arrows via `addwstr`** (→ V4.9) — `const char *k_dirs[8]` = `{"→","↗","↑","↖","←","↙","↓","↘"}`.
 
 **Ring-buffer trail coloring** (→ V5.14) — newest position gets pair 1 (brightest), oldest gets pair 8 (dimmest).
+
+---
+
+### fluid/complex_flowfield.c
+*Four field types, 6 cosine-palette themes, 3 background modes, 16 pre-baked color pairs.*
+
+**16 pairs, 6 cosine themes, pre-baked once** (→ V3.8) — `color_apply_theme(t)` evaluates the cosine palette formula at 16 evenly-spaced `t` values and calls `init_pair()` 16 times. No per-frame re-registration. Six `CosTheme` structs: cosmic, ember, ocean, neon, sunset, mono.
+
+**`angle_to_pair(angle)` — always hue** — normalises angle to `[0,1]` → `CP_BASE + (int)(t*16)%16`. All 16 pairs span one full cosine cycle, so every flow direction gets a distinct palette color. The colormap background and particle trails use the same mapping.
+
+**Three background modes** (→ V2.6) — `bg_mode=0` blank (trails only); `bg_mode=1` dim direction glyphs tinted by palette (wind-map aesthetic); `bg_mode=2` full colormap — every cell painted at `A_NORMAL` by `angle→pair`, particles on top at `A_BOLD`.
+
+**Four field type dispatch** — `field_tick()` switches on `field_type` (0=curl noise, 1=vortex lattice, 2=sine lattice, 3=radial spiral). All types write into the same `float *angles` grid; the rendering path is identical for all four.
+
+**`A_DIM`/`A_NORMAL`/`A_BOLD` brightness ramp on trails** — oldest quarter → `A_DIM`, middle half → `A_NORMAL`, newest (head) → `A_BOLD`. All cells use the same `head_pair` (from current angle) — brightness, not hue, encodes trail age. The direction glyph (`>^<v/\`) at the head makes the movement vector immediately readable.
 
 ---
 

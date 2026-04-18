@@ -43,20 +43,32 @@ attroff(attr);
 
 ## 3. Theme Switching / Dynamic Palette Cycling
 
-**Where:** fire.c, aafire_port.c
+**Where:** fire.c, smoke.c, aafire_port.c
 
 **How it works:**
-Six predefined `FireTheme` structs each contain 9 xterm-256 color indices covering a heat gradient. Themes cycle automatically every `CYCLE_TICKS` frames or on manual `t` keypress. `theme_apply()` re-registers all color pairs with the new theme's indices — no visual structure changes, only the palette.
+Each theme struct contains 9 xterm-256 color indices covering a gradient from cold/sparse to hot/dense. Themes switch on manual `t` keypress. `theme_apply()` re-registers all color pairs with the new theme's indices — no visual structure changes, only the palette. This pattern is shared by fire.c (6 fire themes), smoke.c (6 smoke themes), and aafire_port.c.
 
-**Themes:**
+**fire.c themes:**
 | Name   | Colors                                |
 |--------|---------------------------------------|
 | fire   | Red → orange → yellow                 |
-| ice    | Dark blue → cyan → white              |
-| plasma | Dark purple → magenta → white         |
-| nova   | Dark green → lime → white             |
-| poison | Green → yellow-green → white          |
-| gold   | Amber → bright yellow → white         |
+| ice    | Sky blue → cyan → white               |
+| plasma | Violet → magenta → white              |
+| nova   | Green → lime → white                  |
+| poison | Olive → yellow-green → white          |
+| gold   | Amber → orange → yellow               |
+
+**smoke.c themes:**
+| Name   | Colors                                |
+|--------|---------------------------------------|
+| gray   | Medium gray → white                   |
+| soot   | Cool dark-gray → light-gray           |
+| steam  | Sky blue → cyan → white               |
+| toxic  | Mid green → bright lime               |
+| ember  | Orange → yellow → white               |
+| arcane | Violet → pink → white                 |
+
+All palettes start at clearly visible mid-tones — no near-black (232–236) entries so even the faintest wisps show up on dark terminals.
 
 ```c
 static void theme_apply(int t) {

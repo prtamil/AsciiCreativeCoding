@@ -1,8 +1,16 @@
-# Pass 1 — fire.c: Doom-style cellular automaton fire with Floyd-Steinberg dithering
+# Pass 1 — fire.c: Three-algorithm ASCII fire with shared rendering pipeline
 
 ## Core Idea
 
-A 2-D grid of floating-point heat values simulates flame using a simple physics rule lifted from the original Doom game engine: heat rises from a "fuel row" at the bottom, spreads slightly left or right as it propagates upward, and cools as it travels. The heat values are converted to ASCII characters and terminal colors through a perceptual rendering pipeline involving gamma correction and Floyd-Steinberg error-diffusion dithering. The result is a flame that flickers realistically with natural spire shapes, gradients, and color. Six color themes (fire, ice, plasma, nova, poison, gold) cycle automatically every 300 ticks.
+A 2-D grid of floating-point heat values is written by one of three swappable physics algorithms, then rendered through a shared Floyd-Steinberg + perceptual-LUT pipeline. All three algorithms share common helpers for warmup ramp, wind accumulation, arch-shaped fuel seeding, and 3×3 Gaussian splat. Every tunable constant is a named `#define` in §1 presets so the algorithm functions contain only algorithm logic.
+
+**Algorithm 0 — Doom CA:** Heat rises from a bottom fuel row with random ±1 lateral jitter and per-cell adaptive decay. Produces natural spire shapes and sideways flicker.
+
+**Algorithm 1 — Particle fire:** A pool of 800 embers is born at the arch source zone and rises with upward vy. Each tick particles advance, then the heat grid is cleared and rebuilt by 3×3 Gaussian splat. Same rendering pipeline produces a denser, puffier flame.
+
+**Algorithm 2 — Plasma tongues:** Three overlapping sine harmonics define a "tongue height" per column; heat falls linearly from 1.0 at the base to 0 at the tongue tip. Entire grid recomputed from scratch each tick — no persistent state.
+
+Six color themes (fire, ice, plasma, nova, poison, gold) are switched manually with `t`.
 
 ## The Mental Model
 
@@ -16,18 +24,21 @@ The fuel row is shaped like an arch — hot in the center, fading at the edges, 
 
 ### Grid (§4)
 ```
-float *heat;      — [rows * cols] current heat values, 0.0 to MAX_HEAT (1.0)
-float *prev_heat; — [rows * cols] heat values from the previous drawn frame
-float *dither;    — [rows * cols] working buffer for Floyd-Steinberg errors
+float *heat;          — [rows * cols] current heat values, 0.0 to MAX_HEAT (1.0)
+float *prev_heat;     — [rows * cols] heat values from the previous drawn frame
+float *dither;        — [rows * cols] working buffer for Floyd-Steinberg errors
 int    cols, rows;
-float  fuel;      — user-controlled flame intensity [0.1, 1.0]
-int    wind;      — wind velocity in cells/tick, range -WIND_MAX to +WIND_MAX
-int    wind_acc;  — accumulated wind offset for the fuel row shift
-int    theme;     — index into k_themes[] (0 = fire, 1 = ice, ...)
-int    cycle_tick; — counts down to next auto-theme-cycle
-int    warmup;    — frame counter 0..80, controls startup intensity
+float  fuel;          — user-controlled flame intensity [0.1, 1.0]
+int    wind;          — wind velocity in cells/tick, range -WIND_MAX to +WIND_MAX
+int    wind_acc;      — accumulated wind offset (advanced by advance_wind each tick)
+int    theme;         — index into k_themes[] (0 = fire, 1 = ice, ...)
+int    warmup;        — frame counter 0→WARMUP_TICKS; warmup_scale() reads this
+int    algo;          — 0=CA  1=Particle  2=Plasma
+float  plasma_t;      — plasma: animation time counter, advances by PLASMA_TIME_STEP
+FirePart parts[800];  — particle pool for algo 1
+int    part_idx;      — round-robin spawn cursor
 ```
-The simulation and rendering state are both in this one struct. `heat` is the active grid being read/written this tick. After drawing, `heat` and `prev_heat` are swapped — `prev_heat` becomes what was just shown, `heat` is cleared for the next tick. `dither` is a scratch buffer that is filled once per frame and discarded.
+`heat` and `prev_heat` are pointer-swapped after each draw so the diff-based clearing never needs a full memset. `dither` is a scratch buffer refilled each frame.
 
 ### FireTheme (§3)
 ```
@@ -104,11 +115,7 @@ RUNNING ──── space key ────► PAUSED
    └───────── space key ──────────┘
 ```
 
-And the theme has an implicit cycle:
-```
-theme 0 (fire) ──── 300 ticks ────► theme 1 (ice) ──── 300 ticks ────► ... ──► theme 0
-               or 't' key at any time
-```
+Theme is changed only by the `t` key — there is no auto-cycling. The `a` key cycles the algorithm (CA → Particle → Plasma → CA).
 
 ## From the Source
 
@@ -124,14 +131,17 @@ theme 0 (fire) ──── 300 ticks ────► theme 1 (ice) ────
 
 | Constant | Default | Effect if changed |
 |---|---|---|
-| `DECAY_BASE` | 0.040 | Higher = shorter flames (more aggressive cooling); lower = taller flames |
-| `DECAY_RAND` | 0.060 | Higher = more variation in flame height (jagged tops); lower = more uniform |
-| `MAX_HEAT` | 1.0 | Scale factor only; raising it while keeping decay the same has no effect |
-| `CYCLE_TICKS` | 300 | More = longer time on each theme; fewer = rapid theme cycling |
+| `CA_REACH_FRAC` | 0.75 | Fraction of screen height the average flame peak targets; raise = taller flames |
+| `CA_DECAY_BASE_FRAC` | 0.55 | Base decay fraction; higher = more aggressive cooling per tick |
+| `CA_DECAY_RAND_FRAC` | 0.90 | Random decay fraction; higher = more variation in flame height (jagged tops) |
+| `ARCH_MARGIN_FRAC` | 0.04 | Fraction of cols kept cold at each side edge; higher = narrower base |
+| `WARMUP_TICKS` | 80 | Ticks to ramp fuel from 0→1 on startup; fewer = quicker ignition |
 | `WIND_MAX` | 3 | Maximum wind offset in cells/tick; higher = stronger lean |
-| `RAMP_N` | 9 | Number of distinct display levels; adding levels would require matching theme color entries |
-| warmup limit (80) | 80 ticks | Faster = quicker ignition; slower = longer cold startup |
-| fuel margin (0.10) | 10% each side | Higher = narrower base flame (taller but thinner); lower = fuel extends to edges |
+| `PART_LIFE_MIN` | 15 | Minimum particle lifetime in ticks; longer = taller particle flames |
+| `PART_LIFE_RANGE` | 20 | Random range added to lifetime; higher = more height variation |
+| `PLASMA_BASE` | 0.50 | DC offset for tongue height; raise to keep tongues above zero at all times |
+| `PLASMA_H1_AMP` | 0.28 | Amplitude of first sine harmonic; larger = more dramatic tongue swings |
+| `RAMP_N` | 9 | Number of distinct display levels; adding levels requires matching theme color entries |
 
 ## Open Questions for Pass 3
 
@@ -157,66 +167,119 @@ theme 0 (fire) ──── 300 ticks ────► theme 1 (ice) ────
 
 | Section | Purpose |
 |---|---|
-| §1 config | MAX_HEAT, DECAY_BASE/RAND, WIND_MAX, CYCLE_TICKS, SIM_FPS |
+| §1 presets | All named `#define` constants grouped by sub-system: source zone, CA decay, particle physics, plasma harmonics |
 | §2 clock | `clock_ns()`, `clock_sleep_ns()` |
 | §3 theme | 9-level ASCII ramp, gamma-corrected LUT breaks, FireTheme struct, 6 themes, `theme_apply()`, `ramp_attr()` |
-| §4 grid | `Grid` struct; `grid_tick()` — Doom CA + arch fuel; `grid_draw()` — Floyd-Steinberg + diff clear |
-| §5 scene | Owns Grid; thin wrappers for tick/draw/resize |
-| §6 screen | ncurses init/draw/present/resize; HUD |
-| §7 app | Signal handlers, main dt loop, key handling |
+| §4 grid | `Grid` struct; `grid_alloc()` / `grid_free()` / `grid_resize()` |
+| §5 shared helpers | `warmup_scale()`, `advance_wind()`, `arch_envelope()`, `seed_fuel_row()`, `splat3x3()` |
+| §6 algo 0 | `ca_fire_tick()` — Doom CA + arch fuel seeding |
+| §7 algo 1 | `particle_fire_tick()`, `fire_part_spawn()` — particle pool + 3×3 Gaussian splat |
+| §8 algo 2 | `plasma_fire_tick()` — three sine harmonics, no persistent state |
+| §9 scene | `scene_tick()` → dispatches to active algo; `scene_draw()` → `grid_draw()` |
+| §10 screen | ncurses init/draw/present/resize; HUD |
+| §11 app | Signal handlers, main dt loop, key handling |
 
 ---
 
 ## Data Flow Diagram
 
 ```
-grid_tick():
-  warmup_scale = min(1.0, tick_count / 80)
+scene_tick():
+  wind_acc += wind   ← accumulated ONCE here, before dispatch
 
-  Arch fuel seeding (bottom row):
-    for each x:
-      sx = x − margin − wind_acc
-      t = sx / span            [0..1 within flame zone]
-      edge_dist = min(t, 1−t)
-      arch = (edge_dist * 2)²  [squared = steep edges]
-      jitter = rand in [0.82, 1.0]
-      heat[bottom][x] = MAX_HEAT * fuel * arch * jitter * warmup_scale
+  dispatch on grid.algo:
+    0 → ca_fire_tick(grid)
+    1 → particle_fire_tick(grid)
+    2 → plasma_fire_tick(grid)
 
-  Propagation (all rows except bottom, top-to-bottom):
+── shared helpers used by all algos ──────────────────────────────────────
+
+warmup_scale(grid):
+  scale = clamp(warmup / WARMUP_TICKS, 0, 1)   [0.0→1.0 over 80 ticks]
+  warmup++
+  return scale
+
+advance_wind(grid):
+  wind_acc += wind
+  if wind_acc >= cols: wind_acc -= cols
+  if wind_acc < 0:     wind_acc += cols
+
+arch_envelope(x, cols, wind_acc):
+  margin = ARCH_MARGIN_FRAC * cols
+  span   = cols − 2 * margin
+  sx     = x − margin − wind_acc   [shifted by wind]
+  t      = sx / span               [0..1 within flame zone]
+  edge   = min(t, 1−t) * 2
+  return edge * edge               [squared = steep edges]
+
+seed_fuel_row(grid, wscale):
+  for each x:
+    arch    = arch_envelope(x, cols, wind_acc)
+    jitter  = FUEL_JITTER_BASE + rand × FUEL_JITTER_RANGE
+    heat[bottom][x] = MAX_HEAT × fuel × arch × jitter × wscale
+
+── algo 0: ca_fire_tick ──────────────────────────────────────────────────
+
+  wscale = warmup_scale(grid)
+  advance_wind(grid)
+  seed_fuel_row(grid, wscale)
+
+  Propagation (top to bottom, all rows except bottom):
     for each (x, y) from y=0 to rows-2:
-      rx = x + rand(-1, 0, +1)   [random horizontal spread]
+      rx  = x + rand(-1, 0, +1)    [Doom lateral jitter: sample ONE cell]
       src = heat[y+1][rx]
-      decay = DECAY_BASE + rand() * DECAY_RAND
+      decay = base + rand × range  [height-adaptive: CA_REACH_FRAC*rows target]
       heat[y][x] = max(0, src − decay)
 
-  wind_acc += wind (cyclic shift)
-  cycle_tick++ → auto-cycle theme every CYCLE_TICKS
+── algo 1: particle_fire_tick ────────────────────────────────────────────
 
-grid_draw():
-  for each cell (x, y):
-    v = heat[y][x]
-    if v <= 0:
-      if prev_heat[y][x] > 0:   ← was hot last frame
-        mvaddch(y, x, ' ')      ← erase stale char
-      continue                  ← skip cold cells otherwise
-    v = pow(v / MAX_HEAT, 1/2.2)  ← gamma correction
-    dither[y][x] = v
+  clear heat grid to 0
+  spawn SPAWN_PER_TICK new particles (fire_part_spawn via arch_envelope)
 
-  Floyd-Steinberg pass (left-to-right, top-to-bottom):
-    for each cell (x, y) with dither[y][x] >= 0:
-      idx = lut_index(dither[y][x])  ← find ramp level
-      qv  = lut_midpoint(idx)
-      err = dither[y][x] − qv        ← quantization error
-      distribute error to warm neighbours only:
-        right:       += err * 7/16
-        below-left:  += err * 3/16
-        below:       += err * 5/16
-        below-right: += err * 1/16
-      attr = COLOR_PAIR(CP_BASE + idx) [+ A_BOLD for top 2 levels]
-      mvaddch(y, x, k_ramp[idx])
+  for each live particle:
+    vx += rand(−PART_TURB_STEP, +PART_TURB_STEP)
+    vx *= PART_VX_DAMP
+    px += vx;  py += vy
+    heat -= PART_HEAT_FADE
+    if out-of-bounds or heat <= 0: mark dead
+    else: splat3x3(heat_grid, px, py, particle_heat)
+
+── algo 2: plasma_fire_tick ──────────────────────────────────────────────
+
+  wscale = warmup_scale(grid)
+  advance_wind(grid)
+  plasma_t += PLASMA_TIME_STEP
+
+  for each column x:
+    nx = x / cols
+    tongue = PLASMA_BASE
+           + H1_AMP * sin(nx*H1_XFREQ + plasma_t*H1_TSPD)
+           + H2_AMP * sin(nx*H2_XFREQ − plasma_t*H2_TSPD)
+           + H3_AMP * sin(nx*H3_XFREQ + plasma_t*H3_TSPD)
+    for each row y:
+      ny = y / rows                [0=top, 1=bottom]
+      arch = arch_envelope shifted by wind_acc
+      heat[y][x] = clamp((ny − (1−tongue)) / tongue, 0, 1) × arch × wscale
+
+── grid_draw (shared by all algos) ──────────────────────────────────────
+
+  gamma pass: for each cell v > 0: dither[i] = pow(v / MAX_HEAT, 1/2.2)
+              for each cell v ≤ 0: dither[i] = -1  (cold marker)
+
+  Floyd-Steinberg + draw (left-to-right, top-to-bottom):
+    for each cell (x, y):
+      if dither[i] < 0:
+        if prev_heat[i] > 0: mvaddch(y, x, ' ')   ← erase stale hot char
+        else: skip                                  ← no write, no flicker
+      else:
+        idx = lut_index(dither[i])
+        err = dither[i] − lut_midpoint(idx)
+        spread to warm neighbours: right 7/16, below-left 3/16,
+                                   below 5/16, below-right 1/16
+        mvaddch(y, x, k_ramp[idx]) with ramp_attr(idx, theme)
 
   swap heat ↔ prev_heat
-  copy new heat from prev_heat (so next tick writes into cleared buffer)
+  memcpy heat from prev_heat  (re-seed for next tick)
 ```
 
 ---
@@ -260,23 +323,68 @@ Steps:
 
 ---
 
-### grid_tick(grid) → bool (theme changed?)
-Purpose: one CA step — seed fuel, propagate heat, auto-cycle theme
+### warmup_scale(grid) → float
+Purpose: return ramp multiplier [0..1] and advance warmup counter
 Steps:
-1. warmup_scale = clamp(warmup / 80, 0, 1); warmup++
-2. wind_acc += wind (cyclic, reset if >= cols)
-3. Arch fuel seeding (bottom row):
-   - 10% margin each side
-   - Normalize position along span to t ∈ [0,1]
-   - arch = (min(t, 1-t) * 2)² — tall dome profile
-   - jitter = rand [0.82, 1.0] for organic edge
-   - heat[bottom][x] = MAX_HEAT × fuel × arch × jitter × warmup_scale
-4. Propagation (rows 0 to rows-2, top to bottom):
-   - rx = x + rand(-1..+1) — random lateral spread
-   - src = heat[y+1][clamped rx]
-   - decay = DECAY_BASE + rand × DECAY_RAND (0.04 to 0.10)
-   - heat[y][x] = max(0, src - decay)
-5. cycle_tick++; if >= CYCLE_TICKS: advance theme, reset warmup, return true
+1. scale = clamp(warmup / WARMUP_TICKS, 0.0, 1.0)
+2. warmup++
+3. return scale
+Note: all three algo functions call this first to gate fuel intensity on startup.
+
+---
+
+### advance_wind(grid)
+Purpose: move wind_acc forward by one tick and keep it in [0, cols)
+Steps:
+1. wind_acc += wind
+2. if wind_acc >= cols: wind_acc -= cols
+3. if wind_acc < 0:     wind_acc += cols
+Note: called at the start of each algo tick (not in scene_tick) for CA and plasma.
+      Particle algo also calls it.
+
+---
+
+### arch_envelope(x, cols, wind_acc) → float
+Purpose: squared arch profile [0..1] at column x, shifted by wind
+Steps:
+1. margin = ARCH_MARGIN_FRAC × cols
+2. t = (x − margin − wind_acc) / (cols − 2×margin)  [0..1 in flame zone]
+3. edge = min(t, 1−t) × 2                           [0 at edges, 1 at centre]
+4. return edge × edge                               [squared: steeper drop-off]
+Returns 0 outside the flame zone (clipped by caller before use).
+
+---
+
+### seed_fuel_row(grid, wscale)
+Purpose: fill bottom row with arch-shaped fuel, scaled by warmup and fuel knob
+Steps:
+1. For each x: arch = arch_envelope(x, cols, wind_acc)
+2. jitter = FUEL_JITTER_BASE + rand × FUEL_JITTER_RANGE
+3. heat[bottom][x] = MAX_HEAT × grid.fuel × arch × jitter × wscale
+
+---
+
+### splat3x3(heat, cols, rows, cx, cy, v)
+Purpose: deposit heat v at (cx,cy) via 3×3 Gaussian kernel
+Kernel weights (sum = 1.0):
+  corners      = 0.0625
+  edge-midpoints = 0.125
+  centre       = 0.25
+Steps:
+1. For dy in {-1, 0, +1}, dx in {-1, 0, +1}:
+   - Skip if out-of-bounds
+   - heat[(cy+dy)*cols + (cx+dx)] += v × weight[dy+1][dx+1]
+
+---
+
+### scene_tick(scene)
+Purpose: advance wind once, then dispatch to the active algo
+Steps:
+1. if paused: return
+2. dispatch on grid.algo:
+   - 0 → ca_fire_tick(grid)
+   - 1 → particle_fire_tick(grid)
+   - 2 → plasma_fire_tick(grid)
 
 ---
 
@@ -334,8 +442,7 @@ main loop (while running):
      sim_accum += dt
      while sim_accum >= tick_ns:
        if not paused:
-         theme_changed = grid_tick()
-         if theme_changed: erase()  ← clear old theme chars
+         scene_tick()   ← dispatches to ca/particle/plasma based on grid.algo
        sim_accum -= tick_ns
 
   4. FPS counter (every 500ms)
@@ -351,9 +458,10 @@ main loop (while running):
   7. input:
      q/ESC   → quit
      space   → toggle paused
+     a       → next algorithm (0→1→2→0), reset warmup, needs_clear = true
+     t       → next theme, reset warmup, needs_clear = true
      ]       → sim_fps += 5
      [       → sim_fps -= 5
-     t       → advance theme, reset warmup, needs_clear = true
      g       → fuel -= 0.1
      G       → fuel += 0.1
      w       → wind++ (right)
@@ -367,15 +475,23 @@ main loop (while running):
 
 ```
 App
- └── main loop: sim_accum → scene_tick → grid_tick → CA + fuel seeding
+ └── main loop: sim_accum → scene_tick → [ca_fire_tick | particle_fire_tick | plasma_fire_tick]
                 render → grid_draw → Floyd-Steinberg → mvaddch
-                input → fuel/wind/theme adjustments
+                input → algo/theme/fuel/wind adjustments
+
+§5 shared helpers (called by all three algos)
+ ├── warmup_scale()     — ramp 0→1 over WARMUP_TICKS, increments grid.warmup
+ ├── advance_wind()     — wind_acc += wind, cyclic wrap
+ ├── arch_envelope()    — squared arch profile, wind-shifted
+ ├── seed_fuel_row()    — bottom row arch-shaped fuel
+ └── splat3x3()         — 3×3 Gaussian deposit into heat grid
 
 Grid
- ├── heat[]     — current frame physics
- ├── prev_heat[] — previous drawn frame (for diff clearing)
- ├── dither[]   — working float buffer for Floyd-Steinberg
- └── table (aafire only) — precomputed decay LUT
+ ├── heat[]         — current frame physics (written by active algo)
+ ├── prev_heat[]    — previous drawn frame (for diff clearing)
+ ├── dither[]       — working float buffer for Floyd-Steinberg
+ ├── parts[800]     — particle pool (used by algo 1 only)
+ └── plasma_t       — plasma animation time counter (algo 2 only)
 
 §3 theme
  ├── k_ramp[], k_lut_breaks[] — shared between fire.c and aafire_port.c

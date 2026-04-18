@@ -381,9 +381,13 @@ Rockets cycle through `IDLE → RISING → EXPLODED`; fire columns have `COLD / 
 Each cell is either empty or sand. Each tick, process bottom-to-top: try to fall straight down; if blocked, try a random diagonal; if both blocked, try wind drift; otherwise mark stationary. Processing bottom-to-top prevents a grain from moving multiple cells in one tick (which would look like teleportation).
 *Files: `sand.c`*
 
-#### E2 Doom-style Fire — Heat Diffusion CA
-Each cell's heat value diffuses upward by averaging with three neighbours below, then subtracts a small decay. The bottom row is periodically seeded with maximum heat. The result is a convincing fire that rises, flickers, and fades — achieved with a 3-line update rule and no fluid simulation.
-*Files: `fire.c`*
+#### E2 Doom-style Fire — Heat Diffusion CA + Multi-Algorithm Grid Sims
+The base CA rule: each cell samples ONE randomly-jittered neighbour from one row below and subtracts a decay term — not an average, a single sample. The lateral jitter (±1 col) is why flames flicker sideways rather than rising straight. The bottom row is arch-shaped fuel seeded every tick.
+
+`fire.c` extends this with two additional algorithms switchable at runtime: **particle fire** (pool of embers 3×3 Gaussian-splatted onto the heat grid) and **plasma tongues** (sine-harmonic procedural columns, no persistent state). All three write into the same float grid and share the same Floyd-Steinberg + perceptual-LUT rendering pipeline. All tunable constants are named `#define` presets and shared helpers (`warmup_scale`, `advance_wind`, `arch_envelope`, `seed_fuel_row`, `splat3x3`) are factored out so no algo function duplicates the boilerplate.
+
+`smoke.c` uses the same architecture with 3 smoke-specific algorithms: CA diffusion (±2 lateral jitter for broader billow), particle puffs (quadratic life² fade, bilinear splat), and vortex advection (Biot-Savart point vortices, semi-Lagrangian back-trace). Wind is accumulated once per tick in `scene_tick()` before dispatch to any algorithm.
+*Files: `fire.c`, `smoke.c`*
 
 #### E3 aafire 5-Neighbour CA
 The aalib variant samples five neighbours (three below plus two diagonals two rows below) and averages them, producing rounder, slower-rising blobs compared to Doom's sharper spikes. A precomputed `minus` value based on screen height normalises the decay rate so the flame height is consistent at any terminal size.

@@ -9,7 +9,7 @@
    ╚═╝     ╚══════╝  ╚═╝  ╚═╝  ╚═╝     ╚═╝    blackhole.c  terminal as canvas
 ```
 
-146 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+147 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -250,7 +250,7 @@ See `Claude.md` for the complete build list.
 ├── geometry/          — parametric curves, grids, computational geometry (lissajous, voronoi, convex hull…)
 ├── matrix_rain/       — Matrix rain variants (classic rain, DLA snowflake hybrid)
 ├── misc/              — sorting, maze, forest fire
-├── particle_systems/  — fire, fireworks, explosions
+├── particle_systems/  — fire (3 algos), smoke (3 algos), fireworks, explosions
 ├── physics/           — Lorenz, N-body, cloth, pendulums, Ising, Schrödinger, Schwarzschild black hole
 ├── raster/            — software rasterizer (torus, cube, sphere)
 ├── raymarcher/        — SDF ray marching

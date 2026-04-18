@@ -21,6 +21,7 @@ gcc -std=c11 -O2 -Wall -Wextra matrix_rain/fireworks_rain.c  -o fireworks_rain  
 
 # ── particle systems ─────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra particle_systems/fire.c         -o fire         -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra particle_systems/smoke.c        -o smoke         -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra particle_systems/aafire_port.c  -o aafire        -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra particle_systems/fireworks.c    -o fireworks     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra particle_systems/brust.c        -o brust         -lncurses -lm
@@ -209,7 +210,8 @@ gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer 
 - `fireworks_rain.c`   — Fireworks with matrix-rain arc trails: rockets explode at apex, each of 72 sparks grows a 16-slot position-history trail; characters shimmer 75 % per tick; head=white/bold, trail fades by color pair; 5 themes (vivid/matrix/fire/ice/plasma) remap all 7 spark color pairs; ] [ = - t
 
 ### particle_systems/
-- `fire.c`              — Doom-style fire CA: heat diffusion, Floyd-Steinberg dithering, 6 auto-cycling color themes, wind and gravity controls
+- `fire.c`              — 3-algorithm fire: Doom CA (lateral ±1 jitter, adaptive decay), particle pool (3×3 Gaussian splat), plasma tongues (sine harmonics); shared helpers (warmup_scale / advance_wind / arch_envelope / seed_fuel_row / splat3x3); all tunable values as named `#define` presets; 6 themes; §1-§11 layout
+- `smoke.c`             — 3-algorithm smoke: CA diffusion (±2 lateral jitter), particle puffs (life² quadratic fade, bilinear splat), vortex advection (Biot-Savart, semi-Lagrangian back-trace); named presets + shared helpers; 6 smoke themes; §1-§10 layout
 - `aafire_port.c`       — aalib fire variant: 5-neighbour CA, per-row decay LUT, 9-step `attr_t` brightness gradient
 - `fireworks.c`         — rocket fireworks: IDLE → RISING → EXPLODED state machine, particle pool, gravity + drag
 - `brust.c`             — random explosion bursts: staggered particle waves, scorch mark persistence, `A_DIM` residue rendering

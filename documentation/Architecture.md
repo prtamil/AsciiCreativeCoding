@@ -32,7 +32,7 @@ Reference implementation: `basics/bounce_ball.c`
     - [Mesh and Tessellation](#mesh-and-tessellation)
     - [Vertex and Fragment Shaders](#vertex-and-fragment-shaders)
     - [Displacement (displace_raster.c)](#displacement-displace_rasterc)
-13. [Cellular Automata — fire.c, aafire_port.c, sand.c](#13-cellular-automata--firec-aafire_portc-sandc)
+13. [Cellular Automata & Particle Grid Sims — fire.c, smoke.c, aafire_port.c, sand.c](#13-cellular-automata--firec-smokec-aafire_portc-sandc)
 14. [Flow Field — flowfield.c](#14-flow-field--flowfieldc)
 15. [Flocking Simulation — flocking.c](#15-flocking-simulation--flockingc)
 16. [Bonsai Tree — bonsai.c](#16-bonsai-tree--bonsaic)
@@ -939,27 +939,86 @@ N'  = normalize(cross(T', B'))
 
 ---
 
-## 13. Cellular Automata — fire.c, aafire_port.c, sand.c
+## 13. Cellular Automata & Particle Grid Sims — fire.c, smoke.c, aafire_port.c, sand.c
 
-### Doom Fire — Heat Diffusion CA
+### fire.c — Three-Algorithm Fire
 
-`fire.c` models fire as a 2-D heat grid `[rows × cols]`:
+`fire.c` writes a `[rows × cols]` float heat grid and renders it through a shared Floyd-Steinberg + perceptual-LUT pipeline.  Three algorithms are runtime-switchable with `a`:
 
+**Algo 0 — Doom CA** (Fabien Sanglard, 2013):
 ```
-Bottom row: held at MAX_HEAT (fuel line, arch-shaped, wind-offset each tick)
-Every other cell:
-  heat[y][x] = (heat[y+1][x-1] + heat[y+1][x] + heat[y+1][x+1] + heat[y+1][rand_neighbour]) / 4
-             - decay
+Bottom row: arch-shaped fuel (warmup-scaled at startup, wind-shifted each tick)
+For each cell (x, y) from top to rows-2:
+  rx = x + rand(-1, 0, +1)          lateral jitter → sideways flicker
+  src = heat[y+1][rx]               sample ONE cell below (not average)
+  heat[y][x] = max(0, src − decay)
 ```
+Decay is computed from screen height: `avg_d = MAX_HEAT / (rows × CA_REACH_FRAC)`.  Split into `d_base = avg_d × 0.55` and `d_rand = avg_d × 0.90` so flame peak sits at 75% of terminal height on any terminal size.
 
-The seeded bottom row uses an arch shape: `heat = MAX_HEAT * sin(π * x / cols)^0.6`. Wind is implemented by offsetting the arch centre each tick, making flames lean.
-
-**Rendering pipeline:**
+**Algo 1 — Particle fire:**
+`MAX_FIRE_PARTS = 800` particles are born at the arch source zone, rise with upward `vy`, carry a `heat` value that fades by `decay = 1/lifetime` each tick.  On each tick all active particles advance, then the heat grid is cleared and rebuilt by 3×3 Gaussian splat:
 ```
-heat[][] → Floyd-Steinberg dithering → perceptual LUT → color LUT → mvaddch
+Kernel (sum=1): corners=0.0625, edge-midpoints=0.125, centre=0.25
+splat3x3(heat, cx, cy, p->heat)
 ```
+This fills the grid densely enough that the same Floyd-Steinberg pipeline renders it identically to the CA mode.
 
-The Floyd-Steinberg pass works on a scratch copy of the heat grid (`heat_work`). After quantization, the rounding error is distributed to four unprocessed neighbours. This produces smooth gradients without the regular pattern of ordered dithering.
+**Algo 2 — Plasma tongues:**
+No persistent grid state.  Each tick the entire grid is recomputed from three overlapping sine harmonics:
+```
+tongue(x, t) = PLASMA_BASE
+             + H1_AMP × sin(wx × H1_XFREQ + t × H1_TSPD)
+             + H2_AMP × sin(wx × H2_XFREQ − t × H2_TSPD)
+             + H3_AMP × sin(wx × H3_XFREQ + t × H3_TSPD)
+heat(x, y) = clamp((ny − (1 − tongue)) / tongue, 0, 1)
+```
+where `ny = y/rows` (0 at top, 1 at bottom — same direction as CA).
+
+**§5 Shared helpers** (called by all three algos):
+- `warmup_scale(g)` — ramp 0→1 over WARMUP_TICKS=80; increments counter
+- `advance_wind(g)` — wind_acc += wind, wraps at cols
+- `arch_envelope(x, cols, wind_acc)` — squared arch weight [0,1] at column x
+- `seed_fuel_row(g, wscale)` — write arch-shaped fuel to bottom row
+- `splat3x3(heat, cols, rows, cx, cy, v)` — 3×3 Gaussian deposit
+
+**All magic floats are named `#define` presets in §1**, grouped: source zone, CA decay, particle physics, plasma harmonics.  No unnamed float literals appear in any algo function.
+
+**Rendering pipeline (shared):**
+```
+heat[][] → gamma pow(v, 1/2.2) → Floyd-Steinberg dither → perceptual LUT → mvaddch
+```
+Diff-based clearing: cold cells that were also cold last frame get no write.  Only cells hot last frame but cold now emit an explicit `' '`.
+
+**Sections:** §1 presets · §2 clock · §3 theme · §4 grid · §5 shared helpers · §6 CA algo · §7 particle algo · §8 plasma algo · §9 scene · §10 screen · §11 app
+
+---
+
+### smoke.c — Three-Algorithm Smoke
+
+`smoke.c` shares the same Floyd-Steinberg + perceptual-LUT rendering pipeline as fire.c, with a softer ramp `" .,:coO0#"` and six smoke-specific color themes (gray/soot/steam/toxic/ember/arcane).  Three algorithms switchable with `a`:
+
+**Algo 0 — CA diffusion:**
+Same structure as fire.c CA but with `CA_JITTER_RANGE = ±2` columns (vs fire's ±1) giving smoke's characteristic lateral billow.  Decay targets `CA_REACH_FRAC = 0.60` of rows (vs fire's 0.75) for a lower, denser column.
+
+**Algo 1 — Particle puffs:**
+`MAX_PARTS = 400` particles; density rendered = `life²` (quadratic fade for long soft trails vs fire's linear fade).  Bilinear splat (2×2 tent filter) rather than 3×3 Gaussian — smoke puffs are softer and larger than fire embers.
+
+**Algo 2 — Vortex advection:**
+Three point vortices orbit the screen centre.  Velocity at any point via 2D Biot-Savart:
+```
+vx += strength × (−dy) / (r² + VORT_EPS)
+vy += strength × ( dx) / (r² + VORT_EPS)
+```
+Semi-Lagrangian advection: `new_d[p] = bilinear(old_d, p − v(p) × ADV_DT) × (1 − decay) + source(p)`.  `ADV_DT = 0.8` keeps advection stable.
+
+**Key structural differences from fire.c:**
+- `WARMUP_CAP = 200` (vs fire's implicit cap at WARMUP_TICKS) prevents counter overflow
+- Vortex presets stored as `static const float VORT_ORB_FRACS[]`, `VORT_STRENGTHS[]` etc. at file scope — not local arrays in `vortex_init()`
+- Wind accumulated **once** in `scene_tick()` before dispatch; `vortex_tick()` does not touch `wind_acc`
+
+**Sections:** §1 presets · §2 clock · §3 theme · §4 shared helpers · §5 CA algo · §6 particle algo · §7 vortex algo · §8 scene · §9 screen · §10 app
+
+---
 
 ### aafire 5-Neighbour CA
 

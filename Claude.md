@@ -134,6 +134,10 @@ gcc -std=c11 -O2 -Wall -Wextra artistic/dune_sandworm.c       -o dune_sandworm  
 gcc -std=c11 -O2 -Wall -Wextra artistic/sand_art.c            -o sand_art       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra artistic/dna.c                 -o dna            -lncurses -lm
 
+# ── robots ───────────────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra robots/walking_robot.c       -o walking_robot       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra robots/perlin_terrain_bot.c  -o perlin_terrain_bot  -lncurses -lm
+
 # ── animation / kinematics ───────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra animation/hexpod_tripod.c           -o hexpod_tripod           -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra animation/ik_spider.c               -o ik_spider               -lncurses -lm

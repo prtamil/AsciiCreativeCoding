@@ -148,6 +148,8 @@ Reference implementation: `basics/bounce_ball.c`
 111. [Torus Raytrace — raytracing/torus_raytrace.c](#111-torus-raytrace--raytracingtorus_raytracec)
 112. [Beam Bending & Vibration — physics/beam_bending.c](#112-beam-bending--vibration--physicsbeam_bendingc)
 113. [Differential Drive Robot — physics/diff_drive_robot.c](#113-differential-drive-robot--physicsdiff_drive_robotc)
+114. [Walking Robot — robots/walking_robot.c](#114-walking-robot--robotswalking_robotc)
+115. [Perlin Terrain Bot — robots/perlin_terrain_bot.c](#115-perlin-terrain-bot--robotsperlin_terrain_botc)
 
 ---
 
@@ -4026,6 +4028,47 @@ The robot's centre traces a 600-slot ring buffer (`TRAIL_CAP=600`), sampled ever
 World-wrap interpolation suppression: if `|Δpx| > world_width/2` the interpolation delta is clamped to zero, preventing a ghost streak across the screen when the robot wraps a toroidal edge.
 
 *Files: `physics/diff_drive_robot.c`*
+
+---
+
+## 114. Walking Robot — robots/walking_robot.c
+
+A procedural bipedal walk cycle simulation combining sinusoidal forward kinematics for the swing phase with 2-joint analytical IK for the stance phase.
+
+**Gait architecture:** The walk cycle drives joint angles via sinusoidal FK for each leg in swing. Foot contact locking freezes the grounded foot's world position so the body glides over it — this is the stance IK phase. The solver uses the standard 2-joint law-of-cosines formula to find hip and knee angles given the locked foot target.
+
+**Body dynamics:** Body sway is computed as a lateral sinusoid locked to the step frequency. A separate vertical oscillation creates the characteristic human bounce. Centre-of-mass (COM) projection is drawn as a vertical line from the pelvis to the ground, giving immediate visual feedback on balance.
+
+**Rendering:** Motion trails are stored in a ring buffer and rendered behind the figure using fading characters. A shadow ellipse is projected below the feet. The ground grid is toggled with `g`. Hotkeys: `SPACE` pause, `r` reverse, `+`/`-` speed, `.` step-frame, `[`/`]` Hz.
+
+*Files: `robots/walking_robot.c`*
+
+---
+
+## 115. Perlin Terrain Bot — robots/perlin_terrain_bot.c
+
+A self-balancing single-wheel robot navigating infinite 1D Perlin fBm terrain. The physics are an inverted pendulum (Lagrangian cart-pole) formulated on a sloped surface.
+
+**Physics model:** The equation of motion is the Lagrangian cart-pole on slope:
+
+```
+θ_ddot = (g·sin(θ_eff) − ẍ·cos(θ_eff)) / L
+```
+
+where `θ_eff = θ − α` accounts for terrain slope `α`. The cart acceleration `ẍ` is the PID output.
+
+**PID controller:** Proportional, integral, and derivative terms act on the pendulum angle error. A cascade position control loop generates a slope-corrected angle reference `θ_ref = −α×0.65`. Integral windup is clamped to prevent runaway accumulation on sustained slope.
+
+**Terrain:** A 1D Perlin fBm ring buffer generates infinite scrolling terrain ahead of the bot. The slope `α` is computed as the finite-difference gradient of the height field at the bot's position.
+
+**Interactive views (key `m` to cycle):**
+- TELEMETRY — bar-graph display of P/I/D contributions and state variables
+- EQUATIONS — live Lagrangian values substituted into the symbolic EOM
+- PHASE SPACE — θ vs ω phase portrait with 240-sample convergence trail and regime classification (stable/settling/underdamped/overdamped)
+
+**Gain presets (key `g` to cycle):** Six named presets (BALANCED, HIGH Kp, LOW Kp, NO Kd, HIGH Kd, NO Ki) are designed to teach PID tuning by showing characteristic failure modes side-by-side in the phase portrait.
+
+*Files: `robots/perlin_terrain_bot.c`*
 
 ---
 

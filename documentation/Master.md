@@ -56,6 +56,8 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [D16 Quantum Wavepacket — Crank-Nicolson / Thomas Algorithm](#d16-quantum-wavepacket--crank-nicolson--thomas-algorithm)
 - [D17 Euler-Bernoulli Beam — Analytical Statics + Modal Dynamics](#d17-euler-bernoulli-beam--analytical-statics--modal-dynamics)
 - [D18 Differential Drive Robot — Nonholonomic Kinematics](#d18-differential-drive-robot--nonholonomic-kinematics)
+- [D19 Inverted Pendulum — Lagrangian Cart-Pole on Slope](#d19-inverted-pendulum--lagrangian-cart-pole-on-slope)
+- [D20 PID Controller — Proportional/Integral/Derivative with Windup Clamp](#d20-pid-controller--proportionalintegralderivative-with-windup-clamp)
 
 ### E — Cellular Automata & Grid Simulations
 - [E1 Falling Sand — Gravity CA](#e1-falling-sand--gravity-ca)
@@ -2294,6 +2296,63 @@ A common mistake is to use the screen-geometry perpendicular without accounting 
 **Why V_DECAY = 1.0 (no linear decay):** A real wheeled robot on flat ground has negligible rolling resistance at low speeds. Setting decay < 1.0 per tick at 60 Hz creates exponential drag that makes the robot stop within a second of key release — counterintuitive and physically wrong for a flat surface. The user controls speed explicitly; braking requires the dedicated S key.
 
 *Files: `physics/diff_drive_robot.c`*
+
+---
+
+## D19 Inverted Pendulum — Lagrangian Cart-Pole on Slope
+
+The inverted pendulum is the canonical benchmark for control theory. A pole of length L is hinged at the top of a cart. The goal is to keep it upright by accelerating the cart horizontally.
+
+**Lagrangian derivation on flat ground:** With generalised coordinates cart position x and pole angle θ (measured from vertical), the Lagrangian L = T − V yields the coupled EOM. After eliminating the cart equation the pole dynamics reduce to:
+
+```
+θ_ddot = (g·sin(θ) − ẍ·cos(θ)) / L
+```
+
+This is the core equation: gravity pulls the pole over (`g·sin(θ)`), and cart acceleration pushes it back (`−ẍ·cos(θ)`).
+
+**Slope generalisation:** On terrain with slope angle α the effective angle is `θ_eff = θ − α`. The equilibrium is no longer vertical — the bot must lean into the slope. The equation becomes:
+
+```
+θ_ddot = (g·sin(θ_eff) − ẍ·cos(θ_eff)) / L
+```
+
+The slope thus enters purely as an offset to θ in both the sin and cos terms.
+
+**Why linearise around zero?** For small angles sin(θ) ≈ θ and cos(θ) ≈ 1, giving `θ_ddot ≈ (g·θ − ẍ)/L`. This is the linear model standard PID is tuned against. The full nonlinear form is used here for visual correctness at larger angles.
+
+**Numerical integration:** Symplectic Euler (update ω first, then θ from updated ω) is unconditionally energy-preserving for the undamped case and is preferred over explicit Euler which would inject energy and cause instability.
+
+*Files: `robots/perlin_terrain_bot.c`*
+
+---
+
+## D20 PID Controller — Proportional/Integral/Derivative with Windup Clamp
+
+A PID controller closes a feedback loop by computing a corrective action from three terms acting on the error signal `e = setpoint − measurement`.
+
+**The three terms:**
+
+```
+u(t) = Kp·e(t)  +  Ki·∫e dt  +  Kd·(de/dt)
+```
+
+- **P (proportional):** Immediate reaction proportional to current error. High Kp gives fast response but causes overshoot and oscillation.
+- **I (integral):** Accumulates past error to eliminate steady-state offset. Slow to act; too high causes "integral windup" where the integrator saturates and the controller overshoots badly on recovery.
+- **D (derivative):** Reacts to the rate of change of error, damping oscillations. Sensitive to noise; too high amplifies measurement noise.
+
+**Integral windup clamp:** The integral accumulator is clamped to `[-IMAX, +IMAX]` every tick. Without this, a sustained large error (e.g. the bot hitting a steep slope and falling) saturates the integrator. When the error finally reverses, the clamped integrator lets the controller recover quickly instead of fighting a large stored charge.
+
+**Cascade control (position + angle):** The outer loop is position control: an error in horizontal speed or position generates a desired lean angle. The inner loop is angle control: the angle error drives the wheel torque (cart acceleration `ẍ`). The slope feed-forward `θ_ref = −α×0.65` is added to the outer-loop setpoint so the bot pre-leans into the hill rather than waiting for the angle error to build up.
+
+**Gain preset teaching:** The six named presets in `perlin_terrain_bot.c` show characteristic PID failure modes in the phase portrait:
+- HIGH Kp: fast but oscillatory spiral in phase space
+- LOW Kp: sluggish, large excursion before settling
+- NO Kd: underdamped, persistent oscillation
+- HIGH Kd: overdamped, slow creep to equilibrium
+- NO Ki: stable but with persistent lean offset on slope
+
+*Files: `robots/perlin_terrain_bot.c`*
 
 ---
 

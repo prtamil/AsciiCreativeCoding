@@ -96,6 +96,17 @@ Bridges kinematic geometry with the physics patterns from Tier 2. Introduces art
 | `ik_tentacle_seek.c` | FABRIK on seeking tentacles | Wandering target, per-segment reach tolerance |
 | `ragdoll_figure.c` | Verlet ragdoll skeleton | Verlet integration, iterative distance-constraint projection |
 | `ragdoll_ropes.c` | Verlet rope chains, multi-rope sway | Damping, phase-offset anchors, constraint relaxation |
+| `walking_robot.c` | Procedural bipedal walk cycle — sinusoidal FK, 2-joint analytical IK stance, foot contact locking | Sinusoidal FK gait, law of cosines IK, COM projection, shadow ellipse, motion trails |
+
+---
+
+## Tier 2.6 — Control Systems (1–2 months)
+**Prerequisites: Tier 2 (Lagrangian mechanics, Euler integration) and Tier 2.5 (IK, procedural locomotion).**
+Introduces closed-loop feedback control, stability analysis, and the phase-space view of dynamical systems.
+
+| File | Subject | Key Math |
+|---|---|---|
+| `perlin_terrain_bot.c` | Self-balancing wheel bot on infinite Perlin terrain | Lagrangian cart-pole on slope: θ_ddot = (g·sin(θ_eff) − ẍ·cos(θ_eff))/L; PID controller (P/I/D terms), integral windup clamp; cascade slope feed-forward θ_ref = −α×0.65; 1D Perlin fBm terrain ring buffer; phase portrait (θ vs ω); six named gain presets (BALANCED/HIGH Kp/LOW Kp/NO Kd/HIGH Kd/NO Ki); regime classification (stable/settling/underdamped/overdamped) |
 
 ---
 
@@ -205,6 +216,7 @@ Agent-based simulation, graph algorithms, complex systems.
 | Month 1–2 | Framework + Tier 1 | Rewrite 5 Tier 1 files from scratch |
 | Month 3–5 | Tier 2 | Understand RK4, Verlet; rewrite lorenz from paper |
 | Month 6–8 | Tier 2.5 — Character Animation | Implement FK chain from scratch; solve a 2-joint IK analytically; build a Verlet ragdoll |
+| Month 8–9 | Tier 2.6 — Control Systems | Derive Lagrangian cart-pole EOM; implement PID from scratch; tune gains using phase portrait |
 | Month 9–12 | Tier 3 | Implement Gray-Scott and Navier-Stokes from equations alone |
 | Month 13–17 | Tier 4 | Derive Crank-Nicolson; implement Ising from Metropolis paper |
 | Month 18–21 | Tier 5 | Build a software rasterizer from scratch |
@@ -219,6 +231,7 @@ Agent-based simulation, graph algorithms, complex systems.
 | 1 | *The Nature of Code* — Daniel Shiffman |
 | 2 | *Physics-Based Animation* — Kenny Erleben |
 | 2.5 | *Computer Animation: Algorithms and Techniques* — Rick Parent |
+| 2.6 | *Feedback Control of Dynamic Systems* — Franklin, Powell & Emami-Naeini |
 | 3 | *Fluid Simulation for Computer Graphics* — Robert Bridson |
 | 4 | *Statistical Mechanics* — Reif; *Quantum Mechanics* — Griffiths |
 | 5 | *Real-Time Rendering* — Akenine-Möller |

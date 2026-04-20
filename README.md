@@ -9,7 +9,7 @@
    ╚═╝     ╚══════╝  ╚═╝  ╚═╝  ╚═╝     ╚═╝    blackhole.c  terminal as canvas
 ```
 
-153 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+155 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -167,6 +167,8 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `ragdoll_figure` | Ragdoll stick figure — constraint-projected Verlet joints, momentum carry-over |
 | `snake_inverse_kinematics` | FABRIK inverse kinematics snake — iterative forward/backward reach solver |
 | `fk_centipede` | Centipede — forward kinematics body chain, leg phase offsets |
+| `walking_robot` | Procedural bipedal walk cycle — sinusoidal FK, 2-joint analytical IK stance, foot contact locking, body sway, shadow ellipse, COM projection, motion trails, ground grid |
+| `perlin_terrain_bot` | Self-balancing wheel bot — inverted pendulum Lagrangian cart-pole on Perlin terrain slope; PID controller with cascade slope feed-forward; phase portrait, gain preset tuning |
 
 ### Artistic / Biological
 | Program | Algorithm |
@@ -261,6 +263,7 @@ See `Claude.md` for the complete build list.
 ├── raymarcher/        — SDF ray marching
 ├── raytracing/        — analytic ray tracing (sphere, cube, torus, capsule)
 ├── animation/         — kinematics, IK solvers, legged locomotion
+├── robots/            — advanced robot simulations (bipedal walk cycle, self-balancing bot)
 ├── ncurses_basics/    — framework reference implementations
 └── documentation/
     ├── Claude.md          — complete build reference

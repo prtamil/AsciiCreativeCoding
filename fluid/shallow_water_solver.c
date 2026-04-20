@@ -731,26 +731,70 @@ static void preset_apply(Scene *s, int id, int cols, int rows);
 static const char k_arrows[8] = { '>', '/', 'v', '\\', '<', '/', '^', '\\' };
 
 /*
+ * is_shoreline_cell() — return true if (r,c) straddles a zero-crossing in h.
+ *
+ * A shoreline / wavefront cell is near zero AND has at least one neighbour
+ * above shore_thresh AND one below -shore_thresh.  This means a zero-crossing
+ * of h is happening between (r,c) and a neighbour — the physical waterline
+ * passes through here.
+ *
+ * WHY check opposite-sign neighbours, not just |h| < thresh:
+ *   A cell with h ≈ 0 at rest (no wave passing) would be dimly drawn in the
+ *   height shading.  We only want to mark cells that are actively straddling
+ *   a wavefront.  Opposite-sign neighbours confirm a zero-crossing is present.
+ *
+ * WHY skip obstacle neighbours:
+ *   Obstacles are forced to h=0.  Without the g_obs guard, every obstacle edge
+ *   would look like a shoreline because g_h at the obstacle is always near-zero
+ *   with a non-zero interior neighbour — a false positive.
+ */
+static bool is_shoreline_cell(int r, int c, int rows, int cols,
+                               float shore_thresh)
+{
+    bool near_pos = false, near_neg = false;
+    if (r > 0       && !g_obs[r-1][c]) {
+        near_pos |= (g_h[r-1][c] >  shore_thresh);
+        near_neg |= (g_h[r-1][c] < -shore_thresh);
+    }
+    if (r < rows-1  && !g_obs[r+1][c]) {
+        near_pos |= (g_h[r+1][c] >  shore_thresh);
+        near_neg |= (g_h[r+1][c] < -shore_thresh);
+    }
+    if (c > 0       && !g_obs[r][c-1]) {
+        near_pos |= (g_h[r][c-1] >  shore_thresh);
+        near_neg |= (g_h[r][c-1] < -shore_thresh);
+    }
+    if (c < cols-1  && !g_obs[r][c+1]) {
+        near_pos |= (g_h[r][c+1] >  shore_thresh);
+        near_neg |= (g_h[r][c+1] < -shore_thresh);
+    }
+    return near_pos && near_neg;
+}
+
+/*
  * render_heightmap() — draw h, u, v fields into ncurses window w.
  *
- * Rendering layers (applied in order, each may override the previous):
+ * Four rendering layers applied in priority order.  Each continue skips
+ * the lower-priority layers for that cell.
  *
- *   1. Height shading: |h| → character density, sign → color temperature.
- *      Crests (h>0) in warm colors; troughs (h<0) in cool colors.
- *      Matches the signed-amplitude encoding used in the membrane solver.
+ *   Layer 1 — Obstacle (highest priority):
+ *     Solid cells drawn as '#' in dim gray.  No height/velocity data here.
+ *     Must be first so obstacle walls always appear intact over field shading.
  *
- *   2. Shoreline detection (show_shore): cells where |h| < SHORE_THRESH
- *      AND an adjacent cell has opposite sign of h.  These zero-crossings
- *      mark the physical waterline / wavefront boundary.  Drawn as '~'
- *      in bright cyan to make the wavefront trajectory visible.
+ *   Layer 2 — Shoreline (optional, show_shore):
+ *     Cells straddling a h=0 zero-crossing drawn as '~' in bright cyan.
+ *     Shows the wavefront / waterline location even at low amplitude.
+ *     Uses is_shoreline_cell() for the zero-crossing test.
  *
- *   3. Flow arrows (show_arrows): cells where |velocity| > ARROW_SPD_THRESH
- *      have their height glyph replaced by a direction arrow.  The arrow
- *      shows the instantaneous flow direction — useful for seeing the
- *      pressure-driven flow pattern during dam break or reflection events.
+ *   Layer 3 — Height shading:
+ *     |h| → character density, sign → colour temperature.
+ *     Crests (h>0): warm (red/yellow).  Troughs (h<0): cool (blue/cyan).
+ *     Cells below display threshold (lvl==0) are skipped → background dark.
  *
- *   4. Obstacles: always rendered as '░' in dim gray, regardless of h.
- *      They are solid and impermeable; no height or velocity data applies.
+ *   Layer 4 — Flow arrow overlay (optional, show_arrows):
+ *     At cells where |velocity| > ARROW_SPD_THRESH, the height glyph is
+ *     replaced by an 8-way direction arrow.  The height colour is preserved
+ *     so depth information is not lost while viewing flow direction.
  */
 static void render_heightmap(WINDOW *w, int cols, int rows,
                              int theme, bool show_arrows, bool show_shore,
@@ -758,12 +802,11 @@ static void render_heightmap(WINDOW *w, int cols, int rows,
 {
     if (display_max < 0.05f) display_max = 0.05f;
     float inv_max = 1.0f / display_max;
-    float shore_thresh = SHORE_THRESH;
 
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
 
-            /* ── Obstacle ─────────────────────────────────────────── */
+            /* Layer 1: Obstacle — solid wall, always drawn first */
             if (g_obs[r][c]) {
                 wattron(w, COLOR_PAIR(CP_OBS) | A_DIM);
                 mvwaddch(w, r, c, '#');
@@ -773,51 +816,28 @@ static void render_heightmap(WINDOW *w, int cols, int rows,
 
             float h = g_h[r][c];
 
-            /* ── Shoreline detection ──────────────────────────────── *
-             * A wavefront / shoreline exists where h crosses zero.
-             * We check if this cell is near-zero while its neighbours
-             * have opposite signs — the zero-crossing is between them.  */
-            if (show_shore && fabsf(h) < shore_thresh) {
-                bool near_pos = false, near_neg = false;
-                if (r > 0 && !g_obs[r-1][c]) {
-                    near_pos |= (g_h[r-1][c] > shore_thresh);
-                    near_neg |= (g_h[r-1][c] < -shore_thresh);
-                }
-                if (r < rows-1 && !g_obs[r+1][c]) {
-                    near_pos |= (g_h[r+1][c] > shore_thresh);
-                    near_neg |= (g_h[r+1][c] < -shore_thresh);
-                }
-                if (c > 0 && !g_obs[r][c-1]) {
-                    near_pos |= (g_h[r][c-1] > shore_thresh);
-                    near_neg |= (g_h[r][c-1] < -shore_thresh);
-                }
-                if (c < cols-1 && !g_obs[r][c+1]) {
-                    near_pos |= (g_h[r][c+1] > shore_thresh);
-                    near_neg |= (g_h[r][c+1] < -shore_thresh);
-                }
-                if (near_pos && near_neg) {
+            /* Layer 2: Shoreline — zero-crossing wavefront marker */
+            if (show_shore && fabsf(h) < SHORE_THRESH) {
+                if (is_shoreline_cell(r, c, rows, cols, SHORE_THRESH)) {
                     wattron(w, COLOR_PAIR(CP_SHORE) | A_BOLD);
                     mvwaddch(w, r, c, '~');
                     wattroff(w, COLOR_PAIR(CP_SHORE) | A_BOLD);
-                    continue;
                 }
-                continue;   /* near-zero, no crossing → skip (background) */
+                /* Near-zero with no crossing → skip (background) */
+                continue;
             }
 
-            /* ── Height shading ───────────────────────────────────── */
-            bool positive = (h >= 0.0f);
-            float norm    = fabsf(h) * inv_max;
+            /* Layer 3: Height shading — signed amplitude to char + colour */
+            bool  positive = (h >= 0.0f);
+            float norm     = fabsf(h) * inv_max;
             if (norm > 1.0f) norm = 1.0f;
-
-            int lvl = lut_index(norm);
-            if (lvl == 0) continue;
-
+            int    lvl  = lut_index(norm);
+            if (lvl == 0) continue;   /* below display threshold → dark */
             attr_t attr = height_attr(theme, positive, lvl);
 
-            /* ── Flow arrow overlay ───────────────────────────────── *
-             * Arrow replaces the height glyph at fast-moving cells.
-             * atan2 returns angle in (-π, π]; we shift to [0, 2π).
-             * Dividing by π/4 gives the octant index 0..7.           */
+            /* Layer 4: Flow arrow — replaces height glyph at fast cells.
+             * atan2 ∈ (-π,π]; shift to [0,2π) then divide by π/4 for octant.
+             * The height colour (attr) is reused so depth is still visible.  */
             if (show_arrows) {
                 float spd = sqrtf(g_u[r][c]*g_u[r][c] + g_v[r][c]*g_v[r][c]);
                 if (spd > ARROW_SPD_THRESH) {

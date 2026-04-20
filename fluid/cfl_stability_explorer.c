@@ -532,14 +532,73 @@ static void apply_resonance_mode(int nx, int ny, float amp, int cols, int rows)
  */
 #define DASH_H  8    /* rows reserved for the bottom dashboard */
 
+/*
+ * render_alarm_text() — blink three alarm lines centred in the field zone.
+ *
+ * WHY separate function:
+ *   Alarm text is drawn AFTER the field shading loop so it always sits on
+ *   top of the field cells.  Mixing the text into the shading loop would
+ *   require per-row range checks inside the hot path.  Extracting it makes
+ *   the structure explicit: "draw field, then draw overlay text on top."
+ *
+ * WHY blink_on alternation:
+ *   Blinking between CP_WARN (bright white-on-red) and CP_UNSTABLE (red-on-black)
+ *   creates urgency without relying on terminal-specific blink attributes,
+ *   which are disabled on many modern terminal emulators.  The software blink
+ *   rate is blink_frame/8 — one toggle per 8 render frames ≈ 7.5 Hz at 60 fps.
+ *   That's slow enough to read and fast enough to demand attention.
+ */
+static void render_alarm_text(WINDOW *w, int cols, int field_rows,
+                              float cfl, int blink_frame)
+{
+    if (field_rows < 5) return;   /* not enough rows to place 3 lines */
+    int  wy       = field_rows / 2;
+    bool blink_on = (blink_frame / 8) % 2 == 0;
+
+    char line0[64], line1[64], line2[64];
+    snprintf(line0, sizeof line0, "  !!!  NUMERICAL INSTABILITY  !!!  ");
+    snprintf(line1, sizeof line1, "  !!!  CFL = %5.3f > 1.0      !!!  ", cfl);
+    snprintf(line2, sizeof line2, "  !!!  press '-' to reduce dt  !!!  ");
+
+    int wx0 = (cols - (int)strlen(line0)) / 2; if (wx0 < 0) wx0 = 0;
+    int wx1 = (cols - (int)strlen(line1)) / 2; if (wx1 < 0) wx1 = 0;
+    int wx2 = (cols - (int)strlen(line2)) / 2; if (wx2 < 0) wx2 = 0;
+
+    attr_t a = blink_on ? COLOR_PAIR(CP_WARN) | A_BOLD
+                        : COLOR_PAIR(CP_UNSTABLE) | A_BOLD;
+    wattron(w, a);
+    mvwprintw(w, wy - 1, wx0, "%s", line0);
+    mvwprintw(w, wy,     wx1, "%s", line1);
+    mvwprintw(w, wy + 1, wx2, "%s", line2);
+    wattroff(w, a);
+}
+
+/*
+ * render_field() — draw the wave displacement field with CFL-zone colouring.
+ *
+ * Three visual zones driven by the current CFL_2D value:
+ *
+ *   STABLE   (CFL < 0.70): signed-amplitude colouring — crests warm, troughs
+ *            cool — identical to membrane.c.  This is the "normal science" view.
+ *
+ *   MARGINAL (0.70 ≤ CFL < 1.00): amber tint replaces both sign colours.  The
+ *            field looks uniformly warm — a caution-light cue that the solver
+ *            is close to the stability boundary.  Sign distinction is dropped
+ *            because the focus shifts from wave physics to numerical health.
+ *
+ *   UNSTABLE (CFL ≥ 1.00): all cells red regardless of sign.  The growing
+ *            checkerboard mode (alternating +1/-1 on adjacent cells) appears as
+ *            alternating bright-red and dim-red cells — a dramatic visual that
+ *            matches the Von Neumann analysis prediction.
+ */
 static void render_field(WINDOW *w, int cols, int field_rows, int theme,
                          float cfl, float display_max, int blink_frame)
 {
     if (display_max < 0.05f) display_max = 0.05f;
-    float inv     = 1.0f / display_max;
-    bool unstable = (cfl >= 1.0f);
-    bool marginal = (cfl >= 0.7f && cfl < 1.0f);
-    bool blink_on = (blink_frame / 8) % 2 == 0;
+    float inv      = 1.0f / display_max;
+    bool  unstable = (cfl >= 1.0f);
+    bool  marginal = (cfl >= 0.7f && cfl < 1.0f);
+    bool  blink_on = (blink_frame / 8) % 2 == 0;
 
     for (int r = 0; r < field_rows; r++) {
         for (int c = 0; c < cols; c++) {
@@ -552,22 +611,21 @@ static void render_field(WINDOW *w, int cols, int field_rows, int theme,
 
             attr_t attr;
             if (unstable) {
-                /* Alarm mode: drop sign distinction — everything red.
-                 * The alternating +/- checkerboard shows up as alternating
-                 * bright-red ('#'/'@') and dim-red ('.'/':') cells.     */
-                if (!blink_on && lvl >= RAMP_N / 2) {
+                /* Red alarm mode: blink between CP_WARN and CP_UNSTABLE.
+                 * The alternating +/- checkerboard (instability eigenmode)
+                 * shows up as alternating bright/dim red cells.           */
+                if (!blink_on && lvl >= RAMP_N / 2)
                     attr = COLOR_PAIR(CP_WARN) | A_BOLD;
-                } else {
+                else {
                     attr = COLOR_PAIR(CP_UNSTABLE);
                     if (lvl >= RAMP_N - 2) attr |= A_BOLD;
                 }
             } else if (marginal) {
-                /* Marginal: amber tint — same for both signs so the
-                 * field looks uniformly warm, like a caution light.     */
+                /* Amber tint: same colour for positive and negative      */
                 attr = COLOR_PAIR(CP_MARGINAL);
                 if (lvl >= RAMP_N - 2) attr |= A_BOLD;
             } else {
-                /* Stable: normal signed-amplitude coloring              */
+                /* Normal: signed-amplitude colour (warm crests, cool troughs) */
                 attr = wave_attr(theme, pos, lvl);
             }
             wattron(w, attr);
@@ -576,33 +634,9 @@ static void render_field(WINDOW *w, int cols, int field_rows, int theme,
         }
     }
 
-    /* Centre alarm text — overwrites field when CFL ≥ 1 */
-    if (unstable && field_rows >= 5) {
-        int wy = field_rows / 2;
-        char line0[64], line1[64], line2[64];
-        snprintf(line0, sizeof line0, "  !!!  NUMERICAL INSTABILITY  !!!  ");
-        snprintf(line1, sizeof line1, "  !!!  CFL = %5.3f > 1.0      !!!  ", cfl);
-        snprintf(line2, sizeof line2, "  !!!  increase dt is ILLEGAL  !!!  ");
-        int wx0 = (cols - (int)strlen(line0)) / 2;
-        int wx1 = (cols - (int)strlen(line1)) / 2;
-        int wx2 = (cols - (int)strlen(line2)) / 2;
-        if (wx0 < 0) wx0 = 0;
-        if (wx1 < 0) wx1 = 0;
-        if (wx2 < 0) wx2 = 0;
-        if (blink_on) {
-            wattron(w, COLOR_PAIR(CP_WARN) | A_BOLD);
-            mvwprintw(w, wy - 1, wx0, "%s", line0);
-            mvwprintw(w, wy,     wx1, "%s", line1);
-            mvwprintw(w, wy + 1, wx2, "%s", line2);
-            wattroff(w, COLOR_PAIR(CP_WARN) | A_BOLD);
-        } else {
-            wattron(w, COLOR_PAIR(CP_UNSTABLE) | A_BOLD);
-            mvwprintw(w, wy - 1, wx0, "%s", line0);
-            mvwprintw(w, wy,     wx1, "%s", line1);
-            mvwprintw(w, wy + 1, wx2, "%s", line2);
-            wattroff(w, COLOR_PAIR(CP_UNSTABLE) | A_BOLD);
-        }
-    }
+    /* Alarm text overlay: drawn on top of field shading when unstable */
+    if (unstable)
+        render_alarm_text(w, cols, field_rows, cfl, blink_frame);
 }
 
 /*

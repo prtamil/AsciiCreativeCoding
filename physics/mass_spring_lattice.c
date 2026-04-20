@@ -438,21 +438,44 @@ static chtype spring_char(float dx, float dy)
     return (dx * dy > 0.0f) ? (chtype)'\\' : (chtype)'/';
 }
 
-static void render_lattice(WINDOW *w, int cols, int rows, bool show_vel)
+/*
+ * render_springs() — draw every spring as 1–2 characters coloured by stretch.
+ *
+ * WHY 1–2 chars per spring (not a full walk):
+ *   Horizontal springs span NODE_DX=3 columns; vertical span NODE_DY=2 rows.
+ *   Walking every interior cell would put 2–3 chars on screen per spring.
+ *   But at deformed angles the walk diverges from the visual line, creating
+ *   ragged gaps.  Two samples at t=0.33 and t=0.67 give a cleaner look and
+ *   are O(1) per spring instead of O(N) for diagonal walks.
+ *
+ * WHY NaN/displaced guard:
+ *   If k is raised past the stability limit, positions blow up to Inf/NaN.
+ *   The scene_tick blow-up check resets the scene on the next tick, but
+ *   this render call can happen BEFORE that check on the same frame.
+ *   Without the guard, walking an Inf→Inf line wraps the loop counter
+ *   and takes thousands of iterations — causing a visual hang.
+ *
+ * Colour mapping (stretch_color_pair):
+ *   ratio < 0.82 → CP_VERY_COMP (blue)      — spring is tightly compressed
+ *   ratio < 0.93 → CP_COMP      (cyan)       — slightly compressed
+ *   ratio < 1.08 → CP_NORMAL    (white)      — near rest length
+ *   ratio < 1.22 → CP_EXTEND    (yellow)     — slightly stretched
+ *   ratio ≥ 1.22 → CP_VERY_EXT  (red)        — heavily stretched (alert)
+ */
+static void render_springs(WINDOW *w, int cols, int max_r)
 {
-    int max_r = rows - (int)STATUS_ROW_OFF;
-
-    /* Draw springs: 1-2 chars per spring, never a full walk.
-     * Skip any spring where nodes have gone NaN or blown far off rest. */
+    /* Guard: skip any spring that has blown past 6× rest displacement.
+     * max_disp2 in cell² — if |ab|² > this, the spring is numerically broken. */
     float max_disp2 = (float)((NODE_DX * 6) * (NODE_DX * 6)
                              + (NODE_DY * 6) * (NODE_DY * 6));
+
     for (int s = 0; s < g_ns; s++) {
         int   a  = g_springs[s].a;
         int   b  = g_springs[s].b;
         float ax = g_nodes[a].x, ay = g_nodes[a].y;
         float bx = g_nodes[b].x, by = g_nodes[b].y;
 
-        /* skip NaN/Inf or absurdly stretched springs — prevents infinite walk */
+        /* NaN/Inf guard — prevents infinite loop on a blown-up lattice */
         if (!isfinite(ax) || !isfinite(ay) || !isfinite(bx) || !isfinite(by))
             continue;
         float dx = bx - ax, dy = by - ay;
@@ -462,7 +485,9 @@ static void render_lattice(WINDOW *w, int cols, int rows, bool show_vel)
         int    cp = stretch_color_pair(g_springs[s].stretch_ratio);
 
         if (g_springs[s].kind == SPRING_D) {
-            /* diagonal: two chars at 1/3 and 2/3 */
+            /* Diagonal shear spring: two samples at 1/3 and 2/3 of the span.
+             * One character near each endpoint shows the shear direction clearly
+             * without crowding the node positions at t=0 and t=1.            */
             int x1 = (int)roundf(ax + dx * 0.33f);
             int y1 = (int)roundf(ay + dy * 0.33f);
             int x2 = (int)roundf(ax + dx * 0.67f);
@@ -472,13 +497,15 @@ static void render_lattice(WINDOW *w, int cols, int rows, bool show_vel)
             if (x2 >= 0 && x2 < cols && y2 >= 0 && y2 < max_r)
                 mvwaddch(w, y2, x2, ch | COLOR_PAIR(cp));
         } else {
-            /* structural H/V: interior integer steps, capped for safety */
+            /* Structural H/V spring: walk interior cells one step at a time.
+             * The hard cap (NODE_DX + NODE_DY + 2) prevents O(∞) loops when
+             * the deformed length temporarily exceeds the rest length.        */
             int x0i = (int)roundf(ax), y0i = (int)roundf(ay);
             int x1i = (int)roundf(bx), y1i = (int)roundf(by);
             int sxi  = (x0i < x1i) ? 1 : (x0i > x1i) ? -1 : 0;
             int syi  = (y0i < y1i) ? 1 : (y0i > y1i) ? -1 : 0;
             int cxi  = x0i + sxi, cyi = y0i + syi;
-            int lim  = NODE_DX + NODE_DY + 2;   /* hard cap on steps */
+            int lim  = NODE_DX + NODE_DY + 2;
             while ((cxi != x1i || cyi != y1i) && lim-- > 0) {
                 if (cxi >= 0 && cxi < cols && cyi >= 0 && cyi < max_r)
                     mvwaddch(w, cyi, cxi, ch | COLOR_PAIR(cp));
@@ -486,23 +513,54 @@ static void render_lattice(WINDOW *w, int cols, int rows, bool show_vel)
             }
         }
     }
+}
 
-    /* Velocity arrows (if enabled) */
-    if (show_vel) {
-        for (int i = 0; i < g_nn; i++) {
-            if (g_nodes[i].pinned) continue;
-            float speed = sqrtf(g_nodes[i].vx * g_nodes[i].vx
-                              + g_nodes[i].vy * g_nodes[i].vy);
-            if (speed < 0.5f) continue;
-            float scale = 1.5f / speed;
-            int ax = (int)roundf(g_nodes[i].x + g_nodes[i].vx * scale);
-            int ay = (int)roundf(g_nodes[i].y + g_nodes[i].vy * scale);
-            if (ax >= 0 && ax < cols && ay >= 0 && ay < max_r)
-                mvwaddch(w, ay, ax, '>' | COLOR_PAIR(CP_NODE_FAST));
-        }
+/*
+ * render_velocity_arrows() — place '>' 1.5 cells ahead of each moving node.
+ *
+ * WHY 1.5-cell scale:
+ *   scale = 1.5 / speed → arrow tip is always 1.5 cells from the node.
+ *   This makes all arrows the same visual length regardless of speed magnitude,
+ *   showing DIRECTION without implying magnitude (speed is shown by node colour).
+ *   Arrow tips are clipped to the lattice drawing region (max_r).
+ *
+ * WHY skip pinned nodes:
+ *   Pinned nodes have non-zero velocity initialised by impulse/hammer but then
+ *   immediately zeroed by the solver.  They never move, so any stored velocity
+ *   is stale.  Skipping them avoids drawing misleading arrows at fixed anchors.
+ */
+static void render_velocity_arrows(WINDOW *w, int cols, int max_r)
+{
+    for (int i = 0; i < g_nn; i++) {
+        if (g_nodes[i].pinned) continue;
+        float speed = sqrtf(g_nodes[i].vx * g_nodes[i].vx
+                          + g_nodes[i].vy * g_nodes[i].vy);
+        if (speed < 0.5f) continue;   /* below noise threshold — skip */
+        float scale = 1.5f / speed;
+        int   ax    = (int)roundf(g_nodes[i].x + g_nodes[i].vx * scale);
+        int   ay    = (int)roundf(g_nodes[i].y + g_nodes[i].vy * scale);
+        if (ax >= 0 && ax < cols && ay >= 0 && ay < max_r)
+            mvwaddch(w, ay, ax, '>' | COLOR_PAIR(CP_NODE_FAST));
     }
+}
 
-    /* Draw nodes on top */
+/*
+ * render_nodes() — draw each node glyph ON TOP of springs.
+ *
+ * Nodes are drawn last so they are always visible even when the spring
+ * character would occupy the same cell.  The glyph + colour encode speed:
+ *   pinned → '@' CP_NODE_PIN  — anchored to world; never moves
+ *   slow   → 'o' CP_NODE_SLOW — velocity < 1 cell/s; nearly at rest
+ *   medium → '*' CP_NORMAL    — velocity 1–8 cell/s; actively oscillating
+ *   fast   → '0' CP_NODE_FAST — velocity > 8 cell/s; just hit or impulsed
+ *
+ * WHY speed thresholds 1 and 8:
+ *   With k=40 and m=1, the natural frequency is ~6.3 rad/s, giving a peak
+ *   velocity of ~amplitude × ω.  A 1-cell impulse gives ~6 cells/s peak.
+ *   "Fast" (>8) catches the first half-cycle of a fresh hammer strike.
+ */
+static void render_nodes(WINDOW *w, int cols, int max_r)
+{
     for (int i = 0; i < g_nn; i++) {
         int cx = (int)roundf(g_nodes[i].x);
         int cy = (int)roundf(g_nodes[i].y);
@@ -510,24 +568,38 @@ static void render_lattice(WINDOW *w, int cols, int rows, bool show_vel)
 
         float speed = sqrtf(g_nodes[i].vx * g_nodes[i].vx
                           + g_nodes[i].vy * g_nodes[i].vy);
-        int   cp;
+        int    cp;
         chtype ch;
 
         if (g_nodes[i].pinned) {
-            cp = CP_NODE_PIN;
-            ch = (chtype)'@';
+            cp = CP_NODE_PIN;  ch = (chtype)'@';
         } else if (speed < 1.0f) {
-            cp = CP_NODE_SLOW;
-            ch = (chtype)'o';
+            cp = CP_NODE_SLOW; ch = (chtype)'o';
         } else if (speed < 8.0f) {
-            cp = CP_NORMAL;
-            ch = (chtype)'*';
+            cp = CP_NORMAL;    ch = (chtype)'*';
         } else {
-            cp = CP_NODE_FAST;
-            ch = (chtype)'0';
+            cp = CP_NODE_FAST; ch = (chtype)'0';
         }
         mvwaddch(w, cy, cx, ch | COLOR_PAIR(cp));
     }
+}
+
+/*
+ * render_lattice() — coordinate the three render layers in draw order.
+ *
+ * Draw order matters: springs first (background), optional velocity arrows
+ * (mid), then nodes on top (foreground).  If nodes were drawn first, springs
+ * would overwrite them.  Velocity arrows go between so the node glyph still
+ * dominates visually at the node position.
+ */
+static void render_lattice(WINDOW *w, int cols, int rows, bool show_vel)
+{
+    int max_r = rows - (int)STATUS_ROW_OFF;
+
+    render_springs(w, cols, max_r);
+    if (show_vel)
+        render_velocity_arrows(w, cols, max_r);
+    render_nodes(w, cols, max_r);
 }
 
 static void render_cursor(WINDOW *w, int cols, int rows,

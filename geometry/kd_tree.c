@@ -3,7 +3,7 @@
  *
  * This file is in two parts:
  *
- *   PART 1  (lines ~55-280)  — the kd-tree library
+ *   PART 1  (lines ~110-280)  — the kd-tree library
  *     Data structures, memory management, core operations,
  *     inspection helpers, and an ASCII grid visualizer.
  *     This part has no I/O — it is a reusable module.
@@ -18,6 +18,58 @@
  * Run:
  *   ./kd_tree
  */
+
+/* ── CONCEPTS ───────────────────────────────────────────────────────────── *
+ *
+ * K-D tree vs Quadtree vs BSP tree (all three are in geometry/):
+ *
+ *   Quadtree  — every leaf holds up to LEAF_CAPACITY points; when it
+ *               overflows it splits into FOUR equal children (NW/NE/SW/SE).
+ *               Both axes are cut simultaneously.  Good for spatial hashing
+ *               of points and 2-D range queries.
+ *
+ *   BSP tree  — every leaf splits into TWO children; axis alternates with
+ *               depth (even → vertical, odd → horizontal).  Each node stores
+ *               the split line, not a data point.  Classic use: Doom/Quake
+ *               back-to-front rendering (pre-computed at level build time).
+ *
+ *   K-D tree  — each node holds EXACTLY ONE data point AND acts as the
+ *               split plane.  Axis alternates with depth.  Every internal
+ *               node is simultaneously a stored datum and a spatial divider.
+ *               This makes insertion and exact-match search simple: just
+ *               compare the relevant coordinate and go left or right.
+ *               Trade-off: deletion is more complex (requires re-insertion
+ *               of the subtree, or a "tombstone" flag).
+ *
+ * Time complexity:
+ *   Insert (kd_insert):   O(log N) average, O(N) worst case (unbalanced)
+ *   Range query (kd_query): O(√N + k) average for 2-D, k = points found
+ *   Nearest-neighbour:    O(log N) average (not implemented here)
+ *   The √N factor in range queries comes from the fact that in 2-D, a
+ *   worst-case strip query touches O(√N) subtrees — this is tighter
+ *   than the O(N) brute force but looser than 1-D binary search O(log N).
+ *
+ * Alternating axis split (kd_insert, kd_query):
+ *   At depth 0, 2, 4 … the split is on X (vertical dividing line).
+ *   At depth 1, 3, 5 … the split is on Y (horizontal dividing line).
+ *   This guarantees that every 2-D region is eventually subdivided along
+ *   both axes, preventing degeneracy from axis-aligned point clusters.
+ *
+ * Bounding-box pruning (kd_query):
+ *   Each recursive call narrows the bounding box by halving it along the
+ *   current node's split axis.  If the narrowed box does NOT overlap the
+ *   query rectangle, the ENTIRE subtree is skipped in O(1).  This is the
+ *   source of the √N efficiency — whole branches are pruned without visiting
+ *   individual points.
+ *
+ * Reading order:
+ *   1. KDNode struct — understand how one node encodes a point AND a split.
+ *   2. kd_insert — trace one insertion by hand through a 3-level tree.
+ *   3. kd_query  — trace the pruning rule: draw the bounding box on paper.
+ *   4. draw_tree_grid — see how the grid visualizer maps the tree back to 2-D.
+ *   5. main() PART 2 — run the demo and predict each split before pressing Enter.
+ *
+ * ─────────────────────────────────────────────────────────────────────────── */
 
 #include <assert.h>
 #include <stdbool.h>

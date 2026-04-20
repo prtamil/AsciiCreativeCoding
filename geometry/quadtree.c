@@ -3,7 +3,7 @@
  *
  * This file is in two parts:
  *
- *   PART 1  (lines ~60-310)  — the quadtree library
+ *   PART 1  (lines ~115-310)  — the quadtree library
  *     Data structures, memory management, core operations,
  *     inspection helpers, and an ASCII grid visualizer.
  *     This part has no I/O — it is a reusable module.
@@ -18,6 +18,67 @@
  * Run:
  *   ./quadtree
  */
+
+/* ── CONCEPTS ───────────────────────────────────────────────────────────── *
+ *
+ * What problem does a quadtree solve?
+ *   Given N points in 2-D space, answer "which points are inside rectangle R?"
+ *   efficiently.  Brute force is O(N) — check every point.  A quadtree gives
+ *   O(log N + k) average, where k = number of points found.  The key insight:
+ *   skip whole subtrees whose region does NOT overlap R.
+ *
+ * Quadtree vs BSP tree vs K-D tree (all three are in geometry/):
+ *
+ *   Quadtree  — (this file) leaf holds up to LEAF_CAPACITY points; when full,
+ *               it subdivides into FOUR children (NW/NE/SW/SE) simultaneously.
+ *               Internal nodes hold NO data — all data lives in leaves.
+ *               Simple to implement; good when points cluster in few regions.
+ *
+ *   BSP tree  — splits into TWO children per node; axis alternates (V/H).
+ *               Each node owns its boundary rect and the split line position.
+ *               Split at midpoint (not at the inserted point).
+ *               Classical Doom/Quake rendering algorithm.
+ *
+ *   K-D tree  — each node holds EXACTLY ONE data point AND is the split.
+ *               No "region" concept; split position = the stored point's coord.
+ *               Best average-case for nearest-neighbour search.
+ *
+ * Subdivision trigger (qt_insert):
+ *   A leaf subdivides when inserting would make count exceed LEAF_CAPACITY.
+ *   After subdividing, the leaf's existing points are re-inserted into the
+ *   appropriate child (their coordinates determine NW/NE/SW/SE).
+ *   LEAF_CAPACITY=4 means subdivisions happen visibly during the 12-point demo.
+ *
+ * Half-open intervals (Rect):
+ *   The region is x ∈ [x, x+w) and y ∈ [y, y+h).  The upper bound is
+ *   EXCLUSIVE.  This makes subdivision exact: the four children share no
+ *   pixels and together cover the parent exactly:
+ *     NW: [x,   x+w/2) × [y,   y+h/2)
+ *     NE: [x+w/2, x+w) × [y,   y+h/2)
+ *     SW: [x,   x+w/2) × [y+h/2, y+h)
+ *     SE: [x+w/2, x+w) × [y+h/2, y+h)
+ *   With inclusive bounds, the four midpoint cells would each belong to TWO
+ *   children simultaneously, creating ambiguity.
+ *
+ * AABB pruning (qt_query):
+ *   Before examining any node, check if the query rect overlaps the node's
+ *   boundary.  Non-overlap → skip the ENTIRE subtree in O(1).
+ *   This is the source of the O(log N + k) bound.
+ *
+ * Complexity:
+ *   Insert:      O(log N) average when points are spatially distributed.
+ *   Range query: O(log N + k) average, k = points returned.
+ *   Worst case (all points in same cell): O(N) for both.
+ *
+ * Reading order:
+ *   1. QuadNode struct — leaf capacity, four children, boundary Rect.
+ *   2. qt_subdivide   — how one leaf becomes four; trace on paper.
+ *   3. qt_insert      — follow one insertion across three levels.
+ *   4. qt_query       — trace the AABB pruning on the demo grid.
+ *   5. draw_tree_grid — how grid borders map to the QuadNode hierarchy.
+ *   6. main() PART 2  — predict each subdivision before pressing Enter.
+ *
+ * ─────────────────────────────────────────────────────────────────────────── */
 
 #include <assert.h>
 #include <stdbool.h>

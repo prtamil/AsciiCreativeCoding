@@ -3,7 +3,7 @@
  *
  * This file is in two parts:
  *
- *   PART 1  (lines ~65-340)  — the BSP tree library
+ *   PART 1  (lines ~130-340)  — the BSP tree library
  *     Data structures, memory management, core operations,
  *     inspection helpers, and an ASCII grid visualizer.
  *     This part has no I/O — it is a reusable module.
@@ -12,24 +12,68 @@
  *     Inserts 12 labelled points, shows every split live,
  *     then demonstrates a range query.  Press Enter each step.
  *
- * A BSP tree splits a rectangular region with a single axis-aligned line,
- * creating two children (front / back) instead of four.  The split axis
- * alternates: even depth = VERTICAL (left/right), odd = HORIZONTAL (top/bottom).
- *
- * Contrast with the quadtree (see geometry/quadtree.c):
- *   Quadtree  — splits into 4 equal quadrants at once with a cross (+)
- *   BSP tree  — splits into 2 halves, one axis at a time (! or =)
- *
- * Historical note: BSP trees powered Doom (1993) for back-to-front rendering
- * and Quake for collision detection.  The tree was pre-computed at build time
- * to allow O(log N) visibility queries at run time.
- *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra geometry/bsp_tree.c -o bsp_tree
  *
  * Run:
  *   ./bsp_tree
  */
+
+/* ── CONCEPTS ───────────────────────────────────────────────────────────── *
+ *
+ * BSP tree vs Quadtree vs K-D tree (all three are in geometry/):
+ *
+ *   Quadtree  — splits into FOUR equal children (NW/NE/SW/SE) when a leaf
+ *               overflows LEAF_CAPACITY.  Both axes cut simultaneously.
+ *               Each internal node holds no data; data lives in leaves only.
+ *
+ *   K-D tree  — each node holds EXACTLY ONE data point AND is the split.
+ *               Axis alternates with depth.  Faster nearest-neighbour search.
+ *               No concept of a "region" per node — split tracks one coord.
+ *
+ *   BSP tree  — (this file) splits into TWO children per node; each node
+ *               owns the boundary rectangle of its region.  Internal nodes
+ *               store the split axis and position; data lives in leaf nodes.
+ *               Closest to how the original game BSP trees worked.
+ *
+ * Historical context — Doom (1993) and Quake:
+ *   Doom precomputed a BSP tree over the map's line segments at build time.
+ *   At render time, the engine traversed the BSP front-to-back to determine
+ *   which walls were visible — O(log N) per frame instead of O(N) per segment.
+ *   Quake used BSP for collision detection between the player and geometry.
+ *   This demo uses the simpler "axis-aligned point BSP" (not arbitrary planes),
+ *   which is sufficient to show the spatial subdivision structure.
+ *
+ * Split axis alternation:
+ *   Even depth (0, 2, 4…) → SPLIT_VERTICAL   — a vertical line x = split_pos.
+ *                            front = left  half  (x < split_pos)
+ *                            back  = right half  (x ≥ split_pos)
+ *   Odd  depth (1, 3, 5…) → SPLIT_HORIZONTAL — a horizontal line y = split_pos.
+ *                            front = top    half (y < split_pos)
+ *                            back  = bottom half (y ≥ split_pos)
+ *   Alternating axes prevents one axis from dominating, keeping the tree balanced
+ *   in both dimensions (assuming points are spatially distributed).
+ *
+ * Split position (bsp_insert):
+ *   The split_pos is set to the MIDPOINT of the boundary region along the
+ *   split axis.  This guarantees O(log N) depth even for sorted inputs —
+ *   unlike the K-D tree where split_pos equals the inserted point's coordinate,
+ *   making depth sensitive to insertion order.
+ *
+ * Time complexity:
+ *   Insert:      O(log N) average (balanced mid-point split)
+ *   Range query: O(√N + k) average in 2-D, k = points found
+ *   The bounding-box pruning in bsp_query skips whole subtrees in O(1),
+ *   same mechanism as kd_query — check overlap before recursing.
+ *
+ * Reading order:
+ *   1. BSPNode struct — boundary rect + split + data[] in one node.
+ *   2. bsp_insert     — trace one insertion; note the midpoint split choice.
+ *   3. bsp_query      — trace the bounding-box pruning.
+ *   4. draw_tree_grid — how the grid renders both '!' and '=' split lines.
+ *   5. main() PART 2  — predict which axis splits before pressing Enter.
+ *
+ * ─────────────────────────────────────────────────────────────────────────── */
 
 #include <assert.h>
 #include <stdbool.h>

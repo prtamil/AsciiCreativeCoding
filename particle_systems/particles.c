@@ -824,99 +824,125 @@ static char velocity_arrow(float vx, float vy)
 }
 
 /*
- * render_particles() — dispatch to the active render mode.
+ * render_heatmap() — continuous density-field view of the particle cloud.
  *
- * All four modes share the same function signature so the caller
- * does not need a switch statement — just call render_particles()
- * with the current mode.
+ * This mode treats all particles as sources of a scalar density field rather
+ * than discrete points.  The result looks like infrared heat or smoke density.
  *
- * Visual encoding decisions:
- *   • Speed → character: fast particles carry more energy and are
- *     rendered with denser glyphs ('@', '#') to feel "hotter".
- *   • Life fraction → dim: particles dim (A_DIM) when they are
- *     below 30% remaining life, signalling that they are dying.
- *   • Trail: older trail entries get progressively dimmer to suggest
- *     motion blur without complex alpha blending.
- *   • Heatmap: each particle splats a Gaussian blob; the resulting
- *     continuous density field is more suitable for fluid/smoke.
- *   • Arrow: angle→glyph instantly conveys flow direction without
- *     a vector field overlay — useful for studying force fields.
+ * Algorithm (three passes):
+ *
+ *   PASS 1 — erase stale cells:
+ *     Cells that had density > threshold last frame but are now empty need
+ *     explicit blanking.  We compare g_prev_density vs g_density (before
+ *     rebuilding) instead of clearing the whole screen each frame.
+ *     WHY: clearing all ROWS×COLS cells each frame causes terminal flicker
+ *     because ncurses still has to repaint them all.  Differential erase
+ *     only touches cells that actually changed.
+ *
+ *   PASS 2 — accumulate density:
+ *     g_density is zeroed, then every alive particle splats a 3×3 Gaussian
+ *     blob weighted by (speed / MAX_SPEED_NORM) × life_fraction.
+ *     WHY weight by speed: fast particles carry more kinetic energy and should
+ *     appear brighter (hotter).  A stationary particle contributes nothing.
+ *     WHY weight by life_frac: dying particles fade out naturally in the field
+ *     without needing per-particle dim logic.
+ *
+ *   PASS 3 — render density grid:
+ *     Normalised density → lut_index → k_ramp character + theme colour pair.
+ *     Cells below 0.01 are skipped (background stays dark).
  */
-static void render_particles(WINDOW *w, int cols, int rows,
-                             int mode, int theme)
+static void render_heatmap(WINDOW *w, int cols, int rows, int theme)
 {
-    /* ── HEATMAP mode: build density grid then render it ────────── */
-    if (mode == RENDER_HEATMAP) {
-        /* Erase cells that had density last frame but are now empty */
-        for (int r = 0; r < rows && r < GRID_MAX_H; r++)
-            for (int c = 0; c < cols && c < GRID_MAX_W; c++)
-                if (g_prev_density[r][c] > 0.01f && g_density[r][c] < 0.01f)
-                    mvwaddch(w, r, c, ' ');
+    /* PASS 1: erase cells that were occupied last frame but are now empty */
+    for (int r = 0; r < rows && r < GRID_MAX_H; r++)
+        for (int c = 0; c < cols && c < GRID_MAX_W; c++)
+            if (g_prev_density[r][c] > 0.01f && g_density[r][c] < 0.01f)
+                mvwaddch(w, r, c, ' ');
 
-        /* Save previous density for next frame's borderless erase */
-        memcpy(g_prev_density, g_density,
-               sizeof(float) * GRID_MAX_H * GRID_MAX_W);
+    /* Save snapshot of current density so next frame's PASS 1 can diff it */
+    memcpy(g_prev_density, g_density, sizeof(float) * GRID_MAX_H * GRID_MAX_W);
 
-        /* Splat all alive particles onto density grid */
-        memset(g_density, 0, sizeof g_density);
-        for (int i = 0; i < MAX_PARTICLES; i++) {
-            const Particle *p = &g_particles[i];
-            if (!p->alive) continue;
-            int   cx = px_to_cx(p->x);
-            int   cy = px_to_cy(p->y);
-            float lf = p->lifetime / p->max_lifetime;   /* [0,1] */
-            float speed = sqrtf(p->vx*p->vx + p->vy*p->vy);
-            float weight = (speed / MAX_SPEED_NORM) * lf;
-            if (weight > 1.0f) weight = 1.0f;
-            splat_density(cx, cy, weight, cols, rows);
-        }
-
-        /* Render density grid through the LUT pipeline */
-        for (int r = 0; r < rows && r < GRID_MAX_H; r++) {
-            for (int c = 0; c < cols && c < GRID_MAX_W; c++) {
-                float d = g_density[r][c];
-                if (d < 0.01f) continue;
-                int   lvl  = lut_index(d);
-                if (lvl == 0) continue;
-                attr_t attr = theme_attr(theme, lvl);
-                wattron(w, attr);
-                mvwaddch(w, r, c, k_ramp[lvl]);
-                wattroff(w, attr);
-            }
-        }
-        return;
+    /* PASS 2: rebuild density from current particle positions */
+    memset(g_density, 0, sizeof g_density);
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        const Particle *p = &g_particles[i];
+        if (!p->alive) continue;
+        int   cx     = px_to_cx(p->x);
+        int   cy     = px_to_cy(p->y);
+        float lf     = p->lifetime / p->max_lifetime;
+        float speed  = sqrtf(p->vx*p->vx + p->vy*p->vy);
+        float weight = (speed / MAX_SPEED_NORM) * lf;
+        if (weight > 1.0f) weight = 1.0f;
+        splat_density(cx, cy, weight, cols, rows);
     }
 
-    /* ── GLYPH / TRAIL / ARROW modes: per-particle rendering ────── */
+    /* PASS 3: map density → character + colour */
+    for (int r = 0; r < rows && r < GRID_MAX_H; r++) {
+        for (int c = 0; c < cols && c < GRID_MAX_W; c++) {
+            float d = g_density[r][c];
+            if (d < 0.01f) continue;
+            int    lvl  = lut_index(d);
+            if (lvl == 0) continue;
+            attr_t attr = theme_attr(theme, lvl);
+            wattron(w, attr);
+            mvwaddch(w, r, c, k_ramp[lvl]);
+            wattroff(w, attr);
+        }
+    }
+}
+
+/*
+ * render_per_particle() — GLYPH / TRAIL / ARROW modes.
+ *
+ * Every alive particle is drawn as a single character at its current cell
+ * position.  The three modes share the same speed→level and life→dim logic;
+ * they differ only in which character is placed:
+ *
+ *   GLYPH  — k_ramp[lvl]: density glyph encodes kinetic energy directly.
+ *   TRAIL  — draws TRAIL_LEN-1 past cell positions first (fading), then the
+ *             current glyph.  Older trail entries are dimmer (tlvl -= t/2).
+ *             WHY draw trail before current: ensures the head glyph is on top
+ *             and not overwritten by a trail entry from the next particle.
+ *   ARROW  — velocity_arrow(vx, vy): 8-way direction char instead of density.
+ *             Good for visualising flow fields and force alignment.
+ *
+ * Life-based dimming at 30%:
+ *   At lifetime_fraction < 0.30, A_DIM replaces A_BOLD.  This creates a
+ *   visible "dying" fade that doesn't require gradual alpha — just two
+ *   brightness levels available in all ncurses terminals.
+ */
+static void render_per_particle(WINDOW *w, int cols, int rows,
+                                int mode, int theme)
+{
     for (int i = 0; i < MAX_PARTICLES; i++) {
         const Particle *p = &g_particles[i];
         if (!p->alive) continue;
 
-        int   cx   = px_to_cx(p->x);
-        int   cy   = px_to_cy(p->y);
-        float lf   = p->lifetime / p->max_lifetime;     /* [0,1]       */
-        float speed= sqrtf(p->vx*p->vx + p->vy*p->vy);
+        int   cx    = px_to_cx(p->x);
+        int   cy    = px_to_cy(p->y);
+        float lf    = p->lifetime / p->max_lifetime;
+        float speed = sqrtf(p->vx*p->vx + p->vy*p->vy);
 
-        /* Map speed to ramp level (visual density ∝ kinetic energy) */
+        /* Speed → ramp level: fast = visually dense, slow = sparse */
         float norm_spd = speed / MAX_SPEED_NORM;
         if (norm_spd > 1.0f) norm_spd = 1.0f;
         int lvl = lut_index(norm_spd);
         if (lvl < 1) lvl = 1;   /* always at least faintly visible */
 
-        /* Life-based dim: fade the last 30% of life */
+        /* Life fraction < 30% → dim (dying visual cue) */
         attr_t base_attr = theme_attr(theme, lvl);
         if (lf < 0.30f) base_attr = (base_attr & ~A_BOLD) | A_DIM;
 
-        /* ── TRAIL: draw past positions first, then current ─────── */
+        /* TRAIL: render ring-buffer history first (older = dimmer) */
         if (mode == RENDER_TRAIL) {
             for (int t = 0; t < TRAIL_LEN - 1; t++) {
-                /* Age in ring buffer: older = lower index offset    */
+                /* Walk backwards through the ring buffer: index t=0 is newest
+                 * trail entry (one tick ago), t=TRAIL_LEN-2 is oldest.       */
                 int tidx = (p->trail_head - 1 - t + TRAIL_LEN) % TRAIL_LEN;
                 int tx = p->trail_cx[tidx];
                 int ty = p->trail_cy[tidx];
                 if (tx < 0 || tx >= cols || ty < 0 || ty >= rows) continue;
-                /* Each step further back gets one ramp level dimmer */
-                int tlvl = lvl - t / 2;
+                int tlvl = lvl - t / 2;   /* older entries drop one level per 2 steps */
                 if (tlvl < 1) tlvl = 1;
                 attr_t ta = theme_attr(theme, tlvl) | A_DIM;
                 wattron(w, ta);
@@ -925,19 +951,33 @@ static void render_particles(WINDOW *w, int cols, int rows,
             }
         }
 
-        /* ── Current position glyph ─────────────────────────────── */
+        /* Current position: glyph, arrow, or density char */
         if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
-
-        char ch;
-        if (mode == RENDER_ARROW) {
-            ch = velocity_arrow(p->vx, p->vy);
-        } else {
-            ch = k_ramp[lvl];
-        }
-
+        char ch = (mode == RENDER_ARROW) ? velocity_arrow(p->vx, p->vy)
+                                         : k_ramp[lvl];
         wattron(w, base_attr);
         mvwaddch(w, cy, cx, (chtype)(unsigned char)ch);
         wattroff(w, base_attr);
+    }
+}
+
+/*
+ * render_particles() — dispatch to the active render mode.
+ *
+ * Visual encoding summary by mode:
+ *   HEATMAP — continuous density field (Gaussian splat per particle).
+ *             Best for fluid/smoke where individual identity is irrelevant.
+ *   GLYPH   — per-particle: speed → character density.
+ *   TRAIL   — per-particle: past positions fading behind each particle.
+ *   ARROW   — per-particle: velocity angle → 8-way direction glyph.
+ */
+static void render_particles(WINDOW *w, int cols, int rows,
+                             int mode, int theme)
+{
+    if (mode == RENDER_HEATMAP) {
+        render_heatmap(w, cols, rows, theme);
+    } else {
+        render_per_particle(w, cols, rows, mode, theme);
     }
 }
 

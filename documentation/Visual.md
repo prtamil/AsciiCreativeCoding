@@ -46,6 +46,7 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [V4.7 Directional Characters — Velocity to Glyph](#v47-directional-characters--velocity-to-glyph)
 - [V4.8 Branch/Slope Characters — Angle to `/`, `\`, `|`, `-`](#v48-branchslope-characters--angle-to----)
 - [V4.9 Unicode Multi-byte Glyphs via `addwstr`](#v49-unicode-multi-byte-glyphs-via-addwstr)
+- [V4.10 Pixel-Space Dot Progression — No Diagonal Artifacts](#v410-pixel-space-dot-progression--no-diagonal-artifacts)
 
 ### V5 — Visual Effects Techniques
 - [V5.1 Draw Order / Z-Ordering — Last Write Wins](#v51-draw-order--z-ordering--last-write-wins)
@@ -1050,6 +1051,46 @@ addstr(k_dirs[octant]);   /* addstr handles UTF-8 byte sequences */
 **How to apply:** Use when the direction itself is the primary visual information (flow fields, vector visualizations). Fall back to ASCII arrow chars (`>v<^`) if the terminal locale is uncertain or for simpler needs (flocking.c uses ASCII per-flock char sets for portability).
 
 *Files: `flowfield.c`*
+
+---
+
+#### V4.10 Pixel-Space Dot Progression — No Diagonal Artifacts
+
+**What it is:** Drawing arrows and directional lines in pixel space and placing `.`/`o`/`0` chars along the path, instead of using Bresenham with slope-mapped characters.
+
+**Problem it solves:** When drawing a line at ~45° through a terminal cell grid with 2:1 aspect ratio (cells are twice as tall as wide in pixels), Bresenham visits cells that appear mostly vertical even for a true 45° line. The slope-mapped char `\` or `/` looks wrong at these angles — the char appears to lean more steeply than the actual line direction. The visual result is an arrow that looks jagged and incorrect.
+
+**How:**
+
+```c
+static void draw_dot_line(float x0, float y0, float x1, float y1,
+                          int cp, attr_t extra, int cols, int rows)
+{
+    float dx = x1 - x0, dy = y1 - y0;
+    float len = sqrtf(dx*dx + dy*dy);
+    if (len < 0.5f) return;
+    int steps = (int)(len / (float)CELL_W) + 1;
+    int prev_cx = -9999, prev_cy = -9999;
+    for (int i = 0; i <= steps; i++) {
+        float t  = (float)i / (float)(steps > 0 ? steps : 1);
+        int   cx = px_to_cx(x0 + dx * t);
+        int   cy = px_to_cy(y0 + dy * t);
+        if (cx == prev_cx && cy == prev_cy) continue;   /* dedup */
+        prev_cx = cx; prev_cy = cy;
+        if (cx<0||cx>=cols||cy<1||cy>=rows-2) continue;
+        chtype ch = (t < 0.40f) ? '.' : (t < 0.75f) ? 'o' : '0';
+        mvaddch(cy, cx, ch | COLOR_PAIR(cp) | extra);
+    }
+}
+```
+
+The step size is `CELL_W` pixels — this produces roughly one dot per cell along the line direction, aspect-correct because the sample spacing is in pixel space before the `px_to_cx/cy` conversion. The progressive `'.'`→`'o'`→`'0'` characters give a visual sense of motion or direction.
+
+**Tip char:** After `draw_dot_line`, the caller places a cardinal tip char (`>`, `v`, `<`, `^`) or `'o'` for diagonal directions at the endpoint. This is placed last so it overwrites the final dot.
+
+**When to use:** Short directional arrows (heading vectors, velocity arrows) where the direction is the message and the angle may vary continuously. Bresenham + slope chars is better for long structural lines (springs, wires) where character selection at each cell is important.
+
+*Files: `physics/diff_drive_robot.c`*
 
 ---
 

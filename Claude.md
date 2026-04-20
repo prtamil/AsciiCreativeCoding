@@ -71,6 +71,8 @@ gcc -std=c11 -O2 -Wall -Wextra physics/schrodinger.c        -o schrodinger      
 gcc -std=c11 -O2 -Wall -Wextra physics/blackhole.c          -o blackhole         -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/magnetic_field.c     -o magnetic_field    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/chain.c              -o chain             -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/beam_bending.c       -o beam_bending      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/diff_drive_robot.c   -o diff_drive_robot  -lncurses -lm
 
 # ── fractal / random growth (new) ────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/penrose.c           -o penrose           -lncurses -lm
@@ -159,7 +161,10 @@ gcc -std=c11 -O2 -Wall -Wextra geometry/lissajous.c    -o lissajous   -lncurses 
 gcc -std=c11 -O2 -Wall -Wextra geometry/spirograph.c   -o spirograph  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra geometry/string_art.c   -o string_art  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra geometry/voronoi.c      -o voronoi     -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra geometry/convex_hull.c  -o convex_hull -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra geometry/convex_hull.c              -o convex_hull  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra geometry/quad_tree_helloworld.c    -o qt_hello     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra geometry/quadtree.c                -o quadtree
+gcc -std=c11 -O2 -Wall -Wextra geometry/bsp_tree.c                -o bsp_tree
 
 # ── raster (software rasterizer) ─────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c    -o torus    -lncurses -lm
@@ -247,6 +252,8 @@ gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer 
 - `ising.c`             — 2-D Ising model: Monte Carlo Metropolis spin flips; `exp(−ΔE/kT)` acceptance; phase transition at T_c; magnetisation HUD; interactive temperature control
 - `schrodinger.c`       — 1-D Schrödinger equation: Crank-Nicolson tridiagonal solver (Thomas algorithm); Gaussian wave-packet; 4 presets (free/barrier/harmonic/double-slit); absorbing walls; |ψ|² display
 - `blackhole.c`         — Gargantua black hole GR raytracer: Schwarzschild null geodesics (RK4), precomputed lensing table, photon ring from min_r tracking, primary + secondary disk images, relativistic Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift; 11 themes; +/- zoom
+- `beam_bending.c`      — Euler-Bernoulli beam bending + vibration: 9 BC×load combos (SS/cantilever/fixed-fixed × center/distributed/end); analytical static deflection w(x) and moment M(x); curvature-shaded render + bending moment side panel; dynamic modal superposition (`d`) with 4 eigenmodes per BC type, exact damped oscillator transition matrix (unconditionally stable); b/l cycle BC/load; space pause; e/E exaggeration; r reset
+- `diff_drive_robot.c`  — differential drive robot: nonholonomic kinematics v=(vL+vR)/2, ω=(vR-vL)/L; pixel-space Euler pose integration; toroidal wrap; 600-slot trail ring buffer; heading arrow + per-wheel velocity arrows drawn with pixel-space dot progression (`.`→`o`→`0`, no `/\` diagonals); arrow keys drive, S brake, R reset
 
 ### fractal_random/
 - `penrose.c`      — Penrose P3 rhombus tiling: de Bruijn pentagrid duality, O(1) per cell, parity-based thick/thin distinction, pentagrid edge detection for visible tile outlines (|/\-), slow rotation, 256-color warm/cool palette

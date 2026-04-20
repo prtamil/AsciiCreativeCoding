@@ -1190,3 +1190,53 @@ The planted-foot pair (4) is always 256-color green (46) across every theme — 
 **When to use:** Any simulation with multiple visually distinct element classes that need to remain perceptually separable across all themes. Separating "what this color means" (role) from "what this color is" (palette) makes theme switching trivially safe.
 
 **Effect:** The maze reads immediately as a physical structure — dark solid walls, light open passages, and a glowing blue-green solution path, without any box-drawing characters or Unicode blocks.
+
+---
+
+## 22. Curvature-Based Density Shading (beam_bending.c)
+
+**Where:** `physics/beam_bending.c`
+
+**How it works:** The beam deflection w(x) and bending moment M(x) are computed analytically. At each node, a character from the Paul Bourke density ramp `".,-~=+*#@"` is selected proportional to `|w[i]| / max_deflection`. Nodes with high curvature (large |w|, near load application points) get dense chars like `#` or `@`; nodes near supports get sparse chars like `.` or `,`. This communicates structural behavior — where the beam deforms most — through character density alone, without any secondary plot.
+
+The bending moment panel uses separate color semantics: cyan for positive moment (sagging, tension at bottom) and magenta for negative moment (hogging, tension at top). This is a role-based assignment: the sign of M carries physical meaning that a neutral palette would obscure.
+
+```c
+/* beam density ramp — char encodes curvature magnitude */
+static const char k_beam_ramp[] = ".,-~=+*#@";
+#define BEAM_RAMP_N 9
+
+/* in render_beam(): */
+float frac = fabsf(b->w[i]) / (b->max_deflection + 1e-6f);
+int   ri   = (int)(frac * (BEAM_RAMP_N - 1));
+char  ch   = k_beam_ramp[ri];
+
+/* moment panel color */
+int cp = (b->M[i] >= 0.0f) ? CP_MOM_POS : CP_MOM_NEG;  /* cyan / magenta */
+```
+
+**Effect:** The beam reads as a physical object — denser characters where it flexes most, the moment diagram beside it showing sign changes. All information is carried in character choice and color, with no separate graph window.
+
+---
+
+## 23. Role-Named Velocity Arrow Colors (diff_drive_robot.c)
+
+**Where:** `physics/diff_drive_robot.c`
+
+**How it works:** Each visual element gets a named color pair constant, not a numbered pair. This separates the question "what does this color mean?" from "what xterm-256 index is it?":
+
+```c
+/* §3 color — role names, not numbers */
+#define CP_HEAD   1   /* heading arrow — cyan      */
+#define CP_VEL_P  2   /* positive velocity — green */
+#define CP_VEL_N  3   /* negative velocity — red   */
+#define CP_WHL_L  4   /* left wheel label — yellow */
+#define CP_WHL_R  5   /* right wheel label — white */
+#define CP_TR_NEW 6   /* fresh trail dots — bright */
+#define CP_TR_OLD 7   /* old trail dots — dim      */
+#define CP_HUD    8   /* HUD text                  */
+```
+
+Green velocity arrows mean "moving forward" and red means "reversing" — the color matches the intuition. The heading arrow is cyan to stand out from both velocity colors. Trail dots age from bright to dim using `A_BOLD` → `A_DIM` attribute gating on top of the same color pair, giving three brightness levels without extra pairs.
+
+**Effect:** At a glance the viewer can read robot state: cyan arrow is "I'm going this way", green/red wheel arrows are "each wheel is pushing/braking", aged trail shows the robot's history.

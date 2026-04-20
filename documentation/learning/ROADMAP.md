@@ -1,6 +1,6 @@
 # Learning Roadmap — ASCII Creative Coding
 
-146 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
+151 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
 and the 2-year breakdown. Do not skip layers.
 
 ---
@@ -74,6 +74,8 @@ Introduces differential equations and numerical integration.
 | `chain.c` | Position-Based Dynamics | Verlet prediction, iterative distance-constraint projection, tension coloring, wave propagation |
 | `rigid_body.c` | 2D rigid body collisions — unified AABB | Single `col_bodies()` for all pairs; sphere AABB `hw=r, hh=2r` (terminal aspect fix); two-pass: Baumgarte always + velocity impulse when approaching; adaptive `e_eff`; Coulomb friction; spawn overlap check; sleep counter |
 | `soft_body.c` | Jelly blob — spring-mass mesh + pressure | Hooke springs (structural/shear/bending), shoelace area, pressure force on boundary edges, symplectic Euler |
+| `beam_bending.c` | Euler-Bernoulli beam statics + modal dynamics | Analytical w(x)/M(x) for 9 BC×load combos; eigenmode superposition; exact damped oscillator step (unconditionally stable) |
+| `diff_drive_robot.c` | Differential drive robot kinematics | v=(vL+vR)/2, ω=(vR-vL)/L; nonholonomic constraint; pixel-space Euler integration; ICC turn radius |
 
 ---
 
@@ -177,6 +179,9 @@ Agent-based simulation, graph algorithms, complex systems.
 | `reaction_wave.c` | Excitable media | FitzHugh-Nagumo |
 | `maze.c` | Graph algorithms | DFS generation, BFS solve |
 | `convex_hull.c` | Computational geom | Graham scan, Jarvis march |
+| `quad_tree_helloworld.c` | Quadtree (animated ncurses) | PR quadtree, AABB pruning, static pool, depth-coloured INSERT→QUERY phases |
+| `quadtree.c` | Quadtree (pure C demo) | half-open intervals, recursive subdivision, range query O(log N + k) |
+| `bsp_tree.c` | BSP tree (pure C demo) | alternating axis splits, front/back children, Doom/Quake lineage |
 | `sort_vis.c` | Algorithms | bubble/insertion/selection/quick/heap |
 | `forest_fire.c` | Drossel-Schwabl CA | 3-state probabilistic update, neighbour spread + lightning, SOC power-law fire sizes |
 | `slime_mold.c` | Physarum agent model | Jeff Jones (2010) sense-rotate-move-deposit, trail diffusion + decay, emergent Steiner networks |

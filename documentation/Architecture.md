@@ -66,6 +66,8 @@ Reference implementation: `basics/bounce_ball.c`
     - [Magnetic Field Lines — magnetic_field.c](#magnetic-field-lines--magnetic_fieldc)
     - [Hanging Chain — chain.c](#hanging-chain--chainc)
     - [Slime Mold — slime_mold.c](#slime-mold--slime_moldc)
+    - [Beam Bending & Vibration — beam_bending.c](#beam-bending--vibration--beam_bendingc)
+    - [Differential Drive Robot — diff_drive_robot.c](#differential-drive-robot--diff_drive_robotc)
 38. [Artistic Effects — artistic/ & geometry/](#38-artistic-effects--artistic)
     - [Aurora Borealis — aurora.c](#aurora-borealis--aurorac)
     - [Animated Voronoi — voronoi.c](#animated-voronoi--voronoic)
@@ -144,6 +146,8 @@ Reference implementation: `basics/bounce_ball.c`
 109. [Path Tracer — raytracing/path_tracer.c](#109-path-tracer--raytracingpath_tracerc)
 110. [Sphere Raytrace — raytracing/sphere_raytrace.c](#110-sphere-raytrace--raytracing-sphere_raytracec)
 111. [Torus Raytrace — raytracing/torus_raytrace.c](#111-torus-raytrace--raytracingtorus_raytracec)
+112. [Beam Bending & Vibration — physics/beam_bending.c](#112-beam-bending--vibration--physicsbeam_bendingc)
+113. [Differential Drive Robot — physics/diff_drive_robot.c](#113-differential-drive-robot--physicsdiff_drive_robotc)
 
 ---
 
@@ -3904,5 +3908,125 @@ After a toroidal edge wrap or rapid turn, the hip can teleport away from a plant
 Physics runs at 60 Hz in a fixed-step accumulator. Between ticks, `alpha = sim_accum / tick_ns` linearly interpolates all positions (`prev_*` → current) before drawing. Heading uses short-arc lerp: `bh = prev_heading + normalize(heading − prev_heading) × alpha`. This decouples render frame rate from physics rate, producing smooth motion even at low sim Hz settings.
 
 *Files: `animation/hexpod_tripod.c`*
+
+---
+
+## 112. Beam Bending & Vibration — physics/beam_bending.c
+
+### Static Analysis — Euler-Bernoulli Beam
+
+The Euler-Bernoulli beam equation `EI·w'''' = q(x)` is solved analytically for each combination of boundary condition and load type. Nine combinations are supported (3 BC types × 3 load types):
+
+| BC | Load | Deflection w(x) |
+|----|------|-----------------|
+| Simply supported | center point | `Pbx(L²−b²−x²)/(6EIL)` for x≤a |
+| Simply supported | distributed | `qx(L³−2Lx²+x³)/(24EI)` |
+| Simply supported | end moment | `Mx(L²−x²)/(6EIL)` (approx as end point) |
+| Cantilever | tip point | `Px²(3L−x)/(6EI)` |
+| Cantilever | distributed | `qx²(6L²−4Lx+x²)/(24EI)` |
+| Cantilever | base moment | `Mx²/(2EI)` |
+| Fixed-fixed | center point | `Px²(3L−4x)/(48EI)` for x≤L/2 |
+| Fixed-fixed | distributed | `qx²(L−x)²/(24EI)` |
+| Fixed-fixed | end moment | moment-balanced as fixed-free |
+
+The bending moment M(x) = EI·w'' is derived from the second derivative of each formula. Both static quantities are computed once per `init_beam()` call into arrays `b.w[]` and `b.M[]` of N_NODES=200 elements.
+
+### Load Animation and Visualization
+
+The load ramps in over `RAMP_SPEED=0.7s` via `load_anim` ∈ [0,1], which scales the deflection and moment during drawing. An exaggeration factor `b.exag` (keys e/E) multiplies the displayed deflection so hairline-thin deflections become visible.
+
+**Curvature shading:** Each node selects a character from the density ramp `".,-~=+*#@"` based on `|w[i]|/max_deflection`, giving darker chars where curvature is highest. A 3-row band (`BEAM_HEIGHT=3`) is drawn per node; the centre row shows the deflection char, the outer rows show `.` for structural thickness.
+
+**Bending moment panel:** A side panel of width `PANEL_W=22` draws a vertical bar for each node position proportional to `M[i]/max_moment`. Positive moments (sagging) draw downward with cyan; negative (hogging) draw upward with magenta.
+
+### Dynamic Modal Superposition
+
+Pressing `d` triggers the dynamic mode (`DynBeam.active=true`). Modal properties are computed for the current BC type:
+
+- **Cantilever eigenvalues:** β₁L = 1.8751, 4.6941, 7.8548, 10.9955. Eigenfunctions involve `cosh`/`sinh`/`cos`/`sin` combinations requiring double precision to avoid cancellation.
+- **Fixed-fixed eigenvalues:** β_nL = nπ (n=1,2,3,4). Pure sine eigenfunctions, numerically clean.
+- **Simply supported eigenvalues:** β_nL = nπ. Pure sine eigenfunctions.
+
+Modal mass and generalised force are computed by integrating `φ_n(x)·q(x)` over the beam length. Each mode then runs as an independent damped oscillator:
+
+```
+ωd = ω_n · √(1 − ζ²)         where ζ = MODAL_DAMP = 0.025
+e  = exp(−ζ·ω_n·dt)
+q(t+dt) = q_s + e·(A·cos(ωd·dt) + B·sin(ωd·dt))
+```
+
+The exact transition matrix is unconditionally stable — no step size constraint, unlike explicit Euler which becomes unstable when `ω_n·dt > 2`.
+
+The dynamic deflection is `w(x) = Σ_n q_n(t)·φ_n(x)·exag`, added on top of zero (the modes are a complete basis; the static solution is embedded in the initial conditions of q and qdot).
+
+*Files: `physics/beam_bending.c`*
+
+---
+
+## 113. Differential Drive Robot — physics/diff_drive_robot.c
+
+### Kinematic Model
+
+A differential drive robot has two independently driven wheels on a common axle. The pose is (x, y, θ) in 2D. For wheel velocities vL and vR with axle width L:
+
+```
+v     = (vL + vR) / 2          linear velocity
+ω     = (vR − vL) / L          angular velocity (CW positive in y-down)
+x'    = v · cos(θ)
+y'    = v · sin(θ)
+θ'    = ω
+```
+
+When `ω = 0` the robot moves straight. When `vL = −vR` the robot spins in place (R=0). The turn radius `R = v/ω` is displayed in the HUD (shown as `INF` when |ω| < 0.001).
+
+The nonholonomic constraint — the robot cannot move sideways — is embedded in the kinematic equations: velocity is always along the heading vector (cosθ, sinθ). No penalty term is needed; the constraint is geometric.
+
+### Input Mapping and Momentum
+
+User input sets `v_cmd` (forward/reverse) and `w_cmd` (turn rate) via arrow keys. These are converted to individual wheel speeds:
+
+```
+vL = v_cmd − w_cmd · axle/2
+vR = v_cmd + w_cmd · axle/2
+```
+
+Linear momentum: `V_DECAY = 1.00` — no automatic slowdown. The robot holds its last commanded speed indefinitely until the user brakes (`S` key sets v_cmd = w_cmd = 0) or steers. This models a real wheeled robot which keeps rolling unless braked.
+
+Angular decay: `W_DECAY = 0.88` per tick — turns damp out quickly when the turn key is released, preventing endless spinning.
+
+### Pixel-Space Physics and Aspect Correction
+
+All positions are in pixel space (`CELL_W=8`, `CELL_H=16`). The axle length is defined in pixels (`AXLE_PX=36`). Wheel positions in pixel space:
+
+```
+left  wheel: (px + sin(θ)·half,   py − cos(θ)·half)   [north of body when facing east]
+right wheel: (px − sin(θ)·half,   py + cos(θ)·half)   [south of body when facing east]
+```
+
+The sign convention uses y-down coordinates (standard terminal layout): θ=0 faces right (+x), θ=π/2 faces down (+y). Perpendicular to heading in y-down is (sinθ, −cosθ) for the left side.
+
+Conversion to cell space (`px_to_cx/cy`) happens only at draw time. This keeps all velocity and distance arithmetic in consistent pixel units regardless of terminal size.
+
+### Dot-Progression Arrow Drawing
+
+The heading arrow and wheel velocity arrows use `draw_dot_line()` instead of Bresenham. The function steps in pixel space by `CELL_W` per sample and places characters based on fractional progress along the line:
+
+```
+t < 0.40 → '.'    (near, faint)
+t < 0.75 → 'o'    (mid)
+t ≥ 0.75 → '0'    (far, bold)
+```
+
+This avoids the `\`/`/` diagonal artifacts that appear when Bresenham steps diagonally through a character grid with a 2:1 cell aspect ratio. The caller places a cardinal tip char (`>`, `v`, `<`, `^`) or `o` for diagonal directions on top of the last dot.
+
+### Trail Ring Buffer
+
+The robot's centre traces a 600-slot ring buffer (`TRAIL_CAP=600`), sampled every `TRAIL_STEP=2` physics ticks. Trail dots fade from `.` (recent, bright) to `:` (old, dim) based on age fraction. Sub-tick render interpolation is applied to the live robot pose; trail dots use their stored pixel coordinates directly.
+
+World-wrap interpolation suppression: if `|Δpx| > world_width/2` the interpolation delta is clamped to zero, preventing a ghost streak across the screen when the robot wraps a toroidal edge.
+
+*Files: `physics/diff_drive_robot.c`*
+
+---
 
 *This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `physics/bounce_ball.c`.*

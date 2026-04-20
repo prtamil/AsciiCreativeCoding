@@ -54,6 +54,8 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [D14 Slider-Crank Kinematics — Engine Cycle Simulation](#d14-slider-crank-kinematics--engine-cycle-simulation)
 - [D15 Baumgarte Stabilised Rigid-Body Collision](#d15-baumgarte-stabilised-rigid-body-collision)
 - [D16 Quantum Wavepacket — Crank-Nicolson / Thomas Algorithm](#d16-quantum-wavepacket--crank-nicolson--thomas-algorithm)
+- [D17 Euler-Bernoulli Beam — Analytical Statics + Modal Dynamics](#d17-euler-bernoulli-beam--analytical-statics--modal-dynamics)
+- [D18 Differential Drive Robot — Nonholonomic Kinematics](#d18-differential-drive-robot--nonholonomic-kinematics)
 
 ### E — Cellular Automata & Grid Simulations
 - [E1 Falling Sand — Gravity CA](#e1-falling-sand--gravity-ca)
@@ -2225,6 +2227,73 @@ Rather than Ferrari's analytic quartic solver (numerically unstable near degener
 
 The surface normal at hit point `P` is the gradient of the implicit function: `N = normalize(P − R·normalize(P_xz))` where `P_xz = (P.x, 0, P.z)` is the XZ projection. Geometrically, `R·normalize(P_xz)` is the nearest point on the ring centreline — the normal points radially outward from that centre-line point, which is the "outward tube direction" at any surface location.
 *Files: `raytracing/torus_raytrace.c`*
+
+---
+
+---
+
+#### D17 Euler-Bernoulli Beam — Analytical Statics + Modal Dynamics
+
+The Euler-Bernoulli beam model assumes cross-sections remain plane and perpendicular to the neutral axis. The governing equation for transverse deflection `w(x)`:
+
+```
+EI · d⁴w/dx⁴ = q(x)
+```
+
+where `E` is Young's modulus, `I` is the second moment of area, and `q(x)` is the distributed load. Integrating four times with appropriate boundary conditions gives closed-form `w(x)`. The bending moment `M(x) = EI · w''` (second derivative) follows from the deflection profile.
+
+**Nine analytical solutions** are tabulated for 3 BC types × 3 load types:
+
+- Simply supported (SS): zero deflection and zero moment at both ends
+- Cantilever: fixed at x=0 (zero deflection + zero slope), free at x=L
+- Fixed-fixed: zero deflection and zero slope at both ends
+
+For each BC, three load cases are solved: concentrated center load P, uniformly distributed load q, and end moment M.
+
+**Modal dynamics** use the free-vibration eigenmodes of each BC type. For a cantilever, the characteristic equation is `1 + cos(βL)·cosh(βL) = 0`, giving β₁L = 1.8751, β₂L = 4.6941, etc. The eigenfrequency is `ω_n = (β_nL)²·√(EI/ρA·L⁴)`. Each mode runs as an independent damped oscillator solved with the exact transition matrix (avoids explicit-Euler instability at high ω·dt).
+
+**Why exact transition matrix instead of Euler integration:**
+The modal ODE `q̈ + 2ζω_n·q̇ + ω_n²·q = F_n(t)` has a closed-form solution per step:
+
+```
+q(t+dt) = q_s + e^(−ζωdt) · [A·cos(ωd·dt) + B·sin(ωd·dt)]
+```
+
+where `q_s = F_n/ω_n²` is the static equilibrium, `ωd = ω_n√(1−ζ²)`, and A, B are set from initial conditions. This is unconditionally stable for any dt — a property explicit Euler lacks (it diverges when `ω_n·dt > 2`).
+
+*Files: `physics/beam_bending.c`*
+
+---
+
+#### D18 Differential Drive Robot — Nonholonomic Kinematics
+
+A differential drive robot has two wheels on a shared axle, driven independently. The robot's configuration is the pose (x, y, θ). From wheel velocities:
+
+```
+v  = (vL + vR) / 2          center velocity
+ω  = (vR − vL) / L          angular velocity (axle width L)
+ẋ  = v · cos(θ)
+ẏ  = v · sin(θ)
+θ̇  = ω
+```
+
+**Nonholonomic constraint:** the robot cannot move perpendicular to its heading. This is encoded implicitly — velocity is always (v·cosθ, v·sinθ), no lateral component. The constraint is automatically satisfied without any penalty or projection step.
+
+**Instantaneous Centre of Curvature (ICC):** when ω ≠ 0, the robot turns about a point at distance `R = v/ω` from the robot's midpoint. When vL = vR the robot goes straight (R → ∞). When vL = −vR the robot spins in place (R = 0).
+
+**Perpendicular wheel geometry in y-down coordinates** (standard terminal layout, +y points down):
+
+```
+heading direction:  (cos θ, sin θ)
+perpendicular left: (+sin θ, −cos θ)     [north of body when facing east]
+perpendicular right:(−sin θ, +cos θ)     [south of body when facing east]
+```
+
+A common mistake is to use the screen-geometry perpendicular without accounting for the y-down flip. The correct form has the +sin/−cos sign pattern, not the standard math-convention −sin/+cos.
+
+**Why V_DECAY = 1.0 (no linear decay):** A real wheeled robot on flat ground has negligible rolling resistance at low speeds. Setting decay < 1.0 per tick at 60 Hz creates exponential drag that makes the robot stop within a second of key release — counterintuitive and physically wrong for a flat surface. The user controls speed explicitly; braking requires the dedicated S key.
+
+*Files: `physics/diff_drive_robot.c`*
 
 ---
 

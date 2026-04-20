@@ -9,7 +9,7 @@
    ╚═╝     ╚══════╝  ╚═╝  ╚═╝  ╚═╝     ╚═╝    blackhole.c  terminal as canvas
 ```
 
-148 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
+153 simulations. Pure C. Zero GUI dependencies. The terminal is the only renderer.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -65,6 +65,8 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `gyroscope` | 3D rigid-body gyroscope — quaternion orientation (no gimbal lock), Gram-Schmidt re-ortho safeguard; 3 presets: Euler's Top (torque-free symmetric, angular momentum cone), Gravity Top (precession + nutation, wobble tightens with spin), Dzhanibekov (asymmetric torque-free, flip instability) |
 | `spring_pendulum` | Spring pendulum — Lagrangian polar-coordinate EOM (r, θ); energy exchange resonance when ω_spring ≈ 2×ω_pendulum; rosette path tracing |
 | `2stroke` | 2-stroke engine animation — slider-crank kinematics; crank/connecting-rod/piston geometry per θ; exhaust + transfer ports open/close; TDC spark; real-time cycle phase label |
+| `beam_bending` | Euler-Bernoulli beam — 9 BC×load combos; analytical w(x) + M(x); curvature-shaded ASCII render + moment panel; dynamic modal superposition (4 eigenmodes, exact damped transition matrix) |
+| `diff_drive_robot` | Differential drive robot — nonholonomic kinematics; pixel-space Euler integration; trail ring buffer; heading + wheel velocity arrows drawn with `.o0` dot progression |
 
 ### Fractals & Chaos
 | Program | Algorithm |
@@ -139,6 +141,9 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `string_art` | Modular arithmetic i→⌊i×k⌋ mod N, morphing cardioid/nephroid/astroid |
 | `voronoi` | Brute-force nearest-neighbor, Langevin seed motion, d2−d1 edge detection |
 | `convex_hull` | Graham scan + Jarvis march — simultaneous race |
+| `quad_tree_helloworld` | Animated quadtree — INSERT phase (random points, live subdivision) → QUERY phase (drifting rectangle, AABB pruning visible); static node pool, depth-coloured borders, scrolling info panel |
+| `quadtree` | Quadtree pure-C demo — 8-step walkthrough: fill root, trigger VERTICAL+HORIZONTAL subdivisions, range query; ANSI-coloured ASCII grid; malloc-based nodes |
+| `bsp_tree` | BSP tree pure-C demo — alternating VERTICAL (!) / HORIZONTAL (=) splits, front/back children, AABB range query with full right-half pruning; 8-step walkthrough |
 
 ### Mathematical Art
 | Program | Algorithm |
@@ -261,7 +266,7 @@ See `Claude.md` for the complete build list.
     ├── Claude.md          — complete build reference
     └── learning/
         ├── ROADMAP.md         — 6-tier study order, 2-year plan
-        └── concept_*.md       — 101 deep-dive concept files
+        └── concept_*.md       — 104 deep-dive concept files
                                  (math → pseudocode → implementation notes)
 ```
 
@@ -269,7 +274,7 @@ See `Claude.md` for the complete build list.
 
 ## Documentation
 
-`documentation/learning/` contains 101 concept files — one per program. Each file has two passes:
+`documentation/learning/` contains 104 concept files — one per program. Each file has two passes:
 
 - **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
 - **Pass 2** — pseudocode, module map, data flow diagram, core loop

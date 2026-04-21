@@ -126,8 +126,8 @@ enum {
 
 /* ── Raymarcher ─────────────────────────────────────────────────────── */
 /* Increase RM_MAX_STEPS for sharper detail at cost of frame rate.        */
-#define RM_MAX_STEPS   72     /* max sphere-trace steps per ray                       */
-#define RM_HIT_EPS     0.018f /* hit threshold (world units); smaller = sharper edges */
+#define RM_MAX_STEPS   48     /* max sphere-trace steps per ray                       */
+#define RM_HIT_EPS     0.022f /* hit threshold (world units); smaller = sharper edges */
 #define RM_MAX_DIST    18.0f  /* bail-out distance (world units)                      */
 #define RM_NORM_EPS    0.004f /* finite-difference step for surface normal estimation */
 
@@ -1079,15 +1079,15 @@ static Pixel rm_cast(int px_col, int py_row, int cw, int ch,
         corona_acc += expf(-near * CORONA_SCALE) * CORONA_BRIGHT * CORONA_WEIGHT;
 
         if (sh.dist < RM_HIT_EPS) {
-            /* Step 4: hit — compute normal and apply limb darkening */
+            /* Step 4: hit — compute normal and apply limb darkening.
+             * 1-sided FD reuses sh.dist as the centre sample → 3 calls
+             * instead of 6, halving the most expensive per-pixel cost.  */
             float e = RM_NORM_EPS;
+            float d0 = sh.dist;
             V3 n;
-            n.x = sdf_sun(v3add(p, v3( e, 0, 0)), time, ry, flares, n_flares).dist
-                - sdf_sun(v3add(p, v3(-e, 0, 0)), time, ry, flares, n_flares).dist;
-            n.y = sdf_sun(v3add(p, v3(0,  e, 0)), time, ry, flares, n_flares).dist
-                - sdf_sun(v3add(p, v3(0, -e, 0)), time, ry, flares, n_flares).dist;
-            n.z = sdf_sun(v3add(p, v3(0, 0,  e)), time, ry, flares, n_flares).dist
-                - sdf_sun(v3add(p, v3(0, 0, -e)), time, ry, flares, n_flares).dist;
+            n.x = sdf_sun(v3add(p, v3(e, 0, 0)), time, ry, flares, n_flares).dist - d0;
+            n.y = sdf_sun(v3add(p, v3(0, e, 0)), time, ry, flares, n_flares).dist - d0;
+            n.z = sdf_sun(v3add(p, v3(0, 0, e)), time, ry, flares, n_flares).dist - d0;
             V3 N = v3norm(n);
             V3 V = v3norm(v3sub(ro, p));
             float ndv = fabsf(v3dot(N, V));

@@ -152,32 +152,31 @@ enum {
     N_THEMES        =  10,    /* selectable colour themes (cycle with 't') */
 
     N_LEGS          =   6,    /* 3 per side                                */
-    N_BODY_SEGS     =   6,    /* body trail-buffer FK segments             */
+    N_BODY_SEGS     =   5,    /* body trail-buffer FK segments             */
     TRAIL_CAP       = 1024,   /* circular trail buffer capacity            */
 };
 
 /* Body motion */
-#define BODY_SEG_LEN      20.0f   /* px between consecutive body joints    */
+#define BODY_SEG_LEN      18.0f   /* px between consecutive body joints    */
 #define BODY_SPEED        45.0f   /* head translation speed, px/s          */
 #define BODY_SPEED_MIN    10.0f
 #define BODY_SPEED_MAX   200.0f
 #define TURN_RATE          2.5f   /* rad/s — steering rate toward target heading */
 
 /* IK leg geometry */
-#define UPPER_LEN         50.0f   /* hip-to-knee segment length, px        */
-#define LOWER_LEN         44.0f   /* knee-to-foot segment length, px       */
+#define UPPER_LEN         55.0f   /* hip-to-knee segment length, px        */
+#define LOWER_LEN         48.0f   /* knee-to-foot segment length, px       */
 
 /*
  * HIP_DIST_FACTOR — hip offset from body centerline as fraction of screen
- * pixel height.  Small value keeps hips close to body so legs emanate
- * directly from the body edge with minimal gap.
+ * pixel height.
  */
-#define HIP_DIST_FACTOR   0.06f
+#define HIP_DIST_FACTOR   0.07f
 
-/* Step / gait parameters — scaled for the longer legs */
+/* Step / gait parameters */
 #define STEP_REACH_FACTOR 0.68f   /* ideal reach = (UPPER+LOWER)*factor    */
-#define STEP_TRIGGER_DIST 25.0f   /* px drift before step triggers         */
-#define MAX_STRETCH       60.0f   /* absolute max hip-to-foot before step  */
+#define STEP_TRIGGER_DIST 28.0f   /* px drift before step triggers         */
+#define MAX_STRETCH       65.0f   /* absolute max hip-to-foot before step  */
 #define STEP_DURATION     0.22f   /* seconds for one complete step         */
 
 /* Body bead fill step (px) */
@@ -666,72 +665,62 @@ static Vec2 compute_ideal_foot(const Spider *sp, int i)
 }
 
 /*
- * update_steps() — evaluate gait logic and advance step animations.
+ * update_steps() — independent per-leg step scheduling.
  *
- * For each leg:
- *   1. Compute ideal_foot position from current hip.
- *   2. Check step trigger conditions (drift or over-stretch).
- *   3. If trigger fires and opposite tripod is not stepping: start step.
- *   4. Advance active step animations using smoothstep lerp.
- *   5. Finalize completed steps.
+ * Each leg checks its own drift / stretch and steps as soon as it is ready.
+ * Stability constraint: at most N_LEGS/2 (3) legs in the air simultaneously,
+ * guaranteeing 3-point ground contact at all times.
+ *
+ * Contrast with the old alternating-tripod logic: that held the entire
+ * opposite tripod (3 legs) frozen while one tripod stepped.  Here any leg
+ * is free to swing the moment it is ready AND the in-air count is below 3.
+ * The result is fluid, organic-looking movement: legs step at slightly
+ * different times driven by their individual geometry, not a group timer.
  */
 static void update_steps(Spider *sp, float dt)
 {
-    /* Determine if each tripod is currently stepping */
-    bool tripod_a = sp->stepping[0] || sp->stepping[2] || sp->stepping[4];
-    bool tripod_b = sp->stepping[1] || sp->stepping[3] || sp->stepping[5];
+    /* Count how many legs are currently airborne */
+    int n_air = 0;
+    for (int i = 0; i < N_LEGS; i++)
+        if (sp->stepping[i]) n_air++;
 
     for (int i = 0; i < N_LEGS; i++) {
-        bool in_a = (i == 0 || i == 2 || i == 4);
 
-        /* ── Screen-wrap snap ─────────────────────────────────────────
-         * After a toroidal wrap the hip teleports to the opposite edge
-         * while the planted foot stays behind.  The resulting
-         * hip-to-foot distance exceeds the IK chain reach, causing the
-         * solver to clamp and the leg to look unnaturally stretched.
-         * Detect this by checking against the hard IK limit and snap
-         * the foot to its ideal position immediately (no animation).
-         * ────────────────────────────────────────────────────────── */
+        /* ── Screen-wrap snap ────────────────────────────────────────── */
         float snap_stretch = vec2_dist(sp->foot_pos[i], sp->hip[i]);
         if (snap_stretch > UPPER_LEN + LOWER_LEN - 2.0f) {
             sp->foot_pos[i]    = compute_ideal_foot(sp, i);
             sp->foot_old[i]    = sp->foot_pos[i];
             sp->step_target[i] = sp->foot_pos[i];
-            sp->stepping[i]    = false;
+            if (sp->stepping[i]) { sp->stepping[i] = false; n_air--; }
             sp->step_t[i]      = 0.0f;
-            bool is_left = (i % 2 == 0);
-            solve_ik(sp->hip[i], sp->foot_pos[i], is_left, &sp->knee[i]);
+            solve_ik(sp->hip[i], sp->foot_pos[i], (i % 2 == 0), &sp->knee[i]);
             continue;
         }
 
         if (!sp->stepping[i]) {
-            /* Check step trigger */
-            Vec2  ideal = compute_ideal_foot(sp, i);
-            float drift = vec2_dist(sp->foot_pos[i], ideal);
+            Vec2  ideal   = compute_ideal_foot(sp, i);
+            float drift   = vec2_dist(sp->foot_pos[i], ideal);
             float stretch = vec2_dist(sp->foot_pos[i], sp->hip[i]);
 
-            bool should_step = (drift > STEP_TRIGGER_DIST
-                                || stretch > MAX_STRETCH);
-
-            /* Alternating tripod: only step if opposite tripod is planted */
-            bool opposite_stepping = in_a ? tripod_b : tripod_a;
-
-            if (should_step && !opposite_stepping) {
+            /* Step if foot has drifted too far OR leg is over-stretched,
+             * but only when below the in-air cap (stability guarantee). */
+            if ((drift > STEP_TRIGGER_DIST || stretch > MAX_STRETCH)
+                    && n_air < N_LEGS / 2) {
                 sp->stepping[i]    = true;
                 sp->step_t[i]      = 0.0f;
                 sp->foot_old[i]    = sp->foot_pos[i];
                 sp->step_target[i] = ideal;
-
-                /* Update which tripod is now stepping */
-                if (in_a) tripod_a = true; else tripod_b = true;
+                n_air++;
             }
         } else {
             /* Advance step animation */
             sp->step_t[i] += dt / STEP_DURATION;
             if (sp->step_t[i] >= 1.0f) {
-                sp->step_t[i]  = 1.0f;
+                sp->step_t[i]   = 1.0f;
                 sp->foot_pos[i] = sp->step_target[i];
                 sp->stepping[i] = false;
+                n_air--;
             } else {
                 float ease = smoothstep(sp->step_t[i]);
                 sp->foot_pos[i] = vec2_lerp(sp->foot_old[i],
@@ -740,11 +729,9 @@ static void update_steps(Spider *sp, float dt)
         }
     }
 
-    /* Recompute IK for all legs after step positions updated */
-    for (int i = 0; i < N_LEGS; i++) {
-        bool is_left = (i % 2 == 0);
-        solve_ik(sp->hip[i], sp->foot_pos[i], is_left, &sp->knee[i]);
-    }
+    /* Recompute IK for all legs */
+    for (int i = 0; i < N_LEGS; i++)
+        solve_ik(sp->hip[i], sp->foot_pos[i], (i % 2 == 0), &sp->knee[i]);
 }
 
 /* ── §5h  rendering ─────────────────────────────────────────────────── */

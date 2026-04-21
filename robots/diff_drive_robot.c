@@ -101,7 +101,7 @@
  *   r    reset         q/ESC quit
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/diff_drive_robot.c \
+ *   gcc -std=c11 -O2 -Wall -Wextra robots/diff_drive_robot.c \
  *       -o diff_drive_robot -lncurses -lm
  *
  * ─────────────────────────────────────────────────────────────────────

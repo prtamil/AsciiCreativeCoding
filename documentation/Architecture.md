@@ -147,7 +147,7 @@ Reference implementation: `basics/bounce_ball.c`
 110. [Sphere Raytrace — raytracing/sphere_raytrace.c](#110-sphere-raytrace--raytracing-sphere_raytracec)
 111. [Torus Raytrace — raytracing/torus_raytrace.c](#111-torus-raytrace--raytracingtorus_raytracec)
 112. [Beam Bending & Vibration — physics/beam_bending.c](#112-beam-bending--vibration--physicsbeam_bendingc)
-113. [Differential Drive Robot — physics/diff_drive_robot.c](#113-differential-drive-robot--physicsdiff_drive_robotc)
+113. [Differential Drive Robot — robots/diff_drive_robot.c](#113-differential-drive-robot--physicsdiff_drive_robotc)
 114. [Walking Robot — robots/walking_robot.c](#114-walking-robot--robotswalking_robotc)
 115. [Perlin Terrain Bot — robots/perlin_terrain_bot.c](#115-perlin-terrain-bot--robotsperlin_terrain_botc)
 
@@ -3965,7 +3965,7 @@ The dynamic deflection is `w(x) = Σ_n q_n(t)·φ_n(x)·exag`, added on top of z
 
 ---
 
-## 113. Differential Drive Robot — physics/diff_drive_robot.c
+## 113. Differential Drive Robot — robots/diff_drive_robot.c
 
 ### Kinematic Model
 
@@ -4027,7 +4027,7 @@ The robot's centre traces a 600-slot ring buffer (`TRAIL_CAP=600`), sampled ever
 
 World-wrap interpolation suppression: if `|Δpx| > world_width/2` the interpolation delta is clamped to zero, preventing a ghost streak across the screen when the robot wraps a toroidal edge.
 
-*Files: `physics/diff_drive_robot.c`*
+*Files: `robots/diff_drive_robot.c`*
 
 ---
 

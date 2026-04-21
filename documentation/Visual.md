@@ -1090,7 +1090,7 @@ The step size is `CELL_W` pixels — this produces roughly one dot per cell alon
 
 **When to use:** Short directional arrows (heading vectors, velocity arrows) where the direction is the message and the angle may vary continuously. Bresenham + slope chars is better for long structural lines (springs, wires) where character selection at each cell is important.
 
-*Files: `physics/diff_drive_robot.c`*
+*Files: `robots/diff_drive_robot.c`*
 
 ---
 

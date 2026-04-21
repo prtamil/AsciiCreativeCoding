@@ -2295,7 +2295,7 @@ A common mistake is to use the screen-geometry perpendicular without accounting 
 
 **Why V_DECAY = 1.0 (no linear decay):** A real wheeled robot on flat ground has negligible rolling resistance at low speeds. Setting decay < 1.0 per tick at 60 Hz creates exponential drag that makes the robot stop within a second of key release — counterintuitive and physically wrong for a flat surface. The user controls speed explicitly; braking requires the dedicated S key.
 
-*Files: `physics/diff_drive_robot.c`*
+*Files: `robots/diff_drive_robot.c`*
 
 ---
 

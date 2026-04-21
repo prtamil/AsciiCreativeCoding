@@ -1221,7 +1221,7 @@ int cp = (b->M[i] >= 0.0f) ? CP_MOM_POS : CP_MOM_NEG;  /* cyan / magenta */
 
 ## 23. Role-Named Velocity Arrow Colors (diff_drive_robot.c)
 
-**Where:** `physics/diff_drive_robot.c`
+**Where:** `robots/diff_drive_robot.c`
 
 **How it works:** Each visual element gets a named color pair constant, not a numbered pair. This separates the question "what does this color mean?" from "what xterm-256 index is it?":
 

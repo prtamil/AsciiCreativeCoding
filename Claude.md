@@ -72,7 +72,8 @@ gcc -std=c11 -O2 -Wall -Wextra physics/blackhole.c          -o blackhole        
 gcc -std=c11 -O2 -Wall -Wextra physics/magnetic_field.c     -o magnetic_field    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/chain.c              -o chain             -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/beam_bending.c       -o beam_bending      -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra physics/diff_drive_robot.c   -o diff_drive_robot  -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra robots/diff_drive_robot.c    -o diff_drive_robot       -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra robots/moving_jump_spring_leg_robot.c -o moving_jump_spring_leg_robot -lncurses -lm
 
 # ── fractal / random growth (new) ────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/penrose.c           -o penrose           -lncurses -lm

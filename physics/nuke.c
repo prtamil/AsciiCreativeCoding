@@ -102,7 +102,7 @@
 enum {
     SIM_FPS       = 60,
     N_SUBSTEPS    =  2,    /* wave sub-steps per frame (improves CFL margin) */
-    HUD_COLS      = 80,
+    HUD_COLS      = 120,
     FPS_MS        = 500,
     MAX_PARTS     = 240,   /* total particle pool                            */
     DEBRIS_BURST  =  80,   /* debris particles per blast                     */
@@ -171,17 +171,18 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  color — 6 themes, cycled with 't'                                 */
 /*                                                                        */
-/*   1–8   pressure ramp: dark-red → orange → yellow → white            */
-/*   9     rarefaction trough: cold blue                                 */
-/*   10    terrain body (dark green/brown)                               */
-/*   11    terrain surface (olive)                                       */
-/*   12    terrain displaced (bright orange — shows energy transfer)     */
-/*   13    debris spark (yellow)                                         */
-/*   14    dust cloud (pale tan)                                         */
-/*   15    flash (white)                                                 */
-/*   16    HUD                                                           */
+/* Color pair layout (same slots for every theme):                       */
+/*   1–8   pressure ramp — 8-step gradient, dim → bright                */
+/*   9     rarefaction trough (trailing negative wave)                   */
+/*   10    terrain body                                                   */
+/*   11    terrain surface (undisturbed)                                 */
+/*   12    terrain displaced (energy-impact highlight)                   */
+/*   13    debris sparks                                                  */
+/*   14    dust cloud                                                     */
+/*   15    flash burst                                                    */
+/*   16    HUD text                                                       */
 /* ===================================================================== */
 
 #define N_PRESS   8
@@ -194,34 +195,105 @@ static void clock_sleep_ns(int64_t ns)
 #define CP_FLASH  15
 #define CP_HUD    16
 
-static const short k_press_fg[N_PRESS] = { 88, 124, 160, 196, 202, 208, 220, 231 };
+typedef struct {
+    const char *name;
+    short       press[N_PRESS]; /* pressure gradient, dim → bright     */
+    short       rarefy;         /* rarefaction (negative pressure)      */
+    short       tbase;          /* terrain body fill                    */
+    short       tsurf;          /* terrain surface line                 */
+    short       tdisp;          /* terrain ripple highlight             */
+    short       debris;         /* debris sparks                        */
+    short       dust;           /* dust cloud                           */
+    short       flash;          /* initial flash                        */
+    short       hud;            /* HUD / status line                    */
+    /* fallback basic-color indices for terminals without 256 colors    */
+    short       fb_press_lo;    /* low-end pressure (basic color)       */
+    short       fb_press_hi;    /* high-end pressure (basic color)      */
+    short       fb_rarefy;
+} Theme;
 
-static void color_init(void)
+static const Theme k_themes[] = {
+
+    /* ── 0  NUKE — original red-orange-white nuclear fire ─────────── */
+    { "NUKE",
+      { 88, 124, 160, 196, 202, 208, 220, 231 },
+      18, 22, 100, 214, 226, 180, 231, 231,
+      COLOR_RED, COLOR_YELLOW, COLOR_BLUE
+    },
+
+    /* ── 1  BRIGHT — electric cyan through white, hot-magenta trough ─ */
+    { "BRIGHT",
+      { 39, 45, 51, 87, 123, 159, 195, 231 },
+      201, 24, 31, 51, 231, 159, 231, 51,
+      COLOR_CYAN, COLOR_WHITE, COLOR_MAGENTA
+    },
+
+    /* ── 2  MATRIX — terminal-green code rain, dead-black trough ───── */
+    { "MATRIX",
+      { 22, 28, 34, 40, 46, 82, 118, 154 },
+      17, 22, 34, 118, 118, 46, 154, 46,
+      COLOR_GREEN, COLOR_GREEN, COLOR_BLACK
+    },
+
+    /* ── 3  NOVA — deep-space blue-violet bursting to white ──────────  */
+    { "NOVA",
+      { 17, 19, 57, 93, 129, 165, 207, 231 },
+      196, 17, 54, 141, 225, 141, 231, 225,
+      COLOR_BLUE, COLOR_MAGENTA, COLOR_RED
+    },
+
+    /* ── 4  FIRE — dark smoldering ember to blinding flame ──────────  */
+    { "FIRE",
+      { 52, 88, 124, 160, 196, 208, 214, 220 },
+      17, 52, 88, 220, 220, 130, 220, 214,
+      COLOR_RED, COLOR_YELLOW, COLOR_BLACK
+    },
+
+    /* ── 5  TOXIC — bio-hazard acid lime, blood-red rarefaction ─────  */
+    { "TOXIC",
+      { 22, 58, 64, 70, 76, 82, 118, 154 },
+      88, 22, 58, 82, 154, 112, 154, 82,
+      COLOR_GREEN, COLOR_GREEN, COLOR_RED
+    },
+};
+
+#define N_THEMES ((int)(sizeof k_themes / sizeof *k_themes))
+
+static int g_theme = 0;   /* current theme index; cycled by 't' key */
+
+/*
+ * color_apply() — (re)initialise all 16 color pairs for theme t.
+ * Safe to call at any time; ncurses picks up changes on the next refresh.
+ */
+static void color_apply(int t)
 {
+    const Theme *th = &k_themes[t];
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
         for (int i = 0; i < N_PRESS; i++)
-            init_pair((short)(i + 1), k_press_fg[i], -1);
-        init_pair(CP_RAREFY,  18, -1);   /* dark navy             */
-        init_pair(CP_TBASE,   22, -1);   /* dark green            */
-        init_pair(CP_TSURF,  100, -1);   /* olive                 */
-        init_pair(CP_TDISP,  214, -1);   /* orange (wave impact)  */
-        init_pair(CP_DEBRIS, 226, -1);   /* bright yellow         */
-        init_pair(CP_DUST,   180, -1);   /* pale tan              */
-        init_pair(CP_FLASH,  231, -1);   /* white                 */
-        init_pair(CP_HUD,    231, -1);
+            init_pair((short)(i + 1), th->press[i], -1);
+        init_pair(CP_RAREFY, th->rarefy, -1);
+        init_pair(CP_TBASE,  th->tbase,  -1);
+        init_pair(CP_TSURF,  th->tsurf,  -1);
+        init_pair(CP_TDISP,  th->tdisp,  -1);
+        init_pair(CP_DEBRIS, th->debris, -1);
+        init_pair(CP_DUST,   th->dust,   -1);
+        init_pair(CP_FLASH,  th->flash,  -1);
+        init_pair(CP_HUD,    th->hud,    -1);
     } else {
-        for (int i = 0; i < 6; i++) init_pair((short)(i+1), COLOR_RED,    -1);
-        for (int i = 6; i < 8; i++) init_pair((short)(i+1), COLOR_YELLOW, -1);
-        init_pair(CP_RAREFY,  COLOR_BLUE,  -1);
-        init_pair(CP_TBASE,   COLOR_GREEN, -1);
-        init_pair(CP_TSURF,   COLOR_GREEN, -1);
-        init_pair(CP_TDISP,   COLOR_YELLOW,-1);
-        init_pair(CP_DEBRIS,  COLOR_YELLOW,-1);
-        init_pair(CP_DUST,    COLOR_WHITE, -1);
-        init_pair(CP_FLASH,   COLOR_WHITE, -1);
-        init_pair(CP_HUD,     COLOR_WHITE, -1);
+        for (int i = 0; i < N_PRESS / 2; i++)
+            init_pair((short)(i + 1), th->fb_press_lo, -1);
+        for (int i = N_PRESS / 2; i < N_PRESS; i++)
+            init_pair((short)(i + 1), th->fb_press_hi, -1);
+        init_pair(CP_RAREFY, th->fb_rarefy,      -1);
+        init_pair(CP_TBASE,  COLOR_GREEN,         -1);
+        init_pair(CP_TSURF,  COLOR_GREEN,         -1);
+        init_pair(CP_TDISP,  th->fb_press_hi,     -1);
+        init_pair(CP_DEBRIS, th->fb_press_hi,     -1);
+        init_pair(CP_DUST,   COLOR_WHITE,         -1);
+        init_pair(CP_FLASH,  COLOR_WHITE,         -1);
+        init_pair(CP_HUD,    COLOR_WHITE,         -1);
     }
 }
 
@@ -644,8 +716,9 @@ static void render_frame(const SimState *s, int trows, int tcols,
                     * 1.41421356f;
         char buf[HUD_COLS];
         snprintf(buf, sizeof buf,
-                 " nuke | t=%.1fs | %.0ffps | CFL=%.2f | "
-                 "space:blast  r:reset  p:pause%s  q:quit ",
+                 " nuke [%s] | t=%.1fs | %.0ffps | CFL=%.2f | "
+                 "space:blast  r:reset  p:pause%s  t:theme  q:quit ",
+                 k_themes[g_theme].name,
                  (double)s->time, (double)fps, (double)cfl,
                  paused ? "(ON)" : "");
         attron(COLOR_PAIR(CP_HUD) | A_BOLD);
@@ -687,7 +760,7 @@ int main(void)
     nodelay(stdscr, TRUE);
     curs_set(0);
     typeahead(-1);
-    color_init();
+    color_apply(g_theme);
 
     int trows, tcols;
     getmaxyx(stdscr, trows, tcols);
@@ -716,10 +789,14 @@ int main(void)
         /* ── Input ───────────────────────────────────────────────────── */
         int key = getch();
         switch (key) {
-            case 'q': case 27: g_quit = 1;           break;
-            case ' ': case 'b': sim_blast(s);         break;
-            case 'r':           sim_reset(s);         break;
-            case 'p':           s->paused = !s->paused; break;
+            case 'q': case 27: g_quit = 1;                                  break;
+            case ' ': case 'b': sim_blast(s);                               break;
+            case 'r':           sim_reset(s);                               break;
+            case 'p':           s->paused = !s->paused;                     break;
+            case 't':
+                g_theme = (g_theme + 1) % N_THEMES;
+                color_apply(g_theme);
+                break;
         }
 
         /* ── Tick ────────────────────────────────────────────────────── */

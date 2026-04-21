@@ -1,5 +1,5 @@
 # The Terminal Animation Framework
-### A Complete Technical Guide for First-Year Students
+### A Complete Technical Guide for Beginner Programmers
 
 Based on `ncurses_basics/framework.c` — the canonical template for every animation in this project.
 
@@ -924,6 +924,15 @@ Physics functions can be tested without a terminal. Call `scene_tick` 1000 times
 
 A common point of confusion: the code has *two* different delta time values. They look similar but are used for completely different things.
 
+### Quick reference
+
+| Variable | Type | Unit | Source | Used for |
+|----------|------|------|--------|----------|
+| `dt` | `int64_t` | nanoseconds | `clock_ns()` — real wall clock | filling `sim_accum`, fps counter, frame-cap sleep |
+| `dt_sec` | `float` | seconds | `tick_ns / NS_PER_SEC` — constant derived from `sim_fps` | passed to `scene_tick` as the physics timestep |
+
+---
+
 ### `dt` (int64_t, nanoseconds) — the real elapsed time
 
 ```c
@@ -933,27 +942,143 @@ frame_time  = now;
 if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
 ```
 
-This is the actual wall-clock time since the last frame. It varies every frame: sometimes 16ms, sometimes 17ms, sometimes 14ms depending on OS scheduling. It is used only for:
-1. Filling the accumulator: `sim_accum += dt`
-2. The frame cap: `int64_t elapsed = clock_ns() - frame_time + dt`
-3. The fps counter: `fps_accum += dt`
+This is the actual wall-clock time since the last frame. It is measured from `CLOCK_MONOTONIC` — a hardware counter that cannot go backwards and is unaffected by NTP adjustments or system clock changes. It varies every frame: sometimes 16 ms, sometimes 17 ms, sometimes 14 ms, depending on OS scheduling, background load, and the terminal emulator's own overhead.
 
-It is **never** passed to `scene_tick`.
+It is used only for three things:
+1. **Filling the accumulator:** `sim_accum += dt` — this is the only place real time enters the physics system
+2. **The frame cap sleep:** `clock_sleep_ns(RENDER_NS - elapsed)` uses it to decide how long to sleep
+3. **The fps counter:** `fps_accum += dt` accumulates real time between display updates
+
+It is **never** passed to `scene_tick`. Handing raw wall-clock time to a physics integrator is the single most common mistake in simulation programming.
+
+#### The 100 ms cap
+
+```c
+if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+```
+
+Without this cap, any pause in the process (debugger breakpoint, Ctrl-Z, laptop lid close, OS hiccup) would produce a `dt` of seconds or minutes. The accumulator would fill up and the `while` loop would fire hundreds or thousands of physics ticks in a row — the program appears frozen catching up. The cap limits the damage: at most `100ms / 16.7ms ≈ 6` catch-up ticks. The simulation snaps forward a small amount and continues normally.
+
+---
 
 ### `dt_sec` (float, seconds) — the fixed physics timestep
 
 ```c
-int64_t tick_ns = TICK_NS(app->sim_fps);
-float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+int64_t tick_ns = TICK_NS(app->sim_fps);          /* e.g. 16,666,666 ns at 60 Hz */
+float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;   /* 0.016666... f           */
 ```
 
-This is computed from `sim_fps` (a constant, not the actual elapsed time). If `sim_fps = 60`, then `dt_sec = 1/60 ≈ 0.01667f`. It is the same every single physics tick. It is passed to `scene_tick`.
+This is computed once from `sim_fps` — a setting, not a measurement. It does not depend on how long any frame actually took. If `sim_fps = 60`, then `dt_sec = 1/60 ≈ 0.01667 s` on every single call to `scene_tick`, no matter what. It is the same value for the first tick of the program and the millionth.
 
-**Why is this distinction critical?**
+This fixed value is the timestep that every physics integrator in every simulation in this project uses:
 
-If you passed the real `dt` (variable) to `scene_tick`, your physics would be variable-timestep. The whole point of the accumulator pattern is to give physics a fixed timestep. Using the real dt in the physics function would bypass the accumulator and reintroduce all the problems (instability, non-determinism, speed variation) it was designed to solve.
+```c
+ball.vx += ax * dt_sec;
+ball.px += ball.vx * dt_sec;
+```
 
-The accumulator says "I will call scene_tick exactly N times this frame, each time pretending that exactly `tick_ns` nanoseconds have passed." That pretending is `dt_sec`. It is a lie told to the physics — but a necessary lie that makes physics stable and deterministic.
+```c
+/* RK4 in double_pendulum.c */
+k1 = f(state, dt_sec);
+k2 = f(state + k1 * 0.5f * dt_sec, dt_sec);
+...
+```
+
+```c
+/* Gauss-Seidel in navier_stokes.c */
+diffuse(u, u0, visc, dt_sec, iter);
+```
+
+All of them receive `dt_sec`. None of them receive `dt`.
+
+---
+
+### Why is this distinction critical?
+
+#### The naive (wrong) approach
+
+A beginner might write:
+
+```c
+while (running) {
+    int64_t now = clock_ns();
+    float dt = (float)(now - last) / 1e9f;
+    last = now;
+
+    ball.x += ball.vx * dt;   /* variable timestep — looks right, isn't */
+    draw();
+}
+```
+
+This is called a **variable-timestep loop**. Physics advances by a different amount each frame. It seems correct — you scale by the actual elapsed time. It has four serious problems:
+
+**1. Numerical instability**
+
+Physics integrators (Euler, RK4, Verlet) are derived under the assumption that `dt` is small and constant. Most have a stability threshold — a maximum `dt` above which the approximation diverges. For a spring: `dt_max = 2 / sqrt(k/m)`. For explicit Euler on a stiff ODE, even a 2× spike in `dt` can cause the simulation to explode. The 100 ms cap helps but does not eliminate this: a frame that genuinely takes 33 ms (slow terminal, background load) gives `dt = 0.033` instead of `0.0167` — 2× larger, which can destabilise many simulations.
+
+**2. Non-determinism**
+
+Run the program twice and you get a different trajectory for every particle, pendulum, and fluid cell — because the sequence of `dt` values from the OS is never exactly the same. You cannot reproduce a bug. You cannot write a test that checks "after 100 steps the ball is at position X" because the answer depends on the timing of each frame.
+
+**3. Speed variation across hardware**
+
+A fast machine runs at 120 fps: `dt ≈ 0.0083`. A slow machine runs at 15 fps: `dt ≈ 0.067`. Both use `dt` directly, so both advance the physics by the correct total time over one second — but with very different step sizes. RK4 with `dt = 0.067` is far less accurate than with `dt = 0.0083`. The simulation looks visibly different on each machine.
+
+**4. Floating-point collision skipping**
+
+Two objects that would collide at the midpoint of a frame might completely pass through each other if `dt` is large enough that the discrete step skips the collision. Fixed `dt_sec` keeps the step small enough that collision geometry is reliable.
+
+#### How the accumulator solves all four
+
+```c
+sim_accum += dt;                              /* real time enters here  */
+while (sim_accum >= tick_ns) {
+    scene_tick(&app->scene, dt_sec, cols, rows);  /* fixed dt_sec always */
+    sim_accum -= tick_ns;
+}
+```
+
+The accumulator acts as a buffer between the real clock and the physics. Real time accumulates in `sim_accum` in whatever irregular chunks the OS provides. Physics drains it in precise fixed scoops of `tick_ns`. The physics function never knows that a frame was slow or fast — it always sees `dt_sec = 1/60`.
+
+- **Stability:** `dt_sec` is chosen to be safely below every integrator's stability threshold
+- **Determinism:** same `dt_sec` every tick → same result every run on every machine
+- **Speed independence:** physics advances at exactly `sim_fps` ticks per real second regardless of render rate
+- **Collision reliability:** step size is predictable and bounded
+
+#### The lie, and why it is necessary
+
+The accumulator says: "I will call `scene_tick` exactly N times this frame, each time telling the physics that exactly `tick_ns` nanoseconds have passed."
+
+That is a lie. The frame might have taken 33 ms, not 16.7 ms. But the lie is deliberate and beneficial. It gives physics a stable, deterministic, hardware-independent substrate. The real elapsed time is accounted for correctly at the accumulator level — two ticks fire for a 33 ms frame instead of one. The *total* simulated time is still correct; only the *per-tick* granularity is fixed.
+
+`dt_sec` is not an approximation of reality. It is a contract: "this simulation integrates in steps of exactly 1/60 second."
+
+---
+
+### Where each variable appears in the code
+
+| Location | Uses `dt` | Uses `dt_sec` |
+|----------|-----------|----------------|
+| Accumulator fill | `sim_accum += dt` | — |
+| Frame cap sleep | `RENDER_NS - elapsed(dt)` | — |
+| FPS display | `fps_accum += dt` | — |
+| `scene_tick` call | — | passed as argument |
+| Every physics integrator | — | `vx += ax * dt_sec` etc. |
+| `alpha` computation | `sim_accum / tick_ns` (both) | — |
+
+---
+
+### The interpolation factor `alpha`
+
+```c
+float alpha = (float)sim_accum / (float)tick_ns;
+```
+
+After the accumulator loop, `sim_accum < tick_ns`. This leftover is how far into the *next* tick we are — a tick that has not fired yet. `alpha ∈ [0.0, 1.0)` represents a fraction of `dt_sec`.
+
+Drawing entities at their last simulated position (alpha ignored) causes visible jitter: positions snap in discrete jumps of one physics step. Drawing at `lerp(prev_pos, curr_pos, alpha)` gives smooth sub-tick motion at any render rate, without the physics having to run more often.
+
+`alpha` is derived from both time values — `sim_accum` was filled by real `dt`, and `tick_ns` is the fixed physics step — making it the bridge between the two worlds.
 
 ---
 

@@ -58,6 +58,12 @@ Use this as a reading map: scan the index, pick what you do not know, read the e
 - [D18 Differential Drive Robot — Nonholonomic Kinematics](#d18-differential-drive-robot--nonholonomic-kinematics)
 - [D19 Inverted Pendulum — Lagrangian Cart-Pole on Slope](#d19-inverted-pendulum--lagrangian-cart-pole-on-slope)
 - [D20 PID Controller — Proportional/Integral/Derivative with Windup Clamp](#d20-pid-controller--proportionalintegralderivative-with-windup-clamp)
+- [D21 Vorticity-Streamfunction (VSF) Navier-Stokes — fluid/vorticity_streamfunction_solver.c](#d21-vorticity-streamfunction-vsf-navier-stokes)
+- [D22 Acoustic FDTD — Leapfrog Scalar Wave Equation](#d22-acoustic-fdtd--leapfrog-scalar-wave-equation)
+- [D23 Lattice Boltzmann Method (D2Q9) — LBM Fluid](#d23-lattice-boltzmann-method-d2q9--lbm-fluid)
+- [D24 ODE Integrator Zoo — Euler / RK2 / RK4 / Velocity Verlet](#d24-ode-integrator-zoo--euler--rk2--rk4--velocity-verlet)
+- [D25 Short-Time Fourier Transform — STFT Spectrogram](#d25-short-time-fourier-transform--stft-spectrogram)
+- [D26 Deferred Rendering Pipeline — G-buffer + Blinn-Phong Lighting Pass](#d26-deferred-rendering-pipeline--g-buffer--blinn-phong-lighting-pass)
 
 ### E — Cellular Automata & Grid Simulations
 - [E1 Falling Sand — Gravity CA](#e1-falling-sand--gravity-ca)
@@ -2353,6 +2359,184 @@ u(t) = Kp·e(t)  +  Ki·∫e dt  +  Kd·(de/dt)
 - NO Ki: stable but with persistent lean offset on slope
 
 *Files: `robots/perlin_terrain_bot.c`*
+
+---
+
+---
+
+## D21 Vorticity-Streamfunction (VSF) Navier-Stokes
+
+The vorticity-streamfunction (ω-ψ) formulation eliminates pressure from 2-D incompressible Navier-Stokes, leaving two scalar PDEs instead of the coupled velocity-pressure system.
+
+**Why eliminate pressure?** In the primitive variable form (u, v, p) you must solve a Poisson equation for pressure at every step to enforce ∇·u=0 (incompressibility). Taking the curl of momentum eliminates ∇p entirely:
+
+```
+∂ω/∂t + u·∇ω = ν·∇²ω    (vorticity transport)
+∇²ψ = −ω                   (Poisson: streamfunction)
+u = ∂ψ/∂y,   v = −∂ψ/∂x  (velocity recovery)
+```
+
+You still solve a Poisson equation (for ψ), but only once per step rather than iteratively within a pressure-correction loop.
+
+**SOR vs Gauss-Seidel:** Plain Gauss-Seidel has spectral radius ρ_GS ≈ 1 − π²/N² for an N×N grid — convergence is slow for large N. SOR with the optimal relaxation factor ω_opt = 2/(1+sin(π/(N+1))) gives ρ_SOR ≈ 1 − 2π/N — dramatically faster. The formula assumes a square grid with Dirichlet boundaries. For a 64×64 grid: ρ_GS ≈ 0.9976 (need ~1000 iterations) vs ρ_SOR ≈ 0.906 (need ~25 iterations).
+
+**Thom's wall-vorticity formula (1933):** At a solid wall ψ is constant (ψ_wall=0). The vorticity is not prescribed — it must be derived from the no-slip condition. Thom's formula uses the interior streamfunction values via a one-sided second-order Taylor expansion of ∇²ψ=−ω evaluated at the wall cell:
+
+```
+ω_wall = −2·(ψ_interior − ψ_wall) / dy²
+```
+
+For the moving lid (top wall, velocity U): the term −2U/dy is added, injecting the sole vorticity source driving cavity flow.
+
+**Upwind vs central for convection:** The nonlinear convection `u·∂ω/∂x` is linearly unstable with central differences at high Re (negative effective viscosity). Upwind differencing: `∂ω/∂x ≈ (ω_i − ω_{i-1})/dx` when u>0, `(ω_{i+1} − ω_i)/dx` when u<0. This introduces truncation-error diffusion proportional to `|u|dx/2`, which dominates the physical ν/Re at high Re — acceptable because the goal is qualitatively correct flow, not DNS accuracy.
+
+**CFL and von Neumann stability limits:**
+- Convection CFL: `dt ≤ dx / |u_max|`  (advection stability)
+- Diffusion von Neumann: `dt ≤ dx² / (4ν)`  (parabolic stability)
+Both must hold simultaneously. At low Re the diffusion limit is tighter; at high Re the convection CFL dominates.
+
+*Files: `fluid/vorticity_streamfunction_solver.c`*
+
+---
+
+## D22 Acoustic FDTD — Leapfrog Scalar Wave Equation
+
+The acoustic wave equation `∂²p/∂t² = c²∇²p` describes the propagation of pressure perturbations in a homogeneous medium. The FDTD discretisation is one of the most natural numerical methods for wave equations.
+
+**Leapfrog stencil derivation:** Approximate both time and space derivatives with centred finite differences:
+
+```
+∂²p/∂t² ≈ (p_new − 2p + p_old) / dt²
+∇²p     ≈ (p_{i+1,j} + p_{i-1,j} − 2p_{i,j})/dx²
+          + (p_{i,j+1} + p_{i,j-1} − 2p_{i,j})/dy²
+```
+
+Substituting and solving for p_new:
+```
+p_new = 2p − p_old + rx²·(p_{i+1,j} − 2p + p_{i-1,j})
+                    + ry²·(p_{i,j+1} − 2p + p_{i,j-1})
+```
+where rx² = (c·dt/dx)². This explicit update needs only the current and previous time levels — no matrix solve.
+
+**Why leapfrog (not forward Euler)?** Forward Euler on the wave equation is unconditionally unstable — any perturbation grows. The centred-time (leapfrog) scheme is neutrally stable within the CFL limit: |A(ω)| = 1 for all frequencies when CFL ≤ 1. It introduces no numerical dissipation, preserving wave amplitude over long propagation distances.
+
+**2-D CFL stability criterion:** In 2D the Courant number must satisfy:
+```
+c·dt·√(1/dx² + 1/dy²) ≤ 1
+```
+For a square grid dx=dy: `c·dt ≤ dx/√2`. At CFL=0.90 we use 90% of the stability limit; exceeding 1.0 causes exponential blow-up within one step.
+
+**Terminal aspect correction:** Terminal characters are ~16px tall × 8px wide (2:1 aspect). Without correction, setting dx=dy in cell coordinates means the physical grid cells are twice as tall as they are wide. A wavefront that should be circular would appear elliptical (elongated vertically). The fix: `dy_phys = dx_phys / ASPECT_Y` where ASPECT_Y=2. This makes physical cells square, so wavefronts appear circular on screen.
+
+**Sponge vs PML:** A perfectly matched layer (PML) achieves near-zero reflection by using a complex coordinate stretching that makes the medium impedance-matched to outgoing waves at all angles and frequencies. A sponge layer simply multiplies p by a damping factor ∈ [0,1] that ramps from 1 (interior) to 0 (boundary). The sponge is 5× simpler to implement but causes some low-frequency reflection. For visual simulations, sponge layers are sufficient.
+
+*Files: `physics/acoustic_wavesolver.c`*
+
+---
+
+## D23 Lattice Boltzmann Method (D2Q9) — LBM Fluid
+
+LBM evolved from the lattice gas automata of the 1980s. Instead of solving Navier-Stokes directly, it evolves particle distribution functions on a lattice. The macroscopic N-S equations emerge via Chapman-Enskog multiscale expansion — LBM is a mesoscopic model that recovers the correct macroscopic fluid behavior.
+
+**Why LBM over finite-difference N-S?** LBM is trivially parallelisable (each cell's collision is independent), handles complex boundaries naturally (bounce-back), and avoids solving pressure Poisson equations. The tradeoff: it introduces a lattice Mach number constraint (Ma < 0.3) and is memory-intensive (9 floats per cell).
+
+**D2Q9 velocity set:** The 9 lattice velocities are chosen so that the first four moments (mass, momentum, momentum flux, energy flux) of the Maxwell-Boltzmann distribution are exactly reproduced:
+```
+e0 = (0,0)                           w0 = 4/9
+e1 = (1,0), e2=(-1,0), e3=(0,1), e4=(0,-1)    w = 1/9
+e5 = (1,1), e6=(-1,1), e7=(-1,-1), e8=(1,-1)  w = 1/36
+```
+The lattice speed of sound cs² = 1/3 (in lattice units, dx=dt=1).
+
+**Equilibrium distribution:** The second-order Maxwell-Boltzmann equilibrium truncated to Ma²:
+```
+feq_i = w_i · ρ · [1 + (e_i·u)/cs² + (e_i·u)²/(2cs⁴) − u²/(2cs²)]
+```
+The three polynomial correction terms are the Taylor expansion of `exp((e_i·u)/cs²)`. Only quadratic terms are kept; cubic and higher terms break Galilean invariance on the lattice.
+
+**Viscosity-relaxation relation:** The viscosity ν = (τ − 0.5) · cs² = (τ − 0.5)/3. The constraint τ > 0.5 ensures ν > 0 (physical viscosity). The τ < 2 constraint keeps feq positive (stability). Typical range: τ ∈ [0.51, 1.8].
+
+**Streaming race condition:** After collision, f*[x,y,i] must propagate to neighbour cell (x+e_ix, y+e_iy). If done in-place, a cell that was already updated might be read by a neighbour that has not yet been updated. The double-buffer solves this: collide from f into ftmp, then stream from ftmp into f. The two arrays swap pointers each step — O(1) overhead.
+
+**Reynolds number:** Re = U·L/ν where U is the characteristic velocity (lattice units), L is the characteristic length (cells), ν is lattice viscosity. For flow past a cylinder of radius R: Re = U·2R/ν. Shedding threshold Re≈47; fully developed Kármán street Re≈100–300.
+
+*Files: `physics/lattice_boltzman_fluid_simulator.c`*
+
+---
+
+## D24 ODE Integrator Zoo — Euler / RK2 / RK4 / Velocity Verlet
+
+Numerical ODE integrators differ in accuracy order, computational cost (function evaluations per step), and geometric properties (symplecticity). Understanding these tradeoffs is essential for choosing the right method.
+
+**Error order:** A method has local truncation error O(h^{p+1}) and global error O(h^p) where h is the step size. Doubling h multiplies global error by 2^p. RK4 at p=4: halving h reduces error by 16×. Euler at p=1: halving h only halves error.
+
+**Euler — why it fails for oscillators:** The amplification matrix A maps (q,p) from one step to the next. For the harmonic oscillator |A|² = 1 + (ωh)² > 1 — eigenvalues lie outside the unit circle. Every step amplifies the state, so energy grows as (1+(ωh)²)^n ≈ exp(ω²h·t). This is not a roundoff or truncation issue — it is a fundamental stability property of the Euler scheme.
+
+**RK2 (midpoint method):** The midpoint method achieves O(h²) by evaluating the derivative at the step midpoint and using that slope for the full step. The O(h²) leading error term in Euler (which comes from evaluating the slope only at the start) is cancelled because the midpoint slope already contains first-order information about the curvature.
+
+**RK4 derivation sketch:** The four-stage weighted average `(k1 + 2k2 + 2k3 + k4)/6` matches the Taylor expansion of the exact solution through the h⁴ term. The coefficients 1/6, 2/6, 2/6, 1/6 are the Simpson's rule weights applied to the ODE integration interval — not a coincidence.
+
+**Symplecticity (Verlet):** A symplectic integrator preserves the symplectic 2-form dq∧dp (volume of phase-space regions). For Hamiltonian systems this implies:
+- Energy error is bounded (oscillates but does not drift)
+- The invariant tori of integrable systems are preserved (Poincaré section shows closed curves, not spirals)
+- No secular energy drift even over millions of steps
+
+The velocity Verlet is symplectic because it alternates momentum half-steps with full position steps: the composition of the two half-maps is volume-preserving. By contrast, RK4 is not symplectic — it eventually drifts for very long integrations.
+
+**When to use each:**
+| Method        | Cost   | Error  | Stable for oscillators | Long-time |
+|---------------|--------|--------|----------------------|-----------|
+| Euler         | 1 eval | O(h)   | No (grows)            | Bad       |
+| RK2           | 2 eval | O(h²)  | Borderline            | Mediocre  |
+| RK4           | 4 eval | O(h⁴)  | Yes (bounded)         | Good      |
+| Verlet        | 2 eval | O(h²)  | Yes (bounded)         | Excellent |
+
+*Files: `physics/rk_method_comparision.c`*
+
+---
+
+## D25 Short-Time Fourier Transform — STFT Spectrogram
+
+The STFT trades frequency resolution for time resolution relative to the full-signal DFT. A window of N samples is extracted, windowed (to reduce spectral leakage), and FFT'd. The resulting spectrum column is appended to a scrolling 2-D display.
+
+**Time-frequency uncertainty:** The Gabor limit states Δt·Δf ≥ 1/(4π). You cannot simultaneously resolve an event in time and in frequency arbitrarily well. This is the signal-processing analog of Heisenberg's uncertainty principle (and shares the same mathematical root in Fourier analysis). In practice: N=512, SR=8000 → Δf=15.6 Hz, Δt=64ms. For transient detection use N=64; for pure tone detection use N=2048.
+
+**Bit-reversal permutation (why DIT needs it):** The Cooley-Tukey DIT algorithm splits the input into even-indexed and odd-indexed subsequences recursively. After log₂N levels of splitting, the natural ordering of input samples is in bit-reversed order. For N=8: index 3 (binary 011) maps to index 6 (binary 110). The bit-reversal is a permutation, so it can be done in-place in O(N) by swapping x[i] with x[bitrev(i)] for i < bitrev(i).
+
+**Butterfly stages:** Each stage performs N/2 butterfly operations: `(a, b) → (a + W·b, a − W·b)` where W = e^{−j2πk/N} is the twiddle factor for that position. The twiddle factor recurrence `W_next = W · e^{-j2π/N_stage}` avoids recomputing sin/cos in the inner loop (which would dominate cost at large N).
+
+**Spectral leakage:** A finite-length DFT implicitly multiplies the signal by a rectangular window. A pure sine at frequency f not exactly on a DFT bin leaks energy into all other bins. The sidelobe level of the rectangular window is −13 dB — a signal 4.5× weaker than the main tone can be completely hidden. Window functions (Hann, Hamming, Blackman) taper the signal to zero at both ends, dramatically reducing sidelobes at the cost of widening the main lobe.
+
+**AM/FM sidebands:**
+- AM: `(1 + m·cos(2πfm·t))·cos(2πfc·t)` → carrier at fc + sidebands at fc±fm of amplitude m/2. Visible as three peaks in the spectrogram.
+- FM: `cos(2πfc·t + β·sin(2πfm·t))` → Bessel function sideband amplitudes J_n(β) at fc±n·fm. Large β (wideband FM, β=75) gives many visible sidebands. Small β (narrowband FM) approximates AM.
+
+*Files: `physics/spectrogram_visualizer.c`*
+
+---
+
+## D26 Deferred Rendering Pipeline — G-buffer + Blinn-Phong Lighting Pass
+
+Deferred rendering decouples geometry processing from lighting. In a forward renderer, each object is shaded for all lights during geometry draw — cost is O(objects × lights). In deferred, geometry writes data to the G-buffer in pass 1, and lighting reads from it in pass 2 — cost is O(pixels × lights), independent of geometry count.
+
+**G-buffer layout:** Each G-buffer texture stores per-pixel surface data at screen resolution:
+```
+RT0: world position    (x, y, z, 1)     — for light attenuation  
+RT1: world normal      (nx, ny, nz, 0)  — for diffuse + specular
+RT2: albedo            (r, g, b, mat)   — surface base color
+RT3: material          (shininess, ...)  — specular exponent
+```
+This is structurally identical to Unreal Engine 5's GBufferA/B/C/D layout and Unity HDRP's RT0–RT3.
+
+**Perspective projection depth:** The projection matrix row `m[3][2] = −1` sets the output w-component to `−z_view`. After perspective divide (NDC = clip/w), the depth buffer stores `−z_view/−z_view = 1` at the near plane and approaches 0 at the far plane (reversed-Z convention). The clip-space w = −z_view > 0 for objects in front of the camera (where z_view < 0).
+
+**Normal matrix derivation:** When you transform a vertex by M, the normal must transform by `(M⁻¹)ᵀ` (inverse-transpose) to remain perpendicular to the surface. Proof: if n·t=0 (normal perpendicular to tangent), after transform: `(Mn·Pt) = nᵀMᵀPt`. For this to be zero for all tangents Pt = t, we need `nᵀMᵀP = nᵀ(M⁻¹)ᵀ·(MM⁻¹)ᵀP`. The shortcut: if M is a pure rotation, M⁻¹ = Mᵀ so (M⁻¹)ᵀ = M itself — no extra work needed.
+
+**Blinn-Phong half-vector:** The Phong model reflects L around N to get R, then measures angle between R and V. The Blinn approximation uses the half-vector H = normalize(L + V): the specular term is `(N·H)^n`. H is independent of shading position (constant for parallel light and camera), making it faster for distant sources. The exponent relationship: Blinn specular exponent ≈ 4× Phong exponent to achieve the same lobe width.
+
+**Bayer dithering vs Floyd-Steinberg:** Bayer ordered dithering uses a precomputed threshold matrix — spatially ordered, no error propagation, parallelisable. Floyd-Steinberg propagates quantisation error to neighbours — better perceptual quality but sequential (each pixel depends on previous). For real-time per-pixel rendering the Bayer approach is O(1) per pixel with no state, making it the standard choice in hardware shaders (it is used in MSAA resolve and HDR-to-LDR tone mapping).
+
+*Files: `raster/deferred_rendering_pipeline.c`*
 
 ---
 

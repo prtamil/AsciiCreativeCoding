@@ -44,6 +44,7 @@ gcc -std=c11 -O2 -Wall -Wextra fluid/navier_stokes.c           -o navier_stokes 
 gcc -std=c11 -O2 -Wall -Wextra fluid/lenia.c                   -o lenia               -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/slime_mold.c              -o slime_mold          -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra fluid/lattice_gas.c             -o lattice_gas         -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/vorticity_streamfunction_solver.c -o vsf -lncurses -lm
 
 # ── fractal / random growth ───────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fractal_random/snowflake.c  -o snowflake  -lncurses -lm
@@ -72,6 +73,10 @@ gcc -std=c11 -O2 -Wall -Wextra physics/blackhole.c          -o blackhole        
 gcc -std=c11 -O2 -Wall -Wextra physics/magnetic_field.c     -o magnetic_field    -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/chain.c              -o chain             -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/beam_bending.c       -o beam_bending      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/lattice_boltzman_fluid_simulator.c -o lbm_fluid -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/acoustic_wavesolver.c -o acoustic_wave -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/spectrogram_visualizer.c -o spectrogram -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/rk_method_comparision.c -o rk_compare -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra robots/diff_drive_robot.c    -o diff_drive_robot       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra robots/moving_jump_spring_leg_robot.c -o moving_jump_spring_leg_robot -lncurses -lm
 
@@ -177,6 +182,7 @@ gcc -std=c11 -O2 -Wall -Wextra raster/cube_raster.c     -o cube     -lncurses -l
 gcc -std=c11 -O2 -Wall -Wextra raster/sphere_raster.c   -o sphere   -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raster/displace_raster.c    -o displace          -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raster/mandelbulb_raster.c  -o mandelbulb_raster -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raster/deferred_rendering_pipeline.c -o deferred_raster -lncurses -lm
 
 # ── raymarcher / 3-D ─────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/donut.c                -o donut       -lncurses -lm
@@ -244,6 +250,7 @@ gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer 
 - `complex_flowfield.c` — 4-mode flow field visualiser: curl noise (divergence-free), vortex lattice (Biot-Savart), sine lattice (wave interference), radial spiral (galaxy); 6 cosine-palette themes (a+b·cos(2π(ct+d)) → xterm-256 cube, 16 color pairs); 3 background modes (blank/arrows/colormap); reset key `r`; particle trails with brightness ramp; §1-§9 layout
 - `navier_stokes.c`     — Jos Stam stable fluid: velocity+density N×N grid, Gauss-Seidel diffuse (warm-start), semi-Lagrangian advect, divergence-free project; two counter-rotating auto-emitters; dynamic density normalization; 3 dye colors; arrow-key wind; pre-warmed 80 steps at startup
 - `lenia.c`             — continuous Game of Life: convolution kernel + growth function, smooth organic creatures, multiple presets
+- `vorticity_streamfunction_solver.c`  — 2-D incompressible Navier-Stokes in ω-ψ form: SOR Poisson solver ∇²ψ=−ω (optimal ω=2/(1+sin(π/(N+1)))), Thom wall-vorticity BC, upwind convection + central diffusion, adaptive dt from convection CFL + diffusion von Neumann; lid-driven cavity test case; Re=50–1000 presets; stream function + vorticity dual-panel display
 
 ### physics/
 - `bounce_ball.c`       — **reference implementation** — bouncing balls with pixel-space physics, fixed-timestep accumulator, render interpolation (alpha), SIGWINCH resize
@@ -259,6 +266,10 @@ gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer 
 - `blackhole.c`         — Gargantua black hole GR raytracer: Schwarzschild null geodesics (RK4), precomputed lensing table, photon ring from min_r tracking, primary + secondary disk images, relativistic Doppler beaming D=[(1+β)/(1−β)]^1.5, gravitational redshift; 11 themes; +/- zoom
 - `beam_bending.c`      — Euler-Bernoulli beam bending + vibration: 9 BC×load combos (SS/cantilever/fixed-fixed × center/distributed/end); analytical static deflection w(x) and moment M(x); curvature-shaded render + bending moment side panel; dynamic modal superposition (`d`) with 4 eigenmodes per BC type, exact damped oscillator transition matrix (unconditionally stable); b/l cycle BC/load; space pause; e/E exaggeration; r reset
 - `diff_drive_robot.c`  — differential drive robot: nonholonomic kinematics v=(vL+vR)/2, ω=(vR-vL)/L; pixel-space Euler pose integration; toroidal wrap; 600-slot trail ring buffer; heading arrow + per-wheel velocity arrows drawn with pixel-space dot progression (`.`→`o`→`0`, no `/\` diagonals); arrow keys drive, S brake, R reset
+- `lattice_boltzman_fluid_simulator.c` — D2Q9 Lattice Boltzmann: BGK collision f*=f−ω(f−feq), bounce-back no-slip, cs²=1/3, inlet equilibrium BC, outlet zero-gradient BC; macroscopic ρ=Σfi / ρu=Σfi·ei; Kármán vortex street at Re>47; Ma constraint Ma<0.3; 5 color themes
+- `acoustic_wavesolver.c`              — 2-D acoustic FDTD: leapfrog ∂²p/∂t²=c²∇²p, triple-buffer (p_old/p/p_new) O(1) pointer rotation, CFL=0.90, ASPECT_Y=2 terminal correction, sponge absorbing BC vs Dirichlet reflecting BC, zero-crossing frequency estimator, point-source monopole injection; 5 color themes
+- `spectrogram_visualizer.c`           — STFT spectrogram: Cooley-Tukey iterative radix-2 DIT FFT, bit-reversal permutation, 4 windows (Rect/Hann/Hamming/Blackman −13/−31/−41/−57 dB), 75% overlap, dB normalization, dominant frequency tracker; AM/FM/chirp/noise signal generator; scrolling time-frequency heatmap display
+- `rk_method_comparision.c`            — ODE integrator comparison: Euler (O(h), spiral instability), RK2 midpoint (O(h²)), RK4 (O(h⁴), four-stage weighted), Velocity Verlet (symplectic, no secular energy drift); harmonic oscillator + nonlinear pendulum; energy error metric; side-by-side phase portrait and energy-drift time series
 
 ### fractal_random/
 - `penrose.c`      — Penrose P3 rhombus tiling: de Bruijn pentagrid duality, O(1) per cell, parity-based thick/thin distinction, pentagrid edge detection for visible tile outlines (|/\-), slow rotation, 256-color warm/cool palette
@@ -314,6 +325,7 @@ gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer 
 - `cube_raster.c`       — unit cube, flat normals, same 4 shaders + toggleable cull + zoom
 - `sphere_raster.c`     — UV sphere, same 4 shaders + toggleable cull + zoom
 - `displace_raster.c`   — UV sphere with real-time vertex displacement (ripple / wave / pulse / spiky), central-difference normal recomputation
+- `deferred_rendering_pipeline.c`      — two-pass deferred renderer: G-buffer (position/normal/albedo/material) rasterization pass then Blinn-Phong lighting pass; barycentric rasterization with back-face cull; Bayer 4×4 dithering + Paul Bourke ASCII ramp; perspective projection (m[3][2]=−1), lookat matrix, inverse-transpose normal matrix; flat (cube) vs smooth (sphere) normals; 4 point lights with configurable color presets; equivalent to OpenGL MRT G-buffer layout
 
 ### raymarcher/
 - `donut.c`             — parametric torus (no mesh): trigonometric projection, depth sort, luminance → grey pair

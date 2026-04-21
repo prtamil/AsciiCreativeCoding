@@ -150,6 +150,12 @@ Reference implementation: `basics/bounce_ball.c`
 113. [Differential Drive Robot — robots/diff_drive_robot.c](#113-differential-drive-robot--physicsdiff_drive_robotc)
 114. [Walking Robot — robots/walking_robot.c](#114-walking-robot--robotswalking_robotc)
 115. [Perlin Terrain Bot — robots/perlin_terrain_bot.c](#115-perlin-terrain-bot--robotsperlin_terrain_botc)
+116. [Vorticity-Streamfunction Solver — fluid/vorticity_streamfunction_solver.c](#116-vorticity-streamfunction-solver--fluidvorticity_streamfunction_solverc)
+117. [Acoustic Wave FDTD — physics/acoustic_wavesolver.c](#117-acoustic-wave-fdtd--physicsacoustic_wavesolverc)
+118. [Lattice Boltzmann Fluid — physics/lattice_boltzman_fluid_simulator.c](#118-lattice-boltzmann-fluid--physicslattice_boltzman_fluid_simulatorc)
+119. [ODE Integrator Comparison — physics/rk_method_comparision.c](#119-ode-integrator-comparison--physicsrk_method_comparisionc)
+120. [STFT Spectrogram — physics/spectrogram_visualizer.c](#120-stft-spectrogram--physicsspectrogram_visualizerc)
+121. [Deferred Rendering Pipeline — raster/deferred_rendering_pipeline.c](#121-deferred-rendering-pipeline--rasterdeferred_rendering_pipelinec)
 
 ---
 
@@ -4069,6 +4075,240 @@ where `θ_eff = θ − α` accounts for terrain slope `α`. The cart acceleratio
 **Gain presets (key `g` to cycle):** Six named presets (BALANCED, HIGH Kp, LOW Kp, NO Kd, HIGH Kd, NO Ki) are designed to teach PID tuning by showing characteristic failure modes side-by-side in the phase portrait.
 
 *Files: `robots/perlin_terrain_bot.c`*
+
+---
+
+---
+
+## 116. Vorticity-Streamfunction Solver — fluid/vorticity_streamfunction_solver.c
+
+Solves 2-D incompressible Navier-Stokes using the ω-ψ (vorticity-streamfunction) formulation. Taking the curl of momentum eliminates pressure entirely, leaving two scalar PDEs that are cheaper to solve than the full velocity-pressure system.
+
+**Governing equations:**
+
+```
+∂ω/∂t + u·∂ω/∂x + v·∂ω/∂y = ν·∇²ω   (vorticity transport)
+∇²ψ = −ω                                  (Poisson: streamfunction from vorticity)
+u = ∂ψ/∂y,   v = −∂ψ/∂x               (velocity from streamfunction)
+```
+
+**Poisson solver — SOR:** The Poisson equation ∇²ψ=−ω is solved by Successive Over-Relaxation (SOR). The relaxation factor ω_sor is set to the theoretically optimal value `2/(1+sin(π/(N+1)))` which gives geometric convergence rate `≈ 1 − 2π/N` per sweep, far faster than plain Gauss-Seidel (ω_sor=1).
+
+**Boundary conditions — Thom's formula (1933):** At solid walls the streamfunction is constant (ψ=0 for a closed cavity). The wall vorticity cannot be prescribed directly; instead Thom's formula derives it from a one-sided second-order finite difference of the ∇²ψ=−ω relation evaluated at the boundary node. The moving lid injects vorticity via the `−2U/dy` term — the sole driving source for the cavity flow.
+
+**Convection discretisation — upwind differencing:** The nonlinear convection term `u·∂ω/∂x + v·∂ω/∂y` uses first-order upwind differencing. Upwind biases the stencil against the flow direction, introducing just enough numerical diffusion to suppress negative-viscosity instabilities that would appear with centred differences at high Re.
+
+**Diffusion — central differences:** Viscous diffusion `ν·∇²ω` is discretised with second-order central differences. Diffusion is linear and unconditionally bounded so central differences are stable here.
+
+**Adaptive timestep:** Every step the code computes both the convection CFL limit `dt_CFL = dx/(|u|_max + ε)` and the diffusion von Neumann limit `dt_diff = dx²/(4ν)`. The actual dt is `SAFETY × min(dt_CFL, dt_diff)`. This ensures stability automatically as the flow develops.
+
+**Test case — lid-driven cavity:** A square cavity with three stationary walls and a top lid moving at speed U=1. The Re=U·L/ν parameter controls the flow regime: Re=50 creeping flow (single primary vortex), Re=400 onset of corner vortices, Re=1000 turbulent-like secondary vortices in the lower corners.
+
+**Visualisation:** Dual-panel display. Left: streamfunction ψ contours (stream lines — particles follow these curves). Right: vorticity ω field (red=clockwise, blue=counter-clockwise). The HUD shows Re, iteration count, max vorticity, and current dt.
+
+*Files: `fluid/vorticity_streamfunction_solver.c`*
+
+---
+
+## 117. Acoustic Wave FDTD — physics/acoustic_wavesolver.c
+
+Simulates 2-D acoustic (pressure) wave propagation by finite-difference time-domain (FDTD) discretisation of the scalar wave equation.
+
+**Governing equation:**
+
+```
+∂²p/∂t² = c² · ∇²p   (scalar wave equation for pressure)
+```
+
+**Leapfrog time integration:** The second-order time derivative is discretised as a centred difference over three time levels:
+
+```
+p_new[i,j] = 2·p[i,j] − p_old[i,j]
+            + rx2·(p[i+1,j] − 2p[i,j] + p[i-1,j])
+            + ry2·(p[i,j+1] − 2p[i,j] + p[i,j-1])
+```
+
+where `rx2 = (c·dt/dx)²` and `ry2 = (c·dt/dy)²`. This is the classic leapfrog (Verlet-in-time) stencil — second-order accurate in both space and time with no numerical dissipation.
+
+**Triple-buffer scheme:** Three arrays `p_old`, `p`, `p_new` are maintained. After each step the pointers rotate: `p_old←p`, `p←p_new`. This is O(1) — no memcpy of the grid. Only three float pointers swap, regardless of grid size.
+
+**CFL stability criterion (2-D):**
+
+```
+c · dt · √(1/dx² + 1/dy²) ≤ 1
+```
+
+The code uses CFL=0.90 (90% of the stability limit) for a safety margin. Exceeding CFL=1.0 causes the simulation to explode in one step.
+
+**ASPECT_Y=2.0 correction:** Terminal cells are approximately twice as tall as they are wide. Without this correction, a point source emits elliptical wavefronts. Setting `dy = dx/ASPECT_Y` makes the physical grid cells square in screen space, so wavefronts appear circular.
+
+**Boundary conditions:**
+- `BC_REFLECT` — Dirichlet p=0 at boundary: hard wall (pressure node). Causes 180° phase reflection. Models a rigid room boundary — standing waves form at resonant frequencies.
+- `BC_ABSORB` — Sponge layer: multiply p by a quadratic ramp from 1.0 (interior) to 0.0 (edge) over SPONGE_WIDTH cells. Approximates an anechoic boundary. True Perfectly Matched Layers (PML) are more accurate but require auxiliary fields.
+
+**Source injection:** Point sources add directly to `p_new[iy][ix] += amplitude·sin(phase)`. This is an additive monopole source — physically correct for a pulsating sphere. A Dirichlet (clamped) source would create an impedance discontinuity and reflect incoming waves.
+
+**Frequency estimator:** The displayed frequency is estimated by counting zero-crossings of the source waveform and dividing by 2 (each full cycle has 2 crossings): `f = crossings / (2 · elapsed_time)`.
+
+*Files: `physics/acoustic_wavesolver.c`*
+
+---
+
+## 118. Lattice Boltzmann Fluid — physics/lattice_boltzman_fluid_simulator.c
+
+Simulates viscous 2-D fluid flow using the D2Q9 Lattice Boltzmann Method (LBM). LBM evolves mesoscopic particle distribution functions on a lattice instead of solving the Navier-Stokes equations directly, yet recovers N-S macroscopics via Chapman-Enskog expansion.
+
+**D2Q9 lattice:** 9 discrete velocity directions per cell: rest (e0=(0,0)), 4 axial (e1–e4), 4 diagonal (e5–e8). Weights: w0=4/9 (rest), w1–4=1/9 (axial), w5–8=1/36 (diagonal). These weights come from the Maxwell-Boltzmann distribution discretised onto the D2Q9 stencil.
+
+**BGK collision:**
+
+```
+f_i* = f_i − ω·(f_i − f_eq_i)
+```
+
+The BGK (Bhatnagar-Gross-Krook) operator relaxes each distribution toward the equilibrium `f_eq` at rate ω=1/τ. τ is the relaxation time; ν=(τ−0.5)/3 gives kinematic viscosity in lattice units.
+
+**Maxwell-Boltzmann equilibrium:**
+
+```
+f_eq_i = w_i · ρ · [1 + (e_i·u)/cs² + (e_i·u)²/(2cs⁴) − u²/(2cs²)]
+```
+
+where cs²=1/3 is the lattice speed of sound squared. The three polynomial terms come from a second-order Taylor expansion of the full Maxwell-Boltzmann exponential.
+
+**Streaming step:** After collision, distributions propagate to neighbour cells: `f[x + e_ix, y + e_iy, i] = f*[x, y, i]`. A double-buffer (`f` and `ftmp`) prevents race conditions where a streamed value overwrites a value still needed for streaming.
+
+**Bounce-back no-slip BC:** At solid walls, distributions pointing into the wall are reflected back in the opposite direction: `f[i] ↔ f[opposite_i]`. This is the simplest no-slip implementation — the effective no-slip plane sits halfway between the fluid cell and the solid cell.
+
+**Macroscopic moments:**
+
+```
+ρ = Σᵢ fᵢ          (zeroth moment: density)
+ρ·u = Σᵢ fᵢ·eᵢ    (first moment: momentum)
+```
+
+These are the only connections between the LBM mesoscopic world and the macroscopic Navier-Stokes flow.
+
+**Kármán vortex street:** At Re ≈ 47 (TAU_DEFAULT=0.65 → ν=0.0383) a cylinder begins shedding alternating vortices in a periodic street. The shedding frequency is characterised by the Strouhal number St≈0.2.
+
+*Files: `physics/lattice_boltzman_fluid_simulator.c`*
+
+---
+
+## 119. ODE Integrator Comparison — physics/rk_method_comparision.c
+
+Side-by-side comparison of four numerical ODE integrators on two test systems: the harmonic oscillator (linear) and the nonlinear pendulum. Both are Hamiltonian systems with known analytical solutions, making energy conservation the natural accuracy metric.
+
+**Hamiltonian mechanics notation:** State vector (q, p) where q is generalised position (angle or displacement) and p is generalised momentum. Hamilton's equations:
+
+```
+dq/dt = ∂H/∂p = p/m
+dp/dt = −∂H/∂q = −∂V/∂q
+```
+
+For the harmonic oscillator: H = ½p² + ½ω²q²   (energy oscillates between kinetic and potential)
+For the pendulum: H = ½p² + (g/L)(1−cos q)      (exact nonlinear potential)
+
+**Euler (O(h) global error):**
+```
+p_new = p + h · (−∂V/∂q)
+q_new = q + h · p
+```
+One function evaluation per step. Amplification factor |A|² = 1 + (ωh)² > 1 — energy grows each step. Spirals outward in phase space. Unstable for oscillators at any step size.
+
+**RK2 midpoint (O(h²) global error):**
+```
+k1 = f(q, p)
+k2 = f(q + h/2·k1.q, p + h/2·k1.p)   ← midpoint
+(q,p)_new = (q,p) + h · k2
+```
+The midpoint cancels the O(h²) leading error term from Euler, achieving O(h³) local / O(h²) global error. Two evaluations per step.
+
+**RK4 (O(h⁴) global error):**
+Four stages: k1 at start, k2/k3 at midpoint (two separate evaluations), k4 at end. Weighted average `(k1 + 2k2 + 2k3 + k4)/6` cancels all terms through O(h⁴). Four evaluations per step. Gold standard for non-stiff ODEs.
+
+**Velocity Verlet (symplectic, O(h²)):**
+```
+p_half = p + h/2 · a(q)
+q_new  = q + h · p_half
+p_new  = p_half + h/2 · a(q_new)
+```
+Symplectic integrator — preserves the phase-space volume element dq∧dp (Liouville's theorem). For Hamiltonian systems this means energy error oscillates but does not drift secularly. Verlet energy oscillates around the true value; Euler/RK energy drifts monotonically.
+
+**Energy drift metric:** Each frame computes `ΔE% = 100·(H(t) − H(0))/H(0)`. Over many periods Euler shows monotonic drift (+), Verlet shows bounded oscillation (±), RK4 shows near-zero drift for reasonable step sizes.
+
+**Reference solution:** A fourth RK4 with 32× substeps per display step gives a solution with error O((h/32)⁴) ≈ negligible, used as the ground truth trajectory.
+
+*Files: `physics/rk_method_comparision.c`*
+
+---
+
+## 120. STFT Spectrogram — physics/spectrogram_visualizer.c
+
+Computes and displays a real-time Short-Time Fourier Transform (STFT) spectrogram: a 2-D time-frequency representation where x-axis is time, y-axis is frequency, and color encodes magnitude in dB.
+
+**Short-Time Fourier Transform:** The STFT slides a window of N samples over the signal with hop size H:
+
+```
+X(t, f) = Σₙ x[n + t·H] · w[n] · e^{−j2πfn/N}
+```
+
+The time-frequency uncertainty principle constrains the resolution: Δt · Δf ≥ 1/(4π). Large N → fine frequency resolution, coarse time resolution. Small N → fine time resolution, coarse frequency resolution.
+
+**Cooley-Tukey radix-2 DIT FFT:** The discrete Fourier transform is computed in O(N log₂N) operations:
+
+1. **Bit-reversal permutation:** Reorders samples so the butterfly stages work in-place. For DIT (decimation-in-time) the input must be in bit-reversed order.
+2. **Butterfly stages:** log₂N passes, each combining pairs `(a, b)` via `a' = a + W·b`, `b' = a − W·b` where W = e^{−j2π k/N} is the twiddle factor. A recurrence `W_next = W · W_step` avoids calling `cexpf` inside the hot loop.
+
+**Window functions** (spectral leakage suppression):
+| Window   | Sidelobe level | Main-lobe width | Use case |
+|----------|---------------|-----------------|---------|
+| Rect     | −13 dB        | narrowest       | transient detection |
+| Hann     | −31 dB        | 2×              | general purpose |
+| Hamming  | −41 dB        | 2×              | audio analysis |
+| Blackman | −57 dB        | 3×              | pure tone extraction |
+
+**Signal generator:**
+- **Sine/multi-tone:** Phase accumulator `φ += 2πf/SR` per sample. Wrapping at 2π prevents float precision loss after ~10⁶ samples (φ≈6×10⁵ at that point exhausts float mantissa).
+- **Chirp:** Quadratic phase `φ = 2π(f0·t + ½·(f1−f0)/T·t²)` — the phase integral of a linearly sweeping frequency.
+- **AM:** Carrier × (1 + m·cos(2π·f_m·t)). Produces sidebands at fc±fm with amplitude m/2.
+- **FM:** `sin(2πfc·t + β·sin(2πfm·t))`. Bessel function J_n(β) gives sideband amplitudes at fc±n·fm.
+
+**Scrolling display:** A ring buffer stores FFT columns. Each frame a new column is computed and appended. The display renders `ring[(head + col) % total_cols]` — reading forward through the ring gives chronological order.
+
+*Files: `physics/spectrogram_visualizer.c`*
+
+---
+
+## 121. Deferred Rendering Pipeline — raster/deferred_rendering_pipeline.c
+
+A two-pass software rasterizer implementing the deferred shading pipeline used in modern game engines (Unreal Engine 5, Unity HDRP).
+
+**Geometry pass (pass 1):** Each triangle is rasterized and for every covered fragment, the G-buffer is written:
+- RT0: world-space position (x, y, z) — used for light-distance attenuation
+- RT1: world-space normal (nx, ny, nz) — used for diffuse Lambertian and specular lobe
+- RT2: albedo (base color) — material surface color
+- RT3: material (shininess, metallic flags) — controls specular highlight width
+
+**Lighting pass (pass 2):** A full-screen quad iterates over every pixel. For each G-buffer pixel it reconstructs world position + normal, then evaluates Blinn-Phong shading from all lights:
+
+```
+L = ambient + Σ_lights [ diffuse · max(N·L̂, 0) + specular · max(N·Ĥ, 0)^shininess ]
+```
+
+The half-vector H = normalize(L̂ + V̂) is the Blinn approximation to the Phong reflected ray — cheaper to compute and gives a slightly more physically plausible lobe. This is the analogue of OpenGL's full-screen-quad lighting pass in deferred rendering.
+
+**Projection matrix:** `m[3][2] = −1` encodes the perspective divide. During clip-to-NDC the output w-component equals `−z_view`, so the homogeneous divide `x/w, y/w` correctly shrinks far objects.
+
+**Normal matrix:** The normal matrix is the inverse-transpose of the model matrix (upper-left 3×3). Pure rotation matrices are orthogonal (M⁻¹ = Mᵀ), so the inverse-transpose equals M itself — no extra computation needed. Non-uniform scaling would break this, which is why the general formula must be used when scale ≠ 1.
+
+**Flat vs smooth normals:**
+- Cube: 24 vertices (4 per face × 6 faces) — each vertex carries the face normal. Adjacent faces share no vertices, so the silhouette shows hard edges. This is "flat shading."
+- Sphere: vertices generated on the unit sphere. Normal = vertex position / radius — points radially outward. Adjacent triangles share interpolated normals giving a smooth gradient. This is "smooth shading."
+
+**Bayer 4×4 dithering:** Before mapping luminance to an ASCII character, a spatially-varying threshold from a 4×4 Bayer matrix is added. This converts the continuous luminance into a spatially dithered binary pattern that approximates the original grey level — the same technique used in early print halftoning and Game Boy LCD shading.
+
+*Files: `raster/deferred_rendering_pipeline.c`*
 
 ---
 

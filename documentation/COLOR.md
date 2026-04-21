@@ -1240,3 +1240,104 @@ int cp = (b->M[i] >= 0.0f) ? CP_MOM_POS : CP_MOM_NEG;  /* cyan / magenta */
 Green velocity arrows mean "moving forward" and red means "reversing" — the color matches the intuition. The heading arrow is cyan to stand out from both velocity colors. Trail dots age from bright to dim using `A_BOLD` → `A_DIM` attribute gating on top of the same color pair, giving three brightness levels without extra pairs.
 
 **Effect:** At a glance the viewer can read robot state: cyan arrow is "I'm going this way", green/red wheel arrows are "each wheel is pushing/braking", aged trail shows the robot's history.
+
+---
+
+## 24. Signed Amplitude Colormap — Pressure Fields (acoustic_wavesolver.c, vorticity_streamfunction_solver.c)
+
+**Where:** `physics/acoustic_wavesolver.c`, `fluid/vorticity_streamfunction_solver.c`
+
+**How it works:**
+Physical fields take both positive and negative values. Pressure p can be compression (+) or rarefaction (−); vorticity ω can be clockwise (+) or counter-clockwise (−). A single-sided color ramp cannot encode sign. The solution: map the sign to a hue (e.g. blue for negative, red for positive) and map the magnitude to brightness within that hue.
+
+```c
+float v   = field[y][x] / (max_val + 1e-6f);   /* normalised ∈ [-1, 1] */
+int   mag = (int)(fabsf(v) * (NLEVELS - 1));    /* magnitude → brightness */
+int   cp  = (v >= 0.0f) ? CP_POS : CP_NEG;      /* sign → color pair */
+attron(COLOR_PAIR(cp) | brightness_attr[mag]);
+mvaddch(y, x, ramp[mag]);
+```
+
+The brightness ramp `ramp[]` is the Paul Bourke density ramp `" .:-=+*#@"`. At zero amplitude the space character is used — the field is visually dark at equilibrium and lights up symmetrically in both directions as the wave passes.
+
+**Effect:** Compression wavefronts appear in one color, rarefaction in another. The two colors move through each other at interference nodes, making constructive and destructive interference immediately visible.
+
+---
+
+## 25. Frequency-to-Row Color Bands — STFT Spectrogram (spectrogram_visualizer.c)
+
+**Where:** `physics/spectrogram_visualizer.c`
+
+**How it works:**
+The spectrogram maps dB magnitude at each (time, frequency) bin to a color. Frequency determines the row; time determines the column; magnitude determines the color intensity. A 256-color heat ramp maps [DB_FLOOR, 0 dB] to a gradient:
+
+```c
+/* map dB value [DB_FLOOR..0] to color index [0..NCOLORS-1] */
+float frac = (db_val - DB_FLOOR) / (-DB_FLOOR);        /* 0=quiet, 1=loud */
+frac       = fmaxf(0.0f, fminf(1.0f, frac));
+int ci     = (int)(frac * (NCOLORS - 1));
+
+/* color ramp: black → dark blue → cyan → white */
+init_pair(ci + 1, ramp_color[ci], COLOR_BLACK);
+attron(COLOR_PAIR(ci + 1));
+mvaddch(row, col, ' ' | A_REVERSE);   /* filled block via reverse video */
+```
+
+The dynamic range is 80 dB (DB_FLOOR=−80) — a 10,000:1 amplitude ratio. Without the dB scale the display would be dominated by the loudest component and all others would appear equally dark. The log scale compresses the dynamic range so faint harmonics are visible alongside the dominant tone.
+
+**Smoothed peak tracking:** The peak magnitude `p_max` is updated via exponential smoothing `p_max = 0.97·p_max + 0.03·current_max`. This prevents a sudden loud transient from collapsing all other components to black for many frames.
+
+**Effect:** Strong frequency components appear as bright horizontal streaks. Chirps appear as diagonal lines (frequency changing over time). AM sidebands appear as three parallel horizontal lines. FM creates a cluster of sidebands of varying brightness.
+
+---
+
+## 26. Method-Coded Trajectory Colors — ODE Comparison (rk_method_comparision.c)
+
+**Where:** `physics/rk_method_comparision.c`
+
+**How it works:**
+Four integrators run simultaneously on the same ODE. Each integrator gets a fixed color identity, used consistently across the phase portrait, the energy-drift time series, and the HUD label. This is role-based coloring where the role is "this numerical method":
+
+```c
+#define CP_EULER   1  /* red    — unstable, spirals outward    */
+#define CP_RK2     2  /* yellow — better but not symplectic    */
+#define CP_RK4     3  /* green  — high accuracy reference      */
+#define CP_VERLET  4  /* cyan   — symplectic, bounded energy   */
+#define CP_REF     5  /* white  — ground truth (RK4 ×32)       */
+```
+
+Red is chosen for Euler to signal danger: on the harmonic oscillator Euler spirals outward, violating energy conservation. Green is chosen for RK4 because it is the "safe" choice for most problems. Cyan for Verlet signals a different kind of correctness — long-time stability rather than per-step accuracy.
+
+In the energy-drift panel, the y-axis represents ΔE% = (H(t)−H(0))/H(0)·100. Euler drifts monotonically upward (red line climbing); Verlet oscillates around zero (cyan line bounded); RK4 stays near zero (green line flat).
+
+**Effect:** A learner can immediately read "red is bad for long-time integration, cyan is good." The color coding reinforces the lesson without requiring a legend to be visible at all times.
+
+---
+
+## 27. G-buffer ASCII Visualization — Deferred Pipeline (deferred_rendering_pipeline.c)
+
+**Where:** `raster/deferred_rendering_pipeline.c`
+
+**How it works:**
+The deferred rendering pipeline produces a combined luminance value per pixel from Blinn-Phong lighting. That luminance is mapped to an ASCII character via Bayer dithering:
+
+```c
+/* 4×4 Bayer ordered-dither threshold matrix (normalised to [0,1]) */
+static const float k_bayer[4][4] = {
+    {0/16.f, 8/16.f, 2/16.f, 10/16.f},
+    {12/16.f,4/16.f,14/16.f, 6/16.f},
+    {3/16.f,11/16.f, 1/16.f, 9/16.f},
+    {15/16.f,7/16.f,13/16.f, 5/16.f}
+};
+
+/* in fragment shader: */
+float dithered = luma + k_bayer[y%4][x%4] * (1.0f/RAMP_LEN);
+int   ri       = (int)(dithered * RAMP_LEN);
+char  ch       = k_ramp[ri];   /* Paul Bourke density ramp */
+```
+
+The Bayer matrix spatial threshold converts the continuous luminance into a pseudo-halftone pattern. High-luminance regions get dense characters (`@#*`); low-luminance regions get sparse characters (`.` or space). The spatially-varying threshold creates the appearance of intermediate luminance levels with only a discrete character set.
+
+Color pairs map to material properties from RT2 (albedo): the albedo color index is used to select the ncurses color pair, so different objects (lit by the same lights) retain their surface color while sharing the same brightness logic.
+
+**Effect:** Smooth Phong shading gradients appear as natural-looking ASCII halftones. The cube shows hard-edge transitions between faces; the sphere shows smooth gradients from highlight to shadow — all from the same rendering code, driven by the flat vs smooth normal distinction.

@@ -65,6 +65,9 @@ Organised as a field guide: what the call does, why it matters, where it appears
 - [V5.14 Ring-buffer Trail Coloring](#v514-ring-buffer-trail-coloring)
 - [V5.15 `luma_to_cell` — Dither + Ramp + Color in One Call](#v515-luma_to_cell--dither--ramp--color-in-one-call)
 - [V5.16 Depth Sort — Painter's Algorithm](#v516-depth-sort--painters-algorithm)
+- [V5.27 Triple-Buffer Leapfrog Display — Pointer-Rotation Pattern](#v527-triple-buffer-leapfrog-display--pointer-rotation-pattern)
+- [V5.28 Ring-Buffer Scrolling Spectrogram](#v528-ring-buffer-scrolling-spectrogram)
+- [V5.29 Multi-Panel Side-by-Side Comparison Display](#v529-multi-panel-side-by-side-comparison-display)
 
 ### V6 — Input Handling
 - [V6.1 `nodelay` — Non-blocking Input](#v61-nodelay--non-blocking-input)
@@ -3194,6 +3197,109 @@ The interpolated heading `bh` used here is the alpha-lerped value `prev_heading 
 **Why this generalises:** Any rigid shape (triangle, hexagon, oriented capsule) can be drawn this way. Compute body-local corner offsets once; call `rotate2d(corner, heading)` at draw time. No branch for each direction — one code path handles all headings.
 
 *Files: `animation/hexpod_tripod.c`*
+
+---
+
+---
+
+#### V5.27 Triple-Buffer Leapfrog Display — Pointer-Rotation Pattern
+
+**What it is:** Using three arrays (p_old, p, p_new) and rotating pointers each frame instead of copying array contents.
+
+**What we achieve:** O(1) per-step overhead regardless of grid size. For a 120×80 grid (9600 cells) a full memcpy costs ~38 KB of memory writes; pointer rotation costs 3 pointer assignments.
+
+**How:**
+
+```c
+/* three float grids allocated once */
+float (*p_old)[COLS] = buf0;
+float (*p)    [COLS] = buf1;
+float (*p_new)[COLS] = buf2;
+
+/* after each FDTD step: rotate instead of copy */
+float (*tmp)[COLS] = p_old;
+p_old = p;
+p     = p_new;
+p_new = tmp;    /* p_new is now free for writing next step */
+```
+
+The physical meaning: `p_old` is t−1, `p` is t, `p_new` is t+1. After rotation: old `p` becomes new `p_old` (the previous step), old `p_new` becomes new `p` (the current result), and old `p_old` becomes new `p_new` (scratch buffer for next step).
+
+**Why this generalises:** Any explicit time-marching scheme with a fixed stencil depth can use this pattern. The leapfrog wave equation needs depth 2 (three arrays). A first-order scheme needs depth 1 (two arrays). Runge-Kutta needs more scratch buffers but the same pointer-rotation idea applies.
+
+*Files: `physics/acoustic_wavesolver.c`*
+
+---
+
+#### V5.28 Ring-Buffer Scrolling Spectrogram
+
+**What it is:** Storing FFT columns in a circular (ring) buffer and computing the display column from the ring head position.
+
+**What we achieve:** O(1) spectrogram update — only compute and store one new column per frame, never shift the entire buffer. The display looks like a scrolling waterfall with new data entering from one edge.
+
+**How:**
+
+```c
+int spec_cols;         /* number of visible display columns */
+int spec_head = 0;     /* next write position (ring head)   */
+float spec[MAX_COLS][FFT_SIZE/2];   /* ring buffer of magnitude columns */
+
+/* each frame: write one new column at head */
+compute_fft_magnitudes(spec[spec_head]);
+spec_head = (spec_head + 1) % spec_cols;
+
+/* render: read from head+0 (oldest) to head-1 (newest) */
+for (int sx = 0; sx < spec_cols; sx++) {
+    int ring_col = (spec_head + sx) % spec_cols;
+    /* ring_col=spec_head is oldest, ring_col=(spec_head-1)%spec_cols is newest */
+    for (int sy = 0; sy < FFT_SIZE/2; sy++) {
+        float db = spec[ring_col][sy];
+        /* map db → color, display at (sx, sy) */
+    }
+}
+```
+
+The key formula `ring_col = (spec_head + sx) % spec_cols` maps screen column sx to ring buffer column. At sx=0 you read the oldest data (head); at sx=spec_cols−1 you read the data written one frame ago (head−1). This gives the scrolling-history view without any data movement.
+
+**Why head = next write slot:** The convention "head points to the next write location" (not the oldest data) means: oldest data is at `head`, newest will be at `(head−1+spec_cols)%spec_cols`. This is the standard ring-buffer convention — consistent with the rendering formula above.
+
+*Files: `physics/spectrogram_visualizer.c`*
+
+---
+
+#### V5.29 Multi-Panel Side-by-Side Comparison Display
+
+**What it is:** Dividing the terminal into fixed-width vertical panels, each showing a different integrator's phase portrait and time series, with a shared HUD at the top.
+
+**What we achieve:** Four simulations running concurrently, all visible simultaneously for direct comparison. The learner sees Euler spiraling outward while Verlet remains bounded — without switching views.
+
+**How:**
+
+```c
+int panel_w = COLS / N_METHODS;   /* width per integrator panel */
+
+for (int m = 0; m < N_METHODS; m++) {
+    int x0 = m * panel_w;          /* left edge of this panel   */
+    int cx = x0 + panel_w / 2;     /* center x for phase origin */
+
+    /* draw phase portrait orbit in this panel */
+    for (int i = 0; i < traj_len[m]; i++) {
+        int px = cx + (int)(traj[m][i].q * SCALE);
+        int py = cy + (int)(traj[m][i].p * SCALE);
+        if (px >= x0 && px < x0 + panel_w)  /* clip to panel */
+            mvaddch(py, px, '.' | COLOR_PAIR(method_cp[m]));
+    }
+
+    /* draw energy drift time series below phase portrait */
+    /* ... same x0/panel_w clipping */
+}
+```
+
+The critical detail: **clip every draw call to `[x0, x0+panel_w)`**. Without clipping, a large orbit in one panel overwrites the adjacent panel. The clip is a simple integer range check, not a ncurses window.
+
+**Separator lines:** Vertical `|` characters drawn at `x0` for each panel provide a visual partition without creating separate ncurses WINDOWs (which would require coordinating `wrefresh` across multiple windows). Single-window rendering with manual clipping is simpler and avoids ncurses multi-window overhead.
+
+*Files: `physics/rk_method_comparision.c`*
 
 ---
 

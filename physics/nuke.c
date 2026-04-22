@@ -147,6 +147,19 @@ enum {
 /* ── Flash ───────────────────────────────────────────────────────────── */
 #define FLASH_DECAY      8.0f   /* flash fade rate (1/sec)                    */
 
+/* ── Mushroom cloud overlay ──────────────────────────────────────────── */
+#define CP_SMOKE        17     /* cloud smoke/gray color pair                */
+#define DUR_CL_FIREBALL  1.5f  /* fireball expansion phase (sec)             */
+#define DUR_CL_RISING    3.0f  /* fireball-rise + stem growth phase (sec)    */
+#define DUR_CL_CAPFORM   2.0f  /* mushroom cap formation phase (sec)         */
+#define DUR_CL_MUSHROOM  3.5f  /* full-mushroom hold phase (sec)             */
+#define DUR_CL_FADE      5.0f  /* fade-out phase (sec)                       */
+#define CL_FB_R_MAX      6.0f  /* max fireball radius (cols)                 */
+#define CL_FB_RISE      12.0f  /* rows the fireball rises upward             */
+#define CL_STEM_W        2.2f  /* stem half-width (cols)                     */
+#define CL_CAP_RH        9.0f  /* cap horizontal radius (cols)               */
+#define CL_CAP_RV        4.0f  /* cap vertical radius (rows)                 */
+
 /* ── Timing ─────────────────────────────────────────────────────────── */
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
@@ -183,6 +196,7 @@ static void clock_sleep_ns(int64_t ns)
 /*   14    dust cloud                                                     */
 /*   15    flash burst                                                    */
 /*   16    HUD text                                                       */
+/*   17    mushroom cloud smoke                                           */
 /* ===================================================================== */
 
 #define N_PRESS   8
@@ -206,10 +220,12 @@ typedef struct {
     short       dust;           /* dust cloud                           */
     short       flash;          /* initial flash                        */
     short       hud;            /* HUD / status line                    */
+    short       smoke;          /* mushroom cloud smoke/gray            */
     /* fallback basic-color indices for terminals without 256 colors    */
     short       fb_press_lo;    /* low-end pressure (basic color)       */
     short       fb_press_hi;    /* high-end pressure (basic color)      */
     short       fb_rarefy;
+    short       fb_smoke;       /* fallback smoke (basic-color term)    */
 } Theme;
 
 static const Theme k_themes[] = {
@@ -217,43 +233,43 @@ static const Theme k_themes[] = {
     /* ── 0  NUKE — original red-orange-white nuclear fire ─────────── */
     { "NUKE",
       { 88, 124, 160, 196, 202, 208, 220, 231 },
-      18, 22, 100, 214, 226, 180, 231, 231,
-      COLOR_RED, COLOR_YELLOW, COLOR_BLUE
+      18, 22, 100, 214, 226, 180, 231, 231, 245,
+      COLOR_RED, COLOR_YELLOW, COLOR_BLUE, COLOR_WHITE
     },
 
     /* ── 1  BRIGHT — electric cyan through white, hot-magenta trough ─ */
     { "BRIGHT",
       { 39, 45, 51, 87, 123, 159, 195, 231 },
-      201, 24, 31, 51, 231, 159, 231, 51,
-      COLOR_CYAN, COLOR_WHITE, COLOR_MAGENTA
+      201, 24, 31, 51, 231, 159, 231, 51, 252,
+      COLOR_CYAN, COLOR_WHITE, COLOR_MAGENTA, COLOR_WHITE
     },
 
     /* ── 2  MATRIX — terminal-green code rain, dead-black trough ───── */
     { "MATRIX",
       { 22, 28, 34, 40, 46, 82, 118, 154 },
-      17, 22, 34, 118, 118, 46, 154, 46,
-      COLOR_GREEN, COLOR_GREEN, COLOR_BLACK
+      17, 22, 34, 118, 118, 46, 154, 46, 22,
+      COLOR_GREEN, COLOR_GREEN, COLOR_BLACK, COLOR_GREEN
     },
 
     /* ── 3  NOVA — deep-space blue-violet bursting to white ──────────  */
     { "NOVA",
       { 17, 19, 57, 93, 129, 165, 207, 231 },
-      196, 17, 54, 141, 225, 141, 231, 225,
-      COLOR_BLUE, COLOR_MAGENTA, COLOR_RED
+      196, 17, 54, 141, 225, 141, 231, 225, 60,
+      COLOR_BLUE, COLOR_MAGENTA, COLOR_RED, COLOR_BLUE
     },
 
     /* ── 4  FIRE — dark smoldering ember to blinding flame ──────────  */
     { "FIRE",
       { 52, 88, 124, 160, 196, 208, 214, 220 },
-      17, 52, 88, 220, 220, 130, 220, 214,
-      COLOR_RED, COLOR_YELLOW, COLOR_BLACK
+      17, 52, 88, 220, 220, 130, 220, 214, 238,
+      COLOR_RED, COLOR_YELLOW, COLOR_BLACK, COLOR_WHITE
     },
 
     /* ── 5  TOXIC — bio-hazard acid lime, blood-red rarefaction ─────  */
     { "TOXIC",
       { 22, 58, 64, 70, 76, 82, 118, 154 },
-      88, 22, 58, 82, 154, 112, 154, 82,
-      COLOR_GREEN, COLOR_GREEN, COLOR_RED
+      88, 22, 58, 82, 154, 112, 154, 82, 64,
+      COLOR_GREEN, COLOR_GREEN, COLOR_RED, COLOR_GREEN
     },
 };
 
@@ -281,6 +297,7 @@ static void color_apply(int t)
         init_pair(CP_DUST,   th->dust,   -1);
         init_pair(CP_FLASH,  th->flash,  -1);
         init_pair(CP_HUD,    th->hud,    -1);
+        init_pair(CP_SMOKE,  th->smoke,  -1);
     } else {
         for (int i = 0; i < N_PRESS / 2; i++)
             init_pair((short)(i + 1), th->fb_press_lo, -1);
@@ -294,6 +311,7 @@ static void color_apply(int t)
         init_pair(CP_DUST,   COLOR_WHITE,         -1);
         init_pair(CP_FLASH,  COLOR_WHITE,         -1);
         init_pair(CP_HUD,    COLOR_WHITE,         -1);
+        init_pair(CP_SMOKE,  th->fb_smoke,        -1);
     }
 }
 
@@ -471,6 +489,211 @@ static void particles_tick(Particle *pool, int n, float dt)
 }
 
 /* ===================================================================== */
+/* §6b cloud — mushroom cloud phase machine + cell renderer              */
+/*                                                                        */
+/* Visual anatomy:                                                        */
+/*   Phase FIREBALL : bright sphere swells from blast origin             */
+/*   Phase RISING   : sphere rises; narrow stem forms beneath it        */
+/*   Phase CAPFORM  : oblate ellipsoid (cap) grows from the top          */
+/*   Phase MUSHROOM : iconic silhouette holds, turbulence churns it     */
+/*   Phase FADE     : opacity ramps to 0 and cloud dissolves             */
+/*                                                                        */
+/* Each cell inside the cloud boundary gets a heat value [0,1]:         */
+/*   heat = max(fireball_heat, stem_heat, cap_heat)                      */
+/* mapped to a fire palette color pair (pairs 1–8) or CP_SMOKE.         */
+/* Sin-wave turbulence + wave-field pressure warp the boundary.          */
+/* ===================================================================== */
+
+typedef enum {
+    CL_FIREBALL, CL_RISING, CL_CAPFORM, CL_MUSHROOM, CL_FADE, CL_DONE
+} CloudPhase;
+
+typedef struct {
+    CloudPhase phase;
+    float      phase_t;      /* progress [0,1] within current phase        */
+    float      total_time;   /* total elapsed since cloud_init             */
+    int        cx;           /* blast column                               */
+    int        cy_base;      /* blast row (ground level)                   */
+    float      fireball_r;   /* current fireball radius (cols)             */
+    float      fireball_y;   /* current fireball centre row (decreases=up) */
+    float      stem_h;       /* current stem height (rows)                 */
+    float      cap_rh;       /* current cap horizontal radius (cols)       */
+    float      cap_rv;       /* current cap vertical radius (rows)         */
+    float      opacity;      /* overall fade multiplier [0,1]              */
+    bool       active;       /* false until first cloud_init               */
+} CloudState;
+
+/* Hermite smooth-step on [edge0, edge1] */
+static float cl_smoothstep(float edge0, float edge1, float x)
+{
+    float t = (x - edge0) / (edge1 - edge0);
+    if (t < 0.f) t = 0.f;
+    if (t > 1.f) t = 1.f;
+    return t * t * (3.f - 2.f * t);
+}
+
+static void cloud_init(CloudState *cl, int cx, int cy_base)
+{
+    memset(cl, 0, sizeof *cl);
+    cl->phase      = CL_FIREBALL;
+    cl->cx         = cx;
+    cl->cy_base    = cy_base;
+    cl->fireball_y = (float)cy_base;
+    cl->opacity    = 1.f;
+    cl->active     = true;
+}
+
+static void cloud_tick(CloudState *cl, float dt)
+{
+    if (!cl->active || cl->phase == CL_DONE) return;
+    cl->total_time += dt;
+
+    switch (cl->phase) {
+        case CL_FIREBALL:
+            cl->phase_t += dt / DUR_CL_FIREBALL;
+            cl->fireball_r = cl_smoothstep(0.f, 1.f, cl->phase_t) * CL_FB_R_MAX;
+            if (cl->phase_t >= 1.f) { cl->phase = CL_RISING; cl->phase_t = 0.f; }
+            break;
+
+        case CL_RISING: {
+            cl->phase_t += dt / DUR_CL_RISING;
+            float t = cl_smoothstep(0.f, 1.f, cl->phase_t);
+            cl->fireball_y = (float)cl->cy_base - t * CL_FB_RISE;
+            cl->stem_h     = t * CL_FB_RISE;
+            if (cl->phase_t >= 1.f) { cl->phase = CL_CAPFORM; cl->phase_t = 0.f; }
+            break;
+        }
+
+        case CL_CAPFORM: {
+            cl->phase_t += dt / DUR_CL_CAPFORM;
+            float t = cl_smoothstep(0.f, 1.f, cl->phase_t);
+            cl->cap_rh = t * CL_CAP_RH;
+            cl->cap_rv = t * CL_CAP_RV;
+            if (cl->phase_t >= 1.f) { cl->phase = CL_MUSHROOM; cl->phase_t = 0.f; }
+            break;
+        }
+
+        case CL_MUSHROOM:
+            cl->phase_t += dt / DUR_CL_MUSHROOM;
+            if (cl->phase_t >= 1.f) { cl->phase = CL_FADE; cl->phase_t = 0.f; }
+            break;
+
+        case CL_FADE:
+            cl->phase_t += dt / DUR_CL_FADE;
+            cl->opacity = 1.f - cl_smoothstep(0.f, 1.f, cl->phase_t);
+            if (cl->phase_t >= 1.f) { cl->phase = CL_DONE; cl->opacity = 0.f; }
+            break;
+
+        case CL_DONE: break;
+    }
+}
+
+/*
+ * render_cloud — draw the cloud layer cell by cell.
+ * Must be called after terrain (so cloud overlays ground) and before
+ * particles (so debris flies in front of the cloud).
+ */
+static void render_cloud(const CloudState *cl, const float *wave_u,
+                          int sim_rows, int sim_cols,
+                          int trows, int tcols,
+                          int shake_r, int shake_c)
+{
+    if (!cl->active || cl->opacity < 0.01f) return;
+
+    float opa  = cl->opacity;
+    float time = cl->total_time;
+
+    /* Compute bounding box (cols may go negative; clamp below) */
+    int r_top   = (int)(cl->fireball_y) - (int)(CL_FB_R_MAX + CL_CAP_RV + 3);
+    int r_bot   = cl->cy_base;
+    int c_left  = cl->cx - (int)(cl->cap_rh + CL_FB_R_MAX + 3);
+    int c_right = cl->cx + (int)(cl->cap_rh + CL_FB_R_MAX + 3);
+
+    if (r_top  < 0)          r_top  = 0;
+    if (r_bot  >= sim_rows)  r_bot  = sim_rows - 1;
+    if (c_left < 0)          c_left = 0;
+    if (c_right >= sim_cols) c_right = sim_cols - 1;
+
+    for (int r = r_top; r <= r_bot; r++) {
+        for (int c = c_left; c <= c_right; c++) {
+            float dx    = (float)(c - cl->cx);
+            float dy_fb = (float)r - cl->fireball_y;   /* +ve = below fb centre */
+
+            /* Turbulence: layered sin waves + wave-field pressure warp */
+            float wave_warp = wave_u[r * sim_cols + c] * 0.10f;
+            float turb = 0.22f * sinf(r * 0.72f + time * 2.3f)
+                       + 0.15f * sinf(c * 1.15f + time * 1.8f)
+                       + 0.10f * sinf((r + c) * 0.55f + time * 3.1f)
+                       + wave_warp;
+
+            /* ── Fireball component: expanding sphere ── */
+            float d_fb   = sqrtf(dx*dx + (dy_fb * CELL_ASPECT) * (dy_fb * CELL_ASPECT));
+            float fb_edge = cl->fireball_r + turb;
+            float heat_fb = (fb_edge > 0.1f && d_fb < fb_edge)
+                          ? (1.f - d_fb / (fb_edge + 0.01f)) : 0.f;
+
+            /* ── Stem component: narrow column below the fireball ── */
+            float heat_stem = 0.f;
+            if (cl->stem_h > 0.5f && (float)r > cl->fireball_y) {
+                float stem_top = cl->fireball_y;
+                float stem_bot = (float)cl->cy_base;
+                float sw = CL_STEM_W + fabsf(turb) * 0.35f;
+                if (fabsf(dx) < sw) {
+                    float fill = (1.f - fabsf(dx) / (sw + 0.01f)) * 0.75f;
+                    /* Taper near top (blends into fireball) and base */
+                    float tp = ((float)r - stem_top) / (stem_bot - stem_top + 0.01f);
+                    float taper = cl_smoothstep(0.f, 0.12f, tp)
+                                * (1.f - cl_smoothstep(0.88f, 1.f, tp));
+                    heat_stem = fill * taper;
+                }
+            }
+
+            /* ── Cap component: oblate ellipsoid at the top ── */
+            float heat_cap = 0.f;
+            if (cl->cap_rh > 0.3f) {
+                float dy_cap = (float)r - cl->fireball_y;
+                float rh = cl->cap_rh + turb * 0.55f;
+                float rv = cl->cap_rv + 0.1f;
+                float ed = (dx / (rh + 0.01f)) * (dx / (rh + 0.01f))
+                         + (dy_cap * CELL_ASPECT / rv) * (dy_cap * CELL_ASPECT / rv);
+                if (ed < 1.0f)
+                    heat_cap = (1.f - ed) * 0.65f;
+            }
+
+            /* Max across all components, then apply opacity */
+            float heat = heat_fb;
+            if (heat_stem > heat) heat = heat_stem;
+            if (heat_cap  > heat) heat = heat_cap;
+            if (heat < 0.04f) continue;
+            heat *= opa;
+
+            /* Map heat → color pair + character */
+            attr_t at;
+            char   ch;
+            if (heat > 0.78f) {
+                ch = '@'; at = COLOR_PAIR(N_PRESS) | A_BOLD;
+            } else if (heat > 0.58f) {
+                ch = '#'; at = COLOR_PAIR(7) | A_BOLD;
+            } else if (heat > 0.38f) {
+                ch = '*'; at = COLOR_PAIR(5);
+            } else if (heat > 0.20f) {
+                ch = 'o'; at = COLOR_PAIR(3);
+            } else if (heat > 0.10f) {
+                ch = ':'; at = COLOR_PAIR(2);
+            } else {
+                ch = '.'; at = COLOR_PAIR(CP_SMOKE);
+            }
+
+            int tr = r + shake_r, tc = c + shake_c;
+            if (tr < 0 || tr >= trows - 1 || tc < 0 || tc >= tcols) continue;
+            attron(at);
+            mvaddch(tr, tc, (chtype)(unsigned char)ch);
+            attroff(at);
+        }
+    }
+}
+
+/* ===================================================================== */
 /* §7  simulation — full state, blast trigger, per-frame tick            */
 /* ===================================================================== */
 
@@ -480,12 +703,13 @@ typedef struct {
     float    *terrain_h;    /* static terrain height per column          */
     float    *terrain_d;    /* dynamic ripple displacement per column    */
     Particle  parts[MAX_PARTS];
-    int       rows, cols;
-    float     time;
-    float     shake_t;      /* time elapsed since last blast             */
-    float     flash;        /* flash intensity [0,1]                     */
-    int       blast_cx, blast_cy;
-    bool      paused;
+    int        rows, cols;
+    float      time;
+    float      shake_t;      /* time elapsed since last blast            */
+    float      flash;        /* flash intensity [0,1]                    */
+    int        blast_cx, blast_cy;
+    bool       paused;
+    CloudState cloud;        /* mushroom cloud phase machine             */
 } SimState;
 
 static SimState *sim_alloc(int rows, int cols)
@@ -523,6 +747,7 @@ static void sim_blast(SimState *s)
     if (cy < 2) cy = 2;
     wave_blast(s->u, s->rows, s->cols, cx, cy);
     spawn_debris(s->parts, MAX_PARTS, (float)cx, (float)cy);
+    cloud_init(&s->cloud, cx, cy);
     s->flash    = 1.0f;
     s->shake_t  = 0.f;
     s->blast_cx = cx;
@@ -572,6 +797,7 @@ static void sim_tick(SimState *s, float dt)
     }
 
     particles_tick(s->parts, MAX_PARTS, dt);
+    cloud_tick(&s->cloud, dt);
 
     s->shake_t += dt;
     s->flash    = fmaxf(0.f, s->flash - FLASH_DECAY * dt);
@@ -661,6 +887,10 @@ static void render_frame(const SimState *s, int trows, int tcols,
             attroff(at);
         }
     }
+
+    /* ── 2b. Mushroom cloud ──────────────────────────────────────────── */
+    render_cloud(&s->cloud, s->u, s->rows, s->cols,
+                 trows, tcols, shake_r, shake_c);
 
     /* ── 3. Particles ─────────────────────────────────────────────────── */
     for (int i = 0; i < MAX_PARTS; i++) {

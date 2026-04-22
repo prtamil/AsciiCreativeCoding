@@ -2540,4 +2540,89 @@ This is structurally identical to Unreal Engine 5's GBufferA/B/C/D layout and Un
 
 ---
 
+## D27 2-D Damped Wave Equation — Shockwave Demo
+
+The damped scalar wave PDE governs everything from drumheads to acoustic shocks to ripples on a pond. In its simplest 2-D form:
+
+```
+∂²u/∂t² = c²∇²u − γ ∂u/∂t
+```
+
+The Laplacian `∇²u` is the spatial second derivative summed over both axes. On a uniform grid, the standard 5-point stencil is `u[x+1] + u[x−1] + u[y+1] + u[y−1] − 4u[x,y]` — accurate to O(dx²). Time integration is leapfrog (explicit second-order), needing only `u_old`, `u`, `u_new`. The damping term `−γ ∂u/∂t` is approximated by `−γ(u − u_old)/dt`, which is unconditionally stable at any γ.
+
+**CFL stability** caps the wave-speed/timestep product: for the 5-point stencil in 2-D, `c · dt · √2 ≤ 1`. Two substeps per render frame halve the effective `dt`, doubling the maximum stable `c` for free — useful when you want a fast-moving wave at low render cost.
+
+**Two decay mechanisms emerge naturally:**
+- *Geometric (cylindrical spreading):* in 2-D, total energy in a ring grows linearly with the circumference, so amplitude must drop as `1/√r`. This is geometry, not damping — total energy is conserved.
+- *Physical (damping):* the `γ` term converts wave energy to heat (or any sink). Amplitude envelope is `exp(−γt)`, independent of geometry.
+
+**Initial condition matters.** A pixel-sharp delta excites every wavenumber up to Nyquist; the highest wavenumbers are exactly the unstable modes the discrete Laplacian cannot represent. A Gaussian tap of half-width 2 cells filters them out, giving a clean ring without ringing artifacts.
+
+The `physics/nuke.c` simulation drives a coordinated visual from this single field: ring shockwave (the field itself), terrain heave (per-column displacement reading `u` at the surface row), debris/dust particle pools (spawned at blast and ring-sweep events), screen shake (integer cell offset at the `mvaddch` boundary), full-screen flash (alpha overlay).
+
+*Files: `physics/nuke.c`*
+
+---
+
+## D28 Sphere Tracing & SDF Composition — Solar Simulation
+
+Sphere tracing (Hart 1996) replaces analytic ray–surface intersection with iterative steps. Given a Signed Distance Function `f: ℝ³ → ℝ`, where `|f(p)|` equals the distance from `p` to the nearest surface and the sign tells you inside/outside, you can step along a ray by exactly `f(p)` and never overshoot. Terminate when `f(p) < ε` (hit) or accumulated `t > MAX_T` (miss).
+
+**SDF composition** is the real power. Boolean operations are trivial:
+- Union: `min(a, b)` — the closer of two surfaces
+- Intersection: `max(a, b)`
+- Subtraction: `max(a, −b)`
+
+Smooth versions blend the boundary instead of butting:
+- `smin(a, b, k) = min(a, b) − k·h²/4` with `h = max(k − |a−b|, 0)/k` — polynomial smooth minimum, gives a rounded crease over a region of width `k`.
+
+**Domain operations** modify `p` before the SDF lookup: translate, rotate, repeat (`p mod size`), twist (`rotate(p.xy, p.z · k)`), bend, displace by noise. All of these compose with all primitives.
+
+**Why noise-displaced SDFs make sense for natural surfaces.** A surface like a sun's photosphere has no analytic equation but is well-approximated by a sphere with high-frequency perturbation. Subtracting `fbm(p)·amp` from the sphere SDF gives exactly that — boiling lava without any explicit polygon mesh.
+
+`raymarcher/sun.c` uses one SDF (`sphere − warped_fbm`) smooth-unioned with up to 8 capsule flares. The flares run independent state machines (BLAST → ARCH → DECAY); their geometry is a Bézier-arched magnetic loop approximated by 8 capsule segments (`bezier_tube_dist()`). The analytic distance to a quadratic Bézier curve requires solving a degree-5 polynomial — capsule subdivision is visually identical at one-tenth the code.
+
+**Limb darkening** (Eddington 1-coefficient law, ref: en.wikipedia.org/wiki/Limb_darkening) accounts for the cooler-looking edge of a star: `T_visible = T·(0.80 + 0.20·μ)` with `μ = N·V`. A real photometric law is a polynomial in μ; `u₁ = 0.20` matches the visible-light limb of the Sun closely.
+
+*Files: `raymarcher/sun.c`*
+
+---
+
+## D29 Volumetric Raymarching — Beer–Lambert Mushroom Cloud
+
+Surface-based rendering (SDFs, polygons) cannot draw clouds, smoke, fog, or fire — these have no surface. Instead the medium is a 3-D scalar density field; rendering integrates light transport through the field along each ray.
+
+**The Beer–Lambert law** describes light attenuation in a participating medium:
+```
+T(t) = exp(−∫₀ᵗ density(p(s)) · σ_t  ds)
+```
+where `T(t)` is remaining transmittance after travelling distance `t` and `σ_t` is the extinction coefficient. Discretised front-to-back:
+
+```
+T = 1
+out_colour = 0
+for each step along ray:
+    dτ = density(p) · step · EXTINCTION
+    a  = 1 − exp(−dτ)
+    out_colour += a · emission(p) · T
+    T *= exp(−dτ)
+    if T < 0.07: break               /* invisible contribution */
+```
+
+Front-to-back (rather than back-to-front) lets you bail when `T` drops below the colour quantization threshold. The density field can be anything: voxel grid, procedural noise, or in this case, a sum of soft Gaussian primitives.
+
+**Soft Gaussian primitives** replace SDFs for volume work. A blob is `exp(−d² · k)` where `d` is some distance metric. With *anisotropic* distance `d² = (dx/rx)² + (dy/ry)² + (dz/rz)²`, the same blob morphs from sphere → bullet → cap by independently scaling `rx`, `ry`, `rz` over time.
+
+**Continuous-time morphing** beats scene switches. Every animated parameter is `smoothstep(t_beg, t_end, time)` over an *overlapping* window — fireball is still rising while the cap is starting to bulge. Quintic smootherstep `6t⁵−15t⁴+10t³` (zero 1st AND 2nd derivative at endpoints, Perlin SIGGRAPH 2002) on the most-watched parameter eliminates the visible acceleration kink at the seam.
+
+**Domain warping** (Inigo Quilez, iquilezles.org/articles/warp/) generates the boiling cloud surface texture: `fbm(p + fbm2(p) · WARP_AMP)`. The self-offset creates swirling cauliflower turbulence that pure fBm cannot.
+
+**Particle terminal velocity for ash** — without a `vy` clamp, ash accelerates indefinitely. Real particulate hits terminal velocity within a second from air drag; clamping `vy ≥ −1.6` cells/s and adding horizontal `exp(−1.4·dt)` decay produces a settling cloud that looks like real fallout, not Newtonian rocks.
+
+`raymarcher/nuke_v1.c` puts these together: one Beer–Lambert volume integrator, one anisotropic Gaussian blob morphing through the full mushroom-cloud life cycle, three particle classes sharing one struct, 2× vertical supersampling with sub-cell glyph picker for terminal display.
+
+*Files: `raymarcher/nuke_v1.c`*
+
+---
+
 *Read the code, run the programs, change one constant at a time. That is how it becomes yours.*

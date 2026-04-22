@@ -76,6 +76,7 @@ gcc -std=c11 -O2 -Wall -Wextra physics/beam_bending.c       -o beam_bending     
 gcc -std=c11 -O2 -Wall -Wextra physics/lattice_boltzman_fluid_simulator.c -o lbm_fluid -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/acoustic_wavesolver.c -o acoustic_wave -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/spectrogram_visualizer.c -o spectrogram -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/nuke.c                -o nuke              -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/rk_method_comparision.c -o rk_compare -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra robots/diff_drive_robot.c    -o diff_drive_robot       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra robots/moving_jump_spring_leg_robot.c -o moving_jump_spring_leg_robot -lncurses -lm
@@ -193,6 +194,8 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher_primitives.c -o ray_prims  
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c            -o metaballs         -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/sdf_gallery.c          -o sdf_gallery       -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/mandelbulb_explorer.c  -o mandelbulb        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/sun.c                  -o sun               -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/nuke_v1.c              -o nuke_v1           -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer       -lncurses -lm
 ```
 
@@ -270,6 +273,7 @@ gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer 
 - `acoustic_wavesolver.c`              — 2-D acoustic FDTD: leapfrog ∂²p/∂t²=c²∇²p, triple-buffer (p_old/p/p_new) O(1) pointer rotation, CFL=0.90, ASPECT_Y=2 terminal correction, sponge absorbing BC vs Dirichlet reflecting BC, zero-crossing frequency estimator, point-source monopole injection; 5 color themes
 - `spectrogram_visualizer.c`           — STFT spectrogram: Cooley-Tukey iterative radix-2 DIT FFT, bit-reversal permutation, 4 windows (Rect/Hann/Hamming/Blackman −13/−31/−41/−57 dB), 75% overlap, dB normalization, dominant frequency tracker; AM/FM/chirp/noise signal generator; scrolling time-frequency heatmap display
 - `rk_method_comparision.c`            — ODE integrator comparison: Euler (O(h), spiral instability), RK2 midpoint (O(h²)), RK4 (O(h⁴), four-stage weighted), Velocity Verlet (symplectic, no secular energy drift); harmonic oscillator + nonlinear pendulum; energy error metric; side-by-side phase portrait and energy-drift time series
+- `nuke.c`                              — 2-D shockwave demo: scalar wave PDE ∂²u/∂t² = c²∇²u − γ∂u/∂t with 5-point Laplacian; 2 substeps/frame so c can reach 84 cells/s while CFL stays ≤ 0.33; cylindrical 1/√r geometric decay × exp(-γt) damping envelope; terrain heave-and-settle ripples (per-column displacement with spring restoring force); debris arc (gravity) + drifting ground-dust particle pool; decaying sinusoidal screen-shake `SHAKE_AMP·exp(-decay·t)·sin(2π·freq·t)`; full-screen flash that fades in ~0.2 s; 6 themes (`t` to cycle), `space`/`b` re-detonate
 
 ### fractal_random/
 - `penrose.c`      — Penrose P3 rhombus tiling: de Bruijn pentagrid duality, O(1) per cell, parity-based thick/thin distinction, pentagrid edge detection for visible tile outlines (|/\-), slow rotation, 256-color warm/cool palette
@@ -333,6 +337,8 @@ gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer 
 - `raymarcher.c`        — sphere-marching SDF raymarcher: sphere + plane, Blinn-Phong, gamma correction
 - `raymarcher_cube.c`   — SDF box raymarcher: finite-difference normal, shadow ray
 - `raymarcher_primitives.c` — multiple SDF primitives (sphere, box, torus, capsule, cone…) composited with `min`/`max`
+- `sun.c`               — animated 3-D sun: noise-displaced sphere SDF + domain-warped fBm boiling surface; 8 flares with state machine (BLAST → magnetic Bézier-arch → DECAY) using `bezier_tube_dist()` over capsule SDFs smooth-unioned (smin) into the sphere; exponential corona accumulator; 1-coefficient limb-darkening law (Eddington); temperature-mapped 256-color palette; 4 themes
+- `nuke_v1.c`           — volumetric mushroom-cloud raymarcher (no SDFs): single morphing anisotropic Gaussian blob (rx grows monotonic, ry grows-then-compresses) for fireball→cap; quintic smootherstep continuous-time morph over overlapping windows; Beer–Lambert front-to-back integration with early-bail at T<0.07; 2× vertical supersampling + sub-cell glyph picker; debris/ember/ash particles (ash uses lighter gravity + horizontal exp drag + −1.6 terminal velocity); 5-second plateau then FALL phase fading the cloud and sinking the blob; 5 themes
 
 ### raytracing/
 - `sphere_raytrace.c`   — quadratic ray-sphere intersection; orbiting camera; 3-point Phong; Fresnel glass mode; 256-color; 6 themes

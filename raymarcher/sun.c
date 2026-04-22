@@ -804,6 +804,33 @@ static float arc_radius(float t)
 }
 
 /*
+ * bezier_tube_dist() — minimum SDF distance from p to a Bézier-swept tube.
+ *
+ * Approximate a curved tube by N capsule segments along the Bézier curve.
+ * Each segment uses the local arc_radius() so the tube widens at the apex
+ * and tapers at the feet. Returns the smallest capsule SDF found.
+ *
+ * Why segments instead of an analytic tube SDF? A true Bézier-tube SDF
+ * requires solving a polynomial of degree 5 — expensive. 8 capsule
+ * segments is visually indistinguishable at terminal resolution and lets
+ * us reuse the existing sdf_capsule() primitive.
+ */
+static float bezier_tube_dist(V3 p, V3 fa, V3 fb, float h, int segs)
+{
+    float best = 1e9f;
+    for (int seg = 0; seg < segs; seg++) {
+        float t0 = (float) seg      / (float)segs;
+        float t1 = (float)(seg + 1) / (float)segs;
+        V3    pa = bezier_arc(fa, fb, h, t0);
+        V3    pb = bezier_arc(fa, fb, h, t1);
+        float r  = arc_radius((t0 + t1) * 0.5f);
+        float d  = sdf_capsule(p, pa, pb, r);
+        if (d < best) best = d;
+    }
+    return best;
+}
+
+/*
  * FlareSDF — result of evaluating one flare's SDF.
  *   dist : distance to nearest flare surface
  *   ft   : flare intensity ∈ [0,1] at that surface point
@@ -836,16 +863,8 @@ static FlareSDF flare_sdf(V3 p, const Flare *f)
                            ? smoothstep(0.f, 0.25f, f->phase)
                            : 1.f;
 
-        float best_arc = 1e9f;
-        for (int seg = 0; seg < FLARE_ARC_SEGS; seg++) {
-            float t0 = (float) seg      / (float)FLARE_ARC_SEGS;
-            float t1 = (float)(seg + 1) / (float)FLARE_ARC_SEGS;
-            V3    pa = bezier_arc(f->foot_a, f->foot_b, f->height, t0);
-            V3    pb = bezier_arc(f->foot_a, f->foot_b, f->height, t1);
-            float r  = arc_radius((t0 + t1) * 0.5f);
-            float d  = sdf_capsule(p, pa, pb, r);
-            if (d < best_arc) best_arc = d;
-        }
+        float best_arc =
+            bezier_tube_dist(p, f->foot_a, f->foot_b, f->height, FLARE_ARC_SEGS);
         out.dist = best_arc;
 
         /* Only clearly-inside pixels get high ft — avoids border flicker */
@@ -1091,7 +1110,11 @@ static Pixel rm_cast(int px_col, int py_row, int cw, int ch,
             V3 N = v3norm(n);
             V3 V = v3norm(v3sub(ro, p));
             float ndv = fabsf(v3dot(N, V));
-            /* Limb darkening: edges appear ~20% cooler (N·V near 0 at limb) */
+            /* Limb darkening: photons from the limb traverse more atmosphere,
+             * so the edge of a star looks cooler/dimmer than its centre.
+             * Real model is a polynomial in μ = N·V (Eddington / Hestroffer);
+             * we use a 1-coefficient linear law u₁=0.20 — visually convincing
+             * and one fma. Ref: en.wikipedia.org/wiki/Limb_darkening      */
             float temp = sh.temp * (0.80f + 0.20f * ndv);
 
             pix.hit     = true;
@@ -1267,6 +1290,16 @@ static void renderer_draw(const Renderer *r, int cols, int rows,
 
 /* ===================================================================== */
 /* §12  screen — ncurses terminal setup / teardown                        */
+/*                                                                        */
+/* Thin ncurses wrapper. Owns terminal-side state only:                   */
+/*   - cols/rows (current viewport size)                                  */
+/*   - cursor visibility, raw-mode flags, color pairs                     */
+/*                                                                        */
+/* The renderer never calls ncurses directly; it goes through this layer. */
+/* That keeps the ncurses dependency confined to ~30 lines and makes      */
+/* swapping in SDL/raylib later a one-file job.                           */
+/*                                                                        */
+/* Ref: invisible-island.net/ncurses/man/ncurses.3x.html                  */
 /* ===================================================================== */
 
 typedef struct { int cols, rows; } Screen;

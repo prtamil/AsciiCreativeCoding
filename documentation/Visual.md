@@ -2551,6 +2551,65 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
+### raymarcher/sun.c
+*Sphere-traced sun with 8 magnetic flares + corona + limb darkening.*
+
+**Single-SDF composition** — entire visual = `sphere_radius − warped_fbm(p,t)·NOISE_AMP` smooth-unioned with up to 8 capsule flares. `smin(a,b,k) = min(a,b) − k·h²/4` polynomial blend (with `h = max(k−|a−b|, 0)/k`) hides the flare-foot crease.
+
+**Bézier-tube SDF approximation** — `bezier_tube_dist()` samples 8 capsule segments along a quadratic Bézier arc and takes the minimum. Visually identical to the analytic distance (which would require degree-5 root-finding) at one-tenth the code.
+
+**One-sided FD normals** — reuses the centre SDF value already known from the hit test, evaluating only 3 extra samples (`+ε` per axis). Halves the per-pixel cost vs. a textbook 6-sample central difference.
+
+**Eddington 1-coefficient limb darkening** — `temp *= 0.80 + 0.20·|N·V|`. Real stars look ~20% cooler at the edge because limb photons cross more atmosphere. One linear coefficient `u₁=0.20`, one fma instruction. Ref: en.wikipedia.org/wiki/Limb_darkening.
+
+**Corona accumulator** — every ray (hit or miss) accumulates `exp(−near·CORONA_SCALE)·CORONA_BRIGHT` along its path with `near = max(0, sdf)`. The soft halo emerges naturally — no separate post-process pass.
+
+**Domain-warped fBm** — `fbm(p + fbm2(p)·WARP_AMP)`. The self-offset creates swirling cauliflower granulation that pure fBm cannot. Ref: iquilezles.org/articles/warp/.
+
+**Flare state machine** — DORMANT → BLAST (`smoothstep(0,0.25)` fade-in) → ARCH → DECAY (`smoothstep(1,0)` fade-out). Each flare runs an independent clock; phase is normalised to `[0, 1)` per state.
+
+---
+
+### raymarcher/nuke_v1.c
+*Volumetric mushroom cloud — Beer–Lambert raymarching, no SDFs.*
+
+**Beer–Lambert front-to-back** — at each step `dτ = density·step·EXTINCTION`, alpha `a = 1−exp(−dτ)`, accumulate `heat += a·cloud_heat·T`, then `T *= exp(−dτ)`. Bail at `T < 0.07` (invisible contribution) — saves ~20% per pixel.
+
+**Single morphing anisotropic Gaussian blob** — `(dx/rx)² + (dy/ry)² + (dz/rz)²` distance with independent radii. `rx` grows monotonic, `ry` grows-then-compresses → sphere → bullet → cap continuously, with no "lerp pop" between distinct primitives.
+
+**Quintic smootherstep** `6t⁵−15t⁴+10t³` (zero 1st AND 2nd derivative at endpoints) on the spread parameter eliminates the visible acceleration kink at cap formation. Used for the most-watched window only; cheaper smoothstep elsewhere.
+
+**Continuous-time morph** — every animated parameter is `smoothstep(t_beg, t_end, time)` over an *overlapping* window. The fireball is still rising while the cap is starting to bulge — no scene switches, no phase transitions.
+
+**Anti-rise noise bias** — subtract `time × RISE_BIAS` from the noise lookup `y` coord. Without this the granulation pattern would slide visibly downward relative to the rising cloud, looking like the cloud is falling through static noise. The bias glues the texture to the cloud.
+
+**2× vertical supersampling + glyph picker** — two rays per terminal cell (top and bottom sub-row). The picker chooses one of 5 glyph classes — full block, top-weighted (`'`), bottom-weighted (`,`), middle (`:`), or space — recovering vertical sub-cell detail without doubling column count.
+
+**Three particle classes, one struct** — `PartType` enum in `Particle`. ASH gets `gravity × 0.35`, horizontal `exp(−1.4·dt)` drag, terminal-velocity clamp `vy ≥ −1.6` — that clamp is what makes ash look like real particulate, not Newtonian rocks.
+
+**Cloud-fade fall phase** — at `t > T_FALL_BEG`, multiply density everywhere by `(1 − fall)` while `blob_y -= fall · 1.6` and `blob_ry *= (1 − 0.55·fall)`. The whole cloud sinks and dissolves through the same field, no extra geometry.
+
+---
+
+### physics/nuke.c
+*2-D shockwave PDE coordinating ring, terrain, debris, dust, shake, flash.*
+
+**Damped scalar wave PDE** — `∂²u/∂t² = c²∇²u − γ∂u/∂t` with 5-point Laplacian, leapfrog time step. Three buffers (`u_old`, `u`, `u_new`) rotated each substep — three pointers, no copies.
+
+**CFL substepping** — `c · dt · √2 ≤ 1` is the stability ceiling. Two substeps per 60 Hz frame halve the effective `dt`, doubling the maximum stable `c` for free. Default `c = 28` gives CFL ≈ 0.33.
+
+**Two independent decay mechanisms** — geometric (cylindrical spreading, `amp ∝ 1/√r`) plus physical (damping, `amp ∝ exp(−γt)`). Combined, a ring 30 cells out is at ~40% of its initial peak.
+
+**Gaussian tap initial condition** — a delta would excite every wavenumber up to Nyquist, including the unstable ones. A Gaussian of half-width 2 cells filters out the high-frequency content the discrete Laplacian cannot represent.
+
+**Terrain ripple coupling** — per-column displacement `terrain_d[col]` reads `u` at the surface row, accumulates with a spring-restoring decay each frame. Heave-and-settle motion from one scalar field, no separate terrain physics.
+
+**Integer-cell screen shake** — applied at the `mvaddch` boundary only. The simulation never sees the shake. `shake_amp = SHAKE_AMP·exp(−SHAKE_DECAY·t)·sin(2π·SHAKE_FREQ·t)`. Sub-cell jitter would quantize to the same result anyway.
+
+**Theme rebinding** — `t` cycles 6 themes, calling `init_pair()` to rebind the same colour pair indices. The renderer never branches on theme.
+
+---
+
 ### raymarcher/metaballs.c
 *6 SDF metaballs on Lissajous orbits, smooth-min blending, curvature coloring.*
 

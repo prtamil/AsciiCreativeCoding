@@ -156,6 +156,9 @@ Reference implementation: `basics/bounce_ball.c`
 119. [ODE Integrator Comparison — physics/rk_method_comparision.c](#119-ode-integrator-comparison--physicsrk_method_comparisionc)
 120. [STFT Spectrogram — physics/spectrogram_visualizer.c](#120-stft-spectrogram--physicsspectrogram_visualizerc)
 121. [Deferred Rendering Pipeline — raster/deferred_rendering_pipeline.c](#121-deferred-rendering-pipeline--rasterdeferred_rendering_pipelinec)
+122. [2-D Shockwave Detonation — physics/nuke.c](#122-2-d-shockwave-detonation--physicsnukec)
+123. [Animated Solar Simulation — raymarcher/sun.c](#123-animated-solar-simulation--raymarchersunc)
+124. [Volumetric Mushroom Cloud — raymarcher/nuke_v1.c](#124-volumetric-mushroom-cloud--raymarchernuke_v1c)
 
 ---
 
@@ -4309,6 +4312,163 @@ The half-vector H = normalize(L̂ + V̂) is the Blinn approximation to the Phong
 **Bayer 4×4 dithering:** Before mapping luminance to an ASCII character, a spatially-varying threshold from a 4×4 Bayer matrix is added. This converts the continuous luminance into a spatially dithered binary pattern that approximates the original grey level — the same technique used in early print halftoning and Game Boy LCD shading.
 
 *Files: `raster/deferred_rendering_pipeline.c`*
+
+---
+
+## 122. 2-D Shockwave Detonation — physics/nuke.c
+
+A 2-D scalar wave PDE driving a coordinated visual: ring shockwave, terrain heave, debris arc, dust drift, screen shake, full-screen flash. Every surface element is derived from one field — the pressure scalar `u(x,y,t)`.
+
+**Wave equation:**
+```
+∂²u/∂t² = c²∇²u − γ ∂u/∂t
+```
+discretised with a 5-point Laplacian and a leapfrog timestep. The `−γ ∂u/∂t` term models damping (energy → heat). Initial condition is a tight Gaussian tap centred just above the terrain.
+
+**CFL stability:** `c · dt · √2 ≤ 1`. With 2 substeps per 60 Hz frame the effective `dt` is `1/120 s`, so the stable wave-speed ceiling is 84 cells/s. Default `c = 28` gives CFL ≈ 0.33 — comfortably stable. The substep idea is a free 2× headroom on `c` for no extra render cost.
+
+**Energy decay** combines two independent mechanisms:
+- **Geometric (cylindrical spreading):** `amp ∝ 1/√r`. Total ring energy is conserved while the circumference grows linearly.
+- **Physical (damping):** `amp ∝ exp(−γt)`. Energy lost per second is `γ × E`.
+
+Combined, a ring 30 cells out has ~40% of its initial peak under default constants.
+
+**Terrain coupling:** A 1-D `terrain_d[col]` array stores per-column displacement. Each column reads `u` at its terrain-surface row, injects it into `terrain_d[col]`, and then decays toward zero with a spring-restoring multiplier each frame. The result is heave-and-settle motion — the soil briefly bulges where the wave passes, then dampens out.
+
+**Particle pools:** One `Particle` struct serves both DEBRIS (radial burst from the blast point, gravity-pulled) and DUST (slow ground particles spawned at terrain rows as the ring sweeps past, drifting laterally + slow upward).
+
+**Screen shake:** Integer cell offset applied at the `mvaddch` boundary only — the simulation never sees the shake. Magnitude `SHAKE_AMP × exp(−SHAKE_DECAY × t_since_blast)`, oscillating at `SHAKE_FREQ`.
+
+**Themes (6):** Atomic / Plasma / Inferno / Acid / Arctic / Mono. `t` cycles them; `init_pair()` re-binds the same colour pair indices each switch so the renderer never branches on theme.
+
+*Files: `physics/nuke.c`*
+
+---
+
+## 123. Animated Solar Simulation — raymarcher/sun.c
+
+A 3-D sphere-traced sun with churning surface, eight magnetic flares, and exponential corona. The whole visual collapses to one SDF (`sdf_sun`) plus one noise (`warped_fbm`).
+
+**SDF composition:**
+```
+sdf_sun(p, t) = (sphere_radius − warped_fbm(p, t) × NOISE_AMP)
+              ⊕  smin_over_flares(p)
+```
+where `smin(a, b, k) = min(a, b) − k·h²/4` (polynomial smooth minimum) makes the flare foot melt into the sphere with no visible crease.
+
+**Sphere tracing:** Step along the ray by `f(p)` — guaranteed-safe because the SDF is the shortest distance to the surface. Hit when `f(p) < HIT_EPS`; miss when accumulated `t > MAX_T`. Empty space → big steps, surface vicinity → tiny steps. Average ~25 evaluations per ray.
+
+**One-sided FD normals:** Reuse the centre-sample SDF from the hit test, and only evaluate three more samples (`+ε` on each axis). Halves the per-pixel cost vs. the textbook 6-sample central difference.
+
+**Flare state machine** (per flare, independent clock):
+
+| State | Visual |
+|---|---|
+| DORMANT | invisible |
+| BLAST (~0.5 s) | white-hot point + sparks fading in (`smoothstep(0, 0.25, phase)`) |
+| ARCH (~3 s) | Bézier-arched magnetic loop from `foot_a` to `foot_b`, peak intensity |
+| DECAY (~2 s) | fade to dormant (`smoothstep(1, 0, phase)`) |
+
+**Bézier tube SDF** (`bezier_tube_dist()`): The analytic distance to a quadratic Bézier curve needs a degree-5 polynomial root finder. Instead, sample 8 segments and take the minimum `sdf_capsule(p, pa, pb, r)` — visually identical, one tenth the code:
+```c
+float bezier_tube_dist(p, fa, fb, h, segs):
+    best = ∞
+    for seg in 0..segs:
+        pa = bezier_arc(fa, fb, h, seg / segs)
+        pb = bezier_arc(fa, fb, h, (seg+1) / segs)
+        d  = sdf_capsule(p, pa, pb, arc_radius((seg+0.5)/segs))
+        if d < best: best = d
+    return best
+```
+
+**Limb darkening** (Eddington 1-coefficient law, ref: Wikipedia):
+```c
+ndv  = |dot(N, V)|                       /* μ = N · V */
+temp = sh.temp * (0.80 + 0.20 * ndv)     /* edge ~20% cooler */
+```
+A real star's edge looks cooler/dimmer because photons there traverse more atmosphere. One linear coefficient `u₁ = 0.20`, one fma instruction.
+
+**Corona** is accumulated along every ray (hit or miss):
+```
+corona += exp(−near · CORONA_SCALE) · CORONA_BRIGHT · CORONA_WEIGHT
+```
+where `near = max(0, sdf_value)`. Close points contribute heavily; far points fall off exponentially. The soft halo emerges naturally — no separate post-process pass.
+
+**Themes (4):** Solar / Plasma / Toxic / Arctic. Each pairs a sun temperature ramp with a complementary flare colour.
+
+*Files: `raymarcher/sun.c`*
+
+---
+
+## 124. Volumetric Mushroom Cloud — raymarcher/nuke_v1.c
+
+High-fidelity nuclear blast — pure volumetric raymarching, no SDFs. The mushroom is a sum of soft Gaussian density blobs with anisotropic distance, morphing through one continuous time line.
+
+**Beer–Lambert integrator** (front-to-back):
+```
+T = 1
+heat = 0
+for each step along ray:
+    dτ = density(p) · step · EXTINCTION
+    a  = 1 − exp(−dτ)
+    heat += a · cloud_heat(p) · T
+    T    *= exp(−dτ)
+    if T < 0.07: break              /* invisible contribution */
+```
+`T` is remaining transmittance. `(1 − exp(−dτ)) · T` correctly weights front-most cloud over back cloud. Bailing at `T < 0.07` saves ~20% of per-pixel cost for no visible change.
+
+**Single morphing blob** (anisotropic distance):
+```c
+ellipsoid_dn2(p, c, rx, ry, rz):
+    return (dx/rx)² + (dy/ry)² + (dz/rz)²
+gauss = exp(−dn² · k)
+```
+`rx` (horizontal) grows monotonically; `ry` (vertical) grows then compresses. The same primitive becomes sphere → bullet → cap continuously, with no "lerp pop" between distinct shapes.
+
+**Continuous-time morph** — every animated parameter is `smoothstep(t_beg, t_end, time)` over an *overlapping* window. Quintic smootherstep `6t⁵−15t⁴+10t³` (zero 1st AND 2nd derivative at endpoints) on the spread parameter eliminates the visible acceleration kink at cap formation:
+```c
+static inline float smootherstep(float e0, float e1, float x) {
+    float t = clmpf((x - e0) / (e1 - e0), 0.f, 1.f);
+    return t * t * t * (t * (t * 6.f - 15.f) + 10.f);
+}
+```
+
+**Phase timeline** (continuous, no branches):
+
+| Window | Event |
+|---|---|
+| 0 – 3.6 s | RISE — fireball blob accelerates upward |
+| 3.0 – 8.0 s | SPREAD — `rx` grows, `ry` flattens (cap forms) |
+| 4.0 – 8.4 s | VORTEX ring intensifies |
+| 4.7 – 8.6 s | SKIRT ring of secondary turbulence |
+| 5.8 – 9.0 s | PYROCUMULUS noise layer ramps in |
+| 9.0 – 12 s | PLATEAU — full mushroom holds |
+| 12 – 16.5 s | FALL — `cloud_fade` multiplier kills density, `blob_y -= fall · 1.6`, ash spawns |
+| 20.5 s | DEACTIVATE — eligible for re-detonation |
+
+**Domain-warped fBm** (Inigo Quilez):
+```
+warped_fbm(p, t) = fbm(p + fbm2(p) · WARP_AMP)
+```
+The self-offset creates swirling cauliflower turbulence that pure fBm cannot — the boiling cloud surface texture.
+
+**Anti-rise bias** on noise lookup: subtract `time × RISE_BIAS` from the `y` coord before noise sampling. Without this the granulation pattern would slide downward relative to the rising cloud, looking like the cloud is falling through static noise. The bias glues the texture to the cloud.
+
+**Three particle classes** sharing one `Particle` struct:
+
+| Type | Forces |
+|---|---|
+| DEBRIS | full gravity, no drag, fast radial burst |
+| EMBER | gravity, slight upward bias from heat |
+| ASH | gravity × 0.35; horizontal `exp(−1.4 · dt)` drag; terminal velocity clamp `vy ≥ −1.6` |
+
+The terminal-velocity clamp is what makes ash look like real particulate suspension instead of Newtonian rocks.
+
+**2× vertical supersampling + glyph picker:** Two rays per terminal cell — top sub-row and bottom sub-row. The picker chooses a glyph that approximates the pair: full block, top-weighted (`'`), bottom-weighted (`,`), middle (`:`), or space. Recovers vertical sub-cell detail without doubling column count.
+
+**Themes (5):** Realistic / Matrix / Ocean / Nova / Toxic. Each is a paired smoke palette (32 entries) + fire palette (16 entries). `t` cycles.
+
+*Files: `raymarcher/nuke_v1.c`*
 
 ---
 

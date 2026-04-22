@@ -1341,3 +1341,82 @@ The Bayer matrix spatial threshold converts the continuous luminance into a pseu
 Color pairs map to material properties from RT2 (albedo): the albedo color index is used to select the ncurses color pair, so different objects (lit by the same lights) retain their surface color while sharing the same brightness logic.
 
 **Effect:** Smooth Phong shading gradients appear as natural-looking ASCII halftones. The cube shows hard-edge transitions between faces; the sphere shows smooth gradients from highlight to shadow — all from the same rendering code, driven by the flat vs smooth normal distinction.
+
+---
+
+## 28. Temperature-Mapped Stellar Palette with Limb Darkening (sun.c)
+
+A solar surface needs a colour ramp that matches blackbody radiation: a single scalar `temp ∈ [0, 1]` should map to white-hot core → yellow → orange → red → maroon edge. The Eddington 1-coefficient limb-darkening law dims the limb by ~20% before the colour lookup, so the edge palette entries get hit naturally without any special "edge" branch.
+
+```c
+/* §11 renderer (per pixel) */
+float ndv  = fabsf(v3dot(N, V));            /* μ = N · V */
+float temp = sh.temp * (0.80f + 0.20f * ndv);  /* edge ~20% cooler */
+int   pi   = (int)(temp * (PALETTE_N - 1));
+attron(COLOR_PAIR(theme[active].sun[pi]));
+```
+
+**Why one float instead of RGB:** A single temperature feeds through the entire pipeline — fbm temperature, flare contribution, limb darkening, corona accumulator — composing as scalar multiplications. RGB would triple the bookkeeping for no visual gain at 256-colour terminal resolution.
+
+**Theme rebinding for live switches:** 4 themes (Solar, Plasma, Toxic, Arctic) each define a 16-entry sun ramp + complementary flare colour. `t` cycles `active`; `init_pair()` rebinds the same colour-pair indices to the new theme. The hot loop in `canvas_draw` never branches on theme.
+
+**Corona accumulator** writes into a separate brightness band so the palette stays clean. Hits use the `sun_pair[]` ramp; misses with `corona_acc > 0` use the `halo_pair[]` ramp; the boundary is handled by additive blending in the brightness char picker.
+
+*Files: `raymarcher/sun.c`*
+
+---
+
+## 29. Dual-Palette Smoke + Fire — Volumetric Cloud (nuke_v1.c)
+
+A mushroom cloud has two distinct colour regimes: cold smoke (greys/dark colours, the bulk of the cloud) and hot fire (white-yellow-red, the molten core and heated edges). The volumetric integrator tracks both `smoke` (transparency-weighted density) and `heat` (transparency-weighted core emission) as separate accumulators; the colour pair is chosen at draw time:
+
+```c
+if (px.heat > FIRE_THRESHOLD)
+    pair = fire_pair[ (int)(px.heat * (FIRE_PALETTE_N - 1)) ];
+else
+    pair = smoke_pair[ (int)(px.smoke * (SMOKE_PALETTE_N - 1)) ];
+```
+
+**Per-theme paired palettes:** Each of 5 themes defines a 32-entry smoke palette + 16-entry fire palette tuned to share a perceptual midpoint, so the smoke-to-fire boundary in the colour ramp is invisible. Realistic uses greys → white-yellow-red; Matrix uses dark greens → white-green; Ocean uses indigo-teal → white-cyan; Nova uses violet-magenta → white-pink; Toxic uses dark olive-lime → white-yellow.
+
+**Pair count:** 5 × (32 + 16) = 240 colour pairs per session. ncurses on most terminals supports 256 colour pairs; this fits with margin.
+
+**Why the threshold and not a smooth blend:** A smooth heat→smoke blend produces muddy intermediate colours that don't read as either fire or smoke. The hard threshold (with the `FIRE_THRESHOLD` tuned per theme) gives crisp visual layering — bright fire core surrounded by clearly-smoke edges.
+
+**Glyph picker is independent of palette:** The 2× vertical supersampling and sub-cell glyph picker run on `(top.heat + top.smoke, bottom.heat + bottom.smoke)` totals — the picker doesn't care which palette will be used. Decoupling glyph selection from colour selection keeps both pieces simple.
+
+*Files: `raymarcher/nuke_v1.c`*
+
+---
+
+## 30. Signed-Pressure Theme with Flash Overlay (nuke.c)
+
+A 2-D shockwave field has signed amplitude (positive overpressure peak, negative rarefaction trough). The colour map needs to encode sign (which colour ramp) and magnitude (which entry within the ramp) without losing either signal. The flash overlay is a separate full-screen white tint that decays exponentially from detonation.
+
+**Signed colour map:**
+```c
+float a = fabsf(u);
+int   pi = (int)(clmpf(a / WAVE_AMP, 0, 1) * (RAMP_N - 1));
+short pair = (u >= 0) ? theme.peak[pi] : theme.trough[pi];
+mvaddch(row + shake_r, col + shake_c, '#' | COLOR_PAIR(pair));
+```
+
+The `peak[]` ramp uses the theme's hot colours (yellow → orange → red for Atomic); the `trough[]` ramp uses cool/dark colours (cyan → blue → black). Visually the ring shows a bright peak with a dark following edge, exactly the N-wave shape of a real shock.
+
+**Flash overlay** is applied per-cell after the wave colour:
+```c
+if (flash_alpha > 0.05f) {
+    /* lerp current pair toward FLASH_PAIR (white) */
+    if (rand_unit() < flash_alpha)
+        mvaddch(row, col, ' ' | COLOR_PAIR(CP_FLASH));
+}
+flash_alpha *= FLASH_DECAY;     /* ~0.2 s to invisible */
+```
+
+The stochastic per-cell substitution gives a natural "fading away" feel, since the random density drops with `flash_alpha` — at 0.5 alpha, half the cells are still flashed; at 0.1 alpha, only 10%.
+
+**Theme rebinding:** 6 themes (Atomic, Plasma, Inferno, Acid, Arctic, Mono). Each theme defines `peak[8]`, `trough[8]`, terrain `[4]`, particle `[4]`, plus the always-white `CP_FLASH`. `t` rebinds via `init_pair()` — the renderer never branches on theme.
+
+**Screen shake interacts with colour at the `mvaddch` boundary only:** the colour pair is selected from the unshaken physics, then the destination cell is offset by `(shake_r, shake_c)`. The simulation never sees the shake; the colour never sees the shake; only the final `mvaddch` knows.
+
+*Files: `physics/nuke.c`*

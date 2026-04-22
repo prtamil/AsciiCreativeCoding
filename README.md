@@ -9,7 +9,7 @@
 ╚═╝     ╚═╝    ╚═╝     ╚═════╝   ╚═╝  ╚═╝   Make Terminal Great Again
 ```
 
-173 simulations. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
+176 simulations. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -65,6 +65,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `gyroscope` | 3D rigid-body gyroscope — quaternion orientation (no gimbal lock), Gram-Schmidt re-ortho safeguard; 3 presets: Euler's Top (torque-free symmetric, angular momentum cone), Gravity Top (precession + nutation, wobble tightens with spin), Dzhanibekov (asymmetric torque-free, flip instability) |
 | `spring_pendulum` | Spring pendulum — Lagrangian polar-coordinate EOM (r, θ); energy exchange resonance when ω_spring ≈ 2×ω_pendulum; rosette path tracing |
 | `2stroke` | 2-stroke engine animation — slider-crank kinematics; crank/connecting-rod/piston geometry per θ; exhaust + transfer ports open/close; TDC spark; real-time cycle phase label |
+| `nuke` | 2D shockwave demo — scalar wave PDE (∂²u/∂t² = c²∇²u − γ∂u/∂t) with 5-point Laplacian, CFL-stable substepping (CFL ≈ 0.33); cylindrical 1/√r decay + γ damping; terrain heave-and-settle ripples; debris arc + ground-dust pool; decaying sinusoidal screen shake; full-screen flash; 6 themes (`t` to cycle) |
 | `beam_bending` | Euler-Bernoulli beam — 9 BC×load combos; analytical w(x) + M(x); curvature-shaded ASCII render + moment panel; dynamic modal superposition (4 eigenmodes, exact damped transition matrix) |
 | `diff_drive_robot` | Differential drive robot — nonholonomic kinematics; pixel-space Euler integration; trail ring buffer; heading + wheel velocity arrows drawn with `.o0` dot progression |
 
@@ -110,6 +111,8 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `displace_raster` | Real-time vertex displacement, central-difference normal recompute |
 | `donut` | Parametric torus projection — the original spinning donut |
 | `wireframe` | 3D Bresenham edge projection, slope-to-character line drawing |
+| `sun` | 3D solar simulation — noise-displaced sphere SDF + domain-warped fBm boiling surface; 8 flares (blast → magnetic Bézier-arch → decay state machine, capsule SDFs smooth-unioned via smin); exponential corona accumulator; limb darkening (1-coefficient law); temperature-mapped 256-color palette; 4 themes |
+| `nuke_v1` | Volumetric mushroom cloud — Beer–Lambert raymarched volume (no SDFs); single morphing anisotropic Gaussian blob (rx grows monotonic, ry grows-then-compresses) for fireball→cap; quintic smootherstep continuous-time morph; domain-warped fBm + value noise displacement; 2× vertical supersampling with sub-cell glyph picker; debris/ember/ash particles with air-drag terminal velocity; 5-second plateau then fall-collapse phase; 5 themes |
 
 ### Analytic Ray Tracing
 | Program | Algorithm |
@@ -266,10 +269,14 @@ See `Claude.md` for the complete build list.
 ├── robots/            — advanced robot simulations (bipedal walk cycle, self-balancing bot)
 ├── ncurses_basics/    — framework reference implementations
 └── documentation/
-    ├── Claude.md          — complete build reference
+    ├── Architecture.md    — full framework + per-program architecture write-ups
+    ├── Visual.md          — every visual technique (rendering, shading, palettes)
+    ├── Master.md          — mastery roadmap and study notes
+    ├── Framework.md       — base ncurses framework anatomy
+    ├── COLOR.md           — color theory, 256-color usage, theme design
     └── learning/
         ├── ROADMAP.md         — 6-tier study order, 2-year plan
-        └── concept_*.md       — 104 deep-dive concept files
+        └── concept_*.md       — 146 deep-dive concept files
                                  (math → pseudocode → implementation notes)
 ```
 
@@ -277,7 +284,7 @@ See `Claude.md` for the complete build list.
 
 ## Documentation
 
-`documentation/learning/` contains 104 concept files — one per program. Each file has two passes:
+`documentation/learning/` contains 146 concept files — one per program. Each file has two passes:
 
 - **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
 - **Pass 2** — pseudocode, module map, data flow diagram, core loop

@@ -1,6 +1,6 @@
 # Learning Roadmap — ASCII Creative Coding
 
-151 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
+176 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
 and the 2-year breakdown. Do not skip layers.
 
 ---
@@ -118,6 +118,7 @@ Requires partial differential equations and numerical stability.
 | `lattice_gas.c` | FHP-I lattice gas | 6-dir bit-packed hex, collision lookup table, streaming + bounce-back, Navier-Stokes emerges |
 | `wave.c` | 1D/2D wave PDE | FDTD, CFL condition |
 | `wave_2d.c` | 2D wave PDE | Huygens, interference |
+| `nuke.c` | 2D shockwave | scalar wave PDE + cylindrical 1/√r decay + γ damping; CFL substepping; terrain ripple coupling; debris/dust particles; decaying screen shake |
 | `reaction_diffusion.c` | Gray-Scott | Laplacian, diffusion |
 | `sand.c` | Cellular automaton | simple rules |
 | `flowfield.c` | Vector field | fBm Perlin noise |
@@ -172,6 +173,8 @@ Requires linear algebra and graphics pipeline understanding.
 | `mandelbulb_raster.c` | Fractal rasterization | sphere projection tessellation, HSV fragment shaders, rgb_to_cell 216-color, frag_phong_hue / frag_normals / frag_depth_hue |
 | `sdf_gallery.c` | SDF composition gallery | boolean ops min/max, smin polynomial blend, twist pre-warp, domain repetition, 5 scenes, 3 lighting modes (N·V/Phong/Flat), gamma-encoded Bourke ramp, bright hue-varying themes |
 | `path_tracer.c` | Monte Carlo path tracing | Lambertian BRDF, cosine hemisphere sampling (Malley), Russian roulette, progressive accumulator, Reinhard tone map, Cornell Box, xorshift32 RNG |
+| `sun.c` | Animated solar SDF + flares | sphere-trace SDF, value-noise + warped fBm displacement, capsule flare smin-blend, `bezier_tube_dist()` Bézier-arched magnetic loops, exponential corona accumulator, Eddington 1-coefficient limb darkening |
+| `nuke_v1.c` | Volumetric mushroom cloud | Beer–Lambert front-to-back integrator (no SDFs), single morphing anisotropic Gaussian blob, quintic smootherstep continuous-time morph over overlapping windows, domain-warped fBm displacement, 2× vertical supersampling + sub-cell glyph picker, ash terminal-velocity drag, plateau→fall phase fade |
 
 ---
 

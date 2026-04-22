@@ -197,6 +197,9 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/mandelbulb_explorer.c  -o mandelbulb  
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/sun.c                  -o sun               -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/nuke_v1.c              -o nuke_v1           -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer       -lncurses -lm
+
+# ── turtle ───────────────────────────────────────────────────────────────
+gcc -std=c11 -O2 -Wall -Wextra turtle/duo_poly.c                 -o duo_poly          -lncurses -lm
 ```
 
 ---
@@ -345,6 +348,9 @@ gcc -std=c11 -O2 -Wall -Wextra raytracing/path_tracer.c          -o path_tracer 
 - `cube_raytrace.c`     — AABB slab method; inverse-rotation ray transform; face-normal colour; pixel-perfect wireframe; 6 themes
 - `torus_raytrace.c`    — quartic intersection via sampling+bisection; gradient normal; Fresnel; 6 themes
 - `capsule_raytrace.c`  — cylinder body + hemisphere caps (IQ method); axial-projection body normal / sphere cap normal; inverse-rotation transform; 6 themes
+
+### turtle/
+- `duo_poly.c` — dual turtle polygon animator: two turtles (cyan A / magenta B) simultaneously draw regular polygons step-by-step in the terminal; each sim tick advances one edge per turtle; head `@` marks current pen position; line chars (`- | / \`) reflect true edge heading; aspect-corrected Y via CELL_W/CELL_H=0.5 so polygons look visually round/square; auto-cycle: both polygons gain +1 side after 2 s hold (3→4→…→12→3); `a/z` A sides, `s/x` B sides, `+/-` drawing speed (eps), `r` reset, `spc` pause; framework.c §1–§8 structure
 
 ---
 

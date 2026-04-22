@@ -33,6 +33,7 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `koch.c` | L-system | recursive subdivision |
 | `dragon_curve.c` | L-system | iterative string rewrite |
 | `l_system.c` | General L-system | production rules |
+| `duo_poly.c` | Turtle graphics — dual polygon animator | regular polygon vertex angles θ_k = θ₀ + k·(2π/n), aspect-corrected Y, DDA segment fill, edge timer |
 | `lissajous.c` | Parametric curves | sin/cos phase |
 | `spirograph.c` | Hypotrochoid | parametric gear math |
 | `string_art.c` | Modular arithmetic | i → round(i×k) mod N |

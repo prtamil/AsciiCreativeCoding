@@ -9,7 +9,7 @@
 ╚═╝     ╚═╝    ╚═╝     ╚═════╝   ╚═╝  ╚═╝   Make Terminal Great Again
 ```
 
-176 simulations. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
+177 simulations. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -132,6 +132,11 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 | `wator` | Wa-Tor predator-prey ecosystem |
 | `network_sim` | SIR epidemic + spring-force graph layout |
 | `slime_mold` | Physarum polycephalum — Jeff Jones (2010) agent model; 3-sensor sense→rotate→move→deposit loop; double-buffered trail diffusion + decay; emergent minimum Steiner tree networks connecting food sources; 4 presets, 5 themes |
+
+### Turtle Graphics
+| Program | Algorithm |
+|---------|-----------|
+| `duo_poly` | Dual turtle polygon animator — two turtles (cyan A / magenta B) draw regular polygons step-by-step; each tick advances one edge; aspect-corrected Y keeps shapes visually round; auto-cycles 3→12 sides; `a/z` `s/x` sides, `+/-` speed |
 
 ### Geometry
 | Program | Algorithm |
@@ -267,6 +272,7 @@ See `Claude.md` for the complete build list.
 ├── raytracing/        — analytic ray tracing (sphere, cube, torus, capsule)
 ├── animation/         — kinematics, IK solvers, legged locomotion
 ├── robots/            — advanced robot simulations (bipedal walk cycle, self-balancing bot)
+├── turtle/            — turtle graphics programs (polygon animators, path drawing)
 ├── ncurses_basics/    — framework reference implementations
 └── documentation/
     ├── Architecture.md    — full framework + per-program architecture write-ups

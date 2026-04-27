@@ -1,6 +1,6 @@
 # Learning Roadmap — ASCII Creative Coding
 
-176 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
+180 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
 and the 2-year breakdown. Do not skip layers.
 
 ---
@@ -200,6 +200,9 @@ Agent-based simulation, graph algorithms, complex systems.
 | `sort_vis.c` | Algorithms | bubble/insertion/selection/quick/heap |
 | `forest_fire.c` | Drossel-Schwabl CA | 3-state probabilistic update, neighbour spread + lightning, SOC power-law fire sizes |
 | `slime_mold.c` | Physarum agent model | Jeff Jones (2010) sense-rotate-move-deposit, trail diffusion + decay, emergent Steiner networks |
+| `crowd.c` | Reynolds steering crowd | 6 behaviours (WANDER/FLOCK/PANIC/GATHER/FOLLOW/QUEUE); seek/flee/separate/align/cohesion; momentum-based steering; `force = desired_vel − current_vel` |
+| `war.c` | Battle simulation FSM | 4-state FSM (ADVANCE/COMBAT/FLEE/DEAD); travelling projectile arrows; flat pool; 6 live StrategyParams presets via g_sp pointer |
+| `swarm_gen_numbers.c` | Swarm digit formation | 10 strategies; greedy slot assignment O(N×S); steer_arrive deceleration; steer_spring Hooke's law; SEP_BASE_FORCE independence; force balance design |
 
 ---
 

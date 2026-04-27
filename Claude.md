@@ -29,8 +29,11 @@ gcc -std=c11 -O2 -Wall -Wextra particle_systems/kaboom.c       -o kaboom        
 gcc -std=c11 -O2 -Wall -Wextra particle_systems/constellation.c -o constellation -lncurses -lm
 
 # ── flocking ─────────────────────────────────────────────────────────────
-gcc -std=c11 -O2 -Wall -Wextra flocking/flocking.c             -o flocking      -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra flocking/shepherd.c             -o shepherd      -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra flocking/flocking.c             -o flocking          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra flocking/shepherd.c             -o shepherd          -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra flocking/crowd.c                -o crowd             -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra flocking/war.c                  -o war               -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra flocking/swarm_gen_numbers.c    -o swarm_gen_numbers -lncurses -lm
 
 # ── fluid / grid sims ────────────────────────────────────────────────────
 gcc -std=c11 -O2 -Wall -Wextra fluid/sand.c                    -o sand                -lncurses -lm
@@ -245,6 +248,9 @@ gcc -std=c11 -O2 -Wall -Wextra turtle/duo_poly.c                 -o duo_poly    
 ### flocking/
 - `flocking.c`          — boid flocking: 3 flock groups, 5 switchable modes (classic boids, leader chase, Vicsek, orbit, predator-prey), toroidal wrap, cosine palette color cycling, `A_BOLD` proximity halo
 - `shepherd.c`          — shepherd herding sim: user-controlled `#` shepherd moves with arrow keys; sheep flock with boids (separation+alignment+cohesion) and flee when shepherd enters FLEE_RADIUS; sheep chars `o`(calm) `<>^v/\`(moving) `O`(fleeing); bounced boundaries so sheep can be cornered; dotted flee-radius ring toggle (`f`)
+- `crowd.c`             — Reynolds steering crowd: up to 150 agents; 6 live-switchable behaviours (`1`=WANDER seek random target, `2`=FLOCK classic boids, `3`=PANIC flee roaming `!` threat, `4`=GATHER seek screen centre, `5`=FOLLOW index-chain snake, `6`=QUEUE orderly right-edge line); `+/-` add/remove 5 agents; fixed-timestep accumulator + render interpolation; 8-section §1–§8 framework layout
+- `war.c`               — two-faction battle (GONDOR cyan vs MORDOR red): melee warriors + `@`/`%` archers; archer fires `-` projectile arrows (flat pool 80, ARROW_TRAVEL_SPD=220 px/s, ARROW_HIT_DIST=14 px, deal damage on contact); 4-state FSM per unit (ADVANCE/COMBAT/FLEE/DEAD); two-pass render (arrows → corpses → warriors → HUD); 6 StrategyParams presets (STANDARD/BERSERKER/SHIELD WALL/GUERRILLA/ARCHER FOCUS/CHAOS) live-switched with `1`–`6` via `g_sp` pointer; `g/m` add units
+- `swarm_gen_numbers.c` — Reynolds steering digit swarm: 25 agents form digits 0–9; greedy nearest-slot O(N×S) assignment; SEP_BASE_FORCE=60 fixed (not arrive_speed — prevents scattering); 10 strategies n/p cycle (DRIFT wander-fade/RUSH sprint/FLOW rightward-stream/ORBIT centroid-spiral/FLOCK boids/PULSE breathing/VORTEX per-slot-orbit/GRAVITY downward-bias/SPRING Hooke's law ζ≈0.53/WAVE lateral-sine); steer_spring() Hooke's law helper; sub-tick alpha interpolation; `0`–`9` digit keys; `a` auto-cycle
 
 ### fluid/
 - `sand.c`                  — falling sand CA

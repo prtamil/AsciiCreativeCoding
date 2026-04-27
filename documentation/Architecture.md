@@ -4472,4 +4472,91 @@ The terminal-velocity clamp is what makes ash look like real particulate suspens
 
 ---
 
+## 125. Swarm Digit Simulator — flocking/swarm_gen_numbers.c
+
+25 ASCII agents coordinate through Reynolds steering behaviours to form the shapes of digits 0–9 on screen. A 5×7 bitmap template is scaled and centred; each `#` becomes one pixel-space Slot. Each agent is greedily assigned its nearest unoccupied slot (O(N·S)); agents beyond the slot count wander freely.
+
+### Physics Loop
+
+Fixed-step accumulator (60 Hz); sub-tick alpha interpolation (`draw_pos = prev + (pos − prev) × α`) eliminates stutter between ticks.
+
+### Slot Assignment
+
+For each agent in index order, find the nearest unoccupied slot and mark it taken. O(N×S), N=25, S≤17. Not globally optimal but converges naturally and looks organic.
+
+### Force Balance Rule
+
+`arrive_speed × slot_weight` must dominate all other forces. Separation force uses a fixed base (SEP_BASE_FORCE=60 px/s, NOT arrive_speed) so it doesn't scale explosively between strategies.
+
+### Ten Strategies (live-switch with n/p)
+
+| # | Name | Mechanism |
+|---|------|-----------|
+| 1 | DRIFT | Brownian wander + gentle slot-arrive; wander fades inside 55 px of slot |
+| 2 | RUSH | Direct arrive sprint, no wander; sharp digit formation |
+| 3 | FLOW | Rightward current until aligned with slot x, then slot-arrive takes over |
+| 4 | ORBIT | Orbit digit centroid tangentially while arrive pulls toward slot — spiral collapse |
+| 5 | FLOCK | Reynolds boids (cohesion + alignment + separation) guided by weak slot force |
+| 6 | PULSE | Oscillating target = slot + centroid→slot direction × sin(2πft) × amplitude |
+| 7 | VORTEX | Per-slot spiral: orbit own slot with tangent force that fades at slot |
+| 8 | GRAVITY | Constant downward force + slot-arrive; agents rain into position |
+| 9 | SPRING | Hooke's law F = k(slot−pos) − c·vel; ζ≈0.53, underdamped → bouncy settle |
+| 10 | WAVE | Lateral sine perpendicular to approach; amplitude ramps then fades at slot |
+
+*Files: `flocking/swarm_gen_numbers.c`*
+
+---
+
+## 126. Two-Faction Battle Simulator — flocking/war.c
+
+GONDOR (cyan uppercase + green `@` archers) vs MORDOR (red lowercase + orange `%` archers). Two unit types share a 4-state FSM: ADVANCE → COMBAT → FLEE → (back to ADVANCE); HP=0 → DEAD.
+
+### Archer Projectile System
+
+Archers do not deal instant damage. When the shoot timer fires, they spawn a `-` Arrow struct with `vel = normalise(target_pos − archer_pos) × ARROW_TRAVEL_SPD`. Each tick arrows integrate position; any arrow within ARROW_HIT_DIST=14 px of its target deals damage and deactivates. Flat pool of 80 arrows, append-only to avoid aliasing.
+
+### Two-Pass Rendering
+
+Arrows drawn first (lowest z), then corpses, then living warriors, then HUD. This ensures projectiles never overwrite unit glyphs.
+
+### Six Battle Strategies (live-switch 1–6)
+
+| # | Name | Character |
+|---|------|-----------|
+| 1 | STANDARD | Balanced advance, engage at moderate range, flee at low HP |
+| 2 | BERSERKER | No routing, fast attacks, tight melee rush |
+| 3 | SHIELD WALL | Slow tight ranks, high separation, long archer range |
+| 4 | GUERRILLA | Hit-and-run, early flee, quick rally, highly mobile archers |
+| 5 | ARCHER FOCUS | Extended arrow range, rapid fire, archers hold deep |
+| 6 | CHAOS | Sprint, ignore formation, brawl to the death |
+
+Each strategy is a `StrategyParams` struct; `g_sp` pointer switches live on keypress so the very next tick uses new values.
+
+*Files: `flocking/war.c`*
+
+---
+
+## 127. Crowd Behaviour Simulator — flocking/crowd.c
+
+N agents (5–150) move under one of six switchable crowd behaviours. All six use the same Euler-integrated physics loop: `force = weighted sum of steering forces`, `vel += force·dt`, `vel = clamp(|vel|, SPEED_MAX)`, `pos += vel·dt`.
+
+### Six Behaviours
+
+| Key | Name | Forces |
+|-----|------|--------|
+| 1 | WANDER | Seek random target + separation |
+| 2 | FLOCK | Classic boids: separation + alignment + cohesion |
+| 3 | PANIC | Flee a roaming `!` threat; flee force overrides cohesion |
+| 4 | GATHER | Seek screen centre + separation |
+| 5 | FOLLOW | Chain-follow leader `@`; each agent seeks the one ahead |
+| 6 | QUEUE | Orderly line to right-edge counter; agents sort into a queue |
+
+### Seek Force
+
+`desired = normalise(target − pos) × speed`, `force = desired − vel`. Subtracting current velocity means force → 0 when already at full speed toward target — natural deceleration for free.
+
+*Files: `flocking/crowd.c`*
+
+---
+
 *This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `physics/bounce_ball.c`.*

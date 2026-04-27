@@ -9,7 +9,7 @@
 ╚═╝     ╚═╝    ╚═╝     ╚═════╝   ╚═╝  ╚═╝   Make Terminal Great Again
 ```
 
-177 simulations. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
+180 simulations. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -128,6 +128,9 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 |---------|-----------|
 | `flocking` | Reynolds boids — 5 modes (classic/leader/Vicsek/orbit/predator-prey) |
 | `shepherd` | User-controlled herding — flee force, panic zone, flee-radius ring |
+| `crowd` | Reynolds steering crowd — 6 live-switchable behaviours (WANDER/FLOCK/PANIC/GATHER/FOLLOW/QUEUE); up to 150 agents; seek/flee/separate/align/cohesion forces |
+| `war` | Two-faction battle (GONDOR vs MORDOR) — melee + archer units; travelling `-` arrow projectiles (flat pool, 220 px/s); 4-state FSM (ADVANCE/COMBAT/FLEE/DEAD); 6 live battle strategies |
+| `swarm_gen_numbers` | Reynolds steering digit swarm — 25 agents form digits 0–9 via 10 strategies (DRIFT/RUSH/FLOW/ORBIT/FLOCK/PULSE/VORTEX/GRAVITY/SPRING/WAVE); greedy slot assignment; Hooke's law spring steering |
 | `ant_colony` | Pheromone ACO — stigmergic path optimization |
 | `wator` | Wa-Tor predator-prey ecosystem |
 | `network_sim` | SIR epidemic + spring-force graph layout |
@@ -260,7 +263,7 @@ See `Claude.md` for the complete build list.
 .
 ├── artistic/          — parametric art, CA, L-systems, visual math
 ├── fluid/             — Navier-Stokes, Gray-Scott, wave PDE, FitzHugh-Nagumo, Lenia
-├── flocking/          — Reynolds boids, shepherd herding
+├── flocking/          — Reynolds boids, shepherd herding, crowd steering, battle sim, swarm digit animator
 ├── fractal_random/    — Mandelbrot, Julia, Newton, Apollonian, terrain, Perlin landscape
 ├── geometry/          — parametric curves, grids, computational geometry (lissajous, voronoi, convex hull…)
 ├── matrix_rain/       — Matrix rain variants (classic rain, DLA snowflake hybrid)
@@ -282,7 +285,7 @@ See `Claude.md` for the complete build list.
     ├── COLOR.md           — color theory, 256-color usage, theme design
     └── learning/
         ├── ROADMAP.md         — 6-tier study order, 2-year plan
-        └── concept_*.md       — 146 deep-dive concept files
+        └── concept_*.md       — 150 deep-dive concept files
                                  (math → pseudocode → implementation notes)
 ```
 
@@ -290,7 +293,7 @@ See `Claude.md` for the complete build list.
 
 ## Documentation
 
-`documentation/learning/` contains 146 concept files — one per program. Each file has two passes:
+`documentation/learning/` contains 150 concept files — one per program. Each file has two passes:
 
 - **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
 - **Pass 2** — pseudocode, module map, data flow diagram, core loop

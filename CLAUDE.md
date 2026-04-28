@@ -218,6 +218,91 @@ For any non-obvious physics formula, add the derivation or a named reference:
 
 ---
 
+# Working on This Project
+
+## New Simulation Workflow
+
+When asked to write a new simulation, clarify these before writing any code:
+
+**Step 1 — Name the algorithm.** State what it computes and why it produces something worth watching.
+
+**Step 2 — Choose coordinate space.** This is the first architectural decision:
+
+| Use cell-space (skip §4) | Use pixel-space (include §4) |
+|---|---|
+| Grid/CA simulations — each cell IS one character | Continuous motion — balls, pendulums, particles, flocking |
+| fire, sand, reaction-diffusion, flowfield, matrix_rain | bounce_ball, lorenz, nbody, cloth, boids |
+| Position stored as `int row, col` | Position stored as `float px, py` in pixel units |
+
+**Step 3 — Estimate scope.** A typical file is 250–450 lines. State if it will be longer and why. If it approaches 600+, the §5 physics is probably doing too much — split into sub-functions.
+
+**Step 4 — Write in this order:** §1 config → §5 entity/physics → §6 scene → §3 color → §7 screen → §8 app. Config first forces all magic numbers to be named before any logic is written.
+
+---
+
+## Verification (no tests — compile + visual = done)
+
+There is no test suite. "Done" means all five of these:
+
+1. `gcc -std=c11 -O2 -Wall -Wextra <file>.c -o name -lncurses -lm` — **zero warnings**
+2. Runs at stable ~60 fps — no busy-loop, no spiral-of-death on slow terminals
+3. HUD shows fps + sim parameters + PAUSED/running state
+4. `q` / `ESC` exits cleanly — terminal restored, cursor visible
+5. Resize (`SIGWINCH`) doesn't crash or corrupt display
+
+**Debugging visual bugs:** When Tamil describes a visual problem ("particles going wrong direction", "rope not moving with bob"), treat the description as ground truth. Debug `scene_draw()` in §6 first — the mapping from physics state to screen coordinates is the most common source, not the physics math itself.
+
+---
+
+## HUD Standard
+
+Every program has two fixed UI elements. Follow this layout exactly:
+
+```c
+/* §7 screen_draw() — top-right: fps + params + state */
+char buf[64];
+snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  %s ",
+         fps, sim_fps, paused ? "PAUSED " : "running");
+attron(COLOR_PAIR(3) | A_BOLD);
+mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+attroff(COLOR_PAIR(3) | A_BOLD);
+
+/* bottom-left: one-line key hint strip */
+attron(COLOR_PAIR(6) | A_DIM);
+mvprintw(rows - 1, 0, " q:quit  spc:pause  r:reset  +/-:<param> ");
+attroff(COLOR_PAIR(6) | A_DIM);
+```
+
+The key hint at the bottom must list every interactive key the program uses.
+
+---
+
+## Common ncurses Bugs
+
+These are the mistakes most likely to appear in generated code. Verify each before presenting:
+
+| Bug | Correct form |
+|---|---|
+| `mvaddch(y, x, ch)` without cast | `mvaddch(y, x, (chtype)(unsigned char)ch)` — prevents sign-extension on chars > 127 |
+| `clear()` each frame | `erase()` — `clear()` retransmits the full screen every frame, causes flicker |
+| `refresh()` to flush | `wnoutrefresh(stdscr); doupdate();` — one diff write, no partial frames |
+| Missing `typeahead(-1)` in screen_init | ncurses silently interrupts output to peek stdin — causes tearing |
+| No `SIGWINCH` handler | Terminal resize corrupts display permanently |
+| Missing `atexit(cleanup)` / `endwin()` on all exit paths | Terminal left in raw mode after crash or signal |
+
+---
+
+## Self-Contained File Rule
+
+Every program is one `.c` file. Hard rules:
+
+- No `#include "local_header.h"` — no shared headers of any kind
+- No multi-file compilation — one `gcc` command, one binary
+- No libraries beyond `ncurses` and `libm`
+- If a function from another file is needed, copy it inline and note the source in a comment
+
+---
+
 # Project: Terminal Demos — ncurses C (C11)
 
 ## Build Pattern

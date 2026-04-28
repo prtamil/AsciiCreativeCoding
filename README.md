@@ -26,6 +26,53 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 
 ---
 
+## Design Choices
+
+> *"All art is quite useless."*
+> — Oscar Wilde, The Picture of Dorian Gray
+
+This project is not a library. It is not a framework. It is not a toolkit.
+It is closer to a sketchbook — 180 individual programs, each complete in itself,
+each existing for no reason other than that it is interesting to build and beautiful to watch.
+
+**Every file is self-contained by intention.**
+There are no shared headers, no common modules, no inter-file dependencies. Code
+duplication is a deliberate trade-off: a repeated 20-line physics loop in every
+file is far better than a shared abstraction that requires understanding six other
+files before you can touch one. When a simulation changes, only one file changes.
+No edge cases bleed across boundaries. No ripple effects. You can delete any file
+and nothing else breaks.
+
+**Copying is the intended usage.**
+To run any simulation, copy the file, compile, and run:
+```bash
+gcc filename.c -lncurses -lm && ./a.out
+```
+That is the entire workflow. No build system, no CMake, no Makefile, no package
+manager, no project configuration. A single file is a single program. A learner
+can take any file, read it top to bottom, and understand the whole thing.
+
+**Linux terminal only. No Windows, no GUI.**
+Every simulation targets a POSIX terminal with ncurses. The constraint is the
+medium: forcing a Navier-Stokes solver or a path tracer through a character grid
+demands a much sharper understanding of the underlying math than reaching for a
+graphics API would. The terminal is not a limitation — it is the whole point.
+
+**Art for art's sake.**
+None of these simulations solve a practical problem. A falling-sand automaton has
+no business case. A Buddhabrot renderer does not ship a product. A mushroom-cloud
+raymarcher is not on anyone's roadmap. That uselessness is precisely what makes
+them worth building. The best way to understand an algorithm is to make it
+beautiful with no deadline and no stakeholder.
+
+**One physics model, one rendering model, applied uniformly.**
+Every file uses the same fixed-timestep accumulator, the same pixel-space
+coordinate model, and the same ncurses double-buffer sequence. A reader who
+studies one file can read any other. The framework is not hidden — it is the
+first thing documented in every source file.
+
+---
+
 ## Demos
 
 ### Fluid Dynamics
@@ -239,7 +286,7 @@ gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c     -o raymarcher     -ln
 gcc -std=c11 -O2 -Wall -Wextra physics/schrodinger.c       -o schrodinger    -lncurses -lm
 ```
 
-See `Claude.md` for the complete build list.
+See `CLAUDE.md` for the complete build list.
 
 ---
 

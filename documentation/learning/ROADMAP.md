@@ -53,6 +53,11 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `fourier_art.c` | User-drawn path → Fourier epicycles | DRAW→PLAY state machine, arc-length resampling, O(N²) DFT, amplitude-sorted epicycle chain, auto-add convergence |
 | `galaxy.c` | Spiral galaxy — differential rotation | flat rotation curve ω=v₀/r, logarithmic spiral arm init, brightness accumulator + frame decay, radial colour zones |
 | `fft_vis.c` | Cooley-Tukey FFT visualiser | bit-reversal permutation, radix-2 butterfly O(N log N), time vs frequency panel, twiddle factors W_N^k = exp(-2πik/N) |
+| `01_uniform_rect.c` … `14_origin.c` | 14 rectangular grid displays — cell-space rendering | direct screen-sweep: `(sr%ch==0 \|\| sc%cw==0)`, brick stagger `(r%2)*(cw/2)`, diamond `safe_mod(u*IH+v*IW, 2*IW*IH)`, iso 2:1 oblique |
+| `01_direct.c` | Direct cursor placement — GridCtx unification | `ctx_to_screen` as single coordinate seam, ObjectPool swap-last, grid cycling `(mode±1+GM_COUNT)%GM_COUNT` |
+| `02_patterns.c` | Pattern stamp — predicate-driven fill | border/fill/hollow/row/col as boolean functions of `(dr,dc,N)`; preview overlay before stamp |
+| `03_path.c` | Two-point path drawing | Bresenham line (error accumulation), L-path, ring border, diagonal staircase; 3-state `SEL_IDLE→ONE→TWO` FSM |
+| `04_scatter.c` | Procedural object scatter | random uniform, Poisson-disk rejection sampling, BFS flood fill, gradient Bernoulli trials; Chebyshev distance |
 
 ---
 

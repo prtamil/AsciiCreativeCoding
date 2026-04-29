@@ -159,6 +159,14 @@ Reference implementation: `basics/bounce_ball.c`
 122. [2-D Shockwave Detonation — physics/nuke.c](#122-2-d-shockwave-detonation--physicsnukec)
 123. [Animated Solar Simulation — raymarcher/sun.c](#123-animated-solar-simulation--raymarchersunc)
 124. [Volumetric Mushroom Cloud — raymarcher/nuke_v1.c](#124-volumetric-mushroom-cloud--raymarchernuke_v1c)
+125. [Swarm Digit Generator — flocking/swarm_gen_numbers.c](#125-swarm-digit-generator--flockingswarm_gen_numbersc)
+126. [Two-Faction Battle Simulator — flocking/war.c](#126-two-faction-battle-simulator--flockingwarc)
+127. [Crowd Behaviour Simulator — flocking/crowd.c](#127-crowd-behaviour-simulator--flockingcrowdc)
+128. [Rectangular Grid Series — grids/rect_grids/](#128-rectangular-grid-series--gridsrect_grids)
+129. [Direct Cursor Placement — grids/rect_grids_placement/01_direct.c](#129-direct-cursor-placement--gridsrect_grids_placement01_directc)
+130. [Pattern Stamp Placement — grids/rect_grids_placement/02_patterns.c](#130-pattern-stamp-placement--gridsrect_grids_placement02_patternsc)
+131. [Two-Point Path Drawing — grids/rect_grids_placement/03_path.c](#131-two-point-path-drawing--gridsrect_grids_placement03_pathc)
+132. [Procedural Scatter — grids/rect_grids_placement/04_scatter.c](#132-procedural-scatter--gridsrect_grids_placement04_scatterc)
 
 ---
 
@@ -4556,6 +4564,198 @@ N agents (5–150) move under one of six switchable crowd behaviours. All six us
 `desired = normalise(target − pos) × speed`, `force = desired − vel`. Subtracting current velocity means force → 0 when already at full speed toward target — natural deceleration for free.
 
 *Files: `flocking/crowd.c`*
+
+---
+
+## 128. Rectangular Grid Series — grids/rect_grids/
+
+Fourteen standalone programs, one per grid type. Each program is a pure cell-space display (no physics, no pixel coordinates) — every rendered character maps directly to a grid intersection or cell fill, with no `§4 coords` section.
+
+### The 14 Grid Types
+
+| # | File | Grid type | Key geometry |
+|---|------|-----------|--------------|
+| 01 | `01_uniform_rect.c` | Uniform rectangular | `+/-\|` at every `U_CW×U_CH` junction |
+| 02 | `02_square.c` | Square cells | `SQ_CS*2` wide × `SQ_CS` tall — visually square on a 2:1 terminal |
+| 03 | `03_fine_dense.c` | Fine / dense | `FN_CW=4 × FN_CH=2` — maximum line density |
+| 04 | `04_coarse_sparse.c` | Coarse / sparse | `CO_CW=12 × CO_CH=4` — open, spacious cells |
+| 05 | `05_hierarchical.c` | Hierarchical | Three line weights: major `#`/`=`, semi `\|`/`-`, minor `:`/`.` |
+| 06 | `06_brick_stagger.c` | Horizontal brick | Even rows shifted right by `cw/2`; creates running-bond brickwork |
+| 07 | `07_half_brick_vert.c` | Vertical brick | Even cols shifted down by `ch/2`; 90° rotation of brick-h |
+| 08 | `08_diamond.c` | Diamond | 45° rotation: lines `sc = ox+(c−r)*DM_IW`, `sr = oy+(c+r)*DM_IH` |
+| 09 | `09_isometric.c` | Isometric | 2:1 oblique: same formula as diamond but wider pitch `IS_IW=8` |
+| 10 | `10_crosshatch.c` | Crosshatch | Rectangular grid + two diagonal families: `(sc+sr)%cw==0` and `safe_mod(sc-sr,ch)==0` |
+| 11 | `11_checkerboard.c` | Checkerboard | Grid lines + `#` fill in alternating `(sr/ch+sc/cw)%2==1` cells |
+| 12 | `12_ruled.c` | Ruled | Horizontal `-` lines every `RL_LS=3` rows; no vertical lines |
+| 13 | `13_dot.c` | Dot | `*` only at `(sr%ch==0 && sc%cw==0)` intersections |
+| 14 | `14_origin.c` | Origin-marked | Rectangular grid with `=`/`I` on the x/y axes through `(ox,oy)` |
+
+### Cell-Space Architecture
+
+These programs omit `§4 coords` entirely. Positions are stored as `int row, col` (grid coordinates); drawing is a direct sweep:
+
+```c
+for (int sr = 0; sr < rows-1; sr++)
+    for (int sc = 0; sc < cols; sc++)
+        if (condition(sr, sc)) mvaddch(sr, sc, char);
+```
+
+No pixel-to-cell conversion, no sub-pixel interpolation. The grid pattern is a purely visual function of `(sr % ch, sc % cw)`.
+
+### Brick Stagger Formula
+
+The horizontal brick offset is: `sc_offset = (row % 2) * (cw / 2)`. For the background draw this is baked into the column condition; for `ctx_to_screen` (used in placement files) it is: `*sc = c*cw + (r%2)*(cw/2)`.
+
+### Diamond / Isometric Line Detection
+
+Both grids use the same affine-transform trick. Given screen position `(u, v)` = `(sc−ox, sr−oy)`:
+
+```
+left-leaning lines:   safe_mod(u*IH + v*IW, 2*IW*IH) == 0   →  '/'
+right-leaning lines:  safe_mod(v*IW - u*IH, 2*IW*IH) == 0   →  '\'
+```
+
+`safe_mod(a, b) = ((a%b)+b)%b` handles negative coordinates correctly (required for any position left or above the origin).
+
+### Colour and Interactivity
+
+Each program has `+/-` to cycle the 5 colour themes. `09_isometric.c` additionally supports `w/a/s/d` / arrow keys to shift the origin, making the iso grid scroll to explore movement on a continuous plane. The column-skip bug (cursor jumping two columns per keypress) was fixed by applying a minimum column step of 1 instead of the full `IS_IW`.
+
+*Files: `grids/rect_grids/01_uniform_rect.c` … `grids/rect_grids/14_origin.c`*
+
+---
+
+## 129. Direct Cursor Placement — grids/rect_grids_placement/01_direct.c
+
+First of four interactive placement editors. Introduces the `GridCtx` abstraction that all placement files share.
+
+### GridCtx — The Unified Grid Abstraction
+
+```c
+typedef struct {
+    GridMode mode;
+    int rows, cols, cw, ch, ox, oy, range;
+    int min_r, max_r, min_c, max_c;
+} GridCtx;
+```
+
+One `ctx_init(g, mode, rows, cols)` call configures every field for any of the 14 grid types. `min_r/max_r/min_c/max_c` give the valid cell coordinate range — negative for diamond/iso (they are centred on the screen).
+
+### ctx_to_screen — The Single Seam
+
+```c
+static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+{
+    switch (g->mode) {
+    case GM_DIAMOND: *sc=g->ox+(c-r)*DM_IW; *sr=g->oy+(c+r)*DM_IH; break;
+    case GM_ISO:     *sc=g->ox+(c-r)*IS_IW; *sr=g->oy+(c+r)*IS_IH; break;
+    case GM_RULED:   *sr=r*RL_LS; *sc=c; break;
+    case GM_BRICK_H: *sr=r*g->ch; *sc=c*g->cw+(r%2)*(g->cw/2); break;
+    case GM_BRICK_V: *sr=r*g->ch+(c%2)*(g->ch/2); *sc=c*g->cw; break;
+    default:         *sr=r*g->ch; *sc=c*g->cw; break;
+    }
+}
+```
+
+This is the **only** coordinate conversion in the placement files. All cursor drawing, object drawing, and path endpoint markers go through this one function — so a brick-stagger fix here corrects cursor, objects, and markers simultaneously.
+
+### ObjectPool
+
+Flat array of `Obj {r, c, glyph, alive}` with O(1) swap-last removal and O(n) membership test `pool_find`. `pool_toggle` places an object if none is at `(r,c)`, removes it otherwise — giving toggle-on-space behaviour.
+
+### Grid Cycling
+
+`'a'` = prev grid, `'e'` = next grid:
+
+```c
+case 'a': { GridMode m = (GridMode)((ctx.mode-1+GM_COUNT)%GM_COUNT);
+            ctx_init(&ctx, m, rows, cols); cursor_reset(&cur, &ctx); } break;
+```
+
+Objects persist across grid switches — they are stored as `(r, c)` cell coordinates and re-rendered through the new `ctx_to_screen` formula, so a line of dots placed on the uniform grid appears in a different screen arrangement on the iso grid.
+
+*Files: `grids/rect_grids_placement/01_direct.c`*
+
+---
+
+## 130. Pattern Stamp Placement — grids/rect_grids_placement/02_patterns.c
+
+Extends 01_direct with multi-cell stamp patterns. Five pattern predicates over relative offset `(dr, dc)` from the cursor:
+
+| Key | Name | Predicate |
+|-----|------|-----------|
+| `B` | Border | `(\|dr\|==N \|\| \|dc\|==N) && \|dr\|<=N && \|dc\|<=N` |
+| `F` | Fill | `\|dr\|<=N && \|dc\|<=N` |
+| `H` | Hollow | `fill(N) && !fill(N-1)` — outermost ring only |
+| `R` | Row | `dr==0 && \|dc\|<=N` |
+| `V` | Col | `dc==0 && \|dr\|<=N` |
+
+`+/-` changes `N` (half-size) in `[MIN_PAT_N=1, MAX_PAT_N=8]`. The same predicate drives both the live preview (highlighted in `PAIR_CURSOR|A_REVERSE`) and the actual stamp via `pool_place`.
+
+### Pattern as Predicate
+
+Representing patterns as predicates rather than bitmaps gives three properties: they scale with `N`; they compose (hollow = fill AND NOT fill-of-n-minus-1); and the same predicate works unchanged on every grid type — no special-casing per mode.
+
+### Preview Overlay
+
+`preview_draw()` evaluates the predicate and renders matching cells with a `.` character in `PAIR_CURSOR|A_REVERSE` before any key is pressed. The user sees the exact footprint before stamping.
+
+*Files: `grids/rect_grids_placement/02_patterns.c`*
+
+---
+
+## 131. Two-Point Path Drawing — grids/rect_grids_placement/03_path.c
+
+Three-state selection machine drives two-point path generation:
+
+```
+SEL_IDLE  →(p)→  SEL_ONE  →(p)→  SEL_TWO  →(l/j/o/x)→  SEL_IDLE
+                                            →(p)→  SEL_IDLE  (cancel)
+```
+
+`'p'` cycles the state. Path keys only fire in `SEL_TWO`, then reset to `SEL_IDLE`.
+
+### Four Path Generators
+
+**`path_line`** — Bresenham's line algorithm. Column-major when `dc >= dr` (steps every column, steps row when error crosses zero); row-major otherwise. Exactly one cell per major-axis step, no gaps.
+
+**`path_lpath`** — L-shaped rectilinear path. Horizontal leg to `(r0, c1)`, then vertical leg to `(r1, c1)`. Used in PCB routing; produces right-angle turns.
+
+**`path_ring`** — Hollow rectangle border. Top/bottom rows from `cmin` to `cmax`; left/right cols from `rmin+1` to `rmax-1` (corners handled by rows, not repeated).
+
+**`path_diagonal`** — Staircase diagonal. Each step moves `(sign(dr), sign(dc))` until `(r1,c1)` is reached. Produces a 45° staircase.
+
+### Key Design
+
+All four path keys (`l j o x`) are conflict-free with grid-cycle keys (`a e`). The `'p'` state-machine key replaces the old ENTER key, which was unreliable across terminals.
+
+*Files: `grids/rect_grids_placement/03_path.c`*
+
+---
+
+## 132. Procedural Scatter — grids/rect_grids_placement/04_scatter.c
+
+Four scatter algorithms that treat placement as a sampling strategy over grid cells.
+
+### Scatter Algorithms
+
+**`scatter_random` (`R`)** — Uniform random: pick `RAND_N=40` random `(r, c)` pairs from the valid range. Fast, produces clusters and voids.
+
+**`scatter_mindist` (`M`)** — Poisson-disk rejection sampling: repeat up to `MAX_TRIES=400` times; accept a candidate only if its Chebyshev distance to every existing object is `>= MIN_DIST=3`. Produces blue-noise-like even spacing. O(n²) per attempt — correct for `n ≤ 256`.
+
+**`scatter_flood` (`F`)** — BFS from the cursor cell. 4-connected expansion; place an object at each visited cell; stop at `FLOOD_MAX=120`. Uses a `bool vis[]` flat array indexed by `(r−min_r)*gw + (c−min_c)`. The BFS ring buffer is also heap-allocated (`malloc`) to avoid VLA stack overflow on large grids.
+
+**`scatter_gradient` (`G`)** — Bernoulli trial per cell: `P = GRAD_SCALE / (chebyshev_dist_from_centre + GRAD_SCALE)`. Cells near the centre are denser. Integer threshold avoids floating point: `threshold = (long)GRAD_SCALE * RAND_MAX / (dist + GRAD_SCALE)`.
+
+### Chebyshev Distance
+
+Used for both min-dist rejection and gradient density: `cheb(r0,c0,r1,c1) = max(|Δr|, |Δc|)`. It equals the number of king-moves between cells, naturally defines a square "ball", and is faster than Euclidean (no sqrt).
+
+### BFS Implementation Note
+
+The `scatter_flood` BFS uses a `#define ENQUEUE(R,C) do { ... } while(0)` macro rather than a nested function because C11 does not allow nested functions. The macro performs bounds check, visited check, and ring-buffer push inline. `#undef ENQUEUE` follows immediately after the BFS loop.
+
+*Files: `grids/rect_grids_placement/04_scatter.c`*
 
 ---
 

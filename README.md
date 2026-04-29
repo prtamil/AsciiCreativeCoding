@@ -9,7 +9,7 @@
 ╚═╝     ╚═╝    ╚═╝     ╚═════╝   ╚═╝  ╚═╝   Make Terminal Great Again
 ```
 
-180 simulations. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
+195 simulations. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -188,6 +188,36 @@ first thing documented in every source file.
 |---------|-----------|
 | `duo_poly` | Dual turtle polygon animator — two turtles (cyan A / magenta B) draw regular polygons step-by-step; each tick advances one edge; aspect-corrected Y keeps shapes visually round; auto-cycles 3→12 sides; `a/z` `s/x` sides, `+/-` speed |
 
+### Grid Systems
+
+All 14 grid types are implemented as standalone display programs in `grids/rect_grids/`, and as unified interactive editors in `grids/rect_grids_placement/`. Every placement editor accepts `a`/`e` to cycle through all 14 grid types live.
+
+#### Background Grid Displays (`grids/rect_grids/`)
+| Program | Grid Type |
+|---------|-----------|
+| `01_uniform_rect` | Regular rectangular grid — `+` junctions, `-` rows, `\|` cols |
+| `02_square` | Square cells — equal visual proportions via `SQ_CS×2` / `SQ_CS` |
+| `03_fine_dense` | Fine dense grid — small `4×2` cells, high line density |
+| `04_coarse_sparse` | Coarse sparse grid — large `12×4` cells, open space |
+| `05_hierarchical` | Three-weight hierarchy — major `#=`, semi `\|-`, minor `.:` lines |
+| `06_brick_stagger` | Horizontal brick — even rows shifted right by `cw/2` |
+| `07_half_brick_vert` | Vertical brick — even columns shifted down by `ch/2` |
+| `08_diamond` | Diamond grid — 45° rotated with `/\` line chars |
+| `09_isometric` | Isometric 2:1 oblique projection — `/\` at 2:1 aspect |
+| `10_crosshatch` | Crosshatch — rectangular grid + 45° diagonal overlay |
+| `11_checkerboard` | Checkerboard — alternating `#`-filled squares |
+| `12_ruled` | Ruled — horizontal lines only, `RL_LS=3` line spacing |
+| `13_dot` | Dot grid — `*` at intersections only |
+| `14_origin` | Origin-marked grid — `=` x-axis, `I` y-axis, `+` at crossing |
+
+#### Interactive Placement Editors (`grids/rect_grids_placement/`)
+| Program | Algorithm |
+|---------|-----------|
+| `01_direct` | Cursor placement — arrow-key navigation, `space` toggles objects; `GridCtx` abstraction drives all 14 grid types from one cursor |
+| `02_patterns` | Pattern stamp — 5 predicates (border/fill/hollow/row/col) stamped at cursor; live preview; `+/-` resizes |
+| `03_path` | Two-point path drawing — `p` cycles IDLE→A→B; `l`=Bresenham line, `j`=L-path, `o`=ring, `x`=diagonal |
+| `04_scatter` | Procedural scatter — `R`=random, `M`=Poisson min-distance, `F`=BFS flood, `G`=gradient density |
+
 ### Geometry
 | Program | Algorithm |
 |---------|-----------|
@@ -313,6 +343,9 @@ See `CLAUDE.md` for the complete build list.
 ├── flocking/          — Reynolds boids, shepherd herding, crowd steering, battle sim, swarm digit animator
 ├── fractal_random/    — Mandelbrot, Julia, Newton, Apollonian, terrain, Perlin landscape
 ├── geometry/          — parametric curves, grids, computational geometry (lissajous, voronoi, convex hull…)
+├── grids/
+│   ├── rect_grids/        — 14 grid-type displays (uniform, square, brick, diamond, iso, …)
+│   └── rect_grids_placement/ — 4 interactive placement editors (direct/patterns/path/scatter)
 ├── matrix_rain/       — Matrix rain variants (classic rain, DLA snowflake hybrid)
 ├── misc/              — sorting, maze, forest fire
 ├── particle_systems/  — fire (3 algos), smoke (3 algos), fireworks, explosions
@@ -321,7 +354,7 @@ See `CLAUDE.md` for the complete build list.
 ├── raymarcher/        — SDF ray marching
 ├── raytracing/        — analytic ray tracing (sphere, cube, torus, capsule)
 ├── animation/         — kinematics, IK solvers, legged locomotion
-├── robots/            — advanced robot simulations (bipedal walk cycle, self-balancing bot)
+├── robots/            — advanced robot simulations (bipedal walk cycle, self-balancing bot, Perlin terrain)
 ├── turtle/            — turtle graphics programs (polygon animators, path drawing)
 ├── ncurses_basics/    — framework reference implementations
 └── documentation/
@@ -332,7 +365,7 @@ See `CLAUDE.md` for the complete build list.
     ├── COLOR.md           — color theory, 256-color usage, theme design
     └── learning/
         ├── ROADMAP.md         — 6-tier study order, 2-year plan
-        └── concept_*.md       — 150 deep-dive concept files
+        └── concept_*.md       — 168 deep-dive concept files
                                  (math → pseudocode → implementation notes)
 ```
 
@@ -340,7 +373,7 @@ See `CLAUDE.md` for the complete build list.
 
 ## Documentation
 
-`documentation/learning/` contains 150 concept files — one per program. Each file has two passes:
+`documentation/learning/` contains 168 concept files — one per program. Each file has two passes:
 
 - **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
 - **Pass 2** — pseudocode, module map, data flow diagram, core loop

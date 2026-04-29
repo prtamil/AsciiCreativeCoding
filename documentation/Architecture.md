@@ -167,6 +167,28 @@ Reference implementation: `basics/bounce_ball.c`
 130. [Pattern Stamp Placement — grids/rect_grids_placement/02_patterns.c](#130-pattern-stamp-placement--gridsrect_grids_placement02_patternsc)
 131. [Two-Point Path Drawing — grids/rect_grids_placement/03_path.c](#131-two-point-path-drawing--gridsrect_grids_placement03_pathc)
 132. [Procedural Scatter — grids/rect_grids_placement/04_scatter.c](#132-procedural-scatter--gridsrect_grids_placement04_scatterc)
+133. [Standard Polar Grid — grids/polar_grids/01_rings_spokes.c](#133-standard-polar-grid--gridspolar_grids01_rings_spokesc)
+134. [Log-Polar Grid — grids/polar_grids/02_log_polar.c](#134-log-polar-grid--gridspolar_grids02_log_polarc)
+135. [Archimedean Spiral — grids/polar_grids/03_archimedean_spiral.c](#135-archimedean-spiral--gridspolar_grids03_archimedean_spiralc)
+136. [Logarithmic Spiral — grids/polar_grids/04_log_spiral.c](#136-logarithmic-spiral--gridspolar_grids04_log_spiralc)
+137. [Phyllotaxis Sunflower — grids/polar_grids/05_sunflower.c](#137-phyllotaxis-sunflower--gridspolar_grids05_sunflowerc)
+138. [Equal-Area Sector Grid — grids/polar_grids/06_sector.c](#138-equal-area-sector-grid--gridspolar_grids06_sectorc)
+139. [Elliptic Polar Grid — grids/polar_grids/07_elliptic.c](#139-elliptic-polar-grid--gridspolar_grids07_ellipticc)
+140. [Polar Direct Placement — grids/polar_grids_placement/01_polar_direct.c](#140-polar-direct-placement--gridspolar_grids_placement01_polar_directc)
+141. [Polar Arc Placement — grids/polar_grids_placement/02_polar_arc.c](#141-polar-arc-placement--gridspolar_grids_placement02_polar_arcc)
+142. [Polar Spiral Placement — grids/polar_grids_placement/03_polar_spiral.c](#142-polar-spiral-placement--gridspolar_grids_placement03_polar_spiralc)
+143. [Polar Scatter Placement — grids/polar_grids_placement/04_polar_scatter.c](#143-polar-scatter-placement--gridspolar_grids_placement04_polar_scatterc)
+144. [Flat-Top Hexagonal Grid — grids/hex_grids/01_flat_top.c](#144-flat-top-hexagonal-grid--gridshex_grids01_flat_topc)
+145. [Pointy-Top Hexagonal Grid — grids/hex_grids/02_pointy_top.c](#145-pointy-top-hexagonal-grid--gridshex_grids02_pointy_topc)
+146. [Axial Coordinate Display — grids/hex_grids/03_axial.c](#146-axial-coordinate-display--gridshex_grids03_axialc)
+147. [Ring-Distance Colouring — grids/hex_grids/04_ring_distance.c](#147-ring-distance-colouring--gridshex_grids04_ring_distancec)
+148. [Triangular-Dual Grid — grids/hex_grids/05_triangular.c](#148-triangular-dual-grid--gridshex_grids05_triangularc)
+149. [Rhombille Tiling — grids/hex_grids/06_rhombille.c](#149-rhombille-tiling--gridshex_grids06_rhombillec)
+150. [Trihexagonal Tiling — grids/hex_grids/07_trihexagonal.c](#150-trihexagonal-tiling--gridshex_grids07_trihexagonalc)
+151. [Hex Direct Placement — grids/hex_grids_placement/01_hex_direct.c](#151-hex-direct-placement--gridshex_grids_placement01_hex_directc)
+152. [Hex Pattern Stamp — grids/hex_grids_placement/02_hex_pattern.c](#152-hex-pattern-stamp--gridshex_grids_placement02_hex_patternc)
+153. [Hex Path Drawing — grids/hex_grids_placement/03_hex_path.c](#153-hex-path-drawing--gridshex_grids_placement03_hex_pathc)
+154. [Hex Scatter Placement — grids/hex_grids_placement/04_hex_scatter.c](#154-hex-scatter-placement--gridshex_grids_placement04_hex_scatterc)
 
 ---
 
@@ -4756,6 +4778,378 @@ Used for both min-dist rejection and gradient density: `cheb(r0,c0,r1,c1) = max(
 The `scatter_flood` BFS uses a `#define ENQUEUE(R,C) do { ... } while(0)` macro rather than a nested function because C11 does not allow nested functions. The macro performs bounds check, visited check, and ring-buffer push inline. `#undef ENQUEUE` follows immediately after the BFS loop.
 
 *Files: `grids/rect_grids_placement/04_scatter.c`*
+
+---
+
+## 133. Standard Polar Grid — grids/polar_grids/01_rings_spokes.c
+
+Concentric rings and radial spokes using a screen-sweep algorithm.  Every terminal cell is converted to polar coordinates and tested against two modular conditions.
+
+### Core Algorithm
+
+**Pixel-space coordinates** (aspect-corrected with CELL_W=2, CELL_H=4):
+```c
+dx_px = (col - ox) * CELL_W;  dy_px = (row - oy) * CELL_H;
+r     = sqrt(dx_px² + dy_px²);   theta = atan2(dy_px, dx_px);
+```
+
+**Ring test** (all rings simultaneously):
+```c
+ring_phase = fmod(r_px, ring_spacing);
+on_ring = ring_phase < RING_W || ring_phase > ring_spacing - RING_W;
+```
+
+**Spoke test** (all spokes simultaneously):
+```c
+theta_norm  = fmod(theta + 2π, 2π);
+spoke_phase = fmod(theta_norm, spoke_angle);
+on_spoke    = r > SPOKE_MIN_R && (spoke_phase < SPOKE_W || …);
+```
+
+**Character selection** — `angle_char(theta)` folds to `[0, π)` and maps to `-`, `\`, `|`, `/` by octant.  Intersections use `+`.
+
+CELL_H/CELL_W = 2 compensates for terminal cell aspect ratio so rings appear circular rather than elliptic.
+
+*Files: `grids/polar_grids/01_rings_spokes.c`*
+
+---
+
+## 134. Log-Polar Grid — grids/polar_grids/02_log_polar.c
+
+Rings at exponentially growing radii: `r_k = R_MIN × RATIO^k`.  The same coordinate system as the human retina, SIFT feature descriptors, and conformal optics.
+
+### Log-Ring Detection
+
+```c
+u    = log(r_px / R_MIN) / log_step;   /* continuous ring index */
+frac = u - floor(u);
+on_ring = frac < RING_W_U || frac > 1.0 - RING_W_U;
+```
+
+`RING_W_U` is a fractional width in log-ring-index space (not pixels).  A fixed pixel width would make inner rings imperceptibly thin — the fractional width keeps all rings visually equal in log space.
+
+**Key difference from 01:** Ring spacing is constant in `log(r)` space, not pixel space.  Each ring is a fixed multiplicative factor further out than the previous.
+
+HUD displays `ratio = exp(log_step)` — the radial multiplier per ring.
+
+*Files: `grids/polar_grids/02_log_polar.c`*
+
+---
+
+## 135. Archimedean Spiral — grids/polar_grids/03_archimedean_spiral.c
+
+Spiral arms with constant pitch (gap in pixels between successive turns at any radius).  N arms rendered simultaneously via a single modular phase test.
+
+### N-Arm Phase Test
+
+```c
+a     = pitch / (2π);                         /* radial advance per radian */
+raw   = N * (theta_norm - r_px / a);
+phase = fmod(raw + N * 2π, 2π);
+on_spiral = phase < SPIRAL_W || phase > 2π - SPIRAL_W;
+```
+
+**Why it detects all N arms:** On arm k, `theta = r/a + k×2π/N`, so `N×(theta − r/a) = k×2π`.  `fmod(k×2π, 2π) = 0` for any integer k.  All N arms collapse to phase ≈ 0 in a single expression.
+
+**Why `+ N×2π` before fmod:** C's `fmod` is not mathematical mod for negative values.  Adding `N×2π` guarantees a positive argument.
+
+*Files: `grids/polar_grids/03_archimedean_spiral.c`*
+
+---
+
+## 136. Logarithmic Spiral — grids/polar_grids/04_log_spiral.c
+
+Spiral arms where the radial gap grows proportionally to radius.  Found in nautilus shells, galaxy arms, and hurricane bands.  Includes a golden spiral preset.
+
+### Log-Spiral Phase Test
+
+```c
+theta_pred = log(r_px / R_MIN) / growth;      /* angle predicted by r = b×e^(a×θ) */
+raw        = n_arms * (theta_norm - theta_pred);
+phase      = fmod(raw + n_arms * 2π, 2π);
+```
+
+**Golden spiral preset:**
+```c
+a_golden = 2 × ln(φ) / π ≈ 0.3065      φ = (1+√5)/2
+```
+After one half-turn the radius multiplies by φ² — matching Fibonacci phyllotaxis.
+
+**Key difference from 03:** Uses `log(r/b)/a` as the predicted angle instead of `r/a`.  The log transforms constant-gap-in-log(r) into constant phase, whereas 03 transforms constant-gap-in-pixels.
+
+The `'g'` key toggles the golden preset; pressing `+/-` exits golden mode.
+
+*Files: `grids/polar_grids/04_log_spiral.c`*
+
+---
+
+## 137. Phyllotaxis Sunflower — grids/polar_grids/05_sunflower.c
+
+Vogel's 1979 model: seed i placed at `(sqrt(i) × SPACING, i × GOLDEN_ANGLE)` in polar coordinates, reproducing the pattern of sunflower seeds, pinecones, and daisy centres.
+
+### Vogel Model
+
+```c
+r_i  = sqrt(i) * spacing;             /* uniform area density */
+th_i = i * GOLDEN_ANGLE;              /* 2π/φ² ≈ 137.508°     */
+col  = ox + round(r * cos(th) / CELL_W);
+row  = oy + round(r * sin(th) / CELL_H);
+```
+
+**Why `sqrt(i)` not `i`:** Each new seed adds area `π × SPACING²` — uniform density regardless of distance.
+
+**Why GOLDEN_ANGLE:** It is the "most irrational" rotation.  Any rational multiple of 2π produces visible spokes; GOLDEN_ANGLE fills the disc uniformly.  The `'g'` key cycles through rational alternatives (72°, 45°, …) to demonstrate this dramatically.
+
+**Unlike all other polar files**, this uses a parametric seed loop (not a screen sweep): iterate seeds, convert to cell, write character.  A `visited[]` bool grid prevents double-writes.
+
+*Files: `grids/polar_grids/05_sunflower.c`*
+
+---
+
+## 138. Equal-Area Sector Grid — grids/polar_grids/06_sector.c
+
+Rings placed at `r_k = sqrt(k) × R_UNIT` so every annular band has area `π × R_UNIT²`.  Combined with uniform angular sectors, each grid cell covers the same area.
+
+### Equal-Area Ring Detection
+
+```c
+k_float = (r_px * r_px) / r_unit_sq;    /* continuous ring index = (r/R_UNIT)² */
+frac    = k_float - floor(k_float);
+on_ring = frac < RING_W_F || frac > 1.0 - RING_W_F;
+```
+
+**Why `r²/R_UNIT²`:** The k-th ring is at `r_k = sqrt(k) × R_UNIT`, so `k = (r/R_UNIT)²`.  The continuous index `k_float = (r/R_UNIT)²` places all ring boundaries at integers — standard fmod fractional test applies.
+
+**Equal-area proof:** Annular area from ring k to k+1 = `π × R_UNIT² × ((k+1) − k) = π × R_UNIT²` (constant for all k).
+
+Applications: HEALPix astronomy tessellation, dartboard probability tables, equal-probability polling bins.
+
+*Files: `grids/polar_grids/06_sector.c`*
+
+---
+
+## 139. Elliptic Polar Grid — grids/polar_grids/07_elliptic.c
+
+Concentric ellipses with independently adjustable semi-axes A and B.  At A = B: standard circular grid.  The `'h'` key reveals confocal hyperbolae — the orthogonal family.
+
+### Elliptic Coordinates
+
+```c
+dx_px = (col - ox) * CELL_W;   dy_px = (row - oy) * CELL_H;
+e_r   = sqrt((dx_px/A)² + (dy_px/B)²);          /* elliptic radius */
+ell_theta = atan2(dy_px/B, dx_px/A);             /* for character direction */
+```
+
+**Ring detection** (identical structure to 01 with `e_r` replacing `r_px`):
+```c
+u = e_r / ring_spacing;   frac = u - floor(u);
+on_ring = frac < RING_W_U || frac > 1.0 - RING_W_U;
+```
+
+**Hyperbola overlay:** Level sets of `cos(ell_theta)` are confocal hyperbolae:
+```c
+cv = fabs(cos(ell_theta));          /* |cos| folds both branches */
+hfrac = fmod(cv, HYPER_STEP);
+on_hyper = hfrac < HYPER_W || hfrac > HYPER_STEP - HYPER_W;
+```
+
+Ellipses and hyperbolae are rendered in different color pairs (PAIR_GRID vs PAIR_HYPER), making the orthogonality visible.  `ell_theta` used for `angle_char` aligns characters with the ellipse tangent, not the radial direction.
+
+*Files: `grids/polar_grids/07_elliptic.c`*
+
+---
+
+## 140. Polar Direct Placement — grids/polar_grids_placement/01_polar_direct.c
+
+Cursor placement editor on a polar background.  The cursor position is stored as both `(r, θ)` and `(row, col)` simultaneously; `m` toggles between **screen mode** (arrow keys move by Δrow/Δcol) and **polar mode** (arrow keys move by Δr/Δθ = 4 px / 10°).  Sync functions keep both representations consistent after each move.
+
+### Dual-Representation Cursor
+
+```c
+typedef struct {
+    double r, theta;   /* polar position: pixels and radians */
+    int    row, col;   /* terminal cell derived from (r, theta) */
+    bool   polar_mode;
+} Cursor;
+```
+
+After a screen-mode move: `cell_to_polar(col, row, ox, oy, &r, &theta)`.
+After a polar-mode move: `polar_to_screen(r, theta, ox, oy, &col, &row)` — the inverse transform `col = ox + round(r*cos(θ)/CELL_W)`.
+
+**Space** toggles the cell at the cursor position (pool_toggle: swap-last removal for O(1) delete).  `a`/`e` cycles through all 7 polar background types live.
+
+*Files: `grids/polar_grids_placement/01_polar_direct.c`*
+
+---
+
+## 141. Polar Arc Placement — grids/polar_grids_placement/02_polar_arc.c
+
+Two-anchor geometric drawing on a polar background.  An `AnchorCtx` state machine tracks IDLE → ONE (anchor A placed) → TWO (anchor B placed).  With two anchors set, a drawing command produces objects along the chosen shape:
+
+| Key | Shape | Method |
+|-----|-------|--------|
+| `l` | Arc | Walk θ from θ_A to θ_B at radius r_A; step = `CELL_W/(r_A+1)` rad |
+| `s` | Spoke | Walk r from r_A to r_B at angle θ_A; step = 1 pixel |
+| `r` | Full ring | Walk 0→2π at r_A |
+| `x` | Radial | Walk r from R_OPS_MIN to half-diagonal at θ_A |
+
+Anchor A is displayed as `@` (PAIR_ANCHOR, color 220); anchor B as `#`.  Objects are stored in an ObjPool of up to 4096 `*` glyphs.
+
+*Files: `grids/polar_grids_placement/02_polar_arc.c`*
+
+---
+
+## 142. Polar Spiral Placement — grids/polar_grids_placement/03_polar_spiral.c
+
+Parametric spiral object placement.  Rather than screen-sweeping, placement walks a parametric curve and converts each point to a terminal cell via `polar_to_screen`:
+
+**Archimedean** (`l` key): `r = r₀ + a×t`, `θ = θ₀ + t`, where `a = pitch / (2π)`.  Constant gap between successive turns.
+
+**Log-spiral** (`o` key): `r = r₀ × e^(growth×t)`, `θ = θ₀ + t`.  Gap grows exponentially; golden spiral uses `GROWTH_GOLDEN = 2×ln(φ)/π ≈ 0.3065`.
+
+`d` draws the spiral from the current cursor; `+/-` adjusts pitch/growth, `[/]` adjusts turn count, `,/.` adjusts step density.
+
+*Files: `grids/polar_grids_placement/03_polar_spiral.c`*
+
+---
+
+## 143. Polar Scatter Placement — grids/polar_grids_placement/04_polar_scatter.c
+
+Four procedural scatter strategies on a polar background.  Each deposits N objects in one keystroke:
+
+| Key | Strategy | Formula |
+|-----|----------|---------|
+| `U` | Uniform-area | `r = sqrt(r₀² + rand×(r₁²−r₀²))` — equal probability per unit area |
+| `G` | Radial-Gaussian | Box-Muller: `r = |mean + σ×z|`; objects cluster at cursor radius |
+| `W` | Wedge | Uniform in `[θ−half, θ+half]`; `r` uniform over outer band |
+| `D` | Ring-snap | `r = k×RING_SNAP_SP + jitter`, k random in [1, N_RINGS] |
+
+`[`/`]` adjusts σ (after `G`) or wedge half-angle (after `W`), tracked via `last_key`.  The uniform-area formula ensures that scatter `U` does not over-concentrate near the origin — the sqrt linearises the CDF of the 2D annular area element `r dr`.
+
+*Files: `grids/polar_grids_placement/04_polar_scatter.c`*
+
+---
+
+---
+
+## 144. Flat-Top Hexagonal Grid — grids/hex_grids/01_flat_top.c
+
+The foundation for all hex_grids work.  Uses **axial coordinates** (Q, R) with the cube constraint Q+R+S=0.
+
+**Forward matrix (flat-top):**
+```
+cx = size × 3/2 × Q
+cy = size × (√3/2 × Q  +  √3 × R)
+```
+Each screen pixel is inverse-mapped to fractional axial coords, then `cube_round` snaps to the nearest integer hex.  `angle_char(θ)` picks the right border glyph (`/`, `\`, `|`) by rotating the vector from the hex centre to the pixel.
+
+*Files: `grids/hex_grids/01_flat_top.c`*
+
+---
+
+## 145. Pointy-Top Hexagonal Grid — grids/hex_grids/02_pointy_top.c
+
+Swaps Q and R roles in the forward matrix — a 30° rotation of the flat-top case.  The same `cube_round` kernel and `angle_char` function work unchanged; only the matrix entries differ.  Compare with `01_flat_top.c` to see that orientation is a one-line change in the coordinate transform.
+
+*Files: `grids/hex_grids/02_pointy_top.c`*
+
+---
+
+## 146. Axial Coordinate Display — grids/hex_grids/03_axial.c
+
+Draws the Q=0, R=0, S=0 axis lines through the grid and colour-codes every hex by its hex_dist from the origin.  The cube constraint Q+R+S=0 is the defining invariant — visualising it as three crossing axes helps readers build intuition for why ring distance equals `(|dQ|+|dR|+|dQ+dR|)/2`.
+
+*Files: `grids/hex_grids/03_axial.c`*
+
+---
+
+## 147. Ring-Distance Colouring — grids/hex_grids/04_ring_distance.c
+
+Every hex is coloured by `hex_dist(Q,R, cQ,cR)` from the cursor.  Moving the cursor recolours the whole grid live.  Demonstrates that hex distance forms perfect concentric rings — unlike Manhattan distance on a square grid, which forms diamonds.
+
+*Files: `grids/hex_grids/04_ring_distance.c`*
+
+---
+
+## 148. Triangular-Dual Grid — grids/hex_grids/05_triangular.c
+
+The dual of the hex lattice is a triangular lattice.  Each hex becomes a vertex; each edge between two hexes becomes a triangle edge.  In screen space, up-triangles (▲) appear when `(row+col)%2 == 0`; down-triangles (▽) when odd.  Each triangle has exactly 3 neighbours — compare with the 6-neighbour hex and 4-neighbour rectangle.
+
+*Files: `grids/hex_grids/05_triangular.c`*
+
+---
+
+## 149. Rhombille Tiling — grids/hex_grids/06_rhombille.c
+
+Projects the three visible faces of a cube onto the 2D plane.  Each face is a rhombus (diamond) whose long and short axes are `√3:1`.  Three distinct face orientations tile the plane without gaps.  The cube-face interpretation gives an immediate 3D illusion.
+
+*Files: `grids/hex_grids/06_rhombille.c`*
+
+---
+
+## 150. Trihexagonal Tiling — grids/hex_grids/07_trihexagonal.c
+
+One of the 11 Archimedean tilings: vertex figure `3.6.3.6` — each vertex is surrounded by alternating triangles and hexagons.  Also called the Kagome lattice in physics.  Derived from the hex grid by placing a triangle in the centre of alternating hex cells.
+
+*Files: `grids/hex_grids/07_trihexagonal.c`*
+
+---
+
+## 151. Hex Direct Placement — grids/hex_grids_placement/01_hex_direct.c
+
+Interactive cursor placement on a flat-top hex background.  Cursor lives in axial (Q,R) space; `HEX_DIR[4]` gives the four navigable directions (right, upper-right, lower-right, left — matching arrow keys on the flat-top grid).  `space` toggles a placed object; the object pool uses swap-last O(1) removal.  `cube_round` converts any screen click to the nearest hex.
+
+*Files: `grids/hex_grids_placement/01_hex_direct.c`*
+
+---
+
+## 152. Hex Pattern Stamp — grids/hex_grids_placement/02_hex_pattern.c
+
+Four pattern predicates (disc, ring, row, col) defined purely in axial (dQ, dR) space:
+
+| Mode | Predicate |
+|------|-----------|
+| DISC | `hex_dist(dQ,dR) ≤ N` |
+| RING | `hex_dist(dQ,dR) == N` |
+| ROW  | `dR == 0 && |dQ| ≤ N` |
+| COL  | `dQ == 0 && |dR| ≤ N` |
+
+The preview runs a **full O(rows×cols) per-pixel rasterizer** filtered by the predicate — rather than sparse centre dots — so the overlay shows true hex borders in bright green.  This approach (identical to how the grid draws itself) was chosen after sparse centre-dot previews proved invisible on dark backgrounds.
+
+*Files: `grids/hex_grids_placement/02_hex_pattern.c`*
+
+---
+
+## 153. Hex Path Drawing — grids/hex_grids_placement/03_hex_path.c
+
+Three path types in axial space:
+
+**LINE** — `hex_lerp_round(aQ,aR, bQ,bR, t)` with t ∈ [0,1] at N+1 equal steps.  The linear interpolation in cube space always produces a straight geodesic on the hex grid, even across tricky diagonal directions.
+
+**RING** — Walk N steps from `centre + N×HEX6[4]`, then 6 legs of N steps each turning by one HEX6 direction.  This is the canonical ring-walk algorithm.
+
+**L-PATH** — Walk |dQ| steps along Q-axis then |dR| steps along R-axis.
+
+`a` marks endpoint A; `b` marks endpoint B.  Without `b` pressed, the cursor acts as endpoint B (live preview of path as cursor moves).
+
+*Files: `grids/hex_grids_placement/03_hex_path.c`*
+
+---
+
+## 154. Hex Scatter Placement — grids/hex_grids_placement/04_hex_scatter.c
+
+Four scatter strategies on a hex disc of radius R:
+
+| Key | Strategy | Detail |
+|-----|----------|--------|
+| `1` | Uniform | Include each disc hex with probability = density |
+| `2` | Min-dist | Accept only if `hex_dist ≥ mindist` to all existing objects |
+| `3` | Flood | BFS from centre; accept all cells within disc radius |
+| `4` | Gradient | `P = FALLOFF/(d+FALLOFF)` — dense at centre, sparse at edge |
+
+The min-dist strategy (`2`) is the hex-space equivalent of Poisson-disk sampling.  Because `hex_dist` is an integer metric, the rejection loop is a simple integer comparison with no square root.
+
+*Files: `grids/hex_grids_placement/04_hex_scatter.c`*
 
 ---
 

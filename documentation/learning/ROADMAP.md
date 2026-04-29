@@ -1,6 +1,6 @@
 # Learning Roadmap — ASCII Creative Coding
 
-180 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
+221 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
 and the 2-year breakdown. Do not skip layers.
 
 ---
@@ -58,6 +58,28 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `02_patterns.c` | Pattern stamp — predicate-driven fill | border/fill/hollow/row/col as boolean functions of `(dr,dc,N)`; preview overlay before stamp |
 | `03_path.c` | Two-point path drawing | Bresenham line (error accumulation), L-path, ring border, diagonal staircase; 3-state `SEL_IDLE→ONE→TWO` FSM |
 | `04_scatter.c` | Procedural object scatter | random uniform, Poisson-disk rejection sampling, BFS flood fill, gradient Bernoulli trials; Chebyshev distance |
+| `01_rings_spokes.c` | Standard polar grid — rings + spokes | `cell_to_polar` with CELL_H/CELL_W aspect correction; fmod ring + spoke test; `angle_char` tangent character |
+| `02_log_polar.c` | Log-polar grid — exponential ring spacing | `u = log(r/R_MIN)/log_step`; fractional width `RING_W_U` in log-index space; log-polar transform in retina/SIFT |
+| `03_archimedean_spiral.c` | Archimedean spiral — constant pitch | N-arm phase test `fmod(N×(θ−r/a)+N×2π, 2π)`; why all N arms map to phase≈0 |
+| `04_log_spiral.c` | Logarithmic spiral — growing pitch | `θ_pred = log(r/b)/a`; golden spiral `a=2ln(φ)/π≈0.3065`; equiangular property |
+| `05_sunflower.c` | Phyllotaxis — Vogel sunflower | `(√i×spacing, i×GOLDEN_ANGLE)`; equal-area √i spacing; GOLDEN_ANGLE=2π/φ²; parametric vs screen-sweep |
+| `06_sector.c` | Equal-area sector grid | `k_float=(r/R_UNIT)²`; annular area constant; HEALPix connection |
+| `07_elliptic.c` | Elliptic polar + confocal hyperbolae | `e_r=sqrt((dx/A)²+(dy/B)²)`; `ell_theta` for tangent chars; confocal conic orthogonality |
+| `01_polar_direct.c` | Polar cursor placement — dual-representation | `Cursor{r,θ,row,col}`; screen↔polar mode sync; `polar_to_screen` inverse: `col=ox+round(r×cos(θ)/CELL_W)` |
+| `02_polar_arc.c` | Arc/spoke/ring drawing — two-anchor FSM | IDLE→ONE→TWO state machine; arc step `CELL_W/(r+1)` adapts to radius; ring = full 0→2π walk |
+| `03_polar_spiral.c` | Parametric spiral placement | Archimedean `r=r₀+a×t`; log `r=r₀×e^(growth×t)`; parametric walk vs screen-sweep; golden spiral preset |
+| `04_polar_scatter.c` | Polar scatter — 4 strategies | uniform-area `r=sqrt(r₀²+rand×(r₁²-r₀²))`; Box-Muller radial-Gaussian; wedge angular clamp; ring-snap quantisation |
+| `01_flat_top.c` | Flat-top hexagonal grid — axial coordinates, forward matrix | forward: `cx=size×3/2×Q`, `cy=size×(√3/2×Q+√3×R)`; inverse: `fq=(2/3×px)/size`, `fr=(-px/3+√3py/3)/size`; cube_round for hit-test |
+| `02_pointy_top.c` | Pointy-top hexagonal grid — rotated orientation | rotated forward matrix; both orientations share same axial coordinate engine |
+| `03_axial.c` | Axial coordinate display — Q/R/S axes, cube constraint | Q+R+S=0 plane visualised; axial vs cube vs offset coordinate systems |
+| `04_ring_distance.c` | Ring-distance colouring | `hex_dist=(|dQ|+|dR|+|dQ+dR|)/2`; concentric colour rings from any centre |
+| `05_triangular.c` | Triangular-dual grid — hex dual graph | hex centres become triangle vertices; parity `(row+col)%2` selects up/down triangle |
+| `06_rhombille.c` | Rhombille tiling — cube-face diamonds | three cube faces projected onto 2D; each rhombus is one cube face |
+| `07_trihexagonal.c` | Trihexagonal (Kagome) tiling — `3.6.3.6` vertex figure | alternating triangle+hexagon rings; one of the 11 Archimedean tilings |
+| `01_hex_direct.c` | Hex cursor placement | axial cursor + HEX_DIR[4] movement; swap-last O(1) object pool; cube_round inverse map |
+| `02_hex_pattern.c` | Hex pattern stamp — predicate-driven fill | disc/ring/row/col predicates on `(dQ,dR)`; full per-pixel overlay rasterizer; shows preview before stamp |
+| `03_hex_path.c` | Hex path drawing — line/ring/L-path | hex_lerp_round for interpolated line; ring walk 6×N steps; `a`/`b` dual-endpoint FSM |
+| `04_hex_scatter.c` | Hex procedural scatter — 4 strategies | uniform density; hex_dist min-distance rejection; BFS flood disc; gradient Bernoulli `P=k/(d+k)` |
 
 ---
 

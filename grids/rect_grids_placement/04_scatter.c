@@ -102,6 +102,46 @@
  * The visited[] array prevents re-queuing cells.  It is zeroed before each
  * flood and acts as both the "seen" and "placed" marker.
  *
+ * KEY FORMULAS
+ * ────────────
+ * cheb — Chebyshev distance (king-moves):
+ *   cheb(r0,c0,r1,c1) = max(|r1−r0|, |c1−c0|)
+ *   No sqrt, no multiply.  Chebyshev ball of radius k = (2k+1)² square.
+ *
+ * scatter_mindist — Poisson-ish rejection sampling:
+ *   Accept candidate (r,c) iff cheb(r,c, p.r[i], p.c[i]) >= MIN_DIST
+ *   for all i in pool.  O(n × MAX_TRIES) overall.
+ *
+ * scatter_gradient — Bernoulli per cell, higher P near grid centre:
+ *   dist = cheb(r, c, cr, cc)   where (cr,cc) = grid centre
+ *   P(place) = GRAD_SCALE / (dist + GRAD_SCALE)
+ *   threshold = (long)GRAD_SCALE × RAND_MAX / (dist + GRAD_SCALE)
+ *   place if rand() < threshold
+ *   At dist=0: P=1.0.  At dist=GRAD_SCALE: P=0.5.  At dist=5×GS: P≈17%.
+ *   long cast prevents overflow: GRAD_SCALE×RAND_MAX > INT_MAX.
+ *
+ * scatter_flood — BFS ring buffer:
+ *   Queue size = grid_area = gw × gh.  Never overflows (each cell enters once).
+ *   Visited index: idx = (r − min_r) × gw + (c − min_c)
+ *   Ring buffer: head/tail mod area; head!=tail means non-empty.
+ *   Stop condition: placed >= FLOOD_MAX || pool.count >= MAX_OBJ.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ * Uniform grid, terminal 80×24 → max_r=5, max_c=9 (6×10=60 cells).
+ *
+ * scatter_mindist (MIN_DIST=3, first object placed at (3,5)):
+ *   Candidate (3,6): cheb=max(0,1)=1 < 3 → REJECTED  ✓
+ *   Candidate (1,1): cheb=max(2,4)=4 >= 3 → ACCEPTED  ✓
+ *   Candidate (3,2): cheb=max(0,3)=3 >= 3 → ACCEPTED (boundary)  ✓
+ *   Candidate (3,3): cheb=max(0,2)=2 < 3 → REJECTED  ✓
+ *
+ * scatter_gradient (GRAD_SCALE=6, grid centre cr=2, cc=4):
+ *   Cell (2,4): dist=0, P=6/(0+6)=1.0  → always placed  ✓
+ *   Cell (2,8): dist=max(0,4)=4, P=6/10=0.60  ✓
+ *   Cell (0,0): dist=max(2,4)=4, P=0.60  ✓
+ *   Cell (5,9): dist=max(3,5)=5, P=6/11≈0.55  ✓
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

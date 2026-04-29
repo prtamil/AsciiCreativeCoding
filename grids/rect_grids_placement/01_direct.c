@@ -102,6 +102,46 @@
  * stored (r,c) values; they may appear off-screen if the new mode uses a
  * smaller grid or different origin.  Press C to clear the pool.
  *
+ * KEY FORMULAS
+ * ────────────
+ * ctx_to_screen — the single seam between grid and screen coordinates:
+ *
+ *   Rect (default): sr = r × ch,  sc = c × cw
+ *   Brick-H:        sr = r × ch,  sc = c × cw + (r%2) × (cw/2)
+ *   Brick-V:        sr = r × ch + (c%2) × (ch/2),  sc = c × cw
+ *   Ruled:          sr = r × RL_LS,  sc = c
+ *   Diamond:        sc = ox + (c − r) × DM_IW
+ *                   sr = oy + (c + r) × DM_IH
+ *   ISO:            sc = ox + (c − r) × IS_IW
+ *                   sr = oy + (c + r) × IS_IH
+ *
+ * Diamond/ISO rotation derivation:
+ *   The grid axes are rotated 45°.  c+r increases downward; c−r increases
+ *   rightward.  Scaling by the half-cell size:
+ *     sc = ox + (c−r) × IW    →  right as c increases, left as r increases
+ *     sr = oy + (c+r) × IH    →  down as c+r increases
+ *   Adjacent grid cells are separated by (±IW, ±IH) on screen, forming
+ *   the diamond/rhombus pattern.
+ *
+ * Grid bounds (cursor clamping):
+ *   Rect:    max_r = (rows−2)/ch,   max_c = (cols−1)/cw
+ *   Rotated: min_r=−range, max_r=+range,  min_c=−range, max_c=+range
+ *   Ruled:   max_r = (rows−1)/RL_LS − 1,  max_c = cols−1
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ * Terminal 80×24 → rows=24, cols=80.
+ *
+ * Uniform (U_CW=8, U_CH=4):
+ *   max_r=(24−2)/4=5, max_c=(80−1)/8=9  →  6×10 grid
+ *   ctx_to_screen(r=2, c=3): sr=2×4=8, sc=3×8=24  ✓
+ *   pool_draw offsets by +1 inside cell: object at sr+1=9, sc+1=25  ✓
+ *
+ * Diamond (DM_IW=4, DM_IH=2, ox=40, oy=12):
+ *   ctx_to_screen(r=1, c=2): sc=40+(2−1)×4=44, sr=12+(2+1)×2=18  ✓
+ *   ctx_to_screen(r=0, c=0): sc=40, sr=12  (origin at centre)  ✓
+ *   ctx_to_screen(r=−1, c=1): sc=40+(1+1)×4=48, sr=12+(1−1)×2=12  ✓
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

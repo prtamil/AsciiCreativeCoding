@@ -92,6 +92,47 @@
  * stored at (r,c) values; they render via ctx_to_screen() using the new mode's
  * formula, so they appear at different screen positions.  Press C to clear.
  *
+ * KEY FORMULAS
+ * ────────────
+ * pat_test — five predicate rules (ar=|dr|, ac=|dc|):
+ *
+ *   border(dr,dc,N): (ar==N || ac==N) && ar<=N && ac<=N
+ *     → cells on the outermost row or column of an N-ring square perimeter
+ *     Count = 8N cells
+ *
+ *   fill(dr,dc,N): ar<=N && ac<=N
+ *     → all cells in the (2N+1)×(2N+1) square
+ *     Count = (2N+1)²
+ *
+ *   hollow(dr,dc,N): fill(N) && NOT fill(N−1)
+ *     ≡ cells with max(ar, ac) == N  (L∞ distance = N)
+ *     Count = (2N+1)² − (2N−1)² = 8N  (same as border)
+ *
+ *   row(dr,dc,N): dr==0 && ac<=N
+ *     → horizontal strip of 2N+1 cells
+ *
+ *   col(dr,dc,N): dc==0 && ar<=N
+ *     → vertical strip of 2N+1 cells
+ *
+ * Note: border and hollow are numerically equal because for a square both
+ * definitions select the same cells (the outermost shell).
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ * Uniform grid (U_CW=8, U_CH=4), terminal 80×24.
+ * Cursor at (r=2, c=3), N=2.
+ *
+ * border (N=2): outer ring of a 5×5 box.
+ *   Count = 8×2 = 16 cells placed.
+ *   Top-left offset (dr=−2, dc=−2) → grid cell (0,1)
+ *   screen: sr=0×4+1=1, sc=1×8+1=9  ✓
+ *
+ * fill (N=1): 3×3 = 9 cells.
+ *   Centre (dr=0, dc=0) → grid (2,3); screen: sr=9, sc=25  ✓
+ *
+ * hollow (N=2): 5×5 minus 3×3 = 25−9 = 16 = 8×2 cells.
+ *   Identical to border count — the outermost shell of a square.  ✓
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

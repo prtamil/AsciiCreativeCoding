@@ -99,6 +99,53 @@
  *   Left and right cols: r from min_r to max_r at c0 and c1.
  * No interior cells are placed (unlike PAT_FILL).
  *
+ * KEY FORMULAS
+ * ────────────
+ * path_line — Bresenham's error accumulation:
+ *   dr = |r1−r0|,  dc = |c1−c0|,  sr = sign(r1−r0),  sc = sign(c1−c0)
+ *   Column-major (dc >= dr):
+ *     err = 2×dr − dc
+ *     for i in [0, dc]: place(r,c); c+=sc
+ *       if err > 0: r+=sr; err −= 2×dc
+ *       err += 2×dr
+ *   Row-major (dr > dc): symmetric with dr/dc swapped.
+ *   Invariant: err tracks 2×(minor_steps×major_delta − major_steps×minor_delta).
+ *   When err > 0 the path overshoots; step minor axis and subtract 2×major.
+ *
+ * path_lpath — L-shaped rectilinear path:
+ *   Leg 1 (horizontal): c from c0 to c1, r fixed at r0
+ *   Leg 2 (vertical):   r from r0 to r1, c fixed at c1
+ *   Total unique cells = |dc|+1 + |dr|+1 − 1 = |dc|+|dr|+1
+ *   (minus 1 avoids double-counting the corner at (r0, c1))
+ *
+ * path_ring — hollow rectangle:
+ *   rmin=min(r0,r1), rmax=max(r0,r1), cmin=min(c0,c1), cmax=max(c0,c1)
+ *   Top row:    r=rmin, c ∈ [cmin, cmax]
+ *   Bottom row: r=rmax, c ∈ [cmin, cmax]
+ *   Left col:   c=cmin, r ∈ [rmin+1, rmax−1]
+ *   Right col:  c=cmax, r ∈ [rmin+1, rmax−1]
+ *   Total cells = 2×(|c1−c0|+1) + 2×(|r1−r0|−1) = 2×|dc| + 2×|dr|
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ * Uniform grid (U_CW=8, U_CH=4), terminal 80×24.
+ *
+ * path_line from A=(1,1) to B=(3,5):
+ *   dr=2, dc=4 → column-major; err_init=2×2−4=0; sc=+1, sr=+1
+ *   i=0: place(1,1); err=0 (not>0); c=2, err=0+4=4
+ *   i=1: err=4>0: r=2, err=4−8=−4; c=3, err=−4+4=0
+ *   i=2: err=0 (not>0); c=4, err=0+4=4
+ *   i=3: err=4>0: r=3, err=4−8=−4; c=5, err=0
+ *   Placed: (1,1),(1,2),(2,3),(2,4),(3,5) — 5 cells  ✓
+ *
+ * path_ring from A=(1,1) to B=(3,4):
+ *   rmin=1,rmax=3,cmin=1,cmax=4
+ *   Top (r=1): c=1,2,3,4 — 4 cells
+ *   Bottom (r=3): c=1,2,3,4 — 4 cells
+ *   Left (c=1): r=2 — 1 cell
+ *   Right (c=4): r=2 — 1 cell
+ *   Total = 10 = 2×3 + 2×2 ✓
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

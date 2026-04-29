@@ -9,7 +9,7 @@
 ╚═╝     ╚═╝    ╚═╝     ╚═════╝   ╚═╝  ╚═╝   Make Terminal Great Again
 ```
 
-195 simulations. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
+221 programs. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -32,7 +32,7 @@ Topics span from elementary cellular automata to the Navier-Stokes equations. Fr
 > — Oscar Wilde, The Picture of Dorian Gray
 
 This project is not a library. It is not a framework. It is not a toolkit.
-It is closer to a sketchbook — 180 individual programs, each complete in itself,
+It is closer to a sketchbook — 221 individual programs, each complete in itself,
 each existing for no reason other than that it is interesting to build and beautiful to watch.
 
 **Every file is self-contained by intention.**
@@ -89,6 +89,12 @@ first thing documented in every source file.
 | `wave_interference` | Analytic N-source wave interference — precomputed k·r phase table, aspect-corrected pixel distance, 8-level signed amplitude colour ramp; 4 presets (Double Slit/Ripple Tank/Beat/Radial); 5 themes; interactive source move/add/delete, ω and λ control |
 | `fluid_sph` | SPH particle fluid — kernel density estimation, pressure + viscosity forces, symplectic Euler, O(N·k) spatial grid, 5 scenes, 8 themes |
 | `flowfield` | Perlin fBm vector field — bilinear sampling, 8-direction particle trails |
+| `complex_flowfield` | Complex-function vector field — conformal mapping, Joukowski transform, 6 field presets, 5 themes |
+| `marching_squares` | Isosurface extraction — 16-case 4-bit lookup, linear edge interpolation, animated metaball scalar field |
+| `sand` | Falling-sand cellular automaton — gravity, sliding, density sorting |
+| `shallow_water_solver` | Shallow water equations — height + velocity fields, reflective boundaries, interactive wave injection |
+| `vorticity_streamfunction_solver` | 2D incompressible flow — vorticity-streamfunction formulation, Jacobi-iterated Poisson solve, obstacle boundary |
+| `cfl_stability_explorer` | CFL condition visualiser — live sweep of Courant number across FDTD schemes; shows stable vs unstable regimes |
 
 ### Physics
 | Program | Algorithm |
@@ -115,6 +121,15 @@ first thing documented in every source file.
 | `nuke` | 2D shockwave demo — scalar wave PDE (∂²u/∂t² = c²∇²u − γ∂u/∂t) with 5-point Laplacian, CFL-stable substepping (CFL ≈ 0.33); cylindrical 1/√r decay + γ damping; terrain heave-and-settle ripples; debris arc + ground-dust pool; decaying sinusoidal screen shake; full-screen flash; 6 themes (`t` to cycle) |
 | `beam_bending` | Euler-Bernoulli beam — 9 BC×load combos; analytical w(x) + M(x); curvature-shaded ASCII render + moment panel; dynamic modal superposition (4 eigenmodes, exact damped transition matrix) |
 | `diff_drive_robot` | Differential drive robot — nonholonomic kinematics; pixel-space Euler integration; trail ring buffer; heading + wheel velocity arrows drawn with `.o0` dot progression |
+| `acoustic_wavesolver` | Acoustic pressure wave solver — 2D FDTD on staggered pressure/velocity grid; absorbing PML boundary; interactive source placement |
+| `lattice_boltzman_fluid_simulator` | Lattice Boltzmann fluid — D2Q9 BGK collision, streaming, bounce-back walls; density + velocity visualised; multiple obstacle presets |
+| `mass_spring_lattice` | 2D mass-spring lattice — rectangular mesh of springs; symplectic Euler; wave packet injection; spring constant and damping tunable |
+| `membrane` | 2D membrane vibration — FDTD wave equation on fixed-boundary grid; modal initialisation; aspect-correct pixel display |
+| `conjugate_gradient_linear_solver` | Conjugate-gradient visualiser — animated convergence of CG solving Ax=b; residual norm display; comparison with Gauss-Seidel |
+| `multigrid_solver_visualizer` | Multigrid solver — V-cycle Poisson solver; per-level residual animated; shows restriction and prolongation operators |
+| `rk_method_comparision` | RK integrator comparison — RK1/2/4 side-by-side on same ODE; global error vs step-size; phase-space trajectories |
+| `spectrogram_visualizer` | Spectrogram — real-time STFT with Hann window; frequency × time heat-map; 3-component sine mixer |
+| `bounce_ball` | Reference implementation — single bouncing ball with gravity and floor restitution; the simplest complete framework example |
 
 ### Fractals & Chaos
 | Program | Algorithm |
@@ -190,7 +205,11 @@ first thing documented in every source file.
 
 ### Grid Systems
 
-All 14 grid types are implemented as standalone display programs in `grids/rect_grids/`, and as unified interactive editors in `grids/rect_grids_placement/`. Every placement editor accepts `a`/`e` to cycle through all 14 grid types live.
+All 14 rectangular grid types are implemented as standalone display programs in `grids/rect_grids/`, and as unified interactive editors in `grids/rect_grids_placement/`. Every placement editor accepts `a`/`e` to cycle through all 14 grid types live.
+
+Seven polar grid variants are in `grids/polar_grids/`, covering the full range from circular rings through spirals, phyllotaxis, equal-area sectors, and elliptic coordinates. Four interactive polar placement editors are in `grids/polar_grids_placement/`, mirroring the rect_grids_placement series: cursor placement, arc/spoke/ring drawing, parametric spiral placement, and four scatter strategies.
+
+Seven hexagonal grid variants are in `grids/hex_grids/`, covering flat-top and pointy-top orientations, axial coordinates, ring-distance colouring, and three Laves-lattice tilings (triangular dual, rhombille, trihexagonal). Four interactive hex placement editors are in `grids/hex_grids_placement/`, using axial (Q,R) coordinates throughout: cursor toggle, pattern stamp (disc/ring/row/col), two-endpoint path drawing (line/ring/L-path), and four scatter strategies.
 
 #### Background Grid Displays (`grids/rect_grids/`)
 | Program | Grid Type |
@@ -218,17 +237,59 @@ All 14 grid types are implemented as standalone display programs in `grids/rect_
 | `03_path` | Two-point path drawing — `p` cycles IDLE→A→B; `l`=Bresenham line, `j`=L-path, `o`=ring, `x`=diagonal |
 | `04_scatter` | Procedural scatter — `R`=random, `M`=Poisson min-distance, `F`=BFS flood, `G`=gradient density |
 
+#### Polar Grid Displays (`grids/polar_grids/`)
+| Program | Algorithm |
+|---------|-----------|
+| `01_rings_spokes` | Standard polar grid — concentric rings + radial spokes; fmod detects all simultaneously |
+| `02_log_polar` | Log-polar grid — rings at `R_MIN × RATIO^k`; fractional width in log-ring-index space |
+| `03_archimedean_spiral` | Archimedean spiral — constant-pitch arms; N-arm phase test `fmod(N×(θ−r/a), 2π)` |
+| `04_log_spiral` | Logarithmic spiral — gap grows with radius; golden spiral preset `a≈0.3065` |
+| `05_sunflower` | Phyllotaxis — Vogel model `(√i×spacing, i×GOLDEN_ANGLE)`; 'g' cycles angle variants |
+| `06_sector` | Equal-area sectors — rings at `√k × R_UNIT` so every annulus has equal area |
+| `07_elliptic` | Elliptic polar — `e_r = sqrt((dx/A)²+(dy/B)²)`; 'h' overlays confocal hyperbolae |
+
+#### Polar Placement Editors (`grids/polar_grids_placement/`)
+| Program | Algorithm |
+|---------|-----------|
+| `01_polar_direct` | Cursor placement — screen-mode (Δrow/Δcol) or polar-mode (Δr/Δθ); `m` toggles; all 7 polar backgrounds via `a`/`e` |
+| `02_polar_arc` | Arc/spoke/ring drawing — two-anchor state machine; `l`=arc, `s`=spoke, `r`=ring, `x`=radial; PAIR_ANCHOR highlights anchors |
+| `03_polar_spiral` | Parametric spiral placement — `l`=Archimedean `r=r₀+aθ`, `o`=log-spiral `r=r₀eᵍᶿ`; `d` draws; pitch/turns/density tunable |
+| `04_polar_scatter` | Procedural scatter — `U`=uniform-area, `G`=radial-Gaussian (Box-Muller), `W`=wedge, `D`=ring-snap; `[`/`]` adjusts sigma/wedge |
+
+#### Hex Grid Displays (`grids/hex_grids/`)
+| Program | Grid Type |
+|---------|-----------|
+| `01_flat_top` | Flat-top hexagonal grid — forward matrix `cx=size×3/2×Q`, `cy=size×(√3/2×Q+√3×R)`; cube-round hit test; angle_char border rasterizer |
+| `02_pointy_top` | Pointy-top hexagonal grid — rotated forward matrix; alternating row offset layout; same axial core |
+| `03_axial` | Axial coordinate display — Q/R/S axis lines; cube constraint Q+R+S=0 visualised; ring-distance colour bands |
+| `04_ring_distance` | Ring-distance colouring — hex_dist=(|dQ|+|dR|+|dQ+dR|)/2; concentric colour rings from origin |
+| `05_triangular` | Triangular-dual grid — triangular tessellation derived from hex centres; up/down triangle parity |
+| `06_rhombille` | Rhombille tiling — three-direction diamond lattice; cube-face projection mapping |
+| `07_trihexagonal` | Trihexagonal (Kagome) tiling — alternating hexagons and triangles; vertex-figure `3.6.3.6` |
+
+#### Hex Placement Editors (`grids/hex_grids_placement/`)
+| Program | Algorithm |
+|---------|-----------|
+| `01_hex_direct` | Cursor placement — axial (Q,R) cursor; `space` toggles objects; `+/-` hex size; cube_round hit-test; HEX_DIR[4] movement |
+| `02_hex_pattern` | Pattern stamp — disc/ring/row/col predicates in axial space; full per-pixel border overlay preview (bright green); `+/-` radius; 4 stamp glyphs |
+| `03_hex_path` | Two-endpoint path drawing — `a`/`b` set endpoints; `l`=line (hex_lerp_round), `o`=ring (6N cells), `j`=L-path; live green-dot preview |
+| `04_hex_scatter` | Procedural scatter — `1`=uniform, `2`=min-dist (hex_dist rejection), `3`=flood-fill disc, `4`=gradient density; `+/-` radius |
+
 ### Geometry
 | Program | Algorithm |
 |---------|-----------|
 | `rect_grid` | Rectangular character grid — per-cell random rate, dual sinusoidal colour waves, 6 themes |
 | `polar_grid` | Polar character grid — concentric rings, alternating rotation, colour by ring, 6 themes |
 | `hex_grid` | Hexagonal character grid — offset-row tiling, cube-coordinate ring distance for colour bands |
+| `grid_proper` | Unified grid explorer — all grid types in a single interactive switcher |
 | `lissajous` | Harmonograph/Lissajous — two damped perpendicular oscillators, phase drift |
 | `spirograph` | Hypotrochoid parametric curves — 3 simultaneous with parameter drift |
 | `string_art` | Modular arithmetic i→⌊i×k⌋ mod N, morphing cardioid/nephroid/astroid |
 | `voronoi` | Brute-force nearest-neighbor, Langevin seed motion, d2−d1 edge detection |
 | `convex_hull` | Graham scan + Jarvis march — simultaneous race |
+| `delaunay_triangulation` | Bowyer-Watson incremental Delaunay — circumcircle insertion, edge flip to fix violations |
+| `kd_tree` | k-d tree — 2D median-split BSP; nearest-neighbour and range-query animated; static pool |
+| `visibility_polygon` | Visibility polygon — radial sweep, endpoint sort, shadow casting from a point light |
 | `quad_tree_helloworld` | Animated quadtree — INSERT phase (random points, live subdivision) → QUERY phase (drifting rectangle, AABB pruning visible); static node pool, depth-coloured borders, scrolling info panel |
 | `quadtree` | Quadtree pure-C demo — 8-step walkthrough: fill root, trigger VERTICAL+HORIZONTAL subdivisions, range query; ANSI-coloured ASCII grid; malloc-based nodes |
 | `bsp_tree` | BSP tree pure-C demo — alternating VERTICAL (!) / HORIZONTAL (=) splits, front/back children, AABB range query with full right-half pruning; 8-step walkthrough |
@@ -251,11 +312,17 @@ All 14 grid types are implemented as standalone display programs in `grids/rect_
 |---------|-----------|
 | `hexpod_tripod` | 6-legged robot — tripod gait (alternating support triangles), 2-joint analytical IK (law of cosines), 4-direction steering with angular interpolation, toroidal wrap |
 | `ik_spider` | IK spider — sinusoidal body locomotion, 2-joint IK per limb, step-trigger gait |
-| `ik_arm_reach` | 2-joint arm — mouse-driven IK reach with elbow-side toggle |
+| `ik_arm_reach` | 2-joint arm — FABRIK IK reach with elbow-side toggle, Lissajous target path |
+| `ik_tentacle_seek` | Seeking tentacles — FABRIK solver on wandering target, per-segment reach tolerance, multiple independent chains |
 | `ragdoll_figure` | Ragdoll stick figure — constraint-projected Verlet joints, momentum carry-over |
+| `ragdoll_ropes` | Multi-rope Verlet chains — damping, phase-offset anchors, iterative constraint relaxation |
+| `snake_forward_kinematics` | FK snake — circular trail-buffer chain, sinusoidal heading, bead rendering, 10 themes |
 | `snake_inverse_kinematics` | FABRIK inverse kinematics snake — iterative forward/backward reach solver |
-| `fk_centipede` | Centipede — forward kinematics body chain, leg phase offsets |
+| `fk_centipede` | Centipede — trail-buffer FK body, stateless sinusoidal FK legs, contralateral antiphase gait |
+| `fk_tentacle_forest` | Tentacle forest — pure stateless sinusoidal FK; per-tentacle phase/frequency/amplitude parameters |
+| `fk_medusa` | Medusa jellyfish — radial bell-oscillation FK + cascaded trailing tentacle FK chains |
 | `walking_robot` | Procedural bipedal walk cycle — sinusoidal FK, 2-joint analytical IK stance, foot contact locking, body sway, shadow ellipse, COM projection, motion trails, ground grid |
+| `moving_jump_spring_leg_robot` | Spring-leg jumping robot — spring-mass leg compression/release, aerial phase, landing absorption |
 | `perlin_terrain_bot` | Self-balancing wheel bot — inverted pendulum Lagrangian cart-pole on Perlin terrain slope; PID controller with cascade slope feed-forward; phase portrait, gain preset tuning |
 
 ### Artistic / Biological
@@ -267,12 +334,31 @@ All 14 grid types are implemented as standalone display programs in `grids/rect_
 | `gear` | Wireframe rotating gear — proximity-based edge detection, tangential surface-velocity sparks, speed-proportional emission, 10 color themes (fire/matrix/plasma/nova/poison/ocean/gold/neon/arctic/lava) |
 | `railwaymap` | Procedural transit map — H/V/Z grid-aligned line templates, canvas-based ACS junction detection, station interchange, 10 themes |
 | `fireworks_rain` | Fireworks with matrix-rain arc trails — each of 72 sparks per explosion grows a 16-slot position-history trail; chars shimmer 75 % per tick; 5 themes (vivid/matrix/fire/ice/plasma) remap all spark color pairs; `t` cycles theme |
+| `matrix_rain` | Classic digital rain — cascading katakana/Latin glyphs, speed and density tunable, 5 themes |
 | `matrix_snowflake` | Matrix rain + live DLA snowflake — two real simulations on one screen: classic digital rain in the background; a D6-symmetric DLA ice crystal grows from the center in the foreground, freezing 12 symmetric positions per walker stick event; crystal flashes white on completion then resets; 5 themes (Classic/Inferno/Nebula/Toxic/Gold) |
+| `pulsar_rain` | Rotating pulsar neutron star — N-beam (1–16) lighthouse sweep; angular wake cache; pre-computed trig reuse across radii; render interpolation for smooth rotation |
+| `sun_rain` | Matrix-rain solar — circular clip mask, radial solar wind streams, parametric border ring with rotating wave |
 | `led_number_morph` | Particle digit morphing — 168 particles form a scaled 7-segment LED display; particles belong permanently to one segment and spring to their targets when the segment is lit, drift to centre when dark; orientation-aware chars ('-' horizontal, '|' vertical) for formed segments; scales with terminal height; 5 themes with per-digit colours; `n` skip, `]`/`[` speed |
 | `particle_number_morph` | Solid filled particle morphing — up to 500 particles densely pack the full interior of a 9×7 bitmap font digit; greedy nearest-neighbour matching routes every particle to its closest target; positions lerp with smoothstep easing (no spring/velocity) for a clean deterministic glide; idle particles glide to centre and vanish; `f`/`F` morph speed, `]`/`[` hold time; 5 themes |
 | `dune_rocket` | Dune-universe rocket launch — particle exhaust trails, `+/-` launch rate, `Space` salvo burst |
 | `dune_sandworm` | Dune sandworm — sinusoidal body locomotion, surface breach animation, `Space` trigger breach, `+/-` speed |
 | `sand_art` | Hourglass sand art — 5-layer coloured falling-sand CA; gravity-flip on `Space`; scan sweeps away from gravity so grains never move twice per tick; `R` pour fresh layers |
+| `bat` | Bat silhouette animation — flapping wing kinematics, Bézier curve body outline, moth-hunt targeting |
+| `bonsai` | Procedural bonsai tree — recursive L-system branching, aging simulation, seasonal cycle |
+| `leaf_fall` | Falling leaves — Euler-angle tumbling with aerodynamic torque, ground accumulation |
+| `dna` | DNA double helix — parametric strand animation, base-pair rungs, rotation and colour cycling |
+### Particle Systems
+| Program | Algorithm |
+|---------|-----------|
+| `fire` | Fire — 3 switchable algorithms: CA heat diffusion, upward particle splat, plasma sine sum; shared Floyd-Steinberg + LUT pipeline |
+| `smoke` | Smoke — 3 algorithms: CA diffusion, particle Gaussian splat, Perlin-driven curl; shared density→char pipeline |
+| `fireworks` | Fireworks — 3-state rocket FSM (LAUNCH/BURST/FALL); shell burst to N sparks; gravity + drag |
+| `kaboom` | Explosion — deterministic LCG ring expansion, shock-front char ramp, debris scatter |
+| `particles` | General particle sandbox — spawn, gravity, bounce, colour-by-age |
+| `aafire_port` | AAlib fire port — classic fire algorithm adapted for ncurses; bottom-row heat source, upward diffusion, char-density palette |
+| `brust` | Staggered burst waves — multiple expanding rings with phase offset, echo decay |
+| `constellation` | Constellation network — proximity-linked stars, Delaunay-style edge pruning, slow drift |
+
 ### Algorithms
 | Program | Algorithm |
 |---------|-----------|
@@ -345,7 +431,11 @@ See `CLAUDE.md` for the complete build list.
 ├── geometry/          — parametric curves, grids, computational geometry (lissajous, voronoi, convex hull…)
 ├── grids/
 │   ├── rect_grids/        — 14 grid-type displays (uniform, square, brick, diamond, iso, …)
-│   └── rect_grids_placement/ — 4 interactive placement editors (direct/patterns/path/scatter)
+│   ├── rect_grids_placement/ — 4 interactive placement editors (direct/patterns/path/scatter)
+│   ├── polar_grids/       — 7 polar grid types (rings, log, spirals, phyllotaxis, sector, elliptic)
+│   ├── polar_grids_placement/ — 4 polar placement editors (direct/arc/spiral/scatter)
+│   ├── hex_grids/         — 7 hex grid types (flat-top, pointy-top, axial, ring-dist, triangular, rhombille, trihexagonal)
+│   └── hex_grids_placement/ — 4 hex placement editors (direct/pattern/path/scatter)
 ├── matrix_rain/       — Matrix rain variants (classic rain, DLA snowflake hybrid)
 ├── misc/              — sorting, maze, forest fire
 ├── particle_systems/  — fire (3 algos), smoke (3 algos), fireworks, explosions
@@ -365,7 +455,7 @@ See `CLAUDE.md` for the complete build list.
     ├── COLOR.md           — color theory, 256-color usage, theme design
     └── learning/
         ├── ROADMAP.md         — 6-tier study order, 2-year plan
-        └── concept_*.md       — 168 deep-dive concept files
+        └── concept_*.md       — 179 deep-dive concept files
                                  (math → pseudocode → implementation notes)
 ```
 
@@ -373,7 +463,7 @@ See `CLAUDE.md` for the complete build list.
 
 ## Documentation
 
-`documentation/learning/` contains 168 concept files — one per program. Each file has two passes:
+`documentation/learning/` contains 179 concept files — one per program. Each file has two passes:
 
 - **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
 - **Pass 2** — pseudocode, module map, data flow diagram, core loop

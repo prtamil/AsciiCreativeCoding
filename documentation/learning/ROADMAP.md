@@ -1,6 +1,6 @@
 # Learning Roadmap — ASCII Creative Coding
 
-221 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
+257 C files, 40+ topics. This roadmap gives the optimal study order, the per-file loop,
 and the 2-year breakdown. Do not skip layers.
 
 ---
@@ -80,6 +80,27 @@ Needs only geometry and trigonometry. Fast feedback loops.
 | `02_hex_pattern.c` | Hex pattern stamp — predicate-driven fill | disc/ring/row/col predicates on `(dQ,dR)`; full per-pixel overlay rasterizer; shows preview before stamp |
 | `03_hex_path.c` | Hex path drawing — line/ring/L-path | hex_lerp_round for interpolated line; ring walk 6×N steps; `a`/`b` dual-endpoint FSM |
 | `04_hex_scatter.c` | Hex procedural scatter — 4 strategies | uniform density; hex_dist min-distance rejection; BFS flood disc; gradient Bernoulli `P=k/(d+k)` |
+| `01_equilateral.c` | Equilateral triangular tiling — 2-axis skew lattice | basis `v₁=(s,0), v₂=(s/2, s√3/2)`; pixel→lattice inverse `b=py/h, a=px/s−0.5b`; ▽/△ split by `fa+fb=1`; barycentric edge picker; cursor (col,row,up) walked by TRI_DIR[4][2] |
+| `02_right_isosceles.c` | Half-rect tiling — single-diagonal split | axis-aligned lattice; UR/LL split by `fa≥fb`; barycentric weights pick `\|`/`\\`/`_` per orientation |
+| `03_double_diagonal.c` | Tetrakis square tiling — 4 wedges per cell | wedge classifier from `\|fa−½\|` vs `\|fb−½\|`; vertex config `8.8.8.8`; per-wedge barycentric formula |
+| `04_30_60_90.c` | Kisrhombille — equilateral grid + 3 medians per triangle | line equations for medians (`fa−fb=0`, `fa+2fb−1=0`, etc.); signed-distance with `1/√(aL²+bL²)` normalisation; 12 right triangles per vertex |
+| `05_isometric.c` | Iso solid-fill grid — 6-cycle palette | `palette_index = (col+2·row+up) mod 6`; six triangles meeting at vertex get six distinct slots; A_REVERSE on cursor for visibility |
+| `06_hex_subdivision.c` | Hex with three diagonals — 6 equilateral wedges | hex via cube_round (from hex_grids/01); sector via `atan2 + π/6` bucketed into `π/3`; three centre-line proximity tests |
+| `07_barycentric.c` | Recursive barycentric subdivision | Hatcher §2.1 algebraic-topology decomposition; centroid + 3 midpoints → 6 children; 6^N leaves; stack-only recursion |
+| `08_triforce.c` | 4-way midpoint subdivision | three corner children + inverted centre; Loop subdivision base step; 4^N leaves; the "triforce" visual at every level |
+| `09_sierpinski.c` | Sierpinski gasket | drop the centre child of the triforce; 3^N leaves; Hausdorff dimension log₂3 ≈ 1.585; area→0, perimeter→∞ |
+| `10_pinwheel.c` | Pinwheel-inspired 5-way split of a 1-2-√5 right triangle | midpoint subdivision + altitude bisect of inverted centre; 5^N leaves; aperiodic-looking; documented deviation from strict Conway-Radin |
+| `11_delaunay.c` | Delaunay triangulation via Bowyer-Watson | super-triangle scaffold; in-circumcircle determinant predicate; bad triangles → star-shaped hole → re-triangulation; CCW orientation enforced |
+| `12_penrose.c` | Robinson-triangle golden-ratio substitution | acute (apex 36°, leg=φ·base) + obtuse (apex 108°, base=φ·leg); split point at `1/φ` along edge; A→B+A and B→A+B; aperiodic limit |
+| `01_equilateral_direct.c` | Direct triangle placement — equilateral grid | `(col,row,up)` cursor with TRI_DIR[4][2]; SPACE toggles ObjectPool; per-cell-aspect `tri_centroid_pixel` for object/cursor draw |
+| `01_equilateral_patterns.c` | Triangle pattern stamps — equilateral | static `(Δcol, Δrow, target_up)` arrays for RING/LINE/STAR/TRIFORCE; pool_add no-op on collision; rand scatter as 5th preset |
+| `01_equilateral_path.c` | Triangle line-of-sight path — equilateral | pixel-walk between two centroids at step `size·0.25`; `pixel_to_tri` per sample collects unique triangles |
+| `01_equilateral_scatter.c` | Distance-coloured scatter — equilateral | Manhattan-style `\|Δc\|+\|Δr\|+\|Δu\|`; 6-bucket gradient; LCG xor'd by clock for reseed |
+| `02_right_isosceles_*` | Half-rect placement quartet | axis-aligned (col,row,up); same direct/patterns/path/scatter pattern as equilateral |
+| `03_double_diagonal_*` | Tetrakis placement quartet | wedge cursor `(col,row,dir)` with TETRA_DIR[4][4]; arrows toward N/E/S/W; `dir` distance includes mod-4 sector difference |
+| `04_30_60_90_*` | Kisrhombille placement quartet | same cursor as equilateral but rendering adds median proximity check + PAIR_MEDIAN colour |
+| `05_isometric_*` | Iso solid-fill placement quartet | iso 6-cycle palette as cell background; objects/path/scatter/cursor render in `A_REVERSE` over fill so they're always visible |
+| `06_hex_subdivision_*` | Hex-subdivision placement quartet | `(Q,R,sector)` cursor; arrows walk hex via HEX_DIR[4], `,`/`.` rotate sector; wedge-distance metric for scatter gradient |
 
 ---
 

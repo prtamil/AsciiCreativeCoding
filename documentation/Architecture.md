@@ -189,6 +189,22 @@ Reference implementation: `basics/bounce_ball.c`
 152. [Hex Pattern Stamp — grids/hex_grids_placement/02_hex_pattern.c](#152-hex-pattern-stamp--gridshex_grids_placement02_hex_patternc)
 153. [Hex Path Drawing — grids/hex_grids_placement/03_hex_path.c](#153-hex-path-drawing--gridshex_grids_placement03_hex_pathc)
 154. [Hex Scatter Placement — grids/hex_grids_placement/04_hex_scatter.c](#154-hex-scatter-placement--gridshex_grids_placement04_hex_scatterc)
+155. [Equilateral Triangular Grid — grids/tri_grids/01_equilateral.c](#155-equilateral-triangular-grid--gridstri_grids01_equilateralc)
+156. [Right-Isosceles Half-Rect Grid — grids/tri_grids/02_right_isosceles.c](#156-right-isosceles-half-rect-grid--gridstri_grids02_right_isoscelesc)
+157. [Tetrakis Double-Diagonal Grid — grids/tri_grids/03_double_diagonal.c](#157-tetrakis-double-diagonal-grid--gridstri_grids03_double_diagonalc)
+158. [Kisrhombille 30-60-90 Grid — grids/tri_grids/04_30_60_90.c](#158-kisrhombille-30-60-90-grid--gridstri_grids04_30_60_90c)
+159. [Isometric Solid-Fill Grid — grids/tri_grids/05_isometric.c](#159-isometric-solid-fill-grid--gridstri_grids05_isometricc)
+160. [Hex Subdivision Grid — grids/tri_grids/06_hex_subdivision.c](#160-hex-subdivision-grid--gridstri_grids06_hex_subdivisionc)
+161. [Recursive Barycentric Subdivision — grids/tri_grids/07_barycentric.c](#161-recursive-barycentric-subdivision--gridstri_grids07_barycentricc)
+162. [Triforce Midpoint Subdivision — grids/tri_grids/08_triforce.c](#162-triforce-midpoint-subdivision--gridstri_grids08_triforcec)
+163. [Sierpinski Triangle — grids/tri_grids/09_sierpinski.c](#163-sierpinski-triangle--gridstri_grids09_sierpinskic)
+164. [Pinwheel-Style Substitution — grids/tri_grids/10_pinwheel.c](#164-pinwheel-style-substitution--gridstri_grids10_pinwheelc)
+165. [Delaunay Triangulation — grids/tri_grids/11_delaunay.c](#165-delaunay-triangulation--gridstri_grids11_delaunayc)
+166. [Penrose Robinson-Triangle Substitution — grids/tri_grids/12_penrose.c](#166-penrose-robinson-triangle-substitution--gridstri_grids12_penrosec)
+167. [Triangle Direct Placement — grids/tri_grids_placement/](#167-triangle-direct-placement--gridstri_grids_placement)
+168. [Triangle Pattern Placement — grids/tri_grids_placement/](#168-triangle-pattern-placement--gridstri_grids_placement)
+169. [Triangle Path Placement — grids/tri_grids_placement/](#169-triangle-path-placement--gridstri_grids_placement)
+170. [Triangle Scatter Placement — grids/tri_grids_placement/](#170-triangle-scatter-placement--gridstri_grids_placement)
 
 ---
 
@@ -5150,6 +5166,259 @@ Four scatter strategies on a hex disc of radius R:
 The min-dist strategy (`2`) is the hex-space equivalent of Poisson-disk sampling.  Because `hex_dist` is an integer metric, the rejection loop is a simple integer comparison with no square root.
 
 *Files: `grids/hex_grids_placement/04_hex_scatter.c`*
+
+---
+
+## 155. Equilateral Triangular Grid — grids/tri_grids/01_equilateral.c
+
+The base of the triangular grid family.  Two-axis skew lattice with basis `v₁=(s,0)` and `v₂=(s/2, s·√3/2)`.  Every rhombus contains two equilateral triangles — `▽` (lower-left) and `△` (upper-right) — separated by the diagonal `fa+fb=1` in lattice space.  Pixel→lattice inverse:
+
+```
+b = py / h           (h = s·√3/2 = strip height)
+a = px/s − 0.5·b     (undoes the half-step shear of v₂)
+```
+
+Triangle id `(col, row, up) = (⌊a⌋, ⌊b⌋, fa+fb≥1)`.  Edge proximity uses barycentric weights — for `▽`: `l₁=1−fa−fb, l₂=fa, l₃=fb`; the smallest weight names the edge opposite that vertex and selects the line character (`/`, `\`, `_`).  Cursor walked by `TRI_DIR[4][2]` lookup table; UP·UP traverses one full strip from any orientation.
+
+*Files: `grids/tri_grids/01_equilateral.c`*
+
+---
+
+## 156. Right-Isosceles Half-Rect Grid — grids/tri_grids/02_right_isosceles.c
+
+Square cells split by a single `\` diagonal into UR and LL right-isosceles triangles.  Axis-aligned lattice (no shear): `a=px/s, b=py/s`.  Diagonal split: `up = (fa ≥ fb) ? UR : LL`.
+
+Barycentric weights:
+- UR (vertices A=(0,0), B=(1,0), C=(1,1)): `l_A=1−fa, l_B=fa−fb, l_C=fb` → `|`, `\`, `_`
+- LL (A=(0,0), C=(1,1), D=(0,1)):           `l_A=1−fb, l_C=fa, l_D=fb−fa` → `_`, `|`, `\`
+
+Cursor `TRI_DIR[4][2]` table — UP from LL toggles to UR (LL has no top edge), DOWN from UR toggles to LL.
+
+*Files: `grids/tri_grids/02_right_isosceles.c`*
+
+---
+
+## 157. Tetrakis Double-Diagonal Grid — grids/tri_grids/03_double_diagonal.c
+
+Both diagonals applied to each square — four right-isosceles wedges per cell, vertex configuration `8.8.8.8`.  Wedge classifier from offsets `(dx, dy) = (fa−½, fb−½)`:
+
+```
+|dx| > |dy|, dx > 0  →  E
+|dx| > |dy|, dx < 0  →  W
+|dy| ≥ |dx|, dy > 0  →  S
+|dy| ≥ |dx|, dy < 0  →  N
+```
+
+Each wedge has its own barycentric-weight formula (apex at the cell centre `C=(½,½)` for all four).  Cursor `TETRA_DIR[4][4]` — arrow keys move toward the matching apex direction within the cell, jumping cells when already at that apex.
+
+*Files: `grids/tri_grids/03_double_diagonal.c`*
+
+---
+
+## 158. Kisrhombille 30-60-90 Grid — grids/tri_grids/04_30_60_90.c
+
+The "kis" operation applied to the equilateral grid: each triangle is split by its three medians into 6 right (30-60-90) sub-triangles meeting at the centroid.  Twelve sub-triangles meet at every original equilateral vertex; vertex configuration `4.6.12`.
+
+Pixel→equilateral identical to grid 01.  Median proximity tested with signed-distance to three line equations per orientation, normalised by `1/√(aL²+bL²)`:
+
+- ▽ medians: `fa−fb=0` (diagonal `\`), `fa+2·fb−1=0` (`/`), `2·fa+fb−1=0` (`|`)
+- △ medians: `fa−fb=0` (shared diagonal), `2·fa+fb−2=0` (`|`), `fa+2·fb−2=0` (`/`)
+
+Edge wins ties with the median: draw the equilateral edge if its weight is below the threshold AND ≤ the smallest median distance.  Cursor identical to grid 01 (whole-equilateral selection).
+
+*Files: `grids/tri_grids/04_30_60_90.c`*
+
+---
+
+## 159. Isometric Solid-Fill Grid — grids/tri_grids/05_isometric.c
+
+Same equilateral lattice as grid 01, but each triangle is filled with a solid background colour from a 6-cycle palette indexed by `palette_index(col, row, up) = (col + 2·row + up) mod 6`.  Walking around any vertex of the tiling visits the six distinct slots in order — exactly the visual signature of an isometric "stack of cubes" projection.
+
+No edge characters; the visual boundary between triangles is the colour discontinuity itself.  Cursor renders with `A_REVERSE` so it inverts the underlying triangle colour and stays visible regardless of which palette slot it sits on.
+
+*Files: `grids/tri_grids/05_isometric.c`*
+
+---
+
+## 160. Hex Subdivision Grid — grids/tri_grids/06_hex_subdivision.c
+
+Each hexagon split into six equilateral wedges by drawing radii from the centre to each vertex (three diagonals through the centre).  Hex identification reuses the cube-round inverse from `hex_grids/01_flat_top.c`; sector identification adds an angular bin around the hex centre:
+
+```
+sector = ⌊(atan2(dy, dx) + π/6) / (π/3)⌋ mod 6
+```
+
+Three centre-line proximity tests render the radii in `PAIR_RADIUS`.  Cursor stored as `(Q, R, sector)`; arrow keys walk hex via `HEX_DIR[4]`, `,`/`.` rotate the sector counter-/clockwise.
+
+*Files: `grids/tri_grids/06_hex_subdivision.c`*
+
+---
+
+## 161. Recursive Barycentric Subdivision — grids/tri_grids/07_barycentric.c
+
+Algebraic-topology decomposition (Hatcher §2.1).  At each step take a triangle `(V₀, V₁, V₂)`, compute centroid `C = (V₀+V₁+V₂)/3` and edge midpoints `Mᵢⱼ = (Vᵢ+Vⱼ)/2`, emit six children `(C, V₀, M₀₁), (C, M₀₁, V₁), …` walking around the parent counter-clockwise.
+
+Each child is a 30-60-90 right triangle.  At depth N the result has `6^N` leaves.  Stack-only recursion; each leaf draws its three edges via Bresenham + slope→character.  Colour keyed to depth — early levels drawn first so deeper edges overwrite them, giving the "outer = bold, inner = fine" visual.
+
+*Files: `grids/tri_grids/07_barycentric.c`*
+
+---
+
+## 162. Triforce Midpoint Subdivision — grids/tri_grids/08_triforce.c
+
+Midpoint subdivision (Loop subdivision base step).  Three midpoints per triangle, four children: three corner triangles same-orientation, one inverted centre.  At depth N: `4^N` leaves, each at scale `2⁻ᴺ`.
+
+The "Triforce" visual at every level: pointing-up corners + pointing-down centre.  The centre child's vertices are listed in REVERSE order (`M₁₂, M₂₀, M₀₁`) — doesn't affect rendering (we draw the same three edges either way) but matters if a subsequent step relied on vertex-order semantics.
+
+*Files: `grids/tri_grids/08_triforce.c`*
+
+---
+
+## 163. Sierpinski Triangle — grids/tri_grids/09_sierpinski.c
+
+Same midpoint split as 08, but the inverted centre child is dropped — keeping only the three corner children.  At depth N: `3^N` leaves.
+
+The fractal limit set has Hausdorff dimension `log₂3 ≈ 1.585`, area zero, infinite perimeter.  At finite depth N the figure occupies `(3/4)^N` of the parent's area (tending to zero) and has perimeter `(3/2)^N · P₀` (tending to infinity).
+
+*Files: `grids/tri_grids/09_sierpinski.c`*
+
+---
+
+## 164. Pinwheel-Style Substitution — grids/tri_grids/10_pinwheel.c
+
+Pinwheel-inspired aperiodic substitution of a 1-2-√5 right triangle.  Step:
+
+1. Compute the three edge midpoints — gives the standard 4-way midpoint subdivision.
+2. The inverted centre child is similar to the parent.  Find its right-angle vertex (`M₂₀`) and the foot of perpendicular `F` to the opposite hypotenuse `M₀₁M₁₂`.
+3. Split the centre into halves `(M₂₀, M₀₁, F)` and `(M₂₀, F, M₁₂)`.
+4. Emit five children: three corner triangles (scale 1/2) + two altitude halves of centre (scales 1/√5 and 1/(2√5)).
+
+NOT strict Conway-Radin pinwheel — the strict version uses 5 identically-scaled children with rotations of `arctan(1/2) ≈ 26.57°`.  This file uses a related substitution where the 5 children are similar but at TWO scales; visually just as aperiodic-looking, the difference is bookkeeping.
+
+*Files: `grids/tri_grids/10_pinwheel.c`*
+
+---
+
+## 165. Delaunay Triangulation — grids/tri_grids/11_delaunay.c
+
+Bowyer-Watson incremental Delaunay triangulation of N random points.  Steps:
+
+1. Install a giant super-triangle that contains every input point (50× the larger screen dimension).
+2. For each input P:
+   - Find every triangle whose circumcircle contains P (the "bad" triangles).
+   - The bad triangles form a star-shaped polygon ("hole"); delete them.
+   - Connect P to every boundary edge of the hole — fresh triangles.
+3. Remove every triangle still touching a super-triangle vertex; the rest is the Delaunay triangulation.
+
+In-circumcircle predicate (3×3 determinant) for triangle `ABC` (CCW) and query `P`:
+
+```
+det = a²·(bx·cy − cx·by)
+    − b²·(ax·cy − cx·ay)
+    + c²·(ax·by − bx·ay)
+```
+
+where `(ax,ay) = A − P` etc., and `a² = ax² + ay²`.  Sign positive ⇔ P strictly inside circumcircle.  CCW orientation is forced by `tri_add()` swapping vertices when `orient2d` is negative.
+
+*Files: `grids/tri_grids/11_delaunay.c`*
+
+---
+
+## 166. Penrose Robinson-Triangle Substitution — grids/tri_grids/12_penrose.c
+
+Two golden-ratio Robinson triangles:
+
+- **Acute (A):** isoceles, apex 36°, leg = `φ`, base = 1.
+- **Obtuse (B):** isoceles, apex 108°, leg = 1, base = `φ`.
+
+`φ = (1+√5)/2 ≈ 1.618`.  Substitution rule (the "half-rhomb" 2/2 version):
+
+```
+A → B + A    (B at full scale, A at scale 1/φ)
+B → A + B    (both at scale 1/φ)
+```
+
+Split point `P` placed at fraction `1/φ` along the chosen edge.  At depth N: `2^N` leaves.  Aperiodic in the limit because the scale factor `1/φ` is irrational — no periodic pattern can have rational scaling.  NOT strict Penrose P3 (`A→A+B`, `B→A+2B` with all children at `1/φ`); the 2/2 simplification preserves the same key ideas (two prototiles, golden split, self-similarity).
+
+*Files: `grids/tri_grids/12_penrose.c`*
+
+---
+
+## 167. Triangle Direct Placement — grids/tri_grids_placement/
+
+Six interactive placement editors — one per regular tri-grid type from sections 155–160.  Each holds a cursor, an `ObjectPool` of placed glyphs, and SPACE-toggle:
+
+| File | Cursor address | Movement |
+|------|----------------|----------|
+| `01_equilateral_direct.c`     | `(col, row, up)`  | `TRI_DIR[4][2]`, UP·UP traverses a full strip |
+| `02_right_isosceles_direct.c` | `(col, row, up)`  | UR/LL toggle on diagonal cross |
+| `03_double_diagonal_direct.c` | `(col, row, dir)` | `TETRA_DIR[4][4]` toward N/E/S/W |
+| `04_30_60_90_direct.c`        | `(col, row, up)`  | Same as 01 but renders medians too |
+| `05_isometric_direct.c`       | `(col, row, up)`  | Iso solid-fill background, glyphs in `A_REVERSE` |
+| `06_hex_subdivision_direct.c` | `(Q, R, sector)`  | Arrows walk hex via `HEX_DIR[4]`, `,`/`.` rotate sector |
+
+ObjectPool is a flat array of `{address, glyph}` records; removal swaps the dead slot with the last item (O(1) delete).  Cursor mark always drawn last so it overwrites any object at its position.
+
+*Files: `grids/tri_grids_placement/*_direct.c`*
+
+---
+
+## 168. Triangle Pattern Placement — grids/tri_grids_placement/
+
+Six pattern-stamp editors.  Each pattern is a static array of `(Δaddress)` triples relative to the cursor; pressing a digit translates the array by the cursor and inserts every entry into the pool (no-op on collision).  Five preset patterns per editor:
+
+| Key | Pattern | Notes |
+|-----|---------|-------|
+| `1` | RING    | Cursor + immediate neighbours (varies by grid) |
+| `2` | LINE    | 6–8 triangles in a row |
+| `3` | STAR    | RING + outer ring |
+| `4` | TRI     | Triforce-style 3- or 4-element corner pattern |
+| `5` | SCATTER | 10 random within ±4-step radius (uses LCG xor'd by clock) |
+
+For grids with absolute-orientation addressing (01, 02, 04, 05) the patterns specify `target_up` (or UR/LL) as a literal value — the pattern shape is independent of the cursor's orientation.
+
+*Files: `grids/tri_grids_placement/*_patterns.c`*
+
+---
+
+## 169. Triangle Path Placement — grids/tri_grids_placement/
+
+Six line-of-sight path editors.  Two markers `S` (start) and `E` (end); `s`/`e` keys set them at the cursor.  Path computed by walking pixel coordinates along the centroid-to-centroid line and recording which triangle each sample falls in:
+
+```
+sample step = tri_size · 0.25
+n_samples   = (centroid_distance / step) + 1
+for each t ∈ [0, 1] in n_samples steps:
+   px, py = centroid_S + t · (centroid_E − centroid_S)
+   pixel_to_tri(px, py) → (col, row, up)
+   path_add unique entries
+```
+
+Result is the ordered set of triangles traversed by the straight line — effectively a "line of sight" path on the triangular lattice.  Path is recomputed every time a marker moves or `tri_size` changes.
+
+For grid 06 the per-sample classifier additionally calls `sector_of(dx, dy)` after `pixel_to_hex` to identify the wedge.
+
+*Files: `grids/tri_grids_placement/*_path.c`*
+
+---
+
+## 170. Triangle Scatter Placement — grids/tri_grids_placement/
+
+Six distance-coloured scatter editors.  SPACE re-randomises N triangles within `±SCATTER_RADIUS` of the cursor; each triangle is coloured on a 6-stop gradient by its address-distance to the cursor — closer = warm, farther = cool.
+
+Distance metrics (cheap per-grid approximations of edge-walk distance):
+
+| Grid | Metric |
+|------|--------|
+| 01, 02, 04, 05 | `\|Δcol\| + \|Δrow\| + (Δup ? 1 : 0)` |
+| 03             | `\|Δcol\| + \|Δrow\| + \|Δdir\|` (mod 4 wrap, max 2) |
+| 06             | `cube_distance(Q, R) + sector_arc_distance` (mod 6 wrap, max 3) |
+
+Density configurable via `+`/`-` (range 20–500).  Border colour bumped to `248` (light gray) so the grid stays visible under the scatter dots; A_DIM removed from `grid_draw` to keep the grid clearly rendered without competing with the bright scatter palette.
+
+The iso variant (`05_isometric_scatter.c`) uses solid-fill background under the scatter dots — the dots' bright foreground colour pops against the iso background colour.
+
+*Files: `grids/tri_grids_placement/*_scatter.c`*
 
 ---
 

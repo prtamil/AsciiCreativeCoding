@@ -82,6 +82,136 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Three independent layered subsystems share the screen:
+ *   1. GAS — multi-octave fBm scalar field, sampled per cell each
+ *      frame at two scrolled offsets (parallax near/far).
+ *   2. STARS — fixed catalogue of `(x, y, brightness, phase)`,
+ *      twinkling via a sinusoid of world_time.
+ *   3. SHOCKS — periodic events at high-density gas cells: bright
+ *      flash → diffraction spikes → expanding ring → fade. Each
+ *      shock leaves a permanent star at its birthplace.
+ *
+ * No subsystem talks to another except through the SHARED brightness
+ * function: shocks ADD brightness to the gas (Gaussian halo + spike
+ * + ring); the gas glyph picker then reads the combined value.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine looking up at a deep-space photograph that's been animated.
+ * The gas is a slowly drifting cloud of glowing dust — multi-octave
+ * noise gives it plausible cosmic shape. Stars sparkle in front of
+ * the gas, twinkling on their own clock. Once in a while a star
+ * BIRTHS — a bright flash like a flashbulb, then 4-pointed spikes
+ * radiating outward like the diffraction pattern of a real telescope
+ * image, then a slow shockwave illuminating the surrounding gas as it
+ * propagates. After 5 seconds the shock fades, but the new star
+ * remains forever in the catalogue. Run for a few minutes and the
+ * sky genuinely fills up with newborn stars where you've seen things
+ * ignite.
+ *
+ * DRAWING METHOD  (per frame, three layers + HUD)
+ * ──────────────
+ *  1. erase()
+ *  2. Gas raster — for every cell:
+ *       a. fbm_near + fbm_far at scrolled offsets
+ *       b. + shock_brightness contributions (rings + spikes + halos)
+ *       c. if total < threshold: skip (empty space)
+ *       d. else: bucket by intensity, emit heat-ramp glyph
+ *  3. Star catalogue — N_STARS dots with sinusoidal twinkle.
+ *  4. Shock centres — three phases by age:
+ *       age < 0.3s : 3×3 white-hot core (Phase 1 flash)
+ *       age < 1.5s : centre + horizontal/vertical spike rays
+ *                    (Phase 2 young star with diffraction spikes)
+ *       age ≥ 1.5s : single dim glyph fading out (Phase 3 settling)
+ *  5. HUD + key hints.
+ *
+ *  Tick:
+ *    1. world_time += dt; scroll offsets += rate · dt
+ *    2. For each shock: age += dt; if age ≥ 1.5s and not yet added,
+ *       plant a permanent star in the catalogue at the birthplace
+ *    3. Countdown next_shock_in; on ≤ 0, spawn a new shock at the
+ *       densest gas cell sampled from K=12 random candidates.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  fBm (per cell):
+ *    sum = 0; amp = 1; freq = base_freq
+ *    for o in 0..OCTAVES-1:
+ *        sum += amp · value_noise(x · freq, y · freq)
+ *        amp *= GAIN; freq *= LACUNARITY
+ *    return sum / Σ amplitudes
+ *
+ *  Combined gas brightness:
+ *    v = 0.55 · fbm_near + 0.45 · fbm_far + 0.5 · shock_brightness
+ *    if v < threshold: empty
+ *    else: intensity = (v − threshold) / (1 − threshold)
+ *
+ *  Shock brightness contribution at (sx, sy) for shock at (x_s, y_s):
+ *    r_now = SHOCK_SPEED · age
+ *    d     = √((Δx/ASPECT_X)² + (Δy)²)
+ *    fade  = 1 − age / SHOCK_LIFE
+ *
+ *    ring   = exp(−(d − r_now)² / SHOCK_THICKNESS²) · fade
+ *    spikes = (exp(−Δy²/0.6) + exp(−Δx²/0.3)) · exp(−d²/80) · spike_t
+ *             where spike_t = max(0, 1 − age/1.2)
+ *    halo   = exp(−d²/12) · halo_t
+ *             where halo_t = max(0, 1 − age/2.5)
+ *    total  = ring + spikes·1.5 + halo·0.6
+ *
+ *  Star twinkle:
+ *    twinkle = 0.7 + 0.3 · sin(world_time · 1.5 + star.phase)
+ *    visible_brightness = star.brightness · twinkle
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Threshold cutoff is what keeps the image sparse. With
+ *    `THRESH_DEFAULT = 0.45`, about half the screen is empty space.
+ *    Going below `0.30` paints almost everywhere; going above `0.7`
+ *    leaves only the brightest gas knots visible.
+ *
+ *  • Hash-based value noise — `hash01(x, y)` is fast but lower-quality
+ *    than Perlin's gradient noise. For a slow-scrolling deep-space
+ *    image it's plenty.
+ *
+ *  • Permanent star catalogue grows — every shock adds a new star. If
+ *    you let it run forever, `n_stars` could hit `N_STARS_MAX = 400`.
+ *    Past that, new births don't add (silent cap). Press `r` to reset.
+ *
+ *  • Shock spawn picks densest cell of K=12 random candidates — not
+ *    GLOBALLY densest. The bias is gentle: shocks tend to fire inside
+ *    the gas, but occasionally a "lucky" sparse spot wins.
+ *
+ *  • Performance — O(rows · cols · OCTAVES · 2) per frame for the gas.
+ *    At 24×80×4×2 = 15k value-noise evals/frame; each is ~10 multiplies.
+ *    Easily 30 fps.
+ *
+ *  • Resize — `nebula_reseed` regenerates everything (stars + clears
+ *    shocks). The new star catalogue uses new dimensions.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Default config: a slow drifting cloud with twinkling stars; about
+ *    every 4–9 seconds a bright flash, spike rays, then expanding ring.
+ *
+ *  • Press `b` to fire a birth on demand. Watch the 3-act sequence:
+ *    flash (3×3) → spikes (cross rays) → ring expansion (5 seconds).
+ *
+ *  • After several `b` presses, count stars: each birth should have
+ *    added one to the catalogue. The HUD `stars:N` rises by 1 per
+ *    completed birth.
+ *
+ *  • Press `,` / `.` to slow/speed the parallax scroll. The gas
+ *    visibly slides faster or slower across the screen.
+ *
+ *  • Press `t` to cycle nebula type: red / blue / green / purple gas.
+ *    Star colour stays white in every theme.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>
@@ -284,6 +414,8 @@ typedef struct {
     float x, y;            /* world-space (cell) — does NOT scroll        */
     float age;              /* seconds since birth                          */
     int   alive;
+    int   star_added;       /* set when the permanent star is added to     *
+                             * the catalogue (mid-event)                    */
 } Shock;
 
 static const char STAR_GLYPH[3] = { '.', '+', '*' };
@@ -380,10 +512,11 @@ static void shock_spawn(Nebula *n, int rows, int cols)
         float v  = 0.55f * fn + 0.45f * ff;
         if (v > best_v) { best_v = v; best_x = cx; best_y = cy; }
     }
-    n->shocks[slot].x     = (float)best_x;
-    n->shocks[slot].y     = (float)best_y;
-    n->shocks[slot].age   = 0.0f;
-    n->shocks[slot].alive = 1;
+    n->shocks[slot].x          = (float)best_x;
+    n->shocks[slot].y          = (float)best_y;
+    n->shocks[slot].age        = 0.0f;
+    n->shocks[slot].alive      = 1;
+    n->shocks[slot].star_added = 0;
 }
 
 static void nebula_tick(Nebula *n, float dt, int rows, int cols)
@@ -398,6 +531,23 @@ static void nebula_tick(Nebula *n, float dt, int rows, int cols)
     for (int i = 0; i < N_SHOCKS_MAX; i++) {
         if (!n->shocks[i].alive) continue;
         n->shocks[i].age += dt;
+
+        /* When the bright cross-spike phase ends (age ≥ 1.5s) and the
+         * shock is settling, plant a permanent twinkling star at the
+         * birthplace. After the shock dies entirely, the new star is
+         * the visible legacy of the event. */
+        if (!n->shocks[i].star_added && n->shocks[i].age >= 1.5f) {
+            if (n->n_stars < N_STARS_MAX) {
+                Star *st = &n->stars[n->n_stars++];
+                st->x = (int)n->shocks[i].x;
+                st->y = (int)n->shocks[i].y;
+                st->brightness = 0.85f + 0.15f * frand();    /* bright newborn */
+                st->phase      = frand() * 2.0f * (float)M_PI;
+                st->alive      = 1;
+            }
+            n->shocks[i].star_added = 1;
+        }
+
         if (n->shocks[i].age > SHOCK_LIFE) n->shocks[i].alive = 0;
     }
 
@@ -425,8 +575,15 @@ static int gas_bucket(float v)
 
 /*
  * shock_brightness_at — extra brightness contribution from active shocks
- * at cell (sx, sy). Each shock adds a Gaussian-ish ring of brightness
- * centred on its expanding radius.
+ * at cell (sx, sy). Three layered contributions:
+ *
+ *   1. Expanding shockwave ring — Gaussian peak at d = r_now (was the
+ *      only effect in stage 1).
+ *   2. Anisotropic diffraction spikes — bright on the horizontal and
+ *      vertical axes through the star centre, fading by age 1.2s.
+ *      This is what gives a newborn star its iconic 4-pointed look.
+ *   3. Diffuse halo — soft Gaussian glow centred on the star, slowly
+ *      illuminating the surrounding gas; fades by age 2.5s.
  */
 static float shock_brightness_at(const Nebula *n, float sx, float sy)
 {
@@ -434,16 +591,35 @@ static float shock_brightness_at(const Nebula *n, float sx, float sy)
     for (int i = 0; i < N_SHOCKS_MAX; i++) {
         const Shock *s = &n->shocks[i];
         if (!s->alive) continue;
+
         float r_now = SHOCK_SPEED * s->age;
         float dx    = (sx - s->x) / ASPECT_X;
         float dy    = (sy - s->y);
         float d     = sqrtf(dx * dx + dy * dy);
-        float ring  = d - r_now;
         float fade  = 1.0f - (s->age / SHOCK_LIFE);
         if (fade < 0) fade = 0;
-        /* Gaussian-ish ring, peak at d == r_now. */
+
+        /* Layer 1 — expanding shockwave ring. */
+        float ring  = d - r_now;
         float gauss = expf(-ring * ring / (SHOCK_THICKNESS * SHOCK_THICKNESS));
         total += gauss * fade;
+
+        /* Layer 2 — diffraction spikes. Bright thin lines along ±x
+         * and ±y axes through the star, falling off radially so the
+         * spikes don't dominate at large distance. Strong early. */
+        float spike_t = 1.0f - (s->age / 1.2f);
+        if (spike_t > 0.0f) {
+            float h_spike = expf(-dy * dy / 0.6f) * expf(-d * d / 80.0f);
+            float v_spike = expf(-dx * dx / 0.3f) * expf(-d * d / 80.0f);
+            total += (h_spike + v_spike) * spike_t * 1.5f;
+        }
+
+        /* Layer 3 — diffuse halo. Soft Gaussian glow around the centre
+         * that fades over a couple of seconds, illuminating gas. */
+        float halo_t = 1.0f - (s->age / 2.5f);
+        if (halo_t < 0.0f) halo_t = 0.0f;
+        float halo = expf(-d * d / 12.0f);
+        total += halo * halo_t * 0.6f;
     }
     return total;
 }
@@ -480,18 +656,58 @@ static void scene_draw(int rows, int cols, const Nebula *n, double fps)
     for (int i = 0; i < n->n_stars; i++)
         star_draw(&n->stars[i], n->world_time, rows, cols);
 
-    /* Shock centres marked as a bright pulsing dot. */
+    /*
+     * Shock centre rendering — three phases driven by age:
+     *
+     *   age < 0.3s : brilliant 3×3 white-hot core (Phase 1 — flash)
+     *   age < 1.5s : bright 4-pointed cross with diffraction rays
+     *                (Phase 2 — young star with spikes)
+     *   else        : single dim glyph fading toward death
+     *                (Phase 3 — settling)
+     */
     for (int i = 0; i < N_SHOCKS_MAX; i++) {
         const Shock *s = &n->shocks[i];
         if (!s->alive) continue;
         int sr = (int)s->y, sc = (int)s->x;
         if (sr < 0 || sr >= rows - 1 || sc < 0 || sc >= cols) continue;
-        float fade = 1.0f - (s->age / SHOCK_LIFE);
-        if (fade < 0) fade = 0;
-        chtype attr = COLOR_PAIR(PAIR_SHOCK) | (fade > 0.5f ? A_BOLD : 0);
-        attron(attr);
-        mvaddch(sr, sc, (chtype)(unsigned char)(fade > 0.7f ? '*' : '+'));
-        attroff(attr);
+
+        if (s->age < 0.3f) {
+            /* Phase 1 — flash: 3×3 hot core. */
+            attron(COLOR_PAIR(PAIR_SHOCK) | A_BOLD);
+            for (int dr = -1; dr <= 1; dr++) {
+                for (int dc = -1; dc <= 1; dc++) {
+                    int rr = sr + dr, cc = sc + dc;
+                    if (rr < 0 || rr >= rows - 1) continue;
+                    if (cc < 0 || cc >= cols)     continue;
+                    char ch = (dr == 0 && dc == 0) ? '*' : '+';
+                    mvaddch(rr, cc, (chtype)(unsigned char)ch);
+                }
+            }
+            attroff(COLOR_PAIR(PAIR_SHOCK) | A_BOLD);
+        } else if (s->age < 1.5f) {
+            /* Phase 2 — young star with horizontal/vertical spikes
+             * extending two cells in each direction. */
+            attron(COLOR_PAIR(PAIR_SHOCK) | A_BOLD);
+            mvaddch(sr, sc, (chtype)'*');
+            if (sc - 1 >= 0)        mvaddch(sr, sc - 1, (chtype)'-');
+            if (sc - 2 >= 0)        mvaddch(sr, sc - 2, (chtype)'<');
+            if (sc + 1 < cols)      mvaddch(sr, sc + 1, (chtype)'-');
+            if (sc + 2 < cols)      mvaddch(sr, sc + 2, (chtype)'>');
+            if (sr - 1 >= 0)        mvaddch(sr - 1, sc, (chtype)'|');
+            if (sr + 1 < rows - 1)  mvaddch(sr + 1, sc, (chtype)'|');
+            attroff(COLOR_PAIR(PAIR_SHOCK) | A_BOLD);
+        } else {
+            /* Phase 3 — settling, fades to nothing. */
+            float fade = 1.0f - (s->age / SHOCK_LIFE);
+            if (fade > 0.2f) {
+                chtype attr = COLOR_PAIR(PAIR_SHOCK)
+                            | (fade > 0.5f ? A_BOLD : 0);
+                attron(attr);
+                mvaddch(sr, sc,
+                        (chtype)(unsigned char)(fade > 0.6f ? '+' : '.'));
+                attroff(attr);
+            }
+        }
     }
 
     /* HUD */

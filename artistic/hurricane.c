@@ -82,6 +82,115 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A hurricane viewed from above is a polar vortex. Each cloud particle
+ * lives in `(radius, theta)` around the eye and orbits at angular
+ * velocity ω(r) given by the Rankine profile:
+ *   inside the eyewall  → ω = ω_max · r/R_eye   (solid-body rotation)
+ *   outside the eyewall → ω = ω_max · R_eye/r   (free-vortex 1/r decay)
+ * The kink at r = R_eye is where v = ω·r peaks — the eyewall, the
+ * highest winds. Radial inflow slowly pulls particles toward the eye;
+ * particles that cross the inner boundary respawn at the outer rim.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Think of a spinning bowl of soup with a hole at the centre. Soup
+ * close to the hole spins fast (small radius, high angular velocity);
+ * soup at the rim drifts slowly. The hole stays still — that's the
+ * eye. Now drop confetti into the soup: the confetti spirals inward
+ * because of weak suction (radial inflow), and orbits at the local
+ * angular velocity. The confetti closer to the eye looks like it's
+ * going faster around (it is). The closer confetti enters the hole
+ * and disappears; we respawn it at the rim. The whole picture reads
+ * as a hurricane on satellite.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. Compute centre `(cx, cy) = (cols/2, (rows-1)/2)`.
+ *  3. For each cloud particle:
+ *       - project polar to screen: `sx = cx + ASPECT_X · r · cos(θ)`,
+ *         `sy = cy + r · sin(θ)`.
+ *       - radial_zone(r) returns 0/1/2/3 (outer / band / eyewall / eye).
+ *       - if zone == 3 (inside eye): SKIP — the centre stays empty.
+ *       - else: emit a wind-direction glyph (`-` `\` `|` `/`) coloured
+ *         by zone (outer = mid-tone, band = brighter, eyewall = bold
+ *         white).
+ *  4. draw_eye — three static `.` marks at the centre in fixed grey.
+ *  5. HUD + key hints.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Rankine velocity profile:
+ *    ω(r) = ω_max · r/R_eye          if r ≤ R_eye   (solid-body)
+ *    ω(r) = ω_max · R_eye/r          if r >  R_eye   (free vortex)
+ *    v(r) = ω(r) · r                                  (tangential speed)
+ *    Peak v at r = R_eye; "eyewall winds" = ω_max · R_eye.
+ *
+ *  Tangential velocity vector (for the wind-glyph picker):
+ *    vx = -sin(θ) · ω(r) · r · ASPECT_X
+ *    vy =  cos(θ) · ω(r) · r
+ *    (perpendicular to the radial direction; ω positive → CCW spin)
+ *
+ *  Per-tick update:
+ *    θ += ω(r) · dt
+ *    r -= INFLOW_RATE · dt          (if inflow enabled)
+ *    if r < 0.5·R_eye OR r > 1.05·R_outer: respawn at rim
+ *
+ *  Zone test:
+ *    r < 0.7·R_eye   → 3 (eye, skip drawing)
+ *    r < 1.15·R_eye  → 2 (eyewall, A_BOLD)
+ *    r < 0.6·R_outer → 1 (band)
+ *    else            → 0 (outer)
+ *
+ *  Wind glyph (8 sectors via atan2):
+ *    sect = floor((atan2(vy, vx) + 2π) / (π/4)) mod 8
+ *    glyph = ['-','\\','|','/','-','\\','|','/'][sect]
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Cell-aspect distortion — terminal cells are ~2× tall as wide. The
+ *    `ASPECT_X = 2` factor on the cos(θ) term makes the storm read as
+ *    round, not vertically squashed.
+ *
+ *  • A_DIM on outer band hides it — earlier code did `attr |= A_DIM` on
+ *    zone 0 and combined with mid-saturation hues like `33` (medium
+ *    blue) the outer rim disappeared. Removed; brightness gradient now
+ *    comes from colour values + A_BOLD on eyewall only.
+ *
+ *  • Eye-zone particles draw — would clutter the empty centre. Skipped
+ *    in cloud_draw; only the static `draw_eye` markers paint there.
+ *
+ *  • Inflow disabled (`i` toggle) — particles orbit at fixed radius
+ *    forever. Useful for verifying the Rankine profile but visually
+ *    less satisfying than a converging spiral.
+ *
+ *  • Resize — geometry recomputes via `hurricane_geometry`; clouds
+ *    keep their (r, θ) positions, which may now be off-screen. The
+ *    next tick respawns any that exceed bounds.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Default config: clouds spiral inward toward an empty eye. Inner
+ *    clouds orbit visibly faster than outer clouds (Rankine 1/r outside).
+ *
+ *  • Press `,` / `.` to shrink/grow the eye. The eyewall (brightest
+ *    zone) follows the eye boundary, scaling proportionally.
+ *
+ *  • Press `i` to toggle inflow. With inflow OFF, clouds orbit at
+ *    fixed radius forever — pure rotation, no drain.
+ *
+ *  • Press `+` to raise spin. Inner clouds blur as their angular
+ *    velocity grows; outer clouds barely change.
+ *
+ *  • Press `t` to cycle storms: white / blue / gold / pink. The
+ *    dominant hue swap is unmistakable across the whole spiral.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

@@ -79,6 +79,115 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A static cone silhouette plus two ballistic particle systems
+ * (lava bombs + ash) plus a periodic burst event. Bombs follow plain
+ * Newtonian projectile motion `vy += g·dt`, no curve fitting. Ash is
+ * a slow rising haze with horizontal random walk. The cone is just a
+ * mathematical predicate `is_in_mountain(row, col)` — bombs that land
+ * inside the cone die on impact. There is no "lava flow," no terrain
+ * deformation, no fluid simulation — just three independent layers
+ * sharing a coordinate system.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a child's drawing of a volcano. The triangle outline is
+ * literally drawn with `/` and `\`. Above the apex, you scatter dots
+ * at random and give them initial velocities pointing up and out.
+ * Gravity pulls them down. Some come back over the slope; they hit
+ * the rock and stop. Others escape sideways and fall off-screen.
+ * Rinse, repeat. The volcano never changes shape; only the air above
+ * it changes, frame by frame, as bombs and ash inhabit different
+ * positions over time.
+ *
+ * DRAWING METHOD  (per frame, layered)
+ * ──────────────
+ *  1. erase()
+ *  2. ash_draw — rising haze, drawn first so the cone overpaints any
+ *     plume that strays into the silhouette
+ *  3. draw_mountain — `/`/`\` slopes + sparse interior `.` rocks +
+ *     ground-line `_____` underneath
+ *  4. draw_crater — the hottest row at the apex: `\`/`_`/`_`/`/` in
+ *     bright white, `A_BOLD`
+ *  5. bomb_draw — every alive bomb in heat-ramp by temperature
+ *  6. HUD + key hints
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Cone membership (linear taper from crater to base):
+ *    frac    = (row − top_row) / (base_row − top_row)
+ *    half_w  = crater_half + frac · (base_half − crater_half)
+ *    in_cone = (row > top_row) AND (|col − axis_x| ≤ half_w)
+ *
+ *  Bomb launch (narrow upward cone):
+ *    ang   ∈ [-CONE, +CONE] uniform (default cone = 0.7 rad ≈ 40°)
+ *    speed ∈ [SPEED_MIN, SPEED_MAX]
+ *    vx = sin(ang) · speed · ASPECT_X
+ *    vy = -cos(ang) · speed                  (negative = up)
+ *
+ *  Bomb ballistics (per tick):
+ *    vy   += GRAVITY · dt
+ *    pos  += v · dt
+ *    temp -= BOMB_COOL · dt
+ *    die if off-screen, in_cone, or temp ≤ 0
+ *
+ *  Ash random walk:
+ *    vx   += rand_signed() · ASH_DRIFT · dt
+ *    vx   *= (1 − 0.6 · dt)                  (light damping)
+ *    pos  += v · dt
+ *    life -= ASH_FADE · dt
+ *
+ *  Apex height above launch  (ang=0, max info-density):
+ *    apex = vy² / (2·GRAVITY) ≈ MAX_VEL² / (2·g)
+ *    With MAX_VEL = 12, g = 14: apex ≈ 5 cells. Bombs stay on-screen.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Bombs flying off-screen — early tuning had MAX_VEL = 22, g = 18,
+ *    which gave apex ≈ 13 cells. On a 24-row terminal with top_row=8,
+ *    bombs flew off the top before falling back. Current values keep
+ *    every arc visible.
+ *
+ *  • Pool full — `try_spawn_bomb` silently drops new spawns when no
+ *    dead slot exists. The `b` key handler avoids this by replacing
+ *    every active slot with a fresh `bomb_spawn_burst`.
+ *
+ *  • Cone overlap with bombs — bombs DO render briefly inside the
+ *    cone region during their last tick before death. The mountain
+ *    is drawn before bombs, so a hot glyph appears momentarily on
+ *    rock; visually fine, even nice.
+ *
+ *  • Crater vs ash spawn point — both spawn at row=top_row, but the
+ *    crater glyph is drawn AFTER ash, so the crater's `_____` in
+ *    PAIR_HEAT_4 overpaints any ash on that row. Acceptable: ash is
+ *    above the crater, not below.
+ *
+ *  • Resize — cone geometry recomputes (`volcano_position`), pools
+ *    keep flying. Bombs in mid-air at old screen positions naturally
+ *    crash off the new bounds.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Default config: bombs visibly arc above the cone, most landing
+ *    on the slopes, a few escaping sideways.
+ *
+ *  • Press `b`: every active bomb slot fires at once with a wider
+ *    cone and 1.5× speed. Dramatic eruption.
+ *
+ *  • Press `,` / `.`: crater shrinks/widens. Ash and bomb spawn area
+ *    follow because both use `crater_half` for spawn jitter.
+ *
+ *  • Periodic burst: every 3 seconds 12 bombs spawn in a tight cluster
+ *    (visible as a sudden surge of activity).
+ *
+ *  • Themes: red/blue/green/purple — colour change is unmistakable
+ *    because every layer (mountain, crater, bombs, ash) updates.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

@@ -94,6 +94,103 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The "tornado" is a 1-D phase variable per ember pretending to be 3-D
+ * rotation. Each ember has `(y, phase, radius)` in cylindrical coords.
+ * Side-view 2-D projection is `screen_col = axis + radius·cos(phase)`,
+ * `screen_row = base − y`. The trick that sells the rotation: an ember
+ * with `sin(phase) > 0` is on the camera-facing half (drawn bright);
+ * `sin(phase) < 0` is the back half (drawn dim). As phase advances each
+ * frame, a single ember alternates between bright and dim — that
+ * alternation, across the whole pool, reads as a 3-D rotating column.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a glass of fizzy fire viewed from the side. Bubbles rise
+ * along helical paths, faster near the centre, slower near the rim.
+ * Bubbles on the camera side are bright; bubbles on the far side are
+ * dimmer (they're behind the column, attenuated). The funnel narrows
+ * with height because hot bubbles near the axis rise fastest and pull
+ * the radius inward — the periphery cools and falls away. We don't
+ * actually compute "behind" via 3-D geometry; we just dim the ember
+ * when sin(phase) < 0, and the eye fills in the depth.
+ *
+ * DRAWING METHOD  (per frame, three layers)
+ * ──────────────
+ *  1. erase()
+ *  2. base_heat — 1-D heat strip at the ground row:
+ *       decay  : heat[i] *= (1 − BASE_DECAY · dt)
+ *       blur   : heat[i] = 0.25·heat[i-1] + 0.5·heat[i] + 0.25·heat[i+1]
+ *       inject : 1–3 random cells get heat ≈ 0.85, biased to centre
+ *  3. embers — two passes for depth ordering:
+ *       pass 1: every ember with sin(phase) < 0 (back half), A_DIM
+ *       pass 2: every ember with sin(phase) ≥ 0 (front half), A_BOLD
+ *  4. sparks — outward-thrown particles drawn last so they appear in
+ *     front of everything else
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Cylindrical → screen (with wind tilt):
+ *    sx = axis_x + wind_offset(y) + ASPECT_X · radius · cos(phase)
+ *    sy = base_y − y
+ *
+ *  Per-ember dynamics (per tick):
+ *    phase  += omega · omega_mult · dt          (omega ∝ 1/radius)
+ *    y      += y_vel · dt                       (y_vel ∝ 1 − r/R_max)
+ *    radius *= (1 − RADIUS_DECAY · dt)          (slow inward drift)
+ *    temp   -= COOL_RATE · dt
+ *    if y ≥ height || temp ≤ 0: respawn at base
+ *
+ *  Wind tilt (sway scaled by height):
+ *    wind_offset(y) = wind_amp · sin(world_time · WIND_FREQ) · (y/height)
+ *    base stays planted (y=0), top swings ±wind_amp
+ *
+ *  Heat ramp index:
+ *    bucket = floor(temp · 4.99)        (clamped to 0..4)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • A_DIM on already-dark colours = invisible. The earliest version
+ *    used dark cyan (24) for the cold end + A_DIM and the back-half
+ *    embers vanished. Cold-end colours are now `45/34/178/134` —
+ *    visible even with A_DIM applied.
+ *
+ *  • Radius near zero — `omega ∝ 1/radius` would blow up. Guarded with
+ *    `fmaxf(e->radius * 0.4f, 0.6f)` in ember_respawn.
+ *
+ *  • Cell aspect — terminals are ~2× taller than wide. Without the
+ *    `ASPECT_X = 2` stretch, the column would render as a vertical
+ *    ellipse, not a round funnel.
+ *
+ *  • Two-pass draw avoids per-frame depth sorting. Sorting 250 embers
+ *    by sin(phase) would work too but adds O(N log N) per frame for
+ *    no visual gain.
+ *
+ *  • Resize keeps embers in flight (good — feels continuous), only
+ *    repositions the axis. base_heat is cleared on resize implicitly
+ *    via the next tick's decay; no special handling needed.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Watch a single ember through one revolution: it should fade
+ *    (sin(phase) crosses 0 from + to −), reappear bright on the other
+ *    side, and rise visibly during the cycle.
+ *
+ *  • Press `[` to drop ember count to 50. The column thins; you can
+ *    track individual embers more clearly.
+ *
+ *  • Press `+` to crank spin: the centre spins faster than the edge
+ *    (omega ∝ 1/r), which you can see as differential rotation —
+ *    inner embers complete a revolution while outer ones barely move.
+ *
+ *  • Press `w` to toggle wind: the top of the funnel sways back and
+ *    forth over ~14 seconds, base stays planted.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

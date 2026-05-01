@@ -87,6 +87,100 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Each rocket carries an INSTRUCTION TAPE — `LIFESPAN` force vectors,
+ * applied one per simulation tick. The whole flight is genetically
+ * determined. Rockets that end the flight near the target leave more
+ * descendants; rockets that crash leave very few. Repeat for 50–80
+ * generations and the population converges on tapes that hit the target.
+ *
+ * The "intelligence" is entirely in the genome — there is no real-time
+ * steering, no goal-seeking heuristic, no neural net. Just random tapes,
+ * fitness-weighted selection, and crossover-with-mutation. That's it.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine printing 50 random Etch-A-Sketch programs, running each on a
+ * fresh rocket, scoring how close to the target each one ended up. Now
+ * pick parents in proportion to their score, splice their programs at a
+ * random midpoint, throw a few random bytes in for mutation, print 50
+ * new programs. Run again. Score again. Splice again. After 50 rounds
+ * the average program is a near-perfect target hitter, even though no
+ * one ever told the program HOW to hit — it only ever knew whether it
+ * succeeded.
+ *
+ * EVOLUTION ALGORITHM
+ * ───────────────────
+ *  1. Generation 0: every rocket gets a fresh random genome.
+ *  2. Run all rockets for `LIFESPAN` ticks (or until all dead).
+ *  3. Score: fitness = (1/(distance+1))² · hit_bonus · crash_penalty.
+ *  4. Build a mating pool — each rocket gets `k = 100·f/f_max` slots.
+ *  5. Breed `n_pop` children: pick two parents at random from the pool,
+ *     splice genomes at a random midpoint, mutate each gene with
+ *     probability `mutation_rate`.
+ *  6. Replace population with children, relaunch all, increment gen.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Fitness          : f = (1/(distance + 1))²
+ *                     ×10  if hit_target
+ *                     ×0.1 if crashed
+ *
+ *  Pool slot count  : k_i = floor(100 · f_i / f_max)    (min 1)
+ *
+ *  Crossover        : child.genes[i] = (i < mid) ? a.genes[i] : b.genes[i]
+ *                     mid is a fresh random index per child.
+ *
+ *  Mutation         : if frand() < mutation_rate
+ *                     replace genes[i] with a fresh random unit force
+ *
+ *  Rocket physics   : v += genes[age]
+ *                     |v| capped at MAX_VEL
+ *                     pos += v
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Premature convergence — mutation rate too low: the population
+ *    locks onto one bad genome and never improves. Bump mutation with
+ *    `+`. 0.01 is a good starting point; up to 0.05 if stuck.
+ *
+ *  • Pool overflow — at high `n_pop` the mating pool can hit
+ *    `POOL_CAPACITY = pop · 100 = 5000` slots. Defensive cap in
+ *    ga_evolve prevents UB; selection just gets slightly biased.
+ *
+ *  • All-crashers gen 0 — if every rocket crashes, max_f is tiny but
+ *    still positive (the 0.1 penalty floor). Selection picks the
+ *    "least bad" crashers; their genomes become the seed for gen 1.
+ *
+ *  • Zero-length genome — LIFESPAN = 0 would skip every gene-apply
+ *    and rockets would never move. Keep LIFESPAN ≥ 30 for any visible
+ *    flight at typical screen sizes.
+ *
+ *  • Resize during a generation — target/launch positions update via
+ *    `world_position`, but rockets in flight keep their old positions
+ *    and may crash on the new bounds. Acceptable: the next generation
+ *    starts fresh with the new geometry.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Default config (pop=50, lifespan=100, mutation=0.01) should show:
+ *    • gen 0:   chaos, hits ≈ 0–2 / 50
+ *    • gen 10:  some convergence, hits ≈ 5–10
+ *    • gen 30:  most arc toward target, hits ≈ 20–35
+ *    • gen 80:  nearly all hit, hits ≈ 45–50
+ *
+ *  Press `f` to fast-forward (1 generation per frame). At 30 fps you
+ *  should reach gen 80 in ~3 seconds and see the population nearly
+ *  saturated with hitters.
+ *
+ *  If hits never grow past gen 0: mutation too low, or fitness function
+ *  not pressuring enough. Try `+` to raise mutation.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

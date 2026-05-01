@@ -82,6 +82,116 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A bird-shaped formation of fire particles. The body is a fixed ANCHOR
+ * TEMPLATE in body-local coordinates (head at origin, wings extending
+ * sideways, tail trailing); each frame the particles rebind to a random
+ * anchor with small jitter. The bird is therefore drawn FRESH every
+ * frame from the template — particles don't carry positional memory,
+ * only an anchor index. Wing flap is a sinusoid in time applied to
+ * wing anchors. Lifecycle is a 4-state FSM that controls how binding
+ * works in each phase.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Think of a stage performance. The skeleton (head, neck, wings, tail)
+ * is a fixed dancer pose. A swarm of glowing dots takes positions
+ * around that skeleton each frame. The dots aren't the dancer; they're
+ * spectators clustering around invisible anchor points. As the anchors
+ * drift across the stage, the dots redistribute themselves around the
+ * new positions. Wing flap sees the wing anchors swing up and down;
+ * the dots follow. When the dancer dies, the spectators are released
+ * and scatter (free-flight + gravity + cooling). Then a new dancer is
+ * born and the spectators re-cluster.
+ *
+ * DRAWING METHOD  (per frame, FSM-driven)
+ * ──────────────
+ *  1. erase()
+ *  2. Advance head_x along its trajectory (FLY/DIE/BIRTH) or stay put
+ *     (ASH).
+ *  3. For each particle:
+ *       - In FLY/DIE/BIRTH: compute anchor world position via
+ *         `anchor_world(p->anchor_idx, ...)` and rebind p with jitter.
+ *       - In ASH: skip rebind; particle keeps its velocity from the
+ *         death-burst, integrates with gravity + cooling.
+ *  4. particle_draw — heat-ramp glyph by per-particle temperature.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Anchor world position (with mirror on dir change):
+ *    dx = anchor.dx · (-dir) · ASPECT_X
+ *    dy = anchor.dy + flap_term + bob_term
+ *    flap_term = sin(t · 2π · WING_FLAP_HZ)
+ *              · WING_FLAP_AMP · wing_frac · ±1   (left=-1, right=+1)
+ *    bob_term  = sin(t · 2π · WING_FLAP_HZ) · HEAD_BOB_AMP · 0.3
+ *
+ *  Particle bind:
+ *    p.x = ax + signed_jitter · JITTER_R · ASPECT_X
+ *    p.y = ay + signed_jitter · JITTER_R
+ *
+ *  Per-anchor base temperature (heat gradient by body part):
+ *    wings     : base_t = 0.45 + 0.50 · wing_frac    (tips white, roots warm)
+ *    body      : base_t = 0.55                       (warm)
+ *    tail      : base_t = 0.35                       (cooler red/orange)
+ *    p.temp = base_t + small_jitter
+ *
+ *  Lifecycle (seconds, total cycle ≈ 20 sec):
+ *    FLY   T_FLY=10s   — head crosses screen, particles rebind
+ *    DIE   T_DIE=2.5s  — head decelerates, particles bind tighter,
+ *                         temps rise
+ *    ASH   T_ASH=5s    — burst! particles released with radial
+ *                         velocity; gravity + cooling
+ *    BIRTH T_BIRTH=2.5s — head moves to start, particles rebind
+ *                         incrementally over time
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • All particles bucket 4 — initial design used `temp = 0.85 + 0.15·rand()`
+ *    so every particle was bucket 4 (white). Theme cycling had nothing
+ *    to recolour. The fix is the per-anchor heat gradient above; now
+ *    wing tips are bucket 4 (white), body bucket 2 (theme colour),
+ *    tail bucket 1 (theme dim).
+ *
+ *  • Direction mirror on rebirth — when `dir` flips (-1 ↔ +1), anchors
+ *    must mirror x so the head still points the way the bird is flying.
+ *    Done via `dx = anchor.dx · (-dir)`.
+ *
+ *  • Anchor weight imbalance — wings have many anchors, head has few.
+ *    `anchor_pick` is weighted-random by `Anchor.weight` so density
+ *    along the body is controllable per-body-part.
+ *
+ *  • Frame-rate independence — anchor world depends on `world_time`,
+ *    which advances by `dt`. Wing flap is therefore time-based, not
+ *    frame-based; the bird flaps at the same rate regardless of fps.
+ *
+ *  • Resize — head_x/y are absolute screen coords, not relative. After
+ *    resize the bird may briefly fly at the wrong screen height; the
+ *    next FLY phase uses `rows/3` for the new dimensions.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Watch the wing flap: a particle near a wing tip should oscillate
+ *    up and down once per (1/WING_FLAP_HZ) ≈ 0.67 seconds.
+ *
+ *  • Watch heat by body part: wing tips bright white (bucket 4),
+ *    body cooler theme colour (bucket 2), tail dim red/cyan/etc.
+ *
+ *  • Press `s` to skip phases. Cycle FLY → DIE → ASH → BIRTH → FLY
+ *    in seconds; verify the bird collapses, bursts outward, then
+ *    reforms at the opposite edge of the screen.
+ *
+ *  • Press `t` to cycle theme. Body and tail change colour;
+ *    wing tips stay white (always bucket 4 = white in every theme).
+ *    That's the heat-ramp gradient working as intended.
+ *
+ *  • At ASH phase, particles should NOT respect the anchor positions —
+ *    they should fly outward and fall under gravity, freely.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

@@ -183,12 +183,11 @@ See `CLAUDE.md` for the complete build list.
 └── documentation/
     ├── Architecture.md    — full framework + per-program architecture write-ups
     ├── Visual.md          — every visual technique (rendering, shading, palettes)
-    ├── Master.md          — mastery roadmap and study notes
+    ├── Master.md          — every technique, with canonical references
     ├── Framework.md       — base ncurses framework anatomy
     ├── COLOR.md           — color theory, 256-color usage, theme design
     └── learning/
-        ├── ROADMAP.md         — 6-tier study order, 2-year plan
-        └── concept_*.md       — 179 deep-dive concept files
+        └── concept_*.md       — deep-dive concept files, one per program
                                  (math → pseudocode → implementation notes)
 ```
 
@@ -196,12 +195,12 @@ See `CLAUDE.md` for the complete build list.
 
 ## Documentation
 
-`documentation/learning/` contains 179 concept files — one per program. Each file has two passes:
+`documentation/learning/` contains a `concept_*.md` file for every program in the project. Each file has two passes:
 
 - **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
 - **Pass 2** — pseudocode, module map, data flow diagram, core loop
 
-`documentation/learning/ROADMAP.md` gives the optimal study order across 6 tiers (visual math → simulation → fluid PDE → advanced physics → rendering → emergent systems) with a 2-year breakdown and a book recommendation per tier.
+`documentation/Master.md` is the cross-cutting reference: each technique used in the project is explained from first principles, names the source files where it appears, and (for named algorithms) cites the canonical paper, textbook, or author.
 
 ---
 

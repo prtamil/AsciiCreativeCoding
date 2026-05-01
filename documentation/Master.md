@@ -1,7 +1,10 @@
 # Master — Concepts, Techniques & Mental Models
 
-Everything used across this project, explained from first principles.
-Use this as a reading map: scan the index, pick what you do not know, read the essay.
+Everything used across this project, explained from first principles. Each
+essay names the source files where the technique appears (`*Files:*`) and,
+where applicable, the canonical paper, textbook, or author who originated or
+formalised the idea (`*References:*`). The references point to the literature
+you would consult to extend the technique past what is implemented here.
 
 ---
 
@@ -357,10 +360,12 @@ In the raymarcher, the ray direction's Y component is divided by `CELL_ASPECT = 
 #### D1 Euler Integration
 The simplest integrator: `pos += vel × dt`, `vel += accel × dt`. It is first-order accurate and adds energy to oscillating systems over time (the orbit spirals outward). Used in particle systems and fire where energy drift doesn't matter because particles have finite lifetimes.
 *Files: `fireworks.c`, `brust.c`, `kaboom.c`*
+*References: Press et al., "Numerical Recipes" 3e ch. 17; Hairer, Nørsett, Wanner, "Solving Ordinary Differential Equations I" (1993).*
 
 #### D2 Semi-implicit (Symplectic) Euler
 Update velocity *before* position: `vel += accel × dt; pos += vel × dt`. This tiny reordering makes the integrator symplectic — it conserves a modified energy and does not spiral outward over time. Essential for oscillators like the spring-pendulum where standard Euler would visibly gain energy over seconds.
 *Files: `spring_pendulum.c`*
+*References: Hairer, Lubich, Wanner, "Geometric Numerical Integration" (2006); Yoshida, "Construction of higher order symplectic integrators" *Phys. Lett. A* 150 (1990).*
 
 #### D3 Wall Bounce — Elastic Reflection
 When a ball crosses a boundary, clamp position to the boundary and negate the relevant velocity component. Doing it in the correct order (clamp then flip) prevents the ball from getting stuck inside the wall on the next tick. The raster files' `CAM_DIST_MIN/MAX` zoom clamp uses the same pattern.
@@ -373,6 +378,7 @@ Gravity adds a constant downward acceleration each tick (`vy += GRAVITY × dt`).
 #### D5 Spring-Pendulum — Lagrangian Mechanics
 The Lagrangian formulation derives equations of motion from kinetic minus potential energy, handling the coupling between spring extension and pendulum angle automatically. The result is two coupled second-order ODEs for `r̈` and `θ̈` that are integrated numerically each tick — more principled than writing forces by hand.
 *Files: `spring_pendulum.c`*
+*References: Goldstein, Poole, Safko, "Classical Mechanics" 3e ch. 1–2; Landau & Lifshitz, "Mechanics" §§5–8.*
 
 #### D6 Lifetime & Exponential Decay
 `life -= dt / lifetime_sec` counts down linearly; when it reaches 0 the particle is recycled. Multiplying by a `decay` factor less than 1 each tick gives exponential decay — the particle fades quickly at first then more slowly, matching the visual feel of embers cooling.
@@ -393,6 +399,7 @@ Rockets cycle through `IDLE → RISING → EXPLODED`; fire columns have `COLD / 
 #### E1 Falling Sand — Gravity CA
 Each cell is either empty or sand. Each tick, process bottom-to-top: try to fall straight down; if blocked, try a random diagonal; if both blocked, try wind drift; otherwise mark stationary. Processing bottom-to-top prevents a grain from moving multiple cells in one tick (which would look like teleportation).
 *Files: `sand.c`*
+*References: Toffoli & Margolus, "Cellular Automata Machines" MIT Press (1987) ch. 7; Noita / "The Powder Toy" — folklore lineage of falling-sand games as continuous-cellular-automaton playgrounds.*
 
 #### E2 Doom-style Fire — Heat Diffusion CA + Multi-Algorithm Grid Sims
 The base CA rule: each cell samples ONE randomly-jittered neighbour from one row below and subtracts a decay term — not an average, a single sample. The lateral jitter (±1 col) is why flames flicker sideways rather than rising straight. The bottom row is arch-shaped fuel seeded every tick.
@@ -401,6 +408,7 @@ The base CA rule: each cell samples ONE randomly-jittered neighbour from one row
 
 `smoke.c` uses the same architecture with 3 smoke-specific algorithms: CA diffusion (±2 lateral jitter for broader billow), particle puffs (quadratic life² fade, bilinear splat), and vortex advection (Biot-Savart point vortices, semi-Lagrangian back-trace). Wind is accumulated once per tick in `scene_tick()` before dispatch to any algorithm.
 *Files: `fire.c`, `smoke.c`*
+*References: Sanglard, "Game Engine Black Book: Doom" (2018) ch. 11 (the heat-diffusion algorithm reverse-engineered from `id` source); Stam, "Real-Time Fluid Dynamics for Games" GDC (2003) for the semi-Lagrangian advection step in `smoke.c`.*
 
 #### E3 aafire 5-Neighbour CA
 The aalib variant samples five neighbours (three below plus two diagonals two rows below) and averages them, producing rounder, slower-rising blobs compared to Doom's sharper spikes. A precomputed `minus` value based on screen height normalises the decay rate so the flame height is consistent at any terminal size.
@@ -413,6 +421,7 @@ Scanning top-to-bottom in a falling CA lets grains move multiple cells in a sing
 #### E5 Stochastic Rules
 Adding `rand() % 2` to decide which diagonal direction to try, or whether to scatter a fire cell, gives organic variation with almost no code. Deterministic rules produce repetitive, crystalline patterns; a single random branch breaks the symmetry and makes the simulation look alive.
 *Files: `sand.c`, `fire.c`, `aafire_port.c`, `flowfield.c`, `complex_flowfield.c`*
+*References: Wolfram, "A New Kind of Science" (2002) ch. 7 (probabilistic CA rules and "Class IV" complexity); Bak, Tang & Wiesenfeld, "Self-Organized Criticality" *Phys. Rev. A* 38 (1988).*
 
 ---
 
@@ -421,10 +430,12 @@ Adding `rand() % 2` to decide which diagonal direction to try, or whether to sca
 #### F1 Perlin Noise — Permutation Table & Smoothstep
 Ken Perlin's classic algorithm hashes integer grid corners using a 256-element permutation table, then blends the four corner contributions using a smoothstep curve (`6t⁵ - 15t⁴ + 10t³`). The result is a continuous, band-limited noise signal that looks natural — unlike `rand()` which has no spatial coherence.
 *Files: `flowfield.c`, `complex_flowfield.c`*
+*References: Perlin, "An Image Synthesizer" SIGGRAPH (1985); Perlin, "Improving Noise" SIGGRAPH (2002) — introduces the quintic fade function and gradient-table refinements used here.*
 
 #### F2 Octave Layering (Fractal Brownian Motion)
 Summing multiple noise samples at increasing frequencies (`freq × 2ⁿ`) and decreasing amplitudes (`amp × 0.5ⁿ`) builds fractal detail. Two octaves give smooth hills; four give terrain with boulders; eight give bark texture. This project uses three octaves for the flow field angle, balancing detail against computation. `complex_flowfield.c` also uses multi-octave fBm for the curl noise scalar potential.
 *Files: `flowfield.c`, `complex_flowfield.c`*
+*References: Mandelbrot, "The Fractal Geometry of Nature" (1982) §28; Musgrave, Kolb & Mace, "The synthesis and rendering of eroded fractal terrains" SIGGRAPH (1989).*
 
 #### F3 Flow Field from Noise
 Sample two independent noise fields at offset coordinates to get `(vx, vy)`, then `atan2(vy, vx)` gives an angle. Placing this angle at every grid cell builds a vector field that is spatially smooth but visually complex. Particles that follow the field produce curved, organic-looking trails.
@@ -433,22 +444,27 @@ Sample two independent noise fields at offset coordinates to get `(vx, vy)`, the
 #### F4 Curl Noise — Divergence-Free Vector Fields
 Build a scalar potential ψ(x,y,t) from noise. The 2-D curl of a scalar field is a divergence-free vector field: `Vx = ∂ψ/∂y`, `Vy = −∂ψ/∂x`. Approximate with central differences: `Vx ≈ (ψ(x, y+ε) − ψ(x, y−ε)) / 2ε`. Divergence-free means `∂Vx/∂x + ∂Vy/∂y = 0` everywhere — no sources or sinks. Particles orbit indefinitely without clustering or dispersing, producing looping smoke-like motion that plain angle noise cannot achieve.
 *Files: `complex_flowfield.c`*
+*References: Bridson, Hourihan & Nordenstam, "Curl-Noise for Procedural Fluid Flow" SIGGRAPH (2007).*
 
 #### F5 Biot-Savart Vortex Lattice
 N point vortices each contribute a velocity at any grid cell via the 2-D Biot-Savart law: `Vx += S·(−dy)/(r²+ε)`, `Vy += S·dx/(r²+ε)`. Superimposing N vortices with alternating positive (CCW) and negative (CW) strengths creates complex whirlpool interference. The `ε` (VORT_EPS) term regularises the singularity at the vortex centre — without it, cells at exactly the vortex position receive infinite velocity. Placing vortices on a slowly rotating ring makes the pattern evolve continuously.
 *Files: `complex_flowfield.c`, `particle_systems/smoke.c`*
+*References: Jackson, "Classical Electrodynamics" 3e §5.3; Chorin, "Numerical study of slightly viscous flow" *J. Fluid Mech.* 57 (1973) — vortex-blob method origin.*
 
 #### F6 Pre-Baked Cosine Palette → 16 Color Pairs
 The cosine palette formula `color(t) = a + b·cos(2π·(c·t+d))` generates smooth complementary hue gradients from just four 3-vectors per theme. Rather than calling `init_pair()` every frame (as `flocking.c` does), `complex_flowfield.c` calls it once at theme-change time for 16 evenly-spaced `t` values, registering all 16 color pairs upfront. Particles then select a pair by mapping their flow angle to `t ∈ [0,1]` — no per-frame color registration, no flicker. The `cos_to_xterm256()` function maps each float RGB triple to the xterm-256 color cube: `16 + 36·r5 + 6·g5 + b5` where each channel is rounded to the nearest of 6 discrete levels.
 *Files: `complex_flowfield.c`*
+*References: Quilez, "Procedural Color Palettes" (iquilezles.org/articles/palettes) — derivation and example coefficient sets.*
 
 #### F4 LCG — Deterministic Pseudo-random Numbers
 A Linear Congruential Generator (`state = state × A + C mod 2³²`) produces a deterministic sequence from a seed. `kaboom.c` uses it so that the same seed always produces the same explosion shape — useful for pre-generating animation frames or making effects reproducible.
 *Files: `kaboom.c`*
+*References: Lehmer, "Mathematical methods in large-scale computing units" Harvard (1951); Press et al., "Numerical Recipes" 3e ch. 7.*
 
 #### F5 Rejection Sampling — Isotropic Random Direction
 Generating `(vx, vy)` as two independent uniform `[-1,1]` randoms and normalizing gives a non-uniform distribution — diagonal directions are more likely. The fix is to sample a point inside the unit circle by rejection: generate random `(x,y)` until `x² + y² <= 1`, then normalize. The result is a perfectly uniform angle distribution.
 *Files: `bounce.c`*
+*References: Devroye, "Non-Uniform Random Variate Generation" (1986) §I.4 — the canonical treatment of rejection sampling on the unit disc.*
 
 ---
 
@@ -457,22 +473,27 @@ Generating `(vx, vy)` as two independent uniform `[-1,1]` randoms and normalizin
 #### G1 Paul Bourke ASCII Density Ramp
 A 92-character string ordered from visually sparse (space, backtick) to visually dense (`@`, `#`). Mapping a `[0,1]` luminance value to an index in this string converts brightness to an ASCII "pixel density" — dark regions get sparse characters, bright regions get dense ones. Used in every raster and raymarcher file.
 *Files: all raster files, all raymarch files, `fire.c`*
+*References: Bourke, "Character representation of greyscale images" (paulbourke.net/dataformats/asciiart/).*
 
 #### G2 Bayer 4×4 Ordered Dithering
 A precomputed 4×4 threshold matrix is added to each pixel's luminance before quantization: `dithered = luma + (bayer[y&3][x&3] - 0.5) × strength`. Ordered dithering introduces a regular, position-dependent pattern that encodes fractional brightness levels that the discrete character ramp cannot represent directly. It is fast (one table lookup per pixel) and produces clean halftone patterns.
 *Files: all raster files, `fire.c`*
+*References: Bayer, "An optimum method for two-level rendition of continuous-tone pictures" *IEEE Conf. on Communications* (1973).*
 
 #### G3 Floyd-Steinberg Error Diffusion Dithering
 After quantizing a pixel, the quantization error is distributed to the four unprocessed neighbours with weights `7/16, 3/16, 5/16, 1/16`. This "spends" the rounding error across adjacent pixels, producing smoother gradients than ordered dithering at the cost of a full-grid pass. Used in the fire renderers where smooth gradient quality is more important than pattern regularity.
 *Files: `fire.c`, `aafire_port.c`*
+*References: Floyd & Steinberg, "An adaptive algorithm for spatial grey scale" *Proc. SID* 17 (1976).*
 
 #### G4 Luminance — Perceptual RGB Weighting
 Human eyes are most sensitive to green and least to blue. Converting colour to brightness as `L = 0.2126R + 0.7152G + 0.0722B` (the ITU-R BT.709 coefficients) matches perceived brightness. Using a simple average `(R+G+B)/3` would make pure green look dim and pure blue look bright — the wrong result.
 *Files: all raster files*
+*References: ITU-R Recommendation BT.709-6 "Parameter values for the HDTV standards" (2015); Poynton, "Digital Video and HD: Algorithms and Interfaces" 2e ch. 24.*
 
 #### G5 Gamma Correction
 Display hardware applies a nonlinear transfer function (gamma ≈ 2.2) to the stored color value. Working in linear light (as Phong shading does) and outputting without correction makes the image look too dark. Applying `pow(value, 1/2.2)` before output converts linear light to gamma-encoded display values and restores the correct perceptual brightness. In terminal renderers the same principle applies to Bourke char selection: without `pow(luma, 0.45)` before the ramp index calculation, linear luma values cluster in the top 2–3 chars and the lower density chars are rarely used, collapsing perceived contrast.
 *Files: all raster files, `raymarcher.c`, `raymarcher/sdf_gallery.c`*
+*References: Poynton, "Frequently asked questions about Gamma" (1998); ITU-R BT.1886 (display reference EOTF).*
 
 #### G6 Directional Characters — Arrow & Line Glyphs
 In `flowfield.c` the particle head character is chosen by the angle of motion: `→ ↗ ↑ ↖ ← ↙ ↓ ↘`. Dividing `atan2(vy,vx)` by `π/4` and rounding to the nearest octant indexes into an 8-character array. `complex_flowfield.c` uses the same technique for both particle heads and the background colormap — every cell shows the flow direction glyph colored by the cosine palette. In `spring_pendulum.c` the spring is drawn with `/`, `\`, `|`, `-` chosen by the local segment slope.
@@ -525,10 +546,12 @@ After multiplying by the MVP matrix, coordinates are in clip space with a non-un
 #### I1 Signed Distance Functions (SDF)
 An SDF returns the signed minimum distance from a point P to a surface: negative inside, positive outside, zero on the surface. The sphere SDF is simply `length(P) - radius`. SDFs can be combined with `min` (union), `max` (intersection), and `-` (subtraction) to build complex shapes analytically, with no mesh required.
 *Files: `raymarcher.c`, `raymarcher_cube.c`*
+*References: Quilez, "Distance Functions" (iquilezles.org/articles/distfunctions/) — the canonical SDF primitive and operator catalogue.*
 
 #### I2 Sphere Marching Loop
 Cast a ray from the camera. At each step, evaluate the SDF. The SDF tells you the safe distance you can step without crossing any surface — so step by exactly that amount. Near a surface the SDF approaches zero and steps shrink; a hit is declared when the SDF falls below an epsilon (0.002). This is guaranteed safe and converges much faster than fixed-step raytracing.
 *Files: `raymarcher.c`, `raymarcher_cube.c`*
+*References: Hart, "Sphere Tracing: A Geometric Method for the Antialiased Ray Tracing of Implicit Surfaces" *The Visual Computer* 12 (1996).*
 
 #### I3 SDF Normal via Finite Difference
 The gradient of an SDF equals the surface normal: `N = normalize(∇SDF(P))`. Approximating the gradient numerically as `(SDF(P+εx̂) - SDF(P-εx̂)) / 2ε` along each axis gives the normal at any point on any SDF without needing an analytic formula. This generalizes to any arbitrary SDF shape.
@@ -621,10 +644,12 @@ To step along the surface for central differences, you need two vectors tangent 
 #### K1 Blinn-Phong Shading
 Computes lighting as `ambient + diffuse + specular`. Diffuse = `max(0, N·L)` (Lambertian) where `L` is the normalised direction to the light. Specular = `max(0, N·H)^shininess` where `H = normalize(L + V)` is the half-vector between light and view directions (Blinn's approximation — cheaper than reflecting L). The shininess exponent controls highlight size.
 *Files: all raster files, `raymarcher.c`*
+*References: Blinn, "Models of light reflection for computer synthesized pictures" SIGGRAPH (1977); Phong, "Illumination for computer generated pictures" *CACM* 18 (1975).*
 
 #### K2 Toon / Cel Shading — Banded Diffuse
 Quantise the diffuse term into N discrete bands: `banded = floor(diff × N) / N`. This replaces the smooth gradient with hard steps, giving the flat-coloured look of cel animation. A binary specular (`N·H > 0.94 ? 0.7 : 0`) adds a hard highlight. On the cube, each flat face falls entirely into one band, making the effect especially striking.
 *Files: all raster files*
+*References: Lake, Marshall, Harris & Blackstein, "Stylized rendering techniques for scalable real-time 3D animation" NPAR (2000).*
 
 #### K3 Normal Visualisation Shader
 Map world-space normals from `[-1,1]` to `[0,1]`: `color = N × 0.5 + 0.5`. This encodes surface orientation as RGB: +X right = red, +Y up = green, +Z toward camera = blue. It is invaluable for debugging: correct normals produce smooth colour gradients; wrong normals show as sudden hue jumps or flat solid colours.
@@ -641,6 +666,7 @@ The `donut.c` algorithm computes 3D positions by rotating a point on a circle (t
 #### L1 Bresenham Line Algorithm
 Draws a line between two integer grid points by incrementally tracking the sub-pixel error. At each step it moves in the major axis direction and conditionally steps in the minor axis when the accumulated error exceeds half a pixel. It uses only integer addition and comparison — no floating-point per step — making it the fastest possible discrete line rasterizer.
 *Files: `wireframe.c`, `spring_pendulum.c`*
+*References: Bresenham, "Algorithm for computer control of a digital plotter" *IBM Systems Journal* 4 (1965).*
 
 #### L2 Ring Buffer
 A fixed-size array with `head` and `tail` indices that wrap modulo the array size. `matrix_rain.c` uses a ring buffer for each column's trail: the `head` index advances each tick, overwriting the oldest entry. Reading backwards from head gives the trail in order from newest to oldest without any shifting or allocation.
@@ -657,6 +683,7 @@ Rather than testing every pixel on screen against every triangle, compute the ax
 #### L5 Fisher-Yates Shuffle
 To randomise the column scan order in `sand.c` each tick: fill an array `[0..cols-1]`, then for `i` from `cols-1` down to 1, swap `arr[i]` with `arr[rand() % (i+1)]`. Each permutation is equally likely, removing the left/right scan bias that would otherwise cause sand to pile up asymmetrically. This is the standard O(n) unbiased shuffle.
 *Files: `sand.c`*
+*References: Fisher & Yates, "Statistical Tables for Biological, Agricultural and Medical Research" (1938) §XVIII; Knuth, "The Art of Computer Programming" Vol. 2 §3.4.2 (Algorithm P).*
 
 #### L6 Callback / Function Pointer Patterns
 `brust.c` passes a `scorch` function pointer into `burst_tick`; the raster pipeline invokes `sh->vert` and `sh->frag` through `ShaderProgram`; `flowfield.c` maps colours through a theme function. Function pointers turn hardcoded behaviour into pluggable strategies — new displacement modes, new shaders, new themes — without touching the pipeline code.
@@ -808,6 +835,7 @@ Reynolds' three rules, each computed over neighbors within `PERCEPTION_RADIUS`:
 
 The three force vectors are combined with independent weights (`SEP_WEIGHT`, `ALG_WEIGHT`, `COH_WEIGHT`). The boid's steering force is added to its velocity, then clamped to `MAX_SPEED`.
 *Files: `flocking.c`*
+*References: Reynolds, "Flocks, Herds and Schools: A Distributed Behavioral Model" SIGGRAPH (1987); Reynolds, "Steering Behaviors For Autonomous Characters" GDC (1999) for the steering-force formulation used here.*
 
 #### N2 Vicsek Model — Noise-driven Phase Transition
 
@@ -819,6 +847,7 @@ The Vicsek model is a minimal self-propulsion model that exhibits a phase transi
 
 where `<θ_neighbors>` is the average heading of all boids within radius, `η` is the noise amplitude, and `ξ` is uniform `[−π, π]` noise. As `η` increases beyond a critical value, the global order parameter (average heading alignment) collapses from 1 to 0 — the flock fragments. Adjustable with `n/m` keys.
 *Files: `flocking.c`*
+*References: Vicsek, Czirók, Ben-Jacob, Cohen & Shochet, "Novel type of phase transition in a system of self-driven particles" *Phys. Rev. Lett.* 75 (1995).*
 
 #### N3 Leader Chase
 
@@ -922,6 +951,7 @@ Key design decisions:
 - **Sticking probability < 1.0** — probabilistic sticking (coral.c) smooths the branches and allows side growth.
 
 *Files: `snowflake.c`, `coral.c`*
+*References: Witten & Sander, "Diffusion-Limited Aggregation, a Kinetic Critical Phenomenon" *Phys. Rev. Lett.* 47 (1981); Meakin, "Fractals, Scaling and Growth far from Equilibrium" Cambridge (1998).*
 
 #### P2 D6 Hexagonal Symmetry with Aspect Correction
 
@@ -968,6 +998,7 @@ For the Sierpinski triangle the three transforms are `T_i(x,y) = ((x + V_i.x)/2,
 The attractor is reached because each transform is contractive (Lipschitz constant 0.5). Banach's fixed-point theorem guarantees that repeated application converges to the unique fixed-point set — the Sierpinski triangle.
 
 *Files: `sierpinski.c`, `fern.c`*
+*References: Barnsley, "Fractals Everywhere" 2e (1993) ch. 3; Hutchinson, "Fractals and Self Similarity" *Indiana Univ. Math. J.* 30 (1981) — the formal IFS framework.*
 
 #### P5 Barnsley Fern — 4-Transform IFS
 
@@ -990,6 +1021,7 @@ scale_x = cols * 0.45 / (x_max - x_min)
 ```
 
 *Files: `fern.c`*
+*References: Barnsley, "Fractals Everywhere" 2e (1993) §3.8 — the original four-affine fern coefficients.*
 
 #### P6 Escape-time Iteration — Julia and Mandelbrot Sets
 
@@ -1010,6 +1042,7 @@ The escape-time coloring maps `frac` to color bands:
 Julia sets visualise the filled Julia set for a particular `c`. Different `c` values produce dramatically different shapes: `c = −0.7 + 0.27i` gives the Douady rabbit, `c = −0.8 + 0.156i` gives a dendrite, `c = −0.7269 + 0.1889i` gives a seahorse.
 
 *Files: `julia.c`, `mandelbrot.c`*
+*References: Mandelbrot, "Fractal aspects of the iteration of z → λz(1−z) for complex λ and z" *Annals NY Acad. Sci.* 357 (1980); Douady & Hubbard, "Étude dynamique des polynômes complexes" Publ. Math. Orsay (1984).*
 
 #### P7 Fisher-Yates Random Pixel Reveal
 
@@ -1100,6 +1133,7 @@ if (t < floor) return 0;  /* invisible */
 **Five presets:** buddha 500, buddha 2000 (outer filaments), anti 100, anti 500, anti 1000 (interior complexity). Each preset accumulates TOTAL_SAMPLES=150000 random samples then holds for DONE_PAUSE_TICKS before cycling.
 
 *Files: `buddhabrot.c`*
+*References: Green, "Buddhabrot" (1993) (superliminal.com/fractals/bbrot/bbrot.htm) — the original orbit-density visualisation.*
 
 #### P11 Pascal-Triangle Bat Swarms — Artistic Formation Flying
 
@@ -1148,6 +1182,7 @@ The along/perp offsets are rotated into world space using the group's flight ang
 **Key insight:** Placing children at the origin (departure cell) rather than the destination (arrival cell) is the rule that prevents newborns from acting in the same tick as they are born — origin was already processed, destination may not have been.
 
 *Files: `artistic/wator.c`*
+*References: Dewdney, "Sharks and fish wage an ecological war on the toroidal planet Wa-Tor" *Scientific American* "Computer Recreations" (Dec 1984).*
 
 ---
 
@@ -1175,6 +1210,7 @@ Without `g_inq`, a cell receiving grains from 4 neighbours could be enqueued 4 t
 **Emergent fractal:** After millions of drops the stable pattern develops 4-fold quasi-crystalline symmetry. Avalanche size distribution follows a power law — the system self-tunes to criticality.
 
 *Files: `fractal_random/sandpile.c`*
+*References: Bak, Tang & Wiesenfeld, "Self-Organized Criticality: An Explanation of 1/f Noise" *Phys. Rev. Lett.* 59 (1987); Dhar, "Self-Organized Critical State of Sandpile Automaton Models" *Phys. Rev. Lett.* 64 (1990) — abelian property of the sandpile.*
 
 ---
 
@@ -1220,6 +1256,7 @@ float sdf_scene(Vec3 p, ...) {
 **Color hash:** `h = abs(k_0·3 + k_1·7 + k_2·11 + k_3·13 + k_4·17) % 3`. Since adjacent tiles are always opposite type, same-type color collisions never cause invisible boundaries.
 
 *Files: `fractal_random/penrose.c`*
+*References: de Bruijn, "Algebraic theory of Penrose's nonperiodic tilings of the plane" *Indag. Math.* 84 (1981); Senechal, "Quasicrystals and Geometry" Cambridge (1995) ch. 4.*
 
 ---
 
@@ -1234,6 +1271,7 @@ float sdf_scene(Vec3 p, ...) {
 **Bilinear interpolation** maps the fixed 65×65 grid to any terminal size without blocky nearest-neighbor artifacts.
 
 *Files: `fractal_random/terrain.c`*
+*References: Fournier, Fussell & Carpenter, "Computer rendering of stochastic models" *CACM* 25 (1982) — diamond-square / midpoint displacement; Musgrave, "A multifractal explanation for terrain ridges" SIGGRAPH (1989) — thermal weathering.*
 
 ---
 
@@ -1272,6 +1310,7 @@ Two-octave sinusoidal curtains with a vertical sine envelope render the northern
 `voronoi.c` moves seeds via `v += (−DAMP·v + NOISE·ξ)·dt` (Langevin dynamics). Per-cell nearest-seed search tracks d1 and d2; `d2−d1 < BORDER_PX` identifies Voronoi edges without Fortune's algorithm.
 
 *Files: `geometry/voronoi.c`*
+*References: Voronoi, "Nouvelles applications des paramètres continus à la théorie des formes quadratiques" *J. reine angew. Math.* 133 (1908); Aurenhammer, "Voronoi diagrams — a survey of a fundamental geometric data structure" *ACM Computing Surveys* 23 (1991).*
 
 ---
 
@@ -1284,6 +1323,7 @@ Two-octave sinusoidal curtains with a vertical sine envelope render the northern
 **Spring force:** `F = k·stretch + kd·v_rel` where `v_rel = dot(v_b − v_a, n)`. Symplectic Euler: `v += a·dt; v *= DAMP; x += v·dt`.
 
 *Files: `physics/cloth.c`*
+*References: Provot, "Deformation Constraints in a Mass-Spring Model to Describe Rigid Cloth Behavior" *Graphics Interface* (1995); Baraff & Witkin, "Large Steps in Cloth Simulation" SIGGRAPH (1998).*
 
 ---
 
@@ -1292,6 +1332,7 @@ Two-octave sinusoidal curtains with a vertical sine envelope render the northern
 **Softened gravity:** `F = G·m_i·m_j / (r² + ε²)^(3/2)`. ε² prevents singularities at close approach. O(n²) force loop, n=20 bodies, Velocity Verlet integration.
 
 *Files: `physics/nbody.c`*
+*References: Verlet, "Computer 'experiments' on classical fluids. I. Thermodynamical properties of Lennard-Jones molecules" *Phys. Rev.* 159 (1967); Aarseth, "Gravitational N-Body Simulations" Cambridge (2003) ch. 2.*
 
 ---
 
@@ -1300,6 +1341,7 @@ Two-octave sinusoidal curtains with a vertical sine envelope render the northern
 **RK4** keeps the trajectory on the attractor without time-step reduction (Euler diverges due to chaos sensitivity). **Ghost trajectory** starts at x+ε=0.001 offset; exponential divergence on the Lyapunov time-scale (~1.1 s) is rendered in a contrasting color. **Orthographic rotation** `px = x·cos(a) − y·sin(a)` reveals 3-D structure without a projection matrix.
 
 *Files: `physics/lorenz.c`*
+*References: Lorenz, "Deterministic Nonperiodic Flow" *Journal of the Atmospheric Sciences* 20 (1963); Strogatz, "Nonlinear Dynamics and Chaos" 2e ch. 9.*
 
 ---
 
@@ -1349,6 +1391,7 @@ void qt_force(int ni, int bi, float *fx, float *fy) {
 **Complexity:** O(N log N) average case. Each body visits O(log N) nodes in the well-separated regime. The actual cost depends on θ and on how clustered the bodies are.
 
 *Files: `physics/barnes_hut.c`, `physics/nbody.c` (O(N²) for comparison)*
+*References: Barnes & Hut, "A hierarchical O(N log N) force-calculation algorithm" *Nature* 324 (1986); Greengard & Rokhlin, "A fast algorithm for particle simulations" *J. Comp. Phys.* 73 (1987) — the related FMM.*
 
 ---
 
@@ -1531,6 +1574,7 @@ lambda /= ITER;
 **int8_t bucket encoding:** The computed λ is stored as a signed 8-bit integer (×32 scale) rather than a float, saving 4× memory and enabling fast palette lookup via sign bit.
 
 *Files: `fractal_random/lyapunov.c`*
+*References: May, "Simple mathematical models with very complicated dynamics" *Nature* 261 (1976); Wolf, Swift, Swinney & Vastano, "Determining Lyapunov exponents from a time series" *Physica D* 16 (1985); Markus & Hess, "Lyapunov exponents of the logistic map with periodic forcing" *Computers & Graphics* 13 (1989) — Markus-Lyapunov fractals.*
 
 ---
 
@@ -1551,6 +1595,7 @@ The key difference from pure DLA (random walker) is that the Laplace field `φ` 
 **Neumann boundary conditions:** Side walls get `∂φ/∂n = 0` (no flux): `φ[r][0] = φ[r][1]`, `φ[r][cols-1] = φ[r][cols-2]`. This lets the field bend naturally around obstacles without artificial reflection.
 
 *Files: `fractal_random/tree_la.c`*
+*References: Niemeyer, Pietronero & Wiesmann, "Fractal dimension of dielectric breakdown" *Phys. Rev. Lett.* 52 (1984).*
 
 ---
 
@@ -1581,6 +1626,7 @@ The key difference from pure DLA (random walker) is that the Laplace field `φ` 
 #### I5 Mandelbulb Distance Estimator
 The Mandelbulb extends Mandelbrot iteration to 3D using spherical power: `z^p → r^p · (sin(pθ)cos(pφ), sin(pθ)sin(pφ), cos(pθ))` then `z += c`. The distance estimator tracks the derivative magnitude `dr = p · r^(p-1) · dr + 1` alongside the iteration, giving `DE = 0.5 · log(r) · r / dr`. When `dr` is large the surface is far; when small the march is close. Power 8 gives the classic 8-fold symmetric Mandelbulb; powers 2–12 sweep from sphere to full fractal.
 *Files: `raymarcher/mandelbulb_explorer.c`, `raster/mandelbulb_raster.c`*
+*References: White & Nylander, "The Mandelbulb: first 'true' 3D image of the Mandelbrot set" (skytopia.com, 2009); Hart, Sandin & Kauffman, "Ray tracing deterministic 3-D fractals" SIGGRAPH (1989) — distance-estimation framework.*
 
 #### I6 Smooth Escape-time Coloring
 Integer escape count `i` produces harsh banding where adjacent iteration shells have discrete color jumps. The continuous formula: `mu = i + 1 − log(log(|z|)/log(bail)) / log(power)`. The `log(log(|z|))` term measures how far past the bailout the orbit was, interpolating continuously between integer counts. `mu ∈ ℝ` produces smooth color gradients across depth shells.
@@ -1673,14 +1719,17 @@ if (light_mode == 0) { return KA + KD*ndv*ao; } /* N·V: no light direction */
 #### U1 Monte Carlo Path Tracing
 A **path tracer** solves the rendering equation `L_o = L_e + ∫ L_i · f_r · cosθ dω` by Monte Carlo sampling: fire one ray per pixel, bounce it randomly, accumulate radiance from emissive hits. The estimate is unbiased — more samples converge to the exact ground-truth image. Key phenomena that emerge automatically: soft shadows (area light sampling), color bleeding (diffuse inter-reflection), ambient occlusion (geometry occlusion), caustics (specular → diffuse paths).
 *Files: `raytracing/path_tracer.c`*
+*References: Kajiya, "The Rendering Equation" SIGGRAPH (1986); Veach, "Robust Monte Carlo Methods for Light Transport Simulation" Stanford PhD thesis (1997); Pharr, Jakob & Humphreys, "Physically Based Rendering" 4e (2023) ch. 13–16.*
 
 #### U2 Lambertian BRDF + Cosine Hemisphere Sampling
 For Lambertian BRDF `f_r = ρ/π` and cosine-weighted hemisphere PDF `p(ω) = cosθ/π`, the Monte Carlo weight simplifies: `f_r · cosθ / p = (ρ/π) · cosθ / (cosθ/π) = ρ`. The π and cosθ cancel — `throughput *= albedo` is the complete update. Malley's method generates cosine-weighted samples: uniform disk sample `(r1,r2)` → azimuth `φ=2πr1`, elevation `sinθ=√r2`, `cosθ=√(1−r2)`, transform to world space via ONB around N.
 *Files: `raytracing/path_tracer.c`*
+*References: Malley, "A shading method for computer generated images" MSc thesis, Univ. of Utah (1988) — origin of the disk-projection cosine sampler; Pharr et al. "PBR" 4e §13.6.*
 
 #### U3 Russian Roulette — Unbiased Path Termination
 Fixed-depth truncation misses deep indirect light (biased). Russian roulette terminates at any depth `d ≥ RR_DEPTH` with probability `1 − p` where `p = max(throughput)`. Surviving paths compensate with `throughput /= p`. Unbiased proof: `E[contribution] = (contribution × p) / p = contribution`. Dim paths (near-zero throughput, small p) are more likely to die — exactly correct since they contribute negligibly even if they survive.
 *Files: `raytracing/path_tracer.c`*
+*References: Arvo & Kirk, "Particle Transport and Image Synthesis" SIGGRAPH (1990) — first application of Russian roulette to graphics rendering.*
 
 #### U4 Progressive Accumulator — Convergent Rendering
 `g_accum[y][x][3]` stores the running sum of radiance samples. Each frame adds `SPP_PER_FRAME` jittered samples (sub-pixel random offset = free anti-aliasing). Display = `accum / samples` after tone-mapping. The image evolves from white noise → recognizable structure (16 samples) → converged (512+ samples). Reset on resize (`memset+0`) or user request. Auto-stop at `ACCUM_CAP=8192` since convergence past that is imperceptible at ASCII resolution.
@@ -1689,6 +1738,7 @@ Fixed-depth truncation misses deep indirect light (biased). Russian roulette ter
 #### U5 Reinhard Tone Mapping
 Raw path-traced radiance is unbounded (`[0, ∞)`). Reinhard compresses per channel: `L_display = L / (1 + L)`. Properties: passes 0→0, maps 1→0.5, asymptotes to 1 as L→∞. Follow with gamma encode `L^(1/2.2)` for perceptual sRGB. Filmic alternatives (Hejl-Dawson, ACES) give more dramatic contrast but Reinhard is sufficient for terminal resolution. The light emission of 15 W·sr⁻¹ compresses to `15/16 ≈ 0.94` — near-white as intended.
 *Files: `raytracing/path_tracer.c`*
+*References: Reinhard, Stark, Shirley & Ferwerda, "Photographic tone reproduction for digital images" SIGGRAPH (2002).*
 
 #### U6 xorshift32 — Decorrelated Per-pixel RNG
 ```c
@@ -1700,10 +1750,12 @@ static Rng rng_seed(int px, int py, int frame) {
 ```
 Independent per-pixel seeds prevent correlated noise (bands, streaks). The hash mixes pixel coordinates and frame index — adjacent pixels and adjacent frames get unrelated initial states. Three warm-up xorshift steps break up any regularities in the hash output. The `s ? s : 1` guard prevents the all-zero state (xorshift(0) = 0 forever).
 *Files: `raytracing/path_tracer.c`*
+*References: Marsaglia, "Xorshift RNGs" *Journal of Statistical Software* 8 (2003).*
 
 #### U7 Cornell Box — Standard Path Tracing Scene
 The Cornell Box is the benchmark for global illumination algorithms: red left wall, green right wall, white floor/ceiling/back, small overhead area light. Designed to show: color bleeding (red/green walls tint white surfaces), soft shadows (finite area light), and indirect illumination (ceiling lit by floor reflections). Two spheres with distinct colors add inter-object color bleeding. Any path tracer that renders the Cornell Box correctly handles all first-order global illumination effects.
 *Files: `raytracing/path_tracer.c`*
+*References: Goral, Torrance, Greenberg & Battaile, "Modeling the interaction of light between diffuse surfaces" SIGGRAPH (1984) — the original radiosity Cornell Box; cornellbox.com — current canonical scene parameters.*
 
 #### U8 Axis-aligned Quad Intersection
 ```c
@@ -1728,6 +1780,7 @@ Penetration is a separate problem from velocity. Before resolving velocity, sepa
 
 Equal-mass collisions along the normal reduce to swapping the normal velocity components exactly. Non-equal masses cause the lighter body to deflect more — matching billiard-ball intuition where a cue ball deflects when striking a heavier ball.
 *Files: `physics/elastic_collision.c`*
+*References: Mirtich & Canny, "Impulse-based Simulation of Rigid Bodies" *I3D* (1995); Baraff, "Physically Based Modeling" SIGGRAPH course notes (2001).*
 
 ---
 
@@ -1746,6 +1799,7 @@ float vy_new = vx * s + vy * c;
 
 This preserves `|v|` exactly. Ionisation energy loss (the drag that makes bubble-chamber tracks spiral inward) is added afterward as a multiplicative speed reduction: `|v| *= (1 - DRAG)`. The combined effect — exact rotation plus shrinking speed — produces the logarithmic inward spiral that characterises real particle tracks.
 *Files: `physics/bubble_chamber.c`*
+*References: Jackson, "Classical Electrodynamics" 3e §12.2; Boris, "Relativistic Plasma Simulation" (1970) — origin of the exact-rotation Boris pusher used in particle-in-cell codes.*
 
 ---
 
@@ -1763,6 +1817,7 @@ These are nonlinear (the right-hand side contains products of angular velocities
 
 Orientation is tracked as a unit quaternion `q = (qw, qx, qy, qz)`. The quaternion derivative is `q̇ = 0.5 · q ⊗ (0, ω)` where `(0, ω)` is a pure quaternion from the body-frame angular velocity. After each RK4 step the quaternion is re-normalised (`q /= |q|`) and the world-space rotation matrix is extracted from it. This avoids gimbal lock (which Euler angles suffer at `θ = 0`) and the accumulated drift that rotation-matrix integration has.
 *Files: `physics/gyroscope.c`*
+*References: Goldstein, Poole, Safko, "Classical Mechanics" 3e §5.5–§5.7 (Euler equations); Shoemake, "Animating Rotation with Quaternion Curves" SIGGRAPH (1985); the Dzhanibekov-effect / intermediate-axis theorem is treated in Marsden & Ratiu, "Mechanics and Symmetry" §15.10.*
 
 ---
 
@@ -1774,6 +1829,7 @@ The initial conditions must be specified to high precision (five or more signifi
 
 The centre-of-mass frame correction — subtracting the mean velocity each step — keeps the simulation centred on screen. Without it, momentum imbalance from floating-point rounding causes the whole system to drift off screen over time. The `x` key in the implementation adds a random perturbation to one body, instantly revealing the underlying chaotic dynamics hiding beneath the symmetric orbit.
 *Files: `physics/orbit_3body.c`*
+*References: Chenciner & Montgomery, "A remarkable periodic solution of the three-body problem in the case of equal masses" *Annals of Mathematics* 152 (2000); Moore, "Braids in classical dynamics" *Phys. Rev. Lett.* 70 (1993).*
 
 ---
 
@@ -1785,6 +1841,7 @@ Because consecutive pendulums differ by exactly one oscillation per `T_SYNC`, at
 
 The key rendering detail is drawing the string as a sloped line from the pivot to the bob using slope-appropriate characters (`|`, `/`, `\`), not as a vertical column. Drawing a vertical column makes the string appear to disappear while only the bob moves — the sloped line gives the correct visual impression of the pendulum's angle.
 *Files: `physics/pendulum_wave.c`*
+*References: Berg & Marshall, "Wilberforce pendulum oscillations and normal modes" *Am. J. Phys.* 59 (1991); Harvard Natural Sciences Lecture Demonstrations — pendulum wave (canonical demo).*
 
 ---
 
@@ -1814,6 +1871,7 @@ Iterative impulse resolution with Baumgarte position correction is the industry-
 
 Running `SOLVER_ITERS = 10` passes propagates contact corrections through stacked bodies (resolving the bottom pair propagates upward through the stack). A sleep system (freezing bodies whose speed stays below `SLEEP_VEL` for `SLEEP_FRAMES` frames) eliminates CPU cost for settled stacks.
 *Files: `physics/rigid_body.c`*
+*References: Baumgarte, "Stabilization of constraints and integrals of motion in dynamical systems" *CMAME* 1 (1972); Catto, "Iterative Dynamics with Temporal Coherence" GDC (2005) — Box2D solver design.*
 
 ---
 
@@ -1825,6 +1883,7 @@ The resulting linear system is tridiagonal (three diagonals, because the Hamilto
 
 Quantum tunnelling is visible when the packet encounters a potential barrier `V > E`. The transmitted amplitude is `T ≈ exp(−2κd)` where `κ = √(2m(V−E))/ℏ` and `d` is barrier width. Absorbing boundaries (multiplying `ψ` by a smooth damping function near the edges) suppress reflections from the grid walls that would otherwise contaminate the physics.
 *Files: `physics/schrodinger.c`*
+*References: Crank & Nicolson, "A practical method for numerical evaluation of solutions of partial differential equations of the heat-conduction type" *Proc. Camb. Phil. Soc.* 43 (1947); Press et al., "Numerical Recipes" 3e §19.2 (Thomas algorithm); Goldberg, Schey & Schwartz, "Computer-generated motion pictures of one-dimensional quantum-mechanical transmission and reflection phenomena" *Am. J. Phys.* 35 (1967).*
 
 ---
 
@@ -1907,6 +1966,7 @@ The growth function `G` reaches +1 when the local density matches the species pa
 
 Precomputing the kernel once as a flat list of (row-offset, col-offset, weight) triples amortises the O(R²) cost and enables cache-friendly inner loops. Different parameter pairs `(μ, σ, R)` define distinct "species": the Orbium (μ=0.15, σ=0.015, R=13) moves coherently like a glider; the Aquarium produces a rich soup of interacting blobs.
 *Files: `fluid/lenia.c`*
+*References: Chan, "Lenia — Biology of Artificial Life" *Complex Systems* 28 (2019); Chan's interactive notebook (chakazul.github.io/lenia.html).*
 
 ---
 
@@ -1918,6 +1978,7 @@ The FitzHugh-Nagumo variant used in `reaction_wave.c` extends this to continuous
 
 Spiral waves require a broken wavefront for initiation: create a planar wave, then make a section of the medium refractory (blocking that half). The free end of the planar wave curls into a rotating spiral. Once established, spirals are self-sustaining — they do not require continuous external forcing, and two counter-rotating spirals can annihilate each other on contact.
 *Files: `fluid/excitable.c`, `fluid/reaction_wave.c`*
+*References: Greenberg & Hastings, "Spatial patterns for discrete models of diffusion in excitable media" *SIAM J. Appl. Math.* 34 (1978); FitzHugh, "Impulses and physiological states in theoretical models of nerve membrane" *Biophys. J.* 1 (1961); Nagumo, Arimoto & Yoshizawa, "An active pulse transmission line simulating nerve axon" *Proc. IRE* 50 (1962).*
 
 ---
 
@@ -1934,6 +1995,7 @@ Two ambiguous cases exist (patterns 5 and 10 — diagonally opposite corners bot
 
 For ASCII rendering, the crossing direction (the slope of the line segment through the cell) maps to a character: nearly horizontal → `─`, nearly vertical → `│`, diagonals → `/` `\`, corners → `+`. The metaball potential field `f(x,y) = Σ Aᵢ / rᵢ²` (gravitational potential of multiple point masses) is the canonical test signal — two nearby blobs produce an organic "peanut" contour that merges into a single blob as they approach.
 *Files: `fluid/marching_squares.c`*
+*References: Lorensen & Cline, "Marching cubes: A high resolution 3D surface construction algorithm" SIGGRAPH (1987) — the 3D progenitor; Maple & Rouse, "Geometric Algorithms and Combinatorial Optimization" (1988) for the 2D case.*
 
 ---
 
@@ -1949,6 +2011,7 @@ The convex hull of N points is the smallest convex polygon containing all points
 
 The cross product `(A→B) × (A→C) = (Bx−Ax)(Cy−Ay) − (By−Ay)(Cx−Ax)` is the foundation of all computational geometry predicates: positive → left turn (CCW), zero → collinear, negative → right turn (CW). Floating-point near-collinear points may give wrong signs — robust implementations use exact arithmetic or add a small epsilon to the comparison.
 *Files: `geometry/convex_hull.c`*
+*References: Graham, "An efficient algorithm for determining the convex hull of a finite planar set" *Information Processing Letters* 1 (1972); Jarvis, "On the identification of the convex hull of a finite set of points in the plane" *Information Processing Letters* 2 (1973); de Berg et al., "Computational Geometry" 3e ch. 1.*
 
 ---
 
@@ -1960,6 +2023,7 @@ For grid graphs, the Manhattan distance heuristic `h = |nx − gx| + |ny − gy|
 
 Force-directed layout (Fruchterman-Reingold) positions graph nodes by simulating repulsive forces between all pairs and attractive spring forces along edges: `F_repel ∝ k²/d`, `F_attract ∝ d²/k`, where `k = √(area/N)`. Iterating to equilibrium produces visually legible layouts where connected nodes cluster and unconnected nodes separate.
 *Files: `artistic/graph_search.c`*
+*References: Hart, Nilsson & Raphael, "A Formal Basis for the Heuristic Determination of Minimum Cost Paths" *IEEE Trans. SSC* 4 (1968) — the A* algorithm; Cormen, Leiserson, Rivest & Stein, "Introduction to Algorithms" 4e ch. 22 (BFS/DFS); Fruchterman & Reingold, "Graph drawing by force-directed placement" *Software: Practice and Experience* 21 (1991).*
 
 ---
 
@@ -2007,6 +2071,7 @@ A panic zone at `PANIC_RADIUS < FLEE_RADIUS` triples the flee weight — sheep s
 
 Sheep use elastic wall bounces (velocity component reflected) rather than toroidal wrap. This makes them cornerable — the flock can be funnelled through an opening, which is the fundamental herding technique. Toroidal wrap would let sheep escape through walls, making herding impossible.
 *Files: `flocking/shepherd.c`*
+*References: Strömbom, Mann, Wilson, Hailes, Morton, Sumpter & King, "Solving the shepherding problem: heuristics for herding autonomous, interacting agents" *J. R. Soc. Interface* 11 (2014).*
 
 ---
 
@@ -2018,6 +2083,7 @@ The pheromone update rule is: `τ(t+1) = (1-ρ)·τ(t) + Σ Δτᵏ` where `ρ` 
 
 The terminal implementation uses a 2D grid rather than a complete graph, making ant movement visual: trails form as visible density gradients in the pheromone field. The pheromone concentration at each cell maps directly to the Bourke ASCII density ramp — denser trails appear as denser characters, making the path selection dynamics directly observable.
 *Files: `artistic/ant_colony.c`*
+*References: Dorigo, "Optimization, Learning and Natural Algorithms" PhD thesis, Politecnico di Milano (1992); Dorigo & Stützle, "Ant Colony Optimization" MIT Press (2004).*
 
 ---
 
@@ -2035,6 +2101,7 @@ Solving for `k₄`: `k₄ = k₁ + k₂ + k₃ ± 2√(k₁k₂ + k₂k₃ + k�
 
 The integer Apollonian gasket starting configuration `(k = −1, 2, 2, 3)` keeps all curvatures integer throughout the recursion — a number-theoretic curiosity. Circle count grows as `3^depth`; the recursion terminates when the resulting radius falls below one pixel. Terminal rendering draws each circle as a ring of characters at positions satisfying `||P − centre|| − radius| < 0.7 px`, with terminal aspect correction applied to the radius test in the row direction.
 *Files: `fractal_random/apollonian.c`*
+*References: Descartes, *Œuvres* IV (letter to Princess Elisabeth, 1643) — original four-circle theorem; Lagarias, Mallows & Wilks, "Beyond the Descartes Circle Theorem" *Amer. Math. Monthly* 109 (2002); Graham, Lagarias, Mallows, Wilks & Yan, "Apollonian Circle Packings: Number Theory" *J. Number Theory* 100 (2003).*
 
 ---
 
@@ -2046,6 +2113,7 @@ The diagram is computed column by column: for each column mapped to a value of `
 
 Auto-zoom scrolls the viewport toward `r∞`, progressively revealing the self-similar structure at finer and finer scales. Panning and zooming are implemented by adjusting the `r_min, r_max` bounds — each zoom doubles the resolution of the displayed bifurcation tree.
 *Files: `fractal_random/bifurcation.c`*
+*References: May, "Simple mathematical models with very complicated dynamics" *Nature* 261 (1976); Feigenbaum, "Quantitative universality for a class of nonlinear transformations" *J. Stat. Phys.* 19 (1978).*
 
 ---
 
@@ -2057,6 +2125,7 @@ Negating the imaginary axis before display (`cy = −(py − centre_y) × scale`
 
 Geometrically the `|·|` operation reflects the complex plane into the first quadrant before each squaring. This is topologically a fold — the Julia sets become asymmetric and the main cardioid transforms into the pointed ship hull with mast and flames. Self-similar miniature copies of the ship appear along the boundary at ever smaller scales, as in the Mandelbrot set.
 *Files: `fractal_random/burning_ship.c`*
+*References: Michelitsch & Rössler, "The 'Burning Ship' and its quasi-Julia sets" *Computers & Graphics* 16 (1992).*
 
 ---
 
@@ -2068,6 +2137,7 @@ The sequence obeys a self-similar recursive structure: the turn sequence for gen
 
 Four copies of the dragon curve rotated by 0°, 90°, 180°, 270° tile the plane without gaps or overlaps — it is a rep-tile of order 4. Terminal rendering uses Bresenham line drawing for each segment, choosing `/`, `\`, `|`, `−` by the segment slope direction, with aspect correction applied to horizontal steps (`×CELL_H/CELL_W`) to prevent circles becoming ellipses.
 *Files: `fractal_random/dragon_curve.c`*
+*References: Davis & Knuth, "Number representations and dragon curves" *J. Recreational Mathematics* 3 (1970); Heighway's original construction is reproduced in Gardner, "Mathematical Games" *Sci. Amer.* (March 1967).*
 
 ---
 
@@ -2079,6 +2149,7 @@ For `f(z) = z⁴ − 1` (four roots at `±1, ±i`), each root's basin is colored
 
 Damped Newton (`z -= α·f(z)/f′(z)` with `α < 1`) slows convergence and exposes finer boundary structure. The four roots of unity form a 4-fold symmetric fractal; the basins have fractal dimension between 1 and 2 — they are neither curves nor areas but something in between.
 *Files: `fractal_random/newton_fractal.c`*
+*References: Cayley, "The Newton-Fourier Imaginary Problem" *Amer. J. Math.* 2 (1879) — first published Newton-fractal-like investigation; Hubbard, Schleicher & Sutherland, "How to find all roots of complex polynomials by Newton's method" *Inventiones Mathematicae* 146 (2001).*
 
 ---
 
@@ -2090,6 +2161,7 @@ Log normalisation is essential: `brightness = log(1 + count) / log(1 + max_count
 
 Warm-up iterations (first 5000 discarded) move the orbit onto the attractor before plotting begins. The invariant measure of a strange attractor has multi-fractal structure — different regions have different fractal dimensions. This is visible in the density map as regions of varying texture density. Interactive parameter sliders let the user explore the parameter space and watch the attractor shape morph continuously between configurations.
 *Files: `fractal_random/strange_attractor.c`*
+*References: Sprott, "Strange Attractors: Creating Patterns in Chaos" M&T Books (1993); Pickover, "The Pattern Book: Fractals, Art, and Nature" World Scientific (1995).*
 
 ---
 
@@ -2130,6 +2202,7 @@ The iterative bottom-up implementation avoids stack overhead. Input samples are 
 
 Only the first N/2 bins are displayed (the upper half are complex conjugates of the lower half for real-valued inputs — the Nyquist theorem). Bin `k` represents frequency `k·f_sample/N`. Adding a pure sine of frequency `f` to the signal produces a spike at bin `f` — the DFT is linear, so a sum of three sines produces three spikes. Spectral leakage appears when a sine frequency falls between two bins: energy "leaks" into adjacent bins and the spike becomes a wide lobe. Multiplying the input by a window function (Hann, Hamming) reduces leakage at the cost of frequency resolution.
 *Files: `artistic/fft_vis.c`*
+*References: Cooley & Tukey, "An algorithm for the machine calculation of complex Fourier series" *Math. Comp.* 19 (1965); Oppenheim & Schafer, "Discrete-Time Signal Processing" 3e ch. 9.*
 
 ---
 
@@ -2165,6 +2238,7 @@ The CFL stability condition for 2D is `c·dt/dx ≤ 1/√2`. Violating it causes
 
 A sponge (absorbing) boundary layer at the grid edges suppresses reflections that would otherwise create a standing-wave "box mode." Within `BORDER_W` cells of each edge, the damping coefficient ramps up from zero at the interior boundary to a maximum at the wall. This is far simpler to implement than a Perfectly Matched Layer (PML) and sufficient for terminal-resolution wave visualisation. Point sources are driven as `u[row][col] += A·sin(2π·f·t)`, creating circular wave-fronts; multiple sources create interference patterns where constructive and destructive interference alternate spatially.
 *Files: `fluid/wave_2d.c`*
+*References: Yee, "Numerical solution of initial boundary value problems involving Maxwell's equations in isotropic media" *IEEE Trans. Antennas Propag.* 14 (1966) — the FDTD scheme; Courant, Friedrichs & Lewy, "Über die partiellen Differenzengleichungen der mathematischen Physik" *Math. Ann.* 100 (1928) — the CFL stability condition.*
 
 ---
 
@@ -2179,6 +2253,7 @@ Jos Stam's "Stable Fluids" (SIGGRAPH 1999) simulates incompressible viscous flow
 
 The density field (dye/smoke) follows the same diffuse+advect steps without the project step. Dynamic normalisation (`display = density / max_density`) prevents the display from going blank as dye concentrations change. Gauss-Seidel with `ITER = 16` iterations gives acceptable incompressibility for N = 80: residual decays geometrically per pass and the visual error is imperceptible.
 *Files: `fluid/navier_stokes.c`*
+*References: Stam, "Stable Fluids" SIGGRAPH (1999); Stam, "Real-Time Fluid Dynamics for Games" GDC (2003) — the simplified pedagogical version this implementation tracks.*
 
 ---
 
@@ -2195,6 +2270,7 @@ The cubic term `u³/3` creates the excitation threshold: small perturbations dec
 
 Explicit Euler integration with `STEPS_PER_FRAME = 8` sub-steps maintains the CFL stability condition `DT·D/dx² < 0.25` while displaying at 30 fps. Spiral waves initiate from a broken planar wavefront: create a horizontal wave then make the lower half of the medium refractory. The free end curls into a rotating spiral that sustains itself indefinitely. Two counter-rotating spirals that collide annihilate each other — a direct simulation of cardiac re-entry arrhythmia termination.
 *Files: `fluid/reaction_wave.c`, `fluid/excitable.c`*
+*References: FitzHugh, "Impulses and physiological states in theoretical models of nerve membrane" *Biophys. J.* 1 (1961); Nagumo, Arimoto & Yoshizawa, "An active pulse transmission line simulating nerve axon" *Proc. IRE* 50 (1962); Keener & Sneyd, "Mathematical Physiology" 2e ch. 6.*
 
 ---
 
@@ -2270,6 +2346,7 @@ q(t+dt) = q_s + e^(−ζωdt) · [A·cos(ωd·dt) + B·sin(ωd·dt)]
 where `q_s = F_n/ω_n²` is the static equilibrium, `ωd = ω_n√(1−ζ²)`, and A, B are set from initial conditions. This is unconditionally stable for any dt — a property explicit Euler lacks (it diverges when `ω_n·dt > 2`).
 
 *Files: `physics/beam_bending.c`*
+*References: Timoshenko, "Vibration Problems in Engineering" 4e (1974) ch. 5; Géradin & Rixen, "Mechanical Vibrations: Theory and Application to Structural Dynamics" 3e ch. 4 (continuous-system eigenmodes).*
 
 ---
 
@@ -2302,6 +2379,7 @@ A common mistake is to use the screen-geometry perpendicular without accounting 
 **Why V_DECAY = 1.0 (no linear decay):** A real wheeled robot on flat ground has negligible rolling resistance at low speeds. Setting decay < 1.0 per tick at 60 Hz creates exponential drag that makes the robot stop within a second of key release — counterintuitive and physically wrong for a flat surface. The user controls speed explicitly; braking requires the dedicated S key.
 
 *Files: `robots/diff_drive_robot.c`*
+*References: Siciliano, Sciavicco, Villani & Oriolo, "Robotics: Modelling, Planning and Control" Springer (2009) ch. 11; Dudek & Jenkin, "Computational Principles of Mobile Robotics" 2e ch. 2.*
 
 ---
 
@@ -2330,6 +2408,7 @@ The slope thus enters purely as an offset to θ in both the sin and cos terms.
 **Numerical integration:** Symplectic Euler (update ω first, then θ from updated ω) is unconditionally energy-preserving for the undamped case and is preferred over explicit Euler which would inject energy and cause instability.
 
 *Files: `robots/perlin_terrain_bot.c`*
+*References: Goldstein, Poole, Safko, "Classical Mechanics" 3e §1.4; Åström & Murray, "Feedback Systems" 2e §3.2 (cart-pole as canonical example); Spong, "The Swing Up Control Problem for the Acrobot" *IEEE Control Systems* 15 (1995).*
 
 ---
 
@@ -2359,6 +2438,7 @@ u(t) = Kp·e(t)  +  Ki·∫e dt  +  Kd·(de/dt)
 - NO Ki: stable but with persistent lean offset on slope
 
 *Files: `robots/perlin_terrain_bot.c`*
+*References: Åström & Hägglund, "PID Controllers: Theory, Design, and Tuning" 2e (1995); Franklin, Powell & Emami-Naeini, "Feedback Control of Dynamic Systems" 8e ch. 4.*
 
 ---
 
@@ -2396,6 +2476,7 @@ For the moving lid (top wall, velocity U): the term −2U/dy is added, injecting
 Both must hold simultaneously. At low Re the diffusion limit is tighter; at high Re the convection CFL dominates.
 
 *Files: `fluid/vorticity_streamfunction_solver.c`*
+*References: Thom, "The Flow Past Circular Cylinders at Low Speeds" *Proc. R. Soc. Lond. A* 141 (1933) — wall-vorticity boundary; Pozrikidis, "Fluid Dynamics: Theory, Computation, and Numerical Simulation" 3e ch. 13; Ghia, Ghia & Shin, "High-Re Solutions for Incompressible Flow Using the Navier-Stokes Equations and a Multigrid Method" *J. Comp. Phys.* 48 (1982) — the classical lid-driven-cavity benchmark.*
 
 ---
 
@@ -2431,6 +2512,7 @@ For a square grid dx=dy: `c·dt ≤ dx/√2`. At CFL=0.90 we use 90% of the stab
 **Sponge vs PML:** A perfectly matched layer (PML) achieves near-zero reflection by using a complex coordinate stretching that makes the medium impedance-matched to outgoing waves at all angles and frequencies. A sponge layer simply multiplies p by a damping factor ∈ [0,1] that ramps from 1 (interior) to 0 (boundary). The sponge is 5× simpler to implement but causes some low-frequency reflection. For visual simulations, sponge layers are sufficient.
 
 *Files: `physics/acoustic_wavesolver.c`*
+*References: Yee, "Numerical solution of initial boundary value problems involving Maxwell's equations in isotropic media" *IEEE Trans. Antennas Propag.* 14 (1966); Botteldooren, "Finite-difference time-domain simulation of low-frequency room acoustic problems" *J. Acoust. Soc. Am.* 98 (1995); Berenger, "A Perfectly Matched Layer for the absorption of electromagnetic waves" *J. Comp. Phys.* 114 (1994).*
 
 ---
 
@@ -2461,6 +2543,7 @@ The three polynomial correction terms are the Taylor expansion of `exp((e_i·u)/
 **Reynolds number:** Re = U·L/ν where U is the characteristic velocity (lattice units), L is the characteristic length (cells), ν is lattice viscosity. For flow past a cylinder of radius R: Re = U·2R/ν. Shedding threshold Re≈47; fully developed Kármán street Re≈100–300.
 
 *Files: `physics/lattice_boltzman_fluid_simulator.c`*
+*References: McNamara & Zanetti, "Use of the Boltzmann Equation to Simulate Lattice-Gas Automata" *Phys. Rev. Lett.* 61 (1988); Qian, d'Humières & Lallemand, "Lattice BGK Models for Navier-Stokes Equation" *Europhys. Lett.* 17 (1992) — D2Q9 BGK formulation; Krüger, Kusumaatmaja, Kuzmin, Shardt, Silva & Viggen, "The Lattice Boltzmann Method" Springer (2017).*
 
 ---
 
@@ -2492,6 +2575,7 @@ The velocity Verlet is symplectic because it alternates momentum half-steps with
 | Verlet        | 2 eval | O(h²)  | Yes (bounded)         | Excellent |
 
 *Files: `physics/rk_method_comparision.c`*
+*References: Hairer, Nørsett & Wanner, "Solving Ordinary Differential Equations I" 2e (1993); Hairer, Lubich & Wanner, "Geometric Numerical Integration" 2e (2006) — comprehensive treatment of symplectic methods.*
 
 ---
 
@@ -2512,6 +2596,7 @@ The STFT trades frequency resolution for time resolution relative to the full-si
 - FM: `cos(2πfc·t + β·sin(2πfm·t))` → Bessel function sideband amplitudes J_n(β) at fc±n·fm. Large β (wideband FM, β=75) gives many visible sidebands. Small β (narrowband FM) approximates AM.
 
 *Files: `physics/spectrogram_visualizer.c`*
+*References: Allen & Rabiner, "A unified approach to short-time Fourier analysis and synthesis" *Proc. IEEE* 65 (1977); Gabor, "Theory of Communication" *J. IEE* 93 (1946) — the time-frequency uncertainty bound; Harris, "On the use of windows for harmonic analysis" *Proc. IEEE* 66 (1978) — window function catalogue.*
 
 ---
 
@@ -2537,6 +2622,7 @@ This is structurally identical to Unreal Engine 5's GBufferA/B/C/D layout and Un
 **Bayer dithering vs Floyd-Steinberg:** Bayer ordered dithering uses a precomputed threshold matrix — spatially ordered, no error propagation, parallelisable. Floyd-Steinberg propagates quantisation error to neighbours — better perceptual quality but sequential (each pixel depends on previous). For real-time per-pixel rendering the Bayer approach is O(1) per pixel with no state, making it the standard choice in hardware shaders (it is used in MSAA resolve and HDR-to-LDR tone mapping).
 
 *Files: `raster/deferred_rendering_pipeline.c`*
+*References: Saito & Takahashi, "Comprehensible Rendering of 3-D Shapes" SIGGRAPH (1990) — early G-buffer paper; Akenine-Möller, Haines, Hoffman et al., "Real-Time Rendering" 4e ch. 20.*
 
 ---
 

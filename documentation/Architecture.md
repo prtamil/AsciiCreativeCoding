@@ -5420,6 +5420,54 @@ The iso variant (`05_isometric_scatter.c`) uses solid-fill background under the 
 
 *Files: `grids/tri_grids_placement/*_scatter.c`*
 
+## 171. Neural Network Visualisation — artistic/neural_net_vis.c
+
+A feed-forward neural network drawn as columns of `(O)` neurons fully connected by slope-character lines. Single coordinate seam: `neuron_cell(layer, idx, n_layers, n_in_layer, rows, cols)` recomputes positions from terminal size each frame. One particle per input neuron drifts forward via `TRI_DIR`-style hop logic — at each layer it picks a random target in the next layer; on reaching the output it loops back to a random input. Connection thickness is a 4-level ladder (dot / thin / bold / heavy) — level 3 swaps to UTF-8 box-drawing `═ ║ ╲ ╱` via `mvaddstr`.
+
+*Files: `artistic/neural_net_vis.c`*
+
+## 172. Genetic Rocket — Ai/genetic_rocket.c
+
+Population of rockets evolves to hit a target circle via Holland's classical GA. Each rocket carries a fixed-length genome of force vectors applied one per simulation tick. Fitness is `(1/(dist+1))²` with hit bonus ×10 / crash penalty ×0.1. Selection is fitness-proportional via a mating pool (each rocket's slot count scales with its fitness). Single-point crossover + per-gene mutation produce the next generation. Fast-forward mode runs one generation per render frame (~30 generations/sec); normal mode runs one tick per frame.
+
+*Files: `Ai/genetic_rocket.c`*
+
+## 173. Fire Tornado — artistic/fire_tornado.c
+
+A rotating column of embers in cylindrical coordinates `(y, phase, radius)` around a vertical axis. `omega ∝ 1/radius` (centre spins fast, edge drifts) and `y_vel ∝ 1/radius` (hot core rises faster) give the cone shape. Two-pass back/front draw with `A_BOLD`/`A_DIM` makes the rotation legible from a 2-D side view (`sin(phase)` is depth). Stage 2 layers a 1-D base flame mat (decay + diffuse + inject), an outward spark pool with gravity, and a wind-tilt sinusoid scaled by `y/height`.
+
+*Files: `artistic/fire_tornado.c`*
+
+## 174. Volcano with Lava Bombs and Ash Plume — artistic/volcano.c
+
+Truncated cone with glowing crater. Lava bombs erupt on parabolic trajectories (initial velocity + gravity), die on impact with the cone slopes via `is_in_mountain(row, col)`. Ash plume rises through horizontal random walk. Periodic eruption bursts every 3 seconds (12 bombs at once); `b` key fires a max-drama burst that replaces every active slot with a `bomb_spawn_burst` (1.5× speed, 1.6× cone width). Two distinct particle pools share the heat ramp — bombs at the bright end, ash at the cool end.
+
+*Files: `artistic/volcano.c`*
+
+## 175. Phoenix in Flight — artistic/phoenix.c
+
+Bird-shaped formation of fire particles with a 4-phase lifecycle FSM: `FLY → DIE → ASH → BIRTH → FLY`. The body is a fixed array of ~21 anchor points (head, neck, body, two wings, tail feathers); each frame, particles re-bind to a random anchor with a small jitter. Wings flap via `sin(t · WING_FLAP_HZ)` scaled by per-anchor `wing_frac`. Particle temperatures vary by anchor type (wing tips white-hot bucket 4, body warm bucket 2, tail orange bucket 1) so theme cycling visibly recolours the body. ASH phase releases bindings — particles burst outward with explicit velocity, fall under gravity.
+
+*Files: `artistic/phoenix.c`*
+
+## 176. Hurricane / Cyclone — artistic/hurricane.c
+
+Top-down satellite view of a cyclone. Cloud particles in polar coordinates orbit a central eye following the **Rankine vortex** profile: solid-body rotation `ω ∝ r` inside the eyewall, free-vortex `1/r` outside — peak wind at the eyewall. Three concentric zones (outer / band / eyewall) use distinct brightness via colour values + `A_BOLD` on eyewall (no `A_DIM`, which made the outer band invisible at mid-saturation hues). Eye-zone particles are skipped — the centre stays empty, marked only by three static `.` glyphs in fixed grey. Wind glyphs (`-` `\` `|` `/`) come from `atan2` of tangential velocity, making the swirl direction visible on still frames.
+
+*Files: `artistic/hurricane.c`*
+
+## 177. Magma Chamber / Lava Lamp — artistic/lava_lamp.c
+
+Slow viscous metaball blobs inside a sealed chamber. Each blob is a Gaussian-like scalar field centre — the total field is `f(x,y) = Σ rᵢ² / (dx² + dy²·k² + ε²)` with cell-aspect squashing `k² = 4`. Cells where `f > threshold` render with intensity-driven heat-ramp glyphs; intensity blends with weighted-average blob temperature for both shape and colour. Buoyancy = `−BUOYANCY · (temp − T_ambient(y))`: hot blobs near the floor rise, cool ones near the ceiling sink — slow oscillation with merge/split via field summation. Time scale ~30 fps, full up-down cycle ~6 seconds — meditative.
+
+*Files: `artistic/lava_lamp.c`*
+
+## 178. Nebula / Star Nursery — artistic/nebula.c
+
+Multi-octave fBm scalar field defines glowing gas density across the screen. Two parallax layers (near at `freq=0.10`, far at `freq=0.04`) scroll at different rates for depth illusion. A static catalogue of ~180 stars sparkles via `sin(t · 1.5 + phase)` twinkle. Periodic shock events — star births — fire every 4–9 seconds at the densest gas cell (sampled from K=12 random candidates): an expanding ring `r = SHOCK_SPEED · age` adds Gaussian-of-distance brightness around the ring, fading over `SHOCK_LIFE`. Hash-based value noise (no permutation table) keeps the per-cell evaluation cheap.
+
+*Files: `artistic/nebula.c`*
+
 ---
 
 *This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `physics/bounce_ball.c`.*

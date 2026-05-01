@@ -1,15 +1,21 @@
 # ASCII Creative Coding
 
 ```
-███╗   ███╗ ████████╗  ██████╗   █████╗        .:+##@@@@@@@@@@@##+ :.
-████╗ ████║ ╚══██╔══╝ ██╔════╝  ██╔══██╗     +#@@@#:.          :#@@@+
-██╔████╔██║    ██║    ██║  ███╗  ███████║    #@@@#.  @@@@@@@@@@  .#@@@#
-██║╚██╔╝██║    ██║    ██║   ██║  ██╔══██║     +#@@@#:.          :#@@@+
-██║ ╚═╝ ██║    ██║    ╚██████╔╝  ██║  ██║       .:+##@@@@@@@@@@@##+ :.
-╚═╝     ╚═╝    ╚═╝     ╚═════╝   ╚═╝  ╚═╝   Make Terminal Great Again
+ ╔══════════════════════════════════════════════════╗
+ ║                                                  ║
+ ║          ██╗   ██╗ ████████╗                     ║
+ ║          ██║   ██║ ╚══██╔══╝                     ║
+ ║          ██║   ██║    ██║                        ║
+ ║          ██║   ██║    ██║                        ║
+ ║          ╚██████╔╝    ██║                        ║
+ ║           ╚═════╝     ╚═╝                        ║
+ ║                                                  ║
+ ║                useless  terminals                ║
+ ║                                                  ║
+ ╚══════════════════════════════════════════════════╝
 ```
 
-257 programs. Pure C. Zero GUI dependencies. MTGA — Make Terminal Great Again.
+257 programs. Pure C. Zero GUI dependencies. UT — useless terminals.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.

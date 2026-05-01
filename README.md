@@ -45,6 +45,18 @@ files before you can touch one. When a simulation changes, only one file changes
 No edge cases bleed across boundaries. No ripple effects. You can delete any file
 and nothing else breaks.
 
+**C, with structures and functions only.**
+The whole project is written in plain C — no classes, no inheritance, no
+interfaces, no module system. After enough years of professional work I came to
+believe that those abstractions, sold as aids to understanding, often hinder it:
+every layer is another file to open, another name to memorise, and another
+contract to hold in your head before reaching the actual computation. When the
+goal is to *understand how something works*, plain `struct`s and free functions
+are the floor of what a program needs to express; anything beyond that has to
+earn its keep. The cost is a little duplication; the benefit is that any program
+can be read top-to-bottom in a single sitting, and every change stays exactly
+where you put it. Easy to read, easy to maintain, hard to lose track of.
+
 **Copying is the intended usage.**
 To run any simulation, copy the file, compile, and run:
 ```bash
@@ -100,25 +112,6 @@ per-program algorithm notes are in [DEMOS.md](DEMOS.md).
 
 ---
 
-## Architecture
-
-Every simulation uses the same framework:
-
-```
-§1 config   — all constants in one place
-§2 clock    — CLOCK_MONOTONIC nanosecond timer
-§3 color    — 256-color with 8-color fallback
-§4 physics  — simulation state, fixed-timestep step()
-§5 draw     — scene_draw() via ncurses primitives
-§6 app      — main loop: input → physics → render → sleep
-```
-
-Physics runs in **pixel space** (`CELL_W=8 px`, `CELL_H=16 px` per terminal cell), independent of terminal size. The only coordinate conversion is inside `scene_draw()`.
-
-Frame sequence: `erase() → draw → wnoutrefresh() → doupdate()`. The `typeahead(-1)` call prevents tearing. No custom double-buffer — ncurses provides it.
-
----
-
 ## Build
 
 ```bash
@@ -148,48 +141,6 @@ See `CLAUDE.md` for the complete build list.
 | Arrow keys | move / steer (where applicable) |
 | `1`–`5` | switch preset / mode |
 | `Space` | trigger event or jump to next state |
-
----
-
-## Structure
-
-```
-.
-├── artistic/          — parametric art, CA, L-systems, visual math
-├── fluid/             — Navier-Stokes, Gray-Scott, wave PDE, FitzHugh-Nagumo, Lenia
-├── flocking/          — Reynolds boids, shepherd herding, crowd steering, battle sim, swarm digit animator
-├── fractal_random/    — Mandelbrot, Julia, Newton, Apollonian, terrain, Perlin landscape
-├── geometry/          — parametric curves, grids, computational geometry (lissajous, voronoi, convex hull…)
-├── grids/
-│   ├── rect_grids/        — 14 grid-type displays (uniform, square, brick, diamond, iso, …)
-│   ├── rect_grids_placement/ — 4 interactive placement editors (direct/patterns/path/scatter)
-│   ├── polar_grids/       — 7 polar grid types (rings, log, spirals, phyllotaxis, sector, elliptic)
-│   ├── polar_grids_placement/ — 4 polar placement editors (direct/arc/spiral/scatter)
-│   ├── hex_grids/         — 7 hex grid types (flat-top, pointy-top, axial, ring-dist, triangular, rhombille, trihexagonal)
-│   ├── hex_grids_placement/ — 4 hex placement editors (direct/pattern/path/scatter)
-│   ├── tri_grids/         — 12 triangular tilings (equilateral, half-rect, tetrakis, kisrhombille, isometric, hex-subdivision; barycentric/triforce/sierpinski recursion; pinwheel, Delaunay, Penrose)
-│   └── tri_grids_placement/ — 24 triangular placement editors (6 grid types × direct/patterns/path/scatter)
-├── matrix_rain/       — Matrix rain variants (classic rain, DLA snowflake hybrid)
-├── misc/              — sorting, maze, forest fire
-├── particle_systems/  — fire (3 algos), smoke (3 algos), fireworks, explosions
-├── physics/           — Lorenz, N-body, cloth, pendulums, Ising, Schrödinger, Schwarzschild black hole
-├── raster/            — software rasterizer (torus, cube, sphere)
-├── raymarcher/        — SDF ray marching
-├── raytracing/        — analytic ray tracing (sphere, cube, torus, capsule)
-├── animation/         — kinematics, IK solvers, legged locomotion
-├── robots/            — advanced robot simulations (bipedal walk cycle, self-balancing bot, Perlin terrain)
-├── turtle/            — turtle graphics programs (polygon animators, path drawing)
-├── ncurses_basics/    — framework reference implementations
-└── documentation/
-    ├── Architecture.md    — full framework + per-program architecture write-ups
-    ├── Visual.md          — every visual technique (rendering, shading, palettes)
-    ├── Master.md          — every technique, with canonical references
-    ├── Framework.md       — base ncurses framework anatomy
-    ├── COLOR.md           — color theory, 256-color usage, theme design
-    └── learning/
-        └── concept_*.md       — deep-dive concept files, one per program
-                                 (math → pseudocode → implementation notes)
-```
 
 ---
 

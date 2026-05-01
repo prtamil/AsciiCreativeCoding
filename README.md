@@ -12,6 +12,8 @@
  ║                                                  ║
  ║                useless  terminals                ║
  ║                                                  ║
+ ║   the most useful thing in the world is useless  ║
+ ║                                                  ║
  ╚══════════════════════════════════════════════════╝
 ```
 

@@ -37,6 +37,17 @@ This project is not a library. It is not a framework. It is not a toolkit.
 It is closer to a sketchbook — 257 individual programs, each complete in itself,
 each existing for no reason other than that it is interesting to build and beautiful to watch.
 
+The argument for uselessness is older than Wilde. The bricks and mortar of a
+house are what you pay for, but it is the empty space inside the walls that
+you actually live in. The clay shapes a vessel; the hollow is what holds the
+water. The doors and windows are cut out so that the house can be useful at
+all. Substance gives the form, emptiness gives the use. By that older logic,
+*the highest honour for a piece of work is to be deliberately useless* — to
+exist purely as itself, with no claim on anyone's productivity, no roadmap,
+no target market. Useless turns out to be the most useful posture a piece of
+work can take. Many of these programs are trying to earn that kind of
+uselessness.
+
 **Every file is self-contained by intention.**
 There are no shared headers, no common modules, no inter-file dependencies. Code
 duplication is a deliberate trade-off: a repeated 20-line physics loop in every

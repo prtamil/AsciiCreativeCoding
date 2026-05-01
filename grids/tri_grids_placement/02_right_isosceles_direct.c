@@ -30,6 +30,81 @@
  *
  * References     :
  *   Half-rect tiling — https://en.wikipedia.org/wiki/Triangular_tiling
+ *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Same two-address-space idea as 01_equilateral_direct, but on a square
+ * (axis-aligned) lattice instead of a 60° skew lattice. Each unit
+ * square is bisected by '\' into UR (up=1) and LL (up=0). The pixel→
+ * lattice inverse is just (a,b) = (px/size, py/size); no shear to
+ * undo. Above the diagonal (fa ≥ fb) is UR, below is LL.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture standard graph paper — but instead of giving each square
+ * one address, you split each square diagonally and give each HALF its
+ * own address (col, row, UR/LL). The cursor walks half-squares; SPACE
+ * pins an object onto the current half-square. Resize moves the
+ * window; objects keep their (col, row, up) addresses.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan: pixel_to_tri → tri_edge_char → mvaddch
+ *     when min-weight < BORDER_W. Edges are '|', '_', '\\'.
+ *  3. pool_draw — for each object, tri_centroid_pixel → divide by
+ *     CELL_W / CELL_H → mvaddch the glyph at that screen cell.
+ *  4. cursor_draw — '@' on top.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → lattice  (axis-aligned, no shear):
+ *    a = px / size,   b = py / size
+ *    col = ⌊a⌋,       row = ⌊b⌋
+ *    fa  = a - col,   fb  = b - row
+ *    up  = (fa ≥ fb)  ?  UR  :  LL
+ *
+ *  Centroid lattice → pixel:
+ *    UR centroid:  a = col + 2/3,  b = row + 1/3
+ *    LL centroid:  a = col + 1/3,  b = row + 2/3
+ *    px = a · size,  py = b · size
+ *
+ *  Cursor step (TRI_DIR table, see §6):
+ *    LEFT   ▽LL: col-1, up→UR;     △UR: same square, toggle to LL
+ *    RIGHT  ▽LL: same square, toggle to UR;  △UR: col+1, up→LL
+ *    UP     ▽LL: same, toggle UR;  △UR: row-1, stay UR
+ *    DOWN   ▽LL: row+1, stay LL;   △UR: same, toggle LL
+ *
+ *  Pool toggle (O(1) remove via swap-with-last):
+ *    if (i = pool_find(col,row,up)) >= 0:
+ *      pool->objs[i] = pool->objs[--pool->count]
+ *    else:
+ *      pool->objs[pool->count++] = (TObj){col,row,up,glyph}
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Diagonal tie-break: at fa == fb the formula picks UR. This is a
+ *    measure-zero set; integer round-off may flicker the choice for
+ *    one frame on resize. Harmless.
+ *  • Cells appear vertically squashed: CELL_W=2, CELL_H=4 means each
+ *    terminal cell is 1:2 wide:tall. Triangles drawn here are right-
+ *    isosceles in PIXEL space, so the displayed shape looks taller
+ *    than wide. That is correct, not a bug.
+ *  • MAX_OBJ cap: silently dropped when full; 'C' clears.
+ *  • Resize: addresses preserved; objects re-centre as ox/oy update.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place a glyph on the LL of the origin square. Press '+': size
+ *  increases, the glyph stays on the LL. Press LEFT: cursor goes to
+ *  UR of (col-1, row). Press LEFT again: cursor goes to LL of
+ *  (col-1, row). Two LEFTs = one full square left, regardless of
+ *  starting orientation.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

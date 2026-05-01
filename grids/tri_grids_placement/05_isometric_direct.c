@@ -2,15 +2,132 @@
 /*
  * 05_isometric_direct.c — direct placement on isometric (solid-fill) grid
  *
- * DEMO: Same equilateral lattice as 01, but each triangle is filled with
- *       a solid color from a 6-cycle (palette_index hash). Move '@';
- *       SPACE toggles a glyph at the cursor triangle. Glyphs render in
- *       reverse video so they pop against the colored fill.
+ * DEMO: Same equilateral lattice as 01, but every triangle is FILLED
+ *       with a solid colour from a 6-cycle palette indexed by
+ *       (col + 2·row + up) mod 6. Move '@' with arrows; SPACE toggles
+ *       a glyph at the cursor triangle. Glyphs render in reverse
+ *       video so they pop against the coloured fill. The palette
+ *       cycle creates the characteristic "stacked cubes" look around
+ *       every vertex.
+ *
+ * Study alongside: grids/tri_grids/05_isometric.c (rasterizer +
+ *                  palette derivation),
+ *                  01_equilateral_direct.c (same cursor + pool, but
+ *                  edge-character rendering instead of solid fill).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, palette + pair IDs
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — N_PALETTE fill pairs + cursor / HUD / hint
+ *   §4 formula  — pixel ↔ skew lattice + palette_index hash
+ *   §5 pool     — ObjectPool: clear / find / toggle
+ *   §6 cursor   — TRI_DIR + step + draw
+ *   §7 scene    — solid-fill raster + pool + cursor
+ *   §8 screen   — ncurses init / cleanup
+ *   §9 app      — signals, main loop
+ *
+ * Keys:  arrows:move  spc:toggle  g:glyph  C:clear  r:reset
+ *        +/-:size  t:theme  q/ESC:quit
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/05_isometric_direct.c \
  *       -o 05_isometric_direct -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Direct placement on the equilateral skew lattice
+ *                  with solid-colour fills. The cursor holds
+ *                  (col, row, up); SPACE toggles a glyph at that
+ *                  address. Each cell colour comes from
+ *                    palette_index = (col + 2·row + up) mod N_PALETTE.
+ *                  Six neighbouring triangles around any vertex spell
+ *                  the full palette cycle, producing the iso "cubes"
+ *                  illusion.
+ *
+ * Data-structure : ObjectPool — flat array of TObj{col, row, up, glyph}.
+ *                  Removal swaps with last (O(1)).
+ *
+ * Rendering      : Per screen cell, mvaddch(' ') under the bg-colour
+ *                  pair (PAIR_FILL_BASE + palette_index). No edge
+ *                  characters — the cell IS the colour. Glyphs draw on
+ *                  top using PAIR_CURSOR (white-on-black) so they pop.
+ *
+ * References     :
+ *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
+ *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
+ *   Isometric projection — https://en.wikipedia.org/wiki/Isometric_projection
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Same address space as 01_equilateral_direct, different paint. The
+ * grid is no longer drawn as edge characters; every screen cell is
+ * coloured by which triangle owns it. Six colours cycle around every
+ * vertex, and the eye recognises the cycle as 3-D cubes seen on edge.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine the equilateral tiling, but instead of inking the borders
+ * we fill each tile with one of six paint cans, picked by a parity
+ * formula. The cans are arranged so that every vertex (where 6
+ * triangles meet) gets all 6 colours in order. The eye reads three
+ * adjacent colours as the top, left, and right faces of a cube; the
+ * tiling becomes a wall of stacked cubes.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. Raster scan every screen cell:
+ *       pixel_to_tri → (col, row, up)
+ *       k = palette_index(col, row, up) = (col + 2·row + up) mod 6
+ *       attron(COLOR_PAIR(PAIR_FILL_BASE + k))
+ *       mvaddch(row, col, ' ')
+ *  3. pool_draw — for each placed object, mvaddch(glyph) at its
+ *     centroid screen cell using PAIR_CURSOR.
+ *  4. cursor_draw — '@' on top.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → lattice (skew inverse, same as 01_equilateral):
+ *    h = size · √3 / 2
+ *    b = py / h,   a = px / size - 0.5·b
+ *    col = ⌊a⌋,    row = ⌊b⌋
+ *    up  = (fa + fb ≥ 1) ? △ : ▽
+ *
+ *  Palette hash:
+ *    palette_index(col, row, up) = (col + 2·row + up) mod N_PALETTE
+ *
+ *  Why (col + 2·row + up): walking RIGHT shifts k by +1; walking UP
+ *  shifts k by +2; toggling up shifts k by +1. Six steps around a
+ *  vertex → k advances 1+2+1+1+2+1 ≡ 0 (mod 6). Hence the colour
+ *  wheel closes exactly around every vertex.
+ *
+ *  Centroid lattice → pixel: same as 01_equilateral.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Cursor visibility: '@' draws over a coloured fill, so the cursor
+ *    pair MUST have a contrasting bg/fg. PAIR_CURSOR uses white-on-
+ *    black for max contrast.
+ *  • Theme change recolours the whole field — but the (col,row,up)
+ *    addresses of placed objects are unchanged. The same triangle
+ *    may end up under a different fill colour.
+ *  • Negative cells: palette_index uses a positive-modulo guard
+ *    (`if (k < 0) k += N_PALETTE`) so that walking left of origin
+ *    still yields valid pair IDs.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place a glyph; press 't' to cycle theme. The glyph stays at the
+ *  same triangle but the surrounding fills shift. Walk one step in
+ *  any cardinal direction: the colour under the cursor changes by
+ *  exactly one slot of the palette.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

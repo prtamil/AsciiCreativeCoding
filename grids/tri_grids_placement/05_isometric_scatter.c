@@ -2,15 +2,131 @@
 /*
  * 05_isometric_scatter.c — distance-colored scatter on iso (solid-fill) grid
  *
- * DEMO: Iso solid-fill background (6-cycle palette by triangle position).
- *       Random scatter of N triangles colored on a 6-stop distance gradient
- *       from the cursor — closer = warm, farther = cool. The cursor walks
- *       the iso lattice; SPACE reseeds the scatter.
+ * DEMO: Iso solid-fill background (6-cycle palette by triangle
+ *       position). A random scatter of N triangles is overlaid with
+ *       glyphs coloured on a 6-stop distance gradient from the cursor
+ *       — closer = warm, farther = cool. The cursor walks the iso
+ *       lattice; SPACE reseeds; +/- changes density.
+ *
+ * Study alongside: grids/tri_grids/05_isometric.c (rasterizer + palette),
+ *                  05_isometric_direct.c (manual placement on iso),
+ *                  01_equilateral_scatter.c (same scatter, edges).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, SCATTER_RADIUS, DENSITY
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — iso fill palette + 6-bucket distance gradient + cursor
+ *   §4 formula  — pixel ↔ skew lattice + centroid + palette_index
+ *   §5 pool     — ScatterPool: clear / contains / add / draw
+ *   §6 cursor   — TRI_DIR + step + draw
+ *   §7 scatter  — random spawn + Manhattan distance bucket
+ *   §8 scene    — solid-fill raster + scatter + cursor
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move  spc:reseed  +/-:density  r:reset
+ *        t:theme  q/ESC:quit
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/05_isometric_scatter.c \
  *       -o 05_isometric_scatter -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Random scatter on the equilateral skew lattice. Pick
+ *                  N random (Δcol, Δrow, up) within ±SCATTER_RADIUS of
+ *                  the cursor; colour each by Manhattan-style cell
+ *                  distance from the cursor, bucketed into 6 gradient
+ *                  slots. The iso solid-fill background remains.
+ *
+ * Data-structure : ScatterPool — flat array of (col, row, up). Bucket
+ *                  is recomputed every frame from cursor position;
+ *                  entries change only on reseed.
+ *
+ * Distance metric: |Δcol| + |Δrow| + (Δup ? 1 : 0).
+ *
+ * Re-seeding     : SPACE reseeds with a new seed (xor'd by clock).
+ *                  +/- density also reseeds. Cursor movement does not.
+ *
+ * References     :
+ *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
+ *   Linear congruential generator — Numerical Recipes ch. 7
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Two layers: ISO BACKGROUND (every triangle filled by palette_index)
+ * and SCATTER OVERLAY (random triangles overlaid with glyphs whose
+ * fg colour comes from a distance-bucket palette). The iso colours
+ * decorate the field; the scatter glyphs read the cursor distance.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a wall of stacked cubes (iso fills) with sticky dots placed
+ * at random triangles around the cursor. Each dot is a different
+ * shade depending on how far it is from the cursor — warm near,
+ * cool far. The cubes don't move when you walk the cursor; only the
+ * dot colours shift.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. Raster scan: pixel_to_tri → palette_index → fill pair →
+ *     mvaddch(' ') at every cell.
+ *  3. For each scatter entry:
+ *       d = |obj.col - cur.col| + |obj.row - cur.row|
+ *           + (obj.up != cur.up ? 1 : 0)
+ *       bucket = min(d, N_BUCKETS - 1)
+ *       attron(COLOR_PAIR(PAIR_BUCKET_0 + bucket))
+ *       mvaddch(centroid_screen, '*')
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Reseed (only on SPACE or +/- density):
+ *    pool->count = 0
+ *    g_seed ^= clock_ns()
+ *    for i in 0..density:
+ *      dC = floor(frand·(2·R+1)) - R    ; dR = same
+ *      up = (frand > 0.5) ? △ : ▽
+ *      pool_add(cur.col+dC, cur.row+dR, up)   // dedup
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → lattice (h = size · √3 / 2):
+ *    b = py / h,  a = px / size - 0.5·b
+ *    col = ⌊a⌋,    row = ⌊b⌋
+ *    up  = (fa + fb ≥ 1) ? △ : ▽
+ *
+ *  Palette hash:
+ *    k = (col + 2·row + up) mod N_PALETTE
+ *
+ *  Manhattan cell distance:
+ *    d = |Δcol| + |Δrow| + (Δup ? 1 : 0)
+ *
+ *  LCG step (Numerical Recipes ch. 7):
+ *    g_seed = g_seed · 1103515245 + 12345
+ *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Bucket vs fill colour: a scatter glyph's foreground colour pair
+ *    must be readable on ANY of the 6 fills. The bucket palette is
+ *    chosen for high luminance contrast; theme cycle re-tunes it.
+ *  • Density saturation, dedup, reseed-on-cursor-move: same caveats
+ *    as 01_equilateral_scatter.c.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place cursor at the centre of a fresh scatter — glyphs are warmest
+ *  right around '@'. Walk the cursor diagonally: same dots persist;
+ *  the warm/cool boundary follows the cursor. Press 't': background
+ *  recolours, scatter dots stay where they are, bucket gradient
+ *  remains aligned to cursor distance.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

@@ -2,16 +2,120 @@
 /*
  * 05_isometric_path.c — line-of-sight path on the iso (solid-fill) grid
  *
- * DEMO: Iso solid-color triangular grid (6-cycle palette). Move '@' with
- *       arrows; `s` sets START, `e` sets END. The path between markers
- *       is computed by pixel-walking the centroid-to-centroid line and
- *       recording each triangle the line passes through. Path cells are
- *       overlaid with bright `*` glyphs.
+ * DEMO: Iso solid-colour triangular grid (6-cycle palette). Move '@'
+ *       with arrows; 's' sets START at cursor, 'e' sets END. The path
+ *       between markers is computed by pixel-walking the centroid-to-
+ *       centroid line and recording each triangle the line passes
+ *       through. Path cells overlay bright '*' glyphs on the colour
+ *       fill.
+ *
+ * Study alongside: grids/tri_grids/05_isometric.c (rasterizer + palette),
+ *                  05_isometric_direct.c (manual placement on iso),
+ *                  01_equilateral_path.c (same path mechanic, edges
+ *                                         instead of fills).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — fill palette + start / end / path / cursor / HUD / hint
+ *   §4 formula  — pixel ↔ skew lattice + centroid + palette_index
+ *   §5 pool     — PathPool: clear / contains / add / draw
+ *   §6 cursor   — TRI_DIR + step + draw + START / END markers
+ *   §7 path     — pixel walk between two centroids → triangle list
+ *   §8 scene    — solid-fill raster + path + markers + cursor
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move  s:set-start  e:set-end  spc:clear-path
+ *        +/-:size  t:theme  r:reset  q/ESC:quit
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/05_isometric_path.c \
  *       -o 05_isometric_path -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Line-rasterize between two centroids in PIXEL space;
+ *                  for each sampled pixel, ask pixel_to_tri "which
+ *                  triangle (col, row, up) am I in?" and record uniques.
+ *                  The result is the ordered set of triangles traversed
+ *                  by the straight line.
+ *
+ * Data-structure : PathPool — flat array of TPath{col, row, up}; dedup
+ *                  via path_contains. The fill colour of each path
+ *                  triangle is the same palette index as the background;
+ *                  the '*' overlay is what the user sees.
+ *
+ * Sampling step  : ~size/4 — fine enough never to skip a triangle.
+ *
+ * References     :
+ *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
+ *   Bresenham line — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
+ *   Line-of-sight on grids — Red Blob Games
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Same line-walk as 01_equilateral_path; the only difference is paint.
+ * The background is solid-filled by palette index; the path overlays
+ * '*' on top of those fills. Path computation is unaware of colour.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a wall of stacked cubes (the iso fill) and a string stretched
+ * from S to E. The path is the ordered list of cube faces the string
+ * crosses. We sample the string finely in pixel space and classify
+ * each sample's triangle with the same skew-lattice formula the
+ * background uses. Adjacent samples in the same triangle are deduped.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. Raster scan: pixel_to_tri → palette_index → fill colour pair →
+ *     mvaddch(' ') at every cell.
+ *  3. path_draw — '*' at each PathPool entry's centroid screen cell.
+ *  4. marker_draw — 'S' at start, 'E' at end.
+ *  5. cursor_draw — '@' at the cursor address.
+ *
+ *  path_compute runs only on START/END change or size change.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → lattice  (h = size · √3 / 2):
+ *    b = py / h,  a = px / size - 0.5 · b
+ *    col = ⌊a⌋,   row = ⌊b⌋
+ *    up  = (fa + fb ≥ 1) ? △ : ▽
+ *
+ *  Centroid lattice → pixel:
+ *    ▽: a = col + 1/3,  b = row + 1/3
+ *    △: a = col + 2/3,  b = row + 2/3
+ *    px = (a + 0.5·b) · size,  py = b · h
+ *
+ *  Palette hash (background only):
+ *    k = (col + 2·row + up) mod N_PALETTE
+ *
+ *  Walk: same dist / step / n / loop as 01_equilateral_path.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • '*' contrast: the path colour pair uses bright fg over the same
+ *    bg as the underlying fill. If the theme has very light fills,
+ *    the path '*' may need its own contrasting pair (already handled).
+ *  • Zero-length, sampling step, MAX_OBJ cap: identical to other
+ *    _path siblings.
+ *  • Recompute on size change: '+'/'-' must call path_compute.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Set START and END at the same triangle: path size = 1.
+ *  END one edge away: path size = 2. Cycle 't': path stars stay over
+ *  the same triangles even though the colours under them shift.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

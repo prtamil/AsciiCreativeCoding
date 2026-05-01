@@ -2,10 +2,127 @@
 /*
  * 03_double_diagonal_scatter.c — distance-colored scatter on the tetrakis grid
  *
+ * DEMO: A random scatter of N wedges fills a square region around the
+ *       cursor on the tetrakis grid (each square split by both
+ *       diagonals into 4 N/E/S/W wedges). Each wedge is colored on a
+ *       6-stop gradient by its cell-distance from the cursor — closer
+ *       = warm, farther = cool. SPACE reseeds; +/- changes density.
+ *
+ * Study alongside: 03_double_diagonal_direct.c (manual placement),
+ *                  03_double_diagonal_patterns.c (preset stamps),
+ *                  02_right_isosceles_scatter.c (1-diagonal sibling).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, SCATTER_RADIUS, DENSITY
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 6-bucket gradient palette + cursor / HUD / hint
+ *   §4 formula  — wedge classifier + barycentric per wedge
+ *   §5 pool     — ScatterPool: clear / contains / add / draw
+ *   §6 cursor   — TETRA_DIR + step + draw
+ *   §7 scatter  — random spawn + Manhattan-style cell distance bucket
+ *   §8 scene    — grid_draw + scene_draw
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move  spc:reseed  +/-:density  r:reset
+ *        t:theme  q/ESC:quit
+ *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/03_double_diagonal_scatter.c \
  *       -o 03_double_diagonal_scatter -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Random scatter. Pick N random (Δcol, Δrow, dir)
+ *                  within ±SCATTER_RADIUS of the cursor; color by
+ *                  Manhattan-style cell distance from cursor, bucketed
+ *                  into 6 gradient slots.
+ *
+ * Data-structure : ScatterPool — flat array of (col, row, dir) entries.
+ *                  Bucket assignment is recomputed every frame from the
+ *                  cursor's CURRENT position; entries themselves only
+ *                  change on reseed.
+ *
+ * Distance metric: |Δcol| + |Δrow| + (Δdir ? 1 : 0). The dir term is
+ *                  a coarse penalty for being in a different wedge of
+ *                  the same square — cheap and visually "right".
+ *
+ * Re-seeding     : SPACE re-randomises with a new seed (xor'd by clock).
+ *                  +/- density also reseeds. Moving the cursor does
+ *                  NOT re-seed — only re-colours.
+ *
+ * References     :
+ *   Tetrakis square tiling — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
+ *   Linear congruential generator — Numerical Recipes ch. 7
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Two halves: STORAGE (random wedge addresses, one shot per reseed)
+ * and COLOURING (a pure function of cursor distance, recomputed every
+ * frame). Moving the cursor never reseeds; it only repaints the same
+ * scatter through a different distance lens.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Sprinkle salt on X-cut graph paper — grains land in random wedges
+ * inside a small square region around the cursor. Now point a
+ * coloured spotlight at the cloth: grains close to the beam glow
+ * warm, farther ones cool. Move the spotlight: same grains, different
+ * colours.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan: pixel_to_tri → tri_edge_char draws
+ *     '/', '\\', '|', '_' on each wedge boundary.
+ *  3. For each scatter object:
+ *       d = |obj.col - cur.col| + |obj.row - cur.row|
+ *           + (obj.dir != cur.dir ? 1 : 0)
+ *       bucket = min(d, N_BUCKETS - 1)
+ *       attron(COLOR_PAIR(PAIR_BUCKET_0 + bucket))
+ *       mvaddch(centroid_screen, '*')
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Reseed (only on SPACE or +/- density):
+ *    pool->count = 0
+ *    g_seed ^= clock_ns()
+ *    for i in 0..density:
+ *      dC = floor(frand·(2·R+1)) - R    ; dR = same
+ *      d  = (int)floor(frand · 4)       // 0..3  → N/E/S/W
+ *      pool_add(cur.col+dC, cur.row+dR, d)   // dedup
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → wedge: see §4 (wedge classifier above the centre offsets).
+ *
+ *  Manhattan cell distance:
+ *    d = |Δcol| + |Δrow| + (Δdir ? 1 : 0)
+ *
+ *  LCG step (Numerical Recipes ch. 7):
+ *    g_seed = g_seed · 1103515245 + 12345
+ *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Density vs MAX_OBJ: at high density the dedup pass may give
+ *    fewer visible dots than the requested count.
+ *  • Manhattan vs true distance: each square has 4 wedges and the
+ *    true edge-walk distance involves crossing diagonals; Manhattan
+ *    is a fast proxy that under-counts intra-square hops by 0–1.
+ *  • Reseed-on-cursor-move: not triggered by design.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place cursor at the centre of a fresh scatter — colours warmest
+ *  near '@'. Walk the cursor outward: same dots, the warm/cool
+ *  boundary follows the cursor.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

@@ -51,6 +51,72 @@
  * References     :
  *   Bresenham line — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
  *   Line-of-sight on grids — Red Blob Games
+ *   Kisrhombille tiling — https://en.wikipedia.org/wiki/Kisrhombille_tiling
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The path is computed in WHOLE-equilateral lattice space, exactly as
+ * in 01_equilateral_path. The medians (the "30-60-90 substructure")
+ * are decoration only — they do not alter pixel_to_tri's output.
+ * Sampling fine on the centroid-to-centroid pixel line and asking
+ * "which parent triangle am I in?" yields the ordered traversal.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine the kisrhombille as graph paper with extra crosshatch lines
+ * inside every triangle. The crosshatches do not subdivide ADDRESSES;
+ * they only subdivide visual area. The path connects two
+ * coarse-grained addresses; the visual line crosses through several
+ * 30-60-90 wedges along the way, but only the parent-triangle
+ * sequence is recorded.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — equilateral edges + median proximity → '/' '\\' '|'.
+ *  3. path_draw — '*' at each path-triangle's centroid screen cell.
+ *  4. marker_draw — 'S' at start, 'E' at end.
+ *  5. cursor_draw — '@' at the cursor address.
+ *
+ *  path_compute runs only on START/END change or size change.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Centroid pixel  (h = size · √3 / 2):  same as 01_equilateral_path.
+ *
+ *  Walk parameters:
+ *    dx = ex - sx,   dy = ey - sy
+ *    dist = sqrt(dx² + dy²)
+ *    step = tri_size · 0.25
+ *    n    = floor(dist / step) + 1
+ *
+ *  Walk loop:
+ *    for i in 0..n:
+ *      t  = i / n
+ *      px = sx + t·dx,  py = sy + t·dy
+ *      pixel_to_tri(px, py) → (tC, tR, tU)   // parent triangle
+ *      path_add(tC, tR, tU)                   // dedup
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Medians vs path: the path '*' at a centroid lands precisely on
+ *    the median concurrent point. By draw order the '*' wins. The
+ *    median ink under it is invisibly covered.
+ *  • Zero-length, sampling step, MAX_OBJ cap: identical caveats to
+ *    01_equilateral_path.c.
+ *  • Recompute on size change: must call path_compute when '+'/'-'
+ *    changes tri_size, otherwise stored centroids drift.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Set START and END at the same triangle: path size = 1.
+ *  Walk one edge: path size = 2 — the path crosses no medians; the
+ *  visual line passes through several 30-60-90 wedges but the
+ *  RECORDED list only has 2 entries.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

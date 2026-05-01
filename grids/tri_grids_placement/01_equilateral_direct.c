@@ -52,6 +52,81 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Two address spaces share the screen at once:
+ *   1. The GRID — a function of every screen pixel via the equilateral
+ *      skew lattice. No data; reformed every frame in grid_draw().
+ *   2. The OBJECTS — a tiny array of (col, row, up, glyph) records in
+ *      ObjectPool. The cursor is just one more such address. SPACE
+ *      toggles whether the cursor address is in the pool.
+ * Drawing is grid first, then objects, then cursor. The cursor draws
+ * on top so it is always visible.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine the triangular tiling as an infinite address book — every
+ * triangle has a unique 3-tuple (col, row, up). The screen is a window
+ * onto that address book, re-centred each frame from
+ * (ox=cols/2, oy=(rows-1)/2). Objects are tagged by ADDRESS, not by
+ * pixel position; resizing the terminal moves the WINDOW, but the
+ * objects keep their addresses and reappear at new pixel positions.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan: for every screen cell, pixel_to_tri →
+ *     tri_edge_char → mvaddch when min-weight < BORDER_W.
+ *  3. pool_draw — for each object, tri_centroid_pixel → divide by
+ *     CELL_W / CELL_H → mvaddch the glyph at that screen cell.
+ *  4. cursor_draw — same path as pool_draw but '@' on top.
+ *  5. HUD + key hints; wnoutrefresh + doupdate.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Cursor step (4-direction lookup, see TRI_DIR in §6):
+ *    (cur->col, cur->row, cur->up) ← TRI_DIR[dir][cur->up]
+ *
+ *  Centroid lattice → pixel  (h = size · √3 / 2):
+ *    ▽ centroid  a = col + 1/3,   b = row + 1/3
+ *    △ centroid  a = col + 2/3,   b = row + 2/3
+ *    px = (a + 0.5·b) · size,   py = b · h
+ *
+ *  Centroid pixel → screen cell:
+ *    scol = ox + (int)(px / CELL_W)
+ *    srow = oy + (int)(py / CELL_H)
+ *
+ *  Pool toggle (O(1) remove via swap-with-last):
+ *    if (i = pool_find(col,row,up)) >= 0:
+ *      pool->objs[i] = pool->objs[--pool->count]
+ *    else:
+ *      pool->objs[pool->count++] = (TObj){col,row,up,glyph}
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • MAX_OBJ cap: silently dropped when the pool is full. 'C' clears
+ *    the pool. Bumping MAX_OBJ has no other cost — the pool is one
+ *    flat array, no allocation churn.
+ *  • Resize: cursor and objects keep their lattice addresses, but the
+ *    pixel positions shift because ox/oy are recomputed each frame.
+ *    An object can fall off-screen if the new terminal is small — its
+ *    address is still valid; the cursor can walk back to it.
+ *  • Glyph cycle: changing the glyph affects only the NEXT placement.
+ *    Already-placed objects keep the glyph they were stored with.
+ *  • Centroid rounding: tri_centroid_pixel uses int truncation, which
+ *    keeps '@' inside the interior so it never lands on a border char.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place a '*' at the origin triangle, press +/- to change tri_size,
+ *  then watch the glyph follow the same triangle to its new pixel
+ *  position. The (col, row, up) address is preserved across resize and
+ *  size change.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

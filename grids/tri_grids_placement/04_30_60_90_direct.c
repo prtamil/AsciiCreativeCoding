@@ -49,6 +49,70 @@
  * References     :
  *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
  *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
+ *   Kisrhombille tiling — https://en.wikipedia.org/wiki/Kisrhombille_tiling
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Same lattice and cursor mechanic as 01_equilateral_direct, with one
+ * twist: each equilateral triangle is dressed with its three medians
+ * (vertex → opposite-edge midpoint), splitting it into 6 right
+ * 30-60-90 sub-triangles. The cursor still addresses WHOLE equilaterals
+ * — placement is by (col, row, up), not by sub-triangle. The medians
+ * are visual decoration that grid_draw renders automatically per cell.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture the equilateral tiling, then over-print three thin lines
+ * inside every triangle joining each vertex to the midpoint of the
+ * opposite side. The cursor walks parent triangles; the medians are
+ * just paint. ObjectPool stores the same 3-tuple (col, row, up) and
+ * draws glyphs at the parent's centroid — which happens to be the
+ * concurrent point of the three medians.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan: pixel_to_tri → tri_edge_char (edges)
+ *     AND a median-proximity test for each of the 3 medians inside
+ *     the parent triangle → render '/' '\\' '|' near a median.
+ *  3. pool_draw — glyph at each placed object's centroid screen cell.
+ *  4. cursor_draw — '@' on top.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Cursor step (4-direction lookup): same TRI_DIR as 01_equilateral.
+ *
+ *  Centroid lattice → pixel  (h = size · √3 / 2):
+ *    ▽: a = col + 1/3,  b = row + 1/3
+ *    △: a = col + 2/3,  b = row + 2/3
+ *    px = (a + 0.5·b) · size,   py = b · h
+ *
+ *  Median proximity (visual only, inside grid_draw):
+ *    distance from (fa, fb) to each of the 3 median segments;
+ *    if any < MEDIAN_T → render the median character.
+ *
+ *  Pool toggle: swap-with-last; same as 01_equilateral_direct.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Centroid lands ON a median: every parent's centroid is the
+ *    medians' concurrent point. The glyph drawn there sits exactly
+ *    on top of the median character. By draw order, the glyph wins.
+ *  • MEDIAN_T tuning: too thin → medians look dashed; too thick →
+ *    medians thicken into noise.
+ *  • MAX_OBJ cap and resize behaviour: identical to
+ *    01_equilateral_direct.c.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place a glyph; the three medians of its parent triangle should
+ *  meet under the glyph. Press +/- to resize the grid: glyph and
+ *  medians scale together because both derive from the same cell
+ *  math.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

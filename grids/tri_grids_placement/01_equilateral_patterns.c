@@ -54,6 +54,77 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A pattern is a STATIC list of relative addresses. Pressing '1' is
+ * "translate the RING list by the cursor and insert each entry into the
+ * pool". The cursor never moves; only objects appear. Each pattern is
+ * a piece of compile-time data, not runtime state — adding a new pattern
+ * is just adding another array.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Think rubber stamps. Each pattern (RING, LINE, STAR, TRI, SCATTER)
+ * is a stamp whose ink dots are at fixed offsets from a centre. When
+ * you press the stamp at the cursor, the ink lands at
+ *   (cur->col + Δcol, cur->row + Δrow, target_up)
+ * for each entry in the table. SCATTER is the same idea but with a
+ * randomly-generated stamp each press.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — equilateral edge characters via raster scan.
+ *  3. pool_draw — every placed object's glyph at its centroid cell.
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Stamping (only on key press, not per frame):
+ *    pattern_stamp(pool, PAT_xxx, cur.col, cur.row, glyph)
+ *      for each entry (Δc, Δr, up_abs):
+ *        pool_add(pool, cur.col+Δc, cur.row+Δr, up_abs, glyph)
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pattern entry shape:  (Δcol, Δrow, target_up)        [3-tuple]
+ *  Sentinel:             { 0xDEAD, 0, 0 }               [end marker]
+ *  Iteration:            for i in 0..; while !IS_END(pat[i])
+ *
+ *  Why ABSOLUTE target_up (not delta):
+ *    On the equilateral lattice, triangle orientation depends on the
+ *    parity of (col+row), but the stamp is meant to look the same
+ *    regardless of where it lands. Storing the target_up directly
+ *    keeps the stamp's shape invariant under translation.
+ *
+ *  RING (6 triangles surrounding the cursor): the 6 entries that share
+ *    a vertex or edge with the cursor's triangle. Centred at (0,0,▽)
+ *    they spell out a Star-of-David hexagon.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • MAX_OBJ cap: large patterns (STAR ≈ 12 entries) plus repeated
+ *    SCATTER will fill the pool quickly; new entries silently dropped.
+ *    SPACE clears the pool to recover.
+ *  • Glyph cycle: the glyph used by the next stamp comes from
+ *    GLYPHS[cur.glyph_idx] AT the time of the stamp. Already-stamped
+ *    entries keep their glyph.
+ *  • SCATTER seed: g_seed is xor'd with clock_ns each call, so two
+ *    presses always produce different scatters — even at the same
+ *    millisecond, the LCG advances on each frand() call.
+ *  • Pattern overlap: pool_add deduplicates; stamping a RING twice has
+ *    no effect (the entries already exist).
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Press '1' (RING) — exactly 6 objects + cursor cell visible (7 total
+ *  if the cursor cell is one of the entries; here it is, so 6 unique).
+ *  Press '2' (LINE) — 8 entries forming a horizontal strip of 4 rhombi.
+ *  Move the cursor, press '1' again — a new ring at the new address;
+ *  the old ring remains because patterns ADD, not REPLACE.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

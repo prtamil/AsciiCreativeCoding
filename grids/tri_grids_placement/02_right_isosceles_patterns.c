@@ -2,20 +2,132 @@
 /*
  * 02_right_isosceles_patterns.c — preset pattern stamps on the half-rect grid
  *
- * DEMO: Cursor moves with arrows. Press 1..5 to STAMP a preset pattern:
+ * DEMO: Cursor moves with arrows on a square grid bisected by '\' into
+ *       UR / LL right-isosceles triangles. Press 1..5 to STAMP a preset
+ *       pattern at the cursor:
  *         1 = RING    (cursor + neighbours)
  *         2 = LINE    (8-tri horizontal strip)
  *         3 = STAR    (RING + outer ring)
  *         4 = TRI     (cursor + 3 corner triangles)
  *         5 = SCATTER (10 random within 4-step radius)
- *       SPACE clears all objects.
+ *       SPACE clears all objects. 'g' cycles the placed glyph.
  *
- * Study alongside: 02_right_isosceles_direct.c, grids/tri_grids/02_right_isosceles.c
+ * Study alongside: 02_right_isosceles_direct.c (manual SPACE-toggle),
+ *                  grids/tri_grids/02_right_isosceles.c (rasterizer),
+ *                  01_equilateral_patterns.c (same idea, equilateral).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 5 pairs: edge / cursor / object / HUD / hint
+ *   §4 formula  — pixel ↔ axis-aligned lattice + centroid + edge char
+ *   §5 pool     — ObjectPool: clear / find / add / draw
+ *   §6 cursor   — TRI_DIR + step + draw
+ *   §7 patterns — pattern offset tables + pattern_stamp + pattern_scatter
+ *   §8 scene    — grid_draw + scene_draw
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move  1..5:stamp  spc:clear  g:glyph
+ *        +/-:size  t:theme  r:reset  q/ESC:quit
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/02_right_isosceles_patterns.c \
  *       -o 02_right_isosceles_patterns -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Stamp-based placement. Each pattern is a STATIC array
+ *                  of (Δcol, Δrow, target_up) triples relative to the
+ *                  cursor. Pressing a digit translates the array by the
+ *                  cursor and inserts each entry into the pool.
+ *
+ * Data-structure : ObjectPool — flat array of TObj{col, row, up, glyph}.
+ *                  Pattern tables are read-only in §7. SCATTER uses an
+ *                  LCG (g_seed) to pick random offsets within a ±4 box.
+ *
+ * The trick      : target_up is ABSOLUTE (UR=1, LL=0), not a delta.
+ *                  On the half-rect lattice every (col, row) holds one
+ *                  UR and one LL — the stamp's silhouette must not
+ *                  flip when translated, so we store UR/LL directly.
+ *
+ * References     :
+ *   Half-rect tiling — https://en.wikipedia.org/wiki/Triangular_tiling
+ *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
+ *   Linear congruential generator — Numerical Recipes ch. 7
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A pattern is a static list of relative addresses. Pressing '1' is
+ * "translate the RING list by the cursor and insert each entry into
+ * the pool". The cursor never moves; only objects appear. Adding a
+ * new pattern is just adding another array — pure compile-time data.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Think rubber stamps on graph-paper-with-diagonals. Each pattern
+ * (RING, LINE, STAR, TRI, SCATTER) is a stamp whose ink dots are
+ * fixed offsets from a centre. Pressing the stamp at the cursor lands
+ *   (cur->col + Δcol, cur->row + Δrow, target_up)
+ * for each entry. SCATTER is the same idea but generates a random
+ * stamp on every press.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan: pixel_to_tri → tri_edge_char draws
+ *     '|', '_', '\\' near triangle edges.
+ *  3. pool_draw — every placed object's glyph at its centroid cell.
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Stamping (only on key press, not per frame):
+ *    pattern_stamp(pool, PAT_xxx, cur.col, cur.row, glyph)
+ *      for each entry (Δc, Δr, up_abs):
+ *        pool_add(pool, cur.col+Δc, cur.row+Δr, up_abs, glyph)
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pattern entry shape:  (Δcol, Δrow, target_up)        [3-tuple]
+ *  Sentinel:             { 0xDEAD, 0, 0 }
+ *  Iteration:            for i in 0..; while !IS_END(pat[i])
+ *
+ *  SCATTER (LCG, see §7):
+ *    g_seed ^= clock_ns()
+ *    dC = floor(frand·9) - 4    ; dR = floor(frand·9) - 4
+ *    up = (frand > 0.5) ? UR : LL
+ *    pool_add(cur.col+dC, cur.row+dR, up, glyph)
+ *
+ *  Why ABSOLUTE target_up: the half-rect lattice always has both UR
+ *  and LL at every (col, row); the choice is not parity-dependent
+ *  (unlike the equilateral grid). Storing absolute orientations keeps
+ *  the stamp's shape invariant under translation, period.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • MAX_OBJ cap: large STAR (12 entries) plus repeated SCATTER
+ *    saturates; new entries silently dropped. SPACE clears.
+ *  • Glyph cycle: glyph used by next stamp comes from
+ *    GLYPHS[cur.glyph_idx] AT stamp time. Already-stamped entries
+ *    keep their original glyph.
+ *  • Pattern overlap: pool_add deduplicates; stamping a RING twice
+ *    has no effect (the entries already exist).
+ *  • SCATTER bound: 100 retries, 10 entries — if the area near the
+ *    cursor is already full, fewer than 10 dots may land.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Press '1' (RING): a small cluster of 6 entries around the cursor.
+ *  Press '2' (LINE): 8 entries forming a horizontal strip across 4
+ *  squares. Move the cursor and press '1' again — a new ring at the
+ *  new address; the old ring remains because patterns ADD, not
+ *  REPLACE.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

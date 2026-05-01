@@ -2,12 +2,126 @@
 /*
  * 03_double_diagonal_patterns.c — preset stamps on the tetrakis grid
  *
- * Press 1..5 to stamp a preset; SPACE clears.
+ * DEMO: Cursor moves with arrows on a tetrakis grid (each square split
+ *       by both diagonals into 4 N/E/S/W wedges). Press 1..5 to STAMP
+ *       a preset pattern at the cursor:
+ *         1 = RING    (4 wedges around the cursor's square)
+ *         2 = LINE    (horizontal strip of wedges)
+ *         3 = STAR    (RING + outer ring)
+ *         4 = CROSS   (cursor + 4 cardinal neighbours)
+ *         5 = SCATTER (random wedges within a small box)
+ *       SPACE clears all objects. 'g' cycles the placed glyph.
+ *
+ * Study alongside: 03_double_diagonal_direct.c (manual SPACE-toggle),
+ *                  grids/tri_grids/03_double_diagonal.c (rasterizer),
+ *                  02_right_isosceles_patterns.c (1-diagonal sibling).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 5 pairs: edge / cursor / object / HUD / hint
+ *   §4 formula  — wedge classifier + barycentric per wedge
+ *   §5 pool     — ObjectPool: clear / find / add / draw
+ *   §6 cursor   — TETRA_DIR + step + draw
+ *   §7 patterns — pattern offset tables + pattern_stamp + pattern_scatter
+ *   §8 scene    — grid_draw + scene_draw
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move  1..5:stamp  spc:clear  g:glyph
+ *        +/-:size  t:theme  r:reset  q/ESC:quit
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/03_double_diagonal_patterns.c \
  *       -o 03_double_diagonal_patterns -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Stamp-based placement. Each pattern is a STATIC array
+ *                  of (Δcol, Δrow, target_dir) triples relative to the
+ *                  cursor. Pressing a digit translates the array by the
+ *                  cursor and inserts each entry into the pool.
+ *
+ * Data-structure : ObjectPool — flat array of TObj{col, row, dir, glyph}.
+ *                  Pattern tables are read-only in §7. SCATTER picks
+ *                  random offsets and a random direction via LCG.
+ *
+ * The trick      : target_dir is ABSOLUTE (one of N/E/S/W), not a delta.
+ *                  Each (col, row) holds 4 wedges; the stamp's
+ *                  silhouette must not rotate when translated, so we
+ *                  store dir directly per entry.
+ *
+ * References     :
+ *   Tetrakis square tiling — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
+ *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
+ *   Linear congruential generator — Numerical Recipes ch. 7
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A pattern is a static list of (Δcol, Δrow, dir) entries. Pressing
+ * '1' translates the RING list by the cursor and inserts each entry
+ * into the pool. The cursor never moves; only objects appear.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Think rubber stamps on X-cut graph paper. The RING stamp's ink dots
+ * are pre-placed at the four wedges around the cursor's square; the
+ * STAR stamp adds the outer ring. SCATTER generates a fresh random
+ * stamp on each press.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan: pixel_to_tri → tri_edge_char draws
+ *     '/', '\\', '|', '_' near each wedge's edges.
+ *  3. pool_draw — every placed object's glyph at its wedge centroid.
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Stamping (only on key press):
+ *    pattern_stamp(pool, PAT_xxx, cur.col, cur.row, glyph)
+ *      for each entry (Δc, Δr, dir_abs):
+ *        pool_add(pool, cur.col+Δc, cur.row+Δr, dir_abs, glyph)
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pattern entry shape:  (Δcol, Δrow, target_dir)        [3-tuple]
+ *  Sentinel:             { 0xDEAD, 0, 0 }
+ *  Iteration:            for i in 0..; while !IS_END(pat[i])
+ *
+ *  Wedge centroid (used by pool_draw, see §4 of the file):
+ *    N: a = col+1/2, b = row+1/6
+ *    E: a = col+5/6, b = row+1/2
+ *    S: a = col+1/2, b = row+5/6
+ *    W: a = col+1/6, b = row+1/2
+ *    px = a · size, py = b · size
+ *
+ *  Why ABSOLUTE target_dir: every (col, row) holds all 4 wedges
+ *  simultaneously, so the stamp's footprint is a fixed shape relative
+ *  to the cursor regardless of where it lands. A delta would have no
+ *  meaning — there is no "relative direction" between two wedges of
+ *  the same square.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • MAX_OBJ cap: large STAR plus repeated SCATTER saturates; new
+ *    entries silently dropped. SPACE clears.
+ *  • Glyph cycle: glyph used by next stamp comes from
+ *    GLYPHS[cur.glyph_idx] AT stamp time.
+ *  • Pattern overlap: pool_add deduplicates; stamping a RING twice at
+ *    the same cursor has no effect.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Press '1' (RING) at the origin: 4 wedges placed at (0,0,N), (0,0,E),
+ *  (0,0,S), (0,0,W) — all four wedges of the cursor's square.
+ *  Press '2' (LINE): a horizontal strip of wedges along row 0.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

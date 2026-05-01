@@ -50,6 +50,75 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Two halves: STORAGE (random scatter, generated once per reseed) and
+ * COLOURING (a pure function of cursor distance, recomputed every
+ * frame). Moving the cursor never re-seeds; it only re-paints the
+ * existing scatter through a different distance lens.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine sprinkling salt on a triangular tablecloth — the grains land
+ * randomly inside a small square region. Now point a coloured spotlight
+ * (the cursor) at the cloth; grains close to the beam glow warm,
+ * grains farther away cool. Move the spotlight: same grains, different
+ * colours. SPACE re-sprinkles.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — equilateral edge characters.
+ *  3. For each scatter object:
+ *       d = |obj.col - cur.col| + |obj.row - cur.row|
+ *           + (obj.up != cur.up ? 1 : 0)
+ *       bucket = min(d, N_BUCKETS - 1)
+ *       attron(COLOR_PAIR(PAIR_BUCKET_0 + bucket))
+ *       mvaddch(centroid_screen, '*')
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Reseed (only on SPACE or +/- density):
+ *    pool->count = 0
+ *    g_seed ^= clock_ns()
+ *    for i in 0..density:
+ *      dC = frand·(2·R+1) - R   ; dR = same
+ *      up = (frand > 0.5) ? △ : ▽
+ *      pool_add(cur.col+dC, cur.row+dR, up)   // dedup
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Manhattan-style cell distance (cheap, monotonic-ish on the
+ *  equilateral lattice for short ranges):
+ *    d = |Δcol| + |Δrow| + (Δup ? 1 : 0)
+ *
+ *  LCG step (Numerical Recipes ch. 7):
+ *    g_seed = g_seed · 1103515245 + 12345    (mod 2³²)
+ *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Manhattan vs true edge distance: on the equilateral lattice the
+ *    true minimum-edges distance is more complex (depends on parity).
+ *    Manhattan is a useful proxy for SMALL distances; for large ones
+ *    the gradient may "bend" visually. Acceptable for a colouring
+ *    demo, not for pathfinding.
+ *  • Density cap: density values approaching MAX_OBJ saturate the pool;
+ *    pool_add deduplicates, so "tries" may not reach the requested
+ *    count. The visible scatter may look thinner than density would
+ *    suggest at high values.
+ *  • Reseed on cursor move: NOT reseed-triggering by design. Move
+ *    cursor to "rotate the spotlight" without disturbing the scatter.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place cursor in the middle of a freshly-seeded scatter — colours
+ *  are warmest near '@', cooling outward. Walk the cursor to the edge:
+ *  the same dots stay, but the warm/cool boundary follows the cursor.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

@@ -2,10 +2,147 @@
 /*
  * 06_hex_subdivision_path.c — line-of-sight path on hex-subdivision grid
  *
+ * DEMO: Two markers (S/E) on a flat-top hex grid where each hex is
+ *       split into 6 wedges by 3 long diagonals. Move '@' with arrows
+ *       (move whole hexes); ',' / '.' rotate the cursor sector. Press
+ *       's' to set START at the cursor wedge, 'e' to set END. The
+ *       path is computed by pixel-walking the centroid-to-centroid
+ *       line and recording each (Q, R, sector) wedge it passes
+ *       through.
+ *
+ * Study alongside: grids/tri_grids/06_hex_subdivision.c (rasterizer),
+ *                  06_hex_subdivision_direct.c (manual placement),
+ *                  01_equilateral_path.c (same idea on equilateral).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, HEX_SIZE, MAX_OBJ
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 7 pairs: edge / radius / cursor / start / end / path / HUD
+ *   §4 formula  — pixel ↔ axial hex (cube-round) + sector_of (atan2 bin)
+ *   §5 pool     — PathPool: clear / contains / add / draw
+ *   §6 cursor   — HEX_DIR + cursor_step_hex + cursor_rotate_sector
+ *   §7 path     — pixel walk between two wedge centroids → wedge list
+ *   §8 scene    — grid_draw + scene_draw
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move-hex  ,/.:rotate  s:set-start  e:set-end
+ *        spc:clear-path  +/-:size  t:theme  r:reset  q/ESC:quit
+ *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/06_hex_subdivision_path.c \
  *       -o 06_hex_subdivision_path -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Line-rasterize between two wedge centroids in PIXEL
+ *                  space. For each sampled pixel, compute (Q, R) via
+ *                  cube-rounding, then classify the SECTOR by atan2 of
+ *                  the offset from the hex centre. The result is the
+ *                  ordered set of (Q, R, sector) wedges traversed by
+ *                  the straight line.
+ *
+ * Data-structure : PathPool — flat array of HPath{Q, R, sector}. Dedup
+ *                  via path_contains.
+ *
+ * Sector test    : sector_of(dx, dy) bins atan2(dy, dx) into 6 wedges
+ *                  rotated by 30°:
+ *                    s = floor((ang + π/6) / (π/3)) mod 6
+ *                  Sector 0 is centred on +x; sector 1 on 60° CCW; etc.
+ *
+ * Sampling step  : ~hex_size/4 — fine enough that no wedge is skipped.
+ *
+ * References     :
+ *   Hexagonal coordinates — https://www.redblobgames.com/grids/hexagons/
+ *   Hex axial system — https://en.wikipedia.org/wiki/Hexagonal_coordinate_systems
+ *   Bresenham line — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Stretch a string from S to E across a hex grid with diameters drawn
+ * inside every hex. The path is the ordered list of wedges the string
+ * passes through. We rediscover that list by pixel-walking the string
+ * and asking — at every sample — which (Q, R, sector) wedge owns the
+ * point. Cube-rounding answers (Q, R); atan2 answers the sector.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * The grid topology is two-tiered: hex membership (cube-rounding) and
+ * wedge angle (atan2 from hex centre). The line walks across hex
+ * boundaries and across diameter boundaries; each crossing introduces
+ * a new (Q, R, sector) into the path. Sampling at hex_size/4 is more
+ * than fine enough — wedges are large fractions of a hex.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — for each screen cell:
+ *       pixel_to_hex → (Q, R, dist)
+ *       hex_centre_pixel → (cx, cy)
+ *       if dist > limit_inner: render hex border via angle_char
+ *       else: test proximity to the 3 radii; if near, render the
+ *             radius character.
+ *  3. path_draw — '*' at each PathPool wedge centroid screen cell.
+ *  4. marker_draw — 'S' at start, 'E' at end.
+ *  5. cursor_draw — '@' at cursor wedge.
+ *
+ *  path_compute runs only on START/END change or size change.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → axial hex: cube-round (fq, fr, fs=-fq-fr) → integer (Q, R).
+ *
+ *  Sector classifier:
+ *    dx = px - cx,   dy = py - cy
+ *    ang = atan2(dy, dx)
+ *    sector = floor((ang + π/6) / (π/3)) mod 6
+ *
+ *  Wedge centroid:
+ *    angle = sector · π/3
+ *    r     = size · √3 / 3
+ *    cx_w  = cx + r · cos(angle)
+ *    cy_w  = cy + r · sin(angle)
+ *
+ *  Walk parameters:
+ *    dx = ex - sx,  dy = ey - sy
+ *    dist = sqrt(dx² + dy²)
+ *    step = hex_size · 0.25
+ *    n    = floor(dist / step) + 1
+ *
+ *  Walk loop:
+ *    for i in 0..n:
+ *      t  = i / n
+ *      px = sx + t·dx,   py = sy + t·dy
+ *      pixel_to_hex(px, py) → (Q, R)
+ *      hex_centre_pixel(Q, R) → (cx, cy)
+ *      sector_of(px - cx, py - cy) → s
+ *      path_add(Q, R, s)            // dedup
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Sector tie at hex centre: when (dx, dy) ≈ (0, 0) the atan2 angle
+ *    is undefined; sector_of returns 0 deterministically because the
+ *    +π/6 bias places the centre solidly in sector 0.
+ *  • Cube-round drift: the largest residual is snapped back; this
+ *    can flip the chosen hex by 1 in pathological floating-point
+ *    cases. Visible only at extreme zoom-out.
+ *  • Recompute on size change: '+'/'-' must call path_compute.
+ *  • Zero-length, MAX_OBJ cap: identical to other _path siblings.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Set START at sector 0 (east wedge) of (0,0); set END at sector 3
+ *  (west wedge) of (0,0): path size ≈ 4 (the line crosses sectors
+ *  0 → 1 → 2 → 3 inside one hex). Walk END to (1, 0, 0): path size
+ *  reaches across the hex boundary; sector-0 entries appear in two
+ *  different hexes.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

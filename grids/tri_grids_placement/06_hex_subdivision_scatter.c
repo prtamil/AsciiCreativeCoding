@@ -2,10 +2,141 @@
 /*
  * 06_hex_subdivision_scatter.c — distance-colored scatter on hex-subdivision
  *
+ * DEMO: A random scatter of N wedges fills a region around the cursor
+ *       on a flat-top hex grid where each hex is split into 6 wedges
+ *       by 3 long diagonals. Each wedge is coloured on a 6-stop
+ *       gradient by hex-axial distance from the cursor — closer = warm,
+ *       farther = cool. Move '@' with arrows; ',' / '.' rotate the
+ *       cursor sector. SPACE reseeds; +/- changes density.
+ *
+ * Study alongside: grids/tri_grids/06_hex_subdivision.c (rasterizer),
+ *                  06_hex_subdivision_direct.c (manual placement),
+ *                  01_equilateral_scatter.c (same idea on tri).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, HEX_SIZE, SCATTER_RADIUS, DENSITY
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 6-bucket gradient palette + cursor / HUD / hint
+ *   §4 formula  — pixel ↔ axial hex + wedge centroid
+ *   §5 pool     — ScatterPool: clear / contains / add / draw
+ *   §6 cursor   — HEX_DIR + cursor_step_hex + cursor_rotate_sector
+ *   §7 scatter  — random spawn + axial-distance bucket
+ *   §8 scene    — grid_draw + scene_draw
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move-hex  ,/.:rotate  spc:reseed  +/-:density
+ *        r:reset  t:theme  q/ESC:quit
+ *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/06_hex_subdivision_scatter.c \
  *       -o 06_hex_subdivision_scatter -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Random scatter on the hex-subdivision grid. Pick N
+ *                  random (ΔQ, ΔR, sector) within ±SCATTER_RADIUS of
+ *                  the cursor; colour by hex-axial distance bucketed
+ *                  into 6 gradient slots.
+ *
+ * Data-structure : ScatterPool — flat array of (Q, R, sector) entries.
+ *                  Bucket assignment is recomputed every frame from
+ *                  cursor's current position; entries change only on
+ *                  reseed.
+ *
+ * Distance metric: Hex axial distance for the (Q, R) part:
+ *                    d_hex = (|ΔQ| + |ΔR| + |ΔQ + ΔR|) / 2
+ *                  plus a small sector-mismatch penalty if Δsector ≠ 0.
+ *                  This is the proper hex graph distance — exact, not
+ *                  a Manhattan proxy.
+ *
+ * Re-seeding     : SPACE re-randomises with a new seed (xor'd by clock).
+ *                  +/- density also reseeds. Cursor movement does NOT.
+ *
+ * References     :
+ *   Hexagonal coordinates — https://www.redblobgames.com/grids/hexagons/
+ *   Hex distance — Red Blob Games "hex grid distance"
+ *   Linear congruential generator — Numerical Recipes ch. 7
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Two halves: STORAGE (random scatter of (Q, R, sector) addresses,
+ * generated once per reseed) and COLOURING (a pure function of
+ * cursor distance, recomputed every frame). Moving the cursor never
+ * reseeds; it only repaints the same scatter through a different
+ * distance lens.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Sprinkle salt on a soccer-ball-pattern grid with diameter cuts —
+ * grains land in random wedges within a disc around the cursor's
+ * hex. Now point a coloured spotlight at the cloth: grains close to
+ * the beam glow warm, farther ones cool. Move the spotlight: same
+ * grains, different colours.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — hex border via angle_char + 3-radii proximity
+ *     overlay.
+ *  3. For each scatter entry:
+ *       d = hex_dist(obj.Q - cur.Q, obj.R - cur.R)
+ *           + (obj.sector != cur.sector ? 1 : 0)
+ *       bucket = min(d, N_BUCKETS - 1)
+ *       attron(COLOR_PAIR(PAIR_BUCKET_0 + bucket))
+ *       mvaddch(wedge_centroid_screen, '*')
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Reseed (only on SPACE or +/- density):
+ *    pool->count = 0
+ *    g_seed ^= clock_ns()
+ *    for i in 0..density:
+ *      dQ = floor(frand·(2·R+1)) - R    ; dR = same
+ *      s  = (int)floor(frand · 6)       // 0..5
+ *      pool_add(cur.Q+dQ, cur.R+dR, s)   // dedup
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Hex axial distance:
+ *    d_hex = (|ΔQ| + |ΔR| + |ΔQ + ΔR|) / 2
+ *  This is exact for the hex graph (NOT a Manhattan approximation).
+ *
+ *  Wedge centroid (used by pool_draw):
+ *    angle = sector · π/3
+ *    r     = size · √3 / 3
+ *    cx_w  = cx + r · cos(angle)
+ *    cy_w  = cy + r · sin(angle)
+ *
+ *  LCG step (Numerical Recipes ch. 7):
+ *    g_seed = g_seed · 1103515245 + 12345
+ *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Hex distance vs sector: the sector mismatch only adds 1 unit;
+ *    two wedges of the same hex can be visually quite distant but
+ *    share d_hex = 0. The "+1 if Δsector" term keeps neighbours
+ *    inside one hex from all collapsing to the same colour bucket.
+ *  • SCATTER_RADIUS is in HEX cells, not pixels. A radius of 8 covers
+ *    a roughly 16-hex-wide disc.
+ *  • Density vs MAX_OBJ: dedup and high density may give fewer dots
+ *    than requested.
+ *  • Reseed-on-cursor-move: not triggered by design.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place cursor at the centre of a fresh scatter — colours warmest
+ *  near '@'. Walk the cursor a few hexes outward: same dots persist;
+ *  the warm/cool boundary follows the cursor. Press ',' to rotate
+ *  cursor sector — the bucket of any dot in the cursor's hex shifts
+ *  by 0 or 1 depending on whether its sector now matches.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

@@ -2,12 +2,130 @@
 /*
  * 06_hex_subdivision_patterns.c — preset stamps on hex-subdivision grid
  *
- * Press 1..5 to stamp; SPACE clears.
+ * DEMO: Cursor moves with arrows (whole hexes) on a flat-top hex grid
+ *       where each hex is split into 6 wedges by 3 long diagonals.
+ *       ',' / '.' rotate the cursor sector. Press 1..5 to STAMP a
+ *       preset pattern at the cursor wedge:
+ *         1 = RING    (6 wedges of the cursor's hex — full pinwheel)
+ *         2 = LINE    (wedges along a horizontal hex strip)
+ *         3 = STAR    (RING + outer ring of neighbouring hexes)
+ *         4 = TRI     (cursor + 3 alternating sectors)
+ *         5 = SCATTER (random within a small radius)
+ *       SPACE clears all objects. 'g' cycles the placed glyph.
+ *
+ * Study alongside: grids/tri_grids/06_hex_subdivision.c (rasterizer),
+ *                  06_hex_subdivision_direct.c (manual placement),
+ *                  01_equilateral_patterns.c (same patterns on tri).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, HEX_SIZE, MAX_OBJ
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 6 pairs: edge / radius / cursor / object / HUD / hint
+ *   §4 formula  — pixel ↔ axial hex + wedge centroid
+ *   §5 pool     — ObjectPool: clear / find / add / draw
+ *   §6 cursor   — HEX_DIR + cursor_step_hex + cursor_rotate_sector
+ *   §7 patterns — pattern offset tables + pattern_stamp + pattern_scatter
+ *   §8 scene    — grid_draw + scene_draw
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move-hex  ,/.:rotate  1..5:stamp  spc:clear  g:glyph
+ *        +/-:size  t:theme  r:reset  q/ESC:quit
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/06_hex_subdivision_patterns.c \
  *       -o 06_hex_subdivision_patterns -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Stamp-based placement. Each pattern is a STATIC
+ *                  array of (ΔQ, ΔR, target_sector) triples relative
+ *                  to the cursor. Pressing a digit translates the
+ *                  array by the cursor and inserts each entry into
+ *                  the pool.
+ *
+ * Data-structure : ObjectPool — flat array of HObj{Q, R, sector, glyph}.
+ *                  Pattern tables are read-only in §7. SCATTER picks
+ *                  random offsets and a random sector via LCG.
+ *
+ * The trick      : target_sector is ABSOLUTE (0..5), not a delta.
+ *                  Sectors are oriented by the same +x reference in
+ *                  every hex; a translated stamp must keep its
+ *                  silhouette regardless of where it lands.
+ *
+ * References     :
+ *   Hexagonal coordinates — https://www.redblobgames.com/grids/hexagons/
+ *   Hex axial system — https://en.wikipedia.org/wiki/Hexagonal_coordinate_systems
+ *   Linear congruential generator — Numerical Recipes ch. 7
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A pattern is a static list of (ΔQ, ΔR, sector) entries. Pressing
+ * '1' translates the RING list by the cursor and inserts each entry
+ * into the pool. The cursor never moves; only objects appear. The
+ * RING covers all 6 sectors of one hex (a full pinwheel); the STAR
+ * adds neighbouring hex wedges around it.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Rubber stamps on a hex grid with diameter cuts. Each pattern is a
+ * fixed-shape ink dot pattern keyed to the cursor's hex address; the
+ * sector field selects which wedge inside the target hex receives ink.
+ * SCATTER generates a random stamp on every press.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — hex border + 3 radii via angle_char and radius
+ *     proximity test.
+ *  3. pool_draw — every placed object's glyph at its wedge centroid.
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Stamping (only on key press):
+ *    pattern_stamp(pool, PAT_xxx, cur.Q, cur.R, glyph)
+ *      for each entry (ΔQ, ΔR, sector_abs):
+ *        pool_add(pool, cur.Q+ΔQ, cur.R+ΔR, sector_abs, glyph)
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pattern entry shape:  (ΔQ, ΔR, target_sector)        [3-tuple]
+ *  Sentinel:             { 0xDEAD, 0, 0 }
+ *
+ *  Wedge centroid (1/3 of the way from hex centre to a vertex):
+ *    angle = sector · π/3
+ *    r     = size · √3 / 3
+ *    cx_w  = cx + r · cos(angle)
+ *    cy_w  = cy + r · sin(angle)
+ *
+ *  Why ABSOLUTE target_sector: sectors are global angles measured
+ *  from +x at every hex centre. The same sector ID in two different
+ *  hexes points the same compass direction; a delta would have no
+ *  consistent meaning across hex translations.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • RING covers the cursor's full hex (6 sectors) — repeating the
+ *    stamp at the same hex has no effect (pool_add deduplicates).
+ *  • MAX_OBJ cap: STAR (12+ entries) plus SCATTER saturates quickly.
+ *    SPACE clears the pool to recover.
+ *  • Glyph cycle: glyph used by the next stamp comes from
+ *    GLYPHS[cur.glyph_idx] AT stamp time.
+ *  • Pattern silhouette under rotation: target_sector is fixed in
+ *    pattern data — rotating the cursor sector before stamping has
+ *    no effect on the stamp's shape (which is intended).
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Press '1' (RING): all 6 wedges of the cursor's hex hold a glyph.
+ *  Press LEFT to move one hex left; press '1' again — a new ring on
+ *  the new hex; the old ring remains. Patterns ADD, not REPLACE.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

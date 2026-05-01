@@ -2,16 +2,127 @@
 /*
  * 03_double_diagonal_direct.c — direct placement on tetrakis (4-wedge) grid
  *
- * DEMO: Each square is split by both diagonals into 4 right-isosceles
- *       triangles (N/E/S/W). Move '@' with arrows; SPACE toggles a
- *       glyph at the cursor wedge. Each arrow press moves toward that
- *       compass direction within the square, jumping squares when at
+ * DEMO: Each square is split by BOTH diagonals into 4 right-isosceles
+ *       triangles labelled by the direction their apex points: N, E, S,
+ *       W. Move '@' with arrows; SPACE toggles a glyph at the cursor
+ *       wedge. An arrow key moves toward that compass direction —
+ *       within the current square if possible, jumping squares when at
  *       the matching apex.
+ *
+ * Study alongside: grids/tri_grids/03_double_diagonal.c (rasterizer),
+ *                  02_right_isosceles_direct.c (1 diagonal, 2 wedges).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ, DIR_N/E/S/W
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 5 pairs: edge / cursor / object / HUD / hint
+ *   §4 formula  — wedge classifier + barycentric per wedge
+ *   §5 pool     — ObjectPool: clear / find / toggle / draw
+ *   §6 cursor   — TETRA_DIR table + step + draw
+ *   §7 scene    — grid_draw + scene_draw
+ *   §8 screen   — ncurses init / cleanup
+ *   §9 app      — signals, main loop
+ *
+ * Keys:  arrows:move  spc:toggle  g:glyph  C:clear  r:reset
+ *        +/-:size  t:theme  q/ESC:quit
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/03_double_diagonal_direct.c \
  *       -o 03_double_diagonal_direct -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Tetrakis (a.k.a. "kis-square") tiling — every square
+ *                  cut by both diagonals into 4 right-isosceles wedges
+ *                  meeting at the centre. The cursor lives in
+ *                  (col, row, dir) where dir ∈ {N, E, S, W}; SPACE
+ *                  toggles an object at that address.
+ *
+ * Data-structure : ObjectPool — flat array of TObj{col, row, dir, glyph}.
+ *                  pool_toggle removes via swap-with-last (O(1)).
+ *
+ * Wedge picker   : Translate (fa, fb) so the square centre is the origin
+ *                  by computing (dx, dy) = (fa-0.5, fb-0.5). The wedge
+ *                  is named by which axis dominates and the sign:
+ *                    |dx| > |dy|, dx > 0 → E
+ *                    |dx| > |dy|, dx ≤ 0 → W
+ *                    |dy| ≥ |dx|, dy > 0 → S
+ *                    |dy| ≥ |dx|, dy ≤ 0 → N
+ *
+ * References     :
+ *   Tetrakis square tiling — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
+ *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The grid is square cells, each cut into 4 wedges by the two diagonals.
+ * An address is (col, row, dir) where dir ∈ {N, E, S, W} — the apex
+ * direction of the wedge. The cursor walks wedges; SPACE pins a glyph
+ * at the current wedge. The grid lives only as arithmetic; objects
+ * live in an array of (col, row, dir) records.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a square cake split into 4 triangular slices by an X cut.
+ * Each slice points outward in one cardinal direction. The cursor sits
+ * in one slice; pressing N steps to the slice that points N — INSIDE
+ * the same square if the current dir is on the SOUTH side, or by
+ * jumping to the square above when already pointing N. The TETRA_DIR
+ * table encodes all 16 (arrow, current dir) → (Δcol, Δrow, new dir)
+ * transitions.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan: for every screen cell, pixel_to_tri
+ *     classifies the wedge, tri_edge_char picks an ASCII glyph by
+ *     barycentric proximity to the wedge's three edges (two diagonals
+ *     and one square side).
+ *  3. pool_draw — for each placed object, glyph at wedge centroid
+ *     screen cell.
+ *  4. cursor_draw — '@' on top.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → square + wedge:
+ *    a = px / size,   b = py / size
+ *    col = ⌊a⌋,        row = ⌊b⌋
+ *    fa  = a - col,    fb  = b - row
+ *    dx  = fa - 0.5,   dy  = fb - 0.5
+ *    if |dx| > |dy|:   dir = (dx > 0) ? E : W
+ *    else:             dir = (dy > 0) ? S : N
+ *
+ *  Centroid lattice → pixel  (each centroid is 1/3 from the apex):
+ *    N: (col + 1/2,    row + 1/6) · size
+ *    E: (col + 5/6,    row + 1/2) · size
+ *    S: (col + 1/2,    row + 5/6) · size
+ *    W: (col + 1/6,    row + 1/2) · size
+ *
+ *  Cursor step: TETRA_DIR[arrow][cur->dir] → (Δcol, Δrow, new_dir).
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Centre tie: at fa == fb == 0.5 the cursor sits exactly at the
+ *    apex meeting point. The classifier then resolves via the |dx| vs
+ *    |dy| comparison (using ≥), defaulting to N/S over E/W. Harmless.
+ *  • Glyph cycle, MAX_OBJ cap, resize behaviour: identical to
+ *    01_equilateral_direct.c.
+ *  • Aspect: CELL_W=2, CELL_H=4 → cells are 1:2 wide:tall. Wedges are
+ *    right-isosceles in PIXEL space; on screen they appear taller than
+ *    wide. This is a faithful aspect-corrected rendering, not a bug.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place a glyph in the N wedge of (0,0). Press DOWN: cursor → S
+ *  wedge of (0,0) (same square). Press DOWN again: cursor → N wedge
+ *  of (0,1) (next row). Two DOWNs traverse one whole square.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

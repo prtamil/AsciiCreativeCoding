@@ -2,10 +2,129 @@
 /*
  * 03_double_diagonal_path.c — line-of-sight path on the tetrakis grid
  *
+ * DEMO: Two markers — START (S) and END (E) — sit on a tetrakis grid
+ *       (each square split by both diagonals into N/E/S/W wedges).
+ *       Move '@' with arrows; 's' sets START at cursor, 'e' sets END.
+ *       The path is computed by walking pixel coordinates along the
+ *       centroid-to-centroid line and recording which wedge each
+ *       sampled pixel lies in.
+ *
+ * Study alongside: 03_double_diagonal_direct.c (manual placement),
+ *                  grids/tri_grids/03_double_diagonal.c (rasterizer),
+ *                  02_right_isosceles_path.c (1-diagonal sibling).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 7 pairs: edge / cursor / start / end / path / HUD / hint
+ *   §4 formula  — wedge classifier + barycentric per wedge
+ *   §5 pool     — PathPool: clear / contains / add / draw
+ *   §6 cursor   — TETRA_DIR + step + draw + START / END markers
+ *   §7 path     — pixel walk between two centroids → wedge list
+ *   §8 scene    — grid_draw + scene_draw
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move  s:set-start  e:set-end  spc:clear-path
+ *        +/-:size  t:theme  r:reset  q/ESC:quit
+ *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/03_double_diagonal_path.c \
  *       -o 03_double_diagonal_path -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Line-rasterize between two wedge centroids in PIXEL
+ *                  space; for each sampled pixel, ask pixel_to_tri
+ *                  "which (col, row, dir) wedge owns me?" and record
+ *                  uniques. The result is the ordered set of N/E/S/W
+ *                  wedges traversed by the straight line.
+ *
+ * Data-structure : PathPool — flat array of TPath{col, row, dir}.
+ *                  path_add deduplicates via path_contains.
+ *
+ * Sampling step  : ~size/4 pixels — fine enough that no wedge is
+ *                  skipped. Wedges are smaller than the underlying
+ *                  square (4 per square), so the step must stay tight.
+ *
+ * References     :
+ *   Tetrakis square tiling — https://en.wikipedia.org/wiki/Tetrakis_square_tiling
+ *   Bresenham line — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
+ *   Line-of-sight on grids — Red Blob Games
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Stretch a string from S to E across an X-cut grid of squares. The
+ * path is the ordered list of wedges the string passes through. Sample
+ * the string finely in pixel space; at each sample, classify the
+ * underlying wedge with the same formula grid_draw uses.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * The grid is a square lattice with both diagonals drawn — every
+ * square holds 4 triangular wedges. Where the line crosses a side
+ * it changes square; where it crosses a diagonal it changes wedge
+ * inside the same square. The path captures every such transition
+ * by sampling more often than half the wedge size.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan: pixel_to_tri → tri_edge_char draws
+ *     '/', '\\', '|', '_' near edges of each wedge.
+ *  3. path_draw — '*' at each PathPool entry's centroid screen cell.
+ *  4. marker_draw — 'S' at start, 'E' at end.
+ *  5. cursor_draw — '@' at the cursor address.
+ *
+ *  path_compute runs only on START/END change or size change.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → wedge:
+ *    a = px / size,   b = py / size
+ *    col = ⌊a⌋,        row = ⌊b⌋
+ *    dx = fa-0.5,      dy = fb-0.5
+ *    dir = (|dx|>|dy|) ? (dx>0?E:W) : (dy>0?S:N)
+ *
+ *  Wedge centroid (1/3 of the way from apex to opposite edge midpoint):
+ *    N: a = col+1/2,  b = row+1/6
+ *    E: a = col+5/6,  b = row+1/2
+ *    S: a = col+1/2,  b = row+5/6
+ *    W: a = col+1/6,  b = row+1/2
+ *    px = a · size,   py = b · size
+ *
+ *  Walk parameters: dist, n, step = size/4 — same as 02_*_path.
+ *
+ *  Walk loop:
+ *    for i in 0..n:
+ *      t  = i / n
+ *      px = sx + t·dx,  py = sy + t·dy
+ *      pixel_to_tri(px, py) → (tC, tR, tD)
+ *      path_add(tC, tR, tD)         // dedup
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Wedge density: 4 wedges per square means a horizontal line of
+ *    one-square length can record 2–3 wedges. Keep step ≤ size/4.
+ *  • Apex point: at the centre of any square the line passes through
+ *    a single pixel where all 4 wedges meet. The classifier breaks
+ *    the tie deterministically by ≥ on |dy|, so the path won't
+ *    "flicker" between wedges.
+ *  • Recompute on size change: '+'/'-' must call path_compute.
+ *  • Zero-length, MAX_OBJ cap: identical to 02_*_path.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  START and END both at N wedge of (0,0): path size = 1.
+ *  END at E wedge of (0,0): path size ≥ 2 (passes through the apex).
+ *  END at N wedge of (1,0): path size = 2 (one square step right).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

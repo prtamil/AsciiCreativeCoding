@@ -47,6 +47,71 @@
  *
  * References     :
  *   Linear congruential generator — Numerical Recipes ch. 7
+ *   Kisrhombille tiling — https://en.wikipedia.org/wiki/Kisrhombille_tiling
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Random scatter coloured by cursor distance, on the kisrhombille
+ * background. Storage is generated once per reseed; colouring is
+ * recomputed every frame from cursor distance. The medians beneath
+ * each scatter dot render automatically via grid_draw.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Sprinkle salt on triangle graph paper that has crosshatched cells.
+ * Point a coloured spotlight (cursor) at the cloth — closer grains
+ * glow warm, farther cool. Move the spotlight: same grains, different
+ * colours. SPACE re-sprinkles.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — equilateral edges + median overlay.
+ *  3. For each scatter object:
+ *       d = |obj.col - cur.col| + |obj.row - cur.row|
+ *           + (obj.up != cur.up ? 1 : 0)
+ *       bucket = min(d, N_BUCKETS - 1)
+ *       attron(COLOR_PAIR(PAIR_BUCKET_0 + bucket))
+ *       mvaddch(centroid_screen, '*')
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Reseed (only on SPACE or +/- density):
+ *    pool->count = 0
+ *    g_seed ^= clock_ns()
+ *    for i in 0..density:
+ *      dC = frand·(2·R+1) - R    ; dR = same
+ *      up = (frand > 0.5) ? △ : ▽
+ *      pool_add(cur.col+dC, cur.row+dR, up)   // dedup
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Manhattan-style cell distance:
+ *    d = |Δcol| + |Δrow| + (Δup ? 1 : 0)
+ *
+ *  LCG step (Numerical Recipes ch. 7):
+ *    g_seed = g_seed · 1103515245 + 12345
+ *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Manhattan vs true edge distance: the actual edge-walk distance
+ *    on the equilateral lattice depends on parity. Manhattan is a
+ *    fast proxy useful for short distances and a colouring demo.
+ *  • Glyph over medians: each scatter dot's centroid lands on the
+ *    median concurrent point of its parent — the glyph covers the
+ *    median ink at that single cell.
+ *  • Density saturation, dedup and reseed-on-cursor-move: identical
+ *    to 01_equilateral_scatter.c.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place cursor in the middle of a fresh scatter — colours warmest
+ *  near '@'. Walk the cursor outward: same dots, warmth follows
+ *  cursor. Observe medians peeking through between scatter dots.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

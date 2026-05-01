@@ -2,15 +2,145 @@
 /*
  * 06_hex_subdivision_direct.c — direct placement on hex-with-radii grid
  *
- * DEMO: Flat-top hex grid; each hex is split into 6 equilateral wedges
- *       by 3 diagonals through the centre. Cursor lives at (Q, R, sector)
- *       where sector ∈ 0..5. Arrows move the hex; ',' / '.' rotate the
- *       cursor sub-triangle. SPACE toggles a glyph at the cursor wedge.
+ * DEMO: Flat-top hex grid where each hex is split into 6 equilateral
+ *       wedges by 3 long diagonals through the centre. The cursor
+ *       lives at (Q, R, sector) where (Q, R) are axial hex coords and
+ *       sector ∈ 0..5 (CCW from +x). Arrow keys move the hex; ',' /
+ *       '.' rotate the cursor sub-triangle within the hex. SPACE
+ *       toggles a glyph at the cursor wedge.
+ *
+ * Study alongside: grids/tri_grids/06_hex_subdivision.c (rasterizer +
+ *                  hex inverse via cube-rounding),
+ *                  grids/hex_grids/01_flat_top.c (base hex grid).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, HEX_SIZE, BORDER_W, RADIUS_T_FRAC
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 6 pairs: edge / radius / cursor / object / HUD / hint
+ *   §4 formula  — pixel ↔ axial hex (cube-round) + wedge centroid
+ *   §5 pool     — ObjectPool: clear / find / toggle / draw
+ *   §6 cursor   — HEX_DIR + cursor_step_hex + cursor_rotate_sector
+ *   §7 scene    — grid_draw (border + 3 radii) + scene_draw
+ *   §8 screen   — ncurses init / cleanup
+ *   §9 app      — signals, main loop
+ *
+ * Keys:  arrows:move-hex  ,/.:rotate-sector  spc:toggle  g:glyph
+ *        C:clear  +/-:size  t:theme  r:reset  q/ESC:quit
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/06_hex_subdivision_direct.c \
  *       -o 06_hex_subdivision_direct -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Direct placement on a flat-top hex grid where each
+ *                  hex is sliced into 6 equilateral wedges by three
+ *                  diameters. The cursor address is (Q, R, sector). Q
+ *                  and R are axial hex coordinates; sector is rotated
+ *                  by ',' (CCW) and '.' (CW). SPACE toggles an object
+ *                  at that address.
+ *
+ * Data-structure : ObjectPool — flat array of HObj{Q, R, sector, glyph}.
+ *                  pool_toggle removes via swap-with-last (O(1)).
+ *
+ * Pixel→hex      : Cube-rounding (round (q, r, s) with s = -q - r,
+ *                  then snap the largest absolute residual back to its
+ *                  neighbours). See grids/tri_grids/06_hex_subdivision.c.
+ *
+ * Sector address : The CURSOR carries the sector — the user rotates it
+ *                  with ',' / '.'. pixel_to_hex does NOT classify the
+ *                  sector here (only direct-placement variant). Wedge
+ *                  centroids sit at sector·60° from the hex centre.
+ *
+ * References     :
+ *   Hexagonal coordinates — https://www.redblobgames.com/grids/hexagons/
+ *   Hex axial system — https://en.wikipedia.org/wiki/Hexagonal_coordinate_systems
+ *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Two address levels:
+ *   1. The HEX  — a flat-top tiling with axial coordinates (Q, R).
+ *   2. The WEDGE — one of 6 equilateral sub-triangles inside the hex,
+ *      indexed by sector ∈ 0..5 measured CCW from +x.
+ * The cursor carries a (Q, R, sector). Arrows change (Q, R); ',' / '.'
+ * rotate the sector within the current hex. SPACE pins an object at
+ * the current address.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a soccer-ball pattern of hexes; inside each hex draw three
+ * lines from corner to corner through the centre, splitting it into
+ * six equilateral wedges. The cursor walks hexes; the sector is the
+ * "clock hand" inside the hex pointing to the active wedge. Objects
+ * are stored by (Q, R, sector) — not by pixel position — so they
+ * survive resize and size change.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — for each screen cell:
+ *       pixel_to_hex → (Q, R, dist)
+ *       hex_centre_pixel → (cx, cy)
+ *       if dist > limit_inner: render hex border via angle_char
+ *       else: test proximity to the 3 radii; if near, render '/' '\\' '-'
+ *  3. pool_draw — for each placed object, glyph at wedge centroid
+ *     screen cell.
+ *  4. cursor_draw — '@' on top.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → axial (flat-top, with size = hex side length):
+ *    fq = (2/3 · px) / size
+ *    fr = (-1/3 · px + (√3/3) · py) / size
+ *    Cube-round (fq, fr, fs = -fq-fr) → integer (Q, R).
+ *
+ *  Hex centre → pixel:
+ *    cx = size · 1.5 · Q
+ *    cy = size · ((√3/2) · Q + √3 · R)
+ *
+ *  Wedge centroid (1/3 of the way from centre to a vertex):
+ *    angle = sector · π/3
+ *    r     = size · √3 / 3
+ *    cx_w  = cx + r · cos(angle)
+ *    cy_w  = cy + r · sin(angle)
+ *
+ *  Cursor step (hex movement):
+ *    HEX_DIR[idx] for idx ∈ {LEFT=2, RIGHT=3, UP=0, DOWN=1}
+ *    cur->Q += HEX_DIR[idx][0]
+ *    cur->R += HEX_DIR[idx][1]
+ *
+ *  Sector rotate:
+ *    cur->sector = (cur->sector + Δ + 6) mod 6
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Arrow→hex mapping: the hex grid has 6 neighbours, not 4. This
+ *    file uses ONLY 4 cardinal arrow keys, mapping to 4 of those 6
+ *    (Q±1 and R±1). The two diagonal hex neighbours are reachable by
+ *    chaining two key-presses. This is intentional simplification —
+ *    see hex_grids/ for full 6-neighbour navigation.
+ *  • Sector rotation does NOT change Q or R — only the cursor's wedge
+ *    inside the same hex.
+ *  • dist threshold: limit_inner = 0.5 - BORDER_W. dist near 0.5
+ *    means the pixel is near a hex edge; dist near 0 means near the
+ *    centre.
+ *  • Aspect: CELL_W=2, CELL_H=4 keeps wedges roughly equilateral on
+ *    screen even though terminal characters are taller than wide.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place a glyph at sector 0 (east wedge). Press ',' six times — the
+ *  cursor returns to sector 0; the glyph is still where you placed
+ *  it. Press LEFT — cursor moves to (Q-1, R, sector=0); the glyph
+ *  stays. Press +/- to resize: glyph still anchored to its wedge.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

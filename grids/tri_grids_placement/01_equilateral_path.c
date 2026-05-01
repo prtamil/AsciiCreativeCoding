@@ -54,6 +54,81 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A path between two triangles is the set of triangles a straight pixel
+ * line passes through, in order. We compute it by SAMPLING the line at
+ * fine intervals and asking pixel_to_tri "which triangle owns this
+ * pixel?" — recording each new triangle. No graph, no BFS, no edge list:
+ * the topology of the grid is rediscovered by a one-dimensional walk
+ * through the same skew-lattice formula the grid_draw uses.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Think of the START and END markers as two pins on a sheet of triangle
+ * graph paper. Stretch a string between them. The string crosses some
+ * triangles; we want that ordered list. Sampling the string every
+ * size/4 pixels (much finer than the triangle's smallest dimension)
+ * guarantees we never skip one. Each sample is a query into the same
+ * pixel→lattice inverse used by grid_draw — the path is just a 1-D
+ * scan instead of a 2-D scan.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan, equilateral edge characters.
+ *  3. path_draw — for each triangle in PathPool, draw '*' at its
+ *     centroid screen cell.
+ *  4. marker_draw — 'S' at start (if has_start), 'E' at end.
+ *  5. cursor_draw — '@' at the cursor address.
+ *
+ *  path_compute runs only on START/END change or size change — NOT
+ *  every frame. PathPool is reused; cleared and refilled each time.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Centroid pixel  (h = size · √3 / 2):
+ *    ▽: a = col + 1/3,  b = row + 1/3
+ *    △: a = col + 2/3,  b = row + 2/3
+ *    px = (a + 0.5·b)·size,   py = b · h
+ *
+ *  Walk parameters:
+ *    dx = ex - sx,   dy = ey - sy
+ *    dist = sqrt(dx² + dy²)
+ *    step = tri_size · 0.25      (sampling resolution)
+ *    n    = floor(dist / step) + 1
+ *
+ *  Walk loop:
+ *    for i in 0..n:
+ *      t  = i / n
+ *      px = sx + t·dx,  py = sy + t·dy
+ *      pixel_to_tri(px, py) → (tC, tR, tU)
+ *      path_add(tC, tR, tU)         // dedup via path_contains
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Zero-length path: when start == end, n divides by zero. Guarded
+ *    by the dist < 1e-6 early return — adds the start triangle alone.
+ *  • Sampling too coarse: step = size/4 is fine for any reasonable
+ *    angle, but a step ≥ size/2 risks skipping triangles that the line
+ *    crosses corner-to-corner. Don't relax it.
+ *  • MAX_OBJ cap on PathPool: a very long path can be silently
+ *    truncated. Increase MAX_OBJ, or shorten the line.
+ *  • Recompute on size change: '+'/'-' resize the grid AND must call
+ *    path_compute, otherwise the stored path triangles render at
+ *    centroids of the OLD size — they'll appear off the line.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Set START and END at the same triangle: path size = 1.
+ *  Set START and END as horizontal neighbours (one edge apart): path
+ *  size = 2. As the line rotates 30° its triangle count grows roughly
+ *  proportional to the perpendicular thickness of one strip.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

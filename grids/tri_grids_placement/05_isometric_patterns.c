@@ -2,10 +2,126 @@
 /*
  * 05_isometric_patterns.c — preset stamps on the iso (solid-fill) grid
  *
+ * DEMO: Iso solid-colour triangular grid (6-cycle palette). Cursor
+ *       moves with arrows. Press 1..5 to STAMP a preset pattern at
+ *       the cursor:
+ *         1 = RING    (6 triangles surrounding the cursor)
+ *         2 = LINE    (8 triangles in a horizontal strip)
+ *         3 = STAR    (RING + 6 outer triangles)
+ *         4 = TRI     (cursor + 3 corner triangles forming a triforce)
+ *         5 = SCATTER (10 random within 4-step radius)
+ *       SPACE clears all objects. 'g' cycles the placed glyph.
+ *
+ * Study alongside: grids/tri_grids/05_isometric.c (rasterizer),
+ *                  05_isometric_direct.c (manual SPACE-toggle on iso),
+ *                  01_equilateral_patterns.c (same patterns, edges).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — fill palette + cursor / HUD / hint
+ *   §4 formula  — pixel ↔ skew lattice + centroid + palette_index
+ *   §5 pool     — ObjectPool
+ *   §6 cursor   — TRI_DIR + step + draw
+ *   §7 patterns — pattern offset tables + pattern_stamp + pattern_scatter
+ *   §8 scene    — solid-fill raster + pool + cursor
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move  1..5:stamp  spc:clear  g:glyph
+ *        +/-:size  t:theme  r:reset  q/ESC:quit
+ *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/05_isometric_patterns.c \
  *       -o 05_isometric_patterns -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Stamp-based placement. Each pattern is a STATIC
+ *                  array of (Δcol, Δrow, target_up) triples relative to
+ *                  the cursor. Pressing a digit translates the array by
+ *                  the cursor and inserts each entry into the pool.
+ *
+ * Data-structure : ObjectPool — flat array of TObj{col, row, up, glyph}.
+ *                  Pattern tables are read-only in §7.
+ *
+ * The trick      : target_up is ABSOLUTE — orientation depends on
+ *                  (col + row) parity in the equilateral lattice, so
+ *                  storing a delta would flip the stamp's silhouette
+ *                  every other position.
+ *
+ * Iso twist      : The background is solid-filled by palette_index.
+ *                  Stamped glyphs render in PAIR_CURSOR (white-on-black)
+ *                  so they pop on any palette colour.
+ *
+ * References     :
+ *   Triangular tiling — https://en.wikipedia.org/wiki/Triangular_tiling
+ *   Object pool pattern — gameprogrammingpatterns.com/object-pool.html
+ *   Linear congruential generator — Numerical Recipes ch. 7
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Same stamp mechanic as 01_equilateral_patterns; the underlying paint
+ * is solid colour fills instead of edge characters. Patterns are
+ * unaware of paint — they manipulate addresses (col, row, up). The
+ * iso colour wheel decorates the background; stamped glyphs sit on
+ * top in a contrasting cursor colour.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Rubber stamps on an iso "wall of cubes". Each pattern (RING, LINE,
+ * STAR, TRI, SCATTER) is a fixed-offset list; pressing the stamp at
+ * the cursor lands a glyph at every offset address. Cubes underneath
+ * keep their colours; the glyph row pops in white-on-black.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. Raster scan: pixel_to_tri → palette_index → fill pair →
+ *     mvaddch(' ').
+ *  3. pool_draw — every placed object's glyph at its centroid cell
+ *     using PAIR_CURSOR.
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Stamping (only on key press):
+ *    pattern_stamp(pool, PAT_xxx, cur.col, cur.row, glyph)
+ *      for each entry (Δc, Δr, up_abs):
+ *        pool_add(pool, cur.col+Δc, cur.row+Δr, up_abs, glyph)
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pattern entry shape:  (Δcol, Δrow, target_up)        [3-tuple]
+ *  Sentinel:             { 0xDEAD, 0, 0 }
+ *
+ *  Centroid lattice → pixel  (h = size · √3 / 2):
+ *    ▽: a = col + 1/3,  b = row + 1/3
+ *    △: a = col + 2/3,  b = row + 2/3
+ *    px = (a + 0.5·b) · size,  py = b · h
+ *
+ *  Palette hash (paints background only):
+ *    k = (col + 2·row + up) mod N_PALETTE
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Theme cycle: 't' rebuilds palette pairs; objects keep addresses.
+ *    Same stamp may sit over a different colour after theme change.
+ *  • Glyph cycle, MAX_OBJ cap, dedup: identical to
+ *    01_equilateral_patterns.c.
+ *  • SCATTER at high density on top of patterns can fill MAX_OBJ
+ *    quickly. SPACE clears.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Press '1' (RING) at origin: 6 stamped glyphs around the cursor on
+ *  visibly different palette colours. Press 't': background recolours
+ *  but the same triangles still hold the glyphs.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

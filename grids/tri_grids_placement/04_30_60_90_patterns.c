@@ -51,6 +51,64 @@
  *
  * References     :
  *   Equilateral tiling — https://en.wikipedia.org/wiki/Triangular_tiling
+ *   Kisrhombille tiling — https://en.wikipedia.org/wiki/Kisrhombille_tiling
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Rubber-stamp placement on the kisrhombille — but the stamps address
+ * WHOLE equilaterals (col, row, up), not the 30-60-90 sub-triangles.
+ * The medians render automatically in grid_draw and form a backdrop
+ * for the stamped glyphs at parent centroids.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Same as 01_equilateral_patterns: each pattern is a static list of
+ * relative addresses; pressing a digit translates the list by the
+ * cursor. The medians are visual extras only — patterns are unaware
+ * of them.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — equilateral edges + 3-median proximity overlay.
+ *  3. pool_draw — every placed object's glyph at its centroid cell.
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Stamping (only on key press):
+ *    pattern_stamp(pool, PAT_xxx, cur.col, cur.row, glyph)
+ *      for each entry (Δc, Δr, up_abs):
+ *        pool_add(pool, cur.col+Δc, cur.row+Δr, up_abs, glyph)
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pattern entry shape:  (Δcol, Δrow, target_up)        [3-tuple]
+ *  Sentinel:             { 0xDEAD, 0, 0 }
+ *  Iteration:            for i in 0..; while !IS_END(pat[i])
+ *
+ *  Why ABSOLUTE target_up: equilateral orientation depends on
+ *  (col+row) parity, so a delta would flip the stamp's silhouette
+ *  every other position. Storing absolute orientations keeps the
+ *  stamp shape invariant under translation.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Medians under glyphs: every parent centroid is the median
+ *    concurrent point. The glyph paints over the median ink.
+ *  • MAX_OBJ cap, glyph cycle, scatter seed: identical to
+ *    01_equilateral_patterns.c.
+ *  • Patterns ADD, not REPLACE: stamping the same pattern twice at
+ *    the same cursor has no effect (pool_add deduplicates).
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Press '1' (RING): exactly 6 stamped triangles around the cursor.
+ *  Each stamped triangle still shows its 3 medians beneath the glyph.
+ *  Press '4' (TRI): 4 entries forming a triforce — three corners
+ *  plus the inverted centre.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

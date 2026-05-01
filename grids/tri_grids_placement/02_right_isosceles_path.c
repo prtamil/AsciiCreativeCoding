@@ -2,14 +2,138 @@
 /*
  * 02_right_isosceles_path.c — line-of-sight path on the half-rect grid
  *
- * DEMO: Two markers (S/E) and the centroid-line walk between them.
- *       's' sets START at cursor; 'e' sets END. Path = triangles whose
- *       centroids the line passes through.
+ * DEMO: Two markers — START (green S) and END (red E) — sit on a square
+ *       grid bisected by '\' diagonals into UR / LL right-isosceles
+ *       triangles. Move '@' with arrows; press 's' to set START at the
+ *       cursor, 'e' to set END. The path between markers is computed by
+ *       walking pixel coordinates along the centroid-to-centroid line
+ *       and recording which triangle each sampled pixel lies in.
+ *
+ * Study alongside: 02_right_isosceles_direct.c (manual placement),
+ *                  grids/tri_grids/02_right_isosceles.c (rasterizer),
+ *                  01_equilateral_path.c (same idea on equilateral grid).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, MAX_OBJ
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 7 pairs: edge / cursor / start / end / path / HUD / hint
+ *   §4 formula  — pixel ↔ axis-aligned lattice + centroid + edge char
+ *   §5 pool     — PathPool: clear / contains / add / draw
+ *   §6 cursor   — TRI_DIR + step + draw + START / END markers
+ *   §7 path     — pixel walk between two centroids → triangle list
+ *   §8 scene    — grid_draw + scene_draw
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move  s:set-start  e:set-end  spc:clear-path
+ *        +/-:size  t:theme  r:reset  q/ESC:quit
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/02_right_isosceles_path.c \
  *       -o 02_right_isosceles_path -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Line-rasterize between two centroids in PIXEL space;
+ *                  for each sampled pixel, ask pixel_to_tri "which UR/LL
+ *                  triangle am I in?" and record uniques. The result is
+ *                  the ordered set of right-isosceles triangles traversed
+ *                  by the straight line — a "line of sight" path.
+ *
+ * Data-structure : PathPool — flat array of TPath{col, row, up}.
+ *                  path_add deduplicates via path_contains (linear scan;
+ *                  fine because paths stay short for any visible line).
+ *
+ * Why pixel walk : Graph BFS on the half-rect lattice would also work,
+ *                  but the pixel-walk is simpler and produces an
+ *                  intuitively "straight" path. Adjacent path entries
+ *                  always differ by exactly one edge crossing.
+ *
+ * Sampling step  : The pixel walk samples every ~size/4 pixels — fine
+ *                  enough that a unit-square triangle is never skipped.
+ *
+ * References     :
+ *   Bresenham line — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
+ *   Line-of-sight on grids — Red Blob Games
+ *   Half-rect tiling — https://en.wikipedia.org/wiki/Triangular_tiling
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Stretch a string from S to E on graph-paper-with-diagonals. The path
+ * is the ordered list of half-squares the string passes through. We
+ * find that list by walking the string in pixel space and asking the
+ * SAME pixel→lattice formula the grid uses, "which triangle owns this
+ * point?" — every unique answer joins the path.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * The grid is square cells split by '\'. Above the diagonal lives UR
+ * (up=1), below lives LL (up=0). The cursor walks half-squares; START
+ * and END pin two of them. The path is rediscovered each time a marker
+ * moves — no stored topology, just a fine 1-D scan through the same
+ * pixel_to_tri the renderer uses.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan: pixel_to_tri → tri_edge_char ('|', '_',
+ *     '\\') when min weight < BORDER_W.
+ *  3. path_draw — '*' at each PathPool entry's centroid screen cell.
+ *  4. marker_draw — 'S' at start (if has_start), 'E' at end.
+ *  5. cursor_draw — '@' at the cursor address.
+ *
+ *  path_compute runs only on START/END change or size change.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → lattice  (axis-aligned, no shear):
+ *    a = px / size,   b = py / size
+ *    col = ⌊a⌋,       row = ⌊b⌋
+ *    fa  = a - col,   fb  = b - row
+ *    up  = (fa ≥ fb) ? UR : LL
+ *
+ *  Centroid lattice → pixel:
+ *    UR centroid:  a = col + 2/3,  b = row + 1/3
+ *    LL centroid:  a = col + 1/3,  b = row + 2/3
+ *    px = a · size,   py = b · size
+ *
+ *  Walk parameters:
+ *    dx = ex - sx,   dy = ey - sy
+ *    dist = sqrt(dx² + dy²)
+ *    step = tri_size · 0.25
+ *    n    = floor(dist / step) + 1
+ *
+ *  Walk loop:
+ *    for i in 0..n:
+ *      t  = i / n
+ *      px = sx + t·dx,  py = sy + t·dy
+ *      pixel_to_tri(px, py) → (tC, tR, tU)
+ *      path_add(tC, tR, tU)         // dedup via path_contains
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Zero-length: when start == end, dist < 1e-6 returns early after
+ *    adding the start triangle.
+ *  • Sampling step: size/4 is fine for any reasonable angle; relaxing
+ *    to size/2 risks skipping a triangle the line crosses corner-on.
+ *  • MAX_OBJ cap: a long path can saturate; further entries are
+ *    silently dropped.
+ *  • Recompute on size change: '+'/'-' must call path_compute,
+ *    otherwise stored centroids drift.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Set START and END at the same triangle: path size = 1. Move END one
+ *  edge away (LEFT/RIGHT/UP/DOWN once): path size = 2. A purely
+ *  vertical line of length L pixels crosses ≈ L/size unit squares,
+ *  each contributing 1–2 entries depending on angle.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

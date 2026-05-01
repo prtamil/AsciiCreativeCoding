@@ -2,10 +2,139 @@
 /*
  * 02_right_isosceles_scatter.c — distance-colored scatter on the half-rect grid
  *
+ * DEMO: A random scatter of N triangles fills a square region around
+ *       the cursor on the UR/LL right-isosceles grid. Each triangle
+ *       is colored on a 6-stop gradient by its cell-distance from the
+ *       cursor — closer = warm, farther = cool. Press SPACE to reseed;
+ *       +/- to change density (N).
+ *
+ * Study alongside: 02_right_isosceles_direct.c (manual placement),
+ *                  02_right_isosceles_patterns.c (preset stamps),
+ *                  01_equilateral_scatter.c (same idea, equilateral).
+ *
+ * Section map:
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, SCATTER_RADIUS, DENSITY
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 6-bucket gradient palette + cursor / HUD / hint
+ *   §4 formula  — pixel ↔ axis-aligned lattice + centroid + edge char
+ *   §5 pool     — ScatterPool: clear / contains / add / draw
+ *   §6 cursor   — TRI_DIR + step + draw
+ *   §7 scatter  — pattern_scatter spawn + Manhattan distance bucket
+ *   §8 scene    — grid_draw + scene_draw
+ *   §9 screen   — ncurses init / cleanup
+ *  §10 app      — signals, main loop
+ *
+ * Keys:  arrows:move  spc:reseed  +/-:density  r:reset
+ *        t:theme  q/ESC:quit
+ *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/02_right_isosceles_scatter.c \
  *       -o 02_right_isosceles_scatter -lncurses -lm
  */
+
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Random scatter. Pick N random (Δcol, Δrow, up) within
+ *                  ±SCATTER_RADIUS of the cursor; color by Manhattan-
+ *                  style cell distance from cursor, bucketed into 6
+ *                  gradient slots.
+ *
+ * Data-structure : ScatterPool — flat array of (col, row, up) entries.
+ *                  Bucket assignment is recomputed every frame from the
+ *                  cursor's CURRENT position; the entries themselves
+ *                  only change on reseed.
+ *
+ * Distance metric: |Δcol| + |Δrow| + (Δup ? 1 : 0). Cheap, monotonic
+ *                  enough for a colouring demo on the half-rect grid.
+ *
+ * Re-seeding     : SPACE re-randomises with a new seed (xor'd by clock).
+ *                  +/- density ALSO triggers a reseed. Moving the
+ *                  cursor does NOT re-seed — but recolours the existing
+ *                  scatter as the cursor moves.
+ *
+ * References     :
+ *   Linear congruential generator — Numerical Recipes ch. 7
+ *   Half-rect tiling — https://en.wikipedia.org/wiki/Triangular_tiling
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Two halves: STORAGE (random scatter of half-square addresses,
+ * generated once per reseed) and COLOURING (a pure function of cursor
+ * distance, recomputed every frame). Moving the cursor never re-seeds;
+ * it only re-paints the existing scatter through a different distance
+ * lens.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine sprinkling salt on graph-paper-with-diagonals — grains land
+ * randomly inside a small square region. Now point a coloured
+ * spotlight (the cursor) at the cloth; grains close to the beam glow
+ * warm, grains farther away cool. Move the spotlight: same grains,
+ * different colours. SPACE re-sprinkles.
+ *
+ * DRAWING METHOD  (per frame)
+ * ──────────────
+ *  1. erase()
+ *  2. grid_draw — raster scan: pixel_to_tri → tri_edge_char ('|','_',
+ *     '\\').
+ *  3. For each scatter object:
+ *       d = |obj.col - cur.col| + |obj.row - cur.row|
+ *           + (obj.up != cur.up ? 1 : 0)
+ *       bucket = min(d, N_BUCKETS - 1)
+ *       attron(COLOR_PAIR(PAIR_BUCKET_0 + bucket))
+ *       mvaddch(centroid_screen, '*')
+ *  4. cursor_draw — '@' on top.
+ *
+ *  Reseed (only on SPACE or +/- density):
+ *    pool->count = 0
+ *    g_seed ^= clock_ns()
+ *    for i in 0..density:
+ *      dC = floor(frand·(2·R+1)) - R    ; dR = same
+ *      up = (frand > 0.5) ? UR : LL
+ *      pool_add(cur.col+dC, cur.row+dR, up)   // dedup
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel → lattice  (axis-aligned):
+ *    a = px / size,  b = py / size
+ *    col = ⌊a⌋,      row = ⌊b⌋
+ *    up  = (fa ≥ fb) ? UR : LL
+ *
+ *  Centroid lattice → pixel:
+ *    UR centroid:  a = col + 2/3,  b = row + 1/3
+ *    LL centroid:  a = col + 1/3,  b = row + 2/3
+ *    px = a · size,  py = b · size
+ *
+ *  Manhattan-style cell distance:
+ *    d = |Δcol| + |Δrow| + (Δup ? 1 : 0)
+ *
+ *  LCG step (Numerical Recipes ch. 7):
+ *    g_seed = g_seed · 1103515245 + 12345
+ *    frand  = ((g_seed >> 16) & 0x7FFF) / 32767.0
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Density saturation: at density values approaching MAX_OBJ the
+ *    pool fills and pool_add deduplicates. The visible scatter may
+ *    look thinner than the requested density.
+ *  • Manhattan vs true edge distance: on the half-rect lattice the
+ *    actual edge-walk distance involves the diagonal; Manhattan is a
+ *    fast proxy for short ranges.
+ *  • Reseed on cursor move: NOT triggered by design — moving the
+ *    cursor "rotates the spotlight" without disturbing the scatter.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  Place cursor in the middle of a freshly-seeded scatter — colours
+ *  are warmest near '@', cooling outward. Walk the cursor to the
+ *  edge: same dots remain, but the warm/cool boundary follows the
+ *  cursor.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>

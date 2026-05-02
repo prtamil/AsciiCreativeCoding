@@ -1495,6 +1495,92 @@ Master these five ideas and you understand not just `framework.c`, but every sim
 
 ---
 
+## Procedural Programs — Framework Conventions Applied
+
+The 20 programs in `procedural/` (split between `generational/` for
+discrete builders and `fields/` for continuous noise) all build on
+the framework described above. They share several conventions worth
+noting if you study or extend them:
+
+### Section layout follows the §1–§8 pattern, with two consistent additions
+
+`procedural/fields/` files use a 9-section layout (`§1` through `§9`)
+because the algorithm-specific noise primitives, patterns, and scene
+state need their own headings. The standard mapping:
+
+| § | Role | Procedural specifics |
+|---|---|---|
+| §1 | config | All tunable constants, the `Pattern` enum, the `themes[]` and `glyph_sets[]` literals |
+| §2 | clock | Unchanged from `framework.c` |
+| §3 | color | `theme_apply()` (re-installs band pairs) + `color_init()` (HUD-reserved + theme bootstrap) |
+| §5 | algorithm | Noise primitives (Perlin / Worley / curl / etc.) |
+| §6 | patterns | Per-pattern noise→glow mapping functions |
+| §7 | scene | `Field` struct, `scene_tick`, state machine |
+| §8 | screen | ASCII render with density-graded glyphs |
+| §9 | app | Main loop, signal handlers — identical to framework |
+
+`procedural/generational/` files use the standard `§1–§8` layout
+because they don't separate "algorithm primitives" from "patterns".
+
+### The state-machine idiom
+
+Every procedural showcase has an explicit `SceneState` enum that
+drives `scene_tick`. Two common shapes:
+
+- **Generational (one-shot)**: typically 3–4 states like
+  `BUILDING / SOLVING / HOLD / supernova-reset`. The "supernova flash"
+  on reset is a yellow per-cell glow buffer that decays at
+  `SUPERNOVA_DECAY ~ 4.0/s`, providing a clear visual punctuation
+  between runs. Examples: `wfc_showcase.c`, `maze_backtracker.c`,
+  `bsp_dungeon_showcase.c`.
+
+- **Continuous fields**: simpler state — just `paused / running` — but
+  with a periodic "soft reset" every `~12 s` that re-shuffles the
+  noise permutation table. The pattern keeps animating; only the seed
+  changes. Examples: `perin_noise_flow_showcase.c`,
+  `simplex_noise_clouds.c`.
+
+### The `n`/`p` pattern, `t`/`T` theme, `g`/`G` glyph triad
+
+This 3-axis selector — algorithm pattern × colour theme × glyph
+density — is the hallmark of the `procedural/fields/` series. Each
+axis is independent, so a single file with 5 patterns / 10 themes /
+5 glyph sets exposes 250 distinct visual identities. The selector
+keys are themselves a framework-level convention now adopted by the
+project; new continuous-field programs should reuse them verbatim.
+
+### Buffer architecture: `trail_glow[]` + `trail_color[]` + `trail_glyph[]`
+
+Every `procedural/fields/` file uses three per-cell arrays:
+
+- `trail_glow[]` — `float [0, 1]`, the intensity that drives glyph
+  density (`.` low / `*` mid / `#` high in the default MEDIUM glyph
+  set)
+- `trail_color[]` — `uint8_t 0..3`, the band index into the active
+  theme's 4-colour palette
+- `trail_glyph[]` — `char`, optional override for patterns that need
+  a specific character (e.g. arrow glyphs `>`, `^`, `v`, `<`, `/`,
+  `\` in `flow_field_particles.c`'s VECTOR pattern)
+
+`scene_tick` populates the buffers (either via particle painting +
+decay for FLOW-style patterns, or full-grid rewrite for static
+patterns); `scene_draw` reads them with a uniform glyph-selection
+ladder.
+
+### Build pattern (identical to other animations)
+
+```
+gcc -std=c11 -O2 -Wall -Wextra <path>/<file>.c -o <name> -lncurses -lm
+```
+
+No headers shared between files — every procedural program is
+self-contained, including its inlined Perlin/simplex/Worley
+primitive (per the project's Self-Contained File Rule).
+
+*Files: `procedural/generational/*.c`, `procedural/fields/*.c`*
+
+---
+
 *Source file: `ncurses_basics/framework.c`*
 *Companion reference: `physics/bounce_ball.c` — the motion-physics reference implementation*
 *Build: `gcc -std=c11 -O2 -Wall -Wextra ncurses_basics/framework.c -o framework -lncurses -lm`*

@@ -5470,4 +5470,74 @@ Multi-octave fBm scalar field defines glowing gas density across the screen. Two
 
 ---
 
+## 179. Procedural Generation — `procedural/`
+
+The `procedural/` tree holds the project's procedural-generation
+showcases. All of these follow the standard §1–§8 framework
+architecture; the algorithm-specific code lives in §5 (state) and §6
+(state machine + scheduling). Two sub-folders separate the two
+families.
+
+### `procedural/generational/` — discrete, one-shot generators
+
+These programs **build** a structure step-by-step (split-by-split,
+cell-by-cell, point-by-point), animate the build process, then HOLD
+on the finished result before resetting. State machines typically run
+`BUILDING / CARVING / SOLVING / HOLD` then back to a fresh start.
+
+| File | Algorithm |
+|---|---|
+| `bsp_dungeon_showcase.c` | Recursive binary space partition + room placement + L-corridors (classic roguelike) |
+| `cellular_automata_cave_4-5_rule_showcase.c` | Random fill + iterated 4-5 rule, cell-by-cell sweep with double-buffer wavefront |
+| `delaunay_triangulation.c` | Bowyer-Watson incremental Delaunay (orientation-aware in-circumcircle predicate) |
+| `diamond_square_heightmap_showcase.c` | Diamond + square subdivision producing fractal terrain bands (water/beach/grass/hills/mountain/snow) with biome filter keys |
+| `drunkards_walk_cave_showcase.c` | Multi-walker random-walk cave carving with respawn on max-age |
+| `maze_backtracker.c` | DFS recursive-backtracker maze + tree-diameter solution beam (two BFS) |
+| `poission_disk_sampling_showcase.c` | Bridson's fast Poisson-disk sampler with 5×5 cell-grid lookup |
+| `voronoi_region_map.c` | 8-seed Voronoi with distance-sorted reveal (closest cells first) |
+| `wfc_learn.c` | Tile-based Wave Function Collapse — slowed down with entropy heatmap and step-through |
+| `wfc_showcase.c` | WFC with 34-tile alphabet (light/heavy/double weight classes), multi-seed, looping spectacle |
+| `wilsons_algorithms_maze_showcase.c` | Wilson's loop-erased random walk uniform spanning tree maze |
+
+### `procedural/fields/` — continuous noise + flow fields
+
+These animate **continuously** — there is no discrete "build" phase,
+the field evolves forever via time drift. Five patterns per file
+(navigated with `n`/`p`), 10 themes (`t`/`T`), and most include the
+slim→fat glyph-set selector (`g`/`G`).
+
+| File | Algorithm |
+|---|---|
+| `curl_noise_vector_field.c` | Divergence-free `(∂ψ/∂y, −∂ψ/∂x)` curl flow over a Perlin scalar potential. 5 visualisations: PARTICLES / VECTOR / POTENTIAL / CURL_MAG / WARPED |
+| `domain_warped_noise_iq_style.c` | Inigo Quilez recursive domain warping `f(x + h(x + g(x)))`. 5 patterns: RAW / WARP1 / WARP2 (canonical) / WARP3 / RIDGE |
+| `flow_field_particles.c` | Algebraic vector fields (no noise): VORTICES / WAVE / SADDLE / MAGNET / TURBULENT |
+| `magnetic_fields.c` | N/S magnetic-pole field-line viz with theme-independent red 'N' / blue 'S' markers. 5 configs: DIPOLE / QUAD / OCTUPOLE / CHAIN / PLASMA |
+| `midpoint_displacement_coastline.c` | 1-D fractal silhouettes via midpoint displacement, with smooth A→B morphing. 5 patterns: COASTLINE / MOUNTAINS / CITY / VALLEY / WAVES |
+| `perin_noise_flow_showcase.c` | Particles flowing along the Perlin gradient angle. 5 patterns: FLOW / HEIGHT / WARP / FBM / CONTOUR |
+| `reaction_diffusion_gray_scott.c` | Gray-Scott PDE (explicit Euler + 5-point Laplacian, NEUMANN boundary). 5 morphology presets from Pearson 1993: SPOTS / STRIPES / MAZES / CORAL / WORMS |
+| `simplex_noise_clouds.c` | Ken Perlin's 2001 simplex noise — isotropic alternative to Perlin. 5 cloud patterns: CLOUDS / WISPS / TURBULENCE / BILLOW / RIDGED |
+| `worley_cellular_noise.c` | Steven Worley's cellular noise via 3×3 tile-grid lookup. 5 patterns: F1 / F2_F1 / F2 / MANHATTAN / CELL_ID |
+
+### Shared UX skeleton (all `procedural/fields/`)
+
+- **`n` / `p`** — next / previous pattern
+- **`t` / `T`** — next / previous theme (10 named palettes: DEFAULT, MATRIX, NOVA, MONO, OCEAN, FIRE, EARTH, FOREST, DESERT, ARCTIC)
+- **`g` / `G`** — next / previous glyph set (slim → fat: SLIM, LIGHT, MEDIUM, HEAVY, FAT)
+- **`r`** reset, **`space`** pause, **`+/-`** speed, **`q`** quit
+
+HUD layout is standardised: row 0 left = title, row 0 right = primary
+state; row 1 left = pattern + theme + 4-colour palette swatches; row 1
+right = glyph-set indicator with 3-char preview; bottom = key hints in
+PAIR_HINT.
+
+### Documentation cross-reference
+
+Per-algorithm concept docs live at
+`documentation/learning/concept_procedural_index.md` (master index)
+plus individual `concept_*.md` files for each technique.
+
+*Files: `procedural/generational/*.c`, `procedural/fields/*.c`*
+
+---
+
 *This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `physics/bounce_ball.c`.*

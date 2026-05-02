@@ -134,6 +134,67 @@ Examples of good references:
 - A textbook chapter (e.g. "Game Physics Engine Development — Millington §12")
 - A web resource (e.g. Inigo Quilez SDF functions, Red Blob Games pathfinding)
 
+## MENTAL MODEL Block (mandatory, after CONCEPTS, before §1)
+
+CONCEPTS names the algorithm; MENTAL MODEL teaches a learner to *think* in
+it. After the CONCEPTS block, add a `/* ── MENTAL MODEL ── */` block with
+these six fixed sub-headings, in this order:
+
+```c
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * <One paragraph. The single sentence a learner should walk away with —
+ *  the "aha" that makes the rest fall into place. No code.>
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * <Analogy or metaphor that anchors the algorithm in everyday intuition.
+ *  Graph paper, cellular automaton, conveyor belt, billiard balls — pick
+ *  the closest physical or visual object the learner already understands.>
+ *
+ * DRAWING METHOD  /  ALGORITHM IN STEPS
+ * ─────────────────────────────────────
+ * <Numbered steps the algorithm follows each frame or each iteration.
+ *  Plain English, not pseudocode. A learner reading only this section
+ *  should be able to reimplement the algorithm from scratch.>
+ *
+ * KEY FORMULAS
+ * ────────────
+ * <Every non-trivial equation used in the file, in math-like form with a
+ *  one-line gloss. Forward AND inverse mappings if both exist.>
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ * <Bulleted list of subtle things that bite. Boundary conditions, off-
+ *  by-one traps, resize handling, what happens at min/max parameter
+ *  values, contradictions/contradictory states, etc.>
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ * <Concrete sanity checks: counts a learner can do by hand, expected
+ *  values at sentinel inputs, what should happen when a parameter is
+ *  doubled. The "if I'm not sure it's working, here's how I'd tell."
+ *  section.>
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+```
+
+The canonical reference for this block is `grids/rect_grids/01_uniform_rect.c`
+— study its MENTAL MODEL block before writing your own. It demonstrates the
+right level of detail: enough that a learner can reimplement, not so much
+that the actual code feels redundant.
+
+CONCEPTS vs MENTAL MODEL — the distinction:
+- **CONCEPTS** answers "what is this and where do I read more?" — algorithm
+  name, data structure, references. Skim-friendly, citation-style.
+- **MENTAL MODEL** answers "how do I think in this algorithm?" — analogies,
+  steps, formulas, traps. The "if you read only one comment block, read this
+  one" section.
+
+Both are mandatory in every new file. Do not collapse them.
+
 ## Named Constants — No Magic Numbers
 
 Every literal that carries meaning belongs in `§1 config` as a named constant.
@@ -256,24 +317,89 @@ There is no test suite. "Done" means all five of these:
 
 ## HUD Standard
 
-Every program has two fixed UI elements. Follow this layout exactly:
+Every program has two fixed UI elements. Follow this layout and these
+colours exactly — the HUD must remain legible against ANY animation
+behind it (dark or bright, sparse or dense), so it always uses
+**high-contrast bright colours and `A_BOLD`. Never `A_DIM`.**
+
+Required colour pairs (define these in `§3 color_init()` for every demo):
+
+```c
+/* §3 color_init() — HUD pairs are reserved IDs across all demos.
+ * Use 256-colour codes when COLORS >= 256, fall back to basic-8 below. */
+init_pair(PAIR_HUD,  226, -1);   /* bright yellow on default bg */
+init_pair(PAIR_HINT,  51, -1);   /* bright cyan   on default bg */
+/* 8-colour fallback: COLOR_YELLOW for HUD, COLOR_CYAN for HINT.   */
+```
+
+Required draw block — the hint strip uses `A_BOLD` (NOT `A_DIM`) so it
+stays readable when a bright animation flashes behind it:
 
 ```c
 /* §7 screen_draw() — top-right: fps + params + state */
-char buf[64];
+char buf[80];
 snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  %s ",
          fps, sim_fps, paused ? "PAUSED " : "running");
-attron(COLOR_PAIR(3) | A_BOLD);
+attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 mvprintw(0, cols - (int)strlen(buf), "%s", buf);
-attroff(COLOR_PAIR(3) | A_BOLD);
+attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-/* bottom-left: one-line key hint strip */
-attron(COLOR_PAIR(6) | A_DIM);
+/* bottom-left: one-line key hint strip — A_BOLD, never A_DIM */
+attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 mvprintw(rows - 1, 0, " q:quit  spc:pause  r:reset  +/-:<param> ");
-attroff(COLOR_PAIR(6) | A_DIM);
+attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 ```
 
-The key hint at the bottom must list every interactive key the program uses.
+Why these specific colours:
+- **226 (bright yellow)** for the status — pops against blue/red/green
+  animations, dim enough to not glare on a black background.
+- **51 (bright cyan)** for the hint — distinct hue from any common
+  particle/fire/plasma palette, so the hint never camouflages.
+- **`A_BOLD` on both** — many terminals render bold as a brighter shade
+  of the foreground; combined with the already-bright 256-colour codes
+  the HUD becomes near-white-bright, readable on every animation.
+
+The key hint at the bottom must list every interactive key the program
+uses. If the demo has a SECOND status line (e.g. parameter readouts), it
+sits at `row 1` using `PAIR_HUD` without `A_BOLD` so the primary status
+on `row 0` remains the dominant element.
+
+---
+
+## ASCII-Only Rendering
+
+**All runtime glyphs must be ASCII (codepoints 0x20–0x7E). No UTF-8
+box-drawing, no Unicode block elements, no multi-byte characters in
+`mvaddch` / `mvaddstr` output.**
+
+Why: Unicode rendering depends on the user's terminal locale, font, and
+ncurses link variant. On non-UTF-8 locales the multi-byte sequences
+arrive as garbled bytes (e.g. `─` becomes `MMM`-style mojibake). ASCII
+renders identically on every terminal.
+
+The classic ASCII vocabulary covers every common simulation:
+
+| Need | Use | Don't use |
+|---|---|---|
+| Horizontal line / wall  | `-`              | `─` `━` `═` |
+| Vertical line / wall    | `\|`              | `│` `┃` `║` |
+| Corners and junctions   | `+`              | `┌┐└┘├┤┬┴┼` |
+| Filled cell / particle  | `#` `*` `@` `O`  | `█` `▓` `▒` |
+| Trail / dot             | `.` `,` `'` `` ` `` | `·` `•` |
+| Diagonal hint           | `/` `\`          | `╱` `╲` |
+
+Distinguish similar tile types by **colour, intensity, and animation**,
+not by glyph variety. wfc_showcase.c demonstrates the pattern: 33
+junction tiles all render as `+`, with weight classes encoded in three
+distinct colour pairs (cyan / pink / gold).
+
+**Comment dividers** like `── §1 config ──` are exempt — they're source
+text, not runtime output, and are part of the established project style.
+
+**`setlocale(LC_ALL, "")`** in `screen_init()` is no longer required for
+new files. Leave it out unless a specific reason demands it; if a future
+file does use UTF-8 output, justify the choice in a comment and add the
+build-time fallback (8-colour locale-C path).
 
 ---
 

@@ -1420,3 +1420,84 @@ The stochastic per-cell substitution gives a natural "fading away" feel, since t
 **Screen shake interacts with colour at the `mvaddch` boundary only:** the colour pair is selected from the unshaken physics, then the destination cell is offset by `(shake_r, shake_c)`. The simulation never sees the shake; the colour never sees the shake; only the final `mvaddch` knows.
 
 *Files: `physics/nuke.c`*
+
+---
+
+## Procedural Programs — Themed Palettes (`procedural/`)
+
+The `procedural/fields/` subfolder establishes a **standard 10-theme
+naming scheme** reused across every continuous-field showcase. Each
+theme defines 4 palette colours plus a flash accent, all
+re-installable at runtime via `init_pair()` when the user presses
+`t`/`T`.
+
+### The 10 standard theme names
+
+| Name | Vibe | Typical 4-band 256-colour ramp |
+|---|---|---|
+| `DEFAULT` | Sky/sand/green | 33 / 117 / 220 / 231 (blue → cyan → gold → white) |
+| `MATRIX` | Cyberpunk green | 22 / 34 / 46 / 118 (4 shades of green) |
+| `NOVA` | Cosmic purple/pink | 53 / 129 / 201 / 219 (purple → magenta) |
+| `MONO` | Greyscale gradient | 234 / 244 / 250 / 254 |
+| `OCEAN` | Navy → cyan | 17 / 33 / 39 / 51 |
+| `FIRE` | Volcanic | 52 / 124 / 208 / 226 |
+| `EARTH` | Brown / cream | 58 / 100 / 173 / 230 |
+| `FOREST` | Dark green → tan | 22 / 28 / 64 / 144 |
+| `DESERT` | Warm sandy | 94 / 130 / 173 / 222 |
+| `ARCTIC` | Navy → ice → white | 18 / 39 / 159 / 231 |
+
+Each file's `themes[]` array is a static `Theme[N_THEMES]` literal so
+themes are zero-cost at startup. Switching themes calls only
+`init_pair()` for the 4 (or more) per-theme pairs; `PAIR_HUD` and
+`PAIR_HINT` (per CLAUDE.md HUD Standard) stay theme-independent.
+
+### Pattern: themes are decoupled from algorithm
+
+Per the `procedural/` design pattern, the noise / particle
+algorithm itself is **theme-blind** — it produces a scalar `glow ∈
+[0, 1]` and a `band ∈ {0, 1, 2, 3}`. The render layer maps these to
+`COLOR_PAIR(PAIR_BAND_BASE + band)` with the active theme already
+installed. Every theme produces visually distinct output for the
+same algorithm seed without touching the algorithm.
+
+### Two file-specific deviations
+
+1. **`magnetic_fields.c`** uses theme-independent **red 'N'** and
+   **blue 'S'** for pole markers (physics convention) on top of the
+   themed trails. Polarity stays unambiguous regardless of the
+   background colour scheme.
+2. **`midpoint_displacement_coastline.c`** uses an **all-light**
+   variant of the standard themes (lowest band shifted from 17 → 39,
+   etc.) because that file paints solid vertical fills below its
+   silhouette lines. Dark fills become invisible on dark terminal
+   backgrounds; the lifted palette stays readable everywhere. See
+   the in-file comment block above its `themes[]` array.
+
+### Glyph sets — the slim→fat density ramp
+
+Independent from themes, every `procedural/fields/` file (where
+applicable) includes a 5-step glyph-set selector via `g`/`G`:
+
+| Set | Low | Mid | High |
+|---|---|---|---|
+| `SLIM` | `.` | `'` | `:` |
+| `LIGHT` | `.` | `*` | `+` |
+| `MEDIUM` (default) | `.` | `*` | `#` |
+| `HEAVY` | `o` | `O` | `@` |
+| `FAT` | `+` | `#` | `M` |
+
+Theme + glyph-set are **orthogonal axes** — any of the 10 themes
+combined with any of the 5 glyph sets gives 50 distinct visual
+identities per pattern. With 5 patterns, that's 250 visual
+variations per file.
+
+### Concrete files using this scheme
+
+`curl_noise_vector_field.c`, `domain_warped_noise_iq_style.c`,
+`flow_field_particles.c`, `magnetic_fields.c`,
+`midpoint_displacement_coastline.c`, `perin_noise_flow_showcase.c`,
+`reaction_diffusion_gray_scott.c`, `simplex_noise_clouds.c`,
+`worley_cellular_noise.c` — and the related `procedural/generational/`
+showcases like `voronoi_region_map.c` and `diamond_square_heightmap_showcase.c`.
+
+*Files: `procedural/fields/*.c`, `procedural/generational/*.c`*

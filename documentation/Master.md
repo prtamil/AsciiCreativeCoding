@@ -2711,4 +2711,267 @@ Front-to-back (rather than back-to-front) lets you bail when `T` drops below the
 
 ---
 
+# X — Procedural Generation (`procedural/`)
+
+The procedural family covers the algorithmic toolkit for building
+worlds, terrain, mazes, fields, and other generative content. Each
+program in `procedural/generational/` and `procedural/fields/`
+implements a specific algorithm with full teaching scaffolding
+(CONCEPTS + MENTAL MODEL blocks per CLAUDE.md). Below is the
+algorithm essay for each — what it does, when to reach for it, and
+how to extend it past what's implemented.
+
+## X.1 Wave Function Collapse — `wfc_learn.c`, `wfc_showcase.c`
+
+Pick the cell with the fewest remaining tile options (lowest
+entropy), commit it to one tile, propagate the constraint outward
+(every neighbour discards tiles whose connecting edge no longer
+matches), repeat until every cell has exactly one tile. The result is
+a globally-consistent tiling — pipes always connect, dungeon-tile
+walls always meet, etc. — without backtracking on most random inputs.
+
+**Algorithm:** AC-3 style constraint propagation with min-entropy
+heuristic and uniform tile pick. Each cell is a uint16_t bitmask
+(`wfc_learn`) or uint64_t (`wfc_showcase`, 34-tile alphabet).
+
+**References:** Maxim Gumin's original 2016 GitHub repo; Karth & Smith
+2017 academic framing; Boris-the-Brave's tile-based tutorial.
+
+*Files: `procedural/generational/wfc_learn.c` (12 tiles, slow with
+entropy heatmap and step-through), `procedural/generational/wfc_showcase.c`
+(34 tiles in three weight classes, multi-seed, looping spectacle).*
+
+## X.2 Recursive-Backtracker DFS Maze — `maze_backtracker.c`
+
+A "drunkard with chalk" walks a depth-first random path, carving
+walls behind it. When stuck, it backtracks along its trail until it
+finds a side-passage. Result: a perfect maze (uniform spanning tree)
+with long winding corridors. Plus a tree-diameter solution beam (two
+BFS passes) renders the longest path.
+
+**References:** Jamis Buck's recursive-backtracker tutorial; standard
+graph-algorithm "tree diameter via 2 BFS" trick.
+
+*Files: `procedural/generational/maze_backtracker.c`.*
+
+## X.3 Wilson's Algorithm — `wilsons_algorithms_maze_showcase.c`
+
+Loop-erased random walk uniform spanning tree. Walk randomly from an
+outside cell; whenever the walk crosses itself, ERASE the looped
+portion. When the walk hits the existing tree, absorb the path. The
+resulting spanning tree is uniformly distributed over all possible
+spanning trees — a much stronger property than DFS's biased trees.
+
+**References:** Wilson 1996 "Generating random spanning trees more
+quickly than the cover time".
+
+*Files: `procedural/generational/wilsons_algorithms_maze_showcase.c`.*
+
+## X.4 Diamond-Square Heightmap — `diamond_square_heightmap_showcase.c`
+
+Fournier-Fussell-Carpenter 1982. Start with corner heights; each
+iteration: DIAMOND step (set every square's centre to its 4 corners'
+average + jitter), then SQUARE step (set every cross midpoint to its
+4 cardinal neighbours' average + jitter). Halve the jitter
+amplitude each level. Output is fractal terrain that, with a height
+ramp, looks like real coastlines and mountains.
+
+**References:** Fournier, Fussell & Carpenter 1982 (CACM).
+
+*Files: `procedural/generational/diamond_square_heightmap_showcase.c`.*
+
+## X.5 Midpoint Displacement (1-D) — `midpoint_displacement_coastline.c`
+
+The 1-D ancestor of Diamond-Square. Recursively split a line segment
+and displace each midpoint by random jitter. Used in the Star Trek
+II Genesis effect (1982) for planet horizons. Five silhouette
+patterns: COASTLINE / MOUNTAINS / CITY / VALLEY / WAVES with smooth
+A→B morphing.
+
+*Files: `procedural/fields/midpoint_displacement_coastline.c`.*
+
+## X.6 Cellular-Automata Cave (4-5 rule) — `cellular_automata_cave_4-5_rule_showcase.c`
+
+Random 45 % wall fill, then iterate the rule "cell becomes WALL iff
+≥ 5 of its 8 Moore neighbours are walls". After ~4 passes the noise
+self-organises into rounded organic caves. Out-of-grid neighbours
+count as walls so caves don't reach the map edge.
+
+*Files: `procedural/generational/cellular_automata_cave_4-5_rule_showcase.c`.*
+
+## X.7 Drunkard's Walk Cave — `drunkards_walk_cave_showcase.c`
+
+Multi-walker random-walk carving. Each walker picks a random
+direction every tick and floods a cell to FLOOR. Walkers respawn
+after `WALKER_MAX_AGE` ticks at a random already-floor cell to
+prevent edge-meandering. Stops at 45 % carved fraction.
+
+*Files: `procedural/generational/drunkards_walk_cave_showcase.c`.*
+
+## X.8 BSP Dungeon — `bsp_dungeon_showcase.c`
+
+Recursive binary space partition: split rectangles along their longer
+axis until below MIN_LEAF size. Place a smaller room inside each
+leaf with random padding. Connect siblings with L-corridors via
+post-order traversal. Result: the classic roguelike dungeon
+(Rogue / NetHack lineage).
+
+**References:** Jamis Buck "Rooms and Mazes"; RogueBasin Basic BSP
+Dungeon tutorial.
+
+*Files: `procedural/generational/bsp_dungeon_showcase.c`.*
+
+## X.9 Voronoi Region Map — `voronoi_region_map.c`
+
+Brute-force nearest-seed assignment for each cell. Pre-compute every
+cell's owner + squared distance, sort cells by distance, reveal in
+distance order — produces visible "wave" expansion from each seed.
+
+*Files: `procedural/generational/voronoi_region_map.c`.*
+
+## X.10 Bowyer-Watson Delaunay — `delaunay_triangulation.c`
+
+Incremental Delaunay triangulation. Start with a "super-triangle"
+covering the map. Insert each point: find triangles whose
+circumcircle contains the point ("bad" triangles), remove them, fan
+new triangles from each cavity-boundary edge to the new point.
+Filter super-triangle artefacts at render time.
+
+**References:** Bowyer 1981, Watson 1981; the in-circle test is
+standard 3×3 determinant with orientation correction.
+
+*Files: `procedural/generational/delaunay_triangulation.c`.*
+
+## X.11 Bridson Poisson-Disk Sampling — `poission_disk_sampling_showcase.c`
+
+Maintains an active list of accepted points. For each, generate
+candidates in the annulus `[r, 2r]` around it and check them against
+a background grid (cell size `r/√2` so each cell holds ≤ 1 sample).
+Accept the first valid candidate, push it onto the active list. After
+K=30 attempts on any active point, drop it. The result is "blue
+noise" — points uniformly spaced with no two closer than `r`.
+
+**References:** Bridson 2007 "Fast Poisson Disk Sampling in Arbitrary
+Dimensions".
+
+*Files: `procedural/generational/poission_disk_sampling_showcase.c`.*
+
+## X.12 Perlin Noise Flow — `perin_noise_flow_showcase.c`
+
+Particle advection through `angle = perlin(x · scale, y · scale + t) ·
+π`. Particles step in the local field direction, leaving fading
+trails. Five visualisations: FLOW / HEIGHT / WARP / FBM / CONTOUR.
+
+**References:** Perlin 1985 "An image synthesizer"; Perlin 2002
+"Improving noise" (the quintic fade curve we use).
+
+*Files: `procedural/fields/perin_noise_flow_showcase.c`.*
+
+## X.13 Simplex Noise — `simplex_noise_clouds.c`
+
+Perlin's 2001 fix for the directional bias of his original 1985
+noise. Triangular simplex lattice + 12-direction gradients +
+quintic fade curve. Faster than Perlin (3 vs 4 corner contributions
+in 2-D) and more isotropic.
+
+**References:** Perlin 2001; Stefan Gustavson "Simplex noise demystified".
+
+*Files: `procedural/fields/simplex_noise_clouds.c`.*
+
+## X.14 Worley Cellular Noise — `worley_cellular_noise.c`
+
+Hash-determined feature points one per integer tile. For any query,
+find the F1 (nearest) and F2 (second-nearest) feature-point distances
+across the 3×3 surrounding tiles. Different functions of (F1, F2)
+give different visualisations: F1 alone for blobs, F2-F1 for sharp
+boundary lines, etc.
+
+**References:** Worley 1996 "A cellular texture basis function";
+Inigo Quilez "Voronoise".
+
+*Files: `procedural/fields/worley_cellular_noise.c`.*
+
+## X.15 Domain Warping (IQ Style) — `domain_warped_noise_iq_style.c`
+
+Recursive coordinate warping `f(x + h(x + g(x)))`. Each warp level
+multiplies the visual richness — by the second level you get the
+classic IQ "marble" pattern. Five depths from RAW (no warp) through
+WARP3 (3-level) plus a RIDGE variant.
+
+**References:** Inigo Quilez "Domain warping" article on iquilezles.org.
+
+*Files: `procedural/fields/domain_warped_noise_iq_style.c`.*
+
+## X.16 Curl Noise (Divergence-Free) — `curl_noise_vector_field.c`
+
+`v = (∂ψ/∂y, −∂ψ/∂x)` of a scalar potential ψ — divergence-free by
+construction (∇·v = 0). Particles flowing through it swirl into
+eternal vortices, never converging or diverging. The standard
+graphics tool for fluid/smoke effects without explicit PDE solvers.
+
+**References:** Bridson, Houriham & Nordenstam 2007 SIGGRAPH "Curl-
+Noise for Procedural Fluid Flow".
+
+*Files: `procedural/fields/curl_noise_vector_field.c`.*
+
+## X.17 Algebraic Vector Fields — `flow_field_particles.c`
+
+Closed-form mathematical vector fields (no noise): VORTICES,
+WAVE, SADDLE, MAGNET, TURBULENT. Useful as the textbook taxonomy
+of 2-D dynamical systems behaviours — every undergraduate phase-plane
+example in one file.
+
+**References:** Strogatz "Nonlinear Dynamics and Chaos", chapters on
+phase plane analysis.
+
+*Files: `procedural/fields/flow_field_particles.c`.*
+
+## X.18 Magnetic Fields — `magnetic_fields.c`
+
+Inverse-square magnetic monopole field `B = Σᵢ qᵢ · (r − rᵢ) / |r − rᵢ|³`.
+Particles flowing through reveal the iron-filings pattern. N/S poles
+render in theme-independent red/blue (physics convention) on top of
+the themed trails.
+
+**References:** any high-school physics textbook; Griffiths
+"Introduction to Electrodynamics".
+
+*Files: `procedural/fields/magnetic_fields.c`.*
+
+## X.19 Reaction-Diffusion (Gray-Scott) — `reaction_diffusion_gray_scott.c`
+
+Coupled PDE on two chemical concentrations U and V. Each iteration
+applies a 5-point Laplacian for diffusion plus the U + 2V → 3V
+reaction with feed-rate F and kill-rate (F+k). Different (F, k)
+choices produce SPOTS / STRIPES / MAZES / CORAL / WORMS — the
+canonical Pearson 1993 morphology phase diagram.
+
+**References:** Gray & Scott 1983; Pearson 1993 "Complex Patterns in
+a Simple System" SCIENCE 261:189–192.
+
+*Files: `procedural/fields/reaction_diffusion_gray_scott.c`.*
+
+## X.20 The Shared `procedural/` Conventions
+
+Every program in `procedural/` follows the same architectural
+patterns:
+
+- §1–§8 (or §1–§9 for fields) layout
+- 10 standard themes (DEFAULT / MATRIX / NOVA / MONO / OCEAN / FIRE /
+  EARTH / FOREST / DESERT / ARCTIC) cycled with `t`/`T`
+- 5 algorithmic patterns cycled with `n`/`p`
+- 5 glyph sets (SLIM / LIGHT / MEDIUM / HEAVY / FAT) cycled with
+  `g`/`G` (where applicable)
+- Reserved HUD colour pairs per CLAUDE.md
+- Self-contained — no shared headers, every file inlines its own
+  Perlin / Worley / hash primitives
+
+This reuse means once you understand one file, the others are just
+"different algorithm in §5". The framework, themes, and UX are
+identical.
+
+*Files: `procedural/generational/*.c`, `procedural/fields/*.c`*
+
+---
+
 *Read the code, run the programs, change one constant at a time. That is how it becomes yours.*

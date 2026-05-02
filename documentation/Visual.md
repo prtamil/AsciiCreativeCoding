@@ -3362,4 +3362,188 @@ The critical detail: **clip every draw call to `[x0, x0+panel_w)`**. Without cli
 
 ---
 
-*This document is the single reference for all ncurses techniques used across the C files in this project. For fractal algorithms and IFS theory, see Master.md §P and §Q. For the overall loop architecture and subsystem details, see Architecture.md. For color-specific techniques, see COLOR.md.*
+# Procedural Showcases — Visual Techniques (`procedural/`)
+
+This section catalogues the ncurses visual techniques used across the
+20 procedural-generation showcases. The techniques are reusable
+beyond `procedural/`; many would benefit other simulations in this
+project too.
+
+## V-P1 — Density-Graded Glyph Ramp (Slim → Fat)
+
+A core idea in `procedural/fields/`: every cell's `trail_glow ∈ [0, 1]`
+maps to one of 3 ASCII glyphs by threshold:
+
+```
+glow > GLYPH_HIGH_THRESH (0.65) → high  (e.g. '#')
+glow > GLYPH_MID_THRESH  (0.30) → mid   (e.g. '*')
+glow > GLOW_THRESHOLD    (0.05) → low   (e.g. '.')
+```
+
+The 3-glyph triple is a **glyph set**, switchable at runtime via
+`g`/`G`. Five sets cover the slim→fat ramp:
+
+| Set | Low / Mid / High | Visual feel |
+|---|---|---|
+| `SLIM` | `.` / `'` / `:` | Wireframe, sparse |
+| `LIGHT` | `.` / `*` / `+` | Small but visible |
+| `MEDIUM` | `.` / `*` / `#` | Standard default |
+| `HEAVY` | `o` / `O` / `@` | Round, dense |
+| `FAT` | `+` / `#` / `M` | Maximum coverage |
+
+Visual identity decouples completely from algorithm: a cyan `MEDIUM`
+flow looks like wires, the same flow with `HEAVY` looks like rolling
+bubbles, with `FAT` looks like sloshing fluid. Same physics; same
+data; different **density representation**.
+
+*Files: `procedural/fields/flow_field_particles.c` (origin),
+`procedural/fields/curl_noise_vector_field.c`,
+`procedural/fields/magnetic_fields.c`,
+`procedural/fields/midpoint_displacement_coastline.c`, et al.*
+
+## V-P2 — Theme-Decoupled Rendering (10 Named Palettes)
+
+Algorithm produces `glow ∈ [0, 1]` and `band ∈ {0..3}`. Render layer
+draws via `COLOR_PAIR(PAIR_BAND_BASE + band)`. The 4 band pairs are
+re-installed at runtime via `init_pair()` whenever the user presses
+`t`/`T` — algorithm code stays theme-blind.
+
+10 standard theme names (DEFAULT, MATRIX, NOVA, MONO, OCEAN, FIRE,
+EARTH, FOREST, DESERT, ARCTIC) appear in every continuous-field
+file. Theme + glyph set + algorithm pattern form three orthogonal
+axes — a single file with 5 patterns × 10 themes × 5 glyph sets has
+**250 distinct visual identities**.
+
+*Files: all `procedural/fields/*.c` and most `procedural/generational/*.c`.*
+
+## V-P3 — Bresenham Line Drawing for Triangulation Edges
+
+`delaunay_triangulation.c` renders each triangle's three edges
+cell-by-cell using Bresenham's integer-only line algorithm. Per-edge
+glyph is chosen by the line's dominant slope:
+
+```
+|dx| > 2|dy|  → '-'    (mostly horizontal)
+|dy| > 2|dx|  → '|'    (mostly vertical)
+dx · dy > 0   → '\\'   (down-right diagonal)
+dx · dy < 0   → '/'    (up-right diagonal)
+```
+
+`attron`/`attroff` set once per edge (cheaper than per-cell).
+Triangles touching the super-triangle vertices (indices 0–2) are
+skipped at render — that's the on-the-fly scaffold filtering.
+
+*Files: `procedural/generational/delaunay_triangulation.c`.*
+
+## V-P4 — Wavefront Reveal (Cell Sweep with Double Buffer)
+
+`cellular_automata_cave_4-5_rule_showcase.c` advances cell-by-cell
+through each iteration's pass. Cells with `idx < sweep_idx` show
+their NEW state (next_tiles), cells `≥ sweep_idx` show their OLD
+state. A clear horizontal wavefront crawls top-left → bottom-right;
+cells that flipped flash bright in the theme accent.
+
+This trick makes ALGORITHMIC PROGRESS visible. Without the sweep,
+the user sees a discrete jump every iteration, which loses the
+educational value of "cells decide their fate based on neighbours".
+
+*Files: `procedural/generational/cellular_automata_cave_4-5_rule_showcase.c`.*
+
+## V-P5 — Distance-Sorted Reveal (Voronoi Wave Expansion)
+
+`voronoi_region_map.c` pre-computes every cell's owner + squared
+distance to its owning seed. It then sorts cells by distance and
+reveals them in distance order — closest cells first. Visually:
+coloured waves expand from each seed simultaneously, meeting at
+the perpendicular-bisector boundaries of the Voronoi diagram.
+
+The reveal animation **encodes the Voronoi geometry itself** —
+without it you'd see a flat raster sweep that hides the structure.
+
+*Files: `procedural/generational/voronoi_region_map.c`.*
+
+## V-P6 — Pole / Attractor Markers Layered On Top
+
+`magnetic_fields.c` and `flow_field_particles.c` render their
+field-source markers (`'N'`, `'S'`, or `'@'` for vortex/magnet
+centres) as a SECOND PASS after the trail field. The markers always
+appear on top of any trail cell that happens to coincide with a
+pole.
+
+For `magnetic_fields.c` the marker colours are **theme-independent**
+(red 'N', blue 'S' — physics convention) so polarity stays
+unambiguous across all 10 themes including those that would
+otherwise blend N or S into the background.
+
+*Files: `procedural/fields/magnetic_fields.c`,
+`procedural/fields/flow_field_particles.c`.*
+
+## V-P7 — Wall Rendering "Only Adjacent to Floor"
+
+`bsp_dungeon_showcase.c`, `drunkards_walk_cave_showcase.c`,
+`cellular_automata_cave_4-5_rule_showcase.c` all use the classic
+roguelike trick: render `'#'` walls **only where adjacent (8-connected)
+to a floor cell**. Pure interior wall — surrounded by other walls in
+all 8 directions — stays blank.
+
+Code:
+
+```c
+if (k == TILE_WALL && tile_has_floor_neighbour(c, x, y)) {
+    /* render '#' */
+} else if (k == TILE_WALL) {
+    continue;  /* skip — interior void */
+}
+```
+
+Effect: cave/dungeon outlines clean, void where there is no floor
+gives the screen breathing room. Without this trick, the screen
+would be a uniform `#` field with the dungeon punched out — visually
+overwhelming.
+
+*Files: `procedural/generational/bsp_dungeon_showcase.c`,
+`procedural/generational/drunkards_walk_cave_showcase.c`,
+`procedural/generational/cellular_automata_cave_4-5_rule_showcase.c`.*
+
+## V-P8 — 16-Entry Wall-Corner LUT (Smooth Box-Drawing → ASCII Variant)
+
+`maze_backtracker.c` and `wilsons_algorithms_maze_showcase.c` render
+maze walls. Per cell, look at which of the 4 incident wall segments
+exist (NESW bits) and pick the appropriate corner glyph from a
+16-entry table. Originally Unicode `┼ ├ ┤ ┬ ┴ └ ┘ ┌ ┐ ─ │` etc., now
+**collapsed to `+` for ASCII portability** (per CLAUDE.md ASCII-only
+rule). Walls are `-` and `|`.
+
+*Files: `procedural/generational/maze_backtracker.c`,
+`procedural/generational/wilsons_algorithms_maze_showcase.c`.*
+
+## V-P9 — Smooth A→B Line Morph for Continuous Animation
+
+`midpoint_displacement_coastline.c` keeps two line buffers (A and B)
+per silhouette. Each frame computes `line_now = lerp(A, B, t)` for
+display. When `t` reaches 1, swap `A ← B` and regenerate `B` from
+scratch. Result: silhouettes evolve continuously through any
+sequence of fractal shapes; no visible "snap" at the transition.
+
+This generalises to any "interpolate between two random instances"
+pattern. The same idea applies to particle systems, terrain, etc.
+
+*Files: `procedural/fields/midpoint_displacement_coastline.c`.*
+
+## V-P10 — Supernova Reset Flash
+
+A common "punctuation" between resets across the procedural family:
+on reset, paint every cell's `supernova_glow` to 1.0. The renderer
+treats supernova_glow above threshold as the highest-priority
+visualisation (yellow `*` glyph, BOLD). It decays at `~4.0/s` so
+fades over ~0.4 s before the new pattern emerges.
+
+Provides clear visual punctuation between runs and between pattern
+switches. Without it, a pattern reset can look like a glitch rather
+than a deliberate "new attempt".
+
+*Files: every `procedural/generational/*.c` and every `procedural/fields/*.c`.*
+
+---
+
+*This document is the single reference for all ncurses techniques used across the C files in this project. For fractal algorithms and IFS theory, see Master.md §P and §Q. For the overall loop architecture and subsystem details, see Architecture.md. For color-specific techniques, see COLOR.md. For procedural generation algorithms specifically, see Master.md §X.*

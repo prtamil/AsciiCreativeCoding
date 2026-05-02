@@ -366,6 +366,54 @@ on `row 0` remains the dominant element.
 
 ---
 
+## Theme Palette Brightness
+
+**Every theme entry must sit in the BRIGHT HALF of the 256-colour space —
+even the "deepest / darkest" tier of the ramp.** Avoid the bottom of the
+palette: colours below ~24 in the 6×6×6 RGB cube and below ~240 in the
+grayscale strip become invisible against a default-black terminal,
+especially when the renderer applies `A_DIM`.
+
+**Concrete rule of thumb:**
+
+| Range                | Status                          |
+|----------------------|---------------------------------|
+| 16-23 (cube)         | NEVER use — too close to black, A_DIM = invisible |
+| 232-239 (grayscale)  | NEVER use — same problem in gray    |
+| 24-29 / 240-243      | Use sparingly; OK as the lowest ramp tier only |
+| 30+ / 244+           | Safe everywhere                 |
+
+**Why:** `A_DIM` typically renders at half intensity. Color 17 (a near-
+black blue) with `A_DIM` is effectively invisible. Color 24 stays a
+barely-visible navy that still reads as "dark theme tint". The trick is
+that theme CHARACTER comes from the *relative gradient* — readers see a
+clear progression from low to high — not from the absolute "darkness" of
+the lowest entry. As long as ramp[0] < ramp[1] < … < ramp[N-1], the
+theme works; pushing ramp[0] from 17 to 24 keeps the gradient and gains
+visibility.
+
+**Anti-pattern (do NOT do this):**
+```c
+{ "OCEAN", { 17,  18,  24,  31,  39,  51, 117, 195 }, 196,  21 },
+//          ^^   ^^                                  ↑ both invisible with A_DIM
+```
+
+**Correct:**
+```c
+{ "OCEAN", { 24,  25,  31,  38,  45,  51, 117, 195 }, 196,  21 },
+//          ^^^^^^                                    ↑ all visibly tinted
+```
+
+The hot/cold accent colours used for boundary highlighting, peak
+flashes, etc. follow the same rule — pick from the bright half so the
+accent reads regardless of `A_DIM` / `A_NORMAL` / `A_BOLD` rendering.
+
+This applies to ALL theme palettes — biome ramps, plate tints, building
+tints, star tints, line colours, backdrop sprinkles. Every theme cell
+the user can land on through `t/T` cycling must be legible.
+
+---
+
 ## ASCII-Only Rendering
 
 **All runtime glyphs must be ASCII (codepoints 0x20–0x7E). No UTF-8

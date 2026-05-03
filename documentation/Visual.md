@@ -3544,6 +3544,145 @@ than a deliberate "new attempt".
 
 *Files: every `procedural/generational/*.c` and every `procedural/fields/*.c`.*
 
+## V-P11 — Per-Pattern Perm Reshuffle
+
+Across `procedural/patterns/*.c`, the same idiom appears: cycling
+the pattern axis (`n`/`p`) reshuffles the global Perlin `perm[]`
+table from `seed XOR (current_pattern · 0xA5A5A5)`. Effect: each
+(seed, pattern) pair gets its own deterministic noise field, so the
+brightness drift overlay (fBm) changes shape when the user switches
+patterns. Without this, the foreground tiles change but the
+underlying spotlight is identical — patterns feel like recolours of
+the same drift, not genuinely different worlds.
+
+```c
+static void apply_perm(const Scene *s)
+{
+    perm_shuffle(s->seed ^ ((int)s->current_pattern * 0xA5A5A5));
+}
+```
+
+Called from `scene_init`, `scene_reseed` ('r'), and the n/p key
+handlers.
+
+*Files: `truchet_tiles.c`, `wang_tiles.c`, `quasicrystal.c`,
+`penrose_tiling.c`, `maze_of_maze.c`.*
+
+## V-P12 — `no_dim` Brightness-Floor Clamp for Background Layers
+
+Multi-scale renderers (e.g. `maze_of_maze.c` outer + inner mazes)
+hit a problem where the background layer at a dimmer ramp slot
+becomes invisible during the dim half of the brightness fBm wave.
+Solution: pass a `bool no_dim` flag down through the cell-drawing
+helper. When true, A_DIM is clamped up to A_NORMAL:
+
+```c
+if      (b > 0.65f)             b_attr = A_BOLD;
+else if (b < 0.35f && !no_dim)  b_attr = A_DIM;
+else                            b_attr = A_NORMAL;
+```
+
+Foreground layers (outer maze) keep `no_dim=false` so the spotlight
+drift remains legible. Background layers (inner mazes) pass
+`no_dim=true` so their structure stays readable through the entire
+drift. Generalises to any "always-readable background" pattern.
+
+*Files: `procedural/patterns/maze_of_maze.c`.*
+
+## V-P13 — Layered Render Order: Background First, Detail Last
+
+Rendering order matters when the same screen cell is touched by
+multiple visual layers. Two patterns that recur in the showcases:
+
+1. **Background → Foreground** (`maze_of_maze.c`): inner mazes
+   render first; outer maze renders last so its bold walls overlay
+   any inner-maze drawing that landed on the outer-cell boundary.
+   Without this, inner-maze walls near the boundary would eat the
+   outer wall and the two-scale hierarchy would break.
+
+2. **Edges → Centroids** (`penrose_tiling.c`): triangle edges
+   render first; centroid markers render after so they sit visibly
+   on top of the wireframe rather than being clipped by the line
+   pass.
+
+3. **Tiles → Cars** (`procedural_city.c`): the static city renders
+   first; moving traffic dots overlay last so cars are always
+   visible on top of road glyphs.
+
+The general rule: less-frequently-changing structure first;
+more-detail / more-animation last. Last write wins → most-recent
+layer dominates at every shared cell.
+
+*Files: `procedural/patterns/maze_of_maze.c`,
+`procedural/patterns/penrose_tiling.c`,
+`procedural/worldgen/procedural_city.c`.*
+
+## V-P14 — Visibility-Aware Edge Detection
+
+In `procedural/worldgen/procedural_city.c`, building cells render
+as framed boxes (walls + interior). Edge detection ("am I on the
+top row of my lot?") usually compares the cell's `type` against
+its neighbours. But during the BUILD ANIMATION, neighbouring cells
+may have type=BUILDING but `step > build_step` (not yet visible).
+Comparing `type` alone makes the cell render as INTERIOR even when
+the row above is currently invisible — visually wrong.
+
+Fix: edge detection consults BOTH type AND visibility:
+
+```c
+static inline bool nb_visible(const City *c, int x, int y,
+                              int build_step, CellType want)
+{
+    if (out of bounds) return false;
+    const Cell *n = &c->map[idx(x, y)];
+    return n->type == want && n->step <= build_step;
+}
+```
+
+Effect: as the build animation progresses, a building's TOP edge
+correctly draws as `_` until the row above becomes visible, at
+which point it transitions to interior glyph. The frame "grows"
+along with the wavefront. Cleaner reveal animation.
+
+*Files: `procedural/worldgen/procedural_city.c`
+(`nb_visible`, `building_glyph_at`).*
+
+## V-P15 — Aspect-Corrected Distance for Round Visuals on Tall Cells
+
+Terminal cells are ~2× taller than wide, so naïve Euclidean
+distance produces horizontally-squashed shapes. Across
+`procedural/worldgen/*.c` and `procedural/patterns/*.c`:
+
+```c
+#define ASPECT_Y_F  2.0f
+
+/* Voronoi distance — y multiplied by 2 so cells look round */
+long dx = x - plate.x;
+long dy = (y - plate.y) * 2;
+long d2 = dx*dx + dy*dy;
+
+/* Galaxy radius — same correction so the disk looks circular */
+float fy = (sy - cy) * ASPECT_Y_F;
+
+/* Brightness fBm sampling — y · ASPECT_Y so spotlight blob is round */
+float ny = sy * BRIGHT_SCALE_Y * ASPECT_Y_F;
+```
+
+The CIRRUS pattern in `cloud.c` deliberately VIOLATES this — its
+anisotropic scaling produces horizontally-stretched wisps:
+
+```c
+/* CIRRUS — y scale much larger than x → features stretched horizontally */
+return fbm2((x + wind_x · 1.4) · CIRRUS_SCALE_X,
+            (y + wind_y      ) · CIRRUS_SCALE_Y);  // SCALE_Y > SCALE_X
+```
+
+The rule: aspect correction is the default. Anisotropic looks are
+explicit deviations from it.
+
+*Files: `procedural/worldgen/tectonic.c`, `procedural_galaxy.c`,
+`hydraulic.c`, `cloud.c`; `procedural/patterns/*.c`.*
+
 ---
 
 *This document is the single reference for all ncurses techniques used across the C files in this project. For fractal algorithms and IFS theory, see Master.md §P and §Q. For the overall loop architecture and subsystem details, see Architecture.md. For color-specific techniques, see COLOR.md. For procedural generation algorithms specifically, see Master.md §X.*

@@ -2974,4 +2974,373 @@ identical.
 
 ---
 
+## X.21 Hash-Based Pure-Function Worlds — `procedural/worldgen/`
+
+The `worldgen/` family pushes the "world is a function" idea to its
+limit. Every cell of every frame is computed as a pure function of
+`(cell_x, cell_y, time, seed)`; nothing is stored. The world is
+therefore **infinite** (no allocation grows with map size),
+**deterministic** (same seed = same world), **resumable** (no state
+to save) and **regenerable in microseconds**.
+
+**The recipe**, repeated with variations across the seven files:
+
+1. **Spatial hash** (`hash3(x, y, z)`) — three large prime
+   multipliers (Teschner et al. 2003) followed by a splitmix-style
+   finaliser. Used to ask "is there content at world cell (x, y)?"
+   in O(1) without a lookup table.
+2. **Density / orientation field** — closed-form scalar, sometimes
+   summed Perlin octaves (`fbm`), sometimes geometric primitives
+   (Gaussian bulge, log-spiral arm distance, plate Voronoi).
+3. **Hash gate** — content is placed iff
+   `(hash & 0xFFFFFF) / 16777216 < density`. Gives a rate of
+   placement that smoothly tracks the density field while remaining
+   pixel-precise and seed-deterministic.
+4. **Per-content hash bits** — the SAME hash that gates placement
+   also encodes glyph variant, colour variant, twinkle phase. Same
+   seed → same star.
+5. **Optional drift** — multiply the field's input coords by a
+   slowly-evolving `wind_x = WIND_RATE · t`. The world doesn't move;
+   the camera does. Nothing is allocated; nothing is invalidated.
+
+**Concrete files:**
+- `procedural_star_field_parallax_noise_showcase.c` — 4 hash-gated
+  layers at different speeds → parallax depth
+- `procedural_galaxy.c` — closed-form `bulge + disk·arm` density;
+  log-spiral arm-phase formula `arc = (θ − ln(r)/b) · r`
+- `procedural_constellation.c` — jittered-grid anchor stars +
+  4 graph topologies + Bresenham line trace
+- `cloud.c` — domain-warped fBm with 4 sampling shapes (cumulus /
+  cirrus / stratus / stacked)
+
+**References:** Teschner et al. (2003) "Optimized Spatial Hashing
+for Collision Detection of Deformable Objects", VMV 2003.
+Wikipedia — "Procedural generation". Inigo Quilez articles on
+domain warping and noise techniques.
+
+*Files: `procedural/worldgen/*.c`.*
+
+---
+
+## X.22 Plate Tectonics — `tectonic.c`
+
+Five-stage pipeline that turns "place N random points and give them
+velocities" into a recognisable world map:
+
+1. **Plate seed placement** — jittered grid (~6–14 plates).
+2. **Voronoi assignment** — every cell to its nearest plate seed
+   (squared Euclidean with `y · 2` aspect correction).
+3. **Boundary detection + classification** — for each cell, if any
+   4-neighbour belongs to a different plate, classify the boundary
+   from the relative velocity of the two plates:
+   ```
+   n_ab     = (b.pos − a.pos) / |b.pos − a.pos|     // boundary normal
+   approach = (a.v − b.v) · n_ab                    // closing speed
+   if |approach| > |perpendicular| · K  →  CONVERGENT (approach > 0)
+                                          DIVERGENT  (approach < 0)
+   else                                  TRANSFORM  (parallel slide)
+   ```
+4. **Elevation modulation** — for every cell, scan a small
+   aspect-corrected neighbourhood for the closest boundary cell;
+   apply a distance-decayed type-specific delta:
+   ```
+   CONVERGENT : +0.5 · (1 − d/R)       // mountains rise
+   DIVERGENT  : −0.4 · (1 − d/R)       // rifts deepen
+   TRANSFORM  :  0                     // no vertical motion
+   ```
+   Plus 4-octave fBm for organic detail. Clamp to `[−1, +1]`.
+5. **Biome binning** — 8 buckets from DEEP_OCEAN to PEAKS.
+
+**Why this looks geological:** the same physics that produced the
+real Andes (convergent boundary), Mid-Atlantic Ridge (divergent),
+San Andreas (transform). Mountain CHAINS appear because the
+boundary is a CONNECTED curve and the +Δh decays with distance from
+that curve, so the whole curve produces a ridge of high cells.
+
+**References:** Wikipedia — "Plate boundaries"; Lague, Sebastian —
+"Tectonic Plate Simulation for Procedural Terrain"; Andy Gainey —
+"Procedural Worlds from Simple Tiles" (experilous.com).
+
+*Files: `procedural/worldgen/tectonic.c`.*
+
+---
+
+## X.23 Particle-Based Hydraulic Erosion — `hydraulic.c`
+
+Beyer (2015) / Sebastian Lague's algorithm. A fBm initial heightmap
+is eroded by 1000s of independent water-droplet particles. Each
+droplet is a tiny Lagrangian:
+
+```
+loop MAX_STEPS times:
+  ∇h        = bilinear gradient at (x, y)
+  v        ← inertia · v − (1 − inertia) · ∇h        // steering
+  v        ← v / |v|                                  // unit length
+  Δh       = h(new_pos) − h(old_pos)
+  C        = max(−Δh · speed · water · K, C_min)     // capacity
+  if (sediment > C  ||  Δh > 0):
+    DEPOSIT  = (sed − C) · rate  (or Δh capped if uphill)
+    distribute amount across the four-corner footprint
+  else:
+    ERODE   = min((C − sed) · rate, |Δh|)
+    apply DISC-WEIGHTED brush (radius R) of `1 − d/R`-weighted height removal
+    sed += ERODE
+  v²        ← max(0, v² − Δh · g)                     // gravity adds KE
+  water    *= (1 − evaporate_rate)
+  pos      ← new_pos
+```
+
+**Why disc brush instead of single-cell erosion:** single-cell erosion
+produces 1-pixel-wide zig-zag canyons because each step removes only
+the cell the droplet is in. Disc-weighted brush removes a small radius
+of cells per step; valleys end up smoothly U-shaped. Same total mass
+removed; vastly cleaner visual.
+
+**Why the uphill guard:** without `if (Δh > 0): always deposit`, a
+near-empty droplet steering uphill would erode the rise it just
+climbed — unphysical, makes pits at hill tops.
+
+**Why evaporation:** as water decreases, capacity decreases; the
+droplet must shed sediment near the end of its life. This is what
+produces deltas at the foot of the rivers.
+
+**References:** Beyer, H. (2015) "Implementation of a method for
+hydraulic erosion", TU München; Sebastian Lague (2019) "Coding
+Adventure: Hydraulic Erosion" (YouTube).
+
+*Files: `procedural/worldgen/hydraulic.c`.*
+
+---
+
+## X.24 Truchet Tiles + Pattern×Glyph Decoupling — `truchet_tiles.c`
+
+Sébastien Truchet's 1704 observation: a single tile randomly
+rotated at every cell of a grid produces complex emergent patterns.
+Curves, ribbons, and meanders appear because the eye stitches the
+per-cell diagonals into globally-meaningful curves; no global
+structure was specified.
+
+**The decoupled architecture** (a key design pattern reused
+across every `procedural/patterns/*.c` file):
+
+- **Pattern axis** (`n` / `p`) — the underlying SCALAR FIELD that
+  determines per-cell orientation. Examples:
+  - RANDOM: `hash3(tile_x, tile_y, seed) / 2³²`
+  - NOISE:  `fbm2(tile_x · scale, tile_y · scale)`
+  - BANDS:  `0.5 + 0.5·sin(tx · fx + ty · fy)`
+  - VORONOI: nearest jittered seed in 3×3 neighbourhood
+- **Glyph axis** (`g` / `G`) — the CHARACTER MAPPING. Each glyph set
+  carries `(n_orient, tile_w, glyphs[8])` metadata. The pattern's
+  `[0,1]` value is quantised into `n_orient` buckets; the chosen
+  orientation × `tile_w` indexes into `glyphs[]`.
+
+The pattern decides WHERE rotations live; the glyph set decides WHAT
+each rotation looks like. Twelve glyph sets × four patterns = 48
+distinct combinations from a single ~600-line file.
+
+**References:** Truchet, S. (1704) "Mémoire sur les Combinaisons";
+Smith, C. (1987) "The tiling patterns of Sébastien Truchet";
+Inigo Quilez — Truchet shader article.
+
+*Files: `procedural/patterns/truchet_tiles.c`.*
+
+---
+
+## X.25 Wang Tiles — `wang_tiles.c`
+
+Hao Wang's 1961 construction: square tiles with coloured edges,
+placed on a grid such that adjacent tiles have matching edge
+colours.
+
+**The 16-tile complete set** for 2 colours per axis:
+`(N, E, S, W) ∈ {0, 1}⁴`. For any (W, N) constraint pair there are
+exactly 4 valid tiles (free choice over E and S) — placement never
+gets stuck.
+
+**Constraint solver** (row-major):
+
+```
+for each cell (x, y):
+  expected_w = (x > 0) ? grid[y][x-1].E : ANY
+  expected_n = (y > 0) ? grid[y-1][x].S : ANY
+  valid      = filter(tile_set, by W & N constraints)
+  scored     = score each valid tile by pattern bias (NOISE / STRIPES / SWIRL)
+  chosen     = highest-scored, with hash-based tiebreak
+  grid[x,y]  = chosen
+```
+
+**Pattern bias** never violates the constraint — it only chooses
+among the 4 candidates the constraint already validated. NOISE
+prefers tiles with E and S matching an fBm-biased colour (giving
+big colour blobs); STRIPES prefers tiles where S matches sin(y)
+(giving horizontal bands); RANDOM is uniform.
+
+**Visual signature:** continuous "veins" of edge colour flow across
+many tiles because the matching rule chains them together. The
+whole picture reads as a single coherent network even though each
+tile picked its colour locally.
+
+**References:** Wang, H. (1961) "Proving theorems by pattern
+recognition II", BSTJ 40; Berger, R. (1966) "The Undecidability of
+the Domino Problem"; Cohen, M. F. et al. (2003) "Wang Tiles for
+Image and Texture Generation", SIGGRAPH 2003.
+
+*Files: `procedural/patterns/wang_tiles.c`.*
+
+---
+
+## X.26 Quasicrystal Plane-Wave Interference — `quasicrystal.c`
+
+Sum N cosine waves at angles `θ_m = m · π / N` with per-wave phase
+drift:
+
+```
+I(x, y, t) = (1/N) · Σ_{m=0..N-1} cos( ω · (x · cos θ_m + y · sin θ_m)
+                                         + φ_m(t) )
+```
+
+For N coprime with the Bravais symmetries (1, 2, 3, 4, 6) — i.e.
+N = 5, 7, 11, 13, … — the resulting interference has 2N-fold
+rotational symmetry that CANNOT tile periodically. The
+**Crystallographic Restriction Theorem** says only 1, 2, 3, 4, 6-fold
+rotational symmetry can arise in 2-D periodic lattices, so N=5
+(10-fold) and N=7 (14-fold) interference is necessarily aperiodic
+— a *quasicrystal*.
+
+Animation comes from per-wave phase rates `(r_base + m · r_delta)`
+— without `r_delta`, all waves shift uniformly and the pattern just
+translates rigidly. With `r_delta ≠ 0`, relative phases evolve and
+the pattern morphs in place.
+
+**References:** Shechtman et al. (1984) "Metallic Phase with
+Long-Range Orientational Order and No Translational Symmetry"
+(Nobel 2011); Wikipedia — "Crystallographic Restriction Theorem";
+Mike Bostock — interactive quasicrystal demo.
+
+*Files: `procedural/patterns/quasicrystal.c`.*
+
+---
+
+## X.27 Penrose P3 Tiling — `penrose_tiling.c`
+
+Roger Penrose's 1974 aperiodic tiling, generated by **Robinson
+triangle deflation**. Two triangle types:
+
+- **Acute** — 36°/72°/72°, half of a thin rhombus
+- **Obtuse** — 108°/36°/36°, half of a thick rhombus
+
+**Deflation rules** — each round scales by 1/φ (golden ratio
+inverse) and grows the count by ~φ:
+
+```
+ACUTE(A, B, C):                      // A is the 36° apex
+  P = A + (B - A) / φ
+  →  ACUTE  (apex C, base P, B)
+     OBTUSE (apex P, base C, A)
+
+OBTUSE(A, B, C):                     // A is the 108° apex
+  Q = B + (A - B) / φ
+  R = B + (C - B) / φ
+  →  OBTUSE (apex R, base C, A)
+     OBTUSE (apex Q, base R, B)
+     ACUTE  (apex R, base Q, A)
+```
+
+Starting from a 10-acute STAR seed, K=5 deflations produce ~900
+triangles; K=6 produces ~2300. The pattern has 5-fold rotational
+symmetry around the seed point but no translational period — the
+hallmark of a quasicrystal in tile form.
+
+**Rendering:** all triangle edges via Bresenham (glyph chosen by
+edge direction); acute and obtuse use different ramp slots so the
+two types remain visually distinct.
+
+**References:** Penrose, R. (1974) "The Role of Aesthetics in Pure
+and Applied Mathematical Research", Bulletin of the IMA 10;
+Grünbaum & Shephard (1986) "Tilings and Patterns"; Preshing, Jeff
+— "Penrose Tiling Explained".
+
+*Files: `procedural/patterns/penrose_tiling.c`.*
+
+---
+
+## X.28 Recursive Backtracker Mazes (Perfect Mazes) — `maze_of_maze.c`
+
+Classical DFS maze carving. From cell (x, y), shuffle the four
+directions; for each unvisited in-bounds neighbour, knock down the
+shared wall and recurse; backtrack when stuck.
+
+```
+walls[y][x]    &= ~(1 << d)             // remove our wall
+walls[ny][nx]  &= ~(1 << OPPOSITE[d])   // remove their wall
+```
+
+Result: a **perfect maze** — every cell reachable, exactly one path
+between any two cells, no loops. This is the simplest member of the
+maze-algorithm family; produces long winding corridors with few
+short dead-ends.
+
+**Two-scale composition** — the showcase applies the same algorithm
+TWICE: once for the OUTER maze (W_outer × H_outer cells), then
+W_outer · H_outer times for INDEPENDENT inner mazes inside each
+outer cell. Each inner maze has its own seed
+(`base_seed XOR hash3(ox, oy, salt)`), so the same `base_seed`
+deterministically produces the same maze of mazes.
+
+**Why the outer maze is drawn LAST:** if drawn first, inner-maze
+walls near the outer-cell boundary would overwrite the outer wall
+at that boundary. Drawing outer last means its bold walls always
+overlay the inner-maze edges and the two-scale hierarchy reads
+clearly.
+
+**References:** Wikipedia — "Maze generation algorithm"; Buck, Jamis
+(2015) "Mazes for Programmers" (Pragmatic Bookshelf), chapter 1
+covers recursive backtracker exhaustively; Think Labyrinth —
+www.astrolog.org/labyrnth/algrithm.htm.
+
+*Files: `procedural/patterns/maze_of_maze.c`.*
+
+---
+
+## X.29 fBm Brightness-Field Spotlight Modulation
+
+A common technique across `procedural/patterns/*.c` and
+`procedural/worldgen/*.c`: a STATIC visual structure (Truchet
+tiling, Penrose tiling, Wang tiling, etc.) is animated by a
+slow-drifting fBm scalar field that modulates per-cell
+A_DIM/A_NORMAL/A_BOLD without changing the underlying structure.
+
+The structure says WHAT to render at each cell (which glyph, which
+colour family); the field says HOW BRIGHT to render it. The two
+layers are independent and composable.
+
+```c
+float bright_at(int sx, int sy, float wind_x) {
+    return fbm2(sx · BRIGHT_SCALE_X + wind_x,
+                sy · BRIGHT_SCALE_Y · ASPECT_Y);
+}
+
+int level_to_attr(float b) {
+    if (b > 0.65f) return A_BOLD;
+    if (b < 0.35f) return A_DIM;
+    return A_NORMAL;
+}
+```
+
+`wind_x` accumulates over time; the brightness pattern slides
+slowly across the screen. The eye reads it as a moving spotlight
+illuminating a fixed scene — like watching a static painting under
+a passing cloud.
+
+**Combined with per-pattern perm reshuffle** (see COLOR.md §28):
+when the user cycles patterns, the perm is reshuffled too, so the
+brightness field changes shape and no two patterns share the same
+drift. This decouples "structure changed" from "lighting changed"
+into a single user action.
+
+*Files: every `procedural/patterns/*.c` and most
+`procedural/worldgen/*.c`.*
+
+---
+
 *Read the code, run the programs, change one constant at a time. That is how it becomes yours.*

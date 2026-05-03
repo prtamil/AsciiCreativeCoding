@@ -17,7 +17,7 @@
  ╚══════════════════════════════════════════════════╝
 ```
 
-257 programs. Pure C. Zero GUI dependencies. UT — useless terminals.
+269 programs. Pure C. Zero GUI dependencies. UT — useless terminals.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
@@ -127,6 +127,8 @@ per-program algorithm notes are in [DEMOS.md](DEMOS.md).
 | `animation/` + `robots/` | 14 | Hexapod tripod gait, IK spider / arm-reach / tentacle-seek, ragdoll figure & ropes, FK snake / centipede / tentacle-forest / medusa, walking biped, spring-leg jumper, self-balancing Perlin-terrain bot |
 | `particle_systems/` | 8 | Fire (3 algos), smoke (3 algos), fireworks FSM, kaboom shockwave, generic particle sandbox, AAlib fire port, staggered burst, constellation network |
 | `matrix_rain/` | 4 | Classic Matrix rain plus snowflake / pulsar / sun-mask hybrids |
+| `procedural/worldgen/` | 7 | Pure-function worlds: parallax star fields, logarithmic-spiral galaxy, L-system city, anchor-graph constellation, Voronoi tectonic plates, droplet-based hydraulic erosion, fBm cloud layers |
+| `procedural/patterns/` | 5 | Tile / interference / substitution showcases: Truchet, Wang (16-tile complete set), quasicrystal (5/7/11-fold plane-wave interference), Penrose P3 (Robinson-triangle deflation), maze-of-maze (recursive DFS at two scales) |
 | `ncurses_basics/` | — | Framework reference programs (`bounce_ball` lives in `physics/`) |
 
 ---

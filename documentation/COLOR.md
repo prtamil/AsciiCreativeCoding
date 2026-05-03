@@ -1501,3 +1501,174 @@ variations per file.
 showcases like `voronoi_region_map.c` and `diamond_square_heightmap_showcase.c`.
 
 *Files: `procedural/fields/*.c`, `procedural/generational/*.c`*
+
+---
+
+## 27. Bright-Half-of-256 Theme Rule
+
+**Where:** all `procedural/worldgen/*.c`, all `procedural/patterns/*.c`
+
+**Why:** Theme entries chosen from the bottom of the 256-colour cube
+(indices 16–23 in the RGB cube, 232–239 in the grayscale strip)
+become invisible against a default-black terminal — *especially* with
+`A_DIM`. The renderer is correct, the colour is just below the
+terminal's effective floor.
+
+**The rule** (also documented in `CLAUDE.md` § "Theme Palette
+Brightness"):
+
+| Range                | Status                                       |
+|----------------------|----------------------------------------------|
+| 16–23 (cube)         | NEVER use — too close to black, A_DIM = invisible |
+| 232–239 (grayscale)  | NEVER use — same problem in gray             |
+| 24–29 / 240–243      | Use sparingly; OK as the lowest ramp tier only |
+| 30+ / 244+           | Safe everywhere                              |
+
+**Why theme character is preserved:** the eye reads theme identity
+from the *relative* gradient (`ramp[0] < ramp[1] < … < ramp[N-1]`),
+not from the absolute darkness of the lowest entry. Pushing a "deep
+ocean" entry from 17 to 24 keeps it visibly the darkest tint of the
+ramp while ensuring it's not invisible.
+
+**Anti-pattern → correct:**
+
+```c
+/* WRONG — both 17 and 18 vanish under A_DIM */
+{ "OCEAN", { 17, 18, 24, 31, 39, 51, 117, 195 }, ... }
+
+/* RIGHT — every entry visibly tinted */
+{ "OCEAN", { 24, 25, 31, 38, 45, 51, 117, 195 }, ... }
+```
+
+The accent ("hot" / "cold") colours used for highlight glyphs follow
+the same rule.
+
+*Files: every theme block in `procedural/worldgen/*.c` and
+`procedural/patterns/*.c`.*
+
+---
+
+## 28. Per-(Seed, Pattern) Perm Reshuffle
+
+**Where:** `procedural/patterns/truchet_tiles.c`, `wang_tiles.c`,
+`quasicrystal.c`, `penrose_tiling.c`, `maze_of_maze.c`
+
+**The pattern:** every showcase that has both a "current pattern"
+selector AND a Perlin-fBm brightness drift overlays the same trick:
+
+```c
+static void apply_perm(const Scene *s)
+{
+    perm_shuffle(s->seed ^ ((int)s->current_pattern * 0xA5A5A5));
+}
+```
+
+Called from:
+
+- `scene_init` — seed the perm at startup
+- `scene_reseed` (`r` key) — fresh perm for the new seed
+- `n` / `p` (pattern change) — fresh perm for the new pattern
+
+**Why:** without it, switching patterns leaves the brightness field
+identical — only the foreground tile glyphs change, the underlying
+"spotlight" stays put. Users perceive the patterns as visually
+different colour configurations of the *same* drift. Reshuffling
+perm gives each (seed, pattern) pair its own deterministic
+brightness field, so cycling patterns truly transforms the whole
+screen.
+
+The `0xA5A5A5` multiplier is a simple bit-decorrelating constant —
+any large odd salt works; the only requirement is that distinct
+pattern indices XOR to distinct seeds.
+
+**Where it especially matters:** the NOISE-distribution patterns
+(e.g. `pattern_value_noise` in truchet, the `PATTERN_NOISE` of wang)
+ALSO read the same `perm[]` for their own placement, so the perm
+reshuffle changes BOTH the brightness AND the orientation field
+together — a clean two-channel state change from a single perm
+invalidation.
+
+*Files: `apply_perm` definitions in `procedural/patterns/*.c`.*
+
+---
+
+## 29. `no_dim` Brightness-Floor Clamp
+
+**Where:** `procedural/patterns/maze_of_maze.c`
+
+**The problem:** brightness fBm overlay maps cells to one of three
+attribute states (`A_DIM` / `A_NORMAL` / `A_BOLD`) by sampling a
+slow-drifting Perlin field. For the **inner** layer of a recursive
+multi-scale renderer (e.g. inner mazes inside outer rooms), the
+inner walls already sit on a dimmer ramp slot than the outer; if the
+brightness field ALSO drives them to `A_DIM`, they vanish entirely
+in the dim half of the wave.
+
+**The fix:** pass a `bool no_dim` flag down through the cell-drawing
+helper. When set, `A_DIM` is clamped up to `A_NORMAL`:
+
+```c
+if      (b > 0.65f)             b_attr = A_BOLD;
+else if (b < 0.35f && !no_dim)  b_attr = A_DIM;
+else                            b_attr = A_NORMAL;
+```
+
+**Effect:** the outer layer keeps the full DIM/NORMAL/BOLD contrast
+(the spotlight drift is still legible). The inner layer pulses only
+between NORMAL and BOLD — never disappears. The two-scale structure
+remains readable across the entire frame.
+
+**Generalisable:** any "background structure" rendered through the
+brightness field can use `no_dim=true` to stay always-visible while
+foreground elements keep the full modulation range. Useful for
+multi-layer patterns where one layer carries the animation and the
+other carries the structure.
+
+*Files: `draw_wall_cell` / `render_maze` in
+`procedural/patterns/maze_of_maze.c`.*
+
+---
+
+## 30. Per-Layer Ramp Slot Assignment for Multi-Scale Renderers
+
+**Where:** `procedural/patterns/maze_of_maze.c`,
+`procedural/patterns/penrose_tiling.c`,
+`procedural/worldgen/cloud.c` (STACKED pattern)
+
+When a single frame renders multiple visual layers (outer maze +
+inner maze; acute triangles + obtuse triangles; cirrus + cumulus +
+stratus), assign each layer a fixed ramp slot from the SAME 8-step
+theme so all layers stay in the theme's colour family but remain
+distinguishable.
+
+Concrete patterns observed:
+
+```c
+/* maze_of_maze.c */
+#define OUTER_RAMP  7    /* brightest end */
+#define INNER_RAMP  5    /* mid-bright    */
+
+/* penrose_tiling.c */
+#define ACUTE_EDGE_RAMP    4
+#define OBTUSE_EDGE_RAMP   6
+#define ACUTE_CENTER_RAMP  5
+#define OBTUSE_CENTER_RAMP 7
+
+/* cloud.c STACKED — three layer altitudes */
+/* high (cirrus): ramp[3..4]
+ * mid  (cumulus): ramp[5..6]
+ * low  (stratus): ramp[6..7] */
+```
+
+**Why this works across themes:** every theme defines `ramp[0..7]`
+as a monotone gradient. Distinct ramp slots are visually distinct
+in EVERY theme — no need to pick per-theme accent colours. One slot
+assignment, ten themes' worth of consistent layer differentiation.
+
+**Pairing with extra_attr:** typically the more-dominant layer also
+gets `A_BOLD` (e.g. outer maze = ramp[7] + A_BOLD; inner = ramp[5] +
+A_NORMAL). The combination — brighter slot AND brighter attribute —
+guarantees the dominant layer wins visual hierarchy on every theme.
+
+*Files: ramp-slot defines in `procedural/patterns/*.c` and
+`procedural/worldgen/cloud.c`.*

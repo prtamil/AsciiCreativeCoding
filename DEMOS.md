@@ -382,3 +382,29 @@ fractals; cycle-through-triangles for Delaunay.
 | `maze` | DFS generation + BFS/A* animated solve |
 | `graph_search` | BFS/DFS/A* on grid — animated frontier expansion |
 | `forest_fire` | Drossel-Schwabl CA — 3-state (EMPTY/TREE/FIRE) probabilistic update; neighbour-spread + lightning ignition; ratio p/f controls cluster size and self-organised criticality; 4-way/8-way spread, 4 presets, 5 themes |
+
+## Procedural Worldgen  (`procedural/worldgen/`)
+
+Pure-function world generators — every cell is a deterministic function of (x, y, seed, time). No grid storage; the world is recomputed every frame from a few floats. All files share the standard 8-step ramp + 10 themes; `n`/`p` cycles patterns, `r` reseeds, brightness fBm overlay drifts under most.
+
+| Program | Algorithm |
+|---------|-----------|
+| `procedural_star_field_parallax_noise_showcase` | Procedural infinite star field with depth-cued parallax. 4 layers at speeds {1.0, 0.45, 0.18, 0.06}; per-cell `hash3(world_x, world_y, layer)` decides "is there a star here?"; same hash bits drive glyph, colour, twinkle phase. 4 patterns: STARFIELD / TWINKLE / NEBULA (fBm dust) / WARP (5× speed + streak glyphs) |
+| `procedural_galaxy` | Logarithmic spiral + Perlin noise. `r = a·exp(b·θ)` arms; closed-form density `bulge(r) + disk(r)·arm(r,θ)`; hash gate `h_unit < density·SCALE` places stars; aspect-corrected polar transform; rigid rotation. 4 patterns: SPIRAL / BARRED (with bar term) / ELLIPTICAL / NEBULA (fBm clouds in arm gaps) |
+| `procedural_city` | L-system framing for recursive BSP subdivision. `B → HSplit B B \| VSplit B B \| Lot`; aspect-aware split-axis choice; ±33 % jittered split position. Animated build (depth-tagged step counter ramps up); window-twinkle + 28 directional-arrow cars (`> < ^ v`) drive on the road network after BUILT. 4 patterns: GRID / ORGANIC / DISTRICTS (zoning gradient) / PARKS |
+| `procedural_constellation` | Anchor-star placement (jittered grid) + 4 graph topologies + Bresenham line trace + procedural Latin name. 4 patterns: TREE (Prim's MST) / CHAIN (sort-by-x sequential) / LOOP (polar-sort cycle) / SPOKE (centroid hub). Phase machine: DRAW_STARS → DRAW_EDGES (animated Bresenham) → HOLD (name fades in, underline grows) → FADE → regen |
+| `tectonic` | Plate tectonics. Voronoi-assigned plates (oceanic / continental); relative velocity at each boundary classifies CONVERGENT / DIVERGENT / TRANSFORM; aspect-corrected R=6 distance from boundary modulates elevation; 4-octave fBm adds organic detail; 8-bucket biome binning. 4 patterns: WORLD (biome map with shimmering water + volcanic spark) / PLATES (Voronoi + seed markers) / STRESS (boundary heatmap) / ELEVATION (gradient) |
+| `hydraulic` | Particle-based hydraulic erosion (Beyer 2015 / Lague). Droplets walk fBm heightmap; bilinear gradient steers; carrying capacity `C = max(−Δh·speed·water·K, C_min)`; disc-weighted erosion brush; deposit when oversaturated or going uphill; energetics + evaporation. 4 patterns: TERRAIN / DROPLETS (live water-trail visualisation) / EROSION (cut/fill diff) / SLOPE (gradient + downhill arrows). Phase machine: ERODING → SETTLED → regen |
+| `cloud` | Plane fBm cloud layers — morphology via sampling shape. 4 patterns: CUMULUS (domain-warped fBm) / CIRRUS (high-freq, anisotropic stretched) / STRATUS (low-freq, banded) / STACKED (cirrus + cumulus + stratus rendered in altitude order, with `/` lightning where stratus AND cumulus both exceed STORM_THRESH). Wind drift + per-wave phase shift; no regen cycle |
+
+## Procedural Patterns  (`procedural/patterns/`)
+
+Tile / interference / substitution patterns. Decoupled axes: `n`/`p` cycles **pattern** (the underlying distribution rule), `g`/`G` cycles **glyph set** (the visual character family). Brightness fBm "spotlight" drifts over static tilings. All files use the same bright-half theme palette (per CLAUDE.md "Theme Palette Brightness").
+
+| Program | Algorithm |
+|---------|-----------|
+| `truchet_tiles` | Per-cell randomly-rotated tile (Truchet 1704) + fBm brightness modulation. 4 patterns (genuinely structural distributions): RANDOM / NOISE (fBm) / BANDS (sin) / VORONOI (jittered seeds). 12 glyph sets across three structural families: 2-orient × 1-cell (diag/lens/brkt/wave), 4-orient × 1-cell (axis/cross/arrow/dots), 2-orient × 2-cell (slope/tri/wcurv/wbrkt). 48 distinct combinations |
+| `wang_tiles` | 16-tile complete set (2 edge colours per axis, all `(N,E,S,W) ∈ {0,1}⁴`); constraint-propagation placement (W edge = left.E, N edge = above.S); 4 placement-bias patterns: RANDOM / NOISE (fBm) / STRIPES (sin-y) / SWIRL (atan2 around centre). 3 glyph sets: EDGES / BLOCKS / MIXED |
+| `quasicrystal` | Plane-wave interference: `I = (1/N)·Σ cos(ω·k̂_m·(x,y) + φ_m(t))` with N waves at θ_m = m·π/N; per-wave phase drift gives morphing animation. 4 patterns by wave count: TRI (3, periodic hex) / PENTA (5, 10-fold quasicrystal) / HEPTA (7, 14-fold) / UNDECA (11, 22-fold). 4 glyph sets: RAMP / PEAKS (positive only) / CONTOUR (zero-crossings) / WAVES (bipolar) |
+| `penrose_tiling` | Robinson-triangle deflation. Acute → 1A + 1B; obtuse → 2B + 1A; each child scaled by 1/φ. 4 seeds: STAR (10 acutes around centre, K=5) / DEEP (K=6) / THIN (single thin rhombus) / THICK (single thick rhombus). 3 glyph sets: EDGES (Bresenham line edges, glyph by direction) / CENTERS (centroid dots) / BOTH. Acute and obtuse render in different ramp slots |
+| `maze_of_maze` | DFS recursive-backtracker carving applied at TWO scales — outer maze + independent inner maze per outer cell. 4 patterns: CLASSIC (6×3 outer × 6×4 inner) / WIDE (4×2 × 10×6) / DENSE (8×4 × 4×3) / EVEN (5×3 × 8×5). 3 glyph sets: LINES / BLOCKS / MIXED. Outer walls A_BOLD + ramp[7]; inner A_NORMAL + ramp[5] with `no_dim` clamp so they stay readable through the brightness drift |

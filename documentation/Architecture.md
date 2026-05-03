@@ -5538,6 +5538,66 @@ plus individual `concept_*.md` files for each technique.
 
 *Files: `procedural/generational/*.c`, `procedural/fields/*.c`*
 
+### `procedural/worldgen/` — pure-function worlds at scale
+
+Where `procedural/generational/` BUILDS a structure step-by-step and
+HOLDS it, and `procedural/fields/` evolves a continuous field forever,
+`procedural/worldgen/` programs build a WORLD (terrain, sky, city,
+universe) once per seed and visualise it. Most are pure functions of
+`(cell_x, cell_y, time, seed)` — no per-cell storage; every frame
+re-evaluates the world from a few floats. Three notable exceptions
+(`tectonic`, `hydraulic`, `procedural_city`) DO store a per-cell map
+because the algorithm requires neighbour lookups (Voronoi propagation,
+brush erosion, BSP recursion).
+
+| File | Algorithm |
+|---|---|
+| `procedural_star_field_parallax_noise_showcase.c` | 4 parallax sheets at speeds {1.0, 0.45, 0.18, 0.06}; per-cell hash-gated star presence; same hash bits drive glyph, colour, twinkle phase. 4 patterns: STARFIELD / TWINKLE / NEBULA / WARP |
+| `procedural_galaxy.c` | Logarithmic spiral arms `r = a·exp(b·θ)`; closed-form density `bulge(r) + disk(r)·arm(r,θ)`; rigid rotation per frame. 4 patterns: SPIRAL / BARRED / ELLIPTICAL / NEBULA |
+| `procedural_city.c` | L-system framing for recursive BSP subdivision; depth-tagged step counter animates the build. Window twinkle + 28 directional-arrow cars after BUILT. 4 patterns: GRID / ORGANIC / DISTRICTS / PARKS |
+| `procedural_constellation.c` | 4 graph topologies (TREE / CHAIN / LOOP / SPOKE) over jittered-grid anchor stars; Bresenham line trace; procedural Latin name. 4-phase machine: DRAW_STARS → DRAW_EDGES → HOLD → FADE → regen |
+| `tectonic.c` | Voronoi-assigned plates + relative-velocity boundary classification (CONVERGENT / DIVERGENT / TRANSFORM) + R=6 distance-to-boundary elevation modulation + 4-octave fBm. 8-bucket biome binning. 4 patterns: WORLD / PLATES / STRESS / ELEVATION |
+| `hydraulic.c` | Beyer/Lague droplet erosion on fBm heightmap. Bilinear gradient, carrying capacity, disc-weighted brush, deposit-when-uphill. 4 patterns: TERRAIN / DROPLETS / EROSION / SLOPE. Phase machine: ERODING → SETTLED → regen |
+| `cloud.c` | Plane-wave interference (no, that's quasicrystal — here it's pure fBm sampling at different shapes). 4 morphologies: CUMULUS (domain-warped) / CIRRUS (anisotropic high-freq) / STRATUS (banded) / STACKED (3 layers + lightning at storm cells) |
+
+### `procedural/patterns/` — tile / interference / substitution
+
+Static patterns at multiple scales, animated by a slowly-drifting
+fBm "spotlight" (brightness-only modulation; the underlying tile
+layout doesn't move). Decoupled axes: `n`/`p` cycles **pattern** (the
+underlying distribution / structural rule); `g`/`G` cycles **glyph
+set** (visual character family). Pattern change ALSO reshuffles the
+Perlin perm table (via `apply_perm(s)`) so the brightness field
+changes with the pattern — no two patterns share the same drift.
+
+| File | Algorithm |
+|---|---|
+| `truchet_tiles.c` | Per-cell randomly-rotated tile (Truchet 1704). 4 distribution patterns: RANDOM (hash) / NOISE (fBm) / BANDS (sin) / VORONOI (jittered seeds). 12 glyph sets across three structural families: 2-orient × 1-cell, 4-orient × 1-cell, 2-orient × 2-cell |
+| `wang_tiles.c` | 16-tile complete set (`(N,E,S,W) ∈ {0,1}⁴`); constraint-propagation placement (W = left.E, N = above.S); 4 placement-bias patterns; 3 glyph sets (EDGES / BLOCKS / MIXED) |
+| `quasicrystal.c` | Plane-wave interference `I = (1/N)·Σ cos(ω·k̂_m·(x,y) + φ_m(t))`. 4 wave counts: TRI (3, periodic) / PENTA (5) / HEPTA (7) / UNDECA (11). 4 glyph sets: RAMP / PEAKS / CONTOUR / WAVES |
+| `penrose_tiling.c` | Robinson-triangle deflation (acute → 1A+1B; obtuse → 2B+1A; scale 1/φ). 4 seeds: STAR / DEEP / THIN / THICK. 3 glyph sets: EDGES (Bresenham, glyph by direction) / CENTERS / BOTH |
+| `maze_of_maze.c` | DFS recursive-backtracker carving applied at two scales (outer + per-outer-cell inner). 4 size patterns; 3 glyph sets. `no_dim` flag on inner walls so the brightness drift can't make them invisible |
+
+### Cross-pattern conventions
+
+The patterns / worldgen files introduced two new architectural
+conventions on top of the standard `procedural/` framework:
+
+1. **`apply_perm(scene)`** — reshuffle Perlin `perm[]` from
+   `seed XOR (current_pattern · 0xA5A5A5)` whenever the pattern OR
+   the seed changes. Each (seed, pattern) pair has its own
+   deterministic perm view, so cycling patterns gives a fresh
+   brightness field without losing reproducibility.
+
+2. **`no_dim` flag in `draw_wall_cell` / `render_*`** — clamps the
+   brightness floor to A_NORMAL when set. Used for the INNER layer
+   in `maze_of_maze.c` (and could be reused anywhere a "background
+   structure" must remain readable through the spotlight drift).
+   Without it, low-brightness regions of the fBm field hide cells
+   entirely.
+
+*Files: `procedural/worldgen/*.c`, `procedural/patterns/*.c`*
+
 ---
 
 *This document describes the state of the framework as implemented across all C files in this repository. The canonical reference for any ambiguity is `physics/bounce_ball.c`.*

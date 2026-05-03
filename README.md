@@ -17,7 +17,7 @@
  ╚══════════════════════════════════════════════════╝
 ```
 
-269 programs. Pure C. Zero GUI dependencies. UT — useless terminals.
+273 programs. Pure C. Zero GUI dependencies. UT — useless terminals.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.

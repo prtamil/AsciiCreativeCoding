@@ -131,6 +131,10 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 | `torus_raytrace` | Quartic intersection (sampling + bisection) — ring in XZ plane, gradient normal, Fresnel, 6 themes |
 | `capsule_raytrace` | Cylinder + hemisphere caps — axial projection body normal, cap sphere normal, inverse-rotation transform, 6 themes |
 | `path_tracer` | Monte Carlo path tracer — Lambertian BRDF, cosine hemisphere sampling (Malley's method), Russian roulette termination, progressive per-pixel accumulator, Reinhard tone map + gamma, Cornell Box scene with color bleeding |
+| `atmospheric_sky` | Procedural sky over a sin-sum mountain silhouette — per-pixel horizon→zenith ramp, Rayleigh-style sun proximity boost, fBm cloud bands with horizontal wind, hash-gated twinkling stars; 5 patterns (DAWN/DAY/DUSK/NIGHT/TRANSIT), 10 themes |
+| `saturn_with_rings` | Iconic ringed planet — analytic ray-sphere (planet) + ray-plane annulus (rings) with depth-sort occlusion; per-radius ring density + Cassini Division gap; shadow-ray to sun gives planet-cast dark band on rings; 4 patterns (SATURN/URANUS/RINGED-EARTH with fBm continents/EXOPLANET) |
+| `solar_eclipse` | Two ray-sphere tests + screen-space corona overlay — limb-darkened sun, depth-sorted moon transit, `exp(-d·k)·pow(occlusion,γ)` corona bloom only at totality, diamond-ring bead at sun edge opposite moon when sep ≈ \|moon_α − sun_α\|; 4 patterns (TOTAL/PARTIAL/ANNULAR/TRANSIT) |
+| `god_rays_silhouette` | Volumetric light shafts via per-cell screen-space shadow-ray accumulation — Beer–Lambert weighted samples toward sun, point-in-shape silhouette test gates each step; 5 silhouette patterns (ARCHWAY/MOUNTAIN/COLUMN/WINDOWS/TREE), fBm fog jitter, 10 themes |
 
 ## Emergent Systems  (`flocking/`)
 

@@ -146,6 +146,10 @@ Reference implementation: `basics/bounce_ball.c`
 109. [Path Tracer — raytracing/path_tracer.c](#109-path-tracer--raytracingpath_tracerc)
 110. [Sphere Raytrace — raytracing/sphere_raytrace.c](#110-sphere-raytrace--raytracing-sphere_raytracec)
 111. [Torus Raytrace — raytracing/torus_raytrace.c](#111-torus-raytrace--raytracingtorus_raytracec)
+111a. [Atmospheric Sky — raytracing/atmospheric_sky.c](#111a-atmospheric-sky--raytracingatmospheric_skyc)
+111b. [Saturn With Rings — raytracing/saturn_with_rings.c](#111b-saturn-with-rings--raytracingsaturn_with_ringsc)
+111c. [Solar Eclipse — raytracing/solar_eclipse.c](#111c-solar-eclipse--raytracingsolar_eclipsec)
+111d. [God Rays Silhouette — raytracing/god_rays_silhouette.c](#111d-god-rays-silhouette--raytracinggod_rays_silhouettec)
 112. [Beam Bending & Vibration — physics/beam_bending.c](#112-beam-bending--vibration--physicsbeam_bendingc)
 113. [Differential Drive Robot — robots/diff_drive_robot.c](#113-differential-drive-robot--physicsdiff_drive_robotc)
 114. [Walking Robot — robots/walking_robot.c](#114-walking-robot--robotswalking_robotc)
@@ -3922,6 +3926,38 @@ Coefficients A, B, C, D are derived by algebra from the torus equation. Rather t
 Same inverse-ray-transform approach as cube and capsule: rotate the ray into object space, intersect the axis-aligned torus, transform the normal back. Four rendering modes (Phong, normals, Fresnel, depth); six themes (titanium, solar, cobalt, forest, rose, chrome).
 
 *Files: `raytracing/torus_raytrace.c`*
+
+---
+
+## 111a. Atmospheric Sky — raytracing/atmospheric_sky.c
+
+Procedural sky that needs NO geometry — every cell is a pure function of `(sx, sy, time, pattern, seed, theme)`. Per-pixel horizon→zenith ramp lookup with day/dusk/night fades; sun-proximity gaussian boost approximates Rayleigh-style brightness near the sun. Mountain silhouette via 3-term sin sum anchors the horizon; fBm-sampled cloud bands drift on a horizontal wind; hash-gated stars twinkle at night. 5 patterns: DAWN / DAY / DUSK / NIGHT / TRANSIT (60 s cycle). 10 themes redesigned as horizon-to-zenith gradients. Airy `' .,:;-+*'` glyph ramp.
+
+*Files: `raytracing/atmospheric_sky.c`*
+
+---
+
+## 111b. Saturn With Rings — raytracing/saturn_with_rings.c
+
+Iconic ringed planet from one ray-sphere + one ray-plane-annulus per cell. Depth-sort gives ring-passes-behind-planet occlusion. Shadow ray from each ring point toward the sun, tested against the planet sphere, casts the dark shadow band on the back of the rings. Per-radius ring density modulation + Cassini Division dim band. Planet shading: latitude bands (SATURN, EXO) or fBm continent map (RINGED-EARTH). 4 patterns: SATURN / URANUS (near-edge-on) / RINGED-EARTH / EXOPLANET. Slow sun rotation drives both the planet terminator AND the shadow band from the same `sun_dir`.
+
+*Files: `raytracing/saturn_with_rings.c`*
+
+---
+
+## 111c. Solar Eclipse — raytracing/solar_eclipse.c
+
+Two ray-sphere tests with depth-sort: sun (far, big), moon (close, small). Per-pixel screen-space corona overlay `corona = exp(-d_out·K) · pow(occlusion,γ)` blooms only at totality because the occlusion factor is gamma-curved (γ=4). Limb darkening on the sun via Eddington's 1-coefficient law `L = 0.40 + 0.60·μ`. Diamond-ring bead fires when `|sep − |moon_α − sun_α|| < ε` (TOTAL only) at the sun edge opposite the moon. 4 patterns: TOTAL (corona + diamond) / PARTIAL (offset moon, never centres) / ANNULAR (moon angular < sun, max occlusion `(moon_α/sun_α)²`) / TRANSIT (Mercury-sized moon).
+
+*Files: `raytracing/solar_eclipse.c`*
+
+---
+
+## 111d. God Rays Silhouette — raytracing/god_rays_silhouette.c
+
+Volumetric light shafts via per-cell screen-space shadow-ray accumulation (the GPU Gems 3 / Crysis trick). For each cell: march `MARCH_STEPS=20` samples toward the sun's screen position; at each sample, point-in-shape test against the silhouette; unblocked samples accumulate Beer-Lambert weight `exp(-σ·d)`. `visibility = unblocked_weight / total_weight`. Plus sun-disc gaussian, plus fBm fog jitter for shimmer. 5 silhouette patterns (each a `bool sil_*(u, v)` predicate): ARCHWAY (pillars + half-annulus arch) / MOUNTAIN (gaussian peak) / COLUMN (capped rect with cosine-jagged broken top) / WINDOWS (4×2 arched-window cathedral wall) / TREE (tapered trunk + 6 capsule branches).
+
+*Files: `raytracing/god_rays_silhouette.c`*
 
 ---
 

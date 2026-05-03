@@ -77,6 +77,52 @@ to ε. Average rays cost ~25 evaluations even at the silhouette.
 
 ---
 
+## Performance — Three Bounding Optimisations
+
+The naive marcher costs ~1.4 billion ops per frame at 240×80 (per cell: ~25
+march steps × `sdf_sun` which itself does 8 noise calls + 8 flares × 8 capsules).
+This pegs `-O3` at ~10 fps. Three bounding tricks bring it under 30 fps:
+
+**1. Scene bounding sphere early-out in `rm_cast` (biggest win).**
+The entire scene fits inside a sphere of radius `SCENE_BOUND_R = 3.30` at the
+origin. Rays that miss this sphere can never hit the surface AND are too far
+for meaningful corona accumulation. They return immediately with `corona = 0`
+after one ray-sphere intersection (~10 ops). Typically ~70 % of screen cells
+are pure background, so this single test cuts the work to a fraction. For
+rays that DO hit the bounding sphere, the march is also clamped to
+`bb_exit` so no steps are wasted past the scene.
+
+```c
+float bb_b    = ro.x*rd.x + ro.y*rd.y + ro.z*rd.z;
+float bb_c    = ro.x*ro.x + ro.y*ro.y + ro.z*ro.z - SCENE_BOUND_R*SCENE_BOUND_R;
+float bb_disc = bb_b*bb_b - bb_c;
+if (bb_disc < 0.f) {
+    pix.is_star = star_at(rd);   /* only stars remain */
+    return pix;
+}
+float bb_exit = -bb_b + sqrtf(bb_disc);
+/* march from bb_enter to bb_exit only */
+```
+
+**2. Per-flare bounding sphere in `flare_sdf`.**
+Each flare's geometry (arc tube + sparks + flow particles + embers) fits
+inside a small sphere centred at the arch midpoint with radius
+`(height + spark_reach + pad)`. Rays far from this sphere skip the entire
+8-segment Bézier evaluation and return a CONSERVATIVE outer distance (sphere
+distance, slightly relaxed) so the marcher still steps correctly. With 8
+flares evaluated every march step but typically only 1–2 active near any
+given ray, this saves ~6× on flare work.
+
+**3. fBm octaves 5 → 3.**
+The last two octaves contribute amp `0.0625 + 0.03125 ≈ 6 %` of the noise —
+invisible at terminal resolution. Cuts noise call count by 40 % at zero
+visual cost.
+
+Combined effect: ~7× speedup. With `-O3 -ffast-math -march=native -funroll-loops`
+the demo now hits the 24 fps render cap with headroom.
+
+---
+
 ## Flare State Machine
 
 Each flare has three states and runs its own clock:

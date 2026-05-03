@@ -156,7 +156,13 @@ enum {
     HUD_ROWS        = 3,
 };
 
-/* Terminal cell aspect — same as raymarcher.c */
+/* Terminal cell aspect — same as raymarcher.c
+ * CELL_W = CELL_H = 1: every terminal cell is one rendered ray. This
+ * is the resolution required for the Mandelbulb's lobe structure to
+ * READ as a Mandelbulb at terminal scale. Performance is bought back
+ * by the bounding-sphere early-out in mb_march (which rejects ~70%
+ * of cells whose ray clearly misses the fractal) rather than by
+ * dropping resolution. */
 #define CELL_W       1
 #define CELL_H       1
 #define CELL_ASPECT  2.0f
@@ -168,25 +174,33 @@ static inline int canvas_h_from_rows(int r) { return r / CELL_H; }
 #define CANVAS_MAX_W  400
 #define CANVAS_MAX_H  120
 
-/* ── Raymarching geometry ─────────────────────────────────────────────── */
-#define MB_MAX_STEPS_FULL  100      /* was 80  — more budget reaches deeper surface features    */
+/* ── Raymarching geometry ─────────────────────────────────────────────── *
+ * iter 12 keeps the lobe geometry crisp at terminal resolution; the
+ * bounding-sphere early-out (BB_RADIUS, see mb_march) makes sharp 1:1
+ * rendering affordable by skipping all the empty space outside the
+ * fractal's bounding sphere. */
+#define MB_MAX_STEPS_FULL   80
 #define MB_MAX_STEPS_FAST   40
-#define MB_HIT_EPS          0.002f  /* was 0.003 — tighter hit gives sharper silhouette         */
+#define MB_HIT_EPS          0.002f
 #define MB_MAX_DIST         5.0f
-#define MB_MAX_ITER         16      /* was 12  — more iterations = more accurate DE surface      */
-#define MB_MAX_ITER_AUX      8      /* was  6  — better normals, AO, shadows                    */
+#define MB_MAX_ITER         12      /* primary surface-finding iterations       */
+#define MB_MAX_ITER_AUX      6      /* normals / shadows / AO                    */
 #define MB_BAIL             2.0f    /* escape radius                            */
+#define BB_RADIUS           1.30f   /* Mandelbulb bounding sphere — early-out   */
 
-/* ── Near-miss glow ───────────────────────────────────────────────────── */
-#define GLOW_THRESH  0.04f          /* T.13 DE < this → luminous corona pixel   */
+/* ── Near-miss glow ───────────────────────────────────────────────────── *
+ * Wider threshold → bigger luminous halo around the silhouette. The
+ * iconic "fractal aura" only reads at terminal resolution if the corona
+ * is thick enough to span several cells. */
+#define GLOW_THRESH  0.07f
 
 /* ── Soft shadow ──────────────────────────────────────────────────────── */
-#define SH_STEPS    24              /* march steps for penumbra ray             */
+#define SH_STEPS    16              /* march steps for penumbra ray             */
 #define SH_K        8.0f            /* sharpness: higher = harder shadow edge   */
 #define SH_MIN_T    0.02f           /* start offset to avoid self-intersection  */
 
 /* ── Ambient occlusion ────────────────────────────────────────────────── */
-#define AO_SAMPLES  5
+#define AO_SAMPLES  3
 #define AO_STEP     0.08f
 #define AO_DECAY    0.7f
 
@@ -194,9 +208,9 @@ static inline int canvas_h_from_rows(int r) { return r / CELL_H; }
 #define CAM_DIST_DEFAULT   2.8f
 #define CAM_DIST_MIN       1.4f
 #define CAM_DIST_MAX       6.0f
-#define CAM_THETA_DEFAULT  0.35f
+#define CAM_THETA_DEFAULT  0.55f       /* 3/4 view: shows polar cap + equator   */
 #define CAM_PHI_DEFAULT    0.0f
-#define CAM_ORBIT_SPD      0.4f
+#define CAM_ORBIT_SPD      0.18f       /* slow — readable at any framerate     */
 #define CAM_ZOOM_SPD       0.15f
 #define CAM_STEP_THETA     0.07f
 #define CAM_STEP_PHI       0.10f
@@ -206,22 +220,28 @@ static inline int canvas_h_from_rows(int r) { return r / CELL_H; }
 #define CAM_SPD_MAX        4.0f
 #define FOV_HALF_TAN       0.55f
 
-/* ── Lighting ─────────────────────────────────────────────────────────── */
-#define LIGHT_X   1.8f    /* key light position (front-right-above)           */
-#define LIGHT_Y   2.2f
-#define LIGHT_Z   2.0f
+/* ── Lighting ─────────────────────────────────────────────────────────── *
+ * Strong SIDE-DOMINANT key light: low elevation, high horizontal offset
+ * so lobes cast clear shadows on each other. Without strong side light
+ * the bulb just looks like a sphere — the lobe geometry is invisible. */
+#define LIGHT_X   2.2f    /* key light: more from the side                    */
+#define LIGHT_Y   1.0f    /* less from above                                  */
+#define LIGHT_Z   1.4f    /* slightly forward of the bulb                     */
 #define RIM_X    -1.0f    /* rim / fill light direction (back-left-below)     */
 #define RIM_Y    -0.5f
 #define RIM_Z    -0.8f
-#define RIM_STR   0.30f   /* rim diffuse weight: back/side illumination       */
+#define RIM_STR   0.42f   /* rim diffuse weight: back/side illumination       */
 
-/* ── Phong shading ────────────────────────────────────────────────────── */
-/* KA is NOT multiplied by AO — ambient is a global constant so even
-   fully-occluded cavity pixels always have KA = 0.25 brightness and
-   never collapse to a space character.  AO only darkens the diffuse term. */
-#define KA   0.25f   /* ambient baseline — guaranteed minimum visibility      */
-#define KD   0.72f   /* diffuse                                               */
-#define KS   0.20f   /* specular: low — micro-facets make high KS noisy      */
+/* ── Phong shading ────────────────────────────────────────────────────── *
+ * Lower ambient + higher diffuse → stronger contrast between lit lobes
+ * and shadowed cavities. The lobe geometry only READS as 3-D structure
+ * if the dark side is actually dark.
+ * KA is NOT multiplied by AO — ambient is a global constant so even
+ * fully-occluded cavity pixels always have KA brightness and never
+ * collapse to a space character. AO only darkens the diffuse term. */
+#define KA   0.18f   /* ambient baseline — visible but truly DARK             */
+#define KD   0.82f   /* diffuse: dominant — drives lobe shadow contrast       */
+#define KS   0.20f   /* specular: low — micro-facets make high KS noisy       */
 #define SHIN 48.0f   /* shininess: tight spot, avoids specular smearing       */
 
 /* ── Display ──────────────────────────────────────────────────────────── */
@@ -237,8 +257,8 @@ static inline int canvas_h_from_rows(int r) { return r / CELL_H; }
 #define MORPH_LO        2.0f   /* power morph: lower bound                     */
 #define MORPH_HI        8.0f   /* power morph: upper bound                     */
 #define COLOR_BANDS     1.0f   /* palette: full cycles visible at once         */
-#define COLOR_PHASE_SPD 0.0f   /* no automatic palette rotation                */
-#define ROWS_PER_TICK   8      /* T.10/T.11 progressive: rows rendered per tick */
+#define COLOR_PHASE_SPD 0.50f  /* subtle palette rotation — adds life          */
+#define ROWS_PER_TICK   240    /* full-frame each tick (≥ CANVAS_MAX_H)        */
 #define NSTARS          200    /* starfield background particle count           */
 
 /* Trap types */
@@ -361,7 +381,7 @@ static void clock_sleep_ns(int64_t ns)
 /* §3  color                                                              */
 /* ===================================================================== */
 
-static int g_theme_idx    = 0;
+static int g_theme_idx    = 7;   /* Plasma — vibrant default            */
 static int g_color_offset = 0;   /* rotated each tick by scene_tick()  */
 
 static void color_init_theme(void)
@@ -584,11 +604,37 @@ static float mb_march(Vec3 ro, Vec3 rd, float power, int max_steps,
                        float *out_trap, float *out_smooth, float *out_glow_str,
                        TrapType trap_type)
 {
-    float t      = 0.02f;
+    /* ── Bounding-sphere early-out ───────────────────────────────────── *
+     * The Mandelbulb (n ≥ 2) fits entirely inside a sphere of radius
+     * BB_RADIUS. Any view ray that misses this bounding sphere cannot
+     * possibly hit the fractal surface, so we can return MISS without
+     * a single DE evaluation. For typical camera distances ~70% of
+     * screen cells fall outside the bounding sphere — this turns those
+     * cells from ~25 expensive iterations × 12 inner = 300 mb_de iters
+     * into one ray-sphere test. The remaining 30% (cells whose ray
+     * actually crosses the bulb's volume) march normally, but only
+     * between t_enter and t_exit (no wasted steps past the bulb). */
+    float bb_b    = v3dot(ro, rd);
+    float bb_c    = v3dot(ro, ro) - BB_RADIUS * BB_RADIUS;
+    float bb_disc = bb_b * bb_b - bb_c;
+    if (bb_disc < 0.0f) {
+        /* Ray clean-misses bounding sphere → no fractal hit possible. */
+        *out_glow_str = 0.0f;
+        *out_trap     = 1.0f;
+        *out_smooth   = 0.1f;
+        return -1.0f;
+    }
+    float bb_sq    = sqrtf(bb_disc);
+    float t_enter  = -bb_b - bb_sq;
+    float t_exit   = -bb_b + bb_sq;
+    if (t_enter < 0.02f) t_enter = 0.02f;     /* camera inside bbox    */
+    if (t_exit  > MB_MAX_DIST) t_exit = MB_MAX_DIST;
+
+    float t      = t_enter;
     float min_d  = 1e9f;
     float dt;
 
-    for (int i = 0; i < max_steps && t < MB_MAX_DIST; i++) {
+    for (int i = 0; i < max_steps && t < t_exit; i++) {
         Vec3  p = v3add(ro, v3mul(rd, t));
         float d = mb_de(p, power, MB_MAX_ITER, &dt, trap_type, NULL);
         if (d < min_d) min_d = d;
@@ -652,10 +698,15 @@ static Vec3 g_snap_cam, g_snap_fwd, g_snap_right, g_snap_up;
 
 /*
  * T.9  8-level char ramp — every step is visually distinct at arm's length:
- *   ' '=0  '.'=1  ':'=2  '='=3  '+'=4  '*'=5  '#'=6  '@'=7
+ *   ' '=0  '.'=1  ','=2  ':'=3  ';'=4  '-'=5  '+'=6  '*'=7
  * Hit pixels clamp to ri ≥ 1 so the minimum visible char is always '.'.
+ *
+ * Tuned for AIRY look: brightest cells use '+' / '*' rather than the
+ * blocky '#' / '@' so the fractal silhouette reads as a glowing object
+ * rather than a cluster of solid blocks. Matches the rest of the
+ * project (atmospheric_sky, saturn_with_rings, solar_eclipse, god_rays).
  */
-static const char k_ramp[] = " .:=+*#@";
+static const char k_ramp[] = " .,:;-+*";
 #define RAMP_N (int)(sizeof k_ramp - 1)   /* = 8 */
 
 /* Starfield — initialised once with a fixed seed */
@@ -952,10 +1003,16 @@ static void canvas_draw(int cw, int ch, int cols, int rows,
                 ch_c = k_ramp[ri];
 
                 int  pair = mb_color_pair(cell->smooth);
-                /* A_BOLD on every hit pixel: ncurses A_NORMAL renders colour pairs
-                 * at ~60% terminal intensity.  ri encodes brightness; bold = full
-                 * colour saturation so the palette reads at its intended depth. */
-                attr = COLOR_PAIR(pair) | A_BOLD;
+                /* Attribute tracks BRIGHTNESS (ri), not a flat A_BOLD.
+                 * A_BOLD on every hit washed the dark side bright — making
+                 * the bulb look like a colour-blob instead of a 3-D shape.
+                 * Now: brightest cells get A_BOLD (specular highlights pop),
+                 * darkest cells get A_DIM (lobe shadows are truly dark),
+                 * mid cells render normally. The luminance ramp drives the
+                 * 3-D read; the palette only colours it. */
+                attr = COLOR_PAIR(pair);
+                if      (ri >= 6) attr |= A_BOLD;
+                else if (ri <= 2) attr |= A_DIM;
             }
 
             for (int by = 0; by < CELL_H; by++) {

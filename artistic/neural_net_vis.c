@@ -74,6 +74,113 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A feed-forward neural network diagram is a column of dots, then a
+ * column of dots, then a column of dots, fully connected.  Geometry is
+ * the whole demo: the position of every neuron is computed on demand
+ * from (layer, idx, rows, cols) — nothing stored, nothing pre-baked.
+ * On top of that geometry, a small pool of particles drifts forward
+ * one edge at a time, picking a random next-layer target each hop.
+ * No real activations or weights — but the visual unmistakably shows
+ * "data flows left-to-right through fully-connected layers."
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Think of a city subway map drawn as parallel station rows.  Every
+ * station in row i has a track to every station in row i+1 — a
+ * complete bipartite graph between adjacent rows.  Now imagine a
+ * commuter at each row-0 station who, at every junction, picks a
+ * random track to the next row.  Resize the city (terminal) and the
+ * stations rearrange to keep the layout balanced; change the number
+ * of rows or stations-per-row and the commuter pool resizes too.
+ * The single source of truth is neuron_cell(layer, idx) — change
+ * that formula and every line, every neuron, every particle moves
+ * accordingly.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. neuron_cell(layer, idx) returns
+ *       col = (layer + 1) · cols / (n_layers + 1)
+ *       row = (idx   + 1) · (rows - 1) / (n_per_layer + 1)
+ *     The "+1" margins distribute equal space at all four edges.
+ *  2. draw_connections: for each pair of adjacent layers, for each
+ *     pair (a,b) of neurons (n² edges per layer pair), call draw_line
+ *     between their cells.  draw_line interpolates linearly with
+ *     steps = max(|dr|, |dc|), and picks a glyph PER CELL based on
+ *     the LOCAL step direction (hor/ver/down/up) — not the global
+ *     slope — so a near-horizontal line renders as '------\------'
+ *     instead of staircased back-slashes.
+ *  3. Particle pool: one particle per input neuron.  Each holds
+ *     {from_layer, from_idx, to_idx, t∈[0,1], speed} where speed has
+ *     ±40% jitter so dots desync within ~3 hops.
+ *  4. particle_tick: t += speed·dt.  When t≥1: subtract 1, advance
+ *     to next layer (from_idx ← to_idx, pick new to_idx).  At output
+ *     layer, loop back to a random input neuron.  The `while` loop
+ *     handles the rare large-dt case of crossing 2 edges in one tick.
+ *  5. particle_draw: linearly interpolate between source and target
+ *     cells, paint '*' at sr,sc.  Drawn between connections and
+ *     neurons so neurons cap the trajectory cleanly.
+ *  6. Endpoints i=0 and i=steps are skipped in draw_line so the
+ *     connection lines don't overdraw the '(O)' neuron sigil.
+ *  7. HUD top-right (params + fps), hint strip bottom-left.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Neuron col       col = (L + 1) · cols / (n_layers + 1)
+ *  Neuron row       row = (I + 1) · (rows - 1) / (n_per_layer + 1)
+ *  Edge interp      sr = ar + (br - ar) · t,  sc = ac + (bc - ac) · t
+ *  Edge advance     t ← t + speed · dt
+ *  Speed jitter     speed = SPEED · (1 - J + 2·J·rand01)
+ *  Bresenham steps  steps = max(|Δr|, |Δc|);  step glyph from local
+ *                   (dsr, dsc): hor / ver / dn / up
+ *  Connection cost  per frame O(L · n²) edges, L=layers, n=per-layer
+ *  Particle cost    per tick O(p) where p = n_per_layer
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • neuron_cell uses INTEGER division — at small terminal sizes,
+ *    several neurons can collapse onto the same row.  Visually
+ *    they look like one dot; physics still treats them as separate.
+ *  • The particle's t can exceed 1.0 in a single tick if dt is huge
+ *    (e.g. paused 5 s then unpaused).  The DT_CAP_S = 0.10 clamp in
+ *    main and the while loop in particle_tick together prevent both
+ *    spiral-of-death and "particle teleports".
+ *  • Resize re-reads LINES/COLS but does NOT call particle_reset —
+ *    in-flight particles continue with their old indices, which are
+ *    still valid since n_layers and n_per_layer are unchanged.
+ *  • Changing n_layers or n_per_layer DOES call particle_reset
+ *    because old indices may now be out of range.
+ *  • thickness=3 (heavy) uses UTF-8 (═ ║ ╲ ╱); requires a UTF-8
+ *    locale — setlocale(LC_ALL, "") in screen_init covers this.
+ *    Levels 0-2 are pure ASCII.
+ *  • particle_draw clamps to rows-1 (leaves bottom row for hint),
+ *    cols-1 (no right margin).  A particle drawn at the boundary
+ *    is silently skipped — visible as a tiny gap before the next
+ *    neuron.
+ *  • PAIR_HUD uses background COLOR_CYAN — on terminals that don't
+ *    honour PAIR_HUD bg, the HUD becomes faded yellow on default.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Default 3 layers × 5 neurons → 15 neurons, 2·25 = 50 connection
+ *    lines, 5 particles.  Press '+' until 16 neurons → 3·16² = 768
+ *    line draws per frame.  Should still hit 30 fps easily.
+ *  • Press '[' down to 2 layers — connections cut to one layer pair
+ *    (n²); particles never advance past the output, just bounce
+ *    back to input each hop.
+ *  • Pause (p): particles freeze mid-edge; resume — they continue
+ *    from same t, no jump.
+ *  • Reset (r): every particle snaps back to t=0 at its input
+ *    neuron (visible as a momentary alignment at column 0).
+ *  • Theme cycle (t): all four colour pairs change in unison.
+ *  • Thickness '<' / '>': line glyphs change between '.', '-|\/'
+ *    (thin/bold), and Unicode '═║╲╱' (heavy).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <locale.h>
 #include <ncurses.h>

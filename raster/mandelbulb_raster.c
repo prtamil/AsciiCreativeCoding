@@ -72,6 +72,87 @@
  *                       detail (holes, overhangs) is lost.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The Mandelbulb is defined implicitly by an SDF — there is no list of
+ * triangles to draw. So we MAKE one: at startup, we shoot 28×56 rays from
+ * outside the bulb inward, march each one until the SDF tells us we've
+ * hit the surface, and record those hit points as mesh vertices. Then we
+ * stitch them into triangles. From that frame onward the bulb is just an
+ * ordinary mesh and goes through a textbook MVP-and-rasterise pipeline.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine wrapping a balloon around the fractal and pulling it tight: the
+ * balloon takes the shape of the outermost skin and ignores any inner
+ * caves. The UV-sphere of rays IS that balloon. The mesh you get cannot
+ * show concavities or interior pods (those need raymarching), but it
+ * captures the recognisable Mandelbulb silhouette and rotates at 30 fps
+ * on a CPU because each frame is just `n_tris × per-vertex math`, not
+ * `pixels × march_steps`.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Build mesh ONCE (tessellate_mandelbulb):
+ *       For each (i,j) in 28×56 UV grid:
+ *         a. dir = (cosθcosφ, sinθ, cosθsinφ); start at r = 1.5 outside.
+ *         b. Step inward: r -= mb_de(p)·0.85 until DE < MB_HIT_EPS or
+ *            ray miss (r < 0 or step cap).
+ *         c. Record (pos, gradient-normal, smooth_iter as `u`) → Vertex.
+ *       Stitch quads from each set of 4 valid neighbours; emit 2 tris.
+ *  2. Each frame:
+ *       a. Build MVP = proj · view · model(rotation_x · rotation_y).
+ *       b. Run vert_mb on every vertex: clip_pos, world_pos, world_nrm.
+ *       c. For each triangle: clip cull → NDC → screen-space → optional
+ *          back-face cull → barycentric rasterise → z-test → frag shader.
+ *       d. Frag shader writes RGB into cbuf[]; framebuffer holds zbuf[].
+ *  3. Pick a glyph by Bayer-dithered luma into the Bourke ramp; map RGB
+ *     to the nearest of HUE_N=12 colour pairs; mvaddch + colour pair.
+ *  4. Pressing 'p' rebuilds the mesh from scratch with a new power; cost
+ *     is one-time, not per-frame.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  z_{n+1} = z_n^p + c          spherical-power Mandelbulb iteration
+ *  dr_{n+1} = p·r^(p-1)·dr + 1   running derivative for DE estimate
+ *  de = 0.5·log(r)·r / dr        Hubbard-Douady distance estimator
+ *  smooth = (esc + 1 − log(log(r)/log(bail))/log(p)) / max_iter
+ *  z^p     = r^p·(sin pθ·cos pφ, sin pθ·sin pφ, cos pθ)
+ *  hue     = fmod(smooth · hue_bands, 1)        rainbow shells
+ *  Bourke: glyph_idx = (luma + bayer[y%4][x%4]/16) · 91
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Sphere projection misses inner pods — by design. If you see "missing"
+ *    geometry compared to the raymarcher, that's the trade-off, not a bug.
+ *  • Ray stepping at 0.85 × DE is a safety multiplier; full step (1.0)
+ *    sometimes overshoots the surface and falls through.
+ *  • mb_de can return ≈0 inside the set; the `r < 1e-7` early return
+ *    prevents divide-by-zero.
+ *  • Pressing 'p' rebuilds NLAT·NLON·MB_MARCH_STEPS rays — ~0.2s freeze.
+ *    Acceptable but visible. Don't spam the key.
+ *  • Vertex `u` field is reused as smooth_iter (NOT a UV coordinate);
+ *    fragment shaders read in->custom[0] which the vert shader copied
+ *    from in->u. Confusing but intentional.
+ *  • Back-face cull (toggle 'c') may hide the front face of inverted
+ *    triangles; if a chunk vanishes, disable cull to verify winding.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause rotation (space). The Mandelbulb's classic 8-bulb silhouette
+ *    should be recognisable from any frozen frame at default power=8.
+ *  • Power=2 should give a smooth round blob (no fractal detail).
+ *  • depth_hue shader should rainbow-shell from outside-red to inside-
+ *    violet (or whatever HUE_BANDS picks).
+ *  • Toggle backface cull; with cull ON the silhouette becomes more
+ *    crisp, with cull OFF you can see "inside" tris that bleed through.
+ *  • At zoom max, the surface should fill ~80% of the terminal; at zoom
+ *    min, it shrinks to a small ball with the same hue mapping.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

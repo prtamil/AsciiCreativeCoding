@@ -29,6 +29,108 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The worm is a head plus 49 followers held on an invisible string.
+ * The HEAD is the only entity with a destination — it follows a smooth
+ * sine-wave path underground or a parabolic arc in the air.  The body
+ * is dumb: each segment just keeps itself exactly SEG_LEN cells from
+ * the segment in front, every frame.  This simple chain-of-circles
+ * (a.k.a. Conga / Verlet rope) gives a swimming, lashing snake for
+ * almost no code.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a string of magnetic beads pulled by the front bead.  As
+ * the lead bead swerves, each follower jerks toward the bead in
+ * front — but only by exactly the amount needed to keep the spacing
+ * fixed.  No spring, no mass, no inertia: just "if too far, slide
+ * along the line connecting us."  After many ticks, slow tail
+ * curves trail behind sharp head turns, exactly like a sandworm
+ * undulating.  The breach is just a parabola y = 4·H·t·(1-t) added
+ * on top of the swimming model, with t = horizontal progress
+ * across BREACH_SPAN.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Each worm has hx,hy (head) and segs[N=50].  WS_SWIM phase:
+ *       hx += dir · speed · dt
+ *       phase += SWIM_FREQ · speed · dt
+ *       hy = surface(hx) + SWIM_DEPTH + SWIM_AMP·sin(phase)
+ *  2. Decrement swim_timer; when ≤ 0, switch to WS_BREACH and
+ *     remember breach_x0 = hx.  Spawn 3 ripples at the breach point.
+ *  3. WS_BREACH:  t = (hx − breach_x0) / (dir · BREACH_SPAN).  When
+ *     t ≥ 1, return to WS_SWIM; otherwise:
+ *       above = BREACH_HEIGHT · 4t(1−t)        (parabola, peak at 0.5)
+ *       hy = surface(hx) − above
+ *       mouth_open = (|t-0.5| < 0.22) ? 1 - |t-0.5|/0.22 : 0
+ *  4. One-time sand spray at t∈[0.02, 0.13] (head clearing surface).
+ *  5. Body chain: segs[0] = head; for i=1..N-1, if dist(seg[i],
+ *     seg[i-1]) > SEG_LEN: pull seg[i] along the connecting line
+ *     until distance == SEG_LEN.  This is one Verlet constraint
+ *     iteration per pair — order matters (head first), so the tail
+ *     responds to whip-like head moves.
+ *  6. Render: tail-to-head so head writes last.  Above-ground
+ *     segments: WORM_TOP colour, '|/-\' by direction.  Below-ground:
+ *     WORM_SUB DIM '.', '. ' to suggest sand.  Last 8 segments
+ *     render as A_DIM (taper).
+ *  7. Mouth at apex draws 3 rows: top lip "_____" with '|' caps,
+ *     middle cavity "(   @  )", bottom lip "-----".  open_w =
+ *     round(mouth_open · 3.5).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Swim path     y(x) = surface(x) + DEPTH + AMP · sin(φ),
+ *                φ̇ = SWIM_FREQ · speed
+ *  Breach arc    y(t) = surface(hx) − 4·H·t(1−t),  t ∈ [0,1]
+ *  Apex height   y_min = surface − H   (at t = 0.5)
+ *  Rope const.   if |Δ| > L: seg ← seg + Δ · ((|Δ|−L)/|Δ|)
+ *  Mouth open    open(t) = max(0, 1 − |t−0.5| / 0.22)
+ *  Spray gravity sp.vy += 9·dt
+ *  Ripple radius r(t) = RIPPLE_SPEED · (RIPPLE_LIFE − life)
+ *  Terrain dunes h(x) = Σ Aₖ · sin(2π·fₖ·x + φₖ),  k=1..3
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • The chain rule pulls seg[i] toward seg[i-1] but does NOT push
+ *    them apart — segments can compress when the head reverses.
+ *    For a sandworm this is fine (it never reverses).
+ *  • SEG_LEN=1.8 is < 2 cell spacing; closely-packed segments may
+ *    map to the same screen cell, especially on diagonals.  The
+ *    "thicken on horizontal" rule (draw seg+1 when |dx| > |dy|·1.3)
+ *    masks this by widening the body at horizontal moments.
+ *  • parabola formula needs hx − breach_x0 to share sign with dir;
+ *    if speed swings during a breach the t calculation breaks —
+ *    the code freezes speed during a breach implicitly because
+ *    state is set at swim_timer expiry.
+ *  • Worms reset off-screen with all segs collinear and hy at swim
+ *    depth; first chain pulls in are gentle — no whip artefact.
+ *  • Surface row uses terrain_at(seg.x), so the body undulates at
+ *    each segment's local terrain — gives wave-following look.
+ *  • respawn_timer is preserved across worm_reset (memset followed
+ *    by restore) so off-screen worms wait 2 s before re-entering.
+ *  • Theme cycling reapplies colour pairs but does NOT touch CP_HUD
+ *    (that pair is set once in color_init).
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause when one worm is mid-breach: head should sit at hy =
+ *    surface − BREACH_HEIGHT · 4·t·(1-t) — at t=0.5, exactly 13
+ *    rows above ground.
+ *  • Count body segments: 50.  Last 8 should render dimmer (tail).
+ *  • Press space — the next swimming worm should breach within
+ *    one tick (its swim_timer is forced to 0).
+ *  • Watch ripples after a breach: they expand at 9 cols/sec,
+ *    fading from '~' to '.' to ' ' over 1.8 seconds.
+ *  • '+' raises speed by 2 cells/sec each press (cap 40); the
+ *    sinusoidal swim should visibly speed up its phase as well.
+ *  • Theme cycling 't': worm/sand/ripple colours change while
+ *    the HUD bar stays silver-on-grey.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ── §1 config ───────────────────────────────────────────────────────────── */
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>

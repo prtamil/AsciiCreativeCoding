@@ -78,6 +78,88 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A particle system is just an object pool plus three independent layers:
+ * (1) where particles are BORN (emitter), (2) what FORCES act on them
+ * (gravity/drag), (3) what happens at the EDGE (bounce/kill/wrap). Every
+ * preset — fountain, fireworks, rainfall, explosion — is just different
+ * values for these three knobs over the same fixed-step integrator. Master
+ * this single file and you can build any 2-D particle effect.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture an assembly line: a spigot drips particles at one end (emitter),
+ * the conveyor belt is governed by Newton's laws (forces + integrator),
+ * and the boundaries either bounce things back, kill them, or teleport
+ * them to the opposite edge. The pool is a fixed-size parking lot of 2048
+ * slots — slots flip from "alive" to "dead" but no malloc ever runs after
+ * init. Switching presets only changes which spigot is open, what gravity
+ * value is used, and which walls are killers.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Pool: 2048 Particle slots in BSS. pool_alloc() linear-scans from a
+ *     cursor for the first !alive slot; returns NULL when full (drop spawn).
+ *  2. Each tick (fixed dt = 1/sim_fps):
+ *       a. Emitter: rate_accum += rate·dt; spawn floor(accum) particles
+ *          into the cone (angle ± spread/2). Carry the fractional remainder.
+ *       b. For every alive particle:
+ *            - apply_forces clears (ax,ay) and adds gravity.
+ *            - drag scales velocity multiplicatively: v *= 1 − k·density·dt.
+ *            - symplectic Euler: v += a·dt; x += v·dt (v new used for x).
+ *            - lifetime -= dt; kill at 0.
+ *            - push (cell_x,cell_y) into trail ring buffer.
+ *       c. handle_collisions: per wall, bounce (flip + damp) or kill.
+ *  3. Render passes (mode-switched):
+ *     GLYPH: ramp char by speed, A_BOLD by fraction-of-life.
+ *     TRAIL: glyph + dim past TRAIL_LEN cells.
+ *     HEATMAP: Gaussian-splat alive particles into GRID_MAX, LUT->ramp.
+ *     ARROW: 8-way glyph from atan2(vy,vx).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  v += a·dt; x += v·dt           symplectic Euler (v BEFORE x)
+ *  v *= 1 − k·ρ·dt                drag: closed-form of dv/dt = -k·v
+ *  bounce:  v ← −v · DAMPING      1 − DAMPING² fraction of KE lost
+ *  rate accumulator: spawn ⌊accum⌋ each tick, keep frac for fairness
+ *  pixel↔cell: cx = ⌊px/CELL_W + 0.5⌋ where CELL_W=8, CELL_H=16
+ *  ramp_idx = first i where v^(1/2.2) ≥ k_lut_breaks[i]    gamma-corrected
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Drag as additive accel (a -= k·v) explodes when k·dt > 2; this code
+ *    uses MULTIPLICATIVE damping which is unconditionally stable.
+ *  • Symplectic order is critical — swapping the two `+=` lines turns it
+ *    into explicit Euler and energy drifts (visible as fountain "ghost
+ *    rises" on long runs).
+ *  • Rate accumulator must persist across ticks; resetting it biases birth
+ *    counts when rate × dt < 1.
+ *  • pool_alloc returns NULL when full → spawn dropped silently. Don't
+ *    deref without check; caller treats as harmless miss.
+ *  • Trail ring buffer stores CELL coords — if you change CELL_W/H mid-
+ *    flight, old trail entries point to wrong cells until they cycle out.
+ *  • handle_collisions runs after integration so a particle that crosses
+ *    the floor in one step is snapped to floor THEN bounced — it never
+ *    appears below the world.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Fountain preset: set GRAVITY=200, fire straight up at speed 400.
+ *    Expected apex ≈ v²/(2g) = 400 px above emitter. Eyeball matches.
+ *  • Doubling sim_fps must NOT change apparent dynamics — fixed-step
+ *    accumulator decouples physics from render.
+ *  • With gravity 0 and drag off, particles travel in straight lines
+ *    forever (until lifetime expires).
+ *  • With drag on, terminal velocity should approach gravity / DRAG_COEFF
+ *    once vertical force balances drag.
+ *  • Pool stats line should report alive ≤ 2048; if it pegs at 2048 with
+ *    spawn rate exceeding death rate, the cursor is the bottleneck.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #define _USE_MATH_DEFINES
 

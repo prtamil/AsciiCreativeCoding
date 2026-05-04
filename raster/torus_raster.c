@@ -76,6 +76,116 @@
  *                  shaders without changing the pipeline structure.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A torus is a CIRCLE-OF-CIRCLES.  Sweep a tube of radius r around a
+ * ring of radius R; mesh both directions with TESS_U×TESS_V steps and
+ * you have a closed quad grid that wraps both ways.  Each vertex's
+ * outward normal is just the vector from the ring centre to the
+ * surface point — no derivatives needed.  The rasterizer then runs the
+ * same GPU-style pipeline as sphere_raster: vertex shader → clip → NDC
+ → screen → bary → z-test → fragment shader → luma → Bayer dither →
+ * Bourke glyph.  Four shaders prove the pipeline is mesh-agnostic.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine bending a bicycle inner tube into a perfect O.  Now drive a
+ * grid of latitude/longitude lines into its surface — TESS_U around
+ * the big O (like longitudes) and TESS_V around the tube cross-section
+ * (like latitudes).  Each grid intersection is a vertex.  Group every
+ * 2×2 cell into two triangles and you have a closed mesh.  At any
+ * point on the surface, the "normal" is just the direction from the
+ * nearest piece of the bike rim outward — that's the ring-centre
+ * formula.  Spinning the tube and watching its highlight glide is the
+ * Phong shader; banding the diffuse term gives toon; mapping normals
+ * to RGB gives the rainbow swirl; killing interior fragments gives
+ * wireframe.
+ *
+ * ALGORITHM IN STEPS  (one frame)
+ * ──────────────────
+ *  1. scene_tick: angle_y += ROT_Y·dt; angle_x += ROT_X·dt.
+ *     model = Ry · Rx.  mvp = proj · view · model.  norm_mat =
+ *     cofactor of model upper-left 3×3.
+ *  2. fb_clear: zbuf := FLT_MAX, cbuf := zero.
+ *  3. pipeline_draw_mesh, per triangle (1536 of them):
+ *      a. For wireframe, pre-write custom[0..2] = (1,0,0)/(0,1,0)/
+ *         (0,0,1) into VSIn before each vertex shader call.
+ *      b. Vertex shader: clip_pos = mvp·pos; world_pos = model·pos;
+ *         world_nrm = normalise(norm_mat·normal).
+ *      c. Reject if all 3 w<0.001 (behind near plane).
+ *      d. Perspective divide → screen.  Reject if signed area ≤ 0
+ *         (back-face).
+ *      e. Walk integer bbox; per cell compute barycentric (b0,b1,b2);
+ *         skip if any negative; z-test against zbuf.
+ *      f. Build FSIn by interpolating world_pos, world_nrm, u, v,
+ *         custom; run frag shader → FSOut.color.
+ *      g. luma = Rec.709(R,G,B); dither + Bourke glyph + 1-of-7 colour
+ *         pair; write to cbuf with bold flag.
+ *  4. fb_blit: walk cbuf; mvaddch every non-empty cell.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Torus parameterisation:
+ *      x = (R + r·cos φ)·cos θ
+ *      y =  r·sin φ
+ *      z = (R + r·cos φ)·sin θ
+ *      θ ∈ [0,2π) sweeps the major ring,
+ *      φ ∈ [0,2π) sweeps the tube cross-section
+ *  Outward normal :  n = normalise(pos − ring_centre(θ))
+ *                    where ring_centre(θ) = (R·cos θ, 0, R·sin θ)
+ *  Vertex count   :  V = (TESS_U+1)·(TESS_V+1) = 33·25 = 825
+ *  Triangle count :  T = TESS_U·TESS_V·2 = 32·24·2 = 1536
+ *  Major / minor  :  R = 0.65, r = 0.28 — donut visibly has a hole
+ *                    at this ratio (R/r ≈ 2.3)
+ *  Phong          :  diff = max(0, N·L)
+ *                    spec = max(0, N·H)^shininess
+ *                    out = ambient + obj·light·diff + spec·0.5
+ *  Toon banding   :  banded = ⌊diff·bands⌋ / bands  (4 bands)
+ *  Wireframe      :  edge = min(b0,b1,b2);  discard if > WIRE_THRESH
+ *  Luma           :  Y = 0.2126R + 0.7152G + 0.0722B
+ *  Dither glyph   :  d = clamp(Y + (bayer−0.5)·0.15, 0, 1);
+ *                    glyph = k_bourke[(int)(d·91)]
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • If R < r the torus self-intersects and becomes a "spindle torus"
+ *    — the inner ring vertices wrap through the centre.  Defaults
+ *    keep R > r so the donut has a clean hole.
+ *  • Backface culling is essential: without it, the tube's inner
+ *    surface would draw on top of the outer, producing a confusing
+ *    double-image; the area>0 test resolves it.
+ *  • The ring-centre normal trick gives smooth normals trivially —
+ *    DO NOT compute via finite differences on the position formula,
+ *    that produces visible banding at low TESS values.
+ *  • Wireframe requires custom[0..2] to be set BEFORE the vertex
+ *    shader runs (per-vertex unit vector).  vert_wire reads those,
+ *    bary interpolation reconstructs the gradient, frag_wire detects
+ *    edges by min < threshold.
+ *  • Z-buffer stores z/w post-divide; nonlinear but monotonic, fine
+ *    for ordering at this scale.
+ *  • Aspect: terminal cells are y-tall, so an aspect = (cols·CELL_W)/
+ *    (rows·CELL_H) is fed into m4_perspective.  Without it the donut
+ *    appears as an oval.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause (space) on Phong: a single specular highlight rests on the
+ *    upper outside of the donut where N·H is maximised.  As you cycle
+ *    rotation, the highlight glides along the rim.
+ *  • Toon (s): exactly 4 distinct shade bands form circular contours
+ *    around the tube.  Count them on the lit side.
+ *  • Normals: all six axes appear.  +Y green at top/bottom of the tube,
+ *    +X red on the +x side, +Z blue facing camera, etc.
+ *  • Wireframe: count rings — TESS_U=32 longitudinal lines, TESS_V=24
+ *    latitudinal lines.  Through the donut hole, opposite-side
+ *    wireframe is visible, confirming back-face cull and z-buffer
+ *    correctly hide tube-far over tube-near.
+ *  • Rotation periods: ROT_Y=0.7 → 2π/0.7 ≈ 9 s per spin.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

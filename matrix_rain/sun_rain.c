@@ -69,6 +69,77 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Take The Matrix's vertical green rain, replace gravity with a centre,
+ * and let each drop choose its own outward angle. With 180 angles spaced
+ * 2° apart, each carrying its own speed and stagger, you get a continuous
+ * sun's-corona effect: characters streaming radially in every direction
+ * from a single '@' core, never repeating, never pausing.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a clock with 180 hour-marks. From each mark, a comet shoots
+ * outward. Each comet has a head, a 16-character glittering tail, a
+ * personal speed (1.5 to 4.0 cells/tick), and was launched at a different
+ * time so the field looks chaotic rather than synchronised. The trick is
+ * the "tall cell" correction: terminal cells are about 2:1 in aspect, so
+ * raw sin(θ) values cause vertical rays to walk twice as fast as
+ * horizontal ones — multiplying sin by ASPECT=0.45 fixes this once.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. At init, build 180 SolarRays. For ray k, angle θ = k·2π/180. Bake
+ *     cos_a = cos(θ) and sin_a = sin(θ)·ASPECT into the struct.
+ *  2. Give each ray a NEGATIVE r_off (random in [−0.55·max_r, 0]) so they
+ *     "warm up" at different times — emerging staggered, not all at once.
+ *  3. Each physics tick: r_off += speed; randomly reshuffle 75% of the
+ *     16-char trail cache (shimmer). When tail clears max_r → reset.
+ *  4. Each render frame: alpha = sim_accum / TICK_NS, draw_r_off = r_off +
+ *     speed·alpha (exact because speed is constant).
+ *  5. For each ray, walk i = 0..15 (head→tail): ri = draw_r_off − i,
+ *     break when ri < 1 (preserves centre cell). Map to (col,row) =
+ *     (cx + ri·cos_a, cy + ri·sin_a). Draw cache[i] with dist_attr(i).
+ *  6. Last: paint the '@' core on top so no trail can overwrite it.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  θ_k     = 2π·k/180                  ray angle
+ *  cos_a   = cos(θ)                    horizontal direction component
+ *  sin_a   = sin(θ)·ASPECT             ASPECT=0.45 corrects 2:1 cell ratio
+ *  col,row = cx + ri·cos_a, cy + ri·sin_a    polar→cell mapping
+ *  draw_r  = r_off + speed·alpha       exact subtick extrapolation
+ *  max_r   = cols + rows/ASPECT        worst-case travel before recycle
+ *  stagger = -rand() % (max_r·0.55)    pre-emergence delay
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Forgetting the ASPECT compression makes vertical rays look longer
+ *    than horizontal — the sun becomes a tall ellipse instead of round.
+ *  • The `if (ri < 1.0f) break;` in solar_ray_draw is critical — without
+ *    it, trails draw over the centre and the '@' flickers off.
+ *  • Pass-2 '@' must be drawn AFTER all rays. Reordering = invisible core.
+ *  • r_off starts negative; an off-by-one in the recycle test
+ *    (r_off − RAY_TRAIL < max_r) leaks rays beyond the screen and they
+ *    never reset.
+ *  • CHARSET shimmer at rate `rand()%4 != 0` — change to e.g. `==0` and
+ *    the trail freezes; rays look like static lines.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • At startup the screen should fill in gradually over ~2 seconds (the
+ *    stagger), not pop fully populated.
+ *  • Press 'r' to reset; the sun blooms outward from centre.
+ *  • The '@' must remain visible at every moment — the most fragile bug.
+ *  • Look at the head-only colour pair (CP_HEAD, white): exactly 180 white
+ *    glyphs should be visible at any time (one per ray).
+ *  • Resize the terminal: rays re-init centred on the new midpoint with no
+ *    crash; old trails are erased on next frame.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
@@ -445,7 +516,7 @@ int main(void)
          * draw_r_off = r_off + speed × alpha projects each ray's head
          * forward by the sub-tick fraction elapsed since last physics step.
          */
-        float alpha = (float)sim_accum / (float)TICK_NS;
+        float alpha = (float)sim_accum / ((float)NSPS / (float)SIM_FPS);
 
         /* ── fps counter ─────────────────────────────────────────── */
         frame_count++;

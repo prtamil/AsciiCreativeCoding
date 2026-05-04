@@ -80,6 +80,115 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A constellation is the by-product of two independent rules running on
+ * the same point cloud:
+ *   (1) every star wanders slowly through pixel space (random-walk in
+ *       acceleration, capped speed, elastic walls);
+ *   (2) every PAIR within CONNECT_DIST gets a thin ASCII line whose
+ *       weight depends on the pair's normalised separation.
+ * The constellation never has explicit edges in memory — it is
+ * recomputed from the O(N²) pair scan each frame.  Stars don't know
+ * about lines; lines don't know about each other beyond a "this cell
+ * is taken" boolean.  That decoupling is what keeps the code small.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a tray of ball bearings on a vibrating table, each painted
+ * a different colour.  Whenever two come close enough, an invisible
+ * elastic band stretches between them — bright when nearly touching,
+ * dim and dashed at maximum stretch, snapped (no line) past the limit.
+ * Watch the table for a minute and you see Delaunay-like webs flicker
+ * into existence and fall apart.  No central choreographer; just
+ * thresholding distances every frame.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Spawn: place stars at random pixels; pick an isotropic direction
+ *     by rejection-sampling the unit disk; assign speed in [50,120] px/s.
+ *  2. Each tick (60 Hz default), for every star:
+ *       a. save (px,py) into (prev_px,prev_py).
+ *       b. add random acceleration in [-WANDER_ACCEL, +WANDER_ACCEL]·dt
+ *          to (vx,vy).
+ *       c. clamp |v| to SPEED_CAP=130 px/s.
+ *       d. integrate: px += vx·dt;  py += vy·dt.
+ *       e. elastic bounce off walls: clamp position, flip normal vel.
+ *  3. Each render frame (≤60 fps) at fractional alpha = sim_accum/tick:
+ *       lerp draw_px = prev_px + (px-prev_px)·alpha for every star.
+ *  4. Convert lerp'd pixel positions to cell coordinates via
+ *     px_to_cell_x/y (CELL_W=8, CELL_H=16 sub-pixels per cell).
+ *  5. Connection pass — O(N²) over N=5..80:
+ *       for each i<j: dx,dy in pixel space; if dx²+dy² < CONNECT_DIST²:
+ *         ratio = sqrt(dx²+dy²)/CONNECT_DIST
+ *         ratio < 0.50 → bold,    stipple 1   (every cell drawn)
+ *         ratio < 0.75 → normal,  stipple 1
+ *         ratio < 1.00 → normal,  stipple 2   (every 2nd cell, dashed)
+ *         draw_line_supercover writes thin ASCII line (-, |, /, \)
+ *         honouring a cell_used[][] mask so overlapping lines never
+ *         multi-write the same cell.
+ *  6. Star pass: paint each star's char in its colour pair on top of
+ *     any line that passed through that cell (stars always win).
+ *  7. HUD overlay: fps, star count, preset name, sim Hz, paused flag.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pixel→cell        cx = floor(px/CELL_W + 0.5)   (round-half-up)
+ *  Render lerp       draw = prev + (cur − prev) · alpha,  α ∈ [0,1)
+ *  Speed cap         if |v| > SPEED_CAP: v ← v · SPEED_CAP / |v|
+ *  Wall reflection   if px<0 or px>max: vx ← −vx, clamp px
+ *  Pair distance²    d² = (xi−xj)² + (yi−yj)²
+ *  Brightness ratio  r = √(d²)/CONNECT_DIST          ∈ [0,1)
+ *  Bresenham shallow err -= ady; if err<0: y+=sy, err+=adx; advance x
+ *  Per-step glyph    next_err < 0 → diag (sx·sy>0 ? '\\' : '/');
+ *                    else axis run → '-' (shallow) or '|' (steep)
+ *  Stipple gate      draw only when (step % stipple) == 0
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • The pair scan is O(N²); STARS_MAX=80 ⇒ 3160 pairs/frame, fine.
+ *    Increase STARS_MAX without a spatial hash and 60 fps will drop.
+ *  • cell_used[rows][cols] is a VLA on the stack — large terminals
+ *    (250×80 = 20kB) are okay but extreme sizes may overflow.
+ *  • Wander uses rand() with NO srand seed in scene_init — reproducible
+ *    runs come from main()'s `srand(clock_ns())`.  If you reuse this
+ *    code without that seed, every run looks identical.
+ *  • The slope character is chosen per Bresenham step from LOCAL
+ *    motion, not the line's overall angle — this prevents the doubled-
+ *    diagonal artefact ('\\\\' or '//') that vanilla Bresenham gives
+ *    on near-45° lines.
+ *  • Stars are drawn AFTER lines so the star char always overwrites
+ *    a connection's endpoint cell — without this, a passing line
+ *    erases the star symbol intermittently.
+ *  • Connection presets use raw pixel distance (no aspect correction
+ *    in the threshold compare) — ratio thresholds 0.50/0.75 are
+ *    direction-independent because dx² + dy² is isotropic in pixels.
+ *  • lerp uses the post-bounce `px`; right after a wall bounce, prev
+ *    is on one side and px on the other — the lerp briefly draws the
+ *    star "tunnelling" through the wall.  In practice invisible at
+ *    SPEED_CAP=130 and 60 Hz tick.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause (space) and count: lines should connect every pair within
+ *    the visible "tight/normal/wide" range.  Press `c` to widen the
+ *    threshold — line count should grow roughly as area, i.e. ~r².
+ *  • At default 30 stars + "normal" preset = ~45 lines visible.
+ *  • Bold vs dashed: pick two slowly-approaching stars and watch the
+ *    line transition stipple-2 (far) → normal (closer) → bold (close).
+ *    Smooth class transitions ⇒ ratio thresholds correct.
+ *  • Press `[` to drop sim_fps; motion should slow but stay smooth
+ *    because alpha-lerp interpolates between the (now distant) ticks.
+ *  • Resize the terminal: stars should clamp into the new bounds,
+ *    none should fly off-screen — clamp logic in app_do_resize.
+ *  • Press `r` repeatedly: stars should re-spawn with isotropic
+ *    directions; over many runs the angle distribution should look
+ *    uniform (no clustering at 45° or axes).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

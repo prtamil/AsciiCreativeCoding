@@ -85,6 +85,124 @@
  *                  the expensive step: 4 extra displacement evaluations per vertex.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The mesh is a UV sphere tessellated ONCE.  Every frame the vertex
+ * shader pushes each vertex outward (or inward) along its normal by
+ * a scalar function of position and time.  But moving a vertex
+ * invalidates its normal — the surface has bent.  So we recompute
+ * the normal numerically by sampling the displacement at four
+ * neighbouring points (central difference) and crossing the resulting
+ * tangent vectors.  This single trick — displacement + recomputed
+ * normal — is what makes lighting react correctly to the moving
+ * geometry.  Without it the highlights would still hug the original
+ * sphere while the surface visibly heaves.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine pushing thumbtacks into and out of a balloon while a torch
+ * shines on it.  The balloon deforms; the bright spot has to slide
+ * to wherever the new surface is most face-on to the torch.  Pure
+ * displacement of vertex positions is "moving the thumbtacks";
+ * recomputing the normal is "telling the torch where the new face is."
+ * The shader pipeline is ordered: VS (position + normal), then
+ * raster (barycentric interp), then FS (Phong/toon/normals/wire).
+ * Each fragment shader works UNCHANGED — they all read world_pos
+ * and world_nrm without knowing whether the geometry was displaced
+ * or not.  That's the encapsulation win.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Tessellate once: TESS_U=48 longitude × TESS_V=32 latitude →
+ *     3072 triangles, with normals = normalised positions.
+ *  2. Each frame:  scene_tick advances time and rotation matrices,
+ *     scene_sync_disp copies current Uniforms into DisplaceUniforms
+ *     and selects k_disp_fn[mode], k_amp[mode], k_freq[mode].
+ *  3. For every vertex (vert_displace):
+ *       a. N = normalise(pos)            (sphere normal = pos)
+ *       b. d = disp_fn(pos, time, amp, freq)
+ *       c. dpos = pos + N · d
+ *       d. dnrm = displaced_normal(...) — see step 4
+ *       e. clip = MVP · dpos             (NDC for raster)
+ *       f. world_pos = model · dpos      (lighting)
+ *  4. displaced_normal: pick tangent T (any non-parallel cross), B = N×T.
+ *     Sample d at pos±εT and pos±εB.  Reconstruct displaced tangents:
+ *       T' = 2εT + N·(d_+T − d_-T)
+ *       B' = 2εB + N·(d_+B − d_-B)
+ *     N_new = normalise(T' × B').
+ *  5. Rasterize: each pixel barycentric-interpolates world_pos,
+ *     world_nrm, custom[].  Z-test against zbuf (init FLT_MAX).
+ *  6. Fragment shader (Phong/toon/normals/wire) writes Vec3 colour;
+ *     luma_to_cell quantises to Bayer-dithered Bourke ramp char +
+ *     colour pair index.
+ *  7. fb_blit walks cbuf and emits mvaddch with the per-cell colour.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Displacement     p' = p + N · f(p, t)
+ *  RIPPLE f         A · sin(2.5t + r·k) · (1 − 0.6·|y|),  r = √(x² + z²)
+ *  WAVE f           A · sin(2t + k·(x + 0.8y + 0.5z))
+ *  PULSE f          A · (0.85·sin(1.5t) + 0.15·sin(4.5t)) · e^(−r·k·0.4)
+ *  SPIKY f          A · |sin(kx + t) · sin(0.7t + ky) · sin(1.3t + kz)|^0.6
+ *  Tangent basis    T = norm(up × N),  B = N × T   (up=Y, fallback X)
+ *  Central diff     ∂f/∂T ≈ (f(p+εT) − f(p−εT)) / (2ε)
+ *  Displaced T'     T' = 2ε·T + N · Δd_T
+ *  New normal       N' = normalise(T' × B')
+ *  CD epsilon       ε = 0.03 · R    (3% of radius — empirical sweet spot)
+ *  Bayer dither     d ← luma + (B[py%4][px%4] − 0.5) · 0.15
+ *  Bourke ramp idx  i = ⌊d · (BOURKE_LEN − 1)⌋
+ *  Luma             Y = 0.2126·R + 0.7152·G + 0.0722·B
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • CD_EPS too small → floating-point noise dominates the difference;
+ *    normals jitter and lighting flickers.  Too large → normal lags
+ *    actual curvature; high-freq spikes get softened.  0.03·R is
+ *    tuned for these four modes.
+ *  • make_tangent_basis chooses up=(0,1,0) when |N.y|<0.9, else up=
+ *    (1,0,0) — without this fallback, polar vertices (N≈±Y) give a
+ *    degenerate cross and the normal flips randomly.
+ *  • DisplaceUniforms leads with `Uniforms base` so &disp_uni casts
+ *    cleanly to const Uniforms* in frag_phong.  The split vert_uni
+ *    / frag_uni in ShaderProgram is what fixed the original crash
+ *    when the toon shader needed bands.
+ *  • Pole normals are explicitly hardcoded to (0,±1,0) in
+ *    tessellate_sphere because sin(phi)=0 makes v3_norm degenerate.
+ *  • Backface culling uses 2D screen-space cross-product sign — a
+ *    deeply concave displacement (large negative d) can flip the
+ *    triangle's winding and silently cull faces that should show.
+ *    Press 'c' to disable culling and see the back side.
+ *  • Wireframe is barycentric edge detection — the wire shader is
+ *    fed barycentric coords via custom[0..2] from the pipeline AFTER
+ *    vert_displace_wire runs (it leaves custom[] untouched).
+ *  • Time accumulator runs only when !paused; angle still advances
+ *    too.  Resize does NOT reset time (continuous animation).
+ *  • At extreme zoom (cam_dist=1.2), the sphere clips against
+ *    CAM_NEAR=0.1 only on huge SPIKY mode peaks.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • frag_normals view: rotate through all four modes — RGB-encoded
+ *    normals should clearly bend with the deformation.  Static
+ *    sphere shows a smooth blue→green→red colour wheel; SPIKY shows
+ *    needle-tip swirls.
+ *  • Pause + cycle 'd' through modes: at t=0 the sphere is the
+ *    UNDEFORMED base (sin(0) = 0 in ripple/wave/pulse).  SPIKY has
+ *    permanent peaks because |sin·sin·sin| > 0 for most positions.
+ *  • Toon shader: band boundaries should follow the wave crests, not
+ *    the original sphere — confirms displaced normals reach the FS.
+ *  • Wireframe: latitude/longitude grid visibly ripples in RIPPLE
+ *    and WAVE; in PULSE the grid breathes uniformly; SPIKY makes
+ *    porcupine-quill grid distortions.
+ *  • Press 'c' to disable backface culling — you should see the
+ *    interior surface poke through on big PULSE inflations.
+ *  • FPS HUD: 3072 tris × ~6 disp_fn evals/vert ≈ 18k fn calls per
+ *    frame — should still hit 60 fps on any reasonable terminal.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

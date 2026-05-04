@@ -33,6 +33,97 @@
  *                  RESET_NS=0.7 s) measured with CLOCK_MONOTONIC timestamps.
  *
  * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The tree is grown ONCE into a cell grid (chars + colour-pair codes),
+ * then frozen.  The leaves remember their birthplace (orig_row, orig_col)
+ * and a single moving HEAD row.  When fall begins, each leaf's head
+ * starts at orig_row and walks downward at its own period; the trail is
+ * not stored — it's the last TRAIL_LEN rows above the head, drawn live
+ * each frame with the head white-bold and the trail solid green.  This
+ * is the matrix-rain composition recycled: per-column streamers, but the
+ * column AND the start row come from the tree's foliage layout.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Two layers stacked.  Bottom layer: a still painting (trunk + branches
+ * + leaves).  Top layer: vertical waterfalls, one per leaf, each with a
+ * white droplet at the bottom and a fading green tail trailing upward.
+ * In DISPLAY the waterfall is invisible — you see the painting.  In
+ * FALLING the waterfall switches on per-leaf as its start_delay expires;
+ * the painting's leaf cells turn into droplets and the static green
+ * leaves disappear from their birthplace as the head leaves it behind.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. scene_new_tree()  — reseed LCG, clear grid, run grow_tree() which
+ *     pushes branch tasks to a fixed-size BTask stack and processes them
+ *     iteratively (DFS).  Branch ends call place_foliage(), which
+ *     scatters leaves in an aspect-corrected ellipse (1×2 axes ratio
+ *     compensates for non-square cells).  Each leaf gets a random
+ *     start_delay in [0, MAX_START_DELAY) and fall_period in {1,2,3}.
+ *  2. ST_DISPLAY for DISPLAY_NS; HUD shows static painting.
+ *  3. ST_FALLING:  every FALL_NS the fall_tick() advances each started
+ *     leaf's head_row when its sub-counter hits its period.  Leaves
+ *     finish (done=true) when head exceeds rows + TRAIL_LEN.
+ *  4. scene_draw() during fall: trunk/branch cells are drawn from the
+ *     grid as-is.  Leaves not yet started → static green at orig.
+ *     Started leaves → for j in [TRAIL_LEN..0], draw cell at
+ *     (head_row − j, orig_col).  j=0 is the white head; j>0 is the
+ *     green tail.  Trail is clipped at orig_row so rain starts AT the
+ *     leaf, not above it.
+ *  5. When all_done(), enter ST_RESET for RESET_NS, then loop with a
+ *     new seed (g_cycle increments to vary tree shape).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Branch endpoint (screen y-up, sin uses negation):
+ *      er = r − ⌊sin(θ) · len⌋,   ec = c + ⌊cos(θ) · len⌋
+ *  Foliage ellipse test (aspect-correct):
+ *      d  = dr² + 0.25·dc²            (so semi-axes are rad × 2·rad)
+ *      keep cell if d ≤ rad²
+ *  Foliage density:  thresh = 0.62 + 0.33·d/(rad²+1); rng > thresh
+ *  Leaf fall trigger:  ++fall_sub >= fall_period → head_row++
+ *  LCG step       :  s = s · 1664525 + 1013904223
+ *  Trunk height   :  h = (TRUNK_H_MIN..MAX) · g_rows  (≈45–65 % of screen)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • RESET_NS uses the same g_state_t timer as DISPLAY/FALLING — if
+ *    all_done() fires before any tick, RESET reads `elapsed` from the
+ *    OLD state's timestamp; the code resets g_state_t when entering
+ *    ST_RESET to avoid that.
+ *  • MAX_LEAVES is hard-capped at 4096; large terminals with high
+ *    foliage density can saturate this and silently drop leaves —
+ *    add_leaf simply returns if the pool is full.
+ *  • BSTACK_MAX = 512 limits recursion depth × branch count; the code
+ *    guards every push with `bsp < BSTACK_MAX-3`.  Excess branches
+ *    are silently dropped, never crashing.
+ *  • The trail draw skips j when (head_row − j) < orig_row, so a leaf
+ *    just starting still shows as a single white head on its own cell
+ *    without a phantom tail above it.
+ *  • set_cell on the trunk skips overwrite if cell is already CP_TRUNK
+ *    in draw_branch_line — protects the 2-cell-wide trunk from being
+ *    eaten by branches.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • DISPLAY phase: count distinct foliage characters in `*@&#%o~`
+ *    (7 leaf glyphs).  All seven should appear in a healthy canopy.
+ *  • Press space mid-DISPLAY → leaves immediately begin falling.
+ *  • Press `r` → an entirely different tree (new seed) appears; trunk
+ *    height varies between ~45 % and ~65 % of screen rows.
+ *  • Watch one column carefully — head is bright white-bold, body is
+ *    bright green for up to TRAIL_LEN=7 cells above it, then nothing.
+ *  • When head_row > rows + TRAIL_LEN, the entire column should be
+ *    blank — no lingering tail.
+ *  • g_cycle in HUD increments by 1 per generated tree.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <math.h>

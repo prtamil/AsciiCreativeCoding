@@ -66,6 +66,113 @@
  *                  low — a UV sphere looks smooth with just 16×16 tessellation.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A sphere on a terminal is a CHAIN of transforms ending in luma.  The
+ * mesh is a 36×24 grid of vertices wrapped to a sphere by the UV
+ * parameterisation; each vertex is shoved through a Model→View→Proj
+ * matrix (vertex shader), each triangle is bary-rasterised across its
+ * screen bounding box, each covered cell asks "what is my normal, my
+ * world position?" (interpolated by barycentric weights) and computes
+ * a colour (fragment shader); finally the colour is reduced to luma in
+ * [0,1], dithered with a Bayer 4×4 matrix, and looked up in Paul
+ * Bourke's 92-character density ramp.  Four shaders demonstrate the
+ * pipeline isn't sphere-specific — only §4 changes if you swap meshes.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine peeling a globe into a flat rectangular grid: latitude lines
+ * across, longitude lines down, then re-pasting it into 3D using
+ * (sin φ cos θ, cos φ, sin φ sin θ).  The pasting is the mesh.  Then
+ * the camera takes a 3D photograph of the ball, but the photograph is
+ * developed not on film but on a Z-buffered character grid: nearer
+ * fragments win their cell, brighter fragments pick a denser glyph,
+ * with a bit of ordered noise (Bayer) so smooth gradients don't
+ * banded-step.  The four shaders are four "exposure recipes" picking
+ * different chemistry for the same negative.
+ *
+ * ALGORITHM IN STEPS  (one frame)
+ * ──────────────────
+ *  1. scene_tick: angle_x,y += ROT·dt.  Build model = Ry · Rx; build
+ *     mvp = proj · view · model; build norm_mat = cofactor(model3×3).
+ *  2. fb_clear: zbuf := FLT_MAX, cbuf := all-zero cells.
+ *  3. pipeline_draw_mesh, per triangle:
+ *      a. For each of 3 vertices, run vert shader → VSOut with clip_pos,
+ *         world_pos, world_nrm, custom[].
+ *      b. Reject if all 3 w-components < 0.001 (behind near plane).
+ *      c. Perspective divide: sx = (clip.x/w + 1)·cols/2,
+ *         sy = (−clip.y/w + 1)·rows/2,  sz = clip.z/w.
+ *      d. Cull back-faces if signed area <= 0 (CCW).
+ *      e. Walk integer bbox; per cell, compute barycentric (b0,b1,b2);
+ *         skip if any negative.  Z-test against zbuf; on win, write z.
+ *      f. Build FSIn by bary-interpolating world_pos, world_nrm, u, v,
+ *         custom; run frag shader → FSOut.  Discard if requested.
+ *      g. luma = 0.2126·R + 0.7152·G + 0.0722·B (Rec. 709).
+ *      h. luma_to_cell: add Bayer dither, pick Bourke glyph, pick one
+ *         of 7 colour pairs based on luma, bold if luma > 0.6.
+ *  4. fb_blit: walk cbuf, mvaddch each non-empty cell.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Sphere parameterisation:
+ *      x = R·sin φ·cos θ,   y = R·cos φ,   z = R·sin φ·sin θ
+ *      φ ∈ [0,π], θ ∈ [0,2π)
+ *  Vertex normal       :  n = pos / R           (unit sphere shortcut)
+ *  Pole degeneracy fix :  if sin φ < 1e-6,   n = (0, ±1, 0)
+ *  Vertex / triangle # :  V = (TESS_U+1)·(TESS_V+1) = 925
+ *                         T = TESS_U·TESS_V·2     = 1728
+ *  Perspective divide  :  sx = (x/w + 1)·cols/2,  sy = (−y/w + 1)·rows/2
+ *  Aspect              :  aspect = cols·CELL_W / (rows·CELL_H)
+ *  Barycentric area    :  d = (sy1−sy2)(sx0−sx2) + (sx2−sx1)(sy0−sy2)
+ *  Z-buffer test       :  z_new < zbuf[idx]  → write
+ *  Phong               :  diff = max(0, N·L);
+ *                         spec = max(0, N·H)^shininess;
+ *                         out = ambient + obj·light·diff + spec·0.5
+ *  Toon                :  banded = ⌊diff·bands⌋ / bands  (bands = 4)
+ *  Normal viz          :  RGB = N·0.5 + 0.5
+ *  Wire edge           :  edge = min(b0,b1,b2);   discard if > WIRE_THRESH
+ *  Luma → glyph        :  d = clamp(luma + (bayer−0.5)·0.15, 0, 1)
+ *                         glyph = k_bourke[(int)(d·91)]
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Pole singularity: when sin φ = 0 the normalised position is (0,0,0).
+ *    The explicit (0,±1,0) override prevents black bands at the poles.
+ *  • Back-face cull breaks for negative scale; we never apply one, so
+ *    the area-sign test is reliable.  Toggle `c` to disable cull and
+ *    inspect the inner surface — useful for understanding winding.
+ *  • Wireframe needs custom[0..2] = barycentric u,v,1−u−v written by
+ *    pipeline_draw_mesh AFTER the vertex shader runs (vert_wire writes
+ *    zeros first, pipeline overwrites).  If pipeline order changes, the
+ *    wire shader silently sees 0 and discards everything.
+ *  • Aspect ratio uses CELL_W/CELL_H = 8/16 = 0.5 — without this the
+ *    sphere appears as a vertical egg.
+ *  • Z-buffer is float and stores z/w (post-divide); not linear, but
+ *    monotonic, which is sufficient for ordering.
+ *  • At very small triangles (subpixel), barycentric area ~ 0 and the
+ *    test |d|<1e-6 returns negative bary that fails the visibility
+ *    test — triangle silently disappears.  Acceptable for a UV sphere.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause (space).  Phong: a single bright highlight over the upper-
+ *    right hemisphere (light at (3,4,3)).  Toon: 4 concentric bands.
+ *    Normals: a smooth RGB rainbow, +X red, +Y green, +Z blue.
+ *    Wire: ~1728 outline triangles, latitude/longitude grid pattern.
+ *  • Press `c`: back-face cull off → you can now see through the
+ *    silhouette to the far side surface.
+ *  • Zoom in (`+`) until CAM_DIST hits CAM_DIST_MIN = 1.0; the sphere
+ *    fills the screen and then exceeds it; wireframe still legible.
+ *  • Watch one rotation cycle: ROT_Y = 0.5 rad/s ⇒ full revolution
+ *    every 2π/0.5 ≈ 12.6 s.  Time it.
+ *  • Resize the terminal: aspect updates and the sphere stays round.
+ *  • Pole vertices (top, bottom row of the UV grid in wireframe) all
+ *    converge to one point — the classic UV sphere "fan" pattern.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

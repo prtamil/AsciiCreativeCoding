@@ -74,6 +74,105 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Each cell of the toroidal ocean owns three numbers — type (empty,
+ * fish, shark), breed counter, hunger counter.  Each tick, every live
+ * cell is awakened in random order and runs a tiny three-rule script:
+ * "did I starve?", "is there food / open water adjacent?", "have I bred
+ * yet?".  No global step, no neighbour count — just per-cell lottery
+ * draws against a randomly-shuffled neighbour list.  Lotka-Volterra
+ * oscillations EMERGE from this micro-rule, they aren't programmed in.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a chess board where every fish and shark gets one ticket per
+ * tick.  The tickets are drawn from a hat in random order.  When your
+ * ticket is called, you look in the four cardinal directions: a shark
+ * checks for fish first, then for empty water; a fish checks for empty
+ * water; both then check whether they've bred enough times to leave a
+ * baby behind.  Sharks that haven't eaten in SHARK_STARVE turns leave
+ * the board.  No central referee — the only synchronization is the
+ * "moved" flag that prevents re-drawing the same ticket twice.
+ *
+ * ALGORITHM IN STEPS  (per sim_step)
+ * ──────────────────
+ *  1. Clear g_moved[][].  Scan ocean, push every live cell index into
+ *     g_order[]; Fisher-Yates shuffle g_order.
+ *  2. For each cell index in shuffled order:
+ *        if g_moved[r][c] continue.  (cell already participated this tick)
+ *        if FISH  → fish_step(r,c)
+ *        if SHARK → shark_step(r,c)
+ *  3. fish_step:
+ *        a. age++.
+ *        b. shuffle 4 directions; pick first EMPTY neighbour.
+ *        c. if breed_age >= FISH_BREED, leave new fish at old cell, reset.
+ *        d. write fish to new cell, mark g_moved.
+ *  4. shark_step:
+ *        a. breed++, hunger++.
+ *        b. if hunger >= SHARK_STARVE → die, return.
+ *        c. shuffle dirs; first FISH wins (eat, hunger=0); else first
+ *           EMPTY; else stay put.
+ *        d. if breed >= SHARK_BREED, leave offspring at old cell.
+ *        e. write shark to new cell, mark g_moved.
+ *  5. Census fish_pop, shark_pop; push into ring buffers indexed by
+ *     g_hist_head, advance head modulo HIST_LEN.
+ *  6. Render: ocean rows (top), 4-row dual histogram (middle), HUD (bot).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Toroidal wrap   :  nr = (r + dr + R) mod R,   nc = (c + dc + C) mod C
+ *  Histogram index :  idx = (head − (cols−1−col) + 2·HIST_LEN) mod HIST_LEN
+ *  Bar height      :  fl = pop · bar_rows / scale,  scale_fish = R·C/2,
+ *                     scale_shark = R·C/10  (sharks scaled brighter
+ *                     because they're rarer)
+ *  Visual age cue  :  fish "old"   when breed_age >= FISH_BREED − 1
+ *                     shark "hungry" when hunger >= SHARK_STARVE − 1
+ *  Population
+ *    oscillation   :  steady-state cycle requires
+ *                     fish births ≈ shark predation rate;
+ *                     phase lag arises because sharks reproduce slower
+ *                     than fish.  At defaults
+ *                     (FISH_BREED=3, SHARK_BREED=10, SHARK_STARVE=4)
+ *                     the system shows visible Lotka–Volterra waves.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • A shark that just bred AND ate — the offspring at the OLD cell
+ *    inherits hunger from after the meal (zero), not the parent's
+ *    pre-meal hunger.  This is the classic Wa-Tor convention.
+ *  • g_moved guard: when shark eats fish, the eaten fish's slot becomes
+ *    SHARK with moved=1, so when the fish's own ticket is later drawn,
+ *    the cell is no longer FISH and the if-chain falls through.
+ *  • Total extinction is a stable fixed point — when sharks eat all
+ *    fish, they then starve out; ocean ends empty.  Press `r` to reseed.
+ *  • Histogram scale is fixed; if fish exceed 50 % of grid the bars
+ *    saturate (always full); below scale they fall to 0 (empty bar).
+ *  • HIST_LEN = 512 is a ring; older history scrolls off the left edge
+ *    silently when g_cols > 512 (rare on a terminal).
+ *  • g_breed and g_hunger are uint8_t and saturate at 255 — fish that
+ *    sit trapped in a corner forever stop counting at 255 instead of
+ *    overflowing.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Press `r`: ocean reseeds; fish density ≈30 %, sharks ≈5 %.
+ *    Count by sampling 100 random cells.
+ *  • Watch the histogram: fish bars (cyan, top) and shark bars (red,
+ *    bottom) should oscillate roughly out of phase — fish peak comes
+ *    several ticks before shark peak.
+ *  • Hold `+` to crank steps/frame to 20: oscillation period clearly
+ *    visible across the screen width within seconds.
+ *  • Pause (space): tick counter freezes; populations shown stay fixed.
+ *  • A fully starved ocean (everything gone) should show empty bars
+ *    sliding rightward as new zero-pop ticks accumulate.
+ *  • Single fish-only ocean (set SHARK_INIT_PCT=0): fish saturate the
+ *    ocean within ~10 ticks at FISH_BREED=3.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

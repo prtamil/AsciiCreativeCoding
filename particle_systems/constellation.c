@@ -80,6 +80,103 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The constellation is an O(N²) PROXIMITY GRAPH redrawn from scratch
+ * every frame.  Stars are point particles wandering with a tiny
+ * Ornstein–Uhlenbeck nudge in pure pixel space, bouncing off the
+ * screen rect.  Each frame, every (i,j) pair within CONNECT_DIST gets
+ * an ASCII line connecting them; line WEIGHT (bold / normal /
+ * stippled) is a function of the inter-star distance.  Stars are
+ * drawn AFTER lines so they always sit on top.  All physics is in
+ * sub-pixel space; conversion to terminal cells happens ONLY in
+ * scene_draw().
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture fireflies in a dark field, each carrying a faint LED.  When
+ * two fireflies drift within "shouting distance" of each other, an
+ * imaginary string of light snaps between them; the closer they are,
+ * the brighter the string.  The graph is recomputed every blink, so
+ * strings appear and dissolve as the swarm moves.  The wander force is
+ * what makes fireflies look natural: each tick the velocity gets
+ * bumped by a small random kick, then immediately speed-capped so it
+ * cannot run away.
+ *
+ * ALGORITHM IN STEPS  (per frame)
+ * ──────────────────
+ *  1. scene_tick (per star): save (px,py) into (prev_px,prev_py).  Add
+ *     small random acceleration (±WANDER_ACCEL)·dt to velocity.  Clamp
+ *     speed magnitude to SPEED_CAP.  Integrate pos += v·dt.  Reflect
+ *     off screen edges (vx → −vx if px < 0 or > max_px).
+ *  2. scene_draw alpha = sim_accum/tick_ns ∈ [0,1).  Pre-compute
+ *     draw_px = prev_px + (px − prev_px)·alpha for every star, plus
+ *     its terminal cell (dcx, dcy).
+ *  3. Connection pass: O(N²/2) loop over pairs (i<j).  Skip if
+ *     dist² >= CONNECT_DIST².  Compute ratio = dist/CONNECT_DIST.
+ *     Bucket: <0.50 bold solid; <0.75 normal solid; <1.00 normal
+ *     stipple-2.  Call draw_line with a thin Bresenham that picks per-
+ *     step glyph from local axis movement (`-`, `|`, `\\` or `/`).
+ *  4. cell_used[][] grid: each line marks cells it draws on; later
+ *     lines that hit those cells silently skip — prevents thick
+ *     mixed-character bundles when many lines overlap.
+ *  5. Star pass: each star renders its glyph (`*+o@.` cycled) at
+ *     (dcx, dcy) with bold and its assigned colour, atop any line.
+ *  6. HUD draws fps, star count, connect preset name, sim Hz, paused.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Render lerp        :  draw_p = prev_p + (p − prev_p) · alpha
+ *  Wander integration :  v += rand(±WANDER_ACCEL) · dt
+ *  Speed cap          :  if |v| > SPEED_CAP, v *= SPEED_CAP/|v|
+ *  Wall reflection    :  if p < 0 or p > max,   v = −v;  clamp p
+ *  Pair distance²     :  d² = (px_j − px_i)² + (py_j − py_i)²
+ *  Brightness bucket  :  ratio = d / CONNECT_DIST    (0..1)
+ *  Bresenham step
+ *    shallow (adx>=ady):  diagonal glyph if next_err < 0; else `-`
+ *    steep             :  diagonal glyph if next_err < 0; else `|`
+ *  Diagonal direction :  `\\` if sx·sy > 0 else `/`
+ *  Pixel↔cell convert :  cx = ⌊px/CELL_W + 0.5⌋
+ *  Pair complexity    :  C(N,2) = N(N−1)/2; default N=30 → 435 pairs
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Two stars ON THE SAME CELL: draw_line's adx=0,ady=0 branch draws
+ *    the diagonal glyph and exits — the star pass then overwrites it
+ *    with the star glyph, so the visual is just two stars overlapping.
+ *  • cell_used grid uses VLA `bool[rows][cols]` — for very large
+ *    terminals this is small (e.g. 200×60 = 12 KB) but stack-allocated;
+ *    huge sizes could overflow.  Acceptable on standard terminals.
+ *  • Resize: stars outside new screen are clamped; their velocities
+ *    keep them moving; first-frame jitter possible.
+ *  • Stipple-2 means draw `step % 2 == 0` only; visually shows ~50 %
+ *    of cells.  step starts at 0, so the first cell is always drawn.
+ *  • Wander uses a random ax,ay each tick — at very low SIM_FPS
+ *    (<20) the kicks become large per integration step and motion
+ *    becomes jittery.  SPEED_CAP and dt scaling mitigate this.
+ *  • prev/curr swap is at the START of star_tick.  Skip a tick (e.g.
+ *    paused) and prev tracks correctly because it isn't updated.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Default 30 stars, "normal" 200 px connect: at 60 fps you should
+ *    see 5–15 active connection lines at any moment.
+ *  • Press `=` to add stars to STARS_MAX=80; line count grows
+ *    quadratically; CPU climbs noticeably.
+ *  • Press `c` to cycle connect preset: tight (120 px) → normal
+ *    (200 px) → wide (280 px).  Wide should approximately double the
+ *    line count vs normal.
+ *  • Pause (space): freeze; pick any pair; their distance in cells
+ *    should match their drawn line length within ±1.
+ *  • Sight along any line: glyphs alternate `-` for runs and `\\`
+ *    /`/` for true diagonal cells; never two diagonal glyphs in a row.
+ *  • Stars never escape — bounce off all four walls; verify by
+ *    watching the corners.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

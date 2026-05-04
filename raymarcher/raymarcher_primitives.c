@@ -65,6 +65,111 @@
  *                  the SDF function differs between primitives.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A signed distance function f(p) returns "how far is p from the surface,
+ * negative inside, positive outside".  Given f, you don't NEED a mesh:
+ * shoot a ray, ask f(p) at the current point, take a step exactly that
+ * far along the ray, repeat.  Because f is the distance to the nearest
+ * surface, this jump can never overshoot — the ray converges to the
+ * surface in O(log) steps for smooth shapes.  This file is a gallery:
+ * one canvas, one marcher, one shader, but seventeen swap-in f's.  The
+ * function pointer in the Prim table IS the geometry.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a blind man with a metre-stick walking toward a sculpture.
+ * At every step he extends the stick — it tells him "the nearest piece
+ * of marble is X metres away".  He walks exactly X metres, no more (he
+ * knows nothing closer exists, or the stick lied).  When X < 2 mm, he
+ * has touched the surface.  Each pixel of the screen sends out one such
+ * blind walker; the surface he touches and the angle he hits at decide
+ * how bright that pixel is.  Replacing the sculpture means replacing
+ * only the stick's distance rule — the walking algorithm is unchanged.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. For each terminal cell (px,py) compute a ray: origin ro=(0,0,4.5),
+ *     direction rd through the pixel, FOV controlled by FOV_HALF_TAN.
+ *     Aspect-correct the v-component because terminal cells are ~2:1.
+ *  2. rm_march: start t=0.05; loop up to RM_MAX_STEPS=100:
+ *       - p_world = ro + rd·t
+ *       - p_local = tumble(p_world, ry, ry*0.37)  (inverse rotate)
+ *       - d = sdf(p_local, size)
+ *       - if d < RM_HIT_EPS=0.002: return t  (hit)
+ *       - if t > RM_MAX_DIST=20: return -1   (miss)
+ *       - t += d                              (sphere step)
+ *  3. rm_normal: estimate gradient by 4 tetrahedral SDF samples at
+ *     ±RM_NORM_EPS offsets, sum weighted basis vectors, normalise.
+ *  4. rm_shade: Phong = KA + KD·max(0,N·L) + KS·(R·V)^SHIN.
+ *  5. canvas_render fills intensity[]; shade_to_terminal applies gamma
+ *     1/2.2, LUT-quantises into 92 Bourke ramp slots, and Floyd-
+ *     Steinberg-dithers the residual error to four neighbours.
+ *  6. Each frame scene_tick advances ry by rot_spd·dt; rx is implicit
+ *     from ry·ROT_X_RATIO.  Tab switches the active prim index.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Sphere SDF        d = |p| − r
+ *  Box SDF           q = |p| − b;  d = |max(q,0)| + min(max(qx,qy,qz),0)
+ *  Round box         box(p,b) − r        (offset surface by r)
+ *  Torus (XZ ring)   d = |(|p.xz|−R, p.y)| − r
+ *  Capsule(a,b,r)    h = clamp((p−a)·(b−a)/|b−a|², 0,1)
+ *                    d = |(p−a) − (b−a)·h| − r
+ *  Cylinder          d2 = |(|p.xz|, |p.y|) − (r,h)|;
+ *                    d = min(max(d2),0) + |max(d2,0)|
+ *  Sphere step       t ← t + sdf(ro + rd·t)        (never overshoots)
+ *  Tetrahedron ∇     N ≈ Σ_i e_i · sdf(p + ε·e_i),  e_i = ±tetra basis
+ *                    (4 samples beats 6-sample central difference)
+ *  Phong intensity   I = KA + KD·max(0,N·L) + KS·max(0,R·V)^SHIN
+ *  Reflection        R = 2(N·L)N − L
+ *  Gamma correct     v' = v^(1/2.2)
+ *  Floyd-Steinberg   err·{7/16 →,  3/16 ↙,  5/16 ↓,  1/16 ↘}
+ *  Pixel→ray u/v     u = (px+0.5)/cw·2−1,  v = −(py+0.5)/ch·2+1
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • The ROT_X_RATIO=0.37 is irrational on purpose — a rational ratio
+ *    makes the tumble close back on itself and you'd never see some
+ *    faces.  If you change it to 0.5 the orbit becomes 2:1 periodic.
+ *  • Sphere-tracing is only correct when sdf is a TRUE distance (1-
+ *    Lipschitz).  Some IQ primitives (cone, pyramid) return signed
+ *    distance only inside a bounding region — far rays can step past
+ *    the surface.  RM_MAX_DIST=20 catches these gracefully.
+ *  • RM_HIT_EPS=0.002 is in world units; smaller eps demands more
+ *    steps (RM_MAX_STEPS=100 is the brake).  At grazing angles the
+ *    marcher stalls — characteristic "haloing" along silhouettes.
+ *  • The Bourke ramp's 92 chars give ~1% intensity quantisation.
+ *    Without dithering you'd see distinct bands; with FS dithering
+ *    the bands dissolve into noise the eye reads as gradient.
+ *  • Plane / Triangle / Quad pre-tilt p by 0.52 rad (~30°) so the
+ *    tumble shows their face — at rot=0 a flat shape would be edge-on
+ *    and invisible.  Cone / pyramid wrappers shift p in y so the
+ *    centre of mass aligns with the camera target.
+ *  • shade_to_terminal allocates a malloc per frame; on alloc failure
+ *    it falls back to direct linear mapping (no dither, no gamma).
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Press Tab through all 17 primitives without resizing — every
+ *    shape should re-centre and re-orient automatically; if a shape
+ *    appears offscreen, the wrapper's translation is wrong.
+ *  • Pause with space and watch the Phong highlight: a single bright
+ *    spot should sit on the side facing LIGHT=(-3, 3.5, 2.5).  Its
+ *    position is independent of rot — only the object turns under it.
+ *  • +/− doubles/halves apparent size by PRIM_SIZE_STEP=1.15; verify
+ *    the silhouette grows/shrinks but the centre stays put.
+ *  • Set rot_spd to 0 (R repeatedly): image freezes — no jitter means
+ *    rm_normal is stable.  Jitter ⇒ RM_NORM_EPS too small.
+ *  • Sphere is the canonical test: at default size the silhouette
+ *    should be a perfect ellipse (terminal aspect 2:1) with smooth
+ *    Phong fall-off.  Banding ⇒ dithering broken; flat shading ⇒
+ *    rm_normal returning a constant.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

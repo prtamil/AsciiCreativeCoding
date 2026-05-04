@@ -54,6 +54,109 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * All three searches share one skeleton: maintain a "frontier" of nodes
+ * whose neighbours are next in line to expand, pop one node off the
+ * frontier each tick, mark it VISITED, push every fresh neighbour onto
+ * the frontier, and record which neighbour discovered which (the
+ * g_prev[] back-pointer).  The ONLY thing the three algorithms differ
+ * on is the rule for which frontier node to pop next: BFS pops the
+ * oldest (FIFO queue), DFS pops the newest (LIFO stack), A* pops the
+ * one with the smallest f = g + h.  When the popped node is the goal,
+ * walk g_prev[] backwards to paint the final path.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture flooding ink across a road map starting at source S.  BFS is
+ * wet ink spreading evenly outward in concentric rings — every node
+ * 1 hop away gets soaked before anything 2 hops away.  DFS is one
+ * obsessive person walking, taking the first unvisited side road every
+ * time, only backtracking when stuck — it draws a single long worm
+ * through the graph.  A* is a guided drone that prefers nodes pointing
+ * toward G — it bends the BFS ring into an oval stretched toward the
+ * goal.  Same map, three different exploration orders, three different
+ * stories told by the colour wave.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. graph_generate(): drop N_NODES at random positions, connect each
+ *     to its K_CONNECT=3 nearest neighbours by Euclidean distance.
+ *     Pick the farthest-apart pair as (src, goal).
+ *  2. layout_settle(): run SETTLE_ITERS=250 of Fruchterman-Reingold —
+ *     all-pairs repulsion (∝ K_REP/d²) plus spring attraction along
+ *     edges (∝ K_ATT·(d−REST_LEN)) — until nodes spread legibly.
+ *  3. search_reset(): mark src FRONTIER, push it on the BFS queue or
+ *     DFS stack; A* uses no container — it scans the FRONTIER array.
+ *  4. Each STEP_NS=125 ms tick, call search_step():
+ *       BFS:  u = queue.pop_front(); mark VISITED; for each neighbour
+ *             still UNVIS, set g_prev[v]=u, mark FRONTIER, queue.push.
+ *       DFS:  u = stack.pop_top(); same expansion but stack-ordered.
+ *       A*:   scan FRONTIER, pick u minimising f = g_dist[u] + h(u→G);
+ *             relax g_dist[v] = g_dist[u] + edge_len if smaller.
+ *  5. Whenever a neighbour equals goal, call reconstruct_path():
+ *     walk g_prev[] from goal back to src, flag g_on_path[i] = true,
+ *     re-paint those nodes PATH_NODE/yellow and set g_phase = DONE.
+ *  6. scene_draw() reads g_ns[] each frame and pushes glyph + colour
+ *     per node, plus a Bresenham line per edge with bold yellow if
+ *     both endpoints are on the final path.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Euclidean distance   d = sqrt((xi-xj)² + (yi-yj)²)
+ *  Repulsion force      Frep = K_REP / d²            (per pair)
+ *  Spring force         Fatt = K_ATT · (d − REST_LEN) (per edge)
+ *  A* node priority     f(n) = g(n) + h(n)
+ *                       g(n) = sum of edge lengths along best known
+ *                              path src → n
+ *                       h(n) = Euclidean distance n → goal (admissible)
+ *  Edge relaxation      if g[u] + len(u,v) < g[v]: g[v] := g[u]+len; prev[v] := u
+ *  Path reconstruction  n := goal; while n != −1: on_path[n]=true; n := prev[n]
+ *  Pixel→cell           cx = round(px / CELL_W), cy = round(py / CELL_H)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • DFS uses a "lazy" pop: the same node can sit multiple times on
+ *    the stack — the `if (g_ns[u] == VISITED) return;` guard at the
+ *    top of dfs_step() catches the stale copies.
+ *  • The A* implementation has NO closed set per se: VISITED nodes
+ *    are skipped in the relaxation loop, but the FRONTIER scan is
+ *    O(N) per pop — fine at N_NODES=40, would be O(N²) total at scale.
+ *  • g_prev[] is never reset between algorithms when only `a` is
+ *    pressed — search_reset() handles it; pressing `a` alone clears
+ *    g_ns[] but not g_prev[].  Press `s` to start a clean search.
+ *  • Random graphs can be disconnected — if goal is unreachable, the
+ *    queue/stack drains and g_phase becomes DONE with no path drawn.
+ *  • The K_CONNECT=3 mutual-adding step double-connects pairs (i→j and
+ *    j→i are both set), but the symmetry is intentional — adjacency
+ *    is undirected.
+ *  • Layout uses fixed DT_SETTLE=0.3 with no damping — explosions are
+ *    avoided only because forces stabilise within 250 iterations and
+ *    bounds clamp keeps strays in.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Run BFS on a freshly generated graph: count rings of cyan
+ *    flashing outward — every node at hop k turns FRONTIER on tick k
+ *    after src.  A bright concentric pattern means BFS is correct.
+ *  • Run A* and BFS on the same graph (`s` then `a` then `s`): A*
+ *    should expand fewer or equal VISITED nodes than BFS, and the
+ *    final yellow path length should be identical for both (both
+ *    optimal under unit-weight... actually A* optimal under
+ *    Euclidean-weighted, BFS optimal under hop count; on this random
+ *    layout they may differ slightly).
+ *  • DFS frontier should look like a thin tendril, not a ring; its
+ *    final path is usually longer than BFS's.
+ *  • g_steps in the HUD: typical BFS ≈ 15-25 expansions on N=40,
+ *    A* ≈ 8-15.  If A* exceeds BFS, the heuristic computation is
+ *    broken.
+ *  • Press `r` repeatedly: nodes should redistribute and arms should
+ *    not overlap heavily — if they do, SETTLE_ITERS is too low.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

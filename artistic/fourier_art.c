@@ -65,6 +65,102 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * You scribble any closed-ish path with arrow keys.  The program treats
+ * your scribble as a sampled complex-valued time series, runs a DFT on
+ * it, and turns the bins into rotating arms.  Press ENTER and the arm
+ * chain starts redrawing your curve from scratch.  The lesson: the
+ * Fourier transform doesn't care WHAT shape you give it — give it any
+ * closed path and a finite chain of circles will reproduce it.  The
+ * shape was always a sum of rotations.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Think of a scrolling spirograph that re-tunes itself.  You hand the
+ * machine a closed-curve template.  It measures, in one O(N²) pass,
+ * the "best" radius and starting angle for each whole-number gear
+ * ratio (1, 2, 3, … and -1, -2, -3, … rotations per cycle).  Largest
+ * gear first, the chain lays them end-to-end.  Each press of '+'
+ * tells the machine to keep one more harmonic; the corner-cutting
+ * approximation grows toward your original.  The first harmonic is
+ * always an ellipse — your shape's "best ellipse" — and from there
+ * detail piles on.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. DRAW mode: arrow keys move a cell-space cursor; each move that
+ *     lands on a new pixel-space coordinate appends to g_raw_px/py
+ *     (max RAW_MAX = 8192 points).  Cells along the path are marked
+ *     in g_drawn[][] for visual feedback.
+ *  2. ENTER: arc-length resample.  Compute cumulative chord lengths
+ *     arc[i] = arc[i-1] + |Δp|.  For k=0..N-1 pick s = k/N · total,
+ *     binary-walk j until arc[j+1] ≥ s, lerp between p[j] and p[j+1].
+ *     This eliminates draw-speed bias — the DFT now sees uniformly
+ *     spaced samples regardless of how fast you drew.
+ *  3. Centre on origin: subtract centroid, record max radius for
+ *     screen-fit scaling.
+ *  4. Run twiddle-recurrence DFT (same as epicycles.c).  Build
+ *     {amp = |Z[n]|/N, phase = arg Z[n], freq = signed n} and qsort
+ *     descending by amp.
+ *  5. PLAY mode: scale = 0.40 · min(pw, ph) / max_radius so the
+ *     reconstruction always fits the screen.  φ advances by
+ *     2π/CYCLE_FRAMES per tick (CYCLE_FRAMES = 300 → 10 s at 30 fps).
+ *  6. Each tick: walk the chain, record final tip into trail.  If
+ *     auto_add is on, advance one arm every AUTO_ADD_FRAMES = 8.
+ *  7. On φ wrap, clear the trail so the curve redraws cleanly.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Chord arc        arc[i] = arc[i-1] + √((Δx)² + (Δy)²)
+ *  Resample target  s_k = (k/N) · arc[n-1]
+ *  Lerp interp      p_k = p[j] + (s_k - arc[j])/(arc[j+1] - arc[j]) · Δp
+ *  Centroid         μ = (1/N) Σ z[k]
+ *  DFT bin          Z[n] = Σ z[k] · exp(-2πi·n·k/N)
+ *  Arm contribution amp_n · exp(i·(freq_n · φ + phase_n))
+ *  Pixel scale      g_scale = 0.40·min(pw,ph) / max_r
+ *  Cycle step       φ ← φ + 2π / CYCLE_FRAMES
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • draw_compute() refuses to play with < 4 points — sets
+ *    g_draw_err and stays in DRAW mode.  A single dot has no shape.
+ *  • Arc length total is clamped to 1.0 if < 0.001 to avoid divide
+ *    by zero on a 1-cell scribble.
+ *  • The path is NOT auto-closed.  An open curve still produces a
+ *    valid reconstruction, but the DFT treats it as periodic — the
+ *    arm chain "teleports" from end to start each cycle.
+ *  • Cell aspect: cursor moves are integer cell deltas, then
+ *    multiplied by CELL_W=8 / CELL_H=16 to get pixel coords.  A
+ *    diagonal arrow key thus generates an 8:16 = 1:2 step in pixel
+ *    space — the centred shape preserves the terminal aspect.
+ *  • Repeated arrow presses at the same cell are filtered: the
+ *    "skip if identical to last point" guard prevents zero-length
+ *    chord segments from breaking arc-length normalisation.
+ *  • Resize during PLAY: pivot is recomputed but old g_scale is
+ *    reused via a ratio — slight drift possible on many resizes.
+ *  • '+' / '-' clear the trail so partial-arm previews don't blend
+ *    with full-arm trails.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Draw a small circle (~30 cells around).  After ENTER with
+ *    N_active=1 you should see a near-perfect ellipse (single arm).
+ *    By N_active=3 the reconstruction should overlay your circle.
+ *  • Draw a "+" cross — sharp corners need 50+ arms to crisp up;
+ *    with N_active=10 you'll see Gibbs ringing (oscillation near
+ *    the cross-arms).
+ *  • The HUD shows pts:N/8192 in DRAW mode — verify it grows by 1
+ *    per arrow press onto a new cell.
+ *  • In PLAY, press '-' down to N_active=1: only the largest arm
+ *    rotates, tip traces an ellipse approximating your shape's
+ *    bulk size and orientation.
+ *  • Auto-add cycles all 256 arms in 256 · 8 / 30 ≈ 68 seconds.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

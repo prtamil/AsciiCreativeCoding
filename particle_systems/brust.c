@@ -52,6 +52,85 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * No rockets, no rising trajectory — just bursts that pop into existence
+ * at random screen cells, throw 48 ASCII shards radially outward, and die
+ * within ~22 ticks. Each burst is a finite-state machine (IDLE → FLASH →
+ * LIVE → IDLE). When a burst fades, it stamps a permanent '.' at its
+ * centre on a separate scorch grid, so the screen accumulates evidence of
+ * past bursts even after sparks vanish.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a fireworks finale where every shell skips the rocket and
+ * teleports to its detonation altitude. The sky is the terminal; the
+ * scorch grid is an underexposed photograph of all impacts so far. Each
+ * burst is staged in 4 "waves" (ring-after-ring delay) so a single
+ * explosion looks like an expanding shockwave rather than a single ring.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Field owns up to BURSTS_MAX (16) Burst slots, plus a cols×rows
+ *     scorch[] char grid. Active bursts process; idle bursts count down a
+ *     fuse and re-ignite.
+ *  2. burst_ignite: pick (cx,cy) inside the screen. For each of 48
+ *     particles: angle = 2π·i/48 + jitter, speed in [1.8, 4.6], wave =
+ *     i%4, delay = wave·MAX_DELAY/(waves-1). State → FLASH.
+ *  3. FLASH frame draws a bright '*' surrounded by '+' as the impact, then
+ *     transitions to LIVE next tick.
+ *  4. Each LIVE tick (particle_tick): if delay>0, decrement and skip;
+ *     else vx,vy *= 0.82 (drag), rx += vx, ry += vy, life -= decay. The
+ *     particle is dead when life≤0 or it leaves the screen.
+ *  5. ASPECT=2.0 stretches horizontal travel so circular motion in physics
+ *     reads as circular on screen (cells are taller than wide).
+ *  6. When all 48 die or BURST_TICKS hit, scorch_cb stamps '.' at (cx,cy);
+ *     fuse resets to 8 + rand()%20; state → IDLE.
+ *  7. field_draw paints scorch first (DIM orange), then bursts on top.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  vx,vy   = cos(a)·s, sin(a)·s        radial fan-out from centre
+ *  v *= 0.82                            multiplicative drag (≈18%/tick loss)
+ *  life -= decay (~0.05–0.09)           ~12–20 ticks of visible life
+ *  screen_x = cx + rx·ASPECT            horizontal aspect compensation
+ *  wave_delay = wave·MAX_DELAY/(N-1)    staggered shell rings
+ *  bold gate: life > 0.65               brightest only in first third
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Burst centre clamps to (2 .. cols-4, 1 .. rows-2) so the FLASH '+'
+ *    cross doesn't index off-screen.
+ *  • Drag *= 0.82 each tick → after 22 ticks v has decayed to ~1.5% of
+ *    original; longer BURST_TICKS won't extend visible motion noticeably.
+ *  • Scorch grid is char-typed; only one stamp per cell, so dense bursting
+ *    will overwrite older marks invisibly. Calling 'r' (reset) reallocs
+ *    via field_free + field_init — old scorch lost.
+ *  • Wave count divides into PARTICLES; if PARTICLES isn't a multiple of
+ *    waves(=4), the last wave gets fewer particles. Currently 48/4 = 12
+ *    each, exact.
+ *  • Adding a burst with '+' inserts directly into the next slot WITHOUT
+ *    seeding parts[]; first ignition cycle still works because burst_tick
+ *    calls burst_ignite when fuse runs out.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Press '-' to drop to 1 burst; you should see exactly one detonation
+ *    at a time, with a clear FLASH (yellow '*+++') frame before the
+ *    coloured shrapnel appears.
+ *  • Particle motion should be visibly circular, not oval — if it looks
+ *    flat, ASPECT is wrong (should be 2.0 for default 8×16 cell).
+ *  • After 30 seconds of running, scorch dots should pepper the screen;
+ *    'r' must wipe them instantly.
+ *  • Slowing to SIM_FPS_MIN (5) makes the wave-delay visible — you'll see
+ *    rings 0,1,2,3 emerge in turn.
+ *  • Each spark glyph should remain stable for its lifetime (k_syms is
+ *    chosen once at spawn, never re-rolled).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

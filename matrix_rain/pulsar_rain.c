@@ -79,6 +79,99 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The pulsar is a SHEAF OF DIRECTIONS, not pixels.  At any instant it
+ * holds N angular sweep directions equally spaced around the circle;
+ * each direction emits a beam consisting of N_RADII radial samples and
+ * a WAKE_LEN-slot angular tail.  Rendering one beam is therefore TWO
+ * indices: ri (how far along the beam) and k (how far behind the head).
+ * The head k=0 is white-bold; k increases makes the colour fade and
+ * the radial rounding spread the slots into a visible 46° wake.  No
+ * pixel buffer for the rotation — the angle alone advances; everything
+ * else is recomputed each frame from cos/sin.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * A lighthouse sweeping a foggy night.  The beam itself is bright and
+ * narrow; behind it, glowing fog particles linger in the air for a
+ * moment before fading.  Now spin the lighthouse fast enough that you
+ * see N beams at once (one or two for a real pulsar; more if you want
+ * stylised flowers).  Each frame you "snap a photo" of the beams plus
+ * their fog wakes.  The matrix-rain shimmer is just the foggy
+ * particles being random ASCII chars that re-pick themselves every
+ * tick — the FOG IS THE TEXT.
+ *
+ * ALGORITHM IN STEPS  (per frame)
+ * ──────────────────
+ *  1. pulsar_tick: angle += spin; wrap mod 2π.  Refresh ~75 % of the
+ *     N_RADII×(WAKE_LEN+1) char cache with rand_ch() — this is the
+ *     visible shimmer of the beam glyphs.
+ *  2. Compute draw_angle = angle + spin·alpha (sub-tick smooth).
+ *  3. For each beam b in 0..n_beams-1, base_a = draw_angle + b·2π/n.
+ *  4. draw_beam(base_a):
+ *      a. For k = 0..WAKE_LEN, precompute (cw, sw) = (cos(base_a−k·STEP),
+ *         sin(base_a−k·STEP)·ASPECT).  17 trig pairs total.
+ *      b. For ri = 0..N_RADII−1, r = (ri+1)·r_step.  For k =
+ *         WAKE_LEN..0 (DIM FIRST so HEAD WINS):
+ *             col = cx + round(r·cw[k])
+ *             row = cy + round(r·sw[k])
+ *             attr = wake_attr(k)
+ *             mvaddch with cache[ri][k]
+ *  5. After all beams, draw the core '@' at (cx,cy) so it tops anything.
+ *  6. HUD shows fps, rps, beam count, theme.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Angular wake span :  arc = WAKE_LEN · WAKE_STEP = 16 · 0.05 = 0.8 rad ≈ 46°
+ *  Spin (rad/tick)   :  spin ∈ [SPIN_MIN, SPIN_MAX]
+ *  Rotations / sec   :  rps = spin · SIM_FPS / (2π)        (default ≈ 0.48)
+ *  Beam separation   :  Δ = 2π / n_beams
+ *  Wake slot angle k :  θ_k = base_angle − k · WAKE_STEP
+ *  Cell projection   :  col = cx + round(r · cos θ)
+ *                       row = cy + round(r · sin θ · ASPECT)
+ *  Render alpha      :  draw_angle = angle + spin · alpha   (alpha ∈ [0,1))
+ *  Coverage rule     :  WAKE_STEP × r ≈ 1 cell at r ≈ 1/STEP = 20 cells
+ *                       — sets minimum radius for solid-arc wake density
+ *  Max radius        :  max_r = √((cols/2)² + (rows/(2·ASPECT))²) · 1.05
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Multiple wake slots collapse onto the same cell at small r — order
+ *    of drawing (k descending → 0 last) is critical so the bright head
+ *    wins.  Reverse and the head is hidden behind dim fog.
+ *  • Beam overlap with N_BEAMS=16 — adjacent wakes (22.5° apart) merge;
+ *    drawing later beams over earlier is fine since all share the same
+ *    brightness ramp at each k.
+ *  • Char cache shimmer rate = 75 % per tick — at SIM_FPS=20 that's
+ *    ≈ one full refresh every 1.3 ticks; lower rate would feel frozen.
+ *  • ASPECT is BAKED into sw[k]; never apply it again at draw time, or
+ *    the wake will compress vertically twice.
+ *  • Resize: pulsar_init re-runs which fully resets cache and angle —
+ *    a brief beam restart is unavoidable.
+ *  • spin=0 corner case: SPIN_MIN=0.03 prevents fully stationary beams,
+ *    keeping the shimmer obvious.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Default 2 beams: at any frozen frame, the two beams are exactly
+ *    180° apart.  Press `]` to add: 3 beams at 120°, 4 at 90°, etc.
+ *  • Spin sanity: HUD reads "rps" — at SPIN_DEF (0.15 rad/tick × 20 Hz
+ *    / 2π) ≈ 0.48 rps, one beam returns to its starting cell every
+ *    ≈ 2.1 s.  Time it.
+ *  • Reduce spin (`-`) to SPIN_MIN; HUD reads ≈ 0.10 rps; rotation is
+ *    barely visible but shimmer continues.
+ *  • Inspect the wake: head cell is white bold, then 1 hot, 1 bright,
+ *    a stretch of mid, a stretch of dark, finally fade dim — for a
+ *    total of WAKE_LEN+1 = 17 angular slots.
+ *  • The '@' centre never disappears regardless of beam count or spin.
+ *  • Theme cycle: `t` runs through 5 hue palettes; head and core stay
+ *    white in all themes.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
@@ -474,7 +567,7 @@ int main(void)
          * Passed to pulsar_draw() which adds spin×alpha to beam_angle,
          * projecting the rotation to the exact sub-tick elapsed time.
          */
-        float alpha = (float)sim_accum / (float)TICK_NS;
+        float alpha = (float)sim_accum / ((float)NSPS / (float)SIM_FPS);
 
         /* ── fps counter ─────────────────────────────────────────── */
         frame_count++;

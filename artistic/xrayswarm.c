@@ -49,6 +49,99 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A swarm is a TIMER-DRIVEN BREATH.  The state machine inhales (DIVERGE)
+ * pushing N_WORKERS rays outward from a queen, holds (PAUSE) while
+ * trails physically retract one slot per tick, exhales (CONVERGE)
+ * pulling each worker straight back along its parked exit point, holds
+ * again, and repeats.  Workers carry no autonomy — their behaviour is
+ * dictated entirely by the swarm's current phase.  The "ray" is not a
+ * line primitive; it's the visible TAIL of a moving particle, drawn
+ * three brightness tiers deep in cross-swarm passes so dim tails never
+ * paint over bright tips.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a sea anemone in a tide.  When the tide goes out (DIVERGE)
+ * its tentacles all extend straight outward from the central body.
+ * The tide hesitates (PAUSE), and the tentacles slowly contract.  The
+ * tide flips (CONVERGE) and the tentacles snap back to the body, each
+ * one retracing its outstretched path.  Pause again, and the cycle
+ * begins anew.  The body stays put — DIVERGE locks the queen position
+ * so CONVERGE has a fixed homing target.
+ *
+ * ALGORITHM IN STEPS  (per swarm tick)
+ * ──────────────────
+ *  1. ST_DIVERGE: phase_timer += dt. For each worker: integrate
+ *     velocity + small jitter; push current position into trail ring;
+ *     if the worker exits the screen bbox, clamp to edge and zero its
+ *     velocity (parks).  When phase_timer >= DIVERGE_DUR, lock queen
+ *     pos, snapshot every worker's park_px/py, set state=ST_PAUSE,
+ *     next_state=ST_CONVERGE, pause_timer=PAUSE_DUR.
+ *  2. ST_PAUSE: each tick decrement every trail's tlen by 1 (visual
+ *     retraction).  When pause_timer<=0, branch on next_state:
+ *       CONVERGE → relaunch each worker from its park position aimed
+ *                  at the locked queen
+ *       DIVERGE  → relaunch each worker from queen at staggered angle
+ *  3. ST_CONVERGE: phase_timer += dt.  Each worker: vector toward
+ *     locked queen, steered with strength CONVERGE_STEER per second.
+ *     Park at queen when within ARRIVE_DIST.  Phase ends on timer.
+ *  4. Render in 3 BRIGHTNESS PASSES across all swarms then a HEAD pass:
+ *       DP_DIM    = oldest 20 % of trails, '.', A_DIM
+ *       DP_MID    = middle 40 %, line glyph, A_NORMAL
+ *       DP_BRIGHT = newest 40 %, line glyph, A_BOLD
+ *       DP_HEAD   = workers '*', then queens '@' last so they top.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Worker launch angle :  θ_i = i · 2π / N_WORKERS + U(0, 0.5)
+ *  Diverge speed       :  v = WORK_SPEED · (0.55 + 0.45·U)
+ *  Converge homing     :  v += (target_dir·WORK_SPEED − v) · STEER · dt
+ *  Trail head index    :  thead = (thead + 1) mod TRAIL_LEN
+ *  Brightness norm     :  norm = 1 − i/(tlen−1)  (i=0 is newest)
+ *  Trail glyph by slope:  adx = |dx|·CELL_H, ady = |dy|·CELL_W
+ *                         adx > 2.2·ady → '-'   ady > 2.2·adx → '|'
+ *                         else  '\\' if sign(dx)==sign(dy) else '/'
+ *  Render interpolate  :  draw_pos = pos + vel · alpha · dt
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • PAUSE retraction subtracts 1 from tlen PER TICK — at SIM_FPS=120
+ *    trails empty in 48/120 ≈ 0.4 s.  At SIM_FPS=10 it takes 4.8 s,
+ *    longer than PAUSE_DUR=0.7 s; trails may still be visible at the
+ *    moment of relaunch.  trail_clear() inside relaunch fixes this.
+ *  • Workers that fail to exit the screen during DIVERGE (e.g. queen
+ *    near edge, ray heading inward) park wherever their velocity dies
+ *    — those become short rays.
+ *  • Trail tip direction uses CURRENT vel (vx,vy), not segment delta;
+ *    after a worker parks (v=0), the LAST glyph's slope equals zero,
+ *    falling into the '/' branch.  Visually negligible.
+ *  • Cross-swarm overdraw: if rendering swarm-by-swarm, a later swarm's
+ *    DIM tail can hide an earlier swarm's BRIGHT tip.  Three-pass order
+ *    fixes this — never collapse the loop nesting.
+ *  • Resize updates max_px/max_py but not in-flight workers; some may
+ *    suddenly be outside, will instantly park on next diverge_tick.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • One full cycle takes DIVERGE_DUR + PAUSE_DUR + CONVERGE_DUR +
+ *    PAUSE_DUR = 8.4 s.  Watch the HUD label cycle DIVERGE → PAUSE →
+ *    CONVERGE → PAUSE.
+ *  • Workers per swarm: N_WORKERS = 20.  Press `+` to increase swarms
+ *    1..5; total visible rays = 20 · n_swarms.
+ *  • In CONVERGE every ray points straight at the queen — pause and
+ *    sight along any ray to confirm.
+ *  • During PAUSE, trails shrink: count visible trail length immediately
+ *    after entering PAUSE vs just before exiting; should be approximately
+ *    TRAIL_LEN − PAUSE_DUR · sim_fps.
+ *  • Reset (`r`) resets all swarms to a fresh DIVERGE; queen positions
+ *    randomize.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

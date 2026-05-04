@@ -58,6 +58,97 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Pre-baked shapes (Square, Arrow, Star-7, Cardioid, Lissajous, Rose)
+ * are sampled into N=256 complex points and decomposed by DFT into
+ * 256 epicycles, sorted by power.  The screen layers four things at
+ * once: the GHOST (true target as ':' dots), the ARM CHAIN currently
+ * active, the TRAIL of the chain's tip, and a POWER BAR showing what
+ * fraction of total signal energy the active arms have captured.
+ * The ghost+power bar make the convergence quantitative — you can
+ * watch Gibbs ringing on Square and read off "82.4%" mid-build.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a sculptor blocking out a statue.  The biggest amplitude
+ * arm is the rough silhouette (the marble blank).  Each next arm
+ * carves smaller details.  The energy bar is "how much marble is
+ * shaped" — a smooth Cardioid is 99% sculpted in 5 strokes; a Square
+ * is still only 95% at 30 strokes because corner-detail demands
+ * many tiny chisels.  Parseval's theorem tells you the bar values
+ * are exact and tight: the greedy ordering by |Z[n]|² gives the
+ * energy-optimal partial reconstruction at every count.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. sample_path(shape, ghost, N) fills 256 complex samples.
+ *     Polygons (Square/Arrow/Star) use sample_poly: for each output
+ *     index i, t = i·nv/N, lerp between vertex floor(t)%nv and the
+ *     next.  Smooth curves (Cardioid/Lissajous/Rose) evaluate the
+ *     parametric formula directly at t = 2π·k/N.
+ *  2. Cardioid additionally subtracts numeric centroid so the cusp
+ *     stays centred.
+ *  3. Run twiddle-recurrence O(N²) DFT.  Build the epicycle array
+ *     {amp = |Z[n]|/N, phase = arg Z[n], freq = signed n}.
+ *  4. qsort descending by amp.  Compute cumulative power table:
+ *     cum[k] = (Σ_{i≤k} amp_i²) / total_power.
+ *  5. Each frame: φ ← φ + 2π/CYCLE_FRAMES (=360 → 12 s loop).  Walk
+ *     chain; tip pushes into trail ring (TRAIL_LEN=512).  Auto-add
+ *     one arm every 8 frames if enabled.
+ *  6. Render order: ghost ':' dots → orbit ellipses → trail '*' (3
+ *     age colours) → arm '|/-\' Bresenham lines → tip '@' → pivot
+ *     '+' → HUD + power bar of 40 '=' chars.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Polygon param   t = i·nv/N,  lerp(v[⌊t⌋%nv], v[(⌊t⌋+1)%nv], frac t)
+ *  Cardioid        r(t) = ½(1 - cos t),  p(t) = r·(cos t + i·sin t)
+ *  Lissajous 3:2   x = sin(3t + π/4),  y = sin(2t)
+ *  Rose 4-petal    r(t) = cos(2t),  p(t) = r·(cos t + i·sin t)
+ *  DFT bin         Z[n] = Σ z[k] · exp(-2πi·n·k/N)
+ *  Arm power       P_n = |Z[n]/N|² = amp_n²
+ *  Parseval        (1/N) Σ |z[k]|² = Σ |Z[n]/N|² = Σ P_n
+ *  Cumulative bar  cum[k] = (Σ_{i≤k} P_i) / Σ P_i  ∈ [0,1]
+ *  Tip recursion   z(φ) = Σ amp_n · exp(i·(freq_n·φ + phase_n))
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Gibbs phenomenon: square corners overshoot the ghost path by
+ *    ~9% (the universal Gibbs constant) no matter how many arms —
+ *    visible as little bumps just outside each corner.
+ *  • Star-7 has 14 vertices in its polygon; with only 256 samples,
+ *    each segment has ~18 samples — fine, but raising N would not
+ *    sharpen the points further (limited by the polygon model).
+ *  • Rose r=cos(2t) goes through r<0 — the curve traces back through
+ *    origin twice per loop, producing the 4 petals.  Ghost dots show
+ *    the cross-overs as concentrated marks at centre.
+ *  • Centroid subtraction is done for cardioid only because its
+ *    formula is offset; other shapes are already centred at origin.
+ *  • Energy bar uses g_cum_energy[g_n_active-1] — at n_active=0 the
+ *    code clamps to 0 to avoid index -1.
+ *  • Resize triggers scene_init which calls scene_reset(0) — you
+ *    LOSE the current shape and arm-count progress on resize.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Cardioid at 5 arms should already read >95% energy.  Square at
+ *    5 arms reads ~85% but visually is still rounded — extra 15%
+ *    lives in many small high-frequency arms (corner detail).
+ *  • Press '-' down to 1 arm: the trail traces an ellipse with
+ *    axes proportional to that shape's first non-DC harmonic —
+ *    Square's biggest non-DC arm is freq ±1 → ellipse aligned with
+ *    diagonals.
+ *  • Toggle 'g' off — only the reconstruction is left.  Toggle on
+ *    again — the ':' lattice should sit RIGHT ON the trail when
+ *    n_active is high (≥80).
+ *  • A full trace takes CYCLE_FRAMES = 360 frames at 30 fps = 12 s.
+ *  • Auto-add cycles 256 arms in 256·8 = 2048 frames ≈ 68 s.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

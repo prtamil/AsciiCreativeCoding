@@ -94,6 +94,120 @@
  * -----------------------------------------------------------------------
  */
 
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+ *
+ * Algorithm      : Two-pass deferred rendering. Pass 1 (geometry/G-buffer):
+ *                  rasterise every mesh into per-pixel arrays of position,
+ *                  normal and albedo — no lighting at all. Pass 2 (lighting):
+ *                  loop over pixels and run Blinn-Phong against every light,
+ *                  using the buffered surface data. Cost goes from
+ *                  O(objects×lights) (forward) to O(objects)+O(pixels×lights).
+ *
+ * Math           : Per-vertex MVP transform = proj·view·model. Normals use
+ *                  the cofactor of the model 3×3 (correct under non-uniform
+ *                  scale). Screen space: sx = (ndcX+1)·cols/2, sy =
+ *                  (1−ndcY)·rows/2 (Y-flip). Barycentric interpolation gives
+ *                  per-pixel position, normal. Blinn-Phong:
+ *                  L = ka·albedo + kd·albedo·max(0,N·L_dir) + ks·max(0,N·H)^s.
+ *
+ * Data-structure : Six parallel grids of size [GBUF_MAX_ROWS][GBUF_MAX_COLS]:
+ *                  g_pos, g_normal, g_albedo, g_zbuf, g_valid, g_light. The
+ *                  G-buffer matches Unity HDRP and Unreal's GBufferA/B/C
+ *                  layout — same idea, simpler packing.
+ *
+ * Performance    : Geometry pass touches each surface pixel exactly once.
+ *                  Adding lights ('l') only grows the lighting pass — the
+ *                  geometry pass is invariant. The HUD shows fwd_ops vs
+ *                  def_ops to make this visible.
+ *
+ * References     : Saito & Takahashi 1990 (G-buffer concept); LearnOpenGL
+ *                  "Deferred Shading" tutorial; Unreal Engine 5 GBuffer
+ *                  documentation; Unity HDRP "Forward and Deferred rendering".
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Stop trying to shade a pixel "while you draw it". Instead, draw every
+ * surface FIRST and dump its position/normal/colour into per-pixel
+ * arrays. Then, only after the geometry phase is over, walk the screen
+ * pixel-by-pixel and run lighting against those arrays. Lights can no
+ * longer see triangles — only the flattened surface data — so adding a
+ * light costs another pass over PIXELS, never over geometry.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine taking a Polaroid photograph of the scene where every pixel of
+ * the photo carries three pieces of metadata in invisible ink: where the
+ * surface was in 3-D (g_pos), which way it faced (g_normal), and what
+ * colour the paint was (g_albedo). A second person can later look at the
+ * Polaroid, read the metadata, and compute lighting — never seeing the
+ * scene itself. The 'g' key swaps the visible "ink" so you can see each
+ * metadata layer; pressing 'l' adds another lightbulb, which only the
+ * second person notices.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. gbuffer_clear: g_zbuf=1.0 (NDC far), g_valid=0 for all pixels.
+ *  2. For each Object:
+ *       a. Build mvp = proj · view · model; norm_mat = cofactor(model).
+ *       b. For each triangle in mesh:
+ *           - Vertex stage: clip[i] = mvp · pos; world_pos = model·pos;
+ *             world_nrm = normalize(norm_mat · normal).
+ *           - Perspective divide: ndc = clip.xyz / clip.w.
+ *           - Screen-space + back-face cull (signed area > 0).
+ *           - For each pixel in tri's bbox: barycentric weights, depth
+ *             test (z < g_zbuf), write g_pos, g_normal, g_albedo, g_zbuf.
+ *  3. render_lightpass: per pixel where g_valid=1, accumulate
+ *     ambient + Σ_lights (diffuse + specular) into g_light.
+ *  4. Display: 'g' selects which layer drives the on-screen colour.
+ *     POSITION/NORMAL/ALBEDO read raw G-buffer; LIGHTING reads g_light.
+ *  5. Map RGB to ncurses colour pair, pick a glyph from the Bourke ramp.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  mvp = P · V · M                        clip-space transform
+ *  norm = cofactor(M_3×3) · n             correct under non-uniform scale
+ *  sx,sy = ((±ndc + 1)/2)·dim             NDC → pixel
+ *  area = (x1−x0)(y2−y0) − (x2−x0)(y1−y0)  back-face cull (CCW: area>0)
+ *  bary: b·v0 + b·v1 + b·v2, Σb = 1       per-pixel attribute interp
+ *  Blinn-Phong: I = ka + kd(N·L) + ks(N·H)^s    s = shininess
+ *  forward cost ∝ obj·lights;  deferred ∝ obj + pix·lights
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Triangles with all w < 0.001 are entirely behind the near plane —
+ *    skip BEFORE the perspective divide or you divide by ~0.
+ *  • Back-face cull uses screen-space signed area, NOT view-space dot
+ *    products. CCW triangles must produce positive area for the cull to
+ *    select front faces.
+ *  • g_zbuf MUST be reset to +1.0 each frame; the test is z < g_zbuf so
+ *    forgetting reset locks the buffer to last frame's depths.
+ *  • g_valid gates ALL reads in the lighting pass; without it, lighting
+ *    leaks onto the bare clear colour where there is no geometry.
+ *  • Adding a light updates ONLY g_light. POSITION/NORMAL/ALBEDO views
+ *    must remain pixel-perfect identical — that's the whole point.
+ *  • Static G-buffer arrays are GBUF_MAX size; resizing past those
+ *    dimensions silently clips render area.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Switch to ALBEDO ('g'); the cube is solid orange, sphere solid
+ *    blue, floor grey. Pressing 'l' must NOT change this view.
+ *  • In NORMAL view the cube faces show 6 distinct constant colours
+ *    (flat normals); the sphere shows a smooth gradient (smooth normals).
+ *    Cube edges look hard, sphere edges look soft.
+ *  • In LIGHTING view, adding a 2nd light should immediately re-shade
+ *    every visible pixel without requiring rotation.
+ *  • The HUD's fwd_ops vs def_ops counters should diverge as you add
+ *    lights — fwd grows by N_objects per light, def by N_pixels.
+ *  • POSITION view should show cyan-near to blue-far; rotate the camera
+ *    and watch surface depths track correctly.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

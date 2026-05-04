@@ -61,6 +61,113 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Every individual is in exactly one of three boxes: S (susceptible), I
+ * (infected), R (recovered).  Each tick, each I rolls the dice once
+ * for recovery (probability γ) and once per infected→susceptible edge
+ * for transmission (probability β).  The single most important
+ * derived number is R0 = β·⟨k⟩/γ — when R0 > 1 the epidemic explodes,
+ * < 1 it dies.  The network shape (small-world: K=4 ring with 15%
+ * rewired shortcuts) controls how fast the wavefront circles the ring
+ * versus skipping across via shortcuts.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture the ring as a circle of 40 candles.  Light one (the seed
+ * infection).  Each tick each lit candle has a γ chance of going out
+ * (recovery), and for each unlit neighbour candle, β chance of
+ * lighting it (transmission).  Now add 15% chance any given candle
+ * has a long wire stretched to a random other candle on the far side
+ * — those wires ("rewired shortcuts") let the fire jump across,
+ * which is why small-world graphs spread infection so fast.  The
+ * right-panel chart is just the global headcount of S/I/R written
+ * down each tick and scrolled left like a polygraph trace.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Watts-Strogatz construction:
+ *       a. Ring lattice: connect each node i to its K/2=2 nearest
+ *          neighbours on each side (K=4 total).
+ *       b. For each ring edge (i, i+k), with probability p=0.15,
+ *          replace target i+k with a random other node, marking
+ *          g_rewired[i][new_j] = true.
+ *  2. Layout: place node i on circle at angle 2π·i/N − π/2 (12
+ *     o'clock start), radius RING_FRAC · half-min-extent.
+ *  3. SIR tick (synchronous; staged update via nxt[]):
+ *       For each I node:
+ *         - With probability γ: mark nxt[i] = R.
+ *         - For each neighbour j with state S: with probability β,
+ *           mark nxt[j] = I, set flash[j] = FLASH_TICKS=6.
+ *       Copy nxt → g_state.
+ *  4. Append (S_count, I_count, R_count) to ring history at
+ *     g_hist_head (capacity 500); track all-time peak I.
+ *  5. Render network: edges first (dim grey for S–S/R–*, hot red for
+ *     any I-touching, bright yellow for hot rewired shortcuts).
+ *     Nodes on top: '.' grey for S, '@' red bold for I (or '*'
+ *     yellow during flash), '+' green for R.
+ *  6. Render chart: each tick = one column, stacked R(bottom green
+ *     '-') / I(red '#') / S(top grey '='); scrolls left as new ticks
+ *     append at right edge.  Y-axis labels at 0/N/4/N/2/3N/4/N.
+ *  7. HUD row: live β, γ, R0 (coloured by threshold), <k>, S/I/R
+ *     counts, phase label (READY/SEEDED/GROWING/WANING/PLATEAU/EXTINCT).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Mean degree    ⟨k⟩ = (1/N) · Σ_i deg(i)        (= K = 4 if no rewire)
+ *  Reproduction   R0 = β · ⟨k⟩ / γ
+ *  Threshold      R0 > 1 → epidemic;  R0 < 1 → extinction
+ *  Tick recover   I → R with prob γ (uniform random)
+ *  Tick transmit  for each (I,S) edge: S → I with prob β
+ *  Ring node pos  (cx + r·cos θ_i,  cy + r·sin θ_i),  θ_i = 2πi/N - π/2
+ *  Rewire prob    p = WS_P = 0.15 per directed edge
+ *  Phase detect   prev_i = hist[(head-2+HIST_LEN) % HIST_LEN]
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Synchronous update: an I that just transmitted to S(j) and ALSO
+ *    recovered in the same tick will appear as R adjacent to a fresh
+ *    yellow flash — both transitions stage into nxt[] before the
+ *    swap.  Without staging the order would matter and bias rates.
+ *  • The transmit loop runs `for (j) if g_adj[i][j] && g_state[j]==S`
+ *    — checking g_state, NOT nxt[j] — so two infected neighbours
+ *    cannot double-infect the same S in one tick: only one transition
+ *    record matters because they all overwrite the same nxt[j] slot.
+ *  • Rewiring tries up to N times to find a non-self, non-existing
+ *    target; if all attempts fail (dense graphs), the original ring
+ *    edge is silently kept.
+ *  • β and γ are clamped to [0,1] but the calculation uses uniform
+ *    rand()/RAND_MAX < g_β — RAND_MAX-1 gives slight bias against
+ *    1.0 but irrelevant in practice.
+ *  • flash counter is decremented EVERY tick including newly-infected
+ *    ones; without that, a tick-old infection still flashes at full
+ *    intensity until the next tick.
+ *  • Resize calls layout_ring (recomputes node positions) but does
+ *    NOT rebuild the graph or reset SIR — the simulation continues.
+ *  • Edge draw uses Bresenham with sx==sy to pick '\' vs '/'; near-
+ *    horizontal/vertical lines correctly use '-' / '|'.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • At default β=0.040, γ=0.025, ⟨k⟩=4: R0 = 0.040·4/0.025 = 6.4 →
+ *    R0 should display in red (> 1) and an epidemic should sweep
+ *    the ring within ~50 ticks.
+ *  • Press ↓ to lower β until R0 < 1.0 (R0 turns green); successive
+ *    resets (r) should mostly fizzle (EXTINCT phase).
+ *  • Inspect a single I node: count its edges; visible neighbours in
+ *    state S should each have an independent ~β chance per tick of
+ *    flipping yellow.
+ *  • Peak counter: 'pk' label should appear at the highest I count
+ *    seen in the chart and never decrease.
+ *  • Press 'r' multiple times: graph stays the same (graph_build
+ *    only runs once); seed node is randomised each reset.
+ *  • At γ=0, no node ever recovers; eventually all 40 → I and stay
+ *    (no R bar growth on the chart).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

@@ -62,6 +62,106 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Two independent simulations run on the same grid: a matrix-rain
+ * BACKGROUND of falling glyph streams and a DLA snowflake FOREGROUND
+ * built by random-walking particles that freeze on contact.  The trick
+ * that makes the snowflake look like a snowflake is that every
+ * stick-event is mirrored through the 12 elements of the dihedral
+ * group D6 — one walker reaches a cell, twelve cells freeze.  Symmetry
+ * is enforced AT WRITE TIME, not as a post-process.  When the outermost
+ * arm reaches 88 % of the screen radius, the whole crystal flashes
+ * bright white and resets.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Think of an empty pond on a winter night.  Rain falls vertically (the
+ * matrix streams).  At the centre a tiny ice seed sits.  Drunk
+ * particles wander randomly; the moment one touches the seed, twelve
+ * mirror-image particles all freeze at once because the pond's
+ * surface is hexagonally pure.  As the ice grows, walkers are spawned
+ * just outside the ice edge to keep growth fast (otherwise edge spawns
+ * waste forever drifting).  When the snowflake nearly fills the screen
+ * the pond glares white and refreezes.
+ *
+ * ALGORITHM IN STEPS  (per frame)
+ * ──────────────────
+ *  1. rain_tick: for each active stream, head += speed·mult.  Randomise
+ *     a few chars at the head (flicker).  Off-bottom streams die.
+ *     Refill columns until live count reaches g_n_streams.  Plus 4 %
+ *     ambient char re-randomisation across the whole grid.
+ *  2. walkers_tick: each walker steps in one of 4 cardinal directions
+ *     (rand%4).  If new cell out of bounds → respawn near crystal.  If
+ *     new cell IS frozen, try to stick at OLD cell with STICK_PROB; on
+ *     stick, freeze symmetrically + respawn.  If new cell is empty but
+ *     adjacent to frozen, try to stick at NEW cell with STICK_PROB.
+ *  3. xtal_freeze_symmetric: convert (col-cx0, row-cy0) to Euclidean
+ *     coords (scale y by 1/ASPECT_R), apply each of 12 D6 transforms,
+ *     round back to grid coords, freeze each unique target.
+ *  4. xtal_freeze_one: compute distance from centre; bin into one of
+ *     6 colour bands (CP_XTAL_1 brightest at edge, CP_XTAL_6 at core);
+ *     update max_frozen_dist.
+ *  5. If max_frozen_dist >= trigger_dist → enter STATE_FLASH for
+ *     FLASH_FRAMES; rain keeps ticking, crystal renders as bright '*'.
+ *  6. Render: rain first (skip cells where crystal exists), then
+ *     glow halo (':' on empty 8-neighbours of frozen), then frozen
+ *     cells with topology-chosen glyphs ('|', '=', '/', '\\', '#', '*').
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Euclidean coords    :  (xe, ye) = (col − cx0, (row − cy0)/ASPECT_R)
+ *  D6 rotation by k    :  rx = x·CA6[k] − y·SA6[k]
+ *                         ry = x·SA6[k] + y·CA6[k]
+ *  D6 reflection       :  ye → −ye  (then rotate)
+ *  Reproject to grid   :  nc = cx0 + round(rx)
+ *                         nr = cy0 + round(ry · ASPECT_R)
+ *  Distance for band   :  d = √(xe² + ye²)
+ *  Colour band         :  band = ⌊d/max_dist · 6⌋   ∈ {0..5}
+ *  Trigger reset       :  max_frozen_dist >= 0.88 · max_dist
+ *  Spawn radius        :  r_spawn = clamp(max_frozen_dist + 8,
+ *                                          4,  0.94·grid_half)
+ *  DLA fractal dim     :  ≈ 1.71  (Witten–Sander 1981)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Symmetric freeze can land OUTSIDE grid for tall thin terminals; the
+ *    xtal_in() guard silently drops out-of-bounds rotations, breaking
+ *    perfect symmetry near the edges.  Acceptable visual artifact.
+ *  • Two walkers can stick the same cell on the same tick — the second
+ *    write is a no-op since xtal_freeze_one tests `cells[r][c] != 0`.
+ *  • Spawning at edge would make growth glacial; spawn_r tracks
+ *    max_frozen_dist + 8 to keep walkers near the fresh perimeter.
+ *  • STICK_PROB extremes: 0.0 = nothing freezes after seed; 1.0 =
+ *    every contact sticks, producing fat blob instead of dendrites.
+ *  • Bottom row reserved for HUD; xtal_draw and rain_draw skip
+ *    `r >= rows-1` to avoid overwriting it.
+ *  • Theme switch via `t` calls theme_apply(); already-frozen cells
+ *    keep their stored CP id which now resolves to the new palette.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause (`p`) immediately after a single walker sticks: count frozen
+ *    cells.  Should be exactly 12 (or fewer near the centre where some
+ *    rotations land on the same cell).  After the seed and stub, total
+ *    frozen ≈ 13 (= 1 centre + 6 stub + 6 mirror).
+ *  • The crystal must always exhibit 6-fold rotational symmetry — pick
+ *    any frozen cell and verify its 5 60°-rotated mates exist.  This
+ *    holds even mid-growth.
+ *  • Increase walkers (`+`) → growth visibly speeds up; max walkers
+ *    300.
+ *  • Press `[`/`]` → rain speed multiplier changes from 0.1 to 4.0;
+ *    head streaks visibly accelerate.
+ *  • The flash phase runs FLASH_FRAMES = 28 frames at RENDER_FPS = 30
+ *    ≈ 0.93 s.
+ *  • Each theme: rain hue and crystal hue should contrast (e.g. green
+ *    rain + cyan crystal in Classic; purple rain + cyan crystal in
+ *    Nebula).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

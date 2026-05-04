@@ -51,6 +51,99 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The gear is an IMPLICIT FIELD, not a mesh.  For every cell on screen
+ * within the gear's bounding box, ask: "given my polar (r, θ) relative
+ * to the gear centre and rotation, do I lie on the hub ring, on a spoke,
+ * on a tooth side, or on the inner/outer arc?"  Each test is a thin
+ * threshold around an analytic curve.  Sparks are the OPPOSITE: explicit
+ * particles emitted from tooth tips, carrying the gear's tangential
+ * surface velocity, then integrating gravity + drag + turbulence until
+ * their life timer expires through 7 cooling stages.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * The gear is like checking whether you're standing on a painted line
+ * by looking at your GPS coordinates — no need to walk the line.  For
+ * every screen cell, convert to (r, θ), subtract the gear's rotation,
+ * and run a switch through 5 mutually-exclusive thresholds.  The teeth
+ * appear because the outer-arc test only fires when the local θ falls
+ * inside a tooth slice (TOOTH_DUTY = 42 % of each 1/N_TEETH wedge).
+ * Sparks then are tiny welding chips flying off the spinning rim — they
+ * inherit the rim's tangential speed plus an outward radial kick, then
+ * gravity wins and they arc downward as they cool through 7 colours.
+ *
+ * ALGORITHM IN STEPS  (per frame)
+ * ──────────────────
+ *  1. gear_tick: angle += ω·dt;  wrap mod TAU.
+ *  2. Spark emission: emit_acc += rate·dt where rate = SPARK_BASE_RATE
+ *     · (ω/ω_base) · density.  While emit_acc ≥ 1, pick a random tooth
+ *     index, compute its tip angle = gear.angle + (t + duty/2)·TAU/N,
+ *     and spark_emit() at that point.
+ *  3. spark_emit: position = centre + R_OUTER·(cos θ, sin θ); velocity
+ *     = tangential + radial kick + random scatter; life = 0.85..1.0.
+ *  4. Spark integration: vy += GRAVITY·dt; v += turb·dt; v *= e^(-DRAG·dt);
+ *     pos += v·dt; life -= dt/SPARK_LIFE.  Off-screen sparks die.
+ *  5. draw_sparks: stage = first STAGE_THRESH index where life > thresh;
+ *     stage selects char/colour/attr from the active theme.
+ *  6. draw_gear: for each cell in the gear's bbox, compute (rad, ang_g),
+ *     ang_l = ang_g − gear.angle, phase = frac(ang_l·N_TEETH/TAU).  Test
+ *     each gear part in priority order: hub ring → spokes → tooth sides
+ *     → inner arc (gap zones) → outer arc (tooth zones).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Tooth tip angle    :  α_t = gear.angle + (t + duty/2) · TAU / N_TEETH
+ *  Tip world position :  (cx + R_outer·cos α, cy + R_outer·sin α)
+ *  Tangential velocity:  v_tang = ω · R_outer · TANG_SCALE,
+ *                        direction = (−sin α, cos α)
+ *  Radial kick        :  v_kick  = (cos α, sin α) · U(KICK_MIN, KICK_MAX)
+ *  Local angle        :  ang_l   = atan2(dy, dx) − gear.angle
+ *  Tooth phase        :  phase   = frac(ang_l · N_TEETH / TAU)  ∈ [0,1)
+ *  In-tooth test      :  phase < TOOTH_DUTY  (42 %)
+ *  Spark life decay   :  life -= dt / SPARK_LIFE  (1.9 s total)
+ *  Spark drag         :  v *= exp(−DRAG · dt)
+ *  Stage              :  smallest i in 0..6 with life > STAGE_THRESH[i]
+ *  Cell aspect fix    :  CELL_W=8, CELL_H=16 — pixel space already y-tall,
+ *                        so the same r=√(dx²+dy²) gives a circular gear.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Spark pool exhaustion — spark_emit linear-scans for life<=0; if all
+ *    1500 are alive the emit silently no-ops (fine for visual; rate
+ *    self-throttles via emit_acc).
+ *  • Emission rate is hard-capped at 1200 sparks/s to prevent runaway
+ *    when ω is high AND density is high.
+ *  • Theme switch must call color_apply_theme() to re-init pairs CP_S0..
+ *    CP_S6; sparks already in flight immediately swap palette.
+ *  • Inside the priority chain in draw_gear, FIRST match wins — change
+ *    the order and the gear loses parts.  Hub ring before spokes,
+ *    spokes before tooth sides, etc.
+ *  • Sparks dying off-screen: clamped to the framebuffer rect; resize
+ *    updates max_px/max_py before next tick.
+ *  • Tooth count and TOOTH_DUTY are tuned together — at 10 teeth and
+ *    duty 0.42, gap is 0.58 of each wedge so tips read clearly.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Press `1` (slow): rotation visible, spark count low (~50–100).
+ *    Press `5` (fast): emission climbs near 1200/s cap, sparks form a
+ *    bright halo, gear nearly blurs.
+ *  • Spark stream ALWAYS leaves a tooth tip tangent-first — at any
+ *    instant the freshest sparks lie on the tangent line through the
+ *    spinning tooth they just left.
+ *  • Sparks fall — vy increases monotonically until drag balances
+ *    gravity, so the spray bows downward, never upward, regardless of
+ *    rotation direction.
+ *  • Theme cycle: press `t` 10 times → returns to FIRE; spark glyphs
+ *    and colour ramp change but spark physics is identical.
+ *  • Pause (space): gear freezes mid-rotation; sparks freeze in place.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

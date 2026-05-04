@@ -29,6 +29,99 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A homing missile does NOT teleport toward its target.  Each tick it
+ * blends its current heading a little bit toward the desired heading;
+ * over many ticks the velocity vector swings around like a compass
+ * needle settling on north.  Tiny perpendicular wobble adds visual
+ * life without changing speed.  When the target is finally hit, the
+ * rocket vanishes and an explosion spawns sparks + an expanding ring
+ * + a bright core flash + persistent ground scorch.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine steering a ship by lerping the rudder.  Each frame: "what
+ * direction do I WANT?" minus "what direction am I going?", times
+ * (TURN_RATE · dt).  Add a small fraction of that gap to the heading,
+ * normalise to keep it a unit vector, and rotate the velocity to
+ * match.  Now multiply by current speed (ramping linearly toward
+ * SPEEDMAX) to get vx, vy.  The wobble is a phase-driven sine
+ * sloshed PERPENDICULAR to the heading, scaled by min(1, dist/10) so
+ * the final dive is straight.  Trail is a 30-frame ring buffer of
+ * (x,y) snapshots, drawn as direction-aware slope characters.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Auto-launch every ~LAUNCH_RATE seconds: pick a random port,
+ *     pick a random ground column tc, target ty = terrain[tc]-0.3.
+ *  2. rocket_update each frame:
+ *       a. Push (x,y) into ring trail.
+ *       b. dx,dy = target − pos; if |d| < 1.5 → done.
+ *       c. ddx,ddy = unit(dx,dy);  cdx,cdy = unit(vx,vy).
+ *       d. tr = min(TURN_RATE · dt, 0.99); cdx += tr·(ddx-cdx).
+ *       e. Re-normalise (cdx,cdy) so it stays a unit heading.
+ *       f. wobble = amp · sin(phase) · min(1, dist/10); add
+ *          perpendicular component (-cdy, cdx)·wobble; re-normalise.
+ *       g. speed += 20·dt, clamp to SPEEDMAX.  vx = wdx·speed.
+ *       h. pos += vel · dt.  If y ≥ terrain[col] → done (ground hit).
+ *  3. dir_char_rocket maps angle to one of 8 ASCII glyphs by
+ *     22.5°-wide bins (>, \, v, /, <, \, ^, /).
+ *  4. Trail draw walks oldest→newest with age fraction af = t/(len-1).
+ *     Three colour tiers: af>0.70 HOT+BOLD, >0.38 MID, else DIM.
+ *  5. Explosion spawn: scorch terrain (radius 5.5, 0..4 intensity),
+ *     emit 22 sparks at radial angles (downward angle clamped to
+ *     keep most going up).  Expanding ring r ← r + 14·dt; aspect
+ *     correction y_radius = ring·0.45 to look circular in cell space.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Heading lerp     ĉ ← ĉ + (TURN_RATE · dt) · (d̂ − ĉ),  ĉ ← ĉ/|ĉ|
+ *  Wobble inject    w = amp·min(1,dist/10)·sin(phase)
+ *                   ĉ' = (cdx − cdy·w, cdy + cdx·w),  ĉ' ← ĉ'/|ĉ'|
+ *  Velocity         v = ĉ · speed
+ *  Speed ramp       speed ← min(SPEEDMAX, speed + 20·dt)
+ *  Direction bin    angle = atan2(vy, vx);  bin = floor((angle+π/8)/(π/4))
+ *  Ring expand      r ← r + 14·dt;  aspect: y_r = r · 0.45
+ *  Spark gravity    sp.vy += 7·dt
+ *  Terrain dunes    h(x) = Σ Aₖ · sin(2π·fₖ·x + φₖ),  k=1..4
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • TURN_RATE·dt is clamped to 0.99 — without the clamp, low fps
+ *    (large dt) would overshoot the target heading entirely.
+ *  • Wobble fades to zero when dist < 10 (final dive); without this
+ *    the rocket misses by ~1 cell and sets state=DONE on bounds, not
+ *    on target — visible as a stray sparkless terminate.
+ *  • Re-normalisation after lerp AND after wobble inject is critical;
+ *    otherwise speed drifts (heading vector grows or shrinks).
+ *  • Trail ring index uses (head − len + t + TRAIL_LEN·2) % TRAIL_LEN
+ *    — the +2× buffer is to keep modulo positive in C without UB.
+ *  • Explosion ring aspect: 0.45 (≠ 0.5) is empirical for typical
+ *    16:8 cells; perfect circle factor is 8/16 = 0.5 but the 0.45
+ *    looks rounder because of font kerning.
+ *  • Resize calls scene_reset — all in-flight rockets vanish.
+ *  • mvaddch with ACS_* and chtype-cast plain chars are mixed; the
+ *    cast (chtype)(unsigned char)ch prevents sign-extension corruption.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause and watch a single rocket: its glyph should rotate through
+ *    all 8 bins as it arcs from launch to impact.
+ *  • Press '+' to halve interval; rocket count climbs toward
+ *    MAX_ROCKETS=28 then plateaus (auto-launch only fires when
+ *    active < MAX-2).
+ *  • Press space (salvo): one rocket per port (8) launches in the
+ *    same frame — count should jump by ~8.
+ *  • Scorch marks on terrain decay every 3 seconds (g_scorch_decay
+ *    counter); successive impacts in the same area persist longer.
+ *  • Wobble is most visible in the middle of flight; near launch and
+ *    near impact the trail should be visibly straighter.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ── §1 config ───────────────────────────────────────────────────────────── */
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>

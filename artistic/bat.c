@@ -82,6 +82,86 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A V-formation isn't simulated bat-by-bat — it's a RIGID JIG that rides
+ * on top of the leader.  Every follower's position is the leader's
+ * position plus a fixed (along, perp) offset rotated into the group's
+ * heading.  Simulation is a single point per group; everything else is
+ * cosmetic geometry recomputed each frame.  The wing flap is a four-frame
+ * cycle indexed by a per-bat phase counter, and the formation is a
+ * triangular Pascal layout where row r holds r+1 bats.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Think of a paper-cutout V glued to the tip of an arrow.  The arrow
+ * flies; the V flies with it, never deforming.  When the arrow flips to
+ * a new heading, the V instantly re-orients — there is no inertia, no
+ * per-bat physics, no flocking.  The "swarm" feel comes purely from
+ * three independent arrows leaving the same origin at staggered times
+ * along six preset compass directions.
+ *
+ * ALGORITHM IN STEPS  (per group, per tick)
+ * ──────────────────
+ *  1. If GRP_PAUSE, decrement timer; on zero, advance angle_idx, pick
+ *     the next preset angle from k_angles[6], call group_launch().
+ *  2. group_launch sets vx,vy = SPEED·(cos θ, sin θ) and re-places every
+ *     bat at (cx,cy) using the formation jig.
+ *  3. If GRP_FLYING, advance every bat by (vx·dt, vy·dt) — same delta
+ *     for all bats, so the formation is rigid by construction.
+ *  4. Increment each bat's phase by 1; wrap at WING_CYCLE (=36 ticks).
+ *  5. If the LEADER (bat 0) leaves the screen rect, switch to GRP_PAUSE
+ *     for PAUSE_TICKS.
+ *  6. Render: for each bat compute frame = phase·4/WING_CYCLE ∈ {0..3}
+ *     and stamp the 3-cell glyph (lw, body, rw); leader uses A_BOLD.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Pascal row of bat k :  largest r with r·(r+1)/2 <= k
+ *  Position in row     :  pos = k − r·(r+1)/2          ∈ {0..r}
+ *  Bat count           :  n_bats = (n_rows+1)·(n_rows+2)/2  (triangular)
+ *  Flight-frame offset :  along = −r · LAG_PX
+ *                         perp  = (pos − r/2) · SPREAD_PX
+ *  World rotation      :  wx = lx + along·cos θ − perp·sin θ
+ *                         wy = ly + along·sin θ + perp·cos θ
+ *  Velocity            :  (vx, vy) = SPEED·(cos θ, sin θ)
+ *  Wing frame index    :  frame = ⌊phase · 4 / WING_CYCLE⌋   (∈ 0..3)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Leader-exit detection uses bat[0] only — followers can briefly
+ *    linger off-screen after the leader trips the bound; the cell-clip
+ *    in group_draw skips out-of-bounds glyphs so this is safe.
+ *  • WING_CYCLE must be divisible by 4, else `frame` skips frames at
+ *    the wrap point.  36 / 4 = 9, fine.
+ *  • Growing rows mid-flight: new bats inherit current leader pos and
+ *    velocity, so the formation snaps in rigidly without trailing.
+ *  • Shrinking rows: tail bats are simply not iterated — old pixel
+ *    positions remain in the slots but are never drawn.
+ *  • Initial stagger uses (k_init_angle_idx − 1) so the post-pause
+ *    increment lands on the intended first-launch heading.
+ *  • Resize triggers full scene_init; current group state is discarded
+ *    intentionally rather than trying to re-anchor mid-flight.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Press `+` six times: row count must climb 3→4→5→6 then clamp.
+ *    Bat counts per group: 6, 10, 15, 21, 28.
+ *  • Pause with space; the leaders sit at the centre and three V's
+ *    fan out behind in their respective heading.  Count rows: should
+ *    equal n_rows + 1 (leader is row 0).
+ *  • Watch one bat through one flap: '/o\' → '-o-' → '\o/' → '-o-' →
+ *    '/o\' over WING_CYCLE ticks (~0.6 s at 60 fps).
+ *  • All three groups should never collide at t=0 — the STAGGER_TICKS
+ *    delay puts them on the screen one at a time.
+ *  • After leader exits, the group reappears at centre after
+ *    PAUSE_TICKS ticks (≈0.9 s at 60 fps) heading 60° later in the
+ *    six-preset cycle.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

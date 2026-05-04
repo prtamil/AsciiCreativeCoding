@@ -67,6 +67,82 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A normal firework spark traces a parabolic arc, but its visible body is
+ * just one bright point. Here we keep the last 16 positions in a ring
+ * buffer per spark and redraw them — and randomly reshuffle the glyphs at
+ * those positions every tick. The result: the spark is no longer a dot but
+ * a 16-character snake of jumping ASCII that traces its own trajectory,
+ * brightest at the head, dim at the tail.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a sparkler in the dark, photographed with long exposure: you see
+ * the arc as a glowing curve. Now overlay The Matrix's flickering character
+ * rain on that curve, head bright, body fading, glyphs rerolling every
+ * frame. That's the visual contract. The rocket-and-burst skeleton is
+ * standard fireworks (rise, drag, apex, explode); the novelty is the
+ * per-spark trail buffer.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Rocket rises: y += vy·dt, vy += DRAG·dt·0.5; explode when vy ≥ 0
+ *     (apex) or y < 2 (top edge).
+ *  2. Burst: spawn 72 sparks at angles 2πi/72 with jittered speed (1.5–5),
+ *     life ∈ [0.6,1.0], decay ∈ [0.025,0.060].
+ *  3. Per spark per tick:
+ *     a. Slide trail history: trail[i] = trail[i-1] for i = TRAIL_LEN-1..1,
+ *        then trail[0] = (cx,cy).
+ *     b. Integrate: cx += vx·dt·8; cy += vy·dt·8; vy += g·dt with g
+ *        jittered ±20% so sparks fan out instead of all tracing one curve.
+ *     c. Shimmer: for each cache[k], if rand()%4 != 0 reroll the glyph
+ *        (≈75% replaced per tick).
+ *     d. life -= decay; deactivate at 0.
+ *  4. Per spark per frame, draw oldest→newest so newer slots overwrite
+ *     older ones at cell collisions; finally draw the white head on top.
+ *  5. trail_attr maps slot index to bold/normal/dim bands; if life<0.25
+ *     everything goes dim (death fade).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  angle_i = 2π·i/N + jitter         even fan-out around explosion centre
+ *  vx,vy   = cos(a)·s, sin(a)·s      polar→cartesian initial velocity
+ *  cy     += vy·dt·8                 the ×8 boosts apparent speed in cells
+ *  vy     += g·dt, g ≈ GRAVITY·U(.8,1.2)  per-spark gravity variance
+ *  trail[0] = (cx,cy)                most recent position; index = age
+ *  shimmer rate = 1 − 1/4 = 0.75     fraction of trail rerolled per tick
+ *  life decay: life -= decay/tick    death at life ≤ 0
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • The trail-shift loop must run in reverse (i = TRAIL_LEN-1 down to 1)
+ *    or you smear the newest position across the whole buffer.
+ *  • Drawing newest-first instead of oldest-first looks visually wrong:
+ *    trails get overwritten by their own dim tails. Order is load-bearing.
+ *  • trail_fill caps at TRAIL_LEN — drawing trail_fill-1 down to 0 avoids
+ *    rendering uninitialised slots in the first 16 ticks of a spark's life.
+ *  • At apex detection, `vy >= 0.0f` only fires once because vy grows
+ *    monotonically; the `y < 2.0f` clause covers the rare too-fast launch.
+ *  • Resize calls show_init which clears all rockets — bursts mid-flight
+ *    are lost. By design.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • A single-rocket setup ('-' to 1) should clearly show 72 trailing
+ *    snakes after each burst, all curving downward under gravity.
+ *  • The head glyph must be white (CP_WHITE) regardless of theme.
+ *  • Press 't' through themes; rocket bodies and spark colours change but
+ *    the head stays white.
+ *  • Slow down with '[' to 10 fps; the shimmer should be visibly chunky
+ *    (≈75% of cache cells reroll each tick is now eye-trackable).
+ *  • Tail of each spark fades cleanly to A_DIM; no abrupt "trail snap"
+ *    when life drops below 0.25.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

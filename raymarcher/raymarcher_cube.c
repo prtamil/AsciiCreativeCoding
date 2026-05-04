@@ -54,6 +54,114 @@
  *                  trade-off: lower VIRT → faster render, larger pixelated blocks.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The cube never moves.  In the SDF's world the box is a static
+ * axis-aligned chunk centred at the origin.  What "rotates" is the
+ * camera ray's query point: before evaluating sdf_box, we rotate p by
+ * the INVERSE of the cube's orientation.  That single trick — sample
+ * the world in box-local coordinates — turns rotation, translation,
+ * scale, and even animation into one-line mutations of p, with no
+ * change to the SDF or the marcher.  The whole image is then "for
+ * each pixel: shoot a ray, sphere-march until d < ε, gradient-sample
+ * a normal, Phong-shade".
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture an actor on a turntable in a dark theatre.  Instead of
+ * physically rotating the actor, you rotate the AUDIENCE (and their
+ * questions about him) by the opposite angle and ask "where is the
+ * actor's chest from where you're now sitting?"  The actor never
+ * budged.  Same here: sdf_box always answers about a box at the
+ * origin; we feed it a rotated p so it tells us how far the ROTATED-
+ * AS-IF cube's surface is.  The light, by contrast, IS in world
+ * space — it orbits the cube on a tilted ellipse driven by s->time.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Each frame: scene_tick advances rx, ry by rot_x/rot_y · dt; time
+ *     accumulates so the orbiting light has fresh phase.
+ *  2. canvas_render iterates every (px,py) in the canvas (one cell per
+ *     pixel since CELL_W = CELL_H = 1) and calls rm_cast_pixel.
+ *  3. rm_cast_pixel builds a primary ray:
+ *       u =  (px+0.5)/cw·2−1            (NDC x)
+ *       v = −(py+0.5)/ch·2+1            (NDC y, flipped)
+ *       rd = normalise(u·FOV, v·FOV·aspect, −1)
+ *       ro = (0, 0, 4.5)
+ *  4. rm_march sphere-traces:  start t=0.5, repeat up to 80 times:
+ *       p = ro + rd·t
+ *       d = sdf_scene(p, rx, ry, h)
+ *       if d < 0.003 → hit; if t > 20 → miss; else t += d.
+ *  5. sdf_scene rotates p by (-rx,-ry) via rm_rotate_yx, then evaluates
+ *     sdf_box: q = |p|−h; outside = |max(q,0)|; inside = min(max qxyz,0);
+ *     return outside + inside.
+ *  6. rm_normal samples sdf_scene at four tetrahedral offsets, sums
+ *     k_i·d_i, normalises — gives a gradient that stays clean across
+ *     edges (where central differences would smudge).
+ *  7. rm_shade: I = KA + KD·max(0,N·L) + KS·max(0,R·V)^SHIN, clamped.
+ *  8. canvas_draw maps the intensity 0..1 to k_ramp index 0..12 (" .,:;+=oxOX#@")
+ *     and writes one terminal cell with the matching luma colour pair.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Box SDF           q = |p| − h
+ *                    d = |max(q,0)| + min(max(qx,qy,qz), 0)
+ *                       └ outside dist ┘ └ inside (negative) ┘
+ *  Sphere step       t ← t + sdf(ro + rd·t)
+ *  Y rotation        x' =  x·cosθ + z·sinθ,   z' = −x·sinθ + z·cosθ
+ *  X rotation        y' =  y·cosφ − z·sinφ,   z' =  y·sinφ + z·cosφ
+ *  Inverse rotate    sample the cube's frame as p_local = R⁻¹·p_world
+ *  Tetrahedral ∇     N = norm(Σ k_i · sdf(p + ε·k_i)),   k_i = corners
+ *                      of a regular tetrahedron in {±1}³
+ *  Phong             I = KA + KD·max(0,N·L) + KS·max(0,R·V)^SHIN
+ *  Reflection        R = 2(N·L)N − L
+ *  Light orbit       L(t) = (3.5·cos(α), sin(0.6α)+2, 3.5·sin(α)+1)
+ *                    α = time · light_spd
+ *  Aspect fix        v_dir ← v_dir · (rows · CELL_ASPECT / cols)
+ *  Ramp index        idx = round(I · (RAMP_N−1)),  RAMP_N = 13
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • The SDF is rotated, but ro and rd are NOT — that's intentional.
+ *    Rotating the ray instead of the SDF would also work but would
+ *    move the camera relative to the lighting, breaking the orbit.
+ *  • At grazing angles the marcher takes many small steps and may
+ *    cap out at RM_MAX_STEPS=80; the resulting "missed silhouette"
+ *    pixels render as background.  Lower RM_HIT_EPS to 0.001 to see
+ *    sharper edges at the cost of more steps.
+ *  • The tetrahedral normal is exact for a planar face but smears
+ *    across edges by ~RM_NORM_EPS=0.001 — visible as a 1-pixel-wide
+ *    chamfer where two faces meet.  This is the price of a stable N.
+ *  • t=0.5 start in rm_march skips self-hit when the camera is
+ *    inside or on the cube; if you grow CUBE_H past CAM_Z=4.5 you
+ *    will end up inside the cube and the marcher returns immediately.
+ *  • The 13-char ramp gives only ~7.5% intensity per step — banding
+ *    is visible by design (no dithering here, unlike primitives.c).
+ *  • SIZE_MAXX clamps cube_h to 2.5 — preventing the inside-camera
+ *    case above.  Don't raise without also raising CAM_Z.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause (space) at any frame: face shading should be uniform per
+ *    face — flat shading is correct because all face normals are
+ *    exactly ±X, ±Y, ±Z.  A gradient ACROSS a face means rm_normal
+ *    is being polluted by edge samples.
+ *  • Six faces is the test: as the cube tumbles, you should see at
+ *    most 3 faces simultaneously, each a different brightness.
+ *  • At cube_h = 0.9 (default) the silhouette spans roughly half the
+ *    canvas height when ry=0; doubling cube_h via `=` should roughly
+ *    double the silhouette before bumping into the camera.
+ *  • Press `l` until light orbits visibly — the specular highlight
+ *    should sweep across faces; if it sticks to one face the
+ *    reflection vector is mis-signed.
+ *  • Set rot_x=rot_y=ROT_MIN (`[` many times) and watch a near-static
+ *    cube — fps should remain steady at SIM_FPS_DEFAULT=24 because
+ *    the marcher cost is independent of motion.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

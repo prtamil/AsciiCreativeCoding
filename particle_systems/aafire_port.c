@@ -89,6 +89,84 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Hot air rises. Encode that as a 2-D byte grid where higher = cooler, and
+ * each frame replace every cell with a smoothed-and-cooled average of
+ * cells just BELOW it. Keep injecting heat at the bottom in an arch shape
+ * and the whole system self-organises into the familiar tongue-of-flame
+ * silhouette. No physics, no particles — just a cellular-automaton
+ * convection model running upside down.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a chimney filled with smoke detectors. Every detector reads
+ * "average of the five detectors below me, minus a constant", and the
+ * chimney is fed at the bottom by a wide-but-uneven gas burner. The
+ * "minus a constant" is gravity-as-cooling: heat fades the further it has
+ * to climb. The five-neighbour stencil (3 from y+1, 2 from y+2 — no centre
+ * on the deeper row) gives more vertical inertia than Doom's 3-neighbour
+ * version, hence the rounder, blobbier flames.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Allocate (rows+2)×cols bytes. The bottom 2 rows are FUEL.
+ *  2. Build a decay table once: for sum 0..1279,
+ *        table[s] = max(0, (s − 800/rows) / 5).
+ *     Subtraction = cooling per row; division by 5 = neighbour averaging.
+ *  3. Each tick (drawfire):
+ *       - height++; loop counter sweeps i1=1↑ and i2=4·cols+1↓ across cols.
+ *         min(i1,i2,height) → an arch profile that warms up over frames.
+ *       - Within bursts of up to 6 cells, last1 = rand()%min(...)·fuel;
+ *         random ±2 walk; written into both fuel rows.
+ *  4. Each tick (firemain):
+ *       For every cell (x,y), sum 5 below — (x±1,y+1), (x,y+1), (x±1,y+2)
+ *       — clamp by MAXTABLE, look up table[], write back.
+ *  5. Render: gamma-correct each byte, Floyd-Steinberg dither into the
+ *     float buffer, LUT the dithered value to a ramp index, paint the
+ *     character with the theme's colour pair.
+ *  6. Diff-clear: only paint ' ' on cells that were hot last frame and are
+ *     cold now (avoids full-screen redraw flicker).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  table[s] = max(0, (s − minus)/5),  minus = max(1, 800/rows)
+ *  next[x,y] = table[ Σ five-neighbour heat values below ]
+ *  fuel arch: cap = min(i1, i2, height); last1 = rand()%cap · fuel
+ *  gamma: v = (heat/255)^(1/2.2)        perceptual brightness
+ *  Floyd-Steinberg weights: 7/16 right, 3/16 ↙, 5/16 ↓, 1/16 ↘
+ *  ramp idx: largest i s.t. v ≥ k_lut_breaks[i]
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Without the +2 phantom rows, firemain reads off the array end — this
+ *    is the most common port-bug. bitmap_alloc allocates rows+2.
+ *  • `minus = 800/rows` is integer-divided; on a 1-row terminal that's
+ *    800, and the table becomes all zeros. The `if (minus==0) minus=1`
+ *    guards the OPPOSITE edge (huge terminals).
+ *  • `cap < 1` from arch sweep → rand()%0 is UB; the `if (cap<1) cap=1`
+ *    clamp is critical.
+ *  • Resize must call gentable() because `minus` depends on rows.
+ *  • prev[] is only allocated for visible rows; copy after firemain only
+ *    for the visible region or you'll memcpy past the buffer.
+ *  • Theme cycle every CYCLE_TICKS triggers needs_clear so the old palette
+ *    doesn't leak through under diff-clear.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Cold start: at t=0 the grid is empty, then a small flame should grow
+ *    over ~cols frames as `height` climbs through the warm-up clamp.
+ *  • Lower fuel with G; the arch should shrink without changing shape.
+ *  • Pause then unpause; the flame must continue from its current state,
+ *    not flash to a fresh seed.
+ *  • Every theme should preserve the silhouette — only colours change.
+ *  • The HUD line at row 0 should remain readable; ramp_attr for the
+ *    hottest index always sets A_BOLD.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

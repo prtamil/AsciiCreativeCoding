@@ -58,6 +58,94 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Any closed 2-D curve, no matter how wiggly, is the SUM of constant-
+ * speed circular motions stacked end-to-end.  The DFT tells you exactly
+ * which radii, frequencies, and starting angles to use.  Sort them
+ * largest-first and the first few arms already capture the silhouette
+ * — the rest are corrective scribbles.  The tip of the chain literally
+ * draws the original shape as time advances.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a child's drawing toy: a big wheel with a smaller wheel
+ * pinned to its rim, and an even smaller wheel pinned to THAT rim,
+ * each spinning at its own integer multiple of a base rate.  A pen at
+ * the very tip of the last arm draws the curve.  The DFT is the
+ * factory: feed it a target shape and it returns the wheel sizes
+ * (|Z[n]|/N), gear ratios (freq n), and starting offsets (arg Z[n]).
+ * Adding more wheels = sharper detail, exactly like adding more
+ * Fourier terms to a square wave.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Parametrise the chosen shape t∈[0,2π) and sample N=256 complex
+ *     points z[k] = x(t_k) + i·y(t_k).
+ *  2. Run the O(N²) DFT with the twiddle recurrence W^(k+1) = W^k · W
+ *     so no trig appears in the inner loop.  Output is Z[0..N-1].
+ *  3. For each bin n, store {amp = |Z[n]|/N, phase = arg Z[n],
+ *     freq = (n ≤ N/2 ? n : n-N)} — remap the upper half to negative
+ *     frequencies so arms can rotate either direction.
+ *  4. qsort the array by amp descending — the greedy best-N
+ *     approximation is just the first N_active entries.
+ *  5. Each frame advance φ by 2π/CYCLE_FRAMES.  Walk the chain: start
+ *     at the pivot, for each active arm i add (amp_i·scale)·
+ *     exp(i·(freq_i·φ + phase_i)) to (x,y).  Cache every joint in
+ *     g_tips_px/py for drawing.
+ *  6. Push the final tip into the trail ring buffer; clear it when φ
+ *     wraps so the curve redraws cleanly each cycle.
+ *  7. Draw orbits (back), trail (mid), arm chain (Bresenham lines),
+ *     tip bob, pivot, HUD.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  DFT bin           Z[n] = Σ_{k=0..N-1} z[k]·exp(-2πi·n·k/N)
+ *  Twiddle step      W^(k+1) = W^k · W,  W = exp(-2πi·n/N)
+ *  Arm amplitude     amp_n = |Z[n]| / N        (radius in shape units)
+ *  Arm phase         phase_n = atan2(Z[n].im, Z[n].re)
+ *  Signed freq       freq_n = n ≤ N/2 ? n : n-N   (allows CW arms)
+ *  Tip recursion     z(φ) = Σ amp_n · exp(i·(freq_n·φ + phase_n))
+ *  Cycle stepping    φ ← φ + 2π / CYCLE_FRAMES   (CYCLE_FRAMES=360)
+ *  Pixel scale       g_scale = SHAPE_SCALE · min(pw, ph)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • The DC bin Z[0] becomes the largest "arm" — it is just a constant
+ *    offset (zero frequency, no rotation).  After sorting it usually
+ *    sits at index 0; you may see a stationary first segment.
+ *  • Sharp-cornered shapes (Star) need many arms to look right —
+ *    Gibbs phenomenon shows as ringing near the points until N_active
+ *    approaches N.  Smooth shapes (Heart) converge in ~10 arms.
+ *  • Negative-frequency arms (n > N/2) rotate CCW; without the signed
+ *    remap they'd all spin the same way and the reconstruction would
+ *    be wrong by a complex conjugate.
+ *  • Trail is cleared every full φ cycle — if you remove that clear
+ *    the trail accumulates forever and the screen fills with stars.
+ *  • Cell aspect 16:8 = 2:1 means circular orbits draw as ellipses;
+ *    draw_orbit uses rx=r/CELL_W, ry=r/CELL_H to compensate.
+ *  • Resize calls scene_init which calls scene_reset — animation
+ *    restarts from φ=0 and N_active=1, even if you had built it up.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • With N_active=1 the tip should trace a perfect circle (just the
+ *    DC + one rotating arm).  At N_active=2 it should be an ellipse
+ *    or limaçon.  At N_active=N_SAMPLES the shape should match the
+ *    parametric curve to within 1 cell.
+ *  • Pause the demo, press '+' once — the chain should grow by one
+ *    segment and the tip should jump slightly (next-best correction).
+ *  • Press 'n' to switch to Heart — visible recognisable heart should
+ *    emerge by ~30 arms; Star needs ~80+ for clean points.
+ *  • Toggle 'c' off — orbit circles disappear but tip path is
+ *    unchanged.  Toggle 'a' off, count manually: each '+' adds one
+ *    arm, '-' removes one and clears the stale trail.
+ *  • One full trace takes CYCLE_FRAMES=360 frames at 30 fps = 12 s.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

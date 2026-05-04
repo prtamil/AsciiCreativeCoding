@@ -64,6 +64,72 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A whole universe of one-dimensional patterns lives inside a single byte.
+ * Take any 8-bit number 0-255, treat its bits as a tiny truth-table indexed
+ * by the three cells above (left, centre, right), and you have a complete
+ * deterministic rule for evolving an infinite row of cells. The screen is
+ * just that row stamped over and over, one generation per terminal line.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a row of dominoes, each either standing or fallen. To produce the
+ * next row, every domino looks at itself and its two neighbours, finds that
+ * 3-bit pattern (one of 8 possibilities) on a small lookup card, and sets
+ * its successor accordingly. The "card" is the rule number printed in
+ * binary. Stack 100 such rows and you get either Sierpinski triangles
+ * (rule 90), pseudo-random noise (rule 30), or gliders (rule 110).
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Seed row 0: usually a single live cell at the centre column.
+ *  2. To compute row r+1 from row r, for each column c:
+ *       a. Read l = row[c-1], m = row[c], rv = row[c+1] (wrap toroidally).
+ *       b. Form the 3-bit index n = (l<<2)|(m<<1)|rv  ∈ [0,7].
+ *       c. New cell = (rule >> n) & 1.
+ *  3. Each tick of the framework loop adds one row (every g_delay ticks).
+ *  4. When row index reaches g_ca_rows-1, freeze the pattern, hold for
+ *     PAUSE_TICKS, then auto-advance to the next preset.
+ *  5. Render: row r of g_grid maps to terminal row 1+r; class colour is
+ *     looked up once per pattern from ca_classify().
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  n = (l<<2)|(m<<1)|r          neighbourhood → 3-bit index 0..7
+ *  next = (rule >> n) & 1       Wolfram lookup: rule's n-th bit
+ *  rule 110 = 0b01101110        bit pattern that yields Turing-completeness
+ *  wrap: src[(c-1+cols) % cols] toroidal boundary, no edge artefacts
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Rule 0 and 255 are degenerate (all-dead / all-alive after one step) —
+ *    kept in the preset list as visual sanity checks.
+ *  • Toroidal wrap means a "centre" seed is only centred for ONE row;
+ *    after a few generations the pattern can re-enter from the opposite edge.
+ *  • g_grid[r] is computed top-down once; resizing columns invalidates the
+ *    seed and forces a re-seed (see screen_resize → ca_seed_center).
+ *  • Random seed (R) populates row 0 with rand()&1 — chaotic rules look
+ *    drastically different from centre seed, fixed/fractal ones may not.
+ *  • Three-digit rule entry auto-applies at 3 chars; values > 255 silently
+ *    rejected so the buffer stays harmless.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Rule 90 must show a Sierpinski triangle from a centre seed —
+ *    canonical fractal sanity check.
+ *  • Rule 30's centre column should look statistically random (Wolfram
+ *    used it as the Mathematica RNG until 2002).
+ *  • Rule 0 collapses to all-zero on row 1; rule 255 to all-ones.
+ *  • The classification colour at the top must match the visual character
+ *    of the pattern (chaotic-orange for rule 30, fractal-yellow for 90).
+ *  • Pressing + halves the rows-per-row delay; the bottom of the screen
+ *    should fill in roughly half the time.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

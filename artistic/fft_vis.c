@@ -64,6 +64,93 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A signal made of three sine waves at frequencies f₁, f₂, f₃ produces
+ * exactly three spikes in its frequency spectrum, each at the matching
+ * bin.  The FFT is the cheap way (O(N log N)) to find those spikes.
+ * This file shows BOTH views side by side: when you toggle a sine off,
+ * its spike vanishes; when you change its frequency, the spike slides
+ * along the bin axis.  The link between the two panels is the whole
+ * lesson.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a prism splitting white light into a rainbow.  The time
+ * panel is the "white light" — a single jagged waveform you can't
+ * easily decode by eye.  The frequency panel is the rainbow — every
+ * pure sine becomes a clean coloured stripe at its own wavelength.
+ * The FFT is the prism, and Cooley-Tukey is the trick that makes
+ * the prism O(N log N) cheap instead of O(N²): split the work into
+ * even/odd halves, recurse, recombine with a twist factor (twiddle).
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Each frame, build the time-domain signal x[n] = Σ_c amp_c ·
+ *     sin(2π·freq_c·n/N + phase·freq_c) + decaying_noise[n].
+ *  2. Copy into complex buffers re[], im[]=0.
+ *  3. Bit-reversal permutation: swap each x[i] with x[reverse_bits(i)]
+ *     so the iterative butterfly processes pairs in natural order.
+ *  4. For each butterfly stage s=1..log₂N, with len=2^s and half=len/2:
+ *       Walk twiddle W from 1 by W₀=exp(-2πi/len) per step.  For each
+ *       pair (j, j+half): t = W·X[j+half]; X[j+half] = X[j]−t;
+ *       X[j] += t.  (Decimation-In-Time butterfly.)
+ *  5. After log₂N stages, X[k] = re[k]+i·im[k] is the DFT.
+ *  6. Compute |X[k]|/(N/2) for k=0..N/2-1 (one-sided magnitude
+ *     spectrum; bins above Nyquist mirror the lower half).
+ *  7. Normalise both panels by their running max and draw vertical
+ *     '|'/'.' bars from a baseline.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Forward DFT      X[k] = Σ_{n=0..N-1} x[n] · exp(-2πi·k·n/N)
+ *  Twiddle          W_N^k = cos(2πk/N) − i·sin(2πk/N)
+ *  Butterfly        X[j]      = E[j] + W_N^j · O[j]
+ *                   X[j+N/2]  = E[j] − W_N^j · O[j]
+ *  Twiddle step     W^(j+1) = W^j · W^1 (one cmul, no trig in inner)
+ *  Magnitude        |X[k]| = √(Re² + Im²)
+ *  Parseval         Σ|x[n]|² = (1/N) · Σ|X[k]|²
+ *  Bit reversal     rev(i, b) flips the b lowest bits of i
+ *  Op count         FFT ≈ N·log₂N,  DFT = N²  (128 → 896 vs 16384)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • N_FFT MUST be a power of two; the bit-reverse and butterfly stage
+ *    loop both depend on it.  Setting N=100 silently corrupts output.
+ *  • build_signal uses the SAME phase·freq term across components, so
+ *    they all drift at consistent rates — this is animation, not real
+ *    audio sampling.  Bin freq is in cycles-per-buffer, not Hz.
+ *  • freq is clamped to [1, N/2-1].  At freq = N/2 (Nyquist) you'd see
+ *    one bar per sample (alternating ±1) — the upper limit prevents
+ *    that aliased degenerate case.
+ *  • Magnitude is divided by N/2, not N — this matches one-sided
+ *    spectrum convention so a unit sine produces a peak ≈ amp.
+ *  • Noise is one-shot: pressing 'n' fills g_noise[] then decays
+ *    g_noise_decay from 1 → 0 at 0.03/frame ≈ 1 s.  Spam pressing
+ *    'n' resets the decay; you cannot stack bursts.
+ *  • Auto-scaling normalises by mag_max each frame — a tiny remaining
+ *    DC bin can blow up visually when all components are off.
+ *  • app_draw uses refresh() (not the wnoutrefresh+doupdate pair);
+ *    fine here because there is no other drawing layer.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Defaults: comp[0]=4, comp[1]=11, comp[2]=23 → spectrum should
+ *    show three clear peaks at bins 4, 11, 23 with relative heights
+ *    1.0, 0.6, 0.4.
+ *  • Toggle '2' off — the bin-11 peak should vanish; the time wave
+ *    becomes visibly simpler.  Toggle back on, peak returns.
+ *  • Press '+' with comp[0] selected — the leftmost peak slides
+ *    rightward by one bin per press.
+ *  • Press 'n' — broad noise floor briefly lifts every bin then fades
+ *    over ~1 second back to clean spikes.
+ *  • The HUD prints "O(N log N)=896 ops vs DFT O(N²)=16384 ops" for
+ *    N=128 — you can verify by hand: 128·7 = 896, 128² = 16384.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -288,7 +375,7 @@ static void app_compute(App *a)
     a->mag_max = 1e-6f;
     a->sig_max = 1e-6f;
     for (int k = 0; k < N_FFT / 2; k++) {
-        a->mag[k] = sqrtf(a->re[k]*a->re[k] + a->im[k]*a->im[k]) / (float)(N_FFT/2);
+        a->mag[k] = sqrtf(a->re[k]*a->re[k] + a->im[k]*a->im[k]) / ((float)N_FFT * 0.5f);
         if (a->mag[k] > a->mag_max) a->mag_max = a->mag[k];
     }
     for (int n = 0; n < N_FFT; n++) {
@@ -403,8 +490,8 @@ int main(void)
             case 'k': a.sel = (a.sel + N_COMPS - 1) % N_COMPS; break;
             case '+': case '=':
                 a.comps[a.sel].freq += 1.0f;
-                if (a.comps[a.sel].freq > N_FFT/2 - 1)
-                    a.comps[a.sel].freq = N_FFT/2 - 1;
+                if (a.comps[a.sel].freq > (float)N_FFT * 0.5f - 1.0f)
+                    a.comps[a.sel].freq = (float)N_FFT * 0.5f - 1.0f;
                 break;
             case '-':
                 a.comps[a.sel].freq -= 1.0f;

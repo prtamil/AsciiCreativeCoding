@@ -47,6 +47,115 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A transit map is just a graph drawn with right angles.  The trick to
+ * generating one procedurally is to NEVER work in pixel space — work
+ * on an 8×6 LOGICAL grid first.  Pick a few path templates that only
+ * use horizontal and vertical strokes between grid nodes (H_FULL,
+ * V_FULL, Z, REV_Z, DOUBLE_Z), stamp 12–15 of them onto the grid, and
+ * map every grid node to a terminal cell at render time.  Where two
+ * lines share a grid node, you get an interchange.  Where two lines
+ * cross at a non-shared cell, the canvas detects an H-track + V-track
+ * coincidence and draws ACS_PLUS.  All of the visual richness comes
+ * from those two facts.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine sketching a subway map on graph paper.  You don't draw
+ * curves — you draw L-shapes and Z-shapes that snap to grid lines.
+ * Each line you draw passes through a sequence of grid nodes; if two
+ * lines cross at a node, the node becomes a station with a transfer.
+ * The canvas is the "ink layer": each pixel cell remembers which
+ * H-line passes through it (h_cp) and which V-line (v_cp).  A cell
+ * with both is a junction; one with neither is empty.  Trains are
+ * just floating-point cursors that ride one node-to-node segment of
+ * a line, bouncing at endpoints — no graph navigation, just t∈[0,N-1].
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Compute terminal coordinates for each grid node:
+ *       term_col[i] = mg_c + i · (cols - 2·mg_c)/(GNODES_C-1)
+ *       term_row[i] = mg_r + i · (rows - mg_r - 4)/(GNODES_R-1)
+ *  2. Shuffle h_rows[GNODES_R] and v_cols[GNODES_C] index arrays so
+ *     each new map looks different.
+ *  3. Build n_lines = 12 + rand()%4 paths from templates:
+ *       3 H_FULL (gc0 → gc1 at one row)
+ *       3 V_FULL (gr0 → gr1 at one col)
+ *       3 Z_SHAPE (H → V → H, 3 nodes total)
+ *       2 REV_Z   (V → H → V)
+ *       1 DOUBLE_Z (H → V → H → V → H, two bends)
+ *       remaining slots alternate Z and REV_Z.
+ *     append_h / append_v skip duplicate nodes at the join points.
+ *  4. For each line, register every path node as a station; if the
+ *     node already exists, just bump its n_lines counter.  Decide
+ *     name_side: H stations use even/odd row parity; V stations use
+ *     left/right halfscreen.
+ *  5. Fill canvas: for each consecutive (n, n+1) pair of path nodes,
+ *     paint h_cp along the row OR v_cp along the column.  Cells that
+ *     get both colours are junctions.
+ *  6. Pick station names from STATION_POOL (shuffled); cap n_lines≥2
+ *     stations as interchanges.
+ *  7. Spawn one train per line (max 10): t∈[0, n_path-1] (random
+ *     start), spd∈[1.2, 4.0] nodes/sec, dir = ±1.
+ *  8. Each frame: trains_tick advances t by dir·spd·dt and bounces
+ *     at endpoints.  Render canvas → station dots → trains → names →
+ *     legend (3 rows × 5 entries) → HUD.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Node spacing      step_c = (cols − 2·mg_c) / (GNODES_C − 1)
+ *  Train interp      pos = p[n] + frac · (p[n+1] − p[n]),  n=⌊t⌋, frac=t-n
+ *  Train bounce      if t≥end: t=end, dir=-1;  if t≤0: t=0, dir=+1
+ *  Junction detect   h_cp != 0 && v_cp != 0  ⇒  ACS_PLUS
+ *  Interchange test  station.n_lines ≥ 2     ⇒  glyph 'O' (else 'o')
+ *  Path templates    Z = H+V+H,  REV_Z = V+H+V,  DOUBLE_Z = H+V+H+V+H
+ *  Legend grid       3 rows × 5 cols, entry_w = (cols<100 ? 14 : 16)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Z_SHAPE picks two distinct grid rows by do-while reroll; a
+ *    coincidence (gr1 == gr2) would degenerate into a straight H.
+ *  • DOUBLE_Z requires gc_b2 > gc_b1 — defensive clamp_gc fallback
+ *    guards against the rand() corner case where they collide.
+ *  • CANVAS_ROWS = 90 / CANVAS_COLS = 320 are ceiling.  Terminals
+ *    larger than this would draw outside; bounds checks at the
+ *    canvas-paint stage prevent out-of-array writes.
+ *  • The h_cp/v_cp store as `unsigned char` — colour pair 0 means
+ *    "no track here".  Pairs 1..15 are line colours.  Cell h_cp=0,
+ *    v_cp=0 is empty.
+ *  • At a junction where both lines exist, the H-line colour wins
+ *    on the ACS_PLUS character; this is asymmetric but legible.
+ *  • Station name placement clamps to [1, cols-len-1] / [1, rows-5];
+ *    a station near the screen edge may have its name shifted away
+ *    from the dot — looks fine but isn't truly perpendicular.
+ *  • Trains use A_REVERSE for solid-block look: if your terminal
+ *    doesn't honour A_REVERSE properly, trains appear as plain text.
+ *  • Station name rendered AFTER trains, so a train passing through
+ *    a station temporarily covers part of the name — intentional
+ *    "vehicle in motion" effect.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • HUD shows e.g. "13 lines  37 stations  6 interchange" — sum of
+ *    template counts (3+3+3+2+1=12, plus 0–3 fillers).  Verify by
+ *    counting coloured legend entries.
+ *  • Press 'r' repeatedly: each refresh produces a different layout
+ *    but the SAME line-count distribution.
+ *  • Junction cells: find a place where two coloured lines visibly
+ *    cross and confirm a '+' sits there (not '─' or '│').
+ *  • Trains: should bounce at line endpoints — observe one running
+ *    long enough to reverse direction; the head/body glyph order
+ *    flips ('## 0' becomes '0 ##').
+ *  • Theme cycling 't': all line colours change in unison, station
+ *    'O'/'o' colour shifts, HUD bar stays bright yellow.
+ *  • At small terminals (< 40 cols), step_c clamp keeps nodes from
+ *    overlapping; map shrinks but lines stay readable.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <curses.h>
 #include <signal.h>

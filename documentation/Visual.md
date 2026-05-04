@@ -2570,24 +2570,22 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
-### raymarcher/nuke_v1.c
-*Volumetric mushroom cloud — Beer–Lambert raymarching, no SDFs.*
+### raymarcher/nuke.c
+*Volumetric mushroom cloud — proper 2-D axisymmetric Stam stable fluids, no scripted timeline.*
 
-**Beer–Lambert front-to-back** — at each step `dτ = density·step·EXTINCTION`, alpha `a = 1−exp(−dτ)`, accumulate `heat += a·cloud_heat·T`, then `T *= exp(−dτ)`. Bail at `T < 0.07` (invisible contribution) — saves ~20% per pixel.
+**Boussinesq Navier-Stokes on (r, y) grid** — single force coupling: `vy += BUOYANCY·(T−T₀)·dt`. Hot cells push UP. Hodge projection (40 Jacobi iters of `∇²p = ∇·v`, then `v ← v − ∇p`) enforces incompressibility and is what DEFLECTS the rising column's leading edge sideways into a vortex ring. The cap is the SOLUTION, not a drawn shape.
 
-**Single morphing anisotropic Gaussian blob** — `(dx/rx)² + (dy/ry)² + (dz/rz)²` distance with independent radii. `rx` grows monotonic, `ry` grows-then-compresses → sphere → bullet → cap continuously, with no "lerp pop" between distinct primitives.
+**Semi-Lagrangian advection** — backward-trace by `v·dt`, bilinearly sample old field. Unconditionally stable (Stam 1999). Numerical diffusion blurs features slightly each step in exchange for never blowing up.
 
-**Quintic smootherstep** `6t⁵−15t⁴+10t³` (zero 1st AND 2nd derivative at endpoints) on the spread parameter eliminates the visible acceleration kink at cap formation. Used for the most-watched window only; cheaper smoothstep elsewhere.
+**Volumetric Beer-Lambert raymarcher** — sphere-trace through 3-D; at each step compute `r = √(x²+z²)` and bilinear-sample the 2-D fields. Two accumulators: total radiance `L` (drives glyph 0..7), hot radiance `L_hot` (drives palette tier — ratio L_hot/L picks smoke→fire colour).
 
-**Continuous-time morph** — every animated parameter is `smoothstep(t_beg, t_end, time)` over an *overlapping* window. The fireball is still rising while the cap is starting to bulge — no scene switches, no phase transitions.
+**Emergent timeline** — there is no `T_RISE_BEG`, no `T_CAP_FORM`, no phase enum. The cap forms because vorticity rolls the leading edge outward; the plateau forms because cooling kills buoyancy; the fall happens because density decays. All driven by physics, not by `smoothstep(t_beg, t_end, time)` windows.
 
-**Anti-rise noise bias** — subtract `time × RISE_BIAS` from the noise lookup `y` coord. Without this the granulation pattern would slide visibly downward relative to the rising cloud, looking like the cloud is falling through static noise. The bias glues the texture to the cloud.
+**Initial-condition Gaussians (5 blast types)** — TACTICAL / STANDARD / MEGATON / AIR_BURST / GROUND. The fluid solver is identical; what differs is `(sigma, T_peak, ρ_peak, blast_y, initial_v)`. The atmosphere is the same; the bomb varies.
 
-**2× vertical supersampling + glyph picker** — two rays per terminal cell (top and bottom sub-row). The picker chooses one of 5 glyph classes — full block, top-weighted (`'`), bottom-weighted (`,`), middle (`:`), or space — recovering vertical sub-cell detail without doubling column count.
+**Themes (5):** REALISTIC / MATRIX / OCEAN / NOVA / TOXIC. Each is an 8-tier ramp from coolest smoke at slot 0 to hottest fire at slot 7. Glyph from `L`, palette tier from `L_hot/L`.
 
-**Three particle classes, one struct** — `PartType` enum in `Particle`. ASH gets `gravity × 0.35`, horizontal `exp(−1.4·dt)` drag, terminal-velocity clamp `vy ≥ −1.6` — that clamp is what makes ash look like real particulate, not Newtonian rocks.
-
-**Cloud-fade fall phase** — at `t > T_FALL_BEG`, multiply density everywhere by `(1 − fall)` while `blob_y -= fall · 1.6` and `blob_ry *= (1 − 0.55·fall)`. The whole cloud sinks and dissolves through the same field, no extra geometry.
+**Faint-tail rendering** — slot 0 of the glyph ramp is `.` (NOT space). Late-stage residual smoke shows as A_DIM dotted shapes rather than vanishing — physics keeps the cells alive long after they stop emitting.
 
 ---
 

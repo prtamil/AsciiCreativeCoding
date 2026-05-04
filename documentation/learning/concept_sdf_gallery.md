@@ -242,7 +242,7 @@ static const char k_bourke[BOURKE_LEN + 1] = " .:=+*#@";
 
 The old 10-char ramp `" .,:;!|%#@"` had ambiguous pairs: `,` and `;` look identical in
 most terminal fonts, as do `!` and `|`. Wasted levels reduce the visible contrast range.
-The 8-char set matches `mandelbulb_explorer.c` — every adjacent step is perceptually
+The 8-char set matches `mandelbulb.c` — every adjacent step is perceptually
 distinct at arm's length.
 
 Index 0 is space (no-hit background). Hit pixels are clamped to `[1, 7]` so every hit

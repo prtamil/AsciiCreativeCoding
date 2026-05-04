@@ -128,7 +128,7 @@
 
 /*
  * 8-char density ramp — every step is visually distinct at arm's length.
- * Same set as mandelbulb_explorer: no ambiguous pairs (,:  ;!  |%).
+ * Same set as mandelbulb: no ambiguous pairs (,:  ;!  |%).
  *   index 0 = ' ' background (no-hit)
  *   index 1 = '.' darkest hit
  *   index 7 = '@' brightest hit

@@ -14,10 +14,11 @@
  *       Wind drifts the cloud field in the +x direction so the shafts
  *       wander in real time.
  *
- *       Distinct from `nuke_v1.c` (the existing volumetric demo): nuke
- *       is a transient explosion morph (blast → fireball → cap → fall);
- *       cloudscape is a stationary atmospheric system.  Same Beer–Lambert
- *       integrator, completely different visual.
+ *       Distinct from `nuke.c` (the existing volumetric demo): nuke
+ *       is a transient buoyant-fluid explosion (rising column + cap +
+ *       fall driven by Boussinesq Navier-Stokes); cloudscape is a
+ *       stationary atmospheric system with no convection.  Same
+ *       Beer–Lambert integrator, completely different physics.
  *
  *       Patterns / cover types (cycle with n / N):
  *         SCATTERED  broken cumulus, big gaps — best god-ray drama
@@ -26,7 +27,7 @@
  *         STORM      dark heavy clouds, dim shafts where sun pokes through
  *
  * Study alongside:
- *   raymarcher/nuke_v1.c         — same volumetric raymarch skeleton.
+ *   raymarcher/nuke.c         — same volumetric raymarch skeleton.
  *                                  Cloudscape is the calm cousin.
  *   raymarcher/voxel_terrain.c   — also column-march + atmospheric
  *                                  perspective.  Different domain

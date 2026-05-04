@@ -112,7 +112,7 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 | `raymarcher_cube` | SDF box — finite-difference normals, shadow ray |
 | `raymarcher_primitives` | SDF boolean composition (min/max) — sphere/box/torus/capsule/cone |
 | `sdf_gallery` | SDF composition gallery — 5 scenes: smooth-union blend, boolean ops, twist deformation, domain repetition, organic sculpt; 3 lighting modes (N·V / Phong / Flat); 5 themes |
-| `mandelbulb_explorer` | 3D Mandelbulb raymarcher — spherical-power DE, tetrahedral normals, smooth-iter coloring, orbit traps, AO, soft shadows, progressive rendering, 2×2 supersampling toggle, 8 themes |
+| `mandelbulb` | 3D Mandelbulb raymarcher — clean ground-up build for terminal low-res. Spherical-power DE (power 8), Hubbard-Douady distance estimator `½·log(r)·r/dr`, central-difference normals, smooth-iter coloring drives palette, Phong + Christensen soft shadow + step-count AO. Auto-orbit + arrow-key manual override; 5 themes (CLASSIC / ICE / PLASMA / MONO / NEGATIVE) |
 | `mandelbulb_raster` | Mandelbulb rasterizer — UV-sphere tessellation (~1800 triangles) built once at startup; MVP + z-buffer; per-vertex smooth-iter + normal; HSV fragment shaders; 4 shader modes (hue/normals/depth/Phong) |
 | `torus_raster` | UV rasterizer — Phong/toon/normal/wireframe shaders, back-face cull |
 | `cube_raster` / `sphere_raster` | Full software rasterizer pipeline |
@@ -120,7 +120,7 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 | `donut` | Parametric torus projection — the original spinning donut |
 | `wireframe` | 3D Bresenham edge projection, slope-to-character line drawing |
 | `sun` | 3D solar simulation — noise-displaced sphere SDF + domain-warped fBm boiling surface; 8 flares (blast → magnetic Bézier-arch → decay state machine, capsule SDFs smooth-unioned via smin); exponential corona accumulator; limb darkening (1-coefficient law); temperature-mapped 256-color palette; 4 themes |
-| `nuke_v1` | Volumetric mushroom cloud — Beer–Lambert raymarched volume (no SDFs); single morphing anisotropic Gaussian blob (rx grows monotonic, ry grows-then-compresses) for fireball→cap; quintic smootherstep continuous-time morph; domain-warped fBm + value noise displacement; 2× vertical supersampling with sub-cell glyph picker; debris/ember/ash particles with air-drag terminal velocity; 5-second plateau then fall-collapse phase; 5 themes |
+| `nuke` (raymarcher) | Volumetric mushroom cloud — proper 2-D axisymmetric Boussinesq Navier-Stokes (Stam stable fluids): semi-Lagrangian advection of velocity/temperature/density, 40-iter Jacobi pressure projection for ∇·v=0, buoyancy `vy += β·(T−T₀)·dt`. Cap, vortex roll, and fall all EMERGE from the simulation — no scripted timeline. Beer–Lambert volumetric raymarcher samples the 2-D field at radius `√(x²+z²)`. 5 blast presets (TACTICAL/STANDARD/MEGATON/AIR_BURST/GROUND), 5 themes |
 
 ## Analytic Ray Tracing  (`raytracing/`)
 

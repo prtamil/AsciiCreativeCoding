@@ -831,7 +831,7 @@ The fix: make every palette entry a vivid, saturated color by ensuring at least 
 ```
 
 Verification: decode any xterm-256 index to RGB: `r=(c-16)/36`, `g=((c-16)%36)/6`, `b=(c-16)%6`. An entry is "bright enough" when `max(r,g,b) >= 4`.
-*Files: `raymarcher/sdf_gallery.c`, `raymarcher/mandelbulb_explorer.c`*
+*Files: `raymarcher/sdf_gallery.c`, `raymarcher/mandelbulb.c`*
 
 ---
 
@@ -1637,24 +1637,24 @@ The key difference from pure DLA (random walker) is that the Laplace field `φ` 
 
 #### I5 Mandelbulb Distance Estimator
 The Mandelbulb extends Mandelbrot iteration to 3D using spherical power: `z^p → r^p · (sin(pθ)cos(pφ), sin(pθ)sin(pφ), cos(pθ))` then `z += c`. The distance estimator tracks the derivative magnitude `dr = p · r^(p-1) · dr + 1` alongside the iteration, giving `DE = 0.5 · log(r) · r / dr`. When `dr` is large the surface is far; when small the march is close. Power 8 gives the classic 8-fold symmetric Mandelbulb; powers 2–12 sweep from sphere to full fractal.
-*Files: `raymarcher/mandelbulb_explorer.c`, `raster/mandelbulb_raster.c`*
+*Files: `raymarcher/mandelbulb.c`, `raster/mandelbulb_raster.c`*
 *References: White & Nylander, "The Mandelbulb: first 'true' 3D image of the Mandelbrot set" (skytopia.com, 2009); Hart, Sandin & Kauffman, "Ray tracing deterministic 3-D fractals" SIGGRAPH (1989) — distance-estimation framework.*
 
 #### I6 Smooth Escape-time Coloring
 Integer escape count `i` produces harsh banding where adjacent iteration shells have discrete color jumps. The continuous formula: `mu = i + 1 − log(log(|z|)/log(bail)) / log(power)`. The `log(log(|z|))` term measures how far past the bailout the orbit was, interpolating continuously between integer counts. `mu ∈ ℝ` produces smooth color gradients across depth shells.
-*Files: `raymarcher/mandelbulb_explorer.c`*
+*Files: `raymarcher/mandelbulb.c`*
 
 #### I7 Orbit Trap Coloring
 During Mandelbulb iteration, track the minimum distance from any orbit point to a geometric object: `trap = min(trap, |z.y|)` (distance to XY plane). Points where the orbit stayed close to the trap get a different hue from points where it diverged widely. Orbit traps reveal the internal structure of the attractor basin, creating the characteristic "tentacle" and "pod" coloring visible on the surface.
-*Files: `raymarcher/mandelbulb_explorer.c`*
+*Files: `raymarcher/mandelbulb.c`*
 
 #### I8 Near-miss Glow via min_d Tracking
 During sphere marching, track the minimum DE value ever reached: `min_d = min(min_d, d)`. When the ray misses but came close (`min_d < GLOW_RANGE`), `glow_str = (1 − min_d/GLOW_RANGE)^3`. Pixels with glow_str > 0 receive a dim edge glow character — a halo around the fractal silhouette. This requires no extra DE calls; the march loop records min_d for free.
-*Files: `raymarcher/mandelbulb_explorer.c`*
+*Files: `raymarcher/mandelbulb.c`*
 
 #### I9 Progressive ROWS_PER_TICK Rendering
 Raymarching the full screen at 60 fps is too slow for complex fractals. Progressive rendering processes `ROWS_PER_TICK=4` rows per frame, maintaining UI responsiveness. A `g_stable` buffer holds the last complete frame, displayed while the new scan sweeps from top to bottom. `g_dirty=true` (set on user input) resets the scan row; morph mode avoids setting dirty so the radar-sweep scan becomes visible as an animation effect.
-*Files: `raymarcher/mandelbulb_explorer.c`, `raymarcher/sdf_gallery.c`*
+*Files: `raymarcher/mandelbulb.c`, `raymarcher/sdf_gallery.c`*
 
 #### I10 SDF Boolean Operations — Union, Intersection, Subtraction
 Three operations combine any two SDFs `a` and `b` into compound geometry:
@@ -1703,7 +1703,7 @@ Standard film/game lighting rig with three independent lights:
 - **Fill** (weak, cool, opposite side): prevents the shadow side from being pure black. `0.22 × diffuse` only.
 - **Rim** (narrow, from behind): creates a bright edge on the silhouette, separating object from background. `0.18 × diffuse + 0.65 × specular` with low shininess (exponent 10) for broad rim highlight.
 Sum = `ambient + key_diffuse + key_spec + fill_diffuse + rim_diffuse + rim_spec`. Each light uses its own color to enable warm/cool contrast.
-*Files: `raymarcher/mandelbulb_explorer.c`, `raymarcher/sdf_gallery.c`*
+*Files: `raymarcher/mandelbulb.c`, `raymarcher/sdf_gallery.c`*
 
 #### K6 Depth Visualization Shader — View-space Depth → Color
 The vertex shader computes view-space depth: `custom[0] = length(world_pos − cam_pos)`. The fragment shader normalizes to `[cam_dist − 1.5, cam_dist + 1.5]` and maps `depth_t ∈ [0,1]` to a color gradient (near=warm, far=cool). Combined with the Bourke ramp for characters, this creates a depth fog effect that reveals the 3D structure of any mesh without lighting computation. Useful for debugging mesh geometry.
@@ -2709,17 +2709,19 @@ for each step along ray:
 
 Front-to-back (rather than back-to-front) lets you bail when `T` drops below the colour quantization threshold. The density field can be anything: voxel grid, procedural noise, or in this case, a sum of soft Gaussian primitives.
 
-**Soft Gaussian primitives** replace SDFs for volume work. A blob is `exp(−d² · k)` where `d` is some distance metric. With *anisotropic* distance `d² = (dx/rx)² + (dy/ry)² + (dz/rz)²`, the same blob morphs from sphere → bullet → cap by independently scaling `rx`, `ry`, `rz` over time.
+**Density field from a fluid simulation** — for a mushroom cloud, the density at every point is the value of an actual Navier-Stokes simulation, not an analytical primitive. This avoids the "scripted morph" trap (where every parameter is a `smoothstep(t_beg, t_end, time)` over a fixed timeline) and produces emergent shape: cap, vortex roll, plateau, fall — all consequences of the equations.
 
-**Continuous-time morphing** beats scene switches. Every animated parameter is `smoothstep(t_beg, t_end, time)` over an *overlapping* window — fireball is still rising while the cap is starting to bulge. Quintic smootherstep `6t⁵−15t⁴+10t³` (zero 1st AND 2nd derivative at endpoints, Perlin SIGGRAPH 2002) on the most-watched parameter eliminates the visible acceleration kink at the seam.
+**2-D axisymmetric Stam stable fluids** (Stam 1999): solve Boussinesq Navier-Stokes on a 2-D (r, y) grid (~56 × 96 cells). State per cell = `(vr, vy, T, ρ)`. Each step: buoyancy (`vy += β·(T−T₀)·dt`), Hodge projection (40 Jacobi iters of `∇²p = ∇·v`, then `v ← v − ∇p` enforces incompressibility), semi-Lagrangian advection (back-trace by `v·dt`, bilinear sample), cool + decay. A 2-D slice services 360° volume because the cloud is rotation-symmetric — every world point `(x, y, z)` maps to the same field at `(r = √(x²+z²), y)`.
 
-**Domain warping** (Inigo Quilez, iquilezles.org/articles/warp/) generates the boiling cloud surface texture: `fbm(p + fbm2(p) · WARP_AMP)`. The self-offset creates swirling cauliflower turbulence that pure fBm cannot.
+**Why incompressibility is the secret to the mushroom shape** — the rising hot column wants to keep moving up, but air is (nearly) incompressible. The pressure-projection step finds the pressure field that satisfies `∇·v = 0`, and that pressure field DEFLECTS the leading edge laterally, rolling it into a vortex ring. The cap is the SOLUTION to the constraint, not a shape we draw.
 
-**Particle terminal velocity for ash** — without a `vy` clamp, ash accelerates indefinitely. Real particulate hits terminal velocity within a second from air drag; clamping `vy ≥ −1.6` cells/s and adding horizontal `exp(−1.4·dt)` decay produces a settling cloud that looks like real fallout, not Newtonian rocks.
+**Hot-fraction colour indexing** — the renderer accumulates two scalars per pixel: total `L` (luminance, weighted by density and emission) and `L_hot` (luminance from cells whose temperature exceeds ambient). The ratio `L_hot / L` indexes a single 8-tier smoke→fire palette per theme. No threshold, no per-pair tuning; bright cloud edges with hot gas behind them naturally get the silver-lining colour at slot 5-6.
 
-`raymarcher/nuke_v1.c` puts these together: one Beer–Lambert volume integrator, one anisotropic Gaussian blob morphing through the full mushroom-cloud life cycle, three particle classes sharing one struct, 2× vertical supersampling with sub-cell glyph picker for terminal display.
+`raymarcher/nuke.c` puts these together: one Beer–Lambert volume integrator, a 2-D axisymmetric Stam stable-fluids solver feeding density and temperature into that integrator, hot-fraction colour palettes, and 5 blast presets that vary only the Gaussian initial condition.
 
-*Files: `raymarcher/nuke_v1.c`*
+*Files: `raymarcher/nuke.c`*
+
+*References: Stam 1999 "Stable Fluids" SIGGRAPH; Foster & Metaxas 1997 "Modeling the motion of a hot, turbulent gas" SIGGRAPH; Bridson "Fluid Simulation for Computer Graphics" 2e ch. 3 + 5.*
 
 ---
 

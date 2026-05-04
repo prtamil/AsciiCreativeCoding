@@ -1366,26 +1366,34 @@ attron(COLOR_PAIR(theme[active].sun[pi]));
 
 ---
 
-## 29. Dual-Palette Smoke + Fire — Volumetric Cloud (nuke_v1.c)
+## 29. Hot-Fraction-Indexed Smoke→Fire Ramp — Volumetric Cloud (nuke.c)
 
-A mushroom cloud has two distinct colour regimes: cold smoke (greys/dark colours, the bulk of the cloud) and hot fire (white-yellow-red, the molten core and heated edges). The volumetric integrator tracks both `smoke` (transparency-weighted density) and `heat` (transparency-weighted core emission) as separate accumulators; the colour pair is chosen at draw time:
+A mushroom cloud has two distinct colour regimes: cool smoke (grey/dark, the bulk of the cloud) and hot fire (white-yellow-red, the core). The volumetric raymarcher tracks two accumulators per pixel:
 
 ```c
-if (px.heat > FIRE_THRESHOLD)
-    pair = fire_pair[ (int)(px.heat * (FIRE_PALETTE_N - 1)) ];
-else
-    pair = smoke_pair[ (int)(px.smoke * (SMOKE_PALETTE_N - 1)) ];
+L_total += T_view · dτ · (emit · GAIN + AMBIENT)
+L_hot   += T_view · dτ · emit · GAIN
+                                  /* emit = (T − T₀)/(T_peak − T₀)  */
 ```
 
-**Per-theme paired palettes:** Each of 5 themes defines a 32-entry smoke palette + 16-entry fire palette tuned to share a perceptual midpoint, so the smoke-to-fire boundary in the colour ramp is invisible. Realistic uses greys → white-yellow-red; Matrix uses dark greens → white-green; Ocean uses indigo-teal → white-cyan; Nova uses violet-magenta → white-pink; Toxic uses dark olive-lime → white-yellow.
+`L_total` drives the glyph slot (luminance ramp 0..7); `L_hot / L_total` (the **hot fraction**) drives the palette slot:
 
-**Pair count:** 5 × (32 + 16) = 240 colour pairs per session. ncurses on most terminals supports 256 colour pairs; this fits with margin.
+```c
+slot_lum = ⌊(L_total / LUM_CLAMP) · 7.999⌋
+slot_hot = ⌊(L_hot   / L_total)   · 7.999⌋
+glyph    = LUMA_GLYPHS[slot_lum]
+pair     = PAIR_RAMP_BASE + slot_hot
+```
 
-**Why the threshold and not a smooth blend:** A smooth heat→smoke blend produces muddy intermediate colours that don't read as either fire or smoke. The hard threshold (with the `FIRE_THRESHOLD` tuned per theme) gives crisp visual layering — bright fire core surrounded by clearly-smoke edges.
+**Per-theme 8-tier ramps:** each theme is ONE 8-pair ramp from coolest smoke (slot 0) to hottest fire (slot 7). REALISTIC = grey → orange-yellow; MATRIX = dark green → lime; OCEAN = teal → cyan; NOVA = violet → ice blue; TOXIC = chartreuse → acid yellow. All entries in the bright half of the 256-cube per the CLAUDE.md theme rule.
 
-**Glyph picker is independent of palette:** The 2× vertical supersampling and sub-cell glyph picker run on `(top.heat + top.smoke, bottom.heat + bottom.smoke)` totals — the picker doesn't care which palette will be used. Decoupling glyph selection from colour selection keeps both pieces simple.
+**Pair count:** just 8 slots — same 8 pair indices rebound on each `t` keypress via `theme_apply()`. Far fewer pairs than the dual-palette approach (a single shared ramp is enough because the *hot fraction* signal cleanly separates smoke and fire pixels at the indexing stage, not at the palette stage).
 
-*Files: `raymarcher/nuke_v1.c`*
+**Why use ratio instead of threshold:** the hot fraction is a CONTINUOUS signal (0 = pure smoke, 1 = pure fire core), so a thin glowing edge with `L_hot/L = 0.4` lands naturally on slot 3 (the warm-in-between tier). No tuning of a per-theme `FIRE_THRESHOLD`; the theme palette itself encodes the smoke→fire transition. Bright cloud edges with hot gas behind them automatically get the silver-lining colour.
+
+**Glyph slot 0 is `.` not space:** late-stage residual smoke (low `L`, low hot fraction) maps to the dimmest visible glyph rather than vanishing into background — the cloud has a long-tail dispersion phase that's actually rendered, not silently dropped. `A_DIM` on slots 0-1 gives the ghost-of-mushroom look.
+
+*Files: `raymarcher/nuke.c`*
 
 ---
 

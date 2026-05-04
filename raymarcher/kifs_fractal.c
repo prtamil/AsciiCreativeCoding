@@ -33,7 +33,7 @@
  *         MONO     pure greyscale (high-contrast etching)
  *
  * Study alongside:
- *   raymarcher/mandelbulb_explorer.c  — same sphere-trace skeleton, but
+ *   raymarcher/mandelbulb.c  — same sphere-trace skeleton, but
  *           Mandelbulb's z = z^p + c iteration produces ORGANIC blobs.
  *           KIFS produces ANGULAR architecture — read both to feel the
  *           difference between "spherical iteration" and "folding".

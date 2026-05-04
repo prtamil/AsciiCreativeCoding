@@ -139,7 +139,7 @@ Reference implementation: `basics/bounce_ball.c`
 102. [Schrödinger Equation — physics/schrodinger.c](#102-schrödinger-equation--physicsschrodingerc)
 103. [Soft Body (PBD) — physics/soft_body.c](#103-soft-body-pbd--physicssoft_bodyc)
 104. [Mandelbulb Rasterizer — raster/mandelbulb_raster.c](#104-mandelbulb-rasterizer--rastermandelbulb_rasterc)
-105. [Mandelbulb Explorer — raymarcher/mandelbulb_explorer.c](#105-mandelbulb-explorer--raymarchermandelbulb_explorerc)
+105. [Mandelbulb — raymarcher/mandelbulb.c](#105-mandelbulb-explorer--raymarchermandelbulbc)
 106. [SDF Gallery — raymarcher/sdf_gallery.c](#106-sdf-gallery--raymarchersdf_galleryc)
 107. [Capsule Raytrace — raytracing/capsule_raytrace.c](#107-capsule-raytrace--raytracingtcapsule_raytracec)
 108. [Cube Raytrace — raytracing/cube_raytrace.c](#108-cube-raytrace--raytracingcube_raytracec)
@@ -162,7 +162,7 @@ Reference implementation: `basics/bounce_ball.c`
 121. [Deferred Rendering Pipeline — raster/deferred_rendering_pipeline.c](#121-deferred-rendering-pipeline--rasterdeferred_rendering_pipelinec)
 122. [2-D Shockwave Detonation — physics/nuke.c](#122-2-d-shockwave-detonation--physicsnukec)
 123. [Animated Solar Simulation — raymarcher/sun.c](#123-animated-solar-simulation--raymarchersunc)
-124. [Volumetric Mushroom Cloud — raymarcher/nuke_v1.c](#124-volumetric-mushroom-cloud--raymarchernuke_v1c)
+124. [Volumetric Mushroom Cloud — raymarcher/nuke.c](#124-volumetric-mushroom-cloud--raymarchernukec)
 125. [Swarm Digit Generator — flocking/swarm_gen_numbers.c](#125-swarm-digit-generator--flockingswarm_gen_numbersc)
 126. [Two-Faction Battle Simulator — flocking/war.c](#126-two-faction-battle-simulator--flockingwarc)
 127. [Crowd Behaviour Simulator — flocking/crowd.c](#127-crowd-behaviour-simulator--flockingcrowdc)
@@ -3830,7 +3830,7 @@ Three modes: `frag_phong_hue` (Blinn-Phong + HSV color from smooth escape time),
 
 ---
 
-## 105. Mandelbulb Explorer — raymarcher/mandelbulb_explorer.c
+## 105. Mandelbulb — raymarcher/mandelbulb.c
 
 3-D Mandelbulb fractal rendered by sphere marching a distance estimator (DE). Each pixel follows a null-geodesic-style march until the DE falls below HIT_EPS, then shading is computed using SDF-gradient normals, ambient occlusion, and soft shadows.
 
@@ -3842,7 +3842,7 @@ Mandelbulb DE (Iñigo Quílez formula): iterate `z ← z^p + c` in spherical coo
 
 Ambient occlusion: sample the DE at several offsets along the normal and compare to expected distances — closer-than-expected → occluded. Soft shadows: march from the hit point toward each light; if the march passes close to geometry, the shadow is soft. A rotating camera orbits the bulb; multiple themes map escape time to palettes.
 
-*Files: `raymarcher/mandelbulb_explorer.c`*
+*Files: `raymarcher/mandelbulb.c`*
 
 ---
 
@@ -4483,75 +4483,80 @@ where `near = max(0, sdf_value)`. Close points contribute heavily; far points fa
 
 ---
 
-## 124. Volumetric Mushroom Cloud — raymarcher/nuke_v1.c
+## 124. Volumetric Mushroom Cloud — raymarcher/nuke.c
 
-High-fidelity nuclear blast — pure volumetric raymarching, no SDFs. The mushroom is a sum of soft Gaussian density blobs with anisotropic distance, morphing through one continuous time line.
+A nuclear blast as **actual fluid dynamics**, not as scripted animation. The cap, the toroidal vortex roll, the plateau, and the fall are all EMERGENT properties of solving Boussinesq Navier-Stokes on a 2-D axisymmetric grid. There is no phase enum, no `T_RISE_BEG`, no `smoothstep(t_beg, t_end, time)` driving geometry. The only scripted moment is the Gaussian initial condition at t=0.
 
-**Beer–Lambert integrator** (front-to-back):
+**Stam (1999) stable fluids on a 2-D axisymmetric (r, y) grid** — `N_R=56`, `N_Y=96`, `GRID_H=0.125`. State per cell:
 ```
-T = 1
-heat = 0
-for each step along ray:
-    dτ = density(p) · step · EXTINCTION
-    a  = 1 − exp(−dτ)
-    heat += a · cloud_heat(p) · T
-    T    *= exp(−dτ)
-    if T < 0.07: break              /* invisible contribution */
+vr, vy   velocity components (radial, vertical)
+T        temperature   (drives buoyancy)
+rho      density       (the visible "smoke")
 ```
-`T` is remaining transmittance. `(1 − exp(−dτ)) · T` correctly weights front-most cloud over back cloud. Bailing at `T < 0.07` saves ~20% of per-pixel cost for no visible change.
+Plus scratch fields (pressure, divergence, two buffers). Total ~1.3 MB in BSS.
 
-**Single morphing blob** (anisotropic distance):
-```c
-ellipsoid_dn2(p, c, rx, ry, rz):
-    return (dx/rx)² + (dy/ry)² + (dz/rz)²
-gauss = exp(−dn² · k)
+**Fluid step** (per `SIM_DT = 0.025 s`):
 ```
-`rx` (horizontal) grows monotonically; `ry` (vertical) grows then compresses. The same primitive becomes sphere → bullet → cap continuously, with no "lerp pop" between distinct shapes.
-
-**Continuous-time morph** — every animated parameter is `smoothstep(t_beg, t_end, time)` over an *overlapping* window. Quintic smootherstep `6t⁵−15t⁴+10t³` (zero 1st AND 2nd derivative at endpoints) on the spread parameter eliminates the visible acceleration kink at cap formation:
-```c
-static inline float smootherstep(float e0, float e1, float x) {
-    float t = clmpf((x - e0) / (e1 - e0), 0.f, 1.f);
-    return t * t * t * (t * (t * 6.f - 15.f) + 10.f);
-}
+1. BUOYANCY:   vy[i][j] += BUOYANCY_COEF · (T[i][j] − T_AMBIENT) · dt
+2. PROJECT:    Solve ∇²p = ∇·v via 40 Jacobi iterations; v ← v − ∇p
+3. ADVECT v:   Semi-Lagrangian — backward-trace by v·dt, bilinear sample
+4. PROJECT:    advection re-introduces divergence
+5. ADVECT T, ρ by the now-corrected velocity
+6. COOL:       T → T_AMBIENT · (1 − exp(−k_cool·dt))
+   DECAY:      ρ *= 1 − k_decay · dt
 ```
 
-**Phase timeline** (continuous, no branches):
+**Why the mushroom emerges:** the SINGLE force coupling is buoyancy. Hot cells push UP. The pressure-projection step says "the air must be incompressible — find the pressure field that makes ∇·v = 0". That pressure field is what DEFLECTS the rising column's leading edge sideways, rolls it into a vortex ring, spreads the cap. The cap is the SOLUTION TO NAVIER-STOKES with a hot initial condition; we don't draw it, we compute it.
 
-| Window | Event |
-|---|---|
-| 0 – 3.6 s | RISE — fireball blob accelerates upward |
-| 3.0 – 8.0 s | SPREAD — `rx` grows, `ry` flattens (cap forms) |
-| 4.0 – 8.4 s | VORTEX ring intensifies |
-| 4.7 – 8.6 s | SKIRT ring of secondary turbulence |
-| 5.8 – 9.0 s | PYROCUMULUS noise layer ramps in |
-| 9.0 – 12 s | PLATEAU — full mushroom holds |
-| 12 – 16.5 s | FALL — `cloud_fade` multiplier kills density, `blob_y -= fall · 1.6`, ash spawns |
-| 20.5 s | DEACTIVATE — eligible for re-detonation |
-
-**Domain-warped fBm** (Inigo Quilez):
+**Hodge projection** (Jacobi on 5-point Laplacian):
 ```
-warped_fbm(p, t) = fbm(p + fbm2(p) · WARP_AMP)
+4·p_new[i][j] = p[i+1][j] + p[i−1][j] + p[i][j+1] + p[i][j−1] − h²·div[i][j]
 ```
-The self-offset creates swirling cauliflower turbulence that pure fBm cannot — the boiling cloud surface texture.
+40 iterations gives ~1-2% residual divergence — invisible at terminal resolution.
 
-**Anti-rise bias** on noise lookup: subtract `time × RISE_BIAS` from the `y` coord before noise sampling. Without this the granulation pattern would slide downward relative to the rising cloud, looking like the cloud is falling through static noise. The bias glues the texture to the cloud.
+**Semi-Lagrangian advection** is unconditionally stable (Stam's key insight). For each cell, trace backward by `v·dt`, bilinearly sample the OLD field there. No CFL constraint on dt; the cost is some numerical diffusion (features blur slightly), which we accept in exchange for never blowing up.
 
-**Three particle classes** sharing one `Particle` struct:
+**Volumetric Beer-Lambert renderer** — 2-D fields service 360° volume:
+```
+For each pixel:
+    ray sphere-traces through 3-D space.
+    At each step P = origin + t·dir:
+        r = √(Pₓ² + Pᵤ²)
+        ρ = bilinear sample density(r, P_y)
+        T = bilinear sample temp(r, P_y)
+        dτ = ρ · step · DENSITY_GAIN
+        emit = clamp((T − T₀)/(T_peak − T₀))
+        L     += T_view · dτ · (emit·EMIT_GAIN + AMBIENT)
+        L_hot += T_view · dτ · emit · EMIT_GAIN
+        T_view *= exp(−dτ)
+        break if T_view < 0.01
+```
+Two accumulators: total `L` (drives glyph slot 0..7) and `L_hot` (drives palette slot — ratio L_hot/L picks smoke→fire colour).
 
-| Type | Forces |
-|---|---|
-| DEBRIS | full gravity, no drag, fast radial burst |
-| EMBER | gravity, slight upward bias from heat |
-| ASH | gravity × 0.35; horizontal `exp(−1.4 · dt)` drag; terminal velocity clamp `vy ≥ −1.6` |
+**Boundary conditions:**
+- Axis (r=0): `vr = 0` (no flow through axis). Pressure: zero-gradient (mirror).
+- Ground (y=0): `vy = 0` (no flow through ground). Pressure: zero-gradient.
+- Outer / top: open (zero-gradient on velocity, advection naturally handles).
 
-The terminal-velocity clamp is what makes ash look like real particulate suspension instead of Newtonian rocks.
+**Blast types (5)** — each a row in `blasts[]`, varying ONLY initial conditions:
 
-**2× vertical supersampling + glyph picker:** Two rays per terminal cell — top sub-row and bottom sub-row. The picker chooses a glyph that approximates the pair: full block, top-weighted (`'`), bottom-weighted (`,`), middle (`:`), or space. Recovers vertical sub-cell detail without doubling column count.
+| Type | sigma | T_peak | ρ_peak | blast_y | initial_v |
+|---|---|---|---|---|---|
+| TACTICAL | 0.35 | 5.0 | 2.5 | 1.0 | 2.0 |
+| STANDARD | 0.55 | 8.0 | 4.0 | 1.6 | 3.0 |
+| MEGATON  | 0.85 | 12.0 | 5.5 | 2.2 | 4.5 |
+| AIR_BURST | 0.55 | 8.0 | 4.0 | 4.5 | 3.0 |
+| GROUND   | 0.45 | 7.0 | 7.0 | 0.6 | 3.5 |
 
-**Themes (5):** Realistic / Matrix / Ocean / Nova / Toxic. Each is a paired smoke palette (32 entries) + fire palette (16 entries). `t` cycles.
+The fluid solver is **identical across types** — same buoyancy, same cooling, same density decay. These are properties of the AIR, not the bomb. Different mushrooms come from different t=0 Gaussians.
 
-*Files: `raymarcher/nuke_v1.c`*
+**Themes (5):** REALISTIC / MATRIX / OCEAN / NOVA / TOXIC. Each is an 8-tier palette from cool smoke (low slot) to bright fire core (high slot). All entries in the bright half of the 256-cube per the CLAUDE.md theme rule.
+
+**Time loop:** real-time `dt_real` is multiplied by the user's time-scale to give `dt_sim`, accumulated, and run as fixed-`SIM_DT` steps. Pause freezes accumulation. Time-scale clamps at 6× because semi-Lagrangian sampling starts to lose accuracy past 4× the natural CFL.
+
+*Files: `raymarcher/nuke.c`*
+
+*References: Stam 1999 "Stable Fluids" SIGGRAPH; Stam 2003 GDC "Real-Time Fluid Dynamics for Games"; Foster & Metaxas 1997 "Modeling the motion of a hot, turbulent gas" SIGGRAPH; Bridson "Fluid Simulation for Computer Graphics" 2e ch. 3 + 5.*
 
 ---
 

@@ -18,14 +18,13 @@
  *     Keplerian orbit  v_orb = √(M/r) = √(1/(2r))
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/blackhole.c \
+ *   gcc -std=c11 -O2 -Wall -Wextra physics/blackhole.c \
  *       -o blackhole -lncurses -lm
  *
  * Keys:
  *   q / ESC   quit          p   pause / resume
- *   r         reset spin    t   cycle theme (10 palettes)
- *   + / =     faster spin   -   slower spin
- *   i / k     tilt up/down  (rebuild lensing table)
+ *   r         reset spin    t   cycle theme (11 palettes)
+ *   + / =     closer cam    -   farther cam
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -55,6 +54,192 @@
  * ASPECT=0.47    : Measured empirically for this terminal font.
  *                  (≠ 0.50 from CELL_W/CELL_H ratio — physical pixels differ.)
  *                  Ensures the event horizon appears circular, not oval.
+ *
+ * References     :
+ *   • Misner, Thorne, Wheeler — *Gravitation* (1973), §25 (geodesics
+ *     of the Schwarzschild metric) and §31 (Schwarzschild black holes).
+ *     The canonical derivation of the Binet equation we cast into 3D.
+ *   • Thorne, K. S. — *The Science of Interstellar* (2014), ch. 8–9.
+ *     The visual reference for the Gargantua image, Doppler beaming
+ *     of the disk, and the asymmetric arch above/below the shadow.
+ *   • James, von Tunzelmann, Franklin, Thorne (2015) — "Gravitational
+ *     lensing by spinning black holes in astrophysics, and in the
+ *     movie *Interstellar*", *Class. Quantum Grav.* 32 065001. The
+ *     paper behind the Interstellar VFX; describes the same backward
+ *     ray-tracing pipeline used here, scaled up to a real film.
+ *   • Hamilton, A. — [Inside Black Holes](https://jila.colorado.edu/~ajsh/insidebh/).
+ *     Free interactive simulator and pedagogy on Schwarzschild and
+ *     Kerr geodesics; cross-check for the photon-ring brightness.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A black hole is a region where spacetime is curved so steeply that
+ * light's "straight lines" (null geodesics) bend visibly. This demo
+ * fires one ray BACKWARD from each terminal cell through that curved
+ * spacetime; the ray either falls through the event horizon (paint
+ * black), pierces the equatorial accretion disk (paint hot/coloured
+ * with Doppler beaming), or escapes to the far field (paint photon
+ * ring if it grazed the photon sphere, otherwise sky). Tracing 900
+ * RK4 steps per ray is too slow for live animation, so we cache the
+ * outcome of every ray in a 2-D lensing TABLE at startup. Each frame
+ * is then just: lookup → apply current disk rotation → compute Doppler
+ * + redshift + texture → choose glyph + colour pair.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a marble rolling on a stretched rubber sheet with a heavy
+ * ball in the middle. Marbles released from far away with different
+ * impact parameters do qualitatively different things: those aimed
+ * straight at the centre fall in (the SHADOW); those that come close
+ * but not too close loop one or more times around the well before
+ * escaping (the PHOTON RING + secondary image of the disk); those
+ * that pass farther out are merely deflected (the LENSED disk arc
+ * above the shadow). Each terminal cell is one such marble. The
+ * "rubber sheet" here is exact Schwarzschild geometry, not a Newtonian
+ * approximation — that is why the photon ring sits at a precise
+ * r = 1.5 r_s and the shadow has its characteristic angular size.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. STARTUP — build camera basis from TILT_DEG (5°) and FOV_DEG (72°).
+ *     Camera sits at distance `cam_dist` r_s, looking at the origin,
+ *     tilted slightly above the equatorial plane so the disk is
+ *     visible as an annulus rather than a line.
+ *
+ *  2. STARTUP — for each (row, col):
+ *        • map screen UV → ray direction in camera space
+ *        • integrate `geo_step()` (RK4 of d²pos/dλ² = −(3/2)h²·pos/r⁵)
+ *          backward from the camera with adaptive ds ∝ r
+ *        • terminate when r < 0.92 r_s (FELL into horizon),
+ *          equatorial-plane crossing within [DISK_IN, DISK_OUT] (HIT disk),
+ *          or r > ESCAPE_R = 130 r_s (ESCAPED to far field)
+ *        • record outcome + (disk_r, disk_phi) on disk hit, or min_r
+ *          for photon-ring proximity on escape
+ *
+ *  3. STARTUP — store everything in `g_table[MAX_ROWS][MAX_COLS]`.
+ *     Total cost: rows·cols rays × ~900 RK4 steps each (~0.3–0.8 s).
+ *
+ *  4. PER FRAME — disk_angle += spin (cumulative rotation of the disk).
+ *
+ *  5. PER FRAME, per visible cell — read `g_table[row][col]`:
+ *
+ *     R_HORIZON  → leave black (erase() already cleared the cell).
+ *
+ *     R_DISK     → phi_now    = disk_phi + disk_angle
+ *                  v_orb      = √(M/r) = √(1/(2r))                 // Keplerian
+ *                  β          = −v_orb · cos(phi_now) · cos(tilt)  // Doppler β
+ *                  D          = [(1+β)/(1−β)]^(3/2)                 // beaming
+ *                  g          = √(1 − r_s/r)                        // gravitational redshift
+ *                  rad        = (1 − 0.86·r_n)^2.2 + 0.65·exp(−Δr²) // ISCO spike
+ *                  tex        = 1 + 0.18·sin(5φ − 4·disk_angle)     // spiral texture
+ *                  brightness = clamp(D · g · rad · tex)
+ *                  pick disk_char + disk_pair, mvaddch.
+ *
+ *     R_ESCAPED  → if min_r ≈ PHOTON_R (1.5 r_s), paint the bright
+ *                  photon ring; otherwise leave dark sky.
+ *
+ *  6. PER FRAME — HUD on bottom row.
+ *
+ *  7. RESIZE / camera-distance change → rebuild lensing table.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Schwarzschild radii (in units r_s = 1, M = 0.5):
+ *    Event horizon  : r = r_s   = 1
+ *    Photon sphere  : r = 1.5 r_s   (unstable circular photon orbit)
+ *    ISCO           : r = 3 r_s     (innermost stable circular orbit;
+ *                                    accretion disk inner edge)
+ *
+ *  Null geodesic in 3D Cartesian (derivation in CONCEPTS):
+ *    h        = pos × vel                       (specific angular mom.)
+ *    d(pos)/dλ = vel
+ *    d(vel)/dλ = −(3/2) · |h|² · pos / r⁵
+ *
+ *  Keplerian orbital speed at disk radius r:
+ *    v_orb = √(M / r) = √(1 / (2r))
+ *
+ *  Relativistic Doppler factor (radial component β):
+ *    D = [(1 + β) / (1 − β)]^(3/2)
+ *    (3/2 instead of 3 or 4 — visually muted to keep dynamic range
+ *     within the 7-tier disk character ramp)
+ *
+ *  Gravitational redshift seen by far observer:
+ *    g = √(1 − r_s/r)
+ *    (drops to 0 at the horizon → faint blue limb just outside r=1)
+ *
+ *  Adaptive RK4 step:
+ *    ds = clamp(0.05 · r,  0.003,  0.10)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • ASPECT RATIO. Terminal cells are ~2× taller than wide. Fixed
+ *    `ASPECT = 0.47` (calibrated by eye, not derived from CELL_W/CELL_H)
+ *    keeps the event-horizon shadow circular. Different terminal fonts
+ *    will need different values — the comment is honest about this.
+ *
+ *  • SECONDARY IMAGE. The sign-change check `prev.y * pos.y < 0` fires
+ *    on both the near-side disk crossing AND the far-side crossing for
+ *    rays that loop once around the photon sphere. Both are real images
+ *    and should both be coloured — the secondary appears as the thin
+ *    arch arcing over the shadow.
+ *
+ *  • PHOTON-SPHERE DIVERGENCE. Rays aimed exactly at the photon sphere
+ *    spiral indefinitely. We cap at MAX_STEPS = 900 and treat un-
+ *    terminated rays as escaped; their min_r is preserved so they
+ *    still contribute to the photon ring brightness.
+ *
+ *  • DOPPLER POLE. β → ±1 makes D blow up. Clamped at β ∈ [−0.95, 0.95].
+ *
+ *  • ESCAPE_R. Too small → curved-space rays prematurely classified as
+ *    escaped while still bending; too large → wasted RK4 steps in
+ *    nearly-flat space. 130 r_s is a good compromise.
+ *
+ *  • RESIZE OR CAMERA-DISTANCE CHANGE. Both invalidate the lensing
+ *    table. The main loop sets `need_rebuild = 1` and re-runs
+ *    `precompute()`; a progress bar is drawn during the rebuild so the
+ *    user knows the freeze is intentional.
+ *
+ *  • PROGRESS BAR vs. RESIZE. SIGWINCH during precompute is captured
+ *    but only acted on between frames, so the rebuild finishes against
+ *    the OLD geometry and the next loop iteration triggers another
+ *    rebuild against the new geometry. Slow but correct.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • PAUSE (p). Disk freezes. The shadow stays dark; the photon ring
+ *    stays bright; only motion stops.
+ *
+ *  • DOPPLER ASYMMETRY. With the disk spinning one way, one half of
+ *    the disk should be visibly brighter (approaching → blueshifted +
+ *    beamed) than the other half (receding → redshifted + dimmed).
+ *    Reverse spin and the bright crescent should swap sides.
+ *
+ *  • SECONDARY IMAGE. The disk's far side appears as an arc OVER the
+ *    shadow because rays from below loop around the photon sphere and
+ *    reach the camera from above the shadow. This is the "second
+ *    image" — its absence would mean the geodesics aren't bending
+ *    enough.
+ *
+ *  • PHOTON RING. A thin, bright ring sits just outside the shadow.
+ *    If you change the inner-disk radius (DISK_IN) the ring stays put
+ *    at r ≈ 1.5 r_s — proving it's the photon-sphere ring, not the
+ *    inner disk edge.
+ *
+ *  • CAMERA DISTANCE (+/−). Closer camera → bigger Gargantua but the
+ *    same proportions (same horizon-to-disk ratio). Farther → smaller.
+ *    The lensing table rebuilds (~0.3–0.8 s).
+ *
+ *  • THEME (t). Only colours change. Geometry is identical across
+ *    themes — confirms colour is decoupled from the lensing table.
+ *
+ *  • RESIZE. Drag the terminal corner; the table rebuilds, and the
+ *    horizon stays a circle (not an oval). If the horizon ovals,
+ *    ASPECT needs re-calibrating.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 199309L
@@ -508,7 +693,7 @@ static void render(float disk_angle, int cols, int rows, float cam_dist)
                 int cp; attr_t a;
                 disk_pair(bright, r_n, &cp, &a);
                 attron(COLOR_PAIR(cp) | a);
-                mvaddch(row, col, disk_char(bright));
+                mvaddch(row, col, (chtype)(unsigned char)disk_char(bright));
                 attroff(COLOR_PAIR(cp) | a);
                 break;
             }
@@ -529,7 +714,7 @@ static void render(float disk_angle, int cols, int rows, float cam_dist)
                         attr_t a = rb > 0.55f ? A_BOLD  : A_NORMAL;
                         char   ch = rb > 0.65f ? '*' : rb > 0.35f ? '+' : '.';
                         attron(COLOR_PAIR(cp) | a);
-                        mvaddch(row, col, ch);
+                        mvaddch(row, col, (chtype)(unsigned char)ch);
                         attroff(COLOR_PAIR(cp) | a);
                     }
                 }
@@ -548,6 +733,7 @@ static volatile sig_atomic_t g_resize = 0;
 
 static void on_sigint  (int s){ (void)s; g_run    = 0; }
 static void on_sigwinch(int s){ (void)s; g_resize = 1; }
+static void cleanup    (void) { endwin(); }
 
 static void screen_init(int *cols, int *rows)
 {
@@ -567,13 +753,13 @@ static void screen_hud(int cols, int rows,
         "interstellar","matrix","nova","ocean","poison",
         "fire","plasma","gold","arctic","lava","mono"
     };
-    attron(COLOR_PAIR(CP_HUD));
+    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
     mvprintw(rows-1, 1,
         " fps:%.0f  dist:%.0f  theme:%s"
         "   [+]closer  [-]farther  [t]theme  [p]pause  [q]quit ",
         (double)fps, (double)cam_dist,
         names[theme % THEME_N]);
-    attroff(COLOR_PAIR(CP_HUD));
+    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
 /* ── §10  main ───────────────────────────────────────────────────────────── */
@@ -581,6 +767,7 @@ static void screen_hud(int cols, int rows,
 int main(void)
 {
     srand((unsigned)time(NULL));
+    atexit(cleanup);
     signal(SIGINT,   on_sigint);
     signal(SIGWINCH, on_sigwinch);
 

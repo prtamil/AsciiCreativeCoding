@@ -74,7 +74,7 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 | `spectrogram_visualizer` | Spectrogram — real-time STFT with Hann window; frequency × time heat-map; 3-component sine mixer |
 | `bounce_ball` | Reference implementation — single bouncing ball with gravity and floor restitution; the simplest complete framework example |
 
-## Fractals & Chaos  (`fractal_random/`)
+## Fractals & Chaos  (`procedural/`)
 
 | Program | Algorithm |
 |---------|-----------|

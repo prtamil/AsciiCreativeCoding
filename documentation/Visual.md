@@ -2251,7 +2251,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### fractal_random/snowflake.c
+### procedural/fractals/snowflake.c
 *DLA crystal with D6 6-fold symmetry and distance-based coloring.*
 
 **12-way simultaneous freeze** — when a walker freezes, all 12 D6 images (6 rotations × 2 reflections) are frozen atomically via `grid_freeze_symmetric()`. Each image is computed by rotating the displacement vector in Euclidean space and converting back to cell space.
@@ -2266,7 +2266,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### fractal_random/coral.c
+### procedural/generational/coral.c
 *Anisotropic DLA with 8 bottom seeds and directional sticking.*
 
 **Bottom-seeded 8-seed init** — 8 evenly spaced cells along the bottom row are frozen at startup, giving the growth multiple independent nucleation points that merge into a connected coral structure.
@@ -2279,7 +2279,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### fractal_random/sierpinski.c
+### procedural/fractals/sierpinski.c
 *Sierpinski triangle via chaos game (IFS).*
 
 **Three-vertex IFS** — `ifs_step()` picks one of three vertices uniformly at random and moves the current point halfway toward it. After 20 warm-up iterations (discarded), all subsequent points lie on the attractor.
@@ -2292,7 +2292,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### fractal_random/fern.c
+### procedural/fractals/fern.c
 *Barnsley Fern via 4-transform IFS.*
 
 **4-transform weighted IFS** — each `ifs_step()` picks a transform by cumulative probability (1%, 86%, 93%, 100% cutpoints). The `(a,b,c,d,e,f)` matrix plus probability is stored in a `static const IFSTransform` array.
@@ -2305,7 +2305,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### fractal_random/julia.c
+### procedural/fractals/julia.c
 *Julia set with Fisher-Yates random pixel reveal and 6 preset cycling.*
 
 **Fisher-Yates shuffled order** (→ V5 new technique) — `grid_shuffle()` fills `order[0..n-1]` then does a Fisher-Yates shuffle. `pixel_idx` advances PIXELS_PER_TICK per tick, revealing pixels in random order. Image materialises from scattered noise.
@@ -2318,7 +2318,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### fractal_random/mandelbrot.c
+### procedural/fractals/mandelbrot.c
 *Mandelbrot set with zoom presets and electric neon palette.*
 
 **re_center / im_center in Grid** — unlike julia.c (always centred at origin), the mandelbrot grid carries `re_center`, `im_center`, `zoom` to map each pixel to the correct complex coordinate for each preset.
@@ -2331,7 +2331,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### fractal_random/koch.c
+### procedural/fractals/koch.c
 *Koch snowflake — recursive midpoint subdivision with Bresenham rasterization.*
 
 **Recursive segment buffer** — `subdivide(segs, n)` uses static globals `g_seg_buf[]`/`g_seg_n`. Level n has 3×4ⁿ segments; level 5 has 3072. MAX_SEGS=4096 covers all levels.
@@ -2346,7 +2346,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### fractal_random/lightning.c
+### procedural/fractals/lightning.c
 *Fractal binary-tree lightning with glow halo and depth coloring.*
 
 **Tip struct with lean bias** — each active tip carries `row`, `col`, `lean` (−2..2), `steps_since_fork`. `lean/2` (rounded) gives the column delta per step. Lean persists, so branches travel diagonally at a consistent angle.
@@ -2361,7 +2361,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### fractal_random/buddhabrot.c
+### procedural/fractals/buddhabrot.c
 *Buddhabrot density accumulator — orbital trajectory heatmap, purple→white nebula palette.*
 
 **Two-pass orbit sampling** — Pass 1 tests whether c escapes within max_iter steps. Pass 2 (only for qualifying samples) re-iterates and increments `counts[row][col]` for each orbit point inside the display region. No orbit buffer is allocated; the two-pass design re-derives the orbit cheaply.
@@ -2534,7 +2534,7 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
-### fractal_random/sandpile.c
+### procedural/generational/sandpile.c
 *Bak-Tang-Wiesenfeld Abelian Sandpile with self-organised criticality.*
 
 **BFS avalanche with `g_inq[]` dedup** — Unstable cells enqueued via `enq(r,c)` which guards with `if (g_inq[r][c]) return`. The circular queue head/tail allows re-enqueueing of the same cell in a later wave without overflow. `QMAX = MAX_ROWS × MAX_COLS + 1` — one extra slot for the circular boundary condition.
@@ -3017,7 +3017,7 @@ for (int s = 0; s < n_steps; s++) {
 
 For sub-pixel circles (radius < 1.5 cols), fall back to a single center dot rather than attempting to render an outline that would collapse to noise.
 
-*Files: `fractal_random/apollonian.c`*
+*Files: `procedural/fractals/apollonian.c`*
 
 ---
 

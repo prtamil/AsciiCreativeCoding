@@ -115,7 +115,7 @@ per-program algorithm notes are in [DEMOS.md](DEMOS.md).
 |--------|---------:|---------|
 | `fluid/` | 17 | Stable fluids (Stam), lattice gas / Boltzmann, FDTD wave solvers, Gray-Scott reaction-diffusion, Lenia, FitzHugh-Nagumo excitable medium, SPH, falling sand, marching squares, vorticity-streamfunction, CFL stability explorer |
 | `physics/` | 31 | Lorenz / N-body / cloth / Ising / Schrödinger; Schwarzschild black hole; quaternion gyroscope; PBD chains; rigid-body cubes & spheres; soft-body jelly; Barnes-Hut O(N log N) gravity; LBM, mass-spring lattice, membrane FDTD; CG and multigrid solver visualisers; RK1/2/4 comparison; spectrogram |
-| `fractal_random/` | 14 | Mandelbrot / Julia / Buddhabrot / Newton; interactive Julia explorer; Barnsley IFS chaos game; DLA + dielectric breakdown; Lyapunov fractal; logistic bifurcation; Apollonian; L-systems; Lorenz strange attractor |
+| `procedural/` | 14 | Mandelbrot / Julia / Buddhabrot / Newton; interactive Julia explorer; Barnsley IFS chaos game; DLA + dielectric breakdown; Lyapunov fractal; logistic bifurcation; Apollonian; L-systems; Lorenz strange attractor |
 | `misc/` | 6 + 4 | Conway Life + variants, 1D Wolfram CA, Langton's ant, hex Life, general 2D outer-totalistic CA; sort visualiser, maze DFS+BFS+A\*, graph search, Drossel-Schwabl forest fire |
 | `raster/` + `raymarcher/` | 13 | SDF raymarcher (Blinn-Phong, shadow rays, primitives, smooth-union gallery); Mandelbulb explorer + rasterizer; UV torus / cube / sphere / displacement raster; Bresenham wireframe; donut; volumetric `nuke` mushroom cloud (2-D axisymmetric Stam stable fluids); `sun_solar` 2-D screen-space sun with arc flares |
 | `raytracing/` | 5 | Analytic ray-tracing of sphere / cube / torus / capsule + Cornell-box Monte Carlo path tracer (Lambertian BRDF, cosine-hemisphere sampling, Russian roulette) |
@@ -142,7 +142,7 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 # Examples:
 gcc -std=c11 -O2 -Wall -Wextra fluid/navier_stokes.c      -o navier_stokes  -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/lorenz.c            -o lorenz         -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra fractal_random/mandelbrot.c -o mandelbrot     -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra procedural/fractals/mandelbrot.c -o mandelbrot     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c     -o raymarcher     -lncurses -lm
 gcc -std=c11 -O2 -Wall -Wextra physics/schrodinger.c       -o schrodinger    -lncurses -lm
 ```

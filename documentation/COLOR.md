@@ -647,7 +647,7 @@ Phase is precomputed once per source per cell: `g_phase[s][r][c] = k * dist(sour
 
 ## 24. Log-Density Accumulator Coloring (Barnsley / DLA)
 
-**Where:** fractal_random/barnsley.c, fractal_random/diffusion_map.c, fractal_random/tree_la.c
+**Where:** procedural/fractals/barnsley.c, procedural/generational/diffusion_map.c, procedural/fractals/tree_la.c
 
 **How it works:**
 Each cell accumulates an integer hit count. Log-normalisation compresses the extreme dynamic range (attractor hot-spots receive millions of hits while transient cells receive 1–5):
@@ -667,7 +667,7 @@ For diffusion_map.c and tree_la.c, age (in ticks since a cell was added) replace
 
 ## 25. Lyapunov Fractal — Dual-Palette Signed Value
 
-**Where:** fractal_random/lyapunov.c
+**Where:** procedural/fractals/lyapunov.c
 
 **How it works:**
 Each pixel is a point `(a, b)` in parameter space of the logistic map. The Lyapunov exponent `λ = (1/N)·Σ ln|r(1−2xₙ)|` is computed; its sign determines stability.
@@ -799,7 +799,7 @@ which was invisible anyway.
 
 ## 28. Root-Basin Coloring with Convergence-Speed Brightness (Newton Fractal)
 
-**Where:** `fractal_random/newton_fractal.c`
+**Where:** `procedural/fractals/newton_fractal.c`
 
 **How it works:**
 Newton's method for `f(z) = z⁴ − 1` converges to one of four roots: +1, −1, +i, −i. Each root is assigned a hue family (red, blue, yellow, green). Within each hue, two color pairs are used: one dark and one bright. The convergence speed `t = n_iter / MAX_ITER` selects which:
@@ -961,7 +961,7 @@ else                  { ch = '.'; }
 
 ## 33. Recursive Depth Rainbow — Hue Encodes Fractal Nesting Level (Apollonian Gasket)
 
-**Where:** `fractal_random/apollonian.c`
+**Where:** `procedural/fractals/apollonian.c`
 
 **How it works:**
 Each circle in the Apollonian gasket is generated at a recursion depth 1–7. The color pair is assigned directly from the depth, cycling through a full hue spectrum from yellow (outermost, depth 1) to red (deepest, depth 7):

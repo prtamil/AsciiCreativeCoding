@@ -115,7 +115,7 @@ ST_STRIKING ──── strike_ticks >= STRIKE_TICKS ────┘
 
 **Visual:** The shockwave (striking phase) expands as a Manhattan-radius ring from the lowest strike point, fading over time. Characters encode direction: `|` straight, `/` `\` leaning. Color depth (row / total_rows) maps top-to-bottom: blue → teal → white.
 
-**Note:** `lightning.c` lives in `fractal_random/lightning.c`, not in `geometry/`.
+**Note:** `lightning.c` lives in `procedural/fractals/lightning.c`, not in `geometry/`.
 
 ---
 

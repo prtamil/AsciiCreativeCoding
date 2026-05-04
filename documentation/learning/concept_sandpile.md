@@ -1,4 +1,4 @@
-# Pass 1 — fractal_random/sandpile.c: Abelian Sandpile (BTW Model)
+# Pass 1 — procedural/generational/sandpile.c: Abelian Sandpile (BTW Model)
 
 ## Core Idea
 

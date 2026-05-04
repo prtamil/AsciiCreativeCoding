@@ -49,7 +49,7 @@ Reference implementation: `basics/bounce_ball.c`
 20. [Matrix Rain — matrix_rain.c](#20-matrix-rain--matrix_rainc)
 20b. [Matrix Snowflake — matrix_snowflake.c](#20b-matrix-snowflake--matrix_snowflakec)
 21. [Documentation Files Reference](#21-documentation-files-reference)
-22. [Fractal / Random Growth — fractal_random/](#22-fractal--random-growth--fractal_random)
+22. [Fractal / Random Growth — procedural/](#22-fractal--random-growth--procedural/fractals & chaos)
     - [DLA — snowflake.c and coral.c](#dla--snowflakec-and-coralc)
     - [D6 Hexagonal Symmetry with Aspect Correction](#d6-hexagonal-symmetry-with-aspect-correction)
     - [Anisotropic DLA — coral.c](#anisotropic-dla--coralc)
@@ -73,8 +73,8 @@ Reference implementation: `basics/bounce_ball.c`
     - [Animated Voronoi — voronoi.c](#animated-voronoi--voronoic)
     - [Spirograph — spirograph.c](#spirograph--spirographc)
     - [Plasma — plasma.c](#plasma--plasmac)
-39. [Penrose Tiling — fractal_random/penrose.c](#39-penrose-tiling--fractal_randompenrosec)
-40. [Diamond-Square Terrain — fractal_random/terrain.c](#40-diamond-square-terrain--fractal_randomterrainc)
+39. [Penrose Tiling — procedural/patterns/penrose_pentagrid.c](#39-penrose-tiling--procedural/fractals & chaospenrosec)
+40. [Diamond-Square Terrain — procedural/worldgen/terrain.c](#40-diamond-square-terrain--procedural/fractals & chaosterrainc)
 41. [Forest Fire CA — misc/forest_fire.c](#41-forest-fire-ca--miscforest_firec)
 42. [Lattice Gas — fluid/lattice_gas.c](#42-lattice-gas--fluidlattice_gasc)
 43. [Galaxy — artistic/galaxy.c](#43-galaxy--artisticgalaxyc)
@@ -82,11 +82,11 @@ Reference implementation: `basics/bounce_ball.c`
 45. [Analytic Wave Interference — fluid/wave_interference.c](#45-analytic-wave-interference--fluidwave_interferencec)
 46. [7-Segment LED Morph — artistic/led_number_morph.c](#46-7-segment-led-morph--artisticled_number_morphc)
 47. [Particle Number Morph — artistic/particle_number_morph.c](#47-particle-number-morph--artisticparticle_number_morphc)
-48. [Julia Explorer — fractal_random/julia_explorer.c](#48-julia-explorer--fractal_randomjulia_explorerc)
-49. [IFS Chaos Game — fractal_random/barnsley.c](#49-ifs-chaos-game--fractal_randombarnsleyc)
-50. [DLA Extended — fractal_random/diffusion_map.c](#50-dla-extended--fractal_randomdiffusion_mapc)
-51. [DBM Tree — fractal_random/tree_la.c](#51-dbm-tree--fractal_randomtree_lac)
-52. [Lyapunov Fractal — fractal_random/lyapunov.c](#52-lyapunov-fractal--fractal_randomlyapunovc)
+48. [Julia Explorer — procedural/fractals/julia_explorer.c](#48-julia-explorer--procedural/fractals & chaosjulia_explorerc)
+49. [IFS Chaos Game — procedural/fractals/barnsley.c](#49-ifs-chaos-game--procedural/fractals & chaosbarnsleyc)
+50. [DLA Extended — procedural/generational/diffusion_map.c](#50-dla-extended--procedural/fractals & chaosdiffusion_mapc)
+51. [DBM Tree — procedural/fractals/tree_la.c](#51-dbm-tree--procedural/fractals & chaostree_lac)
+52. [Lyapunov Fractal — procedural/fractals/lyapunov.c](#52-lyapunov-fractal--procedural/fractals & chaoslyapunovc)
 53. [Ant Colony Optimization — artistic/ant_colony.c](#53-ant-colony-optimization--artisticant_colonyc)
 54. [Dune Rocket — artistic/dune_rocket.c](#54-dune-rocket--artisticdune_rocketc)
 55. [Dune Sandworm — artistic/dune_sandworm.c](#55-dune-sandworm--artisticdune_sandwormc)
@@ -108,15 +108,15 @@ Reference implementation: `basics/bounce_ball.c`
 71. [Stable Fluids (Navier-Stokes) — fluid/navier_stokes.c](#71-stable-fluids-navier-stokes--fluidnavier_stokesc)
 72. [FitzHugh-Nagumo Reaction Wave — fluid/reaction_wave.c](#72-fitzhugh-nagumo-reaction-wave--fluidreaction_wavec)
 73. [2-D Wave Equation — fluid/wave_2d.c](#73-2-d-wave-equation--fluidwave_2dc)
-74. [Apollonian Gasket — fractal_random/apollonian.c](#74-apollonian-gasket--fractal_randomapolonianc)
-75. [2-D Cellular Automaton (LtL) — fractal_random/automaton_2d.c](#75-2-d-cellular-automaton-ltl--fractal_randomautomaton_2dc)
-76. [Bifurcation Diagram — fractal_random/bifurcation.c](#76-bifurcation-diagram--fractal_randombifurcationc)
-77. [Burning Ship Fractal — fractal_random/burning_ship.c](#77-burning-ship-fractal--fractal_randomburning_shipc)
-78. [Dragon Curve — fractal_random/dragon_curve.c](#78-dragon-curve--fractal_randomdragon_curvec)
-79. [L-System — fractal_random/l_system.c](#79-l-system--fractal_randoml_systemc)
-80. [Newton Fractal — fractal_random/newton_fractal.c](#80-newton-fractal--fractal_randomnewton_fractalc)
-81. [Perlin Landscape — fractal_random/perlin_landscape.c](#81-perlin-landscape--fractal_randomperlin_landscapec)
-82. [Strange Attractor — fractal_random/strange_attractor.c](#82-strange-attractor--fractal_randomstrange_attractorc)
+74. [Apollonian Gasket — procedural/fractals/apollonian.c](#74-apollonian-gasket--procedural/fractals & chaosapolonianc)
+75. [2-D Cellular Automaton (LtL) — procedural/generational/automaton_2d.c](#75-2-d-cellular-automaton-ltl--procedural/fractals & chaosautomaton_2dc)
+76. [Bifurcation Diagram — procedural/chaos/bifurcation.c](#76-bifurcation-diagram--procedural/fractals & chaosbifurcationc)
+77. [Burning Ship Fractal — procedural/fractals/burning_ship.c](#77-burning-ship-fractal--procedural/fractals & chaosburning_shipc)
+78. [Dragon Curve — procedural/fractals/dragon_curve.c](#78-dragon-curve--procedural/fractals & chaosdragon_curvec)
+79. [L-System — procedural/fractals/l_system.c](#79-l-system--procedural/fractals & chaosl_systemc)
+80. [Newton Fractal — procedural/fractals/newton_fractal.c](#80-newton-fractal--procedural/fractals & chaosnewton_fractalc)
+81. [Perlin Landscape — procedural/worldgen/perlin_landscape.c](#81-perlin-landscape--procedural/fractals & chaosperlin_landscapec)
+82. [Strange Attractor — procedural/chaos/strange_attractor.c](#82-strange-attractor--procedural/fractals & chaosstrange_attractorc)
 83. [Convex Hull — geometry/convex_hull.c](#83-convex-hull--geometryconvex_hullc)
 84. [Hex Grid — geometry/hex_grid.c](#84-hex-grid--geometryhex_gridc)
 85. [Polar Grid — geometry/polar_grid.c](#85-polar-grid--geometrypolar_gridc)
@@ -1671,9 +1671,9 @@ Identical to snowflake.c — see section 22. The same `CA6[]`/`SA6[]` tables and
 
 ---
 
-## 22. Fractal / Random Growth — fractal_random/
+## 22. Fractal / Random Growth — procedural/
 
-All eight files in `fractal_random/` share the §1–§8 framework. They differ from the physics-based animations in one structural way: the §4 section is a **Grid** (2-D cell buffer) rather than a coordinate-space converter. The grid owns the simulation state; physics ticks write into it; screen_draw reads it.
+All eight files in `procedural/` share the §1–§8 framework. They differ from the physics-based animations in one structural way: the §4 section is a **Grid** (2-D cell buffer) rather than a coordinate-space converter. The grid owns the simulation state; physics ticks write into it; screen_draw reads it.
 
 ```
 Grid  ──  typed cell array (uint8_t cells[ROWS][COLS])
@@ -2237,7 +2237,7 @@ Classic (cyan/red), Ocean (blue/teal), Ember (orange/dark-red), Neon (green/mage
 
 ---
 
-## 34. Abelian Sandpile — fractal_random/sandpile.c
+## 34. Abelian Sandpile — procedural/generational/sandpile.c
 
 `sandpile.c` drops grains one at a time onto the centre of a grid. Any cell with ≥ 4 grains topples: loses 4 grains, gives 1 to each cardinal neighbour. Cascades propagate via BFS until the grid is stable.
 
@@ -2622,7 +2622,7 @@ Normalized to [0,1] then shifted by `fmod(time*CYCLE_HZ, 1.0)` for palette cycli
 
 ---
 
-## 39. Penrose Tiling — fractal_random/penrose.c
+## 39. Penrose Tiling — procedural/patterns/penrose_pentagrid.c
 
 Computes a P3 Penrose rhombus tiling per terminal cell using de Bruijn's pentagrid duality. No tile storage — O(1) per cell.
 
@@ -2650,11 +2650,11 @@ ang = 2π·j/5 + π/2 − view_angle   // grid line angle on screen
 
 **Scale:** `SCALE_PX=80` → each rhombus side is 10 terminal columns wide so tile shapes are clearly legible.
 
-*Files: `fractal_random/penrose.c`*
+*Files: `procedural/patterns/penrose_pentagrid.c`*
 
 ---
 
-## 40. Diamond-Square Terrain — fractal_random/terrain.c
+## 40. Diamond-Square Terrain — procedural/worldgen/terrain.c
 
 Generates a fractal heightmap via diamond-square midpoint displacement, erodes it with thermal weathering, then renders ASCII elevation contours via bilinear interpolation.
 
@@ -2687,7 +2687,7 @@ Material flows downhill when slope exceeds the `TALUS` angle. Mountains slowly c
 | < 0.88 | `#` | orange |
 | ≥ 0.88 | `*` | cyan bold |
 
-*Files: `fractal_random/terrain.c`*
+*Files: `procedural/worldgen/terrain.c`*
 
 ---
 
@@ -2974,7 +2974,7 @@ p.x = p.ox + st * (p.tx - p.ox);         /* lerp from snapshot */
 
 ---
 
-## 48. Julia Explorer — fractal_random/julia_explorer.c
+## 48. Julia Explorer — procedural/fractals/julia_explorer.c
 
 Split-screen interactive Julia/Mandelbrot explorer. Left panel: precomputed Mandelbrot map (computed once at startup, reused every frame). Right panel: Julia set for the current complex parameter c (recomputed every frame).
 
@@ -2995,11 +2995,11 @@ c.im = WANDER_R * WANDER_YSHRK * sinf(wander_angle);
 ```
 `WANDER_R=0.72` places the ellipse in the bulge-arm junction — the most visually rich part of the Mandelbrot boundary.
 
-*Files: `fractal_random/julia_explorer.c`*
+*Files: `procedural/fractals/julia_explorer.c`*
 
 ---
 
-## 49. IFS Chaos Game — fractal_random/barnsley.c
+## 49. IFS Chaos Game — procedural/fractals/barnsley.c
 
 Five IFS presets (Barnsley Fern, Sierpinski Triangle, Lévy C Curve, Dragon Curve, Fractal Tree) rendered via the chaos game with log-density accumulation.
 
@@ -3023,11 +3023,11 @@ float norm = logf(1.0f + (float)hits[r][c])
 
 Maps the wide dynamic range (1 hit to millions) to [0,1]. Four character levels: `. : + @`. The y-axis is flipped: grid row 0 corresponds to `y_max`, row ROWS-1 to `y_min` (IFS attractors are defined in a coordinate system where y increases upward).
 
-*Files: `fractal_random/barnsley.c`*
+*Files: `procedural/fractals/barnsley.c`*
 
 ---
 
-## 50. DLA Extended — fractal_random/diffusion_map.c
+## 50. DLA Extended — procedural/generational/diffusion_map.c
 
 Diffusion-Limited Aggregation (DLA) with Eden mode toggle and age-gradient coloring. Tip-enhancement biases growth toward the frontier's sharpest protrusions.
 
@@ -3043,11 +3043,11 @@ Instead of simulating a random walk, Eden mode directly samples a random frontie
 
 Each cell records its freeze tick as `uint16_t age`. Since age increases monotonically and wraps at 65536, old structures appear in one color and new growth in another — the structure's growth history is visible as a hue gradient.
 
-*Files: `fractal_random/diffusion_map.c`*
+*Files: `procedural/generational/diffusion_map.c`*
 
 ---
 
-## 51. DBM Tree — fractal_random/tree_la.c
+## 51. DBM Tree — procedural/fractals/tree_la.c
 
 Dielectric Breakdown Model: Laplace's equation controls fractal tree/lightning growth. Higher `η` exponent produces thinner, more branched structures.
 
@@ -3070,11 +3070,11 @@ Frontier cells are sampled with probability proportional to `phi[r][c]^eta`. Imp
 
 `φ` value at each cell → color pair (high φ near electrode = bright; low φ deep in tree = dim). The gradient visualises the current electric field, showing where new growth is likely.
 
-*Files: `fractal_random/tree_la.c`*
+*Files: `procedural/fractals/tree_la.c`*
 
 ---
 
-## 52. Lyapunov Fractal — fractal_random/lyapunov.c
+## 52. Lyapunov Fractal — procedural/fractals/lyapunov.c
 
 Each pixel `(a, b)` in a 2D parameter space computes the Lyapunov exponent of the logistic map alternating between rates a and b.
 
@@ -3102,7 +3102,7 @@ if (bkt < 0) {                            /* stable: blue */
 
 The b-axis is inverted: row 0 = `b_max`, row ROWS-1 = `b_min`. This matches the standard Lyapunov fractal orientation where the "Zircon City" structure appears in the upper-left quadrant.
 
-*Files: `fractal_random/lyapunov.c`*
+*Files: `procedural/fractals/lyapunov.c`*
 
 ---
 
@@ -3487,7 +3487,7 @@ Point sources (Space) emit Gaussian impulses; five persistent oscillating source
 
 ---
 
-## 74. Apollonian Gasket — fractal_random/apollonian.c
+## 74. Apollonian Gasket — procedural/fractals/apollonian.c
 
 Recursive circle-packing via Descartes' Circle Theorem. Starting from three mutually tangent circles, the unique fourth tangent circle is found and the process recurses into each of the three new gaps.
 
@@ -3497,11 +3497,11 @@ Recursive circle-packing via Descartes' Circle Theorem. Starting from three mutu
 
 Recursion terminates when the resulting circle is smaller than one pixel on screen. Circle count grows as 3^depth; DEPTH_MAX=7 gives ~6500 circles. Circles are drawn progressively (one per frame) so the gasket builds up visually. Terminal aspect correction ASPECT_R scales the radius when converting to cell coordinates.
 
-*Files: `fractal_random/apollonian.c`*
+*Files: `procedural/fractals/apollonian.c`*
 
 ---
 
-## 75. 2-D Cellular Automaton (LtL) — fractal_random/automaton_2d.c
+## 75. 2-D Cellular Automaton (LtL) — procedural/generational/automaton_2d.c
 
 Extended 2-D Cellular Automaton implementing Larger-than-Life (LtL). Generalizes Conway's Life to radius R > 1: the neighborhood count is the number of alive cells in a (2R+1)² square. Birth/survive thresholds are range-based rather than bitmasks; multi-state dying trails decay over N−1 generations.
 
@@ -3511,11 +3511,11 @@ A 2-D summed area table makes each neighborhood count O(1) after O(W×H) table c
 
 Toroidal wrapping is implemented by padding the grid with R-wide copies on all sides before building the prefix sum, eliminating all per-cell boundary branches. A population history ring buffer `g_pop_hist[512]` is displayed as a time-series graph.
 
-*Files: `fractal_random/automaton_2d.c`*
+*Files: `procedural/generational/automaton_2d.c`*
 
 ---
 
-## 76. Bifurcation Diagram — fractal_random/bifurcation.c
+## 76. Bifurcation Diagram — procedural/chaos/bifurcation.c
 
 Logistic map bifurcation diagram: `x_{n+1} = r·xₙ·(1−xₙ)`. Each screen column maps to a distinct r value. After WARMUP transient iterations, PLOT values are plotted as colored dots showing the attractor.
 
@@ -3523,11 +3523,11 @@ Logistic map bifurcation diagram: `x_{n+1} = r·xₙ·(1−xₙ)`. Each screen c
 
 For r < 3: converges to a fixed point. At r ≈ 3.0: period-2 bifurcation. Each bifurcation point satisfies `r_{n+1} − r_n → 1/δ` where δ = 4.669… is Feigenbaum's universal constant. Onset of chaos at r ≈ 3.5699 (accumulation point). Auto-zoom scrolls r toward r∞ = 3.5699 each frame, continuously revealing self-similar copies of the diagram. Color encodes x value: blue (low) → cyan → green → yellow → red (high). O(W × (WARMUP + PLOT)) per diagram redraw; each column is independent.
 
-*Files: `fractal_random/bifurcation.c`*
+*Files: `procedural/chaos/bifurcation.c`*
 
 ---
 
-## 77. Burning Ship Fractal — fractal_random/burning_ship.c
+## 77. Burning Ship Fractal — procedural/fractals/burning_ship.c
 
 Escape-time fractal identical to Mandelbrot except the real and imaginary parts are forced positive before each squaring: `z ← (|Re(z)| + i|Im(z)|)² + c`.
 
@@ -3537,11 +3537,11 @@ Expanding: `Re_new = Re(z)² − Im(z)² + Re(c)`, `Im_new = 2|Re(z)|·|Im(z)| +
 
 Smooth coloring via fractional escape count: `t = iter + 1 − log₂(log₂|z|)` removes the banding of integer escape counts. A fire palette maps escape speed to color: inside-set → black, slow escape → dark red, fast → yellow/white. Pan and zoom support with a fly-to preset.
 
-*Files: `fractal_random/burning_ship.c`*
+*Files: `procedural/fractals/burning_ship.c`*
 
 ---
 
-## 78. Dragon Curve — fractal_random/dragon_curve.c
+## 78. Dragon Curve — procedural/fractals/dragon_curve.c
 
 Paper-folding Dragon Curve constructed by iterative right-folding. The turn sequence for generation n: `T_n = T_{n-1}  R  reverse_complement(T_{n-1})` where reverse_complement flips L↔R and reverses order.
 
@@ -3549,11 +3549,11 @@ Paper-folding Dragon Curve constructed by iterative right-folding. The turn sequ
 
 After n folds: 2ⁿ−1 turns, 2ⁿ segments. Gen 13 → 8192 segments. The path never self-intersects (proven); four copies at 0°/90°/180°/270° tile the plane without overlap (rep-tile of order 4). Segments are drawn one per frame using turtle graphics — F=forward, R/L=turn. Color encodes position in the sequence (age of segment), producing a visual record of the folding hierarchy. Aspect correction: horizontal steps are scaled by CELL_W/CELL_H ≈ 0.5 to keep the curve isotropic on non-square terminal cells.
 
-*Files: `fractal_random/dragon_curve.c`*
+*Files: `procedural/fractals/dragon_curve.c`*
 
 ---
 
-## 79. L-System — fractal_random/l_system.c
+## 79. L-System — procedural/fractals/l_system.c
 
 String-rewriting Lindenmayer system with turtle-graphics rendering. Each generation replaces every variable in the string with a production rule; the resulting string is executed by a turtle (F=forward, +=left, −=right, [=push, ]=pop).
 
@@ -3563,11 +3563,11 @@ Each rewrite step scans the current string and concatenates productions into a s
 
 Eight presets: Koch, Sierpinski, Plant, Dragon, Hilbert, and others. A bounding-box pre-pass walks the turtle without drawing to find the extent, then scale and center. Aspect correction uses `(STEP_PX_COL, STEP_PX_ROW)` accounting for CELL_W/CELL_H to keep branches isotropic.
 
-*Files: `fractal_random/l_system.c`*
+*Files: `procedural/fractals/l_system.c`*
 
 ---
 
-## 80. Newton Fractal — fractal_random/newton_fractal.c
+## 80. Newton Fractal — procedural/fractals/newton_fractal.c
 
 Per-pixel Newton's method for `f(z) = z⁴ − 1`. Each point in the complex plane is iterated `z ← z − f(z)/f′(z) = (3z⁴+1)/(4z³)` until convergence to one of the four roots (1, −1, i, −i).
 
@@ -3575,11 +3575,11 @@ Per-pixel Newton's method for `f(z) = z⁴ − 1`. Each point in the complex pla
 
 Color encodes which root converged to (four hues); brightness encodes convergence speed (fewer iterations → lighter). Slow convergence occurs near basin boundaries where f(z) ≈ 0, causing large Newton steps and chaotic basin-switching. Non-converging points (cycles or divergence) → black. Convergence tolerance TOL=1e-5, MAX_ITER=64. Pan/zoom with four presets that zoom to each root's basin boundary.
 
-*Files: `fractal_random/newton_fractal.c`*
+*Files: `procedural/fractals/newton_fractal.c`*
 
 ---
 
-## 81. Perlin Landscape — fractal_random/perlin_landscape.c
+## 81. Perlin Landscape — procedural/worldgen/perlin_landscape.c
 
 Three-layer parallax landscape with fractal Brownian motion terrain. The three layers (far/mid/near) scroll at different speeds, creating an illusion of depth.
 
@@ -3589,11 +3589,11 @@ Height: `h(x) = Σ_k noise(x·fᵏ) / Aᵏ` with frequency ratio f=2 and amplitu
 
 Height bins map to terrain types (water/plains/hills/peaks). Stars are scattered deterministically in the upper sky using a hash of the column index. Painter's algorithm: sky → far → mid → near (each layer overwrites the previous).
 
-*Files: `fractal_random/perlin_landscape.c`*
+*Files: `procedural/worldgen/perlin_landscape.c`*
 
 ---
 
-## 82. Strange Attractor — fractal_random/strange_attractor.c
+## 82. Strange Attractor — procedural/chaos/strange_attractor.c
 
 Point-density rendering of 2-D chaotic attractors. A point is iterated for many steps under the attractor map; visit counts accumulate in a density grid, which is log-normalized and mapped to a nebula palette.
 
@@ -3601,7 +3601,7 @@ Point-density rendering of 2-D chaotic attractors. A point is iterated for many 
 
 Six named attractors (Clifford-A, de Jong-B, Marek-C, Svensson, Bedhead, Rampe). All use the Clifford family: `x' = sin(a·y)+c·cos(a·x)`, `y' = sin(b·x)+d·cos(b·y)` except Bedhead which uses its own formula. Log density coloring: `brightness ∝ log(1+count)/log(1+max_count)`. Without log scaling, the densest "spine" would dominate and outlying filaments would be invisible. ITERS_PER_FRAME iterations per tick accumulate into the density grid; the image converges over time.
 
-*Files: `fractal_random/strange_attractor.c`*
+*Files: `procedural/chaos/strange_attractor.c`*
 
 ---
 

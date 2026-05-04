@@ -3108,7 +3108,7 @@ The b-axis is inverted: row 0 = `b_max`, row ROWS-1 = `b_min`. This matches the 
 
 ## 53. Ant Colony Optimization — artistic/ant_colony.c
 
-Stigmergic pathfinding on an 8-directional grid. Ants deposit pheromone on traversed cells; shorter paths accumulate stronger trails before evaporation erases them. The colony converges to the near-optimal path without central coordination.
+Stigmergic pathfinding on an 8-directional grid. Ants deposit pheromone on traversed cells; shorter paths accumulate stronger trails before evaporation erases them. The colony converges to the near-optimal path without central coordination — Deneubourg's double-bridge experiment, run live in the terminal.
 
 ### Pheromone Dynamics
 
@@ -3116,11 +3116,41 @@ Each tick: `τ ← τ × (1 − ρ) + Δτ`. Every ant that uses a cell deposits
 
 ### Probabilistic Movement
 
-An ant at cell i chooses neighbour j with probability `P(i→j) ∝ τ_ij^α × η_ij^β`, where `η_ij = 1/distance` is a heuristic and `α, β` balance exploitation vs. exploration. The implementation uses 8-directional grid movement (not a graph), making it visual but less rigorous than classical graph-based ACO.
+An ant at cell *i* chooses neighbour *j* with probability `P(i→j) ∝ τ_ij^α × η_ij^β`, where `η_ij = 1/distance` is a heuristic and `α, β` balance exploitation vs exploration. The implementation uses 8-directional grid movement (not a graph), making it visual but less mathematically rigorous than classical graph-based ACO. Each ant operates as a small state machine: SEARCHING ants pick from a forward-arc of three 8-dir candidates weighted by pheromone + food-direction bias; RETURNING ants bee-line back to the nest with ±1-step random deviation, depositing the heavier "return" trail.
 
-The pheromone field `g_ph[GRID_H][GRID_W]` (float, ~128 KB) is the colony's shared memory. Two food sources and one nest define the pathfinding goal. O(N_ants × grid_area) per tick.
+### 14 Food-Source Patterns (cycle with `n` / `N`)
+
+Different food layouts demonstrate different stigmergic topologies — the colony adapts its trail geometry to whatever the food problem looks like. All patterns share the same nest at the grid centre.
+
+| Pattern | Sources | Layout | Demonstrates |
+|---------|---------|--------|--------------|
+| DOUBLE | 2 | opposite sides | Deneubourg double-bridge classic |
+| SINGLE | 1 | upper-right | simplest convergent trail |
+| QUAD | 4 | cardinal directions | radial trail star |
+| LINE | 3 | collinear, right edge | trail bundling |
+| HEXAGON | 6 | hex angles around nest | 60° symmetry |
+| CROSS | 4 | mid-distance cardinals | short bidirectional trails |
+| TRIANGLE | 3 | equilateral vertices | 3-way symmetric branching |
+| CIRCLE | 8 | full ring at 45° increments | dense radial pattern |
+| DIAGONAL | 4 | along main diagonal | anisotropic preference |
+| CLUSTER | 5 | tight clump on right | trail merging at source |
+| DISTANT | 2 | extreme opposite corners | longest-trail formation |
+| PERIMETER | 6 | spread along screen edges | sparse outer routes |
+| GRID | 9 | 3×3 grid (skipping nest) | many concurrent sources |
+| RANDOM | 7 | fixed-seed random positions | irregular geometry, reproducible |
+
+### 6 Themes (cycle with `t` / `T`)
+
+CLASSIC (blue trails, yellow/magenta ants), INFRARED (warm "heat" trails), FOREST (green trails), NEON (vivid magenta/cyan), TWILIGHT (violet/purple), SUMI_E (NEGATIVE — white paper background, dark fg, A_BOLD/A_DIM disabled). All ramp entries sit ≥ 24 in the 256-cube per the bright-half rule, so even pheromone slot 0 stays legible under `A_DIM`.
+
+### Modern fixed-step input loop
+
+Earlier versions read input ONCE per render frame AFTER running `speed`-many sim ticks; at high speed multipliers the input felt laggy. The current loop reads input every iteration at 60 fps and uses `speed` only to multiply how many sim ticks run per frame — keys respond instantly at any speed. `+`/`-` adjusts speed (1×–16×), `space/p` pause, `r` reset, `q` quit.
+
+The pheromone field `g_ph[GRID_H][GRID_W]` (float) is the colony's shared memory. 80 ants, 4-tier glyph ramp (`. : + #`), 8-connected movement. O(N_ants + grid_area·evap) per tick — trivially fast past 60 fps with multi-tick speed multipliers.
 
 *Files: `artistic/ant_colony.c`*
+*Cross-references: §175 Phoenix (anchor-template silhouette pattern from a different domain — particles around a body instead of foragers around food).*
 
 ---
 
@@ -5544,11 +5574,66 @@ Six-layer screen-space composition (sky, mountain silhouette, lava flows, crater
 
 *Files: `artistic/volcano.c`*
 
-## 175. Phoenix in Flight — artistic/phoenix.c
+## 175. Perched Phoenix — artistic/phoenix.c
 
-Bird-shaped formation of fire particles with a 4-phase lifecycle FSM: `FLY → DIE → ASH → BIRTH → FLY`. The body is a fixed array of ~21 anchor points (head, neck, body, two wings, tail feathers); each frame, particles re-bind to a random anchor with a small jitter. Wings flap via `sin(t · WING_FLAP_HZ)` scaled by per-anchor `wing_frac`. Particle temperatures vary by anchor type (wing tips white-hot bucket 4, body warm bucket 2, tail orange bucket 1) so theme cycling visibly recolours the body. ASH phase releases bindings — particles burst outward with explicit velocity, fall under gravity.
+A perched owl-shaped phoenix that self-immolates and is reborn from ash on a 6-phase lifecycle FSM: `PERCH (12s) → IGNITE (2s) → BLAZE (3s) → COLLAPSE (2s) → ASH (4s) → REBIRTH (3s) → PERCH`. One full cycle ≈ 26 seconds.
+
+### Two cooperating particle systems
+
+**Body particles (~360)** paint the silhouette by snapping to a fixed anchor template (12 head outline + 14 body outline + 5 body fill + 2 eyes + 1 beak + 2 ear tufts ≈ 37 anchors). Each particle carries a `released` bit: when false it rebinds to a weighted-random anchor every frame with small jitter, when true it integrates free-flight fire physics. The phase decides the rule.
+
+**Spark particles (~220)** are pure free-flight embers, emitted from random anchors at phase-dependent rates (0 / 20 / 120 / 60 / 8 / 15 per second across the six phases). Same fire physics as released body particles; recycled when life or temperature expires.
+
+### Phase rules — what the FSM does
+
+| Phase | Body rule | Temperature shape | Spark rate |
+|-------|-----------|-------------------|------------|
+| PERCH | All BOUND | `T = base_temp + jitter`  (eyes 0.55, body 0.16) | 0 |
+| IGNITE | All BOUND | `T = lerp(base_temp, 1.0, frac)` | 20/s |
+| BLAZE | All BOUND | `T ∈ [0.85, 1.00]` random | 120/s |
+| COLLAPSE | Per frame, prob `frac · 6.0 · dt` of flipping BOUND→FREE | `lerp(1.0, 0.4, frac)` while BOUND | 60/s |
+| ASH | All FREE | integrated from previous heat | 8/s |
+| REBIRTH | Per frame, prob `5.0 · dt` of capturing FREE→BOUND on alive anchor | `0.95 − 0.30·alive_at` (centre hot) | 15/s |
+
+### Radial wake-up via `alive_at`
+
+Each anchor is tagged with `alive_at = dist_from_seed / max_dist ∈ [0,1]` where the seed is the head centre `(0, −3)`. During REBIRTH, only anchors with `alive_at ≤ growth_frac` can be captured. Eyes are nearest the seed, so they reappear first; ear-tufts are farthest, so they appear last. The owl visibly grows back from the eyes outward — no per-frame sort, just one float per anchor compared against the phase fraction.
+
+### Free-flight fire physics (body-FREE and sparks share `fire_step()`)
+
+```
+shx, shy  = sin/cos shear field (FIRE_SHEAR_HZ · t + 0.30·x ± 0.45·y)
+v        += FIRE_SHEAR_AMP · (shx, 0.6·shy) · dt
+vy       -= FIRE_BUOYANCY · (0.20 + 0.80·T) · dt        # Boussinesq lift
+v        *= 1 − FIRE_DRAG · dt                           # multiplicative drag
+x, y     += v · dt
+T        *= exp(−FIRE_COOL · dt)                         # Stefan–Boltzmann small-perturbation
+```
+
+The `0.20 + 0.80·T` lift floor means even cold smoke (T → 0) keeps rising slowly — that's why ash drifts upward through the screen instead of falling.
+
+### Heat-ramp glyph + colour (one ramp, every phase)
+
+```
+b = clamp(floor(temp · 6), 0, 5)
+b=0 '.' A_DIM    smoke         (244)
+b=1 '+'          dim feather   (theme[1])
+b=2 '*'          mid feather   (theme[2])
+b=3 '#'          ember         (theme[3])
+b=4 '@' A_BOLD   flame         (theme[4])
+b=5 '%' A_BOLD   white-hot     (231)
+```
+
+PERCH temps stay low (0.14–0.55) so the owl renders in buckets 1–2 (dim feather colours). BLAZE pegs them at 0.85–1.0 (buckets 4–5, white-hot). One ramp does both jobs — no separate "body tint vs fire" path.
+
+### Themes (4)
+CLASSIC (brown owl/red flame), IRIS (purple/pink), JADE (green poison-flame), GOLD (copper). All sit in the bright half of the 256 cube; bucket 0 always 244 grey so smoke stays visible under `A_DIM`.
+
+### Keys
+`q/ESC` quit · `space/p` pause · `r` reset · `s` skip phase · `i` ignite now · `t/T` theme · `,/.` body density · `;/'` spark density.
 
 *Files: `artistic/phoenix.c`*
+*Cross-references: §173 Fire Tornado (heat ramp + buoyancy), §174 Volcano (free-flight cooling embers), `concept_phoenix.md` for the full mental model.*
 
 ## 176. Hurricane / Cyclone — artistic/hurricane.c
 

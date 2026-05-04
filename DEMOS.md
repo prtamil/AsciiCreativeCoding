@@ -144,7 +144,7 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 | `crowd` | Reynolds steering crowd — 6 live-switchable behaviours (WANDER/FLOCK/PANIC/GATHER/FOLLOW/QUEUE); up to 150 agents; seek/flee/separate/align/cohesion forces |
 | `war` | Two-faction battle (GONDOR vs MORDOR) — melee + archer units; travelling `-` arrow projectiles (flat pool, 220 px/s); 4-state FSM (ADVANCE/COMBAT/FLEE/DEAD); 6 live battle strategies |
 | `swarm_gen_numbers` | Reynolds steering digit swarm — 25 agents form digits 0–9 via 10 strategies (DRIFT/RUSH/FLOW/ORBIT/FLOCK/PULSE/VORTEX/GRAVITY/SPRING/WAVE); greedy slot assignment; Hooke's law spring steering |
-| `ant_colony` | Pheromone ACO — stigmergic path optimization |
+| `ant_colony` | Pheromone ACO — stigmergic path optimization on an 8-dir grid (Deneubourg double-bridge); 80 ants, SEARCHING / RETURNING state machine; 14 food-source patterns (DOUBLE/SINGLE/QUAD/LINE/HEXAGON/CROSS/TRIANGLE/CIRCLE/DIAGONAL/CLUSTER/DISTANT/PERIMETER/GRID/RANDOM) cycle with `n/N`; 6 themes incl. SUMI_E NEGATIVE; modern fixed-step loop reads input every frame, `+/-` scales sim ticks per render frame (1×–16×) without losing key responsiveness |
 | `wator` | Wa-Tor predator-prey ecosystem |
 | `network_sim` | SIR epidemic + spring-force graph layout |
 | `slime_mold` | Physarum polycephalum — Jeff Jones (2010) agent model; 3-sensor sense→rotate→move→deposit loop; double-buffered trail diffusion + decay; emergent minimum Steiner tree networks connecting food sources; 4 presets, 5 themes |
@@ -361,6 +361,7 @@ fractals; cycle-through-triangles for Delaunay.
 | `sand_art` | Sands of time — curved quarter-elliptical hourglass with decorative frame; falling-sand CA + per-cell momentum so neck-stream grains visibly accelerate; auto-flip when bulb fully drains (with stall-fallback for stuck grains); time-progress HUD; 4 patterns (NORMAL/RAINBOW/GEOLOGICAL/DUAL_FLOW) × 6 themes incl. NEGATIVE inverted |
 | `bat` | Bat silhouette animation — flapping wing kinematics, Bézier curve body outline, moth-hunt targeting |
 | `bonsai` | Bonsai tree gallery — static still-life rendering of 5 classical styles (CHOKKAN/MOYOGI/SHAKAN/KENGAI/BUNJIN) with recursive procedural skeleton; aspect-corrected foliage clouds; subtle hash-gated wind rustle on leaves; 6 themes (SPRING/SUMMER/AUTUMN/WINTER/CHERRY/SUMI_E inverted ink-painting) |
+| `phoenix` | Perched phoenix self-immolation cycle — 6-phase lifecycle FSM `PERCH (12s) → IGNITE (2s) → BLAZE (3s) → COLLAPSE (2s) → ASH (4s) → REBIRTH (3s)`; owl silhouette painted by ~360 anchor-bound body particles + ~220 free-flight sparks; realistic fire physics (Boussinesq buoyancy + sin/cos shear turbulence + drag + exponential cooling); REBIRTH grows the bird outward from a head-centre seed via per-anchor `alive_at` thresholds; 4 themes (CLASSIC brown / IRIS purple / JADE green / GOLD copper); `s` skip phase, `i` ignite now |
 | `leaf_fall` | Falling leaves — Euler-angle tumbling with aerodynamic torque, ground accumulation |
 | `dna` | DNA double helix — parametric strand animation, base-pair rungs, rotation and colour cycling |
 

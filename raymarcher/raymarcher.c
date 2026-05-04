@@ -50,6 +50,104 @@
  *                  round despite non-square terminal cells.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * For every screen pixel, fire a ray from the camera into the scene and
+ * ask the SDF "how far is the nearest surface?"  Walk the ray that exact
+ * distance, then ask again.  Repeat.  When the answer drops below
+ * HIT_EPS the ray is sitting on the surface.  When the cumulative march
+ * passes MAX_DIST the ray escaped.  That single loop is the whole
+ * raymarcher — everything else (camera, lighting, character ramp) is
+ * polish on top of "guaranteed-safe variable-length steps".
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine standing in fog.  You cannot see the wall, but a tape measure
+ * tells you "the closest wall is exactly 3.2 m away in some direction".
+ * You safely step 3.2 m forward — you cannot have hit the wall, because
+ * NOTHING was closer than 3.2 m.  Now ask again: "how far?"  Maybe 1.1 m
+ * now.  Step 1.1 m.  After a handful of measurements the tape reads
+ * basically zero — your nose is touching the wall.  Sphere tracing is
+ * exactly that, applied to a vector ray instead of a person, with the
+ * SDF as the magic tape measure.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Each tick: time += dt (paused freezes it).  Light orbits at
+ *     light_spd · time on a Lissajous curve so its position changes
+ *     every render.
+ *  2. Each frame, for every canvas pixel (px, py):
+ *       Compute NDC: u ∈ [-1,1] horizontal, v ∈ [-1,1] vertical (Y up).
+ *       Build ray direction with FOV_HALF_TAN scaling, multiply v's
+ *       component by phys_aspect = canvas_h · CELL_ASPECT / canvas_w
+ *       so the sphere stays circular.
+ *  3. March: t = 0.  Loop up to RM_MAX_STEPS:
+ *       p = ro + t · rd
+ *       d = sdf_sphere(p, R) = |p| - R
+ *       if d < HIT_EPS  → hit, save t
+ *       if t > MAX_DIST → miss
+ *       else t += d  (sphere-trace step)
+ *  4. On hit: compute Phong intensity using N = normalise(hit) (sphere
+ *     normal is just the position vector), light L, view V, reflection
+ *     R = 2(N·L)N - L.  Clamp final I to [0, 1].
+ *  5. Map I to character ramp index:
+ *       idx = round(I · (RAMP_N - 1)),  glyph = " .,:;+*oxOX#@"[idx]
+ *     and to colour pair: (idx · LUMI_N) / RAMP_N → 8-step grey ramp.
+ *  6. canvas_draw centres the canvas in the terminal and emits one
+ *     CELL_W × CELL_H block per pixel (here CELL_W=CELL_H=1 so it is
+ *     a one-cell paint).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Sphere SDF      sdf(p, R) = |p| - R
+ *  Sphere normal   N = p / |p|     (gradient of |p|-R is p/|p|)
+ *  Phong shade     I = KA + KD·max(0, N·L) + KS·max(0, R·V)^SHIN
+ *  Reflection      R = 2(N·L)N - L
+ *  Sphere trace    t ← t + d   until d < HIT_EPS or t > MAX_DIST
+ *  Ray (NDC→dir)   rd = normalise( u·F, v·F·phys_aspect, -1 )
+ *                  with F = FOV_HALF_TAN
+ *  Aspect fix      phys_aspect = canvas_h · CELL_ASPECT / canvas_w
+ *  Light orbit     light = (3·cos(t·s), 1.5 + sin(0.7·t·s), 2.5)
+ *  Ramp index      idx = round(I · (RAMP_N - 1)) = round(I · 12)
+ *  Colour band     band = (idx · 8) / 13
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • If sphere_r grows past CAM_Z (4.0) the camera is INSIDE the
+ *    sphere — every ray's first SDF returns negative.  Sphere tracing
+ *    needs d to be a positive outward distance; SIZE_MAXX=3.0 caps
+ *    just below this trap.
+ *  • RM_HIT_EPS=0.002 is tighter than typical screenspace pixels; if
+ *    you raise it to 0.05 you will see ringing/aliasing at the
+ *    silhouette where the SDF becomes nearly tangent.
+ *  • The 1e-7 floor in v3norm prevents NaN when a degenerate ray
+ *    direction shows up; remove it and you get black holes when (u,v)
+ *    are both 0 with the rare numerical exactness.
+ *  • CAM_Z fixed at 4.0 means the camera never moves — only the light
+ *    and sphere change.  Adding a `cam` member and tying it to keys
+ *    requires re-deriving rd's z-component.
+ *  • Pause freezes time but render still recasts every pixel — the
+ *    image stays still and the FPS counter is still valid.
+ *  • Resize calls canvas_free + canvas_alloc; pixel buffer is sized to
+ *    cols × rows so very large terminals incur quadratic ray cost.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • At default settings the highlight should orbit roughly once every
+ *    2π / 0.8 ≈ 7.8 seconds; press ] five times to multiply by 1.35^5
+ *    ≈ 4.5× — orbit should clearly speed up by that factor.
+ *  • Press = until SIZE_MAXX clamps the radius at 3.0; at that size the
+ *    sphere should occupy ~75% of the smaller dimension.
+ *  • Press - until SIZE_MIN (0.2): sphere becomes a small dot in the
+ *    centre, marching converges in 2-3 steps because |p|-R is huge.
+ *  • Toggle pause with space and confirm the highlight stops mid-orbit.
+ *  • Resize the terminal: HUD shows new canvas dimensions, sphere
+ *    re-centres, never distorts (round on screen at any aspect).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

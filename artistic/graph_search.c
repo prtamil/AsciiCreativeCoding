@@ -123,11 +123,11 @@ static void color_init(void)
     if (COLORS >= 256) {
         init_pair(CP_UNVIS,    250, -1);   /* light grey         */
         init_pair(CP_FRONT,     51, -1);   /* cyan               */
-        init_pair(CP_VIS,      238, -1);   /* dark grey          */
+        init_pair(CP_VIS, 246, -1);   /* dark grey          */
         init_pair(CP_PATH,     226, -1);   /* yellow             */
         init_pair(CP_SRC,       46, -1);   /* green              */
         init_pair(CP_GOAL,     196, -1);   /* red                */
-        init_pair(CP_EDGE,     238, -1);   /* dim grey           */
+        init_pair(CP_EDGE, 246, -1);   /* dim grey           */
         init_pair(CP_PATH_EDGE,226, -1);   /* yellow             */
         init_pair(CP_HUD,      244, -1);   /* grey               */
     } else {

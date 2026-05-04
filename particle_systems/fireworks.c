@@ -56,6 +56,134 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Each rocket is a tiny finite-state machine: IDLE (waiting), RISING
+ * (climbing with deceleration), EXPLODED (its 80 sparks live their
+ * own short lives).  The rocket carries its own particle pool — when
+ * it reaches the apex (vy crosses zero) it fires all 80 sparks at
+ * angles spread evenly around 2π with random speeds.  Each spark
+ * then integrates Euler physics with gravity until its life decays
+ * to zero.  When all 80 are dead, the rocket flips back to IDLE with
+ * a random fuse and the cycle repeats.  The user controls how many
+ * rockets exist (1..20) and how fast time runs (sim_fps 10..60).
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a celebration where N firework launchers fire on staggered
+ * fuses.  Each launcher has its own paint can full of 80 colour-
+ * coded sparks.  A rocket leaves the ground at a random column with
+ * a hard-coded upward kick, drag pulls it back down, and at the
+ * exact instant its velocity reverses sign — boom, the can spills,
+ * 80 sparks hurl outward in a slightly squashed-vertical sphere
+ * (because terminal cells are taller than wide).  Each spark is
+ * given gravity, a random life bar (0.6..1.0), and a unique colour
+ * from the 7-hue palette.  When the can is empty (all sparks dead),
+ * the launcher reloads with a random delay (0.5..2.5 seconds) and
+ * fires again.  No global particle pool — every rocket owns its own.
+ *
+ * ALGORITHM IN STEPS  (per tick, per rocket)
+ * ──────────────────
+ *  IDLE → RISING:
+ *    1. fuse--; when fuse <= 0, rocket_launch(): pick random column,
+ *       random vy ∈ [-LAUNCH_SPEED_MIN, -LAUNCH_SPEED_MAX], random
+ *       colour, deactivate any leftover sparks.
+ *  RISING:
+ *    2. y += vy · dt · 6.0     advance position (scale 6 for terminal cells)
+ *    3. vy += DRAG · dt · 0.5  decelerate (drag halves the vy)
+ *    4. if vy >= 0 OR y < 2.0  (apex reached or hit top): explode.
+ *  EXPLODE → EXPLODED:
+ *    5. for i=0..79: angle = (i/80)·2π + jitter·0.3
+ *                    speed = 1.5 + rand·3.5
+ *                    vx = cos(angle)·speed
+ *                    vy = sin(angle)·speed·0.5  (vertical squash)
+ *                    life = 0.6 + rand·0.4, decay = 0.03 + rand·0.04
+ *                    colour = random from 7-hue palette
+ *  EXPLODED:
+ *    6. for each active spark:
+ *           x += vx · dt · 8.0, y += vy · dt · 8.0
+ *           vy += GRAVITY · dt
+ *           life -= decay; deactivate when life ≤ 0.
+ *    7. if NO sparks alive → set fuse = rand(0.5..2.5 s) → IDLE.
+ *
+ *  Render:
+ *    rocket: '|' bold + '\'' below for exhaust, in rocket colour.
+ *    spark:  random ASCII glyph from k_particle_symbols.
+ *            life > 0.6 → A_BOLD; life < 0.2 → A_DIM; else normal.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Rocket ascent:
+ *      y  += vy · dt · 6.0           dt-scaled position update
+ *      vy += ROCKET_DRAG · dt · 0.5  ROCKET_DRAG = 9.8 (rows/s²)
+ *      apex when vy >= 0
+ *
+ *  Spark physics (Euler, per tick):
+ *      x  += vx · dt · 8.0           cells per second base scale
+ *      y  += vy · dt · 8.0
+ *      vy += GRAVITY · dt            GRAVITY = 4.0 (rows/s²)
+ *      life -= decay                 decay ∈ [0.03, 0.07]/tick
+ *
+ *  Spark birth velocities (uniform angle, random speed):
+ *      angle = (i/N) · 2π + ε·rand   ε = 0.3 rad — breaks ring symmetry
+ *      speed = 1.5 + rand · 3.5      ∈ [1.5, 5.0] cells/s
+ *      vx = cos(angle) · speed
+ *      vy = sin(angle) · speed · 0.5 squash factor for terminal aspect
+ *
+ *  Spark fade attribute:
+ *      life > 0.60 → A_BOLD          fresh, bright
+ *      life < 0.20 → A_DIM           dying ember
+ *      else        → A_NORMAL
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Apex detection by sign-flip: at very high SIM_FPS the rocket may
+ *    overshoot vy=0 by more than one tick.  The condition `vy >= 0`
+ *    catches it on the next tick, so the burst happens at most one
+ *    tick late — visually invisible.
+ *  • Ceiling escape: a rocket launched with the maximum speed at a
+ *    short window can reach y < 2 before vy flips.  The OR condition
+ *    `y < 2.0` forces the burst at the top so rockets never fly off
+ *    screen unhandled.
+ *  • Vertical squash 0.5: terminal cells are roughly 2× taller than
+ *    wide.  Without the 0.5 multiplier on vy at burst, explosions
+ *    look like vertical ovals.  With it they read as round bursts.
+ *  • Per-rocket particle pool: 80 × 20 = 1600 particles total at
+ *    max load.  All on the stack inside the App struct (no malloc).
+ *  • Increasing rocket count via '+': we activate slot[i] with a
+ *    short fuse=5 so it fires almost immediately rather than parking
+ *    forever.  Decreasing via '-' just stops ticking that slot —
+ *    any in-flight rocket above the new count lives out its current
+ *    cycle on its own time but won't be ticked next frame, so it
+ *    visually freezes on screen.
+ *  • Color palette overlap: every spark independently picks one of
+ *    7 hues, so a single explosion looks like a chromatic shotgun
+ *    blast rather than a monochrome ring.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • One rocket, sim_fps=10: the entire LAUNCH→APEX→FADE cycle should
+ *    take ~3 seconds; you can count sparks (~80) and watch them die
+ *    one-by-one.  At sim_fps=60 the sequence is ~0.5 s and the burst
+ *    looks like a flash.
+ *  • Increase to 20 rockets: stagger from show_init (`fuse = i*8`)
+ *    means the first 20 launches arrive over ~5 seconds, never all
+ *    at once.
+ *  • Symmetry test: pause at apex (no pause key here, but lower
+ *    sim_fps to 10).  Watch the burst frame-by-frame: 80 sparks
+ *    should distribute roughly evenly around 2π.  The angle jitter
+ *    (ε=0.3) makes the ring slightly noisy.
+ *  • Gravity test: at the bottom of the burst envelope sparks should
+ *    accelerate downward; horizontal sparks should curve down within
+ *    ~0.5 s.  Top of burst: sparks rise briefly before reversing.
+ *  • Resize test: SIGWINCH should clear and re-init show.  In-flight
+ *    rockets are reset; new ones start from the bottom of the new
+ *    terminal size.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /* M_PI is not guaranteed by C99/C11 — define it explicitly. */
@@ -191,7 +319,7 @@ static void color_init(void)
         init_pair(COL_YELLOW,  226, COLOR_BLACK);
         init_pair(COL_GREEN,    46, COLOR_BLACK);
         init_pair(COL_CYAN,     51, COLOR_BLACK);
-        init_pair(COL_BLUE,     21, COLOR_BLACK);
+        init_pair(COL_BLUE, 33, COLOR_BLACK);
         init_pair(COL_MAGENTA, 201, COLOR_BLACK);
     } else {
         /* 8-color fallback — works in tmux without 256color config */

@@ -59,6 +59,108 @@
  *                  interesting patterns require m ≠ n.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A Chladni figure is just a contour plot of one analytic function:
+ * Z(x, y) = cos(mπx)·cos(nπy) - cos(nπx)·cos(mπy).  Wherever Z ≈ 0 the
+ * sand piles up; wherever Z is positive or negative the plate is
+ * vibrating up or down (an antinode).  No simulation, no PDE solver,
+ * no time-stepping for the physics — we just evaluate Z at every cell
+ * each frame.  The animation is a simple linear blend between the
+ * current mode's Z and the next mode's Z, with t walking from 0 to 1.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine pouring sand on a vibrating glass plate.  The plate has
+ * standing-wave humps in two directions; integers m and n count the
+ * humps along x and y.  The MINUS in cos·cos − cos·cos enforces the
+ * symmetry: swap (x↔y) and Z flips sign — so the nodal lines lie along
+ * the diagonals of symmetry.  Sand falls off the moving regions and
+ * collects on the still ones.  We simulate "still" with the test
+ * |Z| < threshold and paint a glyph there; "moving" we paint blank or
+ * a faint coloured antinode tint.  Picking different (m, n) pairs gives
+ * a museum of these classic patterns — one per pair.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Each tick:
+ *       if paused → return.
+ *       if state == ST_HOLD and auto: hold_ctr++; if ≥ HOLD_TICKS,
+ *         enter ST_MORPH with t=0.
+ *       if state == ST_MORPH: t += MORPH_SPEED.  When t ≥ 1, advance
+ *         g_mode_idx by 1 (mod N_MODES), reset t = 0, return to HOLD.
+ *  2. Each frame, for every cell (r, c):
+ *       Map (r, c) → (x, y) ∈ [0, 1]².
+ *       z1 = chladni(x, y, m_cur, n_cur)
+ *       z  = z1   if t == 0
+ *          = (1-t)·z1 + t·z2  otherwise (z2 from next mode)
+ *  3. Compute az = |z|.  Five threshold bands:
+ *       az < 0.04 → '@' (nodal core, white, A_BOLD)
+ *       az < 0.10 → '#' (close to nodal, A_BOLD)
+ *       az < 0.18 → '*' (penumbra, A_DIM, theme colour)
+ *       az < 0.28 → '+' (faint antinode glow, A_DIM)
+ *       az < 0.40 → '.' (very faint, A_DIM)
+ *       else      → ' ' (blank — pure antinode)
+ *  4. Glyphs in the inner 2 bands paint with CP_NODE (white).  Outer
+ *     bands paint with CP_POS or CP_NEG depending on sign(z).
+ *  5. HUD shows current and next (m, n), state (hold / morph), morph
+ *     parameter t, theme name, and key map.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Mode shape       Z(x,y) = cos(mπx)·cos(nπy) - cos(nπx)·cos(mπy)
+ *  Symmetry         Z(y,x) = -Z(x,y)         (anti-symmetric in x↔y)
+ *  Resonance        f_{m,n} ∝ √(m² + n²)
+ *  Cell→plate       x = c / (cols - 1),  y = r / (rows - 1)
+ *  Morph blend      Z(x,y,t) = (1-t)·Z_cur + t·Z_next     t ∈ [0,1]
+ *  Nodal test       |Z| < NODAL_THRESH  → near-zero displacement
+ *  Band thresholds  0.04, 0.10, 0.18, 0.28, 0.40 → glyphs @ # * + .
+ *  Hold then morph  state oscillates HOLD (HOLD_TICKS=120 ≈ 4s) →
+ *                   MORPH (1/MORPH_SPEED = 40 ticks ≈ 1.3s) → HOLD …
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • The mode list intentionally OMITS m == n: chladni(x, y, k, k)
+ *    returns 0 everywhere because the two cos·cos terms are equal —
+ *    the visual would be a blank plate.  Adding {1,1} or {2,2} to
+ *    MODES[] creates that degenerate frame.
+ *  • Cell (0,0), (cols-1,0), (0,rows-1), and (cols-1,rows-1) ALWAYS
+ *    sit on a nodal line because cos(0) = cos(π) = ±1 — the corners
+ *    are perpetually still.  This is the free-edge boundary.
+ *  • Resize is implicit: g_rows / g_cols are read every frame.  After
+ *    SIGWINCH endwin/refresh re-syncs but the figure briefly stutters
+ *    while next is recomputed.
+ *  • MORPH_SPEED = 0.025 means a full transition in 40 ticks; halving
+ *    it doubles morph time.  Dropping below 0.005 produces visible
+ *    flicker because the float t becomes hard to distinguish frame
+ *    to frame.
+ *  • Pressing 'n' or 'p' during a morph aborts it (state → HOLD,
+ *    t = 0); the next frame renders the new mode cleanly.
+ *  • Auto-advance flag controls ONLY the HOLD → MORPH transition;
+ *    once morphing, it always completes.  Toggle 'a' to freeze on
+ *    the current mode.
+ *  • Theme change re-runs init_pair on CP_POS and CP_NEG only —
+ *    CP_NODE stays white.  The nodal lines never change colour.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Mode (1,2): expect ONE horizontal and ONE vertical nodal line
+ *    crossing at the centre, with four antinode quadrants alternating
+ *    sign in a + pattern.
+ *  • Mode (2,3): three diagonal nodal arcs visible; count them.
+ *  • Mode (3,4): the figure has 3·4·2 = 24 antinodal cells (rough
+ *    rule of thumb — m·n·2 visual cells for low integer modes).
+ *  • Press 'n' rapidly: HUD mode counter cycles 1/20 → 2/20 → … →
+ *    20/20 → 1/20.  Confirm the figure changes for each.
+ *  • Press 't' four times to return to the original theme — the
+ *    pattern should be identical, only colour swapped.
+ *  • Pause mid-morph (space) and confirm t freezes at its current
+ *    value (HUD shows it).  Resume — morph continues.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

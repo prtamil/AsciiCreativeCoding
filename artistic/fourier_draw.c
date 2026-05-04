@@ -133,8 +133,8 @@ static void color_init(void)
     if (COLORS >= 256) {
         init_pair(CP_ARM_HI,  231, -1);   /* xterm bright white   */
         init_pair(CP_ARM_MID,  87, -1);   /* aqua                 */
-        init_pair(CP_ARM_LO,  238, -1);   /* dark grey            */
-        init_pair(CP_CIRCLE,  235, -1);   /* near-black grey      */
+        init_pair(CP_ARM_LO, 246, -1);   /* dark grey            */
+        init_pair(CP_CIRCLE, 243, -1);   /* near-black grey      */
         init_pair(CP_TRAIL_1, 226, -1);   /* yellow               */
         init_pair(CP_TRAIL_2, 208, -1);   /* orange               */
         init_pair(CP_TRAIL_3, 196, -1);   /* red                  */

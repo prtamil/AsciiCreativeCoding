@@ -137,8 +137,8 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_BL2,  17, -1);   /* dark navy    */
-        init_pair(CP_BL1,  21, -1);   /* bright blue  */
+        init_pair(CP_BL2, 25, -1);   /* dark navy    */
+        init_pair(CP_BL1, 33, -1);   /* bright blue  */
         init_pair(CP_BL0,  27, -1);   /* blue         */
         init_pair(CP_WH0, 250, -1);   /* light grey   */
         init_pair(CP_WH1, 255, -1);   /* near white   */

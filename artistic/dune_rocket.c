@@ -97,7 +97,7 @@ static void color_init(void) {
         init_pair(CP_GROUND,    136,   -1);  /* sandy gold */
         init_pair(CP_SAND,       94,   -1);  /* dark sand */
         init_pair(CP_SCORCH,     52,   -1);  /* very dark red */
-        init_pair(CP_HUD,       232,  250);  /* dark text on silver bar */
+        init_pair(CP_HUD, 240,  250);  /* dark text on silver bar */
     } else {
         init_pair(CP_SHIP_HULL, COLOR_WHITE,  COLOR_BLACK);
         init_pair(CP_SHIP_PORT, COLOR_RED,    COLOR_BLACK);

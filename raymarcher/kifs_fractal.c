@@ -474,7 +474,7 @@ static void color_init(void)
     if (COLORS >= 256) {
         init_pair(PAIR_HUD,  226, -1);
         init_pair(PAIR_HINT,  51, -1);
-        init_pair(PAIR_BG,   234, -1);
+        init_pair(PAIR_BG, 242, -1);
     } else {
         init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
         init_pair(PAIR_HINT, COLOR_CYAN,   -1);

@@ -113,6 +113,116 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Each terminal column owns one "stream" — an integer head row that
+ * marches downward at constant speed and a trail of cached characters
+ * behind it.  The trail is six shade buckets deep: white head, hot
+ * red-orange, bright, mid, dark, fade.  Because physics ticks fire
+ * slower than render frames, the renderer projects the head forward
+ * by `speed × alpha` fractional rows so the stream slides smoothly
+ * even when only one tick fires per three frames.  The grid is just
+ * a fading texture left behind for atmosphere; the live columns are
+ * the truth and they bypass the grid entirely on render.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine each column as a Roman candle pointing down.  At the tip is
+ * a glowing white head; behind it stretches a tail that fades from
+ * lime-bright to dim moss to nothing.  The candle moves down by an
+ * integer number of rows per "tick", but you photograph the screen
+ * three times per tick — so the candle has to lie about its position
+ * each photo, claiming "I'm 33% of the way to my next row" or "I'm
+ * 66%".  Round that fractional row to the nearest screen row using
+ * floor(x+0.5), draw the trail relative to it, and the eye sees a
+ * silky scroll instead of a stuttering jump.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Init: allocate one Column slot per terminal column.  Spawn
+ *     columns at density_divisor cadence (every 2nd column by default);
+ *     each gets a random head_y above the screen, random trail length
+ *     [TRAIL_MIN..TRAIL_MAX], random speed [SPEED_MIN..SPEED_MAX], and
+ *     random char cache.
+ *  2. Each sim tick (rain_tick):
+ *       a. clear the persistence grid; scatter-erase a random row's
+ *          worth of cells (DISSOLVE_FRAC=4 → 25% of one row erased).
+ *       b. for each active column: head_y += speed; refresh the
+ *          ch_cache with new random chars (per-tick shimmer); paint
+ *          column into the grid texture.
+ *       c. inactive columns roll a die — 15/divisor% chance per tick
+ *          to respawn.  If column passed off-screen, deactivate.
+ *  3. Each render frame:
+ *       a. compute alpha = sim_accum / tick_ns.
+ *       b. pass 1: draw the persistence grid texture (integer rows).
+ *       c. pass 2: for each active column,
+ *               draw_head_y = head_y + speed · alpha
+ *          and for dist in 0..length-1:
+ *               row = floor(draw_head_y - dist + 0.5)
+ *               glyph = ch_cache[dist]
+ *               shade = col_shade_at(dist, length)
+ *          → mvaddch(row, col, glyph) with shade attribute.
+ *       d. draw HUD top-right; present via wnoutrefresh+doupdate.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  draw_head_y  = head_y + speed · alpha             alpha ∈ [0,1)
+ *  row          = floor(draw_head_y − dist + 0.5)    round half up
+ *  alpha        = sim_accum / tick_ns                fractional remainder
+ *  shade(dist):
+ *      0           → HEAD   (white,  bold)
+ *      1           → HOT    (theme[4], bold)
+ *      2           → BRIGHT (theme[3], bold)
+ *      3..length/2 → MID    (theme[2])
+ *      ..length−2  → DARK   (theme[1])
+ *      else        → FADE   (theme[0], dim)
+ *  density_divisor: spawn rate = 1/divisor; bigger = sparser
+ *  respawn chance:  15 / divisor % per tick per inactive column
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Round-half-even bug: roundf(0.5) gives 0 but roundf(1.5) gives 2
+ *    (banker's rounding).  At alpha=0.5 with head_y at integer N, the
+ *    head would oscillate between rows N and N+1 across frames.  We
+ *    use `floor(x + 0.5)` which always rounds up at .5 — deterministic.
+ *  • Two-pass draw: the persistence grid (pass 1) is integer-rounded;
+ *    live columns (pass 2) are fractional.  Drawing live columns AFTER
+ *    the grid is essential — otherwise the grid's cached cell at the
+ *    head's old row would overwrite the freshly-interpolated head.
+ *  • Char-cache refresh: ch_cache is updated every tick, NOT every
+ *    frame.  At alpha=0..0.99 between two ticks, every frame uses the
+ *    same chars — that's why glyphs shimmer at 20 Hz, not 60 Hz.
+ *  • TRAIL_MAX = 24: ch_cache is a fixed array.  Increasing trail
+ *    length past 24 silently truncates rendering.
+ *  • Speed > 1: at SPEED_MAX=2, draw_head_y = head_y + 2·alpha, which
+ *    can cross two rows in one frame at alpha=0.5+.  The for-loop
+ *    over dist still walks one row at a time so the trail is continuous,
+ *    but the head moves twice as fast as a speed-1 column.
+ *  • Respawn cadence: at density=6 (sparsest), respawn chance is
+ *    15/6=2.5% per tick → average ~40 ticks (~2 s at 20 Hz) before a
+ *    dead column reappears.  Looks empty until columns repopulate.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause sim_fps near minimum ('[' until 4 Hz): you should see the
+ *    head smoothly scroll between integer rows over ~15 frames per
+ *    tick — proving alpha interpolation works.
+ *  • Speed test: at SIM_FPS=20 a column moves at speed×20 rows/sec.
+ *    Time how long a head takes to traverse the screen — should be
+ *    rows / (speed·20) seconds, ±1 frame.
+ *  • Density: '+' down to density=1 fills every column; '-' up to
+ *    density=6 leaves ~16% of columns lit.  Counts visibly on a
+ *    100-column terminal.
+ *  • Theme cycle 't': head colour stays white in every theme; trail
+ *    hue swaps among green/amber/blue/white.  HEAD pair always white.
+ *  • Resize: shrink the terminal — columns past the new width should
+ *    silently stop rendering (col_paint_interpolated guards `c->col >=
+ *    cols`); growing should leave a gap until rain_init repopulates.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

@@ -334,16 +334,16 @@ static void color_init(void)
     use_default_colors();
     if (COLORS >= 256) {
         /* Vorticity: diverging blue → white → red */
-        init_pair(CP_VN2,  17,  COLOR_BLACK);  /* deep blue    */
+        init_pair(CP_VN2, 25,  COLOR_BLACK);  /* deep blue    */
         init_pair(CP_VN1,  27,  COLOR_BLACK);  /* mid blue     */
         init_pair(CP_VN0,  153, COLOR_BLACK);  /* light blue   */
-        init_pair(CP_VZERO,238, COLOR_BLACK);  /* dim grey     */
+        init_pair(CP_VZERO, 246, COLOR_BLACK);  /* dim grey     */
         init_pair(CP_VP0,  217, COLOR_BLACK);  /* light red    */
         init_pair(CP_VP1,  160, COLOR_BLACK);  /* mid red      */
         init_pair(CP_VP2,  52,  COLOR_BLACK);  /* deep red     */
         /* Velocity magnitude: dark→bright */
-        init_pair(CP_VEL0, 17,  COLOR_BLACK);
-        init_pair(CP_VEL1, 19,  COLOR_BLACK);
+        init_pair(CP_VEL0, 25,  COLOR_BLACK);
+        init_pair(CP_VEL1, 27,  COLOR_BLACK);
         init_pair(CP_VEL2, 27,  COLOR_BLACK);
         init_pair(CP_VEL3, 45,  COLOR_BLACK);
         init_pair(CP_VEL4, 46,  COLOR_BLACK);

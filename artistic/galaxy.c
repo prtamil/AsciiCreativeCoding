@@ -55,6 +55,101 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The visible spiral arms are NOT a structure — they are an artefact of
+ * statistical placement plus shear.  Seed 3000 stars on logarithmic
+ * spiral curves, give every star the SAME tangential speed (flat
+ * rotation curve), and let inner stars (small r) accumulate angle
+ * faster than outer ones (ω = V0 / r).  After thousands of ticks the
+ * arms wind up like spaghetti around a fork.  The "winding problem" of
+ * real galaxy theory is the whole demo.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine many runners on circular tracks of different radii, all
+ * moving at the same forward SPEED in metres/second.  The runner on the
+ * inner track laps the outer one constantly because their track is
+ * shorter.  Now line them up at t=0 along a straight radial line — a
+ * "starting gate".  Run for an hour.  The line bends into a spiral.
+ * That is exactly what each arm is doing here, except the seed line is
+ * already a logarithmic spiral, which the differential rotation keeps
+ * tightening forever.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Init: split N_STARS into 20% bulge / 70% arms / 10% halo.  Bulge
+ *     stars get half-Gaussian small radii.  Arm stars are placed along
+ *     N_ARMS log-spirals: θ = arm·(2π/N) + WINDING·ln(r/r_min) + jitter.
+ *     Halo stars get uniform large radii.  Each star caches ω = V0 / r.
+ *  2. Each frame, run g_steps physics sub-steps:
+ *       For every star: θ += ω · g_speed
+ *       Convert (r, θ) to screen (sx, sy) with rx = 0.44·cols and
+ *       ry = 0.5·rx (terminal aspect correction).
+ *       Add 1/g_steps to g_bright[sy][sx].
+ *  3. Each render frame: multiply g_bright[][] by DECAY=0.82 — this is
+ *     a one-line exponential moving average that gives the trail look.
+ *  4. Find b_max over the visible region; normalise t = b / b_max.
+ *  5. Pick glyph by t threshold (".,:oO0@") and pick colour pair by
+ *     normalised radius rn = sqrt((dx/rx)² + (dy/ry)²):
+ *       rn < 0.10 → CP_CORE,  < 0.65 → CP_DISK,  else CP_HALO.
+ *  6. Always paint a '*' at the centre so the galactic nucleus is
+ *     visible regardless of star density.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Flat rotation     v_circ = V0 = const     (independent of r)
+ *  Angular vel       ω(r) = V0 / r            (Keplerian decay)
+ *  Log spiral seed   θ₀(r) = arm·(2π/N) + WINDING · ln(r / r_min)
+ *  Tick update       θ ← θ + ω · g_speed
+ *  Polar→screen      sx = cx + r·cosθ · rx,  sy = cy + r·sinθ · ry
+ *  Aspect fix        ry = 0.5 · rx           (cells are 2× taller)
+ *  Decay model       B(t+1) = B(t) · DECAY + new_stars
+ *  Steady state      B_ss = f / (1 - DECAY) = f · 5.56
+ *  Box-Muller        z = sqrt(-2 ln u₁) · cos(2π u₂)   (bulge sampling)
+ *  Glyph ramp        t < 0.12 .  < 0.25 ,  < 0.40 :  < 0.55 o
+ *                    < 0.70 O  < 0.85 0(bold)  else @(bold)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • DECAY=0.82 is the steady-state controller; cranking it to 0.95
+ *    makes trails persist for ~20 frames (very smeary), 0.5 makes them
+ *    barely visible.  Set DECAY=1.0 and the buffer never clears — the
+ *    arms blur into a uniform disc within a minute.
+ *  • Resize triggers galaxy_init — winding state is LOST every resize.
+ *    The arms re-emerge fresh.  Pressing 'r' has the same effect.
+ *  • g_steps is multiplicative on physics-per-frame; raising it to 16
+ *    makes one rendered frame compress 16 ticks of winding, so the
+ *    galaxy ages 16× faster (visually).
+ *  • Bulge radius is hard-clamped to [0.004, 0.20] to prevent ω = V0 / r
+ *    from blowing up at r → 0; without the floor the centre stars
+ *    teleport.
+ *  • The ARM_SCATTER=0.25 jitter adds (rng-0.5)·0.5 rad to each star;
+ *    setting it to 0 produces RAZOR-thin arms that look unnaturally
+ *    geometric.
+ *  • Halo stars have NO arm structure; if you raise their fraction past
+ *    ~30% the spiral shape gets washed out completely.
+ *  • The peak-normalising step makes brightness adaptive — a sparse
+ *    galaxy still looks bright because b_max scales with density.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • At default speed (1×) and 2 arms, count: 2 spiral arms should be
+ *    clearly visible at t = ~50 ticks; by tick ~500 they wrap multiple
+ *    times around the centre.
+ *  • Press 'r' to reset, then 'a' twice — arm count should cycle
+ *    2→3→4→2; each reset shows the new symmetry.
+ *  • Set speed to MAX (5×) — winding visibly accelerates 5×.
+ *  • Press 't' through all 5 themes; CORE/DISK/HALO colour zones
+ *    should differ for each, but the structure is unchanged.
+ *  • Pause — counts of bright pixels should NOT decay further (decay
+ *    runs in scene_draw which still runs but galaxy_step does not, so
+ *    new stars never refresh — they fade until floor).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>
@@ -153,13 +248,13 @@ static const Theme k_themes[N_THEMES] = {
     /* 0 MilkyWay  — white core, cyan arms, grey halo */
     { 231,  39, 240,  COLOR_WHITE, COLOR_CYAN,    COLOR_WHITE,   "MilkyWay" },
     /* 1 Starburst — yellow core, blue arms, dark grey halo */
-    { 226,  33, 238,  COLOR_YELLOW, COLOR_BLUE,   COLOR_WHITE,   "Starburst" },
+    { 226,  33, 244,  COLOR_YELLOW, COLOR_BLUE,   COLOR_WHITE,   "Starburst" },
     /* 2 Nebula    — white core, pink arms, purple halo */
     { 231, 207,  92,  COLOR_WHITE,  COLOR_MAGENTA, COLOR_MAGENTA, "Nebula" },
     /* 3 Infrared  — white core, red arms, dark-red halo */
     { 231, 196,  52,  COLOR_WHITE,  COLOR_RED,     COLOR_RED,     "Infrared" },
     /* 4 Aurora    — white core, bright-green arms, dark-green halo */
-    { 231,  46,  22,  COLOR_WHITE,  COLOR_GREEN,   COLOR_GREEN,   "Aurora" },
+    { 231,  46,  28,  COLOR_WHITE,  COLOR_GREEN,   COLOR_GREEN,   "Aurora" },
 };
 
 static bool g_has_256;

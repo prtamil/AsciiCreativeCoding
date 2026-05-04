@@ -224,9 +224,9 @@ static void color_init(void)
         init_pair(CP_FLIGHT,    51, COLOR_BLACK);
         init_pair(CP_LAND,     201, COLOR_BLACK);
         init_pair(CP_TRAIL,     27, COLOR_BLACK);
-        init_pair(CP_TRAIL_O,   17, COLOR_BLACK);
+        init_pair(CP_TRAIL_O, 25, COLOR_BLACK);
         init_pair(CP_SURF,      46, COLOR_BLACK);
-        init_pair(CP_ROCK,      22, COLOR_BLACK);
+        init_pair(CP_ROCK, 28, COLOR_BLACK);
         init_pair(CP_HUD,       51, COLOR_BLACK);
         init_pair(CP_ENERGY,   226, COLOR_BLACK);
         init_pair(CP_FOOT,     245, COLOR_BLACK);

@@ -140,7 +140,7 @@ static void color_init(void)
         init_pair(C_YELLOW,  226, COLOR_BLACK);
         init_pair(C_GREEN,    46, COLOR_BLACK);
         init_pair(C_CYAN,     51, COLOR_BLACK);
-        init_pair(C_BLUE,     21, COLOR_BLACK);
+        init_pair(C_BLUE, 33, COLOR_BLACK);
         init_pair(C_MAGENTA, 201, COLOR_BLACK);
     } else {
         init_pair(C_RED,     COLOR_RED,     COLOR_BLACK);

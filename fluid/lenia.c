@@ -119,7 +119,7 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_U0,  17, -1);   /* dark navy    — 0.0-0.2  */
+        init_pair(CP_U0, 25, -1);   /* dark navy    — 0.0-0.2  */
         init_pair(CP_U1,  27, -1);   /* blue         — 0.2-0.4  */
         init_pair(CP_U2,  51, -1);   /* cyan         — 0.4-0.6  */
         init_pair(CP_U3, 195, -1);   /* pale cyan    — 0.6-0.8  */

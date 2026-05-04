@@ -105,8 +105,8 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_D0,  17, -1);   /* very dark blue  */
-        init_pair(CP_D1,  21, -1);   /* blue            */
+        init_pair(CP_D0, 25, -1);   /* very dark blue  */
+        init_pair(CP_D1, 33, -1);   /* blue            */
         init_pair(CP_D2,  27, -1);   /* med blue        */
         init_pair(CP_D3,  51, -1);   /* cyan            */
         init_pair(CP_D4, 231, -1);   /* white           */

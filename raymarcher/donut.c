@@ -57,6 +57,95 @@
  *                  aspect (CELL_H / CELL_W ≈ 2) compensates in the projection.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A torus is two nested circles: walk a small circle (the tube, parameter
+ * φ) while sweeping that whole circle around a bigger circle (the ring,
+ * parameter θ).  Sampling (θ, φ) on a fine grid produces a dense cloud of
+ * 3-D surface points.  Rotate every point by two Euler angles, project to
+ * 2-D with 1/z perspective, and let a z-buffer decide which sample wins
+ * each terminal cell.  The donut you see is just thousands of lit dots
+ * fighting for the front-most spot.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a sparkler tracing a small circle while you slowly rotate your
+ * wrist.  The trail covers a doughnut in space.  Now photograph that
+ * doughnut from a fixed camera while the doughnut itself tumbles — each
+ * sparkler dot is one (θ, φ) sample.  The screen is film: each pixel
+ * remembers ONLY the closest sparkler dot that hit it, and the brightness
+ * comes from how the dot's surface tilts toward a light bulb above and
+ * behind the camera.
+ *
+ * DRAWING METHOD
+ * ──────────────
+ *  1. Clear outbuf[] to spaces and zbuf[] to zero (zero = infinitely far,
+ *     because we store 1/z and bigger 1/z means closer).
+ *  2. Precompute sinA, cosA, sinB, cosB for the current Euler angles.
+ *  3. Two nested loops over θ ∈ [0, 2π) step THETA_STEP and φ ∈ [0, 2π)
+ *     step PHI_STEP.  About 90 × 314 ≈ 28 000 surface samples per frame.
+ *  4. For each (θ, φ): build the un-rotated point (cx, cy) in the tube
+ *     cross-section, apply the combined X-then-Z rotation, add K2 to z so
+ *     the donut sits in front of the camera.
+ *  5. Project: xp = cols/2 + K1·x/z, yp = rows/2 - K1·y/z·0.5 (the 0.5
+ *     fixes the 2:1 terminal cell aspect so the donut looks round).
+ *  6. Compute luminance L = N · light (analytic dot product, no shader).
+ *     If L ≤ 0 the surface faces away — skip.
+ *  7. z-buffer: only keep this dot if 1/z > zbuf[idx].  Pick a glyph from
+ *     ".,-~:;=!*#$@" indexed by L, store it in outbuf[idx].
+ *  8. After both loops finish, walk outbuf[] in row order and emit each
+ *     non-space cell with a colour pair selected from the same L.
+ *  9. Each tick: A += rot_a · dt, B += rot_b · dt — that is the only
+ *     state change between frames.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Tube point      cx = R2 + R1·cos θ,  cy = R1·sin θ      circle in XZ
+ *  Rotation X      after A around X: y' = y·cosA - z·sinA, z' = y·sinA + z·cosA
+ *  Rotation Z      after B around Z: x'' = x·cosB - y·sinB, y'' = x·sinB + y·cosB
+ *  Combined        x = cx(cosB·cosφ + sinA·sinB·sinφ) - cy·cosA·sinB
+ *                  y = cx(sinB·cosφ - sinA·cosB·sinφ) + cy·cosA·cosB
+ *                  z = K2 + cosA·cx·sinφ + cy·sinA
+ *  Projection      xp = cols/2 + K1·x/z,  yp = rows/2 - K1·y/z·0.5
+ *  Luminance       L = cosφ·cosθ·sinB - cosA·cosθ·sinφ - sinA·sinθ
+ *                    + cosB·(cosA·sinθ - cosθ·sinA·sinφ)
+ *  K1 sizing       K1 = 0.42 · min(cols/2, rows) · (K2+R1+R2) / (R1+R2)
+ *  Glyph index     li = floor(L · |ramp|), clamp to |ramp|-1
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • θ-step too coarse — the surface develops Moiré bands; PHI_STEP=0.02
+ *    is finer than THETA_STEP=0.07 because the tube is the smaller circle
+ *    and shows undersampling first.
+ *  • z-buffer convention is INVERTED: zbuf[] holds 1/z, so larger value =
+ *    closer.  Forgetting this ("if (ooz < zbuf)") draws the back of the
+ *    donut on top.
+ *  • Initial zbuf=0 only works because every visible surface has z>0; if
+ *    the donut centre ever crossed K2 the whole render breaks.
+ *  • The 0.5 factor on yp is NOT physics — it is terminal aspect
+ *    correction.  Remove it on a square-cell terminal.
+ *  • Resize must update t->cols / t->rows AND not exceed TORUS_MAX_*; the
+ *    flat outbuf is sized for the worst case.
+ *  • Pause freezes A and B but render still runs every frame — the donut
+ *    stays visible, just stationary.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • At A=B=0 the donut should appear as a flat ring (top-down view) with
+ *    the brightest band along one side where the light grazes it.
+ *  • Pressing ] five times multiplies rot_a by 1.3^5 ≈ 3.7×; the spin
+ *    should look ~4× faster, not 5× — confirms multiplicative scaling.
+ *  • Pressing = until SIZE_MAXX (5.0) caps growth; further presses do
+ *    nothing.  Pressing - back to default returns to original size.
+ *  • Resize the terminal: the donut should re-centre and re-fit to ~42%
+ *    of the smaller dimension automatically (torus_k1 recomputes).
+ *  • Setting THETA_STEP=0.5 deliberately should produce a sparse "wire
+ *    cage" donut — proves the loop is the only source of sample density.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
@@ -346,8 +435,8 @@ static void torus_render(Torus *t)
             const float ooz = 1.0f / z;   /* one-over-z for perspective */
 
             /* Project to screen coordinates. */
-            const int xp = (int)(cols / 2 + K1 * ooz * x);
-            const int yp = (int)(rows / 2 - K1 * ooz * y * 0.5f);
+            const int xp = (int)((float)cols * 0.5f + K1 * ooz * x);
+            const int yp = (int)((float)rows * 0.5f - K1 * ooz * y * 0.5f);
 
             /* Bounds check. */
             if (xp < 0 || xp >= cols || yp < 0 || yp >= rows) continue;

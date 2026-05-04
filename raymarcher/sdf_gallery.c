@@ -64,6 +64,113 @@
  *                     with smooth-min produces blob-like organic shapes.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * One ray-march loop, FIVE different scene_map() functions.  The
+ * raymarcher does not know what shape it is drawing — every preset
+ * answers the same single question: "given world point p, how far is
+ * the nearest surface?"  Composing primitives is just composing those
+ * answers with min/max/smin.  Deforming a shape is preprocessing p
+ * before asking.  Once you accept that, every "trick" in the gallery —
+ * twist, repeat, blend, CSG, organic sculpting — collapses into a
+ * one-line modification of either the input p or the returned d.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture an invisible sonar inside each ray, pinging the world.  The
+ * sonar returns "you are X metres from something solid".  Sphere
+ * tracing trusts that ping and skips X metres at a time, since stepping
+ * less than X cannot collide.  When the ping reads tiny (< MARCH_EPS)
+ * the ray has touched the surface.  CSG is just "report the closer of
+ * two pings".  Repeat is "lie to the sonar by folding p back into one
+ * cell".  Twist is "rotate p around the y-axis based on its height
+ * before pinging".  Smooth union is "average the two pings near the
+ * seam so the world feels welded".
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Each tick: advance scene_t (frozen if paused), orbit cam_phi by
+ *     orbit_spd · dt, advance the colour-cycling phase.
+ *  2. Build the camera basis from (cam_dist, cam_theta, cam_phi); on
+ *     row 0 of a frame, snapshot it so all rows share one viewpoint.
+ *  3. Progressive render: cast ROWS_PER_TICK canvas rows per frame.
+ *     For each pixel (px, py): screen→ndc→ray direction with terminal
+ *     aspect correction (CELL_ASPECT in the y-component of rd).
+ *  4. sdf_march steps along rd: tm += scene_map(p).d · step_scale.
+ *     step_scale=0.85 (twist preset uses 0.60 because the deformed DE
+ *     is no longer Lipschitz-1 and over-stepping ghosts the surface).
+ *  5. On hit (d < MARCH_EPS): six-tap finite-difference normal, optional
+ *     soft penumbra shadow, optional 5-step ambient occlusion along N.
+ *  6. shade_luma branches on light_mode: N·V (default), Phong 3-point,
+ *     or Flat (luma=1).  Each pixel stores (luma, col_signal, hit-bit).
+ *  7. canvas_draw: gamma-encode luma (^0.45) so the 8-glyph Bourke ramp
+ *     lands evenly, look up theme colour from col_signal, paint cell.
+ *  8. Once the last canvas row is reached, copy g_fbuf → g_stable so
+ *     subsequent frames have a complete buffer to draw from while the
+ *     next pass is still in progress.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Sphere SDF       sdSphere(p, r) = |p| - r
+ *  Capsule SDF      project p onto segment ab (clamp t to [0,1]),
+ *                   distance to that point minus r
+ *  Torus SDF        |( |p.xz| - R, p.y )| - r
+ *  Round box SDF    |max(|p|-b, 0)| + min(max(|p|-b), 0) - r
+ *  Boolean union    min(a, b)
+ *  Boolean intersect  max(a, b)
+ *  Boolean subtract   max(a, -b)
+ *  Smooth-min       h = max(k - |a-b|, 0)/k
+ *                   smin(a,b,k) = min(a,b) - h²·k/4
+ *  Twist            angle = p.y · k;  rotate p.xz by angle
+ *  Domain repeat    p.xz -= cell · round(p.xz / cell)
+ *  Sphere trace     tm ← tm + d · step_scale  until d < MARCH_EPS
+ *  Normal           ∂f/∂x ≈ (f(p+h·x̂) - f(p-h·x̂)) / (2h), normalise
+ *  Soft shadow      res = min(res, SH_K · d / tm)  along light ray
+ *  Ambient occl.    occ += w · (dist - f(p + dist·N));  AO = 1 - 2·occ
+ *  Camera position  cam = D · (cosθ·cosφ, sinθ, cosθ·sinφ)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Twist scene's DE is INEXACT — it is a "lie" about distance.  The
+ *    MARCH_TW=0.60 step_scale prevents the marcher from skipping past
+ *    the real surface.  Cranking step_scale back to 0.85 visibly etches
+ *    artefacts.
+ *  • Domain-repeat looks correct ONLY if the primitive radius is less
+ *    than half the cell size (0.72 < 1.1 here); larger radii overlap
+ *    cells and the repeat formula returns a non-Lipschitz distance.
+ *  • Camera near gimbal lock (|fwd · world_up| > 0.99) swaps world-up
+ *    from y to z to keep `right` non-degenerate.
+ *  • Progressive render: while a frame is in progress, rows above
+ *    g_render_row are fresh, rows below are stale (last frame).  The
+ *    stable-buffer copy after row==ch keeps tearing invisible.
+ *  • Pause freezes scene_t but NOT cam_phi when orbit_spd=0; the orbit
+ *    is gated by the `if (a->paused) return;` in app_tick.
+ *  • A canvas wider than CANVAS_MAX_W or taller than CANVAS_MAX_H
+ *    silently clips; resize beyond 220×55 leaves margins unrendered.
+ *  • Shadow off + AO off + Flat lighting reduces to "show colour-only";
+ *    useful for theme tuning, useless for shape reading.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Press 1: two spheres + torus should clearly merge as t advances;
+ *    the smin term oscillates between sharp join and bulgy weld.
+ *  • Press 2: three columns in fixed left/centre/right order; the
+ *    columns rotate together (single ang applied to all of pr).
+ *  • Press 3 then watch twist amplitude: 1.85 · sin(t·0.48) means the
+ *    box should fully un-twist twice per ~13 seconds (period 2π/0.48).
+ *  • Press 4: sphere lattice should tile perfectly; press + to spin
+ *    camera and confirm tiles never seam.
+ *  • Press 5: rotating figure should keep its head, body, arms, belt
+ *    welded — no visible gaps.
+ *  • Toggle l three times: N·V → Phong → Flat → N·V.  Flat must look
+ *    completely shadeless (only colour gradient).
+ *  • Press r: camera resets to (CAM_DIST_DEF, CAM_THETA_DEF, 0).  Try
+ *    after wild orbit changes to confirm no drift.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

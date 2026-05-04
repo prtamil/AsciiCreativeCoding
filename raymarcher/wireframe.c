@@ -62,6 +62,100 @@
  *                  the minor axis when error exceeds 0.5.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A wireframe is just two tables — a vertex list and an edge list — plus
+ * one pipeline that does NOTHING except "rotate every vertex, project to
+ * 2D, draw a line between every (a, b) edge".  No fills, no z-buffer, no
+ * shading.  All four shapes (cube, sphere, pyramid, torus) share the
+ * SAME pipeline; the only thing that differs is what the vertex/edge
+ * tables contain.  Curved shapes are not "curved" — they are dense
+ * polygons whose edges happen to approximate a curve.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine a constellation: stars at fixed positions in space, lines
+ * connecting predetermined pairs.  Spin the whole constellation, snap a
+ * photograph through a pinhole camera, ink the lines onto the photo.
+ * Every shape in this gallery is one such constellation — the cube has
+ * 8 stars and 12 lines; a 6×8 sphere has 48 stars and 88 lines.  The
+ * pipeline never asks "is this a sphere?" — it just walks the edge
+ * list.  That is why adding a new shape costs only a build_X function.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Each tick (paused or not, framerate-independent):
+ *       rx += rot_x · dt,  ry += rot_y · dt   (Euler accumulators)
+ *  2. Each frame:
+ *       fov = fov_from_screen(cols, rows, zoom)  — picks fov_px so the
+ *       unit-radius shape fills FILL=82% of the smaller dimension.
+ *  3. For every vertex i: rotate by (rx, ry) using rot_yx, then project
+ *       through perspective division (fov / (CAM_DIST - z)) into screen
+ *       cell coordinates (col, row, z_world).
+ *  4. For every edge {a, b}:
+ *       skip if either endpoint is behind the camera (z_world too low),
+ *       call canvas_line() with Bresenham's algorithm.
+ *  5. canvas_line picks the glyph: curved shapes use 'o' everywhere
+ *       (varying slope across an arc would look noisy);
+ *       flat shapes pick by slope (-, |, /, \).
+ *  6. canvas_draw walks the framebuffer once and emits each non-zero
+ *       cell with the active shape's color pair + A_BOLD.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Y rotation     x' =  x·cosry + z·sinry,    z' = -x·sinry + z·cosry
+ *  X rotation     y' =  y·cosrx - z·sinrx,    z' =  y·sinrx + z·cosrx
+ *  Perspective    scale = fov_px / (CAM_DIST - p.z)
+ *                 col = ox + p.x · scale
+ *                 row = oy - p.y · scale / CELL_AR    (aspect fix)
+ *  Auto-fit       fov_rows = FILL · (rows/2) · CAM_DIST
+ *                 fov_cols = FILL · (cols/2) · CAM_DIST / CELL_AR
+ *                 fov_px   = min(fov_rows, fov_cols) · zoom
+ *  Sphere param   v(st, sl) = (sin φ·cos θ, cos φ, sin φ·sin θ)
+ *                 with φ = π·st/STACKS, θ = 2π·sl/SLICES
+ *  Torus param    v(i, j) = ((R+r·cos θ)cos φ, r·sin θ, (R+r·cos θ)sin φ)
+ *  Bresenham      err = dx + dy where dy is negated; step x when 2err≥dy,
+ *                 step y when 2err≤dx; both axes share one error term
+ *  Slope to glyph |slope| < 0.5 → '-',  < 2 → '/' or '\\',  else '|'
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • If a vertex passes behind the camera (denom = CAM_DIST - z ≤ 0.01)
+ *    project_to_screen returns z = -9999 and the edge is skipped.  At
+ *    extreme zoom this can hide a face entirely; the shape "blinks".
+ *  • CELL_AR=2.0 is hard-coded.  On a square-cell terminal (some font
+ *    settings) shapes will look squashed vertically.
+ *  • SPHERE_STACKS/SLICES=6/8 is INTENTIONALLY low — at 12/16 the lines
+ *    overlap on screen and the ball looks filled instead of wireframe.
+ *  • Increasing torus MAJOR/MINOR raises edge count quadratically; over
+ *    MAX_EDGES=800 silently truncates.
+ *  • Tab between shapes resets rx/ry to (0.4, 0.6) — accumulators do
+ *    NOT carry across shapes.
+ *  • Resize calls canvas_free + canvas_alloc; if calloc fails the
+ *    canvas is zeroed, which canvas_set then tolerates (NULL ptr deref
+ *    avoided by bounds check on cols/rows already 0).
+ *  • Bresenham draws in row-major; the corner pixel is shared between
+ *    two edges and gets overwritten with the second edge's slope glyph.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Cube: count edges on screen — should be exactly 12 (4 front + 4
+ *    back + 4 pillars).  Stop rotation with space and verify.
+ *  • Sphere: count latitude rings — SPHERE_STACKS=6 means 5 visible
+ *    rings (excluding poles).  Longitude lines: 8.
+ *  • Pyramid: 8 edges (4 base + 4 lateral).  Apex sits above the centre
+ *    of the base.
+ *  • Torus: M·m·2 = 12·6·2 = 144 edges, each rendered as 'o' dots.
+ *  • Resize the terminal — shape should always fill ~82% of the smaller
+ *    dimension; if it drifts, fov_from_screen is broken.
+ *  • Press = until ZOOM_MAX (3.5×): edges should stop scaling further.
+ *  • Press ] until ROT_MAX caps at 8 rad/s (~76 RPM).  Beyond that key
+ *    presses do nothing.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
@@ -256,9 +350,9 @@ static P2 project_to_screen(Vec3 p, float fov_px, float ox, float oy)
  */
 static float fov_from_screen(int cols, int rows, float zoom)
 {
-    float fov_rows = FILL * (float)(rows / 2) * CAM_DIST;
+    float fov_rows = FILL * (float)rows * 0.5f * CAM_DIST;
     /* columns are CELL_AR times narrower visually than rows */
-    float fov_cols = FILL * (float)(cols / 2) * CAM_DIST / CELL_AR;
+    float fov_cols = FILL * (float)cols * 0.5f * CAM_DIST / CELL_AR;
     float fov = fov_rows < fov_cols ? fov_rows : fov_cols;
     return fov * zoom;
 }

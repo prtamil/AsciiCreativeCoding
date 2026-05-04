@@ -180,19 +180,19 @@ static void color_apply_theme(int theme)
 {
     if (COLORS >= 256) {
         if (theme == 0) {   /* RAINBOW — 8 hue steps around the wheel */
-            static const int hues[N_PAIRS] = {196, 208, 226, 46, 51, 21, 129, 201};
+            static const int hues[N_PAIRS] = {196, 208, 226, 46, 51, 33, 129, 201};
             for (int i = 0; i < N_PAIRS; i++)
                 init_pair(i + 1, hues[i], COLOR_BLACK);
         } else if (theme == 1) {   /* CYAN fade */
-            static const int c[N_PAIRS] = {51, 45, 39, 33, 27, 21, 19, 17};
+            static const int c[N_PAIRS] = {51, 45, 39, 33, 27, 26, 25, 25};
             for (int i = 0; i < N_PAIRS; i++)
                 init_pair(i + 1, c[i], COLOR_BLACK);
         } else if (theme == 2) {   /* GREEN fade */
-            static const int g[N_PAIRS] = {82, 46, 40, 34, 28, 22, 22, 22};
+            static const int g[N_PAIRS] = {82, 46, 40, 34, 28, 28, 28, 28};
             for (int i = 0; i < N_PAIRS; i++)
                 init_pair(i + 1, g[i], COLOR_BLACK);
         } else {                    /* WHITE/GREY fade */
-            static const int w[N_PAIRS] = {255, 250, 244, 238, 235, 234, 233, 232};
+            static const int w[N_PAIRS] = {255, 250, 247, 245, 243, 241, 240, 240};
             for (int i = 0; i < N_PAIRS; i++)
                 init_pair(i + 1, w[i], COLOR_BLACK);
         }

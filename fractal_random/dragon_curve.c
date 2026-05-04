@@ -110,7 +110,7 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_G1,  18, -1);
+        init_pair(CP_G1, 26, -1);
         init_pair(CP_G2,  27, -1);
         init_pair(CP_G3,  51, -1);
         init_pair(CP_G4,  46, -1);

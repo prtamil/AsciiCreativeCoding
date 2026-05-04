@@ -110,7 +110,7 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_SLOW,  21, -1);   /* blue   — slow  */
+        init_pair(CP_SLOW, 33, -1);   /* blue   — slow  */
         init_pair(CP_MED,   51, -1);   /* cyan   — med   */
         init_pair(CP_FAST, 231, -1);   /* white  — fast  */
         init_pair(CP_FLASH,196, -1);   /* red    — flash */

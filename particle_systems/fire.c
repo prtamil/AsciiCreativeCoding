@@ -74,6 +74,137 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Three completely different physics produce one shared output: a
+ * float heat field in [0,1] sampled per cell.  The CA algorithm pulls
+ * heat upward from the bottom row and shaves a random decay off it
+ * each step.  The particle algorithm flies tiny embers up from a
+ * source and stamps a 3×3 Gaussian splat of heat wherever they are.
+ * The plasma algorithm computes a tongue-height per column from three
+ * sin harmonics and shades cells below the tongue tip.  Whichever
+ * algorithm filled the heat field, the renderer is identical:
+ * gamma-correct, Floyd-Steinberg dither into 9 buckets, look up the
+ * char and colour from a 9-step ASCII ramp ` .:+x*X#@`.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture the screen as a grid of thermometers.  Three different heaters
+ * — a glowing bar that smears heat upward (CA), a swarm of bottle
+ * rockets that paint heat where they fly (particles), or a sine-wave
+ * cookbook that just declares how tall the flame is at every column
+ * (plasma) — fill the grid each frame.  A photographer in the back
+ * room takes the temperature reading, dithers it (so no banding),
+ * and prints one of nine glyphs from cold-space-' ' to roaring-'@'.
+ * The HUD lets you tint that ramp (fire/ice/plasma/nova/poison/gold),
+ * push the wind, throttle the fuel, or switch the heater.
+ *
+ * ALGORITHM IN STEPS  (per tick)
+ * ──────────────────
+ *  CA (Doom):
+ *   1. warmup_scale × seed_fuel_row — fill bottom row with arch-shaped
+ *      hot fuel jittered by FUEL_JITTER_BASE..+RANGE.
+ *   2. compute decay = MAX_HEAT / (rows · CA_REACH_FRAC) so the average
+ *      flame top sits 75% up the screen.
+ *   3. for each cell (x,y) bottom→top: rx = x + rand{-1,0,+1};
+ *      heat[y][x] = max(0, heat[y+1][rx] − (d_base + rand·d_rand)).
+ *
+ *  Particles:
+ *   1. seed each active particle: vx += turbulence; vx *= damp;
+ *      x += vx; y += vy; heat -= decay; deactivate if heat≤0 or off.
+ *   2. spawn SPAWN_PER_TICK · wscale particles via rejection sampling
+ *      against the arch envelope (centre cells likelier).
+ *   3. clear heat grid; splat3x3 each particle's heat into 9 cells.
+ *
+ *  Plasma:
+ *   1. advance plasma_t by PLASMA_TIME_STEP (0.07).
+ *   2. for each column x: tongue = BASE + H1+H2+H3 sine sum × arch×fuel.
+ *   3. for each row y: ny = y/rows;
+ *      heat = clamp((ny − (1 − tongue)) / tongue, 0, 1).
+ *
+ *  Render (shared):
+ *   1. for each cell: v = pow(heat, 1/2.2)         gamma to perceptual.
+ *   2. Floyd-Steinberg dither: error = v − lut_midpoint(idx);
+ *      push 7/16 right, 3/16 dn-left, 5/16 down, 1/16 dn-right.
+ *   3. mvaddch(y, x, k_ramp[idx]) with theme colour pair attribute.
+ *   4. cells that were hot last frame but cold now get explicit ' ' so
+ *      stale chars don't linger.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  CA propagation:
+ *      heat[y][x] = max(0, heat[y+1][x+rand{-1,0,+1}] − decay)
+ *      decay      = MAX_HEAT / (rows · CA_REACH_FRAC)        ≈ peak height
+ *
+ *  Arch envelope (shared by all algos):
+ *      t    = (x − margin − wind_acc) / span                 ∈ [0,1]
+ *      edge = min(t, 1−t) · 2                                ∈ [0,1]
+ *      arch = edge²                                          0 at edges, 1 ctr
+ *
+ *  Particle splat kernel (3×3, sum=1):
+ *        0.0625  0.125  0.0625
+ *        0.125   0.25   0.125
+ *        0.0625  0.125  0.0625
+ *
+ *  Plasma tongue:
+ *      tongue = 0.50
+ *             + 0.28·sin(wx·5  + t·2.2)        H1 — primary undulation
+ *             + 0.18·sin(wx·11 − t·1.6)        H2 — fine flicker, opposite drift
+ *             + 0.10·sin(wx·3  + t·0.7)        H3 — slow base sway
+ *      heat(x,y) = clamp((y/rows − (1 − tongue)) / tongue, 0, 1)
+ *
+ *  Render LUT thresholds (gamma-corrected):
+ *      0.000 ' ' | 0.080 '.' | 0.180 ':' | 0.290 '+' | 0.390 'x'
+ *      0.500 '*' | 0.620 'X' | 0.750 '#' | 0.900 '@'
+ *
+ *  Floyd-Steinberg distribution:
+ *      e·7/16 → (x+1, y)  e·3/16 → (x−1, y+1)
+ *      e·5/16 → (x  , y+1) e·1/16 → (x+1, y+1)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • CA decay floors: at very small terminals (rows<5), the computed
+ *    avg_decay is huge — fire dies before reaching row 0.  CA_DECAY_*_MIN
+ *    floors keep the visuals reasonable on tiny windows.
+ *  • Particle pool exhaustion: at MAX_FIRE_PARTS=800, fuel=1.0, sim=60Hz,
+ *    spawn=20/tick → ~1200 active in equilibrium with avg lifetime 25
+ *    ticks.  At full warmup the pool is briefly oversubscribed; spawn
+ *    loop tries up to MAX_FIRE_PARTS slots before giving up.
+ *  • Plasma tongue clamp: tongue can exceed 1.0 from the H1+H2+H3 sum
+ *    (worst-case 0.5+0.28+0.18+0.10 = 1.06).  clampf(...0..1) prevents
+ *    the per-column gradient from going negative.
+ *  • Floyd-Steinberg propagation off-grid: error must NOT diffuse into
+ *    cells flagged d[i] = -1 (cold).  Code guards `d[i+1] >= 0.f`
+ *    before adding.  Removing this guard makes cold cells flicker
+ *    with stray dither energy.
+ *  • Wind clamps via wind_acc wrapping at ±cols.  At maxed wind=±3
+ *    the fuel arch cycles offscreen every cols/3 ticks; visually
+ *    the flame snaps when arch wraps from one edge to the other.
+ *  • Theme switch with 'a' algo change: needs_clear flag forces an
+ *    erase() the next frame so stale CA spires don't show under fresh
+ *    plasma tongues.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause + 'a': cycle CA → particles → plasma; shape changes
+ *    completely while ramp glyphs and theme colours stay consistent.
+ *  • Fuel sweep: 'G' down to 0.10 — flame should shrink to ankle
+ *    height; 'g' up to 1.00 — flame returns to ~75% screen height.
+ *  • Wind 'w': arch leans right; columns of '@' core glyph drift
+ *    sideways.  '0' resets to vertical.  At wind=±3 the lean is
+ *    obvious within 5 ticks.
+ *  • Warmup verification: switch algos with 'a'; warmup resets to 0.
+ *    Flame should grow from nothing over 80 ticks (~2.7s at 30Hz).
+ *  • Theme cycle 't': all 6 themes run cleanly without re-pairing
+ *    glitches; the white-hot core (idx 8) is white in every theme.
+ *  • Plasma frequency check: with PLASMA_H1_XFREQ=5 you should see
+ *    ~5 sine peaks horizontally across the screen; H2_XFREQ=11
+ *    adds finer ripple over the top.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

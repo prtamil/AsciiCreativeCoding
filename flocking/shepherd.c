@@ -135,7 +135,7 @@ static void color_init(void)
         init_pair(CP_SHEEP_MOVE, 118,  -1);  /* bright green — moving      */
         init_pair(CP_SHEEP_FLEE, 208,  -1);  /* orange       — panicking   */
         init_pair(CP_SHEPHERD,   226,  -1);  /* bright yellow — you        */
-        init_pair(CP_RING,       238,  -1);  /* dark grey    — radius ring */
+        init_pair(CP_RING, 246,  -1);  /* dark grey    — radius ring */
         init_pair(CP_HUD,        244,  -1);
     } else {
         init_pair(CP_SHEEP_CALM, COLOR_WHITE,   -1);

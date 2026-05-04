@@ -290,7 +290,7 @@ static void color_init(void)
         init_pair(4, 214, COLOR_BLACK);   /* orange — arms            */
         init_pair(5,  75, COLOR_BLACK);   /* blue — legs              */
         init_pair(6,  46, COLOR_BLACK);   /* green — alive indicator  */
-        init_pair(7, 238, COLOR_BLACK);   /* dark grey — floor/struts */
+        init_pair(7, 246, COLOR_BLACK);   /* dark grey — floor/struts */
         init_pair(8, 226, COLOR_BLACK);   /* bright yellow — HUD      */
     } else {
         init_pair(1, COLOR_WHITE,   COLOR_BLACK);

@@ -117,12 +117,12 @@ static void color_init(void)
     use_default_colors();
     if (COLORS >= 256) {
         /* body 0: blue gradient */
-        init_pair(CP_B0,  17, -1);
-        init_pair(CP_B1,  20, -1);
+        init_pair(CP_B0, 25, -1);
+        init_pair(CP_B1, 27, -1);
         init_pair(CP_B2,  27, -1);
         init_pair(CP_B3,  51, -1);
         /* body 1: green gradient */
-        init_pair(CP_G0,  22, -1);
+        init_pair(CP_G0, 28, -1);
         init_pair(CP_G1,  28, -1);
         init_pair(CP_G2,  34, -1);
         init_pair(CP_G3,  46, -1);

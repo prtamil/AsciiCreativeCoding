@@ -683,7 +683,7 @@ static void color_init(void){
     if(COLORS>=256){
         init_pair(1,196,COLOR_BLACK); init_pair(2,208,COLOR_BLACK);
         init_pair(3,226,COLOR_BLACK); init_pair(4, 46,COLOR_BLACK);
-        init_pair(5, 51,COLOR_BLACK); init_pair(6, 21,COLOR_BLACK);
+        init_pair(5, 51,COLOR_BLACK); init_pair(6, 33,COLOR_BLACK);
         init_pair(7,201,COLOR_BLACK);
     } else {
         init_pair(1,COLOR_RED,    COLOR_BLACK);

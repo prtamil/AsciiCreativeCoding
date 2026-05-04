@@ -182,8 +182,8 @@ static void color_init(void)
     use_default_colors();
     if (COLORS >= 256) {
         /* Heat: dark navy -> blue -> cyan -> green -> yellow -> orange -> red */
-        init_pair(CP_H0,  17,  -1);
-        init_pair(CP_H1,  19,  -1);
+        init_pair(CP_H0, 25,  -1);
+        init_pair(CP_H1, 27,  -1);
         init_pair(CP_H2,  27,  -1);
         init_pair(CP_H3,  39,  -1);
         init_pair(CP_H4,  46,  -1);
@@ -192,7 +192,7 @@ static void color_init(void)
         init_pair(CP_H7, 196,  -1);
         init_pair(CP_H8, 201,  -1);
         init_pair(CP_BORDER_ACT,  51,  -1);
-        init_pair(CP_BORDER_OFF, 238,  -1);
+        init_pair(CP_BORDER_OFF, 246,  -1);
         init_pair(CP_HUD,        252,  -1);
         init_pair(CP_HEADER,      51,  -1);
         init_pair(CP_LABEL,      244,  -1);

@@ -191,7 +191,7 @@ static void color_init(void)
         init_pair(3, 226, COLOR_BLACK);   /* yellow  */
         init_pair(4,  46, COLOR_BLACK);   /* green   */
         init_pair(5,  51, COLOR_BLACK);   /* cyan    */
-        init_pair(6,  21, COLOR_BLACK);   /* blue    */
+        init_pair(6, 33, COLOR_BLACK);   /* blue    */
         init_pair(7, 201, COLOR_BLACK);   /* magenta */
     } else {
         init_pair(1, COLOR_RED,     COLOR_BLACK);

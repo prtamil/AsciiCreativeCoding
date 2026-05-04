@@ -213,7 +213,7 @@ static void color_init(void)
         init_pair(4, 214, -1);
         init_pair(5, 154, -1);
         init_pair(6,  46, -1);
-        init_pair(7, 238, -1);
+        init_pair(7, 246, -1);
         init_pair(8, 226, -1);
     } else {
         init_pair(1, COLOR_WHITE,  -1);

@@ -298,8 +298,8 @@ static void color_init(void)
 
     if (COLORS >= 256) {
         /* Velocity: dark-blue → cyan → green → yellow → orange → red */
-        init_pair(CP_VEL0, 17,  COLOR_BLACK);
-        init_pair(CP_VEL1, 19,  COLOR_BLACK);
+        init_pair(CP_VEL0, 25,  COLOR_BLACK);
+        init_pair(CP_VEL1, 27,  COLOR_BLACK);
         init_pair(CP_VEL2, 27,  COLOR_BLACK);
         init_pair(CP_VEL3, 45,  COLOR_BLACK);
         init_pair(CP_VEL4, 46,  COLOR_BLACK);
@@ -309,7 +309,7 @@ static void color_init(void)
         /* Vorticity negative (clockwise) — blue shades */
         init_pair(CP_VNEG0, 153, COLOR_BLACK);
         init_pair(CP_VNEG1,  33, COLOR_BLACK);
-        init_pair(CP_VNEG2,  17, COLOR_BLACK);
+        init_pair(CP_VNEG2, 25, COLOR_BLACK);
         /* Vorticity positive (CCW) — red shades */
         init_pair(CP_VPOS0, 217, COLOR_BLACK);
         init_pair(CP_VPOS1, 160, COLOR_BLACK);

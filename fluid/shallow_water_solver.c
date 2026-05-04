@@ -344,7 +344,7 @@ static void color_init(void)
         init_pair(CP_SHORE, COLOR_CYAN, COLOR_BLACK);
     /* Obstacle: dim gray */
     if (COLORS >= 256)
-        init_pair(CP_OBS, 238, COLOR_BLACK);
+        init_pair(CP_OBS, 246, COLOR_BLACK);
     else
         init_pair(CP_OBS, COLOR_WHITE, COLOR_BLACK);
     /* HUD: amber */

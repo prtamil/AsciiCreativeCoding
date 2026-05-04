@@ -92,7 +92,7 @@ static void color_init(void) {
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_E_LOW,    17,  -1);
+        init_pair(CP_E_LOW, 25,  -1);
         init_pair(CP_E_MID,    33,  -1);
         init_pair(CP_E_HIGH,   214, -1);
         init_pair(CP_E_PEAK,   196, -1);

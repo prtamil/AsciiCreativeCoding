@@ -460,7 +460,7 @@ static void color_init(void)
     use_default_colors();
 
     if (COLORS >= 256) {
-        init_pair(1,  21, COLOR_BLACK);   /* deep blue — root, sea floor     */
+        init_pair(1, 33, COLOR_BLACK);   /* deep blue — root, sea floor     */
         init_pair(2,  27, COLOR_BLACK);   /* medium blue                     */
         init_pair(3,  33, COLOR_BLACK);   /* cyan-blue                       */
         init_pair(4,  51, COLOR_BLACK);   /* bright cyan — mid-body          */

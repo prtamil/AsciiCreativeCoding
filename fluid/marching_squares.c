@@ -262,7 +262,7 @@ static void init_colors(int theme)
     init_pair(CP_LABEL,   231,                  16);
     init_pair(CP_CONTOUR, theme_contour[theme], 16);
     init_pair(CP_INSIDE,  theme_inside[theme],  16);
-    init_pair(CP_OUTSIDE, 236,                  16);
+    init_pair(CP_OUTSIDE, 244,                  16);
 }
 
 static volatile sig_atomic_t g_quit   = 0;

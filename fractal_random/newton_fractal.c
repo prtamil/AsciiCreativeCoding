@@ -117,11 +117,11 @@ static void color_init(void)
     if (COLORS >= 256) {
         init_pair(CP_R1D,  88, -1);   /* dark red    */
         init_pair(CP_R1B, 196, -1);   /* bright red  */
-        init_pair(CP_R2D,  18, -1);   /* dark blue   */
-        init_pair(CP_R2B,  21, -1);   /* bright blue */
+        init_pair(CP_R2D, 26, -1);   /* dark blue   */
+        init_pair(CP_R2B, 33, -1);   /* bright blue */
         init_pair(CP_R3D, 136, -1);   /* dark yellow */
         init_pair(CP_R3B, 226, -1);   /* yellow      */
-        init_pair(CP_R4D,  22, -1);   /* dark green  */
+        init_pair(CP_R4D, 28, -1);   /* dark green  */
         init_pair(CP_R4B,  46, -1);   /* bright green*/
         init_pair(CP_SET, COLOR_BLACK, COLOR_BLACK);
         init_pair(CP_HUD, 226, -1);

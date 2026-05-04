@@ -401,16 +401,16 @@ static void color_init(void)
     use_default_colors();
     if (COLORS >= 256) {
         /* Pressure: diverging blue → grey → red */
-        init_pair(CP_PN2,   17, COLOR_BLACK);   /* deep blue    */
+        init_pair(CP_PN2, 25, COLOR_BLACK);   /* deep blue    */
         init_pair(CP_PN1,   27, COLOR_BLACK);   /* mid blue     */
         init_pair(CP_PN0,  153, COLOR_BLACK);   /* light blue   */
-        init_pair(CP_PZERO,238, COLOR_BLACK);   /* dim grey     */
+        init_pair(CP_PZERO, 246, COLOR_BLACK);   /* dim grey     */
         init_pair(CP_PP0,  217, COLOR_BLACK);   /* light red    */
         init_pair(CP_PP1,  160, COLOR_BLACK);   /* mid red      */
         init_pair(CP_PP2,   52, COLOR_BLACK);   /* deep red     */
         /* Intensity: black → bright green → white */
-        init_pair(CP_INT0,  16, COLOR_BLACK);
-        init_pair(CP_INT1,  22, COLOR_BLACK);
+        init_pair(CP_INT0, 24, COLOR_BLACK);
+        init_pair(CP_INT1, 28, COLOR_BLACK);
         init_pair(CP_INT2,  28, COLOR_BLACK);
         init_pair(CP_INT3,  34, COLOR_BLACK);
         init_pair(CP_INT4,  82, COLOR_BLACK);
@@ -418,7 +418,7 @@ static void color_init(void)
         init_pair(CP_INT6, 154, COLOR_BLACK);
         init_pair(CP_INT7, 231, COLOR_BLACK);   /* white        */
         /* Wavefront bands */
-        init_pair(CP_WFA,   17, COLOR_BLACK);   /* dark blue    */
+        init_pair(CP_WFA, 25, COLOR_BLACK);   /* dark blue    */
         init_pair(CP_WFB,   27, COLOR_BLACK);   /* mid cyan     */
         init_pair(CP_WFC,   51, COLOR_BLACK);   /* bright cyan  */
         /* Misc */

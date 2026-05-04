@@ -139,16 +139,16 @@ typedef struct {
  */
 static const Theme k_themes[N_THEMES] = {
 /*  name      up256  dn256  up8            dn8           up_ch  dn_ch */
-  { "Matrix",    46,    22, COLOR_GREEN,   COLOR_GREEN,  '#',   '.'  },
+  { "Matrix",    46,    28, COLOR_GREEN,   COLOR_GREEN,  '#',   '.'  },
   { "Nova",     231,    57, COLOR_WHITE,   COLOR_BLUE,   '*',   ' '  },
-  { "Mono",     231,   238, COLOR_WHITE,   COLOR_BLACK,  '#',   '.'  },
+  { "Mono",     231,   244, COLOR_WHITE,   COLOR_BLACK,  '#',   '.'  },
   { "Fire",     214,    88, COLOR_YELLOW,  COLOR_RED,    '^',   '.'  },
-  { "Ocean",     51,    17, COLOR_CYAN,    COLOR_BLUE,   '~',   '-'  },
-  { "Void",     201,    16, COLOR_MAGENTA, COLOR_BLACK,  '@',   ' '  },
+  { "Ocean",     51,    25, COLOR_CYAN,    COLOR_BLUE,   '~',   '-'  },
+  { "Void",     201,    24, COLOR_MAGENTA, COLOR_BLACK,  '@',   ' '  },
   { "Amber",    226,    94, COLOR_YELLOW,  COLOR_RED,    '#',   '.'  },
   { "Neon",     199,    54, COLOR_MAGENTA, COLOR_BLUE,   '+',   '-'  },
   { "Ice",      159,    25, COLOR_CYAN,    COLOR_BLUE,   '*',   '.'  },
-  { "Plasma",   196,    21, COLOR_RED,     COLOR_BLUE,   '#',   '.'  },
+  { "Plasma",   196,    33, COLOR_RED,     COLOR_BLUE,   '#',   '.'  },
 };
 
 static int g_theme = 0;

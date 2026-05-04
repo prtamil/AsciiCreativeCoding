@@ -47,6 +47,102 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Plasma is a stateless function: give it a cell coordinate (col, row)
+ * and a time t, and it returns a number v ∈ [0,1].  That number indexes
+ * a palette of glyph+colour pairs.  Render one glyph per cell, every
+ * frame.  No grid, no particles, no physics — every pixel is computed
+ * fresh, independent of every other pixel.  The "movement" you see is
+ * pure phase: the same sine waves shifted by t·speed over time, so what
+ * was at value 0.3 last frame becomes 0.31 this frame, and the colour
+ * mapped to 0.3 quietly slides one cell over.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture four flashlights with rippled lenses pointed at the screen.
+ * One ripples horizontally, one vertically, one diagonally, one in
+ * concentric circles from the centre.  Their brightness adds at each
+ * cell.  Now slowly rotate each lens — same ripple pattern, different
+ * orientation — and the interference pattern shimmers and shifts.
+ * That's it.  No simulation; the math itself IS the animation.  This
+ * is why old demoscene coders loved plasma: it ran in fixed time per
+ * pixel on a Commodore 64, no buffers, no per-pixel state.
+ *
+ * ALGORITHM IN STEPS  (per frame, per cell)
+ * ──────────────────
+ *  1. Advance global time t by dt.
+ *  2. For each (col, row) in the visible region:
+ *       a. Compute four sinusoid terms:
+ *            s1 = sin(col·f1 + t·speed1)        horizontal wave
+ *            s2 = sin(row·f2 + t·speed2)        vertical wave
+ *            s3 = sin((col+row)·f3 + t·speed3)  diagonal wave
+ *            s4 = sin(dist·f4 + t·speed4)       radial wave
+ *          where dist = sqrt(dx² + (2·dy)²) from screen centre, with
+ *          the dy×2 to correct cell-aspect-ratio (terminal cells are
+ *          ~2× taller than wide → circles look round).
+ *       b. v = (s1+s2+s3+s4 + 4) / 8     map sum∈[-4,4] to [0,1].
+ *       c. vs = (v + phase) mod 1        phase = t·CYCLE_HZ ∈ [0,1)
+ *                                        cycles palette globally.
+ *       d. idx = floor(vs · N_PAL)       pick palette entry.
+ *       e. mvaddch(row, col, glyph) with that pair+attr.
+ *  3. Draw HUD (top-right status, bottom-left hint).  Present.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  v(c,r,t) = sin(c·f1 + t·s1) + sin(r·f2 + t·s2)
+ *           + sin((c+r)·f3 + t·s3) + sin(d·f4 + t·s4)
+ *  d        = sqrt((c-cx)² + ((r-cy)·2)²)        aspect-corrected
+ *  v_norm   = (v + 4) / 8                        sum∈[-4,4] → [0,1]
+ *  phase(t) = (t · CYCLE_HZ) mod 1               palette rotates
+ *  idx      = floor(((v_norm + phase) mod 1) · 14)
+ *  fp.f*    spatial frequency rad/cell           gentle 0.10-0.20
+ *  fp.s*    angular speed     rad/sec            grand 0.3-0.5
+ *  CYCLE_HZ = 0.20            full cycle every 5s
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Aspect correction: if you forget the `dy * 2.0f` multiplier in
+ *    dist, the radial term produces vertical ovals instead of round
+ *    rings — terminal rows are roughly twice as tall as columns are
+ *    wide.  The factor 2 is fixed for typical fonts; on square fonts
+ *    drop it to 1.
+ *  • Sum-to-[0,1] normalisation: if any sine amplitude were not 1,
+ *    `(v + 4) / 8` would not span [0,1] cleanly and the palette
+ *    would clamp at the extremes.  All four sines have amplitude 1
+ *    so the math is exact.
+ *  • Palette bands: N_PAL=14 is small.  At very low spatial frequencies
+ *    ("grand" preset, f≈0.1) you can see horizontal banding because
+ *    many adjacent cells round to the same idx.
+ *  • Float drift: t grows without bound.  After hours of runtime sinf
+ *    arguments become large enough to lose precision.  In practice
+ *    the demo runs on the order of minutes and this never matters.
+ *  • Theme palette uses pair indices 1..7 — the same indices used by
+ *    HUD attron/attroff calls.  HUD prints AFTER scene_draw so it
+ *    overwrites those cells; no risk of HUD characters being drawn
+ *    in plasma colours.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Pause (space): all motion freezes; pattern stays static.  Resume:
+ *    motion continues from the same phase — no jump.
+ *  • Cycle test: at CYCLE_HZ=0.20 the palette completes one full
+ *    rotation every 5 seconds.  Pick any cell; its colour should
+ *    return to the same hue exactly 5s later.
+ *  • Frequency preset 'f': cycling through gentle → energetic →
+ *    grand → turbulent should visibly change wave wavelength.
+ *    "Grand" stretches features across the whole screen; "turbulent"
+ *    packs many wavelengths per row.
+ *  • Theme 'p': cycling rainbow → fire → ocean → matrix swaps the
+ *    palette without changing wave shape.  Same pattern, recoloured.
+ *  • Centre symmetry: the radial term is centred at (cols/2, rows/2).
+ *    At preset 0 you should see a soft circular bullseye superposed
+ *    on the moving stripes; never a centre offset.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -119,7 +215,7 @@ static void color_init(void)
         init_pair(3, 226, COLOR_BLACK);   /* yellow  */
         init_pair(4,  46, COLOR_BLACK);   /* green   */
         init_pair(5,  51, COLOR_BLACK);   /* cyan    */
-        init_pair(6,  21, COLOR_BLACK);   /* blue    */
+        init_pair(6, 33, COLOR_BLACK);   /* blue    */
         init_pair(7, 201, COLOR_BLACK);   /* magenta */
     } else {
         init_pair(1, COLOR_RED,     COLOR_BLACK);

@@ -223,7 +223,7 @@ static void color_init(void)
         init_pair(CP_BOB,   231, COLOR_BLACK);  /* bright white          */
         init_pair(CP_TR1,   196, COLOR_BLACK);  /* red (newest)          */
         init_pair(CP_TR2,   208, COLOR_BLACK);  /* orange                */
-        init_pair(CP_TR3,   238, COLOR_BLACK);  /* dark grey (oldest)    */
+        init_pair(CP_TR3, 246, COLOR_BLACK);  /* dark grey (oldest)    */
         init_pair(CP_GHOST,  91, COLOR_BLACK);  /* dim purple            */
         init_pair(CP_HUD,    51, COLOR_BLACK);  /* bright cyan           */
     } else {

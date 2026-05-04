@@ -106,7 +106,7 @@ static long long now_ns(void) {
 static void color_init(void) {
     start_color();
     use_default_colors();
-    init_pair(CP_SKY,      17,  -1);
+    init_pair(CP_SKY, 25,  -1);
     init_pair(CP_STAR,    226,  -1);
     init_pair(CP_SURF,     34,  -1);
     init_pair(CP_ROCK,    240,  -1);
@@ -116,7 +116,7 @@ static void color_init(void) {
     init_pair(CP_AXLE,    201,  -1);
     init_pair(CP_HUD,      82,  -1);
     init_pair(CP_WARN,    196,  -1);
-    init_pair(CP_DIM,     238,  -1);
+    init_pair(CP_DIM, 246,  -1);
     init_pair(CP_TITLE,   255,  -1);
     init_pair(CP_BARP,     51,  -1);
     init_pair(CP_BARN,    213,  -1);

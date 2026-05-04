@@ -54,6 +54,115 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A 3-D helix collapses to a 2-D screen as TWO sinusoidal column
+ * trajectories that mirror each other (cos and -cos), parameterised by
+ * row.  The strand currently AT THE FRONT (sin(phase) ≥ 0) is drawn
+ * bold; the back strand is drawn dim.  Add a horizontal '-' connector
+ * every bstep rows, sprinkle a colour theme on top, and that single
+ * idea — one cosine and one depth test — produces every helical scene
+ * in the gallery.  Non-helix scenes (plasmid, hairpin, ladder) reuse
+ * the same trick on different parameter spaces (angle around a circle,
+ * vertical stem with looping arc, etc.).
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine looking sideways at a spiral staircase.  The two banisters
+ * weave past each other in your view — at any height, one is closer
+ * (in front), the other farther (behind).  Your brain reads "spiral"
+ * because the banister positions oscillate in lockstep with their
+ * apparent depth.  The '-' rungs between them are the steps you can
+ * still see edge-on.  Every helix scene here is exactly that staircase
+ * with different pitch, amplitude, handedness, and theme paint.
+ * Cruciform is two such staircases crossed at right angles; the
+ * plasmid is a staircase rolled into a circle.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Each frame: t += dt, erase the screen.
+ *  2. Apply the active theme (5 xterm-256 indices → ncurses pairs CP_S1,
+ *     CP_S2, CP_S3, CP_BD, CP_LB).
+ *  3. Dispatch to draw_fns[dna_type] with (cx = cols/2, t, rows, cols).
+ *  4. For helix-type scenes:
+ *       a. Loop row from 1 to draw_rows-1.
+ *       b. phase = (TAU / pitch) · row · hand + t   (hand = +1 right,
+ *          -1 left).
+ *       c. x1 = cx + amp·cos(phase), x2 = cx - amp·cos(phase).
+ *       d. depth z = sin(phase).  s1f = (z ≥ 0).  Front = bright bold;
+ *          back = dim.
+ *       e. Every bstep rows draw '-' from min(x1,x2)+1 to max(x1,x2)-1
+ *          using CP_BD (the rung).
+ *       f. Z-DNA picks slope glyphs '/', '\\', '|' by comparing x to
+ *          previous row's x.  Triple Helix sorts three strands by depth.
+ *  5. Plasmid: 360 angular samples; outer ellipse (rx, ry=rx·CELL_AR),
+ *     inner at 0.82· that radius.  Sector = (a / 2π) · 4 picks gene
+ *     colour.
+ *  6. Ladder, hairpin, fork, cruciform, gquad each have their own
+ *     specialised draw, but all reuse sput() with the same depth / bond
+ *     / theme conventions.
+ *  7. HUD: top bar shows DNA name + theme + fps; bottom bar shows keys.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Helix backbone   x1 = cx + amp · cos(phase)
+ *                   x2 = cx − amp · cos(phase)
+ *  Phase            phase = (TAU / pitch) · row · hand + t
+ *  Depth            z = sin(phase)   ∈ [-1, 1]; ≥ 0 means "front"
+ *  Aspect fix       pitch_h = pitch_v / CELL_AR   (CELL_AR = 0.5)
+ *                   amp_h   = amp_v · CELL_AR     (cruciform)
+ *  Rung interval    bstep = round(pitch / 5)      (≥ 2)
+ *  Triple offsets   ph3 = {0, 2π/3, 4π/3}         (radial 120°)
+ *  Plasmid ring     r_outer = (rx · cos a, ry · sin a),  ry = rx · CELL_AR
+ *  Plasmid inner    r_inner = (0.82·rx · cos a, 0.82·ry · sin a)
+ *  Ladder scroll    scroll = floor(t · 1.8) mod (rung_step · n_seq)
+ *  Replication fork fork_row = 1 + (0.35 + 0.15·sin(0.25·t)) · (rows-3)
+ *  G-quadruplex     pulse = sin(2π · row/30 + t) > 0  → A_BOLD
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Z-DNA's slope glyph picks '/' or '\\' by comparing x1 to the
+ *    previous row's x1.  At the inflection points x is the same as the
+ *    previous → '|', producing a vertical "kink" that is real, not a
+ *    bug.
+ *  • Hand = -1 negates the phase increment per row but cos is even, so
+ *    x1/x2 trajectories LOOK the same.  The visible "left-handedness"
+ *    comes from the zigzag glyphs — without zigzag=true the hand flag
+ *    is invisible.
+ *  • Plasmid uses ry = rx · CELL_AR = rx · 0.5 to compensate the 2:1
+ *    cell aspect.  If you remove that, the circle becomes an ellipse
+ *    twice as wide as tall.
+ *  • Cruciform skips drawing in 6-cell horizontal and 3-row vertical
+ *    bands around the junction; without these the bonds clash.
+ *  • Resize redraws into rows-2 (HUD reserved); a very narrow terminal
+ *    (cols < 30) makes amp larger than half-width and strands wrap or
+ *    clip.  sput() bounds-checks but the visual is broken.
+ *  • The ladder scrolls by adjusting which rung is "due"; a base pair
+ *    appears to climb upward at 1.8 rows/sec.  Setting fps too low
+ *    makes the scroll jerky because adj jumps by more than 1.
+ *  • Pause stops scene_tick → s->t freezes; helix phase becomes
+ *    stationary but draws still run every frame.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Press 'n' to cycle 0..9 — name in top bar should match the visual.
+ *  • B-DNA pitch=20: count rows between two rungs → 4 (since bstep=4).
+ *  • A-DNA pitch=13: rungs every ~3 rows; the helix is denser than
+ *    B-DNA at the same height.
+ *  • Z-DNA: zigzag '/' and '\\' visible on the strands, not 'o'.
+ *  • Triple helix shows three colours interleaving; pause and confirm
+ *    the third strand cycles between front-most and back-most.
+ *  • Plasmid: rotate is t·0.08 rad/s — one full revolution every
+ *    ~78 seconds.  Pause and verify the labels stay put.
+ *  • Theme cycling 't' should change all five colours simultaneously
+ *    on the next frame; HUD shows the active theme name.
+ *  • Ladder: G-C pairs render '=' (triple bond), A-T render '-' (double
+ *    bond).  Pause to inspect.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

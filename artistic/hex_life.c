@@ -46,6 +46,109 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Same Conway loop, different topology.  Replace the 8 neighbours of a
+ * square cell with the 6 neighbours of a hexagon, and replace B3/S23
+ * with B2/S34.  The hex lattice is stored as offset rows: each cell
+ * has the same array indices as a square grid, but rendered with odd
+ * rows shifted right one column to fake the hex stagger.  Because two
+ * of the eight square-grid diagonals are "missing" in hex, life-style
+ * patterns are more isotropic — gliders and oscillators don't have a
+ * preferred axis the way Conway's diagonal glider does.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a beehive.  Every cell touches exactly six others — three on
+ * the row above, two beside, and three on the row below — except every
+ * other row is bumped half a cell sideways.  That bump is what makes
+ * even rows have neighbours at (-1,-1)/(-1,0) above, but odd rows have
+ * them at (-1,0)/(-1,+1).  Two lookup tables indexed by row parity is
+ * how the simulation sees the lattice; visually the half-cell shift is
+ * faked by printing odd rows starting one terminal column to the right
+ * of even rows.  The cell glyph itself is two characters wide — `<>`,
+ * `()`, `[]`, `--` — so a cell occupies a 2-wide footprint and the
+ * 1-column odd-row offset gives the perceived hex stagger.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Init grid and age arrays to zero.  Seed live cells (random ~35%
+ *     density, or a centre cluster).
+ *  2. For each cell (r,c):
+ *       a. Pick neighbour delta table by parity: HEX_DC_EVEN or
+ *          HEX_DC_ODD; HEX_DR is shared.
+ *       b. Count live neighbours among 6 offsets, treating off-grid
+ *          as dead (no toroidal wrap here — finite hex board).
+ *       c. Apply B2/S34: alive ∧ n ∈ {3,4} → survive; dead ∧ n=2 →
+ *          birth; otherwise → dead.
+ *       d. Track age: survivors increment age (cap 255); newborns
+ *          age=0; dead cells reset age=0.
+ *  3. Swap g_grid ← g_next, g_age ← g_anext via memcpy.
+ *  4. Render: for each live cell, pick glyph & colour by age bucket
+ *     (0 / 1-4 / 5-14 / 15+).  Dead cells render as dim '.' showing
+ *     the hex lattice structure.
+ *  5. HUD on top 2 rows; sleep until 15 fps deadline.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  hex neighbour deltas (even row r):
+ *      (-1,-1) (-1, 0)  ←  upper neighbours
+ *      ( 0,-1) ( 0, 1)  ←  side neighbours
+ *      ( 1,-1) ( 1, 0)  ←  lower neighbours
+ *  hex neighbour deltas (odd row r):
+ *      (-1, 0) (-1, 1)
+ *      ( 0,-1) ( 0, 1)
+ *      ( 1, 0) ( 1, 1)
+ *  B2/S34 rule:
+ *      next = alive ? (n==3 || n==4) : (n==2)
+ *  screen mapping:
+ *      sc = c·2 + (r & 1)              odd rows shift right 1 col
+ *      sr = r + HUD_ROWS               leave 2 rows for HUD
+ *  age bucket → glyph:
+ *      0       → "<>"   bright yellow + bold
+ *      1..4    → "()"   bright cyan   + bold
+ *      5..14   → "[]"   teal
+ *      15+     → "--"   dark blue-green + dim
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Parity bug: if you forget the `r & 1` parity check and use one
+ *    delta table, the hex neighbourhood is wrong on every other row
+ *    and patterns drift diagonally instead of radially.
+ *  • Bounded board: hex_count() does NOT wrap.  Patterns that hit a
+ *    wall lose neighbours and behave as if surrounded by dead cells —
+ *    expect edge die-off, not toroidal continuation.
+ *  • Age overflow: g_age is uint8_t.  Code caps at 255 explicitly.
+ *    Very long-lived oscillator cells stay in the elder bucket for
+ *    thousands of generations; visually fine, but don't read age as
+ *    "exact generation count" beyond 255.
+ *  • Render footprint: each hex cell is 2 cols + 1 col shift on odd
+ *    rows, so the effective grid width is `(cols - 2) / 2`.  Resize
+ *    must clamp g_gw to that, else the right edge wraps mid-cell.
+ *  • Speed key '+': multiplies sim steps per frame, but the renderer
+ *    is locked at 15 fps (RENDER_NS).  At g_speed=10 you advance 10
+ *    generations per displayed frame; intermediate states are skipped.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Density 1 (sparse, '1' key) — most random seeds die out within
+ *    ~50 generations, leaving a few small static survivors.
+ *  • Density 5 (dense, '5' key) — large random regions tend to the
+ *    "soup" attractor: a churning steady-state population around 30%.
+ *  • Color-age check: seed once, watch a stable cell.  Within 5 gens
+ *    its glyph must change `<>` → `()`; within 15 gens `()` → `[]`;
+ *    after 15 gens `[]` → `--`.  If colours don't change, age update
+ *    is broken.
+ *  • Hex isotropy: random-soup B2/S34 patterns should NOT show a
+ *    preferred axis.  If you see horizontal stripes forming, you've
+ *    accidentally treated even/odd rows the same.
+ *  • Generation counter must increment by g_speed each frame; live
+ *    cell counter recomputes every frame — both visible in the HUD.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <signal.h>
@@ -101,12 +204,12 @@ static void color_init(void)
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_DEAD, 234,   -1);   /* near-black dot, no background */
+        init_pair(CP_DEAD, 242,   -1);   /* near-black dot, no background */
         init_pair(CP_AGE0, 226,   -1);   /* bright yellow  — newborn   */
         init_pair(CP_AGE1,  51,   -1);   /* bright cyan    — young     */
         init_pair(CP_AGE2,  37,   -1);   /* medium teal    — mature    */
-        init_pair(CP_AGE3,  23,   -1);   /* dark blue-green — elder    */
-        init_pair(CP_HUD,  232,  250);   /* dark text on silver bar    */
+        init_pair(CP_AGE3, 30,   -1);   /* dark blue-green — elder    */
+        init_pair(CP_HUD, 240,  250);   /* dark text on silver bar    */
     } else {
         init_pair(CP_DEAD, COLOR_BLACK,  -1);
         init_pair(CP_AGE0, COLOR_YELLOW, -1);

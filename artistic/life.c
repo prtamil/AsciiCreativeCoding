@@ -62,6 +62,93 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Each cell looks at its 8 neighbours, counts how many are alive, and
+ * asks one question — "with this many neighbours, do I live next tick?"
+ * The answer is read out of a 9-bit lookup: bit N of the BIRTH mask
+ * decides what an empty cell does, bit N of the SURVIVE mask decides
+ * what a live cell does.  Different masks = different universes.
+ * Conway's B3/S23 is just one of countless rules; flipping bits gets
+ * you HighLife, Day&Night, Seeds, Morley, 2x2 — same code, same loop,
+ * different cosmologies.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine an infinite chessboard wrapped into a torus.  Each square
+ * holds a stone or doesn't.  Once a tick, every square simultaneously
+ * peeks at its 8 surrounding squares and decides — based on how
+ * crowded it is — whether to keep its stone, drop one, or pick one up.
+ * No square ever cheats by reading the new state of a neighbour; the
+ * old board is read, the new board is written, and they swap.  Two
+ * boards, ping-pong.  That's it.  The astonishing complexity is the
+ * universe's bonus, not your code's burden.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Pick rule (Conway, HighLife, …).  Encode birth/survive as 9-bit
+ *     masks: bit N set iff cell with N neighbours is born / survives.
+ *  2. For each cell (r,c) in the active board: sum the 8 toroidal
+ *     neighbours; (r±1, c±1) wrap with `% rows / % cols`.
+ *  3. Form bit = 1u << n.  Next state =
+ *        cur ? (survive & bit) ? 1 : 0
+ *            : (birth   & bit) ? 1 : 0;
+ *     Write into the OTHER board.
+ *  4. Swap boards (`g_buf = 1 - g_buf`); increment generation; record
+ *     population in the ring history buffer.
+ *  5. Repeat steps 2-4 `g_steps` times per frame for fast-forward.
+ *  6. Render: draw '#' for live cells (top g_ca_rows rows), draw the
+ *     scrolling population histogram (3 rows), HUD on bottom row.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  n = sum over 8 neighbours of g_grid[buf][r±1 mod R][c±1 mod C]
+ *                                                   neighbour count 0..8
+ *  bit = 1u << n                                    9-bit position flag
+ *  next = cur ? (S & bit) != 0
+ *             : (B & bit) != 0                      Conway's rule
+ *  Conway:    B = (1<<3),                           B3 — birth on 3
+ *             S = (1<<2)|(1<<3)                     S23 — survive on 2 or 3
+ *  toroidal:  rp = (r-1+R) % R, rn = (r+1) % R      no edge cells
+ *  hist bar:  level = pop / (R·C) · 2·HIST_ROWS     2 sub-levels per row
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Two-board read/write — if you forget to write into the OTHER
+ *    buffer, neighbour counts read partially-updated state and the
+ *    simulation collapses (gliders smear, oscillators die).
+ *  • Toroidal wrap with C-style %  — `(r-1) % R` is negative for r=0;
+ *    must add R before mod, hence `(r-1+R) % R`.
+ *  • Seeds rule (B2/S0) — every live cell dies every tick; only
+ *    explosions survive.  Looks like everything is broken until you
+ *    see the rule name.
+ *  • Gosper gun period — the canonical pattern emits one glider every
+ *    30 ticks.  At g_steps=3 you see a glider every 10 frames; at
+ *    g_steps=30 you see one every frame.
+ *  • Steps-per-frame * grid size — at MAX_COLS=320, MAX_ROWS=128, and
+ *    STEPS_MAX=30, that's ~1.2M cell updates/frame.  Still well under
+ *    16ms on modern CPUs but watch the histogram ring buffer width
+ *    matches g_cols, not HIST_LEN.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Blinker test (Conway): place 3 cells in a row.  After 1 tick it
+ *    must be vertical; after 2 ticks horizontal again.  Period 2.
+ *  • Glider test (Conway): seed 'g'.  The 5-cell glider must move
+ *    diagonally one cell every 4 ticks.  Toroidal wrap means it
+ *    eventually returns to start after gcd(R, C) · 4 ticks.
+ *  • Acorn test (Conway): seed 'a'.  Should stabilise after exactly
+ *    5206 generations into a soup of 633 cells (one of Life's most
+ *    famous methuselahs).
+ *  • R-pentomino test: seed 'e'.  Stabilises at gen 1103 with 116
+ *    live cells (period-2 oscillators + still-lifes + 6 gliders).
+ *  • Seeds test: seed 'r' under Seeds rule.  Population should
+ *    explode then crash; histogram shows characteristic spikes.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

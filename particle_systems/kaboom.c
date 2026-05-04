@@ -54,6 +54,142 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A blast is two layers stacked.  Layer A is a 2-D shockwave: at each
+ * cell (x,y) compute r=sqrt(x²+(2y)²), apply a petal modulation
+ * cos(petal_n·atan2), and shade the cell from the wave_chars or
+ * flash_chars string by `frame − r`.  Layer B is 800 3-D point blobs
+ * pre-distributed on a unit sphere, flying outward at speed × frame,
+ * projected to the screen by pinhole perspective (cx = bx · P/(bz+P)).
+ * Both layers are drawn into a single Cell[] grid, then blitted.  A
+ * cycle lasts NUM_FRAMES=150 ticks; on completion (or `r`) the
+ * theme + shape index advances and the blast restarts.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine looking head-on at a soap bubble that's exploded outward.
+ * The 2-D layer is like a chalk drawing growing on a flat plate —
+ * a circle (or 6-pointed star, or 12-petal flower depending on
+ * petal_n) thickens outward each frame, with hot inner glyphs and
+ * cooler outer glyphs.  The 3-D layer is like a fistful of glitter
+ * thrown at a window: each piece flies in its own straight line
+ * through 3-space and hits the glass at its own (cx,cy) — far
+ * pieces are little dots `.`, mid pieces are `o`, near pieces are
+ * `@`.  Each frame, the chalk drawing expands by `disc_speed`
+ * cells, the glitter flies outward by `blob_speed` units, and you
+ * print whichever layer wrote to that cell last.
+ *
+ * ALGORITHM IN STEPS  (per tick)
+ * ──────────────────
+ *  Initial setup:
+ *    1. Pre-generate NUM_BLOBS=800 random unit-sphere points (rejection-
+ *       free: pick (bx,by,bz) ∈ [-1,1]³, divide by norm, scale by
+ *       1.3 + 0.2·rand).
+ *    2. Pick theme (colour palette) and shape (petal_n, ripple, …).
+ *
+ *  Per frame:
+ *    3. Clear cells.  Iterate (x,y) over [-cols/2, cols/2] × [-rows/2, rows/2].
+ *    4. frame == 0:    plant a single '*' FLASH at (0,0).
+ *    5. frame < 8:     filled disc — r = sqrt(x² + 4y²); if r < frame·disc_speed
+ *                       paint '@' FLASH (the initial fireball).
+ *    6. frame ≥ 8:    angular shape:
+ *           angle = atan2(2y, x)
+ *           lobe  = 1 + ripple · cos(petal_n · angle)         petal_n>0
+ *           r     = sqrt(x² + 4y²) · (0.5 + prng/3 · lobe·0.3)
+ *           v     = frame − r − 7
+ *           if v < 0      → flash_chars[frame-8] (INNER)
+ *           if v < waveN  → wave_chars[v]; INNER if v<waveN/2 else WAVE
+ *    7. Blob layer (frame > 6):
+ *           bx = blob.x · (frame-6) · blob_speed
+ *           by = blob.y · (frame-6) · blob_speed · y_squash
+ *           bz = blob.z · (frame-6) · blob_speed
+ *           skip if bz < 5−persp or bz > persp
+ *           cx = cols/2 + bx · persp / (bz + persp)
+ *           cy = rows/2 + by · persp / (bz + persp)
+ *           glyph = '.' if bz>0.8·persp; 'o' if bz>-0.4·persp; else '@'
+ *           colour = COL_BLOB_F / _M / _N by depth.
+ *    8. Blit cells to stdscr.  Advance frame.  At frame == NUM_FRAMES,
+ *       cycle++; restart with (cycle % THEMES, cycle % SHAPES).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Aspect-corrected radius:
+ *      r  = sqrt(x² + 4·y²)            terminal cells 2× tall as wide
+ *
+ *  Disc growth (frames 1..7):
+ *      r  < frame · disc_speed         filled '@' fireball
+ *
+ *  Angular petal modulation:
+ *      angle = atan2(2y + ε, x + ε)
+ *      lobe  = 1 + ripple · cos(petal_n · angle)
+ *      r     = base_r · (0.5 + prng/3 · lobe · 0.3)
+ *      v     = frame − r − 7           ramp index into wave_chars
+ *
+ *  Pinhole projection (3-D blobs to 2-D screen):
+ *      cx = cols/2 + bx · P / (bz + P)
+ *      cy = rows/2 + by · P / (bz + P)
+ *      with P = sh.persp ∈ {25..80}
+ *
+ *  Blob outward velocity (per frame):
+ *      bx = sphere.x · (frame−6) · blob_speed
+ *      by = sphere.y · (frame−6) · blob_speed · y_squash
+ *      bz = sphere.z · (frame−6) · blob_speed
+ *
+ *  Depth → glyph:
+ *      bz > 0.8·P  → '.' COL_BLOB_F   (far, small)
+ *      bz > -0.4·P → 'o' COL_BLOB_M   (middle)
+ *      else        → '@' COL_BLOB_N   (near, big)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Custom prng(): the LCG seed is `static long long s = 1` — never
+ *    re-seeded.  Every blast renders the same blob distribution.  This
+ *    is intentional (deterministic look) but means the same blast
+ *    pattern repeats; only the theme/shape varies between cycles.
+ *  • Off-by-one on minx/maxx: the frame buffer iterates (x,y) over
+ *    [−cols/2, cols+minx−1] which equals [−cols/2, +cols/2−1] for
+ *    even cols, slightly asymmetric for odd.  Cells written off the
+ *    grid would corrupt memory — the bounds clamp prevents that.
+ *  • Aspect factor `4·y²` (not `y²`): without the ×4, the blast would
+ *    look like a vertical ellipse on a typical 2:1 cell-aspect terminal.
+ *  • Layer ordering: blobs draw AFTER the wave, so blobs overwrite
+ *    wave glyphs at the same cell.  This is desired — blobs always
+ *    pop on top of the shockwave.
+ *  • Petal_n = 0 path: cos(0·angle) = 1, but a guard `petal_n > 0`
+ *    skips the multiply so the smooth-sphere shape ("ring") looks
+ *    perfectly round, no angular ripple.
+ *  • At frame > NUM_FRAMES, blast_tick returns false and the main loop
+ *    cycles to the next theme/shape via `app->cycle++`.  cycle is an
+ *    int — at int max it wraps to negative and `% N` becomes -1; in
+ *    practice the loop is bounded by user runtime, never an issue.
+ *  • Replay key 'r' increments cycle but does NOT change blob seed,
+ *    so blob pattern repeats.  Theme and shape change.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Frame-by-frame at SIM_FPS=5: the disc grows from frame 0 to 7,
+ *    then the wave starts emitting from frame 8, then blobs join in
+ *    from frame > 6.  Three-stage emergence should be visible.
+ *  • Theme cycle 'r': fire → ice → poison → plasma → gold → blood →
+ *    fire.  6 themes total.  Background stays black; only foreground
+ *    chars change colour.
+ *  • Shape cycle 'r' (same key advances both): classic → star → ring →
+ *    cross → nova → pulse → classic.  6 shapes total.  Star has 6
+ *    visible lobes; cross has 4; ring is smooth circle; nova has 12.
+ *  • Symmetry: at frame 30+, the wave_chars layer should be (k-fold)
+ *    rotationally symmetric for petal_n ∈ {4, 6, 8, 12, 16}.  Count
+ *    petals to verify petal_n.
+ *  • Blob count: at full expansion (frame ~30) you can roughly count
+ *    visible '@'/o/. characters — should be on the order of a few
+ *    hundred (some blobs are off-screen or culled by z-bounds).
+ *  • Restart 'r' resets frame to 0 and advances theme+shape cycle.
+ *    NUM_FRAMES auto-restart after 150 ticks (5 s at 30 Hz).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

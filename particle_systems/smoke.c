@@ -89,6 +89,167 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Three different ways of stirring a single shared float density grid,
+ * then one shared dithered renderer that maps density to round soft
+ * glyphs.  The CA path drags density up from a hot bottom row with
+ * ±2-column lateral wobble (wider than fire's ±1 — that's what makes
+ * smoke billow instead of spike).  The particle path flies puffs
+ * upward and bilinear-splats their life² onto 4 neighbouring cells
+ * (soft tent-filter blobs).  The vortex path declares a velocity
+ * field via Biot-Savart from 3 orbiting point vortices and advects
+ * the density semi-Lagrangianly each tick — the curls and swirls
+ * are the literal streamlines of the field.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture three different chimneys each producing the same kind of
+ * grey haze.  Chimney A (CA) just keeps shovelling smoke from the
+ * bottom and lets it drift sideways one or two cells before it cools.
+ * Chimney B (particles) emits little hot ash motes that fly upward
+ * with their own random velocities and slowly become transparent —
+ * you see each mote because it paints a soft 4-cell halo wherever it
+ * is.  Chimney C (vortex) declares the air itself is rotating: three
+ * invisible whirlpools orbit the centre of the screen and stir the
+ * smoke they pass through; each frame, every cell asks "where was I
+ * one step ago?" and pulls density forward from there.  In all three,
+ * the ink is the same ramp ` .,:coO0#`; only the stirring differs.
+ *
+ * ALGORITHM IN STEPS  (per tick)
+ * ──────────────────
+ *  scene_tick (always):
+ *    1. wind_acc += wind; wrap at ±cols.
+ *    2. dispatch by algo.
+ *
+ *  Algo 0 — CA Diffusion:
+ *    a. seed bottom row with arch · intensity · jitter · wscale.
+ *    b. for each cell (x,y) bottom→top:
+ *         rx = x + rand(−2..+2)
+ *         density[y][x] = max(0, density[y+1][rx] − decay)
+ *
+ *  Algo 1 — Particle Puffs:
+ *    a. for each active particle:
+ *         vx += turb±0.06; vx *= 0.97; x+=vx; y+=vy; life-=decay
+ *         deactivate if life≤0 or off-grid.
+ *    b. spawn SPAWN_PER_TICK new particles via arch-rejection sampling.
+ *    c. clear density grid; bilinear-splat life² into 4 cells per
+ *       particle:  weight(x0,y0) = (1-tx)(1-ty), etc.
+ *    d. clamp density ≤ 1.
+ *
+ *  Algo 2 — Vortex Advection:
+ *    a. advance each vortex's orbital angle: orb_a += orb_spd
+ *       cx,cy = centre + orb_r·(cos,sin)(orb_a).
+ *    b. for each cell (x,y):
+ *       — sum Biot-Savart velocity from N_VORTS vortices:
+ *           vx += s·(-dy)/(dx²+dy²+ε)
+ *           vy += s·( dx)/(dx²+dy²+ε)
+ *       — clamp |v| ≤ ADV_VEL_CAP=2.
+ *       — sx = x − vx·ADV_DT; sy = y − vy·ADV_DT (back-trace).
+ *       — adv = bilinear_sample(density, sx, sy).
+ *       — src = arch·intensity·jitter·wscale on bottom row only.
+ *       — work[y][x] = adv·(1−decay) + src.
+ *    c. memcpy work → density.
+ *
+ *  scene_draw (shared):
+ *    1. for each density cell: if d=0 mark −1; else d = pow(d,1/2.2).
+ *    2. Floyd-Steinberg dither: err = d − lut_midpoint(idx);
+ *       diffuse 7/16, 3/16, 5/16, 1/16 to neighbours.
+ *    3. mvaddch(y, x, k_ramp[idx]) with theme attribute.
+ *    4. cells that were non-zero last frame but zero now → ' '.
+ *    5. swap density ↔ prev_density.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Arch envelope:
+ *      t = (x − margin − wind_acc) / span
+ *      arch = (min(t, 1−t) · 2)²                    0 at edges, 1 ctr
+ *
+ *  CA propagation:
+ *      density[y][x] = max(0, density[y+1][x+rand(−2..+2)] − decay)
+ *      decay = (1/(rows·CA_REACH_FRAC)) · CA_DECAY_*_FRAC + rand range
+ *
+ *  Particle bilinear splat (life² distributed across 4 cells):
+ *      w00 = (1-tx)(1-ty)   w10 = tx(1-ty)
+ *      w01 = (1-tx)ty       w11 = tx·ty
+ *      density[y0..y1][x0..x1] += life² · w
+ *
+ *  Biot-Savart point-vortex velocity:
+ *      vx += strength · (-dy) / (dx² + dy² + ε)
+ *      vy += strength · ( dx) / (dx² + dy² + ε)
+ *      ε = VORT_EPS = 6.0   prevents singularity at vortex centre
+ *
+ *  Semi-Lagrangian advection:
+ *      density'(p) = density(p − v(p)·ΔT)·(1−decay) + source(p)
+ *      ΔT = ADV_DT = 0.8                            CFL: |v|·ΔT ≤ 1.6 cells
+ *
+ *  Vortex orbital motion:
+ *      orb_a += orb_spd                             rad/tick
+ *      cx,cy  = (cols/2, rows/2) + orb_r·(cos, sin)(orb_a)
+ *      orbits: r·{0.20, 0.30, 0.18}·cols, ω ∈ {+0.018, −0.011, +0.025}
+ *      strengths {+2.5, −1.8, +1.4} → mixed chirality
+ *
+ *  Dither + LUT:
+ *      d = pow(density, 1/2.2)                      gamma to perceptual
+ *      idx = lut_index(d) ∈ 0..8
+ *      glyph = " .,:coO0#"[idx]
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Wind double-accumulation: scene_tick advances wind_acc once,
+ *    BEFORE calling the algo.  Each algo therefore must NOT increment
+ *    wind_acc again.  Comment in vortex_tick reinforces this — easy
+ *    to break if copy-pasting from old fire.c.
+ *  • Vortex velocity cap (ADV_VEL_CAP=2): without it, a sample point
+ *    near a vortex centre would back-trace 5+ cells and read garbage
+ *    from outside its origin neighbourhood, breaking smooth advection.
+ *    Capping at 2 gives a CFL-stable ΔT·|v_max| = 1.6 cells.
+ *  • Particle bilinear ranges: at p->y near rows-1 (bottom), y1=rows
+ *    is out-of-grid; the four-quadrant guards prevent OOB writes.
+ *    Particles at p->x = cols-1 splat only into the left two cells.
+ *  • Reuse of `work` buffer: vortex_tick writes the new density into
+ *    `work` then memcpy back; scene_draw later uses `work` again as
+ *    its dither scratch.  Order matters — scene_draw runs AFTER tick,
+ *    so the vortex memcpy happens first and the dither overwrites
+ *    `work` cleanly.
+ *  • Floyd-Steinberg propagation through `−1` cells: the empty-cell
+ *    sentinel d[i] = −1.f must NOT receive dither error; guards
+ *    `>= 0.f` before adding.  Without them, cold cells accumulate
+ *    stray density and the empty space sparkles.
+ *  • Particle pool exhaustion: at MAX_PARTS=400 with avg lifetime
+ *    ~50 ticks and SPAWN_PER_TICK=5, equilibrium ≈ 250 active.
+ *    Pool never fills under default settings.
+ *  • Vortex orbits intersecting the source row: vortices at radius
+ *    0.30·cols can dip near the bottom row, briefly stealing density
+ *    from the source.  Visually this looks like a curl right above
+ *    the chimney mouth — feature, not bug.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Algo cycle 'a': CA → particles → vortex.  Visual signature:
+ *    CA = soft column with sideways drift; particles = discrete
+ *    soft puffs you can count; vortex = obvious swirling curls.
+ *  • Wind 'w'/'W': arch leans right/left.  Confirm with all three
+ *    algos — same lean direction (since wind_acc is accumulated once
+ *    in scene_tick, not per algo).  '0' resets to vertical.
+ *  • Source intensity 'g'/'G': at 0.10 you should see a thin wisp
+ *    barely reaching mid-screen; at 1.00 a thick column hitting
+ *    near the top.
+ *  • Theme cycle 't': 6 themes (gray, soot, steam, toxic, ember,
+ *    arcane).  Ramp glyph stays the same; only colours change.
+ *  • Vortex symmetry: at default 3 vortices with mixed +/− chirality,
+ *    the smoke should NOT show a uniform rotation — instead see
+ *    counter-rotating eddies at different radii.
+ *  • Pause/resume (space): freeze instantly; resume continues from
+ *    the same state — vortex orbital phase is preserved.
+ *  • Resize: SIGWINCH should rebuild buffers and re-init vortices.
+ *    Smoke briefly disappears (warmup resets) and grows back over
+ *    ~80 ticks.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

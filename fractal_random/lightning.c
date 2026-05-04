@@ -191,7 +191,7 @@ static void color_init(void)
         init_pair(COL_TEAL,   51, COLOR_BLACK);   /* bright cyan/teal */
         init_pair(COL_WHITE, 231, COLOR_BLACK);   /* white           */
         init_pair(COL_GLOW_I, 30, COLOR_BLACK);   /* dark teal glow  */
-        init_pair(COL_GLOW_O, 18, COLOR_BLACK);   /* dark navy glow  */
+        init_pair(COL_GLOW_O, 26, COLOR_BLACK);   /* dark navy glow  */
         init_pair(COL_SHOCK, 226, COLOR_BLACK);   /* bright yellow   */
     } else {
         init_pair(COL_LB,    COLOR_CYAN,   COLOR_BLACK);

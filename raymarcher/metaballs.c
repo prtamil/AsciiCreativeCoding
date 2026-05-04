@@ -49,6 +49,96 @@
  *                  hot hue for high-curvature tips, cool for flat merged regions.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * An SDF (signed distance field) is a function f(p) that returns "how
+ * far is point p from the nearest surface, with sign showing inside vs
+ * outside?"  Hard-min'ing six sphere SDFs gives six disjoint balls.
+ * REPLACING that hard min with a polynomial smooth-min converts the
+ * boolean union into a soft union: the surface gently bulges outward
+ * wherever two distance fields are within k of each other, producing
+ * the characteristic "wax dripping between blobs" look.  Everything
+ * else — raymarching, shading, curvature colour — is bookkeeping on
+ * top of that one swap.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture each ball as a small magnet wrapped in a thin sheet of warm
+ * wax.  When two magnets get within distance k, the wax stretches into
+ * a smooth neck instead of forcing the spheres to clip through each
+ * other.  The k slider is "wax temperature": k=0.05 is cold, brittle,
+ * the spheres just touch; k=4 is molten, you barely see individuals.
+ * The render is a still photograph of that wax with one spotlight,
+ * tinted by how curved each surface patch is.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Each tick: advance time, recompute each ball centre on its
+ *     Lissajous orbit ( BALL_A/B/C frequencies + per-ball phase ).
+ *  2. Build a half-resolution canvas (CELL_W × CELL_H = 2×2 blocks).
+ *  3. For each canvas pixel build a camera ray: ndc → FOV-tan scaled
+ *     direction, vertical scaled by phys_aspect to make circles round.
+ *  4. Ray-march the scene SDF: take the current distance, step that far
+ *     along the ray (sphere tracing), repeat until distance < HIT_EPS,
+ *     bail out at MAX_STEPS or MAX_DIST.
+ *  5. At a hit: estimate the normal with 4-tetrahedron finite differences
+ *     of sdf_scene, optionally march toward the light to gather a soft
+ *     penumbra factor.
+ *  6. Compute Phong shade and a Laplacian-based curvature value, store
+ *     both in canvas[].
+ *  7. Draw: shade picks a glyph from " .,:;+*oxOX#@", curvature picks a
+ *     band 0-7 in the active theme palette, the 2×2 block fills with
+ *     that glyph + colour.  Bright shades add A_BOLD.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Sphere SDF       sdf_ball(p, c, r) = |p - c| - r
+ *  Smooth-min       h = max(k - |a-b|, 0) / k
+ *                   smin(a,b,k) = min(a,b) - h²·k/4
+ *  Sphere trace     t ← t + sdf_scene(ro + t·rd)   (largest safe step)
+ *  Tetra normal     n ∝ k0·f0 + k1·f1 + k2·f2 + k3·f3, then normalise
+ *  Curvature        ∇²f ≈ Σ f(p±εê) - 6·f(p)  / ε²   (six-tap Laplacian)
+ *                   For sphere of radius r:  Laplacian = 2/r
+ *  Phong            I = KA + shadow·(KD·max(0,N·L) + KS·max(0,R·V)^SHIN)
+ *                   R = 2(N·L)N - L
+ *  Soft shadow      res = min(res, sk·h/t)         (Quilez penumbra)
+ *  Aspect fix       ray.y *= rows·CELL_H·CELL_ASPECT / (cols·CELL_W)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • k → 0 in smin causes division by zero; the K_MIN floor (0.05)
+ *    keeps h finite.  Setting K_MIN to 0 will crash on smin.
+ *  • The rare concave neck between two balls returns a NEGATIVE
+ *    Laplacian.  calc_curvature returns the raw value; canvas_render
+ *    clamps to [0,1] so concave regions register as the lowest band.
+ *  • RM_HIT_EPS too small (<1e-4) plus k_blend large makes the smooth
+ *    region's distance estimate over-shoot — sphere tracing assumes a
+ *    Lipschitz=1 SDF, and smin slightly violates that near the seam.
+ *    Keeping HIT_EPS=0.005 hides it.
+ *  • Initial sim_accum/dt is huge if the first frame is slow; the
+ *    200 ms cap on dt prevents the orbit from teleporting.
+ *  • Canvas allocation depends on cols/CELL_W, rows/CELL_H — guard
+ *    against 0 (very narrow terminal) by clamping to 1.
+ *  • Soft shadows multiply per-pixel work by SHADOW_STEPS≈16; toggling
+ *    them off on slow terminals roughly doubles the frame rate.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • At K_MIN you should see six distinctly bordered spheres, no neck.
+ *  • At K_MAX the six should look like one amoeba; pressing j five
+ *    times divides k by 1.35^5 ≈ 4.5×, which should clearly re-pinch.
+ *  • Pause (space) and confirm the orbit freezes but shading still
+ *    updates if you change theme — proves render and tick are decoupled.
+ *  • Toggle soft shadows: shadow boundary on the surface should soften
+ *    visibly without changing the silhouette.
+ *  • Resize the terminal: canvas_alloc / canvas_free path must rebuild
+ *    arrays; if the program crashes here, check the malloc pair.
+ *  • Set N_BALLS=1: the result is a single sphere unaffected by k_blend.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

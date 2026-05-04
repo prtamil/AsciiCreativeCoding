@@ -118,7 +118,7 @@ static void color_init(void)
         init_pair(CP_D5,  93, -1);   /* purple         — depth 5             */
         init_pair(CP_D6, 201, -1);   /* magenta        — depth 6             */
         init_pair(CP_D7, 196, -1);   /* red            — depth 7 (deepest)   */
-        init_pair(CP_HUD,232, 250);  /* dark on silver — HUD bar             */
+        init_pair(CP_HUD, 240, 250);  /* dark on silver — HUD bar             */
     } else {
         init_pair(CP_D1, COLOR_YELLOW,  -1);
         init_pair(CP_D2, COLOR_GREEN,   -1);

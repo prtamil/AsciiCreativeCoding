@@ -114,10 +114,10 @@ static void color_init(void)
     use_default_colors();
     if (COLORS >= 256) {
         /* blue dye */
-        init_pair(CP_D0,  17, -1); init_pair(CP_D1,  21, -1);
+        init_pair(CP_D0, 25, -1); init_pair(CP_D1, 33, -1);
         init_pair(CP_D2,  27, -1); init_pair(CP_D3,  51, -1);
         /* green dye */
-        init_pair(CP_G0,  22, -1); init_pair(CP_G1,  28, -1);
+        init_pair(CP_G0, 28, -1); init_pair(CP_G1,  28, -1);
         init_pair(CP_G2,  34, -1); init_pair(CP_G3,  46, -1);
         /* red dye */
         init_pair(CP_R0,  88, -1); init_pair(CP_R1, 124, -1);

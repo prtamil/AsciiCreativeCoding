@@ -61,6 +61,178 @@
  *                  the rasterisation loop itself.
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A unit cube is 24 vertices and 12 triangles.  Each frame: build a
+ * model matrix (rotate X, rotate Y), multiply by view (look at origin)
+ * and projection (perspective), getting an MVP.  For each triangle:
+ * run the vertex shader on its 3 vertices; perspective-divide to NDC
+ * to screen; reject if back-facing (signed area ≤ 0); rasterize by
+ * walking its bounding box and computing barycentric coords for each
+ * pixel; for pixels inside the triangle (all three bary > 0) and
+ * passing the z-test, run the fragment shader to get an RGB; convert
+ * RGB to luma (Rec.709), Bayer-dither, look up Bourke ASCII char,
+ * write to cbuf[].  After all triangles processed, fb_blit() copies
+ * cbuf[] to ncurses.  Four shaders pluggable via 's': phong, toon,
+ * normals, wire — each is just a different fragment function.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * It's a tiny GPU written in C.  Vertices are stamps; transform them
+ * to where they should appear on screen.  Triangles are paint masks
+ * defined by three stamps.  For every cell under a paint mask, ask
+ * "what's my position WITHIN this mask?" — that's barycentric
+ * coordinates u, v, w.  Use those to interpolate any per-vertex
+ * attribute (normal, UV, world position) to the current pixel.
+ * Hand the interpolated state to a shader function, get a colour,
+ * convert it to a single luminance, look up the matching ASCII glyph
+ * from Paul Bourke's density ramp.  Bayer-dither so neighbouring
+ * cells with similar luma get slightly different glyphs and the
+ * eye sees a smoother gradient.  Z-buffer keeps near things in front
+ * of far things.  That's the entire pipeline — same as a 1990s
+ * software renderer, scaled down to 80×24.
+ *
+ * ALGORITHM IN STEPS  (per frame)
+ * ──────────────────
+ *  1. Tessellate cube ONCE at startup: 6 faces × 4 vertices = 24
+ *     vertices, each with face-local outward normal (so vertices
+ *     belong to one face — flat shading, hard edges).
+ *  2. scene_tick: angle_x += ROT_X·dt, angle_y += ROT_Y·dt;
+ *     model = rot_y(angle_y) · rot_x(angle_x);
+ *     mvp = proj · view · model;
+ *     norm_mat = cofactor(model)          (transforms normals correctly).
+ *  3. fb_clear: zbuf[i] = +∞, cbuf[i] = 0.
+ *  4. For each of 12 triangles:
+ *       a. vert_shader on 3 vertices → clip_pos, world_pos, world_nrm.
+ *       b. near-clip reject if all w < 0.001.
+ *       c. perspective divide: sx = (clip.x/w + 1)·0.5·cols
+ *                              sy = (-clip.y/w + 1)·0.5·rows
+ *                              sz = clip.z/w
+ *       d. signed area test; if cull_backface and area ≤ 0 → skip.
+ *       e. compute screen-space bbox; walk every pixel in it.
+ *       f. for each pixel: bary = barycentric(sx, sy, px+0.5, py+0.5);
+ *          all three > 0 and (z = bary·sz) < zbuf → rasterize.
+ *       g. interpolate world_pos, world_nrm, custom by bary; call
+ *          frag_shader(in) → RGB.
+ *       h. luma = 0.2126R + 0.7152G + 0.0722B  (Rec.709).
+ *       i. Bayer 4×4 dither: dithered = luma + (bayer[py][px] − 0.5)·0.15.
+ *       j. idx = dithered · (BOURKE_LEN − 1); write k_bourke[idx].
+ *  5. fb_blit cbuf to stdscr; HUD; present.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Perspective projection (OpenGL-style):
+ *      proj.m[0][0] = (1/tan(fov/2)) / aspect
+ *      proj.m[1][1] = 1/tan(fov/2)
+ *      proj.m[2][2] = (far+near)/(near-far)
+ *      proj.m[2][3] = (2·far·near)/(near-far)
+ *      proj.m[3][2] = -1
+ *
+ *  Aspect (terminal cell ratio corrected):
+ *      aspect = (cols·CELL_W) / (rows·CELL_H)   CELL_W=8, CELL_H=16
+ *
+ *  Perspective divide and screen mapping:
+ *      sx = ( clip.x / w + 1) · 0.5 · cols       NDC x ∈ [-1,1]
+ *      sy = (-clip.y / w + 1) · 0.5 · rows       Y flip for screen-down
+ *      sz =   clip.z / w
+ *
+ *  Barycentric (signed area form, Möller):
+ *      d  = (y1-y2)(x0-x2) + (x2-x1)(y0-y2)
+ *      b0 = ((y1-y2)(px-x2) + (x2-x1)(py-y2)) / d
+ *      b1 = ((y2-y0)(px-x2) + (x0-x2)(py-y2)) / d
+ *      b2 = 1 − b0 − b1
+ *
+ *  Back-face cull (after Y-flip, CCW winding == positive area):
+ *      area = (sx1-sx0)(sy2-sy0) − (sx2-sx0)(sy1-sy0)
+ *      cull when area ≤ 0
+ *
+ *  Blinn-Phong (frag_phong):
+ *      N = world normal,  L = light_dir,  V = view_dir,  H = norm(L+V)
+ *      diff = max(0, N·L)
+ *      spec = max(0, N·H)^shininess          (shininess = 64)
+ *      colour = ambient + obj·light·diff + spec·0.5
+ *      gamma  = colour^(1/2.2)
+ *
+ *  Toon (frag_toon, 4 bands):
+ *      banded = floor(diff · bands) / bands  (bands = 4)
+ *      spec   = (N·H > 0.94) ? 0.7 : 0       hard cel highlight
+ *
+ *  Normals (frag_normals):  RGB = N·0.5 + 0.5  ∈ [0,1] per channel
+ *
+ *  Wireframe (frag_wire):
+ *      edge = min(b0, b1, b2)                 distance to nearest edge
+ *      if edge > WIRE_THRESH (0.06) → discard
+ *      else colour ramp from white at edge to grey at threshold
+ *
+ *  Bayer 4×4 ordered dither matrix (k_bayer[py%4][px%4]):
+ *      0  8  2 10                             /16
+ *     12  4 14  6
+ *      3 11  1  9
+ *     15  7 13  5
+ *
+ *  Luma to ramp index:
+ *      d = clamp(luma + (bayer[py%4][px%4] − 0.5)·0.15, 0, 1)
+ *      idx = d · (BOURKE_LEN − 1)             92-step Paul Bourke ramp
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Y-flip on screen mapping: NDC has +Y up but screen rows count
+ *    downward.  The minus sign in `sy = (-clip.y/w + 1)·…` is what
+ *    flips it.  Without it, the cube renders upside-down AND back-
+ *    face culling inverts (CCW becomes CW after flip).
+ *  • Back-face area test sign: after the Y-flip, CCW triangles have
+ *    POSITIVE area; the cull condition is `area <= 0` (not `< 0`).
+ *    Off-by-one zero-area degenerate triangles are also culled.
+ *  • Wireframe identity coords: pipeline injects (1,0,0)/(0,1,0)/
+ *    (0,0,1) into VSIn.u/v BEFORE the vertex shader; vert_wire
+ *    overwrites custom[0..2] AFTER.  Skip either step and the
+ *    barycentric edge detection in frag_wire reads zeros and the
+ *    whole triangle vanishes (discarded everywhere).
+ *  • Cube vertices are duplicated 4× per face.  Sharing vertices
+ *    between faces would average normals at corners and round the
+ *    cube — wrong for hard-surface shading.  Each face has its own
+ *    set of 4 vertices with a uniform face-normal.
+ *  • Near-clip skip: if all 3 w-values < 0.001 the triangle is
+ *    entirely behind the camera; skipping prevents division-by-tiny.
+ *    Triangles partially behind are NOT properly clipped (would
+ *    require Sutherland-Hodgman); they may produce stretched
+ *    artifacts when CAM_DIST is set very small.
+ *  • Toggle 'c' off-cull: with culling off, both front and back of
+ *    each face render; you see the inside of the cube as well —
+ *    useful for verifying the mesh is closed.
+ *  • Bourke ramp is 92 chars: indexing past BOURKE_LEN-1 reads
+ *    beyond the literal.  The clamp before the cast prevents that.
+ *  • Dither contribution scale 0.15: chosen so dither doesn't blur
+ *    the toon's hard bands.  Larger values dissolve the cel-shading
+ *    look; smaller values cause posterised banding in phong gradients.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Phong shader: light at (4,5,4); the lit faces are upper-front-
+ *    right; opposite faces are dim ambient grey.  Specular highlight
+ *    moves smoothly across the front face as the cube rotates.
+ *  • Toon shader: bands count 4.  At any instant, each face is a
+ *    single band — no gradient across one face (flat normals = same
+ *    diffuse for every fragment on a face).
+ *  • Normals shader: 6 distinct face colours; +X/+Y/+Z map to red/
+ *    green/blue tint (after the ·0.5+0.5 shift), opposite faces use
+ *    the complementary colours.
+ *  • Wireframe: 12 edges visible plus the 6 diagonals from quad-to-
+ *    triangle splits.  As the cube rotates you can count edges.
+ *  • Cull toggle 'c': switch off — interior face glyphs appear
+ *    inside the cube outline.  Switch on — clean silhouette.
+ *  • Zoom +/-: cube grows/shrinks; HUD shows current cam distance
+ *    (1.0..8.0 with 0.2 step).  Aspect remains correct because
+ *    proj is rebuilt with cell-aspect on resize.
+ *  • Pause: rotation freezes; you can toggle shaders to see all
+ *    four on the same orientation.
+ *  • At resize, mesh isn't rebuilt — only proj matrix.  Cube should
+ *    re-fit the new terminal size without flicker.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
@@ -559,7 +731,7 @@ static void color_init(void){
     if(COLORS>=256){
         init_pair(1,196,COLOR_BLACK); init_pair(2,208,COLOR_BLACK);
         init_pair(3,226,COLOR_BLACK); init_pair(4, 46,COLOR_BLACK);
-        init_pair(5, 51,COLOR_BLACK); init_pair(6, 21,COLOR_BLACK);
+        init_pair(5, 51,COLOR_BLACK); init_pair(6, 33,COLOR_BLACK);
         init_pair(7,201,COLOR_BLACK);
     } else {
         init_pair(1,COLOR_RED,    COLOR_BLACK);

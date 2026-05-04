@@ -220,7 +220,7 @@ static void color_init(void)
         init_pair(CP_WHL_L,  46, COLOR_BLACK);   /* bright green */
         init_pair(CP_WHL_R, 201, COLOR_BLACK);   /* magenta      */
         init_pair(CP_TR_NEW, 51, COLOR_BLACK);   /* cyan         */
-        init_pair(CP_TR_OLD, 17, COLOR_BLACK);   /* dark blue    */
+        init_pair(CP_TR_OLD, 25, COLOR_BLACK);   /* dark blue    */
         init_pair(CP_HUD,    51, COLOR_BLACK);   /* cyan         */
         init_pair(CP_VEL_P,  82, COLOR_BLACK);   /* lime green   */
         init_pair(CP_VEL_N, 196, COLOR_BLACK);   /* red          */

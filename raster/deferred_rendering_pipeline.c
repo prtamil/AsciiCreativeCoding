@@ -412,7 +412,7 @@ static void color_init(void)
         init_pair(CP_NRM_NX,  51, -1);  /* -X: cyan     */
         init_pair(CP_NRM_PY,  46, -1);  /* +Y: green    */
         init_pair(CP_NRM_NY, 201, -1);  /* -Y: magenta  */
-        init_pair(CP_NRM_PZ,  21, -1);  /* +Z: blue     */
+        init_pair(CP_NRM_PZ, 33, -1);  /* +Z: blue     */
         init_pair(CP_NRM_NZ, 226, -1);  /* -Z: yellow   */
 
         init_pair(CP_OBJ_CUBE,   208, -1);  /* orange */

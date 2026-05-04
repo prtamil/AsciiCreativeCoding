@@ -137,14 +137,14 @@ static void color_init(void)
         init_pair(CP_I,          196,  -1);  /* red  — infected              */
         init_pair(CP_I_FLASH,    226,  -1);  /* bright yellow — just infected*/
         init_pair(CP_R,           46,  -1);  /* green — recovered            */
-        init_pair(CP_EDGE_DIM,   236,  -1);  /* very dark — background edges */
+        init_pair(CP_EDGE_DIM, 244,  -1);  /* very dark — background edges */
         init_pair(CP_EDGE_HOT,   196,  -1);  /* red  — edges touching I      */
         init_pair(CP_EDGE_REWIRE,220,  -1);  /* yellow — rewired + hot       */
         init_pair(CP_HUD,        244,  -1);  /* grey HUD                     */
         init_pair(CP_BAR_S,      246,  -1);
         init_pair(CP_BAR_I,      196,  -1);
         init_pair(CP_BAR_R,       46,  -1);
-        init_pair(CP_DIVIDER,    238,  -1);
+        init_pair(CP_DIVIDER, 246,  -1);
     } else {
         init_pair(CP_S,         COLOR_WHITE,   -1);
         init_pair(CP_I,         COLOR_RED,     -1);

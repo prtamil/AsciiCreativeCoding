@@ -348,8 +348,8 @@ static void color_init(void)
     use_default_colors();
     if (COLORS >= 256) {
         /* Spectral ramp: black → dark-blue → blue → cyan → green → yellow → red → white */
-        init_pair(CP_S0,  16,  COLOR_BLACK);   /* black (silence)    */
-        init_pair(CP_S1,  17,  COLOR_BLACK);   /* dark navy          */
+        init_pair(CP_S0, 24,  COLOR_BLACK);   /* black (silence)    */
+        init_pair(CP_S1, 25,  COLOR_BLACK);   /* dark navy          */
         init_pair(CP_S2,  27,  COLOR_BLACK);   /* blue               */
         init_pair(CP_S3,  51,  COLOR_BLACK);   /* cyan               */
         init_pair(CP_S4,  46,  COLOR_BLACK);   /* green              */

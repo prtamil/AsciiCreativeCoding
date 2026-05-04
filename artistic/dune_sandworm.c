@@ -135,7 +135,7 @@ static void color_init(void) {
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(CP_HUD, 232, 250);  /* dark text on silver bar */
+        init_pair(CP_HUD, 240, 250);  /* dark text on silver bar */
         theme_apply(g_theme);
     } else {
         init_pair(CP_HUD, COLOR_BLACK, COLOR_WHITE);

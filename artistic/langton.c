@@ -67,6 +67,94 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The ant has a tiny brain — three integers (row, col, heading) — and a
+ * memory shared with the world: each cell stores a colour 0..K-1.  At
+ * every step it reads the colour beneath its feet, looks up "R" or "L"
+ * in the rule string for that colour, turns that way 90°, repaints the
+ * cell to the next colour (mod K), and walks forward one square.  No
+ * planning, no memory of the past.  Yet for rule "RL" specifically,
+ * after roughly 10 000 steps of pure chaos, the ant builds itself a
+ * diagonal "highway" that repeats forever with period 104.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine an ant wandering a tiled floor where each tile changes
+ * colour every time the ant steps off it, and the colour tells the
+ * NEXT ant who arrives where to turn.  So the ant is leaving messages
+ * for itself, and reading those messages, and the rules are just
+ * "right on white, left on black" — and somehow that suffices to
+ * produce a deterministic finite-state machine that paints highways,
+ * spirals, fractals depending on the alphabet.  The grid is the tape;
+ * the ant is the head; the rule string is the program.  It's literally
+ * a 2-D Turing machine.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Pick a rule string of length K (e.g. "RL", "LLRR").  K is the
+ *     number of cell colours.
+ *  2. Start: grid all 0, ant at centre, heading north.
+ *  3. Each step:
+ *       a. state = grid[ant.r][ant.c]
+ *       b. turn = rule[state]              ('R' or 'L')
+ *       c. ant.dir = (turn=='R')? (dir+1)%4 : (dir+3)%4
+ *       d. grid[ant.r][ant.c] = (state+1) % K
+ *       e. ant.r += DR[dir];  ant.c += DC[dir]   (wrap toroidally)
+ *  4. Multi-ant: same loop, N ants each step once per "step" — they
+ *     share one grid, so trails interact.
+ *  5. Render: each non-zero cell in its colour-pair (CP_C0+state) as
+ *     '#'; ants drawn on top as bold '@' in white.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  dir ∈ {0,1,2,3}  →  N, E, S, W                 4-way heading
+ *  DR = {-1, 0, +1, 0}  DC = {0, +1, 0, -1}       step deltas
+ *  turn-right:  dir = (dir + 1) % 4               (+90° cw)
+ *  turn-left :  dir = (dir + 3) % 4               (−90° = +270°)
+ *  next state:  c = (c + 1) % K                   K = strlen(rule)
+ *  toroidal :   r = (r + dr + R) % R              wrap N/S
+ *               c = (c + dc + C) % C              wrap E/W
+ *  Highway period (rule "RL"): 104 steps,         empirically observed
+ *                              moves (2, -2)      diagonal NE
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Rule string length must be ≥ 2.  Length 1 ("R" or "L") loops the
+ *    ant in a 4-cycle on a single cell forever.  Code clamps to ≥ 2.
+ *  • Highway only emerges for "RL" — and only AFTER the chaotic phase.
+ *    At STEPS_DEF=200 it takes ~50 frames; with '+' to step up to 2000
+ *    you'll see the highway form within seconds.  Do not assume every
+ *    rule terminates in a highway; "RLR" is genuinely chaotic.
+ *  • Toroidal wrap interferes with highway — once the highway hits a
+ *    wrap boundary it can collide with its own old trail and dissolve
+ *    back into chaos until a new structure forms.
+ *  • Multi-ant: 2 or 3 ants on the same grid mutate each other's
+ *    trails.  No collision logic — two ants on the same cell still
+ *    each step.  Visually they pass through each other.
+ *  • Cell-colour palette has 8 slots; rules of length > 8 would over-
+ *    flow.  N_PRESETS keeps max length ≤ 5 (LLRRR).
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Rule "RL", 1 ant, STEPS_DEF=200: pause at ~50 frames (~10 000
+ *    steps).  You should see the highway emerging — a recurring
+ *    rectangular zigzag pattern moving diagonally.
+ *  • Rule "LLRR", 1 ant: at ~5 000 steps you should see a clean
+ *    growing square spiral, four-fold symmetric about origin.
+ *  • Reverse-symmetry check: rule "LR" (vs "RL") produces the mirror
+ *    pattern.  Both have identical chaotic phase length.
+ *  • Speed test: '+' raises STEPS to 400, 800, …, 2000.  Total step
+ *    counter in HUD must rise proportionally; framerate should stay
+ *    pegged at 30 fps thanks to the fixed-step accumulator.
+ *  • Reset 'r' must zero the grid AND re-seed ants at preset offsets;
+ *    after reset the same rule must produce the same pattern (it's
+ *    deterministic — no rand involved).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <ncurses.h>

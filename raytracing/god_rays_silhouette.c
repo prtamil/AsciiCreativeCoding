@@ -40,7 +40,6 @@
  *   solar_eclipse.c     — same framework + per-cell brightness
  *                          accumulation; eclipse uses corona overlay
  *                          rather than fog ray-march.
- *   atmospheric_sky.c   — same theme-ramp + glyph density rendering.
  *
  * Section map:
  *   §1 config       — constants, themes (warm fog palettes)

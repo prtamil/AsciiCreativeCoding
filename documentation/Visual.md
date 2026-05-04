@@ -915,32 +915,22 @@ The HUD always uses:
 
 **What we achieve:** Portable, visually clean borders and box outlines. On modern UTF-8 terminals these render as Unicode box-drawing characters (┌ ─ ┐ │ └ ┘). On legacy VT100 terminals they use the alternate character set. Plain ASCII (`+`, `-`, `|`) looks crude by comparison.
 
-**How:** Use `ACS_*` macros directly in `mvaddch` — they expand to the correct terminal-specific `chtype` value. `bonsai.c` builds its message panel border by drawing the four corners, then filling the top and bottom edges with `ACS_HLINE` in a loop, and drawing left/right edges with `ACS_VLINE`. No Unicode literals, no terminal detection needed.
-
-ncurses provides terminal-portable box-drawing characters through the `ACS_*` macros. Used in `bonsai.c` for the message panel box:
+**How:** Use `ACS_*` macros directly in `mvaddch` — they expand to the correct terminal-specific `chtype` value. `railwaymap.c` uses `ACS_HLINE` / `ACS_VLINE` / `ACS_PLUS` for railway tracks: every cell looks at its h/v line state and chooses one of `space → ACS_HLINE → ACS_VLINE → ACS_PLUS`. No Unicode literals, no terminal detection needed.
 
 ```c
-attron(COLOR_PAIR(6) | A_BOLD);
-mvaddch(by,         bx,             ACS_ULCORNER);   /* ┌ */
-for (int i = 1; i < box_w-1; i++)
-    mvaddch(by,     bx+i,           ACS_HLINE);      /* ─ */
-mvaddch(by,         bx + box_w - 1, ACS_URCORNER);   /* ┐ */
-
-mvaddch(by+1,       bx,             ACS_VLINE);      /* │ */
-mvaddch(by+1,       bx + box_w - 1, ACS_VLINE);      /* │ */
-
-mvaddch(by+2,       bx,             ACS_LLCORNER);   /* └ */
-for (int i = 1; i < box_w-1; i++)
-    mvaddch(by+2,   bx+i,           ACS_HLINE);      /* ─ */
-mvaddch(by+2,       bx + box_w - 1, ACS_LRCORNER);   /* ┘ */
-attroff(COLOR_PAIR(6) | A_BOLD);
+chtype ch;
+if      (cell.h_line && cell.v_line) ch = ACS_PLUS;     /* ┼ */
+else if (cell.h_line)                ch = ACS_HLINE;    /* ─ */
+else if (cell.v_line)                ch = ACS_VLINE;    /* │ */
+else                                 ch = ' ';
+mvaddch(y, x, ch);
 ```
 
 `ACS_*` macros translate to the correct terminal-specific values at runtime — on VT100 terminals they use the alternate character set; on UTF-8 terminals they use Unicode box-drawing. Always prefer `ACS_*` over hardcoded Unicode or ASCII approximations for maximum terminal compatibility.
 
-Available symbols used here: `ACS_ULCORNER`, `ACS_URCORNER`, `ACS_LLCORNER`, `ACS_LRCORNER`, `ACS_HLINE`, `ACS_VLINE`.
+Available symbols include: `ACS_ULCORNER`, `ACS_URCORNER`, `ACS_LLCORNER`, `ACS_LRCORNER`, `ACS_HLINE`, `ACS_VLINE`, `ACS_PLUS`.
 
-*Files: `bonsai.c`*
+*Files: `artistic/railwaymap.c`, `robots/walking_robot.c`*
 
 ---
 
@@ -1152,7 +1142,7 @@ static void screen_draw(...)
 
 Row 0, column `cols - HUD_COLS` is a standard HUD position — top-right corner, just wide enough for the formatted string. The `snprintf` target is always `HUD_COLS + 1` bytes so the string is bounded even if terminal is very narrow.
 
-`bonsai.c` writes a second HUD line at `rows - 1` (bottom of screen) for additional status.
+Some files (e.g. `bonsai.c`, `nuke.c`) place the entire HUD on the BOTTOM row (`rows - 1`) instead of the top, freeing the upper screen for the animation centrepiece.
 
 *Files: all files*
 
@@ -2241,19 +2231,23 @@ char ch = k_boid_chars[flock_id][octant];
 ---
 
 ### artistic/bonsai.c
-*Growing bonsai tree with recursive branch growth, transparent background, ACS borders.*
+*Static bonsai still-life — 5 classical styles, 6 themes, hash-gated wind rustle.*
 
-**`use_default_colors()` + `-1` background** (→ V1.3, V3.4) — branches float over the terminal's native background.
+**Two-pass composition** — skeleton + char grid generated ONCE per (style, seed); per-frame work is just emitting the grid + per-cell rustle on foliage cells.  Re-seed (`r`) and style-cycle (`n`) regenerate; theme-cycle (`t`) re-applies palette only.
 
-**ACS line-drawing chars for message box** (→ V4.5) — `ACS_ULCORNER`, `ACS_HLINE`, `ACS_VLINE`, etc. Portable box border on any terminal encoding.
+**Style-specific trunk paths** — five classical bonsai forms each generate trunks via different parametric curves: CHOKKAN straight + tiny noise, MOYOGI sin S-curve, SHAKAN linear slope, KENGAI two-phase rise+cascade, BUNJIN nearly-vertical sparse.
 
-**Branch boldness via conditional OR** — `attr_t a = COLOR_PAIR(cp) | (bold ? A_BOLD : 0)`. Older/thicker branches draw bold; young/thin ones at base brightness.
+**Bresenham branches with depth-aware glyphs** — trunk depth 0-1 uses heavy chars (`M`, `H`, `=`); deeper recursion uses thinner chars (`|`, `/`, `\\`, `-`).  Direction-aware: vertical-dominant segments use `|`, horizontal use `-`, diagonals use `\\` or `/` depending on slope sign.
 
-**Slope chars per branch direction** (→ V4.8) — `abs(dx) < abs(dy)/2 → '|'`; `abs(dy) < abs(dx)/2 → '-'`; `dx*dy > 0 → '\\'`; else `'/'`.
+**Aspect-corrected foliage clouds** (→ V8.2) — cloud is an ellipse with semi-axes `(rx, rx · CELL_ASPECT⁻¹)`, which renders as a ROUND cloud in physical pixels.  Without this, terminal cells being 2× taller than wide make foliage look like vertically-squashed rugby balls.
 
-**Dual HUD rows** — `mvprintw(0, hx, ...)` for top bar; `mvprintw(rows-1, 0, ...)` for bottom bar. More status without crowding either edge.
+**Soft-edge cloud falloff** — cells past 60 % of cloud radius get a 30 % skip probability per cell, breaking the hard disc edge into a fluffy boundary.
 
-**Message panel scrolling text** — `snprintf(buf, box_w-1, "%s", msg)` pre-clips to box width; `mvprintw(by+1, bx+1, "%s", buf)` inside ACS border.
+**Hash-gated wind rustle** — per frame, `hash3(col, row, ⌊time · 6⌋) & 0xFF < 0xFF · 0.06` gates which 6 % of foliage cells re-pick a glyph.  Stable per (cell, time-bucket) → coherent flutter pattern, no boil.
+
+**WINTER and SUMI_E special-cases** — WINTER theme has `bare = true` (no foliage clouds, branch tips paint snow `*` glyph); SUMI_E theme has `inverted = true` (white-paper bg pre-fill, A_BOLD/A_DIM disabled, dark ink fg).  Same inverted-theme recipe used elsewhere in the codebase.
+
+**Trapezoidal pot drawn last** — pot frame (`\___/` lip + `|...|` walls + `:....` base, all ASCII) renders AFTER trunk segments, so KENGAI cascades that dipped into the pot region get cleanly overwritten.
 
 ---
 
@@ -2551,22 +2545,32 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
-### raymarcher/sun.c
-*Sphere-traced sun with 8 magnetic flares + corona + limb darkening.*
+### raymarcher/sun_solar.c
+*Face-on 2-D screen-space sun — disc + corona + arc flares. No raymarch.*
 
-**Single-SDF composition** — entire visual = `sphere_radius − warped_fbm(p,t)·NOISE_AMP` smooth-unioned with up to 8 capsule flares. `smin(a,b,k) = min(a,b) − k·h²/4` polynomial blend (with `h = max(k−|a−b|, 0)/k`) hides the flare-foot crease.
+**Radial classifier per pixel** — `r = √(dx² + (dy·CELL_ASPECT)²)`; three regions:
+```
+r < R_disc          → SURFACE
+R_disc ≤ r < R_corona → CORONA
+r ≥ R_corona        → empty space
+```
+The cell-aspect correction on `dy` makes the disc render as a true round circle, not a vertically-squashed ellipse.
 
-**Bézier-tube SDF approximation** — `bezier_tube_dist()` samples 8 capsule segments along a quadratic Bézier arc and takes the minimum. Visually identical to the analytic distance (which would require degree-5 root-finding) at one-tenth the code.
+**Eddington μ-law from screen radius** — μ derives directly from screen geometry: `μ = √(1 − (r/R_disc)²)`, no surface normal required. Combined with `lum = (LIMB_BASE + LIMB_BIAS·μ) · texture_modulation` it reproduces the canonical "centre brighter than limb" gradient that real stars actually have. Ref: en.wikipedia.org/wiki/Limb_darkening.
 
-**One-sided FD normals** — reuses the centre SDF value already known from the hit test, evaluating only 3 extra samples (`+ε` per axis). Halves the per-pixel cost vs. a textbook 6-sample central difference.
+**Granulation via animated 2-D fBm** — `tex = fbm2d((dx − wind·t)·s, dy·s)`. The time-shifted x argument gives the slow drifting/boiling cell illusion. Modulating disc luminance by `±GRAN_AMP·(tex − 0.5)·2` produces visible convection cells without any explicit cell geometry.
 
-**Eddington 1-coefficient limb darkening** — `temp *= 0.80 + 0.20·|N·V|`. Real stars look ~20% cooler at the edge because limb photons cross more atmosphere. One linear coefficient `u₁=0.20`, one fma instruction. Ref: en.wikipedia.org/wiki/Limb_darkening.
+**Sunspots from low-noise gates** — `spot = max(0, SPOT_THRESH − tex)²`. Where the granulation noise dips below threshold, an additional darkening term takes over. Squaring sharpens the spot cores into clear dark blotches. Same fBm signal, two visual effects (granules + sunspots) — no second noise system.
 
-**Corona accumulator** — every ray (hit or miss) accumulates `exp(−near·CORONA_SCALE)·CORONA_BRIGHT` along its path with `near = max(0, sdf)`. The soft halo emerges naturally — no separate post-process pass.
+**Parabolic arc flares in screen space** — each flare is two footpoints on the disc plus an apex height. Position along arc:
+```
+P(s) = (1−s)·A + s·B  +  4s(1−s) · (apex − chord_midpoint)
+```
+4s(1−s) is 0 at endpoints, 1 at midpoint — exact parabola. Sampling 36 points and writing additively into a luminance buffer gives a smooth bright streak; no SDF, no analytical distance to a quadratic curve.
 
-**Domain-warped fBm** — `fbm(p + fbm2(p)·WARP_AMP)`. The self-offset creates swirling cauliflower granulation that pure fBm cannot. Ref: iquilezles.org/articles/warp/.
+**Lifecycle envelope** — `amp = 1 − |2·τ − 1|^1.4` where `τ = age / lifetime`. Quick rise, sustained peak, quick fall — softer than triangular (exp=1), sharper than parabolic (exp=2). Combined with `arc_amp = sin(π·s)` peaking at the apex, the brightest point of any flare is always `(apex, mid-life)`.
 
-**Flare state machine** — DORMANT → BLAST (`smoothstep(0,0.25)` fade-in) → ARCH → DECAY (`smoothstep(1,0)` fade-out). Each flare runs an independent clock; phase is normalised to `[0, 1)` per state.
+**Three-pass composition** — disc/corona luminance into a static per-cell buffer, additive flare overlay, then ncurses emit with batched attron/attroff. The buffer is needed because flares brighten cells additively; without it the renderer would have to search every flare per cell.
 
 ---
 
@@ -2736,7 +2740,7 @@ if (t < floor) return 0;   /* invisible */
 | `(chtype)(unsigned char)` double cast | V4.2 | all |
 | `wattron`/`wattroff` bracket | V4.3 | all |
 | `mvprintw` HUD text | V4.4 | all |
-| ACS line-drawing chars | V4.5 | bonsai |
+| ACS line-drawing chars | V4.5 | railwaymap, walking_robot |
 | Paul Bourke 92-char ramp | V4.6 | rasters, raymarchers, fire |
 | Directional velocity → glyph | V4.7 | flowfield, flocking |
 | Slope chars `/\|-` | V4.8 | spring_pendulum, bonsai, wireframe |

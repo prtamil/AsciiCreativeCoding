@@ -1,42 +1,52 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * phoenix.c — phoenix in flight with death and rebirth lifecycle
+ * phoenix.c — perched phoenix that self-immolates and is reborn from ash
  *
- * DEMO: A bird-shaped formation of fire particles soars across the
- *       screen. The body is composed of fixed anchor points (head,
- *       neck, two wings, two trailing tail feathers); each anchor
- *       carries a cloud of jittery particles that paint the silhouette
- *       in flame. Wings beat via a slow sinusoid in time, raising and
- *       lowering the wing anchors so the bird flaps as it flies.
+ * DEMO: A still owl-like phoenix sits on a perch, breathing softly.
+ *       After a long calm, it ignites — sparks crawl across the body,
+ *       feathers turn to flame, then the whole bird becomes a roaring
+ *       conflagration.  The silhouette dissolves; embers fall and
+ *       smoulder on the perch as ash and smoke drift upward.  After
+ *       a long quiet, a single bright spark appears at the head of
+ *       the perch and the bird grows back outward from that seed
+ *       until the owl is whole again, eyes glowing, and the cycle
+ *       repeats.
  *
- *       The phoenix follows a four-phase lifecycle:
- *         FLY   — cross the screen left to right (or right to left)
- *         DIE   — slow to a halt mid-screen, body collapses inward
- *         ASH   — bright burst, particles fall as cooling ash
- *         BIRTH — a new spark ignites at the horizon, body reforms
- *       and then back to FLY. One full cycle is ~30 seconds.
+ *       Lifecycle (one full cycle ≈ 26 seconds):
+ *         PERCH    (12s)  still owl, gentle breathing
+ *         IGNITE    (2s)  bird heats; sparks crawl; flame buds form
+ *         BLAZE     (3s)  full conflagration; bright core
+ *         COLLAPSE  (2s)  silhouette dissolves; embers fall as ash
+ *         ASH       (4s)  smouldering remains drift; perch glows red
+ *         REBIRTH   (3s)  spark at head expands outward; bird reforms
  *
- * Study alongside: artistic/fire_tornado.c (heat ramp + cylindrical pool),
- *                  artistic/volcano.c (ballistic ash particles for the
- *                  DIE/ASH phases).
+ * Study alongside: artistic/fire_tornado.c (heat ramp + buoyancy),
+ *                  artistic/volcano.c (free-flight cooling embers),
+ *                  artistic/ant_colony.c (anchor-template particle
+ *                  silhouette pattern from a different domain).
  *
  * Section map:
- *   §1 config    — pool sizes, body anchors, lifecycle timings, palette
- *   §2 clock     — monotonic timer + sleep
- *   §3 color     — heat ramp per theme
- *   §4 random    — frand
- *   §5 anchor    — body template (anchor offsets relative to head)
- *   §6 particle  — Particle struct + tick / draw
- *   §7 phoenix   — Phoenix state + lifecycle FSM + emission
- *   §8 scene     — orchestrates draw order + HUD
- *   §9 screen    — ncurses init / cleanup
- *  §10 app       — signals, dt tracking, key handling, main loop
+ *   §1  config    — sizes, phase timings, fire physics, palette
+ *   §2  clock     — monotonic timer + sleep
+ *   §3  color     — 6-bucket heat ramp by theme
+ *   §4  random    — frand / frand_signed
+ *   §5  anchor    — owl-shaped anchor template + alive_at radial wake
+ *   §6  body      — body particle (BOUND ↔ FREE), tick + draw
+ *   §7  spark     — pure free-flight ember pool (rises from BLAZE)
+ *   §8  phoenix   — Phoenix state + lifecycle FSM + emission rules
+ *   §9  scene     — composition, perch glyphs, HUD
+ *  §10  screen    — ncurses init / cleanup
+ *  §11  app       — signals, dt tracking, key handling, main loop
  *
- * Keys:  +/-   flight speed
- *        [/]   wing span scale
- *        ,/.   particle density
- *        s     skip to next phase
- *        t     cycle theme   r reset   p pause   q/ESC quit
+ * Keys:
+ *   q / ESC      quit
+ *   space / p    pause / resume
+ *   r            reset (immediate PERCH)
+ *   s            skip to next phase
+ *   i            ignite NOW (skip to IGNITE)
+ *   t / T        next / previous theme
+ *   ,/.          decrease / increase body density
+ *   ;/'          decrease / increase spark density
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra artistic/phoenix.c \
@@ -45,40 +55,75 @@
 
 /* ── CONCEPTS ──────────────────────────────────────────────────────────── *
  *
- * Algorithm     : Body is a fixed array of anchor points in body-local
- *                 coordinates (head at origin, wings extending left and
- *                 right, tail trailing behind). Each frame:
- *                 (1) advance the head along its path; (2) compute each
- *                 anchor's world position by translating + applying the
- *                 wing-flap angle (a sinusoid in `world_time`);
- *                 (3) re-bind every particle to a random anchor and
- *                 jitter it within a small radius around that anchor's
- *                 world position. The bird is therefore drawn fresh
- *                 each frame from anchor + jitter; particles don't
- *                 carry memory of where they were.
+ * Algorithm     : Two cooperating particle systems, one anchor template,
+ *                 one finite-state lifecycle.
  *
- *                 Lifecycle is a 4-state FSM driven by `phase_time`:
- *                 FLY → DIE → ASH → BIRTH → FLY. ASH releases the
- *                 anchor binding — particles continue in free flight
- *                 with gravity, cooling. BIRTH binds them back as the
- *                 silhouette reassembles.
+ *                 The BODY is a fixed array of anchor points in body-local
+ *                 coordinates that together describe an owl silhouette
+ *                 — head ellipse, body ellipse, eye discs, beak, ear
+ *                 tufts.  Each frame, body particles either re-bind to a
+ *                 weighted-random anchor (BOUND) or integrate free-flight
+ *                 fire physics (FREE).  Whether a particle is BOUND or
+ *                 FREE is dictated by the lifecycle phase: PERCH/IGNITE/
+ *                 BLAZE force BOUND; ASH forces FREE; COLLAPSE flips
+ *                 particles BOUND→FREE over time; REBIRTH flips them
+ *                 FREE→BOUND.
  *
- * Data-structure: Phoenix holds Particle[N_PART_MAX] inline; each
- *                 particle has position, velocity, temperature, and an
- *                 anchor index used during the bound phases. A small
- *                 fixed-size BODY_ANCHORS array describes the silhouette.
+ *                 During REBIRTH, only anchors whose `alive_at` value is
+ *                 below the growth fraction can be re-bound to.  alive_at
+ *                 is the normalised distance from a SEED point (the head
+ *                 centre).  As growth_frac rises 0→1, the alive set
+ *                 expands outward from the seed, so the bird grows back
+ *                 visually from the eyes outward.
  *
- * Rendering     : Per frame: erase, draw all particles with heat-ramp
- *                 char + colour. No back/front split — the bird is
- *                 small enough that simple draw order is fine.
+ *                 Spark particles are a separate, smaller, pure-free-
+ *                 flight pool.  They're emitted from random body anchors
+ *                 during IGNITE/BLAZE/COLLAPSE — the wisps that rise
+ *                 above the burning silhouette and trail away as smoke.
  *
- * Performance   : O(N_PART) per frame. At N=300 it's a few hundred
- *                 mvaddch — trivial.
+ *                 Both populations integrate the same fire physics:
+ *                   – buoyancy   : vy -= BUOYANCY · (0.2 + 0.8·temp)·dt
+ *                   – turbulence : v  += SHEAR · sin/cos field · dt
+ *                   – drag       : v  *= 1 − DRAG · dt
+ *                   – cooling    : T  *= exp(-COOL · dt)
+ *
+ *                 Heat ramp: temp ∈ [0,1] mapped to 6 colour buckets
+ *                 from smoke (bucket 0, dim grey) through dark theme
+ *                 tint, mid theme, bright theme, hot accent, white-hot
+ *                 core (bucket 5).  At rest the owl's anchors carry low
+ *                 base_temp values (~0.2) so the silhouette renders in
+ *                 buckets 1-2 (dark feather colours).  Ignition raises
+ *                 temps; blaze pegs them at ~1.0; rebirth eases them
+ *                 back down.
+ *
+ * Data-structure: Phoenix holds inline pools — BodyParticle[N_BODY] and
+ *                 Spark[N_SPARK] — plus an Anchor[] array recomputed at
+ *                 init (the owl is static, so anchors don't change per
+ *                 frame; only the per-particle position/state does).
+ *
+ * Rendering     : ASCII only.  Heat-ramp glyph set ` . + * # @ %` from
+ *                 coolest to hottest.  Bucket 0 uses A_DIM, bucket ≥4
+ *                 uses A_BOLD.  Perch is drawn as a static `-` strip
+ *                 with a dim brown colour pair below the bird.
+ *
+ * Performance   : O(N_body + N_spark) per frame.  At defaults
+ *                 (350 body + 200 spark) ≈ 550 mvaddch — trivial well
+ *                 past 60 fps.
  *
  * References    :
- *   Reeves, "Particle Systems" SIGGRAPH (1983).
- *   Reynolds, "Steering Behaviors for Autonomous Characters" GDC (1999)
- *     — formation flight inspires the anchor-based body model here.
+ *   • Reeves, "Particle Systems — A Technique for Modeling a Class of
+ *     Fuzzy Objects", SIGGRAPH 1983.  Foundational paper for the emit/
+ *     integrate/cool/recycle loop used by sparks and free body
+ *     particles.
+ *   • Stam, "Real-Time Fluid Dynamics for Games", GDC 2003.  The sin/
+ *     cos-shear turbulence field is a cheap visual stand-in for proper
+ *     velocity advection.
+ *   • Boussinesq buoyancy approximation (any combustion textbook): the
+ *     hot/cold density gradient drives the rise — implemented here as
+ *     `vy -= BUOYANCY · temp · dt`.
+ *   • Phoenix mythology: the bird that ignites itself, burns to ash,
+ *     and regrows from the embers — Bulfinch's Mythology (1855), Book
+ *     of the Dead (Egyptian "Bennu"), Persian "Simurgh".
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -86,109 +131,145 @@
  *
  * CORE IDEA
  * ─────────
- * A bird-shaped formation of fire particles. The body is a fixed ANCHOR
- * TEMPLATE in body-local coordinates (head at origin, wings extending
- * sideways, tail trailing); each frame the particles rebind to a random
- * anchor with small jitter. The bird is therefore drawn FRESH every
- * frame from the template — particles don't carry positional memory,
- * only an anchor index. Wing flap is a sinusoid in time applied to
- * wing anchors. Lifecycle is a 4-state FSM that controls how binding
- * works in each phase.
+ * The owl is a SHAPE, not a thing.  The shape is a list of anchor
+ * points; the thing is a swarm of particles that snaps to the shape
+ * each frame.  Lifecycle phases change the rules of snapping: snap
+ * always (PERCH), snap with heat (IGNITE), snap at white-hot (BLAZE),
+ * stop snapping piece by piece (COLLAPSE), don't snap at all and float
+ * away (ASH), then snap back from the inside out (REBIRTH).  At the
+ * core, every visible character is just a particle deciding "where am
+ * I and how hot am I" — the lifecycle decides which question to ask.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
- * Think of a stage performance. The skeleton (head, neck, wings, tail)
- * is a fixed dancer pose. A swarm of glowing dots takes positions
- * around that skeleton each frame. The dots aren't the dancer; they're
- * spectators clustering around invisible anchor points. As the anchors
- * drift across the stage, the dots redistribute themselves around the
- * new positions. Wing flap sees the wing anchors swing up and down;
- * the dots follow. When the dancer dies, the spectators are released
- * and scatter (free-flight + gravity + cooling). Then a new dancer is
- * born and the spectators re-cluster.
+ * Imagine a flock of fireflies trained to fly to a pose.  At rest they
+ * land in formation tracing an owl.  Heat them up: they glow brighter.
+ * Heat them more: the formation breaks; some leave the pose and rise
+ * as embers.  Wait long enough, and the heat fades out.  Now drop one
+ * bright firefly back where the owl's eye should be, and call the
+ * others home — they return one by one, nearest pose-points first,
+ * and the silhouette grows back from a single point.  That's the
+ * phoenix.
  *
  * DRAWING METHOD  (per frame, FSM-driven)
  * ──────────────
- *  1. erase()
- *  2. Advance head_x along its trajectory (FLY/DIE/BIRTH) or stay put
- *     (ASH).
- *  3. For each particle:
- *       - In FLY/DIE/BIRTH: compute anchor world position via
- *         `anchor_world(p->anchor_idx, ...)` and rebind p with jitter.
- *       - In ASH: skip rebind; particle keeps its velocity from the
- *         death-burst, integrates with gravity + cooling.
- *  4. particle_draw — heat-ramp glyph by per-particle temperature.
+ *  1. erase(); draw the perch (static).
+ *  2. Advance world_t and phase_t.  If phase_t exceeds the phase's
+ *     duration, advance to the next phase (wraps PERCH → … → REBIRTH
+ *     → PERCH).
+ *  3. For every BODY PARTICLE, decide BOUND vs FREE for this frame:
+ *       PERCH/IGNITE/BLAZE   → force BOUND
+ *       COLLAPSE             → with prob frac·release_rate·dt, become
+ *                              FREE for the rest of the cycle (until
+ *                              REBIRTH or reset)
+ *       ASH                  → force FREE
+ *       REBIRTH              → with prob capture_rate·dt, try to
+ *                              rebind to an anchor whose alive_at <=
+ *                              growth_frac; if successful, BOUND.
+ *  4. For each BOUND particle: re-pick a weighted-random anchor (from
+ *     the alive set during REBIRTH; from the full set otherwise).
+ *     Snap position to anchor world coord + small radial jitter.  Set
+ *     temp to a phase-modified version of anchor.base_temp.
+ *  5. For each FREE particle: integrate buoyancy + turbulence + drag
+ *     + cooling.  If temp drops below FLOOR or particle drifts off the
+ *     screen, mark inactive.
+ *  6. SPARK pool: during IGNITE/BLAZE/COLLAPSE emit at phase-dependent
+ *     rate from random anchors.  Each spark integrates the same fire
+ *     physics, gets recycled when life or temp expires.
+ *  7. Render: BODY (BOUND first, then FREE) → SPARKS → HUD.
  *
  * KEY FORMULAS
  * ────────────
- *  Anchor world position (with mirror on dir change):
- *    dx = anchor.dx · (-dir) · ASPECT_X
- *    dy = anchor.dy + flap_term + bob_term
- *    flap_term = sin(t · 2π · WING_FLAP_HZ)
- *              · WING_FLAP_AMP · wing_frac · ±1   (left=-1, right=+1)
- *    bob_term  = sin(t · 2π · WING_FLAP_HZ) · HEAD_BOB_AMP · 0.3
+ *  Heat-ramp bucket:
+ *      b = clamp(floor(temp · 6), 0, 5)
+ *      bucket  glyph  attr      colour role
+ *      0       '.'    A_DIM     smoke
+ *      1       '+'    -         dark theme tint   (owl feathers)
+ *      2       '*'    -         mid theme tint    (warm feathers)
+ *      3       '#'    -         bright theme tint (ember)
+ *      4       '@'    A_BOLD    hot accent       (flame)
+ *      5       '%'    A_BOLD    white-hot core
  *
- *  Particle bind:
- *    p.x = ax + signed_jitter · JITTER_R · ASPECT_X
- *    p.y = ay + signed_jitter · JITTER_R
+ *  Anchor alive_at (radial wake order during REBIRTH):
+ *      d_i      = sqrt((dx_i − seed_x)^2 + (dy_i − seed_y)^2)
+ *      d_max    = max_i d_i
+ *      alive_at = d_i / d_max                       ∈ [0,1]
+ *      anchor i is alive when growth_frac >= alive_at
  *
- *  Per-anchor base temperature (heat gradient by body part):
- *    wings     : base_t = 0.45 + 0.50 · wing_frac    (tips white, roots warm)
- *    body      : base_t = 0.55                       (warm)
- *    tail      : base_t = 0.35                       (cooler red/orange)
- *    p.temp = base_t + small_jitter
+ *  Phase temp modifier for BOUND particles:
+ *      PERCH    : T = base_temp                         + jitter
+ *      IGNITE   : T = lerp(base_temp, 1.0, frac)        + jitter
+ *      BLAZE    : T = 0.85 + 0.15·frand_pos             (white-hot)
+ *      COLLAPSE : T = lerp(1.0, 0.4, frac)
+ *      REBIRTH  : T = 0.7 + 0.3·(1 − alive_at_of_anchor)
+ *                                                       (centre hot)
  *
- *  Lifecycle (seconds, total cycle ≈ 20 sec):
- *    FLY   T_FLY=10s   — head crosses screen, particles rebind
- *    DIE   T_DIE=2.5s  — head decelerates, particles bind tighter,
- *                         temps rise
- *    ASH   T_ASH=5s    — burst! particles released with radial
- *                         velocity; gravity + cooling
- *    BIRTH T_BIRTH=2.5s — head moves to start, particles rebind
- *                         incrementally over time
+ *  Free-flight fire physics (same for body-FREE and sparks):
+ *      vy   -= BUOYANCY · (0.20 + 0.80·T) · dt
+ *      v    += SHEAR · (sin(t·hz + .3x + .45y),
+ *                       cos(t·hz + .45x − .3y)) · dt
+ *      v    *= 1 − DRAG · dt
+ *      x,y  += v · dt
+ *      T    *= exp(-COOL · dt)
+ *      life -= dt    (sparks only; body-FREE has no life cap)
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *  • All particles bucket 4 — initial design used `temp = 0.85 + 0.15·rand()`
- *    so every particle was bucket 4 (white). Theme cycling had nothing
- *    to recolour. The fix is the per-anchor heat gradient above; now
- *    wing tips are bucket 4 (white), body bucket 2 (theme colour),
- *    tail bucket 1 (theme dim).
+ *  • Phase transition snaps temp — moving COLLAPSE → ASH could leave a
+ *    body particle that was still BOUND with a high temp.  The first
+ *    ASH frame force-flips it to FREE without resetting temp, so it
+ *    integrates with the right initial heat and cools naturally — no
+ *    visual snap.
  *
- *  • Direction mirror on rebirth — when `dir` flips (-1 ↔ +1), anchors
- *    must mirror x so the head still points the way the bird is flying.
- *    Done via `dx = anchor.dx · (-dir)`.
+ *  • REBIRTH growth_frac = 0 — at frame 0 of REBIRTH, ONLY the seed
+ *    anchor (alive_at = 0) is alive.  Body particles trying to capture
+ *    will only ever pick that anchor.  Hence the visual: a single
+ *    bright dot appears at the seed and grows outward.
  *
- *  • Anchor weight imbalance — wings have many anchors, head has few.
- *    `anchor_pick` is weighted-random by `Anchor.weight` so density
- *    along the body is controllable per-body-part.
+ *  • REBIRTH ends mid-growth — if T_REBIRTH is lowered or dt jumps,
+ *    growth_frac may not reach 1.0 by phase end.  We snap growth to
+ *    1.0 on the PERCH transition so the owl finishes complete; this
+ *    is a one-frame visual catch-up but always reads cleaner than a
+ *    half-built bird suddenly settling.
  *
- *  • Frame-rate independence — anchor world depends on `world_time`,
- *    which advances by `dt`. Wing flap is therefore time-based, not
- *    frame-based; the bird flaps at the same rate regardless of fps.
+ *  • Resize — owl x,y are recomputed from rows/cols at init/resize.
+ *    Currently active free particles keep absolute coords; after a
+ *    big shrink some will drift off-screen and recycle naturally.
  *
- *  • Resize — head_x/y are absolute screen coords, not relative. After
- *    resize the bird may briefly fly at the wrong screen height; the
- *    next FLY phase uses `rows/3` for the new dimensions.
+ *  • Ignition heating uniform — IGNITE heats every anchor at the same
+ *    rate.  If you wanted "fire spreading from beak outward", you
+ *    could reuse the same alive_at trick with a different seed and
+ *    delay each anchor's heat ramp by alive_at; the framework
+ *    supports it, current build keeps the simpler uniform heating for
+ *    legibility.
  *
  * HOW TO VERIFY
  * ─────────────
- *  • Watch the wing flap: a particle near a wing tip should oscillate
- *    up and down once per (1/WING_FLAP_HZ) ≈ 0.67 seconds.
+ *  • PERCH: owl visible, dim, eyes (high base_temp) read brighter than
+ *    body.  Gentle vertical bob (BREATH_AMP·sin) — 1 cycle ≈ 4s.
  *
- *  • Watch heat by body part: wing tips bright white (bucket 4),
- *    body cooler theme colour (bucket 2), tail dim red/cyan/etc.
+ *  • IGNITE: in 2s the silhouette fades from feather tints to bright
+ *    flame.  Sparks start to appear above the bird.
  *
- *  • Press `s` to skip phases. Cycle FLY → DIE → ASH → BIRTH → FLY
- *    in seconds; verify the bird collapses, bursts outward, then
- *    reforms at the opposite edge of the screen.
+ *  • BLAZE: ~3s of full-bright fire.  Silhouette still owl-shaped but
+ *    glyphs are `@` and `%`, all bright.
  *
- *  • Press `t` to cycle theme. Body and tail change colour;
- *    wing tips stay white (always bucket 4 = white in every theme).
- *    That's the heat-ramp gradient working as intended.
+ *  • COLLAPSE: silhouette dissolves bottom-up because bottom anchors
+ *    have higher anchor weight × COLLAPSE_RELEASE rate, so they tend
+ *    to release first.  Released particles fall and drift.
  *
- *  • At ASH phase, particles should NOT respect the anchor positions —
- *    they should fly outward and fall under gravity, freely.
+ *  • ASH: no silhouette, just embers drifting up + falling toward the
+ *    perch.  Smoke characters (bucket 0, dim grey) dominate.
+ *
+ *  • REBIRTH: a single white dot at the head centre.  Over 3s an
+ *    expanding circle of fire grows outward; eyes appear first, then
+ *    body, then ear tufts and wing edges.  Feels like a sphere
+ *    expanding.
+ *
+ *  • Press `s` to skip phases — verify all 6 phases in sequence.
+ *
+ *  • Press `t` to cycle theme — palette tints change but heat ramp
+ *    structure (bucket count, glyphs) stays identical.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -213,60 +294,115 @@
 
 #define TARGET_FPS         60
 
-/* Particle pool. */
-#define N_PART_MAX         500
-#define N_PART_DEFAULT     280
-#define N_PART_MIN          80
-#define N_PART_STEP         40
+/* Particle pools. */
+#define N_BODY_MAX         600
+#define N_BODY_DEFAULT     360
+#define N_BODY_MIN         150
+#define N_BODY_STEP         40
 
-/* Body geometry — anchors are placed relative to the head at (0,0).
- * x is forward axis (positive = forward), y is vertical (negative = up).
- * Coordinates are in cell units. */
-#define BODY_HEAD_X         0
-#define BODY_HEAD_Y         0
-#define BODY_LEN            12.0f      /* head-to-tail length in cells   */
-#define WING_SPAN_DEFAULT    12.0f
-#define WING_SPAN_MIN         4.0f
-#define WING_SPAN_MAX        22.0f
-#define WING_SPAN_STEP        2.0f
+#define N_SPARK_MAX        400
+#define N_SPARK_DEFAULT    220
+#define N_SPARK_MIN         60
+#define N_SPARK_STEP        30
 
-#define WING_FLAP_AMP         3.0f     /* vertical wing tip travel        */
-#define WING_FLAP_HZ          1.5f     /* flaps per second                 */
-#define HEAD_BOB_AMP          0.6f     /* small head bob with wing beat   */
+#define N_ANCHOR_MAX       80
 
-/* Path */
-#define FLIGHT_SPEED_DEFAULT 14.0f     /* cells/sec                        */
-#define FLIGHT_SPEED_MIN      4.0f
-#define FLIGHT_SPEED_MAX     30.0f
-#define FLIGHT_SPEED_STEP     2.0f
-#define FLIGHT_AMP            5.0f     /* vertical sine while flying      */
-#define FLIGHT_FREQ           0.4f     /* rad/sec                          */
+/* Display aspect — terminal cells are tall+narrow; multiply x by this
+ * factor when drawing so the owl reads round, not stretched vertical. */
+#define ASPECT_X           2.0f
 
-#define ASPECT_X              2.0f     /* horizontal stretch on draw      */
+/* Owl silhouette geometry (cells; head at origin, +y down).
+ * The seed (REBIRTH growth centre) is the head centre. */
+#define HEAD_CY           (-3.0f)
+#define HEAD_RX            4.0f
+#define HEAD_RY            3.0f
+#define BODY_CY            ( 2.5f)
+#define BODY_RX            3.0f
+#define BODY_RY            3.5f
+#define EYE_DX             2.0f
+#define EYE_DY            (-3.0f)
+#define BEAK_DY           (-1.4f)
+#define EARTUFT_DX         3.4f
+#define EARTUFT_DY        (-6.2f)
+
+#define SEED_DX            0.0f
+#define SEED_DY           (-3.0f)     /* head centre — REBIRTH source   */
 
 /* Lifecycle timings (seconds). */
-#define T_FLY                10.0f
-#define T_DIE                 2.5f
-#define T_ASH                 5.0f
-#define T_BIRTH               2.5f
+#define T_PERCH           12.0f
+#define T_IGNITE           2.0f
+#define T_BLAZE            3.0f
+#define T_COLLAPSE         2.0f
+#define T_ASH              4.0f
+#define T_REBIRTH          3.0f
 
-/* Particle physics. */
-#define JITTER_R              0.7f     /* anchor jitter radius (cells)    */
-#define COOL_RATE_FLY         0.0f     /* during FLY, no cooling           */
-#define COOL_RATE_ASH         0.55f    /* during ASH, fast cool            */
-#define GRAVITY_ASH          12.0f     /* cells/sec² during ASH            */
+/* Body particle behaviour. */
+#define BODY_JITTER_R      0.55f
+#define BREATH_HZ          0.25f      /* slow chest rise, cycles/sec    */
+#define BREATH_AMP         0.20f      /* tiny head/body bob, cells       */
 
-#define DT_CAP_S              0.10f
-#define N_THEMES              4
+/* IGNITE / BLAZE / COLLAPSE / REBIRTH temperature shaping.  See the
+ * MENTAL MODEL "phase temp modifier" formulas. */
+#define BLAZE_TEMP_MIN     0.85f
+#define BLAZE_TEMP_MAX     1.00f
+#define COLLAPSE_TEMP_HOT  1.00f
+#define COLLAPSE_TEMP_COOL 0.30f
+
+/* COLLAPSE: rate at which BOUND body particles flip BOUND→FREE.
+ * With release rate 4/s and frac ramping 0→1, near end of COLLAPSE we
+ * release ~4 particles/s/particle — i.e. virtually all in the last
+ * fraction of the phase. */
+#define COLLAPSE_RELEASE_RATE  6.0f
+
+/* REBIRTH: rate at which FREE body particles try to recapture to an
+ * alive anchor.  Each frame, prob = rate · dt — 5 means most particles
+ * will have at least one capture attempt per second. */
+#define REBIRTH_CAPTURE_RATE   5.0f
+
+/* Spark emission rate, particles/sec, by phase. */
+#define SPARK_HZ_PERCH       0.0f
+#define SPARK_HZ_IGNITE     20.0f
+#define SPARK_HZ_BLAZE     120.0f
+#define SPARK_HZ_COLLAPSE   60.0f
+#define SPARK_HZ_ASH         8.0f
+#define SPARK_HZ_REBIRTH    15.0f
+#define SPARK_BURST_MAX     16
+
+/* Spark physics. */
+#define SPARK_LIFE_BASE     1.6f
+#define SPARK_LIFE_VAR      0.5f
+#define SPARK_TEMP_INIT     0.95f
+#define SPARK_TEMP_VAR      0.10f
+#define SPARK_VEL_BASE      4.0f      /* initial speed, cells/sec       */
+#define SPARK_VEL_VAR       0.6f
+#define SPARK_VEL_UP        2.5f      /* extra upward bias              */
+
+/* Free-flight fire physics — applied to body-FREE particles AND sparks. */
+#define FIRE_BUOYANCY      11.0f
+#define FIRE_DRAG           1.4f
+#define FIRE_COOL           0.85f
+#define FIRE_SHEAR_AMP      6.0f
+#define FIRE_SHEAR_HZ       1.5f
+#define FIRE_TEMP_FLOOR     0.04f
+
+/* COLLAPSE release initial velocity range. */
+#define COLLAPSE_VEL_LATERAL  3.0f    /* ±cells/sec sideways            */
+#define COLLAPSE_VEL_DOWN     2.0f    /* base downward fall, cells/sec  */
+#define COLLAPSE_VEL_UPVAR    3.5f    /* random component (some go up)  */
+
+#define DT_CAP_S           0.10f
+#define N_THEMES           4
 
 /* Colour pair IDs */
-#define PAIR_HEAT_0  1
-#define PAIR_HEAT_1  2
-#define PAIR_HEAT_2  3
-#define PAIR_HEAT_3  4
-#define PAIR_HEAT_4  5
-#define PAIR_HUD     6
-#define PAIR_HINT    7
+#define PAIR_HEAT_0   1
+#define PAIR_HEAT_1   2
+#define PAIR_HEAT_2   3
+#define PAIR_HEAT_3   4
+#define PAIR_HEAT_4   5
+#define PAIR_HEAT_5   6
+#define PAIR_PERCH    7
+#define PAIR_HUD      8
+#define PAIR_HINT     9
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -282,563 +418,1022 @@ static int64_t clock_ns(void)
 static void clock_sleep_ns(int64_t ns)
 {
     if (ns <= 0) return;
-    struct timespec r = { .tv_sec  = (time_t)(ns / 1000000000LL),
-                          .tv_nsec = (long)(ns % 1000000000LL) };
-    nanosleep(&r, NULL);
+    struct timespec t;
+    t.tv_sec  = ns / 1000000000LL;
+    t.tv_nsec = ns % 1000000000LL;
+    nanosleep(&t, NULL);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §3  color                                                               */
+/* §3  color — 6-bucket heat ramp by theme                                 */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-/* Four distinct dominant hues so cycling 't' is unmistakable. The dim
- * end is bright enough to be visible (was 17/52 — near-black). */
-static const short HEAT_256[N_THEMES][5] = {
-    /* 0 fire    — red → orange → yellow → white   */
-    { 124, 196, 208, 226, 231 },
-    /* 1 blue    — navy → blue → cyan → white      */
-    {  25,  33,  39,  51, 231 },
-    /* 2 green   — dark green → lime → yellow → white */
-    {  22,  28,  82, 154, 231 },
-    /* 3 purple  — magenta → pink → white          */
-    {  53,  91, 165, 213, 231 },
-};
-static const short HEAT_8[N_THEMES][5] = {
-    { COLOR_RED,     COLOR_RED,     COLOR_YELLOW,  COLOR_YELLOW,  COLOR_WHITE },
-    { COLOR_BLUE,    COLOR_BLUE,    COLOR_CYAN,    COLOR_CYAN,    COLOR_WHITE },
-    { COLOR_GREEN,   COLOR_GREEN,   COLOR_GREEN,   COLOR_YELLOW,  COLOR_WHITE },
-    { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_WHITE },
+/*
+ * Themes — each is a 6-step ramp that doubles as both BODY tint and
+ * FIRE colour.  Bucket 0 is smoke/ash (always grey-ish), buckets 1-2
+ * are the dim "feather" colours of the perched owl, buckets 3-5 are
+ * the fire palette during BLAZE.  All entries sit in the bright half
+ * of the 256 cube per the CLAUDE.md "Theme Palette Brightness" rule.
+ */
+typedef struct {
+    const char *name;
+    short       heat[6];     /* cool → hot                              */
+    short       perch;        /* perch (branch) colour                   */
+} Theme;
+
+static const Theme g_themes[N_THEMES] = {
+    /* CLASSIC — brown owl, red/orange/yellow fire, white core. */
+    { "CLASSIC", { 244, 130, 166, 202, 214, 231 }, 94 },
+    /* IRIS    — purple/pink phoenix. */
+    { "IRIS   ", { 244,  96, 134, 170, 213, 231 }, 60 },
+    /* JADE    — green-jade phoenix. */
+    { "JADE   ", { 244,  28,  70, 112, 154, 231 }, 64 },
+    /* GOLD    — copper/gold phoenix. */
+    { "GOLD   ", { 244,  94, 130, 172, 214, 231 }, 94 },
 };
 
-static void color_init(int theme)
+static void color_init(int theme_idx)
 {
-    start_color(); use_default_colors();
-    int x256 = (COLORS >= 256);
-    for (int i = 0; i < 5; i++) {
-        short fg = x256 ? HEAT_256[theme][i] : HEAT_8[theme][i];
-        init_pair((short)(PAIR_HEAT_0 + i), fg, -1);
+    if (!has_colors()) return;
+    start_color();
+    use_default_colors();
+    const Theme *th = &g_themes[theme_idx % N_THEMES];
+
+    if (COLORS >= 256) {
+        init_pair(PAIR_HEAT_0, th->heat[0], -1);
+        init_pair(PAIR_HEAT_1, th->heat[1], -1);
+        init_pair(PAIR_HEAT_2, th->heat[2], -1);
+        init_pair(PAIR_HEAT_3, th->heat[3], -1);
+        init_pair(PAIR_HEAT_4, th->heat[4], -1);
+        init_pair(PAIR_HEAT_5, th->heat[5], -1);
+        init_pair(PAIR_PERCH,  th->perch,   -1);
+        init_pair(PAIR_HUD,    226,         -1);
+        init_pair(PAIR_HINT,    51,         -1);
+    } else {
+        init_pair(PAIR_HEAT_0, COLOR_WHITE,   -1);
+        init_pair(PAIR_HEAT_1, COLOR_RED,     -1);
+        init_pair(PAIR_HEAT_2, COLOR_RED,     -1);
+        init_pair(PAIR_HEAT_3, COLOR_YELLOW,  -1);
+        init_pair(PAIR_HEAT_4, COLOR_YELLOW,  -1);
+        init_pair(PAIR_HEAT_5, COLOR_WHITE,   -1);
+        init_pair(PAIR_PERCH,  COLOR_YELLOW,  -1);
+        init_pair(PAIR_HUD,    COLOR_YELLOW,  -1);
+        init_pair(PAIR_HINT,   COLOR_CYAN,    -1);
     }
-    init_pair(PAIR_HUD,  x256 ?  0 : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT, x256 ? 75 : COLOR_CYAN,  -1);
+}
+
+/* heat_attrs — map a per-particle temperature to (color pair, glyph,
+ * extra attributes).  Bucket 0 dim, buckets 1-3 normal, buckets 4-5
+ * bold so the white-hot core dominates.  Glyph density (sparser →
+ * denser) parallels heat (cool dot, bright fill char). */
+static void heat_attrs(float temp, short *pair, char *glyph, attr_t *attrs)
+{
+    static const char glyphs[6] = { '.', '+', '*', '#', '@', '%' };
+    int b = (int)floorf(temp * 6.0f);
+    if (b < 0) b = 0;
+    if (b > 5) b = 5;
+    *glyph = glyphs[b];
+    *pair  = (short)(PAIR_HEAT_0 + b);
+    *attrs = (b == 0) ? A_DIM : (b >= 4 ? A_BOLD : 0);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §4  random                                                              */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static float frand(void) { return (float)rand() / (float)RAND_MAX; }
-static float frand_signed(void) { return frand() * 2.0f - 1.0f; }
-
-static int heat_bucket(float t)
-{
-    int b = (int)(t * 4.99f);
-    if (b < 0) b = 0;
-    if (b > 4) b = 4;
-    return b;
-}
-
-static const char HEAT_GLYPH[5] = { '`', '.', '*', 'o', '#' };
+static float frand(void)         { return (float)rand() / (float)RAND_MAX; }
+static float frand_signed(void)  { return frand() * 2.f - 1.f; }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  anchor — body template                                              */
+/* §5  anchor — owl-shaped anchor template + alive_at radial wake          */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * Anchor type encodes role for animation:
- *   ANCHOR_BODY     — fixed offset from head (head, neck, body, tail)
- *   ANCHOR_WING_L   — left wing tip; flapping motion applied
- *   ANCHOR_WING_R   — right wing tip; flapping motion applied
- *   ANCHOR_TAIL     — trailing feather; sways with wing beat
+ * AnchorKind — region of the owl this anchor paints.  Used for setting
+ * weight (denser regions get more particles) and base_temp (PERCH
+ * temperature; eyes warmest, body coolest).
  */
-enum AnchorType {
-    AT_BODY = 0,
-    AT_WING_L,
-    AT_WING_R,
-    AT_TAIL,
-};
+typedef enum {
+    AK_HEAD = 0,    /* head outline             */
+    AK_BODY,        /* body outline + fill      */
+    AK_EYE,         /* eye centre               */
+    AK_BEAK,        /* beak                     */
+    AK_TUFT,        /* ear tuft                 */
+    N_AK,
+} AnchorKind;
 
 typedef struct {
-    float           dx, dy;     /* offset from head in body-local cells   */
-    float           wing_frac;  /* 0..1 — fraction of wing span used by   *
-                                 * this anchor (1.0 = wing tip)            */
-    enum AnchorType type;
-    int             weight;     /* particle-spawn weight                   */
+    float dx, dy;      /* body-local position (cells)                  */
+    float weight;      /* draw probability                              */
+    float base_temp;   /* PERCH temperature                             */
+    float alive_at;    /* REBIRTH wake threshold (0 = at seed, 1 = far) */
+    AnchorKind kind;
 } Anchor;
 
-/* Body template — head at (0,0), forward = +x, up = -y. Coordinates
- * are in cells. Wing anchors carry wing_frac from base (~0.2) to tip
- * (1.0) so we paint the whole wing in flame, not just the tip. */
-static const Anchor BODY_ANCHORS[] = {
-    /* head + neck + body axis (forward of head) */
-    { -1.0f,  0.0f, 0,      AT_BODY,    6 },     /* head                 */
-    { -2.5f, -0.5f, 0,      AT_BODY,    5 },     /* neck                 */
-    { -4.5f,  0.0f, 0,      AT_BODY,    8 },     /* breast               */
-    { -7.0f,  0.5f, 0,      AT_BODY,    6 },     /* mid-body             */
-    { -9.5f,  0.5f, 0,      AT_BODY,    4 },     /* lower body           */
-
-    /* tail feathers — trail behind, sway with wing beat */
-    {-12.0f,  0.0f, 0,      AT_TAIL,    4 },
-    {-13.5f, -1.5f, 0,      AT_TAIL,    3 },     /* upper tail feather   */
-    {-13.5f,  1.5f, 0,      AT_TAIL,    3 },     /* lower tail feather   */
-    {-15.0f,  0.0f, 0,      AT_TAIL,    2 },     /* tail tip             */
-
-    /* left wing — multiple anchors from shoulder to tip */
-    { -3.5f, -1.0f, 0.20f,  AT_WING_L,  4 },
-    { -4.5f, -2.5f, 0.45f,  AT_WING_L,  4 },
-    { -5.5f, -4.0f, 0.70f,  AT_WING_L,  3 },
-    { -7.0f, -5.0f, 1.00f,  AT_WING_L,  3 },     /* tip                  */
-    { -3.0f, -2.0f, 0.30f,  AT_WING_L,  3 },     /* leading edge         */
-    { -5.0f, -3.0f, 0.60f,  AT_WING_L,  3 },
-
-    /* right wing — mirror of left */
-    { -3.5f,  1.0f, 0.20f,  AT_WING_R,  4 },
-    { -4.5f,  2.5f, 0.45f,  AT_WING_R,  4 },
-    { -5.5f,  4.0f, 0.70f,  AT_WING_R,  3 },
-    { -7.0f,  5.0f, 1.00f,  AT_WING_R,  3 },
-    { -3.0f,  2.0f, 0.30f,  AT_WING_R,  3 },
-    { -5.0f,  3.0f, 0.60f,  AT_WING_R,  3 },
-};
-#define N_ANCHORS (int)(sizeof(BODY_ANCHORS) / sizeof(BODY_ANCHORS[0]))
-
-/* Compute total weight for weighted-random anchor selection. */
-static int anchor_total_weight(void)
+/*
+ * anchor_table_build — populate `out[]` with the owl silhouette.
+ * Returns the number of anchors written.
+ *
+ * Layout strategy: outline rings (head + body) for silhouette, plus
+ * high-weight feature anchors (eyes, beak, ear tufts).  Body fill
+ * anchors give the silhouette mass without making it solid white.
+ *
+ * After geometry, alive_at is normalised to [0,1] so REBIRTH can use
+ * it to grow the bird outward from the seed.
+ */
+static int anchor_table_build(Anchor *out)
 {
-    int s = 0;
-    for (int i = 0; i < N_ANCHORS; i++) s += BODY_ANCHORS[i].weight;
-    return s;
+    int idx = 0;
+
+    /* Head outline — 12 points around an ellipse.  A mid-density anchor
+     * count: enough to read as a curve, not so many that the eyes/beak
+     * are overwhelmed. */
+    for (int i = 0; i < 12; i++) {
+        float a = (float)i * (float)(2.0 * M_PI / 12.0);
+        out[idx].dx       = HEAD_RX * cosf(a);
+        out[idx].dy       = HEAD_CY + HEAD_RY * sinf(a);
+        out[idx].kind     = AK_HEAD;
+        out[idx].weight   = 1.4f;
+        out[idx].base_temp = 0.18f;
+        idx++;
+    }
+
+    /* Body outline — 14 points.  The body is taller than wide (stocky
+     * owl), so ry > rx. */
+    for (int i = 0; i < 14; i++) {
+        float a = (float)i * (float)(2.0 * M_PI / 14.0);
+        out[idx].dx       = BODY_RX * cosf(a);
+        out[idx].dy       = BODY_CY + BODY_RY * sinf(a);
+        out[idx].kind     = AK_BODY;
+        out[idx].weight   = 1.2f;
+        out[idx].base_temp = 0.16f;     /* darker than head */
+        idx++;
+    }
+
+    /* Body interior fill — a few low-weight anchors so the silhouette
+     * has visible mass, not just an outline.  Placed on a small inner
+     * ellipse. */
+    for (int i = 0; i < 5; i++) {
+        float a = (float)i * (float)(2.0 * M_PI / 5.0);
+        out[idx].dx       = (BODY_RX * 0.45f) * cosf(a);
+        out[idx].dy       = BODY_CY + (BODY_RY * 0.45f) * sinf(a);
+        out[idx].kind     = AK_BODY;
+        out[idx].weight   = 0.7f;
+        out[idx].base_temp = 0.14f;
+        idx++;
+    }
+
+    /* Eyes — two prominent feature anchors.  High weight + high
+     * base_temp so they always read as glowing pupils against the
+     * darker body. */
+    out[idx].dx = -EYE_DX; out[idx].dy = EYE_DY;
+    out[idx].kind = AK_EYE; out[idx].weight = 5.0f; out[idx].base_temp = 0.55f;
+    idx++;
+    out[idx].dx =  EYE_DX; out[idx].dy = EYE_DY;
+    out[idx].kind = AK_EYE; out[idx].weight = 5.0f; out[idx].base_temp = 0.55f;
+    idx++;
+
+    /* Beak — one anchor below + between the eyes. */
+    out[idx].dx = 0.f; out[idx].dy = BEAK_DY;
+    out[idx].kind = AK_BEAK; out[idx].weight = 2.0f; out[idx].base_temp = 0.40f;
+    idx++;
+
+    /* Ear tufts — pointed tips above the head.  Two anchors.  Very
+     * recognisable owl feature. */
+    out[idx].dx = -EARTUFT_DX; out[idx].dy = EARTUFT_DY;
+    out[idx].kind = AK_TUFT; out[idx].weight = 1.5f; out[idx].base_temp = 0.22f;
+    idx++;
+    out[idx].dx =  EARTUFT_DX; out[idx].dy = EARTUFT_DY;
+    out[idx].kind = AK_TUFT; out[idx].weight = 1.5f; out[idx].base_temp = 0.22f;
+    idx++;
+
+    /* Compute alive_at — normalised distance from seed.  REBIRTH uses
+     * this so the bird grows back from the head centre outward; eyes
+     * (close to seed) reappear first, ear tufts (far) last. */
+    float max_d = 0.f;
+    for (int i = 0; i < idx; i++) {
+        float ddx = out[i].dx - SEED_DX;
+        float ddy = out[i].dy - SEED_DY;
+        float d   = sqrtf(ddx * ddx + ddy * ddy);
+        if (d > max_d) max_d = d;
+    }
+    if (max_d < 0.001f) max_d = 1.f;
+    for (int i = 0; i < idx; i++) {
+        float ddx = out[i].dx - SEED_DX;
+        float ddy = out[i].dy - SEED_DY;
+        float d   = sqrtf(ddx * ddx + ddy * ddy);
+        out[i].alive_at = d / max_d;
+    }
+
+    return idx;
 }
 
-/* Pick a random anchor index by weight. */
-static int anchor_pick(int total)
+/* anchor_pick — weighted-random anchor index over ALL anchors. */
+static int anchor_pick(const Anchor *anch, int n)
 {
-    int r = rand() % total;
-    for (int i = 0; i < N_ANCHORS; i++) {
-        r -= BODY_ANCHORS[i].weight;
-        if (r < 0) return i;
+    float total = 0.f;
+    for (int i = 0; i < n; i++) total += anch[i].weight;
+    float r = frand() * total;
+    float acc = 0.f;
+    for (int i = 0; i < n; i++) {
+        acc += anch[i].weight;
+        if (r <= acc) return i;
     }
-    return 0;
+    return n - 1;
+}
+
+/* anchor_pick_alive — weighted-random over anchors with alive_at <=
+ * growth_frac (used during REBIRTH).  Returns -1 if none alive. */
+static int anchor_pick_alive(const Anchor *anch, int n, float growth_frac)
+{
+    float total = 0.f;
+    for (int i = 0; i < n; i++)
+        if (anch[i].alive_at <= growth_frac) total += anch[i].weight;
+    if (total <= 0.f) return -1;
+    float r = frand() * total;
+    float acc = 0.f;
+    int last_alive = -1;
+    for (int i = 0; i < n; i++) {
+        if (anch[i].alive_at <= growth_frac) {
+            last_alive = i;
+            acc += anch[i].weight;
+            if (r <= acc) return i;
+        }
+    }
+    return last_alive;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  particle                                                            */
+/* §6  body — particle, BOUND/FREE, tick + draw                            */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    float x, y;          /* world cell coords                            */
+    float vx, vy;        /* used while FREE (released)                   */
+    float temp;          /* drives heat-ramp bucket                      */
+    int   anchor_idx;    /* current anchor, when BOUND                   */
+    bool  released;      /* false = BOUND, true = FREE                   */
+} BodyParticle;
+
+/*
+ * body_rebind_to — set particle position to anchor world pos + jitter,
+ * record anchor index, mark BOUND.  Caller chooses the anchor so this
+ * works for both unrestricted (PERCH/IGNITE/BLAZE) and alive-only
+ * (REBIRTH) bind paths.
+ */
+static void body_rebind_to(BodyParticle *p, const Anchor *anch, int idx,
+                           float ox, float oy, float bob)
+{
+    p->anchor_idx = idx;
+    float ax = ox + anch[idx].dx * ASPECT_X;
+    float ay = oy + anch[idx].dy + bob;
+    p->x = ax + frand_signed() * BODY_JITTER_R * ASPECT_X;
+    p->y = ay + frand_signed() * BODY_JITTER_R;
+    p->released = false;
+}
+
+/*
+ * body_release — convert a BOUND particle to FREE.  Initial velocity
+ * is mostly downward (the bird is collapsing onto the perch) with
+ * lateral spread and an upward random component (some embers fly up
+ * even as the silhouette falls).
+ *
+ * Position is left at its current value (just snapped from rebind),
+ * temperature is preserved so the released particle starts hot and
+ * cools naturally — a sudden temp drop on release would look like
+ * teleportation rather than disintegration.
+ */
+static void body_release(BodyParticle *p)
+{
+    p->released = true;
+    p->vx = frand_signed() * COLLAPSE_VEL_LATERAL;
+    /* y velocity: mostly down, with random component that occasionally
+     * sends a piece upward — visually "embers escaping the collapse". */
+    p->vy = COLLAPSE_VEL_DOWN + frand_signed() * COLLAPSE_VEL_UPVAR;
+}
+
+/*
+ * fire_step — one integration step of the free-flight fire physics.
+ * Used by FREE body particles AND by sparks.  Same buoyancy + sin-shear
+ * + drag + cooling formulas as fire_tornado.c / volcano.c.
+ */
+static void fire_step(float *x, float *y, float *vx, float *vy, float *temp,
+                      float dt, float t)
+{
+    /* Turbulence — sine-shear field, position-dependent so neighbours
+     * get different forces (otherwise the column sways as a block). */
+    float shx = sinf(FIRE_SHEAR_HZ * t + 0.30f * (*x) + 0.45f * (*y));
+    float shy = cosf(FIRE_SHEAR_HZ * t + 0.45f * (*x) - 0.30f * (*y));
+    *vx += FIRE_SHEAR_AMP * shx * dt;
+    *vy += FIRE_SHEAR_AMP * shy * dt * 0.6f;
+
+    /* Buoyancy (negative y = up).  Smoke (low temp) keeps a small floor
+     * lift so wisps drift up. */
+    float lift = FIRE_BUOYANCY * (0.20f + 0.80f * (*temp));
+    *vy -= lift * dt;
+
+    /* Drag — multiplicative velocity damping. */
+    float k = 1.f - FIRE_DRAG * dt;
+    if (k < 0.f) k = 0.f;
+    *vx *= k;
+    *vy *= k;
+
+    /* Integrate. */
+    *x += *vx * dt;
+    *y += *vy * dt;
+
+    /* Cooling — exponential. */
+    *temp *= expf(-FIRE_COOL * dt);
+    if (*temp < 0.f) *temp = 0.f;
+}
+
+static void body_draw(const BodyParticle *p, int rows, int cols)
+{
+    int cx = (int)lroundf(p->x);
+    int cy = (int)lroundf(p->y);
+    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+
+    short  pair;
+    char   gl;
+    attr_t at;
+    heat_attrs(p->temp, &pair, &gl, &at);
+    attron(COLOR_PAIR(pair) | at);
+    mvaddch(cy, cx, (chtype)(unsigned char)gl);
+    attroff(COLOR_PAIR(pair) | at);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §7  spark — pure free-flight ember pool                                 */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
     float x, y;
     float vx, vy;
     float temp;
-    int   anchor_idx;     /* during bound phases: which anchor we follow   */
-    int   alive;
-} Particle;
+    float life;
+    bool  active;
+} Spark;
 
-static void particle_draw(const Particle *p, int rows, int cols)
+/*
+ * spark_emit — one new spark at (sx,sy), with mostly-upward velocity
+ * (sparks rise from a fire) plus lateral spread.  Life and temp
+ * randomised so the resulting trail isn't striped.
+ */
+static void spark_emit(Spark *s, float sx, float sy)
 {
-    if (!p->alive) return;
-    int sr = (int)p->y, sc = (int)p->x;
-    if (sr < 0 || sr >= rows - 1 || sc < 0 || sc >= cols) return;
-    int bucket = heat_bucket(p->temp);
-    attron(COLOR_PAIR(PAIR_HEAT_0 + bucket) | A_BOLD);
-    mvaddch(sr, sc, (chtype)(unsigned char)HEAT_GLYPH[bucket]);
-    attroff(COLOR_PAIR(PAIR_HEAT_0 + bucket) | A_BOLD);
+    float speed   = SPARK_VEL_BASE * (1.f + SPARK_VEL_VAR * frand_signed());
+    float ang     = (float)(-M_PI / 2.0)               /* up */
+                  + frand_signed() * 0.7f;             /* ±~40° */
+    s->x          = sx + frand_signed() * 0.6f;
+    s->y          = sy + frand_signed() * 0.4f;
+    s->vx         = cosf(ang) * speed;
+    s->vy         = sinf(ang) * speed - SPARK_VEL_UP;
+    s->temp       = SPARK_TEMP_INIT + frand_signed() * SPARK_TEMP_VAR;
+    if (s->temp > 1.f) s->temp = 1.f;
+    if (s->temp < 0.f) s->temp = 0.f;
+    s->life       = SPARK_LIFE_BASE * (1.f + SPARK_LIFE_VAR * frand_signed());
+    s->active     = true;
+}
+
+static void spark_tick(Spark *s, float dt, float t)
+{
+    if (!s->active) return;
+    fire_step(&s->x, &s->y, &s->vx, &s->vy, &s->temp, dt, t);
+    s->life -= dt;
+    if (s->life <= 0.f || s->temp <= FIRE_TEMP_FLOOR) s->active = false;
+}
+
+static void spark_draw(const Spark *s, int rows, int cols)
+{
+    if (!s->active) return;
+    int cx = (int)lroundf(s->x);
+    int cy = (int)lroundf(s->y);
+    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+
+    short  pair;
+    char   gl;
+    attr_t at;
+    heat_attrs(s->temp, &pair, &gl, &at);
+    attron(COLOR_PAIR(pair) | at);
+    mvaddch(cy, cx, (chtype)(unsigned char)gl);
+    attroff(COLOR_PAIR(pair) | at);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  phoenix                                                             */
+/* §8  phoenix — state, lifecycle FSM, emission                            */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-enum Phase { PH_FLY, PH_DIE, PH_ASH, PH_BIRTH };
+typedef enum {
+    PHX_PERCH = 0,
+    PHX_IGNITE,
+    PHX_BLAZE,
+    PHX_COLLAPSE,
+    PHX_ASH,
+    PHX_REBIRTH,
+    N_PHX_PHASES,
+} PhoenixPhase;
 
 typedef struct {
-    Particle parts[N_PART_MAX];
-    int      n;
+    /* Pose. */
+    float ox, oy;                /* world centre of owl                  */
+    float perch_y;               /* perch row                             */
 
-    /* Head trajectory. */
-    float head_x;
-    float head_y;
-    float dir;             /* +1 right, -1 left                          */
+    /* Time / state. */
+    float world_t;
+    float phase_t;
+    PhoenixPhase phase;
 
-    /* Knobs. */
-    float flight_speed;
-    float wing_span;
+    /* Anchors (built once at init). */
+    Anchor anchors[N_ANCHOR_MAX];
+    int    n_anchor;
 
-    /* Lifecycle FSM. */
-    enum Phase phase;
-    float      phase_time;
-    float      world_time;
+    /* Pools. */
+    BodyParticle body[N_BODY_MAX];
+    int          n_body;
+    Spark        sparks[N_SPARK_MAX];
+    int          n_spark;
 
-    int   theme;
-    int   paused;
+    /* Spark emission accumulator. */
+    float spark_emit_acc;
 } Phoenix;
 
-/*
- * anchor_world — given anchor index, head position, dir, wing_span and
- * world time, compute the anchor's world position. Wing anchors have
- * an additional flap term scaled by wing_frac and dir (the bird mirrors
- * y-flip when flying right-to-left).
- */
-static void anchor_world(const Phoenix *ph, int idx, float *out_x, float *out_y)
-{
-    const Anchor *a = &BODY_ANCHORS[idx];
-    float dx = a->dx;
-    float dy = a->dy;
-
-    /* Wing span scaling — multiply the y component for wing anchors. */
-    if (a->type == AT_WING_L || a->type == AT_WING_R)
-        dy *= ph->wing_span / WING_SPAN_DEFAULT;
-
-    /* Wing flap. Sinusoid in time, scaled by wing_frac. Left/right
-     * wings flap in phase (both up, both down), as real birds do. */
-    if (a->type == AT_WING_L || a->type == AT_WING_R) {
-        float flap = sinf(ph->world_time * 2.0f * (float)M_PI * WING_FLAP_HZ);
-        dy += flap * WING_FLAP_AMP * a->wing_frac
-            * (a->type == AT_WING_L ? -1.0f : 1.0f);
-    }
-
-    /* Head bob with wing beat. */
-    float bob = sinf(ph->world_time * 2.0f * (float)M_PI * WING_FLAP_HZ);
-    dy += bob * HEAD_BOB_AMP * 0.3f;
-
-    /* Mirror x when flying left (head → tail goes right instead). */
-    *out_x = ph->head_x + dx * (-ph->dir) * ASPECT_X;
-    *out_y = ph->head_y + dy;
-}
-
-/*
- * particle_bind — set particle position to a small jitter around the
- * given anchor's world position. Used during FLY and BIRTH (partial).
- *
- * Temperature varies by body part so the heat ramp is visible across
- * the bird, not uniformly white:
- *   wing tips    → bucket 4  (white-hot)
- *   wing base    → bucket 2  (mid heat)
- *   body         → bucket 2-3
- *   tail         → bucket 1-2 (red/orange)
- * This is what makes 't' theme cycling visible — different heat
- * buckets show theme colours.
- */
-static void particle_bind(Particle *p, const Phoenix *ph)
-{
-    float ax, ay;
-    anchor_world(ph, p->anchor_idx, &ax, &ay);
-    p->x  = ax + frand_signed() * JITTER_R * ASPECT_X;
-    p->y  = ay + frand_signed() * JITTER_R;
-    p->vx = 0;
-    p->vy = 0;
-
-    enum AnchorType type = BODY_ANCHORS[p->anchor_idx].type;
-    float base_t;
-    if (type == AT_WING_L || type == AT_WING_R) {
-        /* Wing tips white, roots cooler — wing_frac=1.0 → 0.95,
-         * wing_frac=0.20 → 0.51. */
-        base_t = 0.45f + 0.50f * BODY_ANCHORS[p->anchor_idx].wing_frac;
-    } else if (type == AT_BODY) {
-        base_t = 0.55f;
-    } else { /* AT_TAIL */
-        base_t = 0.35f;
-    }
-    p->temp = base_t + 0.10f * (frand() - 0.5f);
-    if (p->temp < 0.10f) p->temp = 0.10f;
-    if (p->temp > 1.00f) p->temp = 1.00f;
-    p->alive = 1;
-}
-
-static void phoenix_reset(Phoenix *ph, int rows, int cols)
-{
-    (void)cols;
-    int total_w = anchor_total_weight();
-    for (int i = 0; i < ph->n; i++) {
-        ph->parts[i].anchor_idx = anchor_pick(total_w);
-        ph->parts[i].alive = 1;
-    }
-    ph->head_x = -10.0f;                          /* start off-screen left */
-    ph->head_y = (float)rows / 3.0f;
-    ph->dir    = 1.0f;
-    ph->phase  = PH_FLY;
-    ph->phase_time = 0.0f;
-    ph->world_time = 0.0f;
-    /* Seed positions immediately so frame 0 isn't a black flash. */
-    for (int i = 0; i < ph->n; i++) particle_bind(&ph->parts[i], ph);
-}
-
-/*
- * phoenix_tick — drive particle motion based on the current phase.
- *
- *   FLY   — head advances along dir; particles continuously rebind to
- *           anchors (bird is drawn fresh each frame).
- *   DIE   — head decelerates; particles stay bound but jitter shrinks.
- *   ASH   — particles released; gravity + cooling. Head fixed.
- *   BIRTH — head moves to start position; particles fade in by gradually
- *           rebinding to anchors with rising temp.
- */
-static void phoenix_tick(Phoenix *ph, float dt, int rows, int cols)
-{
-    ph->world_time += dt;
-    ph->phase_time += dt;
-
-    int total_w = anchor_total_weight();
-
-    switch (ph->phase) {
-    case PH_FLY: {
-        /* Head moves; vertical sinusoid for soaring feel. */
-        ph->head_x += ph->flight_speed * ph->dir * dt;
-        ph->head_y  = (float)rows / 3.0f
-                    + sinf(ph->world_time * FLIGHT_FREQ) * FLIGHT_AMP;
-        /* Rebind every particle every frame. */
-        for (int i = 0; i < ph->n; i++) {
-            if (frand() < 0.4f)  /* refresh anchor occasionally */
-                ph->parts[i].anchor_idx = anchor_pick(total_w);
-            particle_bind(&ph->parts[i], ph);
-        }
-        if (ph->phase_time >= T_FLY) {
-            ph->phase = PH_DIE;
-            ph->phase_time = 0.0f;
-        }
-        break;
-    }
-    case PH_DIE: {
-        /* Slow to a halt at screen centre. */
-        float slow = 1.0f - (ph->phase_time / T_DIE);
-        if (slow < 0) slow = 0;
-        ph->head_x += ph->flight_speed * ph->dir * dt * slow;
-        ph->head_y  = (float)rows / 3.0f
-                    + sinf(ph->world_time * FLIGHT_FREQ) * FLIGHT_AMP * slow;
-        /* Particles still bound, jitter shrinking, intensity rising. */
-        for (int i = 0; i < ph->n; i++) {
-            float ax, ay;
-            anchor_world(ph, ph->parts[i].anchor_idx, &ax, &ay);
-            float r = JITTER_R * (0.5f + 0.5f * slow);
-            ph->parts[i].x = ax + frand_signed() * r * ASPECT_X;
-            ph->parts[i].y = ay + frand_signed() * r;
-            ph->parts[i].temp = 0.95f + 0.05f * frand();
-            ph->parts[i].alive = 1;
-        }
-        if (ph->phase_time >= T_DIE) {
-            /* Burst — release particles with outward radial velocity. */
-            for (int i = 0; i < ph->n; i++) {
-                Particle *p = &ph->parts[i];
-                float dx = p->x - ph->head_x;
-                float dy = p->y - ph->head_y;
-                float l  = sqrtf(dx * dx + dy * dy);
-                if (l < 1e-3f) { dx = frand_signed(); dy = frand_signed(); l = 1.0f; }
-                float speed = 6.0f + frand() * 14.0f;
-                p->vx = dx / l * speed * ASPECT_X;
-                p->vy = dy / l * speed * 0.7f;
-                p->temp = 1.0f;
-            }
-            ph->phase = PH_ASH;
-            ph->phase_time = 0.0f;
-        }
-        break;
-    }
-    case PH_ASH: {
-        /* Free flight + gravity + cool. */
-        for (int i = 0; i < ph->n; i++) {
-            Particle *p = &ph->parts[i];
-            p->vy += GRAVITY_ASH * dt;
-            p->x  += p->vx * dt;
-            p->y  += p->vy * dt;
-            p->temp -= COOL_RATE_ASH * dt;
-            if (p->temp <= 0 || p->y >= rows - 1) p->alive = 0;
-        }
-        if (ph->phase_time >= T_ASH) {
-            /* Reset for BIRTH at the opposite edge. */
-            ph->dir    = -ph->dir;
-            ph->head_x = (ph->dir > 0) ? -8.0f : (float)(cols + 8);
-            ph->head_y = (float)rows / 3.0f;
-            for (int i = 0; i < ph->n; i++) {
-                ph->parts[i].anchor_idx = anchor_pick(total_w);
-                ph->parts[i].alive = 0;
-                ph->parts[i].temp  = 0.0f;
-            }
-            ph->phase = PH_BIRTH;
-            ph->phase_time = 0.0f;
-        }
-        break;
-    }
-    case PH_BIRTH: {
-        /* Particles fade in over time; bind incrementally. */
-        float t = ph->phase_time / T_BIRTH;
-        if (t > 1.0f) t = 1.0f;
-        int n_active = (int)(t * ph->n);
-        for (int i = 0; i < ph->n; i++) {
-            if (i < n_active) {
-                if (!ph->parts[i].alive) {
-                    ph->parts[i].anchor_idx = anchor_pick(total_w);
-                    particle_bind(&ph->parts[i], ph);
-                } else {
-                    particle_bind(&ph->parts[i], ph);
-                }
-            } else {
-                ph->parts[i].alive = 0;
-            }
-        }
-        if (ph->phase_time >= T_BIRTH) {
-            ph->phase = PH_FLY;
-            ph->phase_time = 0.0f;
-        }
-        break;
-    }
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static const char *phase_name(enum Phase p)
+static const char *phase_name(PhoenixPhase p)
 {
     switch (p) {
-        case PH_FLY:   return "FLY  ";
-        case PH_DIE:   return "DIE  ";
-        case PH_ASH:   return "ASH  ";
-        case PH_BIRTH: return "BIRTH";
+    case PHX_PERCH:    return "PERCH   ";
+    case PHX_IGNITE:   return "IGNITE  ";
+    case PHX_BLAZE:    return "BLAZE   ";
+    case PHX_COLLAPSE: return "COLLAPSE";
+    case PHX_ASH:      return "ASH     ";
+    case PHX_REBIRTH:  return "REBIRTH ";
+    default:           return "?       ";
     }
-    return "?";
 }
 
-static void scene_draw(int rows, int cols, const Phoenix *ph, double fps)
+static float phase_duration(PhoenixPhase p)
+{
+    switch (p) {
+    case PHX_PERCH:    return T_PERCH;
+    case PHX_IGNITE:   return T_IGNITE;
+    case PHX_BLAZE:    return T_BLAZE;
+    case PHX_COLLAPSE: return T_COLLAPSE;
+    case PHX_ASH:      return T_ASH;
+    case PHX_REBIRTH:  return T_REBIRTH;
+    default:           return 1.f;
+    }
+}
+
+static float spark_hz_for_phase(PhoenixPhase p)
+{
+    switch (p) {
+    case PHX_PERCH:    return SPARK_HZ_PERCH;
+    case PHX_IGNITE:   return SPARK_HZ_IGNITE;
+    case PHX_BLAZE:    return SPARK_HZ_BLAZE;
+    case PHX_COLLAPSE: return SPARK_HZ_COLLAPSE;
+    case PHX_ASH:      return SPARK_HZ_ASH;
+    case PHX_REBIRTH:  return SPARK_HZ_REBIRTH;
+    default:           return 0.f;
+    }
+}
+
+/* Compute the per-frame BOUND temperature for a body particle, given
+ * the anchor's base_temp and the current phase + phase fraction.
+ * This is where each phase's "temperament" lives — see the MENTAL
+ * MODEL "phase temp modifier" section. */
+static float bound_temp(PhoenixPhase phase, float frac, float base_temp,
+                        float alive_at)
+{
+    switch (phase) {
+    case PHX_PERCH:
+        return base_temp + frand_signed() * 0.05f;
+    case PHX_IGNITE: {
+        /* Linearly blend from base_temp toward 1.0.  At frac=1 the bird
+         * is fully ignited (white-hot); at frac=0 it's still itself. */
+        float t = base_temp + (1.0f - base_temp) * frac;
+        return t + frand_signed() * 0.05f;
+    }
+    case PHX_BLAZE:
+        return BLAZE_TEMP_MIN + (BLAZE_TEMP_MAX - BLAZE_TEMP_MIN) * frand();
+    case PHX_COLLAPSE: {
+        float t = COLLAPSE_TEMP_HOT
+                + (COLLAPSE_TEMP_COOL - COLLAPSE_TEMP_HOT) * frac;
+        return t + frand_signed() * 0.05f;
+    }
+    case PHX_REBIRTH: {
+        /* Centre anchors hot (alive_at small), edges cooler.  Particles
+         * entering at the seed are bright white; later, periphery binds
+         * at moderate heat.  Inner cluster reads "hot core, cooling
+         * outward" as the bird grows. */
+        float t = 0.95f - 0.30f * alive_at;
+        return t + frand_signed() * 0.05f;
+    }
+    default:
+        return base_temp;
+    }
+}
+
+/*
+ * phoenix_init — build anchors, place owl at the screen centre slightly
+ * above the perch, distribute body particles to anchors with valid
+ * initial state.  Sparks all inactive.
+ */
+static void phoenix_init(Phoenix *p, int rows, int cols, int n_body, int n_spark)
+{
+    memset(p, 0, sizeof *p);
+    p->ox       = (float)cols * 0.5f;
+    p->oy       = (float)rows * 0.45f;
+    p->perch_y  = (float)rows * 0.45f + (BODY_CY + BODY_RY + 1.0f);
+    p->phase    = PHX_PERCH;
+    p->n_body   = n_body;
+    p->n_spark  = n_spark;
+    p->n_anchor = anchor_table_build(p->anchors);
+
+    /* Initial bind so frame 0 is already an owl, not a smear. */
+    for (int i = 0; i < p->n_body; i++) {
+        int idx = anchor_pick(p->anchors, p->n_anchor);
+        body_rebind_to(&p->body[i], p->anchors, idx, p->ox, p->oy, 0.f);
+        p->body[i].temp = p->anchors[idx].base_temp;
+        p->body[i].vx = p->body[i].vy = 0.f;
+    }
+    for (int i = 0; i < p->n_spark; i++) p->sparks[i].active = false;
+    p->spark_emit_acc = 0.f;
+}
+
+static void phoenix_reset(Phoenix *p, int rows, int cols)
+{
+    int nb = p->n_body, ns = p->n_spark;
+    phoenix_init(p, rows, cols, nb, ns);
+}
+
+static void phoenix_resize(Phoenix *p, int rows, int cols)
+{
+    p->ox      = (float)cols * 0.5f;
+    p->oy      = (float)rows * 0.45f;
+    p->perch_y = (float)rows * 0.45f + (BODY_CY + BODY_RY + 1.0f);
+}
+
+/* phoenix_advance_phase — phase_t exceeded duration; advance state.
+ * Special: REBIRTH→PERCH snaps any still-FREE body particles back to
+ * their nearest anchor so the next PERCH frame is a complete owl, not
+ * a half-rebuilt one. */
+static void phoenix_advance_phase(Phoenix *p)
+{
+    p->phase_t = 0.f;
+    p->phase   = (PhoenixPhase)((int)(p->phase + 1) % N_PHX_PHASES);
+
+    if (p->phase == PHX_PERCH) {
+        for (int i = 0; i < p->n_body; i++) {
+            if (p->body[i].released) {
+                int idx = anchor_pick(p->anchors, p->n_anchor);
+                body_rebind_to(&p->body[i], p->anchors, idx, p->ox, p->oy, 0.f);
+                p->body[i].temp = p->anchors[idx].base_temp;
+                p->body[i].vx = p->body[i].vy = 0.f;
+            }
+        }
+    }
+    if (p->phase == PHX_REBIRTH) {
+        /* Force every body particle to FREE so the rebuild works from
+         * a clean slate (any still-bound stragglers from COLLAPSE end
+         * would otherwise look like leftover ghost owl). */
+        for (int i = 0; i < p->n_body; i++) {
+            if (!p->body[i].released) {
+                p->body[i].released = true;
+                /* Inherit current position; assign small drift. */
+                p->body[i].vx = frand_signed() * 1.5f;
+                p->body[i].vy = -1.0f + frand_signed() * 0.8f;
+            }
+        }
+    }
+}
+
+/*
+ * phoenix_tick_body — per-body-particle update.
+ *
+ * Consults the FSM to decide BOUND vs FREE for this frame, then either
+ * rebinds (BOUND path) or integrates fire physics (FREE path).
+ *
+ * COLLAPSE is the most subtle: each frame, every still-BOUND particle
+ * has a small chance to flip to FREE.  Probability is frac · rate · dt
+ * so the release rate accelerates through the phase.  By end of
+ * COLLAPSE, virtually all particles are FREE.
+ *
+ * REBIRTH inverts: every still-FREE particle has a chance per frame
+ * to capture onto an alive anchor.  Capture is gated by alive_at <
+ * growth_frac (anchor must be "awake"); particles that fail to find
+ * an alive anchor stay FREE another frame.
+ */
+static void phoenix_tick_body(Phoenix *p, float dt, float bob)
+{
+    float frac = p->phase_t / phase_duration(p->phase);
+    if (frac > 1.f) frac = 1.f;
+
+    for (int i = 0; i < p->n_body; i++) {
+        BodyParticle *b = &p->body[i];
+
+        switch (p->phase) {
+        case PHX_PERCH:
+        case PHX_IGNITE:
+        case PHX_BLAZE: {
+            /* Always BOUND, full anchor pool. */
+            int idx = anchor_pick(p->anchors, p->n_anchor);
+            body_rebind_to(b, p->anchors, idx, p->ox, p->oy, bob);
+            b->temp = bound_temp(p->phase, frac,
+                                 p->anchors[idx].base_temp,
+                                 p->anchors[idx].alive_at);
+            break;
+        }
+
+        case PHX_COLLAPSE:
+            if (!b->released) {
+                /* Probabilistic release.  Higher frac → more likely. */
+                if (frand() < frac * COLLAPSE_RELEASE_RATE * dt) {
+                    body_release(b);
+                } else {
+                    int idx = anchor_pick(p->anchors, p->n_anchor);
+                    body_rebind_to(b, p->anchors, idx, p->ox, p->oy, bob);
+                    b->temp = bound_temp(PHX_COLLAPSE, frac,
+                                         p->anchors[idx].base_temp,
+                                         p->anchors[idx].alive_at);
+                }
+            }
+            if (b->released) {
+                fire_step(&b->x, &b->y, &b->vx, &b->vy, &b->temp,
+                          dt, p->world_t);
+            }
+            break;
+
+        case PHX_ASH:
+            /* Force FREE.  If somehow still bound, release with small
+             * upward velocity (these are smouldering wisps).  */
+            if (!b->released) {
+                b->released = true;
+                b->vx = frand_signed() * 1.0f;
+                b->vy = -0.5f + frand_signed() * 0.8f;
+            }
+            fire_step(&b->x, &b->y, &b->vx, &b->vy, &b->temp,
+                      dt, p->world_t);
+            break;
+
+        case PHX_REBIRTH: {
+            float growth = frac;
+            if (!b->released) {
+                /* A bound straggler — keep bound to alive anchor or do
+                 * nothing if none alive.  Almost never hit because
+                 * advance_phase forces all to FREE on REBIRTH entry. */
+                int idx = anchor_pick_alive(p->anchors, p->n_anchor, growth);
+                if (idx >= 0) {
+                    body_rebind_to(b, p->anchors, idx, p->ox, p->oy, bob);
+                    b->temp = bound_temp(PHX_REBIRTH, frac,
+                                         p->anchors[idx].base_temp,
+                                         p->anchors[idx].alive_at);
+                }
+            } else {
+                /* FREE: try to capture each frame. */
+                if (frand() < REBIRTH_CAPTURE_RATE * dt) {
+                    int idx = anchor_pick_alive(p->anchors, p->n_anchor,
+                                                growth);
+                    if (idx >= 0) {
+                        body_rebind_to(b, p->anchors, idx, p->ox, p->oy, bob);
+                        b->temp = bound_temp(PHX_REBIRTH, frac,
+                                             p->anchors[idx].base_temp,
+                                             p->anchors[idx].alive_at);
+                    } else {
+                        fire_step(&b->x, &b->y, &b->vx, &b->vy, &b->temp,
+                                  dt, p->world_t);
+                    }
+                } else {
+                    fire_step(&b->x, &b->y, &b->vx, &b->vy, &b->temp,
+                              dt, p->world_t);
+                }
+            }
+            break;
+        }
+
+        default: break;
+        }
+    }
+}
+
+/*
+ * phoenix_tick_sparks — emit sparks from random anchors at the rate
+ * dictated by the current phase, then integrate every active spark.
+ */
+static void phoenix_tick_sparks(Phoenix *p, float dt)
+{
+    float hz = spark_hz_for_phase(p->phase);
+    p->spark_emit_acc += dt * hz;
+    int to_emit = (int)p->spark_emit_acc;
+    p->spark_emit_acc -= (float)to_emit;
+    if (to_emit > SPARK_BURST_MAX) to_emit = SPARK_BURST_MAX;
+
+    int emitted = 0;
+    for (int i = 0; i < p->n_spark && emitted < to_emit; i++) {
+        if (p->sparks[i].active) continue;
+        int idx = anchor_pick(p->anchors, p->n_anchor);
+        float sx = p->ox + p->anchors[idx].dx * ASPECT_X;
+        float sy = p->oy + p->anchors[idx].dy;
+        spark_emit(&p->sparks[i], sx, sy);
+        emitted++;
+    }
+
+    for (int i = 0; i < p->n_spark; i++)
+        spark_tick(&p->sparks[i], dt, p->world_t);
+}
+
+/*
+ * phoenix_tick — top-level update.  Advance time, advance phase, then
+ * step body and sparks.  Body bob is a slow vertical breath so even
+ * the perched owl looks alive.
+ */
+static void phoenix_tick(Phoenix *p, float dt)
+{
+    p->world_t += dt;
+    p->phase_t += dt;
+
+    if (p->phase_t >= phase_duration(p->phase))
+        phoenix_advance_phase(p);
+
+    /* Breath bob — only obvious during PERCH but harmless during
+     * fire phases (the rebind absorbs the small offset). */
+    float bob = (p->phase == PHX_PERCH)
+              ? sinf(p->world_t * (float)(2.0 * M_PI) * BREATH_HZ) * BREATH_AMP
+              : 0.f;
+
+    phoenix_tick_body(p, dt, bob);
+    phoenix_tick_sparks(p, dt);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §9  scene — composition + perch + HUD                                   */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int   rows, cols;
+    Phoenix phx;
+    int   theme;
+    bool  paused;
+    float fps;
+} Scene;
+
+static void scene_init(Scene *s, int rows, int cols)
+{
+    memset(s, 0, sizeof *s);
+    s->rows = rows;
+    s->cols = cols;
+    phoenix_init(&s->phx, rows, cols, N_BODY_DEFAULT, N_SPARK_DEFAULT);
+}
+
+static void scene_resize(Scene *s, int rows, int cols)
+{
+    s->rows = rows;
+    s->cols = cols;
+    phoenix_resize(&s->phx, rows, cols);
+}
+
+static void scene_tick(Scene *s, float dt)
+{
+    if (s->paused) return;
+    phoenix_tick(&s->phx, dt);
+}
+
+/*
+ * draw_perch — static branch under the bird, dim themed brown.
+ * Length ≈ body width + padding, plus two short "leg" anchors below
+ * to suggest depth.  Drawn before particles so the bird can sit on it.
+ */
+static void draw_perch(const Scene *s)
+{
+    int row = (int)lroundf(s->phx.perch_y);
+    if (row < 0 || row >= s->rows) return;
+    int half = (int)(BODY_RX * ASPECT_X) + 4;
+    int cx   = (int)lroundf(s->phx.ox);
+    int x0   = cx - half;
+    int x1   = cx + half;
+    if (x0 < 0)        x0 = 0;
+    if (x1 >= s->cols) x1 = s->cols - 1;
+
+    attron(COLOR_PAIR(PAIR_PERCH) | A_BOLD);
+    for (int x = x0; x <= x1; x++)
+        mvaddch(row, x, (chtype)(unsigned char)'-');
+    /* End caps: slight upturn so it looks like a branch, not a beam. */
+    if (x0 - 1 >= 0)        mvaddch(row, x0 - 1,
+                                    (chtype)(unsigned char)'/');
+    if (x1 + 1 <  s->cols)  mvaddch(row, x1 + 1,
+                                    (chtype)(unsigned char)'\\');
+    /* Drop strut so it grounds visually. */
+    if (row + 1 < s->rows)
+        mvaddch(row + 1, cx, (chtype)(unsigned char)'|');
+    attroff(COLOR_PAIR(PAIR_PERCH) | A_BOLD);
+}
+
+/*
+ * scene_draw — render order: perch → body (BOUND first, then FREE) →
+ * sparks → HUD.  Drawing BOUND before FREE ensures fire that's flying
+ * over the silhouette doesn't get overwritten by a re-snap below it.
+ */
+static void scene_draw(const Scene *s)
 {
     erase();
-    for (int i = 0; i < ph->n; i++)
-        particle_draw(&ph->parts[i], rows, cols);
+    draw_perch(s);
 
-    /* HUD */
-    char buf[160];
+    /* BOUND body first. */
+    for (int i = 0; i < s->phx.n_body; i++)
+        if (!s->phx.body[i].released)
+            body_draw(&s->phx.body[i], s->rows, s->cols);
+
+    /* FREE body next (these are released embers — drawn on top of the
+     * silhouette they're disintegrating from). */
+    for (int i = 0; i < s->phx.n_body; i++)
+        if (s->phx.body[i].released)
+            body_draw(&s->phx.body[i], s->rows, s->cols);
+
+    /* Sparks (pure free-flight pool) on top. */
+    for (int i = 0; i < s->phx.n_spark; i++)
+        spark_draw(&s->phx.sparks[i], s->rows, s->cols);
+
+    /* HUD. */
+    char buf[120];
     snprintf(buf, sizeof buf,
-             " phase:%s  parts:%d  speed:%.0f  span:%.0f  theme:%d  "
-             "%5.1f fps  %s ",
-             phase_name(ph->phase), ph->n, ph->flight_speed,
-             ph->wing_span, ph->theme, fps,
-             ph->paused ? "PAUSED " : "running");
+             " PHOENIX  %s   %s  body:%d  spark:%d  %5.1f fps ",
+             g_themes[s->theme].name,
+             phase_name(s->phx.phase),
+             s->phx.n_body, s->phx.n_spark,
+             s->fps);
+    int len = (int)strlen(buf);
+    if (len > s->cols) len = s->cols;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, s->cols - len, "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
-             " +/-:speed  [/]:span  ,/.:density  s:skip  t:theme  "
-             "r:reset  p:pause  q:quit  [phoenix] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
-
-    wnoutrefresh(stdscr);
-    doupdate();
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  spc:pause  r:reset  s:skip  i:ignite  t/T:theme  ,/.:body  ;/':sparks ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §9  screen                                                              */
+/* §10 screen                                                              */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void screen_cleanup(void) { endwin(); }
-
-static void screen_init(int theme)
+static void screen_init(int theme_idx)
 {
-    initscr(); cbreak(); noecho();
+    initscr();
+    cbreak();
+    noecho();
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
-    curs_set(0);
     typeahead(-1);
-    color_init(theme);
-    atexit(screen_cleanup);
+    curs_set(0);
+    color_init(theme_idx);
+}
+
+static void screen_cleanup(void)
+{
+    if (!isendwin()) {
+        curs_set(1);
+        endwin();
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §10 app                                                                 */
+/* §11 app — signals, main loop, key handling                              */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 static volatile sig_atomic_t g_running     = 1;
 static volatile sig_atomic_t g_need_resize = 0;
 
-static void on_signal(int s)
+static void on_signal(int sig)
 {
-    if (s == SIGINT || s == SIGTERM) g_running     = 0;
-    if (s == SIGWINCH)               g_need_resize = 1;
+    if (sig == SIGWINCH) g_need_resize = 1;
+    else                 g_running = 0;
 }
 
-static Phoenix g_ph;
+static void install_signals(void)
+{
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGWINCH,&sa, NULL);
+}
+
+static void atexit_cleanup(void) { screen_cleanup(); }
+
+/* phoenix_skip_phase — finish the current phase immediately so
+ * advance fires at the next tick.  Used by 's' and 'i' (jump to
+ * IGNITE). */
+static void phoenix_skip_phase(Phoenix *p)
+{
+    p->phase_t = phase_duration(p->phase);
+}
+
+static void phoenix_jump_to_ignite(Phoenix *p)
+{
+    p->phase   = PHX_IGNITE;
+    p->phase_t = 0.f;
+}
+
+static bool app_handle_key(Scene *s, int ch)
+{
+    switch (ch) {
+    case 'q': case 'Q': case 27 /* ESC */: return false;
+    case ' ':
+    case 'p': case 'P': s->paused = !s->paused;                       break;
+    case 'r': case 'R': phoenix_reset(&s->phx, s->rows, s->cols);     break;
+    case 's': case 'S': phoenix_skip_phase(&s->phx);                  break;
+    case 'i': case 'I': phoenix_jump_to_ignite(&s->phx);              break;
+
+    case 't':
+        s->theme = (s->theme + 1) % N_THEMES;
+        color_init(s->theme);
+        break;
+    case 'T':
+        s->theme = (s->theme + N_THEMES - 1) % N_THEMES;
+        color_init(s->theme);
+        break;
+
+    case '.': case '>':
+        if (s->phx.n_body + N_BODY_STEP <= N_BODY_MAX)
+            s->phx.n_body += N_BODY_STEP;
+        break;
+    case ',': case '<':
+        if (s->phx.n_body - N_BODY_STEP >= N_BODY_MIN)
+            s->phx.n_body -= N_BODY_STEP;
+        break;
+
+    case '\'': case '"':
+        if (s->phx.n_spark + N_SPARK_STEP <= N_SPARK_MAX)
+            s->phx.n_spark += N_SPARK_STEP;
+        break;
+    case ';': case ':':
+        if (s->phx.n_spark - N_SPARK_STEP >= N_SPARK_MIN)
+            s->phx.n_spark -= N_SPARK_STEP;
+        break;
+
+    default: break;
+    }
+    return true;
+}
+
+static void app_do_resize(Scene *s)
+{
+    endwin();
+    refresh();
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    scene_resize(s, rows, cols);
+    g_need_resize = 0;
+}
 
 int main(void)
 {
-    signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
-    signal(SIGWINCH, on_signal);
-    srand((unsigned)time(NULL));
+    install_signals();
+    atexit(atexit_cleanup);
 
-    g_ph.n            = N_PART_DEFAULT;
-    g_ph.flight_speed = FLIGHT_SPEED_DEFAULT;
-    g_ph.wing_span    = WING_SPAN_DEFAULT;
-    g_ph.theme        = 0;
+    int seed = (int)(clock_ns() & 0x7FFFFFFF);
+    srand((unsigned)seed);
 
-    screen_init(g_ph.theme);
-    int rows = LINES, cols = COLS;
-    phoenix_reset(&g_ph, rows, cols);
+    screen_init(0);
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
 
-    const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double  fps         = TARGET_FPS;
-    int64_t t_fps_prev  = clock_ns();
-    int64_t t_tick_prev = t_fps_prev;
+    Scene scene;
+    scene_init(&scene, rows, cols);
+
+    const int64_t frame_ns = 1000000000LL / TARGET_FPS;
+    int64_t prev = clock_ns();
+
+    int frames = 0;
+    int64_t fps_t0 = prev;
 
     while (g_running) {
-        if (g_need_resize) {
-            g_need_resize = 0;
-            endwin(); refresh();
-            rows = LINES; cols = COLS;
-        }
+        if (g_need_resize) app_do_resize(&scene);
 
-        int ch;
-        while ((ch = getch()) != ERR) {
-            switch (ch) {
-                case 'q': case 27: g_running = 0; break;
-                case 'p':          g_ph.paused ^= 1; break;
-                case 'r':          phoenix_reset(&g_ph, rows, cols); break;
-                case 't':          g_ph.theme = (g_ph.theme + 1) % N_THEMES;
-                                   color_init(g_ph.theme); break;
-                case 's':
-                    /* Skip to next phase. */
-                    g_ph.phase_time = 1e6f;
-                    break;
-                case '+': case '=':
-                    if (g_ph.flight_speed + FLIGHT_SPEED_STEP <= FLIGHT_SPEED_MAX)
-                        g_ph.flight_speed += FLIGHT_SPEED_STEP;
-                    break;
-                case '-':
-                    if (g_ph.flight_speed - FLIGHT_SPEED_STEP >= FLIGHT_SPEED_MIN)
-                        g_ph.flight_speed -= FLIGHT_SPEED_STEP;
-                    break;
-                case '[':
-                    if (g_ph.wing_span - WING_SPAN_STEP >= WING_SPAN_MIN)
-                        g_ph.wing_span -= WING_SPAN_STEP;
-                    break;
-                case ']':
-                    if (g_ph.wing_span + WING_SPAN_STEP <= WING_SPAN_MAX)
-                        g_ph.wing_span += WING_SPAN_STEP;
-                    break;
-                case ',':
-                    if (g_ph.n - N_PART_STEP >= N_PART_MIN)
-                        g_ph.n -= N_PART_STEP;
-                    break;
-                case '.':
-                    if (g_ph.n + N_PART_STEP <= N_PART_MAX) {
-                        g_ph.n += N_PART_STEP;
-                        int total_w = anchor_total_weight();
-                        for (int i = 0; i < g_ph.n; i++) {
-                            g_ph.parts[i].anchor_idx = anchor_pick(total_w);
-                            particle_bind(&g_ph.parts[i], &g_ph);
-                        }
-                    }
-                    break;
-            }
-        }
+        int ch = getch();
+        if (ch != ERR && !app_handle_key(&scene, ch)) g_running = 0;
 
         int64_t now = clock_ns();
-        float   dt  = (float)(now - t_tick_prev) / 1e9f;
+        float dt = (float)(now - prev) * 1e-9f;
         if (dt > DT_CAP_S) dt = DT_CAP_S;
-        t_tick_prev = now;
-        if (!g_ph.paused) phoenix_tick(&g_ph, dt, rows, cols);
+        prev = now;
 
-        fps = fps * 0.95 + (1e9 / (double)(now - t_fps_prev + 1)) * 0.05;
-        t_fps_prev = now;
+        scene_tick(&scene, dt);
 
-        scene_draw(rows, cols, &g_ph, fps);
-        clock_sleep_ns(FRAME_NS - (clock_ns() - now));
+        scene_draw(&scene);
+        wnoutrefresh(stdscr);
+        doupdate();
+
+        frames++;
+        if (now - fps_t0 >= 500000000LL) {
+            scene.fps = (float)frames * 1e9f / (float)(now - fps_t0);
+            frames    = 0;
+            fps_t0    = now;
+        }
+
+        int64_t sleep_ns = frame_ns - (clock_ns() - now);
+        clock_sleep_ns(sleep_ns);
     }
+
     return 0;
 }

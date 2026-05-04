@@ -407,7 +407,7 @@ ncurses reserves pair 0 as the default (unmodifiable), giving 255 usable pairs (
 | flowfield.c | 8 | 8 hue/age levels |
 | complex_flowfield.c | 16 | 16-step cosine palette, pre-baked at theme change; angle→pair at runtime |
 | sand.c | 4 | Grain density levels |
-| bonsai.c | 6 | Brown trunk, branches, leaf shades |
+| bonsai.c | 10 | 3 trunk shades + 6 foliage variants + 1 pot, per theme (6 themes incl. SUMI_E inverted) |
 | snowflake.c | 7 | 6 ice gradient pairs + 1 walker pair |
 | coral.c | 7 | 6 vivid coral pairs + 1 walker pair |
 | sierpinski.c | 4 | 3 vertex colors + 1 HUD |
@@ -1344,25 +1344,37 @@ Color pairs map to material properties from RT2 (albedo): the albedo color index
 
 ---
 
-## 28. Temperature-Mapped Stellar Palette with Limb Darkening (sun.c)
+## 28. Stellar Palette via Eddington-Driven Single Luminance (sun_solar.c)
 
-A solar surface needs a colour ramp that matches blackbody radiation: a single scalar `temp ∈ [0, 1]` should map to white-hot core → yellow → orange → red → maroon edge. The Eddington 1-coefficient limb-darkening law dims the limb by ~20% before the colour lookup, so the edge palette entries get hit naturally without any special "edge" branch.
+A solar surface needs a colour ramp that matches blackbody radiation across the disc: a single scalar `lum ∈ [0, 1]` should map to white-hot core → yellow → orange → red at the limb. Critically, the LIMB darkening must be *built into* the luminance value before the palette lookup so the edge entries of the ramp are hit naturally — no separate "edge" branch.
 
+**Single-luminance composition** — every visual effect contributes to ONE scalar:
 ```c
-/* §11 renderer (per pixel) */
-float ndv  = fabsf(v3dot(N, V));            /* μ = N · V */
-float temp = sh.temp * (0.80f + 0.20f * ndv);  /* edge ~20% cooler */
-int   pi   = (int)(temp * (PALETTE_N - 1));
-attron(COLOR_PAIR(theme[active].sun[pi]));
+mu    = sqrtf(1.0f - r_norm * r_norm);            /* Eddington μ */
+tex   = fbm2d(...);                               /* granulation */
+spot  = max(0.0f, SPOT_THRESH - tex);             /* sunspot     */
+spot  = spot * spot;                              /* sharpen     */
+lum   = (LIMB_BASE + LIMB_BIAS * mu)              /* μ-law       */
+      * (1.0f - GRAN_AMP * (tex - 0.5f) * 2.0f    /* texture mod */
+              - SPOT_AMP * spot);                 /* spot mod    */
 ```
+Eddington's 1-coefficient law gives ~20% edge darkening (`u₁ = 0.20`); granulation and sunspot modulation ride on top of that base. The same `lum` value drives glyph slot AND palette slot — there's only one number per pixel to track.
 
-**Why one float instead of RGB:** A single temperature feeds through the entire pipeline — fbm temperature, flare contribution, limb darkening, corona accumulator — composing as scalar multiplications. RGB would triple the bookkeeping for no visual gain at 256-colour terminal resolution.
+**Pixel encoding** — slot indexes BOTH glyph and pair from the same `lum`:
+```c
+int slot = (int)(clamp(lum / LUM_CLAMP, 0, 1) * 7.999f);
+char glyph = LUMA_GLYPHS[slot];
+int  pair  = PAIR_RAMP_BASE + slot;
+```
+The 8-tier palette walks from the coolest blackbody colour (slot 0, dim red) through yellow to hottest (slot 7, near-white). Same ramp shape for every theme; theme just rebinds the pair indices to a different colour family.
 
-**Theme rebinding for live switches:** 4 themes (Solar, Plasma, Toxic, Arctic) each define a 16-entry sun ramp + complementary flare colour. `t` cycles `active`; `init_pair()` rebinds the same colour-pair indices to the new theme. The hot loop in `canvas_draw` never branches on theme.
+**Why this is simpler than dual-ramp (sun + halo):** the corona is just `corona_lum = exp(−d/falloff) · CORONA_GAIN` — it produces low `lum` values that fall into slots 0–2 of the same ramp. The "halo colour" emerges naturally from the cool end of the temperature ramp; no separate halo palette to keep in sync.
 
-**Corona accumulator** writes into a separate brightness band so the palette stays clean. Hits use the `sun_pair[]` ramp; misses with `corona_acc > 0` use the `halo_pair[]` ramp; the boundary is handled by additive blending in the brightness char picker.
+**Flare overlay is additive on `lum`** — flare `arc_amp · life_amp · intensity` brightens the same scalar. A flare at full intensity at the apex pushes `lum` past 1, which clamps to slot 7 (the hottest tier). Flares automatically take the brightest palette colour without per-flare lookup.
 
-*Files: `raymarcher/sun.c`*
+**Five themes, same code path:** SOLAR / BLUE_GIANT / RED_DWARF / ALIEN / NEGATIVE. Each defines an 8-pair ramp; `theme_apply()` rebinds `PAIR_RAMP_BASE..+7`. NEGATIVE is the inverted variant (white bg, dark fg) following the standard repo recipe — `init_pair` uses `bg = 231`, `A_BOLD/A_DIM` disabled in the pixel mapper.
+
+*Files: `raymarcher/sun_solar.c`*
 
 ---
 

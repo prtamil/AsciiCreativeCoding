@@ -197,7 +197,7 @@ you would consult to extend the technique past what is implemented here.
 - [N8 Ant Colony Optimization — Stigmergic Pheromone Trails](#n8-ant-colony-optimization--stigmergic-pheromone-trails)
 
 ### O — Procedural Growth
-- [O1 Recursive Branch Growth — Bonsai](#o1-recursive-branch-growth--bonsai)
+- [O1 Recursive Skeleton Generation — Bonsai](#o1-recursive-skeleton-generation--bonsai)
 - [O2 Branch Type State Machine](#o2-branch-type-state-machine)
 - [O3 Leaf Scatter](#o3-leaf-scatter)
 
@@ -753,7 +753,7 @@ Shader functions accept `const void *uni` and cast it to the specific struct the
 #### A10 ACS Line-drawing Characters
 
 ncurses provides portable box-drawing glyphs through `ACS_*` macros: `ACS_ULCORNER` (┌), `ACS_URCORNER` (┐), `ACS_LLCORNER` (└), `ACS_LRCORNER` (┘), `ACS_HLINE` (─), `ACS_VLINE` (│). On VT100 terminals they activate the alternate character set; on modern UTF-8 terminals they emit Unicode box-drawing code points. Always prefer `ACS_*` over hardcoded characters for maximum terminal compatibility.
-*Files: `bonsai.c` (message panel)*
+*Files: `artistic/railwaymap.c`, `robots/walking_robot.c`*
 
 #### A11 (chtype)(unsigned char) — Sign-extension Guard
 
@@ -900,49 +900,32 @@ This produces `|d| ≤ max/2`, the correct shortest-path distance across the wra
 
 ### O — Procedural Growth
 
-#### O1 Recursive Branch Growth — Bonsai
+#### O1 Recursive Skeleton Generation — Bonsai
 
-`bonsai.c` grows a tree one step per tick from a pool of active branches. Each branch struct carries `(x, y, dx, dy, life, type, color)`. Each tick, `branch_step()` draws the character at `(y, x)` (chosen by slope), optionally spawns child branches when life crosses a threshold, and decrements life. Branches with `life ≤ 0` are retired.
+`bonsai.c` builds a static bonsai still-life by recursive descent.  Trunk path is a sequence of small line segments laid out along a STYLE-SPECIFIC curve (CHOKKAN straight, MOYOGI sin S-curve, SHAKAN slanted line, KENGAI two-phase rise+cascade, BUNJIN tall-thin).  At each trunk node, a branching probability spawns child branches that recurse with attenuated length.  Terminal recursion drops a foliage cloud at the tip.
 
-The character drawn at each step is chosen by the slope of `(dx, dy)`:
-```c
-if      (fabs(dx) < fabs(dy) / 2)  ch = '|';
-else if (fabs(dy) < fabs(dx) / 2)  ch = '-';
-else if (dx * dy > 0)               ch = '\\';
-else                                ch = '/';
-```
-
-Growth simulation runs at `SIM_FPS`; each sim tick produces one step per active branch — visually one character per branch per tick.
+The skeleton is generated ONCE per (style, seed); per-frame work is just rasterising the cached skeleton + per-cell wind rustle.  Re-seed (`r`) and style-cycle (`n`) regenerate; theme-cycle (`t`) only re-applies the colour palette.
 *Files: `bonsai.c`*
 
-#### O2 Branch Type State Machine
+#### O2 Slope-to-Char Branch Rendering
 
-Four branch types drive different wander and branching behaviour:
-
-| Type | Tendency | Branch Spawning |
-|---|---|---|
-| `TRUNK` | Upward, moderate wander | Spawns `SHOOT` branches frequently |
-| `SHOOT` | Outward / upward diagonal | Spawns `DYING` at low life |
-| `DYING` | Gravitational sag | No new branches |
-| `DEAD` | No wander | No branches |
-
-Type is set at spawn and never changes. The type-specific code path is a simple `switch(b->type)` in `branch_step()`. Five overall tree styles (`RANDOM`, `DWARF`, `WEEPING`, `SPARSE`, `BAMBOO`) adjust the initial parameters and spawning thresholds.
-*Files: `bonsai.c`*
-
-#### O3 Leaf Scatter
-
-When a branch exhausts its life, `leaf_scatter()` places leaf characters in a Gaussian blob around the tip:
+Branch line segments are rasterised via Bresenham; the glyph at each cell is chosen by segment direction so diagonal branches read as diagonals and verticals as verticals:
 
 ```c
-for (int i = 0; i < n_leaves; i++) {
-    int lx = tip_x + (int)(gaussian() * LEAF_SPREAD);
-    int ly = tip_y + (int)(gaussian() * LEAF_SPREAD / 2.0f);
-    /* half spread on Y — terminal cells are taller than wide */
-    draw_char(ly, lx, leaf_char(), COLOR_PAIR(leaf_color) | A_BOLD);
-}
+if      (dx > dy * 2)   g = (depth ≤ 1) ? '=' : '-';
+else if (dy > dx * 2)   g = (depth ≤ 1) ? 'H' : '|';
+else if (sx == sy)      g = (depth ≤ 1) ? 'M' : '\\';
+else                    g = (depth ≤ 1) ? 'M' : '/';
 ```
 
-The Y spread is halved because terminal cells are twice as tall as wide — equal pixel spread requires half as many cell rows as columns. Leaf chars are drawn with `A_BOLD` to appear lighter and more delicate than branch chars.
+Trunk depth determines weight: depth 0-1 uses heavy-bracket chars (`M`, `H`, `=`); deeper recursion uses thinner chars (`|`, `/`, `\\`, `-`).  The branch silhouette reads as a thick trunk thinning into delicate twigs without any per-segment thickness simulation.
+*Files: `bonsai.c`*
+
+#### O3 Aspect-Corrected Foliage Clouds
+
+A foliage cloud at a branch tip is an ELLIPSE with semi-axes `(rx, rx · CELL_ASPECT⁻¹)` so the cloud appears ROUND in physical pixels.  Without correction (`ry = rx`), terminal cells being 2× taller than wide make the cloud render as a vertically-squashed rugby ball.  Cells inside the ellipse get a random leaf glyph from the theme's leaf set; soft falloff at 60 % radius gives clouds a fluffy outline rather than a hard disc edge.
+
+Per frame, ~6 % of foliage cells re-pick their glyph via a hash gate keyed by `(col, row, ⌊time · 6⌋)` — a coherent 6 Hz wind rustle without per-frame re-randomisation cost.
 *Files: `bonsai.c`*
 
 ---
@@ -2676,13 +2659,15 @@ Smooth versions blend the boundary instead of butting:
 
 **Domain operations** modify `p` before the SDF lookup: translate, rotate, repeat (`p mod size`), twist (`rotate(p.xy, p.z · k)`), bend, displace by noise. All of these compose with all primitives.
 
-**Why noise-displaced SDFs make sense for natural surfaces.** A surface like a sun's photosphere has no analytic equation but is well-approximated by a sphere with high-frequency perturbation. Subtracting `fbm(p)·amp` from the sphere SDF gives exactly that — boiling lava without any explicit polygon mesh.
+**Why iterated SDFs work for fractals.** The Mandelbulb's distance estimator is built from an iterated power-spherical map of `z` plus a derivative-tracker `dr`; the Hubbard-Douady form `½·log(r)·r/dr` is then a *valid* SDF for sphere tracing. No polygon mesh, no voxel volume — pure mathematical surface. Same idea generalises to KIFS folds (Sierpinski tetrahedron, Menger sponge), Mandelbox, and Apollonian packing.
 
-`raymarcher/sun.c` uses one SDF (`sphere − warped_fbm`) smooth-unioned with up to 8 capsule flares. The flares run independent state machines (BLAST → ARCH → DECAY); their geometry is a Bézier-arched magnetic loop approximated by 8 capsule segments (`bezier_tube_dist()`). The analytic distance to a quadratic Bézier curve requires solving a degree-5 polynomial — capsule subdivision is visually identical at one-tenth the code.
+`raymarcher/mandelbulb.c` is the canonical example here: power = 8, ~8 iterations per DE evaluation, central-difference normals, Christensen-style soft shadow ray, step-count AO for crevices. `raymarcher/kifs_fractal.c` is the angular-fold cousin (3 plane folds + scale-toward-fixed-point).
 
-**Limb darkening** (Eddington 1-coefficient law, ref: en.wikipedia.org/wiki/Limb_darkening) accounts for the cooler-looking edge of a star: `T_visible = T·(0.80 + 0.20·μ)` with `μ = N·V`. A real photometric law is a polynomial in μ; `u₁ = 0.20` matches the visible-light limb of the Sun closely.
+**Worth knowing: 2-D screen-space alternatives.** Not everything needs sphere tracing. A sun viewed face-on is the same disc-with-corona regardless of camera angle, so `raymarcher/sun_solar.c` skips raymarching entirely and classifies pixels by 2-D radial distance — about 30× cheaper per pixel. Choose the technique that matches the visual: SDF when 3-D geometry actually rotates and occludes, screen-space when the silhouette is invariant.
 
-*Files: `raymarcher/sun.c`*
+**Limb darkening** (Eddington 1-coefficient law, ref: en.wikipedia.org/wiki/Limb_darkening) accounts for the cooler-looking edge of a star: `I(μ) = I_centre · (0.80 + 0.20·μ)`. In a 3-D SDF context, `μ = |N · V|` (angle from normal); in a 2-D screen-space context, `μ = √(1 − (r/R)²)` (derived directly from screen radius — same value, no normal needed). A real photometric law is a polynomial in μ; `u₁ = 0.20` matches the visible-light limb of the Sun closely.
+
+*Files: `raymarcher/mandelbulb.c`, `raymarcher/kifs_fractal.c`, `raymarcher/sdf_gallery.c` (SDF composition); `raymarcher/sun_solar.c` (limb darkening, 2-D screen-space alternative)*
 
 ---
 

@@ -33,7 +33,7 @@
  *                                  perspective.  Different domain
  *                                  (heightfield vs. volume) but the
  *                                  haze-ramp colour idea carries over.
- *   raymarcher/sun.c             — the sun's corona aesthetic.
+ *   raymarcher/sun_solar.c             — the sun's corona aesthetic.
  *
  * Section map:
  *   §1 config   — patterns, themes, raymarch tunables

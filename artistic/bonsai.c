@@ -1,81 +1,275 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * bonsai.c  —  growing bonsai tree in the terminal
+ * bonsai.c — bonsai tree gallery: 5 classical styles, 6 themes,
+ *            static skeleton + subtle wind rustle on foliage.
  *
- * A feature-complete cbonsai-style program built on the same ncurses
- * rendering framework as bounce.c and matrix_rain.c:
- *   - dt loop, CLOCK_MONOTONIC, fixed-timestep accumulator
- *   - single stdscr / erase / wnoutrefresh / doupdate flush
- *   - SIGWINCH resize, SIGINT/SIGTERM clean exit, atexit cleanup
+ * DEMO: A single bonsai tree fills the screen, drawn as a hand-tuned
+ *       composition: pot at the bottom, trunk rising in a style-
+ *       specific path (straight, S-curved, slanted, cascading, or
+ *       sparse), recursive branches growing outward, foliage clouds
+ *       at the branch tips, all framed by empty negative space in
+ *       the Japanese aesthetic.  Foliage cells subtly re-randomise
+ *       their glyph each frame to simulate leaves rustling in a
+ *       breeze — the only animation; the skeleton itself is static.
  *
- * Features
- * --------
- *   Live growth animation  — watch the tree grow step by step
- *   Infinite mode          — regrow a new tree after each one finishes
- *   Screensaver mode       — live + infinite, any key quits
- *   5 tree types           — t key cycles: random / dwarf / weeping /
- *                            sparse / bamboo
- *   2 pot styles           — b key cycles: big / small / none
- *   Message box            — m key toggles a centred message panel
- *   Leaves                 — configurable leaf chars, random per branch
- *   Branch multiplier      — M / N keys (more / fewer branches)
- *   Life                   — L / K keys (longer / shorter tree)
- *   Speed                  — ] / [ keys (faster / slower growth)
- *   Seed control           — r key re-seeds and resets
- *   Pause                  — space
- *   Colour themes          — 256-colour with 8-colour fallback
+ *       Distinct from a "growing tree" demo (the previous bonsai.c
+ *       grows live like cbonsai): this file shows the FINISHED tree
+ *       as a hand-tuned still image you can study, with the wind
+ *       rustle keeping it visually alive.  Better for "looks great
+ *       to leave on screen" use; less educational about L-systems.
  *
- * Runtime keys
- * ------------
- *   t          cycle tree type
- *   b          cycle pot style
- *   m          toggle message panel
- *   M / N      more / fewer branches (multiplier)
- *   L / K      longer / shorter tree (life)
- *   ] / [      faster / slower growth
- *   r          new random seed → restart
- *   space      pause / resume
- *   q / ESC    quit
+ *       Styles (cycle with n / N):
+ *         CHOKKAN  formal upright — straight vertical trunk
+ *         MOYOGI   informal upright — S-curved trunk (most popular)
+ *         SHAKAN   slanting — trunk leans 15-30° to one side
+ *         KENGAI   cascade — trunk arcs over the pot rim
+ *         BUNJIN   literati — tall thin sparse, lots of negative space
  *
- * Build
- *   gcc -std=c11 -O2 -Wall -Wextra bonsai.c -o bonsai -lncurses -lm
+ *       Themes (cycle with t / T):
+ *         SPRING   fresh greens, light bark
+ *         SUMMER   deep saturated greens
+ *         AUTUMN   orange/red/copper leaves, dark bark
+ *         WINTER   bare branches, snow tips, no foliage
+ *         CHERRY   pink-blossom-heavy
+ *         SUMI_E   black ink on white "paper" (inverted, Japanese
+ *                  ink-painting aesthetic)
  *
- * Sections
- * --------
- *   §1  config        — all tunable constants
- *   §2  clock         — monotonic ns clock + sleep
- *   §3  color         — color pairs, branch/leaf palette
- *   §4  pot           — ASCII art pot rendering
- *   §5  branch        — branch struct, step algorithm, char selection
- *   §6  tree          — branch pool, growth tick, leaf scatter
- *   §7  message       — bordered message box
- *   §8  scene         — owns tree + settings, drives render
- *   §9  screen        — ncurses init/resize/present
- *   §10 app           — dt loop, input, SIGWINCH, cleanup
+ * Section map:
+ *   §1 config    — sizes, theme + style tables
+ *   §2 clock     — monotonic timer + sleep
+ *   §3 color     — 8-tier theme apply (with inverted-bg support)
+ *   §4 random    — LCG + cheap hashes
+ *   §5 tree      — recursive skeleton generation per style
+ *   §6 raster    — char-grid line drawing + foliage cloud fill
+ *   §7 pot       — pot frame rendering
+ *   §8 scene     — generate + raster + render with wind rustle
+ *   §9 screen + app
+ *
+ * Keys:
+ *   q / ESC      quit
+ *   space        pause / resume rustle
+ *   n / N        next / previous style
+ *   t / T        next / previous theme
+ *   r            reseed (new tree variant of same style)
+ *   ] / [        sim Hz up / down
+ *
+ * Build:
+ *   gcc -std=c11 -O2 -Wall -Wextra artistic/bonsai.c \
+ *       -o bonsai -lncurses -lm
  */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Stochastic recursive tree generation (cbonsai algorithm).
- *                  Each branch step chooses direction using weighted random
- *                  selection based on branch age ("life") and tree type.
- *                  Branches spawn child branches when life crosses thresholds,
- *                  producing natural-looking asymmetric growth without L-systems.
+ * Algorithm      : Two-pass procedural composition.
  *
- * Data-structure : Branch pool — flat array of branch structs (position, life,
- *                  type, age).  Active branches are processed FIFO each tick.
- *                  Pool size is bounded by MAX_BRANCHES to prevent unbounded
- *                  memory use during long-lived infinite-mode runs.
+ *                  PASS 1 — SKELETON GENERATION:
+ *                     Generate trunk path according to style:
+ *                       CHOKKAN  : vertical with tiny noise wobble
+ *                       MOYOGI   : sin-S-curve, 1-2 wavelengths over height
+ *                       SHAKAN   : straight line at chosen lean angle
+ *                       KENGAI   : up-then-arc-over-rim 2-phase path
+ *                       BUNJIN   : nearly vertical, very tall, very thin
+ *                     Recursively subdivide: at each trunk node, with
+ *                     style-dependent probability, branch outward.
+ *                     Each branch is itself recursively subdivided.
+ *                     Stop when length < MIN_LEN or depth ≥ MAX_DEPTH;
+ *                     terminal points become FOLIAGE CLOUDS (centre,
+ *                     radius, density).
  *
- * Rendering      : Branch character selected from a lookup table based on
- *                  branch direction and age; leaf characters scattered at
- *                  branch tips when life falls below LEAF_THRESH.
- *                  256-colour palette with 8-colour fallback; pot drawn
- *                  with box-drawing characters.
+ *                  PASS 2 — RASTERISE TO CHAR GRID:
+ *                     For each trunk/branch segment, walk a Bresenham
+ *                     line and stamp a glyph at each cell, choosing
+ *                     trunk-thick (`M`, `H`) vs medium (`|`, `[`) vs
+ *                     thin (`/`, `\`, `|`) based on segment thickness.
+ *                     For each foliage cloud, fill an aspect-corrected
+ *                     ELLIPSE (round in physical pixels) with random
+ *                     leaf glyphs sampled from the theme's leaf set.
+ *                     Pot drawn last over the bottom rows.
  *
- * Randomness     : Seeded with time(NULL) by default; 'r' key re-seeds for
- *                  a new tree.  Seed is displayed in the HUD so interesting
- *                  trees can be reproduced.
+ *                  PER FRAME:
+ *                     Re-emit the char grid; for ~5% of FOLIAGE cells
+ *                     (gated by per-cell rustle hash + global time),
+ *                     re-pick a random leaf glyph.  This is the only
+ *                     per-frame work — the skeleton never regenerates
+ *                     unless the user reseeds (`r`) or switches style
+ *                     (`n`).
+ *
+ * Data-structure : `Tree` struct holds segments[] (trunk + branches as
+ *                  line segments with thickness) and foliage[] (clouds
+ *                  with centre/radius/density).  Sized for the gnarliest
+ *                  recursion: 256 segments + 64 clouds, ~3 KB total.
+ *                  Plus per-render `char_grid[H][W]` and `pair_grid[H][W]`
+ *                  for the rasterised image.
+ *
+ * Rendering      : ASCII only.  Trunk uses heavy bracket-style chars
+ *                  (`M`, `H`, `(`, `)`, `[`, `]`); branches use slashes
+ *                  (`/`, `\`); foliage uses density chars (`&`, `%`,
+ *                  `#`, `*`, `@`, `^`, `o`).  Pot uses `_`, `|`, `:`,
+ *                  `.`, `'` for box-drawing-like effect.
+ *
+ * Performance    : Skeleton generation: 256 segments × ~5 ops + 64
+ *                  clouds × ~50 cells each = ~5 K ops, one-time.
+ *                  Per-frame: cols·rows mvaddch + rustle hash check.
+ *                  Trivial at any terminal size; the limit is ncurses
+ *                  output throughput, not the algorithm.
+ *
+ * References     :
+ *   • Naka, J. Y. — *Bonsai Techniques I & II* (1973, 1982).  The
+ *     classical-style taxonomy (chokkan / moyogi / shakan / kengai /
+ *     bunjin) we use comes from these foundational books.
+ *   • Iwata, Y. — *Bonsai: A Patient Art* (2009).  Photographic
+ *     reference for how trunks curve, branches space, foliage clumps.
+ *   • Lindenmayer, A. — "Mathematical models for cellular interactions
+ *     in development", *J. Theor. Biol.* 18 (1968).  L-system origin;
+ *     we use a simplified non-L-system recursive descent here, but the
+ *     branching pattern follows L-system tradition.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Build a TREE SKELETON once (line segments + foliage clouds), draw it
+ * to a character grid once, then render that grid every frame with
+ * tiny per-cell wind randomness on the foliage.  The "tree" is just a
+ * static still life; the rustle is what keeps it from looking like
+ * a screenshot.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine you've painted a sumi-e bonsai on rice paper.  The tree is
+ * fixed forever; there's nothing to recompute when you display it.
+ * Now imagine you tape that paper outdoors and watch it from a
+ * distance: every few seconds a leaf flutters.  That's all the
+ * animation we need — the tree's structure is its identity, the
+ * flutter is just life.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. SKELETON GENERATION (once per seed/style change):
+ *
+ *       Init RNG from seed.
+ *       Pick pot dimensions, compute pot_top y-coordinate.
+ *       Generate trunk path according to style:
+ *         - CHOKKAN: walk vertically up, tiny per-segment x-wobble.
+ *         - MOYOGI:  x = mid + amp · sin(2π · (y / height) · waves).
+ *         - SHAKAN:  x = mid + slope · (y_pot − y), straight line.
+ *         - KENGAI:  phase 1 (vertical short rise) then phase 2 (arc
+ *                    over pot rim outward and downward).
+ *         - BUNJIN:  vertical nearly-straight, EXTRA tall, sparse.
+ *       At each trunk node, with style-dependent probability, recurse
+ *       into a branch of shorter length and rotated direction.
+ *       Branches recursively subdivide; terminal branches drop a
+ *       FOLIAGE CLOUD at their tip.
+ *
+ *  2. RASTERISE TO CHAR GRID (once after skeleton built):
+ *
+ *       For each segment:
+ *         Walk a Bresenham line from (x0, y0) to (x1, y1).
+ *         At each cell, decide a glyph by segment thickness:
+ *           thick  → 'M', 'H', or thick-bracket
+ *           medium → '|', '[', ']'
+ *           thin   → '|', '/', '\\'
+ *         Write to char_grid + pair_grid.
+ *
+ *       For each foliage cloud:
+ *         Fill an ELLIPSE around (cx, cy) with semi-axes (rx, ry·CELL_ASPECT)
+ *           — corrected so the cloud looks round in physical pixels.
+ *         For each cell in the ellipse, write a random leaf glyph
+ *           from the theme's leaf set.
+ *
+ *       Pot rasterised over the bottom rows last.
+ *
+ *  3. RENDER PER FRAME:
+ *
+ *       For each char_grid cell:
+ *         If FOLIAGE cell AND (rustle_hash(cell, time) < RUSTLE_RATE):
+ *             re-pick a random leaf glyph for this cell
+ *         Emit (glyph, pair) to ncurses with batched attron/attroff.
+ *
+ *  4. CYCLE:
+ *
+ *       n / N — next / previous style: regenerate skeleton + raster.
+ *       t / T — next / previous theme: re-init colours (~10 microsec),
+ *                 char_grid stays the same, pair_grid recoloured by
+ *                 theme region table.
+ *       r     — new seed: regenerate skeleton + raster (same style).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Trunk path (MOYOGI, S-curve):
+ *    x(y) = mid + amp · sin(2π · waves · (y_pot − y) / trunk_height)
+ *
+ *  Trunk path (SHAKAN, slanted):
+ *    x(y) = mid + slope · (y_pot − y)   ,   slope ∈ [0.15, 0.40]
+ *
+ *  Trunk path (KENGAI, cascade two-phase):
+ *    if y in [y_apex, y_pot]:    vertical rise to y_apex
+ *    else (y > y_apex):          arc out & down past pot edge
+ *
+ *  Branch direction at trunk node n:
+ *    base_angle = ±π/2 (90° from trunk axis), ± random jitter
+ *    length     = parent_length · BRANCH_LEN_FACTOR^depth
+ *
+ *  Foliage ellipse (cell-aspect-corrected so it appears round):
+ *    inside iff  ((dx)/rx)² + ((dy · CELL_ASPECT)/ry)² ≤ 1
+ *
+ *  Wind rustle gate (per cell, per frame):
+ *    rustle iff  hash(col, row, ⌊time · RUSTLE_FREQ⌋)  <  RUSTLE_RATE
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • TREE TOO TALL FOR SCREEN.  Trunk height is computed as a fraction
+ *    of `rows_eff`; if the user resizes very small, foliage clouds
+ *    clamp to the visible area.  KENGAI specifically can extend BELOW
+ *    its pot — we draw the cascading branches directly on top of the
+ *    pot frame in that style.
+ *
+ *  • CELL ASPECT.  Terminal cells are ~2× taller than wide.  Foliage
+ *    ellipses use CELL_ASPECT to correct, otherwise circular clouds
+ *    render as vertically-squashed rugby-ball shapes.
+ *
+ *  • RNG DETERMINISM.  Each (style, seed) produces an identical tree.
+ *    Useful for reproducibility — if you find a beautiful seed, you
+ *    can keep coming back to it.  `r` takes a fresh wall-clock seed.
+ *
+ *  • RUSTLE LOAD.  A small percentage (RUSTLE_RATE ~ 5 %) of foliage
+ *    cells re-randomise per frame; combined with the per-cell hash
+ *    you get a steady twinkle without wholesale repainting.  At
+ *    higher rates the foliage looks noisy / boiling.
+ *
+ *  • INVERTED THEME (SUMI_E).  Pre-fill the visible region with the
+ *    white "paper" bg pair before rendering tree cells, so that the
+ *    tree's dark ink stands out against bright paper.  Same recipe
+ *    used in nuke.c, mandelbulb.c, etc.
+ *
+ *  • WINTER THEME — set foliage density to zero in colour-init so no
+ *    leaves get drawn; instead, branch tips paint snow-tip glyphs.
+ *
+ *  • PAUSE.  Freezes the rustle clock; the static skeleton is still
+ *    visible.  Resume — clock continues from where it stopped.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Press space.  Foliage rustle stops.  Tree holds still.  Resume —
+ *    rustle picks up smoothly.
+ *
+ *  • Press `n`.  Style cycles; tree regenerates.  Each style has a
+ *    distinct silhouette: CHOKKAN straight, MOYOGI S-curve obvious,
+ *    SHAKAN visibly leaning, KENGAI cascading down past pot, BUNJIN
+ *    thin and tall.
+ *
+ *  • Press `r`.  New seed: same style, different specific tree.
+ *    Branch positions and foliage clouds shift; skeleton regenerates.
+ *
+ *  • Press `t`.  Theme cycles.  Tree silhouette identical across
+ *    themes; only colours change.  WINTER drops all foliage; SUMI_E
+ *    inverts to white-paper bg.
+ *
+ *  • At 60 × 20, the tree should still be recognisable as a bonsai
+ *    with a pot.  Trunk + at least one branch + at least one foliage
+ *    cloud should fit even at small terminal sizes.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -86,47 +280,134 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 /* ===================================================================== */
 /* §1  config                                                             */
 /* ===================================================================== */
 
 enum {
-    /* Growth simulation */
-    LIFE_DEFAULT       = 120,   /* steps a trunk branch lives          */
-    LIFE_MIN           =  10,
-    LIFE_MAX           = 200,
-    MULT_DEFAULT       =   8,   /* branching multiplier 0-20           */
-    MULT_MIN           =   0,
-    MULT_MAX           =  20,
+    SIM_FPS_MIN      =  10,
+    SIM_FPS_DEFAULT  =  30,    /* rustle is gentle; 30 fps is plenty   */
+    SIM_FPS_MAX      = 120,
+    SIM_FPS_STEP     =  10,
 
-    /* Speed: growth steps per second */
-    GROW_FPS_DEFAULT   =  30,
-    GROW_FPS_MIN       =   2,
-    GROW_FPS_MAX       = 120,
-    GROW_FPS_STEP      =   5,
+    FPS_UPDATE_MS    = 500,
 
-    /* Branch pool */
-    BRANCH_MAX         = 1024,
+    PAIR_HUD          =  1,
+    PAIR_HINT         =  2,
+    PAIR_TRUNK_BASE   =  3,    /* +0..+2 — trunk dark/mid/light bark   */
+    PAIR_FOLIAGE_BASE =  6,    /* +0..+5 — leaf colour variants        */
+    PAIR_POT          = 12,
+    PAIR_PAPER        = 13,    /* SUMI_E white-paper bg                */
 
-    /* Infinite / screensaver wait after tree finishes (ms) */
-    INFINITE_WAIT_MS   = 4000,
+    /* Skeleton pool sizes. */
+    SEG_MAX           = 384,
+    FOL_MAX           = 96,
 
-    /* Message box */
-    MSG_PAD            =   2,   /* padding inside message border       */
-    MSG_MAX            = 128,
-
-    /* HUD */
-    HUD_COLS           =  50,
-    FPS_UPDATE_MS      = 500,
+    /* Char grid maximum (for static buffers). */
+    GRID_MAX_W        = 280,
+    GRID_MAX_H        = 90,
 };
 
-#define NS_PER_SEC  1000000000LL
-#define NS_PER_MS      1000000LL
+#define NS_PER_SEC      1000000000LL
+#define NS_PER_MS          1000000LL
+#define TICK_NS(f)      (NS_PER_SEC / (f))
+
+#define CELL_ASPECT      2.0f      /* terminal cell h/w                  */
+
+/* Tree generation — global tunables. */
+#define MAX_DEPTH        7         /* max recursion depth                */
+#define MIN_LEN          1.5f      /* segments shorter than this stop    */
+#define BRANCH_LEN_F     0.66f     /* child length = parent · this       */
+
+/* Wind rustle. */
+#define RUSTLE_FREQ      6.0f      /* rustle hash key advances at this Hz */
+#define RUSTLE_RATE      0.06f     /* fraction of foliage cells per tick  */
+
+/* ── Style enum + per-style params ── */
+typedef enum {
+    STYLE_CHOKKAN = 0,    /* formal upright */
+    STYLE_MOYOGI  = 1,    /* informal upright (S-curve) */
+    STYLE_SHAKAN  = 2,    /* slanting */
+    STYLE_KENGAI  = 3,    /* cascade */
+    STYLE_BUNJIN  = 4,    /* literati */
+    N_STYLES      = 5,
+} TreeStyle;
+
+typedef struct {
+    const char *name;
+    float       trunk_height_frac;  /* of (rows_eff − pot_rows)         */
+    float       trunk_curve_amp;    /* MOYOGI sin amplitude (cells)     */
+    float       trunk_curve_waves;  /* MOYOGI wavelengths over height   */
+    float       trunk_lean;         /* SHAKAN slope (cells per row)     */
+    float       branch_density;     /* probability per trunk node       */
+    float       branch_length;      /* base branch length (cells)       */
+    int         max_depth;
+    float       foliage_size;       /* base foliage cloud radius        */
+} StyleParams;
+
+static const StyleParams styles[N_STYLES] = {
+    /*  name           trunk_h  curv_amp  waves  lean  br_dens br_len  depth  fol_size */
+    /* CHOKKAN */   { "CHOKKAN ", 0.65f,  0.5f,   0.0f, 0.00f,  0.45f,  6.5f,  6,    3.0f },
+    /* MOYOGI  */   { "MOYOGI  ", 0.65f,  4.0f,   1.7f, 0.00f,  0.50f,  6.0f,  6,    2.8f },
+    /* SHAKAN  */   { "SHAKAN  ", 0.62f,  0.0f,   0.0f, 0.30f,  0.55f,  5.5f,  6,    2.7f },
+    /* KENGAI  */   { "KENGAI  ", 0.50f,  0.0f,   0.0f, 0.00f,  0.55f,  6.5f,  6,    2.5f },
+    /* BUNJIN  */   { "BUNJIN  ", 0.78f,  1.0f,   0.5f, 0.05f,  0.18f,  4.5f,  5,    2.0f },
+};
+
+/* ── Theme ── */
+typedef struct {
+    const char *name;
+    short       trunk[3];        /* dark / mid / light bark              */
+    short       foliage[6];      /* 6 leaf colour variants for variety   */
+    short       pot;
+    bool        inverted;        /* white-paper bg + dark ink            */
+    bool        bare;            /* WINTER: skip foliage clouds entirely */
+    const char *leaf_set;        /* glyphs for leaves                    */
+    const char *snow_tip;        /* WINTER tip char (else NULL)          */
+} Theme;
+
+#define N_THEMES 6
+
+static const Theme themes[N_THEMES] = {
+    /* name        trunk[]              foliage[]                              pot  inv   bare    leaves            snow */
+    { "SPRING ",  { 130, 137, 173 },   {  28,  34,  64,  70, 112, 154 },      136, false, false, "&%#*o^",          NULL  },
+    { "SUMMER ",  { 130, 137, 173 },   {  22,  28,  34,  64,  70, 112 },      136, false, false, "&%#@*o",          NULL  },
+    { "AUTUMN ",  {  88, 130, 166 },   { 124, 130, 166, 202, 208, 220 },      130, false, false, "&%#*@^",          NULL  },
+    { "WINTER ",  {  60,  66, 103 },   { 240, 244, 247, 250, 252, 255 },      103, false, true,  ".,oO",            "*"   },
+    { "CHERRY ",  {  88, 130, 166 },   { 175, 211, 213, 217, 219, 225 },      130, false, false, "&%#*o^",          NULL  },
+    { "SUMI_E ",  {  16, 232, 234 },   { 234, 236, 238, 241, 244, 247 },      234, true,  false, "&%#*o^",          NULL  },
+};
+
+/* Glyph palettes. */
+static const char TRUNK_THICK[]    = "MHHM[]()";   /* depth 0-1, thick bark   */
+static const char TRUNK_MEDIUM[]   = "|[]/\\";       /* depth 2-3, medium       */
+static const char TRUNK_THIN[]     = "|/\\";         /* depth 4+, thin twigs    */
+
+#define POT_TOP_CH      '_'
+#define POT_SIDE_CH     '|'
+#define POT_LIP_LEFT    '\\'
+#define POT_LIP_RIGHT   '/'
+#define POT_BOTTOM_CH   ':'
+
+/* Per-cell role (drives glyph + colour selection at render time). */
+typedef enum {
+    ROLE_EMPTY = 0,
+    ROLE_TRUNK_DARK,
+    ROLE_TRUNK_MID,
+    ROLE_TRUNK_LIGHT,
+    ROLE_FOLIAGE,
+    ROLE_SNOW_TIP,        /* WINTER only */
+    ROLE_POT,
+} CellRole;
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -142,721 +423,680 @@ static int64_t clock_ns(void)
 static void clock_sleep_ns(int64_t ns)
 {
     if (ns <= 0) return;
-    struct timespec r = {
+    struct timespec req = {
         .tv_sec  = (time_t)(ns / NS_PER_SEC),
         .tv_nsec = (long)  (ns % NS_PER_SEC),
     };
-    nanosleep(&r, NULL);
+    nanosleep(&req, NULL);
 }
 
 /* ===================================================================== */
 /* §3  color                                                              */
 /* ===================================================================== */
 
-/*
- * Color pair assignments:
- *   1  dark wood    (trunk, thick branches)
- *   2  light wood   (thin branches)
- *   3  dark leaf    (dense foliage)
- *   4  light leaf   (sparse foliage, tips)
- *   5  pot / base   (ceramic colour)
- *   6  message bg   (message box border + text)
- *   7  HUD          (status bar)
- */
+static void theme_apply(int idx)
+{
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    const Theme *t = &themes[idx];
+    short bg = t->inverted ? 231 : -1;
+
+    if (COLORS >= 256) {
+        for (int i = 0; i < 3; i++)
+            init_pair((short)(PAIR_TRUNK_BASE + i), t->trunk[i], bg);
+        for (int i = 0; i < 6; i++)
+            init_pair((short)(PAIR_FOLIAGE_BASE + i), t->foliage[i], bg);
+        init_pair(PAIR_POT,   t->pot, bg);
+        init_pair(PAIR_PAPER, 16,     t->inverted ? 231 : -1);  /* unused if not inverted */
+    } else {
+        for (int i = 0; i < 3; i++)
+            init_pair((short)(PAIR_TRUNK_BASE + i),
+                      t->inverted ? COLOR_BLACK : COLOR_YELLOW,
+                      t->inverted ? COLOR_WHITE : (short)-1);
+        for (int i = 0; i < 6; i++)
+            init_pair((short)(PAIR_FOLIAGE_BASE + i),
+                      t->inverted ? COLOR_BLACK : COLOR_GREEN,
+                      t->inverted ? COLOR_WHITE : (short)-1);
+        init_pair(PAIR_POT,
+                  t->inverted ? COLOR_BLACK : COLOR_YELLOW,
+                  t->inverted ? COLOR_WHITE : (short)-1);
+        init_pair(PAIR_PAPER, COLOR_BLACK, COLOR_WHITE);
+    }
+}
 
 static void color_init(void)
 {
     start_color();
     use_default_colors();
-
     if (COLORS >= 256) {
-        /* 256-colour: rich brown trunk, varied greens */
-        init_pair(1, 130, -1);   /* dark brown  — trunk         */
-        init_pair(2, 172, -1);   /* amber brown — branches      */
-        init_pair(3,  28, -1);   /* dark green  — dense leaves  */
-        init_pair(4,  82, -1);   /* lime green  — light leaves  */
-        init_pair(5, 180, -1);   /* tan         — pot           */
-        init_pair(6, 250, -1);   /* light grey  — message       */
-        init_pair(7, 226, -1);   /* yellow      — HUD           */
+        init_pair(PAIR_HUD,  226, -1);
+        init_pair(PAIR_HINT,  51, -1);
     } else {
-        /* 8-colour fallback */
-        init_pair(1, COLOR_RED,     -1);
-        init_pair(2, COLOR_YELLOW,  -1);
-        init_pair(3, COLOR_GREEN,   -1);
-        init_pair(4, COLOR_GREEN,   -1);
-        init_pair(5, COLOR_YELLOW,  -1);
-        init_pair(6, COLOR_WHITE,   -1);
-        init_pair(7, COLOR_YELLOW,  -1);
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
     }
+    theme_apply(0);
 }
 
 /* ===================================================================== */
-/* §4  pot                                                                */
+/* §4  random — LCG + cheap hashes                                        */
 /* ===================================================================== */
 
-typedef enum { POT_BIG=0, POT_SMALL, POT_NONE, POT_COUNT } PotType;
-static const char *k_pot_names[] = { "big", "small", "none" };
-
-/*
- * Pot art — drawn centred at (cx, base_row).
- *
- * All strings in each array share the same maxw so draw_pot's
- * left-edge calculation (lx = cx - maxw/2) keeps every line
- * visually centred.  Each row's wall characters sit at the
- * same column positions as the rows above and below.
- *
- * POT_BIG  (17-char max, walls at col 1 and col 16):
- *   row 0  __ rim top  __ (cols 2-15, inset 1 from walls)
- *   row 1  /  rim arc  \  (cols 1-16, outermost)
- *   row 2  |  body     |  (cols 1-16, same as rim arc)
- *   row 3  |  body     |
- *   row 4  \_ base arc_/  (cols 2-15, inset 1, tapers inward)
- *
- * POT_SMALL (10-char max, walls at col 0 and col 9):
- *   row 0   _ rim top _   (cols 1-8, inset 1)
- *   row 1  /  body    \   (cols 0-9, outermost)
- *   row 2  |  body    |   (cols 0-9)
- *   row 3  \_ base   _/   (cols 1-8, inset 1)
- */
-static const char *k_pot_big[] = {
-    "  ______________",
-    " /              \\",
-    " |              |",
-    " |              |",
-    "  \\____________/",
-    NULL
-};
-
-static const char *k_pot_small[] = {
-    " ________",
-    "/        \\",
-    "|        |",
-    " \\______/",
-    NULL
-};
-
-/*
- * draw_pot — render the pot centred horizontally at cx, bottom at row.
- * Returns the row of the topmost pot line (= where trunk starts).
- */
-static int draw_pot(int cx, int rows, PotType type)
+static inline uint32_t lcg_next(uint32_t *st)
 {
-    if (type == POT_NONE) return rows - 1;
-
-    const char **lines = (type == POT_BIG) ? k_pot_big : k_pot_small;
-    int n = 0;
-    while (lines[n]) n++;
-
-    /* measure widest line for centering */
-    int maxw = 0;
-    for (int i = 0; i < n; i++) {
-        int w = (int)strlen(lines[i]);
-        if (w > maxw) maxw = w;
-    }
-
-    int top_row = rows - n;
-    attron(COLOR_PAIR(5) | A_BOLD);
-    for (int i = 0; i < n; i++) {
-        int lx = cx - maxw/2;
-        if (lx < 0) lx = 0;
-        mvprintw(top_row + i, lx, "%s", lines[i]);
-    }
-    attroff(COLOR_PAIR(5) | A_BOLD);
-
-    return top_row;   /* trunk initialises here; first draw lands at top_row-1 (rim-adjacent) */
+    *st = *st * 1664525u + 1013904223u;
+    return *st;
 }
 
-/* ===================================================================== */
-/* §5  branch                                                             */
-/* ===================================================================== */
-
-typedef enum {
-    BR_TRUNK  = 0,
-    BR_LEFT   = 1,
-    BR_RIGHT  = 2,
-    BR_DYING  = 3,
-    BR_DEAD   = 4,
-} BranchType;
-
-/*
- * Tree types — control the growth algorithm weights:
- *
- *   TREE_RANDOM   — cbonsai default: balanced trunk + spread branches
- *   TREE_DWARF    — very short life, dense branching, compact
- *   TREE_WEEPING  — branches strongly prefer downward drift
- *   TREE_SPARSE   — low multiplier, long life, open canopy
- *   TREE_BAMBOO   — trunk grows almost straight up, thin side shoots
- */
-typedef enum {
-    TREE_RANDOM=0, TREE_DWARF, TREE_WEEPING, TREE_SPARSE, TREE_BAMBOO,
-    TREE_COUNT
-} TreeType;
-static const char *k_tree_names[] = {
-    "random","dwarf","weeping","sparse","bamboo"
-};
-
-/*
- * Branch — one growing segment of the tree.
- *
- * x, y      current cell position
- * life      steps remaining before this branch dies
- * type      trunk / left / right / dying
- * dx, dy    current direction (−1/0/+1 each)
- * age       steps taken so far (used for character selection)
- */
-typedef struct {
-    int        x, y;
-    int        life;
-    BranchType type;
-    int        dx, dy;
-    int        age;
-    bool       alive;
-} Branch;
-
-/*
- * branch_char — choose the ASCII character for a branch segment.
- *
- * Based on direction and type, matching cbonsai's character choices:
- *   trunk rising straight   → |  (pipe)
- *   trunk leaning           → /\ (slashes)
- *   thin diagonal branch    → /\ or ~  (wiggle for dying)
- *   thick horizontal        → _ (underscore)
- *   dying / very thin       → ~ (tilde)
- */
-static char branch_char(int dx, int dy, BranchType type, int age)
+static inline float lcg_unit(uint32_t *st)
 {
-    if (type == BR_DYING) {
-        /* dying: sparse, wiggly */
-        const char *dying = "~";
-        return dying[0];
-    }
-
-    /* trunk near base: thick chars */
-    if (type == BR_TRUNK && age < 4) {
-        if      (dy == -1 && dx ==  0) return '|';
-        else if (dy == -1 && dx ==  1) return '\\';
-        else if (dy == -1 && dx == -1) return '/';
-        else if (dy ==  0 && dx ==  1) return '_';
-        else if (dy ==  0 && dx == -1) return '_';
-    }
-
-    if (dy == -1) {
-        if      (dx ==  0) return '|';
-        else if (dx ==  1) return '\\';
-        else if (dx == -1) return '/';
-    } else if (dy == 0) {
-        if      (dx ==  1) return '_';
-        else if (dx == -1) return '_';
-        else               return '-';
-    } else {
-        /* downward (weeping) */
-        if      (dx ==  1) return '\\';
-        else if (dx == -1) return '/';
-        else               return '|';
-    }
-    return '?';
+    return (float)(lcg_next(st) >> 8) / (float)(1u << 24);
 }
 
-/*
- * branch_color — color pair for a branch segment.
- *
- * Young trunk → dark wood (pair 1, bold).
- * Older trunk + thick branches → light wood (pair 2).
- * Thin / dying → light wood, no bold.
- */
-static int branch_color(BranchType type, int life, int life_max)
+static inline float lcg_range(uint32_t *st, float lo, float hi)
 {
-    if (type == BR_TRUNK)
-        return (life > life_max * 2/3) ? 1 : 2;
-    if (type == BR_DYING) return 2;
-    return (life > 8) ? 2 : 2;
+    return lo + (hi - lo) * lcg_unit(st);
 }
 
-static bool branch_bold(BranchType type, int life, int life_max)
+/* Stateless 3-input hash → uint32 for per-cell rustle gating. */
+static inline uint32_t hash3(int x, int y, int t)
 {
-    if (type == BR_TRUNK && life > life_max * 2/3) return true;
-    if (type == BR_DYING) return false;
-    return (life > life_max / 2);
+    uint32_t h = (uint32_t)x * 374761393u
+               + (uint32_t)y * 668265263u
+               + (uint32_t)t * 2147483647u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return h ^ (h >> 16);
 }
 
 /* ===================================================================== */
-/* §6  tree                                                               */
+/* §5  tree — recursive skeleton generation                               */
 /* ===================================================================== */
-
-/*
- * Leaf characters — randomly chosen when a branch dies.
- * Custom sets can be cycled with the 'l' key.
- */
-static const char *k_leaf_sets[] = {
-    "&",
-    "*",
-    "@",
-    "#",
-    "~",
-    "&*@",
-    "+",
-};
-#define LEAF_SETS  (int)(sizeof k_leaf_sets / sizeof k_leaf_sets[0])
 
 typedef struct {
-    Branch  pool[BRANCH_MAX];
-    int     n;              /* active branch count               */
-    bool    growing;        /* false = tree finished             */
-    int     shoots;         /* live branch count this generation */
-    int     shoot_max;      /* max shoots = multiplier           */
-    int     leaf_set;       /* index into k_leaf_sets            */
-    TreeType tree_type;
-    int     life_start;     /* life given to trunk               */
-    int     multiplier;
+    float    x0, y0, x1, y1;
+    int      depth;        /* 0 = trunk, 1 = primary branch, ...   */
+} Segment;
+
+typedef struct {
+    float    cx, cy;       /* centre in cell coords                */
+    float    radius;       /* base radius (x); y radius applies aspect */
+    int      depth_at_tip; /* used for snow-tip flag in WINTER     */
+} FoliageCloud;
+
+typedef struct {
+    Segment      segs[SEG_MAX];
+    int          n_segs;
+    FoliageCloud fols[FOL_MAX];
+    int          n_fols;
 } Tree;
 
-static void tree_reset(Tree *t, int cx, int cy,
-                       TreeType type, int life, int mult)
-{
-    memset(t, 0, sizeof *t);
-    t->tree_type  = type;
-    t->life_start = life;
-    t->multiplier = mult;
-    t->shoot_max  = mult;
-    t->growing    = true;
+static Tree g_tree;
 
-    /* seed trunk branch */
-    t->pool[0] = (Branch){
-        .x     = cx,
-        .y     = cy,
-        .life  = life,
-        .type  = BR_TRUNK,
-        .dx    = 0,
-        .dy    = -1,
-        .age   = 0,
-        .alive = true,
-    };
-    t->n = 1;
+static void tree_clear(Tree *t)
+{
+    t->n_segs = 0;
+    t->n_fols = 0;
+}
+
+static void seg_add(Tree *t, float x0, float y0, float x1, float y1, int depth)
+{
+    if (t->n_segs >= SEG_MAX) return;
+    Segment *s = &t->segs[t->n_segs++];
+    s->x0 = x0; s->y0 = y0; s->x1 = x1; s->y1 = y1;
+    s->depth = depth;
+}
+
+static void fol_add(Tree *t, float cx, float cy, float radius, int depth)
+{
+    if (t->n_fols >= FOL_MAX) return;
+    FoliageCloud *f = &t->fols[t->n_fols++];
+    f->cx = cx; f->cy = cy; f->radius = radius;
+    f->depth_at_tip = depth;
 }
 
 /*
- * tree_new_branch — spawn a child branch from parent position.
- */
-static void tree_new_branch(Tree *t, int x, int y,
-                             int life, BranchType type, int dx, int dy)
-{
-    if (t->n >= BRANCH_MAX) return;
-    t->pool[t->n++] = (Branch){
-        .x=x,.y=y,.life=life,.type=type,
-        .dx=dx,.dy=dy,.age=0,.alive=true
-    };
-    t->shoots++;
-}
-
-/*
- * next_dir — advance direction based on tree type and current state.
+ * grow_branch — recursive descent.  Walks (start → end) along `dir` for
+ * `length` cells, emits a Segment, then either spawns sub-branches or
+ * places a foliage cloud at the tip.
  *
- * Returns new (dx, dy).  The algorithm mirrors cbonsai's original
- * heuristic: biased random walk, type-specific weights.
+ * `dir` is a 2-D unit-ish vector in screen-cell space; we scale y by
+ * 1/CELL_ASPECT so that "1 unit of length" produces equal physical
+ * pixels regardless of direction.
  */
-static void next_dir(TreeType type, BranchType btype,
-                     int age, int life,
-                     int cur_dx, int cur_dy,
-                     int *out_dx, int *out_dy)
+static void grow_branch(Tree *t, uint32_t *rng,
+                        float x, float y, float dir_x, float dir_y,
+                        float length, int depth,
+                        const StyleParams *sp, bool no_foliage)
 {
-    int dx = cur_dx;
-    int dy = cur_dy;
-
-    /* random perturbation — direction drifts each step */
-    int r = rand() % 10;
-
-    switch (type) {
-
-    case TREE_BAMBOO:
-        /*
-         * Bamboo: trunk almost always goes straight up.
-         * Very slight horizontal drift (1-in-10 chance per step).
-         */
-        if (btype == BR_TRUNK) {
-            dy = -1;
-            dx = (r == 0) ? 1 : (r == 1) ? -1 : 0;
-        } else {
-            /* side shoots spread quickly then flatten */
-            dx = (age < 3) ? cur_dx : 0;
-            dy = (age < 2) ? -1 : 0;
+    if (length < MIN_LEN || depth > sp->max_depth) {
+        if (!no_foliage) {
+            float r = sp->foliage_size * (0.6f + lcg_unit(rng) * 0.6f);
+            fol_add(t, x, y, r, depth);
         }
-        break;
-
-    case TREE_WEEPING:
-        /*
-         * Weeping: trunk goes up normally, but branches strongly
-         * prefer to droop downward as they age.
-         */
-        if (btype == BR_TRUNK) {
-            dy = -1;
-            dx = (r < 4) ? 0 : (r < 7) ? 1 : -1;
-        } else {
-            /* branches droop: after a few steps go sideways then down */
-            dy = (age < 2) ? -1 : (age < 5) ? 0 : 1;
-            dx = cur_dx + (r < 3 ? 1 : r < 6 ? -1 : 0);
-            if (dx >  1) dx =  1;
-            if (dx < -1) dx = -1;
-        }
-        break;
-
-    case TREE_DWARF:
-        /*
-         * Dwarf: compact, dense. Branches spread wide quickly.
-         */
-        if (btype == BR_TRUNK) {
-            dy = -1;
-            dx = (r < 5) ? 0 : (r < 8) ? 1 : -1;
-        } else {
-            dx = cur_dx + (r < 4 ? 1 : r < 8 ? -1 : 0);
-            dy = (r < 6) ? -1 : 0;
-            if (dx >  1) dx =  1;
-            if (dx < -1) dx = -1;
-        }
-        break;
-
-    case TREE_SPARSE:
-        /*
-         * Sparse: branches grow long and mostly upward.
-         * Very little horizontal drift on trunk.
-         */
-        if (btype == BR_TRUNK) {
-            dy = -1;
-            dx = (r < 2) ? 1 : (r < 4) ? -1 : 0;
-        } else {
-            dx = cur_dx + (r < 2 ? 1 : r < 4 ? -1 : 0);
-            dy = (r < 7) ? -1 : 0;
-            if (dx >  1) dx =  1;
-            if (dx < -1) dx = -1;
-        }
-        break;
-
-    default: /* TREE_RANDOM — cbonsai default */
-        if (btype == BR_TRUNK) {
-            /* trunk drifts slowly: mostly up, slight horizontal wobble */
-            if (r <= 2)      { dy = -1; dx =  0; }
-            else if (r <= 4) { dy = -1; dx =  1; }
-            else if (r <= 6) { dy = -1; dx = -1; }
-            else if (r == 7) { dy =  0; dx =  1; }
-            else             { dy =  0; dx = -1; }
-        } else {
-            /* branches: weighted toward spreading outward */
-            int bias = (btype == BR_LEFT) ? -1 : 1;
-            dx = cur_dx + bias * (r < 5 ? 0 : r < 8 ? 1 : -1);
-            dy = (r < 5) ? -1 : (r < 8) ? 0 : (rand()%3==0 ? 1 : -1);
-            if (dx >  2) dx =  2;
-            if (dx < -2) dx = -2;
-        }
-        break;
+        return;
     }
 
-    *out_dx = dx;
-    *out_dy = dy;
+    /* Apply cell-aspect to y component so the branch is the same
+     * physical length regardless of angle. */
+    float ex = x + dir_x * length;
+    float ey = y + dir_y * length / CELL_ASPECT;
+    seg_add(t, x, y, ex, ey, depth);
+
+    /* Decide how to continue: extend (with bend) and/or branch. */
+    int n_subs = 1;
+    if (lcg_unit(rng) < sp->branch_density && depth < sp->max_depth - 1) {
+        n_subs = 2;                    /* fork into 2 */
+    }
+    if (depth == 0 && lcg_unit(rng) < 0.6f) n_subs = 2;
+
+    for (int i = 0; i < n_subs; i++) {
+        float bend = lcg_range(rng, -0.40f, 0.40f);
+        if (n_subs > 1) {
+            /* Two children fork outward at moderate angles. */
+            bend = (i == 0 ? -1 : +1) * lcg_range(rng, 0.5f, 0.95f);
+        }
+        float c = cosf(bend), s = sinf(bend);
+        float ndx = dir_x * c - dir_y * s;
+        float ndy = dir_x * s + dir_y * c;
+        /* Slight upward bias (anti-gravity for branches that aren't
+         * cascading) so non-trunk branches reach upward. */
+        if (depth > 0 && ndy > -0.1f) ndy -= 0.2f;
+        float nlen = length * BRANCH_LEN_F;
+        grow_branch(t, rng, ex, ey, ndx, ndy, nlen, depth + 1, sp, no_foliage);
+    }
 }
 
 /*
- * tree_step — advance one growth tick.
+ * tree_generate — entry point.  Picks pot dimensions, lays out the
+ * trunk according to style, and recurses for branches.
  *
- * For each live branch:
- *   1. Compute next direction.
- *   2. Move position.
- *   3. Determine if it should spawn children.
- *   4. Decrement life; on death scatter leaves.
- *   5. Draw the character at the new position.
- *
- * Returns false when no branches are alive (tree done).
+ * Returns the y-coordinate of the pot's TOP edge so the renderer can
+ * draw the pot frame.
  */
-static bool tree_step(Tree *t, int cols, int rows, int trunk_base_y)
+static int tree_generate(Tree *t, uint32_t seed, int cols, int rows_eff,
+                         TreeStyle style, bool no_foliage)
 {
-    bool any_alive = false;
-    int n_this_tick = t->n;   /* only step branches that existed at start */
+    uint32_t rng = seed;
+    tree_clear(t);
 
-    for (int i = 0; i < n_this_tick; i++) {
-        Branch *b = &t->pool[i];
-        if (!b->alive) continue;
-        any_alive = true;
+    const StyleParams *sp = &styles[style];
 
-        /* advance direction */
-        int nx, ny;
-        next_dir(t->tree_type, b->type, b->age, t->life_start,
-                 b->dx, b->dy, &nx, &ny);
-        b->dx = nx;
-        b->dy = ny;
+    /* Pot occupies bottom POT_ROWS rows. */
+    int pot_rows = (rows_eff >= 18) ? 4 : 3;
+    int pot_top  = rows_eff - pot_rows - 1;
+    if (pot_top < 5) pot_top = rows_eff - 1;
 
-        b->x  += b->dx;
-        b->y  += b->dy;
-        b->age++;
-        b->life--;
+    /* Trunk rooted at (mid, pot_top). */
+    float trunk_height = (float)(pot_top) * sp->trunk_height_frac;
+    if (trunk_height > (float)pot_top - 1.0f) trunk_height = (float)pot_top - 1.0f;
+    if (trunk_height < 4.0f) trunk_height = 4.0f;
+    float mid = (float)cols * 0.5f;
 
-        /* clamp to screen */
-        if (b->x < 0)      b->x = 0;
-        if (b->x >= cols)  b->x = cols - 1;
-        if (b->y < 0)      b->y = 1;
-        if (b->y >= rows)  b->y = rows - 1;
+    /* Build trunk as a poly-line of small segments — gives the trunk
+     * its style-specific shape.  At each segment endpoint we have a
+     * branching opportunity. */
+    int trunk_segs = (int)(trunk_height * 1.8f);
+    if (trunk_segs < 6) trunk_segs = 6;
+    if (trunk_segs > 30) trunk_segs = 30;
 
-        /* draw branch character */
-        BranchType draw_type = (b->life <= 3) ? BR_DYING : b->type;
-        char ch = branch_char(b->dx, b->dy, draw_type, b->age);
-        int  cp = branch_color(b->type, b->life, t->life_start);
-        bool bo = branch_bold (b->type, b->life, t->life_start);
-
-        attr_t attr = COLOR_PAIR(cp) | (bo ? A_BOLD : 0);
-        attron(attr);
-        mvaddch(b->y, b->x, (chtype)(unsigned char)ch);
-        attroff(attr);
-
-        /*
-         * Branching logic — mirrors cbonsai:
-         * Trunk re-branches when not close to ground AND either randomly
-         * or upon every <multiplier> steps.
-         */
-        bool should_branch = false;
-
-        if (b->type == BR_TRUNK) {
-            int dist_from_base = trunk_base_y - b->y;
-            if (dist_from_base > 3) {
-                /* random branch: 1-in-multiplier chance per step */
-                if (t->multiplier > 0 && (rand() % (MULT_MAX - t->multiplier + 2)) == 0)
-                    should_branch = true;
-                /* periodic branch every multiplier steps */
-                if (t->multiplier > 0 && (b->age % (t->multiplier + 1)) == 0)
-                    should_branch = true;
+    float prev_x = mid, prev_y = (float)pot_top;
+    for (int i = 1; i <= trunk_segs; i++) {
+        float frac = (float)i / (float)trunk_segs;
+        float y    = (float)pot_top - frac * trunk_height;
+        float x;
+        switch (style) {
+        case STYLE_CHOKKAN:
+            x = mid + lcg_range(&rng, -0.3f, 0.3f);
+            break;
+        case STYLE_MOYOGI:
+            x = mid + sp->trunk_curve_amp
+                    * sinf(2.0f * (float)M_PI * sp->trunk_curve_waves * frac);
+            break;
+        case STYLE_SHAKAN:
+            x = mid + sp->trunk_lean * frac * trunk_height;
+            break;
+        case STYLE_KENGAI: {
+            /* Trunk rises a short way, then arcs over the pot rim
+             * outward and downward.  We model it by putting trunk
+             * apex at frac = 0.30, then path drops/right.    */
+            float apex = 0.30f;
+            if (frac < apex) {
+                /* short straight rise */
+                x = mid;
+            } else {
+                float t2 = (frac - apex) / (1.0f - apex);
+                /* Arc outward right and slightly downward */
+                x = mid + 6.0f * sinf(t2 * (float)M_PI * 0.6f) * 1.5f;
+                /* Cascade down: reverse y to grow downward past pot */
+                y = (float)pot_top - apex * trunk_height + t2 * 6.0f;
             }
-        } else {
-            /* side branches spawn near-tips if shoots budget allows */
-            if (b->life > 3 && t->shoots < t->shoot_max * 3)
-                if ((rand() % 8) == 0)
-                    should_branch = true;
+            break;
+        }
+        case STYLE_BUNJIN:
+        default:
+            x = mid + sp->trunk_curve_amp
+                    * sinf(2.0f * (float)M_PI * sp->trunk_curve_waves * frac
+                           + 0.5f);
+            break;
         }
 
-        if (should_branch && t->n < BRANCH_MAX - 2) {
-            int child_life = b->life / 2;
-            if (child_life < 2) child_life = 2;
-            /* spawn left and right children */
-            tree_new_branch(t, b->x, b->y, child_life, BR_LEFT,  -1, -1);
-            tree_new_branch(t, b->x, b->y, child_life, BR_RIGHT,  1, -1);
+        /* Add the trunk segment. */
+        seg_add(t, prev_x, prev_y, x, y, 0);
+
+        /* Branching opportunity (skip first 30 % so trunk has a clean
+         * base, also skip very last 10 % so trunk apex is clean). */
+        if (frac > 0.30f && frac < 0.92f
+            && lcg_unit(&rng) < sp->branch_density) {
+            float angle = (lcg_unit(&rng) < 0.5f ? -1.0f : 1.0f)
+                        * lcg_range(&rng, 0.7f, 1.2f);
+            float dx = sinf(angle);
+            float dy = -fabsf(cosf(angle));   /* always upward          */
+            float blen = sp->branch_length * (1.0f - frac * 0.5f);
+            grow_branch(t, &rng, x, y, dx, dy, blen, 1, sp, no_foliage);
         }
 
-        /* die */
-        if (b->life <= 0) {
-            b->alive = false;
-            b->type  = BR_DEAD;
+        prev_x = x;
+        prev_y = y;
+    }
 
-            /* scatter leaves at death position */
-            const char *lset = k_leaf_sets[t->leaf_set % LEAF_SETS];
-            int llen = (int)strlen(lset);
+    /* Trunk tip foliage (skipped for KENGAI which trails off). */
+    if (style != STYLE_KENGAI && !no_foliage) {
+        float r = sp->foliage_size * 1.4f;     /* big crown at the top */
+        fol_add(t, prev_x, prev_y - 0.5f, r, sp->max_depth);
+    }
+    if (style == STYLE_KENGAI && !no_foliage) {
+        /* Foliage at the cascading tip */
+        fol_add(t, prev_x, prev_y, sp->foliage_size * 1.2f, sp->max_depth);
+    }
 
-            int n_leaves = 3 + rand() % 4;
-            for (int li = 0; li < n_leaves; li++) {
-                int lx = b->x + (rand() % 5) - 2;
-                int ly = b->y + (rand() % 3) - 1;
-                if (lx < 0 || lx >= cols) continue;
-                if (ly < 1 || ly >= rows) continue;
+    return pot_top;
+}
 
-                char lch = lset[rand() % llen];
-                int  lcp = (rand() & 1) ? 3 : 4;  /* dark or light leaf */
-                attron(COLOR_PAIR(lcp) | A_BOLD);
-                mvaddch(ly, lx, (chtype)(unsigned char)lch);
-                attroff(COLOR_PAIR(lcp) | A_BOLD);
-            }
+/* ===================================================================== */
+/* §6  raster — char grid + Bresenham + ellipse fill                      */
+/* ===================================================================== */
+
+static char     g_char[GRID_MAX_H][GRID_MAX_W];
+static uint8_t  g_role[GRID_MAX_H][GRID_MAX_W];
+static uint8_t  g_pair_idx[GRID_MAX_H][GRID_MAX_W];
+
+static void grid_clear(int rows_eff, int cols)
+{
+    for (int r = 0; r < rows_eff && r < GRID_MAX_H; r++)
+        for (int c = 0; c < cols && c < GRID_MAX_W; c++) {
+            g_char[r][c]     = ' ';
+            g_role[r][c]     = ROLE_EMPTY;
+            g_pair_idx[r][c] = 0;
+        }
+}
+
+static inline void grid_put(int r, int c, char ch, uint8_t role,
+                            uint8_t pair_idx, int rows_eff, int cols)
+{
+    if (r < 0 || r >= rows_eff || r >= GRID_MAX_H) return;
+    if (c < 0 || c >= cols     || c >= GRID_MAX_W) return;
+    /* Don't overwrite trunk/branch cells with foliage edges; trunk wins. */
+    uint8_t existing = g_role[r][c];
+    if (existing >= ROLE_TRUNK_DARK && existing <= ROLE_TRUNK_LIGHT
+        && role == ROLE_FOLIAGE) return;
+    g_char[r][c]     = ch;
+    g_role[r][c]     = role;
+    g_pair_idx[r][c] = pair_idx;
+}
+
+/*
+ * draw_segment — Bresenham line in cell coords.  Picks trunk-thick /
+ * medium / thin glyph by depth and writes to the grid.
+ */
+static void draw_segment(const Segment *s, int rows_eff, int cols)
+{
+    int x0 = (int)(s->x0 + 0.5f);
+    int y0 = (int)(s->y0 + 0.5f);
+    int x1 = (int)(s->x1 + 0.5f);
+    int y1 = (int)(s->y1 + 0.5f);
+
+    /* Pick glyph + role by depth. */
+    char glyph;
+    uint8_t role;
+    uint8_t pair_idx;     /* 0..2 within trunk palette */
+    if (s->depth <= 1) {
+        glyph    = TRUNK_THICK[((unsigned)abs(x0 + y0)) % (sizeof TRUNK_THICK - 1)];
+        role     = ROLE_TRUNK_DARK;
+        pair_idx = 0;
+    } else if (s->depth <= 3) {
+        glyph    = TRUNK_MEDIUM[((unsigned)abs(x0 + y0)) % (sizeof TRUNK_MEDIUM - 1)];
+        role     = ROLE_TRUNK_MID;
+        pair_idx = 1;
+    } else {
+        glyph    = TRUNK_THIN[((unsigned)abs(x0 + y0)) % (sizeof TRUNK_THIN - 1)];
+        role     = ROLE_TRUNK_LIGHT;
+        pair_idx = 2;
+    }
+
+    /* Bresenham. */
+    int dx = abs(x1 - x0), dy = abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+
+    while (1) {
+        /* Choose a glyph that hints at direction for diagonal cells. */
+        char g = glyph;
+        if (dx > dy * 2)        g = (s->depth <= 1) ? '=' : '-';
+        else if (dy > dx * 2)   g = (s->depth <= 1) ? 'H' : '|';
+        else if (sx == sy)      g = (s->depth <= 1) ? 'M' : '\\';
+        else if (sx != sy)      g = (s->depth <= 1) ? 'M' : '/';
+        grid_put(y0, x0, g, role, pair_idx, rows_eff, cols);
+
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+}
+
+/*
+ * draw_foliage_cloud — fill an aspect-corrected ellipse with random
+ * leaf glyphs from the active theme's leaf set.
+ */
+static void draw_foliage_cloud(const FoliageCloud *f, const Theme *th,
+                                uint32_t *rng,
+                                int rows_eff, int cols)
+{
+    int cxi = (int)(f->cx + 0.5f);
+    int cyi = (int)(f->cy + 0.5f);
+    float rx = f->radius;
+    float ry = f->radius / CELL_ASPECT;     /* corrected → round on screen */
+
+    int yr_lo = cyi - (int)(ry + 1);
+    int yr_hi = cyi + (int)(ry + 1);
+    int xr_lo = cxi - (int)(rx + 1);
+    int xr_hi = cxi + (int)(rx + 1);
+
+    int leaf_set_len = (int)strlen(th->leaf_set);
+
+    for (int y = yr_lo; y <= yr_hi; y++) {
+        for (int x = xr_lo; x <= xr_hi; x++) {
+            float dx = (float)(x - cxi);
+            float dy = (float)(y - cyi) * CELL_ASPECT;
+            float r2 = (dx*dx) / (rx*rx) + (dy*dy) / (rx*rx);
+            if (r2 > 1.0f) continue;
+
+            /* Density falloff at the edge — softer cloud. */
+            if (r2 > 0.6f && lcg_unit(rng) > 0.7f) continue;
+
+            char g = th->leaf_set[lcg_next(rng) % (uint32_t)leaf_set_len];
+            uint8_t pair_idx = (uint8_t)(lcg_next(rng) % 6u);
+            grid_put(y, x, g, ROLE_FOLIAGE, pair_idx, rows_eff, cols);
         }
     }
 
-    return any_alive;
+    /* WINTER snow tip on the topmost cell of each cloud (depth at tip
+     * means this is a terminal foliage point). */
+    if (th->snow_tip != NULL) {
+        int top = yr_lo + 1;
+        if (top >= 0 && top < rows_eff && cxi >= 0 && cxi < cols) {
+            grid_put(top, cxi, th->snow_tip[0], ROLE_SNOW_TIP, 5,
+                     rows_eff, cols);
+        }
+    }
 }
 
 /* ===================================================================== */
-/* §7  message                                                            */
+/* §7  pot — pot frame rendering                                          */
 /* ===================================================================== */
 
 /*
- * draw_message — draw a bordered message box.
- *
- * Positioned at (4, 2) top-left, matching cbonsai's default placement.
- * Wraps long messages at a fixed column width.
+ * draw_pot — a small trapezoidal pot centred under the trunk.  Width
+ * is half the screen, capped at PRECEDED constants.  The pot frame is
+ * drawn last so it sits on top of any trunk segments that dipped into
+ * its cells (e.g. KENGAI cascades).
  */
-static void draw_message(const char *msg, int cols, int rows)
+static void draw_pot(int pot_top, int rows_eff, int cols)
 {
-    if (!msg || !msg[0]) return;
+    int w = cols / 3;
+    if (w < 12) w = 12;
+    if (w > cols - 4) w = cols - 4;
+    int x0 = cols / 2 - w / 2;
+    int x1 = x0 + w - 1;
 
-    int mlen = (int)strlen(msg);
-    int max_w = (cols / 2) - 4;
-    if (max_w < 10) max_w = 10;
-    if (mlen < max_w) max_w = mlen;
+    /* Top rim row (just above the pot proper).  Slight overhang. */
+    int rim_y = pot_top + 1;
+    if (rim_y >= 0 && rim_y < rows_eff) {
+        for (int x = x0 - 1; x <= x1 + 1; x++) {
+            if (x < 0 || x >= cols) continue;
+            char c = POT_TOP_CH;
+            if (x == x0 - 1)      c = POT_LIP_LEFT;
+            else if (x == x1 + 1) c = POT_LIP_RIGHT;
+            grid_put(rim_y, x, c, ROLE_POT, 0, rows_eff, cols);
+        }
+    }
 
-    int box_w = max_w + MSG_PAD * 2 + 2;  /* +2 for border chars */
-    int box_h = 3;                         /* border + text + border */
-    int bx = 4, by = 2;
-    if (bx + box_w >= cols) bx = 0;
-    if (by + box_h >= rows) by = 0;
+    /* Side walls + bottom row(s). */
+    int pot_rows = rows_eff - pot_top - 1;
+    if (pot_rows < 1) pot_rows = 1;
+    if (pot_rows > 4) pot_rows = 4;
 
-    attron(COLOR_PAIR(6) | A_BOLD);
+    for (int i = 0; i < pot_rows; i++) {
+        int y = rim_y + 1 + i;
+        if (y >= rows_eff) break;
 
-    /* top border */
-    mvaddch(by, bx, ACS_ULCORNER);
-    for (int i = 1; i < box_w - 1; i++) mvaddch(by, bx+i, ACS_HLINE);
-    mvaddch(by, bx + box_w - 1, ACS_URCORNER);
-
-    /* middle row with message */
-    mvaddch(by+1, bx, ACS_VLINE);
-    for (int i = 0; i < MSG_PAD; i++) mvaddch(by+1, bx+1+i, ' ');
-    int tx = bx + 1 + MSG_PAD;
-    for (int i = 0; i < max_w && msg[i]; i++)
-        mvaddch(by+1, tx+i, (chtype)(unsigned char)msg[i]);
-    for (int i = 0; i < MSG_PAD; i++) mvaddch(by+1, tx+max_w+i, ' ');
-    mvaddch(by+1, bx + box_w - 1, ACS_VLINE);
-
-    /* bottom border */
-    mvaddch(by+2, bx, ACS_LLCORNER);
-    for (int i = 1; i < box_w - 1; i++) mvaddch(by+2, bx+i, ACS_HLINE);
-    mvaddch(by+2, bx + box_w - 1, ACS_LRCORNER);
-
-    attroff(COLOR_PAIR(6) | A_BOLD);
+        if (i == pot_rows - 1) {
+            /* Bottom row — solid. */
+            for (int x = x0; x <= x1; x++) {
+                if (x < 0 || x >= cols) continue;
+                char c = POT_BOTTOM_CH;
+                if (x == x0)      c = '\\';
+                else if (x == x1) c = '/';
+                grid_put(y, x, c, ROLE_POT, 0, rows_eff, cols);
+            }
+        } else {
+            /* Side walls. */
+            if (x0 >= 0 && x0 < cols)
+                grid_put(y, x0, POT_SIDE_CH, ROLE_POT, 0, rows_eff, cols);
+            if (x1 >= 0 && x1 < cols)
+                grid_put(y, x1, POT_SIDE_CH, ROLE_POT, 0, rows_eff, cols);
+            /* Faint interior fill (just a few dots). */
+            for (int x = x0 + 1; x <= x1 - 1; x++) {
+                if (x < 0 || x >= cols) continue;
+                if (((unsigned)(x + y)) & 3u) continue;   /* 25 % density */
+                grid_put(y, x, '.', ROLE_POT, 0, rows_eff, cols);
+            }
+        }
+    }
 }
 
 /* ===================================================================== */
-/* §8  scene                                                              */
+/* §8  scene — generate + raster + render with rustle                     */
 /* ===================================================================== */
 
-/*
- * Scene — owns all runtime state.
- *
- * The tree grows on treeWin-equivalent: stdscr with erase each regrow.
- * We repaint the static elements (pot, message, HUD) every render frame
- * and only call tree_step() when the growth accumulator fires.
- */
 typedef struct {
-    Tree      tree;
-    TreeType  tree_type;
-    PotType   pot_type;
-    int       multiplier;
-    int       life;
-    int       grow_fps;
-    int       leaf_set;
-
-    bool      live_mode;    /* animate growth step by step              */
-    bool      infinite;     /* regrow when tree finishes                */
-    bool      screensaver;  /* live+infinite, any key quits             */
-    bool      show_msg;     /* message box visible                      */
-    char      message[MSG_MAX];
-
-    unsigned int seed;
-    bool      paused;
-    bool      done;         /* tree finished growing                    */
-    bool      growing;
-
-    /* regrow wait state */
-    int64_t   wait_accum;   /* ns accumulated waiting after tree done   */
-
-    /* trunk init row = pot's top row; first drawn char lands one row above */
-    int       trunk_base_y;
-    int       trunk_cx;     /* centre x */
+    bool       paused;
+    int        cols, rows;
+    uint32_t   seed;
+    int        current_style;
+    int        current_theme;
+    float      time;
+    int        pot_top;     /* y row of pot's top edge                  */
 } Scene;
 
-static void scene_plant(Scene *s, int cols, int rows)
+static void scene_rebuild(Scene *s)
 {
-    /*
-     * Plant a new tree.
-     * trunk_cx: horizontal centre of screen.
-     * trunk_base_y: row just above pot, computed after drawing pot.
-     */
-    s->trunk_cx     = cols / 2;
-    s->trunk_base_y = draw_pot(s->trunk_cx, rows, s->pot_type);
+    int rows_eff = s->rows - 1;
+    bool no_foliage = themes[s->current_theme].bare;
 
-    tree_reset(&s->tree, s->trunk_cx, s->trunk_base_y,
-               s->tree_type, s->life, s->multiplier);
-    s->tree.leaf_set = s->leaf_set;
-    s->done    = false;
-    s->growing = true;
-    s->wait_accum = 0;
+    s->pot_top = tree_generate(&g_tree, s->seed, s->cols, rows_eff,
+                                (TreeStyle)s->current_style, no_foliage);
+
+    grid_clear(rows_eff, s->cols);
+
+    /* Draw segments (trunk + branches). */
+    for (int i = 0; i < g_tree.n_segs; i++)
+        draw_segment(&g_tree.segs[i], rows_eff, s->cols);
+
+    /* Draw foliage. */
+    const Theme *th = &themes[s->current_theme];
+    uint32_t fol_rng = s->seed ^ 0xDEC0DEu;
+    for (int i = 0; i < g_tree.n_fols; i++)
+        draw_foliage_cloud(&g_tree.fols[i], th, &fol_rng, rows_eff, s->cols);
+
+    /* Draw pot. */
+    draw_pot(s->pot_top, rows_eff, s->cols);
 }
 
 static void scene_init(Scene *s, int cols, int rows)
 {
     memset(s, 0, sizeof *s);
-    s->tree_type  = TREE_RANDOM;
-    s->pot_type   = POT_BIG;
-    s->multiplier = MULT_DEFAULT;
-    s->life       = LIFE_DEFAULT;
-    s->grow_fps   = GROW_FPS_DEFAULT;
-    s->leaf_set   = 0;
-    s->live_mode  = true;
-    s->infinite   = false;
-    s->screensaver= false;
-    s->show_msg   = false;
-    strncpy(s->message, "bonsai!", MSG_MAX - 1);
-    s->seed       = (unsigned int)clock_ns();
-    srand(s->seed);
+    s->cols          = cols;
+    s->rows          = rows;
+    s->seed          = (uint32_t)clock_ns();
+    s->current_style = STYLE_MOYOGI;
+    s->current_theme = 0;
+    s->time          = 0.0f;
+    scene_rebuild(s);
+}
 
-    scene_plant(s, cols, rows);
+static void scene_resize(Scene *s, int cols, int rows)
+{
+    s->cols = cols;
+    s->rows = rows;
+    scene_rebuild(s);
+}
+
+static void scene_reseed(Scene *s)
+{
+    s->seed = (uint32_t)clock_ns() ^ 0xA5A5A5A5u;
+    scene_rebuild(s);
+}
+
+static void scene_cycle_style(Scene *s, int dir)
+{
+    int idx = s->current_style + dir;
+    while (idx < 0) idx += N_STYLES;
+    s->current_style = idx % N_STYLES;
+    scene_rebuild(s);
+}
+
+static void scene_cycle_theme(Scene *s, int dir)
+{
+    int idx = s->current_theme + dir;
+    while (idx < 0) idx += N_THEMES;
+    s->current_theme = idx % N_THEMES;
+    theme_apply(s->current_theme);
+    scene_rebuild(s);     /* WINTER toggles foliage on/off → rebuild */
+}
+
+static void scene_tick(Scene *s, float dt)
+{
+    if (s->paused) return;
+    s->time += dt;
 }
 
 /*
- * scene_tick — called each growth step from the accumulator.
- * Returns false when tree has just finished.
+ * scene_render — emit the char grid to ncurses.  For foliage cells,
+ * gate a per-cell rustle: hash(col, row, ⌊time · RUSTLE_FREQ⌋) gives
+ * a stable random per-cell seed; if the high bits fall under a
+ * threshold, re-pick the leaf glyph.
+ *
+ * Inverted theme (SUMI_E): pre-fill white background before drawing
+ * the tree, and disable A_BOLD/A_DIM (light fg over white bg would
+ * invert the brightness intent).
  */
-static bool scene_tick(Scene *s, int cols, int rows)
+static void scene_render(const Scene *s)
 {
-    if (s->done || s->paused) return true;
+    int rows_eff = s->rows - 1;
+    if (rows_eff < 1) return;
+    int cols = s->cols;
+    if (rows_eff > GRID_MAX_H) rows_eff = GRID_MAX_H;
+    if (cols     > GRID_MAX_W) cols     = GRID_MAX_W;
 
-    bool alive = tree_step(&s->tree, cols, rows, s->trunk_base_y);
-    if (!alive) {
-        s->done    = true;
-        s->growing = false;
-        return false;
+    const Theme *th       = &themes[s->current_theme];
+    bool         inverted = th->inverted;
+    int          time_key = (int)(s->time * RUSTLE_FREQ);
+    int          leaf_len = (int)strlen(th->leaf_set);
+
+    /* Pre-fill white "paper" if SUMI_E. */
+    if (inverted) {
+        attron(COLOR_PAIR(PAIR_PAPER));
+        for (int r = 0; r < rows_eff; r++)
+            for (int c = 0; c < cols; c++)
+                mvaddch(r, c, ' ');
+        attroff(COLOR_PAIR(PAIR_PAPER));
     }
-    return true;
-}
 
-/*
- * scene_draw_static — repaint elements that don't change each growth step:
- * pot, message, HUD.  Called every render frame.
- */
-static void scene_draw_static(Scene *s, int cols, int rows, double fps)
-{
-    /* pot */
-    draw_pot(s->trunk_cx, rows, s->pot_type);
+    int    last_pair = -1;
+    attr_t last_attr = 0;
 
-    /* message */
-    if (s->show_msg)
-        draw_message(s->message, cols, rows);
+    for (int r = 0; r < rows_eff; r++) {
+        for (int c = 0; c < cols; c++) {
+            uint8_t role = g_role[r][c];
+            if (role == ROLE_EMPTY) {
+                if (!inverted && last_pair >= 0) {
+                    attroff(COLOR_PAIR(last_pair) | last_attr);
+                    last_pair = -1;
+                }
+                continue;
+            }
 
-    /* HUD — top right */
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps [%s][%s] M:%d L:%d ",
-             fps,
-             k_tree_names[s->tree_type],
-             k_pot_names[s->pot_type],
-             s->multiplier,
-             s->life);
-    int hx = cols - HUD_COLS;
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(7) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(7) | A_BOLD);
+            char glyph = g_char[r][c];
+            int  pair;
+            attr_t attr;
 
-    /* key hints bottom */
-    attron(COLOR_PAIR(6));
-    mvprintw(rows - 1, 0,
-        "t=type  b=pot  m=msg  M/N=branch  L/K=life  ]/[=speed  r=seed  q=quit");
-    attroff(COLOR_PAIR(6));
+            switch (role) {
+            case ROLE_TRUNK_DARK:
+                pair = PAIR_TRUNK_BASE + 0;
+                attr = inverted ? A_NORMAL : A_BOLD;
+                break;
+            case ROLE_TRUNK_MID:
+                pair = PAIR_TRUNK_BASE + 1;
+                attr = A_NORMAL;
+                break;
+            case ROLE_TRUNK_LIGHT:
+                pair = PAIR_TRUNK_BASE + 2;
+                attr = inverted ? A_NORMAL : A_DIM;
+                break;
+            case ROLE_FOLIAGE: {
+                uint8_t pair_idx = g_pair_idx[r][c];
+                pair = PAIR_FOLIAGE_BASE + (pair_idx % 6);
+                attr = (pair_idx >= 4 && !inverted) ? A_BOLD : A_NORMAL;
+                /* Per-cell rustle: stable bytes per (cell, time_key);
+                 * if random byte under threshold, re-pick glyph. */
+                uint32_t h = hash3(c, r, time_key);
+                if ((h & 0xFFu) < (uint32_t)(255.0f * RUSTLE_RATE)) {
+                    glyph = th->leaf_set[(h >> 8) % (uint32_t)leaf_len];
+                }
+                break;
+            }
+            case ROLE_SNOW_TIP:
+                pair = PAIR_FOLIAGE_BASE + 5;       /* whitest */
+                attr = inverted ? A_NORMAL : A_BOLD;
+                break;
+            case ROLE_POT:
+            default:
+                pair = PAIR_POT;
+                attr = A_NORMAL;
+                break;
+            }
 
-    /* status indicator */
-    const char *status = s->done    ? (s->infinite ? "waiting..." : "done")
-                       : s->paused  ? "PAUSED"
-                       : "growing";
-    attron(COLOR_PAIR(7));
-    mvprintw(0, 0, " [%s] seed:%u ", status, s->seed);
-    attroff(COLOR_PAIR(7));
+            if (pair != last_pair || attr != last_attr) {
+                if (last_pair >= 0)
+                    attroff(COLOR_PAIR(last_pair) | last_attr);
+                attron(COLOR_PAIR(pair) | attr);
+                last_pair = pair;
+                last_attr = attr;
+            }
+            mvaddch(r, c, (chtype)(unsigned char)glyph);
+        }
+    }
+    if (last_pair >= 0) attroff(COLOR_PAIR(last_pair) | last_attr);
 }
 
 /* ===================================================================== */
-/* §9  screen                                                             */
+/* §9  screen + app                                                       */
 /* ===================================================================== */
 
 typedef struct { int cols, rows; } Screen;
 
-static void screen_init(Screen *s)
+static void screen_init(Screen *sc)
 {
     initscr();
     noecho();
@@ -866,157 +1106,83 @@ static void screen_init(Screen *s)
     keypad(stdscr, TRUE);
     typeahead(-1);
     color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
+    getmaxyx(stdscr, sc->rows, sc->cols);
 }
-
-static void screen_free(Screen *s){ (void)s; endwin(); }
-
-static void screen_resize(Screen *s)
+static void screen_free(Screen *sc) { (void)sc; endwin(); }
+static void screen_resize_curses(Screen *sc)
 {
     endwin();
     refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
+    getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
-static void screen_present(void)
+static void screen_draw(Screen *sc, const Scene *s,
+                        double fps, int sim_fps)
 {
-    wnoutrefresh(stdscr);
-    doupdate();
+    erase();
+    scene_render(s);
+
+    char buf[200];
+    snprintf(buf, sizeof buf,
+             " BONSAI   %s   style:%s   theme:%s   "
+             "%4.1f fps  %3d Hz   "
+             "n/N:style  t/T:theme  r:reseed  spc:pause  q:quit ",
+             s->paused ? "PAUSED" : "RUSTLE",
+             styles[s->current_style].name,
+             themes[s->current_theme].name,
+             fps, sim_fps);
+
+    int row = sc->rows - 1;
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    for (int x = 0; x < sc->cols; x++) mvaddch(row, x, ' ');
+    mvprintw(row, 0, "%s", buf);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/* ===================================================================== */
-/* §10  app                                                               */
-/* ===================================================================== */
+static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 typedef struct {
     Scene                 scene;
     Screen                screen;
+    int                   sim_fps;
     volatile sig_atomic_t running;
     volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal(int sig)  { (void)sig; g_app.running    = 0; }
-static void on_resize_signal(int sig){ (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)            { endwin(); }
+static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
+static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
+static void cleanup(void)             { endwin(); }
 
-static void app_do_resize(App *app, int64_t *frame_time, int64_t *grow_accum)
+static void app_do_resize(App *app)
 {
-    screen_resize(&app->screen);
-    /* redraw from scratch on resize */
-    erase();
-    scene_plant(&app->scene, app->screen.cols, app->screen.rows);
-    srand(app->scene.seed);
-    *frame_time  = clock_ns();
-    *grow_accum  = 0;
+    screen_resize_curses(&app->screen);
+    scene_resize(&app->scene, app->screen.cols, app->screen.rows);
     app->need_resize = 0;
 }
 
-static void app_regrow(App *app, int64_t *frame_time, int64_t *grow_accum)
+static bool app_handle_key(App *app, int ch)
 {
-    app->scene.seed = (unsigned int)clock_ns();
-    srand(app->scene.seed);
-    erase();
-    scene_plant(&app->scene, app->screen.cols, app->screen.rows);
-    *frame_time = clock_ns();
-    *grow_accum = 0;
-}
-
-/*
- * app_handle_key — return false to quit.
- *
- * For screensaver mode any key quits.
- */
-static bool app_handle_key(App *app, int ch,
-                            int64_t *frame_time, int64_t *grow_accum)
-{
-    Scene  *s    = &app->scene;
-    int     cols = app->screen.cols;
-    int     rows = app->screen.rows;
-
-    if (s->screensaver) return false;   /* any key quits screensaver */
-
+    Scene *s = &app->scene;
     switch (ch) {
-    case 'q': case 'Q': case 27: return false;
+    case 'q': case 'Q': case 27 /* ESC */: return false;
+    case ' ':           s->paused = !s->paused;                       break;
+    case 'r': case 'R': scene_reseed(s);                              break;
 
-    case ' ':
-        s->paused = !s->paused;
-        break;
+    case 'n':           scene_cycle_style(s, +1);                     break;
+    case 'N':           scene_cycle_style(s, -1);                     break;
 
-    case 'r': case 'R':
-        /* new seed → full restart */
-        s->seed = (unsigned int)clock_ns();
-        srand(s->seed);
-        erase();
-        scene_plant(s, cols, rows);
-        *frame_time = clock_ns();
-        *grow_accum = 0;
-        break;
-
-    case 't': case 'T':
-        s->tree_type = (TreeType)((s->tree_type + 1) % TREE_COUNT);
-        erase();
-        scene_plant(s, cols, rows);
-        *frame_time = clock_ns();
-        *grow_accum = 0;
-        break;
-
-    case 'b': case 'B':
-        s->pot_type = (PotType)((s->pot_type + 1) % POT_COUNT);
-        erase();
-        scene_plant(s, cols, rows);
-        *frame_time = clock_ns();
-        *grow_accum = 0;
-        break;
-
-    case 'm':
-        s->show_msg = !s->show_msg;
-        break;
-
-    case 'M':
-        s->multiplier++;
-        if (s->multiplier > MULT_MAX) s->multiplier = MULT_MAX;
-        break;
-
-    case 'N':
-        s->multiplier--;
-        if (s->multiplier < MULT_MIN) s->multiplier = MULT_MIN;
-        break;
-
-    case 'L':
-        s->life += 10;
-        if (s->life > LIFE_MAX) s->life = LIFE_MAX;
-        break;
-
-    case 'K':
-        s->life -= 10;
-        if (s->life < LIFE_MIN) s->life = LIFE_MIN;
-        break;
-
-    case 'l':   /* cycle leaf character set */
-        s->leaf_set = (s->leaf_set + 1) % LEAF_SETS;
-        s->tree.leaf_set = s->leaf_set;
-        break;
+    case 't':           scene_cycle_theme(s, +1);                     break;
+    case 'T':           scene_cycle_theme(s, -1);                     break;
 
     case ']':
-        s->grow_fps += GROW_FPS_STEP;
-        if (s->grow_fps > GROW_FPS_MAX) s->grow_fps = GROW_FPS_MAX;
+        app->sim_fps += SIM_FPS_STEP;
+        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
         break;
-
     case '[':
-        s->grow_fps -= GROW_FPS_STEP;
-        if (s->grow_fps < GROW_FPS_MIN) s->grow_fps = GROW_FPS_MIN;
-        break;
-
-    case 'i': case 'I':
-        s->infinite = !s->infinite;
-        break;
-
-    case 'S':
-        s->screensaver = true;
-        s->live_mode   = true;
-        s->infinite    = true;
+        app->sim_fps -= SIM_FPS_STEP;
+        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
         break;
 
     default: break;
@@ -1024,126 +1190,41 @@ static bool app_handle_key(App *app, int ch,
     return true;
 }
 
-int main(int argc, char *argv[])
+int main(void)
 {
-    /* minimal CLI: -S screensaver, -i infinite, -m "msg", -s seed */
+    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+    atexit(cleanup);
+    signal(SIGINT,   on_exit_signal);
+    signal(SIGTERM,  on_exit_signal);
+    signal(SIGWINCH, on_resize_signal);
+
     App *app     = &g_app;
     app->running = 1;
+    app->sim_fps = SIM_FPS_DEFAULT;
 
     screen_init(&app->screen);
     scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    /* parse simple CLI args */
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-S") || !strcmp(argv[i], "--screensaver")) {
-            app->scene.screensaver = true;
-            app->scene.live_mode   = true;
-            app->scene.infinite    = true;
-        } else if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--infinite")) {
-            app->scene.infinite = true;
-        } else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--live")) {
-            app->scene.live_mode = true;
-        } else if ((!strcmp(argv[i], "-m") || !strcmp(argv[i], "--message"))
-                   && i+1 < argc) {
-            strncpy(app->scene.message, argv[++i], MSG_MAX-1);
-            app->scene.show_msg = true;
-        } else if ((!strcmp(argv[i], "-s") || !strcmp(argv[i], "--seed"))
-                   && i+1 < argc) {
-            app->scene.seed = (unsigned int)atoi(argv[++i]);
-            srand(app->scene.seed);
-            /* replant with new seed */
-            erase();
-            scene_plant(&app->scene,
-                        app->screen.cols, app->screen.rows);
-        } else if ((!strcmp(argv[i], "-M") || !strcmp(argv[i], "--multiplier"))
-                   && i+1 < argc) {
-            app->scene.multiplier = atoi(argv[++i]);
-            if (app->scene.multiplier < MULT_MIN) app->scene.multiplier = MULT_MIN;
-            if (app->scene.multiplier > MULT_MAX) app->scene.multiplier = MULT_MAX;
-        } else if ((!strcmp(argv[i], "-L") || !strcmp(argv[i], "--life"))
-                   && i+1 < argc) {
-            app->scene.life = atoi(argv[++i]);
-            if (app->scene.life < LIFE_MIN) app->scene.life = LIFE_MIN;
-            if (app->scene.life > LIFE_MAX) app->scene.life = LIFE_MAX;
-        } else if ((!strcmp(argv[i], "-t") || !strcmp(argv[i], "--type"))
-                   && i+1 < argc) {
-            app->scene.tree_type = (TreeType)(atoi(argv[++i]) % TREE_COUNT);
-        } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            endwin();
-            printf("Usage: bonsai [OPTIONS]\n\n");
-            printf("  -S, --screensaver      screensaver mode (live+infinite, any key quits)\n");
-            printf("  -i, --infinite         regrow tree after each one finishes\n");
-            printf("  -l, --live             animate growth step by step\n");
-            printf("  -m, --message STR      show message box next to tree\n");
-            printf("  -s, --seed INT         seed the random number generator\n");
-            printf("  -M, --multiplier INT   branch multiplier 0-20 [default: %d]\n", MULT_DEFAULT);
-            printf("  -L, --life INT         tree life 10-200 [default: %d]\n", LIFE_DEFAULT);
-            printf("  -t, --type INT         tree type 0=random 1=dwarf 2=weeping 3=sparse 4=bamboo\n");
-            printf("  -h, --help             show this help\n");
-            printf("\nRuntime keys:\n");
-            printf("  t = cycle type    b = cycle pot    m = toggle message\n");
-            printf("  M/N = more/fewer branches    L/K = longer/shorter\n");
-            printf("  ]/[ = faster/slower    r = new seed    space = pause    q = quit\n");
-            return 0;
-        }
-    }
-
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
-    atexit(cleanup);
-
     int64_t frame_time  = clock_ns();
-    int64_t grow_accum  = 0;
     int64_t fps_accum   = 0;
     int     frame_count = 0;
     double  fps_display = 0.0;
 
-    /*
-     * Render loop.
-     *
-     * Two accumulators:
-     *   grow_accum  — drives tree_step() at grow_fps Hz
-     *   fps_accum   — measures actual render fps for HUD
-     *
-     * The tree is drawn incrementally — we do NOT erase() each frame.
-     * Each tree_step() writes characters directly to stdscr and they
-     * persist until the next erase() (which only happens on regrow).
-     * Static elements (pot, HUD, message) are redrawn every frame so
-     * they stay on top of any branch characters that may land there.
-     */
     while (app->running) {
 
-        /* ── resize ──────────────────────────────────────────── */
-        if (app->need_resize)
-            app_do_resize(app, &frame_time, &grow_accum);
+        if (app->need_resize) {
+            app_do_resize(app);
+            frame_time = clock_ns();
+        }
 
-        /* ── dt ──────────────────────────────────────────────── */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
-        if (dt > 200 * NS_PER_MS) dt = 200 * NS_PER_MS;
+        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
 
-        /* ── growth accumulator ──────────────────────────────── */
-        Scene *s = &app->scene;
+        float dt_sec = (float)dt / (float)NS_PER_SEC;
+        scene_tick(&app->scene, dt_sec);
 
-        if (s->done && (s->infinite || s->screensaver)) {
-            /*
-             * Tree finished — wait INFINITE_WAIT_MS then regrow.
-             */
-            s->wait_accum += dt;
-            if (s->wait_accum >= INFINITE_WAIT_MS * NS_PER_MS)
-                app_regrow(app, &frame_time, &grow_accum);
-        } else if (!s->done) {
-            int64_t tick_ns = NS_PER_SEC / s->grow_fps;
-            grow_accum += dt;
-            while (grow_accum >= tick_ns && !s->done) {
-                scene_tick(s, app->screen.cols, app->screen.rows);
-                grow_accum -= tick_ns;
-            }
-        }
-
-        /* ── FPS counter ─────────────────────────────────────── */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -1153,22 +1234,16 @@ int main(int argc, char *argv[])
             fps_accum   = 0;
         }
 
-        /* ── static elements (redrawn every frame, on top) ───── */
-        scene_draw_static(s, app->screen.cols, app->screen.rows, fps_display);
+        int64_t target_ns = TICK_NS(app->sim_fps);
+        int64_t elapsed   = clock_ns() - frame_time + dt;
+        clock_sleep_ns(target_ns - elapsed);
 
-        /* ── flush ───────────────────────────────────────────── */
+        screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
         screen_present();
 
-        /* ── input ───────────────────────────────────────────── */
         int ch = getch();
-        if (ch != ERR) {
-            if (!app_handle_key(app, ch, &frame_time, &grow_accum))
-                app->running = 0;
-        }
-
-        /* ── frame cap ───────────────────────────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+        if (ch != ERR && !app_handle_key(app, ch))
+            app->running = 0;
     }
 
     screen_free(&app->screen);

@@ -40,8 +40,6 @@
  *       on RINGED-EARTH, new tints on EXOPLANET).
  *
  * Study alongside:
- *   atmospheric_sky.c — same V3 vector math, same theme-ramp +
- *                       glyph-density rendering convention.
  *   sphere_raytrace.c — the foundational ray-sphere intersection
  *                       routine that this file extends with a ring
  *                       plane and shadow rays.

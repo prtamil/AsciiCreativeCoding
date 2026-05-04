@@ -45,8 +45,6 @@
  *       'r' reseeds (random orbit phase + small y-offset).
  *
  * Study alongside:
- *   atmospheric_sky.c   — same framework, theme-ramp + glyph
- *                          density rendering.
  *   saturn_with_rings.c — same ray-sphere intersection routine and
  *                          shadow-test idiom; this file uses two
  *                          spheres but no shadow ray (corona is a

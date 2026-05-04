@@ -119,7 +119,7 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 | `displace_raster` | Real-time vertex displacement, central-difference normal recompute |
 | `donut` | Parametric torus projection — the original spinning donut |
 | `wireframe` | 3D Bresenham edge projection, slope-to-character line drawing |
-| `sun` | 3D solar simulation — noise-displaced sphere SDF + domain-warped fBm boiling surface; 8 flares (blast → magnetic Bézier-arch → decay state machine, capsule SDFs smooth-unioned via smin); exponential corona accumulator; limb darkening (1-coefficient law); temperature-mapped 256-color palette; 4 themes |
+| `sun_solar` | Clean 2-D screen-space sun with arc flares — radial classifier (disc / corona / empty), Eddington 1-coefficient limb darkening, animated fBm granulation + sunspots, parabolic-arc flares with `sin(πs)·life_envelope` lifecycle additively overlaid, exponential corona falloff. 5 themes (SOLAR / BLUE_GIANT / RED_DWARF / ALIEN / NEGATIVE) |
 | `nuke` (raymarcher) | Volumetric mushroom cloud — proper 2-D axisymmetric Boussinesq Navier-Stokes (Stam stable fluids): semi-Lagrangian advection of velocity/temperature/density, 40-iter Jacobi pressure projection for ∇·v=0, buoyancy `vy += β·(T−T₀)·dt`. Cap, vortex roll, and fall all EMERGE from the simulation — no scripted timeline. Beer–Lambert volumetric raymarcher samples the 2-D field at radius `√(x²+z²)`. 5 blast presets (TACTICAL/STANDARD/MEGATON/AIR_BURST/GROUND), 5 themes |
 
 ## Analytic Ray Tracing  (`raytracing/`)
@@ -131,7 +131,6 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 | `torus_raytrace` | Quartic intersection (sampling + bisection) — ring in XZ plane, gradient normal, Fresnel, 6 themes |
 | `capsule_raytrace` | Cylinder + hemisphere caps — axial projection body normal, cap sphere normal, inverse-rotation transform, 6 themes |
 | `path_tracer` | Monte Carlo path tracer — Lambertian BRDF, cosine hemisphere sampling (Malley's method), Russian roulette termination, progressive per-pixel accumulator, Reinhard tone map + gamma, Cornell Box scene with color bleeding |
-| `atmospheric_sky` | Procedural sky over a sin-sum mountain silhouette — per-pixel horizon→zenith ramp, Rayleigh-style sun proximity boost, fBm cloud bands with horizontal wind, hash-gated twinkling stars; 5 patterns (DAWN/DAY/DUSK/NIGHT/TRANSIT), 10 themes |
 | `saturn_with_rings` | Iconic ringed planet — analytic ray-sphere (planet) + ray-plane annulus (rings) with depth-sort occlusion; per-radius ring density + Cassini Division gap; shadow-ray to sun gives planet-cast dark band on rings; 4 patterns (SATURN/URANUS/RINGED-EARTH with fBm continents/EXOPLANET) |
 | `solar_eclipse` | Two ray-sphere tests + screen-space corona overlay — limb-darkened sun, depth-sorted moon transit, `exp(-d·k)·pow(occlusion,γ)` corona bloom only at totality, diamond-ring bead at sun edge opposite moon when sep ≈ \|moon_α − sun_α\|; 4 patterns (TOTAL/PARTIAL/ANNULAR/TRANSIT) |
 | `god_rays_silhouette` | Volumetric light shafts via per-cell screen-space shadow-ray accumulation — Beer–Lambert weighted samples toward sun, point-in-shape silhouette test gates each step; 5 silhouette patterns (ARCHWAY/MOUNTAIN/COLUMN/WINDOWS/TREE), fBm fog jitter, 10 themes |
@@ -359,9 +358,9 @@ fractals; cycle-through-triangles for Delaunay.
 | `particle_number_morph` | Solid filled particle morphing — up to 500 particles densely pack the full interior of a 9×7 bitmap font digit; greedy nearest-neighbour matching routes every particle to its closest target; positions lerp with smoothstep easing (no spring/velocity) for a clean deterministic glide; idle particles glide to centre and vanish; `f`/`F` morph speed, `]`/`[` hold time; 5 themes |
 | `dune_rocket` | Dune-universe rocket launch — particle exhaust trails, `+/-` launch rate, `Space` salvo burst |
 | `dune_sandworm` | Dune sandworm — sinusoidal body locomotion, surface breach animation, `Space` trigger breach, `+/-` speed |
-| `sand_art` | Hourglass sand art — 5-layer coloured falling-sand CA; gravity-flip on `Space`; scan sweeps away from gravity so grains never move twice per tick; `R` pour fresh layers |
+| `sand_art` | Sands of time — curved quarter-elliptical hourglass with decorative frame; falling-sand CA + per-cell momentum so neck-stream grains visibly accelerate; auto-flip when bulb fully drains (with stall-fallback for stuck grains); time-progress HUD; 4 patterns (NORMAL/RAINBOW/GEOLOGICAL/DUAL_FLOW) × 6 themes incl. NEGATIVE inverted |
 | `bat` | Bat silhouette animation — flapping wing kinematics, Bézier curve body outline, moth-hunt targeting |
-| `bonsai` | Procedural bonsai tree — recursive L-system branching, aging simulation, seasonal cycle |
+| `bonsai` | Bonsai tree gallery — static still-life rendering of 5 classical styles (CHOKKAN/MOYOGI/SHAKAN/KENGAI/BUNJIN) with recursive procedural skeleton; aspect-corrected foliage clouds; subtle hash-gated wind rustle on leaves; 6 themes (SPRING/SUMMER/AUTUMN/WINTER/CHERRY/SUMI_E inverted ink-painting) |
 | `leaf_fall` | Falling leaves — Euler-angle tumbling with aerodynamic torque, ground accumulation |
 | `dna` | DNA double helix — parametric strand animation, base-pair rungs, rotation and colour cycling |
 

@@ -209,6 +209,7 @@ Reference implementation: `basics/bounce_ball.c`
 168. [Triangle Pattern Placement — grids/tri_grids_placement/](#168-triangle-pattern-placement--gridstri_grids_placement)
 169. [Triangle Path Placement — grids/tri_grids_placement/](#169-triangle-path-placement--gridstri_grids_placement)
 170. [Triangle Scatter Placement — grids/tri_grids_placement/](#170-triangle-scatter-placement--gridstri_grids_placement)
+180. [Sparks — particle_systems/sparks.c](#180-sparks--particle_systemssparksc)
 
 ---
 
@@ -5633,6 +5634,61 @@ conventions on top of the standard `procedural/` framework:
    entirely.
 
 *Files: `procedural/worldgen/*.c`, `procedural/patterns/*.c`*
+
+---
+
+## 180. Sparks — particle_systems/sparks.c
+
+`sparks.c` is the FAST-and-BOUNCY counterpart to `embers.c`'s SLOW-and-BUOYANT. Same pool / spawn / tick / draw skeleton, three architectural changes:
+
+### Motion-blur trail history
+
+Each `Spark` carries `trail_x[TRAIL_LEN] / trail_y[TRAIL_LEN]` (default `TRAIL_LEN = 3`). At the start of every tick:
+
+```
+shift trail: for k = 0..TRAIL_LEN−2: trail[k] = trail[k+1]
+push current: trail[TRAIL_LEN−1] = (x, y)
+then integrate
+```
+
+Trail slots are filled with the spawn `(x, y)` at birth so the renderer never sees uninitialised history (no streaks inherited from the slot's previous occupant).
+
+### Two-pass draw — trails first, heads second
+
+`scene_draw()` runs two full sweeps of the pool: pass 1 paints every spark's trail (dim glyphs from `TRAIL_GLYPHS[]`, ramp slot = `head_slot − (TRAIL_LEN − k)`, older points use cooler slots); pass 2 paints every spark's head (bright glyph from `HEAD_GLYPHS[]`, slot = remaining-life slot, `A_BOLD` if `slot >= 6`). The order matters — interleaved per-spark draws would let spark A's trail overwrite spark B's head when their paths crossed.
+
+### Floor bounce with coefficient of restitution
+
+After integration, if `y >= floor_y && vy > 0`:
+
+```
+y'  = 2 · floor_y − y                      // mirror reflection
+vy' = −vy · pattern.restitution            // 0 < e < 1 → energy loss
+vx' = vx · pattern.floor_friction          // tangential drag
+if |vy'| < SETTLE_VY && |vx'| < SETTLE_VX → kill   // settle-cull
+```
+
+Without the settle-cull, gravity re-bounces a low-energy spark forever — it micro-bounces against the floor every tick. Killing the spark when both components are below threshold reclaims the pool slot. Restitution `e ∈ (0, 1)` per pattern: bounce `n` reaches `e^(2n)` of the initial height; with `e = 0.55` (WELDING), the third bounce is at ~9% — visually 2–3 distinct bounces before it dies.
+
+### Pattern table = physics + emission cone in one row
+
+The four patterns differ only in the `pattern_params[]` row, not in any code path:
+
+| Pattern | Emitter | Cone (rad) | Speed | Gravity | Restitution |
+|---|---|---|---|---|---|
+| WELDING  | left wall, mid-height | ±0.55 (right)         | 55–90  | 78 | 0.55 |
+| GRINDER  | bottom-left           | -1.30 to -0.40 (UR)   | 72–110 | 92 | 0.50 |
+| CAMPFIRE | bottom-centre         | -2.20 to -0.94 (up)   | 34–56  | 36 | 0.40 |
+| TESLA    | screen centre         | -π to +π (full circle)| 55–85  | 26 | 0.65 |
+
+Cone emission is polar: sample `angle ∈ [angle_min, angle_max]`, sample `speed ∈ [speed_min, speed_max]`, then `(vx, vy) = speed · (cos(angle), sin(angle))`. Setting `angle_max − angle_min = 2π` gives full omnidirectional emission for free — no special TESLA branch.
+
+### Frame-rate-independent drag
+
+`sparks.c` uses `drag_factor = expf(−drag_coeff · dt)` instead of a hard-coded per-tick multiplier. The exponential form commutes correctly across substeps — applying it across two `dt/2` ticks is identical to one `dt` tick. Changing the sim Hz with `]/[` doesn't change the visual damping.
+
+*Files: `particle_systems/sparks.c`*
+*Cross-references: §19 (particle state machines — sparks have no state machine, just LIVE → DEAD with bounces as in-place velocity edits); D27 in Master.md (motion-blur trails as a reusable technique); D28 in Master.md (cone emission).*
 
 ---
 

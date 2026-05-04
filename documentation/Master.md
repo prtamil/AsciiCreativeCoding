@@ -67,6 +67,8 @@ you would consult to extend the technique past what is implemented here.
 - [D24 ODE Integrator Zoo — Euler / RK2 / RK4 / Velocity Verlet](#d24-ode-integrator-zoo--euler--rk2--rk4--velocity-verlet)
 - [D25 Short-Time Fourier Transform — STFT Spectrogram](#d25-short-time-fourier-transform--stft-spectrogram)
 - [D26 Deferred Rendering Pipeline — G-buffer + Blinn-Phong Lighting Pass](#d26-deferred-rendering-pipeline--g-buffer--blinn-phong-lighting-pass)
+- [D27 Motion-Blur Trails — Per-Particle Position History](#d27-motion-blur-trails--per-particle-position-history)
+- [D28 Cone Emission — Polar (angle, speed) Sampling](#d28-cone-emission--polar-angle-speed-sampling)
 
 ### E — Cellular Automata & Grid Simulations
 - [E1 Falling Sand — Gravity CA](#e1-falling-sand--gravity-ca)
@@ -368,12 +370,13 @@ Update velocity *before* position: `vel += accel × dt; pos += vel × dt`. This 
 *References: Hairer, Lubich, Wanner, "Geometric Numerical Integration" (2006); Yoshida, "Construction of higher order symplectic integrators" *Phys. Lett. A* 150 (1990).*
 
 #### D3 Wall Bounce — Elastic Reflection
-When a ball crosses a boundary, clamp position to the boundary and negate the relevant velocity component. Doing it in the correct order (clamp then flip) prevents the ball from getting stuck inside the wall on the next tick. The raster files' `CAM_DIST_MIN/MAX` zoom clamp uses the same pattern.
-*Files: `bounce.c`, `fireworks.c`*
+When a ball crosses a boundary, clamp position to the boundary and negate the relevant velocity component. Doing it in the correct order (clamp then flip) prevents the ball from getting stuck inside the wall on the next tick. The raster files' `CAM_DIST_MIN/MAX` zoom clamp uses the same pattern. `sparks.c` extends this with a per-pattern **coefficient of restitution** `e ∈ (0, 1)` so each bounce loses energy: `vy' = −e · vy`. Bounce `n` reaches a height proportional to `e^(2n)` of the original — three bounces with `e = 0.55` reach ~9% of the initial height.
+*Files: `bounce.c`, `fireworks.c`, `particle_systems/sparks.c`*
+*References: Wikipedia, "Coefficient of restitution"; Millington, "Game Physics Engine Development" §7 (Particle Contacts).*
 
 #### D4 Gravity & Drag (Particle Systems)
-Gravity adds a constant downward acceleration each tick (`vy += GRAVITY × dt`). Drag multiplies velocity by a factor less than 1 each tick (`vx *= 0.98`), simulating air resistance and preventing particles from flying off-screen forever. Exponential decay of `life` (`life *= DECAY`) drives the particle's visual fade.
-*Files: `fireworks.c`, `brust.c`*
+Gravity adds a constant downward acceleration each tick (`vy += GRAVITY × dt`). Drag multiplies velocity by a factor less than 1 each tick (`vx *= 0.98`), simulating air resistance and preventing particles from flying off-screen forever. Exponential decay of `life` (`life *= DECAY`) drives the particle's visual fade. `sparks.c` uses the **frame-rate-independent** form `v *= exp(−drag_coeff · dt)` instead of a hard-coded per-tick multiplier, so changing the sim Hz with `]/[` doesn't change the visual damping. `embers.c` is the inverse — buoyancy is gravity with the sign flipped (always negative).
+*Files: `fireworks.c`, `brust.c`, `particle_systems/sparks.c`, `particle_systems/embers.c`*
 
 #### D5 Spring-Pendulum — Lagrangian Mechanics
 The Lagrangian formulation derives equations of motion from kinetic minus potential energy, handling the coupling between spring extension and pendulum angle automatically. The result is two coupled second-order ODEs for `r̈` and `θ̈` that are integrated numerically each tick — more principled than writing forces by hand.
@@ -381,16 +384,25 @@ The Lagrangian formulation derives equations of motion from kinetic minus potent
 *References: Goldstein, Poole, Safko, "Classical Mechanics" 3e ch. 1–2; Landau & Lifshitz, "Mechanics" §§5–8.*
 
 #### D6 Lifetime & Exponential Decay
-`life -= dt / lifetime_sec` counts down linearly; when it reaches 0 the particle is recycled. Multiplying by a `decay` factor less than 1 each tick gives exponential decay — the particle fades quickly at first then more slowly, matching the visual feel of embers cooling.
-*Files: `fireworks.c`, `brust.c`, `matrix_rain.c` (trail fade)*
+`life -= dt / lifetime_sec` counts down linearly; when it reaches 0 the particle is recycled. Multiplying by a `decay` factor less than 1 each tick gives exponential decay — the particle fades quickly at first then more slowly, matching the visual feel of embers cooling. `sparks.c` and `embers.c` use the linear `age / life` form to drive a `temperature ∈ [0, 1]` value that picks both the heat-ramp colour pair and the glyph-density slot (cool = sparse, hot = dense), so the visual "cooling" is encoded once and re-used for two visual axes.
+*Files: `fireworks.c`, `brust.c`, `matrix_rain.c` (trail fade), `particle_systems/sparks.c`, `particle_systems/embers.c`*
 
 #### D7 Particle Pool — Fixed Array, No Allocation
 All particle arrays are statically sized at init (`Particle pool[MAX]`). An `active` flag or lifetime <= 0 marks slots as free. Burst functions scan for inactive slots rather than calling `malloc`/`free` per particle — avoids heap fragmentation and allocation stalls in a 60 fps loop.
-*Files: `fireworks.c`, `brust.c`, `kaboom.c`*
+*Files: `fireworks.c`, `brust.c`, `kaboom.c`, `particle_systems/sparks.c`, `particle_systems/embers.c`*
 
 #### D8 State Machines in Physics Objects
 Rockets cycle through `IDLE → RISING → EXPLODED`; fire columns have `COLD / HOT`; matrix columns have `ACTIVE / FADING`. A state machine makes transitions explicit and prevents illegal state combinations (e.g., exploding a rocket that hasn't launched). Each state drives a different code path in the tick function.
 *Files: `fireworks.c`, `brust.c`, `matrix_rain.c`*
+
+#### D27 Motion-Blur Trails — Per-Particle Position History
+Each particle stores `TRAIL_LEN` of its previous positions in a small ring (shifted each tick: drop oldest, push current as newest prev). At draw time, two passes paint the scene: pass 1 draws every spark's trail history with progressively cooler/dimmer ramp slots so older points fade behind the head; pass 2 draws every spark's head with the brightest ramp slot. The two-pass order matters — if heads and trails were interleaved per-spark, spark A's trail would overwrite spark B's head when their paths crossed. Trail history is initialised at spawn to the spawn position so a fresh particle never inherits a streak from a previous pool occupant. The technique is independent of the physics: any cell-space particle that wants a fading streak can adopt it by adding `trail_x[N] / trail_y[N]` to its struct and a shift-then-store step in its tick.
+*Files: `particle_systems/sparks.c`, `matrix_rain.c` (column trail), `comet.c`*
+*References: Reeves, "Particle Systems: A Technique for Modelling a Class of Fuzzy Objects" *ACM TOG* 2(2) 1983.*
+
+#### D28 Cone Emission — Polar (angle, speed) Sampling
+For an emitter that should fire particles in a constrained direction, sample `angle ∈ [angle_min, angle_max]` and `speed ∈ [speed_min, speed_max]` from uniform distributions, then decompose to `(vx, vy) = speed · (cos(angle), sin(angle))`. The pattern table stores a single `(angle_min, angle_max)` pair per pattern — a tight cone for a grinder (-1.3 to -0.4 rad), a broad cone for a campfire (-2.2 to -0.94 rad), or a 2π-wide range for full omnidirectional emission (TESLA's `−π` to `+π`). No special omnidirectional code path is needed; widening the cone past 2π gives full coverage for free.
+*Files: `particle_systems/sparks.c`, `fireworks.c` (radial burst is a 2π cone)*
 
 ---
 

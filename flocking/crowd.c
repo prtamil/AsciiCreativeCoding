@@ -1,79 +1,190 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * crowd.c — ASCII Crowd Simulator
+ * crowd.c — six switchable steering-behaviour crowds in ASCII
  *
- * N people (ASCII characters) move around the terminal under one of six
- * switchable crowd behaviours.  Press 1–6 to cycle between them live.
+ * DEMO: A pool of up to 150 ASCII "people" move around the terminal under
+ *       one of six crowd modes — wander, boids flock, panic-flee from a
+ *       roaming '!' threat, gather to the centre, chain-follow the '@'
+ *       leader, or queue at a right-edge service counter. Press 1-6 to
+ *       cycle behaviours live.
  *
- * This file follows the canonical 8-section framework pattern from
- * ncurses_basics/framework.c — study that file first for the game-loop.
- * The new concept introduced here is STEERING BEHAVIOURS (Reynolds 1987):
- * every entity accumulates a weighted sum of forces each physics tick.
+ * Study alongside: flocking/flocking.c (the same boids rules in isolation)
  *
- * Keys
- * ────
- *   q / ESC    quit
- *   space      pause / resume
- *   1          WANDER  — random targets, personal space enforced
- *   2          FLOCK   — boids: separation + alignment + cohesion
- *   3          PANIC   — flee a roaming threat '!'
- *   4          GATHER  — converge to screen centre
- *   5          FOLLOW  — chain-follow the leader '@'
- *   6          QUEUE   — orderly line to right-edge counter
- *   + / =      add 5 people   (max 150)
- *   -          remove 5 people (min 5)
- *   r          reset positions
+ * Section map:
+ *   §1 config   — tunables: counts, speeds, radii, weights, queue layout
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 7 colour pairs + PAIR_HUD/PAIR_HINT
+ *   §4 coords   — pixel↔cell aspect-ratio bridge + Vec2 helpers
+ *   §5 entity   — Person struct, person_spawn, person_step
+ *   §6 steering — seek / flee / separate / align / cohere force generators
+ *   §7 scene    — Scene state, six tick_* behaviours, scene_draw + mark_cell
+ *   §8 app      — signals, resize, screen, main game loop
+ *
+ * Keys:
+ *   q / ESC    quit                     space      pause / resume
+ *   1          WANDER  (random targets) 2          FLOCK   (boids)
+ *   3          PANIC   (flee threat)    4          GATHER  (to centre)
+ *   5          FOLLOW  (chain leader)   6          QUEUE   (right-edge)
+ *   + / =      add 5 people (max 150)   -          remove 5 (min 5)
+ *   r          reset all positions
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra flocking/crowd.c -o crowd -lncurses -lm
- *
- * §1 config   §2 clock   §3 color   §4 coords & vec2
- * §5 entity   §6 steering §7 scene   §8 app
  */
 
-/* ── STEERING BEHAVIOUR PRIMER ─────────────────────────────────────────
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * HOW MOVEMENT WORKS (same pattern in every behaviour):
+ * Algorithm      : Reynolds steering behaviours. Each tick every agent
+ *                  computes a weighted sum of force vectors — seek, flee,
+ *                  separate, align, cohere — and integrates them into
+ *                  velocity (capped at SPEED_MAX) then position. The
+ *                  weighted sum is the entire intelligence: no rule
+ *                  hierarchy, no FSM, no global planner. Six behaviours
+ *                  share the same five primitive forces, with different
+ *                  weights and target geometry per behaviour.
  *
- *   Each tick, a person computes a STEERING FORCE — a 2-D vector
- *   pointing where they "want" to go.  That force is added to velocity
- *   and velocity is capped so nobody goes hypersonic.  This gives
- *   smooth, momentum-based motion instead of instant teleporting.
+ * Data-structure : Scene owns a fixed-capacity pool of Person (up to 150).
+ *                  Only the first `count` people are simulated each tick;
+ *                  the rest are pre-spawned so '+' can reveal them
+ *                  instantly without re-randomising. Each Person holds
+ *                  pos, prev_pos, vel, target, glyph, color pair index.
+ *                  prev_pos is snapshotted before every tick so the
+ *                  renderer can sub-tick lerp for smooth motion at any
+ *                  render-rate / sim-rate combination. The PANIC threat
+ *                  has its own pos/vel/target on Scene.
  *
- *       force     = W_A * forceA  +  W_B * forceB  + ...
- *       velocity += force × dt
- *       velocity  = clamp(|velocity|, SPEED_MAX)
- *       position += velocity × dt
+ * Rendering      : Each frame, every active person is drawn at
+ *                  alpha-interpolated `lerp(prev_pos, pos, alpha)` cells.
+ *                  Per-behaviour decorations draw first (PANIC '!' threat,
+ *                  QUEUE counter '|' + '>>|', FOLLOW leader '@') so they
+ *                  sit underneath the bulk crowd render. A single
+ *                  `mark_cell()` helper carries the (chtype)(unsigned char)
+ *                  cast and bounds-check that every glyph stamp needs.
  *
- * THE SEEK FORCE (used by most behaviours):
+ * Performance    : Steering is O(N²) — each person checks every other for
+ *                  separation/align/cohere. At N=150 that is 22 500
+ *                  distance checks per tick, trivial at 60 Hz. A spatial
+ *                  hash would scale to thousands; not needed here.
  *
- *       desired   = normalise(target − pos) × desired_speed
- *       seek      = desired − current_velocity
+ * References     : Reynolds, "Flocks, Herds, and Schools: A Distributed
+ *                    Behavioral Model," SIGGRAPH 1987 — the original
+ *                    boids paper.
+ *                  Reynolds, "Steering Behaviors for Autonomous
+ *                    Characters," 1999 (red3d.com/cwr/steer/) — the
+ *                    canonical steering-behaviour primer.
+ *                  Wikipedia: "Boids" — concise summary of the three
+ *                    rules and the emergent flocking property.
+ *                  Shiffman, *The Nature of Code*, ch. 6 — reading-level
+ *                    walkthrough of the same forces used here.
  *
- *   This steers toward the target.  As the agent speeds up toward the
- *   target its current_velocity approaches desired, so the force naturally
- *   shrinks — producing smooth deceleration for free.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
  *
- * FLEE = seek with the sign flipped (steer AWAY from threat).
+ * CORE IDEA
+ * ─────────
+ * Every agent is a particle with mass = 1, accumulating a steering force
+ * each tick. The force is a weighted sum of direction vectors — "go
+ * toward target", "go away from neighbour", "match neighbour velocity",
+ * "go toward neighbour centre". Add force×dt to velocity, cap velocity,
+ * add velocity×dt to position. There is no global goal, no top-down
+ * scheduling — every behaviour is just a different recipe of weights.
  *
- * SEPARATION — prevents crowding:
- *   For every neighbour within SEP_RADIUS, apply a repulsion force.
- *   Strength ∝ (SEP_RADIUS − distance): touching → full push, edge → ~0.
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine each person carries a backpack of springs pulling them toward
+ * a few different targets at once: a "go where I want" spring, a "stay
+ * away from each neighbour" spring per neighbour, sometimes an "align
+ * with the herd" spring. The steering force is the resultant pull. The
+ * velocity cap is a top speed; nobody can sprint faster than SPEED_MAX
+ * regardless of how many springs are tugging. Switching behaviours
+ * (1-6) just swaps which springs are active.
  *
- * BOIDS (FLOCK mode) — three independent local rules:
- *   Separation  — avoid neighbours within SEP_RADIUS
- *   Alignment   — match average heading of neighbours in ALIGN_RADIUS
- *   Cohesion    — seek centre of mass of neighbours in COHESION_RADIUS
- *   Flocking emerges from purely local interaction, no central authority.
+ * ALGORITHM IN STEPS  (per tick, per person)
+ * ──────────────────────────────────────────
+ *   1. force = 0
+ *   2. force += W_seek      · steer_seek(pos, vel, target, speed)
+ *   3. force += W_separate  · steer_separate(neighbours within SEP_RADIUS)
+ *   4. force += W_align     · steer_align    (neighbours within ALIGN_RADIUS)   [FLOCK only]
+ *   5. force += W_cohere    · steer_cohere   (neighbours within COHESION_RADIUS) [FLOCK only]
+ *   6. vel  = clamp(vel + force·dt, SPEED_MAX)
+ *   7. prev_pos = pos
+ *   8. pos += vel · dt
+ *   9. apply boundary: wrap (most modes) / bounce (PANIC) / clamp (QUEUE)
  *
- * TWO COORDINATE SPACES (why §4 matters):
- *   PIXEL space — physics lives here; one unit ≈ one physical screen pixel.
- *                 Square and isotropic: moving 1 unit in X travels the same
- *                 physical distance as 1 unit in Y.
- *   CELL space  — terminal rows/cols where drawing happens.
- *                 Cells are ~2× taller than wide, so if physics were done
- *                 in cell coords diagonal motion would look skewed.
- *   Only the draw step converts pixel → cell via px_to_cell_x/y.
+ * KEY FORMULAS
+ * ────────────
+ *   Seek:        desired = normalise(target − pos) · speed
+ *                force   = desired − vel
+ *
+ *   Flee:        force   = − seek(target=threat)
+ *
+ *   Separate:    for each neighbour with d < SEP_RADIUS:
+ *                  strength = (SEP_RADIUS − d) / SEP_RADIUS
+ *                  force   += normalise(pos − neighbour.pos) · strength · SPEED_BASE
+ *
+ *   Align:       v_avg   = mean(neighbour.vel : d < ALIGN_RADIUS)
+ *                force   = v_avg − vel
+ *
+ *   Cohere:      p_avg   = mean(neighbour.pos : d < COHESION_RADIUS)
+ *                force   = seek(target=p_avg)
+ *
+ *   Pixel→cell:  cx = round(px / CELL_W)    (CELL_W = 8)
+ *                cy = round(py / CELL_H)    (CELL_H = 16)
+ *
+ * WORKED EXAMPLE  (defaults: 60 people, 200x60 terminal, 60 Hz)
+ * ────────────────────────────────────────────────────────────
+ *   World box       : 200 cols x 60 rows = 1600 x 960 pixels.
+ *   Per tick (1/60 s):
+ *     a person at SPEED_BASE (80 px/s) advances 80/60 ≈ 1.3 px,
+ *     i.e. one new cell every ~6 ticks (~100 ms) — visibly smooth.
+ *   Personal space  : SEP_RADIUS = 40 px = 5 columns. Two people
+ *     in adjacent cells (8 px apart) are well inside the bubble:
+ *     strength = (40−8)/40 = 0.8, so each pushes the other with
+ *     0.8·SPEED_BASE = 64 px/s² of acceleration — they will be
+ *     two cells apart within ~3 ticks.
+ *   Steering cost   : separation alone is O(N²). At 60 people it
+ *     is 60·59 = 3540 distance checks per tick, ~210 000 per
+ *     second — microseconds total on any modern CPU.
+ *   Boundary        : WANDER/FLOCK/GATHER/FOLLOW wrap at edges
+ *     (a person leaving x = 1599 reappears at x = 0); PANIC
+ *     bounces (vel.x flips sign at the wall) so the threat
+ *     traps the crowd; QUEUE clamps so people stop at the line.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   - Coincident agents → divide by zero in v2norm. Guarded by
+ *     `if (l > 0.001f)` in v2norm — returns zero vector below threshold.
+ *   - Very small `count` in FOLLOW: if count==1 there are no followers,
+ *     just a wandering leader. The loop `for i in 1..count` empties
+ *     naturally. count==0 cannot happen because CROWD_MIN=5.
+ *   - QUEUE slots fall off the left edge at high count: `slot_x` is
+ *     clamped to one cell from the left so the trailing line stays
+ *     visible rather than vanishing.
+ *   - Resize: world_w/h is recomputed every tick from cols/rows, so
+ *     scale-up is automatic. Scale-down clamps people into the new box
+ *     in app_do_resize.
+ *   - Frame cap: do NOT add dt back into elapsed (`elapsed = clock_ns() −
+ *     frame_start`, no `+ dt`) — adding dt cancels the cap, sleep is 0,
+ *     CPU pegs at 100 %.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   - Press 2 (FLOCK), wait 5 seconds: a clear flock or two should form,
+ *     all agents pointing roughly the same direction. Lower W_ALIGN
+ *     (recompile) and the flock dissolves into chaos — confirms
+ *     alignment is what knits the flock.
+ *   - Press 3 (PANIC): the cloud of agents flees away from '!' radially.
+ *     The '!' moves slower than agents (THREAT_SPEED < SPEED_PANIC), so
+ *     the cloud always escapes; if you crank W_FLEE down they get caught.
+ *   - Press 4 (GATHER): all agents converge to centre, mill around at
+ *     reduced speed within GATHER_SLOW_RADIUS. They never overshoot.
+ *   - Press 5 (FOLLOW): the '@' leader wanders; a snake of agents
+ *     trails behind. Each agent seeks the one immediately ahead, so the
+ *     line bends as the leader turns.
+ *   - Press 6 (QUEUE): agents converge to staggered slots in a 3-row
+ *     line ending at the right-edge counter '>>|'.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
@@ -104,7 +215,15 @@ enum {
     HUD_COLS        =  72,   /* max chars in the status-bar string */
     FPS_UPDATE_MS   = 500,   /* how often the displayed fps refreshes */
 
-    N_COLORS        =   7,   /* color pairs defined in §3 */
+    /*
+     * Colour-pair IDs.  Pairs 1-7 paint the agents (one per band of the
+     * rainbow); PAIR_HUD / PAIR_HINT paint the two HUD lines per the
+     * project HUD spec.  Both are theme-independent so the HUD stays
+     * readable against any animation backdrop.
+     */
+    N_COLORS        =   7,   /* agent palette: pairs 1-7 */
+    PAIR_HUD        =   8,   /* bright yellow — top status bar  */
+    PAIR_HINT       =   9,   /* bright cyan   — bottom key hint */
 
     CROWD_MIN       =   5,   /* fewest people allowed */
     CROWD_MAX       = 150,   /* pool size; also the hard cap */
@@ -230,33 +349,43 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * color_init — define N_COLORS ncurses color pairs.
- * Pair IDs 1–7 map to the 7 visible colors used by people and UI.
- * 256-color path uses xterm-256 indices for vivid saturated hues.
- * 8-color fallback uses the basic ANSI colors on older terminals.
+ * color_init — define agent and HUD ncurses colour pairs.
  *
- * Pair map:  1=red  2=orange  3=yellow  4=green  5=cyan  6=blue  7=magenta
+ * Background = -1 (terminal default) so the demo respects the user's
+ * theme.  All foreground tints sit in the bright half of the 256-colour
+ * cube (≥ 33) per the project palette-brightness rule.
+ *
+ *   Agent palette (pairs 1-7):
+ *     1=red  2=orange  3=yellow  4=green  5=cyan  6=blue  7=magenta
+ *
+ *   HUD pairs (per project spec):
+ *     PAIR_HUD  (8)  bright yellow 226 — top status bar, A_BOLD
+ *     PAIR_HINT (9)  bright cyan   51  — bottom key hint, A_BOLD
  */
 static void color_init(void)
 {
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(1, 196, COLOR_BLACK);
-        init_pair(2, 208, COLOR_BLACK);
-        init_pair(3, 226, COLOR_BLACK);
-        init_pair(4,  46, COLOR_BLACK);
-        init_pair(5,  51, COLOR_BLACK);
-        init_pair(6, 33, COLOR_BLACK);
-        init_pair(7, 201, COLOR_BLACK);
+        init_pair(1, 196, -1);   /* red     */
+        init_pair(2, 208, -1);   /* orange  */
+        init_pair(3, 226, -1);   /* yellow  */
+        init_pair(4,  46, -1);   /* green   */
+        init_pair(5,  51, -1);   /* cyan    */
+        init_pair(6,  33, -1);   /* blue    */
+        init_pair(7, 201, -1);   /* magenta */
+        init_pair(PAIR_HUD,  226, -1);
+        init_pair(PAIR_HINT,  51, -1);
     } else {
-        init_pair(1, COLOR_RED,     COLOR_BLACK);
-        init_pair(2, COLOR_RED,     COLOR_BLACK);
-        init_pair(3, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(4, COLOR_GREEN,   COLOR_BLACK);
-        init_pair(5, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(6, COLOR_BLUE,    COLOR_BLACK);
-        init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
+        init_pair(1, COLOR_RED,     -1);
+        init_pair(2, COLOR_RED,     -1);
+        init_pair(3, COLOR_YELLOW,  -1);
+        init_pair(4, COLOR_GREEN,   -1);
+        init_pair(5, COLOR_CYAN,    -1);
+        init_pair(6, COLOR_BLUE,    -1);
+        init_pair(7, COLOR_MAGENTA, -1);
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
     }
 }
 
@@ -380,21 +509,21 @@ static const char GLYPHS[] = "oO0abcdefghijklmnpqrstuvwxyz";
 /*
  * Person — all per-entity state.
  *
- * pos      — current position in pixel space.
- * prev_pos — position from the previous tick, kept so the renderer can
- *            lerp between prev and pos by alpha for smooth sub-tick motion.
- * vel      — velocity in pixels per second.
- * target   — personal wander/queue destination (reused per behaviour).
- * glyph    — the ASCII character drawn for this person.
- * color    — ncurses color pair index (1–N_COLORS).
+ * Grouped so a reader can scan the struct and see at a glance what
+ * changes every tick (kinematic state) versus what was set once at
+ * spawn (render identity). The two groups never cross — the renderer
+ * never reads vel; the physics never reads glyph.
  */
 typedef struct {
-    Vec2  pos;
-    Vec2  prev_pos;
-    Vec2  vel;
-    Vec2  target;
-    char  glyph;
-    int   color;
+    /* kinematic state — written by physics every tick */
+    Vec2  pos;        /* current position, pixel space (px)              */
+    Vec2  prev_pos;   /* position at start of this tick — for alpha lerp */
+    Vec2  vel;        /* velocity, pixels per second                     */
+    Vec2  target;     /* personal destination (used by WANDER/QUEUE/...) */
+
+    /* render identity — written once at spawn, read by scene_draw only */
+    char  glyph;      /* ASCII character drawn for this person           */
+    int   color;      /* ncurses colour pair index, 1 .. N_COLORS        */
 } Person;
 
 static float randf(void) { return (float)rand() / (float)RAND_MAX; }
@@ -542,20 +671,33 @@ static Vec2 steer_cohere(const Person *people, int count, int self)
 /*
  * Scene — all simulation state in one struct.
  *
- * people[]       — pool of all agents; only [0 .. count-1] are active.
- *                  The pool is always fully initialised so that raising
- *                  count with '+' reveals already-placed people.
- * threat_*       — roaming threat used only in PANIC mode.
- * world_w/h      — pixel dimensions, recomputed from cols/rows each tick.
+ * Three groups, each with a different lifetime and ownership:
+ *   - the agent pool (touched every tick by every steering rule)
+ *   - the user-facing mode flags (touched once per keypress)
+ *   - the PANIC-only threat (touched only by tick_panic)
+ *   - the world dimensions (refreshed once per tick from ncurses)
+ * Joining them in one struct keeps `scene_*` function signatures short
+ * (one Scene * argument); separating the groups inside makes the data
+ * flow obvious — a reader can tell which fields each tick_* function
+ * will touch just from this header.
  */
 typedef struct {
+    /* agent pool — first `count` Person slots are active; the rest are
+     * pre-spawned so '+' reveals already-placed people without a fresh
+     * randomise pass. */
     Person    people[CROWD_MAX];
     int       count;
+
+    /* user mode flags — written by app_handle_key, read by scene_tick */
     Behaviour behaviour;
     bool      paused;
+
+    /* PANIC threat — only tick_panic and the '!' renderer touch these */
     Vec2      threat_pos;
     Vec2      threat_vel;
     Vec2      threat_target;
+
+    /* world dimensions in pixels — refreshed each tick from cols/rows */
     float     world_w, world_h;
 } Scene;
 
@@ -747,6 +889,24 @@ static void tick_queue(Scene *s, float dt)
 
 /* ── scene dispatch and draw ───────────────────────────────────────── */
 
+/*
+ * mark_cell — stamp one ASCII glyph at terminal cell (cx,cy).
+ *
+ * Centralises the (chtype)(unsigned char) cast, bounds-check, and the
+ * wattron / wattroff sandwich so the renderer stays linear and short.
+ * The double cast prevents sign-extension on character values > 127
+ * (per CLAUDE.md "Common ncurses Bugs").  Off-screen cells are silently
+ * dropped.
+ */
+static void mark_cell(WINDOW *w, int cx, int cy, char ch,
+                      int pair, attr_t attr, int cols, int rows)
+{
+    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+    wattron(w, COLOR_PAIR(pair) | attr);
+    mvwaddch(w, cy, cx, (chtype)(unsigned char)ch);
+    wattroff(w, COLOR_PAIR(pair) | attr);
+}
+
 static void scene_tick(Scene *s, float dt, int cols, int rows)
 {
     s->world_w = pw(cols);
@@ -780,23 +940,18 @@ static void scene_draw(const Scene *s, WINDOW *w,
     if (s->behaviour == BEH_PANIC) {
         int tx = px_to_cell_x(s->threat_pos.x);
         int ty = px_to_cell_y(s->threat_pos.y);
-        if (tx >= 0 && tx < cols && ty >= 0 && ty < rows) {
-            wattron(w, COLOR_PAIR(1) | A_BOLD | A_BLINK);
-            mvwaddch(w, ty, tx, '!');
-            wattroff(w, COLOR_PAIR(1) | A_BOLD | A_BLINK);
-        }
+        mark_cell(w, tx, ty, '!', 1, A_BOLD | A_BLINK, cols, rows);
     }
 
-    /* ── QUEUE: service counter on the right edge ── */
+    /* ── QUEUE: service counter '|' bar + '>>|' arrow on the right edge ── */
     if (s->behaviour == BEH_QUEUE) {
         int qcol = cols - 2;
         int qrow = rows / 2;
-        wattron(w, COLOR_PAIR(3) | A_BOLD);
-        for (int r = qrow-3; r <= qrow+3; r++)
-            if (r >= 0 && r < rows) mvwaddch(w, r, qcol, '|');
-        if (qrow >= 0 && qrow < rows && qcol >= 3)
-            mvwprintw(w, qrow, qcol-3, ">>|");
-        wattroff(w, COLOR_PAIR(3) | A_BOLD);
+        for (int r = qrow - 3; r <= qrow + 3; r++)
+            mark_cell(w, qcol, r, '|', 3, A_BOLD, cols, rows);
+        mark_cell(w, qcol - 3, qrow, '>', 3, A_BOLD, cols, rows);
+        mark_cell(w, qcol - 2, qrow, '>', 3, A_BOLD, cols, rows);
+        mark_cell(w, qcol - 1, qrow, '|', 3, A_BOLD, cols, rows);
     }
 
     /* ── FOLLOW: leader '@' drawn with underline to stand out ── */
@@ -804,12 +959,8 @@ static void scene_draw(const Scene *s, WINDOW *w,
         const Person *ldr = &s->people[0];
         Vec2 dp = v2add(ldr->prev_pos,
                         v2scale(v2sub(ldr->pos, ldr->prev_pos), alpha));
-        int lx = px_to_cell_x(dp.x), ly = px_to_cell_y(dp.y);
-        if (lx >= 0 && lx < cols && ly >= 0 && ly < rows) {
-            wattron(w, COLOR_PAIR(3) | A_BOLD | A_UNDERLINE);
-            mvwaddch(w, ly, lx, '@');
-            wattroff(w, COLOR_PAIR(3) | A_BOLD | A_UNDERLINE);
-        }
+        mark_cell(w, px_to_cell_x(dp.x), px_to_cell_y(dp.y),
+                  '@', 3, A_BOLD | A_UNDERLINE, cols, rows);
     }
 
     /* ── all active people ── */
@@ -818,11 +969,8 @@ static void scene_draw(const Scene *s, WINDOW *w,
         const Person *p = &s->people[i];
         Vec2 dp = v2add(p->prev_pos,
                         v2scale(v2sub(p->pos, p->prev_pos), alpha));
-        int cx = px_to_cell_x(dp.x), cy = px_to_cell_y(dp.y);
-        if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
-        wattron(w, COLOR_PAIR(p->color));
-        mvwaddch(w, cy, cx, (chtype)(unsigned char)p->glyph);
-        wattroff(w, COLOR_PAIR(p->color));
+        mark_cell(w, px_to_cell_x(dp.x), px_to_cell_y(dp.y),
+                  p->glyph, p->color, A_NORMAL, cols, rows);
     }
 }
 
@@ -869,23 +1017,23 @@ static void screen_draw(Screen *s, const Scene *sc,
     erase();
     scene_draw(sc, stdscr, s->cols, s->rows, alpha);
 
-    /* status bar — top right */
+    /* Top-right status — PAIR_HUD bright yellow, A_BOLD */
     char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf, " %.1f fps  sim:%d Hz  n:%d  [%s]%s ",
+    snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  n:%3d  [%s]%s ",
              fps, sim_fps, sc->count,
              BEH_NAMES[sc->behaviour],
              sc->paused ? "  PAUSED" : "");
     int hx = s->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(3) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(3) | A_BOLD);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* key hint bar — bottom */
-    attron(COLOR_PAIR(3));
-    mvprintw(s->rows-1, 0,
+    /* Bottom-left key hint — PAIR_HINT bright cyan, A_BOLD */
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
              " q:quit  spc:pause  1:wander 2:flock 3:panic 4:gather 5:follow 6:queue  +/-:people  r:reset ");
-    attroff(COLOR_PAIR(3));
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /*
@@ -998,6 +1146,8 @@ int main(void)
 
     while (app->running) {
 
+        int64_t frame_start = clock_ns();
+
         /* ① resize */
         if (app->need_resize) {
             app_do_resize(app);
@@ -1034,8 +1184,12 @@ int main(void)
             fps_accum   = 0;
         }
 
-        /* ⑤ sleep before render to keep the budget honest */
-        int64_t elapsed = clock_ns() - frame_time + dt;
+        /* ⑤ sleep before render to keep the budget honest.
+         * Budget = 1/TARGET_FPS s.  elapsed is wall time spent on physics
+         * + accounting since frame_start; sleep the remainder.  Do NOT
+         * add dt back into elapsed — that cancels the cap, sleep is 0,
+         * CPU pegs at 100 %.                                            */
+        int64_t elapsed = clock_ns() - frame_start;
         clock_sleep_ns(NS_PER_SEC / TARGET_FPS - elapsed);
 
         /* ⑥ render */

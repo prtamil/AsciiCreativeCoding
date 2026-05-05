@@ -3371,13 +3371,26 @@ Cell-aspect correction (CELL_W=8, CELL_H=16) ensures equal angular spacing on sc
 
 ## 66. Shepherd Herding — flocking/shepherd.c
 
-Interactive boid herding simulation. A flock of sheep uses Classic Boids rules (separation, alignment, cohesion) plus a flee force when the player-controlled shepherd comes within FLEE_RADIUS pixels.
+Autonomous border-collie herding simulation (rewritten from the earlier user-controlled version). A flock of sheep grazes calmly inside a circular pen drawn at the screen centre. Press SPACE: every sheep gets an outward radial impulse and runs for the boundary. A single AI-driven border collie (`&` glyph) outside the pen runs to whichever sheep has strayed furthest, positions itself behind that sheep relative to the pen centre, and the sheep — fleeing the dog — runs back through the boundary on its own. The dog repeats with the next outlier until every sheep is back inside.
 
-### Boids Plus Flee
+### Strömbom-Style Controller
 
-Flee force overrides cohesion so panicking sheep disperse rather than cluster. Sheep speed has two modes: cruise (SHEEP_SPEED) and flee (SHEEP_SPEED_FLEE ≈ 1.5× cruise). The shepherd moves at fixed speed (SHEPHERD_SPEED px/s) driven by held arrow keys. Both operate in isotropic pixel space with CELL_W=8, CELL_H=16 aspect correction.
+The dog implements the collect/drive heuristic from Strömbom et al. (2014, *"Solving the shepherding problem"*). Each tick it picks one of two modes:
 
-Sheep characters are selected from an 8-direction glyph table (`o < > ^ v / \`) based on velocity heading; bold red when fleeing. An optional dashed circle around the shepherd shows the panic zone radius.
+- **COLLECT**: if any sheep is more than `pen_radius + PEN_TOLERANCE` from the pen centre, find the worst outlier and place the dog at `target = sheep_pos + DOG_APPROACH_OFFSET · normalize(sheep_pos − pen_centre)` — i.e. directly *outside* the sheep relative to the pen. The sheep, fleeing the dog radially, ends up running back toward the pen.
+- **PATROL**: when all sheep are inside the pen (with tolerance), the dog walks a slow circle around the pen at radius `pen_r + DOG_PATROL_OFFSET`, advancing at `DOG_PATROL_OMEGA` rad/s. Patrolling rather than parking keeps the dog visible and reactive to fresh scatter events.
+
+The dog has no path planner — it simply steers toward its target position at `DOG_SPEED = 180 px/s` (faster than `SHEEP_FLEE_SPEED = 140 px/s` so it can outflank). The emergent herding comes from the geometric placement rule alone.
+
+### Sheep Forces
+
+Sheep run four steering forces summed each tick: separation from close neighbours, soft cohesion toward the local centroid, flee from the dog within `DOG_FLEE_RADIUS = 120 px`, and a gentle inward pull whenever outside the pen. Velocity has per-tick `SHEEP_DAMPING = 0.95` damping (`0.95^60 ≈ 4.6 %` retained per second), so motion settles to grazing rest when no force applies.
+
+Sheep glyph: `o` calm (white), `O` panicking (bold red). Pen boundary: dashed `*` and `.` ring drawn in pixel space (so the circle stays circular regardless of cell aspect ratio).
+
+### Keys
+
+`q` quit, `space` SCATTER, `S` mega-scatter, `c` toggle continuous chaos, `p` pause, `r` reset, `+`/`-` add/remove 5 sheep.
 
 *Files: `flocking/shepherd.c`*
 
@@ -4629,15 +4642,21 @@ The fluid solver is **identical across types** — same buoyancy, same cooling, 
 
 ## 125. Swarm Digit Simulator — flocking/swarm_gen_numbers.c
 
-25 ASCII agents coordinate through Reynolds steering behaviours to form the shapes of digits 0–9 on screen. A 5×7 bitmap template is scaled and centred; each `#` becomes one pixel-space Slot. Each agent is greedily assigned its nearest unoccupied slot (O(N·S)); agents beyond the slot count wander freely.
+160 ASCII agents coordinate through Reynolds steering behaviours to form the shapes of digits 0–9 on screen. A 5×7 bitmap template is scaled and centred; each `#` is **subdivided into a 3×3 grid of mini-slots** (`SLOT_GRID = 3`), so each `#` produces 9 target points and a digit has 99–153 slots total. `N_AGENTS = 160` matches `SLOTS_MAX` so every slot of every digit can be filled — the formed digit reads as a dense cluster of glyphs rather than a sparse outline. Each agent is greedily assigned its nearest unoccupied slot (O(N·S)); surplus agents wander freely.
+
+A 10-theme colour cycle (`t`/`T`) lets the swarm tint switch live: Rainbow / Solar / Ocean / Fire / Matrix / Aurora / Neon / Sunset / Toxic / Ghost.
 
 ### Physics Loop
 
 Fixed-step accumulator (60 Hz); sub-tick alpha interpolation (`draw_pos = prev + (pos − prev) × α`) eliminates stutter between ticks.
 
+### Sub-slot subdivision (the "6 looks like 5" fix)
+
+`DIGIT_CELL_H = 3` (matching `SLOT_GRID = 3`) — each `#` cell allocates 3 terminal rows so the 3 sub-slot rows map cleanly to distinct cells. With the previous `DIGIT_CELL_H = 2`, the third sub-slot row at `fy = 0.833` mapped (via `floor(py/16 + 0.5)`) into the next bitmap row's allocated rows, leaking density between bitmap rows and making digit 6 render visually as digit 5. Sub-slots are placed at exact terminal-cell corners (`px = ox + (c · DIGIT_CELL_W + sc · stride_x) · CELL_W`) with `stride_x = 2`, `stride_y = 1` — first sub-slot at offset 0, last at the cell's far edge.
+
 ### Slot Assignment
 
-For each agent in index order, find the nearest unoccupied slot and mark it taken. O(N×S), N=25, S≤17. Not globally optimal but converges naturally and looks organic.
+For each agent in index order, find the nearest unoccupied slot and mark it taken. O(N×S), N=160, S≤153 ≈ 24 500 ops per digit change. Not globally optimal but converges naturally and looks organic.
 
 ### Force Balance Rule
 
@@ -5837,6 +5856,53 @@ Cone emission is polar: sample `angle ∈ [angle_min, angle_max]`, sample `speed
 
 *Files: `particle_systems/sparks.c`*
 *Cross-references: §19 (particle state machines — sparks have no state machine, just LIVE → DEAD with bounces as in-place velocity edits); D27 in Master.md (motion-blur trails as a reusable technique); D28 in Master.md (cone emission).*
+
+---
+
+## 181. Density-Rendered Starling Flock — flocking/murmuration.c
+
+800-bird Reynolds flock (separation + alignment + cohesion) on a toroidal world, plus a single hawk predator that orbits the world centre and (on SPACE) dives through the flock at 250 px/s for ~1.5 s. The visual signature is **density rendering**: instead of one glyph per bird, each frame bins agents into a `density[rows][cols]` grid and stamps a glyph from the ASCII ramp `.,:;oO*#@` indexed by per-cell count, producing the moving black-cloud-with-glowing-core look of real starling murmurations.
+
+### Single-pass O(N²) steering
+
+All three boid forces and the hawk-flee force are computed in ONE inner loop per bird per tick — `toroidal_delta` and squared distance are computed once per pair and reused for every rule. Per-rule accumulators (`sep_force`, `ali_vsum + ali_n`, `coh_dsum + coh_n`) are converted to final forces by named helpers (`align_force`, `cohere_force`, `hawk_flee_force`) after the loop. At N = 800 this is 800·799 = 639 K pair tests/tick × 60 Hz ≈ 38 M/s — sub-millisecond per tick at -O2.
+
+### Density renderer (the visual core)
+
+Each render frame:
+1. Zero `density[rows][cols]` over the active region.
+2. Bin every bird into the grid via `px_to_cell_x/y`.
+3. For each non-empty cell:
+   - glyph = `RAMP[min(density − 1, RAMP_LEN − 1)]` from `.,:;oO*#@`
+   - attribute = `A_BOLD` for density ≥ 5, `A_NORMAL` otherwise (no `A_DIM` — periphery would mute to invisible)
+   - colour pair = `((cy * 7 + cx) % N_COLORS) + 1` (spatial-hash mottle within the active theme)
+4. Over-stamp the hawk last (`PAIR_HAWK = 196 red`, `A_BOLD`).
+
+Sub-tick alpha lerp is omitted on purpose — the density field is itself stable across alpha values.
+
+### Hawk controller
+
+`HAWK_PATROL`: orbit world centre at `0.40 · min(w, h)`, angular speed `0.4 rad/s`. Slow enough to read as "watching" without constantly disturbing the flock.
+
+`HAWK_DIVE`: triggered by SPACE (or auto-dive timer if `h` is on). Set `vel = HAWK_DIVE_SPEED · normalize(flock_centroid − pos)`; integrate forward for `HAWK_DIVE_DURATION = 1.5 s`; when timer expires, swap back to PATROL with `patrol_phase` re-derived from the current position so the orbit resumes without a teleport.
+
+### Toroidal-aware centroid
+
+`scene_centroid` picks `pool[0]` as a reference, accumulates `toroidal_delta` offsets relative to it, and adds the mean offset back to the reference (with wrap). Naïve averaging would put the centroid in the middle of the screen even when birds are clustered at opposite edges of the torus.
+
+### 10 themes, t/T cycle
+
+Each theme is a tight cluster of 7 bright shades of one tint (NOT a dim-to-bright gradient) — the renderer cycles through the 7 pairs by spatial hash so adjacent cells get different pairs; if the palette spanned dim-to-bright, half the cells would render dim and the cloud would read as muddy. All theme entries ≥ 80 (or full-saturation primaries 46/196/220/226).
+
+Themes: `Dusk` (warm cream), `Sky` (sky-blue), `Solar` (warm yellow), `Aurora` (mint→pink), `Ember` (fire), `Forest` (leafy green), `Neon` (hot magenta), `Sunset` (warm orange), `Ghost` (near-white), `Matrix` (matrix green).
+
+### Keys
+
+`q` quit, `space` hawk dive, `h` toggle auto-dive (every 6 s), `p` pause, `r` reset, `t`/`T` next/prev theme, `+`/`-` add/remove 100 birds (100..1500).
+
+*Files: `flocking/murmuration.c`*
+*References: Reynolds 1987 SIGGRAPH "Flocks, Herds, and Schools"; Couzin et al. 2002 J. Theor. Biol. "Collective Memory and Spatial Sorting"; Hildenbrandt et al. 2010 Behav. Ecol. "Self-organized aerial displays of thousands of starlings".*
+*Cross-references: §66 (Strömbom-style hawk/sheep predator model — same predator-loosely-coupled-via-position pattern); §125 (swarm_gen_numbers — also uses spatial-hash colour cycling for cell tint).*
 
 ---
 

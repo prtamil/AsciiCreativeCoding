@@ -452,6 +452,86 @@ Spend the budget on concepts the simulation genuinely requires, not on
 abbreviations or premature optimizations. When in doubt: write the slow
 obvious version, then measure before sacrificing clarity for speed.
 
+## A beginner must be able to grok the algorithm from the code alone
+
+This is the **acceptance test** for every other principle in this
+section. Imagine a competent C programmer who has never seen the
+algorithm before — say, a CS undergraduate who knows pointers but has
+never heard of FABRIK, or boids, or position-Verlet. Open the file.
+Read top-to-bottom. Within ~10 minutes, that reader should be able to
+**name the algorithm, sketch it on paper, and predict what each
+function does before reading its body**. If they can't, the file fails
+this test.
+
+The four levers that decide whether a file passes:
+
+**1. Algorithm explanation in plain English, before any code.**
+The CONCEPTS block names the algorithm; the MENTAL MODEL block teaches
+the reader to *think in it*. By the time they reach §1 they should
+already know — in words — what the file is going to compute, why it
+works, and what the steps are. Code without that prelude is a maze; a
+reader has to reverse-engineer the algorithm before they can study it.
+**Test:** delete every function body. Does the prose alone teach the
+algorithm? If not, expand MENTAL MODEL → ALGORITHM IN STEPS until it
+does.
+
+**2. Data joined when it travels together; separated when it doesn't.**
+A `Boid` carries position + velocity + colour together because they
+*move together* through the simulation. A `Scene` separates the boid
+pool from the threat from the queue geometry because those evolve on
+different rules. The shape of the data is the shape of the concept.
+
+- *Join* fields that are always read or written in the same step
+  (e.g. `pos.x, pos.y` → `Vec2 pos` because nothing ever uses one
+  without the other).
+- *Separate* concerns that change at different rates or for different
+  reasons (e.g. simulation state vs. render snapshots vs. config —
+  three different structs, even if they share field names).
+- A struct with 15 ungrouped fields is a sign of failed separation: the
+  reader cannot see at a glance which fields belong together. Add the
+  one-line group headers (see "Group struct fields with one-line
+  headers" above) or split the struct.
+
+**Test:** for each struct field, ask "what other field do I always
+touch alongside this one?" If the answer is always *the same group*,
+the join is correct. If the answer differs by field, the struct should
+be split.
+
+**3. Names that explain themselves to a stranger.**
+A reader should be able to read a function signature and predict what
+it does. `wrap_pi(angle)` is self-explanatory; `fix_a(x)` is not.
+`steer_separate(people, count, self)` describes a concept; `f1(p, n,
+s)` describes nothing. This is the difference between code a learner
+can study and code they have to *decipher* before they can study.
+
+- Function names: verb + noun describing the simulation concept
+  (`fabrik_forward_pass`, `apply_platform_collisions`, not `step`).
+- Struct names: the entity name, not the data layout
+  (`Centipede`, not `EntityArray`).
+- Field names: the physical or conceptual quantity, with units in the
+  comment (`heading /* radians */`, not `h`).
+
+**Test:** show a function signature to someone who has not read the
+file. Can they predict what it does? If not, rename.
+
+**4. Worked example threaded through the comments.**
+At every non-obvious step, anchor the explanation with concrete
+numbers. "At 60 Hz × 0.992 damping, a rope segment loses 38 % of its
+speed in one second" is teachable; "exponential decay applies" is
+filler. KEY FORMULAS shows the equation; HOW TO VERIFY shows what
+plugging in default values produces; EDGE CASES shows what happens at
+the limits. A learner reading the file should never have to *imagine*
+what the simulation does — the comments should walk them through one
+specific run.
+
+**The grok test.** When you finish a file, hand it to someone who has
+never seen the algorithm. Tell them: "Read this for ten minutes. Then
+without referring to the code, sketch on paper what happens each tick
+and what each function does." If they can do it, the file passes. If
+they go blank, fix the prose first, then the structure, then — only as
+a last resort — the code. Most learner-friendliness problems are not
+code problems; they are explanation problems.
+
 ---
 
 # Working on This Project

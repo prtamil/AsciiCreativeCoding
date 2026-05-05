@@ -20,24 +20,30 @@ The entire terminal surface is conceptually much larger than the visible cells �
 
 ## Data Structures
 
-### Boid
+### Boid (one agent's complete kinematic state)
 ```
-px, py          — position in sub-pixel space (float)
-vx, vy          — velocity in pixels per second (float)
-cruise_speed    — this individual boid's personal target speed
+px, py          — position, pixel space
+vx, vy          — velocity, pixels per second
+cruise_speed    — personal target speed, px/s; varies ±15% per
+                  follower so fast boids push forward and slow ones
+                  drift back, giving the flock organic depth
 ```
 Every boid lives entirely in pixel-space coordinates. Only at draw time is position divided by CELL_W or CELL_H to get the terminal cell coordinate.
 
-### Flock
+### Flock — grouped fields
 ```
-leader          — one Boid that wanders independently
-followers[]     — up to FOLLOWERS_MAX Boid slots
-n               — how many followers are active
-color_phase     — which flock index this is (0, 1, or 2)
-wander_angle    — leader's current heading in radians
-orbit_phase     — for MODE_ORBIT: current rotation angle of the ring
+/* boid pool — leader + active followers[0..n-1] */
+leader, followers[FOLLOWERS_MAX], n
+
+/* leader steering state */
+wander_angle    — leader heading in radians (random walk)
+
+/* mode-specific extras */
+orbit_phase     — MODE_ORBIT: ring rotation angle in radians
+
+/* render identity — set once at flock_init */
+color_phase     — hue offset (kept for future palette tweaks)
 ```
-A Flock is self-contained. The Scene holds an array of three Flocks.
 
 ### Scene
 ```
@@ -46,6 +52,16 @@ mode            — which of the five algorithms is active
 paused          — if true, scene_tick does nothing
 vicsek_noise    — the noise level parameter for MODE_VICSEK
 ```
+
+### Color pair layout (CLAUDE.md HUD spec)
+```
+pairs 1..FLOCKS         — follower colors per flock (theme-driven)
+pairs FLOCKS+1..2*FLOCKS — leader colors (complementary to followers)
+PAIR_HUD  = 2*FLOCKS+1  — bright yellow 226, top-right status, A_BOLD
+PAIR_HINT = 2*FLOCKS+2  — bright cyan   51,  bottom hint, A_BOLD
+```
+
+Background is `-1` (terminal default) so the demo respects the user's theme. All foreground tints sit in the bright half of the 256-colour cube (≥ 33).
 
 ## The Main Loop
 
@@ -141,6 +157,15 @@ Prey followers:
 **Physics:** All boids in isotropic pixel space: `CELL_W=8` sub-pixels wide, `CELL_H=16` sub-pixels tall per terminal cell. Two-stage update: Stage 1 reads all old positions to compute new velocities; Stage 2 writes all velocities simultaneously — prevents update-order bias. Toroidal wrap, not bounce: every boid always has potential neighbours in all directions.
 
 **Performance:** `floorf(x + 0.5f)` instead of `roundf` for pixel→cell conversion — breaks the round-half-even tie to prevent per-frame cell oscillation flicker. Render interpolation: `draw_px = px + vx * alpha * dt_sec` projects each boid forward to its fractional-tick position.
+
+## Worked Example (defaults: 3 flocks × 12 followers, 80×24 terminal, 60 Hz)
+
+- World box: 200 cols × 60 rows = 1600 × 960 pixels in pixel space.
+- Per tick (1/60 s): a follower at `BOID_SPEED = 280 px/s` travels `280/60 ≈ 4.7 px` ≈ one new column every ~2 ticks (~33 ms) — the direction glyph reads as a moving arrow, not a static character.
+- Perception: `PERCEPTION_RADIUS = 180 px = 22 cols / 11 rows`. A boid sees ~2-4 same-flock neighbours plus its leader (12 followers spread over 1600×960 px gives `12 / (1600·960 / (π·180²)) ≈ 0.8` expected neighbours; the spawn scatter of 70 px makes the actual count higher).
+- Steering cost: O(N²) within each flock. 12·11 = 132 distance checks per flock per tick × 3 flocks = 396 checks/tick × 60 Hz ≈ 24 K/s — microseconds. Predator mode adds a flee scan: ~13 predator boids × 24 prey ≈ 312 extra checks/tick, also trivial.
+- Vicsek phase: at noise = 0.05 (`n` key) the alignment summation dominates and every boid lines up within ~1 second. At noise = 1.5 the random angle ≈ ±86° per tick swamps alignment and the flock dissolves. The transition is visibly sharp around noise ≈ 0.6.
+- Boundary: toroidal everywhere — a boid at `px = 1599` reappears at `px = 0` next tick. `toroidal_delta` makes neighbours across the wrap behave as close, so flock cohesion never "tears" at edges.
 
 ## Key Constants and What Tuning Them Does
 

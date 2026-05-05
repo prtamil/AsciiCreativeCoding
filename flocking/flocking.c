@@ -1,67 +1,239 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * flocking.c — ncurses ASCII flocking simulation
+ * flocking.c — five switchable flocking algorithms across three flocks
  *
- * Three flock groups, each with a wandering leader and followers that steer
- * using one of two switchable algorithms. Boids wrap around screen edges
- * (toroidal topology) instead of bouncing. Colors cycle via a cosine palette
- * so all three flocks stay visually distinct while slowly shifting hue.
+ * DEMO: Three flocks, each led by a wandering leader, share the screen and
+ *       run simultaneously. Press 1-5 to switch between Reynolds boids,
+ *       leader chase, Vicsek noise-driven alignment, orbit formation, and
+ *       predator-prey hunt-flee. Boids wrap toroidally at the screen edges
+ *       so flocking behaviour is uniform everywhere.
  *
- * Physics run in square pixel space (CELL_W × CELL_H sub-pixels per cell)
- * so that motion is isotropic — same technique as bounce.c.
+ * Study alongside: flocking/crowd.c (the same forces in single-flock form)
  *
- * Sections
- * --------
- *   §1  config   — every tunable constant with reasoning
- *   §2  clock    — monotonic nanosecond clock + sleep
- *   §3  color    — cosine palette → xterm-256 cube → ncurses pairs
- *   §4  coords   — pixel ↔ cell conversion (the one aspect-ratio fix)
- *   §5  boid     — struct; velocity-direction char; spawn; speed clamp; wrap
- *   §6  flock    — leader wander; boids rules; two algorithm modes; flock init
- *   §7  scene    — pool of flocks; tick; draw with brightness gradient
- *   §8  screen   — ncurses init / draw (color update + HUD) / present
- *   §9  app      — dt loop, input, resize, signal handling
+ * Section map:
+ *   §1 config   — tunables: counts, speeds, radii, weights, mode params
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 3-flock palette (followers + leaders) + PAIR_HUD/PAIR_HINT
+ *   §4 coords   — pixel↔cell aspect-ratio bridge + toroidal_delta helper
+ *   §5 boid     — Boid struct; spawn; speed clamp; wrap; direction glyph
+ *   §6 flock    — leader wander; five steering modes; flock_init
+ *   §7 scene    — Scene = 3 flocks; predator-prey path; scene_draw
+ *   §8 screen   — ncurses double-buffer display layer
+ *   §9 app      — signals, resize, main game loop
  *
- * Keys
- *   q / ESC   quit
- *   space     pause / resume
- *   1         mode: Classic Boids    (separation + alignment + cohesion)
- *   2         mode: Leader Chase     (followers home directly on leader)
- *   3         mode: Vicsek           (align to neighbors + noise angle)
- *   4         mode: Orbit Formation  (followers spin on ring around leader)
- *   5         mode: Predator-Prey    (flock 0 hunts; flocks 1-2 flee)
- *   n / m     decrease / increase Vicsek noise level
- *   + / -     add / remove one follower per flock
- *   r         reset all flocks to their starting quadrants
+ * Keys:
+ *   q / ESC    quit                       space    pause / resume
+ *   1          BOIDS    (sep+align+coh)   2        CHASE   (leader homing)
+ *   3          VICSEK   (align+noise)     4        ORBIT   (spinning ring)
+ *   5          PREDATOR (hunt/flee)
+ *   n / m      Vicsek noise − / +         + / -    add / remove a follower
+ *   r          reset all flocks to starting quadrants
  *
- * Build
+ * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra flocking.c -o flocking -lncurses -lm
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Five switchable flocking algorithms:
+ * Algorithm      : Five switchable flocking algorithms sharing the same
+ *                  Boid + leader infrastructure:
  *                  1. Classic Boids (Reynolds 1987) — separation (avoid
- *                     crowding), alignment (steer toward average heading),
- *                     cohesion (steer toward average position).
- *                  2. Leader Chase — followers home on leader position.
- *                  3. Vicsek model (Vicsek 1995) — align to average heading
- *                     of neighbours within radius, add noise angle η.
- *                  4. Orbit Formation — followers maintain ring radius around
- *                     leader with angular spacing enforced by angular springs.
- *                  5. Predator-Prey — flock 0 hunts; flocks 1–2 flee.
+ *                     crowding), alignment (match average heading),
+ *                     cohesion (steer to centre of mass).
+ *                  2. Leader Chase — followers ignore peers and home on
+ *                     their flock's leader; only short-range separation
+ *                     prevents stacking.
+ *                  3. Vicsek model (Vicsek 1995) — align to mean heading
+ *                     of neighbours within radius, add a noise angle η.
+ *                     The single noise parameter drives a phase
+ *                     transition between ordered and disordered regimes.
+ *                  4. Orbit Formation — followers chase evenly-spaced
+ *                     slots on a ring of radius ORBIT_RADIUS rotating at
+ *                     ORBIT_SPEED rad/s around the leader.
+ *                  5. Predator-Prey — flock 0 hunts the nearest prey
+ *                     boid; flocks 1-2 boid-steer plus flee any predator
+ *                     within PREY_FLEE_RADIUS.
  *
- * Physics        : All boids run in isotropic square pixel space
- *                  (CELL_W×CELL_H sub-pixels per terminal cell) to prevent
- *                  the taller-than-wide cell aspect ratio from distorting
- *                  neighbour distances and force magnitudes.
- *                  Velocity integration: explicit Euler; speed clamped each tick.
- *                  Toroidal topology: positions wrap at screen edges.
+ * Physics        : All boids live in isotropic pixel space
+ *                  (CELL_W × CELL_H sub-pixels per terminal cell) so
+ *                  the taller-than-wide cell aspect ratio cannot distort
+ *                  neighbour distances or force magnitudes. Integration
+ *                  is explicit Euler; speed is clamped to [MIN_SPEED,
+ *                  MAX_SPEED] each tick. Boundary topology is toroidal:
+ *                  positions wrap at screen edges and `toroidal_delta`
+ *                  computes the shortest signed displacement between
+ *                  any two points.
  *
- * Math           : Vicsek order parameter: φ = |Σ v̂_i| / N ∈ [0,1];
- *                  0 = disordered, 1 = perfect alignment.
- *                  Colour: cosine palette r,g,b = 0.5 + 0.5·cos(2π(t + phase))
- *                  cycles hue slowly while keeping three flocks distinct.
+ * Data-structure : Scene owns three Flock structs; each Flock owns a
+ *                  Boid leader and a fixed-capacity Boid followers[]
+ *                  array (up to 20 active). The two-stage tick computes
+ *                  every follower's *new* velocity into a scratch array
+ *                  before writing any back, so no boid reacts to a
+ *                  neighbour that has already moved this tick.
+ *
+ * Rendering      : Forward extrapolation by `alpha · dt` (constant
+ *                  velocity assumption — boid_clamp_speed makes the
+ *                  per-tick speed effectively constant). Each follower
+ *                  renders at its flock's colour pair with brightness
+ *                  modulated by toroidal distance to its leader (close →
+ *                  A_BOLD, far → A_NORMAL); each leader renders in its
+ *                  own pair with `A_BOLD`. Direction glyphs differ per
+ *                  flock so flocks stay distinguishable when they mix.
+ *
+ * Performance    : Steering is O(N²) within each flock (every follower
+ *                  checks every other for separation/align/cohere).
+ *                  At 12 followers per flock this is 144 distance checks
+ *                  per flock per tick — trivial. Predator mode adds a
+ *                  cross-flock O(N_predator × N_prey) flee term,
+ *                  ~20 × 24 ≈ 480 checks, also trivial.
+ *
+ * References     : Reynolds, "Flocks, Herds, and Schools: A Distributed
+ *                    Behavioral Model," SIGGRAPH 1987 — the original
+ *                    boids paper.
+ *                  Vicsek et al., "Novel Type of Phase Transition in a
+ *                    System of Self-Driven Particles," Phys. Rev. Lett.
+ *                    75 (1995) — the Vicsek model and its phase
+ *                    transition.
+ *                  Reynolds, "Steering Behaviors for Autonomous
+ *                    Characters," 1999 (red3d.com/cwr/steer/) — the
+ *                    canonical steering-behaviour primer.
+ *                  Wikipedia: "Boids", "Vicsek model" — concise
+ *                    summaries of the rules and emergent properties.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Every boid is a particle with a constant cruise speed; what changes is
+ * *direction*. Each tick, a boid sums steering forces (separation,
+ * alignment, cohesion, leader pull, flee, …), adds them to its velocity,
+ * clamps the magnitude, integrates position. The flock as a whole is
+ * just an emergent pattern in those independent local rules — no
+ * scheduler, no formation table, no central planner. Switching modes
+ * (1-5) only changes which forces are summed; the integration is the
+ * same.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine three swarms of ASCII fish, each chasing its own slightly
+ * faster glider (the leader). Every fish has three rules in its head at
+ * once — "don't bump into neighbours", "swim parallel to neighbours",
+ * "drift toward the centre of nearby neighbours" — and a quieter pull
+ * toward its own leader. Add these tugs together, point in their
+ * direction, swim. That single recipe with different weight choices
+ * produces all five modes: pure boids (1), drop alignment+cohesion and
+ * dial up leader pull (2), throw out everything except a mean-heading
+ * align with random noise (3), replace the leader pull with "go to slot
+ * i on the rotating ring" (4), or add a strong flee force per visible
+ * predator (5).
+ *
+ * ALGORITHM IN STEPS  (per tick, per flock)
+ * ─────────────────────────────────────────
+ *   1. leader_tick: jitter the leader's heading by ±WANDER_JITTER rad,
+ *      derive velocity, integrate position, wrap toroidally.
+ *   2. Stage 1 — read-only: for every follower compute new_v[i] using
+ *      the active mode's steering function. Reads OLD positions only.
+ *   3. Stage 2 — write: for every follower copy new_v[i] into vel,
+ *      clamp speed, integrate position, wrap toroidally.
+ *
+ * Two stages so no boid reacts to an already-moved neighbour — without
+ * this, the flock drifts in array order over time.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Toroidal delta (shortest signed displacement on a wrapped axis):
+ *     d = b − a
+ *     if d >  extent/2 : d −= extent
+ *     if d < −extent/2 : d += extent
+ *
+ *   Boids separation (per neighbour with 0 < d < SEPARATION_RADIUS):
+ *     closeness = (SEPARATION_RADIUS − d) / SEPARATION_RADIUS
+ *     sep_x    -= (dx/d) · closeness                     (sum over neighbours)
+ *     sep_y    -= (dy/d) · closeness
+ *     steer    += W_SEPARATION · normalise(sep) · MAX_STEER
+ *
+ *   Boids alignment (per neighbour with d < PERCEPTION_RADIUS):
+ *     desired = normalise(mean_neighbour_velocity) · cruise_speed
+ *     steer  += W_ALIGNMENT · (desired − vel)
+ *
+ *   Boids cohesion (toroidal centre of mass — accumulate offsets, not
+ *   absolute positions, because a wrapped torus makes naïve averaging
+ *   meaningless):
+ *     desired = normalise(mean_neighbour_offset) · cruise_speed
+ *     steer  += W_COHESION  · (desired − vel)
+ *
+ *   Vicsek update:
+ *     avg_angle = atan2(Σ neighbour_vy, Σ neighbour_vx)
+ *     new_v     = cruise_speed · (cos, sin)(avg_angle + η)   (η ∈ [−noise, noise])
+ *
+ *   Pixel→cell aspect bridge:
+ *     cx = round(px / CELL_W)        (CELL_W = 8)
+ *     cy = round(py / CELL_H)        (CELL_H = 16)
+ *
+ * WORKED EXAMPLE  (defaults: 3 flocks x 12 followers, 200x60 terminal, 60 Hz)
+ * ──────────────────────────────────────────────────────────────────────────
+ *   World box       : 200 cols x 60 rows = 1600 x 960 pixels.
+ *   Per tick (1/60 s):
+ *     a follower at BOID_SPEED (280 px/s) travels 280/60 ≈ 4.7 px,
+ *     i.e. crosses one column every ~2 ticks (~33 ms) — fast enough
+ *     that the direction glyph reads as a moving arrow, not a static
+ *     character.
+ *   Perception      : PERCEPTION_RADIUS = 180 px = 22 cols / 11 rows.
+ *     Inside this disc a boid sees ~2-4 neighbours of its own flock
+ *     plus its leader (12 followers spread over 1600x960 px gives
+ *     ~12 / (1600·960 / (π·180²)) ≈ 0.8 expected neighbours, and the
+ *     spawn scatter (70 px radius) makes the actual count higher).
+ *   Steering cost   : O(N²) within each flock. 12·11 = 132 distance
+ *     checks per flock per tick, 3 flocks = 396 checks, ~24 000 per
+ *     second — microseconds. Predator mode adds a flee scan against
+ *     ~13 predator boids (1 leader + 12 followers) per prey boid:
+ *     ~24·13 = 312 extra checks per tick, also trivial.
+ *   Vicsek phase    : at noise = 0.05 (n key) the alignment summation
+ *     dominates and every boid lines up within ~1 second. At noise =
+ *     1.5 the random angle ≈ ±86° per tick swamps alignment and the
+ *     flock dissolves. Transition is visibly sharp around noise ≈ 0.6.
+ *   Boundary        : toroidal everywhere — a boid at px = 1599
+ *     reappears at px = 0 next tick. toroidal_delta makes neighbours
+ *     across the wrap behave as close, so the flock cohesion never
+ *     "tears" at edges.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   - Naïve averaging across the wrap: boids at px=5 and px=max−5 are
+ *     close on the torus but the mean of their absolute positions is in
+ *     the middle of the screen. Cohesion always uses summed *offsets*
+ *     via toroidal_delta, never absolute positions.
+ *   - Two-stage update: writing into the same array we are reading from
+ *     causes order-of-iteration artefacts (the flock drifts in index
+ *     order). Stage 1 fills new_vx/new_vy[]; stage 2 writes back.
+ *   - Speed floor: when separation and cohesion roughly cancel, |v| can
+ *     drop to ~0 and the boid stalls. boid_clamp_speed bumps it back to
+ *     MIN_SPEED so the flock never freezes.
+ *   - Vicsek noise sweep: at very low noise (0.05) the flock locks into
+ *     parallel beams; at very high noise (1.80) every boid moves
+ *     independently. Adjust live with n/m to see the phase transition.
+ *   - Frame cap: never `elapsed = clock_ns() − frame_time + dt` — adding
+ *     dt cancels the cap, sleep is 0, CPU pegs at 100 %. Use a
+ *     `frame_start` snapshot taken at the top of the loop instead.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   - Mode 1 (BOIDS), default config: within 5 seconds each flock should
+ *     coalesce into a coherent swirl with a leader at its head. Lower
+ *     W_ALIGNMENT (recompile) and the swirl dissolves — confirms
+ *     alignment is what knits a flock.
+ *   - Mode 3 (VICSEK), press n until noise = 0.05: flock locks into a
+ *     near-perfect parallel stream. Press m until noise > 1.5: every
+ *     boid wanders independently. The transition is visibly sharp around
+ *     noise ≈ 0.6.
+ *   - Mode 4 (ORBIT): each flock collapses into a rotating ring around
+ *     its leader within 2-3 seconds. Followers stay roughly evenly
+ *     spaced even as the leader wanders.
+ *   - Mode 5 (PREDATOR): flock 0 (green) chases the nearest prey boid;
+ *     flocks 1-2 (orange/blue) form tight balls that scatter when flock
+ *     0 closes in. Watch the flee force "tear" the prey flock apart.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -280,7 +452,8 @@ static void clock_sleep_ns(int64_t ns)
  * Color pair layout:
  *   pairs 1 … FLOCKS          — follower colors
  *   pairs FLOCKS+1 … 2*FLOCKS — leader colors
- *   pair  2*FLOCKS + 1        — HUD
+ *   pair  2*FLOCKS + 1        — PAIR_HUD  (top status — bright yellow)
+ *   pair  2*FLOCKS + 2        — PAIR_HINT (bottom key hint — bright cyan)
  */
 
 /* xterm-256 follower colors */
@@ -302,33 +475,51 @@ static void clock_sleep_ns(int64_t ns)
 
 static int follower_color_pair(int flock_idx) { return flock_idx + 1;          }
 static int leader_color_pair  (int flock_idx) { return flock_idx + 1 + FLOCKS; }
-#define HUD_COLOR_PAIR  (2 * FLOCKS + 1)
+#define PAIR_HUD   (2 * FLOCKS + 1)   /* bright yellow — top status   */
+#define PAIR_HINT  (2 * FLOCKS + 2)   /* bright cyan   — bottom hint  */
 
+/*
+ * color_init — register all ncurses colour pairs.
+ *
+ * Background = -1 (terminal default) so the demo respects the user's
+ * terminal theme.  use_default_colors() must be called once before any
+ * init_pair(.., .., -1) so ncurses understands -1 as "the default".
+ *
+ * All foreground tints sit in the bright half of the 256-colour cube
+ * (≥ 33) per the project palette-brightness rule — even leaders that
+ * read as "neutral" use 231 (near-white) rather than the dark grey
+ * region.  HUD pairs use the canonical bright yellow + cyan combo.
+ */
 static void color_init(void)
 {
     start_color();
+    use_default_colors();
 
     if (COLORS >= 256) {
         /* xterm-256: vivid named colors */
-        init_pair(follower_color_pair(0), COLOR_256_MATRIX_GREEN, COLOR_BLACK);
-        init_pair(follower_color_pair(1), COLOR_256_FIRE_ORANGE,  COLOR_BLACK);
-        init_pair(follower_color_pair(2), COLOR_256_ELECTRIC_BLUE, COLOR_BLACK);
+        init_pair(follower_color_pair(0), COLOR_256_MATRIX_GREEN,  -1);
+        init_pair(follower_color_pair(1), COLOR_256_FIRE_ORANGE,   -1);
+        init_pair(follower_color_pair(2), COLOR_256_ELECTRIC_BLUE, -1);
 
-        init_pair(leader_color_pair(0), COLOR_256_LEADER_YELLOW, COLOR_BLACK);
-        init_pair(leader_color_pair(1), COLOR_256_LEADER_CYAN,   COLOR_BLACK);
-        init_pair(leader_color_pair(2), COLOR_256_LEADER_WHITE,  COLOR_BLACK);
+        init_pair(leader_color_pair(0), COLOR_256_LEADER_YELLOW, -1);
+        init_pair(leader_color_pair(1), COLOR_256_LEADER_CYAN,   -1);
+        init_pair(leader_color_pair(2), COLOR_256_LEADER_WHITE,  -1);
+
+        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
+        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
     } else {
         /* 16-color fallback — closest approximations */
-        init_pair(follower_color_pair(0), COLOR_GREEN,   COLOR_BLACK);
-        init_pair(follower_color_pair(1), COLOR_RED,     COLOR_BLACK);
-        init_pair(follower_color_pair(2), COLOR_BLUE,    COLOR_BLACK);
+        init_pair(follower_color_pair(0), COLOR_GREEN, -1);
+        init_pair(follower_color_pair(1), COLOR_RED,   -1);
+        init_pair(follower_color_pair(2), COLOR_BLUE,  -1);
 
-        init_pair(leader_color_pair(0), COLOR_YELLOW, COLOR_BLACK);
-        init_pair(leader_color_pair(1), COLOR_CYAN,   COLOR_BLACK);
-        init_pair(leader_color_pair(2), COLOR_CYAN,   COLOR_BLACK);
+        init_pair(leader_color_pair(0), COLOR_YELLOW, -1);
+        init_pair(leader_color_pair(1), COLOR_CYAN,   -1);
+        init_pair(leader_color_pair(2), COLOR_CYAN,   -1);
+
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
     }
-
-    init_pair(HUD_COLOR_PAIR, COLOR_WHITE, COLOR_BLACK);
 }
 
 /* ===================================================================== */
@@ -364,11 +555,21 @@ static inline int px_to_cell_y(float py)
 /* §5  boid                                                               */
 /* ===================================================================== */
 
-/* All positions and velocities are in PIXEL SPACE. */
+/*
+ * Boid — one agent's complete kinematic state.
+ *
+ * Three fields, three concepts: WHERE you are, WHICH WAY and HOW FAST
+ * you are moving, and HOW FAST you LIKE to move. The first two get
+ * rewritten every tick by integration; cruise_speed is set once at
+ * spawn (with ±15 % variation per follower) and gives the flock its
+ * organic "fast at the front, slow at the back" depth.
+ *
+ * All positions and velocities are in PIXEL SPACE — see §4 for why.
+ */
 typedef struct {
-    float px, py;          /* position (pixels)                          */
-    float vx, vy;          /* velocity (pixels / second)                 */
-    float cruise_speed;    /* personal target speed, px/s; varies ±15%  */
+    float px, py;          /* position, pixel space                      */
+    float vx, vy;          /* velocity, pixels / second                  */
+    float cruise_speed;    /* personal target speed, px/s; varies ±15 %  */
 } Boid;
 
 /*
@@ -504,13 +705,30 @@ static const char *k_mode_names[MODE_COUNT] = {
     "PREDATOR hunt/flee",
 };
 
+/*
+ * Flock — one leader plus its pool of followers.
+ *
+ * Field groups, by who reads/writes them:
+ *   - the boid pool: leader + followers[] (touched every tick)
+ *   - the leader's own state: wander_angle (touched only by leader_tick
+ *     or, in MODE_PREDATOR, by predator_leader_tick)
+ *   - mode-specific extras: orbit_phase (only MODE_ORBIT advances it)
+ *   - render identity: color_phase (set once at flock_init, never moves)
+ */
 typedef struct {
+    /* boid pool — leader + active followers[0..n-1] */
     Boid  leader;
     Boid  followers[FOLLOWERS_MAX];
-    int   n;              /* active follower count             */
-    float color_phase;    /* hue offset in cosine palette      */
-    float wander_angle;   /* leader heading in radians         */
-    float orbit_phase;    /* MODE_ORBIT: ring rotation angle   */
+    int   n;              /* active follower count                       */
+
+    /* leader steering state */
+    float wander_angle;   /* leader heading in radians (random walk)     */
+
+    /* mode-specific extras */
+    float orbit_phase;    /* MODE_ORBIT: ring rotation angle, radians    */
+
+    /* render identity — set once at flock_init */
+    float color_phase;    /* hue offset (kept for future palette tweaks) */
 } Flock;
 
 /* ── leader ──────────────────────────────────────────────────────────── */
@@ -1314,19 +1532,30 @@ static void screen_draw(Screen *s, Scene *sc,
     int total_boids = 0;
     for (int i = 0; i < FLOCKS; i++) total_boids += sc->flocks[i].n + 1;
 
-    attron(COLOR_PAIR(HUD_COLOR_PAIR));
+    /* Top-right status — PAIR_HUD bright yellow, A_BOLD */
+    char buf[160];
     if (sc->mode == MODE_VICSEK) {
-        mvprintw(0, 0, "FLOCKING  mode:%-28s  noise:%.2f  boids:%-3d  %s  %.0ffps"
-                       "  1-5:mode  n/m:noise  +/-:boids  r:reset  spc:pause  q:quit",
-                 k_mode_names[sc->mode], sc->vicsek_noise,
-                 total_boids, sc->paused ? "PAUSED " : "running", fps);
+        snprintf(buf, sizeof buf,
+                 " %5.0f fps  mode:%s  noise:%.2f  boids:%d  %s ",
+                 fps, k_mode_names[sc->mode], sc->vicsek_noise,
+                 total_boids, sc->paused ? "PAUSED " : "running");
     } else {
-        mvprintw(0, 0, "FLOCKING  mode:%-28s  boids:%-3d  %s  %.0ffps"
-                       "  1-5:mode  +/-:boids  r:reset  spc:pause  q:quit",
-                 k_mode_names[sc->mode], total_boids,
-                 sc->paused ? "PAUSED " : "running", fps);
+        snprintf(buf, sizeof buf,
+                 " %5.0f fps  mode:%s  boids:%d  %s ",
+                 fps, k_mode_names[sc->mode],
+                 total_boids, sc->paused ? "PAUSED " : "running");
     }
-    attroff(COLOR_PAIR(HUD_COLOR_PAIR));
+    int hx = s->cols - (int)strlen(buf);
+    if (hx < 0) hx = 0;
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, hx, "%s", buf);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    /* Bottom-left key hint — PAIR_HINT bright cyan, A_BOLD */
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  spc:pause  1:boids 2:chase 3:vicsek 4:orbit 5:predator  n/m:noise  +/-:boids  r:reset ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void)
@@ -1448,6 +1677,8 @@ int main(void)
 
     while (app->running) {
 
+        int64_t frame_start = clock_ns();
+
         /* ── resize ──────────────────────────────────────────────── */
         if (app->need_resize) {
             app_do_resize(app);
@@ -1492,8 +1723,12 @@ int main(void)
             fps_accum   = 0;
         }
 
-        /* ── frame cap (sleep before render to avoid I/O drift) ─── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
+        /* ── frame cap (sleep before render to avoid I/O drift) ─── *
+         * Budget = 1 / RENDER_FPS s.  elapsed is wall time spent on
+         * physics + accounting since frame_start; sleep the
+         * remainder.  Do NOT add dt back into elapsed — that cancels
+         * the cap, sleep is 0, CPU pegs at 100 %.                    */
+        int64_t elapsed = clock_ns() - frame_start;
         clock_sleep_ns(NS_PER_SEC / RENDER_FPS - elapsed);
 
         /* ── draw + present ──────────────────────────────────────── */

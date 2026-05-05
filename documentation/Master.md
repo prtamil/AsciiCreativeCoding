@@ -2058,15 +2058,41 @@ Converting between axial and screen coordinates: `screen_col = q + (r - (r & 1))
 
 ### N — Flocking & Collective Behaviour (new entries)
 
-#### N7 Shepherd / Herding — Flee Force with Panic Boost
+#### N7 Shepherd / Herding — Strömbom Geometric Placement
 
-The herding simulation adds a user-controlled shepherd to the Classic Boids model. Sheep experience five combined forces: the three standard Boids forces (separation, alignment, cohesion) plus a flee force from the shepherd and a boundary containment force. The flee force uses inverse-distance weighting: `F_flee = (pos_sheep − pos_shepherd) / dist` so nearby shepherds produce overwhelming repulsion while distant ones are barely felt.
+> **Note:** This essay was rewritten when `flocking/shepherd.c` was redesigned around an autonomous border collie. The previous user-controlled shepherd model is gone; the dog now decides where to stand and the sheep do the herding by fleeing the dog.
 
-A panic zone at `PANIC_RADIUS < FLEE_RADIUS` triples the flee weight — sheep sprint when the shepherd is close. This creates two behavioural modes: gentle steering (shepherd at medium range) and panicked scattering (shepherd closes in). The combination of cohesion (which tries to keep sheep together) and flee (which pushes them apart) produces the realistic oscillation where a flock partly stays together and partly scatters when a sheepdog approaches.
+A circular pen sits at the screen centre. ~30 sheep graze inside it under standard boid forces (separation + soft cohesion + gentle inward pull when outside the pen) plus a flee force from a single border collie. Press SPACE: every sheep gets an outward radial impulse and runs for the boundary. The dog — outside the pen — uses a Strömbom-style controller (Strömbom et al. 2014) to herd them back.
 
-Sheep use elastic wall bounces (velocity component reflected) rather than toroidal wrap. This makes them cornerable — the flock can be funnelled through an opening, which is the fundamental herding technique. Toroidal wrap would let sheep escape through walls, making herding impossible.
+**The geometric trick.** The dog never tells a sheep where to go. Each tick it picks ONE of two modes:
+- **COLLECT** (any sheep > `pen_r + tolerance` from centre): find the worst outlier; the dog's target is `sheep_pos + DOG_APPROACH_OFFSET · normalize(sheep_pos − pen_centre)` — directly *outside* the sheep relative to the pen. The sheep, fleeing the dog radially, ends up running *toward* the pen. The goal direction emerges from positioning, not from a goal-aware sheep.
+- **PATROL** (everyone home): walk a slow circle around the pen at `pen_r + DOG_PATROL_OFFSET`. Patrolling rather than parking keeps the dog reactive to fresh scatter events.
+
+The dog has no path planner — it simply steers toward its target at `DOG_SPEED = 180 px/s` (faster than `SHEEP_FLEE_SPEED = 140` so it can outflank). Emergent herding comes from the placement rule alone.
+
+**Why `(sheep − pen)`, not `(sheep − dog)`, for the offset direction.** The pen is the *goal*; the sheep is the *obstacle*. The line that matters is pen→sheep extended outward, not dog→sheep (which would just chase). This is the signature insight of the Strömbom paper: predator placement is goal-relative, not predator-relative.
+
+**Sheep dynamics.** Four forces summed each tick: separation, soft cohesion, flee from dog within `DOG_FLEE_RADIUS`, gentle inward pull when outside the pen. Per-tick `SHEEP_DAMPING = 0.95` factor (`0.95^60 ≈ 4.6%` retained per second) so motion settles to grazing rest when no force applies — sheep actually *stop and graze*.
+
 *Files: `flocking/shepherd.c`*
-*References: Strömbom, Mann, Wilson, Hailes, Morton, Sumpter & King, "Solving the shepherding problem: heuristics for herding autonomous, interacting agents" *J. R. Soc. Interface* 11 (2014).*
+*References: Strömbom, Mann, Wilson, Hailes, Morton, Sumpter & King, "Solving the shepherding problem: heuristics for herding autonomous, interacting agents" *J. R. Soc. Interface* 11 (2014). Reynolds 1987 SIGGRAPH "Flocks, Herds, and Schools" for the boid forces.*
+
+---
+
+#### N7b Murmuration — Density-Field Rendering of a High-Count Flock
+
+`flocking/murmuration.c` runs ~800 Reynolds boids on a toroidal world and inverts the usual question: instead of drawing 800 individual glyphs, it draws **the local density** of birds as a 2D scalar field projected onto the ASCII glyph ramp `.,:;oO*#@`. The flocking simulation produces the spatial density field; the renderer projects it to characters. The result is the classic murmuration "moving black cloud with glowing core and density-wave silhouette" — exactly how real starling flocks look at human visual scale.
+
+**The render trick.** Each frame: zero `density[rows][cols]`; for every bird `density[cy][cx]++`; then for every non-empty cell, glyph = `RAMP[min(density − 1, 8)]`, attribute = `A_BOLD` for density ≥ 5, `A_NORMAL` otherwise. No `A_DIM` tier — sparse cells (the majority) would mute to invisible. The fade-to-edge effect comes from the glyph ramp itself, not from brightness modulation.
+
+**One-pass O(N²) steering.** Separation, alignment, cohesion, and the hawk-flee force are all accumulated in a single inner loop per bird. `toroidal_delta` and squared distance are computed once per pair and reused for every rule. Cohesion accumulates **toroidal offsets** (relative to self) rather than absolute positions, because naïve averaging across the wrap puts the centroid in the middle of the screen even when birds are clustered at opposite edges.
+
+**Hawk predator with two modes.** PATROL: orbit world centre at `0.40 · min(w, h)`, slow `0.4 rad/s` angular speed. DIVE (SPACE-triggered or auto-dive every 6 s): straight-line sprint at `HAWK_DIVE_SPEED = 250 px/s` toward the flock centroid for `HAWK_DIVE_DURATION = 1.5 s`, then resume PATROL from the new position with `patrol_phase = atan2(pos − world_centre)`. Single hawk gives a clean visual narrative — multiple would each carve their own scatter wave and the flock would never re-cohere.
+
+**Why a tight-cluster theme palette, not a gradient.** The renderer picks the cell tint via spatial hash `((cy · 7 + cx) % N_COLORS) + 1`, so adjacent cells get DIFFERENT pairs from the active theme. If the palette were a dim-to-bright gradient, half the cells would render dim and the cloud would read as muddy. Each theme is instead a tight cluster of 7 bright shades of one tint (Dusk, Sky, Solar, Aurora, Ember, Forest, Neon, Sunset, Ghost, Matrix); the result is one tinted cloud with a soft mottle.
+
+*Files: `flocking/murmuration.c`*
+*References: Reynolds 1987 SIGGRAPH "Flocks, Herds, and Schools"; Couzin, Krause, James, Ruxton, Franks "Collective Memory and Spatial Sorting in Animal Groups" *J. Theor. Biol.* 218 (2002); Hildenbrandt, Carere, Hemelrijk "Self-organized aerial displays of thousands of starlings: a model" *Behav. Ecol.* 21 (2010).*
 
 ---
 

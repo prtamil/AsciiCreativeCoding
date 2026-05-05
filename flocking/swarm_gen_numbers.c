@@ -1,71 +1,235 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * swarm_gen_numbers.c — ASCII Swarm Digit Simulator
+ * swarm_gen_numbers.c — 120-agent steering swarm forms ASCII digits
  *
- * A swarm of 25 ASCII agents coordinates itself through Reynolds steering
- * behaviours to form the shapes of digits 0–9 on screen.
+ * DEMO: A swarm of 120 ASCII particles coordinates itself through
+ *       Reynolds steering behaviours to form the shapes of digits 0-9
+ *       on screen.  Each '#' in a digit's 5x7 bitmap is subdivided
+ *       into a 3x3 grid of mini-slots — 99 to 153 slots per digit —
+ *       so the formed digit reads as a dense cluster of glyphs, not
+ *       a sparse outline.  Ten switchable strategies (drift, rush,
+ *       flow, orbit, flock, pulse, vortex, gravity, spring, wave)
+ *       give the same digit ten different formation rhythms.  Ten
+ *       colour themes cycle live with t / T.
  *
- * HOW IT WORKS
- * ────────────
- * 1. A digit (0–9) is selected.  Its 5×7 bitmap is scaled and centred
- *    on screen; each '#' becomes one Slot (a target pixel-space point).
- * 2. Each Agent is greedily assigned its nearest available Slot.
- *    Agents with no slot (digit has fewer slots than agents) wander freely.
- * 3. Every physics tick, agents compute steering forces based on the
- *    active Strategy and integrate:  vel += force·dt,  pos += vel·dt.
- * 4. The renderer lerps between prev_pos and pos by alpha for smooth draw.
+ * Study alongside: flocking/flocking.c (boid forces + steering primer)
+ *                  flocking/crowd.c    (Person model / single flock)
  *
- * Visual cues
- * ───────────
- *   A_BOLD    agent is at its slot (within AT_SLOT_DIST px)
- *   normal    agent is en route to slot
- *   A_DIM     agent has no assigned slot (wandering)
+ * Section map:
+ *   §1 config   — strategies, slot subdivision, speeds, force weights
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 10 theme palettes + PAIR_HUD/PAIR_HINT + theme_apply
+ *   §4 coords   — pixel↔cell aspect bridge + Vec2 helpers
+ *   §5 entity   — Agent + Slot structs, spawn, agent_step
+ *   §6 steering — seek / arrive / separate / wander / cohesion / align / spring
+ *   §7 strategy — ten tick functions, one per strategy
+ *   §8 digit    — bitmap library, slot extraction, greedy assignment
+ *   §9 scene    — SwarmScene, scene_tick, scene_draw, mark_cell
+ *   §10 app     — signals, resize, main game loop
  *
- * Ten Strategies (press n/p to cycle, live — no reset needed)
- * ────────────────────────────────────────────────────────────
- *   1  DRIFT    organic wander + gentle slot pull
- *   2  RUSH     direct sprint to slot; arrive slows on arrival
- *   3  FLOW     left-to-right stream fills digit like liquid
- *   4  ORBIT    galaxy spiral — orbit centroid, collapse to slot
- *   5  FLOCK    Reynolds boids morph the swarm into the digit
- *   6  PULSE    formed digit breathes in and out rhythmically
- *   7  VORTEX   each agent spirals into its own slot (per-slot orbit)
- *   8  GRAVITY  downward pull + slot seek — agents rain into position
- *   9  SPRING   Hooke's law spring — underdamped oscillation into slot
- *  10  WAVE     agents snake toward slot with lateral sinusoidal wiggle
- *
- * Keys
- * ────
- *   0–9    form that digit          a    auto-cycle (3 s per digit)
- *   n/p    next/prev strategy       space  pause / resume
- *   r      scatter agents           q / ESC  quit
+ * Keys:
+ *   0-9    form that digit                a         auto-cycle (3 s/digit)
+ *   n / p  next / prev strategy           space     pause / resume
+ *   r      scatter agents                 t / T     next / prev theme
+ *   q/ESC  quit
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra flocking/swarm_gen_numbers.c -o swarm_gen_numbers -lncurses -lm
- *
- * §1 config    §2 clock    §3 color    §4 coords & vec2    §5 entity
- * §6 steering  §7 strategy §8 digit    §9 scene            §10 app
+ *   gcc -std=c11 -O2 -Wall -Wextra flocking/swarm_gen_numbers.c \
+ *       -o swarm_gen_numbers -lncurses -lm
  */
 
-/* ── STEERING PRIMER ──────────────────────────────────────────────── *
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Reynolds steering (1987):  force = desired_velocity − current_velocity
+ * Algorithm      : Reynolds-style steering swarm with greedy slot
+ *                  assignment.  Each tick every agent computes a force
+ *                  vector — different strategies mix different forces
+ *                  (seek, arrive, separate, wander, cohesion, align,
+ *                  spring, plus per-strategy extras) — integrates it
+ *                  into velocity, clamps to max_speed, and integrates
+ *                  position.  The slot-arrive force pulls each agent
+ *                  toward its assigned target point in the digit; the
+ *                  greedy nearest-unoccupied assignment ensures every
+ *                  agent knows where to go without the cost of an
+ *                  optimal Hungarian solve.
  *
- *   seek(target, speed)      steer toward target at 'speed'
- *   arrive(target, speed)    seek but slow inside slow_radius → no overshoot
- *   flee(threat, speed)      steer away from threat
- *   separate(neighbours)     push away from nearby agents
- *   wander(angle)            smoothly rotating random force
- *   cohesion(neighbours)     seek the local group's average position
- *   align(neighbours)        match the local group's average velocity
- *   spring(target, k, damp)  Hooke's law: force ∝ displacement, damp ∝ vel
+ *                  Each '#' in the digit's 5x7 bitmap is subdivided
+ *                  into a SLOT_GRID x SLOT_GRID grid of mini-slots,
+ *                  giving 9 slots per '#' cell at the default.  This
+ *                  packs ~100-150 agents into the digit shape so the
+ *                  formed digit reads as a filled cluster rather than
+ *                  a sparse skeleton.
  *
- * Each strategy mixes these forces with strategy-specific weights.
+ * Data-structure : SwarmScene owns a fixed Agent pool (all 120 always
+ *                  live), a Slot pool sized to SLOTS_MAX (largest
+ *                  possible digit), the active digit/strategy/theme
+ *                  indices, and the simulation clock used by PULSE/
+ *                  WAVE.  Agents carry pos/prev_pos/vel + their slot
+ *                  index (-1 if wandering) + their fixed glyph and
+ *                  per-agent colour pair.  Slots carry pos + an
+ *                  occupied flag used during greedy assignment.
  *
- * SLOT ASSIGNMENT (greedy nearest-available, O(N·S))
- *   For each agent (in order), find the nearest unoccupied slot and
- *   assign.  Unassigned agents (when n_agents > n_slots) wander.
- * ──────────────────────────────────────────────────────────────────── */
+ * Rendering      : Sub-tick alpha lerp of pos for smooth motion.
+ *                  Agent attributes derive from slot state — A_BOLD
+ *                  if at slot (within AT_SLOT_DIST), A_DIM if no
+ *                  slot, A_NORMAL otherwise.  Every glyph stamp goes
+ *                  through a mark_cell helper that performs the
+ *                  (chtype)(unsigned char) cast and bounds-check.
+ *
+ * Performance    : Separation runs O(N²) every tick.  At N = 160,
+ *                  160·159 = 25 440 distance checks per tick ≈
+ *                  1.5 M/s at 60 Hz — sub-millisecond at -O2.
+ *                  FLOCK adds two more O(N²) passes for cohesion
+ *                  and alignment but only when active.  Slot
+ *                  assignment is O(N·S), runs once per digit change
+ *                  (≈ 160·153 = 24 500 ops, microseconds).
+ *
+ * References     : Reynolds, "Flocks, Herds, and Schools: A
+ *                    Distributed Behavioral Model," SIGGRAPH 1987 —
+ *                    the source of every force used here.
+ *                  Reynolds, "Steering Behaviors for Autonomous
+ *                    Characters," 1999 (red3d.com/cwr/steer/) — the
+ *                    seek/arrive/separate/wander primer.
+ *                  Wikipedia: "Boids", "Hooke's law" — the alignment
+ *                    rule and the SPRING strategy's underlying
+ *                    second-order ODE (ζ ≈ 0.53 here, underdamped).
+ *                  Shiffman, "The Nature of Code" ch. 6 —
+ *                    accessible walkthrough of the same forces.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Pin a target point to every agent (its slot), then sum a few
+ * direction-of-motion forces — "go to the slot", "stay clear of
+ * neighbours", plus whatever extra mood the strategy adds — and
+ * integrate.  The digit shape is just the spatial pattern of slot
+ * positions; the strategy is just the recipe of forces.  Same digit,
+ * ten recipes → ten different visual rhythms of the same final
+ * formation.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a stadium where 120 fans are about to spell "5".  Each
+ * fan has a card with a seat number — that is the slot assignment.
+ * They walk to their seats from wherever they currently are.  How
+ * they walk is the strategy: a directed sprint (RUSH), a leisurely
+ * wander (DRIFT), a left-to-right stream (FLOW), a rotating queue
+ * (ORBIT), a herd that drifts together until everyone is somehow
+ * in the right spot (FLOCK), a falling drop (GRAVITY), a bouncing
+ * spring (SPRING), and so on.  When everyone is at their seat the
+ * digit is visible; when the digit changes the cards are reissued
+ * and the walk starts over.
+ *
+ * ALGORITHM IN STEPS  (per tick, per agent)
+ * ─────────────────────────────────────────
+ *   1. Compute the strategy's forces (each is a Vec2 in px/s²):
+ *        - slot-arrive toward agents[i].slot pos (always present
+ *          if agent has a slot)
+ *        - separation from nearby neighbours (always present)
+ *        - strategy-specific extras:
+ *            DRIFT/FLOW/FLOCK   wander
+ *            FLOW               rightward stream until aligned
+ *            ORBIT              tangent to digit centroid
+ *            FLOCK              cohesion + alignment
+ *            PULSE              oscillating slot target
+ *            VORTEX             tangent to own slot
+ *            GRAVITY            constant downward pull
+ *            SPRING             Hooke spring force replaces arrive
+ *            WAVE               lateral sin perpendicular to approach
+ *   2. force = Σ weighted forces
+ *   3. vel = clamp(vel + force · dt, max_speed)
+ *   4. prev_pos = pos
+ *   5. pos = pos + vel · dt; bounce off walls.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Seek:        desired = normalize(target − pos) · speed
+ *                force   = desired − vel
+ *
+ *   Arrive (seek with deceleration inside slow_radius):
+ *                desired_speed = max_speed · min(1, dist / slow_radius)
+ *                force         = desired - vel
+ *
+ *   Separate (per neighbour with 0 < d < sep_radius):
+ *                strength = (sep_radius − d) / sep_radius
+ *                force   += normalize(self − neighbour) · strength · 60 px/s
+ *
+ *   Spring (Hooke + linear damping; SPRING strategy):
+ *                force = SPRING_K · (target − pos) − SPRING_DAMP · vel
+ *                ζ     = SPRING_DAMP / (2·sqrt(SPRING_K)) ≈ 0.53 (underdamped)
+ *
+ *   Slot subdivision (digit_load):
+ *                for each '#' at bitmap (r, c):
+ *                  for sr in 0..SLOT_GRID-1:
+ *                    for sc in 0..SLOT_GRID-1:
+ *                      slot.pos = cell_origin + sub_offset(sr, sc)
+ *
+ *   Pixel→cell:  cx = round(px / CELL_W)        (CELL_W = 8)
+ *                cy = round(py / CELL_H)        (CELL_H = 16)
+ *
+ * WORKED EXAMPLE  (defaults: 160 agents, 80x24 terminal)
+ * ──────────────────────────────────────────────────────
+ *   World box        : 80 cols × 24 rows = 640 × 384 pixels.
+ *   Digit footprint  : 5 cols × 5 cells/bitmap-col = 25 cell-cols
+ *                       wide; 7 rows × 3 cells/bitmap-row = 21
+ *                       cell-rows tall.  Fills ~31 % of screen width,
+ *                       ~88 % of height — leaves 1 row top + 1 row
+ *                       bottom for HUD and key-hint bars.
+ *   Slot count       : digit 0/6/9 → 144 slots; digit 1 → 108;
+ *                       digit 2/3 → 135; digit 4 → 126;
+ *                       digit 5/8 → 153 (max); digit 7 → 99 (min).
+ *                       N_AGENTS = 160 ensures EVERY slot of EVERY
+ *                       digit can be filled.  On digit 7 (99 slots),
+ *                       the surplus 61 agents wander A_DIM around
+ *                       the formed shape; on digit 5/8 (153 slots),
+ *                       only 7 wander.
+ *   Per tick (1/60 s):
+ *     a RUSH agent at arrive_speed 180 px/s travels 3 px ≈ less than
+ *       half a column — visibly smooth.
+ *     a DRIFT agent at arrive_speed 70 px/s travels 1.2 px — slow
+ *       meander.
+ *   Steering cost    : separation O(N²): 160·159 = 25 440 checks/tick
+ *                       × 60 Hz ≈ 1.5 M/s.  Sub-millisecond at -O2.
+ *   Slot assignment  : O(N·S) = 160·153 ≈ 24 500 ops, runs only on
+ *                       digit change (key '0'-'9' or auto-cycle tick).
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   - More agents than slots: agents beyond n_slots get slot_idx = -1
+ *     and wander.  scene_draw renders them A_DIM so the eye
+ *     distinguishes "lost" agents from "settled" ones.
+ *   - Greedy nearest assignment is not globally optimal (Hungarian
+ *     algorithm would be), but the visual difference is minor and
+ *     the cost is much lower.
+ *   - Pulse direction at exact slot: when agent sits ON its slot,
+ *     v2norm(agent − slot) is the zero vector.  PULSE uses
+ *     centroid → slot direction instead so the push direction is
+ *     stable.
+ *   - Wander out of slot: DRIFT and FLOCK have a wander force that
+ *     would keep kicking agents off the slot.  Both fade wander to
+ *     zero inside WANDER_FADE_DIST so the digit can settle.
+ *   - Frame cap: do NOT add dt back into elapsed (the bug fixed in
+ *     this rewrite); use a `frame_start = clock_ns()` snapshot.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   - On startup, agents scatter randomly then all pile into digit 0
+ *     within 2-3 seconds (default DRIFT strategy).  HUD shows
+ *     "144/144 formed" once settled.
+ *   - Press 1, 2, ... 9 — each digit forms a recognisable cluster of
+ *     glyphs.  The number of mini-slots per '#' (9) is tight enough
+ *     that the digit shape is clear, loose enough to read individual
+ *     agents.
+ *   - Press n to advance through strategies.  RUSH snaps in, DRIFT
+ *     wanders in slowly, FLOW comes in left to right, ORBIT spirals,
+ *     GRAVITY rains down, SPRING bounces, etc.
+ *   - Press t / T — palette cycles through 10 themes; the formed
+ *     digit re-tints on the next render.
+ *   - Press a (auto-cycle): every 3 s the digit advances 0→1→...→9→0.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #include <float.h>
@@ -236,21 +400,61 @@ static const char *const DIGIT_BITMAPS[10][DIGIT_NROWS] = {
 
 /*
  * Scaling: each template cell maps to DIGIT_CELL_W × DIGIT_CELL_H
- * terminal cells.  At the default values a digit spans 25×14 cells
- * which fits comfortably in an 80×24 terminal.
+ * terminal cells.  At the default values a digit spans 25 × 21 cells
+ * which fits in 80 × 24 with a 2-row HUD reserve.
+ *
+ * Why DIGIT_CELL_H = 3 (and not 2)?  We subdivide each '#' into a
+ * SLOT_GRID × SLOT_GRID grid of sub-slots in §8.  When SLOT_GRID = 3
+ * we want 3 distinct terminal rows per cell so each sub-slot row
+ * lands cleanly in its own row.  At DIGIT_CELL_H = 2 the third
+ * sub-slot row leaks into the NEXT bitmap row's allocated terminal
+ * rows (because px_to_cell_y rounds half-up at 8-px boundaries),
+ * blurring the digit's vertical structure — the historical "6 looks
+ * like 5" bug.  Setting DIGIT_CELL_H = SLOT_GRID = 3 makes the
+ * mapping exact: one sub-slot row per terminal row.
  */
 #define DIGIT_CELL_W   5   /* terminal columns per template column */
-#define DIGIT_CELL_H   2   /* terminal rows per template row       */
+#define DIGIT_CELL_H   3   /* terminal rows per template row       */
 
-/* Simulation sizes */
+/* Simulation sizes
+ *
+ * SLOT_GRID — sub-slot subdivision per '#' cell in the digit bitmap.
+ *   3x3 = 9 sub-slots per '#', so digit slot counts are:
+ *      digit 0,6,9 → 16 × 9 = 144 slots
+ *      digit 1     → 12 × 9 = 108
+ *      digit 2,3   → 15 × 9 = 135
+ *      digit 4     → 14 × 9 = 126
+ *      digit 5,8   → 17 × 9 = 153  (the maximum)
+ *      digit 7     → 11 × 9 =  99  (the minimum)
+ *
+ * N_AGENTS — total agents in the swarm.  Set to SLOTS_MAX so every
+ *   slot of every digit can be filled — including digits 5 and 8
+ *   which need all 153 slots populated to read clearly.  Smaller
+ *   digits (7 has only 99 slots) leave the remaining agents in the
+ *   wander state, milling around the formed digit; this is visually
+ *   fine because they render A_DIM and the digit shape stays clear.
+ *
+ * SLOTS_MAX — upper bound on slot count.  Sized to the maximum
+ *   possible (digit 5/8: 17 '#' × SLOT_GRID²); also caps N_AGENTS.
+ *
+ * N_COLORS — number of body-colour pairs (1..N_COLORS).  Agent i
+ *   uses pair (i % N_COLORS) + 1.  Combined with the THEMES table
+ *   in §3, the swarm cycles through 7 theme tints round-robin.
+ */
 enum {
-    N_AGENTS        = 25,   /* total agents in the swarm */
-    SLOTS_MAX       = 20,   /* max '#' count in any digit + margin */
-    SIM_FPS_DEFAULT = 60,
-    TARGET_FPS      = 60,
+    SLOT_GRID       =   3,   /* 3x3 sub-slot grid per '#' = 9 slots/cell */
+    SLOTS_MAX       = 160,   /* 17 # × 9 sub-slots = 153, plus margin    */
+    N_AGENTS        = 160,   /* matches SLOTS_MAX so every slot fills    */
+    SIM_FPS_DEFAULT =  60,
+    TARGET_FPS      =  60,
     FPS_UPDATE_MS   = 500,
-    N_COLORS        = 7,
-    AUTO_CYCLE_S    = 3,    /* seconds per digit in auto-cycle mode */
+    N_COLORS        =   7,
+    AUTO_CYCLE_S    =   3,    /* seconds per digit in auto-cycle mode */
+
+    PAIR_HUD        =   8,    /* bright yellow — top status bar  */
+    PAIR_HINT       =   9,    /* bright cyan   — bottom key hint */
+
+    N_THEMES        =  10,    /* see THEMES[] in §3 */
 };
 
 /* Cell dimensions — physics in px, draw in cells; convert only at render */
@@ -327,36 +531,80 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                            */
+/* §3  color — 10-theme palette + dedicated HUD pairs                    */
 /* ===================================================================== */
 
 /*
- * Seven color pairs used across the swarm:
- *   1=red  2=orange  3=yellow  4=green  5=cyan  6=blue  7=magenta
+ * Theme — one named palette.  body[0..6] holds the seven xterm-256
+ * foreground indices that agents cycle through (agent i uses pair
+ * (i % N_COLORS) + 1).  Themes are cycled with t / T.
  *
- * Agents cycle through all seven so the digit looks like a colourful
- * mosaic when formed.  The HUD uses pair 3 (yellow).
+ * Every entry sits in the bright half of the 256-colour cube (≥ 24)
+ * per the project palette-brightness rule; entries below 24 become
+ * invisible under A_DIM (used by wandering agents).
  */
-static void color_init(void)
+typedef struct {
+    const char *name;
+    int         body[N_COLORS];
+} Theme;
+
+static const Theme THEMES[N_THEMES] = {
+    /* name        agent 0 ←──────────────────────────→ agent 6 */
+    {"Rainbow", { 196, 208, 226,  46,  51,  33, 201}},
+    {"Solar",   { 226, 220, 214, 208, 202, 196, 160}},
+    {"Ocean",   {  24,  27,  33,  38,  45,  51, 117}},
+    {"Fire",    { 196, 202, 208, 214, 220, 226, 227}},
+    {"Matrix",  {  28,  34,  40,  46,  76,  82, 118}},
+    {"Aurora",  {  28,  34,  79, 122, 159, 165, 201}},
+    {"Neon",    { 201, 165, 129,  93,  57,  51,  45}},
+    {"Sunset",  {  54,  91, 128, 165, 202, 209, 208}},
+    {"Toxic",   {  28,  58,  64,  70,  76,  82, 118}},
+    {"Ghost",   { 244, 247, 250, 252, 253, 254, 255}},
+};
+
+/*
+ * theme_apply — register palette idx with ncurses.  Background = -1
+ * (terminal default) so the demo respects the user's theme.  The
+ * 8-colour fallback approximates the warm-to-cool feel.
+ *
+ * PAIR_HUD/PAIR_HINT are theme-independent and configured once in
+ * color_init().
+ */
+static void theme_apply(int idx)
+{
+    const Theme *th = &THEMES[idx];
+    if (COLORS >= 256) {
+        for (int p = 0; p < N_COLORS; p++)
+            init_pair(p + 1, th->body[p], -1);
+    } else {
+        static const int fb8[N_COLORS] = {
+            COLOR_RED, COLOR_RED, COLOR_YELLOW,
+            COLOR_GREEN, COLOR_CYAN, COLOR_BLUE, COLOR_MAGENTA
+        };
+        for (int p = 0; p < N_COLORS; p++)
+            init_pair(p + 1, fb8[p], -1);
+    }
+}
+
+/*
+ * color_init — one-time colour setup.
+ *   start_color()        — initialise ncurses colour support.
+ *   use_default_colors() — allow background = -1 to mean "terminal default".
+ *   theme_apply()        — register the initial body palette (Rainbow).
+ *   PAIR_HUD/PAIR_HINT   — bright yellow / cyan, theme-independent.
+ */
+static void color_init(int initial_theme)
 {
     start_color();
     use_default_colors();
+    theme_apply(initial_theme);
+
     if (COLORS >= 256) {
-        init_pair(1, 196, COLOR_BLACK);
-        init_pair(2, 208, COLOR_BLACK);
-        init_pair(3, 226, COLOR_BLACK);
-        init_pair(4,  46, COLOR_BLACK);
-        init_pair(5,  51, COLOR_BLACK);
-        init_pair(6, 33, COLOR_BLACK);
-        init_pair(7, 201, COLOR_BLACK);
+        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
+        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
     } else {
-        init_pair(1, COLOR_RED,     COLOR_BLACK);
-        init_pair(2, COLOR_RED,     COLOR_BLACK);
-        init_pair(3, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(4, COLOR_GREEN,   COLOR_BLACK);
-        init_pair(5, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(6, COLOR_BLUE,    COLOR_BLACK);
-        init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
     }
 }
 
@@ -1076,33 +1324,72 @@ static void agent_tick(Agent *agents, int n_agents, int self,
 /*
  * digit_load — extract Slot positions from a digit's bitmap.
  *
- * The 5×7 template is scaled by DIGIT_CELL_W × DIGIT_CELL_H terminal
- * cells and centred on the screen.  Each '#' in the template becomes
- * one Slot at the centre of the corresponding scaled cell.
+ * The 5x7 template is scaled by DIGIT_CELL_W × DIGIT_CELL_H terminal
+ * cells and centred on the screen.  Each '#' becomes a SLOT_GRID ×
+ * SLOT_GRID grid of mini-slots packed into the scaled cell.
  *
- * Returns the number of slots extracted (the actual '#' count).
+ * Sub-slot placement (the "no rounding leak" trick):
+ *
+ *   We place each sub-slot at the EXACT TOP-LEFT of a terminal cell —
+ *   px = ox + (c · DIGIT_CELL_W + sc · stride_x) · CELL_W
+ *   py = oy + (r · DIGIT_CELL_H + sr · stride_y) · CELL_H
+ *   where stride_x = (DIGIT_CELL_W − 1) / (SLOT_GRID − 1)
+ *         stride_y = (DIGIT_CELL_H − 1) / (SLOT_GRID − 1)
+ *
+ *   stride_x = (5 − 1) / (3 − 1) = 2  → sub-cols 0, 2, 4 in a 5-wide cell
+ *   stride_y = (3 − 1) / (3 − 1) = 1  → sub-rows 0, 1, 2 in a 3-tall cell
+ *
+ *   Putting sub-slots at terminal-cell-aligned coordinates means
+ *   px_to_cell_y/x rounds them exactly to the intended row/col with
+ *   no boundary leak.  At fractional positions like (sc + 0.5)/SLOT_GRID,
+ *   the third sub-slot lands at py = 26.7 which the round-half-up
+ *   `floor(py/16 + 0.5)` maps to row 2 — the NEXT cell's row 0 — so
+ *   the third sub-row of bitmap row 0 ends up rendering on top of
+ *   bitmap row 1.  That is the "6 looks like 5" bug fix.
+ *
+ * Returns the total slot count (SLOT_GRID² × bitmap-fill-count).
  */
 static int digit_load(Slot *slots, int digit, int cols, int rows)
 {
     int n = 0;
 
     /* Pixel-space origin: top-left corner of the digit's bounding box */
-    float digit_px_w = (float)(DIGIT_NCOLS * DIGIT_CELL_W * CELL_W);
-    float digit_px_h = (float)(DIGIT_NROWS * DIGIT_CELL_H * CELL_H);
-    float ox = (pw(cols) - digit_px_w) * 0.5f;
-    float oy = (ph(rows) - digit_px_h) * 0.5f;
+    const float cell_w_px  = (float)(DIGIT_CELL_W * CELL_W);
+    const float cell_h_px  = (float)(DIGIT_CELL_H * CELL_H);
+    const float digit_px_w = (float)DIGIT_NCOLS * cell_w_px;
+    const float digit_px_h = (float)DIGIT_NROWS * cell_h_px;
+    const float ox         = (pw(cols) - digit_px_w) * 0.5f;
+    const float oy         = (ph(rows) - digit_px_h) * 0.5f;
+
+    /* Stride between sub-slots in TERMINAL CELLS.  Distributes
+     * SLOT_GRID sub-slots evenly across DIGIT_CELL_W / DIGIT_CELL_H
+     * terminal cells, with first at offset 0 and last at the cell's
+     * far edge (col DIGIT_CELL_W − 1 / row DIGIT_CELL_H − 1).
+     * Integer division — works cleanly when (DIM − 1) divides
+     * (SLOT_GRID − 1), which holds for our defaults. */
+    const int stride_x = (DIGIT_CELL_W - 1) / (SLOT_GRID - 1);  /* 2 */
+    const int stride_y = (DIGIT_CELL_H - 1) / (SLOT_GRID - 1);  /* 1 */
 
     for (int r = 0; r < DIGIT_NROWS && n < SLOTS_MAX; r++) {
         const char *row = DIGIT_BITMAPS[digit][r];
-        for (int c = 0; row[c] && c < DIGIT_NCOLS && n < SLOTS_MAX; c++) {
-            if (row[c] == '#') {
-                /* Centre of the scaled cell */
-                slots[n].pos = v2(
-                    ox + (float)c * DIGIT_CELL_W * CELL_W + DIGIT_CELL_W * CELL_W * 0.5f,
-                    oy + (float)r * DIGIT_CELL_H * CELL_H + DIGIT_CELL_H * CELL_H * 0.5f
-                );
-                slots[n].occupied = false;
-                n++;
+        for (int c = 0; row[c] && c < DIGIT_NCOLS; c++) {
+            if (row[c] != '#') continue;
+
+            /* Top-left of this '#' cell, in TERMINAL-CELL coordinates. */
+            int cell_col0 = c * DIGIT_CELL_W;
+            int cell_row0 = r * DIGIT_CELL_H;
+
+            /* SLOT_GRID × SLOT_GRID sub-slots, each at a distinct
+             * terminal cell aligned by stride_x / stride_y. */
+            for (int sr = 0; sr < SLOT_GRID && n < SLOTS_MAX; sr++) {
+                for (int sc = 0; sc < SLOT_GRID && n < SLOTS_MAX; sc++) {
+                    int sub_col = cell_col0 + sc * stride_x;
+                    int sub_row = cell_row0 + sr * stride_y;
+                    slots[n].pos      = v2(ox + (float)sub_col * (float)CELL_W,
+                                           oy + (float)sub_row * (float)CELL_H);
+                    slots[n].occupied = false;
+                    n++;
+                }
             }
         }
     }
@@ -1163,26 +1450,31 @@ static void assign_slots(Agent *agents, int n_agents,
 /*
  * SwarmScene — complete simulation state.
  *
- * agents[]      flat agent pool; all 25 live for the duration.
- * slots[]       current digit's target points; rebuilt on digit change.
- * n_slots       number of valid slots for the current digit.
- * current_digit which digit is currently being formed (0–9).
- * strategy      active strategy index (0–9).
- * sim_time      accumulated simulation time (seconds); used by PULSE/WAVE.
- * auto_cycle    true = automatically advance digit every AUTO_CYCLE_S s.
- * cycle_timer   seconds since last auto-advance.
+ * Field groups:
+ *   - agent + slot pools (touched every tick by every steering rule)
+ *   - active selection (which digit, which strategy, which theme)
+ *   - simulation clock + world dimensions
+ *   - user mode flags (paused, auto_cycle)
  */
 typedef struct {
+    /* agent + slot pools — first n_slots slots active per digit */
     Agent agents[N_AGENTS];
     Slot  slots[SLOTS_MAX];
     int   n_slots;
-    int   current_digit;
-    int   strategy;
-    float sim_time;
-    float world_w, world_h;
+
+    /* active selection */
+    int   current_digit;       /* 0..9                                 */
+    int   strategy;            /* 0..N_STRATEGIES-1                    */
+    int   theme_idx;           /* 0..N_THEMES-1; t/T cycles            */
+
+    /* simulation clock + world dimensions */
+    float sim_time;            /* drives PULSE/WAVE oscillations       */
+    float world_w, world_h;    /* refreshed each tick from cols/rows   */
+
+    /* user mode flags */
     bool  paused;
-    bool  auto_cycle;
-    float cycle_timer;
+    bool  auto_cycle;          /* auto-advance digit every AUTO_CYCLE_S */
+    float cycle_timer;         /* seconds since last auto-advance       */
 } SwarmScene;
 
 /* scene_scatter — randomise all agent positions (used on 'r' key and init) */
@@ -1241,16 +1533,34 @@ static void scene_tick(SwarmScene *s, float dt, int cols, int rows)
 }
 
 /*
+ * mark_cell — stamp one ASCII glyph at terminal cell (cx, cy).
+ *
+ * Centralises the (chtype)(unsigned char) cast plus bounds-check that
+ * would otherwise be repeated at every mvwaddch site.  The double
+ * cast prevents sign-extension on character values > 127 (per
+ * CLAUDE.md "Common ncurses Bugs").  Off-screen cells are silently
+ * dropped.
+ */
+static void mark_cell(WINDOW *w, int cx, int cy, char ch,
+                      int pair, attr_t attr, int cols, int rows)
+{
+    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+    wattron(w, COLOR_PAIR(pair) | attr);
+    mvwaddch(w, cy, cx, (chtype)(unsigned char)ch);
+    wattroff(w, COLOR_PAIR(pair) | attr);
+}
+
+/*
  * scene_draw — render all agents into WINDOW *w.
  *
- * Draw attributes are driven by distance to assigned slot:
- *   within AT_SLOT_DIST px → A_BOLD   (agent is "at" its slot)
- *   no slot assigned        → A_DIM   (wandering agent)
- *   otherwise               → normal  (en route)
+ * Per-agent attribute ladder (drives the "what's settled" reading):
+ *   within AT_SLOT_DIST px of slot   → A_BOLD   (agent has arrived)
+ *   no slot assigned                 → A_DIM    (wandering, low priority)
+ *   otherwise (en route)             → A_NORMAL
  *
  * Sub-tick alpha interpolation:
  *   draw_pos = prev_pos + (pos − prev_pos) × alpha
- * This eliminates micro-stutter between fixed physics ticks.
+ * eliminates micro-stutter between fixed physics ticks.
  */
 static void scene_draw(const SwarmScene *s, WINDOW *w,
                        int cols, int rows, float alpha)
@@ -1260,20 +1570,17 @@ static void scene_draw(const SwarmScene *s, WINDOW *w,
 
         Vec2 dp = v2add(a->prev_pos,
                         v2scale(v2sub(a->pos, a->prev_pos), alpha));
-        int cx = px_to_cell_x(dp.x), cy = px_to_cell_y(dp.y);
-        if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
 
-        attr_t attr = (attr_t)COLOR_PAIR(a->color_pair);
+        attr_t attr;
         if (a->slot_idx < 0) {
-            attr |= A_DIM;   /* unassigned: wandering */
+            attr = A_DIM;            /* unassigned: wandering              */
         } else {
             float d = v2len(v2sub(s->slots[a->slot_idx].pos, a->pos));
-            if (d < AT_SLOT_DIST) attr |= A_BOLD;   /* at slot: full brightness */
+            attr = (d < AT_SLOT_DIST) ? A_BOLD : A_NORMAL;
         }
 
-        wattron(w, attr);
-        mvwaddch(w, cy, cx, (chtype)(unsigned char)a->glyph);
-        wattroff(w, attr);
+        mark_cell(w, px_to_cell_x(dp.x), px_to_cell_y(dp.y),
+                  a->glyph, a->color_pair, attr, cols, rows);
     }
 }
 
@@ -1283,14 +1590,14 @@ static void scene_draw(const SwarmScene *s, WINDOW *w,
 
 typedef struct { int cols, rows; } Screen;
 
-static void screen_init(Screen *s)
+static void screen_init(Screen *s, int initial_theme)
 {
     initscr(); noecho(); cbreak();
     curs_set(0);
     nodelay(stdscr, TRUE);
     keypad(stdscr, TRUE);
     typeahead(-1);
-    color_init();
+    color_init(initial_theme);
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
@@ -1328,33 +1635,28 @@ static void screen_draw(Screen *s, const SwarmScene *sc,
         if (d < AT_SLOT_DIST) at_slot++;
     }
 
-    char hud[120];
-    snprintf(hud, sizeof hud,
-             " [ SWARM ]  Digit: %d   %s (%d/%d)%s   %d/%d formed ",
+    /* Top-right status — PAIR_HUD bright yellow, A_BOLD */
+    char buf[120];
+    snprintf(buf, sizeof buf,
+             " %5.0f fps  sim:%3d Hz  digit:%d  %s (%d/%d)  [%s]  %d/%d formed%s%s ",
+             fps, sim_fps,
              sc->current_digit,
              g_sp->name, g_strat_idx + 1, N_STRATEGIES,
-             sc->auto_cycle ? "  [AUTO]" : "",
-             at_slot, sc->n_slots);
+             THEMES[sc->theme_idx].name,
+             at_slot, sc->n_slots,
+             sc->auto_cycle ? "  AUTO"   : "",
+             sc->paused     ? "  PAUSED" : "");
+    int hx = s->cols - (int)strlen(buf);
+    if (hx < 0) hx = 0;
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, hx, "%s", buf);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    const char *pause_str = sc->paused ? "  [PAUSED]" : "";
-
-    attron(COLOR_PAIR(3) | A_BOLD);
-    mvprintw(0, 0, "%s%s", hud, pause_str);
-    attroff(COLOR_PAIR(3) | A_BOLD);
-
-    char fps_buf[40];
-    snprintf(fps_buf, sizeof fps_buf, " %.0ffps sim:%dHz ", fps, sim_fps);
-    int fx = s->cols - (int)strlen(fps_buf);
-    if (fx < 0) fx = 0;
-    attron(COLOR_PAIR(3));
-    mvprintw(1, fx, "%s", fps_buf);
-    attroff(COLOR_PAIR(3));
-
-    attron(COLOR_PAIR(3));
+    /* Bottom-left key hint — PAIR_HINT bright cyan, A_BOLD */
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(s->rows - 1, 0,
-             " 0-9:digit  n/p:strategy  a:auto-cycle  r:scatter"
-             "  spc:pause  q:quit ");
-    attroff(COLOR_PAIR(3));
+             " q:quit  spc:pause  0-9:digit  n/p:strategy  t/T:theme  a:auto  r:scatter ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
@@ -1418,6 +1720,16 @@ static bool app_handle_key(App *app, int ch)
         g_sp             = &g_presets[g_strat_idx];
         sc->strategy     = g_strat_idx;
         break;
+    case 't':
+        /* Cycle to next theme, wrapping at N_THEMES */
+        sc->theme_idx = (sc->theme_idx + 1) % N_THEMES;
+        theme_apply(sc->theme_idx);
+        break;
+    case 'T':
+        /* Cycle to previous theme, +N-1 mod N to avoid negative modulo */
+        sc->theme_idx = (sc->theme_idx + N_THEMES - 1) % N_THEMES;
+        theme_apply(sc->theme_idx);
+        break;
     case '0': case '1': case '2': case '3': case '4':
     case '5': case '6': case '7': case '8': case '9':
         /* Digit keys 0–9: select that digit */
@@ -1451,7 +1763,7 @@ int main(void)
     app->running = 1;
     app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
+    screen_init(&app->screen, 0 /* initial theme = Rainbow */);
     scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
     int64_t frame_time  = clock_ns();
@@ -1461,18 +1773,21 @@ int main(void)
     double  fps_display = 0.0;
 
     while (app->running) {
+
+        int64_t frame_start = clock_ns();
+
         if (app->need_resize) {
             app_do_resize(app);
             frame_time = clock_ns(); sim_accum = 0;
         }
 
-        /* ① */
+        /* ① dt */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
         if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
 
-        /* ② */
+        /* ② fixed-step accumulator */
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
         sim_accum += dt;
@@ -1482,7 +1797,7 @@ int main(void)
             sim_accum -= tick_ns;
         }
 
-        /* ③ */
+        /* ③ alpha */
         float alpha = (float)sim_accum / (float)tick_ns;
 
         frame_count++;
@@ -1493,8 +1808,12 @@ int main(void)
             frame_count = 0; fps_accum = 0;
         }
 
-        /* ④ */
-        int64_t elapsed = clock_ns() - frame_time + dt;
+        /* ④ frame cap — sleep BEFORE render to keep terminal I/O off
+         * the next frame's budget.  elapsed = wall time spent on
+         * physics + accounting since frame_start.  Do NOT add dt back
+         * into elapsed — that cancels the cap, sleep is always 0,
+         * CPU pegs at 100 %.                                         */
+        int64_t elapsed = clock_ns() - frame_start;
         clock_sleep_ns(NS_PER_SEC / TARGET_FPS - elapsed);
 
         /* ⑤ */

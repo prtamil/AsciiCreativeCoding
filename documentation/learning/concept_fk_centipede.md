@@ -518,7 +518,7 @@ Use trail-buffer FK for chains whose roots move freely through space (body, snak
 `phi_R = phi_L + π` is the minimal constraint that ensures stability — at every moment, at least half the legs are on the ground. This generalizes: for n legs per side, spacing phases by `2π/n` gives maximum desynchronization with minimum support gaps.
 
 **Two-pass rendering for line+node chains:**
-Always draw segment fill lines first, then joint node markers. The second pass guarantees nodes are never overwritten by segment lines. This pattern appears in fk_centipede, fk_tentacle_forest, and fk_medusa — it is a codebase convention.
+Always draw segment fill lines first, then joint node markers. The second pass guarantees nodes are never overwritten by segment lines. This pattern appears in fk_centipede and fk_tentacle_forest — it is a codebase convention.
 
 **Arc-length interpolation for path-following FK:**
 `trail_sample(dist)` gives the correct body joint position regardless of head speed. If the head slowed down, trail entries are denser in that region, and the arc-length walk naturally finds the correct back-along-the-path position. Speed changes do not cause joint spacing to change.

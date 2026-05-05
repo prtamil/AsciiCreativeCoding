@@ -2,9 +2,9 @@
 
 ## From the Source
 
-**Algorithm:** Path-following FK. The head's past pixel positions are stored tick-by-tick in a circular trail buffer. Each body joint is placed by measuring cumulative arc length backward along the trail and linearly interpolating. No per-segment angle computation is needed; the trail encodes the full geometry of the path already taken. Sinusoidal auto-steering turns the heading continuously, producing smooth S-curve locomotion with no user input.
+**Algorithm:** Path-following FK with sinusoidal auto-steering and an edge-bias soft fence. The head's past pixel positions are stored tick-by-tick in a circular trail buffer. Each body joint is placed by measuring cumulative arc length backward along the trail and linearly interpolating. No per-segment angle computation is needed; the trail encodes the full geometry of the path already taken. The autonomous turn rate `A · sin(f · wave_time)` is integrated into the heading each tick. Whenever the head enters an `EDGE_MARGIN_PX = 80` band along any screen edge, an additional inward turn rate is added (proportional to penetration depth) so the snake naturally curves back into the screen interior. A hard position clamp is the safety net at the highest speeds. There is no toroidal wrap — the snake stays on-screen forever.
 
-**Math:** Head steering: `dheading/dt = amplitude * sin(frequency * wave_time)`. Head translation: `joint[0] += move_speed * (cos(heading), sin(heading)) * dt`. Arc-length sampling: walk trail from newest, accumulate Euclidean segment lengths until `accum >= target_dist`, then `lerp(a, b, (target_dist - accum_before) / seg_len)`. Render: `rj[i] = prev_joint[i] + (joint[i] - prev_joint[i]) * alpha`.
+**Math:** Wave turn: `turn_wave = amplitude * sin(frequency * wave_time)`. Edge-bias turn: `(fx, fy)` is the inward potential summed from each wall (linear falloff inside the margin band); `desired = atan2(fy, fx)`; `turn_edge = wrap_pi(desired − heading) · |(fx, fy)| · EDGE_TURN_GAIN`. Heading update: `heading += (turn_wave + turn_edge) * dt`. Head translation: `joint[0] += move_speed * (cos(heading), sin(heading)) * dt` then hard clamp into `[0, wpx] × [0, hpx]`. Arc-length sampling: walk trail from newest, accumulate Euclidean segment lengths until `accum >= target_dist`, then `lerp(a, b, (target_dist - accum_before) / seg_len)`. Render: `rj[i] = prev_joint[i] + (joint[i] - prev_joint[i]) * alpha`.
 
 **Performance:** Fixed-step accumulator decouples physics Hz from render Hz. At default speed (72 px/s at 60 Hz), each tick adds 1.2 px to trail. The farthest joint (joint[32]) is 576 px behind head → `trail_sample` walks ~480 entries. With 32 joints: ~15 360 iterations/tick — trivial. ncurses diff engine sends ~60–120 changed cells per frame.
 
@@ -14,7 +14,9 @@
 
 A 32-segment snake swims autonomously across the screen in a smooth sinusoidal S-curve. The foundational insight is that the body does not compute its shape from a formula — it follows the actual recorded path of the head. Every pixel position the head visits is logged in a circular trail buffer. Each body joint is placed at a fixed arc-length distance behind the head by walking backward along that buffer. Any curve the head carves propagates down the body exactly as it would in a real snake, because the body is literally tracing the historical path.
 
-This trail-buffer + arc-length pattern is the foundational FK technique in this codebase. The centipede, medusa, and spider demos all use it. Understanding it here unlocks all of them.
+When the head approaches any screen edge, an *edge-bias* steering term gently turns the heading inward — the snake curves back into the screen rather than wrapping. There is no teleport-to-other-side: the snake stays on-screen forever, drawing its S-curve inside the visible area.
+
+This trail-buffer + arc-length pattern is the foundational FK technique in this codebase. The centipede, scorpion, spider, and IK snake all use it. Understanding it here unlocks all of them.
 
 ## The Mental Model
 
@@ -23,6 +25,8 @@ Imagine laying a piece of string on a table and dragging one end (the head) in a
 The circular trail buffer IS that notebook. `trail_sample(dist)` is the "flip back" operation. The fact that it uses arc length (not time, not entry count) means the body spacing is constant in physical distance regardless of whether the head was moving fast or slow.
 
 The autonomous steering (`dheading/dt = amplitude * sin(frequency * wave_time)`) produces an S-curve because it alternately swings the heading left and right. The heading is integrated (not snapped), so the transitions are smooth. The body follows the resulting curved path naturally via the trail.
+
+The wall-bounce is the second hand on the wrist: an *artificial-potential field* with linear falloff inside an `EDGE_MARGIN_PX` band along each edge. The deeper the head penetrates the band, the stronger the inward turn rate added to the heading. Outside the band the bias is zero, so the snake's interior motion is unaffected. A hard position clamp catches anything edge bias can't redirect in time at the highest speeds.
 
 ## Data Structures
 
@@ -84,6 +88,12 @@ Each iteration:
 **Why trail buffer + arc-length sampling instead of per-joint angle formula?**
 The naive FK formula (`joint[i+1] = joint[i] - SEG_LEN * (cos θ_i, sin θ_i)`) is stateless — it recalculates the entire chain from the current heading each tick. This means the body does not actually follow the path the head carved; it is always computed from the current heading direction. A turning head produces a mathematically generated shape, not a physically correct chain. The trail buffer approach gives the body genuine memory of the head's actual path.
 
+**Why edge-bias steering instead of toroidal wrap?**
+The earlier version of this demo wrapped the head to the opposite side when it crossed any edge. That created a one-frame jump in the trail buffer (`trail[k]` at the wall, `trail[k+1]` at the opposite edge), which `trail_sample()` would walk straight through as a single very long segment — the body briefly stretched between the two edges. Edge-bias steering avoids the jump entirely: the head simply turns away. The result is a snake that stays inside the screen, body always continuous, and you can watch one full wavelength of the S-curve without the head ever leaving view. The trade-off is more parameters to tune (`EDGE_MARGIN_PX`, `EDGE_TURN_GAIN`), but the visual is cleaner.
+
+**Why a separate hard clamp on `joint[0]` after edge-bias?**
+The bias is a *turn rate*, integrated over `dt`. At very high speeds (`500 px/s` × `1/60 s` ≈ 8 px/tick), the edge-bias may not redirect the head fast enough to prevent it crossing the wall in a single tick. The hard clamp `joint[0].x ∈ [0, wpx]` is the unconditional safety net: even if the turn-rate term loses the race, the position can never leave the screen. Visually, the clamp is invisible because the bias has already started turning the head before it gets close.
+
 **Why TRAIL_CAP = 4096?**
 At the minimum speed (20 px/s, 60 Hz) each tick adds 0.33 px to the trail. The full snake body (576 px) would need `576 / 0.33 ≈ 1745` entries. 4096 gives a 2.3× safety margin. At maximum speed (500 px/s), each tick adds 8.3 px and only ~70 entries cover the full body — 4096 is far more than enough. The 32 KB cost is acceptable for a global allocation.
 
@@ -122,10 +132,11 @@ When two segments overlap (e.g. in a tight loop), the segment drawn last wins th
 │                                                     │
 │ 3. move_head(dt, cols, rows):                       │
 │      wave_time += dt * speed_scale                  │
-│      turn = amplitude * sin(frequency * wave_time)  │
-│      heading += turn * dt                           │
+│      turn_wave = amplitude * sin(frequency*wave_time)│
+│      turn_edge = edge_bias_turn(joint[0], wpx, hpx) │
+│      heading += (turn_wave + turn_edge) * dt        │
 │      joint[0] += move_speed * (cos,sin)(heading)*dt │
-│      toroidal wrap: if joint[0].x < 0 → += wpx etc │
+│      hard clamp joint[0] into [0,wpx] x [0,hpx]    │
 │      trail_push(joint[0])                           │
 │                                                     │
 │ 4. compute_joints():                                │
@@ -228,7 +239,8 @@ seg_attr(i)  = A_BOLD  (i < 8)   head quarter — brightest
 
 - `trail_sample()` walks the trail from newest to oldest, O(dist / px_per_tick) per call. With 32 joints all called in sequence, joint 32 takes 32× longer to sample than joint 1. Is there a way to compute all 32 joints in a single O(trail_length) pass? (Hint: walk the trail once, sampling at each multiple of SEG_LEN_PX along the way.)
 - At `MOVE_SPEED_MIN = 20 px/s`, `60 Hz`, each tick adds `0.33 px` to the trail. The trail fills at the rate of 0.33 entries per px of body. At very low speeds does `trail_sample()` ever fail to find enough arc-length and fall back to returning the oldest entry? What does this look like visually?
-- The toroidal wrap sets `joint[0].x -= wpx` when it exceeds the pixel width. The trail then has a large discontinuity: one entry at `wpx - 1` and the next at `0 + something`. `trail_sample()` will compute a large `seg` distance for this entry pair and immediately overshoot. What visual artifact does this produce and how long does it last?
+- Edge-bias steering uses linear potential falloff. What if it used quadratic (`(margin − x)² / margin²`) instead? The gradient at the band's outer edge would be zero — would the turn still feel responsive enough? At the wall the gradient would be steeper — would it look more like a hard reflection?
+- `EDGE_MARGIN_PX = 80` and `EDGE_TURN_GAIN = 3.5` are tuned for the default `MOVE_SPEED_DEFAULT = 72 px/s`. At maximum speed (`500 px/s`), a single tick can carry the head ~8 px, comparable to the 80-px margin in 10 ticks. Does the edge-bias band need to widen with speed, or does the hard clamp catch every overshoot in practice?
 - `wave_time` is not normalised and accumulates indefinitely. After `2π / FREQUENCY_DEFAULT / dt = ~395` ticks at 60 Hz, the argument to `sinf()` has accumulated about `0.95 * 395 / 60 ≈ 6.25` radians. Over days of running, does floating-point precision degrade `sinf()`'s output for very large arguments?
 - When `amplitude = 0`, the snake swims in a perfectly straight line. The `heading` still accumulates `turn * dt = 0 * dt = 0` per tick, so no change. But what happens to the trail? Does `trail_sample()` still work correctly when all 4096 trail entries are collinear at 1 px spacing?
 - The 10 themes are hard-coded in `THEMES[10]`. If you wanted to add an 11th theme, you would need to change `N_THEMES`. Is there a way to detect the array length automatically in C without a count constant?
@@ -258,7 +270,7 @@ seg_attr(i)  = A_BOLD  (i < 8)   head quarter — brightest
 | §3 color | `Theme` struct, `THEMES[10]`, `theme_apply()`, `color_init()` — 10-palette system |
 | §4 coords | `px_to_cell_x/y` — aspect-ratio bridge, called only at draw time |
 | §5a trail helpers | `trail_push()`, `trail_at()`, `trail_sample()` — the three trail operations |
-| §5b move_head | Advance wave_time → integrate heading → translate head → wrap → trail_push |
+| §5b move_head | Advance wave_time → wave_turn + edge_bias_turn → integrate heading → translate head → hard clamp → trail_push |
 | §5c compute_joints | `joint[i] = trail_sample(i * SEG_LEN_PX)` for i=1..32 |
 | §5d rendering helpers | `seg_pair`, `seg_attr`, `joint_node_char`, `head_glyph` |
 | §5e draw_segment_beads | Dense 'o' fill for one segment (pass 1 of two-pass render) |
@@ -286,10 +298,11 @@ scene_tick(dt_sec, cols, rows)
     │
     ├── move_head(dt, cols, rows):
     │     wave_time += dt * speed_scale
-    │     turn = amplitude * sin(frequency * wave_time)
-    │     heading += turn * dt              [integrate → smooth curves]
+    │     turn_wave = amplitude * sin(frequency * wave_time)
+    │     turn_edge = edge_bias_turn(...)   [zero outside margin band]
+    │     heading += (turn_wave + turn_edge) * dt   [integrate]
     │     joint[0] += move_speed * (cos(heading), sin(heading)) * dt
-    │     toroidal wrap for joint[0]
+    │     hard clamp joint[0] into screen box       [safety net]
     │     trail_push(joint[0])             [record new head position]
     │
     └── compute_joints():
@@ -357,16 +370,30 @@ Cost: O(dist / px_per_tick) — proportional to how far back in the trail we nee
 
 ---
 
+### edge_bias_turn(s, wpx, hpx) → float
+Purpose: inward soft-fence turn rate (rad/s), zero outside the margin band
+Steps:
+1. For each side, compute penetration depth in `[0, 1]` (0 at outer band edge, 1 at the wall):
+   - `depth_left  = max(0, (margin − x) / margin)`
+   - `depth_right = max(0, (x − (wpx − margin)) / margin)`
+   - `depth_top`  / `depth_bot` analogous on y
+2. Sum into inward potential: `fx = depth_left − depth_right`, `fy = depth_top − depth_bot`
+3. If both `fx == 0` and `fy == 0`: return 0 (interior — no bias)
+4. `strength = sqrt(fx² + fy²)` ∈ [0, √2]
+5. `desired = atan2(fy, fx)`; `delta = wrap_pi(desired − heading)`
+6. Return `delta · strength · EDGE_TURN_GAIN`
+
 ### move_head(s, dt, cols, rows)
-Purpose: advance wave, update heading, translate head, wrap, record trail
+Purpose: advance wave, sum wave + edge-bias turn rates into heading, translate head, hard clamp, record trail
 Steps:
 1. `wave_time += dt * speed_scale`
-2. `turn = amplitude * sinf(frequency * wave_time)`
-3. `heading += turn * dt`
-4. `joint[0].x += move_speed * cosf(heading) * dt`
-5. `joint[0].y += move_speed * sinf(heading) * dt`
-6. Toroidal wrap: `if joint[0].x < 0: += wpx`, etc.
-7. `trail_push(joint[0])`
+2. `turn_wave = amplitude * sinf(frequency * wave_time)`
+3. `turn_edge = edge_bias_turn(s, wpx, hpx)`     ← zero unless within EDGE_MARGIN_PX
+4. `heading += (turn_wave + turn_edge) * dt`
+5. `joint[0].x += move_speed * cosf(heading) * dt`
+6. `joint[0].y += move_speed * sinf(heading) * dt`
+7. Hard clamp: `joint[0]` into `[0, wpx] × [0, hpx]` (safety net at high speed)
+8. `trail_push(joint[0])`
 
 ---
 
@@ -470,7 +497,7 @@ App
 
 Scene / scene_tick:
  ├── memcpy prev_joint  ← snapshot anchor
- ├── move_head()        ← wave → heading → translation → trail_push
+ ├── move_head()        ← wave_turn + edge_bias_turn → heading → translation → clamp → trail_push
  └── compute_joints()   ← trail_sample(i*SEG_LEN_PX) for all 32 joints
 
 Rendering / render_chain:

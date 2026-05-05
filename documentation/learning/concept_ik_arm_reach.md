@@ -2,13 +2,13 @@
 
 ## From the Source
 
-**Algorithm:** FABRIK iterative IK. Two geometric passes per iteration: (1) FORWARD — tip snapped to target, link lengths restored in the tip→root direction; (2) BACKWARD — root re-anchored, link lengths restored root→tip. Each iteration strictly reduces tip error. Converges in 3–5 iterations for a 4-link chain; MAX_ITER=15 caps degenerate-configuration cost. No Jacobian matrix, no trigonometry, no singularities. Reachability check (`|target−root| vs Σ link_len`) fires once per tick and short-circuits to a straight-stretch posture when the target is out of reach.
+**Algorithm:** FABRIK iterative IK, decomposed into three named helpers — `stretch_collinear()` (out-of-reach short-circuit, places every joint along the root→target ray), `fabrik_forward_pass()` (tip→root, snap tip to target then restore each link length walking back), and `fabrik_backward_pass()` (root→tip, snap root to anchor then restore each link length walking forward). Each full iteration strictly reduces tip error. Converges in 3–5 iterations for a 4-link chain; `MAX_ITER = 15` caps degenerate-configuration cost. No Jacobian matrix, no trigonometry, no singularities. Reachability check `|target − root| vs Σ link_len` fires once per tick and routes to `stretch_collinear` when the target is out of reach.
 
-**Math:** Lissajous figure-8: `x(t) = root_px + lis_ax × cos(LIS_FX × scene_time)`, `y(t) = root_py + lis_ay × sin(LIS_FY × scene_time + LIS_PHASE)`. Frequency ratio LIS_FX=1 : LIS_FY=2 creates a figure-8 because the y-axis completes two oscillations per x-cycle, crossing the centre from opposite vertical directions once — producing one self-intersection (a figure-8). Phase LIS_PHASE=π/4 converts the tangent cusp into a clean X crossing.
+**Math:** Lissajous figure-8: `x(t) = root_px + lis_ax · cos(LIS_FX · scene_time)`, `y(t) = root_py + lis_ay · sin(LIS_FY · scene_time + LIS_PHASE)`. Frequency ratio `LIS_FX=1 : LIS_FY=2` creates a figure-8 because the y-axis completes two oscillations per x-cycle, crossing the centre from opposite vertical directions once — producing one self-intersection. Phase `LIS_PHASE = π/4` converts the tangent cusp into a clean X crossing.
 
-**Performance:** Fixed-step accumulator decouples physics (60 Hz default) from render (capped at 60 fps). FABRIK worst-case: MAX_ITER=15 × N_JOINTS=5 × 2 passes = 150 simple arithmetic ops per tick — trivial at 60 Hz. ncurses doupdate() sends only changed cells; typically fewer than 50 per frame.
+**Performance:** Variable timestep at render rate — no fixed-step accumulator, no alpha lerp, no `prev_pos[]` snapshot. The simulation is non-stiff (no springs, no rapid oscillators, no constraints with high stiffness coefficients), so a single `dt` from frame to frame is stable. The sub-tick interpolation scaffolding buys nothing visually here. FABRIK worst-case per frame: `MAX_ITER = 15 × N_JOINTS = 5 × 2 passes ≈ 150` simple arithmetic ops — trivial at 60 fps. ncurses `doupdate()` sends only changed cells; typically fewer than 50 per frame.
 
-**Data-structure:** `Vec2 pos[N_JOINTS]` — current joint positions (N=5 joints, 4 links). `Vec2 prev_pos[N_JOINTS]` — snapshot at tick start for sub-tick alpha lerp. Lissajous trail ring buffer (TRAIL_SIZE=60 entries) stores recent target positions for the faint figure-8 path display. All positions in square pixel space; converted to cell coordinates only at draw time.
+**Data-structure:** `Vec2 pos[N_JOINTS]` — current joint positions (N=5 joints, 4 links). `link_len[N_LINKS]` — tapered link lengths (root longest). `total_len = Σ link_len` for the reachability check. Lissajous trail ring buffer (`TRAIL_SIZE = 60` entries) stores recent target positions for the faint figure-8 path display. All positions in square pixel space; converted to cell coordinates only at draw time.
 
 ## Core Idea
 
@@ -27,11 +27,9 @@ The Lissajous figure-8 is the motion path. Set x to oscillate at one frequency a
 ### Arm struct (key fields)
 ```
 pos[N_JOINTS]         — current joint positions in pixel space (Vec2, 5 entries)
-prev_pos[N_JOINTS]    — snapshot at tick start; used for sub-tick alpha lerp
 link_len[N_LINKS]     — tapered link lengths in pixels (4 entries, root longest)
 total_len             — Σ link_len; reachability threshold
 target                — current Lissajous target pixel position
-prev_target           — snapshot for alpha lerp of target marker
 scene_time            — accumulated simulation time driving the Lissajous
 speed_scale           — Lissajous time multiplier (+ / - keys)
 root_px, root_py      — root anchor pixel position (Lissajous centre)
@@ -41,6 +39,7 @@ trail[TRAIL_SIZE]     — ring buffer of recent target positions (60 entries)
 trail_head            — write cursor (index of most recently pushed entry)
 trail_count           — valid entries, <= TRAIL_SIZE
 ```
+No `prev_pos[]` or `prev_target` — the variable-timestep loop solves directly into `pos[]` and renders straight from it. Sub-tick lerp scaffolding was removed because the FABRIK output is already smooth frame-to-frame and the simulation is non-stiff.
 
 ### Vec2
 ```
@@ -59,23 +58,21 @@ pair 8      — HUD status bar (varies per theme)
 
 ## The Main Loop
 
-Each iteration of the main loop:
+Variable timestep — each iteration is one rendered frame, and the simulation advances by exactly `dt` since the previous frame:
 
 1. **Check for resize.** If SIGWINCH fired, call `endwin` + `refresh`, re-read terminal size, reinitialise the scene with new dimensions and reset timing state.
 
-2. **Measure elapsed time (dt).** Read CLOCK_MONOTONIC. Subtract previous frame timestamp. Cap dt at 100 ms to prevent spiral-of-death after OS suspend.
+2. **Measure dt.** Read `CLOCK_MONOTONIC`. Subtract the previous `frame_start`. Cap at 100 ms (suspend guard).
 
-3. **Run the physics accumulator.** Add dt to `sim_accum`. While `sim_accum >= tick_ns`: save `prev_pos` snapshot, call `update_target()` to advance `scene_time` and compute new Lissajous target, call `fabrik_solve()` to move joints toward target, subtract one tick from `sim_accum`.
+3. **Step simulation directly with dt.** No accumulator. `update_target(dt)` advances `scene_time` and recomputes the Lissajous target. `fabrik_solve()` runs FABRIK iterations into `pos[]` until the tip is within `CONV_TOL` or `MAX_ITER` is reached.
 
-4. **Compute alpha.** `alpha = sim_accum / tick_ns` — fractional progress toward the next tick; used by renderer to interpolate between `prev_pos` and `pos`.
+4. **Update FPS counter.** Every 500 ms, compute frames/elapsed for the HUD display.
 
-5. **Update FPS counter.** Every 500 ms, compute frames/elapsed for the HUD display.
+5. **Frame cap sleep.** Sleep until 1/60 s has elapsed since `frame_start`. Sleeping before rendering keeps terminal I/O latency off the physics budget.
 
-6. **Frame cap sleep.** Sleep until 1/60 s has elapsed. Sleeping before rendering keeps terminal I/O latency off the physics budget.
+6. **Draw and present.** `erase()` clears the back buffer. `render_arm()` draws the arm in five passes (decomposed): trail dots → optional reach circle → arm links + joints → tip marker → target marker. HUD drawn on top. `wnoutrefresh` + `doupdate` for one atomic write.
 
-7. **Draw and present.** `erase()` clears the back buffer. `render_arm()` draws the alpha-interpolated arm, trail, optional reach circle, and target marker. HUD drawn on top. `wnoutrefresh` + `doupdate` for one atomic write.
-
-8. **Handle input.** `getch()` in nodelay mode. Dispatch keys for quit, pause, speed adjust, theme cycle, sim Hz change.
+7. **Handle input.** `getch()` in nodelay mode. Dispatch keys for quit, pause, speed adjust, theme cycle.
 
 ## Non-Obvious Decisions
 
@@ -91,8 +88,11 @@ Constant-length links look mechanical and uniform — all joints contribute equa
 **Why is CONV_TOL = 1.5 px chosen to be sub-cell?**
 1.5 / CELL_W (8 px) = 0.19 of a column; 1.5 / CELL_H (16 px) = 0.09 of a row. Once the tip is within 1.5 px of target, both occupy the same terminal cell — further solver iterations produce no visible improvement and waste CPU.
 
-**Why store prev_pos and use alpha lerp instead of forward extrapolation (as in bounce_ball)?**
-In bounce_ball, forward extrapolation (`draw_px = px + vx*alpha*dt`) works because ball velocity is constant between ticks. FABRIK-solved joint positions are non-linear — the tip and interior joints can change direction abruptly as the solver converges. Forward extrapolation from velocity is undefined here; prev_pos gives an exact snapshot of the previous tick's position for a correct lerp.
+**Why variable timestep instead of fixed-step + alpha lerp?**
+The original version used a fixed-step accumulator and a `prev_pos[]` snapshot for sub-tick interpolation — the bounce-ball pattern. But the arm has no springs, no fast oscillators, no constraints with high stiffness coefficients: it is a *non-stiff* simulation. Variable timestep at the render rate (60 fps) is unconditionally stable here, and skipping the lerp scaffolding removes ~50 lines of code without any visible motion artefact. Fixed-step + lerp is still the right call for ragdoll, ropes, and anything Verlet — for a pure FABRIK arm it is over-engineering.
+
+**Why decompose `fabrik_solve()` into `stretch_collinear`, `fabrik_forward_pass`, and `fabrik_backward_pass`?**
+The original `fabrik_solve()` was one long function that mixed reachability handling, the iteration loop, and both pass directions in one body. Splitting it into three named helpers means each function does exactly one thing: the out-of-reach short-circuit reads as one paragraph, the forward pass as one paragraph, the backward pass as one paragraph. A learner reading the file can study each pass in isolation — the most important learning aid for FABRIK, where most beginners get confused by which pass anchors which end of the chain.
 
 **Why are the reach-circle dots spaced with 48 samples?**
 Drawing every pixel on the circle would stamp hundreds of adjacent cells, many mapping to the same terminal cell (wasteful, noisy). 48 samples at 7.5° spacing gives arc spacing of R×2π/48 ≈ R/7.6 px. For a typical arm reach of ~300 px, that is ~39 px ≈ 5 cell-widths — a clearly dashed circle without dot overlap.

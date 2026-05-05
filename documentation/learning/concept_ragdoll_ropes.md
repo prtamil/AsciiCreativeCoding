@@ -235,7 +235,7 @@ Step 3: for each rope r:
 | §5d apply_wind | Compute sin-based lateral acceleration, call Verlet for all non-anchors, boundary bounce |
 | §5e rope_node_char/attr | Size and brightness gradient functions for two-pass bead rendering |
 | §5f draw_rope_beads | Two-pass bead render per rope (fill + node markers + tip weight marker) |
-| §5g render_scene | Alpha lerp → ceiling line → all ropes |
+| §5g render_scene | `render_scene` orchestrates 3 painter's-order helpers: `lerp_positions` (sub-tick interp for all 7 × 20 particles) → `draw_ceiling` (`#` line at the anchor row) → `draw_rope_beads` × 7 (each rope is a two-pass bead chain). All glyph stamps go through a central `mark_cell()` helper that performs the `(chtype)(unsigned char)` cast and bounds-check. |
 | §6 scene | `scene_init` (lengths, anchors, phases) / `scene_tick` / `scene_draw` wrappers |
 | §7 screen | ncurses layer (erase → draw → wnoutrefresh → doupdate) |
 | §8 app | Signal handlers, resize (full scene_init on resize), main loop |
@@ -482,3 +482,15 @@ Shorter ropes have higher natural frequencies. By linearly spacing lengths from 
 
 **Two-pass bead rendering:**
 Pass 1 fills segment lines with `'o'` beads. Pass 2 overwrites particle positions with size-graded markers (`'0'`/`'o'`/`'.'`). Drawing node markers last ensures they always win over segment fill on overlapping cells — the structure reads clearly even when ropes cross.
+
+**Theme brightness rule:**
+Every rope-pair colour sits in the bright half of the 256-colour cube (≥ 24). The 16–23 cube range and the 232–239 grayscale range become invisible under `A_DIM` against a default-black terminal — and the bottom-quarter rope tip uses `A_DIM`. Earlier theme palettes (Ocean: 17, 18; Aurora/Forest/Matrix: 22) were bumped to 24+ so every entry stays legible. The HUD pairs are theme-independent and use the project's bright yellow / cyan combo regardless of which theme is active.
+
+---
+
+## References
+
+- Jakobsen, "Advanced Character Physics," GDC 2001 — the canonical Verlet-rope and ragdoll paper.
+- Müller et al., "Position Based Dynamics," 2007 — modern generalisation of constraint projection.
+- Wikipedia, "Verlet integration" — derivation of the velocity-implicit form used here.
+- Stam, "Real-Time Stable Cloth and Hair," 2002 — the same projection idea applied to many parallel chains.

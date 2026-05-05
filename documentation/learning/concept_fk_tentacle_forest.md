@@ -528,4 +528,4 @@ World-space direction at segment i = sum of all local bends from segment 0 throu
 `freq_offset = (i − N/2) × 0.04` gives each strand a slightly different oscillation period. Without this, even with different initial `root_phase` values, all strands would gradually re-align into lockstep synchrony over time (because they are all driven by the same `wave_time`). The detuning ensures they permanently drift independently.
 
 **Resize preserving wave state:**
-When geometry changes (terminal resize), physics time must not reset. Save `wave_time`, reinitialize geometry, restore `wave_time`. This pattern appears identically in fk_tentacle_forest, fk_medusa, and (with additional bell_time/pulse_phase) fk_medusa. It is the correct way to handle resize in any stateless-FK demo.
+When geometry changes (terminal resize), physics time must not reset. Save `wave_time`, reinitialize geometry, restore `wave_time`. It is the correct way to handle resize in any stateless-FK demo.

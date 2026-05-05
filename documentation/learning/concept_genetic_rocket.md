@@ -23,8 +23,8 @@ mutation:  if frand() < MUTATION_RATE: replace genes[i] with random unit force
 - **Fitness squared**: Amplifies selection pressure without going so extreme that the population collapses to one solution.
 - **Hit bonus ×10, crash penalty ×0.1**: Crashers still contribute occasional good genes (their early flight may be useful).
 - **Single-point crossover, not uniform**: Preserves contiguous "manoeuvre patterns" in the genome rather than scrambling them.
-- **`t = 0` reset on shape change**: All particles snap to launch, makes the moment of restart visible.
-- **Two spawn paths (`bomb_spawn` and `bomb_spawn_burst`)**: Burst uses 1.5× speed and wider cone so it's visually unmistakable even when pool is full.
+- **Mating pool of slots (`k = 100·f/f_max`) instead of roulette-wheel sampling**: Building the pool is `O(POP × max_slots)` once per generation; sampling from it is `O(1)` per parent draw. The roulette-wheel alternative recomputes a cumulative-fitness array per draw — same expected outcome, more code per parent pick.
+- **In-flight leader highlight**: The rocket currently closest to the target is over-stamped in a brighter colour each frame so the eye has something to track; without it, the cloud of identically-coloured rockets is hard to follow.
 
 ### Key Constants
 | Name | Role |
@@ -44,14 +44,17 @@ mutation:  if frand() < MUTATION_RATE: replace genes[i] with random unit force
 
 ## Pass 2 — Implementation
 
-### Module Map
+### Module Map (matches the source's §1 … §9 layout)
 ```
-§1 config   — POP_SIZE, LIFESPAN, MAX_FORCE, MUTATION_RATE
+§1 config   — POP_SIZE, LIFESPAN, MAX_FORCE, MUTATION_RATE, target geometry
+§2 clock    — monotonic timer + sleep
+§3 color    — themed palettes + spec PAIR_HUD / PAIR_HINT
 §4 random   — frand, rand_unit (rejection sampling on disc)
 §5 rocket   — Rocket struct, init_genome, launch, tick, fitness
 §6 ga       — World struct, ga_breed (crossover + mutation), ga_evolve
-§7 scene    — draw_target + draw_rockets + draw_trails + HUD
-§9 app      — main loop, fast-forward toggle, key handling
+§7 scene    — draw_target + draw_rockets + draw_trails + leader highlight
+§8 screen   — ncurses init / cleanup
+§9 app      — signals, main loop, fast-forward toggle, key handling
 ```
 
 ### Data Flow

@@ -1,71 +1,36 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * ragdoll_figure.c — Verlet-integrated humanoid ragdoll in the terminal
+ * ragdoll_figure.c — Verlet humanoid ragdoll bouncing through slanted shelves
  *
- * DEMO: A 15-particle humanoid stick figure falls, bounces, and sways
- *       under gravity and periodic wind gusts.  Distance constraints
- *       connect the 17 bone-pairs to maintain limb lengths.  The figure
- *       bounces realistically off all four screen edges.  Wind impulses
- *       are applied every WIND_PERIOD seconds to keep the figure lively.
+ * DEMO: A 15-particle stick figure falls under gravity and tumbles down five
+ *       slanted platforms before settling on the ground. Distance constraints
+ *       hold its 17 bones rigid; periodic wind gusts keep the figure lively.
  *
- * STUDY ALONGSIDE: framework.c     (canonical loop / timing template)
- *                  snake_forward_kinematics.c  (coord-space / alpha lerp)
+ * Study alongside: snake_inverse_kinematics.c (constraint-projection sibling)
  *
- * ─────────────────────────────────────────────────────────────────────────
- *  Section map
- * ─────────────────────────────────────────────────────────────────────────
- *   §1  config        — all tunables in one place
- *   §2  clock         — monotonic clock + sleep (verbatim from framework)
- *   §3  color         — body-part palette + dedicated HUD pair
- *   §4  coords        — pixel↔cell aspect-ratio helpers
- *   §5  entity        — Ragdoll: Verlet particles + distance constraints
- *       §5a  verlet_update     — Verlet integration with damping
- *       §5b  apply_boundaries  — floor/wall/ceiling collision + bounce
- *       §5c  satisfy_constraint— distance constraint solver
- *       §5d  ragdoll_tick      — one full physics step
- *       §5e  ragdoll_draw      — ASCII stick-figure renderer
- *   §6  scene         — scene_init / scene_tick / scene_draw
- *   §7  screen        — ncurses double-buffer display layer
- *   §8  app           — signals, resize, main game loop
- * ─────────────────────────────────────────────────────────────────────────
- *
- * HOW VERLET INTEGRATION WORKS
- * ────────────────────────────
- * Classic Verlet (position-only) stores velocity implicitly:
- *   velocity ≈ (pos - old_pos) / dt
- *
- * Update rule:
- *   vel      = (pos - old_pos) * DAMPING
- *   new_pos  = pos + vel + accel * dt²
- *   old_pos  = pos
- *   pos      = new_pos
- *
- * Advantages over explicit Euler:
- *  • Unconditionally stable at the step sizes we use.
- *  • Bounce is trivial: reflect old_pos across the collision surface.
- *  • Constraints (rigid bones) can be applied as position corrections
- *    after integration without introducing artificial velocity error.
- *
- * HOW DISTANCE CONSTRAINTS WORK
- * ──────────────────────────────
- * For each bone (p1, p2) with rest_len L:
- *   vec   = p2.pos - p1.pos
- *   dist  = |vec|
- *   error = (dist - L) / dist        ← fractional over/under-stretch
- *
- *   Each particle gets half the correction (equal mass):
- *     p1.pos += 0.5 * error * vec
- *     p2.pos -= 0.5 * error * vec
- *
- * Running 8 iterations converges the constraint network to within
- * < 0.1 px of rest length under typical loads.
+ * Section map:
+ *   §1 config   — tunables: physics, gravity, wind, platform layout
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — body-part palette + HUD/hint pairs
+ *   §4 coords   — pixel↔cell aspect-ratio bridge
+ *   §5 entity   — Ragdoll: Verlet particles + distance constraints
+ *       §5a verlet_update             — gravity + wind integration
+ *       §5b apply_boundaries          — wall/floor/ceiling bounce
+ *       §5b-2 apply_platform_collisions — slanted-shelf reflection
+ *       §5c satisfy_constraint        — bone-length projection
+ *       §5d ragdoll_tick              — orchestrator (one physics step)
+ *       §5e bone_glyph / draw_bone    — ASCII line stamp
+ *   §6 scene    — Scene = ragdoll + platforms; tick/draw + render decomposition
+ *   §7 screen   — ncurses double-buffer display layer
+ *   §8 app      — signals, resize, main game loop
  *
  * Keys:
  *   q / ESC       quit
- *   space         pause / resume
- *   ↑ / ↓         gravity ×1.3 / ÷1.3
- *   ← / →         wind force ±20
- *   [ / ]         simulation Hz down / up
+ *   space         pause
+ *   r             reset (figure back to top, new platforms)
+ *   w/s, ↑/↓      gravity × 1.3 / ÷ 1.3
+ *   a/d, ←/→      wind force ± 20
+ *   [ / ]         sim Hz − / +
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra \
@@ -74,32 +39,141 @@
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Verlet integration.  Each particle stores its current
- *                  and previous position; velocity is implicit in the
- *                  difference.  Gravity and wind accelerate particles each
- *                  tick; 8 passes of distance-constraint projection then
- *                  restore all bone lengths.  Boundary collisions are
- *                  implemented as position clamp + old_pos reflection,
- *                  which naturally produces a physical bounce response
- *                  without any explicit velocity manipulation.
+ * Algorithm      : Position-Verlet integration. Each particle stores its
+ *                  current and previous position; velocity is implicit in
+ *                  the difference. Gravity and wind accelerate particles;
+ *                  8 passes of distance-constraint projection (Jakobsen)
+ *                  restore all bone lengths after integration. Boundary
+ *                  and slanted-platform collisions are implemented as
+ *                  position clamp + old_pos reflection, which naturally
+ *                  yields a physical bounce without explicit velocity
+ *                  manipulation.
  *
- * Data-structure : Ragdoll struct with pos[], old_pos[] (Verlet pair) and
- *                  prev_pos[] (snapshot for alpha lerp).  Constraint arrays
- *                  c_a[], c_b[], c_len[] are parallel arrays indexed by
- *                  constraint id.  All positions in pixel space (square
- *                  isotropic grid) so that distances and forces are correct
- *                  regardless of terminal aspect ratio.
+ * Data-structure : Ragdoll holds pos[], old_pos[] (the Verlet pair) and
+ *                  prev_pos[] (snapshot for sub-tick alpha lerp).
+ *                  Constraint arrays c_a[], c_b[], c_len[] are parallel
+ *                  arrays indexed by constraint id. Platforms are kept in
+ *                  Scene as Platform[] (cx, y, half_w, slope). All state
+ *                  lives in pixel space — square, isotropic — so forces
+ *                  and distances are correct regardless of the terminal's
+ *                  cell aspect ratio.
  *
- * Rendering      : Each bone is walked in DRAW_STEP_PX increments; a
- *                  direction glyph (- | / \) is stamped at every terminal
- *                  cell the bone passes through.  Alpha interpolation of
- *                  prev_pos → pos ensures visual smoothness at any render
- *                  frame rate.  Ground line drawn at floor row.
+ * Rendering      : Each bone is walked in DRAW_STEP_PX increments; the
+ *                  direction glyph (-, |, /, \) is stamped at every
+ *                  terminal cell the bone crosses. Alpha-interpolated
+ *                  prev_pos → pos positions keep motion smooth even when
+ *                  render Hz ≠ sim Hz. Platforms render in two passes
+ *                  (fill 'o' bead, then '0' nodes at quarter points).
  *
  * Performance    : Fixed-step accumulator decouples physics Hz from render
- *                  Hz.  8 constraint iterations cost ≈ 8×17 = 136 scalar
- *                  ops per tick — trivial.  ncurses doupdate sends only
- *                  changed cells to the terminal fd.
+ *                  Hz. 8 constraint iterations × 17 constraints ≈ 136
+ *                  scalar projections per tick — trivial. ncurses
+ *                  wnoutrefresh + doupdate emits only changed cells.
+ *
+ * References     : Jakobsen, "Advanced Character Physics," GDC 2001
+ *                    (the canonical Verlet-ragdoll paper).
+ *                  Müller et al., "Position Based Dynamics," 2007 — the
+ *                    modern generalisation of Jakobsen's projection idea.
+ *                  Wikipedia: "Verlet integration" — derivation and the
+ *                    velocity-implicit form used here.
+ *                  Hecker, "Behind the Screen — Verlet Physics," Game
+ *                    Developer Magazine, 2005.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A ragdoll is just a cloud of particles falling under gravity, with rigid
+ * bones enforced as a *post-step correction*: integrate first, then project
+ * the network back to its rest distances. Repeat the projection enough
+ * times and the figure looks rigid; do it too few times and it stretches
+ * like rubber. There is no joint solver, no angular velocity, no torque —
+ * the rigidity emerges from iterating distance-only constraints.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine 15 marbles connected by 17 inelastic strings, all falling
+ * through a stack of tilted glass shelves. Each tick:
+ *   • each marble takes one step in the direction it was already moving,
+ *     plus a downward kick from gravity (Verlet);
+ *   • whenever a string is too long or too short, the two marbles at its
+ *     ends move halfway toward each other (or apart) along the string.
+ * Run that string-fix step eight times in a row and the figure looks
+ * solid. Touch a shelf and the marble *and its previous position* both
+ * snap above the surface — the bounce is automatic.
+ *
+ * DRAWING METHOD / ALGORITHM IN STEPS
+ * ───────────────────────────────────
+ *   1. Save prev_pos = pos             (anchor for sub-tick interpolation)
+ *   2. If a wind period elapsed, kick old_pos sideways (impulse via Verlet
+ *      identity: changing old_pos changes implicit velocity).
+ *   3. For each particle, Verlet update:
+ *        vel     = (pos − old_pos) · DAMPING
+ *        old_pos = pos
+ *        pos    += vel + accel · dt²
+ *   4. Clamp particles to walls/floor/ceiling; reflect old_pos for bounce.
+ *   5. Test each particle against each slanted platform; reflect velocity
+ *      along the surface normal n = (slope, −1)/||·|| if crossing from above.
+ *   6. Repeat N_CONSTRAINT_ITERS times: walk every bone, project both
+ *      endpoints by half the length error along the bone direction.
+ *      After each iteration re-apply platform collisions so a bone cannot
+ *      yank a foot through a shelf.
+ *   7. Render: lerp prev_pos → pos by alpha, stamp bone glyphs and joints.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Verlet integration (position-implicit velocity):
+ *     vel     = (pos − old_pos) · DAMPING
+ *     old_pos = pos
+ *     pos    += vel + accel · dt²
+ *
+ *   Distance constraint (Jakobsen projection):
+ *     v     = p2 − p1
+ *     dist  = |v|
+ *     error = (dist − rest) / dist
+ *     p1   += 0.5 · error · v        (equal mass → half each)
+ *     p2   −= 0.5 · error · v
+ *
+ *   Slanted-surface reflection (screen +y down, upward normal):
+ *     n        = (slope, −1) / sqrt(slope² + 1)
+ *     v_n      = v · n
+ *     v_refl   = v − (1 + BOUNCE) · v_n · n
+ *     old_pos  = pos − v_refl
+ *
+ *   Pixel→cell aspect-ratio fix:
+ *     cx = round(px / CELL_W)
+ *     cy = round(py / CELL_H)        CELL_W=8, CELL_H=16
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • Two coincident particles → distance ≈ 0 → constraint divides by zero.
+ *     satisfy_constraint() bails early when dist < 1e-6.
+ *   • Order matters: Verlet integration MUST save old_pos before computing
+ *     new pos (verlet_update uses a temp). Reverse order destroys velocity.
+ *   • Bones can drag a foot through a platform if collisions only run
+ *     before constraints — that is why ragdoll_tick re-applies platform
+ *     collisions inside the constraint loop.
+ *   • Negative slope = right side higher (looks like /), positive = right
+ *     side lower (looks like \) — easy to flip mentally.
+ *   • Resize: rescaling platforms must preserve relative layout; clamp all
+ *     particle positions to new pixel bounds so none get stranded.
+ *   • Frame cap: do NOT add dt to elapsed — it cancels the cap. Use
+ *     `clock_ns() − frame_start` only.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Drop the figure with wind=0 and gravity=800: it should land in a
+ *     limp pile, no limbs longer than they started (constraint solver OK).
+ *   • Pause (space): figure freezes mid-fall. Resume: motion continues
+ *     without a velocity glitch (because prev_pos is saved every tick).
+ *   • Crank gravity to 3200 and bounce off the floor: figure should rebound
+ *     to ~30 % of drop height (BOUNCE_COEFF = 0.55, so √0.55² ≈ 0.30).
+ *   • Drop on a 0.4-slope platform: ankle slides sideways — proves the
+ *     normal-component reflection is working, not just a vertical bounce.
+ *   • Reset (r) repeatedly: every reset must produce a clean T-pose at the
+ *     top with all 17 bones at rest length (no pop on first frame).
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -153,11 +227,18 @@ enum {
     FPS_UPDATE_MS    = 500,
 
     /*
-     * N_PAIRS — number of body-part color pairs (§3).
-     * HUD_PAIR (8) is dedicated to the status bars.
+     * Color-pair IDs.  Pairs 1-7 paint the body; PAIR_HUD/PAIR_HINT paint
+     * the two HUD lines per the project HUD spec.
      */
-    N_PAIRS          =   7,
-    HUD_PAIR         =   8,
+    PAIR_HEAD        =   1,   /* white   — head marker             */
+    PAIR_BODY        =   2,   /* white   — non-head joints         */
+    PAIR_SPINE       =   3,   /* grey    — spine + collarbones     */
+    PAIR_ARM         =   4,   /* orange  — arm bones + wrists      */
+    PAIR_LEG         =   5,   /* blue    — leg bones + ankles      */
+    PAIR_PLATFORM    =   6,   /* cyan    — slanted shelves         */
+    PAIR_STRUT       =   7,   /* dim grey — stabiliser struts/floor*/
+    PAIR_HUD         =   8,   /* bright yellow — top status        */
+    PAIR_HINT        =   9,   /* bright cyan   — bottom key hints  */
 
     /*
      * Ragdoll topology constants.
@@ -263,20 +344,24 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * color_init() — define all ncurses color pairs for the ragdoll.
+ * color_init() — define all ncurses color pairs.
  *
- * RAGDOLL PALETTE (pairs 1–7):
+ * Background = -1 (terminal default) so the demo respects the user's
+ * theme.  Foreground tints are chosen from the bright half of the
+ * 256-colour cube (≥ 24) so every glyph remains legible even under
+ * A_DIM (see CLAUDE.md "Theme Palette Brightness").
+ *
  *   Pair  256-col  Role
- *   ──────────────────────────────
- *     1     231    white  — head marker
- *     2     255    near-white — neck / body text
- *     3     248    medium grey — spine bones
- *     4     214    orange — arm bones
- *     5      75    blue — leg bones
- *     6      46    green — live indicator (unused, reserved)
- *     7     238    dark grey — floor line + stabiliser struts
- *
- * HUD PAIR (pair 8): bright yellow — status bar + hint bar.
+ *   ─────────────────────────────────────────────────
+ *     1     231    bright white  — head marker
+ *     2     255    near-white    — generic joint dot
+ *     3     248    light grey    — spine + collarbones
+ *     4     214    orange        — arm bones, wrists
+ *     5      75    sky blue      — leg bones, ankles
+ *     6      45    cyan          — slanted platform beads
+ *     7     244    medium grey   — stabiliser struts + ground line
+ *     8     226    bright yellow — HUD top status (PAIR_HUD)
+ *     9      51    bright cyan   — HUD bottom key hint (PAIR_HINT)
  */
 static void color_init(void)
 {
@@ -284,23 +369,25 @@ static void color_init(void)
     use_default_colors();
 
     if (COLORS >= 256) {
-        init_pair(1, 231, COLOR_BLACK);   /* white — head             */
-        init_pair(2, 255, COLOR_BLACK);   /* near-white               */
-        init_pair(3, 248, COLOR_BLACK);   /* medium grey — spine      */
-        init_pair(4, 214, COLOR_BLACK);   /* orange — arms            */
-        init_pair(5,  75, COLOR_BLACK);   /* blue — legs              */
-        init_pair(6,  46, COLOR_BLACK);   /* green — alive indicator  */
-        init_pair(7, 246, COLOR_BLACK);   /* dark grey — floor/struts */
-        init_pair(8, 226, COLOR_BLACK);   /* bright yellow — HUD      */
+        init_pair(PAIR_HEAD,     231, -1);
+        init_pair(PAIR_BODY,     255, -1);
+        init_pair(PAIR_SPINE,    248, -1);
+        init_pair(PAIR_ARM,      214, -1);
+        init_pair(PAIR_LEG,       75, -1);
+        init_pair(PAIR_PLATFORM,  45, -1);
+        init_pair(PAIR_STRUT,    244, -1);
+        init_pair(PAIR_HUD,      226, -1);
+        init_pair(PAIR_HINT,      51, -1);
     } else {
-        init_pair(1, COLOR_WHITE,   COLOR_BLACK);
-        init_pair(2, COLOR_WHITE,   COLOR_BLACK);
-        init_pair(3, COLOR_WHITE,   COLOR_BLACK);
-        init_pair(4, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(5, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(6, COLOR_GREEN,   COLOR_BLACK);
-        init_pair(7, COLOR_BLACK,   COLOR_BLACK);
-        init_pair(8, COLOR_YELLOW,  COLOR_BLACK);
+        init_pair(PAIR_HEAD,     COLOR_WHITE,   -1);
+        init_pair(PAIR_BODY,     COLOR_WHITE,   -1);
+        init_pair(PAIR_SPINE,    COLOR_WHITE,   -1);
+        init_pair(PAIR_ARM,      COLOR_YELLOW,  -1);
+        init_pair(PAIR_LEG,      COLOR_CYAN,    -1);
+        init_pair(PAIR_PLATFORM, COLOR_CYAN,    -1);
+        init_pair(PAIR_STRUT,    COLOR_WHITE,   -1);
+        init_pair(PAIR_HUD,      COLOR_YELLOW,  -1);
+        init_pair(PAIR_HINT,     COLOR_CYAN,    -1);
     }
 }
 
@@ -725,178 +812,189 @@ static void draw_bone(WINDOW *w,
 }
 
 /*
- * render_ragdoll() — compose a complete frame of the stick figure.
+ * mark_cell() — stamp one ASCII glyph at terminal cell (cx,cy).
  *
- * STEP 1 — alpha interpolation.
- *   For each particle i:
- *     rp[i] = prev_pos[i] + (pos[i] - prev_pos[i]) * alpha
- *   alpha ∈ [0,1) is the fractional leftover in the accumulator.
- *   This blends between the position at the last tick and the current
- *   tick, producing smooth motion at any render rate.
- *
- * STEP 2 — ground line.
- *   Draw a row of '-' at the floor row to give visual ground reference.
- *
- * STEP 3 — bones.
- *   Draw each constraint as a bone line.  Color and attribute based on
- *   which part of the body the constraint belongs to:
- *     Spine (constraints 0-1):   pair 3, A_BOLD
- *     Collarbones (2-3):         pair 3, A_NORMAL
- *     Arms (4-7):                pair 4, A_NORMAL
- *     Hip cross (8-9):           pair 3, A_NORMAL
- *     Legs (10-13):              pair 5, A_NORMAL
- *     Stabilisers (14-16):       pair 7, A_DIM
- *
- * STEP 4 — particle markers.
- *   Head (0): 'O' pair 1 A_BOLD
- *   Wrists (6,7): '*' pair 4
- *   Ankles (13,14): 'v' pair 5
- *   Other particles: '.' pair 2 A_DIM
+ * Centralises the (chtype)(unsigned char) cast plus bounds-check that would
+ * otherwise be repeated at every mvwaddch site.  Glyph is silently dropped
+ * if the cell is off-screen.
  */
-static void render_ragdoll(const Ragdoll *r, WINDOW *w,
-                           int cols, int rows, float alpha,
-                           const Platform *plats)
+static void mark_cell(WINDOW *w, int cx, int cy, char ch,
+                      int pair, attr_t attr, int cols, int rows)
 {
-    /* Step 1 — build alpha-interpolated positions */
-    Vec2 rp[N_PARTICLES];
-    for (int i = 0; i < N_PARTICLES; i++) {
-        rp[i].x = r->prev_pos[i].x
-                + (r->pos[i].x - r->prev_pos[i].x) * alpha;
-        rp[i].y = r->prev_pos[i].y
-                + (r->pos[i].y - r->prev_pos[i].y) * alpha;
-    }
+    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+    wattron(w, COLOR_PAIR(pair) | attr);
+    mvwaddch(w, cy, cx, (chtype)(unsigned char)ch);
+    wattroff(w, COLOR_PAIR(pair) | attr);
+}
 
-    /* Step 2 — slanted platforms, bead style (two-pass: fill then nodes) */
+/*
+ * lerp_positions() — fill rp[] with alpha-interpolated render positions.
+ *
+ * rp[i] = prev_pos[i] + (pos[i] − prev_pos[i]) · alpha
+ *
+ * alpha ∈ [0,1) is the leftover fraction in the fixed-step accumulator.
+ * Without this lerp, motion stutters whenever render Hz ≠ sim Hz; with
+ * it, the figure glides smoothly at any combination of the two rates.
+ */
+static void lerp_positions(const Ragdoll *r, float alpha, Vec2 rp[N_PARTICLES])
+{
+    for (int i = 0; i < N_PARTICLES; i++) {
+        rp[i].x = r->prev_pos[i].x + (r->pos[i].x - r->prev_pos[i].x) * alpha;
+        rp[i].y = r->prev_pos[i].y + (r->pos[i].y - r->prev_pos[i].y) * alpha;
+    }
+}
+
+/*
+ * draw_platforms() — render the slanted shelves in two passes per platform.
+ *
+ * Pass 1 fills every cell along the surface with 'o' (the bead).
+ * Pass 2 over-stamps quarter-point '0' nodes (A_BOLD on ends + centre),
+ * giving each shelf a clear visual anchor without losing the smooth line.
+ */
+static void draw_platforms(WINDOW *w, const Platform *plats,
+                           int cols, int rows)
+{
+    static const float  node_u   [5] = { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f };
+    static const char   node_ch  [5] = { '0',  'o',   '0',  'o',   '0'  };
+    static const attr_t node_attr[5] = { A_BOLD, A_NORMAL, A_BOLD, A_NORMAL, A_BOLD };
+
     for (int p = 0; p < N_PLATFORMS; p++) {
         const Platform *pl = &plats[p];
-        float px0 = pl->cx - pl->half_w;
-        float py0 = pl->y  + (-pl->half_w) * pl->slope;
-        float px1 = pl->cx + pl->half_w;
-        float py1 = pl->y  + ( pl->half_w) * pl->slope;
-        float ddx  = px1 - px0;
-        float ddy  = py1 - py0;
-        float dlen = sqrtf(ddx*ddx + ddy*ddy);
-        if (dlen < 0.1f) continue;
+        float x0 = pl->cx - pl->half_w;
+        float y0 = pl->y  + (-pl->half_w) * pl->slope;
+        float x1 = pl->cx + pl->half_w;
+        float y1 = pl->y  + ( pl->half_w) * pl->slope;
+        float dx = x1 - x0, dy = y1 - y0;
+        float L  = sqrtf(dx*dx + dy*dy);
+        if (L < 0.1f) continue;
 
-        /* Pass 1 — fill every unique cell with 'o' */
-        int bead_steps = (int)ceilf(dlen / 5.0f) + 1;
-        int prev_pcx = -9999, prev_pcy = -9999;
-        wattron(w, COLOR_PAIR(3) | A_NORMAL);
-        for (int s = 0; s <= bead_steps; s++) {
-            float u   = (float)s / (float)bead_steps;
-            int   pcx = px_to_cell_x(px0 + ddx * u);
-            int   pcy = px_to_cell_y(py0 + ddy * u);
-            if (pcx == prev_pcx && pcy == prev_pcy) continue;
-            prev_pcx = pcx; prev_pcy = pcy;
-            if (pcx < 0 || pcx >= cols || pcy < 0 || pcy >= rows) continue;
-            mvwaddch(w, pcy, pcx, 'o');
+        /* Pass 1 — bead fill */
+        int steps = (int)ceilf(L / 5.0f) + 1;
+        int prev_cx = -9999, prev_cy = -9999;
+        for (int s = 0; s <= steps; s++) {
+            float u  = (float)s / (float)steps;
+            int   cx = px_to_cell_x(x0 + dx * u);
+            int   cy = px_to_cell_y(y0 + dy * u);
+            if (cx == prev_cx && cy == prev_cy) continue;
+            prev_cx = cx; prev_cy = cy;
+            mark_cell(w, cx, cy, 'o', PAIR_PLATFORM, A_NORMAL, cols, rows);
         }
-        wattroff(w, COLOR_PAIR(3) | A_NORMAL);
 
-        /* Pass 2 — node markers at 0%, 25%, 50%, 75%, 100%
-         *   ends → '0' (A_BOLD)   mid-quarter → 'o'   centre → '0' */
-        static const float node_u[5]     = { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f };
-        static const chtype node_ch[5]   = { '0',  'o',   '0',  'o',   '0'  };
-        static const attr_t node_attr[5] = { A_BOLD, A_NORMAL, A_BOLD, A_NORMAL, A_BOLD };
+        /* Pass 2 — quarter-point nodes */
         for (int n = 0; n < 5; n++) {
-            int ncx = px_to_cell_x(px0 + ddx * node_u[n]);
-            int ncy = px_to_cell_y(py0 + ddy * node_u[n]);
-            if (ncx < 0 || ncx >= cols || ncy < 0 || ncy >= rows) continue;
-            wattron(w, COLOR_PAIR(3) | node_attr[n]);
-            mvwaddch(w, ncy, ncx, node_ch[n]);
-            wattroff(w, COLOR_PAIR(3) | node_attr[n]);
+            int cx = px_to_cell_x(x0 + dx * node_u[n]);
+            int cy = px_to_cell_y(y0 + dy * node_u[n]);
+            mark_cell(w, cx, cy, node_ch[n],
+                      PAIR_PLATFORM, node_attr[n], cols, rows);
         }
     }
+}
 
-    /* Step 3 — ground line */
+/*
+ * draw_ground() — single dashed row at the floor for visual reference.
+ */
+static void draw_ground(WINDOW *w, int cols, int rows)
+{
     int floor_row = px_to_cell_y((float)(rows * CELL_H) - FLOOR_MARGIN);
-    if (floor_row >= 0 && floor_row < rows) {
-        wattron(w, COLOR_PAIR(7) | A_DIM);
-        for (int cx = 0; cx < cols; cx++) {
-            mvwaddch(w, floor_row, cx, (chtype)'-');
-        }
-        wattroff(w, COLOR_PAIR(7) | A_DIM);
+    if (floor_row < 0 || floor_row >= rows) return;
+    for (int cx = 0; cx < cols; cx++) {
+        mark_cell(w, cx, floor_row, '-', PAIR_STRUT, A_DIM, cols, rows);
     }
+}
 
-    /*
-     * Step 3 — bones.
-     *
-     * Constraint layout:
-     *   Index  Pair Attr     Description
-     *   ──────────────────────────────────────
-     *   0  (0,1)   3 BOLD   head→neck (spine top)
-     *   1  (1,8)   3 BOLD   neck→hip_center (spine)
-     *   2  (1,2)   3 NORM   neck→left_shoulder (collarbone)
-     *   3  (1,3)   3 NORM   neck→right_shoulder (collarbone)
-     *   4  (2,4)   4 NORM   left_shoulder→left_elbow
-     *   5  (4,6)   4 NORM   left_elbow→left_wrist
-     *   6  (3,5)   4 NORM   right_shoulder→right_elbow
-     *   7  (5,7)   4 NORM   right_elbow→right_wrist
-     *   8  (8,9)   3 NORM   hip_center→left_hip
-     *   9  (8,10)  3 NORM   hip_center→right_hip
-     *   10 (9,11)  5 NORM   left_hip→left_knee
-     *   11 (11,13) 5 NORM   left_knee→left_ankle
-     *   12 (10,12) 5 NORM   right_hip→right_knee
-     *   13 (12,14) 5 NORM   right_knee→right_ankle
-     *   14 (2,3)   7 DIM    shoulder width stabiliser
-     *   15 (9,10)  7 DIM    hip width stabiliser
-     *   16 (0,2)   7 DIM    head→left_shoulder strut
-     *   (0,3 is omitted from the table but included in c_a[]/c_b[])
-     *
-     * Note: we have 17 constraints total.  Index 16 = (0,2) and
-     * constraint 17 would be (0,3); both are stored in the arrays.
-     */
+/*
+ * draw_bones() — render every distance constraint as a glyph-stamped line.
+ *
+ * Bone palette is keyed by constraint index ranges:
+ *   0–1   spine (head→neck, neck→hip)            PAIR_SPINE A_BOLD
+ *   2–3   collarbones (neck→shoulders)           PAIR_SPINE A_NORMAL
+ *   4–7   arms (shoulders→elbows→wrists)         PAIR_ARM   A_NORMAL
+ *   8–9   hip cross (hip_center→hips)            PAIR_SPINE A_NORMAL
+ *   10–13 legs (hips→knees→ankles)               PAIR_LEG   A_NORMAL
+ *   14–16 stabilisers (shoulder-W, hip-W, strut) PAIR_STRUT A_DIM
+ *
+ * The pcx/pcy de-dup state is reset per bone so adjacent bones don't
+ * suppress each other's first cell.
+ */
+static void draw_bones(WINDOW *w, const Ragdoll *r,
+                       const Vec2 rp[N_PARTICLES], int cols, int rows)
+{
     static const int bone_pair[N_CONSTRAINTS] = {
-        3, 3,  /* spine */
-        3, 3,  /* collarbones */
-        4, 4, 4, 4, /* arms */
-        3, 3,  /* hip cross */
-        5, 5, 5, 5, /* legs */
-        7, 7, 7  /* stabilisers: shoulder-width, hip-width, head-shoulder */
+        PAIR_SPINE, PAIR_SPINE,                                   /*  0–1 */
+        PAIR_SPINE, PAIR_SPINE,                                   /*  2–3 */
+        PAIR_ARM,   PAIR_ARM,   PAIR_ARM,   PAIR_ARM,             /*  4–7 */
+        PAIR_SPINE, PAIR_SPINE,                                   /*  8–9 */
+        PAIR_LEG,   PAIR_LEG,   PAIR_LEG,   PAIR_LEG,             /* 10–13 */
+        PAIR_STRUT, PAIR_STRUT, PAIR_STRUT,                       /* 14–16 */
     };
     static const attr_t bone_attr[N_CONSTRAINTS] = {
-        A_BOLD, A_BOLD,
+        A_BOLD,   A_BOLD,
         A_NORMAL, A_NORMAL,
         A_NORMAL, A_NORMAL, A_NORMAL, A_NORMAL,
         A_NORMAL, A_NORMAL,
         A_NORMAL, A_NORMAL, A_NORMAL, A_NORMAL,
-        A_DIM, A_DIM, A_DIM
+        A_DIM,    A_DIM,    A_DIM,
     };
 
-    int pcx = -9999, pcy = -9999;
     for (int ci = 0; ci < N_CONSTRAINTS; ci++) {
-        pcx = -9999; pcy = -9999;   /* reset cursor per bone */
+        int pcx = -9999, pcy = -9999;
         draw_bone(w,
                   rp[r->c_a[ci]], rp[r->c_b[ci]],
                   bone_pair[ci], bone_attr[ci],
                   cols, rows,
                   &pcx, &pcy);
     }
+}
 
-    /* Step 4 — particle markers */
+/*
+ * draw_particles() — over-stamp joint markers on top of bones.
+ *
+ * Glyph distinguishes role: 'O' head (A_BOLD), '*' wrists, 'v' ankles,
+ * '.' all other joints (dim).  Drawn last so markers always read above
+ * the bone lines that meet at them.
+ */
+static void draw_particles(WINDOW *w, const Vec2 rp[N_PARTICLES],
+                           int cols, int rows)
+{
     for (int i = 0; i < N_PARTICLES; i++) {
         int cx = px_to_cell_x(rp[i].x);
         int cy = px_to_cell_y(rp[i].y);
-        if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
 
-        chtype glyph;
-        int    cpair;
-        attr_t cattr;
+        char   ch    = '.';
+        int    pair  = PAIR_BODY;
+        attr_t attr  = A_DIM;
 
-        if (i == 0) {
-            glyph = (chtype)'O'; cpair = 1; cattr = A_BOLD;
-        } else if (i == 6 || i == 7) {
-            glyph = (chtype)'*'; cpair = 4; cattr = A_NORMAL;
-        } else if (i == 13 || i == 14) {
-            glyph = (chtype)'v'; cpair = 5; cattr = A_NORMAL;
-        } else {
-            glyph = (chtype)'.'; cpair = 2; cattr = A_DIM;
-        }
+        if (i == 0)                  { ch = 'O'; pair = PAIR_HEAD; attr = A_BOLD;   }
+        else if (i == 6 || i == 7)   { ch = '*'; pair = PAIR_ARM;  attr = A_NORMAL; }
+        else if (i == 13 || i == 14) { ch = 'v'; pair = PAIR_LEG;  attr = A_NORMAL; }
 
-        wattron(w, COLOR_PAIR(cpair) | cattr);
-        mvwaddch(w, cy, cx, glyph);
-        wattroff(w, COLOR_PAIR(cpair) | cattr);
+        mark_cell(w, cx, cy, ch, pair, attr, cols, rows);
     }
+}
+
+/*
+ * render_ragdoll() — orchestrate one frame in painter's order.
+ *
+ *   1. lerp_positions  — sub-tick interpolation
+ *   2. draw_platforms  — slanted shelves first (bottom layer)
+ *   3. draw_ground     — floor reference line
+ *   4. draw_bones      — every distance constraint stamped as glyph line
+ *   5. draw_particles  — joint markers on top
+ *
+ * Order matters: each later layer over-stamps earlier ones at shared cells,
+ * so joints read above bones, bones above ground, etc.
+ */
+static void render_ragdoll(const Ragdoll *r, WINDOW *w,
+                           int cols, int rows, float alpha,
+                           const Platform *plats)
+{
+    Vec2 rp[N_PARTICLES];
+    lerp_positions(r, alpha, rp);
+
+    draw_platforms (w, plats,    cols, rows);
+    draw_ground    (w,           cols, rows);
+    draw_bones     (w, r, rp,    cols, rows);
+    draw_particles (w, rp,       cols, rows);
 }
 
 /* ===================================================================== */
@@ -1136,26 +1234,24 @@ static void screen_draw(Screen *s, const Scene *sc,
     scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
 
     const Ragdoll *r = &sc->ragdoll;
+
+    /* Top-right status — PAIR_HUD bright yellow, A_BOLD */
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
-             " RAGDOLL  15-particles  17-constraints"
-             "  gravity:%.0f  %s ",
-             r->gravity,
-             r->paused ? "PAUSED" : "simulating");
+             " %5.1f fps  sim:%3d Hz  grav:%.0f  wind:%.0f  %s ",
+             fps, sim_fps, r->gravity, r->wind_force,
+             r->paused ? "PAUSED " : "running");
     int hx = s->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    char buf2[HUD_COLS + 1];
-    snprintf(buf2, sizeof buf2,
-             " %.1ffps  %dHz  wind:%.0f"
-             "  q:quit  spc:pause  r:reset  w/s:gravity  a/d:wind  [/]:Hz ",
-             fps, sim_fps, r->wind_force);
-    attron(COLOR_PAIR(HUD_PAIR) | A_BOLD);
-    mvprintw(s->rows - 1, 0, "%s", buf2);
-    attroff(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    /* Bottom-left key hint — PAIR_HINT bright cyan, A_BOLD */
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  spc:pause  r:reset  w/s:gravity  a/d:wind  [/]:Hz ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /*
@@ -1314,6 +1410,8 @@ int main(void)
 
     while (app->running) {
 
+        int64_t frame_start = clock_ns();
+
         /* ── ① resize ────────────────────────────────────────────── */
         if (app->need_resize) {
             app_do_resize(app);
@@ -1351,8 +1449,11 @@ int main(void)
             fps_accum   = 0;
         }
 
-        /* ── ⑥ frame cap — sleep before render ──────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
+        /* ── ⑥ frame cap — sleep before render ──────────────────── *
+         * Budget = 1/60 s.  elapsed is wall time spent on physics +
+         * accounting since frame_start; sleep the remainder so the
+         * render rate sits at 60 fps regardless of sim Hz.           */
+        int64_t elapsed = clock_ns() - frame_start;
         clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 
         /* ── ⑦ draw + present ────────────────────────────────────── */

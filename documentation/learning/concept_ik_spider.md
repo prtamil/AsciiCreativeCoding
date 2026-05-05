@@ -6,13 +6,17 @@
 
 **Algorithm 2 — 2-Joint Analytical IK (legs):** Given hip H and foot target T, the knee position is solved in closed form using the law of cosines. No iteration required. `cos(angle_at_hip) = (dist² + UPPER² − LOWER²) / (2 × dist × UPPER)`. Left vs right legs choose opposite knee-bend directions so knees splay outward from the body centre.
 
-**Algorithm 3 — Alternating Tripod Gait:** Legs are grouped into two tripods: A={0,2,4} (left front, left mid, left rear) and B={1,3,5} (right front, right mid, right rear). Only one tripod steps at a time. A leg triggers a step when its foot drifts more than STEP_TRIGGER_DIST from ideal position, or hip-to-foot distance exceeds MAX_STRETCH. Foot animation uses a cubic smoothstep ease-in/ease-out curve over STEP_DURATION=0.22 s.
+**Algorithm 3 — Autonomous Per-Leg Gait with Stability Cap:** No fixed tripod schedule. Each leg watches its own foot's drift from `ideal_target` and triggers a swing when the drift exceeds `STEP_TRIGGER_DIST` OR hip-to-foot distance exceeds `MAX_STRETCH`. A global cap `n_air < N_LEGS/2 = 3` blocks any new step while three feet are already in the air, so at least three feet are always planted (the same stability guarantee a tripod gives, achieved decentrally). Foot swing is a cubic smoothstep ease-in/ease-out over `STEP_DURATION = 0.22 s`. The emergent pattern *resembles* an alternating tripod most of the time, but adapts to disturbances (e.g. a body wrap that snaps several feet at once) more gracefully.
 
 **Data-structure:** Circular trail buffer `Vec2 trail[TRAIL_CAP]` for body FK. Per-leg: `foot_pos` (planted), `foot_old` (step-start), `step_target` (destination), `step_t` (0→1 progress), `stepping` flag. Two snapshot arrays `prev_body/prev_hip/prev_knee/prev_foot` enable sub-tick alpha lerp for smooth rendering. All positions in pixel space; cell conversion only at draw time.
 
 ## Core Idea
 
-A 6-legged spider crawls across the terminal in a direction set by arrow keys. The body uses trail-buffer FK — the head position is pushed into a ring buffer each tick, and each body segment is placed at the appropriate arc-length distance behind the head. The spider steers by gradually rotating its heading toward a `target_heading` (set by arrow keys) at `TURN_RATE` rad/s, using short-arc normalisation so turns across ±π are always the short way round. Each of the 6 legs independently uses 2-joint analytical IK (law of cosines) to reach a computed step target. Legs step in an alternating tripod gait that automatically adapts to the spider's speed.
+A 6-legged spider crawls across the terminal in a direction set by arrow keys. The body is `N_BODY_SEGS = 4` segments × `BODY_SEG_LEN = 20 px` = 80 px end-to-end, matching `hexpod_tripod.c`'s chassis length so the two demos sit visually side-by-side. The body uses trail-buffer FK — the head position is pushed into a ring buffer each tick, and each body segment is placed at the appropriate arc-length distance behind the head. Each of the 6 legs independently uses 2-joint analytical IK (law of cosines) with `UPPER_LEN = 56 px` and `LOWER_LEN = 50 px`, arranged in three angular pairs: front (60° forward of perpendicular), mid (perpendicular), and rear (60° rearward) — the classic arachnid fan.
+
+Visual identity (vs `hexpod_tripod.c`): the spider is recognised by its head cluster — a `:>:` triplet stamped perpendicular to the heading, where `:` are the eyes and `>` is a small directional arrow at the centre — and a chunky `'O'` abdomen-tip marker versus the slim `'o'` mid-body markers. The hexapod uses a square chassis with crossbraces; the spider has no chassis.
+
+Legs step in an autonomous per-leg gait gated by an `n_air < N_LEGS/2 = 3` stability cap so at least three feet are always planted. There is no fixed alternating tripod schedule — each leg decides for itself when its own foot has drifted too far, subject to the global cap.
 
 The key difference from ik_arm_reach.c: IK here is analytical (one formula, exact, no iteration) because each leg has exactly 2 joints. For 2-joint chains, the law of cosines gives a closed-form solution with two cases (elbow-up or elbow-down) chosen by the left/right body side.
 
@@ -20,7 +24,7 @@ The key difference from ik_arm_reach.c: IK here is analytical (one formula, exac
 
 Imagine a real spider. Its body snakes forward along whatever curved path it's walking. The legs are attached to the body and must reach the ground. Each leg has exactly two segments (thigh and shin), so you can solve exactly where the knee must be given where the hip is and where the foot needs to land — that is the law of cosines triangle.
 
-The gait logic is automatic and emergent: no pre-programmed timing tells legs when to step. Instead, each leg watches how far its planted foot has drifted from where it ideally wants to be. When the drift exceeds a threshold, the leg wants to step. The alternating tripod rule — "only step if your opposite tripod is planted" — enforces the insect's natural 3-point stability: while one tripod of 3 legs is in the air, the other 3 are firmly on the ground.
+The gait logic is automatic and emergent: no pre-programmed timing tells legs when to step. Instead, each leg watches how far its planted foot has drifted from where it ideally wants to be. When the drift exceeds a threshold, the leg *wants* to step. A global stability cap — "at most 3 of the 6 legs may be airborne at any time" — blocks the request when three feet are already in the air. The remaining 3 are guaranteed to be planted, giving the same insect-like 3-point stability as a hard-coded tripod schedule, but emerging from local rules rather than a global timer.
 
 ## Data Structures
 
@@ -69,20 +73,33 @@ pair 8     — HUD status bar
 ```
 Only pair 3 (main spider colour), pair 6 (planted foot), and pair 7 (stepping foot) are actively used in the renderer.
 
-### LEG_ANGLE and HIP_BODY_T arrays
+### LEG_ANGLE and HIP_BODY_T arrays (3-pair angular fan)
 ```
-LEG_ANGLE[6] = {0.55, -0.55, 1.57, -1.57, 2.60, -2.60}  radians
+LEG_ANGLE[6] = ±π/3, ±π/2, ±2π/3   (front, mid, rear pairs)
   — angle added to body_forward for ideal step direction per leg
-  — legs 0/1 = front pair (slight forward angle)
-  — legs 2/3 = mid pair (straight sideways, π/2)
-  — legs 4/5 = rear pair (backward-angled)
+  — legs 0/1 = front pair (60° forward of perpendicular)
+  — legs 2/3 = mid pair   (straight sideways, ±π/2)
+  — legs 4/5 = rear pair  (60° rearward of perpendicular)
 
-HIP_BODY_T[6] = {0.15, 0.15, 0.50, 0.50, 0.85, 0.85}
-  — parametric position along body centerline (0=head, 1=tail)
-  — front pair attaches 15% back from head
-  — mid pair at 50%
-  — rear pair at 85% (near the tail)
+HIP_BODY_T[6] = parametric positions along body centerline
+  0 = head, 1 = tail (abdomen). Front hips attach near the head, mid
+  hips at the body midpoint, rear hips near the abdomen tip — three
+  evenly-spaced lateral pairs producing the classic arachnid fan.
 ```
+
+### Visual identity constants
+```
+EYE_OFFSET_PX     10.0    head cluster perpendicular offset
+HIP_DIST_FACTOR   0.04    hip lateral offset = body_length × 0.04
+                          (small offset since legs sweep wide on their own)
+```
+
+The head cluster is a 3-cell strip drawn perpendicular to the heading:
+```
+:>:    where  :  = eye glyph (PAIR_HEAD, A_BOLD)
+              >  = directional arrow (rotates by quadrant: > v < ^)
+```
+The abdomen tip uses chunky `'O'` (PAIR_BODY, A_BOLD); mid-body joints use slim `'o'` (PAIR_BODY, A_NORMAL).
 
 ## The Main Loop
 
@@ -107,7 +124,7 @@ Each iteration of the main loop:
 
 6. **Frame cap sleep.** Before render; 60 fps ceiling.
 
-7. **Draw and present.** `render_spider()` draws at alpha-interpolated positions: legs (direction chars), body (bead chain), head (directional arrow). HUD overlay. `doupdate()`.
+7. **Draw and present.** `render_spider()` draws in painter's order: leg lines (femur + tibia direction glyphs) → leg joints (knees, planted/swinging foot markers) → body bead-fill (tail → head) → body markers (`'O'` abdomen + `'o'` mid-body) → head cluster (`:>:` perpendicular to heading). The head cluster is drawn last so it always overlays. `doupdate()`.
 
 8. **Handle input.** Speed adjust, theme cycle, sim Hz, quit.
 

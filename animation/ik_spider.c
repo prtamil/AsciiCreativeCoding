@@ -1,125 +1,248 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * ik_spider.c — 6-Legged Spider with Procedural IK Leg Placement
+ * ik_spider.c — six-legged crawler with trail-buffer body and IK legs
  *
- * DEMO: A 6-legged spider crawls autonomously across the terminal.
- *       The body follows a sinusoidal swimming path (trail-buffer FK,
- *       identical to snake_forward_kinematics.c).  Each of the 6 legs
- *       uses 2-joint analytical inverse kinematics (law of cosines) to
- *       reach a computed step target.  Legs step in an alternating tripod
- *       gait when they become too stretched from their ideal position.
+ * DEMO: A six-legged crawler walks across the terminal under autonomous
+ *       steering. Its body curves through space along a trail buffer
+ *       (FK), while each leg uses analytical 2-joint IK to reach a
+ *       computed step target. Each leg steps independently when its foot
+ *       drifts too far from its ideal position, with at most three legs
+ *       airborne at once for stability.
  *
- * STUDY ALONGSIDE: snake_forward_kinematics.c (trail-buffer FK body)
- *                  framework.c (canonical loop / timing template)
+ * Study alongside: hexpod_tripod.c            (rigid-body chassis contrast)
+ *                  snake_forward_kinematics.c (trail-buffer body sibling)
  *
- * ─────────────────────────────────────────────────────────────────────────
- *  Section map
- * ─────────────────────────────────────────────────────────────────────────
+ * Section map:
  *   §1  config        — all tunables in one place
  *   §2  clock         — monotonic clock + sleep (verbatim from framework)
- *   §3  color         — arachnid palette (dark red + olive gradient)
+ *   §3  color         — 10 themes + spec HUD/hint pairs
  *   §4  coords        — pixel↔cell aspect-ratio helpers
- *   §5  entity        — Spider: body FK + IK legs + step gait logic
- *       §5a  vec2 helpers
- *       §5b  trail helpers (push / at / sample — same as snake FK)
- *       §5c  body motion (heading integration + toroidal wrap)
+ *   §5  entity        — Spider: body FK + IK legs + step gait
+ *       §5a  vec2 + small helpers
+ *       §5b  trail (push / at / sample)
+ *       §5c  body motion (steer + translate + wrap)
  *       §5d  body joints (trail-buffer FK)
- *       §5e  hip placement (attach legs to body)
+ *       §5e  hip placement (legs attach to body)
  *       §5f  2-joint analytical IK (law of cosines)
- *       §5g  step logic (trigger, alternating tripod gait, smoothstep)
- *       §5h  rendering (legs, feet, body, head)
- *   §6  scene         — scene_init / scene_tick / scene_draw
+ *       §5g  step gait (drift detect, swing animate, autonomous)
+ *       §5h  rendering helpers (line/bead/marker primitives)
+ *       §5i  render_spider (orchestrator)
+ *   §6  scene         — thin Scene wrapper
  *   §7  screen        — ncurses double-buffer display layer
- *   §8  app           — signals, resize, fixed-step main loop
- * ─────────────────────────────────────────────────────────────────────────
+ *   §8  app           — signals, resize, main game loop
  *
- * HOW THE SPIDER WORKS
- * ────────────────────
- *
- * BODY (trail-buffer FK):
- *   The thorax/head position (body_joint[0]) integrates a sinusoidal
- *   turn rate each tick, identical to the snake FK approach.  Past
- *   positions are stored in a circular trail buffer.  Each body joint
- *   i is placed at arc-length i*BODY_SEG_LEN behind the head via
- *   trail_sample() — no per-joint angle formula needed.
- *
- * LEGS (2-joint analytical IK):
- *   Each leg has a hip (root, attached to the body), knee (mid-joint),
- *   and foot (end effector).  Given a hip position H and foot target T:
- *
- *     1. dist = |T - H|, clamped to [|UPPER-LOWER|+1, UPPER+LOWER-1]
- *     2. Law of cosines: cos_angle = (dist²+UPPER²-LOWER²)/(2·dist·UPPER)
- *     3. angle_at_hip = acos(cos_angle)
- *     4. base_angle   = atan2(dy, dx)
- *     5. Left legs:  knee_angle = base_angle + angle_at_hip  (knee out-left)
- *        Right legs: knee_angle = base_angle - angle_at_hip  (knee out-right)
- *     6. knee = hip + UPPER * (cos(knee_angle), sin(knee_angle))
- *
- *   The foot always reaches the target exactly — IK solves it analytically
- *   with no iteration needed for 2-joint chains.
- *
- * STEP GAIT (alternating tripod):
- *   Legs are grouped in two tripods: A={0,2,4} and B={1,3,5}.
- *   A leg triggers a step when its foot drifts > STEP_TRIGGER_DIST from
- *   its ideal position, or the hip-to-foot distance > MAX_STRETCH.
- *   Only one tripod steps at a time (while A steps, B is planted and
- *   vice-versa), giving the classic insect tripod gait.
- *   During a step, the foot smoothly lerps to its new target over
- *   STEP_DURATION seconds using a smoothstep ease-in/ease-out curve.
- *
- * Keys:
- *   q / ESC       quit
- *   space         pause / resume
- *   arrow keys    steer in 4 directions (gradual turn)
- *   w / s         speed faster / slower
- *   [/]           raise / lower simulation Hz
+ * Keys:  q / ESC     quit                 space   pause / resume
+ *        ↑ ↓ ← →     steer in 4 directions
+ *        w / s       speed × / ÷ 1.25
+ *        t           cycle theme          [ / ]   time scale (0.25× .. 4×)
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra \
- *       ik_spider.c -o ik_spider -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra animation/ik_spider.c \
+ *       -o ik_spider -lncurses -lm
  */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
  *
- * Algorithm 1 — Trail-buffer FK (body):
- *   The head position history is stored tick-by-tick in a circular buffer.
- *   Body joints are placed by measuring cumulative arc length backward along
- *   the trail and linearly interpolating.  Any path the head carves (curves,
- *   turns) propagates naturally to the body.
+ * Algorithm     : Three sub-systems share one body.
  *
- * Algorithm 2 — 2-Joint Analytical IK (legs):
- *   Given hip H and target T, the knee position is solved in closed form
- *   using the law of cosines.  No iteration, no singularity handling beyond
- *   distance clamping.  Left vs right legs choose opposite knee-bend
- *   directions so knees splay outward from the body center.
+ *                 BODY uses path-following (trail-buffer) FK, identical
+ *                 to snake_forward_kinematics.c. Every tick the head's
+ *                 position is pushed into a circular trail; each body
+ *                 joint is placed at arc-length i*BODY_SEG_LEN backward
+ *                 along the recorded path. The body curves naturally
+ *                 wherever the head went — no per-segment angle math.
  *
- * Algorithm 3 — Alternating Tripod Gait:
- *   Insects use a tripod gait: legs {0,2,4} lift together while {1,3,5}
- *   are planted, then swap.  This guarantees 3-point ground contact at all
- *   times — statically stable.  Step timing is driven by foot drift from
- *   the ideal reach position, so the gait automatically adapts to speed.
+ *                 LEGS use 2-joint analytical IK via law of cosines:
+ *                     cos(θ_hip) = (d² + U² − L²) / (2·d·U)
+ *                 with the hip→target distance d clamped into the
+ *                 reachable annulus to keep acos in [-1, 1]. Left and
+ *                 right legs use opposite signs of θ_hip so knees splay
+ *                 outward from the body centre line.
  *
- * Data-structure:
- *   Circular trail buffer Vec2 trail[TRAIL_CAP] for body FK.
- *   Per-leg: foot_pos (planted), foot_old (start of step), step_target
- *   (where foot is heading), step_t (0→1 progress), stepping flag.
- *   Two snapshot arrays prev_body/prev_hip/prev_knee/prev_foot enable
- *   sub-tick alpha lerp for smooth rendering.
+ *                 GAIT is per-leg autonomous: each leg checks its own
+ *                 drift from ideal foot position and over-stretch from
+ *                 the hip, and triggers a swing when ready — gated by
+ *                 a global "no more than N_LEGS/2 legs in the air at
+ *                 once" stability cap. This is fluid and asymmetric vs
+ *                 the lockstep tripod gait of hexpod_tripod.c.
  *
- * Rendering:
- *   Legs drawn as segmented chain lines (hip→knee→foot): alternating
- *   direction char and '.' gives -.-.- / |.|.| / \.\.\  feel per angle.
- *   Knee: 'o' joint node.  Feet: '*' planted, '.' lifting.
- *   Body drawn as a dense bead chain, tail→head.  Head: directional arrow.
+ *                 STEERING interpolates heading toward target_heading
+ *                 at TURN_RATE rad/s, taking the short arc through ±π.
+ *
+ * Data-structure: Spider holds the trail buffer + body joints (4
+ *                 segments curving through space), per-leg state
+ *                 (hip / knee / foot / step animation), heading +
+ *                 target_heading, and ui state. Static tables LEG_ANGLE
+ *                 and HIP_BODY_T encode each leg's angular bias and
+ *                 attachment point along the body.
+ *
+ * Rendering     : Painter's order — leg lines (femur + tibia
+ *                 alternating direction-glyph and `.` for chain look)
+ *                 → knee 'o' markers + foot '*'/'o' markers → body
+ *                 bead-fill (tail→head) → body 'O'/'o' joint markers
+ *                 → eye cluster `:>:` at the head perpendicular to
+ *                 heading. The eye cluster + chunky 'O' abdomen tip
+ *                 are the spider's visual signature, distinct from
+ *                 hexpod_tripod's plain rectangle chassis.
+ *
+ * Performance   : Variable timestep at render rate. Per frame: 6 IK
+ *                 solves (each one acos + atan2 + sin/cos), 6 step
+ *                 animation updates, body motion + trail push +
+ *                 4-joint trail sample. Microseconds total.
+ *
+ * References    :
+ *   Reynolds, "Steering Behaviors for Autonomous Characters" (1999) —
+ *     framework for the heading-toward-target interpolation pattern.
+ *     https://www.red3d.com/cwr/steer/
+ *   Wikipedia, "Inverse kinematics" — derivation of the 2-joint
+ *     law-of-cosines solver used in solve_ik().
+ *   Aristidou & Lasenby, "FABRIK: a fast, iterative solver" (2011) —
+ *     iterative IK contrast; for 2-joint chains the closed-form
+ *     law-of-cosines wins on simplicity and exactness.
+ *   Glenn Fiedler, "Fix Your Timestep!" (gafferongames.com) — case
+ *     for fixed-step (stiff sims); we don't qualify, hence variable.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The spider is a snake-like body with six pendulum legs hanging off
+ * it. Body: head walks autonomously, body trails along the path the
+ * head carved (trail-buffer FK). Legs: each one is a 2-bar linkage
+ * solved by trig; given the hip's current world position and the foot's
+ * planted target, the knee falls out of the law of cosines. Gait: a
+ * leg autonomously decides when to swing forward — when its foot has
+ * drifted too far from where it should be, OR the leg is stretched
+ * past its IK reach. A stability cap keeps at most three legs airborne
+ * at any instant so the support tripod is always intact.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Body : a four-bead chain that follows the trail of the head. Turning
+ *        bends the body just like a snake — the curving body is the
+ *        spider's identity vs hexpod_tripod's rigid rectangular chassis.
+ *
+ * Legs : six 2-bar linkages with hips anchored to the body. Each hip
+ *        attaches at a parametric position along the body (front pair
+ *        near the head, mid pair in the middle, rear pair near the
+ *        abdomen) with a lateral offset to either the left or right.
+ *
+ * Knees: knee position is a closed-form function of (hip, foot,
+ *        UPPER_LEN, LOWER_LEN, side) — left legs bend knee outward to
+ *        the left, right legs to the right. No iteration.
+ *
+ * Gait : an autonomous timer per leg. Each leg watches its own foot's
+ *        drift from the ideal step target; when it triggers, the foot
+ *        animates from old position to new along a smoothstep ease.
+ *        Stability cap: at most N_LEGS/2 = 3 legs may be airborne, so
+ *        ground contact is always at least 3-point.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  1. Measure dt = wall-clock since last frame; multiply by time_scale.
+ *  2. Steer: heading interpolates toward target_heading at TURN_RATE
+ *     rad/s, taking the short arc through ±π.
+ *  3. Translate body_joint[0] (head) along heading at move_speed; wrap
+ *     toroidally. Push the new head position into the circular trail.
+ *  4. Body: for each i in 1..N_BODY_SEGS, body_joint[i] = trail_sample
+ *     at arc-length i·BODY_SEG_LEN backward from the head.
+ *  5. Hips: each hip's world position = attachment point along the
+ *     body (interpolated from HIP_BODY_T) + lateral hip_dist on the
+ *     correct side (left/right by leg parity).
+ *  6. Stretch-snap: any foot now beyond IK reach (hip just moved a
+ *     screen-wrap teleport) gets snapped to its rest position.
+ *  7. Step gait: each non-stepping leg checks drift and stretch; if
+ *     above thresholds AND fewer than N_LEGS/2 legs already airborne,
+ *     trigger swing. Each stepping leg animates its foot via
+ *     smoothstep until step_t hits 1.0 and lands.
+ *  8. IK: solve law-of-cosines for every leg → knee position.
+ *  9. Render painter's order: leg lines → leg joint markers → body
+ *     bead-fill → body markers → head eye cluster + arrow.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *  Trail sample (s): walk trail backward summing segment distances
+ *                    until total ≥ s; interpolate inside the bracketing
+ *                    segment.
+ *
+ *  Heading lerp    : turn = clamp(target − heading, ±TURN_RATE · dt)
+ *                    (with target − heading wrapped to [−π, π])
+ *
+ *  Hip placement   : attach = lerp(body_joint[k], body_joint[k+1], frac)
+ *                    forward = norm(body_joint[k] − body_joint[k+1])
+ *                    left_normal = (−forward.y, forward.x)
+ *                    hip = attach + side · hip_dist · left_normal
+ *                    ( side = +1 left, −1 right )
+ *
+ *  2-joint IK      : dist  = clamp(|T − H|, |U − L| + 1, U + L − 1)
+ *                    base  = atan2(Ty − Hy, Tx − Hx)
+ *                    cos_h = (dist² + U² − L²) / (2 · dist · U)
+ *                    θ_hip = acos(clamp(cos_h, −1, 1))
+ *                    knee_angle = base ± θ_hip   ( + left, − right )
+ *                    knee  = H + U · (cos knee_angle, sin knee_angle)
+ *
+ *  Ideal foot      : forward = (cos heading, sin heading)
+ *                    dir     = rotate2d(forward, LEG_ANGLE[i])
+ *                    foot    = hip + dir · (UPPER + LOWER) · STEP_REACH_FACTOR
+ *
+ *  Step swing      : ease = smoothstep(step_t)
+ *                    foot = lerp(foot_old, step_target, ease)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  - IK clamp. The hip↔target distance is bounded into the reachable
+ *    annulus so acos never sees a value outside [−1, 1]. Without the
+ *    clamp, an over-stretched leg yields NaN and the chain vanishes.
+ *
+ *  - Toroidal wrap during walk. The body wraps with the trail buffer,
+ *    but planted feet do NOT — they were anchored to old coordinates.
+ *    The stretch-snap pass detects feet beyond reach and snaps them to
+ *    rest. The visible glitch is one frame of teleporting feet, then
+ *    the gait recovers.
+ *
+ *  - Stability cap. The "n_air < N_LEGS/2" gate prevents all legs from
+ *    swinging at once. At very high speeds, drift may exceed the
+ *    threshold for many legs simultaneously; they queue up and step in
+ *    turn, which makes the gait visibly hurry but never tip.
+ *
+ *  - Suspend / lid-close. dt clamped to 100 ms in main() so the body
+ *    doesn't teleport across the screen on resume.
+ *
+ *  - Glyph aliasing. The four ASCII line glyphs ('-', '\', '|', '/')
+ *    sample a continuous angle; near boundaries the glyph flickers
+ *    when a leg rotates through the threshold. Folding to [0°, 180°)
+ *    halves the boundary crossings.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  - Default config: spider walks rightward at 45 px/s. The body
+ *    visibly curves when steering (vs hexpod's rigid rotation). At any
+ *    frozen frame, exactly 3-or-fewer legs have '.' (swinging) and the
+ *    rest have '*' (planted) — never all six in the air.
+ *
+ *  - Press arrows → heading interpolates toward target; a 90° turn
+ *    takes ~0.6 s. Body bends through the turn following the head.
+ *
+ *  - Press space → everything freezes. Un-pause → motion resumes
+ *    exactly from where it was.
+ *
+ *  - Crank speed with `w` → step lookahead grows so feet land further
+ *    ahead of the hips. Gait keeps up via the per-leg drift trigger.
+ *
+ *  - Press `[` for slow time → motion stays smooth (variable timestep
+ *    guarantees this); press `]` for fast-forward.
+ *
+ *  - Cycle themes with `t` → spider colour changes; HUD stays bright
+ *    yellow regardless.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
-/*
- * M_PI is a POSIX extension, not standard C99/C11.
- * Define our own if the toolchain omits it.
- */
+/* M_PI is a POSIX extension, not standard C99/C11 — provide a fallback
+ * so the build never fails on strict-conformance toolchains. */
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -129,101 +252,123 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ===================================================================== */
 /* §1  config                                                             */
 /* ===================================================================== */
 
+/* All magic numbers live here. Never scatter literals through the code. */
 enum {
-    SIM_FPS_MIN     =  10,
-    SIM_FPS_DEFAULT =  60,
-    SIM_FPS_MAX     = 120,
-    SIM_FPS_STEP    =  10,
+    /* Render frame-rate target. Variable-timestep simulation, so the
+     * only thing this controls is the sleep cap at end of frame. */
+    TARGET_FPS    = 60,
 
-    HUD_COLS        =  96,
-    FPS_UPDATE_MS   = 500,
+    /* HUD layout. */
+    HUD_COLS      = 96,
+    FPS_UPDATE_MS = 500,
 
-    N_PAIRS         =   7,
-    HUD_PAIR        =   8,
-    N_THEMES        =  10,    /* selectable colour themes (cycle with 't') */
+    /* ncurses pair IDs.
+     *   1..N_PAIRS  body + legs gradient (themed)
+     *   8 PAIR_HUD   bright yellow status bar (theme-independent)
+     *   9 PAIR_HINT  bright cyan key hint    (theme-independent) */
+    N_PAIRS       = 7,
+    PAIR_HUD      = 8,
+    PAIR_HINT     = 9,
 
-    N_LEGS          =   6,    /* 3 per side                                */
-    N_BODY_SEGS     =   5,    /* body trail-buffer FK segments             */
-    TRAIL_CAP       = 1024,   /* circular trail buffer capacity            */
+    N_THEMES      = 10,    /* cycled with `t` */
+
+    /* Anatomy.
+     *   N_LEGS       = 6 (3 per side, three pairs at 60° angular spacing)
+     *   N_BODY_SEGS  = 4 → body has 5 joints, 80 px end-to-end at
+     *                  BODY_SEG_LEN = 20, matching hexpod_tripod's
+     *                  BODY_LEN. The body's identity is that it CURVES
+     *                  (multi-segment chain) rather than being rigid. */
+    N_LEGS        = 6,
+    N_BODY_SEGS   = 4,
+    TRAIL_CAP     = 1024,
 };
 
-/* Body motion */
-#define BODY_SEG_LEN      18.0f   /* px between consecutive body joints    */
-#define BODY_SPEED        45.0f   /* head translation speed, px/s          */
+/* Body geometry (px). Body curves through space — multi-segment chain. */
+#define BODY_SEG_LEN      20.0f   /* px between consecutive body joints     */
+#define BODY_SPEED        45.0f   /* head translation speed, px/s           */
 #define BODY_SPEED_MIN    10.0f
 #define BODY_SPEED_MAX   200.0f
-#define TURN_RATE          2.5f   /* rad/s — steering rate toward target heading */
+#define TURN_RATE          2.5f   /* rad/s — heading interpolation rate     */
 
-/* IK leg geometry */
-#define UPPER_LEN         55.0f   /* hip-to-knee segment length, px        */
-#define LOWER_LEN         48.0f   /* knee-to-foot segment length, px       */
+/* Leg geometry (px). Legs are 4× body length to read as long-limbed. */
+#define UPPER_LEN         56.0f   /* femur (hip → knee)                     */
+#define LOWER_LEN         50.0f   /* tibia (knee → foot)                    */
 
-/*
- * HIP_DIST_FACTOR — hip offset from body centerline as fraction of screen
- * pixel height.
- */
-#define HIP_DIST_FACTOR   0.07f
+/* Hip lateral offset from body centerline as a fraction of screen height.
+ * 4% gives ~2 cells of body width on a typical 30-row terminal — narrow
+ * silhouette, legs do most of the visual work. */
+#define HIP_DIST_FACTOR   0.04f
 
-/* Step / gait parameters */
-#define STEP_REACH_FACTOR 0.68f   /* ideal reach = (UPPER+LOWER)*factor    */
-#define STEP_TRIGGER_DIST 28.0f   /* px drift before step triggers         */
-#define MAX_STRETCH       65.0f   /* absolute max hip-to-foot before step  */
-#define STEP_DURATION     0.22f   /* seconds for one complete step         */
+/* Step gait parameters.
+ *   STEP_REACH_FACTOR — ideal foot reach as fraction of (UPPER + LOWER).
+ *   STEP_TRIGGER_DIST — px drift before a step is triggered.
+ *   MAX_STRETCH       — absolute hip→foot distance that forces a step.
+ *   STEP_DURATION     — seconds for one swing arc to complete. */
+#define STEP_REACH_FACTOR 0.68f
+#define STEP_TRIGGER_DIST 28.0f
+#define MAX_STRETCH       65.0f
+#define STEP_DURATION     0.22f
 
-/* Body bead fill step (px) */
-#define DRAW_STEP_PX      5.0f
-/*
- * DRAW_LEG_STEP_PX — step for leg direction-char lines.
- * Set to CELL_W (8 px) so each sample lands in a distinct terminal column:
- * exactly one char per cell traversed, no adjacent duplicates.
- */
-#define DRAW_LEG_STEP_PX  8.0f
+/* Direction-glyph step sizes. DRAW_STEP_PX < CELL_W (8) so the dense
+ * stamping never skips a column. */
+#define DRAW_STEP_PX      5.0f    /* body bead fill                         */
+#define DRAW_LEG_STEP_PX  8.0f    /* leg direction-char lines               */
 
-/* Timing */
+/* Eye cluster — perpendicular distance from head joint, in pixel space.
+ * 10 px ≈ 1.25 cells; eyes flank the head arrow at all four directions. */
+#define EYE_OFFSET_PX    10.0f
+
+/* Time scale — user-controlled simulation speed multiplier on `[/]`. */
+#define TIME_SCALE_DEFAULT  1.0f
+#define TIME_SCALE_MIN      0.25f
+#define TIME_SCALE_MAX      4.0f
+#define TIME_SCALE_STEP     1.5f
+
+/* Timing primitives — verbatim from framework.c. */
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
-#define TICK_NS(f)  (NS_PER_SEC / (f))
 
-/* Terminal cell dimensions (aspect-ratio bridge) */
-#define CELL_W   8    /* physical pixels per terminal column */
-#define CELL_H  16    /* physical pixels per terminal row    */
+/* Terminal cell dimensions (aspect-ratio bridge). */
+#define CELL_W   8
+#define CELL_H  16
 
 /*
- * LEG_ANGLE[i] — angle (radians) added to body_forward to get the ideal
- * step direction for leg i, measured in body-local space.
- * Legs 0/1 = front pair, 2/3 = mid pair, 4/5 = rear pair.
- * Left legs (even): angle is positive (left side).
- * Right legs (odd): angle is negative (right side).
+ * LEG_ANGLE[i] — angle (radians) added to body forward to give leg i's
+ * ideal step direction in body-local space.
+ *
+ * Three pairs at 60° angular spacing — each pair clearly distinct, no
+ * overlap. Left legs (even index) get positive angle; right legs the
+ * negative mirror.
  */
 static const float LEG_ANGLE[N_LEGS] = {
-     0.55f,   /* leg 0 front-left  */
-    -0.55f,   /* leg 1 front-right */
-     1.57f,   /* leg 2 mid-left    (straight out) */
-    -1.57f,   /* leg 3 mid-right   */
-     2.60f,   /* leg 4 rear-left   */
-    -2.60f,   /* leg 5 rear-right  */
+     0.6f,    /* 0 front-LEFT   ~ 34° forward + outward */
+    -0.6f,    /* 1 front-RIGHT  */
+     1.57f,   /* 2 mid-LEFT     90° straight out        */
+    -1.57f,   /* 3 mid-RIGHT    */
+     2.5f,    /* 4 rear-LEFT    ~143° rear + outward    */
+    -2.5f,    /* 5 rear-RIGHT   */
 };
 
 /*
- * HIP_BODY_T[i] — parametric position (0=head, 1=tail) along the body
- * centerline where each hip is attached.
+ * HIP_BODY_T[i] — parametric position along the body where each hip
+ * attaches (0 = head joint, 1 = tail joint). Three pairs spread evenly
+ * along the (4-segment) body so the front/mid/rear anchor points are
+ * spatially distinct — the eye reads three legs per side, not all six
+ * stacked at one point.
  */
 static const float HIP_BODY_T[N_LEGS] = {
-    0.15f,    /* leg 0 front-left  */
-    0.15f,    /* leg 1 front-right */
-    0.50f,    /* leg 2 mid-left    */
-    0.50f,    /* leg 3 mid-right   */
-    0.85f,    /* leg 4 rear-left   */
-    0.85f,    /* leg 5 rear-right  */
+    0.20f, 0.20f,   /* front pair — near the head */
+    0.50f, 0.50f,   /* mid pair   — body centre   */
+    0.80f, 0.80f,   /* rear pair  — near the tail */
 };
 
 /* ===================================================================== */
@@ -233,13 +378,13 @@ static const float HIP_BODY_T[N_LEGS] = {
 static int64_t clock_ns(void)
 {
     struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
+    clock_gettime(CLOCK_MONOTONIC, &t);    /* never goes backward */
     return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
 static void clock_sleep_ns(int64_t ns)
 {
-    if (ns <= 0) return;
+    if (ns <= 0) return;                   /* over-budget frame: skip */
     struct timespec req = {
         .tv_sec  = (time_t)(ns / NS_PER_SEC),
         .tv_nsec = (long)  (ns % NS_PER_SEC),
@@ -248,71 +393,51 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color — themed arachnid palette                                    */
+/* §3  color — 10 themes + spec-fixed HUD pairs                          */
 /* ===================================================================== */
 
 /*
- * Theme — one runtime colour scheme.
- *   col[0..6] → pairs 1–7:
- *     col[0-2]  body gradient (tail=1 → head=3)
- *     col[3-4]  leg segments  (upper=4, lower=5)
- *     col[5]    planted foot  (pair 6, bold '*')
- *     col[6]    stepping foot (pair 7, dim 'o')
- *   hud         pair 8 (status bars)
+ * Per-theme palette. Pairs 1..7 set by the theme; HUD/HINT pairs are
+ * theme-independent (CLAUDE.md HUD spec).
+ *
+ * Pair semantics:
+ *   col[0..2] body gradient (tail → head)  — col[2] is the main spider colour
+ *   col[3..4] leg segments (upper / lower) — same colour as body in practice
+ *   col[5]    planted foot '*'              — bright accent
+ *   col[6]    swinging foot '.'             — dim trailing accent
+ *
+ * All entries sit in the bright half of the 256-colour space:
+ *   - cube colours: ≥ 24 (brightness rule)
+ *   - grayscale:    ≥ 240 (the 232-239 zone vanishes under A_DIM)
  */
 typedef struct {
     const char *name;
-    int col[N_PAIRS];   /* 7 entries: pairs 1–7 */
-    int hud;
+    int col[N_PAIRS];   /* pairs 1..7 */
 } Theme;
 
-/*
- * THEMES[10] — ten selectable palettes.  Press 't' to cycle.
- *
- *  0  Arachnid — dark red body + olive legs (original)
- *  1  Scarlet  — crimson body + red legs
- *  2  Toxic    — dark green body + lime legs
- *  3  Ocean    — deep navy body + aqua legs
- *  4  Nova     — violet body + pink legs
- *  5  Ember    — dark amber body + orange legs
- *  6  Aurora   — teal body + gold legs
- *  7  Ghost    — charcoal body + white legs
- *  8  Fire     — red body + flame legs
- *  9  Neon     — violet body + hot-pink legs
- */
-/*
- * Only col[2] (pair 3), col[5] (pair 6), col[6] (pair 7) and hud are
- * used by the renderer.  col[0/1/3/4] are set consistently but ignored.
- *
- *   col[2]  = main spider colour  (body + all legs)
- *   col[5]  = planted foot        (bright accent, should contrast well)
- *   col[6]  = stepping foot       (near-black / very dim ghost)
- */
 static const Theme THEMES[N_THEMES] = {
-    {"Arachnid",{52, 88,124, 58, 64, 70,236}, 226},  /* red + olive foot    */
-    {"Scarlet", {88,124,160, 52, 88,196,240}, 208},  /* crimson + red foot  */
-    {"Toxic",   {22, 28, 34, 28, 34, 82,236},  46},  /* green + lime foot   */
-    {"Ocean",   {17, 18, 20, 18, 27, 51,236},  51},  /* navy + cyan foot    */
-    {"Nova",    {54, 93,129, 93,129,165,240}, 213},  /* violet + pink foot  */
-    {"Ember",   {52, 94,130,130,130,208,240}, 208},  /* amber + orange foot */
-    {"Aurora",  {22, 28, 35, 28, 35,221,240}, 221},  /* teal + gold foot    */
-    {"Ghost",   {234,238,242,238,242,254,240},252},  /* grey + white foot   */
-    {"Fire",    {52, 88,196, 88,124,226,240}, 226},  /* red + yellow foot   */
-    {"Neon",    {57, 93,201, 93,129,201,240}, 197},  /* violet + pink foot  */
+    /* name        body gradient   legs      foot   ghost */
+    {"Arachnid",{ 52,  88, 124,  58,  64,  70, 240}},
+    {"Scarlet", { 88, 124, 160,  52,  88, 196, 240}},
+    {"Toxic",   { 24,  28,  34,  28,  34,  82, 240}},
+    {"Ocean",   { 24,  25,  27,  33,  39,  51, 240}},
+    {"Nova",    { 54,  93, 129,  93, 129, 165, 240}},
+    {"Ember",   { 52,  94, 130, 130, 130, 208, 240}},
+    {"Aurora",  { 24,  29,  35,  35,  71, 221, 240}},
+    {"Ghost",   {240, 244, 248, 244, 248, 254, 246}},
+    {"Fire",    { 52,  88, 196,  88, 124, 226, 240}},
+    {"Neon",    { 57,  93, 201,  93, 129, 201, 240}},
 };
 
-/*
- * theme_apply() — rebind pairs 1–7 and HUD pair to the given theme index.
- * Safe to call after start_color() — ncurses picks up the new palette
- * on the next draw cycle without reinitialising the display.
- */
+/* theme_apply — re-bind body/leg pairs (1..N_PAIRS) to chosen theme.
+ * HUD/HINT pairs are NEVER touched — they're theme-independent. */
 static void theme_apply(int idx)
 {
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
     if (COLORS < 256) return;
     const Theme *t = &THEMES[idx];
     for (int p = 0; p < N_PAIRS; p++)
-        init_pair(p + 1, t->col[p], COLOR_BLACK);
-    init_pair(HUD_PAIR, t->hud, COLOR_BLACK);
+        init_pair(p + 1, t->col[p], -1);
 }
 
 static void color_init(int initial_theme)
@@ -323,15 +448,20 @@ static void color_init(int initial_theme)
     if (COLORS >= 256) {
         theme_apply(initial_theme);
     } else {
-        init_pair(1, COLOR_RED,    COLOR_BLACK);
-        init_pair(2, COLOR_RED,    COLOR_BLACK);
-        init_pair(3, COLOR_RED,    COLOR_BLACK);
-        init_pair(4, COLOR_GREEN,  COLOR_BLACK);
-        init_pair(5, COLOR_GREEN,  COLOR_BLACK);
-        init_pair(6, COLOR_GREEN,  COLOR_BLACK);
-        init_pair(7, COLOR_BLACK,  COLOR_BLACK);
-        init_pair(8, COLOR_YELLOW, COLOR_BLACK);
+        /* 8-color fallback */
+        init_pair(1, COLOR_RED,    -1);
+        init_pair(2, COLOR_RED,    -1);
+        init_pair(3, COLOR_RED,    -1);
+        init_pair(4, COLOR_GREEN,  -1);
+        init_pair(5, COLOR_GREEN,  -1);
+        init_pair(6, COLOR_GREEN,  -1);
+        init_pair(7, COLOR_WHITE,  -1);
     }
+
+    /* HUD pairs are theme-independent — bright yellow status, bright
+     * cyan hint, both on default bg so they overlay any theme. */
+    init_pair(PAIR_HUD,  COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ===================================================================== */
@@ -339,9 +469,10 @@ static void color_init(int initial_theme)
 /* ===================================================================== */
 
 /*
- * All physics positions are in a square pixel space (1 unit = 1 physical px).
- * Only at draw time do we convert to terminal cell coordinates.
- * formula: cell = floor(px / CELL_DIM + 0.5)  (round to nearest)
+ * All entity positions live in square pixel space (1 unit = 1 px).
+ * Only at draw time do these helpers convert to cell coordinates,
+ * undoing the 8:16 cell aspect ratio.
+ *   cell = floor(px / CELL_DIM + 0.5)    — nearest-integer rounding
  */
 static inline int px_to_cell_x(float px)
 {
@@ -356,106 +487,90 @@ static inline int px_to_cell_y(float py)
 /* §5  entity — Spider                                                    */
 /* ===================================================================== */
 
-/* ── §5a  vec2 helpers ─────────────────────────────────────────────── */
-
+/* Vec2 — 2-D position vector in pixel space.
+ * x increases eastward; y increases downward (terminal convention). */
 typedef struct { float x, y; } Vec2;
+
+/* ── §5a  vec2 + small helpers ──────────────────────────────────────── */
 
 static inline float clampf(float v, float lo, float hi)
 {
     return v < lo ? lo : v > hi ? hi : v;
 }
 
-static inline Vec2 vec2_add(Vec2 a, Vec2 b)   { return (Vec2){ a.x+b.x, a.y+b.y }; }
-static inline Vec2 vec2_sub(Vec2 a, Vec2 b)   { return (Vec2){ a.x-b.x, a.y-b.y }; }
-static inline Vec2 vec2_scale(Vec2 a, float s) { return (Vec2){ a.x*s, a.y*s }; }
-static inline Vec2 vec2_lerp(Vec2 a, Vec2 b, float t)
-{
-    return (Vec2){ a.x + (b.x-a.x)*t, a.y + (b.y-a.y)*t };
-}
+static inline Vec2 vec2_add  (Vec2 a, Vec2 b)
+{ return (Vec2){ a.x + b.x, a.y + b.y }; }
 
-static inline float vec2_len(Vec2 a)
-{
-    return sqrtf(a.x*a.x + a.y*a.y);
-}
+static inline Vec2 vec2_sub  (Vec2 a, Vec2 b)
+{ return (Vec2){ a.x - b.x, a.y - b.y }; }
+
+static inline Vec2 vec2_scale(Vec2 a, float s)
+{ return (Vec2){ a.x * s, a.y * s }; }
+
+static inline Vec2 vec2_lerp (Vec2 a, Vec2 b, float t)
+{ return (Vec2){ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t }; }
+
+static inline float vec2_len (Vec2 v)
+{ return sqrtf(v.x * v.x + v.y * v.y); }
+
 static inline float vec2_dist(Vec2 a, Vec2 b)
+{ return vec2_len(vec2_sub(a, b)); }
+
+/* vec2_norm — unit vector. Zero-length input returns (1, 0); the
+ * specific direction is arbitrary but lets callers use the result
+ * without NaN propagation. */
+static inline Vec2 vec2_norm(Vec2 v)
 {
-    return vec2_len(vec2_sub(b, a));
-}
-static inline Vec2 vec2_norm(Vec2 a)
-{
-    float len = vec2_len(a);
-    if (len < 1e-6f) return (Vec2){1.0f, 0.0f};
-    return (Vec2){ a.x/len, a.y/len };
+    float len = vec2_len(v);
+    if (len < 1e-6f) return (Vec2){ 1.0f, 0.0f };
+    return (Vec2){ v.x / len, v.y / len };
 }
 
-/*
- * smoothstep(t) — cubic ease-in/ease-out in [0,1].
- * smoothstep(0)=0, smoothstep(1)=1, derivative=0 at both ends.
- * Produces a smooth S-curve for leg step animation.
- */
+/* smoothstep — cubic ease-in/ease-out on [0, 1]. Used for foot swing. */
 static inline float smoothstep(float t)
 {
     t = clampf(t, 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
 }
 
-/*
- * rotate2d() — rotate vector (x,y) by angle θ (radians) around origin.
- * Standard 2D rotation matrix: [cosθ -sinθ; sinθ cosθ].
- */
+/* rotate2d — rotate v by `angle` rad (screen space: +y = down). */
 static inline Vec2 rotate2d(Vec2 v, float angle)
 {
     float c = cosf(angle), s = sinf(angle);
-    return (Vec2){ v.x*c - v.y*s, v.x*s + v.y*c };
+    return (Vec2){ v.x * c - v.y * s, v.x * s + v.y * c };
 }
 
-/* ── §5b  trail helpers ─────────────────────────────────────────────── */
+/* ── Spider state ──────────────────────────────────────────────────── */
 
-/*
- * Spider — complete simulation state.
- *
- * BODY FK:
- *   Same trail-buffer approach as snake_forward_kinematics.c.
- *   body_joint[0] = thorax/head; body_joint[1..N_BODY_SEGS] = body segments.
- *   trail[] records the per-tick position history of body_joint[0].
- *
- * LEGS:
- *   6 legs, each described by: hip (world-space root attached to body),
- *   knee (mid-joint, computed by IK), foot_pos (current planted target).
- *   During a step: foot animates from foot_old to step_target over STEP_DURATION s.
- *
- * PREV arrays: snapshot from start of tick for sub-tick alpha interpolation.
- */
 typedef struct {
-    /* ── body ── */
+    /* body — trail-buffer FK */
     Vec2  trail[TRAIL_CAP];
     int   trail_head, trail_count;
-    Vec2  body_joint[N_BODY_SEGS + 1];
-    Vec2  prev_body[N_BODY_SEGS + 1];
-    float heading;          /* current direction (rad, 0=right)    */
-    float target_heading;   /* desired direction set by arrow keys  */
-    float move_speed;
+    Vec2  body_joint[N_BODY_SEGS + 1];     /* [0]=head, [N]=tail        */
 
-    /* ── legs ── */
-    Vec2  hip[N_LEGS];          /* world-space hip root (updated from body) */
-    Vec2  knee[N_LEGS];         /* mid-joint computed by 2-joint IK          */
-    Vec2  foot_pos[N_LEGS];     /* planted foot (IK target)                  */
-    Vec2  foot_old[N_LEGS];     /* foot at step-start (for lerp)             */
-    Vec2  step_target[N_LEGS];  /* where foot steps to                       */
-    bool  stepping[N_LEGS];     /* is leg currently in swing phase?          */
-    float step_t[N_LEGS];       /* step progress 0→1                         */
+    /* body kinematics */
+    float heading;            /* current direction (rad, 0=+x)          */
+    float target_heading;     /* desired direction (steered toward)     */
+    float move_speed;         /* px/s along heading                     */
 
-    /* ── render prev snapshots ── */
-    Vec2  prev_hip[N_LEGS];
-    Vec2  prev_knee[N_LEGS];
-    Vec2  prev_foot[N_LEGS];
+    /* per-leg state */
+    Vec2  hip[N_LEGS];        /* world hip from body joint + lateral    */
+    Vec2  knee[N_LEGS];       /* IK-solved mid-joint                    */
+    Vec2  foot_pos[N_LEGS];   /* current planted target                  */
+    Vec2  foot_old[N_LEGS];   /* foot at swing start — lerp anchor       */
+    Vec2  step_target[N_LEGS];/* where this foot is stepping to          */
+    bool  stepping[N_LEGS];   /* swing animation active                  */
+    float step_t[N_LEGS];     /* swing progress in [0, 1]                */
 
-    float hip_dist;   /* hip offset from body centerline (px), set at init  */
+    /* derived */
+    float hip_dist;           /* lateral offset, px (set from screen)    */
+
+    /* ui state */
     bool  paused;
-    int   theme_idx;  /* current colour theme [0, N_THEMES)                 */
+    int   theme_idx;
 } Spider;
 
-/* trail push/at/sample — identical logic to snake_forward_kinematics.c */
+/* ── §5b  trail (push / at / sample) ────────────────────────────────── */
 
 static void trail_push(Spider *sp, Vec2 pos)
 {
@@ -470,8 +585,10 @@ static inline Vec2 trail_at(const Spider *sp, int k)
 }
 
 /*
- * trail_sample() — position at arc-length dist px behind the head.
- * Walks the trail accumulating segment lengths; interpolates the crossing.
+ * trail_sample — interpolated position at arc-length `dist` from head.
+ * Walks the trail accumulating Euclidean distance until the running
+ * total crosses `dist`, then linearly interpolates inside the
+ * bracketing segment. The body literally retraces the head's path.
  */
 static Vec2 trail_sample(const Spider *sp, float dist)
 {
@@ -482,11 +599,11 @@ static Vec2 trail_sample(const Spider *sp, float dist)
         Vec2  b   = trail_at(sp, k);
         float dx  = b.x - a.x;
         float dy  = b.y - a.y;
-        float seg = sqrtf(dx*dx + dy*dy);
+        float seg = sqrtf(dx * dx + dy * dy);
 
         if (accum + seg >= dist) {
             float t = (dist - accum) / (seg > 1e-4f ? seg : 1e-4f);
-            return (Vec2){ a.x + dx*t, a.y + dy*t };
+            return (Vec2){ a.x + dx * t, a.y + dy * t };
         }
         accum += seg;
         a      = b;
@@ -496,27 +613,25 @@ static Vec2 trail_sample(const Spider *sp, float dist)
 
 /* ── §5c  body motion ──────────────────────────────────────────────── */
 
-/*
- * move_body() — steer heading toward target_heading + translate body_joint[0].
- *
- *   1. Normalise angular diff to [−π, π] (short-arc) and clamp to TURN_RATE.
- *   2. Translate body_joint[0] along current heading at move_speed.
- *   3. Toroidal wrap at screen pixel boundaries.
- *   4. Push body_joint[0] into the trail.
- */
-static void move_body(Spider *sp, float dt, int cols, int rows)
+/* steer_heading — interpolate heading toward target_heading at TURN_RATE.
+ * Diff wrapped to [−π, π] so a 180° flip takes the short arc. */
+static void steer_heading(Spider *sp, float dt)
 {
     float diff = sp->target_heading - sp->heading;
     while (diff >  (float)M_PI) diff -= 2.0f * (float)M_PI;
     while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
     sp->heading += clampf(diff, -TURN_RATE * dt, TURN_RATE * dt);
+}
 
-    float wpx = (float)(cols * CELL_W);
-    float hpx = (float)(rows * CELL_H);
-
+/* translate_body — advance body_joint[0] along heading; toroidal wrap;
+ * push the new position into the trail buffer. */
+static void translate_body(Spider *sp, float dt, int cols, int rows)
+{
     sp->body_joint[0].x += sp->move_speed * cosf(sp->heading) * dt;
     sp->body_joint[0].y += sp->move_speed * sinf(sp->heading) * dt;
 
+    float wpx = (float)(cols * CELL_W);
+    float hpx = (float)(rows * CELL_H);
     if (sp->body_joint[0].x <  0.0f) sp->body_joint[0].x += wpx;
     if (sp->body_joint[0].x >= wpx)  sp->body_joint[0].x -= wpx;
     if (sp->body_joint[0].y <  0.0f) sp->body_joint[0].y += hpx;
@@ -525,234 +640,206 @@ static void move_body(Spider *sp, float dt, int cols, int rows)
     trail_push(sp, sp->body_joint[0]);
 }
 
-/* ── §5d  body joints ──────────────────────────────────────────────── */
+/* ── §5d  body joints (trail-buffer FK) ──────────────────────────── */
 
-/*
- * compute_body_joints() — place body_joint[1..N_BODY_SEGS] via trail sampling.
- * body_joint[0] is already updated by move_body().
- */
+/* compute_body_joints — place body_joint[1..N] by arc-length sampling
+ * along the trail. body_joint[0] is set by translate_body(). */
 static void compute_body_joints(Spider *sp)
 {
-    for (int i = 1; i <= N_BODY_SEGS; i++) {
+    for (int i = 1; i <= N_BODY_SEGS; i++)
         sp->body_joint[i] = trail_sample(sp, (float)i * BODY_SEG_LEN);
-    }
 }
 
-/* ── §5e  hip placement ─────────────────────────────────────────────── */
+/* ── §5e  hip placement ──────────────────────────────────────────── */
+
+/* body_local_forward — local body forward direction at parametric
+ * position t along the body. Smoothed by a single-segment difference. */
+static Vec2 body_local_forward(const Spider *sp, int seg_idx)
+{
+    if (seg_idx + 1 > N_BODY_SEGS)
+        return (Vec2){ cosf(sp->heading), sinf(sp->heading) };
+    return vec2_norm(vec2_sub(sp->body_joint[seg_idx],
+                              sp->body_joint[seg_idx + 1]));
+}
 
 /*
- * compute_hips() — place each hip in world space.
+ * compute_hips — place each hip in world space.
  *
- * Each hip attaches to the body at parametric position HIP_BODY_T[i]
- * (0=head, 1=tail) and is offset laterally by hip_dist px perpendicular
- * to the body's local forward direction.
- *
- * Body forward at attachment point = normalise(body_joint[k] - body_joint[k+1]).
- * Body normal (perpendicular, pointing left) = rotate forward by +90°.
- * Left legs (even index): hip = attach_pt + normal * hip_dist
- * Right legs (odd index): hip = attach_pt - normal * hip_dist
+ * Each hip attaches to the body at HIP_BODY_T[i] (head→tail) and is
+ * offset laterally by hip_dist perpendicular to the local body
+ * forward direction (left for even-index legs, right for odd).
  */
 static void compute_hips(Spider *sp)
 {
     for (int i = 0; i < N_LEGS; i++) {
-        /* Find attachment point along body by interpolating body joints */
-        float t_body   = HIP_BODY_T[i] * (float)N_BODY_SEGS;
-        int   seg_idx  = (int)t_body;
+        /* Attachment point along the body */
+        float t_body  = HIP_BODY_T[i] * (float)N_BODY_SEGS;
+        int   seg_idx = (int)t_body;
         if (seg_idx >= N_BODY_SEGS) seg_idx = N_BODY_SEGS - 1;
-        float frac     = t_body - (float)seg_idx;
+        float frac    = t_body - (float)seg_idx;
+        Vec2  attach  = vec2_lerp(sp->body_joint[seg_idx],
+                                  sp->body_joint[seg_idx + 1], frac);
 
-        Vec2 attach = vec2_lerp(sp->body_joint[seg_idx],
-                                sp->body_joint[seg_idx + 1], frac);
+        Vec2  fwd       = body_local_forward(sp, seg_idx);
+        Vec2  left_norm = (Vec2){ -fwd.y, fwd.x };
+        float side      = (i % 2 == 0) ? 1.0f : -1.0f;   /* even=left */
 
-        /* Local forward direction at this body point */
-        Vec2 fwd;
-        if (seg_idx + 1 <= N_BODY_SEGS) {
-            fwd = vec2_norm(vec2_sub(sp->body_joint[seg_idx],
-                                     sp->body_joint[seg_idx + 1]));
-        } else {
-            fwd = (Vec2){ cosf(sp->heading), sinf(sp->heading) };
-        }
-
-        /* Left normal: rotate forward +90° → (-fy, fx) */
-        Vec2 left_norm = (Vec2){ -fwd.y, fwd.x };
-
-        /* Even legs = left side, odd legs = right side */
-        float side = (i % 2 == 0) ? 1.0f : -1.0f;
-        sp->hip[i] = vec2_add(attach, vec2_scale(left_norm, side * sp->hip_dist));
+        sp->hip[i] = vec2_add(attach,
+                              vec2_scale(left_norm, side * sp->hip_dist));
     }
 }
 
-/* ── §5f  2-joint analytical IK ────────────────────────────────────── */
+/* ── §5f  2-joint analytical IK ──────────────────────────────────── */
 
 /*
- * solve_ik() — 2-joint analytical IK for one leg.
+ * solve_ik — 2-joint analytical IK via law of cosines. See KEY FORMULAS.
  *
- * Given: hip position H, foot target T, upper/lower segment lengths,
- *        and whether this is a left or right leg (determines knee bend).
+ * The hip→target distance is clamped just inside the reachable annulus
+ * [|U − L| + 1, U + L − 1] so acos never receives a value outside
+ * [−1, 1]. Without the clamp, an over-stretched leg would yield NaN.
  *
- * ALGORITHM (law of cosines):
- *
- *  Step 1: Compute distance vector and clamped reach distance.
- *    dx = T.x - H.x,  dy = T.y - H.y
- *    dist = sqrtf(dx²+dy²)
- *    Clamp dist to [|UPPER-LOWER|+1, UPPER+LOWER-1] to avoid acos domain error
- *    (dist > UPPER+LOWER = over-extended, dist < |UPPER-LOWER| = folded in on itself).
- *
- *  Step 2: Law of cosines → angle at hip.
- *    In the triangle (hip, knee, foot):
- *      side_a = LOWER (knee→foot), side_b = UPPER (hip→knee), side_c = dist (hip→foot)
- *    cos(angle_at_hip) = (dist² + UPPER² - LOWER²) / (2 * dist * UPPER)
- *    angle_at_hip = acosf(clamped value)
- *
- *  Step 3: Base angle from hip toward target.
- *    base_angle = atan2f(dy, dx)
- *
- *  Step 4: Knee direction = base_angle ± angle_at_hip.
- *    Left legs: knee bends outward (left = positive normal side)
- *      → add angle_at_hip (rotates knee counter-clockwise, out to the left)
- *    Right legs: subtract angle_at_hip (rotates knee clockwise, out to the right)
- *
- *  Step 5: Place knee.
- *    knee.x = hip.x + UPPER * cos(knee_angle)
- *    knee.y = hip.y + UPPER * sin(knee_angle)
- *
- * Output: writes knee position into *knee_out.
- * The foot is always the target T (end-effector reaches target exactly).
+ * Left and right legs use opposite signs of θ_hip so knees splay outward
+ * from the body centerline.
  */
 static void solve_ik(Vec2 hip, Vec2 target, bool is_left, Vec2 *knee_out)
 {
     float dx   = target.x - hip.x;
     float dy   = target.y - hip.y;
-    float dist = sqrtf(dx*dx + dy*dy);
+    float dist = sqrtf(dx * dx + dy * dy);
 
-    /* Clamp dist to reachable range (avoid acos NaN) */
-    float min_r = fabsf(UPPER_LEN - LOWER_LEN) + 1.0f;
-    float max_r = UPPER_LEN + LOWER_LEN - 1.0f;
-    dist = clampf(dist, min_r, max_r);
+    dist = clampf(dist,
+                  fabsf(UPPER_LEN - LOWER_LEN) + 1.0f,
+                  UPPER_LEN + LOWER_LEN - 1.0f);
 
-    /* Reconstruct a clamped target direction if dist changed */
-    float base_angle = atan2f(dy, dx);
-
-    /* Law of cosines: angle at the hip vertex */
-    float cos_hip = (dist*dist + UPPER_LEN*UPPER_LEN - LOWER_LEN*LOWER_LEN)
+    float base    = atan2f(dy, dx);
+    float cos_h   = (dist * dist + UPPER_LEN * UPPER_LEN
+                                  - LOWER_LEN * LOWER_LEN)
                     / (2.0f * dist * UPPER_LEN);
-    cos_hip = clampf(cos_hip, -1.0f, 1.0f);
-    float angle_hip = acosf(cos_hip);
+    float ah      = acosf(clampf(cos_h, -1.0f, 1.0f));
+    float ka      = is_left ? (base + ah) : (base - ah);
 
-    /* Knee bends outward from body center */
-    float knee_angle = is_left ? (base_angle + angle_hip)
-                                : (base_angle - angle_hip);
-
-    knee_out->x = hip.x + UPPER_LEN * cosf(knee_angle);
-    knee_out->y = hip.y + UPPER_LEN * sinf(knee_angle);
+    knee_out->x = hip.x + UPPER_LEN * cosf(ka);
+    knee_out->y = hip.y + UPPER_LEN * sinf(ka);
 }
 
-/* ── §5g  step logic ────────────────────────────────────────────────── */
+/* ── §5g  step gait ──────────────────────────────────────────────── */
 
 /*
- * compute_ideal_foot() — where leg i wants its foot to be when not stepping.
- *
- * ideal_foot = hip + STEP_REACH × (unit vector in step direction)
- * step direction = body forward direction rotated by LEG_ANGLE[i].
- * Body forward = (cos(heading), sin(heading)).
+ * compute_ideal_foot — where leg i wants its foot to be when not stepping.
+ * Body forward × LEG_ANGLE[i] rotation gives the leg's angular bias;
+ * STEP_REACH_FACTOR sets how far out from the hip the foot should land.
  */
 static Vec2 compute_ideal_foot(const Spider *sp, int i)
 {
-    Vec2 fwd   = (Vec2){ cosf(sp->heading), sinf(sp->heading) };
-    Vec2 dir   = rotate2d(fwd, LEG_ANGLE[i]);
+    Vec2  fwd   = (Vec2){ cosf(sp->heading), sinf(sp->heading) };
+    Vec2  dir   = rotate2d(fwd, LEG_ANGLE[i]);
     float reach = (UPPER_LEN + LOWER_LEN) * STEP_REACH_FACTOR;
     return vec2_add(sp->hip[i], vec2_scale(dir, reach));
 }
 
+/* count_airborne — number of legs currently in swing phase. */
+static int count_airborne(const Spider *sp)
+{
+    int n = 0;
+    for (int i = 0; i < N_LEGS; i++)
+        if (sp->stepping[i]) n++;
+    return n;
+}
+
+/* snap_overstretched_foot — recover after toroidal wrap or sharp turn.
+ * If a foot is now beyond IK reach (e.g., because the body just wrapped
+ * across the screen), force it to its rest position. Returns true if
+ * the leg was airborne and got snapped (caller must decrement n_air). */
+static bool snap_overstretched_foot(Spider *sp, int i)
+{
+    if (vec2_dist(sp->foot_pos[i], sp->hip[i]) <= UPPER_LEN + LOWER_LEN - 2.0f)
+        return false;
+
+    bool was_airborne   = sp->stepping[i];
+    sp->foot_pos[i]     = compute_ideal_foot(sp, i);
+    sp->foot_old[i]     = sp->foot_pos[i];
+    sp->step_target[i]  = sp->foot_pos[i];
+    sp->stepping[i]     = false;
+    sp->step_t[i]       = 0.0f;
+    return was_airborne;
+}
+
+/* maybe_trigger_step — for a non-stepping leg, decide whether to swing.
+ * Triggers if foot has drifted from ideal OR is over-stretched. Gated
+ * by the n_air < N_LEGS/2 stability cap. Returns true if a swing started. */
+static bool maybe_trigger_step(Spider *sp, int i, int n_air)
+{
+    if (sp->stepping[i] || n_air >= N_LEGS / 2) return false;
+
+    Vec2  ideal   = compute_ideal_foot(sp, i);
+    float drift   = vec2_dist(sp->foot_pos[i], ideal);
+    float stretch = vec2_dist(sp->foot_pos[i], sp->hip[i]);
+    if (drift <= STEP_TRIGGER_DIST && stretch <= MAX_STRETCH) return false;
+
+    sp->stepping[i]    = true;
+    sp->step_t[i]      = 0.0f;
+    sp->foot_old[i]    = sp->foot_pos[i];
+    sp->step_target[i] = ideal;
+    return true;
+}
+
+/* advance_swing — for a stepping leg, animate the foot along its arc.
+ * Returns true if the swing finished this frame (caller decrements n_air). */
+static bool advance_swing(Spider *sp, int i, float dt)
+{
+    sp->step_t[i] += dt / STEP_DURATION;
+    if (sp->step_t[i] >= 1.0f) {
+        sp->step_t[i]   = 1.0f;
+        sp->foot_pos[i] = sp->step_target[i];
+        sp->stepping[i] = false;
+        return true;
+    }
+    float ease     = smoothstep(sp->step_t[i]);
+    sp->foot_pos[i] = vec2_lerp(sp->foot_old[i], sp->step_target[i], ease);
+    return false;
+}
+
 /*
- * update_steps() — independent per-leg step scheduling.
- *
- * Each leg checks its own drift / stretch and steps as soon as it is ready.
- * Stability constraint: at most N_LEGS/2 (3) legs in the air simultaneously,
- * guaranteeing 3-point ground contact at all times.
- *
- * Contrast with the old alternating-tripod logic: that held the entire
- * opposite tripod (3 legs) frozen while one tripod stepped.  Here any leg
- * is free to swing the moment it is ready AND the in-air count is below 3.
- * The result is fluid, organic-looking movement: legs step at slightly
- * different times driven by their individual geometry, not a group timer.
+ * update_steps — one tick of the per-leg autonomous gait.
+ * Each leg checks its own state; the n_air cap keeps the support
+ * tripod stable (≥ 3 feet always planted).
  */
 static void update_steps(Spider *sp, float dt)
 {
-    /* Count how many legs are currently airborne */
-    int n_air = 0;
-    for (int i = 0; i < N_LEGS; i++)
-        if (sp->stepping[i]) n_air++;
+    int n_air = count_airborne(sp);
 
     for (int i = 0; i < N_LEGS; i++) {
-
-        /* ── Screen-wrap snap ────────────────────────────────────────── */
-        float snap_stretch = vec2_dist(sp->foot_pos[i], sp->hip[i]);
-        if (snap_stretch > UPPER_LEN + LOWER_LEN - 2.0f) {
-            sp->foot_pos[i]    = compute_ideal_foot(sp, i);
-            sp->foot_old[i]    = sp->foot_pos[i];
-            sp->step_target[i] = sp->foot_pos[i];
-            if (sp->stepping[i]) { sp->stepping[i] = false; n_air--; }
-            sp->step_t[i]      = 0.0f;
-            solve_ik(sp->hip[i], sp->foot_pos[i], (i % 2 == 0), &sp->knee[i]);
-            continue;
+        if (snap_overstretched_foot(sp, i)) n_air--;
+        else if (sp->stepping[i]) {
+            if (advance_swing(sp, i, dt))   n_air--;
         }
-
-        if (!sp->stepping[i]) {
-            Vec2  ideal   = compute_ideal_foot(sp, i);
-            float drift   = vec2_dist(sp->foot_pos[i], ideal);
-            float stretch = vec2_dist(sp->foot_pos[i], sp->hip[i]);
-
-            /* Step if foot has drifted too far OR leg is over-stretched,
-             * but only when below the in-air cap (stability guarantee). */
-            if ((drift > STEP_TRIGGER_DIST || stretch > MAX_STRETCH)
-                    && n_air < N_LEGS / 2) {
-                sp->stepping[i]    = true;
-                sp->step_t[i]      = 0.0f;
-                sp->foot_old[i]    = sp->foot_pos[i];
-                sp->step_target[i] = ideal;
-                n_air++;
-            }
-        } else {
-            /* Advance step animation */
-            sp->step_t[i] += dt / STEP_DURATION;
-            if (sp->step_t[i] >= 1.0f) {
-                sp->step_t[i]   = 1.0f;
-                sp->foot_pos[i] = sp->step_target[i];
-                sp->stepping[i] = false;
-                n_air--;
-            } else {
-                float ease = smoothstep(sp->step_t[i]);
-                sp->foot_pos[i] = vec2_lerp(sp->foot_old[i],
-                                             sp->step_target[i], ease);
-            }
+        else {
+            if (maybe_trigger_step(sp, i, n_air)) n_air++;
         }
     }
 
-    /* Recompute IK for all legs */
+    /* Solve IK for every leg from its current (planted or arcing) foot. */
     for (int i = 0; i < N_LEGS; i++)
         solve_ik(sp->hip[i], sp->foot_pos[i], (i % 2 == 0), &sp->knee[i]);
 }
 
-/* ── §5h  rendering ─────────────────────────────────────────────────── */
+/* ── §5h  rendering helpers ──────────────────────────────────────── */
 
-/*
- * head_glyph() — directional arrow for spider thorax head.
- */
+/* head_glyph — directional arrow ('>' '<' '^' 'v') for heading (rad). */
 static chtype head_glyph(float heading)
 {
     float deg = heading * (180.0f / (float)M_PI);
     while (deg <    0.0f) deg += 360.0f;
     while (deg >= 360.0f) deg -= 360.0f;
-
-    if (deg <  45.0f || deg >= 315.0f) return (chtype)'>';
-    if (deg < 135.0f)                   return (chtype)'v';
-    if (deg < 225.0f)                   return (chtype)'<';
-    return                              (chtype)'^';
+    if (deg <  45.0f || deg >= 315.0f) return (chtype)(unsigned char)'>';
+    if (deg < 135.0f)                  return (chtype)(unsigned char)'v';
+    if (deg < 225.0f)                  return (chtype)(unsigned char)'<';
+    return                             (chtype)(unsigned char)'^';
 }
 
 /*
- * seg_glyph() — direction char for a vector (dx,dy): - \ | /
+ * seg_glyph — best ASCII direction glyph for vector (dx, dy).
+ * dy negated before atan2f so the angle matches visual direction.
  */
 static chtype seg_glyph(float dx, float dy)
 {
@@ -761,46 +848,42 @@ static chtype seg_glyph(float dx, float dy)
     if (deg <    0.0f) deg += 360.0f;
     if (deg >= 180.0f) deg -= 180.0f;
 
-    if (deg < 22.5f || deg >= 157.5f) return (chtype)'-';
-    if (deg < 67.5f)                   return (chtype)'\\';
-    if (deg < 112.5f)                  return (chtype)'|';
-    return                             (chtype)'/';
+    if (deg < 22.5f || deg >= 157.5f) return (chtype)(unsigned char)'-';
+    if (deg < 67.5f)                   return (chtype)(unsigned char)'\\';
+    if (deg < 112.5f)                  return (chtype)(unsigned char)'|';
+    return                             (chtype)(unsigned char)'/';
 }
 
 /*
- * draw_leg_line() — segmented-limb line for a leg segment.
+ * draw_leg_line — segmented-limb line for a leg segment.
  *
- * Alternates direction char and '.' so each segment reads as a chain:
- *   horizontal  →  -.-.-.-
- *   vertical    →  |.|.|.|
- *   diagonal    →  \.\.\.\  or  /./././
- * This gives an organic arthropod-limb feel in pure ASCII.
+ * Alternates direction-glyph and '.' so each segment reads as a chain
+ * (e.g., '-.-.-.-' horizontal, '|.|.|.|' vertical). This gives the
+ * arthropod-limb feel that distinguishes legs from body bead-fill.
  */
-static void draw_leg_line(WINDOW *w,
-                          Vec2 a, Vec2 b,
-                          int pair, attr_t attr,
-                          int cols, int rows)
+static void draw_leg_line(WINDOW *w, Vec2 a, Vec2 b,
+                          int pair, attr_t attr, int cols, int rows)
 {
     float dx  = b.x - a.x;
     float dy  = b.y - a.y;
-    float len = sqrtf(dx*dx + dy*dy);
+    float len = sqrtf(dx * dx + dy * dy);
     if (len < 0.1f) return;
 
-    chtype glyph  = seg_glyph(dx, dy);
-    int    nsteps = (int)ceilf(len / DRAW_LEG_STEP_PX) + 1;
+    chtype glyph   = seg_glyph(dx, dy);
+    int    nsteps  = (int)ceilf(len / DRAW_LEG_STEP_PX) + 1;
     int    prev_cx = -9999, prev_cy = -9999;
     int    phase   = 0;
 
     for (int t = 0; t <= nsteps; t++) {
         float u  = (float)t / (float)nsteps;
-        int   cx = px_to_cell_x(a.x + dx*u);
-        int   cy = px_to_cell_y(a.y + dy*u);
+        int   cx = px_to_cell_x(a.x + dx * u);
+        int   cy = px_to_cell_y(a.y + dy * u);
 
         if (cx == prev_cx && cy == prev_cy) continue;
         prev_cx = cx; prev_cy = cy;
         if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
 
-        chtype ch = (phase & 1) ? (chtype)'.' : glyph;
+        chtype ch = (phase & 1) ? (chtype)(unsigned char)'.' : glyph;
         wattron(w, COLOR_PAIR(pair) | attr);
         mvwaddch(w, cy, cx, ch);
         wattroff(w, COLOR_PAIR(pair) | attr);
@@ -809,144 +892,152 @@ static void draw_leg_line(WINDOW *w,
 }
 
 /*
- * draw_line_beads() — stamp bead char 'o' along a segment.
- * Used for the body centerline; joint node markers drawn on top.
+ * draw_body_beads — stamp 'o' along the body centerline. Used for
+ * body bead-fill (joint markers drawn on top in a second pass). Caller
+ * supplies the dedup cursor so it persists across all body segments.
  */
-static void draw_line_beads(WINDOW *w,
-                             Vec2 a, Vec2 b,
-                             int pair, attr_t attr,
-                             int cols, int rows,
-                             int *prev_cx, int *prev_cy)
+static void draw_body_beads(WINDOW *w, Vec2 a, Vec2 b,
+                            int pair, attr_t attr, int cols, int rows,
+                            int *prev_cx, int *prev_cy)
 {
     float dx  = b.x - a.x;
     float dy  = b.y - a.y;
-    float len = sqrtf(dx*dx + dy*dy);
+    float len = sqrtf(dx * dx + dy * dy);
     if (len < 0.1f) return;
 
     int nsteps = (int)ceilf(len / DRAW_STEP_PX) + 1;
 
     for (int t = 0; t <= nsteps; t++) {
         float u  = (float)t / (float)nsteps;
-        int   cx = px_to_cell_x(a.x + dx*u);
-        int   cy = px_to_cell_y(a.y + dy*u);
+        int   cx = px_to_cell_x(a.x + dx * u);
+        int   cy = px_to_cell_y(a.y + dy * u);
 
         if (cx == *prev_cx && cy == *prev_cy) continue;
         *prev_cx = cx; *prev_cy = cy;
         if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
 
         wattron(w, COLOR_PAIR(pair) | attr);
-        mvwaddch(w, cy, cx, (chtype)'o');
+        mvwaddch(w, cy, cx, (chtype)(unsigned char)'o');
         wattroff(w, COLOR_PAIR(pair) | attr);
     }
 }
 
-/*
- * render_spider() — draw the complete spider frame.
- *
- * Two distinct rendering styles for visual clarity:
- *
- *   LEGS  — direction chars (\ | / -)  so each limb reads as a crisp angled
- *            line.  Knee node 'o' marks the articulation.
- *            Foot: '*' planted (pair 6 bold), 'o' stepping (pair 7 dim).
- *
- *   BODY  — bead chain (o 0 . fill + '0' node markers) identical to the
- *            other FK/IK demos.  Head gets a directional arrow glyph.
- *
- * Draw order (back to front):
- *   1. Legs  — direction-char lines: hip→knee, knee→foot
- *   2. Legs  — knee 'o' + foot '*'/'o' node markers
- *   3. Body  — bead fill tail→head
- *   4. Body  — '0' node markers
- *   5. Head  — directional arrow
- */
-static void render_spider(const Spider *sp, WINDOW *w,
-                          int cols, int rows, float alpha)
+/* mark_cell — stamp one glyph at a pixel position with bounds check. */
+static void mark_cell(WINDOW *w, Vec2 p, chtype glyph,
+                      int pair, attr_t attr, int cols, int rows)
 {
-    /* Build alpha-interpolated positions */
-    Vec2 r_body[N_BODY_SEGS + 1];
-    for (int i = 0; i <= N_BODY_SEGS; i++) {
-        r_body[i] = vec2_lerp(sp->prev_body[i], sp->body_joint[i], alpha);
-    }
+    int cx = px_to_cell_x(p.x);
+    int cy = px_to_cell_y(p.y);
+    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+    wattron(w, COLOR_PAIR(pair) | attr);
+    mvwaddch(w, cy, cx, glyph);
+    wattroff(w, COLOR_PAIR(pair) | attr);
+}
 
-    Vec2 r_hip[N_LEGS], r_knee[N_LEGS], r_foot[N_LEGS];
+/* ── §5i  render_spider ──────────────────────────────────────────── */
+
+/* draw_legs — pass 1: femur and tibia direction-glyph lines for all 6 legs. */
+static void draw_legs(const Spider *sp, WINDOW *w, int cols, int rows)
+{
     for (int i = 0; i < N_LEGS; i++) {
-        r_hip[i]  = vec2_lerp(sp->prev_hip[i],  sp->hip[i],      alpha);
-        r_knee[i] = vec2_lerp(sp->prev_knee[i], sp->knee[i],     alpha);
-        r_foot[i] = vec2_lerp(sp->prev_foot[i], sp->foot_pos[i], alpha);
-    }
-
-    /* 1. Legs — Unicode box-drawing lines (─ ╲ │ ╱), bold for crispness */
-    for (int i = 0; i < N_LEGS; i++) {
-        draw_leg_line(w, r_hip[i],  r_knee[i], 3, A_BOLD, cols, rows);
-        draw_leg_line(w, r_knee[i], r_foot[i], 3, A_BOLD, cols, rows);
-    }
-
-    /* 2. Leg joint nodes on top */
-    for (int i = 0; i < N_LEGS; i++) {
-        /* Knee: 'o' bold — joint node, contrasts with '.' beads on limb */
-        int kx = px_to_cell_x(r_knee[i].x);
-        int ky = px_to_cell_y(r_knee[i].y);
-        if (kx >= 0 && kx < cols && ky >= 0 && ky < rows) {
-            wattron(w, COLOR_PAIR(3) | A_BOLD);
-            mvwaddch(w, ky, kx, (chtype)'o');
-            wattroff(w, COLOR_PAIR(3) | A_BOLD);
-        }
-
-        /* Foot: '*' planted (pair 6 bold), '.' stepping (pair 7 dim) */
-        int fx = px_to_cell_x(r_foot[i].x);
-        int fy = px_to_cell_y(r_foot[i].y);
-        if (fx >= 0 && fx < cols && fy >= 0 && fy < rows) {
-            if (sp->stepping[i]) {
-                wattron(w, COLOR_PAIR(7) | A_DIM);
-                mvwaddch(w, fy, fx, (chtype)'.');
-                wattroff(w, COLOR_PAIR(7) | A_DIM);
-            } else {
-                wattron(w, COLOR_PAIR(6) | A_BOLD);
-                mvwaddch(w, fy, fx, (chtype)'*');
-                wattroff(w, COLOR_PAIR(6) | A_BOLD);
-            }
-        }
-    }
-
-    /* 3. Body bead fill — tail→head, pair 3 A_BOLD */
-    int prev_cx = -9999, prev_cy = -9999;
-    for (int i = N_BODY_SEGS - 1; i >= 0; i--) {
-        draw_line_beads(w, r_body[i+1], r_body[i],
-                        3, A_BOLD, cols, rows, &prev_cx, &prev_cy);
-    }
-
-    /* 4. Body node markers: '0' at each joint, pair 3 bold */
-    for (int i = N_BODY_SEGS; i >= 1; i--) {
-        int bx = px_to_cell_x(r_body[i].x);
-        int by = px_to_cell_y(r_body[i].y);
-        if (bx < 0 || bx >= cols || by < 0 || by >= rows) continue;
-        wattron(w, COLOR_PAIR(3) | A_BOLD);
-        mvwaddch(w, by, bx, (chtype)'0');
-        wattroff(w, COLOR_PAIR(3) | A_BOLD);
-    }
-
-    /* 5. Head glyph — directional arrow, pair 3 A_BOLD */
-    int hx = px_to_cell_x(r_body[0].x);
-    int hy = px_to_cell_y(r_body[0].y);
-    if (hx >= 0 && hx < cols && hy >= 0 && hy < rows) {
-        wattron(w, COLOR_PAIR(3) | A_BOLD);
-        mvwaddch(w, hy, hx, head_glyph(sp->heading));
-        wattroff(w, COLOR_PAIR(3) | A_BOLD);
+        draw_leg_line(w, sp->hip[i],  sp->knee[i],     3, A_BOLD, cols, rows);
+        draw_leg_line(w, sp->knee[i], sp->foot_pos[i], 3, A_BOLD, cols, rows);
     }
 }
 
+/* draw_leg_joints — pass 2: knee 'o' + foot ('*' planted, '.' airborne). */
+static void draw_leg_joints(const Spider *sp, WINDOW *w, int cols, int rows)
+{
+    for (int i = 0; i < N_LEGS; i++) {
+        mark_cell(w, sp->knee[i], (chtype)(unsigned char)'o',
+                  3, A_BOLD, cols, rows);
+
+        if (sp->stepping[i])
+            mark_cell(w, sp->foot_pos[i], (chtype)(unsigned char)'.',
+                      7, A_DIM, cols, rows);
+        else
+            mark_cell(w, sp->foot_pos[i], (chtype)(unsigned char)'*',
+                      6, A_BOLD, cols, rows);
+    }
+}
+
+/* draw_body_lines — pass 3: bead fill along body centerline, tail→head.
+ * Tail-to-head order means head-area glyphs win where the body
+ * crosses itself in tight curves. */
+static void draw_body_lines(const Spider *sp, WINDOW *w, int cols, int rows)
+{
+    int prev_cx = -9999, prev_cy = -9999;
+    for (int i = N_BODY_SEGS - 1; i >= 0; i--) {
+        draw_body_beads(w, sp->body_joint[i + 1], sp->body_joint[i],
+                        3, A_BOLD, cols, rows, &prev_cx, &prev_cy);
+    }
+}
+
+/* draw_body_nodes — pass 4: chunky 'O' at the abdomen tip, slimmer 'o'
+ * at mid-body joints. The size taper distinguishes the spider's body
+ * from hexpod_tripod's uniform '+' rectangle markers. */
+static void draw_body_nodes(const Spider *sp, WINDOW *w, int cols, int rows)
+{
+    for (int i = N_BODY_SEGS; i >= 1; i--) {
+        chtype glyph = (i == N_BODY_SEGS)
+                     ? (chtype)(unsigned char)'O'   /* abdomen tip */
+                     : (chtype)(unsigned char)'o';  /* mid-body    */
+        mark_cell(w, sp->body_joint[i], glyph, 3, A_BOLD, cols, rows);
+    }
+}
+
+/*
+ * draw_head — pass 5: eye cluster ': arrow :' at the head joint.
+ *
+ * Eyes sit at perpendicular offset (-sinθ, cosθ) · EYE_OFFSET_PX from
+ * the head, so they always flank the directional arrow correctly:
+ *   east/west motion → eyes above and below
+ *   north/south motion → eyes left and right
+ * The 3-glyph cluster is the spider's visual signature, distinct from
+ * hexpod_tripod's plain '@' body centre.
+ */
+static void draw_head(const Spider *sp, WINDOW *w, int cols, int rows)
+{
+    Vec2  head   = sp->body_joint[0];
+    float perp_x = -sinf(sp->heading) * EYE_OFFSET_PX;
+    float perp_y =  cosf(sp->heading) * EYE_OFFSET_PX;
+
+    Vec2 eye_l = { head.x - perp_x, head.y - perp_y };
+    Vec2 eye_r = { head.x + perp_x, head.y + perp_y };
+
+    /* Dim ':' eyes — read as eyes, not as solid markers. */
+    mark_cell(w, eye_l, (chtype)(unsigned char)':', 3, A_DIM, cols, rows);
+    mark_cell(w, eye_r, (chtype)(unsigned char)':', 3, A_DIM, cols, rows);
+
+    /* Bold directional arrow dominates between the eyes. */
+    mark_cell(w, head, head_glyph(sp->heading), 3, A_BOLD, cols, rows);
+}
+
+/*
+ * render_spider — orchestrator. Painter's order back-to-front so node
+ * markers always sit on top of line glyphs:
+ *   legs (lines)     →  leg joints  →  body fill
+ *   body nodes       →  head cluster
+ */
+static void render_spider(const Spider *sp, WINDOW *w, int cols, int rows)
+{
+    draw_legs       (sp, w, cols, rows);
+    draw_leg_joints (sp, w, cols, rows);
+    draw_body_lines (sp, w, cols, rows);
+    draw_body_nodes (sp, w, cols, rows);
+    draw_head       (sp, w, cols, rows);
+}
+
 /* ===================================================================== */
-/* §6  scene                                                              */
+/* §6  scene — thin wrapper around Spider                                */
 /* ===================================================================== */
 
 typedef struct { Spider spider; } Scene;
 
 /*
- * scene_init() — place spider at screen center with pre-populated trail.
- *
- * Body starts at 50% width, 50% height, heading slightly south-east.
- * Trail pre-filled straight backward (same technique as snake FK scene_init).
- * Feet placed at ideal positions around the initial body pose.
+ * scene_init — place spider at screen centre with a pre-populated trail
+ * (so the body is fully extended on frame 1) and feet planted at their
+ * ideal rest positions.
  */
 static void scene_init(Scene *sc, int cols, int rows)
 {
@@ -954,17 +1045,17 @@ static void scene_init(Scene *sc, int cols, int rows)
     Spider *sp = &sc->spider;
 
     sp->move_speed     = BODY_SPEED;
-    sp->heading        = 0.0f;   /* start facing right */
+    sp->heading        = 0.0f;
     sp->target_heading = 0.0f;
     sp->hip_dist       = (float)(rows * CELL_H) * HIP_DIST_FACTOR;
-    sp->paused     = false;
-    sp->theme_idx  = 0;
+    sp->paused         = false;
+    sp->theme_idx      = 0;
 
-    /* Place head at screen center */
     sp->body_joint[0].x = (float)(cols * CELL_W) * 0.50f;
     sp->body_joint[0].y = (float)(rows * CELL_H) * 0.50f;
 
-    /* Pre-fill trail straight backward */
+    /* Pre-fill trail one pixel at a time straight backward so the body
+     * appears fully extended on the very first rendered frame. */
     float bx = cosf(sp->heading + (float)M_PI);
     float by = sinf(sp->heading + (float)M_PI);
     for (int k = 0; k < TRAIL_CAP; k++) {
@@ -974,64 +1065,42 @@ static void scene_init(Scene *sc, int cols, int rows)
     sp->trail_head  = 0;
     sp->trail_count = TRAIL_CAP;
 
-    /* Compute initial body joints */
     compute_body_joints(sp);
     compute_hips(sp);
 
-    /* Solve initial IK and place feet at ideal positions */
+    /* Plant all feet at their ideal positions and solve IK. */
     for (int i = 0; i < N_LEGS; i++) {
         sp->foot_pos[i]    = compute_ideal_foot(sp, i);
         sp->foot_old[i]    = sp->foot_pos[i];
         sp->step_target[i] = sp->foot_pos[i];
         sp->stepping[i]    = false;
         sp->step_t[i]      = 0.0f;
-
-        bool is_left = (i % 2 == 0);
-        solve_ik(sp->hip[i], sp->foot_pos[i], is_left, &sp->knee[i]);
+        solve_ik(sp->hip[i], sp->foot_pos[i], (i % 2 == 0), &sp->knee[i]);
     }
-
-    /* Snapshot prev arrays for alpha lerp (no-op on first frame) */
-    memcpy(sp->prev_body, sp->body_joint, sizeof sp->body_joint);
-    memcpy(sp->prev_hip,  sp->hip,        sizeof sp->hip);
-    memcpy(sp->prev_knee, sp->knee,       sizeof sp->knee);
-    memcpy(sp->prev_foot, sp->foot_pos,   sizeof sp->foot_pos);
 }
 
 /*
- * scene_tick() — one fixed-step physics update.
+ * scene_tick — one variable-timestep simulation step. dt is wall-clock
+ * delta scaled by the caller's time_scale.
  *
- * ORDER:
- *   1. Save prev snapshots (before any physics).
- *   2. If paused, return early (lerp freezes cleanly).
- *   3. Move body (heading integration + wrap + trail push).
- *   4. Compute body joints from updated trail.
- *   5. Update hip positions from new body joints.
- *   6. Update step logic and advance step animations.
- *   7. Solve IK for all legs.
+ * Order: steer, translate, body joints, hips, gait + IK. Each step
+ * depends on the previous (hips need updated body, IK needs hips, etc).
  */
 static void scene_tick(Scene *sc, float dt, int cols, int rows)
 {
     Spider *sp = &sc->spider;
+    if (sp->paused) return;
 
-    /* Step 1 — snapshot prev */
-    memcpy(sp->prev_body, sp->body_joint, sizeof sp->body_joint);
-    memcpy(sp->prev_hip,  sp->hip,        sizeof sp->hip);
-    memcpy(sp->prev_knee, sp->knee,       sizeof sp->knee);
-    memcpy(sp->prev_foot, sp->foot_pos,   sizeof sp->foot_pos);
-
-    if (sp->paused) return;   /* Step 2 */
-
-    move_body(sp, dt, cols, rows);         /* Step 3 */
-    compute_body_joints(sp);               /* Step 4 */
-    compute_hips(sp);                      /* Step 5 */
-    update_steps(sp, dt);                  /* Steps 6 + 7 */
+    steer_heading      (sp, dt);
+    translate_body     (sp, dt, cols, rows);
+    compute_body_joints(sp);
+    compute_hips       (sp);
+    update_steps       (sp, dt);
 }
 
-static void scene_draw(const Scene *sc, WINDOW *w,
-                       int cols, int rows, float alpha, float dt_sec)
+static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows)
 {
-    (void)dt_sec;
-    render_spider(&sc->spider, w, cols, rows, alpha);
+    render_spider(&sc->spider, w, cols, rows);
 }
 
 /* ===================================================================== */
@@ -1040,6 +1109,8 @@ static void scene_draw(const Scene *sc, WINDOW *w,
 
 typedef struct { int cols, rows; } Screen;
 
+/* The non-obvious call here is typeahead(-1): without it, ncurses peeks
+ * at stdin during output writes, which can tear frames mid-update. */
 static void screen_init(Screen *s)
 {
     initscr();
@@ -1062,57 +1133,51 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-/*
- * Count how many legs are currently in the stepping tripod A vs B,
- * used to compute step rate for the HUD display.
- */
-static float count_step_hz(const Spider *sp, float sim_fps)
+/* heading_arrow — '>' '<' '^' 'v' for the HUD readout. */
+static const char *heading_arrow(float heading)
 {
-    int n_step = 0;
-    for (int i = 0; i < N_LEGS; i++) {
-        if (sp->stepping[i]) n_step++;
-    }
-    /* rough estimate: n_stepping / STEP_DURATION gives steps/sec */
-    (void)sim_fps;
-    return (float)n_step / STEP_DURATION;
-}
-
-static void screen_draw(Screen *s, const Scene *sc,
-                        double fps, int sim_fps,
-                        float alpha, float dt_sec)
-{
-    erase();
-    scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
-
-    const Spider *sp = &sc->spider;
-    float step_hz = count_step_hz(sp, (float)sim_fps);
-
-    char buf[HUD_COLS + 1];
-    float deg = sp->heading * (180.0f / (float)M_PI);
+    float deg = heading * (180.0f / (float)M_PI);
     while (deg <    0.0f) deg += 360.0f;
     while (deg >= 360.0f) deg -= 360.0f;
-    const char *dir_arrow =
-        (deg < 45.0f || deg >= 315.0f) ? ">" :
-        (deg < 135.0f)                  ? "v" :
-        (deg < 225.0f)                  ? "<" : "^";
+    if (deg <  45.0f || deg >= 315.0f) return ">";
+    if (deg < 135.0f)                   return "v";
+    if (deg < 225.0f)                   return "<";
+    return                              "^";
+}
 
+/*
+ * screen_draw — compose one full frame:
+ *   erase → spider → status (top right) → key hint (bottom).
+ *
+ * HUD pairs are spec-fixed (PAIR_HUD = bright yellow, PAIR_HINT = bright
+ * cyan, both A_BOLD on default bg) so they read against any theme.
+ */
+static void screen_draw(Screen *s, const Scene *sc,
+                        double fps, float time_scale)
+{
+    erase();
+    scene_draw(sc, stdscr, s->cols, s->rows);
+
+    const Spider *sp = &sc->spider;
+    char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
-             " IK-SPIDER  dir:%s  spd:%.0f  step:%.0fHz  [%s]  %s  %.1ffps  %dHz ",
-             dir_arrow, sp->move_speed, step_hz,
+             " IK-SPIDER  dir:%s  spd:%.0f  theme:%s  %.2fx  %.1ffps  %s ",
+             heading_arrow(sp->heading), sp->move_speed,
              THEMES[sp->theme_idx].name,
-             sp->paused ? "PAUSED" : "crawling",
-             fps, sim_fps);
+             time_scale, fps,
+             sp->paused ? "PAUSED" : "crawling");
 
     int hx = s->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(HUD_PAIR) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(HUD_PAIR) | A_BOLD);
 
-    attron(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, hx, "%s", buf);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(s->rows - 1, 0,
-             " q:quit  spc:pause  arrows:steer  w/s:speed  t:theme  [/]:Hz ");
-    attroff(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+             " q:quit  spc:pause  arrows:steer  w/s:speed  t:theme  [/]:time ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
@@ -1124,17 +1189,25 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 typedef struct {
     Scene                 scene;
     Screen                screen;
-    int                   sim_fps;
+    float                 time_scale;
     volatile sig_atomic_t running;
     volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal(int sig)   { (void)sig; g_app.running     = 0; }
+static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
 
+/* atexit safety net — endwin() called on every exit path. */
+static void cleanup(void) { endwin(); }
+
+/*
+ * app_do_resize — handle a pending SIGWINCH.
+ * Body position is clamped into the new bounds; hip_dist is recomputed
+ * for the new screen height. Theme is re-applied because some
+ * terminals re-derive COLORS on resize.
+ */
 static void app_do_resize(App *app)
 {
     screen_resize(&app->screen);
@@ -1143,40 +1216,33 @@ static void app_do_resize(App *app)
     float   hpx = (float)(app->screen.rows * CELL_H);
     if (sp->body_joint[0].x >= wpx) sp->body_joint[0].x = wpx - 1.0f;
     if (sp->body_joint[0].y >= hpx) sp->body_joint[0].y = hpx - 1.0f;
-    /* Recompute hip_dist for new terminal size; preserve theme */
     sp->hip_dist = hpx * HIP_DIST_FACTOR;
-    app->need_resize = 0;
-    /* Re-apply theme in case ncurses reset pairs during resize */
     theme_apply(sp->theme_idx);
+    app->need_resize = 0;
 }
 
 /*
- * app_handle_key() — process one keypress; return false to quit.
- *
- * KEY MAP:
- *   q / Q / ESC   quit
- *   space         pause / resume
- *   arrow keys    steer — set target_heading; body turns gradually
- *   w / s         speed ×1.25 / ÷1.25
- *   ] / [         sim Hz + / - SIM_FPS_STEP
+ * app_handle_key — dispatch one keypress; return false to quit.
+ * Arrow keys set target_heading; the body interpolates toward it at
+ * TURN_RATE rad/s in steer_heading().
  */
 static bool app_handle_key(App *app, int ch)
 {
     Spider *sp = &app->scene.spider;
     switch (ch) {
-    case 'q': case 'Q': case 27: return false;
+    case 'q': case 'Q': case 27 /* ESC */: return false;
     case ' ': sp->paused = !sp->paused; break;
 
     case KEY_RIGHT: sp->target_heading =  0.0f;                break;
-    case KEY_DOWN:  sp->target_heading =  (float)M_PI * 0.5f; break;
-    case KEY_LEFT:  sp->target_heading =  (float)M_PI;        break;
-    case KEY_UP:    sp->target_heading = -(float)M_PI * 0.5f; break;
+    case KEY_DOWN:  sp->target_heading =  (float)M_PI * 0.5f;  break;
+    case KEY_LEFT:  sp->target_heading =  (float)M_PI;         break;
+    case KEY_UP:    sp->target_heading = -(float)M_PI * 0.5f;  break;
 
-    case 'w':
+    case 'w': case 'W':
         sp->move_speed *= 1.25f;
         if (sp->move_speed > BODY_SPEED_MAX) sp->move_speed = BODY_SPEED_MAX;
         break;
-    case 's':
+    case 's': case 'S':
         sp->move_speed /= 1.25f;
         if (sp->move_speed < BODY_SPEED_MIN) sp->move_speed = BODY_SPEED_MIN;
         break;
@@ -1187,12 +1253,12 @@ static bool app_handle_key(App *app, int ch)
         break;
 
     case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
+        app->time_scale *= TIME_SCALE_STEP;
+        if (app->time_scale > TIME_SCALE_MAX) app->time_scale = TIME_SCALE_MAX;
         break;
     case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
+        app->time_scale /= TIME_SCALE_STEP;
+        if (app->time_scale < TIME_SCALE_MIN) app->time_scale = TIME_SCALE_MIN;
         break;
 
     default: break;
@@ -1200,90 +1266,44 @@ static bool app_handle_key(App *app, int ch)
     return true;
 }
 
-/* ─────────────────────────────────────────────────────────────────────
- * main() — fixed-step accumulator game loop (identical structure to framework.c §8)
- *
- * ① RESIZE CHECK   — handle SIGWINCH before touching ncurses
- * ② MEASURE dt     — wall-clock since last frame, capped at 100 ms
- * ③ ACCUMULATOR    — fire scene_tick() at sim_fps Hz
- * ④ ALPHA          — sub-tick interpolation factor for smooth render
- * ⑤ FPS COUNTER    — smoothed over 500 ms windows
- * ⑥ FRAME CAP      — sleep to cap render at 60 fps
- * ⑦ DRAW + PRESENT — erase → scene_draw → HUD → doupdate
- * ⑧ DRAIN INPUT    — consume all queued keypresses
- * ───────────────────────────────────────────────────────────────────── */
+/*
+ * main — variable-timestep render loop. Per-frame phases:
+ *   ① INPUT      drain getch() — a press takes effect on this frame
+ *   ② RESIZE     handle pending SIGWINCH before touching ncurses
+ *   ③ MEASURE dt wall-clock ns since last frame; capped at 100 ms
+ *   ④ TICK       one simulation step at exactly dt · time_scale
+ *   ⑤ FPS        smoothed over a 500 ms window
+ *   ⑥ RENDER     erase → draw → wnoutrefresh → doupdate
+ *   ⑦ FRAME CAP  sleep so total frame ≈ 1/TARGET_FPS
+ */
 int main(void)
 {
-    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+    srand((unsigned int)(clock_ns() & 0xFFFFFFFFU));
     atexit(cleanup);
 
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+    App *app        = &g_app;
+    app->running    = 1;
+    app->time_scale = TIME_SCALE_DEFAULT;
 
     screen_init(&app->screen);
     scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
+    const int64_t target_ns = NS_PER_SEC / TARGET_FPS;
+
+    int64_t last_time   = clock_ns();
     int64_t fps_accum   = 0;
-    int     frame_count = 0;
+    int     fps_frames  = 0;
     double  fps_display = 0.0;
 
     while (app->running) {
 
-        /* ── ① resize ─────────────────────────────────────────────── */
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
+        int64_t frame_start = clock_ns();
 
-        /* ── ② dt ─────────────────────────────────────────────────── */
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        /* ── ③ fixed-step accumulator ─────────────────────────────── */
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec,
-                       app->screen.cols, app->screen.rows);
-            sim_accum -= tick_ns;
-        }
-
-        /* ── ④ alpha ──────────────────────────────────────────────── */
-        float alpha = (float)sim_accum / (float)tick_ns;
-
-        /* ── ⑤ fps counter ────────────────────────────────────────── */
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        /* ── ⑥ frame cap — sleep before render ───────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        /* ── ⑦ draw + present ─────────────────────────────────────── */
-        screen_draw(&app->screen, &app->scene,
-                    fps_display, app->sim_fps,
-                    alpha, dt_sec);
-        screen_present();
-
-        /* ── ⑧ drain all pending input ───────────────────────────── */
+        /* ① drain input */
         int ch;
         while ((ch = getch()) != ERR) {
             if (!app_handle_key(app, ch)) {
@@ -1291,6 +1311,43 @@ int main(void)
                 break;
             }
         }
+        if (!app->running) break;
+
+        /* ② resize */
+        if (app->need_resize) {
+            app_do_resize(app);
+            last_time = clock_ns();
+        }
+
+        /* ③ measure dt */
+        int64_t dt_ns = frame_start - last_time;
+        last_time     = frame_start;
+        if (dt_ns > 100 * NS_PER_MS) dt_ns = 100 * NS_PER_MS;
+        float dt = (float)dt_ns / (float)NS_PER_SEC;
+
+        /* ④ tick */
+        scene_tick(&app->scene, dt * app->time_scale,
+                   app->screen.cols, app->screen.rows);
+
+        /* ⑤ fps counter */
+        fps_frames++;
+        fps_accum += dt_ns;
+        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+            fps_display = (double)fps_frames
+                        / ((double)fps_accum / (double)NS_PER_SEC);
+            fps_frames = 0;
+            fps_accum  = 0;
+        }
+
+        /* ⑥ render */
+        screen_draw(&app->screen, &app->scene,
+                    fps_display, app->time_scale);
+        screen_present();
+
+        /* ⑦ frame cap — sleep so total frame ≈ target_ns. The math is
+         *    just (target − elapsed); no spurious +dt terms. */
+        int64_t elapsed = clock_ns() - frame_start;
+        clock_sleep_ns(target_ns - elapsed);
     }
 
     screen_free(&app->screen);

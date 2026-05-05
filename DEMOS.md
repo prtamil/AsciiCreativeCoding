@@ -335,7 +335,6 @@ fractals; cycle-through-triangles for Delaunay.
 | `snake_inverse_kinematics` | FABRIK inverse kinematics snake — iterative forward/backward reach solver |
 | `fk_centipede` | Centipede — trail-buffer FK body, stateless sinusoidal FK legs, contralateral antiphase gait |
 | `fk_tentacle_forest` | Tentacle forest — pure stateless sinusoidal FK; per-tentacle phase/frequency/amplitude parameters |
-| `fk_medusa` | Medusa jellyfish — radial bell-oscillation FK + cascaded trailing tentacle FK chains |
 | `walking_robot` | Procedural bipedal walk cycle — sinusoidal FK, 2-joint analytical IK stance, foot contact locking, body sway, shadow ellipse, COM projection, motion trails, ground grid |
 | `moving_jump_spring_leg_robot` | Spring-leg jumping robot — spring-mass leg compression/release, aerial phase, landing absorption |
 | `perlin_terrain_bot` | Self-balancing wheel bot — inverted pendulum Lagrangian cart-pole on Perlin terrain slope; PID controller with cascade slope feed-forward; phase portrait, gain preset tuning |

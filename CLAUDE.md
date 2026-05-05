@@ -279,6 +279,181 @@ For any non-obvious physics formula, add the derivation or a named reference:
 
 ---
 
+# Learner-Friendly Code Structure
+
+The previous section covers *comments and documentation*. This section
+covers *the code itself* — how to organize functions, control flow, data,
+and naming so a reader can pick up the file cold and follow the thread
+without backtracking.
+
+**Test:** open the file and read top-to-bottom. If you ever stop and ask
+"wait, where is this defined?" or "what is this doing?" — the code has
+failed the readability test, regardless of how thorough the comments are.
+
+## One concept per function
+
+If a function name needs `_and_` to describe it, split it. The §5/§6/§7
+sectioning is the same idea at file scale; apply it at function scale too.
+
+```c
+/* BAD  */ void update_and_draw(Boid *b, WINDOW *w);
+/* GOOD */ void boid_tick(Boid *b, float dt);
+           void boid_draw(const Boid *b, WINDOW *w);
+```
+
+A reader scanning the function list should be able to predict what each
+one does from the name alone. If two functions could plausibly do the
+same thing, one of them is misnamed or one of them shouldn't exist.
+
+## Separate pure from mutating
+
+Pure helpers take `const` and return values; mutating functions take a
+non-const pointer to the entity. The signature alone tells the reader
+whether state can change.
+
+```c
+static int  body_seg_pair (int i);                       /* pure   */
+static Vec2 trail_sample  (const Centipede *c, float s); /* pure   */
+static void trail_push    (Centipede *c, Vec2 pos);      /* mutate */
+static void move_head     (Centipede *c, float dt, ...); /* mutate */
+```
+
+This makes data flow obvious: glance at the signatures and you know
+which functions touch the world.
+
+## Mirror the math in the code
+
+If KEY FORMULAS lists steps 1–4, the function body has four lines, in
+order, one per step. Don't fold steps to save lines — a learner needs
+to read the formula and the code side-by-side and have them match.
+
+```c
+/* BAD — four math steps fused into one cryptic expression */
+foot.x = hip.x + UPPER_LEN*cosf(body_dir + LEG_SPLAY +
+       SWING_AMP*sinf(wave_time*GAIT_FREQ + i*M_PI/N_LEGS));
+
+/* GOOD — one line per step in KEY FORMULAS */
+float phi   = wave_time * GAIT_FREQ + i * (M_PI / N_LEGS);
+float upper = body_dir + LEG_SPLAY + SWING_AMP * sinf(phi);
+Vec2  knee  = { hip.x + UPPER_LEN * cosf(upper),
+                hip.y + UPPER_LEN * sinf(upper) };
+```
+
+Each intermediate variable is a label for a concept named in the math.
+Names like `phi`, `upper`, `knee` map 1:1 onto the formulas.
+
+## Linear flow inside functions
+
+Top-to-bottom reading order should match conceptual order. Guard
+clauses first; main work after. If you find yourself with three levels
+of nesting (loop-inside-loop-inside-if), the function wants to be split
+or have early returns added.
+
+```c
+static void rocket_tick(Rocket *r, ...) {
+    if (!r->alive)             return;
+    if (r->age >= LIFESPAN) {  r->alive = 0; return; }
+
+    push_trail(r);
+    apply_gene(r);
+    advance_position(r);
+    check_target_hit(r);
+    check_offscreen(r);
+}
+```
+
+The reader holds the whole function in their head at once. No backwards
+jumps, no "wait, what state are we in here?"
+
+## Function length discipline
+
+- **≤ 30 lines** is the target.
+- **Up to ~60** is fine for orchestration functions (`scene_tick`,
+  `compute_legs`, `main`) where the structure itself is the documentation.
+- **Past 60 lines**, the function is doing more than one thing — split it.
+
+## Group struct fields with one-line headers
+
+A struct with 15 ungrouped fields is a cliff. Group related fields
+together; one comment per group is enough.
+
+```c
+typedef struct {
+    /* trail buffer — circular head-position log */
+    Vec2 trail[TRAIL_CAP];
+    int  trail_head, trail_count;
+
+    /* body joints — placed by arc-length sampling each tick */
+    Vec2 joint[BODY_SEGS + 1];
+
+    /* motion state */
+    float heading, wave_time, turn_phase;
+    float move_speed, turn_amp, turn_freq;
+
+    /* legs — computed each frame from body joints */
+    Vec2 leg_left [N_LEGS][3];
+    Vec2 leg_right[N_LEGS][3];
+} Centipede;
+```
+
+A reader can scan the group headers and find the field they need
+without parsing every line.
+
+## Name for the concept, not the type
+
+Names describe the simulation meaning, not the C type or the
+mechanical action.
+
+```c
+/* BAD  */  float f, x1, x2;        int n;     int  flag;
+/* GOOD */  float fitness;          int n_pop; bool hit_target;
+            float target_x, launch_x;
+```
+
+Single-letter names (`i`, `dx`, `dy`, `t`) are fine *inside* tight
+loops where the context is one line away. Outside tight context: spell
+the concept out.
+
+## Don't reach across §-sections
+
+§5 entity must not call §7 ncurses. §7 screen must not mutate §5 state.
+§3 color must not know about entity geometry. The section boundaries
+name layers of abstraction; reaching across collapses the layering.
+
+If data needs to cross a layer, pass it as a parameter (`const` where
+read-only) rather than touching globals from another section. The
+exception is `g_app` / `g_running` flags written by signal handlers —
+those are unavoidable in C.
+
+## Cleverness needs a one-line justification
+
+If a line uses bit tricks, ternary chains, pointer arithmetic, or
+non-obvious math identities, leave a comment proving the trick earns
+its keep:
+
+```c
+/* +TRAIL_CAP before % avoids C's negative-modulo trap */
+return c->trail[(c->trail_head + TRAIL_CAP - k) % TRAIL_CAP];
+
+/* dy negated so atan2f returns angle in math (y-up) coords, not
+ * terminal (y-down) coords — matches what the eye sees */
+float ang = atan2f(-dy, dx);
+```
+
+If you can't justify the trick in one line, rewrite it the slow
+obvious way. Cell-resolution terminal animation is rarely the place
+where a clever trick matters more than readability.
+
+## The reader's mental budget
+
+A learner has limited working memory while reading. Every concept you
+introduce — every variable, every helper, every macro — costs a slot.
+Spend the budget on concepts the simulation genuinely requires, not on
+abbreviations or premature optimizations. When in doubt: write the slow
+obvious version, then measure before sacrificing clarity for speed.
+
+---
+
 # Working on This Project
 
 ## New Simulation Workflow

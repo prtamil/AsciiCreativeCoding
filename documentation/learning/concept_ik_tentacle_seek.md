@@ -1,4 +1,4 @@
-# Pass 1 — ik_tentacle_seek: 12-Segment FABRIK Tentacle with Joint Constraints
+# Pass 1 — ik_tentacle_seek: 16-Segment FABRIK Tentacle with Joint Constraints
 
 ## From the Source
 
@@ -8,13 +8,13 @@
 
 **Target motion:** Lissajous figure with frequency ratio 1:1.7 (= 10:17). The ratio is rational but produces a long period (≈62.8 s of scene_time), making the path feel quasi-periodic. `actual_target` low-pass lerps toward the raw Lissajous position at rate `TARGET_SMOOTH = 8 s⁻¹`, smoothing sudden direction reversals near path crossings so joint constraints do not fire aggressively.
 
-**Data-structure:** `Vec2 pos[N_JOINTS]` — joint positions in pixel space (13 joints, 12 links). `Vec2 prev_pos[N_JOINTS]` — tick-start snapshot for alpha lerp. `float link_len[N_LINKS]` — tapered lengths (root longest). `Vec2 trail_pts[TRAIL_POINTS]` ring buffer (120 entries) — ghost trail of recent `actual_target` positions, rendered as '.' dots every 3rd entry.
+**Data-structure:** `Vec2 pos[N_JOINTS]` — joint positions in pixel space (`N_JOINTS = 17`, `N_LINKS = 16`). `Vec2 prev_pos[N_JOINTS]` — tick-start snapshot for alpha lerp. `float link_len[N_LINKS]` — tapered lengths (root longest, 22 px → 6 px after taper). `Vec2 trail_pts[TRAIL_POINTS]` ring buffer (120 entries) — ghost trail of recent `actual_target` positions, rendered in the tip pair (PAIR 7, the brightest in every theme) at `A_NORMAL` so the trail reads clearly above the screen background.
 
 ## Core Idea
 
-A 12-segment tentacle is anchored at screen centre and uses FABRIK to smoothly reach toward a target tracing a complex Lissajous path (frequency ratio 1:1.7). Per-joint angle constraints prevent the tentacle from kinking — each joint can bend at most 63°. A ghost trail of '.' dots shows the recent target path. Ten selectable bioluminescent colour themes cycle with 't'/'T'.
+A 16-segment tentacle is anchored at screen centre and uses FABRIK to smoothly reach toward a target tracing a complex Lissajous path (frequency ratio 1:1.7). The chain extends ~268 px from anchor to tip — 43 % longer than the previous 12-segment version, giving the tentacle visibly more reach and a fuller silhouette. Per-joint angle constraints prevent kinking — each joint can bend at most 63°. A ghost trail of bright dots in the tip colour shows the recent target path. Ten selectable bioluminescent colour themes cycle with 't'/'T'.
 
-The key additions over ik_arm_reach.c: (1) the chain is 3× longer (12 links vs 4), demanding more FABRIK iterations; (2) per-joint angle constraints are woven into the backward pass — the tentacle behaves like a real biological appendage rather than a robot arm; (3) the target is low-pass filtered to absorb sudden direction changes at Lissajous crossings, keeping the tentacle fluid.
+The key additions over `ik_arm_reach.c`: (1) the chain is 4× longer (16 links vs 4), demanding more FABRIK iterations; (2) per-joint angle constraints are woven into the backward pass — the tentacle behaves like a real biological appendage rather than a robot arm; (3) the target is low-pass filtered to absorb sudden direction changes at Lissajous crossings, keeping the tentacle fluid.
 
 ## The Mental Model
 
@@ -26,9 +26,9 @@ The target smoothing is essential: at the internal crossings of the Lissajous fi
 
 ### Tentacle struct (key fields)
 ```
-pos[N_JOINTS]         — current joint positions in pixel space (13 entries)
+pos[N_JOINTS]         — current joint positions in pixel space (17 entries)
 prev_pos[N_JOINTS]    — snapshot at tick start for sub-tick alpha lerp
-link_len[N_LINKS]     — tapered link lengths; link_len[i] = 20.0 − i×0.8 (12 entries)
+link_len[N_LINKS]     — tapered link lengths; link_len[i] = max(22.0 − i×0.7, 4.0) (16 entries)
 anchor                — fixed root pixel position (screen centre); set at init
 actual_target         — smoothly tracked target (low-pass filtered)
 prev_target           — snapshot of actual_target at tick start for alpha lerp
@@ -46,13 +46,14 @@ theme_idx
 ### Link length taper
 ```
 link_len[i] = max(BASE_LINK_LEN − i × TAPER, 4.0)
-            = max(20.0 − i × 0.8, 4.0)
+            = max(22.0 − i × 0.7, 4.0)
 
-i=0  (root link):  20.0 px
-i=5  (mid link):   16.0 px
-i=11 (tip link):   11.2 px
-Total reach: Σᵢ₌₀¹¹(20 − 0.8i) = 240 − 52.8 = 187.2 px
+i=0  (root link):  22.0 px   ← longest
+i=8  (mid link):   16.4 px
+i=15 (tip link):   11.5 px
+Total reach: Σᵢ₌₀¹⁵ max(22 − 0.7i, 4) ≈ 268 px
 ```
+The longer chain (16 links vs the previous 12) and slightly longer base link give the tentacle ~43 % more reach. Visually the silhouette fills more of the screen and the curl back at the tip is more dramatic.
 
 ### Vec2 helpers used in constraint
 ```
@@ -65,11 +66,14 @@ atan2(cross, dot) = atan2(sin θ, cos θ) = θ  (signed angle in [−π, π])
 
 ### Color pair layout (tentacle)
 ```
-pairs 1–7   — tentacle body gradient: pair 1 = root (deepest/dimmest),
-               pair 7 = tip (brightest) — seven pairs for 12 links
-pair 8      — HUD status bar
+pairs 1–7   — tentacle body gradient: pair 1 = root (deepest tier of theme),
+               pair 7 = tip (brightest tier) — seven pairs spread over 16 links
+pair 7      — also used for the ghost trail dots, drawn in A_NORMAL so the
+               trail reads at full theme tip-brightness against the screen
+pair 8      — PAIR_HUD  (status bar — bright yellow on default bg)
+pair 9      — PAIR_HINT (key hint — bright cyan on default bg)
 ```
-No separate semantic pairs; the target marker and HUD both use pair assignments from the theme.
+The trail was bumped from a dim-grey HUD-pair render to the tip pair at A_NORMAL specifically so the figure-8 path is legible without forcing the user to squint. Theme palettes have all been raised so even the "deepest" tier (pair 1 root) sits at index ≥ 24 in the 256-colour cube — visible under A_DIM, per the project brightness rule.
 
 ## The Main Loop
 
@@ -92,7 +96,7 @@ Each iteration of the main loop:
 
 6. **Frame cap sleep.** Before render; 60 fps ceiling.
 
-7. **Draw and present.** `render_tentacle()`: alpha-lerp positions, draw ghost trail, draw PASS 1 bead fill (gradient pairs), draw PASS 2 node markers, draw target marker. HUD overlay. `doupdate()`.
+7. **Draw and present.** `render_tentacle()` decomposes into five named passes — `draw_trail()` (bright tip-pair dots, oldest first) → `draw_link_fill()` (segment beads, root → tip with gradient pairs) → `draw_link_nodes()` (graded joint markers '0'/'o'/'.') → `draw_target_marker()` (bright `+` cursor) → `draw_anchor_marker()` (`@` at the root). HUD overlay. `doupdate()`.
 
 8. **Handle input.** Speed up/down, theme cycle (forward 't', backward 'T'), sim Hz, quit.
 

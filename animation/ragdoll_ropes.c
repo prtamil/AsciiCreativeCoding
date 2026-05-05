@@ -1,123 +1,38 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * ragdoll_ropes.c — 7 Verlet ropes swaying in sinusoidal wind
+ * ragdoll_ropes.c — seven Verlet ropes swaying in sinusoidal wind
  *
- * DEMO: Seven ropes hang from ceiling anchors evenly distributed across
- *       the terminal.  Each rope has 20 particles connected by distance
- *       constraints.  A sinusoidal wind force with per-rope phase offsets
- *       drives each rope independently, creating a beautiful staggered
- *       "Mexican wave" sway.  Ropes have varying lengths and their tips
- *       carry a weighted bead marker.
+ * DEMO: Seven ropes of varying lengths hang from a ceiling and sway under a
+ *       sinusoidal wind whose phase is offset per rope, producing a Mexican-
+ *       wave sway. Each rope is 20 particles bound by distance constraints.
  *
- * STUDY ALONGSIDE: framework.c            (canonical loop / timing)
- *                  ragdoll_figure.c       (Verlet + constraint physics)
- *                  snake_forward_kinematics.c (rendering style reference)
+ * Study alongside: ragdoll_figure.c (the same Verlet engine, branched skeleton)
  *
- * ─────────────────────────────────────────────────────────────────────────
- *  Section map
- * ─────────────────────────────────────────────────────────────────────────
- *   §1  config        — all tunables in one place
- *   §2  clock         — monotonic clock + sleep (verbatim from framework)
- *   §3  color         — 10-theme palette system (7 rope pairs + HUD pair)
- *   §4  coords        — pixel↔cell aspect-ratio helpers
- *   §5  entity        — Scene: Verlet ropes + constraint solver + renderer
- *       §5a  rope_verlet_step     — Verlet integration for one particle
- *       §5b  apply_rope_constraints — distance constraint solver (N_ITERS passes)
- *       §5c  enforce_anchors      — pin particle[0] to ceiling after every pass
- *       §5d  apply_wind           — sinusoidal wind force per rope
- *       §5e  rope_node_char       — bead glyph selector (size gradient)
- *       §5f  draw_rope_beads      — dense segment fill + node marker pass
- *       §5g  render_scene         — full frame: ceiling, all ropes, weight tips
- *   §6  scene         — scene_init / scene_tick / scene_draw wrappers
- *   §7  screen        — ncurses double-buffer display layer
- *   §8  app           — signals, resize, main game loop
- * ─────────────────────────────────────────────────────────────────────────
- *
- * HOW THIS ROPE SIM WORKS — VERLET INTEGRATION + DISTANCE CONSTRAINTS
- * ────────────────────────────────────────────────────────────────────
- *
- * WHY VERLET FOR ROPES?
- *
- * A rope is inextensible: segments must not stretch.  You might think to
- * model this with stiff springs, but stiff springs require very small dt
- * to stay numerically stable — the spring constant explodes the simulation
- * unless the time step is tiny.
- *
- * Verlet integration solves this elegantly by storing velocity implicitly
- * as the difference between current and previous position:
- *
- *   velocity ≈ pos − old_pos     (over one tick)
- *
- * This means inextensibility is enforced AFTER the Verlet step by a
- * "distance constraint" that simply moves particles back to the correct
- * distance, without any explicit spring force.  The constraint is a
- * geometry operation, not a force, so it cannot blow up.
- *
- * VERLET STEP (one particle):
- *
- *   vel     = (pos − old_pos) × ROPE_DAMPING
- *   new_pos = pos + vel + accel × dt²
- *   old_pos = pos
- *   pos     = new_pos
- *
- * ROPE_DAMPING = 0.992 (versus ragdoll_figure.c's 0.995).  The lower
- * value means 0.8% velocity loss per tick versus 0.5%.  Rope segments
- * have more air resistance than rigid bones: a rope segment is thin and
- * whippy, so each tick it loses more kinetic energy to air drag.  The
- * slightly stronger damping keeps the rope from building up oscillation
- * energy and going unstable at high wind amplitudes.
- *
- * DISTANCE CONSTRAINT (one segment):
- *
- *   dx  = pos[s+1] − pos[s]
- *   err = (|dx| − rest_len) / |dx|        ← fractional error
- *   correction = 0.5 × err × dx           ← equal mass: split equally
- *   pos[s]   += correction
- *   pos[s+1] -= correction
- *
- * After CONSTRAINT_ITERS=6 passes the rope is inextensible to within
- * floating-point precision.  A simple chain (no branching) needs fewer
- * iterations than a full ragdoll skeleton — 6 is sufficient for N_SEG=20.
- *
- * ANCHOR ENFORCEMENT:
- *
- * Particle[r][0] is the ceiling anchor.  After every Verlet step AND
- * after every constraint pass we reset:
- *   pos[r][0] = old_pos[r][0] = anchor[r]
- *
- * Resetting BOTH pos and old_pos is essential.  If only pos is reset,
- * Verlet computes velocity = pos − old_pos on the next tick, which now
- * points away from the anchor (old_pos is still at the Verlet-displaced
- * location).  This phantom velocity yanks the particle off the anchor on
- * the very next tick, and drift accumulates over time.  Resetting both
- * zeroes the implicit velocity and permanently pins the particle.
- *
- * SINUSOIDAL WIND:
- *
- * Each rope r receives a horizontal acceleration:
- *   accel_x = wind_amp × sin(wind_time × wind_freq + phase_offset[r])
- *
- * phase_offset[r] = r × 2π / N_ROPES distributes 7 ropes evenly around
- * the full 2π cycle.  At any moment in time every rope is at a different
- * point in its oscillation, so neighbouring ropes always sway in opposite
- * directions — never all left or all right at the same time.  The result
- * is the characteristic "Mexican wave" visual.
- *
- * Sinusoidal wind (rather than random impulses) is used because:
- *   • Smooth enough: sin() is C-infinity continuous; no sudden jumps that
- *     would cause constraint explosions.
- *   • Complex enough: the per-rope phase shift makes each rope unique.
- *   • Controllable: wind_amp and wind_freq map directly to physical
- *     intuition and are adjustable at runtime via ↑/↓ and ←/→.
+ * Section map:
+ *   §1 config   — tunables: gravity, damping, wind defaults, geometry
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 10 themes × 7 rope pairs + PAIR_HUD/PAIR_HINT
+ *   §4 coords   — pixel↔cell aspect-ratio bridge
+ *   §5 entity   — Scene: Verlet ropes + constraint solver + renderer
+ *       §5a rope_verlet_step      — gravity + wind integration per particle
+ *       §5b apply_rope_constraints — N_ITERS passes of distance projection
+ *       §5c enforce_anchors       — pin particle[0] to its ceiling slot
+ *       §5d apply_wind            — sinusoidal lateral force per rope
+ *       §5e rope_node_char/_attr  — bead glyph + brightness gradient
+ *       §5f draw_rope_beads       — two-pass per-rope render
+ *       §5g render_scene          — full frame: ceiling + all ropes
+ *   §6 scene    — scene_init / scene_tick / scene_draw
+ *   §7 screen   — ncurses double-buffer display layer
+ *   §8 app      — signals, resize, main game loop
  *
  * Keys:
  *   q / ESC       quit
  *   space         pause / resume
- *   ↑ / ↓         wind amplitude ±50 px/s²
- *   ← / →         wind frequency ±0.05 rad/s
+ *   w/s, ↑/↓      wind amplitude ± 50 px/s²
+ *   a/d, ←/→      wind frequency ± 0.05 rad/s
  *   r / R         reset (ropes back to straight, theme preserved)
- *   t / T         next / previous colour theme
- *   [ / ]         simulation Hz down / up
+ *   t / T         next / previous theme
+ *   [ / ]         sim Hz − / +
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra \
@@ -126,40 +41,139 @@
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Position-based Verlet integration with iterative distance
- *                  constraints.  Unlike spring forces, distance constraints
- *                  directly correct particle positions to maintain segment
- *                  length, so the rope is numerically inextensible at any
- *                  dt.  Six constraint passes per tick converge to within
- *                  floating-point precision for a 20-node chain.
- *                  A sinusoidal wind force with per-rope phase offsets
- *                  (phase[r] = r × 2π / N_ROPES) drives each rope
- *                  independently, creating staggered rhythmic sway.
- *                  Anchor particle[r][0] is pinned by resetting both pos
- *                  and old_pos after every Verlet step and constraint pass.
+ * Algorithm      : Position-Verlet integration with iterative distance-
+ *                  constraint projection (Jakobsen). Each rope is a chain
+ *                  of N_SEG particles. Each tick: gravity + a sinusoidal
+ *                  lateral wind are integrated, then six constraint passes
+ *                  pull every adjacent pair back to its rest length. The
+ *                  ceiling anchor is re-pinned (both pos AND old_pos) after
+ *                  every pass so constraint corrections cannot drift it.
+ *                  Per-rope phase offsets (r · 2π / N_ROPES) make ropes
+ *                  oscillate out of step — the Mexican-wave look.
  *
- * Data-structure : Scene struct holds flat 2D arrays: pos[N_ROPES][N_SEG],
- *                  old_pos[N_ROPES][N_SEG], prev_pos[N_ROPES][N_SEG].
- *                  rest_len[N_ROPES] stores the per-segment rest length
- *                  (= rope_len_px[r] / (N_SEG − 1), varies by rope).
- *                  anchor[N_ROPES] is the fixed ceiling pixel position.
- *                  phase_offset[N_ROPES] holds the pre-computed 2π offsets.
- *                  wind_time is a single accumulator driving all sin() calls.
+ * Data-structure : Scene packs flat 2-D arrays pos[N_ROPES][N_SEG],
+ *                  old_pos[][] and prev_pos[][]. rest_len[r] holds the
+ *                  per-rope segment length (= rope_len_px[r] / (N_SEG−1)).
+ *                  anchor[r] is the fixed ceiling pixel position; a
+ *                  pre-computed phase_offset[r] is added to wind_time on
+ *                  every sin() call. All positions live in pixel space so
+ *                  forces and lengths stay isotropic across cell aspect.
  *
- * Rendering      : Two-pass bead style.  Pass 1: walk each segment in 2 px
- *                  increments, stamping 'o' with dedup to avoid cell flicker.
- *                  Pass 2: overwrite particle positions with size-graded node
- *                  markers ('0' top quarter = A_BOLD; 'o' middle; '.' bottom
- *                  quarter = A_DIM), mimicking physical tension: particles
- *                  near the ceiling bear more load and appear brighter.
- *                  Alpha interpolation (prev_pos → pos) smooths motion at
- *                  any combination of sim Hz and render Hz.
+ * Rendering      : Two-pass bead style. Pass 1 walks each segment in 2 px
+ *                  increments stamping 'o' with cell-dedup to avoid attr
+ *                  flicker. Pass 2 over-stamps each particle with a size-
+ *                  graded node ('0' A_BOLD top quarter / 'o' middle / '.'
+ *                  A_DIM bottom quarter), so the eye reads tension as a
+ *                  brightness gradient. The free tip gets an A_BOLD 'o'
+ *                  weight marker. Alpha-interpolated prev_pos → pos keeps
+ *                  motion smooth at any render rate.
  *
- * Performance    : N_ROPES × N_SEG = 140 particles.  N_ITERS constraint
- *                  passes cost 6 × 7 × 19 = 798 distance corrections per
- *                  tick — trivial for any CPU.  ncurses doupdate() is the
- *                  bottleneck; it typically transmits ~200–400 changed cells
- *                  per frame across 7 swaying ropes.
+ * Performance    : 7 × 20 = 140 particles. Six constraint passes × 7 ropes
+ *                  × 19 segments = 798 projections per tick — trivial.
+ *                  ncurses doupdate is the bottleneck (~200-400 changed
+ *                  cells per frame).
+ *
+ * References     : Jakobsen, "Advanced Character Physics," GDC 2001 — the
+ *                    canonical Verlet-rope and ragdoll paper.
+ *                  Müller et al., "Position Based Dynamics," 2007 — the
+ *                    modern generalisation of constraint projection.
+ *                  Wikipedia: "Verlet integration" — derivation and the
+ *                    velocity-implicit form used here.
+ *                  Stam, "Real-Time Stable Cloth and Hair," 2002 — the
+ *                    same projection idea applied to many parallel chains.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A rope is just a string of beads being pulled around by gravity and
+ * wind, with the rule "neighbouring beads must stay exactly L apart"
+ * enforced as a *post-step correction*: integrate first, then project
+ * each pair back to the right distance, repeat six times. There is no
+ * spring constant, no implicit-velocity solve, no stiffness parameter
+ * to tune — the inextensibility falls out of pure geometry.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine seven dangling necklaces side-by-side. Every tick the wind
+ * gives each necklace a horizontal nudge — but the wind gusts hit each
+ * necklace at a slightly different moment in its cycle, so they never
+ * sway together. After every nudge the chain stretches a hair, and you
+ * pinch each link back to the right length six times in a row. That
+ * pinch is the constraint. The top bead is glued to the ceiling: every
+ * time the pinch tries to drag it, you snap it back and zero its
+ * implicit velocity by overwriting *both* pos and old_pos.
+ *
+ * DRAWING METHOD / ALGORITHM IN STEPS
+ * ───────────────────────────────────
+ *   1. Save prev_pos = pos                (anchor for sub-tick lerp)
+ *   2. Advance wind_time by dt
+ *   3. For each rope r:
+ *      a. wind_x = wind_amp · sin(wind_time · wind_freq + phase[r])
+ *      b. For each free particle s ∈ [1, N_SEG):
+ *           vel     = (pos − old_pos) · ROPE_DAMPING
+ *           old_pos = pos
+ *           pos    += vel + (wind_x, gravity) · dt²
+ *      c. Clamp particles to floor / walls; reflect old_pos for bounce.
+ *   4. Pin every anchor: pos[r][0] = old_pos[r][0] = anchor[r].
+ *   5. Repeat N_ITERS times: walk every segment, project both endpoints
+ *      by half the length error along the segment direction; re-pin
+ *      anchors after each iteration so the projection cannot drag them.
+ *   6. Render: lerp prev_pos → pos by alpha; pass-1 fill bead 'o' along
+ *      every segment; pass-2 over-stamp graded particle markers.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Verlet step (per particle, per tick):
+ *     vel     = (pos − old_pos) · ROPE_DAMPING
+ *     old_pos = pos
+ *     pos    += vel + accel · dt²
+ *
+ *   Distance constraint (per segment, per pass):
+ *     v     = pos[s+1] − pos[s]
+ *     dist  = |v|
+ *     error = (dist − rest) / dist
+ *     pos[s]   += 0.5 · error · v
+ *     pos[s+1] -= 0.5 · error · v
+ *
+ *   Sinusoidal wind (per rope, per tick):
+ *     accel_x = wind_amp · sin(wind_time · wind_freq + r · 2π / N_ROPES)
+ *
+ *   Pixel→cell aspect bridge:
+ *     cx = round(px / CELL_W)         (CELL_W = 8)
+ *     cy = round(py / CELL_H)         (CELL_H = 16)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • Coincident particles → dist = 0 → divide by zero. Guard with
+ *     `if (dist < 1e-6f) continue;` in apply_rope_constraints.
+ *   • Pinning only pos[r][0] (not old_pos[r][0]) leaves an implicit
+ *     velocity (anchor − displaced_old_pos) that yanks the anchor off
+ *     on the very next tick — drift compounds. Always reset BOTH.
+ *   • Constraint projection is equal-mass; one pass nudges the anchor
+ *     too. Re-pin after every pass, not just at the end.
+ *   • Sub-tick lerp anchor (prev_pos) MUST be saved before any physics
+ *     this tick, otherwise the render shows overshoot past the new state.
+ *   • Frame cap: never add dt to elapsed (`elapsed = clock_ns() − frame_start`,
+ *     no `+ dt`) — adding dt cancels the cap and pegs CPU at 100 %.
+ *   • Resize: rope_len_px is recomputed from `rows`, so scene_init must
+ *     be re-called with the new dimensions; otherwise lengths are stale.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Set wind_amp = 0 (s key until 0): all 7 ropes hang dead-vertical
+ *     with no drift over many seconds — proves the anchor pin is solid.
+ *   • Pause (space): every particle freezes in place; no perceptible
+ *     micro-stutter at the freeze frame (proves prev_pos save order).
+ *   • Crank wind_amp to 1000: ropes whip wildly but never stretch — proves
+ *     6 constraint passes are enough.
+ *   • Cycle themes (t/T): every theme is legible against a default-bg
+ *     terminal under A_DIM (no rope segment "disappears" at the bottom
+ *     quarter). Confirms theme palettes obey the brightness rule.
+ *   • Sweep wind_freq from 0.05 → 4.0 (d key): visible period should
+ *     scale as 2π/wind_freq — at 0.4 ≈ 16 s/cycle, at 4.0 ≈ 1.6 s/cycle.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -224,15 +238,17 @@ enum {
      * N_PAIRS — number of rope colour pairs registered with ncurses (1–7).
      *   Rope r uses colour pair (r % N_PAIRS) + 1, cycling through all seven.
      *
-     * HUD_PAIR (8) — dedicated pair for both HUD bars so their colour is
-     *   independent of the rope palette and never accidentally shifts when
-     *   N_PAIRS is changed.
+     * PAIR_HUD / PAIR_HINT — dedicated pairs for the top status and bottom
+     *   key-hint bars per the project HUD spec.  Theme-independent: their
+     *   colours never shift when the rope palette cycles, so the HUD stays
+     *   readable against any backdrop.
      *
      * N_THEMES — number of switchable palettes in the THEMES[] array (§3).
      *   Cycled at runtime with the t / T keys.
      */
     N_PAIRS          =   7,
-    HUD_PAIR         =   8,
+    PAIR_HUD         =   8,   /* bright yellow — top status bar  */
+    PAIR_HINT        =   9,   /* bright cyan   — bottom key hint */
     N_THEMES         =  10,
 
     /*
@@ -421,12 +437,14 @@ static void clock_sleep_ns(int64_t ns)
 /*
  * Theme — one complete named colour palette.
  *
- *   name      — displayed in the HUD status bar.
- *   body[]    — 7 xterm-256 foreground colour indices for ncurses pairs
- *               1–7 (one per rope).  Rope r always uses pair (r%7)+1.
- *   hud       — foreground index for HUD_PAIR (pair 8), kept separate so
- *               the status bar colour never accidentally changes when the
- *               rope palette cycles.
+ *   name   — displayed in the HUD status bar.
+ *   body[] — 7 xterm-256 foreground colour indices for rope pairs 1–7
+ *            (rope r always uses pair (r%7)+1).
+ *
+ * Brightness rule: every body[] entry is in the bright half of the
+ * 256-colour cube (≥ 24).  Indices 16–23 (cube near-blacks) and 232–239
+ * (gray near-blacks) become invisible under A_DIM at the bottom-quarter
+ * tip of each rope, so we avoid them entirely.
  *
  * theme_apply() registers the chosen palette with ncurses init_pair() live;
  * switching themes takes effect on the very next frame without restarting.
@@ -436,82 +454,90 @@ static void clock_sleep_ns(int64_t ns)
 typedef struct {
     const char *name;
     int body[N_PAIRS];   /* xterm-256 colour index for rope pairs 1–7 */
-    int hud;             /* colour index for HUD pair 8               */
 } Theme;
 
 /*
- * THEMES[10] — the ten built-in palettes.
+ * THEMES[10] — the ten built-in palettes.  Column order is
+ * pair 1 (rope 0) → pair 7 (rope 6).
  *
- * Column order: pair 1 (rope 0) → pair 7 (rope 6), then hud.
- *
- * Design rationale for each theme:
- *   Rainbow — classic ROYGBIV: maximum contrast between neighbouring ropes.
- *   Neon    — hot pinks, yellows, greens: bright club-light aesthetic.
- *   Fire    — deep red to pale yellow: ropes look like glowing embers.
- *   Ocean   — navy to aqua: calm cool gradient.
- *   Aurora  — forest green to violet: northern lights palette.
- *   Lava    — dark red to orange: slow molten glow.
- *   Forest  — multiple greens: organic, earthy.
- *   Sunset  — purple to warm orange: dusk gradient.
- *   Ice     — light blue to cyan: cold crystalline.
- *   Matrix  — dark to bright green: terminal hacker aesthetic.
+ *   Rainbow — classic ROYGBIV.
+ *   Neon    — hot pinks, yellows, greens — club-light.
+ *   Fire    — deep red to pale yellow — glowing embers.
+ *   Ocean   — navy to aqua — cool gradient (lowest tier bumped to 24).
+ *   Aurora  — green to violet — northern lights (lowest tier bumped to 24).
+ *   Lava    — dark red to orange — molten glow.
+ *   Forest  — multiple greens (lowest tier bumped to 24).
+ *   Sunset  — purple to warm orange — dusk.
+ *   Ice     — light blue to cyan — crystalline.
+ *   Matrix  — dark to bright green (lowest tier bumped to 24).
  */
 static const Theme THEMES[N_THEMES] = {
-    /* name       rope0  rope1  rope2  rope3  rope4  rope5  rope6  hud  */
-    {"Rainbow", {196,   208,   226,    46,    51,    21,   129}, 226},
-    {"Neon",    {201,   226,   118,   159,   213,   208,    15}, 226},
-    {"Fire",    {124,   160,   196,   202,   208,   214,   220}, 220},
-    {"Ocean",   { 17,    18,    27,    33,    39,    45,    51},  45},
-    {"Aurora",  { 22,    34,    79,   122,   159,   165,   201}, 159},
-    {"Lava",    { 52,    88,   124,   160,   196,   202,   208}, 196},
-    {"Forest",  { 22,    28,    34,    40,    70,   106,    82},  46},
-    {"Sunset",  { 54,    91,   128,   165,   202,   209,   208}, 208},
-    {"Ice",     {195,   159,   123,    87,    51,    45,    39}, 195},
-    {"Matrix",  { 22,    28,    34,    40,    46,    82,   118},  46},
+    /* name       rope0  rope1  rope2  rope3  rope4  rope5  rope6 */
+    {"Rainbow", {196,   208,   226,    46,    51,    27,   129}},
+    {"Neon",    {201,   226,   118,   159,   213,   208,    15}},
+    {"Fire",    {124,   160,   196,   202,   208,   214,   220}},
+    {"Ocean",   { 24,    25,    31,    33,    39,    45,    51}},
+    {"Aurora",  { 28,    34,    79,   122,   159,   165,   201}},
+    {"Lava",    { 52,    88,   124,   160,   196,   202,   208}},
+    {"Forest",  { 28,    34,    40,    70,    76,   106,    82}},
+    {"Sunset",  { 54,    91,   128,   165,   202,   209,   208}},
+    {"Ice",     {195,   159,   123,    87,    51,    45,    39}},
+    {"Matrix",  { 28,    34,    40,    46,    76,    82,   118}},
 };
 
 /*
- * theme_apply() — register palette idx with ncurses init_pair().
+ * theme_apply() — register rope palette idx with ncurses init_pair().
  *
  * Called from color_init() at startup and from app_handle_key() on t/T.
+ * Background is -1 (terminal default) so demos respect the user's theme.
  * On 256-colour terminals: uses the xterm-256 indices directly.
  * On 8-colour fallback: maps to the closest ANSI colour by visual feel
  * (red→yellow→green→cyan→blue→magenta arc approximates ROYGBIV order).
+ *
+ * PAIR_HUD / PAIR_HINT are NOT touched here — they are theme-independent
+ * per the project HUD spec, and are configured once in color_init().
  */
 static void theme_apply(int idx)
 {
     const Theme *th = &THEMES[idx];
     if (COLORS >= 256) {
         for (int p = 1; p <= N_PAIRS; p++)
-            init_pair(p, th->body[p - 1], COLOR_BLACK);
-        init_pair(HUD_PAIR, th->hud, COLOR_BLACK);
+            init_pair(p, th->body[p - 1], -1);
     } else {
         /* 8-colour ANSI fallback — approximate ROYGBIV order */
-        init_pair(1, COLOR_RED,     COLOR_BLACK);
-        init_pair(2, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(3, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(4, COLOR_GREEN,   COLOR_BLACK);
-        init_pair(5, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(6, COLOR_BLUE,    COLOR_BLACK);
-        init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
-        init_pair(HUD_PAIR, COLOR_YELLOW, COLOR_BLACK);
+        init_pair(1, COLOR_RED,     -1);
+        init_pair(2, COLOR_YELLOW,  -1);
+        init_pair(3, COLOR_YELLOW,  -1);
+        init_pair(4, COLOR_GREEN,   -1);
+        init_pair(5, COLOR_CYAN,    -1);
+        init_pair(6, COLOR_BLUE,    -1);
+        init_pair(7, COLOR_MAGENTA, -1);
     }
 }
 
 /*
  * color_init() — one-time colour system setup.
  *
- * start_color()       — initialise ncurses colour support.
- * use_default_colors() — allow colour pair 0 to mean "terminal default"
- *                        so the black background is the true terminal bg
- *                        rather than a filled black cell.
- * theme_apply()        — register the initial palette.
+ *   start_color()        — initialise ncurses colour support.
+ *   use_default_colors() — allow background = -1 to mean "terminal default".
+ *   theme_apply()        — register the initial rope palette.
+ *   PAIR_HUD / PAIR_HINT — registered once with bright yellow / cyan
+ *                          (256-colour) or YELLOW / CYAN (8-colour fallback)
+ *                          per the project HUD spec.
  */
 static void color_init(int initial_theme)
 {
     start_color();
     use_default_colors();
     theme_apply(initial_theme);
+
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
+        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
+    } else {
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
+    }
 }
 
 /* ===================================================================== */
@@ -983,6 +1009,25 @@ static attr_t rope_node_attr(int s)
     return A_NORMAL;
 }
 
+/* ── §5e2  mark_cell — central glyph stamp helper ───────────────────── */
+
+/*
+ * mark_cell() — stamp one ASCII glyph at terminal cell (cx,cy).
+ *
+ * Centralises the (chtype)(unsigned char) cast plus bounds-check that
+ * would otherwise be repeated at every mvwaddch site.  The double cast
+ * prevents sign-extension on character values > 127 (per CLAUDE.md
+ * "Common ncurses Bugs").  Glyph is silently dropped if off-screen.
+ */
+static void mark_cell(WINDOW *w, int cx, int cy, char ch,
+                      int pair, attr_t attr, int cols, int rows)
+{
+    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+    wattron(w, COLOR_PAIR(pair) | attr);
+    mvwaddch(w, cy, cx, (chtype)(unsigned char)ch);
+    wattroff(w, COLOR_PAIR(pair) | attr);
+}
+
 /* ── §5f  draw_rope_beads ───────────────────────────────────────────── */
 
 /*
@@ -1038,19 +1083,18 @@ static void draw_rope_beads(const Scene *sc, const Vec2 rp[][N_SEG],
                             int r, WINDOW *w, int cols, int rows)
 {
     (void)sc;                         /* colour pair derived from r, not sc  */
-    int cpair = (r % N_PAIRS) + 1;   /* cycle rope colours through pairs 1–7 */
+    int cpair = (r % N_PAIRS) + 1;    /* cycle rope colours through pairs 1–7 */
 
-    /* ── Pass 1: fill segments with 'o' beads at DRAW_STEP_PX intervals ── */
+    /* Pass 1 — fill segments with 'o' beads at DRAW_STEP_PX intervals */
     for (int s = 0; s < N_SEG - 1; s++) {
         float dx  = rp[r][s+1].x - rp[r][s].x;
         float dy  = rp[r][s+1].y - rp[r][s].y;
         float len = sqrtf(dx * dx + dy * dy);
-        if (len < 0.1f) continue;   /* degenerate segment: skip */
+        if (len < 0.1f) continue;   /* degenerate segment */
 
         int nsteps  = (int)ceilf(len / DRAW_STEP_PX) + 1;
         int prev_cx = -9999, prev_cy = -9999;
 
-        wattron(w, COLOR_PAIR(cpair) | A_NORMAL);
         for (int t = 0; t <= nsteps; t++) {
             float u  = (float)t / (float)nsteps;
             int   cx = px_to_cell_x(rp[r][s].x + dx * u);
@@ -1058,76 +1102,41 @@ static void draw_rope_beads(const Scene *sc, const Vec2 rp[][N_SEG],
 
             if (cx == prev_cx && cy == prev_cy) continue;   /* dedup */
             prev_cx = cx;  prev_cy = cy;
-            if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
-
-            mvwaddch(w, cy, cx, 'o');
+            mark_cell(w, cx, cy, 'o', cpair, A_NORMAL, cols, rows);
         }
-        wattroff(w, COLOR_PAIR(cpair) | A_NORMAL);
     }
 
-    /* ── Pass 2: node markers overwrite fill beads at particle positions ── */
+    /* Pass 2 — node markers over-stamp fill beads at particle positions */
     for (int s = 0; s < N_SEG; s++) {
         int cx = px_to_cell_x(rp[r][s].x);
         int cy = px_to_cell_y(rp[r][s].y);
-        if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
-
-        chtype nch  = rope_node_char(s);
-        attr_t natt = rope_node_attr(s);
-        wattron(w, COLOR_PAIR(cpair) | natt);
-        mvwaddch(w, cy, cx, nch);
-        wattroff(w, COLOR_PAIR(cpair) | natt);
+        char   ch   = (char)rope_node_char(s);
+        attr_t attr = rope_node_attr(s);
+        mark_cell(w, cx, cy, ch, cpair, attr, cols, rows);
     }
 
-    /* ── Weight marker: bright 'o' at the free tip (particle N_SEG-1) ── */
+    /* Weight marker — bright 'o' over-stamps the free tip */
     {
         int cx = px_to_cell_x(rp[r][N_SEG - 1].x);
         int cy = px_to_cell_y(rp[r][N_SEG - 1].y);
-        if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) {
-            wattron(w, COLOR_PAIR(cpair) | A_BOLD);
-            mvwaddch(w, cy, cx, 'o');
-            wattroff(w, COLOR_PAIR(cpair) | A_BOLD);
-        }
+        mark_cell(w, cx, cy, 'o', cpair, A_BOLD, cols, rows);
     }
 }
 
 /* ── §5g  render_scene ──────────────────────────────────────────────── */
 
 /*
- * render_scene() — compose a complete frame of all 7 ropes into WINDOW *w.
+ * lerp_positions() — fill rp[][] with alpha-interpolated render positions.
  *
- * WHAT: Draws the ceiling line, then all ropes using draw_rope_beads().
- *   Sub-tick alpha interpolation smooths motion between physics ticks.
+ *   rp[r][s] = prev_pos[r][s] + (pos[r][s] − prev_pos[r][s]) · alpha
  *
- * STEP-BY-STEP:
- *
- *   1. ALPHA INTERPOLATION — compute render positions rp[r][s]:
- *        rp[r][s] = prev_pos[r][s] + (pos[r][s] − prev_pos[r][s]) × alpha
- *      alpha ∈ [0,1) is the fractional progress into the current unfired
- *      physics tick (computed in §8 main loop).  When alpha = 0 the display
- *      shows exactly the last physics state; when alpha → 1 it shows the
- *      predicted next state.  The result is visually smooth motion at any
- *      render frame rate, even if sim Hz ≠ render Hz.
- *
- *   2. CEILING LINE — draw a row of '#' characters across the full terminal
- *      width at ANCHOR_ROW_CELLS.
- *      Uses COLOR_PAIR(7) | A_DIM: the last rope's colour, dimmed, gives
- *      the ceiling a structural look without dominating the frame.
- *
- *   3. ROPES — call draw_rope_beads() for each rope r in order 0..N_ROPES-1.
- *      Later ropes are drawn on top of earlier ropes on overlapping cells
- *      (natural Z-order by rope index).
- *
- * PARAMETERS:
- *   sc         — const scene (simulation state, read-only).
- *   w          — ncurses WINDOW (stdscr).
- *   cols, rows — terminal dimensions for bounds checking.
- *   alpha      — sub-tick interpolation factor ∈ [0, 1).
+ * alpha ∈ [0,1) is the leftover fraction in the fixed-step accumulator.
+ * Without this lerp, motion stutters whenever render Hz ≠ sim Hz; with
+ * it, every rope glides smoothly at any combination of the two rates.
  */
-static void render_scene(const Scene *sc, WINDOW *w,
-                         int cols, int rows, float alpha)
+static void lerp_positions(const Scene *sc, float alpha,
+                           Vec2 rp[N_ROPES][N_SEG])
 {
-    /* Step 1 — alpha-interpolated render positions */
-    Vec2 rp[N_ROPES][N_SEG];
     for (int r = 0; r < N_ROPES; r++) {
         for (int s = 0; s < N_SEG; s++) {
             rp[r][s].x = sc->prev_pos[r][s].x
@@ -1136,17 +1145,41 @@ static void render_scene(const Scene *sc, WINDOW *w,
                        + (sc->pos[r][s].y - sc->prev_pos[r][s].y) * alpha;
         }
     }
+}
 
-    /* Step 2 — ceiling '#' line at the anchor row */
-    int anchor_row = ANCHOR_ROW_CELLS;
-    if (anchor_row >= 0 && anchor_row < rows) {
-        wattron(w, COLOR_PAIR(7) | A_DIM);
-        for (int cx = 0; cx < cols; cx++)
-            mvwaddch(w, anchor_row, cx, (chtype)'#');
-        wattroff(w, COLOR_PAIR(7) | A_DIM);
+/*
+ * draw_ceiling() — render a structural '#' line at ANCHOR_ROW_CELLS.
+ *
+ * Uses the last rope's colour pair (N_PAIRS) under A_DIM so the ceiling
+ * reads as scenery, not as a participating rope.  Rendered before the
+ * ropes so any rope cell at the anchor row over-stamps it cleanly.
+ */
+static void draw_ceiling(WINDOW *w, int cols, int rows)
+{
+    if (ANCHOR_ROW_CELLS < 0 || ANCHOR_ROW_CELLS >= rows) return;
+    for (int cx = 0; cx < cols; cx++) {
+        mark_cell(w, cx, ANCHOR_ROW_CELLS, '#',
+                  N_PAIRS, A_DIM, cols, rows);
     }
+}
 
-    /* Step 3 — ropes (two-pass bead rendering per rope) */
+/*
+ * render_scene() — orchestrate one frame in painter's order.
+ *
+ *   1. lerp_positions — sub-tick interpolation for all 7 × 20 particles.
+ *   2. draw_ceiling   — '#' line at the anchor row (bottom layer).
+ *   3. draw_rope_beads × N_ROPES — two-pass per-rope render.
+ *
+ * Order matters: each later layer over-stamps earlier ones at shared
+ * cells, so rope nodes read above the ceiling.
+ */
+static void render_scene(const Scene *sc, WINDOW *w,
+                         int cols, int rows, float alpha)
+{
+    Vec2 rp[N_ROPES][N_SEG];
+    lerp_positions(sc, alpha, rp);
+
+    draw_ceiling(w, cols, rows);
     for (int r = 0; r < N_ROPES; r++) {
         draw_rope_beads(sc, rp, r, w, cols, rows);
     }
@@ -1414,24 +1447,25 @@ static void screen_draw(Screen *s, const Scene *sc,
     erase();
     scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
 
+    /* Top-right status — PAIR_HUD bright yellow, A_BOLD */
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
-             " ROPES  %dx%d  wind:%.0f  freq:%.2f  [%s]  %.1ffps  %dHz  %s ",
-             N_ROPES, N_SEG,
+             " %5.1f fps  sim:%3d Hz  wind:%.0f  freq:%.2f  [%s]  %s ",
+             fps, sim_fps,
              sc->wind_amp, sc->wind_freq,
              THEMES[sc->theme_idx].name,
-             fps, sim_fps,
-             sc->paused ? "PAUSED" : "swaying");
+             sc->paused ? "PAUSED " : "swaying");
     int hx = s->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    /* Bottom-left key hint — PAIR_HINT bright cyan, A_BOLD */
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(s->rows - 1, 0,
              " q:quit  spc:pause  r:reset  w/s:wind  a/d:freq  t:theme  [/]:Hz ");
-    attroff(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /*
@@ -1691,6 +1725,8 @@ int main(void)
 
     while (app->running) {
 
+        int64_t frame_start = clock_ns();
+
         /* ── ① resize ────────────────────────────────────────────── */
         if (app->need_resize) {
             app_do_resize(app);
@@ -1728,8 +1764,11 @@ int main(void)
             fps_accum   = 0;
         }
 
-        /* ── ⑥ frame cap — sleep before render ──────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
+        /* ── ⑥ frame cap — sleep before render ──────────────────── *
+         * Budget = 1/60 s.  elapsed is wall time spent on physics +
+         * accounting since frame_start; sleep the remainder so the
+         * render rate sits at 60 fps regardless of sim Hz.            */
+        int64_t elapsed = clock_ns() - frame_start;
         clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 
         /* ── ⑦ draw + present ────────────────────────────────────── */

@@ -232,7 +232,7 @@ each endpoint moves 0.5 × error × vec  (equal mass assumption)
 | §5b-2 apply_platform_collisions | Slanted-surface detection + normal-component reflection |
 | §5c satisfy_constraint | One distance constraint projection (half-correction to each endpoint) |
 | §5d ragdoll_tick | Full physics step: prev_pos save → wind → Verlet → boundaries → constraints |
-| §5e ragdoll_draw | Alpha lerp → bone rendering (draw_bone) → particle markers |
+| §5e ragdoll_draw | `render_ragdoll` orchestrates 5 painter's-order helpers: `lerp_positions` (sub-tick interp) → `draw_platforms` (slanted shelves, bead+nodes) → `draw_ground` (dashed floor row) → `draw_bones` (bone glyphs by constraint range — spine/arm/leg/strut) → `draw_particles` (head 'O', wrists '*', ankles 'v', other joints '.'). All glyph stamps go through a central `mark_cell()` helper that performs the `(chtype)(unsigned char)` cast and bounds-check. |
 | §6 scene | `scene_init` (T-pose + platforms) / `scene_tick` / `scene_draw` wrappers |
 | §7 screen | ncurses double-buffer layer (erase → draw → wnoutrefresh → doupdate) |
 | §8 app | Signal handlers, resize handler, main fixed-step accumulator loop |
@@ -482,3 +482,12 @@ Saved before any physics runs, `prev_pos` holds the state at the END of the prev
 
 **Old_pos manipulation as velocity injection:**
 The wind gust code `old_pos[i].x -= impulse * dt` is not a hack — it is the correct Verlet way to apply an instantaneous velocity kick. Understanding this pattern is essential for adding any kind of impulse-based interaction (kicks, explosions, picking up objects) to a Verlet simulation.
+
+---
+
+## References
+
+- Jakobsen, "Advanced Character Physics," GDC 2001 — the canonical Verlet-ragdoll paper. Establishes both the position-Verlet integration form and the iterative distance-constraint projection used here.
+- Müller, Heidelberger, Hennix, Ratcliff, "Position Based Dynamics," 2007 — modern generalisation of Jakobsen's projection idea, covering arbitrary constraint types beyond fixed distance.
+- Wikipedia, "Verlet integration" — derivation of the velocity-implicit form `new_pos = pos + (pos − old_pos) · damping + accel · dt²`.
+- Hecker, "Behind the Screen — Verlet Physics," *Game Developer Magazine*, 2005 — readable walkthrough with diagrams of the same constraint+bounce pipeline used in `ragdoll_figure.c`.

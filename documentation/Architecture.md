@@ -4052,15 +4052,15 @@ The sign convention is **opposite** to `ik_spider.c`. In the spider the hips ext
 
 ### Heading-Based Rotation System
 
-All hip attachment positions and rest foot targets are defined in body-local space (body faces +x). `rotate2d(v, heading)` transforms them to world space each tick. This means the same static tables `HIP_LOCAL_X/Y` and `REST_FORWARD/SIDE` work for any heading — no per-direction special cases. The render layer performs a short-arc heading lerp between `prev_heading` and `heading` using the same ±π normalization trick to avoid a visual snap when heading crosses ±π.
+All hip attachment positions and rest foot targets are defined in body-local space (body faces +x). `rotate2d(v, heading)` transforms them to world space each tick. This means the same static tables `HIP_LOCAL_X/Y` and `REST_FORWARD/SIDE` work for any heading — no per-direction special cases. Heading interpolates toward `target_heading` at `TURN_RATE` rad/s using a short-arc wrap to ±π so a 180° steer always takes the shorter way round.
 
 ### Stretch-Snap Mechanism
 
 After a toroidal edge wrap or rapid turn, the hip can teleport away from a planted foot. If `|hip − foot| > UPPER_LEN + LOWER_LEN − 2`, the IK solver would receive an out-of-reach target and clamp artificially. The stretch-snap check runs after every hip recompute: it teleports the foot to `rest_target()` immediately (no swing animation) so the solver always receives a valid target. This prevents the one-frame "stretched leg" artifact.
 
-### Sub-tick Alpha Interpolation
+### Variable Timestep
 
-Physics runs at 60 Hz in a fixed-step accumulator. Between ticks, `alpha = sim_accum / tick_ns` linearly interpolates all positions (`prev_*` → current) before drawing. Heading uses short-arc lerp: `bh = prev_heading + normalize(heading − prev_heading) × alpha`. This decouples render frame rate from physics rate, producing smooth motion even at low sim Hz settings.
+This demo uses variable timestep at the render rate — no fixed-step accumulator, no alpha lerp, no `prev_*` snapshots. The simulation is non-stiff (no springs, no rapid oscillators), so a single `dt` from frame to frame is unconditionally stable; the sub-tick interpolation scaffolding buys nothing visually here. `dt` is multiplied by `time_scale` (0.25× ↔ 4× via `[`/`]` keys) and clamped to 100 ms (suspend guard). Fixed-step + alpha lerp remains the right call for the Verlet ragdoll and rope demos — for a pure-IK walker it is over-engineering.
 
 *Files: `animation/hexpod_tripod.c`*
 

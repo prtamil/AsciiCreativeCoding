@@ -1,85 +1,41 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * snake_forward_kinematics.c — 2-D FK Snake Swimming Across the Terminal
+ * snake_forward_kinematics.c — autonomous FK snake bouncing inside the screen
  *
- * DEMO: A 32-segment snake swims autonomously across the screen in a
- *       smooth sinusoidal S-curve path.  The screen wraps toroidally so
- *       the snake never stops.  All wave parameters are configurable
- *       at runtime — no manual steering; the motion is a pure simulation.
+ * DEMO: A 32-segment snake swims autonomously along a smooth sinusoidal
+ *       S-curve. When it nears any screen edge, an edge-bias steering term
+ *       turns it inward — the snake naturally curves back rather than
+ *       wrapping or flying off.
  *
- * STUDY ALONGSIDE: framework.c (canonical loop / timing template)
- *                  bounce_ball.c (continuous-motion physics reference)
+ * Study alongside: snake_inverse_kinematics.c (same body, IK head + bouncing target)
  *
- * ─────────────────────────────────────────────────────────────────────────
- *  Section map
- * ─────────────────────────────────────────────────────────────────────────
- *   §1  config        — all tunables in one place
- *   §2  clock         — monotonic clock + sleep (verbatim from framework)
- *   §3  color         — 7-step warm-to-cool gradient + dedicated HUD pair
- *   §4  coords        — pixel↔cell aspect-ratio helpers
- *   §5  entity        — Snake: trail buffer, path-following FK, renderer
- *       §5a  trail helpers   — push, index, arc-length sampler
- *       §5b  move_head       — steer + translate + wrap + record
- *       §5c  compute_joints  — body placement from trail
- *       §5d  rendering helpers — glyphs, colors, attributes
- *       §5e  draw_segment_dense — dense cell-fill for one segment
- *       §5f  render_chain    — full frame composition
- *   §6  scene         — scene_init / scene_tick / scene_draw wrappers
- *   §7  screen        — ncurses double-buffer display layer
- *   §8  app           — signals, resize, main game loop
- * ─────────────────────────────────────────────────────────────────────────
+ * Section map:
+ *   §1 config   — tunables: speeds, wave, edge bias, geometry
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — 10 themes × 7 body pairs + PAIR_HUD/PAIR_HINT
+ *   §4 coords   — pixel↔cell aspect-ratio bridge
+ *   §5 entity   — Snake: trail buffer, path-following FK, renderer
+ *       §5a trail helpers      — push, index, arc-length sampler
+ *       §5b move_head          — wave + edge bias + translate + clamp + record
+ *       §5c compute_joints     — body placement from trail
+ *       §5d rendering helpers  — glyphs, pair, attribute
+ *       §5e mark_cell          — central glyph stamp helper
+ *       §5f draw_segment_beads — bead fill for one segment
+ *       §5g render_chain       — full frame composition
+ *   §6 scene    — scene_init / scene_tick / scene_draw
+ *   §7 screen   — ncurses double-buffer display layer
+ *   §8 app      — signals, resize, main game loop
  *
- * HOW THIS SNAKE WORKS — PATH-FOLLOWING FORWARD KINEMATICS
- * ─────────────────────────────────────────────────────────
- *
- * A naive FK snake computes body positions each frame from a static
- * formula:
- *   joint[i+1] = joint[i] − SEG_LEN × (cos θᵢ, sin θᵢ)
- *   θᵢ = heading + A·sin(ωt + i·φ)
- *
- * This is stateless — it recalculates the entire chain from scratch each
- * tick.  Turning the head does not actually curve the body; it just
- * shifts the sine wave's origin.  The body looks rigid and disconnected
- * because it has no memory of the path the head actually took.
- *
- * THE CORRECT APPROACH — trail buffer + arc-length sampling:
- *
- *   1. Every simulation tick, push joint[0] (head position) into a
- *      circular trail buffer.  This buffer IS the complete positional
- *      history of the head.
- *
- *   2. To place body joint i, walk backward along the trail until the
- *      cumulative arc length equals i × SEG_LEN_PX, then interpolate:
- *
- *        joint[i] = trail_sample( i × SEG_LEN_PX )
- *
- *   The body now traces the EXACT PATH the head carved — every curve,
- *   loop, and bend propagates down the chain naturally, with no per-joint
- *   angle formula required.  The trail buffer is the only state needed.
- *
- * AUTONOMOUS STEERING — continuous sinusoidal heading change:
- *
- *   dheading/dt = amplitude × sin(frequency × wave_time)
- *
- *   The heading angle oscillates symmetrically around its mean, carving
- *   a smooth S-curve without any user input.  Because the turn rate is
- *   integrated into the heading each tick (not applied as a discrete
- *   jump), and because the body follows the actual path recorded in the
- *   trail, the motion is physically continuous at every level.
- *
- *   All wave parameters are tunable at runtime — see §1 for the
- *   geometric meaning of each value.
- *
- * Keys  (simulation parameters only — motion is fully autonomous):
+ * Keys (simulation parameters only — motion is fully autonomous):
  *   q / ESC       quit
  *   space         pause / resume
  *   ↑ / ↓         move speed faster / slower
- *   ← / →         undulation frequency slower / faster
+ *   ← / →, a / d  undulation frequency slower / faster
  *   w / s         swim amplitude wider / narrower
- *   a / d         undulation frequency slower / faster  (same as ←/→)
- *   + / =         wave-time scale faster
- *   -             wave-time scale slower
- *   ] / [         raise / lower simulation Hz
+ *   + / -         wave-time scale faster / slower
+ *   t / T         next / previous theme
+ *   r / R         reset (theme preserved)
+ *   ] / [         sim Hz + / -
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra \
@@ -88,33 +44,139 @@
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Path-following FK.  The head's past pixel positions are
- *                  stored tick-by-tick in a circular trail buffer.  Each
- *                  body joint is placed by measuring cumulative arc length
- *                  backward along the trail and linearly interpolating.
- *                  No per-segment angle computation is needed; the trail
- *                  encodes the full geometry of the path already taken.
- *                  Sinusoidal auto-steering turns the heading continuously,
- *                  producing smooth S-curve locomotion with no user input.
+ * Algorithm      : Path-following FK with sinusoidal auto-steering and
+ *                  edge-bias soft fence. The head's past pixel positions
+ *                  are stored tick-by-tick in a circular trail buffer.
+ *                  Each body joint is placed by walking that buffer until
+ *                  the accumulated arc length equals i · SEG_LEN_PX, then
+ *                  linearly interpolating. No per-joint angle formula is
+ *                  needed; the trail encodes the full geometry of the
+ *                  past path. The autonomous steering integrates a sine-
+ *                  wave turn rate into the heading each tick, producing
+ *                  a continuous S-curve. When the head approaches any
+ *                  edge, an additional inward turn is added proportional
+ *                  to penetration depth (an artificial-potential field
+ *                  with linear falloff inside an EDGE_MARGIN_PX band).
  *
- * Data-structure : Circular trail buffer: Vec2 trail[TRAIL_CAP], one entry
- *                  per simulation tick.  trail_head is the write pointer;
- *                  trail_at(k) retrieves the entry k ticks in the past.
- *                  Two joint arrays — joint[] (current) and prev_joint[]
- *                  (start of this tick) — enable sub-tick alpha lerp.
+ * Data-structure : trail[TRAIL_CAP] is a Vec2 ring buffer; trail_head is
+ *                  the write cursor; trail_at(k) returns the entry k ticks
+ *                  back. joint[N_SEGS+1] is the current chain; prev_joint[]
+ *                  is its snapshot at the start of the tick (anchor for
+ *                  sub-tick alpha lerp). All positions live in pixel space
+ *                  — square, isotropic — so the curve's geometry is correct
+ *                  regardless of terminal cell aspect ratio.
  *
- * Rendering      : draw_segment_dense() walks each of the 32 segments in
- *                  DRAW_STEP_PX pixel increments, stamping a direction
- *                  glyph (- | / \) at every terminal cell the line passes
- *                  through.  A warm-to-cool 7-step color gradient runs
- *                  head→tail.  The head arrow is drawn last (always on top).
- *                  Alpha interpolation blends prev/current joint positions
- *                  for motion that is smooth at any render frame rate.
+ * Rendering      : draw_segment_beads() walks each of the 32 segments in
+ *                  DRAW_STEP_PX increments, stamping 'o' at every cell the
+ *                  line crosses (cell-dedup avoids attr flicker). A second
+ *                  pass over-stamps each joint with a graded node ('0' /
+ *                  'o' / '.') and the head is drawn last as a directional
+ *                  arrow. A 10-theme warm-to-cool palette runs head→tail.
+ *                  Alpha interpolation between prev_joint and joint keeps
+ *                  motion smooth at any sim/render rate combination.
  *
- * Performance    : Fixed-step accumulator (see §8) decouples physics Hz
- *                  from render Hz.  ncurses diff engine (doupdate) sends
- *                  only changed cells to the terminal fd — typically 60–120
- *                  cells changed per frame for a moving snake on a dark bg.
+ * Performance    : Fixed-step accumulator decouples physics Hz from render
+ *                  Hz. trail_sample is O(distance/speed) per joint; with
+ *                  32 joints at 60 Hz this is well under 1 µs per frame.
+ *                  ncurses doupdate transmits only changed cells.
+ *
+ * References     : Khoshrou, "Snake Robot Locomotion," 2009 — analysis of
+ *                    serpentine FK on a moving curve.
+ *                  Reynolds, "Steering Behaviors for Autonomous Characters,"
+ *                    1999 — the seminal source for edge-bias / containment.
+ *                  Wikipedia: "Forward kinematics" — chained-frame model.
+ *                  Red Blob Games, "2D Visibility / Field of View" — the
+ *                    cell-walk pattern reused here for bead rendering.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * The body never has its own physics — it just remembers where the head
+ * has been. Place joint i exactly i·SEG_LEN_PX behind the head along the
+ * recorded path, and the chain bends naturally with every curve. The
+ * head's heading is itself driven by a sine wave (autonomous wiggle); a
+ * second steering term bends it inward whenever it gets close to any
+ * screen edge, so the snake stays on-screen forever without wrapping.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a marker drawn across paper, with 32 dots strung behind the
+ * pen at fixed bead spacings along the inked line. Whatever the pen's
+ * curve looks like, the dots curve the same way — they ARE the line,
+ * just sampled at later distances. The wiggle comes from the pen's
+ * built-in oscillating "wrist". The wall-bounce is a second hand
+ * gently nudging the wrist whenever it strays too close to the edge of
+ * the page — gradual, never a sharp slap.
+ *
+ * DRAWING METHOD / ALGORITHM IN STEPS
+ * ───────────────────────────────────
+ *   1. Save prev_joint = joint                     (anchor for alpha lerp)
+ *   2. wave_time += dt · speed_scale
+ *   3. turn_wave  = amplitude · sin(frequency · wave_time)
+ *   4. turn_edge  = edge_bias_turn(joint[0], wpx, hpx) (see KEY FORMULAS)
+ *   5. heading   += (turn_wave + turn_edge) · dt
+ *   6. joint[0]  += move_speed · (cos heading, sin heading) · dt
+ *   7. Hard-clamp joint[0] to [0,wpx] × [0,hpx]      (safety net)
+ *   8. trail_push(joint[0])
+ *   9. For i in 1..N_SEGS: joint[i] = trail_sample(i · SEG_LEN_PX)
+ *  10. Render: lerp prev_joint → joint by alpha; bead-fill, node markers,
+ *      head arrow.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Sinusoidal auto-turn:
+ *     turn_wave = amplitude · sin(frequency · wave_time)            [rad/s]
+ *
+ *   Edge-bias steering (linear potential inside EDGE_MARGIN_PX):
+ *     fx = max(0, (margin − x)/margin) − max(0, (x − (wpx−margin))/margin)
+ *     fy = max(0, (margin − y)/margin) − max(0, (y − (hpx−margin))/margin)
+ *     desired = atan2(fy, fx)             (inward direction unit vector)
+ *     delta   = wrap_pi(desired − heading)
+ *     turn_edge = delta · sqrt(fx² + fy²) · EDGE_TURN_GAIN          [rad/s]
+ *
+ *   Trail arc-length sampling (place joint i):
+ *     walk trail newest→oldest, accumulating |trail[k+1] − trail[k]|;
+ *     when accum ≥ i · SEG_LEN_PX, lerp into the segment that crossed it.
+ *
+ *   Pixel→cell aspect bridge:
+ *     cx = round(px / CELL_W)              (CELL_W = 8)
+ *     cy = round(py / CELL_H)              (CELL_H = 16)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • If two consecutive trail samples land on the same pixel (paused or
+ *     speed=0), trail_sample's normalisation would divide by zero. Guard
+ *     with `seg = max(seg, 1e-4f)` in the lerp denominator.
+ *   • Heading is allowed to grow unbounded — sin/cos handle wrap. Do NOT
+ *     normalise to ±π in move_head; the discontinuity at the wrap point
+ *     causes a one-frame direction jerk.
+ *   • Edge bias must clamp the position too — at very high speeds (500 px/s)
+ *     the turn rate may not catch up, so a hard clamp is the safety net.
+ *   • Resize: rope_len_px scales with terminal rows but trail content
+ *     does not — the body length stays constant in pixels regardless of
+ *     terminal size. That is intentional; body length should not change
+ *     when the user just makes the window wider.
+ *   • Frame cap: never `elapsed = clock_ns() − frame_time + dt` — the +dt
+ *     cancels the cap; sleep is always 0 and CPU pegs at 100 %. Use
+ *     `clock_ns() − frame_start` with a fresh snapshot.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Set amplitude=0 (s key until 0): the snake swims straight. Drive it
+ *     toward any wall — it should curve away within EDGE_MARGIN_PX of the
+ *     edge, not wrap to the other side and not exit.
+ *   • Crank move_speed to MAX (UP×many): even at 500 px/s the head must
+ *     stay inside (the hard clamp catches anything edge bias misses).
+ *   • Pause (space): joints freeze in place; resume is glitch-free.
+ *   • Theme cycle (t/T): every theme entry is legible against a default
+ *     terminal background under A_DIM. No segment "disappears" at the tail
+ *     end. Confirms the cube ≥ 24 brightness rule.
+ *   • Reset (r/R) repeatedly: every reset places the head ≥ EDGE_MARGIN_PX
+ *     from any edge so it has room to start swimming without an immediate
+ *     edge-bias kick.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -175,12 +237,15 @@ enum {
     /*
      * N_PAIRS — number of gradient color pairs for the snake body (§3).
      * Pairs 1..7 map head→tail from warm (yellow) to cool (blue).
-     * HUD_PAIR = 8 is dedicated to both HUD bars so their color is
-     * independent of the snake gradient and never accidentally changes
-     * if N_PAIRS is adjusted.
+     *
+     * PAIR_HUD / PAIR_HINT — dedicated, theme-independent pairs for the
+     * top status and bottom key-hint bars per the project HUD spec.
+     * Their colours never shift when the body palette cycles, so the
+     * HUD stays readable against any backdrop.
      */
     N_PAIRS          =   7,
-    HUD_PAIR         =   8,
+    PAIR_HUD         =   8,   /* bright yellow — top status bar  */
+    PAIR_HINT        =   9,   /* bright cyan   — bottom key hint */
     N_THEMES         =  10,
 
     /*
@@ -307,6 +372,29 @@ enum {
 #define SPEED_SCALE_DEFAULT  1.0f
 
 /*
+ * Edge-bias steering — keeps the snake on-screen without toroidal wrap.
+ *
+ * Inside an EDGE_MARGIN_PX band along each edge, an inward-pointing
+ * "potential" is summed and converted to an extra turn rate.  Outside
+ * the band the bias is zero, so the wave-driven motion is unaffected
+ * in the screen interior.
+ *
+ * EDGE_MARGIN_PX — width of the soft-fence band, in pixels.
+ *   80 px ≈ 10 columns / 5 rows.  Wide enough that the edge-turn starts
+ *   gently and curves the snake back over several body lengths; narrow
+ *   enough that the snake still uses most of the screen interior.
+ *
+ * EDGE_TURN_GAIN — gain on the edge-bias turn rate (rad/s per unit
+ *   penetration).  At max penetration (snake right at the wall) the
+ *   strength factor is ~1, so the peak edge turn ≈ EDGE_TURN_GAIN rad/s.
+ *   3.5 turns the snake about 200°/s at the wall — fast enough to round
+ *   the corner before crossing it, slow enough to look like a deliberate
+ *   curve, not a hard reflection.
+ */
+#define EDGE_MARGIN_PX     80.0f
+#define EDGE_TURN_GAIN      3.5f
+
+/*
  * Timing primitives — verbatim from framework.c.
  *
  * NS_PER_SEC / NS_PER_MS: unit conversion constants.
@@ -379,55 +467,84 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Theme — one named color palette.
- * body[N_PAIRS]: xterm-256 foreground indices for pairs 1..7 (head→tail).
- * hud: foreground index for HUD_PAIR (pair 8).
+ * Theme — one named body palette.
+ *
+ *   name   — displayed in the HUD status bar.
+ *   body[] — 7 xterm-256 foreground indices for pairs 1..7 (head→tail).
+ *
+ * Brightness rule: every body[] entry is in the bright half of the
+ * 256-colour cube (≥ 24).  Indices 16–23 (cube near-blacks) and 232–239
+ * (gray near-blacks) become invisible under A_DIM at the tail-quarter
+ * of the body, so they are avoided.
+ *
  * theme_apply() calls init_pair() live; switching themes takes effect on
- * the very next frame without restarting ncurses.
+ * the very next frame.  PAIR_HUD/PAIR_HINT are theme-independent and are
+ * configured once in color_init().
  */
 typedef struct {
     const char *name;
     int         body[N_PAIRS];
-    int         hud;
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
-    /* name      head←────────────────────────────→tail  hud  */
-    {"Solar",  {226, 220, 214, 208, 202, 196, 160}, 226},
-    {"Matrix", { 22,  28,  34,  40,  46,  82, 118},  46},
-    {"Ocean",  { 17,  18,  19,  20,  21,  27,  51}, 123},
-    {"Fire",   {196, 202, 208, 214, 220, 226, 227}, 226},
-    {"Nova",   { 54,  55,  56,  57,  93, 129, 165}, 201},
-    {"Medusa", { 57,  63,  93,  99, 105, 111, 159}, 226},
-    {"Lava",   { 52,  88, 124, 160, 196, 202, 208}, 196},
-    {"Ghost",  {237, 238, 239, 240, 241, 250, 255}, 255},
-    {"Aurora", { 22,  28,  64,  71,  78, 121, 159}, 159},
-    {"Neon",   {201, 165, 129,  93,  57,  51,  45}, 201},
+    /* name      head ←─────────────────────→ tail */
+    {"Solar",  {226, 220, 214, 208, 202, 196, 160}},
+    {"Matrix", { 28,  34,  40,  76,  46,  82, 118}},
+    {"Ocean",  { 24,  25,  31,  33,  39,  45,  51}},
+    {"Fire",   {196, 202, 208, 214, 220, 226, 227}},
+    {"Nova",   { 54,  55,  56,  57,  93, 129, 165}},
+    {"Medusa", { 57,  63,  93,  99, 105, 111, 159}},
+    {"Lava",   { 52,  88, 124, 160, 196, 202, 208}},
+    {"Ghost",  {244, 245, 247, 249, 251, 253, 255}},
+    {"Aurora", { 28,  34,  64,  71,  78, 121, 159}},
+    {"Neon",   {201, 165, 129,  93,  57,  51,  45}},
 };
 
+/*
+ * theme_apply() — register the body palette with ncurses.
+ *
+ * Background is -1 (terminal default) so demos respect the user's theme.
+ * On 8-colour terminals, falls back to a yellow→green→cyan→blue gradient
+ * that approximates the warm-to-cool feel of every 256-colour theme.
+ */
 static void theme_apply(int idx)
 {
     const Theme *th = &THEMES[idx];
     if (COLORS >= 256) {
         for (int p = 0; p < N_PAIRS; p++)
-            init_pair(p + 1, th->body[p], COLOR_BLACK);
-        init_pair(HUD_PAIR, th->hud, COLOR_BLACK);
+            init_pair(p + 1, th->body[p], -1);
     } else {
         static const int fb8[N_PAIRS] = {
             COLOR_YELLOW, COLOR_YELLOW, COLOR_GREEN,
             COLOR_GREEN,  COLOR_CYAN,   COLOR_CYAN, COLOR_BLUE
         };
         for (int p = 0; p < N_PAIRS; p++)
-            init_pair(p + 1, fb8[p], COLOR_BLACK);
-        init_pair(HUD_PAIR, COLOR_YELLOW, COLOR_BLACK);
+            init_pair(p + 1, fb8[p], -1);
     }
 }
 
+/*
+ * color_init() — one-time colour system setup.
+ *
+ *   start_color()        — initialise ncurses colour support.
+ *   use_default_colors() — allow background = -1 to mean "terminal default".
+ *   theme_apply()        — register the initial body palette.
+ *   PAIR_HUD / PAIR_HINT — bright yellow / cyan, theme-independent per
+ *                          the project HUD spec.
+ */
 static void color_init(int initial_theme)
 {
     start_color();
     use_default_colors();
     theme_apply(initial_theme);
+
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
+        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
+    } else {
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
+    }
 }
 
 /* ===================================================================== */
@@ -650,78 +767,123 @@ static Vec2 trail_sample(const Snake *s, float dist)
 /* ── §5b  move_head ─────────────────────────────────────────────────── */
 
 /*
- * move_head() — advance wave_time, update heading, translate head, wrap.
+ * wrap_pi() — fold any radian value into the canonical (−π, π] range.
+ *
+ * Used by edge_bias_turn() so the (desired − heading) angular delta is
+ * a *signed shortest-arc* turn rather than the raw difference, which
+ * could be 2π − ε (turn the long way around) when the heading and the
+ * desired direction straddle the ±π wrap boundary.
+ */
+static inline float wrap_pi(float a)
+{
+    while (a >  (float)M_PI) a -= 2.0f * (float)M_PI;
+    while (a < -(float)M_PI) a += 2.0f * (float)M_PI;
+    return a;
+}
+
+/*
+ * edge_bias_turn() — soft-fence inward steering rate, in rad/s.
+ *
+ * WHAT: Returns an additional turn rate to add to the autonomous wave
+ *   turn whenever the head is within EDGE_MARGIN_PX of any screen edge.
+ *   Outside that band the function returns 0 — the snake's interior
+ *   motion is unaffected.
+ *
+ * HOW (artificial-potential field with linear falloff):
+ *   1. For each side, measure how deep the head has penetrated into the
+ *      margin band (0 = right at the edge of the band, 1 = at the wall):
+ *        depth_left = max(0, (margin − x) / margin)
+ *        depth_right, depth_top, depth_bot — analogous.
+ *
+ *   2. Sum depth contributions into an inward-pointing 2-D vector:
+ *        fx = depth_left − depth_right        (push east − push west)
+ *        fy = depth_top  − depth_bot          (push south − push north)
+ *
+ *      |(fx, fy)| ∈ [0, √2] grows as the head penetrates further.
+ *
+ *   3. Convert to a desired heading (atan2) and take the signed shortest
+ *      arc to the current heading.
+ *
+ *   4. Scale by penetration magnitude × EDGE_TURN_GAIN to get a turn
+ *      rate in rad/s.  Deeper penetration → harder turn-back.
+ *
+ * WHY THIS SHAPE OF FALLOFF:
+ *   Linear (rather than quadratic or stepped) falloff makes the steering
+ *   start gently at the band's outer edge and ramp up smoothly toward
+ *   the wall — visually it looks like the snake "notices" the wall and
+ *   curves away, rather than slapping into a hard reflection.
+ */
+static float edge_bias_turn(const Snake *s, float wpx, float hpx)
+{
+    float margin = EDGE_MARGIN_PX;
+    float x = s->joint[0].x;
+    float y = s->joint[0].y;
+
+    float fx = 0.0f, fy = 0.0f;
+    if (x < margin)          fx += (margin - x)         / margin;
+    if (x > wpx - margin)    fx -= (x - (wpx - margin)) / margin;
+    if (y < margin)          fy += (margin - y)         / margin;
+    if (y > hpx - margin)    fy -= (y - (hpx - margin)) / margin;
+
+    if (fx == 0.0f && fy == 0.0f) return 0.0f;
+
+    float strength = sqrtf(fx * fx + fy * fy);
+    float desired  = atan2f(fy, fx);
+    float delta    = wrap_pi(desired - s->heading);
+    return delta * strength * EDGE_TURN_GAIN;
+}
+
+/*
+ * move_head() — advance wave_time, update heading, translate, clamp, record.
  *
  * Called once per simulation tick by scene_tick().  This function is the
  * sole writer of wave_time, heading, and joint[0].
  *
- * STEP 1 — advance wave_time.
- *   wave_time += dt × speed_scale
- *   wave_time is a pure accumulator; it is only ever used as the argument
- *   to sinf().  Multiplying dt by speed_scale stretches or compresses the
- *   wave in time without affecting move_speed or heading directly.
+ * STEP 1 — advance wave_time (scaled).
+ * STEP 2 — sinusoidal autonomous turn rate, INTEGRATED into heading.
+ *          Integration (not assignment) gives smooth continuous curvature.
+ * STEP 3 — edge-bias turn rate, also integrated into heading.
+ *          Soft-fence inside EDGE_MARGIN_PX; zero outside.
+ * STEP 4 — translate head along heading by move_speed × dt.
+ * STEP 5 — hard-clamp position into [0,wpx] × [0,hpx].  This is the safety
+ *          net for the rare case where, at very high speed, the edge-bias
+ *          turn cannot redirect the head fast enough.  Without this, a
+ *          single very-large-dt frame (debugger pause + resume) could fling
+ *          the head past the wall.
+ * STEP 6 — push the new head position into the trail.  compute_joints()
+ *          then samples this freshly pushed trail to place body joints.
  *
- * STEP 2 — compute sinusoidal turn rate and integrate into heading.
- *   turn = amplitude × sin(frequency × wave_time)   [rad/s]
- *   heading += turn × dt                            [rad]
- *
- *   Why integrate rather than directly assign?  Because a snake's heading
- *   is the integral of its angular velocity over time.  Assigning heading
- *   directly would produce a square-wave heading change (instant snap to
- *   each new angle), which is the wrong physical model.  Integration gives
- *   the smooth continuous curvature of real muscle-driven locomotion.
- *
- *   heading is not normalised to [0, 2π) here.  It accumulates freely as
- *   a float.  sinf/cosf are periodic so this causes no error, and avoiding
- *   normalisation prevents a tiny discontinuity when heading crosses the
- *   ±π wrap boundary (which would be visible as a one-frame direction jerk).
- *
- * STEP 3 — translate head along heading.
- *   joint[0].x += move_speed × cos(heading) × dt
- *   joint[0].y += move_speed × sin(heading) × dt
- *
- *   cos(heading) → east component (x increases eastward).
- *   sin(heading) → south component (y increases downward in terminal space).
- *   heading = 0   → moves east.    heading = π/2 → moves south.
- *   This matches the pixel coordinate convention (§4) where +y is downward.
- *
- * STEP 4 — toroidal screen wrap.
- *   When joint[0] exits the pixel-space boundary on any side, it re-enters
- *   from the opposite side.  The body lags behind: its joints will cross the
- *   boundary one by one over the next N_SEGS ticks as the trail empties out
- *   of the old side.  During the transition, out-of-bounds joints are
- *   clipped by the bounds check in draw_segment_dense() — they simply do
- *   not get drawn.  This produces the natural "snake appears from the other
- *   side" effect without any special wrap-aware rendering.
- *
- * STEP 5 — push joint[0] into the trail.
- *   The push happens AFTER translation so the trail records the head's
- *   final position for this tick.  compute_joints() then samples this
- *   freshly pushed trail to place the body (called from scene_tick).
+ * heading is NOT normalised to (−π, π] inside this function — sin/cos are
+ * periodic, and skipping normalisation prevents a one-frame direction
+ * jerk when the heading crosses the wrap boundary.  edge_bias_turn() does
+ * its own wrap-pi on the angular delta, so unbounded heading is fine here.
  */
 static void move_head(Snake *s, float dt, int cols, int rows)
 {
     /* Step 1: advance the wave clock */
     s->wave_time += dt * s->speed_scale;
 
-    /* Step 2: sinusoidal turn — integrate turn rate into heading */
-    float turn = s->amplitude * sinf(s->frequency * s->wave_time);
-    s->heading += turn * dt;
+    /* Step 2: sinusoidal autonomous turn */
+    float turn_wave = s->amplitude * sinf(s->frequency * s->wave_time);
 
-    /* Step 3: translate head in pixel space */
-    float wpx = (float)(cols * CELL_W);   /* total pixel width  */
-    float hpx = (float)(rows * CELL_H);   /* total pixel height */
+    /* Step 3: edge-bias turn (zero unless within EDGE_MARGIN_PX of an edge) */
+    float wpx       = (float)(cols * CELL_W);
+    float hpx       = (float)(rows * CELL_H);
+    float turn_edge = edge_bias_turn(s, wpx, hpx);
 
+    s->heading += (turn_wave + turn_edge) * dt;
+
+    /* Step 4: translate head in pixel space */
     s->joint[0].x += s->move_speed * cosf(s->heading) * dt;
     s->joint[0].y += s->move_speed * sinf(s->heading) * dt;
 
-    /* Step 4: toroidal wrap */
-    if (s->joint[0].x <  0.0f) s->joint[0].x += wpx;
-    if (s->joint[0].x >= wpx)  s->joint[0].x -= wpx;
-    if (s->joint[0].y <  0.0f) s->joint[0].y += hpx;
-    if (s->joint[0].y >= hpx)  s->joint[0].y -= hpx;
+    /* Step 5: hard clamp — safety net for the highest speeds */
+    if (s->joint[0].x < 0.0f) s->joint[0].x = 0.0f;
+    if (s->joint[0].x > wpx)  s->joint[0].x = wpx;
+    if (s->joint[0].y < 0.0f) s->joint[0].y = 0.0f;
+    if (s->joint[0].y > hpx)  s->joint[0].y = hpx;
 
-    /* Step 5: record this tick's head position in the trail */
+    /* Step 6: record this tick's head position in the trail */
     trail_push(s, s->joint[0]);
 }
 
@@ -854,23 +1016,38 @@ static chtype head_glyph(float heading)
     return                             (chtype)'^';
 }
 
-/* ── §5e  draw_segment_beads ────────────────────────────────────────── */
+/* ── §5e  mark_cell — central glyph stamp helper ────────────────────── */
+
+/*
+ * mark_cell() — stamp one ASCII glyph at terminal cell (cx,cy).
+ *
+ * Centralises the (chtype)(unsigned char) cast, bounds-check, and the
+ * wattron/wattroff sandwich that would otherwise be repeated at every
+ * mvwaddch site.  The double cast prevents sign-extension on character
+ * values > 127 (per CLAUDE.md "Common ncurses Bugs").  Glyph is silently
+ * dropped if the cell is off-screen.
+ */
+static void mark_cell(WINDOW *w, int cx, int cy, char ch,
+                      int pair, attr_t attr, int cols, int rows)
+{
+    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+    wattron(w, COLOR_PAIR(pair) | attr);
+    mvwaddch(w, cy, cx, (chtype)(unsigned char)ch);
+    wattroff(w, COLOR_PAIR(pair) | attr);
+}
+
+/* ── §5f  draw_segment_beads ────────────────────────────────────────── */
 
 /*
  * draw_segment_beads() — fill segment a→b with 'o' beads at DRAW_STEP_PX
  * intervals (pass 1 of the two-pass bead render).
  *
- * Each cell touched by the walk receives an 'o' character using the
- * gradient pair for this segment.  A per-call dedup cursor (prev_cx/prev_cy)
- * avoids stamping the same cell twice, which would cause flicker artefacts
- * when two adjacent samples land on the same terminal cell.
+ * Walks the segment in pixel space; per-call dedup (prev_cx/prev_cy)
+ * prevents a cell from being stamped twice, which would cause attribute
+ * flicker.  Cells outside the screen are silently skipped by mark_cell.
  *
- * Pass 2 (in render_chain) overwrites joint positions with '0'/'o'/'.'
+ * Pass 2 (in render_chain) over-stamps joint positions with '0'/'o'/'.'
  * node markers, giving the chain its articulated bead appearance.
- *
- * OUT-OF-BOUNDS CLIPPING:
- *   Cells outside [0,cols)×[0,rows) are silently skipped so toroidal wrap
- *   transitions (body partially off-screen) are handled without special code.
  */
 static void draw_segment_beads(WINDOW *w,
                                 Vec2 a, Vec2 b,
@@ -892,75 +1069,100 @@ static void draw_segment_beads(WINDOW *w,
 
         if (cx == prev_cx && cy == prev_cy) continue;
         prev_cx = cx;  prev_cy = cy;
-        if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
-
-        wattron(w, COLOR_PAIR(pair) | attr);
-        mvwaddch(w, cy, cx, 'o');
-        wattroff(w, COLOR_PAIR(pair) | attr);
+        mark_cell(w, cx, cy, 'o', pair, attr, cols, rows);
     }
 }
 
-/* ── §5f  render_chain ──────────────────────────────────────────────── */
+/* ── §5g  render_chain ──────────────────────────────────────────────── */
 
 /*
- * render_chain() — compose the complete snake frame (two-pass bead style).
+ * lerp_joints() — fill rj[] with alpha-interpolated render positions.
  *
- * STEP 1 — sub-tick alpha interpolation.
- *   rj[i] = lerp(prev_joint[i], joint[i], alpha) for all joints.
- *   Eliminates micro-stutter at any combination of sim Hz and render Hz.
+ * rj[i] = prev_joint[i] + (joint[i] − prev_joint[i]) · alpha
  *
- * STEP 2 — bead fill, tail → head (pass 1).
- *   draw_segment_beads() fills each segment with 'o' at DRAW_STEP_PX
- *   intervals using the gradient pair for that segment.  Tail-first draw
- *   order ensures head-end segments overwrite tail segments on overlaps.
- *
- * STEP 3 — joint node markers, tail → head (pass 2).
- *   joint_node_char(i) stamps '0'/'o'/'.' at each rj[i], overwriting the
- *   fill beads at joint positions and giving the chain its articulated look.
- *
- * STEP 4 — head arrow, drawn last so it always wins.
- *   head_glyph() maps the current heading to >, v, <, ^ at rj[0].
+ * alpha ∈ [0,1) is the leftover fraction in the fixed-step accumulator.
+ * Without this lerp, motion stutters whenever render Hz ≠ sim Hz; with
+ * it, the snake glides smoothly at any combination of the two rates.
  */
-static void render_chain(const Snake *s, WINDOW *w,
-                          int cols, int rows, float alpha)
+static void lerp_joints(const Snake *s, float alpha, Vec2 rj[N_SEGS + 1])
 {
-    /* Step 1 — interpolated render positions */
-    Vec2 rj[N_SEGS + 1];
     for (int i = 0; i <= N_SEGS; i++) {
         rj[i].x = s->prev_joint[i].x
                 + (s->joint[i].x - s->prev_joint[i].x) * alpha;
         rj[i].y = s->prev_joint[i].y
                 + (s->joint[i].y - s->prev_joint[i].y) * alpha;
     }
+}
 
-    /* Step 2 — bead fill: tail → head */
+/*
+ * draw_body_fill() — bead-fill every segment, tail → head.
+ *
+ * Tail-first ordering ensures head-end segments over-stamp tail segments
+ * on cells where two segments cross — the warmer head colour wins.
+ */
+static void draw_body_fill(WINDOW *w, const Vec2 rj[N_SEGS + 1],
+                           int cols, int rows)
+{
     for (int i = N_SEGS - 1; i >= 0; i--) {
         draw_segment_beads(w,
                            rj[i + 1], rj[i],
                            seg_pair(i), seg_attr(i),
                            cols, rows);
     }
+}
 
-    /* Step 3 — joint node markers: tail → head (overwrite fill beads) */
+/*
+ * draw_body_nodes() — over-stamp graded node markers at every joint.
+ *
+ * Drawn tail → head so the warmest colour wins on overlap.  Each marker
+ * uses its segment's pair (i−1), keeping the colour gradient continuous
+ * across the body.
+ */
+static void draw_body_nodes(WINDOW *w, const Vec2 rj[N_SEGS + 1],
+                            int cols, int rows)
+{
     for (int i = N_SEGS; i >= 1; i--) {
         int cx = px_to_cell_x(rj[i].x);
         int cy = px_to_cell_y(rj[i].y);
-        if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
-        int    p = seg_pair(i - 1);
-        attr_t a = seg_attr(i - 1);
-        wattron(w, COLOR_PAIR(p) | a);
-        mvwaddch(w, cy, cx, joint_node_char(i));
-        wattroff(w, COLOR_PAIR(p) | a);
+        char ch = (char)joint_node_char(i);
+        mark_cell(w, cx, cy, ch,
+                  seg_pair(i - 1), seg_attr(i - 1),
+                  cols, rows);
     }
+}
 
-    /* Step 4 — head arrow always on top */
-    int hx = px_to_cell_x(rj[0].x);
-    int hy = px_to_cell_y(rj[0].y);
-    if (hx >= 0 && hx < cols && hy >= 0 && hy < rows) {
-        wattron(w, COLOR_PAIR(1) | A_BOLD);
-        mvwaddch(w, hy, hx, head_glyph(s->heading));
-        wattroff(w, COLOR_PAIR(1) | A_BOLD);
-    }
+/*
+ * draw_head() — arrow glyph at joint[0], always on top.
+ *
+ * The arrow direction is computed from the current heading, NOT from
+ * the lerp — the head's direction should not stutter when alpha = 0.
+ */
+static void draw_head(WINDOW *w, const Vec2 *head_pos, float heading,
+                      int cols, int rows)
+{
+    int cx = px_to_cell_x(head_pos->x);
+    int cy = px_to_cell_y(head_pos->y);
+    char ch = (char)head_glyph(heading);
+    mark_cell(w, cx, cy, ch, 1 /* PAIR_HEAD */, A_BOLD, cols, rows);
+}
+
+/*
+ * render_chain() — orchestrate one frame in painter's order.
+ *
+ *   1. lerp_joints     — sub-tick interpolation for all 33 joints.
+ *   2. draw_body_fill  — bead fill (bottom layer, tail → head).
+ *   3. draw_body_nodes — graded node markers over-stamp the fill.
+ *   4. draw_head       — directional arrow, always on top.
+ */
+static void render_chain(const Snake *s, WINDOW *w,
+                          int cols, int rows, float alpha)
+{
+    Vec2 rj[N_SEGS + 1];
+    lerp_joints(s, alpha, rj);
+
+    draw_body_fill (w, rj, cols, rows);
+    draw_body_nodes(w, rj, cols, rows);
+    draw_head      (w, &rj[0], s->heading, cols, rows);
 }
 
 /* ===================================================================== */
@@ -1026,7 +1228,9 @@ static void scene_init(Scene *sc, int cols, int rows)
     /* Heading slightly south-east: drifts toward centre on most terminals */
     s->heading = (float)M_PI / 8.0f;
 
-    /* Head at 38% from left, vertically centred */
+    /* Head at 38% from left, vertically centred — well inside the
+     * EDGE_MARGIN_PX band so the snake starts swimming under wave-only
+     * steering, with no edge bias kicking in until it actually nears a wall. */
     s->joint[0].x = (float)(cols * CELL_W) * 0.38f;
     s->joint[0].y = (float)(rows * CELL_H) * 0.50f;
 
@@ -1181,27 +1385,29 @@ static void screen_draw(Screen *s, const Scene *sc,
     erase();
     scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
 
+    /* Top-right status — PAIR_HUD bright yellow, A_BOLD */
     const Snake *sn = &sc->snake;
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
-             " %.1ffps  %dHz  spd:%.0f  amp:%.2f  freq:%.1f  x%.2f  [%s]  %s ",
+             " %5.1f fps  sim:%3d Hz  spd:%.0f  amp:%.2f  freq:%.1f  x%.2f  [%s]  %s ",
              fps, sim_fps,
              sn->move_speed,
              sn->amplitude,
              sn->frequency,
              sn->speed_scale,
              THEMES[sn->theme_idx].name,
-             sn->paused ? "PAUSED" : "swimming");
+             sn->paused ? "PAUSED " : "swimming");
     int hx = s->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    /* Bottom-left key hint — PAIR_HINT bright cyan, A_BOLD */
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(s->rows - 1, 0,
              " q:quit  spc:pause  r:reset  UD:spd  LR/ad:freq  ws:amp  +/-:wave-x  t/T:theme  [/]:Hz ");
-    attroff(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /*
@@ -1465,6 +1671,8 @@ int main(void)
 
     while (app->running) {
 
+        int64_t frame_start = clock_ns();
+
         /* ── ① resize ────────────────────────────────────────────── */
         if (app->need_resize) {
             app_do_resize(app);
@@ -1502,8 +1710,11 @@ int main(void)
             fps_accum   = 0;
         }
 
-        /* ── ⑥ frame cap — sleep before render ──────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
+        /* ── ⑥ frame cap — sleep before render ──────────────────── *
+         * Budget = 1/60 s.  elapsed is wall time spent on physics +
+         * accounting since frame_start; sleep the remainder so the
+         * render rate sits at 60 fps regardless of sim Hz.            */
+        int64_t elapsed = clock_ns() - frame_start;
         clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 
         /* ── ⑦ draw + present ────────────────────────────────────── */

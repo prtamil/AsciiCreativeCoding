@@ -2,236 +2,273 @@
 
 ## Core Idea
 
-A 2D grid where every cell is one of three states — EMPTY, TREE, or FIRE — updated simultaneously each tick by three probabilistic rules:
+A 2D grid where every cell is one of three states — EMPTY, TREE, or
+FIRE — updated simultaneously each tick by four probabilistic rules:
 
 1. **Fire burns out:** FIRE → EMPTY (deterministic, one tick)
-2. **Fire spreads:** TREE → FIRE if any orthogonal neighbour is FIRE (deterministic)
+2. **Fire spreads:** TREE → FIRE if any neighbour is FIRE (deterministic)
 3. **Lightning ignites:** TREE → FIRE with probability `f` (stochastic)
 4. **Regrowth:** EMPTY → TREE with probability `p` (stochastic)
 
-The two parameters `p` and `f` are the whole model. Their ratio `p/f` determines the character of the forest: the distribution of fire sizes, the density of the canopy, and whether fires are frequent-small or rare-catastrophic.
+The two parameters `p` and `f` are the entire model. Their ratio `p/f`
+determines whether the forest is sparse-and-burning-often or dense-and-
+catastrophic, and whether fire-size statistics follow a power law.
 
-Reference: Drossel & Schwabl, *Physical Review Letters* 69(11):1629–1632, 1992.
+Reference: Drossel & Schwabl, *Physical Review Letters* 69(11):1629–1632,
+1992.
 
-## The Mental Model
+## Mental Model
 
 ### Why this is not just a random process
 
-At first glance, TREE→FIRE with probability `f` looks like uncorrelated random sampling. But the state of each cell depends on its neighbours (fire spread), and the neighbours' states depend on their neighbours, and so on. The correlations propagate across the grid and across time. The system develops spatial structure (clusters) and temporal structure (rare large events).
+At first glance, TREE→FIRE with probability `f` looks like uncorrelated
+random sampling. But each cell's fate depends on its neighbours (fire
+spread), and the neighbours' states depend on theirs, and so on. The
+correlations propagate across the grid and across time. The system
+develops spatial structure (clusters) and temporal structure (rare
+large events).
 
 ### The p/f ratio and cluster size
 
-Imagine `f = 0` (no lightning). Trees only burn if a neighbour burns. Starting from a seed fire, the fire can only spread as far as the connected cluster of trees. After it burns out, that region regrows (slowly, with probability `p` per tick). At steady state, the cluster size distribution depends on how long trees grow before the next fire visits — which is controlled by `p/f`.
+Imagine `f = 0` (no lightning). Trees only burn when a neighbour
+burns. Starting from a seed fire, the fire spreads through whatever
+connected cluster of trees it touches. After it burns out, that
+region regrows slowly (probability `p` per tick). At steady state the
+cluster size distribution depends on how long trees grow before the
+next fire visits — controlled by `p/f`.
 
-- High `p/f`: trees grow back quickly, form large clusters → fires can spread very far → occasional system-spanning fires
-- Low `p/f`: trees grow back slowly, clusters stay small → fires exhaust their fuel quickly → many small isolated fires
+- High `p/f`: trees grow back quickly, form large clusters → fires
+  spread very far → occasional system-spanning fires.
+- Low `p/f`: trees grow back slowly, clusters stay small → fires
+  exhaust their fuel quickly → many small isolated fires.
 
 ### Self-organised criticality (SOC)
 
-At a specific ratio (roughly `p/f ≈ 200` for this model), the system sits at the **critical point** of a phase transition. At this point:
+At a specific ratio (roughly `p/f ≈ 200` for this model), the system
+sits at the **critical point** of a phase transition:
 
-- The cluster size distribution is a power law: `P(s) ∝ s^{−τ}`, `τ ≈ 1.19`
-- There is no characteristic fire size — fires at all scales coexist
-- The system reaches this state automatically without tuning (self-organised)
+- Cluster size distribution is a power law `P(s) ∝ s^{−τ}`, τ ≈ 1.19.
+- No characteristic fire size — fires at all scales coexist.
+- The system reaches this state automatically without tuning.
 
-This is the same phenomenon Bak, Tang, and Wiesenfeld called **self-organised criticality (SOC)** in their 1987 sandpile model. Real forests, real earthquakes, and real financial markets all show similar scale-free event size distributions, suggesting they operate near SOC.
+This is the same phenomenon Bak, Tang, and Wiesenfeld called **self-
+organised criticality** in their 1987 sandpile model. Real forests,
+real earthquakes, and real markets all show similar scale-free event
+size distributions.
 
-**Why does it self-organise?** If `p` is too small relative to `f`, fires quickly outstrip regrowth and the forest stays sparse — fires can't spread far. If `p` is too large, dense clusters form and large fires return frequently — but fires keep resetting the density. The two forces (growth and destruction) balance at the critical density automatically.
+**Why it self-organises:** if `p` is too small relative to `f`, fires
+outstrip regrowth and the forest stays sparse — fires can't spread
+far. If `p` is too large, dense clusters form and large fires reset
+the density. The two forces balance at the critical density without
+any external tuning.
 
-### Double-buffer update
+## Worked Example (defaults: 80×24 terminal, p=0.030, f=0.0002)
 
-All cells must update simultaneously. If you updated left-to-right, a FIRE at column 5 that becomes EMPTY would no longer spread to column 6 — but the rule says fire spreads to any neighbour that is currently FIRE. The double-buffer `g_next` stores next states without overwriting `g_grid` mid-sweep. After all cells are computed: `memcpy(g_grid, g_next)`.
+- Per tick the inner loop fires ~1920 RNG calls (one per cell).
+- At `p_grow = 0.030`, an empty cell reaches 50% TREE probability after
+  ln(2)/0.030 ≈ 23 ticks. So at SIM_FPS=20 a freshly burned patch
+  takes about 1.2 s to half-recover.
+- At `p_fire = 0.0002`, the expected number of lightning strikes per
+  tick across the grid is 1920 · 0.0002 ≈ 0.4. Roughly one strike
+  every 2.5 ticks during steady-state.
+- p/f = 150 — close to the critical ratio. Press `s` to scatter 12
+  ignitions and watch which die quickly (isolated trees) and which
+  cascade (cluster edges).
+
+## Double-Buffer Update
+
+All cells must update simultaneously. If the sweep updated cells
+left-to-right, a FIRE at column 5 that becomes EMPTY would no longer
+spread to column 6 — but the rule says fire spreads to any cell
+currently on fire. Solution: a separate `g_next` array stores next-
+generation states without overwriting `g_grid`. After the sweep:
+`memcpy(g_grid, g_next)`.
 
 This is identical to Conway's Game of Life's two-grid approach.
 
-### 4-neighbour vs 8-neighbour spread (preset 3)
+## Ash Overlay (the third buffer)
 
-With 4-neighbour spread, fire propagates in a diamond shape — fastest along axes, never diagonal. With 8-neighbour spread, fire can move diagonally too, producing rounder fronts and a higher effective contagion rate. The same `f` and `p` produce larger fires in 8-neighbour mode because each burning cell has up to 8 possible targets instead of 4.
+When FIRE → EMPTY, we want to show ash `'.'` for one tick before
+the cell goes fully empty. But `g_next[r][c] = EMPTY` overwrites the
+FIRE state immediately — the draw pass can't tell that this cell just
+burned. Solution: a separate flag `g_ash[r][c]` set whenever
+FIRE → EMPTY. It's reset to 0 at the start of each `grid_step()`,
+so it persists for exactly one draw frame.
 
-## Data Structures
+Visually this gives the forest a "burned-scar memory" — a 1-tick echo
+that turns the fire front into a moving wave, not just a colour
+change.
 
-### Grids (§4)
-```c
-uint8_t g_grid[ROWS_MAX][COLS_MAX]   // current state: EMPTY=0, TREE=1, FIRE=2
-uint8_t g_next[ROWS_MAX][COLS_MAX]   // next state (double-buffer)
-uint8_t g_ash [ROWS_MAX][COLS_MAX]   // 1 if cell burned this tick (for ash display)
-```
+## Flickering Without Per-Cell RNG
 
-### Preset (§4)
-```c
-typedef struct {
-    float p_grow;        // growth probability
-    float p_fire;        // lightning probability
-    bool  eight_neighbor;// diagonal spread?
-    float density;       // initial tree fraction
-    const char *name;
-} Preset;
-```
+Drawing FIRE as `'*'` (CP_FIRE2 bright) or `','` (CP_FIRE1 dim) by
+`(r + c + tick) & 1` creates a checkerboard pattern that shifts by
+one cell each tick. To the eye at real-time framerates it looks like
+random flickering but costs zero RNG calls at draw time and never
+repeats the same pattern in consecutive frames.
 
-No per-cell agent struct — the grid IS the state.
+## xorshift32 RNG
 
-## The Main Loop
-
-1. **`grid_step()`**: iterate all `(r, c)`:
-   - FIRE → set `g_next[r][c] = EMPTY`, mark `g_ash[r][c] = 1`
-   - TREE → check 4 (or 8) neighbours; if any is FIRE or `rand() < f`: set FIRE; else keep TREE
-   - EMPTY → if `rand() < p`: set TREE; else keep EMPTY
-   - After full sweep: `memcpy(g_grid, g_next)`
-
-2. **`scene_draw()`**: for each cell, draw character and color based on state; ash cells show `'.'` for one tick
-
-## Non-Obvious Decisions
-
-### xorshift32 RNG instead of `rand()`
-
-The inner loop calls the RNG once per cell per tick. With a 80×24 terminal that's ~1920 calls/tick at 20fps = ~38,400 calls/second. `rand()` with `RAND_MAX=32767` (common on some platforms) would only give 15 bits of precision, and `rand()` itself can be slow due to global state and locking. The xorshift32:
+The inner loop calls the RNG once per cell per tick — ~1920 calls/tick
+at 20 fps = ~38 400 calls/second. `rand()` with `RAND_MAX=32767` would
+only give 15 bits, and `rand()` itself can be slow due to global state.
+xorshift32:
 ```c
 g_rng ^= g_rng << 13;
 g_rng ^= g_rng >> 17;
 g_rng ^= g_rng << 5;
 ```
-generates 32 bits per call, passes the BigCrush randomness suite for this use case, and is 3 XOR+shift operations — faster than a `rand()` call with modulo.
+generates 32 bits per call in three XOR+shift ops — faster than `rand()`
+and platform-independent.
 
-Float conversion: `(rng_next() >> 8) / (1 << 24)` gives uniform float in [0,1) with 24 bits of precision (more than enough for probability comparisons).
+Float conversion: `(rng_next() >> 8) / (1 << 24)` gives uniform float
+in [0, 1) with 24 bits of precision (more than enough for probability
+comparisons).
 
-### Ash display: `g_ash` is separate from `g_next`
+## 4-Neighbour vs 8-Neighbour Spread (Smoulder preset)
 
-When FIRE → EMPTY, we want to show ash `'.'` for one tick. But `g_next[r][c] = EMPTY` overwrites the FIRE state immediately — the draw pass can't tell that this cell just burned. Solution: a separate boolean `g_ash[r][c]` set whenever FIRE → EMPTY. It's reset to 0 at the start of each `grid_step()`, so it only persists for one draw frame.
+With 4-neighbour (von Neumann) spread, fire propagates in a diamond
+shape — fastest along axes, never diagonal. With 8-neighbour (Moore)
+spread, fire moves diagonally too, producing rounder fronts and a
+higher effective contagion rate. Same `f` and `p` produce larger fires
+in 8-neighbour mode because each burning cell has up to 8 possible
+targets instead of 4.
 
-### Flickering fire without per-cell randomness
+The Smoulder preset (preset 3) enables 8-neighbour spread; presets
+0–2 are 4-neighbour.
 
-Drawing `'*'` or `','` by `(r + c + tick) & 1` creates a checkerboard pattern that shifts by one cell each tick. To the eye at real-time framerates, this looks like random flickering but costs zero RNG calls at draw time and never repeats the same pattern in consecutive frames.
+## Themes (5)
 
-### Manual scatter (`s` key)
+`t/T` cycles. All bg = -1 (terminal default), all fg in the bright
+half of the 256-colour cube so A_DIM stays visible:
 
-Igniting `SCATTER_COUNT=12` random TREE cells simultaneously creates an instant stress test: how does the forest respond to multiple simultaneous ignitions? This lets you empirically observe:
-- Which fires die quickly (isolated trees, no cluster)
-- Which fires cascade (edge of a dense cluster)
-- Whether the fires merge into one large front or stay independent
+| # | Name    | EMPTY    | TREE      | FIRE          | Mood              |
+|---|---------|----------|-----------|---------------|-------------------|
+| 0 | Classic | dark grey| green     | orange/red    | Standard          |
+| 1 | Night   | near-blk | dark green| yellow        | Night fire        |
+| 2 | Autumn  | dark grey| orange    | red           | Autumn forest     |
+| 3 | Boreal  | very dark| cyan-tint | yellow-white  | Northern boreal   |
+| 4 | Lava    | near-blk | dark green| magenta       | Volcanic          |
 
-### Probability clamping
-
-`g_p_grow` and `g_p_fire` are adjusted via `g/G` and `l/L` keys. Clamped to [P_GROW_MIN, P_GROW_MAX] and [P_FIRE_MIN, P_FIRE_MAX] to prevent degenerate states (p=0 means no regrowth, f=0 means no fire — both result in a static grid).
-
-## State Machine
-
-```
-PRESETS 0..3 — no automatic transitions; n/N to switch
-  Each preset sets: p_grow, p_fire, eight_neighbor, density
-  Switching preset resets the grid (scene_init)
-
-PER TICK:
-  grid_step():
-    for all cells simultaneously:
-      FIRE  → EMPTY + ash mark
-      TREE  → FIRE (spread) | FIRE (lightning, prob f) | TREE
-      EMPTY → TREE (prob p) | EMPTY
-  scene_draw():
-    FIRE alternate '*'/',' by (r+c+tick)&1
-    EMPTY with ash mark → '.'
-    TREE → '^'
-```
-
-## From the Source
-
-**Algorithm:** Drossel-Schwabl (1992) three-state synchronous CA. Double-buffer pattern: all next-gen states computed from current gen before any are applied — identical to Conway GoL.
-
-**Physics:** Self-organised criticality (Bak, Tang, Wiesenfeld 1987): at the critical ratio p/f, fire cluster sizes follow `P(s) ∝ s^(−τ)`, τ ≈ 1.19. Analogous to earthquakes (Gutenberg-Richter law) and real forest fires — no characteristic scale, system self-tunes to critical point without external parameter adjustment.
-
-**Math:** Spread kernel choice: 4-neighbour (von Neumann neighbourhood) vs 8-neighbour (Moore neighbourhood). Moore neighbourhood raises effective contagion rate and changes fire-front isotropy; same p/f produces larger fires in 8-neighbour mode.
-
-**Performance:** O(rows × cols) per tick. Per-cell RNG uses xorshift32 (3 XOR+shift ops) — faster than `rand()` and avoids platform-specific RAND_MAX=32767 precision limits. Float conversion: `(rng >> 8) / (1 << 24)` gives 24-bit uniform [0, 1).
-
-## Key Constants
-
-| Constant | Default | Effect if changed |
-|---|---|---|
-| `P_GROW_DEF` | 0.030 | Higher → denser forest, larger clusters, rarer but bigger fires |
-| `P_FIRE_DEF` | 0.0002 | Higher → more lightning, smaller clusters, frequent small fires |
-| `SCATTER_COUNT` | 12 | More manual ignitions per `s` press |
-| `SIM_FPS_DEF` | 20 | Lower → each tick visible; higher → watch time-lapse evolution |
-
-## Themes
-
-5 themes cycle with `t`/`T`:
-
-| # | Name | EMPTY | TREE | FIRE | Mood |
-|---|---|---|---|---|---|
-| 0 | Classic | Dark grey | Green | Orange/red | Standard ecological |
-| 1 | Night | Near-black | Dark green | Yellow | Night fire |
-| 2 | Autumn | Dark grey | Orange | Red | Autumn forest |
-| 3 | Boreal | Very dark | Cyan-tinted | Yellow-white | Northern boreal |
-| 4 | Lava | Near-black | Dark green | Magenta | Volcanic |
-
----
-
-# Structure
-
-| Symbol | Type | Size | Role |
-|--------|------|------|------|
-| `g_cur[ROWS_MAX][COLS_MAX]` | `uint8_t[]` | ~64 KB | current generation cell states (EMPTY=0, TREE=1, FIRE=2) |
-| `g_nxt[ROWS_MAX][COLS_MAX]` | `uint8_t[]` | ~64 KB | next generation buffer (double-buffer synchronous update) |
-| `ROWS_MAX`, `COLS_MAX` | constants | N/A | maximum grid size (128 × 512) |
-| `P_GROW_DEF` | `float` constant | N/A | default regrowth probability p = 0.030 |
-| `P_FIRE_DEF` | `float` constant | N/A | default lightning probability f = 0.0002 |
-| `g_p_grow`, `g_p_fire` | `float` | scalar | current p and f values; adjusted with g/l keys |
-
-# Pass 2 — forest_fire: Pseudocode
+PAIR_HUD (yellow 226 + A_BOLD) and PAIR_HINT (cyan 51 + A_BOLD) are
+theme-independent and registered once in `color_init()`.
 
 ## Module Map
 
-| Section | Purpose |
-|---|---|
-| §1 config | EMPTY/TREE/FIRE states, P_GROW_DEF, P_FIRE_DEF, probability step/min/max |
-| §2 clock | `clock_ns()`, `clock_sleep_ns()` |
-| §3 color | 5 themes × 6 color pairs (empty/tree/fire1/fire2/ash/hud) |
-| §4 grid | `g_grid`, `g_next`, `g_ash`, `grid_step()`, `grid_seed()`, `grid_scatter()` |
-| §5 scene | `scene_draw()`, `scene_init()` |
-| §6 screen | ncurses init, `screen_resize()` |
-| §7 app | main loop, input, signal handlers |
+```
+§1 config  — EMPTY/TREE/FIRE constants, P_GROW_DEF, P_FIRE_DEF,
+             SCATTER_COUNT, SIM_FPS_DEF, theme/preset enums
+§2 clock   — clock_ns + clock_sleep_ns
+§3 color   — N_THEMES Theme records + theme_apply +
+             PAIR_HUD/PAIR_HINT registered once
+§5 grid    — g_grid/g_next/g_ash + grid_seed + grid_step +
+             grid_scatter + has_fire_neighbor helper
+§6 scene   — mark_cell + draw_grid + draw_hud + scene_draw
+§7 screen  — ncurses init/resize
+§8 app     — signal handlers, main loop
+```
 
-## Data Flow
+## Pseudocode
 
 ```
 grid_step():
-  memset(g_ash, 0)
-  for r in 0..g_rows-1:
-    for c in 0..g_cols-1:
-      state = g_grid[r][c]
-      if state == FIRE:
-        g_next[r][c] = EMPTY
-        g_ash[r][c]  = 1
-      elif state == TREE:
-        neighbor_fire = any of {(r-1,c),(r+1,c),(r,c-1),(r,c+1)} == FIRE
-        if eight_neighbor: also check diagonals
-        if neighbor_fire or rng_float() < g_p_fire:
-          g_next[r][c] = FIRE
-        else:
-          g_next[r][c] = TREE
-      else: /* EMPTY */
-        g_next[r][c] = (rng_float() < g_p_grow) ? TREE : EMPTY
-  memcpy(g_grid, g_next, g_rows * COLS_MAX)
-  update g_n_tree, g_n_fire, g_n_empty counts
+  memset(ash, 0)
+  for each (r, c):
+    state = grid[r][c]
+    if state == FIRE:
+      next[r][c] = EMPTY; ash[r][c] = 1
+    elif state == TREE:
+      if has_fire_neighbor(r, c, eight) or rng_float() < p_fire:
+        next[r][c] = FIRE
+      else:
+        next[r][c] = TREE
+    else:  /* EMPTY */
+      next[r][c] = (rng_float() < p_grow) ? TREE : EMPTY
+    update tree/fire/empty counters
+  memcpy(grid <- next)
 
 scene_draw():
-  for each cell (r, c):
-    if g_grid[r][c] == EMPTY:
-      if g_ash[r][c]: draw '.' CP_ASH
-      else:           draw ' ' CP_EMPTY
-    elif g_grid[r][c] == TREE:
-      draw '^' CP_TREE A_BOLD
-    else: /* FIRE */
-      bright = (r + c + tick) & 1
-      if bright: draw '*' CP_FIRE2 A_BOLD
-      else:      draw ',' CP_FIRE1
-  draw HUD: tree%, fire%, p, f, preset, theme, tick
+  draw_grid():
+    for each (r, c):
+      if grid[r][c] == EMPTY:
+        if ash[r][c]: '.'  CP_ASH
+        else:         ' '
+      elif grid[r][c] == TREE:
+        '^' CP_TREE A_BOLD
+      else:  /* FIRE */
+        bright = (r + c + tick) & 1
+        bright ? '*' CP_FIRE2 A_BOLD : ',' CP_FIRE1
+  draw_hud():
+    top-right yellow A_BOLD: tree%, fire%, p, f, preset, theme, fps
+    bottom-left cyan A_BOLD: key hints
 ```
 
-## Open Questions for Pass 3
+## Edge Cases
 
-- Measure the fire size distribution: log-log plot of frequency vs size. Does it show a straight line (power law) at the default p/f ratio?
-- At what exact p/f does the distribution become power-law? Sweep p from 0.001 to 0.100 with f fixed.
-- How does 8-neighbour spread change the power-law exponent τ? Theory predicts τ should change slightly because the local contagion geometry is different.
-- Is there a percolation threshold? At what tree density does a fire always span the full grid?
-- Add a second FIRE state (EMBER) that spreads with lower probability — does this create realistic smoldering front behaviour?
-- The model has no wind. Adding a directional bias (higher spread probability in one direction) breaks the isotropy — does SOC persist with wind?
+- **Ash buffer reset.** Must clear `g_ash` at the START of `grid_step()`.
+  Forgetting this leaves yesterday's ashes painted forever.
+
+- **8-neighbour mode and percolation.** With 8-neighbour spread at high
+  p_grow, fires sometimes percolate the entire grid in one tick.
+  This is correct behaviour, but the visual loses its narrative; lower
+  p_grow or use preset 0–2 for "fire-front" aesthetics.
+
+- **Probability clamping.** g/G and l/L adjust p_grow / p_fire in fixed
+  steps. Clamped to [P_GROW_MIN, P_GROW_MAX] and [P_FIRE_MIN,
+  P_FIRE_MAX] so they can't become 0 (degenerate static grid) or 1
+  (instant catastrophe).
+
+- **A_DIM avoidance.** The grayscale strip 232–239 is forbidden by
+  CLAUDE.md (invisible under A_DIM). All theme colours sit at ≥ 24
+  in the cube and ≥ 240 in grayscale, so theme tints are visible
+  even when A_DIM is applied.
+
+- **Scatter respects current trees.** `grid_scatter()` only ignites
+  cells whose state is TREE. Trying to scatter into an empty grid
+  (no trees yet) silently does nothing — not a bug, but a "wait until
+  there's something to burn" reminder.
+
+## How to Verify
+
+- After many ticks at default p/f, the forest stabilises around a
+  steady-state tree fraction of ~0.4–0.5 (visible in the HUD percentage).
+  Pushing p_grow up shifts steady-state higher; pushing p_fire up
+  shifts it lower.
+
+- Cluster size distribution is power-law-ish at default ratio. Hard to
+  see by eye, but a histogram of fire areas across many ticks should
+  show a long tail with no characteristic scale.
+
+- Doubling grid dimensions roughly quadruples per-tick CPU cost
+  (O(rows × cols)).
+
+- Disable lightning (set p_fire=0 via lots of L presses) and watch
+  the forest mature into a static green field — confirms that
+  spreading is the only fire-source when lightning is off.
+
+- Press `s` repeatedly: visual stress test of multiple simultaneous
+  ignitions. Some die alone (isolated trees), some merge fronts.
+
+## Open Questions
+
+1. Measure the fire-size distribution: log-log plot of frequency vs
+   size. Does it show a straight line at the default p/f ratio?
+2. At what exact p/f does the distribution become power-law? Sweep
+   p from 0.001 to 0.100 with f fixed.
+3. How does 8-neighbour spread change the power-law exponent τ?
+4. Add a directional wind bias (higher spread probability in one
+   direction). Does SOC persist with anisotropy?
+5. Add a second fire state (EMBER) that spreads with lower probability
+   — does this create realistic smouldering front behaviour?
+
+## References
+
+- Drossel & Schwabl, "Self-organized critical forest-fire model",
+  *Physical Review Letters* 69(11):1629–1632, 1992.
+- Bak, Tang & Wiesenfeld, "Self-organized criticality: An explanation
+  of 1/f noise", *Physical Review Letters* 59:381, 1987.
+- Wikipedia, *Forest-fire model*,
+  https://en.wikipedia.org/wiki/Forest-fire_model
+- Christensen et al., "Self-organized critical forest-fire model:
+  Mean-field theory and simulation results in 1 to 6 dimensions",
+  *Physical Review Letters* 71:2737, 1993.

@@ -2722,6 +2722,8 @@ EMPTY → EMPTY   otherwise
 
 **Preset 3 (Smoulder):** Enables 8-neighbour fire spread (diagonal cells included). This doubles the possible spread directions, producing rounder fire fronts and slower smouldering expansion compared to the sharp diamond-shaped fronts of 4-neighbour spread.
 
+**Code organisation after CLAUDE.md compliance pass:** `grid_step` extracts `has_fire_neighbor(r, c, eight)` so the spread test is a clean predicate, and the per-cell switch fits in 30 lines. `scene_draw` decomposes into `mark_cell` + `draw_grid` + `draw_hud`. PAIR_HUD (yellow 226 + A_BOLD) and PAIR_HINT (cyan 51 + A_BOLD) are theme-independent and registered once in `color_init`; the 5 themed pairs (CP_TREE/CP_FIRE1/CP_FIRE2/CP_ASH plus default-bg empty) re-register on `t/T` cycle via `theme_apply(ti)`. Empty-cell background is `-1` (terminal default) so the burned-down state inherits the user's wallpaper. Theme palettes were curated to sit at ≥24 in the colour cube — earlier grayscale 232–239 entries became invisible under A_DIM and were replaced.
+
 *Files: `misc/forest_fire.c`*
 
 ---
@@ -3720,6 +3722,14 @@ DFS: maintain a stack of visited cells; pick a random unvisited neighbor, carve 
 
 BFS solve: flood-fill from entrance level-by-level; first reach of exit = shortest path. Parent array reconstructs the path backward. SOL_STEPS=16 BFS steps per frame for animated solve. Display: 2×2 terminal pixels per maze cell → (2W+1)×(2H+1) terminal cells total.
 
+### Pixel Lattice and Color
+
+Pixel parities decide which lattice element to draw — `(0,0)` corner `+`, `(0,1)` horizontal wall, `(1,0)` vertical wall, `(1,1)` cell interior. All pairs use bg=-1 with bright-half foregrounds: walls 251 grey + A_BOLD, DFS frontier `@` yellow 226 + A_BOLD, BFS visited `.` light blue 117, final path `*` matrix green 46 + A_BOLD. PAIR_HUD (yellow) sits on row 0 right-aligned; PAIR_HINT (cyan) on the last row, both A_BOLD per the project HUD spec. Earlier code used `init_pair(CP_WALL, 232, 232)` (fg=bg=near-black) which made walls invisible — the rewrite picks 251 to match the CLAUDE.md "bright half only" theme rule.
+
+### Code Organisation
+
+`mark_cell()` is the single ncurses-output choke point with the canonical `(chtype)(unsigned char)` double-cast. `scene_draw` decomposes into `draw_lattice_pixel` (corner/wall classification by parity) + `draw_cell_interior` (frontier vs visited vs unvisited per phase) + `draw_grid` + `draw_hud`. The main loop extracts `handle_key` and `step_simulation` so the render pipeline is one straight `erase → scene_draw → wnoutrefresh → doupdate` block. Frame cap uses a `frame_start = clock_ns()` snapshot at top-of-loop; the earlier `clock_ns() - frame_time + dt` form cancelled the cap and pegged CPU at 100%.
+
 *Files: `misc/maze.c`*
 
 ---
@@ -3730,7 +3740,15 @@ Five sorting algorithms animated as a vertical bar chart: Bubble, Insertion, Sel
 
 ### Coroutine-Style Iterators
 
-Each algorithm is implemented as a state machine (struct + step function) that advances one operation per call, enabling the animation loop to run at user-controlled rate without threads. Color encodes operation state: grey=unsorted, yellow=comparing, red=just swapped, green=in final sorted position. N_ELEMS=48 bars. Complexity reference: Bubble/Insertion/Selection O(n²); Quicksort O(n log n) average (Lomuto partition: pivot=last element); Heapsort O(n log n) worst-case (max-heap built in O(n), extracted in O(n log n)).
+Each algorithm is implemented as a state machine (struct + step function) that advances one operation per call, enabling the animation loop to run at user-controlled rate without threads. The five `step_fn`s share a `StepFn` typedef and live in a `static const STEP_FN[ALG_COUNT]` dispatch table, so `step_simulation` is a single line: `STEP_FN[g_alg]()`. Quicksort uses an iterative explicit stack (`g_qlo`/`g_qhi`/`g_qtop`) to avoid recursion; heap_sift is the one exception to one-op-per-step and walks the whole sift in a single call, which simplifies state at a small visual cost.
+
+### Color Encoding
+
+`g_cmp1/g_cmp2/g_swp1/g_swp2` carry the indices to highlight after every step. `bar_pair(i)` returns: PAIR_SWP red 196 + A_BOLD if i was just swapped, PAIR_CMP gold 220 if comparing, PAIR_SORT green 46 + A_BOLD if `g_done`, else PAIR_NORM grey 250. Compare uses gold not yellow specifically so it doesn't blur with PAIR_HUD's yellow status row. PAIR_HINT cyan + A_BOLD bottom-left lists the keys. N_ELEMS=48 bars; STEPS_MAX=256 so `+/-` exponentially scales operations-per-frame from 1× to 256× without overshooting.
+
+### Code Organisation
+
+`mark_cell()` is the single ncurses-output choke point with the canonical `(chtype)(unsigned char)` double-cast. `draw_bars` → `draw_bar` → `bar_pair` separates layout from operation-state dispatch. Bar drawing scans top-down and breaks above the bar height instead of writing space cells. The main loop extracts `handle_key` and `step_simulation`; frame cap uses the `frame_start = clock_ns()` snapshot at top-of-loop. Complexity reference: Bubble/Insertion/Selection O(n²); Quicksort O(n log n) average; Heapsort O(n log n) worst-case.
 
 *Files: `misc/sort_vis.c`*
 

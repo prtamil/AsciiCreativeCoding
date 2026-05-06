@@ -930,7 +930,7 @@ mvaddch(y, x, ch);
 
 Available symbols include: `ACS_ULCORNER`, `ACS_URCORNER`, `ACS_LLCORNER`, `ACS_LRCORNER`, `ACS_HLINE`, `ACS_VLINE`, `ACS_PLUS`.
 
-*Files: `artistic/railwaymap.c`, `robots/walking_robot.c`*
+*Files: `artistic/railwaymap.c`*
 
 ---
 
@@ -2740,7 +2740,7 @@ P(s) = (1−s)·A + s·B  +  4s(1−s) · (apex − chord_midpoint)
 | `(chtype)(unsigned char)` double cast | V4.2 | all |
 | `wattron`/`wattroff` bracket | V4.3 | all |
 | `mvprintw` HUD text | V4.4 | all |
-| ACS line-drawing chars | V4.5 | railwaymap, walking_robot |
+| ACS line-drawing chars | V4.5 | railwaymap |
 | Paul Bourke 92-char ramp | V4.6 | rasters, raymarchers, fire |
 | Directional velocity → glyph | V4.7 | flowfield, flocking |
 | Slope chars `/\|-` | V4.8 | spring_pendulum, bonsai, wireframe |

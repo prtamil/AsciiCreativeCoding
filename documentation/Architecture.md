@@ -4151,6 +4151,13 @@ The dynamic deflection is `w(x) = Σ_n q_n(t)·φ_n(x)·exag`, added on top of z
 
 ## 113. Differential Drive Robot — robots/diff_drive_robot.c
 
+The whole simulation is two pure functions:
+
+- **§6.2 `compute_wheels(v, ω) → (vL, vR)`** — INVERSE kinematics: given desired centre velocity and turn rate, what wheel speeds achieve that?
+- **§6.3 `step_pose(pose, vL, vR, dt) → new pose`** — FORWARD kinematics + Euler integration: given wheel speeds, where am I after dt seconds?
+
+Splitting them gives each concept its own narrative. A learner can read §6.2 to understand IK, §6.3 to understand FK + integration, without skipping past helper code. The orchestrator `robot_tick` (§6.6) wires them together with input ramping and trail logging.
+
 ### Kinematic Model
 
 A differential drive robot has two independently driven wheels on a common axle. The pose is (x, y, θ) in 2D. For wheel velocities vL and vR with axle width L:
@@ -4217,13 +4224,17 @@ World-wrap interpolation suppression: if `|Δpx| > world_width/2` the interpolat
 
 ## 114. Walking Robot — robots/walking_robot.c
 
-A procedural bipedal walk cycle simulation combining sinusoidal forward kinematics for the swing phase with 2-joint analytical IK for the stance phase.
+A procedural bipedal walk that mixes two kinds of kinematics on each leg, gated by gait phase: sinusoidal **forward kinematics** during swing (joint angles drive foot position), **2-joint analytical IK** during stance (locked foot + advancing hip drive knee position). One float `phase` advances at `2π · walk_freq · dt` per frame and drives every other oscillation in the file: per-leg `phi_leg`, body bob, body sway, and counter-phase arm swing.
 
-**Gait architecture:** The walk cycle drives joint angles via sinusoidal FK for each leg in swing. Foot contact locking freezes the grounded foot's world position so the body glides over it — this is the stance IK phase. The solver uses the standard 2-joint law-of-cosines formula to find hip and knee angles given the locked foot target.
+**Gait architecture (§5):** Each leg checks `sin(phi_leg)` every frame — positive → SWING (FK from §5.3 `leg_swing_pose`), non-positive → STANCE (IK from §5.4 `leg_stance_pose`). Touchdown is detected as the swing→stance transition; at that exact instant the FK landing position is captured into `foot_lock[i]`. While the leg is in stance, the IK reads `foot_lock[i]` as a fixed end-effector and solves for the knee using `solve_ik2` (§5.2 — same law-of-cosines as `animation/ik_helloworld.c`).
 
-**Body dynamics:** Body sway is computed as a lateral sinusoid locked to the step frequency. A separate vertical oscillation creates the characteristic human bounce. Centre-of-mass (COM) projection is drawn as a vertical line from the pelvis to the ground, giving immediate visual feedback on balance.
+**Anatomical sign convention:** `shin_angle = thigh_angle − knee_bend`, NOT `+ knee_bend`. The minus is anatomical — a real knee folds so the heel rises toward the butt; the plus sign produces the famous "Smooth Criminal" forward lean (lower body slants while upper body stays vertical). At mid-swing the heel tucks UP toward the butt; at touchdown `knee_bend ≈ 0` so shin and thigh are colinear.
 
-**Rendering:** Motion trails are stored in a ring buffer and rendered behind the figure using fading characters. A shadow ellipse is projected below the feet. The ground grid is toggled with `g`. Hotkeys: `SPACE` pause, `r` reverse, `+`/`-` speed, `.` step-frame, `[`/`]` Hz.
+**Speed/frequency coupling:** `walk_speed` is NOT a free parameter. Stride length is determined by leg geometry (`2 · (UPPER + LOWER) · sin(SWING_AMP)`); stride period is `1/walk_freq`; so speed must be `walk_freq · stride_length` for the body to cross the planted foot exactly once per stance. The setter `robot_set_pace(r, freq)` enforces the coupling — both `+`/`-` keys and `robot_init` go through it. Decoupling them produces lean artefacts (too slow → forward lean throughout stance, too fast → backward lean).
+
+**Body dynamics:** vertical bob `BOB_AMP · sin(2φ)` (two peaks per stride — the pelvic bob), lateral sway `SWAY_AMP · cos(φ)` (one peak per stride — keeps COM over support). Arms are single-segment (no elbow), counter-phase to same-side leg.
+
+**Rendering (§6):** ground line + optional scrolling grid → spine → arms → legs → head → feet. Bones drawn via Bresenham line glyph (`draw_bone`). Hotkeys: `SPACE` pause, `r` reverse, `+`/`-` walk_freq (and derived speed), `.` step-frame, `g` toggle grid.
 
 *Files: `robots/walking_robot.c`*
 
@@ -4231,7 +4242,15 @@ A procedural bipedal walk cycle simulation combining sinusoidal forward kinemati
 
 ## 115. Perlin Terrain Bot — robots/perlin_terrain_bot.c
 
-A self-balancing single-wheel robot navigating infinite 1D Perlin fBm terrain. The physics are an inverted pendulum (Lagrangian cart-pole) formulated on a sloped surface.
+A self-balancing single-wheel robot navigating infinite 1D Perlin fBm terrain, built as two PURE functions plus an orchestrator:
+
+- **§6.3 `pid_step(err, slope, dt) → control`** — controller; pure math, no physics. Standard P + I + D form with **anti-windup clamp** on the integral and **slope feed-forward** added to the output (`-K_SLOPE_FF · slope`).
+- **§6.4 `cart_pole_step(control, dt) → updates state`** — physics; pure math, no controller. Lagrangian inverted pendulum on a sloped surface.
+- **§6.6 `bot_substep(dt_sub)`** — wires them: sample slope, run PID, run cart-pole, push to phase history.
+
+This decomposition mirrors classical control theory ("controller + plant") and lets a learner mentally swap controllers (replace PID with bang-bang or LQR) without touching the physics, and vice versa.
+
+**Sub-stepping:** the cart-pole is *stiff* — at large dt with large θ, the integration diverges because `Δθ` per step exceeds the linearisation regime. Each render frame runs `SUBSTEP_COUNT = 4` calls to `bot_substep(dt / 4)`, keeping per-sub-step delta small. This is correctness, not optimisation: without sub-stepping the simulation literally explodes.
 
 **Physics model:** The equation of motion is the Lagrangian cart-pole on slope:
 
@@ -4241,7 +4260,7 @@ A self-balancing single-wheel robot navigating infinite 1D Perlin fBm terrain. T
 
 where `θ_eff = θ − α` accounts for terrain slope `α`. The cart acceleration `ẍ` is the PID output.
 
-**PID controller:** Proportional, integral, and derivative terms act on the pendulum angle error. A cascade position control loop generates a slope-corrected angle reference `θ_ref = −α×0.65`. Integral windup is clamped to prevent runaway accumulation on sustained slope.
+**PID controller:** Proportional, integral, and derivative terms act on the pendulum angle error. A cascade position control loop generates a slope-corrected angle reference `θ_ref = −α×0.65`. Integral windup is clamped to prevent runaway accumulation on sustained slope. Slope feed-forward (`-K_SLOPE_FF · slope` added directly to the controller output) ANTICIPATES the gravitational disturbance before tilt error develops — the standard feed-forward + feedback cascade pattern.
 
 **Terrain:** A 1D Perlin fBm ring buffer generates infinite scrolling terrain ahead of the bot. The slope `α` is computed as the finite-difference gradient of the height field at the bot's position.
 

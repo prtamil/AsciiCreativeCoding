@@ -1,135 +1,665 @@
-/* perlin_terrain_bot.c  — Learning Edition
- * Self-balancing wheel-bot on infinite Perlin terrain
- * Three interactive view modes teach inverted-pendulum + PID control
+/* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
+/*
+ * perlin_terrain_bot.c — self-balancing wheel-bot crossing a Perlin landscape
  *
- * Build:  gcc -std=c11 -O2 -Wall -Wextra robots/perlin_terrain_bot.c \
- *             -o perlin_terrain_bot -lncurses -lm
+ * DEMO: A two-wheeled robot like a Segway. By itself it would tip over
+ *       in milliseconds — gravity is unstable for an inverted
+ *       pendulum. Stay-upright is achieved by a PID controller
+ *       reading the body's lean angle and pushing the wheels forward
+ *       or backward to keep the pendulum balanced. The terrain is
+ *       procedurally generated Perlin noise that scrolls past as the
+ *       robot drives forward; on slopes the controller adapts its
+ *       setpoint so the bot leans into the hill rather than fighting
+ *       gravity directly.
+ *
+ *           ┌────────────────────────────────────────────┐
+ *           │     . .  ✦                                 │
+ *           │                                            │
+ *           │           *      ← top of body (beacon)    │
+ *           │            \                               │
+ *           │             \                              │
+ *           │              \                             │
+ *           │             O═O ← wheels (chassis tilts    │
+ *           │            /‾‾‾‾\___      with terrain)    │
+ *           │       /‾‾‾‾      ‾‾‾\___                   │
+ *           │  /‾‾‾‾                ‾‾‾‾\__              │
+ *           │##############################              │
+ *           └────────────────────────────────────────────┘
+ *
+ *       Three view modes (toggle with `m`):
+ *           TELEMETRY — live values + bar gauges
+ *           EQUATIONS — the math with live numbers substituted
+ *           PHASE     — phase-space portrait of (θ, ω)
+ *
+ *       Three real concepts at play:
+ *           1. INVERTED PENDULUM — gravity pulls the body away from
+ *              vertical. Without control, θ grows exponentially.
+ *           2. CART-POLE COUPLING — pushing the wheels horizontally
+ *              tilts the body the OTHER way. That's how the bot
+ *              corrects itself.
+ *           3. PID CONTROL — three-term feedback that produces the
+ *              motor force every tick from the body's lean error.
+ *
+ * Real-world analogues:
+ *           Segway PT, Ninebot, hoverboards — same physics
+ *           Boston Dynamics Handle (taller pendulum, wheeled base)
+ *           Kid balancing a broom on their palm
+ *
+ * Study alongside:
+ *   robots/diff_drive_robot.c             — wheels, no balancing
+ *                                            (simpler kinematics).
+ *   robots/moving_jump_spring_leg_robot.c — one-legged jumping robot
+ *                                            (different actuation,
+ *                                             same Perlin terrain).
+ *   particle_systems/ragdoll_figure.c     — gravity-driven articulated
+ *                                            body without control.
+ *
+ * Section map:
+ *   §1  config       — every tunable in one place, grouped by concept
+ *   §2  clock        — monotonic timer + sleep
+ *   §3  color        — HUD/HINT plus per-element semantic pairs
+ *   §4  noise        — Perlin noise + fBm (terrain primitive)
+ *   §5  terrain      — height query, slope, ring buffer
+ *   §6  bot          — Bot type, PID, cart-pole physics, init/reset
+ *   §7  render       — paint terrain, robot, telemetry, equations, phase
+ *   §8  screen       — ncurses init / present
+ *   §9  app          — signals, resize, variable-dt main loop with substeps
  *
  * Keys:
- *   SPACE  pause          q / ESC  quit        r  reset
- *   ↑ / ↓  drive speed    p        toggle PID
- *   m      cycle view     g        cycle gain preset
- *   + / -  tune Kp        [ / ]    sim Hz
+ *   q / Q / ESC      quit
+ *   space            pause / resume
+ *   r                reset bot + new terrain
+ *   ↑ / ↓            change drive speed
+ *   p                toggle PID controller (watch the bot fall)
+ *   m                cycle view (TELEMETRY / EQUATIONS / PHASE)
+ *   g                cycle gain preset (BALANCED / HIGH-Kp / NO-Kd / NO-Ki)
+ *   + / -            tweak Kp manually
+ *
+ * Build:
+ *   gcc -std=c11 -O2 -Wall -Wextra robots/perlin_terrain_bot.c \
+ *       -o perlin_terrain_bot -lncurses -lm
  */
 
-/* ── §1  CONFIG ─────────────────────────────────────────────────── */
-#define _GNU_SOURCE
-#define _POSIX_C_SOURCE 199309L
-#include <ncurses.h>
+/* ── CONCEPTS ──────────────────────────────────────────────────────────── *
+ *
+ * Algorithm     : Three layers stacked together.
+ *
+ *                 (A) PERLIN TERRAIN — 5-octave fBm gives a smoothly
+ *                     rolling height function h(x). The bot's
+ *                     world_x advances at drive_spd; we sample
+ *                     h(world_x) for the wheel contact and use a
+ *                     central-difference slope α as a feed-forward
+ *                     hint to the controller.
+ *
+ *                 (B) INVERTED PENDULUM — the body is a rigid rod
+ *                     of length L, mass m_p, hinged at the wheel
+ *                     axle. Its state is (θ, ω) — angle from
+ *                     vertical and angular velocity. Gravity tips
+ *                     it: τ_gravity = m·g·L·sin(θ). Without
+ *                     control, θ runs away exponentially.
+ *
+ *                 (C) PID CONTROLLER — every tick reads the lean
+ *                     error e = θ − θ_ref, computes
+ *                          F = Kp·e + Ki·∫e + Kd·de/dt
+ *                     and applies F as horizontal motor force on
+ *                     the cart (axle). Cart-pole coupling tilts
+ *                     the body the other way; the controller's job
+ *                     is to keep θ near 0 despite gravity.
+ *
+ *                 The setpoint θ_ref is shifted by the terrain slope
+ *                 (θ_ref = -α · SLOPE_FEED) so the bot leans into the
+ *                 hill — the slope pushes the body, and we ask the
+ *                 controller to expect that.
+ *
+ * Data-structure: One Bot struct holds:
+ *                   • pendulum state (θ, ω)
+ *                   • cached cart-pole derived values (θ_eff,
+ *                     M_eff, ẍ, F) for display
+ *                   • PID gains (Kp, Ki, Kd) and integrator state
+ *                   • motion (world_x, drive_spd)
+ *                   • phase-space history ring buffer
+ *                   • UI flags (paused, fallen, view mode, preset)
+ *
+ *                 Terrain is a TBUF-entry ring buffer of heights
+ *                 indexed by world column; new columns are filled
+ *                 as the bot moves forward.
+ *
+ * Rendering     : Painter's order — last write wins:
+ *                   (1) Sky (with sparse stars)
+ *                   (2) Terrain — surface row + texture row + rock
+ *                       fill below
+ *                   (3) Robot — chassis, wheels, body line, beacon
+ *                   (4) Right-side panel — telemetry / equations /
+ *                       phase portrait depending on view mode
+ *                   (5) HUD row 0 (yellow) + hint row last (cyan)
+ *
+ * Performance   : Per frame: O(cols) for terrain, O(1) for robot,
+ *                 O(HIST_LEN) for phase trail. Sub-stepping in the
+ *                 physics integrator keeps the controller stable
+ *                 even at low frame rates: each frame splits dt
+ *                 into N substeps of size ≤ TICK_DT_TARGET = 1/120
+ *                 sec, and each substep runs one integration step.
+ *
+ * References    :
+ *   Wikipedia, "Inverted pendulum" — the canonical control problem.
+ *     https://en.wikipedia.org/wiki/Inverted_pendulum
+ *   Wikipedia, "PID controller" — three-term feedback in industrial
+ *     and robotic systems.  https://en.wikipedia.org/wiki/PID_controller
+ *   Åström & Hägglund, "Advanced PID Control" (ISA, 2006) — the
+ *     reference text on PID tuning, anti-windup, and feed-forward.
+ *   Anderson, "Cart-pole physics" derivation — Lagrangian or Newton-
+ *     Euler approach, both give the same equations of motion.
+ *   Wikipedia, "Phase space" — the (θ, ω) diagram is a phase
+ *     portrait of a 2-D dynamical system.
+ *     https://en.wikipedia.org/wiki/Phase_space
+ *   Inigo Quilez, "Perlin noise" — the terrain primitive.
+ *     https://iquilezles.org/articles/morenoise/
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Three independent ideas working together:
+ *   1. Gravity wants to tip the bot over — it's an inverted pendulum
+ *      and that's fundamentally unstable.
+ *   2. Pushing the wheels forward/backward makes the body lean the
+ *      OTHER way — that's the cart-pole coupling that makes balancing
+ *      possible.
+ *   3. A PID controller reads the lean error and computes the right
+ *      amount of force to push, every single tick. Slope-aware: the
+ *      setpoint shifts so the bot leans into the hill.
+ *
+ *
+ * ANALOGY: BALANCING A BROOM ON YOUR HAND
+ * ───────────────────────────────────────
+ *
+ *   When you balance a broom upright on your palm, you don't push UP
+ *   on the broom — you slide your hand SIDEWAYS. If the broom tilts
+ *   right, you slide your hand right (faster than the broom is
+ *   tipping). That accelerates the broom's base rightward, which
+ *   makes the top rotate LEFT (relative to the base), which corrects
+ *   the lean.
+ *
+ *   Your hand = the cart (wheel). The broom = the pendulum. Your
+ *   eyes-and-arm = the PID controller, reading the broom's tilt and
+ *   computing where to slide your hand.
+ *
+ *   The bot does exactly this, except instead of "where to slide my
+ *   hand" the controller outputs "what motor force to apply to the
+ *   wheel". Same physics.
+ *
+ *
+ * GEOMETRY DIAGRAM
+ * ────────────────
+ *
+ *      (gravity ↓)                   * ← top of body (mass m_p)
+ *                                   /
+ *                                  /  ← rod of length L
+ *                                 /    pendulum state: (θ, ω)
+ *                                /     θ  = angle from vertical
+ *                               /      ω  = θ̇  = angular velocity
+ *                              /
+ *                       O═════O ← cart (wheels)
+ *                       │  ↑
+ *                       │  F = motor force from PID (horizontal)
+ *                       │
+ *                       └──→ x ← cart position
+ *                            ẍ = horizontal acceleration
+ *
+ *      The CRUCIAL coupling:
+ *        • Pushing the cart RIGHT (ẍ > 0) tilts the body LEFT.
+ *        • Pushing the cart LEFT  (ẍ < 0) tilts the body RIGHT.
+ *      That's how the controller corrects lean — by accelerating
+ *      the BASE in the same direction as the lean (so the top is
+ *      "left behind" and rotates back toward vertical).
+ *
+ *
+ * THE CART-POLE EQUATIONS (Lagrangian)
+ * ────────────────────────────────────
+ *
+ *      M_eff = M_cart + m_pole · sin²θ_eff
+ *
+ *      ẍ      = (F + m_pole · sin θ_eff · (L · ω² − g · cos θ_eff)) / M_eff
+ *
+ *      θ̈      = (g · sin θ_eff − ẍ · cos θ_eff) / L
+ *
+ *      θ_eff = θ + α   (α = terrain slope; gives "lean from gravity",
+ *                        not "lean from chassis")
+ *
+ *      Then forward Euler:
+ *          ω ← ω + θ̈ · dt
+ *          θ ← θ + ω · dt
+ *
+ *      Why M_eff = M_cart + m_pole · sin²θ_eff?
+ *      Some of the pole's mass effectively belongs to the cart's
+ *      inertia (the part being dragged horizontally as the pole
+ *      rotates). That fraction is sin²θ — zero at θ = 0 (pole
+ *      perfectly upright; cart inertia is just M_cart) and 1 at
+ *      θ = 90° (pole horizontal; the entire pole is being shoved
+ *      horizontally).
+ *
+ *
+ * PID CONTROLLER — block diagram
+ * ──────────────────────────────
+ *
+ *      θ_ref ──┐                   ┌────────────────┐
+ *              │  e = θ − θ_ref    │     Kp · e     │  P term
+ *      θ ──────┼─►  error  ─────►  │  + Ki · ∫e     │  I term
+ *                                  │  + Kd · de/dt  │  D term
+ *                                  └────────┬───────┘
+ *                                           ▼  F
+ *                                  ┌────────────────┐
+ *                                  │  Cart-pole     │
+ *                                  │  dynamics      │
+ *                                  └────────┬───────┘
+ *                                           ▼
+ *                              new θ, ω ────┘ (closes the loop)
+ *
+ *      • P  (Kp · e)    — instant stiffness. "Tilt 0.1 rad? Apply 12 N back."
+ *                         Larger Kp → faster correction but more overshoot.
+ *      • I  (Ki · ∫e)   — drift correction. On a slope a fixed lean accumulates
+ *                         in the integral; Ki sums that error and cancels the
+ *                         steady-state offset. Anti-windup clamps the integral
+ *                         so it can't grow unbounded.
+ *      • D  (Kd · de/dt) — damping. Resists rapid changes in error,
+ *                         brakes oscillation. Without Kd, the system
+ *                         oscillates forever (underdamped).
+ *
+ *
+ * SLOPE FEED-FORWARD
+ * ──────────────────
+ *
+ *   On a slope of α radians, gravity pulls the body away from
+ *   chassis-perpendicular. To stay upright with respect to gravity,
+ *   the body must LEAN into the slope. We tell the controller to
+ *   target a tilted setpoint:
+ *
+ *       θ_ref = -SLOPE_FEED · α
+ *
+ *   With SLOPE_FEED = 0.65, on a 20° slope (α ≈ 0.35 rad), the
+ *   setpoint becomes ≈ -13°. The bot's body leans 13° into the
+ *   slope, perfectly upright with respect to gravity (modulo the
+ *   feed-forward gain).
+ *
+ *   Without slope feed-forward, only the integral term would
+ *   correct slope drift — too slowly to follow rapidly changing
+ *   terrain. With feed-forward, slope is mostly handled
+ *   pre-emptively and Ki only mops up small residuals.
+ *
+ *
+ * PHASE PORTRAIT
+ * ──────────────
+ *
+ *   Plotting (θ, ω) over time on a 2-D plane shows the controller's
+ *   character:
+ *
+ *      ω ↑
+ *        │           UNDERDAMPED (small Kd)
+ *        │     ╭─.─╮            wide circles
+ *        │    ╱     ╲           that slowly shrink
+ *        │   ╱  ●    ╲
+ *        │  ╱         ╲    →
+ *        │ ╱           ╲
+ *        │╱             ╲       STABLE (good Kd)
+ *        ┼────────────────────  tight inward spiral
+ *        │                ╲     converges to (0, 0)
+ *        │                 ╲
+ *        │  OVERDAMPED      ╲   →  ────────────●
+ *        │  (large Kd)              slow direct
+ *        │                          path to origin
+ *        │                                          → θ
+ *
+ *   In the demo's phase view you'll see the actual trajectory.
+ *   Press 'g' to cycle gains and watch how the trajectory shape
+ *   changes — that's a tuning lesson by direct observation.
+ *
+ *
+ * ALGORITHM IN STEPS  (per frame)
+ * ──────────────────
+ *  1. Measure dt = wall-clock seconds since last frame.
+ *  2. Compute n_substeps = ceil(dt / TICK_DT_TARGET), capped at 16.
+ *     This keeps the integrator stable when frames take longer
+ *     than the physics timestep.
+ *  3. For each substep:
+ *       a. Advance world_x by drive_spd · sub_dt.
+ *       b. Sample terrain slope α at the new x.
+ *       c. Compute θ_eff = θ + α and θ_ref = -SLOPE_FEED · α.
+ *       d. PID:
+ *           e = θ − θ_ref
+ *           ∫e += e · sub_dt   (clamped by anti-windup)
+ *           de/dt = (e − e_prev) / sub_dt
+ *           F = Kp·e + Ki·∫e + Kd·de/dt    (clamped to ±F_MAX)
+ *       e. Cart-pole physics:
+ *           M_eff = M_cart + m_pole · sin²θ_eff
+ *           ẍ     = (F + m_pole·sin·(L·ω² − g·cos)) / M_eff
+ *           θ̈     = (g·sin θ_eff − ẍ·cos θ_eff) / L
+ *           ω    += θ̈ · sub_dt
+ *           θ    += ω · sub_dt
+ *       f. Append (θ, ω) to phase-history ring buffer.
+ *       g. If |θ_eff| > FALL_ANGLE → mark as fallen; stop ticking.
+ *  4. erase()
+ *  5. Render terrain → robot → side panel (telemetry / equations /
+ *     phase) → HUD row 0 + hint strip.
+ *  6. doupdate; sleep to TARGET_FPS.
+ *
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Stiff dynamics. At low frame rates (e.g. 30 fps), forward-Euler
+ *    integration can become marginally unstable for the cart-pole.
+ *    Sub-stepping each frame at TICK_DT_TARGET = 1/120 sec keeps
+ *    the integrator inside the stability region.
+ *
+ *  • Integrator wind-up. On steep slopes the error is sustained;
+ *    ∫e grows without bound and the controller overshoots wildly
+ *    when the slope ends. Clamp the integrator at WINDUP_MAX so its
+ *    contribution can't exceed about ±F_MAX.
+ *
+ *  • Slope feed-forward gain. SLOPE_FEED = 1.0 would cancel slope
+ *    perfectly, but real terrain noise (Perlin) means α changes
+ *    rapidly; using 0.65 leaves headroom for the controller to
+ *    smooth out the residual.
+ *
+ *  • Falling threshold. Above ~60° lean, the cart-pole equations
+ *    are still mathematically valid but the bot can't recover with
+ *    bounded F. We stop ticking and show a "FALLEN" banner.
+ *
+ *  • Ring buffer wrap-around. Phase history wraps at HIST_LEN; older
+ *    samples are silently overwritten. Drawing newest-first keeps the
+ *    fresh tip of the trajectory bright.
+ *
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • Press 'r' to reset on flat-ish ground. The bot stands upright
+ *    immediately. HUD shows θ ≈ 0, F ≈ 0.
+ *
+ *  • Press 'p' to disable PID. The bot tips over within ~0.5 sec.
+ *    That's how unstable an uncontrolled inverted pendulum is.
+ *
+ *  • Cycle through gain presets with 'g'. Watch:
+ *      BALANCED  — clean inward spiral in the phase view.
+ *      HIGH Kp   — bot oscillates more, phase trajectory is wider.
+ *      NO Kd     — phase trajectory becomes a circle that doesn't
+ *                  shrink. Underdamping = perpetual oscillation.
+ *      NO Ki     — on a slope, the bot drifts to a steady non-zero
+ *                  lean and stays there. Steady-state error.
+ *
+ *  • Switch to EQUATIONS view ('m'). Read the live numbers; multiply
+ *    Kp by e by hand and verify it matches the displayed P term.
+ *
+ *  • Push drive speed to max with ↑. The bot still balances — slope
+ *    feed-forward + PID handles the constantly changing terrain.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+#define _POSIX_C_SOURCE 200809L
+
+#ifndef M_PI
+#  define M_PI 3.14159265358979323846
+#endif
+
 #include <math.h>
+#include <ncurses.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
 #include <time.h>
-#include <stdbool.h>
-#include <stdio.h>
 
-/*── pixel / cell ──*/
-#define CELL_W        8
-#define CELL_H       16
+/* ===================================================================== */
+/* §1  config                                                             */
+/* ===================================================================== */
 
-/*── physics (SI) ──*/
-#define GRAVITY      9.81f   /* m/s² */
-#define PEND_LEN     1.0f    /* metres  — axle to body COM */
-#define MASS_CART    4.0f    /* kg  — chassis + wheel mass */
-#define MASS_POLE    2.0f    /* kg  — upper body mass */
-#define MAX_FORCE  200.0f    /* N   — motor force clamp */
-#define PIX_PER_M  100.0f    /* px per metre (display scale) */
-#define FALL_ANGLE   1.05f   /* rad (~60°) — fallen threshold */
+/* ── §1.1 frame rate + sub-step target ────────────────────────────── */
+enum {
+    TARGET_FPS = 60,
+};
 
-/*── PID defaults ──*/
-#define KP_DEF     120.0f
-#define KI_DEF       0.2f
-#define KD_DEF      18.0f
-#define WINDUP_MAX   5.0f    /* integral anti-windup clamp */
+/*
+ * TICK_DT_TARGET — desired physics step. Each frame is split into
+ * sub-steps no larger than this so the cart-pole integrator stays
+ * stable even at slow frame rates. 1/120 sec is small enough for
+ * the default gains to be well within the stability region.
+ *
+ * MAX_SUBSTEPS — cap so a long-stalled frame doesn't loop forever.
+ */
+#define TICK_DT_TARGET   (1.0f / 120.0f)
+#define MAX_SUBSTEPS     16
 
-/*── slope compensation ──*/
-#define SLOPE_FEED   0.65f   /* fraction of slope fed to θ_ref */
+/* ── §1.2 cell pixel dimensions ──────────────────────────────────── */
+/* Terminal cells are roughly 2× tall as wide (8 × 16 px). Physics
+ * is in pixel space; cell conversion happens at draw time. */
+#define CELL_W   8
+#define CELL_H  16
 
-/*── bot geometry (pixels) ──*/
-#define WHEEL_R     18.0f
-#define AXLE_HW     24.0f
-#define BODY_H      96.0f
-#define BODY_HW      8.0f
+/* ── §1.3 cart-pole physics (SI) ─────────────────────────────────── */
+/*
+ * GRAVITY   — m/s²; standard Earth value.
+ * PEND_LEN  — m; rod length from axle to body centre-of-mass.
+ *             Longer rod = slower oscillation (τ ∝ √(L/g)).
+ * MASS_CART — kg; effective mass of chassis + wheels.
+ * MASS_POLE — kg; mass of the body above the axle.
+ * MAX_FORCE — N; motor force clamp (saturation).
+ *             80 N keeps "everything bounded" for our default
+ *             pendulum geometry.
+ * FALL_ANGLE — rad; "fallen over" threshold (~60°). At larger
+ *              angles even unbounded F couldn't recover quickly,
+ *              so we just stop ticking.
+ */
+#define GRAVITY      9.81f
+#define PEND_LEN     1.00f
+#define MASS_CART    4.00f
+#define MASS_POLE    2.00f
+#define MAX_FORCE  200.00f
+#define FALL_ANGLE   1.05f
 
-/*── drive ──*/
-#define DRIVE_DEF   55.0f    /* px/s */
-#define DRIVE_STEP  15.0f
-#define DRIVE_MAX  160.0f
+/* ── §1.4 PID defaults + anti-windup ─────────────────────────────── */
+/*
+ * KP_DEF — proportional gain. Larger = faster correction, more overshoot.
+ * KI_DEF — integral gain. Larger = faster drift removal but risk of windup.
+ * KD_DEF — derivative gain. Larger = more damping, slower response.
+ * WINDUP_MAX — clamp on the integrator's accumulated value (rad·sec).
+ *             Prevents unbounded growth on sustained errors.
+ */
+#define KP_DEF      120.0f
+#define KI_DEF        0.20f
+#define KD_DEF       18.0f
+#define WINDUP_MAX    5.00f
 
-/*── terrain ring-buffer ──*/
-#define TBUF       1024      /* power of 2 */
-#define TMASK      (TBUF-1)
-#define T_FREQ     0.022f    /* Perlin frequency per world-column */
-#define T_AMP_F    0.20f     /* amplitude fraction of screen height */
-#define T_MID_F    0.62f     /* baseline fraction of screen height */
+/* ── §1.5 slope feed-forward ─────────────────────────────────────── */
+/*
+ * SLOPE_FEED — fraction of terrain slope α fed to θ_ref.
+ *   1.0 cancels slope perfectly in theory but amplifies high-frequency
+ *   slope changes; 0.65 leaves headroom for the PID to smooth residuals.
+ */
+#define SLOPE_FEED   0.65f
 
-/*── timing ──*/
-#define FPS_TARGET   60
-#define TICK_HZ_DEF 120
+/* ── §1.6 robot geometry (pixels) ────────────────────────────────── */
+#define WHEEL_R      18.0f      /* wheel radius (only used for axle height) */
+#define AXLE_HW      26.0f      /* half the axle width (wheel separation) */
+#define BODY_H       96.0f      /* body length axle → top mass */
 
-/*── history (phase portrait + error plot) ──*/
-#define HIST_LEN   240       /* samples kept for phase portrait */
+/* ── §1.7 drive speed cycle ──────────────────────────────────────── */
+#define DRIVE_DEF    55.0f
+#define DRIVE_STEP   15.0f
+#define DRIVE_MAX   160.0f
+#define DRIVE_MIN     0.0f
+#define PIX_PER_M   100.0f     /* HUD scale: pixels per metre  */
 
-/*── view modes ──*/
-typedef enum { VIEW_TELE = 0, VIEW_EQ, VIEW_PHASE, VIEW_COUNT } ViewMode;
-static const char *VIEW_NAMES[] = { "TELEMETRY", "EQUATIONS", "PHASE SPACE" };
+/* ── §1.8 terrain ─────────────────────────────────────────────────── */
+/*
+ * TBUF       — power of two; ring-buffer size for terrain heights.
+ * T_FREQ     — Perlin frequency per world column. Smaller = bigger hills.
+ * T_AMP_F    — amplitude as fraction of screen height.
+ * T_MID_F    — vertical placement of the terrain centre line.
+ */
+#define TBUF       1024
+#define TMASK      (TBUF - 1)
+#define T_FREQ      0.022f
+#define T_AMP_F     0.20f
+#define T_MID_F     0.62f
 
-/*── color pairs ──*/
-#define CP_SKY      1
-#define CP_STAR     2
-#define CP_SURF     3
-#define CP_ROCK     4
-#define CP_CHASSIS  5
-#define CP_WHEEL    6
-#define CP_SPOKE    7
-#define CP_AXLE     8
-#define CP_HUD      9
-#define CP_WARN    10
-#define CP_DIM     11
-#define CP_TITLE   12
-#define CP_BARP    13
-#define CP_BARN    14
-#define CP_SPD     15
-#define CP_EQ      16   /* equation text */
-#define CP_VAL     17   /* live numeric values */
-#define CP_GOOD    18   /* stable / positive indicator */
+/* ── §1.9 phase-history ring buffer ─────────────────────────────── */
+enum { HIST_LEN = 240 };
 
-/* ── §2  CLOCK ──────────────────────────────────────────────────── */
-static long long now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+/* ── §1.10 view modes ────────────────────────────────────────────── */
+typedef enum {
+    VIEW_TELEMETRY = 0,
+    VIEW_EQUATIONS,
+    VIEW_PHASE,
+    VIEW_COUNT
+} ViewMode;
+
+static const char *VIEW_NAMES[VIEW_COUNT] = {
+    "TELEMETRY", "EQUATIONS", "PHASE-SPACE"
+};
+
+/* ── §1.11 dt cap (spiral-of-death guard) ────────────────────────── */
+#define DT_CAP_SEC  0.10f
+
+/* ── §1.12 ncurses pair IDs ──────────────────────────────────────── */
+enum {
+    /* 1..2 — sky & stars */
+    CP_SKY      = 1,
+    CP_STAR,
+    /* 3..4 — terrain */
+    CP_SURF,
+    CP_ROCK,
+    /* 5..7 — robot */
+    CP_CHASSIS,
+    CP_WHEEL,
+    CP_BEACON,
+    /* 8..10 — UI */
+    CP_DIM,             /* dim text                            */
+    CP_GOOD,            /* green positive indicator            */
+    CP_WARN,            /* red warning                         */
+    /* 11..12 — value text */
+    CP_VAL,             /* live numeric values                 */
+    CP_EQ,              /* equation labels                     */
+    /* 13..14 — bar gauge */
+    CP_BAR_POS,
+    CP_BAR_NEG,
+    /* 15..16 — HUD spec */
+    PAIR_HUD,
+    PAIR_HINT,
+};
+
+/* ── §1.13 timing primitives ─────────────────────────────────────── */
+#define NS_PER_SEC  1000000000LL
+#define NS_PER_MS   1000000LL
+
+/* ── §1.14 HUD layout ────────────────────────────────────────────── */
+#define HUD_BUF_LEN  160
+#define PANEL_W       32
+
+/* ===================================================================== */
+/* §2  clock                                                              */
+/* ===================================================================== */
+
+static int64_t clock_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-/* ── §3  COLOR ──────────────────────────────────────────────────── */
-static void color_init(void) {
+static void clock_sleep_ns(int64_t ns)
+{
+    if (ns <= 0) return;
+    struct timespec req = {
+        .tv_sec  = (time_t)(ns / NS_PER_SEC),
+        .tv_nsec = (long)  (ns % NS_PER_SEC),
+    };
+    nanosleep(&req, NULL);
+}
+
+/* ===================================================================== */
+/* §3  color                                                              */
+/* ===================================================================== */
+
+/*
+ * Each visual element gets one fixed semantic colour. Layout:
+ *
+ *   sky background      dark blue
+ *   stars               bright yellow (sparse)
+ *   terrain surface     bright green
+ *   terrain rock fill   dim green
+ *   robot chassis       white
+ *   robot wheel         cyan
+ *   beacon              red (warning-ish; tip of body, easy to spot)
+ *   dim text            grey
+ *   stable indicator    bright green
+ *   warning indicator   bright red
+ *   live values         light yellow
+ *   equation labels     light cyan
+ *   bar pos             cyan
+ *   bar neg             magenta
+ *
+ * HUD pairs (PAIR_HUD, PAIR_HINT) bind separately on default
+ * terminal background per CLAUDE.md HUD spec.
+ */
+static void color_init(void)
+{
     start_color();
     use_default_colors();
-    init_pair(CP_SKY, 25,  -1);
-    init_pair(CP_STAR,    226,  -1);
-    init_pair(CP_SURF,     34,  -1);
-    init_pair(CP_ROCK,    240,  -1);
-    init_pair(CP_CHASSIS, 253,  -1);
-    init_pair(CP_WHEEL,    51,  -1);
-    init_pair(CP_SPOKE,   226,  -1);
-    init_pair(CP_AXLE,    201,  -1);
-    init_pair(CP_HUD,      82,  -1);
-    init_pair(CP_WARN,    196,  -1);
-    init_pair(CP_DIM, 246,  -1);
-    init_pair(CP_TITLE,   255,  -1);
-    init_pair(CP_BARP,     51,  -1);
-    init_pair(CP_BARN,    213,  -1);
-    init_pair(CP_SPD,     214,  -1);
-    init_pair(CP_EQ,      159,  -1);   /* light cyan — equation text */
-    init_pair(CP_VAL,     229,  -1);   /* pale yellow — live values */
-    init_pair(CP_GOOD,     46,  -1);   /* bright green — stable */
+
+    if (COLORS >= 256) {
+        init_pair(CP_SKY,       25,  -1);    /* dark blue          */
+        init_pair(CP_STAR,     226,  -1);    /* yellow             */
+        init_pair(CP_SURF,      46,  -1);    /* bright green       */
+        init_pair(CP_ROCK,      28,  -1);    /* dim green          */
+        init_pair(CP_CHASSIS,  255,  -1);    /* near-white         */
+        init_pair(CP_WHEEL,     51,  -1);    /* cyan               */
+        init_pair(CP_BEACON,   196,  -1);    /* red                */
+        init_pair(CP_DIM,      244,  -1);    /* grey               */
+        init_pair(CP_GOOD,      82,  -1);    /* lime               */
+        init_pair(CP_WARN,     196,  -1);    /* red                */
+        init_pair(CP_VAL,      229,  -1);    /* pale yellow        */
+        init_pair(CP_EQ,       159,  -1);    /* light cyan         */
+        init_pair(CP_BAR_POS,   51,  -1);    /* cyan               */
+        init_pair(CP_BAR_NEG,  201,  -1);    /* magenta            */
+        init_pair(PAIR_HUD,    226,  -1);    /* yellow on default  */
+        init_pair(PAIR_HINT,    51,  -1);    /* cyan on default    */
+    } else {
+        init_pair(CP_SKY,      COLOR_BLUE,    -1);
+        init_pair(CP_STAR,     COLOR_YELLOW,  -1);
+        init_pair(CP_SURF,     COLOR_GREEN,   -1);
+        init_pair(CP_ROCK,     COLOR_GREEN,   -1);
+        init_pair(CP_CHASSIS,  COLOR_WHITE,   -1);
+        init_pair(CP_WHEEL,    COLOR_CYAN,    -1);
+        init_pair(CP_BEACON,   COLOR_RED,     -1);
+        init_pair(CP_DIM,      COLOR_WHITE,   -1);
+        init_pair(CP_GOOD,     COLOR_GREEN,   -1);
+        init_pair(CP_WARN,     COLOR_RED,     -1);
+        init_pair(CP_VAL,      COLOR_YELLOW,  -1);
+        init_pair(CP_EQ,       COLOR_CYAN,    -1);
+        init_pair(CP_BAR_POS,  COLOR_CYAN,    -1);
+        init_pair(CP_BAR_NEG,  COLOR_MAGENTA, -1);
+        init_pair(PAIR_HUD,    COLOR_YELLOW,  -1);
+        init_pair(PAIR_HINT,   COLOR_CYAN,    -1);
+    }
 }
 
-/* ── §4  PERLIN NOISE ───────────────────────────────────────────── */
-static unsigned char perm[512];
+/* ===================================================================== */
+/* §4  noise — Perlin 1-D + fBm                                           */
+/* ===================================================================== */
 
-static void perlin_init(unsigned int seed) {
+/*
+ * Perlin gradient noise over a permutation table. We use a simple
+ * 1-D variant with quintic smoothstep:
+ *      fade(t) = 6t⁵ − 15t⁴ + 10t³
+ * which is C²-continuous, so the resulting surface has continuous
+ * curvature (no visible kinks).
+ */
+static unsigned char g_perm[512];
+
+static void perlin_init(unsigned int seed)
+{
     unsigned char p[256];
     srand(seed);
     for (int i = 0; i < 256; i++) p[i] = (unsigned char)i;
@@ -137,896 +667,1062 @@ static void perlin_init(unsigned int seed) {
         int j = rand() % (i + 1);
         unsigned char t = p[i]; p[i] = p[j]; p[j] = t;
     }
-    for (int i = 0; i < 512; i++) perm[i] = p[i & 255];
+    for (int i = 0; i < 512; i++) g_perm[i] = p[i & 255];
 }
 
-/* Perlin smoothstep and gradient */
-static float p_fade(float t)           { return t*t*t*(t*(t*6.f-15.f)+10.f); }
-static float p_lerp(float a, float b, float t) { return a + t*(b-a); }
-static float p_grad(int h, float x)   { return (h & 1) ? x : -x; }
+static inline float fade (float t) { return t*t*t*(t*(t*6.0f - 15.0f) + 10.0f); }
+static inline float lerp (float a, float b, float t) { return a + t * (b - a); }
+static inline float grad1(int h, float x) { return (h & 1) ? x : -x; }
 
-static float perlin1(float x) {
-    int xi = (int)floorf(x) & 255;
+static float perlin1(float x)
+{
+    int   xi = (int)floorf(x) & 255;
     float xf = x - floorf(x);
-    return p_lerp(p_grad(perm[xi], xf),
-                  p_grad(perm[xi+1], xf-1.f), p_fade(xf));
+    return lerp(grad1(g_perm[xi],     xf       ),
+                grad1(g_perm[xi + 1], xf - 1.0f),
+                fade(xf));
 }
 
-/* Fractional Brownian Motion — 5 octaves */
-static float fbm(float x) {
-    float v = 0.f, a = 0.5f, f = 1.f;
-    for (int i = 0; i < 5; i++) { v += a*perlin1(x*f); a*=.5f; f*=2.f; }
-    return v;   /* ≈ [-1, +1] */
-}
-
-/* ── §5  COORDS + DRAW PRIMITIVES ───────────────────────────────── */
-static inline int px_to_cx(float px) { return (int)(px / CELL_W); }
-static inline int px_to_cy(float py) { return (int)(py / CELL_H); }
-
-static void put_c(int r, int c, chtype ch, attr_t a, int pair,
-                  int rows, int cols) {
-    if (r>=0 && r<rows && c>=0 && c<cols) {
-        attron(a | COLOR_PAIR(pair));
-        mvaddch(r, c, ch);
-        attroff(a | COLOR_PAIR(pair));
+/*
+ * Fractional Brownian Motion — sum of 5 perlin octaves at increasing
+ * frequency and decreasing amplitude. Result is in [-1, +1] roughly.
+ * Each octave doubles frequency and halves amplitude — the classic
+ * 1/f spectrum that gives nature-like terrain.
+ */
+static float fbm(float x)
+{
+    float v = 0.0f, amp = 0.5f, freq = 1.0f;
+    for (int i = 0; i < 5; i++) {
+        v   += amp * perlin1(x * freq);
+        amp *= 0.5f;
+        freq *= 2.0f;
     }
+    return v;
 }
 
-static void put_s(int r, int c, const char *s, attr_t a, int pair,
-                  int rows, int cols) {
-    if (r < 0 || r >= rows) return;
-    attron(a | COLOR_PAIR(pair));
-    for (int i = 0; s[i] && c+i < cols; i++)
-        mvaddch(r, c+i, (unsigned char)s[i]);
-    attroff(a | COLOR_PAIR(pair));
-}
+/* ===================================================================== */
+/* §5  terrain — height query, slope, ring buffer                         */
+/* ===================================================================== */
 
-/* Ascii bar centred at zero; W cols wide, v in [-1,+1] */
-static void draw_bar(int r, int c, int W, float v,
-                     int pp, int pn, int rows, int cols) {
-    int half = W/2, mid = c+half;
-    int fill = (int)(fabsf(v)*half); if (fill>half) fill=half;
-    attron(COLOR_PAIR(CP_DIM));
-    for (int i=0;i<W;i++) put_c(r,c+i,' ',0,CP_DIM,rows,cols);
-    put_c(r,mid,'|',0,CP_DIM,rows,cols);
-    attroff(COLOR_PAIR(CP_DIM));
-    int cp = (v>=0.f)?pp:pn;
-    attron(COLOR_PAIR(cp)|A_BOLD);
-    if (v>=0.f) for(int i=0;i<fill;i++) put_c(r,mid+1+i,'=',A_BOLD,cp,rows,cols);
-    else        for(int i=0;i<fill;i++) put_c(r,mid-1-i,'=',A_BOLD,cp,rows,cols);
-    attroff(COLOR_PAIR(cp)|A_BOLD);
-}
-
-/* ── §6  TERRAIN ────────────────────────────────────────────────── */
+/*
+ * Terrain heights are stored in a ring buffer indexed by world
+ * column. As the bot moves right, new columns are filled lazily
+ * by `terrain_ensure`.
+ */
 typedef struct {
-    float h[TBUF];   /* surface height in px from screen top */
-    int   gen_col;
-    int   rows, cols;
+    float h[TBUF];   /* surface height (px from screen top)     */
+    int   gen_col;   /* highest world column already populated  */
+    int   rows;      /* terminal rows; needed for amplitude     */
 } Terrain;
 
-/* Height at a world column (px from top) */
-static float terrain_h_at(int wc, int rows) {
-    float mid = rows * T_MID_F * CELL_H;
-    float amp = rows * T_AMP_F * CELL_H;
-    return mid + fbm(wc * T_FREQ) * amp;
+/* World y of the surface at a given world column. */
+static float terrain_h_at(int wc, int rows)
+{
+    float mid = (float)rows * T_MID_F * (float)CELL_H;
+    float amp = (float)rows * T_AMP_F * (float)CELL_H;
+    return mid + fbm((float)wc * T_FREQ) * amp;
 }
 
-/* Slope angle (rad) at world column; positive = uphill to the right */
-static float terrain_slope_at(const Terrain *t, int wc) {
-    float dh = t->h[(wc+1)&TMASK] - t->h[wc&TMASK];
-    return -atanf(dh / CELL_W);   /* negative: screen +y is down */
+/*
+ * Terrain slope at a world column, in radians.
+ *
+ *   slope = atan2(Δh, Δx)   — central or forward difference would
+ *                              both work; we use forward difference
+ *                              for the cached buffer (h[c+1] − h[c]).
+ *
+ *   Sign convention in screen-y (which is positive DOWN):
+ *     dh > 0 → terrain falls to the right → slope > 0 (descending)
+ *     dh < 0 → terrain rises to the right → slope < 0 (ascending)
+ *   We negate to match the cart-pole convention (positive = uphill
+ *   to the right) so the controller sees an intuitive sign.
+ */
+static float terrain_slope_at(const Terrain *t, int wc)
+{
+    float dh = t->h[(wc + 1) & TMASK] - t->h[wc & TMASK];
+    return -atanf(dh / (float)CELL_W);
 }
 
-static void terrain_ensure(Terrain *t, int upto) {
-    for (int c = t->gen_col+1; c <= upto; c++)
-        t->h[c&TMASK] = terrain_h_at(c, t->rows);
+static void terrain_ensure(Terrain *t, int upto)
+{
+    for (int c = t->gen_col + 1; c <= upto; c++)
+        t->h[c & TMASK] = terrain_h_at(c, t->rows);
     if (upto > t->gen_col) t->gen_col = upto;
 }
 
-static void terrain_init(Terrain *t, int rows, int cols) {
-    t->rows = rows; t->cols = cols; t->gen_col = -1;
+static void terrain_init(Terrain *t, int rows, int cols)
+{
+    t->rows    = rows;
+    t->gen_col = -1;
     terrain_ensure(t, cols + 64);
 }
 
-/* ── §7  GAIN PRESETS (for learning PID tuning) ─────────────────── */
+/* ===================================================================== */
+/* §6  bot — Bot type, PID, cart-pole physics, init/reset                 */
+/* ===================================================================== */
+
+/* ── §6.1 GainPreset (for the 'g' key teaching cycle) ─────────────── */
+
 typedef struct {
-    const char *name;      /* short label */
-    const char *lesson[3]; /* three lines explaining what to observe */
-    float kp, ki, kd;
+    const char *name;
+    const char *lesson_l1;
+    const char *lesson_l2;
+    float       kp, ki, kd;
 } GainPreset;
 
 static const GainPreset PRESETS[] = {
-    {
-        "BALANCED",
-        { "Kp=120 Ki=0.2 Kd=18: well-tuned baseline.",
-          "Responds quickly, damps oscillation,",
-          "corrects slope-induced drift via Ki." },
-        120.f, 0.20f, 18.f
-    },
-    {
-        "HIGH Kp ",
-        { "Kp=240: stiffer proportional response.",
-          "Watch: faster correction but more",
-          "overshoot and oscillation on slopes." },
-        240.f, 0.20f, 18.f
-    },
-    {
-        "LOW  Kp ",
-        { "Kp=40: sluggish proportional gain.",
-          "Watch: bot leans further before",
-          "correcting. Falls on steep terrain." },
-        40.f, 0.10f, 10.f
-    },
-    {
-        "NO   Kd ",
-        { "Kd=0: no derivative (damping) term.",
-          "Watch: bot oscillates continuously,",
-          "never settles. Classic underdamping." },
-        120.f, 0.20f,  0.f
-    },
-    {
-        "HIGH Kd ",
-        { "Kd=70: heavily overdamped response.",
-          "Watch: very slow, sluggish correction.",
-          "May struggle on sudden slope changes." },
-        120.f, 0.20f, 70.f
-    },
-    {
-        "NO   Ki ",
-        { "Ki=0: no integral term.",
-          "Watch: bot leans permanently on slope",
-          "— steady-state error, never corrects." },
-        120.f, 0.00f, 18.f
-    },
+    { "BALANCED",
+      "well-tuned baseline.",
+      "fast, damped, slope-aware.",
+      120.0f, 0.20f, 18.0f },
+
+    { "HIGH Kp ",
+      "stiffer P → more overshoot",
+      "& oscillation on slopes.",
+      240.0f, 0.20f, 18.0f },
+
+    { "NO Kd   ",
+      "no damping → underdamped:",
+      "bot oscillates forever.",
+      120.0f, 0.20f,  0.0f },
+
+    { "NO Ki   ",
+      "no integral → steady-state",
+      "drift on every slope.",
+      120.0f, 0.00f, 18.0f },
 };
-#define N_PRESETS (int)(sizeof PRESETS / sizeof PRESETS[0])
+#define N_PRESETS  (int)(sizeof PRESETS / sizeof PRESETS[0])
 
-/* ── §8  BOT ────────────────────────────────────────────────────── */
+/* ── §6.2 Bot type ───────────────────────────────────────────────── */
+
+/*
+ * Bot — the entire simulation state.
+ *
+ *   Pendulum state (the unknowns):
+ *     theta       lean angle from chassis-perpendicular (rad)
+ *     omega       angular velocity θ̇ (rad/sec)
+ *
+ *   Cart-pole derived (computed each substep, exposed for display):
+ *     theta_eff   θ + α — lean from gravity
+ *     theta_ref   PID setpoint = -SLOPE_FEED · α (lean into slope)
+ *     theta_ddot  θ̈ this step
+ *     x_ddot      ẍ this step (cart's horizontal accel)
+ *     M_eff       effective inertia M_cart + m_pole · sin²θ_eff
+ *     F           motor force this step
+ *
+ *   PID state:
+ *     kp, ki, kd   gains
+ *     pid_int      integrator accumulator
+ *     pid_prev_err previous frame's error (for derivative)
+ *     pid_p, pid_i, pid_d, pid_out  per-term outputs (display only)
+ *     pid_on       toggle (off → bot tips immediately)
+ *
+ *   Motion / world:
+ *     world_x      pixel-space position along the terrain
+ *     drive_spd    forward speed in px/sec
+ *     spin_angle   wheel spin (cosmetic; unused now)
+ *     alpha        current terrain slope at foot (rad)
+ *
+ *   Phase ring buffer: last HIST_LEN (θ, ω) samples for the phase
+ *     portrait. Newest at idx (head − 1).
+ *
+ *   UI:
+ *     paused       freeze ticks
+ *     fallen       above FALL_ANGLE; stop ticking, show banner
+ *     dist_m       cumulative travel in metres (HUD)
+ *     view         which side panel is visible
+ *     preset_idx   which gain preset is active
+ */
 typedef struct {
-    /* pendulum state */
-    float theta;        /* body lean from terrain normal (rad) */
-    float theta_dot;    /* angular velocity (rad/s) */
+    float theta, omega;
 
-    /* cart-pole derived (computed each tick, exposed for display) */
-    float theta_eff;    /* theta + alpha (effective lean from vertical) */
-    float theta_ref;    /* PID setpoint */
-    float theta_ddot;   /* angular acceleration this tick */
-    float x_ddot;       /* horizontal acceleration this tick */
-    float M_eff;        /* effective inertia this tick */
-    float F;            /* motor force applied this tick */
+    float theta_eff, theta_ref;
+    float theta_ddot, x_ddot, M_eff, F;
 
-    /* PID */
     float kp, ki, kd;
-    float pid_int;
-    float pid_prev_err;
+    float pid_int, pid_prev_err;
     float pid_p, pid_i, pid_d, pid_out;
     bool  pid_on;
 
-    /* motion / terrain */
-    float world_x;
-    float drive_spd;
+    float world_x, drive_spd;
     float spin_angle;
-    float alpha;        /* terrain slope (rad) */
+    float alpha;
 
-    /* phase portrait history */
     float ph_theta[HIST_LEN];
     float ph_omega[HIST_LEN];
     int   ph_head, ph_fill;
 
-    /* sim control */
-    bool  paused;
-    int   tick_hz;
-    bool  fallen;
-    float dist_m;
-
-    /* learning */
-    ViewMode    view;
-    int         preset_idx;
+    bool     paused, fallen;
+    float    dist_m;
+    ViewMode view;
+    int      preset_idx;
 } Bot;
 
-static void bot_reset(Bot *b) {
-    b->theta = 0.04f; b->theta_dot = 0.f;
-    b->pid_int = 0.f; b->pid_prev_err = 0.f;
-    b->pid_p = b->pid_i = b->pid_d = b->pid_out = 0.f;
-    b->world_x = 0.f; b->spin_angle = 0.f;
-    b->alpha = 0.f; b->fallen = false; b->dist_m = 0.f;
-    b->ph_head = 0; b->ph_fill = 0;
-}
+/* ── §6.3 PID controller (single function — easy to read) ──────────── */
 
-static void bot_init(Bot *b) {
-    memset(b, 0, sizeof *b);
-    b->kp = KP_DEF; b->ki = KI_DEF; b->kd = KD_DEF;
-    b->pid_on = true;
-    b->drive_spd = DRIVE_DEF;
-    b->tick_hz = TICK_HZ_DEF;
-    b->view = VIEW_TELE;
-    b->preset_idx = 0;
-    bot_reset(b);
-}
+/*
+ * Compute the motor force from the current lean error.
+ *
+ *   e          = θ − θ_ref               error
+ *   pid_int   += e · dt                  integral (clamped)
+ *   de_dt      = (e − e_prev) / dt       derivative
+ *   F          = Kp·e + Ki·∫e + Kd·de_dt clamped to ±MAX_FORCE
+ *
+ * The three term outputs are stored separately so the equations
+ * view can show them broken out.
+ */
+static void pid_step(Bot *b, float dt)
+{
+    if (!b->pid_on) {
+        b->pid_p = b->pid_i = b->pid_d = b->pid_out = 0.0f;
+        b->F = 0.0f;
+        return;
+    }
 
-static void bot_apply_preset(Bot *b) {
-    const GainPreset *p = &PRESETS[b->preset_idx];
-    b->kp = p->kp; b->ki = p->ki; b->kd = p->kd;
-    b->pid_int = 0.f;   /* clear integral on gain change */
-}
-
-/* ── §9  PHYSICS ────────────────────────────────────────────────── */
-static void bot_tick(Bot *b, const Terrain *t, float dt) {
-    if (b->fallen) return;
-
-    /* advance along terrain */
-    b->world_x += b->drive_spd * dt;
-    b->dist_m  += b->drive_spd * dt / PIX_PER_M;
-
-    int wc   = (int)(b->world_x / CELL_W);
-    b->alpha = terrain_slope_at(t, wc);
-
-    b->spin_angle += (b->drive_spd / WHEEL_R) * dt;
-
-    /* effective lean from vertical = body angle + terrain slope */
-    b->theta_eff = b->theta + b->alpha;
-
-    /* PID setpoint: lean into slope so bot stays upright on terrain */
-    b->theta_ref = -b->alpha * SLOPE_FEED;
     float err = b->theta - b->theta_ref;
 
-    b->F = 0.f;
-    if (b->pid_on) {
-        b->pid_int += err * dt;
-        if (b->pid_int >  WINDUP_MAX) b->pid_int =  WINDUP_MAX;
-        if (b->pid_int < -WINDUP_MAX) b->pid_int = -WINDUP_MAX;
+    b->pid_int += err * dt;
+    if (b->pid_int >  WINDUP_MAX) b->pid_int =  WINDUP_MAX;
+    if (b->pid_int < -WINDUP_MAX) b->pid_int = -WINDUP_MAX;
 
-        float deriv = (dt > 1e-9f) ? (err - b->pid_prev_err) / dt : 0.f;
-        b->pid_prev_err = err;
+    float deriv = (dt > 1e-9f) ? (err - b->pid_prev_err) / dt : 0.0f;
+    b->pid_prev_err = err;
 
-        b->pid_p = b->kp * err;
-        b->pid_i = b->ki * b->pid_int;
-        b->pid_d = b->kd * deriv;
-        b->F = b->pid_p + b->pid_i + b->pid_d;
-    }
-    if (b->F >  MAX_FORCE) b->F =  MAX_FORCE;
-    if (b->F < -MAX_FORCE) b->F = -MAX_FORCE;
-    b->pid_out = b->F;
+    b->pid_p   = b->kp * err;
+    b->pid_i   = b->ki * b->pid_int;
+    b->pid_d   = b->kd * deriv;
+    b->pid_out = b->pid_p + b->pid_i + b->pid_d;
 
-    /* Exact Lagrangian cart-pole on slope */
+    if (b->pid_out >  MAX_FORCE) b->pid_out =  MAX_FORCE;
+    if (b->pid_out < -MAX_FORCE) b->pid_out = -MAX_FORCE;
+    b->F = b->pid_out;
+}
+
+/* ── §6.4 cart-pole dynamics (Lagrangian) ───────────────────────────── */
+
+/*
+ * One forward-Euler step of the cart-pole equations on a sloped
+ * surface. See MENTAL MODEL → CART-POLE EQUATIONS for derivation.
+ *
+ * Inputs:  θ, ω, F      (and the current slope α via theta_eff)
+ * Outputs: ẍ, θ̈ stored in b for display; ω, θ updated in place.
+ */
+static void cart_pole_step(Bot *b, float dt)
+{
     float st = sinf(b->theta_eff);
     float ct = cosf(b->theta_eff);
-    b->M_eff   = MASS_CART + MASS_POLE * st * st;
-    b->x_ddot  = (b->F + MASS_POLE*st*(PEND_LEN*b->theta_dot*b->theta_dot
-                  - GRAVITY*ct)) / b->M_eff;
-    b->theta_ddot = (GRAVITY*st - b->x_ddot*ct) / PEND_LEN;
 
-    b->theta_dot += b->theta_ddot * dt;
-    b->theta     += b->theta_dot  * dt;
+    b->M_eff      =  MASS_CART + MASS_POLE * st * st;
+    b->x_ddot     = (b->F + MASS_POLE * st *
+                     (PEND_LEN * b->omega * b->omega - GRAVITY * ct))
+                    / b->M_eff;
+    b->theta_ddot = (GRAVITY * st - b->x_ddot * ct) / PEND_LEN;
 
-    /* record phase history */
+    b->omega += b->theta_ddot * dt;
+    b->theta += b->omega      * dt;
+}
+
+/* ── §6.5 phase history push ──────────────────────────────────────── */
+
+static void phase_push(Bot *b)
+{
     b->ph_theta[b->ph_head] = b->theta;
-    b->ph_omega[b->ph_head] = b->theta_dot;
+    b->ph_omega[b->ph_head] = b->omega;
     b->ph_head = (b->ph_head + 1) % HIST_LEN;
     if (b->ph_fill < HIST_LEN) b->ph_fill++;
+}
 
+/* ── §6.6 bot_substep — one physics step (called N times per frame) ── */
+
+/*
+ * Runs the physics pipeline for one timestep `sub_dt`:
+ *   1. Move forward along terrain at drive_spd.
+ *   2. Sample slope α at the new world position.
+ *   3. Compute θ_eff and the slope-aware setpoint θ_ref.
+ *   4. Run PID → motor force F.
+ *   5. Run cart-pole dynamics → update θ, ω.
+ *   6. Push (θ, ω) into the phase history.
+ *   7. Detect fall (|θ_eff| > FALL_ANGLE).
+ */
+static void bot_substep(Bot *b, const Terrain *t, float sub_dt)
+{
+    if (b->fallen) return;
+
+    /* 1. advance along terrain */
+    b->world_x += b->drive_spd * sub_dt;
+    b->dist_m  += b->drive_spd * sub_dt / PIX_PER_M;
+    int wc = (int)(b->world_x / (float)CELL_W);
+
+    /* 2. sample slope */
+    b->alpha = terrain_slope_at(t, wc);
+
+    /* 3. effective angle + slope-aware setpoint */
+    b->theta_eff = b->theta + b->alpha;
+    b->theta_ref = -b->alpha * SLOPE_FEED;
+
+    /* spin angle (cosmetic; not currently rendered) */
+    b->spin_angle += (b->drive_spd / WHEEL_R) * sub_dt;
+
+    /* 4. PID → F */
+    pid_step(b, sub_dt);
+
+    /* 5. cart-pole dynamics → updated θ, ω */
+    cart_pole_step(b, sub_dt);
+
+    /* 6. record phase trajectory */
+    phase_push(b);
+
+    /* 7. fall test */
     if (fabsf(b->theta_eff) > FALL_ANGLE) b->fallen = true;
 }
 
-/* ── §10  SIGNAL ────────────────────────────────────────────────── */
-static volatile sig_atomic_t running     = 1;
-static volatile sig_atomic_t need_resize = 0;
+/* ── §6.7 init / reset / preset ──────────────────────────────────── */
 
-static void sig_handler(int s) {
-    if (s == SIGINT || s == SIGTERM) running = 0;
-    if (s == SIGWINCH) need_resize = 1;
+static void bot_apply_preset(Bot *b, int idx)
+{
+    const GainPreset *p = &PRESETS[idx];
+    b->kp = p->kp;
+    b->ki = p->ki;
+    b->kd = p->kd;
+    b->pid_int = 0.0f;          /* clear integral on gain change */
 }
 
-/* ── §11  DRAW TERRAIN ──────────────────────────────────────────── */
-static bool is_star(int r, int c) {
-    unsigned h = (unsigned)(r*7919 + c*6271);
-    h ^= h>>13; h *= 0x45d9f3b; h ^= h>>17;
+static void bot_reset(Bot *b)
+{
+    /* Preserve user-adjustable settings across reset. */
+    bool     pid_on = b->pid_on;
+    float    drive  = b->drive_spd;
+    ViewMode view   = b->view;
+    int      preset = b->preset_idx;
+
+    memset(b, 0, sizeof *b);
+
+    b->pid_on      = pid_on;
+    b->drive_spd   = drive;
+    b->view        = view;
+    b->preset_idx  = preset;
+
+    /* Tiny initial lean so the controller has something to work with. */
+    b->theta = 0.04f;
+
+    bot_apply_preset(b, preset);
+}
+
+static void bot_init(Bot *b)
+{
+    memset(b, 0, sizeof *b);
+    b->pid_on      = true;
+    b->drive_spd   = DRIVE_DEF;
+    b->view        = VIEW_TELEMETRY;
+    b->preset_idx  = 0;
+    b->theta       = 0.04f;
+    bot_apply_preset(b, 0);
+}
+
+/* ===================================================================== */
+/* §7  render                                                             */
+/* ===================================================================== */
+
+/* ── §7.1 helpers ────────────────────────────────────────────────── */
+
+static inline int   px_to_cx (float px) { return (int)floorf(px / (float)CELL_W + 0.5f); }
+static inline int   px_to_cy (float py) { return (int)floorf(py / (float)CELL_H + 0.5f); }
+static inline bool  in_screen(int r, int c, int rows, int cols)
+{
+    return r >= 0 && r < rows && c >= 0 && c < cols;
+}
+
+static void put_ch(int r, int c, chtype ch, attr_t a, int cp,
+                   int rows, int cols)
+{
+    if (!in_screen(r, c, rows, cols)) return;
+    attron (a | COLOR_PAIR(cp));
+    mvaddch(r, c, ch);
+    attroff(a | COLOR_PAIR(cp));
+}
+
+static void put_str(int r, int c, const char *s, attr_t a, int cp,
+                    int rows, int cols)
+{
+    if (r < 0 || r >= rows) return;
+    attron (a | COLOR_PAIR(cp));
+    for (int i = 0; s[i] && c + i < cols; i++)
+        mvaddch(r, c + i, (unsigned char)s[i]);
+    attroff(a | COLOR_PAIR(cp));
+}
+
+/*
+ * Bresenham line picker — chooses a glyph based on segment slope so
+ * a long line "looks line-like" without per-cell trig.
+ */
+static chtype seg_glyph(int dr, int dc)
+{
+    if (dr == 0) return '-';
+    if (dc == 0) return '|';
+    return (dr * dc < 0) ? '/' : '\\';
+}
+
+static void draw_line(float x0, float y0, float x1, float y1,
+                      attr_t a, int cp, int rows, int cols)
+{
+    int r0 = px_to_cy(y0), c0 = px_to_cx(x0);
+    int r1 = px_to_cy(y1), c1 = px_to_cx(x1);
+    int dr = r1 - r0, dc = c1 - c0;
+    chtype ch = seg_glyph(dr, dc);
+    int sr = (r0 < r1) ? 1 : -1;
+    int sc = (c0 < c1) ? 1 : -1;
+    int err = abs(dr) - abs(dc);
+    int r = r0, c = c0;
+    for (;;) {
+        put_ch(r, c, ch, a, cp, rows, cols);
+        if (r == r1 && c == c1) break;
+        int e2 = 2 * err;
+        if (e2 > -abs(dc)) { err -= abs(dc); r += sr; }
+        if (e2 <  abs(dr)) { err += abs(dr); c += sc; }
+    }
+}
+
+/* Centred horizontal bar gauge in [-1, +1]. */
+static void draw_bar(int r, int c, int W, float v,
+                     int cp_pos, int cp_neg, int rows, int cols)
+{
+    int half = W / 2;
+    int mid  = c + half;
+    int fill = (int)(fabsf(v) * (float)half);
+    if (fill > half) fill = half;
+
+    /* track */
+    attron(COLOR_PAIR(CP_DIM));
+    for (int i = 0; i < W; i++) put_ch(r, c + i, ' ', 0, CP_DIM, rows, cols);
+    put_ch(r, mid, '|', 0, CP_DIM, rows, cols);
+    attroff(COLOR_PAIR(CP_DIM));
+
+    /* fill */
+    int cp = (v >= 0.0f) ? cp_pos : cp_neg;
+    attron(COLOR_PAIR(cp) | A_BOLD);
+    if (v >= 0.0f) for (int i = 0; i < fill; i++) put_ch(r, mid + 1 + i, '=', A_BOLD, cp, rows, cols);
+    else            for (int i = 0; i < fill; i++) put_ch(r, mid - 1 - i, '=', A_BOLD, cp, rows, cols);
+    attroff(COLOR_PAIR(cp) | A_BOLD);
+}
+
+/* ── §7.2 render_terrain — sky, surface, rock fill ───────────────── */
+
+static bool is_star(int r, int c)
+{
+    /* Cheap deterministic hash so stars stay in fixed cells. */
+    unsigned h = (unsigned)(r * 7919 + c * 6271);
+    h ^= h >> 13; h *= 0x45d9f3bU; h ^= h >> 17;
     return (h % 60) == 0;
 }
 
-static chtype surface_glyph(float dh) {
-    if (dh > CELL_W * 0.22f) return '/';
-    if (dh < -CELL_W * 0.22f) return '\\';
+static chtype surface_glyph(float dh)
+{
+    if (dh > (float)CELL_W * 0.22f)  return '/';
+    if (dh < -(float)CELL_W * 0.22f) return '\\';
     return '_';
 }
 
-static void draw_terrain(const Terrain *t, int bot_wc,
-                         float bot_sub, int bot_sc,
-                         int rows, int cols) {
+/*
+ * For each on-screen column:
+ *   - Sky rows render '.' stars at sparse hash-selected cells.
+ *   - Surface row gets a slope-shaped glyph ( _ / \ ).
+ *   - Texture row directly below alternates ':' '.' for grass feel.
+ *   - Rows further below are the rock fill ('#' alternating).
+ */
+static void render_terrain(const Terrain *t, int bot_wc, int bot_sc,
+                           int rows, int cols)
+{
     for (int sc = 0; sc < cols; sc++) {
-        int wc = bot_wc - bot_sc + sc;
+        int   wc  = bot_wc - bot_sc + sc;
         if (wc < 0) wc = 0;
         float h   = t->h[wc & TMASK];
-        float dh  = t->h[(wc+1)&TMASK] - h;
-        int surf  = px_to_cy(h);
+        float dh  = t->h[(wc + 1) & TMASK] - h;
+        int   surf = px_to_cy(h);
+        if (surf < 1)        surf = 1;
+        if (surf > rows - 2) surf = rows - 2;
+
         chtype sg = surface_glyph(dh);
-        (void)bot_sub;
 
         for (int r = 0; r < rows; r++) {
             if (r < surf) {
                 if (is_star(r, sc))
-                    put_c(r, sc, '.', A_BOLD, CP_STAR, rows, cols);
+                    put_ch(r, sc, '.', A_BOLD, CP_STAR, rows, cols);
             } else if (r == surf) {
-                int cp = (fabsf(dh) > CELL_W*0.22f) ? CP_ROCK : CP_SURF;
-                put_c(r, sc, sg, A_BOLD, cp, rows, cols);
-            } else if (r == surf+1) {
-                put_c(r, sc, (sc%3==0)?':':'.', A_DIM, CP_SURF, rows, cols);
+                int cp = (fabsf(dh) > (float)CELL_W * 0.22f) ? CP_ROCK : CP_SURF;
+                put_ch(r, sc, sg, A_BOLD, cp, rows, cols);
+            } else if (r == surf + 1) {
+                put_ch(r, sc, (sc % 3 == 0) ? ':' : '.', A_DIM, CP_SURF, rows, cols);
             } else {
-                put_c(r, sc, (sc%2==0)?'#':' ', A_DIM, CP_ROCK, rows, cols);
+                put_ch(r, sc, (sc % 2 == 0) ? '#' : ' ', A_DIM, CP_ROCK, rows, cols);
             }
         }
     }
 }
 
-/* ── §12  DRAW BOT ──────────────────────────────────────────────── */
-static void bot_body_pt(float ax, float ay, float theta, float alpha,
-                        float along, float side,
-                        float *ox, float *oy) {
-    float ang = theta + alpha;
-    *ox = ax + along*sinf(ang) + side*cosf(ang);
-    *oy = ay - along*cosf(ang) + side*sinf(ang);
-}
+/* ── §7.3 render_bot — clean wheels + tilted body line ───────────── */
 
-static chtype seg_glyph(int dr, int dc) {
-    if (!dr)       return '-';
-    if (!dc)       return '|';
-    return (dr*dc < 0) ? '/' : '\\';
-}
-
-static void draw_seg(float ax, float ay, float bx, float by,
-                     attr_t a, int cp, int rows, int cols) {
-    int r0=px_to_cy(ay), c0=px_to_cx(ax);
-    int r1=px_to_cy(by), c1=px_to_cx(bx);
-    int dr=r1-r0, dc=c1-c0;
-    chtype ch = seg_glyph(dr, dc);
-    int sr=(r0<r1)?1:-1, sc2=(c0<c1)?1:-1;
-    int err=abs(dr)-abs(dc), r=r0, c=c0;
-    for (;;) {
-        put_c(r, c, ch, a, cp, rows, cols);
-        if (r==r1 && c==c1) break;
-        int e2=2*err;
-        if (e2 > -abs(dc)) { err-=abs(dc); r+=sr; }
-        if (e2 <  abs(dr)) { err+=abs(dr); c+=sc2; }
-    }
-}
-
-static void draw_wheel(float wcx, float wcy, float spin,
-                       int rows, int cols) {
-    int cx=px_to_cx(wcx), cy=px_to_cy(wcy);
-    static const char spk[4]={'|','/','-','\\'};
-    int si=((int)(spin/(M_PI*0.5f)))&3;
-    put_c(cy-1,cx-2,'/',  A_BOLD,CP_WHEEL,rows,cols);
-    put_c(cy-1,cx-1,'-',  A_BOLD,CP_WHEEL,rows,cols);
-    put_c(cy-1,cx+1,'-',  A_BOLD,CP_WHEEL,rows,cols);
-    put_c(cy-1,cx+2,'\\', A_BOLD,CP_WHEEL,rows,cols);
-    put_c(cy,  cx-2,'|',  A_BOLD,CP_WHEEL,rows,cols);
-    put_c(cy,  cx+2,'|',  A_BOLD,CP_WHEEL,rows,cols);
-    put_c(cy+1,cx-2,'\\', A_BOLD,CP_WHEEL,rows,cols);
-    put_c(cy+1,cx-1,'_',  A_BOLD,CP_WHEEL,rows,cols);
-    put_c(cy+1,cx+1,'_',  A_BOLD,CP_WHEEL,rows,cols);
-    put_c(cy+1,cx+2,'/',  A_BOLD,CP_WHEEL,rows,cols);
-    put_c(cy-1,cx,  spk[si],       A_BOLD,CP_SPOKE,rows,cols);
-    put_c(cy,  cx-1,spk[(si+1)&3], A_BOLD,CP_SPOKE,rows,cols);
-    put_c(cy,  cx+1,spk[(si+1)&3], A_BOLD,CP_SPOKE,rows,cols);
-    put_c(cy+1,cx,  spk[si],       A_BOLD,CP_SPOKE,rows,cols);
-    put_c(cy,  cx,  'O',            A_BOLD,CP_AXLE, rows,cols);
-}
-
-static void draw_bot(const Bot *b, const Terrain *t,
-                     int bot_sc, int rows, int cols) {
-    int   wc    = (int)(b->world_x / CELL_W);
+/*
+ * The robot is intentionally minimal:
+ *
+ *      *           ← beacon (top of body)
+ *       \
+ *        \         ← body line (tilts with θ_eff = θ + α)
+ *         \
+ *        O═O       ← chassis '═' between two 'O' wheels
+ *
+ * Total: 6 cells of body + 1 beacon + 3 chassis = ~10 cells.
+ * Lean is shown by the body line's actual angle in cell space.
+ */
+static void render_bot(const Bot *b, const Terrain *t, int bot_sc,
+                       int rows, int cols)
+{
+    int   wc    = (int)(b->world_x / (float)CELL_W);
     float h_px  = t->h[wc & TMASK];
+
+    /* Axle in pixel space — just above the surface. */
     float ax_px = (float)(bot_sc * CELL_W);
     float ax_py = h_px - WHEEL_R;
 
-    /* wheels (offset slightly along slope) */
-    float lx = ax_px - AXLE_HW*cosf(b->alpha);
-    float ly = ax_py + AXLE_HW*sinf(b->alpha);
-    float rx = ax_px + AXLE_HW*cosf(b->alpha);
-    float ry = ax_py - AXLE_HW*sinf(b->alpha);
-    draw_wheel(lx, ly, b->spin_angle, rows, cols);
-    draw_wheel(rx, ry, b->spin_angle, rows, cols);
+    /* Wheels offset along the slope direction so the chassis sits
+     * "flat" on the terrain. */
+    float ca = cosf(b->alpha), sa = sinf(b->alpha);
+    float lx_px = ax_px - AXLE_HW * ca;
+    float ly_px = ax_py + AXLE_HW * sa;
+    float rx_px = ax_px + AXLE_HW * ca;
+    float ry_px = ax_py - AXLE_HW * sa;
 
-    /* axle bar */
+    /* Body top in pixel space — tilt by θ_eff. */
+    float te    = b->theta_eff;
+    float bx_px = ax_px + BODY_H * sinf(te);
+    float by_px = ax_py - BODY_H * cosf(te);
+
+    /* (1) chassis line — always between the two wheels. */
+    draw_line(lx_px, ly_px, rx_px, ry_px, A_BOLD, CP_CHASSIS, rows, cols);
+
+    /* (2) body line from axle to body top. */
+    draw_line(ax_px, ax_py, bx_px, by_px, A_BOLD, CP_CHASSIS, rows, cols);
+
+    /* (3) wheels — single 'O' each. */
+    int lcx = px_to_cx(lx_px), lcy = px_to_cy(ly_px);
+    int rcx = px_to_cx(rx_px), rcy = px_to_cy(ry_px);
+    put_ch(lcy, lcx, 'O', A_BOLD, CP_WHEEL, rows, cols);
+    put_ch(rcy, rcx, 'O', A_BOLD, CP_WHEEL, rows, cols);
+
+    /* (4) beacon at body top — '*' that pulses slightly so a learner
+     * can easily track "the top of the body" while it leans. */
+    int bcx = px_to_cx(bx_px), bcy = px_to_cy(by_px);
+    attr_t pulse = (((int)(b->dist_m * 4.0f)) & 1) ? A_BOLD : A_DIM;
+    put_ch(bcy, bcx, '*', pulse, CP_BEACON, rows, cols);
+
+    /* (5) lean readout — small floating number near the axle. */
     {
-        int ar=px_to_cy(ax_py), cl=px_to_cx(lx)+3, cr=px_to_cx(rx)-3;
-        attron(COLOR_PAIR(CP_CHASSIS)|A_BOLD);
-        for(int c=cl;c<=cr&&c<cols;c++) if(ar>=0&&ar<rows) mvaddch(ar,c,'=');
-        attroff(COLOR_PAIR(CP_CHASSIS)|A_BOLD);
-    }
-
-    /* chassis box */
-    float p0x,p0y,p1x,p1y;
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,  0,   -BODY_HW,&p0x,&p0y);
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,BODY_H,-BODY_HW,&p1x,&p1y);
-    draw_seg(p0x,p0y,p1x,p1y, A_BOLD, CP_CHASSIS, rows, cols);
-
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,  0,   +BODY_HW,&p0x,&p0y);
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,BODY_H,+BODY_HW,&p1x,&p1y);
-    draw_seg(p0x,p0y,p1x,p1y, A_BOLD, CP_CHASSIS, rows, cols);
-
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,  0,-BODY_HW,&p0x,&p0y);
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,  0,+BODY_HW,&p1x,&p1y);
-    draw_seg(p0x,p0y,p1x,p1y, A_NORMAL, CP_CHASSIS, rows, cols);
-
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,BODY_H,-BODY_HW,&p0x,&p0y);
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,BODY_H,+BODY_HW,&p1x,&p1y);
-    draw_seg(p0x,p0y,p1x,p1y, A_NORMAL, CP_CHASSIS, rows, cols);
-
-    /* spine */
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,   4, 0,&p0x,&p0y);
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,BODY_H-4,0,&p1x,&p1y);
-    draw_seg(p0x,p0y,p1x,p1y, A_DIM, CP_WHEEL, rows, cols);
-
-    /* beacon */
-    bot_body_pt(ax_px,ax_py,b->theta,b->alpha,BODY_H,0,&p1x,&p1y);
-    attr_t ba=(((int)(b->spin_angle*2))&1)?A_BOLD:A_DIM;
-    put_c(px_to_cy(p1y),px_to_cx(p1x),'*',ba,CP_WARN,rows,cols);
-
-    /* lean readout */
-    {
-        float deg = b->theta_eff * 57.3f;
-        int ar=px_to_cy(ax_py), ac=px_to_cx(ax_px);
-        int cp=(fabsf(deg)>20.f)?CP_WARN:CP_HUD;
-        attron(COLOR_PAIR(cp));
-        mvprintw(ar, ac-4, "%+.1f\xc2\xb0", deg);
+        float deg = b->theta_eff * (180.0f / (float)M_PI);
+        int   ar  = px_to_cy(ax_py);
+        int   ac  = px_to_cx(ax_px);
+        int   cp  = (fabsf(deg) > 20.0f) ? CP_WARN : CP_GOOD;
+        char  buf[16];
+        snprintf(buf, sizeof buf, "%+5.1f°", deg);
+        attron (COLOR_PAIR(cp));
+        mvprintw(ar, ac - 6, "%s", buf);
         attroff(COLOR_PAIR(cp));
     }
 
+    /* Fallen banner — overlay middle of screen. */
     if (b->fallen) {
-        int mr=rows/2, mc=cols/2-9;
-        put_s(mr-1,mc,"   !! FALLEN !!   ",A_BOLD|A_BLINK,CP_WARN,rows,cols);
-        put_s(mr,  mc,"  g=preset  r=reset",A_BOLD,CP_DIM,rows,cols);
+        int mr = rows / 2;
+        int mc = cols / 2 - 9;
+        if (mc < 0) mc = 0;
+        attron (COLOR_PAIR(CP_WARN) | A_BOLD | A_BLINK);
+        mvprintw(mr, mc, "  !! FALLEN !!  ");
+        attroff(COLOR_PAIR(CP_WARN) | A_BOLD | A_BLINK);
+        attron (COLOR_PAIR(CP_DIM));
+        mvprintw(mr + 1, mc - 1, "g=preset  r=reset");
+        attroff(COLOR_PAIR(CP_DIM));
     }
 }
 
-/* ── §13  VIEW A — TELEMETRY ────────────────────────────────────── */
-static void draw_telemetry(const Bot *b, int rows, int cols,
-                           int fps, int c0) {
-    int bw=14, bc=c0+18, r=0;
+/* ── §7.4 render_panel_telemetry — live numbers + bar gauges ──────── */
 
-    /* separator helper (nested function — GCC extension) */
-    auto void sep(void);
-    void sep(void){
-        attron(COLOR_PAIR(CP_DIM));
-        for(int i=0;i<31;i++)
-            put_c(r,c0+i,(i==0||i==30)?'+':'-',0,CP_DIM,rows,cols);
-        attroff(COLOR_PAIR(CP_DIM)); r++;
+static void render_panel_telemetry(const Bot *b, int rows, int cols, int c0)
+{
+    int r = 0;
+    int bw = 14;
+    int bc = c0 + 16;
+    char buf[64];
+
+    put_str(r++, c0, " TELEMETRY              ", A_BOLD, CP_VAL, rows, cols);
+
+    {
+        float deg = b->theta_eff * (180.0f / (float)M_PI);
+        int   cp  = fabsf(deg) > 20.0f ? CP_WARN : CP_GOOD;
+        snprintf(buf, sizeof buf, " theta_eff %+6.2f° ", deg);
+        put_str(r, c0, buf, A_BOLD, cp, rows, cols);
+        draw_bar(r, bc, bw, deg / 35.0f, CP_BAR_POS, CP_BAR_NEG, rows, cols);
+        r++;
+    }
+    {
+        snprintf(buf, sizeof buf, " omega    %+6.2f  ", b->omega);
+        put_str(r, c0, buf, A_NORMAL, CP_VAL, rows, cols);
+        draw_bar(r, bc, bw, b->omega / 6.0f, CP_BAR_POS, CP_BAR_NEG, rows, cols);
+        r++;
+    }
+    {
+        float sdeg = b->alpha * (180.0f / (float)M_PI);
+        int   cp   = fabsf(sdeg) > 15.0f ? CP_WARN : CP_VAL;
+        snprintf(buf, sizeof buf, " slope α  %+6.2f° ", sdeg);
+        put_str(r, c0, buf, A_NORMAL, cp, rows, cols);
+        draw_bar(r, bc, bw, sdeg / 25.0f, CP_BAR_NEG, CP_BAR_POS, rows, cols);
+        r++;
+    }
+    {
+        float mps = b->drive_spd / PIX_PER_M;
+        snprintf(buf, sizeof buf, " spd  %+5.2f m/s     ", mps);
+        put_str(r++, c0, buf, A_BOLD, CP_VAL, rows, cols);
+    }
+    {
+        snprintf(buf, sizeof buf, " dist %7.1f m       ", b->dist_m);
+        put_str(r++, c0, buf, A_NORMAL, CP_VAL, rows, cols);
     }
 
-    put_s(r++,c0," TELEMETRY              ",A_BOLD,CP_TITLE,rows,cols);
-    sep();
-
-    { float deg=b->theta_eff*57.3f;
-      int cp=fabsf(deg)>20.f?CP_WARN:CP_HUD;
-      char buf[32]; snprintf(buf,sizeof buf," \xce\xb8  %+6.2f\xc2\xb0 ",deg);
-      put_s(r,c0,buf,A_BOLD,cp,rows,cols);
-      draw_bar(r,bc,bw,deg/35.f,CP_BARP,CP_BARN,rows,cols); r++; }
-
-    { char buf[32]; snprintf(buf,sizeof buf," \xcf\x89  %+6.2f   ",b->theta_dot);
-      put_s(r,c0,buf,A_NORMAL,CP_HUD,rows,cols);
-      draw_bar(r,bc,bw,b->theta_dot/6.f,CP_BARP,CP_BARN,rows,cols); r++; }
-
-    { float sdeg=b->alpha*57.3f;
-      int cp=fabsf(sdeg)>15.f?CP_WARN:CP_HUD;
-      char buf[32]; snprintf(buf,sizeof buf," \xce\xb1  %+6.2f\xc2\xb0 ",sdeg);
-      put_s(r,c0,buf,A_NORMAL,cp,rows,cols);
-      draw_bar(r,bc,bw,sdeg/25.f,CP_BARN,CP_BARP,rows,cols); r++; }
-
-    { float mps=b->drive_spd/PIX_PER_M;
-      char buf[32]; snprintf(buf,sizeof buf," spd  %+5.2fm/s ",mps);
-      put_s(r++,c0,buf,A_BOLD,CP_SPD,rows,cols); }
-
-    { char buf[32]; snprintf(buf,sizeof buf," dist %7.1fm   ",b->dist_m);
-      put_s(r++,c0,buf,A_NORMAL,CP_HUD,rows,cols); }
-
-    sep();
-    put_s(r++,c0," PID OUTPUT             ",A_BOLD,CP_TITLE,rows,cols);
+    r++;
+    put_str(r++, c0, " PID OUTPUTS            ", A_BOLD, CP_VAL, rows, cols);
 
     if (b->pid_on) {
-        char buf[32];
-        snprintf(buf,sizeof buf," P   %+8.2f  ",b->pid_p);
-        put_s(r,c0,buf,A_NORMAL,CP_HUD,rows,cols);
-        draw_bar(r,bc,bw,b->pid_p/MAX_FORCE,CP_BARP,CP_BARN,rows,cols); r++;
+        snprintf(buf, sizeof buf, " P  Kp·e   %+8.2f ", b->pid_p);
+        put_str(r, c0, buf, A_NORMAL, CP_VAL, rows, cols);
+        draw_bar(r, bc, bw, b->pid_p / MAX_FORCE, CP_BAR_POS, CP_BAR_NEG, rows, cols);
+        r++;
 
-        snprintf(buf,sizeof buf," I   %+8.2f  ",b->pid_i);
-        put_s(r++,c0,buf,A_DIM,CP_HUD,rows,cols);
+        snprintf(buf, sizeof buf, " I  Ki·∫e  %+8.2f ", b->pid_i);
+        put_str(r++, c0, buf, A_NORMAL, CP_VAL, rows, cols);
 
-        snprintf(buf,sizeof buf," D   %+8.2f  ",b->pid_d);
-        put_s(r,c0,buf,A_NORMAL,CP_HUD,rows,cols);
-        draw_bar(r,bc,bw,b->pid_d/(MAX_FORCE*0.4f),CP_BARP,CP_BARN,rows,cols); r++;
+        snprintf(buf, sizeof buf, " D  Kd·θ̇   %+8.2f ", b->pid_d);
+        put_str(r, c0, buf, A_NORMAL, CP_VAL, rows, cols);
+        draw_bar(r, bc, bw, b->pid_d / (MAX_FORCE * 0.4f),
+                 CP_BAR_POS, CP_BAR_NEG, rows, cols);
+        r++;
 
-        snprintf(buf,sizeof buf," \xce\xa3   %+8.2f  ",b->pid_out);
-        int cp=fabsf(b->pid_out)>MAX_FORCE*0.85f?CP_WARN:CP_HUD;
-        put_s(r,c0,buf,A_BOLD,cp,rows,cols);
-        draw_bar(r,bc,bw,b->pid_out/MAX_FORCE,CP_BARP,CP_BARN,rows,cols); r++;
+        snprintf(buf, sizeof buf, " F total  %+8.2f N", b->pid_out);
+        int cp = fabsf(b->pid_out) > MAX_FORCE * 0.85f ? CP_WARN : CP_GOOD;
+        put_str(r, c0, buf, A_BOLD, cp, rows, cols);
+        draw_bar(r, bc, bw, b->pid_out / MAX_FORCE,
+                 CP_BAR_POS, CP_BAR_NEG, rows, cols);
+        r++;
     } else {
-        put_s(r++,c0," PID  DISABLED          ",A_BOLD,CP_WARN,rows,cols);
-        r+=3;
+        put_str(r++, c0, " PID  DISABLED          ", A_BOLD, CP_WARN, rows, cols);
+        r += 3;
     }
 
-    sep();
+    r++;
+    snprintf(buf, sizeof buf, " Kp:%.0f Ki:%.2f Kd:%.0f  ", b->kp, b->ki, b->kd);
+    put_str(r++, c0, buf, A_NORMAL, CP_DIM, rows, cols);
 
-    { char buf[32]; snprintf(buf,sizeof buf," Kp:%.0f Ki:%.2f Kd:%.0f  ",b->kp,b->ki,b->kd);
-      put_s(r++,c0,buf,A_NORMAL,CP_DIM,rows,cols); }
-    { char buf[32]; snprintf(buf,sizeof buf," %dfps  %dHz              ",fps,b->tick_hz);
-      put_s(r++,c0,buf,A_NORMAL,CP_DIM,rows,cols); }
-
-    sep();
-    put_s(r++,c0," q:quit SPC:pause r:reset",A_BOLD,CP_HUD,rows,cols);
-    put_s(r++,c0," \xe2\x86\x91\xe2\x86\x93:speed  p:PID     ",A_BOLD,CP_HUD,rows,cols);
-    put_s(r++,c0," m:view  g:preset +/-:Kp ",A_BOLD,CP_HUD,rows,cols);
+    snprintf(buf, sizeof buf, " preset: %s ", PRESETS[b->preset_idx].name);
+    put_str(r++, c0, buf, A_BOLD, CP_VAL, rows, cols);
 }
 
-/* ── §14  VIEW B — EQUATIONS ────────────────────────────────────── */
+/* ── §7.5 render_panel_equations — math with live values ─────────── */
+
 /*
- * Shows the Lagrangian cart-pole equations with live values substituted.
- * Goal: reader can trace exactly how the physics produces the numbers.
+ * Show the cart-pole and PID equations with their current numerical
+ * values substituted. The reader can multiply Kp · e by hand and
+ * verify it matches the displayed P term — a "cell-level" debugger.
  */
-static void draw_equations(const Bot *b, int rows, int cols, int c0) {
+static void render_panel_equations(const Bot *b, int rows, int cols, int c0)
+{
+    int r = 0;
+    char buf[80];
+
+    put_str(r++, c0, " EQUATIONS               ", A_BOLD, CP_VAL, rows, cols);
+
+    /* Effective lean. */
+    put_str(r++, c0 + 1, "Effective lean from grav:", A_DIM, CP_DIM, rows, cols);
+    snprintf(buf, sizeof buf, " θ_eff = θ + α = %+5.3f rad (%+5.1f°)",
+             b->theta_eff, b->theta_eff * (180.0f / (float)M_PI));
+    put_str(r++, c0, buf, A_BOLD, CP_VAL, rows, cols);
+
+    /* Cart-pole horizontal accel. */
+    put_str(r++, c0 + 1, "Horizontal accel of base:", A_DIM, CP_DIM, rows, cols);
+    snprintf(buf, sizeof buf, " ẍ = %+6.3f m/s²", b->x_ddot);
+    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+
+    /* Pendulum angular accel. */
+    put_str(r++, c0 + 1, "Pendulum angular accel:", A_DIM, CP_DIM, rows, cols);
+    snprintf(buf, sizeof buf, " θ̈ = %+6.3f rad/s²", b->theta_ddot);
+    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+
+    r++;
+    put_str(r++, c0, " PID                    ", A_BOLD, CP_VAL, rows, cols);
+
+    /* Setpoint: lean into slope. */
+    put_str(r++, c0 + 1, "Setpoint (slope feed):",  A_DIM, CP_DIM, rows, cols);
+    snprintf(buf, sizeof buf, " θ_ref = -%.2f·α = %+5.3f rad",
+             SLOPE_FEED, b->theta_ref);
+    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+
+    /* Error. */
+    put_str(r++, c0 + 1, "Error drives PID:",       A_DIM, CP_DIM, rows, cols);
+    snprintf(buf, sizeof buf, " e = θ − θ_ref = %+5.3f",
+             b->theta - b->theta_ref);
+    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+
+    /* Three terms. */
+    put_str(r++, c0 + 1, "P — instant stiffness:",  A_DIM, CP_DIM, rows, cols);
+    snprintf(buf, sizeof buf, " %.0f · %+.4f = %+.2f",
+             b->kp, b->theta - b->theta_ref, b->pid_p);
+    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+
+    put_str(r++, c0 + 1, "I — drift removal:",      A_DIM, CP_DIM, rows, cols);
+    snprintf(buf, sizeof buf, " %.2f · ∫e = %+.2f", b->ki, b->pid_i);
+    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+
+    put_str(r++, c0 + 1, "D — damping:",            A_DIM, CP_DIM, rows, cols);
+    snprintf(buf, sizeof buf, " %.0f · θ̇ = %+.2f", b->kd, b->pid_d);
+    put_str(r++, c0, buf, A_NORMAL, CP_EQ, rows, cols);
+
+    /* Total F. */
+    int cp = fabsf(b->pid_out) > MAX_FORCE * 0.85f ? CP_WARN : CP_GOOD;
+    snprintf(buf, sizeof buf, " F = %+.2f N (max ±%.0f)",
+             b->pid_out, MAX_FORCE);
+    put_str(r++, c0, buf, A_BOLD, cp, rows, cols);
+}
+
+/* ── §7.6 render_panel_phase — phase-space portrait of (θ, ω) ────── */
+
+/*
+ * Plot the last HIST_LEN samples of (θ, ω) on a small 2-D grid:
+ *
+ *      ω axis (vertical) — angular velocity in rad/sec
+ *      θ axis (horizontal) — lean angle in radians
+ *
+ * A stable controller draws an inward spiral converging to (0, 0).
+ * Underdamped systems trace wide circles; overdamped systems trace
+ * a slow direct path. The shape IS the controller's character.
+ */
+static void render_panel_phase(const Bot *b, int rows, int cols, int c0)
+{
     int r = 0;
     char buf[64];
 
-    auto void hdr(const char *s);
-    void hdr(const char *s) {
-        put_s(r++,c0,s,A_BOLD,CP_TITLE,rows,cols);
-    }
-    auto void eq(const char *label, const char *expr);
-    void eq(const char *label, const char *expr) {
-        put_s(r,  c0+1, label, A_BOLD,   CP_EQ,  rows,cols);
-        put_s(r++,c0+10, expr,  A_NORMAL, CP_VAL, rows,cols);
-    }
-    auto void sep(void);
-    void sep(void){
-        attron(COLOR_PAIR(CP_DIM));
-        for(int i=0;i<31;i++)
-            put_c(r,c0+i,(i==0||i==30)?'+':'-',0,CP_DIM,rows,cols);
-        attroff(COLOR_PAIR(CP_DIM)); r++;
-    }
-    auto void note(const char *s);
-    void note(const char *s){ put_s(r++,c0+1,s,A_DIM,CP_DIM,rows,cols); }
+    put_str(r++, c0, " PHASE PORTRAIT         ", A_BOLD, CP_VAL, rows, cols);
+    put_str(r++, c0, " (θ vs ω)               ", A_DIM,  CP_DIM, rows, cols);
 
-    hdr(" INVERTED PENDULUM EQ   ");
-    sep();
-
-    /* Effective lean */
-    note("Effective lean from vertical:");
-    snprintf(buf,sizeof buf,"%.3f+%.3f=%+.3f rad",
-             b->theta, b->alpha, b->theta_eff);
-    eq("\xce\xb8_eff=\xce\xb8+\xce\xb1", buf);
-    snprintf(buf,sizeof buf,"(%+.1f\xc2\xb0)", b->theta_eff*57.3f);
-    put_s(r++,c0+12,buf,A_BOLD,
-          fabsf(b->theta_eff)>0.35f?CP_WARN:CP_GOOD, rows,cols);
-
-    sep();
-    note("Effective inertia:");
-    snprintf(buf,sizeof buf,"%.1f+%.1f*%.4f=%.3f kg",
-             MASS_CART, MASS_POLE,
-             sinf(b->theta_eff)*sinf(b->theta_eff), b->M_eff);
-    eq("M_eff   ", buf);
-
-    note("Horizontal accel (F drives cart):");
-    snprintf(buf,sizeof buf,"%+.3f m/s\xc2\xb2", b->x_ddot);
-    eq("\xc3\xbc (x\xcc\x88)  ", buf);
-
-    note("Angular accel (g tips, x\xcc\x88 corrects):");
-    snprintf(buf,sizeof buf,"%+.3f rad/s\xc2\xb2", b->theta_ddot);
-    eq("\xce\xb8\xcc\x88      ", buf);
-
-    sep();
-    hdr(" PID CONTROL            ");
-    sep();
-
-    note("Setpoint: lean into slope:");
-    snprintf(buf,sizeof buf,"-%.2f*%.3f=%+.3f rad",
-             SLOPE_FEED, b->alpha, b->theta_ref);
-    eq("\xce\xb8_ref   ", buf);
-
-    note("Error drives all three terms:");
-    snprintf(buf,sizeof buf,"%+.4f - (%+.4f) = %+.4f",
-             b->theta, b->theta_ref, b->theta - b->theta_ref);
-    eq("error   ", buf);
-
-    note("P — stiffness (instant correction)");
-    snprintf(buf,sizeof buf,"%.0f * %+.4f = %+.2f N",
-             b->kp, b->theta-b->theta_ref, b->pid_p);
-    eq("Kp*e    ", buf);
-
-    note("I — drift removal (slope offset)");
-    snprintf(buf,sizeof buf,"%.2f * integ = %+.2f N", b->ki, b->pid_i);
-    eq("Ki*\xe2\x88\xab""e    ", buf);
-
-    note("D — damping (brakes oscillation)");
-    snprintf(buf,sizeof buf,"%.0f * \xce\xb8\xcc\x87 = %+.2f N", b->kd, b->pid_d);
-    eq("Kd*\xce\xb8\xcc\x87    ", buf);
-
-    note("Total motor force:");
-    snprintf(buf,sizeof buf,"%+.2f N  (max \xc2\xb1%.0f N)", b->pid_out, MAX_FORCE);
-    int cp=fabsf(b->pid_out)>MAX_FORCE*0.85f?CP_WARN:CP_GOOD;
-    put_s(r,c0+1,"F total ", A_BOLD, CP_EQ, rows,cols);
-    put_s(r++,c0+10,buf, A_BOLD, cp, rows,cols);
-
-    sep();
-    /* Stability margin */
-    {
-        float margin = FALL_ANGLE - fabsf(b->theta_eff);
-        float frac   = margin / FALL_ANGLE;
-        int   bar_w  = 20;
-        int   filled = (int)(frac * bar_w);
-        int   cp     = frac > 0.5f ? CP_GOOD : (frac > 0.25f ? CP_SPD : CP_WARN);
-        note("Safety margin to fall (60\xc2\xb0 limit):");
-        attron(COLOR_PAIR(cp)|A_BOLD);
-        mvprintw(r, c0+1, "margin %+.1f\xc2\xb0 [", (margin)*57.3f);
-        attroff(COLOR_PAIR(cp)|A_BOLD);
-        attron(COLOR_PAIR(cp));
-        int sc = c0+16;
-        for(int i=0;i<bar_w;i++)
-            put_c(r,sc+i, i<filled?'|':' ', 0,cp,rows,cols);
-        put_c(r,sc+bar_w,']',0,CP_DIM,rows,cols);
-        attroff(COLOR_PAIR(cp)); r++;
-    }
-    sep();
-    put_s(r++,c0," m:next view  g:preset  ",A_BOLD,CP_HUD,rows,cols);
-}
-
-/* ── §15  VIEW C — PHASE PORTRAIT ──────────────────────────────── */
-/*
- * Phase space: X-axis = θ (lean), Y-axis = ω (angular velocity).
- * A stable controller draws a spiral converging to (0,0).
- * Underdamped → wide circles.  Overdamped → slow straight line.
- */
-static void draw_phase(const Bot *b, int rows, int cols, int c0) {
-    int r = 0;
-    char buf[64];
-
-    auto void sep(void);
-    void sep(void){
-        attron(COLOR_PAIR(CP_DIM));
-        for(int i=0;i<31;i++)
-            put_c(r,c0+i,(i==0||i==30)?'+':'-',0,CP_DIM,rows,cols);
-        attroff(COLOR_PAIR(CP_DIM)); r++;
-    }
-
-    put_s(r++,c0," PHASE PORTRAIT         ",A_BOLD,CP_TITLE,rows,cols);
-    sep();
-    put_s(r++,c0,"  \xce\xb8 (lean) vs \xcf\x89 (spin rate) ",A_DIM,CP_DIM,rows,cols);
-
-    /* plot area */
+    /* Plot rectangle. */
     int plot_r0 = r;
     int plot_h  = 12;
     int plot_w  = 29;
-    int mid_r   = plot_r0 + plot_h/2;
-    int mid_c   = c0 + 1 + plot_w/2;
+    int mid_r   = plot_r0 + plot_h / 2;
+    int mid_c   = c0 + 1 + plot_w / 2;
 
-    /* axes */
-    for (int i=0;i<plot_h;i++)
-        put_c(plot_r0+i, mid_c, '|', A_DIM, CP_DIM, rows, cols);
-    for (int i=0;i<plot_w;i++)
-        put_c(mid_r, c0+1+i, '-', A_DIM, CP_DIM, rows, cols);
-    put_c(mid_r,mid_c,'+',A_DIM,CP_DIM,rows,cols);
+    /* Axes. */
+    for (int i = 0; i < plot_h; i++)
+        put_ch(plot_r0 + i, mid_c, '|', A_DIM, CP_DIM, rows, cols);
+    for (int i = 0; i < plot_w; i++)
+        put_ch(mid_r, c0 + 1 + i, '-', A_DIM, CP_DIM, rows, cols);
+    put_ch(mid_r, mid_c, '+', A_DIM, CP_DIM, rows, cols);
 
-    /* axis labels */
-    put_s(mid_r-1, c0+1,  "-\xce\xb8", A_DIM, CP_DIM, rows, cols);
-    put_s(mid_r-1, c0+28, "+\xce\xb8", A_DIM, CP_DIM, rows, cols);
-    put_s(plot_r0,   mid_c-2, "+\xcf\x89", A_DIM, CP_DIM, rows, cols);
-    put_s(plot_r0+plot_h-1, mid_c-2, "-\xcf\x89", A_DIM, CP_DIM, rows, cols);
+    /* Axis labels. */
+    put_str(mid_r - 1, c0 + 1,        "-θ", A_DIM, CP_DIM, rows, cols);
+    put_str(mid_r - 1, c0 + plot_w,   "+θ", A_DIM, CP_DIM, rows, cols);
+    put_str(plot_r0,        mid_c - 2, "+ω", A_DIM, CP_DIM, rows, cols);
+    put_str(plot_r0 + plot_h - 1, mid_c - 2, "-ω", A_DIM, CP_DIM, rows, cols);
 
-    /* map rad to plot cell */
-    float theta_scale = (plot_w/2) / 0.6f;  /* 0.6 rad full half */
-    float omega_scale = (plot_h/2) / 5.0f;  /* 5 rad/s full half */
+    /* Pixel-to-cell scale. */
+    float th_scale = ((float)plot_w * 0.5f) / 0.6f;   /* full range ±0.6 rad */
+    float om_scale = ((float)plot_h * 0.5f) / 5.0f;   /* full range ±5 rad/s */
 
-    /* draw trail */
+    /* Trail (oldest → newest, so newest paints on top). */
     int n = b->ph_fill;
     for (int i = 0; i < n; i++) {
-        int idx = (b->ph_head - n + i + HIST_LEN) % HIST_LEN;
-        float th = b->ph_theta[idx];
-        float om = b->ph_omega[idx];
-        int pc = mid_c + (int)(th * theta_scale);
-        int pr = mid_r - (int)(om * omega_scale);
+        int   idx = (b->ph_head - n + i + HIST_LEN) % HIST_LEN;
+        float th  = b->ph_theta[idx];
+        float om  = b->ph_omega[idx];
+        int   pc  = mid_c + (int)(th * th_scale);
+        int   pr  = mid_r - (int)(om * om_scale);
         float age = (float)i / (float)n;
-        int cp = (age > 0.85f) ? CP_WARN :
-                 (age > 0.5f)  ? CP_SPD  : CP_DIM;
-        put_c(pr, pc, '.', A_NORMAL, cp, rows, cols);
+        int   cp  = (age > 0.85f) ? CP_WARN
+                  : (age > 0.50f) ? CP_VAL  : CP_DIM;
+        put_ch(pr, pc, '.', A_NORMAL, cp, rows, cols);
     }
 
-    /* current point (bright) */
-    {
-        int pc = mid_c + (int)(b->theta * theta_scale);
-        int pr = mid_r - (int)(b->theta_dot * omega_scale);
-        put_c(pr, pc, '@', A_BOLD, CP_WARN, rows, cols);
-    }
+    /* Current point — bright '@'. */
+    int pc = mid_c + (int)(b->theta * th_scale);
+    int pr = mid_r - (int)(b->omega * om_scale);
+    put_ch(pr, pc, '@', A_BOLD, CP_BEACON, rows, cols);
 
     r = plot_r0 + plot_h;
-    sep();
+    r++;
 
-    /* regime classification */
+    /* Regime classification — tells the user what they're seeing. */
     {
         float abs_err = fabsf(b->theta - b->theta_ref);
         const char *regime;
-        int cp;
-        if (!b->pid_on) {
-            regime = "PID OFF  (free fall)"; cp = CP_WARN;
-        } else if (b->kd < 1.f) {
-            regime = "UNDERDAMPED (Kd too low)"; cp = CP_SPD;
-        } else if (b->kd > 50.f) {
-            regime = "OVERDAMPED (Kd too high)"; cp = CP_SPD;
-        } else if (abs_err < 0.03f) {
-            regime = "STABLE — converged"; cp = CP_GOOD;
-        } else {
-            regime = "SETTLING — correcting"; cp = CP_HUD;
-        }
-        put_s(r++,c0+1,regime,A_BOLD,cp,rows,cols);
+        int regime_cp;
+        if (!b->pid_on)              { regime = "PID OFF (free fall)";  regime_cp = CP_WARN; }
+        else if (b->kd < 1.0f)       { regime = "UNDERDAMPED (no Kd)";  regime_cp = CP_VAL; }
+        else if (b->kd > 50.0f)      { regime = "OVERDAMPED (high Kd)"; regime_cp = CP_VAL; }
+        else if (abs_err < 0.03f)    { regime = "STABLE — converged";   regime_cp = CP_GOOD; }
+        else                         { regime = "SETTLING — correcting"; regime_cp = CP_VAL; }
+        put_str(r++, c0 + 1, regime, A_BOLD, regime_cp, rows, cols);
     }
 
-    snprintf(buf,sizeof buf," \xce\xb8=%+.3f  \xcf\x89=%+.3f ",
-             b->theta, b->theta_dot);
-    put_s(r++,c0,buf,A_NORMAL,CP_VAL,rows,cols);
+    snprintf(buf, sizeof buf, " θ=%+.3f ω=%+.3f", b->theta, b->omega);
+    put_str(r++, c0, buf, A_NORMAL, CP_VAL, rows, cols);
 
-    sep();
-
-    /* active gain preset lesson */
-    const GainPreset *pr_ = &PRESETS[b->preset_idx];
-    snprintf(buf,sizeof buf," [%s]",pr_->name);
-    put_s(r++,c0,buf,A_BOLD,CP_SPD,rows,cols);
-    for(int i=0;i<3;i++)
-        put_s(r++,c0+1,pr_->lesson[i],A_DIM,CP_DIM,rows,cols);
-
-    sep();
-    put_s(r++,c0," m:view  g:next preset  ",A_BOLD,CP_HUD,rows,cols);
+    r++;
+    /* Active preset's mini-lesson. */
+    const GainPreset *pp = &PRESETS[b->preset_idx];
+    snprintf(buf, sizeof buf, " [%s]", pp->name);
+    put_str(r++, c0, buf, A_BOLD, CP_VAL, rows, cols);
+    put_str(r++, c0 + 1, pp->lesson_l1, A_DIM, CP_DIM, rows, cols);
+    put_str(r++, c0 + 1, pp->lesson_l2, A_DIM, CP_DIM, rows, cols);
 }
 
-/* ── §16  APP ────────────────────────────────────────────────────── */
-int main(void) {
-    struct sigaction sa = {0};
-    sa.sa_handler = sig_handler;
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGWINCH,&sa, NULL);
+/* ── §7.7 render_hud — top-row status + bottom-row hints ────────── */
+
+static void render_hud(const Bot *b, double fps, int rows, int cols)
+{
+    char buf[HUD_BUF_LEN];
+
+    float margin_deg = (FALL_ANGLE - fabsf(b->theta_eff))
+                       * (180.0f / (float)M_PI);
+    snprintf(buf, sizeof buf,
+             " %5.1f fps  %s%s  α=%+5.1f°  margin=%4.1f°  dist=%5.1fm  view=[%s]  preset=%s ",
+             fps,
+             b->paused ? "PAUSED " : (b->fallen ? "FALLEN " : "running"),
+             b->pid_on ? ""        : "  NO-PID ",
+             b->alpha * (180.0f / (float)M_PI),
+             margin_deg, b->dist_m,
+             VIEW_NAMES[b->view], PRESETS[b->preset_idx].name);
+
+    attron (COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvaddnstr(0, 0, buf, cols);
+    int used = (int)strlen(buf);
+    for (int x = used; x < cols; x++) mvaddch(0, x, ' ');
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    attron (COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(rows - 1, 0,
+             " q:quit  spc:pause  r:reset  ↑↓:speed  p:PID  m:view  g:preset  +/-:Kp ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+/* ── §7.8 scene_draw — full frame ─────────────────────────────────── */
+
+static void scene_draw(const Bot *b, const Terrain *t, double fps,
+                       int bot_sc, int rows, int cols)
+{
+    erase();
+
+    int wc = (int)(b->world_x / (float)CELL_W);
+
+    /* (1) terrain (sky + surface + rock) */
+    render_terrain(t, wc, bot_sc, rows, cols);
+
+    /* (2) robot */
+    render_bot(b, t, bot_sc, rows, cols);
+
+    /* (3) right side panel — view-dependent */
+    int c0 = cols - PANEL_W;
+    if (c0 < 1) c0 = 1;
+
+    switch (b->view) {
+    case VIEW_TELEMETRY: render_panel_telemetry(b, rows, cols, c0); break;
+    case VIEW_EQUATIONS: render_panel_equations(b, rows, cols, c0); break;
+    case VIEW_PHASE:     render_panel_phase    (b, rows, cols, c0); break;
+    default: break;
+    }
+
+    /* (4) HUD */
+    render_hud(b, fps, rows, cols);
+}
+
+/* ===================================================================== */
+/* §8  screen — ncurses init / present                                    */
+/* ===================================================================== */
+
+typedef struct { int cols, rows; } Screen;
+
+static void screen_init(Screen *s)
+{
+    initscr();
+    noecho();
+    cbreak();
+    curs_set(0);
+    nodelay(stdscr, TRUE);
+    keypad(stdscr, TRUE);
+    typeahead(-1);
+    color_init();
+    getmaxyx(stdscr, s->rows, s->cols);
+}
+
+static void screen_free(Screen *s) { (void)s; endwin(); }
+
+static void screen_resize(Screen *s)
+{
+    endwin();
+    refresh();
+    getmaxyx(stdscr, s->rows, s->cols);
+}
+
+static void screen_present(void)
+{
+    wnoutrefresh(stdscr);
+    doupdate();
+}
+
+/* ===================================================================== */
+/* §9  app — signals, resize, variable-dt main loop with substeps         */
+/* ===================================================================== */
+
+typedef struct {
+    Bot                   bot;
+    Terrain               terrain;
+    Screen                screen;
+    int                   bot_sc;          /* bot stays at this screen col */
+    volatile sig_atomic_t running;
+    volatile sig_atomic_t need_resize;
+} App;
+
+static App g_app;
+
+static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
+static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
+static void cleanup(void)             { endwin(); }
+
+static void app_handle_key(App *app, int ch)
+{
+    Bot *b = &app->bot;
+    switch (ch) {
+    case 'q': case 'Q': case 27:
+        app->running = 0;
+        break;
+
+    case ' ':
+        b->paused = !b->paused;
+        break;
+
+    case 'p': case 'P':
+        b->pid_on  = !b->pid_on;
+        b->pid_int = 0.0f;
+        break;
+
+    case 'r': case 'R':
+        bot_reset(b);
+        terrain_init(&app->terrain, app->screen.rows, app->screen.cols);
+        break;
+
+    case 'm': case 'M':
+        b->view = (ViewMode)((b->view + 1) % VIEW_COUNT);
+        break;
+
+    case 'g': case 'G':
+        b->preset_idx = (b->preset_idx + 1) % N_PRESETS;
+        bot_apply_preset(b, b->preset_idx);
+        break;
+
+    case KEY_UP:
+        b->drive_spd += DRIVE_STEP;
+        if (b->drive_spd > DRIVE_MAX) b->drive_spd = DRIVE_MAX;
+        break;
+
+    case KEY_DOWN:
+        b->drive_spd -= DRIVE_STEP;
+        if (b->drive_spd < DRIVE_MIN) b->drive_spd = DRIVE_MIN;
+        break;
+
+    case '+': case '=':
+        b->kp += 5.0f; if (b->kp > 400.0f) b->kp = 400.0f;
+        break;
+
+    case '-':
+        b->kp -= 5.0f; if (b->kp < 0.0f) b->kp = 0.0f;
+        break;
+
+    default: break;
+    }
+}
+
+int main(void)
+{
+    atexit(cleanup);
+    signal(SIGINT,   on_exit_signal);
+    signal(SIGTERM,  on_exit_signal);
+    signal(SIGWINCH, on_resize_signal);
 
     perlin_init((unsigned int)time(NULL));
 
-    initscr(); cbreak(); noecho();
-    keypad(stdscr, TRUE); nodelay(stdscr, TRUE);
-    curs_set(0); typeahead(-1);
-    color_init();
+    App *app     = &g_app;
+    app->running = 1;
 
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
+    screen_init(&app->screen);
+    terrain_init(&app->terrain, app->screen.rows, app->screen.cols);
+    bot_init(&app->bot);
 
-    Terrain terrain;
-    terrain_init(&terrain, rows, cols);
+    app->bot_sc = app->screen.cols / 3;     /* bot stays at this screen col */
 
-    Bot bot;
-    bot_init(&bot);
+    int64_t last_ns      = clock_ns();
+    int64_t fps_accum_ns = 0;
+    int     fps_frames   = 0;
+    double  fps_display  = 0.0;
+    const int64_t TICK_NS = NS_PER_SEC / TARGET_FPS;
 
-    int bot_sc = cols / 3;   /* bot stays at this screen column */
+    while (app->running) {
 
-    long long frame_ns = 1000000000LL / FPS_TARGET;
-    long long tick_ns  = 1000000000LL / bot.tick_hz;
-    long long sim_acc  = 0;
-    long long t_prev   = now_ns();
-    long long fps_acc  = 0;
-    int fps_cnt=0, fps_disp=0;
-
-    while (running) {
-        if (need_resize) {
-            endwin(); refresh();
-            getmaxyx(stdscr, rows, cols);
-            bot_sc = cols / 3;
-            terrain.rows = rows; terrain.cols = cols;
-            need_resize = 0;
+        /* (1) handle resize */
+        if (app->need_resize) {
+            screen_resize(&app->screen);
+            app->bot_sc = app->screen.cols / 3;
+            app->terrain.rows = app->screen.rows;
+            app->need_resize = 0;
+            last_ns = clock_ns();
         }
 
-        long long t_now = now_ns();
-        long long dt_ns = t_now - t_prev;
-        t_prev = t_now;
-        if (dt_ns > 50000000LL) dt_ns = 50000000LL;
+        /* (2) measure dt, capped */
+        int64_t now_ns = clock_ns();
+        int64_t dt_ns  = now_ns - last_ns;
+        last_ns        = now_ns;
+        float   dt     = (float)dt_ns / (float)NS_PER_SEC;
+        if (dt > DT_CAP_SEC) dt = DT_CAP_SEC;
 
-        terrain_ensure(&terrain, (int)(bot.world_x/CELL_W) + cols + 32);
-
-        if (!bot.paused && !bot.fallen) {
-            sim_acc += dt_ns;
-            tick_ns  = 1000000000LL / bot.tick_hz;
-            while (sim_acc >= tick_ns) {
-                bot_tick(&bot, &terrain, (float)tick_ns * 1e-9f);
-                sim_acc -= tick_ns;
-            }
-        }
-
-        fps_acc += dt_ns; fps_cnt++;
-        if (fps_acc >= 1000000000LL) {
-            fps_disp = fps_cnt; fps_cnt = 0;
-            fps_acc -= 1000000000LL;
-        }
-
-        long long el = now_ns() - t_now;
-        long long sl = frame_ns - el;
-        if (sl > 0) { struct timespec ts={0,sl}; nanosleep(&ts,NULL); }
-
-        /* draw */
-        getmaxyx(stdscr, rows, cols);
-        erase();
-
-        int wc = (int)(bot.world_x / CELL_W);
-        draw_terrain(&terrain, wc, fmodf(bot.world_x,CELL_W), bot_sc, rows, cols);
-        draw_bot(&bot, &terrain, bot_sc, rows, cols);
-
-        /* right panel — active view */
-        int c0 = cols - 32;
-        if (c0 < 1) c0 = 1;
-
-        /* view mode badge */
-        {
-            char badge[32];
-            snprintf(badge,sizeof badge,"[%s]",VIEW_NAMES[bot.view]);
-            put_s(rows-1, c0, badge, A_BOLD, CP_SPD, rows, cols);
-        }
-
-        switch (bot.view) {
-        case VIEW_TELE:  draw_telemetry(&bot, rows, cols, fps_disp, c0); break;
-        case VIEW_EQ:    draw_equations(&bot, rows, cols, c0);            break;
-        case VIEW_PHASE: draw_phase    (&bot, rows, cols, c0);            break;
-        default: break;
-        }
-
-        /* status bar */
-        {
-            float margin_deg = (FALL_ANGLE - fabsf(bot.theta_eff)) * 57.3f;
-            char sb[80];
-            snprintf(sb,sizeof sb,"  %s%s  \xce\xb1=%+.1f\xc2\xb0  margin=%.1f\xc2\xb0  dist=%.1fm",
-                     bot.paused?"PAUSED ":"",
-                     bot.pid_on?"":" NO-PID",
-                     bot.alpha*57.3f, margin_deg, bot.dist_m);
-            put_s(rows-1,0,sb,A_DIM,CP_DIM,rows,cols);
-        }
-
-        wnoutrefresh(stdscr); doupdate();
-
-        /* input */
+        /* (3) drain input */
         int ch;
-        while ((ch = getch()) != ERR) {
-            switch (ch) {
-            case 'q': case 27: running = 0; break;
-            case ' ': bot.paused = !bot.paused; break;
-            case 'p':
-                bot.pid_on = !bot.pid_on;
-                bot.pid_int = 0.f;
-                break;
-            case 'r':
-                bot_reset(&bot);
-                terrain_init(&terrain, rows, cols);
-                break;
-            case 'm':
-                bot.view = (ViewMode)((bot.view + 1) % VIEW_COUNT);
-                break;
-            case 'g':
-                bot.preset_idx = (bot.preset_idx + 1) % N_PRESETS;
-                bot_apply_preset(&bot);
-                break;
-            case KEY_UP:
-                bot.drive_spd += DRIVE_STEP;
-                if (bot.drive_spd > DRIVE_MAX) bot.drive_spd = DRIVE_MAX;
-                break;
-            case KEY_DOWN:
-                bot.drive_spd -= DRIVE_STEP;
-                if (bot.drive_spd < 0.f) bot.drive_spd = 0.f;
-                break;
-            case '+': case '=':
-                bot.kp += 5.f; if (bot.kp > 400.f) bot.kp = 400.f;
-                break;
-            case '-':
-                bot.kp -= 5.f; if (bot.kp < 0.f) bot.kp = 0.f;
-                break;
-            case '[':
-                bot.tick_hz -= 10; if (bot.tick_hz < 10) bot.tick_hz = 10;
-                break;
-            case ']':
-                bot.tick_hz += 10; if (bot.tick_hz > 600) bot.tick_hz = 600;
-                break;
-            }
+        while ((ch = getch()) != ERR) app_handle_key(app, ch);
+
+        /* (4) ensure terrain is generated ahead of the bot */
+        terrain_ensure(&app->terrain,
+                       (int)(app->bot.world_x / (float)CELL_W)
+                       + app->screen.cols + 32);
+
+        /* (5) advance physics in sub-steps for stability */
+        if (!app->bot.paused && !app->bot.fallen) {
+            int   n_sub  = (int)ceilf(dt / TICK_DT_TARGET);
+            if (n_sub < 1)             n_sub = 1;
+            if (n_sub > MAX_SUBSTEPS)  n_sub = MAX_SUBSTEPS;
+            float sub_dt = dt / (float)n_sub;
+            for (int i = 0; i < n_sub; i++)
+                bot_substep(&app->bot, &app->terrain, sub_dt);
         }
+
+        /* (6) rolling fps display (0.5 s window) */
+        fps_accum_ns += dt_ns;
+        fps_frames++;
+        if (fps_accum_ns >= NS_PER_SEC / 2) {
+            fps_display = (double)fps_frames * 1e9
+                        / (double)fps_accum_ns;
+            fps_accum_ns = 0;
+            fps_frames   = 0;
+        }
+
+        /* (7) draw + present */
+        scene_draw(&app->bot, &app->terrain, fps_display,
+                   app->bot_sc, app->screen.rows, app->screen.cols);
+        screen_present();
+
+        /* (8) frame cap */
+        int64_t elapsed = clock_ns() - now_ns;
+        clock_sleep_ns(TICK_NS - elapsed);
     }
 
-    endwin();
+    screen_free(&app->screen);
     return 0;
 }

@@ -63,7 +63,7 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 | `2stroke` | 2-stroke engine animation — slider-crank kinematics; crank/connecting-rod/piston geometry per θ; exhaust + transfer ports open/close; TDC spark; real-time cycle phase label |
 | `nuke` | 2D shockwave demo — scalar wave PDE (∂²u/∂t² = c²∇²u − γ∂u/∂t) with 5-point Laplacian, CFL-stable substepping (CFL ≈ 0.33); cylindrical 1/√r decay + γ damping; terrain heave-and-settle ripples; debris arc + ground-dust pool; decaying sinusoidal screen shake; full-screen flash; 6 themes (`t` to cycle) |
 | `beam_bending` | Euler-Bernoulli beam — 9 BC×load combos; analytical w(x) + M(x); curvature-shaded ASCII render + moment panel; dynamic modal superposition (4 eigenmodes, exact damped transition matrix) |
-| `diff_drive_robot` | Differential drive robot — nonholonomic kinematics; pixel-space Euler integration; trail ring buffer; heading + wheel velocity arrows drawn with `.o0` dot progression |
+| `diff_drive_robot` | Differential drive robot — two named functions `compute_wheels` (inverse kinematics) and `step_pose` (forward kinematics + Euler); nonholonomic constraint by construction; pixel-space variable-dt integration; 600-slot ring-buffer trail with wrap-interp suppression; heading + wheel velocity arrows drawn with `.o0` dot progression |
 | `acoustic_wavesolver` | Acoustic pressure wave solver — 2D FDTD on staggered pressure/velocity grid; absorbing PML boundary; interactive source placement |
 | `lattice_boltzman_fluid_simulator` | Lattice Boltzmann fluid — D2Q9 BGK collision, streaming, bounce-back walls; density + velocity visualised; multiple obstacle presets |
 | `mass_spring_lattice` | 2D mass-spring lattice — rectangular mesh of springs; symplectic Euler; wave packet injection; spring constant and damping tunable |
@@ -338,9 +338,9 @@ fractals; cycle-through-triangles for Delaunay.
 | `snake_inverse_kinematics` | FABRIK inverse kinematics snake — iterative forward/backward reach solver |
 | `fk_centipede` | Centipede — trail-buffer FK body, stateless sinusoidal FK legs, contralateral antiphase gait |
 | `fk_tentacle_forest` | Tentacle forest — pure stateless sinusoidal FK; per-tentacle phase/frequency/amplitude parameters |
-| `walking_robot` | Procedural bipedal walk cycle — sinusoidal FK, 2-joint analytical IK stance, foot contact locking, body sway, shadow ellipse, COM projection, motion trails, ground grid |
-| `moving_jump_spring_leg_robot` | Spring-leg jumping robot — spring-mass leg compression/release, aerial phase, landing absorption |
-| `perlin_terrain_bot` | Self-balancing wheel bot — inverted pendulum Lagrangian cart-pole on Perlin terrain slope; PID controller with cascade slope feed-forward; phase portrait, gain preset tuning |
+| `walking_robot` | Procedural bipedal walk — sinusoidal FK during swing, 2-joint analytical IK during stance, foot contact locking at touchdown; one-phase oscillator drives gait + bob + sway + arm swing; walk_speed COUPLED to walk_freq via `stride_length = 2·(U+L)·sin(SWING_AMP)` so the body crosses the planted foot exactly once per stance; `shin = thigh − knee_bend` (anatomical fold) prevents the "Smooth Criminal" forward lean |
+| `moving_jump_spring_leg_robot` | Spring-leg pogo robot — 3-state FSM (COMPRESS/FLIGHT/LAND) with one tick function per phase; energy-conserving launch `½kx² = ½mv²`; projectile motion under gravity in cells/s²; brief LAND fuse for visual readability; right-edge follow camera over Perlin terrain |
+| `perlin_terrain_bot` | Self-balancing wheel bot — Lagrangian cart-pole on Perlin slope, stabilised by PID with anti-windup clamp + slope feed-forward cascade; sub-stepping (4×) inside each frame keeps the stiff dynamics stable; six gain presets demonstrate distinct PID failure modes; three swappable views (telemetry / equations / phase portrait) |
 
 ## Artistic / Biological  (`artistic/`, `matrix_rain/`)
 

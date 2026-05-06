@@ -753,7 +753,7 @@ Shader functions accept `const void *uni` and cast it to the specific struct the
 #### A10 ACS Line-drawing Characters
 
 ncurses provides portable box-drawing glyphs through `ACS_*` macros: `ACS_ULCORNER` (┌), `ACS_URCORNER` (┐), `ACS_LLCORNER` (└), `ACS_LRCORNER` (┘), `ACS_HLINE` (─), `ACS_VLINE` (│). On VT100 terminals they activate the alternate character set; on modern UTF-8 terminals they emit Unicode box-drawing code points. Always prefer `ACS_*` over hardcoded characters for maximum terminal compatibility.
-*Files: `artistic/railwaymap.c`, `robots/walking_robot.c`*
+*Files: `artistic/railwaymap.c`*
 
 #### A11 (chtype)(unsigned char) — Sign-extension Guard
 

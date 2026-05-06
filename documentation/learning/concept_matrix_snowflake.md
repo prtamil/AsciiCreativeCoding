@@ -1,257 +1,221 @@
-# Pass 1 — matrix_rain/matrix_snowflake.c: Matrix rain + live DLA snowflake
+# Pass 1 — matrix_snowflake.c: Matrix rain falls, glyphs freeze, snow piles up
 
 ## Core Idea
 
-Two independent real-time simulations run on the same terminal simultaneously. In the background, classic matrix digital rain falls — streams of random ASCII characters in theme-colored columns, flickering as they descend. In the foreground, a DLA (Diffusion-Limited Aggregation) ice crystal grows from the screen center using the same D6 hexagonal symmetry as snowflake.c. Frozen crystal cells are drawn on top of the rain. When the crystal fills the screen it flashes white and resets — new crystal, same rain — repeating indefinitely.
+Two simulations sharing one screen, with a moving boundary between them. In each terminal column, a stream of matrix-rain glyphs falls from the top. When the stream's head reaches the top of the snow pile in that column, the head glyph freezes there — its colour switches from rain hue to snow hue, the pile's top in that column rises by one row, and the stream respawns above the screen after a short random delay. When every column is full (pile reaches the top across the whole screen) the entire pile flashes bright for ~1 s and the world resets.
+
+The previous version of this file ran a DLA aggregate with D6 hexagonal symmetry — clever fractal math but a weird match for "matrix rain hits something and snow grows." The new design is straight gravity + per-column accumulation, which is both intuitively obvious from a 30-second watch and dramatically simpler to read in code.
 
 ## The Mental Model
 
-Think of two transparent overlays stacked on one screen. The bottom overlay is a video of rain (matrix-style characters falling). The top overlay is a growing ice crystal. The crystal is clear glass where it hasn't grown yet (rain shows through) and opaque white-to-blue ice where it has frozen. The rain always falls everywhere; it is only visually occluded by the crystal in frozen regions.
+A row of N hourglasses, side by side. In each hourglass the upper chamber is the rain region (where a glyph stream is currently falling) and the lower chamber is the snow pile. The "neck" between chambers — the boundary where a falling glyph turns into a frozen one — is the row index `pile_top[c] − 1`. As snow piles up, that boundary moves UP the screen (smaller row indices). When the boundary in every column reaches the top edge, the whole setup glares bright and refills empty for another round.
 
-The DLA physics: random walkers (invisible) spawn in a ring just outside the current crystal boundary, take random steps, and when they touch the crystal they freeze to it. The D6 symmetry law means every stick event is applied to all 12 positions simultaneously — 6 rotations × 2 reflections — so all six arms grow together without any explicit arm-counting.
+```
+   t = 0 (empty pile)        t = mid                     t = full
+   ┌──┐                      ┌──┐                        ┌──┐
+   │  │                      │  │                        │##│
+   │X │ ← head               │  │                        │##│
+   │k │   trail              │X │                        │##│
+   │7 │                      │k │ ← head                 │##│
+   │  │                      │##│ ← pile_top moved up    │##│ ← pile_top = 0
+   │##│ ← pile_top           │##│                        │##│   COLUMN FULL
+   ├──┤ ← HUD                ├──┤                        ├──┤
 
-The key insight of this simulation: rain and crystal share the same terminal grid but are logically independent. The rain does not affect the crystal, and the crystal does not affect the rain. The only interaction is visual: the rain draw skips frozen cells, and the crystal draw overwrites whatever rain was there.
+   pile_top[c]:  rows-1      pile_top[c]: ~rows/2        pile_top[c]: 0
+```
+
+Different columns fill at different rates because per-stream speeds and respawn delays are randomised. The pile profile (pile_top vs col) is therefore never flat — always wavy.
 
 ## Data Structures
 
-### Crystal (§4)
+### RainStream (§4)
 ```
-uint8_t cells[ROWS_MAX][COLS_MAX]  — 0 = empty, n = color pair ID (CP_XTAL_1..6)
-int     frozen_count               — total frozen cells across all arms
-int     cols, rows, cx0, cy0       — grid size and center position
-float   max_dist                   — normalisation radius (90% of half-diagonal)
-float   trigger_dist               — reset threshold (88% of max_dist)
-float   max_frozen_dist            — current farthest frozen cell from center
-```
-Color pair assigned at freeze time by Euclidean distance: outer tips get CP_XTAL_1 (bright), core gets CP_XTAL_6 (dim). Never changes once assigned.
-
-### RainStream (§5)
-```
-float head    — head row as float for fractional speed
-int   trail   — trail length in rows (6–21)
-float speed   — rows per frame (0.35–1.25)
-bool  active
-```
-One slot per column — g_streams[COLS_MAX]. Independent per-column.
-
-### g_rain_ch[ROWS_MAX][COLS_MAX]
-Global char buffer. Each cell holds its current character. Randomised near stream heads every tick (~67% chance per head cell) and globally flickered at ~4% of all cells per tick. Shared between all streams; a cell's char is updated by whichever stream is above it.
-
-### Walker (§6)
-```
-int  col, row
-bool active
-```
-Spawned in a ring around the crystal. Random-walk one cardinal step per frame. Tested for adjacency to frozen cells each step.
-
-### AppState
-```
-typedef enum { STATE_GROW, STATE_FLASH } AppState;
-```
-STATE_GROW: normal DLA + rain. STATE_FLASH: crystal complete, 28-frame flash, then scene_reset().
-
-## The Main Loop
-
-1. Resize → scene_init() at new dimensions.
-2. Input: q/r/p/+/-/]/[/t keys.
-3. scene_tick():
-   - If STATE_FLASH: rain_tick(), decrement flash_timer, reset when zero.
-   - If STATE_GROW: rain_tick(), walkers_tick(), check trigger_dist.
-4. erase().
-5. rain_draw() — skip frozen cells (crystal draws on top).
-6. xtal_draw() — two passes: glow halo, then frozen cells.
-7. HUD: walker count, speed, theme, frozen count.
-8. wnoutrefresh + doupdate.
-9. Sleep to maintain 30fps.
-
-## Non-Obvious Decisions
-
-### Walker spawn radius — the critical optimisation
-In snowflake.c, walkers spawn at screen edges and random-walk to the center. On a 220-column terminal the expected steps for a random walk from edge to center is O((cols/2)²) ≈ 10,000+ steps. With 60 walkers at 30fps the crystal would take minutes to start. The fix: spawn walkers at `max_frozen_dist + 8` (the current crystal boundary + 8 cells buffer). Walkers need only a few steps to find the crystal. Growth begins immediately and stays fast throughout.
-
-The spawn code uses polar coordinates to place walkers uniformly on the circular spawn ring:
-```c
-float angle = rand_float * 2 * PI;
-int nc = cx0 + roundf(cosf(angle) * spawn_r);
-int nr = cy0 + roundf(sinf(angle) * spawn_r / ASPECT_R);
-```
-ASPECT_R=2.0 is divided in the row direction to compensate for terminal cells being 2× taller than wide, making the spawn ring look circular rather than elliptical.
-
-### Rain char buffer vs on-the-fly generation
-g_rain_ch[ROWS_MAX][COLS_MAX] stores one char per cell (80×300 = 24,000 bytes). Alternative: generate chars on the fly using a hash of (row, col, frame). The buffer wins because: (1) different regions can be updated at different rates — head cells flicker fast, bulk cells slow; (2) chars persist across frames so streams leave a visible "shimmer trail"; (3) no per-frame hash computation.
-
-### Two draw layers, one z-order rule
-draw order: rain_draw → xtal_draw. Because ncurses uses "last write wins", crystal cells are always on top. The rain draw skips frozen cells (`if (x->cells[r][c] != 0) continue`) so rain never flickers through frozen positions. The crystal glow halo (dim `:` on empty neighbors) is drawn in xtal_draw pass 1 — it appears on top of rain, which is acceptable and looks like the ice is glowing through the rain.
-
-### Crystal color: black background not transparent
-Crystal color pairs use `COLOR_BLACK` background while rain uses `-1` (transparent terminal background). This is intentional: frozen cells need an opaque background so rain chars beneath them are fully occluded. Without black background, the crystal chars would be drawn over the rain chars in the same cell, producing visual noise instead of clean crystal structure.
-
-### Flash on completion
-When `max_frozen_dist >= trigger_dist` (88% of max radius): switch to STATE_FLASH. All frozen cells rendered as bold white `*` for 28 frames (~0.9s). Then scene_reset(): clear crystal, re-seed, respawn walkers. Rain continues uninterrupted through the flash and reset — only the crystal resets, not the rain.
-
-## D6 Symmetry — Same as snowflake.c
-
-Identical math to snowflake.c: 12 = 6 rotations × 2 reflections. The 6 rotation angles are multiples of 60°; reflection is applied by negating dy before rotation. Euclidean space (with ASPECT_R correction) is used for the rotation math; converted back to terminal (col, row) after.
-
-```c
-for (int refl = 0; refl < 2; refl++) {
-    float dx_e =  dx;
-    float dy_e = (refl == 0 ? dy : -dy) / ASPECT_R;  /* Euclidean y */
-    for (int k = 0; k < 6; k++) {
-        float rx_e = dx_e * CA6[k] - dy_e * SA6[k];
-        float ry_e = dx_e * SA6[k] + dy_e * CA6[k];
-        int nc = cx0 + roundf(rx_e);
-        int nr = cy0 + roundf(ry_e * ASPECT_R);
-        xtal_freeze_one(x, nc, nr);
-    }
-}
+int    col;            — column index, set once at spawn
+float  head;           — head row (float for sub-row smoothness)
+int    trail_len;      — visible tail length (4..14)
+float  speed;          — rows/sec; per-stream constant
+float  restart_delay;  — seconds remaining until respawn (only valid when !active)
+char   glyphs[14];     — per-stream glyph cache, top 3 reroll every frame
+bool   active;
 ```
 
-## From the Source
+### Snow (§5)
+```
+char  pile_chars[rows][cols];  — glyph at each frozen cell, 0 if empty
+int   pile_top[cols];          — row index of TOPMOST FROZEN row in column c.
+                                 Rows pile_top[c]..rows-2 are frozen.
+                                 Rows 0..pile_top[c]-1 are empty.
+                                 DECREASES (moves UP) as snow grows.
+                                 Initial: rows-1 (no usable frozen row yet).
+                                 Reaches 0 when column is full.
+int   cols, rows;
+int   frozen_count;             — total frozen cells; HUD readout
+```
 
-**Algorithm:** `STICK_PROB=0.35` — probability a walker sticks on contact. Low value (0.35) means walkers bounce many times before freezing, producing thicker, rounder arms. High value (0.90) → sparse spiky fractal. Walker spawn radius = `max_frozen_dist + 8` (current crystal boundary + 8-cell buffer), not screen edges — keeps growth fast throughout.
+### Scene (§6)
+```
+RainStream  streams[cols];
+Snow        snow;
+int         cols, rows;
+SceneState  state;     — STATE_FALL or STATE_FLASH
+int         flash_tick;— frames remaining in FLASH state
+int         theme_idx;
+bool        paused;
+float       rain_speed_scale;
+```
 
-**Math:** `ASPECT_R=2.0` terminal cell height/width ratio. Applied in two places: (1) spawn ring: `nr = cy0 + roundf(sinf(angle) * spawn_r / ASPECT_R)` — makes spawn ring circular not elliptical; (2) D6 symmetry rotation: `dy_e = dy / ASPECT_R` before rotation, `nr = cy0 + roundf(ry_e * ASPECT_R)` after — ensures rotations are performed in Euclidean space. DLA fractal dimension ≈ 1.71.
+## Brightness bands
 
-**Performance:** `g_rain_ch[ROWS_MAX][COLS_MAX]` (24,000 bytes) stores one char per cell: head cells flickered at ~67% chance per tick, all cells at ~4% ambient. Walker sticking check: scans 8 neighbours O(1) per walker per tick. Multiple concurrent walkers (`WALKER_DEFAULT=12`, adjustable with +/-) speed growth at cost of less ideal DLA statistics.
+Rain (3 bands):
+```
+dist 0      → CP_RAIN_HEAD  (BOLD)
+dist 1..3   → CP_RAIN_MID
+dist 4+     → CP_RAIN_FADE  (DIM)
+```
 
-**Rendering:** Two draw layers: rain first (`rain_draw` skips frozen cells), crystal second. Crystal color pairs use `COLOR_BLACK` background (opaque) while rain uses transparent terminal background — ensures frozen cells fully occlude rain beneath them. Flash on completion: `FLASH_FRAMES=28` frames (~0.9 s at 30 fps) of bold white `*` for all frozen cells, then `scene_reset()` — rain continues uninterrupted.
+Snow (2 bands):
+```
+depth = r - pile_top[c]
+depth < SNOW_FRESH_DEPTH    → CP_SNOW_FRESH   (BOLD)  — recently fallen
+depth ≥ SNOW_FRESH_DEPTH    → CP_SNOW_PACKED  (NORMAL) — older
+```
 
-## Key Constants
+## The Main Loop (variable dt)
 
-| Constant | Default | Effect if changed |
-|---|---|---|
-| `STICK_PROB` | 0.35 | Lower = thicker arms, slower growth; higher = spiky, faster |
-| `WALKER_DEFAULT` | 12 | Fewer = slow dramatic growth; more = rapid fill (use + key) |
-| `FLASH_FRAMES` | 28 | Frames of white flash before reset (~0.9s at 30fps) |
-| `RENDER_FPS` | 30 | Lower = more CPU time for DLA; higher = smoother rain but less DLA |
-| `ASPECT_R` | 2.0 | Must match terminal font aspect ratio; wrong value = lopsided arms |
-
-## Themes
-
-5 themes, each pairing a rain hue family with a contrasting crystal palette:
-- **Classic**: green rain + ice blue crystal (teal→white gradient)
-- **Inferno**: red rain + gold/orange crystal
-- **Nebula**: purple rain + cyan crystal
-- **Toxic**: cyan rain + pink/magenta crystal
-- **Gold**: yellow rain + violet/purple crystal
-
-Contrast between rain and crystal hue is intentional: the crystal must be visually distinct from the rain color so the eye can separate the two layers.
+1. Resize check — SIGWINCH triggers `scene_init` with the new (cols, rows).
+2. `dt` = wall-clock seconds since last frame, capped at `DT_CAP_SEC`.
+3. Drain input.
+4. `scene_tick(dt)`:
+   - **STATE_FLASH**: `flash_tick--`; if zero, `scene_reset` (clears pile, respawns streams).
+   - **STATE_FALL**: per column:
+     - Inactive stream: `restart_delay -= dt`; respawn when ≤ 0 AND column not yet full.
+     - Active stream's column already full: deactivate forever (until next reset).
+     - Active stream: `head += speed · dt · rain_speed_scale`; reroll top 3 glyphs at 67% chance each. If `floor(head + 0.5) ≥ pile_top[c] - 1`: `snow_freeze(c, glyphs[0])`, deactivate, schedule respawn.
+   - If `snow_is_full()` (every `pile_top[c] == 0`), enter STATE_FLASH.
+5. fps rolling average.
+6. Draw: `erase`, `snow_draw` (pile, fresh-on-top), `rain_draw` (streams above pile_top), HUD, hint, `wnoutrefresh + doupdate`.
+7. Frame cap.
 
 ## State Machine
 
 ```
-                     r key or trigger_dist reached
-STATE_GROW ──────────────────────────────────────► STATE_FLASH
-    ▲                                                    │
-    │              flash_tick == 0                       │
-    └────────────────── scene_reset() ──────────────────-┘
-         (crystal cleared, walkers respawned, rain continues)
+      ┌───────┐  every column full   ┌───────┐
+      │ FALL  │ ──────────────────►  │ FLASH │
+      │       │   (snow_is_full)      │       │
+      │ rain  │                       │ pile  │
+      │ feeds │                       │ glares│
+      │ pile  │                       │ white │
+      │       │  ← FLASH_FRAMES = 0 ──│       │
+      └───────┘  (scene_reset clears  └───────┘
+                  pile, respawns streams)
 ```
 
-## Open Questions for Pass 3
+## Non-Obvious Decisions
 
-- What happens if two walkers try to freeze the same cell simultaneously in the same tick? (The freeze_one function silently skips already-frozen cells, so the second walker's symmetric freeze just skips some positions — no double-count, no race condition.)
-- How does the color gradient behave when the crystal resets? (It recalculates from scratch — center = CP_XTAL_6, tips = CP_XTAL_1 — based on distance from the new center, same every cycle.)
-- What would happen if walkers had a drift toward center instead of pure random walk? (Arms would grow outward faster and be spikier — same effect as raising STICK_PROB.)
-- Could the rain and DLA run at different frame rates? (Yes: run DLA every N frames while rain runs every frame. Would decouple their visual rhythms.)
+**Why drop the DLA + D6 symmetry version?**
+DLA + D6 produces a fractal snowflake — clever, but the user has to know what DLA is and what dihedral groups are to read the code. The new "rain → snow pile" version requires only "things fall and stack up", which anyone watching the screen recognises in seconds.
+
+**Why is `pile_top[c]` initialised to `rows-1` (not `rows-2`)?**
+`rows-1` is the HUD hint strip — never frozen. `pile_top = rows-1` means "no actual snow yet, but the floor is conceptually at rows-1." The first freeze in column c places a glyph at `pile_top[c] - 1 = rows - 2` (the lowest usable row) and decrements pile_top to rows-2. Off-by-one trap if you initialise to rows-2.
+
+**Why does each stream own its own glyph cache?**
+A 2-D `g_rain_ch[][]` grid was used in the old DLA version for ambient flicker. It adds a parallel data path and complicates the mental model. Per-stream cache is one structure per stream, no shared state — simpler to teach.
+
+**Why does the trail vanish when the head freezes?**
+When a stream freezes its head, the rest of the trail (which extends ABOVE the head row) is just thrown away — `active = false` and the stream restarts later from above the screen. This is the cleanest design: the trail is purely visual, not stored as separate cells. Animating the trail dissipating would mean carrying state through the freeze event, which we don't need for the visual.
+
+**Why no horizontal sand-pile dynamics?**
+Real falling-sand simulations cascade laterally: when a pile is much taller in column c than c+1, glyphs slide diagonally down. The matrix_snowflake design deliberately does NOT do that — each column accumulates independently. The result is a wavy but vertically-stratified pile, which reads as "snow accumulating" rather than "sand piling." Adding lateral cascades would be a separate file (sandpile.c).
+
+## Key Constants
+
+| Constant | Default | Effect |
+|---|---|---|
+| RAIN_TRAIL_MIN, MAX | 4, 14 | Stream length range. |
+| RAIN_SPEED_MIN, MAX | 6, 20 (cells/sec) | Per-stream speed range. |
+| RAIN_HEAD_FLICKER | 3 | Top 3 cells reroll every frame. |
+| RAIN_HEAD_REROLL_PROB | 0.67 | Per-cell reroll chance per frame. |
+| STREAM_RESTART_MIN, VAR | 0.30, 1.20 sec | Respawn delay range. |
+| SNOW_FRESH_DEPTH | 3 | Top 3 rows of pile render BOLD. |
+| FLASH_FRAMES | 28 | At 30 fps ≈ 0.93 s flash duration. |
+
+## Open Questions
+- Should the pile "melt" between flashes? Currently it clears instantly. A melt animation could reuse the same per-column state.
+- Wind drift on freeze (small lateral chance) would produce uneven pile profiles. Worth adding for visual interest, or does it muddy the simple "vertical stack" model?
+- Could SNOW_FRESH be a gradient (3-4 rows fade from BOLD to NORMAL) rather than a sharp boundary?
 
 ---
 
-# Structure
-
-| Symbol | Type | Size | Role |
-|--------|------|------|------|
-| `xtal.cells[ROWS_MAX][COLS_MAX]` | `uint8_t[80][300]` | ~24 KB | DLA crystal grid: 0=empty, n=color-pair id |
-| `g_streams[COLS_MAX]` | `RainStream[300]` | ~5 KB | one rain stream per terminal column |
-| `g_rain_ch[ROWS_MAX][COLS_MAX]` | `char[80][300]` | ~24 KB | shimmering character cache for rain |
-
-# Pass 2 — matrix_snowflake: Pseudocode
+# Pass 2 — Pseudocode
 
 ## Module Map
 
-| Section | Purpose |
+| § | Purpose |
 |---|---|
-| [1] config | Constants: FPS, STICK_PROB, ASPECT_R, FLASH_FRAMES, rain chars, color pair IDs, Theme struct, k_themes[5] |
-| [2] clock | clock_ns(), clock_sleep_ns() |
-| [3] color | theme_apply(), color_init() |
-| [4] crystal | Crystal struct, xtal_freeze_one/symmetric, xtal_char, xtal_init, xtal_draw (2-pass) |
-| [5] rain | RainStream struct, g_rain_ch[][], rain_init, rain_tick, rain_draw |
-| [6] walkers | Walker struct, walker_spawn (proximity ring), walkers_init, walkers_tick |
-| [7] scene | AppState, g_xtal, scene_init/reset/tick/draw |
-| [8] app | Signal handlers, main loop, key input |
+| §1 config | grid bounds, frame rate, stream geometry/speed, snow params, color pairs |
+| §2 clock | monotonic timer + sleep |
+| §3 color | 5 themes (rain hue paired with snow hue), HUD pairs |
+| §4 stream | RainStream type, spawn, advance, draw helpers |
+| §5 snow | Snow type, pile state, freeze, full check, draw |
+| §6 scene | Scene state + FALL/FLASH state machine |
+| §7 screen | ncurses init / present / HUD |
+| §8 app | signals, resize, variable-dt main loop |
 
-## Data Flow Diagram
-
-```
-scene_tick():
-  if STATE_FLASH:
-    rain_tick()
-    flash_tick--
-    if 0: scene_reset()
-  else:
-    rain_tick():
-      advance stream heads (+=speed*mult)
-      randomise chars near heads (67% chance/cell)
-      ambient flicker (4% of all cells)
-      spawn new streams at random columns to hit g_n_streams target
-
-    walkers_tick(crystal):
-      for each walker:
-        random cardinal step
-        if out-of-bounds: walker_spawn(w, crystal)  ← on proximity ring
-        if new cell frozen: try stick at current pos
-        if new cell adj-frozen: try stick at new pos
-        on stick: xtal_freeze_symmetric(12 positions), respawn walker
-
-    if crystal.max_frozen_dist >= trigger_dist:
-      state = STATE_FLASH, flash_tick = 28
-
-scene_draw():
-  rain_draw(crystal):
-    for each active stream s:
-      for trail depth d=0..trail:
-        r = head - d
-        if crystal.cells[r][col] != 0: skip  (crystal on top)
-        draw g_rain_ch[r][col] with depth-based color
-
-  xtal_draw(crystal, flashing):
-    Pass 1: for each frozen cell:
-      paint dim ':' on all empty 8-neighbors (glow halo)
-    Pass 2: for each frozen cell:
-      if flashing: bold white '*'
-      else: xtal_char() with distance-based color pair + bold for tips/core
-
-  HUD: walkers, speed, theme, frozen_count
-```
-
-## Pseudocode — Core Loop
+## Data Flow
 
 ```
-srand(time); atexit(cleanup); signals(SIGINT/SIGTERM/SIGWINCH)
-initscr / cbreak / noecho / keypad / nodelay / curs_set(0)
-color_init()
-getmaxyx → g_rows, g_cols
-scene_init()   ← rain_init + xtal_init + walkers_init(crystal)
-
-loop while !g_quit:
-  if g_resize:
-    endwin; refresh; getmaxyx
-    scene_init()
-
-  getch() → switch:
-    q/ESC → quit
-    r     → scene_reset()
-    p/spc → g_paused toggle
-    + =   → g_n_walkers += 5; walkers_init(crystal)
-    -     → g_n_walkers -= 5
-    ] [   → g_speed_mult ± 0.2
-    t     → g_theme = (g_theme+1)%5; theme_apply()
-
-  now = clock_ns()
-  scene_tick()
-  erase()
-  scene_draw()
-  wnoutrefresh; doupdate
-  clock_sleep_ns(RENDER_NS - elapsed)
+keys ──► app_handle_key ──► scene.{paused, theme_idx, rain_speed_scale}
+                                      │
+clock_ns ──► dt ──► scene_tick(dt)
+                          │
+                          ├── STATE_FALL: per-column
+                          │     ├── if !active: restart_delay -= dt; respawn if ready
+                          │     ├── stream_advance(s, dt, scale, land_row)
+                          │     │     └── return true → snow_freeze(c, glyphs[0]); deactivate
+                          │     └── if all pile_top == 0 → STATE_FLASH
+                          │
+                          └── STATE_FLASH: flash_tick--; if 0 → scene_reset
+                          │
+                          ▼
+                      scene_draw
+                          ├── snow_draw   (rows pile_top..rows-2 per column)
+                          └── rain_draw   (per active stream, rows < pile_top[c])
+                                  │
+                                  ▼
+                         ncurses paint + HUD + hint
 ```
+
+## Pseudocode
+
+```
+setup:
+  install signals
+  screen_init, color (theme_apply + hud_pairs_init)
+  scene_init(cols, rows)
+
+while running:
+  if need_resize: scene_init(new cols, rows) preserving theme & speed
+  dt = clamp(now - last, 0, DT_CAP_SEC)
+  drain input → app_handle_key
+  scene_tick(scene, dt)
+  fps update
+  erase
+  scene_draw(scene)              # snow first, rain on top above pile_top
+  screen_draw_hud(screen, fps, scene)
+  wnoutrefresh + doupdate
+  sleep to TARGET_FPS
+
+cleanup: endwin
+```
+
+## Key Patterns to Internalize
+
+**Per-column accumulators.** Each column is its own little hourglass. No global "snow level" — only per-column `pile_top[c]`.
+
+**The boundary is just a number.** `pile_top[c]` defines what's snow vs what's air. The physics changes nothing else.
+
+**Variable dt + float head.** Same as matrix_rain.c. Smooth motion at any frame rate, no accumulator.
+
+**State machines belong in the orchestrator.** `scene_tick` dispatches by `state`; the per-column logic doesn't know about FLASH at all.
+
+**Two simulations on one screen, one boundary.** This is the meta-pattern: when you want two things sharing a grid, define a clean boundary (pile_top, freeze line, etc.) and let each simulation operate above/below it independently.

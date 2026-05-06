@@ -1,41 +1,41 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * displace_raster.c  —  ncurses software rasterizer, vertex displacement demo
+ * displace_raster.c — software vertex displacement on a UV sphere
  *
- * Primitive: UV sphere, tessellated once at init.
- * Vertex shader displaces each vertex along its normal by a time-varying
- * function — the mesh breathes, ripples, pulses, and spikes in real time.
+ * DEMO: A UV sphere whose vertices are pushed along their normals every
+ *       frame by a time-varying scalar field. The geometry actually
+ *       changes — this isn't a normal-map fake, the surface really
+ *       moves. Cycle 'd' through four modes:
  *
- * Four displacement modes cycled with  d:
- *   RIPPLE   concentric rings from equator — sin(time + r*freq)
- *   WAVE     diagonal travelling wave     — sin(time + x*f + y*f)
- *   PULSE    whole sphere breathes        — sin(time) * exp(-r*falloff)
- *   SPIKY    spiky ball                   — |sin(x*f)*sin(y*f)*sin(z*f)|
+ *         RIPPLE  concentric rings sweep from the equator outward
+ *         WAVE    a diagonal travelling wave deforms the whole ball
+ *         PULSE   the sphere breathes, biggest at the equator
+ *         SPIKY   a porcupine of moving spikes
  *
- * Four shaders cycled with  s:
- *   phong / toon / normals / wireframe
+ *       Cycle 's' through four shaders (phong → toon → normals → wire)
+ *       to see HOW the deformed surface is being lit. The fragment
+ *       shaders are unchanged from any other file in the folder —
+ *       what makes the demo "react" to the deformation is the VERTEX
+ *       pass recomputing each surface normal numerically (central
+ *       difference) at every frame. Without that, the highlights
+ *       would still hug the original sphere while the visible surface
+ *       heaved underneath.
  *
- * Normal recomputation — central difference method:
- *   The mesh normal is correct for the undisplaced sphere.
- *   After displacement the surface has moved, so the normal must be
- *   recomputed from the actual deformed surface geometry.
+ * Study alongside:
+ *   raster/sphere_raster.c  — same UV sphere, no displacement
+ *   raster/cube_raster.c    — same shader-program scaffolding
  *
- *   Method: sample the displacement function at two nearby points
- *   along each of two tangent directions (central difference), then
- *   reconstruct the displaced tangent vectors and take their cross product.
- *
- *   displace(pos) → scalar offset along normal
- *   eps = small step along tangent
- *
- *   d_u = displace(pos + eps*Tu) - displace(pos - eps*Tu)
- *   d_v = displace(pos + eps*Tv) - displace(pos - eps*Tv)
- *   T'  = Tu*(2*eps) + N*d_u        ← displaced tangent in u direction
- *   B'  = Tv*(2*eps) + N*d_v        ← displaced tangent in v direction
- *   N'  = normalize(cross(T', B'))  ← new surface normal
- *
- *   This matches the lighting to the actual deformed surface exactly,
- *   not the original sphere.  Without recomputation normals would point
- *   in the wrong direction and lighting would look completely wrong.
+ * Section map:
+ *   §1  config       — frame, view, sphere, displacement, ramp, dither
+ *   §2  math         — Vec3 / Vec4 / Mat4 helpers
+ *   §3  displace     — four mode functions + tangent basis + central-diff
+ *   §4  shaders      — VSIn / VSOut / FSIn / FSOut + 1 vert × 4 frag
+ *   §5  mesh         — UV sphere tessellation (poles handled explicitly)
+ *   §6  framebuffer  — zbuf + cbuf, Bayer dither, Bourke ramp, blit
+ *   §7  pipeline     — vertex transform → cull → barycentric raster → FS
+ *   §8  scene        — uniforms wiring, tick, draw, mode/shader swap
+ *   §9  screen       — ncurses init / resize / HUD / present
+ *   §10 app          — dt loop, input, resize, cleanup
  *
  * Keys:
  *   d / D     cycle displacement mode  (ripple → wave → pulse → spiky)
@@ -47,159 +47,179 @@
  *   q / ESC   quit
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra displace_raster.c -o displace -lncurses -lm
- *
- * Sections
- * --------
- *   §1  config
- *   §2  math         Vec3 Vec4 Mat4
- *   §3  displacement  4 mode functions + tangent basis + normal recompute
- *   §4  shaders       VSIn VSOut FSIn FSOut + vert_displace + 3 frag shaders
- *   §5  mesh          UV sphere tessellation
- *   §6  framebuffer   zbuf cbuf dither paulbourke blit
- *   §7  pipeline      vertex transform · rasterize · draw
- *   §8  scene         uniforms · tick · draw · mode/shader swap
- *   §9  screen        ncurses init/resize/hud/present
- *   §10 app           dt loop · input · resize · cleanup
+ *   gcc -std=c11 -O2 -Wall -Wextra raster/displace_raster.c -o displace \
+ *       -lncurses -lm
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Vertex displacement shader — modifies mesh geometry per-frame.
- *                  Unlike cube/sphere/torus_raster.c (fixed mesh), here the
- *                  vertex positions are re-calculated each frame by displacing
- *                  the base sphere vertices along their normals.
+ * Algorithm      : Vertex displacement. Push every mesh vertex along its
+ *                  surface normal by a scalar function f(p, t) — the
+ *                  "displacement field". Then recompute the surface
+ *                  normal numerically so lighting follows the deformed
+ *                  shape, not the original. The fragment shaders never
+ *                  see the displacement; they read whatever world
+ *                  position + normal arrived from the vertex stage.
  *
- * Math           : Displacement: p' = p + N · f(p, t)  where f is the mode function.
- *                  RIPPLE: f = A·sin(ω·t + k·|p.xz|) — cylindrical wave from equator.
- *                  WAVE:   f = A·sin(ω·t + k·p.x + k·p.y) — diagonal plane wave.
- *                  PULSE:  f = A·sin(ω·t) · exp(−γ·|p.y|) — breathing along y-axis.
- *                  SPIKY:  f = |sin(kx·p.x)·sin(ky·p.y)·sin(kz·p.z)| — sharp spikes.
+ *                  Field formulas (all return a scalar offset along N):
+ *                    RIPPLE   f = A·sin(ω·t + k·r) · taper(y),  r = √(x²+z²)
+ *                    WAVE     f = A·sin(ω·t + k·(x + 0.8y + 0.5z))
+ *                    PULSE    f = A·sin(ω·t)·exp(−γ·r)
+ *                    SPIKY    f = A·|sin(kx)·sin(ky)·sin(kz)|^0.6
  *
- *                  Normal recomputation (central difference):
- *                    N_new = normalise(∂p'/∂u × ∂p'/∂v)
- *                  where ∂p'/∂u ≈ (displaced(u+ε,v) − displaced(u−ε,v)) / (2ε).
- *                  This ensures shading remains correct for the deformed surface.
+ *                  Normal recomputation (central difference): pick two
+ *                  tangent directions T, B perpendicular to N; sample
+ *                  f at p ± εT and p ± εB; reconstruct the displaced
+ *                  tangent vectors and cross-product them.
  *
- * Performance    : O(N_verts) displacement per frame.  Normal recomputation is
- *                  the expensive step: 4 extra displacement evaluations per vertex.
+ * Data-structure : One static UV sphere mesh (TESS_U × TESS_V quads,
+ *                  pole vertices handled explicitly), tessellated once
+ *                  at init. Per-frame the vertex shader re-derives
+ *                  position + normal from the base sphere; the mesh
+ *                  buffer never changes. Fragment outputs land in a
+ *                  zbuf + cbuf framebuffer the same shape as cube_raster.
+ *
+ * Rendering      : Standard forward pipeline. Per triangle: vertex
+ *                  shader runs (displace + normal recompute) → clip →
+ *                  perspective divide → screen → back-face cull →
+ *                  bounding-box raster with barycentric interp →
+ *                  fragment shader → luma → Bayer dither → Bourke ramp.
+ *
+ * Performance    : O(N_verts) displacement evaluations per frame. The
+ *                  normal pass adds 4 extra f() calls per vertex (2
+ *                  tangent dirs × ±ε). With TESS_U=48, TESS_V=32 →
+ *                  ~3000 vertices × 5 = 15 k field evals per frame —
+ *                  trivial at 60 fps in a terminal.
+ *
+ * References     : Cook, "Shade Trees," SIGGRAPH '84 (the original
+ *                    "displacement shader" concept).
+ *                  RenderMan Companion §13 — central difference is
+ *                    the canonical RenderMan technique for derived
+ *                    normals.
+ *                  Akenine-Möller et al., Real-Time Rendering 4ed,
+ *                    §16.2.4 (modern displacement on the GPU).
+ *                  Möller, "Fast Triangle Rasterization by
+ *                    Interpolating Edge Functions," GPG (2000).
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
  *
  * CORE IDEA
  * ─────────
- * The mesh is a UV sphere tessellated ONCE.  Every frame the vertex
- * shader pushes each vertex outward (or inward) along its normal by
- * a scalar function of position and time.  But moving a vertex
- * invalidates its normal — the surface has bent.  So we recompute
- * the normal numerically by sampling the displacement at four
- * neighbouring points (central difference) and crossing the resulting
- * tangent vectors.  This single trick — displacement + recomputed
- * normal — is what makes lighting react correctly to the moving
- * geometry.  Without it the highlights would still hug the original
- * sphere while the surface visibly heaves.
+ * Tessellate the sphere ONCE. Every frame the vertex shader pushes
+ * each vertex along its (original) normal by f(p, t). Moving the
+ * vertex invalidates its normal — the surface has bent — so we
+ * recompute the normal numerically by sampling f at four nearby
+ * points and crossing the resulting tangent vectors. That single
+ * trick is what makes the four fragment shaders react to the
+ * moving geometry without knowing it moved.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
- * Imagine pushing thumbtacks into and out of a balloon while a torch
- * shines on it.  The balloon deforms; the bright spot has to slide
- * to wherever the new surface is most face-on to the torch.  Pure
- * displacement of vertex positions is "moving the thumbtacks";
- * recomputing the normal is "telling the torch where the new face is."
- * The shader pipeline is ordered: VS (position + normal), then
- * raster (barycentric interp), then FS (Phong/toon/normals/wire).
- * Each fragment shader works UNCHANGED — they all read world_pos
- * and world_nrm without knowing whether the geometry was displaced
- * or not.  That's the encapsulation win.
+ * Pushing thumbtacks into and out of a balloon under a torch:
+ * displacement = "move the thumbtacks"; normal recompute = "tell
+ * the torch where the new face is." If you only move thumbtacks,
+ * the highlight stays where it was while the surface heaves
+ * underneath — wrong. Recomputing the normal puts the highlight
+ * where the new face actually points.
  *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Tessellate once: TESS_U=48 longitude × TESS_V=32 latitude →
- *     3072 triangles, with normals = normalised positions.
- *  2. Each frame:  scene_tick advances time and rotation matrices,
- *     scene_sync_disp copies current Uniforms into DisplaceUniforms
- *     and selects k_disp_fn[mode], k_amp[mode], k_freq[mode].
- *  3. For every vertex (vert_displace):
- *       a. N = normalise(pos)            (sphere normal = pos)
- *       b. d = disp_fn(pos, time, amp, freq)
- *       c. dpos = pos + N · d
- *       d. dnrm = displaced_normal(...) — see step 4
- *       e. clip = MVP · dpos             (NDC for raster)
- *       f. world_pos = model · dpos      (lighting)
- *  4. displaced_normal: pick tangent T (any non-parallel cross), B = N×T.
- *     Sample d at pos±εT and pos±εB.  Reconstruct displaced tangents:
- *       T' = 2εT + N·(d_+T − d_-T)
- *       B' = 2εB + N·(d_+B − d_-B)
- *     N_new = normalise(T' × B').
- *  5. Rasterize: each pixel barycentric-interpolates world_pos,
- *     world_nrm, custom[].  Z-test against zbuf (init FLT_MAX).
- *  6. Fragment shader (Phong/toon/normals/wire) writes Vec3 colour;
- *     luma_to_cell quantises to Bayer-dithered Bourke ramp char +
- *     colour pair index.
- *  7. fb_blit walks cbuf and emits mvaddch with the per-cell colour.
+ *      ┌──────────────────────────────────────────────┐
+ *      │   undisplaced              displaced         │
+ *      │                                              │
+ *      │      ↑ N (sphere)            ↑ N′ (recomputed)│
+ *      │       \                       \              │
+ *      │    ────●────             ─────●──╲           │
+ *      │      sphere                deformed surface  │
+ *      └──────────────────────────────────────────────┘
+ *
+ * DRAWING METHOD  /  ALGORITHM IN STEPS
+ * ─────────────────────────────────────
+ *  1. Tessellate once at init: TESS_U × TESS_V quads, normals = unit
+ *     positions, poles handled explicitly.
+ *
+ *  2. Per frame, vert_displace runs for every vertex:
+ *       N    = normalize(pos)                    // sphere normal
+ *       d    = disp_fn(pos, time, amp, freq)     // scalar offset
+ *       p′   = pos + N · d                       // displaced pos
+ *       N′   = displaced_normal(pos, N, ...)     // central diff
+ *       clip = MVP · (p′, 1)                     // for rasteriser
+ *       wpos = model    · p′                     // for lighting
+ *       wnrm = norm_mat · N′                     // for lighting
+ *
+ *  3. displaced_normal builds a tangent frame (T, B) at pos and
+ *     samples f at pos ± εT and pos ± εB. The displaced tangents are
+ *       T′ = 2εT + N · (f(+εT) − f(−εT))
+ *       B′ = 2εB + N · (f(+εB) − f(−εB))
+ *     and N′ = normalize(T′ × B′).
+ *
+ *  4. Rasteriser barycentric-interpolates world_pos, world_nrm,
+ *     u/v, and custom[] across each triangle; z-test → fragment
+ *     shader → Vec3 colour.
+ *
+ *  5. luma_to_cell quantises the Vec3 to a Bayer-dithered Bourke
+ *     glyph + colour pair.
  *
  * KEY FORMULAS
  * ────────────
- *  Displacement     p' = p + N · f(p, t)
- *  RIPPLE f         A · sin(2.5t + r·k) · (1 − 0.6·|y|),  r = √(x² + z²)
- *  WAVE f           A · sin(2t + k·(x + 0.8y + 0.5z))
- *  PULSE f          A · (0.85·sin(1.5t) + 0.15·sin(4.5t)) · e^(−r·k·0.4)
- *  SPIKY f          A · |sin(kx + t) · sin(0.7t + ky) · sin(1.3t + kz)|^0.6
- *  Tangent basis    T = norm(up × N),  B = N × T   (up=Y, fallback X)
- *  Central diff     ∂f/∂T ≈ (f(p+εT) − f(p−εT)) / (2ε)
- *  Displaced T'     T' = 2ε·T + N · Δd_T
- *  New normal       N' = normalise(T' × B')
- *  CD epsilon       ε = 0.03 · R    (3% of radius — empirical sweet spot)
- *  Bayer dither     d ← luma + (B[py%4][px%4] − 0.5) · 0.15
- *  Bourke ramp idx  i = ⌊d · (BOURKE_LEN − 1)⌋
- *  Luma             Y = 0.2126·R + 0.7152·G + 0.0722·B
+ *   Displacement    p′ = p + N · f(p, t)
+ *   Tangent basis   T = norm(cross(up, N)),  B = cross(N, T)
+ *                   up = (0, 1, 0) if |N.y| < 0.9 else (1, 0, 0)
+ *   Central diff    ∂f/∂T ≈ (f(p+εT) − f(p−εT)) / (2ε)
+ *   Displaced T′    T′ = 2εT + N · ΔfT
+ *   New normal      N′ = normalize(T′ × B′)
+ *   CD epsilon      ε = 0.03 · R    (3 % of radius — sweet spot)
+ *   Bayer dither    d ← luma + (B[py%4][px%4] − 0.5) · 0.15
+ *   Luma            Y = 0.2126·R + 0.7152·G + 0.0722·B
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *  • CD_EPS too small → floating-point noise dominates the difference;
- *    normals jitter and lighting flickers.  Too large → normal lags
- *    actual curvature; high-freq spikes get softened.  0.03·R is
- *    tuned for these four modes.
- *  • make_tangent_basis chooses up=(0,1,0) when |N.y|<0.9, else up=
- *    (1,0,0) — without this fallback, polar vertices (N≈±Y) give a
- *    degenerate cross and the normal flips randomly.
- *  • DisplaceUniforms leads with `Uniforms base` so &disp_uni casts
- *    cleanly to const Uniforms* in frag_phong.  The split vert_uni
- *    / frag_uni in ShaderProgram is what fixed the original crash
- *    when the toon shader needed bands.
- *  • Pole normals are explicitly hardcoded to (0,±1,0) in
- *    tessellate_sphere because sin(phi)=0 makes v3_norm degenerate.
- *  • Backface culling uses 2D screen-space cross-product sign — a
- *    deeply concave displacement (large negative d) can flip the
- *    triangle's winding and silently cull faces that should show.
- *    Press 'c' to disable culling and see the back side.
- *  • Wireframe is barycentric edge detection — the wire shader is
- *    fed barycentric coords via custom[0..2] from the pipeline AFTER
- *    vert_displace_wire runs (it leaves custom[] untouched).
- *  • Time accumulator runs only when !paused; angle still advances
- *    too.  Resize does NOT reset time (continuous animation).
- *  • At extreme zoom (cam_dist=1.2), the sphere clips against
- *    CAM_NEAR=0.1 only on huge SPIKY mode peaks.
+ *   • CD_EPS too small → float noise dominates the difference,
+ *     normals jitter, lighting flickers. Too large → normal lags
+ *     curvature, high-freq spikes get softened. 0.03 · R is the
+ *     tuned sweet spot.
+ *
+ *   • Tangent basis at the poles: if N ≈ ±Y, cross(Y, N) is
+ *     degenerate. make_tangent_basis falls back to up = (1, 0, 0).
+ *
+ *   • DisplaceUniforms leads with `Uniforms base` so &disp_uni casts
+ *     cleanly to const Uniforms* inside the fragment shaders. The
+ *     vert_uni / frag_uni split in ShaderProgram is the alternative
+ *     for shaders that need a different uniform struct (toon).
+ *
+ *   • Pole vertex normals are hard-coded to (0, ±1, 0) in
+ *     tessellate_sphere — sin(phi) = 0 makes v3_norm degenerate.
+ *
+ *   • Back-face cull is by signed-area sign in screen space. A deep
+ *     concave displacement (big negative d) can flip a triangle's
+ *     winding; press 'c' to disable culling if it happens.
+ *
+ *   • Wireframe shader reads barycentric coords from custom[0..2];
+ *     the pipeline writes those AFTER vert_displace_wire runs.
+ *
+ *   • Time advances only while !paused; rotation does too.
+ *     Resize does NOT reset time, so animation continues smoothly.
  *
  * HOW TO VERIFY
  * ─────────────
- *  • frag_normals view: rotate through all four modes — RGB-encoded
- *    normals should clearly bend with the deformation.  Static
- *    sphere shows a smooth blue→green→red colour wheel; SPIKY shows
- *    needle-tip swirls.
- *  • Pause + cycle 'd' through modes: at t=0 the sphere is the
- *    UNDEFORMED base (sin(0) = 0 in ripple/wave/pulse).  SPIKY has
- *    permanent peaks because |sin·sin·sin| > 0 for most positions.
- *  • Toon shader: band boundaries should follow the wave crests, not
- *    the original sphere — confirms displaced normals reach the FS.
- *  • Wireframe: latitude/longitude grid visibly ripples in RIPPLE
- *    and WAVE; in PULSE the grid breathes uniformly; SPIKY makes
- *    porcupine-quill grid distortions.
- *  • Press 'c' to disable backface culling — you should see the
- *    interior surface poke through on big PULSE inflations.
- *  • FPS HUD: 3072 tris × ~6 disp_fn evals/vert ≈ 18k fn calls per
- *    frame — should still hit 60 fps on any reasonable terminal.
+ *   • Switch to NORMALS shader: the RGB hue at each pixel is the
+ *     world normal at that fragment. Wave crests rotate the hue;
+ *     spikes show needle-tip swirls. If hue stayed static while
+ *     the silhouette heaved, normal recompute would be broken.
+ *
+ *   • Pause + cycle 'd': at t = 0, ripple/wave/pulse are zero
+ *     (sin(0) = 0) so the sphere is undeformed. SPIKY has permanent
+ *     peaks because |sin · sin · sin| > 0 for most positions.
+ *
+ *   • Toon shader: the band boundaries follow the wave crests, not
+ *     the original sphere outline — confirms the displaced normal
+ *     is what reaches the fragment.
+ *
+ *   • Wireframe: lat/long grid ripples with the surface. SPIKY mode
+ *     makes porcupine-quill distortions of the grid.
+ *
+ *   • Press 'c' to disable culling — on big PULSE inflations you
+ *     should see the interior surface poke through.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -216,14 +236,12 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ───────────────────────────────────────────────────────── */
 
 enum {
     FPS_TARGET    = 60,
     FPS_UPDATE_MS = 500,
-    HUD_COLS      = 52,
+    HUD_COLS      = 80,
 
     /*
      * Tessellation resolution.
@@ -280,9 +298,7 @@ static const float k_bayer[4][4] = {
 #define NS_PER_MS      1000000LL
 #define PI  3.14159265f
 
-/* ===================================================================== */
-/* §2  math                                                               */
-/* ===================================================================== */
+/* ── §2 math (V3, V4, Mat4) ──────────────────────────────────────────── */
 
 typedef struct { float x,y,z;    } Vec3;
 typedef struct { float x,y,z,w;  } Vec4;
@@ -377,9 +393,7 @@ static Mat4 m4_normal_mat(Mat4 m){
     return n;
 }
 
-/* ===================================================================== */
-/* §3  displacement                                                       */
-/* ===================================================================== */
+/* ── §3 displacement — the four mode functions + normal recompute ────── */
 
 /*
  * Displacement modes — each returns a scalar offset to apply along
@@ -507,51 +521,48 @@ static void make_tangent_basis(Vec3 N, Vec3 *T, Vec3 *B)
 }
 
 /*
- * displaced_normal — recompute surface normal after displacement.
+ * displaced_normal — recompute the surface normal at `pos` after
+ * the displacement field f has deformed the surface, using central
+ * differences in the surface's tangent plane.
  *
- * Central difference:
- *   Sample displacement at pos ± eps*T and pos ± eps*B.
- *   The delta d_t and d_b give how much the surface rises/falls
- *   as we move along each tangent direction.
+ *   1. Build a tangent frame (T, B) at pos.
+ *   2. Sample f at four neighbours: pos ± εT and pos ± εB.
+ *   3. Reconstruct the displaced tangent vectors:
+ *        T′ = 2εT + N · (f(p+εT) − f(p−εT))
+ *        B′ = 2εB + N · (f(p+εB) − f(p−εB))
+ *   4. N′ = normalize(T′ × B′).
  *
- *   Reconstruct displaced tangent vectors:
- *     T' = T*(2*eps) + N*d_t   ← actual direction along surface in T
- *     B' = B*(2*eps) + N*d_b   ← actual direction along surface in B
- *
- *   New normal = normalize(cross(T', B'))
- *
- * This works for any displacement function — no need to derive an
- * analytic gradient.  The eps=CD_EPS (~3% of radius) is small enough
- * to be a good local approximation for all four displacement modes.
+ * Works for ANY scalar displacement function — no analytic gradient
+ * required. ε = CD_EPS (~3 % of radius) is the empirical sweet spot
+ * for all four modes here.
  */
 static Vec3 displaced_normal(Vec3 pos, Vec3 N,
-                              DispFn fn, float time,
-                              float amp, float freq)
+                             DispFn fn, float time,
+                             float amp, float freq)
 {
     Vec3 T, B;
     make_tangent_basis(N, &T, &B);
 
     float eps = CD_EPS;
 
-    /* sample displacement function at four nearby points */
-    float d_tp = fn(v3_add(pos, v3_scale(T,  eps)), time, amp, freq);
-    float d_tm = fn(v3_add(pos, v3_scale(T, -eps)), time, amp, freq);
-    float d_bp = fn(v3_add(pos, v3_scale(B,  eps)), time, amp, freq);
-    float d_bm = fn(v3_add(pos, v3_scale(B, -eps)), time, amp, freq);
+    /* Sample the displacement field at four tangent-plane neighbours. */
+    float f_Tp = fn(v3_add(pos, v3_scale(T,  eps)), time, amp, freq);
+    float f_Tm = fn(v3_add(pos, v3_scale(T, -eps)), time, amp, freq);
+    float f_Bp = fn(v3_add(pos, v3_scale(B,  eps)), time, amp, freq);
+    float f_Bm = fn(v3_add(pos, v3_scale(B, -eps)), time, amp, freq);
 
-    float d_t = d_tp - d_tm;   /* central difference along T */
-    float d_b = d_bp - d_bm;   /* central difference along B */
+    /* Central differences — how much the surface rises/falls along each. */
+    float df_T = f_Tp - f_Tm;
+    float df_B = f_Bp - f_Bm;
 
-    /* displaced tangent vectors */
-    Vec3 Td = v3_add(v3_scale(T, 2.f*eps), v3_scale(N, d_t));
-    Vec3 Bd = v3_add(v3_scale(B, 2.f*eps), v3_scale(N, d_b));
+    /* Reconstruct the deformed tangent vectors. */
+    Vec3 T_disp = v3_add(v3_scale(T, 2.f * eps), v3_scale(N, df_T));
+    Vec3 B_disp = v3_add(v3_scale(B, 2.f * eps), v3_scale(N, df_B));
 
-    return v3_norm(v3_cross(Td, Bd));
+    return v3_norm(v3_cross(T_disp, B_disp));
 }
 
-/* ===================================================================== */
-/* §4  shaders                                                            */
-/* ===================================================================== */
+/* ── §4 shaders — VS/FS types, uniforms, vertex pass, four frag passes ─ */
 
 typedef struct { Vec3 pos; Vec3 normal; float u,v; } VSIn;
 
@@ -627,55 +638,44 @@ typedef struct {
 /* ── vertex shaders ──────────────────────────────────────────────── */
 
 /*
- * vert_displace — the core of this demo.
+ * vert_displace — the heart of the demo. Reads like its formula:
  *
- * Steps:
- *   1. Get sphere normal (normalised position for unit sphere).
- *   2. Compute displacement scalar d = disp_fn(pos, time, amp, freq).
- *   3. Move position along normal: displaced_pos = pos + N*d
- *   4. Recompute surface normal at displaced position via central diff.
- *   5. Transform to clip space using the displaced position.
- *   6. Transform new normal to world space for lighting.
+ *   N    = normalize(pos)                         // sphere normal
+ *   d    = disp_fn(pos, time, amp, freq)          // scalar offset
+ *   p′   = pos + N · d                            // displaced pos
+ *   N′   = displaced_normal(pos, N, ...)          // central diff
+ *   clip = MVP · (p′, 1)                          // for raster
+ *   wpos = model    · p′                          // for FS lighting
+ *   wnrm = norm_mat · N′                          // for FS lighting
  *
- * The fragment shaders receive world_pos and world_nrm from the
- * displaced surface — they do not know or care about the original sphere.
- * All four fragment shaders (phong, toon, normals, wire) work unchanged.
+ * The fragment shaders never learn the displacement happened —
+ * they only see whatever world_pos / world_nrm arrived. That's why
+ * all four FSes (phong / toon / normals / wire) work unchanged.
  */
 static void vert_displace(const VSIn *in, VSOut *out, const void *u_)
 {
-    const DisplaceUniforms *du = (const DisplaceUniforms*)u_;
+    const DisplaceUniforms *du = (const DisplaceUniforms *)u_;
     const Uniforms         *u  = &du->base;
 
-    /* sphere normal == normalised position for unit sphere */
-    Vec3 N   = v3_norm(in->pos);
-
-    /* scalar displacement along normal */
-    float d  = du->disp_fn(in->pos, du->time, du->amplitude, du->frequency);
-
-    /* displaced model-space position */
-    Vec3 dpos = v3_add(in->pos, v3_scale(N, d));
-
-    /* recompute normal for the deformed surface */
-    Vec3 dnrm = displaced_normal(in->pos, N,
+    Vec3  N    = v3_norm(in->pos);                     /* sphere normal     */
+    float d    = du->disp_fn(in->pos, du->time,
+                             du->amplitude, du->frequency);
+    Vec3  dpos = v3_add(in->pos, v3_scale(N, d));      /* displaced pos     */
+    Vec3  dnrm = displaced_normal(in->pos, N,
                                   du->disp_fn, du->time,
                                   du->amplitude, du->frequency);
 
-    /* clip space from displaced position */
-    out->clip_pos  = m4_mul_v4(u->mvp, v4(dpos.x,dpos.y,dpos.z,1.f));
-
-    /* world space for fragment lighting */
-    out->world_pos = m4_pt (u->model,    dpos);
-    out->world_nrm = v3_norm(m4_dir(u->norm_mat, dnrm));
+    out->clip_pos  = m4_mul_v4(u->mvp, v4(dpos.x, dpos.y, dpos.z, 1.f));
+    out->world_pos = m4_pt   (u->model, dpos);
+    out->world_nrm = v3_norm (m4_dir(u->norm_mat, dnrm));
 
     out->u = in->u;
     out->v = in->v;
-    out->custom[0]=out->custom[1]=out->custom[2]=out->custom[3]=0.f;
+    out->custom[0] = out->custom[1] = out->custom[2] = out->custom[3] = 0.f;
 }
 
-/*
- * vert_displace_normals — same as vert_displace but additionally
- * packs world normal into custom[0..2] for frag_normals.
- */
+/* Variant that also packs the world normal into custom[0..2] so
+ * frag_normals can read it directly without barycentric loss. */
 static void vert_displace_normals(const VSIn *in, VSOut *out, const void *u_)
 {
     vert_displace(in, out, u_);
@@ -684,14 +684,11 @@ static void vert_displace_normals(const VSIn *in, VSOut *out, const void *u_)
     out->custom[2] = out->world_nrm.z;
 }
 
-/*
- * vert_displace_wire — same as vert_displace but leaves custom[0..2]
- * free for the pipeline to inject barycentric coords (wireframe).
- */
+/* Variant that leaves custom[0..2] free; the pipeline writes
+ * barycentric coordinates there for wireframe edge detection. */
 static void vert_displace_wire(const VSIn *in, VSOut *out, const void *u_)
 {
     vert_displace(in, out, u_);
-    /* custom[] will be overwritten by pipeline for wireframe */
 }
 
 /* ── fragment shaders ────────────────────────────────────────────── */
@@ -778,9 +775,7 @@ static void frag_wire(const FSIn *in, FSOut *out, const void *u_)
 typedef enum { SH_PHONG=0, SH_TOON, SH_NORMALS, SH_WIRE, SH_COUNT } ShaderIdx;
 static const char *k_shader_names[]={"phong","toon","normals","wire"};
 
-/* ===================================================================== */
-/* §5  mesh — UV sphere                                                   */
-/* ===================================================================== */
+/* ── §5 mesh — UV sphere tessellation ────────────────────────────────── */
 
 typedef struct { Vec3 pos; Vec3 normal; float u,v; } Vertex;
 typedef struct { int v[3]; } Triangle;
@@ -827,9 +822,7 @@ static Mesh tessellate_sphere(void)
     return m;
 }
 
-/* ===================================================================== */
-/* §6  framebuffer                                                        */
-/* ===================================================================== */
+/* ── §6 framebuffer — zbuf + cbuf + Bourke ramp + dither + blit ──────── */
 
 typedef struct { char ch; int color_pair; bool bold; } Cell;
 typedef struct { float *zbuf; Cell *cbuf; int cols,rows; } Framebuffer;
@@ -884,9 +877,7 @@ static void fb_blit(const Framebuffer *fb){
     }
 }
 
-/* ===================================================================== */
-/* §7  pipeline                                                           */
-/* ===================================================================== */
+/* ── §7 pipeline — vertex transform → cull → barycentric raster → FS ── */
 
 static void barycentric(const float sx[3],const float sy[3],
                         float px,float py,float b[3]){
@@ -984,9 +975,7 @@ static void pipeline_draw_mesh(Framebuffer   *fb,
     }
 }
 
-/* ===================================================================== */
-/* §8  scene                                                              */
-/* ===================================================================== */
+/* ── §8 scene — uniforms wiring, tick, draw, mode/shader swap ────────── */
 
 /*
  * Per-mode amplitude and frequency tuning.
@@ -1156,9 +1145,7 @@ static void scene_next_disp(Scene *s){
     scene_build_shader(s);
 }
 
-/* ===================================================================== */
-/* §9  screen                                                             */
-/* ===================================================================== */
+/* ── §9 screen — ncurses init / resize / HUD / present ───────────────── */
 
 typedef struct { int cols,rows; } Screen;
 
@@ -1171,30 +1158,40 @@ static void screen_init(Screen *s){
 static void screen_free(Screen *s){ (void)s; endwin(); }
 static void screen_resize(Screen *s){ endwin(); refresh(); getmaxyx(stdscr,s->rows,s->cols); }
 
-static void screen_draw_hud(const Screen *s,const Scene *sc,double fps)
+/* HUD layout (CLAUDE.md spec):
+ *   row 0          PAIR_HUD (yellow + bold)  — title left, status right
+ *   row rows-1     PAIR_HINT (cyan + bold)   — key hint                       */
+#define PAIR_HUD   3        /* yellow — see color_init() palette        */
+#define PAIR_HINT  5        /* cyan                                     */
+
+static void screen_draw_hud(const Screen *s, const Scene *sc, double fps)
 {
-    char buf[HUD_COLS+1];
-    snprintf(buf,sizeof buf," %5.1f fps  [%s][%s]  z:%.1f  c:%s%s ",
+    /* Right-aligned status. */
+    char status[HUD_COLS + 1];
+    snprintf(status, sizeof status,
+             " %5.1f fps  disp:%s  shader:%s  zoom:%.1f  cull:%s%s ",
              fps,
              k_disp_names[sc->disp_idx],
              k_shader_names[sc->shade_idx],
              sc->cam_dist,
-             sc->cull_backface?"on ":"off",
-             sc->paused?" PAUSED":"");
-    int hx=s->cols-HUD_COLS; if(hx<0)hx=0;
-    attron(COLOR_PAIR(3)|A_BOLD);
-    mvprintw(0,hx,"%s",buf);
-    attroff(COLOR_PAIR(3)|A_BOLD);
-    attron(COLOR_PAIR(5));
-    mvprintw(s->rows-1,0,"d=disp  s=shader  c=cull  +/-=zoom  space=pause  q=quit");
-    attroff(COLOR_PAIR(5));
+             sc->cull_backface ? "on "  : "off",
+             sc->paused        ? " PAUSED" : "");
+    int slen = (int)strlen(status); if (slen > s->cols) slen = s->cols;
+
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, s->cols - slen, "%s", status);
+    mvprintw(0, 0, " DISPLACE · UV SPHERE ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  spc:pause  d:disp  s:shader  c:cull  +/-:zoom ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void){ wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §10  app                                                               */
-/* ===================================================================== */
+/* ── §10 app — main loop, signals, resize, cleanup ───────────────────── */
 
 typedef struct {
     Scene                 scene;
@@ -1251,7 +1248,6 @@ static void clock_sleep_ns(int64_t ns){
 
 int main(void)
 {
-    srand((unsigned int)clock_ns());
     atexit(cleanup);
     signal(SIGINT,  on_exit);
     signal(SIGTERM, on_exit);

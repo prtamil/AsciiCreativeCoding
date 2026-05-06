@@ -1,35 +1,43 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * torus_raster.c  —  ncurses software rasterizer, torus demo
+ * torus_raster.c — software rasteriser of a smooth-shaded torus
  *
- * One primitive: torus (tessellated mesh, rendered every frame).
- * Four shaders cycled with  s : phong / toon / normals / wireframe
+ * DEMO: A cyan-blue donut spins under a single point light, with four
+ *       classic real-time shaders cycled by 's':
  *
- * Pipeline:
- *   tessellate_torus()    once at init
- *       ↓
- *   scene_tick()          rotate model matrix each frame
- *       ↓
- *   pipeline_draw()       for every triangle:
- *       vert shader        VSIn → VSOut          (C function pointer)
- *       clip / NDC / screen
- *       back-face cull
- *       rasterize          barycentric coverage
- *       z-test             float zbuf
- *       frag shader        FSIn → FSOut          (C function pointer)
- *       luma → dither → Paul Bourke char → cbuf
- *       ↓
- *   fb_blit()             cbuf → stdscr → doupdate
+ *         phong      Blinn-Phong with a sharp specular highlight
+ *                    that glides along the rim as the torus rotates.
+ *         toon       4-band quantised diffuse + hard specular —
+ *                    concentric shade bands wrap the tube.
+ *         normals    World normal RGB visualisation. Hue rotates
+ *                    twice as you sweep around the torus: once
+ *                    around the ring and once around the tube.
+ *         wireframe  Barycentric edge detection. The UV grid shows
+ *                    TESS_U meridians × TESS_V tube cross-sections,
+ *                    and through the donut hole you can see the
+ *                    far-side wireframe — proof that z-buffer +
+ *                    back-face cull are working together.
  *
- * Shader interface — pure C, no GLSL, no parsing:
- *   VSIn / VSOut / FSIn / FSOut  plain structs
- *   VertexShaderFn / FragmentShaderFn  function pointers
- *   uniforms  void* to any C struct, cast inside shader
+ *       The torus is special among the simple primitives because its
+ *       outward normal has a clean closed-form: at any surface point
+ *       p, n = normalise(p − ring_centre(θ)). No partial derivatives
+ *       needed, no pole singularity to handle.
  *
- * Wireframe shader — barycentric edge detection:
- *   vert_wire packs per-vertex barycentric coord (1,0,0)/(0,1,0)/(0,0,1)
- *   into custom[0..2].  After interpolation, min(custom[]) = distance
- *   to nearest edge.  frag_wire discards interior fragments.
+ * Study alongside:
+ *   raster/sphere_raster.c   — same shader scaffolding, different mesh
+ *   raster/cube_raster.c     — same pipeline + 6 face-flat normals
+ *   raster/displace_raster.c — same VS/FS scheme + vertex displacement
+ *
+ * Section map:
+ *   §1  config       — frame, view, torus, tessellation, ramp, dither
+ *   §2  math         — V3 / V4 / Mat4 helpers
+ *   §3  shaders      — VS / FS types + uniforms + 1 base VS + 4 FS
+ *   §4  mesh         — Vertex / Triangle / Mesh + tessellate_torus
+ *   §5  framebuffer  — zbuf + cbuf + Bourke ramp + Bayer dither + blit
+ *   §6  pipeline     — vertex transform → cull → barycentric raster → FS
+ *   §7  scene        — Scene struct, uniforms wiring, tick, draw, swap
+ *   §8  screen       — ncurses init / resize / HUD / present
+ *   §9  app          — main loop, signals, resize, cleanup
  *
  * Keys:
  *   s / S     cycle shader  (phong → toon → normals → wireframe)
@@ -37,152 +45,194 @@
  *   q / ESC   quit
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra torus_raster.c -o torus -lncurses -lm
- *
- * Sections
- * --------
- *   §1  config
- *   §2  math         Vec3 Vec4 Mat4
- *   §3  shaders      structs + 4 vert/frag pairs
- *   §4  mesh         Vertex Triangle Mesh + tessellate_torus
- *   §5  framebuffer  zbuf cbuf dither paulbourke blit
- *   §6  pipeline     vertex transform · rasterize · draw
- *   §7  scene        uniforms · tick · draw · shader swap
- *   §8  screen       ncurses init/resize/hud/present
- *   §9  app          dt loop · input · resize · cleanup
+ *   gcc -std=c11 -O2 -Wall -Wextra raster/torus_raster.c -o torus \
+ *       -lncurses -lm
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Software rasterization pipeline (GPU-pipeline emulation in C).
- *                  The full pipeline runs every frame:
- *                  1. Tessellate mesh into triangles (done once at init).
- *                  2. Vertex shader: transform each vertex from object→world→clip space.
- *                  3. Perspective divide: clip → NDC → screen coordinates.
- *                  4. Back-face culling: discard triangles facing away from camera.
- *                  5. Rasterization: iterate over bounding box, test barycentric coords.
- *                  6. Z-test: per-fragment depth comparison against float z-buffer.
- *                  7. Fragment shader: Phong/toon/normal/wireframe shading.
+ * Algorithm      : Standard forward rasterisation. Tessellate the
+ *                  torus once into a static triangle mesh with
+ *                  closed-form smooth normals, then per frame:
+ *                  vertex shader (MVP transform) → near-clip reject
+ *                  → perspective divide → back-face cull → bounding-
+ *                  box raster with barycentric weights → z-test →
+ *                  fragment shader → luma → Bayer dither → Bourke
+ *                  ramp glyph + colour pair.
  *
- * Math           : Barycentric coordinates (λ₀, λ₁, λ₂) for point p in triangle:
- *                    Area test: λᵢ = signed_area(edge_i) / total_area
- *                  All λ ∈ [0,1] and sum to 1 iff inside the triangle.
- *                  Used to interpolate normals and attributes across the face.
- *                  Perspective-correct interpolation: interpolate z⁻¹, then divide.
+ *                  Torus parameterisation:
+ *                    pos = ((R + r·cos φ)·cos θ,  r·sin φ,
+ *                           (R + r·cos φ)·sin θ)
+ *                    nrm = normalise(pos − ring_centre(θ))
+ *                  with ring_centre(θ) = (R·cos θ, 0, R·sin θ).
  *
- * Performance    : Z-buffer resolves occlusion without sorting triangles.
- *                  Back-face culling halves the triangle count for closed meshes.
- *                  Function pointers (vert_shader, frag_shader) allow swapping
- *                  shaders without changing the pipeline structure.
+ *                  The "subtract the ring centre" trick gives smooth
+ *                  outward normals trivially — no derivatives needed.
+ *
+ * Data-structure : One Mesh = flat arrays of vertices and triangles,
+ *                  sized at compile time:
+ *                    verts = (TESS_U+1) × (TESS_V+1)  = 33 · 25 = 825
+ *                    tris  = TESS_U × TESS_V × 2      = 1536
+ *                  Plus a Framebuffer (zbuf + cbuf) re-allocated on
+ *                  each terminal resize.
+ *
+ *                  ShaderProgram bundles {vert, frag, vert_uni,
+ *                  frag_uni}: function pointers + opaque uniform
+ *                  buffers. Swapping shaders is just rewiring this
+ *                  struct in scene_build_shader.
+ *
+ * Rendering      : Standard forward pipeline matching cube_raster.c
+ *                  and sphere_raster.c. Wireframe is the one shader
+ *                  that interacts with the pipeline specially: the
+ *                  pipeline injects per-vertex barycentric unit
+ *                  vectors (1,0,0)/(0,1,0)/(0,0,1) into VSOut.custom[]
+ *                  AFTER the vertex shader runs, then frag_wire reads
+ *                  the interpolated bary coords from custom[] to
+ *                  detect edges by min(b0,b1,b2) < threshold.
+ *
+ * Performance    : Tessellation is one-shot at init. Per-frame cost
+ *                  is O(N_tris × pixels_per_tri). Smooth ring-centre
+ *                  normals let TESS_U × TESS_V stay modest (32 × 24
+ *                  = 1536 tris) with the surface still looking
+ *                  perfectly round; coarse tessellation is hidden by
+ *                  the smooth interpolation.
+ *
+ * References     : Phong, "Illumination for Computer Generated
+ *                    Pictures," CACM '75.
+ *                  Blinn, "Models of Light Reflection for Computer
+ *                    Synthesised Pictures," SIGGRAPH '77.
+ *                  Möller, "Fast Triangle Rasterization by
+ *                    Interpolating Edge Functions," GPG (2000) —
+ *                    the signed-area barycentric formulation used in
+ *                    §6.
+ *                  Andy Sloane, "donut.c" (1986) — the classic ASCII
+ *                    spinning torus that inspired this whole genre.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
  *
  * CORE IDEA
  * ─────────
- * A torus is a CIRCLE-OF-CIRCLES.  Sweep a tube of radius r around a
- * ring of radius R; mesh both directions with TESS_U×TESS_V steps and
- * you have a closed quad grid that wraps both ways.  Each vertex's
- * outward normal is just the vector from the ring centre to the
- * surface point — no derivatives needed.  The rasterizer then runs the
- * same GPU-style pipeline as sphere_raster: vertex shader → clip → NDC
- → screen → bary → z-test → fragment shader → luma → Bayer dither →
- * Bourke glyph.  Four shaders prove the pipeline is mesh-agnostic.
+ * A torus is a CIRCLE OF CIRCLES. Sweep a tube of radius r around a
+ * ring of radius R; mesh both directions with TESS_U × TESS_V steps
+ * and you have a closed quad grid that wraps both ways. The outward
+ * normal at any vertex is just the direction from the ring centre to
+ * the surface point — a clean closed form, no derivatives. From there
+ * the rasteriser is the same as sphere_raster.c: vertex shader → clip
+ * → screen → barycentric raster → z-test → fragment shader → luma →
+ * Bayer dither → Bourke glyph.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
- * Imagine bending a bicycle inner tube into a perfect O.  Now drive a
- * grid of latitude/longitude lines into its surface — TESS_U around
- * the big O (like longitudes) and TESS_V around the tube cross-section
- * (like latitudes).  Each grid intersection is a vertex.  Group every
- * 2×2 cell into two triangles and you have a closed mesh.  At any
- * point on the surface, the "normal" is just the direction from the
- * nearest piece of the bike rim outward — that's the ring-centre
- * formula.  Spinning the tube and watching its highlight glide is the
- * Phong shader; banding the diffuse term gives toon; mapping normals
- * to RGB gives the rainbow swirl; killing interior fragments gives
- * wireframe.
+ * Bend a bicycle inner tube into a perfect O. Drive a lat/long grid
+ * into its surface — TESS_U around the big O (longitudes) and TESS_V
+ * around the tube cross-section (latitudes). Group every 2×2 cell
+ * into two triangles. At any surface point, the outward normal is
+ * the direction from the *nearest piece of the bike rim* outward.
  *
- * ALGORITHM IN STEPS  (one frame)
- * ──────────────────
- *  1. scene_tick: angle_y += ROT_Y·dt; angle_x += ROT_X·dt.
- *     model = Ry · Rx.  mvp = proj · view · model.  norm_mat =
- *     cofactor of model upper-left 3×3.
- *  2. fb_clear: zbuf := FLT_MAX, cbuf := zero.
- *  3. pipeline_draw_mesh, per triangle (1536 of them):
- *      a. For wireframe, pre-write custom[0..2] = (1,0,0)/(0,1,0)/
- *         (0,0,1) into VSIn before each vertex shader call.
- *      b. Vertex shader: clip_pos = mvp·pos; world_pos = model·pos;
- *         world_nrm = normalise(norm_mat·normal).
- *      c. Reject if all 3 w<0.001 (behind near plane).
- *      d. Perspective divide → screen.  Reject if signed area ≤ 0
- *         (back-face).
- *      e. Walk integer bbox; per cell compute barycentric (b0,b1,b2);
- *         skip if any negative; z-test against zbuf.
- *      f. Build FSIn by interpolating world_pos, world_nrm, u, v,
- *         custom; run frag shader → FSOut.color.
- *      g. luma = Rec.709(R,G,B); dither + Bourke glyph + 1-of-7 colour
- *         pair; write to cbuf with bold flag.
- *  4. fb_blit: walk cbuf; mvaddch every non-empty cell.
+ *      ┌──────────────────────────────────────────────┐
+ *      │        ring (major radius R)                 │
+ *      │            ___                               │
+ *      │           ╱   ╲                              │
+ *      │          (  ●  )←ring_centre(θ)              │
+ *      │           ╲___╱                              │
+ *      │              ↘ pos − ring_centre = normal    │
+ *      │              tube cross-section, radius r    │
+ *      └──────────────────────────────────────────────┘
+ *
+ * DRAWING METHOD  /  ALGORITHM IN STEPS
+ * ─────────────────────────────────────
+ *  1. scene_tick — angle_x, angle_y += ROT · dt; build
+ *     model    = Ry · Rx
+ *     mvp      = proj · view · model
+ *     norm_mat = cofactor(model 3×3)
+ *
+ *  2. fb_clear — zbuf := FLT_MAX, cbuf := zero.
+ *
+ *  3. pipeline_draw_mesh — for each of 1536 triangles:
+ *        a. Run the vertex shader on each of the 3 vertices.
+ *           For wireframe, the pipeline injects per-vertex
+ *           barycentric unit vectors into VSOut.custom[] AFTER
+ *           the VS runs (see §6).
+ *        b. Reject if all 3 clip.w < 0.001 (behind near plane).
+ *        c. Perspective divide:
+ *             sx = ( ndc.x + 1)/2 · cols
+ *             sy = (−ndc.y + 1)/2 · rows         (Y-flip)
+ *             sz = ndc.z
+ *        d. Back-face cull when signed screen area ≤ 0 (CCW front).
+ *        e. Walk the bbox; per cell compute barycentric weights;
+ *           skip if any negative; z-test against zbuf.
+ *        f. Interpolate FSIn fields from VSOut, run the fragment
+ *           shader → Vec3 colour.
+ *        g. luma = 0.2126·R + 0.7152·G + 0.0722·B (Rec. 709).
+ *        h. luma_to_cell: Bayer dither → Bourke glyph + colour pair.
+ *
+ *  4. fb_blit — walk cbuf, mvaddch each non-empty cell.
  *
  * KEY FORMULAS
  * ────────────
- *  Torus parameterisation:
- *      x = (R + r·cos φ)·cos θ
- *      y =  r·sin φ
- *      z = (R + r·cos φ)·sin θ
- *      θ ∈ [0,2π) sweeps the major ring,
- *      φ ∈ [0,2π) sweeps the tube cross-section
- *  Outward normal :  n = normalise(pos − ring_centre(θ))
- *                    where ring_centre(θ) = (R·cos θ, 0, R·sin θ)
- *  Vertex count   :  V = (TESS_U+1)·(TESS_V+1) = 33·25 = 825
- *  Triangle count :  T = TESS_U·TESS_V·2 = 32·24·2 = 1536
- *  Major / minor  :  R = 0.65, r = 0.28 — donut visibly has a hole
- *                    at this ratio (R/r ≈ 2.3)
- *  Phong          :  diff = max(0, N·L)
- *                    spec = max(0, N·H)^shininess
- *                    out = ambient + obj·light·diff + spec·0.5
- *  Toon banding   :  banded = ⌊diff·bands⌋ / bands  (4 bands)
- *  Wireframe      :  edge = min(b0,b1,b2);  discard if > WIRE_THRESH
- *  Luma           :  Y = 0.2126R + 0.7152G + 0.0722B
- *  Dither glyph   :  d = clamp(Y + (bayer−0.5)·0.15, 0, 1);
- *                    glyph = k_bourke[(int)(d·91)]
+ *   Torus parameterisation
+ *     pos = ( (R + r·cos φ) · cos θ,
+ *              r·sin φ,
+ *             (R + r·cos φ) · sin θ )
+ *     θ ∈ [0, 2π)  ring sweep
+ *     φ ∈ [0, 2π)  tube sweep
+ *   Outward normal     n = normalise(pos − ring_centre(θ))
+ *                      ring_centre(θ) = (R·cos θ, 0, R·sin θ)
+ *   Mesh sizes         V = (TESS_U+1) · (TESS_V+1)   = 825
+ *                      T = TESS_U · TESS_V · 2       = 1536
+ *   Major / minor      R = 0.65, r = 0.28 → R/r ≈ 2.3 (clean hole)
+ *   Phong              diff = max(0, N · L)
+ *                      spec = max(0, N · H)^shininess
+ *                      out  = ambient + obj·light·diff + 0.5·spec
+ *   Toon               banded = ⌊diff · bands⌋ / bands       (bands = 4)
+ *   Wireframe          edge = min(b0, b1, b2);  discard if > WIRE_THRESH
+ *   Luma → glyph       d = clamp01(luma + (bayer − 0.5) · 0.15)
+ *                      glyph = k_bourke[(int)(d · (BOURKE_LEN−1))]
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *  • If R < r the torus self-intersects and becomes a "spindle torus"
- *    — the inner ring vertices wrap through the centre.  Defaults
- *    keep R > r so the donut has a clean hole.
- *  • Backface culling is essential: without it, the tube's inner
- *    surface would draw on top of the outer, producing a confusing
- *    double-image; the area>0 test resolves it.
- *  • The ring-centre normal trick gives smooth normals trivially —
- *    DO NOT compute via finite differences on the position formula,
- *    that produces visible banding at low TESS values.
- *  • Wireframe requires custom[0..2] to be set BEFORE the vertex
- *    shader runs (per-vertex unit vector).  vert_wire reads those,
- *    bary interpolation reconstructs the gradient, frag_wire detects
- *    edges by min < threshold.
- *  • Z-buffer stores z/w post-divide; nonlinear but monotonic, fine
- *    for ordering at this scale.
- *  • Aspect: terminal cells are y-tall, so an aspect = (cols·CELL_W)/
- *    (rows·CELL_H) is fed into m4_perspective.  Without it the donut
- *    appears as an oval.
+ *   • R < r is a SPINDLE torus — the inner ring wraps through the
+ *     centre and the donut hole disappears. Defaults keep R > r.
+ *
+ *   • Back-face culling is essential. Without it the tube's far-side
+ *     surface paints over the near-side and produces a confusing
+ *     double image. The signed-area > 0 test resolves it.
+ *
+ *   • The ring-centre normal trick is what makes smooth shading work
+ *     at low TESS. Don't try to compute normals by finite-differencing
+ *     the position formula — the bias produces visible banding.
+ *
+ *   • Wireframe needs the per-vertex barycentric-unit vectors written
+ *     by the pipeline AFTER the vertex shader runs (see §6). The vert
+ *     shader leaves custom[] alone; the pipeline overwrites it.
+ *
+ *   • Cell aspect: aspect = (cols·CELL_W)/(rows·CELL_H) — without
+ *     this, terminal cells being taller than wide make the donut
+ *     render as a vertical oval.
  *
  * HOW TO VERIFY
  * ─────────────
- *  • Pause (space) on Phong: a single specular highlight rests on the
- *    upper outside of the donut where N·H is maximised.  As you cycle
- *    rotation, the highlight glides along the rim.
- *  • Toon (s): exactly 4 distinct shade bands form circular contours
- *    around the tube.  Count them on the lit side.
- *  • Normals: all six axes appear.  +Y green at top/bottom of the tube,
- *    +X red on the +x side, +Z blue facing camera, etc.
- *  • Wireframe: count rings — TESS_U=32 longitudinal lines, TESS_V=24
- *    latitudinal lines.  Through the donut hole, opposite-side
- *    wireframe is visible, confirming back-face cull and z-buffer
- *    correctly hide tube-far over tube-near.
- *  • Rotation periods: ROT_Y=0.7 → 2π/0.7 ≈ 9 s per spin.
+ *   • Pause on phong: a single specular highlight rests on the upper
+ *     outside of the donut where N·H is maximised. As rotation
+ *     resumes the highlight glides along the rim.
+ *
+ *   • toon: count exactly 4 distinct shade bands forming circular
+ *     contours around the tube. Banding follows the lit side.
+ *
+ *   • normals: all six axes appear simultaneously. +Y green at top
+ *     and bottom of the tube, +X red on the +x side, +Z blue facing
+ *     the camera. Hue rotates twice — once around the ring, once
+ *     around the tube.
+ *
+ *   • wireframe: count TESS_U meridians + TESS_V tube parallels.
+ *     Through the donut hole you can see the FAR side wireframe,
+ *     confirming back-face cull + z-buffer hide tube-far behind
+ *     tube-near where they overlap on the silhouette.
+ *
+ *   • Rotation period: ROT_Y = 0.70 rad/s → 2π/0.70 ≈ 9 s per spin.
+ *     Time it on a stopwatch.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -199,9 +249,7 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ───────────────────────────────────────────────────────── */
 
 enum {
     FPS_TARGET    = 60,
@@ -267,9 +315,7 @@ static const float k_bayer[4][4] = {
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 
-/* ===================================================================== */
-/* §2  math                                                               */
-/* ===================================================================== */
+/* ── §2 math (V3, V4, Mat4) ──────────────────────────────────────────── */
 
 typedef struct { float x, y, z;    } Vec3;
 typedef struct { float x, y, z, w; } Vec4;
@@ -406,9 +452,7 @@ static Mat4 m4_normal_mat(Mat4 m){
     return n;
 }
 
-/* ===================================================================== */
-/* §3  shaders                                                            */
-/* ===================================================================== */
+/* ── §3 shaders — VS/FS types + uniforms + 1 base VS + 4 FS ──────────── */
 
 /*
  * Shader data flow:
@@ -491,73 +535,54 @@ typedef struct {
     int      bands;
 } ToonUniforms;
 
-/* ── §3a  vertex shaders ─────────────────────────────────────────── */
-
-/*
- * vert_default — standard MVP transform.
- * Outputs world-space position + normal for fragment lighting.
- * Used by phong and toon.
+/* ── §3a  vertex shaders ─────────────────────────────────────────── *
+ *
+ * All three vertex shaders share the same MVP transform; they only
+ * differ in what they pack into out->custom[]. vert_base does the
+ * common work and the others wrap it. (vert_wire leaves custom[]
+ * alone — the pipeline overwrites it with barycentric unit vectors
+ * AFTER this runs; see §6.)
  */
+
+/* Common transform: MVP for the rasteriser, world pos + world normal
+ * for the fragment stage. Reads like its formula:
+ *   clip = MVP · (pos, 1)
+ *   wpos = model    · pos
+ *   wnrm = norm_mat · nrm,   then normalised
+ */
+static void vert_base(const VSIn *in, VSOut *out, const Uniforms *u)
+{
+    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x, in->pos.y, in->pos.z, 1.f));
+    out->world_pos = m4_pt   (u->model, in->pos);
+    out->world_nrm = v3_norm (m4_dir(u->norm_mat, in->normal));
+    out->u = in->u;
+    out->v = in->v;
+    out->custom[0] = out->custom[1] = out->custom[2] = out->custom[3] = 0.f;
+}
+
 static void vert_default(const VSIn *in, VSOut *out, const void *u_)
 {
-    const Uniforms *u = (const Uniforms *)u_;
-    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x,in->pos.y,in->pos.z,1.f));
-    out->world_pos = m4_pt (u->model,    in->pos);
-    out->world_nrm = v3_norm(m4_dir(u->norm_mat, in->normal));
-    out->u=in->u; out->v=in->v;
-    /* custom unused */
-    out->custom[0]=out->custom[1]=out->custom[2]=out->custom[3]=0.f;
+    vert_base(in, out, (const Uniforms *)u_);
 }
 
-/*
- * vert_normals — same transform but also packs world normal into
- * custom[0..2] for the normals fragment shader to read after
- * interpolation.  frag_normals could use world_nrm directly, but
- * packing into custom demonstrates the general interpolation channel.
- */
+/* Same as default, but also packs world normal into custom[0..2]
+ * for frag_normals to read after interpolation. (frag_normals could
+ * read world_nrm directly — packing into custom[] demonstrates the
+ * general-purpose interpolation channel.) */
 static void vert_normals(const VSIn *in, VSOut *out, const void *u_)
 {
-    const Uniforms *u = (const Uniforms *)u_;
-    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x,in->pos.y,in->pos.z,1.f));
-    out->world_pos = m4_pt (u->model,    in->pos);
-    out->world_nrm = v3_norm(m4_dir(u->norm_mat, in->normal));
-    out->u=in->u; out->v=in->v;
-    out->custom[0]=out->world_nrm.x;
-    out->custom[1]=out->world_nrm.y;
-    out->custom[2]=out->world_nrm.z;
-    out->custom[3]=0.f;
+    vert_base(in, out, (const Uniforms *)u_);
+    out->custom[0] = out->world_nrm.x;
+    out->custom[1] = out->world_nrm.y;
+    out->custom[2] = out->world_nrm.z;
 }
 
-/*
- * vert_wire — packs one corner of the barycentric coordinate system
- * into custom[0..2] per vertex:
- *   vertex 0 → (1,0,0)
- *   vertex 1 → (0,1,0)
- *   vertex 2 → (0,0,1)
- *
- * The pipeline's barycentric interpolation then fills in the gradient
- * across the triangle.  At each interior fragment all three components
- * are > 0.  Near each edge one component approaches 0.
- *
- * The pipeline does not know which vertex index (0/1/2) a given VSOut
- * corresponds to — that information is lost after the vertex shader runs.
- * Instead we pre-assign the barycentric coord in the pipeline before
- * calling vert_wire: custom[0..2] in VSIn is set to the appropriate
- * unit vector by pipeline_draw_mesh before each vert call.
- * See §6 for the three-call pattern.
- */
+/* Same as default. The pipeline writes per-vertex barycentric unit
+ * vectors into custom[0..2] AFTER this runs (see §6) so that
+ * frag_wire can detect edges from the interpolated barycentrics. */
 static void vert_wire(const VSIn *in, VSOut *out, const void *u_)
 {
-    const Uniforms *u = (const Uniforms *)u_;
-    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x,in->pos.y,in->pos.z,1.f));
-    out->world_pos = m4_pt (u->model,    in->pos);
-    out->world_nrm = v3_norm(m4_dir(u->norm_mat, in->normal));
-    out->u=in->u; out->v=in->v;
-    /* custom[0..2] already set by pipeline before this call (see §6) */
-    out->custom[0]=in->u;   /* pipeline overwrites u/v with bary — see §6 */
-    out->custom[1]=in->v;
-    out->custom[2]=0.f;
-    out->custom[3]=0.f;
+    vert_base(in, out, (const Uniforms *)u_);
 }
 
 /* ── §3b  fragment shaders ───────────────────────────────────────── */
@@ -680,9 +705,7 @@ static void frag_wire(const FSIn *in, FSOut *out, const void *u_)
 typedef enum { SH_PHONG=0, SH_TOON, SH_NORMALS, SH_WIRE, SH_COUNT } ShaderIdx;
 static const char *k_shader_names[] = { "phong","toon","normals","wire" };
 
-/* ===================================================================== */
-/* §4  mesh                                                               */
-/* ===================================================================== */
+/* ── §4 mesh — Vertex / Triangle / Mesh + tessellate_torus ───────────── */
 
 typedef struct { Vec3 pos; Vec3 normal; float u,v; } Vertex;
 typedef struct { int v[3]; } Triangle;
@@ -697,28 +720,23 @@ typedef struct {
 static void mesh_free(Mesh *m){ free(m->verts); free(m->tris); *m=(Mesh){0}; }
 
 /*
- * tessellate_torus — UV grid over the torus surface.
+ * tessellate_torus — generate the (TESS_U+1) × (TESS_V+1) UV-grid mesh.
  *
- * Outer loop: angle theta around the ring (major circle, radius R).
- * Inner loop: angle phi around the tube (minor circle, radius r).
+ *   θ = (i / nu) · 2π                        // ring (longitude)
+ *   φ = (j / nv) · 2π                        // tube (latitude)
+ *   pos = ((R + r·cos φ) · cos θ,  r·sin φ,  (R + r·cos φ) · sin θ)
+ *   ring_centre(θ) = (R · cos θ, 0, R · sin θ)
+ *   nrm = normalise(pos − ring_centre)        // closed-form smooth normal
  *
- * Position:
- *   x = (R + r*cos(phi)) * cos(theta)
- *   y =  r * sin(phi)
- *   z = (R + r*cos(phi)) * sin(theta)
- *
- * Normal: direction from the ring centre point to the surface point.
- *   ring_centre(theta) = (R*cos(theta), 0, R*sin(theta))
- *   normal = normalise(position - ring_centre)
- *
- * This gives correct smooth normals for Phong shading without
- * needing to compute partial derivatives of the surface equation.
+ * Quad cells are stitched into two CCW triangles (r0, r2, r1) and
+ * (r1, r2, r3); the winding makes "outward = front" for the back-face
+ * cull.
  */
 static Mesh tessellate_torus(void)
 {
     int nu = TESS_U, nv = TESS_V;
-    int nvert = (nu+1)*(nv+1);
-    int ntri  = nu*nv*2;
+    int nvert = (nu + 1) * (nv + 1);
+    int ntri  =  nu      *  nv      * 2;
 
     Mesh m;
     m.verts = malloc((size_t)nvert * sizeof(Vertex));
@@ -726,42 +744,44 @@ static Mesh tessellate_torus(void)
     m.nvert = 0;
     m.ntri  = 0;
 
-    float R = TORUS_R, r = TORUS_r;
+    float R   = TORUS_R, r = TORUS_r;
     float PI2 = 2.f * 3.14159265f;
 
-    for(int i=0; i<=nu; i++){
+    /* Step 1 — emit (nu+1) × (nv+1) vertices on the parameterised torus. */
+    for (int i = 0; i <= nu; i++) {
         float u     = (float)i / (float)nu;
-        float theta = u * PI2;
-        float ct    = cosf(theta), st = sinf(theta);
+        float theta = u * PI2;                     /* ring angle */
+        float ct = cosf(theta), st = sinf(theta);
 
-        for(int j=0; j<=nv; j++){
+        for (int j = 0; j <= nv; j++) {
             float v   = (float)j / (float)nv;
-            float phi = v * PI2;
-            float cp  = cosf(phi), sp = sinf(phi);
+            float phi = v * PI2;                   /* tube angle */
+            float cp = cosf(phi), sp = sinf(phi);
 
-            Vec3 pos = v3((R + r*cp)*ct,  r*sp,  (R + r*cp)*st);
-            Vec3 rc  = v3(R*ct, 0.f, R*st);        /* ring centre */
-            Vec3 nrm = v3_norm(v3_sub(pos, rc));    /* outward tube normal */
+            Vec3 pos = v3((R + r*cp) * ct,  r * sp,  (R + r*cp) * st);
+            Vec3 rc  = v3(R * ct,           0.f,    R * st);       /* ring centre */
+            Vec3 nrm = v3_norm(v3_sub(pos, rc));                   /* outward */
 
             m.verts[m.nvert++] = (Vertex){ pos, nrm, u, v };
         }
     }
 
-    for(int i=0; i<nu; i++){
-        for(int j=0; j<nv; j++){
-            int r0 = i*(nv+1)+j,   r1 = r0+1;
-            int r2 = r0+(nv+1),    r3 = r2+1;
-            m.tris[m.ntri++] = (Triangle){{r0,r2,r1}};
-            m.tris[m.ntri++] = (Triangle){{r1,r2,r3}};
+    /* Step 2 — stitch each quad into two CCW triangles.
+     *   r0 = (i,   j)      r1 = (i,   j+1)
+     *   r2 = (i+1, j)      r3 = (i+1, j+1)                       */
+    for (int i = 0; i < nu; i++) {
+        for (int j = 0; j < nv; j++) {
+            int r0 = i * (nv + 1) + j,  r1 = r0 + 1;
+            int r2 = r0 + (nv + 1),     r3 = r2 + 1;
+            m.tris[m.ntri++] = (Triangle){{ r0, r2, r1 }};
+            m.tris[m.ntri++] = (Triangle){{ r1, r2, r3 }};
         }
     }
 
     return m;
 }
 
-/* ===================================================================== */
-/* §5  framebuffer                                                        */
-/* ===================================================================== */
+/* ── §5 framebuffer — zbuf + cbuf + Bourke ramp + dither + blit ──────── */
 
 typedef struct {
     char ch;
@@ -858,9 +878,7 @@ static void fb_blit(const Framebuffer *fb)
     }
 }
 
-/* ===================================================================== */
-/* §6  pipeline                                                           */
-/* ===================================================================== */
+/* ── §6 pipeline — vertex transform → cull → barycentric raster → FS ─── */
 
 /*
  * barycentric — compute barycentric coordinates (b[3]) for point
@@ -1032,9 +1050,7 @@ static void pipeline_draw_mesh(Framebuffer   *fb,
     }
 }
 
-/* ===================================================================== */
-/* §7  scene                                                              */
-/* ===================================================================== */
+/* ── §7 scene — Scene struct, uniforms wiring, tick, draw, swap ──────── */
 
 typedef struct {
     Mesh          mesh;
@@ -1126,9 +1142,7 @@ static void scene_next_shader(Scene *s)
     scene_build_shader(s);
 }
 
-/* ===================================================================== */
-/* §8  screen                                                             */
-/* ===================================================================== */
+/* ── §8 screen — ncurses init / resize / HUD / present ────────────────── */
 
 typedef struct { int cols, rows; } Screen;
 
@@ -1143,27 +1157,39 @@ static void screen_resize(Screen *s){
     endwin(); refresh(); getmaxyx(stdscr,s->rows,s->cols);
 }
 
+/* HUD layout (CLAUDE.md spec):
+ *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
+ *   row rows-1     PAIR_HINT (cyan + bold)   — key hint
+ *
+ * The 7-pair luma palette uses pair 3 (yellow) and pair 5 (cyan) at
+ * the right brightness for HUD text — alias them here so the HUD code
+ * reads "yellow / cyan" instead of "magic 3 / 5". */
+#define PAIR_HUD   3       /* yellow */
+#define PAIR_HINT  5       /* cyan   */
+
 static void screen_draw_hud(const Screen *s, const Scene *sc, double fps)
 {
-    char buf[HUD_COLS+1];
-    snprintf(buf,sizeof buf," %5.1f fps  shader:[%s]%s ",
+    char status[HUD_COLS + 1];
+    snprintf(status, sizeof status,
+             " %5.1f fps  shader:%s%s ",
              fps, k_shader_names[sc->shade_idx],
-             sc->paused?" PAUSED":"       ");
-    int hx=s->cols-HUD_COLS; if(hx<0)hx=0;
-    attron(COLOR_PAIR(3)|A_BOLD);
-    mvprintw(0,hx,"%s",buf);
-    attroff(COLOR_PAIR(3)|A_BOLD);
+             sc->paused ? " PAUSED" : "");
+    int slen = (int)strlen(status); if (slen > s->cols) slen = s->cols;
 
-    attron(COLOR_PAIR(5));
-    mvprintw(s->rows-1,0,"s=shader  space=pause  q=quit");
-    attroff(COLOR_PAIR(5));
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, s->cols - slen, "%s", status);
+    mvprintw(0, 0, " TORUS · RASTER ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  spc:pause  s:shader ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void){ wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §9  app                                                                */
-/* ===================================================================== */
+/* ── §9 app — main loop, signals, resize, cleanup ─────────────────────── */
 
 typedef struct {
     Scene                 scene;
@@ -1209,7 +1235,6 @@ static void clock_sleep_ns(int64_t ns){
 
 int main(void)
 {
-    srand((unsigned int)clock_ns());
     atexit(cleanup);
     signal(SIGINT,  on_exit);
     signal(SIGTERM, on_exit);

@@ -858,16 +858,32 @@ Follow this checklist to add a new file to the project:
 
 ## 12. Software Rasterizer — raster/*.c
 
-The `raster/` folder contains four self-contained software rasterizers that render 3-D geometry into the ncurses terminal using ASCII characters. They share an identical pipeline; only the mesh and (for `displace_raster.c`) the shader set differ.
+The `raster/` folder contains eleven self-contained software rasterizers that render 3-D geometry into the ncurses terminal using ASCII characters. They share an identical pipeline core; the differences are in **what mesh** they render, **what passes** they run, and **what techniques** they layer on top.
 
-Files:
+### Shader-gallery primitives (canonical pipeline)
+
+These four files share the textbook forward rasteriser pipeline (§12 below) and exist to demonstrate the shader scaffolding on different primitives:
 
 | File | Primitive | Notes |
 |---|---|---|
 | `torus_raster.c`    | UV torus  | 4 shaders, always-on back-face cull |
 | `cube_raster.c`     | Unit cube | 4 shaders, toggleable cull, zoom |
 | `sphere_raster.c`   | UV sphere | 4 shaders, toggleable cull, zoom |
-| `displace_raster.c` | UV sphere | 4 displacement modes, 4 shaders, zoom |
+| `displace_raster.c` | UV sphere | 4 displacement modes, 4 shaders, central-difference normal recompute, zoom |
+
+### Technique demos (specific pipeline extensions)
+
+These seven files extend the basic pipeline with a specific real-time-rendering technique. Each has its own per-file architecture section later in this document:
+
+| File | Technique | Architecture section |
+|---|---|---|
+| `mandelbulb_raster.c`         | Mesh-from-SDF via sphere projection                | §104 |
+| `deferred_rendering_pipeline.c` | Two-pass G-buffer + deferred lighting             | §121 |
+| `ssao_pipeline.c`             | Screen-space ambient occlusion (hemisphere sampling + 3×3 blur) | §182 |
+| `marching_cubes.c`            | Animated metaballs, 256-case marching cubes mesh extraction | §183 |
+| `shadow_mapping.c`            | Two-pass depth-from-light + PCF shadow lookup     | §184 |
+| `bloom_finale.c`              | Capstone: deferred + SSAO + HDR bloom (separable Gaussian) | §185 |
+| `neon_edges.c`                | Tron-style edge glow: Sobel post-process + bloom  | §186 |
 
 ### Pipeline Overview
 
@@ -5990,6 +6006,200 @@ Themes: `Dusk` (warm cream), `Sky` (sky-blue), `Solar` (warm yellow), `Aurora` (
 *Files: `flocking/murmuration.c`*
 *References: Reynolds 1987 SIGGRAPH "Flocks, Herds, and Schools"; Couzin et al. 2002 J. Theor. Biol. "Collective Memory and Spatial Sorting"; Hildenbrandt et al. 2010 Behav. Ecol. "Self-organized aerial displays of thousands of starlings".*
 *Cross-references: §66 (Strömbom-style hawk/sheep predator model — same predator-loosely-coupled-via-position pattern); §125 (swarm_gen_numbers — also uses spatial-hash colour cycling for cell tint).*
+
+---
+
+## 182. Screen-Space Ambient Occlusion — raster/ssao_pipeline.c
+
+A four-pass extension of the deferred-rendering pipeline (§121) that approximates the iconic "dark crevice" look of modern real-time renderers. AO is the fraction of the upper hemisphere above each visible surface point that is occluded by nearby visible geometry; SSAO computes that approximation entirely from the G-buffer with K samples per pixel.
+
+### Pipeline
+
+```
+1. render_gbuffer    — pos / normal / albedo / NDC-z / view-z / valid
+2. ssao_pass         — K hemisphere samples per pixel → g_ao
+3. ssao_blur         — 3×3 box average → g_ao_blur
+4. render_lightpass  — Blinn-Phong, ambient × g_ao_blur
+```
+
+### Per-pixel sample loop
+
+For each visible pixel (P, N), pick one of `SSAO_KERNEL_VARIANTS` precomputed sample sets by `(c & 1) | ((r & 1) << 1)`. For each direction `dir` in the variant: flip into the upper hemisphere (`if dir·N < 0: dir = −dir`), build sample point `S = P + dir · radius`, project `S` through the camera VP, and read the G-buffer at the projected pixel. If the recorded depth is closer to the camera than `S`, the sample is occluded.
+
+### Why view-space z
+
+Range falloff (`attn = 1 − |dz| / radius`) needs LINEAR depth — NDC z is non-linear after perspective and would skew the gradient. The G-buffer carries a parallel `g_z_view[r][c]` channel of pre-divide view-space z just for this.
+
+### Kernel design
+
+The kernel uses 4 deterministic variants of 12 samples each. Vector lengths are biased toward the surface (`scale = 0.1 + 0.9·t²`, t = i/SAMPLES) so close-in samples dominate the gradient and far-out samples catch broader darkening. The 4 variants × 9-cell blur means each blurred pixel is smoothed by ≈ 100 sample contributions — enough to hide the per-pixel checker noise.
+
+### Edge cases
+
+Off-screen samples and samples landing on `g_valid = 0` pixels are SKIPPED (don't count for or against occlusion) — counting them would produce a dark halo around every silhouette. SSAO_BIAS pushes the depth comparison plane slightly forward so flat surfaces don't self-occlude on float jitter.
+
+### Modes (`a` cycles)
+
+`AO_ONLY` (grayscale crevice map), `LIT_NO_AO` (full Blinn-Phong with AO disabled), `LIT_WITH_AO` (full deferred with AO multiplying ambient). Pressing `[`/`]` shrinks/grows `ssao_radius` live; the dark bands narrow/widen accordingly.
+
+*Files: `raster/ssao_pipeline.c`*
+*References: Mittring, "Finding Next Gen — CryEngine 2," SIGGRAPH '07; LearnOpenGL "SSAO" tutorial; Bavoil & Sainz, "Multi-Layer Dual-Resolution SSAO," SIGGRAPH '09.*
+
+---
+
+## 183. Marching Cubes Metaballs — raster/marching_cubes.c
+
+Real-time isosurface extraction. Four colored metaballs orbit inside a 24³ voxel grid; every frame the mesh is RE-EXTRACTED from scratch via the 256-case marching cubes algorithm (Lorensen & Cline, 1987) and rendered through the standard rasteriser. The geometry itself is the animation — most demos shade static meshes, this one rebuilds the mesh 60× per second.
+
+### Per-frame algorithm
+
+```
+1. Update metaball positions (orbits)
+2. Compute scalar field at every grid corner:
+     g_field[k][j][i] = Σ s_n / (|p − c_n|² + ε)
+3. For every cube (i, j, k):
+     read 8 corner values, build 8-bit case index
+     emask = EDGE_TABLE[case]   (which of 12 edges are crossed)
+     for each crossed edge: linearly interpolate the iso-crossing
+     walk TRI_TABLE[case] in groups of 3, emit triangles
+4. Render the dynamic triangle pool through the camera
+```
+
+### Why two embedded tables
+
+`EDGE_TABLE[256]` holds a 12-bit mask of crossed edges per case; `TRI_TABLE[256][16]` holds up to 5 triangles per case as edge indices. The two are mathematically related (the OR of every edge mentioned in TRI_TABLE for case `c` must equal `EDGE_TABLE[c]`); a startup `mc_verify_tables()` checks this and exits loudly with the offending case index if a typo crept in. A typo would silently break surface topology — fail loudly at boot beats debugging mystery holes later.
+
+### Per-vertex colour blend
+
+Each MC vertex evaluates `metaball_color` (influence-weighted palette blend) at the interpolated surface point. The rasteriser barycentric-interpolates the per-vertex colours into `g_albedo`, so the seam where two metaballs merge shows their two colours bleeding into each other instead of a hard boundary. Normals come from the analytic SDF gradient `N ∝ Σ s · (p − c) / (|p − c|² + ε)²`.
+
+### 7 colour themes (`n` cycles)
+
+PRIMARY / LAVA / PLASMA / MATRIX / OCEAN / SUNSET / NEON. Each theme bundles 4 ball colours + ambient + sun colour + rim strength. The rim term `(1 − N·V)^2.5 · rim_strength` is multiplied by sun colour and added to the lightpass — turns each blob into a silhouette-glowing shape rather than a flat coloured disc, which restores the 3-D feel that flat Blinn-Phong loses on the unlit side.
+
+### Threshold control (`t`/`g`)
+
+Press `t` to raise the iso threshold (blobs shrink and may split); `g` to lower it (blobs grow and merge faster). Topology changes in real time — the gap between two metaballs opens and closes as you scrub.
+
+*Files: `raster/marching_cubes.c`*
+*References: Lorensen & Cline, "Marching Cubes," SIGGRAPH '87; Paul Bourke "Polygonising a scalar field"; Inigo Quilez "Distance functions" and "Smin."*
+
+---
+
+## 184. Shadow Mapping — raster/shadow_mapping.c
+
+Two-pass software shadow mapping with optional 3×3 PCF (percentage closer filtering). The same algorithm modern engines use for sun shadows, implemented in C with a 256² depth buffer.
+
+### Two passes
+
+```
+1. SHADOW PASS  — rasterise scene from the light's POV with an
+                  orthographic projection. Write only NDC z into
+                  g_shadow_zbuf[256][256]. No colour, no normal.
+2. CAMERA PASS  — main G-buffer + Blinn-Phong as usual.
+3. SHADOW LOOKUP — per fragment in the lightpass:
+     light_clip = light_proj · light_view · (P, 1)
+     light_ndc  = light_clip / light_clip.w
+     map (ndc.xy) to shadow texel
+     in_shadow ⇔ shadow_zbuf[v][u] + BIAS < light_ndc.z
+   Direct lighting is multiplied by (1 − shadow); ambient stays.
+```
+
+### Why orthographic for the light
+
+The sun is a directional source — parallel rays. An ortho projection preserves linear depth across the scene and produces a uniform shadow texel density everywhere in the frustum. Perspective from the light would over-resolve nearby objects and starve the back of the scene.
+
+### Bias calibration
+
+Per-texel depth jitter on a flat surface is `(texel_world_size) · |∇light_z| · (2/(far−near))`. For this scene's defaults (texel ≈ 0.047, gradient on floor ≈ 0.75, NDC factor ≈ 0.148) that's ≈ 0.005 NDC. SHADOW_BIAS = 0.008 sits comfortably above it: too small → grid-pattern acne on flat surfaces; too large → "peter-panning" (shadows visibly detach from casters).
+
+### PCF (`f` toggles)
+
+Hard mode: one shadow_map read, binary in/out test. Soft mode: 3×3 neighbourhood read, average the binary tests. PCF gives a 1-cell-wide soft transition along the shadow edge; interiors are pixel-identical to hard.
+
+### Conventions in this file
+
+This file uses the standard glm `cross(forward, up)` convention in `m4_lookat` and the **flipped** back-face cull (`area >= 0 → skip`) — this combo puts world +X on screen right and world +Y at screen top, AND lets the floor's +Y top face pass the cull. Without the flip the only side of the floor visible from above would be silently culled and there'd be nothing for the shadows to land on.
+
+*Files: `raster/shadow_mapping.c`*
+*References: Williams, "Casting Curved Shadows on Curved Surfaces," SIGGRAPH '78 (the original); Reeves, Salesin & Cook, "Rendering Antialiased Shadows with Depth Maps," SIGGRAPH '87 (PCF); LearnOpenGL "Shadow Mapping" tutorial.*
+
+---
+
+## 185. Bloom Finale — raster/bloom_finale.c
+
+The capstone of the raster folder: a single frame runs the deferred pipeline (§121), the SSAO pipeline (§182), and a HDR bloom post-process. Demonstrates that the previous techniques compose cleanly.
+
+### Pipeline (`render_frame`)
+
+```
+1. render_gbuffer       — pos / normal / albedo / EMISSIVE / depth
+2. ssao_pass + blur     (if enabled)
+3. render_lightpass     — HDR Blinn-Phong + emissive (NOT clamped to 1.0)
+4. bloom_extract        — bright-pixel side buffer
+5. bloom_blur_h         — separable Gaussian, horizontal
+6. bloom_blur_v         — separable Gaussian, vertical
+7. bloom_composite      — add INTENSITY · bloom into g_light
+8. paint_cell           — Reinhard tone-map collapses HDR to terminal
+```
+
+### Why NOT clamp the lightpass
+
+Reinhard tone-mapping happens at paint time. If the lightpass clamps to `[0, 1]` per channel, the bloom extract pass has nothing to extract — emissive surfaces would peak at 1.0, equal to fully-lit white, and the THRESHOLD test wouldn't trigger. Keep `g_light` as HDR (channels can exceed 1.0) so emissive `(3.2, 1.8, 0.8)` orb pixels actually feed the bright extract.
+
+### Separable Gaussian
+
+A 7-tap 1-D Gaussian (σ ≈ 1.5) applied separately along x then along y is mathematically equivalent to a 7×7 2-D Gaussian, but costs `O(taps)` instead of `O(taps²)`. The same technique is used in every modern bloom implementation.
+
+### Bright extract via luma threshold
+
+`bloom_extract` reads each pixel of `g_light`, computes Rec. 709 luma, and copies the pixel into `g_bloom` only if luma > BLOOM_THRESHOLD (1.0). Below threshold the bloom buffer is zero. Threshold just above 1.0 means only HDR (emissive) pixels trigger; ordinary lit surfaces — even bright ones — stay calm.
+
+### Scene + emissive material
+
+Floor + 2 cubes + 1 emissive orb. The orb's `emissive` field is `(3.2, 1.8, 0.8)` — well past the 1.0 white ceiling. Lightpass writes `ambient + diffuse + spec + emissive`; only the orb's pixels exceed the bloom threshold. Toggle `b` off and the orb becomes a hard-edged disc; toggle on and a soft warm halo bleeds 3-4 cells past the silhouette.
+
+*Files: `raster/bloom_finale.c`*
+*References: James & O'Rorke, "Real-Time Glow," GPU Gems (2004); LearnOpenGL "Bloom" tutorial; Reinhard et al., "Photographic Tone Reproduction for Digital Images," SIGGRAPH '02.*
+
+---
+
+## 186. Tron-Style Edge Glow — raster/neon_edges.c
+
+Sobel-filter post-process driving the bloom pipeline. Three low-poly platonic-style shapes (cube, tetrahedron, octahedron) on a near-black floor, with their silhouette and crease edges glowing bright cyan with a soft halo.
+
+### Pipeline
+
+```
+1. render_gbuffer   — pos / normal / albedo / NDC z / view-z / valid
+2. edge_pass        — Sobel on z_view + normal → g_edge (HDR neon)
+3. render_lightpass — DIM Blinn-Phong + g_edge → g_light (HDR)
+4. bloom_extract → bloom_blur_h → bloom_blur_v → bloom_composite
+5. paint_cell       — Reinhard tone-map
+```
+
+### Edge detection (the new step)
+
+For each visible pixel, run a 3×3 Sobel filter on **two** sources:
+- `g_z_view` — depth gradient catches SILHOUETTE edges. Invalid neighbours (pixels outside the screen or where g_valid = 0) are sampled as `−CAM_FAR`, so the depth jump at silhouettes is enormous and reliably triggers the threshold.
+- Each component of `g_normal` separately — normal gradient catches CREASE edges (where two faces meet at an angle). Sum the magnitudes of the three component Sobels.
+
+```
+edge = max(depth_grad · DEPTH_SCALE, normal_grad · NORMAL_SCALE)
+t    = smoothstep(THRESHOLD, THRESHOLD + KNEE, edge)
+g_edge[r][c] = NEON_COLOR · t · INTENSITY
+```
+
+### Why dim Blinn-Phong + bright HDR edges
+
+Lit faces use ambient `≈ 0.04` and sun colour `≈ 0.12` per channel — intentionally dim. Edge pixels carry HDR cyan `(0.5, 2.0, 2.5) · 1.5 = (0.75, 3.0, 3.75)` — well above the BLOOM_THRESHOLD. The contrast is what produces the iconic Tron look: glowing wireframe outline of solid 3-D objects against a near-void canvas. Toggle `e` off → shapes become barely-visible dim faces with no edges; toggle `b` off → edges are hard pixel lines without the halo.
+
+### Low-poly geometry choice
+
+Cube (12 tris), tetrahedron (4 tris), octahedron (8 tris) — total 24 + 2 floor = 26 tris. Each platonic-style solid has clean creases and a distinct silhouette. UV spheres or other high-poly meshes would show every triangle subdivision as a "crease" — too noisy. Keep the geometry low-poly for the cleanest Sobel output.
+
+*Files: `raster/neon_edges.c`*
+*References: Sobel & Feldman, "A 3×3 Isotropic Gradient Operator for Image Processing" (SAIL, 1968); Mitchell et al., "Real-Time Rendering Tricks for Ambient Occlusion and Edge Detection," GDC '07; LearnOpenGL "Bloom" tutorial.*
 
 ---
 

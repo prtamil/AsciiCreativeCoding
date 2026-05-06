@@ -1,25 +1,46 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * sphere_raster.c  —  ncurses software rasterizer, sphere demo
+ * sphere_raster.c — software rasteriser of a smooth-shaded UV sphere
  *
- * One primitive: UV sphere, TESS_U×TESS_V tessellation.
- * Four shaders cycled with  s : phong / toon / normals / wireframe
+ * DEMO: A blue UV-tessellated sphere rotates slowly under a single
+ *       point light, demonstrating four classic real-time shaders on
+ *       the canonical smooth-surface primitive. Cycle 's' through:
  *
- * The sphere is the best showcase for the pipeline:
- *   - Smooth normals produce a continuous Phong highlight
- *   - Toon banding forms clean latitudinal rings around the surface
- *   - Normal shader gives a full RGB hue map as the sphere rotates
- *   - Wireframe shows the UV grid — latitude/longitude lines
+ *         phong      Blinn-Phong with a sharp specular highlight.
+ *                    The highlight glides across the sphere as it
+ *                    spins — proof that smooth normals are working.
+ *         toon       4-band quantised diffuse + hard specular.
+ *                    Concentric latitudinal rings track the light.
+ *         normals    World normal RGB visualisation. The full RGB
+ *                    cube wraps once around the sphere — every
+ *                    surface direction gets a unique hue.
+ *         wireframe  Barycentric edge detection. Reveals the UV grid:
+ *                    TESS_U meridians × TESS_V parallels, with the
+ *                    iconic pole-fan singularity.
  *
- * Sphere tessellation notes:
- *   Normal == normalised position for a unit sphere centred at origin.
- *   No normal matrix needed for the normal itself, but we still pass it
- *   through the normal_mat transform so non-uniform scale works later.
- *   Pole vertices (top/bottom) share position but have unique normals
- *   per triangle fan — no degenerate normals at poles.
+ *       Toggle 'c' to disable back-face culling — the inner surface
+ *       becomes visible and you can see triangle winding from below.
  *
- * Pipeline identical to cube_raster.c.
- * Only §1 config and §4 tessellation change.
+ *       Pipeline is identical to cube_raster.c — only §1 config and
+ *       §4 tessellation differ. The sphere is the best showcase for
+ *       the pipeline because every shader has something distinct to
+ *       say about a continuously curved surface.
+ *
+ * Study alongside:
+ *   raster/cube_raster.c     — same pipeline, single mesh primitive
+ *   raster/torus_raster.c    — same pipeline, parametric torus
+ *   raster/displace_raster.c — same UV sphere, animated displacement
+ *
+ * Section map:
+ *   §1  config       — frame, view, sphere, tessellation, ramp, dither
+ *   §2  math         — V3 / V4 / Mat4 helpers
+ *   §3  shaders      — VS / FS types + uniforms + 1 base VS + 4 FS
+ *   §4  mesh         — UV sphere tessellation (smooth normals + poles)
+ *   §5  framebuffer  — zbuf + cbuf + Bourke ramp + Bayer dither + blit
+ *   §6  pipeline     — vertex transform → cull → barycentric raster → FS
+ *   §7  scene        — Scene struct, uniforms wiring, tick, draw, swap
+ *   §8  screen       — ncurses init / resize / HUD / present
+ *   §9  app          — main loop, signals, resize, cleanup
  *
  * Keys:
  *   s / S     cycle shader  (phong → toon → normals → wireframe)
@@ -30,146 +51,172 @@
  *   q / ESC   quit
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra sphere_raster.c -o sphere -lncurses -lm
- *
- * Sections
- * --------
- *   §1  config
- *   §2  math         Vec3 Vec4 Mat4
- *   §3  shaders      VSIn VSOut FSIn FSOut + 4 vert/frag pairs
- *   §4  mesh         sphere tessellation (UV grid, smooth normals)
- *   §5  framebuffer  zbuf cbuf dither paulbourke blit
- *   §6  pipeline     vertex transform · rasterize · draw
- *   §7  scene        uniforms · tick · draw · shader swap
- *   §8  screen       ncurses init/resize/hud/present
- *   §9  app          dt loop · input · resize · cleanup
+ *   gcc -std=c11 -O2 -Wall -Wextra raster/sphere_raster.c -o sphere \
+ *       -lncurses -lm
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Same software rasterization pipeline as torus_raster.c.
- *                  The sphere is the canonical smooth-shading demo:
- *                  per-vertex normals = normalised vertex positions (unit sphere).
- *                  Interpolated across the face using barycentric coordinates
- *                  → continuous Phong highlight across triangle boundaries.
+ * Algorithm      : Standard forward rasterisation. Tessellate the
+ *                  sphere once at init into a static triangle mesh
+ *                  with smooth per-vertex normals (= position / R for
+ *                  the unit sphere). Each frame transforms vertices
+ *                  through MVP, runs back-face culling, walks each
+ *                  triangle's bounding box with barycentric weights,
+ *                  z-tests, and runs a fragment shader. The sphere's
+ *                  smooth normals + barycentric interpolation are
+ *                  what produce the continuous Phong highlight.
  *
- * Math           : UV sphere tessellation:
- *                  For u ∈ [0, 2π] and v ∈ [0, π]:
- *                    x = sin(v)·cos(u), y = cos(v), z = sin(v)·sin(u)
- *                  TESS_U rings × TESS_V stacks gives (TESS_U × TESS_V) quads
- *                  = 2 × TESS_U × TESS_V triangles.
- *                  Poles require triangle fans (degenerate quads).
+ *                  UV parameterisation:
+ *                    pos = (R·sin φ·cos θ, R·cos φ, R·sin φ·sin θ)
+ *                    nrm = pos / R
+ *                  φ ∈ [0, π] is latitude (0 = north pole),
+ *                  θ ∈ [0, 2π) is longitude.
  *
- * Performance    : The sphere tessellation is fixed at init; no re-tessellation
- *                  per frame (unlike displace_raster.c which recomputes vertices).
- *                  Smooth normals reduce visual artifacts when triangle count is
- *                  low — a UV sphere looks smooth with just 16×16 tessellation.
+ * Data-structure : One Mesh = flat arrays of vertices and triangles,
+ *                  sized at compile time:
+ *                    verts = (TESS_U+1) × (TESS_V+1)
+ *                    tris  = TESS_U × TESS_V × 2 (two per quad cell)
+ *                  Plus a Framebuffer (zbuf + cbuf) re-allocated on
+ *                  each resize. No dynamic state changes per frame
+ *                  except rotation matrices.
+ *
+ * Rendering      : Standard forward pipeline matching cube_raster.c:
+ *                    vert shader → near-clip reject → perspective
+ *                    divide → screen mapping (with cell-aspect fix)
+ *                    → back-face cull → bounding-box raster +
+ *                    barycentric interp → frag shader → luma →
+ *                    Bayer dither → Bourke ramp glyph + colour pair.
+ *
+ * Performance    : Tessellation is one-shot at init. Per-frame cost
+ *                  is O(N_tris × pixels_per_tri). Smooth normals let
+ *                  TESS_U × TESS_V stay modest (36 × 24 = 1728 tris)
+ *                  while the surface still looks round — coarse
+ *                  tessellation is "hidden" by the smooth shading.
+ *
+ * References     : Phong, "Illumination for Computer Generated
+ *                    Pictures," CACM '75 (the original Phong model).
+ *                  Blinn, "Models of Light Reflection for Computer
+ *                    Synthesised Pictures," SIGGRAPH '77 (Blinn-Phong).
+ *                  Möller, "Fast Triangle Rasterization by
+ *                    Interpolating Edge Functions," GPG (2000).
+ *                  RTRender 4ed, §16.1 (sphere tessellation
+ *                    schemes — UV vs icosphere comparison).
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
  *
  * CORE IDEA
  * ─────────
- * A sphere on a terminal is a CHAIN of transforms ending in luma.  The
- * mesh is a 36×24 grid of vertices wrapped to a sphere by the UV
- * parameterisation; each vertex is shoved through a Model→View→Proj
- * matrix (vertex shader), each triangle is bary-rasterised across its
- * screen bounding box, each covered cell asks "what is my normal, my
- * world position?" (interpolated by barycentric weights) and computes
- * a colour (fragment shader); finally the colour is reduced to luma in
- * [0,1], dithered with a Bayer 4×4 matrix, and looked up in Paul
- * Bourke's 92-character density ramp.  Four shaders demonstrate the
- * pipeline isn't sphere-specific — only §4 changes if you swap meshes.
+ * A sphere in the terminal is a CHAIN of transforms ending in luma.
+ * Tessellate once into a UV grid, then per frame: every vertex →
+ * MVP transform → screen-space coordinates; every triangle → bbox
+ * raster with barycentric weights; every covered cell → a fragment
+ * shader → an RGB colour → a luma → a Bayer-dithered Bourke glyph.
+ * Four shaders demonstrate the pipeline isn't sphere-specific —
+ * only §4 changes if you swap the mesh.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
- * Imagine peeling a globe into a flat rectangular grid: latitude lines
- * across, longitude lines down, then re-pasting it into 3D using
- * (sin φ cos θ, cos φ, sin φ sin θ).  The pasting is the mesh.  Then
- * the camera takes a 3D photograph of the ball, but the photograph is
- * developed not on film but on a Z-buffered character grid: nearer
- * fragments win their cell, brighter fragments pick a denser glyph,
- * with a bit of ordered noise (Bayer) so smooth gradients don't
- * banded-step.  The four shaders are four "exposure recipes" picking
- * different chemistry for the same negative.
+ * Peel a globe into a flat rectangular grid (latitude × longitude),
+ * then re-paste it in 3-D using (sin φ cos θ, cos φ, sin φ sin θ).
+ * That's the mesh. The camera takes a 3-D photograph, but instead
+ * of film the negative is a Z-buffered grid of cells: nearer
+ * fragments win, brighter fragments pick a denser glyph, with a
+ * bit of ordered noise (Bayer) so smooth gradients don't band.
+ * The four shaders are four "exposure recipes" on the same negative.
  *
- * ALGORITHM IN STEPS  (one frame)
- * ──────────────────
- *  1. scene_tick: angle_x,y += ROT·dt.  Build model = Ry · Rx; build
- *     mvp = proj · view · model; build norm_mat = cofactor(model3×3).
- *  2. fb_clear: zbuf := FLT_MAX, cbuf := all-zero cells.
- *  3. pipeline_draw_mesh, per triangle:
- *      a. For each of 3 vertices, run vert shader → VSOut with clip_pos,
- *         world_pos, world_nrm, custom[].
- *      b. Reject if all 3 w-components < 0.001 (behind near plane).
- *      c. Perspective divide: sx = (clip.x/w + 1)·cols/2,
- *         sy = (−clip.y/w + 1)·rows/2,  sz = clip.z/w.
- *      d. Cull back-faces if signed area <= 0 (CCW).
- *      e. Walk integer bbox; per cell, compute barycentric (b0,b1,b2);
- *         skip if any negative.  Z-test against zbuf; on win, write z.
- *      f. Build FSIn by bary-interpolating world_pos, world_nrm, u, v,
- *         custom; run frag shader → FSOut.  Discard if requested.
- *      g. luma = 0.2126·R + 0.7152·G + 0.0722·B (Rec. 709).
- *      h. luma_to_cell: add Bayer dither, pick Bourke glyph, pick one
- *         of 7 colour pairs based on luma, bold if luma > 0.6.
- *  4. fb_blit: walk cbuf, mvaddch each non-empty cell.
+ *      ┌──────────────────────────────────────────────┐
+ *      │  vertex shader        rasteriser             │
+ *      │      ▾                     ▾                 │
+ *      │  pos → MVP → clip → /w → screen              │
+ *      │                            ▾                 │
+ *      │  tri  → bbox → bary → z-test → fragment      │
+ *      │                                  ▾           │
+ *      │  RGB → luma → bayer → bourke glyph + pair    │
+ *      └──────────────────────────────────────────────┘
+ *
+ * DRAWING METHOD  /  ALGORITHM IN STEPS
+ * ─────────────────────────────────────
+ *  1. scene_tick — angle_x, angle_y += ROT · dt; build
+ *       model = Ry · Rx; mvp = proj · view · model;
+ *       norm_mat = cofactor(model 3×3).
+ *
+ *  2. fb_clear — zbuf := FLT_MAX, cbuf := all-zero cells.
+ *
+ *  3. pipeline_draw_mesh — per triangle:
+ *        a. Run vert shader on each of the 3 vertices → VSOut
+ *           (clip_pos + world_pos + world_nrm + custom[]).
+ *        b. Reject if all 3 clip.w < ε (behind near plane).
+ *        c. Perspective divide: sx = (clip.x/w + 1) · cols/2,
+ *                              sy = (−clip.y/w + 1) · rows/2,
+ *                              sz = clip.z / w.
+ *        d. Back-face cull if signed area ≤ 0 (CCW front).
+ *        e. Walk integer bbox; per cell compute barycentric (b0,b1,b2);
+ *           skip if any negative; z-test against zbuf; on win write z.
+ *        f. Build FSIn by interpolating world_pos / world_nrm /
+ *           u / v / custom[]; run frag shader → FSOut.
+ *        g. luma = 0.2126·R + 0.7152·G + 0.0722·B (Rec. 709).
+ *        h. luma_to_cell: bayer dither → Bourke glyph + colour pair.
+ *
+ *  4. fb_blit — walk cbuf, mvaddch each non-empty cell.
  *
  * KEY FORMULAS
  * ────────────
- *  Sphere parameterisation:
- *      x = R·sin φ·cos θ,   y = R·cos φ,   z = R·sin φ·sin θ
- *      φ ∈ [0,π], θ ∈ [0,2π)
- *  Vertex normal       :  n = pos / R           (unit sphere shortcut)
- *  Pole degeneracy fix :  if sin φ < 1e-6,   n = (0, ±1, 0)
- *  Vertex / triangle # :  V = (TESS_U+1)·(TESS_V+1) = 925
- *                         T = TESS_U·TESS_V·2     = 1728
- *  Perspective divide  :  sx = (x/w + 1)·cols/2,  sy = (−y/w + 1)·rows/2
- *  Aspect              :  aspect = cols·CELL_W / (rows·CELL_H)
- *  Barycentric area    :  d = (sy1−sy2)(sx0−sx2) + (sx2−sx1)(sy0−sy2)
- *  Z-buffer test       :  z_new < zbuf[idx]  → write
- *  Phong               :  diff = max(0, N·L);
- *                         spec = max(0, N·H)^shininess;
- *                         out = ambient + obj·light·diff + spec·0.5
- *  Toon                :  banded = ⌊diff·bands⌋ / bands  (bands = 4)
- *  Normal viz          :  RGB = N·0.5 + 0.5
- *  Wire edge           :  edge = min(b0,b1,b2);   discard if > WIRE_THRESH
- *  Luma → glyph        :  d = clamp(luma + (bayer−0.5)·0.15, 0, 1)
- *                         glyph = k_bourke[(int)(d·91)]
+ *   UV parameterisation
+ *     pos = (R · sin φ · cos θ,  R · cos φ,  R · sin φ · sin θ)
+ *     φ ∈ [0, π], θ ∈ [0, 2π)
+ *   Vertex normal       N = pos / R          (unit sphere shortcut)
+ *   Pole degeneracy     if sin φ < 1e-6,  N = (0, ±1, 0) explicitly
+ *   Mesh sizes          V = (TESS_U+1) · (TESS_V+1)        = 925
+ *                       T = TESS_U · TESS_V · 2            = 1728
+ *   Perspective divide  sx = ( ndc.x + 1)/2 · cols
+ *                       sy = (−ndc.y + 1)/2 · rows         (Y-flip)
+ *   Aspect              cols · CELL_W / (rows · CELL_H)
+ *   Phong               diff = max(0, N · L)
+ *                       spec = max(0, N · H)^shininess
+ *                       out  = ambient + obj·light·diff + 0.5·spec
+ *   Toon                banded = ⌊diff · bands⌋ / bands     (bands = 4)
+ *   Normal viz          RGB = N · 0.5 + 0.5
+ *   Wire edge           edge = min(b0, b1, b2);  discard if > WIRE_THRESH
+ *   Luma → glyph        d = clamp01(luma + (bayer − 0.5) · 0.15)
+ *                       glyph = k_bourke[(int)(d · (BOURKE_LEN−1))]
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *  • Pole singularity: when sin φ = 0 the normalised position is (0,0,0).
- *    The explicit (0,±1,0) override prevents black bands at the poles.
- *  • Back-face cull breaks for negative scale; we never apply one, so
- *    the area-sign test is reliable.  Toggle `c` to disable cull and
- *    inspect the inner surface — useful for understanding winding.
- *  • Wireframe needs custom[0..2] = barycentric u,v,1−u−v written by
- *    pipeline_draw_mesh AFTER the vertex shader runs (vert_wire writes
- *    zeros first, pipeline overwrites).  If pipeline order changes, the
- *    wire shader silently sees 0 and discards everything.
- *  • Aspect ratio uses CELL_W/CELL_H = 8/16 = 0.5 — without this the
- *    sphere appears as a vertical egg.
- *  • Z-buffer is float and stores z/w (post-divide); not linear, but
- *    monotonic, which is sufficient for ordering.
- *  • At very small triangles (subpixel), barycentric area ~ 0 and the
- *    test |d|<1e-6 returns negative bary that fails the visibility
- *    test — triangle silently disappears.  Acceptable for a UV sphere.
+ *   • Pole singularity. sin φ = 0 makes the normalised position
+ *     degenerate. tessellate_sphere overrides the normal to
+ *     (0, ±1, 0) at the poles to avoid divide-by-zero.
+ *
+ *   • Wireframe relies on custom[0..2] = barycentric coords being
+ *     written by the pipeline AFTER the vertex shader runs. If you
+ *     swap the order, the wire shader silently sees zeros and
+ *     discards everything.
+ *
+ *   • Cell aspect. CELL_W / CELL_H = 8/16 = 0.5 in the projection
+ *     aspect ratio — without it the sphere stretches into an egg.
+ *
+ *   • Sub-pixel triangles. When |signed area| < 1e-6 the
+ *     barycentric helper returns -1s; the triangle silently
+ *     disappears. Acceptable at the poles where many tiny tris meet.
+ *
+ *   • Back-face cull works because no negative scale is applied.
+ *     Press 'c' to disable and study the inner-surface winding.
  *
  * HOW TO VERIFY
  * ─────────────
- *  • Pause (space).  Phong: a single bright highlight over the upper-
- *    right hemisphere (light at (3,4,3)).  Toon: 4 concentric bands.
- *    Normals: a smooth RGB rainbow, +X red, +Y green, +Z blue.
- *    Wire: ~1728 outline triangles, latitude/longitude grid pattern.
- *  • Press `c`: back-face cull off → you can now see through the
- *    silhouette to the far side surface.
- *  • Zoom in (`+`) until CAM_DIST hits CAM_DIST_MIN = 1.0; the sphere
- *    fills the screen and then exceeds it; wireframe still legible.
- *  • Watch one rotation cycle: ROT_Y = 0.5 rad/s ⇒ full revolution
- *    every 2π/0.5 ≈ 12.6 s.  Time it.
- *  • Resize the terminal: aspect updates and the sphere stays round.
- *  • Pole vertices (top, bottom row of the UV grid in wireframe) all
- *    converge to one point — the classic UV sphere "fan" pattern.
+ *   • Pause (space). Phong: a single bright highlight over the
+ *     upper-right hemisphere (light at (3, 4, 3)).
+ *   • Toon: four concentric latitudinal bands tracking the light.
+ *   • Normals: smooth RGB across the sphere — +X red, +Y green,
+ *     +Z blue. The full RGB cube wraps once.
+ *   • Wireframe: ~1728 triangle outlines forming a clean lat/long
+ *     grid with the iconic pole-fan singularity.
+ *   • Toggle 'c': inner surface becomes visible at the silhouette;
+ *     watch how triangles wind from the back side.
+ *   • Zoom in to CAM_DIST_MIN = 1.0 — the sphere fills (and exceeds)
+ *     the screen; the wireframe is still legible up close.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -186,14 +233,12 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ───────────────────────────────────────────────────────── */
 
 enum {
     FPS_TARGET    = 60,
     FPS_UPDATE_MS = 500,
-    HUD_COLS      = 46,
+    HUD_COLS      = 80,
 };
 
 #define CAM_FOV       (55.0f * 3.14159265f / 180.0f)
@@ -266,9 +311,7 @@ static const float k_bayer[4][4] = {
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 
-/* ===================================================================== */
-/* §2  math                                                               */
-/* ===================================================================== */
+/* ── §2 math (V3, V4, Mat4) ──────────────────────────────────────────── */
 
 typedef struct { float x, y, z;    } Vec3;
 typedef struct { float x, y, z, w; } Vec4;
@@ -373,9 +416,7 @@ static Mat4 m4_normal_mat(Mat4 m){
     return n;
 }
 
-/* ===================================================================== */
-/* §3  shaders                                                            */
-/* ===================================================================== */
+/* ── §3 shaders — VS/FS types + uniforms + 1 base VS + 4 FS ──────────── */
 
 typedef struct { Vec3 pos; Vec3 normal; float u,v; } VSIn;
 
@@ -411,40 +452,52 @@ typedef struct {
 
 typedef struct { Uniforms base; int bands; } ToonUniforms;
 
-/* ── vertex shaders ──────────────────────────────────────────────── */
+/* ── vertex shaders ──────────────────────────────────────────────── *
+ *
+ * All three vertex shaders share the same MVP transform — they only
+ * differ in what they pack into out->custom[]. vert_base does the
+ * common work; vert_normals + vert_wire wrap it and add their per-
+ * shader payload. (vert_wire leaves custom[] at zero; the pipeline
+ * overwrites it with barycentric coords AFTER this runs.)
+ */
+
+/* Common transform: MVP for the rasteriser, world pos + world normal
+ * for the fragment stage. Reads like its formula:
+ *   clip = MVP · (pos, 1)
+ *   wpos = model    · pos
+ *   wnrm = norm_mat · nrm,   then normalised
+ */
+static void vert_base(const VSIn *in, VSOut *out, const Uniforms *u)
+{
+    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x, in->pos.y, in->pos.z, 1.f));
+    out->world_pos = m4_pt   (u->model, in->pos);
+    out->world_nrm = v3_norm (m4_dir(u->norm_mat, in->normal));
+    out->u = in->u;
+    out->v = in->v;
+    out->custom[0] = out->custom[1] = out->custom[2] = out->custom[3] = 0.f;
+}
 
 static void vert_default(const VSIn *in, VSOut *out, const void *u_)
 {
-    const Uniforms *u=(const Uniforms*)u_;
-    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x,in->pos.y,in->pos.z,1.f));
-    out->world_pos = m4_pt (u->model,    in->pos);
-    out->world_nrm = v3_norm(m4_dir(u->norm_mat, in->normal));
-    out->u=in->u; out->v=in->v;
-    out->custom[0]=out->custom[1]=out->custom[2]=out->custom[3]=0.f;
+    vert_base(in, out, (const Uniforms *)u_);
 }
 
+/* Same as default, but additionally packs world normal into
+ * custom[0..2] so frag_normals can read it without barycentric
+ * loss. */
 static void vert_normals(const VSIn *in, VSOut *out, const void *u_)
 {
-    const Uniforms *u=(const Uniforms*)u_;
-    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x,in->pos.y,in->pos.z,1.f));
-    out->world_pos = m4_pt (u->model,    in->pos);
-    out->world_nrm = v3_norm(m4_dir(u->norm_mat, in->normal));
-    out->u=in->u; out->v=in->v;
-    out->custom[0]=out->world_nrm.x;
-    out->custom[1]=out->world_nrm.y;
-    out->custom[2]=out->world_nrm.z;
-    out->custom[3]=0.f;
+    vert_base(in, out, (const Uniforms *)u_);
+    out->custom[0] = out->world_nrm.x;
+    out->custom[1] = out->world_nrm.y;
+    out->custom[2] = out->world_nrm.z;
 }
 
+/* Same as default, custom[] left at zero — the pipeline writes
+ * barycentric coordinates into custom[0..2] after this runs. */
 static void vert_wire(const VSIn *in, VSOut *out, const void *u_)
 {
-    const Uniforms *u=(const Uniforms*)u_;
-    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x,in->pos.y,in->pos.z,1.f));
-    out->world_pos = m4_pt (u->model,    in->pos);
-    out->world_nrm = v3_norm(m4_dir(u->norm_mat, in->normal));
-    out->u=in->u; out->v=in->v;
-    out->custom[0]=0.f; out->custom[1]=0.f;
-    out->custom[2]=0.f; out->custom[3]=0.f;
+    vert_base(in, out, (const Uniforms *)u_);
 }
 
 /* ── fragment shaders ────────────────────────────────────────────── */
@@ -541,9 +594,7 @@ static void frag_wire(const FSIn *in, FSOut *out, const void *u_)
 typedef enum { SH_PHONG=0, SH_TOON, SH_NORMALS, SH_WIRE, SH_COUNT } ShaderIdx;
 static const char *k_shader_names[]={"phong","toon","normals","wire"};
 
-/* ===================================================================== */
-/* §4  mesh — sphere tessellation                                         */
-/* ===================================================================== */
+/* ── §4 mesh — UV sphere tessellation ────────────────────────────────── */
 
 typedef struct { Vec3 pos; Vec3 normal; float u,v; } Vertex;
 typedef struct { int v[3]; } Triangle;
@@ -552,105 +603,75 @@ typedef struct { Vertex *verts; int nvert; Triangle *tris; int ntri; } Mesh;
 static void mesh_free(Mesh *m){ free(m->verts); free(m->tris); *m=(Mesh){0}; }
 
 /*
- * tessellate_sphere — UV grid over the sphere surface.
+ * tessellate_sphere — generate the UV-sphere mesh.
  *
- * Parameterisation:
- *   theta ∈ [0, 2π)  — longitude, TESS_U divisions
- *   phi   ∈ [0,  π]  — latitude,  TESS_V divisions (0=north, π=south)
+ * Walks an (nu+1) × (nv+1) UV grid:
+ *   φ = (j / nv) · π            // latitude:  0 = north pole, π = south
+ *   θ = (i / nu) · 2π           // longitude: 0 .. 2π
+ *   pos = (R · sin φ · cos θ,  R · cos φ,  R · sin φ · sin θ)
+ *   nrm = pos / R               // unit-sphere shortcut
  *
- * Position:
- *   x = R * sin(phi) * cos(theta)
- *   y = R * cos(phi)               ← Y is up
- *   z = R * sin(phi) * sin(theta)
+ * Pole handling: when sin φ ≈ 0 the normalised position is degenerate;
+ * we override the normal to (0, ±1, 0) so the poles don't get black
+ * bands from divide-by-zero.
  *
- * Normal:
- *   For a unit sphere, normal == normalised position.
- *   normal = normalise(position) = position / R
- *   This gives perfectly smooth per-vertex normals with no discontinuity
- *   except at the poles (phi=0 and phi=π) where sin(phi)=0 and all
- *   vertices at the same stack share the same position.
- *
- * Pole handling:
- *   The top pole (phi=0) and bottom pole (phi=π) degenerate to a single
- *   point.  We still generate (TESS_U+1) vertices per pole stack so
- *   the UV grid is uniform, but each pole vertex has a unique U coordinate
- *   so the texture seam is handled correctly.  The normal at the top
- *   pole is (0,1,0) and at the bottom is (0,-1,0) regardless of theta.
- *
- * Winding:
- *   CCW when viewed from outside (normal pointing toward camera).
- *   Quad split: (r0,r2,r1) and (r1,r2,r3) — verified CCW for outward
- *   facing quads in a right-handed system with Y-up.
- *
- * Vertex count: (TESS_U+1) * (TESS_V+1)
- * Triangle count: TESS_U * TESS_V * 2
+ * Triangulation: each quad cell (i, j)..(i+1, j+1) emits two CCW
+ * triangles (r0, r2, r1) and (r1, r2, r3). The winding is what
+ * "outward = front" depends on for back-face culling.
  */
 static Mesh tessellate_sphere(void)
 {
-    int nu=TESS_U, nv=TESS_V;
-    float R=SPHERE_R;
-    float PI=3.14159265f, PI2=2.f*PI;
+    int   nu  = TESS_U;
+    int   nv  = TESS_V;
+    float R   = SPHERE_R;
+    float PI  = 3.14159265f;
+    float PI2 = 2.f * PI;
 
-    int nvert=(nu+1)*(nv+1);
-    int ntri =nu*nv*2;
+    int nvert = (nu + 1) * (nv + 1);
+    int ntri  =  nu      *  nv      * 2;
 
     Mesh m;
-    m.verts=malloc((size_t)nvert*sizeof(Vertex));
-    m.tris =malloc((size_t)ntri *sizeof(Triangle));
-    m.nvert=0; m.ntri=0;
+    m.verts = malloc((size_t)nvert * sizeof(Vertex));
+    m.tris  = malloc((size_t)ntri  * sizeof(Triangle));
+    m.nvert = 0;
+    m.ntri  = 0;
 
-    for(int j=0;j<=nv;j++){
-        float v   =(float)j/(float)nv;
-        float phi = v*PI;            /* 0 (north pole) → π (south pole) */
-        float sp  =sinf(phi);
-        float cp  =cosf(phi);
+    /* Step 1 — emit (nu+1) × (nv+1) vertices on the parameterised sphere. */
+    for (int j = 0; j <= nv; j++) {
+        float v   = (float)j / (float)nv;
+        float phi = v * PI;                            /* latitude  */
+        float sp  = sinf(phi), cp = cosf(phi);
 
-        for(int i=0;i<=nu;i++){
-            float u     =(float)i/(float)nu;
-            float theta = u*PI2;
-            float st=sinf(theta), ct=cosf(theta);
+        for (int i = 0; i <= nu; i++) {
+            float u     = (float)i / (float)nu;
+            float theta = u * PI2;                     /* longitude */
+            float st = sinf(theta), ct = cosf(theta);
 
-            Vec3 pos=v3(R*sp*ct, R*cp, R*sp*st);
+            Vec3 pos = v3(R * sp * ct, R * cp, R * sp * st);
+            Vec3 nrm = (sp < 1e-6f)                    /* pole guard */
+                     ? ((j == 0) ? v3(0,  1, 0) : v3(0, -1, 0))
+                     : v3_norm(pos);
 
-            /*
-             * Normal = normalised position for unit sphere.
-             * At poles (sp≈0) this degenerates — we set it explicitly
-             * to the pure pole direction to avoid divide-by-zero.
-             */
-            Vec3 nrm;
-            if(sp < 1e-6f){
-                nrm = (j==0) ? v3(0,1,0) : v3(0,-1,0);
-            } else {
-                nrm = v3_norm(pos);
-            }
-
-            m.verts[m.nvert++]=(Vertex){pos,nrm,u,v};
+            m.verts[m.nvert++] = (Vertex){ pos, nrm, u, v };
         }
     }
 
-    /*
-     * Build quad grid, split each quad into 2 CCW triangles.
-     * r0 = top-left, r1 = top-right (i+1)
-     * r2 = bot-left (j+1), r3 = bot-right
-     *
-     * Tri 0: r0,r2,r1  (CCW from outside)
-     * Tri 1: r1,r2,r3  (CCW from outside)
-     */
-    for(int j=0;j<nv;j++){
-        for(int i=0;i<nu;i++){
-            int r0=j*(nu+1)+i,   r1=r0+1;
-            int r2=r0+(nu+1),    r3=r2+1;
-            m.tris[m.ntri++]=(Triangle){{r0,r2,r1}};
-            m.tris[m.ntri++]=(Triangle){{r1,r2,r3}};
+    /* Step 2 — stitch each quad into two CCW triangles.
+     *   r0 = top-left      r1 = top-right
+     *   r2 = bot-left      r3 = bot-right                            */
+    for (int j = 0; j < nv; j++) {
+        for (int i = 0; i < nu; i++) {
+            int r0 = j * (nu + 1) + i,  r1 = r0 + 1;
+            int r2 = r0 + (nu + 1),     r3 = r2 + 1;
+            m.tris[m.ntri++] = (Triangle){{ r0, r2, r1 }};
+            m.tris[m.ntri++] = (Triangle){{ r1, r2, r3 }};
         }
     }
 
     return m;
 }
 
-/* ===================================================================== */
-/* §5  framebuffer                                                        */
-/* ===================================================================== */
+/* ── §5 framebuffer — zbuf + cbuf + Bourke ramp + dither + blit ──────── */
 
 typedef struct { char ch; int color_pair; bool bold; } Cell;
 typedef struct { float *zbuf; Cell *cbuf; int cols,rows; } Framebuffer;
@@ -710,9 +731,7 @@ static void fb_blit(const Framebuffer *fb)
     }
 }
 
-/* ===================================================================== */
-/* §6  pipeline                                                           */
-/* ===================================================================== */
+/* ── §6 pipeline — vertex transform → cull → barycentric raster → FS ─── */
 
 static void barycentric(const float sx[3],const float sy[3],
                         float px,float py,float b[3])
@@ -818,9 +837,7 @@ static void pipeline_draw_mesh(Framebuffer   *fb,
     }
 }
 
-/* ===================================================================== */
-/* §7  scene                                                              */
-/* ===================================================================== */
+/* ── §7 scene — Scene struct, uniforms wiring, tick, draw, swap ──────── */
 
 typedef struct {
     Mesh          mesh;
@@ -909,9 +926,7 @@ static void scene_next_shader(Scene *s){
     scene_build_shader(s);
 }
 
-/* ===================================================================== */
-/* §8  screen                                                             */
-/* ===================================================================== */
+/* ── §8 screen — ncurses init / resize / HUD / present ────────────────── */
 
 typedef struct { int cols,rows; } Screen;
 
@@ -926,28 +941,41 @@ static void screen_resize(Screen *s){
     endwin(); refresh(); getmaxyx(stdscr,s->rows,s->cols);
 }
 
-static void screen_draw_hud(const Screen *s,const Scene *sc,double fps)
+/* HUD layout (CLAUDE.md spec):
+ *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
+ *   row rows-1     PAIR_HINT (cyan + bold)   — key hint
+ *
+ * The 7-pair luma palette uses pair 3 (yellow) and pair 5 (cyan) at
+ * the right brightness for HUD text — we alias them as named constants
+ * so the HUD code reads "yellow / cyan" instead of "magic 3 / 5". */
+#define PAIR_HUD   3       /* yellow */
+#define PAIR_HINT  5       /* cyan   */
+
+static void screen_draw_hud(const Screen *s, const Scene *sc, double fps)
 {
-    char buf[HUD_COLS+1];
-    snprintf(buf,sizeof buf," %5.1f fps  [%s]  z:%.1f  cull:%s%s ",
+    char status[HUD_COLS + 1];
+    snprintf(status, sizeof status,
+             " %5.1f fps  shader:%s  zoom:%.1f  cull:%s%s ",
              fps, k_shader_names[sc->shade_idx],
              sc->cam_dist,
              sc->cull_backface ? "on " : "off",
-             sc->paused ? " PAUSED" : "");
-    int hx=s->cols-HUD_COLS; if(hx<0)hx=0;
-    attron(COLOR_PAIR(3)|A_BOLD);
-    mvprintw(0,hx,"%s",buf);
-    attroff(COLOR_PAIR(3)|A_BOLD);
-    attron(COLOR_PAIR(5));
-    mvprintw(s->rows-1,0,"s=shader  c=cull  +/-=zoom  space=pause  q=quit");
-    attroff(COLOR_PAIR(5));
+             sc->paused        ? " PAUSED" : "");
+    int slen = (int)strlen(status); if (slen > s->cols) slen = s->cols;
+
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, s->cols - slen, "%s", status);
+    mvprintw(0, 0, " SPHERE · RASTER ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  spc:pause  s:shader  c:cull  +/-:zoom ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void){ wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §9  app                                                                */
-/* ===================================================================== */
+/* ── §9 app — main loop, signals, resize, cleanup ─────────────────────── */
 
 typedef struct {
     Scene                 scene;
@@ -1005,7 +1033,6 @@ static void clock_sleep_ns(int64_t ns){
 
 int main(void)
 {
-    srand((unsigned int)clock_ns());
     atexit(cleanup);
     signal(SIGINT,  on_exit);
     signal(SIGTERM, on_exit);

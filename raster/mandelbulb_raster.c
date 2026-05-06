@@ -1,31 +1,55 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * mandelbulb_raster.c — Mandelbulb software rasterizer
+ * mandelbulb_raster.c — software rasteriser of the Mandelbulb fractal
  *
- * Approach: mesh the Mandelbulb surface ONCE at startup via sphere projection
- * (march each UV-sphere ray inward to the implicit surface), then rotate and
- * rasterize in real time through the same triangle pipeline as cube_raster.c.
+ * DEMO: A spinning Mandelbulb (the canonical 8-power 3-D fractal) drawn
+ *       not by raymarching every pixel, but by MESHING the fractal once
+ *       at startup and then running it through a textbook rasteriser
+ *       every frame. At init we shoot a UV-sphere of rays from outside
+ *       the bulb inward, march each one with the distance estimator
+ *       until it touches the surface, and record the hit positions +
+ *       normals + smooth-iteration counts as triangle vertices. From
+ *       that moment on the bulb is just an ordinary mesh and renders
+ *       at 30 fps from any angle.
  *
- * Unlike the raymarcher (one DE march per pixel per frame), the rasterizer:
- *   - Pays mesh cost ONCE at startup (<0.2 s) — ~1800 triangles
- *   - Projects triangles to screen via MVP transform + z-buffer per frame
- *   - Interpolates per-vertex attributes (smooth iter, normal) barycentrically
- *   - Runs real vertex + fragment shaders, not per-pixel ray math
+ *       Cycle 's' through three fragment shaders:
+ *         phong_hue  — Blinn-Phong + HSV hue from smooth iterations
+ *         normals    — world-normal azimuth → hue (orientation map)
+ *         depth_hue  — pure smooth → hue, no lighting (compare to
+ *                      mandelbulb_raymarcher.c — same colour formula)
  *
- * The tradeoff: inner concavities and back-facing pods are hidden (sphere
- * projection only captures the outermost surface skin).  That is the
- * fundamental difference between rasterisation and raymarching.
+ *       Press 'p' / 'P' to change the fractal power (rebuilds mesh,
+ *       ~0.2 s freeze). Power 2 = round blob; power 8 = canonical
+ *       Mandelbulb; higher → more pod detail, longer build.
  *
- * 3 shaders (cycle with 's'):
- *   phong_hue  — Blinn-Phong lighting, smooth → HSV hue depth bands
- *   normals    — world normal azimuth → hue (orientation visualisation)
- *   depth_hue  — smooth → hue, no lighting  (direct compare to raymarcher)
+ *       Tradeoff vs raymarching: rasterisation requires explicit
+ *       triangles. Sphere projection captures only the OUTERMOST
+ *       skin — concave cavities and inner pods are missing. That's
+ *       not a bug; it's the fundamental difference between the two
+ *       rendering paradigms.
+ *
+ * Study alongside:
+ *   raytracing/mandelbulb_raymarcher.c  — same fractal, same colour map,
+ *                                          but per-pixel raymarched
+ *   raster/sphere_raster.c              — same sphere-grid topology
+ *   raster/cube_raster.c                — same shader / pipeline scaffolding
+ *
+ * Section map:
+ *   §1  config       — frame, view, mesh resolution, DE params, ramp
+ *   §2  math         — V3 / V4 / Mat4 helpers + hsv_to_rgb
+ *   §3  shaders      — phong_hue / normals / depth_hue + uniforms + VS
+ *   §4  mesh         — Mandelbulb DE + sphere-projection tessellation
+ *   §5  framebuffer  — zbuf + cbuf + 12-pair hue palette + Bourke + dither
+ *   §6  pipeline     — vertex transform → cull → barycentric raster → FS
+ *   §7  scene        — Scene struct, init / tick / draw / shader swap
+ *   §8  screen       — ncurses init / resize / HUD / present
+ *   §9  app          — main loop, signals, resize, cleanup
  *
  * Keys:
- *   s / S     cycle shader
- *   c         toggle back-face culling
- *   p / P     power +1 / -1  (2..16, rebuilds mesh)
- *   b         cycle hue bands (1..5 rainbow cycles)
+ *   s / S     cycle shader (phong_hue → normals → depth_hue)
+ *   c / C     toggle back-face culling
+ *   p / P     power +1 / -1   (2..16, rebuilds mesh — ~0.2 s pause)
+ *   b / B     cycle hue bands (1..5 rainbow cycles across the depth)
  *   + / =     zoom in
  *   -         zoom out
  *   space     pause / resume rotation
@@ -34,122 +58,162 @@
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra raster/mandelbulb_raster.c \
  *       -o mandelbulb_raster -lncurses -lm
- *
- * Sections
- * --------
- *   §1  config
- *   §2  math        Vec3 Vec4 Mat4 + hsv_to_rgb
- *   §3  shaders     phong_hue / normals / depth_hue
- *   §4  mesh        Mandelbulb DE + sphere-projection tessellation
- *   §5  framebuffer zbuf cbuf color_to_cell blit
- *   §6  pipeline    vertex transform · rasterize · draw
- *   §7  scene
- *   §8  screen / HUD
- *   §9  app / main
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Hybrid mesh-based Mandelbulb rendering.
- *                  Meshing: for each UV-sphere direction, march a ray inward
- *                  from outside to find where the Mandelbulb SDF ≈ 0.
- *                  This is a one-time O(TESS_U × TESS_V × MAX_MARCH) cost.
- *                  Rendering: project the resulting triangle mesh through the
- *                  standard rasterization pipeline — O(N_tris) per frame.
+ * Algorithm      : Hybrid raymarch-then-rasterise. The Mandelbulb is
+ *                  defined implicitly (no triangles), so we synthesise
+ *                  a triangle mesh from it ONCE: for each (lat, lon)
+ *                  on a UV sphere, march a ray inward from outside the
+ *                  bulb until the distance estimator says we touched
+ *                  the surface, then record (position, normal, smooth
+ *                  iter) at the hit point. Stitch quads from valid
+ *                  neighbours and emit two triangles each.
+ *                  After that init pass the renderer is a textbook
+ *                  forward rasteriser: vertex shader → clip → cull →
+ *                  barycentric raster → fragment shader. No DE evals
+ *                  per frame — the cost is hidden in the mesh.
  *
- * Math           : Mandelbulb SDF (estimated, not exact):
- *                    iterate z ← z^n + c; accumulate dr = n·|z|^(n-1)·dr + 1
- *                    return 0.5·log(|z|)·|z| / dr  (distance lower bound)
- *                  The meshed surface is only the outermost "skin" — concave
- *                  cavities and interior structure are not captured.
- *                  This is the fundamental limitation of rasterisation vs SDF
- *                  raymarching: rasterisation requires explicit surface geometry.
+ * Data-structure : Mesh = flat arrays of vertices and triangles, sized
+ *                  at most NLAT × NLON verts and (NLAT−1) × NLON × 2
+ *                  tris. Vertex carries (pos, normal, u=smooth, v=lon).
+ *                  Pressing 'p' calls tessellate_mandelbulb() with a
+ *                  new power and replaces the mesh wholesale.
  *
- * Trade-offs     : Rasterizer approach:
- *                  PRO: once meshed, rendering is O(N_tris) per frame — much
- *                       faster than re-raymarching every pixel every frame.
- *                  CON: meshing captures only the outermost surface; interior
- *                       detail (holes, overhangs) is lost.
+ * Rendering      : Standard z-buffer pipeline matching cube_raster.c.
+ *                  Per triangle: vert_mb runs (just MVP × pos +
+ *                  normal_mat × N + pass-through smooth) → perspective
+ *                  divide → screen → optional back-face cull →
+ *                  bounding-box raster with barycentric interp →
+ *                  one of three fragment shaders → 12-pair hue palette
+ *                  + Bourke ramp + Bayer dither.
+ *
+ * Performance    : Tessellation is O(NLAT × NLON × MAX_MARCH) at init
+ *                  (~0.2 s for the default 28 × 56). Rendering is
+ *                  O(N_tris × pixels_per_tri) per frame — the same
+ *                  cost as any small mesh (~1800 tris on default).
+ *                  The fundamental rasterisation tradeoff: only the
+ *                  outermost skin is captured. Inner pods, deep
+ *                  cavities, overhangs that the radial ray missed
+ *                  are absent. To see them, use mandelbulb_raymarcher.c.
+ *
+ * References     : Hubbard & Douady, "Étude dynamique des polynômes
+ *                    complexes," Pub. Math. Orsay '85 (DE for Julia
+ *                    sets — origin of the 0.5·log(r)·r/dr formula).
+ *                  White & Nylander, "Hypercomplex Fractals," 2009
+ *                    (the spherical-power Mandelbulb formulation).
+ *                  Inigo Quilez, "Mandelbulb distance estimator":
+ *                    https://iquilezles.org/articles/mandelbulb/
+ *                  Möller, "Fast Triangle Rasterization by
+ *                    Interpolating Edge Functions," GPG (2000).
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
  *
  * CORE IDEA
  * ─────────
- * The Mandelbulb is defined implicitly by an SDF — there is no list of
- * triangles to draw. So we MAKE one: at startup, we shoot 28×56 rays from
- * outside the bulb inward, march each one until the SDF tells us we've
- * hit the surface, and record those hit points as mesh vertices. Then we
- * stitch them into triangles. From that frame onward the bulb is just an
- * ordinary mesh and goes through a textbook MVP-and-rasterise pipeline.
+ * The Mandelbulb has no triangles. We INVENT them. At startup, shoot
+ * a UV sphere of rays from outside the fractal inward; march each ray
+ * with the distance estimator until it touches the surface; record
+ * those hit points as vertices. Stitch them into triangles. From that
+ * point the bulb is an ordinary mesh — no per-pixel DE math, just
+ * MVP-and-rasterise, hence the 30 fps in a terminal.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
- * Imagine wrapping a balloon around the fractal and pulling it tight: the
- * balloon takes the shape of the outermost skin and ignores any inner
- * caves. The UV-sphere of rays IS that balloon. The mesh you get cannot
- * show concavities or interior pods (those need raymarching), but it
- * captures the recognisable Mandelbulb silhouette and rotates at 30 fps
- * on a CPU because each frame is just `n_tris × per-vertex math`, not
- * `pixels × march_steps`.
+ * Wrap a stretchy balloon around the fractal and pull it tight. The
+ * balloon hugs the outermost skin and ignores any cavities. The UV
+ * sphere of rays IS that balloon. The price you pay is that inner
+ * pods, deep concavities, and overhangs are gone — they were inside
+ * the balloon, never reached by a radial ray. To see them, run
+ * mandelbulb_raymarcher.c instead.
  *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Build mesh ONCE (tessellate_mandelbulb):
- *       For each (i,j) in 28×56 UV grid:
- *         a. dir = (cosθcosφ, sinθ, cosθsinφ); start at r = 1.5 outside.
- *         b. Step inward: r -= mb_de(p)·0.85 until DE < MB_HIT_EPS or
- *            ray miss (r < 0 or step cap).
- *         c. Record (pos, gradient-normal, smooth_iter as `u`) → Vertex.
- *       Stitch quads from each set of 4 valid neighbours; emit 2 tris.
- *  2. Each frame:
- *       a. Build MVP = proj · view · model(rotation_x · rotation_y).
- *       b. Run vert_mb on every vertex: clip_pos, world_pos, world_nrm.
- *       c. For each triangle: clip cull → NDC → screen-space → optional
- *          back-face cull → barycentric rasterise → z-test → frag shader.
- *       d. Frag shader writes RGB into cbuf[]; framebuffer holds zbuf[].
- *  3. Pick a glyph by Bayer-dithered luma into the Bourke ramp; map RGB
- *     to the nearest of HUE_N=12 colour pairs; mvaddch + colour pair.
- *  4. Pressing 'p' rebuilds the mesh from scratch with a new power; cost
- *     is one-time, not per-frame.
+ *      ┌──────────────────────────────────────────────┐
+ *      │  raymarch (per pixel)        rasterise (per tri)│
+ *      │                                              │
+ *      │   pix → march → DE          mesh → MVP → raster│
+ *      │   sees inner cavities       only outer skin  │
+ *      │   60 ms / frame             1 ms / frame     │
+ *      └──────────────────────────────────────────────┘
+ *
+ * DRAWING METHOD  /  ALGORITHM IN STEPS
+ * ─────────────────────────────────────
+ *  1. tessellate_mandelbulb() runs ONCE at init (or on 'p'):
+ *       For each (lat, lon) on a NLAT × NLON UV sphere:
+ *         dir = (cos θ cos φ, sin θ, cos θ sin φ)
+ *         r   = 1.5                          // start outside
+ *         while DE(dir·r) > MB_HIT_EPS:
+ *             r -= max(DE · 0.85, 0.004)     // safe march step
+ *             if r < 0.01: break             // miss (no surface)
+ *         if hit:
+ *             record vertex (pos, gradient_normal, smooth_iter, lon)
+ *       Stitch quads → 2 triangles each.
+ *
+ *  2. Per frame:
+ *       a. Build MVP = proj · view · rot_x(t) · rot_y(t).
+ *       b. vert_mb runs on every vertex: clip + world pos + world nrm.
+ *       c. For each triangle: cull → NDC → screen → optional back-face
+ *          cull → barycentric raster → z-test → fragment shader.
+ *       d. fragment writes Vec3 colour → color_to_cell → glyph + pair.
+ *
+ *  3. Pressing 'p' calls tessellate_mandelbulb() again with a new
+ *     power. Cost is one-time per press, not per-frame.
  *
  * KEY FORMULAS
  * ────────────
- *  z_{n+1} = z_n^p + c          spherical-power Mandelbulb iteration
- *  dr_{n+1} = p·r^(p-1)·dr + 1   running derivative for DE estimate
- *  de = 0.5·log(r)·r / dr        Hubbard-Douady distance estimator
- *  smooth = (esc + 1 − log(log(r)/log(bail))/log(p)) / max_iter
- *  z^p     = r^p·(sin pθ·cos pφ, sin pθ·sin pφ, cos pθ)
- *  hue     = fmod(smooth · hue_bands, 1)        rainbow shells
- *  Bourke: glyph_idx = (luma + bayer[y%4][x%4]/16) · 91
+ *   Spherical power     z^p = r^p · (sin pθ · cos pφ, sin pθ · sin pφ, cos pθ)
+ *   Mandelbulb iter     z_{n+1} = z_n^p + c     (start z = 0, c = pos)
+ *   DE recurrence       dr_{n+1} = p · r^(p−1) · dr + 1
+ *   Hubbard-Douady DE   de = 0.5 · log(r) · r / dr
+ *   Smooth iter         μ = esc + 1 − log(log(r)/log(bail)) / log(p)
+ *                        normalised by max_iter ∈ [0, 1]
+ *   Hue rainbow         hue = fmod(μ · HUE_BANDS, 1)
+ *   Glyph index         i = (luma + bayer[y%4][x%4]/16) · (BOURKE_LEN − 1)
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *  • Sphere projection misses inner pods — by design. If you see "missing"
- *    geometry compared to the raymarcher, that's the trade-off, not a bug.
- *  • Ray stepping at 0.85 × DE is a safety multiplier; full step (1.0)
- *    sometimes overshoots the surface and falls through.
- *  • mb_de can return ≈0 inside the set; the `r < 1e-7` early return
- *    prevents divide-by-zero.
- *  • Pressing 'p' rebuilds NLAT·NLON·MB_MARCH_STEPS rays — ~0.2s freeze.
- *    Acceptable but visible. Don't spam the key.
- *  • Vertex `u` field is reused as smooth_iter (NOT a UV coordinate);
- *    fragment shaders read in->custom[0] which the vert shader copied
- *    from in->u. Confusing but intentional.
- *  • Back-face cull (toggle 'c') may hide the front face of inverted
- *    triangles; if a chunk vanishes, disable cull to verify winding.
+ *   • Sphere projection misses inner pods BY DESIGN. The mesh captures
+ *     only the radially-outermost surface. To compare with full DE
+ *     coverage, run raytracing/mandelbulb_raymarcher.c.
+ *
+ *   • The 0.85 multiplier on the march step is a SAFETY factor. Full
+ *     step (1.0 × DE) sometimes overshoots and the ray punches
+ *     through the surface — a "missed" vertex.
+ *
+ *   • mb_de returns ≈0 inside the set; the `r < 1e-7` early return in
+ *     mb_de avoids dividing by zero.
+ *
+ *   • Pressing 'p' rebuilds NLAT × NLON × MB_MARCH_STEPS rays — about
+ *     0.2 s. The HUD freezes during the rebuild; that's normal.
+ *
+ *   • Vertex.u carries SMOOTH ITER, not a UV coord. The vertex shader
+ *     forwards it to in->custom[0] for the fragment shaders. Calling
+ *     it `u` is historical baggage from sphere_raster.c.
+ *
+ *   • Back-face cull may swallow inverted triangles (e.g. when a pod
+ *     creates a near-degenerate quad). Toggle 'c' to see the inside
+ *     triangles peeking through if a chunk seems to vanish.
  *
  * HOW TO VERIFY
  * ─────────────
- *  • Pause rotation (space). The Mandelbulb's classic 8-bulb silhouette
- *    should be recognisable from any frozen frame at default power=8.
- *  • Power=2 should give a smooth round blob (no fractal detail).
- *  • depth_hue shader should rainbow-shell from outside-red to inside-
- *    violet (or whatever HUE_BANDS picks).
- *  • Toggle backface cull; with cull ON the silhouette becomes more
- *    crisp, with cull OFF you can see "inside" tris that bleed through.
- *  • At zoom max, the surface should fill ~80% of the terminal; at zoom
- *    min, it shrinks to a small ball with the same hue mapping.
+ *   • Pause rotation (space). The classic 8-bulb silhouette should
+ *     be unmistakable at the default power 8.
+ *
+ *   • Press 'P' down to power 2 — the bulb should smooth out into an
+ *     almost round blob (no fractal pods at p=2). Press 'p' up to 16
+ *     to see exaggerated detail (and a longer rebuild).
+ *
+ *   • depth_hue shader: every concentric "shell" of fractal depth
+ *     gets a different hue. Outer shell red, inner shells cycling
+ *     through the rainbow per HUE_BANDS settings.
+ *
+ *   • Toggle 'c' off — you can see back-facing triangles bleed
+ *     through. With it on the silhouette becomes crisp.
+ *
+ *   • The HUD's tris count should match the mesh size (≈ 1800 at
+ *     default power). It changes as you press 'p'/'P'.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -170,9 +234,7 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ───────────────────────────────────────────────────────── */
 
 enum {
     FPS_TARGET    = 30,
@@ -213,9 +275,12 @@ enum {
 #define MB_POWER_MIN      2
 #define MB_POWER_MAX     16
 
-/* Hue color pairs */
-#define HUE_N    12          /* 12-step rainbow wheel (30° each)   */
-#define CP_HUD  (HUE_N + 1)  /* bright white for HUD overlay        */
+/* Hue color pairs — 12-step rainbow wheel (30° per pair) for the
+ * fragment shader output, plus two named HUD pairs (yellow status
+ * and cyan key hint per the CLAUDE.md HUD spec). */
+#define HUE_N      12              /* 12-step rainbow */
+#define PAIR_HUD   (HUE_N + 1)     /* bright yellow status */
+#define PAIR_HINT  (HUE_N + 2)     /* bright cyan hint     */
 
 /* Default hue bands: how many full rainbow cycles span smooth [0,1] */
 #define HUE_BANDS_DEFAULT  3
@@ -237,9 +302,7 @@ static const float k_bayer[4][4] = {
 #define NS_PER_SEC  1000000000LL
 #define NS_PER_MS      1000000LL
 
-/* ===================================================================== */
-/* §2  math                                                               */
-/* ===================================================================== */
+/* ── §2 math (V3, V4, Mat4 + hsv_to_rgb) ─────────────────────────────── */
 
 typedef struct { float x, y, z;    } Vec3;
 typedef struct { float x, y, z, w; } Vec4;
@@ -348,9 +411,7 @@ static Vec3 hsv_to_rgb(float h, float s, float v)
     }
 }
 
-/* ===================================================================== */
-/* §3  shaders                                                            */
-/* ===================================================================== */
+/* ── §3 shaders — VS + 3 FS variants + uniforms ──────────────────────── */
 
 typedef struct { Vec3 pos; Vec3 normal; float u, v; } VSIn;
 typedef struct {
@@ -468,9 +529,7 @@ static void frag_depth_hue(const FSIn *in, FSOut *out, const void *u_)
 typedef enum { SH_PHONG_HUE=0, SH_NORMALS, SH_DEPTH_HUE, SH_COUNT } ShaderIdx;
 static const char *k_shader_names[] = { "phong_hue", "normals  ", "depth_hue" };
 
-/* ===================================================================== */
-/* §4  mesh — Mandelbulb DE + sphere-projection tessellation             */
-/* ===================================================================== */
+/* ── §4 mesh — Mandelbulb DE + sphere-projection tessellation ─────────── */
 
 typedef struct { Vec3 pos; Vec3 normal; float u, v; } Vertex;
 typedef struct { int v[3]; } Triangle;
@@ -479,30 +538,41 @@ typedef struct { Vertex *verts; int nvert; Triangle *tris; int ntri; } Mesh;
 static void mesh_free(Mesh *m){ free(m->verts); free(m->tris); *m=(Mesh){0}; }
 
 /*
- * mb_de() — Mandelbulb distance estimator + smooth iteration count.
+ * mb_de — Mandelbulb distance estimator + (optional) smooth iteration.
  *
- * Spherical power formula:
- *   z^p → r^p · (sin(pθ)cos(pφ), sin(pθ)sin(pφ), cos(pθ))
- * DE:   dr_{n+1} = p · r^(p-1) · dr + 1;   de = 0.5·log(r)·r/dr
- * Smooth: mu = esc_i + 1 − log(log(r)/log(bail)) / log(power)
+ * Iterates z ← z^p + c (with c = pos, the start point) tracking the
+ * running derivative dr that the Hubbard-Douady formula needs:
  *
- * out_smooth may be NULL (used in the normal estimation loop).
+ *   spherical power     z^p = r^p · (sin pθ · cos pφ,
+ *                                    sin pθ · sin pφ,
+ *                                    cos pθ)
+ *   derivative recur.   dr_{n+1} = p · r^(p−1) · dr + 1
+ *   distance estimate   de = 0.5 · log(r) · r / dr
+ *
+ * If `out_smooth` is non-NULL, also writes a smooth iteration count
+ * normalised to [0, 1] for hue colouring. Pass NULL when computing
+ * normals (where smooth isn't needed).
  */
 static float mb_de(Vec3 pos, float power, int max_iter, float *out_smooth)
 {
-    Vec3  z  = pos;
-    float dr = 1.0f, r = 0.0f;
-    int   esc = max_iter;
+    Vec3  z   = pos;
+    float r   = 0.0f;
+    float dr  = 1.0f;
+    int   esc = max_iter;        /* iteration at which |z| escaped bail   */
 
     for (int i = 0; i < max_iter; i++) {
         r = v3_len(z);
         if (r > MB_BAIL) { esc = i; break; }
 
+        /* spherical coordinates of z */
         float theta = acosf(z.z / (r + 1e-8f));
         float phi   = atan2f(z.y, z.x);
-        float rp    = powf(r, power);
-        dr = rp / r * power * dr + 1.0f;
 
+        /* update derivative running product */
+        float rp = powf(r, power);                  /* = r^p              */
+        dr = (rp / r) * power * dr + 1.0f;          /* = p·r^(p-1)·dr + 1 */
+
+        /* z ← z^p + c (the original pos plays the role of c here) */
         float st = sinf(power * theta), ct = cosf(power * theta);
         float sp = sinf(power * phi),   cp = cosf(power * phi);
         z = v3_add(v3_scale(v3(st*cp, st*sp, ct), rp), pos);
@@ -519,47 +589,94 @@ static float mb_de(Vec3 pos, float power, int max_iter, float *out_smooth)
         }
     }
 
-    if (r < 1e-7f) return 0.0f;
-    return 0.5f * logf(r) * r / dr;
+    if (r < 1e-7f) return 0.0f;          /* deep inside the set           */
+    return 0.5f * logf(r) * r / dr;      /* Hubbard-Douady DE             */
 }
 
 /*
- * mb_normal() — surface normal from DE gradient (central differences).
- * Uses MB_AUX_ITERS for speed — lower than full quality but fine for normals.
+ * mb_normal — surface normal at p as the gradient of the DE.
+ *
+ * Six DE samples (±H along each axis), the DE differences give the
+ * gradient, normalising gives the surface normal. Uses MB_AUX_ITERS
+ * (cheaper) — full-quality iteration isn't needed for direction,
+ * only for distance.
  */
 static Vec3 mb_normal(Vec3 p, float power)
 {
     const float H = 0.012f;
-    float d0, d1;
-    float dx = mb_de(v3(p.x+H,p.y,p.z), power, MB_AUX_ITERS, NULL)
-             - mb_de(v3(p.x-H,p.y,p.z), power, MB_AUX_ITERS, NULL);
-    float dy = mb_de(v3(p.x,p.y+H,p.z), power, MB_AUX_ITERS, NULL)
-             - mb_de(v3(p.x,p.y-H,p.z), power, MB_AUX_ITERS, NULL);
-    float dz = mb_de(v3(p.x,p.y,p.z+H), power, MB_AUX_ITERS, NULL)
-             - mb_de(v3(p.x,p.y,p.z-H), power, MB_AUX_ITERS, NULL);
-    (void)d0; (void)d1;
+    float dx = mb_de(v3(p.x+H, p.y, p.z), power, MB_AUX_ITERS, NULL)
+             - mb_de(v3(p.x-H, p.y, p.z), power, MB_AUX_ITERS, NULL);
+    float dy = mb_de(v3(p.x, p.y+H, p.z), power, MB_AUX_ITERS, NULL)
+             - mb_de(v3(p.x, p.y-H, p.z), power, MB_AUX_ITERS, NULL);
+    float dz = mb_de(v3(p.x, p.y, p.z+H), power, MB_AUX_ITERS, NULL)
+             - mb_de(v3(p.x, p.y, p.z-H), power, MB_AUX_ITERS, NULL);
     return v3_norm(v3(dx, dy, dz));
 }
 
 /*
- * tessellate_mandelbulb() — generate a triangle mesh for the Mandelbulb.
+ * uv_sphere_direction — convert grid (lat, lon) indices to a unit
+ * direction on a sphere. Latitude i ∈ [0, NLAT−1] maps to θ ∈ [−π/2,
+ * +π/2]; longitude j maps to φ ∈ [0, 2π).
  *
- * Strategy: sphere projection.
- *   1. Lay a NLAT × NLON UV grid over a unit sphere.
- *   2. For each grid point (lat θ, lon φ), shoot a ray from radius 1.5
- *      inward along direction (cos θ cos φ, sin θ, cos θ sin φ).
- *   3. March inward using the DE as a safe step: r -= DE * 0.85.
- *   4. On hit (DE < MB_HIT_EPS): record position, SDF-gradient normal,
- *      and smooth iteration count → vertex.
- *   5. On miss (r < 0 or max steps): mark invalid, skip adjacent quads.
- *   6. Build quads from valid neighbouring grid vertices → triangles.
+ *   dir = (cos θ · cos φ, sin θ, cos θ · sin φ)
+ */
+static Vec3 uv_sphere_direction(int i, int j)
+{
+    float theta = -(float)M_PI * 0.5f
+                + ((float)i / (float)(NLAT - 1)) * (float)M_PI;
+    float phi   = ((float)j / (float)NLON) * 2.0f * (float)M_PI;
+    float ct    = cosf(theta);
+    return v3(ct * cosf(phi), sinf(theta), ct * sinf(phi));
+}
+
+/*
+ * cast_ray_to_surface — march a ray from outside the bulb inward
+ * along `dir` until the DE says we've touched the surface, or the
+ * ray reaches the origin without hitting anything.
  *
- * Limitation: only the outermost surface visible from each radial
- * direction is captured.  Inner pods and concave fold interiors are
- * hidden — that is the fundamental rasterisation vs raymarching trade-off.
+ *   r = 1.5
+ *   loop:
+ *       p = dir · r
+ *       d = DE(p)
+ *       if d < HIT_EPS:  return hit at p, with smooth-iter for hue
+ *       r -= max(d · 0.85, 0.004)        // safe step (0.85 = safety margin)
+ *       if r < 0.01:     return miss
  *
- * The vertex 'u' field carries the smooth iteration value so that
- * fragment shaders can colour by fractal depth.
+ * The 0.85 multiplier on the step is a safety factor — full-step
+ * marching (1.0 × DE) sometimes overshoots and the ray punches
+ * through the surface. 0.004 minimum step keeps tiny-DE regions
+ * making forward progress.
+ *
+ * Returns true on hit; out_pos and out_smooth are written only then.
+ */
+static bool cast_ray_to_surface(Vec3 dir, float power,
+                                Vec3 *out_pos, float *out_smooth)
+{
+    float r = 1.5f;
+    for (int step = 0; step < MB_MARCH_STEPS; step++) {
+        Vec3  p = v3_scale(dir, r);
+        float d = mb_de(p, power, MB_ITERS, NULL);
+
+        if (d < MB_HIT_EPS) {
+            mb_de(p, power, MB_ITERS, out_smooth);   /* second pass: smooth */
+            *out_pos = p;
+            return true;
+        }
+        r -= fmaxf(d * 0.85f, 0.004f);
+        if (r < 0.01f) return false;
+    }
+    return false;
+}
+
+/*
+ * tessellate_mandelbulb — build a triangle mesh of the Mandelbulb's
+ * outermost skin via sphere projection. Walks an NLAT × NLON UV grid;
+ * for each cell shoots a ray inward (cast_ray_to_surface); records hits
+ * as vertices; stitches valid quads into 2 CCW triangles each.
+ *
+ * Vertex.u stores the SMOOTH ITER (later forwarded to fragment
+ * shaders for hue colouring), NOT a UV coordinate. Vertex.v holds
+ * the longitude — currently unused but free for textured shaders.
  */
 static Mesh tessellate_mandelbulb(float power)
 {
@@ -568,47 +685,21 @@ static Mesh tessellate_mandelbulb(float power)
 
     Vertex   *verts = malloc((size_t)max_v * sizeof(Vertex));
     Triangle *tris  = malloc((size_t)max_t * sizeof(Triangle));
-    int      *vidx  = malloc((size_t)max_v * sizeof(int));  /* grid → vert idx or -1 */
+    int      *vidx  = malloc((size_t)max_v * sizeof(int));  /* grid → vert idx, or -1 for miss */
+    int       nvert = 0, ntri = 0;
 
-    int nvert = 0, ntri = 0;
-    float smooth_dummy;
-
+    /* Step 1 — cast one ray per grid cell, collect hits as vertices. */
     for (int i = 0; i < NLAT; i++) {
         for (int j = 0; j < NLON; j++) {
-            /* UV sphere direction for this grid point */
-            float theta = -(float)M_PI * 0.5f
-                        + ((float)i / (float)(NLAT - 1)) * (float)M_PI;
-            float phi   = ((float)j / (float)NLON) * 2.0f * (float)M_PI;
+            Vec3  hit_pos;
+            float smooth;
+            Vec3  dir = uv_sphere_direction(i, j);
 
-            float ct = cosf(theta);
-            Vec3 dir = v3(ct * cosf(phi), sinf(theta), ct * sinf(phi));
-
-            /* March inward from r=1.5 until surface hit or miss */
-            float r   = 1.5f;
-            bool  hit = false;
-            Vec3  hit_pos = v3(0,0,0);
-            float smooth  = 0.f;
-
-            for (int step = 0; step < MB_MARCH_STEPS; step++) {
-                Vec3  p = v3_scale(dir, r);
-                float d = mb_de(p, power, MB_ITERS, NULL);
-
-                if (d < MB_HIT_EPS) {
-                    /* Refine once for smooth coloring */
-                    mb_de(p, power, MB_ITERS, &smooth);
-                    hit_pos = p;
-                    hit = true;
-                    break;
-                }
-                r -= fmaxf(d * 0.85f, 0.004f);
-                if (r < 0.01f) break;
-            }
-
-            if (hit) {
+            if (cast_ray_to_surface(dir, power, &hit_pos, &smooth)) {
                 vidx[i * NLON + j] = nvert;
                 verts[nvert].pos    = hit_pos;
                 verts[nvert].normal = mb_normal(hit_pos, power);
-                verts[nvert].u      = smooth;   /* smooth → hue in shaders */
+                verts[nvert].u      = smooth;                  /* hue input */
                 verts[nvert].v      = (float)j / (float)NLON;
                 nvert++;
             } else {
@@ -617,8 +708,8 @@ static Mesh tessellate_mandelbulb(float power)
         }
     }
 
-    /* Build triangles from valid neighbouring grid quads.
-     * CCW winding: matches cube_raster.c convention (area > 0 = front face). */
+    /* Step 2 — stitch quads from valid neighbouring grid vertices.
+     * CCW winding matches cube_raster.c (area > 0 = front face). */
     for (int i = 0; i < NLAT - 1; i++) {
         for (int j = 0; j < NLON; j++) {
             int j1 = (j + 1) % NLON;
@@ -628,21 +719,17 @@ static Mesh tessellate_mandelbulb(float power)
             int v11 = vidx[(i + 1) * NLON + j1 ];
 
             if (v00 >= 0 && v01 >= 0 && v11 >= 0)
-                tris[ntri++] = (Triangle){{v00, v11, v01}};
+                tris[ntri++] = (Triangle){{ v00, v11, v01 }};
             if (v00 >= 0 && v10 >= 0 && v11 >= 0)
-                tris[ntri++] = (Triangle){{v00, v10, v11}};
+                tris[ntri++] = (Triangle){{ v00, v10, v11 }};
         }
     }
 
     free(vidx);
-    (void)smooth_dummy;
-
     return (Mesh){ verts, nvert, tris, ntri };
 }
 
-/* ===================================================================== */
-/* §5  framebuffer                                                        */
-/* ===================================================================== */
+/* ── §5 framebuffer — zbuf + cbuf + 12-pair hue palette + Bourke ──────── */
 
 typedef struct { char ch; int color_pair; bool bold; } Cell;
 typedef struct { float *zbuf; Cell *cbuf; int cols, rows; } Framebuffer;
@@ -683,8 +770,13 @@ static void color_init(void){
         else
             init_pair(i + 1, k_hue8[i], COLOR_BLACK);
     }
-    if (COLORS >= 256) init_pair(CP_HUD, 255, -1);
-    else               init_pair(CP_HUD, COLOR_WHITE, -1);
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,  226, -1);     /* bright yellow */
+        init_pair(PAIR_HINT,  51, -1);     /* bright cyan   */
+    } else {
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
+    }
 }
 
 /*
@@ -743,9 +835,7 @@ static void fb_blit(const Framebuffer *fb){
     }
 }
 
-/* ===================================================================== */
-/* §6  pipeline                                                           */
-/* ===================================================================== */
+/* ── §6 pipeline — vertex transform → cull → barycentric raster → FS ─── */
 
 static void barycentric(const float sx[3], const float sy[3],
                         float px, float py, float b[3])
@@ -836,9 +926,7 @@ static void pipeline_draw_mesh(Framebuffer *fb, const Mesh *mesh,
     }
 }
 
-/* ===================================================================== */
-/* §7  scene                                                              */
-/* ===================================================================== */
+/* ── §7 scene — Scene struct, init / tick / draw / shader swap ────────── */
 
 typedef struct {
     Mesh          mesh;
@@ -919,9 +1007,7 @@ static void scene_draw(Scene *s, Framebuffer *fb)
     fb_blit(fb);
 }
 
-/* ===================================================================== */
-/* §8  screen                                                             */
-/* ===================================================================== */
+/* ── §8 screen — ncurses init / resize / HUD / present ────────────────── */
 
 typedef struct { int cols, rows; } Screen;
 
@@ -934,26 +1020,34 @@ static void screen_init(Screen *s){
 static void screen_free(Screen *s){ (void)s; endwin(); }
 static void screen_resize(Screen *s){ endwin(); refresh(); getmaxyx(stdscr, s->rows, s->cols); }
 
+/* HUD layout (CLAUDE.md spec):
+ *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
+ *   row rows-1     PAIR_HINT (cyan + bold)   — key hint                       */
 static void screen_draw_hud(const Screen *sc, const Scene *s, double fps)
 {
-    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvprintw(0, 0,
-             " Mandelbulb Raster  %.1f fps  tris:%d  power:%.0f  "
-             "bands:%d  [%s]%s%s ",
+    char status[140];
+    snprintf(status, sizeof status,
+             " %5.1f fps  tris:%d  power:%.0f  bands:%d  shader:%s  cull:%s%s ",
              fps, s->mesh.ntri, s->power, s->hue_bands,
              k_shader_names[s->shade_idx],
-             s->cull_backface ? "  cull" : "  show",
-             s->paused ? "  PAUSED" : "");
+             s->cull_backface ? "on " : "off",
+             s->paused ? " PAUSED" : "");
+    int slen = (int)strlen(status); if (slen > sc->cols) slen = sc->cols;
+
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, sc->cols - slen, "%s", status);
+    mvprintw(0, 0, " MANDELBULB · RASTER ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(sc->rows - 1, 0,
-             "s=shader  c=cull  p/P=power(rebuild)  b=bands  +/-=zoom  spc=pause  q=quit");
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+             " q:quit  spc:pause  s:shader  c:cull  p/P:power  b:bands  +/-:zoom ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void){ wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §9  app                                                                */
-/* ===================================================================== */
+/* ── §9 app — main loop, signals, resize, cleanup ─────────────────────── */
 
 typedef struct {
     Scene                 scene;

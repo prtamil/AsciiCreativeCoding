@@ -1,235 +1,291 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * cube_raster.c  —  ncurses software rasterizer, cube demo
+ * cube_raster.c — software rasteriser, cube demo
  *
- * One primitive: axis-aligned unit cube, 6 faces × 2 triangles = 12 triangles.
- * Four shaders cycled with  s : phong / toon / normals / wireframe
+ * DEMO: A textured glossy cube (warm orange) tumbling on a black
+ *       background. Cycle through phong → toon → normals → wire to
+ *       see four shading models running on the same triangle mesh.
+ *       Press 'c' to toggle back-face culling and watch the inside
+ *       faces appear; press '+' / '-' to zoom.
  *
- * The cube is a good complement to the torus demo:
- *   - Flat faces make per-face normal shading visible as hard steps
- *   - Sharp edges make the barycentric wireframe threshold very clean
- *   - Toon banding is dramatic because each face is uniformly lit
- *   - Normal shader shows 6 distinct colours — one per face direction
+ *       This is the smallest possible software rasteriser:
+ *           - 24 vertices (6 faces × 4 corners, flat-normal duplicated)
+ *           - 12 triangles (each face is a quad split into 2 tris)
+ *           - 4 shaders pluggable as function pointers
+ *           - z-buffer, back-face cull, barycentric rasteriser
+ *           - continuous RGB pipeline → 6×6×6 cube + 92-char Bourke ramp
  *
- * Pipeline identical to torus_raster.c.
- * Only §4 (tessellation) changes — everything else is a direct copy
- * with cube-specific geometry constants.
+ * Study alongside:
+ *   raster/sphere_raster.c           — same skeleton, smooth normals
+ *   raster/torus_raster.c            — same skeleton, parametric tessellation
+ *   raster/displace_raster.c         — same skeleton + vertex displacement
+ *   raster/deferred_rendering_pipeline.c — same skeleton + G-buffer
+ *
+ * Section map:
+ *   §1 config        — frame rate, FOV, cube geometry, ramp, ncurses pairs
+ *   §2 clock         — monotonic timer + sleep
+ *   §3 math          — V3, V4, Mat4 (transform matrices)
+ *   §4 paint         — 216-pair RGB cube + Bourke ramp + paint_cell
+ *   §5 shaders       — VS/FS function-pointer interface + 4 shader pairs
+ *                      §5.1 types     §5.2 default vertex shader
+ *                      §5.3 phong     §5.4 toon
+ *                      §5.5 normals   §5.6 wire (barycentric edge detection)
+ *   §6 mesh          — cube tessellation (24 vertices, 12 triangles)
+ *   §7 framebuffer   — z-buffer + cell buffer + clear/blit
+ *   §8 pipeline      — barycentric + per-triangle rasteriser
+ *                      §8.1 barycentric (Möller signed-area form)
+ *                      §8.2 pipeline_draw_mesh (vert → cull → raster → frag)
+ *   §9 scene         — Uniforms, scene_tick, shader swap
+ *   §10 screen       — ncurses init + HUD (yellow row 0 + cyan bottom)
+ *   §11 app          — signals, resize, fixed-step main loop
  *
  * Keys:
- *   s / S     cycle shader  (phong → toon → normals → wireframe)
- *   c / C     toggle back-face culling
+ *   s         cycle shader (phong → toon → normals → wire)
+ *   c         toggle back-face culling
+ *   space     pause / resume rotation
  *   + / =     zoom in
  *   -         zoom out
- *   space     pause / resume rotation
  *   q / ESC   quit
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra cube_raster.c -o cube -lncurses -lm
- *
- * Sections
- * --------
- *   §1  config
- *   §2  math         Vec3 Vec4 Mat4
- *   §3  shaders      VSIn VSOut FSIn FSOut + 4 vert/frag pairs
- *   §4  mesh         cube tessellation (6 faces, flat normals)
- *   §5  framebuffer  zbuf cbuf dither paulbourke blit
- *   §6  pipeline     vertex transform · rasterize · draw
- *   §7  scene        uniforms · tick · draw · shader swap
- *   §8  screen       ncurses init/resize/hud/present
- *   §9  app          dt loop · input · resize · cleanup
+ *   gcc -std=c11 -O2 -Wall -Wextra raster/cube_raster.c -o cube_rt -lncurses -lm
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Same software rasterization pipeline as torus_raster.c.
- *                  The cube demonstrates flat normals (per-face, not per-vertex).
- *                  Each face has a single outward normal; vertices at shared
- *                  edges are duplicated (3 vertices per face corner) to allow
- *                  distinct normals from each face's perspective.
+ * Algorithm      : Software rasterisation in the classic 1990s pipeline:
+ *                  vertex shader → perspective divide → screen mapping
+ *                  → back-face cull → barycentric rasteriser → fragment
+ *                  shader → z-test → write framebuffer cell.
  *
- * Math           : Flat normals: N is constant across each face = one of
- *                  ±(1,0,0), ±(0,1,0), ±(0,0,1) in model space.
- *                  Smooth vs flat normals: smooth normals are averaged at shared
- *                  vertices (good for organic shapes); flat normals show the
- *                  polyhedron facets (good for hard-surface models like the cube).
- *                  Toon shading: quantise the diffuse term to 3 bands —
- *                  the dramatic band at 50% simulates cel-shading.
+ *                  The cube is a TEACHING choice: 6 flat faces with
+ *                  duplicated vertices (4 per face) make the shading
+ *                  model visible as hard steps — phong shows uniform
+ *                  diffuse per face, toon shows hard cel boundaries
+ *                  between faces, normals shows 6 distinct face colours,
+ *                  wire shows the 12-edge silhouette via barycentric
+ *                  edge detection.
  *
- * Rendering      : Wireframe mode via barycentric edge detection: when any
- *                  barycentric coordinate < WIRE_THRESHOLD, draw as edge colour.
- *                  This avoids separate edge rendering; the wireframe emerges from
- *                  the rasterisation loop itself.
+ *                  The output pipeline is identical to the raytracing
+ *                  folder's: continuous RGB → Reinhard tone-map → gamma
+ *                  → 6×6×6 cube + 92-char Bourke ramp + A_BOLD/A_DIM.
+ *                  This unifies the rendering across every demo in the
+ *                  raster + raytracer folders.
+ *
+ * Data-structure : `Mesh` = static array of `Vertex` (pos, normal, uv) +
+ *                  static array of `Triangle` (3 indices). Cube has 24
+ *                  vertices, 12 triangles, allocated ONCE at startup.
+ *                  `Framebuffer` = z-buffer (float per cell, init +∞) +
+ *                  colour buffer (Cell per cell: char + pair + attr).
+ *                  Reset between frames with `fb_clear`.
+ *                  Shaders are FUNCTION POINTERS — plug-and-play; the
+ *                  pipeline doesn't know what they do.
+ *
+ * Rendering      : Per fragment: V3 colour from frag shader → Reinhard
+ *                  tone-map per channel → gamma 1/2.2 encode → quantise
+ *                  to 216-cell xterm cube → density char from Bourke
+ *                  92-char ramp by Rec.709 luma. Bayer 4×4 dither
+ *                  perturbs luma slightly so neighbouring cells with
+ *                  similar brightness pick different glyphs (smoother
+ *                  gradients on coarse grid).
+ *
+ * Performance    : 12 triangles · ~rows×cols rasterisation cells per
+ *                  frame. Bottleneck is per-fragment cost (4 luma
+ *                  computes + dither + cube quantise + ramp lookup).
+ *                  At 240×80 cells × 60 fps ≈ 4 ms shading per frame.
+ *
+ * References     : Real-Time Rendering 4e §23 (software rasterisation).
+ *                  Möller, "Fast triangle rasterisation by interpolating
+ *                    edge functions," Game Programming Gems (2000).
+ *                    The signed-area barycentric form used in §8.1.
+ *                  Foley, van Dam, Feiner & Hughes, "Computer Graphics:
+ *                    Principles and Practice" 3e §10.4 (rasterisation
+ *                    fundamentals).
+ *                  Reinhard et al., "Photographic Tone Reproduction for
+ *                    Digital Images," SIGGRAPH '02.
+ *                  Tanner Helland (blackbody) — used elsewhere in the
+ *                    raytracer folder; unrelated here but the same
+ *                    paint pipeline is shared.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
  *
  * CORE IDEA
  * ─────────
- * A unit cube is 24 vertices and 12 triangles.  Each frame: build a
- * model matrix (rotate X, rotate Y), multiply by view (look at origin)
- * and projection (perspective), getting an MVP.  For each triangle:
- * run the vertex shader on its 3 vertices; perspective-divide to NDC
- * to screen; reject if back-facing (signed area ≤ 0); rasterize by
- * walking its bounding box and computing barycentric coords for each
- * pixel; for pixels inside the triangle (all three bary > 0) and
- * passing the z-test, run the fragment shader to get an RGB; convert
- * RGB to luma (Rec.709), Bayer-dither, look up Bourke ASCII char,
- * write to cbuf[].  After all triangles processed, fb_blit() copies
- * cbuf[] to ncurses.  Four shaders pluggable via 's': phong, toon,
- * normals, wire — each is just a different fragment function.
+ * A unit cube is 24 vertices and 12 triangles. Each frame:
+ *   1. Build a model matrix (rotate X, then Y); compose with view (look
+ *      at origin) and projection (perspective) → MVP matrix.
+ *   2. For each triangle:
+ *        - Run the vertex shader on its 3 vertices (transform to clip).
+ *        - Perspective-divide to NDC; map to screen.
+ *        - Reject if back-facing (signed area ≤ 0).
+ *        - Rasterise: walk the triangle's screen-space bounding box;
+ *          for each pixel inside (all 3 barycentric coords > 0), z-test;
+ *          run the fragment shader on the interpolated state to get RGB;
+ *          write to framebuffer cell.
+ *   3. After all 12 triangles: blit the framebuffer to ncurses.
+ *
+ * It's a tiny GPU written in C. Vertices are STAMPS; transform them to
+ * where they should appear on screen. Triangles are PAINT MASKS defined
+ * by 3 stamps. For every cell under a paint mask, ask "what's my
+ * position WITHIN this mask?" — that's barycentric coordinates u, v, w.
+ * Use those to interpolate any per-vertex attribute (normal, UV, world
+ * position) to the current pixel. Hand the interpolated state to a
+ * fragment shader → RGB → cube cell.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
- * It's a tiny GPU written in C.  Vertices are stamps; transform them
- * to where they should appear on screen.  Triangles are paint masks
- * defined by three stamps.  For every cell under a paint mask, ask
- * "what's my position WITHIN this mask?" — that's barycentric
- * coordinates u, v, w.  Use those to interpolate any per-vertex
- * attribute (normal, UV, world position) to the current pixel.
- * Hand the interpolated state to a shader function, get a colour,
- * convert it to a single luminance, look up the matching ASCII glyph
- * from Paul Bourke's density ramp.  Bayer-dither so neighbouring
- * cells with similar luma get slightly different glyphs and the
- * eye sees a smoother gradient.  Z-buffer keeps near things in front
- * of far things.  That's the entire pipeline — same as a 1990s
- * software renderer, scaled down to 80×24.
+ *
+ *      MODEL → VIEW → PROJ
+ *        ↓        ↓       ↓     ← matrices composed into MVP
+ *       (vertex shader runs here)
+ *        ↓
+ *      CLIP-SPACE TRIANGLE
+ *        ↓
+ *      perspective divide → SCREEN-SPACE TRIANGLE
+ *        ↓
+ *      back-face cull (signed area)
+ *        ↓
+ *      bounding-box raster:
+ *        for each pixel:
+ *          barycentric (u, v, w)
+ *          if any < 0 → skip (outside)
+ *          z = u·z0 + v·z1 + w·z2
+ *          if z >= zbuf → skip (occluded)
+ *          interpolate position, normal, uv
+ *          (fragment shader runs here)
+ *          → V3 RGB → tone-map → cube cell
+ *
+ * Same skeleton as the rest of the raster folder; only §6 (mesh
+ * tessellation) differs between cube/sphere/torus/displaced.
  *
  * ALGORITHM IN STEPS  (per frame)
- * ──────────────────
+ * ──────────────────────────────
  *  1. Tessellate cube ONCE at startup: 6 faces × 4 vertices = 24
- *     vertices, each with face-local outward normal (so vertices
- *     belong to one face — flat shading, hard edges).
+ *     vertices, each with face-local outward normal (so faces have
+ *     uniform normals — flat shading, hard edges).
  *  2. scene_tick: angle_x += ROT_X·dt, angle_y += ROT_Y·dt;
  *     model = rot_y(angle_y) · rot_x(angle_x);
- *     mvp = proj · view · model;
- *     norm_mat = cofactor(model)          (transforms normals correctly).
- *  3. fb_clear: zbuf[i] = +∞, cbuf[i] = 0.
+ *     mvp   = proj · view · model;
+ *     norm_mat = cofactor(model)  (correct normal transform under
+ *                                   non-uniform scale).
+ *  3. fb_clear: zbuf[i] = +∞, cbuf[i] = empty.
  *  4. For each of 12 triangles:
  *       a. vert_shader on 3 vertices → clip_pos, world_pos, world_nrm.
- *       b. near-clip reject if all w < 0.001.
- *       c. perspective divide: sx = (clip.x/w + 1)·0.5·cols
- *                              sy = (-clip.y/w + 1)·0.5·rows
- *                              sz = clip.z/w
- *       d. signed area test; if cull_backface and area ≤ 0 → skip.
- *       e. compute screen-space bbox; walk every pixel in it.
- *       f. for each pixel: bary = barycentric(sx, sy, px+0.5, py+0.5);
- *          all three > 0 and (z = bary·sz) < zbuf → rasterize.
- *       g. interpolate world_pos, world_nrm, custom by bary; call
- *          frag_shader(in) → RGB.
- *       h. luma = 0.2126R + 0.7152G + 0.0722B  (Rec.709).
- *       i. Bayer 4×4 dither: dithered = luma + (bayer[py][px] − 0.5)·0.15.
- *       j. idx = dithered · (BOURKE_LEN − 1); write k_bourke[idx].
- *  5. fb_blit cbuf to stdscr; HUD; present.
+ *       b. Near-clip reject (all w < ε).
+ *       c. Perspective divide:
+ *            sx = ( clip.x/w + 1)·0.5·cols
+ *            sy = (-clip.y/w + 1)·0.5·rows  (Y-flip for screen-down)
+ *            sz =   clip.z/w
+ *       d. Signed area; if cull_backface AND area ≤ 0 → skip.
+ *       e. Compute bbox; walk every pixel in it.
+ *       f. For each pixel: barycentric → all > 0 + z-test → run fragment.
+ *       g. fragment shader returns V3 RGB; paint_cell tones, gammas,
+ *          quantises to cube + ramp char.
+ *  5. fb_blit to stdscr; HUD; present.
  *
  * KEY FORMULAS
  * ────────────
  *  Perspective projection (OpenGL-style):
- *      proj.m[0][0] = (1/tan(fov/2)) / aspect
- *      proj.m[1][1] = 1/tan(fov/2)
- *      proj.m[2][2] = (far+near)/(near-far)
- *      proj.m[2][3] = (2·far·near)/(near-far)
- *      proj.m[3][2] = -1
+ *     m[0][0] = (1/tan(fov/2)) / aspect
+ *     m[1][1] =  1/tan(fov/2)
+ *     m[2][2] = (far+near)/(near-far)
+ *     m[2][3] = (2·far·near)/(near-far)
+ *     m[3][2] = -1
  *
- *  Aspect (terminal cell ratio corrected):
- *      aspect = (cols·CELL_W) / (rows·CELL_H)   CELL_W=8, CELL_H=16
+ *  Aspect with terminal cell ratio:
+ *     aspect = (cols·CELL_W) / (rows·CELL_H)   CELL_W=8, CELL_H=16
+ *  Without this the cube renders as a vertical ellipsoid because
+ *  terminal cells are taller than wide.
  *
- *  Perspective divide and screen mapping:
- *      sx = ( clip.x / w + 1) · 0.5 · cols       NDC x ∈ [-1,1]
- *      sy = (-clip.y / w + 1) · 0.5 · rows       Y flip for screen-down
- *      sz =   clip.z / w
+ *  Perspective divide + screen mapping:
+ *     sx = ( clip.x / w + 1) · 0.5 · cols      NDC x ∈ [-1,1]
+ *     sy = (-clip.y / w + 1) · 0.5 · rows      Y-flip for screen-down
+ *     sz =   clip.z / w
  *
- *  Barycentric (signed area form, Möller):
- *      d  = (y1-y2)(x0-x2) + (x2-x1)(y0-y2)
- *      b0 = ((y1-y2)(px-x2) + (x2-x1)(py-y2)) / d
- *      b1 = ((y2-y0)(px-x2) + (x0-x2)(py-y2)) / d
- *      b2 = 1 − b0 − b1
+ *  Barycentric (Möller signed-area form):
+ *     d  = (y1−y2)(x0−x2) + (x2−x1)(y0−y2)
+ *     b0 = ((y1−y2)(px−x2) + (x2−x1)(py−y2)) / d
+ *     b1 = ((y2−y0)(px−x2) + (x0−x2)(py−y2)) / d
+ *     b2 = 1 − b0 − b1
  *
- *  Back-face cull (after Y-flip, CCW winding == positive area):
- *      area = (sx1-sx0)(sy2-sy0) − (sx2-sx0)(sy1-sy0)
- *      cull when area ≤ 0
+ *  Back-face cull (after Y-flip, CCW = positive area):
+ *     area = (sx1−sx0)(sy2−sy0) − (sx2−sx0)(sy1−sy0)
+ *     cull when area ≤ 0
  *
  *  Blinn-Phong (frag_phong):
- *      N = world normal,  L = light_dir,  V = view_dir,  H = norm(L+V)
- *      diff = max(0, N·L)
- *      spec = max(0, N·H)^shininess          (shininess = 64)
- *      colour = ambient + obj·light·diff + spec·0.5
- *      gamma  = colour^(1/2.2)
+ *     N=world normal, L=light_dir, V=view_dir, H=normalize(L+V)
+ *     diff = max(0, N·L)
+ *     spec = max(0, N·H)^shininess
+ *     col  = ambient + obj·light·diff + spec·0.5
+ *     gamma = col^(1/2.2)
  *
  *  Toon (frag_toon, 4 bands):
- *      banded = floor(diff · bands) / bands  (bands = 4)
- *      spec   = (N·H > 0.94) ? 0.7 : 0       hard cel highlight
+ *     banded = floor(diff·bands) / bands
+ *     spec   = (N·H > 0.94) ? 0.7 : 0       hard cel highlight
  *
  *  Normals (frag_normals):  RGB = N·0.5 + 0.5  ∈ [0,1] per channel
  *
  *  Wireframe (frag_wire):
- *      edge = min(b0, b1, b2)                 distance to nearest edge
- *      if edge > WIRE_THRESH (0.06) → discard
- *      else colour ramp from white at edge to grey at threshold
+ *     edge = min(b0, b1, b2)    distance to nearest edge
+ *     if edge > WIRE_THRESH → discard
+ *     else colour ramp from white at edge to grey at threshold
  *
- *  Bayer 4×4 ordered dither matrix (k_bayer[py%4][px%4]):
- *      0  8  2 10                             /16
+ *  Bayer 4×4 ordered dither (k_bayer[py%4][px%4]):
+ *      0  8  2 10                /16
  *     12  4 14  6
  *      3 11  1  9
  *     15  7 13  5
  *
- *  Luma to ramp index:
- *      d = clamp(luma + (bayer[py%4][px%4] − 0.5)·0.15, 0, 1)
- *      idx = d · (BOURKE_LEN − 1)             92-step Paul Bourke ramp
+ *  RGB → 6×6×6 cube pair (xterm 16..231):
+ *     r5 = clamp(round(r·5), 0, 5);   g5, b5 likewise
+ *     pair_id = PAIR_CUBE_BASE + r5·36 + g5·6 + b5
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *  • Y-flip on screen mapping: NDC has +Y up but screen rows count
- *    downward.  The minus sign in `sy = (-clip.y/w + 1)·…` is what
- *    flips it.  Without it, the cube renders upside-down AND back-
- *    face culling inverts (CCW becomes CW after flip).
- *  • Back-face area test sign: after the Y-flip, CCW triangles have
- *    POSITIVE area; the cull condition is `area <= 0` (not `< 0`).
- *    Off-by-one zero-area degenerate triangles are also culled.
- *  • Wireframe identity coords: pipeline injects (1,0,0)/(0,1,0)/
- *    (0,0,1) into VSIn.u/v BEFORE the vertex shader; vert_wire
- *    overwrites custom[0..2] AFTER.  Skip either step and the
- *    barycentric edge detection in frag_wire reads zeros and the
- *    whole triangle vanishes (discarded everywhere).
- *  • Cube vertices are duplicated 4× per face.  Sharing vertices
- *    between faces would average normals at corners and round the
- *    cube — wrong for hard-surface shading.  Each face has its own
- *    set of 4 vertices with a uniform face-normal.
- *  • Near-clip skip: if all 3 w-values < 0.001 the triangle is
- *    entirely behind the camera; skipping prevents division-by-tiny.
- *    Triangles partially behind are NOT properly clipped (would
- *    require Sutherland-Hodgman); they may produce stretched
- *    artifacts when CAM_DIST is set very small.
- *  • Toggle 'c' off-cull: with culling off, both front and back of
- *    each face render; you see the inside of the cube as well —
- *    useful for verifying the mesh is closed.
- *  • Bourke ramp is 92 chars: indexing past BOURKE_LEN-1 reads
- *    beyond the literal.  The clamp before the cast prevents that.
- *  • Dither contribution scale 0.15: chosen so dither doesn't blur
- *    the toon's hard bands.  Larger values dissolve the cel-shading
- *    look; smaller values cause posterised banding in phong gradients.
+ *  • Y-FLIP. NDC has +Y up but screen rows go down. The minus sign in
+ *    `sy = (-clip.y/w + 1)·…` flips it. Without the flip the cube is
+ *    upside-down AND back-face culling inverts (CCW becomes CW after
+ *    flip).
+ *  • BACK-FACE AREA SIGN. After the Y-flip, CCW triangles have POSITIVE
+ *    area; cull when `area <= 0` (also catches zero-area degenerates).
+ *  • WIREFRAME IDENTITY COORDS. The pipeline injects (1,0,0), (0,1,0),
+ *    (0,0,1) into VSIn.u/v BEFORE the vertex shader; vert_wire writes
+ *    to custom[0..2] AFTER. Skip either step and barycentric edge
+ *    detection in frag_wire reads zeros and the whole triangle is
+ *    discarded.
+ *  • DUPLICATED CUBE VERTICES. Each face has its own 4 vertices with
+ *    a uniform face-normal — 24 total. Sharing vertices between faces
+ *    would average normals at corners and round the cube. Wrong for
+ *    hard-surface shading.
+ *  • NEAR-CLIP. Triangles entirely behind the camera (all w < ε) are
+ *    skipped before perspective divide. Triangles partially behind
+ *    are NOT properly clipped (would require Sutherland-Hodgman) and
+ *    can produce stretched artefacts when CAM_DIST is set very small.
+ *  • BOURKE RAMP BOUNDS. Indexing past `BOURKE_LEN−1` reads beyond the
+ *    string literal. Always clamp `idx` after the cast.
+ *  • DITHER SCALE. `0.15` is chosen so dither doesn't smear the toon's
+ *    hard bands. Larger values dissolve cel-shading; smaller values
+ *    posterise phong gradients.
  *
  * HOW TO VERIFY
  * ─────────────
- *  • Phong shader: light at (4,5,4); the lit faces are upper-front-
- *    right; opposite faces are dim ambient grey.  Specular highlight
- *    moves smoothly across the front face as the cube rotates.
- *  • Toon shader: bands count 4.  At any instant, each face is a
- *    single band — no gradient across one face (flat normals = same
- *    diffuse for every fragment on a face).
- *  • Normals shader: 6 distinct face colours; +X/+Y/+Z map to red/
- *    green/blue tint (after the ·0.5+0.5 shift), opposite faces use
- *    the complementary colours.
- *  • Wireframe: 12 edges visible plus the 6 diagonals from quad-to-
- *    triangle splits.  As the cube rotates you can count edges.
- *  • Cull toggle 'c': switch off — interior face glyphs appear
- *    inside the cube outline.  Switch on — clean silhouette.
- *  • Zoom +/-: cube grows/shrinks; HUD shows current cam distance
- *    (1.0..8.0 with 0.2 step).  Aspect remains correct because
- *    proj is rebuilt with cell-aspect on resize.
- *  • Pause: rotation freezes; you can toggle shaders to see all
- *    four on the same orientation.
- *  • At resize, mesh isn't rebuilt — only proj matrix.  Cube should
- *    re-fit the new terminal size without flicker.
+ *  • PHONG shader: light at (4, 5, 4); lit faces are upper-front-right;
+ *    opposite faces are dim ambient grey. Specular highlight moves
+ *    smoothly across the front face as the cube rotates.
+ *  • TOON shader: 4 bands. Each face is entirely ONE band — no
+ *    gradient across one face (flat normals).
+ *  • NORMALS shader: 6 distinct face colours. +X → reddish, +Y →
+ *    greenish, +Z → bluish (after the ·0.5+0.5 shift), opposites use
+ *    complementary colours.
+ *  • WIRE: 12 edges visible plus the 6 diagonals from quad-to-tri
+ *    splits. As the cube rotates you can count edges.
+ *  • CULL TOGGLE 'c': switch off — interior face glyphs appear inside
+ *    the cube outline. Switch on — clean silhouette.
+ *  • ZOOM +/-: cube grows/shrinks; HUD shows current cam distance
+ *    (1.0..8.0 with 0.2 step). Aspect remains correct because proj
+ *    is rebuilt with cell-aspect on resize.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -246,51 +302,48 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ───────────────────────────────────────────────────────── */
 
+/* §1.1 frame rate */
 enum {
     FPS_TARGET    = 60,
     FPS_UPDATE_MS = 500,
-    HUD_COLS      = 46,
 };
 
-#define CAM_FOV   (55.0f * 3.14159265f / 180.0f)
-#define CAM_NEAR  0.1f
-#define CAM_FAR   100.0f
-#define CAM_DIST      2.8f   /* default camera Z distance */
-#define CAM_DIST_MIN  1.0f   /* closest zoom              */
-#define CAM_DIST_MAX  8.0f   /* furthest zoom             */
-#define CAM_ZOOM_STEP 0.2f   /* distance change per keypress */
+#define NS_PER_SEC      1000000000LL
+#define NS_PER_MS          1000000LL
+#define DT_CAP_NS       (100 * NS_PER_MS)
 
-/*
- * Cube half-extent — vertices at ±CUBE_S on each axis.
- * 0.75 gives a cube that fills the terminal nicely without clipping.
- */
-#define CUBE_S  0.75f
+/* §1.2 view geometry */
+#define CAM_FOV       (55.0f * 3.14159265f / 180.0f)
+#define CAM_NEAR      0.1f
+#define CAM_FAR       100.0f
+#define CAM_DIST      2.8f       /* default camera Z distance              */
+#define CAM_DIST_MIN  1.0f
+#define CAM_DIST_MAX  8.0f
+#define CAM_ZOOM_STEP 0.2f
 
-/*
- * Rotation speeds.
- * Different X and Y rates give a tumbling motion that shows all
- * six faces over time without ever looking stuck on one axis.
- */
-#define ROT_Y  0.55f   /* radians / second */
-#define ROT_X  0.37f
+/* CELL_W, CELL_H — terminal cell aspect for projection.
+ * Without aspect correction the cube renders as a vertical ellipsoid. */
+#define CELL_W        8
+#define CELL_H        16
 
-/*
- * Wireframe edge threshold — same barycentric detection as torus.
- * Cube triangles are larger in screen space so a slightly smaller
- * threshold (0.06) keeps lines thin and sharp.
- */
-#define WIRE_THRESH  0.06f
+/* §1.3 cube geometry */
+#define CUBE_S        0.75f      /* half-extent: vertices at ±CUBE_S       */
 
-/* Paul Bourke ASCII density ramp — darkest → brightest */
+/* §1.4 rotation rates (rad/sec) — different X and Y for tumbling. */
+#define ROT_Y         0.55f
+#define ROT_X         0.37f
+
+/* §1.5 wireframe edge threshold (barycentric distance). */
+#define WIRE_THRESH   0.06f
+
+/* §1.6 Bourke 92-char ASCII density ramp (sparse → dense). */
 static const char k_bourke[] =
     " `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
-#define BOURKE_LEN (int)(sizeof k_bourke - 1)
+#define BOURKE_LEN ((int)(sizeof k_bourke - 1))
 
-/* Bayer 4×4 ordered dither matrix */
+/* §1.7 Bayer 4×4 ordered dither matrix (values in [0, 1)). */
 static const float k_bayer[4][4] = {
     {  0/16.f,  8/16.f,  2/16.f, 10/16.f },
     { 12/16.f,  4/16.f, 14/16.f,  6/16.f },
@@ -298,372 +351,499 @@ static const float k_bayer[4][4] = {
     { 15/16.f,  7/16.f, 13/16.f,  5/16.f },
 };
 
-/*
- * CELL_W / CELL_H — terminal cell aspect ratio correction.
- * Passed to m4_perspective as (cols*CELL_W)/(rows*CELL_H).
- * Without this the cube appears vertically stretched.
- */
-#define CELL_W  8
-#define CELL_H  16
+#define DITHER_AMP    0.12f
 
-#define NS_PER_SEC  1000000000LL
-#define NS_PER_MS      1000000LL
+/* §1.8 ncurses pair IDs. */
+#define PAIR_CUBE_BASE   1     /* + 0..215 = 6×6×6 RGB cube              */
+#define PAIR_HUD       217     /* yellow status row 0                    */
+#define PAIR_HINT      218     /* cyan hint bottom row                   */
 
-/* ===================================================================== */
-/* §2  math                                                               */
-/* ===================================================================== */
+/* ── §2 clock ────────────────────────────────────────────────────────── */
+
+static int64_t clock_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+}
+
+static void clock_sleep_ns(int64_t ns)
+{
+    if (ns <= 0) return;
+    struct timespec r = { .tv_sec  = (time_t)(ns / NS_PER_SEC),
+                          .tv_nsec = (long)  (ns % NS_PER_SEC) };
+    nanosleep(&r, NULL);
+}
+
+/* ── §3 math (V3, V4, Mat4) ──────────────────────────────────────────── */
 
 typedef struct { float x, y, z;    } Vec3;
 typedef struct { float x, y, z, w; } Vec4;
 typedef struct { float m[4][4];     } Mat4;
 
-static inline Vec3  v3(float x,float y,float z){ return (Vec3){x,y,z}; }
-static inline Vec3  v3_add(Vec3 a,Vec3 b)  { return v3(a.x+b.x,a.y+b.y,a.z+b.z); }
-static inline Vec3  v3_sub(Vec3 a,Vec3 b)  { return v3(a.x-b.x,a.y-b.y,a.z-b.z); }
-static inline Vec3  v3_scale(Vec3 a,float s){ return v3(a.x*s,a.y*s,a.z*s); }
-static inline Vec3  v3_neg(Vec3 a)          { return v3(-a.x,-a.y,-a.z); }
-static inline float v3_dot(Vec3 a,Vec3 b)   { return a.x*b.x+a.y*b.y+a.z*b.z; }
-static inline float v3_len(Vec3 a)          { return sqrtf(v3_dot(a,a)); }
-static inline Vec3  v3_norm(Vec3 a){
-    float l=v3_len(a); return l>1e-7f ? v3_scale(a,1.f/l) : v3(0,1,0);
+static inline Vec3  v3 (float x, float y, float z) { return (Vec3){x, y, z}; }
+static inline Vec3  v3_add  (Vec3 a, Vec3 b)   { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
+static inline Vec3  v3_sub  (Vec3 a, Vec3 b)   { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
+static inline Vec3  v3_scale(Vec3 a, float s)  { return v3(a.x*s, a.y*s, a.z*s); }
+static inline float v3_dot  (Vec3 a, Vec3 b)   { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static inline float v3_len  (Vec3 a)           { return sqrtf(v3_dot(a, a)); }
+static inline Vec3  v3_norm (Vec3 a)
+{
+    float l = v3_len(a);
+    return l > 1e-7f ? v3_scale(a, 1.f/l) : v3(0, 1, 0);
 }
-static inline Vec3 v3_reflect(Vec3 d,Vec3 n){
-    return v3_sub(d, v3_scale(n, 2.f*v3_dot(d,n)));
-}
-static inline Vec3 v3_bary(Vec3 a,Vec3 b,Vec3 c,float u,float v,float w){
-    return v3(u*a.x+v*b.x+w*c.x,
-              u*a.y+v*b.y+w*c.y,
-              u*a.z+v*b.z+w*c.z);
+static inline Vec3 v3_bary(Vec3 a, Vec3 b, Vec3 c, float u, float v, float w)
+{
+    return v3(u*a.x + v*b.x + w*c.x,
+              u*a.y + v*b.y + w*c.y,
+              u*a.z + v*b.z + w*c.z);
 }
 
-static inline Vec4 v4(float x,float y,float z,float w){ return (Vec4){x,y,z,w}; }
+static inline Vec4 v4(float x, float y, float z, float w) { return (Vec4){x,y,z,w}; }
 
-static inline Mat4 m4_identity(void){
-    Mat4 m={{{0}}}; m.m[0][0]=m.m[1][1]=m.m[2][2]=m.m[3][3]=1.f; return m;
+static inline Mat4 m4_identity(void)
+{
+    Mat4 m = {{{0}}};
+    m.m[0][0] = m.m[1][1] = m.m[2][2] = m.m[3][3] = 1.f;
+    return m;
 }
-static inline Vec4 m4_mul_v4(Mat4 m,Vec4 v){
-    return v4(
-        m.m[0][0]*v.x+m.m[0][1]*v.y+m.m[0][2]*v.z+m.m[0][3]*v.w,
-        m.m[1][0]*v.x+m.m[1][1]*v.y+m.m[1][2]*v.z+m.m[1][3]*v.w,
-        m.m[2][0]*v.x+m.m[2][1]*v.y+m.m[2][2]*v.z+m.m[2][3]*v.w,
-        m.m[3][0]*v.x+m.m[3][1]*v.y+m.m[3][2]*v.z+m.m[3][3]*v.w);
+
+static inline Vec4 m4_mul_v4(Mat4 m, Vec4 v)
+{
+    return v4(m.m[0][0]*v.x + m.m[0][1]*v.y + m.m[0][2]*v.z + m.m[0][3]*v.w,
+              m.m[1][0]*v.x + m.m[1][1]*v.y + m.m[1][2]*v.z + m.m[1][3]*v.w,
+              m.m[2][0]*v.x + m.m[2][1]*v.y + m.m[2][2]*v.z + m.m[2][3]*v.w,
+              m.m[3][0]*v.x + m.m[3][1]*v.y + m.m[3][2]*v.z + m.m[3][3]*v.w);
 }
-static inline Mat4 m4_mul(Mat4 a,Mat4 b){
-    Mat4 r={{{0}}};
-    for(int i=0;i<4;i++)
-        for(int j=0;j<4;j++)
-            for(int k=0;k<4;k++)
-                r.m[i][j]+=a.m[i][k]*b.m[k][j];
+
+static inline Mat4 m4_mul(Mat4 a, Mat4 b)
+{
+    Mat4 r = {{{0}}};
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            for (int k = 0; k < 4; k++)
+                r.m[i][j] += a.m[i][k] * b.m[k][j];
     return r;
 }
-static inline Vec3 m4_pt (Mat4 m,Vec3 p){
-    Vec4 r=m4_mul_v4(m,v4(p.x,p.y,p.z,1.f)); return v3(r.x,r.y,r.z);
+
+static inline Vec3 m4_pt (Mat4 m, Vec3 p)
+{
+    Vec4 r = m4_mul_v4(m, v4(p.x, p.y, p.z, 1.f));
+    return v3(r.x, r.y, r.z);
 }
-static inline Vec3 m4_dir(Mat4 m,Vec3 d){
-    Vec4 r=m4_mul_v4(m,v4(d.x,d.y,d.z,0.f)); return v3(r.x,r.y,r.z);
+
+static inline Vec3 m4_dir(Mat4 m, Vec3 d)
+{
+    Vec4 r = m4_mul_v4(m, v4(d.x, d.y, d.z, 0.f));
+    return v3(r.x, r.y, r.z);
 }
-static Mat4 m4_rotate_y(float a){
-    Mat4 m=m4_identity();
-    m.m[0][0]= cosf(a); m.m[0][2]=sinf(a);
-    m.m[2][0]=-sinf(a); m.m[2][2]=cosf(a);
+
+static Mat4 m4_rotate_y(float a)
+{
+    Mat4 m = m4_identity();
+    m.m[0][0] = cosf(a);  m.m[0][2] = sinf(a);
+    m.m[2][0] = -sinf(a); m.m[2][2] = cosf(a);
     return m;
 }
-static Mat4 m4_rotate_x(float a){
-    Mat4 m=m4_identity();
-    m.m[1][1]= cosf(a); m.m[1][2]=-sinf(a);
-    m.m[2][1]= sinf(a); m.m[2][2]= cosf(a);
+
+static Mat4 m4_rotate_x(float a)
+{
+    Mat4 m = m4_identity();
+    m.m[1][1] =  cosf(a); m.m[1][2] = -sinf(a);
+    m.m[2][1] =  sinf(a); m.m[2][2] =  cosf(a);
     return m;
 }
-static Mat4 m4_perspective(float fovy,float aspect,float near,float far){
-    Mat4 m={{{0}}};
-    float f=1.f/tanf(fovy*.5f);
-    m.m[0][0]=f/aspect; m.m[1][1]=f;
-    m.m[2][2]=(far+near)/(near-far);
-    m.m[2][3]=(2.f*far*near)/(near-far);
-    m.m[3][2]=-1.f;
+
+static Mat4 m4_perspective(float fovy, float aspect, float near, float far)
+{
+    Mat4 m = {{{0}}};
+    float f = 1.f / tanf(fovy * 0.5f);
+    m.m[0][0] = f / aspect;
+    m.m[1][1] = f;
+    m.m[2][2] = (far + near) / (near - far);
+    m.m[2][3] = (2.f * far * near) / (near - far);
+    m.m[3][2] = -1.f;
     return m;
 }
-static Mat4 m4_lookat(Vec3 eye,Vec3 at,Vec3 up){
-    Vec3 f=v3_norm(v3_sub(at,eye));
-    Vec3 r=v3_norm(v3(f.z*up.y-f.y*up.z,
-                       f.x*up.z-f.z*up.x,
-                       f.y*up.x-f.x*up.y));
-    Vec3 u=v3(r.y*f.z-r.z*f.y, r.z*f.x-r.x*f.z, r.x*f.y-r.y*f.x);
-    Mat4 m=m4_identity();
-    m.m[0][0]=r.x; m.m[0][1]=r.y; m.m[0][2]=r.z; m.m[0][3]=-v3_dot(r,eye);
-    m.m[1][0]=u.x; m.m[1][1]=u.y; m.m[1][2]=u.z; m.m[1][3]=-v3_dot(u,eye);
-    m.m[2][0]=-f.x;m.m[2][1]=-f.y;m.m[2][2]=-f.z;m.m[2][3]= v3_dot(f,eye);
+
+static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up)
+{
+    Vec3 f = v3_norm(v3_sub(at, eye));
+    Vec3 r = v3_norm(v3(f.z*up.y - f.y*up.z,
+                        f.x*up.z - f.z*up.x,
+                        f.y*up.x - f.x*up.y));
+    Vec3 u = v3(r.y*f.z - r.z*f.y,
+                r.z*f.x - r.x*f.z,
+                r.x*f.y - r.y*f.x);
+    Mat4 m = m4_identity();
+    m.m[0][0] = r.x; m.m[0][1] = r.y; m.m[0][2] = r.z; m.m[0][3] = -v3_dot(r, eye);
+    m.m[1][0] = u.x; m.m[1][1] = u.y; m.m[1][2] = u.z; m.m[1][3] = -v3_dot(u, eye);
+    m.m[2][0] = -f.x; m.m[2][1] = -f.y; m.m[2][2] = -f.z; m.m[2][3] = v3_dot(f, eye);
     return m;
 }
 
 /*
- * m4_normal_mat — cofactor of upper-left 3×3.
+ * m4_normal_mat — cofactor of the upper-left 3×3.
+ *
  * Correctly transforms normals under non-uniform scale.
- * For the cube (uniform scale) this equals the rotation part of model,
- * but computing it properly means non-uniform scale just works later.
+ * For a uniform-scale model (like our cube) this equals the rotation
+ * part of the model matrix — but computing it properly means non-
+ * uniform scale "just works" later if you change the model.
  */
-static Mat4 m4_normal_mat(Mat4 m){
-    Mat4 n=m4_identity();
-    n.m[0][0]=m.m[1][1]*m.m[2][2]-m.m[1][2]*m.m[2][1];
-    n.m[0][1]=m.m[1][2]*m.m[2][0]-m.m[1][0]*m.m[2][2];
-    n.m[0][2]=m.m[1][0]*m.m[2][1]-m.m[1][1]*m.m[2][0];
-    n.m[1][0]=m.m[0][2]*m.m[2][1]-m.m[0][1]*m.m[2][2];
-    n.m[1][1]=m.m[0][0]*m.m[2][2]-m.m[0][2]*m.m[2][0];
-    n.m[1][2]=m.m[0][1]*m.m[2][0]-m.m[0][0]*m.m[2][1];
-    n.m[2][0]=m.m[0][1]*m.m[1][2]-m.m[0][2]*m.m[1][1];
-    n.m[2][1]=m.m[0][2]*m.m[1][0]-m.m[0][0]*m.m[1][2];
-    n.m[2][2]=m.m[0][0]*m.m[1][1]-m.m[0][1]*m.m[1][0];
+static Mat4 m4_normal_mat(Mat4 m)
+{
+    Mat4 n = m4_identity();
+    n.m[0][0] = m.m[1][1]*m.m[2][2] - m.m[1][2]*m.m[2][1];
+    n.m[0][1] = m.m[1][2]*m.m[2][0] - m.m[1][0]*m.m[2][2];
+    n.m[0][2] = m.m[1][0]*m.m[2][1] - m.m[1][1]*m.m[2][0];
+    n.m[1][0] = m.m[0][2]*m.m[2][1] - m.m[0][1]*m.m[2][2];
+    n.m[1][1] = m.m[0][0]*m.m[2][2] - m.m[0][2]*m.m[2][0];
+    n.m[1][2] = m.m[0][1]*m.m[2][0] - m.m[0][0]*m.m[2][1];
+    n.m[2][0] = m.m[0][1]*m.m[1][2] - m.m[0][2]*m.m[1][1];
+    n.m[2][1] = m.m[0][2]*m.m[1][0] - m.m[0][0]*m.m[1][2];
+    n.m[2][2] = m.m[0][0]*m.m[1][1] - m.m[0][1]*m.m[1][0];
     return n;
 }
 
-/* ===================================================================== */
-/* §3  shaders                                                            */
-/* ===================================================================== */
+/* ── §4 paint (216 RGB cube + Bourke ramp) ───────────────────────────── */
 
-typedef struct { Vec3 pos; Vec3 normal; float u,v; } VSIn;
+static int g_256;
+
+/*
+ * color_init — allocate 216 ncurses pairs as a 6×6×6 RGB cube + reserve
+ * yellow PAIR_HUD and cyan PAIR_HINT for the HUD spec.
+ *
+ * Pair index = PAIR_CUBE_BASE + r·36 + g·6 + b   (r,g,b ∈ {0..5})
+ *
+ * Same scheme as the entire raytracer folder; reading any raytrace
+ * file's color_init covers this one too.
+ */
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+    g_256 = (COLORS >= 256);
+    if (g_256) {
+        for (int i = 0; i < 216; i++)
+            init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
+        init_pair(PAIR_HUD,  226, -1);
+        init_pair(PAIR_HINT,  51, -1);
+    } else {
+        init_pair(PAIR_CUBE_BASE, COLOR_WHITE,  -1);
+        init_pair(PAIR_HUD,       COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT,      COLOR_CYAN,   -1);
+    }
+}
+
+/*
+ * Reinhard tone-map and gamma encode (matching path_tracer / raytracers).
+ *   Reinhard: L' = L / (1 + L)   compresses HDR into [0, 1)
+ *   Gamma:    out = L'^(1/2.2)   approximate sRGB transfer
+ *
+ * Without these, quantising to the 6×6×6 cube collapses every bright
+ * cell into one cube cell because the cube is uniform in [0,1]³.
+ */
+static inline float clamp01  (float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
+static inline float reinhard (float x) { return x / (1.f + x); }
+static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
+
+/* Cell stored in the framebuffer; blitted to ncurses at frame end. */
+typedef struct { char ch; int pair; int attr; } Cell;
+
+/*
+ * paint_compute_cell — full RGB → cell pipeline.
+ *
+ *   1. Reinhard tone-map per channel.
+ *   2. Gamma encode 1/2.2.
+ *   3. Bayer 4×4 dither on the luma so neighbouring cells get
+ *      slightly different ramp characters even when their luma is
+ *      identical (smoother gradient on a coarse grid).
+ *   4. Quantise to 6×6×6 cube → pair id.
+ *   5. Compute Rec.709 luma → density glyph from 92-char Bourke ramp.
+ *   6. A_BOLD on the brightest bin, A_DIM on the darkest.
+ */
+static Cell paint_compute_cell(Vec3 col, int px, int py)
+{
+    float r = gamma_enc(reinhard(col.x));
+    float g = gamma_enc(reinhard(col.y));
+    float b = gamma_enc(reinhard(col.z));
+
+    /* Rec.709 luma (Bourke ramp expects perceptual brightness). */
+    float luma = 0.2126f*r + 0.7152f*g + 0.0722f*b;
+
+    /* Bayer dither perturbs the ramp index without changing the cube. */
+    float dith = (k_bayer[py & 3][px & 3] - 0.5f) * DITHER_AMP;
+    float lum_d = clamp01(luma + dith);
+
+    Cell c;
+    if (g_256) {
+        int r5 = (int)(r * 5.f + 0.5f); if (r5 > 5) r5 = 5; if (r5 < 0) r5 = 0;
+        int g5 = (int)(g * 5.f + 0.5f); if (g5 > 5) g5 = 5; if (g5 < 0) g5 = 0;
+        int b5 = (int)(b * 5.f + 0.5f); if (b5 > 5) b5 = 5; if (b5 < 0) b5 = 0;
+        c.pair = PAIR_CUBE_BASE + r5*36 + g5*6 + b5;
+    } else {
+        c.pair = PAIR_CUBE_BASE;
+    }
+
+    int idx = (int)(lum_d * (BOURKE_LEN - 1) + 0.5f);
+    if (idx < 0)            idx = 0;
+    if (idx >= BOURKE_LEN)  idx = BOURKE_LEN - 1;
+    c.ch = k_bourke[idx];
+
+    c.attr = (luma > 0.85f) ? A_BOLD
+           : (luma < 0.15f) ? A_DIM
+           :                  A_NORMAL;
+    return c;
+}
+
+/* ── §5 shaders ──────────────────────────────────────────────────────── */
+
+/* §5.1 ── shader interface types ─────────────────────────────────────── */
+
+typedef struct { Vec3 pos; Vec3 normal; float u, v; } VSIn;
 
 typedef struct {
     Vec4  clip_pos;
     Vec3  world_pos;
     Vec3  world_nrm;
-    float u,v;
-    float custom[4];
+    float u, v;
+    float custom[4];          /* generic per-vertex output (e.g. baryco) */
 } VSOut;
 
 typedef struct {
     Vec3  world_pos;
     Vec3  world_nrm;
-    float u,v;
+    float u, v;
     float custom[4];
-    int   px,py;
+    int   px, py;
 } FSIn;
 
 typedef struct { Vec3 color; bool discard; } FSOut;
 
 typedef void (*VertShaderFn)(const VSIn *in,  VSOut *out, const void *uni);
 typedef void (*FragShaderFn)(const FSIn *in,  FSOut *out, const void *uni);
-typedef struct { VertShaderFn vert; FragShaderFn frag; const void *vert_uni; const void *frag_uni; } ShaderProgram;
 
-/* ── uniforms ─────────────────────────────────────────────────────── */
+typedef struct {
+    VertShaderFn vert;
+    FragShaderFn frag;
+    const void  *vert_uni;
+    const void  *frag_uni;
+} ShaderProgram;
 
+/* Uniforms — global per-frame state shared by all shaders. */
 typedef struct {
     Mat4  model, view, proj, mvp, norm_mat;
     Vec3  light_pos, light_col, ambient, cam_pos, obj_color;
     float shininess;
 } Uniforms;
 
+/* Toon shader needs an extra "bands" parameter. */
 typedef struct { Uniforms base; int bands; } ToonUniforms;
 
-/* ── vertex shaders ──────────────────────────────────────────────── */
+/* §5.2 ── default vertex shader ──────────────────────────────────────── */
 
+/*
+ * Almost every fragment shader needs the same per-vertex computations:
+ * world position, world-space normal, MVP-transformed clip position.
+ * The default vertex shader does ALL of those; specialised shaders
+ * (vert_normals, vert_wire) extend it by writing extra `custom`
+ * outputs.
+ */
 static void vert_default(const VSIn *in, VSOut *out, const void *u_)
 {
-    const Uniforms *u=(const Uniforms*)u_;
-    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x,in->pos.y,in->pos.z,1.f));
-    out->world_pos = m4_pt (u->model,    in->pos);
+    const Uniforms *u = (const Uniforms*)u_;
+    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x, in->pos.y, in->pos.z, 1.f));
+    out->world_pos = m4_pt(u->model, in->pos);
     out->world_nrm = v3_norm(m4_dir(u->norm_mat, in->normal));
-    out->u=in->u; out->v=in->v;
-    out->custom[0]=out->custom[1]=out->custom[2]=out->custom[3]=0.f;
-}
-
-static void vert_normals(const VSIn *in, VSOut *out, const void *u_)
-{
-    const Uniforms *u=(const Uniforms*)u_;
-    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x,in->pos.y,in->pos.z,1.f));
-    out->world_pos = m4_pt (u->model,    in->pos);
-    out->world_nrm = v3_norm(m4_dir(u->norm_mat, in->normal));
-    out->u=in->u; out->v=in->v;
-    out->custom[0]=out->world_nrm.x;
-    out->custom[1]=out->world_nrm.y;
-    out->custom[2]=out->world_nrm.z;
-    out->custom[3]=0.f;
+    out->u = in->u; out->v = in->v;
+    out->custom[0] = out->custom[1] = out->custom[2] = out->custom[3] = 0.f;
 }
 
 /*
- * vert_wire — barycentric coord injection for wireframe.
- * Pipeline sets VSIn.u/v to the per-vertex barycentric identity
- * vector before calling this shader (see §6 pipeline_draw_mesh).
- * We copy u→custom[0], v→custom[1]; pipeline sets custom[2]=1-u-v.
+ * vert_normals — same as default + writes the world normal into custom[]
+ * so the fragment shader can read it directly without recomputing.
+ * (frag_normals doesn't actually use custom, but this is a useful
+ * pattern shown for the wire shader below.)
+ */
+static void vert_normals(const VSIn *in, VSOut *out, const void *u_)
+{
+    vert_default(in, out, u_);
+    out->custom[0] = out->world_nrm.x;
+    out->custom[1] = out->world_nrm.y;
+    out->custom[2] = out->world_nrm.z;
+}
+
+/*
+ * vert_wire — barycentric-coord injection.
+ *
+ * The pipeline (§8.2) sets VSIn.u/v to the per-vertex BARYCENTRIC
+ * IDENTITY VECTOR (1,0,0)/(0,1,0)/(0,0,1) BEFORE this shader runs.
+ * We just call the default; the pipeline writes custom[0..2] AFTER.
+ *
+ * Inside the rasteriser, custom[0..2] are interpolated by barycentric
+ * weights (b0, b1, b2). When all three are large simultaneously, we're
+ * deep inside the triangle; when any one is near zero, we're at an
+ * edge. min(custom[0..2]) is the distance to the nearest edge.
  */
 static void vert_wire(const VSIn *in, VSOut *out, const void *u_)
 {
-    const Uniforms *u=(const Uniforms*)u_;
-    out->clip_pos  = m4_mul_v4(u->mvp, v4(in->pos.x,in->pos.y,in->pos.z,1.f));
-    out->world_pos = m4_pt (u->model,    in->pos);
-    out->world_nrm = v3_norm(m4_dir(u->norm_mat, in->normal));
-    out->u=in->u; out->v=in->v;
-    out->custom[0]=0.f; out->custom[1]=0.f;
-    out->custom[2]=0.f; out->custom[3]=0.f;
+    vert_default(in, out, u_);
+    /* custom[0..2] zeroed by vert_default; pipeline overwrites them. */
 }
 
-/* ── fragment shaders ────────────────────────────────────────────── */
+/* §5.3 ── frag_phong: Blinn-Phong shading ───────────────────────────── */
 
 /*
- * frag_phong — Blinn-Phong shading with gamma correction.
+ * Blinn-Phong = ambient + diffuse + specular.
+ *   diffuse = max(0, N·L)                 Lambertian
+ *   spec    = max(0, N·H)^shininess       half-vector form
+ *   col     = ambient + obj·light·diff + spec·0.5
+ *   gamma   = col^(1/2.2)
  *
- * The cube's flat-shaded faces make the lighting very clear —
- * each face receives uniform diffuse because all fragments on a
- * flat face share the same interpolated normal.
- * The specular highlight appears as a bright patch on whichever
- * face happens to be oriented toward the half-vector.
+ * On the cube this is easy to verify because each face has a uniform
+ * normal: every fragment on a face sees the same N, L, H → uniform
+ * diffuse + a single specular highlight per face.
  */
 static void frag_phong(const FSIn *in, FSOut *out, const void *u_)
 {
-    const Uniforms *u=(const Uniforms*)u_;
-    Vec3 N=v3_norm(in->world_nrm);
-    Vec3 L=v3_norm(v3_sub(u->light_pos, in->world_pos));
-    Vec3 V=v3_norm(v3_sub(u->cam_pos,   in->world_pos));
-    Vec3 H=v3_norm(v3_add(L,V));
-    float diff=fmaxf(0.f,v3_dot(N,L));
-    float spec=powf(fmaxf(0.f,v3_dot(N,H)), u->shininess);
-    Vec3 c=u->obj_color;
-    float r=u->ambient.x+c.x*u->light_col.x*diff+spec*0.5f;
-    float g=u->ambient.y+c.y*u->light_col.y*diff+spec*0.5f;
-    float b=u->ambient.z+c.z*u->light_col.z*diff+spec*0.5f;
-    out->color.x=powf(fminf(r,1.f),1.f/2.2f);
-    out->color.y=powf(fminf(g,1.f),1.f/2.2f);
-    out->color.z=powf(fminf(b,1.f),1.f/2.2f);
-    out->discard=false;
+    const Uniforms *u = (const Uniforms*)u_;
+    Vec3 N = v3_norm(in->world_nrm);
+    Vec3 L = v3_norm(v3_sub(u->light_pos, in->world_pos));
+    Vec3 V = v3_norm(v3_sub(u->cam_pos,   in->world_pos));
+    Vec3 H = v3_norm(v3_add(L, V));
+
+    float diff = fmaxf(0.f, v3_dot(N, L));
+    float spec = powf(fmaxf(0.f, v3_dot(N, H)), u->shininess);
+
+    Vec3 c = u->obj_color;
+    out->color = v3(u->ambient.x + c.x*u->light_col.x*diff + spec*0.5f,
+                    u->ambient.y + c.y*u->light_col.y*diff + spec*0.5f,
+                    u->ambient.z + c.z*u->light_col.z*diff + spec*0.5f);
+    out->discard = false;
 }
 
+/* §5.4 ── frag_toon: 4-band quantised diffuse + hard specular ───────── */
+
 /*
- * frag_toon — 4-band quantised diffuse + hard specular.
+ * Quantising the diffuse term to discrete bands gives the cel-shaded
+ * look: instead of a smooth gradient, you see hard steps. For a cube,
+ * each face is uniformly lit so each face is entirely one band — the
+ * silhouette between a bright and a dim face is a perfectly sharp
+ * boundary.
  *
- * On the cube this is especially striking: each face is entirely
- * one band — hard steps with no gradient across a face.
- * The silhouette between a lit and unlit face is a perfectly
- * sharp boundary, which is the defining look of cel shading.
+ * The hard specular threshold (N·H > 0.94) gives the cel highlight:
+ * either ON (bright spot) or OFF — no falloff.
  */
 static void frag_toon(const FSIn *in, FSOut *out, const void *u_)
 {
-    const ToonUniforms *tu=(const ToonUniforms*)u_;
-    const Uniforms     *u =&tu->base;
-    Vec3 N=v3_norm(in->world_nrm);
-    Vec3 L=v3_norm(v3_sub(u->light_pos, in->world_pos));
-    Vec3 V=v3_norm(v3_sub(u->cam_pos,   in->world_pos));
-    Vec3 H=v3_norm(v3_add(L,V));
-    float diff  =fmaxf(0.f,v3_dot(N,L));
-    float banded=floorf(diff*(float)tu->bands)/(float)tu->bands;
-    float spec  =(v3_dot(N,H)>0.94f)?0.7f:0.f;
-    Vec3 c=u->obj_color;
-    out->color.x=fminf(c.x*(banded+0.12f)+spec,1.f);
-    out->color.y=fminf(c.y*(banded+0.12f)+spec,1.f);
-    out->color.z=fminf(c.z*(banded+0.12f)+spec,1.f);
-    out->discard=false;
+    const ToonUniforms *tu = (const ToonUniforms*)u_;
+    const Uniforms     *u  = &tu->base;
+    Vec3 N = v3_norm(in->world_nrm);
+    Vec3 L = v3_norm(v3_sub(u->light_pos, in->world_pos));
+    Vec3 V = v3_norm(v3_sub(u->cam_pos,   in->world_pos));
+    Vec3 H = v3_norm(v3_add(L, V));
+
+    float diff   = fmaxf(0.f, v3_dot(N, L));
+    float banded = floorf(diff * (float)tu->bands) / (float)tu->bands;
+    float spec   = (v3_dot(N, H) > 0.94f) ? 0.7f : 0.f;
+
+    Vec3 c = u->obj_color;
+    out->color = v3(c.x*(banded + 0.12f) + spec,
+                    c.y*(banded + 0.12f) + spec,
+                    c.z*(banded + 0.12f) + spec);
+    out->discard = false;
 }
 
+/* §5.5 ── frag_normals: world-normal-as-RGB (diagnostic) ─────────────── */
+
 /*
- * frag_normals — world normal → RGB.
+ * Each component remapped from [-1, +1] → [0, 1]. For a cube, each
+ * face has a uniform normal so each face renders as ONE solid colour:
+ *   +X → (1.0, 0.5, 0.5)   -X → (0.0, 0.5, 0.5)
+ *   +Y → (0.5, 1.0, 0.5)   -Y → (0.5, 0.0, 0.5)
+ *   +Z → (0.5, 0.5, 1.0)   -Z → (0.5, 0.5, 0.0)
  *
- * The cube has 6 faces with 6 distinct normals, so this shader
- * renders as 6 solid colour patches — one per face direction:
- *   +X = warm red        -X = cool teal
- *   +Y = bright green    -Y = dark purple
- *   +Z = blue            -Z = yellow-orange
- * The colours change smoothly as the cube rotates because the
- * world-space normal rotates with the model.
+ * The colours rotate as the cube rotates (world-space normal).
  */
 static void frag_normals(const FSIn *in, FSOut *out, const void *u_)
 {
     (void)u_;
-    Vec3 N=v3_norm(in->world_nrm);
-    out->color  =v3(N.x*.5f+.5f, N.y*.5f+.5f, N.z*.5f+.5f);
-    out->discard=false;
+    Vec3 N = v3_norm(in->world_nrm);
+    out->color   = v3(N.x*.5f + .5f, N.y*.5f + .5f, N.z*.5f + .5f);
+    out->discard = false;
 }
 
+/* §5.6 ── frag_wire: barycentric edge detection ─────────────────────── */
+
 /*
- * frag_wire — barycentric edge detection.
+ * `min(custom[0..2])` is the distance to the nearest TRIANGLE edge
+ * (the pipeline interpolates the barycentric identity vector across
+ * fragments, and the smallest of (b0, b1, b2) is the distance to the
+ * opposite edge of the triangle we're inside).
  *
- * min(custom[0..2]) is the distance to the nearest edge.
- * Below WIRE_THRESH: draw edge character.
- * Above WIRE_THRESH: discard (transparent interior).
- *
- * On the cube the wireframe shows a clean 12-edge outline.
- * The diagonal edges from the quad-to-triangle split are visible,
- * which honestly looks good — it shows the mesh structure clearly.
- * If you want to hide the diagonal, you would need to mark shared
- * edges and suppress them — unnecessary complexity for a demo.
+ * Below WIRE_THRESH: draw the edge with a brightness proportional to
+ * "how close to the edge we are" (sharper near the line itself).
+ * Above WIRE_THRESH: discard — the triangle interior is transparent.
  */
 static void frag_wire(const FSIn *in, FSOut *out, const void *u_)
 {
     (void)u_;
-    float b0=in->custom[0], b1=in->custom[1], b2=in->custom[2];
-    float edge=fminf(b0, fminf(b1,b2));
-    if(edge>WIRE_THRESH){ out->discard=true; return; }
-    float t=edge/WIRE_THRESH;
-    out->color  =v3(0.9f-t*0.3f, 0.9f-t*0.3f, 0.9f-t*0.3f);
-    out->discard=false;
+    float b0 = in->custom[0], b1 = in->custom[1], b2 = in->custom[2];
+    float edge = fminf(b0, fminf(b1, b2));
+    if (edge > WIRE_THRESH) { out->discard = true; return; }
+    float t = edge / WIRE_THRESH;
+    out->color   = v3(0.9f - t*0.3f, 0.9f - t*0.3f, 0.9f - t*0.3f);
+    out->discard = false;
 }
 
-typedef enum { SH_PHONG=0, SH_TOON, SH_NORMALS, SH_WIRE, SH_COUNT } ShaderIdx;
-static const char *k_shader_names[]={"phong","toon","normals","wire"};
+typedef enum { SH_PHONG = 0, SH_TOON, SH_NORMALS, SH_WIRE, SH_COUNT } ShaderIdx;
+static const char *k_shader_names[] = { "phong", "toon", "normals", "wire" };
 
-/* ===================================================================== */
-/* §4  mesh — cube tessellation                                           */
-/* ===================================================================== */
+/* ── §6 mesh — cube tessellation ─────────────────────────────────────── */
 
-typedef struct { Vec3 pos; Vec3 normal; float u,v; } Vertex;
+typedef struct { Vec3 pos; Vec3 normal; float u, v; } Vertex;
 typedef struct { int v[3]; } Triangle;
 typedef struct { Vertex *verts; int nvert; Triangle *tris; int ntri; } Mesh;
 
-static void mesh_free(Mesh *m){ free(m->verts); free(m->tris); *m=(Mesh){0}; }
+static void mesh_free(Mesh *m)
+{
+    free(m->verts);
+    free(m->tris);
+    *m = (Mesh){0};
+}
 
 /*
  * tessellate_cube — 6 faces, each a quad split into 2 triangles.
  *
- * Each face has 4 unique vertices with the same outward normal —
- * flat shading, no shared vertices between faces.
- * Sharing vertices would require averaged normals which would round
- * the corners — correct for a sphere, wrong for a cube.
+ * Each face has 4 unique vertices with the SAME outward normal — flat
+ * shading, no shared vertices between faces. Sharing vertices would
+ * average normals at corners and round the cube (correct for a sphere,
+ * wrong for a hard-surface cube).
  *
- * Winding order: CCW when viewed from outside (from the direction
- * the normal points).  The pipeline culls CW-wound back faces.
+ * Winding order: CCW when viewed from outside (from the direction the
+ * normal points). The pipeline culls CW back faces (signed-area test
+ * after Y-flip → CCW maps to positive area).
  *
- * UV layout: each face maps [0,1]² independently.
+ * UV layout per face: each face maps [0,1]² independently.
  *   v0 = bottom-left  (0,1)
  *   v1 = bottom-right (1,1)
  *   v2 = top-right    (1,0)
  *   v3 = top-left     (0,0)
  *
- * Face order: +X, -X, +Y, -Y, +Z, -Z
- * Each described by: normal + 4 corner positions in CCW order.
+ * Total: 24 vertices, 12 triangles. Mesh allocated ONCE at startup.
  */
 static Mesh tessellate_cube(void)
 {
     float s = CUBE_S;
 
-    /*
-     * 6 faces × 4 vertices each = 24 vertices
-     * 6 faces × 2 triangles each = 12 triangles
-     */
     static const float face_nrm[6][3] = {
         { 1, 0, 0}, {-1, 0, 0},
         { 0, 1, 0}, { 0,-1, 0},
         { 0, 0, 1}, { 0, 0,-1},
     };
 
-    /*
-     * Corners for each face in CCW winding viewed from outside
-     * (i.e. from the direction the face normal points toward).
-     *
-     * Right-hand rule: curl fingers v0→v1→v2, thumb points toward viewer.
-     * The pipeline's screen-space signed area test (after Y-flip) passes
-     * triangles with area > 0, which corresponds to CCW in NDC.
-     *
-     * Verified per face:
-     *   +X: looking from +X toward origin. Right = -Z, Up = +Y.
-     *       v0=( 1,-1, 1) v1=( 1, 1, 1) v2=( 1, 1,-1) v3=( 1,-1,-1)  CCW ✓
-     *   -X: looking from -X toward origin. Right = +Z, Up = +Y.
-     *       v0=(-1,-1,-1) v1=(-1, 1,-1) v2=(-1, 1, 1) v3=(-1,-1, 1)  CCW ✓
-     *   +Y: looking down from +Y. Right = +X, Forward = +Z.
-     *       v0=(-1, 1, 1) v1=( 1, 1, 1) v2=( 1, 1,-1) v3=(-1, 1,-1)  CCW ✓
-     *   -Y: looking up from -Y. Right = +X, Forward = -Z.
-     *       v0=(-1,-1,-1) v1=( 1,-1,-1) v2=( 1,-1, 1) v3=(-1,-1, 1)  CCW ✓
-     *   +Z: looking from +Z toward origin. Right = +X, Up = +Y.
-     *       v0=(-1,-1, 1) v1=( 1,-1, 1) v2=( 1, 1, 1) v3=(-1, 1, 1)  CCW ✓
-     *   -Z: looking from -Z toward origin. Right = -X, Up = +Y.
-     *       v0=( 1,-1,-1) v1=(-1,-1,-1) v2=(-1, 1,-1) v3=( 1, 1,-1)  CCW ✓
-     */
+    /* Corners per face in CCW winding viewed from outside. Each corner
+     * is in -1..+1 and gets scaled by s in the build loop. */
     static const float face_vtx[6][4][3] = {
         /* +X */ {{ 1,-1, 1},{ 1, 1, 1},{ 1, 1,-1},{ 1,-1,-1}},
         /* -X */ {{-1,-1,-1},{-1, 1,-1},{-1, 1, 1},{-1,-1, 1}},
@@ -673,9 +853,7 @@ static Mesh tessellate_cube(void)
         /* -Z */ {{ 1,-1,-1},{-1,-1,-1},{-1, 1,-1},{ 1, 1,-1}},
     };
 
-    static const float face_uv[4][2] = {
-        {0,1},{1,1},{1,0},{0,0}
-    };
+    static const float face_uv[4][2] = { {0,1}, {1,1}, {1,0}, {0,0} };
 
     Mesh m;
     m.verts = malloc(24 * sizeof(Vertex));
@@ -683,116 +861,109 @@ static Mesh tessellate_cube(void)
     m.nvert = 0;
     m.ntri  = 0;
 
-    for(int f=0; f<6; f++){
+    for (int f = 0; f < 6; f++) {
         Vec3 n = v3(face_nrm[f][0], face_nrm[f][1], face_nrm[f][2]);
         int base = m.nvert;
 
-        for(int i=0; i<4; i++){
+        for (int i = 0; i < 4; i++) {
             Vec3 p = v3(face_vtx[f][i][0]*s,
                         face_vtx[f][i][1]*s,
                         face_vtx[f][i][2]*s);
             m.verts[m.nvert++] = (Vertex){ p, n, face_uv[i][0], face_uv[i][1] };
         }
 
-        /*
-         * Split quad into 2 CCW triangles:
+        /* Split quad into 2 CCW triangles:
          *   tri 0: v0, v1, v2  (bottom-left → bottom-right → top-right)
-         *   tri 1: v0, v2, v3  (bottom-left → top-right → top-left)
-         */
-        m.tris[m.ntri++] = (Triangle){{base,   base+1, base+2}};
-        m.tris[m.ntri++] = (Triangle){{base,   base+2, base+3}};
+         *   tri 1: v0, v2, v3  (bottom-left → top-right → top-left) */
+        m.tris[m.ntri++] = (Triangle){{ base + 0, base + 1, base + 2 }};
+        m.tris[m.ntri++] = (Triangle){{ base + 0, base + 2, base + 3 }};
     }
 
     return m;
 }
 
-/* ===================================================================== */
-/* §5  framebuffer                                                        */
-/* ===================================================================== */
+/* ── §7 framebuffer ──────────────────────────────────────────────────── */
 
-typedef struct { char ch; int color_pair; bool bold; } Cell;
-typedef struct { float *zbuf; Cell *cbuf; int cols,rows; } Framebuffer;
+typedef struct { float *zbuf; Cell *cbuf; int cols, rows; } Framebuffer;
 
-static void fb_alloc(Framebuffer *fb,int cols,int rows){
-    fb->cols=cols; fb->rows=rows;
-    fb->zbuf=malloc((size_t)(cols*rows)*sizeof(float));
-    fb->cbuf=malloc((size_t)(cols*rows)*sizeof(Cell));
-}
-static void fb_free(Framebuffer *fb){
-    free(fb->zbuf); free(fb->cbuf); *fb=(Framebuffer){0};
-}
-static void fb_clear(Framebuffer *fb){
-    for(int i=0;i<fb->cols*fb->rows;i++) fb->zbuf[i]=FLT_MAX;
-    memset(fb->cbuf,0,(size_t)(fb->cols*fb->rows)*sizeof(Cell));
-}
-
-static void color_init(void){
-    start_color();
-    if(COLORS>=256){
-        init_pair(1,196,COLOR_BLACK); init_pair(2,208,COLOR_BLACK);
-        init_pair(3,226,COLOR_BLACK); init_pair(4, 46,COLOR_BLACK);
-        init_pair(5, 51,COLOR_BLACK); init_pair(6, 33,COLOR_BLACK);
-        init_pair(7,201,COLOR_BLACK);
-    } else {
-        init_pair(1,COLOR_RED,    COLOR_BLACK);
-        init_pair(2,COLOR_RED,    COLOR_BLACK);
-        init_pair(3,COLOR_YELLOW, COLOR_BLACK);
-        init_pair(4,COLOR_GREEN,  COLOR_BLACK);
-        init_pair(5,COLOR_CYAN,   COLOR_BLACK);
-        init_pair(6,COLOR_BLUE,   COLOR_BLACK);
-        init_pair(7,COLOR_MAGENTA,COLOR_BLACK);
-    }
-}
-
-static Cell luma_to_cell(float luma,int px,int py)
+static void fb_alloc(Framebuffer *fb, int cols, int rows)
 {
-    float thr=k_bayer[py&3][px&3];
-    float d=luma+(thr-0.5f)*0.15f;
-    d=d<0.f?0.f:d>1.f?1.f:d;
-    int  idx=(int)(d*(BOURKE_LEN-1));
-    char ch=k_bourke[idx];
-    int  cp=1+(int)(d*6.f); if(cp>7)cp=7;
-    bool bold=d>0.6f;
-    return (Cell){ch,cp,bold};
+    fb->cols = cols; fb->rows = rows;
+    fb->zbuf = malloc((size_t)(cols * rows) * sizeof(float));
+    fb->cbuf = malloc((size_t)(cols * rows) * sizeof(Cell));
 }
 
+static void fb_free(Framebuffer *fb)
+{
+    free(fb->zbuf); free(fb->cbuf);
+    *fb = (Framebuffer){0};
+}
+
+static void fb_clear(Framebuffer *fb)
+{
+    for (int i = 0; i < fb->cols * fb->rows; i++) fb->zbuf[i] = FLT_MAX;
+    memset(fb->cbuf, 0, (size_t)(fb->cols * fb->rows) * sizeof(Cell));
+}
+
+/* fb_blit — copy framebuffer cbuf to ncurses screen. */
 static void fb_blit(const Framebuffer *fb)
 {
-    for(int y=0;y<fb->rows;y++){
-        for(int x=0;x<fb->cols;x++){
-            Cell c=fb->cbuf[y*fb->cols+x];
-            if(!c.ch) continue;
-            attr_t a=COLOR_PAIR(c.color_pair)|(c.bold?A_BOLD:0);
-            attron(a); mvaddch(y,x,(chtype)(unsigned char)c.ch); attroff(a);
+    for (int y = 0; y < fb->rows; y++) {
+        for (int x = 0; x < fb->cols; x++) {
+            Cell c = fb->cbuf[y * fb->cols + x];
+            if (!c.ch) continue;
+            attron(COLOR_PAIR(c.pair) | c.attr);
+            mvaddch(y, x, (chtype)(unsigned char)c.ch);
+            attroff(COLOR_PAIR(c.pair) | c.attr);
         }
     }
 }
 
-/* ===================================================================== */
-/* §6  pipeline                                                           */
-/* ===================================================================== */
+/* ── §8 pipeline ─────────────────────────────────────────────────────── */
 
-static void barycentric(const float sx[3],const float sy[3],
-                        float px,float py,float b[3])
-{
-    float d=(sy[1]-sy[2])*(sx[0]-sx[2])+(sx[2]-sx[1])*(sy[0]-sy[2]);
-    if(fabsf(d)<1e-6f){b[0]=b[1]=b[2]=-1.f;return;}
-    b[0]=((sy[1]-sy[2])*(px-sx[2])+(sx[2]-sx[1])*(py-sy[2]))/d;
-    b[1]=((sy[2]-sy[0])*(px-sx[2])+(sx[0]-sx[2])*(py-sy[2]))/d;
-    b[2]=1.f-b[0]-b[1];
-}
+/* §8.1 ── barycentric (Möller signed-area form) ─────────────────────── */
 
 /*
- * pipeline_draw_mesh — rasterization pipeline, identical to torus_raster.c.
+ * Compute barycentric coordinates of point (px, py) inside triangle
+ * with vertices (sx[0..2], sy[0..2]) in screen space.
  *
- * is_wire flag:
- *   true  → inject barycentric identity coords into VSIn.u/v before
- *            each vertex shader call, then write custom[0..2] in VSOut.
- *   false → use mesh u/v normally, custom unused.
+ * Outputs b[0..2] such that:
+ *   - b[0] + b[1] + b[2] = 1
+ *   - All three positive iff (px, py) is strictly inside the triangle
+ *   - Each b[i] is the SIGNED RATIO of "sub-triangle area opposite
+ *     vertex i" to "full triangle area"
  *
- * The cube has only 12 triangles so the inner loop is fast.
- * Each face covers a large screen area, making the per-fragment
- * cost the bottleneck — not the triangle setup.
+ * If the triangle is degenerate (area ≈ 0), returns negative values
+ * so the caller treats it as a miss.
+ */
+static void barycentric(const float sx[3], const float sy[3],
+                        float px, float py, float b[3])
+{
+    float d = (sy[1] - sy[2]) * (sx[0] - sx[2])
+            + (sx[2] - sx[1]) * (sy[0] - sy[2]);
+    if (fabsf(d) < 1e-6f) { b[0] = b[1] = b[2] = -1.f; return; }
+    b[0] = ((sy[1] - sy[2]) * (px - sx[2]) + (sx[2] - sx[1]) * (py - sy[2])) / d;
+    b[1] = ((sy[2] - sy[0]) * (px - sx[2]) + (sx[0] - sx[2]) * (py - sy[2])) / d;
+    b[2] = 1.f - b[0] - b[1];
+}
+
+/* §8.2 ── pipeline_draw_mesh — vertex → cull → raster → fragment ────── */
+
+/*
+ * The big function. For each triangle in the mesh:
+ *   1. Run the vertex shader on its 3 vertices.
+ *   2. Reject if all 3 are behind the near plane (w < ε).
+ *   3. Perspective-divide to NDC, map to screen.
+ *   4. Back-face cull (signed-area test).
+ *   5. Walk the screen-space bounding box.
+ *   6. For each pixel: barycentric check + z-test + fragment shader
+ *      + paint_compute_cell + framebuffer write.
+ *
+ * The `is_wire` flag inserts barycentric-identity values into VSIn.u/v
+ * BEFORE the vertex shader, then writes them to VSOut.custom[0..2]
+ * AFTER. Inside the rasteriser, custom[0..2] are interpolated by the
+ * barycentric weights. The fragment shader (frag_wire) reads those
+ * three to compute distance-to-nearest-edge.
  */
 static void pipeline_draw_mesh(Framebuffer   *fb,
                                 const Mesh    *mesh,
@@ -800,104 +971,102 @@ static void pipeline_draw_mesh(Framebuffer   *fb,
                                 bool           is_wire,
                                 bool           cull_backface)
 {
-    int cols=fb->cols, rows=fb->rows;
-    static const float wu[3]={1.f,0.f,0.f};
-    static const float wv[3]={0.f,1.f,0.f};
+    int cols = fb->cols, rows = fb->rows;
+    static const float wu[3] = { 1.f, 0.f, 0.f };
+    static const float wv[3] = { 0.f, 1.f, 0.f };
 
-    for(int ti=0;ti<mesh->ntri;ti++){
-        const Triangle *tri=&mesh->tris[ti];
+    for (int ti = 0; ti < mesh->ntri; ti++) {
+        const Triangle *tri = &mesh->tris[ti];
         VSOut vo[3];
 
-        for(int vi=0;vi<3;vi++){
-            const Vertex *vtx=&mesh->verts[tri->v[vi]];
+        /* (1) Run vertex shader on each of the triangle's 3 vertices. */
+        for (int vi = 0; vi < 3; vi++) {
+            const Vertex *vtx = &mesh->verts[tri->v[vi]];
             VSIn in;
-            in.pos=vtx->pos; in.normal=vtx->normal;
-            in.u = is_wire ? wu[vi] : vtx->u;
-            in.v = is_wire ? wv[vi] : vtx->v;
-            memset(&vo[vi],0,sizeof vo[vi]);
-            sh->vert(&in,&vo[vi],sh->vert_uni);
-            if(is_wire){
-                vo[vi].custom[0]=wu[vi];
-                vo[vi].custom[1]=wv[vi];
-                vo[vi].custom[2]=1.f-wu[vi]-wv[vi];
+            in.pos    = vtx->pos;
+            in.normal = vtx->normal;
+            in.u      = is_wire ? wu[vi] : vtx->u;
+            in.v      = is_wire ? wv[vi] : vtx->v;
+            memset(&vo[vi], 0, sizeof vo[vi]);
+            sh->vert(&in, &vo[vi], sh->vert_uni);
+            if (is_wire) {
+                vo[vi].custom[0] = wu[vi];
+                vo[vi].custom[1] = wv[vi];
+                vo[vi].custom[2] = 1.f - wu[vi] - wv[vi];
             }
         }
 
-        /* near clip reject */
-        if(vo[0].clip_pos.w<0.001f &&
-           vo[1].clip_pos.w<0.001f &&
-           vo[2].clip_pos.w<0.001f) continue;
+        /* (2) Near-clip reject — entirely behind camera. */
+        if (vo[0].clip_pos.w < 0.001f &&
+            vo[1].clip_pos.w < 0.001f &&
+            vo[2].clip_pos.w < 0.001f) continue;
 
-        /* perspective divide → screen */
-        float sx[3],sy[3],sz[3];
-        for(int vi=0;vi<3;vi++){
-            float w=vo[vi].clip_pos.w; if(fabsf(w)<1e-6f)w=1e-6f;
-            sx[vi]=( vo[vi].clip_pos.x/w+1.f)*0.5f*(float)cols;
-            sy[vi]=(-vo[vi].clip_pos.y/w+1.f)*0.5f*(float)rows;
-            sz[vi]=  vo[vi].clip_pos.z/w;
+        /* (3) Perspective divide → screen coordinates.
+         * Y-flip because NDC has +Y up but screen rows go down. */
+        float sx[3], sy[3], sz[3];
+        for (int vi = 0; vi < 3; vi++) {
+            float w = vo[vi].clip_pos.w; if (fabsf(w) < 1e-6f) w = 1e-6f;
+            sx[vi] = ( vo[vi].clip_pos.x / w + 1.f) * 0.5f * (float)cols;
+            sy[vi] = (-vo[vi].clip_pos.y / w + 1.f) * 0.5f * (float)rows;
+            sz[vi] =   vo[vi].clip_pos.z / w;
         }
 
-        /* back-face cull — skipped when cull_backface is false */
-        float area=(sx[1]-sx[0])*(sy[2]-sy[0])
-                  -(sx[2]-sx[0])*(sy[1]-sy[0]);
-        if(cull_backface && area<=0.f) continue;
+        /* (4) Back-face cull (after Y-flip, CCW = positive area). */
+        float area = (sx[1] - sx[0]) * (sy[2] - sy[0])
+                   - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+        if (cull_backface && area <= 0.f) continue;
 
-        /* bounding box */
-        int x0=(int)fmaxf(0.f,      floorf(fminf(sx[0],fminf(sx[1],sx[2]))));
-        int x1=(int)fminf(cols-1.f,  ceilf(fmaxf(sx[0],fmaxf(sx[1],sx[2]))));
-        int y0=(int)fmaxf(0.f,      floorf(fminf(sy[0],fminf(sy[1],sy[2]))));
-        int y1=(int)fminf(rows-1.f,  ceilf(fmaxf(sy[0],fmaxf(sy[1],sy[2]))));
+        /* (5) Screen-space bounding box (clamped to framebuffer). */
+        int x0 = (int)fmaxf(0.f,        floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
+        int x1 = (int)fminf(cols - 1.f,  ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
+        int y0 = (int)fmaxf(0.f,        floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
+        int y1 = (int)fminf(rows - 1.f,  ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
 
-        for(int py=y0;py<=y1;py++){
-            for(int px=x0;px<=x1;px++){
+        /* (6) Walk every pixel in the bbox; rasterise. */
+        for (int py = y0; py <= y1; py++) {
+            for (int px = x0; px <= x1; px++) {
                 float b[3];
-                barycentric(sx,sy,px+0.5f,py+0.5f,b);
-                if(b[0]<0.f||b[1]<0.f||b[2]<0.f) continue;
+                barycentric(sx, sy, px + 0.5f, py + 0.5f, b);
+                if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f) continue;
 
-                float z=b[0]*sz[0]+b[1]*sz[1]+b[2]*sz[2];
-                int idx=py*cols+px;
-                if(z>=fb->zbuf[idx]) continue;
-                fb->zbuf[idx]=z;
+                /* Z-test (linear interpolation of NDC depth). */
+                float z = b[0]*sz[0] + b[1]*sz[1] + b[2]*sz[2];
+                int   idx = py * cols + px;
+                if (z >= fb->zbuf[idx]) continue;
+                fb->zbuf[idx] = z;
 
+                /* Build fragment-shader input by barycentric interpolation. */
                 FSIn fsin;
-                fsin.world_pos=v3_bary(vo[0].world_pos,
-                                        vo[1].world_pos,
-                                        vo[2].world_pos,b[0],b[1],b[2]);
-                fsin.world_nrm=v3_norm(
-                               v3_bary(vo[0].world_nrm,
-                                        vo[1].world_nrm,
-                                        vo[2].world_nrm,b[0],b[1],b[2]));
-                fsin.u =b[0]*vo[0].u+b[1]*vo[1].u+b[2]*vo[2].u;
-                fsin.v =b[0]*vo[0].v+b[1]*vo[1].v+b[2]*vo[2].v;
-                fsin.px=px; fsin.py=py;
-                for(int c=0;c<4;c++)
-                    fsin.custom[c]=b[0]*vo[0].custom[c]
-                                  +b[1]*vo[1].custom[c]
-                                  +b[2]*vo[2].custom[c];
+                fsin.world_pos = v3_bary(vo[0].world_pos, vo[1].world_pos, vo[2].world_pos,
+                                         b[0], b[1], b[2]);
+                fsin.world_nrm = v3_norm(v3_bary(vo[0].world_nrm, vo[1].world_nrm, vo[2].world_nrm,
+                                                 b[0], b[1], b[2]));
+                fsin.u  = b[0]*vo[0].u + b[1]*vo[1].u + b[2]*vo[2].u;
+                fsin.v  = b[0]*vo[0].v + b[1]*vo[1].v + b[2]*vo[2].v;
+                fsin.px = px; fsin.py = py;
+                for (int c = 0; c < 4; c++)
+                    fsin.custom[c] = b[0]*vo[0].custom[c]
+                                   + b[1]*vo[1].custom[c]
+                                   + b[2]*vo[2].custom[c];
 
-                FSOut fsout; fsout.discard=false;
-                sh->frag(&fsin,&fsout,sh->frag_uni);
-                if(fsout.discard) continue;
+                FSOut fsout = { v3(0,0,0), false };
+                sh->frag(&fsin, &fsout, sh->frag_uni);
+                if (fsout.discard) continue;
 
-                float luma=0.2126f*fsout.color.x
-                          +0.7152f*fsout.color.y
-                          +0.0722f*fsout.color.z;
-                fb->cbuf[idx]=luma_to_cell(luma,px,py);
+                fb->cbuf[idx] = paint_compute_cell(fsout.color, px, py);
             }
         }
     }
 }
 
-/* ===================================================================== */
-/* §7  scene                                                              */
-/* ===================================================================== */
+/* ── §9 scene ────────────────────────────────────────────────────────── */
 
 typedef struct {
     Mesh          mesh;
     float         angle_x, angle_y;
-    float         cam_dist;      /* current zoom distance — changed by +/- */
+    float         cam_dist;
     bool          paused;
-    bool          cull_backface; /* c toggles — false shows inner faces    */
+    bool          cull_backface;
     ShaderIdx     shade_idx;
     ShaderProgram shader;
     Uniforms      uni;
@@ -906,23 +1075,28 @@ typedef struct {
 
 static void scene_build_shader(Scene *s)
 {
-    switch(s->shade_idx){
+    switch (s->shade_idx) {
     case SH_PHONG:
-        s->shader=(ShaderProgram){vert_default, frag_phong,   &s->uni,      &s->uni};      break;
+        s->shader = (ShaderProgram){ vert_default, frag_phong,   &s->uni, &s->uni };
+        break;
     case SH_TOON:
-        s->toon_uni.base=s->uni; s->toon_uni.bands=4;
-        s->shader=(ShaderProgram){vert_default, frag_toon,    &s->uni,      &s->toon_uni}; break;
+        s->toon_uni.base  = s->uni;
+        s->toon_uni.bands = 4;
+        s->shader = (ShaderProgram){ vert_default, frag_toon,    &s->uni, &s->toon_uni };
+        break;
     case SH_NORMALS:
-        s->shader=(ShaderProgram){vert_normals, frag_normals, &s->uni,      &s->uni};      break;
+        s->shader = (ShaderProgram){ vert_normals, frag_normals, &s->uni, &s->uni };
+        break;
     case SH_WIRE:
-        s->shader=(ShaderProgram){vert_wire,    frag_wire,    &s->uni,      &s->uni};      break;
+        s->shader = (ShaderProgram){ vert_wire,    frag_wire,    &s->uni, &s->uni };
+        break;
     default: break;
     }
 }
 
 static void scene_init(Scene *s, int cols, int rows)
 {
-    memset(s,0,sizeof *s);
+    memset(s, 0, sizeof *s);
     s->mesh           = tessellate_cube();
     s->shade_idx      = SH_PHONG;
     s->cam_dist       = CAM_DIST;
@@ -930,99 +1104,115 @@ static void scene_init(Scene *s, int cols, int rows)
 
     s->uni.light_pos  = v3(4.f, 5.f, 4.f);
     s->uni.light_col  = v3(1.f, 1.f, 1.f);
-    s->uni.ambient    = v3(0.07f,0.07f,0.07f);
+    s->uni.ambient    = v3(0.07f, 0.07f, 0.07f);
     s->uni.shininess  = 64.f;
     s->uni.cam_pos    = v3(0.f, 0.f, s->cam_dist);
     s->uni.obj_color  = v3(0.9f, 0.55f, 0.15f);   /* warm orange */
 
-    s->uni.view = m4_lookat(s->uni.cam_pos, v3(0,0,0), v3(0,1,0));
-    float aspect=(float)(cols*CELL_W)/(float)(rows*CELL_H);
-    s->uni.proj = m4_perspective(CAM_FOV,aspect,CAM_NEAR,CAM_FAR);
+    s->uni.view = m4_lookat(s->uni.cam_pos, v3(0, 0, 0), v3(0, 1, 0));
+    float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
+    s->uni.proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
 
     scene_build_shader(s);
 }
 
 /*
  * scene_set_zoom — update camera position and view matrix.
- * Called whenever cam_dist changes.  Rebuilds cam_pos and view so
- * the change takes effect on the very next scene_tick() → mvp rebuild.
+ * Called on +/- keys; rebuilds cam_pos and view so the change takes
+ * effect on the very next scene_tick → mvp rebuild.
  */
 static void scene_set_zoom(Scene *s)
 {
     s->uni.cam_pos = v3(0.f, 0.f, s->cam_dist);
-    s->uni.view    = m4_lookat(s->uni.cam_pos, v3(0,0,0), v3(0,1,0));
+    s->uni.view    = m4_lookat(s->uni.cam_pos, v3(0, 0, 0), v3(0, 1, 0));
 }
 
-static void scene_rebuild_proj(Scene *s, int cols, int rows){
-    float aspect=(float)(cols*CELL_W)/(float)(rows*CELL_H);
-    s->uni.proj=m4_perspective(CAM_FOV,aspect,CAM_NEAR,CAM_FAR);
+static void scene_rebuild_proj(Scene *s, int cols, int rows)
+{
+    float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
+    s->uni.proj  = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
 }
 
 static void scene_tick(Scene *s, float dt)
 {
-    if(s->paused) return;
-    s->angle_y += ROT_Y*dt;
-    s->angle_x += ROT_X*dt;
-    Mat4 ry=m4_rotate_y(s->angle_y);
-    Mat4 rx=m4_rotate_x(s->angle_x);
-    s->uni.model    = m4_mul(ry,rx);
+    if (s->paused) return;
+    s->angle_y += ROT_Y * dt;
+    s->angle_x += ROT_X * dt;
+    Mat4 ry = m4_rotate_y(s->angle_y);
+    Mat4 rx = m4_rotate_x(s->angle_x);
+    s->uni.model    = m4_mul(ry, rx);
     s->uni.mvp      = m4_mul(s->uni.proj, m4_mul(s->uni.view, s->uni.model));
     s->uni.norm_mat = m4_normal_mat(s->uni.model);
-    s->toon_uni.base= s->uni;
+    s->toon_uni.base = s->uni;
 }
 
 static void scene_draw(Scene *s, Framebuffer *fb)
 {
     fb_clear(fb);
     pipeline_draw_mesh(fb, &s->mesh, &s->shader,
-                       (s->shade_idx==SH_WIRE), s->cull_backface);
+                       (s->shade_idx == SH_WIRE), s->cull_backface);
     fb_blit(fb);
 }
 
-static void scene_next_shader(Scene *s){
-    s->shade_idx=(ShaderIdx)((s->shade_idx+1)%SH_COUNT);
+static void scene_next_shader(Scene *s)
+{
+    s->shade_idx = (ShaderIdx)((s->shade_idx + 1) % SH_COUNT);
     scene_build_shader(s);
 }
 
-/* ===================================================================== */
-/* §8  screen                                                             */
-/* ===================================================================== */
+/* ── §10 screen ──────────────────────────────────────────────────────── */
 
-typedef struct { int cols,rows; } Screen;
+typedef struct { int cols, rows; } Screen;
 
-static void screen_init(Screen *s){
-    initscr(); noecho(); cbreak(); curs_set(0);
-    nodelay(stdscr,TRUE); keypad(stdscr,TRUE); typeahead(-1);
-    color_init();
-    getmaxyx(stdscr,s->rows,s->cols);
-}
-static void screen_free(Screen *s){ (void)s; endwin(); }
-static void screen_resize(Screen *s){
-    endwin(); refresh(); getmaxyx(stdscr,s->rows,s->cols);
-}
-
-static void screen_draw_hud(const Screen *s,const Scene *sc,double fps)
+static void screen_init(Screen *s)
 {
-    char buf[HUD_COLS+1];
-    snprintf(buf,sizeof buf," %5.1f fps  [%s]  z:%.1f  cull:%s%s ",
+    initscr();
+    noecho(); cbreak(); curs_set(0);
+    nodelay(stdscr, TRUE); keypad(stdscr, TRUE);
+    typeahead(-1);
+    color_init();
+    getmaxyx(stdscr, s->rows, s->cols);
+}
+
+static void screen_resize(Screen *s)
+{
+    endwin(); refresh();
+    getmaxyx(stdscr, s->rows, s->cols);
+}
+
+/*
+ * hud_draw — yellow status row 0 + cyan hint bottom row.
+ * Per CLAUDE.md HUD spec: PAIR_HUD is bright yellow (xterm 226) with
+ * A_BOLD; PAIR_HINT is bright cyan (xterm 51) with A_BOLD.
+ */
+static void hud_draw(const Screen *s, const Scene *sc, double fps)
+{
+    char buf[96];
+    snprintf(buf, sizeof buf,
+             " %5.1f fps  [%s]  z:%.1f  cull:%s%s ",
              fps, k_shader_names[sc->shade_idx],
-             sc->cam_dist,
+             (double)sc->cam_dist,
              sc->cull_backface ? "on " : "off",
              sc->paused ? " PAUSED" : "");
-    int hx=s->cols-HUD_COLS; if(hx<0)hx=0;
-    attron(COLOR_PAIR(3)|A_BOLD);
-    mvprintw(0,hx,"%s",buf);
-    attroff(COLOR_PAIR(3)|A_BOLD);
-    attron(COLOR_PAIR(5));
-    mvprintw(s->rows-1,0,"s=shader  c=cull  +/-=zoom  space=pause  q=quit");
-    attroff(COLOR_PAIR(5));
+    int len = (int)strlen(buf);
+    if (len > s->cols) len = s->cols;
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, s->cols - len, "%s", buf);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    attron(COLOR_PAIR(PAIR_HUD));
+    mvprintw(0, 0, " CUBE-RASTER ");
+    attroff(COLOR_PAIR(PAIR_HUD));
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  spc:pause  s:shader  c:cull  +/-:zoom ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void){ wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §9  app                                                                */
-/* ===================================================================== */
+/* ── §11 app ─────────────────────────────────────────────────────────── */
 
 typedef struct {
     Scene                 scene;
@@ -1033,33 +1223,36 @@ typedef struct {
 } App;
 
 static App g_app;
-static void on_exit  (int sig){ (void)sig; g_app.running=0;     }
-static void on_resize(int sig){ (void)sig; g_app.need_resize=1; }
-static void cleanup  (void)   { endwin(); }
 
-static void app_do_resize(App *app){
+static void on_exit  (int sig) { (void)sig; g_app.running     = 0; }
+static void on_resize(int sig) { (void)sig; g_app.need_resize = 1; }
+static void cleanup  (void)    { endwin(); }
+
+static void app_do_resize(App *app)
+{
     screen_resize(&app->screen);
     fb_free(&app->fb);
-    fb_alloc(&app->fb,app->screen.cols,app->screen.rows);
-    scene_rebuild_proj(&app->scene,app->screen.cols,app->screen.rows);
-    app->need_resize=0;
+    fb_alloc(&app->fb, app->screen.cols, app->screen.rows);
+    scene_rebuild_proj(&app->scene, app->screen.cols, app->screen.rows);
+    app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch){
+static bool app_handle_key(App *app, int ch)
+{
     Scene *s = &app->scene;
-    switch(ch){
-    case 'q': case 'Q': case 27: return false;
-    case ' ': s->paused = !s->paused; break;
+    switch (ch) {
+    case 'q': case 'Q': case 27 /* ESC */: return false;
+    case ' ':           s->paused = !s->paused; break;
     case 's': case 'S': scene_next_shader(s); break;
     case 'c': case 'C': s->cull_backface = !s->cull_backface; break;
-    case '=': case '+':                             /* zoom in  */
+    case '=': case '+':
         s->cam_dist -= CAM_ZOOM_STEP;
-        if(s->cam_dist < CAM_DIST_MIN) s->cam_dist = CAM_DIST_MIN;
+        if (s->cam_dist < CAM_DIST_MIN) s->cam_dist = CAM_DIST_MIN;
         scene_set_zoom(s);
         break;
-    case '-':                                       /* zoom out */
+    case '-': case '_':
         s->cam_dist += CAM_ZOOM_STEP;
-        if(s->cam_dist > CAM_DIST_MAX) s->cam_dist = CAM_DIST_MAX;
+        if (s->cam_dist > CAM_DIST_MAX) s->cam_dist = CAM_DIST_MAX;
         scene_set_zoom(s);
         break;
     default: break;
@@ -1067,67 +1260,69 @@ static bool app_handle_key(App *app, int ch){
     return true;
 }
 
-static int64_t clock_ns(void){
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
-    return (int64_t)t.tv_sec*NS_PER_SEC+t.tv_nsec;
-}
-static void clock_sleep_ns(int64_t ns){
-    if(ns<=0)return;
-    struct timespec r={.tv_sec=(time_t)(ns/NS_PER_SEC),
-                       .tv_nsec=(long)(ns%NS_PER_SEC)};
-    nanosleep(&r,NULL);
-}
-
 int main(void)
 {
     srand((unsigned int)clock_ns());
     atexit(cleanup);
-    signal(SIGINT,  on_exit);
-    signal(SIGTERM, on_exit);
-    signal(SIGWINCH,on_resize);
+    signal(SIGINT,   on_exit);
+    signal(SIGTERM,  on_exit);
+    signal(SIGWINCH, on_resize);
 
-    App *app=&g_app;
-    app->running=1;
+    App *app     = &g_app;
+    app->running = 1;
 
     screen_init(&app->screen);
-    fb_alloc(&app->fb,app->screen.cols,app->screen.rows);
-    scene_init(&app->scene,app->screen.cols,app->screen.rows);
+    fb_alloc(&app->fb, app->screen.cols, app->screen.rows);
+    scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time=clock_ns();
-    int64_t fps_acc=0; int fps_cnt=0; double fps_disp=0.0;
+    int64_t frame_time = clock_ns();
+    int64_t fps_acc = 0;
+    int     fps_cnt = 0;
+    double  fps_disp = 0.0;
 
-    while(app->running){
+    while (app->running) {
 
-        if(app->need_resize){ app_do_resize(app); frame_time=clock_ns(); }
-
-        int64_t now=clock_ns();
-        int64_t dt =now-frame_time;
-        frame_time =now;
-        if(dt>100*NS_PER_MS) dt=100*NS_PER_MS;
-        float dt_sec=(float)dt/(float)NS_PER_SEC;
-
-        scene_tick(&app->scene,dt_sec);
-
-        fps_cnt++; fps_acc+=dt;
-        if(fps_acc>=FPS_UPDATE_MS*NS_PER_MS){
-            fps_disp=(double)fps_cnt/((double)fps_acc/(double)NS_PER_SEC);
-            fps_cnt=0; fps_acc=0;
+        /* §11.1 resize. */
+        if (app->need_resize) {
+            app_do_resize(app);
+            frame_time = clock_ns();
         }
 
+        /* §11.2 timing. */
+        int64_t now = clock_ns();
+        int64_t dt  = now - frame_time;
+        frame_time  = now;
+        if (dt > DT_CAP_NS) dt = DT_CAP_NS;
+        float dt_sec = (float)dt / (float)NS_PER_SEC;
+
+        /* §11.3 advance scene state. */
+        scene_tick(&app->scene, dt_sec);
+
+        /* §11.4 fps rolling average over half-second windows. */
+        fps_cnt++;
+        fps_acc += dt;
+        if (fps_acc >= FPS_UPDATE_MS * NS_PER_MS) {
+            fps_disp = (double)fps_cnt / ((double)fps_acc / (double)NS_PER_SEC);
+            fps_cnt = 0; fps_acc = 0;
+        }
+
+        /* §11.5 paint frame. */
         erase();
-        scene_draw(&app->scene,&app->fb);
-        screen_draw_hud(&app->screen,&app->scene,fps_disp);
+        scene_draw(&app->scene, &app->fb);
+        hud_draw(&app->screen, &app->scene, fps_disp);
         screen_present();
 
-        int ch=getch();
-        if(ch!=ERR && !app_handle_key(app,ch)) app->running=0;
+        /* §11.6 input. */
+        int ch = getch();
+        if (ch != ERR && !app_handle_key(app, ch)) app->running = 0;
 
-        int64_t elapsed=clock_ns()-frame_time+dt;
-        clock_sleep_ns(NS_PER_SEC/FPS_TARGET-elapsed);
+        /* §11.7 frame cap. */
+        int64_t elapsed = clock_ns() - frame_time + dt;
+        clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
     }
 
     mesh_free(&app->scene.mesh);
     fb_free(&app->fb);
-    screen_free(&app->screen);
+    endwin();
     return 0;
 }

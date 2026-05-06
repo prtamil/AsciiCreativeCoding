@@ -326,6 +326,9 @@ fractals; cycle-through-triangles for Delaunay.
 | Program | Algorithm |
 |---------|-----------|
 | `hexpod_tripod` | 6-legged robot — tripod gait (alternating support triangles), 2-joint analytical IK (law of cosines), 4-direction steering with angular interpolation, toroidal wrap |
+| `ik_helloworld` | Hello-world IK — 2-link arm, analytical inverse kinematics via law of cosines, single moveable target, elbow-flip key for the two-solution ambiguity, target clamped to reach disc |
+| `fk_helloworld` | Hello-world FK — 2-link arm driven by joint angles, cumulative-angle forward kinematics, hand position computed as deterministic output |
+| `fk_ik_helloworld` | Hello-world hybrid — 3-link arm with FK and IK modes toggled by 'm'; FK uses cumulative angles; IK uses 2+1 hybrid (2-link analytical IK + last-link aimed at target) |
 | `ik_spider` | IK spider — sinusoidal body locomotion, 2-joint IK per limb, step-trigger gait |
 | `ik_arm_reach` | 2-joint arm — FABRIK IK reach with elbow-side toggle, Lissajous target path |
 | `ik_tentacle_seek` | Seeking tentacles — FABRIK solver on wandering target, per-segment reach tolerance, multiple independent chains |

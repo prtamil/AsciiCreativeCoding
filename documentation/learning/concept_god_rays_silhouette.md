@@ -1,160 +1,231 @@
-# Concept — `god_rays_silhouette.c`: Volumetric Light Shafts (Screen-Space)
+# Pass 1 — god_rays_silhouette.c: Volumetric god rays via screen-space ray-march
 
 ## Core Idea
 
-Each cell on the screen asks the sun: "Is there a clear line from you to me, through the fog?" The answer comes from MARCHING. Walk N small steps from the cell toward the sun's screen position. At each step, ask: "Is this step inside the silhouette?" Count the unblocked steps, weighted by how far from the eye they are (closer = more contribution because the `exp(-σ·d)` extinction is gentler). The total is how much light gets through.
+Each cell asks the sun: "is there a clear line from you to me, through
+the fog?" Walk N small steps from the cell toward the sun. Each step
+"lit" iff outside the silhouette, weighted by Beer-Lambert `exp(-σ·d)`.
+The weighted fraction of unblocked steps is the cell's visibility ∈ [0, 1].
+Bright shafts emerge where the line threads a CLEAR channel.
 
-Bright SHAFTS emerge wherever the line from cell to sun threads a CLEAR channel through the silhouette; dark fog fills the cells where every step lies inside the silhouette.
+Five additive layers stacked on top of the visibility computation make
+the demo cinematic:
 
-This is the GPU-engine "screen-space god rays" trick (Crysis-era), reduced to its purest form. The shadow ray collapses to a point-in-shape test because the silhouette is essentially co-planar with the camera; same divergent-cone visual, tiny fraction of the cost of full 3-D shadow rays.
+| Layer | Effect |
+|---|---|
+| COLOUR    | Continuous RGB from blackbody temperature (no preset themes) |
+| SUN       | Cinematic disc = CORE + CORONA halo + 4 LENS-FLARE STREAKS |
+| BLOOM     | Bright cells leak warm light into 5×5 neighbours |
+| DUST      | Sparkle particles drift through shafts with motion-blur trails, gusted by Perlin wind |
+| RAMP      | Curated airy 16-glyph density ramp (no closed blocks like # or @) |
+
+## Three shade modes (cycled with `m`)
+
+| Mode | Visual |
+|---|---|
+| LIT   | Full pipeline (default): RGB + bloom + dust |
+| MASK  | Silhouette black + flat fog tint + sun marker — see the SHAPE |
+| VIS   | Grayscale visibility map — see the algorithm OUTPUT |
+
+## Blackbody Palette (no preset themes)
+
+A single Kelvin temperature drives the entire scene chromaticity via
+Tanner Helland's piecewise blackbody approximation. 8 presets:
+
+| Name | K | Description |
+|---|---|---|
+| EMBER  | 1500 | glowing-coal red |
+| SUNSET | 2000 | orange sunset |
+| CANDLE | 2500 | warm candle flame |
+| TORCH  | 3500 | tungsten bulb |
+| WARM   | 4500 | golden hour |
+| DAY    | 5500 | midday sun (D55) |
+| NOON   | 6500 | clear noon (D65) |
+| BLUE   | 8500 | overcast / blue hour |
+
+`palette_from_kelvin(K)` derives shaft, fog, dust, sky colours from the
+sun colour with small offsets for cool ambient blue. There are no
+"theme" tunings — chromaticity is physically grounded.
+
+## Cinematic Sun (§7.3 sun_disc)
+
+Three additive components:
+
+```
+core   = exp(-r²/CORE_FALLOFF²)                       sharp Gaussian
+corona = exp(-r²/CORONA_FALLOFF²) · CORONA_GAIN        wider warm halo
+flare  = Σ_{s=0..3} exp(-Δa²/ANG_SIGMA²)·exp(-r²/R_FALLOFF²)
+                                                       4 angular streaks
+```
+
+Flare angles 0°, 45°, 90°, 135° (bidirectional → 8 visible spokes).
+Skip flare contribution when r < 0.5 (atan2(0,0) undefined; core
+dominates anyway).
+
+## Dust particles (§9.2 dust)
+
+220 particles with 4-sample motion trails:
+
+```
+position drift  : (DUST_SPEED_X, DUST_SPEED_Y) cells/sec, gusted by wind
+trail recording : distance-spaced (every TRAIL_SPACING = 0.6 cells)
+brightness      : sin(π·age/life) envelope · DUST_BRIGHTNESS · visibility
+trail falloff   : 100% / 55% / 32% / 18% / 10%
+visibility gate : g_vis[gy][gx] — particles in shadow contribute nothing
+```
+
+Distance-spaced (not frame-spaced) trail recording keeps trail length
+visually consistent across frame rates.
+
+## Wind gusts (§9.2 wind_gust)
+
+```
+gust = 1 + WIND_GUST_AMP · perlin2d(time · WIND_GUST_FREQ_HZ)   ≈[0.5, 1.5]
+dust velocity *= gust
+```
+
+10-second gust period; particles ebb and flow organically.
+
+## Bloom (§9.3 bloom_apply)
+
+5×5 bright-pass Gaussian (`luma > 0.55` threshold). Two-pass with
+SEPARATE g_bloom buffer (single-pass would compound asymmetrically as
+later cells read already-bloomed earlier cells). After the pass, fold
+g_bloom into g_buf.
+
+## Five silhouette patterns (§5)
+
+ARCHWAY · MOUNTAIN · COLUMN · WINDOWS · TREE — each is a pure
+point-in-shape function `silhouette_at(p, u, v) → bool`.
+
+## Curated airy ramp
+
+Old Bourke 92-char ramp included alphabetic chars (`g`, `B`, `M`, etc.)
+that read as TEXT NOISE. New ramp ` .'`,-_:;~=+*oO0` (16 chars,
+symbol-only) ends at OPEN circles (`o`, `O`, `0`) — luminous-feeling.
+Closed blocks `#` `@` deliberately excluded.
+
+## §-section structure
+
+```
+§1 config       (sub-sectioned 1.1-1.13)
+§2 clock
+§3 math + palette (V3, RGB, blackbody, palette_from_kelvin)
+§4 ncurses paint (216-cube + airy ramp + paint_cell)
+§5 silhouette (5.1-5.6: 5 patterns + dispatcher)
+§6 noise + RNG
+§7 scene + sun motion
+§8 raymarch (8.1-8.5: cell_to_uv, march_visibility, sun_disc, fog_jitter, shade_lit_rgb)
+§9 buffer + post-processing (9.1 buffer, 9.2 dust, 9.3 bloom)
+§10 screen + scene_draw (4-pass) + HUD
+§11 app
+```
+
+## 4-pass scene_draw (LIT mode)
+
+```
+PASS 1  per cell → V3 colour into g_buf
+                   ALSO: stash visibility into g_vis (for dust gating)
+PASS 2  dust_apply → fold particles into g_buf (gated by g_vis)
+PASS 3  bloom_apply → 5×5 bright-pass Gaussian
+PASS 4  paint each g_buf[r][c] via paint_cell
+```
+
+MASK and VIS short-circuit before PASS 1.
+
+## HUD spec
+
+- Yellow status row 0: fps, Hz, pattern, "DAY 5500K" temperature label,
+  mode, bloom on/off, dust on/off, speed
+- Cyan hint bottom row
+
+## Worked numerical sample
+
+GOLDEN-equivalent at 5778K, shaft-core cell with vis=0.85, sun_term=0.10,
+jitter=1.05:
+
+```
+palette.fog   = (0.18, 0.14, 0.10)
+palette.shaft = (1.00, 0.78, 0.42)
+palette.sun   = (1.00, 0.95, 0.70)
+
+base = lerp(fog, shaft, 0.85·1.20) ≈ shaft (clamp at 1.0)
+sun  = sun_col · 0.10 · 1.50 = (0.150, 0.142, 0.105)
+col  ≈ (1.05, 0.84, 0.48) HDR
+
+Reinhard:    (0.51, 0.46, 0.32)
+Gamma 2.2:   (0.74, 0.71, 0.59)
+Cube:        r5=4, g5=4, b5=3 → pair 172
+Luma 0.71 → ramp idx 11 → '+' glyph
+```
+
+## How to verify
+
+- Toggle BLOOM (`b`): bright shaft cores noticeably "glow into"
+  neighbours when bloom is on.
+- Toggle DUST (`d`): tiny warm sparkles drift across the scene, only
+  visible in shafts. Watch a single particle to see motion-blur trail.
+- Cycle TEMPERATURE (`t`/`T`): scene chromaticity shifts continuously.
+  EMBER 1500K → deep red; NOON 6500K → near-white; BLUE 8500K → cool.
+- Sun has visible CORE + CORONA + 4 SPARKLY STREAKS, not just a
+  Gaussian dot.
+- Wind gusts: at 10+ sec timescales, dust speed visibly ebbs and flows.
 
 ---
 
-## The Mental Model
+# Pass 2 — Pseudocode
 
-Picture a dim hallway. There's a door at one end with light coming through a keyhole. Dust hangs in the air. From your perspective at the other end, the dust forms a bright cone radiating out from the keyhole — the divergent shaft you recognise as "god rays".
+## Module map
 
-At a cell directly along the keyhole-to-eye line, every dust mote on that line is illuminated (the keyhole sees those motes), so the shaft is brightest. At a cell off-axis, only the dust motes near the door see the keyhole; the rest sit in the door's shadow. So off-axis cells are dimmer. Result: a luminous cone of dust diverging from the keyhole. Replace "keyhole" with "gap in the silhouette" and you have this demo.
+| § | Purpose |
+|---|---|
+| §1 config       | frame rate, march, sun, bloom, dust |
+| §2 clock        | monotonic timer + sleep |
+| §3 math+palette | V3, RGB, blackbody, palette_from_kelvin |
+| §4 ncurses paint | 6×6×6 cube + airy ramp + paint_cell |
+| §5 silhouette   | 5 patterns + dispatcher |
+| §6 noise+RNG    | Perlin + fBm + xorshift + hash3 |
+| §7 scene+sun    | Scene state, sun motion |
+| §8 raymarch     | THE CORE — visibility + sun_disc + fog_jitter + shade_lit_rgb |
+| §9 buffer+post  | V3 buf, dust trails, wind, bloom |
+| §10 screen      | scene_draw (4-pass LIT) + HUD |
+| §11 app         | signals, resize, fixed-step main loop |
 
----
+## Data flow (LIT mode)
 
-## Algorithm in Steps
-
-1. **SUN POSITION.** Per frame, compute `(sun_sx, sun_sy)` — slow horizontal drift across the upper portion of the screen so shaft directions change over time.
-
-2. **PER CELL `(sx, sy)`:**
-   - Convert `(sx, sy)` to normalised aspect-corrected `(u, v) ∈ [-1, +1]²`.
-   - If `silhouette(u, v)` → render BLACK silhouette glyph and continue.
-   - Compute step vector toward sun:
-     ```
-     step_dx = (sun_sx − sx) / MARCH_STEPS
-     step_dy = (sun_sy − sy) / MARCH_STEPS
-     step_len = √(step_dx² + (step_dy · ASPECT_Y)²)
-     ```
-   - March N steps:
-     ```
-     for i = 1..MARCH_STEPS:
-       px, py = sx + step_dx · i, sy + step_dy · i
-       d = i · step_len                  // distance from eye in cells
-       w = exp(−FOG_SIGMA · d)
-       if not silhouette(px, py): accum += w
-       total_w += w
-     visibility = accum / total_w
-     ```
-   - Add **sun-disc contribution**: gaussian falloff if cell near sun screen position AND sun isn't behind silhouette.
-   - Multiply by **fog jitter** (subtle fBm density variation — light shafts shimmer slightly as wind moves the dust).
-   - Map intensity → glyph + theme ramp colour.
-
-3. HUD on bottom row.
-
----
-
-## Key Formulas
-
-**Aspect-corrected normalised cell coords:**
 ```
-u = (2 · sx + 1 − cols) / cols
-v = (2 · sy + 1 − rows) / rows · (rows · ASPECT_Y / cols)
+keys → app_handle_key → scene state
+                              │
+clock_ns → dt → scene_tick
+                              │
+                       scene_draw:
+                          PASS 1: per cell shade → g_buf, g_vis
+                          PASS 2: dust_apply (gated by g_vis)
+                          PASS 3: bloom_apply (5×5 Gaussian bright-pass)
+                          PASS 4: paint each cell to ncurses
 ```
 
-**Step vector toward sun** (in cell coordinates):
-```
-Δsx       = (sun_sx − sx) / MARCH_STEPS
-Δsy       = (sun_sy − sy) / MARCH_STEPS
-step_len  = √(Δsx² + (Δsy · ASPECT_Y)²)        // visual distance per step
-```
+## Key patterns to internalise
 
-**Sample weight at step i** (Beer-Lambert):
-```
-d_i = i · step_len
-w_i = exp(−FOG_SIGMA · d_i)
-```
+**Beer-Lambert weighted visibility.** The march sums exp(-σ·d) per
+unblocked step; closer steps weigh more. That's why shafts spread OUT
+from the sun rather than filling the whole half-screen.
 
-**Visibility accumulation:**
-```
-accum   = Σ_{i: silhouette FALSE} w_i
-total_w = Σ_{i in 1..N}            w_i
-vis     = accum / total_w                       // ∈ [0, 1]
-```
+**Continuous RGB pipeline beats preset ramps.** Saturn's lesson, applied
+again. ~20 000 effective shades per cell.
 
-**Sun-disc contribution** (`sx,sy` near `sun_sx,sun_sy`):
-```
-dx, dy = sx − sun_sx, (sy − sun_sy) · ASPECT_Y
-r²     = dx² + dy²
-sun    = exp(−r² / SUN_FALLOFF²) · (1 − sun_in_silhouette)
-```
+**Blackbody temperature = physical chromaticity.** No "theme" tuning;
+sun colour is determined by one Kelvin number, derived colours follow.
 
-**Fog wind** (subtle visual modulation):
-```
-wind        = time · FOG_WIND
-fog_jitter  = 1 + FOG_JITTER_AMP · 2 · (fbm(u·1.4 + wind, v·1.4) − 0.5)
-```
+**Bloom = bright-pass Gaussian + separate buffer.** Two-pass to avoid
+feedback compounding.
 
-**Total intensity:**
-```
-intensity = (vis · SHAFT_GAIN + sun · SUN_GAIN) · fog_jitter
-glyph     = RAMP_GLYPHS[clamp(⌊intensity · 8⌋, 0, 7)]
-```
+**Dust = particle system + visibility gate.** Particles only sparkle
+inside shafts (multiply contribution by g_vis at the cell). Distance-
+spaced trail recording for frame-rate independence.
 
----
+**Wind gust via slow Perlin.** Dust velocity multiplied by `1 + AMP·
+perlin(time)` for organic ebb-and-flow.
 
-## Silhouette Functions
-
-All return `true` if the point is INSIDE the silhouette. Coordinates `(u, v) ∈ [-1, +1]²` aspect-corrected.
-
-| Pattern   | Definition |
-|-----------|------------|
-| ARCHWAY   | Two pillar rectangles at u=±0.40, half-annulus arch top for v<0, capstone block, ground line |
-| MOUNTAIN  | `v > 0.70 − 1.10·exp(−u²/0.30) − 0.35·exp(−(u−0.55)²/0.05)` (gaussian peak + side bump) |
-| COLUMN    | Tall capped rectangle around u=0, cosine-jagged broken top, ground line |
-| WINDOWS   | 4×2 grid of arched windows cut from a wall (rectangular body + half-circle top) |
-| TREE      | Tapered trunk + 6 capsule branches at varying angles with linear taper |
-
----
-
-## Edge Cases and Pitfalls
-
-- **CELL ON SUN.** When `(sx, sy) ≈ (sun_sx, sun_sy)`, step vector is near-zero and N samples coincide. The sun-disc gaussian dominates this region, so the visibility result doesn't matter — but if you cared, early-out with `vis = 1` when `dist < 1 cell`.
-
-- **CELL INSIDE SILHOUETTE.** The silhouette test gates everything: inside cells render solid black with NO march. Otherwise march might yield "visible to sun through the silhouette behind", which makes no sense.
-
-- **SHAFT BACKLIT BY OWN OCCLUDER.** The march samples points BETWEEN the cell and the sun. The cell itself is OUTSIDE the silhouette (gated above). If the silhouette is between cell and sun, samples will fall inside it → visibility drops → cell stays dark. That's exactly the SHADOW behind the silhouette. No special-casing needed.
-
-- **SAMPLE POINT GOES OFF-SCREEN.** The march can sample `(px, py)` outside `[0, cols)×[0, rows)`. Silhouette functions are defined in normalised coords, so they work just as well off-screen — points outside the silhouette area render as "clear sky". (Treating off-screen as silhouette would cut off the shaft fans at screen edges.)
-
-- **ASPECT IN STEP-LENGTH.** Terminal cells are ~2× taller than wide. The "visual length" of one step needs `ASPECT_Y` multiplied into the y component, otherwise vertical shafts look longer (more samples = more accumulation) than they should. `step_len` uses `ASPECT_Y · Δsy` in its sqrt.
-
-- **WINDOW ALIGNMENT.** The WINDOWS pattern's holes must be arched/rectangular consistently. The grid of holes is parameterised on `(gu, gv)` within each cell; if the cell arithmetic floors incorrectly at exact boundaries, you get one-pixel-wide false windows. Use a small margin in the boundary tests to avoid this.
-
-- **PERFORMANCE.** `MARCH_STEPS · cols · rows` is the per-frame silhouette-evaluation count. At 20 steps · 240 · 80 ≈ 384 k silhouette evals per frame. Each is a few branches. Modern CPUs handle this in ~5-15 ms. If you push terminal size to 400×120, drop `MARCH_STEPS` to 14 to maintain 30 fps.
-
----
-
-## How to Verify
-
-- **PAUSE** (space). Sun freezes; shafts stop drifting. Resume: sun continues smoothly.
-
-- **ARCHWAY** pattern. Two pillars visible as black rectangles; curved top visible as a black half-disc. A bright shaft fans out UNDER the arch toward the camera, bright on the line from the arch interior to the sun, dim on the sides.
-
-- **MOUNTAIN** pattern. Black peak fills the lower portion. A bright fan of light spills OVER the ridge wherever the sun is positioned above the ridgeline.
-
-- **WINDOWS** pattern. Several thin parallel shafts streaming through the windows in the cathedral wall — one shaft per window, all converging back toward the sun.
-
-- **TREE** pattern. The trunk and branches form a black silhouette. Many thin shafts thread between the branches (where the sun is visible through the gaps); branches cast sharp dark stripes.
-
-- **Theme cycle** (`t`/`T`). Each theme should produce a recognisably different fog colour while shaft structure stays identical.
-
-- **Speed** (`+`/`−`). Doubling speed should approximately halve the period between sun's leftmost and rightmost positions.
-
----
-
-## References
-
-- Mitchell, K. (2007) — "Volumetric Light Scattering as a Post-Process", *GPU Gems 3*, ch. 13. The screen-space god-rays technique this demo's algorithm is a direct descendant of.
-- Hoffman, N. & Preetham, A. — "Real-time Light Atmosphere Interactions for Outdoor Scenes", *Game Programming Gems 5*.
-- Wikipedia — [Crepuscular rays](https://en.wikipedia.org/wiki/Crepuscular_rays). The atmospheric phenomenon ("god rays") this demo simulates.
-- Wikipedia — [Beer-Lambert law](https://en.wikipedia.org/wiki/Beer%E2%80%93Lambert_law). The `exp(-σ·d)` extinction law that weights samples.
-
----
-
-*Source: `raytracing/god_rays_silhouette.c`*
+**Curated airy ramp.** Open glyphs only — bright cells read as POINTS
+OF LIGHT not solid pixels.

@@ -1,197 +1,197 @@
-# Pass 1 — path_tracer.c: Monte Carlo Path Tracer — Cornell Box
+# Pass 1 — path_tracer.c: Progressive Monte Carlo path tracer (Cornell Box)
 
 ## Core Idea
 
-A **path tracer** simulates light by following photon paths backwards from the camera. For each pixel, one ray is fired into the scene. When it hits a surface it bounces in a random direction sampled from the surface's BRDF. The process repeats until the path hits a light source (contributing energy) or gets terminated by Russian roulette. Many such paths are **averaged** (progressive accumulation) to recover the ground-truth image.
+A path tracer simulates light by following photon paths BACKWARDS from
+the camera. For each pixel, fire a ray into the scene. At each surface
+hit:
+1. If the surface is emissive (a light), accumulate `throughput · emission`
+   and stop.
+2. Otherwise, multiply `throughput *= albedo`, sample a new direction
+   from the cosine-weighted hemisphere around the normal, recurse.
 
-This is *the* algorithm behind photo-realistic renders. The terminal version runs at ~30 fps while converging over ~512 samples, each frame adding a noisy layer that gradually resolves into soft shadows, color bleeding, and accurate indirect illumination.
+Termination by Russian roulette at depth ≥ RR_DEPTH: survive with
+probability `p = max(throughput)`; on survival multiply throughput by
+`1/p` (preserves unbiasedness) — finite expected depth, no truncation.
+
+Per-pixel contributions accumulate ACROSS frames. Each frame adds
+SPP (samples per pixel) more paths. The image converges from noisy
+to clean over hundreds of samples — watching it settle is the demo.
+
+## Cornell Box
+
+The canonical test scene since Goral 1984:
+- 5 walls (white floor/ceiling/back, RED left, GREEN right)
+- 1 area light (warm) just below the ceiling
+- 2 spheres (gold left, indigo right) above the floor
+
+Color bleeding: red wall tints the gold sphere on its left flank;
+green wall tints the indigo sphere on its right. This is the visual
+signature of multi-bounce global illumination.
+
+## Cosine-weighted hemisphere (Malley's method)
+
+```
+r1, r2 ∈ [0,1)
+φ      = 2π · r1
+local  = (cosφ · √r2, sinφ · √r2, √(1−r2))
+world  = onb(N) · local
+```
+
+PDF = cosθ/π. Paired with Lambertian BRDF f_r = albedo/π:
+```
+weight = f_r · cosθ / pdf = (albedo/π) · cosθ / (cosθ/π) = albedo
+```
+The cosθ and π cancel — that's why we use cosine-weighted sampling.
+
+## Russian roulette (Veach)
+
+```
+if depth ≥ RR_DEPTH:
+  p = max(throughput.r, .g, .b)
+  if rng > p: kill (return)
+  else: throughput /= p
+```
+
+Unbiased: E[contribution] is unchanged because the survival probability
+exactly compensates for the throughput inflation.
+
+## RGB cube paint pipeline
+
+Same as the entire raytracer folder:
+1. Reinhard tone-map `L/(1+L)` per channel
+2. Gamma encode `^(1/2.2)`
+3. Quantise to 216 ncurses pairs (6×6×6 RGB cube)
+4. Pick density char from 92-char Bourke ramp
+5. A_BOLD on bright cells; the path tracer also keeps A_BOLD always for
+   the colour cube to stay vivid
+
+## §-section structure
+
+```
+§1 config       (sub-sectioned 1.1-1.6: frame rate, view, PT consts, scene coords, ramp, ncurses)
+§2 clock
+§3 vec3
+§4 rng          xorshift32 + per-pixel-per-frame seed
+§5 scene        5.1 Material · 5.2 Quad · 5.3 Sphere · 5.4 lookup helpers
+§6 intersection 6.1 ray_quad · 6.2 ray_sphere · 6.3 scene_hit
+§7 path trace   7.1 onb · 7.2 cos_sample_hemi · 7.3 path_trace (iterative)
+§8 framebuffer  8.1 accumulator · 8.2 add_frame · 8.3 tone-map+draw
+§9 screen       9.1 color_init · 9.2 progress bar · 9.3 hud_draw
+§10 app         signals, resize, main loop
+```
+
+## Worked Example (verify by hand, color bleeding)
+
+Path: eye → floor → red wall → light.
+
+```
+Materials:
+  floor   albedo (0.73, 0.73, 0.73)
+  red     albedo (0.65, 0.05, 0.05)
+  light   emission (15, 14, 11)
+
+throughput evolution:
+  start:        (1.00, 1.00, 1.00)
+  after floor:  (0.73, 0.73, 0.73)
+  after wall:   (0.4745, 0.0365, 0.0365)
+  light hit, contribution = throughput · emission:
+                = (0.4745·15, 0.0365·14, 0.0365·11)
+                = (7.12, 0.51, 0.40)
+```
+
+Bright RED — that's color bleeding from the wall, the visual signature
+of multi-bounce global illumination.
+
+## HUD spec
+
+- Yellow status row 0: fps, spp, samples, "tracing/PAUSED/CONVERGED"
+- Yellow row 1: progress bar showing convergence (filled green when
+  inside ACCUM_CAP)
+- Cyan hint bottom row
+
+## How to verify
+
+- Press 'r' to reset, then watch:
+  - sample 1     ≈ solid noise, faint scene
+  - sample 32    ≈ silhouettes visible, lots of grain
+  - sample 256   ≈ clean walls, slight grain on spheres
+  - sample 2048  ≈ near-converged
+- COLOUR BLEED: gold sphere has slight reddish tint on LEFT flank
+  (red wall bouncing) and slight greenish on RIGHT (green wall).
+- Soft shadow under each sphere (less direct illumination there).
+- '+' to bump SPP — convergence visibly faster but fps drops.
+
+## Edge cases
+
+- **Self-intersection**: offset ray origin by 1e-4 · N each bounce.
+  Without the push, the next intersection finds the surface we just
+  left at t ≈ 0 → path stops one bounce short.
+- **Double-sided normal**: for quads we pick normal facing incoming
+  ray; for spheres we flip outward normal if pointing away.
+- **RR probability**: max(channels), NOT mean — preserves paths whose
+  energy is concentrated in a single band (deep red etc).
+- **Tone-map AFTER divide**: divide accum by samples FIRST (linear
+  average), THEN Reinhard. Tone-mapping a sum of N samples is not
+  the same as N times the tone-map of one sample.
 
 ---
 
-## The Mental Model
+# Pass 2 — Pseudocode
 
-### The Rendering Equation
+## Module map
 
-Everything in a path tracer is an approximation of:
+| § | Purpose |
+|---|---|
+| §1 config       | frame rate, view, MAX_DEPTH, RR_DEPTH, SPP, scene coords |
+| §2 clock        | monotonic timer + sleep |
+| §3 vec3         | V3 helpers |
+| §4 rng          | xorshift32 + decorrelated per-pixel-per-frame seed |
+| §5 scene        | Cornell box materials + quads + spheres |
+| §6 intersection | ray_quad · ray_sphere · scene_hit |
+| §7 path trace   | iterative random-walk with RR termination |
+| §8 framebuffer  | progressive accumulator |
+| §9 screen       | 6×6×6 cube + 92-char ramp + HUD |
+| §10 app         | signals, resize, main loop |
 
-```
-L_o(x, ω_o) = L_e(x, ω_o) + ∫ L_i(x, ω_i) · f_r(x, ω_i, ω_o) · (N · ω_i) dω_i
-```
-
-- `L_o` = outgoing radiance from point x toward camera
-- `L_e` = emitted radiance (non-zero only for light sources)
-- `f_r` = BRDF (how the surface scatters light)
-- `N · ω_i` = cosine of incidence angle (Lambert's law)
-
-The integral is over all incoming directions. A Monte Carlo estimator approximates it with a single random sample and an importance weight.
-
-### Lambertian BRDF + Cosine Sampling: The Perfect Cancellation
-
-For a Lambertian (matte) surface with albedo `ρ`:
-- BRDF: `f_r = ρ / π`
-- Cosine-weighted hemisphere PDF: `p(ω) = cosθ / π`
-
-Monte Carlo weight = `f_r · cosθ / p(ω)` = `(ρ/π) · cosθ / (cosθ/π)` = **ρ**
-
-The π and cosθ terms cancel exactly. The code `throughput *= albedo` is correct — no division, no cosine computation needed. This is why cosine-weighted hemisphere sampling is the standard choice for Lambertian surfaces.
-
-```c
-/* BRDF = albedo/π, PDF = cosθ/π → weight = albedo */
-throughput = v3mul(throughput, m->albedo);
-rd = cos_sample_hemi(h.N, rng);
-```
-
-### Cosine-Weighted Hemisphere Sampling (Malley's Method)
-
-Sample uniformly from a disk, then project up to the hemisphere:
+## Data flow
 
 ```
-r1 = uniform[0,1)   → azimuth φ = 2π·r1
-r2 = uniform[0,1)   → sinθ = √r2,  cosθ = √(1-r2)
+main → dt → if !paused && samples < ACCUM_CAP:
+              accum_add_frame(spp):
+                per pixel:
+                  per sample s in 0..spp-1:
+                    rng = rng_seed(col, row, frame · spp + s)
+                    jitter pixel position
+                    rd = camera_ray(jittered)
+                    c = path_trace(cam_pos, rd, rng)
+                    accumulate
+                  g_accum[row][col] += sum
+                g_samples += spp
+
+           accum_draw:
+             per pixel:
+               linear_avg = g_accum / g_samples
+               Reinhard + gamma
+               cube quantise + ramp char
+               paint
 ```
 
-The resulting direction in the local frame: `(cosφ·sinθ, sinφ·sinθ, cosθ)`.
-Transform to world space using an ONB (orthonormal basis) around the surface normal.
+## Key patterns to internalise
 
-```c
-static void onb(V3 n, V3 *u, V3 *v) {
-    V3 up = fabsf(n.x) < .9f ? v3(1,0,0) : v3(0,1,0);
-    *u = v3norm(v3cross(up, n));
-    *v = v3cross(n, *u);
-}
-```
+**Photon paths backwards from camera.** Same image as forward sim,
+trillion times less wasted work — random walks that LAND on lights
+contribute, others die.
 
-Why not `cross(n, up)` for both? Because if `n` is nearly parallel to `up`, the cross product is near-zero. Switching `up` when `|n.x| ≥ 0.9` avoids the degenerate case.
+**Cosine-weighted sampling cancels the cosθ in the integrand.** That's
+why we sample directions with that PDF — algebraic simplification of
+the Monte Carlo estimator down to `weight = albedo`.
 
-### Russian Roulette — Unbiased Termination
+**Russian roulette = unbiased termination.** Compensate killed paths
+by inflating survivors' throughput. E[contribution] unchanged.
 
-Paths must terminate; fixed depth is biased (missing deep indirect light). Russian roulette terminates at any depth with probability `1 - p` where `p = max(throughput channel)`. Surviving paths are boosted by `1/p` to maintain an unbiased estimator:
+**Progressive accumulator + tone-map at draw time.** Keep accum in
+linear HDR; divide and tone-map only at paint time.
 
-```c
-if (depth >= RR_DEPTH) {
-    float p = v3maxc(throughput);
-    if (rng_f(rng) > p) break;       /* terminate */
-    throughput = v3s(1.f/p, throughput);  /* compensate */
-}
-```
-
-Key insight: `E[boost × survive] = (1/p) × p = 1` — the expected value is unchanged. Dim paths (low p) are more likely to be killed, which is exactly right: they contribute little energy even if they survive.
-
-### Progressive Accumulator
-
-Per-pixel float array stores running sum of radiance:
-
-```
-accum[y][x][c] += path_trace(pixel_ray)
-display[y][x][c] = accum[y][x][c] / num_samples
-```
-
-- Early frames: very noisy (1-4 samples per pixel)
-- After 64 samples: basic scene structure visible
-- After 512 samples: shadows, bleeding, and soft indirect light converge
-
-On resize or user reset: `memset(accum, 0) + samples = 0`. The visual transition from noise to clarity *is* the animation.
-
-### xorshift32 — Decorrelated Per-pixel RNG
-
-Each pixel × frame gets an independent RNG state seeded from its coordinate and frame index:
-
-```c
-static Rng rng_seed(int px, int py, int frame) {
-    uint32_t s = (uint32_t)(px * 1973 + py * 9277 + frame * 26699 + 1);
-    s ^= s << 13; s ^= s >> 7; s ^= s << 17;   /* warm up */
-    return s ? s : 1u;
-}
-```
-
-Why per-pixel independent states instead of one global RNG? Adjacent pixels sharing a RNG state creates correlated noise — artifacts like bands or streaks. Per-pixel seeds ensure each pixel's samples are uncorrelated with its neighbors, giving proper white noise that averages out.
-
-### Reinhard Tone Mapping
-
-Raw path-traced radiance is unbounded (a small bright light can give values of 10, 100, or more). Reinhard compresses `[0, ∞)` → `[0, 1)` per channel:
-
-```
-L_display = L / (1 + L)
-```
-
-After tone-mapping, apply gamma encoding `L^(1/2.2)` for perceptual sRGB. The light emission of 15 W·sr⁻¹ is compressed to `15/16 ≈ 0.94` — near-white, as desired.
-
----
-
-## Cornell Box Scene
-
-The Cornell Box is the standard path tracing benchmark, designed to isolate key lighting effects:
-
-| Surface | Material | Effect tested |
-|---|---|---|
-| Left wall | Red diffuse | Color bleeding onto white floor |
-| Right wall | Green diffuse | Color bleeding onto white spheres |
-| Floor/ceiling/back | White diffuse | Indirect illumination |
-| Area light (y=0.98) | Emissive (15,14,11) | Soft shadows, warm indirect |
-| Gold sphere | (0.80,0.58,0.18) | Saturated color bleeding |
-| Indigo sphere | (0.22,0.28,0.82) | Cool color contrast |
-
-### Axis-Aligned Quad Intersection
-
-Each wall is an axis-aligned rectangle. Intersection is a one-dimensional solve:
-
-```
-axis=Y, pos=−1 (floor):
-  t = (−1 − ray.y) / ray.dy
-  hit.x = ray.x + t·ray.dx    check ∈ [lo[0], hi[0]]
-  hit.z = ray.z + t·ray.dz    check ∈ [lo[1], hi[1]]
-```
-
-Normal always faces the incoming ray: if `rd[axis] > 0`, flip normal to `-axis`. This ensures hemisphere sampling is always away from the surface.
-
-### Light Placement
-
-The area light at `y=0.98` sits slightly below the ceiling at `y=1.0`. A ray going upward through the light's XZ footprint `x∈[-0.36,0.36], z∈[0.62,1.38]` hits the light first (`t_light < t_ceiling`). Rays outside the footprint skip the light and hit the white ceiling — correct behavior.
-
----
-
-## Non-Obvious Decisions
-
-### Why 1e-4f offset after bounce?
-
-```c
-ro = v3add(h.P, v3s(1e-4f, h.N));
-```
-
-Without offset, the next ray's `t_min=1e-4` test might accept a hit on the same surface (self-intersection) due to floating point rounding. The offset pushes the new ray origin slightly away from the surface so it can't immediately re-hit the same quad/sphere.
-
-### Why terminate at emission instead of continuing?
-
-When a path hits an emissive surface, it adds `throughput × emission` and terminates. This is correct for pure emissive geometry (a light source has no BRDF contribution — it *is* the contribution). Continuing would require subtracting to avoid double-counting.
-
-### Why does convergence stall at ACCUM_CAP?
-
-Path tracing converges as `1/√N` — halving noise requires 4× more samples. At 8192 samples the image is essentially converged for terminal resolution (ASCII chars hide noise below a certain level). The cap prevents wasting CPU on imperceptible improvements.
-
-### SPP tradeoff
-
-- High SPP/frame: converges faster visually but fps drops; terminal becomes unresponsive at 8+ SPP
-- Low SPP/frame: 30 fps maintained, image visibly noisy for longer  
-- Default 2 SPP: reasonable balance — 60 samples/sec, converges in ~8 seconds
-
----
-
-## From the Source
-
-**Algorithm:** Unidirectional Monte Carlo path tracing. For each pixel, cast a ray. At each surface hit: (1) check if hit surface is a light — if so, accumulate; (2) sample a random new direction from the cosine-weighted hemisphere around the surface normal; (3) recurse with that direction. Russian roulette termination: at each bounce, terminate with probability `(1 − max_colour_component)`; scale surviving rays. This gives unbiased termination with finite expected depth.
-
-**Math:** Monte Carlo rendering equation (Kajiya 1986):
-`L_o(p,ω_o) = L_e(p,ω_o) + ∫ f_r·L_i·(ω_i·n)·dω_i`
-Cosine-weighted hemisphere sampling: generate (u,v) uniform, `θ = arccos(√(1−u))`, `φ = 2π·v`. This importance-samples the Lambertian BRDF `f_r = ρ/π`, cancelling the cosine factor for simpler accumulation. Progressive rendering: average accumulates as 1/N, converging to ground truth (variance ∝ 1/N) with each additional sample.
-
-**Rendering:** Reinhard tone mapping: `L_out = L/(1+L)` compresses HDR values. The Cornell box exercises indirect diffuse illumination (colour bleeding from red/green walls) — the key advantage of path tracing over direct-only methods.
-
-**References:** Kajiya (1986), "The Rendering Equation", SIGGRAPH proceedings.
-
-# Structure
-
-| Symbol | Type | Size | Role |
-|--------|------|------|------|
-| `g_accum[MAX_H][MAX_W][3]` | `float[100][320][3]` | ~384 KB | Per-pixel RGB accumulator for progressive path tracing |
-| `g_samples` | `int` | 4 B | Total samples accumulated so far (used to compute the running average) |
-| `k_mats[]` | `const Mat[6]` | ~144 B | Material albedo and emission for the 6 Cornell box surfaces |
+**Same paint pipeline as the entire raytracer folder.** RGB → Reinhard
+→ gamma → 6×6×6 cube + 92-char Bourke ramp.

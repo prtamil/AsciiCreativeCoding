@@ -3964,11 +3964,16 @@ Progressive render: the framebuffer is filled over multiple frames; partially co
 
 Analytic ray-capsule intersection using the Íñigo Quílez decomposition: cylinder body test (quadratic after projecting out the axial component) followed by hemisphere cap tests (sphere quadratics) at each endpoint.
 
+The §5 ray-capsule code is split into three named sub-functions:
+- **§5.1 `cylinder_test`** — infinite cylinder along ba + axial bound check
+- **§5.2 `cap_test`** — single sphere quadratic at endpoint
+- **§5.3 `ray_capsule`** — dispatcher (cylinder first, fall through to nearer cap)
+
 ### Intersection Algorithm
 
 Let `ba = cb − ca` (axis), `oa = ro − ca`. Project out axial component: `a = |ba|² − (ba·rd)²`, `b = |ba|²·(rd·oa)−(ba·oa)·(ba·rd)`, `c = |ba|²·(|oa|²−r²)−(ba·oa)²`. Discriminant `h = b²−a·c`. Body hit if `t > ε` and axial position `y = (ba·oa) + t·(ba·rd) ∈ (0, |ba|²)`. If body misses (y out of range), try cap sphere at `ca` or `cb` using `oc = oa` or `oc = oa − ba`. If `h < 0` (infinite cylinder missed), skip both caps.
 
-Body normal: strip axial component from `(P − ca)`. Cap normal: `normalize(oc + t·rd)`. Normal transition at the seam is C¹ continuous. Four rendering modes (Phong, normals, Fresnel, depth); six themes.
+Body normal: strip axial component from `(P − ca)`. Cap normal: `normalize(oc + t·rd)`. Normal transition at the seam is C¹ continuous. Four rendering modes (Phong, normals, Fresnel, depth); six themes. §6 lighting is split into per-light functions (`light_key`, `light_fill`, `light_rim`) for readability. HUD spec compliant (yellow status row 0, cyan hint bottom row); RGB cube + Bourke ramp paint pipeline.
 
 *Files: `raytracing/capsule_raytrace.c`*
 
@@ -3978,13 +3983,18 @@ Body normal: strip axial component from `(P − ca)`. Cap normal: `normalize(oc 
 
 Analytic ray-AABB intersection using the slab method. The cube tumbles via a rotation matrix applied to the ray (inverse transform), not to the geometry.
 
+§5 split into named sub-functions:
+- **§5.1 `slab_test`** — single-axis 1D slab solve (atomic unit, including parallel-ray case)
+- **§5.2 `ray_aabb`** — dispatcher: combine 3 slabs via max-of-entries / min-of-exits, with explicit inside-the-box recovery (camera inside → return EXIT face)
+- **§5.3 `face_edge_dist`** — fraction-to-edge for wireframe mode
+
 ### Slab Method
 
 For each axis: compute entry/exit times `t_near_i = (−s−ro_i)/rd_i`, `t_far_i = (s−ro_i)/rd_i`. Overall entry = max of entries, overall exit = min of exits. Hit if `t_near ≤ t_far` and `t_far > 0`. The axis that produced `t_near` (recorded during the loop as `near_ax`) is the face the ray actually hit — exact, no post-hoc inference. Normal sign: `(rd_i > 0) ? −1 : +1`.
 
 ### Wireframe Mode
 
-After intersection, the two "free" coordinates on the hit face give edge distance: `min(s−|u|, s−|v|)/s`. If below WIRE_THRESH=0.055, draw edge; otherwise skip (interior transparent). Produces pixel-perfect lines analytically — no rasterization artifacts. Four rendering modes (Phong, normals, wireframe, depth); six themes.
+After intersection, the two "free" coordinates on the hit face give edge distance: `min(s−|u|, s−|v|)/s`. If below WIRE_THRESH=0.055, draw edge; otherwise skip (interior transparent). Produces pixel-perfect lines analytically — no rasterization artifacts. Four rendering modes (Phong, normals, wireframe, depth); six themes. §6 lighting split into per-light functions; HUD spec compliant; RGB cube + Bourke ramp paint pipeline.
 
 *Files: `raytracing/cube_raytrace.c`*
 
@@ -4006,11 +4016,15 @@ Reinhard tone mapping: `L_out = L/(1+L)`. 216-color xterm cube palette; luminanc
 
 ## 110. Sphere Raytrace — raytracing/sphere_raytrace.c
 
-Analytic ray-sphere intersection. Each terminal cell fires one ray; the quadratic ray-sphere equation is solved exactly. Three-point lighting (warm key, cool fill, bright rim) and four rendering modes.
+The foundational analytic raytracer in this folder — sphere is the "Hello World" of analytic ray tracing. Each terminal cell fires one ray; the quadratic ray-sphere equation is solved exactly. Three-point lighting (warm key, cool fill, bright rim) and four rendering modes. Read this file before any sibling (cube/capsule/torus/path_tracer/etc.) — it establishes the skeleton they all extend.
 
 ### Quadratic Intersection
 
-`a=|rd|²=1`, `b=2(rd·oc)` (oc = ro − center), `c=|oc|²−R²`. Discriminant `b²−4c`; miss if negative. Surface normal: `N = (P − center) / R`. Phong: `I = ka + kd·max(N·L,0) + ks·max(R_v·V,0)^shininess`. Fresnel (Schlick): `F = F0 + (1−F0)·(1−N·V)^5`. Six themes (gold, ice, crimson, emerald, amethyst, neon). Four modes: Phong, normals, Fresnel, depth. Camera orbits the sphere; zoom adjustable at runtime.
+Half-b form (rd unit-length): `b = rd·oc` (oc = ro − center), `c = |oc|² − R²`. `disc = b² − c`. Miss if negative. Surface normal `N = (P − center) / R`.
+
+§6 lighting split into per-light functions (`light_key`, `light_fill`, `light_rim`) so each named function is one concept; the orchestrator `shade_phong` is 5 lines of glue. KEY = warm diffuse + sharp specular. FILL = cool diffuse only (intentionally no specular — adding it competes with KEY's highlight). RIM = wide specular at silhouette.
+
+Six themes (gold, ice, crimson, emerald, amethyst, neon). Four modes: Phong, normals, Fresnel (Schlick), depth. Camera orbits the sphere; zoom adjustable at runtime. HUD spec compliant (yellow status row 0, cyan hint bottom row). RGB cube + Bourke ramp paint pipeline (same template as the rest of the folder).
 
 *Files: `raytracing/sphere_raytrace.c`*
 
@@ -4018,13 +4032,20 @@ Analytic ray-sphere intersection. Each terminal cell fires one ray; the quadrati
 
 ## 111. Torus Raytrace — raytracing/torus_raytrace.c
 
-Analytic ray-torus intersection via quartic polynomial root-finding. The torus lies in the XZ plane; substituting the ray into `(√(x²+z²)−R)² + y² = r²` yields a degree-4 polynomial in t.
+Analytic ray-torus intersection via quartic polynomial root-finding. The torus lies in the XZ plane; substituting the ray into `(√(x²+z²)−R)² + y² = r²` and squaring twice (to remove the radical) yields a degree-4 polynomial in t. This is the most expensive analytic primitive in this folder — sphere is degree 2, cube is linear, torus is degree 4.
+
+§5 split into named sub-functions:
+- **§5.1 `q_eval`** — Horner-form polynomial evaluation (3 mults + 4 adds vs 6 mults naïve)
+- **§5.2 `ray_torus`** — derive coefficients (A, B, C, D) + scan-bisect for smallest positive root
+- **§5.3 `torus_normal`** — closest-point geometric formula (faster + more stable than implicit gradient)
 
 ### Quartic Solver
 
-Coefficients A, B, C, D are derived by algebra from the torus equation. Rather than the unstable Ferrari formula, roots are found by evaluating the polynomial at sample points, then bisecting sign-change intervals to locate each real root. The minimum positive root is the front surface hit. Surface normal at hit point p: `N = normalize(p − R·normalize(p.xz × (0,1)))` (strips the Y component and points radially from the nearest ring axis point).
+Coefficients A, B, C, D are derived by algebra from the torus equation. Rather than the unstable Ferrari formula, roots are found by evaluating the polynomial at sample points (Q_SAMPLES=256), then bisecting sign-change intervals (Q_BISECT=40 → ~10⁻¹² precision) to locate each real root. The minimum positive root is the front surface hit. Scan-bisect is slower per pixel (~300 ops vs ~50 for Ferrari) but completely stable — never divides by anything that could be zero.
 
-Same inverse-ray-transform approach as cube and capsule: rotate the ray into object space, intersect the axis-aligned torus, transform the normal back. Four rendering modes (Phong, normals, Fresnel, depth); six themes (titanium, solar, cobalt, forest, rose, chrome).
+Surface normal: project P onto XZ plane, rescale to length R (closest centreline point), unit vector from there to P. Avoids the implicit gradient's `1/√(x²+z²)` term.
+
+Same inverse-ray-transform approach as cube and capsule: rotate the ray into object space, intersect the axis-aligned torus, transform the normal back. Four rendering modes (Phong, normals, Fresnel, depth); six themes (titanium, solar, cobalt, forest, rose, chrome). §6 lighting split into per-light functions; HUD spec compliant.
 
 *Files: `raytracing/torus_raytrace.c`*
 
@@ -4032,7 +4053,17 @@ Same inverse-ray-transform approach as cube and capsule: rotate the ray into obj
 
 ## 111b. Saturn With Rings — raytracing/saturn_with_rings.c
 
-Iconic ringed planet from one ray-sphere + one ray-plane-annulus per cell. Depth-sort gives ring-passes-behind-planet occlusion. Shadow ray from each ring point toward the sun, tested against the planet sphere, casts the dark shadow band on the back of the rings. Per-radius ring density modulation + Cassini Division dim band. Planet shading: latitude bands (SATURN, EXO) or fBm continent map (RINGED-EARTH). 4 patterns: SATURN / URANUS (near-edge-on) / RINGED-EARTH / EXOPLANET. Slow sun rotation drives both the planet terminator AND the shadow band from the same `sun_dir`.
+Iconic ringed planet from one ray-sphere + one ray-plane-annulus per cell. Depth-sort gives ring-passes-behind-planet occlusion. CONTINUOUS RGB pipeline (216 RGB cube + Bourke ramp + Reinhard tone-map), with five additive shading layers stacked on top of the geometry:
+
+- **LAMBERT** — direct sunlight (N·L)
+- **LIMB DARKEN** — atmospheric absorption near silhouette (`pow(NdotV, 0.5)`)
+- **ATMOSPHERE RIM** — warm halo on lit silhouette edge (gated by NdotL > 0)
+- **FORWARD-SCATTER** — ring sections glow when sun is BEHIND them (the Cassini look: `backlight^3 · (1 − density)`)
+- **SOFT SHADOW** — 8-sample penumbra of planet on rings, deterministic hash-jittered offsets in a 3° cone around sun_dir so the shadow doesn't "boil"
+
+Cassini Division uses smoothstep (not a hard band). Sub-pixel anti-aliasing via SPP=1/2/4 cycle, jittered samples averaged in linear RGB before tone-mapping. THREE shade modes: LIT (full pipeline), FLAT (raw albedo, no lighting — see geometry without shading), NORMAL (RGB-encoded surface normal). Themes are RGB triplets per role (planet/ring/sun/dust/sky), not preset palettes.
+
+4 patterns: SATURN / URANUS (near-edge-on, thin rings) / RINGED-EARTH (fBm continent map) / EXOPLANET (per-seed random tints). Slow sun rotation drives both the planet terminator AND the shadow band from the same `sun_dir`.
 
 *Files: `raytracing/saturn_with_rings.c`*
 
@@ -4040,7 +4071,17 @@ Iconic ringed planet from one ray-sphere + one ray-plane-annulus per cell. Depth
 
 ## 111c. Solar Eclipse — raytracing/solar_eclipse.c
 
-Two ray-sphere tests with depth-sort: sun (far, big), moon (close, small). Per-pixel screen-space corona overlay `corona = exp(-d_out·K) · pow(occlusion,γ)` blooms only at totality because the occlusion factor is gamma-curved (γ=4). Limb darkening on the sun via Eddington's 1-coefficient law `L = 0.40 + 0.60·μ`. Diamond-ring bead fires when `|sep − |moon_α − sun_α|| < ε` (TOTAL only) at the sun edge opposite the moon. 4 patterns: TOTAL (corona + diamond) / PARTIAL (offset moon, never centres) / ANNULAR (moon angular < sun, max occlusion `(moon_α/sun_α)²`) / TRANSIT (Mercury-sized moon).
+Two ray-sphere tests with depth-sort: sun (far, big), moon (close, small). CONTINUOUS RGB pipeline with five cinematic shading layers stacked on top of the geometry:
+
+- **PHOTOSPHERE** — limb darkening (Eddington `L = 0.40 + 0.60·μ`) × fBm GRANULATION sampled in surface coordinates (`atan2(N.x, N.z), N.y`) so the texture stays glued to the sphere
+- **CORONA STREAMERS** — `exp(-d_out·K) · streamer · occlusion^γ` where `streamer = (1 + AMP · (fbm(angle·FA, d·FR + drift) − 0.5)·2)^POW`. The fBm in (angle, radius) space produces visible POLAR PLUMES and HELMET STREAMERS — not a uniform halo
+- **CHROMOSPHERE** — thin red Hα band at d_out ∈ [0, CHROMO_W], gated by `occlusion ≥ 0.92` (drowned by photosphere otherwise)
+- **BAILEY'S BEADS** — 5 Gaussian beads at hash3(k, seed)-jittered angular positions around the lunar limb, each with a per-bead random brightness, windowed by Gaussian on `|sep − sep_T|`. NOT a single bright dot — multiple beads at distinct positions, just like real eclipse photographs
+- **BLOOM** — 5×5 bright-pass Gaussian over g_buf
+
+Themes are 5 BLACKBODY star presets: SUN-LIKE 5778K (default) / RED-G 3500K / ORANGE 4500K / GIANT 8000K / WHITE-D 10000K. Photospheric chromaticity comes from one Kelvin via Tanner Helland's piecewise blackbody approximation; corona and chromosphere colours are largely K-independent (different physical processes). Cycling stars is "what if our sun were a different star".
+
+4 patterns: TOTAL (corona + chromosphere + beads) / PARTIAL (offset moon never centres, no totality) / ANNULAR (moon angular < sun, max occlusion `(moon_α/sun_α)² < 1`, no corona) / TRANSIT (Mercury-sized moon). Earthshine on moon during totality (cool-blue tint, not pure black). Sparse stars become visible during totality.
 
 *Files: `raytracing/solar_eclipse.c`*
 
@@ -4048,7 +4089,16 @@ Two ray-sphere tests with depth-sort: sun (far, big), moon (close, small). Per-p
 
 ## 111d. God Rays Silhouette — raytracing/god_rays_silhouette.c
 
-Volumetric light shafts via per-cell screen-space shadow-ray accumulation (the GPU Gems 3 / Crysis trick). For each cell: march `MARCH_STEPS=20` samples toward the sun's screen position; at each sample, point-in-shape test against the silhouette; unblocked samples accumulate Beer-Lambert weight `exp(-σ·d)`. `visibility = unblocked_weight / total_weight`. Plus sun-disc gaussian, plus fBm fog jitter for shimmer. 5 silhouette patterns (each a `bool sil_*(u, v)` predicate): ARCHWAY (pillars + half-annulus arch) / MOUNTAIN (gaussian peak) / COLUMN (capped rect with cosine-jagged broken top) / WINDOWS (4×2 arched-window cathedral wall) / TREE (tapered trunk + 6 capsule branches).
+Volumetric light shafts via per-cell screen-space shadow-ray accumulation (the GPU Gems 3 / Crysis trick), with a continuous-RGB pipeline and four additive cinematic layers:
+
+- **MARCH** — `MARCH_STEPS=20` samples toward the sun, Beer-Lambert weighted (`exp(-σ·d)`); `visibility = unblocked_weight / total_weight`
+- **CINEMATIC SUN** — CORE Gaussian + CORONA halo + 4 LENS-FLARE STREAKS at angles 0°/45°/90°/135°. Skip flare when r < 0.5 (atan2(0,0) undefined; core dominates). Reads as a real luminous body, not just a bright dot
+- **BLOOM** — 5×5 bright-pass Gaussian (`luma > 0.55` threshold), two-pass with separate g_bloom buffer to avoid feedback compounding
+- **DUST PARTICLES** — 220 sparkle particles drift across the scene with motion-blur trails. Trail length distance-spaced (every TRAIL_SPACING = 0.6 cells, NOT every frame) so trails look consistent across frame rates. Wind gusts (slow Perlin field, period ≈ 10 sec) modulate dust velocity by ±50%. Dust brightness GATED BY LOCAL VISIBILITY — particles in shadow contribute nothing, so dust only sparkles inside shafts
+
+Themes are 8 BLACKBODY temperature presets (no preset palettes): EMBER 1500K → SUNSET 2000K → CANDLE 2500K → TORCH 3500K → WARM 4500K → DAY 5500K → NOON 6500K → BLUE 8500K. The entire scene chromaticity (shaft, fog, dust, sky) derives from one Kelvin. THREE shade modes: LIT (full pipeline) / MASK (silhouette only — see the SHAPE) / VIS (grayscale visibility — see the algorithm OUTPUT).
+
+Curated airy 16-glyph density ramp ` .'`,-_:;~=+*oO0` — open-circle endpoints (no closed `#` or `@` blocks) so bright cells read as POINTS OF LIGHT not solid pixels. 5 silhouette patterns: ARCHWAY / MOUNTAIN / COLUMN / WINDOWS / TREE. 4-pass scene_draw (march → dust overlay → bloom → paint).
 
 *Files: `raytracing/god_rays_silhouette.c`*
 

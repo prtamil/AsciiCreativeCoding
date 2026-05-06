@@ -1,321 +1,219 @@
-# Pass 1 — torus_raytrace.c: Analytic ray-traced torus (quartic intersection)
+# Pass 1 — torus_raytrace.c: Analytic ray-torus via quartic root-finding
 
 ## Core Idea
 
-Intersects a ray with a torus by substituting the ray parametrically into the torus
-implicit equation, which produces a **quartic** (degree-4 polynomial) in t.  The
-smallest positive root gives the front surface hit.
+A torus is the set of points at distance r from a horizontal CIRCLE of
+radius R. Substituting the parametric ray P(t) = ro + t·rd into the torus
+implicit equation `(√(x² + z²) − R)² + y² = r²` and squaring twice (to
+remove the square root) collapses into a degree-4 polynomial in t.
 
-The torus lies in the XZ plane (the ring is horizontal).  The camera is elevated
-so both the outer ring surface and the hole through the centre are visible.  The
-same object-space ray transform used in cube_raytrace.c handles rotation.
+Sphere is degree 2; cube is linear per axis. Torus is degree 4 because
+its centreline is a CURVE, not a single point or plane.
 
----
+We solve the quartic numerically (sample + bisect), not by Ferrari's
+closed-form formula — the closed form is mathematically beautiful but
+notoriously unstable near tangent rays.
 
-## The Torus Implicit Equation
+## Quartic Coefficients
 
-Torus centred at origin, major radius R (ring centre to tube centre), minor radius r
-(tube cross-section), ring in XZ plane:
-
-```
-(√(x² + z²) − R)² + y² = r²
-```
-
-This is the set of all points at distance r from the ring circle of radius R in the
-XZ plane.
-
----
-
-## Deriving the Quartic
-
-Ray: `P(t) = ro + t · rd`,  `|rd| = 1`.
-
-Let:
-- `po² = |ro|²` = dot(ro, ro)
-- `rod = rd · ro`
-- `rxz² = ro.x² + ro.z²`  (XZ projection squared)
-- `rdxz_d = rd.x·ro.x + rd.z·ro.z`  (XZ dot product)
-- `rdxz² = rd.x² + rd.z²`
-
-Define `C₀ = po² + R² − r²`.
-
-The torus equation expanded and rearranged gives:
-```
-(|P|² + R² − r²)² = 4R² (P.x² + P.z²)
-```
-
-Both sides are polynomials in t.  Left side squared, right side linear in t²:
+Substituting and simplifying gives `t⁴ + A·t³ + B·t² + C·t + D = 0` with:
 
 ```
-Left  = (t² + 2·rod·t + C₀)²
-Right = 4R²(rdxz²·t² + 2·rdxz_d·t + rxz²)
-```
-
-Expanding and collecting by power of t:
-```
-t⁴  +  A·t³  +  B·t²  +  C·t  +  D  =  0
-
+let rod = rd · ro
+let C0  = |ro|² + R² − r²
 A = 4·rod
-B = 4·rod² + 2·C₀ − 4R²·rdxz²
-C = 4·rod·C₀ − 8R²·rdxz_d
-D = C₀² − 4R²·rxz²
+B = 4·rod² + 2·C0 − 4·R²·(rdx² + rdz²)
+C = 4·rod·C0 − 8·R²·(rdx·rox + rdz·roz)
+D = C0² − 4·R²·(rox² + roz²)
 ```
 
-This is exact — the quartic perfectly describes all intersections of the ray with
-the torus.
-
----
-
-## Root Finding: Sampling + Bisection
-
-A quartic has at most 4 real roots.  We need the smallest positive one (front face).
-
-**Why not Ferrari's formula?**  Ferrari's analytic quartic solver involves nested
-square roots and cube roots.  It is numerically unstable near degenerate cases
-(very thin torus, grazing rays) and produces complex branches that need careful
-case-handling.  Numerical root finding is simpler, robust, and fast enough for a
-terminal renderer.
-
-**Algorithm:**
-
-1. Evaluate the quartic at 256 equally-spaced t values in `[ε, 18]` using
-   Horner's method: `f(t) = t(t(t(t + A) + B) + C) + D`.
-
-2. When `f(t₀) × f(t₁) < 0` (sign change), a root lies in `[t₀, t₁]`.
-
-3. Bisect 40 times (~12 decimal digits of precision):
-```
-for j in 0..40:
-    mid  = (lo + hi) / 2
-    fmid = eval(mid)
-    if f(lo) × fmid < 0: hi = mid
-    else:                 lo = mid, f_lo = fmid
-```
-
-4. Return `(lo + hi) / 2` as the root.
-
-**Why 256 samples?**  The torus's near and far intersection points on the tube are
-separated by ~2r = 0.56.  With a scan step of 18/256 ≈ 0.07, every sign change
-is detected.  False negatives (two roots within one step) cannot happen for our
-parameter ranges.
-
-**Horner's method:**
-```
-t⁴ + At³ + Bt² + Ct + D = t(t(t(t + A) + B) + C) + D
-```
-4 multiplications and 4 additions vs 10 multiplications for naive expansion.
-
----
-
-## Torus Surface Normal
-
-The outward normal at hit point P is the gradient of the implicit function,
-normalized.  For a torus in XZ plane:
+Evaluated efficiently via Horner's method (3 mults + 4 adds vs 6 mults
+naïve):
 
 ```
-P_xz    = (P.x, 0, P.z)              ← projection onto ring plane
-rho     = |P_xz|                      ← distance from Y axis
-ring_pt = (R / rho) × P_xz           ← nearest point on ring centreline
-N       = normalize(P − ring_pt)
+q(t) = ((((t + A)·t + B)·t + C)·t + D
 ```
 
-Geometric meaning: the surface normal points away from the nearest point on the ring
-circle, which is exactly the "tube axis" direction at that location.
-
-Derivation check: gradient of `(√(x²+z²) − R)² + y²` at P gives components
-proportional to `(P − ring_pt)`. ✓
-
----
-
-## Camera Placement and Torus Orientation
-
-The ring is in the XZ plane (horizontal).  Camera at `(0, CAM_HEIGHT=1.8, −cam_dist)`:
-- Elevated by 1.8 above the ring plane → sees both the top of the tube and the hole
-- In front on −Z → the nearer part of the ring is at the bottom of the view
+## Scan + Bisect (numerical solver)
 
 ```
-cam  = (0, 1.8, −3.4)
-fwd  = normalize(origin − cam)     ← slightly downward and forward
+1. Sample q(t) at Q_SAMPLES uniformly-spaced t-values in [ε, T_MAX].
+2. Wherever consecutive samples have OPPOSITE SIGNS, a real root lies
+   in that interval (intermediate value theorem).
+3. On the FIRST sign change, bisect inside that bracket Q_BISECT times
+   to refine the root to ~10⁻¹² precision.
+4. Return that t — it's the smallest positive real root, hence the
+   front-face hit.
 ```
 
-The camera is **fixed**; the torus rotates.  Y rotation `(ROT_Y = 0.40 rad/s)`
-spins the ring.  Slow X tilt `(ROT_X = 0.18 rad/s)` gradually tips the ring plane,
-revealing the inside of the hole from different angles.
+Why scan-bisect over Ferrari?
+- Ferrari requires a resolvent cubic + several square roots; tangent
+  rays produce coefficients that send the discriminant near zero,
+  blowing small input errors into large output errors.
+- Scan-bisect never divides by anything potentially zero. Cost ~300 ops
+  vs ~50 for Ferrari — but completely stable.
 
----
-
-## Fresnel Mode on Torus
-
-The Fresnel effect is especially striking on a torus because:
-- The outer rim of the tube (facing the camera directly) is dark at head-on angles
-- The inner rim of the hole (surface curving away) glows bright
-- The tube silhouette edges are bright
-
-This creates a ghost-donut appearance — the torus seems transparent in the middle
-and glowing at the edges.
-
----
-
-## Non-Obvious Decisions
-
-### Why XZ plane instead of XY?
-With the ring in XY (the usual mathematical convention), the camera must be
-elevated on Y to see the hole — the ring appears nearly edge-on from the standard
-view angle.  XZ plane + elevated camera gives a natural "looking down at a ring"
-perspective without extreme camera angles.
-
-### Why 256 samples, not adaptive?
-Adaptive sampling (finer near expected roots) requires knowing where roots are,
-which is what we're finding.  Uniform sampling is simpler, predictable, and fast:
-256 multiplications at 4 FLOPs each = 1024 FLOPs/ray.  At 80×24 cells, that's
-~2M FLOPs per frame — negligible.
-
-### Why 40 bisection steps?
-40 iterations give `(t_max / 2⁴⁰) ≈ 18 / 10¹² ≈ 1.6e-11` precision — well below
-floating-point epsilon for our t values.  Fewer iterations visibly coarsen the
-silhouette at grazing angles.
-
-### Why not Newton's method for refinement?
-Newton's method on a quartic requires evaluating the derivative `4t³ + 3At² + 2Bt + C`.
-Bisection is cheaper per iteration (one evaluation vs two) and is unconditionally
-convergent within the bracket.  For 40 iterations convergence speed is irrelevant.
-
----
-
-## From the Source
-
-**Math:** The torus normal formula written in the source as `N = normalise(p − R · normalise(p.xz × (0,1)))` is equivalent to the ring-point subtraction form in the concept file. The `p.xz × (0,1)` term produces the XZ projection of p, giving `normalise(p.xz)` as the direction to the ring centre — the cross-product notation is an alternative way to write the same operation.
-
-**Rendering:** The shading pipeline (Phong + Fresnel) is **identical** to sphere_raytrace.c — the quartic root finder is the only code that is torus-specific. Everything else (lighting, modes, rotation transform) is shared. This makes the torus a clean extension exercise: replace one function, get a new shape.
-
----
-
-## Key Constants and What Tuning Them Does
-
-| Constant | Default | Effect |
-|----------|---------|--------|
-| `TORUS_R` | 0.68 | major radius; larger = wider ring, bigger hole |
-| `TORUS_r` | 0.28 | minor radius; larger = fatter tube |
-| `ROT_Y` | 0.40 rad/s | ring spin speed |
-| `ROT_X` | 0.18 rad/s | tilt speed; set to 0 for pure spin |
-| `CAM_HEIGHT` | 1.8 | elevation; 0 = edge-on (ring appears as line) |
-| `Q_SAMPLES` | 256 | scan density; reduce for speed, increase for grazing safety |
-| `Q_BISECT` | 40 | precision; 20 is usually sufficient |
-| `Q_T_MAX` | 18 | scan range; must exceed max hit distance |
-
-**Aspect ratio R/r:**  `0.68/0.28 ≈ 2.4`.  Below ~2 the tube touches itself
-(self-intersecting torus); above ~4 the tube becomes very thin and fragile-looking.
-The 2.4 ratio matches the Interstellar torus aesthetic.
-
----
-
-## Open Questions
-
-1. The quartic has up to 4 real roots.  The current code returns only the first
-   (front surface).  Add logic to find the second root (back of tube) and verify
-   it gives the correct back-surface normal.  This enables transparency effects.
-
-2. Implement the exact Durand-Kerner or Ferrari quartic solver and compare
-   numerical accuracy against bisection at grazing incidence angles.  Which
-   misses roots near the silhouette?
-
-3. A Villarceau circle is a circle traced on a torus at a 45° angle.  Derive
-   which rays through the torus (as a function of origin and direction) produce
-   a single tangent intersection (disc = 0), and visualise the set of such rays
-   as a curve on screen.
-
-4. Extend the XZ-plane normal formula to an arbitrarily oriented torus: the ring
-   axis direction is stored as a unit vector `axis`.  Derive the general formula
-   for `ring_pt` and `N` in terms of `axis` and `P`.
-
----
-
-# Structure
-
-| Symbol | Type | Size | Role |
-|--------|------|------|------|
-| `g_themes[]` | `const Theme[6]` | ~288 B | Per-theme diffuse, specular, and three light colour vectors |
-
-# Pass 2 — torus_raytrace.c: Pseudocode
-
-## Module Map
-
-| Section | Purpose |
-|---------|---------|
-| §1 config | TORUS_R/r, ROT_Y/X, CAM_*, Q_SAMPLES/BISECT/T_MAX |
-| §2 clock | `clock_ns()`, `clock_sleep_ns()` |
-| §3 V3/Mat3 | same as cube_raytrace |
-| §4 color | 6 themes; 216 pre-init pairs; `draw_color` |
-| §5 intersection | `q_eval` (Horner); `ray_torus` (scan+bisect); `torus_normal` |
-| §6 shading | `shade_phong`, `shade_normal`, `shade_fresnel`, `shade_depth` |
-| §7 render | elevated fixed camera → inverse-transform ray → shade |
-| §8 screen | `screen_hud()` |
-| §9 main | angle accumulation, input |
-
-## Data Flow
+## §5 split into 3 named sub-functions
 
 ```
-each frame:
-  angle_y += ROT_Y × dt
-  angle_x += ROT_X × dt
-  M = mat3_rot(angle_x, angle_y)
-
-  render(cols, rows, angle_x, angle_y, cam_dist, theme, mode):
-    cam = (0, CAM_HEIGHT, −cam_dist)
-    build (fwd, rgt, up) pointing toward origin
-
-    for each (row, col):
-      rd_ws = normalize(fwd + u×rgt + v×up)
-      ro_os = mat3_mulT(M, cam)
-      rd_os = mat3_mulT(M, rd_ws)
-
-      t = ray_torus(ro_os, rd_os, TORUS_R, TORUS_r)
-      if miss: continue
-
-      P_os = ro_os + t×rd_os
-      P_ws = cam   + t×rd_ws
-      N_os = torus_normal(P_os, TORUS_R)
-      N_ws = mat3_mul(M, N_os)
-      V    = normalize(cam − P_ws)
-
-      color = shade_*(P_ws, N_ws, V, theme)
-      draw_color(row, col, color, lum)
+§5.1 q_eval         Horner-form polynomial evaluation
+§5.2 ray_torus      derive coefficients + scan-bisect for smallest root
+§5.3 torus_normal   closest-point geometric formula
 ```
 
-## ray_torus
+## Closest-Point Normal
 
-```
-C0 = dot(ro,ro) + R² − r²
-A  = 4·dot(rd,ro)
-B  = 4·dot(rd,ro)² + 2·C0 − 4R²·(rdx²+rdz²)
-C  = 4·dot(rd,ro)·C0 − 8R²·(rdx·rox+rdz·roz)
-D  = C0² − 4R²·(rox²+roz²)
-
-dt = Q_T_MAX / Q_SAMPLES
-t0 = ε,  f0 = q_eval(t0, A,B,C,D)
-
-for i in 1..Q_SAMPLES:
-  t1 = i × dt
-  f1 = q_eval(t1, A,B,C,D)
-  if f0 × f1 < 0:
-    bisect [t0,t1] Q_BISECT times → root
-    return root
-  t0 = t1,  f0 = f1
-
-return miss
-```
-
-## q_eval (Horner)
-
-```
-f(t) = t·(t·(t·(t + A) + B) + C) + D
-```
-
-## torus_normal
+Outward normal at hit point P (avoiding the implicit gradient's
+`1/√(x²+z²)` term):
 
 ```
 P_xz    = (P.x, 0, P.z)
-rho     = sqrt(P.x² + P.z²)
-ring_pt = (R/rho) × P_xz
+ρ       = |P_xz|
+ring_pt = (R / ρ) · P_xz             ← closest point on ring centreline
 N       = normalize(P − ring_pt)
 ```
+
+If `ρ ≈ 0` (P on Y axis — physically impossible on torus surface, but
+defensive), default to (R, 0, 0).
+
+## Worked Example (verify by hand)
+
+Torus R=0.68, r=0.28 in XZ plane. Head-on equatorial ray:
+
+```
+ro = (0, 0, -3.4)        rd = (0, 0, +1)
+
+|ro|²    = 11.56
+rod      = -3.4
+rxz²     = 11.56
+rdxz_d   = -3.4
+rdxz²    = 1.0
+C0       = 11.56 + 0.4624 − 0.0784 = 11.944
+
+A = -13.6
+B = 4·11.56 + 2·11.944 − 4·0.4624·1.0 = 68.28
+C = 4·(-3.4)·11.944 − 8·0.4624·(-3.4) = -149.9
+D = 11.944² − 4·0.4624·11.56          = 121.27
+```
+
+Geometrically: with x=y=0, the ray hits the torus at z = ±(R±r):
+{−0.96, −0.40, +0.40, +0.96}. Mapping z = −3.4 + t:
+
+```
+t1 ≈ 2.44   front-near (z = -0.96)
+t2 ≈ 3.00   front-far  (z = -0.40)
+t3 ≈ 3.80   back-near  (z = +0.40)
+t4 ≈ 4.36   back-far   (z = +0.96)
+```
+
+Verify q(2.44) ≈ 0.1 ✓ — it's a root. Solver finds t1 first → smallest
+positive front-face hit.
+
+## Shade modes (cycled with `s`)
+
+PHONG · NORMAL · FRESNEL · DEPTH — same set as sphere/cube/capsule.
+
+## §6 lighting split (matches sphere/cube/capsule)
+
+```
+§6.1 light_key       KEY warm diffuse + sharp specular
+§6.2 light_fill      FILL cool diffuse only
+§6.3 light_rim       RIM accent specular at silhouette
+§6.4 shade_phong     orchestrator
+§6.5 shade_normal    diagnostic — torus shows TWO colour belts (one per tube hemisphere)
+§6.6 shade_fresnel   Schlick — both inner and outer silhouette glow
+     shade_depth     hit-distance encoding
+```
+
+## HUD spec
+
+- Yellow status row 0 + mode label top-left
+- Cyan hint bottom row
+
+## Inverse-rotation trick
+
+Torus is fixed in object space (ring in XZ plane, centred at origin) —
+this is what keeps the quartic coefficients clean. Rotation is applied
+to the RAY by `M^T = M⁻¹`. Cost: ONE matrix×ray multiply per pixel.
+
+The alternative (rotating the torus) would force every coefficient to
+be recomputed with cross-axis terms — orders of magnitude more code.
+
+## Edge cases
+
+- **Ray missing through hole** — camera elevated looking at hole centre,
+  the polynomial has no real roots; no sign change in the scan window.
+- **Tangent ray (double root)** — polynomial dips to zero and returns
+  WITHOUT crossing → no sign change → typically lost. Acceptable for
+  visual quality; a more robust solver would also find local extrema.
+- **Coefficient magnitude** ~200 at typical distances. Single-precision
+  float retains ~7 digits → fine for 10⁻⁶ precision after 40 bisections.
+- **Scan step size** Q_SAMPLES=256 gives Δt≈0.07. Two roots within 0.07
+  can be missed (a near-tangent pass).
+
+## How to verify
+
+- Static torus, no rotation, camera elevated: silhouette is donut shape
+  — outer circle of radius R+r=0.96 and inner hole of radius R-r=0.40.
+- MODE_NORMAL: rainbow ring with TWO distinct colour belts (one per
+  tube hemisphere — top of tube +Y → green, bottom −Y → magenta, etc.).
+- MODE_FRESNEL: both inner AND outer silhouette glow brightly.
+- Worked example: head-on equatorial ray (ro=(0,0,−3.4), rd=(0,0,1))
+  produces 4 roots t ≈ 2.44, 3.00, 3.80, 4.36. Solver returns the
+  first one, t ≈ 2.44.
+
+---
+
+# Pass 2 — Pseudocode
+
+## Module map
+
+| § | Purpose |
+|---|---|
+| §1 config       | frame rate, FOV, torus R/r, camera, scan params |
+| §2 clock        | monotonic timer + sleep |
+| §3 math         | V3, Mat3 |
+| §4 color        | themes (6) + 256-colour cube + paint |
+| §5 torus        | THE CORE — 5.1 q_eval, 5.2 ray_torus, 5.3 torus_normal |
+| §6 shading      | KEY/FILL/RIM split + 4 modes |
+| §7 render       | inverse-rotation, ray-per-cell |
+| §8 screen + HUD | yellow status + cyan hint |
+| §9 app          | signals, resize, main loop |
+
+## Data flow
+
+```
+keys → main → angle_x, angle_y, theme, mode, paused, cam_dist
+                              │
+                            render
+                              per cell:
+                                M = mat3_rot
+                                ro_os = M^T·cam; rd_os = M^T·rd_ws
+                                ray_torus(ro_os, rd_os, R, r):
+                                  derive A, B, C, D
+                                  scan q(t) for sign change
+                                  bisect to refine
+                                P_os = ro_os + t·rd_os
+                                N_os = torus_normal(P_os, R)
+                                N_ws = M · N_os
+                                shade by mode → draw_color
+```
+
+## Key patterns to internalise
+
+**Higher-degree implicit surfaces solve to higher-degree polynomials.**
+Sphere centreline = point → quadratic. Torus centreline = circle →
+quartic. The square root in the distance-to-curve formula doubles the
+polynomial degree when squared away.
+
+**Numerical solver beats closed-form for stability.** Ferrari's quartic
+formula exists but is unstable. Scan + bisect is slower per pixel but
+never NaN-s.
+
+**Closest-point normal beats implicit gradient.** The gradient has a
+1/√(x²+z²) term; the geometric construction (project to XZ, scale to
+R, vector to P) is cheaper and stable.
+
+**Inverse-rotation = cleaner coefficients.** Same trick as sphere/cube/
+capsule. Keeping the torus fixed in object space is what makes the
+quartic coefficients have closed-form expressions in dot products.

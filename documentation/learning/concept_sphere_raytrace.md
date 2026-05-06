@@ -1,293 +1,238 @@
-# Pass 1 — sphere_raytrace.c: Analytic ray-traced sphere
+# Pass 1 — sphere_raytrace.c: Analytic ray-traced sphere (the foundational demo)
 
 ## Core Idea
 
-Fires one ray per terminal cell and solves the exact quadratic equation for where
-that ray intersects a sphere.  No mesh, no marching — the hit point is computed
-directly from algebra.  Three coloured lights (key · fill · rim) shade the surface
-with Phong, and four modes expose different mathematical properties of the surface.
+The "Hello World" of analytic ray tracing. One ray per terminal cell, one
+sphere, three coloured lights, four shading modes. The intersection test is
+a single quadratic in `t` — solving it gives the hit point exactly, with no
+marching and no mesh.
 
-The camera orbits the sphere slowly, revealing all sides without the object ever
-needing to "rotate."
+The geometry is the simplest possible setup: sphere fixed at the origin,
+camera orbiting around it at fixed elevation. Read this file before any of
+its siblings (cube / capsule / torus / path_tracer / saturn / etc.) — it
+establishes the skeleton they all extend.
+
+## Ray-Sphere Quadratic
+
+Ray: `P(t) = ro + t·rd` with `|rd| = 1`.
+Sphere at origin, radius R: `|P|² = R²`.
+
+Substituting and simplifying (since `|rd| = 1` removes the leading `t²`
+coefficient):
+
+```
+t² + 2(rd·ro)·t + (|ro|² − R²) = 0
+half-b form (saves divisions):
+  b    = rd·ro
+  c    = |ro|² − R²
+  disc = b² − c
+  t    = -b - √disc    (front face; back is -b + √disc)
+```
+
+If `disc < 0`: miss. Else `t = -b - √disc` is the front-face hit. The
+T_EPS guard rejects effectively-zero t-values that arise from
+self-intersection or grazing tangents.
+
+Surface normal at hit P: `N = P / R` (sphere centred at origin).
+
+## Three-Point Lighting
+
+Three world-space POINT lights (positions, not directions). Each pixel:
+
+| Light | Position | Role | Contribution |
+|---|---|---|---|
+| KEY  | (3, 4, −2)  | warm primary | diffuse + sharp specular (shininess 52) |
+| FILL | (−4, 1, −1) | cool ambient | diffuse only — lifts shadow side |
+| RIM  | (0.5, −1, 5) | accent | wide specular at silhouette (shininess 10) |
+
+For each light per pixel:
+```
+L = normalize(light_pos − P)
+d = max(0, N · L)                       Lambertian
+R = reflect(−L, N) = 2(N·L)·N − L       reflection of incoming light
+s = max(0, R · V_dir)^shininess         Phong specular
+```
+
+`V_dir = normalize(cam − P)`. The total is `ambient + KEY + FILL + RIM`,
+clamped to [0, 1].
+
+## §6 split into named sub-functions
+
+Old code was one monolithic `shade_phong`. The current rewrite splits
+contributions:
+
+```
+§6.1 light_key      KEY light (warm diffuse + specular)
+§6.2 light_fill     FILL light (cool diffuse, no specular by design)
+§6.3 light_rim      RIM light (silhouette accent specular)
+§6.4 shade_phong    orchestrator: ambient + key + fill + rim
+§6.5 shade_normal   diagnostic — N encoded as RGB
+§6.6 shade_fresnel  Schlick (1−cosθ)^5 — glass-marble look
+     shade_depth    inverse-square hit-distance encoding
+```
+
+Splitting per-light makes the lighting model readable: each function is one
+concept; the orchestrator is 5 lines of glue.
+
+## Shade modes (cycled with `s`)
+
+| Mode | Visual |
+|---|---|
+| PHONG    | Full 3-point Phong — the default cinematic look |
+| NORMAL   | RGB-encoded surface normal (diagnostic). +Z silhouette → blue, +Y → green, +X → red |
+| FRESNEL  | Schlick — dark head-on, bright at silhouette (glass-marble) |
+| DEPTH    | Closer = brighter, falloff is `(1 − t/t_max)²` |
+
+## Paint pipeline (RGB cube + Bourke ramp)
+
+Same template as the rest of the raytracing folder:
+- 216 ncurses pairs allocated as a 6×6×6 RGB cube (PAIR_CUBE_BASE..+215)
+- For each pixel: tone-mapped RGB → quantise to cube pair + density char
+  from 92-char Bourke ramp
+- Effective resolution per cell ≈ 216 × 92 ≈ 20 000 distinct visual states
+
+## HUD spec
+
+- Yellow status row 0 (top-right): fps, dist, theme, paused/running
+- Yellow mode label row 0 (top-left): "mode: phong" etc.
+- Cyan hint bottom row: key reference
+
+## Worked Example (verify by hand)
+
+Camera at (0, 0.55, −3.6) (orbit_ang=0, cam_dist=3.6). Sphere at origin, R=1.
+Centre cell of screen, so `pu = pv = 0`, `rd ≈ fwd`:
+
+```
+fwd  = normalize((0,0,0) − (0, 0.55, -3.6)) = (0, -0.151, 0.989)
+oc   = ro = (0, 0.55, -3.6)
+b    = rd·oc = -0.151·0.55 + 0.989·(-3.6) = -3.643
+c    = oc·oc − R² = 12.262
+disc = b² − c = 1.010
+t    = -b − √disc = 3.643 − 1.005 = 2.638
+P    = ro + t·rd = (0, 0.152, -0.991)
+|P|  ≈ 1.003 ✓ (≈ unit sphere surface)
+N    = P / 1 ≈ (0, 0.151, -0.987)
+```
+
+For KEY light at (3, 4, -2):
+```
+L_dir = (3, 3.848, -1.009)
+|L_dir| ≈ 4.983
+L     = (0.602, 0.772, -0.202)
+N·L   = 0 + 0.117 + 0.199 = 0.316
+diffuse = 0.316
+```
+
+With gold theme (obj=(0.90, 0.72, 0.18), key_col=(1.00, 0.92, 0.70)):
+```
+key_diff = 0.316 · 0.65 · obj·key_col
+         = 0.205 · (0.90, 0.662, 0.126)
+         ≈ (0.185, 0.136, 0.026)
+```
+
+Plus ambient + FILL + RIM contributions, clamp, gamma-encode, quantise to
+cube → bright warm gold pixel at the centre.
+
+## Edge cases
+
+- **Discriminant near zero** — tangent ray. T_EPS guard rejects t<1e-4 to
+  avoid self-intersection/numerical instability.
+- **Camera inside sphere** — both quadratic roots have opposite signs
+  (back face accepts). Code falls back from t0 (front) to t1 (back) when
+  t0 < T_EPS.
+- **Specular on dark side artifact** — KEY's specular is gated only by R·V
+  (not by N·L). On the unlit hemisphere this can produce a "ghost"
+  highlight. Acceptable simplification for the simplest Phong model.
+- **Tone-map at paint time** — quantising linear HDR puts every pixel in
+  one cube cell. Reinhard inside the paint function opens dynamic range.
+
+## How to verify
+
+- Default gold sphere: KEY highlight upper-right, FILL fills shadow side
+  cool, RIM kisses the silhouette from behind.
+- MODE_NORMAL: rainbow ball — +Z silhouette mostly blue (0.5, 0.5, 1.0)
+  fading to red/green at silhouette.
+- MODE_FRESNEL: dark middle (cosθ=1 → F=0), bright silhouette (cosθ=0
+  → F=1). Classic glass-marble.
+- MODE_DEPTH: silhouette dimmest (largest t).
+- Worked example: at orbit_ang=0, cam_dist=3.6, centre-cell ray hits at
+  t ≈ 2.638. Inspect source if your sphere appears in the wrong place.
 
 ---
 
-## The Ray-Sphere Intersection
-
-Ray parametrically: `P(t) = ro + t · rd`  where `|rd| = 1`.
-
-Sphere at origin, radius r: `|P|² = r²`.
-
-Substitute:
-```
-|ro + t·rd|² = r²
-t²(rd·rd) + 2t(rd·ro) + (ro·ro − r²) = 0
-```
-
-Since `|rd| = 1`, this simplifies to:
-```
-t² + 2bt + c = 0       where b = rd·ro,  c = |ro|² − r²
-discriminant  = b² − c
-t = −b ± √discriminant
-```
-
-- `discriminant < 0`  → miss (ray passes outside sphere)
-- Take the smaller positive root: `t₀ = −b − √disc` if `t₀ > 0`, else `t₁ = −b + √disc`
-
-This is a closed-form solution — no iteration.
-
----
-
-## 3-Point Lighting
-
-Three lights in fixed world space create depth without any shadow rays:
-
-| Light | Position | Colour | Role |
-|-------|----------|--------|------|
-| Key | (3, 4, −2) | warm white | primary diffuse + sharp specular |
-| Fill | (−4, 1, −1) | cool blue | soft diffuse; lifts shadow side |
-| Rim | (0.5, −1, 5) | warm colour | backlight; separates silhouette |
-
-**Phong per light:**
-```
-L = normalize(light.pos − P)
-d = max(0, dot(N, L))             ← diffuse
-R = reflect(−L, N)
-s = pow(max(0, dot(R, V)), k)     ← specular
-
-contribution = d·intensity·(obj·light_color) + s·spec_color
-```
-
-The rim light uses a low shininess exponent (10 vs 52 for key) — it spreads into a
-wide soft highlight on the back silhouette rather than a tight glint.
-
----
-
-## Four Shade Modes
-
-### Phong
-Standard 3-light illumination.  Combined ambient + diffuse (key + fill) + specular
-(key + rim).
-
-### Normals
-```
-color = (N + 1) / 2     ← maps [−1,1]³ → [0,1]³
-```
-X → red channel, Y → green, Z → blue.  Useful for verifying normals are correct.
-
-### Fresnel (glass / crystal)
-Schlick approximation: brightness at a surface point depends on the viewing angle.
-Grazing angles → bright edge; head-on → dark core.
-```
-cosA    = |dot(N, V)|
-fresnel = (1 − cosA)⁵           ← Schlick
-color   = lerp(dark_core, bright_edge, fresnel)
-```
-Makes the sphere look like glass or a crystal ball — completely dark in the centre,
-glowing where the surface curves away.
-
-### Depth
-Brightness proportional to `1 − (t / t_max)²`.  No colour information —
-pure shape from shading by distance.
-
----
-
-## Camera Orbit
-
-Instead of rotating the sphere (which changes nothing for a uniform sphere),
-the camera moves in a horizontal circle:
-```
-cam.x = cam_dist × sin(orbit_angle)
-cam.z = −cam_dist × cos(orbit_angle)
-cam.y = CAM_HEIGHT = 0.55          ← slight elevation
-```
-
-The camera always looks at the origin.  Camera basis is rebuilt each frame:
-```
-fwd = normalize(origin − cam)
-rgt = normalize(cross(fwd, world_up))
-up  = cross(rgt, fwd)
-```
-
-This reveals all sides of the sphere as the lights stay fixed — the Doppler-like
-left/right brightness asymmetry sweeps across the surface.
-
----
-
-## 256-Color Output
-
-Pre-initialise pairs 1–216 at startup:
-```c
-for (int i = 0; i < 216; i++)
-    init_pair(i + 1, 16 + i, -1);   /* maps to 6×6×6 color cube */
-```
-
-Per pixel: compute shaded RGB (0–1), map to nearest cube entry:
-```
-r5 = round(r × 5),  g5 = round(g × 5),  b5 = round(b × 5)
-pair = r5×36 + g5×6 + b5 + 1
-```
-
-Luminance maps to Paul Bourke character density ramp (92 levels):
-```
-lum = 0.299r + 0.587g + 0.114b
-ch  = ramp[round(lum × 91)]
-```
-
-Both the **character** (density) and the **colour** (hue/saturation) carry
-information — the terminal cell encodes two independent dimensions of the image.
-
----
-
-## Non-Obvious Decisions
-
-### Why orbit the camera rather than rotate the sphere?
-A uniform sphere is rotationally symmetric — rotating it changes nothing unless it
-has surface markings.  Orbiting the camera achieves the same animation with less
-indirection, and leaves the world-space light positions fixed so lighting is
-predictable.
-
-### Why divide ray v-component by ASPECT?
-Terminal cells are taller than wide (~2:1 pixel ratio).  Without correction, a
-sphere would appear as a tall oval.  Dividing the vertical NDC by ASPECT
-(`cell_w / cell_h ≈ 0.47`) compresses the vertical ray angle to match the physical
-cell proportions, giving circular silhouettes.
-
-### Why `b = dot(rd, ro)` not `b = 2·dot(rd, ro)`?
-The standard quadratic form `at² + 2bt + c = 0` uses `2b` in the formula so that
-`t = −b ± √(b²−ac)`.  With `a = 1`, this becomes `t = −b ± √(b²−c)` — one fewer
-multiplication.  The convention here absorbs the factor of 2 into the variable
-name.
-
-### Why three lights instead of one?
-A single light leaves the shadow hemisphere completely black — half the sphere
-disappears.  The fill light lifts shadow darkness to ~15% visible brightness,
-maintaining shape cues.  The rim light adds a bright outline that separates the
-sphere silhouette from the black background — the single most effective trick for
-making 3D objects pop on a dark terminal.
-
----
-
-## From the Source
-
-**Algorithm:** The full quadratic form uses `b = 2·(rd · oc)` with `oc = ro − c`, giving discriminant `b²−4ac`. The concept file uses the optimized half-b form (`b' = rd·ro`, discriminant `b'²−c`) which absorbs the factor of 2 — both are equivalent but the source form is the canonical textbook version.
-
-**Rendering:** Each terminal cell fires exactly **one** ray (no anti-aliasing). Luminance is mapped to ASCII ramp `".+*#@"` — the specific 5-character density set used. The Phong model: `I = ka + kd·max(N·L,0) + ks·max(R_v·V,0)^shininess` where `R_v = 2(N·L)N − L`.
-
----
-
-## Key Constants and What Tuning Them Does
-
-| Constant | Default | Effect |
-|----------|---------|--------|
-| `SPHERE_R` | 1.0 | sphere radius in world units |
-| `ORBIT_SPEED` | 0.32 rad/s | how fast camera orbits |
-| `CAM_HEIGHT` | 0.55 | elevation; 0 = equatorial view |
-| `CAM_DIST_DEF` | 3.6 | camera distance; `+/-` at runtime |
-| `SHININESS` | 52 | specular exponent; higher = tighter glint |
-| `AMBIENT` | 0.04 | minimum brightness in full shadow |
-| `FOV_DEG` | 58° | wider = more distortion at edges |
-
----
-
-## Open Questions
-
-1. The Fresnel mode uses Schlick `(1−cosθ)⁵`.  Derive the full Fresnel equations
-   for a dielectric with refractive index n.  How does changing n from 1.0 to 1.5
-   (glass) change the reflectance curve?
-
-2. Add a secondary reflected ray: when a Phong hit occurs, shoot a new ray in the
-   reflection direction `R = reflect(rd, N)` and trace it.  Mix the reflected
-   colour with the surface colour at some reflectivity k.  What does the sphere
-   look like when it reflects itself?
-
-3. The current implementation shades `P` in world space with world-space light
-   positions.  Mathematically, you could equally shade in camera space.  What
-   would need to change?
-
-4. The rim light uses exponent 10 (vs 52 for key).  Derive the visual half-angle
-   of a Phong specular lobe as a function of the exponent.  At what exponent does
-   the rim light look "diffuse" vs "specular"?
-
----
-
-# Structure
-
-| Symbol | Type | Size | Role |
-|--------|------|------|------|
-| `g_themes[]` | `const Theme[6]` | ~288 B | Per-theme diffuse, specular, and three light colour vectors |
-
-# Pass 2 — sphere_raytrace.c: Pseudocode
+# Pass 2 — Pseudocode
 
 ## Module Map
 
-| Section | Purpose |
-|---------|---------|
-| §1 config | SPHERE_R, ORBIT_SPEED, CAM_*, FOV_DEG, SHININESS, AMBIENT |
-| §2 clock | `clock_ns()`, `clock_sleep_ns()` |
-| §3 V3 math | add, sub, scale, mul, dot, len, norm, cross, reflect, clamp1 |
-| §4 color | 6 themes (obj, spec, key_col, fill_col, rim_col); 216 pre-init pairs |
-| §5 intersection | `ray_sphere(ro, rd, r)` → t |
-| §6 shading | `shade_phong`, `shade_normal`, `shade_fresnel`, `shade_depth` |
-| §7 render | camera orbit → ray per cell → shade → `draw_color` |
-| §8 screen | `screen_hud()` |
-| §9 main | fixed-timestep loop, input |
+| § | Purpose |
+|---|---|
+| §1 config        | frame rate, FOV, sphere radius, camera, ramp, HUD pairs |
+| §2 clock         | monotonic timer + sleep |
+| §3 math          | V3 helpers |
+| §4 color         | themes (6) + 256-colour cube + paint_cell |
+| §5 sphere        | THE CORE — analytic quadratic ray-sphere |
+| §6 shading       | 6.1 KEY, 6.2 FILL, 6.3 RIM, 6.4 phong, 6.5 normal, 6.6 fresnel/depth |
+| §7 render        | one frame: ray-per-cell, three-point lighting |
+| §8 screen + HUD  | yellow row 0 status + cyan bottom hint |
+| §9 app           | signals, resize, fixed-step main loop |
 
-## Data Flow
-
-```
-each frame:
-  orbit_ang += ORBIT_SPEED × dt
-
-  render(cols, rows, orbit_ang, cam_dist, theme, mode):
-    cam = { cam_dist×sin(orbit_ang), CAM_HEIGHT, −cam_dist×cos(orbit_ang) }
-    build (fwd, rgt, up) from cam toward origin
-
-    for each (row, col):
-      rd = normalize(fwd + u×rgt + v×up)    ← u,v from FOV and ASPECT
-      t  = ray_sphere(cam, rd, SPHERE_R)
-      if miss: continue
-
-      P = cam + t×rd
-      N = normalize(P)                       ← sphere at origin
-      V = normalize(cam − P)
-
-      color = shade_*(P, N, V, theme)
-      lum   = luminance(color)
-      draw_color(row, col, color, lum)
-```
-
-## ray_sphere
+## Data flow
 
 ```
-b    = dot(rd, ro)
-c    = dot(ro,ro) − r×r
-disc = b×b − c
-if disc < 0: miss
-sq   = sqrt(disc)
-t0   = −b − sq
-t1   = −b + sq
-if t1 < ε: miss
-return t0 > ε ? t0 : t1
+keys → main → orbit_ang, cam_dist, theme_idx, mode, paused
+                              │
+clock_ns → dt → orbit_ang += ROT_SPEED · dt
+                              │
+                       render(cols, rows, ...)
+                          per cell:
+                            rd = camera_ray
+                            ray_sphere(cam, rd, R) → t_hit
+                            P = ro + t·rd; N = P/R; V_dir = -rd
+                            switch (mode):
+                              PHONG   → ambient + KEY + FILL + RIM
+                              NORMAL  → (N+1)/2
+                              FRESNEL → mix(core, edge, (1-cosθ)⁵)
+                              DEPTH   → (1 - t/t_max)²
+                            draw_color(row, col, color, lum)
+                              │
+                              ▼
+                       hud_draw → wnoutrefresh + doupdate
 ```
 
-## shade_phong (per light)
+## Pseudocode
 
 ```
-for light in [key, fill, rim]:
-  L = normalize(light.pos − P)
-  d = max(0, dot(N, L))
-  R = reflect(−L, N)
-  s = pow(max(0, dot(R, V)), shininess_for_light)
-  col += d × intensity × (obj × light_color)
-  col += s × spec_intensity × spec_color
-return clamp(col, 0, 1)
+setup:
+  install signals (SIGINT/SIGTERM/SIGWINCH)
+  initscr + colour_init (216 cube pairs + HUD/HINT)
+  atexit(cleanup)
+
+loop:
+  if need_resize: re-init geometry
+  dt = clock_ns - last
+  if !paused: orbit_ang += ROT_SPEED · dt
+  fps update
+  erase
+  render(cols, rows, orbit_ang, cam_dist, theme, mode)
+  hud_draw
+  wnoutrefresh + doupdate
+  drain input → handle key
+  sleep to TARGET_FPS
 ```
 
-## shade_fresnel
+## Key patterns to internalise
 
-```
-cosA    = |dot(N, V)|
-fresnel = (1 − cosA)^5
-return lerp(0.06×obj, clamp(0.7×spec + 0.5×rim_col), fresnel)
-```
+**Half-b form of the quadratic.** Using `b = rd·ro` (not `2·rd·ro`) and
+`disc = b² − c` (not `b²/4 − c`) saves two divisions per pixel without
+changing the result. Standard simplification when `|rd| = 1`.
+
+**Three-point lighting per-function split.** Each light is one named
+function that returns its contribution. The orchestrator is glue. Easier
+to read, easier to disable a light for debugging.
+
+**Inverse-rotation trick.** Sphere stays at origin; camera orbits.
+Equivalent to rotating the sphere, but keeps the intersection math at its
+simplest.
+
+**Same paint pipeline as the entire folder.** RGB → Reinhard → gamma →
+6×6×6 cube + 92-char ramp. Read once across all the raytracers.

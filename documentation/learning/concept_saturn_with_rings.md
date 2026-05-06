@@ -1,169 +1,184 @@
-# Concept — `saturn_with_rings.c`: Sphere + Annular Ring with Shadow Cast
+# Pass 1 — saturn_with_rings.c: Two-primitive raytrace + RGB realism layers
 
 ## Core Idea
 
-For every screen cell, fire ONE view ray. Two things might be in the way: a SPHERE (the planet) or a flat ANNULUS (the rings, defined as the y=0 plane clipped to a radial band). Whichever is closer wins; the other is hidden behind it. To know if a point on the ring is in the planet's shadow, fire a SECOND ray from that ring point toward the sun and check whether the sphere is in the way. **That is all the math** — everything else is colour and glyph mapping.
+Per pixel: ray vs SPHERE (planet) + ray vs ANNULUS (ring plane y=0
+clipped to [R_in, R_out]). Depth-sort. Shade in continuous RGB with
+five additive layers stacked on top of the geometry:
 
-The visual cues that scream "3-D" come from the algorithm itself:
-1. The ring **passes BEHIND** the planet (depth-sort occlusion).
-2. The planet casts a **dark SHADOW BAND** on the back of the ring (shadow ray hits sphere).
+| Layer | Effect |
+|---|---|
+| LAMBERT      | direct sunlight on planet (N·L) |
+| LIMB DARKEN  | atmospheric absorption near silhouette (`pow(NdotV, 0.5)`) |
+| ATMOSPHERE RIM | warm halo on lit silhouette edge |
+| FORWARD-SCATTER | ring sections glow when sun is BEHIND them (Cassini look) |
+| SOFT SHADOW  | 8-sample penumbra cast by planet onto rings |
+
+## RGB Pipeline
+
+Every shader returns a `V3` colour. Final paint:
+1. Reinhard tone-map `L/(1+L)` per channel
+2. Gamma encode 1/2.2
+3. Quantise to 6×6×6 RGB cube (216 ncurses pairs)
+4. Pick density glyph from 92-char Bourke ramp
+5. A_BOLD on bright cells, A_DIM on dark
+
+Effective resolution: ~20 000 distinct visual states per cell.
+
+## Themes (RGB triplets, not pair indices)
+
+5 themes — SATURN, MARS, OCEAN, FOREST, FIRE, ARCTIC, VIOLET, GOLD —
+each provides RGB triplets per role: planet_base, planet_band_tint,
+ring_base, sun_col, fill_col, rim_col, spec_col, sky_col, land_col,
+sea_col.
+
+## Three shade modes (cycled with `m`)
+
+| Mode | Visual |
+|---|---|
+| LIT     | Full pipeline (default) |
+| FLAT    | Raw albedo, NO lighting — bands + continents still show |
+| NORMAL  | RGB-encoded surface normal (diagnostic) |
+
+FLAT is the "see geometry without lighting" mode; NORMAL is the
+debugging mode for verifying normal orientation.
+
+## §9 shaders (sub-sectioned)
+
+```
+§9.1 limb_darken + atmospheric_rim   helpers
+§9.2 shade_planet                    Lambert + fill + spec + limb + rim
+                                      Bands (SATURN/EXO) or continent fBm (EARTH)
+                                      Diagnostic-mode early returns for FLAT/NORMAL
+§9.3 shade_ring                       Smooth Cassini gap (smoothstep, not hard)
+                                      Soft shadow (8 cone samples)
+                                      Forward-scattering glow (backlight^3)
+                                      Diagnostic returns for FLAT/NORMAL
+§9.4 shade_space                      Sky + warm/cool stars by hash hue
+```
+
+## Forward-scattering ring glow
+
+```
+backlight = max(0, -sun_dir · view_dir)        ← > 0 when sun behind
+glow      = backlight^3 · (1 − density) · GAIN
+col       += glow · sun_col
+```
+
+Sparser ring sections glow MOST brightly when sun is on the opposite
+side — exactly matching Cassini's iconic backlit photographs.
+
+## Soft shadow (8 samples)
+
+Tangent basis around `sun_dir`; 8 jittered samples within a small
+angular cone (3° = 0.05 rad). Returns fraction unobstructed → smooth
+penumbra. Deterministic seed `hash3(sx, sy, frame, sample_i)` so the
+shadow doesn't "boil" between frames.
+
+## Sub-pixel anti-aliasing
+
+`s` key cycles SPP=1/2/4. Sub-pixel jitter from a deterministic hash;
+N samples averaged in linear RGB BEFORE tone-mapping.
+
+## Patterns + Star presets
+
+- **Patterns** (n / N): SATURN, URANUS, EARTH-RING, EXO (per-seed)
+- **Star presets** are coupled into themes via the palette structure
+
+## Worked numerical sample (lit equator pixel, SATURN theme)
+
+```
+N        = (0.95, 0, 0.31)
+sun_dir  = (1, 0.18, 0)
+view_dir = (0, 0.22, -0.97)
+albedo   = (0.95, 0.86, 0.65)        cream
+sun_col  = (1.00, 0.92, 0.78)        warm white
+
+NdotL = 0.95, NdotV = 0.30
+limb  = pow(0.30, 0.5) ≈ 0.55
+
+diffuse_RGB = albedo · NdotL · sun_col ≈ (0.903, 0.752, 0.482)
+col_after_limb ≈ (0.523, 0.435, 0.281)
+
+Reinhard:    (0.34, 0.30, 0.22)
+Gamma 2.2:   (0.61, 0.57, 0.49)
+Cube:        r5=3, g5=3, b5=2 → pair 130 (warm cream-gold)
+Luma 0.57 → ramp index 52 → 'k'
+```
+
+## HUD spec
+
+- Yellow status row 0 with mode label, theme, SPP, sun-azimuth
+- Cyan hint bottom row
+
+## How to verify
+
+- Static planet at full lit phase: limb darkening makes the silhouette
+  noticeably DIMMER than the centre. With limb factor = 1.0 (no
+  darkening), the disc looks flat.
+- At totality-equivalent (sun behind the rings from camera POV): ring
+  sections away from the moon should GLOW brightest, especially in
+  the Cassini-gap region (low density).
+- Shadow penumbra: the dark stripe on the rings should have a SMOOTH
+  edge (gradient), not a stair-step boundary.
+- Sub-pixel AA: `s` cycles SPP=1/2/4. SPP=1 shows visible jaggies on
+  the planet silhouette; SPP=4 smooths them.
+- Cycle MODE: FLAT shows pure albedo (bands and continents visible
+  uniformly); NORMAL shows rainbow ball with ring-angle hue rainbow.
 
 ---
 
-## The Mental Model
+# Pass 2 — Pseudocode
 
-Picture a chocolate-coated marble (the planet) sitting on a paper plate (the ring), photographed from one corner of the room with a flashlight (the sun) on the other side:
+## Module map
 
-- The marble's lit half faces the flashlight; the other half is dark — that's the **Lambertian terminator**.
-- The marble blocks light from reaching the far side of the paper plate, casting a dark stripe — that's the **shadow ray hitting the sphere**.
-- The plate dips behind the marble where the marble is between the camera and the back of the plate — that's the **depth sort**. Ring in front: ring wins. Sphere in front: sphere wins.
+| § | Purpose |
+|---|---|
+| §1 config       | frame rate, geometry, granulation, corona, beads |
+| §2 clock        | monotonic timer + sleep |
+| §3 math         | V3, RGB, blackbody helpers |
+| §4 noise        | Perlin + fBm + RNG |
+| §5 themes       | RGB-triplet palettes per role (per planet/ring/sun) |
+| §6 color        | 216-cube + paint_cell (Reinhard + gamma + quantise) |
+| §7 patterns     | pattern → params mapping |
+| §8 raytrace     | 8.1 ray_sphere · 8.2 ray_ring · 8.3 hard_shadow · 8.4 soft_shadow |
+| §9 shading      | 9.1 limb · 9.2 planet · 9.3 ring · 9.4 space |
+| §10 scene       | Scene state, sun motion, init/reseed/tick |
+| §11 render      | per-cell ray + depth-sort + shading + paint |
+| §12 hud         | yellow row 0 + cyan bottom |
+| §13 app         | signals, resize, fixed-step main loop |
 
-We do this test for every pixel.
+## Data flow (LIT mode)
 
----
-
-## Algorithm in Steps
-
-1. **CAMERA.** Place camera at `(0, CAM_HEIGHT, -CAM_DIST)` looking at origin. Compute basis `(forward, right, up)`. The slight upward offset gives the rings their characteristic ELLIPSE shape on screen (rings are circles in the y=0 plane, foreshortened).
-
-2. **PER CELL `(sx, sy)`:**
-   - Compute view-ray direction:
-     ```
-     u   = (2·sx + 1 − cols) / cols · fov_h
-     v   = −(2·sy + 1 − rows) / rows · fov_v
-     dir = normalize(forward + u·right + v·up)
-     ```
-   - Ray-sphere intersection (planet) → `t_sphere`.
-   - Ray-plane intersection at `y=0`, clipped to annulus `[R_IN, R_OUT]` → `t_ring`.
-   - **Depth sort**: smaller t wins.
-
-3. **SHADE THE WINNER:**
-   - **Sphere**: `N = normalize(P − O)`; `lambert = max(0, N · sun_dir)`; apply latitude bands (SATURN, EXO) or fBm continent map (RINGED-EARTH).
-   - **Ring**: per-radius density modulation + Cassini Division dimming + **shadow ray** to sun tested against sphere → dark stripe across rings.
-
-4. **NO HIT.** Render space cell — dark background, optional hash-gated star.
-
-5. **INTENSITY → GLYPH.** Map intensity ∈ [0, 1] to `RAMP_GLYPHS[(int)(I·8)]`; pick theme ramp index by primitive (planet ramp slots vs ring ramp slots).
-
-6. Sun rotates with `2π / 30 s` azimuth; the same `sun_dir` drives both the planet's terminator AND the ring's shadow band, so they stay perfectly synchronised.
-
----
-
-## Key Formulas
-
-**Sun direction** (azimuth ω·t, fixed elevation):
 ```
-ω        = 2π / ROTATION_PERIOD             // 30 s default
-sun_az   = ω · t + φ
-sun_dir  = normalize( (cos sun_az, SUN_ELEV_Y, sin sun_az) )
+keys → app_handle_key → scene state
+                              │
+clock_ns → dt → scene_tick
+                              │
+                       scene_draw (per cell):
+                          - depth-sort sphere vs ring
+                          - sphere → shade_planet (or albedo/normal in FLAT/NORMAL)
+                          - ring   → shade_ring (or albedo/normal-encoded)
+                          - else   → shade_space
+                          - SPP averaged
+                          - paint_cell (RGB → cube + ramp)
 ```
 
-**Ray-sphere intersection** (sphere at `center` with radius `r`):
-```
-oc    = ray.origin − center
-b     = oc · ray.dir
-c     = oc·oc − r²
-disc  = b² − c
-if disc < 0:        miss
-t     = −b − √disc                          // front face
-if t < ε: t = −b + √disc                    // try far face
-if t < ε:           miss
-```
+## Key patterns to internalise
 
-**Ray-plane annulus intersection** (plane y = 0):
-```
-if |dir.y| < ε:                miss         // parallel
-t  = −origin.y / dir.y
-if t < ε:                      miss
-hit = origin + t·dir
-r² = hit.x² + hit.z²
-if r² < R_IN² or r² > R_OUT²:  miss
-```
+**Continuous-RGB over preset ramps.** Each shader returns a V3 RGB; the
+paint function quantises ONCE at draw time. ~20 000 effective shades
+per cell, no banding.
 
-**Lambert (diffuse) on sphere:**
-```
-N        = normalize(P − O)
-lambert  = max(0, N · sun_dir)
-shade    = AMBIENT + (1 − AMBIENT) · lambert
-```
+**Layer additively, gate physically.** Each effect is a small additive
+contribution to the RGB. Limb darkening MULTIPLIES at the end (the
+atmosphere absorbs everything proportionally), but shadow gating runs
+INSIDE the diffuse term (because shadows block direct sun, not ambient).
 
-**Latitude bands** (SATURN / EXO):
-```
-band     = 1 + BAND_AMP · sin(N.y · BAND_FREQ + φ)
-shade   *= band
-```
+**Soft shadow = N samples in a small angular cone.** Deterministic
+hash-based offsets so the penumbra is stable frame-to-frame.
 
-**Continent map** (RINGED-EARTH):
-```
-u        = atan2(N.x, N.z) / π             // longitude [-1, 1]
-v        = N.y                              // latitude  [-1, 1]
-land     = fbm(u·LAND_FREQ + φ, v·LAND_FREQ) > LAND_THRESH
-ramp     = land ? PAIR_RAMP_BASE : PAIR_RING_BASE     // sea reuses ring ramp
-```
+**Forward-scatter is single dot product.** `max(0, -sun·view)^p` is
+the entire physics — but it's the single biggest "wow" effect.
 
-**Ring density** (per-radius modulation + Cassini gap):
-```
-r        = √(P_ring.x² + P_ring.z²)
-θ        = atan2(P_ring.z, P_ring.x)
-density  = 0.6 + 0.4 · sin(r · RING_BAND_FREQ + θ · 0.4 + φ)
-if |r − CASSINI_R| < CASSINI_W: density *= CASSINI_DIM       // 0.18 → bright gap dims
-```
-
-**Ring shadow test** (ray from ring point toward sun):
-```
-shadow_orig = P_ring + ε · sun_dir          // bias to avoid self-hit
-in_shadow   = sphere_intersect(shadow_orig, sun_dir).hit
-shade      *= in_shadow ? 0.18 : 1.0
-```
-
-**Ring lambert** (rings are flat, normal = (0,1,0); use absolute value because rings are double-sided):
-```
-ring_lambert = AMBIENT + (1 − AMBIENT) · |sun_dir.y|
-```
-
----
-
-## Edge Cases and Pitfalls
-
-- **DEPTH SORT MUST INCLUDE BOTH HITS.** If only the sphere is tested where it hits, the ring is invisible everywhere the sphere doesn't cover. If only the ring is tested where it annulus-clips, the ring would show THROUGH the sphere. Always compute both, then compare `t_sphere` vs `t_ring`.
-
-- **RAY-PLANE GRAZING.** When `|dir.y|` is tiny (camera near edge-on to ring), `t` blows up and rounding produces flicker. Reject `|dir.y| < 1e-5` to skip the test entirely; edge-on rings just don't render those cells (which is correct — edge-on rings are infinitely thin).
-
-- **SHADOW RAY SELF-HIT.** Shadow ray starts ON the ring plane at the hit point. Without an `ε` bias along `sun_dir`, the sphere test may "hit" the ring point itself due to floating-point round-off. Bias by `ε = 1e-3`.
-
-- **SUN BEHIND RING.** Use `|sun_dir.y|` not `max(0, sun_dir.y)` for the ring lambert — rings are double-sided; both top and bottom faces should look lit when the sun is on either side. Without the abs, the bottom of the ring goes black when the sun rises above the equator.
-
-- **CAMERA TOO HIGH OR TOO LOW.** `CAM_HEIGHT` controls the ring tilt on screen. At `CAM_HEIGHT = 0`, rings collapse to a horizontal line (no ellipse, hard to read). At `CAM_HEIGHT > 3`, rings look nearly circular but the planet sits very low. **`CAM_HEIGHT ≈ 1.0–1.5` is the sweet spot.**
-
-- **ASPECT RATIO.** Terminal cells are 2× taller than wide. `fov_v = fov_h · rows · ASPECT_Y / cols` keeps the planet round on screen.
-
----
-
-## How to Verify
-
-- **PAUSE** (space). Sun freezes; the terminator on the planet and the shadow band on the ring stay aligned. Resume: both advance together.
-
-- **SATURN** pattern. The Cassini Division is visible as a thin DARKER ring within the broader bright ring. Planet shows 4–6 horizontal latitude BANDS of slightly different brightness.
-
-- **Watch the SHADOW BAND.** As the sun rotates, the dark stripe the planet casts on the ring sweeps from the back of the ring around to the front. It is always anti-sun-direction from the planet's centre.
-
-- **RINGED-EARTH** pattern. Press `r` a few times. Continent layouts change but stay structurally Earth-like — irregular landmasses over an ocean. The terminator falls across both land and sea.
-
-- **URANUS** pattern. The rings tilt nearly edge-on; thin near-horizontal LINE crossing in front of and behind the planet.
-
-- **Theme cycle** (`t`/`T`). Planet ramp, ring ramp, and space background all change tint while structure stays identical.
-
-- **Speed** (`+`/`−`). Doubling speed should approximately halve the time for the sun to complete one full azimuthal sweep.
-
----
-
-## References
-
-- Shirley, P. — *Ray Tracing in One Weekend*, https://raytracing.github.io/.
-- Wikipedia — [Ring system (astronomy)](https://en.wikipedia.org/wiki/Ring_system_(astronomy)).
-- Wikipedia — [Saturn](https://en.wikipedia.org/wiki/Saturn) — the iconic ringed planet.
-- Inigo Quilez — Sphere intersection, https://iquilezles.org/articles/intersectors/.
-
----
-
-*Source: `raytracing/saturn_with_rings.c`*
+**Same paint pipeline as the entire raytracer folder.**

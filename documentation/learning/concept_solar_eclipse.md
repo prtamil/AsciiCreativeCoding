@@ -1,153 +1,241 @@
-# Concept — `solar_eclipse.c`: Sun + Moon Transit with Volumetric Corona
+# Pass 1 — solar_eclipse.c: Two-sphere raytrace + cinematic eclipse layers
 
 ## Core Idea
 
-Two spheres on (nearly) the optical axis. Whichever is closer along the view ray covers the other. The remarkable visual of an eclipse is caused by the moon being JUST big enough — angularly — to swallow the sun's bright disc, leaving the much fainter CORONA visible for a few seconds of totality. We reproduce that by keeping corona brightness at zero whenever the bright sun body is visible (the eye adapts to the photosphere and corona becomes invisible) and unlocking it only as the moon occludes more and more of the sun.
+Per pixel: ray vs SUN sphere + ray vs MOON sphere. Depth-sort. The
+moon (much closer) wins where it overlaps. The remarkable visual is
+that the moon's angular size JUST exceeds the sun's: the bright
+photosphere vanishes, leaving the much fainter CORONA visible.
+
+Five additive shading layers stack on top of the geometry:
+
+| Layer | Formula | What it adds |
+|---|---|---|
+| PHOTOSPHERE  | limb darken · granulation | textured solar disc |
+| CORONA       | exp(-Δα·K) · streamer_fbm · occlusion^γ | structured halo |
+| CHROMOSPHERE | thin red ring at d_out ∈ [0, W] when occ ≥ 0.92 | "ring of fire" |
+| BEADS        | N=5 Gaussian beads around limb at totality boundary | Bailey's beads |
+| BLOOM        | 5×5 bright-pass Gaussian over g_buf | atmospheric glow |
+
+## Blackbody Star Presets (no preset themes)
+
+The photospheric chromaticity comes from one Kelvin via Tanner Helland's
+piecewise blackbody curve. 5 presets:
+
+| Name | Kelvin | Description |
+|---|---|---|
+| SUN-LIKE | 5778 | the actual sun (default) |
+| RED-G    | 3500 | red giant |
+| ORANGE   | 4500 | warm orange star |
+| GIANT    | 8000 | hot blue giant |
+| WHITE-D  | 10000 | near-white dwarf |
+
+`palette_from_kelvin(K)` derives sun, corona, chromosphere, bead, moon,
+sky colours. Corona and chromosphere are LARGELY K-independent (their
+light comes from different physical processes than the photosphere —
+1 MK plasma emission vs Hα at 656.3 nm). The photosphere IS the
+K-dependent blackbody.
+
+## §9 shaders (sub-sectioned)
+
+```
+§9.1 shade_sun           limb darkening + fBm granulation in surface coords
+§9.2 shade_corona        radial decay × streamer fBm × occlusion^γ
+§9.3 shade_chromosphere  thin red Hα band at d_out ∈ [0, CHROMO_W]
+                         only visible when occlusion >= 0.92
+§9.4 shade_beads         5 Gaussian beads around lunar limb,
+                         each at hash3(k, seed)-jittered angle,
+                         each with random per-bead brightness,
+                         windowed by Gaussian on |sep − sep_T|
+```
+
+## Granulation (§9.1)
+
+fBm sampled in SURFACE coordinates (sphere-stable):
+
+```
+surface_u = atan2(N.x, N.z) · GRAN_FREQ      ← longitude
+surface_v = N.y                · GRAN_FREQ   ← latitude
+granul    = 1 + GRAN_AMP · (fbm(u, v) − 0.5) · 2     ≈ 1 ± 18%
+intensity = limb · granul
+```
+
+Sampling in surface coords means the texture stays GLUED to the sun
+as the camera moves; sampling in screen coords would let it slide.
+
+## Coronal Streamers (§9.2)
+
+Old code: uniform radial Gaussian halo.
+New: streamer = `(1 + AMP · (fbm(angle·FA, d·FR + drift) − 0.5)·2)^POW`
+
+The fBm in `(polar_angle, d_out)` space produces visible POLAR PLUMES
+and HELMET STREAMERS:
+- Angle coord creates radial rays (each fBm "ridge" along the angle
+  axis makes one streamer)
+- Radial coord adds variation along each ray
+- Small `drift = time · STREAM_DRIFT_HZ` makes streamers slowly evolve
+
+The angle coord is NOT time-driven — real streamers don't rotate around
+the sun (their structure is tied to the sun's magnetic field, evolving
+on months-to-years timescales).
+
+## Bailey's Beads (§9.4)
+
+Real beads are 3-7 spots where sunlight passes through valleys between
+mountains on the lunar limb. We fake them with 5 Gaussian beads at
+fixed (per-seed) angular positions around the sun's limb:
+
+```
+window  = exp(-((sep − sep_T) / DIAMOND_W)²)        Gaussian on |sep − sep_T|
+for k in 0..4:
+  φ_k     = anti_moon_angle + jitter[k]              hash3(k, seed)·π
+  bx, by  = sun_centre + sun_r · (cos φ_k, sin φ_k / ASPECT_Y)
+  bead_w  = exp(-distance² / RADIUS²)
+  bead_intensity_k = 0.4 + hash01(...) · 0.6         per-bead random brightness
+  contribution    += window · bead_w · bead_intensity_k · bead_col
+```
+
+Beads only fire when `moon_α > sun_α` (TOTAL pattern). For ANNULAR/
+PARTIAL/TRANSIT, the totality boundary is never crossed.
+
+## Chromosphere Ring (§9.3)
+
+Thin red Hα band just outside the photosphere, gated by occlusion:
+
+```
+if occ < 0.92 OR d_out > CHROMO_W: return 0          only at totality edge
+profile = sin(π · d_out / CHROMO_W)                   smooth 0..1..0
+ramp    = clamp((occ − 0.92) / 0.08)
+chromos = INTENSITY · profile · ramp · chromos_col
+```
+
+## Bloom (§10.2)
+
+Same 5×5 bright-pass Gaussian as saturn/god_rays. Two-pass with
+separate g_bloom buffer.
+
+## Patterns
+
+- **TOTAL** — moon angular > sun (1.10×). Full totality with corona,
+  chromosphere, beads.
+- **PARTIAL** — moon offset above so it never centres. Crescent only.
+- **ANNULAR** — moon angular < sun (0.80×). Bright RING of photosphere
+  remains visible; no corona (drowned out).
+- **TRANSIT** — moon size << sun (0.12×). Tiny dot (Mercury / Venus).
+
+## §-section structure
+
+```
+§1 config        (sub-sectioned 1.1-1.13)
+§2 clock
+§3 math+palette  V3, RGB, blackbody, palette_from_kelvin
+§4 noise+RNG
+§5 ncurses paint
+§6 ray-sphere
+§7 occlusion
+§8 scene+orbit
+§9 shading       9.1 sun · 9.2 corona · 9.3 chromos · 9.4 beads
+§10 buffer+post  V3 buf + 5×5 Gaussian bloom
+§11 screen+draw  3-pass scene_draw + HUD
+§12 app
+```
+
+## 3-pass scene_draw
+
+```
+PASS 1  per cell shade → g_buf
+            ray-sphere sun + moon, depth-sort
+            sun cell    : shade_sun
+            moon cell   : earthshine tint (palette.moon, not pure black)
+            space cell  : shade_corona + shade_chromosphere
+            beads added everywhere if at totality threshold
+            sparse stars during totality (occ > 0.85)
+PASS 2  bloom_apply
+PASS 3  paint_cell each → screen
+```
+
+## HUD spec
+
+- Yellow status row 0 with star preset + Kelvin label + eclipse phase
+- Cyan hint bottom row
+
+## How to verify
+
+- Pause at totality. Look for:
+  - Corona has visible STREAKY structure (polar plumes, helmet
+    streamers) — not a uniform fuzzy halo
+  - Thin RED RING just outside the moon (chromosphere)
+  - Moon silhouette has faint cool-blue tint (earthshine), not solid black
+- At first/last contact (totality threshold):
+  - 5 distinct BAILEY'S BEADS appear around the lunar limb at varied
+    angular positions and brightnesses, NOT a single bright dot
+- Cycle STAR PRESET (t/T):
+  - SUN-LIKE 5778K → warm-white sun, cool-blue corona
+  - RED-G 3500K → deep-red sun, more crimson everything
+  - WHITE-D 10000K → near-white sun, cooler corona
+- Look at the SUN (not eclipsed): faint MOTTLED texture (granulation).
+- PARTIAL pattern: crescent forms but no totality → no corona, no
+  beads, no chromosphere. ANNULAR: bright RING, no corona, no beads.
+  TRANSIT: tiny dot crawls across.
 
 ---
 
-## The Mental Model
+# Pass 2 — Pseudocode
 
-The sun is a desk lamp behind a paper-thin halo of mist (the corona). Normally the bulb is too bright to see the mist. Slide a small piece of card in front of the bulb — the card blocks the bulb but the mist around the silhouette becomes visible. That visibility ratio is the **SUN OCCLUSION FACTOR**.
+## Module map
 
-The card has to be JUST big enough; too small and the bulb still outshines the mist (annular eclipse: bright RING around the card); a tiny card makes no difference (transit). The DIAMOND RING is the moment a sliver of bulb is still visible at the card's edge — a tiny intense flash before the card fully blocks everything.
+| § | Purpose |
+|---|---|
+| §1 config       | frame rate, geometry, granulation, corona, beads |
+| §2 clock        | monotonic timer + sleep |
+| §3 math+palette | V3, RGB, blackbody, palette_from_kelvin |
+| §4 noise+RNG    | Perlin + fBm + hash3 |
+| §5 ncurses paint | 6×6×6 cube + airy ramp + paint_cell |
+| §6 ray-sphere   | analytic intersection (used twice/pixel) |
+| §7 occlusion    | sun-moon angular overlap fraction |
+| §8 scene+orbit  | Scene state, pattern params, moon orbit |
+| §9 shading      | 9.1 sun · 9.2 corona · 9.3 chromos · 9.4 beads |
+| §10 buffer+post | V3 buf + 5×5 Gaussian bloom |
+| §11 screen+draw | 3-pass scene_draw + HUD spec compliance |
+| §12 app         | signals, resize, fixed-step main loop |
 
----
+## Data flow
 
-## Algorithm in Steps
-
-1. **ORBIT.** Moon position drifts in world x via `sin(ω·t)`. For PARTIAL pattern, add a small constant y offset so the moon never centres on the sun.
-
-2. **CAMERA.** Camera at origin looking +z. Sun centred at `(0, 0, SUN_Z)`. Moon at `(moon_x, moon_y, MOON_Z)` with `MOON_Z << SUN_Z` (moon is much closer — that's why a small moon can occlude a vastly larger sun).
-
-3. **PER CELL `(sx, sy)`:**
-   - Build view ray `d = camera_ray(sx, sy)`.
-   - `ray_sphere(sun)` → `t_sun`.
-   - `ray_sphere(moon)` → `t_moon`.
-   - `moon_in_front = moon_hit AND (¬sun_hit OR t_moon < t_sun)`.
-   - If `moon_in_front`: render moon silhouette (dark glyph), continue to corona overlay.
-   - Else if `sun_hit`: shade sun with limb darkening.
-   - Else: pure space — corona overlay computes brightness.
-
-4. **CORONA OVERLAY** (every space cell):
-   ```
-   α_view = acos(ray_d · sun_dir)
-   d_out  = max(0, α_view − sun_α)
-   local  = exp(−d_out · CORONA_K)
-   global = pow(occlusion, CORONA_GAMMA)         // γ = 4
-   corona = local · global · CORONA_BOOST
-   ```
-
-5. **DIAMOND RING** (TOTAL only). When `|sep − |moon_α − sun_α|| < DIAMOND_W` AND `moon_α > sun_α`: a bead lights up at the sun edge OPPOSITE the moon. Fades smoothly on either side of the threshold.
-
-6. **RENDER.** Pick glyph from intensity ramp + colour from theme ramp (sun, corona, moon, space pairs).
-
----
-
-## Key Formulas
-
-**Moon orbit** (pattern-specific):
 ```
-moon_x = MOON_ORBIT_R · sin(ω · t)              ω = 2π / PERIOD
-moon_y = MOON_Y_OFFSET                          (PARTIAL ≠ 0)
+keys → app_handle_key → scene state, star_preset, pattern
+                              │
+clock_ns → dt → scene_tick (orbit phase, flash decay)
+                              │
+                       scene_draw:
+                          build palette from K
+                          per cell:
+                            ray-sphere sun + moon, depth-sort
+                            sun → shade_sun (limb + granulation)
+                            moon → palette.moon (earthshine)
+                            space → corona + chromosphere
+                            beads + stars overlay
+                          bloom_apply
+                          paint each → screen
 ```
 
-**Apparent angular radii (small-angle):**
-```
-sun_α  = atan(SUN_R  / SUN_Z)
-moon_α = atan(MOON_R / MOON_Z)
-```
+## Key patterns to internalise
 
-**Sun-moon angular separation** (per frame):
-```
-cos β  = normalize(sun_pos) · normalize(moon_pos)
-sep    = acos(cos β)
-```
+**Five additive layers, each gated physically.** Limb darkening
+multiplies; corona is multiplied by occlusion^γ so it's invisible until
+totality; chromosphere gated by occlusion threshold; beads gated by
+totality boundary window.
 
-**Sun occlusion factor** (overlap fraction):
-```
-if sep ≥ sun_α + moon_α                : occlusion = 0
-else if sep ≤ |sun_α − moon_α|         : if (moon_α ≥ sun_α): 1
-                                          else: (moon_α/sun_α)²       // ANNULAR max
-else                                    : (sun_α + moon_α − sep)
-                                          / (2·min(sun_α,moon_α))
-```
+**Granulation in surface coords.** Sample fBm at (atan2(N.x,N.z), N.y)
+not (cellx, celly), so the texture stays glued to the sphere as it
+moves.
 
-**Limb darkening** (Eddington's approximation, simplified to 1-coefficient law):
-```
-cos μ  = N · −ray_d                              (N = sphere normal)
-L      = LIMB_AMBIENT + LIMB_GAIN · cos μ        // 0.40 + 0.60 · μ
-```
+**Streamer fBm in (angle, radius) space.** Angle creates radial rays;
+radius adds variation. Don't drift the angle coord — real streamers
+don't rotate.
 
-**Corona brightness at view ray:**
-```
-α_view = acos(ray_d · sun_dir)
-d_out  = max(0, α_view − sun_α)
-local  = exp(−d_out · CORONA_K)                  // K = 16
-global = pow(occlusion, CORONA_GAMMA)            // γ = 4 — corona blooms only at totality
-corona = local · global · CORONA_BOOST           // 1.40
-```
+**Multiple beads beat one bead.** 5 Gaussian beads with per-bead
+random brightnesses are vastly more realistic than a single bright dot
+at "the silver edge."
 
-**Diamond-ring bead** (TOTAL only):
-```
-sep_T  = |moon_α − sun_α|                        // totality boundary
-if |sep − sep_T| < DIAMOND_W AND moon_α > sun_α:
-  bead_dir_2D = −normalize(moon_screen − sun_screen)
-  bead_pos    = sun_screen + bead_dir_2D · sun_r_screen
-  strength    = 1 − |sep − sep_T| / DIAMOND_W    // smooth fade
-```
-
----
-
-## Edge Cases and Pitfalls
-
-- **DEPTH MUST BE TESTED.** The moon MUST be closer to the camera than the sun, otherwise the depth-sort never lets the moon win. Set `MOON_Z` to a small fraction of `SUN_Z`. Also make the moon's WORLD radius small enough that its angular size is only ~1.0× the sun's (TOTAL) — too big and the moon dominates everything.
-
-- **OCCLUSION ZERO INSIDE TOTALITY.** When `sep < |sun_α − moon_α|` AND `moon_α > sun_α`, the sun is FULLY covered → `occlusion = 1`. For ANNULAR (moon_α < sun_α) the sun ring ALWAYS shows; max occlusion is `(moon_α/sun_α)² < 1`, so corona never reaches full brightness — exactly right (annular eclipses don't show corona).
-
-- **CORONA CLIPS INSIDE MOON.** Corona is computed for ALL cells but cells INSIDE the moon's silhouette must NOT show corona — corona is the OUTER atmosphere, visible only outside the occluder. Gate corona rendering by "this cell is OUTSIDE both spheres" → only over space pixels.
-
-- **ASPECT RATIO.** Terminal cells are 2× taller than wide. The `fov_v` computation accounts for this so the sun renders ROUND on screen — without it, sun looks like a vertical ellipse.
-
-- **DIAMOND-RING WINDOW.** The window `|sep − sep_T| < DIAMOND_W` is in radians. With `DIAMOND_W = 0.0035` and `sep` changing by ~0.003 rad/sec at speed 1, the window fires for ~0.7 sec each time it's crossed — visible but not lingering.
-
-- **PARTIAL: NEVER FULL TOTALITY.** With `MOON_Y_OFFSET > 0` the minimum `sep > 0`, so the inner condition `sep ≤ |sun_α − moon_α|` never triggers, occlusion peaks below 1, corona stays dim, diamond ring never fires. Good.
-
-- **TRANSIT (tiny moon).** Occlusion is ALWAYS tiny, so corona factor stays 0; no diamond ring. Moon just appears as a small dark dot drifting across a brightly lit sun.
-
----
-
-## How to Verify
-
-- **PAUSE** (space). Eclipse freezes mid-cycle. Resume: orbit continues from where it stopped.
-
-- **TOTAL** pattern. Watch one full cycle:
-  - pre-eclipse — bright sun
-  - moon enters from one side
-  - crescent shrinks until it's a thin sliver
-  - DIAMOND RING flashes — bright bead at sun's far edge
-  - TOTALITY — sun body dark, corona blooms outward
-  - DIAMOND RING flashes again on the other side
-  - moon exits — sun reappears
-
-- **PARTIAL** pattern. Crescent forms but the moon never centres. No corona, no diamond.
-
-- **ANNULAR** pattern. At maximum the moon sits INSIDE the sun silhouette and a bright RING of sun remains visible all the way around. The bright ring is what makes annular eclipses famous; corona is invisible because the bright ring outshines it.
-
-- **TRANSIT** pattern. A tiny dark dot crawls across the sun's face. Sun's brightness barely changes. Mercury / Venus.
-
-- **HUD phase string.** Live-updates: `PRE/POST → APPROACH → TOTALITY/ANNULARITY → DEPART`. Use this to verify the phase machine matches the visual state.
-
----
-
-## References
-
-- Wikipedia — [Solar eclipse](https://en.wikipedia.org/wiki/Solar_eclipse).
-- Wikipedia — [Corona (the sun's outer atmosphere)](https://en.wikipedia.org/wiki/Corona).
-- Wikipedia — [Baily's beads / diamond ring effect](https://en.wikipedia.org/wiki/Baily%27s_beads).
-- Hestroffer, D. & Magnan, C. (1998) — "Wavelength dependency of the solar limb darkening", *Astronomy & Astrophysics* 333:338.
-- Shirley, P. — *Ray Tracing in One Weekend* — canonical ray-sphere intersection.
-
----
-
-*Source: `raytracing/solar_eclipse.c`*
+**Same paint pipeline + bloom as saturn/god_rays.** Continuous RGB →
+Reinhard → gamma → 6×6×6 cube + airy ramp.

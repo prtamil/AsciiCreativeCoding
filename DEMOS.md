@@ -126,14 +126,14 @@ gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 
 | Program | Algorithm |
 |---------|-----------|
-| `sphere_raytrace` | Quadratic ray-sphere — orbiting camera, 3-point Phong, Fresnel glass mode, 256-color, 6 themes |
-| `cube_raytrace` | AABB slab method — inverse-rotation ray transform, face-normal colour, pixel-perfect wireframe, 6 themes |
-| `torus_raytrace` | Quartic intersection (sampling + bisection) — ring in XZ plane, gradient normal, Fresnel, 6 themes |
-| `capsule_raytrace` | Cylinder + hemisphere caps — axial projection body normal, cap sphere normal, inverse-rotation transform, 6 themes |
-| `path_tracer` | Monte Carlo path tracer — Lambertian BRDF, cosine hemisphere sampling (Malley's method), Russian roulette termination, progressive per-pixel accumulator, Reinhard tone map + gamma, Cornell Box scene with color bleeding |
-| `saturn_with_rings` | Iconic ringed planet — analytic ray-sphere (planet) + ray-plane annulus (rings) with depth-sort occlusion; per-radius ring density + Cassini Division gap; shadow-ray to sun gives planet-cast dark band on rings; 4 patterns (SATURN/URANUS/RINGED-EARTH with fBm continents/EXOPLANET) |
-| `solar_eclipse` | Two ray-sphere tests + screen-space corona overlay — limb-darkened sun, depth-sorted moon transit, `exp(-d·k)·pow(occlusion,γ)` corona bloom only at totality, diamond-ring bead at sun edge opposite moon when sep ≈ \|moon_α − sun_α\|; 4 patterns (TOTAL/PARTIAL/ANNULAR/TRANSIT) |
-| `god_rays_silhouette` | Volumetric light shafts via per-cell screen-space shadow-ray accumulation — Beer–Lambert weighted samples toward sun, point-in-shape silhouette test gates each step; 5 silhouette patterns (ARCHWAY/MOUNTAIN/COLUMN/WINDOWS/TREE), fBm fog jitter, 10 themes |
+| `sphere_raytrace` | Quadratic ray-sphere — foundational raytrace demo; orbiting camera, 3-light Phong (KEY/FILL/RIM split into named functions), Fresnel glass mode, 6×6×6 RGB cube + Bourke 92-char ramp paint pipeline, 6 themes |
+| `cube_raytrace` | AABB slab method — `slab_test` per-axis + `ray_aabb` dispatcher; inverse-rotation ray transform, face-normal colour, wireframe edge mode, 6 themes |
+| `torus_raytrace` | Quartic intersection (Horner-form polynomial + scan + bisect — numerically stable vs Ferrari closed-form) — ring in XZ plane, closest-point geometric normal, Fresnel, 6 themes |
+| `capsule_raytrace` | Cylinder + hemisphere caps — `cylinder_test` + `cap_test` decomposition; Quílez no-division form; inverse-rotation transform, 6 themes |
+| `path_tracer` | Monte Carlo path tracer — Lambertian BRDF, cosine hemisphere sampling (Malley's method), Russian roulette termination, progressive per-pixel accumulator, Reinhard tone map + gamma, 6×6×6 cube + Bourke ramp paint, Cornell Box scene with color bleeding |
+| `saturn_with_rings` | Iconic ringed planet — analytic ray-sphere (planet) + ray-plane annulus (rings); CONTINUOUS RGB pipeline with limb darkening + atmospheric rim, soft-shadow penumbra (8-cone-sample), forward-scattering ring glow (backlight^3 — the Cassini look), sub-pixel anti-aliasing (SPP 1/2/4); 3 shade modes (LIT/FLAT/NORMAL); 4 patterns (SATURN/URANUS/RINGED-EARTH/EXOPLANET) |
+| `solar_eclipse` | Two ray-sphere tests + 5 cinematic shading layers — limb-darkened photosphere with fBm GRANULATION (sphere-stable surface coords), STREAMER-structured corona (fBm in angle×radius space → polar plumes + helmet streamers), CHROMOSPHERE Hα ring at totality edge, MULTIPLE BAILEY'S BEADS at totality boundary (5 beads at random angles around limb), 5×5 Gaussian BLOOM on bright cells; 5 BLACKBODY star presets (1500K-10000K via Tanner Helland approximation); 4 patterns (TOTAL/PARTIAL/ANNULAR/TRANSIT) |
+| `god_rays_silhouette` | Volumetric light shafts via per-cell screen-space ray-march — Beer-Lambert weighted samples toward sun; CONTINUOUS RGB pipeline with BLACKBODY temperature presets (8 from EMBER 1500K to BLUE 8500K — no preset themes), CINEMATIC SUN (CORE + CORONA halo + 4 LENS-FLARE STREAKS), BLOOM (5×5 bright-pass), DUST PARTICLES with motion-blur trails and Perlin WIND GUSTS; 3 shade modes (LIT/MASK/VIS); curated airy 16-glyph open-symbol density ramp (no `#` `@` blocks); 5 silhouette patterns (ARCHWAY/MOUNTAIN/COLUMN/WINDOWS/TREE) |
 
 ## Emergent Systems  (`flocking/`)
 

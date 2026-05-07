@@ -1,148 +1,242 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * donut.c  —  ncurses spinning ASCII torus
+ * donut.c — Andy Sloane's spinning ASCII torus, in the framework style
  *
- * Original algorithm by Andy Sloane (donut.c / a1k0n.net),
- * rewritten in the framework used by matrix_rain / burst / kaboom:
- *   - Single stdscr, ncurses internal double buffer — no flicker
- *   - dt-based rotation — speed is frame-rate independent
- *   - SIGWINCH resize — torus recentres to new terminal dimensions
- *   - Speed control:   ] faster   [ slower
- *   - Size control:    = larger   - smaller
- *   - Pause:           space
- *   - Clean signal / atexit teardown
+ * DEMO: A donut tumbling in front of a fixed light bulb.  The torus is
+ *       sampled on a (θ, φ) grid (~28 000 surface dots), every dot is
+ *       rotated by two Euler angles, projected to the terminal with
+ *       1/z perspective, and a depth buffer keeps the closest dot per
+ *       cell.  Brightness comes from the analytic dot product of the
+ *       surface normal with a fixed light direction; brightness picks
+ *       the glyph from a 12-character ramp `.,-~:;=!*#$@` and one of
+ *       eight grey colour pairs.  No raymarching, no rasteriser — just
+ *       point sampling + z-buffer.  A reader who can read a for-loop
+ *       can follow the entire algorithm.
+ *
+ * Study alongside:
+ *   raster/torus_raster.c    — same torus geometry rendered through
+ *                              the project's full triangle rasteriser
+ *                              (vertex/fragment shaders, MVP matrix,
+ *                              barycentric raster).  Compare and you
+ *                              see why this 700-line file beats the
+ *                              1300-line one for pedagogy: the math
+ *                              is on display, not buried in pipeline.
+ *
+ * Section map:
+ *   §1 config   — all tunable constants + glyph ramp + colour-pair IDs
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — luminance pairs + HUD/hint pairs (CLAUDE.md spec)
+ *   §4 math     — V2 / V3 / Rot constructors (mirror the formulas)
+ *   §5 torus    — Torus state + the five sampling helpers + render
+ *   §6 screen   — ncurses init / resize / HUD draw / present
+ *   §7 app      — main loop, signals, key handling, cleanup
  *
  * Keys:
- *   q / ESC   quit
- *   space     pause / resume
- *   ]  [      spin faster / slower
- *   =  -      larger / smaller torus
+ *   q / ESC      quit
+ *   space        pause / resume rotation
+ *   ] / [        spin faster / slower    (multiplies both rot speeds)
+ *   = / -        torus larger / smaller  (multiplies K1)
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra donut.c -o donut -lncurses -lm
- *
- * Sections
- * --------
- *   §1  config  — every tunable constant
- *   §2  clock   — monotonic nanosecond clock + sleep
- *   §3  color   — luminance color pairs; 256-color with 8-color fallback
- *   §4  torus   — geometry, zbuffer, framebuffer, tick, draw
- *   §5  screen  — single stdscr, ncurses internal double buffer
- *   §6  app     — dt loop, input, resize, cleanup
+ *   gcc -std=c11 -O2 -Wall -Wextra raymarcher/donut.c -o donut \
+ *       -lncurses -lm
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : Analytic torus rasterization (not raymarching).
- *                  For each point on the torus surface, the 3D position is
- *                  computed from (θ, φ) parameters, rotated by two Euler
- *                  angles, then projected to screen space.  The depth buffer
- *                  (z-buffer) resolves visibility between overlapping surface points.
+ * Algorithm      : Analytic torus point-sampling.  We never march a ray
+ *                  and we never tessellate triangles.  We walk a (θ, φ)
+ *                  parameter grid where θ goes around the torus axis
+ *                  (the BIG circle) and φ goes around the tube cross-
+ *                  section (the SMALL circle); each (θ, φ) gives one
+ *                  3-D point on the torus surface in closed form.
+ *                  Rotate every point by two Euler angles, project to
+ *                  2-D with 1/z perspective division, run a per-cell
+ *                  depth buffer that keeps only the closest dot.  The
+ *                  donut you see is thousands of independent points
+ *                  fighting for the front-most spot per cell.
  *
- * Math           : Torus parametric equation:
- *                    x = (R + r·cos φ) cos θ
- *                    y = (R + r·cos φ) sin θ
- *                    z =  r · sin φ
- *                  Surface normal: n = (cos φ cos θ, cos φ sin θ, sin φ).
- *                  Lighting: L·N dot product with Phong specular: (R·V)^shininess.
- *                  Luminance mapped to ASCII ramp ".,:;+=xX$&@#".
+ * Data-structure : Two flat buffers sized to TORUS_MAX_CELLS:
+ *                    zbuf [r·cols+c]  → 1/z of the closest dot here so
+ *                                       far  (zero = empty cell)
+ *                    glyph[r·cols+c]  → ASCII char from LUMI_RAMP, or
+ *                                       space if no dot landed here
+ *                    luma [r·cols+c]  → luma slot 0..7 (so the draw
+ *                                       step picks the colour pair
+ *                                       without re-deriving it)
+ *                  All three are zeroed at the start of each render.
+ *                  No heap allocation after init.
  *
- * Rendering      : Z-buffer (depth buffer): each pixel stores the depth of the
- *                  nearest surface point seen so far.  Rasterization proceeds
- *                  in order of increasing depth — further points overwrite the
- *                  buffer only if they are closer than the current stored depth.
+ * Rendering      : Z-buffer convention is INVERTED — we store 1/z, not
+ *                  z, because perspective division produces 1/z naturally
+ *                  and bigger 1/z = closer.  The depth test is
+ *                  `if (ooz > zbuf[idx])` — accept the new dot if it's
+ *                  closer.  Empty cells start at zbuf=0 (infinitely
+ *                  far), and every visible torus point has positive z
+ *                  thanks to the +K2 shift in surface_point().
  *
- * Performance    : O(N_THETA × N_PHI) per frame — proportional to the number
- *                  of surface samples, not the terminal resolution.  Terminal
- *                  aspect (CELL_H / CELL_W ≈ 2) compensates in the projection.
+ * Performance    : O(N_θ · N_φ) per frame ≈ 90 × 314 = 28 000 surface
+ *                  samples regardless of terminal size.  Each sample is
+ *                  ~25 floating-point ops; ~1 ms / frame on a modern CPU
+ *                  at the default sample density.  Halving THETA_STEP
+ *                  doubles the cost.  Rendering cost is independent of
+ *                  cell count — increasing the terminal makes the donut
+ *                  bigger but not slower.
+ *
+ * References     : Sloane, Andy (2011) — "Donut math: how donut.c works"
+ *                    https://www.a1k0n.net/2011/07/20/donut-math.html
+ *                    The canonical write-up of the original algorithm.
+ *                    Every formula in this file matches one in that post.
+ *                  Wikipedia — "Torus § Parametric equation"
+ *                    https://en.wikipedia.org/wiki/Torus#Geometry
+ *                    The (R, r, θ, φ) parameterisation we use.
+ *                  Newman & Sproull (1979) — "Principles of Interactive
+ *                    Computer Graphics," 2nd ed.  Ch. 22 covers the
+ *                    z-buffer visibility algorithm we lift here.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
  *
  * CORE IDEA
  * ─────────
- * A torus is two nested circles: walk a small circle (the tube, parameter
- * φ) while sweeping that whole circle around a bigger circle (the ring,
- * parameter θ).  Sampling (θ, φ) on a fine grid produces a dense cloud of
- * 3-D surface points.  Rotate every point by two Euler angles, project to
- * 2-D with 1/z perspective, and let a z-buffer decide which sample wins
- * each terminal cell.  The donut you see is just thousands of lit dots
+ * A torus is two nested circles: walk a SMALL circle (the tube cross-
+ * section, parameter φ) while sweeping that whole circle around a
+ * BIGGER circle (the torus axis, parameter θ).  Sampling (θ, φ) on a
+ * fine grid produces a dense cloud of 3-D surface points.  Rotate
+ * every point by two Euler angles, project to 2-D with 1/z
+ * perspective, and let a z-buffer decide which sample wins each
+ * terminal cell.  The donut you see is just thousands of lit dots
  * fighting for the front-most spot.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
- * Imagine a sparkler tracing a small circle while you slowly rotate your
- * wrist.  The trail covers a doughnut in space.  Now photograph that
- * doughnut from a fixed camera while the doughnut itself tumbles — each
- * sparkler dot is one (θ, φ) sample.  The screen is film: each pixel
- * remembers ONLY the closest sparkler dot that hit it, and the brightness
- * comes from how the dot's surface tilts toward a light bulb above and
- * behind the camera.
+ * Imagine a sparkler tracing a small circle while you slowly rotate
+ * your wrist.  The trail covers a doughnut in space.  Now photograph
+ * that doughnut from a fixed camera while the doughnut itself
+ * tumbles — each sparkler dot is one (θ, φ) sample.  The screen is
+ * film: each pixel remembers ONLY the closest sparkler dot that hit
+ * it, and the brightness comes from how the dot's surface tilts
+ * toward a light bulb above and behind the camera.
  *
- * DRAWING METHOD
- * ──────────────
- *  1. Clear outbuf[] to spaces and zbuf[] to zero (zero = infinitely far,
- *     because we store 1/z and bigger 1/z means closer).
- *  2. Precompute sinA, cosA, sinB, cosB for the current Euler angles.
- *  3. Two nested loops over θ ∈ [0, 2π) step THETA_STEP and φ ∈ [0, 2π)
- *     step PHI_STEP.  About 90 × 314 ≈ 28 000 surface samples per frame.
- *  4. For each (θ, φ): build the un-rotated point (cx, cy) in the tube
- *     cross-section, apply the combined X-then-Z rotation, add K2 to z so
- *     the donut sits in front of the camera.
- *  5. Project: xp = cols/2 + K1·x/z, yp = rows/2 - K1·y/z·0.5 (the 0.5
- *     fixes the 2:1 terminal cell aspect so the donut looks round).
- *  6. Compute luminance L = N · light (analytic dot product, no shader).
- *     If L ≤ 0 the surface faces away — skip.
- *  7. z-buffer: only keep this dot if 1/z > zbuf[idx].  Pick a glyph from
- *     ".,-~:;=!*#$@" indexed by L, store it in outbuf[idx].
- *  8. After both loops finish, walk outbuf[] in row order and emit each
- *     non-space cell with a colour pair selected from the same L.
- *  9. Each tick: A += rot_a · dt, B += rot_b · dt — that is the only
- *     state change between frames.
+ *      ┌────────────────────────────────────────────────┐
+ *      │     θ  (around torus axis, big circle)         │
+ *      │       ↻↻↻↻↻↻↻↻↻↻↻↻↻↻↻↻↻↻                       │
+ *      │   ╭───╮  ╭───╮  ╭───╮ ◀── tube cross-section   │
+ *      │   │ φ │  │ φ │  │ φ │     (small circle)       │
+ *      │   ╰───╯  ╰───╯  ╰───╯                          │
+ *      │                                                │
+ *      │   point = tube_point(θ) revolved by φ          │
+ *      │         → rotate by A around X, B around Z     │
+ *      │         → project: (xp, yp, ooz)               │
+ *      │         → keep if ooz > zbuf[idx]              │
+ *      └────────────────────────────────────────────────┘
+ *
+ * DRAWING METHOD  /  ALGORITHM IN STEPS
+ * ─────────────────────────────────────
+ *  Per frame:
+ *    1. Reset zbuf[] to 0 (= infinitely far, since we store 1/z),
+ *       glyph[] to space, luma[] to zero.
+ *    2. Pre-compute (sinA, cosA, sinB, cosB) for the current Euler
+ *       angles — they're constant for every sample within one frame.
+ *
+ *  Per (θ, φ) sample (≈ 28 000 of them):
+ *    3. tube_point(θ)            → 2-D point on the tube cross-section
+ *    4. surface_point(...)       → 3-D world point (rotated, +K2 shifted)
+ *    5. project_to_screen(...)   → (xp, yp, ooz) with bounds flag
+ *    6. surface_luminance(...)   → scalar L; skip if L ≤ 0 (back-facing)
+ *    7. try_emit_pixel(...)      → z-buffer test + glyph + luma store
+ *
+ *  After the loop:
+ *    8. torus_draw walks the buffers, emits every non-space cell with
+ *       its colour pair (luma slot → grey ramp index).
+ *
+ *  Each tick (frame-rate independent):
+ *    9. A += rot_a · dt;  B += rot_b · dt — the only state mutation.
  *
  * KEY FORMULAS
  * ────────────
- *  Tube point      cx = R2 + R1·cos θ,  cy = R1·sin θ      circle in XZ
- *  Rotation X      after A around X: y' = y·cosA - z·sinA, z' = y·sinA + z·cosA
- *  Rotation Z      after B around Z: x'' = x·cosB - y·sinB, y'' = x·sinB + y·cosB
- *  Combined        x = cx(cosB·cosφ + sinA·sinB·sinφ) - cy·cosA·sinB
- *                  y = cx(sinB·cosφ - sinA·cosB·sinφ) + cy·cosA·cosB
- *                  z = K2 + cosA·cx·sinφ + cy·sinA
- *  Projection      xp = cols/2 + K1·x/z,  yp = rows/2 - K1·y/z·0.5
- *  Luminance       L = cosφ·cosθ·sinB - cosA·cosθ·sinφ - sinA·sinθ
- *                    + cosB·(cosA·sinθ - cosθ·sinA·sinφ)
- *  K1 sizing       K1 = 0.42 · min(cols/2, rows) · (K2+R1+R2) / (R1+R2)
- *  Glyph index     li = floor(L · |ramp|), clamp to |ramp|-1
+ *   Tube point        cx = R2 + R1 · cos θ      ┐ circle in the plane
+ *                     cy =      R1 · sin θ      ┘ before revolving
+ *
+ *   X-then-Z combined rotation (after multiplying out the 3×3 matrices):
+ *     x  = cx · (cos B · cos φ + sin A · sin B · sin φ) − cy · cos A · sin B
+ *     y  = cx · (sin B · cos φ − sin A · cos B · sin φ) + cy · cos A · cos B
+ *     z  = K2  +  cos A · cx · sin φ  +  cy · sin A
+ *
+ *   1/z perspective projection (Y_ASPECT halves vertical to undo the
+ *   2:1 terminal cell aspect):
+ *     ooz = 1 / z                                        (one-over-z)
+ *     xp  =  cols/2 + K1 · ooz · x
+ *     yp  =  rows/2 − K1 · ooz · y · Y_ASPECT
+ *
+ *   Lambertian luminance with hard-coded light dir (0, 1, −1)/√2:
+ *     L  =  cos φ · cos θ · sin B
+ *         − cos A · cos θ · sin φ
+ *         − sin A · sin θ
+ *         + cos B · (cos A · sin θ − cos θ · sin A · sin φ)
+ *
+ *   Sizing — K1 chosen so the projected outer edge of the torus fills
+ *   TORUS_TARGET_FILL of the smaller terminal half-dimension:
+ *     K1 = TARGET_FILL · min(cols/2, rows) · (K2 + R2 + R1) / (R2 + R1)
+ *
+ *   Glyph index (0..LUMI_RAMP_LEN−1):
+ *     li = clamp( floor(L · LUMI_RAMP_LEN), 0, LUMI_RAMP_LEN − 1 )
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *  • θ-step too coarse — the surface develops Moiré bands; PHI_STEP=0.02
- *    is finer than THETA_STEP=0.07 because the tube is the smaller circle
- *    and shows undersampling first.
- *  • z-buffer convention is INVERTED: zbuf[] holds 1/z, so larger value =
- *    closer.  Forgetting this ("if (ooz < zbuf)") draws the back of the
- *    donut on top.
- *  • Initial zbuf=0 only works because every visible surface has z>0; if
- *    the donut centre ever crossed K2 the whole render breaks.
- *  • The 0.5 factor on yp is NOT physics — it is terminal aspect
- *    correction.  Remove it on a square-cell terminal.
- *  • Resize must update t->cols / t->rows AND not exceed TORUS_MAX_*; the
- *    flat outbuf is sized for the worst case.
- *  • Pause freezes A and B but render still runs every frame — the donut
- *    stays visible, just stationary.
+ *   • Z-BUFFER CONVENTION IS INVERTED: zbuf[] holds 1/z, so larger =
+ *     closer.  A naïve `if (ooz < zbuf[idx])` draws the BACK of the
+ *     donut on top — a classic introductory bug.
+ *
+ *   • Initial zbuf = 0 only works because every visible surface point
+ *     has z > 0 (the +K2 shift in surface_point puts the donut in
+ *     front of the camera).  If the camera ever crossed K2 the whole
+ *     render breaks; we don't have any code path that does, so it's
+ *     safe.
+ *
+ *   • Y_ASPECT = 0.5 is NOT physics — it's terminal aspect correction
+ *     for cells that are roughly twice as tall as wide.  On a square-
+ *     cell terminal you'd set Y_ASPECT = 1.0 and the donut would be
+ *     vertically squashed otherwise.
+ *
+ *   • Sample undersampling shows on the TUBE before the AXIS because
+ *     the tube is the smaller circle.  PHI_STEP (0.02) is about 3.5×
+ *     finer than THETA_STEP (0.07) for that reason — same density per
+ *     unit length on the surface.
+ *
+ *   • Resize must update Torus.cols / Torus.rows but NEVER exceed
+ *     TORUS_MAX_*; the flat buffers are sized for the worst case so
+ *     larger terminals quietly clip.
+ *
+ *   • Pause freezes A and B but render still runs every frame — the
+ *     donut stays visible, just stationary.  Useful for inspecting
+ *     individual frames at A=0 or after a specific manual rotation.
  *
  * HOW TO VERIFY
  * ─────────────
- *  • At A=B=0 the donut should appear as a flat ring (top-down view) with
- *    the brightest band along one side where the light grazes it.
- *  • Pressing ] five times multiplies rot_a by 1.3^5 ≈ 3.7×; the spin
- *    should look ~4× faster, not 5× — confirms multiplicative scaling.
- *  • Pressing = until SIZE_MAXX (5.0) caps growth; further presses do
- *    nothing.  Pressing - back to default returns to original size.
- *  • Resize the terminal: the donut should re-centre and re-fit to ~42%
- *    of the smaller dimension automatically (torus_k1 recomputes).
- *  • Setting THETA_STEP=0.5 deliberately should produce a sparse "wire
- *    cage" donut — proves the loop is the only source of sample density.
+ *   • At startup the donut should appear as a recognisable doughnut
+ *     silhouette tumbling slowly.  Sun-facing top is bright, far side
+ *     is dim.
+ *
+ *   • Press space.  Rotation freezes.  Press ] five times then space
+ *     to resume — donut should now spin ~3.7× faster (1.3^5 ≈ 3.71).
+ *
+ *   • Press = until growth stops at SIZE_MAX.  Press - back to original
+ *     size.  K1 changes; the donut never disappears off-screen because
+ *     torus_k1 always fits to the smaller dimension.
+ *
+ *   • Resize the terminal: the donut re-centres (it's drawn at
+ *     cols/2, rows/2 always) and re-fits to TORUS_TARGET_FILL of the
+ *     smaller dimension automatically.
+ *
+ *   • Setting THETA_STEP to 0.5 deliberately should produce a sparse
+ *     "wire cage" donut — proves the (θ, φ) loop is the only source
+ *     of sample density.
+ *
+ *   • Hard test: temporarily flip the depth comparison to `<` instead
+ *     of `>`.  The BACK of the donut should now draw on top of the
+ *     front.  Confirms the inverted-z convention is doing the work.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -162,63 +256,91 @@
 #include <time.h>
 #include <stdio.h>
 
-/* ===================================================================== */
-/* §1  config                                                             */
-/* ===================================================================== */
+/* ── §1 config ───────────────────────────────────────────────────────── */
 
+/* §1.1 frame rate + HUD layout */
 enum {
-    /* Render rate */
-    SIM_FPS_MIN      =  5,
     SIM_FPS_DEFAULT  = 30,
-    SIM_FPS_MAX      = 60,
-    SIM_FPS_STEP     =  5,
-
-    /* HUD */
-    HUD_COLS         = 32,
     FPS_UPDATE_MS    = 500,
+    HUD_STATUS_COLS  = 40,
 };
 
-/*
- * Rotation speed in radians per second.
- * A increments faster (tumble), B slower (spin) — matches the original feel.
- * ] / [ keys multiply/divide these by SPEED_SCALE.
- */
-#define ROT_A_DEFAULT   1.2f    /* radians/sec around X axis            */
-#define ROT_B_DEFAULT   0.6f    /* radians/sec around Z axis            */
-#define SPEED_SCALE     1.3f    /* multiplier per ] or [ keypress       */
+#define NS_PER_SEC      1000000000LL
+#define NS_PER_MS          1000000LL
+#define TICK_NS(fps)    (NS_PER_SEC / (fps))
+
+/* §1.2 angles + π helpers */
+#define TWO_PI          (2.0f * (float)M_PI)
+
+/* §1.3 rotation speed (radians per second) — A is the X-axis tumble,
+ * B is the Z-axis spin.  ] and [ multiply BOTH by SPEED_SCALE so the
+ * relative tumble:spin ratio stays at the original feel. */
+#define ROT_A_DEFAULT   1.2f
+#define ROT_B_DEFAULT   0.6f
+#define SPEED_SCALE     1.3f
 #define SPEED_MIN       0.05f
 #define SPEED_MAX      12.0f
 
-/*
- * Torus geometry.
- * R1  inner tube radius (the circle being revolved).
- * R2  distance from torus centre to tube centre.
- * K1  perspective scaling — controls how large the torus appears.
- * K2  viewer distance — larger = less perspective distortion.
- *
- * K1 is recalculated whenever the terminal size or SIZE_SCALE changes
- * so the torus always fills roughly the same fraction of the screen.
- */
+/* §1.4 torus geometry constants — pure shape, no animation.
+ *   R1  tube radius (small circle).
+ *   R2  distance from torus centre to tube centre (big circle).
+ *   K2  viewer distance — added to z so the donut sits in front of
+ *       the camera (z always positive).  Larger = less perspective
+ *       distortion.  K1 (perspective scale) is computed per-frame
+ *       in torus_k1 so the torus auto-fits the terminal. */
 #define TORUS_R1        1.0f
 #define TORUS_R2        2.0f
 #define TORUS_K2        5.0f
 
-/* Size scale multiplier applied on = / - keypresses. */
-#define SIZE_SCALE      1.15f
-#define SIZE_MIN        0.3f
-#define SIZE_MAXX        5.0f
+/* §1.5 K1 sizing — the torus should fill TORUS_TARGET_FILL of the
+ * smaller terminal dimension at user scale 1.0.  See torus_k1 for
+ * the derivation. */
+#define TORUS_TARGET_FILL  0.42f
+#define TORUS_SIZE_SCALE   1.15f
+#define TORUS_SIZE_MIN     0.30f
+#define TORUS_SIZE_MAX     5.00f
 
-/* Angle step sizes for the geometry loops — finer = smoother surface. */
+/* §1.6 sample density — finer = smoother surface, slower frames.
+ * PHI_STEP is finer than THETA_STEP because the tube (φ direction)
+ * is the smaller circle and shows undersampling first. */
 #define THETA_STEP      0.07f
 #define PHI_STEP        0.02f
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS       1000000LL
-#define TICK_NS(fps)    (NS_PER_SEC / (fps))
+/* §1.7 terminal cell aspect correction.
+ *   Y_ASPECT = 0.5  for typical terminals (cells ~2× taller than wide)
+ *   Y_ASPECT = 1.0  for square-cell terminals
+ * Applied as a multiplier on the projected y so the donut reads as a
+ * round shape rather than a vertically stretched ellipse. */
+#define Y_ASPECT        0.5f
 
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
+/* §1.8 luminance ramp — dim → bright.  Twelve glyphs.  The render
+ * picks the index from L · LUMI_RAMP_LEN; the colour pair is picked
+ * from the same index quantised to LUMI_LEVELS slots. */
+static const char LUMI_RAMP[] = ".,-~:;=!*#$@";
+#define LUMI_RAMP_LEN   ((int)(sizeof LUMI_RAMP - 1))   /* = 12 */
+
+/* §1.9 colour-pair scheme — eight grey luminance pairs plus the two
+ * named CLAUDE.md HUD pairs (yellow status, cyan key hint).
+ *
+ *   PAIR_LUMI_BASE..PAIR_LUMI_BASE+7   eight grey shades dim → bright
+ *   PAIR_HUD                           bright yellow (status row)
+ *   PAIR_HINT                          bright cyan   (key-hint row)
+ */
+enum {
+    LUMI_LEVELS      = 8,
+    PAIR_LUMI_BASE   = 1,                    /* +0..+7  */
+    PAIR_HUD         = PAIR_LUMI_BASE + LUMI_LEVELS,    /* = 9  */
+    PAIR_HINT        = PAIR_HUD + 1,                    /* = 10 */
+};
+
+/* §1.10 framebuffer sizing.  Anything larger than TORUS_MAX_COLS ×
+ * TORUS_MAX_ROWS is quietly clipped — we'd need to malloc to avoid
+ * that, but 512×256 = 131 072 cells handles every realistic terminal. */
+#define TORUS_MAX_COLS  512
+#define TORUS_MAX_ROWS  256
+#define TORUS_MAX_CELLS (TORUS_MAX_COLS * TORUS_MAX_ROWS)
+
+/* ── §2 clock — monotonic timer + sleep ──────────────────────────────── */
 
 static int64_t clock_ns(void)
 {
@@ -230,344 +352,418 @@ static int64_t clock_ns(void)
 static void clock_sleep_ns(int64_t ns)
 {
     if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
+    struct timespec req = { .tv_sec  = (time_t)(ns / NS_PER_SEC),
+                            .tv_nsec = (long)  (ns % NS_PER_SEC) };
     nanosleep(&req, NULL);
 }
 
-/* ===================================================================== */
-/* §3  color                                                              */
-/* ===================================================================== */
-
-/*
- * Luminance color pairs — 8 levels from dim grey to bright white.
- * In 256-color mode each pair uses a distinct grey ramp index for smooth
- * shading.  In 8-color mode we use DIM/NORMAL/BOLD on white to fake
- * three brightness levels across the eight pairs.
+/* ── §3 color — luminance pairs + HUD/hint pairs ─────────────────────── *
  *
- * Pair index maps directly to luminance_index (0..7) from the geometry.
- * Pair 0 is unused (ncurses pair 0 is reserved for the default color).
- * We use pairs 1–8.
+ * Eight grey shades come from the xterm-256 grey ramp (indices 232..255
+ * are 24 even greys dark→light).  We pick eight indices in the BRIGHTER
+ * half so the donut is vivid against a black background, even on the
+ * dimmest luma slot.  In 8-colour mode we fall back to A_DIM/A_NORMAL/
+ * A_BOLD on COLOR_WHITE to fake three brightness levels.
  */
-enum { LUMI_LEVELS = 8 };
 
 static void color_init(void)
 {
     start_color();
+    use_default_colors();
 
     if (COLORS >= 256) {
-        /*
-         * xterm-256 grey ramp: indices 232–255 are 24 steps dark→light.
-         * We pick 8 evenly spaced steps across the brighter half (240–255)
-         * so the torus is vivid rather than muddy.
-         */
-        int greys[LUMI_LEVELS] = { 235, 238, 241, 244, 247, 250, 253, 255 };
+        /* Eight evenly-spaced greys in the bright half (240..255). */
+        static const short LUMI_GREYS[LUMI_LEVELS] =
+            { 240, 243, 246, 248, 250, 252, 254, 255 };
         for (int i = 0; i < LUMI_LEVELS; i++)
-            init_pair(i + 1, greys[i], COLOR_BLACK);
+            init_pair((short)(PAIR_LUMI_BASE + i), LUMI_GREYS[i], -1);
+
+        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
+        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
     } else {
-        /* 8-color fallback: alternate WHITE pairs with DIM/NORMAL/BOLD. */
         for (int i = 0; i < LUMI_LEVELS; i++)
-            init_pair(i + 1, COLOR_WHITE, COLOR_BLACK);
+            init_pair((short)(PAIR_LUMI_BASE + i), COLOR_WHITE, -1);
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
     }
 }
 
 /*
- * lumi_attr() — return the ncurses attribute for luminance level l (0..7).
- * In 256-color mode the pair itself carries the brightness.
- * In 8-color mode A_DIM / A_BOLD carry it.
+ * lumi_attr — ncurses attribute for luma slot l ∈ [0, LUMI_LEVELS).
+ *
+ * In 256-colour mode each slot has its own grey pair.
+ * In 8-colour mode we layer DIM/NORMAL/BOLD on top of the white pair
+ * so eight slots still produce three visibly distinct brightnesses.
  */
 static attr_t lumi_attr(int l)
 {
-    if (l < 0) l = 0;
-    if (l > LUMI_LEVELS - 1) l = LUMI_LEVELS - 1;
+    if (l < 0)              l = 0;
+    if (l > LUMI_LEVELS-1)  l = LUMI_LEVELS - 1;
 
-    attr_t attr = COLOR_PAIR(l + 1);
+    attr_t a = COLOR_PAIR(PAIR_LUMI_BASE + l);
     if (COLORS < 256) {
-        if (l < 3)       attr |= A_DIM;
-        else if (l >= 6) attr |= A_BOLD;
+        if      (l < 3) a |= A_DIM;
+        else if (l > 5) a |= A_BOLD;
     }
-    return attr;
+    return a;
 }
 
-/* ===================================================================== */
-/* §4  torus                                                              */
-/* ===================================================================== */
+/* ── §4 math — V2 / V3 / Rot constructors mirror the formulas ────────── *
+ *
+ * The vector types exist purely so call sites read like the math:
+ *     V2 tube  = tube_point(...);
+ *     V3 world = surface_point(tube, cosph, sinph, rot);
+ *
+ * No operator overloading, no arithmetic helpers — just the
+ * constructor and the field access.  C does not get in the way of
+ * the algebra here.
+ */
+
+typedef struct { float x, y;       } V2;
+typedef struct { float x, y, z;    } V3;
 
 /*
- * Torus — owns all mutable state for the spinning donut.
- *
- *   A, B         current rotation angles (radians); accumulate each tick
- *   rot_a, rot_b rotation speed (radians/sec); mutable via ] / [
- *   k1_scale     size scale multiplier; mutable via = / -
- *   paused       when true, tick() does not advance A or B
- *   cols, rows   terminal dimensions (needed for projection centre)
- *
- * The framebuffer (output[]) and zbuffer[] are allocated flat on the
- * struct — no heap allocation needed for a terminal-sized buffer.
- * Maximum terminal size we support: 512 × 256 = 131072 cells.
- * Larger terminals are clipped gracefully.
+ * Rot — the four trig values we need at every (θ, φ) sample, computed
+ * ONCE per frame in torus_render and passed by value to the helpers.
+ * Avoids 56 000+ redundant sinf/cosf calls per frame.
  */
-#define TORUS_MAX_COLS  512
-#define TORUS_MAX_ROWS  256
-#define TORUS_CELLS     (TORUS_MAX_COLS * TORUS_MAX_ROWS)
+typedef struct { float sinA, cosA, sinB, cosB; } Rot;
 
+static inline V2  v2 (float x, float y)            { return (V2){ x, y };    }
+static inline V3  v3 (float x, float y, float z)   { return (V3){ x, y, z }; }
+
+static inline Rot rot_make(float A, float B)
+{
+    return (Rot){ sinf(A), cosf(A), sinf(B), cosf(B) };
+}
+
+/* ── §5 torus — state + sampling helpers + render + draw ─────────────── */
+
+/*
+ * Torus — owns every mutable scrap of state for the demo.
+ *
+ *   A, B          current Euler rotation angles (radians)
+ *   rot_a, rot_b  rotation speed (rad/sec) — multiplied by dt each tick
+ *   k1_scale      user size multiplier — '=' / '-' adjust this
+ *   paused        if true, torus_tick leaves A, B untouched
+ *   cols, rows    terminal dimensions, resampled on SIGWINCH
+ *   zbuf          1/z of the closest dot in each cell so far
+ *   glyph         ASCII char to draw in each cell  (' ' = empty)
+ *   luma          luma slot 0..LUMI_LEVELS-1 (lookup for the colour
+ *                 pair; saved to avoid re-deriving it from the glyph
+ *                 in torus_draw)
+ *
+ * The three flat buffers are sized for TORUS_MAX_CELLS (the worst
+ * case).  No heap allocation after init.
+ */
 typedef struct {
-    float A, B;             /* current rotation angles                  */
-    float rot_a, rot_b;     /* rotation speed radians/sec               */
-    float k1_scale;         /* size multiplier (1.0 = default)          */
-    bool  paused;
-    int   cols, rows;
-    float zbuf[TORUS_CELLS];
-    char  outbuf[TORUS_CELLS];
+    float   A, B;
+    float   rot_a, rot_b;
+    float   k1_scale;
+    bool    paused;
+    int     cols, rows;
+    float   zbuf [TORUS_MAX_CELLS];
+    char    glyph[TORUS_MAX_CELLS];
+    uint8_t luma [TORUS_MAX_CELLS];
 } Torus;
 
 /*
- * torus_k1() — compute the perspective scaling factor K1.
- *
- * K1 is chosen so the projected torus radius fills ~40% of the smaller
- * terminal dimension, then scaled by k1_scale.  Recalculated whenever
- * the terminal size or scale changes.
- *
- * The formula comes from projecting the outermost point of the torus
- * (at distance R2+R1 from the axis) onto the screen:
- *   screen_radius = K1 * (R2+R1) / (K2 + R2+R1)
- * We want screen_radius ≈ 0.4 * min(cols/2, rows):
- *   K1 = 0.4 * min(cols/2, rows) * (K2 + R2+R1) / (R2+R1)
+ * torus_init — zero the buffers and seed the angles + speeds.
  */
-static float torus_k1(const Torus *t)
-{
-    float half_w = (float)t->cols * 0.5f;
-    float half_h = (float)t->rows;
-    float target = (half_w < half_h ? half_w : half_h) * 0.42f;
-    float k1 = target * (TORUS_K2 + TORUS_R2 + TORUS_R1)
-                       / (TORUS_R2 + TORUS_R1);
-    return k1 * t->k1_scale;
-}
-
 static void torus_init(Torus *t, int cols, int rows)
 {
     memset(t, 0, sizeof *t);
-    t->A        = 0.0f;
-    t->B        = 0.0f;
     t->rot_a    = ROT_A_DEFAULT;
     t->rot_b    = ROT_B_DEFAULT;
     t->k1_scale = 1.0f;
-    t->paused   = false;
     t->cols     = cols;
     t->rows     = rows;
 }
 
 /*
- * torus_tick() — advance rotation by dt_sec seconds.
- *
- * dt_sec is the fixed simulation tick duration; rotation is in
- * radians/sec so the visual speed is frame-rate independent.
+ * torus_resize — terminal grew or shrank; just update cols/rows.  The
+ * static buffers already hold enough room; render() will use the new
+ * dimensions next frame.
  */
-static void torus_tick(Torus *t, float dt_sec)
+static void torus_resize(Torus *t, int cols, int rows)
 {
-    if (t->paused) return;
-    t->A += t->rot_a * dt_sec;
-    t->B += t->rot_b * dt_sec;
+    t->cols = cols;
+    t->rows = rows;
 }
 
 /*
- * torus_render() — rasterise the torus into outbuf[] / zbuf[].
+ * torus_tick — advance the two rotation angles by dt seconds.
+ * Skipped when paused so the frame pipeline still renders the same
+ * stationary donut every frame — useful for inspecting a held pose.
+ */
+static void torus_tick(Torus *t, float dt)
+{
+    if (t->paused) return;
+    t->A += t->rot_a * dt;
+    t->B += t->rot_b * dt;
+}
+
+/*
+ * torus_k1 — perspective scaling factor.
  *
- * This is a direct port of Andy Sloane's original algorithm.
- * Two nested loops parameterise the torus surface by (theta, phi):
- *   theta: angle around the tube cross-section
- *   phi:   angle around the torus axis
+ * We want the projected outer edge of the torus (which sits at
+ * x = R2 + R1 in object space, distance K2 + R2 + R1 from the camera
+ * after the +K2 shift) to land at TARGET_FILL × min(cols/2, rows)
+ * pixels from screen centre.  The 1/z projection then gives:
  *
- * Each point is rotated by A (around X) and B (around Z), projected
- * to 2D with perspective division, and written to the flat buffers if
- * it passes the z-buffer test.
+ *   target_pixels = K1 · (R2 + R1) / (K2 + R2 + R1)
+ * ⇒ K1            = target_pixels · (K2 + R2 + R1) / (R2 + R1)
  *
- * The luminance string maps L→character in order of brightness:
- *   ".,-~:;=!*#$@"
- * Index 0 is dimmest, 11 is brightest.
- * We also split the 12 characters into LUMI_LEVELS=8 color bands so
- * the torus uses both character choice AND color for shading depth.
+ * Multiplied by user-controlled k1_scale.  Recomputed every frame so
+ * a resize updates the size automatically.
+ */
+static float torus_k1(const Torus *t)
+{
+    float half_w   = (float)t->cols * 0.5f;
+    float half_h   = (float)t->rows;
+    float min_half = (half_w < half_h ? half_w : half_h);
+    float target   = min_half * TORUS_TARGET_FILL;
+
+    float k1 = target * (TORUS_K2 + TORUS_R2 + TORUS_R1)
+                      / (TORUS_R2 + TORUS_R1);
+    return k1 * t->k1_scale;
+}
+
+/* ── §5 sampling helpers — five tiny functions, one math step each ──── */
+
+/*
+ * tube_point — point on the torus's TUBE cross-section at angle θ.
+ *
+ *   cx = R2 + R1 · cos θ      ┐ a circle of radius R1 centred at
+ *   cy =      R1 · sin θ      ┘ (R2, 0) before being revolved by φ
+ */
+static V2 tube_point(float costh, float sinth)
+{
+    return v2(TORUS_R2 + TORUS_R1 * costh,
+                         TORUS_R1 * sinth);
+}
+
+/*
+ * surface_point — full 3-D world position for a (θ, φ) sample.
+ *
+ * Conceptually three steps composed:
+ *   1. Take the tube point (cx, cy) at angle θ.
+ *   2. Revolve it around the y-axis by angle φ — this places a 3-D
+ *      point on the un-rotated torus surface.
+ *   3. Rotate that 3-D point by A around the X axis, then by B around
+ *      the Z axis, then translate by +K2 along z.
+ *
+ * The composition of those rotations expanded out gives the explicit
+ * formulas below — same as in Sloane's original donut.c.  See KEY
+ * FORMULAS in the MENTAL MODEL block for the matrix derivation.
+ *
+ * `cosph` / `sinph` are passed in (not computed here) so the caller's
+ * inner φ-loop can compute them once and reuse them for both the
+ * surface point AND the luminance.
+ */
+static V3 surface_point(V2 tube, float cosph, float sinph, Rot r)
+{
+    return v3(
+        tube.x * (r.cosB * cosph + r.sinA * r.sinB * sinph)
+      - tube.y *  r.cosA * r.sinB,
+
+        tube.x * (r.sinB * cosph - r.sinA * r.cosB * sinph)
+      + tube.y *  r.cosA * r.cosB,
+
+        TORUS_K2 + r.cosA * tube.x * sinph + tube.y * r.sinA);
+}
+
+/*
+ * project_to_screen — 1/z perspective projection.
+ *
+ *   ooz = 1 / z              (one-over-z; bigger ooz = closer)
+ *   xp  = cols/2 + K1 · ooz · x
+ *   yp  = rows/2 − K1 · ooz · y · Y_ASPECT     (Y-flip + aspect fix)
+ *
+ * The minus sign on yp is the standard screen-Y-flip (terminal rows
+ * grow downward, world y grows upward).  Y_ASPECT corrects for cells
+ * being roughly twice as tall as wide.
+ *
+ * Returned alongside the integer pixel coords so the caller can:
+ *   - skip out-of-bounds samples cheaply (in_bounds flag)
+ *   - feed ooz directly into the z-buffer compare without recomputing
+ */
+typedef struct { int xp, yp; float ooz; bool in_bounds; } ScreenPos;
+
+static ScreenPos project_to_screen(V3 p, int cols, int rows, float K1)
+{
+    float ooz = 1.0f / p.z;
+    int   xp  = (int)((float)cols * 0.5f + K1 * ooz * p.x);
+    int   yp  = (int)((float)rows * 0.5f - K1 * ooz * p.y * Y_ASPECT);
+    bool  ok  = (xp >= 0 && xp < cols && yp >= 0 && yp < rows);
+    return (ScreenPos){ xp, yp, ooz, ok };
+}
+
+/*
+ * surface_luminance — Lambertian L = N · light_dir, baked into a
+ * closed form by substituting the rotated surface normal and the
+ * fixed light direction (0, 1, −1)/√2 (above and behind the camera).
+ *
+ *   L =  cos φ · cos θ · sin B
+ *      − cos A · cos θ · sin φ
+ *      − sin A · sin θ
+ *      + cos B · (cos A · sin θ − cos θ · sin A · sin φ)
+ *
+ * Range is roughly [-√2, +√2].  Caller skips samples with L ≤ 0
+ * (the surface points away from the light → no contribution).
+ */
+static float surface_luminance(float costh, float sinth,
+                                float cosph, float sinph, Rot r)
+{
+    return cosph * costh * r.sinB
+         - r.cosA * costh * sinph
+         - r.sinA * sinth
+         + r.cosB * (r.cosA * sinth - costh * r.sinA * sinph);
+}
+
+/*
+ * try_emit_pixel — z-buffer test + glyph store.
+ *
+ * Three guards short-circuit:
+ *   1. L ≤ 0          surface faces away from light, contributes nothing
+ *   2. !in_bounds     projected pixel is off-screen
+ *   3. ooz ≤ zbuf     a closer sample already won this cell
+ *
+ * If all three pass, write the glyph + luma slot for the cell.
+ */
+static void try_emit_pixel(Torus *t, ScreenPos sp, float L)
+{
+    if (L <= 0.0f || !sp.in_bounds) return;
+
+    int idx = sp.yp * t->cols + sp.xp;
+    if (sp.ooz <= t->zbuf[idx]) return;     /* lost the depth test */
+
+    int li = (int)(L * (float)LUMI_RAMP_LEN);
+    if (li < 0)                  li = 0;
+    if (li >= LUMI_RAMP_LEN)     li = LUMI_RAMP_LEN - 1;
+
+    t->zbuf [idx] = sp.ooz;
+    t->glyph[idx] = LUMI_RAMP[li];
+    t->luma [idx] = (uint8_t)((li * LUMI_LEVELS) / LUMI_RAMP_LEN);
+}
+
+/*
+ * torus_clear_buffers — zero zbuf (= "infinitely far"), space the
+ * glyph buffer, zero the luma buffer.  One memset each.
+ */
+static void torus_clear_buffers(Torus *t)
+{
+    int n = t->cols * t->rows;
+    memset(t->zbuf,  0,   sizeof(float)   * (size_t)n);
+    memset(t->glyph, ' ', sizeof(char)    * (size_t)n);
+    memset(t->luma,  0,   sizeof(uint8_t) * (size_t)n);
+}
+
+/*
+ * torus_render — the orchestrator.  Reads top-to-bottom as the
+ * algorithm pseudocode itself.  Every line either calls one of the
+ * five sample helpers above or advances the (θ, φ) loop variables.
  */
 static void torus_render(Torus *t)
 {
-    const int   cols = t->cols;
-    const int   rows = t->rows;
-    const int   n    = cols * rows;
-    const float K1   = torus_k1(t);
-    const float K2   = TORUS_K2;
+    torus_clear_buffers(t);
 
-    /* Reset buffers. */
-    memset(t->zbuf,   0,   sizeof(float) * (size_t)n);
-    memset(t->outbuf, ' ', sizeof(char)  * (size_t)n);
+    Rot   r  = rot_make(t->A, t->B);
+    float K1 = torus_k1(t);
 
-    /* Precompute rotation sines/cosines — same for every surface point. */
-    const float sinA = sinf(t->A), cosA = cosf(t->A);
-    const float sinB = sinf(t->B), cosB = cosf(t->B);
+    for (float theta = 0.f; theta < TWO_PI; theta += THETA_STEP) {
+        float costh = cosf(theta), sinth = sinf(theta);
+        V2    tube  = tube_point(costh, sinth);
 
-    static const char k_lumi[] = ".,-~:;=!*#$@";
-    const int         k_lumi_n = (int)(sizeof k_lumi - 1);
+        for (float phi = 0.f; phi < TWO_PI; phi += PHI_STEP) {
+            float cosph = cosf(phi), sinph = sinf(phi);
 
-    for (float theta = 0.0f; theta < 2.0f * (float)M_PI; theta += THETA_STEP) {
-        const float costh = cosf(theta), sinth = sinf(theta);
+            V3        world = surface_point   (tube, cosph, sinph, r);
+            ScreenPos sp    = project_to_screen(world, t->cols, t->rows, K1);
+            float     L     = surface_luminance(costh, sinth, cosph, sinph, r);
 
-        for (float phi = 0.0f; phi < 2.0f * (float)M_PI; phi += PHI_STEP) {
-            const float cosph = cosf(phi), sinph = sinf(phi);
-
-            /*
-             * Surface point on the torus before rotation:
-             *   circle in XZ plane centred at (R2, 0, 0), radius R1.
-             */
-            const float cx = TORUS_R2 + TORUS_R1 * costh;
-            const float cy = TORUS_R1 * sinth;
-
-            /*
-             * Rotate by A around X axis then by B around Z axis.
-             * (Combined rotation matrix from the original.)
-             */
-            const float x = cx * (cosB * cosph + sinA * sinB * sinph)
-                          - cy * cosA * sinB;
-            const float y = cx * (sinB * cosph - sinA * cosB * sinph)
-                          + cy * cosA * cosB;
-            const float z = K2 + cosA * cx * sinph + cy * sinA;
-
-            const float ooz = 1.0f / z;   /* one-over-z for perspective */
-
-            /* Project to screen coordinates. */
-            const int xp = (int)((float)cols * 0.5f + K1 * ooz * x);
-            const int yp = (int)((float)rows * 0.5f - K1 * ooz * y * 0.5f);
-
-            /* Bounds check. */
-            if (xp < 0 || xp >= cols || yp < 0 || yp >= rows) continue;
-
-            const int idx = yp * cols + xp;
-
-            /* Luminance: dot product of surface normal with light vector. */
-            const float L = cosph * costh * sinB
-                          - cosA * costh * sinph
-                          - sinA * sinth
-                          + cosB * (cosA * sinth - costh * sinA * sinph);
-
-            if (L <= 0.0f) continue;   /* back-facing surface — skip   */
-
-            /* Z-buffer test — keep the nearest surface point. */
-            if (ooz <= t->zbuf[idx]) continue;
-            t->zbuf[idx] = ooz;
-
-            /* Map luminance to character and color band. */
-            int li = (int)(L * (float)k_lumi_n);
-            if (li >= k_lumi_n) li = k_lumi_n - 1;
-            t->outbuf[idx] = k_lumi[li];
+            try_emit_pixel(t, sp, L);
         }
     }
 }
 
 /*
- * torus_draw() — write the rendered framebuffer into a WINDOW.
- *
- * We iterate row by row and emit only non-space cells with their
- * luminance color attribute.  Space cells are left as the black
- * background — no mvwaddch for them so we never overdraw with spaces.
- *
- * The y-scaling by 0.5 in torus_render (K1 * ooz * y * 0.5) compensates
- * for the terminal's 2:1 cell aspect ratio so the torus looks round.
+ * torus_draw — walk the rendered buffers and emit each non-empty cell
+ * with its colour pair.  The luma slot is stored alongside the glyph
+ * by try_emit_pixel, so we don't need to back-derive it here.
  */
 static void torus_draw(const Torus *t, WINDOW *w)
 {
-    const int cols = t->cols;
-    const int rows = t->rows;
-    const int n    = cols * rows;
-
-    static const char k_lumi[] = ".,-~:;=!*#$@";
-    const int         k_lumi_n = (int)(sizeof k_lumi - 1);
+    int cols = t->cols, n = t->cols * t->rows;
 
     for (int i = 0; i < n; i++) {
-        const char c = t->outbuf[i];
+        char c = t->glyph[i];
         if (c == ' ') continue;
 
-        int y = i / cols;
-        int x = i % cols;
-        if (x >= cols || y >= rows) continue;
-
-        /* Map character back to luminance index for color selection. */
-        const char *p = strchr(k_lumi, c);
-        int li = p ? (int)(p - k_lumi) : 0;
-        int ci = (li * LUMI_LEVELS) / k_lumi_n;   /* 0..LUMI_LEVELS-1 */
-
-        attr_t attr = lumi_attr(ci);
+        attr_t attr = lumi_attr(t->luma[i]);
         wattron(w, attr);
-        mvwaddch(w, y, x, (chtype)(unsigned char)c);
+        mvwaddch(w, i / cols, i % cols, (chtype)(unsigned char)c);
         wattroff(w, attr);
     }
 }
 
-/* ===================================================================== */
-/* §5  screen                                                             */
-/* ===================================================================== */
+/* ── §6 screen — ncurses init / resize / HUD draw / present ──────────── */
 
-typedef struct {
-    int cols;
-    int rows;
-} Screen;
+typedef struct { int cols, rows; } Screen;
 
 static void screen_init(Screen *s)
 {
     initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
+    noecho(); cbreak(); curs_set(0);
+    nodelay(stdscr, TRUE); keypad(stdscr, TRUE); typeahead(-1);
     color_init();
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_free(Screen *s)  { (void)s; endwin(); }
+static void screen_free  (Screen *s) { (void)s; endwin(); }
 
 static void screen_resize(Screen *s)
 {
-    endwin();
-    refresh();
+    endwin(); refresh();
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
+/*
+ * screen_draw — full frame: torus then HUD overlay.
+ *
+ * HUD layout (CLAUDE.md spec):
+ *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
+ *   row rows-1     PAIR_HINT (cyan   + bold) — key hint
+ */
 static void screen_draw(Screen *s, const Torus *t, double fps)
 {
     erase();
     torus_draw(t, stdscr);
 
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             "%5.1f fps A:%.1f B:%.1f spd:%.1f",
-             fps, t->A, t->B, t->rot_a);
-    int hx = s->cols - HUD_COLS;
-    if (hx < 0) hx = 0;
-    attron(lumi_attr(5) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(lumi_attr(5) | A_BOLD);
+    /* Row 0 — yellow status. */
+    char status[HUD_STATUS_COLS + 1];
+    snprintf(status, sizeof status,
+             " %5.1f fps  spd:%4.2f%s ",
+             fps, (double)t->rot_a,
+             t->paused ? "  PAUSED" : "");
+    int slen = (int)strlen(status); if (slen > s->cols) slen = s->cols;
+
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, s->cols - slen, "%s", status);
+    mvprintw(0, 0, " DONUT ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    /* Bottom row — cyan key hint. */
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  spc:pause  ]/[:speed  +/-:size ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void)
-{
-    wnoutrefresh(stdscr);
-    doupdate();
-}
+static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ===================================================================== */
-/* §6  app                                                                */
-/* ===================================================================== */
+/* ── §7 app — main loop, signals, key handling, cleanup ──────────────── */
 
-/*
- * App — top-level owner of all subsystems.
- *
- * sim_fps controls how many times per second torus_tick() fires.
- * The rotation step per tick is rot_a/rot_b * dt_sec so changing
- * sim_fps does NOT change the visual rotation speed — only smoothness.
- *
- * running and need_resize are sig_atomic_t for safe signal writes.
- */
 typedef struct {
     Torus                 torus;
     Screen                screen;
@@ -578,38 +774,28 @@ typedef struct {
 
 static App g_app;
 
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
+static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void cleanup         (void)    { endwin(); }
 
 static void app_do_resize(App *app)
 {
     screen_resize(&app->screen);
-    app->torus.cols = app->screen.cols;
-    app->torus.rows = app->screen.rows;
+    torus_resize (&app->torus, app->screen.cols, app->screen.rows);
     app->need_resize = 0;
 }
 
 /*
- * app_handle_key() — returns false to quit.
- *
- *   q / ESC    quit
- *   space      pause / resume rotation
- *   ]  [       rotate faster / slower (scales rot_a and rot_b together)
- *   =  +       larger torus
- *   -          smaller torus
+ * app_handle_key — returns false to quit.  Keys are listed in the
+ * file header DEMO + Keys block.
  */
 static bool app_handle_key(App *app, int ch)
 {
     Torus *t = &app->torus;
 
     switch (ch) {
-    case 'q': case 'Q': case 27:
-        return false;
-
-    case ' ':
-        t->paused = !t->paused;
-        break;
+    case 'q': case 'Q': case 27: return false;
+    case ' ':                    t->paused = !t->paused; break;
 
     case ']':
         t->rot_a *= SPEED_SCALE;
@@ -626,17 +812,16 @@ static bool app_handle_key(App *app, int ch)
         break;
 
     case '=': case '+':
-        t->k1_scale *= SIZE_SCALE;
-        if (t->k1_scale > SIZE_MAXX) t->k1_scale = SIZE_MAXX;
+        t->k1_scale *= TORUS_SIZE_SCALE;
+        if (t->k1_scale > TORUS_SIZE_MAX) t->k1_scale = TORUS_SIZE_MAX;
         break;
 
     case '-':
-        t->k1_scale /= SIZE_SCALE;
-        if (t->k1_scale < SIZE_MIN) t->k1_scale = SIZE_MIN;
+        t->k1_scale /= TORUS_SIZE_SCALE;
+        if (t->k1_scale < TORUS_SIZE_MIN) t->k1_scale = TORUS_SIZE_MIN;
         break;
 
-    default:
-        break;
+    default: break;
     }
     return true;
 }
@@ -653,11 +838,9 @@ int main(void)
     app->sim_fps = SIM_FPS_DEFAULT;
 
     screen_init(&app->screen);
-    torus_init(&app->torus, app->screen.cols, app->screen.rows);
+    torus_init (&app->torus, app->screen.cols, app->screen.rows);
 
-    /*
-     * dt loop state — identical to every other program in the framework.
-     */
+    /* dt-loop state — same scaffold as the rest of the project. */
     int64_t frame_time  = clock_ns();
     int64_t sim_accum   = 0;
     int64_t fps_accum   = 0;
@@ -666,7 +849,6 @@ int main(void)
 
     while (app->running) {
 
-        /* ── resize ──────────────────────────────────────────────── */
         if (app->need_resize) {
             app_do_resize(app);
             frame_time = clock_ns();
@@ -679,7 +861,7 @@ int main(void)
         frame_time  = now;
         if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
 
-        /* ── sim accumulator ─────────────────────────────────────── */
+        /* ── fixed-step sim accumulator ──────────────────────────── */
         int64_t tick_ns = TICK_NS(app->sim_fps);
         float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
 
@@ -688,13 +870,11 @@ int main(void)
             torus_tick(&app->torus, dt_sec);
             sim_accum -= tick_ns;
         }
-        float alpha = (float)sim_accum / (float)tick_ns;
-        (void)alpha;
 
-        /* ── render ──────────────────────────────────────────────── */
+        /* ── render into the framebuffer ─────────────────────────── */
         torus_render(&app->torus);
 
-        /* ── HUD counter ─────────────────────────────────────────── */
+        /* ── fps counter (rolling window) ────────────────────────── */
         frame_count++;
         fps_accum += dt;
         if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
@@ -704,12 +884,12 @@ int main(void)
             fps_accum   = 0;
         }
 
-        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+        /* ── frame cap (sleep BEFORE I/O so writes don't drift) ──── */
         int64_t elapsed = clock_ns() - frame_time + dt;
         clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 
         /* ── draw + present ──────────────────────────────────────── */
-        screen_draw(&app->screen, &app->torus, fps_display);
+        screen_draw   (&app->screen, &app->torus, fps_display);
         screen_present();
 
         /* ── input ───────────────────────────────────────────────── */

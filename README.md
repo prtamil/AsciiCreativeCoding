@@ -1,26 +1,80 @@
 # ASCII Creative Coding
 
 ```
- ╔══════════════════════════════════════════════════╗
- ║                                                  ║
- ║          ██╗   ██╗ ████████╗                     ║
- ║          ██║   ██║ ╚══██╔══╝                     ║
- ║          ██║   ██║    ██║                        ║
- ║          ██║   ██║    ██║                        ║
- ║          ╚██████╔╝    ██║                        ║
- ║           ╚═════╝     ╚═╝                        ║
- ║                                                  ║
- ║                useless  terminals                ║
- ║                                                  ║
- ║   the most useful thing in the world is useless  ║
- ║                                                  ║
- ╚══════════════════════════════════════════════════╝
+ ╔══════════════════════════════════════════════════════════════════════╗
+ ║                                                                      ║
+ ║   ██╗   ██╗ ███████╗ ███████╗ ██╗      ███████╗ ███████╗ ███████╗    ║
+ ║   ██║   ██║ ██╔════╝ ██╔════╝ ██║      ██╔════╝ ██╔════╝ ██╔════╝    ║
+ ║   ██║   ██║ ███████╗ █████╗   ██║      █████╗   ███████╗ ███████╗    ║
+ ║   ██║   ██║ ╚════██║ ██╔══╝   ██║      ██╔══╝   ╚════██║ ╚════██║    ║
+ ║   ╚██████╔╝ ███████║ ███████╗ ███████╗ ███████╗ ███████║ ███████║    ║
+ ║    ╚═════╝  ╚══════╝ ╚══════╝ ╚══════╝ ╚══════╝ ╚══════╝ ╚══════╝    ║
+ ║                                                                      ║
+ ║                          useless projects                            ║
+ ║                                                                      ║
+ ║       the most useful thing in the world is being useless            ║
+ ║                                                                      ║
+ ╚══════════════════════════════════════════════════════════════════════╝
 ```
 
-273 programs. Pure C. Zero GUI dependencies. UT — useless terminals.
+273 programs. Pure C. Zero GUI dependencies. Each file complete in itself.
 
 All simulations share a unified architecture and fixed-timestep physics loop.
 Each program can be studied independently or as part of the full simulation framework.
+
+---
+
+## Overview
+
+> *"Everyone knows the use of the useful, but nobody knows the use of the useless."*
+> — Zhuangzi
+
+I work my life for useful things. Mortgages, dependents, deadlines — the steady
+accumulation of competence the world demands of anyone trying to stay afloat.
+That is the survival arithmetic, and I respect it; nothing here is meant as a
+complaint about it.
+
+This project is the other arithmetic.
+
+These programs do not solve a problem. They will not ship. They will not earn
+a thing. They are not on a roadmap and they are not on the road to anywhere.
+I write them so I can live a life that isn't entirely owed — small private
+hours where the only stake is whether a number on the screen matches my idea
+of what beauty looks like. If the useful work is what keeps me alive, this
+useless work is what makes being alive feel honest.
+
+> *"All art is quite useless."*
+> — Oscar Wilde, *The Picture of Dorian Gray*
+
+And here I break all the rules.
+
+In production code the orthodoxy is to factor and to reuse: shared headers,
+common modules, a build system to glue them together, every interface widened
+with edge cases until the abstraction can survive every imagined caller. I
+have spent enough years inside that orthodoxy to know its tax. Every level of
+indirection is another file to open, another contract to hold in the head,
+another accidental coupling waiting to surprise you when an unrelated change
+ripples three folders away. By the time you have absorbed the framework, the
+hour is gone — and so is whatever spark made you open the editor.
+
+So here, deliberately, I do the opposite. **One file is one program.** Each
+program is **specifically designed for the one problem in front of me — no
+more, no less.** No future-proofing. No configurable knobs for cases that
+may never come. No "we might need this someday" hooks that always come due
+as someone else's bug. The duplication is the whole point. The freedom is
+the whole point.
+
+The technical details of how this plays out — the single-file invariants,
+the shared coordinate model, the framework reference programs — are in
+*Design Choices* below. This section is just the **why**.
+
+> *"How we spend our days is, of course, how we spend our lives."*
+> — Annie Dillard, *The Writing Life*
+
+The worldly requirements still wait at the door tomorrow morning. But for
+the hours I spend here, the only thing being optimised is my own attention.
+That, I suspect, is the most useful thing this useless project has to offer
+me — and quietly, I hope, to anyone else who reads a file.
 
 ---
 
@@ -38,8 +92,9 @@ For per-program algorithm notes, see [DEMOS.md](DEMOS.md).
 
 ## Design Choices
 
-> *"All art is quite useless."*
-> — Oscar Wilde, The Picture of Dorian Gray
+> *"Perfection is achieved, not when there is nothing more to add, but
+>  when there is nothing left to take away."*
+> — Antoine de Saint-Exupéry, *Terre des Hommes*
 
 This project is not a library. It is not a framework. It is not a toolkit.
 It is closer to a sketchbook — 257 individual programs, each complete in itself,
@@ -57,12 +112,18 @@ work can take. Many of these programs are trying to earn that kind of
 uselessness.
 
 **Every file is self-contained by intention.**
-There are no shared headers, no common modules, no inter-file dependencies. Code
-duplication is a deliberate trade-off: a repeated 20-line physics loop in every
-file is far better than a shared abstraction that requires understanding six other
-files before you can touch one. When a simulation changes, only one file changes.
-No edge cases bleed across boundaries. No ripple effects. You can delete any file
-and nothing else breaks.
+No shared headers, no common modules, no inter-file dependencies. After
+enough years of jumping between fifteen open tabs to track down where one
+constant is defined, where one helper actually mutates state, where one
+edge case sneaks in from another module — I came to believe the search
+itself is the cost most codebases pretend doesn't exist. Code duplication
+is a deliberate trade-off against that cost: a repeated 20-line physics
+loop in every file is far better than a shared abstraction that requires
+understanding six other files before you can touch one. Each file solves
+one problem and stops; if a second program needs the same loop, it
+contains the same loop, line for line. When a simulation changes, only
+one file changes. No edge cases bleed across boundaries. No ripple
+effects. You can delete any file and nothing else breaks.
 
 **C, with structures and functions only.**
 The whole project is written in plain C — no classes, no inheritance, no

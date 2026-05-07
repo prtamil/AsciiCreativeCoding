@@ -41,10 +41,6 @@
  *                            codebase; the solver here is a 2-D
  *                            axisymmetric specialisation of the same
  *                            algorithm.
- *   raymarcher/cloudscape.c — same Beer–Lambert volumetric integrator,
- *                            different physics: stationary atmosphere
- *                            with sun inscatter rather than a transient
- *                            buoyant column.
  *
  * Section map:
  *   §1 config    — grid dims, fluid params, themes

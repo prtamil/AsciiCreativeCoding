@@ -534,6 +534,179 @@ code problems; they are explanation problems.
 
 ---
 
+# Pedagogical Refactor Recipe
+
+When the user asks for a **"refactor for learnability"**, **"pedagogical
+refactor"**, **"learnability rewrite"**, **"learning-friendly rewrite"**,
+**"rewrite from first principles for learning"**, or any phrase combining
+*refactor / rewrite* with *learn / teach / pedagogy / first principles*,
+apply this recipe to the named file.
+
+**This is NOT a production cleanup.** It is a deep rewrite that turns
+the file into an embedded textbook: prose teaches the algorithm
+step-by-step, and the working code is the worked exercises.
+
+## Mindset
+
+- Clarity over cleverness.
+- Intuition over performance.
+- Explicitness over compactness.
+- Mental models over abstraction layers.
+
+Rebuild from first principles. Don't tidy the existing code —
+reconstruct the implementation as if explaining it to a beginner who
+knows basic C syntax but nothing about the domain. Define the core
+problem, explain why the technique exists, explain the
+mathematical/geometric/system meaning, explain how information flows,
+and build the implementation incrementally like a guided tutorial.
+
+## Output structure (in addition to existing CLAUDE.md standards)
+
+The rewritten file must contain, in order:
+
+1. **File header** (per "File Header (mandatory)" above).
+2. **HOW TO READ THIS FILE** — 15-25 lines explaining reading order,
+   the long-name convention, and what background the reader needs.
+3. **CONCEPTS block** (5 subsections, ≥ 2 references).
+4. **MENTAL MODEL block** (all 6 subheadings, with at least one ASCII
+   diagram).
+5. **GUIDED TUTORIAL** — 6 to 12 numbered mini-tutorials that build the
+   algorithm from first principles. Each tutorial:
+     - opens with a question ("What is X?", "Why does Y happen?")
+     - explains the idea in plain English first
+     - includes an ASCII diagram or a worked example
+     - ends with simplified pseudocode
+   Tutorials should cover, in order: the core problem, the data layout,
+   each per-step transformation, coordinate-system bridges, and the
+   render/sim interface (where both exist).
+6. **§1..§N actual code**, broken into many small sections (≥ 15 for
+   non-trivial files), each ≤ ~100 lines and teaching one concept.
+
+## For every section
+
+Open with an educational preamble: what problem is being solved here,
+why this logic exists, what assumptions are made, what inputs flow in,
+what outputs flow out. The preamble is the reader's running orientation
+— when they get lost, they should re-anchor by reading the section
+header.
+
+## For every function
+
+A comment block above the signature describing:
+
+- **Purpose** (one sentence).
+- **Pseudocode** that mirrors the body 1:1.
+- **Mental model** — analogy or visualisation that makes the
+  operation concrete.
+- **Inputs / outputs / units** — including coordinate systems if
+  relevant (`world space`, `grid index space`, `screen pixels`, etc.).
+- **Why this function exists architecturally** — what would break if
+  it were merged with its caller.
+
+The function body must mirror its pseudocode line-for-line, with a
+short inline comment naming each math/physics concept it represents.
+Length ≤ 30 lines target, ≤ 60 for orchestrators.
+
+## Variable naming
+
+Long descriptive names everywhere. Long names add visual weight but
+turn every line into self-documentation. Examples of the conversion:
+
+| Before              | After                                   |
+|---------------------|-----------------------------------------|
+| `vr`, `vy`          | `velocity_radial`, `velocity_vertical`  |
+| `T`, `rho`          | `temperature`, `density`                |
+| `dt`                | `step_seconds`                          |
+| `T_view`            | `transmittance`                         |
+| `dtau`              | `optical_depth_step`                    |
+| `L`, `L_hot`        | `total_luminance`, `hot_luminance`      |
+| `ro`, `rd`          | `cam.origin`, `direction`               |
+| `p`, `div`          | `pressure`, `divergence`                |
+| `buf1`, `buf2`      | `scratch_a`, `scratch_b`                |
+
+Forbidden: vague names, hidden state, magic numbers (every literal
+goes in §1 with a unit-bearing name), compressed math, premature
+optimisation, overly generic abstractions, expert-only shorthand.
+
+## Inline pedagogy
+
+Where a non-obvious concept appears (geometry, physics intuition,
+rendering pipelines, simulation flow, interpolation, coordinate
+systems, state transitions, numerical approximation, memory layout,
+signal flow), pause and **teach** the concept inline. Don't just name
+it. The reader should never need an external textbook open while
+reading.
+
+## ASCII diagrams
+
+Required wherever a spatial, temporal, or data-flow relationship is
+hard to describe in prose. Common cases:
+
+- Memory layout of a struct.
+- Coordinate transformations and projections.
+- Stencils on a grid (Laplacian, advection backward-trace).
+- Pipeline stages with arrows.
+- Ray paths through a volume.
+- Time-step state transitions.
+- Mesh winding or face orientation.
+- Interpolation weighting (bilinear corners, trilinear cube).
+
+## Educational debug helpers
+
+Add optional debug overlays toggled by `d` / `D`. Each overlay
+visualises one piece of intermediate state and teaches a specific
+mental model. Examples by domain:
+
+- **Fluid sim:** density / temperature / velocity-arrows / pressure /
+  divergence views.
+- **Raymarcher:** depth / normal / step-count / curvature / orbit-trap
+  views.
+- **Fractal:** iteration-count / escape-ratio heatmaps.
+- **Rasteriser:** per-stage intermediate buffers (z-buffer, normal
+  buffer, AO buffer, light buffer).
+- **Cellular automaton:** rule-rate, density, age-since-flip overlays.
+
+The debug helper's source code is itself part of the lesson — a 30-line
+`render_debug_density` function teaches what "density field" means
+more vividly than any prose comment. Document each overlay in the
+section preamble: what it shows, what mental model it builds.
+
+## Stacks on top of existing standards
+
+This recipe **adds to** the existing CLAUDE.md standards, it never
+overrides them. The pedagogical rewrite must still pass:
+
+- The `── §N name ──` divider style.
+- HUD spec (yellow status row 0, cyan hint last row, both `A_BOLD`).
+- ASCII-only rendering at runtime.
+- Theme palette brightness rules.
+- Function-length discipline (≤ 30 typical, ≤ 60 orchestrators).
+- Self-contained file rule (one `.c` file, no shared headers).
+- Compile clean with `gcc -std=c11 -O2 -Wall -Wextra ... -lncurses -lm`,
+  zero warnings.
+
+## Expected outcome
+
+Total file length typically 1.5× to 2× the production version. The
+growth is in comments, tutorials, and debug helpers — never in the
+algorithm itself.
+
+## Acceptance test
+
+Hand the rewritten file to a competent C programmer who has never seen
+the technique. Within ten minutes of top-to-bottom reading they should
+be able to:
+
+- Name the algorithm and the problem it solves.
+- Sketch the data flow on paper.
+- Predict what each function does from its signature alone.
+- Identify which knob in §1 controls which visual effect.
+
+If they can't, the fix is almost always more prose, more diagrams,
+more pseudocode — not more code.
+
+---
+
 # Working on This Project
 
 ## New Simulation Workflow

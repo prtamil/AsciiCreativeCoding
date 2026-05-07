@@ -1374,7 +1374,7 @@ The 8-tier palette walks from the coolest blackbody colour (slot 0, dim red) thr
 
 **Five themes, same code path:** SOLAR / BLUE_GIANT / RED_DWARF / ALIEN / NEGATIVE. Each defines an 8-pair ramp; `theme_apply()` rebinds `PAIR_RAMP_BASE..+7`. NEGATIVE is the inverted variant (white bg, dark fg) following the standard repo recipe — `init_pair` uses `bg = 231`, `A_BOLD/A_DIM` disabled in the pixel mapper.
 
-*Files: `raymarcher/sun_solar.c`*
+*Files: `raster/sun_solar.c`*
 
 ---
 
@@ -1405,7 +1405,7 @@ pair     = PAIR_RAMP_BASE + slot_hot
 
 **Glyph slot 0 is `.` not space:** late-stage residual smoke (low `L`, low hot fraction) maps to the dimmest visible glyph rather than vanishing into background — the cloud has a long-tail dispersion phase that's actually rendered, not silently dropped. `A_DIM` on slots 0-1 gives the ghost-of-mushroom look.
 
-*Files: `raymarcher/nuke.c`*
+*Files: `fluid/nuke.c`*
 
 ---
 

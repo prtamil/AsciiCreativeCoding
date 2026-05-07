@@ -26,13 +26,17 @@
  *         SUNSET    warm umber + amber into pale gold
  *
  * Study alongside:
- *   procedural/perlin_landscape.c — same fBm field; rendered as a
- *                                STATIC map.  voxel_terrain.c is
+ *   procedural/worldgen/perlin_landscape.c — same fBm field, rendered
+ *                                as a STATIC map.  voxel_terrain.c is
  *                                that same data with sun-shaded relief
- *                                and panning camera.
- *   particle_systems/snow.c       — completely different demo, but
- *                                shares the "render the same data
- *                                from different camera" idea.
+ *                                and a panning camera.  Direct sibling.
+ *   procedural/worldgen/terrain.c, hydraulic.c, tectonic.c — other
+ *                                heightmap-generation viewers in this
+ *                                same folder; different generation
+ *                                rules, similar visualisation pipeline.
+ *   particle_systems/snow.c    — completely different demo, but shares
+ *                                the "render the same data from a
+ *                                different camera" idea.
  *
  * Section map:
  *   §1 config    — constants, themes
@@ -59,7 +63,7 @@
  *   ] / [        sim Hz up / down
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra raymarcher/voxel_terrain.c \
+ *   gcc -std=c11 -O2 -Wall -Wextra procedural/worldgen/voxel_terrain.c \
  *       -o voxel_terrain -lncurses -lm
  */
 

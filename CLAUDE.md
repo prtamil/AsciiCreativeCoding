@@ -4,6 +4,128 @@ Behavioral guidelines to reduce common LLM coding mistakes.
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+## Modes of Operation
+
+This file describes THREE operating modes.  Different rules apply to each;
+when rules appear to contradict, the contradiction is resolved by which
+mode is active.
+
+| Mode | Trigger | Goal | Latitude |
+|------|---------|------|----------|
+| **Surgical edit** | bug fix, single feature, "change X to Y" | minimum diff that solves the request | rules in §3 *Surgical Changes* dominate; do **not** restructure or relabel beyond the request |
+| **New file** | "write a new simulation", "add a demo for X" | a complete teaching artefact in one file | rules in *Learner-Friendly Code Standards / Structure* dominate; targets in *New Simulation Workflow* apply (250-450 lines) |
+| **Pedagogical refactor** | trigger phrases listed in *Pedagogical Refactor Recipe* | turn an existing file into an embedded textbook | rules in the *Pedagogical Refactor Recipe* dominate; deliberately overrides "match existing style" and the 250-450-line target (1.5×-2× growth is expected) |
+
+When in doubt about which mode applies, name it explicitly before
+acting: *"This is a Surgical edit, so I'll only touch X."* / *"This is a
+Pedagogical refactor, so I'll rewrite the whole file from first
+principles."*
+
+## Three-Phase Workflow
+
+The natural lifecycle of a file in this codebase is a three-phase
+loop.  Each phase activates a different mode (above) and a different
+set of rules.  Knowing which phase you are in resolves most "what
+should I do here?" questions.
+
+### Phase 1 — Author (new code request)
+
+**Trigger:** *"write a new X"*, *"add a demo for Y"*, *"create a
+sphere-traced Z"*.  Anything that asks for a NEW file.
+
+**Goal:** a working production version, validated by clean compile
+and visual inspection.  Target 250-450 lines.
+
+**Produce:**
+
+- File header (DEMO + Section map + Keys + Build).
+- CONCEPTS block — short paragraph per subsection, 2 references.
+- MENTAL MODEL block — short paragraph per subheading, ≥ 1 ASCII diagram.
+- §1..§N code following the *framework.c* template.
+- HUD (yellow status row 0, cyan hint last row, both `A_BOLD`).
+- Themes only if the user asks for them.
+
+**Do NOT produce in phase 1:**
+
+- No HOW TO READ THIS FILE block.
+- No GUIDED TUTORIAL block.
+- No debug overlays unless the user asks.
+- No long-name expansion (write `vr` for now, not `velocity_radial`).
+- No per-function teaching blocks beyond a one-line *what + why*.
+
+The aim is FAST.  Ship a clean, working, framework-conformant file.
+Pedagogy is phase 3's job, after the algorithm has been validated.
+
+### Phase 2 — Iterate (execute → observe → fix)
+
+**Trigger:** implicit — the file exists, the user is running it.
+
+**Goal:** validated visual behaviour.  The user runs the program,
+reports what they SEE, and we converge via surgical edits.
+
+**What I do:**
+
+- Diagnose visual symptoms (*"top half flickers, bottom half doesn't"*):
+  trace the rendering pipeline, identify cause, propose minimum-diff fix.
+- Make surgical edits per the rules in *§3 Surgical Changes*.
+- One concern per turn.
+
+**Do NOT do in phase 2:**
+
+- No restructuring beyond the immediate request.
+- No "while we're here, let me also…".
+- No pedagogy upgrades — phase 3 hasn't started yet.
+
+**End of phase 2** = explicit user approval (*"looks good"* / *"ship
+it"* / *"perfect"*).  After approval the file is **validated**: the
+algorithm produces what the user wanted to see.
+
+### Phase 3 — Refactor for learnability (refactor request)
+
+**Trigger:** any phrase from *Pedagogical Refactor Recipe*.
+
+**Goal:** convert the validated production file into an embedded
+textbook.  Expected file growth 1.5×-2×.
+
+**Add (on top of the phase-1 file):**
+
+- HOW TO READ THIS FILE block (15-25 lines).
+- GUIDED TUTORIAL block (6-12 mini-tutorials with diagrams +
+  pseudocode).
+- Per-function teaching block (purpose / pseudocode / mental model /
+  inputs+outputs+units / why-it-exists).
+- Debug overlays (`d` / `D` cycles them).
+- Long-name expansion across the file (per the recipe's variable-name
+  table).
+- Inline pedagogy where non-obvious concepts appear.
+
+The pedagogical pass works **because** phase 2 has validated the
+algorithm.  Without phase 2, the tutorials risk teaching something
+incorrect.
+
+### Orthogonal track: surgical edits to an existing file
+
+**Trigger:** bug fix, theme addition, dead-code removal, *"remove
+X"*, *"add themes to Y"*.
+
+**Goal:** minimum diff that solves the request.  Surgical edits do
+NOT move a file between phases — a phase-3 textbook file can still
+take a phase-2-style surgical edit (e.g. a bug fix) without losing
+its textbook status.
+
+### When the workflow gets violated
+
+- If **phase 2 hasn't ended** (no approval) and the user asks for
+  phase 3: ask whether the algorithm is validated first.  Pedagogy
+  on a buggy algorithm wastes effort.
+- If the user asks for *"phase 1 with phase 3 quality"* (full
+  textbook in the first pass): warn that the textbook may need
+  rewriting after phase 2 finds bugs, and offer to do a minimal
+  phase 1 first.
+- If a file has never been validated by the user (e.g. an old file
+  the user wrote alone), treat it as still phase-2-pending: ask
+  whether the algorithm is correct before refactoring.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
@@ -89,8 +211,12 @@ Every file opens with a block comment in this exact structure:
  *   §1 config   — all tunable constants
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — ncurses color pair setup
- *   §4 coords   — pixel↔cell conversion  (omit if cell-space sim)
- *   §5 <entity> — simulation state + tick logic
+ *   §4 helpers  — small math helpers — coords (pixel↔cell), vec3 /
+ *                 Mat4 for 3-D, Spherical for fractals, etc.  Pick
+ *                 whatever the renderer needs.  Omit entirely for
+ *                 cell-space sims that don't need any helper math.
+ *   §5 <entity> — simulation state + tick logic (rename to the
+ *                 actual entity: §5 fluid, §5 boids, §5 torus, etc.)
  *   §6 scene    — entity pool, scene_tick, scene_draw
  *   §7 screen   — ncurses display layer
  *   §8 app      — signals, resize, main loop
@@ -120,14 +246,15 @@ Immediately after the file header, add a `/* ── CONCEPTS ── */` block:
  * Performance    : <What makes it fast enough for real-time? Fixed-step,
  *                   spatial hash, precompute, etc.>
  *
- * References     : <2-5 links or citations — Wikipedia, papers, books.
+ * References     : <2 minimum, 5 maximum — Wikipedia, papers, books.
  *                   A learner reading this file should know where to go
  *                   next to understand the math more deeply.>
  *
  * ─────────────────────────────────────────────────────────────────────── */
 ```
 
-References are not optional. Every CONCEPTS block must have at least two.
+References are mandatory: **minimum 2, maximum 5** per file.  Pick the
+ones a learner would actually open next; quality beats quantity.
 Examples of good references:
 - Wikipedia article on the algorithm
 - Original paper (Reynolds 1987 for boids, Stam 1999 for stable fluids, etc.)
@@ -219,6 +346,22 @@ Group related constants together with a comment explaining the context:
 #define SEPARATION_RADIUS   40.0f   /* pixels */
 #define SEPARATION_FORCE   180.0f   /* pixels/sec² */
 ```
+
+**What is NOT a magic number** (do not bother extracting these):
+
+- `0`, `1`, `−1`, `2`            mathematical identity / unit values.
+- `0.5f`                         halving (e.g. centring `(a+b)*0.5f`,
+                                 a midpoint computation).
+- `2.0f * M_PI`                  the constant 2π, when used inline
+                                 (extracting to `TWO_PI` is fine but
+                                 not required).
+- Loop bounds that come from a struct field: `for (i = 0; i < n; i++)`.
+- Index arithmetic: `i + 1`, `j - 1`, etc.
+- Array dimensions when the array's name already encodes the size:
+  `LUMI_GLYPHS[8]` does not need an `LUMI_GLYPHS_LEN = 8` constant.
+
+Everything else with a meaning beyond the literal value belongs in
+§1 with a unit-bearing name.  When unsure, extract.
 
 ## Function Comments — WHY, not WHAT
 
@@ -605,7 +748,8 @@ A comment block above the signature describing:
 
 The function body must mirror its pseudocode line-for-line, with a
 short inline comment naming each math/physics concept it represents.
-Length ≤ 30 lines target, ≤ 60 for orchestrators.
+Length follows the canonical *Function length discipline* rule (≤ 30
+target, ≤ 60 for orchestrators).
 
 ## Variable naming
 
@@ -680,7 +824,7 @@ overrides them. The pedagogical rewrite must still pass:
 - HUD spec (yellow status row 0, cyan hint last row, both `A_BOLD`).
 - ASCII-only rendering at runtime.
 - Theme palette brightness rules.
-- Function-length discipline (≤ 30 typical, ≤ 60 orchestrators).
+- *Function length discipline* (canonical rule above).
 - Self-contained file rule (one `.c` file, no shared headers).
 - Compile clean with `gcc -std=c11 -O2 -Wall -Wextra ... -lncurses -lm`,
   zero warnings.
@@ -723,7 +867,16 @@ When asked to write a new simulation, clarify these before writing any code:
 | fire, sand, reaction-diffusion, flowfield, matrix_rain | bounce_ball, lorenz, nbody, cloth, boids |
 | Position stored as `int row, col` | Position stored as `float px, py` in pixel units |
 
-**Step 3 — Estimate scope.** A typical file is 250–450 lines. State if it will be longer and why. If it approaches 600+, the §5 physics is probably doing too much — split into sub-functions.
+**Step 3 — Estimate scope.** A typical *new-file* (Surgical edit / new
+demo) sits at 250-450 lines. State if it will be longer and why. If it
+approaches 600+, the §5 physics is probably doing too much — split
+into sub-functions.
+
+> **Note (Pedagogical refactor mode):** the 250-450 target does NOT
+> apply to pedagogical refactors.  The Pedagogical Refactor Recipe
+> deliberately grows the file 1.5×-2× via tutorials, diagrams, and
+> debug helpers — that growth is in comments and pedagogy, not in the
+> algorithm.  See *Modes of Operation* at the top of this file.
 
 **Step 4 — Write in this order:** §1 config → §5 entity/physics → §6 scene → §3 color → §7 screen → §8 app. Config first forces all magic numbers to be named before any logic is written.
 
@@ -940,16 +1093,6 @@ Most files need `-lm`. A few cell-space sims (sandpile, hex_grid, bsp_tree, quad
 - `typeahead(-1)` prevents input from interrupting diff write
 - `erase()` not `clear()` — avoids full-screen retransmit every frame
 
-### Section Layout (every animation file)
-- `§1 config` — all `#define` / enum constants, `TICK_NS`, `CELL_W/H`
-- `§2 clock` — `clock_ns()` + `clock_sleep_ns()` (`CLOCK_MONOTONIC`)
-- `§3 color` — `color_init()`, 256-color with 8-color fallback
-- `§4 coords` — `pw/ph/px_to_cell_x/y` (omitted in cell-space sims)
-- `§5 physics` — simulation struct + tick (no ncurses here)
-- `§6 scene` — owns physics objects; `scene_tick` + `scene_draw(alpha)`
-- `§7 screen` — `screen_init/draw/present/resize`
-- `§8 app` — `App` struct, signal flags, main loop
-
 ### Signal Handling
 - `SIGINT/SIGTERM` → `running = 0`; `SIGWINCH` → `need_resize = 1`
 - All signal-written flags are `volatile sig_atomic_t`
@@ -972,13 +1115,19 @@ tessellate → scene_tick (MVP) → pipeline_draw_mesh → fb_blit
 
 ---
 
-## Coding Conventions
-- Comments explain **why** — non-obvious physics, rounding choices, workarounds only
-- Every tunable constant in `§1 config` as `#define` or enum
-- No dynamic allocation after init (except initial `malloc` in tessellate/flowfield/sand)
-- `(chtype)(unsigned char)ch` double cast on every `mvaddch` — prevents sign-extension corruption
-- `sig_atomic_t` for all signal-written flags
-- C11, `-Wall -Wextra` clean
+## Memory Allocation
+
+No dynamic allocation after init.  Allocate everything you need in
+the init phase (or place it in BSS via static / global storage); the
+hot path must not call `malloc` / `free`.  A few exceptions exist
+where the cost of pre-sizing for the worst case would be silly
+(`tessellate`, `flowfield`, `sand` — initial mesh / particle pool
+allocations); document those at the call site.
+
+The other rules that used to live in this section are stated
+elsewhere — see *Function Comments — WHY, not WHAT*, *Named
+Constants*, *Common ncurses Bugs*, *Signal Handling*, and
+*Verification*.
 
 ---
 

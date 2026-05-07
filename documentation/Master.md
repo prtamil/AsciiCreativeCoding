@@ -2689,11 +2689,11 @@ Smooth versions blend the boundary instead of butting:
 
 `raymarcher/mandelbulb.c` is the canonical example here: power = 8, ~8 iterations per DE evaluation, central-difference normals, Christensen-style soft shadow ray, step-count AO for crevices. `raymarcher/kifs_fractal.c` is the angular-fold cousin (3 plane folds + scale-toward-fixed-point).
 
-**Worth knowing: 2-D screen-space alternatives.** Not everything needs sphere tracing. A sun viewed face-on is the same disc-with-corona regardless of camera angle, so `raymarcher/sun_solar.c` skips raymarching entirely and classifies pixels by 2-D radial distance — about 30× cheaper per pixel. Choose the technique that matches the visual: SDF when 3-D geometry actually rotates and occludes, screen-space when the silhouette is invariant.
+**Worth knowing: 2-D screen-space alternatives.** Not everything needs sphere tracing. A sun viewed face-on is the same disc-with-corona regardless of camera angle, so `raster/sun_solar.c` skips raymarching entirely and classifies pixels by 2-D radial distance — about 30× cheaper per pixel. Choose the technique that matches the visual: SDF when 3-D geometry actually rotates and occludes, screen-space when the silhouette is invariant.
 
 **Limb darkening** (Eddington 1-coefficient law, ref: en.wikipedia.org/wiki/Limb_darkening) accounts for the cooler-looking edge of a star: `I(μ) = I_centre · (0.80 + 0.20·μ)`. In a 3-D SDF context, `μ = |N · V|` (angle from normal); in a 2-D screen-space context, `μ = √(1 − (r/R)²)` (derived directly from screen radius — same value, no normal needed). A real photometric law is a polynomial in μ; `u₁ = 0.20` matches the visible-light limb of the Sun closely.
 
-*Files: `raymarcher/mandelbulb.c`, `raymarcher/kifs_fractal.c`, `raymarcher/sdf_gallery.c` (SDF composition); `raymarcher/sun_solar.c` (limb darkening, 2-D screen-space alternative)*
+*Files: `raymarcher/mandelbulb.c`, `raymarcher/kifs_fractal.c`, `raymarcher/sdf_gallery.c` (SDF composition); `raster/sun_solar.c` (limb darkening, 2-D screen-space alternative)*
 
 ---
 
@@ -2728,9 +2728,9 @@ Front-to-back (rather than back-to-front) lets you bail when `T` drops below the
 
 **Hot-fraction colour indexing** — the renderer accumulates two scalars per pixel: total `L` (luminance, weighted by density and emission) and `L_hot` (luminance from cells whose temperature exceeds ambient). The ratio `L_hot / L` indexes a single 8-tier smoke→fire palette per theme. No threshold, no per-pair tuning; bright cloud edges with hot gas behind them naturally get the silver-lining colour at slot 5-6.
 
-`raymarcher/nuke.c` puts these together: one Beer–Lambert volume integrator, a 2-D axisymmetric Stam stable-fluids solver feeding density and temperature into that integrator, hot-fraction colour palettes, and 5 blast presets that vary only the Gaussian initial condition.
+`fluid/nuke.c` puts these together: one Beer–Lambert volume integrator, a 2-D axisymmetric Stam stable-fluids solver feeding density and temperature into that integrator, hot-fraction colour palettes, and 5 blast presets that vary only the Gaussian initial condition.
 
-*Files: `raymarcher/nuke.c`*
+*Files: `fluid/nuke.c`*
 
 *References: Stam 1999 "Stable Fluids" SIGGRAPH; Foster & Metaxas 1997 "Modeling the motion of a hot, turbulent gas" SIGGRAPH; Bridson "Fluid Simulation for Computer Graphics" 2e ch. 3 + 5.*
 

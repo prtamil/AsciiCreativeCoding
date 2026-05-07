@@ -160,8 +160,8 @@ Reference implementation: `basics/bounce_ball.c`
 120. [STFT Spectrogram — physics/spectrogram_visualizer.c](#120-stft-spectrogram--physicsspectrogram_visualizerc)
 121. [Deferred Rendering Pipeline — raster/deferred_rendering_pipeline.c](#121-deferred-rendering-pipeline--rasterdeferred_rendering_pipelinec)
 122. [2-D Shockwave Detonation — physics/nuke.c](#122-2-d-shockwave-detonation--physicsnukec)
-123. [Animated Solar Simulation — raymarcher/sun_solar.c](#123-animated-solar-simulation--raymarchersun_solarc)
-124. [Volumetric Mushroom Cloud — raymarcher/nuke.c](#124-volumetric-mushroom-cloud--raymarchernukec)
+123. [Animated Solar Simulation — raster/sun_solar.c](#123-animated-solar-simulation--rastersun_solarc)
+124. [Volumetric Mushroom Cloud — fluid/nuke.c](#124-volumetric-mushroom-cloud--fluidnukec)
 125. [Swarm Digit Generator — flocking/swarm_gen_numbers.c](#125-swarm-digit-generator--flockingswarm_gen_numbersc)
 126. [Two-Faction Battle Simulator — flocking/war.c](#126-two-faction-battle-simulator--flockingwarc)
 127. [Crowd Behaviour Simulator — flocking/crowd.c](#127-crowd-behaviour-simulator--flockingcrowdc)
@@ -4605,7 +4605,7 @@ Combined, a ring 30 cells out has ~40% of its initial peak under default constan
 
 ---
 
-## 123. Animated Solar Simulation — raymarcher/sun_solar.c
+## 123. Animated Solar Simulation — raster/sun_solar.c
 
 A face-on sun rendered in pure 2-D screen space — no SDF, no raymarch, no 3-D.  A sun viewed from outside is *always* face-on; the depth axis adds zero visual information, so we drop it and recover ~50 % of the per-pixel cost compared to a sphere-traced version.
 
@@ -4662,11 +4662,11 @@ Peaks at `tau = 0.5`, zero at the endpoints. Combined with `arc_amp = sin(π·s)
 
 *References: Eddington 1926 *Internal Constitution of the Stars*; Nordlund & Stein 2009 *Living Rev. Solar Phys.* 6 (granulation physics); Quílez "Domain Warping" (the noise self-warp giving granules their swirly texture).*
 
-*Files: `raymarcher/sun_solar.c`*
+*Files: `raster/sun_solar.c`*
 
 ---
 
-## 124. Volumetric Mushroom Cloud — raymarcher/nuke.c
+## 124. Volumetric Mushroom Cloud — fluid/nuke.c
 
 A nuclear blast as **actual fluid dynamics**, not as scripted animation. The cap, the toroidal vortex roll, the plateau, and the fall are all EMERGENT properties of solving Boussinesq Navier-Stokes on a 2-D axisymmetric grid. There is no phase enum, no `T_RISE_BEG`, no `smoothstep(t_beg, t_end, time)` driving geometry. The only scripted moment is the Gaussian initial condition at t=0.
 
@@ -4737,7 +4737,7 @@ The fluid solver is **identical across types** — same buoyancy, same cooling, 
 
 **Time loop:** real-time `dt_real` is multiplied by the user's time-scale to give `dt_sim`, accumulated, and run as fixed-`SIM_DT` steps. Pause freezes accumulation. Time-scale clamps at 6× because semi-Lagrangian sampling starts to lose accuracy past 4× the natural CFL.
 
-*Files: `raymarcher/nuke.c`*
+*Files: `fluid/nuke.c`*
 
 *References: Stam 1999 "Stable Fluids" SIGGRAPH; Stam 2003 GDC "Real-Time Fluid Dynamics for Games"; Foster & Metaxas 1997 "Modeling the motion of a hot, turbulent gas" SIGGRAPH; Bridson "Fluid Simulation for Computer Graphics" 2e ch. 3 + 5.*
 

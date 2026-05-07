@@ -19,10 +19,12 @@
  *   Tab       cycle shapes  (cube → sphere → pyramid → torus → …)
  *   space     pause / resume
  *   ]  [      spin faster / slower
- *   =  -      zoom in / out
+ *   z / Z     zoom in / out
+ *   t / T     next / previous colour theme
+ *               (CLASSIC / AMBER / MATRIX / NEON / ICE / COPPER)
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra wireframe.c -o wireframe -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra raster/wireframe.c -o wireframe -lncurses -lm
  *
  * Sections
  * --------
@@ -207,6 +209,7 @@ enum {
 #define ROT_MIN      0.01f
 #define ROT_MAX      8.0f
 
+#define ZOOM_DEFAULT 1.0f
 #define ZOOM_STEP    1.15f
 #define ZOOM_MIN     0.4f
 #define ZOOM_MAX     3.5f
@@ -246,30 +249,83 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  color  — themes (4 shape pairs) + HUD/hint pairs                   */
 /* ===================================================================== */
 
+/*
+ * Each shape gets one ncurses color pair (1..4).  A theme provides
+ * those 4 colours; theme_apply re-inits the pairs.  HUD + HINT pairs
+ * (5, 6) are theme-INDEPENDENT — yellow + cyan, both used with
+ * A_BOLD per the CLAUDE.md HUD spec.
+ *
+ * 8-color fallback uses the original four basic-8 hues regardless
+ * of theme (basic-8 has nowhere near the variety needed for themes).
+ */
 typedef enum {
     COL_CUBE    = 1,
     COL_SPHERE  = 2,
     COL_PYRAMID = 3,
     COL_TORUS   = 4,
+    PAIR_HUD    = 5,
+    PAIR_HINT   = 6,
 } ShapeColor;
 
-static void color_init(void)
+#define THEME_COUNT 6
+
+typedef struct {
+    const char *display_name;
+    /* one 256-colour code per shape: cube, sphere, pyramid, torus */
+    short       shape_256[4];
+} Theme;
+
+static const Theme THEMES[THEME_COUNT] = {
+    /* CLASSIC — original four hues (cyan / green / yellow / magenta). */
+    { "CLASSIC ", {  51,  46, 226, 201 } },
+    /* AMBER   — warm phosphor monitor: bronze → gold → orange → amber. */
+    { "AMBER   ", { 130, 178, 208, 220 } },
+    /* MATRIX  — green data-stream: moss → emerald → lime → highlight. */
+    { "MATRIX  ", {  28,  46,  82, 154 } },
+    /* NEON    — synthwave magenta/pink ramp. */
+    { "NEON    ", { 165, 201, 207, 213 } },
+    /* ICE     — blues from teal → cyan → sky. */
+    { "ICE     ", {  39,  51,  87, 159 } },
+    /* COPPER  — bronze → copper-orange → gold. */
+    { "COPPER  ", { 130, 166, 208, 214 } },
+};
+
+static void theme_apply(int theme_index)
 {
-    start_color();
+    if (theme_index < 0 || theme_index >= THEME_COUNT) theme_index = 0;
+    const Theme *t = &THEMES[theme_index];
+
     if (COLORS >= 256) {
-        init_pair(COL_CUBE,     51,  COLOR_BLACK);
-        init_pair(COL_SPHERE,   46,  COLOR_BLACK);
-        init_pair(COL_PYRAMID,  226, COLOR_BLACK);
-        init_pair(COL_TORUS,    201, COLOR_BLACK);
+        init_pair(COL_CUBE,    t->shape_256[0], COLOR_BLACK);
+        init_pair(COL_SPHERE,  t->shape_256[1], COLOR_BLACK);
+        init_pair(COL_PYRAMID, t->shape_256[2], COLOR_BLACK);
+        init_pair(COL_TORUS,   t->shape_256[3], COLOR_BLACK);
     } else {
+        /* 8-colour fallback — basic hues, theme-independent. */
         init_pair(COL_CUBE,    COLOR_CYAN,    COLOR_BLACK);
         init_pair(COL_SPHERE,  COLOR_GREEN,   COLOR_BLACK);
         init_pair(COL_PYRAMID, COLOR_YELLOW,  COLOR_BLACK);
         init_pair(COL_TORUS,   COLOR_MAGENTA, COLOR_BLACK);
     }
+}
+
+static void color_init(void)
+{
+    start_color();
+    use_default_colors();
+
+    if (COLORS >= 256) {
+        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
+        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
+    } else {
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
+    }
+
+    theme_apply(0);                      /* default to CLASSIC */
 }
 
 /* ===================================================================== */
@@ -594,7 +650,8 @@ typedef struct {
     int    active;
     float  rx, ry;
     float  rot_x, rot_y;
-    float  zoom;
+    float  zoom;            /* fov-based zoom (z/Z keys)                */
+    int    theme_index;     /* index into THEMES[] (t/T keys)           */
     bool   paused;
 } Scene;
 
@@ -606,13 +663,14 @@ static void scene_init(Scene *s, int cols, int rows)
     shape_build_pyramid (&s->shapes[2]);
     shape_build_torus   (&s->shapes[3]);
 
-    s->active = 0;
-    s->rx     = 0.4f;
-    s->ry     = 0.6f;
-    s->rot_x  = ROT_X_DEF;
-    s->rot_y  = ROT_Y_DEF;
-    s->zoom   = 1.0f;
-    s->paused = false;
+    s->active      = 0;
+    s->rx          = 0.4f;
+    s->ry          = 0.6f;
+    s->rot_x       = ROT_X_DEF;
+    s->rot_y       = ROT_Y_DEF;
+    s->zoom        = ZOOM_DEFAULT;
+    s->theme_index = 0;                       /* CLASSIC */
+    s->paused      = false;
 
     canvas_alloc(&s->canvas, cols, rows);
 }
@@ -723,17 +781,25 @@ static void screen_draw(Screen *s, const Scene *sc, double fps)
     erase();
     scene_draw(sc);
 
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             "%5.1f fps  %-7s  spd:%.1f  zoom:%.1f",
-             fps, k_names[sc->active], sc->rot_y, sc->zoom);
+    /* Top row — yellow status (right-aligned) + title (left). */
+    char status[160];
+    snprintf(status, sizeof status,
+             " %5.1f fps  %-7s  spd:%.2f  zoom:%.2f  theme:%s  %s ",
+             fps, k_names[sc->active], sc->rot_y, sc->zoom,
+             THEMES[sc->theme_index].display_name,
+             sc->paused ? "PAUSED" : "running");
+    int slen = (int)strlen(status); if (slen > s->cols) slen = s->cols;
 
-    ShapeColor col = sc->shapes[sc->active].color;
-    int hud_x = s->cols - HUD_COLS;
-    if (hud_x < 0) hud_x = 0;
-    attron(COLOR_PAIR(col) | A_BOLD);
-    mvprintw(0, hud_x, "%s", buf);
-    attroff(COLOR_PAIR(col) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, s->cols - slen, "%s", status);
+    mvprintw(0, 0, " WIREFRAME ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    /* Bottom row — cyan key hint. */
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  spc:pause  Tab:shape  ]/[:spin  z/Z:zoom  t/T:theme ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void)
@@ -794,13 +860,24 @@ static bool app_handle_key(App *app, int ch)
         if (s->rot_y < ROT_MIN) s->rot_y = ROT_MIN;
         break;
 
-    case '=': case '+':
+    case 'z':
+        /* zoom IN — bigger fov_px, shape fills more of the screen */
         s->zoom *= ZOOM_STEP;
         if (s->zoom > ZOOM_MAX) s->zoom = ZOOM_MAX;
         break;
-    case '-':
+    case 'Z':
+        /* zoom OUT — smaller fov_px, shape shrinks */
         s->zoom /= ZOOM_STEP;
         if (s->zoom < ZOOM_MIN) s->zoom = ZOOM_MIN;
+        break;
+
+    case 't':
+        s->theme_index = (s->theme_index + 1) % THEME_COUNT;
+        theme_apply(s->theme_index);
+        break;
+    case 'T':
+        s->theme_index = (s->theme_index + THEME_COUNT - 1) % THEME_COUNT;
+        theme_apply(s->theme_index);
         break;
 
     default: break;

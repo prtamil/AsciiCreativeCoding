@@ -2173,8 +2173,8 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### raymarcher/donut.c
-*Parametric torus — no mesh, no SDF, no intermediate framebuffer.*
+### raster/donut.c
+*Parametric torus — point-cloud rasteriser; no mesh, no SDF, no intermediate framebuffer.*
 
 **No intermediate framebuffer** — each computed screen point calls `mvaddch` directly inside the render loop. Simplest possible 3D render path. Works because each parametric `(θ,φ)` point maps to a unique screen cell.
 
@@ -2186,7 +2186,7 @@ char ch = k_boid_chars[flock_id][octant];
 
 ---
 
-### raymarcher/wireframe.c
+### raster/wireframe.c
 *Wireframe cube — Bresenham projected edges, slope characters, monochrome.*
 
 **Bresenham projected edges** — project 8 cube vertices to screen; connect 12 edges with Bresenham. Character at each step selected by slope direction (→ V4.8).
@@ -2545,7 +2545,7 @@ if (t < floor) return 0;   /* invisible */
 
 ---
 
-### raymarcher/sun_solar.c
+### raster/sun_solar.c
 *Face-on 2-D screen-space sun — disc + corona + arc flares. No raymarch.*
 
 **Radial classifier per pixel** — `r = √(dx² + (dy·CELL_ASPECT)²)`; three regions:
@@ -2574,7 +2574,7 @@ P(s) = (1−s)·A + s·B  +  4s(1−s) · (apex − chord_midpoint)
 
 ---
 
-### raymarcher/nuke.c
+### fluid/nuke.c
 *Volumetric mushroom cloud — proper 2-D axisymmetric Stam stable fluids, no scripted timeline.*
 
 **Boussinesq Navier-Stokes on (r, y) grid** — single force coupling: `vy += BUOYANCY·(T−T₀)·dt`. Hot cells push UP. Hodge projection (40 Jacobi iters of `∇²p = ∇·v`, then `v ← v − ∇p`) enforces incompressibility and is what DEFLECTS the rising column's leading edge sideways into a vortex ring. The cap is the SOLUTION, not a drawn shape.

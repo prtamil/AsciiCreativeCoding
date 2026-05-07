@@ -1,317 +1,481 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * kifs_fractal.c — Kaleidoscopic IFS (Knighty's folding fractal)
+ * kifs_fractal.c — Kaleidoscopic IFS fractals (Knighty 2010)
  *
- * DEMO: Sphere-traces a 3-D fractal whose distance estimator (DE) is
- *       built by repeatedly FOLDING space and SCALING toward a fixed
- *       point.  Each fold is a simple reflection; chaining N of them
- *       produces sharp, brutalist, temple-like architecture — alien
- *       angular cathedrals that look nothing like Mandelbulb's organic
- *       blobs.  Surface colour comes from an "orbit trap" (the closest
- *       approach to the origin during the fold sequence), so adjacent
- *       fold-chambers share a hue.  A slow camera orbit + slowly
- *       animated fold rotation keep the fractal walking on its own.
+ * DEMO: Three preset fractals built from "fold + contract" iteration.
+ *       TETRA = Sierpinski tetrahedron, MENGER = Menger sponge,
+ *       KIFS_ROT = an animated rotating crystal.  All three share
+ *       the same renderer; only the per-iteration fold differs.
+ *       Six colour themes, four debug overlays, manual + auto orbit,
+ *       live iteration depth control.
  *
- *       Three presets (cycle with n / N):
- *         TETRA     Sierpinski tetrahedron — three plane folds along
- *                   (x+y), (x+z), (y+z); scale 2 about (1, 1, 1).
- *                   The canonical KIFS — 4-fold symmetric.
- *         MENGER    Menger-sponge variant — abs fold + descending
- *                   sort + scale 3 about (1, 1, 1) + a final z-fold.
- *                   Boxy, 8-fold symmetric, classic recursion grid.
- *         KIFS_ROT  Modified KIFS — per-iteration y-rotation + abs
- *                   fold + 1 swap + scale.  The rotation animates
- *                   over time so the fractal slowly reshapes.
- *
- *       Six themes (cycle with t / T) recolour the orbit-trap palette:
- *         GOLD     warm temple gold → bone white
- *         ICE      pale cyan → ice white
- *         COBALT   deep blue → electric cyan
- *         COPPER   bronze → orange highlights
- *         ALIEN    violet → magenta → cyan
- *         MONO     pure greyscale (high-contrast etching)
- *
- * Study alongside:
- *   raymarcher/donut.c        — same volumetric/raymarcher folder, but
- *           a far simpler algorithm (parametric point sampling + z-buffer).
- *           Read donut.c first; KIFS is what happens when you replace
- *           "sample a torus surface" with "iterate a fold sequence".
- *   raymarcher/sdf_gallery.c  — primer on simple SDF primitives;
- *           kifs_de() is essentially "fold space first, then ask a
- *           sphere or box SDF in the folded space".
- *   raster/mandelbulb_raster.c — same fractal-DE family but spherical
- *           iteration produces ORGANIC blobs; KIFS produces ANGULAR
- *           architecture.  Read both to feel the difference.
+ * Study alongside: raymarcher/mandelbulb.c (also a fractal SDF, but
+ *       built from a single non-linear iteration rather than a
+ *       composition of linear folds + scales).  Both files use the
+ *       same sphere-trace skeleton; the SDF is what differs.
  *
  * Section map:
- *   §1 config   — frame, camera, sphere-trace, lighting, presets, themes
- *   §2 clock    — monotonic timer + sleep
- *   §3 color    — orbit-trap palette + HUD/hint pairs (CLAUDE.md spec)
- *   §4 vec3     — value-type 3-D math
- *   §5 kifs     — per-iteration folds + DE + normal estimator
- *   §6 march    — sphere-trace + Hit struct
- *   §7 scene    — camera basis, ray gen, shade, render orchestrator
- *   §8 screen   — ncurses init / resize / HUD draw / present
- *   §9 app      — main loop, signals, keys
+ *   §1   config       — every tunable named, no magic numbers later
+ *   §2   clock        — monotonic timer + sleep
+ *   §3   color        — orbit-trap palette + HUD/hint pairs
+ *   §4   vec3         — 3-D math, value types
+ *   §5   KifsParams   — per-frame view of all DE parameters
+ *   §6   fold helpers — three preset-specific reflections
+ *   §7   fold dispatch — pick the right helper per preset
+ *   §8   contract     — the contractive map after each fold
+ *   §9   menger fold-back — MENGER-only post-step
+ *   §10  orbit trap   — track running min |p|² during folding
+ *   §11  primitive DEs — sphere + box (Quílez form)
+ *   §12  DE orchestrator — the kifs_de loop body
+ *   §13  normal       — central-difference gradient of DE
+ *   §14  sphere trace — Hart 1996 march along a ray
+ *   §15  camera       — orthonormal basis + per-pixel ray
+ *   §16  lighting     — Lambert + step-count AO
+ *   §17  cell decoration + emit
+ *   §18  scene        — Scene struct + tick + build_kifs
+ *   §19  render       — orchestrator: walk pixels, trace, decorate
+ *   §20  debug overlays — see the raw rendering signals
+ *   §21  screen       — ncurses init / HUD / present
+ *   §22  app          — main loop, signals, key handling
  *
  * Keys:
- *   q / ESC      quit
- *   space        pause / resume animation (camera orbit + fold rot)
- *   r            reset camera
- *   n / N        next / previous preset    (TETRA / MENGER / KIFS_ROT)
- *   t / T        next / previous theme
- *   ← / →        manual orbit (yaw)
- *   ↑ / ↓        manual orbit (pitch)
- *   z / Z        zoom out / in
- *   i / I        iterations −1 / +1   (depth of fractal recursion)
- *   ] / [        sim Hz up / down
+ *   q / ESC    quit
+ *   space      pause / resume orbit + KIFS_ROT animation
+ *   r / R      reset camera + iteration depth
+ *   n / N      next / previous preset (TETRA / MENGER / KIFS_ROT)
+ *   t / T      next / previous theme
+ *                (GOLD / ICE / COBALT / COPPER / ALIEN / MONO)
+ *   d / D      cycle debug overlay
+ *                (NORMAL / TRAP / STEPS / NORMALS)
+ *   i / I      iteration depth − / +   (3..18)
+ *   z / Z      camera farther / closer
+ *   arrows     manual orbit (left/right yaw, up/down pitch)
+ *   ] / [      simulation rate up / down
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra raymarcher/kifs_fractal.c \
- *       -o kifs_fractal -lncurses -lm
+ *       -o kifs -lncurses -lm
  */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
  *
- * Algorithm      : Sphere tracing of a Kaleidoscopic Iterated Function
- *                  System (KIFS) distance estimator.
+ * The file is structured as a textbook.  Read top-to-bottom.
  *
- *                  The DE is built by REPEATEDLY FOLDING and SCALING
- *                  the input point, then evaluating the distance to a
- *                  simple primitive (sphere or box) in the folded
- *                  space.  Each fold is a piecewise affine map (a
- *                  reflection across a plane); chaining N of them
- *                  produces a self-similar fractal because the
- *                  inverse of each fold replicates the primitive
- *                  across the fold axis.  Critically, fold + scale
- *                  together compose to a *contractive* map, so every
- *                  point in space orbits toward the fractal attractor.
+ *   • CONCEPTS         names the algorithm and lists references.
+ *   • MENTAL MODEL     intuition + an ASCII diagram of one iteration.
+ *   • GUIDED TUTORIAL  eight short answers walking from "what is an
+ *                      IFS?" to "how does this become a renderable SDF?"
+ *   • §1..§22          the actual code, each section short and focused.
  *
- *                  One sphere-trace step:
- *                     d = kifs_de(p)        // distance to fractal
- *                     p += d · ray_dir      // safe step, never overshoots
- *                  Repeat until d < ε (hit) or t > MAX_T (miss).
+ * Ten-minute version: read the GUIDED TUTORIAL.  By the end the
+ * §-sections feel like reviewing notes.
  *
- *                  The iteration body is the SAME shape for every preset:
- *                     for i = 1..N:
- *                         fold_iter        (preset-specific reflection)
- *                         contract         (p · scale − offset · (s−1))
- *                         menger_z_foldback (only the MENGER preset)
- *                         track_orbit_trap (running closest-to-origin)
- *                     return primitive_de(p) · scale^(−N)
+ * Math notation used in code:
+ *      p              — a 3-D point (the iteration / DE input)
+ *      offset         — the contraction's fixed point
+ *      scale          — the contraction multiplier (> 1 in our presets)
+ *      iters          — iteration depth (3..18)
+ *      DE(p)          — distance estimate at point p
+ *      trap           — orbit trap value (smallest |p| during folding)
+ *      N              — surface normal at the hit
+ *      L              — light direction (unit vector)
  *
- *                  The final scale^(−N) compensates for the cumulative
- *                  contraction so the DE stays in WORLD-space units.
- *                  (If you forget it, the fractal is the same SHAPE
- *                  but the sphere-trace overshoots and never hits.)
+ * Background you need:
+ *   • basic vector arithmetic (add, dot, cross, length, normalise)
+ *   • read raymarcher.c first for sphere tracing if unfamiliar
+ *   • optional but helpful: the Sierpinski triangle "chaos game"
+ *     — the canonical 2D IFS that motivates this whole approach
  *
- * Data-structure : Stateless DE function.  No tables, no LUTs, no
- *                  caching.  Each pixel re-evaluates the fold
- *                  sequence ~30 times during its sphere trace + 6
- *                  times for normal estimation.  All per-frame
- *                  parameters live in `KifsParams` (preset, iters,
- *                  scale, offset, fold rotation, cached scale^−N) —
- *                  built once in `scene_build_kifs` and passed by
- *                  const-pointer to every DE call.
- *
- * Rendering      : ASCII only.  Glyph from Lambertian luminance plus
- *                  step-count AO; colour pair from orbit trap (closest
- *                  fold-orbit approach to origin) so adjacent surfaces
- *                  in the same fold-chamber share a hue.  Background
- *                  is the default terminal bg.
- *
- * Performance    : ~30 march steps × ~10 fold iters × ~20 ops ≈ 6 000
- *                  ops per pixel.  At 80×24 = 1 920 pixels: ~12 M ops/
- *                  frame, easy at 60 fps.  At 200×60: ~70 M/frame, still
- *                  tractable.  Lower iters (i / I) for big terminals.
- *
- * References     :
- *   • Knighty (2010) — original KIFS thread on Fractal Forums.
- *     The genealogy of the technique: folds + scale + iterate.
- *     https://www.fractalforums.com/3d-fractal-generation/kaleidoscopic-(escape-time-ifs)/
- *   • Christensen, M. H. — "Distance Estimated 3D Fractals — a
- *     Tutorial," parts I–V (2011), syntopia.github.io.  The most
- *     accessible write-up of KIFS, Mandelbox, and the DE
- *     compensation `· scale^−N`.
- *   • Hart, J. C. (1996) — "Sphere Tracing: A Geometric Method for
- *     the Antialiased Ray Tracing of Implicit Surfaces," *The Visual
- *     Computer* 12(10):527–545.  The sphere-trace iteration we use.
- *   • Quílez, I. — "Distance Functions"
- *     https://iquilezles.org/articles/distfunctions/
- *     Source of the sphere/box primitive distances and the central-
- *     difference normal estimator at the bottom of §5.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * ─────────────────────────────────────────────────────────────────── */
 
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+/* ── CONCEPTS ────────────────────────────────────────────────────────── *
+ *
+ * Algorithm    : KALEIDOSCOPIC ITERATED FUNCTION SYSTEM (KIFS,
+ *                Knighty 2010).  An ITERATED FUNCTION SYSTEM is a
+ *                set of CONTRACTIVE MAPS whose attractor is the
+ *                fractal: every point in space, when iterated under
+ *                random selections of the maps, eventually lands on
+ *                the fractal (the "chaos game" theorem of Barnsley).
+ *
+ *                The Kaleidoscopic part adds REFLECTIONS (folds)
+ *                before each contraction.  A fold collapses many
+ *                regions of space onto one; the contraction then
+ *                pulls everything toward a fixed point.  After
+ *                ~10 iterations, the point's position is dominated
+ *                by which sequence of folds + contractions it went
+ *                through — and that sequence is the "address" of
+ *                the attractor leaf it converges to.
+ *
+ *                For RENDERING via sphere tracing we need a
+ *                distance estimator, not just "did this converge?".
+ *                The trick: run the iteration N times, evaluate
+ *                a simple primitive DE (sphere or box) at the final
+ *                point, then divide by scale^N to undo the scaling
+ *                and get back to world units.
+ *
+ *                Per pixel:
+ *                  1. ray from camera through cell
+ *                  2. sphere-trace using kifs_de
+ *                  3. on hit:  6-tap central-difference normal
+ *                              orbit trap value (smallest |p| during
+ *                                                 fold loop)
+ *                              Lambert + step-count AO → luminance
+ *                  4. (luminance, trap, theme) → glyph + colour pair
+ *
+ * Data         : Stateless math on the hot path (no globals, no
+ *                allocation).  Per-frame `KifsParams` packs all DE
+ *                parameters so the inner loop touches one cache
+ *                line.  Per-pixel result is `Hit` (hit / p / normal
+ *                / trap / steps); rendered to one (glyph, colour
+ *                pair, attr) `Cell` per terminal cell.
+ *
+ * Rendering    : One ray per terminal cell (no virtual canvas).
+ *                Glyph from an 8-step luma ramp; colour from the
+ *                active theme's 8-tier orbit-trap ramp.
+ *                attron/attroff batched on (pair, attr) change so
+ *                uniform regions don't thrash ncurses.
+ *
+ * Performance  : ~iters folds + 1 primitive DE per DE call.  Hit
+ *                pixels: 1 trace step at hit + 6-tap normal + 1
+ *                trap-extract = ~8 DE calls × iters folds ≈ ~70
+ *                fold ops per hit pixel.  At iters=10 and modest
+ *                terminals, holds 60+ fps.
+ *
+ * References   :
+ *   • Knighty (2010) — "Kaleidoscopic (escape time) IFS"
+ *     Fractal Forums thread originating the technique.
+ *   • Hart, J. C. (1996) — "Sphere Tracing: A Geometric Method for
+ *     the Antialiased Ray Tracing of Implicit Surfaces", *Visual
+ *     Computer* 12(10):527-545.  The march loop.
+ *   • Barnsley, M. (1988) — "Fractals Everywhere".  IFS theory and
+ *     the chaos game.
+ *   • Quílez, I. — "Distance Functions"
+ *     https://iquilezles.org/articles/distfunctions/  (sphere/box
+ *     primitives we evaluate at the end of the iteration).
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ────────────────────────────────────────────────────── *
  *
  * CORE IDEA
  * ─────────
- * Self-similarity from origami.  Take a piece of space, fold it three
- * times along a few mirror planes, then SHRINK it toward a fixed
- * point.  Repeat 10–14 times.  Anywhere a fold lands a point onto its
- * mirror image, the inverse shows the SAME structure — that's where
- * the fractal's recursion comes from.  After all the folding, ask
- * "how far am I from a unit sphere right now?"  That number, divided
- * by the total contraction (scale^N), is the distance from the
- * original point to the FRACTAL.  Now sphere-trace it.
+ * Take a point in 3D space.  Fold it (reflect across a few planes).
+ * Then pull it toward a fixed point by a contraction (multiply by
+ * scale, shift by offset).  Repeat 10× or so.  After a few iterations
+ * the point's trajectory has been "kneaded" by the fold-and-scale
+ * dynamics until it lands somewhere on the fractal's attractor.
+ * For SDF rendering we don't run the iteration to convergence — we
+ * run it a fixed number of times, evaluate a simple primitive (a
+ * sphere or box) at the final point, and divide by scale^iterations
+ * to bring the distance back to world units.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
- * Imagine a grid of mirrors arranged like a kaleidoscope.  Every
- * time you look into a mirror you see a shrunken copy of yourself
- * behind the mirror plane; the reflection reflects again, ad
- * infinitum.  KIFS is the same idea in code: folding `p = abs(p)` is
- * the mathematical statement "for the rest of this iteration, treat
- * p as if it were on the positive side of three mirror planes at
- * x=0, y=0, z=0".  After N folds, the point sits in one tiny chamber
- * of an infinite mirror cathedral.  The distance to a single test
- * sphere in that chamber, scaled back to the outside world, is the
- * distance to the cathedral itself.
+ * Imagine an origami artist who knows three folds.  Hand them a flat
+ * sheet of paper labelled "I am here".  They fold it three times,
+ * then shrink the result toward a magnet.  Hand the shrunken result
+ * back as input and they repeat.  After a dozen rounds the paper
+ * has been folded into something neither flat nor random — it's
+ * been driven onto an ATTRACTOR by the dynamics of the fold-and-
+ * shrink rule.  KIFS does this in 3D space, with planes-of-symmetry
+ * for folds and a fixed point + scale for the shrink.
  *
- *      ┌─────────────────────────────────────────────────────────┐
- *      │  outside world         (fold sequence)         attractor │
- *      │     ●     ─────fold─────►  ●  ─fold─►  ●  ─►  ··· →  ◆   │
- *      │     ↑                                                    │
- *      │  ray hit p                                  test sphere  │
- *      │                                                          │
- *      │  d_world(p) = d_test(folded_p) · scale^(−N)              │
- *      └─────────────────────────────────────────────────────────┘
+ * One iteration of the TETRA preset, in cross-section:
+ *
+ *      input p ●                                         FOLD step
+ *               \                                        ┌─────────┐
+ *                ●  if (p.x + p.y) < 0:                  │ reflect │
+ *                 \    swap (p.x, p.y) → (−p.y, −p.x)   │ across  │
+ *                  ●                                     │ 3 planes │
+ *                                                        └─────────┘
+ *               folded p                                       │
+ *                       ●                                      ▼
+ *                                                       CONTRACT step
+ *                                                       p ← p · scale
+ *                                                            − offset · (scale−1)
+ *               result ●                                           │
+ *                                                                  ▼
+ *                                                           [next iter]
+ *
+ * Repeat ~10 times → attractor leaf.  The DE at the leaf is just
+ * sphere_de or box_de (depending on preset) divided by scale^iters.
  *
  * ALGORITHM IN STEPS
  * ──────────────────
- *  Per pixel:
+ * Once per frame:
+ *   1. orbit          advance auto-yaw and KIFS_ROT angle (paused
+ *                     freezes both)
+ *   2. build_kifs     pack Scene state → KifsParams (cache scale^−iters)
  *
- *    1. RAY DIRECTION.  Build the world-space ray from the camera
- *       through the cell, aspect-corrected for terminal cells being
- *       2× taller than wide.
+ * Once per pixel:
+ *   3. ray            primary ray from camera through the cell
+ *   4. trace          sphere-march using kifs_de
+ *   5. on hit:        6-tap central-difference normal
+ *                     re-evaluate kifs_de_with_trap (extract orbit trap)
+ *                     Lambert + step-count AO → luminance
  *
- *    2. SPHERE TRACE.  t = 0; for step = 1..MAX_STEPS:
- *           p = origin + t · dir
- *           d = kifs_de(p)
- *           if d < HIT_EPS  → hit
- *           if t > MAX_T    → miss (background)
- *           t += d
- *
- *    3. KIFS DE.  Inside `kifs_de_with_trap`, run N fold iterations
- *       (each iteration ~4 lines):
- *           fold_iter           preset-specific reflection
- *           contract            p ← p · scale − offset · (scale−1)
- *           menger_z_foldback   only when preset == MENGER
- *           track_orbit_trap    update min |p|² seen
- *       Then return primitive_de(p) · scale^(−N).
- *
- *    4. NORMAL.  At the hit point, central-difference the DE on each
- *       axis (6 extra DE calls) → surface normal.
- *
- *    5. SHADE.  Lambert: lum = AMBIENT_LUM + DIFFUSE_LUM · max(0, N·L).
- *       Multiply by a step-count AO factor (deeper concavities took
- *       more march steps → darker).  Map lum → glyph slot 0..7,
- *       trap → colour-pair slot 0..7.
- *
- *    6. MISS.  Background — space char, default bg.
- *
- *  Per frame:
- *    7. ANIMATE.  scene_tick advances orbit yaw and (for KIFS_ROT)
- *       the fold rotation angle.
+ * Once per cell:
+ *   6. quantise       luminance → glyph slot, trap → colour slot
+ *   7. emit           with attron/attroff batched on attr change
  *
  * KEY FORMULAS
  * ────────────
- *   Sphere trace step (Hart 1996):
- *     p_{k+1} = p_k + d(p_k) · ray_dir
+ * Fold (TETRA — three plane reflections):
+ *      if (p.x + p.y < 0):  (p.x, p.y) ← (−p.y, −p.x)
+ *      if (p.x + p.z < 0):  (p.x, p.z) ← (−p.z, −p.x)
+ *      if (p.y + p.z < 0):  (p.y, p.z) ← (−p.z, −p.y)
  *
- *   Plane fold (reflect about plane with normal n̂, through origin):
- *     if (p · n̂) < 0:  p −= 2 · (p · n̂) · n̂
+ * Fold (MENGER — abs + descending sort):
+ *      p ← (|p.x|, |p.y|, |p.z|)
+ *      sort so p.x ≥ p.y ≥ p.z
  *
- *   Octant fold (mirror across all three axis planes):
- *     p = (|p_x|, |p_y|, |p_z|)
+ * Fold (KIFS_ROT — Y-rotation + abs + 1 swap):
+ *      (p.x, p.z) ← rotate by fold_rot around y
+ *      p ← (|p.x|, |p.y|, |p.z|)
+ *      if p.x < p.y: swap(p.x, p.y)
  *
- *   Scale-toward-offset (contraction with fixed point at offset):
- *     p = p · scale − offset · (scale − 1)
- *     fixed-point check: p* = offset:
- *         offset · scale − offset · (scale − 1) = offset       ✓
+ * Contraction (toward fixed point `offset`, multiplier `scale`):
+ *      p ← p · scale  −  offset · (scale − 1)
+ *      verify: offset is the fixed point: offset·scale − offset·(scale−1) = offset
  *
- *   DE compensation (un-do cumulative scaling):
- *     d_world = d_folded · scale^(−N)
+ * KIFS distance estimator (after iters folds + contracts):
+ *      DE(p) = primitive_de(p_final) · scale^(−iters)
  *
- *   Central-difference normal (Quílez):
- *     N_x = de(p + ε x̂) − de(p − ε x̂)         (similarly y, z)
- *     N   = normalise(N_x, N_y, N_z)
+ * Orbit trap (running min over iterations):
+ *      trap = √( min over i of |p_i|² )
  *
- *   Orbit trap (closest approach to origin during fold sequence):
- *     trap = min over i ∈ 1..N of |p_i|
- *     used for colour: smaller trap → "deeper" cathedral interior.
+ * Sphere trace:
+ *      t = 0
+ *      repeat MAX_STEPS:
+ *          d = kifs_de(ro + t·rd)
+ *          if d < HIT_EPS:   hit, return t
+ *          if t > MAX_T:     miss
+ *          t += d
  *
- *   Aspect correction (cells 2× taller than wide):
- *     phys_aspect = (rows · 2) / cols
- *     ray = fwd
- *         + u · tan(FOV/2)              · right
- *         + v · tan(FOV/2) · phys_aspect · up
+ * Lambert + AO:
+ *      lum   = AMBIENT_LUM + DIFFUSE_LUM · max(0, N·L)
+ *      ao    = max(AO_FLOOR, 1 − steps / MAX_STEPS)
+ *      final = lum · ao
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *   • SCALE NEAR 1.  A scale very close to 1 is non-contractive — the
- *     DE never converges and the fractal becomes a thin shell.  Per
- *     preset, we keep `scale ≥ 2.0`.
+ *   • The KIFS DE is a CONSERVATIVE LOWER BOUND on true distance,
+ *     not an exact distance like sphere_de or box_de.  Sphere
+ *     tracing tolerates this — never overshoots — but march steps
+ *     can shrink unhelpfully near the surface.  HIT_EPS = 1.5e-3
+ *     is generous; tighter values increase step count without
+ *     visible quality.
  *
- *   • TOO MANY ITERATIONS.  Past iters ≈ 20, scale^(−N) underflows
- *     single-precision and the DE returns 0 everywhere.  We clamp
- *     ITERS_MAX = 18.  Pressing `I` past that no-ops.
+ *   • TETRA needs HIGH iters (12) to look fractal — at 5 it looks
+ *     like a smoothly bevelled tetrahedron.  MENGER converges
+ *     faster and uses 7.  KIFS_ROT lives between (10).
  *
- *   • CAMERA INSIDE THE FRACTAL.  Zooming in past the bounding sphere
- *     can place the camera inside a fold chamber; the trace then walks
- *     AWAY from the surface.  We clamp `cam_dist ≥ CAM_DIST_MIN` so
- *     the camera always sits outside the fractal hull.
+ *   • The MENGER preset includes a "z fold-back" heuristic (§9)
+ *     that pulls p.z back into the box-DE's expected range.
+ *     Without it the central column reads the wrong distance and
+ *     the recursion ladder visibly breaks (large gaps on one side).
  *
- *   • BACK-FACE HITS.  KIFS folds produce concavities; the trace
- *     hits the closer face first.  One-sided Lambert (ambient + N·L)
- *     keeps back-faces correctly dark.  Two-sided shading would wash
- *     this out.
+ *   • Camera distance < CAM_DIST_MIN (1.6) puts the eye inside the
+ *     fractal hull — the marcher then starts with negative DE and
+ *     does weird things.  The clamp prevents that case.
  *
- *   • NORMAL EPS.  At very high iters the DE becomes nearly
- *     discontinuous between fold cells.  ε too small → noisy
- *     normals.  NORMAL_EPS = 4 · HIT_EPS empirically gives clean
- *     shading.
+ *   • At ITERS_MAX (18) floating-point precision starts to limit
+ *     detail — beyond that, more iterations don't reveal more
+ *     structure, just noise.
  *
- *   • ORBIT-TRAP RANGE.  In theory unbounded; in practice the trap
- *     for our presets sits in [0, ~1.4].  We clamp + scale to [0, 1]
- *     before mapping to the 8-tier ramp; values past 1.4 saturate to
- *     the warmest pair.
- *
- *   • PRESET CHANGE doesn't reset the camera (you might want to keep
- *     your view).  Press `r` to reset both camera and iters.
- *
- *   • PER-FRAME FOLD ROTATION (KIFS_ROT).  The rotation angle is part
- *     of scene state and affects EVERY DE call this frame.  As it
- *     advances each frame the fractal slowly morphs; if it crosses a
- *     symmetry axis the fractal "snaps" briefly — that's the moment
- *     the fold loops over a discrete reflection.
+ *   • Pause freezes the orbit AND the KIFS_ROT animation, so
+ *     KIFS_ROT renders as a static crystal at the current angle.
  *
  * HOW TO VERIFY
  * ─────────────
- *   • Press space.  Camera orbit freezes.  Fold rotation freezes.
- *     Resume — motion picks up smoothly.
+ *   • Press n to cycle through TETRA → MENGER → KIFS_ROT.  Each
+ *     should look distinctly different even at default iters.
  *
- *   • Press n a few times.  TETRA → MENGER → KIFS_ROT.  Each preset
- *     has a distinct silhouette: TETRA has 4-fold tetrahedral
- *     symmetry; MENGER has an obvious 8-cube grid; KIFS_ROT slowly
- *     morphs.
+ *   • TETRA at iters=12 should show a clear Sierpinski-tetrahedron
+ *     hierarchy: four large lobes, each subdivided into four smaller
+ *     ones, recursively.  Pause and orbit (arrows) to inspect.
  *
- *   • Press i (decrease iters).  Fractal becomes coarser — fewer
- *     levels of recursion, more visible primitive shape.  Press I
- *     (increase) → more cathedral detail at the cost of CPU.
+ *   • MENGER at iters=7 should show the cubic Menger sponge: three
+ *     square holes through the centre of each face, with smaller
+ *     holes through each remaining cube.
  *
- *   • Press z / Z.  Camera distance changes; the fractal stays put.
- *     At small cam_dist you should see fold-chamber detail filling
- *     the screen.
+ *   • Press i to drop iters to 3.  All three presets become smooth
+ *     blobs — fractal detail emerges only at higher iterations.
  *
- *   • Press t.  Only colours change — geometry is identical across
- *     themes.  GOLD → ICE is the most striking transition.
+ *   • Press d to cycle debug overlays.  TRAP shows where the colour
+ *     ramp comes from (ignores lighting).  STEPS shows the AO source
+ *     (deeper concavities glow).  NORMALS shows raw geometry hue.
  *
- *   • At 60 × 20, the fractal silhouette should still read as
- *     architecture, not noise.  If you see speckle, lower iters.
+ *   • Press t through all 6 themes.  Geometry stays identical; only
+ *     the orbit-trap colour ramp changes.
  *
- * ─────────────────────────────────────────────────────────────────────── */
+ *   • For KIFS_ROT, watch the fractal slowly morph as the fold_rot
+ *     angle advances — the rotation is what gives this preset its
+ *     "growing crystal" appearance.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL — eight short answers ───────────────────────────── *
+ *
+ *
+ * T1: What is an Iterated Function System?
+ * ────────────────────────────────────────
+ * An IFS is a small set of CONTRACTIVE MAPS f₁, f₂, …, fₙ acting on
+ * a metric space.  Each map shrinks distances (|fᵢ(a) − fᵢ(b)| <
+ * c·|a − b| for some c < 1).  Barnsley's chaos-game theorem: pick
+ * any starting point, repeatedly apply a RANDOMLY CHOSEN map, and
+ * the trajectory of points eventually fills out the same fractal
+ * — the IFS's ATTRACTOR — regardless of starting point.
+ *
+ * The classic 2D example: Sierpinski triangle.  Three maps, each
+ * "halve the distance to one of three vertices":
+ *
+ *      f₁(p) = (p + v₁) / 2
+ *      f₂(p) = (p + v₂) / 2
+ *      f₃(p) = (p + v₃) / 2
+ *
+ * Iterate from any starting point, picking f₁/f₂/f₃ randomly each
+ * step, and within ~50 iterations you've drawn the Sierpinski
+ * triangle.
+ *
+ *
+ * T2: From IFS to KIFS — adding folds
+ * ───────────────────────────────────
+ * The IFS approach (random map per iteration) is great for plotting
+ * a fractal point-by-point but bad for ray-tracing — we don't want
+ * stochasticity in our DE.  KIFS uses a DIFFERENT trick: a single
+ * DETERMINISTIC pipeline of FOLD + CONTRACT, applied the same way
+ * to every point.
+ *
+ * The fold step REPLACES the random map selection: it reflects
+ * regions of space across symmetry planes so that all the "different
+ * orbits" the IFS would explore stochastically are now compressed
+ * into one canonical region.  Then contract.  Then repeat.
+ *
+ * This makes KIFS a deterministic SDF: at any point p in space, the
+ * iteration produces a specific number representing distance to the
+ * fractal surface.  Sphere tracing can then march to find the
+ * intersection with each ray.
+ *
+ *
+ * T3: The contraction step — pulling toward a fixed point
+ * ───────────────────────────────────────────────────────
+ * After folding, every iteration scales p toward a fixed offset:
+ *
+ *      p ← p · scale − offset · (scale − 1)
+ *
+ * Verify the FIXED POINT is `offset`:
+ *
+ *      offset · scale − offset · (scale − 1)
+ *    = offset · scale − offset · scale + offset
+ *    = offset                                              ✓
+ *
+ * For our presets scale > 1, so this is actually an EXPANSION
+ * (points are pushed AWAY from offset).  The fold step beforehand
+ * REFLECTS far points toward the offset's region, so after fold +
+ * "expand" the net effect is convergence onto the attractor.
+ *
+ * Worked example, TETRA preset (offset = (1,1,1), scale = 2):
+ *      p = (0.3, 0.4, 0.5)
+ *      fold: no plane crossings (all sums positive)
+ *      contract: p ← (0.6, 0.8, 1.0) − (1,1,1) · 1 = (−0.4, −0.2, 0)
+ *      Next iteration: now folds DO trigger because of the negative
+ *      components, and the dynamics start to work.
+ *
+ *
+ * T4: TETRA — the Sierpinski tetrahedron
+ * ──────────────────────────────────────
+ * Three plane reflections + contraction toward the four-vertex offset:
+ *
+ *      if (p.x + p.y < 0):  (p.x, p.y) ← (−p.y, −p.x)        plane #1
+ *      if (p.x + p.z < 0):  (p.x, p.z) ← (−p.z, −p.x)        plane #2
+ *      if (p.y + p.z < 0):  (p.y, p.z) ← (−p.z, −p.y)        plane #3
+ *
+ * The three planes (x + y = 0, x + z = 0, y + z = 0) intersect at
+ * the origin and have the four vertices of a regular tetrahedron at
+ * their fixed points.  Each iteration drives p toward one of those
+ * vertices; after many iterations, every starting point has been
+ * herded to one of the four corners of the recursive sub-tetrahedron
+ * structure.  Hence: Sierpinski tetrahedron.
+ *
+ * 12 iterations of fold + contract suffice for the visible scale of
+ * our terminal canvas; finer detail beyond that is sub-pixel.
+ *
+ *
+ * T5: MENGER — the Menger sponge
+ * ──────────────────────────────
+ * Two-step fold:
+ *      p ← (|p.x|, |p.y|, |p.z|)              octant fold
+ *      sort so p.x ≥ p.y ≥ p.z                three swaps if needed
+ *
+ * The abs-fold collapses the 8 octants of space into one (the +X,
+ * +Y, +Z octant).  The sort then orders the components so the
+ * largest is in p.x.  Combined with the contraction (offset =
+ * (1,1,1), scale = 3), this produces the Menger sponge's cell-
+ * removal pattern: 20 of the 27 sub-cubes get pulled outward at
+ * each level, leaving the 7 central cubes empty (the central one
+ * plus the six face-centred ones).
+ *
+ * MENGER also requires a Z FOLD-BACK heuristic (§9) before the
+ * primitive DE is evaluated, otherwise the central column reads the
+ * wrong distance and the recursion ladder visibly breaks.
+ *
+ *
+ * T6: KIFS_ROT — the animated rotating crystal
+ * ────────────────────────────────────────────
+ * Three-step fold:
+ *      (p.x, p.z) ← rotate by fold_rot around y-axis
+ *      p ← (|p.x|, |p.y|, |p.z|)              octant fold
+ *      if p.x < p.y: swap                     ONE swap (not 3)
+ *
+ * The rotation angle `fold_rot` advances at FOLD_ROT_RATE radians
+ * per second.  Each frame the fractal looks slightly different — at
+ * fold_rot = 0 it resembles a crystalline pillar; as the angle
+ * sweeps, structures emerge, twist, and dissolve.
+ *
+ * The single swap (vs MENGER's three) gives a less-symmetric
+ * fractal — chunkier crystals instead of cubic sponge.
+ *
+ *
+ * T7: How does an iteration become a distance?
+ * ────────────────────────────────────────────
+ * After N iterations of fold + contract, p has been driven onto the
+ * fractal's attractor.  But what's the DE there?  Trick:
+ *
+ *      DE(p) = primitive_de(p_final) · scale^(−iters)
+ *
+ * where `primitive_de` is just sphere_de(p) = |p| − 1 (or box_de
+ * for MENGER).  The intuition: each contraction multiplied p by
+ * `scale`, so distance estimates at the END of the iteration are
+ * scaled by scale^iters too large.  Multiplying by scale^(−iters)
+ * undoes this.
+ *
+ * This DE is a CONSERVATIVE LOWER BOUND, not exact distance.
+ * Sphere tracing tolerates lower bounds (never overshoots), but
+ * march speed near the surface is reduced compared to a true DE.
+ *
+ *
+ * T8: Orbit trap — colour by iteration trajectory
+ * ───────────────────────────────────────────────
+ * Naïve colouring: pick a colour by the final value of p.  Result:
+ * blocky bands where neighbouring pixels' iterations diverged.
+ *
+ * Orbit trap colouring: track a feature of the ITERATION TRAJECTORY,
+ * not just the final value.  Common choice: the smallest |p|² seen
+ * over all iterations:
+ *
+ *      trap = √( min over i of |p_i|² )
+ *
+ * This produces SMOOTH gradients across the fractal surface,
+ * because nearby pixels have nearby orbit trajectories and hence
+ * nearby trap values.
+ *
+ * In code we track |p|² (squared) to skip the sqrt per iteration,
+ * then sqrt once at the end.  ~10× cheaper across the loop.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* End of textbook.  The rest of the file is the worked exercises. */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -343,7 +507,7 @@ enum {
     ITERS_MAX        =  18,
 };
 
-/* §1.2 colour-pair IDs (CLAUDE.md HUD pair numbering at the top). */
+/* §1.2 colour-pair IDs. */
 enum {
     PAIR_HUD         =  1,          /* yellow status row 0          */
     PAIR_HINT        =  2,          /* cyan key-hint last row       */
@@ -367,50 +531,33 @@ enum {
 #define FOLD_ROT_RATE     0.18f     /* rad / sec — KIFS_ROT animation */
 #define MANUAL_YAW_STEP   0.12f
 #define MANUAL_PITCH_STEP 0.08f
-#define MANUAL_PITCH_MAX  1.20f     /* clamp so we don't flip past pole */
+#define MANUAL_PITCH_MAX  1.20f     /* clamp short of the poles      */
 
-/* §1.5 sphere-trace tunables.
- *
- * MAX_STEPS    march hard limit (Hart's iteration may not converge in
- *              concave regions; this stops it from running forever).
- * HIT_EPS      surface threshold; "we're touching the fractal".
- * MAX_T        total ray length before we declare a miss.
- * NORMAL_EPS   gradient sample step for the central-difference
- *              normal; should be ≈ 4 × HIT_EPS for clean shading. */
+/* §1.5 sphere-trace tunables. */
 #define MAX_STEPS         70
 #define HIT_EPS           1.5e-3f
 #define MAX_T            14.0f
-#define NORMAL_EPS        6.0e-3f
+#define NORMAL_EPS        6.0e-3f   /* ≈ 4·HIT_EPS empirically        */
 
 /* §1.6 lighting + shading.
- *
- * Lambertian model: lum = AMBIENT_LUM + DIFFUSE_LUM · max(0, N·L)
- * Step-count "AO": more steps to converge → deeper concavity → dimmer.
- * The AO factor never falls below AO_FLOOR so very deep concavities
- * still show their structure (don't fade to pure black). */
+ *      lum = AMBIENT_LUM + DIFFUSE_LUM · max(0, N·L)
+ *      ao  = max(AO_FLOOR, 1 − steps / MAX_STEPS)
+ */
 #define AMBIENT_LUM       0.18f
 #define DIFFUSE_LUM       0.82f
 #define AO_FLOOR          0.60f
 
-/* §1.7 quantisation — number of glyph slots / colour slots.
- *
- *   LUMA_SLOTS               eight glyph tiers in LUMA_GLYPHS[]
- *   LUMA_SLOT_FLT            float scaler used for [0, 1) → [0, 7]
- *   TRAP_NORM_RANGE          empirical max trap value (in practice
- *                            our presets sit in [0, ~1.4]); we divide
- *                            and clamp before mapping to colour slot. */
+/* §1.7 quantisation. */
 #define LUMA_SLOTS         8
 #define LUMA_SLOT_FLT      7.999f       /* (LUMA_SLOTS - 0.001) */
-#define TRAP_NORM_RANGE    1.4f
+#define TRAP_NORM_RANGE    1.4f         /* empirical max trap value */
 #define TRAP_NORM_INV      (1.0f / TRAP_NORM_RANGE)
 
 /* §1.8 fractal preset table.
  *
- * Each row defines one preset's geometry: how many fold iterations
- * by default, the contraction scale, the contraction fixed point
- * (offset), and which primitive to evaluate after the folds.
- *
- * primitive: 0 = sphere SDF, 1 = box SDF.
+ * Each row defines one preset's geometry: default fold iterations,
+ * contraction scale, contraction fixed point (offset), and which
+ * primitive DE to evaluate after the folds.
  */
 typedef enum {
     PRESET_TETRA    = 0,
@@ -445,23 +592,30 @@ typedef struct {
 #define N_THEMES 6
 
 static const Theme THEMES[N_THEMES] = {
-    /* GOLD   — warm temple gold deepening into bone white */
     { "GOLD   ", { 130, 137, 173, 215, 222, 229, 230, 231 } },
-    /* ICE    — pale arctic blue/cyan into pure white      */
     { "ICE    ", {  24,  31,  38,  45,  87, 153, 195, 231 } },
-    /* COBALT — deep sea blue → vivid cyan highlights      */
     { "COBALT ", {  25,  26,  27,  33,  39,  45,  51, 159 } },
-    /* COPPER — bronze → orange → bone                     */
     { "COPPER ", { 130, 166, 173, 209, 215, 222, 229, 230 } },
-    /* ALIEN  — violet → magenta → cyan                    */
     { "ALIEN  ", {  53,  91, 134, 165, 207, 213, 219, 159 } },
-    /* MONO   — pure greyscale                             */
     { "MONO   ", { 244, 246, 248, 250, 252, 253, 254, 255 } },
 };
 
 /* §1.10 luminance ramp — dim → bright. */
 static const char LUMA_GLYPHS[LUMA_SLOTS] = {
     '`', '.', ',', ':', '-', '+', '*', '#'
+};
+
+/* §1.11 debug overlays — d / D cycles between them. */
+typedef enum {
+    DEBUG_NORMAL    = 0,    /* full lit fractal (production view)        */
+    DEBUG_TRAP      = 1,    /* orbit trap value as glyph + colour        */
+    DEBUG_STEPS     = 2,    /* march step count → AO signal source       */
+    DEBUG_NORMALS   = 3,    /* surface normal direction → hue band       */
+    DEBUG_MODE_COUNT = 4,
+} DebugMode;
+
+static const char *DEBUG_MODE_NAMES[DEBUG_MODE_COUNT] = {
+    "NORMAL ", "TRAP   ", "STEPS  ", "NORMALS",
 };
 
 /* ── §2 clock — monotonic timer + sleep ──────────────────────────────── */
@@ -481,13 +635,13 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ── §3 color — orbit-trap palette + HUD/hint pairs ──────────────────── */
-
-/*
- * theme_apply — re-init the eight orbit-trap pairs for the chosen
- * theme.  Called at startup and on every t / T keypress.  Geometry is
- * unaffected; only the trap → colour table changes.
+/* ── §3 color — orbit-trap palette + HUD/hint pairs ──────────────────── *
+ *
+ * 8 trap pairs (PAIR_TRAP_BASE..+7) hold the active theme's colours.
+ * theme_apply re-points them; cell decoration reads from
+ * PAIR_TRAP_BASE+slot to paint a cell.
  */
+
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
@@ -548,46 +702,31 @@ static inline float clampf(float x, float lo, float hi)
     return x < lo ? lo : (x > hi ? hi : x);
 }
 
-/* ── §5 kifs — fold loop + DE + normal estimator ─────────────────────── *
+/* ── §5 KifsParams — per-frame view of all DE parameters ─────────────── *
  *
- * The DE has the same SHAPE for every preset:
- *
- *     for i = 1..iters:
- *         fold_iter             preset-specific reflection
- *         contract              p ← p · scale − offset · (scale−1)
- *         menger_z_foldback     only when preset == MENGER
- *         track_orbit_trap      update min |p|² seen so far
- *     return primitive_de(p) · inv_scale_pow
- *
- * Each helper below is one mathematical step in that pseudocode.  The
- * orchestrator `kifs_de_with_trap` reads top-to-bottom as the four
- * lines above, with no buried logic.
- *
- * KifsParams holds every per-frame parameter the DE needs in registers
- * — it's built once per frame in scene_build_kifs and passed by const
- * pointer to the DE so the hot loop never chases pointers into Scene.
+ * The KIFS DE is called many times per frame.  Rather than pass 8
+ * arguments to every helper, we pack the per-frame state into one
+ * struct.  scene_build_kifs (§18) fills it once per frame from
+ * Scene state; every DE-related helper takes a `const KifsParams *`.
  */
-
 typedef struct {
-    int   preset;
-    int   iters;
-    float scale;
-    float sm1;             /* scale − 1                          */
-    float offx, offy, offz;
-    float fold_rot_c;      /* cos(fold_rot)  — KIFS_ROT only     */
-    float fold_rot_s;      /* sin(fold_rot)  — KIFS_ROT only     */
-    float inv_scale_pow;   /* scale^(−iters), cached             */
+    int   preset;          /* TETRA / MENGER / KIFS_ROT */
+    int   iters;           /* fold iterations (3..18)   */
+    float scale;           /* contraction multiplier    */
+    float sm1;             /* scale − 1 (cached)        */
+    float offx, offy, offz;          /* contraction fixed point   */
+    float fold_rot_c;      /* cos(fold_rot) — KIFS_ROT only */
+    float fold_rot_s;      /* sin(fold_rot) — KIFS_ROT only */
+    float inv_scale_pow;   /* scale^(−iters), cached    */
 } KifsParams;
 
-/* §5.1 fold helpers — one per preset.  Mutate p in place. */
-
-/*
- * fold_iter_tetra — three plane folds making the Sierpinski
- * tetrahedron.  Each `if` reflects p across one of the three planes
- * x+y=0, x+z=0, y+z=0 (only when p is on the wrong side).  The four
- * fixed points of the resulting iteration are the tetrahedron's
- * vertices.
+/* ── §6 fold helpers — three preset-specific reflections ─────────────── *
+ *
+ * Tutorials T4, T5, T6 derived the math.  Each helper mutates p in
+ * place — one fold step per iteration.
  */
+
+/* TETRA: three plane-fold reflections (see T4). */
 static inline void fold_iter_tetra(V3 *p)
 {
     if (p->x + p->y < 0) { float t = -p->y; p->y = -p->x; p->x = t; }
@@ -595,12 +734,7 @@ static inline void fold_iter_tetra(V3 *p)
     if (p->y + p->z < 0) { float t = -p->z; p->z = -p->y; p->y = t; }
 }
 
-/*
- * fold_iter_menger — abs-fold (mirror across all three axis planes)
- * followed by a descending sort.  After the sort, p.x ≥ p.y ≥ p.z;
- * combined with the contract step that follows this gives the Menger-
- * sponge cell removal pattern.
- */
+/* MENGER: abs-fold + descending sort (see T5). */
 static inline void fold_iter_menger(V3 *p)
 {
     p->x = fabsf(p->x); p->y = fabsf(p->y); p->z = fabsf(p->z);
@@ -609,12 +743,7 @@ static inline void fold_iter_menger(V3 *p)
     if (p->y < p->z) { float t = p->y; p->y = p->z; p->z = t; }
 }
 
-/*
- * fold_iter_rot — KIFS_ROT preset: rotate around y by the (animated)
- * fold rotation, then abs-fold + a single swap.  The rotation is what
- * gives KIFS_ROT its characteristic morphing-crystal look as the
- * angle advances each frame.
- */
+/* KIFS_ROT: Y-rotation + abs-fold + ONE swap (see T6). */
 static inline void fold_iter_rot(V3 *p, float c, float s)
 {
     float xr = p->x * c - p->z * s;
@@ -624,11 +753,11 @@ static inline void fold_iter_rot(V3 *p, float c, float s)
     if (p->x < p->y) { float t = p->x; p->x = p->y; p->y = t; }
 }
 
-/*
- * fold_iter — dispatch to the right fold by preset.  The compiler
- * inlines this and the switch becomes a single branch on a value
- * that's constant within a frame, so the branch predictor wins
- * trivially.
+/* ── §7 fold dispatch — pick the right helper by preset ──────────────── *
+ *
+ * The compiler inlines this; the switch becomes a single branch on
+ * a value that's constant within a frame.  Outside the hot loop
+ * the dispatch cost is invisible.
  */
 static inline void fold_iter(V3 *p, const KifsParams *kp)
 {
@@ -639,16 +768,11 @@ static inline void fold_iter(V3 *p, const KifsParams *kp)
     }
 }
 
-/* §5.2 contract + menger fold-back — shared post-steps. */
-
-/*
- * contract_toward_offset — the contractive map after each fold.
+/* ── §8 contract — the contractive map after each fold ───────────────── *
  *
- *    p ← p · scale  −  offset · (scale − 1)
- *
- * Fixed point: p* = offset.  Verify: offset·s − offset·(s−1) = offset.
- * After many iterations every point in space is dragged to one of the
- * map's attractor leaves; THAT'S the fractal we render.
+ * Tutorial T3 derived this.  Pseudocode:
+ *      p ← p · scale  −  offset · (scale − 1)
+ * Fixed point: offset.  Verify: offset · scale − offset · (scale−1) = offset.
  */
 static inline void contract_toward_offset(V3 *p, const KifsParams *kp)
 {
@@ -657,14 +781,13 @@ static inline void contract_toward_offset(V3 *p, const KifsParams *kp)
     p->z = p->z * kp->scale - kp->offz * kp->sm1;
 }
 
-/*
- * menger_z_foldback — MENGER-only post-step.  Pulls p.z back into a
- * sensible range for the box DE that follows so we don't end up
- * measuring distance from a point on the WRONG side of the box.
+/* ── §9 menger z-foldback — MENGER-only post-step ────────────────────── *
  *
- * Pure heuristic — every public KIFS implementation includes this
- * line for the Menger preset; without it the central column reads
- * the wrong distance and the recursion ladder visibly breaks.
+ * Pulls p.z back into a sensible range for the box DE that follows
+ * (§11), so we don't measure distance from the WRONG side of the
+ * box.  Pure heuristic — every public KIFS implementation includes
+ * this line for the Menger preset; without it the central column
+ * reads the wrong distance and the recursion ladder visibly breaks.
  */
 static inline void menger_z_foldback(V3 *p, const KifsParams *kp)
 {
@@ -672,11 +795,10 @@ static inline void menger_z_foldback(V3 *p, const KifsParams *kp)
         p->z += kp->offz * kp->sm1;
 }
 
-/*
- * track_orbit_trap — running minimum of |p|² across all fold
- * iterations.  Smaller trap = the point passed CLOSER to the origin
- * during folding, which empirically corresponds to "deeper inside
- * the cathedral".  The final scaled value drives the colour pair.
+/* ── §10 orbit trap — track running min |p|² during folding ──────────── *
+ *
+ * Tutorial T8 explained the idea.  We track squared magnitude (skip
+ * sqrt per iteration) and sqrt once at the end.
  */
 static inline void track_orbit_trap(V3 p, float *trap_sq)
 {
@@ -684,10 +806,18 @@ static inline void track_orbit_trap(V3 p, float *trap_sq)
     if (r2 < *trap_sq) *trap_sq = r2;
 }
 
-/* §5.3 primitive DEs (Quílez form). */
+/* ── §11 primitive DEs — sphere + box (Quílez form) ──────────────────── *
+ *
+ * After all the folding, we ask "how far is p from a simple unit
+ * shape?".  Tutorial T7 explained why.  These two primitives are
+ * the only "true" DEs in the file — both are Lipschitz-1 exact
+ * Euclidean distance.
+ */
 
+/* sphere of radius 1 centred at origin — f(p) = |p| − 1 */
 static inline float sphere_de(V3 p) { return v3len(p) - 1.0f; }
 
+/* box of half-side 1 centred at origin — Quílez exact box DE */
 static inline float box_de(V3 p)
 {
     float qx = fabsf(p.x) - 1.0f;
@@ -699,27 +829,21 @@ static inline float box_de(V3 p)
     return outside + inside;
 }
 
+/* dispatch: only MENGER uses the box; the others use sphere. */
 static inline float primitive_de(int preset, V3 p)
 {
     return (preset == PRESET_MENGER) ? box_de(p) : sphere_de(p);
 }
 
-/* §5.4 the orchestrator — one tiny loop. */
-
-/*
- * kifs_de_with_trap — full DE for the active preset.  Pseudocode:
+/* ── §12 DE orchestrator — the kifs_de loop body ─────────────────────── *
  *
- *     trap = ∞
- *     for i = 1..iters:
- *         fold_iter
- *         contract_toward_offset
- *         menger_z_foldback   (only MENGER)
- *         track_orbit_trap
- *     trap_out = √trap
- *     return primitive_de(p) · scale^(−iters)
+ * Tutorial T7 derived the formula.  Loop body matches the four-
+ * step pseudocode from MENTAL MODEL: fold → contract → (menger
+ * fold-back if MENGER) → track trap.  Final result is
+ * primitive_de(p_final) · scale^(−iters).
  *
- * Pass `trap_out = NULL` to skip the trap copy-out (the sphere-trace
- * only needs it on hit, not during marching).
+ * trap_out is optional — pass NULL when marching (don't need the
+ * trap during the trace, only on hit).
  */
 static float kifs_de_with_trap(V3 p, const KifsParams *kp, float *trap_out)
 {
@@ -737,23 +861,21 @@ static float kifs_de_with_trap(V3 p, const KifsParams *kp, float *trap_out)
     return primitive_de(kp->preset, p) * kp->inv_scale_pow;
 }
 
+/* thin wrapper for the common case (no trap output) */
 static inline float kifs_de(V3 p, const KifsParams *kp)
 {
     return kifs_de_with_trap(p, kp, NULL);
 }
 
-/*
- * kifs_normal — surface normal at p via central differences.
+/* ── §13 normal — central-difference gradient of DE ──────────────────── *
  *
- *     N_x = de(p + ε x̂) − de(p − ε x̂)
- *     N_y = de(p + ε ŷ) − de(p − ε ŷ)
- *     N_z = de(p + ε ẑ) − de(p − ε ẑ)
- *     N   = normalise(N_x, N_y, N_z)
+ * Surface normal via 6-tap central difference:
+ *      Nₓ ≈ DE(p + ε x̂) − DE(p − ε x̂)         and similarly for y, z
+ *      N  = normalise(Nₓ, Nᵧ, N_z)
  *
- * Central (not forward) differences cost twice as many DE calls
- * (6 vs 3) but the geometry comes out symmetric — forward differences
- * bias the normal toward one axis and produce visibly skewed shading
- * on highly-folded surfaces.
+ * Forward differences (3 evals) bias the normal toward one octant
+ * — visible as skewed shading on highly-folded surfaces.  6 is
+ * worth it.
  */
 static V3 kifs_normal(V3 p, const KifsParams *kp)
 {
@@ -767,37 +889,23 @@ static V3 kifs_normal(V3 p, const KifsParams *kp)
     return v3norm(v3(dx, dy, dz));
 }
 
-/* ── §6 march — sphere trace ─────────────────────────────────────────── */
-
-/*
- * Hit — what the sphere trace returns to the shader.
+/* ── §14 sphere trace — Hart 1996 march along a ray ──────────────────── *
  *
- *   hit       did the ray reach the surface?
- *   p         hit position (only valid if hit)
- *   normal    surface normal at p (only valid if hit)
- *   trap      orbit-trap value normalised to [0, 1]
- *   steps     march iteration count — used as a cheap AO signal
- *             (deeper concavities take more steps to converge)
+ * Same march loop as the sphere/cube files.  On hit we re-evaluate
+ * kifs_de_with_trap once more to extract the orbit trap value (we
+ * don't track it during the march — only the LAST hit's trap
+ * matters for colour).  One extra DE per hit pixel: cheap relative
+ * to the 6 in the normal estimator.
  */
+
 typedef struct {
     bool  hit;
     V3    p;
     V3    normal;
-    float trap;
+    float trap;        /* orbit trap, normalised to [0, 1] */
     int   steps;
 } Hit;
 
-/*
- * sphere_trace — Hart 1996.  Walk along the ray taking steps equal to
- * the current DE.  Distance estimates are conservative LOWER bounds on
- * true distance, so we never overshoot the surface.  Iterate until
- * either |d| drops below HIT_EPS (hit) or t exceeds MAX_T (miss).
- *
- * On hit we re-evaluate the DE once more to extract the orbit trap
- * (we don't track it during the march because only the LAST fold
- * position's trap matters for colour).  This costs one extra DE
- * evaluation per hit pixel — cheap relative to the normal estimator.
- */
 static Hit sphere_trace(V3 origin, V3 dir, const KifsParams *kp)
 {
     Hit out = { false, {0,0,0}, {0,1,0}, 0.0f, 0 };
@@ -825,29 +933,142 @@ static Hit sphere_trace(V3 origin, V3 dir, const KifsParams *kp)
     return out;
 }
 
-/* ── §7 scene — camera basis, ray gen, shade, render orchestrator ────── */
+/* Forward declaration — Scene's full definition lives in §18, but
+ * camera_basis (§15) needs to take a `const Scene *`. */
+typedef struct Scene Scene;
+
+/* ── §15 camera — orthonormal basis + per-pixel ray ──────────────────── *
+ *
+ * Camera orbits horizontally around origin at distance cam_dist,
+ * looking at (0, 0, 0) (the fractal centre).  Three orthonormal
+ * vectors define the view: forward (look at origin), right
+ * (perpendicular to forward, in the world horizontal plane), up
+ * (perpendicular to both).
+ *
+ * Per pixel ray:
+ *      u = (col + 0.5) / cols  · 2 − 1                  ∈ [−1, +1]
+ *      v = ((row + 0.5) / rows · 2 − 1) · −1            (Y-flip)
+ *      direction = forward
+ *                + u · tan(FOV/2)              · right
+ *                + v · tan(FOV/2) · phys_aspect · up
+ *      direction = normalise(direction)
+ *
+ * phys_aspect = (rows · CELL_ASPECT) / cols corrects for terminal
+ * cells being roughly twice as tall as wide, so circles stay round.
+ */
 
 typedef struct {
-    bool   paused;
-    int    current_preset;
-    int    current_theme;
-    int    iters_override;       /* 0 = use preset default */
-    int    cols, rows;
+    V3    origin;
+    V3    fwd, right, up;
+    float fov_t;
+    float phys_aspect;
+} Camera;
 
-    /* Camera state. */
+/* camera_basis is forward-declared because Scene's full definition
+ * (and hence camera_basis's ability to read from it) lives in §18.
+ * The actual definition is at the bottom of §18. */
+static Camera camera_basis(const Scene *s, int rows_eff)
+;
+
+static V3 pixel_ray(int col, int row, int cols, int rows_eff, const Camera *c)
+{
+    float u =  ((float)col + 0.5f) / (float)cols     * 2.0f - 1.0f;
+    float v = -(((float)row + 0.5f) / (float)rows_eff * 2.0f - 1.0f);
+    V3 sx = v3scale(u * c->fov_t,                  c->right);
+    V3 sy = v3scale(v * c->fov_t * c->phys_aspect, c->up);
+    return v3norm(v3add(c->fwd, v3add(sx, sy)));
+}
+
+/* ── §16 lighting — Lambert + step-count AO ──────────────────────────── *
+ *
+ *      diffuse = max(0, N·L)                          Lambert's law
+ *      lum     = AMBIENT_LUM + DIFFUSE_LUM · diffuse
+ *      ao      = max(AO_FLOOR, 1 − steps / MAX_STEPS) cheap AO proxy
+ *      final   = lum · ao
+ *
+ * Step-count AO: cells inside concavities take more march steps to
+ * converge → step count correlates with concavity → naturally
+ * darker crevices.  Geometrically nonsense but visually convincing
+ * and free.
+ */
+static float lambert_with_ao(V3 normal, int steps, V3 light)
+{
+    float ndl = v3dot(normal, light);
+    if (ndl < 0.0f) ndl = 0.0f;
+    float lum = AMBIENT_LUM + DIFFUSE_LUM * ndl;
+
+    float ao = 1.0f - (float)steps / (float)MAX_STEPS;
+    if (ao < AO_FLOOR) ao = AO_FLOOR;
+    return lum * ao;
+}
+
+/* ── §17 cell decoration + emit ──────────────────────────────────────── */
+
+static int to_slot(float x_01)
+{
+    int s = (int)(x_01 * LUMA_SLOT_FLT);
+    if (s < 0)               s = 0;
+    if (s >= LUMA_SLOTS)     s = LUMA_SLOTS - 1;
+    return s;
+}
+
+/* Cell — (glyph, colour pair, attribute) for one terminal cell. */
+typedef struct { char glyph; int pair; attr_t attr; } Cell;
+
+/* Production-view cell: glyph from luma, colour pair from orbit trap. */
+static Cell shade_hit(const Hit *h, V3 light)
+{
+    if (!h->hit) {
+        return (Cell){ ' ', PAIR_BG, A_NORMAL };
+    }
+
+    float lum    = lambert_with_ao(h->normal, h->steps, light);
+    int   s_lum  = to_slot(lum);
+    int   s_clr  = to_slot(h->trap);
+
+    return (Cell){
+        .glyph = LUMA_GLYPHS[s_lum],
+        .pair  = PAIR_TRAP_BASE + s_clr,
+        .attr  = (s_lum >= 6) ? A_BOLD
+               : (s_lum <= 1) ? A_DIM
+               :                A_NORMAL,
+    };
+}
+
+/* emit_cell — paint one cell with attron/attroff batched on (pair,
+ * attr) change.  Halves attribute thrash on uniform regions. */
+static void emit_cell(int row, int col, Cell c,
+                      int *last_pair, attr_t *last_attr)
+{
+    if (c.pair != *last_pair || c.attr != *last_attr) {
+        if (*last_pair >= 0) attroff(COLOR_PAIR(*last_pair) | *last_attr);
+        attron(COLOR_PAIR(c.pair) | c.attr);
+        *last_pair = c.pair;
+        *last_attr = c.attr;
+    }
+    mvaddch(row, col, (chtype)(unsigned char)c.glyph);
+}
+
+/* ── §18 scene state — Scene struct + tick + build_kifs ──────────────── */
+
+struct Scene {
+    bool       paused;
+    int        current_preset;
+    int        current_theme;
+    int        iters_override;       /* 0 = use preset default */
+    DebugMode  debug_mode;
+    int        cols, rows;
+
+    /* Camera state (yaw + pitch around origin). */
     float  cam_dist;
     float  orbit_yaw;             /* auto-advancing */
     float  orbit_pitch;
     float  user_yaw, user_pitch;  /* manual offsets via arrow keys */
 
-    /* KIFS_ROT animated angle (also used by scene_build_kifs). */
+    /* KIFS_ROT animated angle. */
     float  fold_rot;
-} Scene;
+};
 
-/*
- * scene_iters — how many fold iterations the active preset runs.
- * Defaults to the preset's value; user can override via i / I.
- */
 static int scene_iters(const Scene *s)
 {
     int it = (s->iters_override > 0)
@@ -865,6 +1086,7 @@ static void scene_init(Scene *s, int cols, int rows)
     s->current_preset  = PRESET_TETRA;
     s->current_theme   = 0;
     s->iters_override  = 0;
+    s->debug_mode      = DEBUG_NORMAL;
     s->cols            = cols;
     s->rows            = rows;
     s->cam_dist        = CAM_DIST_DEFAULT;
@@ -901,12 +1123,9 @@ static void scene_tick(Scene *s, float dt)
     if (s->fold_rot >  (float)(2.0 * M_PI)) s->fold_rot -= (float)(2.0 * M_PI);
 }
 
-/*
- * scene_build_kifs — pack per-frame state into a flat KifsParams the
- * DE inner loop can read without chasing pointers.  Called ONCE per
- * frame.  Caches `inv_scale_pow = scale^(−iters)` so the per-pixel
- * DE doesn't recompute it.
- */
+/* scene_build_kifs — pack per-frame state into a flat KifsParams the
+ * DE inner loop can read without chasing pointers.  Caches
+ * inv_scale_pow = scale^(−iters) so per-pixel DE doesn't recompute. */
 static void scene_build_kifs(const Scene *s, KifsParams *kp)
 {
     const PresetParams *pp = &PRESETS[s->current_preset];
@@ -924,26 +1143,7 @@ static void scene_build_kifs(const Scene *s, KifsParams *kp)
     kp->inv_scale_pow = expf(-(float)iters * logf(pp->scale));
 }
 
-/* §7.1 camera basis + per-pixel ray. */
-
-typedef struct {
-    V3    origin;
-    V3    fwd, right, up;
-    float fov_t;
-    float phys_aspect;
-} Camera;
-
-/*
- * camera_basis — orthonormal (fwd, right, up) at the orbiting camera
- * position, plus the FOV tangent and aspect correction for ray gen.
- *
- *   yaw   = orbit_yaw + user_yaw
- *   pitch = clamp(orbit_pitch + user_pitch, ±MAX_PITCH)
- *   eye   = cam_dist · (cos pitch · cos yaw, sin pitch, cos pitch · sin yaw)
- *   fwd   = normalise(origin − eye) = normalise(−eye)
- *   right = normalise(fwd × world_up)
- *   up    = right × fwd
- */
+/* camera_basis — definition (forward-declared in §15). */
 static Camera camera_basis(const Scene *s, int rows_eff)
 {
     float yaw   = s->orbit_yaw   + s->user_yaw;
@@ -963,119 +1163,12 @@ static Camera camera_basis(const Scene *s, int rows_eff)
     return c;
 }
 
-/*
- * pixel_ray — direction from camera through pixel (col, row).
+/* ── §19 render — orchestrator: walk pixels, trace, decorate ─────────── *
  *
- *   u   ∈ [−1, +1]  along screen x
- *   v   ∈ [−1, +1]  along screen y (flipped: top of screen → +v)
- *   dir = forward + u·tan(FOV/2)·right + v·tan(FOV/2)·aspect·up
+ * Production view.  Reads top-to-bottom as the algorithm pseudocode:
+ * each line is one named helper from §6..§17.
  */
-static V3 pixel_ray(int col, int row, int cols, int rows_eff, const Camera *c)
-{
-    float u =  ((float)col + 0.5f) / (float)cols     * 2.0f - 1.0f;
-    float v = -(((float)row + 0.5f) / (float)rows_eff * 2.0f - 1.0f);
-    V3 sx = v3scale(u * c->fov_t,                  c->right);
-    V3 sy = v3scale(v * c->fov_t * c->phys_aspect, c->up);
-    return v3norm(v3add(c->fwd, v3add(sx, sy)));
-}
-
-/* §7.2 lighting + shading. */
-
-/*
- * lambert_with_ao — Lambertian shading + step-count AO.
- *
- *   diffuse = max(0, N · L)
- *   lum     = AMBIENT_LUM + DIFFUSE_LUM · diffuse
- *   ao      = max(AO_FLOOR, 1 − steps / MAX_STEPS)
- *   final   = lum · ao
- *
- * AO floor stops very-deep concavities from washing out completely,
- * so the cathedral interior stays readable.
- */
-static float lambert_with_ao(V3 normal, int steps, V3 light)
-{
-    float ndl = v3dot(normal, light);
-    if (ndl < 0.0f) ndl = 0.0f;
-    float lum = AMBIENT_LUM + DIFFUSE_LUM * ndl;
-
-    float ao = 1.0f - (float)steps / (float)MAX_STEPS;
-    if (ao < AO_FLOOR) ao = AO_FLOOR;
-    return lum * ao;
-}
-
-/*
- * to_slot — quantise a [0, 1] value to an integer slot index 0..7.
- * Clamps gracefully on out-of-range inputs.
- */
-static int to_slot(float x_01)
-{
-    int s = (int)(x_01 * LUMA_SLOT_FLT);
-    if (s < 0)               s = 0;
-    if (s >= LUMA_SLOTS)     s = LUMA_SLOTS - 1;
-    return s;
-}
-
-/*
- * Cell — the (glyph, colour pair, attribute) decoration of one
- * terminal cell.  shade_hit returns this; emit_cell paints it.
- */
-typedef struct { char glyph; int pair; attr_t attr; } Cell;
-
-/*
- * shade_hit — given the sphere-trace result and the world light
- * direction, decide what to draw in this cell.
- *
- *   miss → background
- *   hit  → glyph from luma slot,  colour from orbit-trap slot,
- *          attr (BOLD / NORMAL / DIM) from luma slot
- */
-static Cell shade_hit(const Hit *h, V3 light)
-{
-    if (!h->hit) {
-        return (Cell){ ' ', PAIR_BG, A_NORMAL };
-    }
-
-    float lum    = lambert_with_ao(h->normal, h->steps, light);
-    int   s_lum  = to_slot(lum);
-    int   s_clr  = to_slot(h->trap);
-
-    return (Cell){
-        .glyph = LUMA_GLYPHS[s_lum],
-        .pair  = PAIR_TRAP_BASE + s_clr,
-        .attr  = (s_lum >= 6) ? A_BOLD
-               : (s_lum <= 1) ? A_DIM
-               :                A_NORMAL,
-    };
-}
-
-/*
- * emit_cell — paint one cell, batching attron/attroff so we only
- * call them when (pair, attr) actually changes.  Halves attribute
- * thrash on uniform regions.
- */
-static void emit_cell(int row, int col, Cell c,
-                      int *last_pair, attr_t *last_attr)
-{
-    if (c.pair != *last_pair || c.attr != *last_attr) {
-        if (*last_pair >= 0) attroff(COLOR_PAIR(*last_pair) | *last_attr);
-        attron(COLOR_PAIR(c.pair) | c.attr);
-        *last_pair = c.pair;
-        *last_attr = c.attr;
-    }
-    mvaddch(row, col, (chtype)(unsigned char)c.glyph);
-}
-
-/* §7.3 the orchestrator — one tiny double loop. */
-
-/*
- * scene_render — full-frame raymarch.  Reads top-to-bottom as the
- * algorithm pseudocode itself: each line is one of the named helpers.
- *
- * One ray per terminal cell, no virtual canvas / no upscale: terminal
- * cells ARE the pixels.  Visual is "honest" at low res — no smoothing
- * artefacts that hide poor sampling.
- */
-static void scene_render(const Scene *s)
+static void render_normal(const Scene *s)
 {
     int rows_eff = s->rows - HUD_ROWS;
     if (rows_eff < 1) return;
@@ -1087,10 +1180,7 @@ static void scene_render(const Scene *s)
 
     int    last_pair = -1;
     attr_t last_attr = 0;
-
-    /* HUD takes row 0 (status) and row rows-1 (hint).  We render the
-     * scene into rows [1, rows-2] inclusive so neither overlaps. */
-    int y0 = 1;
+    int    y0        = 1;       /* shift down 1 for top HUD row */
 
     for (int row = 0; row < rows_eff; row++) {
         for (int col = 0; col < s->cols; col++) {
@@ -1104,7 +1194,99 @@ static void scene_render(const Scene *s)
     if (last_pair >= 0) attroff(COLOR_PAIR(last_pair) | last_attr);
 }
 
-/* ── §8 screen — ncurses init / resize / HUD draw / present ──────────── */
+/* ── §20 debug overlays — see the raw rendering signals ──────────────── *
+ *
+ * Three educational visualisations.  Each isolates ONE piece of
+ * intermediate state and paints it directly.
+ *
+ *   TRAP    — orbit-trap value as glyph + colour, no lighting.
+ *             Shows where the colour ramp comes from.
+ *   STEPS   — march-step count → glyph + colour.  Shows the AO
+ *             signal's source — high-step regions glow.
+ *   NORMALS — surface-normal direction → colour band.  Hue from
+ *             azimuth around y-axis; reveals raw geometry without
+ *             lighting interference.
+ */
+
+static Cell debug_cell_for_trap(const Hit *h)
+{
+    if (!h->hit) return (Cell){ ' ', PAIR_BG, A_NORMAL };
+    int s_clr = to_slot(h->trap);
+    return (Cell){
+        .glyph = LUMA_GLYPHS[s_clr],
+        .pair  = PAIR_TRAP_BASE + s_clr,
+        .attr  = A_NORMAL,
+    };
+}
+
+static Cell debug_cell_for_steps(const Hit *h)
+{
+    if (!h->hit) return (Cell){ ' ', PAIR_BG, A_NORMAL };
+    float t = (float)h->steps / (float)(MAX_STEPS - 1);
+    int   slot = to_slot(t);
+    return (Cell){
+        .glyph = LUMA_GLYPHS[slot],
+        .pair  = PAIR_TRAP_BASE + slot,
+        .attr  = (slot >= 6) ? A_BOLD : A_NORMAL,
+    };
+}
+
+static Cell debug_cell_for_normals(const Hit *h)
+{
+    if (!h->hit) return (Cell){ ' ', PAIR_BG, A_NORMAL };
+    float azimuth = atan2f(h->normal.z, h->normal.x);   /* −π..+π */
+    float t = (azimuth + (float)M_PI) / (2.0f * (float)M_PI);
+    int   slot = to_slot(t);
+    float y_lit = (h->normal.y * 0.5f + 0.5f);          /* 0..1 */
+    int   g_slot = to_slot(y_lit);
+    return (Cell){
+        .glyph = LUMA_GLYPHS[g_slot],
+        .pair  = PAIR_TRAP_BASE + slot,
+        .attr  = A_NORMAL,
+    };
+}
+
+/* render_debug — same outer loop as render_normal; only the cell
+ * decorator differs. */
+static void render_debug(const Scene *s, DebugMode mode)
+{
+    int rows_eff = s->rows - HUD_ROWS;
+    if (rows_eff < 1) return;
+
+    Camera     cam = camera_basis(s, rows_eff);
+    KifsParams kp;
+    scene_build_kifs(s, &kp);
+
+    int    last_pair = -1;
+    attr_t last_attr = 0;
+    int    y0        = 1;
+
+    for (int row = 0; row < rows_eff; row++) {
+        for (int col = 0; col < s->cols; col++) {
+            V3  ray = pixel_ray(col, row, s->cols, rows_eff, &cam);
+            Hit h   = sphere_trace(cam.origin, ray, &kp);
+
+            Cell c;
+            switch (mode) {
+            case DEBUG_TRAP:    c = debug_cell_for_trap   (&h); break;
+            case DEBUG_STEPS:   c = debug_cell_for_steps  (&h); break;
+            case DEBUG_NORMALS: c = debug_cell_for_normals(&h); break;
+            default:            c = (Cell){ ' ', PAIR_BG, A_NORMAL }; break;
+            }
+            emit_cell(y0 + row, col, c, &last_pair, &last_attr);
+        }
+    }
+
+    if (last_pair >= 0) attroff(COLOR_PAIR(last_pair) | last_attr);
+}
+
+static void render_active_view(const Scene *s)
+{
+    if (s->debug_mode == DEBUG_NORMAL) render_normal(s);
+    else                               render_debug (s, s->debug_mode);
+}
+
+/* ── §21 screen — ncurses init / HUD / present ───────────────────────── */
 
 typedef struct { int cols, rows; } Screen;
 
@@ -1125,25 +1307,21 @@ static void screen_resize_curses(Screen *sc)
     getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
-/*
- * hud_draw — CLAUDE.md HUD spec:
+/* HUD layout (CLAUDE.md spec):
  *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
- *   row rows-1     PAIR_HINT (cyan   + bold) — key hint
- *
- * Both rows always use A_BOLD so the HUD stays legible against any
- * fractal colour underneath.
- */
+ *   row rows-1     PAIR_HINT (cyan   + bold) — key hint */
 static void hud_draw(const Screen *sc, const Scene *s,
                      double fps, int sim_fps)
 {
-    /* Top row: yellow title + status. */
-    char status[140];
+    char status[160];
     snprintf(status, sizeof status,
-             " %5.1f fps  %3d Hz  preset:%s  theme:%s  iters:%2d  dist:%4.2f  %s ",
+             " %5.1f fps  %3d Hz  preset:%s  theme:%s  iters:%2d  "
+             "debug:%s  dist:%4.2f  %s ",
              fps, sim_fps,
              PRESETS[s->current_preset].name,
              THEMES[s->current_theme].name,
              scene_iters(s),
+             DEBUG_MODE_NAMES[s->debug_mode],
              (double)s->cam_dist,
              s->paused ? "PAUSED" : "running");
     int slen = (int)strlen(status); if (slen > sc->cols) slen = sc->cols;
@@ -1153,24 +1331,23 @@ static void hud_draw(const Screen *sc, const Scene *s,
     mvprintw(0, 0, " KIFS · FRACTAL ");
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* Bottom row: cyan key hint. */
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(sc->rows - 1, 0,
              " q:quit  spc:pause  r:reset  n/N:preset  t/T:theme  "
-             "i/I:iters  z/Z:zoom  arrows:orbit ");
+             "d/D:debug  i/I:iters  z/Z:zoom  arrows:orbit ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
 {
     erase();
-    scene_render(s);
+    render_active_view(s);
     hud_draw(sc, s, fps, sim_fps);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ── §9 app — main loop, signals, key handling, cleanup ──────────────── */
+/* ── §22 app — main loop, signals, key handling ──────────────────────── */
 
 typedef struct {
     Scene                 scene;
@@ -1217,6 +1394,14 @@ static bool app_handle_key(App *app, int ch)
     case 'T':
         s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
         theme_apply(s->current_theme);
+        break;
+
+    case 'd':
+        s->debug_mode = (DebugMode)((s->debug_mode + 1) % DEBUG_MODE_COUNT);
+        break;
+    case 'D':
+        s->debug_mode =
+            (DebugMode)((s->debug_mode + DEBUG_MODE_COUNT - 1) % DEBUG_MODE_COUNT);
         break;
 
     case 'i': {

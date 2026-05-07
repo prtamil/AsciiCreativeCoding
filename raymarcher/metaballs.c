@@ -1,318 +1,508 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * metaballs.c — SDF metaballs with smooth-min blending
+ * metaballs.c — six smoothly-blending spheres traced as one blob
  *
- * DEMO: Six spheres orbit on independent Lissajous paths.  Each sphere
- *       is described by a SIGNED DISTANCE FUNCTION (SDF) — a tiny
- *       function that returns "how far am I from the surface, with
- *       sign showing inside/outside?".  The whole scene is the
- *       SMOOTH MIN of the six per-sphere SDFs: instead of taking the
- *       hard min (which would give six disjoint balls), we use a
- *       polynomial that bumps the result slightly down where two
- *       SDFs are close to each other.  The resulting iso-surface
- *       (where the field equals 0) bulges outward into the gap
- *       between two approaching balls, producing the iconic "wax
- *       neck" of a metaball blob.
+ * DEMO: Six spheres orbit on Lissajous paths.  A polynomial smooth-min
+ *       blends their distance fields so the spheres appear to MELT
+ *       into each other when close — the classic metaball look.  Soft
+ *       shadows from an orbiting light, curvature-based colour bands,
+ *       optional 2×2 super-sample anti-aliasing, four colour themes,
+ *       four debug overlays.
  *
- *       Sphere-traced.  Phong shaded.  Optional Quílez soft shadows.
- *       Surface coloured by mean curvature: high-curvature sphere
- *       tips get the warmest hue in the active theme; flat merged
- *       saddles get the coolest.
- *
- *       Vary k live: small k (press j) → balls barely touch;
- *                    large k (press k) → fully melted single blob.
- *
- *       Themes (cycle with c):
- *         CLASSIC    deep-blue → orange (the canonical look)
- *         OCEAN      navy → bright cyan
- *         EMBER      dark-red → bright yellow
- *         NEON       magenta → green
- *
- * Study alongside:
- *   raymarcher/mandelbulb.c    — same sphere-trace + Phong skeleton,
- *                                 iterated-fractal SDF instead of a
- *                                 finite union of spheres
- *   raymarcher/kifs_fractal.c  — folding-fractal SDF; both files use
- *                                 estimate_normal / estimate_curvature
- *                                 the same way, even though their
- *                                 underlying field is wildly different
- *   raymarcher/donut.c         — a non-SDF raymarcher (parametric
- *                                 sampling + z-buffer) — read for
- *                                 contrast: SDF vs parametric
- *                                 rendering
+ * Study alongside: raymarcher/raymarcher.c (single sphere SDF, no
+ *       blending — read it first).  This file is what happens when
+ *       you put many sphere SDFs together with a smooth blend
+ *       operator instead of a hard min.
  *
  * Section map:
- *   §1 config    — frame, canvas, raymarch, lighting, orbit table
- *   §2 clock     — monotonic timer + sleep
- *   §3 color     — theme palette + HUD/hint pairs (CLAUDE.md spec)
- *   §4 vec3      — value-type 3-D math + clampf
- *   §5 sdf       — sphere_sdf, smin, scene_sdf, normal, curvature
- *   §6 march     — sphere_trace, soft_shadow, phong, cast_ray
- *   §7 scene     — orbits, camera, canvas, render, decorate, draw
- *   §8 screen    — ncurses init / resize / HUD draw / present
- *   §9 app       — main loop, signals, key handling, cleanup
+ *   §1   config         — every tunable named, no magic numbers later
+ *   §2   clock          — monotonic timer + sleep
+ *   §3   color          — theme palette + HUD/hint pairs
+ *   §4   vec3           — 3-D math, value types, clampf
+ *   §5   sphere SDF     — the |p − c| − r primitive
+ *   §6   smooth-min     — polynomial smin that makes the blob
+ *   §7   scene SDF      — fold smin over all balls
+ *   §8   normal         — tetrahedron 4-tap gradient
+ *   §9   curvature      — Laplacian of SDF (mean curvature signal)
+ *   §10  sphere trace   — Hart 1996 march by DE
+ *   §11  soft shadow    — Quílez running-min penumbra
+ *   §12  Phong shade    — ambient + diffuse + specular + shadow
+ *   §13  cast_ray       — one-pixel orchestrator → Hit
+ *   §14  ball orbits + light position
+ *   §15  scene state    — Scene struct + tick + SDF view
+ *   §16  camera         — camera_for_canvas + pixel_ray (with AA offsets)
+ *   §17  canvas         — alloc + render orchestrator (with AA loop)
+ *   §18  cell decoration + emit + canvas_draw
+ *   §19  debug overlays — see the rendering signals raw
+ *   §20  screen         — ncurses init + HUD + present
+ *   §21  app            — main loop, signals, key handling
  *
  * Keys:
- *   q / Q / ESC   quit
- *   space         pause / resume orbit
- *   j / k         blend k smaller / larger    (more separate / more merged)
- *   c / C         cycle theme  (CLASSIC → OCEAN → EMBER → NEON)
- *   s / S         toggle soft shadows
- *   + / =         faster animation
- *   - / _         slower animation
+ *   q / ESC    quit
+ *   space      pause / resume the orbits
+ *   j / k      decrease / increase smoothing (smaller k = sharper joins)
+ *   z / Z      zoom in / out (camera closer / farther)
+ *   a / A      toggle 2×2 anti-aliasing
+ *   s / S      toggle soft shadows
+ *   c / C      next colour theme
+ *   d / D      cycle debug overlay (NORMAL / NORMALS / CURV / SHADOW)
+ *   + / -      animation faster / slower
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra raymarcher/metaballs.c \
  *       -o metaballs -lncurses -lm
  */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
  *
- * Algorithm      : Sphere-traced rendering of an SDF field built by
- *                  SMOOTH-MIN'ing six sphere SDFs.
+ * The file is structured as a textbook.  Read top-to-bottom.
  *
- *                  Per pixel:
- *                    1. ray   = camera through pixel, aspect-corrected
- *                    2. trace = Hart-1996 sphere trace of scene_sdf
- *                    3. on hit:
- *                         normal    = tetrahedron finite differences of SDF
- *                         curvature = Laplacian of SDF / 2  (≈ mean curvature)
- *                         shadow    = Quílez soft penumbra ray to light
- *                         shade     = Phong (ambient + N·L + spec) · shadow
- *                    4. (shade, curvature) → glyph + theme-band colour
+ *   • CONCEPTS         names the algorithm and lists references.
+ *   • MENTAL MODEL     intuition + an ASCII diagram of the blob shape.
+ *   • GUIDED TUTORIAL  ten short answers walking from "how do you
+ *                      blend two SDFs?" through curvature, soft
+ *                      shadows, anti-aliasing, and the Hit-driven
+ *                      multi-overlay architecture.
+ *   • §1..§21          the actual code, each section short and focused.
  *
- *                  scene_sdf is the foldr of smooth-min over balls:
- *                    d = sphere_sdf(p, ball[0])
- *                    for i in 1..N−1:  d = smin(d, sphere_sdf(p, ball[i]), k)
+ * Ten-minute version: read the GUIDED TUTORIAL.  By the end the
+ * §-sections feel like reviewing notes.
  *
- *                  smin (Quílez polynomial form):
- *                    h    = max(k − |a − b|, 0) / k
- *                    smin = min(a, b) − h² · k / 4
- *                  At |a − b| > k it equals plain min (no blend); at
- *                  a = b the result is a − k/4 (max bump).
+ * Math notation used in code:
+ *      p              — a 3-D point (the SDF input)
+ *      cᵢ, rᵢ          — centre and radius of ball i
+ *      d              — distance estimate
+ *      k (k_blend)    — smooth-min blend strength (small = sharp join)
+ *      DE(p)          — distance estimator at p
+ *      N              — surface normal
+ *      H              — mean curvature
+ *      L              — light direction (unit vector)
  *
- *                  Tetrahedron normal trick (Inigo Quílez):
- *                    Sample SDF at 4 vertices of a regular tetrahedron
- *                    around p, combine with sign vectors → gradient.
- *                    4 SDF evals vs 6 for central differences, no
- *                    accuracy loss for typical SDFs.
+ * Background you need:
+ *   • basic vector arithmetic (add, dot, length, normalise)
+ *   • read raymarcher.c first if sphere tracing is unfamiliar
+ *   • the Laplacian operator ∇²f (used in the curvature tutorial T5)
  *
- *                  Mean curvature from SDF:
- *                    For any SDF f, ∇²f at the surface = 2H, where H
- *                    is the mean curvature.  Sphere of radius r:
- *                    Laplacian = 2/r.  Saddle: ≈ 0.  We use the six-
- *                    sample Laplacian stencil and clamp to [0, 1].
- *
- * Data-structure : Stateless math.  No tables, no LUTs.  Per-frame
- *                  state lives in `Scene` (centres + radii + k_blend
- *                  + theme + speed); the inner SDF takes a `SceneSDF`
- *                  view (centres + radii + N + k_blend) so the four
- *                  hot-loop helpers (sdf, normal, curvature, shadow)
- *                  carry one pointer instead of four arguments.
- *
- *                  A half-resolution `Canvas` (2×2 terminal cells per
- *                  canvas pixel) stores `(shade, curvature)` per pixel
- *                  so the render and draw passes are decoupled.
- *
- * Rendering      : ASCII only.  Glyph from shade (Phong luma →
- *                  " .,:;+*oxOX#@"), colour pair from curvature
- *                  (theme × 8-band ramp).  Background = default bg.
- *                  Bright shades (> BOLD_SHADE_THRESHOLD) add A_BOLD
- *                  for an extra punch on highlights.
- *
- * Performance    : ~64 march steps × ~6 sphere evals + 4 normal +
- *                  6 curvature + ~16 shadow ≈ 600 SDF evaluations per
- *                  HIT pixel.  At 80×24 with the 2×2 canvas → 480
- *                  canvas pixels.  Holds 24 fps comfortably; toggle
- *                  shadows off (`s`) to roughly double the frame rate
- *                  on slow terminals.
- *
- * References     :
- *   • Quílez, I. (2013) — "Smooth Minimum"
- *     https://iquilezles.org/articles/smin/
- *     The original article on the polynomial smooth-min used here.
- *   • Quílez, I. — "Distance Functions"
- *     https://iquilezles.org/articles/distfunctions/
- *     Source of the sphere SDF, soft-shadow ray, and tetrahedron
- *     normal.
- *   • Quílez, I. — "Normals for an SDF"
- *     https://iquilezles.org/articles/normalsSDF/
- *     The 4-tap tetrahedron gradient trick.
- *   • Hart, J. C. (1996) — "Sphere Tracing: A Geometric Method for
- *     the Antialiased Ray Tracing of Implicit Surfaces," *The Visual
- *     Computer* 12(10):527–545.  The march-by-DE iteration we use.
- *   • Phong, B. T. (1975) — "Illumination for Computer Generated
- *     Pictures," *CACM* 18(6):311–317.  The lighting model.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * ─────────────────────────────────────────────────────────────────── */
 
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+/* ── CONCEPTS ────────────────────────────────────────────────────────── *
+ *
+ * Algorithm    : METABALLS rendered as a SMOOTH-MIN of N SPHERE SDFs.
+ *                Each ball is f_i(p) = |p − c_i| − r_i (a sphere SDF
+ *                centred at c_i with radius r_i).  Combine N balls
+ *                with the polynomial smooth-min:
+ *                    d = f_0
+ *                    for i in 1..N−1: d = smin(d, f_i, k)
+ *                where smin (Quílez) is a continuous-derivative
+ *                replacement for min that softens the join between
+ *                shapes.  The result is one connected SDF whose
+ *                surface is the metaball blob.
+ *
+ *                Render this SDF with sphere tracing.  Add Phong
+ *                lighting + soft shadows + curvature-based colouring
+ *                + 2×2 SSAA → the demo.
+ *
+ * Data         : Stateless math (Vec3 + sphere_sdf + smin + chain) on
+ *                the hot path.  Per-pixel result is `Hit`
+ *                (hit / p / normal / shade / shadow / curvature).
+ *                The `Canvas` stores 4 separate float arrays —
+ *                shades / curvs / shadows / normals — so each debug
+ *                overlay can read just the field it needs.
+ *
+ * Rendering    : 2×2 block rendering: each canvas pixel maps to a
+ *                CELL_W × CELL_H block of terminal cells.  Quarters
+ *                the per-frame ray count vs full-resolution.  2×2
+ *                SSAA optionally casts 4 rays per canvas pixel and
+ *                averages — coverage attenuation softens silhouettes.
+ *
+ * Performance  : Per AA sample: 1 trace (~10-30 SDF calls) + 4-tap
+ *                normal + 6-tap curvature + 16-step soft shadow.
+ *                ~50-100 SDF calls per hit pixel × AA_SAMPLES.  At
+ *                40×12 canvas (= 80×24 terminal) and AA on, ~100K
+ *                SDF calls per frame.  Each SDF is N_BALLS sphere
+ *                evals = 6 vec3 ops.  Holds 24 fps comfortably.
+ *
+ * References   :
+ *   • Blinn, J. F. (1982) — "A Generalization of Algebraic Surface
+ *     Drawing", *ACM TOG* 1(3):235-256.  The original "blobby
+ *     surfaces" paper that introduced the metaball idea.
+ *   • Hart, J. C. (1996) — "Sphere Tracing: A Geometric Method for
+ *     the Antialiased Ray Tracing of Implicit Surfaces", *Visual
+ *     Computer* 12(10):527-545.  The march loop.
+ *   • Quílez, I. — "Distance Functions" / "smooth minimum"
+ *     https://iquilezles.org/articles/distfunctions/
+ *     https://iquilezles.org/articles/smin/
+ *     The polynomial smin (§6) and the running-min soft shadow (§11).
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ────────────────────────────────────────────────────── *
  *
  * CORE IDEA
  * ─────────
- * One function rules everything.  An SDF f(p) returns "how far is p
- * from the nearest surface, with sign showing inside vs outside?".
- * Hard-min'ing six sphere SDFs gives six disjoint balls.  REPLACING
- * that hard min with a polynomial smooth-min converts the boolean
- * union into a soft union: the field gently bulges outward wherever
- * two distance fields are within k of each other, producing the
- * characteristic "wax dripping between blobs" look.  Everything
- * else — sphere tracing, Phong shading, curvature colour — is
- * bookkeeping on top of that one swap.
+ * Six independent spheres exist in 3-D space.  At any point p, ask
+ * each one "how far am I from your surface?" and you get six
+ * distances.  Naïvely combining with min() gives the union of the
+ * six spheres — but the join between two spheres is a SHARP CIRCLE
+ * (where the two distance fields are equal).  Replace min() with
+ * SMOOTH-MIN, a polynomial that's identical to min when the two
+ * distances differ but smoothly interpolates when they're close.
+ * The visual result: spheres now MELT into each other near the
+ * join, producing necks, droplets, drips — the classic blobby
+ * metaball look.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
- * Picture each ball as a small magnet wrapped in a thin sheet of
- * warm wax.  When two magnets get within distance k, the wax
- * stretches into a smooth neck instead of forcing the spheres to
- * clip through each other.  The k slider is "wax temperature":
- * k = 0.05 is cold, brittle, the spheres just touch; k = 4 is
- * molten, you barely see individuals.  The render is a still
- * photograph of that wax with one spotlight, tinted by how curved
- * each surface patch is.
+ * Think of mercury droplets on a flat surface.  When two droplets
+ * are far apart, each is a perfect sphere.  Push them close
+ * together: surface tension pulls them into contact and forms a
+ * smooth NECK between the two — they don't intersect with a sharp
+ * circle, they merge.  smin is the math version of surface tension:
+ * it bulges the iso-surface OUTWARD wherever two distance fields
+ * are within a "blend distance" k of each other.
  *
- *      ┌─────────────────────────────────────────────────────────┐
- *      │                                                         │
- *      │     light                                               │
- *      │       ☀  ↘                                              │
- *      │            ↘                                            │
- *      │            ⬤    (hard min: disjoint)                    │
- *      │              ⬤                                          │
- *      │                                                         │
- *      │            ⬤▬⬤  (smooth min: necked!)                   │
- *      │                                                         │
- *      │   per pixel:  trace → hit? → normal + curv +            │
- *      │                              shadow + shade → cell      │
- *      └─────────────────────────────────────────────────────────┘
+ * The blob's silhouette in cross-section, two balls with smin:
+ *
+ *      with naïve min:                 with smin:
+ *           ╭───╮  ╭───╮                  ╭───────╮
+ *          (     ╳     )                 (         )
+ *           ╰───╯  ╰───╯                  ╰───────╯
+ *           ▲   ▲ ▲    ▲                    ▲   ▲
+ *         ball  intersection             ball  smooth
+ *               circle                          neck
+ *               (sharp)                         (continuous derivative)
+ *
+ * As k → 0, smin → min (back to sharp joins).  As k grows, the
+ * neck thickens until eventually two distant balls visibly bulge
+ * toward each other even before they touch.
  *
  * ALGORITHM IN STEPS
  * ──────────────────
- *  Per frame:
- *    1. ANIMATE — advance scene time; recompute each ball's centre on
- *       its Lissajous orbit (BallOrbit has freq_x/y/z, phase_x/y, r).
- *    2. CAMERA  — origin (0, 0, CAM_Z), FOV tangent, aspect for the
- *       half-resolution canvas (CELL_W × CELL_H = 2 × 2 terminal
- *       cells per canvas pixel).
- *    3. LIGHT   — slowly orbiting position; one fixed direction in
- *       world space, normalised at use.
+ * Once per frame:
+ *   1. animate     advance time × speed (paused freezes it)
+ *   2. orbit       update each ball's position via Lissajous formula
+ *                  update light position via its own slower orbit
  *
- *  Per canvas pixel (px, py):
- *    4. RAY DIRECTION via pixel_ray.
- *    5. SPHERE TRACE: t = 0; loop:
- *           p = origin + t · dir
- *           d = scene_sdf(p)         (smooth-min of all spheres)
- *           if d < HIT_EPS: hit at t
- *           if t > MAX_DIST: miss
- *           t += d                    (largest safe step)
- *    6. ON HIT: cast_ray collects everything in a Hit:
- *           normal     = estimate_normal     (4-tap tetrahedron)
- *           shadow     = soft_shadow ray to light (16 steps, penumbra)
- *           shade      = Phong(N·L + (R·V)^shin) · shadow
- *           curvature  = estimate_curvature (6-tap Laplacian / 2)
+ * Once per canvas pixel × per AA sample:
+ *   3. ray         build a primary ray from camera through sub-pixel
+ *   4. trace       sphere-march; hit when scene_sdf < HIT_EPS
+ *   5. on hit:     4-tap tetrahedral normal
+ *                  6-tap Laplacian → curvature
+ *                  soft shadow ray to the light (running-min penumbra)
+ *                  Phong shading combining all three
+ *   6. accumulate  sum into per-pixel (shade, normal, curv, shadow)
  *
- *  After all pixels:
- *    7. DRAW — per canvas pixel, decorate(shade, curvature, theme):
- *           glyph   = LUMA_RAMP[shade]
- *           pair    = PAIR_THEME_BASE + theme · N + curv-band
- *           attr    = (shade > BOLD_THRESH) ? A_BOLD : 0
- *       Then emit a CELL_W × CELL_H block of that glyph + pair +
- *       attr at the canvas pixel's screen position.
+ * Once per canvas pixel:
+ *   7. average     divide sums by hit_count
+ *                  shade *= coverage = hit_count / n_samples (AA edge)
+ *
+ * Once per cell:
+ *   8. paint       shade → glyph; curvature → colour band; emit
+ *                  CELL_W × CELL_H block
  *
  * KEY FORMULAS
  * ────────────
- *   Sphere SDF:
- *     f(p, c, r) = |p − c| − r
+ * Sphere SDF:
+ *      f(p, c, r) = |p − c| − r
  *
- *   Smooth min:
- *     h    = max(k − |a − b|, 0) / k
- *     smin = min(a, b) − h² · k / 4
+ * Polynomial smooth-min (Quílez):
+ *      h    = max(k − |a − b|, 0) / k
+ *      smin = min(a, b) − h² · k / 4
  *
- *   Scene SDF:
- *     d = f(p, ball₀)
- *     d = smin(d, f(p, ballᵢ), k)   for i = 1..N−1
+ * Scene SDF (fold smin over balls):
+ *      d = f₀(p)
+ *      for i in 1..N−1: d = smin(d, fᵢ(p), k)
  *
- *   Sphere trace:
- *     p_{k+1} = p_k + d(p_k) · dir
+ * Tetrahedron normal (Quílez 4-tap, no shared-axis bias):
+ *      f0 = SDF(p + ε·( 1, −1, −1))
+ *      f1 = SDF(p + ε·(−1,  1, −1))
+ *      f2 = SDF(p + ε·(−1, −1,  1))
+ *      f3 = SDF(p + ε·( 1,  1,  1))
+ *      N  = normalise( f0−f1−f2+f3, −f0+f1−f2+f3, −f0−f1+f2+f3 )
  *
- *   Tetrahedron normal:
- *     k₀ = (+1, −1, −1)   k₁ = (−1, +1, −1)
- *     k₂ = (−1, −1, +1)   k₃ = (+1, +1, +1)
- *     ∇f ≈ Σ k_i · f(p + ε k_i),    N = normalise(∇f)
+ * Mean curvature from Laplacian of SDF:
+ *      ∇²f(p) ≈ ( Σ axis-aligned neighbours of f − 6·f(p) ) / ε²
+ *      H ≈ ½ ∇²f      (true at the surface for unit-gradient SDFs)
  *
- *   Mean curvature:
- *     ∇²f ≈ (Σ f(p ± ε ê_axis) − 6 · f(p)) / ε²
- *     mean curv = ∇²f / 2
+ * Soft shadow (running-min penumbra):
+ *      result = 1
+ *      for each step toward the light:
+ *          h = SDF(p)
+ *          if h < ε·½: return 0
+ *          result = min(result, K · h / t)
+ *      return clamp(result, 0, 1)
  *
- *   Phong shading:
- *     L = AMBIENT + shadow · (KD · max(0, N · L) + KS · max(0, R · V)^SHIN)
- *     R = 2 (N · L) N − L
+ * Phong with shadow:
+ *      I = KA + shadow · (KD · max(0, N·L) + KS · max(0, R·V)^SHIN)
+ *      (shadow multiplies only the direct terms — ambient never goes black)
  *
- *   Soft shadow (Quílez):
- *     res = 1
- *     march from surface toward light; res = min(res, K · d / t)
- *     return clamp(res, 0, 1)
- *
- *   Aspect correction:
- *     phys_aspect = (rows · CELL_H · CELL_ASPECT) / (cols · CELL_W)
+ * AA coverage softening:
+ *      coverage = hit_count / n_samples
+ *      pixel_shade = mean(hit_shades) · coverage
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *   • k → 0 in smin causes division by zero.  K_MIN floor (0.05)
- *     keeps h finite; setting K_MIN to 0 will crash on smin.
+ *   • k → 0: smin formula DIVIDES BY k.  K_MIN (0.05) clamps.  At
+ *     k = 0 you'd get a divide-by-zero NaN; below K_MIN the joins
+ *     are visibly sharp anyway.
  *
- *   • Concave necks between two balls have NEGATIVE Laplacian
- *     (saddle curvature).  estimate_curvature returns the raw
- *     value; the caller clamps to [0, 1] so concave regions register
- *     as the lowest band rather than wrapping.
+ *   • Very large k: balls visibly bulge toward each other even when
+ *     spatially well-separated.  The blob loses recognisable
+ *     individual-ball structure.  K_MAX (4.0) is the practical
+ *     upper bound where the demo still reads as "blobby spheres".
  *
- *   • RM_HIT_EPS too small (< 1e-4) plus large k_blend makes the
- *     smooth region's distance estimate over-shoot — sphere tracing
- *     assumes a Lipschitz=1 SDF, and smin slightly violates that
- *     near the seam.  Keeping HIT_EPS at 5e-3 hides the violation
- *     in practice.
+ *   • Camera inside the blob: at CAM_Z_MIN (2.5) the camera is
+ *     close enough that maximally-extended ball orbits can pass IN
+ *     FRONT of the camera plane.  Visible as flickers when a ball
+ *     swings past.  Acceptable trade-off for the dramatic close-up.
  *
- *   • dt teleport on slow first frame.  We cap dt at 200 ms so the
- *     orbit never advances by more than ~7 simulation steps in one
- *     frame, regardless of how slow the previous frame was.
+ *   • SSAA off (`a` toggle): edges become blocky 2×2 stair-stepping.
+ *     Useful on slow terminals.  AA on quadruples per-pixel cost
+ *     but cleans up the silhouette.
  *
- *   • Canvas allocation depends on cols / CELL_W and rows / CELL_H —
- *     guard against zero (very narrow terminal) by clamping to 1.
+ *   • Soft shadow ray for highly-overlapping balls: the running-min
+ *     can saturate to 0 inside the blob.  AMBIENT (KA = 0.08)
+ *     ensures pixels deep in shadow still read.
  *
- *   • Soft shadows multiply per-hit work by SHADOW_STEPS ≈ 16.
- *     Toggling them off (`s`) on slow terminals roughly doubles the
- *     frame rate.  No visible silhouette change — only the shadow
- *     boundary softness.
- *
- *   • HUD takes 2 rows (top status + bottom hint).  Canvas is
- *     vertically centred in the remaining `rows − 2` rows.  On a
- *     terminal with rows < 6 the canvas height clamps to 1.
+ *   • Curvature estimate is noisy where the SDF gradient is small
+ *     (smin transition zones).  CURV_SCALE (0.25) tames the worst
+ *     of it; visually it just shifts which colour band a transition
+ *     pixel falls into.
  *
  * HOW TO VERIFY
  * ─────────────
- *   • Press j five times to drop k below the merge threshold.  The
- *     six balls separate into distinctly-bordered spheres with no
- *     visible neck between them.
+ *   • Press k repeatedly: balls progressively merge into one
+ *     amoeba.  Watch the necks form and grow.  Press j to reverse:
+ *     balls separate back toward distinct spheres.
  *
- *   • Press k five times to push k high.  The six should look like
- *     one amoeba; the curvature colouring shows the merged saddle
- *     regions in the COOLEST band.
+ *   • At very small k (after pressing j many times) the blob's
+ *     surface develops sharp ridges where balls meet — that's the
+ *     min() limit case.
  *
- *   • Pause (space) and confirm the orbit freezes but key handling
- *     still works — proves render and tick are decoupled.
+ *   • Press d to cycle debug overlays.  CURV shows where the colour-
+ *     band signal comes from (necks have one curvature, caps another).
+ *     SHADOW shows where the soft-shadow ray contributes.  NORMALS
+ *     shows raw geometry without lighting.
  *
- *   • Toggle soft shadows (`s`).  Shadow boundary softens visibly
- *     without changing the silhouette or curvature colours.
+ *   • Toggle aa with `a`.  Off: blocky edges.  On: soft edges where
+ *     coverage attenuates partial-hit pixels.
  *
- *   • Cycle themes (`c`).  Geometry identical, only the curvature
- *     palette changes.
+ *   • Toggle shadow with `s`.  Off: lighting becomes uniform Phong
+ *     (no contact shadows).  On: blob-on-blob darkening visible.
  *
- *   • Resize the terminal — canvas should reallocate and re-centre.
+ *   • Press c to cycle themes.  Geometry stays put; only the
+ *     curvature → colour ramp changes.
  *
- *   • Set N_BALLS = 1 in §1 and recompile.  The result is a single
- *     sphere; k_blend has no effect (smin is only invoked between
- *     two SDFs).  Verifies the algorithm degenerates correctly.
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL — ten short answers ─────────────────────────────── *
  *
- * ─────────────────────────────────────────────────────────────────────── */
+ *
+ * T1: How do you combine multiple SDFs into one scene?
+ * ────────────────────────────────────────────────────
+ * The simplest combination operator: take the MINIMUM of each shape's
+ * SDF.  At any point p:
+ *
+ *      union_sdf(p) = min( sphere1_sdf(p), sphere2_sdf(p), … )
+ *
+ * The min works because for any p outside ALL shapes, the closest
+ * shape determines the distance to the union.  Inside any shape,
+ * the negative SDF of THAT shape is the most-negative value (the
+ * point is "deepest inside" that one), so min picks it correctly.
+ *
+ * Verify with two unit spheres at (−0.5, 0, 0) and (+0.5, 0, 0):
+ *      p = (0, 0, 0):  s1 = 0.5 − 1 = −0.5,  s2 = 0.5 − 1 = −0.5
+ *                      union_sdf = min(−0.5, −0.5) = −0.5
+ *                      → point is 0.5 inside the union ✓
+ *      p = (1.5, 0, 0): s1 = 2.0 − 1 = 1.0,  s2 = 1.0 − 1 = 0.0
+ *                      union_sdf = min(1.0, 0.0) = 0.0
+ *                      → point is on the surface of sphere 2 ✓
+ *
+ * The PROBLEM: min() has a discontinuous derivative at the join
+ * (where the two SDFs are equal).  Visually this is a SHARP CIRCLE
+ * where the spheres meet — not the smooth metaball look we want.
+ *
+ *
+ * T2: Smooth-min — the polynomial blend
+ * ─────────────────────────────────────
+ * Replace min with a function that:
+ *   - equals min when |a − b| > k        (no smoothing far from join)
+ *   - smoothly interpolates when |a − b| < k
+ *
+ * Quílez's polynomial smin:
+ *
+ *      h    = max(k − |a − b|, 0) / k          ∈ [0, 1]
+ *      smin = min(a, b) − h² · k / 4
+ *
+ * Verify the limiting cases:
+ *      |a − b| = 0       (the join):  h = 1 → bump = k/4 → max smoothing
+ *      |a − b| ≥ k       (far apart): h = 0 → bump = 0   → smin = min
+ *
+ * The bump h²·k/4 is what bulges the iso-surface OUTWARD — it makes
+ * the SDF report a SMALLER distance than min would, in the gap
+ * between the two shapes.  Pixels in that gap become "inside the
+ * blob" even though they're outside both individual shapes.  That's
+ * the metaball neck.
+ *
+ *
+ * T3: Building the scene SDF — fold smin over N balls
+ * ───────────────────────────────────────────────────
+ * For N metaballs we apply smin as a left-fold (reduction):
+ *
+ *      d = sphere_sdf(p, ball_0)
+ *      for i in 1..N−1:
+ *          d = smin(d, sphere_sdf(p, ball_i), k)
+ *      return d
+ *
+ * The order of the fold matters in principle (smin is associative
+ * only in the limit k → 0), but for our k values and well-separated
+ * balls the visual difference is invisible.
+ *
+ * The resulting `d` is the metaball blob's distance estimate.  Feed
+ * it to sphere tracing (T4) and you have a renderer.
+ *
+ *
+ * T4: Sphere tracing recap (see raymarcher.c for full derivation)
+ * ───────────────────────────────────────────────────────────────
+ *      t = 0
+ *      repeat MAX_STEPS:
+ *          d = scene_sdf(ro + t·rd)
+ *          if d < HIT_EPS:   return t   (HIT)
+ *          if t > MAX_DIST:  return -1  (MISS)
+ *          t += d
+ *
+ * The smooth-min SDF stays Lipschitz (the derivative magnitude is
+ * bounded), so sphere tracing converges.  No tricks needed beyond
+ * what raymarcher.c already does.
+ *
+ *
+ * T5: Curvature from the Laplacian of the SDF
+ * ───────────────────────────────────────────
+ * For an SDF with unit gradient (true distance functions are
+ * Lipschitz-1), the LAPLACIAN ∇²f at a surface point equals
+ * approximately TWICE the mean curvature H:
+ *
+ *      ∇²f ≈ 2H   at points where |∇f| = 1
+ *
+ * Mean curvature measures how "bendy" a surface is at p:
+ *      H > 0:  convex (sphere caps, ball tops)
+ *      H = 0:  flat or saddle
+ *      H < 0:  concave (necks between merged balls)
+ *
+ * Approximate the Laplacian with a 6-tap stencil:
+ *
+ *      ∇²f ≈ ( f(p+εx) + f(p−εx) +
+ *              f(p+εy) + f(p−εy) +
+ *              f(p+εz) + f(p−εz) − 6·f(p) ) / ε²
+ *
+ * In the metaball demo we use this to COLOUR the surface.  Map
+ * curvature to a colour band: necks (high curvature) get one band,
+ * sphere caps (lower curvature) get another.  The result: the join
+ * regions visually pop out from the rest of the blob.
+ *
+ *
+ * T6: Soft shadow — Quílez running-min penumbra
+ * ─────────────────────────────────────────────
+ * From a hit point, march a ray TOWARD the light source.  At each
+ * step, evaluate the SDF.  If we ever hit something, the light is
+ * blocked.  But we want SOFT shadows — penumbra, not pure on/off.
+ *
+ *      result = 1
+ *      for each step at distance t from origin:
+ *          h = SDF(p_at_t)
+ *          if h < ε·½:   return 0   (definitely blocked)
+ *          result = min(result, K · h / t)
+ *          t += max(h, ε)
+ *
+ * The KEY trick: track the RUNNING MINIMUM of K·h/t.  If the ray
+ * comes CLOSE to a surface (small h at distance t), K·h/t drops
+ * below 1, dimming the light proportionally.  If the ray actually
+ * hits, return 0 (full shadow).  If the ray clears the surface but
+ * passed close, the running min preserves that "near miss" as
+ * partial shadow.
+ *
+ * The result is a smooth penumbra without any extra rays.  K
+ * controls how SHARP the shadow edge is — higher K = harder shadow.
+ *
+ *
+ * T7: Phong with shadow — three components stacked
+ * ────────────────────────────────────────────────
+ *      I = KA + shadow · (KD · max(0, N·L) + KS · max(0, R·V)^SHIN)
+ *
+ * The `shadow` factor multiplies only the direct components
+ * (diffuse + specular), NOT the ambient.  Why: pure black pixels
+ * are visually unreadable; a faint ambient floor preserves the
+ * shape outline even in deep shadow.
+ *
+ * For metaballs, the orbiting light traces specular highlights
+ * across the blob's surface as it moves — and the shadows that one
+ * lobe casts on another visibly shift each frame.
+ *
+ *
+ * T8: Anti-aliasing — coverage-based edge softening
+ * ─────────────────────────────────────────────────
+ * Without AA, each canvas pixel = one ray.  At silhouette pixels,
+ * the single ray either hits (full shade) or misses (background) —
+ * no in-between.  Result: blocky edges.
+ *
+ * Super-sample anti-aliasing (SSAA) casts MULTIPLE rays per pixel
+ * at sub-pixel offsets, then averages:
+ *
+ *      for each pixel:
+ *          for sample in 0..N_SAMPLES−1:
+ *              cast ray at (px + AA_OFFSETS[sample])
+ *              if hit: accumulate
+ *          coverage = hits / N_SAMPLES
+ *          pixel_shade = (sum_shade / hits) · coverage
+ *
+ * The COVERAGE multiplication is the key.  Where the ray-set
+ * straddles a silhouette, only some samples hit (e.g. 2/4).  The
+ * average of those 2 hit shades is full-bright, but multiplying
+ * by 0.5 coverage produces a half-bright pixel — partial coverage
+ * → edge softening.
+ *
+ * 4 samples (2×2 grid) is the standard quality/cost trade-off.
+ * AA quadruples per-pixel ray cost; toggleable for slow terminals.
+ *
+ *
+ * T9: Half-resolution rendering — quartering ray cost
+ * ───────────────────────────────────────────────────
+ * Each canvas pixel is painted as a CELL_W × CELL_H = 2×2 block
+ * of terminal cells.  At an 80×24 terminal:
+ *      canvas = (80/2) × (24/2) = 40 × 12 = 480 pixels
+ *      vs full-res 80×24 = 1920 pixels
+ *
+ * That's 1/4 the rays per frame.  Combined with AA at 4 samples
+ * per canvas pixel:
+ *      total = 480 × 4 = 1920 rays
+ *
+ * Same total ray count as full-res no-AA, but spread 4-per-pixel
+ * across the smaller canvas.  AA's coverage softening + half-res's
+ * lower silhouette resolution combine to give edges that look
+ * smoother than full-res no-AA at the same total cost.
+ *
+ *
+ * T10: The Hit struct — one ray's complete result
+ * ───────────────────────────────────────────────
+ *      Hit { hit, p, normal, shade, shadow, curvature }
+ *
+ * Each AA sample produces one Hit.  The renderer accumulates 1-4
+ * Hits per canvas pixel into per-pixel sums (then averages).  The
+ * Canvas stores 4 separate float arrays for SHADE, NORMAL,
+ * CURVATURE, SHADOW — that lets each debug overlay read just the
+ * field it needs:
+ *
+ *      DEBUG_NORMAL      shade + curvature → glyph + colour
+ *      DEBUG_NORMALS     normal direction → colour band, N.y → glyph
+ *      DEBUG_CURVATURE   curvature → glyph + colour
+ *      DEBUG_SHADOW      shadow → glyph + colour
+ *
+ * Adding a fifth overlay would be ~30 lines of new code with no
+ * change to the trace loop.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* End of textbook.  The rest of the file is the worked exercises. */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
@@ -342,12 +532,7 @@ enum {
     N_CURV_BANDS  = 8,
 };
 
-/* §1.2 colour-pair IDs.
- *
- *   PAIR_HUD                       yellow + bold (status row)
- *   PAIR_HINT                      cyan   + bold (key-hint row)
- *   PAIR_THEME_BASE + θ·N + b      curvature band b in theme θ
- */
+/* §1.2 colour-pair IDs. */
 #define PAIR_HUD          1
 #define PAIR_HINT         2
 #define PAIR_THEME_BASE   3        /* +0..+(N_THEMES * N_CURV_BANDS − 1) */
@@ -357,42 +542,48 @@ enum {
 #define NS_PER_SEC      1000000000LL
 #define NS_PER_MS          1000000LL
 
-/* §1.4 canvas — half-resolution block rendering.
+/* §1.4 canvas — half-resolution block rendering (T9).
  *
- * Each canvas pixel is drawn as a CELL_W × CELL_H block of terminal
- * cells.  2 × 2 quarters the per-frame ray count, keeping the frame
- * rate comfortable despite the heavier SDF math.  CELL_ASPECT is
- * the physical height-to-width ratio of one terminal character cell;
- * multiplied into the vertical ray direction so circles render round.
+ * Each canvas pixel becomes a CELL_W × CELL_H block of terminal cells.
+ * 2×2 quarters the per-frame ray count.
  */
 #define CELL_W        2
 #define CELL_H        2
-#define CELL_ASPECT   2.0f
+#define CELL_ASPECT   2.0f       /* terminal cell h / w (physical) */
 
-/* §1.5 sphere-trace tunables.
- *
- * RM_MAX_STEPS  hard cap on march steps per ray.
- * RM_HIT_EPS    "we're touching the surface" threshold.
- * RM_MAX_DIST   ray-length budget; past this we declare miss.
- */
+/* §1.5 sphere-trace tunables. */
 #define RM_MAX_STEPS    64
 #define RM_HIT_EPS      0.005f
 #define RM_MAX_DIST     12.0f
 
-/* §1.6 camera. */
-#define CAM_Z           5.0f       /* camera at (0, 0, CAM_Z), looking −z */
-#define FOV_HALF_TAN    0.55f      /* tan(FOV / 2) — vertical & horizontal */
+/* §1.6 camera (zoom). */
+#define CAM_Z_DEFAULT   5.0f
+#define CAM_Z_MIN       2.5f      /* keep camera outside ball orbit */
+#define CAM_Z_MAX      14.0f
+#define CAM_ZOOM_STEP   0.40f
+#define FOV_HALF_TAN    0.55f     /* tan(FOV/2) */
+
+/* §1.6.1 anti-aliasing (T8).
+ *
+ * 4 samples (2×2 grid) at sub-pixel offsets.  Cost: 4× per-pixel
+ * rays.  Toggle via `a` / `A` for slow terminals.
+ */
+#define AA_SAMPLES      4
+
+static const float AA_OFFSETS[AA_SAMPLES][2] = {
+    { 0.25f, 0.25f }, { 0.75f, 0.25f },
+    { 0.25f, 0.75f }, { 0.75f, 0.75f },
+};
 
 /* §1.7 smooth-min blend k.
- *
- *   K_MIN  → balls stay separate (almost-hard min)
- *   K_MAX  → balls merge into one blob
- *   K_MIN  must be > 0 to avoid division by zero in smin
+ *      K_MIN  → balls stay separate (hard min)
+ *      K_MAX  → balls visibly bulge toward each other
+ *      K_MIN must be > 0 to avoid division by zero (T2).
  */
 #define K_DEFAULT       0.8f
 #define K_MIN           0.05f
 #define K_MAX           4.0f
-#define K_STEP          1.35f      /* multiplier per j / k keypress */
+#define K_STEP          1.35f
 
 /* §1.8 animation speed (multiplier on dt that drives the orbit). */
 #define SPD_DEFAULT     0.35f
@@ -400,54 +591,40 @@ enum {
 #define SPD_MAX         3.0f
 #define SPD_STEP        1.35f
 
-/* §1.9 Phong shading coefficients.
- *
- *   KA      ambient            — base lit even where N·L = 0
- *   KD      diffuse            — Lambert N·L term
- *   KS      specular           — (R·V)^SHIN term
- *   SHIN    specular sharpness
- *   BOLD_SHADE_THRESHOLD       — A_BOLD added when shade exceeds this
- */
+/* §1.9 Phong shading + bold threshold. */
 #define KA                       0.08f
 #define KD                       0.75f
 #define KS                       0.45f
 #define SHIN                     32.0f
 #define BOLD_SHADE_THRESHOLD     0.72f
 
-/* §1.10 soft shadow.
- *
- *   SHADOW_STEPS        max march steps for the shadow ray
- *   SHADOW_K            penumbra hardness — bigger = sharper edge
- *   SHADOW_BIAS         offset along normal at march start (avoids
- *                       self-shadow due to numerical noise)
- *   SHADOW_NEAR         t-min for the shadow march (skip the bias zone)
+/* §1.10 soft shadow (T6).
+ *      SHADOW_K       hardness (bigger = sharper shadow edge)
+ *      SHADOW_BIAS    offset along normal at march start (anti-self-shadow)
+ *      SHADOW_NEAR    t-min for the shadow march
  */
 #define SHADOW_STEPS    16
 #define SHADOW_K        8.0f
 #define SHADOW_BIAS     0.01f
 #define SHADOW_NEAR     0.02f
 
-/* §1.11 normal + curvature estimation.
- *
- * ε for the gradient stencil should be small enough to capture local
- * geometry but large enough that DE quantisation noise doesn't
- * dominate.  CURV_SCALE maps the raw Laplacian (which for our
- * default sphere radii peaks near 4) into [0, 1] for the colour ramp.
- */
+/* §1.11 normal + curvature estimation. */
 #define NORMAL_EPS      0.004f
 #define CURV_EPS        0.06f
-#define CURV_SCALE      0.25f
+#define CURV_SCALE      0.25f     /* maps raw Laplacian into [0, 1] */
 
-/* §1.12 ball orbits — Lissajous frequencies + phase offsets + radii.
- *
- * Each ball traces:
- *     x = ORBIT_RX · sin(freq_x · t + phase_x)
- *     y = ORBIT_RY · sin(freq_y · t + phase_y)
- *     z = ORBIT_RZ · cos(freq_z · t)
- *
- * Different (freq_x, freq_y, freq_z) ratios produce non-repeating
- * paths.  Phase offsets spread the balls evenly at t = 0.  Radii vary
- * slightly so the balls look distinct when separated.
+/* §1.12 light orbit. */
+#define LIGHT_RATE       0.6f
+#define LIGHT_RATE_Y     (0.6f * 0.45f)
+#define LIGHT_RADIUS_X   4.0f
+#define LIGHT_RADIUS_Y   2.0f
+#define LIGHT_BIAS_Y     2.5f
+#define LIGHT_HEIGHT_Z   3.5f
+
+/* §1.13 ball orbits — Lissajous frequencies + phase offsets + radii.
+ *      x = ORBIT_RX · sin(freq_x · t + phase_x)
+ *      y = ORBIT_RY · sin(freq_y · t + phase_y)
+ *      z = ORBIT_RZ · cos(freq_z · t)
  */
 typedef struct {
     float freq_x, freq_y, freq_z;
@@ -469,36 +646,36 @@ static const BallOrbit ORBITS[N_BALLS] = {
     {  1.0f,  2.5f,  2.0f,  5.236f, 0.262f,  0.52f },
 };
 
-/* §1.13 themes — N_THEMES × N_CURV_BANDS.
- *
- * Each theme is an 8-band ramp from low curvature (slot 0, cool/dim)
- * to high curvature (slot 7, warm/bright).  Per CLAUDE.md every
- * entry sits in the bright half of the 256-cube.
- */
+/* §1.14 themes — N_THEMES × N_CURV_BANDS.  Per CLAUDE.md every entry
+ * sits in the bright half of the 256-cube. */
 typedef struct {
     const char *name;
     short       bands[N_CURV_BANDS];
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
-    /* CLASSIC: deep blue (low) → orange (high) — the canonical look. */
     { "CLASSIC ", {  27,  33,  38,  44, 130, 166, 202, 214 } },
-    /* OCEAN: navy → bright cyan. */
     { "OCEAN   ", {  25,  26,  27,  31,  38,  45,  51, 159 } },
-    /* EMBER: dark red → bright yellow. */
     { "EMBER   ", {  88, 124, 160, 196, 202, 208, 214, 228 } },
-    /* NEON: magenta → green. */
     { "NEON    ", { 201, 165, 129,  93,  57,  82, 118, 155 } },
 };
 
-/* §1.14 luminance ramp — dark → bright.
- *
- * Slot 0 is space, so a hit pixel with shade ≈ 0 (back-facing or
- * deep shadow) leaves the cell empty.  The ambient term (KA) keeps
- * any visible surface above slot 0 in practice.
- */
+/* §1.15 luminance glyph ramp — dark → bright. */
 static const char LUMA_RAMP[] = " .,:;+*oxOX#@";
 #define LUMA_RAMP_LEN   ((int)(sizeof LUMA_RAMP - 1))
+
+/* §1.16 debug overlays — d / D cycles between them. */
+typedef enum {
+    DEBUG_NORMAL    = 0,    /* full lit blob (production view)       */
+    DEBUG_NORMALS   = 1,    /* surface normal direction → colour     */
+    DEBUG_CURVATURE = 2,    /* curvature → colour, no lighting       */
+    DEBUG_SHADOW    = 3,    /* shadow factor → glyph density         */
+    DEBUG_MODE_COUNT = 4,
+} DebugMode;
+
+static const char *DEBUG_MODE_NAMES[DEBUG_MODE_COUNT] = {
+    "NORMAL ", "NORMALS", "CURV   ", "SHADOW ",
+};
 
 /* ── §2 clock — monotonic timer + sleep ──────────────────────────────── */
 
@@ -533,7 +710,6 @@ static void color_init(void)
     } else {
         init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
         init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-        /* 8-colour fallback: low bands cyan, high bands yellow/white. */
         for (int t = 0; t < N_THEMES; t++)
             for (int b = 0; b < N_CURV_BANDS; b++)
                 init_pair((short)PAIR_FOR(t, b),
@@ -545,7 +721,7 @@ static void color_init(void)
     }
 }
 
-/* ── §4 vec3 — value-type 3-D math ───────────────────────────────────── */
+/* ── §4 vec3 — value-type 3-D math + clampf ──────────────────────────── */
 
 typedef struct { float x, y, z; } Vec3;
 
@@ -566,71 +742,25 @@ static inline float clampf(float x, float lo, float hi)
     return x < lo ? lo : (x > hi ? hi : x);
 }
 
-/* ── §5 sdf — sphere, smooth-min, scene, normal, curvature ───────────── *
+/* ── §5 sphere SDF — the |p − c| − r primitive ───────────────────────── *
  *
- * Every helper in this section is a function from "a point in space"
- * to "some scalar quantity of that point".  Each one teaches one
- * piece of the SDF mental model.
- */
-
-/*
- * sphere_sdf — the canonical Signed Distance Function.
- *
- *     f(p, c, r) = |p − c| − r
- *
- * Returns:
- *   • POSITIVE  if p is OUTSIDE the sphere   (= true distance to surface)
- *   • ZERO      if p is exactly on the surface
- *   • NEGATIVE  if p is INSIDE  the sphere   (= negated radial distance)
- *
- * Verify:
- *   p = c           → f = −r          (deepest interior)
- *   p = c + r·n̂     → f =  0          (surface)
- *   p far from c    → f ≈ |p − c|     (true Euclidean distance)
- *
- * Why this matters: this single function is enough to:
- *   1. RAYMARCH.  Step exactly f(p) along a ray; never overshoot.
- *   2. INSIDE/OUTSIDE TEST.  Just check the sign.
- *   3. UNION two spheres:        min(f₁, f₂)         (boolean OR)
- *   4. INTERSECT:                max(f₁, f₂)         (boolean AND)
- *   5. DIFFERENCE A − B:         max(f_A, −f_B)      (boolean SUB)
- *   6. SOFT BLEND:               smin(f₁, f₂, k)     (this demo)
+ * The simplest possible SDF.  Tutorial T2 in raymarcher.c derives
+ * this from "distance to nearest point on a sphere".  Every other
+ * SDF in this file is built by combining sphere SDFs with smin (§6).
  */
 static inline float sphere_sdf(Vec3 p, Vec3 c, float r)
 {
     return v3len(v3sub(p, c)) - r;
 }
 
-/*
- * smin — polynomial smooth minimum.  Quílez (2013).
+/* ── §6 smooth-min — the polynomial smin ─────────────────────────────── *
  *
- * Goal: a function that behaves like min(a, b) when a and b are FAR
- * apart, but smoothly transitions to a slightly-smaller value when
- * they are CLOSE (within k of each other).
+ * Tutorial T2 derived this:
+ *      h    = max(k − |a − b|, 0) / k
+ *      smin = min(a, b) − h² · k / 4
  *
- * Why?  In the SDF world, "smaller distance" = "closer to surface".
- * When two surfaces approach each other, smin returns a value SMALLER
- * than min — so we report being CLOSER than either surface alone.
- * The iso-surface (where the field equals zero) then bulges OUTWARD
- * into the gap between the two objects.  That's the metaball "neck".
- *
- * Polynomial form (mathematically equivalent to Quílez's mix-style):
- *
- *     h    = max(k − |a − b|, 0) / k         blend amount, ∈ [0, 1]
- *     smin = min(a, b) − h² · k / 4          subtract a "bump"
- *
- * Behaviour:
- *     |a − b| > k     → h = 0  → returns plain min(a, b)
- *     a = b           → h = 1  → returns a − k/4   (max bump)
- *     k = 0           → DIVISION BY ZERO          (caller clamps k ≥ K_MIN)
- *
- * The bump magnitude is bounded by k/4: even at peak blending, the
- * result drops by at most a quarter of the blend radius.  The SDF
- * remains well-behaved (Lipschitz ≈ 1) for the sphere trace.  This
- * is why we cap RM_HIT_EPS away from zero (see EDGE CASES).
- *
- * The function is C¹-continuous: both smin and its derivative are
- * smooth across the transition at |a − b| = k.
+ * NOTE: k must be > 0 (we clamp at K_MIN = 0.05 in §1).  At k = 0
+ * the formula divides by zero.
  */
 static float smin(float a, float b, float k)
 {
@@ -638,11 +768,11 @@ static float smin(float a, float b, float k)
     return fminf(a, b) - h * h * k * 0.25f;
 }
 
-/*
- * SceneSDF — read-only "view" of the scene, passed to every helper
- * in §5 / §6 by const pointer.  Avoids passing four parameters
- * (centres, radii, n, k_blend) to each call, and lets the inner
- * loop see all four hot-path values from one cache line.
+/* ── §7 scene SDF — fold smin over balls + SceneSDF view ─────────────── *
+ *
+ * SceneSDF is a read-only "view" of the scene's metaballs, passed to
+ * every SDF helper by const-pointer.  Lets §8..§13 take ONE pointer
+ * instead of four arguments.
  */
 typedef struct {
     const Vec3  *centres;
@@ -651,18 +781,8 @@ typedef struct {
     float        k_blend;
 } SceneSDF;
 
-/*
- * scene_sdf — smooth-min reduction over all metaballs.
- *
- *     d = sphere_sdf(p, ball₀)
- *     for i in 1..N−1:
- *         d = smin(d, sphere_sdf(p, ballᵢ), k)
- *     return d
- *
- * The order of folding doesn't affect the result for well-separated
- * balls; with finite k the order produces tiny visual differences at
- * three-way contact points, invisible at terminal resolution.
- */
+/* T3: fold smin over all balls.  Order doesn't materially affect the
+ * result for our k values and well-separated balls. */
 static float scene_sdf(Vec3 p, const SceneSDF *s)
 {
     float d = sphere_sdf(p, s->centres[0], s->radii[0]);
@@ -671,27 +791,12 @@ static float scene_sdf(Vec3 p, const SceneSDF *s)
     return d;
 }
 
-/*
- * estimate_normal — surface normal at p via the TETRAHEDRON trick
- * (Inigo Quílez, normalsSDF.html).
+/* ── §8 normal — tetrahedron 4-tap gradient ──────────────────────────── *
  *
- * Standard central differences need 6 SDF evaluations (±ε along each
- * axis).  We can do it with 4 by sampling at the vertices of a
- * regular tetrahedron and combining with the vertex sign vectors:
- *
- *     k₀ = (+1, −1, −1)        k₁ = (−1, +1, −1)
- *     k₂ = (−1, −1, +1)        k₃ = (+1, +1, +1)
- *
- *     ∇f ≈ Σ k_i · f(p + ε · k_i)
- *
- * Which expands componentwise to:
- *     ∂f/∂x ≈  +f₀ − f₁ − f₂ + f₃
- *     ∂f/∂y ≈  −f₀ + f₁ − f₂ + f₃
- *     ∂f/∂z ≈  −f₀ − f₁ + f₂ + f₃
- *
- * 4 evals vs 6 with no accuracy loss for typical SDFs.  Saves
- * ~33 % of the per-hit normal cost — a real speedup since this
- * runs once per HIT pixel.
+ * Quílez tetrahedron formula: 4 SDF samples at corners of a regular
+ * tetrahedron in {±ε}³, combined with sign vectors.  4 evals, no
+ * shared-axis pair → cleaner normal at sharp features than 6-tap
+ * central differences.
  */
 static Vec3 estimate_normal(Vec3 p, const SceneSDF *s)
 {
@@ -705,28 +810,13 @@ static Vec3 estimate_normal(Vec3 p, const SceneSDF *s)
                      -f0 - f1 + f2 + f3));
 }
 
-/*
- * estimate_curvature — mean curvature ≈ ½ · Laplacian(SDF).
+/* ── §9 curvature — Laplacian-of-SDF → mean curvature ────────────────── *
  *
- * For ANY SDF f, the Laplacian ∇²f at the surface equals 2H, where
- * H is the mean curvature.  Why?  An SDF locally looks like a signed
- * radial-distance field, and the Laplacian recovers the trace of the
- * curvature tensor.
+ * Tutorial T5 derived ∇²f ≈ 2H at the surface.  6-sample stencil:
+ *      ∇²f ≈ ( Σ axis-aligned neighbours of f − 6·f(p) ) / ε²
  *
- * Sphere of radius r:
- *     f = √(x² + y² + z²) − r
- *     ∂²f/∂x² = (y² + z²) / r³,  similarly for y, z
- *     ∇²f = (2x² + 2y² + 2z²) / r³ = 2/r       (at the surface)
- *
- * Saddle / flat merged region:    Laplacian ≈ 0
- * Concave neck:                   Laplacian < 0  (caller clamps to 0)
- *
- * Six-sample Laplacian stencil:
- *     ∇²f(p) ≈ (Σ over 6 axis-aligned neighbours of f − 6·f(p)) / ε²
- *
- * We use the value to colour the surface by curvature: peaks of
- * individual spheres (high curvature → warm hue) versus merged
- * saddle regions (low curvature → cool hue).
+ * Returns the raw Laplacian; the caller scales by CURV_SCALE and
+ * clamps to [0, 1] for colour-band quantisation.
  */
 static float estimate_curvature(Vec3 p, const SceneSDF *s)
 {
@@ -743,22 +833,11 @@ static float estimate_curvature(Vec3 p, const SceneSDF *s)
     return lap / (e * e);
 }
 
-/* ── §6 march — sphere trace + soft shadow + Phong + cast_ray ────────── */
-
-/*
- * sphere_trace — Hart 1996.  March along a ray, taking a step exactly
- * equal to the current SDF.  Distance estimates are LOWER bounds on
- * true distance, so we never overshoot the surface.
+/* ── §10 sphere trace — Hart 1996 march by DE ────────────────────────── *
  *
- *     t = 0
- *     for step = 1..MAX_STEPS:
- *         p = origin + t · dir
- *         d = scene_sdf(p)
- *         if d < HIT_EPS: hit, return t
- *         if t > MAX_DIST: miss, return -1
- *         t += d
- *
- * Returns the ray-parameter t at the hit, or −1.0 on miss.
+ * Tutorial T4 explained the algorithm.  Returns t at hit, or -1 on
+ * miss.  Same loop as raymarcher.c, just with scene_sdf instead of
+ * sphere_sdf.
  */
 static float sphere_trace(Vec3 origin, Vec3 dir, const SceneSDF *s)
 {
@@ -773,26 +852,10 @@ static float sphere_trace(Vec3 origin, Vec3 dir, const SceneSDF *s)
     return -1.0f;
 }
 
-/*
- * soft_shadow — Quílez penumbra.  March from a hit point toward the
- * light, tracking the closest SDF approach normalised by travel
- * distance:
+/* ── §11 soft shadow — Quílez running-min penumbra ───────────────────── *
  *
- *     res = 1
- *     while not at light:
- *         h = scene_sdf(here)
- *         if h < tiny:  return 0  (fully blocked)
- *         res = min(res, K · h / t)
- *         step h along ray
- *     return clamp(res, 0, 1)
- *
- * The min(K·h/t) tracking gives a SOFT penumbra: the closer the
- * shadow ray comes to a surface (small h at distance t), the more
- * the light is dimmed proportionally.  K controls hardness — bigger
- * K = sharper shadow edge.
- *
- * Returns 1 if the path to the light is clear, 0 if fully blocked,
- * and a soft factor in [0, 1] for partial occlusion.
+ * Tutorial T6 derived this.  Returns 1 if the path is clear, 0 if
+ * fully blocked, soft factor in (0, 1) for partial occlusion.
  */
 static float soft_shadow(Vec3 origin, Vec3 to_light_dir,
                           float t_min, float t_max, const SceneSDF *s)
@@ -808,65 +871,40 @@ static float soft_shadow(Vec3 origin, Vec3 to_light_dir,
     return clampf(res, 0.0f, 1.0f);
 }
 
-/*
- * phong — Phong shading at a hit point.
+/* ── §12 Phong shade — ambient + diffuse + specular + shadow ─────────── *
  *
- *     L_dir = normalise(light_pos − hit)        light direction
- *     V_dir = normalise(cam_pos   − hit)        view direction
- *     ndl   = max(0, N · L_dir)                 Lambert
- *     R_dir = 2 · (N · L_dir) · N − L_dir       reflection
- *     spec  = max(0, R · V)^SHIN
- *     I     = KA + shadow · (KD · ndl + KS · spec)
- *
- * The shadow factor [0, 1] multiplies the direct (diffuse + specular)
- * component but not the ambient — so cells in deep shadow stay at
- * KA, never pure black.
+ * Tutorial T7 wrote the formula.  shadow multiplies only direct
+ * components; ambient never goes black.
  */
 static float phong(Vec3 hit, Vec3 N, Vec3 cam, Vec3 light, float shadow)
 {
-    Vec3  L   = v3norm(v3sub(light, hit));
-    Vec3  V   = v3norm(v3sub(cam,   hit));
-    float ndl = fmaxf(0.0f, v3dot(N, L));
-    Vec3  R   = v3sub(v3mul(N, 2.0f * ndl), L);
-    float sp  = powf(fmaxf(0.0f, v3dot(R, V)), SHIN);
-    return clampf(KA + shadow * (KD * ndl + KS * sp), 0.0f, 1.0f);
+    Vec3  L_dir = v3norm(v3sub(light, hit));
+    Vec3  V_dir = v3norm(v3sub(cam,   hit));
+    float ndl = fmaxf(0.0f, v3dot(N, L_dir));
+    Vec3  R_dir = v3sub(v3mul(N, 2.0f * ndl), L_dir);
+    float spec = powf(fmaxf(0.0f, v3dot(R_dir, V_dir)), SHIN);
+    return clampf(KA + shadow * (KD * ndl + KS * spec), 0.0f, 1.0f);
 }
 
-/*
- * Hit — full per-pixel result of one ray cast.  `hit = false` when
- * the ray missed; the other fields are then irrelevant.  The caller
- * passes (shade, curvature) to the canvas storage and discards the
- * rest.
+/* ── §13 cast_ray — one-pixel orchestrator → Hit ─────────────────────── *
+ *
+ * Tutorial T10 listed Hit's fields.  Each AA sample produces one Hit;
+ * canvas_render accumulates and averages.
  */
+
 typedef struct {
     bool  hit;
     Vec3  p;
     Vec3  normal;
-    float shade;
-    float curvature;
+    float shade;          /* Phong intensity in [0, 1]            */
+    float shadow;         /* soft shadow factor (DEBUG_SHADOW)    */
+    float curvature;      /* normalised curvature in [0, 1]       */
 } Hit;
 
-/*
- * cast_ray — one full per-pixel pipeline.  Pseudocode:
- *
- *     t = sphere_trace(origin, dir, scene)
- *     if t < 0:        return Hit{ hit = false }
- *
- *     hit_p     = origin + t · dir
- *     normal    = estimate_normal(hit_p)
- *     shadow    = soft_shadow_ray(hit_p, light)   if soft_shadows else 1
- *     shade     = phong(hit_p, normal, origin, light, shadow)
- *     raw_curv  = estimate_curvature(hit_p)
- *     curvature = clamp(raw_curv * CURV_SCALE, 0, 1)
- *     return Hit{ ... }
- *
- * Single function call per pixel makes the per-frame DE-evaluation
- * budget auditable in one place.
- */
 static Hit cast_ray(Vec3 origin, Vec3 dir, const SceneSDF *s,
                      Vec3 light, bool soft_shadows)
 {
-    Hit h = { false, {0, 0, 0}, {0, 0, 1}, 0.0f, 0.0f };
+    Hit h = { false, {0, 0, 0}, {0, 0, 1}, 0.0f, 0.0f, 0.0f };
 
     float t = sphere_trace(origin, dir, s);
     if (t < 0.0f) return h;
@@ -876,42 +914,22 @@ static Hit cast_ray(Vec3 origin, Vec3 dir, const SceneSDF *s,
     h.normal = estimate_normal(h.p, s);
 
     /* Shadow factor — soft penumbra ray, or 1.0 if shadows disabled. */
-    float shadow = 1.0f;
+    h.shadow = 1.0f;
     if (soft_shadows) {
         Vec3  L_dir   = v3norm(v3sub(light, h.p));
         Vec3  shad_o  = v3add(h.p, v3mul(h.normal, SHADOW_BIAS));
         float to_lite = v3len(v3sub(light, h.p));
-        shadow = soft_shadow(shad_o, L_dir, SHADOW_NEAR, to_lite, s);
+        h.shadow = soft_shadow(shad_o, L_dir, SHADOW_NEAR, to_lite, s);
     }
 
-    h.shade     = phong(h.p, h.normal, origin, light, shadow);
+    h.shade     = phong(h.p, h.normal, origin, light, h.shadow);
     float raw_c = estimate_curvature(h.p, s);
     h.curvature = clampf(raw_c * CURV_SCALE, 0.0f, 1.0f);
     return h;
 }
 
-/* ── §7 scene — orbits, camera, canvas, render, decorate, draw ───────── */
+/* ── §14 ball orbits + light position ────────────────────────────────── */
 
-/* §7.1 ball orbits + scene state. */
-
-typedef struct {
-    Vec3   centres[N_BALLS];
-    float  radii  [N_BALLS];
-    float  time;                 /* scene time (seconds × speed) */
-    float  k_blend;
-    float  speed;
-    int    theme;
-    bool   paused;
-    bool   soft_shadows;
-} Scene;
-
-/*
- * ball_position_at — Lissajous orbit point for ball i at scene time t.
- *
- *     x = ORBIT_RX · sin(freq_x · t + phase_x)
- *     y = ORBIT_RY · sin(freq_y · t + phase_y)
- *     z = ORBIT_RZ · cos(freq_z · t)
- */
 static Vec3 ball_position_at(int i, float t)
 {
     const BallOrbit *o = &ORBITS[i];
@@ -920,14 +938,28 @@ static Vec3 ball_position_at(int i, float t)
               ORBIT_RZ * cosf(o->freq_z * t));
 }
 
-/* light_position_at — slowly orbiting light fixture so the highlights
- * sweep across the surface as time passes. */
 static Vec3 light_position_at(float t)
 {
-    return v3(cosf(t * 0.6f) * 4.0f,
-              sinf(t * 0.6f * 0.45f) * 2.0f + 2.5f,
-              3.5f);
+    return v3(cosf(t * LIGHT_RATE)   * LIGHT_RADIUS_X,
+              sinf(t * LIGHT_RATE_Y) * LIGHT_RADIUS_Y + LIGHT_BIAS_Y,
+              LIGHT_HEIGHT_Z);
 }
+
+/* ── §15 scene state — Scene struct + tick + SDF view ────────────────── */
+
+typedef struct {
+    Vec3       centres[N_BALLS];
+    float      radii  [N_BALLS];
+    float      time;                 /* scene time (seconds × speed) */
+    float      k_blend;
+    float      speed;
+    float      cam_z;                /* camera z; smaller = zoomed-in */
+    int        theme;
+    DebugMode  debug_mode;
+    bool       paused;
+    bool       soft_shadows;
+    bool       aa_enabled;
+} Scene;
 
 static void scene_update_balls(Scene *s)
 {
@@ -942,9 +974,12 @@ static void scene_init(Scene *s)
     memset(s, 0, sizeof *s);
     s->k_blend      = K_DEFAULT;
     s->speed        = SPD_DEFAULT;
+    s->cam_z        = CAM_Z_DEFAULT;
     s->theme        = 0;
+    s->debug_mode   = DEBUG_NORMAL;
     s->paused       = false;
     s->soft_shadows = true;
+    s->aa_enabled   = true;
     scene_update_balls(s);
 }
 
@@ -965,7 +1000,7 @@ static SceneSDF scene_sdf_view(const Scene *s)
     };
 }
 
-/* §7.2 camera + ray gen for the half-resolution canvas. */
+/* ── §16 camera — camera_for_canvas + pixel_ray (with AA offsets) ────── */
 
 typedef struct {
     Vec3  origin;
@@ -973,19 +1008,10 @@ typedef struct {
     float phys_aspect;
 } Camera;
 
-/*
- * camera_for_canvas — fixed camera at (0, 0, CAM_Z) looking along −z.
- *
- * `phys_aspect` corrects for the fact that terminal cells are CELL_H
- * pixels tall and CELL_W pixels wide, plus an extra CELL_ASPECT
- * factor for cells being physically taller than wide.  Result:
- * circular metaballs render as circles, not vertically-stretched
- * ellipses.
- */
-static Camera camera_for_canvas(int cw, int ch)
+static Camera camera_for_canvas(int cw, int ch, float cam_z)
 {
     return (Camera){
-        .origin      = v3(0.0f, 0.0f, CAM_Z),
+        .origin      = v3(0.0f, 0.0f, cam_z),
         .fov_t       = FOV_HALF_TAN,
         .phys_aspect = ((float)ch * (float)CELL_H * CELL_ASPECT)
                      / ((float)cw * (float)CELL_W),
@@ -993,27 +1019,32 @@ static Camera camera_for_canvas(int cw, int ch)
 }
 
 /*
- * pixel_ray — direction from camera through canvas pixel (px, py).
- *
- *     u   ∈ [−1, +1] along screen x
- *     v   ∈ [−1, +1] along screen y (top of screen → +v)
- *     dir = normalise(u · fov_t,  v · fov_t · aspect,  −1)
+ * pixel_ray — direction from camera through canvas pixel (px, py)
+ * at sub-pixel offset (ox, oy) ∈ [0, 1].  AA passes call with the
+ * 2×2 grid; non-AA passes call with (0.5, 0.5).
  */
-static Vec3 pixel_ray(int px, int py, int cw, int ch, const Camera *c)
+static Vec3 pixel_ray(int px, int py, float ox, float oy,
+                      int cw, int ch, const Camera *c)
 {
-    float u =  ((float)px + 0.5f) / (float)cw * 2.0f - 1.0f;
-    float v = -((float)py + 0.5f) / (float)ch * 2.0f + 1.0f;
+    float u =  ((float)px + ox) / (float)cw * 2.0f - 1.0f;
+    float v = -((float)py + oy) / (float)ch * 2.0f + 1.0f;
     return v3norm(v3(u * c->fov_t,
                      v * c->fov_t * c->phys_aspect,
                      -1.0f));
 }
 
-/* §7.3 canvas — half-resolution storage + render orchestrator. */
+/* ── §17 canvas — alloc + render orchestrator (with AA loop) ─────────── *
+ *
+ * Four parallel float arrays, one per Hit field.  Render writes;
+ * canvas_draw + debug overlays read.
+ */
 
 typedef struct {
     int    w, h;
     float *shades;        /* w*h; < 0 = miss */
     float *curvs;         /* w*h */
+    float *shadows;       /* w*h */
+    Vec3  *normals;       /* w*h */
 } Canvas;
 
 static void canvas_alloc(Canvas *c, int term_cols, int term_rows)
@@ -1026,61 +1057,85 @@ static void canvas_alloc(Canvas *c, int term_cols, int term_rows)
     if (c->w < 1) c->w = 1;
     if (c->h < 1) c->h = 1;
 
-    size_t n  = (size_t)c->w * (size_t)c->h;
-    c->shades = malloc(n * sizeof(float));
-    c->curvs  = malloc(n * sizeof(float));
+    size_t n   = (size_t)c->w * (size_t)c->h;
+    c->shades  = malloc(n * sizeof(float));
+    c->curvs   = malloc(n * sizeof(float));
+    c->shadows = malloc(n * sizeof(float));
+    c->normals = malloc(n * sizeof(Vec3));
 }
 
 static void canvas_free(Canvas *c)
 {
-    free(c->shades); c->shades = NULL;
-    free(c->curvs);  c->curvs  = NULL;
+    free(c->shades);  c->shades  = NULL;
+    free(c->curvs);   c->curvs   = NULL;
+    free(c->shadows); c->shadows = NULL;
+    free(c->normals); c->normals = NULL;
     c->w = c->h = 0;
 }
 
 /*
- * canvas_render — fill `shades` and `curvs` for every canvas pixel.
- *
- *     cam   = camera_for_canvas(canvas.w, canvas.h)
- *     for py, px:
- *         ray = pixel_ray(px, py, ..., cam)
- *         hit = cast_ray(cam.origin, ray, scene, light, shadows)
- *         shades[i] = hit ? hit.shade     : -1
- *         curvs [i] = hit ? hit.curvature :  0
- *
- * The camera basis is computed ONCE per frame, not per pixel.
+ * canvas_render — fill all four arrays.  Tutorial T8 walked through
+ * the AA accumulation; T9 explained the half-resolution gain.
  */
 static void canvas_render(Canvas *c, const Scene *s)
 {
-    Camera   cam   = camera_for_canvas(c->w, c->h);
+    Camera   cam   = camera_for_canvas(c->w, c->h, s->cam_z);
     Vec3     light = light_position_at(s->time);
     SceneSDF view  = scene_sdf_view(s);
 
+    int n_samples = s->aa_enabled ? AA_SAMPLES : 1;
+
     for (int py = 0; py < c->h; py++) {
         for (int px = 0; px < c->w; px++) {
-            Vec3 ray = pixel_ray(px, py, c->w, c->h, &cam);
-            Hit  h   = cast_ray(cam.origin, ray, &view,
-                                light, s->soft_shadows);
-            int  idx = py * c->w + px;
-            c->shades[idx] = h.hit ? h.shade     : -1.0f;
-            c->curvs [idx] = h.hit ? h.curvature :  0.0f;
+
+            float sum_shade  = 0.0f;
+            float sum_curv   = 0.0f;
+            float sum_shadow = 0.0f;
+            Vec3  sum_normal = v3(0, 0, 0);
+            int   hit_count  = 0;
+
+            for (int sample = 0; sample < n_samples; sample++) {
+                float ox, oy;
+                if (n_samples == 1) {
+                    ox = 0.5f; oy = 0.5f;
+                } else {
+                    ox = AA_OFFSETS[sample][0];
+                    oy = AA_OFFSETS[sample][1];
+                }
+
+                Vec3 ray = pixel_ray(px, py, ox, oy, c->w, c->h, &cam);
+                Hit  h   = cast_ray(cam.origin, ray, &view,
+                                    light, s->soft_shadows);
+                if (h.hit) {
+                    sum_shade  += h.shade;
+                    sum_curv   += h.curvature;
+                    sum_shadow += h.shadow;
+                    sum_normal  = v3add(sum_normal, h.normal);
+                    hit_count++;
+                }
+            }
+
+            int idx = py * c->w + px;
+            if (hit_count == 0) {
+                c->shades [idx] = -1.0f;
+                c->curvs  [idx] =  0.0f;
+                c->shadows[idx] =  0.0f;
+                c->normals[idx] =  v3(0, 0, 0);
+            } else {
+                float coverage = (float)hit_count / (float)n_samples;
+                c->shades [idx] = (sum_shade / (float)hit_count) * coverage;
+                c->curvs  [idx] =  sum_curv  / (float)hit_count;
+                c->shadows[idx] =  sum_shadow / (float)hit_count;
+                c->normals[idx] =  v3norm(sum_normal);
+            }
         }
     }
 }
 
-/* §7.4 decorate + emit (canvas → terminal cells). */
+/* ── §18 cell decoration + emit + canvas_draw ────────────────────────── */
 
-/*
- * Cell — the (glyph, colour pair, attribute) decoration of one
- * canvas pixel.  A miss is encoded as `pair = −1` (the painter
- * skips silently, leaving the cell empty).
- */
 typedef struct { char glyph; int pair; attr_t attr; } Cell;
 
-/*
- * shade_to_glyph — map shade ∈ [0, 1] to a glyph from LUMA_RAMP.
- * Out-of-range inputs clamp gracefully.
- */
 static char shade_to_glyph(float shade)
 {
     int idx = (int)(shade * (float)(LUMA_RAMP_LEN - 1) + 0.5f);
@@ -1089,9 +1144,6 @@ static char shade_to_glyph(float shade)
     return LUMA_RAMP[idx];
 }
 
-/*
- * curvature_to_band — map curvature ∈ [0, 1] to a colour band 0..7.
- */
 static int curvature_to_band(float curv)
 {
     int b = (int)(curv * (float)(N_CURV_BANDS - 1) + 0.5f);
@@ -1100,13 +1152,6 @@ static int curvature_to_band(float curv)
     return b;
 }
 
-/*
- * decorate — turn a (shade, curvature, theme) triple into a Cell.
- *
- *   miss              → Cell{ ' ', -1, 0 }   (painter skips)
- *   shade ∈ [0, 1]    → glyph + theme-band pair
- *   shade > BOLD_THR  → A_BOLD added for highlight punch
- */
 static Cell decorate(float shade, float curv, int theme)
 {
     if (shade < 0.0f) return (Cell){ ' ', -1, 0 };
@@ -1118,11 +1163,8 @@ static Cell decorate(float shade, float curv, int theme)
     };
 }
 
-/*
- * emit_block — paint a CELL_W × CELL_H block at (tx0, ty0) with one
- * cell's glyph / pair / attr.  Skips silently for miss cells (pair < 0)
- * and for blocks that fall partly off-screen.
- */
+/* emit_block — paint a CELL_W × CELL_H block.  Skips silently for
+ * miss cells (pair < 0). */
 static void emit_block(int tx0, int ty0, Cell c, int term_cols, int term_rows)
 {
     if (c.pair < 0) return;
@@ -1141,27 +1183,27 @@ static void emit_block(int tx0, int ty0, Cell c, int term_cols, int term_rows)
     attroff(a);
 }
 
-/*
- * canvas_draw — walk every canvas pixel, decorate it, emit the block
- * at the right screen offset.
- *
- *   off_x = (term_cols − canvas.w · CELL_W) / 2          horizontal centre
- *   off_y = 1 + (term_rows − HUD_ROWS − canvas.h · CELL_H) / 2
- *
- * The +1 in off_y leaves row 0 free for the top HUD; the
- * −HUD_ROWS reserves row rows−1 for the hint strip.  Canvas is
- * vertically centred in the remaining `rows − HUD_ROWS` rows.
- */
-static void canvas_draw(const Canvas *c, int term_cols, int term_rows, int theme)
+/* canvas_offsets — top-left screen position centring the canvas. */
+static void canvas_offsets(const Canvas *c, int term_cols, int term_rows,
+                           int *out_off_x, int *out_off_y)
 {
     int off_x = (term_cols - c->w * CELL_W) / 2;
     int off_y = 1 + (term_rows - HUD_ROWS - c->h * CELL_H) / 2;
     if (off_x < 0) off_x = 0;
     if (off_y < 1) off_y = 1;
+    *out_off_x = off_x;
+    *out_off_y = off_y;
+}
+
+/* canvas_draw — production view (shade + curvature → glyph + band). */
+static void canvas_draw(const Canvas *c, int term_cols, int term_rows, int theme)
+{
+    int off_x, off_y;
+    canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
 
     for (int py = 0; py < c->h; py++) {
         for (int px = 0; px < c->w; px++) {
-            int   idx = py * c->w + px;
+            int   idx  = py * c->w + px;
             Cell  cell = decorate(c->shades[idx], c->curvs[idx], theme);
             int   tx0  = off_x + px * CELL_W;
             int   ty0  = off_y + py * CELL_H;
@@ -1170,7 +1212,98 @@ static void canvas_draw(const Canvas *c, int term_cols, int term_rows, int theme
     }
 }
 
-/* ── §8 screen — ncurses init / resize / HUD / present ───────────────── */
+/* ── §19 debug overlays — see the rendering signals raw ──────────────── *
+ *
+ * Three educational visualisations.  Each isolates ONE Canvas array.
+ */
+
+/* NORMALS: hue from azimuth atan2(N.x, N.z); glyph from N.y. */
+static void canvas_draw_normals(const Canvas *c, int term_cols, int term_rows,
+                                int theme)
+{
+    int off_x, off_y;
+    canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
+
+    for (int py = 0; py < c->h; py++) {
+        for (int px = 0; px < c->w; px++) {
+            int idx = py * c->w + px;
+            if (c->shades[idx] < 0.0f) continue;
+
+            Vec3  N       = c->normals[idx];
+            float azimuth = atan2f(N.x, N.z) / (2.0f * (float)M_PI) + 0.5f;
+            float y_lit   = clampf(N.y * 0.5f + 0.5f, 0.0f, 1.0f);
+
+            int  band  = curvature_to_band(azimuth);
+            char glyph = shade_to_glyph(y_lit);
+            Cell cell  = (Cell){ glyph, PAIR_FOR(theme, band), 0 };
+
+            emit_block(off_x + px * CELL_W, off_y + py * CELL_H,
+                       cell, term_cols, term_rows);
+        }
+    }
+}
+
+/* CURVATURE: glyph and colour both from curvature value. */
+static void canvas_draw_curvature(const Canvas *c, int term_cols, int term_rows,
+                                  int theme)
+{
+    int off_x, off_y;
+    canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
+
+    for (int py = 0; py < c->h; py++) {
+        for (int px = 0; px < c->w; px++) {
+            int idx = py * c->w + px;
+            if (c->shades[idx] < 0.0f) continue;
+
+            float curv = c->curvs[idx];
+            int   band = curvature_to_band(curv);
+            char  glyph = shade_to_glyph(curv);
+            Cell  cell = (Cell){ glyph, PAIR_FOR(theme, band),
+                                 (curv > 0.7f) ? A_BOLD : 0 };
+
+            emit_block(off_x + px * CELL_W, off_y + py * CELL_H,
+                       cell, term_cols, term_rows);
+        }
+    }
+}
+
+/* SHADOW: glyph + colour both from shadow factor (1 = lit, 0 = dark). */
+static void canvas_draw_shadow(const Canvas *c, int term_cols, int term_rows,
+                               int theme)
+{
+    int off_x, off_y;
+    canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
+
+    for (int py = 0; py < c->h; py++) {
+        for (int px = 0; px < c->w; px++) {
+            int idx = py * c->w + px;
+            if (c->shades[idx] < 0.0f) continue;
+
+            float shadow = c->shadows[idx];
+            int   band  = curvature_to_band(shadow);
+            char  glyph = shade_to_glyph(shadow);
+            Cell  cell  = (Cell){ glyph, PAIR_FOR(theme, band),
+                                  (shadow > 0.7f) ? A_BOLD : 0 };
+
+            emit_block(off_x + px * CELL_W, off_y + py * CELL_H,
+                       cell, term_cols, term_rows);
+        }
+    }
+}
+
+static void canvas_draw_active(const Canvas *c, int term_cols, int term_rows,
+                                const Scene *s)
+{
+    switch (s->debug_mode) {
+    case DEBUG_NORMAL:    canvas_draw          (c, term_cols, term_rows, s->theme); break;
+    case DEBUG_NORMALS:   canvas_draw_normals  (c, term_cols, term_rows, s->theme); break;
+    case DEBUG_CURVATURE: canvas_draw_curvature(c, term_cols, term_rows, s->theme); break;
+    case DEBUG_SHADOW:    canvas_draw_shadow   (c, term_cols, term_rows, s->theme); break;
+    default:              canvas_draw          (c, term_cols, term_rows, s->theme); break;
+    }
+}
+
+/* ── §20 screen — ncurses init / HUD / present ───────────────────────── */
 
 typedef struct {
     int    cols, rows;
@@ -1201,19 +1334,21 @@ static void screen_resize(Screen *sc)
     canvas_alloc(&sc->canvas, sc->cols, sc->rows);
 }
 
-/*
- * hud_draw — CLAUDE.md HUD spec.
+/* HUD layout (CLAUDE.md spec):
  *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
- *   row rows-1     PAIR_HINT (cyan   + bold) — key hint
- */
+ *   row rows-1     PAIR_HINT (cyan   + bold) — key hint */
 static void hud_draw(const Screen *sc, const Scene *s, double fps)
 {
-    char status[140];
+    char status[200];
     snprintf(status, sizeof status,
-             " %5.1f fps  k=%4.2f  spd=%4.2f  shadow=%-3s  theme=%s  %s ",
+             " %5.1f fps  k=%4.2f  spd=%4.2f  zoom=%4.2f  aa=%-3s  "
+             "shadow=%-3s  theme=%s  debug=%s  %s ",
              fps, (double)s->k_blend, (double)s->speed,
-             s->soft_shadows ? "on" : "off",
+             (double)s->cam_z,
+             s->aa_enabled    ? "on" : "off",
+             s->soft_shadows  ? "on" : "off",
              THEMES[s->theme].name,
+             DEBUG_MODE_NAMES[s->debug_mode],
              s->paused ? "PAUSED" : "running");
     int slen = (int)strlen(status); if (slen > sc->cols) slen = sc->cols;
 
@@ -1224,21 +1359,22 @@ static void hud_draw(const Screen *sc, const Scene *s, double fps)
 
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
     mvprintw(sc->rows - 1, 0,
-             " q:quit  spc:pause  j/k:blend  s:shadow  c:theme  +/-:speed ");
+             " q:quit  spc:pause  j/k:blend  z/Z:zoom  a:aa  "
+             "s:shadow  c:theme  d/D:debug  +/-:speed ");
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_draw(Screen *sc, const Scene *s, double fps)
 {
     erase();
-    canvas_render(&sc->canvas, s);
-    canvas_draw  (&sc->canvas, sc->cols, sc->rows, s->theme);
-    hud_draw     (sc, s, fps);
+    canvas_render     (&sc->canvas, s);
+    canvas_draw_active(&sc->canvas, sc->cols, sc->rows, s);
+    hud_draw          (sc, s, fps);
     wnoutrefresh(stdscr);
     doupdate();
 }
 
-/* ── §9 app — main loop, signals, key handling, cleanup ──────────────── */
+/* ── §21 app — main loop, signals, key handling ──────────────────────── */
 
 typedef struct {
     Scene                 scene;
@@ -1273,8 +1409,29 @@ static bool app_handle_key(App *app, int ch)
         s->soft_shadows = !s->soft_shadows;
         break;
 
+    case 'a': case 'A':
+        s->aa_enabled = !s->aa_enabled;
+        break;
+
+    case 'z':
+        s->cam_z -= CAM_ZOOM_STEP;
+        if (s->cam_z < CAM_Z_MIN) s->cam_z = CAM_Z_MIN;
+        break;
+    case 'Z':
+        s->cam_z += CAM_ZOOM_STEP;
+        if (s->cam_z > CAM_Z_MAX) s->cam_z = CAM_Z_MAX;
+        break;
+
     case 'c': case 'C':
         s->theme = (s->theme + 1) % N_THEMES;
+        break;
+
+    case 'd':
+        s->debug_mode = (DebugMode)((s->debug_mode + 1) % DEBUG_MODE_COUNT);
+        break;
+    case 'D':
+        s->debug_mode =
+            (DebugMode)((s->debug_mode + DEBUG_MODE_COUNT - 1) % DEBUG_MODE_COUNT);
         break;
 
     case '+': case '=':

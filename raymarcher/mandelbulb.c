@@ -1,341 +1,482 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * mandelbulb.c — clean 3-D Mandelbulb explorer for the terminal
+ * mandelbulb.c — a 3-D Mandelbulb fractal raymarcher
  *
- * DEMO: One iconic 3-D Mandelbulb (power = 8), sphere-traced with
- *       Phong shading + soft shadow + ambient occlusion, coloured by
- *       smooth iteration count.  A slow auto-orbit shows the fractal
- *       from every angle; arrow keys override the orbit for manual
- *       inspection.  No starfield, no animated palette, no power
- *       morph, no near-miss glow corona — every pixel of every cell
- *       is dedicated to making the FRACTAL silhouette read clearly.
+ * DEMO: An auto-orbiting view of the canonical p = 8 Mandelbulb.
+ *       Soft shadows from a fixed light, ambient occlusion via march
+ *       step count, smooth-iteration colouring across a 5-theme
+ *       palette (one of which renders the fractal as a photographic
+ *       negative).  Iteration depth, colour theme, camera distance,
+ *       and orbit angles are live-controllable.
  *
- *       Themes (cycle with t / T):
- *         CLASSIC   warm orange-red-yellow (Daniel White's iconic look)
- *         ICE       cool blues climbing into white
- *         PLASMA    high-sat magenta → cyan → yellow (fractal-art neon)
- *         MONO      grayscale, no hue distraction — best for shape study
- *         NEGATIVE  white bg + dark fg, photographic-negative inversion
- *
- * Study alongside:
- *   raymarcher/kifs_fractal.c       — angular cousin (folding fractal);
- *                                      same sphere-trace pipeline, very
- *                                      different visual character
- *                                      (sharp temple architecture vs.
- *                                      organic blobs).
- *   raster/mandelbulb_raster.c      — same fractal, polygon-rasterised
- *                                      pipeline.  Studying both side-
- *                                      by-side reveals the contrast
- *                                      between "evaluate per-pixel"
- *                                      (this file) and "tessellate
- *                                      once, render forever".
- *   raymarcher/donut.c              — simpler raymarcher friend; read
- *                                      donut.c first for the camera +
- *                                      ray-gen + z-buffer skeleton.
+ * Study alongside: raymarcher/raymarcher.c (sphere — same march
+ *       loop with a one-line SDF) and raymarcher/raymarcher_cube.c
+ *       (box SDF + tetrahedral normal).  This file is what happens
+ *       when the SDF stops being a "true" distance function and
+ *       becomes a CONSERVATIVE LOWER BOUND — the marcher needs
+ *       extra tricks to stay correct.
  *
  * Section map:
- *   §1 config    — themes, raymarch tunables, control rates, pair IDs
- *   §2 clock     — monotonic timer + sleep
- *   §3 color     — 8-pair theme apply (with inverted-bg support)
- *   §4 vec3      — value-type 3-D math
- *   §5 mandelbulb— iteration helpers (Spherical / dr / apply_power)
- *                  + DE (with smooth iter) + central-diff normal
- *   §6 march     — sphere trace + soft shadow + AO + Phong shade
- *   §7 scene     — camera basis, ray gen, decorate + emit, render
- *   §8 screen    — ncurses init / resize / HUD draw / present
- *   §9 app       — main loop, signals, key handling, cleanup
+ *   §1  config       — every tunable named, no magic numbers later
+ *   §2  clock        — monotonic timer + sleep
+ *   §3  color        — themes (incl. NEGATIVE inverted) + HUD pairs
+ *   §4  vec3         — 3-D math, value types
+ *   §5  mandelbulb   — iteration, distance estimator, smooth iter, normal
+ *   §6  march        — sphere trace + soft shadow + AO + Phong shade
+ *   §7  scene        — camera basis, ray gen, decorate + emit, render
+ *   §8  screen       — ncurses init / HUD / present
+ *   §9  app          — main loop, signals, key handling
  *
  * Keys:
- *   q / ESC      quit
- *   space        pause / resume auto-orbit
- *   r            reset camera
- *   t / T        next / previous theme
- *   ← / →        manual orbit (yaw)
- *   ↑ / ↓        manual orbit (pitch)
- *   z / Z        zoom in / out
- *   i / I        iterations −1 / +1   (depth of fractal; affects detail)
- *   ] / [        sim Hz up / down
+ *   q / ESC    quit
+ *   space      pause / resume the orbit
+ *   r / R      reset camera + iteration depth
+ *   t / T      next / previous theme
+ *                (CLASSIC / ICE / PLASMA / MONO / NEGATIVE)
+ *   i / I      iteration depth − / +   (3..14, default 8)
+ *   z / Z      zoom in / out (camera closer / farther)
+ *   arrows     manual orbit (left/right yaw, up/down pitch)
+ *   ] / [      simulation rate up / down
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra raymarcher/mandelbulb.c \
  *       -o mandelbulb -lncurses -lm
  */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
  *
- * Algorithm      : Sphere tracing of the Mandelbulb distance estimator
- *                  (Daniel White & Paul Nylander, 2009).
+ * The file is structured as a textbook.  Read top-to-bottom.
  *
- *                  ITERATION (per evaluation point p, with z₀ = p):
- *                     for i = 1..N:
- *                         (r, θ, φ)  = to_spherical(z)         // |z|, polar, azimuth
- *                         if r > BAILOUT: break
- *                         dr         = update_dr(dr, r)        // r^(p−1)·p·dr + 1
- *                         z          = apply_power_and_add(s, p)
+ *   • CONCEPTS         names the algorithm and lists references.
+ *   • MENTAL MODEL     intuition + an ASCII diagram of the iteration.
+ *   • GUIDED TUTORIAL  eight short answers walking from the 2D
+ *                      Mandelbrot up through "why a fractal SDF
+ *                      needs extra marching tricks".
+ *   • §1..§9           the actual code, each section short and focused.
  *
- *                  DISTANCE ESTIMATE (Hubbard-Douady form):
- *                     DE(p) = ½ · log(r) · r / dr
+ * Ten-minute version: read the GUIDED TUTORIAL.  By the end the
+ * §-sections feel like reviewing notes.
  *
- *                  SMOOTH ITER (continuous index for colouring):
- *                     smooth = i + 1 − log₂(log r / log BAILOUT) / log₂(power)
- *                  Adjacent pixels get continuous colour, no banding.
+ * Math notation used in the code:
+ *      z          — the iteration variable (a 3-D point)
+ *      c          — the parameter (the input point we're testing)
+ *      r, θ, φ    — spherical coords:  r = |z|, θ = polar from +y,
+ *                                       φ = azimuth in xz plane
+ *      dr         — running derivative magnitude (used by the DE)
+ *      p          — the Mandelbulb power exponent (8 here)
+ *      DE(p)      — distance estimator at point p
+ *      N          — surface normal at the hit
+ *      L          — light direction (unit vector)
  *
- *                  SPHERE TRACE: t = 0; for step = 1..MAX_STEPS:
- *                     d = DE(origin + t · dir)
- *                     if d < HIT_EPS · (1 + t · ADAPTIVE_FACTOR): hit
- *                     t += d · STEP_RELAX                        // ≈ 0.85
+ * Background you need:
+ *   • basic vector arithmetic (add, dot, cross, length, normalise)
+ *   • familiarity with the 2D Mandelbrot iteration z ← z² + c
+ *     helps a lot — Tutorial 1 recaps it briefly anyway
+ *   • read raymarcher.c first if sphere tracing is unfamiliar; this
+ *     file extends the same march loop with new tricks for fractals.
  *
- *                  The 0.85 multiplier prevents overshoot at grazing
- *                  angles; without it the trace can step PAST a thin
- *                  surface lobe and miss the hit.
- *
- *                  SHADING:
- *                     N    = central-difference normal of DE(p)
- *                     ndl  = max(0, N · light_dir)
- *                     soft = soft-shadow ray toward light (16 steps,
- *                            tracking min(K · d / t) for soft penumbra)
- *                     ao   = 1 − (march_steps / MAX_STEPS) · AO_STRENGTH
- *                            (cells that took many march steps sit in
- *                             concavities — natural ambient occlusion)
- *                     L    = AMBIENT + (1 − AMBIENT) · ndl · soft · ao
- *
- *                  PIXEL ENCODING:
- *                     glyph slot = ⌊L · LUMA_SLOT_FLT⌋             (shape)
- *                     colour slot = ⌊smooth/iters · LUMA_SLOT_FLT⌋ (depth)
- *
- * Data-structure : Stateless math.  No tables, no LUTs.  Each pixel
- *                  re-evaluates the iteration ~70 times during sphere
- *                  trace + 6 times for normal estimation + ~16 times
- *                  for the soft-shadow ray.
- *
- * Rendering      : ASCII only.  Glyph from Lambertian luminance,
- *                  colour pair from smooth iteration count.  The two
- *                  are decoupled — glyph reads as SHAPE (Phong
- *                  lighting), colour reads as DEPTH (escape iter).
- *
- * Performance    : ~50 march × ~8 iters × ~10 ops ≈ 4 000 ops per
- *                  pixel for the trace; another ~1 500 for shading.
- *                  At 80×24 = 1 920 pixels: ~10 M ops/frame.  Holds
- *                  60 fps comfortably; for 200×60 lower iters with `i`.
- *
- * References     :
- *   • White, D. & Nylander, P. (2009) — original Mandelbulb formulation
- *     and triplex algebra.
- *     https://www.skytopia.com/project/fractal/mandelbulb.html
- *   • Hart, J. C. (1996) — "Sphere Tracing: A Geometric Method for the
- *     Antialiased Ray Tracing of Implicit Surfaces," *The Visual
- *     Computer* 12(10):527–545.  The sphere-trace iteration we use.
- *   • Hubbard, J. H. & Douady, A. (1985) — "Étude dynamique des
- *     polynômes complexes," Pub. Math. Orsay.  Origin of the
- *     `½ · log(r) · r / dr` distance estimator.
- *   • Quílez, I. — "Mandelbulb"
- *     https://iquilezles.org/articles/mandelbulb/
- *     The clearest derivation of the smooth iteration count and
- *     central-difference normal estimator.
- *   • Christensen, M. H. — "Distance Estimated 3D Fractals — a
- *     Tutorial," parts I–V (2011), syntopia.github.io.  Soft shadow
- *     and AO recipes for distance-estimated fractals.
- *
- * ─────────────────────────────────────────────────────────────────────── */
+ * ─────────────────────────────────────────────────────────────────── */
 
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+/* ── CONCEPTS ────────────────────────────────────────────────────────── *
+ *
+ * Algorithm    : MANDELBULB DISTANCE ESTIMATOR (Daniel White / Paul
+ *                Nylander, 2009).  The 2D Mandelbrot iteration
+ *                z ← z² + c generalised to 3D by performing the
+ *                squaring (or in this case, raising to power 8) in
+ *                spherical coordinates.  Combined with the Hubbard-
+ *                Douady distance estimator
+ *                    DE(p) = ½ · log(|z|) · |z| / |z'|
+ *                this yields a LOWER BOUND on distance from p to
+ *                the fractal surface — close enough for sphere
+ *                tracing, with two extra tuning knobs (step
+ *                relaxation + adaptive epsilon) to handle the
+ *                "lower bound, not exact" nature.
+ *
+ * Data         : Stateless math (V3 + DE + trace + shade) on the
+ *                hot path.  Per-pixel result is `Hit` (hit / p /
+ *                normal / smooth_iter / luminance / march_steps);
+ *                rendered to one (glyph, colour pair, attr) Cell
+ *                per terminal cell.
+ *
+ * Rendering    : One ray per terminal cell (no virtual canvas).
+ *                Glyph from a faint-to-solid 8-char ramp; colour
+ *                from the active theme's 8-tier 256-colour ramp
+ *                indexed by smooth iteration count.  One theme
+ *                (NEGATIVE) renders the fractal photographic-
+ *                negative — white background, dark foreground —
+ *                handled by an `inverted` flag in the Theme struct.
+ *
+ * Performance  : ~6 DE evaluations per hit pixel (1 trace step at
+ *                hit + 1 smooth-iter eval + 6-tap normal − 1 shared
+ *                = ~6).  Plus SHADOW_STEPS (16) DEs per shadow ray
+ *                (only for hits).  At ITERS_DEFAULT = 8 and a
+ *                modest terminal, this stays north of 60 fps on
+ *                modern CPUs.
+ *
+ * References   :
+ *   • Daniel White & Paul Nylander (2009) — "Mandelbulb"
+ *     https://www.skytopia.com/project/fractal/mandelbulb.html
+ *     The original derivation.
+ *   • Hubbard, J. H. & Douady, A. — distance estimator for the
+ *     Mandelbrot set (general technique extended here to the bulb).
+ *   • Hart, J. C. (1996) — "Sphere Tracing: A Geometric Method for
+ *     the Antialiased Ray Tracing of Implicit Surfaces", *Visual
+ *     Computer* 12(10):527-545.  The march loop.
+ *   • Quílez, I. — "Distance Estimators for Implicit Surfaces"
+ *     https://iquilezles.org/articles/distancefractals/
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ────────────────────────────────────────────────────── *
  *
  * CORE IDEA
  * ─────────
- * The Mandelbulb is a 3-D analogue of the Mandelbrot set.  Each point
- * in 3-D space gets ITERATED through a non-linear function (raise the
- * point to the 8th power in spherical coordinates, add the original
- * point, repeat).  Points whose orbits stay bounded form the fractal's
- * "interior"; points whose orbits diverge are "outside".  We render
- * by sphere-tracing rays through 3-D space; at each step the DISTANCE
- * ESTIMATOR tells us how far the ray can safely advance before
- * possibly hitting the fractal.  Once we hit, lighting + colour give
- * the final pixel.
+ * Take a point c in 3D space.  Iterate z ← z^8 + c (where the
+ * "raising to the 8th power" happens in spherical coordinates
+ * around c).  If after a few iterations |z| stays small, c is INSIDE
+ * the Mandelbulb; if |z| explodes off to infinity, c is outside.
+ * The fractal SURFACE is the boundary between the two.  We don't
+ * just test inside vs outside — we use the rate at which |z|
+ * escapes (and the running magnitude of its derivative) to estimate
+ * HOW FAR c is from the surface.  That distance feeds straight into
+ * sphere tracing.  No mesh, no triangles, no voxels — just an
+ * iteration at every sample point along every ray.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
- * Think of the fractal as an alien fruit suspended in space.  You
- * shine a flashlight on it from above-and-to-the-right (the LIGHT
- * direction).  Your eye looks at it from a slowly orbiting camera.
- * Each pixel of your view is a ray from the camera toward the fruit;
- * that ray walks in steps until it touches the surface, then asks
- * three questions:
- *   – Which way does the surface face?         (normal      → shape)
- *   – Is the spot in shadow from another lobe? (soft shadow → drama)
- *   – Is the spot inside a tight crevice?      (AO          → depth)
- * The answers combine into a brightness number that picks the glyph.
- * A second number — how MANY iterations the spot took to "decide" it
- * was inside the fractal — picks the colour.  Glyph carries shape;
- * colour carries depth.
+ * The 2D Mandelbrot is a fixed-point classifier: for every complex
+ * c, "does the iteration converge or diverge?"  The Mandelbulb is
+ * the same question asked of every point in 3D space, with the
+ * complex squaring replaced by a spherical-coordinate operation
+ * that's well-defined in any number of dimensions.  At power 8 the
+ * iteration's symmetry group is the rotation group acting on the
+ * sphere — the resulting fractal has 8-fold rotational symmetry
+ * around the polar axis and a "lumpy / spiked" appearance with
+ * deep grottoes between the lobes.
  *
- *      ┌─────────────────────────────────────────────────────────────┐
- *      │                                                             │
- *      │   light                                                     │
- *      │      ☀  ↘                                                   │
- *      │            ↘                                                │
- *      │              ╭──────╮         camera                        │
- *      │             ╱        ╲      ←──────  👁                     │
- *      │            ╱  bulb    ╲      one ray per cell               │
- *      │           ╱            ╲                                    │
- *      │            ╲          ╱                                     │
- *      │             ╲________╱                                      │
- *      │                                                             │
- *      │   per ray:  trace → hit? → normal + smooth + shade → cell   │
- *      └─────────────────────────────────────────────────────────────┘
+ * One iteration, in cross-section (along the +y polar axis):
+ *
+ *      z = (r, θ, φ)                           (spherical coords)
+ *           │
+ *           ▼  raise radius to the 8th power
+ *      r' = r^8                                 (radial stretch)
+ *           │
+ *           ▼  multiply both angles by 8
+ *      θ' = 8θ,  φ' = 8φ                       (angular spin-up)
+ *           │
+ *           ▼  back to Cartesian, add c
+ *      z' = (r' sin θ' cos φ', r' cos θ', r' sin θ' sin φ') + c
+ *
+ *      ▲ DE = ½·log(|z|)·|z| / |z'|
+ *      └── Hubbard-Douady estimator: closer to the surface
+ *          ⇒ smaller DE.  Used as the safe step distance.
  *
  * ALGORITHM IN STEPS
  * ──────────────────
- *  Per frame:
+ * Once per frame:
+ *   1. orbit       advance auto-yaw (paused freezes it)
+ *   2. camera      build orthonormal (fwd, right, up) at the orbiting
+ *                  position, compute FOV tangent + aspect correction
  *
- *    1. Build camera basis (origin, fwd, right, up) from orbit yaw,
- *       orbit pitch, manual yaw, manual pitch, cam_dist.
- *    2. Normalise the light direction.
+ * Once per pixel:
+ *   3. ray         build a primary ray from camera through the cell
+ *   4. trace       sphere-march with adaptive ε + step relaxation
+ *   5. on hit:     6-tap central-difference normal
+ *                  smooth iteration count for colour
+ *                  Phong + soft shadow + AO → final luminance
  *
- *  Per pixel:
- *
- *    3. RAY DIRECTION — through (col, row), aspect-corrected.
- *
- *    4. SPHERE TRACE:
- *           t = 0
- *           for step = 1..MAX_STEPS:
- *               p   = origin + t · dir
- *               d   = DE(p)
- *               eps = HIT_EPS · (1 + t · ADAPTIVE_FACTOR)
- *               if d < eps      → hit
- *               if t > MAX_T    → miss
- *               t  += d · STEP_RELAX
- *
- *    5. ON HIT:
- *           N      = central-difference normal of DE
- *           smooth = continuous escape count (for colour)
- *           soft   = soft-shadow ray toward light
- *           ao     = 1 − (march_steps / MAX_STEPS) · AO_STRENGTH
- *           L      = AMBIENT + (1−AMBIENT) · max(0, N·L_dir) · soft · ao
- *
- *    6. DECORATE:
- *           glyph slot = ⌊L · LUMA_SLOT_FLT⌋
- *           colour slot = ⌊smooth/iters · LUMA_SLOT_FLT⌋
- *           Cell  = (LUMA_GLYPHS[lum_slot], PAIR_RAMP_BASE+clr_slot, attr)
- *
- *    7. EMIT — paint with attribute batching (only attron/off when
- *       the pair OR attr changes).
- *
- *  Per tick:
- *    8. ANIMATE — orbit_yaw advances; pause freezes it.
+ * Once per cell:
+ *   6. quantise    luminance → glyph slot (8 levels)
+ *                  smooth_iter / max_iter → colour slot (8 levels)
+ *   7. emit        with attron/attroff batched on (pair, attr) change
  *
  * KEY FORMULAS
  * ────────────
- *   Spherical coords of z:
- *     r     = |z|
- *     θ     = acos(z.y / r)         (polar from +y)
- *     φ     = atan2(z.z, z.x)       (azimuth in xz)
+ * Spherical coordinates:
+ *      r = |z|,  θ = acos(z.y / r),  φ = atan2(z.z, z.x)
  *
- *   Mandelbulb iteration step:
- *     z' = r^p · (sin pθ · cos pφ, cos pθ, sin pθ · sin pφ) + p₀
- *     dr' = r^(p−1) · p · dr + 1
+ * Mandelbulb iteration (power p):
+ *      z' = r^p · (sin pθ · cos pφ,  cos pθ,  sin pθ · sin pφ) + c
  *
- *   Distance estimate:
- *     DE(p) = ½ · log(r) · r / dr
+ * Running derivative magnitude:
+ *      dr ← p · r^(p−1) · dr  +  1
+ *      (this tracks how fast |z| would change with a perturbation
+ *       in c — needed by the distance estimator)
  *
- *   Smooth iteration (continuous):
- *     smooth = i + 1 − log₂(log r / log BAILOUT) / log₂(power)
+ * Hubbard-Douady distance estimator (lower bound, not exact):
+ *      DE(p) = ½ · log(|z|) · |z| / dr
  *
- *   Sphere-trace step under-relaxation:
- *     t_{k+1} = t_k + α · DE(p_k),    α = STEP_RELAX ∈ (0.5, 1.0]
+ * Smooth iteration count (continuous across the boundary):
+ *      smooth = i + 1 − log₂(log(|z|) / log(BAILOUT)) / log₂(p)
  *
- *   Adaptive hit epsilon (cone tracing):
- *     ε_hit(t) = HIT_EPS · (1 + t · ADAPTIVE_FACTOR)
+ * Sphere trace with under-relaxation + adaptive ε:
+ *      t  ← t + α · DE(ro + t·rd)        α = STEP_RELAX < 1
+ *      ε  = HIT_EPS · (1 + t · ADAPTIVE_FACTOR)
+ *      hit when DE < ε,  miss when t > MAX_T
  *
- *   Soft-shadow factor (Christensen):
- *     soft = clamp(min over march of K · d / t,  SHADOW_FLOOR,  1)
+ * Soft shadow (Christensen):
+ *      result = 1
+ *      for each step toward the light:
+ *          result = min(result, K · DE(p) / t)
+ *      result = clamp(result, SHADOW_FLOOR, 1)
  *
- *   AO from march-step count:
- *     ao = clamp(1 − (steps/MAX_STEPS) · AO_STRENGTH,  AO_FLOOR,  1)
+ * Cheap AO (step count proxy):
+ *      ao = 1 − (march_steps / MAX_STEPS) · AO_STRENGTH
+ *      (cells deep in concavities take more steps → naturally darker)
  *
- *   Aspect correction (cells 2× taller than wide):
- *     phys_aspect = (rows · 2) / cols
+ * Phong combine:
+ *      L = AMBIENT + (1 − AMBIENT) · max(0, N·L_dir) · soft · ao
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *   • DE BREAKDOWN AT POWER ≈ 1.  At power < 2 the iteration is nearly
- *     linear and the DE returns nonsense.  We pin power = 8 (default
- *     Mandelbulb).  Power adjustments would need a different DE form.
+ *   • The DE is a LOWER BOUND on true distance, not exact.  Without
+ *     STEP_RELAX (α < 1) the marcher overshoots at grazing angles.
+ *     Set α = 1.0 and you'll see "shadow acne" — speckle pattern
+ *     across slopes that should be smooth.
  *
- *   • r = 0 IN ITERATION.  acos(z.y / r) divides by r.  The very
- *     first iteration with z = origin (r = 0) is fine because we test
- *     `r > BAILOUT` BEFORE the spherical conversion — but a recurrent
- *     return to origin would crash.  In practice z grows fast under
- *     iteration so this never happens for points outside a tiny
- *     pathological set.  `to_spherical` defends with a length check
- *     anyway.
+ *   • ITERS too low (< 5) makes the surface look bulbous and smooth;
+ *     too high (> 12) makes it crumble into noise as floating-point
+ *     accumulates.  ITERS_DEFAULT = 8 is the canonical sweet spot.
  *
- *   • OVERSHOOT WITHOUT UNDER-RELAXATION.  The DE is a LOWER bound on
- *     true distance, but optimistic near singularities.  STEP_RELAX
- *     = 0.85 prevents the trace from punching through thin lobes.
+ *   • ADAPTIVE_FACTOR widens ε linearly with t.  At t = MAX_T the
+ *     effective ε is ~7× the near-camera value — this avoids wasting
+ *     march steps on sub-pixel-precision when far from the surface,
+ *     but if pushed too high (say 0.05) you'll see the silhouette
+ *     bulge outward at large distances.
  *
- *   • ADAPTIVE EPSILON.  Far cells have lower precision needs; their
- *     hit ε scales up with t.  Without this the trace at large t
- *     never converges because the DE bottoms out at a noisy floor.
+ *   • The fractal lives roughly in |p| < 1.5.  CAM_DIST_MIN = 1.5
+ *     keeps the camera outside the bulb's bounding sphere; pushing
+ *     closer puts the eye inside lobes and rays start with negative
+ *     DE, breaking the marcher.
  *
- *   • ITERATION COST.  Each iteration involves 1 acos, 1 atan2, 4
- *     sin/cos, 2 pow.  Doubling N_ITER doubles per-pixel cost.
- *     Default 8 is the sweet spot for terminal resolution; lower
- *     with `i` on large terminals.
+ *   • The NEGATIVE theme requires a white CANVAS background — see
+ *     prefill_canvas.  A_BOLD/A_DIM are also disabled for this theme
+ *     because they invert their visual meaning against a light bg.
  *
- *   • NORMAL EPSILON.  Too small → noisy normals from DE
- *     quantisation; too large → smoothed normals lose surface
- *     detail.  4 · HIT_EPS is the empirical compromise.
- *
- *   • CAMERA INSIDE THE BULB.  Zooming past the hull (cam_dist <
- *     ~1.2) places the camera inside; the trace then walks outward
- *     and the fractal renders inverted.  We clamp cam_dist ≥
- *     CAM_DIST_MIN to keep the camera outside.
- *
- *   • PAUSE freezes orbit, NOT input — you can still manually orbit
- *     and zoom while paused.
- *
- *   • INVERTED THEME (NEGATIVE) needs special handling: the empty
- *     background must be pre-filled with the white bg pair, and the
- *     A_BOLD/A_DIM modulation is disabled (it would invert the
- *     brightness intent on light fg over white bg).
- *
- *   • HUD VS THEME.  HUD pairs are theme-independent (yellow + cyan
- *     on default bg).  In NEGATIVE theme this leaves the HUD strip
- *     on the terminal default background while the canvas is white;
- *     the visual band is acceptable for a niche theme.
+ *   • SHADOW_STEPS = 16 is enough for the bulb's typical occlusion
+ *     scale; larger values cost frame rate without visible quality.
  *
  * HOW TO VERIFY
  * ─────────────
- *   • Press space.  Auto-orbit freezes.  The fractal holds at its
- *     current angle.  Resume — orbit picks up smoothly.
+ *   • At ITERS = 8 and default zoom, the silhouette should show
+ *     8-fold rotational symmetry around the vertical axis (count
+ *     the lobes around the equator).  Tap left/right arrows to
+ *     orbit and confirm.
  *
- *   • Press `r`.  Camera resets to default (orbit yaw = 0, manual
- *     offsets cleared, distance default, iters default).
+ *   • Press i to drop iters to 3.  Surface becomes a smooth,
+ *     pumpkin-like blob — the fractal detail emerges only at higher
+ *     iterations.  Press I to crank to 14 and watch detail appear.
  *
- *   • Press `t`.  Theme cycles.  Geometry identical, only colours
- *     change.  CLASSIC → ICE is the most striking flip.
+ *   • Press t through all 5 themes.  Geometry is identical; only
+ *     the colour mapping changes.  NEGATIVE switches to white-bg,
+ *     dark-fg — verify the HUD and key hint stay readable.
  *
- *   • Press `i` to lower iterations.  At iters = 4 the fractal
- *     becomes a smooth blob; at iters = 8 (default) it has well-
- *     defined lobes and crevices; at iters = 12 the finest surface
- *     detail is visible (also slowest).
+ *   • Press z several times to zoom in.  At CAM_DIST_MIN the camera
+ *     touches the bulb's bounding sphere; close-up shows surface
+ *     detail clearly.
  *
- *   • Press `→` repeatedly.  Manual yaw advances; combined with
- *     auto orbit you get faster rotation.  Hold `←` to slow / reverse.
+ *   • Press space to pause; orbit freezes mid-arc.
  *
- *   • Press `↑` / `↓` to look from above / below.  At extreme
- *     pitches you see the bulb's polar lobes — the iconic "head"
- *     and "feet".
+ *   • Resize the terminal: HUD reflows, fractal re-centres.
  *
- *   • Press `z`.  Zoom in until surface detail fills the screen;
- *     the raymarcher's adaptive epsilon should keep edges crisp.
- *     `Z` to back out.
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL — eight short answers ───────────────────────────── *
  *
- *   • At 60 × 20, the fractal silhouette should still read as 3-D.
- *     If the bulb looks flat, AO or soft shadow has been disabled —
- *     both are critical for depth perception at low res.
  *
- * ─────────────────────────────────────────────────────────────────────── */
+ * T1: Mandelbrot in 2D — the iteration we're generalising
+ * ───────────────────────────────────────────────────────
+ * For each complex number c, run:
+ *
+ *      z₀ = 0
+ *      z_{n+1} = z_n² + c
+ *
+ * If |z_n| stays bounded (always < 2 suffices) for N iterations,
+ * c is "in" the Mandelbrot set.  Otherwise c is outside, and the
+ * iteration n at which |z_n| first crosses the bailout is a measure
+ * of how QUICKLY c escapes.  Plotting black-vs-coloured by escape
+ * iteration gives the iconic Mandelbrot fractal.
+ *
+ * Key insight: the boundary of the set is INFINITELY DETAILED.
+ * Every zoom level reveals new structure.  This is what makes
+ * fractals geometrically interesting and notoriously hard to render
+ * by triangle meshing.
+ *
+ *
+ * T2: Why doesn't z² + c work in 3D?
+ * ──────────────────────────────────
+ * Complex multiplication is intrinsically 2-dimensional.  z² in 2D
+ * is "rotate z's argument by 2× and square its magnitude" — a
+ * geometric operation that needs both an angle and a length.  In
+ * 3D there's no single "argument" angle; you'd need at least two
+ * angles (azimuth + elevation), and the "obvious" generalisation
+ * is ambiguous.
+ *
+ * Quaternions extend complex numbers to 4D and give a unique z² + c,
+ * but quaternionic Julia sets are smooth blobs — visually
+ * unimpressive.  Daniel White's 2009 trick: define z^p in 3D by
+ * transforming the squaring operation to spherical coordinates,
+ * where it has a clean generalisation.  Pick the power, watch
+ * fractal lobes form.
+ *
+ *
+ * T3: The spherical-power trick
+ * ─────────────────────────────
+ * For a 3-D point z = (z.x, z.y, z.z), convert to spherical:
+ *
+ *      r = |z|                          radial distance
+ *      θ = acos(z.y / r)                polar angle (from +y axis)
+ *      φ = atan2(z.z, z.x)              azimuth in the xz plane
+ *
+ * The Mandelbulb's z^p operation is then:
+ *
+ *      z^p = r^p · ( sin(pθ) · cos(pφ),
+ *                     cos(pθ),
+ *                     sin(pθ) · sin(pφ) )
+ *
+ * Then add c (still in Cartesian) and you have one iteration step.
+ *
+ * Worked example with p = 8 at z = (0.5, 0.5, 0):
+ *      r   = √(0.25 + 0.25 + 0) ≈ 0.707
+ *      θ   = acos(0.5 / 0.707) = acos(0.707) ≈ 0.785 rad (45°)
+ *      φ   = atan2(0, 0.5) = 0
+ *      r⁸  ≈ 0.0625
+ *      z^8 ≈ 0.0625 · (sin 6.28 · cos 0, cos 6.28, sin 6.28 · sin 0)
+ *          ≈ 0.0625 · (0, 1, 0)
+ *          ≈ (0, 0.0625, 0)
+ *
+ * The point shrunk hugely (r^8 with r < 1 → r much less than 1)
+ * and rotated 8× around both axes.  After many iterations these
+ * folds compose into the iconic spiked-bulb shape.
+ *
+ *
+ * T4: Counting iterations is too coarse — distance estimation
+ * ───────────────────────────────────────────────────────────
+ * For 2D Mandelbrot rendering, you ASSIGN a colour by iteration
+ * count and you're done — there's no "where exactly is the boundary
+ * pixel?", because every pixel just gets a colour.  For raymarching
+ * a 3D object, we need more: how far is THIS point from the
+ * surface, so the marcher can step safely?
+ *
+ * Hubbard-Douady distance estimator:
+ *
+ *      DE(c) = ½ · log(|z|) · |z| / |z'|
+ *
+ * where z is the iteration value at the time of escape and |z'| is
+ * the magnitude of dz/dc (how fast z changes with a perturbation
+ * in c).  We track |z'| with a running scalar `dr` that updates as:
+ *
+ *      dr_{n+1} = p · |z_n|^(p−1) · dr_n + 1
+ *
+ * The DE is a CONSERVATIVE LOWER BOUND on true Euclidean distance.
+ * That's important — see T5.
+ *
+ *
+ * T5: Sphere tracing a NON-EXACT distance function
+ * ────────────────────────────────────────────────
+ * For sphere SDF (raymarcher.c) and box SDF (raymarcher_cube.c)
+ * the distance returned was EXACT — Lipschitz-1 true distance.  The
+ * marcher could step the full d safely.
+ *
+ * The Hubbard-Douady DE is only a LOWER BOUND.  Stepping the full
+ * d can OVERSHOOT at grazing angles where the true distance is
+ * much smaller than the estimate.  Two tricks fix this:
+ *
+ *   STEP RELAXATION: scale the step by α < 1.
+ *      t ← t + α · DE(p),  with α = STEP_RELAX = 0.85
+ *      Sacrifice some march speed for guaranteed-safe steps.
+ *
+ *   ADAPTIVE EPSILON: the "we're touching" threshold ε grows with t:
+ *      ε(t) = HIT_EPS · (1 + t · ADAPTIVE_FACTOR)
+ *      A pixel at t = 5 doesn't need sub-millimetre precision; it
+ *      occupies more world distance per cell.  Widening ε avoids
+ *      wasting steps when the surface is far away.
+ *
+ * Without either trick, the silhouette breaks up into speckle
+ * (overshoots that fail to converge).
+ *
+ *
+ * T6: Shading a fractal — three contributions
+ * ───────────────────────────────────────────
+ * Three components combine into the per-pixel luminance:
+ *
+ *   LAMBERT       max(0, N·L_dir)
+ *                 N estimated by 6-tap central differences:
+ *                   Nₓ = DE(p + ε x̂) − DE(p − ε x̂)   etc.
+ *                 Then normalise.  6 DE evals per hit pixel — by
+ *                 far the dominant frame cost.
+ *
+ *   SOFT SHADOW   march from p toward the light, tracking
+ *                   min over t of (K · DE / t)
+ *                 Result is in [0, 1]: 1 means "no occluder seen",
+ *                 small values mean "something almost crossed the
+ *                 light path".  K (SHADOW_K) controls penumbra
+ *                 hardness.
+ *
+ *   AMBIENT OCC   1 − (step_count / MAX_STEPS) · AO_STRENGTH
+ *                 Free AO from the marcher itself: rays that travel
+ *                 deep into concavities take many march steps to
+ *                 converge → step count correlates with concavity →
+ *                 darker crevices automatically.  Cleanest free AO
+ *                 you can ask for in a sphere tracer.
+ *
+ * Final:
+ *      L = AMBIENT + (1 − AMBIENT) · ndl · soft · ao
+ *
+ *
+ * T7: Smooth iteration count — gradient instead of bands
+ * ──────────────────────────────────────────────────────
+ * Naïve colouring = "use iteration count i as the colour index".
+ * Result: visible bands at iteration boundaries, especially across
+ * the smooth surface where neighbouring pixels differ by exactly
+ * one iteration.
+ *
+ * Smooth iteration count gives a CONTINUOUS function:
+ *
+ *      smooth = i + 1 − log₂(log(|z|) / log(B)) / log₂(p)
+ *
+ * where i is the integer escape iteration, |z| is the magnitude
+ * at escape, B is the bailout (= 4 here), and p is the power (= 8).
+ * The expression is derived so that as a sample crosses an
+ * iteration boundary, smooth advances continuously.  Plot it as a
+ * colour and you get smooth gradients across the surface, not
+ * stripes.
+ *
+ *
+ * T8: Camera with auto-orbit + manual user offsets
+ * ────────────────────────────────────────────────
+ * The camera position is decomposed into:
+ *
+ *      yaw   = orbit_yaw + user_yaw         (auto + arrow keys)
+ *      pitch = orbit_pitch + user_pitch     (default tilt + arrow keys)
+ *
+ *      eye = cam_dist · (cos pitch · cos yaw,
+ *                        sin pitch,
+ *                        cos pitch · sin yaw)
+ *
+ * orbit_yaw advances at ORBIT_YAW_RATE radians per second; pause
+ * stops it.  user_yaw / user_pitch accumulate from arrow keys, so
+ * the user can offset the auto-orbit live.  pitch is clamped to
+ * ±MANUAL_PITCH_MAX to avoid the gimbal-lock singularity at the
+ * poles.
+ *
+ * From eye, build orthonormal (fwd, right, up):
+ *
+ *      fwd   = normalise(0 − eye)               (look at origin)
+ *      right = normalise(fwd × world_up)
+ *      up    = right × fwd
+ *
+ * Per pixel, the ray direction is:
+ *
+ *      ray = forward + u·tan(FOV/2)·right
+ *                    + v·tan(FOV/2)·aspect·up
+ *
+ * where u, v ∈ [−1, +1] are the pixel's NDC and `aspect` corrects
+ * for terminal cells being roughly twice as tall as they are wide.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* End of textbook.  The rest of the file is the worked exercises. */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -375,7 +516,7 @@ enum {
     PAIR_RAMP_BASE   =  3,     /* +0..+7 — depth ramp                */
 };
 
-/* §1.3 time helpers. */
+/* §1.3 time helpers + cell aspect. */
 #define NS_PER_SEC      1000000000LL
 #define NS_PER_MS          1000000LL
 #define TICK_NS(f)      (NS_PER_SEC / (f))
@@ -383,33 +524,22 @@ enum {
 #define CELL_ASPECT      2.0f      /* terminal cell h / w */
 
 /* §1.4 Mandelbulb iteration. */
-#define MANDELBULB_POWER 8.0f
-#define BAILOUT          4.0f      /* |z| > this → escaped */
+#define MANDELBULB_POWER 8.0f      /* the canonical power; T3 derives why */
+#define BAILOUT          4.0f      /* |z| > this → escaped; T1            */
 
-/* §1.5 sphere trace.
- *
- *   MAX_STEPS         hard cap on march steps per ray.
- *   HIT_EPS           "we're touching the surface" threshold at t=0.
- *   ADAPTIVE_FACTOR   ε grows with t to avoid wasting steps on sub-
- *                     cell precision at large distances.
- *   MAX_T             ray-length budget; past this we declare miss.
- *   STEP_RELAX        under-relaxation factor on each step (DE is a
- *                     LOWER bound; α < 1 prevents grazing-angle
- *                     overshoot).
- */
+/* §1.5 sphere trace (with the two fractal-specific knobs from T5). */
 #define MAX_STEPS        90
 #define HIT_EPS          1.0e-3f
-#define ADAPTIVE_FACTOR  0.012f
+#define ADAPTIVE_FACTOR  0.012f    /* ε grows with t                      */
 #define MAX_T            6.0f
-#define STEP_RELAX       0.85f
+#define STEP_RELAX       0.85f     /* α < 1: under-relax for safe stepping */
 
-/* §1.6 normal estimator. */
+/* §1.6 normal estimator epsilon. */
 #define NORMAL_EPS       3.5e-3f
 
-/* §1.7 soft shadow.
- *
- *   SHADOW_K       hardness — larger = sharper edge.
- *   SHADOW_FLOOR   minimum factor (cells in shadow stay this lit).
+/* §1.7 soft shadow (Christensen).
+ *      SHADOW_K       hardness — bigger = sharper shadow edge
+ *      SHADOW_FLOOR   minimum factor (cells in shadow stay this lit)
  */
 #define SHADOW_STEPS     16
 #define SHADOW_NEAR      0.012f
@@ -429,42 +559,47 @@ enum {
 
 /* §1.9 camera. */
 #define CAM_DIST_DEFAULT  3.2f
-#define CAM_DIST_MIN      1.5f      /* outside the bulb hull */
+#define CAM_DIST_MIN      1.5f      /* outside the bulb's bounding sphere */
 #define CAM_DIST_MAX      8.0f
 #define CAM_DIST_STEP     0.20f
 #define FOV_DEG          45.0f
-#define ORBIT_YAW_RATE    0.30f     /* rad / sec auto-orbit              */
-#define ORBIT_PITCH_DEF   0.25f     /* default static tilt above equator */
-#define MANUAL_YAW_STEP   0.12f     /* per arrow keypress                */
+#define ORBIT_YAW_RATE    0.30f     /* rad / sec auto-orbit               */
+#define ORBIT_PITCH_DEF   0.25f     /* default static tilt above equator  */
+#define MANUAL_YAW_STEP   0.12f
 #define MANUAL_PITCH_STEP 0.08f
-#define MANUAL_PITCH_MAX  1.30f     /* clamp short of poles              */
+#define MANUAL_PITCH_MAX  1.30f     /* clamp short of the poles           */
 
 /* §1.10 quantisation — number of glyph / colour slots. */
 #define LUMA_SLOTS       8
 #define LUMA_SLOT_FLT    7.999f     /* (LUMA_SLOTS - 0.001) */
 
-/* §1.11 themes — each is an 8-tier depth ramp.  Slot 0 = outermost
- * shell (escape early, low smooth iter); slot 7 = innermost.  All
- * entries sit in the bright half of the 256-cube per the CLAUDE.md
- * theme rule, EXCEPT the NEGATIVE theme which uses dark fg over a
- * white bg (handled by the `inverted` flag).
+/* §1.11 themes — five 8-tier 256-colour ramps.
+ *
+ * Slot 0 = outermost shell (escape early, low smooth iter); slot 7
+ * = deep interior (iteration didn't escape).  All entries except
+ * the NEGATIVE theme sit in the bright half of the 256-cube per
+ * the CLAUDE.md theme rule.
+ *
+ * NEGATIVE is photographic-negative: white background, dark
+ * foreground.  The `inverted` flag triggers special handling in
+ * theme_apply (white canvas bg) and luma_attr (no A_BOLD/A_DIM,
+ * which would invert the brightness intent against a light bg).
  */
 typedef struct {
     const char *name;
     short       ramp[LUMA_SLOTS];
-    bool        inverted;       /* white bg, dark fg, A_BOLD/A_DIM off */
+    bool        inverted;
 } Theme;
 
 #define N_THEMES 5
 
 static const Theme THEMES[N_THEMES] = {
-    /* CLASSIC: warm crimson → red → orange → amber → yellow → bone.
-     * Daniel White's original Mandelbulb images had this palette;
-     * still the iconic "alien fruit lit by sunset" look.            */
+    /* CLASSIC: warm crimson → red → orange → amber → bone — Daniel
+     * White's iconic "alien fruit lit by sunset" palette. */
     { "CLASSIC ",
       { 124, 160, 196, 202, 208, 214, 220, 229 }, false },
 
-    /* ICE: deep teal → bright cyan → ice blue → near-white. */
+    /* ICE: deep teal → bright cyan → ice → near-white. */
     { "ICE     ",
       {  30,  37,  44,  51,  87, 123, 159, 195 }, false },
 
@@ -472,21 +607,18 @@ static const Theme THEMES[N_THEMES] = {
     { "PLASMA  ",
       { 125, 165, 207, 213,  87, 123, 220, 229 }, false },
 
-    /* MONO: clean grayscale.  Best for studying fractal shape with
-     * zero hue distraction.  No black at slot 0 — visible grey.   */
+    /* MONO: clean grayscale — best for studying fractal shape. */
     { "MONO    ",
       { 240, 244, 247, 250, 252, 253, 254, 231 }, false },
 
-    /* NEGATIVE: photographic-negative inversion.  White bg, dark fg.
-     * Cool/outer fractal regions blend into white; deep interior
-     * stamps as solid black.  A_BOLD/A_DIM disabled (see CONCEPTS). */
+    /* NEGATIVE: photographic-negative inversion (see comment above). */
     { "NEGATIVE",
       { 253, 250, 245, 240, 237, 234, 232,  16 }, true  },
 };
 
-/* §1.12 luminance ramp — slot 0 = `.` (faint shape) → slot 7 = `@`
- * (full opacity).  Slot 0 is `.` not space, so even the dimmest hit
- * pixel paints something visible against the background. */
+/* §1.12 luminance ramp — slot 0 = `.` (faint), slot 7 = `@` (solid).
+ * No space at slot 0 so even the dimmest hit pixel paints something
+ * visible against the background. */
 static const char LUMA_GLYPHS[LUMA_SLOTS] = {
     '.', ',', ':', ';', '+', '*', '#', '@'
 };
@@ -508,17 +640,17 @@ static void clock_sleep_ns(int64_t ns)
     nanosleep(&req, NULL);
 }
 
-/* ── §3 color — depth ramp + HUD/hint pairs ──────────────────────────── */
-
-/*
- * theme_apply — re-init the eight depth-ramp pairs for the chosen
- * theme.  Called at startup and on every t / T keypress.  Geometry
- * is unaffected; only the smooth-iter → colour table changes.
+/* ── §3 color — depth ramp + HUD/hint pairs ──────────────────────────── *
  *
- * For inverted themes the bg is white (256-colour 231) so that
- * subsequent `mvaddch(' ')` calls in scene_render's pre-fill paint
- * the whole canvas white before the fractal is drawn over it.
+ * Eight depth-ramp pairs (PAIR_RAMP_BASE..+7) hold the active
+ * theme's colour ramp.  Two more (PAIR_HUD, PAIR_HINT) are
+ * theme-independent yellow + cyan for the HUD strips.
+ *
+ * Inverted themes use a white bg (256-colour 231) so subsequent
+ * mvaddch(' ') in prefill_canvas paints the canvas white before the
+ * fractal draws over it.
  */
+
 static void theme_apply(int idx)
 {
     if (idx < 0 || idx >= N_THEMES) idx = 0;
@@ -583,29 +715,14 @@ static inline float clampf(float x, float lo, float hi)
 
 /* ── §5 mandelbulb — iteration + DE + smooth iter + normal ───────────── *
  *
- * The iteration body, expanded line-by-line with one helper per math
- * step, mirrors the pseudocode in the MENTAL MODEL:
- *
- *     for i = 1..N:
- *         (r, θ, φ)  = to_spherical(z)         |z|, polar, azimuth
- *         if r > BAILOUT: break
- *         dr         = update_dr(dr, r)        r^(p−1)·p·dr + 1
- *         z          = apply_power_and_add(s, p)
- *
- * Each helper is `static inline` — at -O2 the compiler inlines them
- * back into one tight loop, so no performance is given up for the
- * extra readability.
+ * Tutorials T3, T4, T7 derived everything in this section.  The
+ * iteration body is split into three helpers (Spherical conversion,
+ * dr update, power-and-add) so the per-step math is line-by-line
+ * verifiable against the formulas.  At -O2 they all inline back
+ * into one tight loop — no performance cost for the readability.
  */
 
-/*
- * Spherical — z in spherical coordinates relative to +y as the polar
- * axis.  Computed once per iteration step and consumed by both
- * update_dr and apply_power_and_add.
- *
- *   r     = |z|
- *   theta = acos(z.y / r)        polar angle from +y
- *   phi   = atan2(z.z, z.x)      azimuth in the xz plane
- */
+/* z in spherical coords: r = |z|, θ = polar from +y, φ = azimuth in xz */
 typedef struct { float r, theta, phi; } Spherical;
 
 static inline Spherical to_spherical(V3 z)
@@ -619,29 +736,13 @@ static inline Spherical to_spherical(V3 z)
     return s;
 }
 
-/*
- * update_dr — one step of the running derivative magnitude.
- *
- *     dr_new = r^(p − 1) · p · dr + 1
- *
- * Tracking dr lets us compute the Hubbard-Douady DE
- * `½ · log(r) · r / dr` at the end of the iteration.
- */
+/* dr_new = p · r^(p−1) · dr + 1   (running derivative magnitude, T4) */
 static inline float update_dr(float dr, float r)
 {
     return powf(r, MANDELBULB_POWER - 1.0f) * MANDELBULB_POWER * dr + 1.0f;
 }
 
-/*
- * apply_power_and_add — the Mandelbulb's signature step.  Take the
- * spherical-coordinate triplet, raise the radius to the 8th power,
- * multiply both angles by 8, convert back to Cartesian, then add the
- * original point c (the parameter the iteration is parameterised by).
- *
- *     z' = r^p · (sin pθ · cos pφ, cos pθ, sin pθ · sin pφ) + c
- *
- * This is the spherical analogue of the 2-D Mandelbrot's z² + c.
- */
+/* z' = r^p · (sin pθ · cos pφ, cos pθ, sin pθ · sin pφ) + c   (T3) */
 static inline V3 apply_power_and_add(Spherical s, V3 c)
 {
     float zr     = powf(s.r, MANDELBULB_POWER);
@@ -654,23 +755,10 @@ static inline V3 apply_power_and_add(Spherical s, V3 c)
 }
 
 /*
- * mandelbulb_de — distance estimator with optional smooth iter output.
- *
- * Pseudocode (see KEY FORMULAS in MENTAL MODEL):
- *
- *     z = p_orig
- *     dr = 1
- *     for i in 0..max_iter:
- *         s = to_spherical(z)
- *         if s.r > BAILOUT: break
- *         dr = update_dr(dr, s.r)
- *         z  = apply_power_and_add(s, p_orig)
- *     return ½ · log(s.r) · s.r / dr
- *
- * If `smooth_out` is non-NULL, also writes the continuous escape
- * count for colouring (smooth across the surface — no integer
- * banding).  Pass NULL when computing normals (where the smooth
- * count isn't needed).
+ * mandelbulb_de — distance estimator + optional smooth iteration count.
+ * Returns ½ · log(|z|) · |z| / dr.  If smooth_out is non-NULL also
+ * writes the smooth (continuous) escape iteration count.  Pass NULL
+ * when computing normals (no need for the smooth count there).
  */
 static float mandelbulb_de(V3 p, int max_iter, float *smooth_out)
 {
@@ -705,18 +793,9 @@ static float mandelbulb_de(V3 p, int max_iter, float *smooth_out)
 }
 
 /*
- * mandelbulb_normal — surface normal at p via central differences.
- *
- *     N_x = de(p + ε x̂) − de(p − ε x̂)
- *     N_y = de(p + ε ŷ) − de(p − ε ŷ)
- *     N_z = de(p + ε ẑ) − de(p − ε ẑ)
- *     N   = normalise(N_x, N_y, N_z)
- *
- * Central (not forward) differences cost twice as many DE evaluations
- * (6 vs 3) but the geometry comes out symmetric — forward differences
- * bias the normal toward one octant and produce visibly skewed Phong
- * shading.  6 DE evals per hit pixel is by far the dominant frame
- * cost.  Normal-only DE skips the smooth_iter pass for speed.
+ * mandelbulb_normal — surface normal at p via 6-tap central differences.
+ * Two DE evals per axis × 3 axes = 6 DEs total (no smooth count needed).
+ * Symmetric around p so the resulting N has no octant bias.
  */
 static V3 mandelbulb_normal(V3 p, int max_iter)
 {
@@ -730,31 +809,21 @@ static V3 mandelbulb_normal(V3 p, int max_iter)
     return v3norm(v3(dx, dy, dz));
 }
 
-/* ── §6 march — sphere trace + soft shadow + AO + Phong shade ────────── */
-
-/*
- * TraceResult — what the sphere trace returns.  `march_steps` is the
- * number of steps taken; the shader uses it as a cheap AO signal.
+/* ── §6 march — sphere trace + soft shadow + AO + Phong shade ────────── *
+ *
+ * Tutorials T5, T6 derived the contents.  Three functions:
+ * sphere_trace returns where (and after how many steps) the ray hit
+ * the surface; soft_shadow returns a [0,1] visibility from a hit
+ * point toward the light; shade combines Lambert + soft shadow + AO
+ * into the final luminance.
  */
+
 typedef struct {
     bool  hit;
     V3    p;
-    int   march_steps;
+    int   march_steps;     /* AO signal: more steps = more occluded */
 } TraceResult;
 
-/*
- * sphere_trace — Hart 1996 with under-relaxation (α = STEP_RELAX) and
- * adaptive hit epsilon.  Pseudocode:
- *
- *     t = 0
- *     for step in 0..MAX_STEPS:
- *         p   = origin + t · dir
- *         d   = DE(p)
- *         eps = HIT_EPS · (1 + t · ADAPTIVE_FACTOR)
- *         if d < eps: return hit at p, with march_steps
- *         if t > MAX_T: return miss
- *         t += d · STEP_RELAX
- */
 static TraceResult sphere_trace(V3 origin, V3 dir, int max_iter)
 {
     TraceResult tr = { false, {0, 0, 0}, 0 };
@@ -780,21 +849,15 @@ static TraceResult sphere_trace(V3 origin, V3 dir, int max_iter)
 }
 
 /*
- * soft_shadow — Christensen-style soft shadow ray.
- *
- *     start at origin + SHADOW_NEAR · light_dir   (avoid self-shadow)
- *     march toward the light, tracking min(K · d / t)
- *     return that minimum, clamped to [SHADOW_FLOOR, 1]
- *
- * The running minimum converts a hard shadow ray into a soft penumbra:
- * if any sample came CLOSE to a surface (small d at a given t), the
- * ratio K·d/t drops, dimming the light contribution proportionally.
- * SHADOW_K controls hardness — bigger K = sharper shadow edge.
+ * soft_shadow — Christensen-style soft shadow from origin toward light.
+ * Returns a visibility factor in [SHADOW_FLOOR, 1].  Tracks the
+ * minimum SHADOW_K · DE / t over the shadow march; that minimum
+ * naturally produces a soft penumbra without any extra rays.
  */
 static float soft_shadow(V3 origin, V3 light_dir, int max_iter)
 {
     float result = 1.0f;
-    float t      = SHADOW_NEAR;
+    float t      = SHADOW_NEAR;     /* offset off the surface to avoid self-shadow */
 
     for (int i = 0; i < SHADOW_STEPS; i++) {
         V3    p = v3add(origin, v3scale(t, light_dir));
@@ -812,14 +875,9 @@ static float soft_shadow(V3 origin, V3 light_dir, int max_iter)
 }
 
 /*
- * shade — combine Lambert + soft shadow + AO into the final luminance.
- *
- *     L = AMBIENT + (1 − AMBIENT) · max(0, N·L_dir) · soft · ao
- *
- * AO is a cheap step-count proxy: cells inside concavities take many
- * march steps to converge (the trace bumps along the wall geometry),
- * so step count correlates with concavity → naturally darkens
- * crevices.  Cleanest free AO you can ask for in a sphere tracer.
+ * shade — combine Lambert + soft shadow + cheap AO into final luminance.
+ *      L = AMBIENT + (1 − AMBIENT) · max(0, N·L_dir) · soft · ao
+ * The cheap AO uses the trace's step count as a concavity proxy (T6).
  */
 static float shade(V3 hit_p, V3 normal, V3 light_dir,
                    int max_iter, int march_steps)
@@ -843,7 +901,7 @@ typedef struct {
     int    iters;
     int    cols, rows;
 
-    /* Camera. */
+    /* Camera (T8). */
     float  cam_dist;
     float  orbit_yaw;            /* auto-advancing                    */
     float  orbit_pitch;          /* fixed default tilt                */
@@ -887,7 +945,7 @@ static void scene_tick(Scene *s, float dt)
     if (s->orbit_yaw >  (float)(2.0 * M_PI)) s->orbit_yaw -= (float)(2.0 * M_PI);
 }
 
-/* §7.1 camera basis + per-pixel ray generation. */
+/* §7.1 camera basis + per-pixel ray generation (T8). */
 
 typedef struct {
     V3    origin;
@@ -896,17 +954,6 @@ typedef struct {
     float phys_aspect;
 } Camera;
 
-/*
- * camera_basis — orthonormal (fwd, right, up) at the orbiting camera
- * position, plus the FOV tangent and aspect correction.
- *
- *   yaw   = orbit_yaw + user_yaw
- *   pitch = clamp(orbit_pitch + user_pitch, ±MAX_PITCH)
- *   eye   = cam_dist · (cos pitch · cos yaw, sin pitch, cos pitch · sin yaw)
- *   fwd   = normalise(0 − eye) = normalise(−eye)
- *   right = normalise(fwd × world_up)
- *   up    = right × fwd
- */
 static Camera camera_basis(const Scene *s, int rows_eff)
 {
     float yaw   = s->orbit_yaw   + s->user_yaw;
@@ -926,13 +973,6 @@ static Camera camera_basis(const Scene *s, int rows_eff)
     return c;
 }
 
-/*
- * pixel_ray — direction from camera through pixel (col, row).
- *
- *   u   ∈ [−1, +1]  along screen x
- *   v   ∈ [−1, +1]  along screen y (flipped: top of screen → +v)
- *   dir = forward + u·tan(FOV/2)·right + v·tan(FOV/2)·aspect·up
- */
 static V3 pixel_ray(int col, int row, int cols, int rows_eff, const Camera *c)
 {
     float u =  ((float)col + 0.5f) / (float)cols     * 2.0f - 1.0f;
@@ -944,30 +984,19 @@ static V3 pixel_ray(int col, int row, int cols, int rows_eff, const Camera *c)
 
 /* §7.2 hit assembly + cell decoration. */
 
-/*
- * Hit — the complete per-pixel result of "did the ray hit, and if so,
- * everything the shader needs about that hit".
- */
 typedef struct {
     bool  hit;
     V3    p;
     V3    normal;
-    float smooth;
-    float luminance;
+    float smooth;          /* smooth iteration count (for colour)   */
+    float luminance;       /* final shaded value in [0, 1]          */
     int   march_steps;
 } Hit;
 
 /*
  * assemble_hit — given a TraceResult, fill in normal + smooth + final
- * luminance.  Pseudocode:
- *
- *     if !tr.hit: return Hit{ hit = false }
- *     normal     = mandelbulb_normal(tr.p)
- *     smooth     = mandelbulb_de(tr.p, &out)            (smooth-only)
- *     luminance  = shade(tr.p, normal, light, march_steps)
- *
- * One-stop: every per-hit DE evaluation lives in one place so the
- * cost is auditable and the orchestrator stays small.
+ * luminance.  Concentrates every per-hit DE evaluation in one place
+ * so the cost is auditable.
  */
 static Hit assemble_hit(TraceResult tr, int max_iter, V3 light)
 {
@@ -981,17 +1010,11 @@ static Hit assemble_hit(TraceResult tr, int max_iter, V3 light)
 }
 
 /*
- * Cell — a (glyph, colour pair, attribute) decoration of one terminal
- * cell.  shade_hit returns this; emit_cell paints it.  pair < 0 is the
- * miss sentinel: don't paint anything (the canvas pre-fill or the
- * default-bg already shows through).
+ * Cell — (glyph, colour pair, attribute) for one terminal cell.
+ * pair < 0 is the miss sentinel (don't paint anything).
  */
 typedef struct { char glyph; int pair; attr_t attr; } Cell;
 
-/*
- * to_slot — quantise a [0, 1] value to an integer slot 0..LUMA_SLOTS−1.
- * Clamps gracefully on out-of-range inputs.
- */
 static int to_slot(float x_01)
 {
     int s = (int)(x_01 * LUMA_SLOT_FLT);
@@ -1001,11 +1024,9 @@ static int to_slot(float x_01)
 }
 
 /*
- * luma_attr — A_BOLD for the brightest slots, A_DIM for the darkest,
- * A_NORMAL otherwise.  Disabled (returns A_NORMAL) for inverted
- * themes: dark-fg-on-white-bg flips the brightness intent of A_BOLD
- * (it makes the foreground LIGHTER on most terminals, which would
- * REDUCE contrast against the white bg).
+ * luma_attr — A_BOLD for brightest slots, A_DIM for darkest.  Disabled
+ * for inverted themes because A_BOLD's "lighter" effect REDUCES
+ * contrast against a white bg.
  */
 static attr_t luma_attr(int slot, bool inverted)
 {
@@ -1015,16 +1036,8 @@ static attr_t luma_attr(int slot, bool inverted)
     return                      A_NORMAL;
 }
 
-/*
- * shade_hit — pixel decoration.  Hit → Cell.
- *
- *     if !h->hit:                    miss sentinel (pair = −1)
- *     glyph slot   = to_slot(luminance)
- *     colour slot  = to_slot(smooth / max_iter)
- *     glyph        = LUMA_GLYPHS[lum]
- *     pair         = PAIR_RAMP_BASE + clr
- *     attr         = luma_attr(lum, inverted)
- */
+/* shade_hit — per-pixel decoration (Hit → Cell).  Glyph from
+ * luminance slot; colour pair from smooth-iter slot. */
 static Cell shade_hit(const Hit *h, int max_iter, bool inverted)
 {
     if (!h->hit) {
@@ -1040,10 +1053,8 @@ static Cell shade_hit(const Hit *h, int max_iter, bool inverted)
 }
 
 /*
- * emit_cell — paint one cell, batching attron/attroff so we only call
- * them when (pair, attr) actually changes.  Halves attribute thrash
- * on uniform regions.  Skips silently when the cell is a miss
- * sentinel (pair < 0).
+ * emit_cell — paint one cell with attron/attroff batched on (pair, attr)
+ * change.  Halves attribute thrash on uniform regions.
  */
 static void emit_cell(int row, int col, Cell c,
                       int *last_pair, attr_t *last_attr)
@@ -1059,11 +1070,9 @@ static void emit_cell(int row, int col, Cell c,
     mvaddch(row, col, (chtype)(unsigned char)c.glyph);
 }
 
-/*
- * prefill_canvas — for inverted themes, paint the fractal canvas
- * region white before any hits draw over it.  Misses then naturally
- * show through as white.
- */
+/* prefill_canvas — paint the canvas region white before fractal
+ * draws over it (inverted themes only).  Misses then naturally
+ * show through as white. */
 static void prefill_canvas(int y0, int rows_eff, int cols, bool inverted)
 {
     if (!inverted) return;
@@ -1074,17 +1083,7 @@ static void prefill_canvas(int y0, int rows_eff, int cols, bool inverted)
     attroff(COLOR_PAIR(PAIR_RAMP_BASE));
 }
 
-/* §7.3 the orchestrator — one tiny double loop. */
-
-/*
- * scene_render — full-frame raymarch.  The body reads as the four-
- * line algorithm: trace → assemble → decorate → emit.
- *
- * One ray per terminal cell.  No virtual canvas, no upscale — the
- * cells ARE the pixels.  The fractal is rendered into rows
- * [y0, y0 + rows_eff − 1]; row 0 (status) and rows−1 (hint) are
- * reserved for the HUD and painted by hud_draw().
- */
+/* §7.3 scene_render — full-frame raymarch, four-line body. */
 static void scene_render(const Scene *s)
 {
     int rows_eff = s->rows - HUD_ROWS;
@@ -1135,13 +1134,11 @@ static void screen_resize_curses(Screen *sc)
     getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
-/*
- * hud_draw — CLAUDE.md HUD spec:
+/* HUD layout (CLAUDE.md spec):
  *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
  *   row rows-1     PAIR_HINT (cyan   + bold) — key hint
- *
  * Both rows always use A_BOLD so the HUD stays legible against any
- * fractal colour underneath (including inverted-theme white).
+ * fractal colour (including inverted-theme white).
  */
 static void hud_draw(const Screen *sc, const Scene *s,
                      double fps, int sim_fps)
@@ -1176,7 +1173,7 @@ static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
-/* ── §9 app — main loop, signals, key handling, cleanup ──────────────── */
+/* ── §9 app — main loop, signals, key handling ───────────────────────── */
 
 typedef struct {
     Scene                 scene;

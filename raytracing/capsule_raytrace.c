@@ -31,7 +31,12 @@
  * Keys:
  *   s         cycle shade mode (phong → normals → fresnel → depth)
  *   d         cycle debug overlay (off → hit-type → axial → discrim)
- *   t         cycle theme (bronze → frost → ember → pine → dusk → pearl)
+ *   t / T     cycle theme — 20 materials in 4 families:
+ *               metals (12)  gold, silver, copper, bronze, brass, platinum,
+ *                            titanium, iron, steel, chrome, mercury, aluminum
+ *               gems    (4)  ruby, emerald, sapphire, amethyst
+ *               dielectrics  plastic, glass, ceramic
+ *               emissive     neon
  *   p / SPC   pause / resume rotation
  *   + / =     zoom in
  *   -         zoom out
@@ -281,7 +286,9 @@
  *   T7  The inverse-rotation trick (rotate the RAY)
  *   T8  Coordinate systems at a glance
  *   T9  Four shading modes — same geometry, four pictures
- *   T10 Three debug overlays — making the algorithm visible
+ *   T10 White light is the lab; the material is the specimen
+ *   T11 Metals vs dielectrics — F0, Fresnel, and the spec-tint trick
+ *   T12 Three debug overlays — making the algorithm visible
  *
  * ─────────────────────────────────────────────────────────────────── *
  *
@@ -492,10 +499,14 @@
  * After we know the hit point and its normal we still have to turn
  * those into a colour. Four orthogonal modes (cycle with `s`):
  *
- *   PHONG    Three-light cinematic setup: warm key + cool fill +
- *            bright rim. Diffuse = max(N·L, 0); specular =
- *            (R·V)^shininess. Looks like a polished pill of the
- *            theme's base colour.
+ *   PHONG    Three pure-WHITE lights (key + fill + rim). Diffuse =
+ *            max(N·L, 0); specular = (R·V)^shininess. The material's
+ *            distinctive colour comes from its OWN albedo and spec
+ *            tint — the lights are white so each material reads as
+ *            itself, not as a coloured filter. Diffuse weight per
+ *            material: metals ≈ 0.15 (spec-dominated), gems ≈ 0.70,
+ *            dielectrics ≈ 0.85, glass ≈ 0.10. Emissive (added after
+ *            lighting, before clamp) lets neon glow in shadow.
  *   NORMALS  N → (N+1)/2, channel-by-channel. RGB-encodes the
  *            surface normal as a colour. A correct intersection shows
  *            a smooth radial gradient on the body and hemispherical
@@ -509,7 +520,124 @@
  *            sanity check (the centre of the silhouette should be the
  *            brightest spot in DEPTH mode — closest to the camera).
  *
- * T10 THREE DEBUG OVERLAYS — MAKING THE ALGORITHM VISIBLE
+ * T10 WHITE LIGHT IS THE LAB; THE MATERIAL IS THE SPECIMEN
+ * ─────────────────────────────────────────────────────────
+ * A common amateur-lighting trick is to TINT the lights to flatter
+ * each material — warm key for gold, cool key for silver, blue rim
+ * for plastic. It looks slick at first glance but it CONFLATES two
+ * orthogonal things: "what the LIGHT is doing" and "what the
+ * MATERIAL is".
+ *
+ * The first-principles fix: keep all lights pure WHITE. Then any
+ * colour the eye sees comes from the MATERIAL itself. This is how
+ * PBR (physically-based rendering) sees the world, and the same
+ * logic an art gallery uses — neutral white-balanced spotlights so
+ * each painting shows its TRUE colours. A warm gallery light would
+ * make every Mondrian lean orange.
+ *
+ * In this file, every per-light colour is unit white:
+ *
+ *     LIGHT_KEY  = (1, 1, 1)         pure white sun
+ *     LIGHT_FILL = (1, 1, 1)         pure white fill
+ *     LIGHT_RIM  = (1, 1, 1)         pure white rim
+ *
+ * The KEY/FILL/RIM weights still differ in INTENSITY (KEY brightest,
+ * RIM dimmest, geometric falloff per light position) but they're all
+ * achromatic. So:
+ *
+ *     gold  albedo + gold  spec   →  looks like real gold
+ *     blue  albedo + WHITE spec   →  looks like real blue plastic
+ *     dark  albedo + WHITE spec   →  looks like real glass
+ *     dim   albedo + EMISSIVE     →  looks like real neon
+ *
+ * Material-as-material, not material-tinted-by-light.
+ *
+ * Try it:
+ *  - Pause (`p`), cycle `t` through all 20 materials. Each material
+ *    should be recognisable as ITSELF — gold reads gold, plastic
+ *    reads plastic, glass reads glass, neon glows pink.
+ *  - If the lights were tinted, every material would lean toward
+ *    the dominant light's hue and the recognition would break.
+ *
+ * T11 METALS VS DIELECTRICS — F0, FRESNEL, AND THE SPEC-TINT TRICK
+ * ─────────────────────────────────────────────────────────────────
+ * Three numbers describe how light interacts with a surface:
+ *
+ *   ALBEDO   the body colour from sub-surface absorption — what you
+ *            see when the surface is EVENLY illuminated and viewed
+ *            head-on (no highlight).
+ *   F0       the fraction of light reflected at NORMAL INCIDENCE
+ *            (cell facing camera, 0° angle to view).
+ *   FRESNEL  the curve raising reflectance to ≈ 1 at GRAZING angles
+ *            (cell at 90° to view, like the rim of the silhouette).
+ *
+ * Real materials split into two regimes along the F0 axis:
+ *
+ *   METALS       F0 has the SAME TINT as the visible body colour.
+ *                  gold's   measured F0 = (1.000, 0.766, 0.336)  ← yellow!
+ *                  silver's measured F0 = (0.972, 0.960, 0.915)  ← white-ish
+ *                  copper's measured F0 = (0.955, 0.638, 0.538)  ← pink-orange
+ *                That tinted F0 is what makes a metal look "metallic"
+ *                — its highlights reflect the metal's own colour
+ *                because metals are conductors and light can't enter
+ *                the bulk to be re-coloured by absorption. Whatever
+ *                gets reflected gets reflected AT THE METAL'S TINT.
+ *
+ *   DIELECTRICS  F0 is achromatic: ~0.04 (4%) across the spectrum.
+ *                Plastic, glass, gem, ceramic, wood, water — all of
+ *                them. The body colour comes ENTIRELY from absorption
+ *                inside the material; the highlight is a small WHITE
+ *                fraction reflected off the surface.
+ *
+ * Why it matters: the DIFFERENCE between gold and yellow plastic is
+ * not the body colour (both yellow) but the highlight — gold's
+ * highlight is YELLOW, plastic's is WHITE. That single tint
+ * difference is what makes "metal" look like metal and "plastic"
+ * look like plastic.
+ *
+ * Our Theme struct encodes this directly:
+ *
+ *   typedef struct {
+ *       V3 albedo;          body colour
+ *       V3 specular;        F0:  metal → albedo;  dielectric → white
+ *       V3 emissive;        self-glow (mostly 0; neon glows hot pink)
+ *       float diffuse_weight;
+ *       const char *name;
+ *   } Theme;
+ *
+ * The `diffuse_weight` field captures the OTHER physical truth:
+ * metals reflect almost everything specularly, with very little
+ * diffuse contribution. So:
+ *
+ *   metal:        diffuse_weight = 0.15  (low; mostly specular reflects)
+ *   gem:          diffuse_weight = 0.70  (saturated body + bright spec)
+ *   plastic:      diffuse_weight = 0.85  (full body colour)
+ *   glass:        diffuse_weight = 0.10  (dark body, bright white spec)
+ *   neon:         diffuse_weight = 0.20  (low diffuse + huge emissive)
+ *
+ * The §6.1 KEY block of `shade_phong` makes this concrete:
+ *
+ *     // Diffuse contribution: WHITE light × albedo × diffuse_weight
+ *     colour += diffuse · diffuse_weight · albedo
+ *
+ *     // Specular contribution: WHITE light × F0
+ *     //   metal       F0 = tinted albedo  → tinted highlight
+ *     //   dielectric  F0 = (1, 1, 1)      → white highlight
+ *     colour += specular · 1.30 · spec_F0
+ *
+ * Try it:
+ *  - Cycle to gold (`t` until name says "gold") — watch the highlight
+ *    on the bright side of the capsule. WARM YELLOW.
+ *  - Cycle to plastic — same geometry, same lighting; highlight is
+ *    pure WHITE. The body is blue but the highlight is white. That's
+ *    the dielectric signature.
+ *  - Cycle to ruby (red gem dielectric) — body deep red, highlight
+ *    near-white. Same dielectric signature.
+ *  - Cycle to neon — even on the SHADOW side, the surface still glows
+ *    hot pink because the emissive value is added AFTER the lighting
+ *    sum and BEFORE the clamp.
+ *
+ * T12 THREE DEBUG OVERLAYS — MAKING THE ALGORITHM VISIBLE
  * ────────────────────────────────────────────────────────
  * Cycling `d` switches the active overlay. Each REPLACES the shaded
  * colour with a visualisation of one piece of intermediate state from
@@ -573,8 +701,8 @@
 #define CAM_DIST_STEP 0.25f
 
 /* §1.6 shading constants. */
-#define AMBIENT       0.05f
-#define SHININESS     48.0f                /* phong exponent                */
+#define AMBIENT       0.20f
+#define SHININESS     75.0f                /* phong exponent — high = metal */
 
 /* §1.7 character ramp — Paul Bourke 92-char density ladder.
  * Index 0 (space) is invisible; index N-1 ('@') is densest. */
@@ -761,34 +889,113 @@ static V3 mat3_mulT(Mat3 m, V3 v)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
+/* ── Theme — PBR-flavoured material descriptor ────────────────────── *
+ *
+ * First-principles redesign: the LIGHTS are pure WHITE, and each
+ * material's distinctive look comes entirely from its own properties.
+ * Under white light, gold looks like gold (warm yellow metal) and
+ * blue plastic looks like blue plastic — the colour is intrinsic to
+ * the material, not painted on by a tinted light source.
+ *
+ * Fields:
+ *   albedo          body diffuse colour (what the material LOOKS LIKE
+ *                   under uniform white illumination)
+ *   specular        F0 — Fresnel reflectance at normal incidence:
+ *                     METALS:      tinted to match albedo (gold spec
+ *                                  is warm yellow because gold reflects
+ *                                  yellow at the highlight)
+ *                     DIELECTRICS: near-white (~4% achromatic
+ *                                  reflectance for non-conductors)
+ *   emissive        self-luminance, added AFTER lighting — visible
+ *                   even in shadow. Mostly (0,0,0); used for neon.
+ *   diffuse_weight  scales the diffuse contribution from albedo:
+ *                     metals      ≈ 0.15 (real metals diffuse very
+ *                                         little — almost everything
+ *                                         reflects via specular)
+ *                     gems        ≈ 0.70 (saturated body + bright spec)
+ *                     plastic /
+ *                       ceramic   ≈ 0.85 (full body colour)
+ *                     glass       ≈ 0.10 (very dark body, bright spec
+ *                                         fakes the transparent look)
+ *                     neon        ≈ 0.20 (low diffuse + bright emissive)
+ *
+ * The 20 themes below are organised into 4 families. Switching themes
+ * with `t / T` cycles through all 20 in order.
+ *
+ * Metal albedos are taken from PBR reference tables (Naty Hoffman,
+ * "Physics and Math of Shading", SIGGRAPH 2013) and lightly tweaked
+ * for terminal-renderer contrast.
+ * ─────────────────────────────────────────────────────────────────── */
 typedef struct {
-    V3          obj;            /* base albedo                                */
-    V3          spec;           /* highlight tint (key + rim)                 */
-    V3          key_col;        /* warm primary light tint                    */
-    V3          fill_col;       /* cool secondary light tint                  */
-    V3          rim_col;        /* bright back-rim tint                       */
+    V3          albedo;         /* body diffuse colour                      */
+    V3          specular;       /* F0 — metal: matches albedo; die: white   */
+    V3          emissive;       /* self-glow (added after lighting)         */
+    float       diffuse_weight; /* 0.10..0.90 — metal/dielectric scale      */
     const char *name;
 } Theme;
 
 static const Theme g_themes[] = {
-    /* bronze — warm antique gold-brown */
-    {{0.80f,0.50f,0.18f},{1.00f,0.88f,0.55f},
-     {1.00f,0.90f,0.60f},{0.30f,0.20f,0.60f},{0.90f,0.45f,0.08f},"bronze"},
-    /* frost — cold pale blue-white */
-    {{0.72f,0.88f,1.00f},{0.92f,0.96f,1.00f},
-     {0.80f,0.90f,1.00f},{0.12f,0.20f,0.70f},{0.55f,0.82f,1.00f},"frost"},
-    /* ember — deep orange-red with bright core */
-    {{0.92f,0.38f,0.08f},{1.00f,0.82f,0.45f},
-     {1.00f,0.78f,0.38f},{0.25f,0.05f,0.45f},{1.00f,0.28f,0.05f},"ember"},
-    /* pine — deep forest green */
-    {{0.12f,0.58f,0.22f},{0.50f,0.92f,0.55f},
-     {0.65f,1.00f,0.50f},{0.05f,0.28f,0.50f},{0.10f,0.80f,0.30f},"pine"},
-    /* dusk — soft purple-mauve */
-    {{0.55f,0.25f,0.75f},{0.88f,0.72f,1.00f},
-     {0.90f,0.80f,1.00f},{0.10f,0.05f,0.55f},{0.70f,0.25f,0.90f},"dusk"},
-    /* pearl — warm cream with soft highlights */
-    {{0.92f,0.88f,0.80f},{1.00f,0.98f,0.92f},
-     {1.00f,0.95f,0.80f},{0.30f,0.35f,0.70f},{0.95f,0.80f,0.55f},"pearl"},
+    /* === METALS (12) — spec hue MATCHES albedo, low diffuse_weight ===
+     * Real metals reflect nearly all incident light specularly. Their
+     * F0 (Fresnel at normal incidence) is what tints the highlight,
+     * giving each metal its signature colour. */
+
+    /* gold     — warm yellow precious metal                            */
+    {{1.00f,0.77f,0.34f}, {1.00f,0.77f,0.34f}, {0.f,0.f,0.f}, 0.15f, "gold"},
+    /* silver   — bright cool precious metal, near-pure white           */
+    {{0.97f,0.96f,0.92f}, {0.97f,0.96f,0.92f}, {0.f,0.f,0.f}, 0.15f, "silver"},
+    /* copper   — warm orange-red metal                                 */
+    {{0.96f,0.64f,0.54f}, {0.96f,0.64f,0.54f}, {0.f,0.f,0.f}, 0.15f, "copper"},
+    /* bronze   — warm brown alloy (Cu+Sn)                              */
+    {{0.78f,0.55f,0.30f}, {0.78f,0.55f,0.30f}, {0.f,0.f,0.f}, 0.15f, "bronze"},
+    /* brass    — yellow-green alloy (Cu+Zn)                            */
+    {{0.85f,0.70f,0.25f}, {0.85f,0.70f,0.25f}, {0.f,0.f,0.f}, 0.15f, "brass"},
+    /* platinum — cool greyish-white precious metal                     */
+    {{0.83f,0.81f,0.78f}, {0.83f,0.81f,0.78f}, {0.f,0.f,0.f}, 0.15f, "platinum"},
+    /* titanium — dark silvery metal                                    */
+    {{0.62f,0.60f,0.55f}, {0.62f,0.60f,0.55f}, {0.f,0.f,0.f}, 0.15f, "titanium"},
+    /* iron     — neutral grey base metal                               */
+    {{0.56f,0.57f,0.58f}, {0.56f,0.57f,0.58f}, {0.f,0.f,0.f}, 0.15f, "iron"},
+    /* steel    — cool blue-grey alloy                                  */
+    {{0.65f,0.70f,0.78f}, {0.65f,0.70f,0.78f}, {0.f,0.f,0.f}, 0.15f, "steel"},
+    /* chrome   — mirror-bright cool metal                              */
+    {{0.92f,0.94f,0.96f}, {0.92f,0.94f,0.96f}, {0.f,0.f,0.f}, 0.15f, "chrome"},
+    /* mercury  — liquid silver                                         */
+    {{0.85f,0.85f,0.88f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.15f, "mercury"},
+    /* aluminum — pale neutral metal                                    */
+    {{0.91f,0.92f,0.92f}, {0.91f,0.92f,0.92f}, {0.f,0.f,0.f}, 0.15f, "aluminum"},
+
+    /* === GEMS (4) — saturated body + WHITE spec, mid diffuse_weight =
+     * Gems are dielectrics; their Fresnel reflectance is achromatic.
+     * Body colour comes from absorption inside the crystal. */
+
+    /* ruby     — red corundum (Cr-doped)                               */
+    {{0.85f,0.10f,0.18f}, {1.00f,0.95f,0.95f}, {0.f,0.f,0.f}, 0.70f, "ruby"},
+    /* emerald  — green beryl (Cr-doped)                                */
+    {{0.10f,0.70f,0.30f}, {0.95f,1.00f,0.95f}, {0.f,0.f,0.f}, 0.70f, "emerald"},
+    /* sapphire — blue corundum (Fe/Ti-doped)                           */
+    {{0.10f,0.30f,0.88f}, {0.95f,0.95f,1.00f}, {0.f,0.f,0.f}, 0.70f, "sapphire"},
+    /* amethyst — purple quartz                                         */
+    {{0.55f,0.30f,0.85f}, {1.00f,0.95f,1.00f}, {0.f,0.f,0.f}, 0.70f, "amethyst"},
+
+    /* === DIELECTRICS (3) — body colour + WHITE spec ===================
+     * Plastics, ceramics, and glass. F0 is achromatic (~4%); body
+     * colour comes from sub-surface absorption. */
+
+    /* plastic  — saturated blue plastic, full body colour              */
+    {{0.20f,0.40f,0.92f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.85f, "plastic"},
+    /* glass    — dark base + bright spec fakes transparency            */
+    {{0.10f,0.12f,0.16f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.10f, "glass"},
+    /* ceramic  — soft warm-cream porcelain                             */
+    {{0.92f,0.90f,0.85f}, {1.00f,0.98f,0.95f}, {0.f,0.f,0.f}, 0.85f, "ceramic"},
+
+    /* === EMISSIVE (1) — neon glow ====================================
+     * Neon plasma is a self-emissive material. The albedo is the dim
+     * "off" tube colour; the emissive value glows hot pink even in
+     * shadow because emissive is added AFTER lighting. */
+
+    /* neon     — hot pink/magenta self-glow                            */
+    {{0.05f,0.02f,0.10f}, {0.80f,0.80f,1.00f}, {1.00f,0.20f,0.85f}, 0.20f, "neon"},
 };
 #define THEME_N ((int)(sizeof g_themes / sizeof g_themes[0]))
 
@@ -1157,49 +1364,70 @@ static const V3 LIGHT_FILL = {-4.0f,  1.0f, -1.0f };
 static const V3 LIGHT_RIM  = { 0.5f, -1.0f,  5.0f };
 
 /*
- * shade_phong — three-point Phong (ambient + diffuse + specular).
+ * shade_phong — three-point Phong with PURE WHITE lights.
  *
- * For each light position L_pos:
+ * For each white light at position L_pos:
  *   light_dir   = normalize(L_pos − point_world)
  *   diffuse     = max(0, normal · light_dir)
  *   reflect_dir = reflect(−light_dir, normal)
  *   specular    = max(0, reflect_dir · view_dir)^SHININESS
  *
+ * The lights are pure white — every material's distinctive look comes
+ * from its OWN albedo and specular tint, not from a coloured key
+ * filter. Under white light:
+ *   gold ALBEDO + gold SPEC      → looks like gold
+ *   blue ALBEDO + WHITE SPEC     → looks like blue plastic
+ *   dark ALBEDO + WHITE SPEC     → looks like glass
+ * Material-as-material, not material-tinted-by-light.
+ *
  * Per-light weighting: KEY > FILL > RIM in diffuse; KEY and RIM
- * contribute specular; FILL is diffuse-only. The albedo tints diffuse
- * only — specular uses the spec tint so the highlight reads as
- * "white-ish" on coloured surfaces (the physically-realistic look).
+ * contribute specular; FILL is diffuse-only.
+ *
+ * Diffuse contribution is multiplied by th->diffuse_weight:
+ *   metals       ≈ 0.15 — real metals reflect almost everything
+ *                         specularly; near-zero diffuse.
+ *   gems         ≈ 0.70 — saturated body + bright white spec.
+ *   dielectrics  ≈ 0.85 — full body colour.
+ *   glass        ≈ 0.10 — very dark body, bright spec fakes
+ *                         transparency.
+ *
+ * Emissive is added AFTER the lighting sum and BEFORE the clamp, so
+ * neon glows hot pink even in shadow.
  *
  * Why pre-flip the light vector when calling v3reflect:
  *   v3reflect(v, n) reflects an OUTGOING vector. Light arrives along
- *   −light_dir, so we pass −light_dir to v3reflect; the result is the
- *   reflection direction we then compare against view_dir.
+ *   −light_dir, so we pass −light_dir to v3reflect; the result is
+ *   the reflection direction we compare against view_dir.
  */
 static V3 shade_phong(V3 point_world, V3 normal_world, V3 view_dir,
                       const Theme *th)
 {
-    V3 colour = v3scale(AMBIENT, th->obj);
+    /* Ambient: dim version of body albedo. */
+    V3 colour = v3scale(AMBIENT, th->albedo);
 
-    /* §6.1 KEY light — primary diffuse + sharp specular. */
+    /* §6.1 KEY light — primary diffuse + sharp specular (white). */
     {
         V3    light_dir   = v3norm(v3sub(LIGHT_KEY, point_world));
         float diffuse     = fmaxf(0.f, v3dot(normal_world, light_dir));
         V3    reflect_dir = v3reflect(v3scale(-1.f, light_dir), normal_world);
         float specular    = powf(fmaxf(0.f, v3dot(reflect_dir, view_dir)),
                                  SHININESS);
+        /* Diffuse: white light × albedo × diffuse_weight. */
         colour = v3add(colour,
-                       v3scale(diffuse  * 0.65f,
-                               v3mul(th->obj, th->key_col)));
+                       v3scale(diffuse * th->diffuse_weight * 1.00f,
+                               th->albedo));
+        /* Specular: white light × spec colour. METAL: tinted spec
+         * tints the highlight (gold). DIELECTRIC: white spec → white peak. */
         colour = v3add(colour,
-                       v3scale(specular * 0.55f, th->spec));
+                       v3scale(specular * 1.30f, th->specular));
     }
     /* §6.2 FILL light — soft diffuse, no specular. Lifts shadow side. */
     {
         V3    light_dir = v3norm(v3sub(LIGHT_FILL, point_world));
         float diffuse   = fmaxf(0.f, v3dot(normal_world, light_dir));
         colour = v3add(colour,
-                       v3scale(diffuse * 0.22f,
-                               v3mul(th->obj, th->fill_col)));
+                       v3scale(diffuse * th->diffuse_weight * 0.55f,
+                               th->albedo));
     }
     /* §6.3 RIM light — wide specular kissing the back silhouette. */
     {
@@ -1209,11 +1437,15 @@ static V3 shade_phong(V3 point_world, V3 normal_world, V3 view_dir,
         float specular    = powf(fmaxf(0.f, v3dot(reflect_dir, view_dir)),
                                  10.f);
         colour = v3add(colour,
-                       v3scale(diffuse  * 0.18f,
-                               v3mul(th->obj, th->rim_col)));
+                       v3scale(diffuse * th->diffuse_weight * 0.40f,
+                               th->albedo));
         colour = v3add(colour,
-                       v3scale(specular * 0.65f, th->rim_col));
+                       v3scale(specular * 1.20f, th->specular));
     }
+    /* §6.4 Emissive — added BEFORE clamp, AFTER lighting. Lets neon
+     * glow regardless of light position. (0,0,0) for everything else. */
+    colour = v3add(colour, th->emissive);
+
     return v3clamp01(colour);
 }
 
@@ -1256,9 +1488,8 @@ static V3 shade_fresnel(V3 normal_world, V3 view_dir, const Theme *th)
     float one_minus_cos  = 1.f - cos_angle;
     float fresnel_factor = one_minus_cos * one_minus_cos * one_minus_cos
                          * one_minus_cos * one_minus_cos;
-    V3 core = v3scale(0.06f, th->obj);
-    V3 edge = v3clamp01(v3add(v3scale(0.7f, th->spec),
-                              v3scale(0.5f, th->rim_col)));
+    V3 core = v3scale(0.06f, th->albedo);
+    V3 edge = v3clamp01(v3scale(1.20f, th->specular));
     return v3clamp01(v3add(v3scale(1.f - fresnel_factor, core),
                            v3scale(fresnel_factor,        edge)));
 }
@@ -1276,7 +1507,7 @@ static V3 shade_depth(float hit_distance, float distance_max, const Theme *th)
 {
     float depth_norm = 1.f - fminf(hit_distance / distance_max, 1.f);
     depth_norm = depth_norm * depth_norm;
-    return v3clamp01(v3scale(depth_norm, th->obj));
+    return v3clamp01(v3scale(depth_norm, th->albedo));
 }
 
 /*
@@ -1533,7 +1764,7 @@ static void hud_draw(int cols, int rows, float fps,
      * clipped by a long mode label on narrow terminals. */
     char status[96];
     snprintf(status, sizeof status,
-             " %5.1f fps  dist:%.1f  %-7s  %s ",
+             " %5.1f fps  dist:%.1f  %-8s  %s ",
              (double)fps, (double)cam_dist,
              g_themes[theme_idx % THEME_N].name,
              paused ? "PAUSED " : "running");
@@ -1647,8 +1878,10 @@ int main(void)
             shade_mode = (ShadeMode)((shade_mode + 1) % MODE_N); break;
         case 'd': case 'D':
             debug_mode = (DebugMode)((debug_mode + 1) % DEBUG_N); break;
-        case 't': case 'T':
+        case 't':
             theme_idx = (theme_idx + 1) % THEME_N; break;
+        case 'T':
+            theme_idx = (theme_idx + THEME_N - 1) % THEME_N; break;
         case '+': case '=':
             cam_dist -= CAM_DIST_STEP;
             if (cam_dist < CAM_DIST_MIN) cam_dist = CAM_DIST_MIN;

@@ -817,7 +817,6 @@ typedef struct { float x, y, z; } V3;
 static inline V3    v3add   (V3 a, V3 b)    { return (V3){a.x+b.x, a.y+b.y, a.z+b.z}; }
 static inline V3    v3sub   (V3 a, V3 b)    { return (V3){a.x-b.x, a.y-b.y, a.z-b.z}; }
 static inline V3    v3scale (float s, V3 a) { return (V3){s*a.x, s*a.y, s*a.z};       }
-static inline V3    v3mul   (V3 a, V3 b)    { return (V3){a.x*b.x, a.y*b.y, a.z*b.z}; }
 static inline float v3dot   (V3 a, V3 b)    { return a.x*b.x + a.y*b.y + a.z*b.z;     }
 static inline float v3len   (V3 a)          { return sqrtf(v3dot(a, a));              }
 

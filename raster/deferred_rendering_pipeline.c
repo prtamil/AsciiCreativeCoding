@@ -253,6 +253,253 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read raster/cube_raster.c first if you don't yet
+ *      know forward rendering — deferred is a REORGANISATION of the
+ *      same pipeline. The point is best appreciated by contrast.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *   3. §6 gbuffer + §7 lightpass — the TWO HEART sections. Read
+ *      AFTER tutorials T1-T4. §6 is the geometry pass (writes per-
+ *      pixel attributes); §7 is the lighting pass (reads them).
+ *   4. §8 scene + LIGHT_PRESETS — three orbiting RGB lights.
+ *   5. §3 math, §4 paint, §9-§10 — same as cube_raster; skim.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   g_pos[r][c]            world-space surface position per pixel
+ *   g_normal[r][c]          world-space surface normal per pixel
+ *   g_albedo[r][c]          surface base colour per pixel
+ *   g_zbuf[r][c]            NDC depth per pixel
+ *   g_valid[r][c]           1 if pixel has surface data, 0 = sky
+ *   g_light[r][c]           accumulated lit colour from PASS 2
+ *   GBufMode                which g_* buffer is being shown
+ *
+ * Background you need
+ * ───────────────────
+ *   - cube_raster.c's 7-stage forward pipeline.
+ *   - The pain of "shade objects per light" in forward — N objects
+ *     × M lights = N·M shading invocations.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - GPU memory bandwidth tradeoffs (relevant for real GPUs;
+ *     this is software, no MRT cost).
+ *   - Tile-based deferred / clustered shading (advanced variants).
+ *   - Anti-aliasing in the deferred path (TAA, MSAA-with-deferred);
+ *     we just write last-wins per pixel.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ * Six short tutorials. Read in order; each builds on the previous.
+ *
+ *   T1  Forward vs deferred — the cost equation that motivates everything
+ *   T2  The G-buffer concept — flatten geometry into per-pixel arrays
+ *   T3  Pass 1: writing to the G-buffer
+ *   T4  Pass 2: per-pixel lighting accumulation
+ *   T5  Many lights cheaply — what changes when you press 'l'
+ *   T6  G-buffer visualisation — POSITION / NORMAL / ALBEDO / LIGHTING
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  FORWARD VS DEFERRED — THE COST EQUATION
+ * ────────────────────────────────────────────
+ * In a FORWARD renderer (cube_raster.c, sphere_raster.c, etc), the
+ * loop structure is:
+ *
+ *     for each object O in scene:
+ *       for each pixel P covered by O:
+ *         for each light L:
+ *           accumulate shading(O, P, L)
+ *
+ * Total shading invocations ≈ (covered pixels) × (lights). For a
+ * scene with M objects and N lights you do M·N shader calls per
+ * pixel — even though most light/object combinations contribute
+ * nothing (a light far away from one object barely lights it).
+ *
+ * In a DEFERRED renderer, the loops are SWAPPED and DECOUPLED:
+ *
+ *     PASS 1 (geometry):
+ *       for each object O:
+ *         for each pixel P covered by O:
+ *           write surface data (pos, normal, albedo) at P     ← ONCE
+ *
+ *     PASS 2 (lighting):
+ *       for each pixel P with valid surface data:
+ *         for each light L:
+ *           accumulate shading(P_data, L)                      ← N×pixels
+ *
+ * Total: M (geometry) + pixels × N (lighting). For dense scenes
+ * with many lights, deferred wins because:
+ *   - Geometry pass cost is INVARIANT to N (number of lights)
+ *   - Adding a 10th light only costs `pixels` more shader invocations,
+ *     not `M × pixels` more
+ *
+ * That guarantee — "geometry once, lighting per-light" — is the
+ * entire point of deferred rendering and what real-time engines
+ * (Unity HDRP, Unreal default deferred) exploit.
+ *
+ * Trade-offs (good to know):
+ *   - Memory: 4-6 buffers worth of per-pixel data (g_pos, g_normal,
+ *     g_albedo, g_zbuf, g_valid, g_light here) instead of just one
+ *     framebuffer.
+ *   - Transparency: deferred handles transparency POORLY (per-pixel
+ *     g_pos overwrites). Real engines fall back to forward for glass.
+ *   - Anti-aliasing: harder in deferred (need TAA or MSAA-with-
+ *     resolve). We don't AA here.
+ *
+ * For TEACHING purposes the cost-equation flip is the WHOLE point.
+ *
+ * T2  THE G-BUFFER — FLATTEN GEOMETRY INTO PER-PIXEL ARRAYS
+ * ──────────────────────────────────────────────────────────
+ * The G-BUFFER is a set of parallel 2-D arrays, one per surface
+ * attribute, storing the CLOSEST surface's data at each pixel
+ * position. Standard layout (varies between engines):
+ *
+ *   g_pos[r][c]      Vec3   world-space hit position
+ *   g_normal[r][c]   Vec3   world-space surface normal
+ *   g_albedo[r][c]   Vec3   base material colour
+ *   g_zbuf[r][c]     float  NDC depth (for hidden-surface removal)
+ *   g_valid[r][c]   bool    1 = pixel has surface, 0 = sky
+ *
+ * After PASS 1, every pixel that hits a surface has its full surface
+ * properties recorded — and the geometry data is no longer needed.
+ *
+ * The G-buffer is the INTERFACE between the two passes. Pass 1
+ * writes; Pass 2 only reads. This is what enables independent
+ * scaling.
+ *
+ * The "G" stands for GEOMETRY (Saito & Takahashi 1990). Modern
+ * engines call the same thing GBufferA, GBufferB, GBufferC...
+ *
+ * In code we declare them as static arrays sized for the maximum
+ * resolution we expect:
+ *
+ *     static Vec3  g_pos    [GBUF_MAX_ROWS][GBUF_MAX_COLS];
+ *     static Vec3  g_normal [GBUF_MAX_ROWS][GBUF_MAX_COLS];
+ *     static Vec3  g_albedo [GBUF_MAX_ROWS][GBUF_MAX_COLS];
+ *     static float g_zbuf   [GBUF_MAX_ROWS][GBUF_MAX_COLS];
+ *     static int   g_valid  [GBUF_MAX_ROWS][GBUF_MAX_COLS];
+ *     static Vec3  g_light  [GBUF_MAX_ROWS][GBUF_MAX_COLS];   pass-2 output
+ *
+ * Read §6.1 for the full declaration.
+ *
+ * T3  PASS 1: WRITING TO THE G-BUFFER
+ * ────────────────────────────────────
+ * Pass 1 is the standard rasteriser (cube_raster.c) BUT with the
+ * fragment shader replaced by "write surface data, don't compute
+ * lighting":
+ *
+ *   render_gbuffer(scene, view, proj):
+ *     gbuffer_clear()
+ *     for each object O:
+ *       mvp     = proj · view · O.model
+ *       nrm_mat = cofactor(O.model)
+ *       for each triangle:
+ *         clip[i] = mvp · vertex[i].pos
+ *         if all behind near plane: skip
+ *         (sx, sy, sz) = perspective divide + screen mapping
+ *         if back-facing (signed area ≤ 0): skip
+ *         for each pixel in screen bbox:
+ *           (b0, b1, b2) = barycentric
+ *           if any < 0: skip                        outside triangle
+ *           z = b0·sz0 + b1·sz1 + b2·sz2            interpolated NDC z
+ *           if z >= g_zbuf[r][c]: skip              z-test
+ *           g_zbuf  [r][c] = z
+ *           g_pos   [r][c] = b0·world_pos0 + b1·world_pos1 + b2·world_pos2
+ *           g_normal[r][c] = b0·world_nrm0 + ... (then normalise)
+ *           g_albedo[r][c] = O.albedo
+ *           g_valid [r][c] = 1
+ *
+ * Same machinery as the forward pipeline, just with different output.
+ * No lighting — that's pass 2's job. Read §6.3 + §6.4.
+ *
+ * T4  PASS 2: PER-PIXEL LIGHTING ACCUMULATION
+ * ────────────────────────────────────────────
+ * Pass 2 walks every VALID pixel of the G-buffer and accumulates
+ * lighting:
+ *
+ *   render_lightpass(scene, cam_pos, lights):
+ *     for r in 0..rows:
+ *       for c in 0..cols:
+ *         if not g_valid[r][c]: continue        sky pixel
+ *         P      = g_pos    [r][c]
+ *         N      = g_normal [r][c]
+ *         albedo = g_albedo [r][c]
+ *         result = AMBIENT · albedo               base illumination
+ *         for each light L:
+ *           result += blinn_phong(P, N, albedo, L, cam_pos)
+ *         g_light[r][c] = clamp01(result)
+ *
+ * blinn_phong is the standard sum: ambient + diffuse·max(N·L) +
+ * specular·max(N·H)^shininess. The pass NEVER touches mesh data —
+ * just per-pixel surface attributes from the G-buffer.
+ *
+ * Read §7 for the full implementation.
+ *
+ * T5  MANY LIGHTS CHEAPLY — WHAT CHANGES WHEN YOU PRESS 'L'
+ * ──────────────────────────────────────────────────────────
+ * Pressing `l' adds another light to the scene. What's the cost
+ * impact?
+ *
+ *   FORWARD:  M·N → M·(N+1)
+ *             extra cost = M · pixels covered by ALL objects
+ *
+ *   DEFERRED: M + pixels·N → M + pixels·(N+1)
+ *             extra cost = pixels (only the lighting loop grows)
+ *
+ * For this scene (M ≈ 1 sphere, N starts at 3, pixels ≈ 3000):
+ *   forward extra: 3000 (per object, per added light)
+ *   deferred extra: 3000 (just per added light)
+ *
+ * They look similar with M=1. With M=20 cube_raster-style scenes:
+ *   forward extra: 20 · 3000 = 60,000
+ *   deferred extra: 3000
+ *
+ * That's the deferred advantage — INDEPENDENT of geometry complexity
+ * once you're in the lighting pass.
+ *
+ * The HUD shows the math live: pressing `l' adds light, the cost
+ * line shows current forward (M·N) vs deferred (M+pixels·N). At
+ * MAX_LIGHTS=8 deferred is significantly cheaper.
+ *
+ * T6  G-BUFFER VISUALISATION — POSITION / NORMAL / ALBEDO / LIGHTING
+ * ───────────────────────────────────────────────────────────────────
+ * Cycling `g' switches between four DEBUG VIEWS of the G-buffer:
+ *
+ *   POSITION   warm-near, cool-far gradient based on z. Identifies
+ *              "where in 3-D is each pixel?" Useful for verifying
+ *              the perspective divide and screen mapping.
+ *
+ *   NORMAL     (N + 1) / 2 visualised as RGB. +X red, +Y green,
+ *              +Z blue. Smooth gradients over a sphere → smooth
+ *              normals working; faceted → flat normals.
+ *
+ *   ALBEDO     raw material colour, no lighting at all. The
+ *              sphere appears as a flat untextured disc. Sets a
+ *              baseline for what the lighting is adding.
+ *
+ *   LIGHTING   the actual lit output (g_light). RED + GREEN +
+ *              BLUE point lights painting their colours onto the
+ *              sphere; overlaps make secondary colours; full
+ *              overlap = white.
+ *
+ * KEY OBSERVATION: only LIGHTING re-shades when you press `l'. The
+ * other three layers are computed BEFORE any light is applied, so
+ * they're invariant to light count — proof that the geometry pass
+ * doesn't care about lighting.
+ *
+ * This is the deferred-rendering DEMO point. Press `l' multiple
+ * times in NORMAL mode — nothing changes. Switch to LIGHTING — the
+ * sphere lights up differently with each new light.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

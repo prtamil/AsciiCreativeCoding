@@ -258,6 +258,310 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read raster/cube_raster.c first if you don't yet
+ *      know the 7-stage forward pipeline; this file runs that
+ *      pipeline TWICE per frame, once from the sun and once from
+ *      the camera.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *   3. §7 shadow_pass + §8 lightpass are THE TWO HEART functions.
+ *      Read AFTER tutorials T1-T4. The shadow pass is a stripped-
+ *      down rasteriser (depth only, no normal/colour); the light
+ *      pass does the per-fragment shadow lookup.
+ *   4. §3 math — projections (perspective + orthographic + lookAt).
+ *      Orthographic is unique to this file; T2 explains why.
+ *   5. §6 gbuffer — same pattern as the other deferred files.
+ *      Read AFTER cube_raster.c if you haven't.
+ *   6. §4 paint + §9-§11 — infrastructure; skip on first read.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   light_view / light_proj / light_mvp   matrices for the SUN's
+ *                                         camera (pass 1)
+ *   shadow_map[v][u]                      flat 2-D float buffer of
+ *                                         depths from the sun's POV
+ *   light_ndc / light_clip                fragment's position projected
+ *                                         into the sun's clip / NDC space
+ *   shadow                                ∈ [0, 1]; 0 = unshadowed,
+ *                                         1 = fully shadowed
+ *   SHADOW_BIAS                           tiny offset added to the
+ *                                         comparison threshold to
+ *                                         avoid self-shadowing acne
+ *   PCF                                   "Percentage-Closer Filtering"
+ *                                         — the 3×3 average soft-shadow
+ *                                         trick
+ *
+ * Background you need
+ * ───────────────────
+ *   - The 7-stage rasteriser (cube_raster.c).
+ *   - Orthographic projection: parallel-ray analogue of perspective.
+ *     Same final NDC mapping; no perspective divide effect.
+ *   - Why a depth buffer (z-buffer) records the closest surface per
+ *     pixel.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Variance shadow maps, exponential shadow maps — we use plain
+ *     hard-test + PCF, the simplest variant.
+ *   - Cascaded shadow maps (sun across an entire game world) —
+ *     we have one ortho frustum, scene fits in it.
+ *   - Shadow volumes (a different algorithm using stencil buffers).
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ * Seven short tutorials that build shadow mapping from first
+ * principles. Read in order; each builds on the previous.
+ *
+ *   T1  The shadow-mapping principle — render twice, compare depth
+ *   T2  Orthographic projection — why a directional sun uses ortho
+ *   T3  Pass 1: depth-only rasterisation from the light's POV
+ *   T4  Pass 2: per-fragment shadow lookup
+ *   T5  Shadow acne and the bias workaround (Peter-Panning trade)
+ *   T6  PCF — 3×3 average for soft shadow edges
+ *   T7  Outside-the-frustum and other defensible defaults
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE SHADOW-MAPPING PRINCIPLE — RENDER TWICE, COMPARE DEPTH
+ * ───────────────────────────────────────────────────────────────
+ * "Is point P in shadow of light L?" is exactly the same question
+ * as "is some surface closer to L than P along the ray P → L?"
+ * Tracing that ray every frame from every pixel is expensive.
+ *
+ * Williams (1978) realised: when you render the scene FROM L's
+ * point of view, the depth buffer at each light-pixel ALREADY
+ * stores the distance to the closest surface in that direction.
+ * That's a precomputed answer to the shadow question for every
+ * direction the light sees.
+ *
+ * Algorithm:
+ *
+ *   1. Render the scene from L's POV. Output: a depth buffer
+ *      called the SHADOW MAP.
+ *   2. Render the scene from the camera's POV. For each fragment
+ *      F:
+ *      a. Project F's world position INTO the light's clip space.
+ *      b. Look up the shadow map at F's (u, v) light-space pixel.
+ *      c. Compare the stored depth against F's light-space depth.
+ *      d. If the stored depth is SMALLER, something closer to L
+ *         was already there → F is in shadow.
+ *
+ * One render of the scene from L's POV. One depth comparison per
+ * fragment in the main render. No rays, no bounce, no recursion.
+ *
+ * Two passes, two cameras, one comparison. That's the entire
+ * algorithm. Everything below is implementation details.
+ *
+ * T2  ORTHOGRAPHIC PROJECTION — WHY A DIRECTIONAL SUN USES ORTHO
+ * ───────────────────────────────────────────────────────────────
+ * The camera uses PERSPECTIVE projection (T3 in cube_raster.c) —
+ * a frustum that narrows toward the eye. Rays from a perspective
+ * camera DIVERGE outward.
+ *
+ * The SUN is treated as DIRECTIONAL — infinitely far away, all rays
+ * parallel, no convergence point. The right projection for a
+ * directional light is ORTHOGRAPHIC:
+ *
+ *   PERSPECTIVE   frustum, narrows at eye, divides by w
+ *   ORTHOGRAPHIC  rectangular box (no narrowing), no perspective
+ *                 divide effect (after the divide, x/w = x because
+ *                 w = 1 throughout)
+ *
+ * Mathematically, the ortho matrix maps a 3-D box [l, r] × [b, t] ×
+ * [n, f] into NDC [-1, +1]³ via translate-and-scale only:
+ *
+ *     m[0][0] =  2 / (r - l)         m[0][3] = -(r + l) / (r - l)
+ *     m[1][1] =  2 / (t - b)         m[1][3] = -(t + b) / (t - b)
+ *     m[2][2] = -2 / (f - n)         m[2][3] = -(f + n) / (f - n)
+ *     m[3][3] =  1
+ *
+ * Apply it to (x, y, z, 1) and you get clip coords with w = 1
+ * (no divide ever does anything). The "depth" stored in the shadow
+ * map is just the z component of the result.
+ *
+ * Geometrically: the light's frustum is a BOX, big enough to
+ * contain every shadow-casting object in the scene. That box's
+ * cross-section maps to the shadow map's (u, v) grid; the box's
+ * length-along-light-direction is mapped to z and stored.
+ *
+ * Read §1 LIGHT_PROJ_HALF + §3 m4_orthographic for the constants
+ * and matrix builder.
+ *
+ * T3  PASS 1: DEPTH-ONLY RASTERISATION FROM THE LIGHT'S POV
+ * ─────────────────────────────────────────────────────────
+ * The shadow pass is the standard rasteriser STRIPPED DOWN — we
+ * write only depth, no colour, no normal:
+ *
+ *   shadow_pass(scene, light_view, light_proj):
+ *     shadow_map[*][*] = +1.0                  (clear to far plane)
+ *     for each triangle:
+ *       v0, v1, v2 = light_proj · light_view · vertex_world_pos
+ *       if all three behind near plane: skip
+ *       (u0, v0, z0) = NDC mapping (T3 in cube_raster)
+ *       ... same screen mapping ...
+ *       for each cell in triangle's bbox:
+ *         compute barycentric (b0, b1, b2)
+ *         if any < 0: outside, skip
+ *         z = b0·z0 + b1·z1 + b2·z2          (interpolated NDC z)
+ *         if z < shadow_map[v][u]:           (closer than current)
+ *           shadow_map[v][u] = z
+ *
+ * No fragment shader, no surface attributes carried, no
+ * back-face cull strictly required (back-facing shadow casters
+ * write a slightly-larger depth that gets overwritten by the
+ * front-facing surface anyway). The output is a 2-D buffer of
+ * depth values from the light's POV.
+ *
+ * For our scene with ~30 triangles and a 256² shadow map, this
+ * pass is sub-millisecond.
+ *
+ * Read §7 shadow_pass for the implementation.
+ *
+ * T4  PASS 2: PER-FRAGMENT SHADOW LOOKUP
+ * ───────────────────────────────────────
+ * The main render goes through the standard pipeline (G-buffer +
+ * Blinn-Phong from cube_raster.c et al). The new step is in the
+ * lightpass: per fragment, compute "am I in shadow?" and use that
+ * to gate the direct lighting.
+ *
+ * lightpass per pixel:
+ *
+ *   P     = g_pos[r][c]                       fragment world pos
+ *   N     = g_normal[r][c]                    fragment normal
+ *   albedo = g_albedo[r][c]
+ *
+ *   ambient = AMBIENT · albedo                always present
+ *
+ *   light_clip = light_proj · light_view · (P, 1)
+ *   light_ndc  = light_clip / light_clip.w        (≈ light_clip — ortho)
+ *
+ *   if light_ndc outside [-1, +1]³:
+ *     shadow = 0                              not in light's frustum
+ *   else:
+ *     u = ( light_ndc.x + 1)/2 · SHADOW_W
+ *     v = (-light_ndc.y + 1)/2 · SHADOW_H     Y-flip (T4 cube_raster)
+ *     stored = shadow_map[v][u]
+ *     if stored + BIAS < light_ndc.z:         something closer first
+ *       shadow = 1                            (fully in shadow)
+ *     else:
+ *       shadow = 0                            (not shadowed)
+ *
+ *   diffuse  = albedo · sun_col · max(0, N · L)
+ *   specular = sun_col · max(0, N · H)^SHININESS · SPEC_GAIN
+ *
+ *   direct = (diffuse + specular) · (1 - shadow)
+ *
+ *   out = ambient + direct
+ *
+ * Note that ambient is NEVER multiplied by (1 - shadow) — even
+ * shadowed fragments still pick up indirect/skylight illumination,
+ * just not the sun's direct rays.
+ *
+ * Read §8 render_lightpass.
+ *
+ * T5  SHADOW ACNE AND THE BIAS WORKAROUND
+ * ────────────────────────────────────────
+ * Without bias, a flat surface like a floor casts a shadow ON
+ * ITSELF. Why?
+ *
+ * The shadow map records depth from the light's POV. When we test
+ * a floor fragment F, we project F into light space and compare
+ * its depth against shadow_map[u][v]. But the shadow map at (u, v)
+ * recorded a DIFFERENT FLOOR PIXEL — the one that the light's ray
+ * happened to land on at the centre of that texel.
+ *
+ *   shadow_map[u][v] ≈ floor depth at the texel centre
+ *   F's depth        ≈ floor depth at F's exact light-space position
+ *
+ * For a flat floor these should be identical. With float jitter,
+ * SOMETIMES the recorded value is slightly less than F's; SOMETIMES
+ * slightly more. The result is striped "shadow acne" — alternating
+ * lit/shadow pixels across the floor.
+ *
+ * The fix: add a SMALL POSITIVE BIAS to the recorded value before
+ * comparing:
+ *
+ *   if stored + BIAS < light_ndc.z:  shadow
+ *
+ * This shifts the comparison so flat surfaces reliably read as
+ * NOT shadowed. Bias = 0.001 is enough for our scene.
+ *
+ * Trade-off — PETER-PANNING:
+ *   too much bias → shadows DETACH from their casters. A sphere
+ *   appears to FLOAT above its own shadow. Looks wrong.
+ *
+ * The right bias is the smallest one that eliminates acne for THIS
+ * scene's worst-case depth gradient. SHADOW_BIAS in §1 is calibrated
+ * for our pillar / cube / sphere mix.
+ *
+ * Sophisticated alternatives (slope-scaled bias, depth gradient
+ * bias) compute bias per-fragment based on local surface slope.
+ * Worth knowing exists; not implemented here.
+ *
+ * T6  PCF — 3×3 AVERAGE FOR SOFT SHADOW EDGES
+ * ────────────────────────────────────────────
+ * Hard shadow mapping returns 0 or 1 — every fragment is either
+ * fully lit or fully shadowed. The shadow EDGE is therefore a
+ * stair-step at the shadow-map's resolution.
+ *
+ * Percentage-Closer Filtering (Reeves, Salesin & Cook 1987) softens
+ * the edge by averaging multiple shadow tests:
+ *
+ *   pcf:
+ *     hits = 0
+ *     for dy ∈ {-1, 0, +1}:
+ *       for dx ∈ {-1, 0, +1}:
+ *         u' = u + dx;  v' = v + dy
+ *         if shadow_map[v'][u'] + BIAS < light_ndc.z: hits++
+ *     shadow = hits / 9.0                       ∈ [0, 1] in steps of 1/9
+ *
+ * Now the edge feathers from 0/9 (lit) through 1/9, 2/9, ..., 8/9
+ * to 9/9 (fully shadowed). The transition is 3 shadow-map texels
+ * wide — soft enough to read as a real penumbra at terminal scale.
+ *
+ * INTERIOR shadow darkness is unchanged (every cell of the 3×3
+ * block agrees → 9/9). Only the EDGE softens. That's exactly what
+ * you want.
+ *
+ * Cost: 9 shadow-map reads per fragment instead of 1. Trivial at
+ * terminal resolution; can matter on a real GPU at 4K.
+ *
+ * Press 'f' to toggle hard ↔ PCF and watch the edges change.
+ *
+ * T7  OUTSIDE-THE-FRUSTUM AND OTHER DEFENSIBLE DEFAULTS
+ * ──────────────────────────────────────────────────────
+ * What if a fragment projects to (u, v) OUTSIDE the shadow map?
+ *
+ *   light_ndc.x or .y outside [-1, +1]   →   off the shadow texture
+ *   light_ndc.z outside [-1, +1]         →   beyond the light's near
+ *                                            or far plane
+ *
+ * The wrong default: clamp (u, v) to the edge and use the edge
+ * texel. Border texels would create a HUGE BLACK HALO around any
+ * fragment behind the light's frustum.
+ *
+ * The right default: shadow = 0. "If the fragment isn't even in
+ * the light's view, the light can't possibly know whether
+ * something occludes it — assume not in shadow."
+ *
+ * This is the usual convention in real shadow-mapping implementations
+ * (often via a "border texture" or "outside-clamp = white" mode in
+ * the texture sampler). For our software version it's a simple early
+ * return:
+ *
+ *   if light_ndc.x or .y outside [-1, +1]: return 0
+ *   if light_ndc.z outside [-1, +1]:       return 0
+ *
+ * The safest thing the algorithm can do when it doesn't have data.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

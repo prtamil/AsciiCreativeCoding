@@ -243,6 +243,282 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read raster/deferred_rendering_pipeline.c FIRST —
+ *      SSAO is built on top of the deferred G-buffer, and you need
+ *      to understand g_pos / g_normal / g_zbuf before you can read
+ *      the AO loop.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *   3. §7 ssao — THE HEART. Read AFTER tutorials T1-T5. The
+ *      ~30-line per-pixel sample loop is the entire algorithm.
+ *   4. §8 lightpass — minimal change from deferred: one extra
+ *      multiplier on the ambient term.
+ *   5. §6 gbuffer — same pattern as deferred. Skim if familiar.
+ *      Note the addition of g_z_view (view-space Z) used by the
+ *      range-falloff calculation.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   g_pos / g_normal / g_albedo / g_zbuf / g_valid / g_light — same
+ *     G-buffer layout as deferred_rendering_pipeline.c
+ *   g_z_view[r][c]      view-space depth (linear distance from camera)
+ *                       added for the range-falloff math
+ *   g_ao[r][c]          raw AO factor ∈ [0, 1] from §7 ssao_pass
+ *   g_ao_blur[r][c]     blurred AO ∈ [0, 1] from §7 ssao_blur
+ *   k_ssao[V][K]        precomputed kernel: V variants × K samples
+ *   variant             pixel chooses one variant by 2×2 tile pattern
+ *   SSAO_RADIUS         physical radius (world units) of the
+ *                       hemisphere we sample
+ *   SSAO_BIAS           tiny depth offset to prevent self-occlusion
+ *
+ * Background you need
+ * ───────────────────
+ *   - Deferred rendering's G-buffer (deferred_rendering_pipeline.c).
+ *   - Hemisphere sampling: K random unit vectors clustered around
+ *     the surface normal.
+ *   - Why AO multiplies AMBIENT and not direct light (T6).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - HBAO, GTAO, voxel AO — variants and refinements; we use
+ *     vanilla Crytek-style SSAO (the original).
+ *   - Cosine-weighted vs uniform hemisphere sampling — both work;
+ *     we use uniform-ish.
+ *   - Bilateral upsample — relevant when SSAO runs at half res; we
+ *     run at full terminal res so plain box blur suffices.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ * Eight short tutorials. Read in order; each builds on the previous.
+ *
+ *   T1  What ambient occlusion IS — and why it darkens corners
+ *   T2  Why "screen-space" — the cost trade vs ray-traced AO
+ *   T3  Hemisphere sampling — K antennas pointed at the sky
+ *   T4  The depth test — "is this antenna blocked?"
+ *   T5  Range falloff — keeping AO local
+ *   T6  Modulating AMBIENT only — never direct light
+ *   T7  The 3×3 blur — denoising the per-pixel checkerboard
+ *   T8  Three modes — AO_ONLY / LIT_NO_AO / LIT_WITH_AO
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHAT AMBIENT OCCLUSION IS — AND WHY IT DARKENS CORNERS
+ * ───────────────────────────────────────────────────────────
+ * Real-world surfaces in CORNERS look DARKER than identical surfaces
+ * in the OPEN. Why? Ambient light (sky, indirect bounce) reaches an
+ * open surface from a full hemisphere of directions. A surface
+ * tucked into a corner has much of that hemisphere BLOCKED by
+ * neighbouring geometry — less ambient light arrives, so the corner
+ * darkens.
+ *
+ *      open: full sky access     corner: half sky blocked by wall
+ *           ╲ │ ╱                            ┌──
+ *            ╲│╱                             │
+ *      ───────P───              ─────────────P──
+ *                                              │ all sky from this
+ *                                              │ side BLOCKED
+ *
+ * Ambient occlusion (AO) is the FRACTION OF THE HEMISPHERE that
+ * remains UNblocked. AO = 1.0 → fully open, normal ambient. AO = 0.0
+ * → fully enclosed, no ambient. The result multiplies the ambient
+ * lighting term.
+ *
+ * Computing AO exactly requires casting many rays per pixel into the
+ * hemisphere and asking each "does it hit something?" That's
+ * expensive. SSAO is a CHEAP HEURISTIC that approximates the answer
+ * using only the depth buffer of the current view (T2).
+ *
+ * T2  WHY "SCREEN-SPACE" — THE COST TRADE VS RAY-TRACED AO
+ * ─────────────────────────────────────────────────────────
+ * RAY-TRACED AO: cast K rays per pixel, intersect each with the full
+ * scene geometry. Cost: O(pixels × K × scene_complexity). Slow.
+ *
+ * SCREEN-SPACE AO: cast K rays per pixel BUT only test against the
+ * existing depth buffer — the per-pixel "depth from camera" data
+ * computed during the geometry pass. Cost: O(pixels × K × 1). Fast.
+ *
+ * What you give up:
+ *   - Off-screen geometry doesn't occlude (the depth buffer doesn't
+ *     have it).
+ *   - Geometry behind objects doesn't occlude either (the depth buffer
+ *     stores only the closest surface per pixel).
+ *
+ * What you gain:
+ *   - O(K) per pixel, completely independent of scene complexity.
+ *   - Trivial to integrate into a deferred pipeline (just sample the
+ *     depth buffer that's already there).
+ *
+ * For most scenes the cheating is invisible — corners and crevices
+ * darken correctly because their occluders are visible to the camera
+ * and therefore in the depth buffer. SSAO is now standard in every
+ * real-time engine since CryEngine 2 shipped it (Mittring 2007).
+ *
+ * T3  HEMISPHERE SAMPLING — K ANTENNAS POINTED AT THE SKY
+ * ────────────────────────────────────────────────────────
+ * For each visible pixel with surface point P and normal N, generate
+ * K sample directions clustered in the upper hemisphere along N:
+ *
+ *     for k in 0 .. K-1:
+ *       dir = pre-computed random unit vector
+ *       if dot(dir, N) < 0: dir = -dir       hemisphere flip
+ *       sample_point = P + dir · SSAO_RADIUS
+ *
+ * `dir` is from a precomputed kernel of K unit vectors with random
+ * orientations — uploaded once at startup (§1 + §7). The "if dot < 0,
+ * flip" trick is cheaper than generating cosine-weighted samples
+ * directly and works fine for AO.
+ *
+ * Each sample_point is "an antenna sticking up from P into the
+ * hemisphere above the surface." We're going to ask each antenna
+ * "is there a closer surface between you and the camera?" (T4).
+ *
+ * Per-pixel kernel variation: each pixel picks a kernel from
+ * VARIANTS = 4 different precomputed sets, indexed by the 2×2 tile
+ * pattern `(c & 1) | ((r & 1) << 1)`. This breaks the directional
+ * banding that would result from EVERY pixel using the SAME K
+ * samples. The result is a per-pixel checkerboard of AO values —
+ * cleaned up by the 3×3 blur (T7).
+ *
+ * Read §1 k_ssao kernel + §7 ssao_pass.
+ *
+ * T4  THE DEPTH TEST — "IS THIS ANTENNA BLOCKED?"
+ * ────────────────────────────────────────────────
+ * For each sample_point S, project it back to the screen and read
+ * the depth buffer at that pixel:
+ *
+ *     clip       = VP · (S, 1)
+ *     ndc.z      = clip.z / clip.w
+ *     (sx, sy)   = ( ndc.x + 1)/2 · cols, (-ndc.y + 1)/2 · rows
+ *
+ *     if g_zbuf[sy][sx] < ndc.z - BIAS:
+ *       OCCLUDED        (something closer than S is at this pixel)
+ *     else:
+ *       NOT OCCLUDED    (S is the closest, or close enough)
+ *
+ * The intuition: if the depth buffer at S's projected pixel
+ * recorded a CLOSER surface than where S actually sits, then
+ * something occludes the path from camera to S.
+ *
+ * BIAS prevents self-occlusion. Without it, samples just above a
+ * flat surface read the surface's own depth — float jitter then
+ * randomly says "occluded" half the time, producing noisy gray
+ * across flat regions. BIAS pushes the comparison threshold
+ * slightly in front of the surface to fix this.
+ *
+ * Trade with bias: too small → acne, too large → AO disappears
+ * inside thin features. SSAO_BIAS = 0.0008 in §1 is calibrated
+ * for this scene's worst-case depth gradient.
+ *
+ * T5  RANGE FALLOFF — KEEPING AO LOCAL
+ * ─────────────────────────────────────
+ * Without falloff, a distant background object occludes a foreground
+ * pixel — producing fake AO darkening that bears no relation to the
+ * real corner geometry.
+ *
+ * Range falloff: weight each sample by HOW CLOSE the occluder is in
+ * VIEW-SPACE Z:
+ *
+ *     dz_view = | g_z_view[r][c] - g_z_view[sy][sx] |
+ *     attn    = max(0, 1 - dz_view / SSAO_RADIUS)
+ *
+ *     if SAMPLE_OCCLUDED:  occluded_weight += attn
+ *     total_weight += attn
+ *
+ * AO = 1 - occluded_weight / total_weight
+ *
+ * Now an occluder more than SSAO_RADIUS from the surface contributes
+ * 0 (attn = 0). Only LOCAL geometry can cast an AO darkening.
+ *
+ * SSAO_RADIUS becomes the "size of the AO halo" — small radius
+ * gives tight crevice shadows; large radius gives fluffy soft
+ * darkening that extends across object boundaries. Pressing `[' /
+ * `]' adjusts it live.
+ *
+ * Note we use g_z_view (linear view-space Z) not g_zbuf (NDC z).
+ * View-space Z varies linearly with distance; NDC z compresses
+ * heavily near the far plane. Range-falloff math is much cleaner
+ * with linear Z.
+ *
+ * T6  MODULATING AMBIENT ONLY — NEVER DIRECT LIGHT
+ * ─────────────────────────────────────────────────
+ * Crucial design choice: AO multiplies the AMBIENT lighting term
+ * ONLY. Direct lighting (sun, point lights) is UNTOUCHED.
+ *
+ *     lit = AMBIENT · albedo · g_ao_blur     ← AO modulates this
+ *         + diffuse · sun_col · max(0, N·L)  ← unchanged
+ *         + specular · ...                   ← unchanged
+ *
+ * Why? Ambient light is the diffuse SKY/INDIRECT contribution from
+ * the full hemisphere. That's exactly what "fraction of hemisphere
+ * occluded" should affect — less hemisphere visible to the surface,
+ * less ambient reaches it.
+ *
+ * Direct light (sun) reaches the surface from a SINGLE specific
+ * direction. If the ray from the surface to the sun is BLOCKED, that's
+ * a SHADOW (handled by shadow_mapping.c, not AO). If the ray is
+ * UNBLOCKED, the sun fully reaches the surface regardless of how
+ * many other directions are blocked — AO has nothing to say about it.
+ *
+ * Multiplying everything by AO would over-darken corners because
+ * sun light would get blocked by ambient occlusion that doesn't
+ * actually obstruct the sun's specific direction. Wrong physics.
+ *
+ * Read §8 render_lightpass — only the ambient line picks up AO.
+ *
+ * T7  THE 3×3 BLUR — DENOISING THE PER-PIXEL CHECKERBOARD
+ * ────────────────────────────────────────────────────────
+ * Per-pixel kernel variation (T3) means neighbouring pixels use
+ * different K-sample sets. Each AO value is therefore a stochastic
+ * estimate; neighbouring pixels can have noticeably different AO
+ * values even on a flat surface.
+ *
+ * 3×3 box blur averages g_ao over the 3×3 neighbourhood:
+ *
+ *     g_ao_blur[r][c] = mean(g_ao[r±1][c±1] for valid pixels)
+ *
+ * Every pixel ends up sharing samples with its 8 neighbours →
+ * checkerboard collapses into a smooth gradient. A 3×3 average is
+ * sufficient because the variation is small and short-range.
+ *
+ * Edge handling: skip pixels where g_valid = 0 (sky pixels).
+ * Otherwise the blur would pull AO toward the sky's default value
+ * across silhouettes.
+ *
+ * Read §7 ssao_blur for the implementation.
+ *
+ * T8  THREE MODES — AO_ONLY / LIT_NO_AO / LIT_WITH_AO
+ * ────────────────────────────────────────────────────
+ * Cycling `a' switches between three OUTPUT MODES, each emphasising
+ * a different aspect of the algorithm:
+ *
+ *   AO_ONLY      Grayscale visualisation of g_ao_blur. Bright
+ *                everywhere except crevices and corners. Diagnostic:
+ *                "is the AO map producing correct dark features?"
+ *
+ *   LIT_NO_AO    Full Blinn-Phong, AMBIENT term unmultiplied. The
+ *                sphere "floats" above the step (no contact halo);
+ *                the pyramid corners are bright; the floor under
+ *                the bottom step is plain.
+ *
+ *   LIT_WITH_AO  Full Blinn-Phong, AMBIENT × AO. The sphere SITS on
+ *                the step (visible contact halo); pyramid corners
+ *                darken; floor under the bottom step has a faint
+ *                surrounding shadow ring. The PROOF that AO adds
+ *                grounding/depth.
+ *
+ * Toggling LIT_NO_AO ↔ LIT_WITH_AO with the orbit paused is the
+ * cleanest way to see what SSAO contributes. Only the four corner
+ * regions change. Flat faces are pixel-identical. The lighting
+ * itself doesn't change — only the AMBIENT modulation.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

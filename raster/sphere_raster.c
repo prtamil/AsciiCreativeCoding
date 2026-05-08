@@ -220,6 +220,239 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read raster/cube_raster.c FIRST if you don't yet
+ *      know the 7-stage raster pipeline; this file inherits it
+ *      directly. Sphere only adds tessellation + smooth normals.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *   3. §4 mesh — UV sphere tessellation. Read AFTER tutorials
+ *      T2-T4. The pole-singularity workaround in §4 is a classic
+ *      gotcha worth understanding.
+ *   4. §6 pipeline — same as cube_raster.c. Skim if already familiar.
+ *   5. §3 shaders — reuses cube_raster.c's four FS pairs, adapted
+ *      for smooth-normal interpolation. Read AFTER T6.
+ *   6. §5 / §7 / §8 / §9 — infrastructure; skip on first read.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   Same as cube_raster.c (V3 / V4 / Mat4 / mvp / norm_mat / sx / sy /
+ *   b0/b1/b2 / zbuf / cbuf / VSIn / VSOut / FSIn).
+ *   Sphere-specific:
+ *     TESS_U                   number of longitude segments (meridians)
+ *     TESS_V                   number of latitude segments (parallels)
+ *     phi  (φ)                 latitude angle ∈ [0, π]; 0 = north pole
+ *     theta (θ)                longitude angle ∈ [0, 2π)
+ *     ring_idx, slice_idx      grid coordinates in the UV tessellation
+ *
+ * Background you need
+ * ───────────────────
+ *   - cube_raster.c's pipeline (read it first if unfamiliar).
+ *   - Spherical coordinates: (radius, latitude, longitude) → (x, y, z).
+ *   - Why a unit-sphere normal equals its position vector.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Icosphere subdivision (we use simpler UV grid; T5 explains).
+ *   - Geodesic / projection distortion (only matters for textures;
+ *     this file uses no texture).
+ *   - Quaternions for rotation — Euler angles suffice here.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ * Six short tutorials. Read in order; each builds on the previous.
+ *
+ *   T1  The shared raster pipeline — reference cube_raster.c
+ *   T2  UV-sphere parameterisation — lat/lon → 3-D point
+ *   T3  Smooth normals — why N = pos / R for a unit sphere
+ *   T4  The pole singularity — sin(0) = 0 problem and the workaround
+ *   T5  UV-sphere vs icosphere — why the simpler grid wins here
+ *   T6  Same four shaders as cube — what changes with smooth normals
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE SHARED RASTER PIPELINE
+ * ───────────────────────────────
+ * This file implements the SAME 7-stage pipeline as cube_raster.c:
+ * vertex shader → perspective divide → screen mapping → back-face
+ * cull → bounding-box raster + barycentric → z-test → fragment
+ * shader. Read cube_raster.c tutorials T1-T6 for the pipeline; here
+ * we focus only on what's SPHERE-specific.
+ *
+ * What changes between cube and sphere:
+ *
+ *   §4 mesh tessellation            cube: 24 verts / 12 tris (hand-listed)
+ *                                   sphere: 925 verts / 1728 tris
+ *                                           (procedurally tessellated)
+ *
+ *   §3 vertex normals               cube: face-normal duplicated to 4
+ *                                         vertices per face → flat shading
+ *                                   sphere: each vertex gets its own
+ *                                           outward-pointing normal →
+ *                                           smooth shading via interpolation
+ *
+ * Everything else (pipeline, shaders, framebuffer, paint, scene,
+ * screen, app) is identical. The same FS function pointers (phong /
+ * toon / normals / wire) plug into either mesh without modification.
+ *
+ * T2  UV-SPHERE PARAMETERISATION — LAT/LON → 3-D POINT
+ * ─────────────────────────────────────────────────────
+ * A UV sphere is a SPHERICAL-COORDINATES grid:
+ *
+ *     for ring (latitude)  in 0 .. TESS_V:
+ *       φ = π · ring / TESS_V             ∈ [0, π]
+ *       for slice (longitude) in 0 .. TESS_U:
+ *         θ = 2π · slice / TESS_U          ∈ [0, 2π)
+ *         pos.x = R · sin(φ) · cos(θ)
+ *         pos.y = R · cos(φ)
+ *         pos.z = R · sin(φ) · sin(θ)
+ *
+ * φ (phi) is LATITUDE measured from the +Y axis (north pole). At
+ * φ = 0 we're at the north pole (pos = (0, R, 0)); at φ = π we're
+ * at the south pole. cos(φ) sweeps from +1 to -1, giving the y
+ * coordinate; sin(φ) is the radius of the latitude circle in the
+ * XZ plane.
+ *
+ * θ (theta) is LONGITUDE around the Y axis. Parameterises the
+ * latitude circle: cos(θ) for x, sin(θ) for z.
+ *
+ * Each (ring, slice) cell of the grid corresponds to a 2-triangle
+ * QUAD on the sphere's surface. For TESS_U=36, TESS_V=24:
+ *
+ *     vertices = (TESS_U+1) · (TESS_V+1) = 37 · 25 = 925
+ *     triangles = TESS_U · TESS_V · 2     = 36 · 24 · 2 = 1728
+ *
+ * The +1 on each grid axis is the SEAM repetition: the slice at
+ * θ = 0 is duplicated at θ = 2π so triangles can index it without
+ * a modular wrap. Same for the poles.
+ *
+ * Read §4 tessellate_sphere — the implementation is ~30 lines.
+ *
+ * T3  SMOOTH NORMALS — WHY N = POS / R FOR A UNIT SPHERE
+ * ───────────────────────────────────────────────────────
+ * The OUTWARD NORMAL at any point on a sphere centred at origin
+ * with radius R is simply the position vector divided by R:
+ *
+ *     N = pos / R     (which is just `pos` if R = 1)
+ *
+ * Why: a sphere is the locus of points equidistant from the centre.
+ * The surface tangent at any point is perpendicular to the radius
+ * vector (which is `pos - centre = pos` for centre at origin).
+ * Therefore the outward normal IS the radius direction.
+ *
+ * For our unit sphere (R = 1):
+ *
+ *     N = pos                              (unit-length already)
+ *
+ * Per-vertex smooth normals are what produce the continuous Phong
+ * highlight that GLIDES across the sphere as it rotates. Compare to
+ * cube_raster.c where each face has 4 vertices with the SAME flat
+ * normal — there the highlight has hard edges at every face boundary.
+ *
+ * Smoothness is INTERPOLATED by the rasteriser. At each pixel inside
+ * a triangle:
+ *
+ *     N_pixel = b0 · N_v0 + b1 · N_v1 + b2 · N_v2
+ *
+ * (linear interpolation via barycentric weights — see cube_raster.c
+ * T5). Because the three vertex normals point slightly differently,
+ * the interpolated normal varies smoothly across the triangle —
+ * letting the FS produce a continuous gradient.
+ *
+ * Subtle but important: the interpolated normal isn't unit-length
+ * after interpolation. Most FS code re-normalises before lighting:
+ *
+ *     N = normalize(N_pixel)
+ *
+ * T4  THE POLE SINGULARITY — SIN(0) = 0 AND THE WORKAROUND
+ * ─────────────────────────────────────────────────────────
+ * At the poles (φ = 0 or φ = π), sin(φ) = 0. The position formula
+ * collapses:
+ *
+ *     pos.x = R · 0 · cos(θ) = 0
+ *     pos.y = R · cos(φ)     = ±R
+ *     pos.z = R · 0 · sin(θ) = 0
+ *
+ * So all TESS_U+1 vertices around the pole map to the same
+ * (0, ±R, 0). Geometrically that's correct (the pole is one point).
+ * BUT the formula N = pos / R becomes degenerate at the pole if you
+ * try to compute it from a non-pole position approaching zero —
+ * floating-point rounding can produce undefined directions.
+ *
+ * Workaround in §4 tessellate_sphere:
+ *
+ *     if sin(φ) < 1e-6:
+ *       N = (0, +1, 0)  if φ ≈ 0  (north pole)
+ *       N = (0, -1, 0)  if φ ≈ π  (south pole)
+ *     else:
+ *       N = pos / R     (the normal formula, well-defined)
+ *
+ * This explicit override avoids divide-by-near-zero NaN that would
+ * propagate through the FS and produce a black hole at the pole.
+ *
+ * Visually, the wireframe shader makes the singularity OBVIOUS:
+ * many tiny triangles fan out from the pole, all sharing the same
+ * pole vertex. That's the famous "pole pinch" of UV spheres.
+ *
+ * T5  UV-SPHERE VS ICOSPHERE — WHY THE SIMPLER GRID WINS HERE
+ * ────────────────────────────────────────────────────────────
+ * Two ways to tessellate a sphere:
+ *
+ *   UV-SPHERE        Lat/lon grid. Parametric, easy to compute,
+ *                    O(TESS_U · TESS_V) triangles. Suffers from pole
+ *                    singularity and uneven triangle sizes (huge
+ *                    near equator, tiny near poles).
+ *
+ *   ICOSPHERE        Subdivide an icosahedron. Uniform triangle
+ *                    sizes, no pole singularity, no UV seam. But
+ *                    requires recursive subdivision logic and
+ *                    indirect indexing.
+ *
+ * For TEACHING purposes UV-sphere wins:
+ *   1. Parametric formula is two lines of code (sin·cos·sin·cos).
+ *   2. The pole singularity IS pedagogically interesting — it
+ *      teaches about coordinate-system degeneracies.
+ *   3. The grid structure makes the wireframe shader produce a
+ *      clean lat/lon grid that obviously reads as a sphere.
+ *
+ * For PRODUCTION (game engines, GPU compute) icosphere is usually
+ * preferred because uniform triangles play nicer with most lighting
+ * + LOD systems. We're not production; we're learners. UV wins.
+ *
+ * T6  SAME FOUR SHADERS AS CUBE — WHAT CHANGES WITH SMOOTH NORMALS
+ * ────────────────────────────────────────────────────────────────
+ * The four FS pairs (phong / toon / normals / wire) are LITERALLY
+ * the same code as cube_raster.c. The pipeline is the same too. So
+ * what's different on a sphere?
+ *
+ *   PHONG    Smooth interpolated normals → smooth diffuse gradient
+ *            and a SLIDING specular highlight. The highlight glides
+ *            across the surface as the sphere rotates — the most
+ *            obvious payoff of smooth normals.
+ *
+ *   TOON     Diffuse banded into 4 levels. Because normals smooth-
+ *            interpolate, the bands form CONCENTRIC RINGS centred on
+ *            the light direction. (On a cube each face was a single
+ *            band; on a sphere each ring corresponds to one band.)
+ *
+ *   NORMALS  RGB = (N + 1) / 2 visualised. The full RGB cube wraps
+ *            once around the sphere — every direction gets a unique
+ *            colour. (On a cube, only 6 distinct face colours.)
+ *
+ *   WIRE     Barycentric edge detection. Reveals the UV grid:
+ *            TESS_U meridians × TESS_V parallels, with the iconic
+ *            pole fan singularity (T4).
+ *
+ * Cycle `s` to compare. Press `c` to disable back-face culling and
+ * see the inner-surface winding direction.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

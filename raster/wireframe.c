@@ -158,6 +158,263 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Wireframe is the SIMPLEST raster pipeline in this
+ *      folder (no z-buffer, no triangle fill, no shading); read it
+ *      first if you're new to the rasterisation family.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *   3. §5 project + §6 canvas — the two-step pipeline. Read AFTER
+ *      tutorials T2, T3.
+ *   4. §7 shapes — pure data tables (vertex + edge arrays for cube,
+ *      sphere, pyramid, torus). Skim. Compare construction to
+ *      tutorial T5.
+ *   5. §8 scene + §10 app — orchestration; skip on a first read.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   Vec3                 a 3-D point or vector by value
+ *   rx / ry              euler accumulators around X / Y axes
+ *   fov_px               focal length IN CELLS (after auto-fit)
+ *   col / row            screen cell coords (top-left origin)
+ *   x0/y0/x1/y1          line endpoints in cell coords (Bresenham)
+ *   STACKS / SLICES      sphere tessellation grid (lat × lon)
+ *   MAJOR / MINOR        torus tessellation grid (around-ring × around-tube)
+ *
+ * Background you need
+ * ───────────────────
+ *   - Basic 3-D rotation (sin/cos around an axis).
+ *   - Perspective projection in one sentence: "divide x and y by z."
+ *   - Bresenham's line algorithm (or willingness to learn from T3).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Triangle rasterisation (cube_raster.c covers that).
+ *   - Z-buffer (no hidden surface removal here — every edge draws).
+ *   - Lighting / shading models (wireframe is monochrome per shape).
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ * Seven short tutorials that build the wireframe renderer from first
+ * principles. Read in order; each builds on the previous.
+ *
+ *   T1  The wireframe pipeline — vertex transform → project → line
+ *   T2  Perspective projection — divide by z, plus aspect correction
+ *   T3  Bresenham's line algorithm — integer-only line drawing
+ *   T4  Auto-fit FOV — making the shape fill ~82% regardless of size
+ *   T5  Parametric tessellation — sphere & torus as 2-D vertex grids
+ *   T6  Curve approximation — why a "sphere" is just dense polygons
+ *   T7  Slope-to-glyph — picking '─', '│', '/', '\\' from line direction
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE WIREFRAME PIPELINE — VERTEX TRANSFORM → PROJECT → LINE
+ * ───────────────────────────────────────────────────────────────
+ * Every wireframe renderer ever written runs the same three-stage
+ * pipeline. Naming the stages explicitly helps you read any
+ * wireframe code in any language:
+ *
+ *   STAGE 1  TRANSFORM    rotate every vertex by the current Euler
+ *                         angles (rx, ry). Output: vertex in CAMERA
+ *                         space.
+ *   STAGE 2  PROJECT      divide x and y by z (the perspective
+ *                         transform), scale by focal length, offset
+ *                         to screen centre. Output: 2-D cell coords.
+ *   STAGE 3  RASTER       for each edge {a, b} in the edge table,
+ *                         draw a line from projected[a] to projected[b]
+ *                         using Bresenham (T3) — output: glyph in cell.
+ *
+ * Pseudocode of one frame:
+ *
+ *   foreach vertex v_i:
+ *     v_rot = rotate(v_i, rx, ry)             stage 1
+ *     screen[i] = project(v_rot, fov_px)       stage 2
+ *
+ *   foreach edge {a, b} in edge_table:
+ *     if either endpoint is behind camera: skip
+ *     bresenham(screen[a], screen[b])           stage 3
+ *
+ * No z-buffer, no triangle fill, no shading. The "solid" appearance
+ * comes from the EYE filling in the gaps between many close edges
+ * (a sphere with 88 edges reads as a sphere even though every cell
+ * between the lines is empty).
+ *
+ * Read §5 project + §6 canvas — that's the entire pipeline, ~50 lines.
+ *
+ * T2  PERSPECTIVE PROJECTION — DIVIDE BY Z, PLUS ASPECT CORRECTION
+ * ────────────────────────────────────────────────────────────────
+ * To project a 3-D point (x, y, z) onto a 2-D screen, do this:
+ *
+ *     col = ox + x · (fov_px / depth)
+ *     row = oy - y · (fov_px / depth) / CELL_AR
+ *
+ * where:
+ *   depth   = CAM_DIST - z   (camera at +Z looking toward origin)
+ *   fov_px  = focal length in screen cells
+ *   ox, oy  = screen centre (cols/2, rows/2)
+ *   CELL_AR = cell height / cell width (≈ 2.0 on most terminals)
+ *
+ * The "divide by depth" is the entire perspective effect. Distant
+ * vertices (large depth) get small (col, row) offsets — they cluster
+ * near the centre. Near vertices get LARGE offsets — they spread
+ * outward. That's why a cube looks like a cube and not a hex.
+ *
+ * The aspect correction `/ CELL_AR` is critical for ASCII rendering.
+ * Terminal cells are ~2× taller than wide. Without correction, a
+ * sphere would render as a vertically-squashed oval. Dividing the
+ * row offset by 2 stretches it back so circles read as circles.
+ *
+ * Negation on the row term: screen y goes DOWN; world y goes UP. The
+ * minus sign converts world-up to screen-down.
+ *
+ * Worked example:
+ *   v = (0.5, 0.5, 0)   on a 60×80 terminal, fov_px = 30
+ *   depth = CAM_DIST - 0 = 3.0
+ *   col   = 30 + 0.5 · (30/3)    = 30 + 5 = 35
+ *   row   = 15 - 0.5 · (30/3)/2  = 15 - 2.5 = 12.5 → 12
+ *   → renders at (35, 12), upper-right quadrant ✓
+ *
+ * Read §5 project_to_screen for the implementation.
+ *
+ * T3  BRESENHAM'S LINE ALGORITHM — INTEGER-ONLY LINE DRAWING
+ * ───────────────────────────────────────────────────────────
+ * Goal: given two screen-cell endpoints (x0, y0) and (x1, y1), light
+ * up every cell along the line between them. Naïvely:
+ *
+ *   for x = x0 .. x1:
+ *     y = y0 + (y1 - y0) · (x - x0) / (x1 - x0)    floating point!
+ *     paint(x, round(y))
+ *
+ * Bresenham (1962) eliminates the floating point. It uses a single
+ * INTEGER ERROR ACCUMULATOR that tracks how far the "true" line
+ * deviates from the cells we've actually painted; when the error
+ * exceeds half a cell, step the minor axis and reset.
+ *
+ * Pseudocode (matches §6 canvas_line):
+ *
+ *   dx = |x1 - x0|;  sx = (x0 < x1) ? +1 : -1
+ *   dy = -|y1 - y0|; sy = (y0 < y1) ? +1 : -1   (note: dy negated)
+ *   err = dx + dy
+ *   loop:
+ *     paint(x0, y0)
+ *     if x0 == x1 and y0 == y1: break
+ *     e2 = 2 · err
+ *     if e2 >= dy:    err += dy;  x0 += sx        step in x
+ *     if e2 <= dx:    err += dx;  y0 += sy        step in y
+ *
+ * The trick: `err += dy` (negative) when stepping x, `err += dx`
+ * (positive) when stepping y. The error oscillates around zero,
+ * which is the geometric distance from the true line to the painted
+ * cells. Both axes can step in the same iteration on diagonals.
+ *
+ * Why Bresenham over float interpolation:
+ *   - Integer ops only — fast, no rounding error.
+ *   - Identical results regardless of CPU float behaviour.
+ *   - The standard "rasterise a line" algorithm in every graphics
+ *     library since 1962.
+ *
+ * T4  AUTO-FIT FOV — MAKING THE SHAPE FILL ~82% REGARDLESS OF SIZE
+ * ────────────────────────────────────────────────────────────────
+ * The shape is unit-radius (centred at origin, max distance from
+ * origin = 1). We want it to fill FILL=0.82 of the SMALLER terminal
+ * dimension regardless of whether the user has a 40×80 or 200×600
+ * terminal.
+ *
+ * Solve for fov_px (focal length in cells) such that a vertex at
+ * radius 1 in world space projects to FILL · (rows/2) cells from
+ * centre:
+ *
+ *     FILL · (rows/2) = 1 · fov_px / CAM_DIST
+ *     fov_rows        = FILL · (rows/2) · CAM_DIST
+ *
+ * Same calculation for cols, with aspect correction:
+ *
+ *     fov_cols = FILL · (cols/2) · CAM_DIST / CELL_AR
+ *
+ * Pick the smaller — that's the dimension that constrains us:
+ *
+ *     fov_px = min(fov_rows, fov_cols) · zoom
+ *
+ * Recomputed each frame so resize and zoom both work seamlessly.
+ *
+ * T5  PARAMETRIC TESSELLATION — SPHERE & TORUS AS 2-D VERTEX GRIDS
+ * ────────────────────────────────────────────────────────────────
+ * Cube and pyramid have hand-listed vertex tables (8 corners, 5
+ * vertices). Sphere and torus are TESSELLATED — built procedurally
+ * from a 2-D parameter grid:
+ *
+ *   SPHERE  parameters (st, sl) ∈ [0, STACKS] × [0, SLICES]
+ *           φ (latitude)  = π · st / STACKS
+ *           θ (longitude) = 2π · sl / SLICES
+ *           v(st, sl) = (sin φ · cos θ, cos φ, sin φ · sin θ)
+ *           Edges: vertical "longitude lines" + horizontal "latitude
+ *           rings". Two stacks share an edge → ring; two slices
+ *           share an edge → meridian.
+ *
+ *   TORUS   parameters (i, j) ∈ [0, MAJOR] × [0, MINOR]
+ *           φ = 2π · i / MAJOR    (around the donut hole)
+ *           θ = 2π · j / MINOR    (around the tube)
+ *           v(i, j) = ((R + r·cos θ) cos φ, r·sin θ, (R + r·cos θ) sin φ)
+ *           Edges: 2-D wraparound grid — every (i, j) connects to
+ *           (i+1, j) and (i, j+1), with both indices wrapping mod
+ *           their respective dimensions.
+ *
+ * The 2-D grid is the KEY abstraction. Both sphere and torus are
+ * parameterised by two angles → 2-D grid → vertex array via lookup
+ * → edge array via "neighbour pairs in the grid."
+ *
+ * SPHERE_STACKS = 6, SPHERE_SLICES = 8 → 7×9 = 63 vertices, ~88 edges.
+ * TORUS  MAJOR = 12, MINOR = 6           → 12×6 = 72 vertices, ~144 edges.
+ *
+ * T6  CURVE APPROXIMATION — WHY A "SPHERE" IS JUST DENSE POLYGONS
+ * ───────────────────────────────────────────────────────────────
+ * No real spheres or torii in this file. Both are POLYGONAL
+ * APPROXIMATIONS — a sphere with STACKS·SLICES edge cells, a torus
+ * with MAJOR·MINOR. Larger numbers → smoother appearance, but more
+ * edges to render.
+ *
+ * SPHERE_STACKS = 6 is INTENTIONALLY low. At 12 stacks the latitude
+ * rings are dense enough that they overlap on screen and the ball
+ * looks SOLID — defeating the wireframe aesthetic. The eye should
+ * see distinct rings; that requires sparse-enough tessellation.
+ *
+ * Trade-off:
+ *   too sparse (e.g. 4×6)  → visibly hexagonal silhouette, not round
+ *   too dense (e.g. 16×24) → solid filled ball, no wireframe feel
+ *   sweet spot (6×8)        → readable as sphere, lines stay distinct
+ *
+ * Same logic for torus: MAJOR=12, MINOR=6 gives 144 edges that
+ * collectively suggest a donut without filling it.
+ *
+ * T7  SLOPE-TO-GLYPH — PICKING '─', '│', '/', '\\' FROM LINE DIRECTION
+ * ───────────────────────────────────────────────────────────────────
+ * For flat shapes (cube, pyramid), edges have a clear direction —
+ * mostly horizontal, vertical, or diagonal. We pick the glyph that
+ * matches:
+ *
+ *   |slope| < 0.5     mostly horizontal → '─'
+ *   |slope| < 2       diagonal          → '/' or '\\' (sign of slope)
+ *   else              mostly vertical   → '│'
+ *
+ * Slope = (dy · CELL_AR) / dx — the CELL_AR factor accounts for the
+ * non-square cells (a 1:1 line in world space is steeper in cell
+ * space because cells are tall).
+ *
+ * For curved shapes (sphere, torus), slope changes continuously
+ * along an edge — picking glyph by slope would produce noisy mix of
+ * '/', '\\', '|'. So we use 'o' EVERYWHERE on curved shapes,
+ * sacrificing slope-information for visual consistency.
+ *
+ * Read §6 canvas_line() for the implementation — slope check at the
+ * top, paint loop below.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

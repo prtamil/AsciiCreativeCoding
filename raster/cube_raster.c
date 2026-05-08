@@ -289,6 +289,312 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. This is the SIMPLEST full triangle rasteriser in
+ *      this folder; read it first if you want to understand the
+ *      raster pipeline before tackling sphere / torus / shadow / SSAO.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *   3. §3 math — V3, V4, Mat4 + matrix builders. Read AFTER tutorial T2.
+ *   4. §6 mesh — cube tessellation (24 verts, 12 tris). Skim.
+ *   5. §8 pipeline — barycentric + per-triangle rasteriser. Read AFTER
+ *      tutorials T3-T6.
+ *   6. §5 shaders — four VS/FS pairs (phong/toon/normals/wire) plug
+ *      into the pipeline via function pointers. Read AFTER tutorial T7.
+ *   7. §4 paint + §7 framebuffer + §9-§11 — infrastructure; skim.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   V3 / V4 / Mat4   3-D vector / 4-D vector / 4×4 matrix
+ *   model / view /   object → world / world → camera / camera → clip
+ *     proj / mvp     transform matrices, composed into mvp
+ *   norm_mat         transposed-inverse of model for transforming normals
+ *   sx / sy / sz     screen-space coordinates (after perspective divide)
+ *   b0 / b1 / b2     barycentric weights (sum to 1; all > 0 = inside)
+ *   zbuf / cbuf      z-buffer (depth) and colour buffer (Cell)
+ *   VSIn / VSOut     vertex shader input / output
+ *   FSIn             fragment shader input (interpolated VSOut)
+ *
+ * Background you need
+ * ───────────────────
+ *   - 4×4 matrices for transforms (identity, perspective, lookAt).
+ *   - Homogeneous coordinates: a 3-D point becomes (x, y, z, 1) so
+ *     translation can be a matrix multiplication.
+ *   - Cross product and signed area of a triangle.
+ *   - Linear interpolation: a · b0 + b · b1 + c · b2 with b0+b1+b2=1.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - GPU shading languages — these are CPU function pointers.
+ *   - Sutherland-Hodgman near-plane clipping (we just reject whole
+ *     triangles where all vertices are behind near; partial clipping
+ *     not implemented).
+ *   - Texture sampling — cube faces are flat-coloured by face-normal.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ * Eight short tutorials that build the rasteriser from first
+ * principles. Read in order; each builds on the previous.
+ *
+ *   T1  The 7-stage raster pipeline — what every triangle goes through
+ *   T2  MVP matrix — composing model · view · proj
+ *   T3  Perspective divide + screen mapping (NDC → cells)
+ *   T4  Back-face culling via signed area
+ *   T5  Barycentric coordinates (Möller signed-area form)
+ *   T6  Z-buffer — hidden surface removal in O(1) per pixel
+ *   T7  Four shader pairs — phong / toon / normals / wire
+ *   T8  Continuous-RGB pipeline → 6×6×6 cube + Bayer dither + ramp
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE 7-STAGE RASTER PIPELINE
+ * ────────────────────────────────
+ * Every triangle in this file goes through the same seven stages:
+ *
+ *   STAGE 1  VERTEX SHADER       per-vertex transform: object-space
+ *                                 vertex → clip-space position +
+ *                                 carried-along data (world pos, normal,
+ *                                 UV) for the fragment shader.
+ *
+ *   STAGE 2  PERSPECTIVE DIVIDE  divide x, y, z by w. Result is in
+ *                                 normalised device coordinates (NDC),
+ *                                 each axis in [-1, +1].
+ *
+ *   STAGE 3  SCREEN MAPPING      NDC → cell coordinates (sx, sy, sz).
+ *                                 Y is flipped (NDC up = +1 → screen
+ *                                 row 0 = top).
+ *
+ *   STAGE 4  BACK-FACE CULL      compute signed triangle area in screen
+ *                                 space. CCW = positive (front);
+ *                                 CW = negative (back, cull if enabled).
+ *
+ *   STAGE 5  BOUNDING-BOX RASTER walk every cell in the triangle's
+ *                                 axis-aligned screen bbox. For each:
+ *                                   compute barycentric (T5)
+ *                                   if any < 0 → outside, skip
+ *
+ *   STAGE 6  Z-TEST (HSR)         interpolated z = b0·z0 + b1·z1 + b2·z2.
+ *                                 If z >= zbuf[cell] → occluded, skip.
+ *                                 Else: zbuf[cell] = z, proceed.
+ *
+ *   STAGE 7  FRAGMENT SHADER      use barycentrics to interpolate
+ *                                 normal/UV/world position to this
+ *                                 pixel; FS returns RGB; paint_cell
+ *                                 quantises to cube + ramp.
+ *
+ * Read §8 pipeline_draw_mesh — it implements stages 1-6 directly.
+ * Stage 7 is the FS function pointer the user picks via 's'.
+ *
+ * T2  MVP MATRIX — COMPOSING MODEL · VIEW · PROJ
+ * ───────────────────────────────────────────────
+ * Three transforms compose to put a vertex on the screen:
+ *
+ *     v_clip = PROJ · VIEW · MODEL · v_object
+ *              ╲___╱   ╲___╱   ╲____╱   ╲_______╱
+ *               5         4       3        2        ← reading order
+ *
+ *   1. v_object — vertex's local-space coords (e.g. cube corner at
+ *                 (0.5, 0.5, 0.5)).
+ *   2. MODEL    — places the object in the WORLD. Rotation,
+ *                 translation, scale.
+ *   3. VIEW     — places the camera. Mat4 from `lookAt(eye, target, up)`
+ *                 — equivalent to "translate so camera is at origin
+ *                 then rotate so it looks down -Z".
+ *   4. PROJ     — perspective. Maps 4-D homogeneous coords such that
+ *                 the camera frustum becomes a clip box. After
+ *                 perspective divide (T3), points in front of the
+ *                 camera land in NDC's [-1, +1]³.
+ *   5. CLIP     — final 4-D output. Per vertex.
+ *
+ * In code (§9 scene_tick):
+ *
+ *     model = rot_y(angle_y) · rot_x(angle_x);
+ *     view  = lookAt(camera, (0,0,0), up);
+ *     mvp   = proj · view · model;       composed once per frame
+ *
+ * Per-vertex (§5.2 default vertex shader):
+ *
+ *     v_clip = mvp · v_object;
+ *
+ * Normals need a separate matrix because non-uniform scale would
+ * shear them — `norm_mat = transpose(inverse(model))`. For pure
+ * rotation/uniform scale (our case) this equals the model matrix's
+ * 3×3 upper-left.
+ *
+ * T3  PERSPECTIVE DIVIDE + SCREEN MAPPING (NDC → CELLS)
+ * ──────────────────────────────────────────────────────
+ * After the vertex shader, we have v_clip = (cx, cy, cz, cw). The
+ * cw component encodes "depth from camera" — a vertex 5 m away has
+ * cw ≈ 5. Perspective divide converts to NDC:
+ *
+ *     ndc.x = cx / cw     ∈ [-1, +1] inside the visible frustum
+ *     ndc.y = cy / cw
+ *     ndc.z = cz / cw
+ *
+ * That divide IS the perspective effect — distant vertices (large
+ * cw) get small ndc values and cluster near the centre.
+ *
+ * Then we map NDC to cell coordinates:
+ *
+ *     sx = ( ndc.x + 1) · 0.5 · cols       NDC -1 → 0; +1 → cols
+ *     sy = (-ndc.y + 1) · 0.5 · rows       Y FLIP: NDC +1 (up) → row 0
+ *     sz = ndc.z                            kept for z-buffer
+ *
+ * The Y-flip is critical. NDC has +Y up; screen rows go DOWN. Without
+ * the minus sign, the cube renders upside-down — AND back-face
+ * culling inverts (CCW becomes CW after flip). Cull-condition then
+ * needs adjusting: post-flip, CCW = positive area = front face
+ * (T4).
+ *
+ * Near-clip rejection: if all three vertices have cw < ε, the
+ * triangle is entirely behind the near plane — skip BEFORE perspective
+ * divide (dividing by zero or negative cw produces garbage).
+ *
+ * T4  BACK-FACE CULLING VIA SIGNED AREA
+ * ──────────────────────────────────────
+ * After screen mapping we have three 2-D points (sx0,sy0), (sx1,sy1),
+ * (sx2,sy2). The signed area of the triangle they form is:
+ *
+ *     area = (sx1 - sx0)(sy2 - sy0) - (sx2 - sx0)(sy1 - sy0)
+ *
+ * Sign tells us orientation:
+ *
+ *     area > 0   counter-clockwise (CCW) — front face after Y-flip
+ *     area = 0   degenerate (zero-area triangle, skip)
+ *     area < 0   clockwise (CW)         — back face, cull if enabled
+ *
+ * The convention "CCW = front" is OpenGL's. After the Y-flip in
+ * stage 3, our screen-space triangles inherit it.
+ *
+ * Pseudocode:
+ *     if cull_enabled and area <= 0: skip triangle
+ *
+ * Saves ~half the per-pixel work on a closed mesh — every back-
+ * facing triangle is invisible from this camera angle anyway. Press
+ * 'c' to toggle and see interior faces appear.
+ *
+ * T5  BARYCENTRIC COORDINATES (MÖLLER SIGNED-AREA FORM)
+ * ──────────────────────────────────────────────────────
+ * For a point P inside triangle (V0, V1, V2), barycentric coordinates
+ * (b0, b1, b2) are the WEIGHTS such that:
+ *
+ *     P = b0·V0 + b1·V1 + b2·V2,      b0 + b1 + b2 = 1
+ *
+ * Geometrically: b0 is the fractional area of the sub-triangle
+ * opposite V0 (between P, V1, V2). Same for b1 (opposite V1) and
+ * b2 (opposite V2). All three positive → P inside.
+ *
+ * Computed via the signed-area form (Möller 2000):
+ *
+ *     d  = (y1-y2)(x0-x2) + (x2-x1)(y0-y2)         total area · 2
+ *     b0 = ((y1-y2)(px-x2) + (x2-x1)(py-y2)) / d
+ *     b1 = ((y2-y0)(px-x2) + (x0-x2)(py-y2)) / d
+ *     b2 = 1 - b0 - b1
+ *
+ * d is computed ONCE per triangle (constant). b0, b1 are computed
+ * per-pixel. The whole inside-test is:
+ *
+ *     if b0 >= 0 and b1 >= 0 and b2 >= 0: inside
+ *
+ * Once inside, barycentrics interpolate any vertex attribute:
+ *
+ *     z       = b0·z0 + b1·z1 + b2·z2          (for z-buffer)
+ *     normal  = b0·n0 + b1·n1 + b2·n2          (for fragment shader)
+ *     world_p = b0·p0 + b1·p1 + b2·p2
+ *
+ * That's the entire triangle rasteriser. Walk the bbox, compute
+ * three weights, test inside, interpolate, ship to fragment shader.
+ *
+ * T6  Z-BUFFER — HIDDEN SURFACE REMOVAL IN O(1) PER PIXEL
+ * ────────────────────────────────────────────────────────
+ * Multiple triangles can cover the same pixel — we want only the
+ * NEAREST one to win. Z-buffer is the standard solution:
+ *
+ *     for each pixel:
+ *       initialise zbuf[pixel] = +∞
+ *
+ *     when a triangle wants to write to (x, y) with depth z:
+ *       if z >= zbuf[x][y]: skip       occluded by previous closer
+ *       else:               write,
+ *                           zbuf[x][y] = z   record new winner
+ *
+ * Cost: O(1) per pixel per triangle. The triangles can be processed
+ * in ANY order — each pixel independently keeps the nearest winner
+ * regardless of submission order.
+ *
+ * Limitations:
+ *   - Memory: one float per cell. Trivial at terminal resolution.
+ *   - Transparency: doesn't work (needs back-to-front sort).
+ *   - Anti-aliasing: a pixel either passes or fails z-test; no
+ *     partial coverage.
+ *
+ * For an opaque cube, z-buffer is perfect. Read §7 (zbuf, cbuf,
+ * fb_clear) and §8 (z-test inside the per-pixel loop).
+ *
+ * T7  FOUR SHADER PAIRS — PHONG / TOON / NORMALS / WIRE
+ * ──────────────────────────────────────────────────────
+ * The pipeline is shape-agnostic and shader-agnostic. The user's
+ * `s' key cycles between four (VS, FS) pairs, all plugging into the
+ * same pipeline:
+ *
+ *   PHONG    smooth diffuse + Blinn-Phong specular. Realistic.
+ *            Lit faces show smooth gradient; opposite faces dim.
+ *
+ *   TOON     diffuse quantised into 4 bands (cel-shading) + a
+ *            hard binary specular cut-off at N·H > 0.94. Each
+ *            cube face = ONE band (flat normals).
+ *
+ *   NORMALS  RGB = (N + 1) / 2 — surface normal as colour. Each
+ *            face is a flat distinct colour (+X red-ish, +Y green-
+ *            ish, etc). Diagnostic for "are normals correct?"
+ *
+ *   WIRE     barycentric edge detection: edge_distance =
+ *            min(b0, b1, b2). Where edge_dist > WIRE_THRESH
+ *            DISCARD the fragment; else fade colour from white at
+ *            edge to dim near threshold. 12 cube edges + 6 quad-
+ *            split diagonals visible.
+ *
+ * The vertex shader is mostly the SAME for all four — it just
+ * computes clip_pos, world_pos, world_normal. WIRE adds a special
+ * vertex shader that writes barycentric identity coords (1,0,0),
+ * (0,1,0), (0,0,1) into the FSIn.custom slot — those interpolate
+ * across the triangle, giving the FS the per-pixel barycentric
+ * needed for edge detection.
+ *
+ * Read §5 — each shader is ~20 lines.
+ *
+ * T8  CONTINUOUS-RGB PIPELINE → 6×6×6 CUBE + DITHER + RAMP
+ * ─────────────────────────────────────────────────────────
+ * Every fragment shader returns a CONTINUOUS V3 RGB in [0, ∞)³.
+ * paint_cell quantises that to a terminal cell:
+ *
+ *   1. Reinhard tone-map per channel:  L' = L / (1 + L)
+ *      Compresses HDR (specular peaks > 1.0) into [0, 1).
+ *   2. Gamma encode 1/2.2: brightens midtones perceptually.
+ *   3. Bayer 4×4 dither: add (dither[r%4][c%4] - 0.5) · 0.15 to luma
+ *      before glyph index lookup. This perturbs brightness slightly
+ *      so neighbouring cells with similar luma pick DIFFERENT ramp
+ *      glyphs — smoother gradients on a coarse 6×6×6 cube.
+ *   4. Quantise: r5 = round(r · 5) ∈ [0, 5] per channel.
+ *   5. Pair index = 16 + 36·r5 + 6·g5 + b5  (xterm cube convention).
+ *   6. Density char = ramp[round(luma_dithered · 91)] in 92-char
+ *      Bourke ramp.
+ *   7. A_BOLD on luma > 0.85, A_DIM on luma < 0.15.
+ *
+ * Bayer dither is the single biggest visual quality improvement
+ * over plain quantisation. Without it, a smooth phong gradient
+ * shows visible bands at every cube-cell boundary. With it, the
+ * boundaries dissolve into noise that the eye averages out.
+ *
+ * Read §4 paint_cell.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

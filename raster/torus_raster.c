@@ -236,6 +236,262 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read raster/cube_raster.c FIRST for the 7-stage
+ *      pipeline, then raster/sphere_raster.c for tessellation +
+ *      smooth normals. This file adds parametric ring-of-rings
+ *      geometry on top.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *   3. §4 mesh — torus tessellation (the parametric trick is in T2).
+ *      Read AFTER tutorials T2, T3.
+ *   4. §6 pipeline — same as cube/sphere. Skim if already familiar.
+ *   5. §3 shaders — same four FS pairs as the rest of the folder.
+ *   6. §5/§7/§8/§9 — infrastructure; skip on first read.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   Same as cube/sphere (V3/V4/Mat4, mvp, norm_mat, sx/sy, b0/b1/b2,
+ *   zbuf/cbuf, VSIn/VSOut/FSIn).
+ *   Torus-specific:
+ *     R                      MAJOR radius — distance from origin to
+ *                            tube centreline (the "donut ring")
+ *     r                      MINOR radius — tube cross-section radius
+ *     TESS_U                 number of segments around the RING
+ *     TESS_V                 number of segments around the TUBE
+ *     theta (θ)              angle around the ring ∈ [0, 2π)
+ *     phi   (φ)              angle around the tube ∈ [0, 2π)
+ *     ring_centre(θ)         (R·cos θ, 0, R·sin θ) — the closest point
+ *                            on the centreline circle to a tube-surface
+ *                            point at azimuth θ
+ *
+ * Background you need
+ * ───────────────────
+ *   - cube_raster.c's pipeline + sphere_raster.c's tessellation idea.
+ *   - Two-angle parametric surfaces (sphere is one angle for lat,
+ *     one for lon; torus is one for ring, one for tube).
+ *   - Why a closed-form normal is faster + stabler than partial
+ *     derivatives.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Differential geometry of a torus (Euler char 0, etc).
+ *   - Sutherland-Hodgman clipping (we do whole-triangle reject).
+ *   - Texture mapping — torus is flat-coloured.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ * Six short tutorials. Read in order; each builds on the previous.
+ *
+ *   T1  The shared raster pipeline — reference cube_raster.c
+ *   T2  Torus parameterisation — two angles → 3-D point
+ *   T3  Closed-form normal via ring-centre subtraction
+ *   T4  No pole singularity — the geometric advantage of a torus
+ *   T5  Sphere vs torus tessellation — same recipe, different formula
+ *   T6  Same four shaders, new geometric story
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE SHARED RASTER PIPELINE
+ * ───────────────────────────────
+ * Same 7-stage forward rasteriser as cube_raster.c and
+ * sphere_raster.c: vertex shader → perspective divide → screen
+ * mapping → back-face cull → bounding-box raster + barycentric →
+ * z-test → fragment shader. Read cube_raster.c tutorials T1-T6 for
+ * the pipeline; here we focus only on what's TORUS-specific.
+ *
+ * What changes between sphere and torus:
+ *
+ *   §4 mesh tessellation         sphere: parametric in (φ, θ),
+ *                                        sin/cos for lat/lon
+ *                                torus:  parametric in (φ, θ) too,
+ *                                        but BOTH angles sweep
+ *                                        circles (one for ring, one
+ *                                        for tube)
+ *
+ *   normals                      sphere: N = pos / R (radius from
+ *                                         origin)
+ *                                torus:  N = normalize(pos − ring_centre)
+ *                                         (radius from the nearest
+ *                                          centreline point)
+ *
+ *   pole singularity             sphere: present at φ ≈ 0 / π
+ *                                torus:  NONE — see T4
+ *
+ * Everything else (pipeline, shaders, framebuffer, paint, scene,
+ * screen, app) is the same as the rest of the folder.
+ *
+ * T2  TORUS PARAMETERISATION — TWO ANGLES → 3-D POINT
+ * ────────────────────────────────────────────────────
+ * A torus is a CIRCLE OF CIRCLES. Imagine a small circle of radius
+ * r (the TUBE) being SWEPT along a larger circle of radius R (the
+ * RING centreline). Two angles parameterise the surface:
+ *
+ *     θ (theta) ∈ [0, 2π)  position around the BIG ring
+ *     φ (phi)   ∈ [0, 2π)  position around the SMALL tube
+ *
+ * Construction:
+ *
+ *   1. Start at the ring centreline at azimuth θ:
+ *
+ *         ring_centre(θ) = (R · cos θ,  0,  R · sin θ)
+ *
+ *   2. From that centre, offset outward by r in the tube cross-
+ *      section. The tube lies in the local "outward & up" plane:
+ *
+ *      outward direction at θ: (cos θ, 0, sin θ)         radially out
+ *      upward direction:        (0, 1, 0)                world up
+ *
+ *      For tube-angle φ:
+ *         offset = r · cos φ · outward + r · sin φ · upward
+ *                = (r·cos φ · cos θ,  r·sin φ,  r·cos φ · sin θ)
+ *
+ *   3. Sum:
+ *
+ *         pos(θ, φ) = ring_centre(θ) + offset
+ *                   = ((R + r·cos φ) · cos θ,
+ *                      r·sin φ,
+ *                      (R + r·cos φ) · sin θ)
+ *
+ * That's the canonical torus parameterisation. (R + r·cos φ) is the
+ * distance from the Y axis at the current tube angle — it's R when
+ * φ ≈ 90° (top/bottom of the tube) and (R+r) at the outermost rim
+ * (φ = 0) and (R−r) at the innermost rim (φ = π).
+ *
+ * Mesh sizes for TESS_U=32 (around ring) × TESS_V=24 (around tube):
+ *
+ *     verts = (TESS_U+1) · (TESS_V+1) = 33 · 25 = 825
+ *     tris  = TESS_U · TESS_V · 2     = 32 · 24 · 2 = 1536
+ *
+ * The grid wraps both ways — column 0 and column TESS_U are the
+ * SAME ring position; row 0 and row TESS_V are the SAME tube angle.
+ * We duplicate the seam vertices anyway so triangle indexing is
+ * trivial (no modular wrap inside the index buffer).
+ *
+ * Read §4 tessellate_torus — implementation is ~25 lines.
+ *
+ * T3  CLOSED-FORM NORMAL VIA RING-CENTRE SUBTRACTION
+ * ───────────────────────────────────────────────────
+ * The OUTWARD normal at any point P on a torus surface points FROM
+ * the closest centreline point TO P. The closest centreline point at
+ * azimuth θ (the same θ that produced P) is just `ring_centre(θ)`:
+ *
+ *     N = normalize(P − ring_centre(θ))
+ *
+ *   Why this works: the tube is a circle of radius r in the plane
+ *   perpendicular to the ring tangent at azimuth θ. The outward
+ *   normal of THAT circle is the direction from its centre to the
+ *   point on its rim — and that centre is `ring_centre(θ)`.
+ *
+ *   So: subtract centre, normalise, done. No partial derivatives, no
+ *   gradient evaluation, no cross-products of tangent vectors.
+ *
+ * Compare to alternatives:
+ *   - IMPLICIT GRADIENT of (√(x² + z²) − R)² + y² = r² involves a
+ *     1/√(x² + z²) chain-rule term — expensive and unstable when
+ *     |xz| is small.
+ *   - PARAMETRIC DERIVATIVES ∂P/∂θ × ∂P/∂φ work but require six
+ *     trig calls and a cross product per vertex.
+ *
+ * Ring-centre subtraction beats both: ONE sub + ONE normalize, with
+ * the centreline point already computed during tessellation.
+ *
+ * Worked example (R = 0.65, r = 0.28, θ = 0, φ = 0):
+ *     pos          = ((0.65 + 0.28·1)·1, 0.28·0, (0.65 + 0.28·1)·0)
+ *                  = (0.93, 0, 0)        outermost equator point
+ *     ring_centre  = (0.65, 0, 0)
+ *     N            = normalize((0.93 − 0.65, 0, 0))
+ *                  = normalize((0.28, 0, 0))
+ *                  = (1, 0, 0)            outward in +X ✓
+ *
+ * T4  NO POLE SINGULARITY — THE GEOMETRIC ADVANTAGE OF A TORUS
+ * ─────────────────────────────────────────────────────────────
+ * Sphere has poles where sin(φ) = 0 collapses many vertices to one
+ * point and makes normals degenerate (sphere_raster.c T4). The
+ * torus has NO POLES — both parameterising angles sweep complete
+ * circles, never reaching a degenerate point.
+ *
+ * Geometrically: a torus is everywhere LOCALLY a flat 2-D
+ * surface. Differential geometers call it "topologically flat" —
+ * the Euler characteristic is 0. A sphere isn't (Euler char 2),
+ * which is why it MUST have at least two poles to be parameterised
+ * by two angles.
+ *
+ * Practical consequence: the torus tessellation is uniform — every
+ * triangle has roughly the same area. The wireframe shader produces
+ * a clean even grid (no fan singularity). Smooth shading works
+ * everywhere with the same algorithm.
+ *
+ * T5  SPHERE VS TORUS TESSELLATION — SAME RECIPE, DIFFERENT FORMULA
+ * ─────────────────────────────────────────────────────────────────
+ * Both meshes use the SAME loop structure:
+ *
+ *     for ring (or stack) v ∈ [0, TESS_V]:
+ *       for slice (or longitude) u ∈ [0, TESS_U]:
+ *         (theta, phi) = (u, v) mapped to angle ranges
+ *         pos = formula(theta, phi)
+ *         nrm = formula(pos)
+ *         add vertex
+ *     for v ∈ [0, TESS_V):
+ *       for u ∈ [0, TESS_U):
+ *         emit two triangles for the (u, v) → (u+1, v+1) quad
+ *
+ * What differs:
+ *
+ *   sphere   theta ∈ [0, 2π],  phi ∈ [0, π]
+ *            pos = (R sin φ cos θ, R cos φ, R sin φ sin θ)
+ *            nrm = pos / R
+ *
+ *   torus    theta ∈ [0, 2π],  phi ∈ [0, 2π]
+ *            pos = ((R + r cos φ) cos θ, r sin φ, (R + r cos φ) sin θ)
+ *            nrm = normalize(pos − ring_centre(θ))
+ *
+ * The seam handling (TESS_U+1 with vertex duplication) is identical.
+ * The shader code is identical. So once you've understood
+ * sphere_raster.c, the torus is "swap two formulas in §4." Same for
+ * the displacement and other primitives in this folder.
+ *
+ * That uniformity is by design — every raster file in this folder is
+ * a tutorial on ONE small twist on the same skeleton.
+ *
+ * T6  SAME FOUR SHADERS, NEW GEOMETRIC STORY
+ * ───────────────────────────────────────────
+ * The four FS pairs (phong / toon / normals / wire) are unchanged
+ * from cube_raster.c and sphere_raster.c. The pipeline is unchanged.
+ * Only the mesh geometry differs. So what does it look like?
+ *
+ *   PHONG    Specular highlight glides along the OUTER RIM of the
+ *            tube. Not a single point but a CURVE — wherever N · H
+ *            peaks. As the torus tumbles, the highlight traces an
+ *            arc along the tube cross-section.
+ *
+ *   TOON     Diffuse banded into 4 levels. Bands form CONCENTRIC
+ *            CIRCLES around the tube — they wrap like rope wound on
+ *            a donut.
+ *
+ *   NORMALS  Hue rotates TWICE around the surface — once around the
+ *            ring (θ), once around the tube (φ). Every position has
+ *            a unique outward direction; every direction maps to a
+ *            unique colour. The full RGB cube wraps twice.
+ *
+ *   WIRE     Barycentric edge detection reveals the (TESS_U,
+ *            TESS_V) grid: 32 meridians around the ring × 24
+ *            parallels around the tube. THROUGH the donut hole you
+ *            can see the far-side wireframe (z-buffer + back-face
+ *            cull working together to hide near-side over far-side
+ *            but not vice-versa).
+ *
+ * Cycle `s' to compare. The torus is the most pedagogically rich
+ * primitive because every shader has something distinct to say about
+ * its curvature.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

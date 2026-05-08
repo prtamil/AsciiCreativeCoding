@@ -281,14 +281,21 @@ static const float AMBIENT_COL[3]= {  0.18f,  0.20f,  0.25f };
  *   HDR (emissive) pixels trigger; ordinary lit surfaces stay calm.
  * INTENSITY — multiplier on the blurred bright buffer when adding
  *   it back into g_light. 1.0 is a strong glow.
- * KERNEL    — a small 1-D Gaussian; applied separably (H then V).
- *   7-tap with σ ≈ 1.5 gives a halo ~3 cells wide at terminal res. */
+ * KERNEL    — a 1-D Gaussian; applied separably (H then V).
+ *   13-tap with σ ≈ 3.0 spreads the halo ~6 cells out from the
+ *   bright source. The previous 7-tap (σ ≈ 1.5, ~3 cells) was too
+ *   tight to read as a glow at terminal resolution — the halo
+ *   barely cleared the orb's silhouette. Wider σ + more taps gives
+ *   an actual halo with a visible falloff. */
 #define BLOOM_THRESHOLD   1.00f
 #define BLOOM_INTENSITY   1.00f
-#define BLOOM_RADIUS         3                          /* taps each side  */
-#define BLOOM_TAPS    (2 * BLOOM_RADIUS + 1)            /* = 7             */
+#define BLOOM_RADIUS         6                          /* taps each side  */
+#define BLOOM_TAPS    (2 * BLOOM_RADIUS + 1)            /* = 13            */
 static const float BLOOM_KERNEL[BLOOM_TAPS] = {
-    0.0702f, 0.1311f, 0.1907f, 0.2161f, 0.1907f, 0.1311f, 0.0702f
+    /* Gaussian weights for σ = 3.0, normalised to sum 1.0. */
+    0.0185f, 0.0342f, 0.0563f, 0.0831f, 0.1097f, 0.1296f,
+    0.1370f,
+    0.1296f, 0.1097f, 0.0831f, 0.0563f, 0.0342f, 0.0185f
 };
 
 /* §1.7 scene geometry — floor + two cubes + one glowing orb.
@@ -327,9 +334,23 @@ enum {
     N_OBJECTS,
 };
 
-/* §1.8 character ramp — Paul Bourke 92-char density ladder. */
-static const char k_bourke[] =
-    " `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
+/* §1.8 character ramp — 18-char dense-low-end ladder.
+ *
+ * Replaces the 92-char Bourke ramp because Bourke's bottom ~25 chars
+ * (` `, '`', '.', ''', '`', '-', '_', ',', ':', etc) are visually
+ * thin/sparse on terminal fonts — at the luma values bloom halos
+ * actually produce (~0.05-0.15), they read as scattered DOTS rather
+ * than a smooth glow.
+ *
+ * This ramp skips the sparse single-pixel glyphs entirely. The lowest
+ * non-space character is `:` (two visible marks), so even very dim
+ * halo cells render as a clearly-visible mark instead of a phantom
+ * dot. Top end keeps the dense '%@#$' for over-bright cells.
+ *
+ * Trade: less fine gradation (18 levels vs 92) — but the 6×6×6 cube
+ * already limits us to ~6 effective brightness levels per channel,
+ * so 18 ramp entries is plenty.                                        */
+static const char k_bourke[] = " .:;~-+*coxOQ0%&@#$";
 #define BOURKE_LEN ((int)(sizeof k_bourke - 1))
 
 /* §1.9 Bayer 4×4 dither. */
@@ -537,9 +558,13 @@ static void paint_cell(int sx, int sy, Vec3 col)
     if (idx < 0)            idx = 0;
     if (idx >= BOURKE_LEN)  idx = BOURKE_LEN - 1;
 
-    int attr = (luma > 0.85f) ? A_BOLD
-             : (luma < 0.15f) ? A_DIM
-             :                  A_NORMAL;
+    /* Bloom halo cells land in luma ≈ 0.05-0.15. A_DIM previously
+     * kicked in there and HALVED their brightness on most terminals
+     * — making the halo nearly invisible despite the bloom math
+     * producing a clean Gaussian. Drop A_DIM so low-luma cells paint
+     * at their actual computed brightness. A_BOLD on the bright orb
+     * stays so it still pops over the halo. */
+    int attr = (luma > 0.85f) ? A_BOLD : A_NORMAL;
 
     attron(COLOR_PAIR(pair) | attr);
     mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[idx]);

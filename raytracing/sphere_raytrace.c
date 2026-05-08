@@ -2,12 +2,14 @@
 /*
  * sphere_raytrace.c — analytic ray-traced sphere (the foundational demo)
  *
- * DEMO: A glossy sphere (gold by default) orbiting in space, lit by
- *       three coloured lights (warm key, cool fill, bright rim).
- *       Cycle through phong → normals → fresnel → depth to see how
- *       the same ray-sphere intersection feeds different shading
- *       models. The single primitive in the simplest possible setup
- *       — this is the "Hello World" of analytic ray tracing.
+ * DEMO: A glossy sphere (gold by default) orbits in space, lit by
+ *       three FIXED WHITE LIGHTS. Each material's distinctive look
+ *       comes from its own properties — gold reflects yellow at the
+ *       highlight, glass shows a near-white specular peak, sapphire
+ *       reads as deep blue. Cycle phong → normals → fresnel → depth
+ *       to see how the same ray-sphere intersection feeds different
+ *       shading models. Single primitive in the simplest possible
+ *       setup — this is the "Hello World" of analytic ray tracing.
  *
  * Study alongside:
  *   raytracing/cube_raytrace.c     — same skeleton, slab method
@@ -31,7 +33,8 @@
  *
  * Keys:
  *   s         cycle shade mode (phong → normals → fresnel → depth)
- *   t         cycle theme (gold → ice → crimson → emerald → amethyst → neon)
+ *   t / T     next / previous theme (20 PBR materials: 12 metals,
+ *             4 gems, 3 dielectrics, 1 emissive — see §4)
  *   p / SPC   pause / resume orbit
  *   + / =     zoom in (orbit closer)
  *   -         zoom out
@@ -41,6 +44,55 @@
  *   gcc -std=c11 -O2 -Wall -Wextra raytracing/sphere_raytrace.c \
  *       -o sphere_rt -lncurses -lm
  */
+
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Ray-sphere is the canonical analytic raytrace; if
+ *      you understand it you can read every other file in this
+ *      folder.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *   3. §5 ray_sphere — THE CORE. Read AFTER tutorial T2.
+ *   4. §6 shading — five small shaders (phong / normal / fresnel /
+ *      depth / luma helper). Read AFTER tutorials T3-T5.
+ *   5. §4 themes — pure data, skim. The interesting bit is the
+ *      `albedo / specular / emissive / diffuse_weight' field
+ *      semantics (T3 explains).
+ *   6. §7 render + §8 hud + §9 app — infrastructure, skip on first
+ *      read.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   ro / rd            primary ray as (origin, unit direction)
+ *   th                 pointer to the active Theme
+ *   P                  surface hit point (world space)
+ *   N                  surface normal at P (unit vector)
+ *   V_dir              vector from P toward the camera
+ *   L                  vector from P toward a light
+ *   R                  reflection of L across N (Phong specular axis)
+ *   NdotL / NdotV      dot products used by every shader
+ *
+ *   Single-letter names (i, c, r, t) appear inside tight loops or as
+ *   ad-hoc symbols whose meaning is on the line above.
+ *
+ * Background you need
+ * ───────────────────
+ *   - 3-D vectors (dot, cross, normalise).
+ *   - The quadratic formula and what its discriminant means
+ *     geometrically (positive → two real roots → ray hits sphere).
+ *   - Lambertian diffuse: max(0, N · L) is the "fraction of incoming
+ *     light at this surface point."
+ *   - 6×6×6 RGB colour cube on xterm-256 (16 + 36·R5 + 6·G5 + B5).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Recursive raytracing — every ray here is one bounce only.
+ *   - PDFs, importance sampling — see path_tracer.c for that.
+ *   - Acceleration structures (BVH, KD-tree). One sphere = no need.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
@@ -59,16 +111,26 @@
  *                  root for the front-face hit.
  *
  *                  Surface normal at hit point P: N = (P − c) / R.
- *                  Three-point lighting (key/fill/rim) drives the
- *                  Phong shading model: kd · (N·L) + ks · (R·V)^n.
+ *                  Three white lights at fixed positions drive the
+ *                  PBR-flavored Phong shading model. The lights are
+ *                  pure white; each MATERIAL is described by:
+ *                    albedo          body colour (diffuse tint)
+ *                    specular  (F0)  Fresnel reflectance at normal
+ *                                    incidence — METALS tint to
+ *                                    match albedo, DIELECTRICS ≈ white
+ *                    emissive        self-glow added after lighting
+ *                    diffuse_weight  scales body diffuse — metals
+ *                                    ≈ 0.15 (low), plastics ≈ 0.85
+ *                  This is the same Theme structure used by
+ *                  cube_raytrace.c, torus_raytrace.c — one material
+ *                  vocabulary across the folder.
  *
  * Data-structure : NONE persistent. Each frame is a pure function of
  *                  (cols, rows, orbit_angle, cam_dist, theme, mode).
- *                  Per-frame: one camera basis. Themes are RGB
- *                  triplets per role (object / specular / per-light
- *                  tint). 216 ncurses pairs are pre-allocated as a
- *                  6×6×6 RGB cube; computed RGB ∈ [0,1]³ quantises
- *                  to one of those at draw time.
+ *                  Per-frame: one camera basis. 20 themes are static
+ *                  PBR descriptors. 216 ncurses pairs are pre-
+ *                  allocated as a 6×6×6 RGB cube; computed RGB
+ *                  ∈ [0,1]³ quantises to one of those at draw time.
  *
  * Rendering      : One ray per terminal cell (no AA). RGB shaded
  *                  output → quantised to xterm 6×6×6 cube + Bourke
@@ -147,11 +209,15 @@
  *
  *   N = (P − c) / R
  *
- * Three coloured lights illuminate the sphere via the standard Phong
- * model: each light contributes a soft Lambertian (cosine of N·L) and
- * a sharp specular ((R·V)^n). The KEY light is the dominant warm
- * source; the FILL light lifts the shadow side with a cool tone;
- * the RIM light kisses the silhouette from behind for separation.
+ * Three WHITE lights illuminate the sphere via PBR-flavored Phong:
+ * each light contributes a soft Lambertian (cosine of N·L) scaled by
+ * the material's diffuse_weight, plus a sharp specular ((R·V)^n)
+ * scaled by the material's specular F0. METALS get a tinted spec
+ * (gold reflects warm yellow, copper reflects orange-red) because
+ * their F0 IS the albedo; DIELECTRICS get near-white spec because
+ * their F0 ≈ (1, 1, 1) regardless of body colour. The KEY light is
+ * the dominant source from upper-right; FILL lifts the shadow side
+ * from upper-left; RIM kisses the silhouette from behind.
  *
  * DRAWING METHOD  /  ALGORITHM IN STEPS  (per pixel)
  * ──────────────────────────────────────────────────
@@ -227,16 +293,22 @@
  *     N·L = 0 + 0.117 + 0.199 = 0.316
  *     diffuse = 0.316     ← hit is partially lit by KEY
  *
- *   For the GOLD theme (obj = 0.90, 0.72, 0.18):
- *     key_diff_RGB = 0.316 · 0.65 · (obj · key_col)
- *                  = 0.205 · (0.90, 0.662, 0.126)
- *                  ≈ (0.185, 0.136, 0.026)
+ *   For the GOLD theme (albedo = 1.00, 0.77, 0.34, diffuse_weight = 0.15):
+ *     key_diffuse  = NdotL · diffuse_weight · 1.00 · albedo
+ *                  = 0.316 · 0.15 · 1.00 · (1.00, 0.77, 0.34)
+ *                  ≈ (0.0474, 0.0365, 0.0161)
  *
- *   With ambient (0.04 · obj) + KEY diffuse + FILL/RIM contributions
- *   and specular, the final RGB at this cell is roughly (0.40, 0.32,
- *   0.08) — a warm gold with slight specular pop. Reinhard tone-map
- *   keeps it inside [0,1], gamma encodes, quantises to a cube cell
- *   in the warm-yellow region, and density ≈ 0.32 → mid ramp glyph.
+ *   FILL contributes ≈ 0.55× weight; RIM ≈ 0.40× weight (both
+ *   scaled by their own NdotL). Plus specular at ≈ 1.30× the
+ *   tinted-yellow F0 = (1.00, 0.77, 0.34) when the eye looks near
+ *   the reflection direction.
+ *
+ *   With AMBIENT_K = 0.20 the ambient term alone is (0.20, 0.154,
+ *   0.068). Final RGB at this cell sums to roughly (0.45, 0.34,
+ *   0.10) — a warm gold body with a yellow specular peak that hits
+ *   harder where the camera looks straight at the highlight.
+ *   Reinhard tone-map → gamma → 6×6×6 cube → warm-yellow region;
+ *   density ≈ 0.30 → mid ramp glyph.
  *
  * EDGE CASES TO WATCH
  * ───────────────────
@@ -291,6 +363,300 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ * Seven short tutorials that build the renderer from first principles.
+ * Read in order; each builds on the previous.
+ *
+ *   T1  The pinhole camera — pixel → world-space ray
+ *   T2  Ray-sphere intersection — the textbook quadratic
+ *   T3  PBR-flavored Phong — white lights + tinted F0
+ *   T4  Why metals look like metals — diffuse_weight + tinted spec
+ *   T5  Schlick Fresnel — the glass-marble look (MODE_FRESNEL)
+ *   T6  Three debug overlays — NORMAL / FRESNEL / DEPTH
+ *   T7  Continuous-RGB pipeline → 6×6×6 cube + 92-char ramp
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE PINHOLE CAMERA — PIXEL → WORLD-SPACE RAY
+ * ─────────────────────────────────────────────────
+ * The screen is a rectangle of cols × rows cells. The camera orbits
+ * the sphere on a circle of radius cam_dist at height CAM_HEIGHT;
+ * its forward vector points at the world origin (where the sphere
+ * sits).
+ *
+ * For each cell (col, row):
+ *
+ *   1. Build screen-space coords (pu, pv). Centred at (0,0) in the
+ *      middle of the frame, scaled by tan(FOV/2) so a unit step in
+ *      pu / pv = a unit step on the image plane at z = 1:
+ *
+ *        pu =  (col − cx) / cx · fov_tan
+ *        pv = -(row − cy) / cx · fov_tan / ASPECT
+ *
+ *      Why divide pv by cx (not cy)? We want SQUARE pixels in world
+ *      space — equal angular extent per cell on both axes. Then we
+ *      correct for the terminal cell's aspect ratio (cells are
+ *      taller than wide) by /ASPECT. Negation flips screen-y-down
+ *      to world-y-up.
+ *
+ *   2. Build the world-space ray direction from the camera basis:
+ *
+ *        rd = norm(forward + pu · right + pv · up)
+ *
+ *      `forward = norm(origin − cam)`, `right = norm(forward × up)`,
+ *      `up' = right × forward` rebuilds an orthonormal basis at the
+ *      orbiting camera each frame.
+ *
+ *   3. The primary ray is (cam_pos, rd). Pass it to ray_sphere (T2).
+ *
+ * Read §7 render frame for the exact code.
+ *
+ * T2  RAY-SPHERE INTERSECTION — THE TEXTBOOK QUADRATIC
+ * ─────────────────────────────────────────────────────
+ * To test if a ray (ro, rd) hits a sphere of radius R at the origin,
+ * ask "for what t along the ray is |ro + t·rd| = R?"  Squaring both
+ * sides removes the radical; rearranging yields:
+ *
+ *     t² (rd · rd) + 2t (rd · ro) + (ro · ro − R²) = 0
+ *
+ * With unit-length rd, rd · rd = 1 — the leading t² coefficient is 1.
+ * Define b = rd · ro, c = ro · ro − R². Then:
+ *
+ *     t² + 2b·t + c = 0
+ *     disc = b² − c             (the discriminant divided by 4)
+ *     if disc < 0: ray MISSES (no real roots)
+ *     t = -b - √disc            ← front face
+ *
+ * Three geometric cases:
+ *
+ *   disc < 0:   ray's closest approach > R, sphere never crosses
+ *   disc = 0:   ray is exactly tangent (one repeated root)
+ *   disc > 0:   ray enters at t = -b - √, exits at t = -b + √
+ *
+ * Once we have t, the hit point is P = ro + t·rd, and the unit
+ * normal at P is (P − centre) / R = P (since centre = origin and
+ * radius = 1). Read §5 ray_sphere.
+ *
+ * Worked example (camera at (0, 0.55, -3.6), centre cell of frame):
+ *   ro    = (0, 0.55, -3.6)
+ *   rd    ≈ (0, -0.151, 0.989)         (looking back at origin)
+ *   b     = rd · ro = 0 - 0.083 - 3.560 = -3.643
+ *   c     = ro · ro − 1 = (0 + 0.302 + 12.96) − 1 = 12.262
+ *   disc  = b² − c = 13.272 − 12.262 = 1.010
+ *   √disc = 1.005
+ *   t0    = -b − √disc = 3.643 − 1.005 = 2.638
+ *   P     = ro + 2.638·rd = (0, 0.152, -0.991)
+ *   |P|   ≈ 1.003 ≈ 1.0   ✓ (on the unit sphere, mod rounding)
+ *   N     = P/1 ≈ (0, 0.152, -0.991)   (faces toward camera)
+ *
+ * T3  PBR-FLAVORED PHONG — WHITE LIGHTS + TINTED F0
+ * ──────────────────────────────────────────────────
+ * Old-school three-point Phong used TINTED LIGHTS (warm key, cool
+ * fill, accent rim) to give the rendered object character. That
+ * works but the colour comes from the LIGHT, not the material — a
+ * gold sphere under a cool light reads as cool-yellow, which is
+ * physically wrong.
+ *
+ * PBR-flavored Phong (this file) uses three WHITE lights at fixed
+ * positions, and lets the material decide the colour. Per light:
+ *
+ *     diffuse  = max(0, N·L) · diffuse_weight · weight · albedo
+ *     specular = max(0, R·V_dir)^SHININESS  · weight · F0
+ *
+ * Where R = 2(N·L)·N − L is the reflection of the light direction
+ * across the normal. The three lights are:
+ *
+ *     KEY  upper-right, weight = 1.00 (dominant)
+ *     FILL upper-left,  weight = 0.55 (lifts shadow)
+ *     RIM  behind,      weight = 0.40 (back-light silhouette)
+ *
+ * Plus a 0.20 ambient term: ambient = AMBIENT_K · albedo.
+ * Plus emissive (0 except for neon).
+ *
+ * That's the entire shader (§6). Read shade_phong after §1 config to
+ * see the full code — it's about 40 lines.
+ *
+ * Worked example (gold theme at the hit point from T2):
+ *   P     = (0, 0.152, -0.991),  N ≈ (0, 0.152, -0.991)
+ *   th->albedo         = (1.00, 0.77, 0.34)
+ *   th->specular  (F0) = (1.00, 0.77, 0.34)             gold metal
+ *   th->diffuse_weight = 0.15                           low (metal)
+ *
+ *   ambient  = AMBIENT · albedo = 0.20 · (1.00, 0.77, 0.34)
+ *            = (0.200, 0.154, 0.068)
+ *
+ *   KEY light:
+ *     L      = norm(LIGHT_KEY − P)
+ *            = norm((3.0, 3.848, -1.009)) = (0.602, 0.772, -0.202)
+ *     N·L    = 0 + 0.117 + 0.200 = 0.317
+ *     diffuse_KEY = 0.317 · 0.15 · 1.00 · (1.00, 0.77, 0.34)
+ *               ≈ (0.0476, 0.0366, 0.0162)
+ *   FILL light:
+ *     N·L ≈ 0.13     (cool fill from upper-left)
+ *     diffuse_FILL = 0.13 · 0.15 · 0.55 · (1.00, 0.77, 0.34)
+ *               ≈ (0.011, 0.008, 0.004)
+ *   RIM light:
+ *     N·L ≈ 0.18     (behind, kissing silhouette)
+ *     diffuse_RIM = 0.18 · 0.15 · 0.40 · (1.00, 0.77, 0.34)
+ *               ≈ (0.011, 0.008, 0.004)
+ *
+ *   Sum so far (no specular yet):
+ *     col ≈ (0.27, 0.21, 0.080)        warm dim gold body
+ *
+ *   If V_dir aligns near the KEY's reflection direction, specular
+ *   adds (R·V)^75 · 1.30 · F0 — a thin yellow peak that can take
+ *   col over 1.0 in the red channel. Reinhard tone-map (T7) then
+ *   compresses it back to display range.
+ *
+ * T4  WHY METALS LOOK LIKE METALS — DIFFUSE_WEIGHT + TINTED SPEC
+ * ──────────────────────────────────────────────────────────────
+ * Two material properties make METALS look distinctively metallic:
+ *
+ *   1. TINTED SPECULAR (F0 matches albedo).
+ *      Real metals are CONDUCTORS — light cannot enter the surface,
+ *      everything reflects. The reflectance at normal incidence is
+ *      colour-tinted to the metal's chemistry: gold reflects yellow
+ *      because gold's electrons resonate at yellow wavelengths.
+ *      In our Theme: specular F0 == albedo for all 12 metals.
+ *
+ *   2. LOW DIFFUSE_WEIGHT (~0.15).
+ *      Because nearly all light reflects via specular, the diffuse
+ *      Lambertian term is much smaller than for dielectrics. A metal
+ *      sphere's body colour is dim; the visible warmth comes from
+ *      the highlight, which carries the tint.
+ *
+ * Compare to GLASS (a dielectric):
+ *     albedo         = (0.10, 0.12, 0.16)   dark base
+ *     specular F0    = (1.00, 1.00, 1.00)   ACHROMATIC ~4% reflection
+ *                                            scaled up so it pops
+ *     diffuse_weight = 0.10                 very low; body is dark
+ *
+ * Glass sphere reads as "dark, with a CRISP WHITE highlight" — and
+ * that's exactly the look of glass under terminal-grade rendering
+ * (real glass also refracts; we don't simulate that).
+ *
+ * Compare to RUBY (a gem, dielectric):
+ *     albedo         = (0.85, 0.10, 0.18)   saturated red
+ *     specular F0    = (1.00, 0.95, 0.95)   near-white
+ *     diffuse_weight = 0.70                 mid; saturated body
+ *
+ * Ruby sphere reads as "deep red with a white highlight" — body
+ * colour from absorption inside the crystal, white highlight from
+ * dielectric F0.
+ *
+ * Cycling `t' through the 20 themes shows all four material
+ * families: 12 metals (gold..aluminum), 4 gems (ruby..amethyst),
+ * 3 dielectrics (plastic / glass / ceramic), 1 emissive (neon —
+ * has nonzero `emissive' added after lighting).
+ *
+ * T5  SCHLICK FRESNEL — THE GLASS-MARBLE LOOK
+ * ────────────────────────────────────────────
+ * The Fresnel equations describe how reflectance varies with
+ * incidence angle: head-on rays reflect a small fraction (F₀ ≈ 4%
+ * for dielectrics, higher for metals); grazing rays reflect ALMOST
+ * EVERYTHING. That's why a glass marble seen from the side reads
+ * as bright at the silhouette and dark in the centre.
+ *
+ * Schlick's approximation (1994):
+ *
+ *     F(θ) = F₀ + (1 − F₀) · (1 − cosθ)^5
+ *
+ * For F₀ = 0 this collapses to (1 − cosθ)^5 — dark head-on, bright
+ * at grazing. We use this in MODE_FRESNEL (§6) as an EFFECT, not
+ * an actual Fresnel-weighted reflection. It blends a dim core
+ * colour (0.06 · albedo) toward a bright edge colour
+ * (1.10 · specular F0) using the Schlick weight.
+ *
+ * The result: a "glass marble" diagnostic mode that lets you see
+ * how grazing the silhouette feels on the eye — useful for
+ * confirming that normals are correct around the sphere.
+ *
+ * T6  THREE DEBUG OVERLAYS — NORMAL / FRESNEL / DEPTH
+ * ────────────────────────────────────────────────────
+ * Cycling `s' switches between four shading modes. Each is a
+ * different pedagogical lens on the same scene:
+ *
+ *   PHONG     The full pipeline — PBR Phong with three lights.
+ *             Use this to admire the result.
+ *
+ *   NORMAL    RGB-encoded surface normal: N → (N+1)/2. Each
+ *             component remapped from [-1,+1] → [0,1] so the three
+ *             RGB channels visualise N.x, N.y, N.z. The +Z
+ *             hemisphere reads mostly blue (0.5, 0.5, 1.0); +X
+ *             red-ish; +Y green-ish. A correct sphere intersection
+ *             produces a smooth radial rainbow gradient.
+ *
+ *   FRESNEL   See T5. Dark head-on, bright at silhouette. The
+ *             glass-marble look.
+ *
+ *   DEPTH     Brightness ∝ 1 − t/t_max. Closer surfaces brighter,
+ *             distant ones darker. Sanity check that the camera
+ *             produces sane distances.
+ *
+ * The three debug modes converge in ONE FRAME (no randomness).
+ * Switching INTO them is instant; switching back to PHONG looks
+ * the same.
+ *
+ * T7  CONTINUOUS-RGB PIPELINE → 6×6×6 CUBE + 92-CHAR RAMP
+ * ────────────────────────────────────────────────────────
+ * The shader produces a LINEAR HDR RGB triplet — values can exceed
+ * 1.0 (specular peaks especially). To display we compress and
+ * quantise:
+ *
+ *   1. Per-pixel shading produces an HDR linear RGB triplet.
+ *   2. Reinhard tone-map per channel:  L' = L / (1 + L)
+ *      Compresses [0, ∞) into [0, 1) without saturation.
+ *   3. Gamma encode 1/2.2: brightens midtones perceptually for
+ *      sRGB displays.
+ *   4. Quantise each channel to {0..5}: 6 levels per axis = 216
+ *      cube cells.
+ *   5. Pair index = 16 + 36·R5 + 6·G5 + B5  (xterm cube convention).
+ *   6. Density character = Rec.601 luma → ramp[index] in 92-char
+ *      ramp.
+ *   7. A_BOLD on luma > 0.85, A_DIM on luma < 0.15.
+ *
+ * Both the COLOUR (cube cell) and the GLYPH DENSITY (ramp index)
+ * carry shading information. Together they encode ~20,000
+ * effective shades per cell — more than enough for smooth
+ * specular gradients without visible banding.
+ *
+ * Worked example (HDR shader output (1.40, 0.85, 0.20) from a
+ * specular peak on the gold sphere):
+ *
+ *   1. Reinhard per channel:
+ *        L' = (1.40/2.40, 0.85/1.85, 0.20/1.20)
+ *           = (0.583, 0.459, 0.167)
+ *
+ *   2. Gamma encode (1/2.2):
+ *        out = (0.583^0.455, 0.459^0.455, 0.167^0.455)
+ *            ≈ (0.776, 0.685, 0.435)
+ *
+ *   3. Quantise to {0..5}:
+ *        r5 = round(0.776 · 5) = round(3.88) = 4
+ *        g5 = round(0.685 · 5) = round(3.42) = 3
+ *        b5 = round(0.435 · 5) = round(2.17) = 2
+ *
+ *   4. Pair index = 16 + 36·4 + 6·3 + 2 = 180
+ *      → xterm 256-colour cube cell #180 ≈ #FFD787 (warm yellow)
+ *
+ *   5. Rec.601 luma:
+ *        Y = 0.299·0.776 + 0.587·0.685 + 0.114·0.435
+ *          = 0.232 + 0.402 + 0.050
+ *          = 0.684
+ *
+ *   6. ASCII glyph: ramp[round(0.684 · 91)] = ramp[62]
+ *      ≈ 'p' or 'P' (mid-density)
+ *      Bright? 0.684 > 0.85 → no → A_NORMAL.
+ *
+ *   Cell paints `P` in warm-yellow on the terminal — a faint
+ *   highlight pixel.
+ *
+ * Read §6 paint_cell and the matching tutorials in path_tracer.c
+ * for the full discussion.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <math.h>
@@ -325,8 +691,8 @@
 #define CAM_DIST_STEP 0.25f
 
 /* §1.5 shading */
-#define AMBIENT       0.04f                /* fraction of obj as ambient    */
-#define SHININESS     52.0f                /* phong exponent for KEY        */
+#define AMBIENT       0.20f                /* dim copy of albedo as ambient */
+#define SHININESS     75.0f                /* phong exponent — high = metal */
 
 /* §1.6 character ramp — Paul Bourke 92-char density ladder.
  * Index 0 (space) is invisible; index N−1 ('@') is densest. */
@@ -365,7 +731,6 @@ typedef struct { float x, y, z; } V3;
 static inline V3    v3add   (V3 a, V3 b)    { return (V3){a.x+b.x, a.y+b.y, a.z+b.z}; }
 static inline V3    v3sub   (V3 a, V3 b)    { return (V3){a.x-b.x, a.y-b.y, a.z-b.z}; }
 static inline V3    v3scale (float s, V3 a) { return (V3){s*a.x, s*a.y, s*a.z};      }
-static inline V3    v3mul   (V3 a, V3 b)    { return (V3){a.x*b.x, a.y*b.y, a.z*b.z}; }
 static inline float v3dot   (V3 a, V3 b)    { return a.x*b.x + a.y*b.y + a.z*b.z;     }
 static inline float v3len   (V3 a)          { return sqrtf(v3dot(a, a));              }
 static inline V3    v3norm  (V3 a)          { float l=v3len(a); return l>1e-9f ? v3scale(1.f/l, a) : (V3){0,1,0}; }
@@ -379,38 +744,106 @@ static inline V3    v3clamp1(V3 v)
 /* ── §4 color / themes ───────────────────────────────────────────────── */
 
 /*
- * Theme — five colour vectors per palette:
- *   obj         base albedo of the sphere
- *   spec        specular highlight tint (KEY + RIM)
- *   key/fill/rim three-light tint (warm·cool·accent)
+ * Theme — PBR-flavoured material descriptor (matches cube_raytrace.c
+ * so all three primitives share one material vocabulary).
  *
- * The Phong shader in §6 multiplies obj by the light tint for diffuse
- * contributions, and uses spec/rim_col directly for specular highlights.
+ * First-principles redesign: the LIGHTS are pure WHITE, and each
+ * material's distinctive look comes entirely from its own properties.
+ * Under white light, gold looks like gold and blue plastic looks like
+ * blue plastic — the colour is intrinsic to the material, not painted
+ * on by a tinted light source.
+ *
+ * Fields:
+ *   albedo          body diffuse colour (what the material LOOKS LIKE
+ *                   under uniform white illumination)
+ *   specular        F0 — Fresnel reflectance at normal incidence:
+ *                     METALS:      tinted to match albedo (gold spec
+ *                                  is warm yellow because gold reflects
+ *                                  yellow at the highlight)
+ *                     DIELECTRICS: near-white (~4% achromatic
+ *                                  reflectance for non-conductors)
+ *   emissive        self-luminance, added AFTER lighting — visible
+ *                   even in shadow. Mostly (0,0,0); used for neon.
+ *   diffuse_weight  scales the diffuse contribution from albedo:
+ *                     metals ≈ 0.15, gems ≈ 0.70, plastic/ceramic ≈ 0.85,
+ *                     glass ≈ 0.10, neon ≈ 0.20.
+ *
+ * The 20 themes below are organised into 4 families. Switching themes
+ * with `t / T` cycles through all 20 in order.
  */
 typedef struct {
-    V3 obj, spec, key_col, fill_col, rim_col;
+    V3          albedo;         /* body diffuse colour                      */
+    V3          specular;       /* F0 — metal: matches albedo; die: white   */
+    V3          emissive;       /* self-glow (added after lighting)         */
+    float       diffuse_weight; /* 0.10..0.90 — metal/dielectric scale      */
     const char *name;
 } Theme;
 
 static const Theme g_themes[] = {
-    /* gold — warm metallic yellow */
-    {{0.90f,0.72f,0.18f},{1.00f,0.95f,0.65f},
-     {1.00f,0.92f,0.70f},{0.25f,0.35f,0.80f},{0.95f,0.55f,0.10f},"gold"},
-    /* ice — cold pale blue */
-    {{0.50f,0.78f,1.00f},{0.85f,0.93f,1.00f},
-     {0.75f,0.88f,1.00f},{0.15f,0.25f,0.75f},{0.45f,0.80f,1.00f},"ice"},
-    /* crimson — saturated red */
-    {{0.88f,0.12f,0.12f},{1.00f,0.75f,0.60f},
-     {1.00f,0.82f,0.65f},{0.15f,0.08f,0.50f},{1.00f,0.35f,0.08f},"crimson"},
-    /* emerald — rich green */
-    {{0.08f,0.78f,0.28f},{0.60f,1.00f,0.70f},
-     {0.75f,1.00f,0.60f},{0.08f,0.35f,0.60f},{0.15f,0.90f,0.35f},"emerald"},
-    /* amethyst — neon purple */
-    {{0.62f,0.18f,0.88f},{0.85f,0.65f,1.00f},
-     {0.88f,0.78f,1.00f},{0.08f,0.08f,0.60f},{0.78f,0.18f,0.88f},"amethyst"},
-    /* neon — cyan/yellow electric */
-    {{0.08f,0.92f,0.88f},{0.70f,1.00f,0.95f},
-     {0.88f,0.92f,0.50f},{0.08f,0.38f,0.80f},{0.18f,1.00f,0.75f},"neon"},
+    /* === METALS (12) — spec hue MATCHES albedo, low diffuse_weight ===
+     * Real metals reflect nearly all incident light specularly. Their
+     * F0 (Fresnel at normal incidence) is what tints the highlight. */
+
+    /* gold     — warm yellow precious metal                            */
+    {{1.00f,0.77f,0.34f}, {1.00f,0.77f,0.34f}, {0.f,0.f,0.f}, 0.15f, "gold"},
+    /* silver   — bright cool precious metal, near-pure white           */
+    {{0.97f,0.96f,0.92f}, {0.97f,0.96f,0.92f}, {0.f,0.f,0.f}, 0.15f, "silver"},
+    /* copper   — warm orange-red metal                                 */
+    {{0.96f,0.64f,0.54f}, {0.96f,0.64f,0.54f}, {0.f,0.f,0.f}, 0.15f, "copper"},
+    /* bronze   — warm brown alloy (Cu+Sn)                              */
+    {{0.78f,0.55f,0.30f}, {0.78f,0.55f,0.30f}, {0.f,0.f,0.f}, 0.15f, "bronze"},
+    /* brass    — yellow-green alloy (Cu+Zn)                            */
+    {{0.85f,0.70f,0.25f}, {0.85f,0.70f,0.25f}, {0.f,0.f,0.f}, 0.15f, "brass"},
+    /* platinum — cool greyish-white precious metal                     */
+    {{0.83f,0.81f,0.78f}, {0.83f,0.81f,0.78f}, {0.f,0.f,0.f}, 0.15f, "platinum"},
+    /* titanium — dark silvery metal                                    */
+    {{0.62f,0.60f,0.55f}, {0.62f,0.60f,0.55f}, {0.f,0.f,0.f}, 0.15f, "titanium"},
+    /* iron     — neutral grey base metal                               */
+    {{0.56f,0.57f,0.58f}, {0.56f,0.57f,0.58f}, {0.f,0.f,0.f}, 0.15f, "iron"},
+    /* steel    — cool blue-grey alloy                                  */
+    {{0.65f,0.70f,0.78f}, {0.65f,0.70f,0.78f}, {0.f,0.f,0.f}, 0.15f, "steel"},
+    /* chrome   — mirror-bright cool metal                              */
+    {{0.92f,0.94f,0.96f}, {0.92f,0.94f,0.96f}, {0.f,0.f,0.f}, 0.15f, "chrome"},
+    /* mercury  — liquid silver                                         */
+    {{0.85f,0.85f,0.88f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.15f, "mercury"},
+    /* aluminum — pale neutral metal                                    */
+    {{0.91f,0.92f,0.92f}, {0.91f,0.92f,0.92f}, {0.f,0.f,0.f}, 0.15f, "aluminum"},
+
+    /* === GEMS (4) — saturated body + WHITE spec, mid diffuse_weight =
+     * Gems are dielectrics; their Fresnel reflectance is achromatic.
+     * Body colour comes from absorption inside the crystal. */
+
+    /* ruby     — red corundum (Cr-doped)                               */
+    {{0.85f,0.10f,0.18f}, {1.00f,0.95f,0.95f}, {0.f,0.f,0.f}, 0.70f, "ruby"},
+    /* emerald  — green beryl (Cr-doped)                                */
+    {{0.10f,0.70f,0.30f}, {0.95f,1.00f,0.95f}, {0.f,0.f,0.f}, 0.70f, "emerald"},
+    /* sapphire — blue corundum (Fe/Ti-doped). Green channel tuned to
+     * 0.22 (not 0.30) so the diffuse gradient crosses only ONE cube-
+     * quantization boundary instead of two — eliminates the worst
+     * patchy banding on the sphere's smooth normal gradient while
+     * preserving brightness. Blue lifted to 0.95 for crisper saturation. */
+    {{0.10f,0.22f,0.95f}, {0.95f,0.95f,1.00f}, {0.f,0.f,0.f}, 0.70f, "sapphire"},
+    /* amethyst — purple quartz                                         */
+    {{0.55f,0.30f,0.85f}, {1.00f,0.95f,1.00f}, {0.f,0.f,0.f}, 0.70f, "amethyst"},
+
+    /* === DIELECTRICS (3) — body colour + WHITE spec ===================
+     * Plastics, ceramics, and glass. F0 is achromatic (~4%); body
+     * colour comes from sub-surface absorption. */
+
+    /* plastic  — saturated blue plastic, full body colour              */
+    {{0.20f,0.40f,0.92f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.85f, "plastic"},
+    /* glass    — dark base + bright spec fakes transparency            */
+    {{0.10f,0.12f,0.16f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.10f, "glass"},
+    /* ceramic  — soft warm-cream porcelain                             */
+    {{0.92f,0.90f,0.85f}, {1.00f,0.98f,0.95f}, {0.f,0.f,0.f}, 0.85f, "ceramic"},
+
+    /* === EMISSIVE (1) — neon glow ====================================
+     * Neon plasma is self-emissive. The albedo is the dim "off" tube
+     * colour; the emissive value glows hot pink even in shadow because
+     * emissive is added AFTER lighting. */
+
+    /* neon     — hot pink/magenta self-glow                            */
+    {{0.05f,0.02f,0.10f}, {0.80f,0.80f,1.00f}, {1.00f,0.20f,0.85f}, 0.20f, "neon"},
 };
 #define THEME_N ((int)(sizeof g_themes / sizeof g_themes[0]))
 
@@ -463,33 +896,47 @@ static void draw_color(int row, int col, V3 c, float lum)
 /* ── §5 ray-sphere intersection (THE CORE) ───────────────────────────── */
 
 /*
- * ray_sphere — analytic ray vs sphere intersection.
+ * ray_sphere — analytic ray vs sphere intersection (T2).
  *
- * Sphere is centred at the ORIGIN with radius r (so we don't pass a
- * centre vector — saves an argument). Ray is (ro, rd) with rd unit-
- * length.
+ * Inputs:
+ *   ro     ray origin (world space)
+ *   rd     ray direction — MUST be unit-length (|rd| = 1)
+ *   r      sphere radius (sphere is centred at origin)
+ * Output:
+ *   *t_hit nearest valid t such that ro + t·rd is on the sphere
+ * Returns: 1 on hit, 0 on miss.
  *
- * Algebra:
- *   |ro + t·rd|² = r²
- *   (ro + t·rd) · (ro + t·rd) = r²
- *   |rd|²·t² + 2(rd·ro)·t + (|ro|² − r²) = 0
- * With |rd| = 1:
- *   t² + 2(rd·ro)·t + (|ro|² − r²) = 0
+ * Pseudocode (mirrors body 1:1):
+ *   b    = rd · ro              half-coefficient of the linear term
+ *   c    = (ro · ro) − r²       constant term
+ *   disc = b² − c               (b/2)²-form discriminant
+ *   if disc < 0:           ray misses sphere → return 0
+ *   sq   = √disc
+ *   t0   = −b − sq              near root (front face)
+ *   t1   = −b + sq              far  root (back  face)
+ *   if t1 < ε:             whole sphere behind us → return 0
+ *   *t_hit = (t0 > ε) ? t0 : t1
+ *   return 1
  *
- * Standard quadratic with a=1, half-b = rd·ro, c = |ro|²−r². The
- * "half-b" form (using b = rd·ro, not 2·rd·ro) lets us write
- *   disc = b² − c        (instead of b²/4 − c)
- *   t    = -b ± √disc    (instead of (-b ± √disc) / 2)
- * — a small saving of two divisions per pixel.
+ * Mental model: ray as a point sweeping forward in t; we ask "for
+ * what t is the sweeping point exactly r away from origin?" Squaring
+ * "distance equals radius" gives a quadratic; b² − c is the
+ * discriminant divided by 4 (the "half-b" form, which saves us a
+ * /2 divide in the root formula).
  *
- * Returns 1 on hit; *t_hit gets the nearest t > T_EPS. The T_EPS guard
- * rejects t-values close to zero, preventing self-intersection at the
- * surface and numerical instability when the ray grazes the sphere
- * (disc ≈ 0 case where t0 and t1 are nearly equal).
+ * Why use the half-b form: with full b' = 2·rd·ro, the standard
+ * quadratic disc' = b'² − 4ac would equal 4·(b² − c). Computing the
+ * roots costs an extra factor of 2 and a divide. The half-b form
+ * eliminates both.
  *
- * Equivalent to ray_quad / ray_aabb in the other primitive files —
- * each is "the analytic solver for ONE primitive shape." Sphere is
- * the simplest such solver in the entire raytracing folder.
+ * Why prefer t0 over t1 normally: t0 is the entry point (front
+ * face), t1 the exit (back face). For a primary ray hitting an
+ * outside sphere, t0 > 0 < t1 and we want t0. Camera INSIDE the
+ * sphere produces t0 < 0 < t1, and we fall back to t1 (the exit).
+ *
+ * The T_EPS guard rejects effectively-zero t values, preventing
+ * self-intersection on bounce rays (not used here — single bounce —
+ * but harmless).
  */
 static int ray_sphere(V3 ro, V3 rd, float r, float *t_hit)
 {
@@ -516,70 +963,95 @@ static int ray_sphere(V3 ro, V3 rd, float r, float *t_hit)
 typedef enum { MODE_PHONG=0, MODE_NORMAL, MODE_FRESNEL, MODE_DEPTH, MODE_N } ShadeMode;
 static const char *const k_mode_names[] = { "phong","normals","fresnel","depth" };
 
-/* Three fixed world-space lights — POSITIONS, not directions.
- * Per pixel we compute L = normalize(light_pos − P) so each light
- * direction depends on the hit point (point lights, not directional). */
-static const V3 L_KEY  = { 3.0f, 4.0f, -2.0f };   /* upper-right, warm     */
-static const V3 L_FILL = {-4.0f, 1.0f, -1.0f };   /* upper-left,  cool     */
-static const V3 L_RIM  = { 0.5f,-1.0f,  5.0f };   /* behind,      accent   */
+/* Three fixed world-space lights — POSITIONS, not directions, all
+ * PURE WHITE. Per pixel we compute L = normalize(light_pos − P) so
+ * each light direction depends on the hit point (point lights, not
+ * directional). The lights have NO tint of their own — every visible
+ * colour comes from the material (Theme.albedo + Theme.specular). */
+static const V3 LIGHT_KEY  = { 3.0f, 4.0f, -2.0f };   /* upper-right       */
+static const V3 LIGHT_FILL = {-4.0f, 1.0f, -1.0f };   /* upper-left        */
+static const V3 LIGHT_RIM  = { 0.5f,-1.0f,  5.0f };   /* behind            */
 
-/* §6.1 ── KEY light: dominant warm diffuse + sharp specular ─────────── */
-
-static V3 light_key(V3 P, V3 N, V3 V_dir, const Theme *th)
-{
-    V3    L = v3norm(v3sub(L_KEY, P));
-    float d = fmaxf(0.f, v3dot(N, L));
-    V3    R = v3reflect(v3scale(-1.f, L), N);
-    float s = powf(fmaxf(0.f, v3dot(R, V_dir)), SHININESS);
-
-    V3 diff = v3scale(d * 0.65f, v3mul(th->obj, th->key_col));
-    V3 spec = v3scale(s * 0.55f, th->spec);
-    return v3add(diff, spec);
-}
-
-/* §6.2 ── FILL light: soft cool diffuse, no specular ────────────────── */
-
-/*
- * The FILL light is intentionally diffuse-only. Its job is to LIFT
- * the unlit hemisphere from pure shadow into a soft cool tone. Adding
- * specular here would produce a second highlight that competes with
- * the KEY's, breaking the three-point-lighting visual hierarchy.
+/* §6.1 ── shade_phong: PBR-flavoured Phong (T3, T4) ──────────────────
+ *
+ * Inputs:
+ *   P       hit point on sphere surface (world space)
+ *   N       unit surface normal at P (= P/r since sphere at origin)
+ *   V_dir   unit vector from P toward camera
+ *   th      pointer to active Theme (albedo, F0, emissive, weight)
+ * Returns: clamped RGB ∈ [0, 1]³.
+ *
+ * Pseudocode (mirrors body 1:1):
+ *   col = AMBIENT · albedo                              ambient
+ *   for (LIGHT, weight, has_specular) in {
+ *        (KEY,  1.00, true),
+ *        (FILL, 0.55, false),
+ *        (RIM,  0.40, true with low shininess) }:
+ *     L = norm(LIGHT − P)                               light direction
+ *     d = max(0, N·L)                                   Lambertian
+ *     col += d · diffuse_weight · weight · albedo
+ *     if has_specular:
+ *       R = reflect(−L, N)                              reflection of L
+ *       s = max(0, R·V_dir)^shininess                   Phong cone
+ *       col += s · spec_weight · F0
+ *   col += emissive                                     neon adds here
+ *   return clamp01(col)
+ *
+ * Mental model: three white spotlights at fixed positions. Each one
+ * contributes diffuse (light scattering off the surface in all
+ * directions, brightest where N faces L) and specular (mirror-like
+ * reflection of L visible only when V_dir ≈ R). The MATERIAL decides
+ * the colour:
+ *   metals      diffuse_weight ≈ 0.15 (low body), F0 = albedo (tinted spec)
+ *   dielectrics diffuse_weight ≈ 0.85 (full body), F0 ≈ white
+ *   gems        diffuse_weight ≈ 0.70 (saturated body), F0 ≈ white
+ *
+ * Why split into three lights with different weights:
+ *   KEY  upper-right, full-strength — primary illumination, hard spec
+ *   FILL upper-left,  half-strength — lifts shadow side without
+ *                                     adding a competing highlight
+ *   RIM  behind,      0.4×        — silhouette glow with a wide spec
+ *                                     cone (shininess = 10 not 75) so
+ *                                     the back edge "kisses" the form
+ *
+ * Why ambient: even with three lights, points facing AWAY from all
+ * of them go pitch black. AMBIENT_K = 0.20 sets a floor brightness
+ * so the sphere never has fully-black cells (terminal cells with
+ * pure-black RGB lose all glyph density and look like holes).
  */
-static V3 light_fill(V3 P, V3 N, const Theme *th)
-{
-    V3    L = v3norm(v3sub(L_FILL, P));
-    float d = fmaxf(0.f, v3dot(N, L));
-    return v3scale(d * 0.22f, v3mul(th->obj, th->fill_col));
-}
-
-/* §6.3 ── RIM light: accent specular on the silhouette ──────────────── */
-
-/*
- * The RIM light sits BEHIND the sphere relative to the camera. Its
- * specular component (with a low shininess of 10) creates a wide
- * brilliant glow on the silhouette edge — the "rim" effect that makes
- * the sphere read as separated from the background.
- */
-static V3 light_rim(V3 P, V3 N, V3 V_dir, const Theme *th)
-{
-    V3    L = v3norm(v3sub(L_RIM, P));
-    float d = fmaxf(0.f, v3dot(N, L));
-    V3    R = v3reflect(v3scale(-1.f, L), N);
-    float s = powf(fmaxf(0.f, v3dot(R, V_dir)), 10.f);
-
-    V3 diff = v3scale(d * 0.18f, v3mul(th->obj, th->rim_col));
-    V3 spec = v3scale(s * 0.65f, th->rim_col);
-    return v3add(diff, spec);
-}
-
-/* §6.4 ── shade_phong: ambient + KEY + FILL + RIM ───────────────────── */
 
 static V3 shade_phong(V3 P, V3 N, V3 V_dir, const Theme *th)
 {
-    V3 col = v3scale(AMBIENT, th->obj);
-    col = v3add(col, light_key (P, N, V_dir, th));
-    col = v3add(col, light_fill(P, N,        th));
-    col = v3add(col, light_rim (P, N, V_dir, th));
+    /* Ambient: dim version of body albedo. */
+    V3 col = v3scale(AMBIENT, th->albedo);
+
+    /* §6.1.1 KEY light — primary diffuse + sharp specular. */
+    {
+        V3    L = v3norm(v3sub(LIGHT_KEY, P));
+        float d = fmaxf(0.f, v3dot(N, L));
+        V3    R = v3reflect(v3scale(-1.f, L), N);
+        float s = powf(fmaxf(0.f, v3dot(R, V_dir)), SHININESS);
+        col = v3add(col, v3scale(d * th->diffuse_weight * 1.00f, th->albedo));
+        col = v3add(col, v3scale(s * 1.30f, th->specular));
+    }
+    /* §6.1.2 FILL light — soft diffuse, no specular. Lifts shadow side. */
+    {
+        V3    L = v3norm(v3sub(LIGHT_FILL, P));
+        float d = fmaxf(0.f, v3dot(N, L));
+        col = v3add(col, v3scale(d * th->diffuse_weight * 0.55f, th->albedo));
+    }
+    /* §6.1.3 RIM light — wide specular kissing the back silhouette. */
+    {
+        V3    L = v3norm(v3sub(LIGHT_RIM, P));
+        float d = fmaxf(0.f, v3dot(N, L));
+        V3    R = v3reflect(v3scale(-1.f, L), N);
+        float s = powf(fmaxf(0.f, v3dot(R, V_dir)), 10.f);
+        col = v3add(col, v3scale(d * th->diffuse_weight * 0.40f, th->albedo));
+        col = v3add(col, v3scale(s * 1.20f, th->specular));
+    }
+    /* §6.1.4 Emissive — added before clamp. Lets neon glow in shadow. */
+    col = v3add(col, th->emissive);
+
     return v3clamp1(col);
 }
 
@@ -601,38 +1073,71 @@ static V3 shade_normal(V3 N)
     return (V3){ N.x*.5f + .5f, N.y*.5f + .5f, N.z*.5f + .5f };
 }
 
-/* §6.6 ── shade_fresnel + shade_depth (alternative diagnostics) ─────── */
+/* §6.6 ── shade_fresnel + shade_depth (alternative diagnostics, T5+T6)  */
 
 /*
- * Schlick approximation: F = F₀ + (1−F₀)(1−cosθ)^5. With F₀ = 0 (full
- * dielectric, like air↔glass), this simplifies to (1−cosθ)^5. Result
- * is dark head-on (cosθ ≈ 1 → F ≈ 0) and bright at grazing angles
- * (cosθ → 0, F → 1) — the classic "glass marble" look.
+ * shade_fresnel — Schlick-Fresnel "glass marble" effect (T5).
  *
- * The blend parameter `fresnel` mixes a dim core colour with a bright
- * edge colour. Increasing F₀ would brighten the head-on view (more
- * metallic).
+ * Inputs:  N (unit normal), V_dir (unit toward camera), th (Theme).
+ * Returns: clamped RGB blending between a dim core and a bright edge.
+ *
+ * Pseudocode:
+ *   cosθ    = |N · V_dir|                       angle to camera
+ *   inv     = 1 − cosθ
+ *   fresnel = inv^5                              Schlick (F₀ = 0)
+ *   core    = 0.06 · albedo                      dim head-on tint
+ *   edge    = clamp01(1.10 · F0)                 bright grazing tint
+ *   return  clamp01( (1−fresnel)·core + fresnel·edge )
+ *
+ * Schlick (1994): F(θ) = F₀ + (1−F₀)·(1−cosθ)^5. We use F₀ = 0 so
+ * the term collapses to (1−cosθ)^5 — pure (1−cosθ)^5 blending.
+ *
+ *   head-on  (cosθ ≈ 1):  fresnel ≈ 0   → core  (dim albedo tint)
+ *   grazing  (cosθ ≈ 0):  fresnel ≈ 1   → edge  (bright F0 tint)
+ *
+ * Worked example for cosθ at various angles:
+ *   cosθ = 1.00 (head-on)    fresnel = 0
+ *   cosθ = 0.90 (slight tilt)  fresnel = 0.1^5 = 1·10⁻⁵ (negligible)
+ *   cosθ = 0.50               fresnel = 0.5^5 = 0.03 (3%)
+ *   cosθ = 0.20 (near-edge)  fresnel = 0.8^5 = 0.33 (33%)
+ *   cosθ = 0.05 (silhouette) fresnel = 0.95^5 = 0.77 (77%)
+ *   cosθ = 0    (limb)       fresnel = 1
+ *
+ * The 5th-power curve concentrates almost ALL of the brightening
+ * very close to the silhouette — exactly the "glass marble" look,
+ * dark across the whole interior with a bright outer ring.
  */
 static V3 shade_fresnel(V3 N, V3 V_dir, const Theme *th)
 {
     float cosA    = fabsf(v3dot(N, V_dir));
     float inv     = 1.f - cosA;
     float fresnel = inv * inv * inv * inv * inv;       /* (1−cosθ)^5 */
-    V3 core = v3scale(0.06f, th->obj);
-    V3 edge = v3clamp1(v3add(v3scale(0.7f, th->spec), v3scale(0.5f, th->rim_col)));
+    V3 core = v3scale(0.06f, th->albedo);
+    V3 edge = v3clamp1(v3scale(1.10f, th->specular));
     return v3clamp1(v3add(v3scale(1.f - fresnel, core), v3scale(fresnel, edge)));
 }
 
 /*
- * shade_depth — encode hit distance as brightness (closer = bright,
- * farther = dim). d² (rather than d) gives a steeper falloff so the
- * silhouette pops as obviously "at the back."
+ * shade_depth — encode hit distance as brightness (T6).
+ *
+ * Pseudocode:
+ *   d = 1 − min(t / t_max, 1)        normalise to [0, 1]
+ *   d = d²                            steeper falloff
+ *   return clamp01(d · albedo)
+ *
+ *   t = 0       → d = 1   → full albedo                (closest hit)
+ *   t = t_max/2 → d = 0.25 → 25% albedo                (mid distance)
+ *   t = t_max   → d = 0   → black                       (farthest hit)
+ *
+ * The squared falloff makes distant cells noticeably darker than
+ * near cells — useful for "is the silhouette where I expect it"
+ * sanity-check.
  */
 static V3 shade_depth(float t, float t_max, const Theme *th)
 {
     float d = 1.f - fminf(t / t_max, 1.f);
     d = d * d;
-    return v3clamp1(v3scale(d, th->obj));
+    return v3clamp1(v3scale(d, th->albedo));
 }
 
 /* Rec. 601 luminance for ramp-index choice. */
@@ -644,12 +1149,36 @@ static inline float rec601_luma(V3 c)
 /* ── §7 render frame ─────────────────────────────────────────────────── */
 
 /*
- * The orbiting-camera trick:
+ * render — paint one frame.
  *
- *   Instead of rotating the sphere, we orbit the CAMERA around the
- *   sphere at a fixed distance. This is mathematically equivalent and
- *   keeps the sphere's intersection math trivial: the sphere stays at
- *   the origin so ray_sphere() never needs a centre argument.
+ * Inputs:
+ *   cols, rows  terminal dimensions
+ *   orbit_ang   camera orbit angle (radians)
+ *   cam_dist    camera orbit radius from origin (world units)
+ *   theme_idx   which Theme is active
+ *   mode        shading mode (PHONG / NORMAL / FRESNEL / DEPTH)
+ *
+ * Pseudocode (mirrors body 1:1):
+ *   th       = &themes[theme_idx]
+ *   fov_tan  = tan(FOV/2)
+ *   cam      = orbit position from cam_dist + orbit_ang
+ *   fwd      = norm(origin − cam)             look toward origin
+ *   right    = norm(fwd × world_up)
+ *   up       = right × fwd                     orthonormal basis
+ *   for each cell (col, row) skipping bottom row (HUD):
+ *     pu, pv = pixel-to-screen-space coords (centred at 0,0)
+ *     rd    = norm(fwd + pu·right + pv·up)
+ *     if not ray_sphere(cam, rd, R, &t): paint background; continue
+ *     P     = cam + t·rd                      hit point
+ *     N     = norm(P)                          normal (sphere at origin)
+ *     V_dir = norm(cam − P)
+ *     col, lum = SHADE(mode, P, N, V_dir, t, th)
+ *     draw_color(row, col, color, lum)
+ *
+ * THE ORBITING-CAMERA TRICK:
+ * Instead of rotating the sphere, we orbit the CAMERA around it at
+ * fixed distance. Mathematically equivalent, but keeps the sphere
+ * fixed at origin so ray_sphere() needs no centre argument:
  *
  *   cam = (cam_dist · sin(θ),  CAM_HEIGHT,  -cam_dist · cos(θ))
  *
@@ -741,7 +1270,7 @@ static void hud_draw(int cols, int rows, float fps,
 
     /* §8.2 top-left mode label row 0 — same yellow, no bold (secondary). */
     char buf2[48];
-    snprintf(buf2, sizeof buf2, " mode: %s ", k_mode_names[mode]);
+    snprintf(buf2, sizeof buf2, " mode:%-9s ", k_mode_names[mode]);
     attron(COLOR_PAIR(PAIR_HUD));
     mvprintw(0, 0, "%s", buf2);
     attroff(COLOR_PAIR(PAIR_HUD));

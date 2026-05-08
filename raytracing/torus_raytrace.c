@@ -2,13 +2,16 @@
 /*
  * torus_raytrace.c — analytic ray-traced torus (quartic intersection)
  *
- * DEMO: A glossy donut tumbling in space, lit by three coloured lights.
- *       Cycle phong → normals → fresnel → depth to see the same
- *       quartic-solved geometry through different shading models.
- *       The torus is the ONLY primitive in this folder that needs a
- *       degree-4 polynomial — sphere is degree 2, cylinder is degree
- *       2, AABB is linear. The torus's tube curving around a ring
- *       creates the extra algebraic complexity.
+ * DEMO: A glossy donut tumbling in space, lit by three FIXED WHITE
+ *       LIGHTS. Each material's distinctive look comes from its own
+ *       PBR properties — gold has a tinted yellow highlight, glass
+ *       shows a near-white specular peak, sapphire reads as deep
+ *       blue. Cycle phong → normals → fresnel → depth to see the
+ *       same quartic-solved geometry through different shading
+ *       models. The torus is the ONLY primitive in this folder that
+ *       needs a degree-4 polynomial — sphere is degree 2, cylinder
+ *       is degree 2, AABB is linear. The torus's tube curving around
+ *       a ring creates the extra algebraic complexity.
  *
  * Study alongside:
  *   raytracing/sphere_raytrace.c   — quadratic intersection (degree 2)
@@ -35,7 +38,8 @@
  *
  * Keys:
  *   s         cycle shade mode (phong → normals → fresnel → depth)
- *   t         cycle theme (titanium → solar → cobalt → forest → rose → chrome)
+ *   t / T     next / previous theme (20 PBR materials: 12 metals,
+ *             4 gems, 3 dielectrics, 1 emissive — see §4)
  *   p / SPC   pause / resume rotation
  *   r         reset rotation angles to zero
  *   + / =     zoom in
@@ -46,6 +50,67 @@
  *   gcc -std=c11 -O2 -Wall -Wextra raytracing/torus_raytrace.c \
  *       -o torus_rt -lncurses -lm
  */
+
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read sphere_raytrace.c first if you don't already
+ *      know ray-sphere; the quartic is the analytic step BEYOND
+ *      ray-sphere, and most of the code is the same.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *   3. §5 ray-torus — THE CORE. Read AFTER tutorials T2-T4. q_eval
+ *      (§5.1) is one line of Horner-form polynomial evaluation;
+ *      ray_torus (§5.2) is the scan-and-bisect solver; torus_normal
+ *      (§5.3) is the closest-point geometric formula.
+ *   4. §6 shading — five small shaders, identical to sphere_raytrace.c.
+ *      Read AFTER tutorial T6.
+ *   5. §3 math has Mat3 helpers (rotation matrix + transpose-multiply)
+ *      with the inverse-rotation trick in §3 explanation. Read AFTER
+ *      tutorial T1.
+ *   6. §4 themes — pure data, skim. Same Theme structure as the rest
+ *      of the folder.
+ *   7. §7 render + §8 hud + §9 app — infrastructure, skip on first
+ *      read.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   ro / rd            primary ray as (origin, unit direction)
+ *                      In §7 we have ro_ws / rd_ws (world-space) and
+ *                      ro_os / rd_os (object-space, after inverse-
+ *                      rotation). The quartic solver works in
+ *                      object space.
+ *   R / r              torus radii — MAJOR (centreline) and MINOR
+ *                      (tube cross-section). NOT to be confused with
+ *                      the reflection vector in shading code.
+ *   A, B, C, D         the four quartic coefficients (named after
+ *                      their canonical positions in t⁴ + A·t³ +
+ *                      B·t² + C·t + D = 0).
+ *   q(t)               the quartic polynomial value at parameter t.
+ *
+ *   Single-letter names (i, c, t) appear inside tight loops.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Same as sphere_raytrace.c: 3-D vectors, Lambertian shading,
+ *     6×6×6 cube quantisation.
+ *   - PLUS: the quadratic formula is degree 2, so a tangent ray
+ *     to a sphere is a "double root". The torus is degree 4 — up
+ *     to four real intersections in t. Make peace with that.
+ *   - Numerical root-finding by BISECTION: if f(a) and f(b) have
+ *     opposite signs, a root lies in [a, b] — halve the bracket
+ *     repeatedly to nail it down.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Closed-form quartic solution (Ferrari's method). Too unstable
+ *     near tangent rays; we use scan-and-bisect instead.
+ *   - Galois theory. Yes, quartics are the LAST polynomial degree
+ *     with a closed-form solution; you don't need to know why.
+ *   - Acceleration structures.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
@@ -82,8 +147,11 @@
  *                  is fixed in the XZ plane at the origin in OBJECT
  *                  space; rotation is applied to the RAY (inverse-
  *                  rotation trick), so the geometry stays simple.
- *                  Themes are RGB triplets per role; 216 ncurses pairs
- *                  pre-allocated as a 6×6×6 RGB cube.
+ *                  20 themes are PBR-flavored material descriptors
+ *                  (albedo, specular F0, emissive, diffuse_weight)
+ *                  shared with sphere_raytrace.c and cube_raytrace.c.
+ *                  216 ncurses pairs pre-allocated as a 6×6×6 RGB
+ *                  cube.
  *
  * Rendering      : One ray per terminal cell. RGB shading → quantised
  *                  to xterm 6×6×6 cube + Bourke 92-char density ramp.
@@ -313,6 +381,323 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ * Eight short tutorials that build the renderer from first
+ * principles. Read in order; each builds on the previous.
+ *
+ *   T1  The inverse-rotation trick — rotate the ray, not the torus
+ *   T2  The torus implicit equation — distance to a circle
+ *   T3  Squaring twice — deriving the quartic
+ *   T4  Sample-then-bisect — numerical root-finding without Ferrari
+ *   T5  Closest-point normal vs implicit gradient
+ *   T6  PBR-flavored Phong (cross-reference sphere_raytrace.c T3-T4)
+ *   T7  Three debug overlays — NORMAL / FRESNEL / DEPTH
+ *   T8  Continuous-RGB pipeline → 6×6×6 cube + 92-char ramp
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE INVERSE-ROTATION TRICK — ROTATE THE RAY, NOT THE TORUS
+ * ───────────────────────────────────────────────────────────────
+ * The torus is an animated object; we want it to tumble in space.
+ * Two ways to do this:
+ *
+ *   FORWARD WAY: rotate the geometry. Recompute the implicit
+ *   equation's coefficients in the rotated frame each frame.
+ *   This is messy — the quartic coefficients (T3) assume the torus
+ *   sits flat in the XZ plane at the origin. Rotating the geometry
+ *   means re-deriving the algebra.
+ *
+ *   INVERSE WAY: leave the torus fixed in OBJECT SPACE (XZ plane,
+ *   origin), and rotate the RAY into that frame. If M is the
+ *   torus's rotation matrix, then for each pixel:
+ *
+ *       ro_os = M^T · cam_world          (camera in object space)
+ *       rd_os = M^T · rd_world           (direction in object space)
+ *
+ *   M^T is M's TRANSPOSE — the inverse of a rotation matrix is its
+ *   transpose. Now we test the ray against the canonical torus
+ *   equation, find a hit point P_os in object space, compute the
+ *   normal N_os in object space, then transform the normal back to
+ *   world space for shading:
+ *
+ *       N_world = M · N_os
+ *
+ *   The quartic coefficients stay simple because the torus is
+ *   always at the canonical position. See §3 for Mat3, mat3_mul,
+ *   mat3_mulT (transpose-multiply).
+ *
+ * T2  THE TORUS IMPLICIT EQUATION — DISTANCE TO A CIRCLE
+ * ───────────────────────────────────────────────────────
+ * A torus is the locus of points at distance r (minor radius) from
+ * a fixed CIRCLE of radius R (major radius). For our canonical
+ * torus the centreline circle lies in the XZ plane at the origin:
+ *
+ *   centreline = { (R·cosφ, 0, R·sinφ) : φ ∈ [0, 2π) }
+ *
+ * For an arbitrary point (x, y, z), the closest point on the
+ * centreline has the same azimuth as (x, z). Project (x, z) onto a
+ * unit-length direction and rescale:
+ *
+ *     ρ        = √(x² + z²)             distance from Y axis
+ *     ring_pt  = (R·x/ρ, 0, R·z/ρ)      closest centreline point
+ *
+ * Distance from (x, y, z) to ring_pt:
+ *
+ *     d² = (x − R·x/ρ)² + y² + (z − R·z/ρ)²
+ *        = x²(1 − R/ρ)² + y² + z²(1 − R/ρ)²
+ *        = (x² + z²)(1 − R/ρ)² + y²
+ *        = ρ²·(1 − R/ρ)² + y²
+ *        = (ρ − R)² + y²
+ *
+ * The torus surface is d = r, so the implicit equation is:
+ *
+ *     (√(x² + z²) − R)² + y² = r²
+ *
+ * The square root is unavoidable in this form — it's the distance
+ * from the point to the Y axis. Squaring twice (T3) eliminates it.
+ *
+ * T3  SQUARING TWICE — DERIVING THE QUARTIC
+ * ──────────────────────────────────────────
+ * Substitute the parametric ray P(t) = ro + t·rd into the implicit
+ * equation:
+ *
+ *     (√((ro.x + t·rd.x)² + (ro.z + t·rd.z)²) − R)² + (ro.y + t·rd.y)² = r²
+ *
+ * Let u = (ro.x + t·rd.x)² + (ro.z + t·rd.z)². Then √u is the
+ * radial component. Move the y² term to the LHS:
+ *
+ *     (√u − R)²  =  r² − (ro.y + t·rd.y)²
+ *
+ * Expand the LHS:
+ *     u − 2R·√u + R²  =  r² − (ro.y + t·rd.y)²
+ *
+ * Isolate the √u term:
+ *     2R·√u  =  u + R² − r² + (ro.y + t·rd.y)²
+ *
+ * SQUARE BOTH SIDES (this is where the quartic emerges):
+ *     4R²·u  =  (u + R² − r² + (ro.y + t·rd.y)²)²
+ *
+ * Expand both sides into polynomials in t. The LHS u is degree 2;
+ * the RHS is the square of (u + ...), which is degree 4 in t.
+ * Collect by powers:
+ *
+ *     t⁴ · 1
+ *   + t³ · 4(rd · ro)
+ *   + t² · [4(rd·ro)² + 2(|ro|² + R² − r²) − 4R²(rd.x² + rd.z²)]
+ *   + t  · [4(rd·ro)(|ro|² + R² − r²) − 8R²(rd.x·ro.x + rd.z·ro.z)]
+ *   +     [(|ro|² + R² − r²)² − 4R²(ro.x² + ro.z²)]
+ *   = 0
+ *
+ * Name the coefficients A, B, C, D for the t³ .. t⁰ terms (the
+ * leading t⁴ has coefficient 1 because rd is unit-length, so
+ * rd·rd = 1):
+ *
+ *     t⁴ + A·t³ + B·t² + C·t + D = 0
+ *
+ * That's the polynomial we need to solve. See §5.2 ray_torus for
+ * the code that computes A, B, C, D from a given ray + (R, r).
+ *
+ * Worked example (head-on equatorial ray, R = 0.68, r = 0.28):
+ *   ro = (0, 0, -3.4)
+ *   rd = (0, 0, +1)
+ *
+ *   Pre-computed quantities:
+ *     po2     = |ro|² = 0 + 0 + 11.56 = 11.56
+ *     rod     = rd · ro = -3.4
+ *     rxz²    = ro.x² + ro.z² = 11.56     (in-plane part of |ro|²)
+ *     rdxz_d  = rd.x·ro.x + rd.z·ro.z = -3.4
+ *     rdxz²   = rd.x² + rd.z² = 1.0       (in-plane part of |rd|²)
+ *     C0      = po2 + R² − r² = 11.56 + 0.4624 − 0.0784 = 11.944
+ *
+ *   Coefficients:
+ *     A = 4·(-3.4)                                = -13.6
+ *     B = 4·(-3.4)² + 2·11.944 − 4·0.4624·1.0
+ *       = 46.24 + 23.888 − 1.850                  = 68.28
+ *     C = 4·(-3.4)·11.944 − 8·0.4624·(-3.4)
+ *       = -162.44 + 12.578                        = -149.9
+ *     D = 11.944² − 4·0.4624·11.56
+ *       = 142.66 − 21.39                          = 121.27
+ *
+ *   Geometric expectation: the ray runs along z, so it should hit
+ *   the torus where (|z| − R)² = r² (since x = 0, y = 0):
+ *     |z| − R = ±r   →   |z| ∈ {R − r, R + r} = {0.40, 0.96}
+ *
+ *   Mapping z = -3.4 + t (the ray goes from z = -3.4 toward z = +∞):
+ *     t1 ≈ 2.44   (entry-near, z = -0.96)
+ *     t2 ≈ 3.00   (entry-far,  z = -0.40)
+ *     t3 ≈ 3.80   (exit-near,  z = +0.40)
+ *     t4 ≈ 4.36   (exit-far,   z = +0.96)
+ *
+ *   Verify q(2.44) using the coefficients above (Horner):
+ *     ((2.44 + (-13.6))·2.44 + 68.28)·2.44 + (-149.9))·2.44 + 121.27
+ *     ≈ ((-27.20)·2.44 + 68.28)·2.44 + (-149.9))·2.44 + 121.27
+ *     ≈ (1.91·2.44 + (-149.9))·2.44 + 121.27
+ *     ≈ (-145.24)·2.44 + 121.27
+ *     ≈ -354.39 + 121.27 ≈ -233.1     hmm, not zero
+ *
+ *   ...because Horner evaluation needs a leading 1 for the t⁴
+ *   coefficient. Re-doing with q(t) = t·(t·(t·(t + A) + B) + C) + D:
+ *     step 1: 2.44 + A = 2.44 − 13.6 = -11.16
+ *     step 2: (-11.16)·2.44 + B = -27.23 + 68.28 = 41.05
+ *     step 3: (41.05)·2.44 + C = 100.16 − 149.9  = -49.74
+ *     step 4: (-49.74)·2.44 + D = -121.36 + 121.27 = -0.09  ✓
+ *
+ *   q(2.44) ≈ -0.09 — close to zero (root!). Plug t = 2.45 to see
+ *   it's already turning negative further, and t = 2.43 to see
+ *   it was positive — that's the sign change that the scan catches.
+ *
+ * T4  SAMPLE-THEN-BISECT — NUMERICAL ROOT-FINDING WITHOUT FERRARI
+ * ───────────────────────────────────────────────────────────────
+ * Quartics have a closed-form solution (Ferrari's method, 1540) but
+ * it's NUMERICALLY UNSTABLE near tangent rays. Small input
+ * perturbations cause large root errors — the rendered torus
+ * surface flickers. Real production raytracers use either a
+ * specialised stable quartic solver or numerical methods.
+ *
+ * We use SAMPLE-AND-BISECT — the simplest robust method:
+ *
+ *   1. SCAN: evaluate q(t) at Q_SAMPLES = 256 uniformly-spaced
+ *      values of t in [ε, T_MAX]. Keep track of the previous q value.
+ *
+ *   2. SIGN CHANGE: when consecutive samples have OPPOSITE signs,
+ *      the intermediate value theorem says a real root lies in
+ *      that interval (q is continuous, it must cross zero between
+ *      a positive value and a negative value).
+ *
+ *   3. BISECT: halve the interval Q_BISECT = 40 times. Each
+ *      iteration:
+ *          mid = (a + b) / 2
+ *          if q(a) and q(mid) have opposite signs: b = mid
+ *          else:                                   a = mid
+ *      After 40 halvings the interval is 2⁻⁴⁰ ≈ 10⁻¹² of the
+ *      original — far below single-precision float resolution.
+ *
+ *   4. RETURN the FIRST positive root we find. That's the front-
+ *      face hit of the ray.
+ *
+ * Trade-off: tangent rays where q grazes zero without crossing
+ * (a "double root") aren't found — there's no sign change. The
+ * torus's silhouette can show tiny single-pixel gaps at exactly-
+ * tangent angles. Acceptable visual cost.
+ *
+ * Cost: 256 polynomial evaluations + 40 bisections per pixel that
+ * has any sign change ≈ 300 floating-point ops in the hit case,
+ * 256 + 0 in the miss case. Sphere is ~10 ops; torus is intrinsic-
+ * ally more expensive. See §5 for the implementation.
+ *
+ * Worked example (continuing from T3, ray with sign change in
+ *   bracket [2.43, 2.44]; q(2.43) > 0, q(2.44) < 0; bisect):
+ *
+ *     iter   lo      hi      mid     q(mid)        next bracket
+ *     ────   ────    ────    ────    ────          ────────────
+ *     0      2.430   2.440   2.435   ≈ +0.40       lo = 2.435
+ *     1      2.435   2.440   2.4375  ≈ +0.16       lo = 2.4375
+ *     2      2.4375  2.440   2.43875 ≈ +0.04       lo = 2.43875
+ *     3      2.43875 2.440   2.43938 ≈ -0.03       hi = 2.43938
+ *     4      2.43875 2.43938 2.43906 ≈ +0.005      lo = 2.43906
+ *     ...
+ *     40     bracket width 2⁻⁴⁰·0.01 ≈ 10⁻¹⁴
+ *
+ *   The bracket halves every iteration; after 40 iterations we
+ *   know t to about 10⁻¹⁴ — far beyond float precision. Output
+ *   is the midpoint of the final bracket.
+ *
+ * Read §5.1 q_eval for Horner-form polynomial evaluation (3 mults
+ * + 3 adds per t-value, vs. 6 mults naive).
+ *
+ * T5  CLOSEST-POINT NORMAL VS IMPLICIT GRADIENT
+ * ──────────────────────────────────────────────
+ * Once we have the hit point P, we need the surface normal at P.
+ * Two ways:
+ *
+ *   IMPLICIT GRADIENT. The normal to an implicit surface F(p) = 0
+ *   is ∇F evaluated at P. Compute the partial derivatives of
+ *   (√(x² + z²) − R)² + y² − r² with respect to x, y, z, normalise.
+ *   Works but requires the radical's derivative (chain rule on √).
+ *
+ *   CLOSEST-POINT GEOMETRY. The normal at any point P on the torus
+ *   surface points FROM the closest centreline point TO P:
+ *
+ *       P_xz    = (P.x, 0, P.z)
+ *       ρ       = |P_xz|
+ *       ring_pt = (R/ρ) · P_xz       project P_xz to centreline
+ *       N       = normalize(P − ring_pt)
+ *
+ *   This is the same construction as T2 — the closest centreline
+ *   point — but now we use it for the normal direction. No radical
+ *   derivatives, just vector projection + subtraction.
+ *
+ * The closest-point method is FASTER (one normalise vs three
+ * partial derivatives) and STABLER (no chain rule on a radical).
+ * See §5.3 torus_normal.
+ *
+ * T6  PBR-FLAVORED PHONG  (cross-reference)
+ * ──────────────────────────────────────────
+ * The shading model is identical to sphere_raytrace.c — three
+ * white lights at fixed positions, PBR-flavored Phong with
+ * material-tinted F0 and a low diffuse_weight for metals. Read
+ * sphere_raytrace.c tutorials T3-T4 for the full discussion.
+ *
+ * Per pixel that hits the torus:
+ *
+ *     ambient   = AMBIENT_K · albedo
+ *     for each of (KEY, FILL, RIM):
+ *       diffuse  += weight · diffuse_weight · max(0, N·L) · albedo
+ *       specular += weight · max(0, R·V_dir)^SHININESS · F0
+ *     col = ambient + diffuse + specular + emissive
+ *
+ * No torus-specific shading; the whole point of the inverse-
+ * rotation trick (T1) is that once you have N at P (in world
+ * space), the shader doesn't care what shape produced it.
+ *
+ * T7  THREE DEBUG OVERLAYS — NORMAL / FRESNEL / DEPTH
+ * ────────────────────────────────────────────────────
+ * Cycling `s' switches between four shading modes. Each is a
+ * different pedagogical lens on the same scene:
+ *
+ *   PHONG     The full pipeline (PBR Phong with three white lights).
+ *
+ *   NORMAL    RGB-encoded surface normal: N → (N+1)/2. Each
+ *             component remapped from [-1,+1] → [0,1]. The TOP of
+ *             the tube (positive Y) reads green-dominant; the OUTER
+ *             edge (away from Y axis) reads red/blue; the INNER
+ *             edge (toward Y axis) reads opposite. The rainbow-on-
+ *             tube look is the easiest way to verify normals are
+ *             oriented correctly all the way around.
+ *
+ *   FRESNEL   Schlick (1 − cosθ)^5. Dark head-on, bright at
+ *             silhouette. Both INNER and OUTER tube silhouettes
+ *             glow brightly — diagnostic for "are the geometric
+ *             silhouettes where I expect them?"
+ *
+ *   DEPTH     Brightness ∝ 1 − t/t_max. As the torus rotates, the
+ *             pattern flows: closer parts swell brighter.
+ *
+ * The three debug modes converge in ONE FRAME (no randomness).
+ * Switching INTO them is instant.
+ *
+ * T8  CONTINUOUS-RGB PIPELINE → 6×6×6 CUBE + 92-CHAR RAMP
+ * ────────────────────────────────────────────────────────
+ * Identical pipeline to sphere_raytrace.c (T7) and path_tracer.c.
+ *
+ *   1. Per-pixel shading produces an HDR linear RGB triplet.
+ *   2. Reinhard tone-map per channel:  L' = L / (1 + L)
+ *   3. Gamma encode 1/2.2.
+ *   4. Quantise each channel to {0..5}: 216 cube cells.
+ *   5. Pair index = 16 + 36·R5 + 6·G5 + B5.
+ *   6. Density character = Rec.601 luma → ramp[index].
+ *   7. A_BOLD on luma > 0.85, A_DIM on luma < 0.15.
+ *
+ * Tone-mapping happens BEFORE quantisation. Quantising linear HDR
+ * puts every pixel above ~0.85 into the same cube cell — no
+ * headroom for the specular peaks. Reinhard spreads the dynamic
+ * range over the full cube uniformly.
+ *
+ * Read §6 paint_cell.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 199309L
 #include <ncurses.h>
 #include <math.h>
@@ -357,8 +742,8 @@
 #define CAM_HEIGHT    1.8f                 /* elevation above equator       */
 
 /* §1.6 shading */
-#define AMBIENT       0.04f
-#define SHININESS     60.0f                /* phong exponent for KEY        */
+#define AMBIENT       0.20f                /* dim copy of albedo as ambient */
+#define SHININESS     75.0f                /* phong exponent — high = metal */
 
 /* §1.7 quartic solver — sample then bisect.
  *
@@ -415,7 +800,6 @@ typedef struct { float x, y, z; } V3;
 static inline V3    v3add   (V3 a, V3 b)    { return (V3){a.x+b.x, a.y+b.y, a.z+b.z}; }
 static inline V3    v3sub   (V3 a, V3 b)    { return (V3){a.x-b.x, a.y-b.y, a.z-b.z}; }
 static inline V3    v3scale (float s, V3 a) { return (V3){s*a.x,  s*a.y,  s*a.z};   }
-static inline V3    v3mul   (V3 a, V3 b)    { return (V3){a.x*b.x, a.y*b.y, a.z*b.z}; }
 static inline float v3dot   (V3 a, V3 b)    { return a.x*b.x + a.y*b.y + a.z*b.z;    }
 static inline float v3len   (V3 a)          { return sqrtf(v3dot(a, a));             }
 static inline V3    v3norm  (V3 a)          { float l=v3len(a); return l>1e-9f ? v3scale(1.f/l,a) : (V3){0,1,0}; }
@@ -468,35 +852,103 @@ static V3 mat3_mulT(Mat3 m, V3 v)
 /* ── §4 color / themes ───────────────────────────────────────────────── */
 
 /*
- * Theme — five colour vectors per palette:
- *   obj         base albedo of the torus
- *   spec        specular highlight tint (KEY + RIM)
- *   key/fill/rim three-light tint (warm·cool·accent)
+ * Theme — PBR-flavoured material descriptor (matches cube_raytrace.c
+ * and sphere_raytrace.c so all three primitives share one material
+ * vocabulary).
+ *
+ * First-principles redesign: the LIGHTS are pure WHITE, and each
+ * material's distinctive look comes entirely from its own properties.
+ * Under white light, gold looks like gold and blue plastic looks like
+ * blue plastic — the colour is intrinsic to the material, not painted
+ * on by a tinted light source.
+ *
+ * Fields:
+ *   albedo          body diffuse colour (what the material LOOKS LIKE
+ *                   under uniform white illumination)
+ *   specular        F0 — Fresnel reflectance at normal incidence:
+ *                     METALS:      tinted to match albedo (gold spec
+ *                                  is warm yellow because gold reflects
+ *                                  yellow at the highlight)
+ *                     DIELECTRICS: near-white (~4% achromatic
+ *                                  reflectance for non-conductors)
+ *   emissive        self-luminance, added AFTER lighting — visible
+ *                   even in shadow. Mostly (0,0,0); used for neon.
+ *   diffuse_weight  scales the diffuse contribution from albedo:
+ *                     metals ≈ 0.15, gems ≈ 0.70, plastic/ceramic ≈ 0.85,
+ *                     glass ≈ 0.10, neon ≈ 0.20.
+ *
+ * The 20 themes below are organised into 4 families. Switching themes
+ * with `t / T` cycles through all 20 in order.
  */
 typedef struct {
-    V3 obj, spec, key_col, fill_col, rim_col;
+    V3          albedo;         /* body diffuse colour                      */
+    V3          specular;       /* F0 — metal: matches albedo; die: white   */
+    V3          emissive;       /* self-glow (added after lighting)         */
+    float       diffuse_weight; /* 0.10..0.90 — metal/dielectric scale      */
     const char *name;
 } Theme;
 
 static const Theme g_themes[] = {
-    /* titanium — cool silver */
-    {{0.72f,0.72f,0.78f},{1.00f,1.00f,1.00f},
-     {1.00f,0.96f,0.88f},{0.22f,0.32f,0.80f},{0.82f,0.88f,1.00f},"titanium"},
-    /* solar — molten gold-orange */
-    {{0.95f,0.62f,0.08f},{1.00f,0.90f,0.55f},
-     {1.00f,0.90f,0.65f},{0.35f,0.12f,0.08f},{1.00f,0.55f,0.10f},"solar"},
-    /* cobalt — electric blue */
-    {{0.08f,0.32f,0.92f},{0.55f,0.75f,1.00f},
-     {0.78f,0.88f,1.00f},{0.04f,0.08f,0.55f},{0.28f,0.58f,1.00f},"cobalt"},
-    /* forest — deep organic green */
-    {{0.12f,0.58f,0.22f},{0.50f,1.00f,0.58f},
-     {0.68f,1.00f,0.50f},{0.04f,0.28f,0.42f},{0.15f,0.80f,0.35f},"forest"},
-    /* rose — warm pink-red */
-    {{0.90f,0.28f,0.48f},{1.00f,0.78f,0.82f},
-     {1.00f,0.85f,0.72f},{0.30f,0.05f,0.25f},{1.00f,0.35f,0.55f},"rose"},
-    /* chrome — high-contrast silver */
-    {{0.82f,0.82f,0.88f},{1.00f,1.00f,1.00f},
-     {1.00f,1.00f,1.00f},{0.15f,0.20f,0.50f},{0.92f,0.92f,1.00f},"chrome"},
+    /* === METALS (12) — spec hue MATCHES albedo, low diffuse_weight ===
+     * Real metals reflect nearly all incident light specularly. Their
+     * F0 (Fresnel at normal incidence) is what tints the highlight. */
+
+    /* gold     — warm yellow precious metal                            */
+    {{1.00f,0.77f,0.34f}, {1.00f,0.77f,0.34f}, {0.f,0.f,0.f}, 0.15f, "gold"},
+    /* silver   — bright cool precious metal, near-pure white           */
+    {{0.97f,0.96f,0.92f}, {0.97f,0.96f,0.92f}, {0.f,0.f,0.f}, 0.15f, "silver"},
+    /* copper   — warm orange-red metal                                 */
+    {{0.96f,0.64f,0.54f}, {0.96f,0.64f,0.54f}, {0.f,0.f,0.f}, 0.15f, "copper"},
+    /* bronze   — warm brown alloy (Cu+Sn)                              */
+    {{0.78f,0.55f,0.30f}, {0.78f,0.55f,0.30f}, {0.f,0.f,0.f}, 0.15f, "bronze"},
+    /* brass    — yellow-green alloy (Cu+Zn)                            */
+    {{0.85f,0.70f,0.25f}, {0.85f,0.70f,0.25f}, {0.f,0.f,0.f}, 0.15f, "brass"},
+    /* platinum — cool greyish-white precious metal                     */
+    {{0.83f,0.81f,0.78f}, {0.83f,0.81f,0.78f}, {0.f,0.f,0.f}, 0.15f, "platinum"},
+    /* titanium — dark silvery metal                                    */
+    {{0.62f,0.60f,0.55f}, {0.62f,0.60f,0.55f}, {0.f,0.f,0.f}, 0.15f, "titanium"},
+    /* iron     — neutral grey base metal                               */
+    {{0.56f,0.57f,0.58f}, {0.56f,0.57f,0.58f}, {0.f,0.f,0.f}, 0.15f, "iron"},
+    /* steel    — cool blue-grey alloy                                  */
+    {{0.65f,0.70f,0.78f}, {0.65f,0.70f,0.78f}, {0.f,0.f,0.f}, 0.15f, "steel"},
+    /* chrome   — mirror-bright cool metal                              */
+    {{0.92f,0.94f,0.96f}, {0.92f,0.94f,0.96f}, {0.f,0.f,0.f}, 0.15f, "chrome"},
+    /* mercury  — liquid silver                                         */
+    {{0.85f,0.85f,0.88f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.15f, "mercury"},
+    /* aluminum — pale neutral metal                                    */
+    {{0.91f,0.92f,0.92f}, {0.91f,0.92f,0.92f}, {0.f,0.f,0.f}, 0.15f, "aluminum"},
+
+    /* === GEMS (4) — saturated body + WHITE spec, mid diffuse_weight =
+     * Gems are dielectrics; their Fresnel reflectance is achromatic.
+     * Body colour comes from absorption inside the crystal. */
+
+    /* ruby     — red corundum (Cr-doped)                               */
+    {{0.85f,0.10f,0.18f}, {1.00f,0.95f,0.95f}, {0.f,0.f,0.f}, 0.70f, "ruby"},
+    /* emerald  — green beryl (Cr-doped)                                */
+    {{0.10f,0.70f,0.30f}, {0.95f,1.00f,0.95f}, {0.f,0.f,0.f}, 0.70f, "emerald"},
+    /* sapphire — blue corundum (Fe/Ti-doped)                           */
+    {{0.10f,0.30f,0.88f}, {0.95f,0.95f,1.00f}, {0.f,0.f,0.f}, 0.70f, "sapphire"},
+    /* amethyst — purple quartz                                         */
+    {{0.55f,0.30f,0.85f}, {1.00f,0.95f,1.00f}, {0.f,0.f,0.f}, 0.70f, "amethyst"},
+
+    /* === DIELECTRICS (3) — body colour + WHITE spec ===================
+     * Plastics, ceramics, and glass. F0 is achromatic (~4%); body
+     * colour comes from sub-surface absorption. */
+
+    /* plastic  — saturated blue plastic, full body colour              */
+    {{0.20f,0.40f,0.92f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.85f, "plastic"},
+    /* glass    — dark base + bright spec fakes transparency            */
+    {{0.10f,0.12f,0.16f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.10f, "glass"},
+    /* ceramic  — soft warm-cream porcelain                             */
+    {{0.92f,0.90f,0.85f}, {1.00f,0.98f,0.95f}, {0.f,0.f,0.f}, 0.85f, "ceramic"},
+
+    /* === EMISSIVE (1) — neon glow ====================================
+     * Neon plasma is self-emissive. The albedo is the dim "off" tube
+     * colour; the emissive value glows hot pink even in shadow because
+     * emissive is added AFTER lighting. */
+
+    /* neon     — hot pink/magenta self-glow                            */
+    {{0.05f,0.02f,0.10f}, {0.80f,0.80f,1.00f}, {1.00f,0.20f,0.85f}, 0.20f, "neon"},
 };
 #define THEME_N ((int)(sizeof g_themes / sizeof g_themes[0]))
 
@@ -583,34 +1035,72 @@ static inline float q_eval(float t, float A, float B, float C, float D)
 /* §5.2 ray_torus — derive coefficients + scan-bisect for smallest root */
 
 /*
- * ray_torus — analytic ray vs torus intersection.
+ * ray_torus — analytic ray vs torus intersection (T3, T4).
  *
- * Inputs:  ro, rd — ray in OBJECT space (torus stays in XZ plane)
- *          R, r_minor — torus major + minor radii
- * Output:  on hit, *t_hit = smallest positive t.
+ * Inputs:
+ *   ro, rd      ray in OBJECT space, rd unit-length
+ *   R           major radius (centreline circle)
+ *   r_minor     minor radius (tube cross-section)
+ * Output:
+ *   *t_hit      smallest positive t where the ray meets the torus
  * Returns: 1 on hit, 0 on miss.
  *
- * Algorithm:
- *   1. Compute the four quartic coefficients from the closed-form
- *      formulas (derived by substituting P = ro + t·rd into the torus
- *      equation and squaring to remove the radical).
- *   2. Scan q(t) at uniformly-spaced t-values starting from T_EPS.
- *      A sign change between consecutive samples brackets a root
- *      (intermediate value theorem applied to the continuous quartic).
- *   3. On the FIRST sign change, bisect inside that bracket Q_BISECT
- *      times to refine the root to ~10⁻¹² precision.
- *   4. Return that t — it's the smallest positive real root, hence
- *      the front-face hit.
+ * Pseudocode (mirrors body 1:1):
+ *   po2     = |ro|²                          common dot products
+ *   rod     = rd · ro
+ *   rxz²    = ro.x² + ro.z²                  in-plane projections
+ *   rdxz_d  = rd.x·ro.x + rd.z·ro.z
+ *   rdxz²   = rd.x² + rd.z²
+ *   C0      = po2 + R² − r²                  recurring constant
+ *   --- quartic coefficients (T3 derivation): ---
+ *   A = 4·rod
+ *   B = 4·rod² + 2·C0 − 4·R²·rdxz²
+ *   C = 4·rod·C0 − 8·R²·rdxz_d
+ *   D = C0² − 4·R²·rxz²
+ *   --- scan and bisect (T4): ---
+ *   dt = Q_T_MAX / Q_SAMPLES
+ *   t0 = ε;  f0 = q(t0)
+ *   for i = 1 .. Q_SAMPLES:
+ *     t1 = i·dt;  f1 = q(t1)
+ *     if f0 · f1 < 0:                        sign change → root in (t0, t1)
+ *       lo, hi, flo = t0, t1, f0
+ *       for j = 0 .. Q_BISECT-1:
+ *         mid = (lo + hi) / 2
+ *         fmid = q(mid)
+ *         if flo · fmid < 0: hi = mid
+ *         else:              lo = mid;  flo = fmid
+ *       *t_hit = (lo + hi) / 2
+ *       return 1
+ *     t0 = t1;  f0 = f1
+ *   return 0                                  no sign change → miss
+ *
+ * Mental model: q(t) is a smooth degree-4 polynomial. Real roots
+ * are points where q crosses zero. The sign-change test (f0·f1 < 0)
+ * is the intermediate value theorem in code: between a positive
+ * value and a negative value, a continuous function must cross
+ * zero. Bisection halves the bracket each iteration; after 40
+ * halvings we know the root to ~2⁻⁴⁰ ≈ 10⁻¹² of the original
+ * bracket — far below single-precision float resolution.
  *
  * Why scan-bisect and not Ferrari's closed-form quartic formula?
  *   Ferrari is mathematically beautiful (substitute u = t + A/4 to
- *   eliminate the cubic term, then solve a resolvent cubic, then take
- *   square roots) but NUMERICALLY UNSTABLE. Tangent rays and near-
- *   tangent rays produce coefficients where Ferrari's discriminant
- *   passes near zero — small input errors blow up into large output
- *   errors. The scan-bisect approach is slower (~300 ops vs ~50 for
- *   Ferrari) but completely stable: it never divides by anything
- *   that could be zero.
+ *   eliminate the cubic term, solve a resolvent cubic, take square
+ *   roots) but NUMERICALLY UNSTABLE. Tangent rays produce
+ *   coefficients where the discriminants pass near zero — small
+ *   input errors blow up into large output errors. Scan-bisect is
+ *   slower (~300 ops vs ~50 for Ferrari) but COMPLETELY STABLE:
+ *   it never divides by anything that could be zero.
+ *
+ * Edge cases:
+ *   - Tangent ray. q dips to zero without crossing. No sign change
+ *     in adjacent samples → missed (acceptable).
+ *   - Two roots within one Δt bin. Only the FIRST one is found.
+ *     With Q_SAMPLES = 256 and T_MAX = 18 m, Δt ≈ 0.07 m — much
+ *     smaller than the torus's diameter, so this only matters
+ *     near-tangent silhouettes.
+ *   - Camera inside the torus tube. Doesn't happen in our scene
+ *     (camera at z = -3.4, torus at origin); if it did, the first
+ *     positive root would still be the exit hit.
  */
 static int ray_torus(V3 ro, V3 rd, float R, float r_minor, float *t_hit)
 {
@@ -660,24 +1150,44 @@ static int ray_torus(V3 ro, V3 rd, float R, float r_minor, float *t_hit)
 /* §5.3 torus_normal — closest-point geometric formula ──────────────── */
 
 /*
- * Outward surface normal at a hit point P on a torus in the XZ plane.
+ * torus_normal — outward surface normal at a hit point P (T5).
  *
- * Geometric construction:
- *   1. Project P onto the XZ plane: P_xz = (P.x, 0, P.z)
- *   2. The closest point on the ring centreline lies along the same
- *      direction at distance R from origin: ring_pt = (R / |P_xz|) · P_xz
- *   3. Outward normal is the unit vector from ring_pt to P:
- *      N = normalize(P − ring_pt)
+ * Inputs:  P (object-space hit point), R (major radius)
+ * Returns: unit vector pointing outward from the torus surface
+ *
+ * Pseudocode (mirrors body 1:1):
+ *   P_xz    = (P.x, 0, P.z)                     drop Y component
+ *   ρ       = |P_xz|
+ *   ring_pt = (ρ > ε) ? (R/ρ) · P_xz : (R, 0, 0)  closest centreline point
+ *   return  norm(P − ring_pt)
+ *
+ * Mental model: the torus is a circle SWEPT by a tube of radius r.
+ * The outward normal at any point P on the tube points FROM the
+ * closest centreline point TO P. To find the closest centreline
+ * point, project P onto the XZ plane (drop Y) and rescale to
+ * length R — the resulting (R/|P_xz|)·P_xz is the centreline point
+ * at the same azimuth as P.
  *
  * Why this and not the implicit gradient?
  *   The gradient of f = (√(x²+z²)−R)² + y² − r² involves a 1/√(x²+z²)
- *   term that's expensive (sqrt + divide) and unstable when |P_xz| is
- *   small (near the Y axis — although that can't happen on the torus
- *   surface, only for the hole). The closest-point formula is one
- *   normalize per pixel; cleaner.
+ *   term — chain rule on a square root. Expensive (sqrt + divide)
+ *   and unstable when |P_xz| is small. The closest-point formula
+ *   needs ONE normalize per pixel and works at all hit points.
+ *
+ * Worked example: P = (0.96, 0, 0) (a point on the torus's outer
+ *   equator with R = 0.68, r = 0.28):
+ *     P_xz    = (0.96, 0, 0)
+ *     ρ       = 0.96
+ *     ring_pt = (0.68/0.96) · (0.96, 0, 0) = (0.68, 0, 0)
+ *     N       = norm((0.96 − 0.68, 0, 0)) = norm((0.28, 0, 0))
+ *             = (1, 0, 0)
+ *   ✓ The outer equator point's outward normal is +X — points away
+ *   from the Y axis, which is correct.
  *
  * Edge case |P_xz| ≈ 0: P is on the Y axis, which is INSIDE the
- * torus's hole — not on the surface. Defensive default (R, 0, 0).
+ * torus's hole — not on the surface. Defensive default (R, 0, 0)
+ * is unreachable in practice but keeps the code from dividing by
+ * zero in pathological inputs.
  */
 static V3 torus_normal(V3 P, float R)
 {
@@ -694,58 +1204,62 @@ static V3 torus_normal(V3 P, float R)
 typedef enum { MODE_PHONG=0, MODE_NORMAL, MODE_FRESNEL, MODE_DEPTH, MODE_N } ShadeMode;
 static const char *const k_mode_names[] = { "phong","normals","fresnel","depth" };
 
-/* Three fixed world-space lights — POSITIONS, not directions.
- * Per pixel we compute L = normalize(light_pos − P) so each light
- * direction depends on the hit point (point lights, not directional). */
-static const V3 L_KEY  = { 3.0f, 4.0f, -2.0f };   /* upper-right, warm */
-static const V3 L_FILL = {-4.0f, 1.5f, -1.0f };   /* upper-left,  cool */
-static const V3 L_RIM  = { 0.5f,-1.0f,  5.0f };   /* behind,    accent */
+/* Three fixed world-space lights — POSITIONS, not directions, all
+ * PURE WHITE. Per pixel we compute L = normalize(light_pos − P) so
+ * each light direction depends on the hit point (point lights, not
+ * directional). The lights have NO tint of their own — every visible
+ * colour comes from the material (Theme.albedo + Theme.specular). */
+static const V3 LIGHT_KEY  = { 3.0f, 4.0f, -2.0f };   /* upper-right    */
+static const V3 LIGHT_FILL = {-4.0f, 1.5f, -1.0f };   /* upper-left     */
+static const V3 LIGHT_RIM  = { 0.5f,-1.0f,  5.0f };   /* behind         */
 
-/* §6.1 ── KEY light: dominant warm diffuse + sharp specular ─────────── */
-
-static V3 light_key(V3 P, V3 N, V3 V_dir, const Theme *th)
-{
-    V3    L = v3norm(v3sub(L_KEY, P));
-    float d = fmaxf(0.f, v3dot(N, L));
-    V3    R = v3reflect(v3scale(-1.f, L), N);
-    float s = powf(fmaxf(0.f, v3dot(R, V_dir)), SHININESS);
-
-    V3 diff = v3scale(d * 0.65f, v3mul(th->obj, th->key_col));
-    V3 spec = v3scale(s * 0.55f, th->spec);
-    return v3add(diff, spec);
-}
-
-/* §6.2 ── FILL light: soft cool diffuse, no specular ────────────────── */
-
-static V3 light_fill(V3 P, V3 N, const Theme *th)
-{
-    V3    L = v3norm(v3sub(L_FILL, P));
-    float d = fmaxf(0.f, v3dot(N, L));
-    return v3scale(d * 0.22f, v3mul(th->obj, th->fill_col));
-}
-
-/* §6.3 ── RIM light: accent specular on the silhouette ──────────────── */
-
-static V3 light_rim(V3 P, V3 N, V3 V_dir, const Theme *th)
-{
-    V3    L = v3norm(v3sub(L_RIM, P));
-    float d = fmaxf(0.f, v3dot(N, L));
-    V3    R = v3reflect(v3scale(-1.f, L), N);
-    float s = powf(fmaxf(0.f, v3dot(R, V_dir)), 10.f);
-
-    V3 diff = v3scale(d * 0.18f, v3mul(th->obj, th->rim_col));
-    V3 spec = v3scale(s * 0.65f, th->rim_col);
-    return v3add(diff, spec);
-}
-
-/* §6.4 ── shade_phong: ambient + KEY + FILL + RIM ───────────────────── */
+/* §6.1 ── shade_phong: PBR-flavoured Phong (ambient + KEY + FILL + RIM)
+ *
+ * Per light:
+ *   diffuse  = max(0, N · L) * albedo * diffuse_weight * weight
+ *   specular = max(0, R · V)^SHININESS  *  Theme.specular * weight
+ *
+ * Metals have specular tinted to albedo (gold spec is yellow);
+ * dielectrics have specular ≈ white. The diffuse_weight scales the
+ * body contribution low for metals (≈0.15) and high for plastics
+ * (≈0.85), giving each material family its characteristic look under
+ * the same white lighting setup.
+ *
+ * Emissive is added LAST, after lighting, so neon glows even in
+ * shadow regions. ────────────────────────────────────────────────── */
 
 static V3 shade_phong(V3 P, V3 N, V3 V_dir, const Theme *th)
 {
-    V3 col = v3scale(AMBIENT, th->obj);
-    col = v3add(col, light_key (P, N, V_dir, th));
-    col = v3add(col, light_fill(P, N,        th));
-    col = v3add(col, light_rim (P, N, V_dir, th));
+    /* Ambient: dim version of body albedo. */
+    V3 col = v3scale(AMBIENT, th->albedo);
+
+    /* §6.1.1 KEY light — primary diffuse + sharp specular. */
+    {
+        V3    L = v3norm(v3sub(LIGHT_KEY, P));
+        float d = fmaxf(0.f, v3dot(N, L));
+        V3    R = v3reflect(v3scale(-1.f, L), N);
+        float s = powf(fmaxf(0.f, v3dot(R, V_dir)), SHININESS);
+        col = v3add(col, v3scale(d * th->diffuse_weight * 1.00f, th->albedo));
+        col = v3add(col, v3scale(s * 1.30f, th->specular));
+    }
+    /* §6.1.2 FILL light — soft diffuse, no specular. Lifts shadow side. */
+    {
+        V3    L = v3norm(v3sub(LIGHT_FILL, P));
+        float d = fmaxf(0.f, v3dot(N, L));
+        col = v3add(col, v3scale(d * th->diffuse_weight * 0.55f, th->albedo));
+    }
+    /* §6.1.3 RIM light — wide specular kissing the back silhouette. */
+    {
+        V3    L = v3norm(v3sub(LIGHT_RIM, P));
+        float d = fmaxf(0.f, v3dot(N, L));
+        V3    R = v3reflect(v3scale(-1.f, L), N);
+        float s = powf(fmaxf(0.f, v3dot(R, V_dir)), 10.f);
+        col = v3add(col, v3scale(d * th->diffuse_weight * 0.40f, th->albedo));
+        col = v3add(col, v3scale(s * 1.20f, th->specular));
+    }
+    /* §6.1.4 Emissive — added before clamp. Lets neon glow in shadow. */
+    col = v3add(col, th->emissive);
+
     return v3clamp1(col);
 }
 
@@ -778,8 +1292,8 @@ static V3 shade_fresnel(V3 N, V3 V_dir, const Theme *th)
     float cosA    = fabsf(v3dot(N, V_dir));
     float inv     = 1.f - cosA;
     float fresnel = inv * inv * inv * inv * inv;       /* (1−cosθ)^5 */
-    V3 core = v3scale(0.06f, th->obj);
-    V3 edge = v3clamp1(v3add(v3scale(0.7f, th->spec), v3scale(0.5f, th->rim_col)));
+    V3 core = v3scale(0.06f, th->albedo);
+    V3 edge = v3clamp1(v3scale(1.10f, th->specular));
     return v3clamp1(v3add(v3scale(1.f - fresnel, core), v3scale(fresnel, edge)));
 }
 
@@ -788,7 +1302,7 @@ static V3 shade_depth(float t, float t_max, const Theme *th)
 {
     float d = 1.f - fminf(t / t_max, 1.f);
     d = d * d;
-    return v3clamp1(v3scale(d, th->obj));
+    return v3clamp1(v3scale(d, th->albedo));
 }
 
 /* Rec. 601 luminance for ramp-index choice. */
@@ -907,7 +1421,7 @@ static void hud_draw(int cols, int rows, float fps,
 
     /* §8.2 top-left mode label row 0 — same yellow, no bold (secondary). */
     char buf2[48];
-    snprintf(buf2, sizeof buf2, " mode: %s ", k_mode_names[mode]);
+    snprintf(buf2, sizeof buf2, " mode:%-9s ", k_mode_names[mode]);
     attron(COLOR_PAIR(PAIR_HUD));
     mvprintw(0, 0, "%s", buf2);
     attroff(COLOR_PAIR(PAIR_HUD));

@@ -9,11 +9,13 @@
  *       atmosphere darkens its silhouette and a warm rim glows where
  *       sunlit edge meets space. The ring system disappears BEHIND
  *       the planet, the planet casts a SOFT SHADOW BAND across the
- *       far side, and where the sun sits BEHIND the ring (relative
- *       to the camera) the sparse ring sections GLOW from forward-
- *       scattered light — the famous Cassini "lit-from-behind" look.
- *       The sun orbits slowly so all of these effects sweep together
- *       around the scene.
+ *       far side, and the RINGS in turn cast their own shadow back —
+ *       parallel dim STREAKS across the planet's lit hemisphere,
+ *       brightest where the Cassini gap lets full sunlight through.
+ *       Where the sun sits BEHIND the ring (relative to the camera)
+ *       the sparse ring sections GLOW from forward-scattered light —
+ *       the famous Cassini "lit-from-behind" look. The sun orbits
+ *       slowly so all of these effects sweep together around the scene.
  *
  *       PATTERNS  (n / p):
  *         SATURN     banded cream planet, broad rings, Cassini gap
@@ -62,6 +64,55 @@
  *   gcc -std=c11 -O2 -Wall -Wextra raytracing/saturn_with_rings.c \
  *       -o saturn_with_rings -lncurses -lm
  */
+
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order as
+ *      prose before touching code.
+ *   2. §1 config — every constant has a unit-bearing comment, so a
+ *      glance is the fastest tour of what's tunable.
+ *   3. §8 raytrace primitives (ray_sphere, ray_ring, soft_shadow) —
+ *      read AFTER tutorials T2.
+ *   4. §9 shading (the heart of the file) — read AFTER tutorials
+ *      T3-T8. Each shader is a small layer; together they are the
+ *      six realism stages.
+ *   5. §11 render and §10 scene wire it all together. §5 themes is
+ *      pure data — skim.
+ *   6. §4 noise + §6 paint + §12/§13 are infrastructure; skip unless
+ *      curious.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   Long descriptive names everywhere. The file uses these:
+ *     ray_origin / ray_dir   the ray as (point, unit direction)
+ *     hit_planet / hit_ring  surface points on the two primitives
+ *     N / view_dir / sun_dir surface normal and light/view directions
+ *     NdotL / NdotV          dot products for shading math
+ *     albedo / sun_col       material × light (Lambertian setup)
+ *     density (rings)        radial × azimuthal × Cassini falloff
+ *
+ *   When a one-letter name appears it's a tight-loop index (`i`, `s`)
+ *   or a math symbol whose meaning is on the line above.
+ *
+ * Background you need
+ * ───────────────────
+ *   - 3-D vectors (dot, cross, normalise).
+ *   - The quadratic formula and what its discriminant means
+ *     geometrically (positive → two real roots → ray hits sphere).
+ *   - Lambertian diffuse: max(0, N · L) is the "fraction of incoming
+ *     light at this surface point".
+ *   - 6×6×6 RGB colour cube on xterm-256 (16 + 36·r + 6·g + b).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Recursive raytracing — every ray here is one bounce only.
+ *   - PDFs, importance sampling — soft shadow uses a small uniform
+ *     cone, that's it.
+ *   - Path tracing or Monte Carlo theory — see path_tracer.c for that.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
 
 /* ── CONCEPTS ──────────────────────────────────────────────────────────── *
  *
@@ -126,15 +177,18 @@
  *
  * CORE IDEA
  * ─────────
- * Two analytic primitives + four realism layers stacked on top.
+ * Two analytic primitives + six realism layers stacked on top.
  * The primitives (sphere + annulus) decide WHAT each pixel sees;
- * the four shading layers decide what COLOUR it should be:
+ * the six shading layers decide what COLOUR it should be:
  *
  *      LAMBERT          gives  light/dark hemispheres
  *      LIMB DARKENING   gives  spherical "fall-off" toward silhouette
  *      ATMOSPHERIC RIM  gives  warm glow on the sunlit edge
  *      FORWARD SCATTER  gives  rings glow when sun is behind them
  *      SOFT SHADOW      gives  ring shadow with a real penumbra
+ *      RING SHADOW      gives  dim streaks across the sunlit hemisphere
+ *                              of the planet, drawn by the ring's
+ *                              density (banding + Cassini gap visible)
  *
  * Each layer is a few lines of math added to the colour vector. None of
  * them require a new ray-trace; they're all derivable from quantities
@@ -208,10 +262,21 @@
  *     L   = normalize(sun_pos − P)         (or just sun_dir if directional)
  *     diffuse = max(0, N · L) · albedo · sun_colour
  *
- *   Limb darkening (atmospheric absorption at grazing angles):
+ *   Limb darkening (atmospheric absorption — applies to REFLECTED
+ *   light only, NOT to ambient/fill):
  *     NdotV = |N · view_dir|
  *     limb  = pow(NdotV, k)        k ≈ 0.5 (gentle), > 1 = aggressive
- *     col  *= limb
+ *     reflected = (diffuse + specular) · limb        ← only these
+ *     col       = ambient + fill + reflected         ← keep ambient/fill
+ *
+ *   Why only reflected light: limb darkening models atmosphere
+ *   absorbing light that bounces off the surface and travels to the
+ *   camera at grazing angles. Ambient + fill represent skylight
+ *   reaching the surface from many directions, so they don't depend
+ *   on the camera's outgoing path. Multiplying everything by limb
+ *   would make the silhouette go pitch-black; this form leaves the
+ *   ambient + fill intact at the edge so the silhouette has a
+ *   visible body colour before the rim glow takes over.
  *
  *   Atmospheric rim glow (warm glow on lit silhouette edge):
  *     if NdotV < RIM_WIDTH and NdotL > 0:
@@ -243,40 +308,52 @@
  *
  * WORKED EXAMPLE  (verify by hand)
  * ────────────────────────────────
- *   At a pixel near the lit equator on SATURN:
+ *   At a pixel near the lit equator on SATURN (current constants:
+ *   AMBIENT_K=0.18, FILL_K=0.40, SUN_ELEV_Y=0.45, LIMB_K=0.5):
  *     N        = (0.95, 0, 0.31)         (front-right of planet)
- *     sun_dir  = (1, 0.18, 0)            (right + slight up)
+ *     sun_dir  = (0.89, 0.45, 0)         (right + raised elevation)
  *     view_dir = (0, 0.22, -0.97)        (toward camera, slight down)
+ *     fill_dir = -sun_dir = (-0.89, -0.45, 0)
  *     albedo   = (0.95, 0.86, 0.65)      (cream)
  *     sun_col  = (1.0, 0.92, 0.78)       (warm white)
+ *     fill_col = (0.32, 0.42, 0.58)      (cool blue)
  *
- *     NdotL = 0.95·1 + 0·0.18 + 0.31·0          = 0.95
- *     NdotV = |0.95·0 + 0·0.22 + 0.31·(−0.97)|  = 0.30
+ *     NdotL = 0.95·0.89 + 0·0.45 + 0.31·0          = 0.846
+ *     NdotF = max(0, N·fill_dir)
+ *           = max(0, 0.95·(-0.89) + 0)              = 0    (back face)
+ *     NdotV = |0.95·0 + 0·0.22 + 0.31·(−0.97)|     = 0.301
  *
- *     limb        = pow(0.30, 0.5)       ≈ 0.55
- *     diffuse_RGB = albedo · NdotL · sun_col
- *                 = (0.95·0.95·1.0, 0.86·0.95·0.92, 0.65·0.95·0.78)
- *                 = (0.903, 0.752, 0.482)
- *     col_pre_limb = ambient(0.05·albedo) + diffuse
- *                  ≈ (0.95, 0.79, 0.51)
- *     col_after_limb = 0.55 · (0.95, 0.79, 0.51)
- *                    = (0.523, 0.435, 0.281)
+ *     limb        = pow(0.301, 0.5)                 ≈ 0.549
+ *     ambient     = albedo · 0.18
+ *                 ≈ (0.171, 0.155, 0.117)
+ *     diffuse_RGB = albedo · sun_col · NdotL
+ *                 = (0.95·1.0·0.846, 0.86·0.92·0.846, 0.65·0.78·0.846)
+ *                 ≈ (0.804, 0.669, 0.429)
+ *     fill_RGB    = albedo · fill_col · NdotF · 0.40 = 0  (NdotF=0 here)
+ *     specular    ≈ 0   (sun and view directions ≈ orthogonal here)
  *
- *     Rim?  NdotV=0.30 > 0.25 → no rim contribution at this pixel.
+ *     reflected   = (diffuse + specular) · limb
+ *                 ≈ (0.804, 0.669, 0.429) · 0.549
+ *                 ≈ (0.441, 0.367, 0.236)
+ *     col         = ambient + fill + reflected
+ *                 ≈ (0.612, 0.522, 0.353)
  *
- *     Reinhard:    (0.34, 0.30, 0.22)
- *     Gamma 2.2:   (0.61, 0.57, 0.49)
+ *     Rim?  NdotV=0.301 > 0.28 → no rim contribution at this pixel.
+ *
+ *     Reinhard:    (0.380, 0.343, 0.261)
+ *     Gamma 2.2:   (0.654, 0.622, 0.531)
  *
  *     6×6×6 quantise:
- *       r5=round(0.61·5)=3, g5=round(0.57·5)=3, b5=round(0.49·5)=2
- *       pair = 3·36 + 3·6 + 2 + 1 = 129  (a warm cream-gold)
+ *       r5=round(0.654·5)=3, g5=round(0.622·5)=3, b5=round(0.531·5)=3
+ *       pair = 3·36 + 3·6 + 3 + 1 = 130  (warm cream)
  *
- *     Luminance = 0.21·0.61 + 0.71·0.57 + 0.08·0.49 ≈ 0.57
- *     Ramp index = round(0.57 · 91) = 52 → glyph 'k'
+ *     Luminance = 0.21·0.654 + 0.72·0.622 + 0.07·0.531 ≈ 0.624
+ *     Ramp index = round(0.624 · 91) = 57 → glyph 'Z'
  *
- *   So this pixel paints the character 'k' in cube-pair 129. Now move
- *   one pixel toward the silhouette: NdotV drops, limb falls, the
- *   rim term might kick in, and the colour shifts toward warm orange.
+ *   Now move one pixel toward the silhouette: NdotV drops below 0.28,
+ *   the rim term kicks in, ambient + fill survive (limb only attenuates
+ *   diffuse + specular), and the silhouette retains a faint cream body
+ *   colour before the warm rim glow overlays it.
  *
  * EDGE CASES TO WATCH
  * ───────────────────
@@ -299,6 +376,17 @@
  *  • CASSINI GAP IS SMOOTH. The old code used a hard `< CASSINI_W`
  *    test; we now use a smoothstep-shaped dip so the gap edges
  *    don't pixel-step.
+ *  • RING SHADOW SAME-SIDE GUARD. ring_transmittance returns 1.0
+ *    (no shadow) when sun and planet hit point are on the SAME side
+ *    of the ring plane (sun_dir.y · P.y >= 0). Without this guard,
+ *    the chord toward the sun never crosses the ring plane in
+ *    forward t and the shadow streaks would be wrong (or appear on
+ *    the wrong hemisphere).
+ *  • RING SHADOW MULTIPLIES DIRECT-SUN ONLY. Diffuse + specular +
+ *    rim get multiplied by ring_transmittance; ambient + fill do
+ *    NOT (they're skylight, not direct sun). Multiplying everything
+ *    would over-darken the streaks and lose the sense of an
+ *    ambient-lit planet with sharp shadow lines drawn across it.
  *
  * HOW TO VERIFY
  * ─────────────
@@ -318,11 +406,433 @@
  *    mentally) — the shadow's edge is GRADIENT, not stair-step. As
  *    the sun rotates, the shadow band sweeps with a soft leading
  *    edge.
+ *  • RING SHADOW STREAKS. Cycle to the SATURN pattern (which has the
+ *    Cassini gap) and pause when the sun is roughly OFF-AXIS but
+ *    still on the camera-side of the rings. The lit hemisphere of
+ *    the planet should show parallel dim BANDS — the projection of
+ *    the ring's density profile along the sun direction. The CASSINI
+ *    GAP appears as a brighter STRIPE in the middle of those bands
+ *    (where ring density is near zero, light passes freely). As the
+ *    sun rotates, the streaks sweep across the planet.
  *  • SUB-PIXEL AA. Press 's' to cycle SPP=1/2/4. SPP=1 should show
  *    visible jaggies on the planet silhouette; SPP=2/4 should smooth
  *    them out.
  *
  * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ * Eleven short tutorials that build the renderer from first principles.
+ * Read in order; each builds on the previous.
+ *
+ *   T1  Two primitives + six layers — the pedagogical handle
+ *   T2  Ray-sphere + ray-annulus intersection
+ *   T3  Layer 1: Three-light Lambertian shading (sun + fill + ambient)
+ *   T4  Layer 2: Limb darkening — and why it applies only to
+ *               REFLECTED light (the "atmospheric absorption" subtlety)
+ *   T5  Layer 3: Atmospheric rim glow at the lit silhouette
+ *   T6  Layer 4: Forward-scatter ring glow (Cassini's lit-from-behind)
+ *   T7  Layer 5: Soft shadows — planet on rings via cone-jittered samples
+ *   T8  Layer 6: Ring shadows — rings on planet via chord-to-sun
+ *   T9  Surface texture — bands, continents, smooth Cassini gap
+ *   T10 Continuous-RGB pipeline → 6×6×6 cube + 92-char ramp
+ *   T11 Three shade modes — LIT vs FLAT vs NORMAL as debug overlays
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  TWO PRIMITIVES + SIX LAYERS — THE PEDAGOGICAL HANDLE
+ * ────────────────────────────────────────────────────────
+ * Most "ringed planet" demos look complicated. This one isn't —
+ * it's two analytic intersections plus six INDEPENDENT shading
+ * layers. Each layer is a few lines of math; together they give
+ * the photorealistic look.
+ *
+ * Two primitives:
+ *   1. SPHERE       the planet (one ray-quadratic per pixel)
+ *   2. ANNULUS      the rings (one ray-plane test, then radial
+ *                   bound check between r_in and r_out)
+ *
+ * Six additive shading layers (per pixel of either primitive):
+ *   1. LAMBERT          three-light setup (sun + fill + ambient)
+ *   2. LIMB DARKENING   spherical brightness fall-off near silhouette
+ *   3. ATMOSPHERIC RIM  warm halo at the lit edge of the silhouette
+ *   4. FORWARD SCATTER  rings glow when sun is behind them
+ *   5. SOFT SHADOW      planet's shadow on rings has real penumbra
+ *   6. RING SHADOW      rings cast streak-shadows on planet's lit side
+ *
+ * Layers 1-4 derive from quantities the primary intersection already
+ * gave us (N, P, sun_dir, view_dir) — no extra rays. Layer 5 needs
+ * N=8 cheap sphere tests per ring pixel for penumbra. Layer 6 is the
+ * symmetric counterpart of layer 5: from each PLANET hit point, one
+ * cheap ray-plane crossing + ring-density lookup tells us how much
+ * sunlight is occluded by the rings (no extra full ray trace).
+ *
+ * Layers 5 and 6 are PHYSICALLY DUAL: planet-occludes-sun-from-rings
+ * (shadow band on rings) and rings-occlude-sun-from-planet (shadow
+ * streaks on planet), respectively. Real Saturn imagery shows BOTH
+ * — the file's pedagogical spine wouldn't be complete without it.
+ *
+ * The "two primitives + six layers" framing is the file's reading
+ * key: each tutorial T2-T8 covers one of these pieces in isolation.
+ * Once you understand each piece, putting them together is bookkeeping.
+ *
+ * T2  RAY-SPHERE + RAY-ANNULUS INTERSECTION
+ * ──────────────────────────────────────────
+ * RAY-SPHERE — textbook quadratic. Substitute the parametric ray
+ * |O + t·D − C|² = r² and expand:
+ *
+ *     t² + 2·b·t + c = 0,    b = D·(O−C), c = |O−C|² − r²
+ *     disc = b² − c
+ *     if disc < 0: MISS
+ *     t = −b − √disc   (front face)
+ *
+ * Read §8.1 ray_sphere — that IS this algebra in code.
+ *
+ * RAY-ANNULUS — even simpler. The rings are a flat disc in the
+ * plane y=0, clipped to two radii r_in ≤ r ≤ r_out:
+ *
+ *     1. Skip if ray is parallel to the plane (|D.y| < ε).
+ *     2. Find t where the ray crosses y=0:    t = −O.y / D.y
+ *     3. If t < 0:                            MISS (behind camera).
+ *     4. Compute hit point  P = O + t·D
+ *        and its 2-D radius r = √(P.x² + P.z²).
+ *     5. If r < r_in or r > r_out:            MISS (inside hole or
+ *                                              outside outer rim).
+ *     6. Otherwise: HIT.
+ *
+ * Read §8.2 ray_ring — six lines of code; that's the entire ring
+ * geometry. The fancy stuff (density profile, Cassini gap, bands,
+ * forward scatter, soft shadow) is all SHADING layered on top of
+ * this trivially-cheap intersection.
+ *
+ * T3  LAYER 1: THREE-LIGHT LAMBERTIAN SHADING
+ * ────────────────────────────────────────────
+ * For a Lambertian surface, the incoming-radiance integral
+ * collapses to:
+ *
+ *     L_o = albedo · (ambient + diffuse_lights)
+ *
+ * Three lights here:
+ *
+ *   AMBIENT        constant fraction of albedo
+ *                  ambient = AMBIENT_K · albedo
+ *                  Models indirect light reaching the surface from
+ *                  every direction. Without this, the dark hemisphere
+ *                  goes pitch-black.
+ *
+ *   SUN (KEY)      directional Lambertian
+ *                  diffuse = max(0, N · sun_dir) · albedo · sun_col
+ *                  Standard Lambert. The sun's WARM tint biases the
+ *                  lit hemisphere toward orange-cream.
+ *
+ *   FILL (COOL)    fake-sky from the OPPOSITE direction
+ *                  fill_dir = -sun_dir
+ *                  fill = max(0, N · fill_dir) · FILL_K · albedo · fill_col
+ *                  Models bluish skylight reaching the dark side.
+ *                  Without this, the dark hemisphere reads as a flat
+ *                  ambient blob; the cool fill differentiates the
+ *                  shadow side from the deep-space background.
+ *
+ * Three-light setup (KEY warm + FILL cool + AMBIENT) is the
+ * cinematic standard — same convention as portrait photography.
+ *
+ * Read §9.2 shade_planet → ambient + diffuse + fill blocks.
+ *
+ * T4  LAYER 2: LIMB DARKENING — REFLECTED-ONLY ATTENUATION
+ * ─────────────────────────────────────────────────────────
+ * Look at any photo of the Sun, Saturn, or Mars: the disc is
+ * BRIGHTER in the centre and DARKER at the edge. This is LIMB
+ * DARKENING, and physically it's atmospheric absorption: light
+ * reflected at grazing angles travels through more atmosphere on
+ * its way out to the camera, so more gets absorbed.
+ *
+ * Math: parameterise by NdotV = |N · view_dir|.
+ *   NdotV = 1 at the disc CENTRE  (camera looks straight in)
+ *   NdotV = 0 at the SILHOUETTE   (camera looks along the surface)
+ *
+ *     limb = pow(NdotV, k),    k ≈ 0.5  (gentle, square-root curve)
+ *
+ * Subtle but important: which contributions does limb darkening
+ * APPLY to?
+ *
+ *   ✗ WRONG   `col *= limb` for everything → silhouette goes BLACK
+ *             (limb=0 at NdotV=0 wipes ambient + fill too)
+ *
+ *   ✓ RIGHT   `col = ambient + fill + (diffuse + specular) · limb`
+ *             reflected light gets attenuated, ambient + fill survive
+ *
+ * Why "reflected only": atmospheric absorption depends on the
+ * OUTGOING path (surface to camera). Diffuse and specular are
+ * reflected light bouncing OUT toward the camera — they take that
+ * path. Ambient and fill represent skylight reaching the surface
+ * from MANY directions — they don't depend on the outgoing path.
+ *
+ * Visual consequence: with the wrong formulation the silhouette
+ * goes pitch-black and the planet looks like it has a black
+ * outline. With the right formulation, the silhouette retains a
+ * faint body colour from ambient + fill, and the rim glow then
+ * overlays the lit edge naturally.
+ *
+ * Read §9.2 shade_planet for this version.
+ *
+ * T5  LAYER 3: ATMOSPHERIC RIM GLOW
+ * ──────────────────────────────────
+ * On Saturn or Earth photographs, the LIT silhouette has a warm
+ * orange-gold halo. That's atmospheric scattering — when sunlight
+ * grazes the atmosphere tangentially (relative to the camera),
+ * Rayleigh-scattered red wavelengths travel toward the camera at
+ * the silhouette.
+ *
+ * We approximate the effect with a triangular falloff cone:
+ *
+ *     if NdotV < RIM_WIDTH and NdotL > 0:
+ *       t = 1 − NdotV / RIM_WIDTH        ← 1 at silhouette, 0 inside
+ *       rim = t² · NdotL · RIM_STRENGTH
+ *       col += rim · WARM_RIM_TINT
+ *
+ * Two gates:
+ *   - NdotV < RIM_WIDTH    only near the silhouette
+ *   - NdotL > 0            only on the LIT half (a halo on the dark
+ *                          half would just be a fake aura)
+ *
+ * The squared-t gives a smooth falloff: at the very edge (t=1)
+ * the rim is FULL strength × NdotL; a few cells inside (t=0.5)
+ * it's a quarter strength; well inside (t=0) it's zero.
+ *
+ * Read §9.1 atmospheric_rim — five lines of code, instantly
+ * recognisable visual feature.
+ *
+ * T6  LAYER 4: FORWARD-SCATTER RING GLOW
+ * ───────────────────────────────────────
+ * The famous Cassini "lit-from-behind" Saturn photographs show the
+ * RING SECTIONS BETWEEN THE SUN AND THE CAMERA glowing brightly,
+ * even where the rings are sparse (Cassini gap). Why?
+ *
+ * Ring particles are mostly transparent ice. When the sun is
+ * BEHIND the ring (relative to the camera), light reaches the
+ * camera by scattering FORWARD through the dust — same physics as
+ * sunbeams in a misty room. SPARSE ring sections (low density) let
+ * MORE light through; that's why the Cassini gap actually looks
+ * BRIGHTER than the dense main bands when backlit.
+ *
+ * Pseudocode (matches §9.3 shade_ring):
+ *
+ *     backlight = max(0, -sun_dir · view_dir)        ← 1 if sun
+ *                                                       OPPOSITE camera
+ *     glow = backlight^GLOW_SHARP · (1 - density) · GLOW_GAIN
+ *     col += glow · sun_col
+ *
+ * Two key ideas:
+ *   - backlight is non-zero ONLY when the sun is roughly opposite
+ *     the camera (sun-behind-rings configuration).
+ *   - (1 - density) means SPARSE sections scatter more — the
+ *     Cassini gap glows BRIGHTEST when backlit.
+ *
+ * GLOW_SHARP ≈ 3 makes the falloff steep (only a narrow angular
+ * range gets the glow). GLOW_GAIN sets peak brightness.
+ *
+ * Visual: pause and watch the sun rotate slowly. About every 30
+ * seconds (one ROTATION_PERIOD_S) the glow sweeps across the rings
+ * — most dramatic when the sun is roughly behind the planet from
+ * the camera's POV.
+ *
+ * T7  LAYER 5: SOFT SHADOWS ON RINGS VIA CONE JITTER
+ * ───────────────────────────────────────────────────
+ * The planet casts a shadow band on the rings. A naïve test —
+ * "shoot one ray from ring point P toward the sun; if blocked by
+ * the planet, this point is shadowed" — gives a HARD-EDGED
+ * shadow. Real shadows have penumbra because the sun is a SMALL
+ * DISC, not a point.
+ *
+ *      ┌──── sun (disc) ────┐
+ *       ╲     ╲    ╲    ╱   ╱     ← rays from POINT P fan out across
+ *        ╲     ╲    ╲  ╱   ╱        the sun's ANGULAR SIZE
+ *         ╲     ╲    ╲╱   ╱
+ *          ╲     ╲   ●   ╱        ● = planet (some rays are blocked,
+ *           ╲     ╲     ╱             some pass freely)
+ *            ╲     ╲   ╱
+ *             ╲     ╲ ╱
+ *              ╲     P            P = ring sample point
+ *
+ *  N samples in the cone:
+ *    n_lit = 0
+ *    for i = 0 .. N − 1:
+ *      offset_i = uniform_disc_2d() · SUN_ANGULAR_RADIUS
+ *      sample_dir = normalize(sun_dir + tangent_basis · offset_i)
+ *      if not sphere_hit(P, sample_dir): n_lit++
+ *    soft = n_lit / N                              ∈ [0, 1]
+ *
+ * `tangent_basis` is two perpendicular vectors orthogonal to
+ * sun_dir — they span the disc the sun's angular radius traces.
+ *
+ * Result: 0 (fully shadowed) → 1 (fully lit) with a SMOOTH
+ * gradient over the penumbra width.
+ *
+ * Critical detail: the jitter sequence must be DETERMINISTIC for
+ * each pixel and frame. We hash (sx, sy, frame) to seed the
+ * sample offsets. Without that, the penumbra "boils" frame to
+ * frame as random noise rolls through it.
+ *
+ * Cost: SOFT_SHADOW_SAMPLES = 8 sphere tests per ring pixel. Linear
+ * in N; an obvious knob if you need more performance.
+ *
+ * Read §8.4 soft_shadow.
+ *
+ * T8  LAYER 6: RING SHADOWS — RINGS ON PLANET VIA CHORD-TO-SUN
+ * ─────────────────────────────────────────────────────────────
+ * The dual of layer 5. Layer 5 said: "planet blocks the sun from
+ * ring points → ring has a soft shadow band". Layer 6 is the
+ * symmetric statement: "rings block the sun from planet points →
+ * planet's lit hemisphere has dim STREAKS where the ring's bands
+ * sit between it and the sun".
+ *
+ * Real Saturn imagery (Cassini probe shots, March 2006) shows this
+ * clearly: parallel dark bands streaking across the lit cloud
+ * tops, brightest at the latitudes farthest from the ring shadow,
+ * darkest where the dense B ring sits between sun and planet, and
+ * with a brighter STRIPE at the latitude where the Cassini gap
+ * lets full sunlight through. The shadow streak is literally a
+ * projection of the ring density profile onto the planet's surface
+ * along the sun direction.
+ *
+ *      ☀ sun
+ *        ╲
+ *         ╲
+ *      ════╪═══   ← ring annulus (y = 0)
+ *           ╲╲     ← chord from sun, intercepted by ring
+ *            ╲╲
+ *             ╲╲
+ *              ●  ← planet hit point P (y < 0, below ring plane)
+ *              │
+ *           shadow
+ *           streak
+ *
+ * Geometric question: from planet point P, follow the chord toward
+ * the sun. Where does it cross the ring plane (y = 0)? If that
+ * crossing is INSIDE the annulus, the ring blocks part of the sun;
+ * the planet's diffuse + specular at P should be multiplied by
+ * (1 - ring_density_at_crossing).
+ *
+ *   Pseudocode:
+ *     if sun_dir.y · P.y >= 0:    sun on same side as P → no shadow
+ *     t = -P.y / sun_dir.y                       chord travel to plane
+ *     if t < ε:                   ring plane is behind us → no shadow
+ *     crossing = P + t · sun_dir
+ *     r = sqrt(crossing.x² + crossing.z²)
+ *     if r outside [r_in, r_out]: chord misses annulus → no shadow
+ *     density = ring_density_at(r, θ)            same formula as the
+ *                                                visible ring (§9.3a)
+ *     ring_through = 1 − density                 ∈ [0, 1]
+ *
+ * Then in shade_planet (§9.2):
+ *
+ *     diffuse  *= ring_through
+ *     specular *= ring_through
+ *     rim      *= ring_through                   (rim is direct sun too)
+ *     ambient + fill UNTOUCHED                   (those are skylight)
+ *
+ * Why ambient + fill aren't multiplied: those represent diffuse sky
+ * radiance reaching P from MANY directions, not the single chord
+ * blocked by the rings. Multiplying them would over-darken the
+ * shadow streaks and lose the sense of a still-illuminated planet
+ * with sharp shadow lines drawn across it.
+ *
+ * Cost: ONE ray-plane crossing + ONE density lookup per planet
+ * pixel. Cheaper than layer 5 (which costs N=8 sphere tests per
+ * ring pixel). The shadow's quality matches the ring's density
+ * formula automatically — Cassini gap shows up as a brighter stripe
+ * in the shadow streaks because density there is close to zero.
+ *
+ * Read §9.3a ring_density_at + §9.3b ring_transmittance.
+ *
+ * T9  SURFACE TEXTURE — BANDS, CONTINENTS, SMOOTH CASSINI GAP
+ * ────────────────────────────────────────────────────────────
+ * The shading we've described so far gives a solid sphere with no
+ * surface detail. Three texture layers add believability:
+ *
+ *   LATITUDE BANDS  modulate albedo by sin(N.y · band_freq + phase).
+ *                   On Saturn this is the cream/gold-stripe pattern;
+ *                   on Uranus it's the faint blue stratification.
+ *                   Frequency and amplitude per pattern.
+ *
+ *   CONTINENTS      EARTH-R only. Map (longitude, latitude) using
+ *                   atan2(N.x, N.z) and N.y, then sample fBm noise.
+ *                   Threshold > 0.55 → land, else sea.
+ *                   Phase animates so the planet appears to rotate.
+ *
+ *   CASSINI GAP     Saturn only. A dip in ring density at radius
+ *                   ≈ 2.10. We use SMOOTHSTEP, not a hard threshold:
+ *                     gap = smoothstep(0, w, |r − cassini_r|)
+ *                     density *= CASSINI_DIM + (1 − CASSINI_DIM)·gap
+ *                   gap=0 INSIDE the dip → density·0.18 (dim).
+ *                   gap=1 OUTSIDE      → density·1.0 (full).
+ *                   The smoothstep curve avoids hard pixel-step at the
+ *                   gap edges.
+ *
+ * Read §9.2 (continents + bands) and §9.3 (Cassini smoothstep).
+ *
+ * T10 CONTINUOUS-RGB PIPELINE → 6×6×6 CUBE + 92-CHAR RAMP
+ * ────────────────────────────────────────────────────────
+ * The naïve approach: tint each shader output with one of N preset
+ * colour-pair indices, switch between them. That's BANDED — smooth
+ * gradients show obvious stripes between palette entries.
+ *
+ * Better: do all colour math in CONTINUOUS RGB (3 floats), tone-
+ * map + gamma, THEN quantise to a uniform 6×6×6 RGB cube at draw
+ * time. Same approach as `path_tracer.c` and `god_rays_silhouette.c`.
+ *
+ *   1. Per-pixel shading produces an HDR linear RGB triplet.
+ *   2. Reinhard tone-map per channel:  L' = L / (1 + L)
+ *      Compresses [0, ∞) into [0, 1) without saturation.
+ *   3. Gamma encode 1/2.2: brightens midtones perceptually.
+ *   4. Quantise each channel to {0..5}: 6 levels per axis = 216 cube.
+ *   5. Pair index = 16 + 36·R5 + 6·G5 + B5  (xterm cube convention).
+ *   6. Density character = Rec.601 luma → ramp[index] in 92-char ramp.
+ *   7. A_BOLD on luma > 0.85, A_DIM on luma < 0.15.
+ *
+ * Tone-mapping BEFORE quantisation is critical (T7 in
+ * path_tracer.c covers this in detail). Quantising linear HDR
+ * puts every pixel above ~0.85 into the same cube cell — no
+ * headroom for the sun, the rim glow, the forward-scatter glow.
+ * Reinhard spreads the dynamic range over the full cube uniformly.
+ *
+ * Read §6 paint_cell.
+ *
+ * T11 THREE SHADE MODES — LIT VS FLAT VS NORMAL
+ * ──────────────────────────────────────────────
+ * Cycling `m` switches between three shading modes. Each is a
+ * different pedagogical lens on the same scene:
+ *
+ *   LIT       The full pipeline (default). All six shading layers
+ *             active. Use this to admire the result.
+ *   FLAT      Raw albedo only — no lighting, no rim, no glow, no
+ *             shadow. Bands and continents still appear (they're
+ *             surface colour, not lighting). Use this to inspect
+ *             the texture WITHOUT shading effects. "What does the
+ *             planet look like under perfectly diffuse light from
+ *             every direction?"
+ *   NORMAL    RGB-encoded surface normal: N → (N+1)/2. Each
+ *             component remapped from [-1, +1] → [0, 1] so RGB
+ *             channels visualise N.x, N.y, N.z.
+ *             For the rings (which are flat in y=0) we substitute
+ *             (cosθ, density, sinθ) instead — flat green would tell
+ *             us nothing; this maps theta around the annulus to a
+ *             rainbow hue and density to brightness.
+ *             Diagnostic mode: a correct sphere intersection produces
+ *             smooth radial gradients; a correct ring produces a
+ *             rainbow donut.
+ *
+ * The two debug modes converge in ONE FRAME because no randomness
+ * is involved (NORMAL/FLAT don't call soft_shadow). Switching INTO
+ * them is instant; switching back to LIT shows the noise smooth
+ * out over a few frames as soft-shadow jitter averages.
+ *
+ * Pedagogical contrast:
+ *   FLAT    → "this is what the materials assert their colour is"
+ *   NORMAL  → "this is what the geometry pipeline gives us"
+ *   LIT     → "this is the result of all six shading layers"
+ *
+ * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -377,18 +887,18 @@ enum {
 
 /* §1.4 sun motion */
 #define ROTATION_PERIOD_S     30.0f
-#define SUN_ELEV_Y            0.18f
+#define SUN_ELEV_Y            0.45f       /* sun elevation; raise for brighter rings */
 
 /* §1.5 shading constants */
-#define AMBIENT_K             0.06f       /* fraction of albedo as ambient   */
-#define FILL_K                0.18f       /* cool fill light strength        */
+#define AMBIENT_K             0.18f       /* fraction of albedo as ambient   */
+#define FILL_K                0.40f       /* cool fill light strength        */
 #define SPEC_SHININESS        24.0f
 #define SPEC_K                0.40f       /* specular gain on planet         */
 #define LIMB_K                0.50f       /* limb-darkening exponent         */
 #define RIM_WIDTH             0.28f       /* atmosphere rim cone half-width  */
 #define RIM_STRENGTH          0.85f       /* rim brightness multiplier       */
 #define GLOW_SHARP            3.0f        /* forward-scatter exponent        */
-#define GLOW_GAIN             0.85f       /* forward-scatter brightness      */
+#define GLOW_GAIN             1.20f       /* forward-scatter brightness      */
 
 /* §1.6 soft shadow on rings */
 #define SOFT_SHADOW_SAMPLES   8
@@ -429,7 +939,7 @@ static const char *shade_mode_name(ShadeMode m)
 }
 
 /* §1.8 stars */
-#define STAR_DENSITY          280
+#define STAR_DENSITY          180
 #define STAR_TWINKLE_HZ       0.4f
 
 /* §1.9 ncurses pair IDs */
@@ -796,6 +1306,28 @@ typedef struct {
 
 /* §8.1 ── ray-sphere ──────────────────────────────────────────────── */
 
+/*
+ * ray_sphere — analytic intersection via the textbook quadratic.
+ *
+ * Setup: |O + t·D − C|² = r². With unit-length ray direction D this
+ * expands to t² + 2·b·t + c = 0 where:
+ *
+ *     b = D · (O − C)
+ *     c = |O − C|² − r²
+ *
+ * Discriminant disc = b² − c. Roots t = −b ± √disc.
+ *
+ * We pick the nearest root that's beyond a small epsilon (front face
+ * for an outside ray; far root only if the ray STARTS inside the
+ * sphere — can't happen for the planet's primary view ray, but the
+ * logic is here for safety).
+ *
+ * Inputs : ray_origin, ray_dir   (unit-length), centre, radius.
+ * Output : *out_t = first valid t > ε.
+ * Returns: true on hit, false on miss (disc < 0 or all t ≤ ε).
+ *
+ * See tutorial T2.
+ */
 static bool ray_sphere(V3 ro, V3 rd, V3 center, float r, float *out_t)
 {
     V3    oc   = v3_sub(ro, center);
@@ -813,6 +1345,29 @@ static bool ray_sphere(V3 ro, V3 rd, V3 center, float r, float *out_t)
 
 /* §8.2 ── ray-ring (plane y=0 clipped to annulus) ─────────────────── */
 
+/*
+ * ray_ring — analytic intersection of a ray with a flat annulus in
+ *            the plane y=0, clipped to inner/outer radii.
+ *
+ * Pseudocode:
+ *   1. If |ray_dir.y| < ε:   parallel to plane → MISS.
+ *   2. t = -ray_origin.y / ray_dir.y           (where ray crosses y=0)
+ *   3. If t < ε:             behind camera → MISS.
+ *   4. hit = ray_origin + t · ray_dir
+ *   5. r² = hit.x² + hit.z²                    (squared 2-D radius)
+ *   6. If r² < r_in² or r² > r_out²:           outside annulus → MISS.
+ *   7. Otherwise: HIT, write *out_t and *out_hit.
+ *
+ * The squared-radius bound check avoids a sqrt; it's algebraically
+ * equivalent to comparing r against r_in and r_out.
+ *
+ * The annulus spans [r_in, r_out] on the y=0 plane — that's the
+ * entire ring system geometry. Density profile, Cassini gap, bands,
+ * forward scatter, and soft shadow are all SHADING applied on top of
+ * this trivially cheap intersection (§9.3 shade_ring).
+ *
+ * See tutorial T2.
+ */
 static bool ray_ring(V3 ro, V3 rd, float r_in, float r_out,
                      float *out_t, V3 *out_hit)
 {
@@ -907,6 +1462,12 @@ static V3 atmospheric_rim(float NdotV, float NdotL, V3 rim_col)
     return v3_scl(rim_col, rim);
 }
 
+/* Forward declarations for ring helpers used below (defined in §9.3a/b). */
+static float ring_density_at  (float r, float theta,
+                               const PatternParams *pp, float seed_phase);
+static float ring_transmittance(V3 P, V3 sun_dir,
+                                const PatternParams *pp, float seed_phase);
+
 /* §9.2 ── shade_planet ───────────────────────────────────────────────── */
 
 /*
@@ -971,24 +1532,129 @@ static V3 shade_planet(const Theme *th, const PatternParams *pp,
     V3 fill     = v3_scl(v3_mul(albedo, th->fill_col), NdotF * FILL_K);
     V3 specular = v3_scl(th->spec_col, spec * SPEC_K);
 
-    V3 col = v3_add(ambient, v3_add(diffuse, v3_add(fill, specular)));
+    /* LAYER 6 (T8) — RINGS CAST SHADOW ON PLANET.
+     *
+     * From the planet hit point, the chord to the sun may pass through
+     * the ring annulus. If it does, the planet sees a dimmer sun:
+     * direct-sun components (diffuse, specular, atmospheric rim) get
+     * multiplied by the ring transmittance. Ambient and fill are
+     * skylight, not direct sun, so they're NOT multiplied. */
+    float ring_through = ring_transmittance(hit, sun_dir, pp, seed_phase);
+    diffuse  = v3_scl(diffuse,  ring_through);
+    specular = v3_scl(specular, ring_through);
 
-    /* Limb darkening — multiply the disc colour by atmosphere thickness. */
-    col = v3_scl(col, limb_darken(NdotV));
+    /* Limb darkening — apply ONLY to the reflected components (diffuse +
+     * specular). Physically, limb darkening models atmosphere absorbing
+     * light that REFLECTS off the surface as it travels to the camera at
+     * grazing angles. Ambient and fill represent skylight reaching the
+     * surface from any direction, independent of the outgoing path —
+     * those should NOT be attenuated. Multiplying everything (the older
+     * formulation) made the silhouette go pitch-black; this form lets
+     * ambient + fill survive at the edge so the silhouette has a visible
+     * body colour before the rim glow takes over. */
+    float limb = limb_darken(NdotV);
+    V3 atmo_attenuated = v3_scl(v3_add(diffuse, specular), limb);
+    V3 col = v3_add(v3_add(ambient, fill), atmo_attenuated);
 
-    /* Atmospheric rim — additive warm halo on lit silhouette edge. */
-    col = v3_add(col, atmospheric_rim(NdotV, NdotL, th->rim_col));
+    /* Atmospheric rim — additive warm halo on lit silhouette edge.
+     * Also dimmed by ring_through (the rim is direct sun scattered
+     * tangentially through the atmosphere — same source as diffuse). */
+    V3 rim = atmospheric_rim(NdotV, NdotL, th->rim_col);
+    col = v3_add(col, v3_scl(rim, ring_through));
 
     return col;
+}
+
+/* §9.3a ── ring_density_at (single source of truth) ──────────────── */
+
+/*
+ * Smooth ring density at polar coords (r, θ) on the ring plane. ∈ [0,1].
+ *   r ∈ [0, ∞)        radial distance from planet centre
+ *   θ ∈ [-π, π]       azimuth around the ring
+ *
+ * Composes three profiles:
+ *   1. Soft radial edges    — annulus fades over 0.04 m at r_in / r_out
+ *                              instead of cutting hard at the boundary.
+ *   2. Bands                — sin(r · BAND_FREQ + θ · 0.4 + phase) drift
+ *                              the density over the ring's radial extent.
+ *   3. Smooth Cassini gap   — smoothstep dip at the gap radius.
+ *
+ * Used by BOTH shade_ring (for direct ring colour, §9.3) AND
+ * ring_transmittance (for shadow cast onto the planet, §9.3b). Single
+ * source of truth — the planet's shadow streaks have the same banding
+ * and Cassini dip as the visible ring.
+ */
+static float ring_density_at(float r, float theta,
+                             const PatternParams *pp, float seed_phase)
+{
+    float edge_in  = smoothstep(pp->ring_r_in,  pp->ring_r_in  + 0.04f, r);
+    float edge_out = 1.f - smoothstep(pp->ring_r_out - 0.04f, pp->ring_r_out, r);
+    float density  = pp->ring_density_floor
+                   + (1.0f - pp->ring_density_floor)
+                     * (0.5f + 0.5f * sinf(r * RING_BAND_FREQ
+                                           + theta * 0.4f
+                                           + seed_phase));
+    density *= edge_in * edge_out;
+
+    if (pp->has_cassini) {
+        float gap = smoothstep(0.f, pp->cassini_w, fabsf(r - pp->cassini_r));
+        density *= CASSINI_DIM + (1.f - CASSINI_DIM) * gap;
+    }
+    return density;
+}
+
+/* §9.3b ── ring_transmittance (rings cast shadow on planet, T8) ──── */
+
+/*
+ * Fraction of direct sunlight reaching planet hit point P after
+ * passing through (or missing) the ring annulus.
+ *
+ * Pseudocode:
+ *   if sun and P on the SAME side of the ring plane:   return 1.0
+ *     (chord toward sun never crosses the ring)
+ *   if sun_dir.y near zero:                            return 1.0
+ *     (chord parallel to the rings — degenerate)
+ *   t = -P.y / sun_dir.y                  distance from P to ring plane
+ *   if t < ε:                              return 1.0
+ *   crossing = P + t · sun_dir
+ *   r² = crossing.x² + crossing.z²
+ *   if r outside annulus:                  return 1.0
+ *   density = ring_density_at(r, θ, ...)   same formula as shade_ring
+ *   return 1 - density
+ *
+ * ∈ [0, 1].  1.0 = unshadowed, 0.0 = fully blocked by an opaque band.
+ *
+ * Multiplies the planet's diffuse + specular + rim — all three are
+ * direct-sun components and the ring sits between sun and P along
+ * the sun chord. Ambient and fill are NOT multiplied (they don't
+ * trace back through the rings).
+ */
+static float ring_transmittance(V3 P, V3 sun_dir,
+                                const PatternParams *pp,
+                                float seed_phase)
+{
+    if (sun_dir.y * P.y >= 0.f)            return 1.f;
+    if (fabsf(sun_dir.y) < 1e-5f)          return 1.f;
+
+    float t = -P.y / sun_dir.y;
+    if (t < 1e-3f)                         return 1.f;
+
+    V3 crossing = v3_add(P, v3_scl(sun_dir, t));
+    float r2 = crossing.x * crossing.x + crossing.z * crossing.z;
+    float r_in2  = pp->ring_r_in  * pp->ring_r_in;
+    float r_out2 = pp->ring_r_out * pp->ring_r_out;
+    if (r2 < r_in2 || r2 > r_out2)         return 1.f;
+
+    float r     = sqrtf(r2);
+    float theta = atan2f(crossing.z, crossing.x);
+    return 1.f - ring_density_at(r, theta, pp, seed_phase);
 }
 
 /* §9.3 ── shade_ring (forward-scatter + soft shadow + smooth Cassini) ─ */
 
 /*
  * Continuous ring shader:
- *   density(r)              — smooth profile across the annulus
- *   bands                   — fine sin-modulation (the Encke wisps)
- *   Cassini                 — smoothstep dip at the gap radius
+ *   density(r, θ)           — via ring_density_at (§9.3a)
  *   soft shadow             — N-sample penumbra by the planet
  *   diffuse (|sun.y|·shad)  — flat-plate Lambertian, double-sided
  *   forward-scatter glow    — backlight × (1-density) × sun_col
@@ -999,27 +1665,9 @@ static V3 shade_ring(const Theme *th, const PatternParams *pp,
                      V3 hit, V3 view_dir, V3 sun_dir,
                      int sx, int sy, int frame, ShadeMode mode)
 {
-    float r     = sqrtf(hit.x * hit.x + hit.z * hit.z);
-    float theta = atan2f(hit.z, hit.x);
-
-    /* Smooth radial density profile.
-     * Edges of the annulus fall off softly so the ring doesn't end with
-     * a hard pixel boundary. */
-    float edge_in  = smoothstep(pp->ring_r_in,  pp->ring_r_in  + 0.04f, r);
-    float edge_out = 1.f - smoothstep(pp->ring_r_out - 0.04f, pp->ring_r_out, r);
-    float density  = pp->ring_density_floor
-                   + (1.0f - pp->ring_density_floor)
-                     * (0.5f + 0.5f * sinf(r * RING_BAND_FREQ
-                                           + theta * 0.4f
-                                           + seed_phase));
-    density *= edge_in * edge_out;
-
-    /* Smooth Cassini Division — dip in density. */
-    if (pp->has_cassini) {
-        float gap = smoothstep(0.f, pp->cassini_w, fabsf(r - pp->cassini_r));
-        /* gap=0 inside, 1 outside; multiply density by (CASSINI_DIM..1) */
-        density *= CASSINI_DIM + (1.f - CASSINI_DIM) * gap;
-    }
+    float r       = sqrtf(hit.x * hit.x + hit.z * hit.z);
+    float theta   = atan2f(hit.z, hit.x);
+    float density = ring_density_at(r, theta, pp, seed_phase);
 
     /* Diagnostic / non-lit modes — return early.
      *
@@ -1043,8 +1691,12 @@ static V3 shade_ring(const Theme *th, const PatternParams *pp,
                                sx, sy, frame);
 
     /* Diffuse (rings are flat, double-sided) — abs of sun.y component.
-     * Multiply by shadow factor. */
-    float diffuse = fabsf(sun_dir.y) * shadow;
+     * Multiply by shadow factor. The (0.25 + 0.75·|sun.y|) shape gives
+     * the rings a 25% diffuse FLOOR even when the sun is near the ring
+     * plane, so they never go pitch-dark. Real ring particles aren't
+     * paper-thin perfect Lambertians; they pick up some glow from the
+     * lit sides of neighbouring particles regardless of sun elevation. */
+    float diffuse = (0.25f + 0.75f * fabsf(sun_dir.y)) * shadow;
 
     /* Forward-scatter glow — sparse parts glow when sun is roughly
      * behind the ring relative to the camera. */
@@ -1214,6 +1866,24 @@ typedef struct {
     int cols, rows;
 } Camera;
 
+/*
+ * camera_make — build the camera basis (right, up, forward) from a
+ *               look-at + height parameterisation.
+ *
+ * The camera sits at (0, cam_height, -CAM_DIST_DEFAULT) and looks
+ * toward the origin. We compute the basis as:
+ *   forward = normalize(target − camera_pos)
+ *   right   = normalize(forward × world_up)        (world_up = +Y)
+ *   up      = right × forward
+ *
+ * Vertical FOV is derived from horizontal FOV using the
+ * (rows × ASPECT_Y / cols) ratio so terminal cells render as
+ * physical SQUARES — without that correction, a circle would look
+ * like a vertical ellipse.
+ *
+ * The cam_height parameter varies per pattern (Uranus tilts more
+ * edge-on, Saturn shows the rings more open) — see §10 pattern_set.
+ */
 static void camera_make(Camera *c, int cols, int rows, float cam_height)
 {
     c->cols = cols;
@@ -1228,6 +1898,20 @@ static void camera_make(Camera *c, int cols, int rows, float cam_height)
     c->fov_v = FOV_H * (float)rows * ASPECT_Y / (float)cols;
 }
 
+/*
+ * camera_ray — build a normalised view ray from a sub-pixel screen
+ *              coordinate (fx, fy).
+ *
+ * The (2·fx + 1 − cols) / cols form maps integer pixel column 0..cols
+ * to the centred range [-1, +1] with a half-pixel offset (so we
+ * sample the cell CENTRE, not corner). Multiply by fov_h for
+ * horizontal angular extent.
+ *
+ * The vertical axis is NEGATED because terminal y grows downward
+ * but world y (up) grows upward.
+ *
+ *     ray_dir = normalize(forward + u · right + v · up)
+ */
 static V3 camera_ray(const Camera *c, float fx, float fy)
 {
     float u =  ( (2.f * fx + 1.f) - (float)c->cols ) / (float)c->cols * c->fov_h;
@@ -1237,6 +1921,21 @@ static V3 camera_ray(const Camera *c, float fx, float fy)
                                  v3_scl(c->up,    v))));
 }
 
+/*
+ * trace_one — primary ray dispatcher for one sub-pixel sample.
+ *
+ * Algorithm:
+ *   1. Build a view ray through screen coord (fx, fy).
+ *   2. Test against both primitives (sphere + ring annulus).
+ *   3. Depth-sort: pick the smaller positive t.
+ *      If sphere wins  → shade_planet() (§9.2)
+ *      If ring wins    → shade_ring()   (§9.3)
+ *      If both miss    → shade_space()  (§9.4 — sky + stars)
+ *
+ * The (sx, sy, frame) integer triple is passed to ring shading so
+ * its soft-shadow jitter is deterministic per pixel per frame —
+ * preventing the penumbra from "boiling" frame to frame.
+ */
 static V3 trace_one(const Scene *s, const Theme *th, const Camera *cam,
                     V3 sun_dir, float fx, float fy, int sx, int sy)
 {

@@ -298,6 +298,200 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read matrix_rain.c first (T1-T5) for the stream-
+ *      per-direction + shimmer mechanics; pulsar_rain.c if polar
+ *      coordinates are new (its T1-T3).
+ *   2. §4 sun — THE HEART. Sub-sections:
+ *        - sun_init / ray_init    ← bake direction vectors
+ *        - ray_reset              ← respawn / stagger
+ *        - sun_tick               ← per-frame integrator + reroll
+ *        - sun_draw               ← polar walk per ray
+ *      Read AFTER tutorials T1-T4 below.
+ *   3. §3 color — 5 themed palettes + HUD pairs.
+ *   4. §1 + §2 + §5 + §6 — config / clock / screen / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   N_RAYS              total number of rays (180).
+ *   ray.cos_a, sin_a    pre-baked direction (set once at init,
+ *                       never recomputed). sin_a has ASPECT
+ *                       already multiplied in.
+ *   ray.r_off           FLOAT distance of the ray's HEAD from
+ *                       core. Negative = "pre-emerged" (still
+ *                       inside the core). Increases over time.
+ *   ray.speed_cps       per-ray speed in cells per second.
+ *   ray.cache[i]        glyph at trail index i (0 = head,
+ *                       RAY_TRAIL-1 = tail tip).
+ *   max_r               radius beyond which a ray "dies" and
+ *                       respawns.
+ *   STAGGER_FRAC        max negative r_off at spawn (creates
+ *                       per-ray phase delay).
+ *   CORE_RESERVED_RADIUS
+ *                       inner radius the trail never paints over
+ *                       (so '@' is always visible).
+ *
+ * Background you need
+ * ───────────────────
+ *   - matrix_rain T1-T5 (stream-per-X, shimmer, bands).
+ *   - pulsar_rain T1-T3 (polar geometry, ASPECT correction).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Solar physics. The core is decorative; we don't simulate
+ *     thermonuclear fusion.
+ *   - Phong / radiometric shading. The "brightness" is just the
+ *     6-band ramp from matrix_rain T4.
+ *   - Per-ray rotation. Rays are FIXED in angle; only their
+ *     head distance changes.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Four tutorials that build a 180-ray Matrix sun from first
+ * principles.
+ *
+ *   T1  Pulsar minus rotation = Sun — what changed
+ *   T2  Per-ray independent speeds — why staggering matters
+ *   T3  Pre-baked direction vectors — zero trig in the inner loop
+ *   T4  Negative r_off — the "pre-emerged" trick that hides spawns
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  PULSAR MINUS ROTATION = SUN — WHAT CHANGED
+ * ──────────────────────────────────────────────
+ * If you take pulsar_rain.c and SET omega TO ZERO so the angle
+ * never advances, you'd just see fixed beams pointing forever in
+ * the same directions. To make them visually interesting again,
+ * what if instead of rotating the beams, we let each beam
+ * EXTEND OUTWARD?
+ *
+ * That's sun_rain. Rays are FIXED IN ANGLE; their HEAD POSITIONS
+ * SLIDE OUTWARD. The simulation owns one float per ray:
+ *
+ *     ray.r_off += ray.speed · dt
+ *
+ * Each ray is essentially a matrix_rain stream that falls
+ * RADIALLY OUTWARD from the centre instead of vertically
+ * downward. Same float-per-stream + shimmer cache + brightness
+ * bands.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │  matrix_rain   pulsar_rain   sun_rain            │
+ *      │                                                  │
+ *      │  vertical      angle ↑       r_off[i] ↑          │
+ *      │  fall          (rotation)    (radial slide)      │
+ *      │                                                  │
+ *      │  one float     one float     N floats            │
+ *      │  per col       global        (one per ray)       │
+ *      │                                                  │
+ *      │  cell-space, shimmer cache, 6-band brightness    │
+ *      │  applied to all three                            │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * The core is decorative — '@' painted last on every frame so
+ * no ray ever overwrites it.
+ *
+ * T2  PER-RAY INDEPENDENT SPEEDS — WHY STAGGERING MATTERS
+ * ───────────────────────────────────────────────────────
+ * If all 180 rays had the same speed and same starting r_off,
+ * the visual would be a single expanding ring — synchronised,
+ * pulsing rapidly. That's a CIRCLE animation, not a SUN.
+ *
+ * Two cheap differentiators:
+ *
+ *   PER-RAY SPEED        each ray spawns with a different speed
+ *                        in [SPEED_MIN_CPS, SPEED_MAX_CPS]. Rays
+ *                        with higher speed lead, lower lag.
+ *
+ *   STAGGERED SPAWN      each ray's initial r_off is pulled from
+ *                        a uniform distribution covering a
+ *                        FRACTION of max_r ("STAGGER_FRAC"). Some
+ *                        rays start near the centre; some start
+ *                        partway out; some haven't even emerged
+ *                        yet (negative r_off — see T4).
+ *
+ * Combined, they ensure the 180 rays are at 180 different points
+ * in their lifecycle at any moment. The visual is a steady
+ * stochastic field of beams, not a synchronised ring.
+ *
+ * Same trick as fk_tentacle_forest's eight-tentacle phase
+ * detuning (T4 there): break synchrony by giving each instance
+ * unique parameters.
+ *
+ * T3  PRE-BAKED DIRECTION VECTORS — ZERO TRIG IN THE INNER LOOP
+ * ─────────────────────────────────────────────────────────────
+ * Naive ray rendering: at every cell paint, compute
+ *
+ *     col = cx + round(r · cos(theta))
+ *     row = cy + round(r · sin(theta) · ASPECT)
+ *
+ * That's 2 trig calls × 180 rays × 16 trail cells = 5760 trig
+ * calls per frame. A lot.
+ *
+ * Optimisation: the angle theta is FIXED for each ray. Bake
+ * cos and sin ONCE at sun_init:
+ *
+ *     ray.cos_a = cos(theta)
+ *     ray.sin_a = sin(theta) · ASPECT       ← bake aspect TOO
+ *
+ * Now rendering is:
+ *
+ *     col = cx + round(r · ray.cos_a)
+ *     row = cy + round(r · ray.sin_a)
+ *
+ * Zero trig in the inner loop. Just floating-point multiplies
+ * and rounds.
+ *
+ * Note: ASPECT is folded into sin_a once at init. Same idea as
+ * pulsar_rain's pre-computed cos_w[k] / sin_w[k] direction
+ * vectors per beam, but here even simpler since each ray has
+ * exactly one direction (no wake spread).
+ *
+ * T4  NEGATIVE r_off — THE "PRE-EMERGED" TRICK THAT HIDES SPAWNS
+ * ──────────────────────────────────────────────────────────────
+ * When a ray dies (its tail clears max_r) and respawns, what
+ * should its initial r_off be?
+ *
+ * Naive: r_off = 0 — head emerges from the centre. Problem:
+ * EVERY new ray pops out at the centre, creating a visible
+ * "spawning ring" you can see if many rays die simultaneously.
+ *
+ * Better: r_off = uniform([-STAGGER_FRAC · max_r, 0]) —
+ * NEGATIVE values allowed. A negative r_off means the ray's
+ * HEAD is INSIDE the core (in fact, BEFORE the core — its
+ * trail extends only to negative radii). For the first few
+ * frames after spawn, NOTHING IS VISIBLE because every cell of
+ * the trail is at negative or near-core radius:
+ *
+ *     for i in 0 .. RAY_TRAIL-1:
+ *       ri = r_off - i           ← can be deeply negative
+ *       if ri < CORE_RESERVED_RADIUS: skip
+ *
+ * The ray "warms up" silently. By the time r_off is positive,
+ * the ray is fully formed and slides smoothly outward.
+ *
+ * This works because the renderer simply SKIPS cells that
+ * round to (or near) the core. The negative r_off period is
+ * INVISIBLE rather than glitchy.
+ *
+ * Same idea is reused in fireworks_rain (sparks have a brief
+ * delay before they appear after the launch flash) and in any
+ * cell-space sim where new objects need to FADE IN rather than
+ * pop. The general principle: when an object's lifecycle has a
+ * "warming up" or "cooling down" phase, model it explicitly as
+ * negative time/distance/intensity and skip the renderer
+ * accordingly.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

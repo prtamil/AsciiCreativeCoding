@@ -320,6 +320,233 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read matrix_rain.c first; the SHIMMER and BAND
+ *      mechanics (T3-T4 there) are reused. The NEW LESSON here is
+ *      polar-coordinate beams instead of vertical streams.
+ *   2. §4 pulsar — THE HEART. Read AFTER tutorials T1-T5 below.
+ *      Sub-sections:
+ *        - pulsar_tick      ← angle += omega · dt  (T1)
+ *        - draw_beam        ← polar walk + wake fading (T2-T4)
+ *        - draw_core        ← '@' at the centre, painted last
+ *   3. §3 color — 5 themed palettes + HUD pairs.
+ *   4. §1 + §2 + §5 + §6 — config / clock / screen / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   angle              float radians, advances by omega · dt.
+ *   spin_rps           rotations PER SECOND (physical units).
+ *   omega              spin_rps · 2π — radians per second.
+ *   n_beams            number of evenly-spaced beams (1..16).
+ *   base_angle         angle + b · (2π / n_beams) for beam b.
+ *   ri                 radial index along a beam (0..N_RADII-1).
+ *   k                  wake slot index (0 = head, larger = older).
+ *   WAKE_LEN+1         total wake slots.
+ *   WAKE_STEP          radians of trail per slot.
+ *   r_step             radial step size (pixels per ri).
+ *   ASPECT             vertical squash factor (~0.45) so a circle
+ *                      looks circular in cells, not stretched.
+ *   glyphs[ri][k]      cached glyph at radial sample ri and wake
+ *                      slot k. Same shimmer cache idea as
+ *                      matrix_rain T3.
+ *
+ * Background you need
+ * ───────────────────
+ *   - matrix_rain T1-T5 (especially T3 shimmer cache).
+ *   - Polar coordinates: (r, θ) → (r cos θ, r sin θ).
+ *   - Terminal aspect ratio: cells are ~2× as tall as wide.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Pulsar physics (general relativity, magnetic dipoles). The
+ *     "rotating beam" is purely a visual analogy.
+ *   - Anti-aliasing. We deliberately rely on cell snapping.
+ *   - Sub-pixel rotation. The angle advances continuously; the
+ *     visual look is fine without ANY anti-aliasing.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a rotating Matrix-style pulsar from
+ * first principles.
+ *
+ *   T1  Polar geometry — what it means to "rotate" a stream
+ *   T2  Wake — extending the beam BACKWARDS in angle
+ *   T3  ASPECT correction — why circles need a y-squash factor
+ *   T4  Render order — DIM FIRST so the head wins overlaps
+ *   T5  Multiple beams — evenly spaced, no extra state
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  POLAR GEOMETRY — WHAT IT MEANS TO "ROTATE" A STREAM
+ * ───────────────────────────────────────────────────────
+ * matrix_rain has streams at FIXED COLUMNS that fall over time.
+ * The simulation owns one float per column (head_y).
+ *
+ * pulsar_rain has BEAMS at FIXED RADIAL DEPTHS that rotate
+ * over time. The simulation owns ONE float (angle) shared by
+ * every beam.
+ *
+ *     angle += omega · dt
+ *     where omega = spin_rps · 2π
+ *
+ * For beam b, base direction is:
+ *     base_angle = angle + b · (2π / n_beams)
+ *
+ * For radial sample ri at radius r = (ri + 1) · r_step:
+ *     col = cx + round(r · cos(base_angle))
+ *     row = cy + round(r · sin(base_angle) · ASPECT)
+ *
+ * That's how a "beam" gets drawn — walk OUTWARD from the centre
+ * in the base_angle direction, painting a glyph at each radial
+ * sample.
+ *
+ * Compare with matrix_rain:
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  matrix_rain    pulsar_rain                      │
+ *      │                                                  │
+ *      │  vertical fall  rotational sweep                 │
+ *      │  head_y ↑       angle ↑                          │
+ *      │  one per col    one for whole sim                │
+ *      │  trail BACK     wake BACK in angle               │
+ *      │  at fixed col   at fixed radius                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Both files OWN a single float per visual element and DERIVE
+ * the screen position by trig. matrix_rain uses identity (head_y
+ * IS row); pulsar_rain uses cos/sin.
+ *
+ * T2  WAKE — EXTENDING THE BEAM BACKWARDS IN ANGLE
+ * ────────────────────────────────────────────────
+ * A bare beam (just the leading edge) reads as a "spinning
+ * line." A WAKE — angularly trailing copies of the beam — turns
+ * it into a rotating glow, like a lighthouse beam through fog.
+ *
+ * Implementation: at each radial sample, paint multiple slots
+ * at slightly DIFFERENT base_angles:
+ *
+ *     for k in 0 .. WAKE_LEN:
+ *       theta_k = base_angle - k · WAKE_STEP
+ *       paint cell at (cx + r·cos theta_k, cy + r·sin theta_k · ASPECT)
+ *               in band(k) colour with shimmer glyph
+ *
+ * Slot k = 0 is the HEAD (brightest). Slot k = WAKE_LEN is the
+ * trailing TIP (faintest). The angular span behind the head is:
+ *
+ *     wake_span = WAKE_LEN · WAKE_STEP
+ *
+ * For WAKE_LEN = 16 and WAKE_STEP = 0.05 rad: span ≈ 46°. Tune
+ * larger for a long lazy trail; smaller for a sharp blade.
+ *
+ * Brightness banding (HEAD / HOT / BRIGHT / MID / DARK / FADE) is
+ * the same six-band ramp from matrix_rain T4 — only the
+ * INDEX is the angular slot k instead of the radial dist.
+ *
+ * Optimisation: pre-compute cos(theta_k) and sin(theta_k) ONCE
+ * per beam (17 trig calls), reuse them at every ri. Without
+ * that, the inner loop would do 17 × 80 = 1360 trig calls per
+ * beam.
+ *
+ * T3  ASPECT CORRECTION — WHY CIRCLES NEED A Y-SQUASH FACTOR
+ * ──────────────────────────────────────────────────────────
+ * Terminal cells are NOT SQUARE. A typical monospace cell is
+ * roughly TWICE AS TALL as it is wide. If we render a circle
+ * naively:
+ *
+ *     col = cx + round(r · cos θ)
+ *     row = cy + round(r · sin θ)
+ *
+ * the result LOOKS LIKE A VERTICAL ELLIPSE — taller than wide
+ * by ~2×.
+ *
+ * Fix: multiply the y-component by a squash factor < 1:
+ *
+ *     row = cy + round(r · sin θ · ASPECT)
+ *
+ * Where ASPECT ≈ cell_width / cell_height ≈ 8/16 = 0.5. Tune
+ * empirically — 0.45 looks right on most terminals.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  no aspect correction:    with ASPECT = 0.5:     │
+ *      │                                                  │
+ *      │       . . .                       .              │
+ *      │     .       .                  .  .  .           │
+ *      │    .         .                .       .          │
+ *      │    .         .                .       .          │
+ *      │     .       .                  .  .  .           │
+ *      │       . . .                       .              │
+ *      │                                                  │
+ *      │  vertical egg                  round-ish         │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Same trick is used by every cell-space radial sim: spirals,
+ * sun_rain, mandala demos.
+ *
+ * T4  RENDER ORDER — DIM FIRST SO THE HEAD WINS OVERLAPS
+ * ──────────────────────────────────────────────────────
+ * Two slots at SMALL RADIUS may round to the SAME terminal
+ * cell. If we paint k = 0 (HEAD, bright) FIRST and then k = 16
+ * (FADE, dim) on top of it at the same cell, the dim slot
+ * overwrites the head — visual artifact, head looks fragmented.
+ *
+ * Fix: paint slots from DIM TO BRIGHT (k = WAKE_LEN down to 0).
+ * The bright HEAD always lands LAST, winning every overlap.
+ *
+ *     for ri in 0 .. N_RADII-1:
+ *       for k in WAKE_LEN .. 0 (decreasing):
+ *         paint slot k
+ *
+ * Same painter's-algorithm reasoning as snowflake T4 (snow
+ * underneath, rain on top). Always paint the FAR / DIM /
+ * background layer first; bring the BRIGHT focal layer last.
+ *
+ * Core '@' painted absolute LAST so it always wins the centre
+ * cell, regardless of how many beams happen to converge there.
+ *
+ * T5  MULTIPLE BEAMS — EVENLY SPACED, NO EXTRA STATE
+ * ──────────────────────────────────────────────────
+ * The simulation owns ONE float (`angle`). All n_beams beams
+ * are derived from it:
+ *
+ *     for b in 0 .. n_beams-1:
+ *       base_angle_b = angle + b · (2π / n_beams)
+ *       draw_beam(base_angle_b)
+ *
+ * Adding more beams costs only RENDER time — no extra state.
+ * The user can change n_beams interactively (']' / '[' keys)
+ * with no allocation, no disruption.
+ *
+ * This is the matrix_rain "stream-per-column" decomposition
+ * (T1 there) generalised: stream-per-(beam-index) where
+ * indices map to evenly spaced angles.
+ *
+ * Visual interpretations of n_beams:
+ *
+ *     1   single sweeping beam (rotating searchlight)
+ *     2   classic pulsar pair (180° apart)        ← default
+ *     3   tri-blade (120° apart)
+ *     4   cross (90° apart)
+ *     8   8-pointed star
+ *     16  flower with overlapping wakes — visually busy
+ *
+ * As n_beams grows, the angular gaps between beams shrink. At
+ * n_beams = 16, adjacent wakes overlap (each spans 46°,
+ * gap is 22.5°), creating a near-solid ring. Pure aesthetic
+ * exploration.
+ *
+ * Same trick (one float + index → many copies) reappears in
+ * fireworks_rain (one explosion fires N particles around a
+ * circle) and sun_rain (the sun emits N rays).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

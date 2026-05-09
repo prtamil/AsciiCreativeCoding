@@ -237,6 +237,295 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. This is the FOUNDATIONAL file of matrix_rain/; the
+ *      other files (snowflake, pulsar, sun, fireworks) reuse the
+ *      same shimmer-cache trick on different geometries.
+ *   2. §4 column — Column type + spawn + tick + draw + band lookup.
+ *      THE HEART of the file. Read AFTER tutorials T1-T5.
+ *   3. §5 rain — orchestrator: array of Columns, per-frame tick,
+ *      respawn handling.
+ *   4. §3 color — 4 themed 5-shade palettes + HUD pairs.
+ *   5. §1 + §2 + §6 + §7 — config, clock, screen, app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   head_y         FLOAT row position of the column's bright head.
+ *                  Increases over time (downward). Float, not int —
+ *                  the smooth fall depends on it.
+ *   length         number of trail glyphs CURRENTLY VISIBLE per
+ *                  column (≤ TRAIL_MAX).
+ *   speed          this column's per-second fall rate (rows/sec).
+ *   glyphs[k]      k-th cached glyph — k = 0 is the head, k =
+ *                  length-1 is the tail tip.
+ *   active         bool — false when the column has no in-flight
+ *                  stream.
+ *   dist           render-time variable — distance ABOVE the head
+ *                  (0 = head, 1 = HOT, ..., length-1 = FADE tail
+ *                  tip).
+ *   speed_scale    user-tunable global multiplier (1.0 default).
+ *   density        spawn 1 column per `density` terminal columns
+ *                  (1 = every column, 6 = sparse).
+ *   PAIR_HEAD      pure-white pair, theme-independent.
+ *   PAIR_HOT/BRIGHT/MID/DARK/FADE
+ *                  per-band colour pairs that change with the theme.
+ *
+ * Background you need
+ * ───────────────────
+ *   - ncurses cell-space rendering (mvaddch + colour pairs +
+ *     attributes A_BOLD / A_DIM).
+ *   - Variable-timestep main loop (Glenn Fiedler "Fix Your
+ *     Timestep!"). We use ONE dt per frame, not a fixed-step
+ *     accumulator.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Particle systems with N_max particles. Here EACH COLUMN owns
+ *     ONE stream — no general particle pool.
+ *   - Texture atlases / sprite sheets. Glyphs are random ASCII;
+ *     no images.
+ *   - GPU shaders. The "shimmer" is a software trick of rerolling
+ *     a tiny char cache.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build the Matrix rain effect from first
+ * principles.
+ *
+ *   T1  The "stream per column" decomposition
+ *   T2  Float head_y — why the fall must be sub-cell smooth
+ *   T3  The shimmer cache — what makes glyphs FEEL alive
+ *   T4  Brightness bands — how the trail fades over distance
+ *   T5  Respawn logic — keeping the screen perpetually busy
+ *   T6  Why this is CELL-SPACE (no §4 coords section)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE "STREAM PER COLUMN" DECOMPOSITION
+ * ─────────────────────────────────────────
+ * The Matrix rain LOOKS like a sea of falling glyphs. The trick:
+ * decompose into a flat array of INDEPENDENT streams — one per
+ * terminal column.
+ *
+ *     struct Column {
+ *       float head_y;          row position of bright head
+ *       int   length;          how long the trail is (1..TRAIL_MAX)
+ *       float speed;           rows / second
+ *       char  glyphs[MAX];     cached glyphs of the trail
+ *       bool  active;          is there a stream falling here?
+ *     };
+ *     struct Rain {
+ *       Column cols[ncols];    one entry per terminal column
+ *     };
+ *
+ * Streams in different columns are completely INDEPENDENT — no
+ * physics couples them. Each column ticks itself, rerolls its
+ * own cache, decides its own respawn timing.
+ *
+ *      ┌──────────────────────────────────────────────┐
+ *      │  the rain decomposed into vertical streams:  │
+ *      │                                              │
+ *      │  col 0   col 1   col 2   col 3   col 4       │
+ *      │   X       e       7              .           │
+ *      │   q       z       k              5           │
+ *      │   ▼       L       z              S           │
+ *      │           o       2              ▼           │
+ *      │           ▼       7                          │
+ *      │                   8                          │
+ *      │                   ▼                          │
+ *      │                                              │
+ *      │  ▼ marks each column's HEAD                  │
+ *      └──────────────────────────────────────────────┘
+ *
+ * The screen is the parallel rendering of all those streams.
+ * The "rain" emerges from independent, non-interacting parts.
+ *
+ * Same pattern in every variant of this file:
+ *   - matrix_snowflake: streams of glyphs blown by lateral wind.
+ *   - pulsar_rain     : radial outward streams from screen centre.
+ *   - sun_rain        : streams emerge from a sun disc.
+ *   - fireworks_rain  : streams ARE arcs from explosion centres.
+ *
+ * Different geometries, same "stream + cache" core.
+ *
+ * T2  FLOAT head_y — WHY THE FALL MUST BE SUB-CELL SMOOTH
+ * ───────────────────────────────────────────────────────
+ * The terminal renders at INTEGER cell positions — there's no
+ * such thing as "between row 5 and row 6." But if we updated
+ * head_y as an INTEGER ("advance by 1 row each tick"), the
+ * fall would step in jagged jumps:
+ *
+ *     tick 1:  head at row 5
+ *     tick 2:  head at row 6
+ *     tick 3:  head at row 7
+ *
+ * Slow streams visibly stutter; fast streams skip rows. Both
+ * look bad.
+ *
+ * Solution: head_y is a FLOAT advanced by speed · dt:
+ *
+ *     head_y += speed · dt · speed_scale
+ *
+ * Then at render time, MAP THE FLOAT to the nearest integer row:
+ *
+ *     row = floor(head_y - dist + 0.5)        ← round half UP
+ *
+ * Now the head can be at "row 5.7" — at render time it paints
+ * row 6, but on the next frame at "row 5.8" it stays on row 6,
+ * and at "row 6.5" it crosses to row 7. The fall reads as
+ * smooth even though the rendering is integer.
+ *
+ * The "round half up" via floor(x + 0.5) is deliberate. C's
+ * stdlib roundf() uses "banker's rounding" (round half EVEN)
+ * which would oscillate at exactly x.5 boundaries — head_y =
+ * 5.5 → row 6, head_y = 6.5 → row 6 again, then head_y = 7.5
+ * → row 8. That gives a one-frame "stall and skip" that the
+ * eye notices. floor(x + 0.5) is monotonic and predictable.
+ *
+ * T3  THE SHIMMER CACHE — WHAT MAKES GLYPHS FEEL ALIVE
+ * ────────────────────────────────────────────────────
+ * Without rerolling glyphs, the falling trail would look like a
+ * static piece of text scrolling — each glyph keeps the same
+ * character forever, just with changing brightness. Boring.
+ *
+ * The trick: cache ONE glyph per trail position, and REROLL
+ * those glyphs periodically (the "shimmer cache").
+ *
+ *     glyphs[length] = static array per column
+ *     SHIMMER_HZ = 20      ← rerolls per second
+ *
+ *     every shimmer tick:
+ *       for k in 0..length-1:
+ *         glyphs[k] = random ASCII printable char
+ *
+ * The shimmer happens at a SLOWER rate than the render
+ * (SHIMMER_HZ = 20 vs render fps = 60). Within one shimmer tick
+ * (50 ms), three render frames see the SAME cache. That gives
+ * the eye a perceptible BLINK PATTERN — each glyph holds its
+ * value for 50 ms, then changes. Faster than the eye registers
+ * as discrete blinks; slower than the render so the trajectory
+ * is still smooth.
+ *
+ * SHIMMER_HZ tuning:
+ *   - Too low (5 Hz):  glyphs READ AS letters, you can almost
+ *                      tell what they are. Reads as "scrolling
+ *                      text," not Matrix rain.
+ *   - Too high (60 Hz): glyphs become an unrecognisable blur,
+ *                      no individual character readable. Rain
+ *                      reads as PURE NOISE rather than "code."
+ *   - 20 Hz: sweet spot — characters glimpsed but not read.
+ *
+ * T4  BRIGHTNESS BANDS — HOW THE TRAIL FADES OVER DISTANCE
+ * ────────────────────────────────────────────────────────
+ * The visible trail isn't uniformly bright. It has SIX BANDS
+ * of progressively darker colour from head to tip:
+ *
+ *     dist=0        HEAD     pure white BOLD
+ *     dist=1        HOT      theme[4] BOLD
+ *     dist=2        BRIGHT   theme[3] BOLD
+ *     dist=3..k     MID      theme[2]
+ *     dist=k+1..N-2 DARK     theme[1]
+ *     dist=N-1      FADE     theme[0] DIM
+ *
+ * Where do the band BOUNDARIES live? §4's col_band function
+ * computes them from `length` so a short trail has the same
+ * head/hot/bright/fade structure as a long trail — just with
+ * less MID in the middle.
+ *
+ * The HEAD band is theme-INDEPENDENT (always pure white). Why?
+ * Because:
+ *   - White provides a clear visual cue: "this is the leading
+ *     edge of a stream." Without it the head blends into the
+ *     trail.
+ *   - It works regardless of theme. Every other band shifts hue
+ *     across themes (green/amber/blue/white); HEAD stays bright
+ *     white, anchoring the visual against any background.
+ *
+ * Per-theme palette: 5 256-colour codes per theme, indexed
+ * theme[0..4]. Strict brightness gradient: theme[0] is DIM-safe
+ * (≥ palette index 24), theme[4] is the brightest. Compliance
+ * with the project's "Theme Palette Brightness" rule —
+ * every band stays legible against default-black with A_DIM.
+ *
+ * T5  RESPAWN LOGIC — KEEPING THE SCREEN PERPETUALLY BUSY
+ * ───────────────────────────────────────────────────────
+ * When a stream's tail clears the bottom edge, the column goes
+ * INACTIVE. If we never respawned, columns would empty out and
+ * the screen would gradually go dark.
+ *
+ * Respawn rule: per inactive column, per frame, with small
+ * probability:
+ *
+ *     respawn_p = RESPAWN_RATE_PER_SEC · dt / density
+ *     if (random() < respawn_p):
+ *       spawn a fresh stream at this column
+ *
+ * `RESPAWN_RATE_PER_SEC` is the EXPECTED number of new streams
+ * per column per second. With density = 3 and rate = 1, each
+ * inactive column has a 1-in-3 chance per second of spawning.
+ *
+ * Spawn parameters are FRESH for every new stream:
+ *
+ *     head_y   = uniform(-rows / 2, 0)        ← above the screen
+ *     length   = uniform(TRAIL_MIN, TRAIL_MAX)
+ *     speed    = uniform(SPEED_MIN, SPEED_MAX)
+ *     glyphs[] = randomised
+ *
+ * Initial head_y < 0 means the new stream FALLS IN from above
+ * the screen — visually graceful, not a sudden pop at the top
+ * row. By the time head_y reaches row 0, the stream looks like
+ * it has always been there.
+ *
+ * Density (the `=` and `-` keys) effectively scales the per-
+ * column respawn rate. density=1: every column eligible →
+ * dense screen. density=6: only ~1 in 6 columns active at once
+ * → sparse / minimal aesthetic.
+ *
+ * T6  WHY THIS IS CELL-SPACE (NO §4 coords SECTION)
+ * ─────────────────────────────────────────────────
+ * The project framework distinguishes two coordinate spaces:
+ *
+ *   PIXEL-SPACE  continuous floats; needs §4 coords for
+ *                pixel↔cell mapping. Used by bouncing balls,
+ *                Lorenz attractors, FK creatures.
+ *
+ *   CELL-SPACE   discrete grid of terminal cells. Each cell IS
+ *                one character. No sub-pixel motion.
+ *
+ * matrix_rain is CELL-SPACE — there's no §4 coords. ONE float
+ * (head_y) is the only continuous quantity, and it converts to
+ * an integer row directly via floor(x + 0.5). Everything else
+ * is integer column / row indexing.
+ *
+ * The decision is the FIRST ARCHITECTURAL CHOICE for any new
+ * sim:
+ *   - "Each cell IS one character / particle / dot" → CELL-SPACE.
+ *     Examples: matrix_rain, fire, sand, reaction-diffusion.
+ *   - "Smooth motion, decoupled from cell grid" → PIXEL-SPACE.
+ *     Examples: bounce_ball, nbody, cloth, all of animation/.
+ *
+ * matrix_rain landed in cell-space because:
+ *   - The visual is GLYPH-CENTRIC: each cell IS one Matrix
+ *     character. There's no "between cells" position that
+ *     needs to be drawn.
+ *   - Streams fall straight down: only one continuous parameter
+ *     (vertical position) needs floats. Horizontal is locked
+ *     to terminal columns.
+ *
+ * Comparing to fireworks_rain (T1 there): the arc trails curve
+ * smoothly but the file is STILL cell-space because every
+ * arc point is rounded to a terminal cell at render time —
+ * the ONE float per particle is its progress along the arc.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

@@ -295,6 +295,240 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read matrix_rain.c first if the basic stream-per-
+ *      column technique is new — that file's tutorials T1-T5 cover
+ *      stream + shimmer + bands. This file ADDS a snow-pile
+ *      accumulator + scene state machine.
+ *   2. §4 stream — borrowed straight from matrix_rain.c.
+ *   3. §5 snow — THE NEW LESSON. Pile state, freeze step, full
+ *      check. Read AFTER tutorials T1-T4 below.
+ *   4. §6 scene — the FALL ↔ FLASH state machine (T5).
+ *   5. §1-§3, §7-§8 — config / colour / screen / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   pile_top[c]            row index of TOPMOST frozen row in column
+ *                          c. Decreases as snow grows. Starts at
+ *                          rows-1 (only the bottom row frozen);
+ *                          ends at 0 (column full).
+ *   pile_chars[r][c]       frozen GLYPH at cell (r, c), or 0 if
+ *                          empty.
+ *   stream.head            float row position of the stream's bright
+ *                          head (same as matrix_rain T2).
+ *   stream.active          true when stream is falling. Goes false
+ *                          when its head freezes; turns back true
+ *                          after restart_delay.
+ *   stream.restart_delay   countdown timer between freeze and
+ *                          respawn (seconds).
+ *   land_row               pile_top[c] - 1: the row where the next
+ *                          glyph will freeze if stream lands here.
+ *   state                  enum { FALL, FLASH }.
+ *   flash_tick             remaining frames in FLASH state.
+ *
+ * Background you need
+ * ───────────────────
+ *   - matrix_rain T1-T5 (stream-per-column + shimmer + bands).
+ *   - The painter's algorithm: draw far layer first, near layer on
+ *     top. Snow first, rain over it; rain skips cells already
+ *     occupied by snow.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - True falling-sand cellular automaton (sand cascades laterally
+ *     into gaps). We DELIBERATELY skip lateral cascade — each
+ *     column is its own independent accumulator. That's a
+ *     pedagogical simplification; if you want real sand, see
+ *     particle_systems/sandpile.c.
+ *   - Particle-particle collision. There's no collision — only
+ *     stream-versus-pile-top.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build the snow-piling Matrix variant from
+ * first principles.
+ *
+ *   T1  Add an ACCUMULATOR — turning rain into something with state
+ *   T2  pile_top[c] — one integer per column tracks the boundary
+ *   T3  The freeze step — when does a falling glyph become snow?
+ *   T4  Two-pass painter — snow underneath, rain on top
+ *   T5  FLASH state — completing the loop
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  ADD AN ACCUMULATOR — TURNING RAIN INTO SOMETHING WITH STATE
+ * ───────────────────────────────────────────────────────────────
+ * matrix_rain.c is STATELESS in the long run — streams fall, exit
+ * the bottom, respawn at the top. Five seconds of rain looks the
+ * same as fifty seconds of rain.
+ *
+ * To make the demo VISIBLY EVOLVE, we need an ACCUMULATOR — a
+ * persistent state that builds up as rain falls. The natural
+ * choice: SNOW. Each column receives stream after stream; each
+ * stream that lands deposits one glyph at a slightly higher
+ * position than the last one. After many streams, the column
+ * fills.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │  matrix_rain    snow:                            │
+ *      │  (this file)                                     │
+ *      │                                                  │
+ *      │  ╲│╱            ╲│╱       ← rain still falls     │
+ *      │   ▼              ▼          (over the pile)      │
+ *      │  ───            ░░░       ← snow piling up       │
+ *      │                 ░░░░                             │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * The pile must fit within the existing terminal grid (no
+ * over-allocation, no resize gymnastics) and grow PREDICTABLY so
+ * the user can watch it evolve. T2 explains the data structure.
+ *
+ * T2  pile_top[c] — ONE INTEGER PER COLUMN TRACKS THE BOUNDARY
+ * ────────────────────────────────────────────────────────────
+ * Naive way: store the pile as a 2-D array of "is this cell
+ * frozen?" booleans. Rendering walks the whole array. That's
+ * ~rows × cols cells per frame just for snow.
+ *
+ * Better: store an ARRAY OF BOUNDARIES — one row index per
+ * column, indicating where the pile starts:
+ *
+ *     pile_top[c] = row index of topmost frozen row in column c
+ *
+ * Initially `pile_top[c] = rows - 1` for every column — only the
+ * very bottom row is "frozen" (visually empty until something
+ * actually lands there). As snow accumulates, pile_top[c]
+ * DECREASES toward 0. When it reaches 0 the column is FULL.
+ *
+ *   row 0   ─────  empty
+ *   row 1   ─────
+ *   row 2   ─────
+ *   ...
+ *   row k-1 ─────  ← pile_top[c] points here
+ *   row k   ░░░░░  ← frozen
+ *   row k+1 ░░░░░
+ *   ...
+ *   row N-1 ░░░░░
+ *
+ * Now the rendering pass walks ONLY rows [pile_top[c], rows-1] in
+ * each column — the empty cells above it never need rendering.
+ *
+ * Plus a 2-D pile_chars[r][c] holding the actual glyph that
+ * landed there (so the visible snow shows different characters,
+ * not a solid fill). The boundary array tells WHERE; the chars
+ * array tells WHAT.
+ *
+ * T3  THE FREEZE STEP — WHEN DOES A FALLING GLYPH BECOME SNOW?
+ * ────────────────────────────────────────────────────────────
+ * The freeze rule is:
+ *
+ *     if round(stream.head_y) >= pile_top[c] - 1:
+ *       FREEZE: pile_chars[pile_top[c] - 1][c] = stream.glyphs[0]
+ *       pile_top[c] -= 1
+ *       stream.active = false
+ *       stream.restart_delay = uniform(MIN, MAX)
+ *
+ * "When the head reaches one row above the pile's top, freeze
+ * the head's CURRENT glyph (glyphs[0], the brightest) at that
+ * row, raise pile_top by one, deactivate the stream, and start
+ * a respawn cooldown."
+ *
+ * Three details:
+ *
+ *   - We freeze the HEAD glyph (glyphs[0]), the one the user
+ *     sees as bright white. Visual continuity: the bright head
+ *     becomes a bright fresh snow flake.
+ *
+ *   - The cooldown delay (restart_delay) means columns don't
+ *     all fill at the same rate. Different per-stream speeds +
+ *     random delays = visually irregular fill.
+ *
+ *   - Once pile_top[c] reaches 0, the column is FULL. New
+ *     streams in that column have no space to land — we skip
+ *     spawning them.
+ *
+ * Compare with sand simulations (particle_systems/sandpile.c):
+ * there, when a particle "lands" it can cascade SIDEWAYS into
+ * a lower neighbouring column. We SKIP that — each column is an
+ * independent stack. Simpler algorithm, slightly less natural
+ * pile shape, but pedagogically focused.
+ *
+ * T4  TWO-PASS PAINTER — SNOW UNDERNEATH, RAIN ON TOP
+ * ───────────────────────────────────────────────────
+ * Painter's algorithm: draw far layer first, near layer over it.
+ * Two passes per frame:
+ *
+ *   PASS 1 — SNOW
+ *     for each column c:
+ *       for r in pile_top[c] .. rows-2:
+ *         paint pile_chars[r][c] in snow colour
+ *         (top SNOW_FRESH_DEPTH rows BOLD = "fresh"; rest
+ *          packed = normal)
+ *
+ *   PASS 2 — RAIN
+ *     for each active stream:
+ *       for dist in 0 .. trail_len-1:
+ *         row = round(head_y - dist)
+ *         if row >= pile_top[c]: skip   ← snow lives here
+ *         if row >= rows - 1:    skip   ← HUD lives here
+ *         paint stream.glyphs[dist] in rain band(dist) colour
+ *
+ * The skip-if-row-≥-pile_top is what makes streams APPEAR to
+ * land ON the snow rather than fall through it. The stream's
+ * tail might extend ABOVE the pile but its leading sections
+ * never overlap the frozen layer.
+ *
+ * Visually: the rain trail looks like it's falling onto a
+ * growing snowscape. The snow doesn't shimmer (it's static
+ * pile_chars). The rain still shimmers above.
+ *
+ * "Fresh" snow band: top SNOW_FRESH_DEPTH rows of each column's
+ * pile use a BOLD colour pair; deeper rows use normal weight.
+ * Visually distinguishes recently-landed flakes from settled
+ * pile, even though both are snow-coloured.
+ *
+ * T5  FLASH STATE — COMPLETING THE LOOP
+ * ─────────────────────────────────────
+ * Without a reset, the demo eventually fills every column and
+ * goes static. We add a 2-state machine:
+ *
+ *     enum { FALL, FLASH }
+ *
+ *   FALL state:
+ *     - rain falls, snow accumulates
+ *     - check snow_is_full() each frame
+ *     - if full: → state = FLASH, flash_tick = FLASH_FRAMES
+ *
+ *   FLASH state:
+ *     - whole pile rendered in BRIGHT WHITE BOLD
+ *     - rain doesn't draw
+ *     - flash_tick decrements each frame
+ *     - if flash_tick == 0: clear pile, state = FALL
+ *
+ * The FLASH gives the loop closure — the user gets a clear
+ * "completed" moment before the world resets. FLASH_FRAMES
+ * tunes how long it lingers; ~1 second feels right.
+ *
+ * scene_reset() returns the pile to empty (pile_top[c] = rows-1
+ * for every column, pile_chars[*][*] = 0) and respawns all
+ * streams. The cycle starts over.
+ *
+ * Same pattern (FALL → FLASH → reset) is reusable for any
+ * accumulator-style demo: build something up, celebrate
+ * completion, restart. Same machinery applies to
+ * fireworks_rain (explode → fade → next launch), fire / sand
+ * (pile up → topple → next launch), etc.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

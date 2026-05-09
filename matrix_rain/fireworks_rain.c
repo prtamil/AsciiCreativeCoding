@@ -238,6 +238,258 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read matrix_rain.c first if the shimmer cache is
+ *      new (its T3-T4). The NEW LESSONS here are: physics-driven
+ *      arcs (gravity), trail history buffer (per-spark ring), and
+ *      a 3-state rocket lifecycle.
+ *   2. §4 spark — THE HEART. spark_tick + spark_burst + spark_draw.
+ *      Read AFTER tutorials T1-T5.
+ *   3. §5 rocket — IDLE / RISING / EXPLODED state machine (T5).
+ *   4. §6 show — orchestrator: pool of rockets + per-frame tick.
+ *   5. §1-§3, §7-§8 — config / colour / screen / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   spark.head           current Vec2 position (newest, brightest).
+ *   spark.vel            Vec2 velocity (cells/sec).
+ *   spark.trail[i]       past head position i frames ago.
+ *                        i = 0 is newest, i = TRAIL_LEN-1 oldest.
+ *   spark.cache[i]       glyph at trail position i.
+ *   spark.life           remaining lifetime in seconds; spark
+ *                        deactivates when life ≤ 0.
+ *   trail_fill           how many trail slots are populated;
+ *                        guard against rendering uninit slots.
+ *   FADING_LIFE_THRESHOLD
+ *                        below this remaining life, every band
+ *                        falls to DIM (death fade).
+ *   rocket.state         IDLE | RISING | EXPLODED.
+ *   GRAVITY              per-rocket downward acceleration.
+ *   SPARK_GRAVITY        per-spark downward acceleration (with
+ *                        small jitter for variety).
+ *
+ * Background you need
+ * ───────────────────
+ *   - matrix_rain T3-T4 (shimmer cache + 6-band brightness ramp).
+ *   - Newton's laws: pos += vel · dt; vel += g · dt.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Air drag / wind. We use plain gravity, no aerodynamic
+ *     forces. The arcs are exact parabolas.
+ *   - Particle-particle collision. Sparks pass through each other.
+ *   - Sound or smoke effects.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build matrix-trailed fireworks from first
+ * principles.
+ *
+ *   T1  Physics-driven motion vs scripted rotation
+ *   T2  Trail HISTORY buffer — past positions, not future
+ *   T3  Polar burst — N sparks fanned around a circle
+ *   T4  Death fade — life threshold collapses bands to DIM
+ *   T5  Rocket lifecycle — IDLE / RISING / EXPLODED
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  PHYSICS-DRIVEN MOTION VS SCRIPTED ROTATION
+ * ──────────────────────────────────────────────
+ * The earlier matrix_rain variants drive motion by SCRIPT:
+ *
+ *   matrix_rain    head_y += speed · dt          (constant speed)
+ *   pulsar_rain    angle  += omega · dt          (constant ω)
+ *   sun_rain       r_off  += speed · dt          (constant outward)
+ *
+ * fireworks_rain drives motion by PHYSICS — Newtonian
+ * integration with gravity:
+ *
+ *   spark.head += spark.vel · dt
+ *   spark.vel.y += GRAVITY · dt
+ *
+ * The vertical velocity DECREASES as gravity pulls down (positive
+ * y is screen-down). The spark slows, stops, reverses. The
+ * resulting trajectory is a PARABOLIC ARC — exactly the path
+ * a real firework spark traces.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │       . . .                                      │
+ *      │     .       .   apex (vy ≈ 0)                    │
+ *      │    .         .                                   │
+ *      │   .           .                                  │
+ *      │  .             .                                 │
+ *      │ .               .                                │
+ *      │.                 .                               │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * No scripting of the apex. No "now turn around at the top."
+ * The integrator handles ascent, apex, and descent uniformly.
+ *
+ * Each spark gets a SLIGHTLY JITTERED gravity (1 ± J) so 72
+ * sparks from the same burst follow 72 SLIGHTLY DIFFERENT
+ * arcs. Without the jitter the burst looks symmetrical and
+ * mechanical; with it, organic.
+ *
+ * T2  TRAIL HISTORY BUFFER — PAST POSITIONS, NOT FUTURE
+ * ─────────────────────────────────────────────────────
+ * matrix_rain's trail is computed BACKWARD from the head's
+ * current position by reading old glyphs at row = head_y - dist.
+ * That works because matrix_rain streams move STRAIGHT DOWN —
+ * the past trail position is just (col, row - dist).
+ *
+ * fireworks_rain's spark CURVES — its past positions don't lie
+ * on a straight line. The trail at frame k must record where
+ * the spark WAS k frames ago, not derive it from the current
+ * head.
+ *
+ * Solution: an explicit HISTORY BUFFER per spark:
+ *
+ *     trail[0] = position now
+ *     trail[1] = position 1 frame ago
+ *     trail[2] = position 2 frames ago
+ *     ...
+ *     trail[TRAIL_LEN-1] = position TRAIL_LEN-1 frames ago
+ *
+ * Each frame:
+ *
+ *     1. SLIDE the buffer:  trail[i] = trail[i-1] for i descending
+ *     2. STORE the new head: trail[0] = head_after_step
+ *
+ * (The slide MUST be in REVERSE order — i = TRAIL_LEN-1 down to
+ * 1 — or you smear the newest entry across the whole buffer.
+ * That's a classic "off-by-direction" bug.)
+ *
+ * The result: rendering the trail is just walking trail[0] to
+ * trail[TRAIL_LEN-1] and painting each at its recorded position
+ * with the appropriate band colour. The arc renders correctly
+ * because every position was actually computed by physics.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │              X    ← trail[0] = current head       │
+ *      │             /                                    │
+ *      │            q     ← trail[1]                      │
+ *      │             ╲                                    │
+ *      │              z   ← trail[2]                      │
+ *      │              │                                    │
+ *      │              R   ← trail[3]                      │
+ *      │              │                                    │
+ *      │              %   ← trail[4..]  (oldest = dimmest) │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * This is the same structure as a Verlet old_pos (ragdoll T2),
+ * extended to TRAIL_LEN history slots instead of just 1.
+ *
+ * T3  POLAR BURST — N SPARKS FANNED AROUND A CIRCLE
+ * ─────────────────────────────────────────────────
+ * When a rocket reaches its apex, it EXPLODES — emits 72 sparks
+ * radially. How to assign each spark its initial velocity?
+ *
+ *     for i in 0 .. N_SPARKS-1:
+ *       angle_i = 2π · i / N_SPARKS + jitter
+ *       speed_i = uniform(SPEED_MIN, SPEED_MAX)
+ *       spark[i].vel = (cos angle_i · speed_i, sin angle_i · speed_i)
+ *
+ * Same evenly-spaced-angles trick as pulsar_rain T5 / sun_rain
+ * (fixed-angle rays). Each spark fans out in a different
+ * direction; gravity then bends each parabola downward.
+ *
+ * The "+ jitter" on each angle (small uniform noise) breaks the
+ * perfect symmetry — without it the explosion looks like a
+ * mechanical 72-pointed star. With it, a natural-looking burst.
+ *
+ * Each spark's speed is also randomised slightly so some sparks
+ * fly farther (lasting longer in the air) than others, giving
+ * the burst a sense of depth.
+ *
+ * T4  DEATH FADE — LIFE THRESHOLD COLLAPSES BANDS TO DIM
+ * ──────────────────────────────────────────────────────
+ * Each spark has a `life` counter that decreases over time.
+ * When life reaches 0, the spark dies. But sparks shouldn't
+ * just POP off the screen — that looks abrupt.
+ *
+ * Death fade: when life drops below FADING_LIFE_THRESHOLD,
+ * EVERY trail band collapses to DIM (regardless of its
+ * normal HOT/WARM/COOL band):
+ *
+ *     trail_attr(i, life):
+ *       if life < FADING_LIFE_THRESHOLD: return DIM
+ *       else:                            return normal band(i)
+ *
+ * Visually the spark gradually loses its brightness uniformly
+ * across the trail before disappearing. Like an ember cooling.
+ *
+ * The threshold is tuned so the fade lasts roughly 0.3 sec —
+ * long enough to register as "fading away," short enough not
+ * to leave dim ghosts on screen.
+ *
+ * Compare with matrix_rain's "respawn" model: there, streams
+ * either FALL OFF the bottom or DEACTIVATE at the end. They
+ * never fade in place because they always exit the screen.
+ * fireworks sparks die in mid-air, so they need an explicit
+ * fade-out.
+ *
+ * T5  ROCKET LIFECYCLE — IDLE / RISING / EXPLODED
+ * ───────────────────────────────────────────────
+ * A rocket is a 3-state machine:
+ *
+ *      ┌──────┐  fuse_sec ≤ 0    ┌────────┐  vy ≥ 0  OR    ┌──────────┐
+ *      │ IDLE │ ────────────────►│ RISING │────────────────│ EXPLODED │
+ *      └──────┘                  └────────┘  y < 2 row     └──────────┘
+ *         ▲                                                      │
+ *         │  all sparks dead → uniform(FUSE_MIN..MAX) sec        │
+ *         └──────────────────────────────────────────────────────┘
+ *
+ *   IDLE:     waiting on the ground. Fuse counts down.
+ *             Transition: fuse hits 0 → RISING.
+ *
+ *   RISING:   physics-driven climb. Initial vy is negative
+ *             (upward); GRAVITY pulls it back. Transition
+ *             to EXPLODED when vy ≥ 0 (apex reached) or
+ *             y < 2 (top edge — too-fast rockets).
+ *
+ *   EXPLODED: 72 sparks tick under their own physics + trail.
+ *             Transition: every spark inactive → IDLE with a
+ *             fresh random fuse.
+ *
+ * Each rocket runs INDEPENDENTLY. The pool has 16 rockets, all
+ * sharing the same logic. With FUSE_MIN/MAX = 1/3 sec, the
+ * pool produces roughly one rocket-burst every 0.5 sec — a
+ * continuous show.
+ *
+ * The state-machine pattern is identical to matrix_snowflake's
+ * FALL ↔ FLASH (T5 there). Both files have a finite-state loop:
+ * an "active" state that runs physics, a transition condition,
+ * and a "transition" state (FLASH / EXPLODED) that ends and
+ * resets back to "active." Same structural template.
+ *
+ * Decision tree for adding state machines:
+ *
+ *   simulation has a clear LIFECYCLE (warm-up → active →
+ *     fade → reset)?                                     → state machine
+ *
+ *   stateless / continuous (always renderable)?          → no state needed,
+ *                                                          just integrate
+ *
+ *   state has BRANCHES (e.g. spark sometimes splits)?    → tree-state machine
+ *                                                          or hierarchical FSM
+ *
+ * Most of matrix_rain/ uses simple linear state (active /
+ * inactive); only matrix_snowflake and fireworks_rain need
+ * proper state machines because their lifecycle has distinct
+ * phases requiring different code paths.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

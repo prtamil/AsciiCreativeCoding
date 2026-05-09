@@ -1,662 +1,1711 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * lattice_gas.c — FHP-I Lattice Gas Automaton (Frisch-Hasslacher-Pomeau 1986)
+ * lattice_gas.c — FHP-I lattice gas automaton (Frisch-Hasslacher-Pomeau, 1986)
  *
- * Watch real fluid physics emerge from simple particle rules.
+ * DEMO: A two-step rule on a hexagonal grid produces REAL FLUID
+ *       behaviour.  Particles flow in from the left, collide with
+ *       each other, bounce off obstacles, and the macroscopic
+ *       picture matches the Navier-Stokes equations.  Six preset
+ *       SCENES (1..6) — flow past a cylinder, jets through slits,
+ *       Poiseuille channel, free gas equilibrium.  Five colour
+ *       THEMES.  All emergent: there is no "fluid equation"
+ *       anywhere in the code, just six bits per cell + a lookup
+ *       table.
  *
- * Particles enter from the LEFT, bounce off each other and obstacles on a
- * hexagonal grid, and collectively behave like a real fluid.  The Navier-
- * Stokes equations emerge automatically from two local rules:
- *   1. COLLISION — particles meeting in the same cell swap directions
- *                  in a way that conserves mass and momentum
- *   2. STREAMING — each particle moves one step in its direction
+ *       Each cell holds ONE BYTE — six bits, one per hexagonal
+ *       direction (E, NE, NW, W, SW, SE).  A bit is "1" if a
+ *       particle is moving in that direction, else "0."  Each
+ *       physics tick:
  *
- * COLOUR KEY (what you are watching):
- *   BLUE   — fluid moving LEFT  (slow zones, wake behind an obstacle)
- *   GREY   — fluid approximately still
- *   RED    — fluid moving RIGHT (the main current)
- *   ######   solid obstacle — particles bounce back off the walls
+ *           COLLIDE  — for each cell, replace its 6-bit state
+ *                       with the post-collision state from a
+ *                       precomputed table.  Mass + momentum
+ *                       conserved; head-on pairs scatter ±60°.
+ *           STREAM   — every particle hops one cell in its
+ *                       direction.  Walls reflect particles back
+ *                       (bounce-back boundary).
  *
- * Character density key:
- *   . , o O 0 @  — sparse to dense fluid
- *   (space)      — empty / no particles
+ *       That's it.  Average over a 3×3 patch and you see the
+ *       macroscopic FLOW FIELD — wakes, jets, boundary layers,
+ *       Bernoulli pressure drops.
  *
- * Display uses a 3×3 spatial average so you see the smooth macroscopic
- * flow field, not the noisy individual-particle level.
+ * Study alongside:
+ *   fluid/navier_stokes.c   — Eulerian grid solver (the OPPOSITE
+ *                              philosophy: solve the PDE directly,
+ *                              don't simulate particles).
+ *   fluid/fluid_sph.c       — Lagrangian particles WITHOUT a lattice
+ *                              (continuous positions).  Read T1 of
+ *                              that file to see the spectrum.
+ *   procedural/cellular_automata/   — other CA examples (Conway,
+ *                              Wireworld, etc.).
  *
- * Presets:
- *   1  Cylinder  — flow past a circular obstacle; BLUE wake forms behind it
- *   2  2-Slit    — two gaps in a wall; particles fan out after each slit
- *   3  3-Slit    — three gaps; interference-like fringes in the jets
- *   4  4-Slit    — four gaps; tighter jets, richer wake pattern
- *   5  Channel   — parallel walls; flow fastest at centre (Poiseuille)
- *   6  Free      — no inlet, no walls; random gas reaches equilibrium
+ * Section map:
+ *   §1  config              — every tunable constant
+ *   §2  clock               — monotonic ns timer + sleep
+ *   §3  rng                 — xorshift32 (no global lock)
+ *   §4  hex_directions      — 6-direction unit-vector tables
+ *   §5  collision_table     — FHP-I rules, precomputed at startup
+ *   §6  momentum_extract    — bit-popcount density + signed mx
+ *   §7  themes              — 5 momentum-to-colour palettes
+ *   §8  colors              — pair init + theme apply
+ *   §9  grid_state          — main + double-buffer + wall mask
+ *   §10 step_inject_inlet   — drive flow from left edge
+ *   §11 step_collide        — collision phase (table lookup)
+ *   §12 step_stream         — streaming + bounce-back
+ *   §13 step                — full physics tick
+ *   §14 presets             — 6 preset definitions
+ *   §15 scene_load          — apply preset to walls + state
+ *   §16 cell_neighbourhood  — 3×3 spatial average
+ *   §17 render              — fluid + walls + glyph ramp
+ *   §18 hud                 — top status + bottom hint
+ *   §19 screen              — ncurses init / cleanup
+ *   §20 app                 — main loop + signals + input
  *
  * Keys:
- *   q/ESC   quit         p/Space  pause/resume     r  reset
- *   n/N     next/prev preset       t/T  next/prev theme
- *   i/I     inlet stronger/weaker  +/-  steps/frame faster/slower
- *   ]/[     FPS up/down
+ *   q / Q / ESC      quit
+ *   p / space        pause / resume
+ *   r                reset (reload current preset)
+ *   n / N            next / prev preset (1..6)
+ *   t / T            next / prev theme  (1..5)
+ *   i / I            inlet probability up / down
+ *   + / -            physics steps per render frame up / down
+ *   ] / [            simulation Hz up / down
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra fluid/lattice_gas.c -o lattice_gas -lncurses -lm
- *
- * Sections: §1 config  §2 clock  §3 color  §4 hex  §5 grid  §6 draw  §7 screen  §8 app
+ *   gcc -std=c11 -O2 -Wall -Wextra fluid/lattice_gas.c -o lattice_gas \
+ *       -lncurses
  */
 
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
+/* ── HOW TO READ THIS FILE ──────────────────────────────────────────── *
  *
- * Algorithm      : FHP-I Lattice Gas Automaton (Frisch, Hasslacher, Pomeau 1986).
- *                  A cellular automaton where each cell holds 6 bits —
- *                  one per hexagonal lattice direction (0–5).  Each tick:
- *                    1. COLLISION: particles in same cell swap according to
- *                       lookup table that conserves mass and momentum.
- *                    2. STREAMING: each particle hops one cell in its direction.
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *      T1-T2 establish CA-fluid worldview + WHY HEX.  T3 explains
+ *      the bit-packed cell.  T4 derives the collision rules.  T5
+ *      covers streaming & walls.  T6-T7 describe the visualisation.
+ *      T8 closes with the H-theorem and the link to Navier-Stokes.
+ *   2. §4 hex_directions + §5 collision_table — the entire physics
+ *      lookup data.  Print the tables, study them: that's the model.
+ *   3. §13 step — three lines: inject, collide, stream.
+ *   4. §11 step_collide — read AFTER tutorial T4.
+ *   5. §12 step_stream — read AFTER tutorial T5.
+ *   6. §17 render + §16 cell_neighbourhood — read AFTER tutorial T6.
+ *   7. §15 scene_load + §14 presets — orchestration.
  *
- * Physics        : Emergent hydrodynamics.
- *                  The H-theorem guarantees that many FHP particles, averaged
- *                  over many cells, obey the Navier-Stokes equations.
- *                  This is a proof that macroscopic fluid behaviour arises
- *                  purely from microscopic conservation laws — no explicit PDEs.
- *                  The hexagonal grid removes velocity-space anisotropy that
- *                  afflicted earlier square-lattice gas models.
+ * Variable-naming convention
+ * ──────────────────────────
+ *   particle_grid[r][c]            uint8_t per cell, 6 bits used
+ *   stream_buffer[r][c]            scratch for double-buffered streaming
+ *   wall_mask[r][c]                true if cell is solid obstacle
  *
- * Rendering      : 3×3 spatial averaging before display.
- *                  Individual cells are binary (particle or no particle), too
- *                  noisy to show macroscopic flow.  Averaging over 9 cells
- *                  gives the local particle density ρ and mean momentum ⟨p⟩.
- *                  These map to color (velocity direction) and character
- *                  (density level) for smooth visualisation.
+ *   collision_table[parity][bits]  post-collision state lookup
+ *   parity                          (row + col) & 1 — alternating
+ *                                    chirality cancels global rotation
  *
- * Performance    : O(W×H) per step — one lookup per cell.  The collision
- *                  table is precomputed at init.  Very cache-friendly since
- *                  each cell is a single byte.
- * ─────────────────────────────────────────────────────────────────────── */
+ *   hex_direction_drow[parity][d]  Δrow for direction d in row parity
+ *   hex_direction_dcol[parity][d]  Δcol  ... same convention
+ *
+ *   physics_tick_count             monotonic counter
+ *   xorshift_state                 PRNG state
+ *
+ *   inlet_probability_per_cell     per-cell probability that left edge
+ *                                    gets an east-going particle
+ *   physics_steps_per_frame        time-lapse multiplier
+ *   sim_steps_per_second           physics tick rate
+ *
+ *   density_estimate               bit-count avg over 3×3 (∈ [0, 6])
+ *   momentum_x_doubled             integer mx*2 from bits (∈ [-2, +2])
+ *
+ * Background you need
+ * ───────────────────
+ *   - Bitwise ops: |, &, <<, >> and that 6 bits fit in a byte.
+ *   - Cellular automata in general (Conway's Life as the cliché).
+ *   - Hexagonal grid offset coordinates (T2 explains the convention
+ *     used here; you don't need to know it ahead of time).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Navier-Stokes derivation.  We just OBSERVE that the macroscopic
+ *     flow looks like fluid — the H-theorem and Chapman-Enskog
+ *     expansion that prove it (T8) are sketched, not derived.
+ *   - Statistical mechanics formalism.  Local conservation laws are
+ *     enough.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── CONCEPTS ───────────────────────────────────────────────────────── *
+ *
+ * Algorithm     : Frisch-Hasslacher-Pomeau (FHP-I) Lattice Gas
+ *                 Cellular Automaton.  Each cell of a HEXAGONAL grid
+ *                 holds 6 BITS — one per direction (E, NE, NW, W, SW,
+ *                 SE).  At most one particle per direction per cell.
+ *
+ *                 Each tick has TWO PHASES:
+ *
+ *                   1. COLLISION (local).  For each cell, look up
+ *                      the 6-bit state in a 64-entry table and
+ *                      replace it with the post-collision state.
+ *                      The table conserves mass (popcount) and
+ *                      momentum (vector sum).  Only 5 of the 64
+ *                      patterns trigger a non-trivial scatter; the
+ *                      other 59 are "identity" (pass through).
+ *
+ *                   2. STREAMING (transport).  Every particle hops
+ *                      one cell in its direction.  Walls reflect
+ *                      particles back the way they came (bounce-
+ *                      back boundary, gives no-slip walls).
+ *
+ *                 The same lookup table is used at every cell every
+ *                 tick.  No PDEs, no floats in the hot loop.  Yet
+ *                 the AVERAGE behaviour is incompressible Navier-
+ *                 Stokes — which is the whole point.
+ *
+ * Per tick:     INJECT INLET   — add east-going particles to the
+ *                                 left edge with probability p (this
+ *                                 is the "wind" driving the flow).
+ *               COLLIDE        — table lookup per cell.
+ *               STREAM         — bit-shift particle to neighbour cell.
+ *
+ * Visualisation: Cells are too NOISY to draw raw — at best 6 bits per
+ *                cell, often 0 or 1 particle.  We average over a 3×3
+ *                neighbourhood:
+ *                   density ρ   ← popcount sum ÷ 9 (≈ 0..6)
+ *                   momentum mx ← signed bit-direction sum ÷ 9
+ *                The DENSITY picks a glyph from a sparse-to-dense
+ *                ramp: '. , o O 0 @'.  The MOMENTUM picks a colour
+ *                pair from a 9-step ramp (deep blue = strong west,
+ *                grey = still, deep red = strong east).
+ *
+ * Performance   : Each cell is ONE BYTE.  Collision = one table
+ *                 lookup.  Streaming = bit shifts.  Whole thing
+ *                 fits in L1 cache for grids up to ~256² ≈ 64KB.
+ *                 Easy 60 fps on multi-million-cell grids.
+ *
+ * References
+ * ──────────
+ *   Frisch, Hasslacher, Pomeau (1986), "Lattice-gas automata for
+ *     the Navier-Stokes equation," Phys.Rev.Lett. 56(14), 1505 —
+ *     THE foundational paper.
+ *   Wolf-Gladrow (2000), "Lattice-Gas Cellular Automata and
+ *     Lattice Boltzmann Models" — the standard textbook.
+ *   d'Humières, Lallemand, Frisch (1986), "Lattice gas models for
+ *     3D hydrodynamics" — the FCHC extension.
+ *   https://en.wikipedia.org/wiki/FHP_model
+ *   Toffoli & Margolus, "Cellular Automata Machines" (MIT, 1987) —
+ *     the broader CA-as-physics worldview.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ───────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A FLUID is a HUGE NUMBER of tiny particles bumping into each other.
+ * If you keep mass + momentum conserved at every collision, and let
+ * everything flow on a regular grid, the AVERAGE BEHAVIOUR over many
+ * particles and many ticks IS A FLUID.  No PDE solver, no continuous
+ * variables — just a 6-bit cell, one lookup table, one shift.  This
+ * is one of the most surprising results in 1980s computational
+ * physics: complex emergent macroscopic behaviour from THE SIMPLEST
+ * possible local rule.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a HONEYCOMB grid.  At each hexagonal cell, draw arrows
+ * pointing OUT toward the 6 neighbours.  At every tick:
+ *
+ *   - Look at the cell's set of arrows.
+ *   - If they make a "head-on collision pattern" (2 arrows opposite,
+ *     no others), rotate them ±60° — the collision scatters the pair.
+ *   - If they make a 3-arrow symmetric pattern, rotate by 60° — same
+ *     reason.
+ *   - Otherwise leave them alone.
+ *   - Then SLIDE every arrow one cell forward in its direction.
+ *
+ * That's the whole simulator.  Repeat a million times and you'll see
+ * vortices behind a cylinder, jets through gaps in a wall, parabolic
+ * channel flow.  All emergent, no fluid equations involved.
+ *
+ *      ┌─────────────────────────────────────────────────────────────┐
+ *      │                                                             │
+ *      │   Hex cell with 6 direction bits:                           │
+ *      │                                                             │
+ *      │            NW          NE                                   │
+ *      │              ╲        ╱                                     │
+ *      │               ╲      ╱                                      │
+ *      │       W ─── [bits]──── E                                    │
+ *      │               ╱      ╲                                      │
+ *      │              ╱        ╲                                     │
+ *      │            SW          SE                                   │
+ *      │                                                             │
+ *      │   bit 0 = E, bit 1 = NE, bit 2 = NW,                        │
+ *      │   bit 3 = W, bit 4 = SW, bit 5 = SE                         │
+ *      │                                                             │
+ *      │   Opposite of bit d  =  bit (d + 3) mod 6                   │
+ *      │                                                             │
+ *      └─────────────────────────────────────────────────────────────┘
+ *
+ * KEY FORMULAS
+ * ────────────
+ *
+ *   CELL STATE (one byte, 6 bits used):
+ *     state = bit_0 | bit_1 | bit_2 | bit_3 | bit_4 | bit_5
+ *           = E    | NE   | NW   | W    | SW   | SE
+ *
+ *   PARTICLE COUNT in cell ("local density"):
+ *     n(state) = popcount(state)        [0..6]
+ *
+ *   HORIZONTAL MOMENTUM × 2 (integer; double the actual mx so we can
+ *   stay in integers — the unit-vector x-components are ±½ for the
+ *   four diagonal bits):
+ *     mx2(state) =  2·E + NE − NW − 2·W − SW + SE
+ *
+ *   COLLISION (table lookup):
+ *     parity = (row + col) & 1
+ *     state' = collision_table[parity][state]
+ *     The table is precomputed once at startup; 64 entries, only 5
+ *     non-identity:
+ *
+ *         0x09 (E + W)        → 0x12 or 0x24    head-on E-W pair
+ *         0x12 (NE + SW)      → 0x24 or 0x09    head-on NE-SW pair
+ *         0x24 (NW + SE)      → 0x09 or 0x12    head-on NW-SE pair
+ *         0x15 (E + NW + SW)  → 0x2A             3-particle Y
+ *         0x2A (NE + W + SE)  → 0x15             3-particle Y rotated
+ *
+ *   STREAMING (per particle):
+ *     for each set bit d in state:
+ *       (nr, nc) = (r + Δrow[parity][d], c + Δcol[parity][d])
+ *       if wall[nr][nc]:  set bit (d+3 mod 6) in stream_buffer[r][c]
+ *                         (bounce-back: stay in place, reverse direction)
+ *       else:             set bit d in stream_buffer[nr][nc]
+ *
+ *   3×3 NEIGHBOURHOOD AVERAGE (visualisation):
+ *     ρ̄  = (Σ popcount over 9 cells) / 9_excluding_walls
+ *     m̄x = (Σ mx2 over 9 cells) / 9_excluding_walls
+ *
+ *   MOMENTUM → COLOUR (9 bins):
+ *     idx = clamp(round((m̄x + 2) / 4 · 8), 0, 8)
+ *
+ *   DENSITY → GLYPH (7 bins):
+ *     glyph = " .,oO0@"[round(ρ̄)]
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   - PARITY MATTERS for hex offset coordinates.  The Δrow/Δcol
+ *     tables have TWO ROWS, indexed by row & 1.  Forgetting to use
+ *     parity gives anisotropic flow.
+ *   - GLOBAL CHIRALITY: the FHP-I head-on collision is AMBIGUOUS
+ *     (two valid post-states: +60° or -60°).  Always picking the
+ *     same one introduces a global rotation bias.  Solution:
+ *     alternate by parity — each cell randomises CW/CCW
+ *     deterministically by its checkerboard colour.
+ *   - WALL BOUNCE-BACK: when a particle would land in a wall, it
+ *     stays at the source cell with its direction REVERSED.  This
+ *     gives no-slip boundary — the velocity AT the wall is zero
+ *     after averaging.  If you don't reverse the direction, you
+ *     get free-slip walls instead.
+ *   - INLET TIMING: we inject AT THE START of every tick, before
+ *     collision.  If you inject AFTER streaming, you'd need a
+ *     guard cycle to avoid double-counting.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   - Preset 1 (cylinder): a BLUE WAKE forms behind the obstacle.
+ *     If the inlet probability is high enough, the wake develops
+ *     a Kármán vortex street (alternating eddies).
+ *   - Preset 5 (channel): the velocity profile across the channel
+ *     is PARABOLIC (Poiseuille flow) — fastest in the centre, zero
+ *     at the walls.  Visible as red gradient.
+ *   - Preset 6 (free): a random initial gas relaxes to a UNIFORM
+ *     density grey field — H-theorem in action.
+ *   - Toggle inlet OFF and watch the flow gradually equilibrate to
+ *     stationary grey.  No spurious global rotation should appear.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ────────────────────────────────────────────────── *
+ *
+ *   T1  CA fluids — emergence from local rules
+ *   T2  Hexagonal lattice — why hex and not square
+ *   T3  Bit-packed cells — six directions in one byte
+ *   T4  Collision table — FHP-I rules step by step
+ *   T5  Streaming + bounce-back walls
+ *   T6  Spatial averaging — micro is noisy, macro is smooth
+ *   T7  Reading the visualisation — density to glyph, momentum to colour
+ *   T8  H-theorem — why this gives Navier-Stokes
+ *
+ * ─────────────────────────────────────────────────────────────────── *
+ *
+ * T1  CA FLUIDS — EMERGENCE FROM LOCAL RULES
+ * ──────────────────────────────────────────
+ * In 1986 Frisch, Hasslacher, and Pomeau proved that a tiny
+ * cellular-automaton model on a hexagonal grid produces THE
+ * NAVIER-STOKES EQUATIONS as its macroscopic limit.  This was
+ * astonishing.  No floating-point, no PDEs, no integration
+ * scheme — just bits, bit-shifts, and a 64-entry lookup table.
+ * Yet zoom out far enough (in space and time) and you see the
+ * exact same equations that govern weather, oceans, blood, and
+ * smoke.
+ *
+ * The recipe has three parts:
+ *
+ *   1. A CRYSTAL LATTICE.  Square doesn't work (T2 explains why).
+ *      Hexagonal does.  Each cell has 6 neighbours.
+ *
+ *   2. A CELL STATE that lists which DIRECTIONS particles are
+ *      going in (T3).  At most ONE particle per direction per cell.
+ *
+ *   3. A LOCAL UPDATE RULE — collide, then stream — that conserves:
+ *        - MASS         (number of particles)
+ *        - MOMENTUM     (sum of direction unit vectors)
+ *        - ENERGY       (in FHP-I, all particles same speed → mass
+ *                        conservation implies energy conservation)
+ *      And nothing else.  No special "fluid forces" added.
+ *
+ * Run this for ~1000 ticks on a 100×100 grid.  Average each 5×5
+ * patch over 100 ticks.  You'll see vortices, jets, boundary
+ * layers, eddies — all the qualitative behaviour of real fluids.
+ *
+ * It's the fluid version of "ANT BEHAVIOUR FROM ANT NEIGHBOUR
+ * RULES" — emergence is the right word.
+ *
+ * Why does it work?  Because the conservation laws are EXACTLY
+ * the same locally as in real fluids.  The Chapman-Enskog
+ * expansion (T8) shows that the LARGE-SCALE LIMIT of any
+ * mass+momentum+energy-conserving local rule on an isotropic
+ * lattice IS Navier-Stokes (with some specific viscosity).
+ *
+ * Lattice gas was largely superseded in the 1990s by LATTICE
+ * BOLTZMANN methods (LBM), which use fractional populations
+ * instead of bits — smoother, less noise, more knobs.  But the
+ * BIT version is far more elegant and educationally valuable:
+ * it shows that the hard part isn't FLOATS, it's GETTING THE
+ * SYMMETRIES RIGHT.
+ *
+ * T2  HEXAGONAL LATTICE — WHY HEX AND NOT SQUARE
+ * ──────────────────────────────────────────────
+ * The first lattice-gas model (HPP, 1973) used a SQUARE grid
+ * with 4 directions per cell.  It failed at fluid behaviour.
+ * The reason: square grids are NOT ISOTROPIC.
+ *
+ * In Navier-Stokes, the second-rank stress tensor must be
+ * INVARIANT under rotation.  In tensor algebra, this requires
+ * the lattice's velocity vectors to satisfy:
+ *
+ *     Σᵢ cᵢα cᵢβ cᵢγ cᵢδ  ∝  δαβ δγδ + δαγ δβδ + δαδ δβγ
+ *
+ * (i.e. the 4-vector sum is a fully symmetric isotropic tensor).
+ * SQUARE has 4 directions: this 4-vector sum is NOT isotropic —
+ * it depends on the orientation of the square.  Result: HPP
+ * fluid has DIFFERENT viscosity along x vs along the diagonal.
+ * Not a fluid; a square-grid artefact.
+ *
+ * HEX has 6 directions.  The same 4-vector sum IS isotropic.
+ * Result: FHP fluid is rotationally symmetric.  The macroscopic
+ * limit really is Navier-Stokes, no anisotropy.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   SQUARE (HPP, FAILS):     HEX (FHP-I, WORKS):   │
+ *      │                                                  │
+ *      │       ↑                       ↗     ↖             │
+ *      │   ←   ●   →                  ●  ←     →           │
+ *      │       ↓                       ↘     ↙             │
+ *      │                                                  │
+ *      │   4 directions             6 directions          │
+ *      │   anisotropic              isotropic              │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Three-dimensional fluid is harder still: 6 directions in 3D
+ * isn't enough.  d'Humières, Lallemand & Frisch (1986) showed
+ * you need 24 directions, on a face-centred hypercubic (FCHC)
+ * lattice projected to 3D.  Modern LBM uses D2Q9 (2D, 9
+ * velocities including a rest particle) or D3Q19, etc.
+ *
+ * Symmetry beats arithmetic.
+ *
+ * T3  BIT-PACKED CELLS — SIX DIRECTIONS IN ONE BYTE
+ * ─────────────────────────────────────────────────
+ * Each cell stores SIX BOOLEAN BITS in a uint8_t:
+ *
+ *     bit 0  — particle moving E   (east)
+ *     bit 1  — particle moving NE  (60° above east)
+ *     bit 2  — particle moving NW  (120° above east)
+ *     bit 3  — particle moving W   (west)
+ *     bit 4  — particle moving SW  (240° above east)
+ *     bit 5  — particle moving SE  (300° above east)
+ *
+ * "Particle moving X" means: at the next streaming step, this
+ * bit will hop into the X neighbour cell and become bit X there.
+ *
+ * EXCLUSION PRINCIPLE: at most ONE particle per direction per
+ * cell.  This is what makes the model finite-state — there are
+ * exactly 64 possible cell states (2⁶), so the collision lookup
+ * table fits in 64 bytes.
+ *
+ * Why not allow MULTIPLE particles per direction?  Because the
+ * collision rules become combinatorially explosive, and you
+ * lose the simple table lookup.  (Lattice Boltzmann gives up
+ * the bits and uses real-valued populations instead — that's
+ * the key generalization.)
+ *
+ * COMPACTNESS: 100×100 grid = 10000 bytes = 10 KB.  Fits in L1
+ * cache.  All hot-loop arithmetic is bitwise, integer, branch-
+ * predictor-friendly.  This is what made FHP fast on 1980s
+ * hardware.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  Cell state byte:                                │
+ *      │    7 6 5 4 3 2 1 0                               │
+ *      │    │ │ │ │ │ │ │ └── E   particle going east      │
+ *      │    │ │ │ │ │ │ └──── NE  particle going NE        │
+ *      │    │ │ │ │ │ └────── NW                           │
+ *      │    │ │ │ │ └──────── W                            │
+ *      │    │ │ │ └────────── SW                           │
+ *      │    │ │ └──────────── SE                           │
+ *      │    └─┴────────────── unused (always 0)            │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Helpful identities:
+ *
+ *   "is there a particle going west?"     →    state & (1 << 3)
+ *   "add a particle going east"           →    state |= (1 << 0)
+ *   "remove the SE particle"              →    state &= ~(1 << 5)
+ *   "all directions"                      →    0x3F (= 63)
+ *   "popcount = local particle count"     →    __builtin_popcount(state)
+ *
+ * T4  COLLISION TABLE — FHP-I RULES STEP BY STEP
+ * ──────────────────────────────────────────────
+ * "Collision" means: given a cell state, what's the post-collision
+ * state, BEFORE streaming?  Most of the 64 states are "leave alone"
+ * (no collision happens).  Only FIVE states have a non-trivial rule.
+ *
+ * RULE #1 — Head-on E-W pair (state = 0x09 = 0b001001):
+ *
+ *     Two particles, opposite directions, no others.  Conserves mass
+ *     and momentum (both vanish).  Collide → scatter ±60° from the
+ *     E-W axis.  TWO valid outcomes:
+ *
+ *         NE+SW  pair  (state 0x12 = 0b010010)        +60° rotation
+ *         NW+SE  pair  (state 0x24 = 0b100100)        -60° rotation
+ *
+ *     Always picking +60° introduces a GLOBAL CHIRALITY — the fluid
+ *     would slowly rotate counter-clockwise even with no input.
+ *     FHP-I removes this by ALTERNATING by parity:
+ *
+ *         parity 0:  0x09 → 0x12     (CCW, +60°)
+ *         parity 1:  0x09 → 0x24     (CW,  -60°)
+ *
+ * RULE #2 — Head-on NE-SW (0x12) and NW-SE (0x24):
+ *
+ *     Same logic as Rule #1, just rotated.  Each parity rotates
+ *     consistently in its own chirality, so no global bias.  The
+ *     full cycles are:
+ *
+ *         parity 0 (CCW):  0x09 → 0x12 → 0x24 → 0x09 ...
+ *         parity 1 (CW):   0x09 → 0x24 → 0x12 → 0x09 ...
+ *
+ * RULE #3 — Three-particle "Y" (state = 0x15 = 0b010101):
+ *
+ *     Three particles at 120° spacing (E + NW + SW).  Mass = 3,
+ *     momentum = 0.  Only ONE other state has the same totals: the
+ *     opposite Y (NE + W + SE = 0x2A).  Both parities rotate by
+ *     60°, no chirality issue:
+ *
+ *         0x15 ↔ 0x2A    (both parities)
+ *
+ * The other 59 states either have unique mass+momentum totals
+ * (so no scatter is possible — would violate conservation) or
+ * have only ONE valid outcome that equals the input (trivial).
+ *
+ * The collision_table[2][64] is built ONCE at startup with all
+ * 64 entries initialised to identity (table[parity][s] = s),
+ * then the 5 non-trivial entries are overwritten.  At runtime
+ * collision is a SINGLE LOOKUP per cell:
+ *
+ *     state' = collision_table[(r + c) & 1][state]
+ *
+ * T5  STREAMING + BOUNCE-BACK WALLS
+ * ─────────────────────────────────
+ * After collision, every set bit must HOP one cell in its
+ * direction.  The hop is the same for every cell:
+ *
+ *     for each set bit d in state[r][c]:
+ *       new_state[r + Δrow[parity][d]][c + Δcol[parity][d]] |= (1 << d)
+ *
+ * Because we read AND write the grid, we use a DOUBLE BUFFER:
+ *   - Read from particle_grid (current state, just collided)
+ *   - Write into stream_buffer (next state, all zeros initially)
+ *   - At end, swap pointers (or memcpy if fixed buffers)
+ *
+ * Otherwise particles would step twice in one tick.
+ *
+ * WALL BOUNCE-BACK
+ * ────────────────
+ * When a particle would hop into a wall cell, instead it STAYS
+ * in its source cell with its direction REVERSED:
+ *
+ *     for each set bit d in state[r][c]:
+ *       (nr, nc) = neighbour
+ *       if wall[nr][nc]:
+ *         stream_buffer[r][c] |= (1 << ((d + 3) % 6))   ← reversed
+ *       else:
+ *         stream_buffer[nr][nc] |= (1 << d)             ← normal hop
+ *
+ * Why "stay in source"?  Real-fluid no-slip walls have ZERO
+ * velocity at the wall.  After many bounce-backs, the average
+ * velocity of cells touching the wall is zero (incoming particles
+ * are reflected back with opposite direction).  Conservation
+ * is local: the bit count is unchanged, momentum is reversed at
+ * the wall (pressure transmitted to wall, like a real boundary).
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  Particle hits a wall:                           │
+ *      │                                                  │
+ *      │   Before:                After:                  │
+ *      │     [E→][WALL]            [←W][WALL]             │
+ *      │                                                  │
+ *      │  bit 0 (E) of source cell                        │
+ *      │  becomes                                         │
+ *      │  bit 3 (W) of source cell                        │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Variants exist (specular reflection, free-slip), but bounce-back
+ * is the simplest and most physically correct for solid walls.
+ *
+ * T6  SPATIAL AVERAGING — MICRO IS NOISY, MACRO IS SMOOTH
+ * ───────────────────────────────────────────────────────
+ * If you draw the raw particle_grid, you get TV STATIC.  Each
+ * cell has ~3 particles on average; popcount gives noisy 0..6
+ * values; momentum jumps wildly between adjacent cells.  No
+ * wakes, no jets visible.  Just noise.
+ *
+ * The solution: AVERAGE over a 3×3 neighbourhood.  For each
+ * draw cell (r, c):
+ *
+ *     ρ̄(r, c)  = (Σ over 3×3 of popcount(s)) / count_excluding_walls
+ *     m̄x(r, c) = (Σ over 3×3 of mx2(s))      / count_excluding_walls
+ *
+ * The 9-cell window smooths out single-particle fluctuations.
+ * What's left after averaging IS the macroscopic flow field —
+ * the same field you'd compute from Navier-Stokes.
+ *
+ * Why 3×3 and not 5×5 or 9×9?  Bigger windows = smoother but
+ * blurrier.  3×3 is the smallest that visibly removes noise
+ * while preserving fine structure (jets, boundary layers).  At
+ * a typical terminal of 200×60 cells, 3×3 averaging gives ~70
+ * "macroscopic patches" across — enough resolution for jet
+ * fringes but not so much that the noise comes back.
+ *
+ * In practice, REAL LATTICE-GAS RESEARCH used much larger
+ * averaging windows (in time AND space) to get clean
+ * measurements.  We sacrifice quantitative accuracy for visual
+ * immediacy.
+ *
+ * T7  READING THE VISUALISATION — DENSITY TO GLYPH, MOMENTUM TO COLOUR
+ * ────────────────────────────────────────────────────────────────────
+ * The averaged ρ̄ and m̄x feed two independent visual channels:
+ *
+ *   ρ̄ → GLYPH (sparse to dense):
+ *     " .,oO0@" indexed by round(ρ̄) ∈ [0, 6]
+ *     Empty cells stay blank; dense cells get '@'.  This shows
+ *     where the FLUID IS — gaps, voids, dense waves.
+ *
+ *   m̄x → COLOUR (deep blue to deep red):
+ *     normalise to [-2, +2], scale to 9 buckets.  Theme palettes
+ *     map these 9 buckets to 9 ncurses pairs:
+ *       bucket 0 (most westward)  : strongest "left" colour
+ *       bucket 4 (still)           : neutral (grey / pale)
+ *       bucket 8 (most eastward)   : strongest "right" colour
+ *     This shows where the FLUID IS GOING — wakes are blue (left
+ *     of inlet direction = backflow), jets are red.
+ *
+ * Result: you see DENSITY AS BRIGHTNESS-LIKE and DIRECTION AS
+ * COLOUR.  Both channels are independent — a dense wake (lots
+ * of '@') can be blue (going backward) at the same time.
+ *
+ * Five THEMES re-shade the colour axis but always preserve the
+ * "left = cool, still = neutral, right = warm" semantics:
+ *
+ *   Classic — blue/cyan/grey/orange/red    (canonical)
+ *   Ocean   — navy → cyan → white          (surface waves)
+ *   Plasma  — purple → magenta → gold      (high-energy feel)
+ *   Matrix  — dark green → bright lime     (cyber-aesthetic)
+ *   Heat    — dark red → orange → yellow   (warm only)
+ *
+ * The glyph ramp doesn't change with theme — it's universal.
+ *
+ * T8  H-THEOREM — WHY THIS GIVES NAVIER-STOKES
+ * ────────────────────────────────────────────
+ * The H-THEOREM (Boltzmann, 1872) says that any system with
+ * conservative collisions evolves toward MAXIMUM ENTROPY (the
+ * Maxwell-Boltzmann equilibrium distribution).
+ *
+ * For FHP-I:
+ *   - Collisions conserve mass and momentum locally.
+ *   - The lattice is rotationally isotropic at 4-vector level (T2).
+ *   - The Chapman-Enskog expansion (a series in mean-free-path /
+ *     macroscopic length) gives:
+ *
+ *         ∂ρ/∂t  + ∇·(ρu)        = 0                ← continuity
+ *         ∂(ρu)/∂t + ∇·(ρuu)    = -∇p + ν∇²(ρu)   ← Navier-Stokes
+ *
+ *     where ν is a CALCULABLE function of the lattice rules.
+ *
+ * Concretely: at FHP-I parameters, ν ≈ 0.166 lattice units²/tick.
+ * Reynolds number Re = U·L/ν is whatever your simulation produces;
+ * for typical inlet velocity 0.1 cells/tick on a width L = 100,
+ * Re ≈ 60 — laminar but interesting.
+ *
+ * What does this mean PRACTICALLY?  It means that if you turn off
+ * gravity, the fluid SETTLES TO uniform density with zero net
+ * velocity (preset 6 demonstrates this).  And at any instant, the
+ * AVERAGED flow field obeys real fluid dynamics — vortices behind
+ * cylinders, parabolic profiles in channels, exactly what
+ * experimentalists measure with real water.
+ *
+ * The H-theorem PROOFS work for any local conservative rule on
+ * an isotropic lattice — FHP-I just happens to be the SIMPLEST
+ * 2D example.  More complex models (FHP-III, lattice Boltzmann)
+ * give more accurate viscosity values, more exotic equations of
+ * state, multiphase flow, magnetohydrodynamics.  The principle
+ * stays the same: GET THE SYMMETRIES RIGHT, GET THE PHYSICS FREE.
+ *
+ * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
+
 #include <ncurses.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 /* ===================================================================== */
-/* §1  config                                                             */
+/* §1  config — every constant in one place                              */
+/* ===================================================================== */
+/*
+ * No magic numbers below this section.  Every literal in code is a
+ * named constant from §1.
+ */
+
+/* ── GRID SIZE LIMITS ── */
+#define GRID_ROWS_MAX                128
+#define GRID_COLS_MAX                512
+
+/* ── PHYSICS TIMING ── */
+
+/* Physics ticks per render frame (time-lapse multiplier). */
+#define STEPS_PER_FRAME_DEFAULT       8
+#define STEPS_PER_FRAME_MIN           1
+#define STEPS_PER_FRAME_MAX          32
+
+/* Inlet (left edge) injection rate. */
+#define INLET_PROB_DEFAULT          0.55f
+#define INLET_PROB_MIN              0.10f
+#define INLET_PROB_MAX              0.95f
+#define INLET_PROB_STEP             0.05f
+
+/* Simulation tick rate (Hz). */
+#define SIM_HZ_DEFAULT               20
+#define SIM_HZ_MIN                    5
+#define SIM_HZ_MAX                   60
+#define SIM_HZ_STEP                   5
+
+/* Render frame rate cap. */
+#define RENDER_FPS_CAP               60
+
+/* Aspect-ratio compensation for circular obstacles in 2:1-tall
+ * terminal cells.  Multiply Δrow by this when computing distances
+ * so a "circle of N cells wide" stays visually round. */
+#define ASPECT_FACTOR_CELL_TO_VISUAL 2.0f
+
+/* ── COLLISION-TABLE CONSTANTS ── */
+
+/* The 5 non-identity FHP-I collision states (T4): */
+#define COLLISION_HEADON_EW          0x09  /* E + W                 */
+#define COLLISION_HEADON_NE_SW       0x12  /* NE + SW               */
+#define COLLISION_HEADON_NW_SE       0x24  /* NW + SE               */
+#define COLLISION_THREEY_EVEN        0x15  /* E + NW + SW           */
+#define COLLISION_THREEY_ODD         0x2A  /* NE + W + SE           */
+
+#define COLLISION_TABLE_SIZE         64    /* 2^6 — six bits per cell */
+#define HEX_DIRECTIONS                6
+#define HEX_DIRECTION_BITS_MASK    0x3F   /* lowest 6 bits          */
+
+/* Direction bit indices.  Order matters — collision-table magic
+ * numbers above assume this exact layout. */
+enum {
+    DIR_E  = 0,      /* east       */
+    DIR_NE = 1,      /* north-east */
+    DIR_NW = 2,      /* north-west */
+    DIR_W  = 3,      /* west       */
+    DIR_SW = 4,      /* south-west */
+    DIR_SE = 5,      /* south-east */
+};
+
+/* ── VISUALISATION ── */
+
+/* 9 momentum buckets → 9 colour pairs (deep west … grey … deep east). */
+#define MOMENTUM_BUCKET_COUNT         9
+
+/* Density-to-glyph ramp.  [0] = blank, [1..6] = sparse..dense. */
+#define DENSITY_GLYPH_COUNT           7
+
+/* 3×3 neighbourhood for spatial averaging. */
+#define AVG_WINDOW_HALF               1
+
+/* Density threshold below which a draw cell is left blank. */
+#define DENSITY_BLANK_THRESHOLD       0.25f
+
+/* Density threshold for A_BOLD on the glyph (denser = brighter). */
+#define DENSITY_BOLD_THRESHOLD        3.5f
+
+/* ── COLOUR PAIRS ── */
+enum {
+    PAIR_MOMENTUM_FIRST = 1,                        /* +0..+8 */
+    PAIR_WALL           = 1 + MOMENTUM_BUCKET_COUNT,
+    PAIR_HUD,
+    PAIR_HINT,
+};
+
+/* ── PRESETS / THEMES ── */
+#define PRESET_COUNT                  6
+#define THEME_COUNT                   5
+
+/* ── HUD reserved rows ── */
+#define HUD_RESERVED_ROWS             2
+
+/* ── TIME UNITS ── */
+#define NS_PER_SEC          1000000000LL
+#define NS_PER_MS              1000000LL
+#define TICK_NS(hz)         (NS_PER_SEC / (hz))
+
+/* ===================================================================== */
+/* §2  clock — monotonic ns timer + sleep                                */
 /* ===================================================================== */
 
-#define ROWS_MAX   128
-#define COLS_MAX   512
-
-/* Physics steps computed per rendered frame — more = faster time-lapse */
-#define STEPS_DEF   8
-#define STEPS_MIN   1
-#define STEPS_MAX  32
-
-/* Inlet: probability that a left-column cell gets an eastward particle/step */
-#define INLET_PROB_DEF  0.55f
-#define INLET_PROB_MIN  0.10f
-#define INLET_PROB_MAX  0.95f
-#define INLET_PROB_STEP 0.05f
-
-#define SIM_FPS_DEF  20
-#define SIM_FPS_MIN   5
-#define SIM_FPS_MAX  60
-#define SIM_FPS_STEP  5
-
-/* Correct circular obstacle for terminal cell aspect ratio (height/width ≈ 2) */
-#define ASPECT_R  2.0f
-
-#define N_PRESETS  6
-#define N_THEMES   5
-#define NS_PER_SEC 1000000000LL
-#define TICK_NS(f) (NS_PER_SEC / (f))
-
-/* ===================================================================== */
-/* §2  clock                                                              */
-/* ===================================================================== */
-
-static int64_t clock_ns(void)
+static int64_t clock_now_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
+
 static void clock_sleep_ns(int64_t ns)
 {
     if (ns <= 0) return;
-    struct timespec req = { .tv_sec  = (time_t)(ns / NS_PER_SEC),
-                            .tv_nsec = (long)(ns % NS_PER_SEC) };
-    nanosleep(&req, NULL);
+    struct timespec ts = { ns / NS_PER_SEC, ns % NS_PER_SEC };
+    nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
-/* §3  color / theme                                                      */
+/* §3  rng — xorshift32 (no global lock)                                 */
 /* ===================================================================== */
-
 /*
- * 9 momentum colour pairs (CP_M1..CP_M9): strongest-west → strongest-east.
- *
- * Colour encodes flow direction; the ASCII character encodes density.
- * Characters ". , o O 0 @" go from sparse to dense fluid.
- * This works in both 256-color and 8-color terminals.
- *
- * CP_WALL  = solid obstacle cells  (white '#')
- * CP_HUD   = status bar
+ * A 32-bit xorshift PRNG.  Period 2³² - 1, fast, no
+ * thread-safety guarantees (we don't need any — single thread).
+ * Used only by inlet injection and "free" preset's initial gas;
+ * the physics is deterministic given an RNG seed.
  */
-enum {
-    CP_M1=1, CP_M2, CP_M3, CP_M4, CP_M5,
-    CP_M6,   CP_M7, CP_M8, CP_M9,
-    CP_WALL=10, CP_HUD=11,
-};
 
-typedef struct {
-    short col[9];    /* 256-color fg: west(0) → east(8), drawn on black bg */
-    short col8[9];   /* 8-color fg fallback */
-    const char *name;
-} Theme;
+static uint32_t xorshift_state = 12345u;
 
-static const Theme k_themes[N_THEMES] = {
-    /* 0 Classic — deep blue → cyan → grey → orange → red */
-    { { 21, 33, 51, 87, 244, 208, 202, 196, 160 },
-      { COLOR_BLUE, COLOR_BLUE, COLOR_CYAN, COLOR_CYAN, COLOR_WHITE,
-        COLOR_YELLOW, COLOR_YELLOW, COLOR_RED, COLOR_RED },
-      "Classic" },
-    /* 1 Ocean   — midnight blue → teal → cyan → white */
-    { { 19, 27, 39, 51, 87, 123, 159, 195, 231 },
-      { COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_CYAN, COLOR_CYAN,
-        COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE },
-      "Ocean" },
-    /* 2 Plasma  — deep purple → magenta → gold */
-    { { 91, 129, 165, 201, 207, 213, 214, 220, 226 },
-      { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_RED, COLOR_RED,
-        COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE },
-      "Plasma" },
-    /* 3 Matrix  — dark green → bright lime */
-    { { 22, 28, 34, 40, 46, 82, 118, 154, 190 },
-      { COLOR_BLACK, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
-        COLOR_GREEN, COLOR_GREEN, COLOR_WHITE, COLOR_WHITE },
-      "Matrix" },
-    /* 4 Heat    — dark red → orange → bright yellow */
-    { { 52, 88, 124, 166, 172, 178, 214, 220, 226 },
-      { COLOR_RED, COLOR_RED, COLOR_RED, COLOR_RED, COLOR_YELLOW,
-        COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE, COLOR_WHITE },
-      "Heat" },
-};
-
-static bool g_has_256;
-
-static void theme_apply(int ti)
+static inline uint32_t xorshift_next(void)
 {
-    const Theme *th = &k_themes[ti];
-    for (int i = 0; i < 9; i++) {
-        short fg = g_has_256 ? th->col[i] : th->col8[i];
-        init_pair(CP_M1 + i, fg, COLOR_BLACK);
+    uint32_t s = xorshift_state;
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    xorshift_state = s;
+    return s;
+}
+
+/* Random float in [0, 1).  24-bit precision. */
+static inline float xorshift_unit_float(void)
+{
+    return (float)(xorshift_next() >> 8) / (float)(1u << 24);
+}
+
+/* ===================================================================== */
+/* §4  hex_directions — 6-direction unit-vector tables                   */
+/* ===================================================================== */
+/*
+ * Hex coordinates use OFFSET COORDINATES with row-parity (T2).
+ * Each row's neighbours are at slightly different (Δrow, Δcol) than
+ * the next row.  This keeps things in a rectangular array indexed by
+ * (row, col), at the cost of needing two tables.
+ *
+ * EVEN ROW (parity 0) layout:
+ *
+ *       NW    NE
+ *         \  /
+ *      W -- ● -- E         dr  dc
+ *         /  \             ─── ───
+ *       SW    SE      E    0   +1
+ *                     NE  -1   0
+ *                     NW  -1  -1
+ *                     W    0   -1
+ *                     SW  +1   -1
+ *                     SE  +1   0
+ *
+ * ODD ROW (parity 1) layout — diagonals shifted by +1 col:
+ *
+ *                            dr  dc
+ *                            ─── ───
+ *                     E    0   +1
+ *                     NE  -1   +1
+ *                     NW  -1   0
+ *                     W    0   -1
+ *                     SW  +1   0
+ *                     SE  +1   +1
+ *
+ * Direction bit indices:
+ *   E=0  NE=1  NW=2  W=3  SW=4  SE=5
+ * Opposite of d:  (d + 3) mod 6
+ */
+
+static const int hex_direction_drow[2][HEX_DIRECTIONS] = {
+    { 0, -1, -1,  0, +1, +1 },   /* even row */
+    { 0, -1, -1,  0, +1, +1 },   /* odd  row */
+};
+
+static const int hex_direction_dcol[2][HEX_DIRECTIONS] = {
+    { +1,  0, -1, -1, -1,  0 },   /* even row */
+    { +1, +1,  0, -1,  0, +1 },   /* odd  row */
+};
+
+/* Opposite-direction lookup: bounce_back[d] = (d + 3) % 6. */
+static const int direction_bounce_back[HEX_DIRECTIONS] = {
+    DIR_W,   /* opposite of E  */
+    DIR_SW,  /* opposite of NE */
+    DIR_SE,  /* opposite of NW */
+    DIR_E,   /* opposite of W  */
+    DIR_NE,  /* opposite of SW */
+    DIR_NW,  /* opposite of SE */
+};
+
+/* ===================================================================== */
+/* §5  collision_table — FHP-I rules, precomputed at startup             */
+/* ===================================================================== */
+/*
+ * collision_table[parity][bits] = post-collision bits.
+ *
+ *   - 64 entries per parity (one per 6-bit input).
+ *   - Default is identity (no collision happens).
+ *   - 5 entries per parity get OVERWRITTEN with the actual rules
+ *     (T4).
+ *
+ * The TWO PARITIES exist to avoid global chirality (T4):
+ *   parity 0 (CCW): head-on cycle  0x09 → 0x12 → 0x24 → 0x09
+ *   parity 1 (CW):  head-on cycle  0x09 → 0x24 → 0x12 → 0x09
+ * The 3-particle Y rule is symmetric, no parity issue.
+ *
+ * Built ONCE in main() before the simulation starts.
+ */
+
+static uint8_t collision_table[2][COLLISION_TABLE_SIZE];
+
+static void collision_table_build(void)
+{
+    /* Default: identity (no collision; pass-through). */
+    for (int s = 0; s < COLLISION_TABLE_SIZE; s++) {
+        collision_table[0][s] = (uint8_t)s;
+        collision_table[1][s] = (uint8_t)s;
     }
-    init_pair(CP_WALL, COLOR_WHITE,  COLOR_BLACK);
-    init_pair(CP_HUD,  g_has_256 ? 255 : COLOR_WHITE,
-                       g_has_256 ? 236 : COLOR_BLACK);
+
+    /* Parity 0 — CCW (+60°) head-on cycle. */
+    collision_table[0][COLLISION_HEADON_EW]    = COLLISION_HEADON_NE_SW;
+    collision_table[0][COLLISION_HEADON_NE_SW] = COLLISION_HEADON_NW_SE;
+    collision_table[0][COLLISION_HEADON_NW_SE] = COLLISION_HEADON_EW;
+
+    /* Parity 1 — CW (-60°) head-on cycle. */
+    collision_table[1][COLLISION_HEADON_EW]    = COLLISION_HEADON_NW_SE;
+    collision_table[1][COLLISION_HEADON_NE_SW] = COLLISION_HEADON_EW;
+    collision_table[1][COLLISION_HEADON_NW_SE] = COLLISION_HEADON_NE_SW;
+
+    /* 3-particle Y — symmetric, both parities. */
+    collision_table[0][COLLISION_THREEY_EVEN] = COLLISION_THREEY_ODD;
+    collision_table[1][COLLISION_THREEY_EVEN] = COLLISION_THREEY_ODD;
+    collision_table[0][COLLISION_THREEY_ODD]  = COLLISION_THREEY_EVEN;
+    collision_table[1][COLLISION_THREEY_ODD]  = COLLISION_THREEY_EVEN;
 }
 
 /* ===================================================================== */
-/* §4  hex grid — directions and collision tables                         */
+/* §6  momentum_extract — bit-popcount density + signed mx               */
 /* ===================================================================== */
-
 /*
- * Hex offset layout, pointy-top hexagons, offset rows.
- * Direction bits:  0=E  1=NE  2=NW  3=W  4=SW  5=SE
- * Opposite of d:   (d + 3) % 6
+ * cell_particle_count(state):
+ *   How many particles are in this cell.  popcount of bits 0..5.
  *
- * Even row neighbours:  E=(0,+1) NE=(-1,0)  NW=(-1,-1) W=(0,-1) SW=(+1,-1) SE=(+1,0)
- * Odd  row neighbours:  E=(0,+1) NE=(-1,+1) NW=(-1,0)  W=(0,-1) SW=(+1,0)  SE=(+1,+1)
- */
-static const int DIR_DR[2][6] = {
-    {  0, -1, -1,  0,  1,  1 },
-    {  0, -1, -1,  0,  1,  1 },
-};
-static const int DIR_DC[2][6] = {
-    { +1,  0, -1, -1, -1,  0 },
-    { +1, +1,  0, -1,  0, +1 },
-};
-
-/*
- * Two 64-entry lookup tables resolve the 5 non-trivial FHP-I collisions.
- * Parity = (row+col)&1; alternating CW/CCW removes spurious global chirality.
+ * cell_momentum_x_doubled(state):
+ *   Sum of horizontal unit-vector components of all set bits, ×2 to
+ *   stay in integers.  Hex unit-vector x components:
+ *     E=+1   NE=+½   NW=-½   W=-1   SW=-½   SE=+½
+ *   ×2 to drop fractions:
+ *     E=+2   NE=+1   NW=-1   W=-2   SW=-1   SE=+1
  *
- * Head-on pairs (ambiguous, two valid post-states):
- *   parity 0 (CCW):  0x09→0x12→0x24→0x09 ...
- *   parity 1 (CW):   0x09→0x24→0x12→0x09 ...
- * 3-particle symmetric (unique rotation, parity-independent):
- *   0x15 ↔ 0x2A
- * All 59 other patterns: identity.
+ * The "doubled" momentum is later renormalised in mx_to_color_index.
  */
-static uint8_t g_col[2][64];
 
-static void build_collision_tables(void)
+static inline int cell_particle_count(uint8_t state)
 {
-    for (int s = 0; s < 64; s++) g_col[0][s] = g_col[1][s] = (uint8_t)s;
-    g_col[0][0x09]=0x12; g_col[1][0x09]=0x24;
-    g_col[0][0x12]=0x24; g_col[1][0x12]=0x09;
-    g_col[0][0x24]=0x09; g_col[1][0x24]=0x12;
-    g_col[0][0x15]=0x2A; g_col[1][0x15]=0x2A;
-    g_col[0][0x2A]=0x15; g_col[1][0x2A]=0x15;
+    return __builtin_popcount((unsigned)state);
 }
 
+static inline int cell_momentum_x_doubled(uint8_t state)
+{
+    int e  = (state >> DIR_E ) & 1;
+    int ne = (state >> DIR_NE) & 1;
+    int nw = (state >> DIR_NW) & 1;
+    int w  = (state >> DIR_W ) & 1;
+    int sw = (state >> DIR_SW) & 1;
+    int se = (state >> DIR_SE) & 1;
+    return  2 * e + ne - nw - 2 * w - sw + se;
+}
+
+/* ===================================================================== */
+/* §7  themes — 5 momentum-to-colour palettes                            */
+/* ===================================================================== */
 /*
- * Horizontal momentum ×2 (integer to avoid floats in the hot draw loop).
- * Hex direction unit-vector x-components: E=+1 NE=+½ NW=-½ W=-1 SW=-½ SE=+½
- * Scaled by 2: E=+2 NE=+1 NW=-1 W=-2 SW=-1 SE=+1
+ * Each theme has 9 entries:
+ *
+ *   index 0 — strongest WESTWARD flow (e.g. deep blue)
+ *   index 4 — neutral / still         (e.g. grey)
+ *   index 8 — strongest EASTWARD flow (e.g. deep red)
+ *
+ * Two palettes per theme:
+ *   palette_256[]: xterm-256 colour codes for 256-colour terminals
+ *   palette_8[] : 8-colour fallback
+ *
+ * All values lie in the BRIGHT half of the 256 cube (≥ 19) or are
+ * standard terminal-bright colours so they remain visible on
+ * default-black background.
  */
-static inline int cell_mx2(uint8_t s)
-{
-    return  2*((s>>0)&1) + ((s>>1)&1) - ((s>>2)&1)
-           -2*((s>>3)&1) - ((s>>4)&1) + ((s>>5)&1);
-}
-
-/* ===================================================================== */
-/* §5  grid state and simulation                                          */
-/* ===================================================================== */
-
-static uint8_t g_grid[ROWS_MAX][COLS_MAX];   /* particle bits per cell   */
-static uint8_t g_buf [ROWS_MAX][COLS_MAX];   /* streaming double-buffer  */
-static bool    g_wall[ROWS_MAX][COLS_MAX];   /* solid obstacle mask      */
-
-static int   g_rows, g_cols;
-static int   g_preset     = 0;
-static int   g_theme      = 0;
-static int   g_steps      = STEPS_DEF;
-static int   g_sim_fps    = SIM_FPS_DEF;
-static bool  g_paused     = false;
-static bool  g_inlet_on   = true;
-static float g_inlet_prob = INLET_PROB_DEF;
-static long  g_tick       = 0;
-
-/* xorshift32 — fast, 32-bit, no global locking */
-static uint32_t g_rng = 12345u;
-static inline uint32_t rng_next(void)
-{
-    g_rng ^= g_rng << 13;
-    g_rng ^= g_rng >> 17;
-    g_rng ^= g_rng << 5;
-    return g_rng;
-}
-static inline float rng_float(void)
-{
-    return (float)(rng_next() >> 8) / (float)(1u << 24);
-}
-
-/* ------------------------------------------------------------------ */
 
 typedef struct {
-    bool  inlet;
-    float init_density;   /* 0 = start empty; flow develops from inlet */
+    short       palette_256[MOMENTUM_BUCKET_COUNT];
+    short       palette_8  [MOMENTUM_BUCKET_COUNT];
     const char *name;
-    const char *desc;     /* plain-English description shown in HUD */
+} ColorTheme;
+
+static const ColorTheme color_theme_table[THEME_COUNT] = {
+    /* 0 Classic — deep blue → cyan → grey → orange → red */
+    {
+      {  21,  33,  51,  87, 244, 208, 202, 196, 160 },
+      { COLOR_BLUE,    COLOR_BLUE,   COLOR_CYAN,   COLOR_CYAN, COLOR_WHITE,
+        COLOR_YELLOW,  COLOR_YELLOW, COLOR_RED,    COLOR_RED                },
+      "Classic"
+    },
+    /* 1 Ocean — midnight blue → teal → cyan → white */
+    {
+      {  19,  27,  39,  51,  87, 123, 159, 195, 231 },
+      { COLOR_BLUE,    COLOR_BLUE,   COLOR_BLUE,   COLOR_CYAN, COLOR_CYAN,
+        COLOR_WHITE,   COLOR_WHITE,  COLOR_WHITE,  COLOR_WHITE              },
+      "Ocean"
+    },
+    /* 2 Plasma — deep purple → magenta → gold */
+    {
+      {  91, 129, 165, 201, 207, 213, 214, 220, 226 },
+      { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_RED, COLOR_RED,
+        COLOR_YELLOW,  COLOR_YELLOW,  COLOR_YELLOW, COLOR_WHITE             },
+      "Plasma"
+    },
+    /* 3 Matrix — dark green → bright lime */
+    {
+      {  28,  34,  40,  46,  82, 118, 154, 190, 226 },
+      { COLOR_GREEN,   COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN, COLOR_GREEN,
+        COLOR_GREEN,   COLOR_GREEN,  COLOR_WHITE,  COLOR_WHITE              },
+      "Matrix"
+    },
+    /* 4 Heat — dark red → orange → bright yellow */
+    {
+      {  52,  88, 124, 166, 172, 178, 214, 220, 226 },
+      { COLOR_RED,     COLOR_RED,    COLOR_RED,    COLOR_RED,   COLOR_YELLOW,
+        COLOR_YELLOW,  COLOR_YELLOW, COLOR_WHITE,  COLOR_WHITE              },
+      "Heat"
+    },
+};
+
+/* ===================================================================== */
+/* §8  colors — pair init + theme apply                                  */
+/* ===================================================================== */
+
+static bool terminal_has_256_colors = false;
+
+static void colors_apply_theme(int theme_index)
+{
+    const ColorTheme *theme = &color_theme_table[theme_index];
+    for (int i = 0; i < MOMENTUM_BUCKET_COUNT; i++) {
+        short fg = terminal_has_256_colors
+                 ? theme->palette_256[i]
+                 : theme->palette_8[i];
+        init_pair((short)(PAIR_MOMENTUM_FIRST + i), fg, -1);
+    }
+
+    if (terminal_has_256_colors) {
+        init_pair(PAIR_WALL, 244, -1);
+        init_pair(PAIR_HUD,  226, -1);     /* bright yellow */
+        init_pair(PAIR_HINT,  51, -1);     /* bright cyan   */
+    } else {
+        init_pair(PAIR_WALL, COLOR_WHITE,  -1);
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
+    }
+}
+
+static void colors_init(int theme_index)
+{
+    start_color();
+    use_default_colors();
+    terminal_has_256_colors = (COLORS >= 256);
+    colors_apply_theme(theme_index);
+}
+
+/* Map 3×3-averaged horizontal momentum (signed, roughly in [-2, +2])
+ * to a colour-pair index 0..8.  Linear bin, clamped. */
+static inline int momentum_to_color_bucket(float m_avg_doubled)
+{
+    float t = (m_avg_doubled + 2.0f) / 4.0f;        /* → [0, 1] */
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    int idx = (int)(t * 8.49f);                     /* → [0, 8] */
+    if (idx < 0)                            idx = 0;
+    if (idx >= MOMENTUM_BUCKET_COUNT)       idx = MOMENTUM_BUCKET_COUNT - 1;
+    return idx;
+}
+
+/* Density-to-glyph ramp.  Indexed by round(ρ̄). */
+static const char density_glyph_ramp[DENSITY_GLYPH_COUNT] = {
+    ' ', '.', ',', 'o', 'O', '0', '@'
+};
+
+/* ===================================================================== */
+/* §9  grid_state — main + double-buffer + wall mask                     */
+/* ===================================================================== */
+/*
+ * particle_grid[r][c]    current state, 6 bits used per cell
+ * stream_buffer[r][c]    scratch for the streaming phase (§12)
+ * wall_mask[r][c]        true if cell is solid obstacle
+ *
+ * grid_active_rows / grid_active_cols: actual in-use dimensions
+ * (terminal might be smaller than the maximum).
+ */
+
+static uint8_t particle_grid [GRID_ROWS_MAX][GRID_COLS_MAX];
+static uint8_t stream_buffer [GRID_ROWS_MAX][GRID_COLS_MAX];
+static bool    wall_mask     [GRID_ROWS_MAX][GRID_COLS_MAX];
+
+static int     grid_active_rows = 0;
+static int     grid_active_cols = 0;
+
+static int     active_preset_index    = 0;
+static int     active_theme_index     = 0;
+static int     physics_steps_per_frame = STEPS_PER_FRAME_DEFAULT;
+static int     sim_steps_per_second   = SIM_HZ_DEFAULT;
+static bool    simulation_paused      = false;
+static bool    inlet_enabled          = true;
+static float   inlet_probability_per_cell = INLET_PROB_DEFAULT;
+static long    physics_tick_count     = 0;
+
+/* ===================================================================== */
+/* §10  step_inject_inlet — drive flow from left edge                    */
+/* ===================================================================== */
+/*
+ * For each non-wall cell on column 0, with probability p, set bit 0
+ * (= particle moving E).  This is the "wind" that drives the flow.
+ *
+ * If the inlet bit is already set, "|=" leaves it alone.
+ */
+
+static void step_inject_inlet(void)
+{
+    if (!inlet_enabled) return;
+    for (int r = 0; r < grid_active_rows; r++) {
+        if (wall_mask[r][0]) continue;
+        if (xorshift_unit_float() < inlet_probability_per_cell)
+            particle_grid[r][0] |= (uint8_t)(1u << DIR_E);
+    }
+}
+
+/* ===================================================================== */
+/* §11  step_collide — collision phase (table lookup)                    */
+/* ===================================================================== */
+/*
+ * For each non-wall cell, replace its 6-bit state with the post-
+ * collision state from collision_table[parity][state].
+ *
+ * Parity = (row + col) & 1 — alternating CW/CCW chirality cancels
+ * global rotation bias (T4).
+ *
+ * MASKING with HEX_DIRECTION_BITS_MASK belt-and-braces guard against
+ * any spurious upper-bit corruption.
+ */
+static void step_collide(void)
+{
+    for (int r = 0; r < grid_active_rows; r++) {
+        for (int c = 0; c < grid_active_cols; c++) {
+            if (wall_mask[r][c]) continue;
+            int parity = (r + c) & 1;
+            uint8_t s  = particle_grid[r][c] & HEX_DIRECTION_BITS_MASK;
+            particle_grid[r][c] = collision_table[parity][s];
+        }
+    }
+}
+
+/* ===================================================================== */
+/* §12  step_stream — streaming + bounce-back                            */
+/* ===================================================================== */
+/*
+ * Double-buffered streaming.  Every set bit in particle_grid[r][c]
+ * hops one cell in its direction.  At wall encounters, the bit
+ * STAYS at (r, c) but flipped to the opposite direction (bounce-back).
+ *
+ * Toroidal wrap: indices outside the grid wrap around (modulo).  This
+ * makes left/right edges connect (so flow that exits east re-enters
+ * west of column 0).
+ */
+
+static void step_stream(void)
+{
+    memset(stream_buffer, 0, sizeof stream_buffer);
+
+    for (int r = 0; r < grid_active_rows; r++) {
+        int parity = r & 1;
+        for (int c = 0; c < grid_active_cols; c++) {
+            if (wall_mask[r][c]) continue;
+            uint8_t state = particle_grid[r][c];
+            if (state == 0) continue;
+
+            for (int d = 0; d < HEX_DIRECTIONS; d++) {
+                if (!((state >> d) & 1)) continue;
+
+                int nr = (r + hex_direction_drow[parity][d]
+                          + grid_active_rows) % grid_active_rows;
+                int nc = (c + hex_direction_dcol[parity][d]
+                          + grid_active_cols) % grid_active_cols;
+
+                if (wall_mask[nr][nc]) {
+                    /* Bounce-back: stay at source, flip direction. */
+                    stream_buffer[r][c] |=
+                        (uint8_t)(1u << direction_bounce_back[d]);
+                } else {
+                    /* Normal hop: deposit bit d at neighbour cell. */
+                    stream_buffer[nr][nc] |= (uint8_t)(1u << d);
+                }
+            }
+        }
+    }
+
+    memcpy(particle_grid, stream_buffer, sizeof particle_grid);
+}
+
+/* ===================================================================== */
+/* §13  step — full physics tick                                         */
+/* ===================================================================== */
+/*
+ *   1. INJECT INLET — add east-going particles to left edge
+ *   2. COLLIDE      — table lookup per cell
+ *   3. STREAM       — bit-shift particles to neighbour cells
+ *
+ * The whole physics in three lines.
+ */
+static void physics_step(void)
+{
+    step_inject_inlet();
+    step_collide();
+    step_stream();
+    physics_tick_count++;
+}
+
+/* ===================================================================== */
+/* §14  presets — 6 preset definitions                                   */
+/* ===================================================================== */
+/*
+ * Each preset specifies:
+ *   inlet            — whether to drive flow from left edge
+ *   initial_density  — fraction of bits randomly seeded at start
+ *                      (only the "Free" preset uses > 0)
+ *   name / desc      — strings shown in the HUD
+ */
+
+typedef struct {
+    bool        inlet;
+    float       initial_density;
+    const char *name;
+    const char *desc;
 } Preset;
 
-static const Preset k_presets[N_PRESETS] = {
+static const Preset preset_table[PRESET_COUNT] = {
     { true,  0.0f, "Cylinder",
-      "Particles hit cylinder -- watch BLUE wake form and grow behind it" },
+      "Particles hit cylinder -- BLUE wake forms and grows behind" },
     { true,  0.0f, "2-Slit",
       "Two gaps in a wall -- jets spread out and meet in the middle" },
     { true,  0.0f, "3-Slit",
-      "Three gaps -- three jets spread and interfere beyond the wall" },
+      "Three gaps -- three jets spread and interfere downstream" },
     { true,  0.0f, "4-Slit",
-      "Four gaps -- tight jets, rich interference pattern downstream" },
+      "Four gaps -- tight jets, rich interference pattern" },
     { true,  0.0f, "Channel",
-      "Parallel walls top & bottom -- flow is fastest in the centre (Poiseuille)" },
+      "Parallel walls top & bottom -- flow fastest at centre (Poiseuille)" },
     { false, 0.40f, "Free",
-      "No inlet, no walls -- random gas collides and spreads toward equilibrium" },
+      "No inlet, no walls -- random gas relaxes toward equilibrium" },
 };
 
-/* ------------------------------------------------------------------ */
-
+/* ===================================================================== */
+/* §15  scene_load — apply preset to walls + state                       */
+/* ===================================================================== */
 /*
- * Build a vertical slit wall at column wc with n_slits evenly-spaced gaps.
- * Each gap is ~11% of the screen height; centres are equally distributed.
+ * Wipe the grid, then build the preset-specific obstacle layout and
+ * (optionally) seed initial particles.
  */
-static void add_slit_wall(int n_slits)
-{
-    int wc    = g_cols / 3;
-    int gap_h = g_rows / (n_slits * 3);   /* each gap height */
-    if (gap_h < 2) gap_h = 2;
 
-    for (int r = 0; r < g_rows; r++) {
-        bool in_slit = false;
-        for (int s = 0; s < n_slits; s++) {
-            int center = g_rows * (s + 1) / (n_slits + 1);
-            if (r >= center - gap_h/2 && r < center + gap_h/2) {
-                in_slit = true;
+static void scene_seed_random_particles(float density_per_bit)
+{
+    if (density_per_bit <= 0.0f) return;
+    for (int r = 0; r < grid_active_rows; r++) {
+        for (int c = 0; c < grid_active_cols; c++) {
+            uint8_t bits = 0;
+            for (int b = 0; b < HEX_DIRECTIONS; b++)
+                if (xorshift_unit_float() < density_per_bit)
+                    bits |= (uint8_t)(1u << b);
+            particle_grid[r][c] = bits;
+        }
+    }
+}
+
+static void scene_build_cylinder(void)
+{
+    int centre_col = grid_active_cols * 2 / 5;
+    int centre_row = grid_active_rows / 2;
+    int radius     = grid_active_cols / 12;
+    if (radius < 3) radius = 3;
+
+    for (int r = 0; r < grid_active_rows; r++) {
+        for (int c = 0; c < grid_active_cols; c++) {
+            float dx = (float)(c - centre_col);
+            float dy = (float)(r - centre_row)
+                     * ASPECT_FACTOR_CELL_TO_VISUAL;
+            if (dx * dx + dy * dy < (float)(radius * radius)) {
+                wall_mask    [r][c] = true;
+                particle_grid[r][c] = 0;
+            }
+        }
+    }
+}
+
+static void scene_build_slit_wall(int slit_count)
+{
+    int wall_col   = grid_active_cols / 3;
+    int gap_height = grid_active_rows / (slit_count * 3);
+    if (gap_height < 2) gap_height = 2;
+
+    for (int r = 0; r < grid_active_rows; r++) {
+        bool inside_slit = false;
+        for (int s = 0; s < slit_count; s++) {
+            int slit_centre_row =
+                grid_active_rows * (s + 1) / (slit_count + 1);
+            if (r >= slit_centre_row - gap_height / 2
+             && r <  slit_centre_row + gap_height / 2) {
+                inside_slit = true;
                 break;
             }
         }
-        if (!in_slit)
-            for (int cc = wc; cc < wc + 2 && cc < g_cols; cc++)
-                { g_wall[r][cc] = true; g_grid[r][cc] = 0; }
-    }
-}
+        if (inside_slit) continue;
 
-static void scene_init(int preset)
-{
-    g_preset   = preset;
-    g_inlet_on = k_presets[preset].inlet;
-    g_tick     = 0;
-    memset(g_wall, 0, sizeof g_wall);
-    memset(g_grid, 0, sizeof g_grid);
-
-    /* Random seed only for Free preset; others start empty so flow develops */
-    float d = k_presets[preset].init_density;
-    if (d > 0.0f)
-        for (int r = 0; r < g_rows; r++)
-            for (int c = 0; c < g_cols; c++)
-                for (int b = 0; b < 6; b++)
-                    if (rng_float() < d)
-                        g_grid[r][c] |= (uint8_t)(1u << b);
-
-    switch (preset) {
-    case 0: {   /* Cylinder: circular obstacle at 2/5 from left */
-        int cx = g_cols * 2 / 5, cy = g_rows / 2;
-        int R  = g_cols / 12; if (R < 3) R = 3;
-        for (int r = 0; r < g_rows; r++)
-            for (int c = 0; c < g_cols; c++) {
-                float dx = (float)(c - cx);
-                float dy = (float)(r - cy) * ASPECT_R;
-                if (dx*dx + dy*dy < (float)(R*R))
-                    { g_wall[r][c] = true; g_grid[r][c] = 0; }
-            }
-        break;
-    }
-    case 1: add_slit_wall(2); break;
-    case 2: add_slit_wall(3); break;
-    case 3: add_slit_wall(4); break;
-    case 4: {   /* Channel: solid top and bottom walls */
-        int wh = (g_rows > 8) ? 2 : 1;
-        for (int c = 0; c < g_cols; c++)
-            for (int i = 0; i < wh; i++) {
-                g_wall[i][c] = g_wall[g_rows-1-i][c] = true;
-                g_grid[i][c] = g_grid[g_rows-1-i][c] = 0;
-            }
-        break;
-    }
-    case 5: break;  /* Free: no obstacles */
-    }
-}
-
-/* ------------------------------------------------------------------ */
-
-static void inject_inlet(void)
-{
-    /* Force eastward particles at left column — this drives the flow */
-    for (int r = 0; r < g_rows; r++) {
-        if (g_wall[r][0]) continue;
-        if (rng_float() < g_inlet_prob)
-            g_grid[r][0] |= 0x01u;   /* bit 0 = East direction */
-    }
-}
-
-static void grid_collide(void)
-{
-    for (int r = 0; r < g_rows; r++)
-        for (int c = 0; c < g_cols; c++) {
-            if (g_wall[r][c]) continue;
-            g_grid[r][c] = g_col[(r+c)&1][g_grid[r][c] & 0x3Fu];
-        }
-}
-
-static void grid_stream(void)
-{
-    memset(g_buf, 0, sizeof g_buf);
-    for (int r = 0; r < g_rows; r++) {
-        int par = r & 1;
-        for (int c = 0; c < g_cols; c++) {
-            if (g_wall[r][c]) continue;
-            uint8_t s = g_grid[r][c];
-            if (!s) continue;
-            for (int d = 0; d < 6; d++) {
-                if (!(s & (uint8_t)(1u << d))) continue;
-                int nr = (r + DIR_DR[par][d] + g_rows) % g_rows;
-                int nc = (c + DIR_DC[par][d] + g_cols) % g_cols;
-                if (g_wall[nr][nc])
-                    g_buf[r][c]   |= (uint8_t)(1u << ((d+3)%6));
-                else
-                    g_buf[nr][nc] |= (uint8_t)(1u << d);
-            }
+        /* Make the wall TWO cells thick so particles can't tunnel. */
+        for (int dc = 0; dc < 2; dc++) {
+            int wc = wall_col + dc;
+            if (wc >= grid_active_cols) break;
+            wall_mask    [r][wc] = true;
+            particle_grid[r][wc] = 0;
         }
     }
-    memcpy(g_grid, g_buf, sizeof g_grid);
 }
 
-static void grid_step(void)
+static void scene_build_channel(void)
 {
-    if (g_inlet_on) inject_inlet();
-    grid_collide();
-    grid_stream();
-    g_tick++;
+    int wall_thickness = (grid_active_rows > 8) ? 2 : 1;
+    for (int c = 0; c < grid_active_cols; c++) {
+        for (int i = 0; i < wall_thickness; i++) {
+            wall_mask    [i][c]                          = true;
+            wall_mask    [grid_active_rows - 1 - i][c]   = true;
+            particle_grid[i][c]                          = 0;
+            particle_grid[grid_active_rows - 1 - i][c]   = 0;
+        }
+    }
+}
+
+static void scene_load(int preset_index)
+{
+    if (preset_index < 0 || preset_index >= PRESET_COUNT) preset_index = 0;
+    active_preset_index = preset_index;
+    inlet_enabled       = preset_table[preset_index].inlet;
+    physics_tick_count  = 0;
+
+    memset(wall_mask,     0, sizeof wall_mask);
+    memset(particle_grid, 0, sizeof particle_grid);
+    memset(stream_buffer, 0, sizeof stream_buffer);
+
+    scene_seed_random_particles(preset_table[preset_index].initial_density);
+
+    switch (preset_index) {
+        case 0: scene_build_cylinder();           break;
+        case 1: scene_build_slit_wall(2);         break;
+        case 2: scene_build_slit_wall(3);         break;
+        case 3: scene_build_slit_wall(4);         break;
+        case 4: scene_build_channel();            break;
+        case 5: /* Free — no obstacles */         break;
+        default: break;
+    }
 }
 
 /* ===================================================================== */
-/* §6  draw                                                               */
+/* §16  cell_neighbourhood — 3×3 spatial average                         */
 /* ===================================================================== */
-
 /*
- * cell_avg: average particle density and horizontal momentum over a 3×3
- * neighbourhood.  This smooths out discrete particle noise and reveals
- * the macroscopic flow patterns (wake, boundary layer, jets).
+ * Average particle-count and momentum-x-doubled over the 3×3 block
+ * centred on (r, c), excluding wall cells.  Returns the averaged
+ * density and momentum.  Used by the renderer (§17).
  */
-static void cell_avg(int r, int c, float *den_out, float *mx_out)
+
+static void cell_neighbourhood_average(int r, int c,
+                                       float *density_out,
+                                       float *momentum_x_doubled_out)
 {
-    float den = 0.0f, mx = 0.0f;
-    int   cnt = 0;
-    for (int dr = -1; dr <= 1; dr++) {
-        for (int dc = -1; dc <= 1; dc++) {
-            int nr = r + dr, nc = c + dc;
-            if (nr < 0 || nr >= g_rows || nc < 0 || nc >= g_cols) continue;
-            if (g_wall[nr][nc]) continue;
-            uint8_t s = g_grid[nr][nc];
-            den += (float)__builtin_popcount((unsigned)s);
-            mx  += (float)cell_mx2(s);
-            cnt++;
+    float density_sum    = 0.0f;
+    float momentum_sum   = 0.0f;
+    int   counted        = 0;
+
+    for (int dr = -AVG_WINDOW_HALF; dr <= AVG_WINDOW_HALF; dr++) {
+        for (int dc = -AVG_WINDOW_HALF; dc <= AVG_WINDOW_HALF; dc++) {
+            int nr = r + dr;
+            int nc = c + dc;
+            if (nr < 0 || nr >= grid_active_rows) continue;
+            if (nc < 0 || nc >= grid_active_cols) continue;
+            if (wall_mask[nr][nc])                continue;
+
+            uint8_t s = particle_grid[nr][nc];
+            density_sum  += (float)cell_particle_count(s);
+            momentum_sum += (float)cell_momentum_x_doubled(s);
+            counted++;
         }
     }
-    if (cnt > 0) { den /= (float)cnt; mx /= (float)cnt; }
-    *den_out = den;
-    *mx_out  = mx;
+
+    if (counted > 0) {
+        density_sum  /= (float)counted;
+        momentum_sum /= (float)counted;
+    }
+    *density_out             = density_sum;
+    *momentum_x_doubled_out  = momentum_sum;
 }
 
+/* ===================================================================== */
+/* §17  render — fluid + walls + glyph ramp                              */
+/* ===================================================================== */
 /*
- * Map averaged horizontal momentum to colour-pair index 0..8.
- * After 3×3 averaging, mx lives roughly in [-2, +2].
+ * For each visible cell:
+ *   if WALL              — draw '#' in wall colour
+ *   else compute (ρ̄, m̄x) from §16
+ *     if ρ̄ < BLANK_THRESHOLD  → leave blank
+ *     else                     → glyph from ramp[round(ρ̄)],
+ *                                 colour from momentum bucket,
+ *                                 A_BOLD if dense.
+ *
+ * The fluid's appearance is driven entirely by these two mappings;
+ * see tutorial T7.
  */
-static inline int mx_to_idx(float mx)
+
+static void render_fluid_field(int draw_rows, int draw_cols)
 {
-    float t = (mx + 2.0f) / 4.0f;   /* [-2,+2] → [0,1] */
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
-    int idx = (int)(t * 8.49f);
-    return (idx < 0) ? 0 : (idx > 8) ? 8 : idx;
-}
-
-/*
- * Fluid character set — density drives character choice.
- * Sparse fluid: '.' or ','  Dense fluid: 'O' '0' '@'
- * Index 0 = empty (never reached via den threshold), 1..6 = particle counts.
- */
-static const char k_fluid[7] = { ' ', '.', ',', 'o', 'O', '0', '@' };
-
-static void scene_draw(void)
-{
-    erase();
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-
-    int draw_rows = (g_rows < rows - 2) ? g_rows : rows - 2;
-    int draw_cols = (g_cols < cols)     ? g_cols : cols;
-
-    /* ── main fluid field ── */
     for (int r = 0; r < draw_rows; r++) {
         for (int c = 0; c < draw_cols; c++) {
 
-            if (g_wall[r][c]) {
-                attron(COLOR_PAIR(CP_WALL) | A_BOLD);
+            if (wall_mask[r][c]) {
+                attron(COLOR_PAIR(PAIR_WALL) | A_BOLD);
                 mvaddch(r, c, '#');
-                attroff(COLOR_PAIR(CP_WALL) | A_BOLD);
+                attroff(COLOR_PAIR(PAIR_WALL) | A_BOLD);
                 continue;
             }
 
-            float den, mx;
-            cell_avg(r, c, &den, &mx);
+            float density, momentum_doubled;
+            cell_neighbourhood_average(r, c, &density, &momentum_doubled);
 
-            if (den < 0.25f) {
-                /* Nearly empty — leave as terminal background (black) */
+            if (density < DENSITY_BLANK_THRESHOLD) {
                 mvaddch(r, c, ' ');
                 continue;
             }
 
-            /* Density → character, momentum → colour */
-            int n = (int)(den + 0.5f);
-            if (n < 1) n = 1;
-            if (n > 6) n = 6;
+            int glyph_index = (int)(density + 0.5f);
+            if (glyph_index < 1)                       glyph_index = 1;
+            if (glyph_index >= DENSITY_GLYPH_COUNT)
+                glyph_index = DENSITY_GLYPH_COUNT - 1;
 
-            int cp    = CP_M1 + mx_to_idx(mx);
-            int bold  = (den >= 3.5f) ? A_BOLD : 0;
+            int  bucket = momentum_to_color_bucket(momentum_doubled);
+            int  pair   = PAIR_MOMENTUM_FIRST + bucket;
+            attr_t bold = (density >= DENSITY_BOLD_THRESHOLD) ? A_BOLD : 0;
 
-            attron(COLOR_PAIR(cp) | bold);
-            mvaddch(r, c, (chtype)k_fluid[n]);
-            attroff(COLOR_PAIR(cp) | bold);
+            attron(COLOR_PAIR(pair) | bold);
+            mvaddch(r, c,
+                    (chtype)(unsigned char)density_glyph_ramp[glyph_index]);
+            attroff(COLOR_PAIR(pair) | bold);
         }
     }
-
-    /* ── HUD row 1: preset description ── */
-    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvprintw(rows-2, 0,
-        " [%d] %-8s  %s  %s  tick:%-6ld  inlet:%.0f%%  steps:%d  fps:%d ",
-        g_preset + 1,
-        k_presets[g_preset].name,
-        k_presets[g_preset].desc,
-        g_paused ? " ** PAUSED **" : "",
-        g_tick, g_inlet_prob * 100.0f, g_steps, g_sim_fps);
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
-
-    /* ── HUD row 2: colour legend + controls ── */
-    attron(COLOR_PAIR(CP_HUD));
-    mvprintw(rows-1, 0,
-        "  Colour: BLUE<-left  GREY=still  RED->right  "
-        "Chars: .=sparse  @=dense  "
-        "[n/N]preset  [t/T]theme  [i/I]inlet  [+/-]speed  [r]reset  [p]pause  [q]quit");
-    attroff(COLOR_PAIR(CP_HUD));
 }
 
 /* ===================================================================== */
-/* §7  screen                                                             */
+/* §18  hud — top status + bottom hint                                   */
 /* ===================================================================== */
+/*
+ * Two HUD elements per CLAUDE.md spec:
+ *   - STATUS at top-right: PAIR_HUD bright yellow + A_BOLD
+ *   - HINT   at bottom:    PAIR_HINT bright cyan   + A_BOLD
+ *
+ * The PRESET DESCRIPTION lives at row 1 (dimmed-yellow A_NORMAL) so
+ * the bright top status row doesn't fight with descriptive text.
+ */
 
-static volatile sig_atomic_t g_resize = 0;
-static volatile sig_atomic_t g_quit   = 0;
-
-static void handle_sigwinch(int s) { (void)s; g_resize = 1; }
-static void handle_sigterm (int s) { (void)s; g_quit   = 1; }
-
-static void screen_init(void)
+static void hud_paint_status(int term_cols)
 {
-    initscr(); cbreak(); noecho();
-    keypad(stdscr, TRUE); nodelay(stdscr, TRUE);
-    curs_set(0); typeahead(-1);
-    start_color();
-    g_has_256 = (COLORS >= 256);
-    theme_apply(g_theme);
+    char buf[200];
+    snprintf(buf, sizeof buf,
+             " [%d] %-9s tick:%-6ld inlet:%3.0f%% steps:%2d sim:%2dHz "
+             "theme:%-7s %s ",
+             active_preset_index + 1,
+             preset_table[active_preset_index].name,
+             physics_tick_count,
+             inlet_probability_per_cell * 100.0f,
+             physics_steps_per_frame,
+             sim_steps_per_second,
+             color_theme_table[active_theme_index].name,
+             simulation_paused ? "PAUSED" : "running");
+    int len = (int)strlen(buf);
+    int x   = term_cols - len;
+    if (x < 0) x = 0;
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, x, "%s", buf);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void screen_resize(void)
+static void hud_paint_description(int term_rows, int term_cols)
 {
-    endwin(); refresh();
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    g_rows = (rows-2 < ROWS_MAX) ? rows-2 : ROWS_MAX;
-    g_cols = (cols   < COLS_MAX) ? cols    : COLS_MAX;
-    g_resize = 0;
+    /* Preset description on the second row from bottom (above hint). */
+    attron(COLOR_PAIR(PAIR_HUD));
+    mvprintw(term_rows - 2, 0,
+             "  %-*s",
+             term_cols - 2,
+             preset_table[active_preset_index].desc);
+    attroff(COLOR_PAIR(PAIR_HUD));
+}
+
+static void hud_paint_hint(int term_rows)
+{
+    const char *hint =
+        " q:quit  spc:pause  r:reset  n/N:preset  t/T:theme  "
+        "i/I:inlet  +/-:steps  ]/[:simHz ";
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(term_rows - 1, 0, "%s", hint);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
-/* §8  app                                                                */
+/* §19  screen — ncurses init / cleanup                                  */
 /* ===================================================================== */
+
+typedef struct { int rows; int cols; } Screen;
+
+static void screen_init(Screen *s, int theme_index)
+{
+    initscr();
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    curs_set(0);
+    typeahead(-1);
+    colors_init(theme_index);
+    getmaxyx(stdscr, s->rows, s->cols);
+}
+
+static void screen_cleanup(void)
+{
+    endwin();
+}
+
+static void screen_resize(Screen *s)
+{
+    endwin();
+    refresh();
+    getmaxyx(stdscr, s->rows, s->cols);
+
+    grid_active_rows = (s->rows - HUD_RESERVED_ROWS < GRID_ROWS_MAX)
+                     ? (s->rows - HUD_RESERVED_ROWS) : GRID_ROWS_MAX;
+    grid_active_cols = (s->cols < GRID_COLS_MAX)
+                     ? s->cols : GRID_COLS_MAX;
+    if (grid_active_rows < 4) grid_active_rows = 4;
+    if (grid_active_cols < 4) grid_active_cols = 4;
+}
+
+static void screen_present_frame(Screen *s)
+{
+    erase();
+    int draw_rows = (grid_active_rows < s->rows - HUD_RESERVED_ROWS)
+                  ? grid_active_rows : s->rows - HUD_RESERVED_ROWS;
+    int draw_cols = (grid_active_cols < s->cols)
+                  ? grid_active_cols : s->cols;
+    render_fluid_field(draw_rows, draw_cols);
+    hud_paint_status     (s->cols);
+    hud_paint_description(s->rows, s->cols);
+    hud_paint_hint       (s->rows);
+    wnoutrefresh(stdscr);
+    doupdate();
+}
+
+/* ===================================================================== */
+/* §20  app — main loop + signals + input                                */
+/* ===================================================================== */
+
+static volatile sig_atomic_t g_should_quit    = 0;
+static volatile sig_atomic_t g_resize_pending = 0;
+
+static void on_signal(int sig)
+{
+    if (sig == SIGWINCH) g_resize_pending = 1;
+    else                 g_should_quit    = 1;
+}
+
+static bool app_handle_key(int ch, Screen *s)
+{
+    switch (ch) {
+        case 'q': case 'Q': case 27:
+            return false;
+
+        case 'p': case ' ':
+            simulation_paused = !simulation_paused;
+            break;
+
+        case 'r': case 'R':
+            scene_load(active_preset_index);
+            break;
+
+        case 'n':
+            scene_load((active_preset_index + 1) % PRESET_COUNT);
+            break;
+        case 'N':
+            scene_load((active_preset_index + PRESET_COUNT - 1)
+                       % PRESET_COUNT);
+            break;
+
+        case 't':
+            active_theme_index = (active_theme_index + 1) % THEME_COUNT;
+            colors_apply_theme(active_theme_index);
+            break;
+        case 'T':
+            active_theme_index =
+                (active_theme_index + THEME_COUNT - 1) % THEME_COUNT;
+            colors_apply_theme(active_theme_index);
+            break;
+
+        case 'i':
+            if (inlet_probability_per_cell + INLET_PROB_STEP <= INLET_PROB_MAX)
+                inlet_probability_per_cell += INLET_PROB_STEP;
+            break;
+        case 'I':
+            if (inlet_probability_per_cell - INLET_PROB_STEP >= INLET_PROB_MIN)
+                inlet_probability_per_cell -= INLET_PROB_STEP;
+            break;
+
+        case '+': case '=':
+            if (physics_steps_per_frame < STEPS_PER_FRAME_MAX)
+                physics_steps_per_frame++;
+            break;
+        case '-':
+            if (physics_steps_per_frame > STEPS_PER_FRAME_MIN)
+                physics_steps_per_frame--;
+            break;
+
+        case ']':
+            if (sim_steps_per_second + SIM_HZ_STEP <= SIM_HZ_MAX)
+                sim_steps_per_second += SIM_HZ_STEP;
+            break;
+        case '[':
+            if (sim_steps_per_second - SIM_HZ_STEP >= SIM_HZ_MIN)
+                sim_steps_per_second -= SIM_HZ_STEP;
+            break;
+
+        default:
+            break;
+    }
+    (void)s;
+    return true;
+}
 
 int main(void)
 {
-    signal(SIGWINCH, handle_sigwinch);
-    signal(SIGTERM,  handle_sigterm);
-    signal(SIGINT,   handle_sigterm);
+    xorshift_state = (uint32_t)time(NULL) ^ 0xFACEB00Cu;
 
-    g_rng = (uint32_t)time(NULL) ^ 0xFACEB00Cu;
-    build_collision_tables();
-    screen_init();
+    atexit(screen_cleanup);
+    signal(SIGINT,   on_signal);
+    signal(SIGTERM,  on_signal);
+    signal(SIGWINCH, on_signal);
 
-    { int rows, cols; getmaxyx(stdscr, rows, cols);
-      g_rows = (rows-2 < ROWS_MAX) ? rows-2 : ROWS_MAX;
-      g_cols = (cols   < COLS_MAX) ? cols    : COLS_MAX; }
+    collision_table_build();
 
-    scene_init(g_preset);
-    int64_t next_tick = clock_ns();
+    Screen screen;
+    screen_init(&screen, active_theme_index);
 
-    while (!g_quit) {
+    grid_active_rows = (screen.rows - HUD_RESERVED_ROWS < GRID_ROWS_MAX)
+                     ? (screen.rows - HUD_RESERVED_ROWS) : GRID_ROWS_MAX;
+    grid_active_cols = (screen.cols < GRID_COLS_MAX)
+                     ? screen.cols : GRID_COLS_MAX;
+    if (grid_active_rows < 4) grid_active_rows = 4;
+    if (grid_active_cols < 4) grid_active_cols = 4;
+
+    scene_load(active_preset_index);
+
+    int64_t       next_physics_at_ns = clock_now_ns();
+    const int64_t frame_cap_ns       = NS_PER_SEC / RENDER_FPS_CAP;
+
+    while (!g_should_quit) {
+        int64_t frame_start = clock_now_ns();
 
         /* ── input ── */
         int ch;
         while ((ch = getch()) != ERR) {
-            switch (ch) {
-            case 'q': case 27: g_quit = 1; break;
-            case 'p': case ' ': g_paused = !g_paused; break;
-            case 'r': scene_init(g_preset); break;
-            case 'n': scene_init((g_preset + 1) % N_PRESETS); break;
-            case 'N': scene_init((g_preset + N_PRESETS - 1) % N_PRESETS); break;
-            case 't':
-                g_theme = (g_theme + 1) % N_THEMES;
-                theme_apply(g_theme);
-                break;
-            case 'T':
-                g_theme = (g_theme + N_THEMES - 1) % N_THEMES;
-                theme_apply(g_theme);
-                break;
-            case 'i':
-                if (g_inlet_prob < INLET_PROB_MAX) g_inlet_prob += INLET_PROB_STEP;
-                break;
-            case 'I':
-                if (g_inlet_prob > INLET_PROB_MIN) g_inlet_prob -= INLET_PROB_STEP;
-                break;
-            case '+': case '=':
-                if (g_steps < STEPS_MAX) g_steps++;
-                break;
-            case '-':
-                if (g_steps > STEPS_MIN) g_steps--;
-                break;
-            case ']':
-                if (g_sim_fps < SIM_FPS_MAX) g_sim_fps += SIM_FPS_STEP;
-                break;
-            case '[':
-                if (g_sim_fps > SIM_FPS_MIN) g_sim_fps -= SIM_FPS_STEP;
+            if (!app_handle_key(ch, &screen)) {
+                g_should_quit = 1;
                 break;
             }
         }
 
         /* ── resize ── */
-        if (g_resize) { screen_resize(); scene_init(g_preset); }
+        if (g_resize_pending) {
+            g_resize_pending = 0;
+            screen_resize(&screen);
+            scene_load(active_preset_index);
+            next_physics_at_ns = clock_now_ns();
+        }
 
-        /* ── simulate ── */
-        int64_t now = clock_ns();
-        if (!g_paused && now >= next_tick) {
-            for (int s = 0; s < g_steps; s++) grid_step();
-            next_tick = now + TICK_NS(g_sim_fps);
+        /* ── physics ── */
+        int64_t now_ns = clock_now_ns();
+        if (!simulation_paused && now_ns >= next_physics_at_ns) {
+            for (int s = 0; s < physics_steps_per_frame; s++)
+                physics_step();
+            next_physics_at_ns = now_ns + TICK_NS(sim_steps_per_second);
         }
 
         /* ── render ── */
-        scene_draw();
-        wnoutrefresh(stdscr);
-        doupdate();
+        screen_present_frame(&screen);
 
-        /* ── sleep until next frame ── */
-        clock_sleep_ns(next_tick - clock_ns() - 1000000LL);
+        /* ── frame cap ── */
+        int64_t spent = clock_now_ns() - frame_start;
+        if (spent < frame_cap_ns) clock_sleep_ns(frame_cap_ns - spent);
     }
 
-    endwin();
     return 0;
 }

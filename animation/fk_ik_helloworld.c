@@ -323,6 +323,246 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read fk_helloworld.c AND ik_helloworld.c first;
+ *      this file is the 3-link version with a switchable solver,
+ *      so it presupposes both halves of the 2-link case.
+ *   2. §5 ik_fk — TWO solvers + a target clamp. Read AFTER tutorials
+ *      T1-T6:
+ *        compute_fk     (3-link FK propagation, 6 trig calls)
+ *        solve_ik3      (the 2+1 hybrid)
+ *        clamp_to_reach (keeps the IK target inside the reach disc)
+ *   3. §6 scene — input dispatcher: which key handler runs depends
+ *      on the current Mode. Mode toggle is 'm'.
+ *   4. §1-§4 + §7-§8 — infrastructure. Skim if you've seen the
+ *      framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   theta1, 2, 3       FK joint angles. theta1 absolute; theta2 and
+ *                      theta3 RELATIVE to their predecessor link.
+ *   L1, L2, L3         link lengths. Constant.
+ *   S, E, W, H         shoulder, elbow, wrist, hand (Vec2). S fixed.
+ *   T                  target (Vec2) — IK INPUT only.
+ *   T2                 virtual 2-link target inside the IK hybrid:
+ *                      T pulled back by L3 along the S→T direction.
+ *   elbow_up           bool, picks the 2-link branch (elbow above or
+ *                      below the S→T2 line).
+ *   Mode               enum { MODE_FK, MODE_IK }; toggled by 'm'.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Both helloworld solvers (fk_helloworld T2-T3 and
+ *     ik_helloworld T3-T5).
+ *   - Vector normalisation: dir = v / |v|.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - General N-link IK (FABRIK, Jacobian). The 2+1 hybrid here
+ *     is a clean way to TEACH 3-link IK without those iterative
+ *     solvers; ik_arm_reach.c covers FABRIK on a longer chain.
+ *   - Quaternions / rotation matrices. We're still in 2-D.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that progress from the 2-link case into 3-link IK
+ * via the simplest design choice that breaks the redundancy.
+ *
+ *   T1  Two modes, one arm — FK and IK as DUAL viewpoints
+ *   T2  3-link FK is just 2-link FK with one more step
+ *   T3  3-link IK is UNDERDETERMINED — what changes
+ *   T4  The 2+1 hybrid — pin the wrist direction
+ *   T5  Why the 2+1 split mirrors real animation rigs
+ *   T6  When the hybrid is wrong (and what to do then)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  TWO MODES, ONE ARM — FK AND IK AS DUAL VIEWPOINTS
+ * ─────────────────────────────────────────────────────
+ * One geometry: shoulder + 3 links + 4 markers. TWO ways to
+ * specify a pose:
+ *
+ *   FK ("puppeteer"):  user gives you angles. You compute positions.
+ *                      Always succeeds. One unique answer.
+ *
+ *   IK ("goal"):       user gives you a target. You compute angles.
+ *                      Can fail if unreachable. Multiple answers if
+ *                      it succeeds.
+ *
+ * Same struct holds the result either way:
+ *
+ *     struct ArmPose { Vec2 elbow, wrist, hand; }
+ *
+ * Whichever solver runs writes into that struct; the renderer
+ * doesn't know which one ran. That's the LESSON of having both
+ * modes in one file: the OUTPUT representation is the same. FK
+ * and IK are just different ways to ARRIVE at the same pose.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │   FK input         shared output     IK input    │
+ *      │                                                  │
+ *      │   θ1, θ2, θ3   →   ArmPose       ←   target T    │
+ *      │     ↑                                  ↑         │
+ *      │  arrow keys                       arrow keys     │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Toggling 'm' switches which input pipeline is alive. The arm
+ * keeps drawing through the same code regardless.
+ *
+ * T2  3-LINK FK IS JUST 2-LINK FK WITH ONE MORE STEP
+ * ──────────────────────────────────────────────────
+ * The FK primitive (fk_helloworld T2) generalises directly:
+ *
+ *     E = S + L₁ · (cos θ₁,            sin θ₁)
+ *     W = E + L₂ · (cos(θ₁+θ₂),        sin(θ₁+θ₂))
+ *     H = W + L₃ · (cos(θ₁+θ₂+θ₃),     sin(θ₁+θ₂+θ₃))
+ *
+ * Three lines, six trig calls. Notice the cumulative angle —
+ * each link sees the SUM of all previous joint angles. That's
+ * why fk_centipede.c can extend this to 30 segments: just keep
+ * adding link steps, each with one more angle in the sum.
+ *
+ * The compute_fk in §5 mirrors these three lines exactly.
+ *
+ * T3  3-LINK IK IS UNDERDETERMINED — WHAT CHANGES
+ * ───────────────────────────────────────────────
+ * Pulling the same trick from ik_helloworld T3 — three sides of
+ * a triangle — does NOT generalise. With three links there's no
+ * single triangle; there's a quadrilateral S → E → W → H, and
+ * the user has only specified two corners (S, T = H).
+ *
+ * Counting unknowns and equations:
+ *
+ *     unknowns:  E.x, E.y, W.x, W.y           (4 numbers)
+ *     equations: |E−S| = L₁                   (1)
+ *                |W−E| = L₂                   (1)
+ *                |H−W| = L₃ AND H = T          (3 — H pinned)
+ *
+ * Wait — let's count carefully. H is given (= T). We need E and W
+ * (4 unknowns). We have:
+ *     |E−S| = L₁          1 equation
+ *     |W−E| = L₂          1 equation
+ *     |T−W| = L₃          1 equation
+ *
+ * 3 equations, 4 unknowns. ONE DEGREE OF FREEDOM is unconstrained
+ * — there's a 1-parameter family of poses where the hand lands
+ * on T.
+ *
+ * Visually: with two links the elbow had only two valid spots
+ * (up/down). With three links the elbow can slide along an
+ * entire CURVE, with the wrist adjusting to keep the hand on T.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  three valid 3-link poses for the SAME target:   │
+ *      │                                                  │
+ *      │      O──o            O──o──*                     │
+ *      │     ╱    ╲          ╱                            │
+ *      │    @      *        @                             │
+ *      │                                                  │
+ *      │           O                                      │
+ *      │          ╱╲                                      │
+ *      │         @  o                                     │
+ *      │             ╲                                    │
+ *      │              *                                   │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * To pick ONE pose, the solver needs an EXTRA CONSTRAINT.
+ *
+ * T4  THE 2+1 HYBRID — PIN THE WRIST DIRECTION
+ * ────────────────────────────────────────────
+ * The simplest extra constraint: "the third link always points
+ * AT the target." That fixes the third link's orientation,
+ * which kills the redundancy.
+ *
+ * Geometric construction:
+ *
+ *   1. The wrist W must be exactly L₃ away from T, on the S→T
+ *      ray. So W = T − L₃ · normalize(T − S).
+ *      Call that point T₂ — the "virtual 2-link target."
+ *
+ *   2. With W = T₂ pinned, the segment S → E → W is a 2-LINK arm
+ *      with target T₂. Run plain 2-link IK exactly as in
+ *      ik_helloworld (law of cosines).
+ *
+ *   3. Place H = W + L₃ · normalize(T − W) — this just confirms
+ *      H lands on T, since W is L₃ along the S→T direction
+ *      already.
+ *
+ * 2+1 split, hence "the 2+1 hybrid." Step 1 is one normalisation
+ * + one subtraction. Step 2 is the existing 2-link solver. Step 3
+ * is one normalisation + one addition.
+ *
+ * The solver is exactly as expensive as 2-link IK plus a few
+ * extra ops. No iteration loop, no convergence check.
+ *
+ * Cost of the design choice: the wrist NEVER bends sideways
+ * relative to the forearm. The user can't tell the arm to "wave"
+ * via the IK target. They'd need to enter FK mode and rotate θ₃
+ * directly.
+ *
+ * T5  WHY THE 2+1 SPLIT MIRRORS REAL ANIMATION RIGS
+ * ─────────────────────────────────────────────────
+ * "IK for the gross reach, FK for the final orientation" is a
+ * standard pattern in production rigs. Examples:
+ *
+ *   - Reaching for a doorknob: IK targets the doorknob; FK
+ *     controls the wrist twist that rotates your hand to grip.
+ *
+ *   - Holding a sword: IK puts the wrist where the user wants;
+ *     FK controls the blade angle independently.
+ *
+ *   - Walking: IK pins the foot to a contact point on the
+ *     ground; FK animates the toes / ankle roll.
+ *
+ * Real rigs use ARMS THAT END at the wrist for IK, and then a
+ * FK chain from wrist to fingertip. Same shape as our 2+1.
+ *
+ * The 2+1 hybrid in this file is the SIMPLEST INSTANCE of that
+ * pattern: one IK joint pair (elbow), one FK aim direction
+ * (wrist→hand). Adding more FK joints past the wrist just keeps
+ * extending the FK chain.
+ *
+ * T6  WHEN THE HYBRID IS WRONG (AND WHAT TO DO THEN)
+ * ──────────────────────────────────────────────────
+ * The 2+1 hybrid produces ONE specific pose for any reachable
+ * target. Sometimes that pose is wrong:
+ *
+ *   - You wanted the elbow tucked in (pose touching the body),
+ *     but the hybrid gave you elbow-out. The 'f' flip handles
+ *     this — switch to the OTHER 2-link branch.
+ *
+ *   - You wanted the wrist bent (e.g. a salute pose). The hybrid
+ *     locks wrist→hand to the S→T direction; you can't ask for
+ *     a bent wrist via IK alone. Switch to FK or compose.
+ *
+ *   - You wanted the arm to AVOID an obstacle — slide the elbow
+ *     along its valid curve to thread between obstacles. The
+ *     hybrid doesn't expose that DOF; you'd need a real
+ *     redundant-IK solver (FABRIK, Jacobian + null-space).
+ *
+ *   - You wanted the elbow to track a SECONDARY GOAL ("look
+ *     elegant"). Same answer — needs a redundant solver.
+ *
+ * For longer chains (4+ links) the redundancy becomes too
+ * useful to ignore, and animation/ moves to FABRIK:
+ *
+ *   ik_arm_reach.c           4-link arm with FABRIK
+ *   ik_tentacle_seek.c       6+ link tentacle with FABRIK
+ *   snake_inverse_kinematics.c  long chain with FABRIK
+ *
+ * FABRIK is the natural successor: like the hybrid here, it
+ * picks a pose without requiring you to specify every joint;
+ * unlike the hybrid, the choice is informed by the previous
+ * frame's pose, giving smooth animation. Read it next.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

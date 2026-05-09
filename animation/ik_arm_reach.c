@@ -225,6 +225,268 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read ik_helloworld.c first if 2-link IK isn't
+ *      automatic. This file handles a 4-link arm where the
+ *      closed-form approach STOPS WORKING (ik_helloworld T6) —
+ *      so we switch to FABRIK iteration.
+ *   2. §5 entity — THE HEART of this file. In sub-section order:
+ *        §5b FABRIK solver           ← read AFTER tutorials T1-T5
+ *           - fabrik_forward
+ *           - fabrik_backward
+ *           - fabrik_solve (orchestrator)
+ *        §5c target Lissajous + trail
+ *        §5d-§5e renderers
+ *      The two passes are tiny (≤15 lines each); the algorithm's
+ *      brilliance is in their COMPOSITION.
+ *   3. §6 scene — thin wrapper.
+ *   4. §1-§4 + §7-§8 — infrastructure. Skim if you've seen the
+ *      framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   pos[i]              joint i position (Vec2). 0 = root, N_JOINTS-1
+ *                       = tip.
+ *   link_len[i]         constant length of link between pos[i] and
+ *                       pos[i+1]. Tapered root-to-tip.
+ *   target              where the user (here: the Lissajous) wants
+ *                       the tip.
+ *   anchor              root pos[0] origin — this NEVER MOVES.
+ *   at_limit            bool — true iff target is outside the reach
+ *                       sphere; renderer draws the dashed circle.
+ *   CONV_TOL            ~1.5 px — once tip is this close to target,
+ *                       declare convergence.
+ *   MAX_ITER            iteration cap (15) — degenerate-config bound.
+ *
+ * Background you need
+ * ───────────────────
+ *   - 2-link analytical IK (ik_helloworld T3-T5). FABRIK is the
+ *     successor for chains where closed-form fails.
+ *   - Vector subtract / normalise / scale.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Jacobian / pseudoinverse IK. FABRIK avoids matrix algebra
+ *     entirely; positions in, positions out.
+ *   - Cyclic Coordinate Descent (CCD). FABRIK is its successor —
+ *     similar idea but converges faster.
+ *   - Joint limits, ball joints, twist constraints. We have a
+ *     plain planar chain; angle limits are mentioned in T7 only.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Seven tutorials that build FABRIK from first principles.
+ *
+ *   T1  Why iteration past 2 links — closed-form's limit
+ *   T2  FABRIK in one sentence — alternate two snaps
+ *   T3  The forward pass — chase the tip down to the root
+ *   T4  The backward pass — anchor the root, push back to the tip
+ *   T5  Why this CONVERGES — error bounded by the convex hull
+ *   T6  Reachability — the disc, the horizon circle, the early-out
+ *   T7  Joint limits, multi-effector, smoothing — what FABRIK adds
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHY ITERATION PAST 2 LINKS — CLOSED-FORM'S LIMIT
+ * ────────────────────────────────────────────────────
+ * 2-link IK has a closed-form solution (law of cosines —
+ * ik_helloworld T3-T5). 3-link IK is UNDERDETERMINED; the
+ * 2+1 hybrid (fk_ik_helloworld T4) picks one specific
+ * configuration by adding a constraint.
+ *
+ * What about 4 links? 5? 30 (a tentacle)? The CONFIG space is
+ * a manifold of dimension N − 2 (target gives 2 equations to
+ * pin down N angles). Tabulating all of those by hand is
+ * intractable.
+ *
+ * Iterative IK side-steps the algebraic blowup: instead of
+ * SOLVING for joint angles, ADJUST the chain repeatedly until
+ * it satisfies the constraints. Two flavours dominate:
+ *
+ *   JACOBIAN  Linearise around the current pose, take a step
+ *             toward the target. Used in robotics.
+ *
+ *   FABRIK    Geometric only. Two passes. No matrix math.
+ *             Used in animation and games.
+ *
+ * FABRIK is what this file implements. It scales to ANY chain
+ * length, converges in 3-5 iterations for typical configurations,
+ * and uses only positions + Euclidean lengths.
+ *
+ * T2  FABRIK IN ONE SENTENCE — ALTERNATE TWO SNAPS
+ * ────────────────────────────────────────────────
+ * "Forward And Backward Reaching Inverse Kinematics."
+ *
+ * Each iteration is two passes:
+ *
+ *   FORWARD   pretend the TIP is at the target. Walk root-ward
+ *             along the chain, re-stretching each segment to
+ *             its link_len. The tip ends exactly at target;
+ *             the root has DRIFTED.
+ *
+ *   BACKWARD  pretend the ROOT is at its anchor. Walk tip-ward
+ *             along the chain, re-stretching each segment to
+ *             its link_len. The root ends exactly at anchor;
+ *             the tip has drifted.
+ *
+ * Iterate. The tip-drift after each backward pass is provably
+ * smaller than after the previous backward pass. After ~5 cycles
+ * the tip lands within sub-pixel tolerance.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │  before:    @──●──●──●──●  current pose          │
+ *      │             (root)        (tip)                  │
+ *      │                                          *  target│
+ *      │                                                  │
+ *      │  forward:        ●──●──●──●──*                   │
+ *      │             ╲ ↑ root drifted               (tip)  │
+ *      │                                                  │
+ *      │  backward:  @──●──●──●──●                        │
+ *      │             (root anchored)  ↑ tip drifted (less) │
+ *      │                                                  │
+ *      │  iterate ~5 times → both ends correct            │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * That is FABRIK. The rest is implementation.
+ *
+ * T3  THE FORWARD PASS — CHASE THE TIP DOWN TO THE ROOT
+ * ─────────────────────────────────────────────────────
+ * The forward pass walks the chain from tip to root.
+ *
+ *     pos[N-1] = target           ← snap the tip to target
+ *     for i = N-2 down to 0:
+ *       direction = pos[i] − pos[i+1]      ← vector from i+1 to i
+ *       d = |direction|
+ *       pos[i] = pos[i+1] + (direction / d) · link_len[i]
+ *
+ * "Slide pos[i] along the line from pos[i+1] until they're
+ * link_len[i] apart." The new pos[i] sits in the SAME DIRECTION
+ * from pos[i+1] as before, but at the correct distance.
+ *
+ * Why does this preserve link length? Because we explicitly
+ * scaled the direction vector to length link_len[i] and
+ * placed pos[i] at that distance from pos[i+1]. By
+ * construction.
+ *
+ * After the loop, every segment has its correct length and
+ * pos[N-1] is on the target. Only pos[0] is wrong — the root
+ * has drifted from its anchor.
+ *
+ * T4  THE BACKWARD PASS — ANCHOR THE ROOT, PUSH BACK TO THE TIP
+ * ─────────────────────────────────────────────────────────────
+ * Same pattern, opposite direction:
+ *
+ *     pos[0] = anchor               ← snap the root to anchor
+ *     for i = 0 up to N-2:
+ *       direction = pos[i+1] − pos[i]      ← vector from i to i+1
+ *       d = |direction|
+ *       pos[i+1] = pos[i] + (direction / d) · link_len[i]
+ *
+ * "Slide pos[i+1] along the line from pos[i] until they're
+ * link_len[i] apart." After the loop, every segment has its
+ * correct length and pos[0] is at anchor — but pos[N-1] has
+ * drifted from target.
+ *
+ * Forward fixed the tip and broke the root.
+ * Backward fixed the root and broke the tip.
+ *
+ * Both passes preserve segment lengths exactly — only the
+ * endpoint constraints get violated, alternately. The
+ * MAGNITUDE of violation shrinks each iteration.
+ *
+ * T5  WHY THIS CONVERGES — ERROR BOUNDED BY THE CONVEX HULL
+ * ─────────────────────────────────────────────────────────
+ * Why doesn't FABRIK oscillate forever between two bad poses?
+ *
+ * Aristidou & Lasenby's proof: the BACKWARD pass moves pos[i]
+ * toward where pos[i] should ideally sit. The chain's tip-end
+ * error after backward pass is BOUNDED ABOVE by the chain's
+ * tip-end error after forward pass scaled by a contraction
+ * factor < 1. Each FULL iteration (forward + backward) shrinks
+ * the error by a factor that depends on the geometry but is
+ * always < 1 for non-degenerate configs.
+ *
+ * Convergence is GEOMETRIC: typical 4-link arm reaches sub-
+ * pixel error in 3-5 iterations. Our MAX_ITER = 15 is just a
+ * safety cap — for adversarial geometries (chain folded
+ * tightly) it might need a few more.
+ *
+ * Failure modes:
+ *   - Coincident joints (|direction| → 0). Guard with a 1e-6
+ *     floor; the next iteration flings the joint apart again.
+ *   - Target unreachable (T6). Forward pass never converges
+ *     because the tip cannot get to the target. Detect early
+ *     and stretch the arm straight.
+ *
+ * T6  REACHABILITY — THE DISC, THE HORIZON CIRCLE, THE EARLY-OUT
+ * ──────────────────────────────────────────────────────────────
+ * The arm can reach any point at distance ≤ Σ link_len from
+ * the anchor — a DISC. Outside, no IK solution exists.
+ *
+ * If we pretend it does and start FABRIK iterating, the tip
+ * keeps trying to reach the target and the root keeps trying
+ * to stay anchored — the algorithm oscillates without
+ * converging. MAX_ITER fires; the result is a fully extended
+ * arm in some semi-random direction.
+ *
+ * Better: detect the unreachable case BEFORE iterating:
+ *
+ *     d = |target − anchor|
+ *     R = Σ link_len
+ *     if d > R:
+ *       at_limit = true
+ *       stretch chain straight at target
+ *       return
+ *
+ * "Stretch the chain straight" means each pos[i] sits at
+ * distance Σ_{j<i} link_len[j] from anchor along the
+ * anchor → target direction. The arm visibly POINTS at the
+ * target it can't reach.
+ *
+ * The reach circle (yellow dashed) is drawn ONLY when at_limit;
+ * its appearance teaches the user that the arm has hit a real
+ * geometric limit, not a buggy solver.
+ *
+ * T7  JOINT LIMITS, MULTI-EFFECTOR, SMOOTHING — WHAT FABRIK ADDS
+ * ──────────────────────────────────────────────────────────────
+ * The basic FABRIK loop in this file is the SIMPLEST form. The
+ * algorithm scales gracefully:
+ *
+ *   JOINT LIMITS  After each pass, clamp every joint's angle
+ *                 (relative to its parent) to a min/max range.
+ *                 The next pass may violate other constraints
+ *                 but on average the chain settles into a
+ *                 limit-respecting pose.
+ *
+ *   MULTI-EFFECTOR  Multiple targets — solve each in turn,
+ *                 average the resulting positions per joint.
+ *                 Used for character rigs where two hands need
+ *                 to grab two objects simultaneously.
+ *
+ *   BRANCHING     The chain forks into a tree (a torso with two
+ *                 arms). At the branching joint, the forward
+ *                 passes from each branch coexist via a centroid
+ *                 average.
+ *
+ *   SMOOTHING     Damp the tip's motion toward target by
+ *                 weight ∈ [0, 1]; the chain follows the target
+ *                 elastically rather than instantly.
+ *
+ * For our 4-link Lissajous-tracking arm, none of these are
+ * needed. The basic loop with reachability early-out is enough.
+ * ik_tentacle_seek.c uses the same basic loop on a 16-link chain;
+ * snake_inverse_kinematics.c on a much longer chain. All three
+ * files share the §5b FABRIK code structurally.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /* M_PI is a POSIX extension, not standard C99/C11 — provide a fallback

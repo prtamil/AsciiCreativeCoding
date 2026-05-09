@@ -180,6 +180,244 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read fk_centipede.c first if path-following FK is
+ *      new — that file introduces the trail-buffer technique on a
+ *      shorter chain. snake_inverse_kinematics.c is the IK partner.
+ *   2. §5 entity — THE HEART of this file. In sub-section order:
+ *        §5a trail helpers       ← circular buffer of head positions
+ *        §5b move_head           ← steering: wave + edge bias
+ *        §5c compute_joints      ← arc-length body placement
+ *        §5d-§5g rendering       ← bead fill, joint nodes, head arrow
+ *      Read AFTER tutorials T1-T5.
+ *   3. §6 scene — orchestrator: tick + draw, with prev/cur snapshot
+ *      for sub-tick alpha interpolation (this file uses fixed-step
+ *      sim; centipede / tentacle don't).
+ *   4. §1-§4 + §7-§8 — config / clock / colour / screen / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   trail[]                circular buffer of recent head positions.
+ *   trail_head, trail_count
+ *                          ring write cursor + filled count.
+ *   joint[i]               body joint i in pixel space (Vec2).
+ *                          0 = head, N_SEGS = tail.
+ *   prev_joint[i]          snapshot at start of this sim tick;
+ *                          renderer alpha-lerps prev → joint.
+ *   heading                head's facing angle (rad), unbounded.
+ *   wave_time              integrator for the sinusoidal turn term.
+ *   amplitude, frequency   sinusoidal-turn parameters.
+ *   move_speed             head translation speed (pixels/sec).
+ *   EDGE_MARGIN_PX         soft-fence width along each edge.
+ *   EDGE_TURN_GAIN         strength of the inward turn near the edge.
+ *
+ * Background you need
+ * ───────────────────
+ *   - The FK primitive (fk_helloworld T2). Used only implicitly —
+ *     the body is placed by trail SAMPLING, not by FK propagation
+ *     from joint angles.
+ *   - Path-following FK (fk_centipede T1-T2). Same idea here.
+ *   - Fixed-step accumulator pattern (Fiedler "Fix Your Timestep!").
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - IK. Snake's BODY just trails the head — no inverse problem.
+ *     For IK on this same body shape, see
+ *     snake_inverse_kinematics.c.
+ *   - Self-collision detection. The snake CAN cross its own body
+ *     visually; we don't prevent it.
+ *   - Goal-seeking. The head wanders autonomously via sin + edge
+ *     bias; it doesn't pursue a target.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build an autonomous FK snake from first
+ * principles.
+ *
+ *   T1  The trail buffer — a recording of the head's path
+ *   T2  Arc-length sampling — body length stays constant
+ *   T3  Sinusoidal autopilot — wandering without a target
+ *   T4  Edge bias — keep the head onscreen with a soft fence
+ *   T5  Why this file uses fixed-step + alpha lerp (and the others don't)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE TRAIL BUFFER — A RECORDING OF THE HEAD'S PATH
+ * ─────────────────────────────────────────────────────
+ * The snake has 32 body joints. Computing them via per-joint
+ * angle FK would require 32 angle states — and the snake would
+ * still need code to BEND the body along its path.
+ *
+ * The trail buffer is the cheap alternative: each frame, push
+ * the head's current pixel position into a circular buffer.
+ * After a few seconds the buffer holds a complete sampled
+ * record of the head's path.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  trail[0..N], head writes at trail_head:         │
+ *      │                                                  │
+ *      │   newest             oldest                      │
+ *      │   ●●●●●●●●●●●●●●●●●●●●●●●● ...                   │
+ *      │   ↑ head_pos this frame                          │
+ *      │                                                  │
+ *      │   1 frame back: trail[(trail_head - 1) mod CAP]  │
+ *      │   k frames back: trail[(trail_head - k) mod CAP] │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Storage: TRAIL_CAP entries (a few thousand) are far more than
+ * we need; the rest is wasted but the wraparound is free. The
+ * buffer wraparound uses (trail_head + CAP - k) % CAP to walk
+ * backwards safely (the "+ CAP" prevents C's negative-modulo
+ * trap; that ALWAYS catches a learner once).
+ *
+ * Body geometry comes from sampling that buffer. T2.
+ *
+ * T2  ARC-LENGTH SAMPLING — BODY LENGTH STAYS CONSTANT
+ * ────────────────────────────────────────────────────
+ * Naïve "place joint i at trail[i frames back]" fails: the head
+ * moves at variable speed, so the body would bunch up when the
+ * head slows and stretch when it sprints.
+ *
+ * Real fix: walk the trail BACKWARDS and accumulate Euclidean
+ * distances; place joint i at the point where the cumulative
+ * distance reaches i · SEG_LEN_PX:
+ *
+ *     for i in 1..N_SEGS:
+ *       target_dist = i · SEG_LEN_PX
+ *       walking trail backwards from trail_head:
+ *         accum_dist += |trail[k] − trail[k+1]|
+ *         when accum_dist ≥ target_dist:
+ *           lerp inside the bracketing trail segment
+ *           joint[i] = lerp result
+ *
+ * Now the body is exactly N_SEGS · SEG_LEN_PX pixels long
+ * regardless of head speed. Two mathematically equivalent
+ * statements:
+ *
+ *   "snake body has constant length"
+ *   "joints are sampled by arc-length, not by frame index"
+ *
+ * The technique is identical to what fk_centipede.c does (T2
+ * in that file). It scales to ANY chain length — 32 here, 24
+ * for the centipede, 80+ for snake_inverse_kinematics.c — by
+ * just looping more.
+ *
+ * T3  SINUSOIDAL AUTOPILOT — WANDERING WITHOUT A TARGET
+ * ─────────────────────────────────────────────────────
+ * The head needs to MOVE somehow. Three obvious choices:
+ *
+ *   USER INPUT   arrow keys steer the head.
+ *   GOAL SEEK    head pursues a moving target (see
+ *                snake_inverse_kinematics.c — that's exactly
+ *                what its IK does).
+ *   AUTOPILOT    head steers itself with no input or goal.
+ *                Used here.
+ *
+ * The autopilot is a sinusoidal TURN-RATE controller:
+ *
+ *     turn_wave = amplitude · sin(frequency · wave_time)
+ *     heading  += turn_wave · dt
+ *
+ * "Turn rate" not "heading directly" — integrating a sinusoid
+ * gives the heading itself a continuously curving path, like a
+ * boat with the wheel oscillating left/right. Result: a smooth
+ * S-curve that never repeats exactly because (sin × t) keeps
+ * advancing.
+ *
+ * Tunings:
+ *   amplitude small, frequency low  → gentle lazy curves
+ *   amplitude high, frequency high  → tight scribble pattern
+ *
+ * Sliders w/s (amplitude) and ←/→ (frequency) expose both.
+ * This is the same idea as Reynolds' (1999) WANDER behaviour:
+ * "constantly nudge the heading by a small random amount."
+ * We replace random with sinusoidal because it gives a
+ * DETERMINISTIC, REPEATABLE pattern — easier to debug.
+ *
+ * T4  EDGE BIAS — KEEP THE HEAD ONSCREEN WITH A SOFT FENCE
+ * ────────────────────────────────────────────────────────
+ * Without intervention, the autopilot would steer the head
+ * off the screen eventually. We need a way to KEEP IT INSIDE
+ * without a hard wall (which would look rigid).
+ *
+ *     EDGE_MARGIN_PX
+ *     ┌─────────────────────────────────────────────┐
+ *     │■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■│ ← inward push grows
+ *     │■                                         ■■│   linearly with depth
+ *     │■                                         ■■│   into the margin band
+ *     │■           open  space                   ■■│
+ *     │■                                         ■■│
+ *     │■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■│
+ *     └─────────────────────────────────────────────┘
+ *
+ * Inside the margin band, the snake feels a CONTINUOUS INWARD
+ * BIAS proportional to how deep into the band it has strayed.
+ * Outside the band: zero force.
+ *
+ *     fx, fy = inward unit vector (only nonzero inside margin)
+ *     desired = atan2(fy, fx)
+ *     turn_edge = wrap_pi(desired − heading) · |force| · gain
+ *     heading += (turn_wave + turn_edge) · dt
+ *
+ * The autopilot's sine wave still drives gentle curves; the
+ * edge bias gently overrides them when the head approaches
+ * the wall, smoothly returning to the open space.
+ *
+ * Hard clamp is also applied as a SAFETY NET — if the user
+ * cranks move_speed up so high the turn-rate can't catch up,
+ * the position is force-clamped inside the screen. With the
+ * default tuning the clamp never fires.
+ *
+ * Same soft-fence pattern is reused in fk_centipede T6 and
+ * fk_tentacle_forest's swarm-steering helpers.
+ *
+ * T5  WHY THIS FILE USES FIXED-STEP + ALPHA LERP (AND THE OTHERS DON'T)
+ * ──────────────────────────────────────────────────────────────────────
+ * fk_centipede.c and fk_tentacle_forest.c both use VARIABLE
+ * timestep. This file uses FIXED-step + alpha interpolation
+ * for sub-tick smoothing. Why the difference?
+ *
+ * Variable timestep is fine when the simulation is NON-STIFF
+ * — when the equations don't have widely-separated time scales.
+ * Pure sin() with a slowly varying argument is non-stiff;
+ * variable dt at frame rate is safe.
+ *
+ * This file's snake is BORDERLINE non-stiff because of the edge
+ * bias. The bias spike near the edge is a fast-time-scale
+ * effect compared to the body wave. With variable timestep, a
+ * slow frame near the wall could cause the snake to overshoot
+ * the wall before the bias responds.
+ *
+ * The defensive fix is fixed-step simulation:
+ *
+ *   while (sim_accum >= TICK_NS):
+ *       scene_tick()         ← always at exactly SIM_FPS Hz
+ *       sim_accum -= TICK_NS
+ *
+ * Then to avoid visual jitter at sub-tick resolution:
+ *
+ *   alpha = sim_accum / TICK_NS                         ∈ [0, 1)
+ *   draw_pos = lerp(prev_joint[i], joint[i], alpha)
+ *
+ * The user can tune SIM_FPS via [/]. If the renderer can't
+ * keep up, the visible motion stays smooth at lower fps; only
+ * the simulation rate is pinned.
+ *
+ * Conclusion: stateless / non-stiff sims (centipede legs,
+ * tentacle wave) get away with variable timestep; stiff or
+ * collision-y sims need fixed step + alpha lerp. This file
+ * picks the conservative option because the edge bias adds
+ * a stiff term to the otherwise non-stiff body.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /*

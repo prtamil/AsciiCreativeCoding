@@ -195,6 +195,200 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read ik_spider.c first; the body + legs + per-leg
+ *      gait are STRUCTURALLY IDENTICAL. The only NEW lesson here is
+ *      §5h tail FK.
+ *   2. §5 entity — focus on §5h tail (T1-T4 below). Everything else
+ *      (§5b-§5g) is the spider's code, unchanged.
+ *   3. §6 scene — thin wrapper.
+ *   4. §1-§4 + §7-§8 — infrastructure. Skim if seen.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   tail[i]                   tail joint i (Vec2). 0 = base (at the
+ *                             abdomen), N_TAIL_SEGS = stinger.
+ *   wave_time                 master clock for the tail oscillation.
+ *   TAIL_BASE_CURL            angle ADDED to the cumulative angle at
+ *                             every segment — the "default arch."
+ *   TAIL_SWAY_AMP             amplitude of the per-segment sin
+ *                             perturbation.
+ *   TAIL_FREQ                 Hz of the sway.
+ *   TAIL_PHASE_PER_SEG        spatial-phase advance per segment;
+ *                             makes the wave TRAVEL up the tail.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Cumulative-angle FK (fk_tentacle_forest T3 / fk_helloworld T3).
+ *     The tail uses this directly.
+ *   - Per-leg gait, IK, body curve from ik_spider.c.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Tail-mass dynamics. The tail is purely kinematic — no Verlet,
+ *     no spring forces. It just LOOKS like it's swaying.
+ *   - Stinger / venom logic. The '#' marker is decorative.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Four tutorials that build the curving scorpion tail on top of
+ * the spider chassis.
+ *
+ *   T1  The constant-curl trick — bake the arch into FK
+ *   T2  Adding sway — sin perturbation that travels up the tail
+ *   T3  Anchoring the tail to the moving abdomen
+ *   T4  Why this isn't a separate state machine
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE CONSTANT-CURL TRICK — BAKE THE ARCH INTO FK
+ * ───────────────────────────────────────────────────
+ * A real scorpion tail is a chain of 7 segments that ARCHES
+ * UP AND OVER the body. The arch isn't a separate posing
+ * decision — it's the tail's NATURAL shape.
+ *
+ * Cumulative-angle FK (fk_tentacle_forest T3) places joint i+1
+ * by:
+ *
+ *     ang_(i+1) = ang_i + δ_i
+ *     tail[i+1] = tail[i] + L · (cos ang_(i+1), sin ang_(i+1))
+ *
+ * If we set δ_i = TAIL_BASE_CURL (constant per segment),
+ * after N segments the cumulative angle has advanced by
+ * N · TAIL_BASE_CURL — the tail describes a CIRCULAR ARC.
+ *
+ * Pick the constants so the total arc is the desired arch:
+ *
+ *     N_TAIL_SEGS = 7
+ *     TAIL_BASE_CURL = 0.34 rad     (≈ 19.5° per segment)
+ *     total = 7 × 0.34 = 2.38 rad   (≈ 136°)
+ *
+ * Starting angle: heading + π — pointing OPPOSITE the body's
+ * forward direction. Adding 136° rotates the tail to point
+ * UP and FORWARD (over the back) — the iconic scorpion shape.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │             ╱  ━╲                                │
+ *      │           ╱    ╮ ╲                               │
+ *      │          │      ╲ ╲ ← tail arc                   │
+ *      │          │       ╲                               │
+ *      │       ↗  ●━━━━━●  │                              │
+ *      │       head      abdomen ← tail base anchor       │
+ *      │                                                  │
+ *      │   each tail segment adds 19.5° to the cumulative │
+ *      │   angle → 7 segments produce 136° total arc      │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Same trick is reused in any "arched" creature: deer antler
+ * curves, fish anal fins, animal tails. Constant-curl-per-
+ * segment is the cheapest expressive arch.
+ *
+ * T2  ADDING SWAY — SIN PERTURBATION THAT TRAVELS UP THE TAIL
+ * ──────────────────────────────────────────────────────────
+ * A still tail looks frozen. Adding a small SIN PERTURBATION
+ * to each segment's bend angle gives the stinger life:
+ *
+ *     δ_i = TAIL_BASE_CURL
+ *         + TAIL_SWAY_AMP · sin(wave_time · TAIL_FREQ
+ *                                + i · TAIL_PHASE_PER_SEG)
+ *
+ * Three parts:
+ *   - TAIL_BASE_CURL       constant arch (T1)
+ *   - · sin(...)           time-varying perturbation
+ *   - i · ... in the sin   spatial phase shift → wave travels
+ *
+ * Same shape as fk_tentacle_forest T2: arg = (time term) +
+ * (spatial term). The wave RIDES UP the tail at speed
+ * TAIL_FREQ / TAIL_PHASE_PER_SEG segments per second.
+ *
+ * Amplitude tuning: TAIL_SWAY_AMP MUST be well below
+ * TAIL_BASE_CURL. If the perturbation overcame the base curl
+ * (sway > curl), the tail's local angle would REVERSE at some
+ * segments, folding the chain on itself. The tuned ratio
+ * 0.06 / 0.34 ≈ 1:5.7 keeps the curl always positive.
+ *
+ * T3  ANCHORING THE TAIL TO THE MOVING ABDOMEN
+ * ────────────────────────────────────────────
+ * The tail base must follow the abdomen as the scorpion
+ * moves. Trick: anchor at the LAST body joint, which is
+ * already trail-sampled to be exactly N_BODY_SEGS · BODY_SEG_LEN
+ * behind the head:
+ *
+ *     tail[0] = body_joint[N_BODY_SEGS]
+ *     ang_0 = heading + π                 ← pointing rearward
+ *     for i = 0..N_TAIL_SEGS-1:
+ *       δ = TAIL_BASE_CURL + sway_perturbation
+ *       ang_(i+1) = ang_i + δ
+ *       tail[i+1] = tail[i] + L · (cos ang_(i+1), sin ang_(i+1))
+ *
+ * Two bonuses from anchoring at body_joint[N]:
+ *   - As the body curves through turns, the abdomen position
+ *     (and therefore the tail base) AUTOMATICALLY tracks the
+ *     curved body without any extra computation.
+ *   - As the body wraps toroidally, the tail wraps with it
+ *     because its base is one of the wrapped body joints.
+ *
+ * The "starting angle = heading + π" trick: the tail should
+ * start pointing OPPOSITE the body's facing. heading is the
+ * body's forward direction; heading + π is its rearward
+ * direction. From there the cumulative curl rotates upward
+ * and over.
+ *
+ * For the body's curving motion, this means: as heading turns,
+ * the tail's STARTING DIRECTION rotates with the body, but
+ * the cumulative arch shape stays the same. Visually: the
+ * scorpion spins, and the tail spins with it.
+ *
+ * T4  WHY THIS ISN'T A SEPARATE STATE MACHINE
+ * ───────────────────────────────────────────
+ * The tail has NO STATE outside wave_time. No locomotion, no
+ * gait, no contact. Pure stateless FK derived from
+ * (wave_time, body pose).
+ *
+ * Why? Because the tail doesn't need to do anything except
+ * LOOK alive. We don't simulate venom strikes, posing
+ * differences, or threat displays. The tail is decoration.
+ *
+ * Anywhere in this folder where the body has a "decorative"
+ * appendage (centipede antennae, scorpion tail, lizard tongue
+ * if we had one), use the same pattern:
+ *
+ *   1. Anchor at the appropriate body joint.
+ *   2. Cumulative-angle FK along the appendage.
+ *   3. Per-segment δ = (constant) + (sin perturbation).
+ *   4. wave_time advances every frame; everything else is
+ *      derived.
+ *
+ * If the appendage SHOULD respond to the environment (avoid
+ * walls, swat at bugs), THEN you'd add per-segment IK or a
+ * physical sim. For pure visual articulation, stateless FK is
+ * always the cheaper, simpler choice.
+ *
+ * Decision tree for adding parts to a creature:
+ *
+ *   purely visual articulation (tail, antennae)
+ *     → cumulative-angle FK + wave_time
+ *
+ *   articulation that REACTS to environment
+ *     → IK + targeting code
+ *
+ *   articulation that PHYSICALLY follows
+ *     → Verlet + constraints (ragdoll family)
+ *
+ * The scorpion tail picks the first. Everything in this file's
+ * §5h is the dumbest version of "make the chain look alive"
+ * that works. That's why it's only ~30 lines added on top of
+ * the spider chassis.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /* M_PI is a POSIX extension, not standard C99/C11 — provide a fallback

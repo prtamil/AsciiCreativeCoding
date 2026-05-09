@@ -239,6 +239,235 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read hexpod_tripod.c first; this file uses the
+ *      same per-leg IK (T1 there) but on a CURVED FK body and
+ *      with an asymmetric per-leg gait instead of locked tripods.
+ *   2. §5 entity — THE HEART. In sub-section order:
+ *        §5b trail (push / sample)        ← from snake FK
+ *        §5c-§5d body motion + joints     ← path-following FK
+ *        §5e hip placement                ← T2 below
+ *        §5f 2-joint IK                   ← same as hexpod T1
+ *        §5g step gait                    ← T3-T5 — the new lesson
+ *        §5h-§5i rendering
+ *   3. §6 scene — thin wrapper.
+ *   4. §1-§4 + §7-§8 — infrastructure. Skim if seen.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   trail[]                    head's recent positions (circular).
+ *   body_joint[i]              i-th body joint world position.
+ *                              0 = head, N_BODY_SEGS = abdomen tip.
+ *   HIP_BODY_T[i]              parametric position along the body
+ *                              for hip i (0 = head, 1 = tail).
+ *   LEG_ANGLE[i]               per-leg body-relative angular bias
+ *                              (sets each leg's "natural" reach
+ *                              direction).
+ *   hip[i], knee[i], foot[i]   per-leg joint world positions.
+ *   stepping[i]                bool — leg i mid-swing.
+ *   step_t[i]                  swing progress ∈ [0, 1].
+ *   step_old[i]                foot position at start of swing.
+ *   step_target[i]             foot position at end of swing.
+ *   N_LEGS                     6.
+ *   N_LEGS/2                   stability cap — max legs in air.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Path-following FK / trail buffer (snake_forward_kinematics
+ *     T1-T2).
+ *   - 2-link analytical IK (hexpod_tripod T1 / ik_helloworld T3-T5).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Centre-of-mass dynamics. Same as hexpod — the body never
+ *     tips because it's not gravity-loaded.
+ *   - Coordinated gait state machines. THIS FILE has DECENTRALISED
+ *     gait: each leg decides for itself when to step.
+ *   - Iterative IK. Closed-form 2-link is exact.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a spider with curved body + per-leg
+ * gait from first principles.
+ *
+ *   T1  Curved body vs rigid chassis — spider vs hexpod
+ *   T2  Sliding hips along a curving body — the parametric attach
+ *   T3  Per-leg autonomous gait — drift triggers a swing
+ *   T4  Stability cap — no more than half the legs airborne
+ *   T5  Why this gait READS LIVELY — emergence from local rules
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  CURVED BODY VS RIGID CHASSIS — SPIDER VS HEXPOD
+ * ───────────────────────────────────────────────────
+ * hexpod_tripod.c uses a RIGID body — a rectangle that
+ * translates and rotates as a single unit. The body's mass is
+ * pinned in one piece; only the legs move relative to it.
+ *
+ * This file uses a CURVING body — four bead joints connected
+ * by trail-buffer FK (snake_forward_kinematics T1-T2). When
+ * the spider turns, the body bends THROUGH the turn rather
+ * than spinning rigidly.
+ *
+ *      ┌─────────────────────────────────────────────────┐
+ *      │  hexpod (rigid):   ▭ → rotates as one piece     │
+ *      │                                                 │
+ *      │  spider (curved):  ●─●─●─● bends through turns  │
+ *      └─────────────────────────────────────────────────┘
+ *
+ * Why curved? Aesthetics — real spiders have flexible
+ * abdomen segments; rigid would look like a tin toy.
+ *
+ * Cost: hips are now ATTACHED TO A MOVING CURVE, not a fixed
+ * rigid offset. T2 explains how to compute hip world positions
+ * in that setting.
+ *
+ * T2  SLIDING HIPS ALONG A CURVING BODY — THE PARAMETRIC ATTACH
+ * ─────────────────────────────────────────────────────────────
+ * Each hip is attached at a parametric position along the body
+ * curve, NOT at a fixed body-local offset:
+ *
+ *     HIP_BODY_T[6] = { 0.18, 0.18,    leg pair 1 — front
+ *                       0.50, 0.50,    leg pair 2 — middle
+ *                       0.82, 0.82 }   leg pair 3 — rear
+ *
+ * Each value is a LERP PARAMETER along the body chain (0 =
+ * head, 1 = tail). To find the hip's world position:
+ *
+ *     T_along = HIP_BODY_T[i]
+ *     k       = floor(T_along · N_BODY_SEGS)
+ *     frac    = (T_along · N_BODY_SEGS) − k
+ *     attach  = lerp(body_joint[k], body_joint[k+1], frac)
+ *     forward = normalize(body_joint[k] − body_joint[k+1])
+ *     left_normal = (−forward.y, forward.x)
+ *     hip = attach + side · hip_dist · left_normal
+ *
+ * Three steps:
+ *   1. Find the attach point on the body curve (linear
+ *      interpolation between two adjacent body joints).
+ *   2. Compute the body's LOCAL forward direction at that
+ *      point (the direction of the body segment the attach
+ *      sits on).
+ *   3. Offset perpendicular to that direction by hip_dist on
+ *      the correct side (left vs right).
+ *
+ * As the body curves, the perpendicular direction CHANGES along
+ * the body, so left hips "steer" with the body's curvature.
+ * That's why the spider's leg arrangement looks organic when it
+ * turns — the hips track the body's spine.
+ *
+ * Hexpod uses a FIXED body-local offset rotated by a single
+ * heading value. Spider uses a PARAMETRIC LOCATION along a
+ * curve plus a local perpendicular at that location. Same idea
+ * generalised to a non-rigid body.
+ *
+ * T3  PER-LEG AUTONOMOUS GAIT — DRIFT TRIGGERS A SWING
+ * ────────────────────────────────────────────────────
+ * Hexpod uses a CENTRAL gait state machine — phases A and B
+ * swap at the drum-beat of a global timer. Spider does it the
+ * other way: each leg decides for itself.
+ *
+ * Per-leg trigger condition:
+ *
+ *     drift = |foot − ideal_foot_for_current_hip|
+ *     stretch = |foot − hip|
+ *
+ *     should_step = (drift > DRIFT_TRIGGER)
+ *                OR (stretch > MAX_REACH)
+ *
+ * "Should step" means the foot is too far from where it ought
+ * to be relative to the body's current pose, OR the foot is so
+ * far that the leg can't physically reach it.
+ *
+ * When should_step fires AND the global stability cap (T4) is
+ * not exceeded, the leg launches a swing:
+ *
+ *     stepping[i]    = true
+ *     step_t[i]      = 0
+ *     step_old[i]    = foot[i]
+ *     step_target[i] = ideal_foot_for_current_hip + lookahead
+ *
+ * During the swing:
+ *
+ *     step_t[i] += SWING_RATE · dt
+ *     ease = smoothstep(step_t[i])
+ *     foot[i] = lerp(step_old[i], step_target[i], ease)
+ *     when step_t[i] reaches 1.0: stepping[i] = false
+ *
+ * No central coordinator. Each leg is its own state machine.
+ *
+ * T4  STABILITY CAP — NO MORE THAN HALF THE LEGS AIRBORNE
+ * ───────────────────────────────────────────────────────
+ * If every leg followed its own trigger independently, ALL SIX
+ * could swing simultaneously when drift conditions align — the
+ * spider lifts all feet and falls.
+ *
+ * Stability cap: at most N_LEGS / 2 = 3 legs may be in the air
+ * at the same time. Implementation:
+ *
+ *     n_air = count(stepping[*] == true)
+ *     for each leg i:
+ *       if not stepping[i] and should_step(i) and n_air < N_LEGS / 2:
+ *         launch_swing(i)
+ *         n_air += 1
+ *
+ * The check happens inside the leg-decision loop. Three
+ * triggered legs go first; the others have to wait until one
+ * lands and frees a slot.
+ *
+ * Two consequences:
+ *   - At any instant ≥ 3 feet are planted → support polygon
+ *     always exists → spider never tips.
+ *   - At very high speeds, more than 3 legs want to step
+ *     simultaneously → they QUEUE in the iteration order
+ *     (legs 0, 1, 2 go first, 3-5 wait). Visually the gait
+ *     looks "hurried" without breaking stability.
+ *
+ * The stability cap is the ONLY centralised piece of gait
+ * logic. Everything else is per-leg autonomous.
+ *
+ * T5  WHY THIS GAIT READS LIVELY — EMERGENCE FROM LOCAL RULES
+ * ───────────────────────────────────────────────────────────
+ * Hexpod's tripod gait is HIGHLY VISUAL — the alternating
+ * tripods are obvious to the eye. But it's also REGULAR; once
+ * you see the pattern, it's clear what comes next.
+ *
+ * Spider's per-leg gait is IRREGULAR by design. Each leg
+ * triggers on its own conditions, so the order in which legs
+ * step depends on:
+ *   - body curvature (faster turns drift outer-side hips
+ *     more than inner-side)
+ *   - body speed (faster speed = more drift per second)
+ *   - what the body did 100 ms ago (legs lag the body)
+ *
+ * No two seconds look exactly alike. The result READS as a
+ * living organism rather than a clockwork mechanism.
+ *
+ * This is "EMERGENT BEHAVIOUR" — complex, lifelike motion
+ * arising from simple per-agent rules with no central
+ * coordinator. The same principle drives boids (flocking from
+ * three local rules), Reynolds steering (autonomous characters
+ * from local sensors), and reaction-diffusion patterns (animal
+ * coats from chemical kinetics).
+ *
+ * Decision tree for new locomotion creatures:
+ *
+ *   regular, mechanical look           → central gait machine
+ *                                        (hexpod_tripod)
+ *   organic, irregular look            → per-leg autonomous +
+ *                                        stability cap (this file)
+ *   need ground-contact dynamics       → add Verlet (ragdoll_*)
+ *   simple wave undulation             → stateless FK
+ *                                        (fk_tentacle_forest)
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /* M_PI is a POSIX extension, not standard C99/C11 — provide a fallback

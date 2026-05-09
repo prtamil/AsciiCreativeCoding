@@ -237,6 +237,207 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read ik_arm_reach.c first if FABRIK is new — that
+ *      file teaches the basic two-pass algorithm. This file ADDS
+ *      per-joint angle limits + low-pass target smoothing.
+ *   2. §5 entity — THE HEART of this file. In sub-section order:
+ *        §5b joint constraint     ← angle clamp helper (T3)
+ *        §5c FABRIK solver        ← read AFTER tutorials T1-T4
+ *        §5d Lissajous + smooth   ← target velocity filter (T5)
+ *        §5e trail ring buffer
+ *        §5f-§5g rendering
+ *   3. §6 scene — thin wrapper.
+ *   4. §1-§4 + §7-§8 — infrastructure. Skim if you've seen the
+ *      framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   pos[i]                joint i position (Vec2). 0 = root, N-1 = tip.
+ *   link_len[i]           constant length of link between i and i+1.
+ *                         Tapered root → tip.
+ *   actual_target         smoothed version of the Lissajous point;
+ *                         what the solver actually chases.
+ *   TARGET_SMOOTH         IIR low-pass rate (1/s). Higher = snappier;
+ *                         lower = laggier.
+ *   MAX_JOINT_BEND        per-joint angle limit, radians. Symmetric
+ *                         (±63°).
+ *   dir_in, dir_out       unit vectors INTO and OUT OF a joint.
+ *   angle                 signed angle between dir_in and dir_out
+ *                         via atan2(cross, dot).
+ *
+ * Background you need
+ * ───────────────────
+ *   - FABRIK (ik_arm_reach T2-T6).
+ *   - atan2(y, x) — four-quadrant arctan.
+ *   - 2-D rotation: rotate(v, δ) = (v.x cos δ − v.y sin δ,
+ *                                    v.x sin δ + v.y cos δ).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Quaternions / 3-D twist constraints. We're planar.
+ *   - Inverse-time / reverse-mode IK ("CCD with ageing"). Plain
+ *     FABRIK + clamp is plenty for this scale.
+ *   - Soft / penalty-based constraints. Hard clamp is enough.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a constrained, smoothed FABRIK
+ * tentacle from first principles.
+ *
+ *   T1  Why plain FABRIK kinks on a 16-link chain
+ *   T2  Joint angle limits — what to clamp and where
+ *   T3  Computing the signed angle at a joint
+ *   T4  Why constraint runs in BACKWARD only (not forward)
+ *   T5  Target smoothing — why the chain needs a low-pass filter
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHY PLAIN FABRIK KINKS ON A 16-LINK CHAIN
+ * ─────────────────────────────────────────────
+ * Run ik_arm_reach.c with N_LINKS = 16 instead of 4 and trace
+ * a fast Lissajous. You'll see the chain SHARPLY KINK at random
+ * joints — adjacent links making 170° angles, the chain folding
+ * back on itself in a hairpin.
+ *
+ * Where does the kink come from? FABRIK preserves LINK LENGTHS
+ * but says NOTHING about the angle between consecutive links.
+ * As long as |pos[i] − pos[i+1]| = link_len[i], the algorithm
+ * is happy. It will gladly fold the chain into a 180° hairpin
+ * if the geometry asks for it.
+ *
+ * For a robot arm with 4 hinges that's fine — physical hinges
+ * have travel limits and you wouldn't ask them to fold. For a
+ * tentacle with 16 segments, the chain has 16 DEGREES OF
+ * FREEDOM and any unconstrained one of them can flip without
+ * the others noticing. Result: kinks during fast direction
+ * changes.
+ *
+ * Real tentacles don't kink. We need to ADD an angle constraint
+ * that rejects the kinking poses.
+ *
+ * T2  JOINT ANGLE LIMITS — WHAT TO CLAMP AND WHERE
+ * ────────────────────────────────────────────────
+ * The constraint is: the angle between consecutive link
+ * directions cannot exceed MAX_JOINT_BEND.
+ *
+ *   dir_in  = normalize(pos[i]   − pos[i-1])    incoming link
+ *   dir_out = normalize(pos[i+1] − pos[i])      outgoing link
+ *   angle   = signed angle from dir_in to dir_out
+ *
+ *   if |angle| > MAX_JOINT_BEND:
+ *     correction = sign(angle) · MAX_JOINT_BEND − angle
+ *     new_dir_out = rotate(dir_out, correction)
+ *     pos[i+1] = pos[i] + new_dir_out · link_len[i]
+ *
+ * Where do we run this clamp? After EACH joint is repositioned
+ * during the FABRIK pass. So as we walk the chain we both
+ * preserve length AND clamp angle joint-by-joint.
+ *
+ * Note we move POS[i+1], not POS[i]. The constraint at joint i
+ * affects the OUTGOING link (i, i+1), so the joint that needs
+ * to move is the FAR END of the outgoing link.
+ *
+ * T3  COMPUTING THE SIGNED ANGLE AT A JOINT
+ * ─────────────────────────────────────────
+ * "Signed angle from u to v" — radians, ∈ (−π, +π], positive
+ * for counter-clockwise rotation. Standard 2-D recipe:
+ *
+ *     angle = atan2( cross(u, v), dot(u, v) )
+ *
+ *     where cross(u, v) = u.x · v.y − u.y · v.x       (scalar)
+ *           dot  (u, v) = u.x · v.x + u.y · v.y       (scalar)
+ *
+ * Reasoning:
+ *   - dot(u, v)   = |u| · |v| · cos(angle)
+ *   - cross(u, v) = |u| · |v| · sin(angle)
+ *
+ *   atan2(sin, cos) recovers the angle without sign loss. (Plain
+ *   acos(dot) would lose sign info — it's always non-negative.)
+ *
+ * The "rotate by δ" used to apply the correction:
+ *
+ *     rotate(v, δ) = (v.x · cos δ − v.y · sin δ,
+ *                     v.x · sin δ + v.y · cos δ)
+ *
+ * Standard 2-D rotation matrix applied to a vector. This is in
+ * §5a vec2 helpers.
+ *
+ * Limit choice: MAX_JOINT_BEND = ~63° (1.1 rad). Bent further,
+ * even consecutive joints can't reach the target geometry; the
+ * chain visibly stiffens but doesn't kink. Tune up for a more
+ * flexible tentacle, down for a stiffer one.
+ *
+ * T4  WHY CONSTRAINT RUNS IN BACKWARD ONLY (NOT FORWARD)
+ * ──────────────────────────────────────────────────────
+ * Tempting symmetry: clamp during BOTH passes. But that breaks
+ * convergence.
+ *
+ * The reason: each FABRIK pass must EITHER restore the boundary
+ * condition (tip / root snap) OR adjust intermediate joints —
+ * not both. A pass that does both can introduce non-shrinking
+ * adjustments and the algorithm oscillates.
+ *
+ * Aristidou & Lasenby's recommendation: clamp ONLY during the
+ * pass that ALREADY moves intermediate joints — that is, the
+ * BACKWARD pass (the one that walks tip-to-root in this file's
+ * orientation, root-to-tip in others). The FORWARD pass just
+ * restores root and re-stretches; no clamp.
+ *
+ * If you reverse the convention (forward = tip-to-root), swap
+ * which pass clamps. The general rule: clamp on the pass that
+ * starts from a "free" end (the end you just snapped, not the
+ * anchored end). That ensures the constraint adjustment doesn't
+ * fight the boundary condition restoration.
+ *
+ * In this file the BACKWARD pass starts at the tip (snaps to
+ * target) and walks rootward; that's where clamping happens.
+ * The FORWARD pass starts at the root (snaps to anchor) and
+ * walks tipward; no clamping.
+ *
+ * T5  TARGET SMOOTHING — WHY THE CHAIN NEEDS A LOW-PASS FILTER
+ * ────────────────────────────────────────────────────────────
+ * The Lissajous target moves SMOOTHLY — its position is a
+ * cosine. But the target's VELOCITY can change abruptly at
+ * the figure's internal crossings (where two strands of the
+ * curve cross at near-perpendicular).
+ *
+ * If the FABRIK solver chases the raw Lissajous point, the
+ * sudden velocity reversal forces the chain into a "snap"
+ * pose — and at fast Lissajous rates, the joint clamp fires
+ * cascadingly across all 16 joints. Visually: stiffness pops.
+ *
+ * The fix is a low-pass filter on the chase target:
+ *
+ *     rate = clamp(dt · TARGET_SMOOTH, 0, 1)
+ *     actual_target += (lissajous − actual_target) · rate
+ *
+ * That's a first-order IIR (infinite impulse response) low-pass
+ * filter. Properties:
+ *   - Time constant τ = 1 / TARGET_SMOOTH.
+ *   - When the target jumps abruptly, actual_target follows
+ *     exponentially with time-constant τ.
+ *   - When the target moves slowly, actual_target tracks
+ *     near-perfectly (the lerp coefficient is small but
+ *     consistent).
+ *
+ * TARGET_SMOOTH = 8 1/s → τ ≈ 125 ms — visible lag, but no
+ * sharp velocity discontinuities. The chain reads as
+ * elastic-following rather than instantaneous tracking.
+ *
+ * This filter is independent of FABRIK; it just makes the
+ * SOLVER's job easier by feeding it smooth motion. Same trick
+ * is used in real animation rigs (often called "chase damping"
+ * or "follow lag").
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /* M_PI is a POSIX extension, not standard C99/C11 — provide a fallback

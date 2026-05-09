@@ -221,6 +221,259 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read fk_helloworld.c first if FK basics aren't
+ *      automatic; this file scales the FK primitive to a 24-segment
+ *      body + 20 legs + 2 antennae.
+ *   2. §5 entity — THE HEART of this file. In sub-section order:
+ *        §5a trail helpers          ← circular buffer of head positions
+ *        §5b edge_bias + move_head  ← steering, screen-edge repulsion
+ *        §5c compute_joints         ← BODY FK from trail (T1-T2)
+ *        §5d compute_legs           ← LEG FK from gait clock (T3-T5)
+ *        §5e-§5g rendering helpers  ← painter's order, body taper, antennae
+ *      Read AFTER tutorials T1-T6.
+ *   3. §6 scene — orchestrator: tick + draw, plus resize handling.
+ *   4. §1-§4 + §7-§8 — config / clock / colour / screen / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   trail[]            circular buffer of recent head positions.
+ *   trail_head, trail_count
+ *                      head = next-write index, count = filled cells.
+ *   joint[i]           position of body joint i (0 = head, BODY_SEGS
+ *                      = tail).
+ *   leg_left/right [i] [3]
+ *                      hip / knee / foot of leg i. left and right
+ *                      are MIRRORED across the body axis.
+ *   wave_time          MASTER CLOCK driving every sinusoid (legs,
+ *                      antennae). Increments by dt every frame.
+ *   turn_phase         INTEGRATED phase for the body's own
+ *                      sinusoidal heading wobble.
+ *   heading            head's facing angle (rad).
+ *   phi_L, phi_R       per-leg gait phase. phi_R = phi_L + π
+ *                      (contralateral antiphase).
+ *
+ * Background you need
+ * ───────────────────
+ *   - The FK primitive (fk_helloworld T2). Each leg is FK applied
+ *     three times: hip → knee → foot.
+ *   - Circular buffers — modular arithmetic to walk a fixed-size
+ *     ring of recent samples.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - IK. No solver here; FK only.
+ *   - Spline math. The trail buffer is "linear interpolation between
+ *     stored points" — no Catmull-Rom, no cubics.
+ *   - Locomotion / contact constraints. The legs swing in air; no
+ *     ground, no ground reaction, no foot slip detection.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a 24-body, 20-leg FK creature from
+ * first principles.
+ *
+ *   T1  The path-following body — a chain that REWINDS the trail
+ *   T2  Arc-length sampling — placing joints by distance, not index
+ *   T3  Stateless leg FK — each leg is a clock with an offset
+ *   T4  Travelling-wave gait — head-to-tail phase shift
+ *   T5  Contralateral antiphase — why right legs lag left by π
+ *   T6  Steering — soft fence around the screen edge
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE PATH-FOLLOWING BODY — A CHAIN THAT REWINDS THE TRAIL
+ * ────────────────────────────────────────────────────────────
+ * The naïve way to animate a long body is N joint angles and FK.
+ * That works for a 3-link arm; it gets ugly past 8 links because
+ * you have to AUTHOR every joint angle each frame.
+ *
+ * The trick: don't author angles. Record the path the HEAD has
+ * walked and place each body joint at a fixed ARC-LENGTH back
+ * along that path.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  trail (newest at left):                         │
+ *      │                                                  │
+ *      │   head ●─●─●─●─●─●─●─●─●─●─●─●─●─●─●─● tail      │
+ *      │   ⌐ where the head was the last 24 segments ⌐    │
+ *      │                                                  │
+ *      │   joint[0] = head position now                   │
+ *      │   joint[1] = head position 1 segment ago         │
+ *      │   joint[2] = head position 2 segments ago        │
+ *      │   ...                                            │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Move the head; the body AUTOMATICALLY follows the path the
+ * head just carved. No per-segment angle math, no constraint
+ * solver. The head is the only thing the simulation truly drives;
+ * every other joint is a delayed echo of the head's history.
+ *
+ * Pros: smooth, no kinks, no IK iterations, body length stays
+ * exact regardless of how the head turns.
+ *
+ * Cons: the body cannot pose INDEPENDENTLY of where the head
+ * went. A real centipede can curl into a circle on the spot;
+ * this one can't — only places it has been are reachable.
+ *
+ * T2  ARC-LENGTH SAMPLING — PLACING JOINTS BY DISTANCE, NOT INDEX
+ * ───────────────────────────────────────────────────────────────
+ * The trail buffer stores discrete samples (one per frame). But
+ * the head moves at variable speed, so frame-i and frame-(i-1)
+ * are NOT separated by a fixed pixel distance. Indexing the
+ * trail by position would give a body whose visible length
+ * fluctuates with frame rate.
+ *
+ * Solution: walk the trail BACKWARDS while keeping a running
+ * sum of Euclidean distances, and place joint i where the
+ * running sum reaches i · SEG_LEN_PX:
+ *
+ *     for i in 1..BODY_SEGS:
+ *       target_distance = i · SEG_LEN_PX
+ *       walk back through trail summing |trail[k+1] − trail[k]|
+ *       when sum reaches target_distance:
+ *         interpolate inside the bracketing trail segment
+ *         joint[i] = that interpolated point
+ *
+ * This is ARC-LENGTH PARAMETRISATION — sampling along the path
+ * by distance rather than by index. The body's visible length
+ * is therefore EXACTLY 24 × SEG_LEN_PX every frame, regardless
+ * of how slow or fast the head was moving.
+ *
+ * Implementation in §5c compute_joints uses two helpers from
+ * §5a (trail_at, trail_size) so the math reads as plain English.
+ *
+ * T3  STATELESS LEG FK — EACH LEG IS A CLOCK WITH AN OFFSET
+ * ─────────────────────────────────────────────────────────
+ * Twenty legs. Twenty independent state machines? No.
+ *
+ * Every leg's pose is a PURE FUNCTION of (wave_time, leg_index,
+ * left/right). No per-leg state. No history. No "which step is
+ * this leg in?" — the master clock and the index already encode
+ * everything.
+ *
+ *     phi_i = wave_time · GAIT_FREQ + i · π / N_LEGS
+ *
+ *     upper_angle = body_dir ± LEG_SPLAY + SWING_AMP · sin(phi_i)
+ *     lower_angle = upper_angle + LEG_BEND + LOWER_SWING ·
+ *                   sin(phi_i + π/4)
+ *
+ * Then plain FK gives the leg joint positions:
+ *
+ *     hip  = joint[hip_segment] + body_offset · body_dir_perp
+ *     knee = hip  + UPPER_LEN · (cos upper, sin upper)
+ *     foot = knee + LOWER_LEN · (cos lower, sin lower)
+ *
+ * Three FK applications per leg. Twenty legs. Sixty trig
+ * evaluations per frame. Trivial.
+ *
+ * Why no state? Because there's no contact, no slip detection,
+ * no gait change. The legs are STYLED appendages, not biome-
+ * chanical actuators. As long as they LOOK like centipede legs,
+ * it's enough.
+ *
+ * T4  TRAVELLING-WAVE GAIT — HEAD-TO-TAIL PHASE SHIFT
+ * ───────────────────────────────────────────────────
+ * Why does phi_i include "i · π / N_LEGS"? Because that's the
+ * PHASE OFFSET that creates a head-to-tail TRAVELLING WAVE in
+ * the leg motion.
+ *
+ * Without the offset (every leg in phase): all legs swing
+ * forward together, then back together. Looks like a wind-up
+ * toy. Wrong.
+ *
+ * With the offset i · π / N_LEGS: leg 0 swings forward; a beat
+ * later leg 1 starts swinging forward; leg 2 a beat after
+ * that; ... leg i is half a cycle behind leg 0 by the time
+ * i = N_LEGS. The motion APPEARS as a wave running down the
+ * body — just like a real centipede.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  legs as a function of time:                     │
+ *      │                                                  │
+ *      │  t=0:    /                                       │
+ *      │  t=Δ:    | /                                     │
+ *      │  t=2Δ:   \ | /                                   │
+ *      │  t=3Δ:    \ \ | /                                │
+ *      │                                                  │
+ *      │ wave runs head → tail at speed proportional to   │
+ *      │ GAIT_FREQ × π/N_LEGS.                            │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * The wave speed and direction can be tuned by changing the
+ * coefficient on i (negative coefficient → tail-to-head wave).
+ * Real centipedes (Manton 1952) propagate the wave from
+ * posterior to anterior; ours runs the cinematically more
+ * obvious head → tail.
+ *
+ * T5  CONTRALATERAL ANTIPHASE — WHY RIGHT LEGS LAG LEFT BY π
+ * ──────────────────────────────────────────────────────────
+ * Each leg pair (left + right at the same body segment) is
+ * EXACTLY HALF A CYCLE OFF. When the left leg is forward, the
+ * right is backward; when the left is backward, the right is
+ * forward.
+ *
+ *     phi_L_i = wave_time · GAIT_FREQ + i · π / N_LEGS
+ *     phi_R_i = phi_L_i + π
+ *
+ * That + π is the "contralateral antiphase" rule. It's not a
+ * cosmetic choice — it's the defining trait of "alternating
+ * wave gait" used by real centipedes and millipedes.
+ *
+ * Result: at any moment, half the body's legs are pushing back
+ * (propulsion), half are swinging forward (recovery). The
+ * combination keeps net force balanced and net body roll near
+ * zero — even though we don't simulate ground contact, the
+ * motion still LOOKS biomechanically grounded.
+ *
+ * Tip: if you want a "trotting" or "scuttling" gait, change
+ * the offset between left and right. + π/2 looks like crab
+ * scuttle. + 0 (in phase) looks like a galloping rabbit. The
+ * phase offset is the entire gait choreography.
+ *
+ * T6  STEERING — SOFT FENCE AROUND THE SCREEN EDGE
+ * ────────────────────────────────────────────────
+ * Without steering, the head wanders off-screen and the body
+ * gets stuck in the corners. We need a way to KEEP THE HEAD
+ * INSIDE.
+ *
+ * Hard wall (clamp head inside): the centipede slams into the
+ * boundary and slides along it. Looks rigid.
+ *
+ * Soft fence (used here): a region near each edge applies a
+ * CONTINUOUS PUSH on the head's heading. Far from the edge:
+ * zero force. Approaching the edge: quadratically increasing
+ * push toward the centre.
+ *
+ *     d = distance from head to nearest edge
+ *     if d < REPEL_MARGIN:
+ *       push = (1 − d / REPEL_MARGIN)²       ∈ (0, 1]
+ *       desired_dir = away_from_nearest_edge
+ *       bias = REPEL_GAIN · angle_diff(desired_dir, heading)
+ *
+ * The bias adds to the body's normal sinusoidal heading wobble.
+ * In open space the wobble dominates; near the edge the bias
+ * dominates and turns the head away.
+ *
+ * Quadratic falloff (Reynolds 1999 §3.3): smooth, non-
+ * discontinuous, easily TUNED via just two parameters
+ * (REPEL_MARGIN sets the ZONE; REPEL_GAIN sets the STRENGTH).
+ * The centipede curves gently away well before reaching the
+ * edge, so the boundary is never visible as a hard wall.
+ *
+ * Same trick is reused in fk_tentacle_forest.c (steering swarm
+ * tentacles) and is a building block for boids (cohesion +
+ * separation + alignment, all "soft forces").
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /* M_PI is a POSIX extension, not standard C99/C11 — provide a fallback

@@ -183,6 +183,206 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read snake_forward_kinematics.c first — same body
+ *      mechanics, but with FK autopilot instead of IK seek.
+ *   2. §5 entity — THE HEART of this file. In sub-section order:
+ *        §5a trail helpers       ← circular buffer (T1 in FK partner)
+ *        §5b move_head           ← READ THIS, T1-T5 below
+ *           ‣ wander target update
+ *           ‣ edge reflection (billiard bounce)
+ *           ‣ low-pass filter on actual_target
+ *           ‣ 1-link IK step toward actual_target
+ *        §5c compute_joints      ← arc-length body placement
+ *        §5d-§5g rendering
+ *   3. §6 scene — orchestrator with prev/cur snapshot.
+ *   4. §1-§4 + §7-§8 — infrastructure. Skim if seen.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   trail[]               head's recent positions (circular).
+ *   tgt_pos               wander target's current position.
+ *   tgt_dir               wander target's heading (rad).
+ *   actual_target         smoothed version of tgt_pos that the
+ *                         head actually chases.
+ *   tgt_trail[]           ghost trail of actual_target positions.
+ *   joint[i]              snake body joint i (Vec2). 0 = head,
+ *                         N_SEGS = tail.
+ *   prev_joint[i]         snapshot for sub-tick alpha lerp.
+ *   move_speed            head's speed in pixels/sec (key-tuned).
+ *   tgt_speed             wander target's speed (key-tuned).
+ *
+ * Background you need
+ * ───────────────────
+ *   - Path-following FK (snake_forward_kinematics T1-T2). The body
+ *     mechanics are IDENTICAL.
+ *   - 1-link IK reduces to atan2 — that's the only "IK" math here.
+ *   - Reynolds-style WANDER (random heading turn rate, integrated).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - FABRIK or Jacobian. The "IK" in this file is exactly one
+ *     joint (the head); analytical solution is one atan2.
+ *   - PID controllers. The IK step is just "step toward target,
+ *     don't overshoot."
+ *   - Joint limits. The body is FK-driven from the trail, no
+ *     joint angles to constrain.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a goal-seeking snake from first
+ * principles.
+ *
+ *   T1  IK on a 1-link chain — atan2 is enough
+ *   T2  Why a separate WANDER TARGET (and not just a fixed goal)
+ *   T3  Billiard-ball bounce — reflect heading through edge normal
+ *   T4  Low-pass filter on the chase target — same trick as tentacle
+ *   T5  No-overshoot guarantee — clamp the step to remaining distance
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  IK ON A 1-LINK CHAIN — atan2 IS ENOUGH
+ * ──────────────────────────────────────────
+ * The snake's BODY is FK (snake_forward_kinematics T1-T2). The
+ * snake's HEAD is the only IK joint — and a 1-link IK has a
+ * closed-form trivial solution:
+ *
+ *     v       = target − head
+ *     heading = atan2(v.y, v.x)
+ *     head   += (v / |v|) · step_size
+ *
+ * "Point at target, walk toward target." That's it. No FABRIK,
+ * no law of cosines — they're not needed because there's only
+ * one joint.
+ *
+ * Once the head moves, the trail records its new position, and
+ * the body follows by arc-length sampling (T2 in the FK partner
+ * file). So the file is structurally:
+ *
+ *     1-link IK on the head + 32-link FK on the body
+ *
+ * Most "IK" demos in this folder follow that pattern: a small
+ * IK problem at the front, FK propagating the rest.
+ *
+ * T2  WHY A SEPARATE WANDER TARGET (AND NOT JUST A FIXED GOAL)
+ * ────────────────────────────────────────────────────────────
+ * If the user moved the target manually with arrow keys, this
+ * file would just be "1-link IK chasing user input." Boring as
+ * a demo because the head response is dominated by user
+ * intention, not by emergent behaviour.
+ *
+ * Instead, the target itself is autonomous — a tiny
+ * "self-wandering" agent. Its motion comes from a sum of three
+ * incommensurable sine waves driving its turn rate:
+ *
+ *     turn = A₁ sin(f₁ t) + A₂ sin(f₂ t + φ₂) + A₃ sin(f₃ t + φ₃)
+ *     tgt_dir += turn · dt
+ *     tgt_pos += tgt_speed · (cos tgt_dir, sin tgt_dir) · dt
+ *
+ * Three frequencies with NO rational ratio means the resulting
+ * curve never exactly repeats — quasi-periodic motion. The
+ * wander target traces organic-looking curves that resemble
+ * terrain ridges or rivers without being any specific shape.
+ *
+ * Reynolds (1999) called this WANDER. He used random noise as
+ * the turn-rate driver; we use the deterministic sine sum
+ * because it's REPRODUCIBLE — running the demo twice gives the
+ * same path, which makes debugging easier and the visual
+ * predictable enough to compare across themes.
+ *
+ * T3  BILLIARD-BALL BOUNCE — REFLECT HEADING THROUGH EDGE NORMAL
+ * ──────────────────────────────────────────────────────────────
+ * The wander target needs to STAY ON SCREEN. The autopilot
+ * alone won't do it — the heading random walk will eventually
+ * drift past any boundary.
+ *
+ * Snake-FK uses a soft fence (edge bias). For the wander target
+ * we use a HARD bounce — billiard physics:
+ *
+ *     if tgt_pos.x < 0 or > screen_width:
+ *       tgt_dir = π − tgt_dir            ← flip horizontal component
+ *       clamp tgt_pos.x inside
+ *     if tgt_pos.y < 0 or > screen_height:
+ *       tgt_dir = −tgt_dir               ← flip vertical component
+ *       clamp tgt_pos.y inside
+ *
+ * Why hard bounce instead of soft fence?
+ *
+ *   - Visually distinct from the snake. The target snaps off
+ *     walls; the snake curves smoothly because it's chasing
+ *     the (now smoothed) target, not the wall directly.
+ *   - Cheaper: just heading flip + position clamp.
+ *   - Quasi-periodic motion + reflective walls = chaotic
+ *     billiard-like trajectory. Looks lively without any
+ *     randomness.
+ *
+ * The CLAMP is essential alongside the flip: a single fast
+ * tick can push tgt_pos several pixels past the wall, so the
+ * flip alone doesn't restore in-bounds. Clamp to the wall
+ * AFTER flipping the direction.
+ *
+ * T4  LOW-PASS FILTER ON THE CHASE TARGET — SAME TRICK AS TENTACLE
+ * ────────────────────────────────────────────────────────────────
+ * The target's motion is autonomous and includes velocity
+ * reversals at every wall bounce. If the head chased tgt_pos
+ * directly, every bounce would be a discontinuous heading
+ * change — the snake would VISUALLY SNAP at the moment of
+ * bounce.
+ *
+ * Same fix as ik_tentacle_seek T5: low-pass filter the
+ * chase target.
+ *
+ *     rate = clamp(dt · 8, 0, 1)
+ *     actual_target += (tgt_pos − actual_target) · rate
+ *     head chases ACTUAL_TARGET, not tgt_pos
+ *
+ * Time constant ≈ 125 ms. Fast enough to track the wander
+ * comfortably; slow enough that bounces appear as a
+ * THOUGHTFUL TURN rather than a snap.
+ *
+ * The ghost-trail dots are positions of actual_target (not
+ * tgt_pos), so the user sees what the snake is actually
+ * chasing — useful for debugging the smoothing tuning.
+ *
+ * T5  NO-OVERSHOOT GUARANTEE — CLAMP THE STEP TO REMAINING DISTANCE
+ * ─────────────────────────────────────────────────────────────────
+ * A naïve IK step always moves move_speed · dt. If the head is
+ * already very close to the target (less than that step), it
+ * OVERSHOOTS, lands on the far side, then overshoots back, then
+ * forward — visible jitter when the snake catches up.
+ *
+ * Standard arrival behaviour: clamp the step to the remaining
+ * distance.
+ *
+ *     dist = |actual_target − head|
+ *     step = min(move_speed · dt, dist)
+ *     head += (v / dist) · step
+ *
+ * Now the head can NEVER pass through the target — it lands on
+ * top of it and waits for the target to drift away. The snake
+ * settles smoothly when paused or when the target loiters.
+ *
+ * Edge case: dist == 0 makes (v / dist) divide by zero. Guard:
+ *
+ *     if dist < 0.5 px: skip the step
+ *
+ * Without the guard, even after the snake catches the target,
+ * NaN would propagate through the head's heading. Half a pixel
+ * is well below visibility, so freezing in place there is
+ * indistinguishable from following exactly.
+ *
+ * Same arrival pattern is used in ik_arm_reach (CONV_TOL early-
+ * out in the FABRIK loop). Different solver, same idea: STOP
+ * when you're already there.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

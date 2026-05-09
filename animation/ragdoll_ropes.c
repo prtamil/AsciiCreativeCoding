@@ -177,6 +177,223 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read ragdoll_figure.c first; the Verlet + Jakobsen
+ *      machinery (T2-T3 there) is reused unchanged. The NEW lessons
+ *      here are: anchor pinning, sinusoidal wind, and per-rope phase
+ *      detuning.
+ *   2. §5 entity — THE HEART. In sub-section order:
+ *        §5a rope_verlet_step        ← Verlet (read AFTER ragdoll T2)
+ *        §5b apply_rope_constraints  ← Jakobsen (ragdoll T3)
+ *        §5c enforce_anchors         ← T1 below — the new lesson
+ *        §5d apply_wind              ← T2 below
+ *        §5e-§5f rendering
+ *   3. §6 scene — orchestrator with prev/cur snapshot.
+ *   4. §1-§4 + §7-§8 — infrastructure. Skim if seen.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   pos[r][s]               rope r, segment s — current position.
+ *   old_pos[r][s]           rope r, segment s — previous position.
+ *   prev_pos[r][s]          start-of-tick snapshot for alpha lerp.
+ *   anchor[r]               fixed ceiling pixel for rope r.
+ *   rest_len[r]             rope r's per-segment rest length.
+ *   phase_offset[r]         per-rope wind-phase offset (rad).
+ *   wind_time               master wind clock (s).
+ *   wind_amp, wind_freq     wind acceleration amplitude (px/s²)
+ *                           and frequency (rad/s).
+ *   N_ROPES, N_SEG          7 ropes, 20 particles each.
+ *   N_ITERS                 6 — Jakobsen passes per tick.
+ *   ROPE_DAMPING            energy-loss multiplier on implicit vel.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Verlet + Jakobsen (ragdoll_figure.c T2-T3). The integrator
+ *     and constraint solver here are IDENTICAL.
+ *   - Sinusoid arguments — same as fk_tentacle_forest T2.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Bending stiffness or twist constraints. Ropes flop freely
+ *     between segments (Jakobsen distance constraint only).
+ *   - Aerodynamic drag. Wind here is a per-particle FORCE, not a
+ *     velocity-dependent drag. Real cloth needs proper drag for
+ *     realism; we don't.
+ *   - Self-intersection. Ropes can pass through each other; we
+ *     don't simulate inter-rope collision.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a Verlet rope from first principles
+ * AND scale it to a parallel array.
+ *
+ *   T1  Pinning the anchor — why both pos AND old_pos must be reset
+ *   T2  Sinusoidal wind — environmental force as a per-tick acceleration
+ *   T3  Per-rope phase detuning — making seven ropes look like seven
+ *   T4  Rope vs ragdoll — what changes when the graph is a chain
+ *   T5  Why we re-anchor INSIDE the constraint loop
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  PINNING THE ANCHOR — WHY BOTH pos AND old_pos MUST BE RESET
+ * ───────────────────────────────────────────────────────────────
+ * The top particle of each rope is FIXED to the ceiling. That's
+ * the simplest "external constraint" — a position that never
+ * moves no matter what physics says.
+ *
+ * Naive pin: just clamp pos[r][0] to anchor[r] every tick.
+ *
+ *     pos[r][0] = anchor[r]
+ *
+ * That's INCORRECT. In Verlet, the implicit velocity is
+ * (pos − old_pos). If we change pos but leave old_pos at its
+ * displaced value, the next tick computes a velocity equal to
+ * (anchor − displaced_old_pos) — a phantom velocity that yanks
+ * the anchor off!
+ *
+ * Correct pin:
+ *
+ *     pos    [r][0] = anchor[r]
+ *     old_pos[r][0] = anchor[r]      ← BOTH
+ *
+ * This sets the anchor's velocity to zero by making the
+ * difference (pos − old_pos) zero. The anchor stays put.
+ *
+ * Same idea applies to ANY external constraint in a Verlet
+ * simulation: when you snap a particle's POSITION, also snap
+ * its OLD position to define the implied velocity.
+ *
+ * If you wanted the anchor to MOVE on a path, set:
+ *
+ *     pos    [r][0] = anchor_path(t)
+ *     old_pos[r][0] = anchor_path(t − dt)
+ *
+ * The implied velocity is (anchor_path(t) − anchor_path(t-dt))
+ * — the anchor's actual velocity. The rope follows.
+ *
+ * T2  SINUSOIDAL WIND — ENVIRONMENTAL FORCE AS A PER-TICK ACCELERATION
+ * ────────────────────────────────────────────────────────────────────
+ * Wind is just a sideways acceleration applied to every
+ * non-anchor particle:
+ *
+ *     accel.x = WIND.x + wind_amp · sin(wind_time · wind_freq
+ *                                       + phase_offset[r])
+ *     accel.y = GRAVITY
+ *
+ * The Verlet step sees this acceleration and integrates it:
+ *
+ *     pos += vel + accel · dt²
+ *
+ * That's literally Newton's second law as a numerical update —
+ * F = ma, integrated with Verlet.
+ *
+ * No need for a separate "wind force" function or aerodynamics
+ * model. We treat wind as a uniformly-applied lateral force.
+ * Cheap, controllable, looks plausible enough for a terminal
+ * demo.
+ *
+ * Frequency and amplitude are user-tunable via arrow keys.
+ * Watching wind_freq sweep from 0.05 to 4.0 rad/s is
+ * surprisingly hypnotic — the rope's mechanical resonance
+ * shows up as some frequencies producing larger swings than
+ * others.
+ *
+ * T3  PER-ROPE PHASE DETUNING — MAKING SEVEN ROPES LOOK LIKE SEVEN
+ * ────────────────────────────────────────────────────────────────
+ * Same trick as fk_tentacle_forest T4. Without per-rope
+ * detuning, all seven ropes would oscillate in lockstep — they
+ * see the SAME wind, with the same amplitude, frequency, and
+ * starting phase.
+ *
+ * Phase offset:
+ *
+ *     phase_offset[r] = r · 2π / N_ROPES        ← evenly spaced
+ *
+ * Each rope sees a wind argument shifted by phase_offset[r],
+ * so the seven ropes are at seven evenly-distributed points
+ * in the wind's cycle at any moment. The visual is a
+ * MEXICAN-WAVE SWAY — left-to-right propagating wave across
+ * the row.
+ *
+ * Notice how this is the SIMPLEST kind of detuning — fixed
+ * phase, no frequency variation. fk_tentacle_forest also
+ * detunes FREQUENCIES so the eight tentacles never re-sync;
+ * here we don't because the user expects the wave to
+ * RECOGNISABLY repeat (it's an effect, not a swarm).
+ *
+ * T4  ROPE VS RAGDOLL — WHAT CHANGES WHEN THE GRAPH IS A CHAIN
+ * ────────────────────────────────────────────────────────────
+ * The difference between this file and ragdoll_figure.c is
+ * the GRAPH STRUCTURE of the constraint network:
+ *
+ *   ragdoll_figure  branched skeleton (head — neck — shoulders —
+ *                   arms / spine — hips — legs / ...)
+ *   ragdoll_ropes   pure chain (anchor — bead — bead — ... — tip)
+ *
+ * Same Verlet step, same Jakobsen iteration, different topology.
+ *
+ * Implications:
+ *   - Chain has fewer constraints per particle (each particle
+ *     has at most 2 neighbours; ragdoll spine particles have
+ *     3-4). Convergence is FASTER for chains.
+ *   - Chain stretches more easily under heavy loads at the tip
+ *     (compounding error along a long chain). Add more iterations
+ *     or shorten the chain.
+ *   - Chain's "rest pose" is straight; ragdoll's is a T-pose with
+ *     specific joint angles. Both are arbitrary choices baked into
+ *     constraint rest lengths.
+ *
+ * The CODE difference is minimal — the constraint solver in §5b
+ * differs from ragdoll_figure §5c only in indexing (here we know
+ * each constraint connects [s, s+1] in the same rope, simpler
+ * loops).
+ *
+ * T5  WHY WE RE-ANCHOR INSIDE THE CONSTRAINT LOOP
+ * ───────────────────────────────────────────────
+ * Same structural concern as ragdoll_figure T4: the constraint
+ * pass YANKS particles around, and an outer-loop anchor pin
+ * can drift if a constraint pulls it.
+ *
+ *   for iter in 1..N_ITERS:
+ *     for s in 0..N_SEG-2:
+ *       satisfy(pos[r][s], pos[r][s+1])
+ *     enforce_anchors()           ← INSIDE the iteration loop
+ *
+ * If you only enforce_anchors after the outer loop:
+ *
+ *   for iter in 1..N_ITERS:
+ *     ...satisfy passes...
+ *   enforce_anchors()             ← only ONCE
+ *
+ * Then iteration 1's satisfy pass yanks the anchor a small
+ * amount; iteration 2 yanks it a bit more (compounding). By
+ * iteration 6, the anchor is visibly above or below its true
+ * position. The single end-of-loop pin clamps it back — but
+ * the rope spent 5 of 6 iterations operating with a wrong
+ * anchor location, so the chain settles into the wrong
+ * shape.
+ *
+ * Re-pinning every iteration costs a couple of memory writes
+ * per rope per iteration — utterly negligible — and produces
+ * a visibly stiffer, more anchored result.
+ *
+ * Same principle is reused in ragdoll_figure (§5d ragdoll_tick
+ * re-applies platform collisions inside the constraint loop)
+ * and in any production cloth/rope simulator.
+ *
+ * Generalised rule: any external position constraint must be
+ * applied AFTER EVERY internal constraint iteration, not just
+ * once at the end. Otherwise convergence drags you off the
+ * pinned points.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /*

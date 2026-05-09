@@ -231,6 +231,197 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. This is THE smallest possible FK demo; everything
+ *      else in animation/ is some elaboration of compute_fk().
+ *   2. §5 fk — the entire algorithm is one function: compute_fk.
+ *      Read AFTER tutorials T1-T4. It mirrors the formula in
+ *      MENTAL MODEL line for line.
+ *   3. §6 scene — input and rendering. Two arrow-key handlers
+ *      (one per joint angle), a draw routine that plots two
+ *      lines + three markers. Mostly UI plumbing.
+ *   4. §1-§4 + §7-§8 — infrastructure (config, clock, colour,
+ *      screen, app loop). Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   theta1, theta2     joint angles. theta1 is absolute (from +X);
+ *                      theta2 is RELATIVE to the upper arm.
+ *   L1, L2             link lengths (in pixels). Constant.
+ *   S, E, H            shoulder / elbow / hand positions (Vec2).
+ *                      S fixed; E and H computed every frame.
+ *   ArmPose            return type bundling (E, H) so compute_fk
+ *                      stays a pure function (no out-params).
+ *
+ * Background you need
+ * ───────────────────
+ *   - Trigonometric circle: (cos θ, sin θ) is a unit vector at
+ *     angle θ from +X.
+ *   - Vector addition: walk a length L along a direction d̂ →
+ *     base + L · d̂.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Matrices. The standard FK formulation in robotics uses 4×4
+ *     transforms; in 2-D with two joints, two trig calls beat
+ *     any matrix.
+ *   - Denavit-Hartenberg parameters. Worth knowing for serial
+ *     robots; overkill for this two-link arm.
+ *   - Quaternions. 2-D angles compose by addition; 3-D needs them.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build forward kinematics from first principles.
+ *
+ *   T1  What is a kinematic chain?
+ *   T2  One link — angle to position
+ *   T3  Two links — relative angles compose by addition
+ *   T4  Why FK is the EASY direction
+ *   T5  How to translate this code into IK
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHAT IS A KINEMATIC CHAIN?
+ * ──────────────────────────────
+ * A KINEMATIC CHAIN is a sequence of rigid links connected by
+ * joints. Each joint has a small set of "degrees of freedom" —
+ * the parameters that pin down its current pose.
+ *
+ *   In 2-D each joint is a HINGE: one degree of freedom (the
+ *   angle around the joint pivot).
+ *   In 3-D a joint can be a hinge (1 DOF), a universal joint
+ *   (2 DOF), a ball joint (3 DOF), or fancier.
+ *
+ * "FORWARD" kinematics walks the chain from the FIXED END (root)
+ * toward the FREE END (tip), using the joint angles to decide
+ * each link's orientation. The output is the WORLD POSITION (and
+ * orientation, in 3-D) of every joint and link.
+ *
+ *      ┌─────────────────────────────────────────────────┐
+ *      │  fixed root               free tip              │
+ *      │   @  ──────  O  ──────  O  ──────  *            │
+ *      │   S  link 1  E  link 2  J3 link 3  H            │
+ *      │                                                 │
+ *      │  given angles → walk forward → tip position     │
+ *      └─────────────────────────────────────────────────┘
+ *
+ * Our arm is the simplest non-trivial chain: two links, two
+ * hinge joints, one fixed root.
+ *
+ * T2  ONE LINK — ANGLE TO POSITION
+ * ────────────────────────────────
+ * Start with one link of length L attached to a base B at angle
+ * θ measured from +X. The tip of that link is at:
+ *
+ *     tip = B + L · (cos θ, sin θ)
+ *
+ * Why? (cos θ, sin θ) is the UNIT VECTOR pointing in direction
+ * θ. Multiplying by L scales it to length L; adding to B places
+ * the tail at B and the head at the tip.
+ *
+ * That's the ENTIRE FK primitive. Every other FK in this folder
+ * (snake, centipede, spider) is just this primitive run in a loop.
+ *
+ *      ┌────────────────────────────────────────────┐
+ *      │      tip                                   │
+ *      │       *                                    │
+ *      │      ╱                                     │
+ *      │     ╱  L                                   │
+ *      │    ╱  ↗                                    │
+ *      │   ╱ θ                                      │
+ *      │  ●─────────────  +X                        │
+ *      │  B                                         │
+ *      └────────────────────────────────────────────┘
+ *
+ * T3  TWO LINKS — RELATIVE ANGLES COMPOSE BY ADDITION
+ * ───────────────────────────────────────────────────
+ * Now add a second link of length L₂ hinged at the tip of the
+ * first. Question: at what ABSOLUTE angle does link 2 point?
+ *
+ * Answer: the ABSOLUTE angle of link 2 is the absolute angle of
+ * link 1 plus the RELATIVE angle θ₂ (measured at the elbow,
+ * between link 1 and link 2):
+ *
+ *     link 1 absolute angle = θ₁
+ *     link 2 absolute angle = θ₁ + θ₂
+ *
+ * That's why "angles compose by addition" — in 2-D, rotation is
+ * a scalar that adds.
+ *
+ * Apply the T2 primitive twice:
+ *
+ *     elbow E = S + L₁ · (cos θ₁,        sin θ₁)
+ *     hand  H = E + L₂ · (cos(θ₁ + θ₂),  sin(θ₁ + θ₂))
+ *
+ * That's compute_fk in §5 in two lines. Notice θ₂ being RELATIVE
+ * is what lets you pose the elbow naturally — "bend the elbow
+ * 30°" rather than "make the forearm point at 47°."
+ *
+ * In 3-D you'd compose two ROTATION MATRICES (or quaternions)
+ * instead of adding scalars, but the structure is identical.
+ *
+ * T4  WHY FK IS THE EASY DIRECTION
+ * ────────────────────────────────
+ * FK gives you positions FROM angles. IK gives you angles FROM
+ * a target position. The two share geometry but differ wildly
+ * in difficulty:
+ *
+ *               FK                   IK
+ *   inputs    angles                 target position
+ *   outputs   positions              angles
+ *   solver    closed form            non-trivial: trig + cases
+ *   solutions ONE                    ZERO, ONE, or TWO
+ *   reach     not asked              reachability check needed
+ *   cost      O(N) trig calls        O(N) per joint × iterations
+ *
+ * FK ALWAYS SUCCEEDS. Every (θ₁, θ₂) maps to one unique (E, H).
+ *
+ * IK can FAIL: the target may be outside the reach disc
+ * [|L₁−L₂|, L₁+L₂]. Even when reachable, two valid arm poses
+ * exist (elbow-up / elbow-down) so the solver must PICK one.
+ *
+ * Doing FK in your head: rotate, walk, rotate, walk. Trivial.
+ * Doing IK in your head: imagine the target, find the elbow
+ * position via the law of cosines, then solve for both angles.
+ * That mental work is exactly what ik_helloworld.c does for you.
+ *
+ * T5  HOW TO TRANSLATE THIS CODE INTO IK
+ * ──────────────────────────────────────
+ * Open ik_helloworld.c side-by-side with this file. The DEMO
+ * is identical: same shoulder, same two coloured links, same
+ * three markers. The DATA-FLOW is reversed:
+ *
+ *   FK input pipeline:    arrow keys  →  θ₁, θ₂
+ *                         compute_fk  →  E, H
+ *                         draw          (E, H)
+ *
+ *   IK input pipeline:    arrow keys  →  H (target)
+ *                         solve_ik    →  θ₁, θ₂  (and back to E)
+ *                         draw          (E, H)
+ *
+ * Reading the IK file with FK already in your head:
+ *   - The 2-link IK solver applies the LAW OF COSINES to the
+ *     triangle (S, E, H) to find θ₂.
+ *   - Then atan2 finds the angle from S to H, and another trig
+ *     adjustment splits that into θ₁.
+ *   - The "elbow up vs elbow down" choice is a single sign flip.
+ *
+ * The IK file is bigger because it has to handle reachability
+ * (clamp the target to the reach disc), pick a branch (which
+ * elbow), and undo the inverse mapping. The math is harder; the
+ * geometry is the same triangle.
+ *
+ * Once you can read both files, every other animation/ file is
+ * "FK or IK on a longer chain or a more interesting pose."
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

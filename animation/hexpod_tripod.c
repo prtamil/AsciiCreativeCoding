@@ -222,6 +222,241 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read ik_helloworld.c first; the IK here is the
+ *      same 2-link law-of-cosines, applied 6 times per frame.
+ *      The NEW lesson is the GAIT state machine.
+ *   2. §5 entity — THE HEART. In sub-section order:
+ *        §5a static tables       ← per-leg geometry
+ *        §5b solve_ik            ← 2-link IK (T1)
+ *        §5c hip_world_pos       ← body→world transform (T2)
+ *        §5d rest_target         ← per-leg ideal foot rest
+ *        §5e gait_tick           ← TRIPOD GAIT state machine (T3-T5)
+ *        §5f hexapod_tick        ← top-level orchestrator
+ *        §5g-§5h rendering
+ *      Read AFTER tutorials T1-T5.
+ *   3. §6 scene — thin wrapper.
+ *   4. §1-§4 + §7-§8 — infrastructure. Skim if seen.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   body_x, body_y         body center pixel position.
+ *   heading                body facing angle. INTERPOLATES toward
+ *                          target_heading at TURN_RATE.
+ *   target_heading         what the user just set with arrow keys.
+ *   HIP_LOCAL_X/Y[i]       hip i's offset from body in BODY LOCAL
+ *                          coordinates (constant per leg).
+ *   hip[i]                 hip i's WORLD position (recomputed each
+ *                          frame from body pose).
+ *   foot_pos[i]            foot i's world position.
+ *   foot_old[i]            foot i's position at the start of its
+ *                          current swing (the lerp anchor).
+ *   step_target[i]         where the foot is heading during swing.
+ *   stepping[i]            bool — true iff this leg is currently
+ *                          swinging.
+ *   step_t[i]              progress through swing ∈ [0, 1].
+ *   gait_phase             0 (tripod A swings) or 1 (tripod B).
+ *   phase_timer            seconds since last phase swap.
+ *   TRIPOD_A, TRIPOD_B     the two leg-index sets.
+ *
+ * Background you need
+ * ───────────────────
+ *   - 2-link analytical IK (ik_helloworld T3-T5).
+ *   - Body-local → world transform via 2-D rotation +
+ *     translation. We'll cover this in T2.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Centre-of-mass / dynamic balance. The body NEVER tips —
+ *     it's not gravity-loaded; we just animate it sliding on
+ *     rails. Tripod gait is purely AESTHETIC stability.
+ *   - 3-D leg geometry. We're planar; femur and tibia all lie
+ *     in the screen plane.
+ *   - Iterative IK. Closed-form 2-link is exact; no FABRIK.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a tripod-gait hexapod from first
+ * principles.
+ *
+ *   T1  Six 2-link arms — IK applied per leg, every frame
+ *   T2  Body-local hips — the rigid-body transform we apply 6 times
+ *   T3  The tripod gait — three legs always planted, stable triangle
+ *   T4  Step phase machine — time-bounded swings with landing wait
+ *   T5  Step target lookahead — feet land where the body is going
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  SIX 2-LINK ARMS — IK APPLIED PER LEG, EVERY FRAME
+ * ─────────────────────────────────────────────────────
+ * Each leg is a 2-link arm hanging off a hip:
+ *
+ *     hip ─── femur ─── knee ─── tibia ─── foot
+ *      │              (U)               (L)
+ *      └─ pinned to the body
+ *      └─ foot pinned to the world (planted) or in flight (swinging)
+ *
+ * For each leg every frame:
+ *   1. Compute hip's WORLD position from body pose (T2).
+ *   2. The foot is given (either planted at last-frame's pos or
+ *      mid-swing as computed by the gait T4).
+ *   3. solve_ik(hip, foot, U, L) → knee position.
+ *
+ * The IK is the SAME law-of-cosines from ik_helloworld T4 — but
+ * applied to a triangle (hip, knee, foot) where hip and foot are
+ * both KNOWN. This is "place the elbow given the shoulder and
+ * the hand position."
+ *
+ * Sign convention: left legs use elbow-DOWN (knee below the
+ * hip-foot line); right legs use elbow-UP. Without that, the
+ * left and right legs would visually mirror the wrong way and
+ * the body would look broken.
+ *
+ * The IK is COMPLETELY STATELESS — it doesn't care if the foot
+ * is planted or swinging. It just places the knee given the
+ * current pair of endpoints. State lives in the GAIT (T3-T5),
+ * not the IK.
+ *
+ * T2  BODY-LOCAL HIPS — THE RIGID-BODY TRANSFORM WE APPLY 6 TIMES
+ * ───────────────────────────────────────────────────────────────
+ * Hips are pinned to the body. As the body moves and rotates,
+ * the hips move and rotate WITH it. Per-leg static tables hold
+ * the BODY-LOCAL offset of each hip:
+ *
+ *     HIP_LOCAL_X[6] = { -2.0, +2.0, -2.0, +2.0, -2.0, +2.0 }
+ *     HIP_LOCAL_Y[6] = { -1.5, -1.5,  0.0,  0.0, +1.5, +1.5 }
+ *
+ * "x = ±2 from body center, y = front / mid / rear." These are
+ * constants — the legs never move relative to the body.
+ *
+ * Every frame, transform LOCAL → WORLD:
+ *
+ *     for each leg i:
+ *       local_x, local_y = HIP_LOCAL_X[i], HIP_LOCAL_Y[i]
+ *       cos_h = cos(heading); sin_h = sin(heading)
+ *       hip[i].x = body_x + local_x · cos_h − local_y · sin_h
+ *       hip[i].y = body_y + local_x · sin_h + local_y · cos_h
+ *
+ * That's the standard 2-D rigid-body transform: rotate the
+ * local offset by the heading, then translate by the body's
+ * world position.
+ *
+ * Same trick is used by every multi-body system: each part's
+ * world pose is parent_pose composed with local_offset.
+ * Hierarchical animation, scene graphs, and physics engines
+ * all operate this way.
+ *
+ * T3  THE TRIPOD GAIT — THREE LEGS ALWAYS PLANTED, STABLE TRIANGLE
+ * ────────────────────────────────────────────────────────────────
+ * Real insects use ALTERNATING TRIPOD: divide six legs into two
+ * sets of three, where each set forms a TRIANGLE under the body.
+ * At any moment, ONE set is planted (forming the support
+ * triangle) and the other set is swinging.
+ *
+ *   TRIPOD A = {LF, RM, LR}   (left-front, right-mid, left-rear)
+ *   TRIPOD B = {RF, LM, RR}   (right-front, left-mid, right-rear)
+ *
+ *      ┌────────────────────────────────────┐
+ *      │      LF *           RF o           │
+ *      │           ╲ A     B ╱              │
+ *      │            ▭body▭                  │
+ *      │           ╱ B     A ╲              │
+ *      │      LM o           RM *           │
+ *      │           ╲ A     B ╱              │
+ *      │            ▭body▭                  │
+ *      │           ╱ B     A ╲              │
+ *      │      LR *           RR o           │
+ *      │                                    │
+ *      │  '*' planted (tripod A here),      │
+ *      │  'o' swinging (tripod B here)      │
+ *      └────────────────────────────────────┘
+ *
+ * Notice each tripod has a leg in EACH front/mid/rear row
+ * AND mixes left + right. This guarantees that when those
+ * three feet are planted, their support triangle ENCLOSES
+ * the body's centre of mass — kinematically stable.
+ *
+ * Real insects use this gait at speed ~3-5 body lengths per
+ * second; slower they switch to wave gait (one leg swinging
+ * at a time, five planted).
+ *
+ * T4  STEP PHASE MACHINE — TIME-BOUNDED SWINGS WITH LANDING WAIT
+ * ──────────────────────────────────────────────────────────────
+ * The gait is a STATE MACHINE with two phases:
+ *
+ *     phase 0:   tripod A swings,   tripod B planted
+ *     phase 1:   tripod A planted,  tripod B swings
+ *
+ * Transition rule: SWAP after PHASE_DURATION elapsed AND every
+ * swinging foot has reached step_t == 1 (finished its arc).
+ *
+ *     phase_timer += dt
+ *     if phase_timer >= PHASE_DURATION:
+ *       all_landed = (every swinging leg has step_t == 1)
+ *       if all_landed:
+ *         swap phases
+ *         phase_timer = 0
+ *
+ * Why both conditions? Time alone isn't enough — at very high
+ * step heights or low swing speeds, a foot may still be
+ * mid-arc when the timer expires. Swapping then would launch
+ * a new tripod while the previous one is still in the air →
+ * three feet up + three feet up = no support triangle = robot
+ * tips. The "all landed" guard prevents that.
+ *
+ * Foot trajectory during swing:
+ *
+ *     ease     = smoothstep(step_t)                   ∈ [0, 1]
+ *     ground   = lerp(foot_old, step_target, ease)
+ *     arc_y    = −STEP_HEIGHT · sin(π · step_t)
+ *     foot     = ground + (0, arc_y)
+ *
+ * The smoothstep on horizontal lerp gives soft acceleration /
+ * deceleration. The sin-based vertical arc peaks at step_t =
+ * 0.5 and lands cleanly at step_t = 1 (the foot kisses the
+ * ground at landing — no slam).
+ *
+ * T5  STEP TARGET LOOKAHEAD — FEET LAND WHERE THE BODY IS GOING
+ * ─────────────────────────────────────────────────────────────
+ * Where SHOULD a stepping foot land? Not at its current rest
+ * position relative to the hip — by the time it lands, the
+ * body has moved forward, and the foot would be too far back.
+ *
+ * Solution: LOOKAHEAD by some amount in the body's heading
+ * direction:
+ *
+ *     T = hip_world + rotate(REST_offset + (body_speed · LOOKAHEAD, 0),
+ *                            heading)
+ *
+ * In words: from the hip's CURRENT world position, walk to
+ * the leg's body-local rest offset PLUS a forward push
+ * proportional to body_speed. At zero speed the lookahead is
+ * zero — feet plant exactly under their rest. At higher
+ * speed, feet plant further ahead of the rest, so by the time
+ * they land they're at the rest under the moving body.
+ *
+ * LOOKAHEAD is in seconds: it's "how far ahead the body will
+ * be when this foot lands." For a half-second swing,
+ * LOOKAHEAD ≈ 0.5 · body_speed predicts almost exactly where
+ * the body will be at landing.
+ *
+ * Without lookahead, the body would visually outpace its own
+ * legs at speed — feet permanently dragging behind the body's
+ * actual position. Lookahead keeps the legs centred under the
+ * moving body.
+ *
+ * Same trick is used by real bipedal walking robots (foot
+ * placement based on velocity prediction) and by 4-legged
+ * animation rigs.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /* M_PI is a POSIX extension, not standard C99/C11 — provide a fallback

@@ -177,6 +177,281 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. This file is your introduction to PHYSICS-BASED
+ *      animation. Everything before in animation/ was kinematic
+ *      (no forces, just geometry). This is forces + integration +
+ *      constraint projection.
+ *   2. §5 entity — THE HEART. In sub-section order:
+ *        §5a verlet_update           ← T2 (the integrator)
+ *        §5b apply_boundaries        ← walls / floor / ceiling
+ *        §5b-2 platform_collisions   ← T5 (slanted surfaces)
+ *        §5c satisfy_constraint      ← T3 (Jakobsen projection)
+ *        §5d ragdoll_tick            ← T4 (orchestration order)
+ *        §5e bone_glyph / draw_bone  ← rendering
+ *      Read AFTER tutorials T1-T6.
+ *   3. §6 scene — Ragdoll + platforms.
+ *   4. §1-§4 + §7-§8 — infrastructure. Skim if you've seen the
+ *      framework. Note this file uses fixed-step + alpha lerp.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   pos[i]                  particle i's CURRENT position (Vec2).
+ *   old_pos[i]              particle i's PREVIOUS position. Velocity
+ *                           is implicit: vel = pos − old_pos.
+ *   prev_pos[i]             snapshot at start of sim tick (for
+ *                           sub-tick alpha lerp).
+ *   c_a[k], c_b[k]          endpoints of constraint k (particle
+ *                           indices).
+ *   c_len[k]                rest length of constraint k.
+ *   N_PARTICLES             15 — head, neck, shoulders, elbows,
+ *                           wrists, hips, knees, ankles, ...
+ *   N_CONSTRAINTS           17 — the bones connecting them.
+ *   N_CONSTRAINT_ITERS      8  — Jakobsen iterations per tick.
+ *   DAMPING                 multiplier on implicit velocity each
+ *                           tick; <1 = energy loss.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Newton's laws — gravity is a constant downward acceleration.
+ *   - Numerical integration — converting force into motion.
+ *   - Distance: |a − b| = sqrt((a.x − b.x)² + (a.y − b.y)²).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Lagrangian / Hamiltonian mechanics. Verlet is just a
+ *     position update.
+ *   - Rigid-body dynamics (forces + torques + inertia tensors).
+ *     Verlet ragdolls SIMULATE rigid-body behaviour as an
+ *     emergent property of constraint iteration.
+ *   - Implicit / semi-implicit Euler. Verlet is its own scheme,
+ *     simpler than Euler, with better long-term energy behaviour.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a Verlet ragdoll from first principles.
+ *
+ *   T1  The shift from kinematic to physics-based animation
+ *   T2  Verlet integration — velocity-implicit position update
+ *   T3  Distance constraints — Jakobsen's projection trick
+ *   T4  Why iteration order MATTERS for ragdolls
+ *   T5  Bouncing off slanted surfaces — reflect, then move old_pos
+ *   T6  Why "rigidity" emerges from soft constraints
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE SHIFT FROM KINEMATIC TO PHYSICS-BASED ANIMATION
+ * ───────────────────────────────────────────────────────
+ * Every previous file in animation/ was KINEMATIC. The animator
+ * (you, the user, or a sin/cos formula) commands joint
+ * positions; the chain follows by FK or IK. No forces, no mass,
+ * no collisions — geometry only.
+ *
+ * A ragdoll is PHYSICS-BASED. You DON'T command joint positions;
+ * you specify FORCES (gravity, wind, contact reactions) and let
+ * the simulator compute where the particles go. The pose
+ * EMERGES from the integrator — the animator gives up direct
+ * control of the figure.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │   kinematic            physics-based             │
+ *      │                                                  │
+ *      │   command pose      command forces               │
+ *      │       ↓                  ↓                       │
+ *      │     pose             integrator                  │
+ *      │                          ↓                       │
+ *      │                      pose emerges                │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * The trade:
+ *   ‒ Less control: you can't pose a ragdoll by writing
+ *     joint angles.
+ *   + More realism: gravity, momentum, and contact "just
+ *     work" without per-frame authoring.
+ *
+ * Ragdolls excel at INVOLUNTARY motion (a knocked-out
+ * character collapsing) and fail at GOAL-DIRECTED motion
+ * (the same character standing back up). Production engines
+ * BLEND animation + ragdoll: keyframe animation when the
+ * character is conscious, ragdoll when it's not.
+ *
+ * T2  VERLET INTEGRATION — VELOCITY-IMPLICIT POSITION UPDATE
+ * ──────────────────────────────────────────────────────────
+ * The simplest physics integrator is EULER:
+ *
+ *     vel  += accel · dt
+ *     pos  += vel   · dt
+ *
+ * Two state variables per particle (pos, vel). Drift over time
+ * is significant — Euler's energy errors accumulate.
+ *
+ * VERLET INTEGRATION (Loup Verlet, 1967) replaces velocity with
+ * an IMPLICIT velocity stored in the previous position:
+ *
+ *     vel       = pos − old_pos    (implicit, computed when needed)
+ *     old_pos   = pos              (save current as new "old")
+ *     pos      += vel + accel · dt²
+ *
+ * One state variable per particle (pos), with old_pos updated
+ * each tick. Equivalent to leapfrog or central-difference
+ * integration; better long-term stability than Euler.
+ *
+ * Why Verlet for a ragdoll? TWO HUGE benefits:
+ *
+ *   1. CONSTRAINT PROJECTION IS TRIVIAL (T3). When you snap a
+ *      particle to a new position to fix a constraint, vel
+ *      automatically updates because vel is "pos − old_pos."
+ *      With Euler you'd have to recompute vel by hand.
+ *
+ *   2. NO EXPLICIT VELOCITY MANAGEMENT. Bouncing off a wall is
+ *      "set old_pos to where vel should reflect" — no separate
+ *      velocity vector to maintain.
+ *
+ * Damping (energy loss): multiply (pos − old_pos) by DAMPING <
+ * 1 each tick. Without damping, Verlet conserves energy and the
+ * ragdoll bounces forever; with damping, it eventually settles.
+ *
+ * T3  DISTANCE CONSTRAINTS — JAKOBSEN'S PROJECTION TRICK
+ * ──────────────────────────────────────────────────────
+ * Each "bone" of the ragdoll is a fixed-length DISTANCE
+ * CONSTRAINT between two particles. After the integration step
+ * pushes particles around, bones may have stretched or
+ * compressed. Jakobsen's (2001) trick: explicitly snap them
+ * back to length.
+ *
+ *     for each constraint (i, j) with rest length L:
+ *       v     = pos[j] − pos[i]
+ *       dist  = |v|
+ *       error = (dist − L) / dist
+ *       pos[i] += 0.5 · error · v        ← move i toward j
+ *       pos[j] −= 0.5 · error · v        ← move j toward i
+ *
+ * "Move both endpoints halfway toward (or away from) each
+ * other along their connecting line until the distance is
+ * exactly L." For equal masses, move each by half the error.
+ *
+ * One pass per bone fixes that bone, but typically BREAKS
+ * adjacent bones (which shared one endpoint). Repeat the whole
+ * pass enough times and the system converges.
+ *
+ * Convergence rate: for small graphs (15 particles, 17
+ * constraints) ~8 iterations per tick gives visually rigid
+ * limbs. More iterations = stiffer body (and slower); fewer =
+ * stretchy / rubbery.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  before                  after constraint pass   │
+ *      │                                                  │
+ *      │  A───────B               A─────B                 │
+ *      │   ╲       ╲                                      │
+ *      │    ╲       ●  C  →   pulls B toward A,           │
+ *      │     ╲                pulls A toward B            │
+ *      │      D               until |A−B| = L_AB          │
+ *      │                                                  │
+ *      │  but now B is too close to C!  Iterate again.    │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * T4  WHY ITERATION ORDER MATTERS FOR RAGDOLLS
+ * ────────────────────────────────────────────
+ * The ragdoll tick has FOUR stages, run in this order:
+ *
+ *   1. INTEGRATE       Verlet step on every particle.
+ *   2. COLLIDE WORLD   clamp to walls; bounce off platforms.
+ *   3. SATISFY (×8)    Jakobsen projection on every bone.
+ *   4. COLLIDE WORLD   AGAIN — inside the satisfy loop.
+ *
+ * Why collide AGAIN inside the satisfy loop? Because step 3
+ * (constraint projection) can YANK A FOOT BACK THROUGH A
+ * PLATFORM. The bone says "ankle must be exactly L from
+ * knee," and pulling the knee out of a slanted shelf would
+ * shorten the leg.
+ *
+ * Solution: every constraint iteration, re-collide all
+ * particles with the world. The satisfy step then has to
+ * accept the world's hard surface BEFORE the next bone tries
+ * to pull through it.
+ *
+ * If you skip the inner-loop collide, the ragdoll's feet will
+ * occasionally pop through platforms — the bone yank wins
+ * over a single boundary clamp.
+ *
+ * T5  BOUNCING OFF SLANTED SURFACES — REFLECT, THEN MOVE old_pos
+ * ──────────────────────────────────────────────────────────────
+ * A horizontal floor bounce is easy: clamp pos.y above the
+ * floor, set old_pos.y = floor (reverses implicit velocity).
+ * A slanted platform needs vector reflection.
+ *
+ * Given a platform with slope k:
+ *
+ *     surface = (1, k)
+ *     normal n = (slope, −1) / sqrt(slope² + 1)
+ *
+ * (We negate the y-component because screen y points down;
+ * the "up" normal is the one with negative y.)
+ *
+ * For each particle that just crossed the platform:
+ *
+ *     v       = pos − old_pos
+ *     v_n     = v · n                 ← component along normal
+ *     v_refl  = v − (1 + BOUNCE) · v_n · n
+ *     old_pos = pos − v_refl          ← put old_pos to make
+ *                                       implicit vel = v_refl
+ *
+ * Reflecting v through n removes the component into the
+ * surface and reverses it. BOUNCE ∈ [0, 1] is the coefficient
+ * of restitution: 1 = perfect bounce, 0 = absorbed completely
+ * (no rebound — just slides along). 0.55 is "rubbery."
+ *
+ * Setting old_pos = pos − v_refl is the Verlet way to assign
+ * a new velocity. No explicit vel variable to update.
+ *
+ * Same recipe works for any surface — circular, polygonal,
+ * SDF — as long as you can compute the surface normal.
+ *
+ * T6  WHY "RIGIDITY" EMERGES FROM SOFT CONSTRAINTS
+ * ────────────────────────────────────────────────
+ * A real human bone is RIGID — its length CANNOT change. Our
+ * constraints are SOFT — each iteration only NUDGES particles
+ * toward the rest length. With ∞ iterations, the system
+ * converges to exact rigidity; with FINITE iterations, the
+ * bones can stretch or compress slightly.
+ *
+ * For 8 iterations and typical drop velocities (gravity 800,
+ * dt 16 ms), bones stretch by < 1 % — visually invisible.
+ * For dramatically high gravity or heavy impacts, you might
+ * see bones briefly elongate at impact frames; cranking
+ * N_CONSTRAINT_ITERS to 16 or 32 fixes that at a small CPU
+ * cost.
+ *
+ * Why use SOFT constraints when hard ones would be more
+ * accurate? Because hard constraints require solving a linear
+ * system (matrix inversion) that gets ugly fast. The Jakobsen
+ * iterative trick produces VISUALLY indistinguishable
+ * rigidity at a fraction of the complexity, and it scales
+ * trivially to thousands of particles + constraints.
+ *
+ * Production physics engines (Box2D, Bullet, Havok) use
+ * SEQUENTIAL IMPULSES — a velocity-based variant of the same
+ * idea: iteratively apply impulses to correct constraint
+ * violations. The mathematical core is identical; the
+ * representation differs.
+ *
+ * For this terminal demo (15 particles, 17 bones), Jakobsen's
+ * position-based projection is simpler, cleaner, and looks
+ * indistinguishable from the impulse approach.
+ *
+ * Same machinery is reused in ragdoll_ropes.c for cloth-like
+ * sheets — same Verlet + same Jakobsen, just thousands of
+ * particles instead of fifteen.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /*

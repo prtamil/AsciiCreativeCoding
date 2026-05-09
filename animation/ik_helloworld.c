@@ -204,6 +204,264 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read animation/fk_helloworld.c FIRST so FK is in
+ *      your head; this file is the inverse problem on the same
+ *      geometry.
+ *   2. §5 ik — the entire algorithm is one function: solve_ik.
+ *      Read AFTER tutorials T1-T6. Eight lines mirror the formula
+ *      in MENTAL MODEL exactly.
+ *   3. §6 scene — input pipeline (arrow keys → target T, clamped to
+ *      the reach disc) and rendering. The clamp is what makes the
+ *      INVARIANT |E−T| = L₂ hold every frame.
+ *   4. §1-§4 + §7-§8 — infrastructure. Skim if you've seen the
+ *      framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   S, T, E         shoulder / target / elbow positions (Vec2).
+ *                   S fixed; T is INPUT (you move it); E is OUTPUT.
+ *   L1, L2          link lengths (constant).
+ *   d_vec, d        T − S, and its length. The "third side" of
+ *                   the triangle.
+ *   alpha (α)       angle at the shoulder VERTEX of the (S, E, T)
+ *                   triangle, opposite the L₂ side.
+ *   phi (φ)         direction S → T, in world coordinates.
+ *   elbow_angle     final absolute angle of the upper arm,
+ *                   = φ + side · α.
+ *   side            ±1 selector — picks elbow-up vs. elbow-down.
+ *   elbow_up        bool form of `side`, exposed to the user via
+ *                   the 'f' key.
+ *
+ * Background you need
+ * ───────────────────
+ *   - The FK primitive (fk_helloworld T2). solve_ik finds θ₁
+ *     such that the FK formula lands on the target.
+ *   - Law of cosines: in any triangle with sides a, b, c, the
+ *     angle opposite c is acos((a² + b² − c²) / (2ab)).
+ *   - atan2(y, x): four-quadrant arctan returning angle of vector
+ *     (x, y) from +X. Plain atan loses sign info.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Iterative solvers (Jacobian, FABRIK). Two-link IK is
+ *     closed-form; iteration only matters past two links.
+ *   - Quaternions. 2-D angles compose by addition.
+ *   - DH parameters or full robotics kinematics — the closed-form
+ *     2-link case predates and undercuts that machinery.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build analytical 2-link IK from first principles.
+ *
+ *   T1  The IK problem statement
+ *   T2  Reachability — the disc and the rim
+ *   T3  Three sides of a triangle, all known
+ *   T4  Law of cosines — angle from sides
+ *   T5  Two valid solutions — elbow up or down
+ *   T6  Why this approach STOPS WORKING past two links
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE IK PROBLEM STATEMENT
+ * ────────────────────────────
+ * Given:
+ *   - a fixed shoulder S
+ *   - link lengths L₁, L₂
+ *   - a target T (where the user wants the hand)
+ *
+ * Find:
+ *   - joint angles θ₁, θ₂ such that the FK output coincides with T.
+ *
+ * Concretely we want the elbow E such that:
+ *   |E − S| = L₁          (upper arm has correct length)
+ *   |E − T| = L₂          (forearm has correct length)
+ *
+ * Two equations, two unknowns (E.x, E.y). Solving them is what
+ * the rest of this tutorial unfolds.
+ *
+ * Note we never directly solve for θ₁, θ₂. Once E is known, the
+ * angles fall out trivially: θ₁ is the angle of E − S; θ₂ is the
+ * angle from (E − S) to (T − E). For rendering, knowing E is
+ * already enough — we just need to draw two line segments.
+ *
+ * T2  REACHABILITY — THE DISC AND THE RIM
+ * ───────────────────────────────────────
+ * Before solving, ask: is the target REACHABLE? With link lengths
+ * L₁, L₂ the hand can reach exactly the points within distance:
+ *
+ *     d_min ≤ |T − S| ≤ d_max
+ *     d_min = |L₁ − L₂|     (forearm folded back maximally)
+ *     d_max = L₁ + L₂       (arm fully extended)
+ *
+ * For L₁ = L₂ that's [0, 2L]. The set of reachable hand positions
+ * is a DISC of radius L₁ + L₂ centred on S, with a hole of radius
+ * |L₁ − L₂| in the middle (only relevant when links differ).
+ *
+ *      ┌──────────────────────────────────────────────┐
+ *      │         outer rim (full extension)           │
+ *      │              ─────────                       │
+ *      │           ─                ─                 │
+ *      │         /                    \               │
+ *      │        /  reach disc           \             │
+ *      │       │       @  shoulder       │            │
+ *      │        \                       /             │
+ *      │         \                     /              │
+ *      │           ─                ─                 │
+ *      │              ─────────                       │
+ *      └──────────────────────────────────────────────┘
+ *
+ * If the user pushes T outside the disc, IK has NO solution. Two
+ * options:
+ *   - REPORT failure and stop drawing the arm. Honest but jarring.
+ *   - CLAMP the target onto the disc rim. The arm fully extends
+ *     toward the off-disc target, and the user simply can't push
+ *     past the rim. Visual — the link lengths stay constant, the
+ *     "target" '*' is the same as the "hand."
+ *
+ * We chose CLAMP. clamp_to_reach() in §6 does it. Once it runs,
+ * the solver is guaranteed reachable input — a robust invariant.
+ *
+ * T3  THREE SIDES OF A TRIANGLE, ALL KNOWN
+ * ────────────────────────────────────────
+ * (S, E, T) are the corners of a triangle:
+ *
+ *     SE side has length L₁          (constant)
+ *     ET side has length L₂          (constant)
+ *     ST side has length d = |T − S| (computed each frame)
+ *
+ * SAS (side-angle-side), SSS (side-side-side), and other
+ * configurations have classical "triangle solving" recipes. We
+ * have SSS — three sides given. The question is the SHAPE of
+ * the triangle and where to place E given S and T are pinned.
+ *
+ *      ┌──────────────────────────────────────────────┐
+ *      │                                              │
+ *      │       elbow E                                │
+ *      │           O                                  │
+ *      │          / \                                 │
+ *      │     L₁  /   \  L₂                            │
+ *      │        /     \                               │
+ *      │       /   α   \                              │
+ *      │      @─────────*                             │
+ *      │      S    d    T                             │
+ *      └──────────────────────────────────────────────┘
+ *
+ * α is the angle at the shoulder vertex, between the S→E and
+ * S→T directions.
+ *
+ * T4  LAW OF COSINES — ANGLE FROM SIDES
+ * ─────────────────────────────────────
+ * In any triangle with sides a, b, c and angle γ opposite side c:
+ *
+ *     c² = a² + b² − 2ab · cos γ
+ *
+ * That's the LAW OF COSINES. Solving for γ:
+ *
+ *     cos γ = (a² + b² − c²) / (2ab)
+ *
+ * Plug in our triangle: at the shoulder vertex, the angle α is
+ * opposite the L₂ side (the side OPPOSITE α is the one not
+ * touching the α-vertex). So a = L₁, b = d, c = L₂:
+ *
+ *     cos α = (L₁² + d² − L₂²) / (2 · L₁ · d)
+ *     α     = acos(...)
+ *
+ * That ONE equation gives the offset angle of the upper arm
+ * from the S→T direction.
+ *
+ * Then the absolute angle of the upper arm is:
+ *
+ *     φ = atan2(T.y − S.y, T.x − S.x)         ← direction of T
+ *     elbow_angle = φ ± α                     ← rotate from φ
+ *
+ * Why ±? See T5.
+ *
+ * Drift defence: floating-point can push the cosine just outside
+ * [-1, +1] on boundary configurations (target exactly on the rim).
+ * acos returns NaN there. Clamp the input to [-1, +1] before acos.
+ *
+ * T5  TWO VALID SOLUTIONS — ELBOW UP OR DOWN
+ * ──────────────────────────────────────────
+ * α is unsigned: acos returns a value in [0, π]. But the elbow
+ * can sit on EITHER side of the S→T line. So there are two
+ * triangles consistent with our SSS:
+ *
+ *      ┌──────────────────────────────────────────────┐
+ *      │                                              │
+ *      │       O  ← elbow-up                          │
+ *      │      / \                                     │
+ *      │     /   \                                    │
+ *      │    /     \                                   │
+ *      │   @-------*                                  │
+ *      │    \     /                                   │
+ *      │     \   /                                    │
+ *      │      \ /                                     │
+ *      │       O  ← elbow-down                        │
+ *      └──────────────────────────────────────────────┘
+ *
+ * Mathematically: the elbow_angle = φ + α and the elbow_angle =
+ * φ − α both satisfy the IK equations.
+ *
+ * The solver must PICK ONE. We expose the choice as a boolean
+ * 'elbow_up'; the 'f' key flips it. Most real applications pick
+ * elbow_up = true (anatomically natural for human arms reaching
+ * forward).
+ *
+ * Reachability EDGE CASE: when the target is exactly on the rim
+ * (d = L₁ + L₂), α = 0 — the two solutions COINCIDE. The arm is
+ * fully extended; there's no elbow bend either way. When the
+ * target is at the far inner-rim limit (d = |L₁ − L₂|, only if
+ * L₁ ≠ L₂), α = π and the two solutions also coincide, with the
+ * forearm folded entirely along the upper arm.
+ *
+ * Both edge cases are CONTINUOUS (no discontinuity in elbow
+ * position as you approach them); the 'f' flip simply has no
+ * visible effect there.
+ *
+ * T6  WHY THIS APPROACH STOPS WORKING PAST TWO LINKS
+ * ──────────────────────────────────────────────────
+ * Closed-form 2-link IK is BEAUTIFUL. Eight lines of trig, exact,
+ * one frame, no iteration. Why doesn't every IK solver work this
+ * way?
+ *
+ * For 3 links the problem becomes UNDERDETERMINED. The user
+ * supplies one target (2 equations: T.x, T.y). The solver has
+ * three unknowns (θ₁, θ₂, θ₃). Infinitely many configurations
+ * satisfy the target — one extra DOF (degree of freedom) is
+ * unconstrained. Picking ONE solution requires extra criteria:
+ * naturalness, joint limits, smoothness over time.
+ *
+ * For 4+ links the under-determination grows further. There's no
+ * clean closed-form; the field moved to ITERATIVE solvers:
+ *
+ *   FABRIK     "forward and backward reaching IK" — sweeps the
+ *              chain twice per iteration. See ik_arm_reach.c
+ *              and ik_tentacle_seek.c.
+ *
+ *   CCD        "cyclic coordinate descent" — adjusts one joint
+ *              at a time, repeats. Older but simpler.
+ *
+ *   Jacobian   linearise around current pose, take a step toward
+ *              the target. Used in physics / robotics.
+ *
+ * All of those work for any chain length, but they ITERATE — the
+ * solver runs many passes per frame to converge. The cost goes
+ * up; the trade is generality.
+ *
+ * Lesson: the elegance of this file's solve_ik EXPIRES at three
+ * links. Use it for 2-link arms (knees, elbows, animal legs in
+ * planar projection) and reach for FABRIK once you have a snake
+ * or tentacle.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

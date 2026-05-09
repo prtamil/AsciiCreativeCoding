@@ -186,6 +186,210 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read fk_helloworld.c first if FK basics aren't
+ *      automatic. fk_centipede.c is its closest cousin (also uses
+ *      sinusoidal FK), but the centipede ALSO has a path-following
+ *      body; this tentacle has ONLY the sinusoidal-FK part.
+ *   2. §5 entity — the entire algorithm is one function:
+ *        §5a tentacle_tick           ← THE HEART (read AFTER T1-T4)
+ *        §5b-§5d rendering helpers   ← painter's two-pass
+ *      The simulation has ONE persistent state variable:
+ *      wave_time. Everything else is a closed-form derivation.
+ *   3. §6 scene — orchestrator: spawn 8 tentacles with detuned
+ *      phases and frequencies, tick them all, draw them all.
+ *   4. §1-§4 + §7-§8 — config / clock / colour / screen / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   joint[i]              i-th joint position (Vec2). 0 = root,
+ *                         N_SEGS = tip.
+ *   wave_time             master clock. INCREMENTS BY DT per frame.
+ *                         Only persistent state.
+ *   freq, amp             shared wave parameters (Hz-ish, radians).
+ *   root_phase[k]         per-tentacle phase offset (radians).
+ *   freq_offset[k]        per-tentacle frequency detune (Hz).
+ *   PHASE_PER_SEG         per-segment phase advance — controls
+ *                         how the wave PROPAGATES along the chain.
+ *
+ * Background you need
+ * ───────────────────
+ *   - The FK primitive (fk_helloworld T2 + T3).
+ *   - Sinusoid arguments: sin(ω·t + φ) at given t shifts left/right
+ *     with φ.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Fluid dynamics. The "current" is fake — there's no fluid
+ *     simulation, just sin().
+ *   - Mass-spring chains, Verlet, soft-body physics. The chain is
+ *     RIGID with closed-form bend angles, not a deformable body.
+ *   - Per-frame state. wave_time is enough.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a stateless FK tentacle from first
+ * principles.
+ *
+ *   T1  Why STATELESS — the entire chain from one number (wave_time)
+ *   T2  Per-segment bend angles — the sinusoid that travels
+ *   T3  Cumulative-angle FK — generalising fk_helloworld T3 to N links
+ *   T4  Phase detuning — eight tentacles, no synchronisation
+ *   T5  When to fold in trail-buffer FK (and why this file doesn't)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHY STATELESS — THE ENTIRE CHAIN FROM ONE NUMBER (wave_time)
+ * ────────────────────────────────────────────────────────────────
+ * "Stateful" simulation: each frame derives the next frame from
+ * the previous frame's positions. Verlet integration, mass-spring,
+ * trail buffers — all stateful.
+ *
+ * "Stateless" simulation: each frame's positions are computed
+ * directly from a single time variable, ignoring whatever state
+ * was visible last frame. tentacle_tick is stateless.
+ *
+ *     joint[0..N_SEGS] = pure_function(wave_time, per-tentacle phase)
+ *
+ * Properties:
+ *
+ *   + No accumulation drift. Re-evaluating at the same wave_time
+ *     produces bit-identical results.
+ *   + Variable timestep is automatically safe — there's no
+ *     numerical-integration scheme to destabilise.
+ *   + Fast forward / fast backward (set wave_time = anything)
+ *     is trivial. Pause = stop incrementing wave_time.
+ *   + No initial condition required: at t = 0 the formula has
+ *     a defined output for every joint.
+ *
+ *   − The motion has to be EXPRESSIBLE as a closed form. If you
+ *     want behaviour that responds to obstacles, contacts, or
+ *     external forces, stateless is too constrained.
+ *
+ * Anything that LOOKS like a wave (oscillation, sway, breathing,
+ * orbit) is best done stateless. Anything that NEEDS history
+ * (trail, collision response, locomotion) needs state.
+ *
+ * T2  PER-SEGMENT BEND ANGLES — THE SINUSOID THAT TRAVELS
+ * ───────────────────────────────────────────────────────
+ * The simulation drives ONE thing per segment: its bend angle
+ * relative to its parent.
+ *
+ *     δθ_i = amp · sin( freq · wave_time
+ *                     + root_phase
+ *                     + i · PHASE_PER_SEG )
+ *
+ * Three things in the sin argument:
+ *
+ *   freq · wave_time      ADVANCE of the wave over time
+ *   root_phase            per-tentacle starting offset (T4)
+ *   i · PHASE_PER_SEG     spatial phase shift along the chain
+ *
+ * The third term is what makes the wave TRAVEL up the chain.
+ * At wave_time = 0 segment i has bend amp · sin(i · PHASE_PER_SEG)
+ * — a SPATIAL pattern. As wave_time grows, that pattern shifts:
+ * the value previously at segment i appears at segment i ± Δi
+ * later. The wave RIDES UP the chain.
+ *
+ * Wave speed in segments per second:
+ *   d(arg)/dt = freq             (advance per second)
+ *   d(arg)/d(i) = PHASE_PER_SEG  (advance per segment)
+ *   speed = freq / PHASE_PER_SEG (segments per second)
+ *
+ * Increase freq → wave runs faster up the chain. Increase
+ * PHASE_PER_SEG → wave compresses (more bends per chain).
+ * Decrease either → wave stretches.
+ *
+ * T3  CUMULATIVE-ANGLE FK — GENERALISING fk_helloworld T3 TO N LINKS
+ * ──────────────────────────────────────────────────────────────────
+ * Recall fk_helloworld T3 — for a 2-link arm:
+ *
+ *   joint[1] = joint[0] + L · (cos θ₁,         sin θ₁)
+ *   joint[2] = joint[1] + L · (cos(θ₁ + θ₂),   sin(θ₁ + θ₂))
+ *
+ * The pattern: each joint's ABSOLUTE angle is the SUM of all
+ * previous bends. For N links:
+ *
+ *     ang_0 = base direction (here: −π/2, "straight up")
+ *     ang_i = ang_(i-1) + δθ_i              ← accumulate
+ *     joint[i+1] = joint[i] + seg_len · (cos ang_i, sin ang_i)
+ *
+ * That's tentacle_tick in §5a. One running cumulative_angle
+ * variable, walked forward through every segment.
+ *
+ * In code:
+ *
+ *     joint[0] = root_pos
+ *     ang = -π/2                       ← upward
+ *     for i in 0..N_SEGS-1:
+ *       δθ = amp · sin(...)
+ *       ang += δθ
+ *       joint[i+1] = joint[i] + seg_len · (cos ang, sin ang)
+ *
+ * No matter how long the chain, FK is one loop and one running
+ * sum. snake_forward_kinematics.c uses the same trick at 80
+ * segments.
+ *
+ * T4  PHASE DETUNING — EIGHT TENTACLES, NO SYNCHRONISATION
+ * ────────────────────────────────────────────────────────
+ * Eight tentacles with IDENTICAL frequency would all reach the
+ * same point in their cycle simultaneously, producing visible
+ * lockstep ("seaweed flashmob"). Two cheap defences:
+ *
+ *   PHASE OFFSET (root_phase[k])
+ *     Each tentacle starts at a different point in its cycle.
+ *     Eight evenly-spaced offsets ∈ [0, 2π) give all eight a
+ *     different starting bend without changing the SHAPE of
+ *     each tentacle's individual motion.
+ *
+ *   FREQUENCY DETUNING (freq_offset[k])
+ *     Each tentacle uses a SLIGHTLY different frequency
+ *     (freq + freq_offset[k]). Without detuning, two tentacles
+ *     that start out of phase will RE-SYNCHRONISE after enough
+ *     time because they have the same period — the lockstep
+ *     would just be delayed, not prevented. Detuning ensures
+ *     no two tentacles ever return to the same relative phase.
+ *
+ * The freq offsets are TINY (~1% of base freq) so each tentacle
+ * still looks like the same SPECIES — they're just slightly
+ * different individuals. Same trick as in detuning oscillator
+ * banks in audio synthesis.
+ *
+ * T5  WHEN TO FOLD IN TRAIL-BUFFER FK (AND WHY THIS FILE DOESN'T)
+ * ───────────────────────────────────────────────────────────────
+ * fk_centipede.c uses TWO FK techniques:
+ *
+ *   - Path-following body (trail buffer + arc-length sampling)
+ *   - Sinusoidal legs (this file's technique)
+ *
+ * Why two? Because a centipede needs to MOVE, and stateless FK
+ * can't drive locomotion — there's no concept of "where I am"
+ * other than the deterministic formula. The trail buffer
+ * handles position; the sinusoid handles articulation.
+ *
+ * fk_tentacle_forest doesn't move. The roots are bolted to the
+ * sea floor; only the body articulates. So statefulness isn't
+ * needed — sinusoidal FK alone is enough.
+ *
+ * Decision tree:
+ *
+ *   needs to MOVE in space?           → add trail buffer (centipede)
+ *   needs RESPONSE to environment?    → add IK or steering (boids)
+ *   needs DEFORMATION (squish)?       → add Verlet (ragdoll)
+ *   none of those — pure articulation → stateless FK (this file)
+ *
+ * The dumbest thing that works wins. Tentacles in seaweed:
+ * sinusoidal FK is plenty.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 /* M_PI is a POSIX extension, not standard C99/C11 — provide a fallback

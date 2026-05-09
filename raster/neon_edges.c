@@ -231,6 +231,331 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read raster/bloom_finale.c first if you don't yet
+ *      know the bloom (extract → blur → composite) pipeline; this
+ *      file ADDS an edge stage in front of the bloom rather than
+ *      replacing it.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *      Note the SCALE / THRESHOLD / KNEE triple — those are the
+ *      knobs that decide WHAT counts as an edge.
+ *   3. §7 edge — the Sobel pass. THE HEART of this file. Read
+ *      AFTER tutorials T1-T4. The G-buffer it reads is identical
+ *      to ssao_pipeline.c's; the buffer it writes (g_edge) is
+ *      consumed only by §8 lightpass.
+ *   4. §6 gbuffer — same forward rasteriser as everywhere else.
+ *      Skim if you've seen cube_raster.c.
+ *   5. §8 lightpass + §9 bloom — read AFTER bloom_finale.c.
+ *      The only addition here is the line that adds g_edge into
+ *      the lit HDR sum.
+ *   6. §3 math + §4 paint + §10-§12 — infrastructure; skip on
+ *      first read.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   g_z_view[r][c]      LINEAR view-space depth (positive = away).
+ *                       Sobel must run on this, NOT on g_zbuf
+ *                       (which is non-linear NDC-z).
+ *   g_valid[r][c]       1 = a triangle wrote here this frame, 0 =
+ *                       background (void).
+ *   g_edge[r][c]        HDR cyan colour added to the lit output;
+ *                       0 = no edge.
+ *   gx, gy              Sobel x/y partial sums for one channel.
+ *   depth_grad          √(gx² + gy²) on z_view.
+ *   normal_grad         sum of three √(gx² + gy²) on Nx, Ny, Nz.
+ *   edge                Combined gradient before threshold.
+ *   t                   smoothstep((edge − THRESHOLD) / KNEE).
+ *
+ * Background you need
+ * ───────────────────
+ *   - The G-buffer pattern (deferred_rendering_pipeline.c).
+ *   - Convolution: a kernel (3×3 weights) applied at every pixel
+ *     to produce a new pixel.
+ *   - Bloom basics (bloom_finale.c) — extract → Gaussian blur →
+ *     composite.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Stencil-buffer outline tricks. Those operate during the
+ *     forward pass and require multiple draws per object; we do
+ *     it once in screen space.
+ *   - Geometry shader / inverted-hull outlines. Same — those
+ *     require GPU geometry-stage features we don't have.
+ *   - The full Canny edge-detection pipeline (Sobel + non-max
+ *     suppression + double threshold + hysteresis). We use only
+ *     Sobel — for real-time stylised edges that's enough.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Eight tutorials that build screen-space edge detection from
+ * first principles.
+ *
+ *   T1  Two kinds of edges — silhouette and crease
+ *   T2  Why screen-space edge detection at all
+ *   T3  The Sobel kernel — what those numbers MEAN
+ *   T4  Combining depth and normal gradients
+ *   T5  Linear depth (z_view) vs. non-linear depth (z_NDC)
+ *   T6  The void problem — borrowing -CAM_FAR for invalid samples
+ *   T7  Smooth thresholding — why a hard cut-off looks bad
+ *   T8  Plugging into bloom — edges as HDR contributors
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  TWO KINDS OF EDGES — SILHOUETTE AND CREASE
+ * ──────────────────────────────────────────────
+ * A pencil sketch of a cube has two visually distinct line types:
+ *
+ *   SILHOUETTE   the outline against the empty page — separates
+ *                "object" from "no object." Crosses the boundary
+ *                between cube depth and infinite background depth.
+ *
+ *   CREASE       the lines BETWEEN faces. The depth varies
+ *                smoothly across a crease (small jump), but the
+ *                surface ORIENTATION (normal) flips sharply.
+ *
+ * A robust outline detector must catch BOTH. One signal can't
+ * cover both because:
+ *
+ *   - Silhouette has huge depth jump, small normal change at the
+ *     boundary (you're sliding off into the void).
+ *   - Crease has small depth jump, huge normal change.
+ *
+ * Solution: run two detectors and combine them with `max`. Any
+ * pixel that hits either condition gets glow.
+ *
+ *      ┌─────────────────────────────────────────────────────┐
+ *      │                                                     │
+ *      │       silhouette                  crease            │
+ *      │                                                     │
+ *      │       ┌────────                  ┌─────             │
+ *      │       │  cube                    │face1│            │
+ *      │       │ (foreground)             │     │            │
+ *      │       │                          ├─ ─ ─┤            │
+ *      │       │                          │face2│            │
+ *      │       └────────                  └─────             │
+ *      │                                                     │
+ *      │  ∇z = HUGE                  ∇z ≈ 0                  │
+ *      │  ∇N ≈ 0                     ∇N = HUGE               │
+ *      └─────────────────────────────────────────────────────┘
+ *
+ * T2  WHY SCREEN-SPACE EDGE DETECTION AT ALL
+ * ──────────────────────────────────────────
+ * Several other ways to draw outlines exist:
+ *
+ *   GEOMETRIC      For each silhouette edge in 3-D, find adjacent
+ *                  triangles, test whether one faces the camera and
+ *                  the other away, draw a line in 3-D. Heavy CPU
+ *                  topology work; per-frame; fragile under deforming
+ *                  meshes.
+ *
+ *   INVERTED HULL  Draw the model twice: a slightly-fat black copy
+ *                  with reversed winding, then the normal model on
+ *                  top. The black halo peeks out at silhouettes.
+ *                  Cheap but only does silhouettes; no creases.
+ *
+ *   STENCIL        Mark pixels covered by the model in the stencil
+ *                  buffer; expand the mark by one pixel; XOR with
+ *                  the original. Same constraint — silhouettes only.
+ *
+ *   SCREEN-SPACE   Render the scene normally → look at the resulting
+ *                  G-buffer → find pixels where depth or normal
+ *                  changes fast → tag those pixels.
+ *
+ * Screen-space wins on three axes for our use case:
+ *
+ *   1. ONE pass for everything in the scene, regardless of mesh
+ *      complexity or topology.
+ *   2. Catches BOTH silhouettes and creases for free (just look at
+ *      different G-buffer channels).
+ *   3. Works downstream of the regular pipeline — every other shader
+ *      stays unchanged.
+ *
+ * Cost: nine G-buffer reads per pixel (the 3×3 neighbourhood).
+ * Trivial.
+ *
+ * T3  THE SOBEL KERNEL — WHAT THOSE NUMBERS MEAN
+ * ──────────────────────────────────────────────
+ * Sobel is a 3×3 convolution that approximates the spatial gradient.
+ * Two kernels — one for x, one for y:
+ *
+ *     Sx = | -1  0  +1 |       Sy = | -1 -2 -1 |
+ *          | -2  0  +2 |            |  0  0  0 |
+ *          | -1  0  +1 |            | +1 +2 +1 |
+ *
+ * To apply Sx at pixel p, you take its 8 neighbours + itself, weight
+ * each by the kernel, sum:
+ *
+ *     gx = -1·NW + 0·N + 1·NE
+ *          -2·W  + 0·P + 2·E
+ *          -1·SW + 0·S + 1·SE
+ *
+ * Read in plain English: "how much darker is the LEFT side than the
+ * RIGHT side, with the MIDDLE row counting double?" That's the rate
+ * of change in x. Sy does the same vertically.
+ *
+ * Why double the middle? Two reasons:
+ *
+ *   - The middle row is on the same y-line as P; it gives the most
+ *     direct measurement of the x-gradient AT P.
+ *   - The corner samples are √2 farther from P than the edge
+ *     samples; downweighting them by 2× compensates for the larger
+ *     distance, making the response approximately rotationally
+ *     invariant.
+ *
+ * The combined gradient magnitude is √(gx² + gy²) — Pythagorean
+ * length of the gradient vector.
+ *
+ * Sobel is just one specific 3×3 derivative kernel. Variants
+ * (Prewitt, Scharr) tweak the weights for slightly different
+ * isotropy properties. For our purpose Sobel is plenty.
+ *
+ * T4  COMBINING DEPTH AND NORMAL GRADIENTS
+ * ────────────────────────────────────────
+ * We compute four Sobel magnitudes per pixel:
+ *
+ *     |∇ z_view|     ← scalar, one number
+ *     |∇ Nx|         ← Sobel on the X component of the world normal
+ *     |∇ Ny|
+ *     |∇ Nz|
+ *
+ * The depth gradient gives silhouettes. The three normal gradients
+ * combine into one number:
+ *
+ *     normal_grad = |∇ Nx| + |∇ Ny| + |∇ Nz|
+ *
+ * (This is the L¹ norm of the per-component gradient. Could equally
+ * use L²; L¹ is cheaper and slightly noisier — fine here.)
+ *
+ * Final edge magnitude is the bigger of the two:
+ *
+ *     edge = max(depth_grad  · DEPTH_SCALE,
+ *                normal_grad · NORMAL_SCALE)
+ *
+ * The two SCALE constants exist because the two signals have
+ * incomparable units. depth_grad is in view-space units (≈ scene
+ * size). normal_grad is dimensionless (normals are unit length).
+ * The scales are tuned so a "real" silhouette and a "real" crease
+ * produce roughly the same edge magnitude — that way one
+ * THRESHOLD value works for both.
+ *
+ * T5  LINEAR DEPTH (z_view) VS. NON-LINEAR DEPTH (z_NDC)
+ * ──────────────────────────────────────────────────────
+ * The G-buffer has TWO depth fields:
+ *
+ *   g_zbuf[r][c]      NDC z, in [-1, +1]. Used by the rasteriser
+ *                     for z-test. After perspective divide, NDC z
+ *                     is HEAVILY non-linear: 90% of the [-1, +1]
+ *                     range is occupied by the near 10% of the
+ *                     scene. Tiny depth changes near the camera
+ *                     produce huge NDC changes; large depth
+ *                     changes far away produce tiny NDC changes.
+ *
+ *   g_z_view[r][c]    Linear view-space z, in scene units. A
+ *                     surface 1 unit farther always reads 1 unit
+ *                     bigger.
+ *
+ * Sobel needs LINEAR. Otherwise:
+ *
+ *   - A flat floor receding into the distance has zero real depth
+ *     gradient (it's flat) but a NON-zero NDC-z gradient (NDC is
+ *     non-linear). Sobel on NDC-z would draw bright lines along
+ *     receding floor stripes — false silhouettes everywhere.
+ *
+ *   - A real silhouette at the back of the scene has small NDC-z
+ *     change (because the non-linearity has already saturated at
+ *     the far plane). Sobel on NDC-z would miss it.
+ *
+ * Linear z_view solves both. Cost: one extra float per G-buffer
+ * pixel.
+ *
+ * T6  THE VOID PROBLEM — BORROWING -CAM_FAR FOR INVALID SAMPLES
+ * ─────────────────────────────────────────────────────────────
+ * At a silhouette, the 3×3 neighbourhood STRADDLES the object
+ * boundary. Some samples land on the object (g_valid = 1, real
+ * z_view), others fall on the empty background (g_valid = 0, no
+ * real depth — never written to).
+ *
+ * If we feed 0.0 in for the void samples, Sobel sees a TINY depth
+ * jump and the silhouette doesn't trigger. If we feed +∞, the
+ * gradient overflows. The fix is to substitute a SENTINEL value
+ * that is both far away and finite:
+ *
+ *     z_void = -CAM_FAR
+ *
+ * (Negative because in our convention, view-space looks down -Z,
+ * so a far point has z_view < 0.)
+ *
+ * Now the silhouette pixel sees neighbours at depth roughly equal
+ * to its own actual depth on one side, and at -CAM_FAR on the
+ * other. The Sobel sum is enormous → silhouette correctly flagged.
+ *
+ * Same trick for the normal field: void neighbours contribute a
+ * sentinel normal (we use (0, 0, 0)), creating a gradient at the
+ * boundary. The exact sentinel doesn't matter much for the normal
+ * — any value distinct from the surface normal triggers detection.
+ *
+ * T7  SMOOTH THRESHOLDING — WHY A HARD CUT-OFF LOOKS BAD
+ * ──────────────────────────────────────────────────────
+ * After computing edge magnitude, we want a per-pixel "edge-ness"
+ * in [0, 1]. The naïve approach is a hard cut-off:
+ *
+ *     t = (edge >= THRESHOLD) ? 1 : 0
+ *
+ * This produces aliased, jagged edges — every pixel is either
+ * fully glowing or fully off. At the boundary you'd see 1-pixel
+ * stair-stepping.
+ *
+ * SMOOTHSTEP softens the transition over a small range:
+ *
+ *     x = clamp01((edge − THRESHOLD) / KNEE)
+ *     t = x² · (3 − 2x)               ← Hermite ease curve
+ *
+ * Now t ramps from 0 (below threshold) through 0.5 (at midpoint)
+ * to 1 (well past threshold). Visually: edges fade in over KNEE
+ * units of magnitude, eliminating the binary stair-step.
+ *
+ * KNEE is the WIDTH of the transition zone. Wide KNEE = soft, ramp-
+ * like edges. Narrow KNEE = sharp but anti-aliased. Tuned here so
+ * the transition is just wide enough to hide single-pixel aliasing
+ * without losing sharpness.
+ *
+ * T8  PLUGGING INTO BLOOM — EDGES AS HDR CONTRIBUTORS
+ * ────────────────────────────────────────────────────
+ * The lightpass for this scene is intentionally DIM:
+ *
+ *     ambient ≈ 0.03 (very low)
+ *     diffuse + spec lit by a weak sun
+ *     lit_total = ambient·albedo + sun·albedo·max(0, N·L) + ...
+ *
+ * Add the edge contribution at the END:
+ *
+ *     lit_total += g_edge[r][c]
+ *
+ * g_edge is HDR — its components can exceed 1.0. The bloom
+ * pipeline (see bloom_finale.c T6) extracts pixels above its own
+ * threshold and Gaussian-blurs them. Because the surfaces are
+ * dim, only edge pixels exceed bloom threshold, and the bleed
+ * traces the outline.
+ *
+ * Composition: the soft cyan halo around each shape is the bloom
+ * stage doing its normal job on a HDR signal that happens to be
+ * concentrated along screen-space edges. None of the bloom code
+ * is changed from bloom_finale.c — only the source of the bright
+ * pixels is.
+ *
+ * Toggling 'b' OFF leaves the edge contribution but skips the
+ * blur stage — you see hard pixel-precise lines. Toggling 'e'
+ * OFF skips the edge stage entirely — only the dim Phong lighting
+ * remains. The pair gives a clean A/B for what each stage adds.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

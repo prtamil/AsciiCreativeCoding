@@ -213,6 +213,333 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read raster/deferred_rendering_pipeline.c first if
+ *      you don't yet know the G-buffer pattern; the rendering half
+ *      of this file is the same. The NEW half is §6 mc.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *      Note especially MC_GRID (resolution), MC_DEFAULT_THRESHOLD,
+ *      and MC_MAX_VERTS (triangle pool cap).
+ *   3. §6 mc — THE HEART of this file. Read AFTER tutorials T1-T6.
+ *      In order:
+ *        §6.1 cube corner / edge geometry  ← labels
+ *        §6.2 EDGE_TABLE  (256 entries)    ← which edges crossed
+ *        §6.3 TRI_TABLE   (256 × ≤16)      ← how to triangulate
+ *        §6.4 vertex pool                  ← per-frame allocator
+ *        §6.5 mc_extract                   ← the algorithm
+ *      Bourke's reference page has the same labelling — keep it open
+ *      next to the file.
+ *   4. §5 metaballs — the scalar field. Independent of MC; you could
+ *      swap in any f: ℝ³ → ℝ and the extractor wouldn't change.
+ *   5. §7 gbuffer + §8 lightpass — same as deferred_rendering.
+ *   6. §3 math + §4 paint + §9-§11 — infrastructure; skip on first
+ *      read.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   GRID, GRID+1            cube count vs. corner count along each
+ *                           axis. 24 cubes in x = 25 corners in x.
+ *   g_field[k][j][i]        scalar value at corner (i, j, k).
+ *   case_idx                8-bit cube index — bit n set iff
+ *                           corner n is INSIDE the level set.
+ *   emask                   12-bit mask — bit e set iff edge e
+ *                           crosses the iso-surface in this case.
+ *   t                       lerp parameter ∈ [0, 1] for the edge's
+ *                           crossing position.
+ *   T (or threshold)        the iso-value: f(p) = T defines the
+ *                           surface.
+ *   blob colour             palette colour of an individual metaball;
+ *                           per-vertex colour is the blended average
+ *                           weighted by metaball influence.
+ *
+ * Background you need
+ * ───────────────────
+ *   - The 7-stage forward rasteriser (cube_raster.c).
+ *   - G-buffer / deferred shading (deferred_rendering_pipeline.c).
+ *   - Linear interpolation: lerp(a, b, t) = a + t·(b − a).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Dual contouring or extended marching cubes. Plain MC has well-
+ *     known ambiguity-case wobbles; we accept them at this scale.
+ *   - SDF / level-set theory at depth — we just need "field value
+ *     above threshold = inside" and "below = outside."
+ *   - Octree spatial decomposition / sparse voxels. Our 24³ grid is
+ *     small enough to scan exhaustively every frame.
+ *   - GPU compute / parallel MC. The CPU version at 24³ is plenty
+ *     fast for terminal output.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Eight tutorials that build marching cubes + animated metaballs
+ * from first principles.
+ *
+ *   T1  The level-set problem — what's an isosurface?
+ *   T2  Why CUBES instead of a smooth equation?
+ *   T3  The 256 cases — how an 8-bit index encodes corner state
+ *   T4  EDGE_TABLE and TRI_TABLE — the precomputed lookup
+ *   T5  Linear edge interpolation — placing a vertex on a crossed edge
+ *   T6  Gradient normals — smooth shading without per-vertex authoring
+ *   T7  The metaball field — animated topology for free
+ *   T8  Per-vertex colour blending — why merging blobs show their seam
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE LEVEL-SET PROBLEM — WHAT'S AN ISOSURFACE?
+ * ─────────────────────────────────────────────────
+ * Take any function f: ℝ³ → ℝ that returns a real number for every
+ * 3-D point. Pick a threshold T. The set of points where f(p) = T
+ * is a 2-D surface (almost everywhere) called the LEVEL SET or
+ * ISOSURFACE of f at T.
+ *
+ *   f(p) = x² + y² + z² − 1   →   level T = 0 is a unit sphere.
+ *   f(p) = density of clouds  →   level T = 0.5 is the cloud's
+ *                                 visible boundary.
+ *   f(p) = signed distance    →   level T = 0 is the surface itself.
+ *
+ * The CHALLENGE: there's no closed-form list of triangles for an
+ * arbitrary level set. Even for the unit sphere, the formula
+ * doesn't TELL you where to put the triangles — only which points
+ * are on the sphere.
+ *
+ * Marching cubes solves this for ANY scalar field: it produces a
+ * triangle approximation of f(p) = T from a discrete grid of
+ * sample values, no analytic surface-finding required.
+ *
+ * T2  WHY CUBES INSTEAD OF A SMOOTH EQUATION?
+ * ───────────────────────────────────────────
+ * The trick: don't try to mesh the surface DIRECTLY. Instead,
+ * partition all of space into tiny cubes (a regular voxel grid).
+ * Inside each cube, ask a much simpler question:
+ *
+ *     "Of my 8 corners, which are INSIDE the surface
+ *      (f(corner) > T) and which are OUTSIDE?"
+ *
+ * Eight corners, each binary → 2⁸ = 256 possible patterns. The
+ * surface inside that one cube is approximated by triangles
+ * connecting the EDGES that cross from inside-to-outside.
+ *
+ * For each of the 256 cases, ONE triangle layout is enough (with
+ * a couple of ambiguity tweaks). Lorensen & Cline (1987) tabulated
+ * all 256 — that's EDGE_TABLE and TRI_TABLE in §6.2 / §6.3.
+ *
+ * The whole continuous surface emerges from doing this lookup at
+ * EVERY cube of the grid. No global meshing — every cube acts
+ * independently and the triangles automatically meet at shared
+ * edges because the interpolation is consistent.
+ *
+ *      ┌──────────────────────────────────────────────┐
+ *      │  surface threading through a cube grid:      │
+ *      │                                              │
+ *      │  ┌───┬───┬───┬───┐                           │
+ *      │  │   │ ╱ │ ╲ │   │   each cube emits         │
+ *      │  ├───┼─/─┼─\─┼───┤   triangles based on      │
+ *      │  │ ╱ │   │   │ ╲ │   which corners are in    │
+ *      │  ├─/─┼───┼───┼─\─┤                           │
+ *      │  │   │   │   │   │                           │
+ *      │  └───┴───┴───┴───┘                           │
+ *      └──────────────────────────────────────────────┘
+ *
+ * T3  THE 256 CASES — HOW AN 8-BIT INDEX ENCODES CORNER STATE
+ * ───────────────────────────────────────────────────────────
+ * Number the cube's 8 corners 0..7 in a fixed labelling
+ * convention. Bourke's labelling (which we use):
+ *
+ *     0: (0, 0, 0)        4: (0, 0, 1)
+ *     1: (1, 0, 0)        5: (1, 0, 1)
+ *     2: (1, 1, 0)        6: (1, 1, 1)
+ *     3: (0, 1, 0)        7: (0, 1, 1)
+ *
+ * Build an 8-bit index by setting bit n if corner n is INSIDE:
+ *
+ *     case_idx = 0
+ *     for n in 0..7:
+ *       if f[n] > T: case_idx |= (1 << n)
+ *
+ * Examples:
+ *     case 0   = 0000 0000   all 8 corners outside  → no triangles
+ *     case 1   = 0000 0001   only corner 0 inside   → one triangle
+ *     case 255 = 1111 1111   all 8 corners inside   → no triangles
+ *     case 11  = 0000 1011   corners 0,1,3 inside   → small wedge
+ *
+ * 256 cases sounds large but most are uninteresting: cases 0 and
+ * 255 emit nothing (cube is entirely out or entirely in). Most
+ * surface-adjacent cubes hit the SAME small handful of cases
+ * (cases 1, 2, 4, 8, 16, 32, 64, 128 are the "single corner
+ * inside" cases — symmetric rotations of one another).
+ *
+ * Lorensen & Cline noted that of 256 cases, only 15 are unique
+ * up to rotation/reflection. Some MC implementations exploit
+ * that with smaller tables; we use the full 256-entry table for
+ * clarity.
+ *
+ * T4  EDGE_TABLE AND TRI_TABLE — THE PRECOMPUTED LOOKUP
+ * ─────────────────────────────────────────────────────
+ * Two tables drive the algorithm:
+ *
+ *   EDGE_TABLE[256]
+ *     12-bit value per case. Bit e set iff edge e is crossed by
+ *     the surface in this case. A "crossed edge" has one corner
+ *     inside and one outside, so the surface must pass through
+ *     somewhere along that edge.
+ *
+ *   TRI_TABLE[256][16]
+ *     For each case, a list of edge indices in groups of three,
+ *     terminated by -1. Each triple says "make a triangle from
+ *     the vertices placed on these three edges, in this winding
+ *     order." Up to 5 triangles per case = 15 indices + sentinel.
+ *
+ * The algorithm becomes:
+ *
+ *     case = (8-bit corner-inside bitset)
+ *     emask = EDGE_TABLE[case]
+ *     for each set bit e in emask:
+ *       compute vert_pos[e] by linear interpolation along edge e
+ *     for each triangle indices in TRI_TABLE[case] until -1:
+ *       emit triangle (vert_pos[i], vert_pos[j], vert_pos[k])
+ *
+ * Two table reads, one short loop per cube. The complexity is in
+ * the OFFLINE construction of the tables; the online algorithm
+ * is trivial.
+ *
+ * Sanity check (we do this at startup): EDGE_TABLE[c] must equal
+ * the bitwise-OR of every edge mentioned in TRI_TABLE[c]. A typo
+ * in either table produces a fatal "MC table mismatch" exit.
+ *
+ * T5  LINEAR EDGE INTERPOLATION — PLACING A VERTEX ON A CROSSED EDGE
+ * ──────────────────────────────────────────────────────────────────
+ * Suppose edge e connects corner a (value f[a]) and corner b
+ * (value f[b]) with f[a] < T < f[b]. The surface passes through
+ * SOMEWHERE along that edge. WHERE exactly?
+ *
+ * Approximation: assume f varies LINEARLY along the edge. Then
+ * the surface crosses where the linear interpolant equals T:
+ *
+ *     f[a] + t · (f[b] − f[a]) = T
+ *     t = (T − f[a]) / (f[b] − f[a])
+ *     vert_pos = lerp(p_a, p_b, t)
+ *
+ * This is the "magic" smoothness step. Without it, you'd snap
+ * vertices to the centre of every crossed edge (t = 0.5
+ * always), and the resulting mesh would be cube-shaped — you
+ * could see every voxel boundary.
+ *
+ * With t computed properly, vertices slide along their edges to
+ * track the actual crossing position, and adjacent cubes' shared
+ * edges produce IDENTICAL t-values (since both see the same
+ * f[a] and f[b]). Result: triangles meet seamlessly at edges
+ * and the cube grid is invisible in the output.
+ *
+ * Caveat: the interpolation is linear, not quadratic — fine for
+ * smooth fields but CAN produce visible kinks where the field
+ * curves sharply within a single cube. Increase MC_GRID to
+ * shrink each cube and the kinks shrink too.
+ *
+ * T6  GRADIENT NORMALS — SMOOTH SHADING WITHOUT PER-VERTEX AUTHORING
+ * ──────────────────────────────────────────────────────────────────
+ * Each triangle vertex needs a normal for lighting. Two options:
+ *
+ *   PER-FACE  Compute one normal per triangle (cross-product of
+ *             two edges). Cheap, but produces faceted shading —
+ *             you'd see every triangle.
+ *
+ *   PER-VERTEX  Each vertex gets its own normal, the rasteriser
+ *             interpolates across the triangle, lighting smooths
+ *             over face boundaries. The result LOOKS curved.
+ *
+ * Per-vertex needs a normal at each vertex. For an isosurface
+ * the answer is built in: the GRADIENT of the field f is
+ * perpendicular to the surface at every point.
+ *
+ *     N(p) = ∇f / |∇f|
+ *
+ * For our metaball field f(p) = Σ s_i / (|p − c_i|² + ε), each
+ * blob contributes a radial gradient outward from its centre,
+ * weighted by the blob's strength. We have an analytic
+ * expression — no need for finite differences:
+ *
+ *     ∇f = − Σ s_i · 2(p − c_i) / (|p − c_i|² + ε)²
+ *
+ * (negative sign because as p moves AWAY from c_i, f decreases).
+ * Negate again to get the OUTWARD normal — points where f exceeds
+ * T are "inside", so outward means in the direction f decreases.
+ *
+ * §5 metaball_gradient computes this; mc_extract evaluates it at
+ * every emitted vertex.
+ *
+ * T7  THE METABALL FIELD — ANIMATED TOPOLOGY FOR FREE
+ * ───────────────────────────────────────────────────
+ * The scalar field is a sum of "metaballs" (Blinn 1982):
+ *
+ *     f(p) = Σ s_i / (|p − c_i|² + ε)
+ *
+ * Each term:
+ *   - peaks at the centre c_i (≈ s_i / ε near c_i)
+ *   - falls off as 1/r² with distance
+ *   - blends ADDITIVELY with other metaballs
+ *
+ * Because the contributions add, two nearby metaballs raise the
+ * field in the gap between them. If the gap-raised value crosses
+ * T, the level set MERGES — one connected component instead of
+ * two.
+ *
+ *      ┌──────────────────────────────────────────────┐
+ *      │  far apart            close together         │
+ *      │                                              │
+ *      │   ⌐⌐⌐    ⌐⌐⌐         ⌐⌐⌐⌐⌐⌐⌐⌐                │
+ *      │  / 1 \  / 2 \         /         \            │
+ *      │  \___/  \___/        \_1______2_/            │
+ *      │                                              │
+ *      │  two blobs           one merged shape        │
+ *      │  genus 0 + genus 0   genus 0                 │
+ *      └──────────────────────────────────────────────┘
+ *
+ * As the metaballs orbit, the surface's TOPOLOGY changes — holes
+ * open and close, components merge and separate. Marching cubes
+ * handles all of this without special-casing: each frame extracts
+ * the level set of the CURRENT field, whatever its topology.
+ *
+ * That's the demo's value proposition: most rendering files
+ * shade a STATIC mesh; this one rebuilds the mesh 60 times a
+ * second from a moving field, and topology evolves naturally.
+ *
+ * T8  PER-VERTEX COLOUR BLENDING — WHY MERGING BLOBS SHOW THEIR SEAM
+ * ──────────────────────────────────────────────────────────────────
+ * Each metaball has a colour. At every emitted vertex p, blend
+ * the metaball colours by their INFLUENCE WEIGHTS at that point:
+ *
+ *     w_i  = s_i / (|p − c_i|² + ε)         ← same as the field
+ *     vert_colour(p) = Σ w_i · colour_i / Σ w_i
+ *
+ * Properties:
+ *   - Right next to ball 1: w_1 ≫ all others → vertex looks
+ *     ball-1's colour.
+ *   - In the middle of a "neck" between ball 1 and ball 2: w_1
+ *     and w_2 are comparable → blended colour.
+ *   - Far from any ball (shouldn't happen on the surface): all
+ *     w_i small but the normalisation by Σ w_i keeps the result
+ *     well-defined.
+ *
+ * The fragment shader (in §8 lightpass) reads the barycentric-
+ * interpolated vertex colour and uses it as the surface albedo.
+ * Result: the SEAM between two merging blobs visibly mixes their
+ * two source colours, while the bulks of each blob retain their
+ * own colour. Merging is BOTH topological (one mesh component
+ * instead of two) AND chromatic (colour mixing in the seam).
+ *
+ * This is the cheap way to fake "material blending" without any
+ * texturing: per-vertex attribute + barycentric interpolation in
+ * the rasteriser. Same machinery as Gouraud shading, just used
+ * for colour instead of intensity.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

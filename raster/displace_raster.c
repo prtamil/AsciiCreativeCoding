@@ -223,6 +223,294 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. Read CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL as prose. Read
+ *      raster/sphere_raster.c first if you don't yet know the
+ *      forward 7-stage pipeline; this file changes ONLY the vertex
+ *      shader, everything downstream is the same.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *   3. §3 displace — the four displacement fields + tangent basis +
+ *      central-difference normal recompute. THIS IS THE HEART of
+ *      the file. Every other section exists to feed §3 and consume
+ *      its output.
+ *   4. §4 shaders — one vertex shader (vert_displace) + four fragment
+ *      shaders (phong, toon, normals, wire). Notice the fragment
+ *      shaders are unmodified copies from cube_raster.c et al —
+ *      they have no idea the geometry is moving.
+ *   5. §5 mesh — UV-sphere tessellation, identical to sphere_raster.c.
+ *   6. §6 framebuffer + §7 pipeline + §8-§10 — infrastructure;
+ *      skim on first read.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   pos                base sphere position (unit sphere · SPHERE_R)
+ *   N                  base sphere normal = pos / |pos|
+ *   T, B               tangent and bi-tangent at pos (perpendicular
+ *                      to N, perpendicular to each other)
+ *   eps / CD_EPS       central-difference step length (along T or B)
+ *   d, ΔfT, ΔfB        displacement scalar at the sample points
+ *   p_displaced        pos + N · d
+ *   N_displaced        normalize(T_displaced × B_displaced)
+ *   amp / freq         per-mode amplitude and spatial frequency
+ *
+ * Background you need
+ * ───────────────────
+ *   - The 7-stage rasteriser (cube_raster.c).
+ *   - Why a unit sphere's surface normal at p is just p̂.
+ *   - Cross product as "perpendicular to both" — this is how T × B
+ *     reconstructs a normal from two displaced tangents.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Tessellation shaders / hardware tessellation. We do CPU vertex
+ *     displacement on a fixed mesh; modern GPUs subdivide adaptively.
+ *   - Analytic normal derivation. We use the universal numeric trick
+ *     (central difference); the analytic version requires a separate
+ *     gradient function per displacement field.
+ *   - Bump / normal maps. Those FAKE the lighting; we genuinely move
+ *     the geometry.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Eight tutorials that build vertex displacement from first principles.
+ *
+ *   T1  Genuine displacement vs. fake displacement
+ *   T2  Why moving a vertex BREAKS its normal
+ *   T3  Building a tangent frame (T, B, N)
+ *   T4  Central difference: a numerical derivative without algebra
+ *   T5  Reconstructing the displaced normal from displaced tangents
+ *   T6  The four displacement fields — anatomy
+ *   T7  Choosing ε — the noise-vs-lag trade
+ *   T8  Why fragment shaders never see the displacement
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  GENUINE DISPLACEMENT VS. FAKE DISPLACEMENT
+ * ──────────────────────────────────────────────
+ * There are two ways to make a sphere LOOK like it has bumps:
+ *
+ *   FAKE  (normal mapping / bump mapping):
+ *     The geometry stays a perfect sphere. The fragment shader
+ *     reads a texture of fake normals and lights AS IF the surface
+ *     were bumpy. The silhouette is still smooth — peek at the
+ *     edge and you'll see a circle, not bumps.
+ *
+ *   REAL (vertex displacement):
+ *     The vertices actually move outward (or inward). The
+ *     silhouette changes — bumps poke into the outline, valleys
+ *     dent it. You can see displacement; you can only INFER bump.
+ *
+ * This file does the REAL kind. Press 'd' until SPIKY: the
+ * silhouette is genuinely jagged, not just shaded jagged.
+ *
+ *      ┌─────────────────────────────────────────────────────┐
+ *      │   FAKE (bump map)            REAL (displacement)    │
+ *      │                                                     │
+ *      │       _______                    _M_M_M_            │
+ *      │      /       \                  / W   W \           │
+ *      │     |  bumpy  |                |  bumpy  |          │
+ *      │     |  shading|                |  shaded |          │
+ *      │      \_______/                  \_W_M_W_/           │
+ *      │                                                     │
+ *      │ silhouette: smooth circle    silhouette: jagged     │
+ *      └─────────────────────────────────────────────────────┘
+ *
+ * T2  WHY MOVING A VERTEX BREAKS ITS NORMAL
+ * ─────────────────────────────────────────
+ * A surface normal is "the direction perpendicular to the
+ * surface at this point." If you move the surface, the
+ * perpendicular changes too.
+ *
+ * Concretely: a sphere's normal at p is just p̂ (the position
+ * is the normal because the centre is at origin). After we
+ * push p outward by f(p), the surface no longer matches the
+ * sphere — it bulges where f is big and dimples where f is
+ * small. The new perpendicular DEPENDS on how f varies in the
+ * neighbourhood of p.
+ *
+ *   At a peak       N′ still points outward (peak is locally a
+ *                   small dome → almost the original N).
+ *   On a slope      N′ tilts in the direction f is increasing.
+ *   At a valley     N′ also points outward (valley is locally a
+ *                   small dome from above).
+ *   On a ridge edge N′ tilts sharply where f changes fast.
+ *
+ * The slope case is what kills naïve renderers: if you forget
+ * to update N, the highlight stays where it was on the original
+ * sphere and the ridges look painted-on rather than physical.
+ *
+ * The job of §3 displaced_normal is to compute N′ correctly.
+ *
+ * T3  BUILDING A TANGENT FRAME (T, B, N)
+ * ──────────────────────────────────────
+ * To detect "how does f vary near p?" we need TWO directions
+ * along the surface (perpendicular to N) so we can sample both.
+ *
+ * The standard trick:
+ *
+ *     pick an "up-ish" reference vector U (normally world-Y)
+ *     T = normalize(cross(U, N))   ← perpendicular to both U and N
+ *     B = cross(N, T)              ← perpendicular to T and N
+ *
+ * (T, B, N) is a right-handed orthonormal frame: three mutually
+ * perpendicular unit vectors anchored at p. T and B span the
+ * tangent plane — the local "ground" at p; N is the local "up."
+ *
+ * Pole degeneracy: if N happens to BE Y (north pole), cross(Y, N)
+ * is zero — Y and N are parallel, no perpendicular direction
+ * exists. We detect that with |N.y| > 0.9 and fall back to
+ * U = (1, 0, 0).
+ *
+ *      ┌──────────────────────────────────────┐
+ *      │           N                          │
+ *      │           │                          │
+ *      │           │                          │
+ *      │     ──────●──────  T                 │
+ *      │          /                           │
+ *      │         /                            │
+ *      │        B  (out of page)              │
+ *      └──────────────────────────────────────┘
+ *
+ * T4  CENTRAL DIFFERENCE: NUMERICAL DERIVATIVE WITHOUT ALGEBRA
+ * ────────────────────────────────────────────────────────────
+ * To know how fast f changes along T, the analytic answer is
+ * "compute ∂f/∂T symbolically." That requires a separate
+ * derivative function per displacement field — annoying, and
+ * brittle if you swap fields.
+ *
+ * The numeric answer is CENTRAL DIFFERENCE:
+ *
+ *       ∂f       f(p + εT) − f(p − εT)
+ *      ──── ≈   ─────────────────────────
+ *       ∂T              2ε
+ *
+ * Sample f at TWO points slightly along ±T, take the difference,
+ * divide by the step. Forward difference (sample at p and p+εT)
+ * works too but is less accurate; central differences cancel
+ * the leading O(ε) error term, leaving O(ε²).
+ *
+ * Cost: 2 extra f() evaluations per direction, 4 total per
+ * vertex. We don't actually do the divide here — we'll fold it
+ * into the cross product in T5.
+ *
+ * Same trick along B gives ∂f/∂B. Two field samples per
+ * direction, four samples per vertex normal.
+ *
+ * T5  RECONSTRUCTING THE DISPLACED NORMAL FROM DISPLACED TANGENTS
+ * ───────────────────────────────────────────────────────────────
+ * The point p moves to p′ = p + N·f(p). What about a neighbour
+ * p + εT? It moves to (p + εT) + N′·f(p+εT) where N′ is its
+ * own normal — but for small ε, N′ ≈ N, so:
+ *
+ *     (p + εT) + N · f(p + εT)
+ *
+ * The vector from p′ to that displaced neighbour is therefore:
+ *
+ *     T_displaced = εT + N·(f(p+εT) − f(p))      forward diff
+ *
+ * For central difference with the symmetric pair:
+ *
+ *     T_displaced = 2εT + N·(f(p+εT) − f(p−εT))
+ *
+ * This is the tangent vector AFTER displacement — pointing along
+ * the displaced surface in the original T direction. Same recipe
+ * for B_displaced.
+ *
+ * Two vectors lying in the new tangent plane → cross-product →
+ * vector perpendicular to that plane → the new normal:
+ *
+ *     N_displaced = normalize(T_displaced × B_displaced)
+ *
+ * Notice the "÷ 2ε" we postponed in T4 cancels: the cross product
+ * is bilinear, scaling both inputs by the same factor scales the
+ * result by that factor squared, and we normalise anyway. So the
+ * code drops the divide entirely.
+ *
+ * T6  THE FOUR DISPLACEMENT FIELDS — ANATOMY
+ * ──────────────────────────────────────────
+ * Each mode picks a scalar function f(p, t). That's it — change
+ * f, get a different deformation. The renderer doesn't change.
+ *
+ *   RIPPLE   f = A · sin(ω·t + k·r) · taper(y)
+ *            r = √(x² + z²) is distance from the polar axis;
+ *            taper(y) = 1 − y² damps near the poles. Reads as
+ *            concentric rings travelling outward from the
+ *            equator.
+ *
+ *   WAVE     f = A · sin(ω·t + k·(x + 0.8y + 0.5z))
+ *            One global plane wave, travelling along a fixed
+ *            diagonal direction. Whole sphere undulates as one.
+ *
+ *   PULSE    f = A · sin(ω·t) · exp(−γ·r)
+ *            No spatial term other than a radial decay; the whole
+ *            sphere breathes in/out, biggest near the equator,
+ *            smallest near the poles.
+ *
+ *   SPIKY    f = A · |sin(kx)·sin(ky)·sin(kz)|^0.6
+ *            Three sine waves multiplied — each axis contributes
+ *            zeros where its sin vanishes, so f stays at zero
+ *            along entire sin-gridlines and peaks at the cell
+ *            centres. The 0.6 power compresses the dynamic range
+ *            so peaks aren't too sharp. Result: a porcupine.
+ *
+ * The four fields cost O(1) each. The vertex pass is dominated by
+ * the FOUR f() calls for normal recompute, not the one for the
+ * displacement.
+ *
+ * T7  CHOOSING ε — THE NOISE-VS-LAG TRADE
+ * ───────────────────────────────────────
+ * Central difference's error is O(ε²) for smooth f. But with
+ * floating-point arithmetic, very small ε hits a different wall:
+ *
+ *   ε too LARGE  → step crosses real curvature; the difference
+ *                  reports the AVERAGE slope, not the local one.
+ *                  Sharp peaks get rounded off in the lighting.
+ *
+ *   ε too SMALL  → f(p+εT) ≈ f(p−εT) to within float precision.
+ *                  Their difference is dominated by float noise;
+ *                  N′ jitters frame to frame even when t doesn't
+ *                  move. Lighting flickers.
+ *
+ * "Sweet spot" depends on the field's frequency. For our four
+ * fields with their default amplitudes/frequencies, ε = 0.03·R
+ * is small enough to track the highest-frequency variation
+ * (SPIKY) and large enough to dominate float noise. Drop to
+ * 0.01·R if you cut amplitudes; raise to 0.05·R if you push k
+ * higher.
+ *
+ * T8  WHY FRAGMENT SHADERS NEVER SEE THE DISPLACEMENT
+ * ───────────────────────────────────────────────────
+ * The fragment shader receives:
+ *
+ *   world_pos    interpolated p′ (the DISPLACED position)
+ *   world_nrm    interpolated N′ (the DISPLACED normal)
+ *   uv, custom   barycentric-interpolated whatever the vert wrote
+ *
+ * It does NOT receive:
+ *   - the base sphere position
+ *   - the displacement amplitude
+ *   - the time
+ *   - which mode is active
+ *
+ * From the fragment shader's perspective, it's just shading a
+ * surface with the position and normal it was handed. That's
+ * why phong / toon / normals / wire are unmodified copies from
+ * cube_raster.c — none of them know about displacement, and yet
+ * they all visibly REACT to it.
+ *
+ * This is the cleanest way to add per-vertex effects to a forward
+ * pipeline: own the vertex shader, leave fragment shaders alone.
+ * The vert/frag uniform split (DisplaceUniforms leads with a base
+ * Uniforms struct) is what makes &disp_uni cast cleanly to const
+ * Uniforms* inside the fragment shaders.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

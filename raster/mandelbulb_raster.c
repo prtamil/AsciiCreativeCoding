@@ -217,6 +217,340 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read raytracing/mandelbulb_raymarcher.c FIRST if
+ *      you don't yet know the Mandelbulb DE formula; this file
+ *      reuses that exact DE but evaluates it OFFLINE during init,
+ *      then renders the resulting mesh with a textbook rasteriser.
+ *   2. §1 config — every constant has a unit-bearing comment.
+ *      Note especially MB_POWER, MB_BAIL, MB_MAX_ITER, MB_HIT_EPS,
+ *      and the NLAT × NLON tessellation resolution.
+ *   3. §4 mesh — THE HEART of this file. Read AFTER tutorials
+ *      T1-T5. Contains:
+ *        - mb_iter / mb_de  (the Mandelbulb distance estimator)
+ *        - tessellate_mandelbulb (the radial-projection meshing)
+ *        - gradient_normal (numeric ∇DE for vertex normals)
+ *      The mesh is built ONCE at init and again only on 'p'/'P'.
+ *   4. §6 pipeline + §3 shaders — same forward rasteriser as
+ *      cube_raster.c. Skim if you've seen it.
+ *   5. §2 math + §5 framebuffer + §7-§9 — infrastructure; skip
+ *      on first read.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   z, c                Mandelbulb iteration variables (z evolves,
+ *                       c is the candidate point). Both 3-D vectors.
+ *   r                   |z|, used both as escape test and DE input.
+ *   dr                  derivative magnitude tracking how fast |z|
+ *                       grows under perturbation; the DE divides by
+ *                       this.
+ *   smooth_iter (μ)     fractional iteration count — smooth scalar
+ *                       in [0, 1] that controls hue.
+ *   NLAT × NLON         mesh resolution (latitude × longitude).
+ *   MB_HIT_EPS          march stop threshold; |DE| < this counts
+ *                       as a surface hit.
+ *   MB_BAIL             escape radius (any point with |z| > BAIL is
+ *                       outside the set).
+ *
+ * Background you need
+ * ───────────────────
+ *   - The 7-stage rasteriser (cube_raster.c).
+ *   - Distance fields and sphere-tracing / raymarching basics
+ *     (raytracing/sphere_raymarch.c is the gentlest).
+ *   - The Mandelbrot escape-time iteration (the 3-D analogue here
+ *     is the Mandelbulb).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Quaternion algebra / hypercomplex numbers — White & Nylander
+ *     deliberately use spherical-coordinate arithmetic instead of a
+ *     true 3-D number system, which is why this fractal exists at
+ *     all (no honest 3-D analogue of complex multiplication).
+ *   - Marching cubes / dual contouring — both extract triangles
+ *     from a scalar field. We do something simpler: shoot rays at
+ *     it. See raster/marching_cubes.c for the proper isosurface
+ *     extractor.
+ *   - GPU compute shaders — modern engines build the mesh on the
+ *     GPU; we do it on the CPU at startup (one-shot).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Eight tutorials that build the raymarch-then-rasterise hybrid
+ * from first principles.
+ *
+ *   T1  The Mandelbulb in 30 seconds — what does z^p mean in 3-D?
+ *   T2  Distance estimation — turning escape-time into a SDF
+ *   T3  Why bother meshing? Speed vs. fidelity trade
+ *   T4  Sphere-projection meshing — shoot a ball of rays inward
+ *   T5  Gradient normals — how to get a normal from a SDF
+ *   T6  Smooth iteration count — μ as a colour key
+ *   T7  Vertex stitching — UV-grid quad to two triangles
+ *   T8  What this rasteriser CAN'T see (and how to know)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE MANDELBULB IN 30 SECONDS — WHAT DOES z^p MEAN IN 3-D?
+ * ─────────────────────────────────────────────────────────────
+ * The Mandelbrot set lives in the complex plane: iterate
+ *
+ *     z_{n+1} = z_n² + c          (start z = 0)
+ *
+ * and ask "does |z| stay bounded forever?" Points where the
+ * answer is YES form the Mandelbrot set; points where it's NO
+ * have a smooth "escape time" we can colour.
+ *
+ * In 3-D there's no honest analogue of complex multiplication.
+ * White & Nylander (2009) cheated: take a 3-D point, convert to
+ * spherical coords (r, θ, φ), and DEFINE
+ *
+ *     z^p in 3-D ≡ (r^p, p·θ, p·φ)        (back to Cartesian)
+ *
+ * This is NOT a real algebraic operation; it's a deliberate
+ * lift of "raise to a power" by analogy. With p = 8 the resulting
+ * iteration produces the canonical Mandelbulb — the fractal
+ * shape with bumpy organic pods every fractal artist has seen.
+ *
+ *     z = (0, 0, 0)
+ *     repeat:
+ *       z = z^p (spherical) + c      ← c is the candidate point
+ *       if |z| > BAIL: escaped, c is OUTSIDE the set
+ *       if iter > MAX_ITER: stayed bounded, c is INSIDE
+ *
+ * mb_iter() in §4 is exactly that loop. The function returns the
+ * iteration count where escape happened (or MAX_ITER if it didn't),
+ * along with the final |z| and dr (T2 uses dr).
+ *
+ * Other powers give other shapes: p = 2 is a smooth blob, p = 3
+ * is a tetrahedral fractal, p = 8 is the canonical Mandelbulb.
+ * Press 'p'/'P' at runtime to cycle.
+ *
+ * T2  DISTANCE ESTIMATION — TURNING ESCAPE-TIME INTO A SDF
+ * ────────────────────────────────────────────────────────
+ * Escape-time alone tells you whether a point is in or out of
+ * the set. It does NOT tell you the DISTANCE to the boundary —
+ * which is what raymarching needs.
+ *
+ * Hubbard & Douady (1985) found a clean lower-bound on distance
+ * for the 2-D Mandelbrot:
+ *
+ *     d ≈ 0.5 · log(r) · r / dr
+ *
+ * where r = |z| at escape and dr = the magnitude of dz/dc tracked
+ * alongside the iteration. Intuitively, dr says "how fast did
+ * tiny perturbations of c amplify into perturbations of z?" — and
+ * dividing the escape distance by that amplification factor pulls
+ * back to a distance in c-space.
+ *
+ * The 3-D analogue uses the same formula with the recurrence
+ *
+ *     dr_{n+1} = p · r^(p-1) · dr + 1
+ *
+ * which tracks the derivative through the spherical power. This
+ * is mb_de() in §4.
+ *
+ * mb_de IS NOT EXACT. It's a Lipschitz lower bound — guaranteed
+ * to be ≤ the true distance. That's enough for raymarching:
+ * stepping by mb_de · 0.85 will never overshoot the surface.
+ * (The 0.85 is a safety multiplier — sometimes the bound is
+ * loose at sharp features.)
+ *
+ *      ┌──────────────────────────────────────────────┐
+ *      │                                              │
+ *      │   ray ───●──→──●─→─●──→ surface              │
+ *      │         │      │  │                          │
+ *      │      mb_de  mb_de small  hit                 │
+ *      │      (big)  (close)  (< MB_HIT_EPS)          │
+ *      └──────────────────────────────────────────────┘
+ *
+ * T3  WHY BOTHER MESHING? SPEED VS. FIDELITY TRADE
+ * ────────────────────────────────────────────────
+ * The natural way to render a Mandelbulb is RAYMARCHING:
+ * for every screen pixel, march a ray with mb_de until it hits.
+ * Cost: ~30-100 DE evaluations per pixel × W × H pixels per
+ * frame. Beautiful but expensive.
+ *
+ * raster/mandelbulb_raster.c takes a different route:
+ *
+ *   ONCE at init:       evaluate mb_de NLAT × NLON × MAX_MARCH ≈
+ *                       28 × 56 × 64 = 100 k times. Build a mesh.
+ *   EVERY FRAME:        run a textbook rasteriser on ~1800
+ *                       triangles. Zero DE evals.
+ *
+ * The init pause is ~200 ms (visible). The runtime cost drops
+ * to "any small mesh," and you get to use every standard raster
+ * trick: shaders, culling, z-buffer, dither.
+ *
+ * Trade-off, not free lunch:
+ *   - Raymarching sees through deep concavities; rasterising the
+ *     "outermost skin" mesh does not (T8).
+ *   - Changing the fractal power requires rebuilding the mesh.
+ *   - The mesh is a finite triangle approximation; raymarching
+ *     resolves to pixel precision regardless of zoom.
+ *
+ * Both files exist on purpose. They're a paradigm A/B.
+ *
+ * T4  SPHERE-PROJECTION MESHING — SHOOT A BALL OF RAYS INWARD
+ * ───────────────────────────────────────────────────────────
+ * Imagine a sphere of radius 1.5 (well outside the bulb's radius
+ * 1.0 max). On the surface of that sphere place a NLAT × NLON
+ * grid of points. From each grid point, fire a ray TOWARD THE
+ * ORIGIN. March each ray with mb_de until you hit the bulb's
+ * surface or pass through the centre.
+ *
+ *     for lat in 0..NLAT-1:
+ *       θ = -π/2 + π · lat / (NLAT-1)        (latitude)
+ *       for lon in 0..NLON-1:
+ *         φ = 2π · lon / NLON                (longitude)
+ *         dir = (cos θ cos φ, sin θ, cos θ sin φ)
+ *         start_pos = dir · 1.5              (outside)
+ *         t = 0
+ *         while t < march_max:
+ *           p = start_pos − dir · t          (march toward origin)
+ *           d = mb_de(p)
+ *           if d < MB_HIT_EPS:               hit
+ *             record vertex (p, normal, μ, lon)
+ *             break
+ *           t += max(d · 0.85, 0.004)
+ *         else:                              missed (no surface)
+ *           mark vertex INVALID
+ *
+ * Every (lat, lon) cell either gets a vertex or is invalid.
+ *
+ *      ┌──────────────────────────────────────────────┐
+ *      │     . . . . .                                │
+ *      │   .         . ← rays start on outer sphere   │
+ *      │  .   bulb   .                                │
+ *      │  .  ╱⌐⌐╲   .                                 │
+ *      │   . ╲___╱  .                                 │
+ *      │     . . . .                                  │
+ *      │    rays march inward until DE < EPS          │
+ *      └──────────────────────────────────────────────┘
+ *
+ * Then T7 takes care of stitching adjacent vertices into quads.
+ *
+ * T5  GRADIENT NORMALS — HOW TO GET A NORMAL FROM A SDF
+ * ─────────────────────────────────────────────────────
+ * The mesh records vertex POSITIONS, but rasterisation also
+ * needs vertex NORMALS for lighting. The Mandelbulb has no
+ * analytic normal — same problem as with the displaced sphere
+ * (displace_raster T4-T5).
+ *
+ * Solution: the gradient of a SDF points AWAY from the surface.
+ * That's the very definition of "distance field": values
+ * increase fastest in the surface-normal direction.
+ *
+ * Sample mb_de at six points around p (±ε in x, y, z) and take
+ * central differences:
+ *
+ *     N = normalize( (mb_de(p+εx) − mb_de(p−εx),
+ *                    mb_de(p+εy) − mb_de(p−εy),
+ *                    mb_de(p+εz) − mb_de(p−εz)) )
+ *
+ * Same trick as in displace_raster.c, applied to a different
+ * scalar field. Six DE evals per vertex; happens once at mesh
+ * build time, never per frame.
+ *
+ * gradient_normal() in §4 implements this.
+ *
+ * T6  SMOOTH ITERATION COUNT — μ AS A COLOUR KEY
+ * ──────────────────────────────────────────────
+ * mb_iter returns an INTEGER count of iterations to escape.
+ * Colouring by integer counts produces visible bands ("Mandelbrot
+ * stripes"). Smooth iteration replaces it with a CONTINUOUS μ:
+ *
+ *     μ = n + 1 − log( log(r_n) / log(BAIL) ) / log(p)
+ *
+ * Where n is the integer iteration count and r_n is the |z| at
+ * that iteration. Properties:
+ *
+ *   - At the boundary of the set, μ → MAX_ITER smoothly.
+ *   - Far outside, μ ≈ small.
+ *   - The "+1 − log(…)" trick subtracts off the partial extra
+ *     iteration after escape, so points that just barely escaped
+ *     read as fractional iterations.
+ *
+ * After normalisation by MAX_ITER → μ ∈ [0, 1], the fragment
+ * shaders use it directly as a hue. depth_hue shader reads μ
+ * and maps it through HSV → RGB; phong_hue uses μ for the base
+ * colour and modulates with Phong lighting; normals shader
+ * ignores μ entirely.
+ *
+ * The HUE_BANDS constant (1..5) cycles the rainbow through μ
+ * multiple times — more bands = more visible iso-iteration
+ * shells.
+ *
+ * T7  VERTEX STITCHING — UV-GRID QUAD TO TWO TRIANGLES
+ * ────────────────────────────────────────────────────
+ * After T4 we have NLAT × NLON vertices, some valid, some not.
+ * To turn them into a renderable mesh, we stitch adjacent
+ * vertices into quads — same idea as a UV-sphere tessellation:
+ *
+ *     for lat in 0..NLAT-2:
+ *       for lon in 0..NLON-1:
+ *         a = grid[lat   ][lon              ]
+ *         b = grid[lat   ][(lon+1) % NLON   ]
+ *         c = grid[lat+1 ][(lon+1) % NLON   ]
+ *         d = grid[lat+1 ][lon              ]
+ *         if all four valid:
+ *           emit triangle (a, b, c)
+ *           emit triangle (a, c, d)
+ *
+ * The `% NLON` wraps longitude — quad 359°→0° connects across
+ * the seam.
+ *
+ * Quads with any invalid corner are dropped. That's how we get
+ * silhouette gaps on highly fractal regions: a ray missed, no
+ * vertex, no quad.
+ *
+ * Pole handling: the latitude poles have NLON identical vertices
+ * (all collapse to one point). The stitching produces degenerate
+ * "thin slice" triangles — the rasteriser handles those as
+ * zero-area and skips them naturally.
+ *
+ * T8  WHAT THIS RASTERISER CAN'T SEE (AND HOW TO KNOW)
+ * ────────────────────────────────────────────────────
+ * Sphere-projection meshing fundamentally captures only the
+ * RADIALLY-OUTERMOST surface. Anywhere a radial ray passes
+ * through one piece of bulb, into a void, and into another
+ * piece of bulb, the inner piece is INVISIBLE.
+ *
+ * Concretely missing:
+ *
+ *   - Inner pods nestled inside the canonical 8-bulb's outer
+ *     "thumbs."
+ *   - Deep concavities (the cavity floors are radially behind
+ *     the cavity rims).
+ *   - Overhangs the radial direction can't reach.
+ *
+ * How to KNOW you're seeing this:
+ *   1. Run mandelbulb_raster.c at power 8; orbit the camera.
+ *   2. Run raytracing/mandelbulb_raymarcher.c at power 8; orbit.
+ *   3. The raymarched version has visibly more interior detail.
+ *   4. The raster version is a "shrink-wrap" of the same shape.
+ *
+ * Workarounds (NOT implemented here, mentioned for completeness):
+ *
+ *   - Marching cubes (raster/marching_cubes.c) extracts the FULL
+ *     isosurface — every cavity, every pod. More expensive but
+ *     complete.
+ *   - Multi-direction projection (six axes, dedupe vertices)
+ *     captures more skin but still misses deeply hidden cavities.
+ *   - Just keep raymarching. That's always the right answer for
+ *     fully accurate fractal rendering.
+ *
+ * The point of this file is the PARADIGM, not the geometric
+ * fidelity: "what does it look like to render a fractal as a
+ * standard mesh through a textbook pipeline, and what do you
+ * lose?" Now you know.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

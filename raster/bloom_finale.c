@@ -208,6 +208,297 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read raster/deferred_rendering_pipeline.c first if
+ *      you don't yet know the G-buffer pattern, and ssao_pipeline.c
+ *      if you don't yet know the AO pass; this file COMPOSES both
+ *      of those plus a new bloom stage.
+ *   2. §1 config — every constant has a unit-bearing comment. The
+ *      bloom block (THRESHOLD, INTENSITY, RADIUS, σ) is what tunes
+ *      the halo's strength and width.
+ *   3. §9 bloom — THE NEW HEART of this file. Read AFTER tutorials
+ *      T1-T6. The four functions (extract / blur_h / blur_v /
+ *      composite) line up 1:1 with the algorithm steps.
+ *   4. §6 gbuffer + §7 ssao + §8 lightpass — copies of the earlier
+ *      files. Skim if you've read those. Notice §8 outputs HDR
+ *      (no clamp before bloom).
+ *   5. §3 math + §4 paint + §10-§12 — infrastructure; skip on
+ *      first read. paint_cell does the Reinhard tone-map at the
+ *      very end — that's the line that finally collapses HDR into
+ *      terminal-friendly brightness.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   g_light[r][c]       HDR lit colour, components may exceed 1.0.
+ *   g_bloom[r][c]       buffer that holds the bright-extract,
+ *                       then the blurred halo. Reused across
+ *                       passes.
+ *   g_bloom_temp[r][c]  scratch buffer for separable-blur
+ *                       intermediate (after H pass, before V).
+ *   luma                Rec.709 luminance: 0.2126 R + 0.7152 G
+ *                       + 0.0722 B.
+ *   THRESHOLD           luminance above which a pixel counts as
+ *                       "bright enough to bloom."
+ *   RADIUS / σ          Gaussian kernel radius (in pixels) and
+ *                       standard deviation. Controls halo size.
+ *   INTENSITY           composite scale factor on the blurred
+ *                       bloom buffer.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Deferred shading (deferred_rendering_pipeline.c) — the
+ *     G-buffer pattern.
+ *   - SSAO (ssao_pipeline.c) — hemisphere sampling + AO blur.
+ *   - Convolution: 1-D and 2-D image kernels.
+ *   - HDR vs. LDR: HDR keeps brightness > 1.0 around so it can
+ *     be processed; LDR clamps at 1.0 (white).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Lens-flare or anamorphic-streak bloom variants. We do
+ *     plain isotropic Gaussian bloom.
+ *   - Multi-scale bloom (mip-chain pyramid). Real engines blur at
+ *     several resolutions and add them; we do one scale, which is
+ *     plenty for the orb-sized bloom in this scene.
+ *   - Filmic tone-mapping (ACES, Hable). We use Reinhard
+ *     (x / (1 + x)), the simplest curve that does the job.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Eight tutorials that build bloom + tone-mapping from first
+ * principles.
+ *
+ *   T1  Why bloom even exists — over-exposed light bleeding
+ *   T2  HDR vs. LDR — the absolute prerequisite
+ *   T3  Emissive surfaces — the source of the excess light
+ *   T4  Bright extract — luminance threshold + smooth knee
+ *   T5  The Gaussian kernel — what σ and RADIUS mean
+ *   T6  Separable blur — O(taps) instead of O(taps²)
+ *   T7  Composite + tone-map — the final HDR-to-LDR collapse
+ *   T8  Why DITHER_AMP was tuned to 0.04 (phase-2 finding)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHY BLOOM EVEN EXISTS — OVER-EXPOSED LIGHT BLEEDING
+ * ───────────────────────────────────────────────────────
+ * Look at a candle in a dark room. The flame doesn't end at a
+ * crisp silhouette — there's a soft halo bleeding outward,
+ * fading over a few millimetres of dark surroundings. That halo
+ * is real. Two physical sources:
+ *
+ *   - The eye (or camera lens) imperfectly focuses bright light;
+ *     a fraction scatters across nearby retinal cells / sensor
+ *     photosites.
+ *   - Tiny dust on the lens, micro-scratches in your eye's
+ *     vitreous humour, etc., diffract the brightest light over
+ *     a wider area than its source.
+ *
+ * The brain reads "bleed around brightness" as "this thing is
+ * very bright." Without the bleed, a digital image of a candle
+ * looks like a sticker. WITH bloom, even a 256-colour terminal
+ * cell can read as a real light source.
+ *
+ * Bloom in rendering is ONE technique that fakes both effects in
+ * one pass: blur the bright parts of the image and add the blur
+ * back on top.
+ *
+ * T2  HDR VS. LDR — THE ABSOLUTE PREREQUISITE
+ * ───────────────────────────────────────────
+ * "Bright" is meaningless without a notion of brightness ABOVE
+ * full white. A standard 8-bit-per-channel image saturates at
+ * (1.0, 1.0, 1.0). That's LOW DYNAMIC RANGE.
+ *
+ * In LDR, an emissive flame and a perfectly white piece of paper
+ * read as the same pixel value: (1, 1, 1). They look identical.
+ * No bloom can fix that — the over-bright information was
+ * destroyed when the renderer clamped to 1.0.
+ *
+ * In HIGH DYNAMIC RANGE, lit values are stored as floats with no
+ * upper limit. The flame might be (3.0, 1.6, 0.7); the paper
+ * (0.95, 0.95, 0.95). The bloom pass can now distinguish them by
+ * looking at luma > 1.0.
+ *
+ * The lightpass in this file emits HDR — no clamp:
+ *
+ *     lit = ambient·albedo·AO + diffuse + specular + emissive
+ *     g_light[r][c] = lit          (NOT clamp01(lit))
+ *
+ * Tone mapping (T7) collapses HDR to LDR ONLY at the very last
+ * step, after bloom has had its chance to operate.
+ *
+ * T3  EMISSIVE SURFACES — THE SOURCE OF THE EXCESS LIGHT
+ * ──────────────────────────────────────────────────────
+ * The G-buffer in this file has an extra channel: g_emissive.
+ * For most surfaces it's (0, 0, 0). For the orb it's a HDR
+ * colour like (3.0, 1.6, 0.7) — meaning "this surface emits
+ * light at 3 units of red, 1.6 of green, 0.7 of blue."
+ *
+ * "Emit" here means: contribute to the lit buffer WITHOUT
+ * needing diffuse / specular reflection. Emissive surfaces
+ * appear bright even with the sun off, even in a deep corner
+ * (SSAO doesn't darken them — they make their OWN light, they
+ * don't reflect ambient).
+ *
+ * In the lightpass:
+ *
+ *     lit = ambient·albedo·AO              ← reflected ambient
+ *         + albedo · sun · max(0, N·L)     ← diffuse
+ *         + spec_term                      ← specular
+ *         + emissive                       ← direct emission
+ *
+ * The orb's emissive (3, 1.6, 0.7) puts its lit value well above
+ * 1.0 in red. That's the over-bright signal bloom will detect.
+ *
+ * Without an emissive channel you can still bloom, but only the
+ * brightest specular highlights would trigger — a much subtler
+ * effect.
+ *
+ * T4  BRIGHT EXTRACT — LUMINANCE THRESHOLD + SMOOTH KNEE
+ * ──────────────────────────────────────────────────────
+ * The first bloom step copies only the BRIGHT pixels of g_light
+ * into g_bloom, leaving everything else at zero:
+ *
+ *     for each pixel:
+ *       Y = luma(g_light[r][c])
+ *       w = smoothstep(THRESHOLD - KNEE, THRESHOLD + KNEE, Y)
+ *       g_bloom[r][c] = g_light[r][c] · w
+ *
+ * Why luminance instead of channel-wise brightness? Because the
+ * eye perceives green as much brighter than blue at the same
+ * value. Rec.709 weights:
+ *
+ *     Y = 0.2126·R + 0.7152·G + 0.0722·B
+ *
+ * Why smoothstep instead of a hard threshold? Same reason as
+ * neon_edges T7: a hard cut-off makes single-pixel aliasing.
+ * smoothstep ramps over a small KNEE-width band so dim halos
+ * blend in.
+ *
+ * After this step, g_bloom looks like the original lit buffer
+ * but with all the dim regions blacked out — a sparse map of
+ * bright spots.
+ *
+ * T5  THE GAUSSIAN KERNEL — WHAT σ AND RADIUS MEAN
+ * ────────────────────────────────────────────────
+ * To "spread" the bright spots, convolve g_bloom with a
+ * Gaussian kernel. The 1-D Gaussian is:
+ *
+ *     g(x) = exp(-x² / (2σ²)) / (σ · √(2π))
+ *
+ * Two parameters:
+ *
+ *   σ (sigma)    standard deviation, controls the WIDTH of the
+ *                bell curve. Bigger σ = wider, softer halo.
+ *
+ *   RADIUS       how many pixels of the kernel to actually use.
+ *                The Gaussian extends to ±∞, but past about ±3σ
+ *                the values are < 1% of the peak; we truncate.
+ *                RULE: RADIUS ≥ 3σ.
+ *
+ * For this file: σ ≈ 3.0, RADIUS = 6, so the kernel has 13 taps
+ * (from -6 to +6 inclusive). The taps are precomputed once in
+ * §9 bloom_kernel_init and stored in a static array.
+ *
+ * The kernel is normalised so its taps sum to 1.0. Convolving by
+ * a normalised kernel preserves the average brightness — we move
+ * energy around, we don't add or remove it.
+ *
+ * T6  SEPARABLE BLUR — O(TAPS) INSTEAD OF O(TAPS²)
+ * ────────────────────────────────────────────────
+ * A naïve 2-D blur with a (2R+1)² kernel costs (2R+1)² reads per
+ * pixel. For our R = 6 that's 169 reads per pixel — wasteful.
+ *
+ * Crucial property of Gaussians: they are SEPARABLE.
+ *
+ *     G_2D(x, y) = G_1D(x) · G_1D(y)
+ *
+ * That means a 2-D Gaussian blur EQUALS:
+ *
+ *     blur_horizontal(image, kernel_1D)   →  intermediate
+ *     blur_vertical (intermediate, kernel_1D)  →  output
+ *
+ * Two 1-D passes, each with (2R+1) reads per pixel. For R = 6
+ * that's 13 + 13 = 26 reads — 6× fewer than the naïve
+ * implementation, and it gets MORE valuable as R grows.
+ *
+ * §9 bloom_blur_h and bloom_blur_v are the two 1-D passes. They
+ * use the same precomputed kernel; they differ only in whether
+ * they walk pixels horizontally or vertically.
+ *
+ * Boundary handling: when the kernel reaches off-screen, we
+ * CLAMP the read coordinate to [0, W-1]. This is "edge
+ * extension" — pretends the pixel at the boundary repeats. The
+ * alternative ("zero outside the image") would create a dark
+ * fringe at the screen edges where bright objects approached
+ * the boundary. Edge extension hides that.
+ *
+ * T7  COMPOSITE + TONE-MAP — THE FINAL HDR-TO-LDR COLLAPSE
+ * ────────────────────────────────────────────────────────
+ * After both blur passes, g_bloom holds a soft halo around every
+ * bright source. Composite is just adding it back into g_light:
+ *
+ *     g_light[r][c] += BLOOM_INTENSITY · g_bloom[r][c]
+ *
+ * BLOOM_INTENSITY < 1 keeps the halo subtle; > 1 makes everything
+ * super-shiny.
+ *
+ * g_light is STILL HDR — adding the bloom can only make it
+ * brighter. So we cannot send g_light directly to a 256-colour
+ * terminal. The final step is TONE MAPPING — collapsing HDR
+ * floats into LDR [0, 1] in a way that preserves visual
+ * relationships:
+ *
+ *     ldr = hdr / (1 + hdr)        ← Reinhard, applied per channel
+ *
+ * Properties:
+ *   - hdr = 0     → ldr = 0
+ *   - hdr = 1     → ldr = 0.5
+ *   - hdr = ∞     → ldr = 1
+ *
+ * Continuous, monotone, never clips. The dim parts of the scene
+ * stay roughly linear (small hdr → ldr ≈ hdr); the very bright
+ * parts get smoothly compressed toward 1.0 instead of clamped.
+ *
+ * Reinhard happens per channel inside paint_cell, JUST before the
+ * 6×6×6 cube quantise + Bourke ramp. That's the FIRST and ONLY
+ * place HDR gets crushed. By that point bloom has already done
+ * its work in HDR space.
+ *
+ * T8  WHY DITHER_AMP WAS TUNED TO 0.04 (PHASE-2 FINDING)
+ * ──────────────────────────────────────────────────────
+ * The Bourke ramp gives ~92 distinct brightness glyphs. The
+ * 6×6×6 RGB cube gives 6 levels per channel. Together that's
+ * still discrete — you'll see banding on smooth dim ramps like
+ * the floor unless you DITHER.
+ *
+ * Bayer dithering adds a deterministic 4×4 noise pattern to the
+ * brightness BEFORE quantising:
+ *
+ *     y_dithered = y + (BAYER[r%4][c%4] - 0.5) · DITHER_AMP
+ *
+ * DITHER_AMP controls how strong the dither is. Phase-2
+ * iteration on this file:
+ *
+ *   0.10  → "wallpaper bands" — the 4×4 Bayer pattern is too
+ *            visible against the dim floor.
+ *
+ *   0.04  → enough dither to break the banding on the floor
+ *            without making the Bayer texture itself visible.
+ *
+ * The constant lives in §1 config with that history noted. Any
+ * scene where the bloom-darkened ambient occupies a large area
+ * of the screen will benefit from low DITHER_AMP for the same
+ * reason; scenes with brighter overall illumination tolerate
+ * higher dither without visible patterning.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

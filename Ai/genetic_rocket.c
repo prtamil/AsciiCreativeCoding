@@ -171,6 +171,325 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. This is the only AI demo in the project, and the
+ *      ONLY genetic-algorithm example. Read it as a STANDALONE
+ *      lesson — no other file builds on its concepts (yet).
+ *   2. §6 ga — THE HEART of this file. Two functions:
+ *        ga_breed   — crossover + mutation
+ *        ga_evolve  — fitness-pool build + breed loop
+ *      Read AFTER tutorials T1-T6 below.
+ *   3. §5 rocket — Rocket struct, genome init, per-tick force
+ *      application, fitness function. THE PHENOTYPE side of the
+ *      simulation.
+ *   4. §7 scene — render order: target → launch pad → trails →
+ *      rockets. The "leader" recolouring is just visual aid.
+ *   5. §1 config — every tunable in one place. POP_SIZE, LIFESPAN,
+ *      MUTATION rate are the three knobs that change behaviour
+ *      most.
+ *   6. §2-§4, §8-§9 — clock / colour / RNG / screen / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   genome / genes[]   array of LIFESPAN force vectors, one per
+ *                      tick of life. The "instruction tape."
+ *   age                ticks elapsed since launch. Index into the
+ *                      genome at this tick.
+ *   fitness            per-rocket score in [0, ~10]. Higher = closer
+ *                      to target / hit.
+ *   max_f              max fitness in this generation. Used to
+ *                      normalise pool slot counts.
+ *   pool[]             flat array of rocket indices. Each rocket
+ *                      appears k = floor(100 * f / f_max) times.
+ *   mid                random crossover midpoint per child genome.
+ *   mutation_rate      probability per gene of replacement during
+ *                      breeding. Tunable live with +/- keys.
+ *   POP_SIZE           population size (20..100, step 5).
+ *   LIFESPAN           genome length = max ticks of flight.
+ *   alive              bool — is rocket still flying this gen?
+ *   hit_target         bool — did this rocket reach the target?
+ *   crashed            bool — did this rocket leave bounds?
+ *
+ * Background you need
+ * ───────────────────
+ *   - Newton's laws (constant force = constant acceleration).
+ *   - Random number generation (rand()/RAND_MAX → uniform [0,1]).
+ *   - Cell-space simulation (no §4 coords; positions ARE cells).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Neural networks. Pure GA, no learning function.
+ *   - Reinforcement learning (TD, Q-learning, policy gradient).
+ *     GAs are POPULATION-based search, not gradient descent.
+ *   - Differential evolution / genetic programming. Both are
+ *     successors of GA but use different gene representations.
+ *   - Calculus / gradients. The fitness function need not be
+ *     differentiable — that's GA's selling point.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a genetic-algorithm Smart Rocket from
+ * first principles.
+ *
+ *   T1  What is a "genetic" algorithm — population, fitness, breed
+ *   T2  The genome — instruction tape, not a control policy
+ *   T3  Fitness — translating "good rocket" into a number
+ *   T4  Selection via mating pool — proportional probability
+ *   T5  Crossover + mutation — two parents make a child
+ *   T6  Why this WORKS — emergent search via parallel evaluation
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHAT IS A "GENETIC" ALGORITHM — POPULATION, FITNESS, BREED
+ * ──────────────────────────────────────────────────────────────
+ * Holland (1975) observed: biological evolution is a SEARCH
+ * algorithm. Random variation + selection over many generations
+ * finds organisms that fit their environment. Replicate the
+ * essential machinery in code and you get a domain-agnostic
+ * optimiser.
+ *
+ * The recipe:
+ *
+ *     1. POPULATION of N candidate solutions (random initially)
+ *     2. EVALUATE each against the goal → fitness score
+ *     3. SELECT pairs of parents weighted by fitness
+ *     4. BREED children (crossover + mutation)
+ *     5. REPLACE old population with children
+ *     6. Goto 2 until happy
+ *
+ * Three things make a problem GA-tractable:
+ *
+ *   - GENOME — a fixed-size representation that encodes a
+ *     candidate solution. Bytes, floats, structs — anything
+ *     you can splice and mutate.
+ *
+ *   - FITNESS FUNCTION — given a genome, produce a real number.
+ *     Higher = better. Need NOT be smooth, differentiable, or
+ *     even continuous. Just COMPUTABLE.
+ *
+ *   - PARALLEL EVALUATION — evaluating one candidate is
+ *     INDEPENDENT of evaluating others. Same fitness function,
+ *     different inputs.
+ *
+ * If your problem fits those three, GA is a candidate. If not
+ * — if you have gradients, if your candidates are unbounded
+ * size, if fitness is impossible to compute — try gradient
+ * descent, RL, or trees.
+ *
+ * Smart Rockets fits perfectly. The genome is a force tape;
+ * fitness is "did you hit the target"; rockets fly independently.
+ *
+ * T2  THE GENOME — INSTRUCTION TAPE, NOT A CONTROL POLICY
+ * ───────────────────────────────────────────────────────
+ * The genome is THE ENTIRE FLIGHT PLAN baked in at birth:
+ *
+ *     struct Rocket {
+ *       Vec2 genes[LIFESPAN];     ← force vectors, one per tick
+ *       Vec2 pos, vel;            ← phenotype (computed during flight)
+ *       int  age;                 ← how many ticks I've lived
+ *       bool alive, hit_target, crashed;
+ *     };
+ *
+ * Per tick of flight:
+ *
+ *     vel += genes[age]      ← apply this tick's gene
+ *     vel = clamp(vel, MAX_VEL)
+ *     pos += vel
+ *     age += 1
+ *
+ * The rocket NEVER LOOKS AT WHERE THE TARGET IS during flight.
+ * It just plays back its tape. If the tape happens to encode a
+ * good trajectory, the rocket lands near the target. If not,
+ * it doesn't.
+ *
+ * This is fundamentally different from a CONTROL POLICY (RL,
+ * neural networks, classical control theory):
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │  Genetic (this file)        Control policy       │
+ *      │                                                  │
+ *      │  fixed instruction tape     learned function     │
+ *      │  open-loop                  closed-loop          │
+ *      │  ignores environment        responds to env      │
+ *      │  evolved offline            updated online       │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Open-loop is severely limited — a rocket can't adapt to
+ * wind it didn't experience during evolution. But for a
+ * deterministic, fixed-environment problem (like this static
+ * target), it works beautifully.
+ *
+ * Why use it pedagogically? Because the GENOME is something
+ * the user can SEE — every gene is one applied force, the
+ * trajectory makes the genome visible. Easier to explain
+ * "evolution finds the right tape" than "evolution finds
+ * weights of a neural net."
+ *
+ * T3  FITNESS — TRANSLATING "GOOD ROCKET" INTO A NUMBER
+ * ─────────────────────────────────────────────────────
+ * Selection picks parents by fitness. Fitness must be a
+ * SINGLE NUMBER per rocket, with HIGHER = BETTER.
+ *
+ * Naive: distance to target inverted.
+ *
+ *     fitness = 1 / (distance + 1)
+ *
+ * The "+1" prevents division by zero when distance hits zero.
+ * Smaller distance → larger fitness. Range (0, 1].
+ *
+ * Squared (used here):
+ *
+ *     fitness = (1 / (distance + 1))²
+ *
+ * Squaring AMPLIFIES THE GRADIENT — the difference between a
+ * near-hit and a far-miss is much larger after squaring. This
+ * helps selection focus on the best rockets.
+ *
+ * Hit / crash bumps:
+ *
+ *     if hit_target:  fitness *= 10        ← strong reward
+ *     if crashed:     fitness *= 0.1       ← penalty (NOT zero)
+ *
+ * Why penalty rather than zero for crashes? Because gen 0 is
+ * mostly crashes — if their fitness was 0 the mating pool
+ * would be empty. The 0.1 multiplier preserves the relative
+ * ordering among crashers (those who crashed FAR from the
+ * target are worse than those who crashed close).
+ *
+ * General lesson: NEVER let fitness go to exactly zero unless
+ * you're sure non-zero candidates will exist in your initial
+ * population. The selection algorithm needs a non-trivial
+ * distribution to draw from.
+ *
+ * T4  SELECTION VIA MATING POOL — PROPORTIONAL PROBABILITY
+ * ────────────────────────────────────────────────────────
+ * "Fitness-proportional selection": parents are picked with
+ * probability proportional to their fitness. Best rocket is
+ * picked most often; worst rocket rarely.
+ *
+ * Implementation: build a MATING POOL where each rocket
+ * appears k_i = floor(100 * f_i / f_max) times. Pick parents
+ * uniformly from the pool.
+ *
+ *     for i in 0..N-1:
+ *       k_i = floor(100 * fitness[i] / max_fitness)
+ *       k_i = max(k_i, 1)               ← always at least once
+ *       for _ in 0..k_i:
+ *         pool.append(i)
+ *
+ *     pick_parent():
+ *       return pool[random()]
+ *
+ * For example: if max_f = 0.4 and rocket A has fitness 0.4,
+ * A gets 100 slots. Rocket B at fitness 0.04 gets 10 slots.
+ * Rocket C at fitness 0.001 gets 1 slot. Picking uniformly
+ * from this pool gives A 100× more likely than C.
+ *
+ * Alternative: STOCHASTIC UNIVERSAL SAMPLING (SUS), TOURNAMENT
+ * SELECTION (pick k random, take best). Both more efficient.
+ * Mating pool is the conceptually clearest, easiest to debug
+ * (just print the pool size per rocket).
+ *
+ * Capacity guard: at high pop and varied fitness, the pool can
+ * grow to N · 100 = 5000-10000 entries. POOL_CAPACITY caps it;
+ * any overflow gets dropped (slight bias, but no crash).
+ *
+ * T5  CROSSOVER + MUTATION — TWO PARENTS MAKE A CHILD
+ * ───────────────────────────────────────────────────
+ * Picking two parents, the child genome is a SPLICE:
+ *
+ *     SINGLE-POINT CROSSOVER:
+ *
+ *     parent A: [a0 a1 a2 a3 a4 a5 a6 a7 a8 a9]
+ *     parent B: [b0 b1 b2 b3 b4 b5 b6 b7 b8 b9]
+ *     mid     = random in [1, LIFESPAN-1]    ← e.g. 5
+ *
+ *     child   = [a0 a1 a2 a3 a4 b5 b6 b7 b8 b9]
+ *
+ * Two-point and uniform crossover variants exist; single-point
+ * is the simplest and works fine for this problem.
+ *
+ * Then MUTATION — for each gene independently:
+ *
+ *     for i in 0..LIFESPAN-1:
+ *       if random() < mutation_rate:
+ *         child.genes[i] = random_unit_force()
+ *
+ * Mutation rate is the most important tunable. Too low: the
+ * population converges quickly to a local optimum and never
+ * gets out. Too high: child genomes are mostly noise; selection
+ * pressure can't keep up with destruction.
+ *
+ *     0.001  too low — visible "stuck" generations
+ *     0.01   GOOD DEFAULT — slow but reliable convergence
+ *     0.05   high — rapid exploration, sometimes destabilising
+ *     0.10   too high — population thrashes, never converges
+ *
+ * The user can tune live with +/-. Watch the hit count: if it
+ * plateaus, raise mutation; if it never settles, lower it.
+ *
+ * T6  WHY THIS WORKS — EMERGENT SEARCH VIA PARALLEL EVALUATION
+ * ────────────────────────────────────────────────────────────
+ * The whole algorithm has NO GRADIENT INFORMATION. Each
+ * generation just:
+ *
+ *   1. Evaluates many random candidates in parallel.
+ *   2. Selects the best probabilistically.
+ *   3. Recombines them.
+ *
+ * Yet it FINDS solutions. Why?
+ *
+ * Implicit parallelism (Holland 1975): the population
+ * implicitly samples many SCHEMATA (gene-pattern templates)
+ * at once. A pattern that produces good fitness in many
+ * carriers gets reinforced; a bad pattern gets selected
+ * against. Over generations, good schemata accumulate.
+ *
+ * Concretely for Smart Rockets: early generations stumble
+ * onto genes that "push upward" being beneficial. Carriers
+ * of these genes outbreed the rest. Their children inherit
+ * "push upward" patterns and add new variation. Eventually
+ * a child has BOTH "push upward early" AND "push toward
+ * target later" — superhuman ancestry plus new mutations.
+ *
+ * This is SLOW compared to gradient methods. A neural network
+ * with backprop on the same problem would converge in seconds,
+ * not 80 generations. But GAs work even when:
+ *
+ *   - The fitness function isn't smooth.
+ *   - The genome is discrete or weird (e.g. tree structures
+ *     in genetic programming).
+ *   - The problem has many local optima (mutation lets the
+ *     population escape).
+ *   - You have NO MODEL of how the genome maps to behaviour.
+ *
+ * Smart Rockets is the canonical "GA in 200 lines" example.
+ * Every concept here scales to harder problems: protein
+ * folding, scheduling, antenna design, neural-architecture
+ * search.
+ *
+ * Decision tree for "should I use a GA?":
+ *
+ *   problem has gradients?                     → use those
+ *   problem is convex?                         → use gradient descent
+ *   genome is fixed-size + fitness computable? → GA candidate
+ *   solutions are STRUCTURED (e.g. programs)?  → genetic programming
+ *   problem is online / sequential?            → reinforcement learning
+ *
+ * GA's niche: black-box optimisation when nothing else works.
+ * Slow but reliable.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
 #include <ncurses.h>

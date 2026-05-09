@@ -164,6 +164,338 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. This is the only file in algorithms/ — read it as a
+ *      standalone lesson on iterative-coroutine algorithm visualization.
+ *      (Companion file: procedural/generational/maze.c uses the same
+ *      pattern for maze carving / solving.)
+ *   2. §5 sort — THE HEART of this file. FIVE step functions, one per
+ *      algorithm. Each step does ONE compare-or-swap and yields:
+ *        bubble_step   — adjacent compare loop with i, j cursors
+ *        insert_step   — slide-left until in place
+ *        select_step   — running min, swap once per pass
+ *        quick_step    — Lomuto partition with explicit stack (T6)
+ *        heap_step     — sift-down phases (build then extract)
+ *      Read AFTER tutorials T1-T6 below.
+ *   3. §7 scene — bar chart renderer + HUD. Draws the array with
+ *      colour bands tracking the current operation (gold compare,
+ *      red swap, green sorted).
+ *   4. §1-§4, §8 — config / clock / colour / app loop. Skim if
+ *      you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   g_arr[N_ELEMS]        the array being sorted (global so all five
+ *                         algorithms share the same data).
+ *   g_alg                 current algorithm enum (ALG_BUBBLE..ALG_HEAP).
+ *   g_done                bool — has the current algorithm finished?
+ *   g_cmp_count, g_swp_count
+ *                         per-run statistics (HUD shows these).
+ *   g_cmp_a, g_cmp_b      indices the renderer paints GOLD this frame
+ *                         (currently being compared).
+ *   g_swp_a, g_swp_b      indices painted RED-BOLD (just swapped).
+ *   PER-ALGORITHM CURSORS:
+ *     g_bi, g_bj          bubble outer/inner index
+ *     g_ii, g_ij          insertion outer/inner
+ *     g_si, g_sj, g_smin  selection outer/inner/running-min
+ *     g_qstack[]          quicksort range stack (lo, hi pairs)
+ *     g_qlo, g_qhi, g_qi, g_qj
+ *                         quicksort current range + partition cursors
+ *     g_hi_h, g_hi_n, g_hphase
+ *                         heapsort heapify cursor / live count / phase
+ *
+ * Background you need
+ * ───────────────────
+ *   - Comparison-sort intuition (you've likely written bubble sort).
+ *   - O-notation: bubble/insertion/selection are O(N²); heap/quick
+ *     are O(N log N).
+ *   - Iterative state machines — converting a recursive function
+ *     into a step-by-step state-driven loop. This is THE technique
+ *     that makes algorithm visualization possible (T1 below).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Coroutines / fibers / generators (Python yield, C++ co_yield).
+ *     We HAND-ROLL coroutines using static state. Same idea, no
+ *     language support needed.
+ *   - Stable-sort theory. Brief mention in CONCEPTS; not essential.
+ *   - External / parallel / non-comparison sorts (radix, merge,
+ *     timsort). Five comparison sorts are the canonical pedagogy
+ *     set.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a multi-algorithm sorting visualizer
+ * from first principles.
+ *
+ *   T1  Visualisation = state machine — one operation per frame
+ *   T2  Coroutines without language support — cursors as state
+ *   T3  Comparing five sorts SIDE-BY-SIDE — input-blind vs adaptive
+ *   T4  Insertion vs bubble — same complexity, different motion
+ *   T5  The N log N divide — heap and quick break the quadratic
+ *   T6  Iterative quicksort — explicit stack replaces recursion
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  VISUALISATION = STATE MACHINE — ONE OPERATION PER FRAME
+ * ───────────────────────────────────────────────────────────
+ * The naive way to "visualise" a sort is to run it normally and
+ * print the array after each step:
+ *
+ *     while not sorted:
+ *       compare();
+ *       maybe_swap();
+ *       print_array();
+ *       sleep(50ms);
+ *
+ * This BLOCKS the program in the sort. The screen freezes for
+ * the duration. Resize, pause, mode switch — all impossible.
+ *
+ * Better: turn the algorithm into a STATE MACHINE. Each call
+ * does ONE OPERATION (compare or swap) and returns. The main
+ * loop calls the state machine N times per frame, then renders.
+ *
+ *     // somewhere outside:
+ *     int g_i = 0, g_j = 0;        ← persistent state
+ *
+ *     bool bubble_step():
+ *       compare(g_arr[g_j], g_arr[g_j+1])
+ *       maybe_swap()
+ *       g_j += 1
+ *       if g_j reaches N - 1 - g_i:
+ *         g_j = 0;  g_i += 1
+ *       return (g_i == N - 1)         ← done?
+ *
+ *     // main loop:
+ *     for _ in steps_per_frame:
+ *       if bubble_step():            // returned done?
+ *         break
+ *     render_array();
+ *     handle_input();
+ *
+ * Now ONE TICK of the algorithm = ONE FRAME of animation. The
+ * main loop owns time; the algorithm just emits events. The
+ * user can pause, switch algorithms, resize — all between ticks.
+ *
+ * This is the SAME pattern used in:
+ *   - matrix_rain T1 (per-column streams ticking independently)
+ *   - particle systems (each particle ticks one frame at a time)
+ *   - fk creatures animation (one timestep per frame)
+ *   - procedural/generational/maze.c (one cell carved per tick)
+ *
+ * Anywhere you want to ANIMATE an algorithm, factor it as a
+ * state machine that emits one event per call.
+ *
+ * T2  COROUTINES WITHOUT LANGUAGE SUPPORT — CURSORS AS STATE
+ * ──────────────────────────────────────────────────────────
+ * Modern languages have COROUTINES — functions that can yield
+ * mid-execution and resume later. Python `yield`, C++20
+ * `co_yield`, Lua coroutines.
+ *
+ * C doesn't. So we HAND-ROLL coroutines using static state:
+ *
+ *     // Recursive bubble sort (CAN'T pause):
+ *     void bubble_sort_normal(int arr[], int n):
+ *       for i in 0..n-1:
+ *         for j in 0..n-1-i:
+ *           if arr[j] > arr[j+1]: swap(arr[j], arr[j+1])
+ *
+ *     // Coroutine-style (CAN pause):
+ *     static int g_bi = 0, g_bj = 0;     ← captured "for loop counters"
+ *
+ *     bool bubble_step():
+ *       if g_bi == n-1: return true     ← done flag
+ *       if g_bj == n-1-g_bi:
+ *         g_bj = 0;  g_bi += 1
+ *         return false
+ *       if g_arr[g_bj] > g_arr[g_bj+1]:
+ *         swap(g_arr[g_bj], g_arr[g_bj+1])
+ *       g_bj += 1
+ *       return false
+ *
+ * The trick: every variable that would normally be a LOCAL
+ * VARIABLE in a recursive function becomes a STATIC GLOBAL.
+ * The "function" returns after one operation but the next call
+ * picks up exactly where it left off because the cursors persist.
+ *
+ * Cost: more state to track, harder to write correctly. Benefit:
+ * the algorithm pauses CLEANLY between any two operations.
+ *
+ * Quicksort is the trickiest case (T6 — recursion → explicit
+ * stack). The other four are simple loop-counter conversions.
+ *
+ * T3  COMPARING FIVE SORTS SIDE-BY-SIDE — INPUT-BLIND VS ADAPTIVE
+ * ───────────────────────────────────────────────────────────────
+ * The five algorithms differ visibly in how they USE THE INPUT:
+ *
+ *                  random N=48    sorted N=48     reverse N=48
+ *   Bubble         ~1100 cmp      ~47 cmp ✓       ~1100 cmp
+ *   Insertion      ~580 cmp       ~47 cmp ✓       ~1100 cmp
+ *   Selection      ~1128 cmp      ~1128 cmp ✗     ~1128 cmp ✗
+ *   Quicksort      ~210 cmp       ~1100 cmp ✗     ~1100 cmp ✗
+ *   Heapsort       ~290 cmp       ~290 cmp        ~290 cmp
+ *
+ * "Adaptive" sorts run faster on partially-sorted input:
+ *   - Bubble        ✓ (early-exits if no swaps in a pass)
+ *   - Insertion     ✓ (slide stops at first smaller)
+ *   - Selection     ✗ (always scans the whole tail)
+ *   - Quicksort     ✗ AND DEGENERATES on sorted input (Lomuto)
+ *   - Heapsort      ✗ (always builds full heap)
+ *
+ * Press TAB on a sorted array (after letting one alg finish)
+ * and watch the next one fly through (or grind, in the case
+ * of selection / Lomuto quicksort).
+ *
+ * The tutorial point: ALGORITHM CHOICE depends not only on
+ * worst-case complexity but also on EXPECTED INPUT
+ * DISTRIBUTION. Real applications use TIMSORT (insertion +
+ * merge hybrid) or INTROSORT (quicksort + heapsort fallback)
+ * because they exploit common-case structure.
+ *
+ * T4  INSERTION VS BUBBLE — SAME COMPLEXITY, DIFFERENT MOTION
+ * ───────────────────────────────────────────────────────────
+ * Both are O(N²). Both are stable. Both make N² compares
+ * worst-case. Visually they look completely different.
+ *
+ *   BUBBLE:
+ *     Compares adjacent pairs left-to-right repeatedly. Largest
+ *     element "bubbles" to the right. Then second largest. Etc.
+ *     Visible motion: a wave of activity sweeping rightward,
+ *     with the right edge growing solid (sorted) over time.
+ *
+ *   INSERTION:
+ *     Walks left-to-right; when it picks up a new element, it
+ *     SLIDES LEFT until it sits in order. Visible motion: the
+ *     left edge is always sorted; new elements arrive on the
+ *     right and slither leftward into place.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   Bubble:                                        │
+ *      │     ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒██████ ← right side sorted    │
+ *      │     compare wave                                 │
+ *      │     sweeps rightward                             │
+ *      │                                                  │
+ *      │   Insertion:                                     │
+ *      │     ███▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒ ← left side sorted     │
+ *      │     new arrival slides                           │
+ *      │     leftward into place                          │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * On nearly-sorted input both win big. Insertion is usually
+ * faster for small N (~16), which is why timsort uses
+ * insertion sort for short runs.
+ *
+ * Run sort_vis.c at slow speed (1 step/frame) and switch
+ * between bubble and insertion. Their personalities are
+ * unmistakable.
+ *
+ * T5  THE N LOG N DIVIDE — HEAP AND QUICK BREAK THE QUADRATIC
+ * ───────────────────────────────────────────────────────────
+ * The quadratic sorts have a hard ceiling: at N=1000, ~500K
+ * compares. At N=10000, ~50M compares. They become unusable.
+ *
+ * The N log N sorts (heap, quick, merge, tim) are
+ * fundamentally different. Where do they save the work?
+ *
+ *   QUICKSORT
+ *     Each partition pass takes O(n) and SPLITS the array
+ *     into two halves. Each half is sorted independently —
+ *     the work doubles in number but halves in size.
+ *     Total: log₂(N) levels × N work per level = N log N.
+ *
+ *   HEAPSORT
+ *     Build a max-heap in O(N), then repeatedly extract the
+ *     max. Each extraction needs O(log N) sift-down. N
+ *     extractions × log N each = N log N.
+ *
+ * Visually: heap and quick make BIG REORDERINGS each step.
+ * Bubble/insertion make small adjacent moves; quicksort can
+ * fling an element halfway across the array in one swap.
+ * That visible distinction matches the asymptotic difference
+ * — N log N takes BIGGER STEPS toward sortedness per
+ * operation.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  N²        per-operation distance ≈ 1 cell       │
+ *      │           (adjacent swaps only)                  │
+ *      │                                                  │
+ *      │  N log N   per-operation distance ≈ N/2 cells    │
+ *      │           (long-range partitions / sifts)        │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * For real applications past N=100 or so, always use an
+ * N log N sort. Insertion is fine for very small N (<32)
+ * where its low overhead beats the asymptotic winner.
+ *
+ * T6  ITERATIVE QUICKSORT — EXPLICIT STACK REPLACES RECURSION
+ * ───────────────────────────────────────────────────────────
+ * Quicksort's natural form is RECURSIVE:
+ *
+ *     quicksort(arr, lo, hi):
+ *       if lo >= hi: return
+ *       p = partition(arr, lo, hi)
+ *       quicksort(arr, lo, p - 1)        ← recursive call
+ *       quicksort(arr, p + 1, hi)        ← recursive call
+ *
+ * Recursive functions can't pause mid-execution from C alone.
+ * The function call stack would unwind on return.
+ *
+ * Solution: REPLACE THE FUNCTION-CALL STACK WITH AN EXPLICIT
+ * DATA STACK of (lo, hi) pairs:
+ *
+ *     int g_qstack[2 * QS_STACK];        ← (lo, hi) pairs
+ *     int g_qtop = 0;
+ *     // initial: push (0, N-1)
+ *
+ *     bool quick_step():
+ *       if g_qtop == 0: return true       ← stack empty = done
+ *       (lo, hi) = peek_top()
+ *       if phase 0 (scanning):
+ *         do one compare-or-swap of partition pass
+ *         if scan complete:
+ *           place pivot
+ *           replace top with two ranges (left, right)
+ *       return false
+ *
+ * The g_qstack ARRAY plays the role the OS stack plays in
+ * recursive quicksort. We can pause between any two
+ * partition steps because the entire algorithm state is
+ * captured in (g_qtop, g_qstack[*], current scan cursor).
+ *
+ * Same trick works for ANY recursive algorithm — DFS,
+ * tree traversal, divide-and-conquer. Convert recursion to
+ * an explicit stack of "function call" records, drive it
+ * one step at a time.
+ *
+ * Stack depth: QS_STACK = 128 is plenty for random N=48
+ * (expected recursion depth ≈ log₂ 48 ≈ 6). Adversarial
+ * input (already sorted, Lomuto pivot at right end)
+ * degenerates to N levels deep — that's why production
+ * quicksorts pivot smarter (median-of-three, randomised)
+ * to bound the stack.
+ *
+ * Decision tree for "should I convert this recursion to
+ * iteration?":
+ *
+ *   need PAUSE/RESUME mid-execution?     → iterate (this file)
+ *   need REENTRANCY (threads)?           → iterate
+ *   tail-recursive (only one call)?      → easy iterate (loop)
+ *   bounded depth, simple recursion?     → keep recursive
+ *   pure mathematical clarity?           → keep recursive
+ *
+ * For VISUALISATION the answer is always "iterate." Otherwise
+ * the algorithm can't be paused for animation.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <signal.h>

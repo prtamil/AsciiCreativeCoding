@@ -272,6 +272,257 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read flocking.c first for boid mechanics; read
+ *      crowd.c for steering primitives library. The NEW LESSONS
+ *      here are: heterogeneous agents (sheep + dog), Strömbom
+ *      collect-or-patrol controller, and "geometry replaces goal-
+ *      awareness" trick.
+ *   2. §6 dog — THE HEART of this file. Strömbom's collect / patrol
+ *      controller. Read AFTER tutorials T1-T5 below.
+ *   3. §5 sheep — sheep struct + four steering forces (separation,
+ *      cohesion, flee dog, pen pull).
+ *   4. §7 scene — orchestrator: pen + flock + dog ticks.
+ *   5. §1-§4, §8 — config / clock / colour / coords / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   pen.centre, pen.radius      where the sheep belong.
+ *   PEN_TOLERANCE               extra slack beyond pen radius
+ *                               before the dog starts collecting.
+ *   sheep.pos, vel, prev_pos    standard particle state.
+ *   sheep.fleeing               bool — set per tick when within
+ *                               DOG_FLEE_RADIUS. Drives glyph
+ *                               choice.
+ *   dog.pos, target             dog's position + where it's
+ *                               heading.
+ *   dog.mode                    COLLECT or PATROL.
+ *   dog.target_idx              which sheep is the current
+ *                               outlier (during COLLECT).
+ *   patrol_phase                radians around the pen for patrol
+ *                               orbit.
+ *   DOG_APPROACH_OFFSET         the geometric magic — distance
+ *                               the dog stands BEHIND the sheep
+ *                               relative to the pen.
+ *
+ * Background you need
+ * ───────────────────
+ *   - flocking.c T1-T7 (boid + Reynolds rules + 2-stage update).
+ *   - crowd.c T1-T2 (steering primitives — seek/flee).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Reinforcement learning / trained dog policies. Strömbom's
+ *     algorithm is a HAND-CRAFTED rule that works without
+ *     training.
+ *   - Goal-aware sheep with mental maps of the pen. Sheep are
+ *     PURELY REACTIVE — they don't even know the pen exists in
+ *     a meaningful sense (only that "outside is bad, inside is
+ *     fine").
+ *   - Multi-dog coordination. We have ONE dog; multi-dog
+ *     herding adds a coordination layer Strömbom (2014) covers
+ *     but we don't.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a Strömbom shepherd from first
+ * principles.
+ *
+ *   T1  Heterogeneous agents — sheep ≠ dog
+ *   T2  The geometric trick — dog stands BEHIND the sheep
+ *   T3  Strömbom's two modes — COLLECT vs PATROL
+ *   T4  Why this is "intelligence without intelligence"
+ *   T5  Damping and rest — sheep that actually stop grazing
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  HETEROGENEOUS AGENTS — SHEEP ≠ DOG
+ * ──────────────────────────────────────
+ * Up until this file every flocking demo had ONE KIND of agent.
+ * Reynolds boids: all boids same. Crowd: all people same. Even
+ * murmuration with the hawk: hawk is a DECORATIVE state-machine
+ * predator with its own simple controller.
+ *
+ * shepherd.c has TWO kinds of agents with INVERSE behaviours:
+ *
+ *   SHEEP   reactive: separation, cohesion, flee dog, pen pull
+ *           passive: graze speed (low), no goal awareness
+ *
+ *   DOG     deliberative: scans entire flock, picks outlier,
+ *           positions to evict outlier toward pen
+ *           active: high speed, picks targets
+ *
+ * Two heterogeneous agents in one simulation. Each ticks its
+ * own logic. The interaction is asymmetric:
+ *
+ *   - SHEEP sees DOG: as a flee target.
+ *   - DOG sees SHEEP: as a goal (which one is furthest from pen?)
+ *
+ * Same simulation, different roles. Real predator-prey,
+ * herding, swarm-robotics scenarios all need this asymmetry.
+ *
+ * Implementation: separate Sheep + Dog structs, separate tick
+ * functions in §5 / §6, but they share the World (positions are
+ * in the same coordinate system, distance computations are the
+ * same).
+ *
+ * T2  THE GEOMETRIC TRICK — DOG STANDS BEHIND THE SHEEP
+ * ─────────────────────────────────────────────────────
+ * The crucial insight from Strömbom et al. (2014):
+ *
+ *   "To herd a sheep TOWARD some destination, position the dog
+ *    at the OPPOSITE side of the sheep relative to the
+ *    destination. The sheep flees radially from the dog. Result:
+ *    sheep moves toward the destination."
+ *
+ * Geometrically:
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   dog target                                     │
+ *      │       &                                          │
+ *      │       │   ← place dog HERE                       │
+ *      │       │                                          │
+ *      │       o   ← sheep, fleeing                       │
+ *      │       │                                          │
+ *      │       │   ← sheep flees DOWN (away from dog)     │
+ *      │       │                                          │
+ *      │       •   ← pen centre (destination)             │
+ *      │                                                  │
+ *      │  Line: dog → sheep → pen                         │
+ *      │  Dog position is sheep + offset · (sheep − pen)/ │
+ *      │                                |sheep − pen|     │
+ *      │  i.e. extending the (pen → sheep) ray by `offset`│
+ *      └──────────────────────────────────────────────────┘
+ *
+ * In code:
+ *
+ *     away_dir = normalize(sheep.pos - pen.centre)
+ *     dog.target = sheep.pos + DOG_APPROACH_OFFSET · away_dir
+ *
+ * The sheep doesn't know about the pen. The dog doesn't push
+ * the sheep. The dog STANDS IN THE RIGHT PLACE, and the sheep
+ * does the rest by panicking.
+ *
+ * This is GEOMETRY REPLACING GOAL-AWARENESS. The dog has a
+ * goal (sheep should be in pen); the sheep doesn't know that
+ * goal. The dog encodes the goal as a POSITIONING RULE so the
+ * sheep's purely reactive behaviour produces the desired
+ * movement.
+ *
+ * T3  STRÖMBOM'S TWO MODES — COLLECT vs PATROL
+ * ────────────────────────────────────────────
+ * The dog runs ONE controller per tick. The controller picks
+ * one of two modes based on the sheep state:
+ *
+ *     find worst outlier:
+ *       worst = argmax_i |sheep[i].pos - pen.centre|
+ *
+ *     if |sheep[worst].pos - pen.centre| > pen.radius + tolerance:
+ *       MODE = COLLECT
+ *       target = position behind sheep[worst] (T2 formula)
+ *     else:
+ *       MODE = PATROL
+ *       phase += omega · dt
+ *       target = pen.centre + (pen.radius + offset) ·
+ *                (cos phase, sin phase)
+ *
+ * Then the dog steers toward target at DOG_SPEED.
+ *
+ * Why PATROL when all sheep are home? Two reasons:
+ *
+ *   - Visual: the dog stays ON SCREEN moving, signalling
+ *     readiness. Without patrol, the dog would freeze somewhere,
+ *     hard to read.
+ *
+ *   - Reactive readiness: when SPACE is pressed and sheep
+ *     scatter, the dog's PATROL position is already near the
+ *     edge of the pen — it can switch to COLLECT instantly
+ *     without first running halfway across the screen.
+ *
+ * Mode selection runs every tick: as soon as one sheep escapes
+ * the pen (during PATROL), the controller switches to COLLECT
+ * and the dog redirects. As soon as all sheep are home (during
+ * COLLECT), it switches back to PATROL.
+ *
+ * No "while" loops, no plan. Just decide, every tick, what to
+ * do RIGHT NOW.
+ *
+ * T4  WHY THIS IS "INTELLIGENCE WITHOUT INTELLIGENCE"
+ * ───────────────────────────────────────────────────
+ * Both agents are SIMPLE:
+ *
+ *   - Sheep: 4 force terms summed + damping. Maybe 30 lines.
+ *   - Dog: argmax + position formula + steering. Maybe 40 lines.
+ *
+ * Yet the result LOOKS LIKE coordinated, intentional behaviour
+ * — a real sheepdog herding a real flock back to a pen.
+ *
+ * That's because the INTELLIGENCE LIVES IN THE INTERACTION,
+ * not in either agent. The dog's positioning rule + the sheep's
+ * flee response together produce GOAL-DIRECTED movement that
+ * NEITHER party planned alone.
+ *
+ * Same principle in:
+ *
+ *   - flocking emergence (no boid plans the swarm shape)
+ *   - ant trails (no ant plans the path; pheromones do)
+ *   - termite mounds (each termite drops sand; the mound
+ *                     emerges)
+ *   - market price discovery (no trader knows the equilibrium;
+ *                             trades discover it)
+ *
+ * SHEPHERD's specific lesson: when designing multi-agent
+ * systems, push as much logic into AGENT INTERACTIONS and as
+ * LITTLE into AGENT INTROSPECTION as possible. Reactive
+ * agents + clever positioning beat goal-aware agents
+ * every time for emergent behaviour.
+ *
+ * T5  DAMPING AND REST — SHEEP THAT ACTUALLY STOP GRAZING
+ * ───────────────────────────────────────────────────────
+ * Reynolds boids in flocking.c clamp speed to [MIN_SPEED,
+ * MAX_SPEED]. MIN_SPEED > 0 means boids NEVER stop — they
+ * always cruise.
+ *
+ * For sheep that doesn't fit. A real flock at rest GRAZES —
+ * sheep mostly stand still, occasionally take a step, mostly
+ * still again. We want sheep that STOP when no force applies.
+ *
+ * Solution: replace MIN_SPEED clamp with VELOCITY DAMPING:
+ *
+ *     vel.x *= DAMPING        (e.g. 0.92 per tick)
+ *     vel.y *= DAMPING
+ *
+ * Each tick velocity decays toward zero. With no applied force,
+ * a sheep at vel = 50 px/s drops to 50 · 0.92 = 46 next tick,
+ * 42 next, ... down to ~0 in a couple of seconds.
+ *
+ * Combined with the still-applied separation force (which
+ * pushes sheep apart slightly when they bump), the net behaviour
+ * is: sheep drift apart slowly, slow to a stop, drift again
+ * when crowded. Looks exactly like grazing.
+ *
+ * Damping is also why the SCATTER impulse is finite-duration —
+ * sheep accelerate up to flee speed, then decelerate as the
+ * impulse + force_dt sum stays smaller than the damping
+ * subtraction. Without damping, sheep would keep fleeing
+ * forever from the impulse.
+ *
+ * Same trick is used in any "agents that should sometimes
+ * rest" simulation: sleeping NPCs, idle pedestrians,
+ * grazing animals. Damping is the simplest way to encode
+ * "if no force, settle to zero" without adding an explicit
+ * REST state.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

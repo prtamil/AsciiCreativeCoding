@@ -187,6 +187,254 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read flocking.c first; that file's tutorials T1-T3
+ *      cover the boid + three Reynolds rules. This file builds a
+ *      LIBRARY of steering primitives (T1 below) and shows how to
+ *      compose them into different behaviours (T2-T6).
+ *   2. §6 steering — a TOOLBOX of pure functions: seek, flee,
+ *      separate, align, cohere. Read AFTER tutorials T1-T2.
+ *   3. §7 scene — six tick_* functions, one per behaviour. Each
+ *      composes 2-4 steering primitives with mode-specific
+ *      weights. Read AFTER tutorials T3-T6.
+ *   4. §5 entity — Person struct, integration step.
+ *   5. §1-§4, §8 — config / clock / colour / coords / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   Person                 the agent. Holds pos, prev_pos, vel,
+ *                          target, glyph, color.
+ *   force                  Vec2 sum of weighted steering primitives.
+ *   target                 per-Person Vec2 of "where to seek."
+ *   threat                 PANIC mode's wandering '!' marker.
+ *   leader                 FOLLOW mode's '@' marker, free-ranging.
+ *   slot                   QUEUE mode's per-Person target position
+ *                          on the staggered queue line.
+ *   W_SEEK, W_FLEE,        per-behaviour weight constants. Tuning
+ *   W_SEPARATE, W_ALIGN,   these is what makes one behaviour look
+ *   W_COHERE               different from another.
+ *
+ * Background you need
+ * ───────────────────
+ *   - flocking.c T1-T3 (boid + three Reynolds rules + weight
+ *     tuning).
+ *   - Vec2 arithmetic.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - A* / pathfinding. Crowd uses purely REACTIVE steering, no
+ *     planning ahead.
+ *   - Social-force / pedestrian dynamics. Helbing (2000) and
+ *     friends model crowd panic with sophisticated friction +
+ *     desire forces; we use a simplified Reynolds toolkit.
+ *   - Spatial hashing. O(N²) at N=150 is microseconds.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build six behaviours from one steering
+ * library.
+ *
+ *   T1  Steering as a LIBRARY of primitives, not a fixed algorithm
+ *   T2  seek + flee — moving toward / away from a single target
+ *   T3  Behaviour composition — six modes from five primitives
+ *   T4  PANIC — bouncing topology + threat-avoidance
+ *   T5  FOLLOW — chain-of-command pattern via per-Person target
+ *   T6  QUEUE — slot-assignment as a goal-driven force
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  STEERING AS A LIBRARY OF PRIMITIVES, NOT A FIXED ALGORITHM
+ * ──────────────────────────────────────────────────────────────
+ * flocking.c hard-codes one steering function per mode. This
+ * file factors out the common forces into REUSABLE PRIMITIVES:
+ *
+ *     seek    (pos, vel, target, speed) → force toward target
+ *     flee    (pos, vel, threat, speed) → force away from threat
+ *     separate(pos, neighbours, radius) → force away from crowd
+ *     align   (vel, neighbours, radius) → force toward avg vel
+ *     cohere  (pos, neighbours, radius) → force toward centre
+ *
+ * Each is a PURE FUNCTION returning a Vec2. They compose by
+ * weighted sum:
+ *
+ *     force = W1·prim1 + W2·prim2 + W3·prim3 + ...
+ *     vel  += force · dt
+ *     pos  += vel · dt
+ *
+ * The library lives in §6 steering. Behaviour code in §7 scene
+ * just CHOOSES WHICH PRIMITIVES TO COMBINE for its mode.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   PRIMITIVES (§6)              BEHAVIOURS (§7)   │
+ *      │                                                  │
+ *      │   seek                         WANDER (1)        │
+ *      │   flee                ──→      FLOCK  (2)        │
+ *      │   separate            ──→      PANIC  (3)        │
+ *      │   align                        GATHER (4)        │
+ *      │   cohere              ──→      FOLLOW (5)        │
+ *      │                                QUEUE  (6)        │
+ *      │                                                  │
+ *      │   pure functions               weighted sums     │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * That's the whole pattern: build the library once, call it
+ * differently per behaviour. Same machinery scales to ANY
+ * agent-based system.
+ *
+ * T2  seek + flee — MOVING TOWARD / AWAY FROM A SINGLE TARGET
+ * ───────────────────────────────────────────────────────────
+ * The most basic primitives are SEEK (toward) and FLEE (away).
+ * Both work the same way with opposite signs:
+ *
+ *     SEEK(pos, vel, target, speed):
+ *       desired = normalize(target - pos) · speed
+ *       force   = desired - vel
+ *
+ * "What velocity would I LIKE to have? The one pointing AT the
+ * target at full speed. Subtract my current velocity to get
+ * the FORCE I need to apply."
+ *
+ *     FLEE = SEEK with target replaced by the threat, sign flipped:
+ *       force = -SEEK(pos, vel, threat, speed)
+ *
+ * This kind of "desired velocity minus current velocity" gives
+ * SMOOTH steering — the closer you are to the desired heading,
+ * the smaller the corrective force. As distance to target
+ * shrinks, the correction becomes proportionally smaller; the
+ * agent decelerates naturally on arrival.
+ *
+ * (Reynolds 1999 calls this PROPORTIONAL STEERING. It's the
+ * cheapest realistic-feeling steering law.)
+ *
+ * Examples in this file:
+ *   - WANDER mode (1):  each Person has a random target;
+ *                       seek pulls them there, then a new
+ *                       random target.
+ *   - PANIC mode (3):   flee from the '!' threat.
+ *   - GATHER mode (4):  seek toward screen centre.
+ *
+ * T3  BEHAVIOUR COMPOSITION — SIX MODES FROM FIVE PRIMITIVES
+ * ──────────────────────────────────────────────────────────
+ * Each mode is a different SUM of primitives. Below is the
+ * weight-table for this file (relative magnitudes; exact
+ * numbers are in §1 config):
+ *
+ *           seek  flee  separ  align  cohere
+ *   WANDER   1     -      -      -      -
+ *   FLOCK    -     -      1      1      1
+ *   PANIC    -     1      1      -      -
+ *   GATHER   1     -      0.5    -      -
+ *   FOLLOW   1     -      0.7    -      -
+ *   QUEUE    1     -      0.3    -      -
+ *
+ * Notice the patterns:
+ *
+ *   - WANDER is JUST seek with random targets. Simplest mode.
+ *   - FLOCK is the classic Reynolds combination — no per-agent
+ *     target, just inter-agent forces.
+ *   - PANIC and GATHER add SEPARATION to the basic seek/flee so
+ *     people don't pile up at the goal.
+ *   - FOLLOW and QUEUE are seek-based with custom per-person
+ *     targets (T5, T6).
+ *
+ * Adding a NEW behaviour is therefore: pick weights, optionally
+ * provide a per-person target. No new physics code needed.
+ *
+ * T4  PANIC — BOUNCING TOPOLOGY + THREAT-AVOIDANCE
+ * ────────────────────────────────────────────────
+ * Most modes use TOROIDAL (wrapping) topology — agents fall off
+ * the right edge and reappear on the left. Good for flocking,
+ * not for PANIC: the threat would never trap the crowd because
+ * the crowd would just wrap to the other side of the threat.
+ *
+ * PANIC uses BOUNCING boundary instead:
+ *
+ *     if pos.x < 0:           pos.x = 0;       vel.x = -vel.x
+ *     if pos.x > world_w - 1: pos.x = w-1;     vel.x = -vel.x
+ *     same for y
+ *
+ * Now the threat HUNTS — agents flee, hit the wall, get
+ * trapped, find a way around. Visually like real panic.
+ *
+ * The threat moves SLOWER than the panicking crowd
+ * (THREAT_SPEED < SPEED_PANIC), so the crowd always (just
+ * barely) escapes. Crank W_FLEE down and you'll watch them
+ * get caught — useful for tuning.
+ *
+ * Decision: BOUNDARY topology is per-MODE, not per-file. Same
+ * agents in WANDER wrap; in PANIC they bounce; in QUEUE they
+ * clamp to the line. This is encoded in the per-tick mode
+ * function in §7.
+ *
+ * T5  FOLLOW — CHAIN-OF-COMMAND PATTERN VIA PER-PERSON TARGET
+ * ───────────────────────────────────────────────────────────
+ * In FOLLOW mode, every person except the leader has its
+ * target set to "the person AHEAD of me in the chain":
+ *
+ *     leader (index 0):     wanders (random target)
+ *     person[1].target  =   leader.pos
+ *     person[2].target  =   person[1].pos
+ *     person[3].target  =   person[2].pos
+ *     ...
+ *
+ * Each person seeks the one immediately ahead. As the leader
+ * turns, person[1] turns to follow, person[2] turns to follow
+ * person[1] (after a delay), and so on. The chain bends like
+ * a snake.
+ *
+ * Same pattern reused in animation/snake_*.c (trail-buffer
+ * body following the head). Here the chain is ASCII people
+ * instead of body segments, but the geometry is identical:
+ * each follower lags its leader by a fixed delay.
+ *
+ * The chain doesn't tear because every link's target is
+ * UPDATED every tick (just before the steering computation).
+ * As long as `person[i].target = person[i-1].pos` runs every
+ * tick, the chain stays connected.
+ *
+ * T6  QUEUE — SLOT-ASSIGNMENT AS A GOAL-DRIVEN FORCE
+ * ──────────────────────────────────────────────────
+ * QUEUE mode pre-computes a SLOT POSITION for each person:
+ *
+ *     for i in 0 .. count-1:
+ *       row = COUNTER_TOP + (i % 3)            ← three queue rows
+ *       col = world_w - 4 - (i / 3)            ← receding from counter
+ *       person[i].slot = (col · CELL_W, row · CELL_H)
+ *
+ * Then the per-person target IS that slot. Seek pulls each
+ * person to their assigned slot; separation prevents
+ * stacking when slots are tight.
+ *
+ * Properties:
+ *   - The line is STAGGERED 3-wide so 30 people fit in only
+ *     10 columns of horizontal space.
+ *   - As `count` grows, slots extend leftward (clamped to
+ *     1 cell from the screen edge so they stay visible).
+ *   - Boundary is CLAMP — a person at slot near the edge
+ *     simply stops there; no wrap, no bounce.
+ *
+ * This is a GENERAL pattern: REPLACE FREE-FORM TARGETS WITH
+ * ASSIGNED SLOTS. Same idea is used in:
+ *
+ *   - flocking ORBIT mode (positions on a rotating ring)
+ *   - parade/marching-band formations
+ *   - team-sport positioning
+ *
+ * Whenever you want agents to fall into a SPECIFIC SHAPE,
+ * give each agent its own target slot and let seek do the
+ * rest. The shape is parameterised by the slot-assignment
+ * code, not by global flock dynamics.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>

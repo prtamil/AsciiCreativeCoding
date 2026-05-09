@@ -231,6 +231,304 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read flocking.c first for steering basics; read
+ *      crowd.c T6 for slot-target patterns. The NEW LESSONS here
+ *      are: bitmap → slot extraction, greedy assignment, and
+ *      strategy-as-force-recipe with TEN variants.
+ *   2. §8 digit — bitmap library + slot subdivision + greedy
+ *      assignment. Read AFTER tutorials T1-T3 below.
+ *   3. §7 strategy — ten tick functions, one per strategy. Read
+ *      AFTER tutorials T4-T6.
+ *   4. §6 steering — primitive force library (similar to crowd.c
+ *      §6 but with a few extras like spring).
+ *   5. §5 entity, §9 scene — Agent struct, scene orchestrator.
+ *   6. §1-§4, §10 — config / clock / colour / coords / app loop.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   Agent              one swarm particle. Has pos, vel, slot
+ *                      index (-1 if none), glyph, colour pair.
+ *   Slot               target position derived from a digit
+ *                      bitmap. Has pos and an `occupied` flag
+ *                      used during assignment.
+ *   N_AGENTS           160 — fixed pool size.
+ *   SLOT_GRID          subdivision per '#' bitmap cell (3 → 9
+ *                      slots per '#').
+ *   DIGITS[10][7][5]   five-by-seven bitmap font for digits 0-9.
+ *   active_digit       which digit (0-9) is currently being
+ *                      formed.
+ *   active_strategy    which of 10 force recipes is active.
+ *   AT_SLOT_DIST       pixel threshold for "this agent is parked
+ *                      at its slot" — drives A_BOLD attribute.
+ *
+ * Background you need
+ * ───────────────────
+ *   - flocking.c T1-T3 (boid + Reynolds rules).
+ *   - crowd.c T1, T6 (steering primitives + slot assignment
+ *     pattern).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Hungarian algorithm for OPTIMAL assignment. Greedy
+ *     nearest is good enough at N=160 (the visual difference
+ *     is minor).
+ *   - Differential equations / ODE solvers. The SPRING
+ *     strategy is just Hooke's law integrated with Euler;
+ *     no fancy integrator needed at terminal scale.
+ *   - Genetic / agent-based optimisation. Strategies are
+ *     hand-tuned, not evolved.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a swarm-spelling-digits demo from
+ * first principles.
+ *
+ *   T1  Bitmap → slot — turning '#' patterns into target points
+ *   T2  Slot subdivision — packing many agents per pixel
+ *   T3  Greedy assignment — N agents → S slots, near-optimal
+ *   T4  Strategy as a force recipe — 10 moods, 1 simulation
+ *   T5  SPRING strategy — Hooke's law replaces arrive
+ *   T6  Auto-cycle and live restrategy — declarative control flow
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  BITMAP → SLOT — TURNING '#' PATTERNS INTO TARGET POINTS
+ * ───────────────────────────────────────────────────────────
+ * The shape we want to FORM is a digit. We define each digit
+ * as a 5×7 bitmap of ASCII characters:
+ *
+ *     "0" =  "###"
+ *            "# #"
+ *            "# #"
+ *            "# #"
+ *            "# #"
+ *            "# #"
+ *            "###"
+ *
+ * Each '#' is a CELL we want at least one agent to stand on.
+ * Walking the bitmap and emitting a Slot per '#' gives:
+ *
+ *     for r in 0..6:
+ *       for c in 0..4:
+ *         if bitmap[r][c] == '#':
+ *           emit Slot at world_position(r, c)
+ *
+ * For digit "0" that produces 16 slots. For "8" — 21. The slot
+ * count VARIES by digit:
+ *
+ *     digit '7': 11 slots (sparse)
+ *     digit '0', '6', '9': 16 (oval)
+ *     digit '5', '8': 17 (densest)
+ *
+ * With one agent per slot, the densest digit needs 17 agents,
+ * and the visualization is SPARSE — outlines, not fills. Real
+ * stadium-card displays have many people PER LETTER.
+ *
+ * Solution: subdivide each '#' cell. T2.
+ *
+ * T2  SLOT SUBDIVISION — PACKING MANY AGENTS PER PIXEL
+ * ────────────────────────────────────────────────────
+ * Each '#' becomes a SLOT_GRID × SLOT_GRID grid of
+ * mini-slots:
+ *
+ *   for each '#' at bitmap (r, c):
+ *     for sr in 0..SLOT_GRID-1:
+ *       for sc in 0..SLOT_GRID-1:
+ *         emit Slot at world_pos(r, c) + (sub_offset(sr, sc))
+ *
+ * With SLOT_GRID = 3, each '#' produces 9 slots.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │  one '#' bitmap cell, SLOT_GRID = 3:             │
+ *      │                                                  │
+ *      │     ●     ●     ●                                │
+ *      │                                                  │
+ *      │     ●     ●     ●                                │
+ *      │                                                  │
+ *      │     ●     ●     ●                                │
+ *      │                                                  │
+ *      │  9 mini-slots packed inside the cell             │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Now digit slot counts are 9× larger:
+ *
+ *     '7':                99 slots
+ *     '0', '6', '9':     144 slots
+ *     '5', '8':          153 slots
+ *
+ * With N_AGENTS = 160, we can FILL even the densest digit
+ * (153) with agents to spare (7 wander loose). For sparser
+ * digits, more agents wander — visually obvious, signals
+ * "extras" rather than "incomplete shape."
+ *
+ * Subdivision is a cheap way to scale visual density without
+ * changing the digit definitions or the algorithm.
+ *
+ * T3  GREEDY ASSIGNMENT — N AGENTS → S SLOTS, NEAR-OPTIMAL
+ * ────────────────────────────────────────────────────────
+ * Given N agents at random starting positions and S target
+ * slots, who goes where?
+ *
+ * OPTIMAL: Hungarian algorithm — minimise total travel
+ * distance. O(N³) cost. Implementation: ~200 lines.
+ *
+ * GREEDY: for each agent in order, assign it to the
+ * NEAREST UNOCCUPIED slot:
+ *
+ *     for each agent in order:
+ *       best_slot = none
+ *       best_dist = ∞
+ *       for each slot s with !s.occupied:
+ *         d = |agent.pos - s.pos|
+ *         if d < best_dist:
+ *           best_slot = s
+ *           best_dist = d
+ *       if best_slot:
+ *         agent.slot = best_slot
+ *         best_slot.occupied = true
+ *
+ * O(N · S) — at N=160, S=153, that's 24K distance checks. Runs
+ * once per digit change. Microseconds.
+ *
+ * Greedy is NOT globally optimal — agent A might "steal" a slot
+ * that would have been better for agent B. But with random
+ * initial scatter and many slots, the suboptimality is barely
+ * visible — about 5-10% extra total travel.
+ *
+ * Trade-off: Hungarian gives perfect assignment at 100× cost.
+ * Greedy gives good-enough at trivial cost. For visual
+ * simulations, greedy wins.
+ *
+ * T4  STRATEGY AS A FORCE RECIPE — 10 MOODS, 1 SIMULATION
+ * ───────────────────────────────────────────────────────
+ * The CORE simulation is "agents seek their slots." Ten
+ * STRATEGIES are different recipes for HOW they get there:
+ *
+ *   DRIFT     wander + slow arrive — agents amble in
+ *   RUSH      fast arrive only — agents sprint straight at slot
+ *   FLOW      eastward stream + arrive — left-to-right convergence
+ *   ORBIT     tangent-to-centroid + arrive — spiraling in
+ *   FLOCK     boid (sep+align+coh) + arrive — herd that finds
+ *             slots
+ *   PULSE     oscillating slot target — agents bounce in
+ *   VORTEX    tangent-to-own-slot + arrive — swirl down to slot
+ *   GRAVITY   constant downward + arrive — rain into shape
+ *   SPRING    Hooke spring (T5) — bouncy arrive
+ *   WAVE      sinusoidal lateral + arrive — swooping arc
+ *
+ * Each strategy is just a tick function selecting which forces
+ * to sum, with which weights:
+ *
+ *     ORBIT_tick(agent):
+ *       arrive  = arrive_force(agent, slot)
+ *       tangent = tangent_to_centroid(agent, digit_centroid)
+ *       force   = W_arrive · arrive + W_tangent · tangent
+ *               + W_separate · separate(agent, neighbours)
+ *       integrate(agent, force)
+ *
+ * Same agents, same slots, same integrator. Ten different
+ * approaches to filling the same shape. The visual difference
+ * is dramatic — RUSH snaps the digit into existence; ORBIT
+ * spirals; SPRING bounces.
+ *
+ * Choosing a strategy is a behaviour-DESIGN choice, not an
+ * agent-LEVEL choice. The strategy IS the simulation's
+ * personality.
+ *
+ * T5  SPRING STRATEGY — HOOKE'S LAW REPLACES ARRIVE
+ * ─────────────────────────────────────────────────
+ * Most strategies use the standard ARRIVE force:
+ *
+ *     desired_speed = max_speed · clamp(dist / slow_radius, 0, 1)
+ *     force = (desired - vel)
+ *
+ * Arrive DECELERATES smoothly to zero at the slot — agents
+ * settle without overshoot.
+ *
+ * The SPRING strategy uses HOOKE'S LAW instead:
+ *
+ *     force = SPRING_K · (target - pos) - SPRING_DAMP · vel
+ *
+ * That's the differential equation of a damped harmonic
+ * oscillator. The constants tune the feel:
+ *
+ *     SPRING_K       spring constant — how stiff is the spring
+ *     SPRING_DAMP    damping coefficient — how much friction
+ *
+ * Damping ratio:
+ *
+ *     ζ = SPRING_DAMP / (2 · √SPRING_K)
+ *
+ *     ζ < 1   underdamped — overshoots and oscillates
+ *     ζ = 1   critically damped — fastest non-overshoot arrival
+ *     ζ > 1   overdamped — slow approach, no oscillation
+ *
+ * We tune ζ ≈ 0.53 — visibly underdamped, so agents OVERSHOOT
+ * the slot and oscillate before settling. Visually distinctive
+ * — it's the BOUNCY strategy.
+ *
+ * Same Hooke trick is used in:
+ *   - rope sims (mass-spring chains)
+ *   - cloth physics
+ *   - UI animations ("springy" easing curves)
+ *   - control systems (PID with integral term)
+ *
+ * Generalisation: any "dynamic equilibrium" behaviour can be
+ * modelled as a linear ODE; underdamped oscillation gives
+ * "bouncy", critically damped gives "smooth", overdamped
+ * gives "sluggish."
+ *
+ * T6  AUTO-CYCLE AND LIVE RESTRATEGY — DECLARATIVE CONTROL FLOW
+ * ─────────────────────────────────────────────────────────────
+ * The user can:
+ *
+ *   - Press 0-9 to select a digit
+ *   - Press n / p to cycle strategies
+ *   - Press 'a' for auto-cycle (advance digit every 3 s)
+ *   - Press t / T to cycle themes
+ *
+ * All four control flows are DECLARATIVE — they set state, they
+ * don't trigger imperative reflows:
+ *
+ *     on key '5':   active_digit = 5; trigger reassign
+ *     on key 'n':   active_strategy = (active_strategy + 1) % 10
+ *     on tick:      if auto_cycle:
+ *                     auto_timer -= dt
+ *                     if auto_timer <= 0:
+ *                       active_digit = (active_digit + 1) % 10
+ *                       trigger reassign
+ *                       auto_timer = AUTO_CYCLE_PERIOD
+ *
+ * "Trigger reassign" rebuilds the slot pool from the new
+ * digit's bitmap and runs the greedy assignment (T3). Same
+ * function regardless of why the digit changed. Idempotent.
+ *
+ * The strategy change DOES NOT need a reassign — same slots
+ * apply, just different forces operating on them. Switching
+ * strategy mid-formation is INSTANT — agents keep their slot
+ * assignments and just start summing different forces next
+ * tick.
+ *
+ * This decoupling (digit ↔ slots ↔ strategy) is what makes the
+ * file pleasant to play with. Each control axis is independent;
+ * you can mix any digit with any strategy with any theme.
+ *
+ * Same separation-of-concerns pattern shows up in any UI with
+ * orthogonal options: video player (file × playback × theme),
+ * chart software (data × style × layout), etc. Keep the
+ * three orthogonal in code; expose them orthogonally to the
+ * user.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <float.h>
 #include <math.h>

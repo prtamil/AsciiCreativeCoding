@@ -248,6 +248,323 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read flocking.c first for steering basics; read
+ *      shepherd.c for "agent state machine" pattern. The NEW
+ *      LESSONS here are: factions, four-state warrior FSM,
+ *      projectile pool, and parameter-driven strategy presets.
+ *   2. §6 combat — THE HEART of this file. Read AFTER tutorials
+ *      T1-T6 below. Sub-sections:
+ *        - steering primitives (seek, flee, separate)
+ *        - melee_logic (4-state FSM)
+ *        - archer_logic (4-state FSM with shooting)
+ *   3. §7 scene — orchestrator + arrows_tick + draw.
+ *   4. §5 entity — Warrior, Arrow structs.
+ *   5. §1 — strategy presets (six tables of constants).
+ *   6. §2-§4, §8 — clock / colour / coords / app loop.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   warrior.faction        F_GONDOR or F_MORDOR.
+ *   warrior.unit_type      UNIT_MELEE or UNIT_ARCHER.
+ *   warrior.state          ADVANCE / COMBAT / FLEE / DEAD.
+ *   warrior.target_idx     index of locked enemy (in COMBAT).
+ *   warrior.hp             current hit points; ≤ 0 → DEAD.
+ *   warrior.atk_timer      countdown to next melee swing.
+ *   warrior.shoot_timer    countdown to next arrow.
+ *   warrior.rally_timer    accumulator while in FLEE — when high
+ *                          enough, rally back to ADVANCE.
+ *   arrow.pos, vel         projectile pose.
+ *   arrow.target_idx       which enemy this arrow is heading to
+ *                          (index captured at shoot time).
+ *   g_sp                   pointer to active StrategyParams. All
+ *                          combat code reads constants through
+ *                          this so 1-6 keys swap rules live.
+ *
+ * Background you need
+ * ───────────────────
+ *   - flocking.c T1-T7 (boid + steering forces).
+ *   - shepherd.c T1-T3 (heterogeneous agents + state machines).
+ *   - Object pool with ACTIVE flag — the arrow pool compacts
+ *     in place rather than allocating.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Real RTS combat math (range/armour/morale models).
+ *     Simplified to HP + flat damage.
+ *   - Pathfinding / navmesh. Warriors steer reactively; no
+ *     A*; no obstacles.
+ *   - Networked multiplayer. Single-process simulation.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a two-faction battle from first
+ * principles.
+ *
+ *   T1  Factions — heterogeneous agents with mirrored behaviour
+ *   T2  The 4-state warrior FSM — ADVANCE / COMBAT / FLEE / DEAD
+ *   T3  Steering, parameterised — same forces, different weights
+ *   T4  Archers — adding a SHOOT action and a projectile pool
+ *   T5  Strategy presets — global parameter tables behind a pointer
+ *   T6  Why mutual annihilation matters (and how to handle it)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  FACTIONS — HETEROGENEOUS AGENTS WITH MIRRORED BEHAVIOUR
+ * ───────────────────────────────────────────────────────────
+ * shepherd.c had two AGENT TYPES (sheep, dog). war.c has two
+ * FACTIONS — same agent type, opposing allegiance.
+ *
+ *     enum Faction { F_GONDOR, F_MORDOR };
+ *     warrior.faction;
+ *
+ * Faction tag is just a colour-and-target marker:
+ *
+ *   - For a Gondor warrior: ALLIES = other Gondor; ENEMIES =
+ *     all Mordor. Reverse for Mordor.
+ *   - When computing forces, separation only counts ALLIES (so
+ *     friendly lines stay tight). Seeking centroid only counts
+ *     ENEMIES (so warriors advance toward the enemy mass).
+ *
+ * Implementation: two faction-filtered loops:
+ *
+ *     for each ally w of self.faction:
+ *       sep += separation_force(self, w)
+ *
+ *     enemy_centroid = mean({w.pos : w.faction != self.faction})
+ *     advance_force = seek(enemy_centroid)
+ *
+ * Both faction sides run THE SAME CODE — the faction tag just
+ * selects which agents go in "allies" and "enemies." Mirroring.
+ *
+ * The two factions could be three (alliances), four (free-for-
+ * all), or any number — same machinery scales. We hard-code 2
+ * for the visual clarity of "this side vs that side."
+ *
+ * T2  THE 4-STATE WARRIOR FSM — ADVANCE / COMBAT / FLEE / DEAD
+ * ────────────────────────────────────────────────────────────
+ * Warriors are NOT pure boids — they have INTENTIONS that
+ * change with context:
+ *
+ *      ┌─────────┐  enemy in range   ┌─────────┐  hp ≤ flee_hp  ┌──────┐
+ *      │ ADVANCE │ ──────────────────│ COMBAT  │ ──────────────►│ FLEE │
+ *      │ (seek   │                   │ (fight) │                │      │
+ *      │  enemy  │                   └─────────┘                └──┬───┘
+ *      │  mass)  │                       ▲                          │
+ *      └────┬────┘                       │                          │
+ *           │                            │                          │
+ *           │ rally_time elapsed         │ target died             ↓
+ *           └────────────────────────────┘                       ┌──────┐
+ *                                                                │ DEAD │
+ *                                                                │      │
+ *                                                                └──────┘
+ *
+ *                                              ↑ hp ≤ 0 from any state
+ *
+ *   ADVANCE:   seek enemy centroid; if any enemy enters
+ *              engage_range, lock target → COMBAT.
+ *
+ *   COMBAT:    seek locked target slowly; deal damage every
+ *              atk_interval seconds. If target dies → ADVANCE
+ *              (look for new target). If hp ≤ flee_hp → FLEE.
+ *
+ *   FLEE:      flee from nearest enemy. Increment rally_timer
+ *              each tick; when rally_timer ≥ rally_time AND
+ *              far enough from enemies → ADVANCE.
+ *
+ *   DEAD:      no forces, becomes a corpse glyph for a brief
+ *              window (corpse_timer), then disappears.
+ *
+ * Each state has its own STEERING FORCE recipe. Code shape:
+ *
+ *     switch (warrior.state):
+ *       case ADVANCE: force = seek_enemy_mass(warrior); ...
+ *       case COMBAT:  force = seek_target(warrior); deal_damage()
+ *       case FLEE:    force = flee_nearest_enemy(warrior); ...
+ *       case DEAD:    return; // no movement
+ *
+ * Mid-state TRANSITIONS happen at the top of each tick before
+ * the steering computation, by checking conditions (hp,
+ * distance, target alive, timer expired). The FSM is the
+ * "agent's mind"; the steering is the "agent's body."
+ *
+ * Same pattern reappears in any agent-based game AI: enemies
+ * in shooters, units in RTS, NPCs in RPGs. State machine for
+ * intent + steering for motion.
+ *
+ * T3  STEERING, PARAMETERISED — SAME FORCES, DIFFERENT WEIGHTS
+ * ────────────────────────────────────────────────────────────
+ * Each warrior steering recipe uses the same primitives we
+ * built in crowd.c (T1-T2 there): seek, flee, separate. The
+ * differences are:
+ *
+ *   - WEIGHTS — how strong each force is.
+ *   - TARGETS — what to seek / flee from.
+ *
+ * Per-state recipes:
+ *
+ *     ADVANCE:  force = W_advance · seek(enemy_centroid)
+ *                     + W_separate · separate(allies)
+ *
+ *     COMBAT:   force = W_combat · seek(locked_target)
+ *                     + W_separate · separate(allies)
+ *
+ *     FLEE:     force = W_flee · flee(nearest_enemy)
+ *                     + W_separate · separate(allies)
+ *
+ * The same boid-style sum drives all three states; only the
+ * coefficients and targets differ. After force is computed:
+ *
+ *     vel += force · dt
+ *     vel = clamp(vel, max_speed)        ← state-dependent cap
+ *     pos += vel · dt
+ *
+ * max_speed is also state-dependent: warriors RUN faster
+ * when fleeing than when advancing. Pulling speed cap from a
+ * per-state lookup gives panic the right urgent feel.
+ *
+ * T4  ARCHERS — ADDING A SHOOT ACTION AND A PROJECTILE POOL
+ * ─────────────────────────────────────────────────────────
+ * Archers are warriors with EXTENDED LOGIC:
+ *
+ *     archer_logic distance ladder:
+ *       d < archer_flee_range:    FLEE (close-range panic)
+ *       d ≤ arrow_range:           COMBAT — shoot every shoot_interval
+ *       d > arrow_range:           ADVANCE — close to standoff range
+ *
+ * The "shoot every interval" action is what's new. Each archer
+ * has a shoot_timer:
+ *
+ *     archer.shoot_timer -= dt
+ *     if archer.state == COMBAT and archer.shoot_timer ≤ 0:
+ *       fire_arrow(archer, archer.target)
+ *       archer.shoot_timer = shoot_interval
+ *
+ * Firing an arrow:
+ *
+ *     fire_arrow(archer, target):
+ *       slot = first inactive slot in arrows[ARROW_POOL_MAX]
+ *       if no slot: silently drop the shot
+ *       slot.pos = archer.pos
+ *       slot.vel = normalize(target.pos - archer.pos) · ARROW_TRAVEL_SPD
+ *       slot.target_idx = target_idx
+ *       slot.faction = archer.faction
+ *       slot.active = true
+ *
+ * arrows_tick advances each arrow:
+ *
+ *     for each active arrow:
+ *       arrow.pos += arrow.vel · dt
+ *       if |arrow.pos - arrows.target.pos| < ARROW_HIT_DIST:
+ *         deal damage; deactivate arrow
+ *       elif arrow off-screen:
+ *         deactivate
+ *     compact arrows[] to keep active entries dense
+ *
+ * Three notable design choices:
+ *
+ *   - Arrow has its own struct + pool; not part of the warrior.
+ *     Arrows can OUTLIVE the archer that fired them.
+ *
+ *   - Damage is on HIT, not on FIRE. The arrow can MISS (target
+ *     moves, arrow exits world).
+ *
+ *   - Arrow is dumb-fire — velocity captured at shoot time.
+ *     No homing. The target may walk out of the way.
+ *
+ * Same pattern works for any projectile system in any game:
+ *  bullet, magic missile, thrown rock. Pool + tick + hit detect.
+ *
+ * T5  STRATEGY PRESETS — GLOBAL PARAMETER TABLES BEHIND A POINTER
+ * ───────────────────────────────────────────────────────────────
+ * Six battle "strategies" — STANDARD, BERSERKER, SHIELD WALL,
+ * GUERRILLA, ARCHER FOCUS, CHAOS — each tune ~16 different
+ * parameters (engage range, flee threshold, attack interval,
+ * archer speed, shoot interval, etc.).
+ *
+ * Naive: switch (strategy) { case BERSERKER: engage_range = 80;
+ * ...; flee_hp = 0; ... } scattered through the combat code.
+ *
+ * Better: a STRUCT of parameters + a global pointer:
+ *
+ *     typedef struct {
+ *       float engage_range;
+ *       float flee_hp;
+ *       float atk_interval;
+ *       float archer_speed;
+ *       ...
+ *     } StrategyParams;
+ *
+ *     StrategyParams STANDARD  = { ... };
+ *     StrategyParams BERSERKER = { ... };
+ *     ...
+ *
+ *     const StrategyParams *g_sp = &STANDARD;     // active strategy
+ *
+ * Combat code reads through `g_sp->engage_range` etc. Pressing
+ * 1-6 just changes g_sp. Next tick, every warrior fights under
+ * the new rules — no reset, no flag, no warrior-level state to
+ * change.
+ *
+ * Why this works: the parameters drive STEERING + FSM
+ * transitions, NOT the agent's structure. Same pool of
+ * warriors; same FSM logic; different constants. Turn the dials
+ * and the war changes character live.
+ *
+ * Generalisation: any "config preset" UI uses this pattern.
+ * Audio mixers, IDE colour themes, scientific simulations
+ * with parameter sweeps. Encapsulate the parameters; expose
+ * them through a pointer; switch the pointer to switch the
+ * config.
+ *
+ * T6  WHY MUTUAL ANNIHILATION MATTERS (AND HOW TO HANDLE IT)
+ * ──────────────────────────────────────────────────────────
+ * In a battle simulation, what if BOTH sides reach 0 alive
+ * simultaneously?
+ *
+ *   - Last Gondor warrior fires an arrow at last Mordor.
+ *   - Last Mordor warrior fires an arrow at last Gondor.
+ *   - Both arrows hit the same tick.
+ *   - Both warriors die simultaneously.
+ *
+ * Without explicit handling, the win-condition check sees
+ * "no Gondor alive AND no Mordor alive" and may declare both
+ * sides winners, neither, or NaN.
+ *
+ * Solution: deterministic tiebreak. We arbitrarily pick MORDOR
+ * to win on simultaneous extinction. Code:
+ *
+ *     if g_alive == 0 and m_alive == 0:
+ *       winner = F_MORDOR
+ *     elif g_alive == 0:
+ *       winner = F_MORDOR
+ *     elif m_alive == 0:
+ *       winner = F_GONDOR
+ *     else:
+ *       winner = NONE
+ *
+ * The choice (Mordor wins ties) is visual flavour, not balance.
+ *
+ * General pattern for ANY simultaneous outcome:
+ *   - Define a tiebreak rule (any deterministic choice — by
+ *     faction order, by who has more arrows in flight, by
+ *     RNG seed).
+ *   - Document it.
+ *   - Don't pretend it can't happen.
+ *
+ * Mutual annihilation is rare but happens reproducibly. A
+ * battle sim that crashes or shows undefined victory text on
+ * those frames is worse than one that shows a slightly
+ * arbitrary winner.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #include <float.h>
 #include <math.h>

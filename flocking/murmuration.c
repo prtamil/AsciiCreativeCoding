@@ -272,6 +272,264 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read flocking.c first; the boid forces are the
+ *      same Reynolds rules. The NEW LESSONS here are: density-field
+ *      rendering, large-N optimisation, and the hawk as a state
+ *      machine.
+ *   2. §6 forces — single-pass O(N²) boid + flee. THE HEART of
+ *      the simulation. Read AFTER tutorials T1-T5 below.
+ *   3. §7 hawk — PATROL / DIVE controller (T4).
+ *   4. §8 scene — orchestrator + density-binning renderer (T1-T2).
+ *   5. §1-§5, §9 — config / clock / colour / coords / boid /
+ *      app loop. Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   density[r][c]          per-cell count of birds, recomputed
+ *                          every frame.
+ *   RAMP                   glyph ramp ".,:;oO*#@" — 9 chars from
+ *                          sparse to dense.
+ *   N_BOIDS_MAX            cap (800 default; tunable with +/-).
+ *   hawk.state             PATROL or DIVE.
+ *   dive_timer             seconds remaining in DIVE.
+ *   HAWK_FLEE_RADIUS       boids inside this distance of the hawk
+ *                          feel a strong push away.
+ *   AUTO_DIVE_PERIOD       seconds between auto-dives (h key
+ *                          enables).
+ *   MIN_SPEED, MAX_SPEED   speed clamp.
+ *
+ * Background you need
+ * ───────────────────
+ *   - flocking.c T1-T7 (boid + three rules + toroidal + 2-stage).
+ *   - Histogram / binning — counting items into discrete buckets.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Spatial hashing (grids of buckets for O(N) neighbour search).
+ *     We rely on raw O(N²) at 800 boids; on a modern CPU that's
+ *     sub-millisecond.
+ *   - Voxel splatting / volume rendering. The density grid is 2-D,
+ *     ASCII output.
+ *   - Per-bird identity. The renderer doesn't track WHICH boid is
+ *     in which cell — only HOW MANY.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a 800-bird density-field flock from
+ * first principles.
+ *
+ *   T1  Why DENSITY rendering — 800 glyphs is a soup
+ *   T2  Density binning — count agents per cell, then map to glyph
+ *   T3  Single-pass O(N²) — combine all three rules in one loop
+ *   T4  Hawk state machine — PATROL ↔ DIVE without a teleport
+ *   T5  Why this looks like REAL starlings — emergent density waves
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHY DENSITY RENDERING — 800 GLYPHS IS A SOUP
+ * ────────────────────────────────────────────────
+ * flocking.c renders ONE GLYPH PER BOID. With 36 boids in
+ * 200×60 = 12000 cells, the glyphs are visibly distinct.
+ *
+ * Now scale to 800 boids in 80×24 = 1920 cells. That's 0.42
+ * boids per cell on average. With cohesion bringing them
+ * close, the central region has 5-15 boids per cell while
+ * the edges have 0-1. If we drew one glyph per boid:
+ *
+ *   - 5 boids overlap on the same cell. Only the LAST one
+ *     drawn shows; you can't tell the cell has 5 or 1.
+ *   - The flock looks like a uniform soup of glyphs at the
+ *     centre, dribbles of glyphs at the edges. Loses all the
+ *     density structure that makes real murmurations
+ *     beautiful.
+ *
+ * Solution: draw the DENSITY FIELD, not the boids.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │  per-boid           density-field                │
+ *      │                                                  │
+ *      │   ▓▓▓▓▓▓             .  ,  : oOO*#@*Oo: , .      │
+ *      │  ▓▓▓▓▓▓▓▓▓          .,:o##@@@@@@##o:,.           │
+ *      │  ▓▓▓▓▓▓▓▓▓           ,;oO*#@@@@@@*#Oo;,          │
+ *      │   ▓▓▓▓▓▓             .,:o*#@@@*Oo:,.             │
+ *      │                       . ,;:O*#OO;:, .            │
+ *      │                                                  │
+ *      │  uniform soup        moving cloud                │
+ *      │  (no structure)      (visible density gradient)  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Same simulation; different rendering. The density field
+ * makes 800 individual agents READ as one organism with
+ * internal structure.
+ *
+ * T2  DENSITY BINNING — COUNT AGENTS PER CELL, THEN MAP TO GLYPH
+ * ──────────────────────────────────────────────────────────────
+ * Each render frame:
+ *
+ *   1. zero a 2-D density grid: density[rows][cols] = 0
+ *   2. for each boid:
+ *        cx = round(boid.px / CELL_W)
+ *        cy = round(boid.py / CELL_H)
+ *        density[cy][cx] += 1
+ *   3. for each cell with density > 0:
+ *        idx   = min(density - 1, RAMP_LEN - 1)
+ *        glyph = RAMP[idx]                  // ".,:;oO*#@"
+ *        attr  = (density ≥ 6) ? A_BOLD : A_NORMAL
+ *        paint cell with (glyph, attr, theme_color)
+ *
+ * The RAMP is a 9-character ASCII gradient from sparse to
+ * dense. density=1 → '.'; density=2 → ','; ...; density=9+
+ * → '@'. The glyph itself encodes the count visually:
+ *
+ *     RAMP = ". , : ; o O * # @"
+ *             1   2   3   4   5   6   7   8   9+
+ *
+ * Three glyph tiers + two attribute tiers (NORMAL, BOLD)
+ * give the eye six visible brightness steps — enough for a
+ * smooth gradient at terminal resolution.
+ *
+ * Why no A_DIM? Sparse cells dominate the area of the flock;
+ * A_DIM would make them invisible, defeating the soft fade.
+ * The RAMP itself provides the dim-end of the gradient.
+ *
+ * Cost: O(N + cells) per frame. For 800 boids + 1920 cells,
+ * that's ~2700 operations per render — way cheaper than
+ * 800 mvaddch operations one per bird.
+ *
+ * T3  SINGLE-PASS O(N²) — COMBINE ALL THREE RULES IN ONE LOOP
+ * ───────────────────────────────────────────────────────────
+ * Naive Reynolds: three separate O(N²) loops, one per rule:
+ *
+ *     for each pair (i, j): compute separation
+ *     for each pair (i, j): compute alignment
+ *     for each pair (i, j): compute cohesion
+ *
+ * That's 3 × 800² = 1.9M pair tests per tick.
+ *
+ * Better: ONE loop over pairs, with classify-by-distance
+ * inside:
+ *
+ *     for each pair (i, j):
+ *       d² = squared toroidal distance
+ *       if d² < SEP_R²:    boid[i].sep_force += ... ; boid[j].sep_force += ...
+ *       if d² < ALIGN_R²:  boid[i].ali_vsum  += boid[j].vel ; ali_n++
+ *       if d² < COH_R²:    boid[i].coh_dsum  += toroidal_delta(j, i)
+ *
+ * One pair test per pair, three classifications per test.
+ * Total: 800² = 640K pair tests = 1/3 the work.
+ *
+ * Crucial detail: keep ALL distance comparisons SQUARED until
+ * the very end. sqrt() is more expensive than square. We only
+ * sqrt at the moment we need a unit vector for the actual
+ * force application.
+ *
+ * Same single-pass pattern is used in any large-N agent sim
+ * (boids, n-body, swarm robotics).
+ *
+ * T4  HAWK STATE MACHINE — PATROL ↔ DIVE WITHOUT A TELEPORT
+ * ─────────────────────────────────────────────────────────
+ * The hawk has TWO states:
+ *
+ *   PATROL: orbit at radius 0.4 · min(w,h) around the world
+ *           centre, angular speed 0.4 rad/s. Hawk position is
+ *           a closed-form function of (centre, radius, phase).
+ *
+ *   DIVE:   set a straight-line velocity toward the flock
+ *           CENTROID (computed at dive entry), step forward at
+ *           250 px/s for HAWK_DIVE_DURATION (~1.5 s).
+ *
+ * Transition rule:
+ *
+ *     PATROL → DIVE       on SPACE press OR auto-dive timer.
+ *                         Capture the flock centroid; capture
+ *                         current hawk pos; dive_timer = duration.
+ *
+ *     DIVE → PATROL       when dive_timer ≤ 0. Resume PATROL
+ *                         AT THE HAWK'S CURRENT POSITION (no
+ *                         teleport back to the orbit). The
+ *                         orbit phase is recomputed from the
+ *                         hawk's actual position relative to
+ *                         the centre, so the next patrol
+ *                         starts smoothly from where the dive
+ *                         left it.
+ *
+ * "Recompute orbit phase from current position" is the trick
+ * that prevents teleport. Naïvely, PATROL has its own phase
+ * variable that ticks regardless of DIVE; when you re-enter
+ * PATROL, the phase is wherever it was paused, but the hawk
+ * has moved miles away during DIVE. The hawk would visibly
+ * jump back to the orbit.
+ *
+ * Solution: when re-entering PATROL, set
+ *
+ *     phase = atan2(hawk_pos.y - centre.y,
+ *                   hawk_pos.x - centre.x)
+ *
+ * The orbit picks up exactly where the hawk currently is.
+ * Continuous motion, no teleport.
+ *
+ * Same pattern works for any "predator suspends → resumes
+ * passive behaviour" agent. shepherd.c uses an analogous
+ * idea for the dog's relax state.
+ *
+ * T5  WHY THIS LOOKS LIKE REAL STARLINGS — EMERGENT DENSITY WAVES
+ * ───────────────────────────────────────────────────────────────
+ * Real starling murmurations exhibit several visual motifs:
+ *
+ *   - SHARP SILHOUETTES — the flock has a clear boundary; you
+ *     can SEE its outline.
+ *   - INTERNAL DENSITY WAVES — bands of higher density move
+ *     through the flock at a different speed than the bulk.
+ *   - SPLITTING + REJOINING — when a hawk dives through, the
+ *     flock parts and re-coheres seconds later.
+ *   - COLLECTIVE TURNS — the flock rotates as one organism.
+ *
+ * Our 800-boid simulation reproduces all four:
+ *
+ *   - Silhouette: density drops sharply at the edge of the
+ *     cohesion radius. The renderer's RAMP makes the
+ *     transition from `.` to nothing extremely visible.
+ *
+ *   - Internal waves: alignment + cohesion tug each boid
+ *     simultaneously; the resulting forces are NOT spatially
+ *     uniform. Local density variations propagate as waves —
+ *     same as sound waves in fluids, except the medium is
+ *     boids.
+ *
+ *   - Hawk dive: the FLEE force at HAWK_FLEE_RADIUS evicts
+ *     boids; cohesion pulls neighbouring boids INTO the void
+ *     once the hawk passes. Result: the flock fragments into
+ *     sheets on dive entry, then reforms.
+ *
+ *   - Collective turn: alignment + cohesion both depend on
+ *     the AVERAGE of neighbours. When some boids start
+ *     turning (e.g. due to flee), the average direction
+ *     shifts, propagating as a group turn.
+ *
+ * None of these motifs are CODED EXPLICITLY. They EMERGE from
+ * three local rules. That's the lesson Reynolds (1987)
+ * established and Couzin et al. (2002) quantified: complex
+ * collective behaviour from simple local rules.
+ *
+ * Decision tree for "I want flock-like motion":
+ *
+ *   small N (≤50)   → individual glyphs, like flocking.c
+ *   medium N (~150) → individual glyphs with brightness
+ *                     coding, like crowd.c
+ *   large N (≥500)  → density field rendering, like this file
+ *
+ * The simulation core is the same; the renderer changes with N.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

@@ -237,6 +237,338 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. This is the FOUNDATIONAL file of flocking/; the
+ *      other files (crowd, murmuration, shepherd, war,
+ *      swarm_gen_numbers) reuse the same Boid + steering machinery
+ *      with different rule combinations.
+ *   2. §6 flock — THE HEART of this file. Read AFTER tutorials
+ *      T1-T7 below. Sub-sections:
+ *        - leader wander
+ *        - boids_steer    (mode 1 — three classic rules)
+ *        - chase_steer    (mode 2)
+ *        - vicsek_step    (mode 3)
+ *        - orbit_steer    (mode 4)
+ *        - predator_steer (mode 5)
+ *        - flock_init
+ *      Each mode is a separate small function summing different
+ *      forces; the integration core is shared.
+ *   3. §5 boid — Boid struct, spawn, speed clamp, wrap helper.
+ *   4. §4 coords — toroidal_delta is the most important helper
+ *      (T6 below).
+ *   5. §7 scene — orchestrator: tick all flocks, two-stage update.
+ *   6. §1-§3, §8-§9 — config / clock / colour / screen / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   px, py             pixel-space position (Vec2 floats).
+ *                      CELL_W=8, CELL_H=16 sub-pixels per cell.
+ *   vx, vy             pixel-space velocity (px/sec).
+ *   new_vx[], new_vy[] scratch arrays for two-stage tick (T7).
+ *   leader             special Boid that drives the flock's
+ *                      "wandering" — followers only know the
+ *                      leader exists in modes 2 and 4.
+ *   followers[]        the regular boids of a flock.
+ *   PERCEPTION_RADIUS  how far a boid "sees" for align + cohere.
+ *   SEPARATION_RADIUS  closer than this = personal-space invasion.
+ *   W_SEPARATION,      weights summing the three forces. Tuning
+ *   W_ALIGNMENT,       these constants is what flocking IS.
+ *   W_COHESION
+ *   MAX_STEER          per-tick steering force cap.
+ *   MIN_SPEED,         clamp range applied each tick.
+ *   MAX_SPEED
+ *   wpx, hpx           world width/height in pixels (toroidal box).
+ *
+ * Background you need
+ * ───────────────────
+ *   - Pixel-space simulation (CLAUDE.md: physics in pixels, render
+ *     converts to cells in §7 scene_draw).
+ *   - Vector arithmetic on Vec2 floats.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Spatial hashing / kd-trees. We do O(N²) neighbour scan;
+ *     small N keeps it microseconds.
+ *   - Quaternions. 2-D motion uses (cos, sin) on a scalar
+ *     heading.
+ *   - GPU compute / parallel boids. Single-threaded CPU is fine
+ *     up to ~1000 boids in a terminal.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Seven tutorials that build flocking + four variant modes from
+ * first principles.
+ *
+ *   T1  The boid — particle with constant speed and steerable heading
+ *   T2  The three Reynolds rules — separation / alignment / cohesion
+ *   T3  Tuning the weights — what each force does on its own
+ *   T4  Vicsek — alignment + noise drives a phase transition
+ *   T5  Orbit + Predator — modes built from the same primitives
+ *   T6  Toroidal topology — why "centre of mass" needs special care
+ *   T7  Two-stage update — read all, then write all (no order bias)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE BOID — PARTICLE WITH CONSTANT SPEED AND STEERABLE HEADING
+ * ─────────────────────────────────────────────────────────────────
+ * A "boid" (Reynolds 1987 — short for "bird-oid") is the
+ * simplest possible flocking agent. It owns:
+ *
+ *     position    px, py     (pixel-space, floats)
+ *     velocity    vx, vy     (px/sec)
+ *     speed       constant after each clamp
+ *
+ * Each tick:
+ *
+ *     1. Compute a STEERING FORCE (Vec2)
+ *     2. vx += steer.x · dt;  vy += steer.y · dt
+ *     3. Clamp |v| to [MIN_SPEED, MAX_SPEED]
+ *     4. px += vx · dt;  py += vy · dt
+ *     5. Wrap (px, py) toroidally
+ *
+ * The boid HEADING is just the angle of (vx, vy). Changing
+ * heading means applying a sideways component of steering;
+ * speeding up / slowing down means applying a parallel
+ * component. After clamping, speed is effectively constant —
+ * only direction changes meaningfully over time.
+ *
+ * That's the entire boid. Six floats, five lines of update,
+ * the rest is what to put in the steering force.
+ *
+ * T2  THE THREE REYNOLDS RULES — SEPARATION / ALIGNMENT / COHESION
+ * ────────────────────────────────────────────────────────────────
+ * Reynolds (1987) showed that THREE LOCAL RULES, applied
+ * INDEPENDENTLY by each boid to its neighbours, produce the
+ * emergent flocking we recognise from real birds.
+ *
+ *   SEPARATION   "Don't crowd nearby boids."
+ *                For each neighbour closer than SEPARATION_RADIUS,
+ *                push AWAY with strength inversely related to
+ *                distance.
+ *
+ *   ALIGNMENT    "Match the average heading of nearby boids."
+ *                Steer toward the average velocity of neighbours
+ *                within PERCEPTION_RADIUS.
+ *
+ *   COHESION     "Move toward the centre of nearby boids."
+ *                Steer toward the average position of neighbours
+ *                within PERCEPTION_RADIUS.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │  separation       alignment       cohesion       │
+ *      │                                                  │
+ *      │   →    .         →    →            .   →         │
+ *      │   .  ← me        →    me ←         me            │
+ *      │   ←    .         →    →            .   →         │
+ *      │                                                  │
+ *      │  push apart     match heading     pull to centre │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * The total steering force is a WEIGHTED SUM:
+ *
+ *     steer = W_SEP · sep + W_ALIGN · align + W_COH · coh
+ *
+ * Each rule operates on a LOCAL NEIGHBOURHOOD — only what
+ * THIS boid can see. There is no global flock state. The
+ * "flock" emerges from many independent agents running the
+ * same three rules.
+ *
+ * That's the whole reason this works: real birds DON'T have
+ * global awareness either, so a flocking model that requires
+ * none reproduces the real behaviour.
+ *
+ * T3  TUNING THE WEIGHTS — WHAT EACH FORCE DOES ON ITS OWN
+ * ────────────────────────────────────────────────────────
+ * The three weights matter more than the rules themselves.
+ * The qualitative behaviour comes from their RELATIVE
+ * MAGNITUDES.
+ *
+ *   high SEP, low everything else
+ *     boids actively push apart, never form a group. Looks
+ *     like a fearful crowd.
+ *
+ *   high ALIGN, low everything else
+ *     boids steer parallel to neighbours but don't gather or
+ *     repel. Eventually all flocks line up; no real grouping.
+ *     This IS the Vicsek model (mode 3, T4).
+ *
+ *   high COH, low everything else
+ *     boids pile onto each other in tight clumps. Looks like
+ *     particles in a gravity well.
+ *
+ *   balanced (default in this file)
+ *     boids form coherent flocks that move as a unit, with
+ *     personal space, with a shared heading. The classic
+ *     Reynolds boid emerges.
+ *
+ * Tip: when implementing flocking somewhere new, start with
+ * SEPARATION strongest, ALIGN medium, COH weakest. The
+ * ratios in the literature are ~1.5 : 1.0 : 1.0; we use
+ * something similar in §1 config.
+ *
+ * Mode 1 (BOIDS in this file) IS this classic combination.
+ *
+ * T4  VICSEK — ALIGNMENT + NOISE DRIVES A PHASE TRANSITION
+ * ────────────────────────────────────────────────────────
+ * Vicsek et al. (1995) stripped Reynolds boids to the
+ * minimum: keep ALIGNMENT, drop SEPARATION + COHESION,
+ * and add a NOISE TERM:
+ *
+ *     avg_angle = atan2(Σ neighbour_vy, Σ neighbour_vx)
+ *     new_angle = avg_angle + η      where η ∈ [-noise, +noise]
+ *     new_v     = cruise_speed · (cos new_angle, sin new_angle)
+ *
+ * No separation, no cohesion, no leader. Just "average
+ * heading of neighbours, plus random angle." Yet this single
+ * rule produces a STRIKING PHASE TRANSITION as you tune
+ * `noise`:
+ *
+ *   noise = 0.05    every boid aligns to the same direction.
+ *                   The whole flock becomes a coherent stream.
+ *                   ORDERED phase.
+ *
+ *   noise = 0.6     boids partially aligned but with churn.
+ *                   This is the CRITICAL POINT.
+ *
+ *   noise = 1.5+    random walk dominates; boids move
+ *                   independently, no global pattern.
+ *                   DISORDERED phase.
+ *
+ * Press n / m to slide noise live. The transition is
+ * visually obvious — same bird species, different climate.
+ *
+ * Vicsek's contribution wasn't the rule (it was simpler than
+ * Reynolds') — it was showing that PHASE TRANSITIONS happen
+ * in self-driven particle systems. That observation kicked
+ * off "active matter" physics.
+ *
+ * T5  ORBIT + PREDATOR — MODES BUILT FROM THE SAME PRIMITIVES
+ * ───────────────────────────────────────────────────────────
+ * The remaining two modes prove that the flocking machinery
+ * is a TOOLKIT, not a fixed algorithm.
+ *
+ *   ORBIT (mode 4)
+ *     Replace the cohesion term with a PULL TOWARD an
+ *     evenly-spaced slot on a rotating ring around the
+ *     leader:
+ *
+ *         slot_angle_i = base_angle + i · (2π / N) + ω · t
+ *         desired_pos  = leader_pos + ORBIT_RADIUS ·
+ *                        (cos slot, sin slot)
+ *         steer       += pull_toward(desired_pos)
+ *
+ *     Result: followers form a rotating ring around their
+ *     leader. Same separation force prevents stacking.
+ *
+ *   PREDATOR (mode 5)
+ *     Add a FLEE term that pushes prey boids AWAY from
+ *     visible predators:
+ *
+ *         for each predator within PREY_FLEE_RADIUS:
+ *           flee += W_FLEE · normalize(my_pos - pred_pos)
+ *
+ *     Predators (flock 0) get a HUNT term — pull toward
+ *     nearest prey. Same boids, different rule mix.
+ *
+ * Both are FORCE COMBINATIONS over the same Boid struct. The
+ * mode switcher in §6 just changes which steering function
+ * runs; the integration core is identical.
+ *
+ * Decision tree for new flocking-style behaviours:
+ *
+ *   want a herd?               → Reynolds 3 rules, balanced weights
+ *   want phase transition?     → Vicsek (align + noise)
+ *   want formation?            → orbit / lattice / line, replacement for cohesion
+ *   want predator-prey?        → add flee/hunt, keep base rules
+ *   want LEADER + followers?   → high leader-pull weight, drop alignment among followers
+ *   want pure milling?         → high cohesion + light noise, no alignment
+ *
+ * T6  TOROIDAL TOPOLOGY — WHY "CENTRE OF MASS" NEEDS SPECIAL CARE
+ * ───────────────────────────────────────────────────────────────
+ * Boids wrap at screen edges — left edge connects to right,
+ * top to bottom. This is a TORUS topology.
+ *
+ * Naive distance: |b.pos - a.pos|. Wrong on a torus. Two
+ * boids at px = 5 and px = wpx - 5 are CLOSE on the torus
+ * (only 10 pixels apart through the wrap), but the naive
+ * difference is wpx - 10 (almost the whole screen).
+ *
+ * Solution: TOROIDAL DELTA — shortest signed displacement
+ * across the wrap:
+ *
+ *     d = b - a
+ *     if d > extent / 2:   d -= extent
+ *     if d < -extent / 2:  d += extent
+ *
+ * Used everywhere distances or directions matter:
+ * separation, alignment, cohesion centroid.
+ *
+ * Cohesion needs extra care: averaging ABSOLUTE positions of
+ * boids straddling the wrap gives a meaningless value (e.g.
+ * boids at px = 1 and px = wpx - 1 average to wpx / 2 — the
+ * middle of the screen, not the wrap point). Solution:
+ *
+ *     for each neighbour:
+ *       offset = toroidal_delta(neighbour.pos, my.pos)
+ *       sum_offset += offset
+ *     mean_offset = sum_offset / n
+ *     desired = my.pos + mean_offset           ← always near my.pos
+ *
+ * Sum the OFFSETS (which are bounded by extent/2), not the
+ * absolute positions. Mean offset is meaningful regardless of
+ * wrap location.
+ *
+ * Same trick is needed in any toroidal sim — fluid sims, CA
+ * grids, particle simulations on periodic boundaries.
+ *
+ * T7  TWO-STAGE UPDATE — READ ALL, THEN WRITE ALL (NO ORDER BIAS)
+ * ───────────────────────────────────────────────────────────────
+ * Wrong way:
+ *
+ *     for each follower i:
+ *       compute new_v from neighbours' CURRENT vel
+ *       follower[i].vel = new_v
+ *       integrate position
+ *
+ * Reading neighbour velocities WHILE updating follower[i]
+ * means follower[i+1] sees follower[i]'s NEW velocity, but
+ * follower[i-1] saw its OLD velocity. The flock develops a
+ * subtle drift in array-index direction.
+ *
+ * Right way (this file):
+ *
+ *     STAGE 1: for each i: new_v[i] = compute_steer(i)
+ *                          (reads ONLY old velocities)
+ *
+ *     STAGE 2: for each i: vel[i] = new_v[i]
+ *                          clamp speed
+ *                          integrate position
+ *                          wrap
+ *
+ * Two scratch arrays (new_vx[], new_vy[]) sit in §6. The
+ * scratch is sized to the maximum follower count.
+ *
+ * General pattern: any per-frame update where every entity's
+ * new state depends on EVERYONE ELSE'S CURRENT state needs
+ * read-before-write decoupling. Same applies to cellular
+ * automata (separate read + write buffers), Verlet
+ * integration (old_pos snapshot), N-body (compute all forces
+ * before any positions update).
+ *
+ * Cost: one extra pass over the array per tick. Negligible.
+ * Benefit: simulation is order-INDEPENDENT, results
+ * reproducible, no axis bias.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /*
  * _GNU_SOURCE exposes M_PI from <math.h>.
  * _POSIX_C_SOURCE alone does not include M_PI (it is a POSIX extension).

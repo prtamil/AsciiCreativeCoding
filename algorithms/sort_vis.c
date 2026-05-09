@@ -9,9 +9,10 @@
  *       When the array is sorted, every bar turns matrix-green.  TAB
  *       cycles algorithms, +/- doubles or halves operations per frame.
  *
- * Study alongside: misc/maze.c — both turn an iterative algorithm
- *   (carve a maze / sort an array) into a state machine that emits one
- *   visible event per tick, so the animation IS the algorithm.
+ * Study alongside: procedural/generational/maze.c — both turn an
+ *   iterative algorithm (carve a maze / sort an array) into a state
+ *   machine that emits one visible event per tick, so the animation
+ *   IS the algorithm.
  *
  * Section map:
  *   §1 config  — N_ELEMS, HUD_ROWS, frame timing, color pair IDs
@@ -24,7 +25,8 @@
  * Keys:  q/ESC quit   TAB next alg   space scramble   p pause   +/- speed
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra misc/sort_vis.c -o sort_vis -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra algorithms/sort_vis.c \
+ *       -o sort_vis -lncurses -lm
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *

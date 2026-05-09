@@ -38,7 +38,7 @@
  *   3  Smouldering — p=0.020 f=0.0003, 8-neighbour spread; creeping fires
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra misc/forest_fire.c \
+ *   gcc -std=c11 -O2 -Wall -Wextra procedural/generational/forest_fire.c \
  *       -o forest_fire -lncurses -lm
  */
 

@@ -8,9 +8,12 @@
  *       the moment it touches the bottom-right cell the shortest path
  *       traces back as a glowing green '*' line.  Press r to regenerate.
  *
- * Study alongside: misc/forest_fire.c — both are cell-grid simulations
- *   driven by an iterative state machine, and both colour-code the
- *   activity wave on top of a static field.
+ * Study alongside: forest_fire.c (same folder) — both are cell-grid
+ *   simulations driven by an iterative state machine, and both
+ *   colour-code the activity wave on top of a static field.
+ *   maze_backtracker.c (same folder) — fancier showcase of the same
+ *   carver with Unicode walls, glow effects, and a longest-path
+ *   (diameter) solver instead of this file's BFS shortest-path.
  *
  * Section map:
  *   §1 config   — sizes, wall bits, phase enum, color pair IDs
@@ -24,7 +27,8 @@
  * Keys:  q/ESC quit   r regen   space skip-to-solve   p pause   1/2/3 sizes
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra misc/maze.c -o maze -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra procedural/generational/maze.c \
+ *       -o maze -lncurses -lm
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *

@@ -10,9 +10,9 @@
  *       a gold beam streams along that path from one end to the other.
  *       Hold, supernova-flash reset, repeat forever.
  *
- * Study alongside: ../../misc/maze.c — the same algorithm in plainer ASCII;
- *       this file adds smooth Unicode wall corners, glow effects, the
- *       diameter solver, and an auto-loop state machine.
+ * Study alongside: maze.c (same folder) — the same algorithm in plainer
+ *       ASCII; this file adds smooth Unicode wall corners, glow effects,
+ *       the diameter solver, and an auto-loop state machine.
  *
  * Section map:
  *   §1 config   — grid size, dig pace, glow rates, hold/dissolve

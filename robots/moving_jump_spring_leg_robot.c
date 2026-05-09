@@ -384,6 +384,302 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read robots/diff_drive_robot.c first (pose
+ *      integration); robots/walking_robot.c if state-machine gait
+ *      is new. NEW LESSONS here: Hooke's-law spring, projectile
+ *      motion, terrain-aware launch, side-scrolling camera.
+ *   2. §8 robot — THE HEART. Sub-sections:
+ *        - phase enum (COMPRESS / FLIGHT / LAND)
+ *        - per-phase tick functions
+ *        - launch velocity computation (T2 below)
+ *      Read AFTER tutorials T1-T6 below.
+ *   3. §6 terrain — height query + slope (T5).
+ *   4. §9 render — paint ground, trail, spring, body, energy bar.
+ *   5. §1-§5, §7, §10-§11 — config / clock / colour / coords /
+ *      noise / trail / screen / app loop. Skim if seen.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   body_px, body_py        body centre position in world pixels.
+ *   foot_px, foot_py        foot position. Equals body_py + leg
+ *                           length during stance; locked during
+ *                           flight.
+ *   vx, vy                  body velocity (px/sec).
+ *   spring_compress         current compression in pixels, 0 to
+ *                           SPRING_COMPRESS_MAX. ENERGY-storing
+ *                           variable.
+ *   PE                      potential energy stored in spring
+ *                           (½ k x²). Visualised by the energy bar.
+ *   phase                   COMPRESS, FLIGHT, or LAND enum.
+ *   phase_time              seconds spent in current phase.
+ *   T_COMPRESS, T_LAND      duration of compress / land phases.
+ *   GRAVITY                 downward acceleration (px/sec²).
+ *   SPRING_K                spring constant (Hooke's law force =
+ *                           -k · x).
+ *   cam_x                   horizontal camera offset for scrolling
+ *                           (T6 below).
+ *
+ * Background you need
+ * ───────────────────
+ *   - Newton's laws: F = ma, vy += g · dt.
+ *   - Hooke's law: F = -k · x; PE = ½ k x².
+ *   - Trig: launch velocity at angle θ has components
+ *     (v · cos θ, -v · sin θ) (negative because screen-y is down).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Real-world spring-mass-damper ODEs (we use COMPRESS as a
+ *     time-ramp, not as a real Hooke's-law oscillator). The
+ *     simplification is a valid teaching shortcut.
+ *   - Air drag, restitution, or real impact dynamics. Landing is
+ *     a brief frozen state, not a physical bounce.
+ *   - Inverse dynamics. The robot is purely kinematic during
+ *     COMPRESS / LAND; only FLIGHT involves Newton's second law.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a hopping pogo-stick robot from
+ * first principles.
+ *
+ *   T1  The three-phase state machine — COMPRESS / FLIGHT / LAND
+ *   T2  Hooke's law — quadratic energy storage
+ *   T3  Energy conservation — PE → KE at release
+ *   T4  Projectile motion — Euler integration of gravity
+ *   T5  Terrain interaction — slope-adapted launch angle
+ *   T6  Side-scrolling camera — pin the robot, scroll the world
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE THREE-PHASE STATE MACHINE — COMPRESS / FLIGHT / LAND
+ * ────────────────────────────────────────────────────────────
+ * The robot's behaviour repeats forever in a 3-state cycle:
+ *
+ *      ┌──────────┐ T_COMPRESS  ┌────────┐  foot hits  ┌──────┐
+ *      │ COMPRESS │ ──────────► │ FLIGHT │ ──────────► │ LAND │
+ *      │ (load)   │  elapsed    │ (arc)  │  ground     │ (stun)│
+ *      └──────────┘             └────────┘             └──────┘
+ *           ▲                                                │
+ *           │                                                │
+ *           └────────── T_LAND elapsed ──────────────────────┘
+ *
+ *   COMPRESS:
+ *     - body sinks toward foot
+ *     - spring_compress ramps 0 → MAX over T_COMPRESS sec
+ *     - PE accumulates = ½ k · spring_compress²
+ *     - at full compression, compute launch velocity (T2)
+ *     - transition to FLIGHT
+ *
+ *   FLIGHT:
+ *     - body undergoes projectile motion (T4)
+ *     - vx constant, vy += GRAVITY · dt
+ *     - body_pos += (vx, vy) · dt
+ *     - record body_pos in trail buffer
+ *     - when foot reaches terrain, transition to LAND
+ *
+ *   LAND:
+ *     - body locked at landing pose for T_LAND seconds
+ *     - flash glyph from '@' to '*' for visual feedback
+ *     - after T_LAND, transition back to COMPRESS
+ *
+ * Each phase has its own TICK FUNCTION in §8. Phase transitions
+ * happen at clear, well-defined events (timer expires, geometric
+ * contact). Same state-machine pattern as walking_robot's gait,
+ * matrix_snowflake's FALL ↔ FLASH, fireworks' IDLE → RISING →
+ * EXPLODED.
+ *
+ * State machines are GREAT for cyclic mechanical processes —
+ * the cycle structure becomes EXPLICIT in the code rather than
+ * being hidden in nested if/else branches.
+ *
+ * T2  HOOKE'S LAW — QUADRATIC ENERGY STORAGE
+ * ──────────────────────────────────────────
+ * A spring resists compression with force PROPORTIONAL to
+ * displacement:
+ *
+ *     F = -k · x          (Hooke's law)
+ *
+ *   - x = compression distance (positive when squeezed)
+ *   - k = spring constant (stiffness)
+ *   - F = restoring force (negative = pushing back)
+ *
+ * The WORK you do compressing the spring is stored as
+ * POTENTIAL ENERGY. Integrating F dx from 0 to x:
+ *
+ *     PE = ∫₀ˣ k · ξ dξ = ½ k x²
+ *
+ * That's the famous QUADRATIC potential. Properties:
+ *
+ *   - Compress 2× as far → store 4× as much energy.
+ *   - Compress 3× as far → store 9× as much energy.
+ *   - Compress to MAX (default 48 px) → store ½ · k · MAX² of PE.
+ *
+ * In the energy bar visualisation: the bar fills SLOWLY at
+ * first (low compression = low PE) and SHOOTS UP near MAX (each
+ * additional pixel of compression adds disproportionately
+ * more energy).
+ *
+ * Implementation note: we don't actually integrate Hooke's law
+ * as an ODE. We just RAMP spring_compress linearly over
+ * T_COMPRESS seconds. This is a SIMPLIFICATION — a real spring
+ * would oscillate. For visual purposes the linear ramp is
+ * cleaner.
+ *
+ * T3  ENERGY CONSERVATION — PE → KE AT RELEASE
+ * ────────────────────────────────────────────
+ * When the spring releases, ALL stored PE converts to KINETIC
+ * energy:
+ *
+ *     ½ k x² = ½ m v²
+ *     ⟹    v = x · √(k / m)
+ *
+ * For our defaults (m = 1, k = SPRING_K, x_max = 48 px):
+ *
+ *     v_launch = 48 · √k = 240 px/sec   (k = 25)
+ *
+ * That's the body's TOTAL launch speed. We split it into
+ * horizontal and vertical components by the LAUNCH ANGLE θ:
+ *
+ *     vx = v_launch · cos θ
+ *     vy = -v_launch · sin θ          (negative = upward in
+ *                                      screen-y-down)
+ *
+ * The launch angle is computed from terrain slope (T5). Flat
+ * ground gives a near-vertical launch (θ ≈ 75°); a steep up-
+ * slope gives a more horizontal launch.
+ *
+ * Why energy conservation matters: it ensures the JUMP HEIGHT
+ * scales with k and x_max in physically meaningful ways. Want
+ * higher jumps? Increase k (stiffer spring) or x_max (deeper
+ * compression). Same scaling as a real pogo stick.
+ *
+ * T4  PROJECTILE MOTION — EULER INTEGRATION OF GRAVITY
+ * ────────────────────────────────────────────────────
+ * In FLIGHT, only gravity acts on the body. Two integrators:
+ *
+ *     vy += GRAVITY · dt          ← gravity accelerates downward
+ *     body_py += vy · dt          ← position from velocity
+ *     body_px += vx · dt          ← horizontal velocity constant
+ *
+ * Three lines. That's PROJECTILE MOTION — the same physics
+ * a thrown rock follows.
+ *
+ * Trajectory analytically:
+ *
+ *     y(t) = y₀ + vy_init · t + ½ · g · t²    ← parabola
+ *     x(t) = x₀ + vx · t                       ← linear
+ *
+ * The locus (x, y(x)) traces a parabola — confirmed by pausing
+ * at apex and checking the trail.
+ *
+ * Termination condition: when the foot's projected position
+ * (foot_py = body_py + leg_length) reaches the terrain
+ * height_at(foot_px), transition to LAND.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │            O   ← apex (vy = 0)                   │
+ *      │           ╱ ╲                                    │
+ *      │         ╱     ╲                                  │
+ *      │       ╱         ╲                                │
+ *      │      ●           ↘                               │
+ *      │   launch       ╱   ●  ← landing                  │
+ *      │            ↘                                     │
+ *      │      _____________________                       │
+ *      │      ground                                      │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Same projectile machinery as fireworks_rain T1 (rocket
+ * physics) but applied to the robot body instead of sparks.
+ *
+ * T5  TERRAIN INTERACTION — SLOPE-ADAPTED LAUNCH ANGLE
+ * ────────────────────────────────────────────────────
+ * On flat ground the launch angle is fixed (e.g. 75°). On
+ * SLOPED terrain the robot needs to lean INTO the slope —
+ * launch more horizontally on uphill, more vertically on
+ * downhill — to reach a meaningful distance.
+ *
+ *     slope = (height_at(x + dx) - height_at(x - dx)) / (2 · dx)
+ *     slope_angle = atan(slope)
+ *
+ *     base_angle = LAUNCH_ANGLE_FLAT       (e.g. 75°)
+ *     adjusted = base_angle - slope_adjust · slope_angle
+ *
+ *     vx = v_launch · cos adjusted
+ *     vy = -v_launch · sin adjusted
+ *
+ * The slope_adjust factor controls how much the robot leans —
+ * 0.5 to 1.0 typically. Too high and the robot jumps almost
+ * along the slope (boring); too low and it gets stuck in
+ * valleys.
+ *
+ * In FLAT mode, terrain is just a horizontal line; slope is
+ * always zero, launch angle never changes. In PERLIN mode,
+ * terrain comes from 1-D value noise — every reset can give
+ * a different landscape (with 'n' = new seed).
+ *
+ * Real-world animal jumpers do this instinctively: a frog on
+ * an incline jumps differently than on flat ground. Boston
+ * Dynamics' robots include explicit terrain-perception in
+ * their footstep planners.
+ *
+ * T6  SIDE-SCROLLING CAMERA — PIN THE ROBOT, SCROLL THE WORLD
+ * ──────────────────────────────────────────────────────────
+ * Without a camera, the robot would jump off the right edge
+ * of the screen and disappear. With a camera, the world
+ * scrolls past while the robot stays visible.
+ *
+ * Naive: cam_x = body_px - cols/2 (always centred). Jarring,
+ * because the robot then NEVER seems to move horizontally —
+ * the world moves underneath it.
+ *
+ * Better: TRIGGER-ZONE CAMERA. While the robot is in the LEFT
+ * 80% of the screen, camera doesn't move (cam_x = 0). Once
+ * body_px exceeds 80% of screen_width, the camera CHASES the
+ * robot to keep it pinned at the trigger column:
+ *
+ *     trigger_x = world_x - 0.8 · screen_w
+ *     if cam_x < trigger_x:
+ *       cam_x = lerp(cam_x, trigger_x, EXP_CHASE_RATE · dt)
+ *
+ * Result:
+ *   - Early jumps: world is fixed, robot visibly moves right.
+ *   - At 80%: camera engages, robot stays in same column,
+ *     terrain scrolls in from the right.
+ *
+ * Exponential lerp gives a SMOOTH catch-up rather than an
+ * instantaneous snap. Standard side-scroller pattern (Mario,
+ * etc.).
+ *
+ * Same lerp pattern is used everywhere "follow the player but
+ * smoothly":
+ *   - 3rd-person camera in 3D games
+ *   - actual_target tracking in ik_tentacle_seek (T5 there)
+ *   - mouse-cursor following in UI
+ *
+ * Decision tree for camera behaviours:
+ *
+ *   character moves through fixed world?
+ *     → trigger-zone scroll (this file)
+ *
+ *   character is the centre of attention?
+ *     → centred camera, world scrolls
+ *
+ *   character interacts with map landmarks?
+ *     → cinematic / context-aware (more complex)
+ *
+ * For procedural-terrain endless-jumper simulations, trigger-
+ * zone is the clean answer.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

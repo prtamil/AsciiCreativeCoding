@@ -355,6 +355,314 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. Read animation/fk_helloworld.c (FK) and
+ *      animation/ik_helloworld.c (IK) first if 2-link kinematics
+ *      are new — this file uses BOTH alternately.
+ *      Read robots/diff_drive_robot.c first if pose integration
+ *      (px, py, theta) is new.
+ *   2. §5 robot — THE HEART of this file. Sub-sections:
+ *        - gait math + phase advance        ← T2 below
+ *        - swing-leg FK (T3 below)
+ *        - stance-leg IK (T4 below)
+ *        - foot-lock at touchdown (T5 below)
+ *        - body bob + sway (T6 below)
+ *      Read AFTER tutorials T1-T6.
+ *   3. §6 render — painter's order draw of stick figure.
+ *   4. §1-§4, §7-§8 — config / clock / colour / coords / screen /
+ *      app loop. Skim if seen.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   phase                   master clock for the gait, radians.
+ *                           Advances at 2π · walk_freq · direction
+ *                           per second.
+ *   walk_freq               strides per second.
+ *   direction               +1 (forward) or -1 (reverse). Flips on
+ *                           'r' key. Reverses phase advance.
+ *   x                       body x-position in pixel space (the
+ *                           hip's horizontal position).
+ *   ground_y                world Y of the ground line (constant
+ *                           per resize).
+ *   base_hip_y              ground_y minus standing leg height —
+ *                           where the hip sits at rest pose.
+ *   foot_lock[i]            world position of foot i when planted.
+ *                           Frozen at touch-down; thawed at toe-off.
+ *   on_ground[i]            bool — is foot i currently planted?
+ *   SWING_AMP, LIFT_AMP     thigh sweep + knee bend amplitudes
+ *                           during swing (radians).
+ *   BOB_AMP, SWAY_AMP       body vertical / lateral motion
+ *                           amplitudes (pixels).
+ *   ARM_SWING               arm angular amplitude (radians).
+ *
+ * Background you need
+ * ───────────────────
+ *   - 2-link FK (fk_helloworld T2-T3) — angles → joint positions.
+ *   - 2-link IK (ik_helloworld T3-T5) — law of cosines.
+ *   - diff_drive_robot T2 — Euler integration of pose.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Real biomechanical gait analysis (zero-moment point, capture
+ *     point control). The gait is purely OPEN-LOOP procedural; no
+ *     stability feedback.
+ *   - Centre-of-mass dynamics. The body is rigidly procedural —
+ *     it doesn't fall.
+ *   - Inverse dynamics (forces / torques). Pure kinematics.
+ *   - Reinforcement learning policies. Hand-crafted gait.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a sinusoidal-gait bipedal walker
+ * from first principles.
+ *
+ *   T1  Walking is alternating swing + stance — half each
+ *   T2  The phase clock — one float drives every joint
+ *   T3  Swing leg via FK — angles in, foot position out
+ *   T4  Stance leg via IK — foot pinned, knee solved
+ *   T5  Foot lock at touchdown — the FK→IK handoff
+ *   T6  Body motion — bob (2×) and sway (1×) per stride
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WALKING IS ALTERNATING SWING + STANCE — HALF EACH
+ * ─────────────────────────────────────────────────────
+ * A walking cycle has two PHASES per leg:
+ *
+ *   SWING    foot in air, leg moving forward.
+ *            Half the cycle. Foot WILL land.
+ *
+ *   STANCE   foot on ground, body moving over it.
+ *            Half the cycle. Foot DOES NOT MOVE in world space.
+ *
+ * The two legs are 180° OUT OF PHASE: when one is mid-swing,
+ * the other is mid-stance. At every moment, AT LEAST ONE leg
+ * is on the ground — that's why a walking biped doesn't fall.
+ *
+ * Each leg gets a phase variable φ_leg:
+ *
+ *     phi_left  = phase + 0
+ *     phi_right = phase + π
+ *
+ *     if sin(φ_leg) > 0:    leg is in SWING (in air)
+ *     if sin(φ_leg) ≤ 0:    leg is in STANCE (planted)
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │  φ:    0      π/2      π      3π/2      2π       │
+ *      │       ┌── SWING ──┐ ┌── STANCE ──┐               │
+ *      │  L:   start ↑  apex  land  ─body crosses─        │
+ *      │                                                  │
+ *      │       ┌── STANCE ──┐ ┌── SWING ──┐               │
+ *      │  R:   ─body crosses─ start  apex  land           │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * The two phases use DIFFERENT MATH:
+ *
+ *   - SWING leg: FK (T3) — given hip and joint angles, compute
+ *     foot position.
+ *   - STANCE leg: IK (T4) — given hip and pinned foot position,
+ *     compute the knee.
+ *
+ * T2  THE PHASE CLOCK — ONE FLOAT DRIVES EVERY JOINT
+ * ──────────────────────────────────────────────────
+ * The simulation owns ONE float: `phase`. Every joint position
+ * is derived from it.
+ *
+ *     phase += 2π · walk_freq · direction · dt
+ *
+ * walk_freq is strides per second (default 1.0); direction is
+ * ±1; dt is the frame timestep.
+ *
+ * From phase we derive (per leg):
+ *
+ *   phi_leg     = phase + (0 or π)              (T1)
+ *   thigh_angle = -SWING_AMP · cos(phi_leg)      (T3)
+ *   knee_bend   = LIFT_AMP · sin(phi_leg)        (T3, swing only)
+ *
+ * From phase we derive (body):
+ *
+ *   hip_y_offset  = BOB_AMP · sin(2 · phase)     (T6)
+ *   sway_x_offset = SWAY_AMP · cos(phase)        (T6)
+ *
+ * From phase we derive (arms):
+ *
+ *   left_arm  = ARM_SWING · sin(phase + π)       (anti-phase L leg)
+ *   right_arm = ARM_SWING · sin(phase + 0)       (anti-phase R leg)
+ *
+ * Every animated quantity is a closed-form function of phase.
+ * Pause the simulation (don't advance phase) and the robot
+ * freezes mid-stride.
+ *
+ * Same pattern as fk_tentacle_forest.c (one wave_time drives
+ * every tentacle) and matrix_rain.c (one head_y per stream).
+ * Stateless animation = simulation owns minimum state, derives
+ * everything else.
+ *
+ * T3  SWING LEG VIA FK — ANGLES IN, FOOT POSITION OUT
+ * ───────────────────────────────────────────────────
+ * During swing, the leg is in the air. We choose its joint
+ * angles smoothly as functions of phi_leg, then compute joint
+ * positions via FK.
+ *
+ * Two joint angles:
+ *
+ *   thigh_angle = -SWING_AMP · cos(phi_leg)
+ *
+ *     φ=0    : -SWING_AMP (leg pointing BACK — toe-off)
+ *     φ=π/2  : 0          (vertical, mid-swing)
+ *     φ=π    : +SWING_AMP (leg pointing FORWARD — landing)
+ *
+ *     The thigh sweeps from back to forward across the swing
+ *     half-cycle.
+ *
+ *   knee_bend = LIFT_AMP · sin(phi_leg)         (radians)
+ *
+ *     φ=0    : 0      (knee straight at toe-off)
+ *     φ=π/2  : +LIFT  (knee maximally bent at apex)
+ *     φ=π    : 0      (knee straight at landing)
+ *
+ *     The knee bends to lift the foot over the ground, then
+ *     straightens for landing.
+ *
+ * Forward kinematics (from fk_helloworld T3) gives joint
+ * positions:
+ *
+ *     hip = body_position + leg_local_offset
+ *     knee = hip + thigh_length · (cos thigh_angle,
+ *                                  sin thigh_angle)
+ *     foot = knee + shin_length · (cos (thigh_angle + π/2 − knee_bend),
+ *                                  sin (thigh_angle + π/2 − knee_bend))
+ *
+ * Three lines of FK, twice per leg per frame. Each frame the
+ * positions are RECOMPUTED from scratch — no per-frame state
+ * needs to be remembered.
+ *
+ * T4  STANCE LEG VIA IK — FOOT PINNED, KNEE SOLVED
+ * ────────────────────────────────────────────────
+ * During stance, the foot is PLANTED on the ground (it doesn't
+ * move). The body moves OVER it. The knee position is the
+ * unknown that satisfies:
+ *
+ *     |hip - knee| = thigh_length
+ *     |knee - foot| = shin_length
+ *
+ * That's the same triangle problem as ik_helloworld.c (T3-T5).
+ * Three sides known (thigh_len, shin_len, distance from hip
+ * to foot), find the third corner. Law of cosines:
+ *
+ *     d = |hip - foot|
+ *     cos α = (thigh_len² + d² - shin_len²) / (2 · thigh_len · d)
+ *     α = acos(...)
+ *     phi = atan2(foot.y - hip.y, foot.x - hip.x)
+ *     knee_angle = phi - side · α          (side = +1 forward)
+ *     knee = hip + thigh_len · (cos knee_angle, sin knee_angle)
+ *
+ * Result: as the body advances (and the hip moves forward over
+ * the foot), the knee position is RECOMPUTED via IK to keep
+ * the leg lengths exact and the foot pinned.
+ *
+ * Without IK, you'd have to manually choreograph the knee
+ * position through stance — error-prone and stiff. IK makes
+ * the stance leg motion AUTOMATIC: once you know the foot is
+ * locked and the hip is moving, the knee falls out.
+ *
+ * T5  FOOT LOCK AT TOUCHDOWN — THE FK→IK HANDOFF
+ * ──────────────────────────────────────────────
+ * The transition from swing (FK) to stance (IK) requires a
+ * MOMENT to capture WHERE the foot lands.
+ *
+ * At the moment of touchdown (sin(phi_leg) crosses from
+ * positive to non-positive), record the foot's CURRENT FK
+ * position as the locked stance position:
+ *
+ *     for each leg:
+ *       was_in_air = on_ground[leg] == false
+ *       in_air     = sin(phi_leg) > 0
+ *
+ *       if was_in_air and not in_air:
+ *         // touchdown
+ *         foot_lock[leg] = foot_position_from_FK
+ *         on_ground[leg] = true
+ *
+ *       if not was_in_air and in_air:
+ *         // toe-off
+ *         on_ground[leg] = false
+ *         (foot_lock no longer used)
+ *
+ * From touchdown until next toe-off, the IK uses
+ * foot_lock[leg] as the foot position; the FK that ran during
+ * swing is paused.
+ *
+ * Why this matters: a real walker's foot LANDS somewhere; the
+ * body then advances RELATIVE to that planted foot. Without
+ * the lock, a stance-leg foot would slide along with the body,
+ * which looks like ICE-SKATING — a common bug in cheap
+ * walking animations.
+ *
+ * Verification: in this file's HUD, watch the foot count when
+ * it lands — it changes from '*' (swing) to '#' (planted) at
+ * the same world coordinate, frame after frame, until toe-off.
+ *
+ * T6  BODY MOTION — BOB (2×) AND SWAY (1×) PER STRIDE
+ * ───────────────────────────────────────────────────
+ * The body itself MOVES during walking — not just the legs.
+ * Two motions, both purely cosmetic:
+ *
+ *   BOB (vertical bobbing):
+ *
+ *     hip_y += BOB_AMP · sin(2 · phase)
+ *
+ *     2× per stride. The body rises at toe-off (when the
+ *     stance leg is vertical and PUSHING UP) and dips at
+ *     heel-strike (when the swing leg lands and momentarily
+ *     compresses).
+ *
+ *   SWAY (lateral leaning):
+ *
+ *     hip_x += SWAY_AMP · cos(phase)
+ *
+ *     1× per stride. The body leans LEFT when the LEFT foot
+ *     is planted and RIGHT when the RIGHT foot is planted —
+ *     mimicking real human gait where the torso shifts over
+ *     the supporting leg.
+ *
+ * Without bob and sway, the robot looks STIFF (head glides
+ * along a constant line). Adding them makes the silhouette
+ * recognisably human.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │   Without bob/sway:   With bob/sway:             │
+ *      │                                                  │
+ *      │   O O O O O O          O   O                     │
+ *      │                       O O O O O O                │
+ *      │   robotic glide       human walk                 │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Arms swing in COUNTER-PHASE to the legs:
+ *
+ *     left_arm_angle  = ARM_SWING · sin(phase + π)
+ *     right_arm_angle = ARM_SWING · sin(phase + 0)
+ *
+ * Notice left arm is 180° behind left leg phase. Why?
+ * Because real humans counter-rotate arms vs legs to balance
+ * angular momentum — when the left leg swings forward, the
+ * left arm swings backward. We don't simulate angular
+ * momentum, but we mimic the geometry for the visual.
+ *
+ * All these "extras" (bob, sway, arm counter-swing) are pure
+ * COSMETIC LAYERS over the gait clock. They cost nothing in
+ * complexity and add a lot in visual realism.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

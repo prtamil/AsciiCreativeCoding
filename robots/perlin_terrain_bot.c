@@ -395,6 +395,333 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. This is the MOST CONTROL-THEORY-HEAVY file in
+ *      robots/. Read robots/diff_drive_robot.c first for pose +
+ *      command-ramping basics. Read NO other file for the inverted
+ *      pendulum, PID, or cart-pole — this file is the canonical
+ *      treatment in the project.
+ *   2. §6 bot — THE HEART. Sub-sections in order:
+ *        - cart-pole physics    ← inverted pendulum equations (T2)
+ *        - PID controller       ← three-term feedback (T3)
+ *        - tick                 ← integrator + sub-stepping (T6)
+ *      Read AFTER tutorials T1-T6 below.
+ *   3. §5 terrain — Perlin noise + slope sampling (T5).
+ *   4. §7 render — three view modes (TELEMETRY / EQUATIONS / PHASE).
+ *   5. §1-§4, §8-§9 — config / clock / colour / noise / screen /
+ *      app loop. Skim if seen.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   theta              body lean angle from vertical (rad). 0 =
+ *                      perfectly upright; positive = leaning right.
+ *   omega              angular velocity = dθ/dt.
+ *   theta_eff          theta + terrain slope α. The "effective"
+ *                      lean from gravity's perspective.
+ *   theta_ref          PID setpoint. Usually 0 (upright) but
+ *                      shifts with terrain slope (T5).
+ *   error              theta - theta_ref (signed PID input).
+ *   integral           accumulated integral term ∫e dt.
+ *   prev_error         previous error (for derivative term).
+ *   F                  motor force on the cart, computed by PID.
+ *   x_acc              horizontal acceleration of cart.
+ *   M_eff              effective inertia (M_cart + m_pole·sin²θ).
+ *   Kp, Ki, Kd         PID gains.
+ *   drive_spd          forward drive speed (px/sec).
+ *   world_x            cumulative position along terrain.
+ *   alpha              terrain slope at current world_x (rad).
+ *   TICK_DT_TARGET     max physics substep size (1/120 sec).
+ *
+ * Background you need
+ * ───────────────────
+ *   - diff_drive_robot T2 (Euler integration of pose).
+ *   - Newton's second law, gravity as constant downward
+ *     acceleration.
+ *   - Trig: sin / cos of small angles.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Lagrangian / Hamiltonian mechanics. The cart-pole
+ *     equations are presented; we don't derive them from
+ *     first principles.
+ *   - Optimal control (LQR, MPC). PID is a much simpler
+ *     special case.
+ *   - State-space / pole placement. PID is "transfer-function
+ *     control" — works without ever writing down a state-space
+ *     model.
+ *   - Real-time embedded programming. Single-threaded soft
+ *     real-time at 60 fps is plenty.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a self-balancing inverted pendulum
+ * robot from first principles.
+ *
+ *   T1  The inverted pendulum problem — instability of upright
+ *   T2  Cart-pole coupling — push the BASE to correct the TOP
+ *   T3  PID control — three terms that keep the body upright
+ *   T4  Tuning the gains — Kp, Ki, Kd in isolation
+ *   T5  Terrain feed-forward — leaning into the hill
+ *   T6  Sub-stepping — keeping the integrator stable
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE INVERTED PENDULUM PROBLEM — INSTABILITY OF UPRIGHT
+ * ──────────────────────────────────────────────────────────
+ * A pendulum hanging DOWN is naturally STABLE. Disturb it and
+ * gravity pulls it back to vertical.
+ *
+ * A pendulum balanced UPRIGHT is naturally UNSTABLE. Disturb
+ * it and gravity AMPLIFIES the disturbance — the angle grows
+ * exponentially.
+ *
+ * Math: for a pendulum of length L, gravity g, the angular
+ * acceleration is:
+ *
+ *     θ̈ = (g / L) · sin θ          ← pendulum
+ *
+ * For an INVERTED pendulum (gravity tipping it AWAY from
+ * vertical):
+ *
+ *     θ̈ = (g / L) · sin θ          ← inverted pendulum (same form!)
+ *
+ * Wait, same equation? Yes. The difference is the MEANING of θ:
+ *
+ *   - Hanging pendulum:  θ = 0 means pointing DOWN; restoring.
+ *   - Inverted pendulum: θ = 0 means pointing UP; destabilising.
+ *
+ * For small θ near 0 (upright):
+ *
+ *     θ̈ ≈ (g / L) · θ              ← exponential growth
+ *
+ * Solution: θ(t) = θ_0 · e^(√(g/L) · t)
+ *
+ * For our defaults (g = 32, L = 1.5), the time constant is
+ * √(g/L) = √21.3 ≈ 4.6 rad/sec. A 1° initial lean grows to
+ * 90° in less than a second. Without control, the bot falls
+ * almost instantly.
+ *
+ * Real-world examples:
+ *   - Broom on your palm (T2 analogy)
+ *   - Segway / Ninebot (this file's exact problem)
+ *   - SpaceX Falcon 9 booster landing (3-D version)
+ *   - Bipedal humanoid robots while standing
+ *
+ * The interesting question: HOW do you stabilise an unstable
+ * system? T2 + T3.
+ *
+ * T2  CART-POLE COUPLING — PUSH THE BASE TO CORRECT THE TOP
+ * ─────────────────────────────────────────────────────────
+ * The pendulum is mounted on a CART (the wheel axle here).
+ * The cart can be pushed left or right with motor force F.
+ *
+ * KEY INSIGHT: pushing the CART has an OPPOSITE effect on the
+ * POLE's lean. If the pole leans right and you push the cart
+ * RIGHT, the pole's TOP gets "left behind" by the
+ * acceleration and rotates toward vertical.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   Initial lean       Cart pushed right           │
+ *      │                                                  │
+ *      │      *  ↘             *  ← top "left behind"     │
+ *      │      |                |  → rotates back toward   │
+ *      │      |                |    vertical              │
+ *      │     [O O]→           [O O] ← cart moved          │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * The cart-pole equations (from Lagrangian mechanics, but you
+ * can take them on faith):
+ *
+ *     M_eff = M_cart + m_pole · sin² θ
+ *     ẍ = (F + m_pole · sin θ · (L · ω² − g · cos θ)) / M_eff
+ *     θ̈ = (g · sin θ − ẍ · cos θ) / L
+ *
+ * Note θ̈ depends on ẍ (cart acceleration). That's the
+ * COUPLING. By choosing F (motor force), we control ẍ, which
+ * controls θ̈.
+ *
+ * The controller's job: choose F SO THAT θ stays near 0.
+ *
+ * T3  PID CONTROL — THREE TERMS THAT KEEP THE BODY UPRIGHT
+ * ────────────────────────────────────────────────────────
+ * PID stands for PROPORTIONAL + INTEGRAL + DERIVATIVE. Three
+ * terms summed:
+ *
+ *     error = theta - theta_ref
+ *     integral += error · dt
+ *     derivative = (error - prev_error) / dt
+ *
+ *     F = Kp · error + Ki · integral + Kd · derivative
+ *
+ *     prev_error = error
+ *
+ * Each term has a distinct role:
+ *
+ *   PROPORTIONAL (P)
+ *     F responds to current lean. If the bot leans 0.1 rad
+ *     right, P pushes the cart with force Kp · 0.1.
+ *     Higher Kp → snappier response but tendency to overshoot.
+ *
+ *   INTEGRAL (I)
+ *     F accumulates integrated error over time. If a constant
+ *     bias (terrain slope, motor offset) keeps the bot
+ *     leaning slightly, P alone reaches a steady-state error;
+ *     I notices the persistent error and drives it to zero.
+ *
+ *   DERIVATIVE (D)
+ *     F responds to RATE of error change. If lean is small but
+ *     INCREASING fast, D acts as damping — pushes harder
+ *     before the lean grows. Critical for stability.
+ *
+ * The output F is then APPLIED to the cart as motor force,
+ * which becomes ẍ via the cart-pole equations (T2), which
+ * affects θ̈, which (over time) reduces the error.
+ *
+ * Together: P pushes proportional to current state, I removes
+ * persistent biases, D damps rapid changes. Three knobs;
+ * tuning them is an art (T4).
+ *
+ * PID is the WORKHORSE of industrial control. Cars
+ * (cruise control), ovens (temperature), robots (joint
+ * angles), HVAC, drones — almost everything that has a
+ * setpoint and feedback uses PID or a close variant.
+ *
+ * T4  TUNING THE GAINS — Kp, Ki, Kd IN ISOLATION
+ * ──────────────────────────────────────────────
+ * The 'g' key cycles four GAIN PRESETS. Watch each carefully:
+ *
+ *   BALANCED          all three gains tuned. Bot stays upright
+ *                     across slopes. The default.
+ *
+ *   HIGH-Kp           huge proportional term, no I, no D.
+ *                     Bot oscillates wildly — overshoots in
+ *                     each direction. Pure P creates a
+ *                     pendulum-like ringing.
+ *
+ *   NO-Kd             P + I but no derivative. No damping.
+ *                     Bot oscillates with growing amplitude;
+ *                     usually falls within seconds. Why D
+ *                     matters.
+ *
+ *   NO-Ki             P + D but no integral. Bot maintains
+ *                     a steady-state lean (especially on
+ *                     slopes). Slope feed-forward partly
+ *                     compensates but I is still needed for
+ *                     residual bias.
+ *
+ * General tuning recipe (Ziegler-Nichols, simplified):
+ *
+ *     1. Start with all gains at zero.
+ *     2. Slowly increase Kp until the system OSCILLATES
+ *        (just barely). Call this Kp_crit.
+ *     3. Set Kp = 0.6 · Kp_crit, Kd = Kp · period / 8,
+ *        Ki = Kp / period.
+ *
+ * Real engineers use SIMULATION + TUNING TOOLS (MATLAB,
+ * model-predictive optimisation). For this file the gains
+ * were hand-tuned by trial and error.
+ *
+ * 'p' key TOGGLES the entire PID off — watch the bot fall.
+ * Confirms it's the controller doing the work, not magic.
+ *
+ * T5  TERRAIN FEED-FORWARD — LEANING INTO THE HILL
+ * ────────────────────────────────────────────────
+ * On flat ground, the bot wants to be vertical (θ_ref = 0).
+ *
+ * On a SLOPE, vertical is the WRONG target. The terrain
+ * pushes the bot's wheels along the slope; the body needs to
+ * lean INTO the hill to stay aligned with the gravitational
+ * vertical, not the local-up-of-the-chassis.
+ *
+ * Solution: shift the SETPOINT by the terrain slope α:
+ *
+ *     theta_ref = -SLOPE_FEED · α
+ *
+ * SLOPE_FEED is a tuning constant (~1.0 means the bot leans
+ * exactly with the slope; <1 less responsive; >1 over-leans).
+ *
+ * Now the PID's error becomes:
+ *
+ *     error = theta - theta_ref
+ *           = theta - (-SLOPE_FEED · α)
+ *           = theta + SLOPE_FEED · α
+ *
+ * On flat ground (α = 0), this reduces to the standard
+ * "lean = error". On a slope, the controller's reference
+ * shifts — it WANTS the bot to lean with the slope, so the
+ * lean is "expected" rather than treated as error.
+ *
+ * This is FEED-FORWARD CONTROL — using known information
+ * (terrain slope from sensor / map) to anticipate the
+ * disturbance instead of reacting to it after it shows up
+ * in the error. Common in precision robotics: factor out
+ * predictable disturbances so the feedback only handles the
+ * unpredictable residual.
+ *
+ * Without slope feed-forward, the integral term eventually
+ * compensates for slope-induced lean — but slowly, and with
+ * lag. The feed-forward makes slope-handling INSTANTANEOUS.
+ *
+ * T6  SUB-STEPPING — KEEPING THE INTEGRATOR STABLE
+ * ────────────────────────────────────────────────
+ * The cart-pole physics is STIFF — the time constant is
+ * ~0.2 sec. Forward Euler with a 1/60 sec timestep is OK on
+ * flat ground, but at fast drive speed and sharp slopes it
+ * can BLOW UP — θ overshoots wildly between integration
+ * steps and the controller can't catch up.
+ *
+ * Solution: SUB-STEPPING. Each frame's dt is divided into
+ * smaller substeps:
+ *
+ *     n_substeps = max(1, ceil(dt / TICK_DT_TARGET))
+ *     sub_dt = dt / n_substeps
+ *
+ *     for _ in n_substeps:
+ *       compute_error_and_F(sub_dt)
+ *       integrate_cart_pole(sub_dt)
+ *
+ * TICK_DT_TARGET = 1/120 sec; a 60 fps frame would split
+ * into 2 substeps; a 30 fps frame into 4.
+ *
+ * Each substep is a SHORTER, more accurate Euler step. The
+ * controller and physics both run at the smaller timestep,
+ * so feedback is tight even when the renderer is slow.
+ *
+ * Cost: 2-4× more PID + integration calls per frame. At
+ * O(20) ops per substep that's nothing.
+ *
+ * Why TICK_DT_TARGET = 1/120? It's slightly under the time
+ * constant of the closed-loop system (controller + physics).
+ * Standard rule: SAMPLE AT LEAST 5× FASTER than the system's
+ * natural frequency. Our balance ringing is ~3-5 Hz, so we
+ * need ≥ 25 Hz sampling — 120 Hz is comfortable margin.
+ *
+ * Same sub-stepping pattern is used in any STIFF physics
+ * simulator: cloth (Verlet with iterations), constraint
+ * solvers (Jakobsen), spring-mass chains. Whenever the
+ * dynamics are faster than the renderer, split dt.
+ *
+ * Decision tree for "is sub-stepping needed?":
+ *
+ *   non-stiff sim (matrix_rain, FK creatures)     → no
+ *   stiff but cheap (springs, ragdoll)            → fixed-step
+ *                                                    accumulator
+ *   STIFF + complex (cart-pole, Verlet cloth)     → sub-stepping
+ *                                                    (this file)
+ *
+ * For balance + procedural terrain, sub-stepping is the
+ * cheapest defence.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

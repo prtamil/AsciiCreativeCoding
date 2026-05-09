@@ -336,6 +336,271 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose. This is the FOUNDATIONAL robotics file in the
+ *      project — read it first if robotics kinematics are new.
+ *      walking_robot, moving_jump_spring_leg_robot, perlin_terrain_bot
+ *      all assume you understand pose (px, py, theta) integration.
+ *   2. §6 robot — THE HEART of this file. Forward kinematics +
+ *      inverse kinematics + Euler integration. Read AFTER tutorials
+ *      T1-T5 below.
+ *   3. §7 scene — input → command translation. The keyboard handler
+ *      converts presses into commanded (v_cmd, w_cmd) which §6 then
+ *      turns into wheel speeds.
+ *   4. §8 render — painter's-order draw with trail, wheel arrows,
+ *      heading arrow, and labels.
+ *   5. §1-§5, §9-§10 — config / clock / colour / coords / trail /
+ *      screen / app loop. Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   px, py            body position in pixel space (Vec2 floats).
+ *   theta             body heading in radians (0 = +X, π/2 = +Y).
+ *   vL, vR            wheel speeds — pixels per second, signed
+ *                     (negative = reverse).
+ *   v                 body speed = (vL + vR) / 2.
+ *   omega             body angular velocity = (vR - vL) / axle.
+ *   axle              constant distance between wheel centres.
+ *   v_cmd, w_cmd      USER COMMANDS — what the user wants. Differ
+ *                     from (v, omega) by an exponential ramp.
+ *   V_MAX, W_MAX      command saturation limits.
+ *   V_RATE, W_RATE    ramp rates — how fast cmds change per second.
+ *   ICC               instantaneous centre of curvature (T3 below).
+ *
+ * Background you need
+ * ───────────────────
+ *   - Vec2 / scalar arithmetic.
+ *   - Trig: (cos θ, sin θ) is the unit vector at angle θ.
+ *   - Variable-timestep main loop (CLAUDE.md §Architecture).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Lagrangian mechanics. Diff-drive kinematics are PURE
+ *     KINEMATICS (geometry of motion); no forces / torques /
+ *     mass involved.
+ *   - Wheel slip, friction modelling. We assume PURE ROLLING
+ *     (lateral velocity always zero — T4 below).
+ *   - Path planning (A*, RRT). The user drives directly with
+ *     keys; no planner.
+ *   - Sensor models, SLAM. No sensors here.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a differential-drive robot from
+ * first principles.
+ *
+ *   T1  Two wheels, no steering — what "differential" means
+ *   T2  Forward kinematics — wheels in, body motion out
+ *   T3  Inverse kinematics — body command in, wheels out
+ *   T4  The nonholonomic constraint — why robots can't slide sideways
+ *   T5  Command ramping — separating WANT from CAN
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  TWO WHEELS, NO STEERING — WHAT "DIFFERENTIAL" MEANS
+ * ───────────────────────────────────────────────────────
+ * A car has FOUR wheels and a STEERING WHEEL. The steering
+ * wheel turns the front wheels left/right relative to the body;
+ * gas controls all four wheels' rotational speed equally.
+ *
+ * A differential-drive robot has TWO WHEELS, no steering. Each
+ * wheel can be controlled INDEPENDENTLY. Steering is purely
+ * the result of running the wheels at different speeds.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │  vL = vR        →   straight                     │
+ *      │  vL > vR        →   turn right                   │
+ *      │  vL < vR        →   turn left                    │
+ *      │  vL = -vR       →   spin in place                │
+ *      │  vL = 0, vR > 0 →   pivot around left wheel      │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * "Differential" = "the difference between vR and vL is what
+ * causes turning." NOT "differential gear" (which is a
+ * mechanical part of cars). The naming is an unfortunate
+ * collision.
+ *
+ * Real-world examples:
+ *   - Roomba: two driven wheels + caster wheels for stability.
+ *   - Tank-style RC toys: same principle scaled up with treads.
+ *   - Power wheelchair: joystick input → independent wheel
+ *     speeds.
+ *   - Many small lab robots: simple, cheap, agile.
+ *
+ * Two wheels are SIMPLER to control than four (no steering
+ * mechanics) and ROOM-EFFICIENT (small turn radius — can spin
+ * in place). They lose to cars on rough terrain (wheels can
+ * slip on uneven ground) but win in flat indoor environments.
+ *
+ * T2  FORWARD KINEMATICS — WHEELS IN, BODY MOTION OUT
+ * ───────────────────────────────────────────────────
+ * Given vL and vR (current wheel speeds), how does the body
+ * move?
+ *
+ * Two scalars come out:
+ *
+ *     v     = (vL + vR) / 2          ← linear speed of body centre
+ *     omega = (vR - vL) / axle        ← angular speed of body
+ *
+ * Why these formulas? Treat each wheel as a point at distance
+ * axle/2 from the body centre. The body's centre moves at the
+ * AVERAGE of the two wheel velocities. The body's rotation
+ * rate is the DIFFERENCE between the wheel velocities, divided
+ * by the perpendicular distance separating them (= axle).
+ *
+ * Then standard rigid-body integration:
+ *
+ *     px += v · cos(theta) · dt
+ *     py += v · sin(theta) · dt
+ *     theta += omega · dt
+ *
+ * "Walk forward by v·dt in the direction theta points; rotate
+ * by omega·dt." Three lines, the entire integrator.
+ *
+ * Note: this is FORWARD EULER integration. For high speeds or
+ * tight turns it can drift slightly; production robotics uses
+ * RUNGE-KUTTA or exact arc integration. At our terminal frame
+ * rates the drift is invisible.
+ *
+ * T3  INVERSE KINEMATICS — BODY COMMAND IN, WHEELS OUT
+ * ────────────────────────────────────────────────────
+ * The user thinks in BODY COMMANDS: "go forward at speed v,
+ * turn right at rate omega." NOT in wheel speeds.
+ *
+ * Inverse kinematics: given (v, omega), what (vL, vR) achieve
+ * them? Solve T2's two equations for vL, vR:
+ *
+ *     v     = (vL + vR) / 2          →   vL + vR = 2v
+ *     omega = (vR - vL) / axle       →   vR - vL = omega · axle
+ *
+ *     vL = v - omega · axle / 2
+ *     vR = v + omega · axle / 2
+ *
+ * This is THE SECOND HALF of the loop. The user's input gives
+ * (v_cmd, w_cmd); inverse kinematics turns those into wheel
+ * speeds (vL, vR); forward kinematics integrates wheel speeds
+ * into the new pose.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   user input        commanded     wheel       new pose │
+ *      │   (keys)        →   (v, omega) →  speeds   →   (px, py, θ) │
+ *      │                                                  │
+ *      │                     INVERSE KIN     FORWARD KIN  │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Both directions are TRIVIAL ALGEBRA — no iterative solver,
+ * no matrix inversion. That's why diff drive is the simplest
+ * mobile-robot kinematic model and a good first lesson.
+ *
+ * ICC — INSTANTANEOUS CENTRE OF CURVATURE
+ * ────────────────────────────────────────
+ * When omega ≠ 0, the body follows a circular arc. The centre
+ * of that circle (the "ICC") lies on the EXTENSION of the axle
+ * line, at distance R from the body centre:
+ *
+ *     R = v / omega
+ *
+ *     R > 0   →   ICC is on the LEFT of the body
+ *     R < 0   →   ICC is on the RIGHT
+ *     R = 0   →   ICC is AT THE BODY CENTRE → spin in place
+ *     R = ∞   →   no ICC → straight line
+ *
+ * The CLOSER WHEEL to the ICC moves slower (it's tracing a
+ * smaller circle); the FARTHER wheel moves faster. For pivot
+ * (vL = 0, vR > 0), ICC sits at the LEFT WHEEL — that wheel
+ * is stationary, the right wheel sweeps the arc.
+ *
+ * T4  THE NONHOLONOMIC CONSTRAINT — WHY ROBOTS CAN'T SLIDE SIDEWAYS
+ * ─────────────────────────────────────────────────────────────────
+ * Wheels ROLL — they don't slide laterally. The body of a
+ * differential-drive robot can ONLY MOVE IN THE DIRECTION ITS
+ * WHEELS ARE POINTING. It cannot translate sideways without
+ * first rotating to face that direction.
+ *
+ * Mathematically:
+ *
+ *     ẋ · sin θ  −  ẏ · cos θ  =  0        (lateral velocity = 0)
+ *
+ * "The component of velocity perpendicular to the heading is
+ * always zero." This is automatic given our forward kinematics:
+ *
+ *     ẋ = v · cos θ
+ *     ẏ = v · sin θ
+ *
+ * Substituting: v · cos θ · sin θ − v · sin θ · cos θ = 0. ✓
+ *
+ * This constraint is called NONHOLONOMIC. Practical
+ * consequences:
+ *
+ *   - Parallel parking is hard. To shift a car body sideways
+ *     by 1 metre, you need a sequence of forward + reverse +
+ *     turn + forward arcs. There's no "side-step" command.
+ *
+ *   - Path planning is harder than for omnidirectional robots.
+ *     The set of reachable poses from a given start grows
+ *     more slowly because of the heading constraint.
+ *
+ *   - In simulation, you DON'T NEED to enforce the constraint
+ *     explicitly — it falls out of the forward kinematics.
+ *
+ * Compare to OMNIDIRECTIONAL robots (mecanum wheels, omni
+ * wheels, holonomic platforms): they CAN slide in any
+ * direction independent of heading. Their kinematics have an
+ * additional vy term not aligned with theta. Easier to plan,
+ * harder to build, more expensive.
+ *
+ * For 99% of indoor robotics, diff drive (nonholonomic) is the
+ * right answer.
+ *
+ * T5  COMMAND RAMPING — SEPARATING WANT FROM CAN
+ * ──────────────────────────────────────────────
+ * If the user pressed W and we instantly set v = V_MAX, the
+ * robot would JUMP to top speed and back to 0 when released.
+ * That's both unrealistic and visually jarring.
+ *
+ * The fix: separate the user's INTENDED COMMAND (`v_cmd`) from
+ * the actual current command. Each frame:
+ *
+ *     while W is held:
+ *       v_cmd += V_RATE · dt
+ *     while no throttle key:
+ *       v_cmd ramps toward 0 with exponential decay
+ *     clamp v_cmd to [-V_MAX, V_MAX]
+ *
+ * Same for w_cmd with the A/D keys. The result: the robot
+ * SMOOTHLY ACCELERATES and SMOOTHLY DECELERATES. Press-and-
+ * hold ramps up; release coasts down.
+ *
+ * V_RATE, W_RATE, V_MAX, W_MAX are knobs:
+ *
+ *     V_MAX     fastest possible body speed
+ *     V_RATE    seconds to reach V_MAX from zero (lower = snappier)
+ *     W_MAX     fastest spin rate
+ *     W_RATE    seconds to reach W_MAX
+ *
+ * The "instant spin in place" keys (Z, E) bypass the ramp:
+ * they set v_cmd = 0 and w_cmd = ±W_MAX directly. Useful for
+ * quick rotations.
+ *
+ * Lesson: real control systems separate WANTED state from
+ * ACTUAL state, with rate limits between them. This is the
+ * minimum — production controllers add PID, model
+ * compensation, and acceleration profiling. But the basic
+ * pattern (cmd → ramped command → physics) is the same
+ * everywhere from car cruise control to drone autopilots.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI

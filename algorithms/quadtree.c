@@ -13,7 +13,7 @@
  *     then demonstrates a range query.  Press Enter each step.
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra geometry/quadtree.c -o quadtree
+ *   gcc -std=c11 -O2 -Wall -Wextra algorithms/quadtree.c -o quadtree
  *
  * Run:
  *   ./quadtree
@@ -70,15 +70,316 @@
  *   Range query: O(log N + k) average, k = points returned.
  *   Worst case (all points in same cell): O(N) for both.
  *
- * Reading order:
- *   1. QuadNode struct — leaf capacity, four children, boundary Rect.
- *   2. qt_subdivide   — how one leaf becomes four; trace on paper.
- *   3. qt_insert      — follow one insertion across three levels.
- *   4. qt_query       — trace the AABB pruning on the demo grid.
- *   5. draw_tree_grid — how grid borders map to the QuadNode hierarchy.
- *   6. main() PART 2  — predict each subdivision before pressing Enter.
+ * References    :
+ *   Finkel & Bentley, "Quad trees: a data structure for retrieval
+ *     on composite keys" (Acta Informatica 4, 1974).
+ *   Samet, "The design and analysis of spatial data structures"
+ *     (1990) — comprehensive textbook.
+ *   de Berg et al., "Computational Geometry" (3rd ed., 2008)
+ *     ch. 14.
  *
- * ─────────────────────────────────────────────────────────────────────────── */
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A QUADTREE recursively divides a 2-D region into FOUR EQUAL
+ * QUADRANTS (NW, NE, SW, SE) whenever a region holds more than
+ * LEAF_CAPACITY points.  Internal nodes hold NO data; every
+ * point lives in some leaf.  The tree adapts to the data:
+ * dense regions get subdivided many times, sparse regions
+ * stay as single leaves.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine an aerial photo divided into a 1×1 grid initially.
+ * If a tile contains more than 4 trees, subdivide it into 4
+ * sub-tiles (NW/NE/SW/SE quadrants).  Recursively subdivide
+ * any sub-tile that's still over capacity.  After enough
+ * subdivisions: every leaf tile holds at most 4 trees.  To
+ * answer "are there trees in this rectangle?" you walk only
+ * the tiles that overlap the rectangle — skipping whole
+ * branches over uninhabited areas.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │   ┌───────────────┬───────────────┐              │
+ *      │   │               │  ●        ●   │              │
+ *      │   │       ●       ├───────┬───────┤              │
+ *      │   │               │       │ ●  ●  │              │
+ *      │   │               │       │       │              │
+ *      │   ├───────┬───────┼───────┼───────┤              │
+ *      │   │       │       │   ●   │       │              │
+ *      │   │   ●   │       ├───┬───┤       │              │
+ *      │   │       │       │ ● │ ● │       │              │
+ *      │   │       │       │   │   │       │              │
+ *      │   └───────┴───────┴───┴───┴───────┘              │
+ *      │                                                  │
+ *      │   dense areas → many fine subdivisions          │
+ *      │   sparse areas → few coarse leaves              │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * QUADTREE vs OTHER SPATIAL TREES
+ * ───────────────────────────────
+ *   QUADTREE:  4 children per split, both axes at once;
+ *              SHALLOWER tree but more memory per internal
+ *              node.  Best for clustered data.
+ *
+ *   BSP TREE:  2 children, alternating axis, mid-point split.
+ *              See algorithms/bsp_tree.c.
+ *
+ *   KD-TREE:   2 children, alternating axis, data-point split,
+ *              data IN nodes.  See algorithms/kd_tree.c.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  INSERT(point P):
+ *    1. Start at root.  If P doesn't fall in root's rect,
+ *       reject.
+ *    2. While current node is INTERNAL:
+ *         determine which quadrant P falls in (NW/NE/SW/SE)
+ *         descend to that child
+ *    3. Now at a LEAF.  Append P to leaf.data.
+ *    4. If leaf.count > LEAF_CAPACITY:
+ *         compute four child rects (sub-quadrants of leaf)
+ *         create four child nodes
+ *         redistribute leaf.data into appropriate child
+ *         convert leaf → internal node
+ *
+ *  RANGE QUERY(rectangle R):
+ *    1. If current node's rect doesn't overlap R: return.
+ *    2. If LEAF: scan data; report points inside R.
+ *    3. Else (INTERNAL): recurse into all 4 children.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Quadrant of point P in rect (x, y, w, h):
+ *     mid_x = x + w/2;  mid_y = y + h/2
+ *     west  = (P.x <  mid_x);  east = !west
+ *     north = (P.y <  mid_y);  south = !north
+ *     quadrant = NW | NE | SW | SE
+ *
+ *   Half-open intervals (CRUCIAL):
+ *     each rect is [x, x+w) × [y, y+h) — UPPER BOUND EXCLUSIVE
+ *     so that the 4 sub-quadrants share NO POINTS at the
+ *     midpoint and together cover the parent exactly.
+ *
+ *   Bounding-box overlap:
+ *     R1 and R2 overlap iff:
+ *       R1.x_max ≥ R2.x_min AND R1.x_min ≤ R2.x_max
+ *       AND same for y
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • LEAF_CAPACITY too small: subdivisions cascade rapidly,
+ *     producing deep trees.  Default 4 = visible subdivisions
+ *     in the 12-point demo without huge depth.
+ *   • LEAF_CAPACITY too large: tree barely splits, queries
+ *     degrade toward O(N).
+ *   • All points coincident: a leaf can NEVER subdivide them
+ *     apart (they all go to same quadrant of any subdivision).
+ *     Need a maximum-depth limit OR just accept overflowing
+ *     leaves.  We pick the latter (simple).
+ *   • Point on midpoint exactly: half-open intervals route
+ *     it to the LOWER quadrant consistently.  No tie.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Insert 12 random points: tree depth ≈ 2-3 levels (a
+ *     few subdivisions visible).
+ *   • Range query: visually verify reported points are in R;
+ *     count matches HUD.
+ *   • Inserting in the same quadrant repeatedly produces
+ *     deeper splits in just that subtree.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *      algorithms/quad_tree_helloworld.c is the ANIMATED ncurses
+ *      sibling — same algorithm, different demo style.
+ *      algorithms/bsp_tree.c and algorithms/kd_tree.c are the
+ *      2-children alternatives.
+ *   2. PART 1: QuadNode struct + qt_subdivide + qt_insert +
+ *      qt_query.  THE LIBRARY.  Read AFTER tutorials T1-T4.
+ *   3. PART 2: main() with step-by-step demo.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   QuadNode                   one node — internal or leaf.
+ *   .rect                      bounding rect.  Half-open.
+ *   .children[4]               NW, NE, SW, SE pointers (NULL for
+ *                              leaf).
+ *   .data[], .count            leaf-only data array.
+ *   LEAF_CAPACITY = 4          subdivide threshold.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Recursion + tree pointer manipulation.
+ *   - Half-open intervals [a, b) — left inclusive, right
+ *     exclusive.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Octrees (3-D analogue).  Same idea with 8 children.
+ *   - Loose quadtrees, point-region quadtrees, etc.  Variants.
+ *   - Self-balancing.  Quadtrees adapt to data; balance is
+ *     emergent.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Four tutorials that build a 2-D quadtree from first principles.
+ *
+ *   T1  Why FOUR children — both axes at once
+ *   T2  Adaptive subdivision — leaf capacity drives depth
+ *   T3  Half-open intervals — the unambiguous-overlap trick
+ *   T4  Range query — pruning by overlap test
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHY FOUR CHILDREN — BOTH AXES AT ONCE
+ * ─────────────────────────────────────────
+ * BSP tree splits 2 ways (one axis); KD tree splits 2 ways
+ * (one axis); QUADTREE splits 4 ways (BOTH axes simultaneously).
+ *
+ * Geometric interpretation: a quadtree splits a square into
+ * its 4 SUB-QUADRANTS (NW, NE, SW, SE) — both axes cut
+ * SIMULTANEOUSLY at the midpoint.  After 1 level, the tree
+ * has 4 leaves.  After 2 levels, 16.  After d levels, 4^d.
+ *
+ * The corresponding BSP/KD tree at the same depth would have
+ * 2^d leaves — quadtrees are SHALLOWER for the same number
+ * of regions.
+ *
+ *   For storing 1M points uniformly distributed in 2-D:
+ *     Quadtree depth: log_4(1M) ≈ 10
+ *     BSP / KD depth: log_2(1M) ≈ 20
+ *
+ * Tradeoffs:
+ *   - Quadtree's shallow depth → faster recursion, less stack.
+ *   - But each internal node has 4 child pointers (more
+ *     memory than BSP/KD's 2).
+ *   - Quadtree fits when both axes are equally important and
+ *     data is roughly square-distributed.
+ *
+ * For HIGHLY ANISOTROPIC data (long thin strips along one
+ * axis), KD-tree's axis-alternation is better; the quadtree
+ * "wastes" half its splits on the unimportant axis.
+ *
+ * T2  ADAPTIVE SUBDIVISION — LEAF CAPACITY DRIVES DEPTH
+ * ─────────────────────────────────────────────────────
+ * The quadtree doesn't subdivide by a FIXED RULE — it adapts
+ * to the data.  A leaf subdivides only when it OVERFLOWS:
+ *
+ *     LEAF_CAPACITY = 4         # tunable
+ *
+ *     insert(P, leaf):
+ *       leaf.data.append(P)
+ *       if leaf.count > LEAF_CAPACITY:
+ *         subdivide(leaf)
+ *         redistribute leaf.data into the 4 new children
+ *
+ * This means:
+ *   - Empty regions stay as single leaves at any depth.
+ *   - Dense regions subdivide many times, fine-graining
+ *     wherever it matters.
+ *   - The TREE'S SHAPE matches the DATA'S SHAPE.
+ *
+ * Visualisation: insert 12 random points, watch some leaves
+ * subdivide while others stay coarse.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   sparse region:    dense region:                │
+ *      │   ┌─────────────┐    ┌──┬──┐                     │
+ *      │   │             │    │  │  │                     │
+ *      │   │      ●      │    ├──┼──┤                     │
+ *      │   │             │    │  │  │                     │
+ *      │   └─────────────┘    └──┴──┘                     │
+ *      │                                                  │
+ *      │   1 leaf, no split   2 levels of subdivision     │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * LEAF_CAPACITY tuning:
+ *   - Small (1, 2): tree is FINE-GRAINED, deep, more pointer
+ *     traversal but tighter pruning.
+ *   - Large (16, 32): tree is COARSE, shallow; queries may
+ *     scan more candidates per leaf but with less recursion.
+ *   - Optimum depends on data + query patterns.  Typical
+ *     production values: 4-16.
+ *
+ * T3  HALF-OPEN INTERVALS — THE UNAMBIGUOUS-OVERLAP TRICK
+ * ───────────────────────────────────────────────────────
+ * When subdividing a rect into 4 quadrants, what about a
+ * point exactly on the midpoint line?  Which quadrant gets
+ * it?
+ *
+ * Use HALF-OPEN INTERVALS: each rect represents
+ *
+ *     [x, x + w) × [y, y + h)
+ *
+ * UPPER BOUND IS EXCLUSIVE.  When subdividing:
+ *
+ *     NW: [x,       x + w/2) × [y,       y + h/2)
+ *     NE: [x + w/2, x + w  ) × [y,       y + h/2)
+ *     SW: [x,       x + w/2) × [y + h/2, y + h  )
+ *     SE: [x + w/2, x + w  ) × [y + h/2, y + h  )
+ *
+ * Properties:
+ *   - The four sub-rects are PAIRWISE DISJOINT (no shared
+ *     points).
+ *   - They UNION to exactly the parent rect.
+ *   - Every point of the parent belongs to EXACTLY ONE child.
+ *
+ * Without half-open intervals, the midpoint cell would belong
+ * to multiple children — quadrant assignment ambiguous,
+ * inserts go to "any" child, queries miss points.
+ *
+ * Same convention is used everywhere in computer graphics:
+ *   - Pixel coordinates: pixel (x, y) covers [x, x+1) × [y, y+1).
+ *   - Texture sampling, scanline rasterisation, etc.
+ *
+ * T4  RANGE QUERY — PRUNING BY OVERLAP TEST
+ * ─────────────────────────────────────────
+ * Query: find all stored points inside rectangle R.
+ *
+ *     query(node, R):
+ *       if NOT overlap(node.rect, R): return    ← prune
+ *       if node is leaf:
+ *         for p in node.data: if p in R: report
+ *       else:
+ *         for child in node.children[0..3]:
+ *           query(child, R)
+ *
+ * Cost: visits only nodes whose rect overlaps R.  For a
+ * "small" R, this is O(log N + k) with k points reported.
+ * For R = entire space, it's O(N + k) (visits everything,
+ * which is the brute-force lower bound).
+ *
+ * Same pruning idea as in BSP tree's query (T4 there) and
+ * KD-tree (T3 there).  Universal across spatial trees.
+ *
+ * COMPARISON OF QUERY COST in 2-D for "small" rect:
+ *   Brute force:   O(N)
+ *   Quadtree:      O(log N + k)        ✓
+ *   BSP tree:      O(log N + k)        ✓
+ *   KD tree:       O(√N + k)           ✓ (worst case)
+ *
+ * All three spatial trees are asymptotically faster than
+ * brute force.  Choose by code complexity + query pattern.
+ *
+ * For an animated demo of EXACTLY this query (with the
+ * pruning visible per node), see
+ * algorithms/quad_tree_helloworld.c — same algorithm,
+ * different presentation style.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #include <assert.h>
 #include <stdbool.h>

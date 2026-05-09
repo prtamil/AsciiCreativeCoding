@@ -13,7 +13,7 @@
  *     then demonstrates a range query.  Press Enter each step.
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra geometry/bsp_tree.c -o bsp_tree
+ *   gcc -std=c11 -O2 -Wall -Wextra algorithms/bsp_tree.c -o bsp_tree
  *
  * Run:
  *   ./bsp_tree
@@ -66,14 +66,342 @@
  *   The bounding-box pruning in bsp_query skips whole subtrees in O(1),
  *   same mechanism as kd_query — check overlap before recursing.
  *
- * Reading order:
- *   1. BSPNode struct — boundary rect + split + data[] in one node.
- *   2. bsp_insert     — trace one insertion; note the midpoint split choice.
- *   3. bsp_query      — trace the bounding-box pruning.
- *   4. draw_tree_grid — how the grid renders both '!' and '=' split lines.
- *   5. main() PART 2  — predict which axis splits before pressing Enter.
+ * References    :
+ *   Fuchs, Kedem & Naylor, "On Visible Surface Generation by A
+ *     Priori Tree Structures" (SIGGRAPH 1980) — the original BSP
+ *     paper.
+ *   Carmack, "Doom rendering" interviews (1993) — game-engine
+ *     application that popularised BSP trees.
+ *   de Berg et al., "Computational Geometry" (3rd ed., 2008)
+ *     ch. 12 — formal treatment.
  *
- * ─────────────────────────────────────────────────────────────────────────── */
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A BSP TREE recursively divides space by AXIS-ALIGNED CUTS.
+ * Every internal node has TWO children — one for each side of
+ * its cut.  Cuts ALTERNATE BETWEEN AXES with depth: depth 0
+ * cuts vertical (x), depth 1 horizontal (y), depth 2 vertical
+ * again, etc.  Points live in LEAF nodes; when a leaf overflows
+ * LEAF_CAPACITY, it splits at its bounding box's midpoint along
+ * the next axis.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine you're filing index cards into a tall, narrow filing
+ * cabinet.  When a drawer fills up, you put a divider in the
+ * middle and split the cards by which half they fall in.  The
+ * NEXT time a drawer fills, you SPLIT THE OTHER WAY (turning
+ * the cabinet 90°).  After many splits the cabinet is a perfect
+ * binary tree of dividers; each card has a unique path from
+ * the top.  Querying "find all cards in this rectangle" walks
+ * the tree, skipping any drawer whose dividers exclude the
+ * region.
+ *
+ * BSP vs OTHER SPATIAL TREES
+ * ──────────────────────────
+ *
+ *   QUADTREE: every internal node splits BOTH axes at once,
+ *             producing 4 children.  Simpler conceptually but
+ *             more children per level → SHALLOWER tree.  See
+ *             algorithms/quadtree.c.
+ *
+ *   K-D TREE: like BSP but each NODE holds a data point AND IS
+ *             the split.  No "leaf capacity"; every level holds
+ *             one point.  See algorithms/kd_tree.c.
+ *
+ *   BSP TREE: 2 children per internal node; data only in leaves;
+ *             splits at MIDPOINT of region (not at a data point).
+ *             Closest to game-engine BSP usage.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  INSERT(point P):
+ *    1. Start at root.
+ *    2. While current node is INTERNAL:
+ *         consult node's split axis + split_pos
+ *         descend to FRONT or BACK child accordingly
+ *    3. Now at a LEAF.  Append P to leaf's data array.
+ *    4. If leaf's count > LEAF_CAPACITY:
+ *         compute next split axis (alternates with depth)
+ *         compute split_pos = midpoint of leaf's region
+ *         create two child leaves
+ *         redistribute leaf's data into front/back child
+ *         convert leaf → internal node
+ *
+ *  RANGE QUERY(rectangle R):
+ *    1. Start at root.
+ *    2. If current node's BOUNDING BOX doesn't overlap R:
+ *         skip whole subtree.  ← THE KEY OPTIMISATION
+ *    3. Else if current is LEAF:
+ *         scan leaf's data, report points inside R.
+ *    4. Else (INTERNAL):
+ *         recurse into FRONT child + BACK child.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Split axis at depth d:  d % 2 == 0 → vertical (x-cut)
+ *                           d % 2 == 1 → horizontal (y-cut)
+ *
+ *   Mid-point split:        split_pos = (rect.min + rect.max) / 2
+ *                           along the chosen axis
+ *
+ *   Front/back assignment:  vertical:    point.x < split_pos → front
+ *                           horizontal:  point.y < split_pos → front
+ *
+ *   Bounding-box overlap:   for each axis: (rect1.min ≤ rect2.max)
+ *                                          AND (rect1.max ≥ rect2.min)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • Mid-point split assumes data is roughly UNIFORMLY
+ *     distributed.  For clustered data, split_pos can fall
+ *     OUTSIDE the actual data range, leaving one child empty
+ *     and the other still overflowing.  The KD tree (T2)
+ *     splits at the data's MEDIAN instead — better for
+ *     skewed data but more expensive.
+ *   • Points exactly on the split line: convention is "<
+ *     goes front, ≥ goes back."  Consistent so queries route
+ *     correctly.
+ *   • Subtree rooted at a node has a tighter "region" than
+ *     just the bounding box implied by ancestor splits.  We
+ *     store the rect explicitly per node so query pruning is
+ *     tight.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Insert 12 points one at a time (PART 2).  Watch the
+ *     splits cascade.  Tree depth should be ⌈log₂(12 / LEAF_CAPACITY)⌉.
+ *   • Range query at the end should report only the points
+ *     actually inside the query rectangle.  HUD shows count.
+ *   • Compare insertion order: random vs. sorted vs. clustered.
+ *     Random produces balanced tree; clustered produces
+ *     unbalanced (mid-point split fails).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *      Read algorithms/quadtree.c first if you want the simpler
+ *      4-child version; algorithms/kd_tree.c after this for the
+ *      "data-point splits" alternative.
+ *   2. PART 1 of the file: BSPNode struct + bsp_insert + bsp_query.
+ *      THE LIBRARY.  Self-contained, no I/O.  Read AFTER tutorials
+ *      T1-T5 below.
+ *   3. PART 2: main() with step-by-step insertion + query.  Press
+ *      Enter to advance one operation; observe the tree grow.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   BSPNode                    one node of the tree.  Internal or leaf.
+ *   .rect                      bounding rectangle this node represents.
+ *   .split                     SPLIT_VERTICAL or SPLIT_HORIZONTAL.
+ *   .split_pos                 the cut value along the split axis.
+ *   .front, .back              children pointers (NULL for leaves).
+ *   .data[], .count            leaf data array (only filled for leaves).
+ *   LEAF_CAPACITY = 4          when leaf has > this, split.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Recursion + binary-tree pointer manipulation.
+ *   - 2-D rectangles and bounding-box overlap test.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Real BSP-with-arbitrary-planes (Doom-style).  We use the
+ *     simpler axis-aligned variant.
+ *   - 3-D BSP for visibility.  This is 2-D for spatial point
+ *     storage.
+ *   - Self-balancing tree theory.  Mid-point splits give
+ *     O(log N) for uniform data; we don't enforce balance for
+ *     adversarial inputs.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a BSP tree from first principles.
+ *
+ *   T1  The space-partitioning problem
+ *   T2  BSP vs Quadtree vs K-D tree — three answers, same problem
+ *   T3  Mid-point split with axis alternation
+ *   T4  Bounding-box pruning — the query speedup
+ *   T5  Why this isn't real BSP — the axis-aligned simplification
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE SPACE-PARTITIONING PROBLEM
+ * ──────────────────────────────────
+ * Given N points in 2-D, answer queries efficiently:
+ *
+ *     "which points lie inside this rectangle R?"
+ *
+ * Brute force: scan all N points, test each.  O(N) per query.
+ * For N = 1M this is too slow for interactive use.
+ *
+ * SPATIAL DATA STRUCTURE INSIGHT: pre-process the points once
+ * into a structure that lets you SKIP big regions during a
+ * query.  Pay O(N log N) to build, then O(log N + k) per query
+ * where k = number of points returned.
+ *
+ * Three classical 2-D structures:
+ *   - QUADTREE (4 children, both axes cut)
+ *   - KD-TREE (2 children, alternates axes, data in nodes)
+ *   - BSP TREE (2 children, alternates axes, data in leaves)
+ *
+ * All three have the SAME ASYMPTOTIC COMPLEXITY for typical
+ * queries on well-distributed data: O(log N + k).  They
+ * differ in constant factors and code complexity.
+ *
+ * T2  BSP VS QUADTREE VS K-D TREE
+ * ───────────────────────────────
+ *
+ *   QUADTREE                       K-D TREE
+ *
+ *   ┌───────┬───────┐              ┌───────┬───────┐
+ *   │       │       │              │       │       │
+ *   │  NW   │  NE   │              │       │       │
+ *   │       │       │              │       │       │
+ *   ├───────┼───────┤              ├───────┤       │
+ *   │       │       │              │       │       │
+ *   │  SW   │  SE   │              │       │       │
+ *   │       │       │              │       │       │
+ *   └───────┴───────┘              └───────┴───────┘
+ *
+ *   Splits BOTH axes at once,      Splits ONE axis at the
+ *   4 children, generally          DATA POINT's coord, axis
+ *   regular grid.                  alternates by depth.
+ *
+ *
+ *   BSP TREE (this file)
+ *
+ *   ┌───────┬───────┐
+ *   │       │       │
+ *   │       │       │
+ *   │       ├───────┤
+ *   │       │       │
+ *   │       │       │
+ *   │       │       │
+ *   └───────┴───────┘
+ *
+ *   Splits ONE axis at MIDPOINT of region;
+ *   alternates by depth; data in leaves.
+ *
+ *
+ * Tradeoffs:
+ *
+ *   QUADTREE:  4 children → shallower tree, simpler intuition,
+ *              wastes memory if data is concentrated in 1 quad.
+ *
+ *   KD-TREE:   storing data in nodes → no wasted "internal-only"
+ *              node memory.  Best for nearest-neighbour queries
+ *              (short stack walk).  Sensitive to insertion order.
+ *
+ *   BSP TREE:  splits at REGION midpoint (not data point) →
+ *              insertion-order independent, balanced for uniform
+ *              data.  Closest to game-engine BSP idiom.
+ *
+ * For an animated visualiser of the SAME quadtree+query, see
+ * algorithms/quad_tree_helloworld.c.
+ *
+ * T3  MID-POINT SPLIT WITH AXIS ALTERNATION
+ * ─────────────────────────────────────────
+ * When a leaf overflows, split it at the MIDPOINT of its
+ * region along the next axis:
+ *
+ *     leaf at depth d has region [x_min, x_max] × [y_min, y_max]
+ *     next split axis = (d % 2 == 0) ? VERTICAL : HORIZONTAL
+ *     split_pos = (axis == VERTICAL) ? (x_min + x_max) / 2
+ *                                    : (y_min + y_max) / 2
+ *
+ *     create FRONT child:  region with the "less than split" half
+ *     create BACK child:   region with the "≥ split" half
+ *     redistribute leaf's data points into one child each
+ *     convert leaf → internal node (split_pos, front, back)
+ *
+ * ALTERNATING AXES is what gives the tree balanced spatial
+ * subdivision in BOTH x AND y over time.  If we always cut x
+ * (no alternation), the tree would have very thin horizontal
+ * strips — bad for queries that span x.
+ *
+ * MID-POINT (vs. median or data-point) keeps the recursion
+ * depth O(log N) for UNIFORMLY DISTRIBUTED data even under
+ * adversarial insertion order.  For non-uniform data, mid-
+ * point can be far from optimal — but the K-D tree's
+ * data-point split ALSO has worst cases.  No free lunch.
+ *
+ * T4  BOUNDING-BOX PRUNING — THE QUERY SPEEDUP
+ * ────────────────────────────────────────────
+ * Range query: find all points inside rectangle R.
+ *
+ * Naive: scan every leaf.  Cost O(N).
+ * Smart: PRUNE subtrees whose bounding box doesn't overlap R.
+ *
+ *     query(node, R):
+ *       if NOT overlap(node.rect, R): return        ← skip
+ *       if node is leaf:
+ *         for each point in node.data:
+ *           if point in R: report
+ *       else:
+ *         query(node.front, R)
+ *         query(node.back, R)
+ *
+ * PERFORMANCE GAIN: for a query rectangle that intersects only
+ * a small fraction of the tree's region, we descend a SHALLOW
+ * subset of the tree — typically O(log N + k) where k is the
+ * answer size.
+ *
+ * Bounding-box overlap is a 4-comparison test (per axis: rect1
+ * left ≤ rect2 right AND rect1 right ≥ rect2 left).  Cheap.
+ *
+ * Same pruning idea is used by:
+ *   - Octrees (3-D version)
+ *   - R-trees (database spatial indexing)
+ *   - Bounding Volume Hierarchies (graphics raytracing)
+ *
+ * The whole point of spatial trees is the LOGARITHMIC PRUNING.
+ * Without it, the tree gives no advantage over a flat array.
+ *
+ * T5  WHY THIS ISN'T REAL BSP — THE AXIS-ALIGNED SIMPLIFICATION
+ * ─────────────────────────────────────────────────────────────
+ * Real BSP trees, as used in Doom (1993) and similar engines,
+ * are MORE GENERAL than this file:
+ *
+ *   - Splits are ARBITRARY PLANES (in 3-D) or arbitrary lines
+ *     (in 2-D), not just axis-aligned.
+ *   - Splits often align with WALL POLYGONS in the scene,
+ *     allowing the tree to determine what's in front/behind
+ *     each wall for visibility calculations.
+ *   - Pre-computed at MAP BUILD TIME, not at insertion (Doom
+ *     compiled BSP from level geometry).
+ *
+ * The full algorithm needed:
+ *   - Pick a SPLITTING PLANE (heuristic: choose the plane that
+ *     minimises CUT polygons + balances the tree).
+ *   - When a polygon STRADDLES the split, SPLIT THE POLYGON
+ *     into two sub-polygons (one per side).
+ *   - Render front-to-back via in-order traversal — gives
+ *     correct occlusion without a Z-buffer.
+ *
+ * This file simplifies to AXIS-ALIGNED splits + POINT data.
+ * Sufficient to teach the SPACE PARTITIONING idea without the
+ * polygon-clipping complexity.
+ *
+ * To go further, see:
+ *   - 3-D BSP rendering (Doom rendering technique)
+ *   - R-tree (database of bounding boxes)
+ *   - Octree (3-D analogue of quadtree)
+ *
+ * For visibility computation in 2-D, the actual visibility
+ * polygon (algorithms/visibility_polygon.c) is more direct.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #include <assert.h>
 #include <stdbool.h>

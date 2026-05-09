@@ -47,7 +47,7 @@
  *   ] / [      sim FPS up / down
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra fluid/slime_mold.c \
+ *   gcc -std=c11 -O2 -Wall -Wextra flocking/slime_mold.c \
  *       -o slime_mold -lncurses -lm
  *
  * Sections: §1 config  §2 clock  §3 color  §4 trail grid  §5 agents
@@ -84,6 +84,397 @@
  *                  Agents read and deposit into g_trail; the grid update reads
  *                  g_trail → writes g_buf → copies back.  This prevents mid-tick
  *                  positional feedback (a grain reading its own fresh deposit).
+ *
+ * References     :
+ *   Jones, "Characteristics of pattern formation and evolution in
+ *     approximations of Physarum transport networks" (Artificial
+ *     Life 16, 2010) — the canonical Physarum agent model.
+ *   Tero, Kobayashi & Nakagaki, "A mathematical model for adaptive
+ *     transport network in path finding by true slime mold"
+ *     (J. Theor. Biol. 244, 2007).
+ *   Adamatzky, "Physarum Machines" (World Scientific, 2010) —
+ *     book-length treatment of slime-mold computing.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Thousands of agents wander a 2-D grid, each leaving a TRAIL.
+ * They prefer to walk where the trail is strongest (positive
+ * feedback).  The trail diffuses outward and decays over time
+ * (negative feedback).  The interplay of these two forces
+ * produces self-organising tube networks that connect food
+ * sources — without ANY central planner.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine 2000 ants in a flat dish, each leaving an evaporating
+ * pheromone trail.  Each ant looks slightly LEFT, FORWARD, and
+ * RIGHT — turns toward whichever direction has the most
+ * pheromone — walks one step — drops more pheromone.
+ * Pheromones diffuse outward and fade away.  Initially the
+ * dish has no pattern.  After a minute, dense ANT-HIGHWAYS
+ * appear connecting food sources, while empty regions stay
+ * dark.  No one CHOSE the highways; they EMERGED from local
+ * follow-the-strongest-trail decisions amplified by stigmergy.
+ *
+ * STIGMERGY
+ * ─────────
+ * "Stigmergy" (Pierre-Paul Grassé, 1959) = indirect
+ * communication via persistent environmental modifications.
+ * No agent talks to another agent.  Communication happens
+ * through the ENVIRONMENT (the trail grid).  This is the
+ * same mechanism real ant colonies, termite mound builders,
+ * and Physarum slime molds use.
+ *
+ * The remarkable result: stigmergic colonies can COMPUTE.
+ * Real Physarum slime molds connect oat-flake food sources
+ * with tubes that approximate the MINIMUM STEINER TREE
+ * (the optimal pipe network).  This file reproduces that
+ * computation in software.
+ *
+ * ALGORITHM IN STEPS  (per tick)
+ * ──────────────────────────────
+ *  AGENT LOOP (N times):
+ *    1. SENSE — sample trail at 3 sensor positions:
+ *         FL = (pos + dir(heading - SENSOR_ANGLE) · SENSOR_DIST)
+ *         F  = (pos + dir(heading                 ) · SENSOR_DIST)
+ *         FR = (pos + dir(heading + SENSOR_ANGLE) · SENSOR_DIST)
+ *    2. ROTATE — based on which sensor sees strongest trail:
+ *         F greatest      → no turn
+ *         FL > FR         → turn LEFT by ROTATE_ANGLE
+ *         FR > FL         → turn RIGHT by ROTATE_ANGLE
+ *         FL == FR > F    → random turn (tie-break)
+ *    3. MOVE — pos += STEP_SIZE · (cos heading, sin heading)
+ *              wrap toroidally
+ *    4. DEPOSIT — trail[pos] += DEPOSIT_AMT
+ *                  (× FOOD_BONUS if near food source)
+ *
+ *  GRID LOOP (once over W × H):
+ *    For each cell:
+ *      avg = mean of 3×3 neighbourhood (in trail[])
+ *      buf[cell] = lerp(trail[cell], avg, DIFFUSE_W) × (1 - DECAY)
+ *    Swap trail and buf.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Diffusion: trail' = lerp(trail, neighbours_avg, w)
+ *              ≈ discretised heat equation ∂u/∂t = D · ∇²u
+ *
+ *   Decay:     trail' = trail · (1 - DECAY)
+ *              exponential fade, time constant ≈ 1/DECAY
+ *
+ *   Sensor:    sample at (pos + dir · SENSOR_DIST) for 3 angles
+ *
+ *   Steady-state trail strength at deposit point ≈
+ *      DEPOSIT_AMT / DECAY    (deposit rate / decay rate)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • DOUBLE BUFFERING: agents read g_trail and deposit into
+ *     g_trail.  Grid update reads g_trail → writes g_buf →
+ *     swaps.  Without buffering, the diffusion step would
+ *     read the just-deposited values and amplify them
+ *     instantly (numerical instability).
+ *   • TOROIDAL WRAP: agents that walk off one edge reappear
+ *     on the opposite edge.  Sensor reads also wrap.  This
+ *     prevents edge-clustering artifacts.
+ *   • FOOD SOURCES: cells within FOOD_RADIUS deposit
+ *     FOOD_BONUS × the normal amount.  This creates strong
+ *     attractors that the trail network grows toward.
+ *   • Resize: ROWS_MAX × COLS_MAX = 128 × 512 static buffers.
+ *     Resize re-derives row/col bounds without reallocation.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • At default 2000 agents + 3 food sources: tube network
+ *     converges in ~30-60 ticks.  Tubes connect all 3 food
+ *     sources via shortest-network paths.
+ *   • Toggle food off (f): no attractors, agents diffuse to
+ *     random uniform pattern.  Toggle food back on: tubes
+ *     re-form within ~20 ticks.
+ *   • Reduce diffusion (D): tubes get THINNER and SHARPER.
+ *     Increase: tubes BLEND and lose definition.
+ *   • Reduce decay (E): trail accumulates everywhere; tubes
+ *     drown in background.  Increase: tubes fade too fast,
+ *     network never forms.
+ *   • Steiner-tree behaviour: try preset 3 (4 corner food
+ *     sources).  The network should approximate a Steiner
+ *     tree (Y-shaped meeting point in the middle, not
+ *     direct edges between every pair).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *      flocking/flocking.c teaches the simpler "agents with
+ *      direct sensing of other agents" pattern.  This file is
+ *      the STIGMERGY variant — agents communicate through the
+ *      ENVIRONMENT instead of directly.  Read flocking.c first.
+ *      flocking/shepherd.c shows another emergent-behaviour
+ *      example (dog herding sheep through positioning, not
+ *      direct commands).
+ *   2. §5 agents — sense + rotate + move + deposit.  THE HEART
+ *      of this file.  Read AFTER tutorials T1-T5.
+ *   3. §4 trail grid — diffusion + decay (the "environment").
+ *   4. §6 scene — preset configurations + food sources.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   g_trail[r][c]              float trail intensity at cell (r,c).
+ *   g_buf[r][c]                double-buffer for diffusion update.
+ *   agent.x, .y, .heading      pose in cell coordinates + radians.
+ *   N_AGENTS                   2000-6000 typical.
+ *   SENSOR_ANGLE = π/4         ±45° from heading (Jones default).
+ *   SENSOR_DIST = 4 cells      look-ahead distance.
+ *   ROTATE_ANGLE = π/4         turn step when sensor decides.
+ *   DEPOSIT_AMT                trail strength dropped per visit.
+ *   DIFFUSE_W                  blend toward 3×3 average; 0 = no
+ *                              diffusion, 1 = total replacement.
+ *   DECAY_RATE                 fraction of trail lost per tick.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Agent-based simulation (flocking.c if new).
+ *   - 2-D grid as a scalar field with diffusion.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Real cell biology (mitosis, signalling).  Slime mold
+ *     biology is the INSPIRATION, not the simulation target.
+ *   - Steiner-tree algorithms (Kruskal, Prim).  Slime mold
+ *     APPROXIMATES Steiner; we don't compute it analytically.
+ *   - PDE solvers.  The diffusion is a 3×3 box-blur, not a
+ *     proper diffusion solver.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a Physarum slime-mold simulation
+ * from first principles.
+ *
+ *   T1  Stigmergy — communication through the environment
+ *   T2  Three sensors → one local turn decision
+ *   T3  Trail grid — diffusion + decay = positive + negative feedback
+ *   T4  Food sources — attractors that anchor the network
+ *   T5  Why this approximates Steiner trees (and what it doesn't)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  STIGMERGY — COMMUNICATION THROUGH THE ENVIRONMENT
+ * ─────────────────────────────────────────────────────
+ * Most flocking simulations have agents READ each other's
+ * state directly: "what's my neighbour's velocity?"  See
+ * flocking/flocking.c (Reynolds boids — agents inspect each
+ * neighbour's pos + vel within a perception radius).
+ *
+ * STIGMERGY is different: agents only see and modify the
+ * ENVIRONMENT.  They never read another agent's state.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │  DIRECT (Reynolds)         STIGMERGIC (Physarum) │
+ *      │                                                  │
+ *      │   agent → agent             agent → ENV → agent  │
+ *      │   reads neighbour           reads/writes trail   │
+ *      │   pos, vel directly         no agent-to-agent    │
+ *      │                                                  │
+ *      │   "what's around me?"       "what marks did      │
+ *      │                              someone leave here?"│
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Stigmergic agents are SIMPLER (no neighbour search) and
+ * SCALE BETTER (no per-pair lookup).  But they require a
+ * persistent environment to communicate through — here, the
+ * trail grid.  That grid IS the swarm's collective memory.
+ *
+ * Real-world examples:
+ *   - Ant colonies (pheromone trails)
+ *   - Termite mound construction (humidity gradients)
+ *   - Slime mold (Physarum, this file's inspiration)
+ *   - Human road networks (paths formed by repeated foot
+ *     travel)
+ *
+ * The principle: SIMPLE LOCAL RULES + PERSISTENT MEDIUM =
+ * GLOBAL OPTIMISATION.
+ *
+ * T2  THREE SENSORS → ONE LOCAL TURN DECISION
+ * ───────────────────────────────────────────
+ * Each agent has THREE virtual sensors: front-left (FL),
+ * front (F), front-right (FR), each at SENSOR_DIST cells
+ * ahead, at angles (heading - SENSOR_ANGLE), heading,
+ * (heading + SENSOR_ANGLE).
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │              FL              FR                  │
+ *      │                ●           ●                     │
+ *      │                  ╲       ╱                       │
+ *      │                    ●  F                          │
+ *      │                    │                             │
+ *      │                    │ ← heading                   │
+ *      │                  agent                           │
+ *      │                                                  │
+ *      │  Three samples of trail intensity at points       │
+ *      │  ahead determine the next turn direction.        │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Decision rule (Jones 2010):
+ *
+ *     if F > FL and F > FR:  no turn         (forward looks best)
+ *     elif FL > FR:          turn LEFT       (left looks better)
+ *     elif FR > FL:          turn RIGHT      (right looks better)
+ *     else:                  random ±turn    (FL == FR, tie-break)
+ *
+ * That's the entire control logic per agent: read 3 numbers,
+ * compare them, turn or not.  Plus a fixed-step move and a
+ * trail deposit.  Six lines of code.
+ *
+ * Why does this WORK?  An agent walking on a strong-trail
+ * cell is likely to keep walking on strong-trail cells
+ * (because nearby cells are also likely strong — diffusion
+ * smooths the trail gradient).  This positive feedback
+ * AMPLIFIES existing trails.  Combined with the decay (T3),
+ * it produces self-organising tubes.
+ *
+ * Sensor parameters from Jones 2010:
+ *   SENSOR_ANGLE = 45°  — sweet spot for crisp tubes
+ *   SENSOR_DIST = 4 cells — local enough to track curves
+ *   ROTATE_ANGLE = 45°  — turn step
+ *
+ * Tweaking these visibly changes the network style:
+ *   smaller SENSOR_DIST → thinner, twistier tubes
+ *   larger ANGLE        → wider tubes, more straightening
+ *
+ * T3  TRAIL GRID — DIFFUSION + DECAY = POSITIVE + NEGATIVE FEEDBACK
+ * ─────────────────────────────────────────────────────────────────
+ * Each tick, the trail grid is updated:
+ *
+ *     for each cell (r, c):
+ *       neighbours_avg = mean of trail[r±1][c±1]   (3×3 box)
+ *       new_trail[r][c] = lerp(trail[r][c], neighbours_avg, DIFFUSE_W)
+ *                         × (1 - DECAY_RATE)
+ *
+ * Two physical effects, opposite sign:
+ *
+ *   DIFFUSION (positive feedback):
+ *     A high-trail cell SPREADS its strength to neighbours.
+ *     Nearby cells become attractive too.  This smooths the
+ *     gradient an agent senses, allowing tubes to maintain
+ *     coherence as agents drift along them.
+ *
+ *   DECAY (negative feedback):
+ *     Every cell loses a small fraction each tick.  Without
+ *     decay, every cell ever visited would stay marked
+ *     forever — the grid would saturate and lose
+ *     discrimination.  With decay, only cells visited
+ *     RECENTLY by agents stay strong.
+ *
+ * The BALANCE between diffusion and decay determines the
+ * tube width.  Tunable live with d/D + e/E keys.
+ *
+ *   high diffusion, low decay  → thick blurry connections
+ *   low diffusion, high decay  → sharp thin tubes
+ *   balanced (default)         → physarum-like tubes
+ *
+ * Same yin-yang of "spread + fade" appears in:
+ *   - Reaction-diffusion patterns (Gray-Scott, Turing)
+ *   - Pheromone-based ant routing
+ *   - Self-organising maps
+ *   - Activator-inhibitor neural models
+ *
+ * The general lesson: positive + negative feedback at
+ * different SPATIAL or TEMPORAL scales produces patterns.
+ *
+ * T4  FOOD SOURCES — ATTRACTORS THAT ANCHOR THE NETWORK
+ * ─────────────────────────────────────────────────────
+ * Without food, agents form random "noise" tubes.  With
+ * food at fixed positions, agents that pass near food
+ * deposit FOOD_BONUS × the normal amount of trail.  These
+ * super-bright cells become permanent attractors.
+ *
+ * The network "grows" toward food sources because:
+ *   - Agents passing near food leave extra-strong trail.
+ *   - That trail amplifies further passing through nearby
+ *     cells.
+ *   - Eventually a stable highway forms between food
+ *     sources, sustained by traffic.
+ *   - Empty regions decay back to background.
+ *
+ * The connection to Physarum biology: real slime molds in
+ * Petri dishes with oat-flake food spread tubes preferentially
+ * to oat positions.  The chemistry of nutrient absorption +
+ * cytoplasmic flow plays the role of our DEPOSIT + DIFFUSION.
+ *
+ * Demo presets vary the food layout:
+ *   0 Scatter   — 3 food in triangle
+ *   1 Ring      — agents on ring, 1 central food
+ *   2 Clusters  — 2 distant food sources
+ *   3 Mesh      — 4 corner food sources
+ *
+ * Press 'f' to toggle food off mid-simulation: tubes
+ * COLLAPSE (decay wins, no replenishment).  Toggle back on:
+ * tubes RE-FORM in ~20 ticks.
+ *
+ * T5  WHY THIS APPROXIMATES STEINER TREES (AND WHAT IT DOESN'T)
+ * ──────────────────────────────────────────────────────────────
+ * The MINIMUM STEINER TREE for N points is the shortest-
+ * total-edge-length tree connecting them, where the tree
+ * may include EXTRA "Steiner points" not in the input.
+ *
+ * For 4 corner food sources arranged as a square:
+ *   - Direct edges:  4 sides + 1 diagonal = ~4.41 units
+ *   - Steiner tree:  Y-Y meeting at 2 internal points = ~2.73
+ *
+ * Real Physarum builds approximations of the Steiner tree.
+ * Tero et al. (2007) experimentally placed oat flakes in
+ * a Tokyo subway map; the resulting Physarum tubes
+ * matched the actual subway lines (≈ optimal transport
+ * network).
+ *
+ * Why does this happen?  Simple intuition:
+ *   - Tubes that connect food via ≈ Steiner topology
+ *     have HIGH TRAFFIC (agents flowing between sources).
+ *   - High traffic = strong trail = positive feedback.
+ *   - Sub-optimal paths have less traffic, so their trail
+ *     decays faster.
+ *   - The network self-prunes toward the optimum.
+ *
+ * What this DOESN'T do:
+ *   - It's NOT GUARANTEED to find the optimum — it's an
+ *     APPROXIMATION via local optimisation.  Stuck in
+ *     local minima possible.
+ *   - It doesn't compute the Steiner tree analytically;
+ *     classical algorithms (Kou-Markowsky-Berman, etc.)
+ *     do that with combinatorial search.
+ *   - It's SLOW compared to algorithms (seconds of agent
+ *     simulation vs. milliseconds of MST + Steiner).
+ *
+ * What it DOES do:
+ *   - PARALLEL: each agent independent; scales to 1000s
+ *     of agents.
+ *   - ROBUST: agents can be added/removed mid-simulation;
+ *     the network adapts.
+ *   - BIOLOGICALLY PLAUSIBLE: real Physarum uses this
+ *     mechanism.
+ *
+ * Slime-mold "computing" is one of the most beautiful
+ * results in biological computation.  Adamatzky (2010)
+ * built mazes solved by Physarum, found shortest paths,
+ * computed planar minimum spanning trees, even
+ * implemented logic gates with chemical-resistance
+ * variations.
+ *
+ * This file gives you the simulation; the Steiner-tree
+ * application is a pedagogical demonstration of one of
+ * its applications.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

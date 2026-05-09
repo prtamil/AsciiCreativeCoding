@@ -67,6 +67,515 @@
  *                  terminal (diff), minimising write latency and flicker.
  *                  Render capped at TARGET_FPS using CLOCK_MONOTONIC sleep.
  *
+ * References     :
+ *   Glenn Fiedler, "Fix Your Timestep!" (gafferongames.com) —
+ *     foundational article on fixed-step + alpha-lerp interpolation.
+ *     Every animation in this project follows this pattern.
+ *   ncurses(3X) man pages — getch, doupdate, wnoutrefresh,
+ *     init_pair, KEY_RESIZE.
+ *   project CLAUDE.md — coding-style + framework-structure rules.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Every animation in this project follows ONE recipe.  The recipe
+ * is not an abstraction (no header, no library) — it's a CODE
+ * SHAPE, copied and customised per file.  This file is the
+ * canonical recipe in template form.  Every other animation file
+ * has the same §1..§8 structure with §5 (entity) replaced by the
+ * specific simulation.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture every animation file as a CAKE: the same 8 layers,
+ * just different filling in §5.  Bottom layer (§1 config) is the
+ * pantry; top layer (§8 app) is the icing.  The recipe (sections
+ * + main loop order) is fixed; the cake's flavour comes from the
+ * §5 entity logic.  This file's flavour is "26 slots cycling
+ * random characters."  bounce_ball.c's is "two balls bouncing."
+ * fluid/navier_stokes.c's is "Stam stable fluid."  Same cake,
+ * different fillings.
+ *
+ * THE EIGHT SECTIONS
+ * ──────────────────
+ *
+ *   §1 config    Every magic number lives here.  Tunable constants,
+ *                feature flags, color pair IDs, sim/render rates.
+ *                Code below NEVER hard-codes a literal — it reads
+ *                from §1.
+ *
+ *   §2 clock     Monotonic timer + nanosecond sleep.  Foundation
+ *                for both physics dt measurement and render-rate
+ *                capping.  CLOCK_MONOTONIC unaffected by NTP /
+ *                wall-clock changes.
+ *
+ *   §3 color     ncurses color pair initialisation.  256-color
+ *                preferred; 8-color fallback for legacy terminals.
+ *                init_pair() once, attron(COLOR_PAIR(n)) per use.
+ *
+ *   §4 coords    Pixel↔cell conversion + aspect-ratio fix.
+ *                Terminal cells are ~2:1 tall; coords from physics
+ *                live in PIXEL space (square units), then convert
+ *                at the LAST POSSIBLE MOMENT before drawing.  Cell-
+ *                space sims (CAs, sand, fire) skip this section.
+ *
+ *   §5 entity    The actual simulation.  Per-animation state +
+ *                update logic.  This is the ONE section that
+ *                differs across files.  KeyGen here; in
+ *                bounce_ball.c it's Ball; in flocking.c it's
+ *                Boid; in raster/cube_raster.c it's Mesh.
+ *
+ *   §6 scene     Entity pool + per-frame orchestration.  Calls
+ *                §5 entity_tick() under fixed-step accumulator;
+ *                calls §5 entity_draw() with sub-tick alpha.
+ *
+ *   §7 screen    ncurses init/cleanup + frame-present helpers
+ *                (erase → wnoutrefresh → doupdate).
+ *
+ *   §8 app       Top-level: signal handling (SIGINT/SIGTERM/
+ *                SIGWINCH), main loop, input dispatch.
+ *
+ * MAIN LOOP — IDENTICAL EVERY FILE
+ * ────────────────────────────────
+ *
+ *   while (running):
+ *     1. dt = clock_now - prev_clock;  prev_clock = clock_now
+ *     2. handle resize if SIGWINCH fired
+ *     3. sim_accum += dt
+ *        while sim_accum >= SIM_TICK_NS:
+ *          scene_tick()              ← fixed-step physics
+ *          sim_accum -= SIM_TICK_NS
+ *     4. alpha = sim_accum / SIM_TICK_NS    ← ∈ [0, 1)
+ *     5. sleep_until_target_fps             ← sleep BEFORE render
+ *     6. erase()
+ *        scene_draw(alpha)                  ← interpolated render
+ *        HUD draw (yellow + cyan, A_BOLD)
+ *        wnoutrefresh + doupdate            ← one diff write
+ *     7. handle input (non-blocking getch)
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Fixed-step accumulator:
+ *     SIM_TICK_NS = NS_PER_SEC / sim_fps    (e.g. 1/60 sec)
+ *     while accum >= SIM_TICK_NS:
+ *       tick(); accum -= SIM_TICK_NS
+ *
+ *   Alpha (sub-tick fraction):
+ *     alpha = accum / SIM_TICK_NS    ∈ [0, 1)
+ *
+ *   Render interpolation (constant velocity):
+ *     draw_pos = pos + vel · alpha · dt
+ *
+ *   Render interpolation (general):
+ *     draw_pos = lerp(prev_pos, cur_pos, alpha)
+ *
+ *   Pixel→cell:
+ *     col = round(px / CELL_W)        (CELL_W typically 8)
+ *     row = round(py / CELL_H)        (CELL_H typically 16)
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • SPIRAL OF DEATH: if dt becomes huge (system suspend, lid
+ *     close), the inner while loop fires hundreds of ticks
+ *     trying to catch up.  Guard with `dt = min(dt, 100ms)`.
+ *   • RESIZE: SIGWINCH sets a sig_atomic_t flag; main loop
+ *     reads it before scene_draw and re-derives geometry.
+ *     Never call ncurses functions FROM the signal handler.
+ *   • SLEEP BEFORE RENDER: sleeping AFTER render means the
+ *     diff write to terminal happens at variable time, causing
+ *     visible jitter.  Sleep first, then write.
+ *   • TYPEAHEAD: by default ncurses interrupts diff writes to
+ *     peek at stdin; call typeahead(-1) to disable.
+ *   • DOUBLE BUFFER: erase() + scene_draw + wnoutrefresh +
+ *     doupdate gives ONE atomic diff per frame.  Naïve refresh()
+ *     after each glyph causes flicker and high CPU.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Default config: 26 character slots cycle; HUD shows live
+ *     fps stable around 60.
+ *   • Press [/]: sim Hz changes; physics rate scales but render
+ *     stays smooth.
+ *   • Press +/-: per-slot character rate changes; visible.
+ *   • Resize terminal: layout re-centres; no crash, no
+ *     corruption.
+ *   • Pause (space): all slots freeze; resume picks up
+ *     identically.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that
+ *      order as prose.  This file is the PROJECT'S TEMPLATE.
+ *      Every other simulation in this project follows the same
+ *      §1..§8 structure with the §5 entity replaced.
+ *   2. §1 config — every constant.  Read first; it's the
+ *      table of contents for the rest.
+ *   3. §6 scene + §8 app — the MAIN LOOP.  Read AFTER tutorials
+ *      T1-T4 below.  Any quirk you see in another file's main
+ *      loop probably has its rationale in T2-T3 here.
+ *   4. §5 entity — the SIMULATION-SPECIFIC code.  In this file
+ *      it's KeyGen (slots cycling random characters).  In
+ *      bounce_ball.c it's Ball physics.  In flocking.c it's
+ *      Boid steering.  Same shape, different content.
+ *   5. §2-§4, §7 — clock + colour + coords + screen.
+ *      Self-contained utilities; read as needed.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   sim_accum       fixed-step accumulator (ns).  Drained one
+ *                   SIM_TICK_NS at a time.
+ *   alpha           sub-tick render offset ∈ [0, 1).
+ *   prev_*, cur_*   per-entity snapshots for alpha-lerp draw.
+ *   SIM_FPS         simulation tick rate.
+ *   TARGET_FPS      render frame cap.
+ *   dt              wall-clock seconds since last frame.
+ *   g_running       sig_atomic_t flag — set false on SIGINT/TERM.
+ *   g_resize        sig_atomic_t flag — set true on SIGWINCH.
+ *
+ * Background you need
+ * ───────────────────
+ *   - C11 + ncurses basics (initscr, mvaddch, init_pair).
+ *   - The IDEA of frames-per-second + fixed-step physics.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - SDL / OpenGL / GPU rendering.  Pure terminal output.
+ *   - Game engines (Unity, Godot).  This is the manual version.
+ *   - Real-time scheduling.  Soft real-time at 60 fps is the
+ *     budget; CLOCK_MONOTONIC + nanosleep is enough.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Eight tutorials that build the framework from first principles.
+ * After reading these, you can write a new animation by COPYING
+ * this file, replacing §5 entity, and tweaking §1 config.
+ *
+ *   T1  Why a "framework"? — the separation of concerns
+ *   T2  The §1 config principle — no scattered magic numbers
+ *   T3  Fixed-step physics — decoupling sim rate from render rate
+ *   T4  Sub-tick alpha lerp — smooth render at any frame rate
+ *   T5  ncurses double-buffering — one diff write per frame
+ *   T6  Variable timestep — when fixed-step is overkill
+ *   T7  Resize + signals — SIGWINCH and atexit cleanup
+ *   T8  When to deviate — pixel-space vs cell-space, rotation, etc.
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHY A "FRAMEWORK"? — THE SEPARATION OF CONCERNS
+ * ───────────────────────────────────────────────────
+ * A naïve animation file mixes EVERYTHING in main():
+ *
+ *     int main() {
+ *       initscr();
+ *       while (running) {
+ *         clear();
+ *         // physics + drawing + input + colour + ...
+ *         // 600 lines of imperative spaghetti
+ *         refresh();
+ *         usleep(16000);
+ *       }
+ *     }
+ *
+ * That works for 100 lines.  It DOES NOT scale to 1000 lines
+ * with multiple entity types, fixed-step physics, alpha
+ * interpolation, resize handling, signal cleanup, themes.
+ *
+ * The §1..§8 structure SEPARATES CONCERNS:
+ *
+ *   - Tunables in ONE place (§1)     ← fast iteration
+ *   - Time / clock isolated (§2)     ← cross-platform
+ *   - Colour setup once (§3)         ← consistent palette
+ *   - Pixel/cell math isolated (§4)  ← aspect bugs caught here
+ *   - Simulation logic in §5         ← THE WORK
+ *   - Frame orchestration §6         ← clear loop pattern
+ *   - I/O at the boundaries §7-§8    ← swap renderer easily
+ *
+ * Each section has ONE responsibility.  Reading any animation
+ * file becomes "find §5 to see the simulation; everything else
+ * is shared infrastructure I already understand."
+ *
+ * Compare across the project:
+ *   - flocking/flocking.c §5 = Boid + steering forces
+ *   - physics/cloth.c §5 = Particle + spring constraints
+ *   - raster/cube_raster.c §5 = Mesh + vertex shader
+ *   - matrix_rain/matrix_rain.c §5 = Column + cycling glyphs
+ *
+ * Same skeleton; diverse §5 logic.
+ *
+ * T2  THE §1 CONFIG PRINCIPLE — NO SCATTERED MAGIC NUMBERS
+ * ────────────────────────────────────────────────────────
+ * Every constant lives in §1.  Every literal in code below
+ * §1 is a NAME from §1 (not a number).
+ *
+ * Wrong:
+ *
+ *     for (int i = 0; i < 100; i++) {     // 100 ← magic
+ *       ...
+ *       if (x > 1024) {                   // 1024 ← magic
+ *         ...
+ *
+ * Right:
+ *
+ *     // §1 config:
+ *     #define N_PARTICLES  100
+ *     #define WORLD_W      1024
+ *
+ *     // ...
+ *     for (int i = 0; i < N_PARTICLES; i++) {
+ *       ...
+ *       if (x > WORLD_W) {
+ *         ...
+ *
+ * Why?
+ *   - TUNING: change one constant in §1, behaviour changes
+ *     globally.  No grep-and-replace, no missed sites.
+ *   - DOCUMENTATION: the constant's NAME explains what the
+ *     number means.  100 is opaque; N_PARTICLES is obvious.
+ *   - TESTING: you can find every parameter at a glance.
+ *
+ * Project rule: any literal that ISN'T 0, 1, 2, or a tight
+ * arithmetic identity (e.g. `i + 1`, `n / 2`) goes in §1.
+ *
+ * T3  FIXED-STEP PHYSICS — DECOUPLING SIM RATE FROM RENDER RATE
+ * ─────────────────────────────────────────────────────────────
+ * Naïve approach: simulation tick = render frame:
+ *
+ *     while (running):
+ *       physics_step(dt)        ← uses variable dt
+ *       render()
+ *       sleep(target_dt)
+ *
+ * Problems:
+ *   - Slow CPU → big dt → physics steps too far → numerical
+ *     instability (springs explode, balls tunnel through walls).
+ *   - Fast CPU → tiny dt → physics integration error
+ *     accumulates.
+ *   - Pause + resume → giant dt → "spiral of death" trying to
+ *     catch up.
+ *   - Physics behaviour DEPENDS on framerate — bad for
+ *     reproducibility.
+ *
+ * Fixed-step accumulator (Glenn Fiedler 2004):
+ *
+ *     SIM_TICK_NS = 1/60 sec       (constant)
+ *     sim_accum += dt              (per frame)
+ *     while sim_accum >= SIM_TICK_NS:
+ *       physics_step(SIM_TICK_NS)  ← always SAME dt
+ *       sim_accum -= SIM_TICK_NS
+ *
+ * Properties:
+ *   - Physics ALWAYS runs at exactly 60 Hz regardless of
+ *     render fps.
+ *   - One slow render frame fires multiple physics ticks to
+ *     catch up.
+ *   - One fast render frame fires zero ticks (just renders
+ *     the same state again — but with alpha to interpolate;
+ *     T4).
+ *   - Reproducible: same input + same seed = same result.
+ *
+ * Spiral-of-death guard: cap dt at 100ms.  If you suspend
+ * for an hour, on resume dt = 1ms (cap) instead of 1hr —
+ * one tick fires, sim moves on; nothing tries to catch up
+ * the missed hour.
+ *
+ * T4  SUB-TICK ALPHA LERP — SMOOTH RENDER AT ANY FRAME RATE
+ * ─────────────────────────────────────────────────────────
+ * Fixed-step physics produces a STAIRCASE of states.  At
+ * 60 Hz physics, the world updates exactly 60 times/sec.
+ * If you render at 120 Hz, every other frame shows the
+ * SAME state — visible STUTTER.
+ *
+ * Fix: SUB-TICK INTERPOLATION.  Compute how far between two
+ * physics steps the render fell:
+ *
+ *     alpha = sim_accum / SIM_TICK_NS    ∈ [0, 1)
+ *
+ * Render entities INTERPOLATED between their previous and
+ * current physics state:
+ *
+ *     draw_pos = lerp(prev_pos, cur_pos, alpha)
+ *
+ * For constant-velocity entities, equivalent shortcut:
+ *
+ *     draw_pos = pos + vel · alpha · dt
+ *
+ * The renderer SEES smooth motion at the render's frame rate
+ * (60, 120, 144Hz, whatever).  The physics still runs at its
+ * fixed 60Hz.  Best of both worlds.
+ *
+ * Cost: each entity stores both PREV and CUR position.  Tiny.
+ *
+ * Watch the demo: press [ to drop sim Hz to 10 (very visible
+ * stair-steps if rendering raw); the alpha lerp keeps the
+ * KeyGen's slot transitions smooth.
+ *
+ * T5  NCURSES DOUBLE-BUFFERING — ONE DIFF WRITE PER FRAME
+ * ───────────────────────────────────────────────────────
+ * Naïve ncurses programs call refresh() after every cell
+ * write:
+ *
+ *     mvaddch(0, 0, 'A'); refresh();
+ *     mvaddch(0, 1, 'B'); refresh();
+ *     mvaddch(0, 2, 'C'); refresh();
+ *
+ * That's 3 terminal writes for 3 characters.  At 1000
+ * characters per frame and 60 fps = 180,000 writes/sec.
+ * Visible flicker, high CPU, lag.
+ *
+ * Correct ncurses pattern:
+ *
+ *     erase();                          ← clear scratch buffer
+ *     // many mvaddch / mvprintw calls  ← writes go to scratch
+ *     wnoutrefresh(stdscr);             ← mark scratch dirty
+ *     doupdate();                       ← ONE diff write
+ *
+ * `erase()` clears ncurses' INTERNAL SCRATCH BUFFER (newscr),
+ * not the terminal.  All draw calls write to scratch.
+ * `doupdate()` computes the DIFF between scratch and the
+ * known terminal state, sends ONLY changed cells.
+ *
+ * Result: 1 write per frame regardless of how many cells
+ * changed.  60 writes/sec total.
+ *
+ * Additional must-haves:
+ *   - typeahead(-1)        ← prevents ncurses from
+ *                            interrupting writes to peek stdin
+ *   - nodelay(stdscr, true)← getch returns ERR if no input,
+ *                            doesn't block
+ *   - keypad(stdscr, true) ← arrow keys etc. → KEY_LEFT etc.
+ *
+ * T6  VARIABLE TIMESTEP — WHEN FIXED-STEP IS OVERKILL
+ * ───────────────────────────────────────────────────
+ * Fixed-step is REQUIRED for stiff physics (springs, fluids,
+ * cloth).  But it's OVERKILL for stateless animations.
+ *
+ * STATELESS animation example: a clock face that draws hands
+ * at the current wall-clock time.  No accumulating state,
+ * no dt-dependent integration.  The clock at time t is a
+ * pure function of t.  Just compute and draw.  No
+ * accumulator needed.
+ *
+ * VARIABLE-TIMESTEP pattern (used in this project's
+ * artistic/ folder + other stateless demos):
+ *
+ *     while (running):
+ *       dt = clock_now - prev
+ *       global_time += dt
+ *       erase()
+ *       draw_at_time(global_time)        ← pure function of t
+ *       wnoutrefresh + doupdate
+ *       sleep_to_target_fps
+ *
+ * Indicator that variable timestep is OK:
+ *   - Sim has NO ACCUMULATING STATE that depends on dt
+ *     (or the only state is a simple advancing clock).
+ *   - No springs, no fluids, no contact dynamics, no
+ *     numerical integration.
+ *   - Want to speed up / slow down with time-scale slider.
+ *
+ * Indicator that fixed-step is REQUIRED:
+ *   - Physics integration (Verlet, RK4, Euler) on stiff
+ *     systems.
+ *   - Constraint solvers (rigid body, cloth, ragdoll).
+ *   - Reproducibility critical (same seed = same result).
+ *
+ * Most files in this project use FIXED-STEP for safety.
+ * The artistic/ folder + a few others (matrix_rain,
+ * sun_solar, pure visualisations) use variable.
+ *
+ * T7  RESIZE + SIGNALS — SIGWINCH AND atexit CLEANUP
+ * ──────────────────────────────────────────────────
+ * Three signals matter:
+ *
+ *   SIGINT (Ctrl-C) + SIGTERM    user wants to quit
+ *   SIGWINCH                      terminal resized
+ *
+ * Signal handlers can run AT ANY MOMENT, including in the
+ * middle of an mvaddch().  They MUST NOT call ncurses
+ * functions, malloc, or anything not async-signal-safe.
+ *
+ * Standard pattern:
+ *
+ *     volatile sig_atomic_t g_running = 1;
+ *     volatile sig_atomic_t g_resize = 0;
+ *
+ *     void on_signal(int sig) {
+ *       if (sig == SIGWINCH) g_resize = 1;
+ *       else                 g_running = 0;
+ *     }
+ *
+ *     // in main:
+ *     signal(SIGINT, on_signal);
+ *     signal(SIGTERM, on_signal);
+ *     signal(SIGWINCH, on_signal);
+ *
+ *     while (g_running) {
+ *       if (g_resize) {
+ *         g_resize = 0;
+ *         endwin();          ← reset ncurses to new size
+ *         refresh();         ← restart with new LINES/COLS
+ *         re_derive_layout();
+ *       }
+ *       // ... rest of frame
+ *     }
+ *
+ * Cleanup via atexit:
+ *
+ *     atexit(endwin);
+ *
+ * Ensures the terminal is restored even on abnormal exit
+ * (assert fail, segfault if registered before, etc.).
+ *
+ * Without atexit endwin, a crash leaves the terminal in raw
+ * mode — no echo, no line buffering, often garbled.  User
+ * has to run `reset` or close the terminal.
+ *
+ * T8  WHEN TO DEVIATE — PIXEL-SPACE VS CELL-SPACE, ROTATION, etc.
+ * ───────────────────────────────────────────────────────────────
+ * The §1..§8 template fits MOST animations.  Variations:
+ *
+ *   CELL-SPACE simulations (CAs, fire, sand, matrix_rain):
+ *     skip §4 coords entirely.  Each cell IS the simulation
+ *     unit; no pixel↔cell math needed.
+ *
+ *   POLAR-COORDINATE simulations (mandalas, pulsars):
+ *     §4 has polar→cell conversion with ASPECT correction
+ *     (sin·0.5 to compensate for 2:1 cell aspect).
+ *
+ *   3-D RENDERING (raster/, raymarcher/, raytracing/):
+ *     §4 expands into projection matrices, MVP, NDC mapping.
+ *     §5 entity becomes Mesh + shaders.
+ *
+ *   STATELESS animations:
+ *     replace fixed-step accumulator with variable dt;
+ *     entity_tick becomes entity_at_time(t).
+ *
+ *   MULTI-LAYERED scenes:
+ *     §6 scene becomes a list of LAYERS, each with its own
+ *     entity pool; draw in painter's order.
+ *
+ * Common to ALL variations:
+ *   - §1 config = magic numbers
+ *   - §2 clock = monotonic time
+ *   - §3 color = palette setup
+ *   - §7 screen = ncurses init/cleanup
+ *   - §8 app = signals + main loop
+ *
+ * The skeleton STAYS.  The flesh changes.
+ *
+ * For a NEW animation: copy this file, replace §5 entity
+ * with your simulation, tweak §1 config, done.  No header
+ * to include, no library to link beyond ncurses + libm.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

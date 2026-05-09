@@ -14,7 +14,7 @@
  * Keys: q quit  SPACE new points  p pause  +/- speed
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra misc/convex_hull.c \
+ *   gcc -std=c11 -O2 -Wall -Wextra algorithms/convex_hull.c \
  *       -o convex_hull -lncurses -lm
  *
  * §1 config  §2 clock  §3 color  §4 algorithms  §5 draw  §6 app
@@ -44,6 +44,280 @@
  * Performance    : Graham scan is O(N log N) due to the sort step.
  *                  The stack sweep is O(N) — each point is pushed/popped ≤ once.
  *                  Jarvis march O(N·h): at worst O(N²) but optimal for small h.
+ *
+ * References     :
+ *   Graham, "An efficient algorithm for determining the convex hull
+ *     of a finite planar set," Inf. Proc. Lett. 1 (1972).
+ *   Jarvis, "On the identification of the convex hull of a finite
+ *     set of points in the plane," Inf. Proc. Lett. 2 (1973).
+ *   de Berg et al., "Computational Geometry: Algorithms and
+ *     Applications" (3rd ed., 2008) ch. 1.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A convex hull is the smallest convex polygon containing every
+ * given point.  Equivalently: stretch a rubber band around all
+ * the points and let it snap tight.  The polygon it forms IS
+ * the convex hull.  Two algorithms compute it differently:
+ * Graham SORTS by angle then sweeps; Jarvis WRAPS by repeatedly
+ * picking the next-most-counter-clockwise neighbour.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ *   GRAHAM SCAN:  imagine a bottom-anchored radar dish sweeping
+ *     anti-clockwise.  As it hits each point in angular order,
+ *     decide: does adding this point keep my hull convex?  If
+ *     not, BACK UP — pop the previous point off the stack — and
+ *     re-check.  After one full sweep the stack holds the hull.
+ *
+ *   JARVIS MARCH:  imagine wrapping a string around the points.
+ *     Start at the lowest point; the next hull point is the one
+ *     most COUNTER-CLOCKWISE from your current hull point (the
+ *     one that's "leftmost as seen from the current direction").
+ *     Repeat until you wrap back to start.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  GRAHAM:
+ *   1. Find the LOWEST point (smallest y, leftmost on tie) — it's
+ *      definitely on the hull.  Call it P0.
+ *   2. Sort all other points by POLAR ANGLE from P0.
+ *   3. Initialize stack with P0, P1.
+ *   4. For each remaining point P:
+ *        while stack has ≥2 points AND turning at the top is NOT
+ *              counter-clockwise:
+ *          stack.pop()
+ *        stack.push(P)
+ *   5. Stack contains the hull (in counter-clockwise order).
+ *
+ *  JARVIS:
+ *   1. current = lowest point.  hull = [current].
+ *   2. Repeat:
+ *        next = current
+ *        for each candidate C ≠ current:
+ *          if next == current OR (next is to RIGHT of current→C line):
+ *            next = C
+ *        if next == hull[0]: done
+ *        else: hull.push(next); current = next.
+ *
+ * KEY FORMULA
+ * ───────────
+ *  Cross product (winding direction):
+ *    cross(A, B, C) = (Bx - Ax) · (Cy - Ay) - (By - Ay) · (Cx - Ax)
+ *
+ *      > 0   →  A → B → C makes a LEFT (counter-clockwise) turn
+ *      < 0   →  RIGHT (clockwise) turn — not on hull
+ *      = 0   →  collinear (depends on tie-break policy)
+ *
+ *  This single primitive drives BOTH algorithms; computational
+ *  geometry runs on cross-product signs.
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *  • Colinear points: cross == 0.  Graham keeps the FARTHEST
+ *    one from P0 (handle in the angle-sort comparator); Jarvis
+ *    treats them as "same direction, pick farthest."
+ *  • Duplicate points: handled by the sort step in Graham
+ *    (duplicates produce stable order); Jarvis sees them as
+ *    candidates with the same angle and picks one consistently.
+ *  • All points collinear: hull is a degenerate line segment
+ *    (2 endpoints).  Graham's sweep still produces it; Jarvis
+ *    walks back and forth.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *  • At default 40 points, Graham finishes in ~40 steps;
+ *    Jarvis in ~h steps where h is the hull size (typically
+ *    8-15).  HUD shows step counts.
+ *  • Both algorithms produce the IDENTICAL hull when finished
+ *    (same set of points).  Order may differ.
+ *  • Press SPACE for new points: many random distributions
+ *    cluster the hull at the boundary; both algorithms find
+ *    the same extreme points.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *      Read sort_vis.c first if state-machine algorithm animation
+ *      is new.  Same coroutine pattern: each algorithm step does
+ *      ONE comparison/operation per tick.
+ *   2. §4 algorithms — graham_scan_step + jarvis_march_step.
+ *      Read AFTER tutorials T1-T4 below.
+ *   3. §5 draw — split-panel renderer.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   pts[N_POINTS]              the input point set (random).
+ *   gr_stack[]                 Graham's stack (active hull
+ *                              candidates).
+ *   ja_hull[]                  Jarvis's hull (committed points).
+ *   pivot                      lowest-y point — anchor for both
+ *                              algorithms.
+ *   cross(A, B, C)             winding determinant (T2).
+ *
+ * Background you need
+ * ───────────────────
+ *   - Sorting (Graham uses qsort).
+ *   - Stack as last-in-first-out array.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Quickhull, chan's algorithm, monotone chain — other hull
+ *     algorithms.  Two basic ones suffice for the lesson.
+ *   - 3-D convex hulls (much harder problem).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Four tutorials that build two convex-hull algorithms.
+ *
+ *   T1  What IS a convex hull, and why care?
+ *   T2  The cross product as winding determinant
+ *   T3  Graham scan — sort, then sweep
+ *   T4  Jarvis march — wrap by always turning left
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHAT IS A CONVEX HULL, AND WHY CARE?
+ * ────────────────────────────────────────
+ * A POLYGON is CONVEX if every line segment between two of
+ * its points stays INSIDE the polygon.  The CONVEX HULL of a
+ * set of points is the smallest convex polygon enclosing all
+ * of them.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │           ●                                      │
+ *      │      ●         ●                                 │
+ *      │   ●        ●         ●                           │
+ *      │              ●                                   │
+ *      │   ●               ●                              │
+ *      │      ●        ●                                  │
+ *      │                                                  │
+ *      │   the rubber-band polygon enclosing all dots     │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Use cases:
+ *   - Collision detection (bounding hulls in games / physics)
+ *   - Pattern recognition (shape descriptors)
+ *   - Computational geometry primitives (used inside Voronoi
+ *     diagrams, Delaunay triangulation, etc.)
+ *   - Quality control (find the extreme outliers in a sample)
+ *
+ * Both algorithms in this file solve the same problem; we
+ * compare them side-by-side because their TRADE-OFFS differ:
+ *   - Graham:  always O(N log N), good for large N.
+ *   - Jarvis:  O(N · h), beats Graham when h ≪ N.
+ *
+ * T2  THE CROSS PRODUCT AS WINDING DETERMINANT
+ * ────────────────────────────────────────────
+ * The most important primitive in computational geometry:
+ *
+ *     cross(A, B, C) = (Bx - Ax)(Cy - Ay) - (By - Ay)(Cx - Ax)
+ *
+ * Geometrically this is the SIGNED AREA of the parallelogram
+ * spanned by vectors (B - A) and (C - A).  Sign tells you
+ * the WINDING:
+ *
+ *      cross > 0       cross < 0       cross = 0
+ *
+ *           C              C
+ *            \            /
+ *      A ─── B        A ─── B          A ── B ── C
+ *      (LEFT turn)    (RIGHT turn)     (collinear)
+ *
+ * Equivalently: "is C to the LEFT of the line A→B?"
+ *
+ * Both algorithms answer that one question many times:
+ *   Graham: "is the new point a left turn from the previous
+ *            two on the stack?"
+ *   Jarvis: "is candidate C to the left of the current ray?"
+ *
+ * The cross product is one MULTIPLY + one MULTIPLY + one
+ * SUBTRACT.  No trig, no division, no floating-point catastrophe
+ * (when inputs are bounded floats).
+ *
+ * T3  GRAHAM SCAN — SORT, THEN SWEEP
+ * ──────────────────────────────────
+ * Graham (1972) observed: if you process points in ANGULAR
+ * ORDER from a fixed pivot, the convex hull can be assembled
+ * in ONE LINEAR SWEEP using a stack.
+ *
+ * Step-by-step:
+ *
+ *   1. PIVOT: find the lowest point P0.  It's on the hull
+ *      (extreme in y).
+ *
+ *   2. SORT: order all other points by their polar angle from
+ *      P0.  Now we walk them in counter-clockwise order.
+ *
+ *   3. SWEEP:
+ *      stack = [P0, P1]
+ *      for each subsequent P:
+ *        while stack has ≥ 2 elements AND
+ *              cross(stack[-2], stack[-1], P) ≤ 0:
+ *          stack.pop()       ← stack[-1] is NOT on the hull
+ *        stack.push(P)
+ *
+ * The "while pop" step is the magic: when adding P would
+ * create a non-LEFT turn at stack[-1], that means stack[-1]
+ * is INSIDE the hull (some triangle with P excludes it).
+ * Pop it and re-check.
+ *
+ * Cost: sort = O(N log N).  Sweep = O(N) (every point pushed
+ * once, popped at most once).  Total: O(N log N).
+ *
+ * Watch the demo: the sweep is animated, so you SEE the pop
+ * step retract the stack at each non-convex turn.
+ *
+ * T4  JARVIS MARCH — WRAP BY ALWAYS TURNING LEFT
+ * ──────────────────────────────────────────────
+ * Jarvis (1973) — also known as GIFT WRAPPING — produces the
+ * hull one vertex at a time:
+ *
+ *   current = lowest point P0   (definitely on hull)
+ *   hull = [P0]
+ *
+ *   repeat:
+ *     next = some point ≠ current
+ *     for each candidate C ≠ current:
+ *       if cross(current, next, C) < 0:
+ *         next = C           ← C is more counter-clockwise
+ *     if next == P0: break    ← wrapped back to start
+ *     else: hull.push(next); current = next
+ *
+ * "Always pick the most LEFT point relative to my current
+ * heading" — exactly what wrapping a string around the
+ * points would do.
+ *
+ * Cost: each hull vertex requires O(N) candidate checks.
+ * If the hull has h vertices, total is O(N · h).
+ *
+ * COMPARISON:
+ *   - h = 3 (triangle): Jarvis is O(3N), Graham is O(N log N).
+ *     Jarvis wins for small h.
+ *   - h = N (all points on hull, e.g. circle): Jarvis is
+ *     O(N²), Graham is O(N log N).  Graham wins.
+ *   - Random points in the plane: h grows as O(log N) on
+ *     average, so Jarvis is ~O(N log N) on random input.
+ *     Wash.
+ *
+ * The animation lets you SEE Jarvis "wrap" — it cleanly walks
+ * one hull edge per outer-loop tick.  Watching the two
+ * algorithms run side-by-side shows that their visual
+ * "personality" differs (sweep vs march) even though the
+ * RESULT is identical.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

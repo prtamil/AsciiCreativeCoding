@@ -26,7 +26,7 @@
  *   ] / [     raise / lower simulation Hz
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra geometry/quad_tree_helloworld.c \
+ *   gcc -std=c11 -O2 -Wall -Wextra algorithms/quad_tree_helloworld.c \
  *       -o qt_hello -lncurses -lm
  *
  * §1 config  §2 clock  §3 color  §4 canvas  §5 quadtree  §6 scene
@@ -58,6 +58,300 @@
  * Pool allocator:
  *   All nodes live in a fixed-size static array; no malloc or free.
  *   Reset = set the used-count back to zero and re-create the root node.
+ *
+ * References    :
+ *   Finkel & Bentley, "Quad trees" (Acta Informatica 4, 1974).
+ *   Samet, "The design and analysis of spatial data structures"
+ *     (1990) — the textbook.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Watch a quadtree GROW.  Each tick a new random point arrives;
+ * if it lands in a leaf at full capacity, the leaf SUBDIVIDES
+ * into 4 children (NW/NE/SW/SE) — visible as four nested
+ * borders appearing.  After all points are inserted, an orange
+ * QUERY RECTANGLE bounces around; points inside it glow green
+ * and the algorithm prunes whole subtrees that don't overlap.
+ *
+ * The animation IS the algorithm: every visible event (point
+ * arrives, subdivision happens, query result changes) corresponds
+ * to one operation of the underlying data structure.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a piece of paper as the [0, 1] × [0, 1] unit square.
+ * Drop random dots one at a time.  Whenever a region holds 4
+ * dots, draw lines splitting it into 4 quadrants.  After all
+ * dots placed, you have a "stained glass" pattern of variable-
+ * sized cells — small where dots cluster, big where they're
+ * sparse.
+ *
+ * Now sweep an orange rectangle around.  At each frame, the
+ * QUERY OPERATION descends the tree, skipping cells whose
+ * region doesn't overlap the rectangle, and reports points
+ * inside.  Visualised as: dots inside rectangle → green,
+ * outside → faded.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  PHASE 1 (INSERT): once per ~0.4 sec
+ *    1. Generate random point (x, y) ∈ [0, 1]².
+ *    2. Descend tree: at each non-leaf, route to NW/NE/SW/SE
+ *       child whose rect contains the point.
+ *    3. At leaf: if leaf has room (count < 3), append; done.
+ *       Else: subdivide leaf into 4 children, redistribute
+ *       leaf's existing points + the new one into the
+ *       correct children, recurse if needed.
+ *
+ *  PHASE 2 (QUERY): every render frame
+ *    1. Move orange rectangle along Lissajous path.
+ *    2. Recursively query tree:
+ *         if node.rect doesn't overlap rectangle: prune
+ *         if leaf: scan; report points inside rectangle
+ *         else: recurse into all 4 children
+ *    3. Render: green for reported points, faded for others.
+ *
+ *  After ~22 sec of phase 2, auto-reset to phase 1 with a fresh
+ *  empty tree.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Quadrant routing: given point (x, y) and node rect
+ *                     [x0, x0+w] × [y0, y0+h]:
+ *     mid_x = x0 + w/2;  mid_y = y0 + h/2
+ *     west  = (x < mid_x);  north = (y < mid_y)
+ *     index: NW=0, NE=1, SW=2, SE=3
+ *
+ *   Bounding-box overlap (rect_overlap):
+ *     R1 ∩ R2 ≠ ∅ iff
+ *       R1.x_min ≤ R2.x_max AND R1.x_max ≥ R2.x_min
+ *       AND same for y
+ *
+ *   Pool allocator:
+ *     g_pool[NODE_POOL_SIZE] static array
+ *     g_used = next free index
+ *     allocate: return &g_pool[g_used++]
+ *     reset:    g_used = 0
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • MAX_TREE_DEPTH = 5: prevents infinite subdivision when
+ *     points cluster on top of each other (perfectly
+ *     coincident points can't be separated by spatial
+ *     subdivision).  At depth 5, the leaf accepts overflow.
+ *   • POOL_SIZE = 512: with 30 points and cap 3, worst-case
+ *     node count is well under 200.  512 is generous.
+ *   • Rectangle bouncing: when query rect hits the unit-square
+ *     edge, velocity flips.  Position clamp keeps it inside.
+ *   • Resize: re-derives the canvas from new (cols, rows);
+ *     tree state preserved.  No rebuild needed.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Phase 1 timing: 30 points × 0.42 sec = ~12.6 sec.
+ *     HUD shows running insertion count.
+ *   • Tree depth: at end of phase 1, deepest leaves typically
+ *     2-4 levels deep.  Visible border thickness varies by
+ *     depth.
+ *   • Query: green dots count matches HUD's "in query" number.
+ *     Drag the rectangle over a dense cluster: many greens.
+ *     Drag to empty corner: zero greens.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *      algorithms/quadtree.c is the LIBRARY-style sibling of this
+ *      file (CLI, "press Enter" demo, no animation).  This file
+ *      is the ANIMATED ncurses version.  Same algorithm.
+ *      algorithms/bsp_tree.c and algorithms/kd_tree.c cover the
+ *      2-children alternatives.
+ *   2. §5 quadtree — tree_insert + tree_query + subdivide.
+ *      THE HEART of this file.  Read AFTER tutorials T1-T4.
+ *   3. §6 scene — phase 1 (INSERT) + phase 2 (QUERY) state
+ *      machine.
+ *   4. §4 canvas — the screen-space rendering of the [0, 1]²
+ *      tree.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   g_pool[]                   static node array (no malloc).
+ *   g_used                     next-free index into pool.
+ *   g_root                     pointer to root (always
+ *                              g_pool + 0 after reset).
+ *   QuadNode .children[4]      indices into g_pool for NW/NE/SW/SE
+ *                              (or -1 for leaf).
+ *   QuadNode .count, .pts[]    leaf data — only valid when
+ *                              children[0] == -1.
+ *   query_rect                 the orange Lissajous-bouncing
+ *                              rectangle.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Recursion + tree pointer manipulation.
+ *   - Static memory pool (no malloc/free).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Octrees (3-D analogue).
+ *   - Loose / point-region quadtree variants.
+ *   - Real-time spatial database systems (R-trees etc.).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Four tutorials that build an animated quadtree from first
+ * principles.
+ *
+ *   T1  Why animate? — turning the algorithm into a state machine
+ *   T2  The pool allocator — fast, deterministic, leak-proof
+ *   T3  Insert + subdivide — what happens visually
+ *   T4  Query as visualisation — green / faded for in/out
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHY ANIMATE? — TURNING THE ALGORITHM INTO A STATE MACHINE
+ * ─────────────────────────────────────────────────────────────
+ * The companion file algorithms/quadtree.c is a CLI tool: it
+ * inserts 12 points, prints the tree, you press Enter to
+ * advance.  Educational but STATIC.
+ *
+ * This file goes further: each operation is paced over time,
+ * the tree GROWS visibly, and after insertion phase a query
+ * rectangle bounces through the tree showing pruning live.
+ *
+ * The state machine has TWO PHASES:
+ *
+ *   PHASE 1 (INSERT):
+ *     ticks at SECONDS_PER_INSERTION ≈ 0.42 sec.
+ *     each tick: insert one new point.
+ *     after DEMO_POINT_COUNT = 30 insertions: → PHASE 2.
+ *
+ *   PHASE 2 (QUERY):
+ *     every render frame: query rectangle moves; query runs.
+ *     after QUERY_PHASE_DURATION ≈ 22 sec: → PHASE 1 (reset).
+ *
+ * This is the SAME state-machine pattern used in
+ * algorithms/sort_vis.c (one comparison per tick),
+ * procedural/generational/maze.c (one cell carved per tick),
+ * matrix_rain/matrix_snowflake.c (FALL ↔ FLASH).
+ *
+ * GENERAL RULE: to animate any algorithm, factor it into
+ * "one operation per tick" + "render the current state."
+ *
+ * T2  THE POOL ALLOCATOR — FAST, DETERMINISTIC, LEAK-PROOF
+ * ────────────────────────────────────────────────────────
+ * Naive: each subdivide() malloc()'s 4 new nodes; reset
+ * free()'s the entire tree recursively.
+ *
+ * Better: PRE-ALLOCATE a static array of nodes; track a
+ * NEXT-FREE INDEX:
+ *
+ *     static QuadNode g_pool[NODE_POOL_SIZE];
+ *     static int     g_used = 0;
+ *
+ *     int alloc_node(...):
+ *       if (g_used >= NODE_POOL_SIZE) return -1;  ← exhausted
+ *       int idx = g_used++;
+ *       g_pool[idx] = (QuadNode){ ... };
+ *       return idx;
+ *
+ *     void reset_pool():
+ *       g_used = 0;        ← that's it — no per-node free
+ *
+ * Properties:
+ *   - O(1) allocation, O(1) reset.
+ *   - DETERMINISTIC memory (no heap fragmentation).
+ *   - LEAK-PROOF (no malloc means no missed free).
+ *   - Children referenced by INDEX (int) instead of pointer,
+ *     so the pool can be moved/realloc'd without invalidating
+ *     references.  Often used in cache-friendly graph
+ *     storage too.
+ *
+ * Sized at 512 nodes: with 30 points and LEAF_CAPACITY=3,
+ * worst-case node count is well under 200.  Generous margin.
+ *
+ * Same pattern is used in many real-time systems where
+ * malloc would be unpredictable: game engines, embedded
+ * systems, audio plugins.  No GC pauses, no allocation
+ * spikes.
+ *
+ * T3  INSERT + SUBDIVIDE — WHAT HAPPENS VISUALLY
+ * ──────────────────────────────────────────────
+ * tree_insert(point P):
+ *   1. Descend from root.  At each node, check if P falls
+ *      in this node's rect (fast bbox test).
+ *   2. If LEAF AND has room: append P to leaf.pts[].  Done.
+ *   3. If LEAF AND FULL (count == LEAF_CAPACITY):
+ *        a. SUBDIVIDE: create 4 children (NW/NE/SW/SE), each
+ *           a leaf with rect = sub-quadrant of this node.
+ *        b. REDISTRIBUTE: route each existing point to the
+ *           child whose rect contains it.
+ *        c. CONVERT: this node becomes INTERNAL.
+ *        d. RECURSE: insert P into the appropriate child.
+ *   4. If INTERNAL: recurse into the appropriate child.
+ *
+ * Visually: when subdivide() fires, FOUR new sub-rects
+ * suddenly appear within the parent rect.  The 3-4 points
+ * already in the leaf SHIFT to their new home leaves
+ * (visually they don't move — only the borders around them
+ * change).  The new point arrives at one of the 4 children.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  before:                  after subdivide:       │
+ *      │                                                  │
+ *      │   ┌─────────────┐          ┌─────┬─────┐         │
+ *      │   │             │          │ ●   │     │         │
+ *      │   │ ●  ●  ●     │   →      ├─────┼─────┤         │
+ *      │   │       ●     │          │  ●  │  ●● │         │
+ *      │   └─────────────┘          └─────┴─────┘         │
+ *      │                                                  │
+ *      │  4 points in 1 leaf       distributed in 4 sub-  │
+ *      │  (full)                   leaves                 │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * The animation paces these subdivisions one per tick so the
+ * user can SEE each subdivision happen.  Real production
+ * inserts run at full speed.
+ *
+ * T4  QUERY AS VISUALISATION — GREEN / FADED FOR IN / OUT
+ * ───────────────────────────────────────────────────────
+ * Phase 2 brings in the QUERY RECTANGLE.  Each frame:
+ *
+ *   1. MOVE rectangle (Lissajous bounce).
+ *   2. tree_query(root, query_rect, results)
+ *        → recursively descends, prunes non-overlapping
+ *          subtrees, collects points inside query rect into
+ *          `results` array.
+ *   3. RENDER:
+ *        - Tree borders + non-result points: faded.
+ *        - Result points: GREEN BOLD.
+ *        - Query rectangle: ORANGE outline.
+ *        - Subtrees pruned by overlap test: visually subtle
+ *          but the borders still draw (we always show
+ *          the structure, only highlight the result).
+ *
+ * The PEDAGOGICAL VALUE: watching the rectangle move from
+ * a sparse area into a dense cluster, you SEE the green-
+ * point count jump.  The tree's structure makes it obvious
+ * why some queries are fast (rectangle in empty quadrant
+ * means immediate skip) and others slower (rectangle covers
+ * a fine-subdivided cluster means many leaf scans).
+ *
+ * Same pattern of "highlight the algorithm's CURRENT
+ * ATTENTION" appears in algorithms/sort_vis.c (gold for
+ * compare, red for swap), algorithms/graph_search.c (cyan
+ * for frontier, yellow for path), and any other algorithm
+ * visualiser.  The colour code IS the algorithm's
+ * communication channel.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

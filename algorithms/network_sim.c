@@ -168,6 +168,309 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *      Read algorithms/graph_search.c first if adjacency lists are
+ *      new — that file has the same Watts-Strogatz layout idea
+ *      (random graph + force layout) for a different purpose.
+ *      Read flocking/flocking.c if you want a totally different
+ *      "interacting agents on a graph" example.
+ *   2. §5 SIR — the per-tick transition rule + staged update.
+ *      THE HEART of this file.  Read AFTER tutorials T1-T5.
+ *   3. §4 graph — Watts-Strogatz construction (T2).
+ *   4. §6 draw — split layout (network ring + epidemic curve).
+ *   5. §1-§3, §7 — config / clock / colour / app loop.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   g_state[i]                  current SIR state of node i.
+ *   g_nxt[i]                    next-tick state — staged so the
+ *                               update is SYNCHRONOUS (T3).
+ *   g_adj[i][j]                 1 if edge i↔j exists, 0 otherwise.
+ *                               Symmetric (undirected graph).
+ *   g_rewired[i][j]             1 if this is a "shortcut" rewired
+ *                               edge (used for yellow highlighting
+ *                               of small-world long-range links).
+ *   g_β, g_γ                    transmission + recovery rates.
+ *   N_NODES                     40.
+ *   WS_K = 4                    ring lattice degree (each node has
+ *                               K/2 neighbours on each side).
+ *   WS_P = 0.15                 rewiring probability per edge.
+ *   g_hist[]                    rolling (S, I, R) history for the
+ *                               right-panel curve.  Capacity 500
+ *                               ticks.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Adjacency-matrix graph storage.
+ *   - Probability: a coin with P(heads) = β, flipped per (I, S)
+ *     edge per tick.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Differential equations.  The continuous SIR ODE
+ *     (dS/dt = -βSI/N etc.) is the limit of large-N stochastic
+ *     simulation; we use the stochastic version directly.
+ *   - Stochastic differential equations / master equations.
+ *   - Real epidemiology (R_eff vs R_0, contact tracing,
+ *     interventions).  We use the simplest textbook model.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build a stochastic SIR epidemic on a
+ * small-world network from first principles.
+ *
+ *   T1  The SIR model — three boxes, two transitions
+ *   T2  Watts-Strogatz — small-world from ring + rewiring
+ *   T3  Synchronous update — staged transitions in nxt[]
+ *   T4  R₀ — the threshold that decides extinction vs outbreak
+ *   T5  Epidemic curve — the global view of a local process
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE SIR MODEL — THREE BOXES, TWO TRANSITIONS
+ * ────────────────────────────────────────────────
+ * Kermack & McKendrick (1927) proposed the SIR model: every
+ * individual is in one of THREE STATES at any time:
+ *
+ *     S  Susceptible  — has not been infected; can catch it
+ *     I  Infected     — currently has it; can transmit it
+ *     R  Recovered    — had it, now immune; cannot catch or
+ *                       transmit
+ *
+ * Two transitions can happen each tick, both probabilistic:
+ *
+ *     S → I   transmission, per (I, S) edge, probability β
+ *     I → R   recovery, per I node, probability γ
+ *
+ * That's IT.  Two rates control the entire dynamic:
+ *   β = transmission rate (how contagious)
+ *   γ = recovery rate     (how quickly people get over it)
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │     Susceptible              β             Infected│
+ *      │           S    ─────────────────────────→   I    │
+ *      │                                              │   │
+ *      │                              γ              ↓   │
+ *      │                              ←──────────── R    │
+ *      │                                          Recovered│
+ *      │                                                  │
+ *      │  Note: there is NO R → S transition.            │
+ *      │  Once recovered, immune for life (this model).  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Real-world refinements (SEIR with Exposed, SIRS with
+ * waning immunity, age-structured models) layer on top of
+ * this basic three-box model.  We use the simplest version.
+ *
+ * The stochastic version (used here): each tick, flip
+ * coins.  The deterministic version (the famous SIR ODE)
+ * is the large-N limit:
+ *
+ *     dS/dt = -β·S·I/N
+ *     dI/dt = +β·S·I/N - γ·I
+ *     dR/dt = +γ·I
+ *
+ * We don't integrate the ODE — at N=40 the stochastic
+ * version is more interesting because individual-level
+ * noise is visible.
+ *
+ * T2  WATTS-STROGATZ — SMALL-WORLD FROM RING + REWIRING
+ * ─────────────────────────────────────────────────────
+ * Watts & Strogatz (1998) noticed that real-world social
+ * networks have TWO properties simultaneously:
+ *
+ *     HIGH CLUSTERING — your friends are usually friends
+ *                       with each other (local triangles)
+ *     SHORT PATHS     — but you're typically only 6 hops
+ *                       from any random stranger ("six
+ *                       degrees of separation")
+ *
+ * REGULAR LATTICES (everyone connected only to nearby
+ * neighbours on a ring) have high clustering but LONG
+ * paths.  RANDOM GRAPHS have short paths but LOW
+ * clustering.  How to get both?
+ *
+ * Their construction:
+ *
+ *     1. Start with a RING LATTICE: connect each node to
+ *        its K/2 = 2 nearest neighbours on each side.
+ *        Total degree K = 4.  This gives high clustering.
+ *
+ *     2. For each existing edge (i, j), with probability
+ *        p = 0.15, REWIRE it to a random target:
+ *          old: edge (i, j)
+ *          new: edge (i, k) where k is random
+ *
+ *        These rewired edges are SHORTCUTS that drastically
+ *        reduce the average path length without much
+ *        affecting clustering.
+ *
+ * Result: a SMALL-WORLD NETWORK.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   ring lattice (p=0):     small-world (p=0.15):  │
+ *      │                                                  │
+ *      │      ●─●                       ●─●               │
+ *      │     ╱   ╲                     ╱   ╲              │
+ *      │    ●     ●                   ●     ●             │
+ *      │    │     │      +rewire     │     │             │
+ *      │    ●     ●        →          ●═════●─────●       │
+ *      │     ╲   ╱                     ╲   ╱   ↑   ╲      │
+ *      │      ●─●                       ●─●  shortcut    │
+ *      │                                                  │
+ *      │   high clustering            high clustering    │
+ *      │   long paths                 SHORT paths        │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Implication for epidemiology: in a pure ring, infection
+ * spreads as a wave that takes O(N) hops to circle.  With
+ * shortcuts, infection JUMPS across, reaching the whole
+ * network in O(log N) hops.  This is why air travel
+ * matters for pandemic spread.
+ *
+ * T3  SYNCHRONOUS UPDATE — STAGED TRANSITIONS IN nxt[]
+ * ────────────────────────────────────────────────────
+ * The naïve update is ASYNCHRONOUS:
+ *
+ *     for each I node:
+ *       maybe recover (set state[i] = R)
+ *       for each S neighbour: maybe infect (set state[j] = I)
+ *
+ * Problem: this lets node 5 infect node 6 in the SAME tick,
+ * and then node 6 (now I) tries to infect node 7 in the SAME
+ * tick.  The infection front moves at "instant speed" within
+ * one tick — physically wrong and order-dependent.
+ *
+ * Fix: SYNCHRONOUS UPDATE via STAGED TRANSITIONS:
+ *
+ *     for each I node:
+ *       if random() < γ: nxt[i] = R              ← stage, don't apply
+ *       for each neighbour j:
+ *         if state[j] == S and random() < β:
+ *           nxt[j] = I                            ← stage, don't apply
+ *
+ *     state = nxt    ← apply ALL transitions atomically
+ *
+ * Now an I that just infected its S neighbour cannot
+ * "instantly transmit further" through that newly-infected
+ * neighbour in the same tick.  The infection front advances
+ * AT MOST ONE EDGE per tick.
+ *
+ * Same pattern as flocking.c T7 (read all, then write all)
+ * and any cellular automaton: when every entity's NEXT state
+ * depends on EVERY OTHER entity's CURRENT state, you need a
+ * separate buffer.
+ *
+ * Also notice: the loop checks `state[j] == S`, NOT
+ * `nxt[j] == S`.  This means TWO infected neighbours of the
+ * same S can't double-record the transition (they both write
+ * to the same nxt[j] slot — last write wins, but the result
+ * is the same: nxt[j] = I).  No double-infection bug.
+ *
+ * T4  R₀ — THE THRESHOLD THAT DECIDES EXTINCTION VS OUTBREAK
+ * ──────────────────────────────────────────────────────────
+ * The basic reproduction number R₀ ("R-naught") is:
+ *
+ *     R₀ = β · ⟨k⟩ / γ
+ *
+ * Where ⟨k⟩ is the mean degree (here ≈ 4).  Interpretation:
+ * "if I patient zero, how many SECONDARY cases on average?"
+ *
+ *   R₀ > 1   each infection produces >1 new infections;
+ *            outbreak grows exponentially.
+ *
+ *   R₀ = 1   each infection produces ~1 new; epidemic
+ *            balances (hovers).
+ *
+ *   R₀ < 1   each infection produces <1 new; epidemic
+ *            FIZZLES, fades to extinction.
+ *
+ * Examples:
+ *   COVID-19 original (no immunity): R₀ ≈ 2.5
+ *   Measles (no vaccine):              R₀ ≈ 12
+ *   Common cold:                      R₀ ≈ 2-3
+ *   Flu (seasonal):                   R₀ ≈ 1.3
+ *
+ * In this simulation the HUD displays R₀ live, coloured RED
+ * if > 1 (likely outbreak) or GREEN if < 1 (likely
+ * extinction).  Press ↑/↓/←/→ to tune β/γ live and watch
+ * R₀ cross the threshold — at R₀ slightly above 1, you can
+ * see stochastic die-out (sometimes a small outbreak still
+ * fizzles by chance), while at R₀ ≈ 5 outbreaks are
+ * essentially guaranteed.
+ *
+ * R₀ is the SINGLE most important number in epidemiology.
+ * It's what intervention strategies (vaccination, distancing,
+ * masking) try to reduce below 1.  This file lets you see
+ * the threshold in action.
+ *
+ * T5  EPIDEMIC CURVE — THE GLOBAL VIEW OF A LOCAL PROCESS
+ * ───────────────────────────────────────────────────────
+ * The left panel shows individual nodes.  The right panel
+ * shows the AGGREGATE — counts of S, I, R over time.
+ *
+ * Each tick we record (S_count, I_count, R_count) into a
+ * rolling 500-tick history buffer.  The display draws each
+ * column as a STACKED BAR:
+ *
+ *     bottom (green, '-')   = R count
+ *     middle (red,    '#')  = I count
+ *     top    (grey,   '=')  = S count
+ *
+ * Total height = N (40), so the bar fills the panel
+ * regardless of phase.  Reading left-to-right is reading
+ * forward in time.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │   N ─────────────────────────────────────────    │
+ *      │       =                                          │
+ *      │       ==                                         │
+ *      │       ==#                                        │
+ *      │       ==##                                       │
+ *      │       =####                                      │
+ *      │       =####-                                     │
+ *      │   --############                                 │
+ *      │   ----############---                            │
+ *      │   ------------############----                   │
+ *      │   0 ────────────────────────────────────────     │
+ *      │     ←──── time ────→                             │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * The curve shape tells the story:
+ *
+ *   - WAVE: R₀ > 1, infection grows then declines as
+ *     susceptibles run out.  Classic "epidemic wave."
+ *
+ *   - DOUBLE PEAK: rare; happens if a fresh seed is
+ *     introduced after the first wave.
+ *
+ *   - FIZZLE: R₀ < 1, I count drops to 0 quickly;
+ *     epidemic curve is a small bump at the start.
+ *
+ *   - HERD IMMUNITY POINT: when R count reaches
+ *     1 - 1/R₀ of N, new infections can no longer be
+ *     sustained even with R₀ > 1 — the epidemic
+ *     declines naturally.  Visible as the moment the I
+ *     bar peaks and starts shrinking.
+ *
+ * The interplay between local interactions (per-edge
+ * β coin flips) and global behaviour (the curve) is what
+ * makes this simulation interesting.  Same structure
+ * underpins forest fires (forest_fire.c — fire-tree-empty
+ * three-state CA) and many other "spreading process"
+ * simulations.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

@@ -51,6 +51,297 @@
  *                    dv/dt = −γ·v + σ·ξ  (ξ = white noise)
  *                  This is Ornstein-Uhlenbeck process — Brownian motion with
  *                  mean-reverting velocity (terminal speed = NOISE/DAMP).
+ *
+ * References     :
+ *   Aurenhammer, "Voronoi diagrams" (ACM Comp. Surv. 23, 1991) —
+ *     comprehensive survey of algorithms + applications.
+ *   Fortune, "A sweepline algorithm for Voronoi diagrams"
+ *     (Algorithmica 2, 1987) — the O(N log N) classical algorithm
+ *     not used here.
+ *   de Berg et al., "Computational Geometry" (3rd ed., 2008) ch. 7.
+ *   See also: procedural/generational/voronoi_region_map.c (static
+ *     Voronoi for region mapping) and the Voronoi-Delaunay duality
+ *     in procedural/generational/delaunay_triangulation.c.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Pin N seeds in the plane.  For every other point in the
+ * plane, ask "which seed am I closest to?"  The points that
+ * share an answer form a CELL — one Voronoi region per seed.
+ * The cell boundaries are the locus of points equidistant from
+ * two seeds (perpendicular bisectors).  Brute-force compute by
+ * asking the question per terminal cell.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture N post offices.  For every house in town, the closest
+ * post office is the one that delivers your mail.  The map of
+ * "which post office serves where" partitions the town into
+ * convex polygonal districts — Voronoi cells.  Move a post
+ * office and the boundaries shift.  Add a new one and a fresh
+ * district carves out of the existing ones.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   ●·························                    │
+ *      │   ····●··················                       │
+ *      │   ··········.....●·····                          │
+ *      │   ···········.....·····●·                        │
+ *      │   ···············......                          │
+ *      │   ●··············●····                           │
+ *      │                                                  │
+ *      │   '●' = seeds (post offices)                     │
+ *      │   '·' = filled-in district                       │
+ *      │   borders detected by "second-nearest is close"  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * ALGORITHM IN STEPS  (per frame)
+ * ───────────────────────────────
+ *  1. Move seeds (Langevin: damped Brownian, mean-reverting).
+ *  2. For each terminal CELL (col, row):
+ *     a. Compute d1 = nearest seed distance, d2 = second
+ *        nearest, by scanning all N seeds.
+ *     b. If d2 - d1 < BORDER_PX: cell is on a Voronoi edge →
+ *        paint '+' in the nearest seed's colour.
+ *        (The border is "where two seeds are nearly tied.")
+ *     c. Else if d1 < SEED_PX: cell is a seed centre → paint 'O'.
+ *     d. Else: cell is interior → paint '.' dim.
+ *  3. HUD + present.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Voronoi cell of seed i:
+ *     V(i) = { p : ∀j ≠ i, dist(p, seed_i) ≤ dist(p, seed_j) }
+ *
+ *   Border test (approximate):
+ *     point p is "on the boundary" if
+ *       d_2nd_nearest(p) - d_1st_nearest(p) < BORDER_PX
+ *
+ *   Langevin (Ornstein-Uhlenbeck velocity):
+ *     v += (-DAMP · v + NOISE · ξ) · dt    where ξ ∈ [-1, 1] random
+ *     p += v · dt
+ *     terminal speed ≈ NOISE / DAMP
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • Brute-force O(W · H · N) per frame.  At 80 × 24 × 24 =
+ *     46k distance comparisons per frame.  Fine.  Fortune's
+ *     sweep-line gives O(N log N) but is much harder to write
+ *     and unnecessary at N ≤ 30.
+ *   • Border detection is APPROXIMATE — wider near vertices
+ *     where 3 seeds are nearly equidistant.  For exact lines
+ *     you'd compute perpendicular bisectors analytically.
+ *   • Bouncing seeds: when a seed hits the screen edge, both
+ *     position is clamped AND velocity flipped.  Without the
+ *     clamp, seeds drift slowly through the wall.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Default 24 seeds: 24 distinct coloured regions visible.
+ *     Each seed has a single 'O' at its centre + a halo of '.'
+ *     in its colour.
+ *   • Watch borders: as two seeds approach, the border between
+ *     them flexes; if seeds collide, one cell may briefly
+ *     shrink to nothing and re-emerge as the seeds separate.
+ *   • Pause + step through frames: seed positions update
+ *     smoothly under Langevin; never teleport.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *   2. §4 voronoi — render loop with brute-force nearest-seed
+ *      lookup.  Read AFTER tutorials T1-T4.
+ *   3. §5 langevin — seed motion (Ornstein-Uhlenbeck).
+ *      Independent of voronoi; read as a self-contained
+ *      sub-lesson on noise-driven motion.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   seeds[N_SEEDS]             seed positions + velocities.
+ *   d1, d2                     nearest + second-nearest seed
+ *                              distances at a point.
+ *   BORDER_PX = 15             border detection threshold.
+ *   SEED_PX = 12               seed-centre detection radius.
+ *   DAMP, NOISE                Langevin coefficients.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Distance: |p - q| = sqrt((px - qx)² + (py - qy)²).
+ *   - Brute-force search: scan all N candidates for min/second-min.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Fortune's sweep-line algorithm (O(N log N) Voronoi).
+ *   - Spatial indexing (kd-tree, etc.) for accelerated nearest-
+ *     neighbour search.  Algorithms/kd_tree.c covers that
+ *     separately.
+ *   - Voronoi-Delaunay duality.  Mentioned in CONCEPTS; see
+ *     procedural/generational/delaunay_triangulation.c for the
+ *     dual structure.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Four tutorials that build a brute-force animated Voronoi
+ * diagram.
+ *
+ *   T1  What IS a Voronoi diagram?
+ *   T2  Brute-force vs. Fortune's algorithm — when each wins
+ *   T3  The "second-nearest distance" border-detection trick
+ *   T4  Langevin motion — drifting seeds without escape velocity
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHAT IS A VORONOI DIAGRAM?
+ * ──────────────────────────────
+ * Given N "seed" points in a plane, the VORONOI DIAGRAM
+ * partitions the rest of the plane into N regions, one per
+ * seed, where each region V(i) is the locus of points closer
+ * to seed i than to any other seed:
+ *
+ *     V(i) = { p : dist(p, seed_i) ≤ dist(p, seed_j)  ∀j ≠ i }
+ *
+ * Properties:
+ *   - Every Voronoi region is CONVEX (intersection of half-
+ *     planes from perpendicular bisectors).
+ *   - Region boundaries are LINE SEGMENTS — the perpendicular
+ *     bisectors of segments joining adjacent seeds.
+ *   - Vertex points (where 3+ regions meet) are equidistant
+ *     from 3+ seeds — the circumcentre of those seeds'
+ *     Delaunay triangle.
+ *
+ * Use cases (this is one of the most-used structures in CS):
+ *   - Nearest-neighbour search: which seed is closest to query
+ *     point p?  Lookup the cell.
+ *   - Region growing: bacterial colony spread, crystal grain
+ *     boundaries, cell biology.
+ *   - Resource partitioning: schools, fire stations, cell
+ *     towers.
+ *   - Mesh generation, computational fluid dynamics, image
+ *     stippling.
+ *   - Procedural generation: organic-looking region maps in
+ *     games (see procedural/generational/voronoi_region_map.c).
+ *
+ * T2  BRUTE-FORCE VS. FORTUNE'S ALGORITHM
+ * ───────────────────────────────────────
+ * Two ways to compute Voronoi:
+ *
+ *   BRUTE-FORCE (this file)
+ *     For each query point, scan all N seeds.
+ *     Cost: O(N) per query.
+ *     Animation: O(N · W · H) per frame for full diagram.
+ *     At W=80, H=24, N=24: 46K compares per frame.  Trivial.
+ *
+ *   FORTUNE'S SWEEP-LINE (Fortune 1987)
+ *     Sweep a line top-to-bottom; maintain a "beach line" of
+ *     parabolas (each seed's region of influence).  Process
+ *     seed events (new parabola appears) and circle events
+ *     (parabola disappears, vertex created).
+ *     Cost: O(N log N) total — independent of grid resolution.
+ *     Output: explicit list of edges + vertices.
+ *
+ * When to use which:
+ *   - VISUALISATION (every pixel is a query, like this demo):
+ *     brute-force is simpler and competitive when the grid is
+ *     small.  GPU-accelerated brute-force is the standard
+ *     approach for animated diagrams.
+ *
+ *   - TOPOLOGY (you need vertex coordinates and edge lists):
+ *     Fortune's gives you the structure directly without
+ *     pixel-resolution loss.  Required for mesh generation,
+ *     CFD, etc.
+ *
+ *   - SCIENTIFIC SCALE (millions of points): Fortune or even
+ *     more advanced (incremental, divide-and-conquer).
+ *
+ * For terminal-resolution animation with N ≤ 30, brute-force
+ * is the right call.
+ *
+ * T3  "SECOND-NEAREST DISTANCE" BORDER-DETECTION TRICK
+ * ────────────────────────────────────────────────────
+ * The Voronoi BORDERS are the perpendicular bisectors between
+ * seeds.  Computing them analytically (intersecting half-
+ * planes) is involved.
+ *
+ * Cheap trick: a query point sits ON a border if its FIRST and
+ * SECOND nearest seeds are at NEARLY EQUAL distance:
+ *
+ *     border_test(p):
+ *       d1 = min over seeds of |p - seed|
+ *       d2 = second-min
+ *       return (d2 - d1) < BORDER_PX
+ *
+ * Reasoning: at a border between seed i and seed j, by
+ * definition |p - seed_i| = |p - seed_j|, so d1 = d2.  Just
+ * off the border, d2 - d1 grows linearly with distance from
+ * the border.  Threshold this difference and you get a thick
+ * "approximate border" band.
+ *
+ * Cost: ONE extra distance comparison per query (track top-2
+ * instead of just top-1).
+ *
+ * Approximation quality:
+ *   - Borders away from vertices: clean ~BORDER_PX-wide bands.
+ *   - Near vertices (3+ seeds nearly equidistant): the band
+ *     widens, sometimes filling small triangles.  Visually
+ *     fine for a animated demo; not ok for surveying.
+ *
+ * Same trick generalises to "find the K-nearest-neighbour
+ * boundary" by tracking K candidates instead of 2.
+ *
+ * T4  LANGEVIN MOTION — DRIFTING SEEDS WITHOUT ESCAPE VELOCITY
+ * ────────────────────────────────────────────────────────────
+ * To animate the diagram, seeds need to MOVE.  Naïve random
+ * walks have a problem: variance grows linearly with time, so
+ * after N steps the seed drifts ~√N pixels away.  In the
+ * limit, all seeds escape any bounded box.
+ *
+ * The LANGEVIN EQUATION (Ornstein-Uhlenbeck process) is a
+ * BOUNDED random walk:
+ *
+ *     dv/dt = -γ · v + σ · ξ(t)
+ *
+ *     -γ · v       drag — pulls velocity back toward zero
+ *     σ · ξ(t)     random kick (Gaussian or uniform white noise)
+ *
+ * Discretised:
+ *
+ *     v += (-DAMP · v + NOISE · ξ) · dt    where ξ ∈ [-1, 1]
+ *     p += v · dt
+ *
+ * Properties:
+ *   - Velocity has a STATIONARY DISTRIBUTION centred at 0.
+ *     Terminal RMS speed ≈ NOISE / DAMP.
+ *   - Position drift IS still unbounded — Langevin is just
+ *     bounded VELOCITY, not bounded POSITION.  We add walls
+ *     that bounce seeds back at the screen edges.
+ *   - At small noise: seeds barely move (low-temperature limit).
+ *   - At high noise: seeds fly fast but slow down quickly.
+ *
+ * Compared with simpler "constant random velocity" motion:
+ *   - Pure random velocity: seeds wander chaotically, no
+ *     correlation in time.
+ *   - Langevin: seeds have MOMENTUM — they keep moving in
+ *     the same direction for a few ticks, giving smooth
+ *     curves rather than zigzags.
+ *
+ * Same equation underlies:
+ *   - Brownian motion of dust in a fluid (Einstein 1905)
+ *   - Stock price models (geometric Brownian motion)
+ *   - Particle filtering (in robotics, sensor fusion)
+ *   - Reinforcement learning exploration noise
+ *
+ * It's a versatile "smooth random motion" primitive.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

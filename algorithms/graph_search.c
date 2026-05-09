@@ -157,6 +157,303 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *      Read algorithms/sort_vis.c first if state-machine algorithm
+ *      animation is new — that file's T1-T2 explain how to turn an
+ *      iterative algorithm into a per-tick coroutine.  Same pattern
+ *      here, on graphs instead of arrays.
+ *   2. §6 algorithms — bfs_step, dfs_step, astar_step.  THE HEART
+ *      of this file.  Read AFTER tutorials T1-T6.
+ *   3. §5 layout — Fruchterman-Reingold force-directed layout.
+ *      Independent of the search; read as a self-contained sub-
+ *      lesson on graph drawing (T6 below).
+ *   4. §4 graph — adjacency-list generation.
+ *   5. §1-§3, §7-§8 — config / clock / colour / scene / app loop.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   N_NODES                    40 — fixed graph size.
+ *   g_ns[i]                    NodeState of node i (UNVIS, FRONTIER,
+ *                              VISITED, PATH_NODE, SRC, GOAL).
+ *   g_prev[i]                  back-pointer for path reconstruction:
+ *                              "which node DISCOVERED node i?"
+ *   g_dist[i]                  cumulative path length src → i (A*
+ *                              only).  AKA `g(n)` in A* literature.
+ *   g_queue / g_stack          BFS FIFO / DFS LIFO containers.
+ *   src, goal                  source + goal node indices.  Picked
+ *                              as farthest-apart pair.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Graphs as adjacency lists: each node has a list of neighbours.
+ *   - Stack vs queue: LIFO vs FIFO, the difference between DFS and
+ *     BFS comes down to which container is used.
+ *   - Euclidean distance.
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Dijkstra's algorithm in detail.  A* with h ≡ 0 IS Dijkstra;
+ *     the heuristic is what makes it A*.  Implicit in T4.
+ *   - Big-O proofs.  Mentioned in CONCEPTS but not derived.
+ *   - Graph theory beyond adjacency-list connectivity.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build BFS / DFS / A* from one shared skeleton.
+ *
+ *   T1  The unified search skeleton — all three are the same loop
+ *   T2  BFS — FIFO queue, expands by hops
+ *   T3  DFS — LIFO stack, expands by depth
+ *   T4  A* — heuristic-guided priority pop
+ *   T5  Path reconstruction — back-pointers tell the story
+ *   T6  Force-directed graph layout (independent sub-lesson)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE UNIFIED SEARCH SKELETON — ALL THREE ARE THE SAME LOOP
+ * ─────────────────────────────────────────────────────────────
+ * BFS, DFS, and A* LOOK like three different algorithms.  They're
+ * really one algorithm with one variable swap:
+ *
+ *     mark src FRONTIER, push it on the container
+ *     while container not empty:
+ *       u = container.POP()           ← the only line that varies
+ *       if u == goal: reconstruct path, done
+ *       mark u VISITED
+ *       for each neighbour v of u:
+ *         if v is UNVIS:
+ *           mark v FRONTIER
+ *           prev[v] = u
+ *           container.PUSH(v)
+ *
+ * The container choice IS the algorithm:
+ *
+ *     BFS: container = QUEUE, POP = pop_front (oldest)
+ *     DFS: container = STACK, POP = pop_top   (newest)
+ *     A* : container = priority FRONTIER set, POP = min by f
+ *
+ * That's it.  Identical bookkeeping (mark, push neighbours,
+ * remember prev), different choice of "which node to visit
+ * NEXT."  The algorithms differ in BEHAVIOUR because the order
+ * of expansion differs, but the loop body is the same.
+ *
+ * §6 algorithms has three step functions — bfs_step, dfs_step,
+ * astar_step — with this skeleton each.  Reading them
+ * side-by-side reveals the structural identity hidden under
+ * different vocabulary.
+ *
+ * T2  BFS — FIFO QUEUE, EXPANDS BY HOPS
+ * ─────────────────────────────────────
+ * BFS uses a FIFO QUEUE: pop the OLDEST node added to the
+ * frontier.  Behaviour:
+ *
+ *     tick 0: pop src; queue its 3 neighbours.
+ *     tick 1: pop neighbour 1; queue ITS 3 neighbours.
+ *     tick 2: pop neighbour 2; queue ITS new neighbours.
+ *     tick 3: pop neighbour 3; queue.
+ *     tick 4: pop the FIRST grandchild of src.  ← was queued at tick 0
+ *
+ * Notice the pattern: all 1-hop neighbours of src are popped
+ * BEFORE any 2-hop neighbour.  All 2-hop before any 3-hop.
+ * BFS expands in CONCENTRIC RINGS by hop count.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │              ●                                   │
+ *      │         ●         ●                              │
+ *      │     ●     ●     ●     ●                          │
+ *      │  ●     ●     S     ●     ●                       │
+ *      │     ●     ●     ●     ●                          │
+ *      │         ●         ●                              │
+ *      │              ●                                   │
+ *      │                                                  │
+ *      │  ring 0 = src; ring 1 = 1-hop; ring 2 = 2-hop;  │
+ *      │  visualised as "ink spreading evenly outward"    │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * GUARANTEE: BFS finds the path with the FEWEST HOPS from src
+ * to goal.  Proof: ring k is processed entirely before ring
+ * k+1 starts; if goal is in ring k, no path of < k hops exists
+ * to it.
+ *
+ * COMPLEXITY: O(V + E) — every vertex popped once, every edge
+ * inspected (at most twice).
+ *
+ * T3  DFS — LIFO STACK, EXPANDS BY DEPTH
+ * ──────────────────────────────────────
+ * DFS uses a LIFO STACK: pop the NEWEST node added.
+ *
+ *     tick 0: pop src; push neighbours [N1, N2, N3].
+ *     tick 1: pop N3 (newest); push its neighbours [M1, M2].
+ *     tick 2: pop M2; push its neighbours.
+ *     ...
+ *
+ * The OLDEST nodes (N1, N2) sit at the BOTTOM of the stack and
+ * don't get popped until the entire subtree below N3 has been
+ * fully explored.  DFS goes DEEP into one branch first, only
+ * backing up when stuck.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   S ─────●─────●─────●─────●                     │
+ *      │                              \                   │
+ *      │                               ●                  │
+ *      │                                \                 │
+ *      │                                 ●                │
+ *      │                                                  │
+ *      │  one obsessive worm walks the graph              │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * NO OPTIMALITY GUARANTEE.  The path DFS finds may be much
+ * longer than the BFS optimum.  But DFS is useful for cycle
+ * detection, topological sort, articulation point search, and
+ * many other graph problems where finding "any path" beats
+ * finding "the shortest path."
+ *
+ * COMPLEXITY: O(V + E) same as BFS.  The container choice
+ * doesn't change asymptotic cost.
+ *
+ * T4  A* — HEURISTIC-GUIDED PRIORITY POP
+ * ──────────────────────────────────────
+ * A* uses a PRIORITY FRONTIER: pop the node with the smallest
+ * f(n) value, where:
+ *
+ *     f(n) = g(n) + h(n)
+ *     g(n) = cost of the BEST KNOWN PATH from src to n
+ *     h(n) = HEURISTIC estimate of cost from n to goal
+ *
+ * For grid/Euclidean problems, h is straight-line distance to
+ * goal.  This heuristic is ADMISSIBLE — it never
+ * overestimates the actual cost (no path can be shorter than
+ * the straight line).
+ *
+ * BEHAVIOUR: A* combines BFS's optimality with directed search.
+ * It expands nodes that look most promising to reach the goal
+ * cheaply, NOT just nodes nearest to src.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │              ●                                   │
+ *      │         ●        ●●●●                            │
+ >      │      ●     ●        ●●●● ─→ G                    │
+ *      │   ●     ●     S        ●●                        │
+ *      │      ●           ●                               │
+ *      │         ●                                        │
+ *      │                                                  │
+ *      │  expansion is BFS-like near src,                 │
+ *      │  STRETCHED toward G                              │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * GUARANTEE: with admissible heuristic, A* finds the OPTIMAL
+ * path AND visits no more nodes than necessary (consistent
+ * heuristic gives the strongest bound).
+ *
+ * Special cases:
+ *   h(n) = 0 always           → A* becomes Dijkstra's algorithm
+ *   h(n) = g(n) = 0           → A* becomes BFS (unit-weight)
+ *   h(n) overestimates       → A* can return non-optimal paths
+ *
+ * EDGE RELAXATION (the A*-specific bookkeeping):
+ *   when expanding u, if g[u] + edge_len(u, v) < g[v]:
+ *     g[v] = g[u] + edge_len(u, v)
+ *     prev[v] = u
+ *
+ * This lets A* find a SHORTER path to v if one exists through
+ * u, even after v has been added to the frontier under a
+ * different prev.
+ *
+ * COMPLEXITY: O((V + E) log V) with a binary heap, where the
+ * log V comes from heap operations.  Our implementation does
+ * a linear scan over the FRONTIER (O(V) per pop), so it's
+ * O(V² + E) — fine at N=40, slow at N=10000+.
+ *
+ * T5  PATH RECONSTRUCTION — BACK-POINTERS TELL THE STORY
+ * ──────────────────────────────────────────────────────
+ * All three algorithms FIND the goal eventually.  But finding
+ * is half the job — you also need to TRACE THE PATH.
+ *
+ * The trick: every time you mark a neighbour FRONTIER (T1
+ * skeleton, line 4), record WHICH NODE DISCOVERED IT:
+ *
+ *     prev[v] = u
+ *
+ * After the search reaches goal, walk prev backward:
+ *
+ *     n = goal
+ *     while n != src:
+ *       on_path[n] = true
+ *       n = prev[n]
+ *
+ * This produces the path in REVERSE order.  Since we just
+ * mark nodes, reverse order doesn't matter — the renderer
+ * paints all marked nodes the same.
+ *
+ * For each algorithm, prev[v] gets ONE value: whichever node
+ * was the FIRST to expand to v (because we only set prev[v]
+ * when v transitions UNVIS → FRONTIER).  That gives:
+ *   BFS: prev = a shortest-by-hops path
+ *   DFS: prev = the path DFS happened to take
+ *   A* : (with the relaxation in T4) the optimal-cost path
+ *
+ * Same machinery (one int per node), three different paths
+ * because the search ORDER was different.
+ *
+ * T6  FORCE-DIRECTED GRAPH LAYOUT (INDEPENDENT SUB-LESSON)
+ * ────────────────────────────────────────────────────────
+ * The graph nodes are placed by FORCE-DIRECTED LAYOUT
+ * (Fruchterman & Reingold 1991): pretend the nodes are charged
+ * particles + the edges are springs.  Run for many iterations;
+ * watch the system settle into a low-energy configuration where
+ * connected nodes are close and unconnected ones are spread out.
+ *
+ * Forces:
+ *
+ *     REPULSION — between EVERY pair of nodes:
+ *       F_rep = K_REP / d²        (Coulomb-like, falls off with
+ *                                  distance squared)
+ *       direction: from j toward i (push apart)
+ *
+ *     ATTRACTION — only along EDGES:
+ *       F_att = K_ATT · (d - REST_LEN)
+ *                                  (Hooke spring; positive when
+ *                                   stretched, negative when
+ *                                   compressed)
+ *       direction: from i toward j (pull together)
+ *
+ * Per iteration:
+ *   1. for each node, sum repulsion forces from all others
+ *   2. for each edge, add attraction forces to both endpoints
+ *   3. update positions: pos_i += F_i · DT_SETTLE
+ *   4. clamp positions to screen bounds
+ *
+ * After ~250 iterations, the system is near-equilibrium —
+ * nodes spread out enough to be legible, connected nodes close
+ * enough to read as a graph.
+ *
+ * No formal convergence guarantee (the energy landscape has
+ * local minima), but in practice random graphs of N ≈ 40
+ * settle quickly.  At larger N, you'd add cooling (gradually
+ * shrink DT_SETTLE) and possibly Barnes-Hut acceleration for
+ * the all-pairs repulsion (O(N log N) instead of O(N²)).
+ *
+ * Same trick is used in:
+ *   - software dependency visualisers
+ *   - social network diagrams
+ *   - molecular structure layouts
+ *   - the d3.js force-directed graph component
+ *
+ * Force-directed layout is INDEPENDENT of the search; it just
+ * makes the graph readable.  You could paste any (V, E)
+ * adjacency list in and the same code would lay it out.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846

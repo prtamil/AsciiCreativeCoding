@@ -35,7 +35,7 @@
  *        t    cycle theme   r reset   p pause   q/ESC quit
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra artistic/neural_net_vis.c \
+ *   gcc -std=c11 -O2 -Wall -Wextra Ai/neural_net_vis.c \
  *       -o neural_net_vis -lncurses -lm
  */
 
@@ -178,6 +178,324 @@
  *  • Theme cycle (t): all four colour pairs change in unison.
  *  • Thickness '<' / '>': line glyphs change between '.', '-|\/'
  *    (thin/bold), and Unicode '═║╲╱' (heavy).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose.  This is a NEURAL-NETWORK STRUCTURE VISUALIZER, not
+ *      an actual NN trainer (no weights, no activation function, no
+ *      backpropagation).  It's the architecture diagram brought to
+ *      life with animated particles to suggest data flow.  Read
+ *      Ai/genetic_rocket.c first if you want a real learning
+ *      algorithm; this file is purely geometric.
+ *   2. §4 layout — neuron_cell() is the SINGLE SOURCE OF TRUTH for
+ *      every neuron's position.  All drawing reads from this.
+ *      Read AFTER tutorials T1-T3 below.
+ *   3. §6 particle — particle pool, advance-edge logic.
+ *      Read AFTER tutorial T5.
+ *   4. §7 scene — orchestrator: connections → particles → neurons
+ *      (painter's order: dim background → moving foreground →
+ *      bright neurons last).
+ *   5. §1-§3, §5, §8-§9 — config / clock / colour / Net struct /
+ *      screen / app loop.  Skim if seen.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   n_layers          number of layers (2..12).
+ *   n_per_layer       neurons per layer (2..16).
+ *   net.thickness     line-glyph style (0=dot, 1=thin, 2=bold,
+ *                     3=heavy unicode).
+ *   neuron_cell(L, I) returns (col, row) for neuron (L, I).
+ *   Particle.t        progress along current edge ∈ [0, 1].
+ *   from_layer        layer index of particle's source neuron.
+ *   from_idx          neuron index in from_layer.
+ *   to_idx            neuron index in (from_layer + 1) — the random
+ *                     target this particle is currently heading to.
+ *   speed             per-particle edge-traversal speed (jittered).
+ *
+ * Background you need
+ * ───────────────────
+ *   - Concept of a feed-forward neural network: layers stacked
+ *     left-to-right, each neuron connected to every neuron in the
+ *     next layer.  No prior NN math required — this file is the
+ *     PICTURE, not the math.
+ *   - Linear interpolation: lerp(a, b, t) = a + t·(b - a).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Backpropagation, gradient descent, activation functions.
+ *     This file does ZERO learning.  Particles pick random
+ *     targets — they're a visual flow indicator, not real
+ *     activations.
+ *   - Tensor frameworks (TensorFlow, PyTorch).  We don't even have
+ *     a weights matrix.
+ *   - Convolutional / recurrent architectures.  Pure feed-forward.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a feed-forward NN visualizer from
+ * first principles.
+ *
+ *   T1  What a feed-forward neural network LOOKS like
+ *   T2  Geometry-only — why this file omits weights and math
+ *   T3  Coordinate-on-demand — neuron_cell() as single source of truth
+ *   T4  Drawing N² connections — line glyph picked per-cell
+ *   T5  Particles as data flow — the visual abstraction
+ *   T6  From visualisation to real NN — what's missing here
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHAT A FEED-FORWARD NEURAL NETWORK LOOKS LIKE
+ * ─────────────────────────────────────────────────
+ * The standard textbook neural-network diagram has THREE features:
+ *
+ *   1. LAYERS — vertical columns of NEURONS (circles, "(O)" here).
+ *      Conventionally drawn left-to-right: input layer leftmost,
+ *      output layer rightmost, "hidden" layers between.
+ *
+ *   2. FULL CONNECTIVITY between adjacent layers — every neuron in
+ *      layer L connects to every neuron in layer L+1.  N neurons
+ *      per layer × N neurons in next layer = N² edges per layer
+ *      pair.  L-1 layer pairs total.
+ *
+ *   3. NO connections WITHIN a layer or BACKWARD between layers
+ *      (that's what "feed-forward" means).
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   layer 0    layer 1    layer 2    layer 3       │
+ *      │   (input)   (hidden)   (hidden)   (output)       │
+ *      │                                                  │
+ *      │   (O)─────╲─(O)──╳───(O)─────────(O)             │
+ *      │      ╳     ╳        ╳                            │
+ *      │   (O)─────╳─(O)──╲───(O)─────────(O)             │
+ *      │      ╲   ╱       ╳                               │
+ *      │   (O)──── (O)────── (O)                          │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * That's the ENTIRE structural picture.  The math (weights,
+ * biases, activation) lives ON TOP of this geometry but DOESN'T
+ * CHANGE the geometry.  This file renders just the geometry —
+ * layers + full connectivity + neurons.
+ *
+ * T2  GEOMETRY-ONLY — WHY THIS FILE OMITS WEIGHTS AND MATH
+ * ────────────────────────────────────────────────────────
+ * A real neural network forward pass:
+ *
+ *     for each layer L from 1 to N:
+ *       for each neuron j in layer L:
+ *         z_j = sum over neurons i in layer (L-1) of:
+ *                 weight[L][i][j] · activation[L-1][i]
+ *         activation[L][j] = sigmoid(z_j + bias[L][j])
+ *
+ * That requires weights (a 3D float array), biases, and an
+ * activation function.  Plus TRAINING needs backpropagation,
+ * loss functions, gradients.  Hundreds of lines just for the
+ * math.
+ *
+ * This file SKIPS all of that.  It just shows the STRUCTURE.
+ * Why?
+ *
+ *   - PEDAGOGICAL: many learners' first confusion is "what
+ *     does the network LOOK like?"  The textbook diagram answer
+ *     is enough to ground further reading.
+ *
+ *   - SCALABLE: with no weights to maintain, we can resize the
+ *     network on a key press (more layers, more neurons) without
+ *     blowing up memory or breaking pre-trained state.
+ *
+ *   - REVEALING: by showing the structure WITHOUT the math, we
+ *     emphasise that "neural network" is mostly a particular
+ *     CONNECTIVITY PATTERN.  The math is the same linear algebra
+ *     that fits any graph.
+ *
+ * For the actual learning algorithm in this project, see
+ * Ai/genetic_rocket.c (genetic algorithm — different family, but
+ * uses real fitness evaluation + breeding).
+ *
+ * T3  COORDINATE-ON-DEMAND — neuron_cell() AS SINGLE SOURCE OF TRUTH
+ * ─────────────────────────────────────────────────────────────────
+ * Naive approach: store neuron positions in an array
+ * `neuron[L][I].col, .row`.  Recompute on resize.
+ *
+ * Better: COMPUTE THEM ON DEMAND from a pure function of (L, I,
+ * cols, rows):
+ *
+ *     neuron_cell(L, I) returns (col, row):
+ *       col = (L + 1) · cols / (n_layers + 1)
+ *       row = (I + 1) · (rows - 1) / (n_per_layer + 1)
+ *
+ * The "(L + 1)" gives equal LEFT margin (no neuron at col 0)
+ * AND equal right margin (when L = n_layers - 1, col is at the
+ * rightmost slot, leaving cols/(n_layers+1) of the right margin
+ * empty).  Same logic for rows.
+ *
+ * Properties of "compute on demand":
+ *
+ *   - RESIZE IS FREE.  Next frame reads new (cols, rows), every
+ *     neuron lands in the right place.  No state to update, no
+ *     bookkeeping.
+ *
+ *   - SHAPE CHANGE IS FREE.  Press [/] to change n_layers or
+ *     -/+ to change n_per_layer; the geometry recomputes from
+ *     fresh values.  Particles need a reset because their
+ *     in-flight indices may go out of range, but that's a
+ *     reseeded particle pool — no neuron-position
+ *     reorganisation.
+ *
+ *   - SINGLE SOURCE OF TRUTH.  Every line, every dot, every
+ *     particle position derives from neuron_cell().  Change
+ *     this one formula and the whole diagram redraws.
+ *
+ * Same pattern as a vertex shader in a GPU pipeline: per-frame
+ * derive position from per-vertex parameters.  Or as the polar→
+ * cell mapping in artistic/hindu_mandalas.c — a single function
+ * that maps abstract index → screen cell.
+ *
+ * T4  DRAWING N² CONNECTIONS — LINE GLYPH PICKED PER-CELL
+ * ───────────────────────────────────────────────────────
+ * Between layer L and layer L+1, every (a, b) pair gets a line
+ * — that's n_per_layer² lines per layer pair.
+ *
+ * Each line goes from neuron_cell(L, a) to neuron_cell(L+1, b)
+ * — different sources, different targets.  Slopes range from
+ * near-horizontal (top-of-layer to top-of-next) to steep diagonal
+ * (top of layer to bottom of next).
+ *
+ * Line drawing: linear-step interpolation from (r1, c1) to
+ * (r2, c2):
+ *
+ *     dr = r2 - r1; dc = c2 - c1
+ *     steps = max(|dr|, |dc|)
+ *     for i in 1 .. steps-1:        ← skip endpoints
+ *       sr = r1 + i·dr/steps
+ *       sc = c1 + i·dc/steps
+ *       paint (sr, sc, glyph_for_local_step)
+ *
+ * "Endpoints skipped" matters: the neurons render '(O)' on top of
+ * the line endpoints; the line shouldn't paint the centre cell of
+ * '(O)' or it'd look messy.
+ *
+ * GLYPH selection per cell: at each cell, look at the LOCAL step
+ * direction (dsr, dsc) — what's the difference to the PREVIOUS
+ * cell?  Pick the glyph that matches that local direction:
+ *
+ *     dsr = 0, dsc != 0   →   horizontal '-'
+ *     dsr != 0, dsc = 0   →   vertical   '|'
+ *     dsr > 0, dsc > 0    →   '\\' (down-right)
+ *     dsr < 0, dsc > 0    →   '/'  (up-right)
+ *
+ * Picking PER CELL (rather than per LINE) gives smoother near-
+ * horizontal lines.  A line that's mostly horizontal but slowly
+ * descends would look like staircased '\\' if the glyph were
+ * fixed for the whole line; per-cell picks gives `------\------`
+ * which reads correctly as "almost horizontal."
+ *
+ * Cost: at max settings (12 layers × 16 neurons), 11 layer pairs
+ * × 16² = 2816 lines per frame, ~10 cells each = 28K paints per
+ * frame at 30 fps = under 1ms.
+ *
+ * T5  PARTICLES AS DATA FLOW — THE VISUAL ABSTRACTION
+ * ───────────────────────────────────────────────────
+ * A static network diagram says "here's the structure" but
+ * doesn't suggest "data flows through it."  Adding moving
+ * particles fixes that without adding any actual computation.
+ *
+ * Particle state per-particle:
+ *
+ *     struct {
+ *       int   from_layer, from_idx;     where am I starting from?
+ *       int   to_idx;                    which neuron in next layer
+ *                                        am I heading to?
+ *       float t;                         progress 0..1 along edge
+ *       float speed;                     per-particle (with jitter)
+ *     };
+ *
+ * Each tick:
+ *
+ *     t += speed · dt
+ *     while t >= 1.0:
+ *       t -= 1.0
+ *       // arrived at (from_layer + 1, to_idx)
+ *       from_layer += 1
+ *       from_idx = to_idx
+ *       if from_layer == n_layers - 1:
+ *         // reached output, loop back
+ *         from_layer = 0
+ *         from_idx = random in [0, n_per_layer)
+ *       to_idx = random in [0, n_per_layer)   ← new target
+ *
+ * Drawing: linear interpolate between source cell and target
+ * cell using `t`, paint a '*' at the resulting cell.
+ *
+ * Why RANDOM target selection?  Because we have no weights to
+ * weight the choice by.  In a real NN, the choice would be
+ * influenced by the activation values — particles would prefer
+ * the connection with the highest weight × incoming activation.
+ * That's T6's discussion.
+ *
+ * The visual effect: particles continuously stream forward
+ * through the network, hopping randomly between neurons,
+ * suggesting "data flowing left-to-right through fully-
+ * connected layers."  Reading the picture becomes immediate.
+ *
+ * T6  FROM VISUALISATION TO REAL NN — WHAT'S MISSING HERE
+ * ───────────────────────────────────────────────────────
+ * To turn this visualizer into an actual neural network
+ * trainer, you'd add:
+ *
+ *   1. WEIGHTS.  A 3D float array weight[L][I][J] = strength
+ *      of the connection from neuron I in layer L to neuron J
+ *      in layer L+1.  Initialise randomly small (Xavier or He
+ *      initialisation).  About L · N² floats — at 12 layers ×
+ *      16 neurons that's ~3000 floats = trivial memory.
+ *
+ *   2. ACTIVATION.  Per-neuron float storing the current
+ *      activation value (after the activation function).  About
+ *      L · N floats.
+ *
+ *   3. FORWARD PASS.  For each layer L, compute every neuron's
+ *      activation as activation_function(sum of weight ·
+ *      previous-layer activation + bias).  Common activation
+ *      functions: sigmoid, tanh, ReLU.
+ *
+ *   4. INPUT.  Some way to set the input layer's activations
+ *      (image pixels, sensor readings, ...).
+ *
+ *   5. LOSS FUNCTION.  Compare output layer to expected target,
+ *      compute a scalar error.
+ *
+ *   6. BACKPROPAGATION.  Compute the gradient of the loss with
+ *      respect to every weight, propagating backward through
+ *      the chain rule.
+ *
+ *   7. WEIGHT UPDATE.  weight -= learning_rate · gradient.
+ *      Or use Adam, RMSProp, etc.
+ *
+ *   8. TRAINING DATA.  A dataset of (input, expected output)
+ *      pairs to train against.
+ *
+ * Each step is a substantial body of code on its own.  This
+ * file gives you the canvas; turning it into a trainer is a
+ * project's worth of work.
+ *
+ * Decision tree for "should I extend this?":
+ *
+ *   want a TEACHING demo of NN structure?     → this file is enough
+ *   want to TRAIN a simple network?           → write a separate
+ *                                                trainer; reuse the
+ *                                                visualiser as
+ *                                                output if desired
+ *   want to USE a network for classification? → use a real ML
+ *                                                framework
+ *   want a different LEARNING algorithm?      → see Ai/genetic_rocket.c
  *
  * ─────────────────────────────────────────────────────────────────────── */
 

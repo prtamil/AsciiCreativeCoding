@@ -13,7 +13,7 @@
  *     then demonstrates a range query.  Press Enter each step.
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra geometry/kd_tree.c -o kd_tree
+ *   gcc -std=c11 -O2 -Wall -Wextra algorithms/kd_tree.c -o kd_tree
  *
  * Run:
  *   ./kd_tree
@@ -62,14 +62,303 @@
  *   source of the √N efficiency — whole branches are pruned without visiting
  *   individual points.
  *
- * Reading order:
- *   1. KDNode struct — understand how one node encodes a point AND a split.
- *   2. kd_insert — trace one insertion by hand through a 3-level tree.
- *   3. kd_query  — trace the pruning rule: draw the bounding box on paper.
- *   4. draw_tree_grid — see how the grid visualizer maps the tree back to 2-D.
- *   5. main() PART 2 — run the demo and predict each split before pressing Enter.
+ * References    :
+ *   Bentley, "Multidimensional binary search trees used for
+ *     associative searching" (CACM 18, 1975) — original K-D tree
+ *     paper.
+ *   Friedman, Bentley & Finkel, "An algorithm for finding best
+ *     matches in logarithmic expected time" (ACM TOMS 3, 1977) —
+ *     nearest-neighbour search.
+ *   de Berg et al., "Computational Geometry" (3rd ed., 2008)
+ *     ch. 5.
  *
- * ─────────────────────────────────────────────────────────────────────────── */
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A K-D TREE is a binary search tree where each node holds ONE
+ * data point AND that point's coordinate IS the split.  The
+ * split axis ALTERNATES with depth: depth 0 cuts on x (the
+ * stored point's x is the split value), depth 1 cuts on y,
+ * depth 2 on x again, etc.  Insertion is "go left if smaller,
+ * right if greater along the current axis."  Range queries
+ * prune subtrees whose region can't possibly contain query
+ * points.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Imagine you're sorting a deck of map pins INTO a tree.  At
+ * the root you compare the new pin's X coordinate to the
+ * root pin's X.  Smaller → go left subtree; larger → go right.
+ * At each child level you compare Y instead of X.  At the
+ * grandchild level: X again.  Alternating axes ensure both
+ * coordinates get used as filtering criteria.  The tree
+ * effectively turns "is this point in this 2-D region?" into
+ * a sequence of 1-D comparisons, one per level.
+ *
+ * KD-TREE vs OTHER SPATIAL TREES
+ * ──────────────────────────────
+ *
+ *   QUADTREE: every internal split = 4 children; both axes at
+ *             once; data only in leaves.  Wider but shallower.
+ *
+ *   BSP TREE: 2 children, splits at MIDPOINT of region; data
+ *             only in leaves.  Insertion-order independent.
+ *
+ *   KD TREE:  2 children, splits at the DATA POINT'S coord;
+ *             data IN every node.  No "internal-only" nodes →
+ *             tighter memory.  Best for nearest-neighbour
+ *             search.  Sensitive to insertion order.
+ *
+ * ALGORITHM IN STEPS
+ * ──────────────────
+ *  INSERT(point P):
+ *    1. If root is null: root = new node with P, depth 0.
+ *    2. Else: descend from root:
+ *       at each node N at depth d:
+ *         axis = (d % 2 == 0) ? X : Y
+ *         if P[axis] < N.point[axis]:
+ *           if N.left is null: N.left = new node with P; done
+ *           else: descend N.left, increment depth
+ *         else: same with N.right
+ *
+ *  RANGE QUERY(rectangle R):
+ *    Recursively descend with a "current bounding box" that
+ *    narrows along the split axis at each level:
+ *
+ *      query(node, R, current_box):
+ *        if current_box doesn't overlap R: return  ← prune
+ *        if node.point in R: report it
+ *        axis = depth-dependent
+ *        split current_box along axis at node.point[axis]:
+ *          left_box  = current_box ∩ {axis < split}
+ *          right_box = current_box ∩ {axis ≥ split}
+ *        query(node.left,  R, left_box)
+ *        query(node.right, R, right_box)
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Split axis at depth d:  d % 2 == 0 → X
+ *                           d % 2 == 1 → Y
+ *
+ *   Insertion comparison:   point[axis] < node.point[axis] → left
+ *
+ *   Bounding box halving:   left_box.max[axis]  = node.point[axis]
+ *                           right_box.min[axis] = node.point[axis]
+ *
+ *   Bounding box overlap:   along each axis, max1 ≥ min2 AND min1 ≤ max2
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • INSERTION ORDER MATTERS: a sorted insertion order
+ *     produces a degenerate linked-list tree (depth N).  In
+ *     practice you either insert in random order OR build the
+ *     tree by recursively choosing the MEDIAN at each level
+ *     (gives perfect balance, O(N log N) build, O(log N)
+ *     queries).
+ *   • DELETION is HARD: removing an internal node requires
+ *     finding a replacement subtree to fill its slot.
+ *     Standard approach: mark "deleted" with a tombstone, or
+ *     rebuild the subtree.
+ *   • EQUAL COORDS: points with the same split-axis value as
+ *     a node — convention is "<", so equal goes right.
+ *     Consistent with bsearch.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Default 12 points: tree depth ≈ ⌈log₂ 12⌉ = 4.  Print
+ *     tree (PART 2) and count levels.
+ *   • Insertion order swap: insert sorted-by-x, expect tree
+ *     depth ≈ N (degenerate).
+ *   • Range query: visually verify reported points are
+ *     inside the query rectangle.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *      Read algorithms/bsp_tree.c first if "midpoint splits" are
+ *      familiar; this file's "data-point splits" is the natural
+ *      contrast.  algorithms/quadtree.c covers the quadtree
+ *      variant.
+ *   2. PART 1: KDNode struct + kd_insert + kd_query.  THE LIBRARY.
+ *      Read AFTER tutorials T1-T4 below.
+ *   3. PART 2: main() with step-by-step insertion + query.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   KDNode                     one node = one data point + 2 children.
+ *   .point                     the (x, y) data this node holds.
+ *   .left, .right              children pointers.
+ *   depth                      tracked during traversal (not stored)
+ *                              — determines split axis.
+ *
+ * Background you need
+ * ───────────────────
+ *   - Recursion + binary-tree pointer manipulation.
+ *   - Comparison-based search (binary search idea).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Self-balancing trees (red-black, AVL).  K-D balance is
+ *     handled by INSERTION ORDER, not by tree rotations.
+ *   - K-D nearest-neighbour search.  We only do range queries
+ *     here.
+ *   - Higher-dimensional K-D trees (k > 2).  The principle
+ *     generalises by cycling through axes 0, 1, ..., k-1 at
+ *     each depth level.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Four tutorials that build a 2-D K-D tree from first principles.
+ *
+ *   T1  Two binary-search-tree problems for the price of one
+ *   T2  Alternating axes — why one sort key isn't enough
+ *   T3  Range query — narrowing the bounding box per level
+ *   T4  Why insertion order matters (and how to fix it)
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  TWO BSTs FOR THE PRICE OF ONE
+ * ─────────────────────────────────
+ * A regular 1-D BINARY SEARCH TREE handles "find all numbers
+ * in [lo, hi]" in O(log N + k).  But what about 2-D points
+ * and "find all (x, y) inside a RECTANGLE"?
+ *
+ * Naive: store points sorted by x.  Find all points with x ∈
+ * [lo_x, hi_x] (1-D BST query).  Then linear-scan that
+ * subset for y ∈ [lo_y, hi_y].  Cost: O(log N + k_x · 1)
+ * where k_x is the count after the first filter — could be
+ * much larger than the answer.
+ *
+ * KD-TREE INSIGHT: USE BOTH X AND Y AS FILTERING CRITERIA at
+ * different levels.  Depth 0 cuts on x; depth 1 cuts on y;
+ * depth 2 on x; etc.  Every level halves the search space
+ * along ONE axis, but ALL AXES get cut over the depth of the
+ * tree.
+ *
+ * Result: each path from root to leaf has split BOTH axes
+ * roughly log N / 2 times each — equivalent to "BST in 2-D."
+ *
+ * Generalisation to k dimensions: cycle through axes 0, 1, ...,
+ * k-1 at each depth level.  Same algorithm.
+ *
+ * T2  ALTERNATING AXES — WHY ONE SORT KEY ISN'T ENOUGH
+ * ────────────────────────────────────────────────────
+ * Why ALTERNATE axes?  Why not always cut on x?
+ *
+ * If we always cut on x, the tree is a 1-D BST.  Range query
+ * on x is fast (O(log N + k_x)) but Y filtering is brute
+ * force (O(k_x)).  For dense clusters along the x-axis (e.g.
+ * data lying near a horizontal line), k_x ≈ N and we save
+ * nothing.
+ *
+ * Alternating axes makes the tree do TIGHT 2-D PRUNING:
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │            depth 0:  cut on x                    │
+ *      │                                                  │
+ *      │   ┌───────────│───────────┐                      │
+ *      │   │           │           │                      │
+ *      │   │           │           │                      │
+ *      │   │     ──────│           │  depth 1: cut on y   │
+ *      │   │           │           │                      │
+ *      │   │           │     ──────│                      │
+ *      │   │           │           │                      │
+ *      │   └───────────│───────────┘                      │
+ *      │                                                  │
+ *      │   depth 0 splits left half and right half        │
+ *      │   depth 1 splits each into top/bottom            │
+ *      │   etc.                                           │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * After d levels: each subtree's bounding box has been cut
+ * about d/2 times along each axis.  Both dimensions
+ * progressively narrow.
+ *
+ * For higher dimensions (k > 2), cycle through all k axes.
+ * Each depth-k path gives one cut along each dimension.
+ *
+ * T3  RANGE QUERY — NARROWING THE BOUNDING BOX PER LEVEL
+ * ──────────────────────────────────────────────────────
+ * Given a query rectangle R, find all stored points inside R.
+ *
+ * As we descend the tree, we MAINTAIN a "current bounding
+ * box" — the region of space this subtree could possibly
+ * contain points in.  At the root, the box is the WHOLE
+ * PLANE.  At each level we cut the box along the current
+ * split axis.
+ *
+ *     query(node, R, current_box):
+ *       if NOT overlap(current_box, R):
+ *         return  ← prune entire subtree
+ *       if node.point in R:
+ *         report node.point
+ *       split_axis = depth % 2
+ *       v = node.point[split_axis]
+ *       left_box  = current_box with axis_max ← v
+ *       right_box = current_box with axis_min ← v
+ *       query(node.left,  R, left_box)
+ *       query(node.right, R, right_box)
+ *
+ * The current_box NARROWS as we descend.  When it stops
+ * overlapping R, the entire subtree is irrelevant.
+ *
+ * Cost: bounded by the number of subtrees whose box
+ * straddles R's boundary.  For "small" query rectangles in
+ * 2-D, that's O(√N + k) (worst case).  For full-space queries,
+ * O(N + k).  Both better than O(N²) brute scan of pairs.
+ *
+ * T4  WHY INSERTION ORDER MATTERS (AND HOW TO FIX IT)
+ * ───────────────────────────────────────────────────
+ * KD-tree balance depends on INSERTION ORDER.  Adversarial
+ * cases:
+ *
+ *   - All points sorted by x: every insertion goes RIGHT at
+ *     depth 0, RIGHT at depth 2, etc.  Tree is a degenerate
+ *     linked list.  Queries become O(N).
+ *
+ *   - Most points clustered in one quadrant: tree imbalanced;
+ *     queries still O(log N) on average but worst case worsens.
+ *
+ *   - Random order with random data: tree expected-balanced.
+ *     This is the typical case.
+ *
+ * FIXES:
+ *
+ *   - INSERT IN RANDOM ORDER (works probabilistically).
+ *
+ *   - BUILD FROM SCRATCH using MEDIAN SPLITS:
+ *       1. Find median by current axis (partition or sort).
+ *       2. Median becomes the node; recurse on left and right
+ *          halves.
+ *       3. Cycle axis at each level.
+ *     Cost: O(N log N) build, O(log N) query (perfectly
+ *     balanced).
+ *
+ *   - REBALANCE PERIODICALLY (rare for K-D trees in practice).
+ *
+ * The animated demo in PART 2 inserts random points, so the
+ * resulting tree is approximately balanced.  For production
+ * use cases (databases, GIS), the build-from-median variant
+ * is preferred.
+ *
+ * Compare with BSP TREE (algorithms/bsp_tree.c): BSP splits
+ * at the REGION MIDPOINT, which is INSERTION-ORDER INDEPENDENT
+ * but can produce bad splits for non-uniform data.  K-D
+ * splits at the DATA-POINT POSITION, which adapts to the data
+ * but depends on insertion order.  Each has its tradeoff.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #include <assert.h>
 #include <stdbool.h>

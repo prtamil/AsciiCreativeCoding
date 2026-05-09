@@ -27,50 +27,382 @@
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra \
- *       geometry/visibility_polygon.c -o vp -lncurses -lm
+ *       algorithms/visibility_polygon.c -o vp -lncurses -lm
  */
 
-/* -- CONCEPTS -------------------------------------------------------------- *
+/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Angular sweep algorithm (S5 compute_visibility):
- *   The visibility polygon from observer O is the set of all points P such
- *   that the segment OP does not cross any wall.  It is computed by sweeping
- *   a ray 360 degrees and recording where each angle first hits a wall.
+ * Algorithm     : Exact angular-sweep visibility polygon.  From observer
+ *                 O, only WALL ENDPOINT directions matter — between
+ *                 two consecutive endpoint angles the nearest wall
+ *                 cannot change, so the visibility boundary is a
+ *                 straight segment between two ray-wall hits.  We
+ *                 cast 3 rays per endpoint (θ - ε, θ, θ + ε) so
+ *                 corners on either side are handled correctly, then
+ *                 sort all hits by angle and join them as a polygon.
  *
- *   Naive approach: cast N uniformly-spaced rays (approximate; misses corners).
- *   Exact approach: only cast rays at wall-endpoint angles, plus a tiny eps
- *   on each side.  Between consecutive endpoint angles the nearest wall cannot
- *   change, so the boundary is always a straight line from hit[i] to hit[i+1].
- *   This gives the *exact* polygon in O(E log E) time (E = endpoint count).
+ * Math          : Ray-segment intersection via 2-D cross product:
+ *                   denom = D × (B - A)
+ *                   t     = (A - O) × (B - A) / denom
+ *                   s     = (A - O) × D       / denom
+ *                 Hit is valid iff t > 0 AND 0 ≤ s ≤ 1.
+ *                 Pick the wall with smallest t.
  *
- * Epsilon trick at corners (S5 cast_ray_in_direction):
- *   For each endpoint angle theta, cast three rays: theta-eps, theta, theta+eps.
- *   The eps-offset rays handle both sides of a wall corner correctly:
- *   - theta-eps sees the wall *ending* at the corner
- *   - theta+eps sees the wall *beginning* past the corner (may differ)
- *   Without eps, a ray aimed exactly at a shared corner gives ambiguous results.
+ * Aspect fix    : Terminal cells are 2:1 tall.  Geometry done in
+ *                 "geo space" where y is multiplied by ASPECT_Y to
+ *                 make distances metrically isotropic.
  *
- * Occlusion detection -- ray vs. segment (S4 ray_hits_wall):
- *   Ray:     P(t) = O + t*D          (parameter t, want t > 0)
- *   Segment: Q(s) = A + s*(B-A)      (parameter s, want 0 <= s <= 1)
- *   Solve O + t*D = A + s*(B-A):
- *     denom = D x (B-A)              (2D cross product = scalar)
- *     t     = (A-O) x (B-A) / denom
- *     s     = (A-O) x D     / denom
- *   The wall at minimum valid t is the occluder for that ray direction.
+ * Performance   : O(E log E) for sorting endpoint angles, plus
+ *                 O(E · W) for ray-vs-all-walls intersection.  With
+ *                 ~30 walls and ~60 endpoints, well under 1 ms per
+ *                 frame.
  *
- * Aspect ratio correction (S4 geo_y, cell_y):
- *   Terminal cells are ~2x taller than wide (CELL_H=16, CELL_W=8 pixels).
- *   Distances and angles computed with raw row/col numbers are metrically
- *   distorted.  All geometry here uses "geo space" where y is doubled:
- *     y_geo = y_cells * ASPECT_Y      (stretch to square pixels)
- *   Results are converted back to cell space only for rendering.
+ * References    :
+ *   de Berg et al., "Computational Geometry" (3rd ed., 2008) ch. 15
+ *     — visibility, art-gallery problem.
+ *   Asano et al., "Visibility of disjoint polygons" (Algorithmica 1,
+ *     1986) — the foundational angular-sweep paper.
+ *   Red Blob Games, "2D Visibility" tutorial:
+ *     https://www.redblobgames.com/articles/visibility/ — superb
+ *     interactive walkthrough of this exact algorithm.
  *
- * Visible area (S7 render_overlay):
- *   Shoelace formula on the sorted hit points (in geo space):
- *     area_geo = 0.5 * |sum_i (x_i * y_{i+1} - x_{i+1} * y_i)|
- *   Cell-space area = area_geo / ASPECT_Y  (y was stretched, so divide back).
- * --------------------------------------------------------------------------- */
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * Stand somewhere in a room full of walls.  The set of cells you
+ * can see (no wall in the way) is the VISIBILITY POLYGON.  Compute
+ * it: sweep a ray 360° around the observer; at each angle, record
+ * where the ray first hits a wall; connect those hit points and
+ * fill the interior.  Cleverness: only WALL CORNERS matter — at
+ * angles between corners, the polygon edge is a straight line from
+ * hit-at-corner-A to hit-at-corner-B.  So we cast O(E) rays
+ * instead of "infinitely many."
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture standing in a maze with a flashlight that fans out 360°.
+ * Where the beam stops is the wall.  Now imagine the beam is
+ * rotating.  Most of the time the wall it hits is the SAME wall
+ * (the beam slides along the wall as you rotate).  But every time
+ * the beam crosses a CORNER of a wall, the "current wall" can
+ * switch.  Between corners the boundary is a LINE — predictable,
+ * computable from corner-to-corner.  Sweep all corners; you have
+ * the boundary.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │   ┌─────┐         ┌─────┐                        │
+ *      │   │     │         │     │                        │
+ *      │   │  A  │  .....  │  B  │                        │
+ *      │   │     │  .....  │     │                        │
+ *      │   └─────┘  .....  └─────┘                        │
+ *      │                                                  │
+ *      │           .O.       ← observer                   │
+ *      │             ........                             │
+ *      │   ┌─────┐ . . . . .                              │
+ *      │   │  C  │ . . . . .                              │
+ *      │   └─────┘ . . . .                                │
+ *      │                                                  │
+ *      │   '.' = visible from O                           │
+ *      │   walls A, B, C cast triangular shadows          │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * ALGORITHM IN STEPS  (per frame)
+ * ───────────────────────────────
+ *  1. Move observer along Lissajous path.
+ *  2. Collect all wall-endpoint angles relative to observer.
+ *  3. For each endpoint at angle θ, cast THREE rays:
+ *     θ - ε, θ, θ + ε.  The ε-offset rays disambiguate corners.
+ *  4. For each ray:
+ *     For each wall, compute ray-segment intersection (t, s).
+ *     Valid iff t > 0 AND 0 ≤ s ≤ 1.  Keep min-t hit.
+ *  5. Sort hits by angle.  The polygon is the closed list of hits
+ *     in angular order.
+ *  6. Render: cell is visible iff angularly-bracketing hits give
+ *     a wall-distance ≥ cell-distance to observer.
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Ray-segment intersection (2-D cross product):
+ *     denom = D.x · (B.y - A.y) - D.y · (B.x - A.x)
+ *     if denom == 0: parallel, no hit
+ *     t = ((A.x - O.x)·(B.y - A.y) - (A.y - O.y)·(B.x - A.x)) / denom
+ *     s = ((A.x - O.x)·D.y       - (A.y - O.y)·D.x      ) / denom
+ *     hit valid iff t > 0 AND 0 ≤ s ≤ 1
+ *
+ *   Polygon area (shoelace):
+ *     area = ½ · |Σ (x_i · y_{i+1} - x_{i+1} · y_i)|
+ *
+ *   Aspect: y_geo = y_cell · ASPECT_Y
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • CORNER AMBIGUITY: a ray exactly at a wall endpoint can match
+ *     "the wall ending there" or "the wall starting there"
+ *     differently.  The ε-offset trick (cast at θ ± ε) handles
+ *     both sides.  Without ε, polygon corners flicker.
+ *   • PARALLEL RAYS: denom == 0 → ray parallel to wall.  Treat
+ *     as miss.
+ *   • OBSERVER ON A WALL: degenerate case — t → 0 for that wall.
+ *     Filtered by t > epsilon.
+ *   • OUT-OF-BOUNDS: world is bounded by 4 outer walls; rays
+ *     always hit something.  No "shoot into infinity" case.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Default: observer drifts along Lissajous path; polygon
+ *     visibly shrinks and grows as walls occlude.  Behind-wall
+ *     cells are immediately dark.
+ *   • Pause: polygon should be the same on every paused frame
+ *     (deterministic for fixed observer position).
+ *   • Walk observer to a wall corner: triangular wedge of
+ *     visibility extends past the corner onto the other side
+ *     ("seeing around" by 1 ray width).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
+ *   2. §5 visibility — compute_visibility + cast_ray + sort.
+ *      THE HEART of this file.  Read AFTER tutorials T1-T5.
+ *   3. §4 geometry — ray-vs-segment intersection primitive.
+ *      The single most important math; everything else is
+ *      bookkeeping.
+ *   4. §6 scene — obstacle layout, observer Lissajous path.
+ *   5. §7 render — visible-cell painter + overlay.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   walls[]                    line-segment obstacle list.
+ *   observer                   current eye position.
+ *   hits[]                     ray-hit list (sorted by angle).
+ *   theta, eps                 sweep angle + ε disambiguator.
+ *   ASPECT_Y                   y-stretch factor for geo space.
+ *
+ * Background you need
+ * ───────────────────
+ *   - 2-D cross product as winding determinant
+ *     (algorithms/convex_hull.c T2 if new).
+ *   - Linear ray equation P(t) = O + t·D, segment Q(s) = A + s·(B−A).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - Computational geometry beyond this single primitive.
+ *   - 3-D visibility (BSP trees, portal rendering).  This is
+ *     2-D only.  See algorithms/bsp_tree.c for the 3-D
+ *     analogue's data structure.
+ *   - Real-time shadow casting in graphics engines.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Five tutorials that build an exact 2-D visibility polygon.
+ *
+ *   T1  The visibility problem
+ *   T2  Why ENDPOINTS matter (and points BETWEEN endpoints don't)
+ *   T3  Ray-segment intersection — the universal primitive
+ *   T4  The ε-offset trick at corners
+ *   T5  Aspect-correct geometry on a 2:1 cell grid
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  THE VISIBILITY PROBLEM
+ * ──────────────────────────
+ * Observer at O.  Walls (line segments) scattered around.
+ * QUESTION: which points P in the plane have line-of-sight to O?
+ * That is, no wall crosses segment OP.
+ *
+ * The set of all such P is the VISIBILITY POLYGON of O.  It's
+ * a CONVEX POLYGON ROOTED AT O, plus shadows cast by walls.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │            (visible)                             │
+ *      │           .........                              │
+ *      │          ...........                             │
+ *      │         .............                            │
+ *      │         .....●.......                            │
+ *      │          ....O....                               │
+ *      │             /  \                                 │
+ *      │            /     \   ────                        │
+ *      │           /       \   wall                       │
+ *      │   (shadow)         (visible behind wall via      │
+ *      │                     other path)                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Use cases:
+ *   - Roguelike line-of-sight (you can see what isn't behind
+ *     walls)
+ *   - Lighting in 2-D games (light only fills the visibility
+ *     polygon)
+ *   - Security camera placement
+ *   - Robot path planning (where can the robot's sensor see?)
+ *
+ * Naive: cast 360 rays at uniform angle increments, find the
+ * nearest wall hit, connect.  Cost: O(360 · W) where W is
+ * walls.  Approximate; misses corners.
+ *
+ * Better: only cast rays at angles where SOMETHING CHANGES.
+ *
+ * T2  WHY ENDPOINTS MATTER (AND POINTS BETWEEN DON'T)
+ * ───────────────────────────────────────────────────
+ * Imagine the ray slowly rotating around O.  At any angle θ,
+ * the ray hits SOME wall at distance d(θ).  How does d change
+ * as θ changes?
+ *
+ * If the ray is "sliding along" a single wall: d changes
+ * SMOOTHLY — the wall gets closer or farther as you rotate.
+ * The visibility boundary moves smoothly.
+ *
+ * If the ray crosses a wall ENDPOINT: d JUMPS — you might
+ * suddenly see a different wall behind it (further away) or
+ * a closer wall in front.  The visibility boundary KINKS.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │               wall A                             │
+ *      │            ●━━━━━━━━━●                           │
+ *      │           /            \                         │
+ *      │          /              \  far wall B            │
+ *      │   ─────/────────────────/────●━━━━━━━━━●         │
+ *      │       /                /     ↑                   │
+ *      │      /                /  visibility KINKS at     │
+ *      │     /                /   wall A's right corner   │
+ *      │    O                                             │
+ *      │                                                  │
+ *      │   d(θ) is smooth EXCEPT at the corner angle      │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * INSIGHT: between two consecutive corner-angles, the ray
+ * always hits the SAME wall.  The boundary on that arc is a
+ * STRAIGHT LINE from hit-at-corner-1 to hit-at-corner-2.
+ *
+ * So we don't need to cast rays at every angle — just at the
+ * corner angles.  With E wall endpoints, only E rays.
+ *
+ * COST drops from O(360 · W) to O(E · W) with EXACT result.
+ * E ≪ 360 typically.
+ *
+ * T3  RAY-SEGMENT INTERSECTION — THE UNIVERSAL PRIMITIVE
+ * ──────────────────────────────────────────────────────
+ * Given:
+ *   Ray:     P(t) = O + t · D          (t > 0)
+ *   Segment: Q(s) = A + s · (B - A)    (0 ≤ s ≤ 1)
+ *
+ * They intersect when O + t · D = A + s · (B - A).  Two
+ * equations (x and y components), two unknowns (t, s).
+ *
+ * Standard 2-D solution using the cross product:
+ *
+ *     v = B - A
+ *     w = A - O
+ *     denom = D.x · v.y - D.y · v.x      ← 2-D cross product
+ *
+ *     if |denom| < ε: ray parallel to segment, no hit
+ *
+ *     t = (w.x · v.y - w.y · v.x) / denom
+ *     s = (w.x · D.y - w.y · D.x) / denom
+ *
+ *     hit_valid = (t > 0) AND (0 ≤ s ≤ 1)
+ *     hit_point = O + t · D    (only if valid)
+ *
+ * For the visibility computation: cast a ray, intersect with
+ * EVERY wall, keep the smallest t (first wall hit).  That's
+ * the cell that is "just barely visible" in this direction.
+ *
+ * The cross-product-based solution is FAST (no trig, no
+ * iterative solve) and well-conditioned for non-degenerate
+ * inputs.
+ *
+ * Same primitive shows up in:
+ *   - 2-D laser sensor simulation
+ *   - 2-D ray-marched lighting
+ *   - Polygon clipping algorithms
+ *   - Physics raycasting (Box2D, Chipmunk)
+ *
+ * T4  THE ε-OFFSET TRICK AT CORNERS
+ * ─────────────────────────────────
+ * Problem: at exactly the angle of a wall corner, the ray
+ * passes THROUGH the corner.  Two walls meet there — which
+ * one does the ray hit?
+ *
+ * The answer depends on which side: walls SHARING the corner
+ * extend in different directions.  A ray on EXACTLY the corner
+ * angle gets ambiguous results (depending on tie-breaking
+ * implementation, possibly returning ANY of the walls).
+ *
+ * The ε-OFFSET trick: instead of casting one ray at angle θ,
+ * cast THREE rays at θ - ε, θ, θ + ε:
+ *
+ *     θ - ε:  the ray "just before" the corner — hits the
+ *             wall ENDING at the corner
+ *     θ:       hits the corner exactly (often gives same
+ *             result as θ - ε or θ + ε)
+ *     θ + ε:  the ray "just after" — hits the wall STARTING
+ *             past the corner (or a wall further behind)
+ *
+ * The two ε-offset rays disambiguate the corner.  Their
+ * different hits are added to the visibility polygon as
+ * SEPARATE VERTICES, producing a proper kink at the corner.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │                                                  │
+ *      │                    ●  ← wall corner              │
+ *      │                   ╱│                             │
+ *      │        ╱θ-ε      ╱ │ θ+ε ╲                       │
+ *      │       ╱      ╱╱╱╱  │      ╲                      │
+ *      │      ╱   ╱╱╱╱╱     │       ╲                     │
+ *      │     ╱╱╱╱           │        ╲                    │
+ *      │    O               │         ╲                   │
+ *      │                    ↑                             │
+ *      │                  ε-offset rays diverge,          │
+ *      │                  recording both sides            │
+ *      │                                                  │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * ε is small (~1e-4 rad).  Big enough to disambiguate
+ * floating-point ties, small enough not to misclassify
+ * non-corner angles.
+ *
+ * T5  ASPECT-CORRECT GEOMETRY ON A 2:1 CELL GRID
+ * ──────────────────────────────────────────────
+ * Terminal cells are roughly TWICE AS TALL as wide.  Without
+ * correction, distance computations between cells are biased:
+ * "1 unit horizontally" is shorter than "1 unit vertically."
+ * Visibility polygons would look squashed.
+ *
+ * Fix: do all GEOMETRY in a corrected "geo space":
+ *
+ *     y_geo = y_cell · ASPECT_Y    (ASPECT_Y ≈ 2.0)
+ *
+ * In geo space, distances are metric (1 unit horizontally =
+ * 1 unit vertically, no bias).  Compute angles, ray-segment
+ * intersections, polygon areas in geo space.
+ *
+ * Convert back ONLY at render time:
+ *
+ *     y_render = y_geo / ASPECT_Y
+ *
+ * Same trick reversed (multiply sin by 0.5) is used in
+ * artistic/hindu_mandalas.c — the difference: hindu_mandalas
+ * does its math in CELL coordinates and shrinks Y at draw;
+ * this file does its math in METRIC coordinates and shrinks
+ * back to cells at draw.  Both work.  Choose based on which
+ * domain the input data lives in.
+ *
+ * Same idea generalises: any time you do geometry on a grid
+ * with non-square cells (terminal, hex, anisotropic raster),
+ * stretch one axis to make units isotropic, do math, stretch
+ * back to render.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI

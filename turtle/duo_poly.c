@@ -61,6 +61,396 @@
  *                  edge index advances and the timer resets.  Speed is
  *                  controlled by edges_per_second (eps), adjustable via +/-.
  *
+ * References     :
+ *   Papert, "Mindstorms: Children, Computers, and Powerful Ideas" (1980)
+ *     — the original LOGO turtle, source of the abstraction.
+ *   Wikipedia, "Turtle graphics" — formal definition + history.
+ *     https://en.wikipedia.org/wiki/Turtle_graphics
+ *   Wikipedia, "Regular polygon" — exterior angle = 2π/n derivation.
+ *     https://en.wikipedia.org/wiki/Regular_polygon
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
+ *
+ * CORE IDEA
+ * ─────────
+ * A turtle is a PEN with a POSITION and a HEADING.  It can do two
+ * things: walk forward by some distance (drawing as it goes), or
+ * turn left/right by some angle.  Regular polygons emerge from a
+ * single repeating recipe: "walk one edge, turn by 2π/n, repeat n
+ * times."  The turtle never needs to know it's drawing a polygon
+ * — the geometry is in the angle.
+ *
+ * HOW TO THINK ABOUT IT
+ * ─────────────────────
+ * Picture a person with a pen on graph paper.  They walk one step,
+ * turn 120°, walk another step, turn 120°, walk a third step, turn
+ * 120°.  After three steps + three turns they're back where they
+ * started, facing the original direction — they drew an equilateral
+ * triangle without ever planning a triangle.  Same recipe with 90°
+ * turns gives a square; with 72° a pentagon; with 30° a dodecagon.
+ *
+ * The TURNING ANGLE is what controls the shape.  Lower angle =
+ * gentler turn = more sides before you close the loop = bigger
+ * polygon.  In the limit (angle → 0), the polygon becomes a circle.
+ *
+ * GEOMETRY DIAGRAM
+ * ────────────────
+ *
+ *      walk →                turn 2π/n
+ *
+ *      ●─────●                 ●
+ *       \                       \
+ *        \         turn 2π/n     \
+ *         ●                       ●
+ *          \      ⇒                \
+ *           \                       ●─────●
+ *            ●                       ↑
+ *             \                  closes the loop after
+ *              ●                 n edges + n turns
+ *
+ *      One edge per tick.  After n ticks, the polygon is complete.
+ *
+ * ALGORITHM IN STEPS  (per tick, per turtle)
+ * ─────────────────────────────────────────
+ *   1. If turtle is DONE, increment "done timer".  After RESET_DELAY
+ *      seconds, reset (clear edges drawn, advance side count by ±1).
+ *   2. Else: decrement edge_timer by dt.
+ *   3. If edge_timer ≤ 0:
+ *        a. Drawing the edge = DDA line walk from vertex[k] to
+ *           vertex[k+1], stamping a line glyph (- | / \) at each cell.
+ *        b. edge_index k += 1.
+ *        c. If k == n: turtle DONE.
+ *        d. edge_timer reset to (1 / eps).
+ *
+ * KEY FORMULAS
+ * ────────────
+ *   Vertex k of regular n-gon inscribed in radius R, centred at (cx, cy):
+ *     θ_k = θ_0 + k · (2π / n)
+ *     v.x = cx + R · cos(θ_k)
+ *     v.y = cy + R · sin(θ_k) · ASPECT          (terminal cells 2:1 tall)
+ *
+ *   Exterior angle (the turn the turtle makes between edges):
+ *     α = 2π / n
+ *     n = 3  → α = 120°
+ *     n = 4  → α = 90°
+ *     n = 6  → α = 60°
+ *     n = 12 → α = 30°
+ *
+ *   DDA line walk from (x1, y1) to (x2, y2):
+ *     n_steps = max(|dx|, |dy|)
+ *     for i in 0..n_steps:
+ *       col = x1 + i·dx/n_steps
+ *       row = y1 + i·dy/n_steps
+ *
+ * EDGE CASES TO WATCH
+ * ───────────────────
+ *   • ASPECT correction.  Without scaling sin θ by 0.5, a hexagon
+ *     looks vertically stretched — terminal cells are ~2:1 tall:wide.
+ *     §4 coords applies the correction in one place; everything
+ *     downstream is in plain cell coordinates.
+ *   • Side-count change mid-draw.  Pressing 'a'/'z' or 's'/'x'
+ *     RESETS the affected turtle (clears its current polygon and
+ *     starts over with the new side count).  Otherwise the partial
+ *     polygon would have stale vertices.
+ *   • Both turtles are on independent edge timers — the side counts
+ *     can differ (3 + 7, 5 + 11, etc.).  When BOTH finish, the
+ *     2-second auto-reset fires for both.
+ *   • DDA line glyph picking: the line glyph is decided ONCE per
+ *     edge (from the edge's overall direction), not per cell.
+ *     Within an edge every cell uses the same glyph.
+ *
+ * HOW TO VERIFY
+ * ─────────────
+ *   • Default state: turtle A draws a triangle (3 edges over ~2 sec
+ *     at eps=1.5), turtle B draws a pentagon (5 edges over ~3.3 sec).
+ *     Both pause 2 sec on completion, then advance: A → square,
+ *     B → hexagon.
+ *   • Press 'a' once.  Turtle A's side count rises by 1; A immediately
+ *     resets and starts redrawing with the new count.  Edge count
+ *     in the HUD matches.
+ *   • Press '+' until eps hits its max (12).  Drawing speed scales
+ *     proportionally; a 12-gon takes ~1 sec at eps=12.
+ *   • Pause with space.  Both turtles freeze mid-edge; resume with
+ *     space and they pick up exactly where they stopped.
+ *   • Eyeball test: with n=12, the dodecagon should look round
+ *     (not vertically squashed).  Confirms ASPECT correction works.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
+ *
+ * Reading order
+ * ─────────────
+ *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
+ *      as prose.  This is the only file in turtle/.  No prior
+ *      knowledge required beyond basic trigonometry (cos / sin /
+ *      angle = 2π/n) and a fixed-step main loop.
+ *   2. §5 entity — Turtle struct + tick + draw + line walker.
+ *      THE HEART of the file.  Read AFTER tutorials T1-T6 below.
+ *   3. §4 coords — pixel↔cell mapping with ASPECT correction.
+ *      Small but load-bearing — the entire visual depends on it.
+ *   4. §6 scene — orchestrator: two turtles, side-count input,
+ *      simultaneous reset on completion.
+ *   5. §1-§3, §7-§8 — config / clock / colour / screen / app loop.
+ *      Skim if you've seen the framework.
+ *
+ * Variable-naming convention
+ * ──────────────────────────
+ *   sides              regular polygon side count (3..12 here)
+ *   edge_index, k      which edge is currently being drawn (0..n-1)
+ *   edge_timer         seconds until the next edge advance
+ *   eps                edges per second (drawing speed)
+ *   ASPECT             0.5 — terminal cell aspect compensator
+ *   vertex[]           cached cell positions for current polygon's n+1
+ *                      vertices (last == first to close the loop)
+ *   done               bool — has this turtle completed its polygon?
+ *   done_timer         seconds since DONE; triggers reset at RESET_DELAY
+ *
+ * Background you need
+ * ───────────────────
+ *   - Trig: (cos θ, sin θ) is a unit vector at angle θ from +X.
+ *   - Fixed-step accumulator (ticks at SIM_FPS regardless of
+ *     render rate).
+ *
+ * Background you DON'T need
+ * ─────────────────────────
+ *   - LOGO / Scratch turtle commands.  We use the IDEA of a turtle
+ *     (pen + heading) but skip the language.
+ *   - Bezier / spline curves.  Regular polygons only.
+ *   - Subpixel anti-aliasing.  Cell-grid output, no smoothing.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
+ *
+ * Six tutorials that build a polygon-drawing turtle from first
+ * principles.
+ *
+ *   T1  What is a "turtle"?  Pen + heading + two verbs
+ *   T2  Regular polygons via the exterior-angle theorem
+ *   T3  Computing vertices analytically (cheaper than turtle stepping)
+ *   T4  ASPECT correction — why hexagons need a y-squash
+ *   T5  DDA line walking with directional ASCII glyphs
+ *   T6  One edge per tick — animating an algorithm
+ *
+ * ─────────────────────────────────────────────────────────────────────── *
+ *
+ * T1  WHAT IS A "TURTLE"?  PEN + HEADING + TWO VERBS
+ * ──────────────────────────────────────────────────
+ * Seymour Papert (LOGO, 1967) introduced the TURTLE — an
+ * abstraction with two pieces of state:
+ *
+ *     position   (x, y)        where am I?
+ *     heading    θ             which direction am I facing?
+ *
+ * And two verbs:
+ *
+ *     forward(d)               walk distance d in direction θ;
+ *                              (x, y) += d · (cos θ, sin θ)
+ *     turn(angle)              rotate heading by angle;
+ *                              θ += angle
+ *
+ * If the pen is DOWN, walking draws a line.  That's it.  No
+ * coordinates to compute, no shape definitions, no "draw a
+ * polygon" command.  Complex shapes emerge from sequencing
+ * forward + turn.
+ *
+ * The pedagogical genius: a 7-year-old who has WALKED can
+ * understand what the turtle does.  No abstraction barrier.
+ *
+ * In this file, we use the IDEA of a turtle but COMPUTE the
+ * vertex positions directly (T3) rather than stepping the turtle
+ * vertex-by-vertex.  That's faster and avoids cumulative angle
+ * drift over many sides.  But the conceptual model — pen,
+ * heading, walk — still applies to the rendering.
+ *
+ * T2  REGULAR POLYGONS VIA THE EXTERIOR-ANGLE THEOREM
+ * ───────────────────────────────────────────────────
+ * Question: what sequence of forward + turn produces a regular
+ * n-gon (equilateral, equiangular)?
+ *
+ * The EXTERIOR ANGLE of a regular n-gon is the angle the
+ * turtle turns at each vertex.  It must satisfy:
+ *
+ *     n · α = 2π        (after n turns, total rotation = 1 full circle)
+ *     α = 2π / n
+ *
+ * Examples:
+ *
+ *     n = 3:  α = 120°    (equilateral triangle)
+ *     n = 4:  α = 90°     (square)
+ *     n = 5:  α = 72°     (regular pentagon)
+ *     n = 6:  α = 60°     (regular hexagon)
+ *     n = 8:  α = 45°     (regular octagon)
+ *     n = 12: α = 30°     (regular dodecagon)
+ *
+ * The recipe:
+ *
+ *     repeat n times:
+ *       forward(side_length)
+ *       turn(2π / n)
+ *
+ * After n iterations, the turtle is back at its start, facing
+ * its original direction.  The drawn path is a closed regular
+ * n-gon.
+ *
+ * Two important variations:
+ *
+ *   - LEFT vs RIGHT turn determines the polygon's WINDING
+ *     (clockwise vs counter-clockwise).  In screen coordinates
+ *     (y down), turning by +α is clockwise.
+ *   - Halving the angle (α = π/n) gives a STAR POLYGON instead
+ *     of a regular polygon — try it as an exercise.
+ *
+ * T3  COMPUTING VERTICES ANALYTICALLY
+ * ───────────────────────────────────
+ * Stepping the turtle "forward, turn, forward, turn..." works
+ * but accumulates floating-point error in the heading.  After
+ * 12 turns of 30°, you might end at 360.001°, leaving the polygon
+ * not quite closed.  And the turtle has to be "stepped" to
+ * reach each vertex.
+ *
+ * Cleaner: compute every vertex directly from a circle equation.
+ * Inscribe the polygon in a circle of radius R centred at (cx, cy):
+ *
+ *     for k in 0..n-1:
+ *       θ_k = θ_0 + k · (2π / n)
+ *       vertex[k].x = cx + R · cos(θ_k)
+ *       vertex[k].y = cy + R · sin(θ_k)
+ *
+ * (Plus θ_0 = -π/2 if you want vertex 0 at the top.)
+ *
+ * Properties:
+ *
+ *   - Every vertex is computed independently — no cumulative drift.
+ *   - You can ask "where will the turtle be after edge 7?" with one
+ *     trig call, no need to simulate edges 0-6.
+ *   - The polygon is GUARANTEED closed: vertex[n] = vertex[0]
+ *     exactly.
+ *
+ * §5 turtle_compute_vertices does this once when the side count
+ * changes; per-frame just walks the cached vertex array.
+ *
+ * The "turtle" abstraction is preserved at RENDER TIME: each
+ * edge is drawn as if the turtle walked from vertex[k] to
+ * vertex[k+1].  The pen's heading for that edge picks the line
+ * glyph (T5).
+ *
+ * T4  ASPECT CORRECTION — WHY HEXAGONS NEED A Y-SQUASH
+ * ────────────────────────────────────────────────────
+ * Terminal cells are NOT square.  A typical monospace font cell
+ * is roughly TWICE AS TALL as it is wide.  If we plot
+ *
+ *     vertex.x = cx + R · cos θ
+ *     vertex.y = cy + R · sin θ          ← naïve
+ *
+ * the result LOOKS LIKE A VERTICAL ELLIPSE — taller than wide
+ * by ~2×.  A "regular" hexagon ends up squashed sideways.
+ *
+ * Fix: multiply the y-component by an aspect compensator:
+ *
+ *     vertex.y = cy + R · sin θ · ASPECT
+ *
+ * Where ASPECT ≈ cell_width / cell_height ≈ 8 / 16 = 0.5.
+ * Tune empirically — 0.5 is a good default for most monospace
+ * fonts; some "tall" fonts want 0.45.
+ *
+ *      ┌──────────────────────────────────────────────────┐
+ *      │  no aspect correction:    with ASPECT = 0.5:     │
+ *      │                                                  │
+ *      │       . . .                       .              │
+ *      │     .       .                  .  .  .           │
+ *      │    .         .                .       .          │
+ *      │    .         .                .       .          │
+ *      │     .       .                  .  .  .           │
+ *      │       . . .                       .              │
+ *      │                                                  │
+ *      │  vertical egg                  round-ish         │
+ *      └──────────────────────────────────────────────────┘
+ *
+ * Same trick is used in artistic/hindu_mandalas.c and any
+ * cell-space radial rendering.
+ *
+ * T5  DDA LINE WALKING WITH DIRECTIONAL ASCII GLYPHS
+ * ──────────────────────────────────────────────────
+ * Given two vertex cells (x1, y1) and (x2, y2), we need to
+ * paint EVERY CELL the line crosses with a glyph that hints
+ * at the line's direction.
+ *
+ * DDA (Digital Differential Analyzer) is the simplest line
+ * algorithm:
+ *
+ *     dx = x2 - x1
+ *     dy = y2 - y1
+ *     n_steps = max(|dx|, |dy|)
+ *     step_x = dx / n_steps
+ *     step_y = dy / n_steps
+ *     for i in 0..n_steps:
+ *       paint cell at (x1 + i·step_x, y1 + i·step_y)
+ *
+ * Variants like Bresenham's avoid float arithmetic; for our
+ * scale DDA is plenty fast and easier to read.
+ *
+ * GLYPH PICKING from (dx, dy):
+ *
+ *     |dx| ≫ |dy|   →   '-'    (mostly horizontal)
+ *     |dy| ≫ |dx|   →   '|'    (mostly vertical)
+ *     dx, dy same sign   →   '\\'   (NW to SE in screen coords)
+ *     dx, dy opposite    →   '/'    (SW to NE in screen coords)
+ *
+ * The glyph is decided ONCE per edge (from edge's overall
+ * direction) and stamped at every cell along the way.  This
+ * gives clean, consistent line segments.
+ *
+ * Within-edge glyph variation (e.g. picking glyph PER CELL
+ * based on local slope) would add noise without improving
+ * legibility — straight edges should look straight.
+ *
+ * T6  ONE EDGE PER TICK — ANIMATING AN ALGORITHM
+ * ──────────────────────────────────────────────
+ * The polygon could be drawn instantly, but watching it appear
+ * EDGE BY EDGE is the pedagogical point of a turtle.  The
+ * animation IS the algorithm.
+ *
+ * State machine per turtle:
+ *
+ *     edge_index k = 0
+ *     edge_timer  = 1 / eps   ← seconds until next edge
+ *
+ *     each frame (with dt = frame time, scene paused or not):
+ *       if turtle.done:
+ *         done_timer += dt
+ *         if done_timer >= RESET_DELAY:
+ *           reset polygon (advance side count, k = 0)
+ *         continue
+ *
+ *       edge_timer -= dt
+ *       if edge_timer <= 0:
+ *         draw edge from vertex[k] to vertex[k+1]
+ *         k += 1
+ *         if k == n:
+ *           turtle.done = true
+ *         edge_timer = 1 / eps
+ *
+ * The DRAWING happens in one chunk (all cells of edge k stamped
+ * at once when the timer expires).  An alternative would be
+ * SUB-EDGE animation — paint cell by cell during edge k's
+ * window — for an even smoother visual.  We keep it edge-at-a-
+ * time because the edge BOUNDARY clicks (vertex landings) are
+ * the most visually informative moments.
+ *
+ * Same pattern as algorithms/sort_vis.c (one operation per
+ * tick) and procedural/generational/maze.c (one cell carved
+ * per tick).  Animation = state machine that emits one
+ * EVENT per tick.
+ *
+ * Two turtles run in parallel using TWO INDEPENDENT timers.
+ * They can have different side counts and finish at different
+ * times.  When both are done, RESET_DELAY fires for both
+ * simultaneously and they advance to their next polygons.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L

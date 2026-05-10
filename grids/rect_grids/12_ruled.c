@@ -56,7 +56,7 @@
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
  *
  * CORE IDEA
- * ────────��
+ * ──────────
  * A ruled grid is a rectangular grid with CELL_W set to infinity.  There
  * is only ONE family of lines: horizontal.  The Y axis is divided into
  * discrete "lines" (rows); the X axis is continuous.  The player has two

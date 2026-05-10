@@ -12,7 +12,7 @@
  *   §1 config   — tunable constants
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — ncurses color pairs
- *   §4 coords   — pixel↔cell, centering offset, pointy-top matrix
+ *   §4 formula  — pixel↔cell, centering offset, pointy-top matrix
  *   §5 draw     — pointy-top hex rasterizer
  *   §5b cursor  — movement vectors, cursor_draw
  *   §6 scene    — state struct + scene_draw
@@ -32,6 +32,10 @@
  *                    fq = (√3/3·px − 1/3·py) / s
  *                    fr = (2/3·py) / s
  *                  Cube→pixel: cx = s(√3Q + √3/2·R), cy = s·3/2·R.
+ *
+ * Data-structure : Same as 01_flat_top — no grid array, axial (cQ, cR)
+ *                  cursor only. The only orientation-dependent state is
+ *                  the inverse matrix in §4; cube space is unchanged.
  *
  * Cursor movement : Same HEX_DIR[4][2] deltas as 01_flat_top — the axial
  *                  system is orientation-independent. RIGHT still adds Q+1,
@@ -202,7 +206,7 @@ static void color_init(int theme) {
     init_pair(PAIR_HINT,   COLOR_CYAN,       COLOR_BLACK);
 }
 
-/* ── §4 coords ────────────────────────────────────────────────────────── */
+/* ── §4 formula ───────────────────────────────────────────────────────── */
 /*
  * Centering: px = (col - ox) × CELL_W, py = (row - oy) × CELL_H.
  *

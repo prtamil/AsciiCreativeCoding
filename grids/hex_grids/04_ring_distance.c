@@ -11,7 +11,7 @@
  *   §1 config   — tunable constants
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — ring color pairs
- *   §4 coords   — pixel↔cell, centering offset
+ *   §4 formula  — pixel↔cell, centering offset
  *   §5 draw     — ring-colored grid rasterizer
  *   §5b cursor  — movement vectors, cursor_draw
  *   §6 scene    — state struct + scene_draw
@@ -29,6 +29,10 @@
  * Algorithm      : Ring distance = max(|ΔQ|,|ΔR|,|ΔS|) = (|ΔQ|+|ΔR|+|ΔS|)/2.
  *                  Counts minimum hex steps between two hexes.
  *                  Ring k has exactly 6k hexes (k>0); ring 0 = 1 hex.
+ *
+ * Data-structure : No grid array — every pixel recomputes its ring distance
+ *                  from the cursor each frame. Moving the cursor is O(1);
+ *                  the entire ring recolor is implicit in the next frame.
  *
  * Cursor movement : HEX_DIR[4][2] same as 01. Cursor moves in O(1); the
  *                  entire grid recolors instantly since distance is recomputed
@@ -194,7 +198,7 @@ static void color_init(void) {
     init_pair(PAIR_HINT,   COLOR_CYAN,   COLOR_BLACK);
 }
 
-/* ── §4 coords ────────────────────────────────────────────────────────── */
+/* ── §4 formula ───────────────────────────────────────────────────────── */
 /*
  * px = (col - ox) × CELL_W,  py = (row - oy) × CELL_H.
  * Flat-top pixel↔cube as in 01_flat_top.

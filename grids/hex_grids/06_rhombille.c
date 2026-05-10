@@ -14,7 +14,7 @@
  *   §1 config   — tunable constants
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — ncurses color pairs, 4 themes
- *   §4 coords   — pixel↔cell notes, spoke directions
+ *   §4 formula  — pixel↔cell notes, spoke directions
  *   §5 draw     — hex borders + 3-spoke interior
  *   §5b cursor  — movement vectors, cursor_draw
  *   §6 scene    — state struct + scene_draw
@@ -241,7 +241,7 @@ static void color_init(int theme) {
     init_pair(PAIR_HINT,   COLOR_CYAN,       COLOR_BLACK);
 }
 
-/* ── §4 coords ────────────────────────────────────────────────────────── */
+/* ── §4 formula ───────────────────────────────────────────────────────── */
 /*
  * px = (col - ox) × CELL_W,  py = (row - oy) × CELL_H.
  * Grid centered on screen: ox = cols/2,  oy = (rows-1)/2.

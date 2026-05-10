@@ -12,7 +12,7 @@
  *   §1 config      — tunable constants
  *   §2 clock       — monotonic timer + sleep
  *   §3 color       — ncurses color pairs
- *   §4 coords      — pixel↔cell conversion, centering offset
+ *   §4 formula     — pixel↔cell conversion, centering offset
  *   §5 draw        — hex rasterizer: cube coords + border detection
  *   §5b cursor     — movement vectors, cursor_draw
  *   §6 scene       — state struct + scene_draw
@@ -31,6 +31,10 @@
  *                  pixel→fractional cube via flat-top inverse matrix,
  *                  cube_round (fix-largest-error) → nearest hex (Q,R),
  *                  cube dist = max(|fq-Q|,|fr-R|,|fs-S|) → border/interior.
+ *
+ * Data-structure : No grid array — every pixel resolves its (Q,R) per
+ *                  frame from the flat-top inverse matrix + cube_round.
+ *                  Cursor is a single axial pair (cQ, cR); state is O(1).
  *
  * Cursor movement : Stored as axial (cQ, cR). Arrow keys apply deltas from
  *                  HEX_DIR[4][2] — 4 of the 6 hex faces. See §5b.
@@ -232,7 +236,7 @@ static void color_init(int theme) {
     init_pair(PAIR_HINT,   COLOR_CYAN,       COLOR_BLACK);
 }
 
-/* ── §4 coords ────────────────────────────────────────────────────────── */
+/* ── §4 formula ───────────────────────────────────────────────────────── */
 /*
  * The grid is centered on screen. For terminal cell (col, row):
  *   px = (col - ox) × CELL_W      ← pixel relative to screen center

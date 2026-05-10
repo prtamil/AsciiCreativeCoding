@@ -11,7 +11,7 @@
  *   §1 config   — tunable constants
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — axis color pairs
- *   §4 coords   — pixel↔cell, centering offset
+ *   §4 formula  — pixel↔cell, centering offset
  *   §5 draw     — border pass + label pass
  *   §5b cursor  — movement vectors, cursor_draw
  *   §6 scene    — state struct + two-pass scene_draw
@@ -30,6 +30,11 @@
  *                  membership. Pass 2: enumerate visible hexes, print label
  *                  at each center. Labels land on interior cells (dist≈0)
  *                  skipped in pass 1.
+ *
+ * Data-structure : No grid array. Pass 2 enumerates the visible (Q,R) range
+ *                  derived from screen bounds + HEX_SIZE to print labels.
+ *                  Axis membership (Q=0, R=0, S=0) is a runtime test on the
+ *                  current (Q,R), not stored.
  *
  * Cursor movement : Same HEX_DIR[4][2] as 01_flat_top. '@' drawn in a third
  *                  pass so it always sits on top of the label. Cursor hex
@@ -218,7 +223,7 @@ static int hex_color(int Q, int R, int cQ, int cR) {
     return PAIR_DEFAULT;
 }
 
-/* ── §4 coords ────────────────────────────────────────────────────────── */
+/* ── §4 formula ───────────────────────────────────────────────────────── */
 /*
  * px = (col - ox) × CELL_W,  py = (row - oy) × CELL_H,  ox=cols/2, oy=(rows-1)/2.
  * Flat-top pixel↔cube: same as 01_flat_top §4.

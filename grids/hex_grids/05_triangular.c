@@ -12,7 +12,7 @@
  *   §1 config   — tunable constants
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — ncurses color pairs
- *   §4 coords   — pixel↔cell, stripe coordinate system
+ *   §4 formula  — pixel↔cell, stripe coordinate system
  *   §5 draw     — three-family stripe classifier
  *   §5b cursor  — TRI_DIR movement, triangle center formula, cursor_draw
  *   §6 scene    — state struct + scene_draw
@@ -33,6 +33,10 @@
  *                    n2 = (√3·px + py) / h   (−60° family)
  *                    n3 = (−√3·px + py) / h  (+60° family)
  *                  edge_frac(nk) < border_w → draw '-', '/', or '\'.
+ *
+ * Data-structure : No grid array — three-family stripe values are recomputed
+ *                  per pixel each frame. Cursor lives as (si, sj) ints;
+ *                  total state is O(1).
  *
  * Cursor storage : (si, sj) = (floor(n1), floor(n2)) — two stripe indices
  *                  uniquely identify the triangle. This works because each
@@ -234,7 +238,7 @@ static void color_init(int theme) {
     init_pair(PAIR_HINT,   COLOR_CYAN,       COLOR_BLACK);
 }
 
-/* ── §4 coords ────────────────────────────────────────────────────────── */
+/* ── §4 formula ───────────────────────────────────────────────────────── */
 /*
  * Centered: px = (col - ox)×CELL_W, py = (row - oy)×CELL_H.
  *

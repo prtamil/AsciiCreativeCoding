@@ -2,20 +2,20 @@
 /*
  * 13_dot.c — dot grid (intersection points only, no lines)
  *
- * DEMO: The minimal grid: only a '·' drawn at each cell corner
+ * DEMO: The minimal grid: only a '.' drawn at each cell corner
  *       (row*CELL_H, col*CELL_W). No connecting lines at all.
- *       The player '@' moves between corners; its 4 surrounding dots
+ *       The cursor '@' moves between corners; its 4 surrounding dots
  *       are highlighted to show which cell it occupies.
  *
  * Study alongside: 01_uniform_rect.c (same formula, adds lines), 12_ruled.c
  *
  * Section map:
- *   §1 config   — DOT_W, DOT_H (dot spacing)
+ *   §1 config   — DOT_W, DOT_H (dot spacing), EWMA
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 4 pairs
- *   §4 formula  — dot at (r*DOT_H, c*DOT_W); corner highlight formula
- *   §5 player   — struct, move, reset (standard)
- *   §6 scene    — draw_dots(), highlight_cell(), draw_player()
+ *   §3 color    — 5 pairs (dot, corner, cursor, HUD, HINT)
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -46,10 +46,10 @@
  *                    bottom-right ((r+1)*DOT_H, (c+1)*DOT_W)
  *                  These 4 dots define a cell without any connecting lines.
  *
- * Player cell    : When the player is at (pr, pc), its 4 corner dots are
- *                  highlighted. The player '@' sits at the cell centre:
- *                    centre_row = pr*DOT_H + DOT_H/2
- *                    centre_col = pc*DOT_W + DOT_W/2
+ * Cursor cell    : When the cursor is at (cur->r, cur->c), its 4 corner dots
+ *                  are highlighted. The cursor '@' sits at the cell centre:
+ *                    centre_row = cur->r*DOT_H + DOT_H/2
+ *                    centre_col = cur->c*DOT_W + DOT_W/2
  *
  * References     :
  *   Dot paper — en.wikipedia.org/wiki/Dot_paper
@@ -90,16 +90,16 @@
  *  Per screen position (sr, sc):
  *
  *  1. on_dot = (sr % DOT_H == 0) AND (sc % DOT_W == 0)
- *  2. If on_dot AND is a player corner -> draw '+' with highlight color.
- *  3. If on_dot AND NOT player corner  -> draw '.' with dim color.
+ *  2. If on_dot AND is a cursor corner -> draw '+' with highlight color.
+ *  3. If on_dot AND NOT cursor corner  -> draw '.' with dim color.
  *  4. Otherwise                        -> skip.
  *
- *  The player cell highlight uses the 4 CORNER DOTS — not fill, not lines.
+ *  The cursor cell highlight uses the 4 CORNER DOTS — not fill, not lines.
  *  This keeps the minimal aesthetic while still showing the active cell.
  *
- *  Corner test for cell (pr, pc):
- *    is_corner_row = (sr == pr*DOT_H)  OR (sr == (pr+1)*DOT_H)
- *    is_corner_col = (sc == pc*DOT_W)  OR (sc == (pc+1)*DOT_W)
+ *  Corner test for cell (cur->r, cur->c):
+ *    is_corner_row = (sr == cur->r*DOT_H)  OR (sr == (cur->r+1)*DOT_H)
+ *    is_corner_col = (sc == cur->c*DOT_W)  OR (sc == (cur->c+1)*DOT_W)
  *    is_corner = is_corner_row AND is_corner_col
  *
  * KEY FORMULAS
@@ -134,13 +134,13 @@
  *      cell_col = sc / DOT_W
  *    Screen positions BETWEEN dots belong to a cell but have no character.
  *
- *  • Player '@' placement: the cell centre is NOT at a dot position (unless
+ *  • Cursor '@' placement: the cell centre is NOT at a dot position (unless
  *    DOT_H is even and DOT_W is even and the centre falls on a multiple).
  *    In general, the '@' sits in empty space — this is correct, since the
  *    cell interior has no drawn characters.
  *
  *  • Dot character choice: '.' uses only 1 cell.  On many terminals, a
- *    middle-dot U+00B7 (·) is more visually pleasing but requires correct
+ *    middle-dot U+00B7 is more visually pleasing but requires correct
  *    locale settings.  Use '.' for maximum portability.
  *
  * HOW TO VERIFY
@@ -174,10 +174,14 @@
 #define DOT_W   6    /* columns between dots */
 #define DOT_H   3    /* rows between dots    */
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
+
 #define PAIR_DOT     1   /* regular grid dots          */
 #define PAIR_CORNER  2   /* highlighted cell corners   */
-#define PAIR_PLAYER  3
+#define PAIR_CURSOR  3
 #define PAIR_HUD     4
+#define PAIR_HINT    5
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -205,93 +209,86 @@ static void color_init(void)
     start_color(); use_default_colors();
     init_pair(PAIR_DOT,    COLORS >= 256 ? 252 : COLOR_WHITE,  -1);
     init_pair(PAIR_CORNER, COLORS >= 256 ?  46 : COLOR_GREEN,  -1);
-    init_pair(PAIR_PLAYER, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  15 : COLOR_WHITE,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
+typedef struct {
+    int rows, cols;
+    int cw, ch;
+    int max_r, max_c;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = DOT_W;  g->ch = DOT_H;
+    g->max_r = (rows - 1) / DOT_H - 1;
+    g->max_c = cols / DOT_W - 1;
+}
+
+static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+{
+    *sr = r * g->ch;
+    *sc = c * g->cw;
+}
+
 /*
- * is_dot — DOT GRID FORMULA:
+ * ctx_grid_char — DOT GRID FORMULA:
  *
  *   on_dot = (sr % DOT_H == 0) && (sc % DOT_W == 0)
  *
- * Compare to grid_char() in 01_uniform_rect:
+ * Compare to 01_uniform_rect:
  *   01: draws when (sr%CELL_H==0) OR (sc%CELL_W==0)   — lines
  *   13: draws when (sr%DOT_H==0) AND (sc%DOT_W==0)    — corners only
- *
- * The AND condition selects only grid corners, omitting all line segments.
  */
-static bool is_dot(int sr, int sc)
+static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
-    return (sr % DOT_H == 0) && (sc % DOT_W == 0);
+    bool on_dot = (sr % g->ch == 0) && (sc % g->cw == 0);
+    return on_dot ? '.' : ' ';
 }
 
 /*
- * is_player_corner — test if (sr,sc) is one of the 4 corners of cell (pr,pc).
+ * is_cursor_corner — test if (sr,sc) is one of the 4 corners of cell (cr,cc).
  *
- * The 4 corner rows are:  pr*DOT_H  and  (pr+1)*DOT_H
- * The 4 corner cols are:  pc*DOT_W  and  (pc+1)*DOT_W
+ * The 4 corner rows are:  cr*DOT_H  and  (cr+1)*DOT_H
+ * The 4 corner cols are:  cc*DOT_W  and  (cc+1)*DOT_W
  */
-static bool is_player_corner(int sr, int sc, int pr, int pc)
+static bool is_cursor_corner(const GridCtx *g, int sr, int sc, int cr, int cc)
 {
-    bool r_ok = (sr == pr * DOT_H || sr == (pr + 1) * DOT_H);
-    bool c_ok = (sc == pc * DOT_W || sc == (pc + 1) * DOT_W);
+    bool r_ok = (sr == cr * g->ch || sr == (cr + 1) * g->ch);
+    bool c_ok = (sc == cc * g->cw || sc == (cc + 1) * g->cw);
     return r_ok && c_ok;
 }
 
-/* Cell top-left corner in screen coords (formula reference; used in draw_player) */
-static void cell_to_screen(int r, int c, int *sr, int *sc)
-{
-    *sr = r * DOT_H;
-    *sc = c * DOT_W;
-}
 /* Cell centre (used for '@' placement) */
-static void cell_centre(int r, int c, int *sr, int *sc)
+static void cell_centre(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
-    cell_to_screen(r, c, sr, sc);
-    *sr += DOT_H / 2;
-    *sc += DOT_W / 2;
+    ctx_to_screen(g, r, c, sr, sc);
+    *sr += g->ch / 2;
+    *sc += g->cw / 2;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  player                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct { int r, c, max_r, max_c; } Player;
-
-static void player_reset(Player *p, int rows, int cols)
+/*
+ * ctx_draw_bg — draw all dots; corners of the cursor's cell get highlight.
+ * Takes the cursor coords so it can paint the corner highlight in PAIR_CORNER.
+ */
+static void ctx_draw_bg(const GridCtx *g, int cr, int cc)
 {
-    p->max_r = (rows - 1) / DOT_H - 1;
-    p->max_c = cols / DOT_W - 1;
-    p->r = p->max_r / 2;
-    p->c = p->max_c / 2;
-}
-static void player_move(Player *p, int dr, int dc)
-{
-    int nr = p->r + dr, nc = p->c + dc;
-    if (nr >= 0 && nr <= p->max_r) p->r = nr;
-    if (nc >= 0 && nc <= p->max_c) p->c = nc;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void draw_dots(int rows, int cols, const Player *p)
-{
-    for (int sr = 0; sr < rows - 1; sr++) {
-        for (int sc = 0; sc < cols; sc++) {
-            if (!is_dot(sr, sc)) continue;
-            if (is_player_corner(sr, sc, p->r, p->c)) {
+    for (int sr = 0; sr < g->rows - 1; sr++) {
+        for (int sc = 0; sc < g->cols; sc++) {
+            if (ctx_grid_char(g, sr, sc) != '.') continue;
+            if (is_cursor_corner(g, sr, sc, cr, cc)) {
                 attron(COLOR_PAIR(PAIR_CORNER) | A_BOLD);
                 mvaddch(sr, sc, (chtype)'+');
                 attroff(COLOR_PAIR(PAIR_CORNER) | A_BOLD);
             } else {
                 attron(COLOR_PAIR(PAIR_DOT));
-                /* Use a compact dot character (period suffices on all terminals) */
                 mvaddch(sr, sc, (chtype)'.');
                 attroff(COLOR_PAIR(PAIR_DOT));
             }
@@ -299,31 +296,57 @@ static void draw_dots(int rows, int cols, const Player *p)
     }
 }
 
-static void draw_player(const Player *p)
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct { int r, c; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
 {
-    int sr, sc; cell_centre(p->r, p->c, &sr, &sc);
-    attron(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
-    mvaddch(sr, sc, (chtype)'@');
-    attroff(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
+    cur->r = g->max_r / 2;
+    cur->c = g->max_c / 2;
 }
 
-static void scene_draw(int rows, int cols, const Player *p, double fps)
+static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
-    erase();
-    draw_dots(rows, cols, p);
-    draw_player(p);
+    int nr = cur->r + dr, nc = cur->c + dc;
+    if (nr >= 0 && nr <= g->max_r) cur->r = nr;
+    if (nc >= 0 && nc <= g->max_c) cur->c = nc;
+}
 
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc; cell_centre(g, cur->r, cur->c, &sr, &sc);
+    attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    mvaddch(sr, sc, (chtype)'@');
+    attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
     char buf[64];
-    snprintf(buf, sizeof buf, " %.1f fps  cell(%d,%d) ", fps, p->r, p->c);
+    snprintf(buf, sizeof buf, " %.1f fps  cell(%d,%d) ", fps, cur->r, cur->c);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_DIM);
-    mvprintw(rows - 1, 0,
-        " arrows:move  r:reset  q:quit  [13 dot grid  corners only: sr%%H==0 && sc%%W==0] ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_DIM);
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+        " arrows:move  r:reset  q/ESC:quit  [13 dot grid  corners only: sr%%H==0 && sc%%W==0] ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
+    erase();
+    ctx_draw_bg(g, cur->r, cur->c);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();
 }
 
@@ -356,29 +379,32 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
     screen_init();
-    int rows = LINES, cols = COLS;
-    Player player; player_reset(&player, rows, cols);
+    GridCtx g;     ctx_init(&g, LINES, COLS);
+    Cursor  cur;   cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double fps = TARGET_FPS; int64_t t0 = clock_ns();
+    double fps = TARGET_FPS;
+    int64_t t0 = clock_ns();
 
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
-            player_reset(&player, rows, cols);
+            ctx_init(&g, LINES, COLS);
+            cursor_reset(&cur, &g);
         }
         int ch = getch();
         switch (ch) {
-            case 'q': case 27: g_running = 0;                    break;
-            case 'r':          player_reset(&player, rows, cols); break;
-            case KEY_UP:    player_move(&player, -1,  0); break;
-            case KEY_DOWN:  player_move(&player, +1,  0); break;
-            case KEY_LEFT:  player_move(&player,  0, -1); break;
-            case KEY_RIGHT: player_move(&player,  0, +1); break;
+            case 'q': case 27: g_running = 0;              break;
+            case 'r':          cursor_reset(&cur, &g);     break;
+            case KEY_UP:    cursor_move(&cur, &g, -1,  0); break;
+            case KEY_DOWN:  cursor_move(&cur, &g, +1,  0); break;
+            case KEY_LEFT:  cursor_move(&cur, &g,  0, -1); break;
+            case KEY_RIGHT: cursor_move(&cur, &g,  0, +1); break;
         }
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (now - t0 + 1)) * 0.05; t0 = now;
-        scene_draw(rows, cols, &player, fps);
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0 = now;
+        scene_draw(&g, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

@@ -7,24 +7,28 @@
  *       corner — the classic "cube illusion" from the rhombille tiling.
  *       An '@' cursor moves between hex cells with arrow keys.
  *
- * Study alongside: grids/hex_grids/01_flat_top.c (hex border algorithm)
- *                  grids/hex_grids/05_triangular.c (triangular dual of rhombille)
+ * Study alongside: ../README.md (the GridCtx + Cursor abstraction),
+ *                  hex_grids/01_flat_top.c (hex border algorithm)
+ *                  hex_grids/05_triangular.c (triangular dual of rhombille)
  *
  * Section map:
- *   §1 config   — tunable constants
+ *   §1 config   — CELL_W/CELL_H, hex_size + border_w + spoke_w bounds,
+ *                 themes, FPS_EWMA_ALPHA, color pair IDs
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — ncurses color pairs, 4 themes
- *   §4 formula  — pixel↔cell notes, spoke directions
- *   §5 draw     — hex borders + 3-spoke interior
- *   §5b cursor  — movement vectors, cursor_draw
- *   §6 scene    — state struct + scene_draw
- *   §7 screen   — ncurses display layer
+ *   §3 color    — border / spoke / cursor / HUD / HINT pairs (4 themes)
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
+ *                 (two-level: hex border → spoke check on interior)
+ *   §5 cursor   — Cursor (q, r) + cursor_reset / cursor_move / cursor_draw
+ *                 + HEX_DIR axial direction table
+ *   §6 scene    — hud_draw + scene_draw
+ *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, resize, main loop
  *
  * Keys:  q/ESC quit  p pause  t theme  r reset  arrows move  +/-:size  [/]:spoke
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra 06_rhombille.c -o 06_rhombille -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids/06_rhombille.c \
+ *       -o 06_rhombille -lncurses -lm
  */
 
 /* ── CONCEPTS ──────────────────────────────────────────────────────────── *
@@ -36,16 +40,20 @@
  *                  Together, adjacent rhombuses from neighboring hexes create
  *                  the illusion of 3D isometric cubes.
  *
- * Data-structure : Two-level classification per cell:
- *                  Level 1: compute cube dist. If dist > 0.5-border_w → hex border.
- *                  Level 2: if interior, check distance from each of 3 spokes.
- *                    Spoke k has direction d_k = (cos θ_k_screen, sin θ_k_screen).
- *                    Project (px-cx, py-cy) onto d_k → along-spoke t and perp dist.
- *                    If 0 ≤ t ≤ size and perp ≤ SPOKE_W_PX → spoke border.
+ * Data-structure : Two structs — GridCtx (hex_size, border_w, spoke_w,
+ *                  cursor bounds in axial space) and Cursor (just (q, r)).
+ *                  No grid array; ctx_draw_bg() runs a two-level per-pixel
+ *                  classifier:
+ *                  Level 1: cube dist > 0.5 − border_w → hex border.
+ *                  Level 2: if interior, project (px−cx, py−cy) onto each
+ *                    spoke direction; if 0 ≤ t ≤ size and perp ≤ spoke_w,
+ *                    draw the spoke character.
+ *                  See ../README.md "The two primitives" for why this same
+ *                  GridCtx + Cursor split is reused across every grid family.
  *
- * Rendering      : Spoke character = angle_char(θ_k_screen) — the direction of
- *                  the spoke line itself (NOT +π/2 as for hex borders, because
- *                  we want the line character aligned with the spoke direction).
+ * Rendering      : Spoke character = direction of the spoke line itself
+ *                  (NOT +π/2 as for hex borders, because we want the line
+ *                  character aligned with the spoke direction).
  *                  Spoke at screen 0° → '-'; 120° → '/'; 240° → '\'.
  *                  Hex border: angle_char(theta + π/2) as in 01_flat_top.
  *
@@ -151,7 +159,7 @@
  *  • cursor hex: both its border AND its spokes are drawn in PAIR_CURSOR.
  *    This gives the cursor hex a fully blue-highlighted appearance.
  *
- * HOW TO VERIFY  (HEX_SIZE=14, spoke_w=2.5, cursor at Q=0, R=0)
+ * HOW TO VERIFY  (HEX_SIZE=14, spoke_w=2.5, cursor at q=0, r=0)
  * ─────────────
  *  Spoke 0 goes from center (0,0) rightward to vertex (14, 0).
  *  Pixel at (col=ox+4, row=oy): px=8, py=0, vx=8, vy=0.
@@ -169,27 +177,34 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
+#include <ncurses.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <ncurses.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── §1 config ────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §1  config                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
+/* Sub-pixel resolution per terminal cell — hex math runs in pixel units. */
 #define CELL_W              2
 #define CELL_H              4
 
+/* Hex side length in pixels — the lone tunable that sets cell scale. */
 #define HEX_SIZE_DEFAULT   14.0
 #define HEX_SIZE_MIN        6.0
 #define HEX_SIZE_MAX       40.0
 #define HEX_SIZE_STEP       2.0
 
+/* Cube-distance threshold for "on a hex border" (normalized [0,0.5]). */
 #define BORDER_W_DEFAULT    0.10
 #define BORDER_W_MIN        0.03
 #define BORDER_W_MAX        0.30
@@ -202,28 +217,40 @@
 #define SPOKE_W_STEP        0.5
 
 #define N_THEMES            4
-#define TICK_NS            16666667LL
+#define TICK_NS            16666667LL    /* ~60 Hz frame budget */
 
-/* ── §2 clock ─────────────────────────────────────────────────────────── */
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA      0.05
 
-static int64_t clock_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
-}
-static void clock_sleep_ns(int64_t ns) {
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
-}
-
-/* ── §3 color ─────────────────────────────────────────────────────────── */
-
+/* Color pair IDs */
 #define PAIR_BORDER  1
 #define PAIR_SPOKE   2   /* interior spokes — slightly dimmer for depth */
 #define PAIR_CURSOR  3   /* cursor hex border + '@' character */
 #define PAIR_HUD     4
 #define PAIR_HINT    5
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §2  clock                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static int64_t clock_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static void clock_sleep_ns(int64_t ns)
+{
+    if (ns <= 0) return;
+    struct timespec ts = { .tv_sec  = (time_t)(ns / 1000000000LL),
+                           .tv_nsec = (long)(ns % 1000000000LL) };
+    nanosleep(&ts, NULL);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §3  color                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
 static const short THEMES[N_THEMES][2] = {
     { COLOR_CYAN,   COLOR_BLACK },
@@ -231,69 +258,108 @@ static const short THEMES[N_THEMES][2] = {
     { COLOR_YELLOW, COLOR_BLACK },
     { COLOR_WHITE,  COLOR_BLACK },
 };
-static void color_init(int theme) {
+
+static void color_init(int theme)
+{
     start_color();
     use_default_colors();
     init_pair(PAIR_BORDER, THEMES[theme][0], THEMES[theme][1]);
     init_pair(PAIR_SPOKE,  THEMES[theme][0], THEMES[theme][1]);
     init_pair(PAIR_CURSOR, COLOR_WHITE,      COLOR_BLUE);
-    init_pair(PAIR_HUD,    COLOR_BLACK,      COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLOR_CYAN,       COLOR_BLACK);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula ───────────────────────────────────────────────────────── */
-/*
- * px = (col - ox) × CELL_W,  py = (row - oy) × CELL_H.
- * Grid centered on screen: ox = cols/2,  oy = (rows-1)/2.
- * Flat-top hex cube coords and center formula — see 01_flat_top.c §4.
- *
- * Spoke directions (screen space, y increases downward):
- *   Math 0° vertex (right):         screen dir = ( 1.0,    0.0  ) → '-'
- *   Math 120° vertex (upper-left):  screen dir = (−0.5, −√3/2  ) → '\'
- *   Math 240° vertex (lower-left):  screen dir = (−0.5, +√3/2  ) → '/'
- * The screen y-component is −sin(math_angle) because y is flipped.
- */
-
-/* ── §5 draw ──────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §4  formula — GridCtx and the hex-border + spoke classifier             */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * MENTAL MODEL — rhombille = hex + 3 spokes:
+ * GridCtx — geometry of the rhombille tiling plus cursor bounds.
  *
- *   Start with a flat-top hex. It has 6 vertices at angles 0°,60°,120°,
- *   180°,240°,300° from the center. Draw lines from center to the ODD-
- *   numbered vertices (0°, 120°, 240°). This creates 3 equal rhombuses:
+ * Cursor is axial (q, r) — the same coordinate system as 01_flat_top, so
+ * max_q / max_r play the same role as max_r / max_c do in rect's GridCtx.
  *
- *        * ← vertex at 60° (not connected)
- *       / \
- *      /   \
- *     *--C--*   C = center; spokes go to left(*), upper-right(*), lower-right(*)
- *      \   /   (the 3 ODD vertices at 0°,120°,240° in this diagram)
- *       \ /
- *        *
- *
- *   Each pair of adjacent hexes shares a rhombus boundary along their
- *   shared edge, creating the seamless rhombille tiling.
- *
- *   The 3 spoke directions at 120° apart match the 3 axis directions of
- *   isometric projection. If you shade the 3 rhombuses differently (top,
- *   left, right face), you see a 3D cube floating in space.
- *
- *   In ASCII: we can't shade, but we can vary the character per spoke:
- *     '-' for horizontal top-face boundary
- *     '\' for upper-left face boundary
- *     '/' for lower-left face boundary
- *
- *   For detecting if a cell is on spoke k:
- *     1. Compute vector v = (px - cx, py - cy) from hex center to cell
- *     2. Project onto spoke direction d_k: t = v · d_k
- *     3. Perpendicular distance: perp = |v × d_k|  (2D cross magnitude)
- *     4. On spoke if: 0 ≤ t ≤ hex_size  AND  perp ≤ spoke_w
+ * The two render knobs (border_w, spoke_w_px) are part of GridCtx because
+ * ctx_draw_bg() reads them directly — keeping them off any global lets
+ * ctx_draw_bg() be called from any caller with any settings.
  */
+typedef struct {
+    /* terminal extent (in cells) */
+    int rows, cols;
+
+    /* hex side length in pixels + sub-pixel cell size */
+    double hex_size;
+    int    cell_w, cell_h;
+
+    /* centring origin in cell coordinates */
+    int ox, oy;
+
+    /* cursor bounds in axial space (loose — cursor can roam freely) */
+    int max_q, max_r;
+
+    /* spoke-related render knobs */
+    double border_w;       /* cube-dist threshold for hex borders */
+    double spoke_w_px;     /* spoke half-width in pixels         */
+} GridCtx;
+
+/*
+ * ctx_init — derive geometry from terminal size + hex_size.
+ *
+ * The grid is centered on screen: ox = cols/2, oy = (rows-1)/2.
+ * Axial bounds are loose — the cursor can move anywhere reachable on
+ * screen. Out-of-bounds values just sit off-screen, cursor_draw checks
+ * before mvaddch.
+ */
+static void ctx_init(GridCtx *g, int rows, int cols,
+                     double hex_size, double border_w, double spoke_w_px)
+{
+    g->rows = rows; g->cols = cols;
+    g->hex_size = hex_size;
+    g->cell_w = CELL_W; g->cell_h = CELL_H;
+    g->ox = cols / 2;
+    g->oy = (rows - 1) / 2;
+    g->border_w   = border_w;
+    g->spoke_w_px = spoke_w_px;
+
+    /* Loose axial bounds — cover screen extent in both axes (flat-top
+     * forward matrix has Δcx ≈ 1.5·s per Q step, Δcy ≈ √3·s per R step). */
+    g->max_q = (int)((cols * CELL_W) / (1.5 * hex_size)) + 2;
+    g->max_r = (int)((rows * CELL_H) / (sqrt(3.0) * hex_size)) + 2;
+}
+
+/*
+ * ctx_to_screen — center cell of flat-top hex (q, r) in screen coordinates.
+ *
+ * THE FORMULA (flat-top forward matrix, same as 01_flat_top):
+ *   cx_pix = size × 3/2 × q
+ *   cy_pix = size × (√3/2 × q  +  √3 × r)
+ *   sc = ox + (int)(cx_pix / CELL_W)
+ *   sr = oy + (int)(cy_pix / CELL_H)
+ *
+ * Reading it: q increases east (1.5·s per step), r increases south-east
+ * (√3·s per step plus a √3/2·s contribution from q). The integer
+ * truncation keeps '@' slightly inside the hex interior rather than
+ * landing on a border character.
+ *
+ * The §4 formula for THIS grid family — every hex file in the series
+ * shares this shape, only the inverse classifier in ctx_draw_bg() changes.
+ */
+static void ctx_to_screen(const GridCtx *g, int q, int r, int *sr, int *sc)
+{
+    double sq3   = sqrt(3.0);
+    double sq3_2 = sq3 * 0.5;
+    double cx_pix = g->hex_size * 1.5      * (double)q;
+    double cy_pix = g->hex_size * (sq3_2   * (double)q + sq3 * (double)r);
+    *sc = g->ox + (int)(cx_pix / g->cell_w);
+    *sr = g->oy + (int)(cy_pix / g->cell_h);
+}
 
 /*
  * angle_char — same as 01_flat_top. See that file for documentation.
  */
-static char angle_char(double theta) {
+static char angle_char(double theta)
+{
     double t = fmod(theta, M_PI);
     if (t < 0.0) t += M_PI;
     if      (t < M_PI / 8.0)         return '-';
@@ -320,7 +386,7 @@ static const double SPOKE_D[3][2] = {
 static const char SPOKE_C[3] = { '-', '\\', '/' };
 
 /*
- * grid_draw — rasterize rhombille: hex borders + interior spokes.
+ * ctx_draw_bg — paint the rhombille tiling: hex borders + interior spokes.
  *
  * THE PIPELINE (per screen cell):
  *
@@ -337,19 +403,23 @@ static const char SPOKE_C[3] = { '-', '\\', '/' };
  *              if 0 ≤ t ≤ size AND perp ≤ spoke_w:
  *                draw SPOKE_C[k] in PAIR_CURSOR (on_cur) or PAIR_SPOKE
  *                break  ← only one spoke character per pixel
+ *
+ * The two-level structure (hex first, spoke on interior) is the whole
+ * point of rhombille — it composes cleanly with 01_flat_top by adding
+ * one more pass on the cells that 01_flat_top would skip.
  */
-static void grid_draw(int rows, int cols,
-                       double size, double border_w, double spoke_w,
-                       int cQ, int cR, int ox, int oy) {
+static void ctx_draw_bg(const GridCtx *g, int cur_q, int cur_r)
+{
     double sq3   = sqrt(3.0);
     double sq3_3 = sq3 / 3.0;
     double sq3_2 = sq3 * 0.5;
-    double limit = 0.5 - border_w;
+    double limit = 0.5 - g->border_w;
+    double size  = g->hex_size;
 
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double px = (double)(col - ox) * CELL_W;
-            double py = (double)(row - oy) * CELL_H;
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
 
             /* Flat-top fractional cube coords */
             double fq = (2.0/3.0 * px) / size;
@@ -376,10 +446,10 @@ static void grid_draw(int rows, int cols,
             double cx = size * 1.5 * fQ;
             double cy = size * (sq3_2 * fQ + sq3 * fR);
 
-            int on_cur = (Q == cQ && R == cR);
+            int on_cur = (Q == cur_q && R == cur_r);
 
             if (dist >= limit) {
-                /* Hex border — cursor hex uses PAIR_CURSOR */
+                /* Level 1: hex border — cursor hex uses PAIR_CURSOR */
                 double theta = atan2(py - cy, px - cx);
                 char ch = angle_char(theta + M_PI / 2.0);
                 int attr = on_cur ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
@@ -388,13 +458,13 @@ static void grid_draw(int rows, int cols,
                 mvaddch(row, col, (chtype)(unsigned char)ch);
                 attroff(attr);
             } else {
-                /* Interior: check 3 spokes */
+                /* Level 2: interior — check 3 spokes */
                 double vx = px - cx, vy = py - cy;
                 for (int k = 0; k < 3; k++) {
                     double dx = SPOKE_D[k][0], dy = SPOKE_D[k][1];
                     double t    = vx * dx + vy * dy;
                     double perp = fabs(vx * dy - vy * dx);
-                    if (t >= 0.0 && t <= size && perp <= spoke_w) {
+                    if (t >= 0.0 && t <= size && perp <= g->spoke_w_px) {
                         int attr = on_cur ? COLOR_PAIR(PAIR_CURSOR)
                                           : COLOR_PAIR(PAIR_SPOKE);
                         attron(attr);
@@ -408,19 +478,30 @@ static void grid_draw(int rows, int cols,
     }
 }
 
-/* ── §5b cursor ───────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * HEX_DIR — 4-direction movement in axial (Q, R) space.
+ * Cursor — just (q, r) in axial flat-top hex coordinates.
+ *
+ * Bounds live in GridCtx (max_q, max_r), not here. The cursor doesn't know
+ * how big the grid is, just where in it the user is pointing. The two
+ * structs compose: Cursor + GridCtx → screen position via ctx_to_screen().
+ */
+typedef struct { int q, r; } Cursor;
+
+/*
+ * HEX_DIR — 4-direction movement in axial (q, r) space.
  *
  * The rhombille tiling uses the same underlying flat-top hex grid as
  * 01_flat_top, so the same axial direction table applies.
  *
- *                 UP: (Q=0, R=-1)
+ *                 UP: (q=0, r=-1)
  *                       ↑
- *   LEFT: (Q=-1, R=0) ← ● → RIGHT: (Q=+1, R=0)
+ *   LEFT: (q=-1, r=0) ← ● → RIGHT: (q=+1, r=0)
  *                       ↓
- *                DOWN: (Q=0, R=+1)
+ *                DOWN: (q=0, r=+1)
  *
  * Moving the cursor shifts the cube illusion's "anchor" hex — the
  * 3-rhombus pattern is identical in every hex, so only the highlight
@@ -433,129 +514,184 @@ static const int HEX_DIR[4][2] = {
     {+1,  0 },   /* RIGHT */
 };
 
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    (void)g;
+    cur->q = 0;
+    cur->r = 0;
+}
+
 /*
- * cursor_draw — place '@' at the center cell of flat-top hex (cQ, cR).
+ * cursor_move — apply (dq, dr) and clamp to GridCtx bounds.
  *
- * THE FORMULA (flat-top forward matrix):
- *   cx_pix = size × 3/2 × cQ
- *   cy_pix = size × (√3/2 × cQ  +  √3 × cR)
- *   col = ox + (int)(cx_pix / CELL_W)
- *   row = oy + (int)(cy_pix / CELL_H)
- *
- * Same as 01_flat_top cursor_draw — the rhombille tiling uses the same
- * flat-top hex lattice for cell centers.
+ * Arrow-key dispatch reads HEX_DIR[k] and forwards (dq, dr) here.
+ * Bounds are loose (±max_q/max_r around 0).
  */
-static void cursor_draw(double size, int cQ, int cR,
-                         int ox, int oy, int rows, int cols) {
-    double sq3   = sqrt(3.0);
-    double sq3_2 = sq3 * 0.5;
-    double cx_pix = size * 1.5      * (double)cQ;
-    double cy_pix = size * (sq3_2   * (double)cQ + sq3 * (double)cR);
-    int col = ox + (int)(cx_pix / CELL_W);
-    int row = oy + (int)(cy_pix / CELL_H);
-    if (col >= 0 && col < cols && row >= 0 && row < rows - 1) {
+static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
+{
+    int nq = cur->q + dq;
+    int nr = cur->r + dr;
+    if (nq >= -g->max_q && nq <= g->max_q) cur->q = nq;
+    if (nr >= -g->max_r && nr <= g->max_r) cur->r = nr;
+}
+
+/*
+ * cursor_draw — place '@' at the centre cell of hex (q, r).
+ *
+ * Delegates the screen-position math to ctx_to_screen(); only checks
+ * bounds and emits the bold '@'. Same shape as cursor_draw across every
+ * grid file in the series.
+ */
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc;
+    ctx_to_screen(g, cur->q, cur->r, &sr, &sc);
+    if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-        mvaddch(row, col, '@');
+        mvaddch(sr, sc, '@');
         attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     }
 }
 
-/* ── §6 scene ─────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
-typedef struct {
-    double hex_size, border_w, spoke_w;
-    int    cQ, cR;
-    int    theme, paused;
-} Scene;
-
-static void scene_init(Scene *s) {
-    s->hex_size = HEX_SIZE_DEFAULT;
-    s->border_w = BORDER_W_DEFAULT;
-    s->spoke_w  = SPOKE_W_DEFAULT;
-    s->cQ = 0; s->cR = 0;
-    s->theme = 0; s->paused = 0;
-}
-static void scene_draw(const Scene *s, int rows, int cols) {
-    int ox = cols / 2;
-    int oy = (rows - 1) / 2;
-    grid_draw(rows, cols, s->hex_size, s->border_w, s->spoke_w,
-              s->cQ, s->cR, ox, oy);
-    cursor_draw(s->hex_size, s->cQ, s->cR, ox, oy, rows, cols);
-}
-
-/* ── §7 screen ────────────────────────────────────────────────────────── */
-
-static void screen_init(void) {
-    initscr(); cbreak(); noecho();
-    keypad(stdscr, TRUE); curs_set(0);
-    nodelay(stdscr, TRUE); typeahead(-1);
-}
-static void screen_draw_hud(const Scene *s, int rows, int cols, double fps) {
+/* Bright bold yellow status (top-right) + bold cyan key hints (bottom). */
+static void hud_draw(const GridCtx *g, const Cursor *cur,
+                     int theme, int paused, double fps)
+{
     char buf[96];
     snprintf(buf, sizeof buf,
              " Q:%+d R:%+d  size:%.0f  spoke:%.1f  theme:%d  %5.1f fps  %s ",
-             s->cQ, s->cR, s->hex_size, s->spoke_w, s->theme, fps,
-             s->paused ? "PAUSED " : "running");
+             cur->q, cur->r, g->hex_size, g->spoke_w_px, theme, fps,
+             paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " q:quit  p:pause  t:theme  r:reset  arrows:move  +/-:size  [/]:spoke ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
-}
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
-static void cleanup(void) { endwin(); }
-
-/* ── §8 app ───────────────────────────────────────────────────────────── */
-
-static volatile sig_atomic_t running = 1, need_resize = 0;
-static void sig_handler(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) running = 0;
-    if (sig == SIGWINCH) need_resize = 1;
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-int main(void) {
-    atexit(cleanup);
-    signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler);
-    signal(SIGWINCH, sig_handler);
+static void scene_draw(const GridCtx *g, const Cursor *cur,
+                       int theme, int paused, double fps)
+{
+    erase();
+    ctx_draw_bg(g, cur->q, cur->r);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, theme, paused, fps);
+    wnoutrefresh(stdscr);
+    doupdate();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §7  screen                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void screen_cleanup(void) { endwin(); }
+
+static void screen_init(void)
+{
+    initscr(); cbreak(); noecho();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    curs_set(0);
+    typeahead(-1);
+    atexit(screen_cleanup);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §8  app                                                                 */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static volatile sig_atomic_t g_running     = 1;
+static volatile sig_atomic_t g_need_resize = 0;
+
+static void on_signal(int s)
+{
+    if (s == SIGINT || s == SIGTERM) g_running     = 0;
+    if (s == SIGWINCH)               g_need_resize = 1;
+}
+
+int main(void)
+{
+    signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
+    signal(SIGWINCH, on_signal);
+
     screen_init();
-    int rows, cols; getmaxyx(stdscr, rows, cols);
-    Scene sc; scene_init(&sc); color_init(sc.theme);
-    int64_t prev = clock_ns(); double fps = 60.0;
 
-    while (running) {
-        if (need_resize) {
-            need_resize = 0; endwin(); refresh();
-            getmaxyx(stdscr, rows, cols);
+    double hex_size = HEX_SIZE_DEFAULT;
+    double border_w = BORDER_W_DEFAULT;
+    double spoke_w  = SPOKE_W_DEFAULT;
+    int    theme    = 0;
+    int    paused   = 0;
+
+    GridCtx g;     ctx_init(&g, LINES, COLS, hex_size, border_w, spoke_w);
+    Cursor  cur;   cursor_reset(&cur, &g);
+    color_init(theme);
+
+    double  fps = 60.0;
+    int64_t prev = clock_ns();
+
+    while (g_running) {
+        if (g_need_resize) {
+            g_need_resize = 0;
+            endwin(); refresh();
+            ctx_init(&g, LINES, COLS, hex_size, border_w, spoke_w);
+            cursor_reset(&cur, &g);
         }
+
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
-            case 'q': case 27: running = 0; break;
-            case 'p': sc.paused ^= 1; break;
-            case 't': sc.theme = (sc.theme + 1) % N_THEMES; color_init(sc.theme); break;
-            case 'r': sc.cQ = 0; sc.cR = 0; break;
-            case KEY_UP:    sc.cQ += HEX_DIR[0][0]; sc.cR += HEX_DIR[0][1]; break;
-            case KEY_DOWN:  sc.cQ += HEX_DIR[1][0]; sc.cR += HEX_DIR[1][1]; break;
-            case KEY_LEFT:  sc.cQ += HEX_DIR[2][0]; sc.cR += HEX_DIR[2][1]; break;
-            case KEY_RIGHT: sc.cQ += HEX_DIR[3][0]; sc.cR += HEX_DIR[3][1]; break;
+            case 'q': case 27: g_running = 0; break;
+            case 'p': paused ^= 1; break;
+            case 't':
+                theme = (theme + 1) % N_THEMES;
+                color_init(theme);
+                break;
+            case 'r': cursor_reset(&cur, &g); break;
+            case KEY_UP:    cursor_move(&cur, &g, HEX_DIR[0][0], HEX_DIR[0][1]); break;
+            case KEY_DOWN:  cursor_move(&cur, &g, HEX_DIR[1][0], HEX_DIR[1][1]); break;
+            case KEY_LEFT:  cursor_move(&cur, &g, HEX_DIR[2][0], HEX_DIR[2][1]); break;
+            case KEY_RIGHT: cursor_move(&cur, &g, HEX_DIR[3][0], HEX_DIR[3][1]); break;
             case '+': case '=':
-                if (sc.hex_size < HEX_SIZE_MAX) { sc.hex_size += HEX_SIZE_STEP; } break;
+                if (hex_size < HEX_SIZE_MAX) {
+                    hex_size += HEX_SIZE_STEP;
+                    ctx_init(&g, LINES, COLS, hex_size, border_w, spoke_w);
+                }
+                break;
             case '-':
-                if (sc.hex_size > HEX_SIZE_MIN) { sc.hex_size -= HEX_SIZE_STEP; } break;
+                if (hex_size > HEX_SIZE_MIN) {
+                    hex_size -= HEX_SIZE_STEP;
+                    ctx_init(&g, LINES, COLS, hex_size, border_w, spoke_w);
+                }
+                break;
             case '[':
-                if (sc.spoke_w > SPOKE_W_MIN) { sc.spoke_w -= SPOKE_W_STEP; } break;
+                if (spoke_w > SPOKE_W_MIN) {
+                    spoke_w -= SPOKE_W_STEP;
+                    g.spoke_w_px = spoke_w;
+                }
+                break;
             case ']':
-                if (sc.spoke_w < SPOKE_W_MAX) { sc.spoke_w += SPOKE_W_STEP; } break;
+                if (spoke_w < SPOKE_W_MAX) {
+                    spoke_w += SPOKE_W_STEP;
+                    g.spoke_w_px = spoke_w;
+                }
+                break;
             }
         }
+
         int64_t now = clock_ns(), dt = now - prev; prev = now;
-        if (dt > 0) fps = fps * 0.9 + 1e9 / (double)dt * 0.1;
-        erase();
-        scene_draw(&sc, rows, cols);
-        screen_draw_hud(&sc, rows, cols, fps);
-        screen_present();
+        if (dt > 0) {
+            fps = fps * (1.0 - FPS_EWMA_ALPHA)
+                + (1e9 / (double)dt) * FPS_EWMA_ALPHA;
+        }
+
+        scene_draw(&g, &cur, theme, paused, fps);
         clock_sleep_ns(TICK_NS - (clock_ns() - now));
     }
     return 0;

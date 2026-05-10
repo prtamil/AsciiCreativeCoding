@@ -11,12 +11,12 @@
  * Study alongside: 08_diamond.c (same formula, 45° square cells)
  *
  * Section map:
- *   §1 config   — IW=8, IH=2 (classic 2:1 isometric aspect)
+ *   §1 config   — IW=8, IH=2 (classic 2:1 isometric aspect), EWMA
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 4 pairs
- *   §4 formula  — IDENTICAL formula to 08_diamond; only IW/IH differ
- *   §5 player   — grid-axis movement (RIGHT=c+1, LEFT=c-1, UP=r-1, DOWN=r+1)
- *   §6 scene    — draw_grid(), draw_player()
+ *   §3 color    — 5 pairs (grid, active, cursor, HUD, HINT)
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move (grid-axis) / cursor_draw
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -105,7 +105,7 @@
  *
  * For isometric (IW=8), screen-axis RIGHT would require Δsc=2*IW=16 chars
  * per keypress — a very large visual jump, and RANGE=6 would place the
- * player 96 chars off-center (off-screen on any normal terminal).
+ * cursor 96 chars off-center (off-screen on any normal terminal).
  *
  * Instead, this file uses GRID-AXIS movement: each key changes exactly ONE
  * cell coordinate, just like navigating a normal (non-rotated) grid:
@@ -144,9 +144,9 @@
  * EDGE CASES TO WATCH
  * ───────────────────
  *  • Cell dimensions: 2*IW=16 cols wide × 2*IH=4 rows tall.  RANGE=4 limits
- *    the player to ±4 cells per axis.  Worst-case screen offset (diagonal
+ *    the cursor to ±4 cells per axis.  Worst-case screen offset (diagonal
  *    corner r=-4, c=4): sc = ox + (4-(-4))*IW = ox + 64 cols.  The '@' guard
- *    in draw_player skips drawing if the centre is off-screen — no crash.
+ *    in cursor_draw skips drawing if the centre is off-screen — no crash.
  *
  *  • The safe_mod() trick is critical: u and v can be negative near the origin
  *    and C's % operator returns negative results for negative dividends.
@@ -200,20 +200,24 @@
 #define MODULUS  (2 * IW * IH)   /* = 32 */
 
 /*
- * RANGE — how many cells the player can navigate from the origin per axis.
+ * RANGE — how many cells the cursor can navigate from the origin per axis.
  * With grid-axis movement the worst-case screen position is the diagonal
  * corner (r=-RANGE, c=RANGE) or (r=RANGE, c=-RANGE):
  *   sc = ox ± (RANGE + RANGE) * IW = ox ± 2*RANGE*IW
  * RANGE=4: worst-case sc = ox ± 64.  Safe on terminals wider than 128 cols
  * (ox ≈ cols/2, so 64 px room each side).  The '@' guard prevents crashes
- * if the player reaches an off-screen position on a narrower terminal.
+ * if the cursor reaches an off-screen position on a narrower terminal.
  */
-#define RANGE  4   /* player cell range: -RANGE .. +RANGE per axis */
+#define RANGE  4   /* cursor cell range: -RANGE .. +RANGE per axis */
+
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
 
 #define PAIR_GRID    1
 #define PAIR_ACTIVE  2
-#define PAIR_PLAYER  3
+#define PAIR_CURSOR  3
 #define PAIR_HUD     4
+#define PAIR_HINT    5
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -241,16 +245,46 @@ static void color_init(void)
     start_color(); use_default_colors();
     init_pair(PAIR_GRID,   COLORS >= 256 ?  48 : COLOR_GREEN,  -1);
     init_pair(PAIR_ACTIVE, COLORS >= 256 ?  82 : COLOR_GREEN,  -1);
-    init_pair(PAIR_PLAYER, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  15 : COLOR_WHITE,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * cell_to_screen — ISOMETRIC FORMULA (same structure as 08_diamond):
+ * GridCtx — geometry of the isometric grid plus origin and cursor range.
+ */
+typedef struct {
+    /* terminal extent */
+    int rows, cols;
+
+    /* half-cell size in screen characters */
+    int cw, ch;
+
+    /* origin (cell (0,0) projects here) */
+    int ox, oy;
+
+    /* cursor bounds — symmetric ±range around origin */
+    int range;
+    int max_r, max_c;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = IW;     g->ch = IH;
+    g->ox = cols / 2;
+    g->oy = (rows - 1) / 2;
+    g->range = RANGE;
+    g->max_r = RANGE;
+    g->max_c = RANGE;
+}
+
+/*
+ * ctx_to_screen — ISOMETRIC FORMULA (same structure as 08_diamond):
  *
  *   screen_col = ox + (c - r) * IW
  *   screen_row = oy + (c + r) * IH
@@ -258,16 +292,16 @@ static void color_init(void)
  * The formula is IDENTICAL to 08_diamond. Only IW=8, IH=2 instead of DW=4, DH=2.
  * Change IW/IH to get any slope between 0° (horizontal grid) and 90° (vertical grid).
  */
-static void cell_to_screen(int r, int c, int ox, int oy, int *sr, int *sc)
+static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
-    *sc = ox + (c - r) * IW;
-    *sr = oy + (c + r) * IH;
+    *sc = g->ox + (c - r) * g->cw;
+    *sr = g->oy + (c + r) * g->ch;
 }
 
 static int safe_mod(int a, int b) { return ((a % b) + b) % b; }
 
 /*
- * grid_char — inverse formula with IW=8, IH=2, MODULUS=32:
+ * ctx_grid_char — inverse formula with IW=8, IH=2, MODULUS=32:
  *
  *   c-line: (u*IH + v*IW) ≡ 0 (mod 32) → (u + 4v) ≡ 0 (mod 16)  → '/'
  *   r-line: (v*IW - u*IH) ≡ 0 (mod 32) → (4v - u) ≡ 0 (mod 16)  → '\'
@@ -275,12 +309,12 @@ static int safe_mod(int a, int b) { return ((a % b) + b) % b; }
  * The conditions hit DIFFERENT positions on odd rows (c-line u=12, r-line u=4),
  * so isolated '/' and '\' characters appear between '+' corners. ✓
  */
-static char grid_char(int sr, int sc, int ox, int oy)
+static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
-    int u = sc - ox;
-    int v = sr - oy;
-    bool c_line = (safe_mod(u * IH + v * IW, MODULUS) == 0);
-    bool r_line = (safe_mod(v * IW - u * IH, MODULUS) == 0);
+    int u = sc - g->ox;
+    int v = sr - g->oy;
+    bool c_line = (safe_mod(u * g->ch + v * g->cw, MODULUS) == 0);
+    bool r_line = (safe_mod(v * g->cw - u * g->ch, MODULUS) == 0);
     if (c_line && r_line) return '+';
     if (c_line)           return '/';
     if (r_line)           return '\\';
@@ -288,7 +322,7 @@ static char grid_char(int sr, int sc, int ox, int oy)
 }
 
 /*
- * in_player_cell — test whether screen position (sr,sc) lies inside cell (pr,pc).
+ * in_cursor_cell — test whether screen position (sr,sc) lies inside cell (pr,pc).
  *
  * The forward formula sc=ox+(c-r)*IW, sr=oy+(c+r)*IH can be inverted:
  *   cn = u*IH + v*IW  where  cn = c * MODULUS  (u=sc-ox, v=sr-oy)
@@ -301,39 +335,99 @@ static char grid_char(int sr, int sc, int ox, int oy)
  * The strict left bound (>) excludes the grid line shared with the previous
  * cell; the inclusive right bound (<=) claims the grid line on the far edge.
  */
-static bool in_player_cell(int sr, int sc, int ox, int oy, int pr, int pc)
+static bool in_cursor_cell(const GridCtx *g, int sr, int sc, int pr, int pc)
 {
-    int u = sc - ox, v = sr - oy;
-    int cn = u * IH + v * IW;          /* = MODULUS * c  (scaled c-coordinate) */
-    int rn = v * IW - u * IH;          /* = MODULUS * r  (scaled r-coordinate) */
+    int u = sc - g->ox, v = sr - g->oy;
+    int cn = u * g->ch + v * g->cw;          /* = MODULUS * c  (scaled c-coordinate) */
+    int rn = v * g->cw - u * g->ch;          /* = MODULUS * r  (scaled r-coordinate) */
     return (cn > pc * MODULUS && cn <= (pc + 1) * MODULUS &&
             rn > pr * MODULUS && rn <= (pr + 1) * MODULUS);
 }
 
+/*
+ * ctx_draw_bg — raster-scan every screen cell and draw the isometric grid.
+ * ctx_grid_char() returns '+', '/', '\', or ' ' for each position.
+ * Skipping ' ' avoids erasing the background on every cell.
+ */
+static void ctx_draw_bg(const GridCtx *g)
+{
+    attron(COLOR_PAIR(PAIR_GRID));
+    for (int sr = 0; sr < g->rows - 1; sr++)
+        for (int sc = 0; sc < g->cols; sc++) {
+            char ch = ctx_grid_char(g, sr, sc);
+            if (ch != ' ')
+                mvaddch(sr, sc, (chtype)(unsigned char)ch);
+        }
+    attroff(COLOR_PAIR(PAIR_GRID));
+}
+
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  player                                                              */
+/* §5  cursor                                                              */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-typedef struct { int r, c; } Player;
+typedef struct { int r, c; } Cursor;
 
-static Player player_reset(void) { return (Player){0, 0}; }
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    (void)g;
+    cur->r = 0; cur->c = 0;
+}
 
 /*
- * player_move — GRID-AXIS movement (one coordinate changes per keypress):
+ * cursor_move — GRID-AXIS movement (one coordinate changes per keypress):
  *   RIGHT/LEFT → dc = ±1  (c changes; screen moves right-down / left-up)
  *   UP/DOWN    → dr = ∓1  (r changes; screen moves right-up  / left-down)
  *
  * Movement is ATOMIC: both r and c must stay within [-RANGE, RANGE],
- * otherwise neither changes.  This prevents partial moves at boundaries
- * where one coordinate is clamped independently (which would produce
- * unintended diagonal motion on screen).
+ * otherwise neither changes.
  */
-static void player_move(Player *p, int dr, int dc)
+static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
-    int nr = p->r + dr, nc = p->c + dc;
-    if (nr >= -RANGE && nr <= RANGE && nc >= -RANGE && nc <= RANGE) {
-        p->r = nr;
-        p->c = nc;
+    int nr = cur->r + dr, nc = cur->c + dc;
+    if (nr >= -g->range && nr <= g->range && nc >= -g->range && nc <= g->range) {
+        cur->r = nr;
+        cur->c = nc;
+    }
+}
+
+/*
+ * cursor_draw — highlight the active cell interior and draw '@' at its centre.
+ *
+ * Two-pass approach:
+ *   1. Fill interior: search a bounding box around the cell's top corner,
+ *      test each position with in_cursor_cell(), draw '.' on empty space.
+ *   2. Draw '@': placed at the cell centre (sc=ox+(c-r)*IW, sr=oy+(c+r+1)*IH).
+ *      Guarded on the CENTRE position (not the top corner) so '@' stays visible
+ *      even when the cell's top corner scrolls above the screen edge.
+ */
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int csr, csc; ctx_to_screen(g, cur->r, cur->c, &csr, &csc);
+    int span_r = g->ch * 2 + 1;   /* rows to search: covers 2*IH=4 row cell height */
+    int span_c = g->cw * 2;       /* cols to search: covers 2*IW=16 col cell width */
+
+    attron(COLOR_PAIR(PAIR_ACTIVE));
+    for (int dr = -span_r; dr <= span_r; dr++) {
+        for (int dc = -span_c; dc <= span_c; dc++) {
+            int sr = csr + dr, sc = csc + dc;
+            if (sr < 0 || sr >= g->rows - 1 || sc < 0 || sc >= g->cols) continue;
+            if (!in_cursor_cell(g, sr, sc, cur->r, cur->c)) continue;
+            if (ctx_grid_char(g, sr, sc) == ' ')
+                mvaddch(sr, sc, (chtype)'.');
+        }
+    }
+    attroff(COLOR_PAIR(PAIR_ACTIVE));
+
+    /* Centre of cell (r,c): sc = ox+(c-r)*IW,  sr = oy+(c+r+1)*IH.
+     * Guard on the CENTRE (not the top corner) so @ stays visible even
+     * when the cell's top corner is above the screen edge. */
+    int centre_sc = g->ox + (cur->c - cur->r) * g->cw;
+    int centre_sr = g->oy + (cur->c + cur->r + 1) * g->ch;
+    if (centre_sr >= 0 && centre_sr < g->rows - 1 &&
+        centre_sc >= 0 && centre_sc < g->cols) {
+        attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+        mvaddch(centre_sr, centre_sc, (chtype)'@');
+        attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     }
 }
 
@@ -341,85 +435,27 @@ static void player_move(Player *p, int dr, int dc)
 /* §6  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-/*
- * draw_grid — raster-scan every screen cell and draw the isometric grid.
- * grid_char() returns '+', '/', '\', or ' ' for each position.
- * Skipping ' ' avoids erasing the background on every cell.
- */
-static void draw_grid(int rows, int cols, int ox, int oy)
+static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
-    attron(COLOR_PAIR(PAIR_GRID));
-    for (int sr = 0; sr < rows - 1; sr++)
-        for (int sc = 0; sc < cols; sc++) {
-            char ch = grid_char(sr, sc, ox, oy);
-            if (ch != ' ')
-                mvaddch(sr, sc, (chtype)(unsigned char)ch);
-        }
-    attroff(COLOR_PAIR(PAIR_GRID));
-}
-
-/*
- * draw_player — highlight the active cell interior and draw '@' at its centre.
- *
- * Two-pass approach:
- *   1. Fill interior: search a bounding box around the cell's top corner,
- *      test each position with in_player_cell(), draw '.' on empty space.
- *      span_r = 2*IH+1  covers the full 4-row cell height plus one guard row.
- *      span_c = 2*IW    covers the full 16-col cell width.
- *
- *   2. Draw '@': placed at the cell centre (sc=ox+(c-r)*IW, sr=oy+(c+r+1)*IH).
- *      Guarded on the CENTRE position (not the top corner) so '@' stays visible
- *      even when the cell's top corner scrolls above the screen edge.
- */
-static void draw_player(const Player *p, int ox, int oy, int rows, int cols)
-{
-    int csr, csc; cell_to_screen(p->r, p->c, ox, oy, &csr, &csc);
-    int span_r = IH * 2 + 1;   /* rows to search: covers 2*IH=4 row cell height */
-    int span_c = IW * 2;        /* cols to search: covers 2*IW=16 col cell width  */
-
-    attron(COLOR_PAIR(PAIR_ACTIVE));
-    for (int dr = -span_r; dr <= span_r; dr++) {
-        for (int dc = -span_c; dc <= span_c; dc++) {
-            int sr = csr + dr, sc = csc + dc;
-            if (sr < 0 || sr >= rows - 1 || sc < 0 || sc >= cols) continue;
-            if (!in_player_cell(sr, sc, ox, oy, p->r, p->c)) continue;
-            if (grid_char(sr, sc, ox, oy) == ' ')
-                mvaddch(sr, sc, (chtype)'.');
-        }
-    }
-    attroff(COLOR_PAIR(PAIR_ACTIVE));
-
-    /* Centre of cell (r,c): sc = ox+(c-r)*IW,  sr = oy+(c+r+1)*IH.
-     * Guard on the CENTRE (not the top corner csr/csc) so @ stays visible
-     * even when the cell's top corner is above the screen edge. */
-    int centre_sc = ox + (p->c - p->r) * IW;
-    int centre_sr = oy + (p->c + p->r + 1) * IH;
-    if (centre_sr >= 0 && centre_sr < rows - 1 &&
-        centre_sc >= 0 && centre_sc < cols) {
-        attron(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
-        mvaddch(centre_sr, centre_sc, (chtype)'@');
-        attroff(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
-    }
-}
-
-static void scene_draw(int rows, int cols, const Player *p, double fps)
-{
-    int ox = cols / 2, oy = (rows - 1) / 2;
-    erase();
-    draw_grid(rows, cols, ox, oy);
-    draw_player(p, ox, oy, rows, cols);
-
     char buf[80];
-    snprintf(buf, sizeof buf, " %.1f fps  cell(%d,%d)  IW=%d IH=%d ", fps, p->r, p->c, IW, IH);
+    snprintf(buf, sizeof buf, " %.1f fps  cell(%d,%d)  IW=%d IH=%d ",
+             fps, cur->r, cur->c, g->cw, g->ch);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_DIM);
-    mvprintw(rows - 1, 0,
-        " right/left:c±1  up/down:r∓1 (grid-axis)  r:reset  q:quit  [09 iso] ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_DIM);
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+        " right/left:c+-1  up/down:r-+1 (grid-axis)  r:reset  q/ESC:quit  [09 iso] ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();
 }
 
@@ -452,28 +488,31 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
     screen_init();
-    int rows = LINES, cols = COLS;
-    Player player = player_reset();
+    GridCtx g;     ctx_init(&g, LINES, COLS);
+    Cursor  cur;   cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double fps = TARGET_FPS; int64_t t0 = clock_ns();
+    double fps = TARGET_FPS;
+    int64_t t0 = clock_ns();
 
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
+            ctx_init(&g, LINES, COLS);
         }
         int ch = getch();
         switch (ch) {
-            case 'q': case 27: g_running = 0;           break;
-            case 'r':          player = player_reset();  break;
-            case KEY_RIGHT: player_move(&player,  0, +1); break;
-            case KEY_LEFT:  player_move(&player,  0, -1); break;
-            case KEY_UP:    player_move(&player, -1,  0); break;
-            case KEY_DOWN:  player_move(&player, +1,  0); break;
+            case 'q': case 27: g_running = 0;              break;
+            case 'r':          cursor_reset(&cur, &g);     break;
+            case KEY_RIGHT: cursor_move(&cur, &g,  0, +1); break;
+            case KEY_LEFT:  cursor_move(&cur, &g,  0, -1); break;
+            case KEY_UP:    cursor_move(&cur, &g, -1,  0); break;
+            case KEY_DOWN:  cursor_move(&cur, &g, +1,  0); break;
         }
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (now - t0 + 1)) * 0.05; t0 = now;
-        scene_draw(rows, cols, &player, fps);
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0 = now;
+        scene_draw(&g, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

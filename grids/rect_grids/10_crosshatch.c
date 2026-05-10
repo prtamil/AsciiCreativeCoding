@@ -4,19 +4,19 @@
  *
  * DEMO: Two independent sets of diagonal lines: '/' lines and '\' lines
  *       each with their own spacing. Together they create a cross-hatch
- *       (tartan/mesh) pattern. The player moves on an underlying
+ *       (tartan/mesh) pattern. The cursor moves on an underlying
  *       rectangular grid whose cells are the diamonds formed by the
  *       intersection of the two diagonal families.
  *
  * Study alongside: 08_diamond.c (single diagonal system), 01_uniform_rect.c
  *
  * Section map:
- *   §1 config   — STEP (spacing), CELL_W/CELL_H (movement grid)
+ *   §1 config   — STEP_A, STEP_B (line spacings), CELL_W/CELL_H, EWMA
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: two line families, active, player, HUD
- *   §4 formula  — TWO independent line formulas composed
- *   §5 player   — struct, move, reset (standard rect movement)
- *   §6 scene    — draw_crosshatch(), draw_player()
+ *   §3 color    — 6 pairs (slash, back, cross, cursor, HUD, HINT)
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -45,8 +45,8 @@
  *
  * Intersection:  Both conditions true → draw 'X' (or '+')
  *
- * Player grid:   The cross-hatch creates diamond-shaped cells of size
- *                STEP_A × STEP_B. The player moves in a rectangular grid
+ * Cursor grid:   The cross-hatch creates diamond-shaped cells of size
+ *                STEP_A × STEP_B. The cursor moves in a rectangular grid
  *                aligned to the underlying coordinate system. Cell (r,c)
  *                maps to the diamond centred at screen (r*CELL_H, c*CELL_W).
  *
@@ -168,15 +168,19 @@
 #define STEP_A   6    /* '/' family spacing  */
 #define STEP_B   4    /* '\' family spacing  */
 
-/* Player moves on a rect grid that approximates the diamond cell size */
+/* Cursor moves on a rect grid that approximates the diamond cell size */
 #define CELL_W   (STEP_A)
 #define CELL_H   (STEP_B)
+
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
 
 #define PAIR_SLASH   1   /* '/' lines  */
 #define PAIR_BACK    2   /* '\' lines  */
 #define PAIR_CROSS   3   /* 'X' at intersections */
-#define PAIR_PLAYER  4
+#define PAIR_CURSOR  4
 #define PAIR_HUD     5
+#define PAIR_HINT    6
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -204,77 +208,70 @@ static void color_init(void)
     start_color(); use_default_colors();
     init_pair(PAIR_SLASH,  COLORS >= 256 ?  32 : COLOR_CYAN,   -1);
     init_pair(PAIR_BACK,   COLORS >= 256 ? 129 : COLOR_MAGENTA,-1);
-    init_pair(PAIR_CROSS,  COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_PLAYER, COLORS >= 256 ? 196 : COLOR_RED,    -1);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  15 : COLOR_WHITE,  -1);
+    init_pair(PAIR_CROSS,  COLORS >= 256 ?  46 : COLOR_GREEN,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ? 196 : COLOR_RED,    -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * CROSSHATCH FORMULAS — two independent line families.
+ * GridCtx — terminal extent + cell size + cursor bounds.
+ * The cell space is the rectangular grid the cursor moves on.
+ */
+typedef struct {
+    int rows, cols;
+    int cw, ch;          /* underlying rect cell size */
+    int max_r, max_c;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->max_r = (rows - 1) / CELL_H - 1;
+    g->max_c = cols / CELL_W - 1;
+}
+
+/*
+ * ctx_to_screen — same as 01_uniform_rect: the cursor's underlying rect.
+ */
+static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
+{
+    *sr = r * g->ch;
+    *sc = c * g->cw;
+}
+
+/*
+ * crosshatch_test — TWO INDEPENDENT LINE FAMILIES.
  *
  * Family A — '/' lines (sum-constant):
  *   on_slash = ((sc + sr) % STEP_A == 0)
  *
- *   Proof: A '/' line satisfies dsc/drow = -1 (going right, row decreases).
- *   So sc + sr = const along any single '/' line.
- *   Different '/' lines differ by STEP_A in this sum.
- *
  * Family B — '\' lines (difference-constant):
- *   on_back = ((sc - sr + BIG) % STEP_B == 0)    BIG = large multiple of STEP_B
- *
- *   A '\' line satisfies dsc/drow = +1 (going right, row increases).
- *   So sc - sr = const along any single '\' line.
- *   (+BIG ensures non-negative modulo for negative sc-sr values)
+ *   on_back = ((sc - sr + BIG) % STEP_B == 0)    (+BIG keeps modulo non-negative)
  *
  * Together: the two families create a mesh of diamond cells.
  * The cells are where NEITHER condition holds.
  */
-static void crosshatch_char(int sr, int sc, bool *slash, bool *back)
+static void crosshatch_test(int sr, int sc, bool *slash, bool *back)
 {
     *slash = ((sc + sr) % STEP_A == 0);
     *back  = (((sc - sr) % STEP_B + STEP_B) % STEP_B == 0);
 }
 
-/* Player rect cell: same formula as 01_uniform_rect */
-static void cell_to_screen(int r, int c, int *sr, int *sc)
+/*
+ * ctx_draw_bg — draw both diagonal families with per-family colour.
+ * '/' uses PAIR_SLASH, '\' uses PAIR_BACK, intersections use PAIR_CROSS.
+ */
+static void ctx_draw_bg(const GridCtx *g)
 {
-    *sr = r * CELL_H;
-    *sc = c * CELL_W;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  player                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct { int r, c, max_r, max_c; } Player;
-
-static void player_reset(Player *p, int rows, int cols)
-{
-    p->max_r = (rows - 1) / CELL_H - 1;
-    p->max_c = cols / CELL_W - 1;
-    p->r = p->max_r / 2;
-    p->c = p->max_c / 2;
-}
-static void player_move(Player *p, int dr, int dc)
-{
-    int nr = p->r + dr, nc = p->c + dc;
-    if (nr >= 0 && nr <= p->max_r) p->r = nr;
-    if (nc >= 0 && nc <= p->max_c) p->c = nc;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void draw_crosshatch(int rows, int cols)
-{
-    for (int sr = 0; sr < rows - 1; sr++) {
-        for (int sc = 0; sc < cols; sc++) {
-            bool s, b; crosshatch_char(sr, sc, &s, &b);
+    for (int sr = 0; sr < g->rows - 1; sr++) {
+        for (int sc = 0; sc < g->cols; sc++) {
+            bool s, b; crosshatch_test(sr, sc, &s, &b);
             if (s && b) {
                 attron(COLOR_PAIR(PAIR_CROSS) | A_BOLD);
                 mvaddch(sr, sc, (chtype)'X');
@@ -292,37 +289,62 @@ static void draw_crosshatch(int rows, int cols)
     }
 }
 
-static void draw_player(const Player *p)
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct { int r, c; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
 {
-    int sr, sc; cell_to_screen(p->r, p->c, &sr, &sc);
-    /* Mark player cell with '@' at its centre */
-    int cr = sr + CELL_H / 2, cc = sc + CELL_W / 2;
+    cur->r = g->max_r / 2;
+    cur->c = g->max_c / 2;
+}
+
+static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
+{
+    int nr = cur->r + dr, nc = cur->c + dc;
+    if (nr >= 0 && nr <= g->max_r) cur->r = nr;
+    if (nc >= 0 && nc <= g->max_c) cur->c = nc;
+}
+
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc; ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    int cr = sr + g->ch / 2, cc = sc + g->cw / 2;
     if (cr >= 0 && cc >= 0) {
-        attron(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
+        attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(cr, cc, (chtype)'@');
-        attroff(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
+        attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     }
 }
 
-static void scene_draw(int rows, int cols, const Player *p, double fps)
-{
-    erase();
-    draw_crosshatch(rows, cols);
-    draw_player(p);
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
+static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
     char buf[80];
     snprintf(buf, sizeof buf,
         " %.1f fps  cell(%d,%d)  /step=%d \\step=%d ",
-        fps, p->r, p->c, STEP_A, STEP_B);
+        fps, cur->r, cur->c, STEP_A, STEP_B);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_DIM);
-    mvprintw(rows - 1, 0,
-        " arrows:move  r:reset  q:quit  [10 crosshatch  /=(sc+sr)%%A  \\=(sc-sr)%%B] ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_DIM);
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+        " arrows:move  r:reset  q/ESC:quit  [10 crosshatch  /=(sc+sr)%%A  \\=(sc-sr)%%B] ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();
 }
 
@@ -355,29 +377,32 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
     screen_init();
-    int rows = LINES, cols = COLS;
-    Player player; player_reset(&player, rows, cols);
+    GridCtx g;     ctx_init(&g, LINES, COLS);
+    Cursor  cur;   cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double fps = TARGET_FPS; int64_t t0 = clock_ns();
+    double fps = TARGET_FPS;
+    int64_t t0 = clock_ns();
 
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
-            player_reset(&player, rows, cols);
+            ctx_init(&g, LINES, COLS);
+            cursor_reset(&cur, &g);
         }
         int ch = getch();
         switch (ch) {
-            case 'q': case 27: g_running = 0;                    break;
-            case 'r':          player_reset(&player, rows, cols); break;
-            case KEY_UP:    player_move(&player, -1,  0); break;
-            case KEY_DOWN:  player_move(&player, +1,  0); break;
-            case KEY_LEFT:  player_move(&player,  0, -1); break;
-            case KEY_RIGHT: player_move(&player,  0, +1); break;
+            case 'q': case 27: g_running = 0;              break;
+            case 'r':          cursor_reset(&cur, &g);     break;
+            case KEY_UP:    cursor_move(&cur, &g, -1,  0); break;
+            case KEY_DOWN:  cursor_move(&cur, &g, +1,  0); break;
+            case KEY_LEFT:  cursor_move(&cur, &g,  0, -1); break;
+            case KEY_RIGHT: cursor_move(&cur, &g,  0, +1); break;
         }
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (now - t0 + 1)) * 0.05; t0 = now;
-        scene_draw(rows, cols, &player, fps);
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0 = now;
+        scene_draw(&g, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

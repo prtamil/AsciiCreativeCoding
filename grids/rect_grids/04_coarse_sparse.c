@@ -10,12 +10,12 @@
  * Study alongside: 03_fine_dense.c (small cells), 01_uniform_rect.c (base)
  *
  * Section map:
- *   §1 config   — CELL_W=20, CELL_H=6
+ *   §1 config   — CELL_W=20, CELL_H=6, EWMA constant
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 4 pairs
- *   §4 formula  — same formula as 01; label placement formula added
- *   §5 player   — struct, move, reset
- *   §6 scene    — draw_grid(), draw_labels(), draw_player()
+ *   §3 color    — grid / active / cursor / HUD / HINT / LABEL pairs
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
+ *   §6 scene    — labels_draw + hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -35,7 +35,7 @@
  * Label position : The label "(r,c)" is placed at:
  *                    label_row = sr + 1             (first interior row)
  *                    label_col = sc + 1             (first interior col)
- *                  where (sr, sc) = cell_to_screen(r, c).
+ *                  where (sr, sc) = ctx_to_screen(g, r, c).
  *                  With CELL_H=6 there are 5 interior rows — plenty of space.
  *
  * Why large cells : A real-world use case is a map grid (room layout,
@@ -82,7 +82,7 @@
  *    raster scan; on_h = sr%CELL_H==0; on_v = sc%CELL_W==0.
  *
  *  Phase 2 — fill cell content:
- *    For each cell (r, c), compute top-left corner (sr, sc) via cell_to_screen.
+ *    For each cell (r, c), compute top-left corner (sr, sc) via ctx_to_screen.
  *    Place label at (sr + 1, sc + 2) — first interior row, slight left indent.
  *    Place '@' at centre: (sr + CELL_H/2, sc + CELL_W/2).
  *
@@ -114,7 +114,7 @@
  *    into the right border or neighbouring cell.  Use snprintf with a buffer
  *    sized generously (at least 24 bytes for "(row,col)" with 2-digit coords).
  *
- *  • Player cell: skip the label draw for the player's cell — the player
+ *  • Cursor cell: skip the label draw for the cursor's cell — the cursor
  *    draws its own content.  Otherwise you get label text drawn under '@'.
  *
  *  • Iterating cells vs. raster scan: for coarse grids it is more efficient
@@ -132,7 +132,7 @@
  *  appear twice or overlap: check draw order (grid lines must come after
  *  interior fill, or you must deliberately not draw over interior).
  *  If label is missing from last column: increase buffer size or check
- *  the max_c computation in player_reset.
+ *  the max_c computation in ctx_init.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -161,11 +161,16 @@
 #define CELL_W  20
 #define CELL_H   6
 
-#define PAIR_GRID    1
-#define PAIR_ACTIVE  2
-#define PAIR_PLAYER  3
-#define PAIR_HUD     4
-#define PAIR_LABEL   5   /* coordinate labels inside cells */
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
+
+/* Color pair IDs */
+#define PAIR_GRID    1   /* grid lines                   */
+#define PAIR_ACTIVE  2   /* highlighted cell fill        */
+#define PAIR_CURSOR  3   /* bright '@'                   */
+#define PAIR_HUD     4   /* status bar (yellow)          */
+#define PAIR_LABEL   5   /* coordinate labels in cells   */
+#define PAIR_HINT    6   /* key-hint footer (cyan)       */
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -193,20 +198,44 @@ static void color_init(void)
     start_color(); use_default_colors();
     init_pair(PAIR_GRID,   COLORS >= 256 ?  75 : COLOR_CYAN,   -1);
     init_pair(PAIR_ACTIVE, COLORS >= 256 ?  82 : COLOR_GREEN,  -1);
-    init_pair(PAIR_PLAYER, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  15 : COLOR_WHITE,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
     init_pair(PAIR_LABEL,  COLORS >= 256 ? 246 : COLOR_WHITE,  -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * cell_to_screen — THE FORMULA (unchanged from 01_uniform_rect):
+ * GridCtx — geometry of the active grid plus cursor bounds.
+ * Same shape as 01_uniform_rect; only cw/ch differ (large coarse cells).
+ */
+typedef struct {
+    /* terminal extent */
+    int rows, cols;
+
+    /* cell size in screen characters */
+    int cw, ch;
+
+    /* cursor bounds — last whole cell that fits in (rows-1) × cols */
+    int max_r, max_c;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->max_r = (rows - 1) / CELL_H - 1;
+    g->max_c = cols / CELL_W - 1;
+}
+
+/*
+ * ctx_to_screen — THE FORMULA (unchanged from 01_uniform_rect):
  *
- *   screen_row = r * CELL_H    (= r * 6)
- *   screen_col = c * CELL_W    (= c * 20)
+ *   screen_row = r * ch    (= r * 6)
+ *   screen_col = c * cw    (= c * 20)
  *
  * LABEL PLACEMENT FORMULA:
  *   A text label "(r,c)" is placed at the first interior position:
@@ -214,78 +243,99 @@ static void color_init(void)
  *     label_col = sc + 2           ← two cols right of left border
  *
  *   Centre the '@' using:
- *     centre_row = sr + CELL_H / 2   (= sr + 3)
- *     centre_col = sc + CELL_W / 2   (= sc + 10)
+ *     centre_row = sr + ch / 2     (= sr + 3)
+ *     centre_col = sc + cw / 2     (= sc + 10)
  */
-static void cell_to_screen(int r, int c, int *sr, int *sc)
+static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
-    *sr = r * CELL_H;
-    *sc = c * CELL_W;
+    *sr = r * g->ch;
+    *sc = c * g->cw;
 }
 
-static char grid_char(int sr, int sc)
+static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
-    bool h = (sr % CELL_H == 0);
-    bool v = (sc % CELL_W == 0);
+    bool h = (sr % g->ch == 0);
+    bool v = (sc % g->cw == 0);
     if (h && v) return '+';
     if (h)      return '-';
     if (v)      return '|';
     return ' ';
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  player                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct { int r, c, max_r, max_c; } Player;
-
-static void player_reset(Player *p, int rows, int cols)
-{
-    p->max_r = (rows - 1) / CELL_H - 1;
-    p->max_c = cols / CELL_W - 1;
-    p->r = p->max_r / 2;
-    p->c = p->max_c / 2;
-}
-static void player_move(Player *p, int dr, int dc)
-{
-    int nr = p->r + dr, nc = p->c + dc;
-    if (nr >= 0 && nr <= p->max_r) p->r = nr;
-    if (nc >= 0 && nc <= p->max_c) p->c = nc;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void draw_grid(int rows, int cols)
+static void ctx_draw_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
-    for (int sr = 0; sr < rows - 1; sr++)
-        for (int sc = 0; sc < cols; sc++) {
-            char ch = grid_char(sr, sc);
+    for (int sr = 0; sr < g->rows - 1; sr++)
+        for (int sc = 0; sc < g->cols; sc++) {
+            char ch = ctx_grid_char(g, sr, sc);
             if (ch != ' ')
                 mvaddch(sr, sc, (chtype)(unsigned char)ch);
         }
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct { int r, c; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    cur->r = g->max_r / 2;
+    cur->c = g->max_c / 2;
+}
+
+static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
+{
+    int nr = cur->r + dr, nc = cur->c + dc;
+    if (nr >= 0 && nr <= g->max_r) cur->r = nr;
+    if (nc >= 0 && nc <= g->max_c) cur->c = nc;
+}
+
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc;
+    ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+
+    attron(COLOR_PAIR(PAIR_ACTIVE));
+    for (int dr = 1; dr < g->ch; dr++)
+        for (int dc = 1; dc < g->cw; dc++)
+            mvaddch(sr + dr, sc + dc, (chtype)' ');
+    attroff(COLOR_PAIR(PAIR_ACTIVE));
+
+    /* Label in active cell */
+    char lbl[24]; snprintf(lbl, sizeof lbl, "(%d,%d)", cur->r, cur->c);
+    attron(COLOR_PAIR(PAIR_ACTIVE));
+    mvprintw(sr + 1, sc + 2, "%s", lbl);
+    attroff(COLOR_PAIR(PAIR_ACTIVE));
+
+    attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    mvaddch(sr + g->ch / 2, sc + g->cw / 2, (chtype)'@');
+    attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
 /*
- * draw_labels — place "(row,col)" text in the top-left of every visible cell.
+ * labels_draw — place "(row,col)" text in the top-left of every visible cell.
  *
  * Label position formula:
  *   label_row = cell_screen_row + 1   (first interior row)
  *   label_col = cell_screen_col + 2   (first interior col, slight indent)
  */
-static void draw_labels(int rows, int cols, const Player *player)
+static void labels_draw(const GridCtx *g, const Cursor *cur)
 {
-    int gr = (rows - 1) / CELL_H;
-    int gc = cols / CELL_W;
+    int gr = (g->rows - 1) / g->ch;
+    int gc = g->cols / g->cw;
 
     for (int r = 0; r < gr; r++) {
         for (int c = 0; c < gc; c++) {
-            if (r == player->r && c == player->c) continue;  /* player draws own cell */
+            if (r == cur->r && c == cur->c) continue;  /* cursor draws own cell */
             int sr, sc;
-            cell_to_screen(r, c, &sr, &sc);
+            ctx_to_screen(g, r, c, &sr, &sc);
             char lbl[24];
             snprintf(lbl, sizeof lbl, "(%d,%d)", r, c);
             attron(COLOR_PAIR(PAIR_LABEL));
@@ -295,48 +345,30 @@ static void draw_labels(int rows, int cols, const Player *player)
     }
 }
 
-static void draw_player(const Player *p)
+static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
-    int sr, sc;
-    cell_to_screen(p->r, p->c, &sr, &sc);
-
-    attron(COLOR_PAIR(PAIR_ACTIVE));
-    for (int dr = 1; dr < CELL_H; dr++)
-        for (int dc = 1; dc < CELL_W; dc++)
-            mvaddch(sr + dr, sc + dc, (chtype)' ');
-    attroff(COLOR_PAIR(PAIR_ACTIVE));
-
-    /* Label in active cell */
-    char lbl[24]; snprintf(lbl, sizeof lbl, "(%d,%d)", p->r, p->c);
-    attron(COLOR_PAIR(PAIR_ACTIVE));
-    mvprintw(sr + 1, sc + 2, "%s", lbl);
-    attroff(COLOR_PAIR(PAIR_ACTIVE));
-
-    attron(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
-    mvaddch(sr + CELL_H / 2, sc + CELL_W / 2, (chtype)'@');
-    attroff(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
-}
-
-static void scene_draw(int rows, int cols, const Player *p, double fps)
-{
-    erase();
-    draw_grid(rows, cols);
-    draw_labels(rows, cols, p);
-    draw_player(p);
-
     char buf[64];
-    snprintf(buf, sizeof buf, " %.1f fps  at(%d,%d) ", fps, p->r, p->c);
+    snprintf(buf, sizeof buf, " %.1f fps  at(%d,%d) ", fps, cur->r, cur->c);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_DIM);
-    mvprintw(rows - 1, 0,
-        " arrows:move  r:reset  q:quit  [04 coarse sparse  %dx%d cell] ",
-        CELL_W, CELL_H);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_DIM);
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+        " arrows:move  r:reset  q/ESC:quit  [04 coarse sparse  %dx%d cell] ",
+        g->cw, g->ch);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
-    wnoutrefresh(stdscr); doupdate();
+static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    labels_draw(g, cur);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, fps);
+    wnoutrefresh(stdscr);
+    doupdate();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -367,30 +399,37 @@ int main(void)
 {
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
+
     screen_init();
-    int rows = LINES, cols = COLS;
-    Player player; player_reset(&player, rows, cols);
+    GridCtx g;     ctx_init(&g, LINES, COLS);
+    Cursor  cur;   cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double fps = TARGET_FPS; int64_t t0 = clock_ns();
+    double fps = TARGET_FPS;
+    int64_t t0 = clock_ns();
 
     while (g_running) {
         if (g_need_resize) {
-            g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
-            player_reset(&player, rows, cols);
+            g_need_resize = 0;
+            endwin(); refresh();
+            ctx_init(&g, LINES, COLS);
+            cursor_reset(&cur, &g);
         }
         int ch = getch();
         switch (ch) {
-            case 'q': case 27: g_running = 0;                    break;
-            case 'r':          player_reset(&player, rows, cols); break;
-            case KEY_UP:    player_move(&player, -1,  0); break;
-            case KEY_DOWN:  player_move(&player, +1,  0); break;
-            case KEY_LEFT:  player_move(&player,  0, -1); break;
-            case KEY_RIGHT: player_move(&player,  0, +1); break;
+            case 'q': case 27:  g_running = 0;                  break;
+            case 'r':           cursor_reset(&cur, &g);          break;
+            case KEY_UP:        cursor_move(&cur, &g, -1,  0);   break;
+            case KEY_DOWN:      cursor_move(&cur, &g, +1,  0);   break;
+            case KEY_LEFT:      cursor_move(&cur, &g,  0, -1);   break;
+            case KEY_RIGHT:     cursor_move(&cur, &g,  0, +1);   break;
         }
+
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (now - t0 + 1)) * 0.05; t0 = now;
-        scene_draw(rows, cols, &player, fps);
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0  = now;
+
+        scene_draw(&g, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

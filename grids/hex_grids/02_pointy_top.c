@@ -6,23 +6,24 @@
  *       '@' cursor moves between hexes with arrow keys.
  *
  * Study alongside: grids/hex_grids/01_flat_top.c
- *                  (identical §5b cursor section; only transform matrix differs)
+ *                  (identical Cursor + HEX_DIR; only matrix entries differ)
  *
  * Section map:
- *   §1 config   — tunable constants
+ *   §1 config   — tunable constants, EWMA alpha
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — ncurses color pairs
- *   §4 formula  — pixel↔cell, centering offset, pointy-top matrix
- *   §5 draw     — pointy-top hex rasterizer
- *   §5b cursor  — movement vectors, cursor_draw
- *   §6 scene    — state struct + scene_draw
+ *   §3 color    — ncurses color pairs (BORDER, CURSOR, HUD, HINT)
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_axial /
+ *                 ctx_draw_bg + cube_round + angle_char (pointy-top matrix)
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw, HEX_DIR
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses display layer
  *   §8 app      — signals, resize, main loop
  *
  * Keys:  q/ESC quit  p pause  t theme  r reset  arrows move  +/-:size  [/]:border
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra 02_pointy_top.c -o 02_pointy_top -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids/02_pointy_top.c \
+ *       -o 02_pointy_top -lncurses -lm
  */
 
 /* ── CONCEPTS ──────────────────────────────────────────────────────────── *
@@ -33,9 +34,10 @@
  *                    fr = (2/3·py) / s
  *                  Cube→pixel: cx = s(√3Q + √3/2·R), cy = s·3/2·R.
  *
- * Data-structure : Same as 01_flat_top — no grid array, axial (cQ, cR)
- *                  cursor only. The only orientation-dependent state is
- *                  the inverse matrix in §4; cube space is unchanged.
+ * Data-structure : Same GridCtx + Cursor as 01_flat_top — no grid array,
+ *                  axial (cur->q, cur->r) cursor only. The only
+ *                  orientation-dependent state is the inverse matrix in §4;
+ *                  cube space is unchanged.
  *
  * Cursor movement : Same HEX_DIR[4][2] deltas as 01_flat_top — the axial
  *                  system is orientation-independent. RIGHT still adds Q+1,
@@ -153,7 +155,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── §1 config ────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §1  config                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
 #define CELL_W             2
 #define CELL_H             4
@@ -171,25 +175,35 @@
 #define N_THEMES           4
 #define TICK_NS           16666667LL
 
-/* ── §2 clock ─────────────────────────────────────────────────────────── */
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA     0.05
 
-static int64_t clock_ns(void) {
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §2  clock                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static int64_t clock_ns(void)
+{
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
-static void clock_sleep_ns(int64_t ns) {
+
+static void clock_sleep_ns(int64_t ns)
+{
     if (ns <= 0) return;
     struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
     nanosleep(&ts, NULL);
 }
 
-/* ── §3 color ─────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §3  color                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
 #define PAIR_BORDER   1
 #define PAIR_CURSOR   2
-#define PAIR_HUD      3
-#define PAIR_HINT     4
+#define PAIR_HUD      3   /* yellow status bar */
+#define PAIR_HINT     4   /* cyan key-hint footer */
 
 static const short THEMES[N_THEMES][2] = {
     { COLOR_CYAN,   COLOR_BLACK },
@@ -197,17 +211,24 @@ static const short THEMES[N_THEMES][2] = {
     { COLOR_YELLOW, COLOR_BLACK },
     { COLOR_WHITE,  COLOR_BLACK },
 };
-static void color_init(int theme) {
+
+static void color_init(int theme)
+{
     start_color();
     use_default_colors();
     init_pair(PAIR_BORDER, THEMES[theme][0], THEMES[theme][1]);
-    init_pair(PAIR_CURSOR, COLOR_WHITE,      COLOR_BLUE);
-    init_pair(PAIR_HUD,    COLOR_BLACK,      COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLOR_CYAN,       COLOR_BLACK);
+    init_pair(PAIR_CURSOR, COLOR_WHITE, COLOR_BLUE);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula ───────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §4  formula — GridCtx and the hex ↔ screen mapping (pointy-top)         */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
 /*
+ * GridCtx — geometry of the active pointy-top hex grid.
+ *
  * Centering: px = (col - ox) × CELL_W, py = (row - oy) × CELL_H.
  *
  * Pointy-top pixel↔cube:
@@ -219,8 +240,89 @@ static void color_init(int theme) {
  * Compare flat-top: only the matrix entries differ; cube_round, cube dist,
  * angle_char, and HEX_DIR are identical.
  */
+typedef struct {
+    /* terminal extent */
+    int rows, cols;
 
-/* ── §5 draw ──────────────────────────────────────────────────────────── */
+    /* hex geometry */
+    double hex_size;
+    double border_w;
+    int    cell_w, cell_h;
+
+    /* screen origin = pixel (0,0) */
+    int    ox, oy;
+
+    /* cursor bounds in axial space (advisory; hex plane is infinite) */
+    int    max_q, max_r;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows   = rows;
+    g->cols   = cols;
+    g->cell_w = CELL_W;
+    g->cell_h = CELL_H;
+    g->ox     = cols / 2;
+    g->oy     = (rows - 1) / 2;
+    if (g->hex_size <= 0.0) g->hex_size = HEX_SIZE_DEFAULT;
+    if (g->border_w <= 0.0) g->border_w = BORDER_W_DEFAULT;
+    g->max_q = (int)((double)cols * CELL_W / (sqrt(3.0) * g->hex_size)) + 1;
+    g->max_r = (int)((double)rows * CELL_H / (3.0      * g->hex_size)) + 1;
+}
+
+/*
+ * ctx_to_screen — center cell of pointy-top hex (Q, R) in screen coordinates.
+ *
+ *   cx_pix = size × (√3 × Q  +  √3/2 × R)
+ *   cy_pix = size × 3/2 × R
+ *   sc = ox + (int)(cx_pix / CELL_W)
+ *   sr = oy + (int)(cy_pix / CELL_H)
+ *
+ * Compare to flat-top:
+ *   flat-top:   cx = 3/2·Q·s,                  cy = (√3/2·Q + √3·R)·s
+ *   pointy-top: cx = (√3·Q + √3/2·R)·s,        cy = 3/2·R·s
+ * The Q and R roles are "swapped" between x and y — the 30° rotation.
+ */
+static void ctx_to_screen(const GridCtx *g, int Q, int R, int *sr, int *sc)
+{
+    double sq3   = sqrt(3.0);
+    double sq3_2 = sq3 * 0.5;
+    double cx_pix = g->hex_size * (sq3   * (double)Q + sq3_2 * (double)R);
+    double cy_pix = g->hex_size * 1.5    * (double)R;
+    *sc = g->ox + (int)(cx_pix / g->cell_w);
+    *sr = g->oy + (int)(cy_pix / g->cell_h);
+}
+
+/*
+ * cube_round — round fractional cube to integer (Q,R) restoring Q+R+S=0.
+ * Identical to flat-top — orientation-independent.
+ */
+static void cube_round(double fq, double fr, double fs, int *Q, int *R)
+{
+    int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
+    double dq = fabs((double)rq - fq);
+    double dr = fabs((double)rr - fr);
+    double ds = fabs((double)rs - fs);
+    if      (dq > dr && dq > ds) rq = -rr - rs;
+    else if (dr > ds)             rr = -rq - rs;
+    *Q = rq; *R = rr;
+}
+
+/*
+ * ctx_pixel_to_axial — terminal cell (sr, sc) → axial (Q, R) via the
+ * pointy-top inverse matrix and cube_round.
+ */
+__attribute__((unused))
+static void ctx_pixel_to_axial(const GridCtx *g, int sr, int sc, int *Q, int *R)
+{
+    double sq3_3 = sqrt(3.0) / 3.0;
+    double px = (double)(sc - g->ox) * g->cell_w;
+    double py = (double)(sr - g->oy) * g->cell_h;
+    double fq = (sq3_3 * px - 1.0/3.0 * py) / g->hex_size;
+    double fr = (2.0/3.0 * py) / g->hex_size;
+    double fs = -fq - fr;
+    cube_round(fq, fr, fs, Q, R);
+}
 
 /*
  * angle_char — same as 01_flat_top. See that file for full documentation.
@@ -230,18 +332,19 @@ static void color_init(int theme) {
  * assumptions. The pointy-top edges happen to produce different theta values
  * that naturally map to '|' on the left/right faces.
  */
-static char angle_char(double theta) {
+static char angle_char(double theta)
+{
     double t = fmod(theta, M_PI);
     if (t < 0.0) t += M_PI;
     if      (t < M_PI / 8.0)         return '-';
-    else if (t < 3.0 * M_PI / 8.0)  return '\\';
-    else if (t < 5.0 * M_PI / 8.0)  return '|';
-    else if (t < 7.0 * M_PI / 8.0)  return '/';
+    else if (t < 3.0 * M_PI / 8.0)   return '\\';
+    else if (t < 5.0 * M_PI / 8.0)   return '|';
+    else if (t < 7.0 * M_PI / 8.0)   return '/';
     else                              return '-';
 }
 
 /*
- * grid_draw — pointy-top hex rasterizer.
+ * ctx_draw_bg — pointy-top hex rasterizer.
  *
  * THE PIPELINE (differences from 01_flat_top marked with ★):
  *
@@ -271,17 +374,18 @@ static char angle_char(double theta) {
  *   Applying this to the flat-top inverse gives the pointy-top inverse
  *   above. The cube_round and distance logic are rotation-invariant.
  */
-static void grid_draw(int rows, int cols, double size, double border_w,
-                       int cQ, int cR, int ox, int oy) {
+static void ctx_draw_bg(const GridCtx *g, int cQ, int cR)
+{
     double sq3   = sqrt(3.0);
     double sq3_3 = sq3 / 3.0;
     double sq3_2 = sq3 * 0.5;
-    double limit = 0.5 - border_w;
+    double size  = g->hex_size;
+    double limit = 0.5 - g->border_w;
 
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double px = (double)(col - ox) * CELL_W;
-            double py = (double)(row - oy) * CELL_H;
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
 
             /* Pointy-top inverse matrix */
             double fq = (sq3_3 * px - 1.0/3.0 * py) / size;
@@ -320,7 +424,21 @@ static void grid_draw(int rows, int cols, double size, double border_w,
     }
 }
 
-/* ── §5b cursor ───────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Cursor — just (q, r) in axial hex space. Same struct as 01_flat_top.
+ */
+typedef struct { int q, r; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    (void)g;
+    cur->q = 0;
+    cur->r = 0;
+}
 
 /*
  * HEX_DIR — 4-direction movement in axial (Q, R).
@@ -348,131 +466,147 @@ static const int HEX_DIR[4][2] = {
     {+1,  0 },   /* RIGHT */
 };
 
+static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
+{
+    (void)g;
+    cur->q += dq;
+    cur->r += dr;
+}
+
 /*
- * cursor_draw — place '@' at the center cell of pointy-top hex (cQ, cR).
+ * cursor_draw — '@' at the center cell of the pointy-top cursor hex.
  *
- * THE FORMULA (pointy-top forward matrix):
- *
- *   cx_pix = size × (√3 × cQ  +  √3/2 × cR)
- *   cy_pix = size × 3/2 × cR
- *
- *   col = ox + (int)(cx_pix / CELL_W)
- *   row = oy + (int)(cy_pix / CELL_H)
- *
- * Compare to flat-top cursor_draw:
- *   flat-top:   cx = 3/2·Q·s,  cy = (√3/2·Q + √3·R)·s
- *   pointy-top: cx = (√3·Q + √3/2·R)·s,  cy = 3/2·R·s
- * The Q and R roles are "swapped" between x and y — reflecting the 30° rotation.
+ * Uses ctx_to_screen, which embeds the pointy-top forward matrix.
  */
-static void cursor_draw(double size, int cQ, int cR,
-                         int ox, int oy, int rows, int cols) {
-    double sq3   = sqrt(3.0);
-    double sq3_2 = sq3 * 0.5;
-    double cx_pix = size * (sq3   * (double)cQ + sq3_2 * (double)cR);
-    double cy_pix = size * 1.5    * (double)cR;
-    int col = ox + (int)(cx_pix / CELL_W);
-    int row = oy + (int)(cy_pix / CELL_H);
-    if (col >= 0 && col < cols && row >= 0 && row < rows - 1) {
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc;
+    ctx_to_screen(g, cur->q, cur->r, &sr, &sc);
+    if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-        mvaddch(row, col, '@');
+        mvaddch(sr, sc, '@');
         attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     }
 }
 
-/* ── §6 scene ─────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
-typedef struct {
-    double hex_size, border_w;
-    int    cQ, cR;
-    int    theme, paused;
-} Scene;
-
-static void scene_init(Scene *s) {
-    s->hex_size = HEX_SIZE_DEFAULT;
-    s->border_w = BORDER_W_DEFAULT;
-    s->cQ = 0; s->cR = 0;
-    s->theme = 0; s->paused = 0;
-}
-static void scene_draw(const Scene *s, int rows, int cols) {
-    int ox = cols / 2;
-    int oy = (rows - 1) / 2;
-    grid_draw(rows, cols, s->hex_size, s->border_w, s->cQ, s->cR, ox, oy);
-    cursor_draw(s->hex_size, s->cQ, s->cR, ox, oy, rows, cols);
-}
-
-/* ── §7 screen ────────────────────────────────────────────────────────── */
-
-static void screen_init(void) {
-    initscr(); cbreak(); noecho();
-    keypad(stdscr, TRUE); curs_set(0);
-    nodelay(stdscr, TRUE); typeahead(-1);
-}
-static void screen_draw_hud(const Scene *s, int rows, int cols, double fps) {
+static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
+                     int paused, double fps)
+{
     char buf[96];
     snprintf(buf, sizeof buf,
              " Q:%+d R:%+d  size:%.0f  border:%.2f  theme:%d  %5.1f fps  %s ",
-             s->cQ, s->cR, s->hex_size, s->border_w, s->theme, fps,
-             s->paused ? "PAUSED " : "running");
+             cur->q, cur->r, g->hex_size, g->border_w, theme, fps,
+             paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " q:quit  p:pause  t:theme  r:reset  arrows:move  +/-:size  [/]:border ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
-}
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
-static void cleanup(void) { endwin(); }
-
-/* ── §8 app ───────────────────────────────────────────────────────────── */
-
-static volatile sig_atomic_t running = 1, need_resize = 0;
-static void sig_handler(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) running = 0;
-    if (sig == SIGWINCH) need_resize = 1;
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-int main(void) {
-    atexit(cleanup);
-    signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler);
-    signal(SIGWINCH, sig_handler);
+static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
+                       int paused, double fps)
+{
+    erase();
+    ctx_draw_bg(g, cur->q, cur->r);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, theme, paused, fps);
+    wnoutrefresh(stdscr);
+    doupdate();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §7  screen                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void screen_cleanup(void) { endwin(); }
+
+static void screen_init(void)
+{
+    initscr(); cbreak(); noecho();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    curs_set(0);
+    typeahead(-1);
+    atexit(screen_cleanup);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §8  app                                                                 */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static volatile sig_atomic_t g_running     = 1;
+static volatile sig_atomic_t g_need_resize = 0;
+
+static void on_signal(int s)
+{
+    if (s == SIGINT || s == SIGTERM) g_running     = 0;
+    if (s == SIGWINCH)               g_need_resize = 1;
+}
+
+int main(void)
+{
+    signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
+    signal(SIGWINCH, on_signal);
+
     screen_init();
-    int rows, cols; getmaxyx(stdscr, rows, cols);
-    Scene sc; scene_init(&sc); color_init(sc.theme);
-    int64_t prev = clock_ns(); double fps = 60.0;
+    int theme = 0, paused = 0;
+    color_init(theme);
 
-    while (running) {
-        if (need_resize) {
-            need_resize = 0; endwin(); refresh();
-            getmaxyx(stdscr, rows, cols);
+    GridCtx g = {0};
+    g.hex_size = HEX_SIZE_DEFAULT;
+    g.border_w = BORDER_W_DEFAULT;
+    ctx_init(&g, LINES, COLS);
+
+    Cursor cur;
+    cursor_reset(&cur, &g);
+
+    double fps = 60.0;
+    int64_t prev = clock_ns();
+
+    while (g_running) {
+        if (g_need_resize) {
+            g_need_resize = 0;
+            endwin(); refresh();
+            ctx_init(&g, LINES, COLS);
         }
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
-            case 'q': case 27: running = 0; break;
-            case 'p': sc.paused ^= 1; break;
-            case 'r': sc.cQ = 0; sc.cR = 0; break;
-            case 't': sc.theme = (sc.theme + 1) % N_THEMES; color_init(sc.theme); break;
-            case KEY_UP:    sc.cQ += HEX_DIR[0][0]; sc.cR += HEX_DIR[0][1]; break;
-            case KEY_DOWN:  sc.cQ += HEX_DIR[1][0]; sc.cR += HEX_DIR[1][1]; break;
-            case KEY_LEFT:  sc.cQ += HEX_DIR[2][0]; sc.cR += HEX_DIR[2][1]; break;
-            case KEY_RIGHT: sc.cQ += HEX_DIR[3][0]; sc.cR += HEX_DIR[3][1]; break;
+            case 'q': case 27: g_running = 0; break;
+            case 'p': paused ^= 1; break;
+            case 'r': cursor_reset(&cur, &g); break;
+            case 't':
+                theme = (theme + 1) % N_THEMES;
+                color_init(theme);
+                break;
+            case KEY_UP:    cursor_move(&cur, &g, HEX_DIR[0][0], HEX_DIR[0][1]); break;
+            case KEY_DOWN:  cursor_move(&cur, &g, HEX_DIR[1][0], HEX_DIR[1][1]); break;
+            case KEY_LEFT:  cursor_move(&cur, &g, HEX_DIR[2][0], HEX_DIR[2][1]); break;
+            case KEY_RIGHT: cursor_move(&cur, &g, HEX_DIR[3][0], HEX_DIR[3][1]); break;
             case '+': case '=':
-                if (sc.hex_size < HEX_SIZE_MAX) { sc.hex_size += HEX_SIZE_STEP; } break;
+                if (g.hex_size < HEX_SIZE_MAX) { g.hex_size += HEX_SIZE_STEP; ctx_init(&g, LINES, COLS); } break;
             case '-':
-                if (sc.hex_size > HEX_SIZE_MIN) { sc.hex_size -= HEX_SIZE_STEP; } break;
+                if (g.hex_size > HEX_SIZE_MIN) { g.hex_size -= HEX_SIZE_STEP; ctx_init(&g, LINES, COLS); } break;
             case '[':
-                if (sc.border_w > BORDER_W_MIN) { sc.border_w -= BORDER_W_STEP; } break;
+                if (g.border_w > BORDER_W_MIN) { g.border_w -= BORDER_W_STEP; } break;
             case ']':
-                if (sc.border_w < BORDER_W_MAX) { sc.border_w += BORDER_W_STEP; } break;
+                if (g.border_w < BORDER_W_MAX) { g.border_w += BORDER_W_STEP; } break;
             }
         }
+
         int64_t now = clock_ns(), dt = now - prev; prev = now;
-        if (dt > 0) fps = fps * 0.9 + 1e9 / (double)dt * 0.1;
-        erase();
-        scene_draw(&sc, rows, cols);
-        screen_draw_hud(&sc, rows, cols, fps);
-        screen_present();
+        if (dt > 0)
+            fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (double)dt) * FPS_EWMA_ALPHA;
+
+        scene_draw(&g, &cur, theme, paused, fps);
         clock_sleep_ns(TICK_NS - (clock_ns() - now));
     }
     return 0;

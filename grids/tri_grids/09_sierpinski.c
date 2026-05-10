@@ -12,14 +12,18 @@
  * Study alongside: 08_triforce.c — same midpoint split, but keeps all 4
  *                  children (4^N leaves vs 3^N here).
  *                  07_barycentric.c — 6-way split (centroid-anchored).
+ *                  ../README.md — GridCtx primitive (this file builds a
+ *                  mesh on demand instead of a per-pixel inverse).
  *
  * Section map:
- *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC
+ *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC, EWMA constant
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — depth-keyed palette + HUD / hint
- *   §4 formula  — slope_char + Bresenham line_draw (same as 07/08)
- *   §5 subdivide — 3-way split (drops centre child)
- *   §6 scene    — seed_triangle + scene_draw
+ *   §4 formula  — GridCtx + ctx_init + slope_char + Bresenham line_draw
+ *   §5 mesh     — 3-way recursive subdivide (drops centre child)
+ *                 (no Cursor — depth is the user-controlled parameter,
+ *                  arrow keys go unused; +/- adjusts depth instead)
+ *   §6 scene    — hud_draw + scene_draw (seed triangle + recursion)
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -39,6 +43,11 @@
  *                  ≈ 1.585, area zero, infinite perimeter. At finite
  *                  depth N the drawn figure has 3^N triangles, each at
  *                  scale 2⁻ᴺ.
+ *
+ * Data-structure : GridCtx carries the recursion parameters (depth,
+ *                  size_frac) and screen extent. No persistent mesh array
+ *                  — the recursion emits each leaf's edges directly into
+ *                  the framebuffer. See ../README.md "The two primitives".
  *
  * Formula        : Same midpoint subdivision as 08; only 3 of the 4
  *                  children are kept. Recursion depth controlled by +/-
@@ -166,6 +175,9 @@
 #define MAX_DEPTH_LEVELS (DEPTH_MAX + 1)
 #define N_THEMES         3
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA 0.05
+
 #define PAIR_DEPTH_BASE  1
 #define PAIR_HUD        (PAIR_DEPTH_BASE + MAX_DEPTH_LEVELS)
 #define PAIR_HINT       (PAIR_HUD + 1)
@@ -218,13 +230,35 @@ static void color_init(int theme)
         short fg = (COLORS >= 256) ? PAL256[theme][i] : PAL8[theme][i];
         init_pair(PAIR_DEPTH_BASE + i, fg, -1);
     }
-    init_pair(PAIR_HUD,  COLORS >= 256 ?  0 : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT, COLORS >= 256 ? 75 : COLOR_CYAN,  -1);
+    init_pair(PAIR_HUD,  COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — slope_char + Bresenham line                               */
+/* §4  formula — GridCtx + slope_char + Bresenham line                     */
 /* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * GridCtx — geometry + recursion parameters for the substitution mesh.
+ * See 07_barycentric.c for the canonical version of this struct.
+ */
+typedef struct {
+    int    rows, cols;
+    int    cw, ch;
+    int    ox, oy;
+    int    depth;
+    double size_frac;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols, int depth, double size_frac)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->ox = (cols * CELL_W) / 2;
+    g->oy = ((rows - 1) * CELL_H) / 2;
+    g->depth     = depth;
+    g->size_frac = size_frac;
+}
 
 static char slope_char(double dx, double dy)
 {
@@ -236,7 +270,7 @@ static char slope_char(double dx, double dy)
     return ((dx >= 0) == (dy >= 0)) ? '\\' : '/';
 }
 
-static void line_draw(int rows, int cols, double px0, double py0,
+static void line_draw(const GridCtx *g, double px0, double py0,
                       double px1, double py1, int attr)
 {
     char ch = slope_char(px1 - px0, py1 - py0);
@@ -247,7 +281,7 @@ static void line_draw(int rows, int cols, double px0, double py0,
     int err = dx + dy;
     attron(attr);
     for (;;) {
-        if (x0 >= 0 && x0 < cols && y0 >= 0 && y0 < rows - 1)
+        if (x0 >= 0 && x0 < g->cols && y0 >= 0 && y0 < g->rows - 1)
             mvaddch(y0, x0, (chtype)(unsigned char)ch);
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -258,27 +292,31 @@ static void line_draw(int rows, int cols, double px0, double py0,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  subdivide — 3-way recursive split                                   */
+/* §5  mesh — 3-way recursive subdivide                                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
+/*
+ * No Cursor struct: as in 07/08, the user navigates by changing DEPTH
+ * and SIZE_FRAC, not by stepping through individual leaves.
+ */
 
 typedef struct { double x[3], y[3]; } Tri;
 
-static void tri_draw_edges(int rows, int cols, Tri t, int depth)
+static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
 {
     int pair = PAIR_DEPTH_BASE + depth;
     int attr = COLOR_PAIR(pair) | (depth == 0 ? A_BOLD : 0);
-    line_draw(rows, cols, t.x[0], t.y[0], t.x[1], t.y[1], attr);
-    line_draw(rows, cols, t.x[1], t.y[1], t.x[2], t.y[2], attr);
-    line_draw(rows, cols, t.x[2], t.y[2], t.x[0], t.y[0], attr);
+    line_draw(g, t.x[0], t.y[0], t.x[1], t.y[1], attr);
+    line_draw(g, t.x[1], t.y[1], t.x[2], t.y[2], attr);
+    line_draw(g, t.x[2], t.y[2], t.x[0], t.y[0], attr);
 }
 
 /*
  * subdivide — keep only the 3 corner children. The inverted centre
  * (the "hole") is silently dropped, producing the gasket.
  */
-static void subdivide(int rows, int cols, Tri t, int depth, int max_depth)
+static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
 {
-    if (depth == max_depth) { tri_draw_edges(rows, cols, t, depth); return; }
+    if (depth == max_depth) { tri_draw_edges(g, t, depth); return; }
     double m01x = (t.x[0] + t.x[1]) * 0.5, m01y = (t.y[0] + t.y[1]) * 0.5;
     double m12x = (t.x[1] + t.x[2]) * 0.5, m12y = (t.y[1] + t.y[2]) * 0.5;
     double m20x = (t.x[2] + t.x[0]) * 0.5, m20y = (t.y[2] + t.y[0]) * 0.5;
@@ -287,9 +325,24 @@ static void subdivide(int rows, int cols, Tri t, int depth, int max_depth)
     Tri c1 = { {m01x, t.x[1], m12x}, {m01y, t.y[1], m12y} };
     Tri c2 = { {m20x, m12x, t.x[2]}, {m20y, m12y, t.y[2]} };
 
-    subdivide(rows, cols, c0, depth + 1, max_depth);
-    subdivide(rows, cols, c1, depth + 1, max_depth);
-    subdivide(rows, cols, c2, depth + 1, max_depth);
+    subdivide(g, c0, depth + 1, max_depth);
+    subdivide(g, c1, depth + 1, max_depth);
+    subdivide(g, c2, depth + 1, max_depth);
+}
+
+static Tri scene_seed(const GridCtx *g)
+{
+    double pw = (double)g->cols * CELL_W;
+    double ph = (double)(g->rows - 1) * CELL_H;
+    double base = (pw < ph ? pw : ph) * g->size_frac;
+    double h    = base * sqrt(3.0) * 0.5;
+    double cxp  = (double)g->ox;
+    double cyp  = (double)g->oy;
+    Tri t = {
+        { cxp,                 cxp - base * 0.5, cxp + base * 0.5 },
+        { cyp - h * 2.0/3.0,   cyp + h / 3.0,    cyp + h / 3.0    },
+    };
+    return t;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -311,27 +364,8 @@ static void scene_reset(Scene *s)
     s->paused    = 0;
 }
 
-static Tri scene_seed(const Scene *s, int rows, int cols)
+static void hud_draw(const GridCtx *g, const Scene *s, double fps)
 {
-    double pw = (double)cols * CELL_W;
-    double ph = (double)(rows - 1) * CELL_H;
-    double base = (pw < ph ? pw : ph) * s->size_frac;
-    double h    = base * sqrt(3.0) * 0.5;
-    double cxp  = pw * 0.5;
-    double cyp  = ph * 0.5;
-    Tri t = {
-        { cxp,                 cxp - base * 0.5, cxp + base * 0.5 },
-        { cyp - h * 2.0/3.0,   cyp + h / 3.0,    cyp + h / 3.0    },
-    };
-    return t;
-}
-
-static void scene_draw(int rows, int cols, const Scene *s, double fps)
-{
-    erase();
-    Tri seed = scene_seed(s, rows, cols);
-    subdivide(rows, cols, seed, 0, s->depth);
-
     long leaves = 1; for (int i = 0; i < s->depth; i++) leaves *= 3;
     char buf[128];
     snprintf(buf, sizeof buf,
@@ -339,14 +373,21 @@ static void scene_draw(int rows, int cols, const Scene *s, double fps)
              s->depth, leaves, s->size_frac, s->theme, fps,
              s->paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " +/-:depth  [/]:size  t:theme  r:reset  p:pause  q:quit  [09 sierpinski] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Scene *s, double fps)
+{
+    erase();
+    Tri seed = scene_seed(g);
+    subdivide(g, seed, 0, s->depth);
+    hud_draw(g, s, fps);
     wnoutrefresh(stdscr);
     doupdate();
 }
@@ -390,7 +431,9 @@ int main(void)
     scene_reset(&sc);
     screen_init(sc.theme);
 
-    int rows = LINES, cols = COLS;
+    GridCtx g;
+    ctx_init(&g, LINES, COLS, sc.depth, sc.size_frac);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double  fps = TARGET_FPS;
     int64_t t0  = clock_ns();
@@ -399,8 +442,9 @@ int main(void)
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();
-            rows = LINES; cols = COLS;
         }
+        ctx_init(&g, LINES, COLS, sc.depth, sc.size_frac);
+
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
@@ -423,10 +467,10 @@ int main(void)
         }
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0  = now;
 
-        scene_draw(rows, cols, &sc, fps);
+        scene_draw(&g, &sc, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

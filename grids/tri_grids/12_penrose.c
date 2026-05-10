@@ -12,14 +12,18 @@
  * Study alongside: 10_pinwheel.c — another aperiodic substitution
  *                  (5-way split with √5 scaling).
  *                  09_sierpinski.c — periodic 3-way self-similar split.
+ *                  ../README.md — GridCtx primitive (this file builds a
+ *                  mesh on demand instead of a per-pixel inverse).
  *
  * Section map:
- *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC, PHI
+ *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC, PHI, EWMA constant
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — type-keyed palette (acute vs obtuse) + HUD / hint
- *   §4 formula  — slope_char + Bresenham line_draw
- *   §5 substitute — golden-ratio split for each Robinson triangle
- *   §6 scene    — seed_triangle (acute or obtuse) + scene_draw
+ *   §4 formula  — GridCtx + ctx_init + slope_char + Bresenham line_draw
+ *   §5 mesh     — golden-ratio substitute for each Robinson triangle
+ *                 (no Cursor — depth is the user-controlled parameter,
+ *                  arrow keys go unused; +/- adjusts depth instead)
+ *   §6 scene    — hud_draw + scene_draw (acute/obtuse seed + recursion)
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -47,6 +51,12 @@
  *                  2/2 simplification produces an aperiodic-looking
  *                  golden-ratio fractal that demonstrates the same key
  *                  ideas (two prototiles, golden split, self-similarity).
+ *
+ * Data-structure : GridCtx carries the recursion parameters (depth,
+ *                  size_frac, seed_type) and screen extent. No persistent
+ *                  mesh array — the recursion emits each leaf's edges
+ *                  directly into the framebuffer. See ../README.md
+ *                  "The two primitives".
  *
  * Formula        : Place a split point P on a chosen edge at the golden-
  *                  ratio fraction (1/φ along the leg or base). The two
@@ -211,6 +221,9 @@
 
 #define N_THEMES 3
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA 0.05
+
 #define PAIR_ACUTE  1
 #define PAIR_OBTUSE 2
 #define PAIR_HUD    3
@@ -260,13 +273,41 @@ static void color_init(int theme)
     else               { fg_a = THEME_FG_8[theme][0]; fg_b = THEME_FG_8[theme][1]; }
     init_pair(PAIR_ACUTE,  fg_a, -1);
     init_pair(PAIR_OBTUSE, fg_b, -1);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  0 : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLORS >= 256 ? 75 : COLOR_CYAN,  -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — slope_char + Bresenham line                               */
+/* §4  formula — GridCtx + slope_char + Bresenham line                     */
 /* ═══════════════════════════════════════════════════════════════════════ */
+
+#define TYPE_ACUTE   0
+#define TYPE_OBTUSE  1
+
+/*
+ * GridCtx — geometry + recursion parameters for the Robinson-triangle mesh.
+ * Mirrors 07_barycentric.c's GridCtx with an extra seed_type knob.
+ */
+typedef struct {
+    int    rows, cols;
+    int    cw, ch;
+    int    ox, oy;
+    int    depth;
+    double size_frac;
+    int    seed_type;        /* TYPE_ACUTE or TYPE_OBTUSE */
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols,
+                     int depth, double size_frac, int seed_type)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->ox = (cols * CELL_W) / 2;
+    g->oy = ((rows - 1) * CELL_H) / 2;
+    g->depth     = depth;
+    g->size_frac = size_frac;
+    g->seed_type = seed_type;
+}
 
 static char slope_char(double dx, double dy)
 {
@@ -278,7 +319,7 @@ static char slope_char(double dx, double dy)
     return ((dx >= 0) == (dy >= 0)) ? '\\' : '/';
 }
 
-static void line_draw(int rows, int cols, double px0, double py0,
+static void line_draw(const GridCtx *g, double px0, double py0,
                       double px1, double py1, int attr)
 {
     char ch = slope_char(px1 - px0, py1 - py0);
@@ -289,7 +330,7 @@ static void line_draw(int rows, int cols, double px0, double py0,
     int err = dx + dy;
     attron(attr);
     for (;;) {
-        if (x0 >= 0 && x0 < cols && y0 >= 0 && y0 < rows - 1)
+        if (x0 >= 0 && x0 < g->cols && y0 >= 0 && y0 < g->rows - 1)
             mvaddch(y0, x0, (chtype)(unsigned char)ch);
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -300,24 +341,26 @@ static void line_draw(int rows, int cols, double px0, double py0,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  substitute — golden-ratio split for Robinson triangles              */
+/* §5  mesh — golden-ratio substitute for Robinson triangles               */
 /* ═══════════════════════════════════════════════════════════════════════ */
-
-#define TYPE_ACUTE   0
-#define TYPE_OBTUSE  1
+/*
+ * No Cursor struct: the user navigates by changing DEPTH, SIZE_FRAC and
+ * SEED_TYPE — not by stepping through individual leaves of an aperiodic
+ * tiling (where "next leaf" has no canonical meaning).
+ */
 
 typedef struct {
     double x[3], y[3];      /* x[0]/y[0] = apex, x[1..2]/y[1..2] = base */
     int    type;            /* TYPE_ACUTE or TYPE_OBTUSE */
 } PTri;
 
-static void tri_draw_edges(int rows, int cols, PTri t)
+static void tri_draw_edges(const GridCtx *g, PTri t)
 {
     int pair = (t.type == TYPE_ACUTE) ? PAIR_ACUTE : PAIR_OBTUSE;
     int attr = COLOR_PAIR(pair);
-    line_draw(rows, cols, t.x[0], t.y[0], t.x[1], t.y[1], attr);
-    line_draw(rows, cols, t.x[1], t.y[1], t.x[2], t.y[2], attr);
-    line_draw(rows, cols, t.x[2], t.y[2], t.x[0], t.y[0], attr);
+    line_draw(g, t.x[0], t.y[0], t.x[1], t.y[1], attr);
+    line_draw(g, t.x[1], t.y[1], t.x[2], t.y[2], attr);
+    line_draw(g, t.x[2], t.y[2], t.x[0], t.y[0], attr);
 }
 
 /*
@@ -335,24 +378,61 @@ static void tri_draw_edges(int rows, int cols, PTri t)
  *     Child ACUTE:  apex at V1, base V0-P.
  *     Child OBTUSE: apex at P, base V0-V2.
  */
-static void substitute(int rows, int cols, PTri t, int depth, int max_depth)
+static void substitute(const GridCtx *g, PTri t, int depth, int max_depth)
 {
-    if (depth == max_depth) { tri_draw_edges(rows, cols, t); return; }
+    if (depth == max_depth) { tri_draw_edges(g, t); return; }
 
     if (t.type == TYPE_ACUTE) {
         double Px = t.x[0] + (t.x[1] - t.x[0]) * INV_PHI;
         double Py = t.y[0] + (t.y[1] - t.y[0]) * INV_PHI;
         PTri c0 = { { Px, t.x[0], t.x[2] }, { Py, t.y[0], t.y[2] }, TYPE_OBTUSE };
         PTri c1 = { { t.x[2], Px, t.x[1] }, { t.y[2], Py, t.y[1] }, TYPE_ACUTE  };
-        substitute(rows, cols, c0, depth + 1, max_depth);
-        substitute(rows, cols, c1, depth + 1, max_depth);
+        substitute(g, c0, depth + 1, max_depth);
+        substitute(g, c1, depth + 1, max_depth);
     } else {
         double Px = t.x[1] + (t.x[2] - t.x[1]) * INV_PHI;
         double Py = t.y[1] + (t.y[2] - t.y[1]) * INV_PHI;
         PTri c0 = { { t.x[1], t.x[0], Px }, { t.y[1], t.y[0], Py }, TYPE_ACUTE  };
         PTri c1 = { { Px, t.x[0], t.x[2] }, { Py, t.y[0], t.y[2] }, TYPE_OBTUSE };
-        substitute(rows, cols, c0, depth + 1, max_depth);
-        substitute(rows, cols, c1, depth + 1, max_depth);
+        substitute(g, c0, depth + 1, max_depth);
+        substitute(g, c1, depth + 1, max_depth);
+    }
+}
+
+/*
+ * Build the seed triangle. Two flavors: an acute or obtuse Robinson tile
+ * centered on screen, sized to fit. Apex always at the top.
+ *
+ *   ACUTE: leg = base · φ, apex angle 36°. Height = leg · sin(72°).
+ *   OBTUSE: base = leg · φ, apex angle 108°. Height = leg · sin(36°).
+ */
+static PTri scene_seed(const GridCtx *g)
+{
+    double pw = (double)g->cols * CELL_W;
+    double ph = (double)(g->rows - 1) * CELL_H;
+    double cxp = (double)g->ox;
+    double cyp = (double)g->oy;
+
+    if (g->seed_type == TYPE_ACUTE) {
+        double leg    = (pw < ph ? pw : ph) * g->size_frac * 0.5;
+        double base   = leg / PHI;
+        double height = leg * sin(72.0 * M_PI / 180.0);
+        PTri t = {
+            { cxp,                cxp - base * 0.5,    cxp + base * 0.5 },
+            { cyp - height * 0.5, cyp + height * 0.5,  cyp + height * 0.5 },
+            TYPE_ACUTE
+        };
+        return t;
+    } else {
+        double leg    = (pw < ph ? pw : ph) * g->size_frac * 0.4;
+        double base   = leg * PHI;
+        double height = leg * sin(36.0 * M_PI / 180.0);
+        PTri t = {
+            { cxp,                cxp - base * 0.5,    cxp + base * 0.5 },
+            { cyp - height * 0.5, cyp + height * 0.5,  cyp + height * 0.5 },
+            TYPE_OBTUSE
+        };
+        return t;
     }
 }
 
@@ -377,49 +457,8 @@ static void scene_reset(Scene *s)
     s->paused    = 0;
 }
 
-/*
- * Build the seed triangle. Two flavors: an acute or obtuse Robinson tile
- * centered on screen, sized to fit. Apex always at the top.
- *
- *   ACUTE: leg = base · φ, apex angle 36°. Height = leg · sin(72°).
- *   OBTUSE: base = leg · φ, apex angle 108°. Height = leg · sin(36°).
- */
-static PTri scene_seed(const Scene *s, int rows, int cols)
+static void hud_draw(const GridCtx *g, const Scene *s, double fps)
 {
-    double pw = (double)cols * CELL_W;
-    double ph = (double)(rows - 1) * CELL_H;
-    double cxp = pw * 0.5;
-    double cyp = ph * 0.5;
-
-    if (s->seed_type == TYPE_ACUTE) {
-        double leg    = (pw < ph ? pw : ph) * s->size_frac * 0.5;
-        double base   = leg / PHI;
-        double height = leg * sin(72.0 * M_PI / 180.0);
-        PTri t = {
-            { cxp,                cxp - base * 0.5,    cxp + base * 0.5 },
-            { cyp - height * 0.5, cyp + height * 0.5,  cyp + height * 0.5 },
-            TYPE_ACUTE
-        };
-        return t;
-    } else {
-        double leg    = (pw < ph ? pw : ph) * s->size_frac * 0.4;
-        double base   = leg * PHI;
-        double height = leg * sin(36.0 * M_PI / 180.0);
-        PTri t = {
-            { cxp,                cxp - base * 0.5,    cxp + base * 0.5 },
-            { cyp - height * 0.5, cyp + height * 0.5,  cyp + height * 0.5 },
-            TYPE_OBTUSE
-        };
-        return t;
-    }
-}
-
-static void scene_draw(int rows, int cols, const Scene *s, double fps)
-{
-    erase();
-    PTri seed = scene_seed(s, rows, cols);
-    substitute(rows, cols, seed, 0, s->depth);
-
     long leaves = 1; for (int i = 0; i < s->depth; i++) leaves *= 2;
     char buf[128];
     snprintf(buf, sizeof buf,
@@ -428,14 +467,21 @@ static void scene_draw(int rows, int cols, const Scene *s, double fps)
              s->depth, leaves, s->size_frac, s->theme, fps,
              s->paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " +/-:depth  [/]:size  s:swap-seed  t:theme  r:reset  p:pause  q:quit  [12 penrose] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Scene *s, double fps)
+{
+    erase();
+    PTri seed = scene_seed(g);
+    substitute(g, seed, 0, s->depth);
+    hud_draw(g, s, fps);
     wnoutrefresh(stdscr);
     doupdate();
 }
@@ -479,7 +525,9 @@ int main(void)
     scene_reset(&sc);
     screen_init(sc.theme);
 
-    int rows = LINES, cols = COLS;
+    GridCtx g;
+    ctx_init(&g, LINES, COLS, sc.depth, sc.size_frac, sc.seed_type);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double  fps = TARGET_FPS;
     int64_t t0  = clock_ns();
@@ -488,8 +536,9 @@ int main(void)
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();
-            rows = LINES; cols = COLS;
         }
+        ctx_init(&g, LINES, COLS, sc.depth, sc.size_frac, sc.seed_type);
+
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
@@ -516,10 +565,10 @@ int main(void)
         }
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0  = now;
 
-        scene_draw(rows, cols, &sc, fps);
+        scene_draw(&g, &sc, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

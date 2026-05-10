@@ -4,19 +4,19 @@
  *
  * DEMO: Same rectangular grid as 01_uniform_rect but cells alternate
  *       between filled ('#') and empty (' '). The fill rule is
- *       (r + c) % 2 — the parity of the cell address. The player '@'
+ *       (r + c) % 2 — the parity of the cell address. The cursor '@'
  *       can only stand on light cells (parity 0); arrow keys skip over
  *       dark cells, moving two steps at once in the correct direction.
  *
  * Study alongside: 01_uniform_rect.c (grid formula), 13_dot.c
  *
  * Section map:
- *   §1 config   — CELL_W, CELL_H, fill characters
+ *   §1 config   — CELL_W, CELL_H, fill characters, EWMA
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: dark cell, light cell, player, border, HUD
- *   §4 formula  — cell fill rule: (r+c)%2; grid line same as 01
- *   §5 player   — moves in steps of 2 to stay on same parity
- *   §6 scene    — draw_grid(), draw_player()
+ *   §3 color    — 6 pairs (dark, light, cursor, border, HUD, HINT)
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move (parity-preserving) / cursor_draw
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -35,19 +35,19 @@
  *
  * Fill formula   :
  *   parity = (r + c) % 2
- *   parity == 0 → light cell   (player can stand here)
+ *   parity == 0 → light cell   (cursor can stand here)
  *   parity == 1 → dark cell    (blocked / filled)
  *
  *   Why (r+c)%2? Moving right (+c=1) flips parity. Moving down (+r=1) also
  *   flips parity. So every neighbour has the opposite parity — checkerboard.
  *
- * Movement rule  : The player only occupies light cells (parity 0).
- *   Since every 1-step move flips parity, the player moves 2 steps at a time:
+ * Movement rule  : The cursor only occupies light cells (parity 0).
+ *   Since every 1-step move flips parity, the cursor moves 2 steps at a time:
  *   new_r = r + 2*dr,  new_c = c + 2*dc
  *   This keeps (new_r + new_c) % 2 == (r + c) % 2 == 0.
  *
- * Alternative    : Let player move 1 step (to dark cells too) — remove the
- *   *2 multiplier in player_move and change the step in player_reset.
+ * Alternative    : Let cursor move 1 step (to dark cells too) — remove the
+ *   *2 multiplier in cursor_move and change the step in cursor_reset.
  *
  * References     :
  *   Checkerboard pattern — en.wikipedia.org/wiki/Checkerboard
@@ -89,50 +89,39 @@
  *    For each cell (r, c):
  *      if (r + c) % 2 == 1:  fill interior with DARK_FILL character ('#')
  *      else:                 leave interior empty
- *    Fill order: row-major scan over cells; inside each cell, fill all
- *    interior positions (sr+1..sr+CH-1) × (sc+1..sc+CW-1).
  *
  *  Phase 2 — grid lines (on top of fill):
  *    Exactly as 01_uniform_rect: raster scan, sr%CH==0 or sc%CW==0.
  *    Drawing grid lines AFTER fill ensures borders are always visible.
- *
- *  Alternatively: draw borders first, then fill — same visual result if
- *  the fill skips the border positions.
  *
  * KEY FORMULAS
  * ────────────
  *  Parity:        parity(r, c) = (r + c) % 2       (0=light, 1=dark)
  *  Fill condition: if parity == 1 -> fill interior
  *
- *  Player parity stays constant during movement (by design):
+ *  Cursor parity stays constant during movement (by design):
  *    parity(r + 2*dr, c + 2*dc) = (r+2dr + c+2dc) % 2
  *                                = (r+c + 2*(dr+dc)) % 2
  *                                = (r+c) % 2          <- same!
  *    Moving 2 steps preserves parity. Moving 1 step flips it.
  *
- *  Player always starts on a light cell (parity=0):
+ *  Cursor always starts on a light cell (parity=0):
  *    r=0, c=0 -> (0+0)%2 = 0 (light) ✓
- *    r=2, c=0 -> (2+0)%2 = 0 ✓
- *    r=1, c=1 -> (1+1)%2 = 0 ✓  (diagonal move keeps parity)
  *
  * EDGE CASES TO WATCH
  * ───────────────────
  *  • Draw order: if you draw fill after grid lines, the fill overwrites
  *    the border characters.  Fix: draw fill first, then borders on top.
- *    Or: use a fill that skips the exact border rows and cols
- *    (dr from 1 to CELL_H-1, dc from 1 to CELL_W-1, not 0 to CELL_H).
  *
- *  • Player start cell: player_reset() sets r and c to even values so
- *    parity is 0 (light cell).  The mask `& ~1` rounds down to even:
- *      r = (some_value) & ~1   -> always even
- *    If r and c are both even, (r+c)%2=0 always (light cell). ✓
+ *  • Cursor start cell: cursor_reset() sets r and c to even values so
+ *    parity is 0 (light cell).  The mask `& ~1` rounds down to even.
  *
- *  • The 2-step movement means the player jumps over dark cells entirely.
- *    If you want the player to enter dark cells too, remove the *2 factor
- *    in player_move and the & ~1 mask in player_reset.
+ *  • The 2-step movement means the cursor jumps over dark cells entirely.
+ *    If you want the cursor to enter dark cells too, remove the *2 factor
+ *    in cursor_move and the & ~1 mask in cursor_reset.
  *
  *  • On resize, if the new grid_rows/cols is odd, max_r/max_c may be
- *    odd.  The & ~1 mask in player_reset keeps the player on even coords.
+ *    odd.  The & ~1 mask in cursor_reset keeps the cursor on even coords.
  *
  * HOW TO VERIFY
  * ─────────────
@@ -163,11 +152,15 @@
 #define CELL_H        4
 #define DARK_FILL   '#'    /* character used to fill dark cells */
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
+
 #define PAIR_DARK    1
 #define PAIR_LIGHT   2
-#define PAIR_PLAYER  3
+#define PAIR_CURSOR  3
 #define PAIR_BORDER  4
 #define PAIR_HUD     5
+#define PAIR_HINT    6
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -195,28 +188,49 @@ static void color_init(void)
     start_color(); use_default_colors();
     init_pair(PAIR_DARK,   COLORS >= 256 ? 242 : COLOR_WHITE,  -1);
     init_pair(PAIR_LIGHT,  COLORS >= 256 ? 255 : COLOR_WHITE,  -1);
-    init_pair(PAIR_PLAYER, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
     init_pair(PAIR_BORDER, COLORS >= 256 ?  24 : COLOR_CYAN,   -1);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  15 : COLOR_WHITE,  -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int rows, cols;
+    int cw, ch;
+    int max_r, max_c;
+} GridCtx;
 
 /*
- * cell_to_screen — unchanged from 01_uniform_rect.
+ * ctx_init — derive geometry from terminal size.
+ * max_r/max_c are masked to even so the cursor always lands on parity-0 cells.
  */
-static void cell_to_screen(int r, int c, int *sr, int *sc)
+static void ctx_init(GridCtx *g, int rows, int cols)
 {
-    *sr = r * CELL_H;
-    *sc = c * CELL_W;
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    int gr = (rows - 1) / CELL_H - 1;
+    int gc = cols / CELL_W - 1;
+    g->max_r = gr & ~1;    /* round down to even so end cell is parity-0 */
+    g->max_c = gc & ~1;
 }
 
-static char grid_char(int sr, int sc)
+/*
+ * ctx_to_screen — unchanged from 01_uniform_rect.
+ */
+static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
-    bool h = (sr % CELL_H == 0);
-    bool v = (sc % CELL_W == 0);
+    *sr = r * g->ch;
+    *sc = c * g->cw;
+}
+
+static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+{
+    bool h = (sr % g->ch == 0);
+    bool v = (sc % g->cw == 0);
     if (h && v) return '+';
     if (h)      return '-';
     if (v)      return '|';
@@ -226,67 +240,29 @@ static char grid_char(int sr, int sc)
 /*
  * cell_parity — CHECKERBOARD FILL FORMULA:
  *
- *   parity(r, c) = (r + c) % 2
+ *   parity(r, c) = (r + c) % 2     0 → light cell   1 → dark cell
  *
- *   0 → light cell   1 → dark cell
- *
- * Proof it produces a checkerboard:
- *   Right neighbour (r, c+1): parity = (r + c + 1) % 2 = 1 - parity(r,c) ✓
- *   Down  neighbour (r+1, c): parity = (r + c + 1) % 2 = 1 - parity(r,c) ✓
- *   Diagonal (r+1, c+1):      parity = (r + c + 2) % 2 = parity(r,c)     ✓ same!
  * Every orthogonal neighbour has opposite parity — true checkerboard.
  */
 static int cell_parity(int r, int c) { return (r + c) % 2; }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  player                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct { int r, c, max_r, max_c; } Player;
-
-static void player_reset(Player *p, int rows, int cols)
-{
-    int gr = (rows - 1) / CELL_H - 1;
-    int gc = cols / CELL_W - 1;
-    p->max_r = gr & ~1;    /* round down to even so start is on parity-0 cell */
-    p->max_c = gc & ~1;
-    p->r = (p->max_r / 2) & ~1;
-    p->c = (p->max_c / 2) & ~1;
-}
-
 /*
- * player_move — PARITY-PRESERVING MOVEMENT:
- *
- *   new_r = r + 2*dr,  new_c = c + 2*dc
- *
- *   Moving 2 steps keeps parity: (r+2dr + c+2dc) % 2 == (r+c) % 2 ✓
- *   The player always stays on light (parity-0) cells.
+ * ctx_draw_bg — paint dark-cell fill, then grid borders on top.
  */
-static void player_move(Player *p, int dr, int dc)
+static void ctx_draw_bg(const GridCtx *g)
 {
-    int nr = p->r + 2 * dr, nc = p->c + 2 * dc;
-    if (nr >= 0 && nr <= p->max_r) p->r = nr;
-    if (nc >= 0 && nc <= p->max_c) p->c = nc;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void draw_grid(int rows, int cols)
-{
-    int gr = (rows - 1) / CELL_H;
-    int gc = cols / CELL_W;
+    int gr = (g->rows - 1) / g->ch;
+    int gc = g->cols / g->cw;
 
     /* Fill cell interiors first */
     for (int r = 0; r < gr; r++) {
         for (int c = 0; c < gc; c++) {
-            int sr, sc; cell_to_screen(r, c, &sr, &sc);
+            int sr, sc; ctx_to_screen(g, r, c, &sr, &sc);
             bool dark = (cell_parity(r, c) == 1);
             if (dark) {
                 attron(COLOR_PAIR(PAIR_DARK));
-                for (int dr = 1; dr < CELL_H; dr++)
-                    for (int dc = 1; dc < CELL_W; dc++)
+                for (int dr = 1; dr < g->ch; dr++)
+                    for (int dc = 1; dc < g->cw; dc++)
                         mvaddch(sr + dr, sc + dc, (chtype)(unsigned char)DARK_FILL);
                 attroff(COLOR_PAIR(PAIR_DARK));
             }
@@ -295,41 +271,76 @@ static void draw_grid(int rows, int cols)
 
     /* Draw grid borders on top */
     attron(COLOR_PAIR(PAIR_BORDER));
-    for (int sr = 0; sr < rows - 1; sr++)
-        for (int sc = 0; sc < cols; sc++) {
-            char ch = grid_char(sr, sc);
+    for (int sr = 0; sr < g->rows - 1; sr++)
+        for (int sc = 0; sc < g->cols; sc++) {
+            char ch = ctx_grid_char(g, sr, sc);
             if (ch != ' ')
                 mvaddch(sr, sc, (chtype)(unsigned char)ch);
         }
     attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
-static void draw_player(const Player *p)
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct { int r, c; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
 {
-    int sr, sc; cell_to_screen(p->r, p->c, &sr, &sc);
-    attron(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
-    mvaddch(sr + CELL_H / 2, sc + CELL_W / 2, (chtype)'@');
-    attroff(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
+    cur->r = (g->max_r / 2) & ~1;
+    cur->c = (g->max_c / 2) & ~1;
 }
 
-static void scene_draw(int rows, int cols, const Player *p, double fps)
+/*
+ * cursor_move — PARITY-PRESERVING MOVEMENT:
+ *
+ *   new_r = r + 2*dr,  new_c = c + 2*dc
+ *
+ *   Moving 2 steps keeps parity: (r+2dr + c+2dc) % 2 == (r+c) % 2 ✓
+ *   The cursor always stays on light (parity-0) cells.
+ */
+static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
 {
-    erase();
-    draw_grid(rows, cols);
-    draw_player(p);
+    int nr = cur->r + 2 * dr, nc = cur->c + 2 * dc;
+    if (nr >= 0 && nr <= g->max_r) cur->r = nr;
+    if (nc >= 0 && nc <= g->max_c) cur->c = nc;
+}
 
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc; ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
+    attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    mvaddch(sr + g->ch / 2, sc + g->cw / 2, (chtype)'@');
+    attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
     char buf[80];
     snprintf(buf, sizeof buf,
-        " %.1f fps  cell(%d,%d)  parity=%d ", fps, p->r, p->c, cell_parity(p->r,p->c));
+        " %.1f fps  cell(%d,%d)  parity=%d ",
+        fps, cur->r, cur->c, cell_parity(cur->r, cur->c));
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_DIM);
-    mvprintw(rows - 1, 0,
-        " arrows:move(2 steps)  r:reset  q:quit  [11 checkerboard  (r+c)%%2] ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_DIM);
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+        " arrows:move(2 steps)  r:reset  q/ESC:quit  [11 checkerboard  (r+c)%%2] ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();
 }
 
@@ -362,29 +373,32 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
     screen_init();
-    int rows = LINES, cols = COLS;
-    Player player; player_reset(&player, rows, cols);
+    GridCtx g;     ctx_init(&g, LINES, COLS);
+    Cursor  cur;   cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double fps = TARGET_FPS; int64_t t0 = clock_ns();
+    double fps = TARGET_FPS;
+    int64_t t0 = clock_ns();
 
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
-            player_reset(&player, rows, cols);
+            ctx_init(&g, LINES, COLS);
+            cursor_reset(&cur, &g);
         }
         int ch = getch();
         switch (ch) {
-            case 'q': case 27: g_running = 0;                    break;
-            case 'r':          player_reset(&player, rows, cols); break;
-            case KEY_UP:    player_move(&player, -1,  0); break;
-            case KEY_DOWN:  player_move(&player, +1,  0); break;
-            case KEY_LEFT:  player_move(&player,  0, -1); break;
-            case KEY_RIGHT: player_move(&player,  0, +1); break;
+            case 'q': case 27: g_running = 0;              break;
+            case 'r':          cursor_reset(&cur, &g);     break;
+            case KEY_UP:    cursor_move(&cur, &g, -1,  0); break;
+            case KEY_DOWN:  cursor_move(&cur, &g, +1,  0); break;
+            case KEY_LEFT:  cursor_move(&cur, &g,  0, -1); break;
+            case KEY_RIGHT: cursor_move(&cur, &g,  0, +1); break;
         }
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (now - t0 + 1)) * 0.05; t0 = now;
-        scene_draw(rows, cols, &player, fps);
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0 = now;
+        scene_draw(&g, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

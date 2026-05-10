@@ -6,23 +6,27 @@
  *       The cursor position is stored as two stripe indices (si, sj) —
  *       a different, non-cube coordinate system specific to triangular grids.
  *
- * Study alongside: grids/hex_grids/01_flat_top.c (hex = dual of this tiling)
+ * Study alongside: ../README.md (the GridCtx + Cursor abstraction),
+ *                  hex_grids/01_flat_top.c (hex = dual of this tiling)
  *
  * Section map:
- *   §1 config   — tunable constants
+ *   §1 config   — CELL_W/CELL_H, tri_size + border_w bounds, themes,
+ *                 FPS_EWMA_ALPHA, color pair IDs
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — ncurses color pairs
- *   §4 formula  — pixel↔cell, stripe coordinate system
- *   §5 draw     — three-family stripe classifier
- *   §5b cursor  — TRI_DIR movement, triangle center formula, cursor_draw
- *   §6 scene    — state struct + scene_draw
- *   §7 screen   — ncurses display layer
+ *   §3 color    — border / cursor / HUD / HINT pairs (4 themes)
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
+ *                 (three-family stripe classifier per pixel)
+ *   §5 cursor   — Cursor (si, sj) + cursor_reset / cursor_move / cursor_draw
+ *                 + TRI_DIR direction table
+ *   §6 scene    — hud_draw + scene_draw
+ *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, resize, main loop
  *
  * Keys:  q/ESC quit  p pause  t theme  r reset  arrows move  +/-:size  [/]:border
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra 05_triangular.c -o 05_triangular -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids/05_triangular.c \
+ *       -o 05_triangular -lncurses -lm
  */
 
 /* ── CONCEPTS ──────────────────────────────────────────────────────────── *
@@ -34,9 +38,12 @@
  *                    n3 = (−√3·px + py) / h  (+60° family)
  *                  edge_frac(nk) < border_w → draw '-', '/', or '\'.
  *
- * Data-structure : No grid array — three-family stripe values are recomputed
- *                  per pixel each frame. Cursor lives as (si, sj) ints;
- *                  total state is O(1).
+ * Data-structure : Two structs — GridCtx (cell size, terminal size, cursor
+ *                  bounds in stripe-index space) and Cursor (just (si, sj)).
+ *                  No grid array; the three-family stripe values are
+ *                  recomputed per pixel each frame. See ../README.md "The
+ *                  two primitives" for why the GridCtx + Cursor split is
+ *                  reused across rect / hex / tri / polar.
  *
  * Cursor storage : (si, sj) = (floor(n1), floor(n2)) — two stripe indices
  *                  uniquely identify the triangle. This works because each
@@ -114,7 +121,7 @@
  *
  *  5. Stripe indices for cursor detection:
  *       cell_si = floor(n1),  cell_sj = floor(n2)
- *       on_cur = (cell_si == si && cell_sj == sj)
+ *       on_cur = (cell_si == cur.si && cell_sj == cur.sj)
  *
  *  6. Draw:
  *       dmin < border_w  → border char (cursor or border color)
@@ -178,50 +185,69 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
+#include <ncurses.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <ncurses.h>
 
-/* ── §1 config ────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §1  config                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
+/* Sub-pixel resolution per terminal cell (hex/tri stripes work in pixels). */
 #define CELL_W              2
 #define CELL_H              4
 
+/* Triangle side length in pixels — the lone tunable that sets cell scale. */
 #define TRI_SIZE_DEFAULT   20.0
 #define TRI_SIZE_MIN        8.0
 #define TRI_SIZE_MAX       60.0
 #define TRI_SIZE_STEP       4.0
 
+/* Stripe-distance threshold for "on a border line" (normalized [0,0.5]). */
 #define BORDER_W_DEFAULT    0.10
 #define BORDER_W_MIN        0.02
 #define BORDER_W_MAX        0.45
 #define BORDER_W_STEP       0.02
 
 #define N_THEMES            4
-#define TICK_NS            16666667LL
+#define TICK_NS            16666667LL    /* ~60 Hz frame budget */
 
-/* ── §2 clock ─────────────────────────────────────────────────────────── */
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA      0.05
 
-static int64_t clock_ns(void) {
+/* Color pair IDs */
+#define PAIR_BORDER   1   /* triangle borders (theme-coloured) */
+#define PAIR_CURSOR   2   /* cursor triangle highlight (white-on-blue) */
+#define PAIR_HUD      3   /* status bar (yellow)               */
+#define PAIR_HINT     4   /* key-hint footer (cyan)            */
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §2  clock                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static int64_t clock_ns(void)
+{
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
-static void clock_sleep_ns(int64_t ns) {
+
+static void clock_sleep_ns(int64_t ns)
+{
     if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
+    struct timespec ts = { .tv_sec  = (time_t)(ns / 1000000000LL),
+                           .tv_nsec = (long)(ns % 1000000000LL) };
     nanosleep(&ts, NULL);
 }
 
-/* ── §3 color ─────────────────────────────────────────────────────────── */
-
-#define PAIR_BORDER   1
-#define PAIR_CURSOR   2
-#define PAIR_HUD      3
-#define PAIR_HINT     4
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §3  color                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
 static const short THEMES[N_THEMES][2] = {
     { COLOR_CYAN,   COLOR_BLACK },
@@ -229,36 +255,108 @@ static const short THEMES[N_THEMES][2] = {
     { COLOR_YELLOW, COLOR_BLACK },
     { COLOR_WHITE,  COLOR_BLACK },
 };
-static void color_init(int theme) {
+
+static void color_init(int theme)
+{
     start_color();
     use_default_colors();
     init_pair(PAIR_BORDER, THEMES[theme][0], THEMES[theme][1]);
     init_pair(PAIR_CURSOR, COLOR_WHITE,      COLOR_BLUE);
-    init_pair(PAIR_HUD,    COLOR_BLACK,      COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLOR_CYAN,       COLOR_BLACK);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula ───────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §4  formula — GridCtx and the three-family stripe classifier            */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
 /*
- * Centered: px = (col - ox)×CELL_W, py = (row - oy)×CELL_H.
+ * GridCtx — geometry of the triangular tiling plus cursor bounds.
  *
- * Stripe coordinate system (non-cube, triangular-specific):
- *   n1 = py / h             → floor(n1) = si  (horizontal stripe row)
- *   n2 = (√3·px + py) / h  → floor(n2) = sj  (diagonal stripe column)
- *
- * Triangle (si, sj) center in pixel space:
- *   py_c = (si + 0.5) × h                — midpoint of row si
- *   px_c = (sj − si) × s/2               — solved from n2_center = sj + 0.5
- *
- * Derivation: n2_center = (√3·px_c + py_c)/h = sj+0.5
- *             → √3·px_c = (sj+0.5)·h − py_c = (sj+0.5)·h − (si+0.5)·h = (sj−si)·h
- *             → px_c = (sj−si)·h/√3 = (sj−si)·s/2  (since h/√3 = s/2)
+ * cw/ch are carried as fields (not just #defines) so the rest of the file
+ * does not depend on global constants — ctx_to_screen() works for any
+ * GridCtx value, the abstraction shared with placement files (see
+ * ../README.md). The cursor lives in stripe-index space (si, sj), so the
+ * bounds carried here are max_si / max_sj — a different shape from rect's
+ * (max_r, max_c) but the same role.
  */
+typedef struct {
+    /* terminal extent (in cells) */
+    int rows, cols;
 
-/* ── §5 draw ──────────────────────────────────────────────────────────── */
+    /* triangle side length in pixels + sub-pixel cell size */
+    double tri_size;
+    int    cell_w, cell_h;
+
+    /* centring origin in cell coordinates */
+    int ox, oy;
+
+    /* cursor bounds in stripe-index space (loose — large enough that the
+     * cursor can roam over any triangle visible in the current terminal) */
+    int max_si, max_sj;
+
+    /* render knob — stripe-distance threshold for borders */
+    double border_w;
+} GridCtx;
 
 /*
- * edge_frac — distance [0, 0.5] to the nearest integer in val.
+ * ctx_init — derive geometry from terminal size + tri_size.
+ *
+ * The grid is centered on screen: ox = cols/2, oy = (rows-1)/2.
+ * Stripe bounds are conservative — cover the whole visible terminal in
+ * both stripe directions. Out-of-bounds cursor values just sit off-screen,
+ * cursor_draw checks before mvaddch.
+ */
+static void ctx_init(GridCtx *g, int rows, int cols,
+                     double tri_size, double border_w)
+{
+    g->rows = rows; g->cols = cols;
+    g->tri_size = tri_size;
+    g->cell_w = CELL_W; g->cell_h = CELL_H;
+    g->ox = cols / 2;
+    g->oy = (rows - 1) / 2;
+    g->border_w = border_w;
+
+    /* Loose stripe bounds — the screen is at most cols/CELL_W ≈ 40 pixels
+     * wide and rows*CELL_H ≈ 100 tall. Stripe period ≈ tri_size·√3/2.
+     * Allow 2× the visible range so cursor can move freely. */
+    int max_pix_w = cols * CELL_W;
+    int max_pix_h = rows * CELL_H;
+    double h = tri_size * sqrt(3.0) * 0.5;
+    g->max_si = (int)(max_pix_h / h) + 4;
+    g->max_sj = (int)((max_pix_w + max_pix_h) / h) + 4;
+}
+
+/*
+ * ctx_to_screen — center cell of triangle (si, sj) in screen coordinates.
+ *
+ * THE FORMULA (triangle center from stripe indices — see KEY FORMULAS):
+ *   h    = tri_size × √3 / 2
+ *   py_c = (si + 0.5) × h
+ *   px_c = (sj − si) × tri_size / 2
+ *
+ *   sr = oy + (int)(py_c / CELL_H)
+ *   sc = ox + (int)(px_c / CELL_W)
+ *
+ * Reading it: si selects a horizontal stripe row; sj selects how far along
+ * that row the triangle's diagonal stripe lands. The (sj − si) term comes
+ * from solving the two stripe equations simultaneously.
+ *
+ * This is the §4 formula for THIS grid family — every triangular file in
+ * the series shares this shape, only the inverse classifier in
+ * ctx_draw_bg() changes.
+ */
+static void ctx_to_screen(const GridCtx *g, int si, int sj, int *sr, int *sc)
+{
+    double h    = g->tri_size * sqrt(3.0) * 0.5;
+    double py_c = ((double)si + 0.5) * h;
+    double px_c = (double)(sj - si) * g->tri_size * 0.5;
+    *sr = g->oy + (int)(py_c / g->cell_h);
+    *sc = g->ox + (int)(px_c / g->cell_w);
+}
+
+/*
+ * edge_frac — distance [0, 0.5] to the nearest integer in v.
  *
  * THE FORMULA:
  *   t = fmod(v, 1.0)       → fractional part in [0,1)
@@ -271,14 +369,15 @@ static void color_init(int theme) {
  * This measures the "closeness to a stripe boundary" in normalized units.
  * Comparing this to border_w gives the border/interior classification.
  */
-static double edge_frac(double v) {
+static double edge_frac(double v)
+{
     double t = fmod(v, 1.0);
     if (t < 0.0) t += 1.0;
     return t < 0.5 ? t : 1.0 - t;
 }
 
 /*
- * grid_draw — three-family stripe rasterizer with cursor triangle highlight.
+ * ctx_draw_bg — paint the triangular grid background and cursor highlight.
  *
  * THE PIPELINE (per screen cell):
  *
@@ -294,7 +393,7 @@ static double edge_frac(double v) {
  *      │
  *      ▼  Stripe indices for cursor detection
  *   cell_si = floor(n1),  cell_sj = floor(n2)
- *   on_cur  = (cell_si == si && cell_sj == sj)
+ *   on_cur  = (cell_si == cur.si && cell_sj == cur.sj)
  *      │
  *      ▼  Edge fractions — distance to nearest line in each family
  *   d1 = edge_frac(n1)   character '-'
@@ -311,16 +410,19 @@ static double edge_frac(double v) {
  *   Family 2 (n2, −60° lines)       → '/'
  *   Family 3 (n3, +60° lines)       → '\'
  * The character direction matches the actual line slope in screen space.
+ *
+ * Cursor (si, sj) is read from the Cursor passed in — the GridCtx itself
+ * does not store cursor state.
  */
-static void grid_draw(int rows, int cols, double tri_size, double border_w,
-                       int si, int sj, int ox, int oy) {
-    double h   = tri_size * sqrt(3.0) * 0.5;
+static void ctx_draw_bg(const GridCtx *g, int cur_si, int cur_sj)
+{
+    double h   = g->tri_size * sqrt(3.0) * 0.5;
     double sq3 = sqrt(3.0);
 
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double px = (double)(col - ox) * CELL_W;
-            double py = (double)(row - oy) * CELL_H;
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
 
             double n1 = py / h;
             double n2 = (sq3 * px + py) / h;
@@ -329,7 +431,7 @@ static void grid_draw(int rows, int cols, double tri_size, double border_w,
             /* Stripe indices identify which triangle this cell is in */
             int cell_si = (int)floor(n1);
             int cell_sj = (int)floor(n2);
-            int on_cur  = (cell_si == si && cell_sj == sj);
+            int on_cur  = (cell_si == cur_si && cell_sj == cur_sj);
 
             double d1 = edge_frac(n1);
             double d2 = edge_frac(n2);
@@ -340,7 +442,7 @@ static void grid_draw(int rows, int cols, double tri_size, double border_w,
             if (d2 < dmin) { dmin = d2; ch = '/';  }
             if (d3 < dmin) { dmin = d3; ch = '\\'; }
 
-            if (dmin < border_w) {
+            if (dmin < g->border_w) {
                 int attr = on_cur ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
                                   : (COLOR_PAIR(PAIR_BORDER) | A_BOLD);
                 attron(attr);
@@ -356,7 +458,18 @@ static void grid_draw(int rows, int cols, double tri_size, double border_w,
     }
 }
 
-/* ── §5b cursor ───────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Cursor — just (si, sj) in stripe-index space.
+ *
+ * Bounds live in GridCtx (max_si, max_sj), not here — the cursor doesn't
+ * know how big the grid is, just where in it the user is pointing. The two
+ * structs compose: Cursor + GridCtx → screen position via ctx_to_screen().
+ */
+typedef struct { int si, sj; } Cursor;
 
 /*
  * TRI_DIR — 4-direction movement in (si, sj) stripe-index space.
@@ -390,130 +503,185 @@ static const int TRI_DIR[4][2] = {
     { 0, +1 },   /* RIGHT — sj increases */
 };
 
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    (void)g;
+    cur->si = 0;
+    cur->sj = 0;
+}
+
 /*
- * cursor_draw — place '@' at the center cell of triangle (si, sj).
+ * cursor_move — apply (dsi, dsj) and clamp to GridCtx bounds.
  *
- * THE FORMULA (triangle center from stripe indices):
- *   h    = tri_size × √3 / 2
- *   py_c = (si + 0.5) × h
- *   px_c = (sj − si) × tri_size / 2
- *
- *   col = ox + (int)(px_c / CELL_W)
- *   row = oy + (int)(py_c / CELL_H)
- *
- * Derivation: the center of triangle (si,sj) is where n1=si+0.5 and
- * n2=sj+0.5. Solving both equations simultaneously gives the formulas above.
- * See §4 for the full derivation.
+ * Arrow-key dispatch reads TRI_DIR[k] and forwards (dsi, dsj) here.
+ * Bounds are loose (±max_si/max_sj around 0) — the cursor can move
+ * anywhere reachable on screen.
  */
-static void cursor_draw(double tri_size, int si, int sj,
-                         int ox, int oy, int rows, int cols) {
-    double h     = tri_size * sqrt(3.0) * 0.5;
-    double py_c  = (si + 0.5) * h;
-    double px_c  = (double)(sj - si) * tri_size * 0.5;
-    int col = ox + (int)(px_c / CELL_W);
-    int row = oy + (int)(py_c / CELL_H);
-    if (col >= 0 && col < cols && row >= 0 && row < rows - 1) {
+static void cursor_move(Cursor *cur, const GridCtx *g, int dsi, int dsj)
+{
+    int nsi = cur->si + dsi;
+    int nsj = cur->sj + dsj;
+    if (nsi >= -g->max_si && nsi <= g->max_si) cur->si = nsi;
+    if (nsj >= -g->max_sj && nsj <= g->max_sj) cur->sj = nsj;
+}
+
+/*
+ * cursor_draw — place '@' at the centre cell of triangle (si, sj).
+ *
+ * Delegates the screen-position math to ctx_to_screen(); only checks
+ * bounds and emits the bold '@'. Same shape as cursor_draw across every
+ * grid file in the series.
+ */
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc;
+    ctx_to_screen(g, cur->si, cur->sj, &sr, &sc);
+    if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-        mvaddch(row, col, '@');
+        mvaddch(sr, sc, '@');
         attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     }
 }
 
-/* ── §6 scene ─────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
-typedef struct {
-    double tri_size, border_w;
-    int    si, sj;    /* cursor triangle — stripe indices (si=row, sj=diagonal) */
-    int    theme, paused;
-} Scene;
-
-static void scene_init(Scene *s) {
-    s->tri_size = TRI_SIZE_DEFAULT;
-    s->border_w = BORDER_W_DEFAULT;
-    s->si = 0; s->sj = 0;
-    s->theme = 0; s->paused = 0;
-}
-static void scene_draw(const Scene *s, int rows, int cols) {
-    int ox = cols / 2;
-    int oy = (rows - 1) / 2;
-    grid_draw(rows, cols, s->tri_size, s->border_w, s->si, s->sj, ox, oy);
-    cursor_draw(s->tri_size, s->si, s->sj, ox, oy, rows, cols);
-}
-
-/* ── §7 screen ────────────────────────────────────────────────────────── */
-
-static void screen_init(void) {
-    initscr(); cbreak(); noecho();
-    keypad(stdscr, TRUE); curs_set(0);
-    nodelay(stdscr, TRUE); typeahead(-1);
-}
-static void screen_draw_hud(const Scene *s, int rows, int cols, double fps) {
+/* Bright bold yellow status (top-right) + bold cyan key hints (bottom). */
+static void hud_draw(const GridCtx *g, const Cursor *cur,
+                     int theme, int paused, double fps)
+{
     char buf[96];
     snprintf(buf, sizeof buf,
              " stripe si:%+d sj:%+d  size:%.0f  border:%.2f  theme:%d  %5.1f fps  %s ",
-             s->si, s->sj, s->tri_size, s->border_w, s->theme, fps,
-             s->paused ? "PAUSED " : "running");
+             cur->si, cur->sj, g->tri_size, g->border_w, theme, fps,
+             paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " q:quit  p:pause  t:theme  r:reset  arrows:move  +/-:size  [/]:border ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
-}
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
-static void cleanup(void) { endwin(); }
-
-/* ── §8 app ───────────────────────────────────────────────────────────── */
-
-static volatile sig_atomic_t running = 1, need_resize = 0;
-static void sig_handler(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) running = 0;
-    if (sig == SIGWINCH) need_resize = 1;
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-int main(void) {
-    atexit(cleanup);
-    signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler);
-    signal(SIGWINCH, sig_handler);
+static void scene_draw(const GridCtx *g, const Cursor *cur,
+                       int theme, int paused, double fps)
+{
+    erase();
+    ctx_draw_bg(g, cur->si, cur->sj);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, theme, paused, fps);
+    wnoutrefresh(stdscr);
+    doupdate();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §7  screen                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void screen_cleanup(void) { endwin(); }
+
+static void screen_init(void)
+{
+    initscr(); cbreak(); noecho();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    curs_set(0);
+    typeahead(-1);
+    atexit(screen_cleanup);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §8  app                                                                 */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static volatile sig_atomic_t g_running     = 1;
+static volatile sig_atomic_t g_need_resize = 0;
+
+static void on_signal(int s)
+{
+    if (s == SIGINT || s == SIGTERM) g_running     = 0;
+    if (s == SIGWINCH)               g_need_resize = 1;
+}
+
+int main(void)
+{
+    signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
+    signal(SIGWINCH, on_signal);
+
     screen_init();
-    int rows, cols; getmaxyx(stdscr, rows, cols);
-    Scene sc; scene_init(&sc); color_init(sc.theme);
-    int64_t prev = clock_ns(); double fps = 60.0;
 
-    while (running) {
-        if (need_resize) {
-            need_resize = 0; endwin(); refresh();
-            getmaxyx(stdscr, rows, cols);
+    double tri_size = TRI_SIZE_DEFAULT;
+    double border_w = BORDER_W_DEFAULT;
+    int    theme    = 0;
+    int    paused   = 0;
+
+    GridCtx g;     ctx_init(&g, LINES, COLS, tri_size, border_w);
+    Cursor  cur;   cursor_reset(&cur, &g);
+    color_init(theme);
+
+    double  fps = 60.0;
+    int64_t prev = clock_ns();
+
+    while (g_running) {
+        if (g_need_resize) {
+            g_need_resize = 0;
+            endwin(); refresh();
+            ctx_init(&g, LINES, COLS, tri_size, border_w);
+            cursor_reset(&cur, &g);
         }
+
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
-            case 'q': case 27: running = 0; break;
-            case 'p': sc.paused ^= 1; break;
-            case 'r': sc.si = 0; sc.sj = 0; break;
-            case 't': sc.theme = (sc.theme + 1) % N_THEMES; color_init(sc.theme); break;
+            case 'q': case 27: g_running = 0; break;
+            case 'p': paused ^= 1; break;
+            case 'r': cursor_reset(&cur, &g); break;
+            case 't':
+                theme = (theme + 1) % N_THEMES;
+                color_init(theme);
+                break;
             /* Arrow keys apply TRI_DIR deltas to stripe cursor */
-            case KEY_UP:    sc.si += TRI_DIR[0][0]; sc.sj += TRI_DIR[0][1]; break;
-            case KEY_DOWN:  sc.si += TRI_DIR[1][0]; sc.sj += TRI_DIR[1][1]; break;
-            case KEY_LEFT:  sc.si += TRI_DIR[2][0]; sc.sj += TRI_DIR[2][1]; break;
-            case KEY_RIGHT: sc.si += TRI_DIR[3][0]; sc.sj += TRI_DIR[3][1]; break;
+            case KEY_UP:    cursor_move(&cur, &g, TRI_DIR[0][0], TRI_DIR[0][1]); break;
+            case KEY_DOWN:  cursor_move(&cur, &g, TRI_DIR[1][0], TRI_DIR[1][1]); break;
+            case KEY_LEFT:  cursor_move(&cur, &g, TRI_DIR[2][0], TRI_DIR[2][1]); break;
+            case KEY_RIGHT: cursor_move(&cur, &g, TRI_DIR[3][0], TRI_DIR[3][1]); break;
             case '+': case '=':
-                if (sc.tri_size < TRI_SIZE_MAX) { sc.tri_size += TRI_SIZE_STEP; } break;
+                if (tri_size < TRI_SIZE_MAX) {
+                    tri_size += TRI_SIZE_STEP;
+                    ctx_init(&g, LINES, COLS, tri_size, border_w);
+                }
+                break;
             case '-':
-                if (sc.tri_size > TRI_SIZE_MIN) { sc.tri_size -= TRI_SIZE_STEP; } break;
+                if (tri_size > TRI_SIZE_MIN) {
+                    tri_size -= TRI_SIZE_STEP;
+                    ctx_init(&g, LINES, COLS, tri_size, border_w);
+                }
+                break;
             case '[':
-                if (sc.border_w > BORDER_W_MIN) { sc.border_w -= BORDER_W_STEP; } break;
+                if (border_w > BORDER_W_MIN) {
+                    border_w -= BORDER_W_STEP;
+                    g.border_w = border_w;
+                }
+                break;
             case ']':
-                if (sc.border_w < BORDER_W_MAX) { sc.border_w += BORDER_W_STEP; } break;
+                if (border_w < BORDER_W_MAX) {
+                    border_w += BORDER_W_STEP;
+                    g.border_w = border_w;
+                }
+                break;
             }
         }
+
         int64_t now = clock_ns(), dt = now - prev; prev = now;
-        if (dt > 0) fps = fps * 0.9 + 1e9 / (double)dt * 0.1;
-        erase();
-        scene_draw(&sc, rows, cols);
-        screen_draw_hud(&sc, rows, cols, fps);
-        screen_present();
+        if (dt > 0) {
+            fps = fps * (1.0 - FPS_EWMA_ALPHA)
+                + (1e9 / (double)dt) * FPS_EWMA_ALPHA;
+        }
+
+        scene_draw(&g, &cur, theme, paused, fps);
         clock_sleep_ns(TICK_NS - (clock_ns() - now));
     }
     return 0;

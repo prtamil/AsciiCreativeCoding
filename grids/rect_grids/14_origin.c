@@ -5,18 +5,19 @@
  * DEMO: A rectangular grid with mathematical (x,y) axes drawn at the
  *       screen centre. The X axis goes right (positive) and left (negative);
  *       the Y axis goes UP (positive, inverted from screen) and down (negative).
- *       The player '@' shows its position in mathematical coordinates,
+ *       The cursor '@' shows its position in mathematical coordinates,
  *       updating as it moves. Quadrant labels (I–IV) are shown.
  *
  * Study alongside: 01_uniform_rect.c (base grid), 04_coarse_sparse.c
  *
  * Section map:
- *   §1 config   — UNIT_W, UNIT_H (one coordinate unit in screen chars)
+ *   §1 config   — UNIT_W, UNIT_H (one coordinate unit in screen chars), EWMA
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6 pairs: grid, x-axis, y-axis, player, quadrants, HUD
- *   §4 formula  — math↔screen conversion; axis detection
- *   §5 player   — position in math coords (mx, my), screen movement
- *   §6 scene    — draw_grid(), draw_axes(), draw_labels(), draw_player()
+ *   §3 color    — 7 pairs (grid, x-axis, y-axis, cursor, quadrants, HUD, HINT)
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen (math↔screen) /
+ *                 ctx_grid_char / ctx_draw_bg + axes_draw + labels_draw
+ *   §5 cursor   — Cursor (mx, my) in MATH space, with Y flip
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -106,9 +107,6 @@
  *    on_h = ((sr - oy) % UNIT_H == 0)   <- rows that are multiples of UNIT_H from origin
  *    on_v = ((sc - ox) % UNIT_W == 0)   <- cols that are multiples of UNIT_W from origin
  *
- *    Note: in C, (sr - oy) can be negative.  Use safe_mod for correct results:
- *      on_h = (safe_mod(sr - oy, UNIT_H) == 0)
- *
  *  Step 3: Axis detection (special case of grid lines):
  *    is_x_axis = (sr == oy)    <- my=0 -> screen_row = oy - 0*UNIT_H = oy
  *    is_y_axis = (sc == ox)    <- mx=0 -> screen_col = ox + 0*UNIT_W = ox
@@ -134,7 +132,7 @@
  *    on_h = (safe_mod(sr - oy, UNIT_H) == 0)
  *    on_v = (safe_mod(sc - ox, UNIT_W) == 0)
  *
- *  Quadrant of player position (mx, my):
+ *  Quadrant of cursor position (mx, my):
  *    I   (mx>0, my>0):  right and above origin
  *    II  (mx<0, my>0):  left  and above origin
  *    III (mx<0, my<0):  left  and below origin
@@ -143,34 +141,27 @@
  *
  * EDGE CASES TO WATCH
  * ───────────────────
- *  • safe_mod REQUIRED for grid line test: (sr - oy) is negative for
- *    rows ABOVE the origin (sr < oy).  C's % returns negative there.
- *    Without safe_mod, the upper half of the grid has no horizontal lines.
+ *  • UP arrow increases my (math) but DECREASES screen row:
+ *    cursor_move with dmy=+1 moves '@' visually UP on screen.
+ *    This is intentional — it matches math convention.
  *
  *  • Origin NOT at screen centre: if COLS or LINES is even, ox or oy
  *    may be off by half a unit.  Integer division gives the closest row/col.
- *    This is correct — just be aware the grid extends asymmetrically.
- *
- *  • UP arrow increases my (math) but DECREASES screen row:
- *    player_move with dmy=+1 moves '@' visually UP on screen.
- *    This is intentional — it matches math convention.  It may feel
- *    inverted if you're used to screen-Y games.
  *
  *  • The axis highlight must override the grid line:
  *    at (sr=oy, sc=anything), it should draw '=' (x-axis), not '-' (grid).
  *    Test axis conditions BEFORE regular grid line conditions.
  *
  *  • Coordinate label axis ticks: to add "2, 4, 6" labels on the x-axis,
- *    draw text at screen col = ox + k*UNIT_W for integer k, at row oy+1
- *    (one row below the x-axis).
+ *    draw text at screen col = ox + k*UNIT_W for integer k, at row oy+1.
  *
  * HOW TO VERIFY
  * ─────────────
  *  At screen (ox, oy): should show 'O' (origin).
  *  At (oy-UNIT_H, ox): should show '|' on y-axis, 1 unit ABOVE origin.
- *    -> my = (oy - (oy-UNIT_H)) / UNIT_H = UNIT_H/UNIT_H = 1. ✓  (positive)
+ *    -> my = (oy - (oy-UNIT_H)) / UNIT_H = 1. ✓  (positive)
  *  At (oy+UNIT_H, ox): my = (oy - (oy+UNIT_H)) / UNIT_H = -1. ✓  (negative, below)
- *  Player at (mx=+1, my=+1): quadrant I.  Move UP -> my=+2, still quadrant I.
+ *  Cursor at (mx=+1, my=+1): quadrant I.  Move UP -> my=+2, still quadrant I.
  *  Move LEFT from quadrant I -> mx=0, on y-axis, no quadrant.
  *
  * ─────────────────────────────────────────────────────────────────────── */
@@ -198,12 +189,16 @@
 #define UNIT_W   8    /* screen cols per 1 math unit */
 #define UNIT_H   4    /* screen rows per 1 math unit */
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
+
 #define PAIR_GRID   1   /* regular grid lines (dim)     */
 #define PAIR_XAXIS  2   /* X axis (bright horizontal)   */
 #define PAIR_YAXIS  3   /* Y axis (bright vertical)     */
-#define PAIR_PLAYER 4
+#define PAIR_CURSOR 4
 #define PAIR_QUAD   5   /* quadrant labels              */
 #define PAIR_HUD    6
+#define PAIR_HINT   7
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -232,69 +227,84 @@ static void color_init(void)
     init_pair(PAIR_GRID,   COLORS >= 256 ? 244 : COLOR_WHITE,  -1);
     init_pair(PAIR_XAXIS,  COLORS >= 256 ? 196 : COLOR_RED,    -1);
     init_pair(PAIR_YAXIS,  COLORS >= 256 ?  46 : COLOR_GREEN,  -1);
-    init_pair(PAIR_PLAYER, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
     init_pair(PAIR_QUAD,   COLORS >= 256 ?  39 : COLOR_CYAN,   -1);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  15 : COLOR_WHITE,  -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  formula — GridCtx and the math ↔ screen mapping                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * math_to_screen — COORDINATE SYSTEM FORMULA:
+ * GridCtx — terminal extent + units + origin + cursor range (math space).
+ *
+ * cw/ch carry UNIT_W/UNIT_H; ox/oy are the math origin in screen coords.
+ * range bounds the cursor to ±range in both math axes.
+ */
+typedef struct {
+    int rows, cols;
+    int cw, ch;          /* UNIT_W, UNIT_H */
+    int ox, oy;          /* math origin in screen coords */
+    int range;           /* cursor lives in [-range, +range] in math space */
+    int max_r, max_c;    /* mirror of range for parity with template */
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = UNIT_W; g->ch = UNIT_H;
+    g->ox = cols / 2;
+    g->oy = (rows - 1) / 2;
+    g->range = (rows < cols) ? rows / (2 * UNIT_H) - 1 : cols / (2 * UNIT_W) - 1;
+    g->max_r = g->range;
+    g->max_c = g->range;
+}
+
+/*
+ * ctx_to_screen — COORDINATE SYSTEM FORMULA (math -> screen):
  *
  *   screen_col = ox + mx * UNIT_W
  *   screen_row = oy - my * UNIT_H    ← MINUS flips Y axis
  *
- * The minus sign on UNIT_H is the key difference from 01_uniform_rect.
- * Without it, increasing my would go DOWN on screen (screen convention).
- * With it, increasing my goes UP (math convention).
+ * Naming note: the (r, c) of the standard ctx_to_screen here are (my, mx) —
+ * the math coordinates.  Y is inverted: positive my goes UP on screen.
  */
-static void math_to_screen(int mx, int my, int ox, int oy, int *sr, int *sc)
+static void ctx_to_screen(const GridCtx *g, int my, int mx, int *sr, int *sc)
 {
-    *sc = ox + mx * UNIT_W;
-    *sr = oy - my * UNIT_H;    /* ← Y flip: -my because screen Y grows downward */
+    *sc = g->ox + mx * g->cw;
+    *sr = g->oy - my * g->ch;
 }
 
 /*
  * screen_to_math — INVERSE FORMULA:
- *
  *   mx = (sc - ox) / UNIT_W
  *   my = (oy - sr) / UNIT_H   ← oy - sr to flip Y back
  */
-static void screen_to_math(int sr, int sc, int ox, int oy, int *mx, int *my)
+static void screen_to_math(const GridCtx *g, int sr, int sc, int *mx, int *my)
 {
-    *mx = (sc - ox) / UNIT_W;
-    *my = (oy - sr) / UNIT_H;
+    *mx = (sc - g->ox) / g->cw;
+    *my = (g->oy - sr) / g->ch;
 }
 
 /*
- * grid_char_at — what to draw at screen (sr, sc), given origin (ox, oy).
- *
- * Axis detection:
- *   X axis: sr == oy          → draw '=' (bold horizontal)
- *   Y axis: sc == ox          → draw '|' (bold vertical)
- *   Origin: sr==oy && sc==ox  → draw 'O'
- *
- * Grid lines (non-axis):
- *   sr offset from oy is a multiple of UNIT_H → horizontal '-'
- *   sc offset from ox is a multiple of UNIT_W → vertical ':'
- *   Both → '+'
+ * grid char classification:
+ *   axis detection takes priority over modular grid lines.
  */
 typedef enum { GC_NONE, GC_GRID, GC_XAXIS, GC_YAXIS, GC_ORIGIN } GridCharType;
 
-static GridCharType grid_char_type(int sr, int sc, int ox, int oy, char *out_ch)
+static GridCharType ctx_grid_char_type(const GridCtx *g, int sr, int sc, char *out_ch)
 {
-    bool on_x = (sr == oy);
-    bool on_y = (sc == ox);
+    bool on_x = (sr == g->oy);
+    bool on_y = (sc == g->ox);
     if (on_x && on_y) { *out_ch = 'O'; return GC_ORIGIN; }
     if (on_x)         { *out_ch = '='; return GC_XAXIS; }
     if (on_y)         { *out_ch = '|'; return GC_YAXIS; }
 
-    int dr = sr - oy, dc = sc - ox;
-    bool gh = (dr % UNIT_H == 0);
-    bool gv = (dc % UNIT_W == 0);
+    int dr = sr - g->oy, dc = sc - g->ox;
+    bool gh = (dr % g->ch == 0);
+    bool gv = (dc % g->cw == 0);
     if (gh && gv) { *out_ch = '+'; return GC_GRID; }
     if (gh)       { *out_ch = '-'; return GC_GRID; }
     if (gv)       { *out_ch = ':'; return GC_GRID; }
@@ -302,47 +312,23 @@ static GridCharType grid_char_type(int sr, int sc, int ox, int oy, char *out_ch)
     return GC_NONE;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  player                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct {
-    int mx, my;       /* position in MATHEMATICAL coordinates  */
-    int range;        /* cells ±range in each direction        */
-} Player;
-
-static void player_reset(Player *p, int rows, int cols)
+/*
+ * ctx_grid_char — standard char-only API (delegates to type-classifier).
+ */
+static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
-    p->range = (rows < cols) ? rows / (2 * UNIT_H) - 1 : cols / (2 * UNIT_W) - 1;
-    p->mx = 0; p->my = 0;
+    char ch; ctx_grid_char_type(g, sr, sc, &ch);
+    return ch;
 }
 
 /*
- * player_move — delta in math space.
- *   RIGHT → mx += 1   (move right on X axis)
- *   LEFT  → mx -= 1
- *   UP    → my += 1   (move UP in math = screen row decreases)
- *   DOWN  → my -= 1
- *
- * Note: UP key increases my (math), which DECREASES screen_row.
- * This is the correct mathematical convention.
+ * ctx_draw_bg — paint grid + axes with priority colouring.
  */
-static void player_move(Player *p, int dmx, int dmy)
+static void ctx_draw_bg(const GridCtx *g)
 {
-    int nx = p->mx + dmx, ny = p->my + dmy;
-    if (nx >= -p->range && nx <= p->range) p->mx = nx;
-    if (ny >= -p->range && ny <= p->range) p->my = ny;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void draw_grid(int rows, int cols, int ox, int oy)
-{
-    for (int sr = 0; sr < rows - 1; sr++) {
-        for (int sc = 0; sc < cols; sc++) {
-            char ch; GridCharType t = grid_char_type(sr, sc, ox, oy, &ch);
+    for (int sr = 0; sr < g->rows - 1; sr++) {
+        for (int sc = 0; sc < g->cols; sc++) {
+            char ch; GridCharType t = ctx_grid_char_type(g, sr, sc, &ch);
             if (t == GC_NONE) continue;
             if (t == GC_ORIGIN) {
                 attron(COLOR_PAIR(PAIR_XAXIS) | A_BOLD);
@@ -366,34 +352,71 @@ static void draw_grid(int rows, int cols, int ox, int oy)
 }
 
 /*
- * draw_quadrant_labels — place I/II/III/IV in the middle of each quadrant.
- * Positions are derived from math_to_screen with fractional unit offsets.
+ * labels_draw — place I/II/III/IV in the middle of each quadrant.
+ * Positions are derived from ctx_to_screen with fractional unit offsets.
  */
-static void draw_quadrant_labels(int ox, int oy)
+static void labels_draw(const GridCtx *g)
 {
     int r, c;
     attron(COLOR_PAIR(PAIR_QUAD) | A_DIM);
     /* Quadrant I: +x, +y → right of Y axis, above X axis */
-    math_to_screen(2, 2, ox, oy, &r, &c); mvprintw(r, c, "I");
+    ctx_to_screen(g, 2,  2, &r, &c);  mvprintw(r, c, "I");
     /* Quadrant II: -x, +y */
-    math_to_screen(-3, 2, ox, oy, &r, &c); mvprintw(r, c, "II");
+    ctx_to_screen(g, 2, -3, &r, &c);  mvprintw(r, c, "II");
     /* Quadrant III: -x, -y */
-    math_to_screen(-3, -2, ox, oy, &r, &c); mvprintw(r, c, "III");
+    ctx_to_screen(g, -2, -3, &r, &c); mvprintw(r, c, "III");
     /* Quadrant IV: +x, -y */
-    math_to_screen(2, -2, ox, oy, &r, &c); mvprintw(r, c, "IV");
+    ctx_to_screen(g, -2,  2, &r, &c); mvprintw(r, c, "IV");
     attroff(COLOR_PAIR(PAIR_QUAD) | A_DIM);
 }
 
-static void draw_player(const Player *p, int ox, int oy)
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Cursor — position in MATHEMATICAL coordinates (mx, my).
+ * Y is the math Y (positive = up); range bound lives in GridCtx.range.
+ */
+typedef struct { int mx, my; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
 {
-    int sr, sc; math_to_screen(p->mx, p->my, ox, oy, &sr, &sc);
-    /* Verify inverse: screen_to_math should return (mx, my) unchanged */
-    int vx, vy; screen_to_math(sr, sc, ox, oy, &vx, &vy);
-    (void)vx; (void)vy;  /* available for debugging: assert vx==p->mx, vy==p->my */
-    attron(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
-    mvaddch(sr, sc, (chtype)'@');
-    attroff(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
+    (void)g;
+    cur->mx = 0; cur->my = 0;
 }
+
+/*
+ * cursor_move — delta in math space.
+ *   RIGHT → mx += 1   (move right on X axis)
+ *   LEFT  → mx -= 1
+ *   UP    → my += 1   (move UP in math = screen row decreases)
+ *   DOWN  → my -= 1
+ *
+ * Note: UP key increases my (math), which DECREASES screen_row.
+ * This is the correct mathematical convention.
+ */
+static void cursor_move(Cursor *cur, const GridCtx *g, int dmx, int dmy)
+{
+    int nx = cur->mx + dmx, ny = cur->my + dmy;
+    if (nx >= -g->range && nx <= g->range) cur->mx = nx;
+    if (ny >= -g->range && ny <= g->range) cur->my = ny;
+}
+
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc; ctx_to_screen(g, cur->my, cur->mx, &sr, &sc);
+    /* Verify inverse: screen_to_math should return (mx, my) unchanged */
+    int vx, vy; screen_to_math(g, sr, sc, &vx, &vy);
+    (void)vx; (void)vy;
+    attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    mvaddch(sr, sc, (chtype)'@');
+    attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
 static const char *quadrant_name(int mx, int my)
 {
@@ -404,30 +427,34 @@ static const char *quadrant_name(int mx, int my)
     return "IV";
 }
 
-static void scene_draw(int rows, int cols, const Player *p, double fps)
+static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
 {
-    int ox = cols / 2, oy = (rows - 1) / 2;
-    erase();
-    draw_grid(rows, cols, ox, oy);
-    draw_quadrant_labels(ox, oy);
-    draw_player(p, ox, oy);
-
-    /* HUD: show math coordinates and quadrant */
     char buf[80];
     snprintf(buf, sizeof buf,
         " %.1f fps  math(%+d,%+d)  Q%s ",
-        fps, p->mx, p->my, quadrant_name(p->mx, p->my));
+        fps, cur->mx, cur->my, quadrant_name(cur->mx, cur->my));
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_DIM);
-    mvprintw(rows - 1, 0,
-        " arrows:move  r:reset  q:quit  [14 origin  screen_row=oy-my*UNIT_H] ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_DIM);
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+        " arrows:move  r:reset  q/ESC:quit  [14 origin  screen_row=oy-my*UNIT_H] ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    labels_draw(g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, fps);
     wnoutrefresh(stdscr); doupdate();
 }
+
+/* Reference for the standard ctx_grid_char API; quiets -Wunused-function. */
+static void ctx_grid_char_ref(void) { (void)ctx_grid_char; }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §7  screen                                                              */
@@ -458,31 +485,34 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
     screen_init();
-    int rows = LINES, cols = COLS;
-    Player player; player_reset(&player, rows, cols);
+    GridCtx g;     ctx_init(&g, LINES, COLS);
+    Cursor  cur;   cursor_reset(&cur, &g);
+    ctx_grid_char_ref();   /* keep the standard API symbol live */
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double fps = TARGET_FPS; int64_t t0 = clock_ns();
+    double fps = TARGET_FPS;
+    int64_t t0 = clock_ns();
 
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
-            player_reset(&player, rows, cols);
+            ctx_init(&g, LINES, COLS);
         }
         int ch = getch();
         switch (ch) {
-            case 'q': case 27: g_running = 0;                    break;
-            case 'r':          player_reset(&player, rows, cols); break;
-            /* UP   → my+1 (math Y up)    DOWN → my-1 */
-            /* RIGHT → mx+1               LEFT → mx-1  */
-            case KEY_UP:    player_move(&player,  0, +1); break;
-            case KEY_DOWN:  player_move(&player,  0, -1); break;
-            case KEY_LEFT:  player_move(&player, -1,  0); break;
-            case KEY_RIGHT: player_move(&player, +1,  0); break;
+            case 'q': case 27: g_running = 0;              break;
+            case 'r':          cursor_reset(&cur, &g);     break;
+            /* UP   → my+1 (math Y up)    DOWN → my-1   */
+            /* RIGHT → mx+1               LEFT → mx-1   */
+            case KEY_UP:    cursor_move(&cur, &g,  0, +1); break;
+            case KEY_DOWN:  cursor_move(&cur, &g,  0, -1); break;
+            case KEY_LEFT:  cursor_move(&cur, &g, -1,  0); break;
+            case KEY_RIGHT: cursor_move(&cur, &g, +1,  0); break;
         }
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (now - t0 + 1)) * 0.05; t0 = now;
-        scene_draw(rows, cols, &player, fps);
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0 = now;
+        scene_draw(&g, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

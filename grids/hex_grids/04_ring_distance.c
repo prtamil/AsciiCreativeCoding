@@ -5,23 +5,24 @@
  *       Ring 0 = cursor (white); ring 1 = 6 neighbours (cyan); etc.
  *       Move the cursor with arrow keys and watch the color rings follow.
  *
- * Study alongside: grids/hex_grids/01_flat_top.c (same §5b cursor section)
+ * Study alongside: grids/hex_grids/01_flat_top.c (same Cursor + HEX_DIR)
  *
  * Section map:
- *   §1 config   — tunable constants
+ *   §1 config   — tunable constants, ring palette size, EWMA alpha
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — ring color pairs
- *   §4 formula  — pixel↔cell, centering offset
- *   §5 draw     — ring-colored grid rasterizer
- *   §5b cursor  — movement vectors, cursor_draw
- *   §6 scene    — state struct + scene_draw
+ *   §3 color    — ring color pairs + CURSOR + HUD + HINT
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_axial /
+ *                 ctx_draw_bg + cube_round + cube_dist + angle_char
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw, HEX_DIR
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses display layer
  *   §8 app      — signals, resize, main loop
  *
  * Keys:  q/ESC quit  p pause  r reset  arrows move  +/-:size  [/]:border
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra 04_ring_distance.c -o 04_ring_distance -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra grids/hex_grids/04_ring_distance.c \
+ *       -o 04_ring_distance -lncurses -lm
  */
 
 /* ── CONCEPTS ──────────────────────────────────────────────────────────── *
@@ -30,9 +31,10 @@
  *                  Counts minimum hex steps between two hexes.
  *                  Ring k has exactly 6k hexes (k>0); ring 0 = 1 hex.
  *
- * Data-structure : No grid array — every pixel recomputes its ring distance
- *                  from the cursor each frame. Moving the cursor is O(1);
- *                  the entire ring recolor is implicit in the next frame.
+ * Data-structure : Same GridCtx + Cursor as 01_flat_top — no grid array,
+ *                  every pixel recomputes its ring distance from the cursor
+ *                  each frame. Moving the cursor is O(1); the entire ring
+ *                  recolor is implicit in the next frame.
  *
  * Cursor movement : HEX_DIR[4][2] same as 01. Cursor moves in O(1); the
  *                  entire grid recolors instantly since distance is recomputed
@@ -80,10 +82,10 @@
  *
  * DRAWING METHOD  (extends 01_flat_top with interior fill + ring color)
  * ──────────────────────────────────────────────────────────────────────
- *  Same pipeline as 01_flat_top up through cube_round and dist computation.
+ *  Same per-pixel pipeline as 01_flat_top up through cube_round and dist.
  *
  *  Then:
- *  1. Compute ring = hex_ring_dist(Q, R, cQ, cR) using the current cursor.
+ *  1. Compute ring = cube_dist(Q, R, cur->q, cur->r) using the cursor.
  *  2. Select color pair:
  *       ring == 0 → PAIR_CURSOR (white-on-blue)
  *       ring  > 0 → PAIR_RING + (ring % N_RING_COLORS)  (cycles)
@@ -145,7 +147,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── §1 config ────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §1  config                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
 #define CELL_W             2
 #define CELL_H             4
@@ -164,50 +168,125 @@
 
 #define TICK_NS           16666667LL
 
-/* ── §2 clock ─────────────────────────────────────────────────────────── */
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA     0.05
 
-static int64_t clock_ns(void) {
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §2  clock                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static int64_t clock_ns(void)
+{
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
-static void clock_sleep_ns(int64_t ns) {
+
+static void clock_sleep_ns(int64_t ns)
+{
     if (ns <= 0) return;
     struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
     nanosleep(&ts, NULL);
 }
 
-/* ── §3 color ─────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §3  color                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
 #define PAIR_RING    1   /* 1..N_RING_COLORS for rings 0..N-1, then wrap */
 #define PAIR_CURSOR  7   /* cursor hex overlay */
-#define PAIR_HUD     8
-#define PAIR_HINT    9
+#define PAIR_HUD     8   /* yellow status bar */
+#define PAIR_HINT    9   /* cyan key-hint footer */
 
 static const short RING_FG[N_RING_COLORS] = {
     COLOR_WHITE, COLOR_CYAN, COLOR_GREEN,
     COLOR_YELLOW, COLOR_MAGENTA, COLOR_BLUE,
 };
-static void color_init(void) {
+
+static void color_init(void)
+{
     start_color();
     use_default_colors();
     for (int i = 0; i < N_RING_COLORS; i++)
         init_pair(PAIR_RING + i, RING_FG[i], COLOR_BLACK);
-    init_pair(PAIR_CURSOR, COLOR_WHITE,  COLOR_BLUE);
-    init_pair(PAIR_HUD,    COLOR_BLACK,  COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLOR_CYAN,   COLOR_BLACK);
+    init_pair(PAIR_CURSOR, COLOR_WHITE, COLOR_BLUE);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
-/* ── §4 formula ───────────────────────────────────────────────────────── */
-/*
- * px = (col - ox) × CELL_W,  py = (row - oy) × CELL_H.
- * Flat-top pixel↔cube as in 01_flat_top.
- */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §4  formula — GridCtx and the hex ↔ screen mapping (flat-top)           */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
-/* ── §5 draw ──────────────────────────────────────────────────────────── */
+/* GridCtx — geometry of the active flat-top hex grid (with ring coloring). */
+typedef struct {
+    /* terminal extent */
+    int rows, cols;
+
+    /* hex geometry */
+    double hex_size;
+    double border_w;
+    int    cell_w, cell_h;
+
+    /* screen origin = pixel (0,0) */
+    int    ox, oy;
+
+    /* cursor bounds in axial space (advisory) */
+    int    max_q, max_r;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows   = rows;
+    g->cols   = cols;
+    g->cell_w = CELL_W;
+    g->cell_h = CELL_H;
+    g->ox     = cols / 2;
+    g->oy     = (rows - 1) / 2;
+    if (g->hex_size <= 0.0) g->hex_size = HEX_SIZE_DEFAULT;
+    if (g->border_w <= 0.0) g->border_w = BORDER_W_DEFAULT;
+    g->max_q = (int)((double)cols * CELL_W / (3.0 * g->hex_size)) + 1;
+    g->max_r = (int)((double)rows * CELL_H / (sqrt(3.0) * g->hex_size)) + 1;
+}
+
+static void ctx_to_screen(const GridCtx *g, int Q, int R, int *sr, int *sc)
+{
+    double sq3   = sqrt(3.0);
+    double sq3_2 = sq3 * 0.5;
+    double cx_pix = g->hex_size * 1.5    * (double)Q;
+    double cy_pix = g->hex_size * (sq3_2 * (double)Q + sq3 * (double)R);
+    *sc = g->ox + (int)(cx_pix / g->cell_w);
+    *sr = g->oy + (int)(cy_pix / g->cell_h);
+}
+
+/* cube_round — see 01_flat_top for full documentation. */
+static void cube_round(double fq, double fr, double fs, int *Q, int *R)
+{
+    int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
+    double dq = fabs((double)rq - fq);
+    double dr = fabs((double)rr - fr);
+    double ds = fabs((double)rs - fs);
+    if      (dq > dr && dq > ds) rq = -rr - rs;
+    else if (dr > ds)             rr = -rq - rs;
+    *Q = rq; *R = rr;
+}
+
+__attribute__((unused))
+static void ctx_pixel_to_axial(const GridCtx *g, int sr, int sc, int *Q, int *R)
+{
+    double sq3_3 = sqrt(3.0) / 3.0;
+    double px = (double)(sc - g->ox) * g->cell_w;
+    double py = (double)(sr - g->oy) * g->cell_h;
+    double fq = (2.0/3.0 * px) / g->hex_size;
+    double fr = (-1.0/3.0 * px + sq3_3 * py) / g->hex_size;
+    double fs = -fq - fr;
+    cube_round(fq, fr, fs, Q, R);
+}
 
 /*
- * hex_ring_dist — cube distance between cursor (cQ,cR) and hex (Q,R).
+ * cube_dist — cube/ring distance between hex (Q,R) and hex (cQ,cR).
+ *
+ * Pure math helper — keeps its domain name.
  *
  * THE FORMULA:
  *   ΔQ = Q − cQ,  ΔR = R − cR,  ΔS = −ΔQ − ΔR   (S = −Q−R always)
@@ -225,34 +304,34 @@ static void color_init(void) {
  *   The maximum component gives the minimum number of steps because you
  *   can always move diagonally to reduce two components at once.
  */
-static int hex_ring_dist(int Q, int R, int cQ, int cR) {
+static int cube_dist(int Q, int R, int cQ, int cR)
+{
     int dQ = Q - cQ, dR = R - cR, dS = -dQ - dR;
     int a = abs(dQ), b = abs(dR), c = abs(dS);
     return a > b ? (a > c ? a : c) : (b > c ? b : c);
 }
 
-/*
- * angle_char — same as 01_flat_top. See that file for full documentation.
- */
-static char angle_char(double theta) {
+/* angle_char — same as 01_flat_top. */
+static char angle_char(double theta)
+{
     double t = fmod(theta, M_PI);
     if (t < 0.0) t += M_PI;
     if      (t < M_PI / 8.0)         return '-';
-    else if (t < 3.0 * M_PI / 8.0)  return '\\';
-    else if (t < 5.0 * M_PI / 8.0)  return '|';
-    else if (t < 7.0 * M_PI / 8.0)  return '/';
+    else if (t < 3.0 * M_PI / 8.0)   return '\\';
+    else if (t < 5.0 * M_PI / 8.0)   return '|';
+    else if (t < 7.0 * M_PI / 8.0)   return '/';
     else                              return '-';
 }
 
 /*
- * grid_draw — rasterize flat-top hex grid with ring-distance coloring.
+ * ctx_draw_bg — rasterize flat-top hex grid with ring-distance coloring.
  *
  * THE PIPELINE (extends 01_flat_top with interior fill and ring color):
  *
  *   pixel → cube → nearest hex (Q,R)  [same as 01_flat_top]
  *      │
  *      ▼  Compute ring distance from cursor
- *   ring = hex_ring_dist(Q, R, cQ, cR)
+ *   ring = cube_dist(Q, R, cQ, cR)
  *   pair = (ring==0) ? PAIR_CURSOR : PAIR_RING + (ring % N_RING_COLORS)
  *      │
  *      ├── dist < limit (interior):
@@ -268,17 +347,18 @@ static char angle_char(double theta) {
  *   with black gaps between them. Filling the interior makes each ring a solid
  *   colored region — the concentric-hexagon pattern becomes obvious.
  */
-static void grid_draw(int rows, int cols, double size, double border_w,
-                       int cQ, int cR, int ox, int oy) {
+static void ctx_draw_bg(const GridCtx *g, int cQ, int cR)
+{
     double sq3   = sqrt(3.0);
     double sq3_3 = sq3 / 3.0;
     double sq3_2 = sq3 * 0.5;
-    double limit = 0.5 - border_w;
+    double size  = g->hex_size;
+    double limit = 0.5 - g->border_w;
 
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double px = (double)(col - ox) * CELL_W;
-            double py = (double)(row - oy) * CELL_H;
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
 
             double fq = (2.0/3.0 * px) / size;
             double fr = (-1.0/3.0 * px + sq3_3 * py) / size;
@@ -299,7 +379,7 @@ static void grid_draw(int rows, int cols, double size, double border_w,
             if (d2 > dist) dist = d2;
             if (d3 > dist) dist = d3;
 
-            int ring = hex_ring_dist(Q, R, cQ, cR);
+            int ring = cube_dist(Q, R, cQ, cR);
             int pair = (ring == 0) ? PAIR_CURSOR
                                    : PAIR_RING + (ring % N_RING_COLORS);
             int attr = COLOR_PAIR(pair);
@@ -323,7 +403,21 @@ static void grid_draw(int rows, int cols, double size, double border_w,
     }
 }
 
-/* ── §5b cursor ───────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Cursor — just (q, r) in axial hex space. Same struct as 01_flat_top.
+ */
+typedef struct { int q, r; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    (void)g;
+    cur->q = 0;
+    cur->r = 0;
+}
 
 /*
  * HEX_DIR — 4-direction axial movement (same table as 01–03).
@@ -340,126 +434,142 @@ static const int HEX_DIR[4][2] = {
     {+1,  0 },   /* RIGHT */
 };
 
+static void cursor_move(Cursor *cur, const GridCtx *g, int dq, int dr)
+{
+    (void)g;
+    cur->q += dq;
+    cur->r += dr;
+}
+
 /*
  * cursor_draw — '@' at cursor hex center, drawn on top of ring fill.
  *
- * THE FORMULA (flat-top forward matrix, same as 01_flat_top):
- *   cx_pix = size × 3/2 × cQ
- *   cy_pix = size × (√3/2 × cQ  +  √3 × cR)
- *   col = ox + (int)(cx_pix / CELL_W)
- *   row = oy + (int)(cy_pix / CELL_H)
- *
- * Drawn after grid_draw so '@' is on top of the ring fill at the cursor hex.
+ * Drawn after ctx_draw_bg so '@' is on top of the ring fill at the cursor hex.
  */
-static void cursor_draw(double size, int cQ, int cR,
-                         int ox, int oy, int rows, int cols) {
-    double sq3   = sqrt(3.0);
-    double sq3_2 = sq3 * 0.5;
-    double cx_pix = size * 1.5    * (double)cQ;
-    double cy_pix = size * (sq3_2 * (double)cQ + sq3 * (double)cR);
-    int col = ox + (int)(cx_pix / CELL_W);
-    int row = oy + (int)(cy_pix / CELL_H);
-    if (col >= 0 && col < cols && row >= 0 && row < rows - 1) {
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc;
+    ctx_to_screen(g, cur->q, cur->r, &sr, &sc);
+    if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-        mvaddch(row, col, '@');
+        mvaddch(sr, sc, '@');
         attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     }
 }
 
-/* ── §6 scene ─────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
-typedef struct {
-    double hex_size, border_w;
-    int    cQ, cR;
-    int    paused;
-} Scene;
-
-static void scene_init(Scene *s) {
-    s->hex_size = HEX_SIZE_DEFAULT;
-    s->border_w = BORDER_W_DEFAULT;
-    s->cQ = 0; s->cR = 0;
-    s->paused = 0;
-}
-static void scene_draw(const Scene *s, int rows, int cols) {
-    int ox = cols / 2;
-    int oy = (rows - 1) / 2;
-    grid_draw(rows, cols, s->hex_size, s->border_w, s->cQ, s->cR, ox, oy);
-    cursor_draw(s->hex_size, s->cQ, s->cR, ox, oy, rows, cols);
-}
-
-/* ── §7 screen ────────────────────────────────────────────────────────── */
-
-static void screen_init(void) {
-    initscr(); cbreak(); noecho();
-    keypad(stdscr, TRUE); curs_set(0);
-    nodelay(stdscr, TRUE); typeahead(-1);
-}
-static void screen_draw_hud(const Scene *s, int rows, int cols, double fps) {
-    int dist_from_origin = hex_ring_dist(s->cQ, s->cR, 0, 0);
+static void hud_draw(const GridCtx *g, const Cursor *cur, int paused, double fps)
+{
+    int dist_from_origin = cube_dist(cur->q, cur->r, 0, 0);
     char buf[96];
     snprintf(buf, sizeof buf,
              " Q:%+d R:%+d  dist-from-origin:%d  size:%.0f  %5.1f fps  %s ",
-             s->cQ, s->cR, dist_from_origin, s->hex_size, fps,
-             s->paused ? "PAUSED " : "running");
+             cur->q, cur->r, dist_from_origin, g->hex_size, fps,
+             paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " q:quit  p:pause  r:reset  arrows:move cursor  +/-:size  [/]:border ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
-}
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
-static void cleanup(void) { endwin(); }
-
-/* ── §8 app ───────────────────────────────────────────────────────────── */
-
-static volatile sig_atomic_t running = 1, need_resize = 0;
-static void sig_handler(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) running = 0;
-    if (sig == SIGWINCH) need_resize = 1;
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-int main(void) {
-    atexit(cleanup);
-    signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler);
-    signal(SIGWINCH, sig_handler);
+static void scene_draw(const GridCtx *g, const Cursor *cur, int paused, double fps)
+{
+    erase();
+    ctx_draw_bg(g, cur->q, cur->r);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, paused, fps);
+    wnoutrefresh(stdscr);
+    doupdate();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §7  screen                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void screen_cleanup(void) { endwin(); }
+
+static void screen_init(void)
+{
+    initscr(); cbreak(); noecho();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    curs_set(0);
+    typeahead(-1);
+    atexit(screen_cleanup);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §8  app                                                                 */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static volatile sig_atomic_t g_running     = 1;
+static volatile sig_atomic_t g_need_resize = 0;
+
+static void on_signal(int s)
+{
+    if (s == SIGINT || s == SIGTERM) g_running     = 0;
+    if (s == SIGWINCH)               g_need_resize = 1;
+}
+
+int main(void)
+{
+    signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
+    signal(SIGWINCH, on_signal);
+
     screen_init();
-    int rows, cols; getmaxyx(stdscr, rows, cols);
-    Scene sc; scene_init(&sc); color_init();
-    int64_t prev = clock_ns(); double fps = 60.0;
+    color_init();
+    int paused = 0;
 
-    while (running) {
-        if (need_resize) {
-            need_resize = 0; endwin(); refresh();
-            getmaxyx(stdscr, rows, cols);
+    GridCtx g = {0};
+    g.hex_size = HEX_SIZE_DEFAULT;
+    g.border_w = BORDER_W_DEFAULT;
+    ctx_init(&g, LINES, COLS);
+
+    Cursor cur;
+    cursor_reset(&cur, &g);
+
+    double fps = 60.0;
+    int64_t prev = clock_ns();
+
+    while (g_running) {
+        if (g_need_resize) {
+            g_need_resize = 0;
+            endwin(); refresh();
+            ctx_init(&g, LINES, COLS);
         }
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
-            case 'q': case 27: running = 0; break;
-            case 'p': sc.paused ^= 1; break;
-            case 'r': sc.cQ = 0; sc.cR = 0; break;
-            case KEY_UP:    sc.cQ += HEX_DIR[0][0]; sc.cR += HEX_DIR[0][1]; break;
-            case KEY_DOWN:  sc.cQ += HEX_DIR[1][0]; sc.cR += HEX_DIR[1][1]; break;
-            case KEY_LEFT:  sc.cQ += HEX_DIR[2][0]; sc.cR += HEX_DIR[2][1]; break;
-            case KEY_RIGHT: sc.cQ += HEX_DIR[3][0]; sc.cR += HEX_DIR[3][1]; break;
+            case 'q': case 27: g_running = 0; break;
+            case 'p': paused ^= 1; break;
+            case 'r': cursor_reset(&cur, &g); break;
+            case KEY_UP:    cursor_move(&cur, &g, HEX_DIR[0][0], HEX_DIR[0][1]); break;
+            case KEY_DOWN:  cursor_move(&cur, &g, HEX_DIR[1][0], HEX_DIR[1][1]); break;
+            case KEY_LEFT:  cursor_move(&cur, &g, HEX_DIR[2][0], HEX_DIR[2][1]); break;
+            case KEY_RIGHT: cursor_move(&cur, &g, HEX_DIR[3][0], HEX_DIR[3][1]); break;
             case '+': case '=':
-                if (sc.hex_size < HEX_SIZE_MAX) { sc.hex_size += HEX_SIZE_STEP; } break;
+                if (g.hex_size < HEX_SIZE_MAX) { g.hex_size += HEX_SIZE_STEP; ctx_init(&g, LINES, COLS); } break;
             case '-':
-                if (sc.hex_size > HEX_SIZE_MIN) { sc.hex_size -= HEX_SIZE_STEP; } break;
+                if (g.hex_size > HEX_SIZE_MIN) { g.hex_size -= HEX_SIZE_STEP; ctx_init(&g, LINES, COLS); } break;
             case '[':
-                if (sc.border_w > BORDER_W_MIN) { sc.border_w -= BORDER_W_STEP; } break;
+                if (g.border_w > BORDER_W_MIN) { g.border_w -= BORDER_W_STEP; } break;
             case ']':
-                if (sc.border_w < BORDER_W_MAX) { sc.border_w += BORDER_W_STEP; } break;
+                if (g.border_w < BORDER_W_MAX) { g.border_w += BORDER_W_STEP; } break;
             }
         }
+
         int64_t now = clock_ns(), dt = now - prev; prev = now;
-        if (dt > 0) fps = fps * 0.9 + 1e9 / (double)dt * 0.1;
-        erase();
-        scene_draw(&sc, rows, cols);
-        screen_draw_hud(&sc, rows, cols, fps);
-        screen_present();
+        if (dt > 0)
+            fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (double)dt) * FPS_EWMA_ALPHA;
+
+        scene_draw(&g, &cur, paused, fps);
         clock_sleep_ns(TICK_NS - (clock_ns() - now));
     }
     return 0;

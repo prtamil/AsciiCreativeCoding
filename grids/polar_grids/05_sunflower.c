@@ -4,25 +4,28 @@
  *
  * DEMO: Seeds are placed at parametric positions r=√i × SPACING,
  *       θ = i × GOLDEN_ANGLE, producing the spiral dot pattern seen in
- *       sunflower heads, pinecones, and daisy centres.  +/- adjusts the
- *       seed spacing; [/] changes the max seed count.  The 'g' key cycles
- *       through slight angle deviations to show why GOLDEN_ANGLE is special.
+ *       sunflower heads, pinecones, and daisy centres.  An '@' cursor
+ *       sits on the n-th seed (a single Vogel index) — arrows step n
+ *       up/down.  +/- adjusts the seed spacing; [/] changes max seed count.
+ *       The 'g' key cycles through slight angle deviations to show why
+ *       GOLDEN_ANGLE is special.
  *
  * Study alongside: 04_log_spiral.c (continuous log-spiral arms),
- *                  03_archimedean_spiral.c (constant-pitch spiral arms)
+ *                  03_archimedean_spiral.c (constant-pitch spiral arms),
+ *                  ../rect_grids/01_uniform_rect.c (the GridCtx template)
  *
  * Section map:
- *   §1 config   — seed count, spacing, golden angle, deviation table
+ *   §1 config   — seed count, spacing, golden angle, deviation table, EWMA
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — theme-switchable PAIR_GRID
- *   §4 coords   — polar_to_cell (inverse direction for parametric placement)
- *   §5 draw     — Vogel phyllotaxis, seed placement loop
- *   §6 scene    — scene_draw
+ *   §3 color    — theme-switchable PAIR_GRID + HUD/HINT/CURSOR
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
+ *   §5 cursor   — Cursor (Vogel index n) + cursor_reset / cursor_move / cursor_draw
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, resize, main loop
  *
- * Keys:  q/ESC quit   p pause   t theme   g cycle angle deviation
- *        +/- seed spacing   [/] seed count
+ * Keys:  q/ESC quit   p pause   t theme   r reset   g cycle angle deviation
+ *        arrows move @   +/- seed spacing   [/] seed count
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids/05_sunflower.c \
@@ -46,6 +49,10 @@
  *
  *                  A visited[] grid prevents double-writes without a hash set.
  *
+ * Data-structure : Two structs — GridCtx (terminal extent, spacing, n_seeds,
+ *                  current angle, ox/oy) and Cursor — a single Vogel index n.
+ *                  ctx_to_screen (n) returns the screen position of seed n.
+ *
  * Math           : The golden angle α = 2π − 2π/φ = 2π(1 − 1/φ) = 2π/φ²
  *                  where φ = (1+√5)/2.  In degrees: ≈ 137.507764°.
  *
@@ -58,14 +65,12 @@
  *                  spokes with gaps between them — the pattern degenerates.
  *                  Only irrational multiples of 2π fill uniformly.
  *
- * Data-structure : `bool visited[rows][cols]` prevents multiple seeds
- *                  occupying the same terminal cell.  Allocated on the stack
- *                  (terminal cells are at most ~250×80 ≈ 20 000 booleans).
+ *                  visited[] prevents two seeds occupying the same terminal
+ *                  cell.  Allocated on the stack (terminal cells are at most
+ *                  ~250×80 ≈ 20 000 booleans).
  *
- * Rendering      : Each seed is one character from SEED_CHARS rotated through
- *                  as the seed index increases — gives a striped colour effect
- *                  that makes the spiral arms visible.  The '·' dot is the
- *                  default; '+' marks seeds that would collide with a prior seed.
+ * Rendering      : Each seed is one character (SEED_CHAR).  The cursor
+ *                  highlights seed n with bright '@'.
  *
  * Performance    : O(N_SEEDS) per frame — iterate seeds, convert to cell,
  *                  write character.  N_SEEDS ≤ 4096 at terminal resolution.
@@ -84,7 +89,8 @@
  * CORE IDEA
  *   Seeds are placed parametrically: seed i goes to polar position
  *   (√i × SPACING, i × GOLDEN_ANGLE).  The √i radius gives uniform density;
- *   the golden angle ensures no two seeds share a spoke — ever.
+ *   the golden angle ensures no two seeds share a spoke — ever.  The Cursor
+ *   address is a single integer n — the index of one specific seed.
  *
  * HOW TO THINK ABOUT IT
  *   Imagine a turntable rotating by GOLDEN_ANGLE per tick while a dispenser
@@ -99,7 +105,7 @@
  * DRAWING METHOD
  *   1. For seed i in [0, N_SEEDS):
  *      r = √i × SPACING           ← pixel radius (√i for equal-area packing)
- *      θ = i × GOLDEN_ANGLE       ← angle in radians (unbounded; cos/sin are periodic)
+ *      θ = i × current_angle      ← angle in radians (unbounded; cos/sin are periodic)
  *   2. Convert to terminal cell:
  *      col = ox + round(r × cos(θ) / CELL_W)
  *      row = oy + round(r × sin(θ) / CELL_H)
@@ -115,6 +121,12 @@
  *     Area up to seed i = π × r_i² = π × i × SPACING².
  *     Each seed adds area π × SPACING² — uniform density for all i.
  *
+ *   Cursor → screen (Vogel seed n):
+ *     r_n     = √n × spacing
+ *     theta_n = n × current_angle
+ *     col_n   = ox + round(r_n × cos theta_n / CELL_W)
+ *     row_n   = oy + round(r_n × sin theta_n / CELL_H)
+ *
  *   Why golden angle avoids spokes:
  *     A rational angle p×2π/q closes after q seeds (modular arithmetic).
  *     GOLDEN_ANGLE is irrational: seeds never return to a prior direction.
@@ -127,6 +139,7 @@
  *     On very large terminals (>500 rows) consider heap allocation.
  *   • angle_idx=3 (222.5°): mathematically equivalent to the golden angle
  *     mod 2π — pattern looks identical to idx=0.  Included to show equivalence.
+ *   • Cursor n is clamped to [0, n_seeds−1]; reset after seed-count change.
  *
  * HOW TO VERIFY
  *   SPACING=3.5, N=800, ox=40, oy=12.
@@ -184,7 +197,7 @@
 
 /* Alternative angles for the 'g' experiment (rational multiples of π) */
 static const double ANGLE_TABLE[] = {
-    2.0 * M_PI / (PHI * PHI),   /* golden angle — perfect packing */
+    2.0 * M_PI / (PHI * PHI),    /* golden angle — perfect packing */
     2.0 * M_PI / 5.0,            /* 72° — 5 clear spokes           */
     2.0 * M_PI / 8.0,            /* 45° — 8 clear spokes           */
     2.0 * M_PI * (1.0 - 1.0/PHI), /* 222.5° — same as golden, mod 2π */
@@ -195,9 +208,13 @@ static const double ANGLE_TABLE[] = {
 /* Character to draw for each seed */
 #define SEED_CHAR  'o'
 
-#define PAIR_GRID   1
-#define PAIR_HUD    2
-#define PAIR_LABEL  3
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA     0.05
+
+#define PAIR_GRID    1
+#define PAIR_CURSOR  2
+#define PAIR_HUD     3
+#define PAIR_HINT    4
 
 static const short THEME_FG[][2] = {
     {75,  COLOR_CYAN},
@@ -233,100 +250,193 @@ static void color_init(int theme)
 {
     start_color(); use_default_colors();
     short fg = COLORS >= 256 ? THEME_FG[theme][0] : THEME_FG[theme][1];
-    init_pair(PAIR_GRID,  fg,                              -1);
-    init_pair(PAIR_HUD,   COLORS>=256 ? 226 : COLOR_YELLOW,-1);
-    init_pair(PAIR_LABEL, COLORS>=256 ? 252 : COLOR_WHITE, -1);
+    init_pair(PAIR_GRID,   fg,                              -1);
+    init_pair(PAIR_CURSOR, COLORS>=256 ? 226 : COLOR_YELLOW,-1);
+    init_pair(PAIR_HUD,    COLORS>=256 ? 226 : COLOR_YELLOW,-1);
+    init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  coords                                                              */
+/* §4  formula — GridCtx and the Vogel-seed ↔ screen mapping              */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * polar_to_cell — convert polar (r_px, theta) to terminal cell (col, row).
+ * GridCtx — Vogel phyllotaxis parameters plus cursor bounds.
+ *
+ * spacing, angle, n_seeds drive the seed placement.  max_n = n_seeds − 1.
+ */
+typedef struct {
+    int rows, cols;
+
+    double spacing;        /* pixel distance scale                          */
+    double angle;          /* current placement angle (radians)             */
+    int    n_seeds;        /* number of seeds to render                     */
+    int    cell_w, cell_h;
+
+    int    ox, oy;
+
+    int    max_n;
+} GridCtx;
+
+/*
+ * ctx_init — derive geometry from terminal size.
+ *
+ * No max_ring computation needed — Vogel placement self-bounds via the
+ * out-of-bounds skip in ctx_draw_bg.  max_n is just n_seeds − 1.
+ */
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows   = rows;
+    g->cols   = cols;
+    g->cell_w = CELL_W;
+    g->cell_h = CELL_H;
+    g->ox     = cols / 2;
+    g->oy     = rows / 2;
+    if (g->spacing <= 0.0) g->spacing = SPACING_DEFAULT;
+    if (g->angle   <= 0.0) g->angle   = GOLDEN_ANGLE;
+    if (g->n_seeds <= 0)   g->n_seeds = N_SEEDS_DEFAULT;
+    g->max_n = g->n_seeds - 1;
+}
+
+/*
+ * ctx_to_screen — terminal cell of Vogel seed n.
  *
  * THE FORMULA:
- *   col = ox + round(r_px × cos(θ) / CELL_W)
- *   row = oy + round(r_px × sin(θ) / CELL_H)
+ *   r_n     = √n × spacing
+ *   theta_n = n × angle
+ *   col = ox + (int)round(r_n × cos(theta_n) / CELL_W)
+ *   row = oy + (int)round(r_n × sin(theta_n) / CELL_H)
  *
- * This is the inverse of cell_to_polar from the ring/spiral files.
+ * This is the inverse direction of cell_to_polar from the ring/spiral files.
  * Dividing by CELL_W and CELL_H undoes the aspect-ratio scaling, so a
- * seed at pixel radius r_px lands at the correct circular position on screen.
+ * seed at pixel radius r_n lands at the correct circular position on screen.
  */
-static void polar_to_cell(double r_px, double theta, int ox, int oy,
-                           int *col, int *row)
+static void ctx_to_screen(const GridCtx *g, int n, int *sr, int *sc)
 {
-    *col = ox + (int)round(r_px * cos(theta) / CELL_W);
-    *row = oy + (int)round(r_px * sin(theta) / CELL_H);
+    double r_n     = sqrt((double)n) * g->spacing;
+    double theta_n = (double)n * g->angle;
+    *sc = g->ox + (int)round(r_n * cos(theta_n) / (double)g->cell_w);
+    *sr = g->oy + (int)round(r_n * sin(theta_n) / (double)g->cell_h);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  draw                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
 /*
- * grid_draw — place N seeds using Vogel's phyllotaxis formula.
+ * ctx_draw_bg — place N seeds using Vogel's phyllotaxis formula.
  *
  * THE PIPELINE:
  *   for i in [0, n_seeds):
  *     r = √i × spacing                 equal-area radial placement
  *     θ = i × angle                    golden/rational angle rotation
- *     (col, row) ← polar_to_cell(r, θ) aspect-corrected cell
+ *     (col, row) ← polar→cell          aspect-corrected cell
  *     skip if out of bounds or already visited
  *     draw SEED_CHAR, mark visited[row][col]
  *
  * visited[] is a stack VLA of bool — prevents two seeds writing the same cell.
  */
-static void grid_draw(int rows, int cols, int ox, int oy,
-                      double spacing, int n_seeds, double angle)
+static void ctx_draw_bg(const GridCtx *g)
 {
+    int rows = g->rows, cols = g->cols;
     /* Stack-allocated visited grid — prevents double-writing a cell */
     bool visited[rows][cols];
     memset(visited, 0, sizeof(bool) * (size_t)(rows * cols));
 
     attron(COLOR_PAIR(PAIR_GRID));
-    for (int i = 0; i < n_seeds; i++) {
-        double r   = sqrt((double)i) * spacing;
-        double th  = (double)i * angle;
-        int c, r2;
-        polar_to_cell(r, th, ox, oy, &c, &r2);
+    for (int i = 0; i < g->n_seeds; i++) {
+        double r   = sqrt((double)i) * g->spacing;
+        double th  = (double)i * g->angle;
+        int sc = g->ox + (int)round(r * cos(th) / (double)g->cell_w);
+        int sr = g->oy + (int)round(r * sin(th) / (double)g->cell_h);
 
-        if (r2 < 0 || r2 >= rows - 1 || c < 0 || c >= cols) continue;
-        if (visited[r2][c]) continue;
-        visited[r2][c] = true;
-        mvaddch(r2, c, (chtype)(unsigned char)SEED_CHAR);
+        if (sr < 0 || sr >= rows - 1 || sc < 0 || sc >= cols) continue;
+        if (visited[sr][sc]) continue;
+        visited[sr][sc] = true;
+        mvaddch(sr, sc, (chtype)(unsigned char)SEED_CHAR);
     }
     attroff(COLOR_PAIR(PAIR_GRID));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Cursor — a single Vogel index n.
+ *
+ * Bounds and geometry live in GridCtx.  cursor_to_screen calls
+ * ctx_to_screen(g, cur->n, ...).
+ */
+typedef struct { int n; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    cur->n = g->max_n / 4;     /* an interior seed, neither centre nor rim */
+}
+
+/*
+ * cursor_move — apply (d_n) and clamp to [0, max_n].
+ *
+ * Arrow-key dispatch:
+ *   UP    → n − CURSOR_RING_STEP (jump several seeds inward)
+ *   DOWN  → n + CURSOR_RING_STEP (jump several seeds outward)
+ *   LEFT  → n − 1                 (previous seed)
+ *   RIGHT → n + 1                 (next seed)
+ *
+ * The big up/down step exists because consecutive Vogel seeds live very far
+ * apart angularly; stepping by 1 looks like teleporting.  Stepping by ≈φ²
+ * (the natural Fibonacci jump) follows a visible Fibonacci spiral arm.
+ */
+#define CURSOR_RING_STEP 8
+static void cursor_move(Cursor *cur, const GridCtx *g, int d_n)
+{
+    int nn = cur->n + d_n;
+    if (nn < 0)         nn = 0;
+    if (nn > g->max_n)  nn = g->max_n;
+    cur->n = nn;
+}
+
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc;
+    ctx_to_screen(g, cur->n, &sr, &sc);
+    if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
+        attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+        mvaddch(sr, sc, (chtype)'@');
+        attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §6  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void scene_draw(int rows, int cols, double spacing, int n_seeds,
-                       int angle_idx, int theme, double fps, bool paused)
+static void hud_draw(const GridCtx *g, const Cursor *cur, int angle_idx,
+                     int theme, bool paused, double fps)
 {
-    int ox = cols / 2, oy = rows / 2;
-    erase();
-    grid_draw(rows, cols, ox, oy, spacing, n_seeds, ANGLE_TABLE[angle_idx]);
-
     const char *angle_name = (angle_idx == 0) ? "golden" :
                              (angle_idx == 1) ? "72deg"  :
                              (angle_idx == 2) ? "45deg"  :
                              (angle_idx == 3) ? "222.5d" : "near-g";
-    char buf[80];
-    snprintf(buf, sizeof buf, " %.1f fps  sp:%.1f  n:%d  ang:%s  %s ",
-             fps, spacing, n_seeds, angle_name, paused ? "PAUSED" : "running");
+    char buf[112];
+    snprintf(buf, sizeof buf,
+             " seed:%d/%d  sp:%.1f  ang:%s  th:%d  %5.1f fps  %s ",
+             cur->n, g->n_seeds, g->spacing, angle_name,
+             theme + 1, fps, paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_LABEL));
-    mvprintw(rows-1, 0,
-        " q:quit  p:pause  t:theme(%d)  g:cycle-angle  +/-:spacing  [/]:seeds ",
-        theme+1);
-    attroff(COLOR_PAIR(PAIR_LABEL));
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+             " q:quit  p:pause  t:theme  r:reset  g:cycle-angle  arrows:move  +/-:spacing  [/]:seeds ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, int angle_idx,
+                       int theme, bool paused, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, angle_idx, theme, paused, fps);
     wnoutrefresh(stdscr); doupdate();
 }
 
@@ -335,12 +445,12 @@ static void scene_draw(int rows, int cols, double spacing, int n_seeds,
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 static void screen_cleanup(void) { endwin(); }
-static void screen_init(int theme)
+static void screen_init(void)
 {
     initscr(); cbreak(); noecho();
     keypad(stdscr, TRUE); nodelay(stdscr, TRUE);
     curs_set(0); typeahead(-1);
-    color_init(theme); atexit(screen_cleanup);
+    atexit(screen_cleanup);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -359,49 +469,72 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
 
-    int theme     = 0;
-    screen_init(theme);
+    int theme = 0;
+    int angle_idx = 0;
+    screen_init();
+    color_init(theme);
 
-    int    rows      = LINES, cols = COLS;
-    double spacing   = SPACING_DEFAULT;
-    int    n_seeds   = N_SEEDS_DEFAULT;
-    int    angle_idx = 0;
-    bool   paused    = false;
-    double fps = TARGET_FPS;
-    int64_t t0 = clock_ns();
+    GridCtx g = {0};
+    g.spacing = SPACING_DEFAULT;
+    g.angle   = ANGLE_TABLE[angle_idx];
+    g.n_seeds = N_SEEDS_DEFAULT;
+    ctx_init(&g, LINES, COLS);
+
+    Cursor cur;
+    cursor_reset(&cur, &g);
+
+    bool   paused = false;
+    double fps    = TARGET_FPS;
+    int64_t t0    = clock_ns();
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
 
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
+            ctx_init(&g, LINES, COLS);
         }
 
         int ch = getch();
         switch (ch) {
         case 'q': case 27: g_running = 0; break;
         case 'p': paused = !paused; break;
+        case 'r': cursor_reset(&cur, &g); break;
         case 't': theme = (theme + 1) % N_THEMES; color_init(theme); break;
-        case 'g': angle_idx = (angle_idx + 1) % N_ANGLES; break;
+        case 'g':
+            angle_idx = (angle_idx + 1) % N_ANGLES;
+            g.angle = ANGLE_TABLE[angle_idx];
+            break;
+        case KEY_UP:    cursor_move(&cur, &g, -CURSOR_RING_STEP); break;
+        case KEY_DOWN:  cursor_move(&cur, &g, +CURSOR_RING_STEP); break;
+        case KEY_LEFT:  cursor_move(&cur, &g, -1);                break;
+        case KEY_RIGHT: cursor_move(&cur, &g, +1);                break;
         case '+': case '=':
-            if (spacing < SPACING_MAX) spacing += SPACING_STEP;
+            if (g.spacing < SPACING_MAX) g.spacing += SPACING_STEP;
             break;
         case '-':
-            if (spacing > SPACING_MIN) spacing -= SPACING_STEP;
+            if (g.spacing > SPACING_MIN) g.spacing -= SPACING_STEP;
             break;
         case '[':
-            if (n_seeds > N_SEEDS_MIN) n_seeds -= N_SEEDS_STEP;
+            if (g.n_seeds > N_SEEDS_MIN) {
+                g.n_seeds -= N_SEEDS_STEP;
+                ctx_init(&g, LINES, COLS);
+                if (cur.n > g.max_n) cur.n = g.max_n;
+            }
             break;
         case ']':
-            if (n_seeds < N_SEEDS_MAX) n_seeds += N_SEEDS_STEP;
+            if (g.n_seeds < N_SEEDS_MAX) {
+                g.n_seeds += N_SEEDS_STEP;
+                ctx_init(&g, LINES, COLS);
+            }
             break;
         }
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) +
+              (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0  = now;
         if (!paused)
-            scene_draw(rows, cols, spacing, n_seeds, angle_idx, theme, fps, paused);
+            scene_draw(&g, &cur, angle_idx, theme, paused, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

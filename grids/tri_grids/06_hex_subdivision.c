@@ -13,12 +13,15 @@
  *                  (this file is the analogous kis-operation on hexagons).
  *
  * Section map:
- *   §1 config   — CELL_W, CELL_H, HEX_SIZE, BORDER_W, RADIUS_T_FRAC
+ *   §1 config   — CELL_W, CELL_H, HEX_SIZE, BORDER_W, RADIUS_T_FRAC,
+ *                 FPS_EWMA_ALPHA
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: edge / radius / cursor / HUD / hint
- *   §4 formula  — pixel ↔ cube coords + sector_of (angular bin)
- *   §5 cursor   — HEX_DIR + sector rotation
- *   §6 scene    — grid_draw (hex border + 3 radii) + scene_draw
+ *   §3 color    — 5 pairs: edge / radius / cursor / HUD / HINT
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_hex /
+ *                 ctx_draw_bg + hex_centre_pixel + sector_of + angle_char
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_rotate /
+ *                 cursor_draw, HEX_DIR
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -39,6 +42,10 @@
  *                  equals hex edge length. Pixel→hex via the cube-rounding
  *                  trick from hex_grids/01; sector ID via atan2 of
  *                  (Δx, Δy) bucketed into 60° bins.
+ *
+ * Data-structure : Two structs — GridCtx (terminal extent, hex_size,
+ *                  CELL_W/CELL_H, screen origin ox/oy, border_w) and
+ *                  Cursor (Q, R, sector). No grid array.
  *
  * Formula        : Hex identification (flat-top inverse, see hex_grids/01):
  *                    fq =  (2/3 · px) / size
@@ -191,6 +198,9 @@
 
 #define N_THEMES 4
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA 0.05
+
 #define PAIR_BORDER 1
 #define PAIR_RADIUS 2
 #define PAIR_CURSOR 3
@@ -243,14 +253,54 @@ static void color_init(int theme)
     else               { fg_e = THEME_FG_8[theme][0]; fg_r = THEME_FG_8[theme][1]; }
     init_pair(PAIR_BORDER, fg_e, -1);
     init_pair(PAIR_RADIUS, fg_r, -1);
-    init_pair(PAIR_CURSOR, COLORS >= 256 ? 15 : COLOR_WHITE, COLOR_BLUE);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  0 : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLORS >= 256 ? 75 : COLOR_CYAN,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ?  15 : COLOR_WHITE, COLOR_BLUE);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — pixel ↔ cube + sector                                     */
+/* §4  formula — GridCtx, pixel ↔ cube + sector                            */
 /* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * GridCtx — geometry of the active hex-subdivision grid.
+ *
+ * Same centring scheme as the hex template: ox = cols/2, oy = (rows-1)/2.
+ * hex_size and border_w are tunable per frame from the main loop.
+ *
+ * max_q / max_r are advisory cursor bounds — the hex plane is infinite,
+ * so "bounds" here means the largest Q/R that still places its centre on
+ * screen given the current hex_size.
+ */
+typedef struct {
+    /* terminal extent */
+    int rows, cols;
+
+    /* hex geometry */
+    double hex_size;       /* circumradius in pixels                         */
+    double border_w;       /* fraction of cube distance that counts as border */
+    int    cw, ch;         /* sub-pixel scaling — CELL_W, CELL_H              */
+
+    /* screen origin = pixel (0,0) */
+    int    ox, oy;
+
+    /* advisory cursor bounds in axial space */
+    int    max_q, max_r;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows = rows;
+    g->cols = cols;
+    g->cw   = CELL_W;
+    g->ch   = CELL_H;
+    g->ox   = cols / 2;
+    g->oy   = (rows - 1) / 2;
+    if (g->hex_size <= 0.0) g->hex_size = HEX_SIZE_DEFAULT;
+    if (g->border_w <= 0.0) g->border_w = BORDER_W_DEFAULT;
+    g->max_q = (int)((double)cols * CELL_W / (3.0 * g->hex_size)) + 1;
+    g->max_r = (int)((double)rows * CELL_H / (sqrt(3.0) * g->hex_size)) + 1;
+}
 
 /*
  * angle_char — copy from hex_grids/01_flat_top.c.
@@ -289,7 +339,7 @@ static int sector_of(double dx, double dy)
 }
 
 /*
- * pixel_to_hex — cube round; returns (Q, R) and dist (cube distance to centre).
+ * ctx_pixel_to_hex — cube round; returns (Q, R) and dist (cube distance).
  *
  * THE FORMULA (flat-top inverse + cube round, see hex_grids/01):
  *
@@ -298,13 +348,13 @@ static int sector_of(double dx, double dy)
  *   fs = -fq - fr
  *   round each → restore Q+R+S=0 by fixing the largest-error axis
  */
-static void pixel_to_hex(double px, double py, double size,
-                         int *Q, int *R, double *dist)
+static void ctx_pixel_to_hex(const GridCtx *g, double px, double py,
+                             int *Q, int *R, double *dist)
 {
     double sq3   = sqrt(3.0);
     double sq3_3 = sq3 / 3.0;
-    double fq = (2.0 / 3.0 * px) / size;
-    double fr = (-1.0/3.0 * px + sq3_3 * py) / size;
+    double fq = (2.0 / 3.0 * px) / g->hex_size;
+    double fr = (-1.0/3.0 * px + sq3_3 * py) / g->hex_size;
     double fs = -fq - fr;
 
     int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
@@ -325,10 +375,13 @@ static void pixel_to_hex(double px, double py, double size,
 }
 
 /*
- * hex_centre_pixel — forward map (Q, R) → pixel of hex centre.
+ * hex_centre_pixel — pure forward map (Q, R) → pixel of hex centre.
  *
  *   cx = size · 3/2 · Q
  *   cy = size · (√3/2 · Q + √3 · R)
+ *
+ * Pure math helper — keeps its domain name. Used by ctx_to_screen and
+ * ctx_draw_bg.
  */
 static void hex_centre_pixel(int Q, int R, double size,
                               double *cx, double *cy)
@@ -338,96 +391,56 @@ static void hex_centre_pixel(int Q, int R, double size,
     *cy = size * (sq3*0.5 * (double)Q + sq3 * (double)R);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct {
-    int    Q, R, sector;        /* hex axial coords + sub-triangle index */
-    double hex_size;
-    double border_w;
-    int    theme;
-    int    paused;
-} Cursor;
-
-/* HEX_DIR — same as hex_grids/01 (4 of the 6 hex faces). */
-static const int HEX_DIR[4][2] = {
-    { 0, -1 },   /* UP    */
-    { 0, +1 },   /* DOWN  */
-    {-1,  0 },   /* LEFT  */
-    {+1,  0 },   /* RIGHT */
-};
-
-static void cursor_reset(Cursor *cur)
-{
-    cur->Q = 0; cur->R = 0; cur->sector = 0;
-    cur->hex_size = HEX_SIZE_DEFAULT;
-    cur->border_w = BORDER_W_DEFAULT;
-    cur->theme    = 0;
-    cur->paused   = 0;
-}
-
-static void cursor_step_hex(Cursor *cur, int idx)
-{
-    cur->Q += HEX_DIR[idx][0];
-    cur->R += HEX_DIR[idx][1];
-}
-static void cursor_rotate_sector(Cursor *cur, int delta)
-{
-    cur->sector = (cur->sector + delta + 6) % 6;
-}
-
 /*
- * cursor_draw — '@' at the centroid of sub-triangle (Q, R, sector).
+ * ctx_to_screen — terminal cell of the centroid of sub-triangle (Q, R, sector).
  *
  * Sub-triangle centroid: 2/3 of the way from hex centre to outer-edge
  * midpoint. Outer-edge midpoint at angle (sector·60°), distance size·√3/2.
  * Centroid distance from hex centre = (2/3)·size·√3/2 = size·√3/3.
  */
-static void cursor_draw(const Cursor *cur, int rows, int cols, int ox, int oy)
+static void ctx_to_screen(const GridCtx *g, int Q, int R, int sector,
+                          int *sr, int *sc)
 {
     double cx_pix, cy_pix;
-    hex_centre_pixel(cur->Q, cur->R, cur->hex_size, &cx_pix, &cy_pix);
-    double ang = (double)cur->sector * M_PI / 3.0;
-    double r   = cur->hex_size * sqrt(3.0) / 3.0;
+    hex_centre_pixel(Q, R, g->hex_size, &cx_pix, &cy_pix);
+    double ang = (double)sector * M_PI / 3.0;
+    double r   = g->hex_size * sqrt(3.0) / 3.0;
     double mx  = cx_pix + r * cos(ang);
     double my  = cy_pix + r * sin(ang);
-    int col = ox + (int)(mx / CELL_W);
-    int row = oy + (int)(my / CELL_H);
-    if (col >= 0 && col < cols && row >= 0 && row < rows - 1) {
-        attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-        mvaddch(row, col, '@');
-        attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-    }
+    *sc = g->ox + (int)(mx / g->cw);
+    *sr = g->oy + (int)(my / g->ch);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void grid_draw(int rows, int cols, const Cursor *cur, int ox, int oy)
+/*
+ * ctx_draw_bg — raster scan: hex border + 3 radii at every cell.
+ *
+ * Per cell: cube_round picks the hex; cube distance picks border vs interior.
+ * Interior cells run the 3-radius perpendicular-distance test for the
+ * sub-triangle separators. Cursor sub-triangle highlighted with PAIR_CURSOR.
+ */
+static void ctx_draw_bg(const GridCtx *g, int cQ, int cR, int cSector)
 {
     double sq3   = sqrt(3.0);
     double sq3_2 = sq3 * 0.5;
-    double limit_inner = 0.5 - cur->border_w;
-    double radius_t    = cur->hex_size * RADIUS_T_FRAC * 0.5;
+    double limit_inner = 0.5 - g->border_w;
+    double radius_t    = g->hex_size * RADIUS_T_FRAC * 0.5;
 
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double px = (double)(col - ox) * CELL_W;
-            double py = (double)(row - oy) * CELL_H;
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double px = (double)(col - g->ox) * g->cw;
+            double py = (double)(row - g->oy) * g->ch;
 
             int Q, R;
             double dist;
-            pixel_to_hex(px, py, cur->hex_size, &Q, &R, &dist);
+            ctx_pixel_to_hex(g, px, py, &Q, &R, &dist);
 
             double cx, cy;
-            hex_centre_pixel(Q, R, cur->hex_size, &cx, &cy);
+            hex_centre_pixel(Q, R, g->hex_size, &cx, &cy);
             double dxp = px - cx, dyp = py - cy;
 
-            int on_cur_hex = (Q == cur->Q && R == cur->R);
+            int on_cur_hex = (Q == cQ && R == cR);
             int sector     = sector_of(dxp, dyp);
-            int on_cur_sec = (on_cur_hex && sector == cur->sector);
+            int on_cur_sec = (on_cur_hex && sector == cSector);
 
             /* Border */
             if (dist >= limit_inner) {
@@ -467,28 +480,95 @@ static void grid_draw(int rows, int cols, const Cursor *cur, int ox, int oy)
     }
 }
 
-static void scene_draw(int rows, int cols, const Cursor *cur, double fps)
-{
-    erase();
-    int ox = cols / 2;
-    int oy = (rows - 1) / 2;
-    grid_draw(rows, cols, cur, ox, oy);
-    cursor_draw(cur, rows, cols, ox, oy);
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
+/*
+ * Cursor — (q, r, sector) where (q, r) is axial hex space and
+ * sector ∈ 0..5 picks the CCW wedge inside that hex.
+ *
+ * Bounds and geometry live in GridCtx, not here — the cursor doesn't know
+ * how big the grid is. The two structs compose: Cursor + GridCtx → screen
+ * position via ctx_to_screen().
+ */
+typedef struct { int q, r, sector; } Cursor;
+
+/* HEX_DIR — same as hex_grids/01 (4 of the 6 hex faces). */
+static const int HEX_DIR[4][2] = {
+    { 0, -1 },   /* UP    */
+    { 0, +1 },   /* DOWN  */
+    {-1,  0 },   /* LEFT  */
+    {+1,  0 },   /* RIGHT */
+};
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    (void)g;
+    cur->q      = 0;
+    cur->r      = 0;
+    cur->sector = 0;
+}
+
+/*
+ * cursor_move — apply (dq, dr) in axial space.
+ *
+ * The hex plane is infinite; we do not clamp here. (max_q/max_r in GridCtx
+ * are advisory — visible-extent only.)
+ */
+static void cursor_move(Cursor *cur, const GridCtx *g, int idx)
+{
+    (void)g;
+    cur->q += HEX_DIR[idx][0];
+    cur->r += HEX_DIR[idx][1];
+}
+
+static void cursor_rotate(Cursor *cur, const GridCtx *g, int delta)
+{
+    (void)g;
+    cur->sector = (cur->sector + delta + 6) % 6;
+}
+
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc;
+    ctx_to_screen(g, cur->q, cur->r, cur->sector, &sr, &sc);
+    if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
+        attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+        mvaddch(sr, sc, '@');
+        attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
+                     int paused, double fps)
+{
     char buf[128];
     snprintf(buf, sizeof buf,
              " Q:%+d R:%+d sec:%d  size:%.0f  border:%.2f  theme:%d  %5.1f fps  %s ",
-             cur->Q, cur->R, cur->sector, cur->hex_size, cur->border_w,
-             cur->theme, fps, cur->paused ? "PAUSED " : "running");
+             cur->q, cur->r, cur->sector, g->hex_size, g->border_w,
+             theme, fps, paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " arrows:hex  ,/.: sector  +/-:size  [/]:border  t:theme  r:reset  q:quit  [06 hex subdivision] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
+                       int paused, double fps)
+{
+    erase();
+    ctx_draw_bg(g, cur->q, cur->r, cur->sector);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr);
     doupdate();
 }
@@ -499,14 +579,13 @@ static void scene_draw(int rows, int cols, const Cursor *cur, double fps)
 
 static void screen_cleanup(void) { endwin(); }
 
-static void screen_init(int theme)
+static void screen_init(void)
 {
     initscr(); cbreak(); noecho();
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
     curs_set(0);
     typeahead(-1);
-    color_init(theme);
     atexit(screen_cleanup);
 }
 
@@ -528,11 +607,18 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
 
-    Cursor cur;
-    cursor_reset(&cur);
-    screen_init(cur.theme);
+    screen_init();
+    int theme = 0, paused = 0;
+    color_init(theme);
 
-    int rows = LINES, cols = COLS;
+    GridCtx g = {0};
+    g.hex_size = HEX_SIZE_DEFAULT;
+    g.border_w = BORDER_W_DEFAULT;
+    ctx_init(&g, LINES, COLS);
+
+    Cursor cur;
+    cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double  fps = TARGET_FPS;
     int64_t t0  = clock_ns();
@@ -541,40 +627,40 @@ int main(void)
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();
-            rows = LINES; cols = COLS;
+            ctx_init(&g, LINES, COLS);
         }
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
                 case 'q': case 27:  g_running = 0; break;
-                case 'p':           cur.paused ^= 1; break;
-                case 'r':           cursor_reset(&cur); color_init(cur.theme); break;
+                case 'p':           paused ^= 1; break;
+                case 'r':           cursor_reset(&cur, &g); break;
                 case 't':
-                    cur.theme = (cur.theme + 1) % N_THEMES;
-                    color_init(cur.theme);
+                    theme = (theme + 1) % N_THEMES;
+                    color_init(theme);
                     break;
-                case KEY_UP:    cursor_step_hex(&cur, 0); break;
-                case KEY_DOWN:  cursor_step_hex(&cur, 1); break;
-                case KEY_LEFT:  cursor_step_hex(&cur, 2); break;
-                case KEY_RIGHT: cursor_step_hex(&cur, 3); break;
-                case ',': case '<': cursor_rotate_sector(&cur, -1); break;
-                case '.': case '>': cursor_rotate_sector(&cur, +1); break;
+                case KEY_UP:    cursor_move(&cur, &g, 0); break;
+                case KEY_DOWN:  cursor_move(&cur, &g, 1); break;
+                case KEY_LEFT:  cursor_move(&cur, &g, 2); break;
+                case KEY_RIGHT: cursor_move(&cur, &g, 3); break;
+                case ',': case '<': cursor_rotate(&cur, &g, -1); break;
+                case '.': case '>': cursor_rotate(&cur, &g, +1); break;
                 case '+': case '=':
-                    if (cur.hex_size < HEX_SIZE_MAX) { cur.hex_size += HEX_SIZE_STEP; } break;
+                    if (g.hex_size < HEX_SIZE_MAX) { g.hex_size += HEX_SIZE_STEP; ctx_init(&g, LINES, COLS); } break;
                 case '-':
-                    if (cur.hex_size > HEX_SIZE_MIN) { cur.hex_size -= HEX_SIZE_STEP; } break;
+                    if (g.hex_size > HEX_SIZE_MIN) { g.hex_size -= HEX_SIZE_STEP; ctx_init(&g, LINES, COLS); } break;
                 case '[':
-                    if (cur.border_w > BORDER_W_MIN) { cur.border_w -= BORDER_W_STEP; } break;
+                    if (g.border_w > BORDER_W_MIN) { g.border_w -= BORDER_W_STEP; } break;
                 case ']':
-                    if (cur.border_w < BORDER_W_MAX) { cur.border_w += BORDER_W_STEP; } break;
+                    if (g.border_w < BORDER_W_MAX) { g.border_w += BORDER_W_STEP; } break;
             }
         }
 
-        int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
-        t0  = now;
+        int64_t now = clock_ns(), dt = now - t0; t0 = now;
+        if (dt > 0)
+            fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (double)dt) * FPS_EWMA_ALPHA;
 
-        scene_draw(rows, cols, &cur, fps);
+        scene_draw(&g, &cur, theme, paused, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

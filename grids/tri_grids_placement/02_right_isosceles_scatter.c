@@ -16,11 +16,11 @@
  *   §1 config   — CELL_W, CELL_H, TRI_SIZE, SCATTER_RADIUS, DENSITY
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — 6-bucket gradient palette + cursor / HUD / hint
- *   §4 formula  — pixel ↔ axis-aligned lattice + centroid + edge char
- *   §5 pool     — ScatterPool: clear / contains / add / draw
- *   §6 cursor   — TRI_DIR + step + draw
- *   §7 scatter  — pattern_scatter spawn + Manhattan distance bucket
- *   §8 scene    — grid_draw + scene_draw
+ *   §4 gridctx  — GridCtx + pixel/centroid/edge formula
+ *   §5 pool     — Pool: clear / draw + LCG / distance helpers
+ *   §6 cursor   — Cursor + TRI_DIR + reset / move / draw
+ *   §7 scatter  — scatter_seed spawn + scatter_draw bucket coloring
+ *   §8 scene    — hud_draw + scene_draw
  *   §9 screen   — ncurses init / cleanup
  *  §10 app      — signals, main loop
  *
@@ -39,7 +39,7 @@
  *                  style cell distance from cursor, bucketed into 6
  *                  gradient slots.
  *
- * Data-structure : ScatterPool — flat array of (col, row, up) entries.
+ * Data-structure : Pool — flat array of Obj{col, row, up, glyph, alive}.
  *                  Bucket assignment is recomputed every frame from the
  *                  cursor's CURRENT position; the entries themselves
  *                  only change on reseed.
@@ -79,7 +79,7 @@
  * DRAWING METHOD  (per frame)
  * ──────────────
  *  1. erase()
- *  2. grid_draw — raster scan: pixel_to_tri → tri_edge_char ('|','_',
+ *  2. ctx_draw_bg — raster scan: pixel_to_tri → tri_edge_char ('|','_',
  *     '\\').
  *  3. For each scatter object:
  *       d = |obj.col - cur.col| + |obj.row - cur.row|
@@ -95,7 +95,7 @@
  *    for i in 0..density:
  *      dC = floor(frand·(2·R+1)) - R    ; dR = same
  *      up = (frand > 0.5) ? UR : LL
- *      pool_add(cur.col+dC, cur.row+dR, up)   // dedup
+ *      pool entry ← (cur.col+dC, cur.row+dR, up)
  *
  * KEY FORMULAS
  * ────────────
@@ -119,8 +119,8 @@
  * EDGE CASES TO WATCH
  * ───────────────────
  *  • Density saturation: at density values approaching MAX_OBJ the
- *    pool fills and pool_add deduplicates. The visible scatter may
- *    look thinner than the requested density.
+ *    pool fills. The visible scatter may look thinner than the
+ *    requested density.
  *  • Manhattan vs true edge distance: on the half-rect lattice the
  *    actual edge-walk distance involves the diagonal; Manhattan is a
  *    fast proxy for short ranges.
@@ -168,6 +168,8 @@
 #define N_BUCKETS  6
 #define N_THEMES   3
 
+#define FPS_EWMA_ALPHA 0.05
+
 #define PAIR_BORDER 1
 #define PAIR_CURSOR 2
 #define PAIR_BUCK0  3
@@ -214,14 +216,48 @@ static void color_init(int theme)
         init_pair(PAIR_BUCK0 + i, fg, -1);
     }
     init_pair(PAIR_BORDER, COLORS >= 256 ? 248 : COLOR_WHITE, -1);
-    init_pair(PAIR_CURSOR, COLORS >= 256 ? 15  : COLOR_WHITE, COLOR_BLUE);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  0  : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLORS >= 256 ? 75  : COLOR_CYAN,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ?  15 : COLOR_WHITE, COLOR_BLUE);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — half-rect lattice                                         */
+/* §4  gridctx — half-rect lattice                                         */
 /* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int    rows, cols;
+    double tri_size;
+    int    cell_w, cell_h;
+    int    ox, oy;
+    double border_w;
+    int    theme;
+    int    paused;
+    int    density;
+    int    scatter_radius;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows     = rows;
+    g->cols     = cols;
+    g->tri_size = TRI_SIZE_DEFAULT;
+    g->cell_w   = CELL_W;
+    g->cell_h   = CELL_H;
+    g->ox       = cols / 2;
+    g->oy       = (rows - 1) / 2;
+    g->border_w = BORDER_W;
+    g->theme    = 0;
+    g->paused   = 0;
+    g->density  = DENSITY_DEFAULT;
+    g->scatter_radius = SCATTER_RADIUS;
+}
+
+static void ctx_resize(GridCtx *g, int rows, int cols)
+{
+    g->rows = rows; g->cols = cols;
+    g->ox = cols / 2; g->oy = (rows - 1) / 2;
+}
 
 static void pixel_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
@@ -243,6 +279,15 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
     *cx_pix = a * size; *cy_pix = b * size;
 }
 
+static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+                          int *scol, int *srow)
+{
+    double cx, cy;
+    tri_centroid_pixel(col, row, up, g->tri_size, &cx, &cy);
+    *scol = g->ox + (int)(cx / g->cell_w);
+    *srow = g->oy + (int)(cy / g->cell_h);
+}
+
 static char tri_edge_char(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3; char ch1, ch2, ch3;
@@ -255,21 +300,29 @@ static char tri_edge_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-static void tri_to_screen(int col, int row, int up, double size,
-                          int ox, int oy, int *scol, int *srow)
+static void ctx_draw_bg(const GridCtx *g)
 {
-    double cx, cy;
-    tri_centroid_pixel(col, row, up, size, &cx, &cy);
-    *scol = ox + (int)(cx / CELL_W);
-    *srow = oy + (int)(cy / CELL_H);
+    attron(COLOR_PAIR(PAIR_BORDER));
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double px = (double)(col - g->ox) * g->cell_w;
+            double py = (double)(row - g->oy) * g->cell_h;
+            int tC, tR, tU; double fa, fb, m;
+            pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+            char ch = tri_edge_char(tU, fa, fb, &m);
+            if (m >= g->border_w) continue;
+            mvaddch(row, col, (chtype)(unsigned char)ch);
+        }
+    }
+    attroff(COLOR_PAIR(PAIR_BORDER));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  pool / cursor / scatter                                             */
+/* §5  pool                                                                */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-typedef struct { int col, row, up; } TPos;
-typedef struct { TPos pos[MAX_OBJ]; int count; } ScatterPool;
+typedef struct { int col, row, up; char glyph; bool alive; } Obj;
+typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
 
 static unsigned int g_seed = 1;
 static double frand(void)
@@ -277,12 +330,16 @@ static double frand(void)
     g_seed = g_seed * 1103515245u + 12345u;
     return ((double)((g_seed >> 16) & 0x7FFF)) / 32767.0;
 }
+
+static void pool_clear(Pool *p) { p->count = 0; }
+
 static int triangle_distance(int aC, int aR, int aU, int bC, int bR, int bU)
 {
     int d = abs(aC - bC) + abs(aR - bR);
     if (aU != bU) d += 1;
     return d;
 }
+
 static int distance_bucket(int dist, int max_d)
 {
     if (max_d <= 0) return 0;
@@ -291,9 +348,11 @@ static int distance_bucket(int dist, int max_d)
     return b;
 }
 
-typedef struct {
-    int col, row, up; int density; double tri_size; int theme, paused;
-} Cursor;
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct { int col, row, up; } Cursor;
 
 static const int TRI_DIR[4][2][3] = {
     { { -1,  0,  1 }, {  0,  0,  0 } },
@@ -302,110 +361,102 @@ static const int TRI_DIR[4][2][3] = {
     { {  0, +1,  1 }, {  0,  0,  0 } },
 };
 
-static void cursor_reset(Cursor *cur)
+static void cursor_reset(Cursor *cur, const GridCtx *g)
 {
+    (void)g;
     cur->col = 0; cur->row = 0; cur->up = 0;
-    cur->density = DENSITY_DEFAULT;
-    cur->tri_size = TRI_SIZE_DEFAULT;
-    cur->theme = 0; cur->paused = 0;
 }
-static void cursor_step(Cursor *cur, int dir)
+
+static void cursor_move(Cursor *cur, const GridCtx *g, int dcol, int drow, int dup)
 {
-    const int *t = TRI_DIR[dir][cur->up];
-    cur->col += t[0]; cur->row += t[1]; cur->up = t[2];
+    (void)g;
+    cur->col += dcol; cur->row += drow; cur->up = dup;
 }
 
-static void scatter_seed(ScatterPool *sp, const Cursor *cur)
-{
-    sp->count = 0;
-    g_seed ^= (unsigned int)clock_ns();
-    int max = (cur->density < MAX_OBJ) ? cur->density : MAX_OBJ;
-    int tries = 0;
-    while (sp->count < max && tries < max * 4) {
-        int dC = (int)(frand() * (2 * SCATTER_RADIUS + 1)) - SCATTER_RADIUS;
-        int dR = (int)(frand() * (2 * SCATTER_RADIUS + 1)) - SCATTER_RADIUS;
-        int up = frand() > 0.5 ? 1 : 0;
-        sp->pos[sp->count++] = (TPos){ cur->col + dC, cur->row + dR, up };
-        tries++;
-    }
-}
-
-static void scatter_draw(const ScatterPool *sp, const Cursor *cur,
-                         int ox, int oy, int rows, int cols)
-{
-    for (int i = 0; i < sp->count; i++) {
-        int sc, sr;
-        tri_to_screen(sp->pos[i].col, sp->pos[i].row, sp->pos[i].up,
-                      cur->tri_size, ox, oy, &sc, &sr);
-        if (sc < 0 || sc >= cols || sr < 0 || sr >= rows - 1) continue;
-        int dist = triangle_distance(sp->pos[i].col, sp->pos[i].row, sp->pos[i].up,
-                                     cur->col, cur->row, cur->up);
-        int b = distance_bucket(dist, SCATTER_RADIUS * 2);
-        attron(COLOR_PAIR(PAIR_BUCK0 + b) | A_BOLD);
-        mvaddch(sr, sc, '*');
-        attroff(COLOR_PAIR(PAIR_BUCK0 + b) | A_BOLD);
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void grid_draw(int rows, int cols, double size, int ox, int oy)
-{
-    attron(COLOR_PAIR(PAIR_BORDER));
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double px = (double)(col - ox) * CELL_W;
-            double py = (double)(row - oy) * CELL_H;
-            int tC, tR, tU; double fa, fb, m;
-            pixel_to_tri(px, py, size, &tC, &tR, &tU, &fa, &fb);
-            char ch = tri_edge_char(tU, fa, fb, &m);
-            if (m >= BORDER_W) continue;
-            mvaddch(row, col, (chtype)(unsigned char)ch);
-        }
-    }
-    attroff(COLOR_PAIR(PAIR_BORDER));
-}
-
-static void cursor_draw(const Cursor *cur, int ox, int oy, int rows, int cols)
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    tri_to_screen(cur->col, cur->row, cur->up, cur->tri_size, ox, oy, &sc, &sr);
-    if (sc >= 0 && sc < cols && sr >= 0 && sr < rows - 1) {
+    ctx_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
+    if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
         attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
         mvaddch(sr, sc, '@');
         attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
     }
 }
 
-static void scene_draw(int rows, int cols, const Cursor *cur,
-                       const ScatterPool *sp, double fps)
-{
-    erase();
-    int ox = cols / 2, oy = (rows - 1) / 2;
-    grid_draw(rows, cols, cur->tri_size, ox, oy);
-    scatter_draw(sp, cur, ox, oy, rows, cols);
-    cursor_draw(cur, ox, oy, rows, cols);
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §7  scatter                                                             */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
+static void scatter_seed(Pool *sp, const GridCtx *g, const Cursor *cur)
+{
+    sp->count = 0;
+    g_seed ^= (unsigned int)clock_ns();
+    int max = (g->density < MAX_OBJ) ? g->density : MAX_OBJ;
+    int tries = 0;
+    int R = g->scatter_radius;
+    while (sp->count < max && tries < max * 4) {
+        int dC = (int)(frand() * (2 * R + 1)) - R;
+        int dR = (int)(frand() * (2 * R + 1)) - R;
+        int up = frand() > 0.5 ? 1 : 0;
+        sp->items[sp->count++] = (Obj){ cur->col + dC, cur->row + dR, up, '*', true };
+        tries++;
+    }
+}
+
+static void scatter_draw(const Pool *sp, const GridCtx *g, const Cursor *cur)
+{
+    int max_d = g->scatter_radius * 2;
+    for (int i = 0; i < sp->count; i++) {
+        int sc, sr;
+        ctx_to_screen(g, sp->items[i].col, sp->items[i].row, sp->items[i].up,
+                      &sc, &sr);
+        if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) continue;
+        int dist = triangle_distance(sp->items[i].col, sp->items[i].row, sp->items[i].up,
+                                     cur->col, cur->row, cur->up);
+        int b = distance_bucket(dist, max_d);
+        attron(COLOR_PAIR(PAIR_BUCK0 + b) | A_BOLD);
+        mvaddch(sr, sc, (chtype)(unsigned char)sp->items[i].glyph);
+        attroff(COLOR_PAIR(PAIR_BUCK0 + b) | A_BOLD);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §8  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void hud_draw(const GridCtx *g, const Pool *sp, const Cursor *cur,
+                     double fps)
+{
     char buf[128];
     snprintf(buf, sizeof buf,
              " C:%+d R:%+d %s  N:%d  size:%.0f  theme:%d  %5.1f fps  %s ",
              cur->col, cur->row, cur->up ? "UR" : "LL",
-             sp->count, cur->tri_size, cur->theme, fps,
-             cur->paused ? "PAUSED " : "running");
+             sp->count, g->tri_size, g->theme, fps,
+             g->paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " arrows:move  spc:reseed  +/-:density  t:theme  r:reset  q:quit  [02 scatter] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+static void scene_draw(const GridCtx *g, const Pool *sp, const Cursor *cur,
+                       double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    scatter_draw(sp, g, cur);
+    cursor_draw(cur, g);
+    hud_draw(g, sp, cur, fps);
     wnoutrefresh(stdscr); doupdate();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  screen                                                              */
+/* §9  screen                                                              */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 static void screen_cleanup(void) { endwin(); }
@@ -418,7 +469,7 @@ static void screen_init(int theme)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  app                                                                 */
+/* §10 app                                                                 */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
@@ -431,38 +482,43 @@ static void on_signal(int s)
 int main(void)
 {
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGWINCH, on_signal);
-    Cursor      cur; cursor_reset(&cur);
-    ScatterPool sp;  sp.count = 0;
+
+    GridCtx g; ctx_init(&g, 0, 0);
+    screen_init(g.theme);
+    ctx_init(&g, LINES, COLS);
+
+    Cursor cur; cursor_reset(&cur, &g);
+    Pool   sp;  pool_clear(&sp);
     g_seed = (unsigned int)clock_ns();
-    screen_init(cur.theme);
-    scatter_seed(&sp, &cur);
-    int rows = LINES, cols = COLS;
+    scatter_seed(&sp, &g, &cur);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double fps = TARGET_FPS; int64_t t0 = clock_ns();
     while (g_running) {
-        if (g_need_resize) { g_need_resize = 0; endwin(); refresh(); rows = LINES; cols = COLS; }
+        if (g_need_resize) { g_need_resize = 0; endwin(); refresh(); ctx_resize(&g, LINES, COLS); }
         int ch;
         while ((ch = getch()) != ERR) {
+            const int *t;
             switch (ch) {
                 case 'q': case 27: g_running = 0; break;
-                case 'p': cur.paused ^= 1; break;
-                case 'r': cursor_reset(&cur); scatter_seed(&sp, &cur); color_init(cur.theme); break;
-                case ' ': scatter_seed(&sp, &cur); break;
-                case 't': cur.theme = (cur.theme + 1) % N_THEMES; color_init(cur.theme); break;
-                case KEY_LEFT:  cursor_step(&cur, 0); break;
-                case KEY_RIGHT: cursor_step(&cur, 1); break;
-                case KEY_UP:    cursor_step(&cur, 2); break;
-                case KEY_DOWN:  cursor_step(&cur, 3); break;
+                case 'p': g.paused ^= 1; break;
+                case 'r': cursor_reset(&cur, &g); scatter_seed(&sp, &g, &cur); color_init(g.theme); break;
+                case ' ': scatter_seed(&sp, &g, &cur); break;
+                case 't': g.theme = (g.theme + 1) % N_THEMES; color_init(g.theme); break;
+                case KEY_LEFT:  t = TRI_DIR[0][cur.up]; cursor_move(&cur, &g, t[0], t[1], t[2]); break;
+                case KEY_RIGHT: t = TRI_DIR[1][cur.up]; cursor_move(&cur, &g, t[0], t[1], t[2]); break;
+                case KEY_UP:    t = TRI_DIR[2][cur.up]; cursor_move(&cur, &g, t[0], t[1], t[2]); break;
+                case KEY_DOWN:  t = TRI_DIR[3][cur.up]; cursor_move(&cur, &g, t[0], t[1], t[2]); break;
                 case '+': case '=':
-                    if (cur.density < DENSITY_MAX) { cur.density += DENSITY_STEP; scatter_seed(&sp, &cur); } break;
+                    if (g.density < DENSITY_MAX) { g.density += DENSITY_STEP; scatter_seed(&sp, &g, &cur); } break;
                 case '-':
-                    if (cur.density > DENSITY_MIN) { cur.density -= DENSITY_STEP; scatter_seed(&sp, &cur); } break;
+                    if (g.density > DENSITY_MIN) { g.density -= DENSITY_STEP; scatter_seed(&sp, &g, &cur); } break;
             }
         }
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0 = now;
-        scene_draw(rows, cols, &cur, &sp, fps);
+        scene_draw(&g, &sp, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

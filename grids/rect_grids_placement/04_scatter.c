@@ -15,10 +15,10 @@
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — 6 pairs
  *   §4 gridctx  — GridCtx, ctx_init, ctx_to_screen, ctx_draw_bg
- *   §5 pool     — ObjectPool
+ *   §5 pool     — Pool
  *   §6 scatter  — random, min-distance, BFS flood fill, gradient
  *   §7 cursor   — Cursor struct, move, reset, draw
- *   §8 scene    — scene_draw
+ *   §8 scene    — hud_draw + scene_draw
  *   §9 screen   — ncurses init/cleanup
  *   §10 app     — signals, main loop
  *
@@ -161,6 +161,9 @@
 #define TARGET_FPS   30
 #define MAX_OBJ     256
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
+
 #define RAND_N       40     /* objects placed by R (random scatter) */
 #define MAX_TRIES   400     /* rejection-sampling attempts for M */
 #define MIN_DIST      3     /* Chebyshev min-distance for M */
@@ -201,8 +204,8 @@
 #define PAIR_ACTIVE  2
 #define PAIR_CURSOR  3
 #define PAIR_OBJ     4
-#define PAIR_HUD     5
-#define PAIR_LABEL   6
+#define PAIR_HUD     5   /* status bar (yellow)  */
+#define PAIR_HINT    6   /* key-hint footer (cyan) */
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -233,7 +236,7 @@ static void color_init(void)
     init_pair(PAIR_CURSOR, COLORS>=256 ? 226 : COLOR_YELLOW, -1);
     init_pair(PAIR_OBJ,    COLORS>=256 ? 214 : COLOR_RED,    -1);
     init_pair(PAIR_HUD,    COLORS>=256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_LABEL,  COLORS>=256 ? 252 : COLOR_WHITE,  -1);
+    init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -542,32 +545,32 @@ static void cursor_draw(const Cursor *cur, const GridCtx *g)
 /* §8  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
-                       double fps)
+/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+static void hud_draw(const GridCtx *g, const Pool *p, double fps)
 {
-    int rows=g->rows, cols=g->cols;
-    erase();
-    ctx_draw_bg(g);
-    pool_draw(p,g);
-    cursor_draw(cur,g);
-
     char buf[96];
     snprintf(buf,sizeof buf," %.1f fps  %s  objs=%d/%d ",
              fps,gm_name[g->mode],p->count,MAX_OBJ);
     attron(COLOR_PAIR(PAIR_HUD)|A_BOLD);
-    mvprintw(0,cols-(int)strlen(buf),"%s",buf);
+    mvprintw(0,g->cols-(int)strlen(buf),"%s",buf);
     attroff(COLOR_PAIR(PAIR_HUD)|A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_ACTIVE)|A_BOLD);
-    mvprintw(rows-1, 0, " %-12s", gm_name[g->mode]);
-    attroff(COLOR_PAIR(PAIR_ACTIVE)|A_BOLD);
-    attron(COLOR_PAIR(PAIR_LABEL));
-    mvprintw(rows-1,13,
+    attron(COLOR_PAIR(PAIR_HINT)|A_BOLD);
+    mvprintw(g->rows-1, 0,
         " arrows:move  R:random M:min-dist F:flood G:gradient"
         "  C:clear  r:reset  q:quit"
-        "  a:prev-grid  e:next-grid ");
-    attroff(COLOR_PAIR(PAIR_LABEL));
+        "  a:prev-grid  e:next-grid  [%s] ", gm_name[g->mode]);
+    attroff(COLOR_PAIR(PAIR_HINT)|A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
+                       double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    pool_draw(p,g);
+    cursor_draw(cur,g);
+    hud_draw(g, p, fps);
     wnoutrefresh(stdscr); doupdate();
 }
 
@@ -638,7 +641,8 @@ int main(void)
         }
 
         int64_t now=clock_ns();
-        fps=fps*0.95+(1e9/(now-t0+1))*0.05; t0=now;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9/(now-t0+1)) * FPS_EWMA_ALPHA;
+        t0 = now;
         scene_draw(&ctx,&pool,&cur,fps);
         clock_sleep_ns(FRAME_NS-(clock_ns()-now));
     }

@@ -12,14 +12,18 @@
  * Study alongside: 04_30_60_90.c — single-level barycentric subdivision
  *                  applied uniformly to the equilateral tiling.
  *                  08_triforce.c — 4-way midpoint split (no centroid).
+ *                  ../README.md — GridCtx primitive (this file builds a
+ *                  mesh on demand instead of a per-pixel inverse).
  *
  * Section map:
- *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC
+ *   §1 config   — CELL_W, CELL_H, DEPTH, SIZE_FRAC, EWMA constant
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — depth-keyed palette + HUD / hint
- *   §4 formula  — slope_char + Bresenham line_draw
- *   §5 subdivide — 6-way recursive split, leaf emitter
- *   §6 scene    — seed_triangle + scene_draw
+ *   §4 formula  — GridCtx + ctx_init + slope_char + Bresenham line_draw
+ *   §5 mesh     — 6-way recursive subdivide, leaf emitter
+ *                 (no Cursor — depth is the user-controlled parameter,
+ *                  arrow keys go unused; +/- adjusts depth instead)
+ *   §6 scene    — hud_draw + scene_draw (seed triangle + recursion)
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -40,6 +44,11 @@
  *                    (C, M12, V2), (C, V2, M20), (C, M20, V0).
  *                  Each sub-triangle is a 30-60-90 right triangle.
  *                  Recurse for N levels: 6^N leaves.
+ *
+ * Data-structure : GridCtx carries the recursion parameters (depth,
+ *                  size_frac) and screen extent. No persistent mesh array
+ *                  — the recursion emits each leaf's edges directly into
+ *                  the framebuffer. See ../README.md "The two primitives".
  *
  * Formula        : Centroid:    C = (V0+V1+V2)/3
  *                  Midpoints:   Mij = (Vi+Vj)/2
@@ -86,7 +95,7 @@
  *
  * DRAWING METHOD  (recursive emit, the approach used here)
  * ──────────────
- *  1. Pick DEPTH and SIZE_FRAC (fraction of screen the seed fills).
+ *  1. Pick DEPTH and SIZE_FRAC.
  *  2. Build the seed triangle as 3 (x, y) pixel coords centered on screen.
  *  3. Recursive function subdivide(t, depth):
  *       if depth == max_depth: draw t's 3 edges with line_draw + slope_char
@@ -134,7 +143,7 @@
  *    recursion depth are the same color — visually communicates the
  *    hierarchical structure.
  *  • Resize: recompute the seed triangle each frame from the current
- *    screen size. No state to recompute; the recursion is pure.
+ *    GridCtx extent. No state to recompute; the recursion is pure.
  *
  * HOW TO VERIFY
  * ─────────────
@@ -187,6 +196,9 @@
 #define MAX_DEPTH_LEVELS (DEPTH_MAX + 1)
 #define N_THEMES         3
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA 0.05
+
 #define PAIR_DEPTH_BASE  1
 #define PAIR_HUD        (PAIR_DEPTH_BASE + MAX_DEPTH_LEVELS)
 #define PAIR_HINT       (PAIR_HUD + 1)
@@ -233,13 +245,49 @@ static void color_init(int theme)
         short fg = (COLORS >= 256) ? PAL256[theme][i] : PAL8[theme][i];
         init_pair(PAIR_DEPTH_BASE + i, fg, -1);
     }
-    init_pair(PAIR_HUD,  COLORS >= 256 ?  0 : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT, COLORS >= 256 ? 75 : COLOR_CYAN,  -1);
+    init_pair(PAIR_HUD,  COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — slope_char + Bresenham line                               */
+/* §4  formula — GridCtx + slope_char + Bresenham line                     */
 /* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * GridCtx — geometry + recursion parameters for the substitution mesh.
+ *
+ * Shape mirrors the canonical GridCtx (rect_grids/01_uniform_rect.c) but
+ * carries the substitution-specific extras: depth and size_frac. The
+ * recursion is pure — no persistent mesh array — so GridCtx is also the
+ * complete state needed to redraw.
+ */
+typedef struct {
+    /* terminal extent */
+    int    rows, cols;
+
+    /* cell size in screen characters (aspect-correction only) */
+    int    cw, ch;
+
+    /* screen origin (centre of seed triangle, in pixel-sub-units) */
+    int    ox, oy;
+
+    /* recursion parameters */
+    int    depth;
+    double size_frac;
+} GridCtx;
+
+/*
+ * ctx_init — derive geometry from terminal size + scene parameters.
+ */
+static void ctx_init(GridCtx *g, int rows, int cols, int depth, double size_frac)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->ox = (cols * CELL_W) / 2;
+    g->oy = ((rows - 1) * CELL_H) / 2;
+    g->depth     = depth;
+    g->size_frac = size_frac;
+}
 
 /*
  * slope_char — pixel-space (dx, dy) → ASCII line character.
@@ -268,7 +316,7 @@ static char slope_char(double dx, double dy)
  * by integer division by (CELL_W, CELL_H). The character is constant
  * along the line (chosen by slope_char of the pixel delta).
  */
-static void line_draw(int rows, int cols, double px0, double py0,
+static void line_draw(const GridCtx *g, double px0, double py0,
                       double px1, double py1, int attr)
 {
     char ch = slope_char(px1 - px0, py1 - py0);
@@ -279,7 +327,7 @@ static void line_draw(int rows, int cols, double px0, double py0,
     int err = dx + dy;
     attron(attr);
     for (;;) {
-        if (x0 >= 0 && x0 < cols && y0 >= 0 && y0 < rows - 1)
+        if (x0 >= 0 && x0 < g->cols && y0 >= 0 && y0 < g->rows - 1)
             mvaddch(y0, x0, (chtype)(unsigned char)ch);
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -290,18 +338,24 @@ static void line_draw(int rows, int cols, double px0, double py0,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  subdivide — 6-way recursive split                                   */
+/* §5  mesh — 6-way recursive subdivide                                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
+/*
+ * No Cursor struct: the user "moves" through the visualisation by changing
+ * DEPTH (+/-) and SIZE_FRAC ([/]), not by stepping through individual
+ * leaves. A leaf-index cursor would need pre-computing the mesh just to
+ * count leaves; we keep the recursion pure-emit.
+ */
 
 typedef struct { double x[3], y[3]; } Tri;
 
-static void tri_draw_edges(int rows, int cols, Tri t, int depth)
+static void tri_draw_edges(const GridCtx *g, Tri t, int depth)
 {
     int pair = PAIR_DEPTH_BASE + depth;
     int attr = COLOR_PAIR(pair) | (depth == 0 ? A_BOLD : 0);
-    line_draw(rows, cols, t.x[0], t.y[0], t.x[1], t.y[1], attr);
-    line_draw(rows, cols, t.x[1], t.y[1], t.x[2], t.y[2], attr);
-    line_draw(rows, cols, t.x[2], t.y[2], t.x[0], t.y[0], attr);
+    line_draw(g, t.x[0], t.y[0], t.x[1], t.y[1], attr);
+    line_draw(g, t.x[1], t.y[1], t.x[2], t.y[2], attr);
+    line_draw(g, t.x[2], t.y[2], t.x[0], t.y[0], attr);
 }
 
 /*
@@ -310,9 +364,9 @@ static void tri_draw_edges(int rows, int cols, Tri t, int depth)
  * Six children are formed by the centroid + 3 edge midpoints. Each
  * child is (C, V_i, M_ij) traversing around the parent counter-clockwise.
  */
-static void subdivide(int rows, int cols, Tri t, int depth, int max_depth)
+static void subdivide(const GridCtx *g, Tri t, int depth, int max_depth)
 {
-    if (depth == max_depth) { tri_draw_edges(rows, cols, t, depth); return; }
+    if (depth == max_depth) { tri_draw_edges(g, t, depth); return; }
     double cx  = (t.x[0] + t.x[1] + t.x[2]) / 3.0;
     double cy  = (t.y[0] + t.y[1] + t.y[2]) / 3.0;
     double m01x = (t.x[0] + t.x[1]) * 0.5, m01y = (t.y[0] + t.y[1]) * 0.5;
@@ -327,7 +381,31 @@ static void subdivide(int rows, int cols, Tri t, int depth, int max_depth)
         { {cx, m20x, t.x[0]}, {cy, m20y, t.y[0]} },
     };
     for (int i = 0; i < 6; i++)
-        subdivide(rows, cols, subs[i], depth + 1, max_depth);
+        subdivide(g, subs[i], depth + 1, max_depth);
+}
+
+/*
+ * scene_seed — equilateral seed triangle centered on screen, apex up.
+ *
+ *   base = SIZE_FRAC · min(pw, ph)
+ *   h    = base · √3 / 2
+ *   V0 = (cx,           cy − 2·h/3)   ← apex
+ *   V1 = (cx − base/2,  cy +   h/3)
+ *   V2 = (cx + base/2,  cy +   h/3)
+ */
+static Tri scene_seed(const GridCtx *g)
+{
+    double pw = (double)g->cols * CELL_W;
+    double ph = (double)(g->rows - 1) * CELL_H;
+    double base = (pw < ph ? pw : ph) * g->size_frac;
+    double h    = base * sqrt(3.0) * 0.5;
+    double cxp  = (double)g->ox;
+    double cyp  = (double)g->oy;
+    Tri t = {
+        { cxp,                 cxp - base * 0.5, cxp + base * 0.5 },
+        { cyp - h * 2.0/3.0,   cyp + h / 3.0,    cyp + h / 3.0    },
+    };
+    return t;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -349,36 +427,9 @@ static void scene_reset(Scene *s)
     s->paused    = 0;
 }
 
-/*
- * scene_seed — equilateral seed triangle centered on screen, apex up.
- *
- *   base = SIZE_FRAC · min(pw, ph)
- *   h    = base · √3 / 2
- *   V0 = (cx,           cy − 2·h/3)   ← apex
- *   V1 = (cx − base/2,  cy +   h/3)
- *   V2 = (cx + base/2,  cy +   h/3)
- */
-static Tri scene_seed(const Scene *s, int rows, int cols)
+/* Bright bold yellow fps readout (top-right) + bold cyan key hints (bottom). */
+static void hud_draw(const GridCtx *g, const Scene *s, double fps)
 {
-    double pw = (double)cols * CELL_W;
-    double ph = (double)(rows - 1) * CELL_H;
-    double base = (pw < ph ? pw : ph) * s->size_frac;
-    double h    = base * sqrt(3.0) * 0.5;
-    double cxp  = pw * 0.5;
-    double cyp  = ph * 0.5;
-    Tri t = {
-        { cxp,                 cxp - base * 0.5, cxp + base * 0.5 },
-        { cyp - h * 2.0/3.0,   cyp + h / 3.0,    cyp + h / 3.0    },
-    };
-    return t;
-}
-
-static void scene_draw(int rows, int cols, const Scene *s, double fps)
-{
-    erase();
-    Tri seed = scene_seed(s, rows, cols);
-    subdivide(rows, cols, seed, 0, s->depth);
-
     long leaves = 1; for (int i = 0; i < s->depth; i++) leaves *= 6;
     char buf[128];
     snprintf(buf, sizeof buf,
@@ -386,14 +437,21 @@ static void scene_draw(int rows, int cols, const Scene *s, double fps)
              s->depth, leaves, s->size_frac, s->theme, fps,
              s->paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " +/-:depth  [/]:size  t:theme  r:reset  p:pause  q:quit  [07 barycentric] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Scene *s, double fps)
+{
+    erase();
+    Tri seed = scene_seed(g);
+    subdivide(g, seed, 0, s->depth);
+    hud_draw(g, s, fps);
     wnoutrefresh(stdscr);
     doupdate();
 }
@@ -437,7 +495,9 @@ int main(void)
     scene_reset(&sc);
     screen_init(sc.theme);
 
-    int rows = LINES, cols = COLS;
+    GridCtx g;
+    ctx_init(&g, LINES, COLS, sc.depth, sc.size_frac);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double  fps = TARGET_FPS;
     int64_t t0  = clock_ns();
@@ -446,8 +506,9 @@ int main(void)
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();
-            rows = LINES; cols = COLS;
         }
+        ctx_init(&g, LINES, COLS, sc.depth, sc.size_frac);
+
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
@@ -470,10 +531,10 @@ int main(void)
         }
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0  = now;
 
-        scene_draw(rows, cols, &sc, fps);
+        scene_draw(&g, &sc, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

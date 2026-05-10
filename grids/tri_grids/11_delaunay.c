@@ -3,9 +3,10 @@
  * 11_delaunay.c — Delaunay triangulation of random points (Bowyer-Watson)
  *
  * DEMO: N random points are scattered across the screen and triangulated
- *       with the Bowyer-Watson incremental algorithm. The cursor
- *       highlights one triangle; ',' / '.' cycle the cursor through the
- *       triangle list. Press 'r' to reseed with new random points.
+ *       with the Bowyer-Watson incremental algorithm. The cursor selects
+ *       one input point and highlights every triangle incident to it;
+ *       ',' / '.' cycle the cursor through the points list. Press 'r' to
+ *       reseed with new random points.
  *
  * Study alongside: 01_equilateral.c — regular triangle tiling. This file
  *                  is the IRREGULAR counterpart: any point cloud can be
@@ -14,15 +15,18 @@
  *                  geometry/delaunay_triangulation.c — fuller reference
  *                  with circumcircle visualisation and step-by-step
  *                  insertion.
+ *                  ../README.md — GridCtx primitive (this file builds a
+ *                  mesh from a point set).
  *
  * Section map:
- *   §1 config   — N points, screen margins
+ *   §1 config   — N points, screen margins, EWMA constant
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — 5 pairs: edge / point / cursor / HUD / hint
- *   §4 formula  — orient2d + circumcircle determinant predicate
+ *   §4 formula  — GridCtx + ctx_init + orient2d + circumcircle predicate
  *   §5 mesh     — Bowyer-Watson insertion + super-triangle cleanup
- *   §5b draw    — slope_char + Bresenham line_draw
- *   §6 scene    — seed_random + scene_draw
+ *   §5b cursor  — Cursor { int point_idx } + cursor_advance / cursor_draw
+ *   §5c draw    — slope_char + Bresenham line_draw
+ *   §6 scene    — hud_draw + scene_draw (seed_random + render)
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -49,6 +53,14 @@
  *                       triangle vertex; the rest is the Delaunay
  *                       triangulation of the actual input points.
  *
+ * Data-structure : GridCtx carries screen extent and the input point
+ *                  count. A separate static mesh (g_pts, g_tris) holds
+ *                  the actual points and triangles — building a Delaunay
+ *                  mesh requires global state (the in-circle predicate
+ *                  consults all triangles), which is the documented
+ *                  exception to "no malloc in hot path" (here static
+ *                  arrays, sized at compile time).
+ *
  * Formula        : Empty-circumcircle predicate (in_circumcircle):
  *                    For triangle ABC (CCW) and point P:
  *                      | A.x−P.x  A.y−P.y  (A.x²+A.y²−P.x²−P.y²) |
@@ -62,9 +74,11 @@
  *                  Slope→character classification (same as 07-10).
  *                  Points draw as '*' in PAIR_POINT.
  *
- * Movement       : ',' / '.' cycle the cursor through the (valid) triangle
- *                  list. Triangle highlight uses PAIR_CURSOR with bold
- *                  edges. 'r' reseeds with new random points.
+ * Movement       : ',' / '.' cycle the cursor through the input points
+ *                  list (N_SUPER..g_n_pts-1). The selected point is drawn
+ *                  with '@' in PAIR_CURSOR; every triangle that contains
+ *                  the selected point as a vertex is highlighted bold.
+ *                  'r' reseeds with new random points.
  *
  * References     :
  *   Bowyer, "Computing Dirichlet Tessellations" (1981)
@@ -116,8 +130,9 @@
  *  4. mesh_strip_super(): mark every triangle touching a super vertex as
  *     invalid.
  *  5. Draw every valid triangle's 3 edges with Bresenham + slope_char.
- *  6. Draw every input point as '*'.
- *  7. Highlight the cursor triangle; ',' / '.' move cursor.
+ *     Bold-highlight every triangle incident to the cursor point.
+ *  6. Draw every input point as '*'; the cursor point as '@'.
+ *  7. ',' / '.' move the cursor index through the input points.
  *
  * KEY FORMULAS
  * ────────────
@@ -205,6 +220,9 @@
 #define MARGIN_FRAC      0.08
 #define N_THEMES         3
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA 0.05
+
 #define PAIR_EDGE   1
 #define PAIR_POINT  2
 #define PAIR_CURSOR 3
@@ -255,17 +273,41 @@ static void color_init(int theme)
     else               { fg_e = THEME_FG_8[theme][0]; fg_p = THEME_FG_8[theme][1]; }
     init_pair(PAIR_EDGE,   fg_e, -1);
     init_pair(PAIR_POINT,  fg_p, -1);
-    init_pair(PAIR_CURSOR, COLORS >= 256 ? 15 : COLOR_WHITE, COLOR_BLUE);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  0 : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLORS >= 256 ? 75 : COLOR_CYAN,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — orient2d + in_circumcircle                                */
+/* §4  formula — GridCtx + orient2d + in_circumcircle                      */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 typedef struct { double x, y; } Pt;
 typedef struct { int v[3]; int valid; } Tri;
+
+/*
+ * GridCtx — geometry + scene parameters for the Delaunay mesh.
+ *
+ * Mirrors the canonical GridCtx (rect_grids/01_uniform_rect.c) but
+ * carries the Delaunay-specific n_pts. The persistent mesh itself
+ * (g_pts, g_tris) lives in §5 statics — keeping that out of GridCtx
+ * preserves GridCtx as a thin geometry descriptor.
+ */
+typedef struct {
+    int rows, cols;
+    int cw, ch;
+    int ox, oy;          /* screen origin (centre) — used by some helpers */
+    int n_pts;           /* input point count (excludes the 3 super verts) */
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols, int n_pts)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->ox = (cols * CELL_W) / 2;
+    g->oy = ((rows - 1) * CELL_H) / 2;
+    g->n_pts = n_pts;
+}
 
 /*
  * orient2d — twice the signed area of triangle ABC. Positive ⇔ CCW.
@@ -421,8 +463,52 @@ static void mesh_strip_super(void)
     }
 }
 
+static int count_valid_tris(void)
+{
+    int n = 0;
+    for (int i = 0; i < g_n_tris; i++) if (g_tris[i].valid) n++;
+    return n;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §5b draw — slope_char + Bresenham line                                  */
+/* §5b  cursor — selection index into the input points list                */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Cursor — index into g_pts[N_SUPER..g_n_pts-1].
+ *
+ * Aperiodic / random meshes have no natural "neighbour" relation in cell
+ * space, so we cycle through the points list with ',' / '.' instead of
+ * arrow-key cell-stepping. The selected point is drawn '@' and every
+ * triangle incident to it is bold-highlighted.
+ */
+typedef struct { int point_idx; } Cursor;
+
+static void cursor_reset(Cursor *cur)
+{
+    cur->point_idx = (g_n_pts > N_SUPER) ? N_SUPER : -1;
+}
+
+static void cursor_advance(Cursor *cur, int dir)
+{
+    int n_input = g_n_pts - N_SUPER;
+    if (n_input <= 0) { cur->point_idx = -1; return; }
+    int rel = cur->point_idx - N_SUPER;
+    rel = (rel + dir + n_input) % n_input;
+    cur->point_idx = N_SUPER + rel;
+}
+
+/* True if triangle ti has the cursor point as one of its vertices. */
+static int tri_has_point(int ti, int point_idx)
+{
+    if (point_idx < 0) return 0;
+    return g_tris[ti].v[0] == point_idx
+        || g_tris[ti].v[1] == point_idx
+        || g_tris[ti].v[2] == point_idx;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5c draw — slope_char + Bresenham line                                  */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 static char slope_char(double dx, double dy)
@@ -435,7 +521,7 @@ static char slope_char(double dx, double dy)
     return ((dx >= 0) == (dy >= 0)) ? '\\' : '/';
 }
 
-static void line_draw(int rows, int cols, double px0, double py0,
+static void line_draw(const GridCtx *g, double px0, double py0,
                       double px1, double py1, int attr)
 {
     char ch = slope_char(px1 - px0, py1 - py0);
@@ -446,7 +532,7 @@ static void line_draw(int rows, int cols, double px0, double py0,
     int err = dx + dy;
     attron(attr);
     for (;;) {
-        if (x0 >= 0 && x0 < cols && y0 >= 0 && y0 < rows - 1)
+        if (x0 >= 0 && x0 < g->cols && y0 >= 0 && y0 < g->rows - 1)
             mvaddch(y0, x0, (chtype)(unsigned char)ch);
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -456,13 +542,58 @@ static void line_draw(int rows, int cols, double px0, double py0,
     attroff(attr);
 }
 
+/*
+ * ctx_draw_bg — render every valid mesh edge.
+ *
+ * Triangles incident to the cursor point are drawn with PAIR_CURSOR + bold;
+ * the rest with PAIR_EDGE.
+ */
+static void ctx_draw_bg(const GridCtx *g, const Cursor *cur)
+{
+    for (int i = 0; i < g_n_tris; i++) {
+        if (!g_tris[i].valid) continue;
+        int hot  = tri_has_point(i, cur->point_idx);
+        int attr = hot ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
+                       : COLOR_PAIR(PAIR_EDGE);
+        Pt A = g_pts[g_tris[i].v[0]];
+        Pt B = g_pts[g_tris[i].v[1]];
+        Pt C = g_pts[g_tris[i].v[2]];
+        line_draw(g, A.x, A.y, B.x, B.y, attr);
+        line_draw(g, B.x, B.y, C.x, C.y, attr);
+        line_draw(g, C.x, C.y, A.x, A.y, attr);
+    }
+}
+
+static void cursor_draw(const GridCtx *g, const Cursor *cur)
+{
+    /* All input points as '*' */
+    attron(COLOR_PAIR(PAIR_POINT) | A_BOLD);
+    for (int i = N_SUPER; i < g_n_pts; i++) {
+        int col = (int)(g_pts[i].x / CELL_W);
+        int row = (int)(g_pts[i].y / CELL_H);
+        if (col >= 0 && col < g->cols && row >= 0 && row < g->rows - 1)
+            mvaddch(row, col, '*');
+    }
+    attroff(COLOR_PAIR(PAIR_POINT) | A_BOLD);
+
+    /* Selected point as '@' on top */
+    if (cur->point_idx >= N_SUPER && cur->point_idx < g_n_pts) {
+        int col = (int)(g_pts[cur->point_idx].x / CELL_W);
+        int row = (int)(g_pts[cur->point_idx].y / CELL_H);
+        if (col >= 0 && col < g->cols && row >= 0 && row < g->rows - 1) {
+            attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+            mvaddch(row, col, '@');
+            attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+        }
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §6  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
     int          n_pts;
-    int          cursor_tri;     /* -1 = none */
     int          theme;
     int          paused;
     unsigned int seed;
@@ -474,7 +605,7 @@ static double frand(unsigned int *s)
     return ((double)((*s >> 16) & 0x7FFF)) / 32767.0;
 }
 
-static void scene_seed_random(Scene *s, int rows, int cols)
+static void scene_seed_random(Scene *s, Cursor *cur, int rows, int cols)
 {
     double pw = (double)cols * CELL_W;
     double ph = (double)(rows - 1) * CELL_H;
@@ -489,77 +620,42 @@ static void scene_seed_random(Scene *s, int rows, int cols)
         mesh_insert(p);
     }
     mesh_strip_super();
-    s->cursor_tri = -1;
-    for (int i = 0; i < g_n_tris; i++)
-        if (g_tris[i].valid) { s->cursor_tri = i; break; }
+    cursor_reset(cur);
 }
 
-static void scene_reset(Scene *s, int rows, int cols)
+static void scene_reset(Scene *s, Cursor *cur, int rows, int cols)
 {
     s->n_pts  = N_POINTS_DEFAULT;
     s->theme  = 0;
     s->paused = 0;
     s->seed   = (unsigned int)time(NULL);
-    scene_seed_random(s, rows, cols);
+    scene_seed_random(s, cur, rows, cols);
 }
 
-static void cursor_advance(Scene *s, int dir)
+static void hud_draw(const GridCtx *g, const Scene *s, const Cursor *cur, double fps)
 {
-    if (g_n_tris == 0) return;
-    int i = s->cursor_tri;
-    for (int step = 0; step < g_n_tris; step++) {
-        i = (i + dir + g_n_tris) % g_n_tris;
-        if (g_tris[i].valid) { s->cursor_tri = i; return; }
-    }
-}
-
-static int count_valid_tris(void)
-{
-    int n = 0;
-    for (int i = 0; i < g_n_tris; i++) if (g_tris[i].valid) n++;
-    return n;
-}
-
-static void scene_draw(int rows, int cols, const Scene *s, double fps)
-{
-    erase();
-    /* Edges */
-    for (int i = 0; i < g_n_tris; i++) {
-        if (!g_tris[i].valid) continue;
-        int on_cur = (i == s->cursor_tri);
-        int attr = on_cur ? (COLOR_PAIR(PAIR_CURSOR) | A_BOLD)
-                          : COLOR_PAIR(PAIR_EDGE);
-        Pt A = g_pts[g_tris[i].v[0]];
-        Pt B = g_pts[g_tris[i].v[1]];
-        Pt C = g_pts[g_tris[i].v[2]];
-        line_draw(rows, cols, A.x, A.y, B.x, B.y, attr);
-        line_draw(rows, cols, B.x, B.y, C.x, C.y, attr);
-        line_draw(rows, cols, C.x, C.y, A.x, A.y, attr);
-    }
-    /* Points (skip super-triangle vertices) */
-    attron(COLOR_PAIR(PAIR_POINT) | A_BOLD);
-    for (int i = N_SUPER; i < g_n_pts; i++) {
-        int col = (int)(g_pts[i].x / CELL_W);
-        int row = (int)(g_pts[i].y / CELL_H);
-        if (col >= 0 && col < cols && row >= 0 && row < rows - 1)
-            mvaddch(row, col, '*');
-    }
-    attroff(COLOR_PAIR(PAIR_POINT) | A_BOLD);
-
     char buf[128];
     snprintf(buf, sizeof buf,
              " pts:%d  tris:%d  cursor:%d  theme:%d  %5.1f fps  %s ",
-             s->n_pts, count_valid_tris(), s->cursor_tri,
+             s->n_pts, count_valid_tris(),
+             cur->point_idx >= 0 ? cur->point_idx - N_SUPER : -1,
              s->theme, fps, s->paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " ,/.:cursor  +/-:N  r:reseed  t:theme  p:pause  q:quit  [11 delaunay] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Scene *s, const Cursor *cur, double fps)
+{
+    erase();
+    ctx_draw_bg(g, cur);
+    cursor_draw(g, cur);
+    hud_draw(g, s, cur, fps);
     wnoutrefresh(stdscr);
     doupdate();
 }
@@ -599,12 +695,14 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
 
-    Scene sc;
+    Scene  sc  = { 0 };
+    Cursor cur = { -1 };
     sc.theme = 0;
     screen_init(sc.theme);
 
-    int rows = LINES, cols = COLS;
-    scene_reset(&sc, rows, cols);
+    GridCtx g;
+    ctx_init(&g, LINES, COLS, N_POINTS_DEFAULT);
+    scene_reset(&sc, &cur, LINES, COLS);
 
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double  fps = TARGET_FPS;
@@ -614,9 +712,10 @@ int main(void)
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();
-            rows = LINES; cols = COLS;
-            scene_seed_random(&sc, rows, cols);
+            scene_seed_random(&sc, &cur, LINES, COLS);
         }
+        ctx_init(&g, LINES, COLS, sc.n_pts);
+
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
@@ -624,30 +723,30 @@ int main(void)
                 case 'p':           sc.paused ^= 1; break;
                 case 'r':
                     sc.seed = (unsigned int)clock_ns();
-                    scene_seed_random(&sc, rows, cols);
+                    scene_seed_random(&sc, &cur, g.rows, g.cols);
                     break;
                 case 't':
                     sc.theme = (sc.theme + 1) % N_THEMES;
                     color_init(sc.theme);
                     break;
-                case ',': case '<': cursor_advance(&sc, -1); break;
-                case '.': case '>': cursor_advance(&sc, +1); break;
+                case ',': case '<': cursor_advance(&cur, -1); break;
+                case '.': case '>': cursor_advance(&cur, +1); break;
                 case '+': case '=':
                     if (sc.n_pts < N_POINTS_MAX) {
-                        sc.n_pts += 2; scene_seed_random(&sc, rows, cols);
+                        sc.n_pts += 2; scene_seed_random(&sc, &cur, g.rows, g.cols);
                     } break;
                 case '-':
                     if (sc.n_pts > N_POINTS_MIN) {
-                        sc.n_pts -= 2; scene_seed_random(&sc, rows, cols);
+                        sc.n_pts -= 2; scene_seed_random(&sc, &cur, g.rows, g.cols);
                     } break;
             }
         }
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0  = now;
 
-        scene_draw(rows, cols, &sc, fps);
+        scene_draw(&g, &sc, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

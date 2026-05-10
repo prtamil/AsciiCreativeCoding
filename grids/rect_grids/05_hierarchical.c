@@ -4,7 +4,7 @@
  *
  * DEMO: Major grid lines (thick, bright) every MAJOR_FACTOR minor cells.
  *       Minor grid lines (thin, dim) fill in between. Looks like graph
- *       paper. The player moves in minor-cell steps; the HUD shows both
+ *       paper. The cursor moves in minor-cell steps; the HUD shows both
  *       the minor cell address and the major cell it belongs to.
  *
  * Study alongside: 01_uniform_rect.c (single level), 04_coarse_sparse.c
@@ -12,10 +12,10 @@
  * Section map:
  *   §1 config   — MINOR_W, MINOR_H, MAJOR_FACTOR (major = factor * minor)
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: minor-grid, major-grid, active, player, HUD
- *   §4 formula  — grid_char_level() returns which level a line belongs to
- *   §5 player   — struct, move, reset
- *   §6 scene    — draw_grid(), draw_player()
+ *   §3 color    — minor / major / active / cursor / HUD / HINT pairs
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_level / ctx_draw_bg
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -43,7 +43,7 @@
  *                  MAJOR_H = MINOR_H * MAJOR_FACTOR → every MAJOR_FACTOR-th
  *                  minor line is also a major line.
  *
- * Player address : minor cell (mr, mc).
+ * Cursor address : minor cell (mr, mc).
  *                  major cell it lives in: (mr / MAJOR_FACTOR, mc / MAJOR_FACTOR)
  *                  local index within major cell: (mr % MAJOR_FACTOR, mc % MAJOR_FACTOR)
  *
@@ -110,7 +110,7 @@
  *    on_minor_h = (sr % MINOR_H == 0)    <- true even at major positions
  *    on_minor_v = (sc % MINOR_W == 0)
  *
- *  Player dual address:
+ *  Cursor dual address:
  *    minor_cell_row = r
  *    minor_cell_col = c
  *    major_cell_row = r / MAJOR_FACTOR   (integer division)
@@ -176,11 +176,16 @@
 #define MAJOR_W       (MINOR_W * MAJOR_FACTOR)
 #define MAJOR_H       (MINOR_H * MAJOR_FACTOR)
 
-#define PAIR_MINOR   1   /* thin dim lines for minor grid  */
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
+
+/* Color pair IDs */
+#define PAIR_MINOR   1   /* thin dim lines for minor grid     */
 #define PAIR_MAJOR   2   /* thick bright lines for major grid */
-#define PAIR_ACTIVE  3   /* highlighted active cell        */
-#define PAIR_PLAYER  4   /* '@'                            */
-#define PAIR_HUD     5
+#define PAIR_ACTIVE  3   /* highlighted active cell           */
+#define PAIR_CURSOR  4   /* '@'                               */
+#define PAIR_HUD     5   /* status bar (yellow)               */
+#define PAIR_HINT    6   /* key-hint footer (cyan)            */
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -209,50 +214,83 @@ static void color_init(void)
     init_pair(PAIR_MINOR,  COLORS >= 256 ?  87 : COLOR_BLUE,   -1);
     init_pair(PAIR_MAJOR,  COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
     init_pair(PAIR_ACTIVE, COLORS >= 256 ?  22 : COLOR_GREEN,  -1);
-    init_pair(PAIR_PLAYER, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  15 : COLOR_WHITE,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * cell_to_screen — minor cell (r,c) to screen.
+ * GridCtx — geometry of a TWO-LEVEL grid plus cursor bounds.
  *
- *   screen_row = r * MINOR_H
- *   screen_col = c * MINOR_W
+ * cw/ch are the MINOR cell size (movement unit). Major step is derived as
+ * cw*factor / ch*factor and stored as mw/mh for the level test in §6.
+ */
+typedef struct {
+    /* terminal extent */
+    int rows, cols;
+
+    /* cell size in screen characters — MINOR cell = movement unit */
+    int cw, ch;
+
+    /* major cell size (= minor * factor) */
+    int mw, mh;
+    int factor;                /* MAJOR_FACTOR */
+
+    /* cursor bounds — last whole minor cell that fits in (rows-1) × cols */
+    int max_r, max_c;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = MINOR_W; g->ch = MINOR_H;
+    g->factor = MAJOR_FACTOR;
+    g->mw = MAJOR_W; g->mh = MAJOR_H;
+    g->max_r = (rows - 1) / MINOR_H - 1;
+    g->max_c = cols / MINOR_W - 1;
+}
+
+/*
+ * ctx_to_screen — minor cell (r,c) to screen.
+ *
+ *   screen_row = r * ch
+ *   screen_col = c * cw
  *
  * Exactly the same formula as 01_uniform_rect — just MINOR_H/MINOR_W
  * instead of CELL_H/CELL_W.
  */
-static void cell_to_screen(int r, int c, int *sr, int *sc)
+static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
-    *sr = r * MINOR_H;
-    *sc = c * MINOR_W;
+    *sr = r * g->ch;
+    *sc = c * g->cw;
 }
 
 /*
- * grid_level — returns 2 (major line), 1 (minor line only), or 0 (interior).
+ * ctx_grid_level — returns 2 (major line), 1 (minor line only), or 0.
  *
  * TWO-LEVEL DETECTION FORMULA:
  *
- *   on_major_h = (sr % MAJOR_H == 0)   ← sr is a multiple of MAJOR_H
- *   on_major_v = (sc % MAJOR_W == 0)
- *   on_minor_h = (sr % MINOR_H == 0)   ← also true for major lines
- *   on_minor_v = (sc % MINOR_W == 0)
+ *   on_major_h = (sr % mh == 0)   ← sr is a multiple of MAJOR_H
+ *   on_major_v = (sc % mw == 0)
+ *   on_minor_h = (sr % ch == 0)   ← also true for major lines
+ *   on_minor_v = (sc % cw == 0)
  *
  * Check MAJOR first because every major line is also a minor line.
  * If we checked minor first, we'd never see major-only lines.
  */
 typedef enum { LEVEL_NONE=0, LEVEL_MINOR=1, LEVEL_MAJOR=2 } GridLevel;
 
-static GridLevel grid_level(int sr, int sc, bool *is_h, bool *is_v)
+static GridLevel ctx_grid_level(const GridCtx *g, int sr, int sc,
+                                bool *is_h, bool *is_v)
 {
-    bool mj_h = (sr % MAJOR_H == 0);
-    bool mj_v = (sc % MAJOR_W == 0);
-    bool mn_h = (sr % MINOR_H == 0);
-    bool mn_v = (sc % MINOR_W == 0);
+    bool mj_h = (sr % g->mh == 0);
+    bool mj_v = (sc % g->mw == 0);
+    bool mn_h = (sr % g->ch == 0);
+    bool mn_v = (sc % g->cw == 0);
 
     if (mj_h || mj_v) { *is_h = mj_h; *is_v = mj_v; return LEVEL_MAJOR; }
     if (mn_h || mn_v) { *is_h = mn_h; *is_v = mn_v; return LEVEL_MINOR; }
@@ -260,36 +298,15 @@ static GridLevel grid_level(int sr, int sc, bool *is_h, bool *is_v)
     return LEVEL_NONE;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  player                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct { int r, c, max_r, max_c; } Player;
-
-static void player_reset(Player *p, int rows, int cols)
+/*
+ * ctx_draw_bg — paint both grid levels, with major drawn in the bright pair.
+ */
+static void ctx_draw_bg(const GridCtx *g)
 {
-    p->max_r = (rows - 1) / MINOR_H - 1;
-    p->max_c = cols / MINOR_W - 1;
-    p->r = p->max_r / 2;
-    p->c = p->max_c / 2;
-}
-static void player_move(Player *p, int dr, int dc)
-{
-    int nr = p->r + dr, nc = p->c + dc;
-    if (nr >= 0 && nr <= p->max_r) p->r = nr;
-    if (nc >= 0 && nc <= p->max_c) p->c = nc;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void draw_grid(int rows, int cols)
-{
-    for (int sr = 0; sr < rows - 1; sr++) {
-        for (int sc = 0; sc < cols; sc++) {
+    for (int sr = 0; sr < g->rows - 1; sr++) {
+        for (int sc = 0; sc < g->cols; sc++) {
             bool is_h, is_v;
-            GridLevel lvl = grid_level(sr, sc, &is_h, &is_v);
+            GridLevel lvl = ctx_grid_level(g, sr, sc, &is_h, &is_v);
             if (lvl == LEVEL_NONE) continue;
 
             char ch = ' ';
@@ -310,45 +327,72 @@ static void draw_grid(int rows, int cols)
     }
 }
 
-static void draw_player(const Player *p)
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct { int r, c; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    cur->r = g->max_r / 2;
+    cur->c = g->max_c / 2;
+}
+
+static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
+{
+    int nr = cur->r + dr, nc = cur->c + dc;
+    if (nr >= 0 && nr <= g->max_r) cur->r = nr;
+    if (nc >= 0 && nc <= g->max_c) cur->c = nc;
+}
+
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    cell_to_screen(p->r, p->c, &sr, &sc);
+    ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
 
     attron(COLOR_PAIR(PAIR_ACTIVE));
-    for (int dc = 1; dc < MINOR_W; dc++)
+    for (int dc = 1; dc < g->cw; dc++)
         mvaddch(sr + 1, sc + dc, (chtype)' ');
     attroff(COLOR_PAIR(PAIR_ACTIVE));
 
-    attron(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
-    mvaddch(sr + 1, sc + MINOR_W / 2, (chtype)'@');
-    attroff(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    mvaddch(sr + 1, sc + g->cw / 2, (chtype)'@');
+    attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-static void scene_draw(int rows, int cols, const Player *p, double fps)
-{
-    erase();
-    draw_grid(rows, cols);
-    draw_player(p);
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
+static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
     /* Show both address levels in HUD */
-    int maj_r = p->r / MAJOR_FACTOR, maj_c = p->c / MAJOR_FACTOR;
-    int loc_r = p->r % MAJOR_FACTOR, loc_c = p->c % MAJOR_FACTOR;
+    int maj_r = cur->r / g->factor, maj_c = cur->c / g->factor;
+    int loc_r = cur->r % g->factor, loc_c = cur->c % g->factor;
     char buf[80];
     snprintf(buf, sizeof buf,
         " %.1f fps  minor(%d,%d)  major(%d,%d)  local(%d,%d) ",
-        fps, p->r, p->c, maj_r, maj_c, loc_r, loc_c);
+        fps, cur->r, cur->c, maj_r, maj_c, loc_r, loc_c);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_DIM);
-    mvprintw(rows - 1, 0,
-        " arrows:move  r:reset  q:quit  [05 hierarchical  factor=%d] ",
-        MAJOR_FACTOR);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_DIM);
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+        " arrows:move  r:reset  q/ESC:quit  [05 hierarchical  factor=%d] ",
+        g->factor);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
-    wnoutrefresh(stdscr); doupdate();
+static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, fps);
+    wnoutrefresh(stdscr);
+    doupdate();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -379,30 +423,37 @@ int main(void)
 {
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
+
     screen_init();
-    int rows = LINES, cols = COLS;
-    Player player; player_reset(&player, rows, cols);
+    GridCtx g;     ctx_init(&g, LINES, COLS);
+    Cursor  cur;   cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double fps = TARGET_FPS; int64_t t0 = clock_ns();
+    double fps = TARGET_FPS;
+    int64_t t0 = clock_ns();
 
     while (g_running) {
         if (g_need_resize) {
-            g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
-            player_reset(&player, rows, cols);
+            g_need_resize = 0;
+            endwin(); refresh();
+            ctx_init(&g, LINES, COLS);
+            cursor_reset(&cur, &g);
         }
         int ch = getch();
         switch (ch) {
-            case 'q': case 27: g_running = 0;                    break;
-            case 'r':          player_reset(&player, rows, cols); break;
-            case KEY_UP:    player_move(&player, -1,  0); break;
-            case KEY_DOWN:  player_move(&player, +1,  0); break;
-            case KEY_LEFT:  player_move(&player,  0, -1); break;
-            case KEY_RIGHT: player_move(&player,  0, +1); break;
+            case 'q': case 27:  g_running = 0;                  break;
+            case 'r':           cursor_reset(&cur, &g);          break;
+            case KEY_UP:        cursor_move(&cur, &g, -1,  0);   break;
+            case KEY_DOWN:      cursor_move(&cur, &g, +1,  0);   break;
+            case KEY_LEFT:      cursor_move(&cur, &g,  0, -1);   break;
+            case KEY_RIGHT:     cursor_move(&cur, &g,  0, +1);   break;
         }
+
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (now - t0 + 1)) * 0.05; t0 = now;
-        scene_draw(rows, cols, &player, fps);
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0  = now;
+
+        scene_draw(&g, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

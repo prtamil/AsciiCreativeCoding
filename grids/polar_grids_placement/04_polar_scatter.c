@@ -15,14 +15,14 @@
  * Section map:
  *   §1 config   — scatter parameters: N, radii, sigma, wedge half-angle
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — theme-switchable color pairs
- *   §4 coords   — cell_to_polar, polar_to_screen, angle_char
- *   §5 bgrid    — draw_polar_bg: 7 inline backgrounds
- *   §6 pool     — ObjectPool: pool_place, pool_draw, pool_clear
- *   §7 scatter  — gauss, scatter_uniform, scatter_gauss, scatter_wedge,
+ *   §3 color    — 5 pairs: grid, active, anchor, HUD (yellow), hint (cyan)
+ *   §4 gridctx  — GridCtx (mode, origin), cell_to_polar, polar_to_screen
+ *   §5 pool     — Pool: place, clear, draw, draw_preview, stamp
+ *   §6 cursor   — Cursor (row, col, r, theta) + screen-space arrow move
+ *   §7 mode     — draw_polar_bg: 7 inline polar background types in one switch
+ *   §8 scatter  — gauss, scatter_uniform, scatter_gauss, scatter_wedge,
  *                  scatter_ringsnap
- *   §8 cursor   — cursor_draw
- *   §9 scene    — scene_draw
+ *   §9 scene    — hud_draw + scene_draw
  *   §10 screen  — ncurses init / cleanup
  *   §11 app     — signals, resize, main loop
  *
@@ -120,7 +120,7 @@
  * scatter_uniform (U) — CDF-inversion for uniform areal density:
  *   Without correction, r~Uniform gives 4× more dots near r_min than r_max.
  *   Area of disc = π r², so sampling r² uniformly → uniform areal density.
- *   r = sqrt(r_min² + rand × (r_max² − r_min²))
+ *   r = sqrt(R_INNER² + rand × (r_outer² − R_INNER²))
  *   θ ∈ [0, 2π) uniformly
  *
  * scatter_gauss (G) — Gaussian ring cluster:
@@ -187,6 +187,9 @@
 #define CELL_W         2
 #define CELL_H         4
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
+
 /* Objects placed per key press */
 #define N_SCATTER_DEFAULT  60
 #define N_SCATTER_MIN      10
@@ -223,9 +226,9 @@
 
 #define PAIR_GRID    1
 #define PAIR_ACTIVE  2
-#define PAIR_HUD     3
-#define PAIR_LABEL   4
-#define PAIR_ANCHOR  5   /* amber — live scatter preview */
+#define PAIR_ANCHOR  3   /* amber — live scatter preview */
+#define PAIR_HUD     4   /* status bar (yellow)  */
+#define PAIR_HINT    5   /* key-hint footer (cyan) */
 
 static const char *const SCATTER_NAMES[] = {
     "uniform", "radial-gauss", "wedge", "ring-snap",
@@ -273,14 +276,34 @@ static void color_init(int theme)
     short fg = COLORS >= 256 ? THEME_FG[theme][0] : THEME_FG[theme][1];
     init_pair(PAIR_GRID,   fg,                               -1);
     init_pair(PAIR_ACTIVE, COLORS>=256 ? 255 : COLOR_WHITE,  -1);
-    init_pair(PAIR_HUD,    COLORS>=256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_LABEL,  COLORS>=256 ? 252 : COLOR_WHITE,  -1);
     init_pair(PAIR_ANCHOR, COLORS>=256 ? 220 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD,    COLORS>=256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  coords                                                              */
+/* §4  gridctx                                                             */
 /* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int mode;
+    int rows, cols;
+    int cw, ch;
+    int ox, oy;
+    int max_ring, max_spoke;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int mode, int rows, int cols)
+{
+    memset(g, 0, sizeof *g);
+    g->mode = mode; g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->ox = cols / 2; g->oy = rows / 2;
+    g->max_spoke = 12;
+    int half_diag_px = (int)(sqrt((double)(g->ox*g->cw)*(g->ox*g->cw) +
+                                   (double)(g->oy*g->ch)*(g->oy*g->ch)));
+    g->max_ring = (int)(half_diag_px / 20.0);
+}
 
 static void cell_to_polar(int col, int row, int ox, int oy,
                            double *r_px, double *theta)
@@ -308,14 +331,100 @@ static char angle_char(double theta)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  bgrid                                                               */
+/* §5  pool                                                                */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void draw_polar_bg(int type, int rows, int cols, int ox, int oy)
+typedef struct { int row, col; char glyph; bool alive; } Obj;
+typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
+
+static void pool_place(Pool *p, int row, int col,
+                       int rows, int cols, char glyph)
 {
+    if (row < 0 || row >= rows-1 || col < 0 || col >= cols) return;
+    if (p->count < MAX_OBJ)
+        p->items[p->count++] = (Obj){ row, col, glyph, true };
+}
+
+static void pool_draw(const Pool *p)
+{
+    attron(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
+    for (int i = 0; i < p->count; i++) {
+        if (!p->items[i].alive) continue;
+        mvaddch(p->items[i].row, p->items[i].col,
+                (chtype)(unsigned char)p->items[i].glyph);
+    }
+    attroff(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
+}
+
+static void pool_clear(Pool *p) { p->count = 0; }
+
+static void pool_draw_preview(const Pool *p)
+{
+    attron(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
+    for (int i = 0; i < p->count; i++) {
+        if (!p->items[i].alive) continue;
+        mvaddch(p->items[i].row, p->items[i].col,
+                (chtype)(unsigned char)p->items[i].glyph);
+    }
+    attroff(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
+}
+
+/* pool_stamp — append all preview objects into the permanent pool */
+static void pool_stamp(Pool *dst, const Pool *src)
+{
+    for (int i = 0; i < src->count && dst->count < MAX_OBJ; i++)
+        dst->items[dst->count++] = src->items[i];
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int    row, col;
+    double r, theta;
+} Cursor;
+
+static void cursor_sync_polar(Cursor *c, const GridCtx *g)
+{
+    cell_to_polar(c->col, c->row, g->ox, g->oy, &c->r, &c->theta);
+}
+
+static void cursor_reset(Cursor *c, const GridCtx *g)
+{
+    c->col = g->ox + (int)round(20.0 / CELL_W);
+    c->row = g->oy;
+    cursor_sync_polar(c, g);
+}
+
+static void cursor_move(Cursor *c, const GridCtx *g, int dr, int dc)
+{
+    int nr = c->row + dr, nc = c->col + dc;
+    if (nr >= 0 && nr < g->rows-1) c->row = nr;
+    if (nc >= 0 && nc < g->cols)   c->col = nc;
+    cursor_sync_polar(c, g);
+}
+
+static void cursor_draw(const Cursor *c, const GridCtx *g)
+{
+    if (c->row < 0 || c->row >= g->rows-1 || c->col < 0 || c->col >= g->cols)
+        return;
+    attron(COLOR_PAIR(PAIR_ACTIVE) | A_REVERSE | A_BOLD);
+    mvaddch(c->row, c->col, (chtype)'+');
+    attroff(COLOR_PAIR(PAIR_ACTIVE) | A_REVERSE | A_BOLD);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §7  mode  (polar background dispatcher)                                 */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void draw_polar_bg(const GridCtx *g)
+{
+    int rows = g->rows, cols = g->cols;
+    int ox = g->ox, oy = g->oy;
     const double two_pi = 2.0 * M_PI;
     attron(COLOR_PAIR(PAIR_GRID));
-    switch (type) {
+    switch (g->mode) {
     case 0: {
         const double sp=20.0,rw=1.6,sw=0.10,sa=two_pi/12.0;
         for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
@@ -376,49 +485,7 @@ static void draw_polar_bg(int type, int rows, int cols, int ox, int oy)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct { int row, col; char glyph; } PObj;
-typedef struct { PObj items[MAX_OBJ]; int count; } ObjPool;
-
-static void pool_place(ObjPool *p, int row, int col,
-                       int rows, int cols, char glyph)
-{
-    if (row < 0 || row >= rows-1 || col < 0 || col >= cols) return;
-    if (p->count < MAX_OBJ)
-        p->items[p->count++] = (PObj){row, col, glyph};
-}
-
-static void pool_draw(const ObjPool *p)
-{
-    attron(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
-    for (int i = 0; i < p->count; i++)
-        mvaddch(p->items[i].row, p->items[i].col,
-                (chtype)(unsigned char)p->items[i].glyph);
-    attroff(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
-}
-
-static void pool_clear(ObjPool *p) { p->count = 0; }
-
-static void pool_draw_preview(const ObjPool *p)
-{
-    attron(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
-    for (int i = 0; i < p->count; i++)
-        mvaddch(p->items[i].row, p->items[i].col,
-                (chtype)(unsigned char)p->items[i].glyph);
-    attroff(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
-}
-
-/* pool_stamp — append all preview objects into the permanent pool */
-static void pool_stamp(ObjPool *dst, const ObjPool *src)
-{
-    for (int i = 0; i < src->count && dst->count < MAX_OBJ; i++)
-        dst->items[dst->count++] = src->items[i];
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  scatter                                                             */
+/* §8  scatter                                                             */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
@@ -446,9 +513,7 @@ static double gauss(double mean, double sigma)
  *   r = sqrt(R_INNER² + rand × (r_outer² − R_INNER²))
  *   θ ∈ [0, 2π) uniformly
  */
-static void scatter_uniform(ObjPool *pool, int n,
-                             double r_outer,
-                             int rows, int cols, int ox, int oy)
+static void scatter_uniform(Pool *pool, int n, double r_outer, const GridCtx *g)
 {
     double r0sq = R_INNER  * R_INNER;
     double r1sq = r_outer  * r_outer;
@@ -456,8 +521,8 @@ static void scatter_uniform(ObjPool *pool, int n,
         double r  = sqrt(r0sq + ((double)rand()/(double)RAND_MAX) * (r1sq - r0sq));
         double th = ((double)rand()/(double)RAND_MAX) * 2.0 * M_PI;
         int c, row;
-        polar_to_screen(r, th, ox, oy, &c, &row);
-        pool_place(pool, row, c, rows, cols, OBJ_GLYPH);
+        polar_to_screen(r, th, g->ox, g->oy, &c, &row);
+        pool_place(pool, row, c, g->rows, g->cols, OBJ_GLYPH);
     }
 }
 
@@ -469,17 +534,16 @@ static void scatter_uniform(ObjPool *pool, int n,
  *   r clamped to R_INNER minimum
  *   θ ∈ [0, 2π) uniformly
  */
-static void scatter_gauss(ObjPool *pool, int n,
-                           double r_cursor, double sigma,
-                           int rows, int cols, int ox, int oy)
+static void scatter_gauss(Pool *pool, int n, double r_cursor, double sigma,
+                           const GridCtx *g)
 {
     for (int i = 0; i < n; i++) {
         double r  = fabs(gauss(r_cursor, sigma));
         if (r < R_INNER) r = R_INNER;
         double th = ((double)rand()/(double)RAND_MAX) * 2.0 * M_PI;
         int c, row;
-        polar_to_screen(r, th, ox, oy, &c, &row);
-        pool_place(pool, row, c, rows, cols, OBJ_GLYPH);
+        polar_to_screen(r, th, g->ox, g->oy, &c, &row);
+        pool_place(pool, row, c, g->rows, g->cols, OBJ_GLYPH);
     }
 }
 
@@ -490,18 +554,17 @@ static void scatter_gauss(ObjPool *pool, int n,
  *   r ∈ [R_INNER, r_outer] uniformly (no area correction — fills the wedge)
  *   θ ∈ [theta_cursor − wedge_half, theta_cursor + wedge_half] uniformly
  */
-static void scatter_wedge(ObjPool *pool, int n,
-                           double r_outer, double theta_cursor,
-                           double wedge_half,
-                           int rows, int cols, int ox, int oy)
+static void scatter_wedge(Pool *pool, int n, double r_outer,
+                           double theta_cursor, double wedge_half,
+                           const GridCtx *g)
 {
     for (int i = 0; i < n; i++) {
         double r  = R_INNER + ((double)rand()/(double)RAND_MAX) * (r_outer - R_INNER);
         double th = theta_cursor - wedge_half
                     + ((double)rand()/(double)RAND_MAX) * 2.0 * wedge_half;
         int c, row;
-        polar_to_screen(r, th, ox, oy, &c, &row);
-        pool_place(pool, row, c, rows, cols, OBJ_GLYPH);
+        polar_to_screen(r, th, g->ox, g->oy, &c, &row);
+        pool_place(pool, row, c, g->rows, g->cols, OBJ_GLYPH);
     }
 }
 
@@ -513,9 +576,8 @@ static void scatter_wedge(ObjPool *pool, int n,
  *   r = k × RING_SNAP_SP + jitter,  jitter ∈ [−RING_SNAP_JITTER, +JITTER]
  *   θ ∈ [0, 2π) uniformly
  */
-static void scatter_ringsnap(ObjPool *pool, int n,
-                              double r_outer,
-                              int rows, int cols, int ox, int oy)
+static void scatter_ringsnap(Pool *pool, int n, double r_outer,
+                              const GridCtx *g)
 {
     int n_rings = (int)(r_outer / RING_SNAP_SP);
     if (n_rings < 1) n_rings = 1;
@@ -526,59 +588,51 @@ static void scatter_ringsnap(ObjPool *pool, int n,
         if (r < R_INNER) r = R_INNER;
         double th = ((double)rand()/(double)RAND_MAX) * 2.0 * M_PI;
         int c, row;
-        polar_to_screen(r, th, ox, oy, &c, &row);
-        pool_place(pool, row, c, rows, cols, OBJ_GLYPH);
+        polar_to_screen(r, th, g->ox, g->oy, &c, &row);
+        pool_place(pool, row, c, g->rows, g->cols, OBJ_GLYPH);
     }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void cursor_draw(int row, int col, int rows, int cols)
-{
-    if (row < 0 || row >= rows-1 || col < 0 || col >= cols) return;
-    attron(COLOR_PAIR(PAIR_ACTIVE) | A_REVERSE | A_BOLD);
-    mvaddch(row, col, (chtype)'+');
-    attroff(COLOR_PAIR(PAIR_ACTIVE) | A_REVERSE | A_BOLD);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §9  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void scene_draw(int rows, int cols,
-                       const ObjPool *pool, const ObjPool *preview,
-                       int cur_row, int cur_col,
-                       double cur_r, double cur_theta,
-                       int scatter_type, int n, double param,
-                       int bg_type, int theme, double fps, bool paused)
+/* Bright bold yellow status (top-right) + bold cyan key hints (bottom). */
+static void hud_draw(const GridCtx *g, const Pool *pool, const Cursor *cur,
+                     int scatter_type, int n, double param,
+                     int theme, double fps, bool paused)
 {
-    int ox = cols/2, oy = rows/2;
-    erase();
-    draw_polar_bg(bg_type, rows, cols, ox, oy);
-    pool_draw(pool);
-    pool_draw_preview(preview);
-    cursor_draw(cur_row, cur_col, rows, cols);
-
-    char buf[80];
-    snprintf(buf, sizeof buf, " %.1f fps  r:%.0f  θ:%.0f°  [%s]  n:%d  p:%.1f  %s ",
-             fps, cur_r, cur_theta*180.0/M_PI, SCATTER_NAMES[scatter_type],
-             n, param, paused ? "PAUSED" : "running");
+    char buf[96];
+    snprintf(buf, sizeof buf,
+             " %5.1f fps  r:%.0f  θ:%.0f°  [%s]  n:%d  p:%.1f  objs:%d  %s ",
+             fps, cur->r, cur->theta*180.0/M_PI, SCATTER_NAMES[scatter_type],
+             n, param, pool->count, paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols-(int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
     attron(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
-    mvprintw(0, 0, " %-13s", BG_NAMES[bg_type]);
+    mvprintw(0, 0, " %-13s ", BG_NAMES[g->mode]);
     attroff(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_LABEL));
-    mvprintw(rows-1, 0,
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
         " U/G/W/D:mode  +/-:N  [/]:param  spc:stamp  C:clear"
-        "  a/e:bg  t:theme(%d)  q:quit ", theme+1);
-    attroff(COLOR_PAIR(PAIR_LABEL));
+        "  a/e:bg  t:theme(%d)  q:quit ", theme + 1);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Pool *pool, const Pool *preview,
+                       const Cursor *cur,
+                       int scatter_type, int n, double param,
+                       int theme, double fps, bool paused)
+{
+    erase();
+    draw_polar_bg(g);
+    pool_draw(pool);
+    pool_draw_preview(preview);
+    cursor_draw(cur, g);
+    hud_draw(g, pool, cur, scatter_type, n, param, theme, fps, paused);
     wnoutrefresh(stdscr); doupdate();
 }
 
@@ -616,21 +670,16 @@ int main(void)
     screen_init(theme);
 
     int rows = LINES, cols = COLS;
-    int ox = cols/2, oy = rows/2;
+    GridCtx ctx; ctx_init(&ctx, 0, rows, cols);
+    Pool    pool;    pool_clear(&pool);
+    Pool    preview; pool_clear(&preview);
+    Cursor  cur;     cursor_reset(&cur, &ctx);
 
-    int     bg_type      = 0;
     int     scatter_type = 0;   /* 0=U 1=G 2=W 3=D */
-    ObjPool pool         = {.count = 0};
-    ObjPool preview      = {.count = 0};
     bool    dirty        = true;   /* regenerate preview before first draw */
     int     n_scat       = N_SCATTER_DEFAULT;
     double  sigma        = SIGMA_R_DEFAULT;
     double  wedge        = WEDGE_DEFAULT;
-
-    int    cur_col = ox + (int)round(20.0 / CELL_W);
-    int    cur_row = oy;
-    double cur_r, cur_theta;
-    cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta);
 
     bool    paused = false;
     double  fps    = TARGET_FPS;
@@ -640,13 +689,14 @@ int main(void)
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS; ox = cols/2; oy = rows/2;
-            cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta);
+            rows = LINES; cols = COLS;
+            ctx_init(&ctx, ctx.mode, rows, cols);
+            cursor_sync_polar(&cur, &ctx);
             dirty = true;
         }
 
-        double r_outer = sqrt((double)(ox*CELL_W)*(double)(ox*CELL_W) +
-                              (double)(oy*CELL_H)*(double)(oy*CELL_H))
+        double r_outer = sqrt((double)(ctx.ox*CELL_W)*(double)(ctx.ox*CELL_W) +
+                              (double)(ctx.oy*CELL_H)*(double)(ctx.oy*CELL_H))
                          * R_OUTER_FACTOR;
 
         int ch = getch();
@@ -654,8 +704,8 @@ int main(void)
         case 'q': case 27: g_running = 0; break;
         case 'P': paused = !paused; break;
         case 't': theme = (theme+1) % N_THEMES; color_init(theme); break;
-        case 'a': bg_type = (bg_type-1+N_BG_TYPES) % N_BG_TYPES; break;
-        case 'e': bg_type = (bg_type+1) % N_BG_TYPES; break;
+        case 'a': ctx_init(&ctx, (ctx.mode-1+N_BG_TYPES) % N_BG_TYPES, rows, cols); break;
+        case 'e': ctx_init(&ctx, (ctx.mode+1) % N_BG_TYPES, rows, cols); break;
         case 'U': scatter_type = 0; dirty = true; break;
         case 'G': scatter_type = 1; dirty = true; break;
         case 'W': scatter_type = 2; dirty = true; break;
@@ -676,33 +726,21 @@ int main(void)
             if (scatter_type == 2 && wedge < WEDGE_MAX)   { wedge += WEDGE_STEP;   dirty = true; }
             break;
         case 'C': pool_clear(&pool); break;
-        case 'r':
-            cur_col = ox + (int)round(20.0 / CELL_W); cur_row = oy;
-            cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta);
-            dirty = true;
-            break;
-        case KEY_UP:
-            if (cur_row > 0) { cur_row--; cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta); dirty = true; }
-            break;
-        case KEY_DOWN:
-            if (cur_row < rows-2) { cur_row++; cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta); dirty = true; }
-            break;
-        case KEY_LEFT:
-            if (cur_col > 0) { cur_col--; cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta); dirty = true; }
-            break;
-        case KEY_RIGHT:
-            if (cur_col < cols-1) { cur_col++; cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta); dirty = true; }
-            break;
+        case 'r': cursor_reset(&cur, &ctx); dirty = true; break;
+        case KEY_UP:    cursor_move(&cur, &ctx, -1,  0); dirty = true; break;
+        case KEY_DOWN:  cursor_move(&cur, &ctx, +1,  0); dirty = true; break;
+        case KEY_LEFT:  cursor_move(&cur, &ctx,  0, -1); dirty = true; break;
+        case KEY_RIGHT: cursor_move(&cur, &ctx,  0, +1); dirty = true; break;
         }
 
         /* regenerate preview only when cursor or params changed */
         if (dirty) {
             pool_clear(&preview);
             switch (scatter_type) {
-            case 0: scatter_uniform(&preview, n_scat, r_outer, rows, cols, ox, oy); break;
-            case 1: scatter_gauss  (&preview, n_scat, cur_r, sigma, rows, cols, ox, oy); break;
-            case 2: scatter_wedge  (&preview, n_scat, r_outer, cur_theta, wedge, rows, cols, ox, oy); break;
-            case 3: scatter_ringsnap(&preview, n_scat, r_outer, rows, cols, ox, oy); break;
+            case 0: scatter_uniform  (&preview, n_scat, r_outer, &ctx); break;
+            case 1: scatter_gauss    (&preview, n_scat, cur.r, sigma, &ctx); break;
+            case 2: scatter_wedge    (&preview, n_scat, r_outer, cur.theta, wedge, &ctx); break;
+            case 3: scatter_ringsnap (&preview, n_scat, r_outer, &ctx); break;
             }
             dirty = false;
         }
@@ -712,12 +750,11 @@ int main(void)
                      : 0.0;
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
-        t0  = now;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9/(now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0 = now;
         if (!paused)
-            scene_draw(rows, cols, &pool, &preview, cur_row, cur_col,
-                       cur_r, cur_theta, scatter_type, n_scat, param,
-                       bg_type, theme, fps, paused);
+            scene_draw(&ctx, &pool, &preview, &cur,
+                       scatter_type, n_scat, param, theme, fps, paused);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

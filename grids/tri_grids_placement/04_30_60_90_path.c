@@ -15,12 +15,12 @@
  * Section map:
  *   §1 config   — CELL_W, CELL_H, MAX_OBJ
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6 pairs: edge / cursor / start / end / path / HUD
- *   §4 formula  — pixel ↔ lattice + centroid + edge char
- *   §5 pool     — ObjectPool for path triangles
- *   §6 cursor   — TRI_DIR + step + draw + START / END markers
- *   §7 path     — pixel walk between two centroids → triangle list
- *   §8 scene    — grid_draw + scene_draw
+ *   §3 color    — 8 pairs: edge / median / cursor / start / end / path / HUD / hint
+ *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
+ *   §5 pool     — Pool: place / find / clear / draw  (used as path)
+ *   §6 cursor   — Cursor + TRI_DIR + reset / move / draw + START / END
+ *   §7 mode     — pixel walk between two centroids → triangle list
+ *   §8 scene    — hud_draw + scene_draw
  *   §9 screen   — ncurses init / cleanup
  *  §10 app      — signals, main loop
  *
@@ -29,7 +29,7 @@
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/04_30_60_90_path.c \
- *       -o 01_equilateral_path -lncurses -lm
+ *       -o 04_30_60_90_path -lncurses -lm
  */
 
 /* ── CONCEPTS ──────────────────────────────────────────────────────────── *
@@ -77,10 +77,11 @@
  * DRAWING METHOD  (per frame)
  * ──────────────
  *  1. erase()
- *  2. grid_draw — equilateral edges + median proximity → '/' '\\' '|'.
- *  3. path_draw — '*' at each path-triangle's centroid screen cell.
+ *  2. ctx_draw_bg — equilateral edges + median proximity → '/' '\\' '|'.
+ *  3. pool_draw — '*' at each path-triangle's centroid screen cell.
  *  4. marker_draw — 'S' at start, 'E' at end.
  *  5. cursor_draw — '@' at the cursor address.
+ *  6. hud_draw — top-right status, bottom-row hint.
  *
  *  path_compute runs only on START/END change or size change.
  *
@@ -99,7 +100,7 @@
  *      t  = i / n
  *      px = sx + t·dx,  py = sy + t·dy
  *      pixel_to_tri(px, py) → (tC, tR, tU)   // parent triangle
- *      path_add(tC, tR, tU)                   // dedup
+ *      pool_place(tC, tR, tU)                 // dedup
  *
  * EDGE CASES TO WATCH
  * ───────────────────
@@ -150,17 +151,20 @@
 
 #define BORDER_W   0.10
 #define MEDIAN_T   0.05
+
 #define MAX_OBJ    1024
 #define N_THEMES   4
 
+#define FPS_EWMA_ALPHA 0.05
+
 #define PAIR_BORDER 1
-#define PAIR_CURSOR 2
-#define PAIR_START  3
-#define PAIR_END    4
-#define PAIR_PATH   5
-#define PAIR_HUD    6
-#define PAIR_HINT   7
-#define PAIR_MEDIAN 8
+#define PAIR_MEDIAN 2
+#define PAIR_CURSOR 3
+#define PAIR_START  4
+#define PAIR_END    5
+#define PAIR_PATH   6
+#define PAIR_HUD    7
+#define PAIR_HINT   8
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -201,8 +205,7 @@ static const short THEME_FG_8[N_THEMES][3] = {
 
 static void color_init(int theme)
 {
-    start_color();
-    use_default_colors();
+    start_color(); use_default_colors();
     short fg_e, fg_s, fg_n;
     if (COLORS >= 256) {
         fg_e = THEME_FG[theme][0]; fg_s = THEME_FG[theme][1]; fg_n = THEME_FG[theme][2];
@@ -210,18 +213,38 @@ static void color_init(int theme)
         fg_e = THEME_FG_8[theme][0]; fg_s = THEME_FG_8[theme][1]; fg_n = THEME_FG_8[theme][2];
     }
     init_pair(PAIR_BORDER, fg_e, -1);
-    init_pair(PAIR_MEDIAN, COLORS >= 256 ? 39 : COLOR_BLUE, -1);
+    init_pair(PAIR_MEDIAN, COLORS >= 256 ?  39 : COLOR_BLUE,   -1);
     init_pair(PAIR_START,  fg_s, -1);
     init_pair(PAIR_END,    fg_n, -1);
     init_pair(PAIR_PATH,   COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_CURSOR, COLORS >= 256 ? 15  : COLOR_WHITE, COLOR_BLUE);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  0  : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLORS >= 256 ? 75  : COLOR_CYAN,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ?  15 : COLOR_WHITE,  COLOR_BLUE);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  gridctx                                                             */
 /* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int    rows, cols;
+    int    cw, ch;
+    int    ox, oy;
+    double tri_size;
+    double border_w;
+    double median_t;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->ox = cols / 2;
+    g->oy = (rows - 1) / 2;
+    g->tri_size = tri_size;
+    g->border_w = BORDER_W;
+    g->median_t = MEDIAN_T;
+}
 
 static void pixel_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
@@ -251,7 +274,7 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
 static char tri_edge_char(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3;
-    char ch1, ch2, ch3;
+    char   ch1, ch2, ch3;
     if (up == 0) {
         l1 = 1.0 - fa - fb; ch1 = '/';
         l2 = fa;            ch2 = '\\';
@@ -289,50 +312,75 @@ static char tri_median_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-static void tri_to_screen(int col, int row, int up, double size,
-                          int ox, int oy, int *scol, int *srow)
+static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+                          int *scol, int *srow)
 {
-    double cx_pix, cy_pix;
-    tri_centroid_pixel(col, row, up, size, &cx_pix, &cy_pix);
-    *scol = ox + (int)(cx_pix / CELL_W);
-    *srow = oy + (int)(cy_pix / CELL_H);
+    double cx, cy;
+    tri_centroid_pixel(col, row, up, g->tri_size, &cx, &cy);
+    *scol = g->ox + (int)(cx / g->cw);
+    *srow = g->oy + (int)(cy / g->ch);
+}
+
+static void ctx_draw_bg(const GridCtx *g)
+{
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double px = (double)(col - g->ox) * g->cw;
+            double py = (double)(row - g->oy) * g->ch;
+            int tC, tR, tU; double fa, fb, em, mm;
+            pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+            char ech = tri_edge_char  (tU, fa, fb, &em);
+            char mch = tri_median_char(tU, fa, fb, &mm);
+            if (em < g->border_w && em <= mm) {
+                attron(COLOR_PAIR(PAIR_BORDER));
+                mvaddch(row, col, (chtype)(unsigned char)ech);
+                attroff(COLOR_PAIR(PAIR_BORDER));
+            } else if (mm < g->median_t) {
+                attron(COLOR_PAIR(PAIR_MEDIAN));
+                mvaddch(row, col, (chtype)(unsigned char)mch);
+                attroff(COLOR_PAIR(PAIR_MEDIAN));
+            }
+        }
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §5  pool                                                                */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-typedef struct { int col, row, up; } TPath;
-typedef struct { TPath items[MAX_OBJ]; int count; } PathPool;
+typedef struct { int col, row, up; char glyph; bool alive; } Obj;
+typedef struct { Obj items[MAX_OBJ];  int count; } Pool;
 
-static void path_clear(PathPool *p) { p->count = 0; }
-
-static int path_contains(const PathPool *p, int col, int row, int up)
+static int pool_find(const Pool *p, int col, int row, int up)
 {
-    for (int i = 0; i < p->count; i++) {
-        if (p->items[i].col == col && p->items[i].row == row && p->items[i].up == up)
-            return 1;
-    }
-    return 0;
+    for (int i = 0; i < p->count; i++)
+        if (p->items[i].alive
+            && p->items[i].col == col
+            && p->items[i].row == row
+            && p->items[i].up  == up)
+            return i;
+    return -1;
 }
 
-static void path_add(PathPool *p, int col, int row, int up)
+static void pool_place(Pool *p, int col, int row, int up, char glyph)
 {
+    if (pool_find(p, col, row, up) >= 0) return;
     if (p->count >= MAX_OBJ) return;
-    if (path_contains(p, col, row, up)) return;
-    p->items[p->count++] = (TPath){ col, row, up };
+    p->items[p->count++] = (Obj){ col, row, up, glyph, true };
 }
 
-static void path_draw(const PathPool *p, double size,
-                      int ox, int oy, int rows, int cols)
+static void pool_clear(Pool *p) { p->count = 0; }
+
+static void pool_draw(const Pool *p, const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_PATH) | A_BOLD);
     for (int i = 0; i < p->count; i++) {
+        if (!p->items[i].alive) continue;
         int sc, sr;
-        tri_to_screen(p->items[i].col, p->items[i].row, p->items[i].up,
-                      size, ox, oy, &sc, &sr);
-        if (sc >= 0 && sc < cols && sr >= 0 && sr < rows - 1)
-            mvaddch(sr, sc, '*');
+        ctx_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
+                      &sc, &sr);
+        if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1)
+            mvaddch(sr, sc, (chtype)(unsigned char)p->items[i].glyph);
     }
     attroff(COLOR_PAIR(PAIR_PATH) | A_BOLD);
 }
@@ -342,13 +390,12 @@ static void path_draw(const PathPool *p, double size,
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    int    col, row, up;
-    int    sCol, sRow, sUp;     /* START marker */
-    int    eCol, eRow, eUp;     /* END marker  */
-    int    has_start, has_end;
-    double tri_size;
-    int    theme;
-    int    paused;
+    int col, row, up;
+    int sCol, sRow, sUp;        /* START marker */
+    int eCol, eRow, eUp;        /* END   marker */
+    int has_start, has_end;
+    int theme;
+    int paused;
 } Cursor;
 
 static const int TRI_DIR[4][2][3] = {
@@ -362,32 +409,39 @@ static void cursor_reset(Cursor *cur)
 {
     cur->col = 0; cur->row = 0; cur->up = 0;
     cur->has_start = 0; cur->has_end = 0;
-    cur->tri_size = TRI_SIZE_DEFAULT;
-    cur->theme    = 0;
-    cur->paused   = 0;
+    cur->theme  = 0;
+    cur->paused = 0;
 }
 
-static void cursor_step(Cursor *cur, int dir)
+static void cursor_move(Cursor *cur, int arrow)
 {
-    const int *t = TRI_DIR[dir][cur->up];
+    const int *t = TRI_DIR[arrow][cur->up];
     cur->col += t[0]; cur->row += t[1]; cur->up = t[2];
 }
 
-static void marker_draw(int col, int row, int up, double size,
-                        int ox, int oy, int rows, int cols,
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sc, sr;
+    ctx_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
+    if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) return;
+    attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    mvaddch(sr, sc, '@');
+    attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+}
+
+static void marker_draw(const GridCtx *g, int col, int row, int up,
                         char glyph, int pair)
 {
     int sc, sr;
-    tri_to_screen(col, row, up, size, ox, oy, &sc, &sr);
-    if (sc >= 0 && sc < cols && sr >= 0 && sr < rows - 1) {
-        attron(COLOR_PAIR(pair) | A_BOLD);
-        mvaddch(sr, sc, glyph);
-        attroff(COLOR_PAIR(pair) | A_BOLD);
-    }
+    ctx_to_screen(g, col, row, up, &sc, &sr);
+    if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) return;
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvaddch(sr, sc, glyph);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  path — pixel walk between two centroids → triangle list             */
+/* §7  mode — pixel walk between two centroids → triangle list             */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
@@ -395,31 +449,30 @@ static void marker_draw(int col, int row, int up, double size,
  * pixel space, sampling at step size·0.25, and collect the unique
  * triangles each sample lands in.
  */
-static void path_compute(PathPool *p, const Cursor *cur)
+static void path_compute(Pool *p, const Cursor *cur, const GridCtx *g)
 {
-    path_clear(p);
+    pool_clear(p);
     if (!cur->has_start || !cur->has_end) return;
 
     double sx, sy, ex, ey;
-    tri_centroid_pixel(cur->sCol, cur->sRow, cur->sUp, cur->tri_size, &sx, &sy);
-    tri_centroid_pixel(cur->eCol, cur->eRow, cur->eUp, cur->tri_size, &ex, &ey);
+    tri_centroid_pixel(cur->sCol, cur->sRow, cur->sUp, g->tri_size, &sx, &sy);
+    tri_centroid_pixel(cur->eCol, cur->eRow, cur->eUp, g->tri_size, &ex, &ey);
 
     double dx = ex - sx, dy = ey - sy;
     double dist = sqrt(dx*dx + dy*dy);
     if (dist < 1e-6) {
-        path_add(p, cur->sCol, cur->sRow, cur->sUp);
+        pool_place(p, cur->sCol, cur->sRow, cur->sUp, '*');
         return;
     }
-    double step = cur->tri_size * 0.25;
+    double step = g->tri_size * 0.25;
     int    n    = (int)(dist / step) + 1;
     for (int i = 0; i <= n; i++) {
-        double t = (double)i / (double)n;
+        double t  = (double)i / (double)n;
         double px = sx + t * dx;
         double py = sy + t * dy;
-        int    tC, tR, tU;
-        double fa, fb;
-        pixel_to_tri(px, py, cur->tri_size, &tC, &tR, &tU, &fa, &fb);
-        path_add(p, tC, tR, tU);
+        int    tC, tR, tU; double fa, fb;
+        pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+        pool_place(p, tC, tR, tU, '*');
     }
 }
 
@@ -427,71 +480,37 @@ static void path_compute(PathPool *p, const Cursor *cur)
 /* §8  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void grid_draw(int rows, int cols, double size, int ox, int oy)
+static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *path,
+                     double fps)
 {
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double px = (double)(col - ox) * CELL_W;
-            double py = (double)(row - oy) * CELL_H;
-            int tC, tR, tU; double fa, fb, em, mm;
-            pixel_to_tri(px, py, size, &tC, &tR, &tU, &fa, &fb);
-            char ech = tri_edge_char(tU, fa, fb, &em);
-            char mch = tri_median_char(tU, fa, fb, &mm);
-            if (em < BORDER_W && em <= mm) {
-                attron(COLOR_PAIR(PAIR_BORDER));
-                mvaddch(row, col, (chtype)(unsigned char)ech);
-                attroff(COLOR_PAIR(PAIR_BORDER));
-            } else if (mm < MEDIAN_T) {
-                attron(COLOR_PAIR(PAIR_MEDIAN));
-                mvaddch(row, col, (chtype)(unsigned char)mch);
-                attroff(COLOR_PAIR(PAIR_MEDIAN));
-            }
-        }
-    }
-}
-
-static void scene_draw(int rows, int cols, const Cursor *cur,
-                       const PathPool *p, double fps)
-{
-    erase();
-    int ox = cols / 2;
-    int oy = (rows - 1) / 2;
-    grid_draw(rows, cols, cur->tri_size, ox, oy);
-    path_draw(p, cur->tri_size, ox, oy, rows, cols);
-
-    if (cur->has_start)
-        marker_draw(cur->sCol, cur->sRow, cur->sUp, cur->tri_size,
-                    ox, oy, rows, cols, 'S', PAIR_START);
-    if (cur->has_end)
-        marker_draw(cur->eCol, cur->eRow, cur->eUp, cur->tri_size,
-                    ox, oy, rows, cols, 'E', PAIR_END);
-
-    /* Cursor (drawn last so always visible) */
-    {
-        int sc, sr;
-        tri_to_screen(cur->col, cur->row, cur->up, cur->tri_size, ox, oy, &sc, &sr);
-        if (sc >= 0 && sc < cols && sr >= 0 && sr < rows - 1) {
-            attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-            mvaddch(sr, sc, '@');
-            attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-        }
-    }
-
     char buf[128];
     snprintf(buf, sizeof buf,
              " C:%+d R:%+d %s  path:%d  size:%.0f  theme:%d  %5.1f fps  %s ",
              cur->col, cur->row, cur->up ? "/\\" : "\\/",
-             p->count, cur->tri_size, cur->theme, fps,
+             path->count, g->tri_size, cur->theme, fps,
              cur->paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " arrows:move  s:set-start  e:set-end  spc:clear  +/-:size  t:theme  r:reset  q:quit  [04 path] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *path,
+                       double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    pool_draw(path, g);
+    if (cur->has_start)
+        marker_draw(g, cur->sCol, cur->sRow, cur->sUp, 'S', PAIR_START);
+    if (cur->has_end)
+        marker_draw(g, cur->eCol, cur->eRow, cur->eUp, 'E', PAIR_END);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, path, fps);
     wnoutrefresh(stdscr);
     doupdate();
 }
@@ -529,11 +548,12 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
 
-    Cursor    cur;  cursor_reset(&cur);
-    PathPool  path; path_clear(&path);
+    Cursor cur;  cursor_reset(&cur);
+    Pool   path; pool_clear(&path);
     screen_init(cur.theme);
 
-    int rows = LINES, cols = COLS;
+    GridCtx g;   ctx_init(&g, LINES, COLS, TRI_SIZE_DEFAULT);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double  fps = TARGET_FPS;
     int64_t t0  = clock_ns();
@@ -542,49 +562,54 @@ int main(void)
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();
-            rows = LINES; cols = COLS;
+            ctx_init(&g, LINES, COLS, g.tri_size);
         }
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
                 case 'q': case 27: g_running = 0; break;
-                case 'p':          cur.paused ^= 1; break;
-                case 'r':          cursor_reset(&cur); path_clear(&path);
-                                   color_init(cur.theme); break;
-                case ' ':          cur.has_start = 0; cur.has_end = 0;
-                                   path_clear(&path); break;
+                case 'p': cur.paused ^= 1; break;
+                case 'r':
+                    cursor_reset(&cur); pool_clear(&path);
+                    ctx_init(&g, LINES, COLS, TRI_SIZE_DEFAULT);
+                    color_init(cur.theme);
+                    break;
+                case ' ':
+                    cur.has_start = 0; cur.has_end = 0; pool_clear(&path);
+                    break;
                 case 's':
                     cur.sCol = cur.col; cur.sRow = cur.row; cur.sUp = cur.up;
-                    cur.has_start = 1; path_compute(&path, &cur);
+                    cur.has_start = 1; path_compute(&path, &cur, &g);
                     break;
                 case 'e':
                     cur.eCol = cur.col; cur.eRow = cur.row; cur.eUp = cur.up;
-                    cur.has_end = 1; path_compute(&path, &cur);
+                    cur.has_end = 1; path_compute(&path, &cur, &g);
                     break;
                 case 't':
                     cur.theme = (cur.theme + 1) % N_THEMES;
                     color_init(cur.theme);
                     break;
-                case KEY_LEFT:  cursor_step(&cur, 0); break;
-                case KEY_RIGHT: cursor_step(&cur, 1); break;
-                case KEY_UP:    cursor_step(&cur, 2); break;
-                case KEY_DOWN:  cursor_step(&cur, 3); break;
+                case KEY_LEFT:  cursor_move(&cur, 0); break;
+                case KEY_RIGHT: cursor_move(&cur, 1); break;
+                case KEY_UP:    cursor_move(&cur, 2); break;
+                case KEY_DOWN:  cursor_move(&cur, 3); break;
                 case '+': case '=':
-                    if (cur.tri_size < TRI_SIZE_MAX) {
-                        cur.tri_size += TRI_SIZE_STEP; path_compute(&path, &cur);
+                    if (g.tri_size < TRI_SIZE_MAX) {
+                        g.tri_size += TRI_SIZE_STEP; path_compute(&path, &cur, &g);
                     } break;
                 case '-':
-                    if (cur.tri_size > TRI_SIZE_MIN) {
-                        cur.tri_size -= TRI_SIZE_STEP; path_compute(&path, &cur);
+                    if (g.tri_size > TRI_SIZE_MIN) {
+                        g.tri_size -= TRI_SIZE_STEP; path_compute(&path, &cur, &g);
                     } break;
             }
         }
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA)
+            + (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0  = now;
 
-        scene_draw(rows, cols, &cur, &path, fps);
+        scene_draw(&g, &cur, &path, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

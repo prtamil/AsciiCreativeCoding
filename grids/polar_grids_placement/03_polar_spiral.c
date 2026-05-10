@@ -16,13 +16,13 @@
  * Section map:
  *   §1 config   — spiral parameters, density, turn range
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — theme-switchable color pairs
- *   §4 coords   — cell_to_polar, polar_to_screen, angle_char
- *   §5 bgrid    — draw_polar_bg: 7 inline backgrounds
- *   §6 pool     — ObjectPool: pool_place, pool_draw, pool_clear
- *   §7 spiral   — spiral_place_archim, spiral_place_log
- *   §8 cursor   — cursor_draw
- *   §9 scene    — scene_draw
+ *   §3 color    — 5 pairs: grid, active, anchor, HUD (yellow), hint (cyan)
+ *   §4 gridctx  — GridCtx (mode, origin), cell_to_polar, polar_to_screen
+ *   §5 pool     — Pool: place, clear, draw
+ *   §6 cursor   — Cursor (row, col, r, theta) + screen-space arrow move
+ *   §7 mode     — draw_polar_bg: 7 inline polar background types in one switch
+ *   §8 spiral   — spiral_place_archim, spiral_place_log
+ *   §9 scene    — hud_draw + scene_draw (+ live preview)
  *   §10 screen  — ncurses init / cleanup
  *   §11 app     — signals, resize, main loop
  *
@@ -168,6 +168,9 @@
 #define CELL_W         2
 #define CELL_H         4
 
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
+
 /* Archimedean pitch: pixel advance per full turn */
 #define PITCH_DEFAULT  32.0
 #define PITCH_MIN       8.0
@@ -202,9 +205,9 @@
 
 #define PAIR_GRID    1
 #define PAIR_ACTIVE  2
-#define PAIR_HUD     3
-#define PAIR_LABEL   4
-#define PAIR_ANCHOR  5
+#define PAIR_ANCHOR  3
+#define PAIR_HUD     4   /* status bar (yellow)  */
+#define PAIR_HINT    5   /* key-hint footer (cyan) */
 
 static const char *const BG_NAMES[] = {
     "rings+spokes", "log-polar",  "archimedean",
@@ -248,14 +251,34 @@ static void color_init(int theme)
     short fg = COLORS >= 256 ? THEME_FG[theme][0] : THEME_FG[theme][1];
     init_pair(PAIR_GRID,   fg,                               -1);
     init_pair(PAIR_ACTIVE, COLORS>=256 ? 255 : COLOR_WHITE,  -1);
-    init_pair(PAIR_HUD,    COLORS>=256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_LABEL,  COLORS>=256 ? 252 : COLOR_WHITE,  -1);
     init_pair(PAIR_ANCHOR, COLORS>=256 ? 220 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD,    COLORS>=256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  coords                                                              */
+/* §4  gridctx                                                             */
 /* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int mode;
+    int rows, cols;
+    int cw, ch;
+    int ox, oy;
+    int max_ring, max_spoke;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int mode, int rows, int cols)
+{
+    memset(g, 0, sizeof *g);
+    g->mode = mode; g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->ox = cols / 2; g->oy = rows / 2;
+    g->max_spoke = 12;
+    int half_diag_px = (int)(sqrt((double)(g->ox*g->cw)*(g->ox*g->cw) +
+                                   (double)(g->oy*g->ch)*(g->oy*g->ch)));
+    g->max_ring = (int)(half_diag_px / 20.0);
+}
 
 static void cell_to_polar(int col, int row, int ox, int oy,
                            double *r_px, double *theta)
@@ -283,14 +306,85 @@ static char angle_char(double theta)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  bgrid                                                               */
+/* §5  pool                                                                */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void draw_polar_bg(int type, int rows, int cols, int ox, int oy)
+typedef struct { int row, col; char glyph; bool alive; } Obj;
+typedef struct { Obj items[MAX_OBJ]; int count; } Pool;
+
+static void pool_place(Pool *p, int row, int col,
+                       int rows, int cols, char glyph)
 {
+    if (row < 0 || row >= rows-1 || col < 0 || col >= cols) return;
+    if (p->count < MAX_OBJ)
+        p->items[p->count++] = (Obj){ row, col, glyph, true };
+}
+
+static void pool_draw(const Pool *p)
+{
+    attron(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
+    for (int i = 0; i < p->count; i++) {
+        if (!p->items[i].alive) continue;
+        mvaddch(p->items[i].row, p->items[i].col,
+                (chtype)(unsigned char)p->items[i].glyph);
+    }
+    attroff(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
+}
+
+static void pool_clear(Pool *p) { p->count = 0; }
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int    row, col;
+    double r, theta;
+} Cursor;
+
+static void cursor_sync_polar(Cursor *c, const GridCtx *g)
+{
+    cell_to_polar(c->col, c->row, g->ox, g->oy, &c->r, &c->theta);
+}
+
+static void cursor_reset(Cursor *c, const GridCtx *g)
+{
+    c->r = 20.0; c->theta = 0.0;
+    polar_to_screen(c->r, c->theta, g->ox, g->oy, &c->col, &c->row);
+    if (c->row < 0)          c->row = 0;
+    if (c->row >= g->rows-1) c->row = g->rows-2;
+    if (c->col < 0)          c->col = 0;
+    if (c->col >= g->cols)   c->col = g->cols-1;
+}
+
+static void cursor_move(Cursor *c, const GridCtx *g, int dr, int dc)
+{
+    int nr = c->row + dr, nc = c->col + dc;
+    if (nr >= 0 && nr < g->rows-1) c->row = nr;
+    if (nc >= 0 && nc < g->cols)   c->col = nc;
+    cursor_sync_polar(c, g);
+}
+
+static void cursor_draw(const Cursor *c, const GridCtx *g)
+{
+    if (c->row < 0 || c->row >= g->rows-1 || c->col < 0 || c->col >= g->cols)
+        return;
+    attron(COLOR_PAIR(PAIR_ANCHOR) | A_REVERSE | A_BOLD);
+    mvaddch(c->row, c->col, (chtype)'+');
+    attroff(COLOR_PAIR(PAIR_ANCHOR) | A_REVERSE | A_BOLD);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §7  mode  (polar background dispatcher)                                 */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void draw_polar_bg(const GridCtx *g)
+{
+    int rows = g->rows, cols = g->cols;
+    int ox = g->ox, oy = g->oy;
     const double two_pi = 2.0 * M_PI;
     attron(COLOR_PAIR(PAIR_GRID));
-    switch (type) {
+    switch (g->mode) {
     case 0: {
         const double sp=20.0,rw=1.6,sw=0.10,sa=two_pi/12.0;
         for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
@@ -352,33 +446,7 @@ static void draw_polar_bg(int type, int rows, int cols, int ox, int oy)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  pool                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct { int row, col; char glyph; } PObj;
-typedef struct { PObj items[MAX_OBJ]; int count; } ObjPool;
-
-static void pool_place(ObjPool *p, int row, int col,
-                       int rows, int cols, char glyph)
-{
-    if (row < 0 || row >= rows-1 || col < 0 || col >= cols) return;
-    if (p->count < MAX_OBJ)
-        p->items[p->count++] = (PObj){row, col, glyph};
-}
-
-static void pool_draw(const ObjPool *p)
-{
-    attron(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
-    for (int i = 0; i < p->count; i++)
-        mvaddch(p->items[i].row, p->items[i].col,
-                (chtype)(unsigned char)p->items[i].glyph);
-    attroff(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
-}
-
-static void pool_clear(ObjPool *p) { p->count = 0; }
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  spiral                                                              */
+/* §8  spiral                                                              */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
@@ -390,9 +458,9 @@ static void pool_clear(ObjPool *p) { p->count = 0; }
  *   r(t) = r0 + a × t      [linear growth]
  *   θ(t) = theta0 + t,  t ∈ [0, n_turns × 2π]
  */
-static void spiral_place_archim(ObjPool *pool, double r0, double theta0,
+static void spiral_place_archim(Pool *pool, double r0, double theta0,
                                  double pitch, int n_turns, double density,
-                                 int rows, int cols, int ox, int oy)
+                                 const GridCtx *g)
 {
     double a       = pitch / (2.0 * M_PI);
     double theta_max = (double)n_turns * 2.0 * M_PI;
@@ -400,8 +468,8 @@ static void spiral_place_archim(ObjPool *pool, double r0, double theta0,
         double r  = r0 + a * t;
         double th = theta0 + t;
         int c, row;
-        polar_to_screen(r, th, ox, oy, &c, &row);
-        pool_place(pool, row, c, rows, cols, OBJ_GLYPH);
+        polar_to_screen(r, th, g->ox, g->oy, &c, &row);
+        pool_place(pool, row, c, g->rows, g->cols, OBJ_GLYPH);
     }
 }
 
@@ -414,9 +482,9 @@ static void spiral_place_archim(ObjPool *pool, double r0, double theta0,
  *   r0 clamped to ≥1.0: r0=0 would give r=0 for all t (0×eˣ=0 always)
  *   Radius after 1 full turn: r0 × e^(growth × 2π)
  */
-static void spiral_place_log(ObjPool *pool, double r0, double theta0,
+static void spiral_place_log(Pool *pool, double r0, double theta0,
                                double growth, int n_turns, double density,
-                               int rows, int cols, int ox, int oy)
+                               const GridCtx *g)
 {
     if (r0 < 1.0) r0 = 1.0;
     double theta_max = (double)n_turns * 2.0 * M_PI;
@@ -424,80 +492,76 @@ static void spiral_place_log(ObjPool *pool, double r0, double theta0,
         double r  = r0 * exp(growth * t);
         double th = theta0 + t;
         int c, row;
-        polar_to_screen(r, th, ox, oy, &c, &row);
-        pool_place(pool, row, c, rows, cols, OBJ_GLYPH);
+        polar_to_screen(r, th, g->ox, g->oy, &c, &row);
+        pool_place(pool, row, c, g->rows, g->cols, OBJ_GLYPH);
     }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §8  cursor                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void cursor_draw(int row, int col, int rows, int cols)
-{
-    if (row < 0 || row >= rows-1 || col < 0 || col >= cols) return;
-    attron(COLOR_PAIR(PAIR_ANCHOR) | A_REVERSE | A_BOLD);
-    mvaddch(row, col, (chtype)'+');
-    attroff(COLOR_PAIR(PAIR_ANCHOR) | A_REVERSE | A_BOLD);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §9  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void scene_draw(int rows, int cols,
-                       const ObjPool *pool, int cur_row, int cur_col,
-                       double cur_r, double cur_theta,
-                       bool log_mode, double pitch, double growth,
-                       int n_turns, double density,
-                       int bg_type, int theme, double fps, bool paused)
+/* Bright bold yellow status (top-right) + bold cyan key hints (bottom). */
+static void hud_draw(const GridCtx *g, const Pool *p, const Cursor *cur,
+                     bool log_mode, double pitch, double growth,
+                     int n_turns, double density,
+                     int theme, double fps, bool paused)
 {
-    int ox = cols/2, oy = rows/2;
-    erase();
-    draw_polar_bg(bg_type, rows, cols, ox, oy);
-    pool_draw(pool);
-
-    /* live spiral preview — redrawn every frame from current cursor position */
-    {
-        double r0 = (cur_r < 1.0) ? 1.0 : cur_r;
-        double a  = pitch / (2.0 * M_PI);
-        double theta_max = (double)n_turns * 2.0 * M_PI;
-        attron(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
-        for (double t = 0.0; t <= theta_max; t += density) {
-            double r  = log_mode ? r0 * exp(growth * t) : r0 + a * t;
-            double th = cur_theta + t;
-            int c, row;
-            polar_to_screen(r, th, ox, oy, &c, &row);
-            if (row >= 0 && row < rows-1 && c >= 0 && c < cols)
-                mvaddch(row, c, (chtype)(unsigned char)OBJ_GLYPH);
-        }
-        attroff(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
-    }
-
-    cursor_draw(cur_row, cur_col, rows, cols);
-
     const char *mode_str = log_mode ? "log-spiral" : "archimedean";
     double param = log_mode ? growth : pitch;
     const char *pname = log_mode ? "g" : "p";
-    char buf[80];
-    snprintf(buf, sizeof buf, " %.1f fps  r:%.0f  θ:%.0f°  %s:%s=%.2f  n:%d  d:%.2f ",
-             fps, cur_r, cur_theta*180.0/M_PI,
-             mode_str, pname, param, n_turns, density);
+    char buf[96];
+    snprintf(buf, sizeof buf,
+             " %5.1f fps  r:%.0f  θ:%.0f°  %s:%s=%.2f  n:%d  d:%.2f  objs:%d ",
+             fps, cur->r, cur->theta*180.0/M_PI,
+             mode_str, pname, param, n_turns, density, p->count);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols-(int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
     attron(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
-    mvprintw(0, 0, " %-13s", BG_NAMES[bg_type]);
+    mvprintw(0, 0, " %-13s %s ", BG_NAMES[g->mode], paused ? "PAUSED" : "");
     attroff(COLOR_PAIR(PAIR_ACTIVE) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_LABEL));
-    mvprintw(rows-1, 0,
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
         " l:archi  o:log  +/-:param  [/]:turns  ,/.:density"
-        "  spc:stamp  C:clear  a/e:bg  t:theme(%d)  %s  q:quit ",
-        theme+1, paused ? "PAUSED" : "running");
-    attroff(COLOR_PAIR(PAIR_LABEL));
+        "  spc:stamp  C:clear  a/e:bg  t:theme(%d)  q:quit ", theme + 1);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void preview_draw(const GridCtx *g, const Cursor *cur,
+                         bool log_mode, double pitch, double growth,
+                         int n_turns, double density)
+{
+    /* live spiral preview — redrawn every frame from current cursor position */
+    double r0 = (cur->r < 1.0) ? 1.0 : cur->r;
+    double a  = pitch / (2.0 * M_PI);
+    double theta_max = (double)n_turns * 2.0 * M_PI;
+    attron(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
+    for (double t = 0.0; t <= theta_max; t += density) {
+        double r  = log_mode ? r0 * exp(growth * t) : r0 + a * t;
+        double th = cur->theta + t;
+        int c, row;
+        polar_to_screen(r, th, g->ox, g->oy, &c, &row);
+        if (row >= 0 && row < g->rows-1 && c >= 0 && c < g->cols)
+            mvaddch(row, c, (chtype)(unsigned char)OBJ_GLYPH);
+    }
+    attroff(COLOR_PAIR(PAIR_ANCHOR) | A_BOLD);
+}
+
+static void scene_draw(const GridCtx *g, const Pool *pool, const Cursor *cur,
+                       bool log_mode, double pitch, double growth,
+                       int n_turns, double density,
+                       int theme, double fps, bool paused)
+{
+    erase();
+    draw_polar_bg(g);
+    pool_draw(pool);
+    preview_draw(g, cur, log_mode, pitch, growth, n_turns, density);
+    cursor_draw(cur, g);
+    hud_draw(g, pool, cur, log_mode, pitch, growth, n_turns, density,
+             theme, fps, paused);
     wnoutrefresh(stdscr); doupdate();
 }
 
@@ -534,19 +598,15 @@ int main(void)
     screen_init(theme);
 
     int rows = LINES, cols = COLS;
-    int ox = cols/2, oy = rows/2;
+    GridCtx ctx; ctx_init(&ctx, 0, rows, cols);
+    Pool    pool; pool_clear(&pool);
+    Cursor  cur; cursor_reset(&cur, &ctx);
 
-    int     bg_type  = 0;
-    ObjPool pool     = {.count = 0};
-    bool    log_mode = false;
-    double  pitch    = PITCH_DEFAULT;
-    double  growth   = GROWTH_DEFAULT;
-    int     n_turns  = N_TURNS_DEFAULT;
-    double  density  = DENSITY_DEFAULT;
-
-    double cur_r = 20.0, cur_theta = 0.0;
-    int    cur_col, cur_row;
-    polar_to_screen(cur_r, cur_theta, ox, oy, &cur_col, &cur_row);
+    bool   log_mode = false;
+    double pitch    = PITCH_DEFAULT;
+    double growth   = GROWTH_DEFAULT;
+    int    n_turns  = N_TURNS_DEFAULT;
+    double density  = DENSITY_DEFAULT;
 
     bool    paused = false;
     double  fps    = TARGET_FPS;
@@ -556,13 +616,14 @@ int main(void)
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS; ox = cols/2; oy = rows/2;
-            /* re-anchor cursor: keep (cur_r, cur_theta), recompute cell */
-            polar_to_screen(cur_r, cur_theta, ox, oy, &cur_col, &cur_row);
-            if (cur_row < 0)       cur_row = 0;
-            if (cur_row >= rows-1) cur_row = rows-2;
-            if (cur_col < 0)       cur_col = 0;
-            if (cur_col >= cols)   cur_col = cols-1;
+            rows = LINES; cols = COLS;
+            ctx_init(&ctx, ctx.mode, rows, cols);
+            /* re-anchor cursor: keep (cur.r, cur.theta), recompute cell */
+            polar_to_screen(cur.r, cur.theta, ctx.ox, ctx.oy, &cur.col, &cur.row);
+            if (cur.row < 0)          cur.row = 0;
+            if (cur.row >= ctx.rows-1) cur.row = ctx.rows-2;
+            if (cur.col < 0)          cur.col = 0;
+            if (cur.col >= ctx.cols)   cur.col = ctx.cols-1;
         }
 
         int ch = getch();
@@ -570,17 +631,17 @@ int main(void)
         case 'q': case 27: g_running = 0; break;
         case 'P': paused = !paused; break;
         case 't': theme = (theme+1) % N_THEMES; color_init(theme); break;
-        case 'a': bg_type = (bg_type-1+N_BG_TYPES) % N_BG_TYPES; break;
-        case 'e': bg_type = (bg_type+1) % N_BG_TYPES; break;
+        case 'a': ctx_init(&ctx, (ctx.mode-1+N_BG_TYPES) % N_BG_TYPES, rows, cols); break;
+        case 'e': ctx_init(&ctx, (ctx.mode+1) % N_BG_TYPES, rows, cols); break;
         case 'l': log_mode = false; break;
         case 'o': log_mode = true;  break;
         case ' ':
             if (log_mode)
-                spiral_place_log(&pool, cur_r, cur_theta, growth,
-                                  n_turns, density, rows, cols, ox, oy);
+                spiral_place_log(&pool, cur.r, cur.theta, growth,
+                                  n_turns, density, &ctx);
             else
-                spiral_place_archim(&pool, cur_r, cur_theta, pitch,
-                                     n_turns, density, rows, cols, ox, oy);
+                spiral_place_archim(&pool, cur.r, cur.theta, pitch,
+                                     n_turns, density, &ctx);
             break;
         case '+': case '=':
             if (log_mode) { if (growth < GROWTH_MAX) growth += GROWTH_STEP; }
@@ -603,35 +664,19 @@ int main(void)
             if (density > DENSITY_MIN) density -= DENSITY_STEP;
             break;
         case 'C': pool_clear(&pool); break;
-        case 'r':
-            cur_r = 20.0; cur_theta = 0.0;
-            polar_to_screen(cur_r, cur_theta, ox, oy, &cur_col, &cur_row);
-            break;
-        case KEY_UP:
-            if (cur_row > 0) cur_row--;
-            cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta);
-            break;
-        case KEY_DOWN:
-            if (cur_row < rows-2) cur_row++;
-            cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta);
-            break;
-        case KEY_LEFT:
-            if (cur_col > 0) cur_col--;
-            cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta);
-            break;
-        case KEY_RIGHT:
-            if (cur_col < cols-1) cur_col++;
-            cell_to_polar(cur_col, cur_row, ox, oy, &cur_r, &cur_theta);
-            break;
+        case 'r': cursor_reset(&cur, &ctx); break;
+        case KEY_UP:    cursor_move(&cur, &ctx, -1,  0); break;
+        case KEY_DOWN:  cursor_move(&cur, &ctx, +1,  0); break;
+        case KEY_LEFT:  cursor_move(&cur, &ctx,  0, -1); break;
+        case KEY_RIGHT: cursor_move(&cur, &ctx,  0, +1); break;
         }
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
-        t0  = now;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9/(now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0 = now;
         if (!paused)
-            scene_draw(rows, cols, &pool, cur_row, cur_col, cur_r, cur_theta,
-                       log_mode, pitch, growth, n_turns, density,
-                       bg_type, theme, fps, paused);
+            scene_draw(&ctx, &pool, &cur, log_mode, pitch, growth,
+                       n_turns, density, theme, fps, paused);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

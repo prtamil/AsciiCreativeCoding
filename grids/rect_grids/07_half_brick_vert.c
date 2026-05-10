@@ -10,12 +10,13 @@
  * Study alongside: 06_brick_stagger.c (horizontal version), 01_uniform_rect.c
  *
  * Section map:
- *   §1 config   — CELL_W, CELL_H, HALF_H = CELL_H/2
+ *   §1 config   — CELL_W, CELL_H, HALF_H = CELL_H/2, EWMA constant
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 4 pairs
- *   §4 formula  — vertical stagger: sr = r*CH + (c%2)*HALF_H
- *   §5 player   — struct, move, reset
- *   §6 scene    — draw_grid(), draw_player()
+ *   §3 color    — grid / active / cursor / HUD / HINT pairs
+ *   §4 formula  — GridCtx (with HALF_H) + ctx_init / ctx_to_screen
+ *                 / ctx_grid_char / ctx_draw_bg
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -32,7 +33,7 @@
  *                  Even cols align normally.
  *                  Odd  cols shift DOWN by HALF_H = CELL_H / 2.
  *
- * Stagger formula: ONLY the vertical part of cell_to_screen changes:
+ * Stagger formula: ONLY the vertical part of ctx_to_screen changes:
  *
  *   screen_row = r * CELL_H + (c % 2) * HALF_H   ← +HALF_H on odd cols
  *   screen_col = c * CELL_W                        ← unchanged from 01
@@ -110,7 +111,7 @@
  *
  *  HALF_H = CELL_H / 2     (CELL_H must be even)
  *
- *  Player row bound (odd cols extend further down):
+ *  Cursor row bound (odd cols extend further down):
  *    max_r = (rows - 1 - HALF_H) / CELL_H - 1
  *
  * EDGE CASES TO WATCH
@@ -119,7 +120,7 @@
  *    HALF_H = CELL_H/2 rounded down — the shift is asymmetric.
  *
  *  • The bottom of odd columns extends HALF_H rows further than even
- *    columns.  Subtract HALF_H from available height in player_reset().
+ *    columns.  Subtract HALF_H from available height in ctx_init().
  *
  *  • Vertical lines span the FULL screen height regardless of col band.
  *    Do NOT stagger the vertical lines (sc%CELL_W==0 always, no shift).
@@ -157,10 +158,15 @@
 #define CELL_H       6   /* rows per cell; must be even for HALF_H */
 #define HALF_H      (CELL_H / 2)   /* = 3: the vertical stagger offset */
 
-#define PAIR_GRID    1
-#define PAIR_ACTIVE  2
-#define PAIR_PLAYER  3
-#define PAIR_HUD     4
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
+
+/* Color pair IDs */
+#define PAIR_GRID    1   /* grid lines                   */
+#define PAIR_ACTIVE  2   /* highlighted cell fill        */
+#define PAIR_CURSOR  3   /* bright '@'                   */
+#define PAIR_HUD     4   /* status bar (yellow)          */
+#define PAIR_HINT    5   /* key-hint footer (cyan)       */
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -188,50 +194,81 @@ static void color_init(void)
     start_color(); use_default_colors();
     init_pair(PAIR_GRID,   COLORS >= 256 ? 220 : COLOR_YELLOW, -1);
     init_pair(PAIR_ACTIVE, COLORS >= 256 ? 196 : COLOR_RED,    -1);
-    init_pair(PAIR_PLAYER, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  15 : COLOR_WHITE,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * cell_to_screen — THE VERTICAL STAGGER FORMULA:
+ * GridCtx — geometry of the vertically-staggered grid plus cursor bounds.
  *
- *   screen_row = r * CELL_H + (c % 2) * HALF_H   ← row shifts on odd cols
- *   screen_col = c * CELL_W                        ← unchanged from 01
+ * half_h is the column-stagger offset = ch / 2.  It is carried as a field
+ * so ctx_to_screen / ctx_grid_char don't depend on file-level macros.
+ */
+typedef struct {
+    /* terminal extent */
+    int rows, cols;
+
+    /* cell size in screen characters */
+    int cw, ch;
+
+    /* vertical stagger offset applied to odd cols (= ch / 2) */
+    int half_h;
+
+    /* cursor bounds — last whole cell that fits, accounting for stagger */
+    int max_r, max_c;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->half_h = HALF_H;
+    /* Odd columns extend HALF_H further down, so reduce max row */
+    g->max_r = (rows - 1 - HALF_H) / CELL_H - 1;
+    g->max_c = cols / CELL_W - 1;
+}
+
+/*
+ * ctx_to_screen — THE VERTICAL STAGGER FORMULA:
+ *
+ *   screen_row = r * ch + (c % 2) * half_h   ← row shifts on odd cols
+ *   screen_col = c * cw                        ← unchanged from 01
  *
  * Compare to 06_brick_stagger:
- *   06:  screen_col = c * CELL_W + (r % 2) * HALF_W   ← col shifts on odd rows
- *   07:  screen_row = r * CELL_H + (c % 2) * HALF_H   ← row shifts on odd cols
+ *   06:  screen_col = c * cw + (r % 2) * half_w   ← col shifts on odd rows
+ *   07:  screen_row = r * ch + (c % 2) * half_h   ← row shifts on odd cols
  * Perfect axis swap.
  */
-static void cell_to_screen(int r, int c, int *sr, int *sc)
+static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
-    *sr = r * CELL_H + (c % 2) * HALF_H;
-    *sc = c * CELL_W;
+    *sr = r * g->ch + (c % 2) * g->half_h;
+    *sc = c * g->cw;
 }
 
 /*
- * grid_char — grid line detection for vertically staggered grid.
+ * ctx_grid_char — grid line detection for vertically staggered grid.
  *
- * Vertical lines: same as 01 — sc % CELL_W == 0
+ * Vertical lines: same as 01 — sc % cw == 0
  *
  * Horizontal lines depend on which column band sc falls in:
- *   col_index = sc / CELL_W
- *   even col: h_line at sr % CELL_H == 0
- *   odd  col: h_line at sr % CELL_H == HALF_H
- *             (because the cell is shifted DOWN by HALF_H)
+ *   col_index = sc / cw
+ *   even col: h_line at sr % ch == 0
+ *   odd  col: h_line at sr % ch == half_h
+ *             (because the cell is shifted DOWN by half_h)
  */
-static char grid_char(int sr, int sc)
+static char ctx_grid_char(const GridCtx *g, int sr, int sc)
 {
-    bool v = (sc % CELL_W == 0);
+    bool v = (sc % g->cw == 0);
 
-    int col_idx = sc / CELL_W;
+    int col_idx = sc / g->cw;
     bool h = (col_idx % 2 == 0)
-             ? (sr % CELL_H == 0)
-             : (sr % CELL_H == HALF_H);
+             ? (sr % g->ch == 0)
+             : (sr % g->ch == g->half_h);
 
     if (h && v) return '+';
     if (h)      return '-';
@@ -239,80 +276,83 @@ static char grid_char(int sr, int sc)
     return ' ';
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  player                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct { int r, c, max_r, max_c; } Player;
-
-static void player_reset(Player *p, int rows, int cols)
-{
-    /* Odd columns extend HALF_H further down, so reduce max row */
-    p->max_r = (rows - 1 - HALF_H) / CELL_H - 1;
-    p->max_c = cols / CELL_W - 1;
-    p->r = p->max_r / 2;
-    p->c = p->max_c / 2;
-}
-static void player_move(Player *p, int dr, int dc)
-{
-    int nr = p->r + dr, nc = p->c + dc;
-    if (nr >= 0 && nr <= p->max_r) p->r = nr;
-    if (nc >= 0 && nc <= p->max_c) p->c = nc;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void draw_grid(int rows, int cols)
+static void ctx_draw_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
-    for (int sr = 0; sr < rows - 1; sr++)
-        for (int sc = 0; sc < cols; sc++) {
-            char ch = grid_char(sr, sc);
+    for (int sr = 0; sr < g->rows - 1; sr++)
+        for (int sc = 0; sc < g->cols; sc++) {
+            char ch = ctx_grid_char(g, sr, sc);
             if (ch != ' ')
                 mvaddch(sr, sc, (chtype)(unsigned char)ch);
         }
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-static void draw_player(const Player *p)
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct { int r, c; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    cur->r = g->max_r / 2;
+    cur->c = g->max_c / 2;
+}
+
+static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
+{
+    int nr = cur->r + dr, nc = cur->c + dc;
+    if (nr >= 0 && nr <= g->max_r) cur->r = nr;
+    if (nc >= 0 && nc <= g->max_c) cur->c = nc;
+}
+
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    cell_to_screen(p->r, p->c, &sr, &sc);
+    ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
 
     attron(COLOR_PAIR(PAIR_ACTIVE));
-    for (int dr = 1; dr < CELL_H; dr++)
-        for (int dc = 1; dc < CELL_W; dc++)
+    for (int dr = 1; dr < g->ch; dr++)
+        for (int dc = 1; dc < g->cw; dc++)
             mvaddch(sr + dr, sc + dc, (chtype)'.');
     attroff(COLOR_PAIR(PAIR_ACTIVE));
 
-    attron(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
-    mvaddch(sr + CELL_H / 2, sc + CELL_W / 2, (chtype)'@');
-    attroff(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    mvaddch(sr + g->ch / 2, sc + g->cw / 2, (chtype)'@');
+    attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-static void scene_draw(int rows, int cols, const Player *p, double fps)
-{
-    erase();
-    draw_grid(rows, cols);
-    draw_player(p);
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
-    int sr, sc; cell_to_screen(p->r, p->c, &sr, &sc);
+static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
+    int sr, sc; ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
     char buf[80];
     snprintf(buf, sizeof buf,
         " %.1f fps  cell(%d,%d)  screen_row=%d  stagger=%d ",
-        fps, p->r, p->c, sr, (p->c % 2) * HALF_H);
+        fps, cur->r, cur->c, sr, (cur->c % 2) * g->half_h);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_DIM);
-    mvprintw(rows - 1, 0,
-        " arrows:move  r:reset  q:quit  [07 half-brick vert  HALF_H=%d] ", HALF_H);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_DIM);
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+        " arrows:move  r:reset  q/ESC:quit  [07 half-brick vert  HALF_H=%d] ",
+        g->half_h);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
-    wnoutrefresh(stdscr); doupdate();
+static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, fps);
+    wnoutrefresh(stdscr);
+    doupdate();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -343,30 +383,37 @@ int main(void)
 {
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
+
     screen_init();
-    int rows = LINES, cols = COLS;
-    Player player; player_reset(&player, rows, cols);
+    GridCtx g;     ctx_init(&g, LINES, COLS);
+    Cursor  cur;   cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double fps = TARGET_FPS; int64_t t0 = clock_ns();
+    double fps = TARGET_FPS;
+    int64_t t0 = clock_ns();
 
     while (g_running) {
         if (g_need_resize) {
-            g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
-            player_reset(&player, rows, cols);
+            g_need_resize = 0;
+            endwin(); refresh();
+            ctx_init(&g, LINES, COLS);
+            cursor_reset(&cur, &g);
         }
         int ch = getch();
         switch (ch) {
-            case 'q': case 27: g_running = 0;                    break;
-            case 'r':          player_reset(&player, rows, cols); break;
-            case KEY_UP:    player_move(&player, -1,  0); break;
-            case KEY_DOWN:  player_move(&player, +1,  0); break;
-            case KEY_LEFT:  player_move(&player,  0, -1); break;
-            case KEY_RIGHT: player_move(&player,  0, +1); break;
+            case 'q': case 27:  g_running = 0;                  break;
+            case 'r':           cursor_reset(&cur, &g);          break;
+            case KEY_UP:        cursor_move(&cur, &g, -1,  0);   break;
+            case KEY_DOWN:      cursor_move(&cur, &g, +1,  0);   break;
+            case KEY_LEFT:      cursor_move(&cur, &g,  0, -1);   break;
+            case KEY_RIGHT:     cursor_move(&cur, &g,  0, +1);   break;
         }
+
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (now - t0 + 1)) * 0.05; t0 = now;
-        scene_draw(rows, cols, &player, fps);
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0  = now;
+
+        scene_draw(&g, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

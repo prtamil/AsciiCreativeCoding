@@ -6,23 +6,25 @@
  *       (between consecutive rings) has the same area — like a bullseye
  *       target where every ring is equally "hard to hit".  Combined with
  *       uniform angular sectors the result is a grid where every cell covers
- *       the same area.  +/- adjusts the unit radius; [/] changes sector count.
+ *       the same area.  An '@' cursor sits at one (ring, spoke) cell — arrows
+ *       step it across the grid.  +/- adjusts unit radius; [/] sector count.
  *
  * Study alongside: 01_rings_spokes.c (linear rings — unequal area),
- *                  02_log_polar.c (log rings — equal log-area)
+ *                  02_log_polar.c (log rings — equal log-area),
+ *                  ../rect_grids/01_uniform_rect.c (the GridCtx template)
  *
  * Section map:
- *   §1 config   — R_UNIT, sector count, themes
+ *   §1 config   — R_UNIT, sector count, themes, EWMA
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — theme-switchable PAIR_GRID
- *   §4 coords   — cell_to_polar, angle_char
- *   §5 draw     — equal-area ring test, sector grid
- *   §6 scene    — scene_draw
+ *   §3 color    — theme-switchable PAIR_GRID + HUD/HINT/CURSOR
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg + angle_char
+ *   §5 cursor   — Cursor (ring, spoke) + cursor_reset / cursor_move / cursor_draw
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, resize, main loop
  *
- * Keys:  q/ESC quit   p pause   t theme
- *        +/- unit radius   [/] sector count
+ * Keys:  q/ESC quit   p pause   t theme   r reset
+ *        arrows move @   +/- unit radius   [/] sector count
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids/06_sector.c \
@@ -54,6 +56,12 @@
  *                  larger r.  This keeps all rings visually present without
  *                  becoming invisible at large radii.
  *
+ * Data-structure : Two structs — GridCtx (terminal extent, R_UNIT, n_sectors,
+ *                  ox/oy) and Cursor (linear ring index, sector index).
+ *                  ctx_to_screen places (ring, spoke) at the equal-area
+ *                  midpoint √(ring + 0.5) × R_UNIT and the angular midpoint
+ *                  (spoke + 0.5) × 2π/N_SECTORS.
+ *
  * Math           : Sector detection is identical to 01_rings_spokes: divide
  *                  [0, 2π) into N_SECTORS equal wedges of width 2π/N_SECTORS
  *                  and use the same fmod spoke test.
@@ -82,7 +90,8 @@
  * CORE IDEA
  *   Rings are placed at r_k = √k × R_UNIT so that each annular band has the
  *   same area: π × R_UNIT².  Combined with uniform angular sectors, every grid
- *   cell covers the same area — the standard equal-area polar grid.
+ *   cell covers the same area — the standard equal-area polar grid.  Cursor
+ *   address (ring k, spoke s) maps to the equal-area midpoint of cell (k, s).
  *
  * HOW TO THINK ABOUT IT
  *   A dartboard where each ring should be equally likely to be hit needs equal-
@@ -111,6 +120,11 @@
  *   Ring detection: k_float = (r / R_UNIT)²
  *     If r = r_k then k_float = k exactly (integer → frac=0 → on_ring).
  *
+ *   Cursor → screen (ring k, sector s):
+ *     mid_radius = √(k + 0.5) × R_UNIT     (equal-area midpoint)
+ *     theta_mid  = (s + 0.5) × (2π / N_SECTORS)
+ *     cx = mid_radius × cos theta_mid;  cy = mid_radius × sin theta_mid
+ *
  *   Adaptive pixel width:
  *     dk = RING_W_F.  dr = r × dk (from d(r²/R_UNIT²)/dr = 2r/R_UNIT²).
  *     Outer rings are wider in pixels — they remain visible at large radii.
@@ -119,6 +133,7 @@
  *   • r=0: k_float=0 → frac=0 → always on_ring.  Guard with R_MIN.
  *   • SECTOR_MIN_R: prevents smeared disc at origin for sector lines.
  *   • RING_W_F ≥ 0.5: every cell becomes "on_ring".  Keep < 0.3.
+ *   • Cursor max_ring re-derived in ctx_init from current R_UNIT.
  *
  * HOW TO VERIFY
  *   R_UNIT=18px, ox=40, oy=12.  Rings at r_k = 18√k px:
@@ -176,9 +191,13 @@
 /* Minimum radius — avoid centre smear */
 #define R_MIN            3.0
 
-#define PAIR_GRID   1
-#define PAIR_HUD    2
-#define PAIR_LABEL  3
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA   0.05
+
+#define PAIR_GRID    1
+#define PAIR_CURSOR  2
+#define PAIR_HUD     3
+#define PAIR_HINT    4
 
 static const short THEME_FG[][2] = {
     {75,  COLOR_CYAN},
@@ -214,29 +233,88 @@ static void color_init(int theme)
 {
     start_color(); use_default_colors();
     short fg = COLORS >= 256 ? THEME_FG[theme][0] : THEME_FG[theme][1];
-    init_pair(PAIR_GRID,  fg,                              -1);
-    init_pair(PAIR_HUD,   COLORS>=256 ? 226 : COLOR_YELLOW,-1);
-    init_pair(PAIR_LABEL, COLORS>=256 ? 252 : COLOR_WHITE, -1);
+    init_pair(PAIR_GRID,   fg,                              -1);
+    init_pair(PAIR_CURSOR, COLORS>=256 ? 226 : COLOR_YELLOW,-1);
+    init_pair(PAIR_HUD,    COLORS>=256 ? 226 : COLOR_YELLOW,-1);
+    init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  coords                                                              */
+/* §4  formula — GridCtx and the equal-area ring/sector ↔ screen mapping  */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * cell_to_polar — convert screen cell (col, row) to polar (r_px, theta).
+ * GridCtx — equal-area sector geometry plus cursor bounds.
+ *
+ * r_unit = innermost ring radius; rings at r_k = √k × r_unit.
+ * n_spokes (called n_sectors in the file's prose) = angular wedges.
+ * max_ring = floor((r_visible / r_unit)² − 0.5).
+ */
+typedef struct {
+    int rows, cols;
+
+    double r_unit;         /* unit radius (pixels)                          */
+    int    n_spokes;       /* number of equal-area angular sectors          */
+    int    cell_w, cell_h;
+
+    int    ox, oy;
+
+    int    max_ring, max_spoke;
+} GridCtx;
+
+/*
+ * ctx_init — derive geometry from terminal size.
+ *
+ * For a sample at the equal-area centre of (ring k, spoke s):
+ *   mid_radius = √(k + 0.5) × r_unit ≤ r_visible
+ *   k_max      = floor((r_visible / r_unit)² − 0.5)
+ */
+static void ctx_init(GridCtx *g, int rows, int cols)
+{
+    g->rows   = rows;
+    g->cols   = cols;
+    g->cell_w = CELL_W;
+    g->cell_h = CELL_H;
+    g->ox     = cols / 2;
+    g->oy     = rows / 2;
+    if (g->r_unit   <= 0.0) g->r_unit   = R_UNIT_DEFAULT;
+    if (g->n_spokes <= 0)   g->n_spokes = N_SECTORS_DEFAULT;
+
+    double rx = (double)cols * 0.5 * CELL_W;
+    double ry = (double)rows * 0.5 * CELL_H;
+    double r_visible = (rx < ry ? rx : ry);
+    int mr = 0;
+    if (r_visible > g->r_unit) {
+        double ratio = r_visible / g->r_unit;
+        mr = (int)floor(ratio * ratio - 0.5);
+        if (mr < 0) mr = 0;
+    }
+    g->max_ring  = mr;
+    g->max_spoke = g->n_spokes - 1;
+}
+
+/*
+ * ctx_to_screen — equal-area centre of (ring k, sector s).
  *
  * THE FORMULA:
- *   dx_px = (col − ox) × CELL_W,  dy_px = (row − oy) × CELL_H
- *   r_px  = √(dx_px² + dy_px²),   theta = atan2(dy_px, dx_px)  ∈ (−π, π]
+ *   mid_radius = √(k + 0.5) × r_unit       (equal-area midpoint of annulus k)
+ *   theta_mid  = (s + 0.5) × (2π / n_spokes)
+ *   cx = mid_radius × cos theta_mid;  cy = mid_radius × sin theta_mid
+ *   sc = ox + (int)round(cx / CELL_W);  sr = oy + (int)round(cy / CELL_H)
+ *
+ * The √(k+0.5) midpoint splits the annular area in two equal halves —
+ * the natural centre for an equal-area cell, just as the arithmetic
+ * midpoint splits a uniform-spaced annulus in 01_rings_spokes.
  */
-static void cell_to_polar(int col, int row, int ox, int oy,
-                           double *r_px, double *theta)
+static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
+                          int *sr, int *sc)
 {
-    double dx = (double)(col - ox) * CELL_W;
-    double dy = (double)(row - oy) * CELL_H;
-    *r_px  = sqrt(dx*dx + dy*dy);
-    *theta = atan2(dy, dx);
+    double mid_radius = sqrt((double)ring + 0.5) * g->r_unit;
+    double theta_mid  = ((double)spoke + 0.5) * (2.0 * M_PI / (double)g->n_spokes);
+    double cx = mid_radius * cos(theta_mid);
+    double cy = mid_radius * sin(theta_mid);
+    *sc = g->ox + (int)round(cx / (double)g->cell_w);
+    *sr = g->oy + (int)round(cy / (double)g->cell_h);
 }
 
 /*
@@ -256,48 +334,44 @@ static char angle_char(double theta)
     return '/';
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  draw                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
 /*
- * grid_draw — sweep every cell, apply equal-area ring and sector tests, draw.
+ * ctx_draw_bg — sweep every cell, apply equal-area ring and sector tests, draw.
  *
  * THE PIPELINE:
  *   for each cell:
- *     (r, θ) ← cell_to_polar(); if r < R_MIN: skip
+ *     dx = (col−ox)×CELL_W,  dy = (row−oy)×CELL_H
+ *     r  = √(dx²+dy²),  θ = atan2(dy,dx);  if r < R_MIN: skip
  *     k_float = (r / r_unit)²           continuous ring index in k² space
  *     frac    = k_float − floor(k_float)
  *     on_ring = frac < RING_W_F  ||  frac > 1 − RING_W_F
  *     on_sector = same fmod test as 01 spoke test on θ_norm
  *     draw '+'/angle_char/skip
  */
-static void grid_draw(int rows, int cols, int ox, int oy,
-                      double r_unit, int n_sectors)
+static void ctx_draw_bg(const GridCtx *g)
 {
-    double sector_angle = 2.0 * M_PI / (double)n_sectors;
-    double r_unit_sq    = r_unit * r_unit;
+    double sector_angle = 2.0 * M_PI / (double)g->n_spokes;
+    double r_unit_sq    = g->r_unit * g->r_unit;
 
     attron(COLOR_PAIR(PAIR_GRID));
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double r_px, theta;
-            cell_to_polar(col, row, ox, oy, &r_px, &theta);
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double dx = (double)(col - g->ox) * g->cell_w;
+            double dy = (double)(row - g->oy) * g->cell_h;
+            double r_px = sqrt(dx*dx + dy*dy);
             if (r_px < R_MIN) continue;
+
+            double theta = atan2(dy, dx);
 
             /*
              * Equal-area ring test:
              *   k_float = (r_px / R_UNIT)²  — continuous ring index
              *   on_ring: fractional part near 0 or 1
              */
-            bool on_ring = false;
-            {
-                double k_float = (r_px * r_px) / r_unit_sq;
-                double frac    = k_float - floor(k_float);
-                on_ring = (frac < RING_W_F || frac > 1.0 - RING_W_F);
-            }
+            double k_float = (r_px * r_px) / r_unit_sq;
+            double frac    = k_float - floor(k_float);
+            bool on_ring = (frac < RING_W_F || frac > 1.0 - RING_W_F);
 
-            double theta_norm  = fmod(theta + 2.0*M_PI, 2.0*M_PI);
+            double theta_norm   = fmod(theta + 2.0*M_PI, 2.0*M_PI);
             double sector_phase = fmod(theta_norm, sector_angle);
             bool on_sector = (r_px > SECTOR_MIN_R) &&
                              (sector_phase < SECTOR_W ||
@@ -313,28 +387,74 @@ static void grid_draw(int rows, int cols, int ox, int oy,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Cursor — (ring index, sector index).  Same shape as 01_rings_spokes;
+ * only ctx_to_screen's radial law differs (equal-area, not uniform).
+ */
+typedef struct { int ring, spoke; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    cur->ring  = g->max_ring / 2;
+    cur->spoke = 0;
+}
+
+static void cursor_move(Cursor *cur, const GridCtx *g, int d_ring, int d_spoke)
+{
+    int nr = cur->ring + d_ring;
+    if (nr < 0)            nr = 0;
+    if (nr > g->max_ring)  nr = g->max_ring;
+    cur->ring = nr;
+
+    int n = g->n_spokes > 0 ? g->n_spokes : 1;
+    int ns = (cur->spoke + d_spoke) % n;
+    if (ns < 0) ns += n;
+    cur->spoke = ns;
+}
+
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc;
+    ctx_to_screen(g, cur->ring, cur->spoke, &sr, &sc);
+    if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
+        attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+        mvaddch(sr, sc, (chtype)'@');
+        attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
 /* §6  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void scene_draw(int rows, int cols, double r_unit, int n_sectors,
-                       int theme, double fps, bool paused)
+static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
+                     bool paused, double fps)
 {
-    int ox = cols / 2, oy = rows / 2;
-    erase();
-    grid_draw(rows, cols, ox, oy, r_unit, n_sectors);
-
-    char buf[80];
-    snprintf(buf, sizeof buf, " %.1f fps  R_unit:%.0fpx  sectors:%d  %s ",
-             fps, r_unit, n_sectors, paused ? "PAUSED" : "running");
+    char buf[112];
+    snprintf(buf, sizeof buf,
+             " ring:%d sector:%d  R_unit:%.0fpx  sectors:%d  th:%d  %5.1f fps  %s ",
+             cur->ring, cur->spoke, g->r_unit, g->n_spokes,
+             theme + 1, fps, paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_LABEL));
-    mvprintw(rows-1, 0,
-        " q:quit  p:pause  t:theme(%d)  +/-:R-unit  [/]:sectors ", theme+1);
-    attroff(COLOR_PAIR(PAIR_LABEL));
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+             " q:quit  p:pause  t:theme  r:reset  arrows:move  +/-:R-unit  [/]:sectors ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
+                       bool paused, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr); doupdate();
 }
 
@@ -343,12 +463,12 @@ static void scene_draw(int rows, int cols, double r_unit, int n_sectors,
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 static void screen_cleanup(void) { endwin(); }
-static void screen_init(int theme)
+static void screen_init(void)
 {
     initscr(); cbreak(); noecho();
     keypad(stdscr, TRUE); nodelay(stdscr, TRUE);
     curs_set(0); typeahead(-1);
-    color_init(theme); atexit(screen_cleanup);
+    atexit(screen_cleanup);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -367,49 +487,74 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
 
-    int theme     = 0;
-    screen_init(theme);
+    int theme = 0;
+    screen_init();
+    color_init(theme);
 
-    int    rows      = LINES, cols = COLS;
-    double r_unit    = R_UNIT_DEFAULT;
-    int    n_sectors = N_SECTORS_DEFAULT;
-    bool   paused    = false;
-    double fps = TARGET_FPS;
-    int64_t t0 = clock_ns();
+    GridCtx g = {0};
+    g.r_unit   = R_UNIT_DEFAULT;
+    g.n_spokes = N_SECTORS_DEFAULT;
+    ctx_init(&g, LINES, COLS);
+
+    Cursor cur;
+    cursor_reset(&cur, &g);
+
+    bool   paused = false;
+    double fps    = TARGET_FPS;
+    int64_t t0    = clock_ns();
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
 
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
+            ctx_init(&g, LINES, COLS);
+            cursor_reset(&cur, &g);
         }
 
         int ch = getch();
         switch (ch) {
         case 'q': case 27: g_running = 0; break;
         case 'p': paused = !paused; break;
+        case 'r': cursor_reset(&cur, &g); break;
         case 't': theme = (theme + 1) % N_THEMES; color_init(theme); break;
+        case KEY_UP:    cursor_move(&cur, &g, -1,  0); break;
+        case KEY_DOWN:  cursor_move(&cur, &g, +1,  0); break;
+        case KEY_LEFT:  cursor_move(&cur, &g,  0, -1); break;
+        case KEY_RIGHT: cursor_move(&cur, &g,  0, +1); break;
         case '+': case '=':
-            if (r_unit < R_UNIT_MAX) r_unit += R_UNIT_STEP;
+            if (g.r_unit < R_UNIT_MAX) {
+                g.r_unit += R_UNIT_STEP;
+                ctx_init(&g, LINES, COLS);
+                if (cur.ring > g.max_ring) cur.ring = g.max_ring;
+            }
             break;
         case '-':
-            if (r_unit > R_UNIT_MIN) r_unit -= R_UNIT_STEP;
+            if (g.r_unit > R_UNIT_MIN) {
+                g.r_unit -= R_UNIT_STEP;
+                ctx_init(&g, LINES, COLS);
+            }
             break;
         case '[':
-            if (n_sectors > N_SECTORS_MIN)
-                n_sectors -= (n_sectors > 8 ? 4 : 2);
+            if (g.n_spokes > N_SECTORS_MIN) {
+                g.n_spokes -= (g.n_spokes > 8 ? 4 : 2);
+                ctx_init(&g, LINES, COLS);
+                if (cur.spoke > g.max_spoke) cur.spoke = g.max_spoke;
+            }
             break;
         case ']':
-            if (n_sectors < N_SECTORS_MAX)
-                n_sectors += (n_sectors >= 8 ? 4 : 2);
+            if (g.n_spokes < N_SECTORS_MAX) {
+                g.n_spokes += (g.n_spokes >= 8 ? 4 : 2);
+                ctx_init(&g, LINES, COLS);
+            }
             break;
         }
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) +
+              (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0  = now;
         if (!paused)
-            scene_draw(rows, cols, r_unit, n_sectors, theme, fps, paused);
+            scene_draw(&g, &cur, theme, paused, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

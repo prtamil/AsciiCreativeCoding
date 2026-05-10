@@ -13,12 +13,13 @@
  *                  drawing edge characters.
  *
  * Section map:
- *   §1 config   — CELL_W, CELL_H, TRI_SIZE
+ *   §1 config   — CELL_W, CELL_H, TRI_SIZE, FPS_EWMA_ALPHA
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 6-color rotating palette + cursor / HUD / hint
- *   §4 formula  — pixel ↔ lattice + palette_index hash
- *   §5 cursor   — TRI_DIR (same as 01)
- *   §6 scene    — grid_draw (solid fill) + scene_draw
+ *   §3 color    — 6-color rotating palette + cursor / HUD / HINT
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_pixel_to_tri /
+ *                 ctx_draw_bg + tri_centroid_pixel + palette_index
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move, TRI_DIR (same as 01)
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -40,6 +41,10 @@
  *                  Pairs of triangles that share a horizontal edge pick
  *                  adjacent indices, so the screen reads as stacked rhombi
  *                  (= cube faces in iso projection).
+ *
+ * Data-structure : Two structs — GridCtx (terminal extent, tri_size,
+ *                  CELL_W/CELL_H, screen origin ox/oy) and Cursor
+ *                  (col, row, up) — same as 01. No grid array.
  *
  * Formula        : Same skew-lattice pixel→triangle as 01_equilateral.c.
  *                  Then palette_index(col, row, up) = (col + 2·row + up) mod 6.
@@ -79,8 +84,8 @@
  *
  * The hash (col + 2·row + up) mod 6 achieves this without any explicit
  * "which face am I on?" reasoning. The "·2" gives different colors to
- * triangles in adjacent strips at the same column; the "+up" splits ▽
- * vs △ in the same rhombus into different colors. Cycling through 6
+ * triangles in adjacent strips at the same column; the "+up" splits
+ * down vs up in the same rhombus into different colors. Cycling through 6
  * indices around any vertex produces the stacked-cube illusion.
  *
  * DRAWING METHOD  (raster scan, the approach used here)
@@ -100,12 +105,9 @@
  *    k = (col + 2·row + up) mod 6     (positive remainder)
  *
  *  Why "·2" and "+up": at any vertex of the triangular tiling, six
- *  triangles meet in a fan. Walking around the vertex CCW visits them in
- *  the order (col, row, up) sequence:
- *    (c+0, r+0, ▽), (c+0, r+0, △), (c-1, r+0, △), (c-1, r+0, ▽),
- *    (c-1, r-1, ▽), (c+0, r-1, △)
- *  Plug each into k and you get six DISTINCT residues mod 6. That's the
- *  stacked-cube property in a single line.
+ *  triangles meet in a fan. Walking around the vertex CCW visits them
+ *  in an order whose (col, row, up) sequence yields six DISTINCT residues
+ *  mod 6. That's the stacked-cube property in a single line.
  *
  * EDGE CASES TO WATCH
  * ───────────────────
@@ -121,13 +123,13 @@
  *
  * HOW TO VERIFY
  * ─────────────
- *  At cursor (cC, cR, cU) = (0, 0, 0): palette = (0+0+0) mod 6 = 0.
+ *  At cursor (col, row, up) = (0, 0, 0): palette = (0+0+0) mod 6 = 0.
  *  Move cursor RIGHT → (0, 0, 1) → palette = 1.
  *  Move cursor RIGHT again → (1, 0, 0) → palette = 1. (Same color as the
- *    previous △ — they are the same hex face in the iso analogy.)
+ *    previous up — they are the same hex face in the iso analogy.)
  *  Move cursor RIGHT again → (1, 0, 1) → palette = 2.
  *  → Walking right cycles through 0, 1, 1, 2, 2, 3, 3, … (each color
- *  used twice in a row because adjacent ▽/△ pairs share a face).
+ *  used twice in a row because adjacent down/up pairs share a face).
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -158,6 +160,9 @@
 
 #define N_PALETTE  6
 #define N_THEMES   3
+
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA 0.05
 
 #define PAIR_FILL_BASE  1                              /* 1..6 */
 #define PAIR_CURSOR    (PAIR_FILL_BASE + N_PALETTE)
@@ -212,21 +217,55 @@ static void color_init(int theme)
         init_pair(PAIR_FILL_BASE + i, COLOR_BLACK, bg);
     }
     init_pair(PAIR_CURSOR, COLOR_WHITE, COLOR_BLACK);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  0 : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLORS >= 256 ? 75 : COLOR_CYAN,  -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula — pixel ↔ lattice + palette hash                            */
+/* §4  formula — GridCtx, pixel ↔ lattice + palette hash                   */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void pixel_to_tri(double px, double py, double size,
-                         int *col, int *row, int *up,
-                         double *fa, double *fb)
+/*
+ * GridCtx — geometry of the active iso (equilateral) grid.
+ *
+ * Same skew-lattice geometry as 01; no border_w because rendering is
+ * solid-fill (no edge characters).
+ */
+typedef struct {
+    /* terminal extent */
+    int rows, cols;
+
+    /* triangle geometry */
+    double tri_size;       /* side length in pixels                          */
+    int    cw, ch;         /* sub-pixel scaling — CELL_W, CELL_H             */
+
+    /* screen origin = pixel (0,0) */
+    int    ox, oy;
+
+    /* advisory cursor bounds in lattice space */
+    int    max_col, max_row;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
 {
-    double h = size * sqrt(3.0) * 0.5;
+    g->rows = rows;
+    g->cols = cols;
+    g->cw   = CELL_W;
+    g->ch   = CELL_H;
+    g->ox   = cols / 2;
+    g->oy   = (rows - 1) / 2;
+    if (g->tri_size <= 0.0) g->tri_size = TRI_SIZE_DEFAULT;
+    g->max_col = (int)((double)cols * CELL_W / g->tri_size) + 1;
+    g->max_row = (int)((double)rows * CELL_H / (sqrt(3.0) * 0.5 * g->tri_size)) + 1;
+}
+
+static void ctx_pixel_to_tri(const GridCtx *g, double px, double py,
+                             int *col, int *row, int *up,
+                             double *fa, double *fb)
+{
+    double h = g->tri_size * sqrt(3.0) * 0.5;
     double b = py / h;
-    double a = px / size - 0.5 * b;
+    double a = px / g->tri_size - 0.5 * b;
     int    c = (int)floor(a);
     int    r = (int)floor(b);
     *col = c; *row = r;
@@ -236,12 +275,35 @@ static void pixel_to_tri(double px, double py, double size,
 }
 
 /*
+ * tri_centroid_pixel — pure forward map for cursor mark (same as 01).
+ */
+static void tri_centroid_pixel(int col, int row, int up, double size,
+                               double *cx_pix, double *cy_pix)
+{
+    double h = size * sqrt(3.0) * 0.5;
+    double a = (up == 0) ? ((double)col + 1.0/3.0) : ((double)col + 2.0/3.0);
+    double b = (up == 0) ? ((double)row + 1.0/3.0) : ((double)row + 2.0/3.0);
+    *cx_pix = (a + 0.5 * b) * size;
+    *cy_pix = b * h;
+}
+
+__attribute__((unused))
+static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+                          int *sr, int *sc)
+{
+    double cx_pix, cy_pix;
+    tri_centroid_pixel(col, row, up, g->tri_size, &cx_pix, &cy_pix);
+    *sc = g->ox + (int)(cx_pix / g->cw);
+    *sr = g->oy + (int)(cy_pix / g->ch);
+}
+
+/*
  * palette_index — assign each triangle a 6-cycle color slot.
  *
  *   k = (col + 2·row + up) mod 6
  *
  * The "·2" gives different colors to triangles in adjacent strips at the
- * same column; the "+up" gives different colors to ▽ vs △ in the same
+ * same column; the "+up" gives different colors to down vs up in the same
  * rhombus. Around any vertex, the 6 distinct slots appear in cyclic order
  * — the visual signature of an isometric "stack of cubes".
  */
@@ -253,16 +315,49 @@ static int palette_index(int col, int row, int up)
     return k;
 }
 
+/*
+ * ctx_draw_bg — solid-fill rendering. Each cell gets the background color
+ * matching its triangle's palette slot. Cursor cell overlaid with '@' in
+ * reverse video so it is visible regardless of palette slot.
+ */
+static void ctx_draw_bg(const GridCtx *g, int cC, int cR, int cU)
+{
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double px = (double)(col - g->ox) * g->cw;
+            double py = (double)(row - g->oy) * g->ch;
+
+            int    tC, tR, tU;
+            double fa, fb;
+            ctx_pixel_to_tri(g, px, py, &tC, &tR, &tU, &fa, &fb);
+
+            int p    = palette_index(tC, tR, tU);
+            int pair = PAIR_FILL_BASE + p;
+            attron(COLOR_PAIR(pair));
+            mvaddch(row, col, ' ');
+            attroff(COLOR_PAIR(pair));
+
+            int on_cur = (tC == cC && tR == cR && tU == cU);
+            if (on_cur) {
+                attron(COLOR_PAIR(pair) | A_BOLD | A_REVERSE);
+                mvaddch(row, col, '@');
+                attroff(COLOR_PAIR(pair) | A_BOLD | A_REVERSE);
+            }
+        }
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §5  cursor                                                              */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-typedef struct {
-    int    col, row, up;
-    double tri_size;
-    int    theme;
-    int    paused;
-} Cursor;
+/*
+ * Cursor — same as 01_equilateral.c: (col, row, up) on the equilateral
+ * lattice. The visual cursor mark is rendered inside ctx_draw_bg (so it
+ * lands on the correct palette colour), so this file does not need a
+ * separate cursor_draw().
+ */
+typedef struct { int col, row, up; } Cursor;
 
 /* Same TRI_DIR as 01_equilateral.c */
 static const int TRI_DIR[4][2][3] = {
@@ -272,16 +367,17 @@ static const int TRI_DIR[4][2][3] = {
     /* DOWN  */ { {  0,  0,  1 }, {  0, +1,  0 } },
 };
 
-static void cursor_reset(Cursor *cur)
+static void cursor_reset(Cursor *cur, const GridCtx *g)
 {
-    cur->col = 0; cur->row = 0; cur->up = 0;
-    cur->tri_size = TRI_SIZE_DEFAULT;
-    cur->theme    = 0;
-    cur->paused   = 0;
+    (void)g;
+    cur->col = 0;
+    cur->row = 0;
+    cur->up  = 0;
 }
 
-static void cursor_step(Cursor *cur, int dir)
+static void cursor_move(Cursor *cur, const GridCtx *g, int dir)
 {
+    (void)g;
     const int *t = TRI_DIR[dir][cur->up];
     cur->col += t[0];
     cur->row += t[1];
@@ -292,55 +388,31 @@ static void cursor_step(Cursor *cur, int dir)
 /* §6  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void grid_draw(int rows, int cols, const Cursor *cur, int ox, int oy)
+static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
+                     int paused, double fps)
 {
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double px = (double)(col - ox) * CELL_W;
-            double py = (double)(row - oy) * CELL_H;
-
-            int    tC, tR, tU;
-            double fa, fb;
-            pixel_to_tri(px, py, cur->tri_size, &tC, &tR, &tU, &fa, &fb);
-
-            int p   = palette_index(tC, tR, tU);
-            int pair = PAIR_FILL_BASE + p;
-            attron(COLOR_PAIR(pair));
-            mvaddch(row, col, ' ');
-            attroff(COLOR_PAIR(pair));
-
-            int on_cur = (tC == cur->col && tR == cur->row && tU == cur->up);
-            if (on_cur) {
-                attron(COLOR_PAIR(pair) | A_BOLD | A_REVERSE);
-                mvaddch(row, col, '@');
-                attroff(COLOR_PAIR(pair) | A_BOLD | A_REVERSE);
-            }
-        }
-    }
-}
-
-static void scene_draw(int rows, int cols, const Cursor *cur, double fps)
-{
-    erase();
-    int ox = cols / 2;
-    int oy = (rows - 1) / 2;
-    grid_draw(rows, cols, cur, ox, oy);
-
     char buf[112];
     snprintf(buf, sizeof buf,
              " C:%+d R:%+d %s  size:%.0f  theme:%d  %5.1f fps  %s ",
              cur->col, cur->row, cur->up ? "/\\" : "\\/",
-             cur->tri_size, cur->theme, fps,
-             cur->paused ? "PAUSED " : "running");
+             g->tri_size, theme, fps,
+             paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " arrows:move  +/-:size  t:theme  r:reset  p:pause  q:quit  [05 isometric] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
+                       int paused, double fps)
+{
+    erase();
+    ctx_draw_bg(g, cur->col, cur->row, cur->up);
+    hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr);
     doupdate();
 }
@@ -351,14 +423,13 @@ static void scene_draw(int rows, int cols, const Cursor *cur, double fps)
 
 static void screen_cleanup(void) { endwin(); }
 
-static void screen_init(int theme)
+static void screen_init(void)
 {
     initscr(); cbreak(); noecho();
     keypad(stdscr, TRUE);
     nodelay(stdscr, TRUE);
     curs_set(0);
     typeahead(-1);
-    color_init(theme);
     atexit(screen_cleanup);
 }
 
@@ -380,11 +451,17 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
 
-    Cursor cur;
-    cursor_reset(&cur);
-    screen_init(cur.theme);
+    screen_init();
+    int theme = 0, paused = 0;
+    color_init(theme);
 
-    int rows = LINES, cols = COLS;
+    GridCtx g = {0};
+    g.tri_size = TRI_SIZE_DEFAULT;
+    ctx_init(&g, LINES, COLS);
+
+    Cursor cur;
+    cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double  fps = TARGET_FPS;
     int64_t t0  = clock_ns();
@@ -393,34 +470,34 @@ int main(void)
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();
-            rows = LINES; cols = COLS;
+            ctx_init(&g, LINES, COLS);
         }
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
                 case 'q': case 27:  g_running = 0; break;
-                case 'p':           cur.paused ^= 1; break;
-                case 'r':           cursor_reset(&cur); color_init(cur.theme); break;
+                case 'p':           paused ^= 1; break;
+                case 'r':           cursor_reset(&cur, &g); break;
                 case 't':
-                    cur.theme = (cur.theme + 1) % N_THEMES;
-                    color_init(cur.theme);
+                    theme = (theme + 1) % N_THEMES;
+                    color_init(theme);
                     break;
-                case KEY_LEFT:  cursor_step(&cur, 0); break;
-                case KEY_RIGHT: cursor_step(&cur, 1); break;
-                case KEY_UP:    cursor_step(&cur, 2); break;
-                case KEY_DOWN:  cursor_step(&cur, 3); break;
+                case KEY_LEFT:  cursor_move(&cur, &g, 0); break;
+                case KEY_RIGHT: cursor_move(&cur, &g, 1); break;
+                case KEY_UP:    cursor_move(&cur, &g, 2); break;
+                case KEY_DOWN:  cursor_move(&cur, &g, 3); break;
                 case '+': case '=':
-                    if (cur.tri_size < TRI_SIZE_MAX) { cur.tri_size += TRI_SIZE_STEP; } break;
+                    if (g.tri_size < TRI_SIZE_MAX) { g.tri_size += TRI_SIZE_STEP; ctx_init(&g, LINES, COLS); } break;
                 case '-':
-                    if (cur.tri_size > TRI_SIZE_MIN) { cur.tri_size -= TRI_SIZE_STEP; } break;
+                    if (g.tri_size > TRI_SIZE_MIN) { g.tri_size -= TRI_SIZE_STEP; ctx_init(&g, LINES, COLS); } break;
             }
         }
 
-        int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
-        t0  = now;
+        int64_t now = clock_ns(), dt = now - t0; t0 = now;
+        if (dt > 0)
+            fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (double)dt) * FPS_EWMA_ALPHA;
 
-        scene_draw(rows, cols, &cur, fps);
+        scene_draw(&g, &cur, theme, paused, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

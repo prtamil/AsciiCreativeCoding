@@ -6,22 +6,24 @@
  *       further from the centre than the previous one (geometric progression).
  *       Inner rings are dense; outer rings grow increasingly wide.  This is
  *       the coordinate system of conformal optics, SIFT descriptors, and
- *       human retinal sampling.  +/- adjusts the growth ratio.
+ *       human retinal sampling.  An '@' cursor sits at one (ring, spoke)
+ *       cell — arrows step it across the grid.  +/- adjusts the growth ratio.
  *
- * Study alongside: 01_rings_spokes.c (linear ring spacing)
+ * Study alongside: 01_rings_spokes.c (linear ring spacing),
+ *                  ../rect_grids/01_uniform_rect.c (the GridCtx template)
  *
  * Section map:
- *   §1 config   — R_MIN, log step (ratio), spoke count, themes
+ *   §1 config   — R_MIN, log step (ratio), spoke count, themes, EWMA
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — theme-switchable PAIR_GRID
- *   §4 coords   — cell_to_polar, log_ring_phase
- *   §5 draw     — grid sweep, log-ring and spoke tests
- *   §6 scene    — scene_draw
+ *   §3 color    — theme-switchable PAIR_GRID + HUD/HINT/CURSOR
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg + angle_char
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, resize, main loop
  *
- * Keys:  q/ESC quit   p pause   t theme
- *        +/- growth ratio   [/] spoke count
+ * Keys:  q/ESC quit   p pause   t theme   r reset
+ *        arrows move @   +/- growth ratio   [/] spoke count
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/polar_grids/02_log_polar.c \
@@ -48,6 +50,12 @@
  *                  pixels.  This keeps all rings the same visual thickness in
  *                  log-space (thin inner rings would be imperceptible with a
  *                  fixed pixel width, so we use adaptive width here instead).
+ *
+ * Data-structure : Two structs — GridCtx (terminal extent, R_MIN, log_step,
+ *                  ring_w_u, n_spokes, ox/oy) and Cursor (linear ring index,
+ *                  spoke index).  ctx_to_screen places the cursor at the
+ *                  geometric mean of two consecutive log-rings — the natural
+ *                  "midpoint" in log space.
  *
  * Math           : The log-polar transform maps (r, θ) → (ln r, θ).  In this
  *                  space, concentric circles become horizontal lines — it is
@@ -78,7 +86,8 @@
  *   Replace the evenly-spaced rings of 01 with exponentially-spaced rings.
  *   Each ring is RATIO times further from the centre than the previous one.
  *   Detection: compute the continuous "ring index" u = log(r/R_MIN)/LOG_STEP;
- *   a cell is on a ring when u's fractional part is near 0 or 1.
+ *   a cell is on a ring when u's fractional part is near 0 or 1.  The Cursor
+ *   address (ring k, spoke s) maps to the geometric midpoint of rings k and k+1.
  *
  * HOW TO THINK ABOUT IT
  *   Imagine zooming into the centre of a photo: each zoom level reveals the
@@ -108,6 +117,12 @@
  *   Ring detection: u = ln(r/R_MIN) / LOG_STEP  (inverse of r_k formula)
  *     If r = r_k exactly, then u = k (integer → frac=0 → on_ring).
  *
+ *   Cursor → screen (ring k, spoke s):
+ *     mid_radius = R_MIN × e^((k + 0.5) × LOG_STEP)   (geometric midpoint)
+ *     theta_mid  = (s + 0.5) × (2π / N_SPOKES)
+ *     cx = mid_radius × cos theta_mid;  cy = mid_radius × sin theta_mid
+ *     sc = ox + (int)round(cx / CELL_W); sr = oy + (int)round(cy / CELL_H)
+ *
  *   Adaptive ring width: RING_W_U is a fraction of the log-space interval,
  *     NOT a pixel width.  Physical width at ring k:
  *       Δr = r_k × LOG_STEP × RING_W_U  (from d(log r)/dr = 1/r)
@@ -118,6 +133,7 @@
  *     Hard guard: skip cells with r ≤ R_MIN.
  *   • LOG_STEP = 0: division by zero.  Constrained to [LOG_STEP_MIN, LOG_STEP_MAX].
  *   • θ normalisation: same as 01 — add 2π before fmod to avoid negative phases.
+ *   • Cursor max_ring depends on ring_spacing; recomputed in ctx_init.
  *
  * HOW TO VERIFY
  *   Terminal 80×24, R_MIN=4, LOG_STEP=0.25 (RATIO=e^0.25≈1.284), ox=40, oy=12.
@@ -174,9 +190,13 @@
 #define SPOKE_W             0.10
 #define SPOKE_MIN_R         3.0
 
-#define PAIR_GRID   1
-#define PAIR_HUD    2
-#define PAIR_LABEL  3
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA      0.05
+
+#define PAIR_GRID    1
+#define PAIR_CURSOR  2
+#define PAIR_HUD     3
+#define PAIR_HINT    4
 
 static const short THEME_FG[][2] = {
     {75,  COLOR_CYAN},
@@ -212,35 +232,93 @@ static void color_init(int theme)
 {
     start_color(); use_default_colors();
     short fg = COLORS >= 256 ? THEME_FG[theme][0] : THEME_FG[theme][1];
-    init_pair(PAIR_GRID,  fg,                              -1);
-    init_pair(PAIR_HUD,   COLORS>=256 ? 226 : COLOR_YELLOW,-1);
-    init_pair(PAIR_LABEL, COLORS>=256 ? 252 : COLOR_WHITE, -1);
+    init_pair(PAIR_GRID,   fg,                              -1);
+    init_pair(PAIR_CURSOR, COLORS>=256 ? 226 : COLOR_YELLOW,-1);
+    init_pair(PAIR_HUD,    COLORS>=256 ? 226 : COLOR_YELLOW,-1);
+    init_pair(PAIR_HINT,   COLORS>=256 ?  51 : COLOR_CYAN,  -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  coords                                                              */
+/* §4  formula — GridCtx and the log-ring/spoke ↔ screen mapping          */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * cell_to_polar — convert screen cell (col, row) to polar (r_px, theta).
+ * GridCtx — geometry of the log-polar grid plus cursor bounds.
  *
- * THE FORMULA:
- *   dx_px = (col − ox) × CELL_W,  dy_px = (row − oy) × CELL_H
- *   r_px  = √(dx_px² + dy_px²)    [Euclidean distance in pixel space]
- *   theta = atan2(dy_px, dx_px)    [angle ∈ (−π, π]]
+ * r_min, log_step, ring_w_u carry the radial law parameters.
+ * n_spokes carries the angular wedge count.
+ * max_ring is the largest ring index whose centre stays on screen.
  */
-static void cell_to_polar(int col, int row, int ox, int oy,
-                           double *r_px, double *theta)
+typedef struct {
+    int rows, cols;
+
+    double r_min;       /* inner anchor (pixels)                          */
+    double log_step;    /* ln(RATIO)                                      */
+    double ring_w_u;    /* fractional ring width in log-index space       */
+
+    int    n_spokes;
+    int    cell_w, cell_h;
+
+    int    ox, oy;
+
+    int    max_ring, max_spoke;
+} GridCtx;
+
+/*
+ * ctx_init — derive geometry from terminal size.
+ *
+ * max_ring solves r_min × e^((k + 0.5) × log_step) ≤ r_visible:
+ *   k_max = floor( ln(r_visible / r_min) / log_step − 0.5 )
+ */
+static void ctx_init(GridCtx *g, int rows, int cols)
 {
-    double dx = (double)(col - ox) * CELL_W;
-    double dy = (double)(row - oy) * CELL_H;
-    *r_px  = sqrt(dx*dx + dy*dy);
-    *theta = atan2(dy, dx);
+    g->rows   = rows;
+    g->cols   = cols;
+    g->cell_w = CELL_W;
+    g->cell_h = CELL_H;
+    g->ox     = cols / 2;
+    g->oy     = rows / 2;
+    if (g->r_min    <= 0.0) g->r_min    = R_MIN;
+    if (g->log_step <= 0.0) g->log_step = LOG_STEP_DEFAULT;
+    if (g->ring_w_u <= 0.0) g->ring_w_u = RING_W_U;
+    if (g->n_spokes <= 0)   g->n_spokes = N_SPOKES_DEFAULT;
+
+    double rx = (double)cols * 0.5 * CELL_W;
+    double ry = (double)rows * 0.5 * CELL_H;
+    double r_visible = (rx < ry ? rx : ry);
+    int mr = 0;
+    if (r_visible > g->r_min) {
+        double k = log(r_visible / g->r_min) / g->log_step - 0.5;
+        mr = (int)floor(k);
+        if (mr < 0) mr = 0;
+    }
+    g->max_ring  = mr;
+    g->max_spoke = g->n_spokes - 1;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  draw                                                                */
-/* ═══════════════════════════════════════════════════════════════════════ */
+/*
+ * ctx_to_screen — centre cell of (ring k, spoke s) in screen coordinates.
+ *
+ * THE FORMULA (geometric midpoint between rings k and k+1):
+ *   mid_radius = r_min × e^((k + 0.5) × log_step)
+ *   theta_mid  = (s + 0.5) × (2π / n_spokes)
+ *   cx = mid_radius × cos theta_mid;  cy = mid_radius × sin theta_mid
+ *   sc = ox + (int)round(cx / CELL_W);  sr = oy + (int)round(cy / CELL_H)
+ *
+ * The geometric mean (k+0.5 in log-index space) is the natural "centre" of
+ * a log-ring annulus, just as the arithmetic mean (k+0.5 in linear-index
+ * space) is the centre of a uniform annulus in 01_rings_spokes.
+ */
+static void ctx_to_screen(const GridCtx *g, int ring, int spoke,
+                          int *sr, int *sc)
+{
+    double mid_radius = g->r_min * exp(((double)ring + 0.5) * g->log_step);
+    double theta_mid  = ((double)spoke + 0.5) * (2.0 * M_PI / (double)g->n_spokes);
+    double cx = mid_radius * cos(theta_mid);
+    double cy = mid_radius * sin(theta_mid);
+    *sc = g->ox + (int)round(cx / (double)g->cell_w);
+    *sr = g->oy + (int)round(cy / (double)g->cell_h);
+}
 
 /*
  * angle_char — pick the ASCII line character that best matches orientation theta.
@@ -260,35 +338,36 @@ static char angle_char(double theta)
 }
 
 /*
- * grid_draw — sweep every cell, apply log-ring and spoke tests, draw.
+ * ctx_draw_bg — sweep every cell, apply log-ring and spoke tests, draw.
  *
  * THE PIPELINE:
  *   for each cell (col, row):
- *     (r, θ) ← cell_to_polar()
- *     if r ≤ R_MIN: skip
- *     u = log(r / R_MIN) / log_step     continuous log ring index
- *     frac = u − floor(u)               ∈ [0, 1)
- *     on_ring = frac < RING_W_U  ||  frac > 1 − RING_W_U
+ *     dx = (col−ox)×CELL_W,  dy = (row−oy)×CELL_H
+ *     r  = √(dx²+dy²),  θ = atan2(dy,dx)
+ *     if r ≤ r_min: skip
+ *     u    = log(r / r_min) / log_step          continuous log ring index
+ *     frac = u − floor(u)                        ∈ [0, 1)
+ *     on_ring  = frac < ring_w_u  ||  frac > 1 − ring_w_u
  *     on_spoke = same fmod test as 01 on θ_norm
  *     draw '+'/angle_char/skip
  */
-static void grid_draw(int rows, int cols, int ox, int oy,
-                      double log_step, int n_spokes)
+static void ctx_draw_bg(const GridCtx *g)
 {
-    double spoke_angle = 2.0 * M_PI / (double)n_spokes;
+    double spoke_angle = 2.0 * M_PI / (double)g->n_spokes;
 
     attron(COLOR_PAIR(PAIR_GRID));
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double r_px, theta;
-            cell_to_polar(col, row, ox, oy, &r_px, &theta);
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double dx = (double)(col - g->ox) * g->cell_w;
+            double dy = (double)(row - g->oy) * g->cell_h;
+            double r_px = sqrt(dx*dx + dy*dy);
+            double theta = atan2(dy, dx);
 
             bool on_ring = false;
-            if (r_px > R_MIN) {
-                /* u = continuous log-ring index: u=0 at r=R_MIN, +1 per ring */
-                double u = log(r_px / R_MIN) / log_step;
+            if (r_px > g->r_min) {
+                double u = log(r_px / g->r_min) / g->log_step;
                 double frac = u - floor(u);
-                on_ring = (frac < RING_W_U || frac > 1.0 - RING_W_U);
+                on_ring = (frac < g->ring_w_u || frac > 1.0 - g->ring_w_u);
             }
 
             double theta_norm  = fmod(theta + 2.0*M_PI, 2.0*M_PI);
@@ -307,29 +386,78 @@ static void grid_draw(int rows, int cols, int ox, int oy,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Cursor — (ring index, spoke index).  Same shape as 01_rings_spokes, but
+ * ctx_to_screen interprets ring as a log-ring index (geometric spacing).
+ */
+typedef struct { int ring, spoke; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    cur->ring  = g->max_ring / 2;
+    cur->spoke = 0;
+}
+
+/*
+ * cursor_move — apply (d_ring, d_spoke); ring clamped, spoke wraps.
+ */
+static void cursor_move(Cursor *cur, const GridCtx *g, int d_ring, int d_spoke)
+{
+    int nr = cur->ring + d_ring;
+    if (nr < 0)            nr = 0;
+    if (nr > g->max_ring)  nr = g->max_ring;
+    cur->ring = nr;
+
+    int n = g->n_spokes > 0 ? g->n_spokes : 1;
+    int ns = (cur->spoke + d_spoke) % n;
+    if (ns < 0) ns += n;
+    cur->spoke = ns;
+}
+
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sr, sc;
+    ctx_to_screen(g, cur->ring, cur->spoke, &sr, &sc);
+    if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
+        attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+        mvaddch(sr, sc, (chtype)'@');
+        attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
 /* §6  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void scene_draw(int rows, int cols, double log_step, int n_spokes,
-                       int theme, double fps, bool paused)
+static void hud_draw(const GridCtx *g, const Cursor *cur, int theme,
+                     bool paused, double fps)
 {
-    int ox = cols / 2, oy = rows / 2;
-    erase();
-    grid_draw(rows, cols, ox, oy, log_step, n_spokes);
-
-    char buf[80];
-    double ratio = exp(log_step);
-    snprintf(buf, sizeof buf, " %.1f fps  ratio:%.2f  spokes:%d  %s ",
-             fps, ratio, n_spokes, paused ? "PAUSED" : "running");
+    char buf[96];
+    double ratio = exp(g->log_step);
+    snprintf(buf, sizeof buf,
+             " ring:%d spoke:%d  ratio:%.2f  spokes:%d  th:%d  %5.1f fps  %s ",
+             cur->ring, cur->spoke, ratio, g->n_spokes,
+             theme + 1, fps, paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_LABEL));
-    mvprintw(rows-1, 0,
-        " q:quit  p:pause  t:theme(%d)  +/-:ring-ratio  [/]:spokes ", theme+1);
-    attroff(COLOR_PAIR(PAIR_LABEL));
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+             " q:quit  p:pause  t:theme  r:reset  arrows:move  +/-:ring-ratio  [/]:spokes ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, int theme,
+                       bool paused, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, theme, paused, fps);
     wnoutrefresh(stdscr); doupdate();
 }
 
@@ -338,12 +466,12 @@ static void scene_draw(int rows, int cols, double log_step, int n_spokes,
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 static void screen_cleanup(void) { endwin(); }
-static void screen_init(int theme)
+static void screen_init(void)
 {
     initscr(); cbreak(); noecho();
     keypad(stdscr, TRUE); nodelay(stdscr, TRUE);
     curs_set(0); typeahead(-1);
-    color_init(theme); atexit(screen_cleanup);
+    atexit(screen_cleanup);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -363,46 +491,75 @@ int main(void)
     signal(SIGWINCH, on_signal);
 
     int theme = 0;
-    screen_init(theme);
+    screen_init();
+    color_init(theme);
 
-    int    rows = LINES, cols = COLS;
-    double log_step = LOG_STEP_DEFAULT;
-    int    n_spokes = N_SPOKES_DEFAULT;
-    bool   paused   = false;
-    double fps = TARGET_FPS;
-    int64_t t0 = clock_ns();
+    GridCtx g = {0};
+    g.r_min    = R_MIN;
+    g.log_step = LOG_STEP_DEFAULT;
+    g.ring_w_u = RING_W_U;
+    g.n_spokes = N_SPOKES_DEFAULT;
+    ctx_init(&g, LINES, COLS);
+
+    Cursor cur;
+    cursor_reset(&cur, &g);
+
+    bool   paused = false;
+    double fps    = TARGET_FPS;
+    int64_t t0    = clock_ns();
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
 
     while (g_running) {
         if (g_need_resize) {
             g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
+            ctx_init(&g, LINES, COLS);
+            cursor_reset(&cur, &g);
         }
 
         int ch = getch();
         switch (ch) {
         case 'q': case 27: g_running = 0; break;
         case 'p': paused = !paused; break;
+        case 'r': cursor_reset(&cur, &g); break;
         case 't': theme = (theme + 1) % N_THEMES; color_init(theme); break;
+        case KEY_UP:    cursor_move(&cur, &g, -1,  0); break;
+        case KEY_DOWN:  cursor_move(&cur, &g, +1,  0); break;
+        case KEY_LEFT:  cursor_move(&cur, &g,  0, -1); break;
+        case KEY_RIGHT: cursor_move(&cur, &g,  0, +1); break;
         case '+': case '=':
-            if (log_step < LOG_STEP_MAX) log_step += LOG_STEP_DELTA;
+            if (g.log_step < LOG_STEP_MAX) {
+                g.log_step += LOG_STEP_DELTA;
+                ctx_init(&g, LINES, COLS);
+                if (cur.ring > g.max_ring) cur.ring = g.max_ring;
+            }
             break;
         case '-':
-            if (log_step > LOG_STEP_MIN) log_step -= LOG_STEP_DELTA;
+            if (g.log_step > LOG_STEP_MIN) {
+                g.log_step -= LOG_STEP_DELTA;
+                ctx_init(&g, LINES, COLS);
+            }
             break;
         case '[':
-            if (n_spokes > N_SPOKES_MIN) n_spokes -= (n_spokes > 8 ? 4 : 2);
+            if (g.n_spokes > N_SPOKES_MIN) {
+                g.n_spokes -= (g.n_spokes > 8 ? 4 : 2);
+                ctx_init(&g, LINES, COLS);
+                if (cur.spoke > g.max_spoke) cur.spoke = g.max_spoke;
+            }
             break;
         case ']':
-            if (n_spokes < N_SPOKES_MAX) n_spokes += (n_spokes >= 8 ? 4 : 2);
+            if (g.n_spokes < N_SPOKES_MAX) {
+                g.n_spokes += (g.n_spokes >= 8 ? 4 : 2);
+                ctx_init(&g, LINES, COLS);
+            }
             break;
         }
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) +
+              (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0  = now;
         if (!paused)
-            scene_draw(rows, cols, log_step, n_spokes, theme, fps, paused);
+            scene_draw(&g, &cur, theme, paused, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

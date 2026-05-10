@@ -12,17 +12,17 @@
  *       SPACE clears all objects. 'g' cycles the placed glyph.
  *
  * Study alongside: 04_30_60_90_direct.c (manual SPACE-toggle placement),
- *                  grids/tri_grids/01_equilateral.c (background).
+ *                  grids/tri_grids/04_30_60_90.c (background).
  *
  * Section map:
  *   §1 config   — CELL_W, CELL_H, MAX_OBJ, patterns
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 5 pairs: edge / cursor / object / HUD / hint
- *   §4 formula  — pixel ↔ lattice + centroid + edge char
- *   §5 pool     — ObjectPool
- *   §6 cursor   — TRI_DIR + step + draw
- *   §7 patterns — pattern offset tables + stamp
- *   §8 scene    — grid_draw + scene_draw
+ *   §3 color    — 6 pairs: edge / median / cursor / object / HUD / hint
+ *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
+ *   §5 pool     — Pool: place / find / clear / draw
+ *   §6 cursor   — Cursor + TRI_DIR + reset / move / draw
+ *   §7 mode     — pattern offset tables + pattern_stamp + pattern_scatter
+ *   §8 scene    — hud_draw + scene_draw
  *   §9 screen   — ncurses init / cleanup
  *  §10 app      — signals, main loop
  *
@@ -31,7 +31,7 @@
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra grids/tri_grids_placement/04_30_60_90_patterns.c \
- *       -o 01_equilateral_patterns -lncurses -lm
+ *       -o 04_30_60_90_patterns -lncurses -lm
  */
 
 /* ── CONCEPTS ──────────────────────────────────────────────────────────── *
@@ -41,8 +41,8 @@
  *                  cursor. Pressing a digit translates the array by the
  *                  cursor and inserts each entry into the pool.
  *
- * Data-structure : ObjectPool — same as 01_equilateral_direct.
- *                  Pattern tables are read-only in §7.
+ * Data-structure : Pool — same as 04_30_60_90_direct. Pattern tables
+ *                  are read-only in §7.
  *
  * The trick      : For △ vs ▽ children of the cursor, we use ABSOLUTE
  *                  target_up (0 or 1) — not a delta — because triangle
@@ -61,7 +61,7 @@
  * ─────────
  * Rubber-stamp placement on the kisrhombille — but the stamps address
  * WHOLE equilaterals (col, row, up), not the 30-60-90 sub-triangles.
- * The medians render automatically in grid_draw and form a backdrop
+ * The medians render automatically in ctx_draw_bg and form a backdrop
  * for the stamped glyphs at parent centroids.
  *
  * HOW TO THINK ABOUT IT
@@ -74,14 +74,15 @@
  * DRAWING METHOD  (per frame)
  * ──────────────
  *  1. erase()
- *  2. grid_draw — equilateral edges + 3-median proximity overlay.
+ *  2. ctx_draw_bg — equilateral edges + 3-median proximity overlay.
  *  3. pool_draw — every placed object's glyph at its centroid cell.
  *  4. cursor_draw — '@' on top.
+ *  5. hud_draw — top-right status, bottom-row hint.
  *
  *  Stamping (only on key press):
  *    pattern_stamp(pool, PAT_xxx, cur.col, cur.row, glyph)
  *      for each entry (Δc, Δr, up_abs):
- *        pool_add(pool, cur.col+Δc, cur.row+Δr, up_abs, glyph)
+ *        pool_place(pool, cur.col+Δc, cur.row+Δr, up_abs, glyph)
  *
  * KEY FORMULAS
  * ────────────
@@ -101,7 +102,7 @@
  *  • MAX_OBJ cap, glyph cycle, scatter seed: identical to
  *    01_equilateral_patterns.c.
  *  • Patterns ADD, not REPLACE: stamping the same pattern twice at
- *    the same cursor has no effect (pool_add deduplicates).
+ *    the same cursor has no effect (pool_place deduplicates).
  *
  * HOW TO VERIFY
  * ─────────────
@@ -142,16 +143,19 @@
 
 #define BORDER_W   0.10
 #define MEDIAN_T   0.05
+
 #define MAX_OBJ    512
 #define N_GLYPHS   6
 #define N_THEMES   4
 
+#define FPS_EWMA_ALPHA 0.05
+
 #define PAIR_BORDER 1
-#define PAIR_CURSOR 2
-#define PAIR_OBJECT 3
-#define PAIR_HUD    4
-#define PAIR_HINT   5
-#define PAIR_MEDIAN 6
+#define PAIR_MEDIAN 2
+#define PAIR_CURSOR 3
+#define PAIR_OBJECT 4
+#define PAIR_HUD    5
+#define PAIR_HINT   6
 
 static const char GLYPHS[N_GLYPHS] = { '*', 'o', '+', '#', 'X', '%' };
 
@@ -190,21 +194,40 @@ static const short THEME_FG_8[N_THEMES][2] = {
 
 static void color_init(int theme)
 {
-    start_color();
-    use_default_colors();
+    start_color(); use_default_colors();
     short fg_e = (COLORS >= 256) ? THEME_FG[theme][0] : THEME_FG_8[theme][0];
     short fg_o = (COLORS >= 256) ? THEME_FG[theme][1] : THEME_FG_8[theme][1];
     init_pair(PAIR_BORDER, fg_e, -1);
+    init_pair(PAIR_MEDIAN, COLORS >= 256 ?  39 : COLOR_BLUE,   -1);
     init_pair(PAIR_OBJECT, fg_o, -1);
-    init_pair(PAIR_MEDIAN, COLORS >= 256 ? 39 : COLOR_BLUE, -1);
-    init_pair(PAIR_CURSOR, COLORS >= 256 ? 15 : COLOR_WHITE, COLOR_BLUE);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  0 : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLORS >= 256 ? 75 : COLOR_CYAN,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ?  15 : COLOR_WHITE,  COLOR_BLUE);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  gridctx                                                             */
 /* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int    rows, cols;
+    int    cw, ch;
+    int    ox, oy;
+    double tri_size;
+    double border_w;
+    double median_t;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols, double tri_size)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->ox = cols / 2;
+    g->oy = (rows - 1) / 2;
+    g->tri_size = tri_size;
+    g->border_w = BORDER_W;
+    g->median_t = MEDIAN_T;
+}
 
 static void pixel_to_tri(double px, double py, double size,
                          int *col, int *row, int *up,
@@ -234,7 +257,7 @@ static void tri_centroid_pixel(int col, int row, int up, double size,
 static char tri_edge_char(int up, double fa, double fb, double *out_min)
 {
     double l1, l2, l3;
-    char ch1, ch2, ch3;
+    char   ch1, ch2, ch3;
     if (up == 0) {
         l1 = 1.0 - fa - fb; ch1 = '/';
         l2 = fa;            ch2 = '\\';
@@ -272,51 +295,75 @@ static char tri_median_char(int up, double fa, double fb, double *out_min)
     return ch;
 }
 
-static void tri_to_screen(int col, int row, int up, double size,
-                          int ox, int oy, int *scol, int *srow)
+static void ctx_to_screen(const GridCtx *g, int col, int row, int up,
+                          int *scol, int *srow)
 {
-    double cx_pix, cy_pix;
-    tri_centroid_pixel(col, row, up, size, &cx_pix, &cy_pix);
-    *scol = ox + (int)(cx_pix / CELL_W);
-    *srow = oy + (int)(cy_pix / CELL_H);
+    double cx, cy;
+    tri_centroid_pixel(col, row, up, g->tri_size, &cx, &cy);
+    *scol = g->ox + (int)(cx / g->cw);
+    *srow = g->oy + (int)(cy / g->ch);
+}
+
+static void ctx_draw_bg(const GridCtx *g)
+{
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double px = (double)(col - g->ox) * g->cw;
+            double py = (double)(row - g->oy) * g->ch;
+            int tC, tR, tU; double fa, fb, em, mm;
+            pixel_to_tri(px, py, g->tri_size, &tC, &tR, &tU, &fa, &fb);
+            char ech = tri_edge_char  (tU, fa, fb, &em);
+            char mch = tri_median_char(tU, fa, fb, &mm);
+            if (em < g->border_w && em <= mm) {
+                attron(COLOR_PAIR(PAIR_BORDER));
+                mvaddch(row, col, (chtype)(unsigned char)ech);
+                attroff(COLOR_PAIR(PAIR_BORDER));
+            } else if (mm < g->median_t) {
+                attron(COLOR_PAIR(PAIR_MEDIAN));
+                mvaddch(row, col, (chtype)(unsigned char)mch);
+                attroff(COLOR_PAIR(PAIR_MEDIAN));
+            }
+        }
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §5  pool                                                                */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-typedef struct { int col, row, up; char glyph; } TObj;
-typedef struct { TObj objs[MAX_OBJ]; int count; } ObjectPool;
+typedef struct { int col, row, up; char glyph; bool alive; } Obj;
+typedef struct { Obj items[MAX_OBJ];  int count; } Pool;
 
-static void pool_clear(ObjectPool *p) { p->count = 0; }
-
-static int pool_find(const ObjectPool *p, int col, int row, int up)
+static int pool_find(const Pool *p, int col, int row, int up)
 {
-    for (int i = 0; i < p->count; i++) {
-        if (p->objs[i].col == col && p->objs[i].row == row && p->objs[i].up == up)
+    for (int i = 0; i < p->count; i++)
+        if (p->items[i].alive
+            && p->items[i].col == col
+            && p->items[i].row == row
+            && p->items[i].up  == up)
             return i;
-    }
     return -1;
 }
 
-/* pool_add — only if not already present at (col, row, up). */
-static void pool_add(ObjectPool *p, int col, int row, int up, char glyph)
+static void pool_place(Pool *p, int col, int row, int up, char glyph)
 {
-    if (p->count >= MAX_OBJ) return;
     if (pool_find(p, col, row, up) >= 0) return;
-    p->objs[p->count++] = (TObj){ col, row, up, glyph };
+    if (p->count >= MAX_OBJ) return;
+    p->items[p->count++] = (Obj){ col, row, up, glyph, true };
 }
 
-static void pool_draw(const ObjectPool *p, double size,
-                      int ox, int oy, int rows, int cols)
+static void pool_clear(Pool *p) { p->count = 0; }
+
+static void pool_draw(const Pool *p, const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_OBJECT) | A_BOLD);
     for (int i = 0; i < p->count; i++) {
+        if (!p->items[i].alive) continue;
         int sc, sr;
-        tri_to_screen(p->objs[i].col, p->objs[i].row, p->objs[i].up,
-                      size, ox, oy, &sc, &sr);
-        if (sc >= 0 && sc < cols && sr >= 0 && sr < rows - 1)
-            mvaddch(sr, sc, (chtype)(unsigned char)p->objs[i].glyph);
+        ctx_to_screen(g, p->items[i].col, p->items[i].row, p->items[i].up,
+                      &sc, &sr);
+        if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1)
+            mvaddch(sr, sc, (chtype)(unsigned char)p->items[i].glyph);
     }
     attroff(COLOR_PAIR(PAIR_OBJECT) | A_BOLD);
 }
@@ -326,11 +373,10 @@ static void pool_draw(const ObjectPool *p, double size,
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    int    col, row, up;
-    double tri_size;
-    int    glyph_idx;
-    int    theme;
-    int    paused;
+    int col, row, up;
+    int glyph_idx;
+    int theme;
+    int paused;
 } Cursor;
 
 static const int TRI_DIR[4][2][3] = {
@@ -343,41 +389,38 @@ static const int TRI_DIR[4][2][3] = {
 static void cursor_reset(Cursor *cur)
 {
     cur->col = 0; cur->row = 0; cur->up = 0;
-    cur->tri_size  = TRI_SIZE_DEFAULT;
     cur->glyph_idx = 0;
     cur->theme     = 0;
     cur->paused    = 0;
 }
 
-static void cursor_step(Cursor *cur, int dir)
+static void cursor_move(Cursor *cur, int arrow)
 {
-    const int *t = TRI_DIR[dir][cur->up];
+    const int *t = TRI_DIR[arrow][cur->up];
     cur->col += t[0]; cur->row += t[1]; cur->up = t[2];
 }
 
-static void cursor_draw(const Cursor *cur, int ox, int oy, int rows, int cols)
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sc, sr;
-    tri_to_screen(cur->col, cur->row, cur->up, cur->tri_size, ox, oy, &sc, &sr);
-    if (sc >= 0 && sc < cols && sr >= 0 && sr < rows - 1) {
-        attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-        mvaddch(sr, sc, '@');
-        attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-    }
+    ctx_to_screen(g, cur->col, cur->row, cur->up, &sc, &sr);
+    if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) return;
+    attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    mvaddch(sr, sc, '@');
+    attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §7  patterns                                                            */
+/* §7  mode — pattern stamps                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
  * Pattern format: (Δcol, Δrow, target_up). target_up is ABSOLUTE (0 or 1),
  * not a delta — the cursor's current orientation does not affect what the
- * pattern looks like.  Each table is null-terminated by a sentinel
- * (INT_MIN-ish) and reads its actual length via PAT_LEN().
+ * pattern looks like. Each table is sentinel-terminated.
  */
 
-#define PAT_END { 0xDEAD, 0, 0 }
+#define PAT_END   { 0xDEAD, 0, 0 }
 #define IS_END(p) ((p)[0] == 0xDEAD)
 
 static const int PAT_RING[][3] = {
@@ -417,12 +460,11 @@ static const int PAT_TRI[][3] = {
     PAT_END
 };
 
-static void pattern_stamp(ObjectPool *pool, const int (*pat)[3],
+static void pattern_stamp(Pool *pool, const int (*pat)[3],
                           int cC, int cR, char glyph)
 {
-    for (int i = 0; !IS_END(pat[i]); i++) {
-        pool_add(pool, cC + pat[i][0], cR + pat[i][1], pat[i][2], glyph);
-    }
+    for (int i = 0; !IS_END(pat[i]); i++)
+        pool_place(pool, cC + pat[i][0], cR + pat[i][1], pat[i][2], glyph);
 }
 
 /* Random scatter — 10 triangles within 4-step radius from cursor. */
@@ -432,16 +474,17 @@ static double frand(void)
     g_seed = g_seed * 1103515245u + 12345u;
     return ((double)((g_seed >> 16) & 0x7FFF)) / 32767.0;
 }
-static void pattern_scatter(ObjectPool *pool, int cC, int cR, char glyph)
+
+static void pattern_scatter(Pool *pool, int cC, int cR, char glyph)
 {
     g_seed ^= (unsigned int)clock_ns();
     int n = 10, tries = 0;
     while (n > 0 && tries < 100) {
-        int dC = (int)(frand() * 9) - 4;
-        int dR = (int)(frand() * 9) - 4;
-        int up = frand() > 0.5 ? 1 : 0;
+        int dC   = (int)(frand() * 9) - 4;
+        int dR   = (int)(frand() * 9) - 4;
+        int up   = frand() > 0.5 ? 1 : 0;
         int prev = pool->count;
-        pool_add(pool, cC + dC, cR + dR, up, glyph);
+        pool_place(pool, cC + dC, cR + dR, up, glyph);
         if (pool->count > prev) n--;
         tries++;
     }
@@ -451,54 +494,33 @@ static void pattern_scatter(ObjectPool *pool, int cC, int cR, char glyph)
 /* §8  scene                                                               */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
-static void grid_draw(int rows, int cols, double size, int ox, int oy)
+static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
+                     double fps)
 {
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double px = (double)(col - ox) * CELL_W;
-            double py = (double)(row - oy) * CELL_H;
-            int tC, tR, tU; double fa, fb, em, mm;
-            pixel_to_tri(px, py, size, &tC, &tR, &tU, &fa, &fb);
-            char ech = tri_edge_char(tU, fa, fb, &em);
-            char mch = tri_median_char(tU, fa, fb, &mm);
-            if (em < BORDER_W && em <= mm) {
-                attron(COLOR_PAIR(PAIR_BORDER));
-                mvaddch(row, col, (chtype)(unsigned char)ech);
-                attroff(COLOR_PAIR(PAIR_BORDER));
-            } else if (mm < MEDIAN_T) {
-                attron(COLOR_PAIR(PAIR_MEDIAN));
-                mvaddch(row, col, (chtype)(unsigned char)mch);
-                attroff(COLOR_PAIR(PAIR_MEDIAN));
-            }
-        }
-    }
-}
-
-static void scene_draw(int rows, int cols, const Cursor *cur,
-                       const ObjectPool *pool, double fps)
-{
-    erase();
-    int ox = cols / 2;
-    int oy = (rows - 1) / 2;
-    grid_draw(rows, cols, cur->tri_size, ox, oy);
-    pool_draw(pool, cur->tri_size, ox, oy, rows, cols);
-    cursor_draw(cur, ox, oy, rows, cols);
-
     char buf[128];
     snprintf(buf, sizeof buf,
              " C:%+d R:%+d %s  obj:%d  glyph:%c  size:%.0f  theme:%d  %5.1f fps  %s ",
              cur->col, cur->row, cur->up ? "/\\" : "\\/",
-             pool->count, GLYPHS[cur->glyph_idx], cur->tri_size,
+             pool->count, GLYPHS[cur->glyph_idx], g->tri_size,
              cur->theme, fps, cur->paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " arrows:move  1:ring 2:line 3:star 4:tri 5:scatter  spc:clear  g:glyph  +/-:size  q:quit  [04 patterns] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
+static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *pool,
+                       double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    pool_draw(pool, g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, pool, fps);
     wnoutrefresh(stdscr);
     doupdate();
 }
@@ -536,11 +558,12 @@ int main(void)
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
 
-    Cursor     cur;     cursor_reset(&cur);
-    ObjectPool pool;    pool_clear(&pool);
+    Cursor cur;  cursor_reset(&cur);
+    Pool   pool; pool_clear(&pool);
     screen_init(cur.theme);
 
-    int rows = LINES, cols = COLS;
+    GridCtx g;   ctx_init(&g, LINES, COLS, TRI_SIZE_DEFAULT);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
     double  fps = TARGET_FPS;
     int64_t t0  = clock_ns();
@@ -549,43 +572,49 @@ int main(void)
         if (g_need_resize) {
             g_need_resize = 0;
             endwin(); refresh();
-            rows = LINES; cols = COLS;
+            ctx_init(&g, LINES, COLS, g.tri_size);
         }
         int ch;
         while ((ch = getch()) != ERR) {
             char glyph = GLYPHS[cur.glyph_idx];
             switch (ch) {
                 case 'q': case 27: g_running = 0; break;
-                case 'p':          cur.paused ^= 1; break;
-                case 'r':          cursor_reset(&cur); pool_clear(&pool);
-                                   color_init(cur.theme); break;
-                case ' ':          pool_clear(&pool); break;
-                case 'g':          cur.glyph_idx = (cur.glyph_idx + 1) % N_GLYPHS; break;
-                case '1':          pattern_stamp(&pool, PAT_RING,  cur.col, cur.row, glyph); break;
-                case '2':          pattern_stamp(&pool, PAT_LINE,  cur.col, cur.row, glyph); break;
-                case '3':          pattern_stamp(&pool, PAT_STAR,  cur.col, cur.row, glyph); break;
-                case '4':          pattern_stamp(&pool, PAT_TRI,   cur.col, cur.row, glyph); break;
-                case '5':          pattern_scatter(&pool, cur.col, cur.row, glyph); break;
+                case 'p': cur.paused ^= 1; break;
+                case 'r':
+                    cursor_reset(&cur); pool_clear(&pool);
+                    ctx_init(&g, LINES, COLS, TRI_SIZE_DEFAULT);
+                    color_init(cur.theme);
+                    break;
+                case ' ': pool_clear(&pool); break;
+                case 'g': cur.glyph_idx = (cur.glyph_idx + 1) % N_GLYPHS; break;
+                case '1': pattern_stamp(&pool, PAT_RING,  cur.col, cur.row, glyph); break;
+                case '2': pattern_stamp(&pool, PAT_LINE,  cur.col, cur.row, glyph); break;
+                case '3': pattern_stamp(&pool, PAT_STAR,  cur.col, cur.row, glyph); break;
+                case '4': pattern_stamp(&pool, PAT_TRI,   cur.col, cur.row, glyph); break;
+                case '5': pattern_scatter(&pool, cur.col, cur.row, glyph); break;
                 case 't':
                     cur.theme = (cur.theme + 1) % N_THEMES;
                     color_init(cur.theme);
                     break;
-                case KEY_LEFT:  cursor_step(&cur, 0); break;
-                case KEY_RIGHT: cursor_step(&cur, 1); break;
-                case KEY_UP:    cursor_step(&cur, 2); break;
-                case KEY_DOWN:  cursor_step(&cur, 3); break;
+                case KEY_LEFT:  cursor_move(&cur, 0); break;
+                case KEY_RIGHT: cursor_move(&cur, 1); break;
+                case KEY_UP:    cursor_move(&cur, 2); break;
+                case KEY_DOWN:  cursor_move(&cur, 3); break;
                 case '+': case '=':
-                    if (cur.tri_size < TRI_SIZE_MAX) { cur.tri_size += TRI_SIZE_STEP; } break;
+                    if (g.tri_size < TRI_SIZE_MAX) g.tri_size += TRI_SIZE_STEP;
+                    break;
                 case '-':
-                    if (cur.tri_size > TRI_SIZE_MIN) { cur.tri_size -= TRI_SIZE_STEP; } break;
+                    if (g.tri_size > TRI_SIZE_MIN) g.tri_size -= TRI_SIZE_STEP;
+                    break;
             }
         }
 
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA)
+            + (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0  = now;
 
-        scene_draw(rows, cols, &cur, &pool, fps);
+        scene_draw(&g, &cur, &pool, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

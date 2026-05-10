@@ -10,12 +10,12 @@
  * Study alongside: 01_uniform_rect.c (base), 04_coarse_sparse.c (large)
  *
  * Section map:
- *   §1 config   — CELL_W=4, CELL_H=2 (minimum practical cell)
+ *   §1 config   — CELL_W=4, CELL_H=2, EWMA constant
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 4 pairs
- *   §4 formula  — same formula as 01; only constants differ
- *   §5 player   — struct, move, reset
- *   §6 scene    — draw_grid(), draw_player()
+ *   §3 color    — grid / active / cursor / HUD / HINT pairs
+ *   §4 formula  — GridCtx + ctx_init / ctx_to_screen / ctx_grid_char / ctx_draw_bg
+ *   §5 cursor   — Cursor + cursor_reset / cursor_move / cursor_draw
+ *   §6 scene    — hud_draw + scene_draw
  *   §7 screen   — ncurses init / cleanup
  *   §8 app      — signals, main loop
  *
@@ -43,7 +43,7 @@
  *                  Compare to 01_uniform_rect (8×4): 10 × 5 = 50 cells.
  *                  Same formula, 4.4× more cells just from halving cell size.
  *
- * Player cell    : With CELL_H=2 the interior is only 1 row tall.
+ * Cursor cell    : With CELL_H=2 the interior is only 1 row tall.
  *                  The '@' sits on the single interior row; no dot fill.
  *
  * References     :
@@ -84,7 +84,7 @@
  *
  *  2. Draw using the standard modular test.
  *
- *  3. For the player cell: with CELL_H=2, interior is only 1 row.
+ *  3. For the cursor cell: with CELL_H=2, interior is only 1 row.
  *     Place '@' in that single interior row at the column centre.
  *     There is no room for '.' fill; just the '@' character.
  *
@@ -119,8 +119,8 @@
  *    can reduce FPS.  Use erase() not clear(), and wnoutrefresh/doupdate
  *    to minimise actual writes.
  *
- *  • Player bounds recomputation after resize: the dense grid has many more
- *    cells, so resizing is more likely to need player_reset().
+ *  • Cursor bounds recomputation after resize: the dense grid has many more
+ *    cells, so resizing is more likely to need cursor_reset().
  *
  * HOW TO VERIFY
  * ─────────────
@@ -154,10 +154,15 @@
 #define CELL_W  4
 #define CELL_H  2
 
-#define PAIR_GRID    1
-#define PAIR_ACTIVE  2
-#define PAIR_PLAYER  3
-#define PAIR_HUD     4
+/* Smoothing factor for the displayed FPS readout (exponential moving avg). */
+#define FPS_EWMA_ALPHA  0.05
+
+/* Color pair IDs */
+#define PAIR_GRID    1   /* dim grid lines               */
+#define PAIR_ACTIVE  2   /* highlighted cell fill        */
+#define PAIR_CURSOR  3   /* bright '@'                   */
+#define PAIR_HUD     4   /* status bar (yellow)          */
+#define PAIR_HINT    5   /* key-hint footer (cyan)       */
 
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* §2  clock                                                               */
@@ -186,117 +191,146 @@ static void color_init(void)
     /* Dimmer grid color — with dense lines a bright color overwhelms */
     init_pair(PAIR_GRID,   COLORS >= 256 ?  75 : COLOR_BLUE,   -1);
     init_pair(PAIR_ACTIVE, COLORS >= 256 ?  82 : COLOR_GREEN,  -1);
-    init_pair(PAIR_PLAYER, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  15 : COLOR_WHITE,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
-/* §4  formula                                                             */
+/* §4  formula — GridCtx and the cell ↔ screen mapping                    */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * cell_to_screen — THE FORMULA (unchanged from 01_uniform_rect):
- *
- *   screen_row = r * CELL_H    (= r * 2)
- *   screen_col = c * CELL_W    (= c * 4)
- *
- * grid_char — unchanged from 01:
- *   sr % 2 == 0  →  horizontal line
- *   sc % 4 == 0  →  vertical line
- *
- * Every 2nd row and every 4th column is a grid line.
- * The 80×24 terminal has 11 horizontal lines and 20 vertical lines.
+ * GridCtx — geometry of the active grid plus cursor bounds.
+ * Same shape as 01_uniform_rect; only the cw/ch values differ.
  */
-static void cell_to_screen(int r, int c, int *sr, int *sc)
+typedef struct {
+    /* terminal extent */
+    int rows, cols;
+
+    /* cell size in screen characters */
+    int cw, ch;
+
+    /* cursor bounds — last whole cell that fits in (rows-1) × cols */
+    int max_r, max_c;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols)
 {
-    *sr = r * CELL_H;
-    *sc = c * CELL_W;
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->max_r = (rows - 1) / CELL_H - 1;
+    g->max_c = cols / CELL_W - 1;
 }
 
-static char grid_char(int sr, int sc)
+/*
+ * ctx_to_screen — THE FORMULA (unchanged from 01_uniform_rect):
+ *
+ *   screen_row = r * ch    (= r * 2)
+ *   screen_col = c * cw    (= c * 4)
+ */
+static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 {
-    bool h = (sr % CELL_H == 0);
-    bool v = (sc % CELL_W == 0);
+    *sr = r * g->ch;
+    *sc = c * g->cw;
+}
+
+/*
+ * ctx_grid_char — unchanged from 01:
+ *   sr % ch == 0  →  horizontal line
+ *   sc % cw == 0  →  vertical line
+ *
+ * Every 2nd row and every 4th column is a grid line.
+ */
+static char ctx_grid_char(const GridCtx *g, int sr, int sc)
+{
+    bool h = (sr % g->ch == 0);
+    bool v = (sc % g->cw == 0);
     if (h && v) return '+';
     if (h)      return '-';
     if (v)      return '|';
     return ' ';
 }
 
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §5  player                                                              */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-typedef struct { int r, c, max_r, max_c; } Player;
-
-static void player_reset(Player *p, int rows, int cols)
-{
-    p->max_r = (rows - 1) / CELL_H - 1;
-    p->max_c = cols / CELL_W - 1;
-    p->r = p->max_r / 2;
-    p->c = p->max_c / 2;
-}
-
-static void player_move(Player *p, int dr, int dc)
-{
-    int nr = p->r + dr, nc = p->c + dc;
-    if (nr >= 0 && nr <= p->max_r) p->r = nr;
-    if (nc >= 0 && nc <= p->max_c) p->c = nc;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════ */
-/* §6  scene                                                               */
-/* ═══════════════════════════════════════════════════════════════════════ */
-
-static void draw_grid(int rows, int cols)
+static void ctx_draw_bg(const GridCtx *g)
 {
     attron(COLOR_PAIR(PAIR_GRID));
-    for (int sr = 0; sr < rows - 1; sr++)
-        for (int sc = 0; sc < cols; sc++) {
-            char ch = grid_char(sr, sc);
+    for (int sr = 0; sr < g->rows - 1; sr++)
+        for (int sc = 0; sc < g->cols; sc++) {
+            char ch = ctx_grid_char(g, sr, sc);
             if (ch != ' ')
                 mvaddch(sr, sc, (chtype)(unsigned char)ch);
         }
     attroff(COLOR_PAIR(PAIR_GRID));
 }
 
-static void draw_player(const Player *p)
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct { int r, c; } Cursor;
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    cur->r = g->max_r / 2;
+    cur->c = g->max_c / 2;
+}
+
+static void cursor_move(Cursor *cur, const GridCtx *g, int dr, int dc)
+{
+    int nr = cur->r + dr, nc = cur->c + dc;
+    if (nr >= 0 && nr <= g->max_r) cur->r = nr;
+    if (nc >= 0 && nc <= g->max_c) cur->c = nc;
+}
+
+/*
+ * cursor_draw — CELL_H=2: interior is exactly row sr+1, cols sc+1..sc+3
+ * Place '@' at centre of that single interior row.
+ */
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
 {
     int sr, sc;
-    cell_to_screen(p->r, p->c, &sr, &sc);
+    ctx_to_screen(g, cur->r, cur->c, &sr, &sc);
 
-    /* CELL_H=2: interior is exactly row sr+1, cols sc+1..sc+3 */
     attron(COLOR_PAIR(PAIR_ACTIVE));
-    for (int dc = 1; dc < CELL_W; dc++)
+    for (int dc = 1; dc < g->cw; dc++)
         mvaddch(sr + 1, sc + dc, (chtype)'-');
     attroff(COLOR_PAIR(PAIR_ACTIVE));
 
     /* '@' at centre of interior */
-    attron(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
-    mvaddch(sr + 1, sc + CELL_W / 2, (chtype)'@');
-    attroff(COLOR_PAIR(PAIR_PLAYER) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    mvaddch(sr + 1, sc + g->cw / 2, (chtype)'@');
+    attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
 }
 
-static void scene_draw(int rows, int cols, const Player *p, double fps)
-{
-    erase();
-    draw_grid(rows, cols);
-    draw_player(p);
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
+static void hud_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
     char buf[64];
     snprintf(buf, sizeof buf, " %.1f fps  cell(%d,%d)  grid%dx%d ",
-             fps, p->r, p->c, p->max_c + 1, p->max_r + 1);
+             fps, cur->r, cur->c, g->max_c + 1, g->max_r + 1);
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_DIM);
-    mvprintw(rows - 1, 0,
-        " arrows:move  r:reset  q:quit  [03 fine dense  %dx%d cells] ",
-        CELL_W, CELL_H);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_DIM);
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
+        " arrows:move  r:reset  q/ESC:quit  [03 fine dense  %dx%d cells] ",
+        g->cw, g->ch);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
 
-    wnoutrefresh(stdscr); doupdate();
+static void scene_draw(const GridCtx *g, const Cursor *cur, double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, fps);
+    wnoutrefresh(stdscr);
+    doupdate();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -327,30 +361,37 @@ int main(void)
 {
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     signal(SIGWINCH, on_signal);
+
     screen_init();
-    int rows = LINES, cols = COLS;
-    Player player; player_reset(&player, rows, cols);
+    GridCtx g;     ctx_init(&g, LINES, COLS);
+    Cursor  cur;   cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double fps = TARGET_FPS; int64_t t0 = clock_ns();
+    double fps = TARGET_FPS;
+    int64_t t0 = clock_ns();
 
     while (g_running) {
         if (g_need_resize) {
-            g_need_resize = 0; endwin(); refresh();
-            rows = LINES; cols = COLS;
-            player_reset(&player, rows, cols);
+            g_need_resize = 0;
+            endwin(); refresh();
+            ctx_init(&g, LINES, COLS);
+            cursor_reset(&cur, &g);
         }
         int ch = getch();
         switch (ch) {
-            case 'q': case 27: g_running = 0;                    break;
-            case 'r':          player_reset(&player, rows, cols); break;
-            case KEY_UP:    player_move(&player, -1,  0); break;
-            case KEY_DOWN:  player_move(&player, +1,  0); break;
-            case KEY_LEFT:  player_move(&player,  0, -1); break;
-            case KEY_RIGHT: player_move(&player,  0, +1); break;
+            case 'q': case 27:  g_running = 0;                  break;
+            case 'r':           cursor_reset(&cur, &g);          break;
+            case KEY_UP:        cursor_move(&cur, &g, -1,  0);   break;
+            case KEY_DOWN:      cursor_move(&cur, &g, +1,  0);   break;
+            case KEY_LEFT:      cursor_move(&cur, &g,  0, -1);   break;
+            case KEY_RIGHT:     cursor_move(&cur, &g,  0, +1);   break;
         }
+
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (now - t0 + 1)) * 0.05; t0 = now;
-        scene_draw(rows, cols, &player, fps);
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) + (1e9 / (now - t0 + 1)) * FPS_EWMA_ALPHA;
+        t0  = now;
+
+        scene_draw(&g, &cur, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

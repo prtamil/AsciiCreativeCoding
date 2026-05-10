@@ -2,13 +2,12 @@
 /*
  * 06_hex_subdivision_path.c — line-of-sight path on hex-subdivision grid
  *
- * DEMO: Two markers (S/E) on a flat-top hex grid where each hex is
- *       split into 6 wedges by 3 long diagonals. Move '@' with arrows
- *       (move whole hexes); ',' / '.' rotate the cursor sector. Press
- *       's' to set START at the cursor wedge, 'e' to set END. The
- *       path is computed by pixel-walking the centroid-to-centroid
- *       line and recording each (Q, R, sector) wedge it passes
- *       through.
+ * DEMO: Two markers (S/E) on a flat-top hex grid where each hex is split
+ *       into 6 wedges by 3 long diagonals. Move '@' with arrows (whole
+ *       hexes); ',' / '.' rotate the cursor sector. Press 's' to set
+ *       START at the cursor wedge, 'e' to set END. The path is computed
+ *       by pixel-walking the centroid-to-centroid line and recording
+ *       each (q, r, sector) wedge it passes through.
  *
  * Study alongside: grids/tri_grids/06_hex_subdivision.c (rasterizer),
  *                  06_hex_subdivision_direct.c (manual placement),
@@ -18,11 +17,11 @@
  *   §1 config   — CELL_W, CELL_H, HEX_SIZE, MAX_OBJ
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — 7 pairs: edge / radius / cursor / start / end / path / HUD
- *   §4 formula  — pixel ↔ axial hex (cube-round) + sector_of (atan2 bin)
- *   §5 pool     — PathPool: clear / contains / add / draw
- *   §6 cursor   — HEX_DIR + cursor_step_hex + cursor_rotate_sector
- *   §7 path     — pixel walk between two wedge centroids → wedge list
- *   §8 scene    — grid_draw + scene_draw
+ *   §4 gridctx  — GridCtx + ctx_init / ctx_to_screen / ctx_draw_bg
+ *   §5 pool     — Pool: place / find / draw  (path entries, glyph='*')
+ *   §6 cursor   — Cursor + cursor_reset / cursor_move / cursor_rotate
+ *   §7 mode     — path: state machine (set start, set end) + line walk
+ *   §8 scene    — hud_draw + scene_draw
  *   §9 screen   — ncurses init / cleanup
  *  §10 app      — signals, main loop
  *
@@ -37,25 +36,23 @@
 /* ── CONCEPTS ──────────────────────────────────────────────────────────── *
  *
  * Algorithm      : Line-rasterize between two wedge centroids in PIXEL
- *                  space. For each sampled pixel, compute (Q, R) via
+ *                  space. For each sampled pixel, compute (q, r) via
  *                  cube-rounding, then classify the SECTOR by atan2 of
  *                  the offset from the hex centre. The result is the
- *                  ordered set of (Q, R, sector) wedges traversed by
- *                  the straight line.
+ *                  ordered set of (q, r, sector) wedges traversed by the
+ *                  straight line.
  *
- * Data-structure : PathPool — flat array of HPath{Q, R, sector}. Dedup
- *                  via path_contains.
+ * Data-structure : Pool — flat array of Obj{q, r, sector, glyph='*',
+ *                  alive}. Dedup via pool_find.
  *
  * Sector test    : sector_of(dx, dy) bins atan2(dy, dx) into 6 wedges
  *                  rotated by 30°:
  *                    s = floor((ang + π/6) / (π/3)) mod 6
- *                  Sector 0 is centred on +x; sector 1 on 60° CCW; etc.
  *
  * Sampling step  : ~hex_size/4 — fine enough that no wedge is skipped.
  *
  * References     :
  *   Hexagonal coordinates — https://www.redblobgames.com/grids/hexagons/
- *   Hex axial system — https://en.wikipedia.org/wiki/Hexagonal_coordinate_systems
  *   Bresenham line — https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
  *
  * ─────────────────────────────────────────────────────────────────────── */
@@ -67,27 +64,27 @@
  * Stretch a string from S to E across a hex grid with diameters drawn
  * inside every hex. The path is the ordered list of wedges the string
  * passes through. We rediscover that list by pixel-walking the string
- * and asking — at every sample — which (Q, R, sector) wedge owns the
- * point. Cube-rounding answers (Q, R); atan2 answers the sector.
+ * and asking — at every sample — which (q, r, sector) wedge owns the
+ * point. Cube-rounding answers (q, r); atan2 answers the sector.
  *
  * HOW TO THINK ABOUT IT
  * ─────────────────────
  * The grid topology is two-tiered: hex membership (cube-rounding) and
  * wedge angle (atan2 from hex centre). The line walks across hex
- * boundaries and across diameter boundaries; each crossing introduces
- * a new (Q, R, sector) into the path. Sampling at hex_size/4 is more
- * than fine enough — wedges are large fractions of a hex.
+ * boundaries and across diameter boundaries; each crossing introduces a
+ * new (q, r, sector) into the path. Sampling at hex_size/4 is more than
+ * fine enough — wedges are large fractions of a hex.
  *
  * DRAWING METHOD  (per frame)
  * ──────────────
  *  1. erase()
- *  2. grid_draw — for each screen cell:
- *       pixel_to_hex → (Q, R, dist)
+ *  2. ctx_draw_bg — for each screen cell:
+ *       pixel_to_hex → (q, r, dist)
  *       hex_centre_pixel → (cx, cy)
  *       if dist > limit_inner: render hex border via angle_char
- *       else: test proximity to the 3 radii; if near, render the
- *             radius character.
- *  3. path_draw — '*' at each PathPool wedge centroid screen cell.
+ *       else: test proximity to the 3 radii; if near, render the radius
+ *             character.
+ *  3. pool_draw — '*' at each path wedge centroid screen cell.
  *  4. marker_draw — 'S' at start, 'E' at end.
  *  5. cursor_draw — '@' at cursor wedge.
  *
@@ -95,7 +92,7 @@
  *
  * KEY FORMULAS
  * ────────────
- *  Pixel → axial hex: cube-round (fq, fr, fs=-fq-fr) → integer (Q, R).
+ *  Pixel → axial hex: cube-round (fq, fr, fs=-fq-fr) → integer (q, r).
  *
  *  Sector classifier:
  *    dx = px - cx,   dy = py - cy
@@ -104,9 +101,9 @@
  *
  *  Wedge centroid:
  *    angle = sector · π/3
- *    r     = size · √3 / 3
- *    cx_w  = cx + r · cos(angle)
- *    cy_w  = cy + r · sin(angle)
+ *    radius = size · √3 / 3
+ *    cx_w   = cx + radius · cos(angle)
+ *    cy_w   = cy + radius · sin(angle)
  *
  *  Walk parameters:
  *    dx = ex - sx,  dy = ey - sy
@@ -114,33 +111,22 @@
  *    step = hex_size · 0.25
  *    n    = floor(dist / step) + 1
  *
- *  Walk loop:
- *    for i in 0..n:
- *      t  = i / n
- *      px = sx + t·dx,   py = sy + t·dy
- *      pixel_to_hex(px, py) → (Q, R)
- *      hex_centre_pixel(Q, R) → (cx, cy)
- *      sector_of(px - cx, py - cy) → s
- *      path_add(Q, R, s)            // dedup
- *
  * EDGE CASES TO WATCH
  * ───────────────────
- *  • Sector tie at hex centre: when (dx, dy) ≈ (0, 0) the atan2 angle
- *    is undefined; sector_of returns 0 deterministically because the
- *    +π/6 bias places the centre solidly in sector 0.
- *  • Cube-round drift: the largest residual is snapped back; this
- *    can flip the chosen hex by 1 in pathological floating-point
- *    cases. Visible only at extreme zoom-out.
+ *  • Sector tie at hex centre: when (dx, dy) ≈ (0, 0) the atan2 angle is
+ *    undefined; sector_of returns 0 deterministically because the +π/6
+ *    bias places the centre solidly in sector 0.
+ *  • Cube-round drift: the largest residual is snapped back; this can
+ *    flip the chosen hex by 1 in pathological floating-point cases.
  *  • Recompute on size change: '+'/'-' must call path_compute.
  *  • Zero-length, MAX_OBJ cap: identical to other _path siblings.
  *
  * HOW TO VERIFY
  * ─────────────
  *  Set START at sector 0 (east wedge) of (0,0); set END at sector 3
- *  (west wedge) of (0,0): path size ≈ 4 (the line crosses sectors
- *  0 → 1 → 2 → 3 inside one hex). Walk END to (1, 0, 0): path size
- *  reaches across the hex boundary; sector-0 entries appear in two
- *  different hexes.
+ *  (west wedge) of (0,0): path size ≈ 4 (the line crosses sectors 0 → 1
+ *  → 2 → 3 inside one hex). Walk END to (1, 0, 0): path reaches across
+ *  the hex boundary; sector-0 entries appear in two different hexes.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -159,17 +145,28 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §1  config                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
 #define TARGET_FPS 60
+
 #define CELL_W 2
 #define CELL_H 4
+
 #define HEX_SIZE_DEFAULT 16.0
 #define HEX_SIZE_MIN      8.0
 #define HEX_SIZE_MAX     40.0
 #define HEX_SIZE_STEP     2.0
-#define BORDER_W 0.10
+
+#define BORDER_W      0.10
 #define RADIUS_T_FRAC 0.12
-#define MAX_OBJ  1024
-#define N_THEMES 4
+
+#define MAX_OBJ   1024
+#define N_THEMES  4
+
+#define FPS_EWMA_ALPHA  0.05
+
 #define PAIR_BORDER 1
 #define PAIR_RADIUS 2
 #define PAIR_CURSOR 3
@@ -179,6 +176,10 @@
 #define PAIR_HUD    7
 #define PAIR_HINT   8
 
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §2  clock                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
 static int64_t clock_ns(void)
 {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -187,19 +188,29 @@ static int64_t clock_ns(void)
 static void clock_sleep_ns(int64_t ns)
 {
     if (ns <= 0) return;
-    struct timespec r = { .tv_sec = (time_t)(ns/1000000000LL), .tv_nsec = (long)(ns%1000000000LL) };
+    struct timespec r = { .tv_sec  = (time_t)(ns / 1000000000LL),
+                          .tv_nsec = (long)(ns % 1000000000LL) };
     nanosleep(&r, NULL);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §3  color                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
 static const short THEME_FG[N_THEMES][4] = {
-    {  75, 39,  82, 196 }, {  82, 226, 226, 207 }, { 207, 196,  82,  39 }, {  15, 87, 82, 196 },
+    /* edge,  radius, start, end */
+    {  75,  39,  82, 196 },
+    {  82, 226, 226, 207 },
+    { 207, 196,  82,  39 },
+    {  87, 226,  82, 196 },
 };
 static const short THEME_FG_8[N_THEMES][4] = {
-    { COLOR_CYAN, COLOR_BLUE, COLOR_GREEN, COLOR_RED },
-    { COLOR_GREEN, COLOR_YELLOW, COLOR_YELLOW, COLOR_MAGENTA },
-    { COLOR_MAGENTA, COLOR_RED, COLOR_GREEN, COLOR_BLUE },
-    { COLOR_WHITE, COLOR_CYAN, COLOR_GREEN, COLOR_RED },
+    { COLOR_CYAN,    COLOR_BLUE,   COLOR_GREEN,  COLOR_RED     },
+    { COLOR_GREEN,   COLOR_YELLOW, COLOR_YELLOW, COLOR_MAGENTA },
+    { COLOR_MAGENTA, COLOR_RED,    COLOR_GREEN,  COLOR_BLUE    },
+    { COLOR_WHITE,   COLOR_CYAN,   COLOR_GREEN,  COLOR_RED     },
 };
+
 static void color_init(int theme)
 {
     start_color(); use_default_colors();
@@ -216,20 +227,48 @@ static void color_init(int theme)
     init_pair(PAIR_START,  fg_s, -1);
     init_pair(PAIR_END,    fg_n, -1);
     init_pair(PAIR_PATH,   COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_CURSOR, COLORS >= 256 ? 15  : COLOR_WHITE, COLOR_BLUE);
-    init_pair(PAIR_HUD,    COLORS >= 256 ?  0  : COLOR_BLACK, COLOR_CYAN);
-    init_pair(PAIR_HINT,   COLORS >= 256 ? 75  : COLOR_CYAN,  -1);
+    init_pair(PAIR_CURSOR, COLORS >= 256 ?  15 : COLOR_WHITE,  COLOR_BLUE);
+    init_pair(PAIR_HUD,    COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT,   COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §4  gridctx                                                             */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int    rows, cols;
+    int    cw, ch;
+    double hex_size;
+    int    ox, oy;
+    int    max_q, max_r;
+    double border_w, radius_t_frac;
+} GridCtx;
+
+static void ctx_init(GridCtx *g, int rows, int cols, double hex_size)
+{
+    g->rows = rows; g->cols = cols;
+    g->cw = CELL_W; g->ch = CELL_H;
+    g->hex_size = hex_size;
+    g->ox = cols / 2;
+    g->oy = (rows - 1) / 2;
+    g->max_q = cols / 2;
+    g->max_r = rows / 2;
+    g->border_w      = BORDER_W;
+    g->radius_t_frac = RADIUS_T_FRAC;
 }
 
 static char angle_char(double theta)
 {
-    double t = fmod(theta, M_PI); if (t < 0.0) t += M_PI;
+    double t = fmod(theta, M_PI);
+    if (t < 0.0) t += M_PI;
     if (t < M_PI / 8.0)         return '-';
     if (t < 3.0 * M_PI / 8.0)   return '\\';
     if (t < 5.0 * M_PI / 8.0)   return '|';
     if (t < 7.0 * M_PI / 8.0)   return '/';
     return '-';
 }
+
 static int sector_of(double dx, double dy)
 {
     double ang = atan2(dy, dx);
@@ -237,141 +276,72 @@ static int sector_of(double dx, double dy)
     s %= 6; if (s < 0) s += 6;
     return s;
 }
+
 static void pixel_to_hex(double px, double py, double size,
                          int *Q, int *R, double *dist)
 {
-    double sq3 = sqrt(3.0), sq3_3 = sq3/3.0;
-    double fq = (2.0/3.0 * px) / size;
+    double sq3 = sqrt(3.0), sq3_3 = sq3 / 3.0;
+    double fq = (2.0 / 3.0 * px) / size;
     double fr = (-1.0/3.0 * px + sq3_3 * py) / size;
     double fs = -fq - fr;
     int rq = (int)round(fq), rr = (int)round(fr), rs = (int)round(fs);
-    double dq = fabs((double)rq-fq), dr = fabs((double)rr-fr), ds = fabs((double)rs-fs);
+    double dq = fabs((double)rq - fq);
+    double dr = fabs((double)rr - fr);
+    double ds = fabs((double)rs - fs);
     if      (dq > dr && dq > ds) rq = -rr - rs;
     else if (dr > ds)             rr = -rq - rs;
     *Q = rq; *R = rr;
-    double fQ = (double)*Q, fR = (double)*R, fS = (double)(-*Q-*R);
-    double d = fabs(fq-fQ); double d2 = fabs(fr-fR); double d3 = fabs(fs-fS);
-    if (d2 > d) { d = d2; }
-    if (d3 > d) { d = d3; }
+    double fQ = (double)*Q, fR = (double)*R, fS = (double)(-*Q - *R);
+    double d = fabs(fq - fQ);
+    double d2 = fabs(fr - fR);
+    double d3 = fabs(fs - fS);
+    if (d2 > d) d = d2;
+    if (d3 > d) d = d3;
     *dist = d;
 }
-static void hex_centre_pixel(int Q, int R, double size, double *cx, double *cy)
+
+static void hex_centre_pixel(int Q, int R, double size,
+                              double *cx, double *cy)
 {
     double sq3 = sqrt(3.0);
-    *cx = size * 1.5 * (double)Q;
+    *cx = size * 1.5      * (double)Q;
     *cy = size * (sq3*0.5 * (double)Q + sq3 * (double)R);
 }
-static void wedge_centroid_pixel(int Q, int R, int sector, double size, double *cx, double *cy)
+
+static void wedge_centroid_pixel(int Q, int R, int sector, double size,
+                                 double *cx_pix, double *cy_pix)
 {
-    double hx, hy; hex_centre_pixel(Q, R, size, &hx, &hy);
+    double cx, cy;
+    hex_centre_pixel(Q, R, size, &cx, &cy);
     double ang = (double)sector * M_PI / 3.0;
     double r   = size * sqrt(3.0) / 3.0;
-    *cx = hx + r * cos(ang); *cy = hy + r * sin(ang);
-}
-static void wedge_to_screen(int Q, int R, int sector, double size,
-                            int ox, int oy, int *scol, int *srow)
-{
-    double cx, cy; wedge_centroid_pixel(Q, R, sector, size, &cx, &cy);
-    *scol = ox + (int)(cx / CELL_W); *srow = oy + (int)(cy / CELL_H);
+    *cx_pix = cx + r * cos(ang);
+    *cy_pix = cy + r * sin(ang);
 }
 
-typedef struct { int Q, R, sector; } HPath;
-typedef struct { HPath items[MAX_OBJ]; int count; } PathPool;
-static void path_clear(PathPool *p) { p->count = 0; }
-static int path_contains(const PathPool *p, int Q, int R, int s)
+static void ctx_to_screen(const GridCtx *g, int q, int r, int sector,
+                          int *scol, int *srow)
 {
-    for (int i = 0; i < p->count; i++)
-        if (p->items[i].Q == Q && p->items[i].R == R && p->items[i].sector == s) return 1;
-    return 0;
-}
-static void path_add(PathPool *p, int Q, int R, int s)
-{
-    if (p->count >= MAX_OBJ || path_contains(p, Q, R, s)) return;
-    p->items[p->count++] = (HPath){ Q, R, s };
-}
-static void path_draw(const PathPool *p, double size, int ox, int oy, int rows, int cols)
-{
-    attron(COLOR_PAIR(PAIR_PATH) | A_BOLD);
-    for (int i = 0; i < p->count; i++) {
-        int sc, sr;
-        wedge_to_screen(p->items[i].Q, p->items[i].R, p->items[i].sector, size, ox, oy, &sc, &sr);
-        if (sc >= 0 && sc < cols && sr >= 0 && sr < rows - 1)
-            mvaddch(sr, sc, '*');
-    }
-    attroff(COLOR_PAIR(PAIR_PATH) | A_BOLD);
+    double cx, cy;
+    wedge_centroid_pixel(q, r, sector, g->hex_size, &cx, &cy);
+    *scol = g->ox + (int)(cx / g->cw);
+    *srow = g->oy + (int)(cy / g->ch);
 }
 
-typedef struct {
-    int Q, R, sector;
-    int sQ, sR, sSec, eQ, eR, eSec;
-    int has_start, has_end;
-    double hex_size; int theme, paused;
-} Cursor;
-static const int HEX_DIR[4][2] = { { 0, -1 }, { 0, +1 }, { -1, 0 }, { +1, 0 } };
-
-static void cursor_reset(Cursor *cur)
-{
-    cur->Q = 0; cur->R = 0; cur->sector = 0;
-    cur->has_start = 0; cur->has_end = 0;
-    cur->hex_size = HEX_SIZE_DEFAULT;
-    cur->theme = 0; cur->paused = 0;
-}
-static void cursor_step_hex(Cursor *cur, int idx)
-{
-    cur->Q += HEX_DIR[idx][0]; cur->R += HEX_DIR[idx][1];
-}
-static void cursor_rotate_sector(Cursor *cur, int delta)
-{
-    cur->sector = (cur->sector + delta + 6) % 6;
-}
-static void marker_draw(int Q, int R, int s, double size,
-                        int ox, int oy, int rows, int cols, char glyph, int pair)
-{
-    int sc, sr; wedge_to_screen(Q, R, s, size, ox, oy, &sc, &sr);
-    if (sc >= 0 && sc < cols && sr >= 0 && sr < rows - 1) {
-        attron(COLOR_PAIR(pair) | A_BOLD); mvaddch(sr, sc, glyph); attroff(COLOR_PAIR(pair) | A_BOLD);
-    }
-}
-
-/*
- * path_compute — pixel-walk between two wedge centroids; for each
- * sample, identify the (Q, R, sector) triple it falls in.
- */
-static void path_compute(PathPool *p, const Cursor *cur)
-{
-    path_clear(p);
-    if (!cur->has_start || !cur->has_end) return;
-    double sx, sy, ex, ey;
-    wedge_centroid_pixel(cur->sQ, cur->sR, cur->sSec, cur->hex_size, &sx, &sy);
-    wedge_centroid_pixel(cur->eQ, cur->eR, cur->eSec, cur->hex_size, &ex, &ey);
-    double dx = ex - sx, dy = ey - sy;
-    double dist = sqrt(dx*dx + dy*dy);
-    if (dist < 1e-6) { path_add(p, cur->sQ, cur->sR, cur->sSec); return; }
-    double step = cur->hex_size * 0.25;
-    int n = (int)(dist / step) + 1;
-    for (int i = 0; i <= n; i++) {
-        double t = (double)i / (double)n;
-        double px = sx + t * dx, py = sy + t * dy;
-        int Q, R; double dd;
-        pixel_to_hex(px, py, cur->hex_size, &Q, &R, &dd);
-        double cx, cy; hex_centre_pixel(Q, R, cur->hex_size, &cx, &cy);
-        int s = sector_of(px - cx, py - cy);
-        path_add(p, Q, R, s);
-    }
-}
-
-static void grid_draw(int rows, int cols, const Cursor *cur, int ox, int oy)
+static void ctx_draw_bg(const GridCtx *g)
 {
     double sq3 = sqrt(3.0), sq3_2 = sq3 * 0.5;
-    double limit_inner = 0.5 - BORDER_W;
-    double radius_t    = cur->hex_size * RADIUS_T_FRAC * 0.5;
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            double px = (double)(col - ox) * CELL_W;
-            double py = (double)(row - oy) * CELL_H;
+    double limit_inner = 0.5 - g->border_w;
+    double radius_t    = g->hex_size * g->radius_t_frac * 0.5;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double px = (double)(col - g->ox) * g->cw;
+            double py = (double)(row - g->oy) * g->ch;
             int Q, R; double dist;
-            pixel_to_hex(px, py, cur->hex_size, &Q, &R, &dist);
-            double cx, cy; hex_centre_pixel(Q, R, cur->hex_size, &cx, &cy);
+            pixel_to_hex(px, py, g->hex_size, &Q, &R, &dist);
+            double cx, cy;
+            hex_centre_pixel(Q, R, g->hex_size, &cx, &cy);
             double dxp = px - cx, dyp = py - cy;
             if (dist >= limit_inner) {
                 double theta = atan2(dyp, dxp);
@@ -382,10 +352,10 @@ static void grid_draw(int rows, int cols, const Cursor *cur, int ox, int oy)
                 continue;
             }
             double r0 = fabs(dyp);
-            double r1 = fabs(0.5*dyp - sq3_2*dxp);
-            double r2 = fabs(0.5*dyp + sq3_2*dxp);
+            double r1 = fabs(0.5 * dyp - sq3_2 * dxp);
+            double r2 = fabs(0.5 * dyp + sq3_2 * dxp);
             char rch = '-'; double rmin = r0;
-            if (r1 < rmin) { rmin = r1; rch = '/'; }
+            if (r1 < rmin) { rmin = r1; rch = '/';  }
             if (r2 < rmin) { rmin = r2; rch = '\\'; }
             if (rmin < radius_t) {
                 attron(COLOR_PAIR(PAIR_RADIUS));
@@ -396,41 +366,192 @@ static void grid_draw(int rows, int cols, const Cursor *cur, int ox, int oy)
     }
 }
 
-static void scene_draw(int rows, int cols, const Cursor *cur, const PathPool *p, double fps)
-{
-    erase();
-    int ox = cols / 2, oy = (rows - 1) / 2;
-    grid_draw(rows, cols, cur, ox, oy);
-    path_draw(p, cur->hex_size, ox, oy, rows, cols);
-    if (cur->has_start)
-        marker_draw(cur->sQ, cur->sR, cur->sSec, cur->hex_size, ox, oy, rows, cols, 'S', PAIR_START);
-    if (cur->has_end)
-        marker_draw(cur->eQ, cur->eR, cur->eSec, cur->hex_size, ox, oy, rows, cols, 'E', PAIR_END);
-    {
-        int sc, sr;
-        wedge_to_screen(cur->Q, cur->R, cur->sector, cur->hex_size, ox, oy, &sc, &sr);
-        if (sc >= 0 && sc < cols && sr >= 0 && sr < rows - 1) {
-            attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-            mvaddch(sr, sc, '@');
-            attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
-        }
-    }
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §5  pool                                                                */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
+typedef struct {
+    int  q, r, sector;
+    char glyph;
+    bool alive;
+} Obj;
+
+typedef struct {
+    Obj items[MAX_OBJ];
+    int count;
+} Pool;
+
+static void pool_clear(Pool *p) { p->count = 0; }
+
+static int pool_find(const Pool *p, int q, int r, int sector)
+{
+    for (int i = 0; i < p->count; i++) {
+        if (p->items[i].alive &&
+            p->items[i].q == q && p->items[i].r == r &&
+            p->items[i].sector == sector)
+            return i;
+    }
+    return -1;
+}
+
+static void pool_place(Pool *p, int q, int r, int sector, char glyph)
+{
+    if (p->count >= MAX_OBJ || pool_find(p, q, r, sector) >= 0) return;
+    p->items[p->count++] = (Obj){ q, r, sector, glyph, true };
+}
+
+static void pool_draw(const Pool *p, const GridCtx *g)
+{
+    attron(COLOR_PAIR(PAIR_PATH) | A_BOLD);
+    for (int i = 0; i < p->count; i++) {
+        if (!p->items[i].alive) continue;
+        int sc, sr;
+        ctx_to_screen(g, p->items[i].q, p->items[i].r, p->items[i].sector,
+                      &sc, &sr);
+        if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1)
+            mvaddch(sr, sc, (chtype)(unsigned char)p->items[i].glyph);
+    }
+    attroff(COLOR_PAIR(PAIR_PATH) | A_BOLD);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §6  cursor                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int q, r, sector;
+    int sQ, sR, sSec;
+    int eQ, eR, eSec;
+    int has_start, has_end;
+    int theme, paused;
+} Cursor;
+
+static const int HEX_DIR[4][2] = {
+    { 0, -1 },   /* UP    */
+    { 0, +1 },   /* DOWN  */
+    {-1,  0 },   /* LEFT  */
+    {+1,  0 },   /* RIGHT */
+};
+
+static void cursor_reset(Cursor *cur, const GridCtx *g)
+{
+    (void)g;
+    cur->q = 0; cur->r = 0; cur->sector = 0;
+    cur->has_start = 0; cur->has_end = 0;
+    cur->theme = 0; cur->paused = 0;
+}
+
+static void cursor_move(Cursor *cur, const GridCtx *g, int idx)
+{
+    int nq = cur->q + HEX_DIR[idx][0];
+    int nr = cur->r + HEX_DIR[idx][1];
+    if (nq < -g->max_q || nq > g->max_q) return;
+    if (nr < -g->max_r || nr > g->max_r) return;
+    cur->q = nq; cur->r = nr;
+}
+
+static void cursor_rotate_sector(Cursor *cur, int delta)
+{
+    cur->sector = (cur->sector + delta + 6) % 6;
+}
+
+static void cursor_draw(const Cursor *cur, const GridCtx *g)
+{
+    int sc, sr;
+    ctx_to_screen(g, cur->q, cur->r, cur->sector, &sc, &sr);
+    if (sc >= 0 && sc < g->cols && sr >= 0 && sr < g->rows - 1) {
+        attron(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+        mvaddch(sr, sc, '@');
+        attroff(COLOR_PAIR(PAIR_CURSOR) | A_BOLD);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §7  mode — path state machine + line walk                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * path_compute — pixel-walk between two wedge centroids; for each
+ * sample, identify the (q, r, sector) triple it falls in.
+ */
+static void path_compute(Pool *pool, const Cursor *cur, const GridCtx *g)
+{
+    pool_clear(pool);
+    if (!cur->has_start || !cur->has_end) return;
+    double sx, sy, ex, ey;
+    wedge_centroid_pixel(cur->sQ, cur->sR, cur->sSec, g->hex_size, &sx, &sy);
+    wedge_centroid_pixel(cur->eQ, cur->eR, cur->eSec, g->hex_size, &ex, &ey);
+    double dx = ex - sx, dy = ey - sy;
+    double dist = sqrt(dx*dx + dy*dy);
+    if (dist < 1e-6) {
+        pool_place(pool, cur->sQ, cur->sR, cur->sSec, '*');
+        return;
+    }
+    double step = g->hex_size * 0.25;
+    int n = (int)(dist / step) + 1;
+    for (int i = 0; i <= n; i++) {
+        double t = (double)i / (double)n;
+        double px = sx + t * dx, py = sy + t * dy;
+        int Q, R; double dd;
+        pixel_to_hex(px, py, g->hex_size, &Q, &R, &dd);
+        double cx, cy; hex_centre_pixel(Q, R, g->hex_size, &cx, &cy);
+        int s = sector_of(px - cx, py - cy);
+        pool_place(pool, Q, R, s, '*');
+    }
+}
+
+static void marker_draw(const GridCtx *g, int q, int r, int s,
+                        char glyph, int pair)
+{
+    int sc, sr;
+    ctx_to_screen(g, q, r, s, &sc, &sr);
+    if (sc < 0 || sc >= g->cols || sr < 0 || sr >= g->rows - 1) return;
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvaddch(sr, sc, glyph);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §8  scene                                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+static void hud_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
+                     double fps)
+{
     char buf[128];
     snprintf(buf, sizeof buf,
              " Q:%+d R:%+d sec:%d  path:%d  size:%.0f  theme:%d  %5.1f fps  %s ",
-             cur->Q, cur->R, cur->sector,
-             p->count, cur->hex_size, cur->theme, fps,
+             cur->q, cur->r, cur->sector,
+             p->count, g->hex_size, cur->theme, fps,
              cur->paused ? "PAUSED " : "running");
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - (int)strlen(buf), "%s", buf);
+    mvprintw(0, g->cols - (int)strlen(buf), "%s", buf);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    attron(COLOR_PAIR(PAIR_HINT) | A_DIM);
-    mvprintw(rows - 1, 0,
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(g->rows - 1, 0,
              " arrows:hex  ,/.: sector  s:set-start  e:set-end  spc:clear  +/-:size  t:theme  q:quit  [06 path] ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_DIM);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+static void scene_draw(const GridCtx *g, const Cursor *cur, const Pool *p,
+                       double fps)
+{
+    erase();
+    ctx_draw_bg(g);
+    pool_draw(p, g);
+    if (cur->has_start)
+        marker_draw(g, cur->sQ, cur->sR, cur->sSec, 'S', PAIR_START);
+    if (cur->has_end)
+        marker_draw(g, cur->eQ, cur->eR, cur->eSec, 'E', PAIR_END);
+    cursor_draw(cur, g);
+    hud_draw(g, cur, p, fps);
     wnoutrefresh(stdscr); doupdate();
 }
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §9  screen                                                              */
+/* ═══════════════════════════════════════════════════════════════════════ */
 
 static void screen_cleanup(void) { endwin(); }
 static void screen_init(int theme)
@@ -441,6 +562,10 @@ static void screen_init(int theme)
     color_init(theme); atexit(screen_cleanup);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* §10 app                                                                 */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
 static volatile sig_atomic_t g_running = 1, g_need_resize = 0;
 static void on_signal(int s)
 {
@@ -450,47 +575,77 @@ static void on_signal(int s)
 
 int main(void)
 {
-    signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGWINCH, on_signal);
-    Cursor cur; cursor_reset(&cur);
-    PathPool path; path_clear(&path);
+    signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
+    signal(SIGWINCH, on_signal);
+
+    Cursor cur;
+    Pool   path; pool_clear(&path);
+    GridCtx g;
+
+    cur.q = 0; cur.r = 0; cur.sector = 0;
+    cur.has_start = 0; cur.has_end = 0; cur.theme = 0; cur.paused = 0;
     screen_init(cur.theme);
-    int rows = LINES, cols = COLS;
+    ctx_init(&g, LINES, COLS, HEX_SIZE_DEFAULT);
+    cursor_reset(&cur, &g);
+
     const int64_t FRAME_NS = 1000000000LL / TARGET_FPS;
-    double fps = TARGET_FPS; int64_t t0 = clock_ns();
+    double fps = TARGET_FPS;
+    int64_t t0 = clock_ns();
+
     while (g_running) {
-        if (g_need_resize) { g_need_resize = 0; endwin(); refresh(); rows = LINES; cols = COLS; }
+        if (g_need_resize) {
+            g_need_resize = 0; endwin(); refresh();
+            ctx_init(&g, LINES, COLS, g.hex_size);
+        }
         int ch;
         while ((ch = getch()) != ERR) {
             switch (ch) {
                 case 'q': case 27: g_running = 0; break;
                 case 'p': cur.paused ^= 1; break;
-                case 'r': cursor_reset(&cur); path_clear(&path); color_init(cur.theme); break;
-                case ' ': cur.has_start = 0; cur.has_end = 0; path_clear(&path); break;
-                case 's': cur.sQ = cur.Q; cur.sR = cur.R; cur.sSec = cur.sector;
-                          cur.has_start = 1; path_compute(&path, &cur); break;
-                case 'e': cur.eQ = cur.Q; cur.eR = cur.R; cur.eSec = cur.sector;
-                          cur.has_end = 1; path_compute(&path, &cur); break;
-                case 't': cur.theme = (cur.theme + 1) % N_THEMES; color_init(cur.theme); break;
-                case KEY_UP:    cursor_step_hex(&cur, 0); break;
-                case KEY_DOWN:  cursor_step_hex(&cur, 1); break;
-                case KEY_LEFT:  cursor_step_hex(&cur, 2); break;
-                case KEY_RIGHT: cursor_step_hex(&cur, 3); break;
+                case 'r':
+                    cursor_reset(&cur, &g); pool_clear(&path);
+                    color_init(cur.theme);
+                    break;
+                case ' ':
+                    cur.has_start = 0; cur.has_end = 0; pool_clear(&path);
+                    break;
+                case 's':
+                    cur.sQ = cur.q; cur.sR = cur.r; cur.sSec = cur.sector;
+                    cur.has_start = 1;
+                    path_compute(&path, &cur, &g);
+                    break;
+                case 'e':
+                    cur.eQ = cur.q; cur.eR = cur.r; cur.eSec = cur.sector;
+                    cur.has_end = 1;
+                    path_compute(&path, &cur, &g);
+                    break;
+                case 't':
+                    cur.theme = (cur.theme + 1) % N_THEMES;
+                    color_init(cur.theme);
+                    break;
+                case KEY_UP:    cursor_move(&cur, &g, 0); break;
+                case KEY_DOWN:  cursor_move(&cur, &g, 1); break;
+                case KEY_LEFT:  cursor_move(&cur, &g, 2); break;
+                case KEY_RIGHT: cursor_move(&cur, &g, 3); break;
                 case ',': case '<': cursor_rotate_sector(&cur, -1); break;
                 case '.': case '>': cursor_rotate_sector(&cur, +1); break;
                 case '+': case '=':
-                    if (cur.hex_size < HEX_SIZE_MAX) {
-                        cur.hex_size += HEX_SIZE_STEP; path_compute(&path, &cur);
+                    if (g.hex_size < HEX_SIZE_MAX) {
+                        g.hex_size += HEX_SIZE_STEP;
+                        path_compute(&path, &cur, &g);
                     } break;
                 case '-':
-                    if (cur.hex_size > HEX_SIZE_MIN) {
-                        cur.hex_size -= HEX_SIZE_STEP; path_compute(&path, &cur);
+                    if (g.hex_size > HEX_SIZE_MIN) {
+                        g.hex_size -= HEX_SIZE_STEP;
+                        path_compute(&path, &cur, &g);
                     } break;
             }
         }
         int64_t now = clock_ns();
-        fps = fps * 0.95 + (1e9 / (double)(now - t0 + 1)) * 0.05;
+        fps = fps * (1.0 - FPS_EWMA_ALPHA) +
+              (1e9 / (double)(now - t0 + 1)) * FPS_EWMA_ALPHA;
         t0 = now;
-        scene_draw(rows, cols, &cur, &path, fps);
+        scene_draw(&g, &cur, &path, fps);
         clock_sleep_ns(FRAME_NS - (clock_ns() - now));
     }
     return 0;

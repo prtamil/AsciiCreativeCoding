@@ -6,8 +6,9 @@ top of the existing phase-1 file:
   • GUIDED TUTORIAL         (5-8 numbered tutorials, first principles)
   • MENTAL MODEL block if absent
 
-Already complete: Ai/, algorithms/, animation/, flocking/, matrix_rain/,
-raster/, raymarcher/, raytracing/, robots/, turtle/.
+Already complete: Ai/, algorithms/, animation/, flocking/, fluid/,
+matrix_rain/, raster/, raymarcher/, raytracing/, robots/, signal/,
+turtle/.
 
 ---
 
@@ -16,14 +17,12 @@ raster/, raymarcher/, raytracing/, robots/, turtle/.
 | Folder              | Files | Notes                                          |
 |---------------------|------:|------------------------------------------------|
 | artistic/           |    23 | aesthetic effects (galaxy, aurora, mandalas, hindu/islamic, plasma, etc.) — already mostly phase-1; some are large |
-| fluid/              |    11 | CFD-related (Navier-Stokes, SPH, lattice gas, vorticity, shallow-water).  Note: reaction_diffusion + reaction_wave duplicates with procedural/fields/ — resolve before refactoring. |
 | grids/              |    80 | 8 sub-folders (rect/hex/tri/polar × intro/showcase/placement).  Highly templated; consider whether tutorials are needed per-file or just one canonical reference per category. |
 | particle_systems/   |    19 | fire, fireworks, smoke, rain, snow, comet, fountain, etc.  Note: constellation_learning is a duplicate of constellation. |
 | physics/            |    36 | nbody, cloth, lorenz, double_pendulum, wave, schrodinger, magnetic_field, ising, etc. — large folder, broad scope |
 | procedural/         |    69 | 6 sub-folders (chaos, fields, fractals, generational, patterns, worldgen) |
-| signal/             |     4 | epicycles, fft_vis, fourier_art, fourier_draw — recently created folder |
 
-Total: ~242 files still pending phase-3.
+Total: ~227 files still pending phase-3.
 
 ## Approach when resuming
 

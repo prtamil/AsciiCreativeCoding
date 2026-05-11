@@ -39,6 +39,7 @@
  *   r         randomise all stars
  *   ]  [      faster / slower simulation
  *   c         cycle connection threshold (tight / normal / wide)
+ *   t  T      next / previous theme  (night/aurora/nebula/winter/ember/void/mono)
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra constellation.c -o constellation -lncurses -lm
@@ -47,13 +48,55 @@
  * --------
  *   §1  config   — every tunable constant
  *   §2  clock    — monotonic ns clock + sleep
- *   §3  color    — night-sky palette
+ *   §3  color    — 7 themes × 6 star colours + line + HUD/HINT pairs
  *   §4  coords   — pixel↔cell conversion; the one aspect-ratio fix
  *   §5  star     — pixel-space physics with wander + speed cap
  *   §6  scene    — star pool; tick; Bresenham line draw
  *   §7  screen   — single stdscr buffer + HUD
  *   §8  app      — dt loop, input, resize, cleanup
  */
+
+/* ── HOW TO READ THIS FILE ────────────────────────────────────────────── *
+ *
+ * READING ORDER
+ *   1. CONCEPTS + MENTAL MODEL (below) — algorithm in plain English.
+ *   2. GUIDED TUTORIAL (below) — 8 mini-lessons that build the
+ *      proximity-graph constellation from "what is a star" up to the
+ *      cell_used overlap-prevention grid.
+ *   3. §1 config — every constant you'd tweak when experimenting,
+ *      grouped: simulation / display / themes.
+ *   4. §3 colour — ConstTheme table + theme_apply.  Read this if you
+ *      want to add a new palette; it's the only colour code in the file.
+ *   5. §5 star — pixel-space physics: wander, speed cap, wall reflect.
+ *   6. §6 scene — the per-frame heart: tick + draw + the proximity
+ *      pair-loop + thin-line Bresenham + cell_used grid.
+ *   7. §7 screen / §8 app — ncurses + fixed-step loop boilerplate.
+ *
+ * NAMING
+ *   Star            one drifting point with pos / vel / prev / glyph / hue
+ *   Scene           the star pool + paused + connect_preset + current_theme
+ *   ConstTheme      one palette entry — 6 star hues + 1 line hue
+ *   k_themes[]      7-entry table of palettes
+ *   k_connect_presets[]  3 distance thresholds: tight / normal / wide
+ *   px, py          star position in PIXEL space (sub-cell, float)
+ *   prev_px, prev_py  position at the start of the previous tick
+ *                   (used for render-frame interpolation; see Tutorial #3)
+ *   pw(cols), ph(rows)  cells × CELL_W/H — width/height in PIXELS
+ *   px_to_cell_x/y  the ONE conversion point pixel → terminal cell
+ *   draw_line()     thin Bresenham — one cell per major-axis step
+ *   cell_used[][]   per-frame bool grid: "this line already drew here"
+ *                   prevents mojibake when many lines overlap
+ *
+ * BACKGROUND ASSUMED
+ *   • Bresenham's line algorithm at a "discrete pixel rasterisation"
+ *     level (we use a thin variant — no doubled diagonals).
+ *   • Pixel-space physics vs cell-space rendering — the project-wide
+ *     pattern, also used by bounce_ball.c and the boids files.
+ *   • Fixed-step accumulator + render-frame interpolation (see
+ *     documentation/Architecture.md).
+ *   • Object-pool pattern (Star[STARS_MAX] with `n` active count).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
@@ -77,6 +120,32 @@
  * Math           : Slope character selection from pixel-space angle:
  *                  0–22.5° → '─'; 22.5–67.5° → '╲'/'╱'; 67.5–90° → '│'.
  *                  CONNECT_DIST in pixels; aspect-corrected before comparison.
+ *
+ * Data-structure : Star[STARS_MAX] flat array with `n` ≤ STARS_MAX active.
+ *                  One ConstTheme[] table for palettes; one bool VLA
+ *                  `cell_used[rows][cols]` reset per frame for line
+ *                  overlap-prevention.  No malloc in the hot path; the
+ *                  whole simulation runs out of the static Scene struct
+ *                  plus the per-frame VLA.
+ *
+ * Performance    : O(N²/2) pair scan per frame.  At N=30 → 435 pairs
+ *                  ×  ≤ 200 px per line  = ≤ 87 000 mvaddch's per frame,
+ *                  most short-circuited by the dist² cull.  60 fps is
+ *                  comfortable up to N=80 (3160 pairs).  The cell_used
+ *                  grid adds one bool flag per cell per frame —
+ *                  negligible vs the line draws.
+ *
+ * References     :
+ *   Bresenham, J. E. (1965) — "Algorithm for computer control of a
+ *     digital plotter", *IBM Systems Journal* 4(1):25–30.  The thin-
+ *     line variant here uses the same error-accumulation idea.
+ *   Uhlenbeck & Ornstein (1930) — "On the Theory of the Brownian
+ *     Motion", *Phys. Rev.* 36:823–841.  Source of the bounded-random-
+ *     walk model used for the wander force.
+ *   particle_systems/burst.c — radial-fan sibling: same pool/tick/draw
+ *     framework, different motion model (no wander, explicit drag).
+ *   particle_systems/comet.c — moving-emitter sibling with trails and
+ *     a ground-impact blast.  Uses the same pixel-vs-cell separation.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -174,6 +243,165 @@
  *    /`/` for true diagonal cells; never two diagonal glyphs in a row.
  *  • Stars never escape — bounce off all four walls; verify by
  *    watching the corners.
+ *  • Theme cycle (`t`/`T`): every existing star and line picks up the
+ *    new palette on the very next frame — no flash, no reset.  Try
+ *    cycling rapidly: the lattice never blanks.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ──────────────────────────────────────────────────── *
+ *
+ * Eight mini-lessons.  Read them in order; each ends with the pseudocode
+ * or struct that maps onto a real symbol below.
+ *
+ * ─── 1.  What is a Star?  ──────────────────────────────────────────── *
+ *   The atom of the simulation.  Five floats and one byte:
+ *       float px, py        // position in PIXEL space (sub-cell precision)
+ *       float vx, vy        // velocity, pixels/second
+ *       float prev_px, prev_py  // position at the LAST tick
+ *       char  glyph         // chosen at spawn from "*+o@."
+ *       Hue   pair_id       // which colour pair to use (1..6)
+ *
+ *   No "alive" flag — the active count `Scene.n` tells you which prefix
+ *   of the array matters.  The first n slots are live; the rest are
+ *   unused storage.  This makes "add a star" an O(1) decrement of `n`
+ *   not a pool scan.
+ *
+ *       Star ≡ { pos, vel, prev_pos, glyph, hue }
+ *
+ * ─── 2.  Pixel space vs cell space  ─────────────────────────────────── *
+ *   Terminal cells are roughly 8 × 16 PIXELS in a typical monospace
+ *   font — they're rectangles, not squares.  If you do physics in cell
+ *   space, you have to multiply x-velocities by 2 to make motion look
+ *   visually isotropic.  Easy to forget; easy to get wrong.
+ *
+ *   The project-wide solution: physics in SUB-CELL PIXEL space where
+ *   the units ARE square, then convert to terminal cells ONLY at draw
+ *   time:
+ *
+ *       CELL_W = 8,  CELL_H = 16          // pixels per cell
+ *       pw(cols) = cols × CELL_W           // playable width in pixels
+ *       ph(rows) = rows × CELL_H           // playable height in pixels
+ *       px_to_cell_x(px) = round(px / CELL_W)
+ *       px_to_cell_y(py) = round(py / CELL_H)
+ *
+ *   ONE conversion point, ONE direction.  All other geometry — wall
+ *   reflection, pair distance, line drawing — happens in pixels.  Test
+ *   it: a star moving at (vx=80, vy=80) traces a true 45° line on
+ *   screen, not a 26.5°-flat oval.
+ *
+ * ─── 3.  Render interpolation (lerp, not extrapolate)  ──────────────── *
+ *   The sim runs at fixed steps (e.g. 60 Hz).  The render can fire at
+ *   any rate.  Without interpolation, render frames see the discrete
+ *   sim state — motion JUDDERS when render is faster than sim.
+ *
+ *   Naive fix: extrapolate forward by alpha × velocity.  But our
+ *   wander adds random acceleration each tick — forward prediction
+ *   diverges from the next real tick's position.  So the lattice
+ *   would visibly snap on every tick boundary.
+ *
+ *   Correct fix: keep PREVIOUS position too, and interpolate BACKWARDS:
+ *
+ *       alpha = sim_accum / tick_ns            // ∈ [0, 1)
+ *       draw_px = prev_px + (px − prev_px) × alpha
+ *
+ *   At alpha=0 we render where the star WAS at the last tick boundary.
+ *   At alpha→1 we render where it IS now.  Smooth between.  The render
+ *   is always slightly BEHIND reality, but it never overshoots, so no
+ *   snap-back artifact.
+ *
+ *       prev = curr  // at start of every star_tick
+ *       integrate curr
+ *
+ * ─── 4.  Ornstein-Uhlenbeck wander  ─────────────────────────────────── *
+ *   A constant-velocity star looks dead.  A purely-random-walking star
+ *   shimmers in place.  The Ornstein-Uhlenbeck bounded random walk is
+ *   the goldilocks middle:
+ *
+ *       each tick:
+ *           v.x += uniform(±WANDER_ACCEL) × dt
+ *           v.y += uniform(±WANDER_ACCEL) × dt
+ *           if |v| > SPEED_CAP:
+ *               v *= SPEED_CAP / |v|         // clamp magnitude, keep direction
+ *
+ *   The random kick keeps direction changing slowly; the speed cap
+ *   prevents the cumulative kicks from blowing up.  Net effect: stars
+ *   meander in gentle curves rather than straight lines or noise.
+ *
+ *   Why "Ornstein-Uhlenbeck"?  Their 1930 paper on Brownian motion
+ *   formalised exactly this kind of bounded random walk with a
+ *   restoring force (here, the speed cap acts as the restoring force).
+ *
+ * ─── 5.  Wall reflection (the simplest collision)  ──────────────────── *
+ *   When a star reaches the edge of the playable rectangle:
+ *
+ *       if px < 0          : px = 0;          vx = −vx;
+ *       if px > pw − 1     : px = pw − 1;     vx = −vx;
+ *       if py < 0          : py = 0;          vy = −vy;
+ *       if py > ph − 1     : py = ph − 1;     vy = −vy;
+ *
+ *   Two things at each bound: SNAP back to in-bounds, then NEGATE the
+ *   normal component.  Without the snap, the star sits stuck at the
+ *   bound for one extra frame; without the negate, it would tunnel.
+ *
+ *   This is the dumbest possible collision response and it works
+ *   because the simulation is friction-free — energy never builds up
+ *   to the point where the snap becomes visible.
+ *
+ * ─── 6.  Proximity graph rendering  ─────────────────────────────────── *
+ *   Every frame, scan all C(N, 2) = N(N−1)/2 pairs:
+ *
+ *       for i = 0..n-2:
+ *         for j = i+1..n-1:
+ *           dx = stars[j].px - stars[i].px
+ *           dy = stars[j].py - stars[i].py
+ *           d² = dx*dx + dy*dy
+ *           if d² >= CONNECT_DIST²:  continue       // cull early
+ *           ratio = sqrt(d²) / CONNECT_DIST          // ∈ [0, 1]
+ *           if ratio < 0.50:  draw_line(...,  A_BOLD,    stride=1)
+ *           if ratio < 0.75:  draw_line(...,  A_NORMAL,  stride=1)
+ *           else:             draw_line(...,  A_NORMAL,  stride=2)  // stippled
+ *
+ *   The three brightness BUCKETS are the cheap way to get "lines fade
+ *   with distance" without subpixel rendering or anti-aliasing.  Each
+ *   bucket is a different attribute combo + Bresenham stride.
+ *
+ *   d² < D² instead of d < D — saves a sqrt per pair, fires on 99 %
+ *   of pairs, sqrt only runs for the few that actually draw a line.
+ *
+ * ─── 7.  Thin-line Bresenham + slope glyphs  ─────────────────────────── *
+ *   Vanilla Bresenham at 45° emits TWO cells per step (one horizontal,
+ *   one diagonal) — you see doubled '\\' '\\' or '//' '//' characters.
+ *   Looks like a thick line, not a thin one.
+ *
+ *   The fix: at each step, choose ONE of three glyphs based on which
+ *   axis just advanced:
+ *
+ *       if dx_step and dy_step:   glyph = '\\' or '/'   // (sign of dx·dy)
+ *       if dx_step only:          glyph = '─'           // horizontal
+ *       if dy_step only:          glyph = '│'           // vertical
+ *
+ *   One cell per major-axis step.  At true 45° you see a clean
+ *   diagonal of '\\' or '/'; at near-flat angles you see mostly '─'
+ *   with occasional diagonal "kicks" where the minor axis advances.
+ *
+ * ─── 8.  cell_used: prevent overlap mojibake  ────────────────────────── *
+ *   With N = 30 stars and 435 candidate pairs, multiple lines often
+ *   pass through the SAME cell.  If line A draws '\\' there and line B
+ *   later writes '─' on top, you see '─' — but the eye reads it as a
+ *   missing diagonal.  Bundles of overlapping lines visually fall apart.
+ *
+ *   Fix: a per-frame `bool cell_used[rows][cols]` (VLA, zeroed every
+ *   frame).  When draw_line writes a cell:
+ *
+ *       if cell_used[row][col]:  return     // first writer wins
+ *       cell_used[row][col] = true
+ *       mvaddch(row, col, glyph)
+ *
+ *   The first line to claim a cell keeps it; later lines that pass
+ *   through silently skip.  Result: overlapping lines look like one
+ *   coherent shape, not garbage.  Cost: one bool per cell per frame
+ *   (~12 KB on a 200×60 terminal) — trivial.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -199,7 +427,7 @@ enum {
     SIM_FPS_MAX      = 60,
     SIM_FPS_STEP     =  5,
 
-    HUD_COLS         = 54,
+    HUD_COLS         = 64,   /* widened to fit [theme] suffix             */
     FPS_UPDATE_MS    = 500,
 
     STARS_DEFAULT    = 30,
@@ -208,7 +436,8 @@ enum {
 
     N_STAR_COLORS    =  6,   /* color pairs 1..6 for stars               */
     CONN_PAIR        =  7,   /* color pair for all connection lines       */
-    HUD_PAIR         =  8,   /* color pair for HUD text                  */
+    HUD_PAIR         =  8,   /* bright yellow 226 + A_BOLD — top-right    */
+    HINT_PAIR        =  9,   /* bright cyan   51  + A_BOLD — bottom-left  */
 };
 
 /*
@@ -282,42 +511,144 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Night-sky / constellation palette.
+ * ConstTheme — one palette: 6 star hues + 1 connection-line hue.
  *
- * Stars (pairs 1–6): bright, saturated — each stands out individually.
- * Connection lines (pair 7): single dim steel-blue so the graph reads
- *   as background structure, not competing with the stars.
- * HUD (pair 8): yellow for easy readability.
+ * Every theme reassigns the SAME seven color pair IDs (1..7), so live
+ * stars and connection lines auto-pick the new colour on the next
+ * mvaddch — no needs_clear, no full redraw required.  HUD/HINT pairs
+ * sit at 8/9, untouched by theme cycling.
  *
- * 8-color fallback maps to the nearest named color.
+ * All entries are in the BRIGHT HALF of the 256-colour cube per the
+ * CLAUDE.md "Theme Palette Brightness" rule (24+ and 244+ only).
  */
-static void color_init(void)
+typedef struct {
+    const char *name;
+    int         star_fg256[6];
+    int         star_fg8  [6];
+    int         conn_fg256;
+    int         conn_fg8;
+} ConstTheme;
+
+#define N_THEMES  7
+
+static const ConstTheme k_themes[N_THEMES] = {
+    /* The classic — was the only palette before theme support was added. */
+    { "night",
+      {  15,  51,  39, 201, 147, 159 },
+      { COLOR_WHITE,  COLOR_CYAN,  COLOR_BLUE,
+        COLOR_MAGENTA, COLOR_CYAN,  COLOR_WHITE },
+      24,  COLOR_BLUE },
+
+    /* Greens and teals — northern-lights vibe. */
+    { "aurora",
+      {  46,  51,  87, 119, 156, 158 },
+      { COLOR_GREEN, COLOR_CYAN,  COLOR_CYAN,
+        COLOR_GREEN, COLOR_GREEN, COLOR_CYAN },
+      30,  COLOR_GREEN },
+
+    /* Saturated magentas / pinks — a star-forming region. */
+    { "nebula",
+      { 201, 207, 213, 219, 225, 159 },
+      { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA,
+        COLOR_MAGENTA, COLOR_MAGENTA, COLOR_CYAN },
+      91,  COLOR_MAGENTA },
+
+    /* Cool blues + whites — clear winter sky. */
+    { "winter",
+      { 195, 159, 153, 117,  75,  39 },
+      { COLOR_WHITE, COLOR_CYAN, COLOR_CYAN,
+        COLOR_CYAN,  COLOR_BLUE, COLOR_BLUE },
+      24,  COLOR_BLUE },
+
+    /* Warm reds → oranges → yellows — campfire / brazier sky. */
+    { "ember",
+      { 226, 220, 214, 208, 202, 196 },
+      { COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW,
+        COLOR_RED,    COLOR_RED,    COLOR_RED },
+      130, COLOR_RED },
+
+    /* Deep indigos + cool whites — empty-space void. */
+    { "void",
+      { 252, 248, 141, 105,  99,  63 },
+      { COLOR_WHITE, COLOR_WHITE, COLOR_BLUE,
+        COLOR_BLUE,  COLOR_BLUE,  COLOR_BLUE },
+      53,  COLOR_BLUE },
+
+    /* Whites + light greys — minimalist / B&W photograph. */
+    { "mono",
+      { 255, 253, 252, 250, 248, 246 },
+      { COLOR_WHITE, COLOR_WHITE, COLOR_WHITE,
+        COLOR_WHITE, COLOR_WHITE, COLOR_WHITE },
+      244, COLOR_WHITE },
+};
+
+/*
+ * theme_apply — bind the 7 rendering pair IDs (1..7) to one theme.
+ * Called from color_init at startup and from the t/T key handler.
+ * Pairs 8 (HUD) and 9 (HINT) are NOT touched; they live forever
+ * once color_init initialises them.
+ */
+static void theme_apply(int theme)
+{
+    const ConstTheme *th = &k_themes[theme];
+    if (COLORS >= 256) {
+        for (int i = 0; i < 6; i++)
+            init_pair(1 + i, th->star_fg256[i], COLOR_BLACK);
+        init_pair(CONN_PAIR, th->conn_fg256, COLOR_BLACK);
+    } else {
+        for (int i = 0; i < 6; i++)
+            init_pair(1 + i, th->star_fg8[i],   COLOR_BLACK);
+        init_pair(CONN_PAIR, th->conn_fg8,   COLOR_BLACK);
+    }
+}
+
+/*
+ * color_init — start_color + theme_apply + theme-independent HUD/HINT.
+ *
+ * HUD/HINT pairs (8/9) get bright yellow / bright cyan per the CLAUDE.md
+ * HUD standard — both drawn with A_BOLD, never A_DIM, so they remain
+ * legible against any theme's star palette.
+ */
+static void color_init(int theme)
 {
     start_color();
+    use_default_colors();
+    theme_apply(theme);
     if (COLORS >= 256) {
-        init_pair(1,  15, COLOR_BLACK);   /* bright white   — star */
-        init_pair(2,  51, COLOR_BLACK);   /* bright cyan    — star */
-        init_pair(3,  39, COLOR_BLACK);   /* cornflower     — star */
-        init_pair(4, 201, COLOR_BLACK);   /* hot magenta    — star */
-        init_pair(5, 147, COLOR_BLACK);   /* light purple   — star */
-        init_pair(6, 159, COLOR_BLACK);   /* pale cyan      — star */
-        init_pair(7,  24, COLOR_BLACK);   /* steel blue     — connection lines */
-        init_pair(8, 226, COLOR_BLACK);   /* yellow         — HUD  */
+        init_pair(HUD_PAIR,  226, -1);    /* bright yellow */
+        init_pair(HINT_PAIR,  51, -1);    /* bright cyan   */
     } else {
-        init_pair(1, COLOR_WHITE,   COLOR_BLACK);
-        init_pair(2, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(3, COLOR_BLUE,    COLOR_BLACK);
-        init_pair(4, COLOR_MAGENTA, COLOR_BLACK);
-        init_pair(5, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(6, COLOR_WHITE,   COLOR_BLACK);
-        init_pair(7, COLOR_BLUE,    COLOR_BLACK);   /* connections */
-        init_pair(8, COLOR_YELLOW,  COLOR_BLACK);   /* HUD         */
+        init_pair(HUD_PAIR,  COLOR_YELLOW, -1);
+        init_pair(HINT_PAIR, COLOR_CYAN,   -1);
     }
 }
 
 /* ===================================================================== */
 /* §4  coords — the one place aspect ratio is handled                    */
 /* ===================================================================== */
+
+/*
+ * §4 PREAMBLE — pixel ↔ cell, the project's ROOT FIX
+ * ────────────────────────────────────────────────────
+ *
+ * Terminal cells are about 8 × 16 PIXELS in a typical monospace font —
+ * a 1:2 aspect ratio.  If physics ran in CELL coordinates, every x
+ * velocity would need a × 2 multiplier to make motion look isotropic.
+ * That's the project-wide trap this file (and bounce_ball.c, boids,
+ * comet.c, raster) all avoid the same way:
+ *
+ *     PHYSICS  in PIXEL space   (square units)
+ *     RENDER   in CELL space    (terminal characters)
+ *     ONE conversion point      px_to_cell_x / px_to_cell_y
+ *
+ * Below this section, NO code outside §5 star_spawn touches CELL_W or
+ * CELL_H directly — everything goes through pw, ph, or the px_to_cell
+ * helpers.  That discipline is what keeps the aspect-ratio fix
+ * contained; break it and motion will start to look skewed.
+ *
+ * pw, ph        cell count → pixel count (multiplication)
+ * px_to_cell_*  pixel → terminal cell (round-half-up division)
+ */
 
 /*
  * Pixel-space extents from terminal dimensions.
@@ -343,6 +674,31 @@ static inline int px_to_cell_y(float py)
 /* ===================================================================== */
 /* §5  star                                                               */
 /* ===================================================================== */
+
+/*
+ * §5 PREAMBLE — the actor
+ * ────────────────────────
+ *
+ * A Star is the atom of the simulation: position + velocity + glyph +
+ * colour.  Per CLAUDE.md's pixel-vs-cell rule (§4 preamble), position
+ * lives in PIXEL space.  The prev_px / prev_py pair stores the position
+ * AT THE LAST TICK so the renderer can interpolate sub-frame motion.
+ *
+ * Three operations:
+ *   star_spawn  fill a freshly-allocated Star at startup or on resize
+ *   star_tick   advance one star by dt (wander + cap + integrate + reflect)
+ *   (no star_draw — that lives in §6 scene_draw alongside the pair loop)
+ *
+ * No allocation: STARS_MAX live in Scene.stars[]; Scene.n controls how
+ * many are active.  Adding a star is `n++`; removing is `n--`.  No
+ * pool scan, no free list.
+ *
+ * COORDINATE SYSTEMS USED HERE
+ *   (px, py)            current pixel position
+ *   (prev_px, prev_py)  pixel position at the last completed tick
+ *   (vx, vy)            velocity, pixels/second
+ *   max_px, max_py      playable rectangle bounds, pw(cols)-1, ph(rows)-1
+ */
 
 /*
  * Star — all positions and velocities live in PIXEL SPACE.
@@ -374,6 +730,52 @@ typedef struct {
 static const char k_star_chars[] = "*+o@.";
 static const int  k_n_star_chars = (int)(sizeof k_star_chars - 1);
 
+/*
+ * star_spawn — initialise one Star at startup, on resize, or on 'r'.
+ *
+ * PURPOSE
+ *   Place a star at a random position INSIDE the playable rectangle
+ *   (with a 1-cell margin) and give it a uniformly-distributed random
+ *   direction.  Glyph and colour pair are deterministic from the
+ *   index — colour cycles 1..6, glyph cycles "*+o@.", so 30 stars
+ *   show all 6 colours and 5 glyphs without rand() flicker.
+ *
+ * PSEUDOCODE
+ *   pxw, pxh = pw(cols), ph(rows)                  // pixel extent
+ *   px = uniform(CELL_W,  pxw − CELL_W)             // 1-cell margin
+ *   py = uniform(CELL_H,  pxh − CELL_H)
+ *   prev_px, prev_py = px, py                       // no past at spawn
+ *   (dx, dy) = REJECTION-SAMPLE inside unit disk    // uniform angle
+ *   speed    = uniform(SPEED_MIN, SPEED_MAX)
+ *   v        = (dx, dy) / |(dx, dy)| · speed        // normalise to speed
+ *   colour, glyph = deterministic from idx
+ *
+ * MENTAL MODEL
+ *   The rejection-sample is the textbook "uniform direction without
+ *   trig" trick: pick (dx, dy) uniformly in the unit SQUARE, reject if
+ *   outside the unit DISK or too close to (0, 0).  Renormalising
+ *   accepted samples gives uniform angle.  Picking vx, vy independently
+ *   would over-represent diagonals (the square's corners are 41% farther
+ *   from the origin than its edges — those become biased directions).
+ *
+ *   The margin (CELL_W on each side) prevents stars spawning ON the
+ *   wall.  Without it, the first tick would already reflect them — a
+ *   visible "snap into bounds" on startup.
+ *
+ * INPUTS / OUTPUTS
+ *   s       ← Star struct to fill (mutated)
+ *   idx     → which slot this star occupies; drives colour + glyph
+ *   cols, rows → terminal extent (cells)
+ *
+ * UNITS
+ *   px, py:   pixels (sub-cell precision)
+ *   speed:    pixels/second (typically 50..120)
+ *
+ * WHY IT EXISTS (vs inlining in scene_init)
+ *   The 'r' (randomise) key calls this on each star.  The resize handler
+ *   calls it on out-of-bounds stars.  Three call sites, three different
+ *   reasons; one shared implementation.
+ */
 static void star_spawn(Star *s, int idx, int cols, int rows)
 {
     int pxw = pw(cols);
@@ -407,16 +809,51 @@ static void star_spawn(Star *s, int idx, int cols, int rows)
 }
 
 /*
- * star_tick() — advance one star by dt seconds in pixel space.
+ * star_tick — advance one star one frame.
  *
- * Steps each tick:
- *   1. Save current position into prev (used for lerp in draw).
- *   2. Apply wander: random acceleration nudge makes paths curve gently.
- *   3. Clamp speed to SPEED_CAP (wander can accumulate otherwise).
- *   4. Integrate velocity → position.
- *   5. Elastic wall bounce (flip velocity component, clamp position).
+ * PURPOSE
+ *   The per-frame physics for ONE star.  Five steps in fixed order;
+ *   getting the order wrong (e.g. integrating BEFORE the speed cap)
+ *   produces visible artifacts.
  *
- * All units are pixels and pixels/second.  No cell coordinates here.
+ * PSEUDOCODE
+ *   prev_px, prev_py = px, py                       // save for lerp (Tut #3)
+ *   v += uniform(±WANDER_ACCEL) · dt                 // O-U wander (Tut #4)
+ *   if |v| > SPEED_CAP: v *= SPEED_CAP / |v|         // magnitude-only clamp
+ *   px += vx · dt;  py += vy · dt                    // explicit Euler
+ *   for each wall:                                    // reflect (Tut #5)
+ *     if px out of [0, max_px]: clamp + negate vx
+ *     if py out of [0, max_py]: clamp + negate vy
+ *
+ * MENTAL MODEL
+ *   Each tick is one step of the bounded random walk.  The wander
+ *   nudge is small (±20 px/s² · dt ≈ ±0.33 px/s per frame at 60 Hz),
+ *   so direction changes slowly.  The speed cap is the ONLY thing
+ *   keeping cumulative wander from blowing up to infinity — without
+ *   it, after a few seconds every star would be pinned to a wall.
+ *
+ *   Wall reflection is the SIMPLEST collision response: SNAP into
+ *   bounds, then NEGATE the normal component of velocity.  Two ops,
+ *   one direction each.  Don't forget the snap — without it, a star
+ *   that overshoots stays out-of-bounds for one frame, then bounces
+ *   back next frame, then bounces again — a visible jitter at the wall.
+ *
+ * INPUTS / OUTPUTS
+ *   s       ← Star to advance (mutated)
+ *   dt      → frame time, seconds (typically 1/60)
+ *   max_px  → pw(cols)-1, the right wall in pixels
+ *   max_py  → ph(rows)-1, the bottom wall in pixels
+ *
+ * UNITS
+ *   dt:        seconds
+ *   wander:    pixels/second² (random kick magnitude)
+ *   speed cap: pixels/second
+ *
+ * WHY IT EXISTS (vs inlining in scene_tick)
+ *   scene_tick stays at "for each star: tick" — one line.  All the
+ *   per-star physics (and there's a fair bit) lives here as one unit.
+ *   If we ever wanted to swap wander for a different force model
+ *   (gravity? attractor?), only this function changes.
  */
 static void star_tick(Star *s, float dt, float max_px, float max_py)
 {
@@ -453,11 +890,37 @@ static void star_tick(Star *s, float dt, float max_px, float max_py)
 /* §6  scene                                                              */
 /* ===================================================================== */
 
+/*
+ * §6 PREAMBLE — orchestrator + the heart
+ * ───────────────────────────────────────
+ *
+ * The Scene owns the star pool, the running configuration (paused state,
+ * connect preset, current theme), and two operations:
+ *
+ *   scene_tick   advance every star by dt — pure state mutation, no I/O
+ *   scene_draw   render one frame at sub-frame alpha — pure rendering
+ *
+ * Plus one helper (draw_line) that the pair loop in scene_draw uses.
+ *
+ * The TICK/DRAW SPLIT is the cleanest separation in this file.  Tick
+ * never touches ncurses; draw never mutates state (const Scene *).
+ * This means:
+ *   - tick runs at fixed Hz; draw runs at render Hz; they don't fight
+ *   - debug overlays can be added inside draw without touching physics
+ *   - render frames can interpolate between tick boundaries (Tutorial #3)
+ *
+ * The pair loop in scene_draw is the algorithmic heart — O(N²/2)
+ * inner-loop iterations per frame.  Skim through it with Tutorials
+ * #6 (proximity graph) and #8 (cell_used) in mind; it should read
+ * directly out of those pseudocode blocks.
+ */
+
 typedef struct {
     Star  stars[STARS_MAX];
     int   n;
     bool  paused;
     int   connect_preset;   /* index into k_connect_presets */
+    int   current_theme;    /* index into k_themes[]        */
 } Scene;
 
 static void scene_init(Scene *sc, int cols, int rows)
@@ -465,10 +928,53 @@ static void scene_init(Scene *sc, int cols, int rows)
     memset(sc, 0, sizeof *sc);
     sc->n              = STARS_DEFAULT;
     sc->connect_preset = 1;   /* "normal" */
+    sc->current_theme  = 0;   /* "night"  */
     for (int i = 0; i < sc->n; i++)
         star_spawn(&sc->stars[i], i, cols, rows);
 }
 
+/*
+ * scene_tick — advance every active star by dt.
+ *
+ * PURPOSE
+ *   The full physics step for one frame.  Trivial because all the work
+ *   is delegated to star_tick (per-star) — scene_tick just walks the
+ *   active prefix of the pool and converts cell extents to pixel
+ *   bounds.
+ *
+ * PSEUDOCODE
+ *   if paused:  return
+ *   max_px = pw(cols) − 1            // right wall in pixels
+ *   max_py = ph(rows) − 1            // bottom wall in pixels
+ *   for i = 0..n-1:
+ *     star_tick(stars[i], dt, max_px, max_py)
+ *
+ * MENTAL MODEL
+ *   The "active prefix" pattern: stars 0..n-1 are live; stars n..MAX-1
+ *   are unused storage.  Adding a star with '+' bumps n by 1 (the slot
+ *   already exists and was last touched at startup, so its state is
+ *   whatever it was).  Removing with '-' decrements n — the star
+ *   silently disappears, no resource to free.
+ *
+ *   No inter-star physics here.  Stars don't see each other during
+ *   tick — only at DRAW time, when the proximity-graph pair scan
+ *   reads their positions to decide which pairs get lines.
+ *
+ * INPUTS / OUTPUTS
+ *   sc          ← Scene (mutated: every active star advances by dt)
+ *   dt          → frame time, seconds
+ *   cols, rows  → terminal extent (cells)
+ *
+ * UNITS
+ *   dt:           seconds
+ *   max_px/py:    pixels — derived from cells via pw/ph
+ *
+ * WHY IT EXISTS (vs inlining the loop in app's main)
+ *   Same pattern as comet.c: keep app's main loop at orchestrator level
+ *   (read input, tick, draw, sleep).  Encapsulating physics inside
+ *   scene_tick means a future test harness or batch renderer can drive
+ *   the same Scene without dragging in ncurses or signals.
+ */
 static void scene_tick(Scene *sc, float dt, int cols, int rows)
 {
     if (sc->paused) return;
@@ -481,30 +987,78 @@ static void scene_tick(Scene *sc, float dt, int cols, int rows)
 }
 
 /*
- * draw_line() — per-step character selection + stipple + first-writer wins.
+ * draw_line — thin Bresenham with slope glyphs, stipple, and overlap skip.
  *
- * Character is chosen at each Bresenham step from the LOCAL movement,
- * not the overall line angle:
+ * PURPOSE
+ *   Rasterise one segment from (x0, y0) to (x1, y1) using ONE cell per
+ *   major-axis step (Tutorial #7), pick a slope-matched glyph at every
+ *   step from the LOCAL movement (not the overall angle), apply the
+ *   stipple stride for distance fade (Tutorial #6 bucket 3), and respect
+ *   the `used` bool grid so multiple overlapping lines don't garble
+ *   each other (Tutorial #8).
  *
- *   Shallow (adx ≥ ady) — loop advances one column per step:
- *     next step will move y  →  '\' or '/'   (true diagonal step)
- *     next step keeps y      →  '-'           (horizontal run)
+ * PSEUDOCODE
+ *   adx, ady = |x1-x0|, |y1-y0|
+ *   sx, sy   = sign(x1-x0), sign(y1-y0)
+ *   diag     = (sx*sy > 0) ? '\\' : '/'      // fixed for the whole line
  *
- *   Steep (ady > adx) — loop advances one row per step:
- *     next step will move x  →  '\' or '/'   (true diagonal step)
- *     next step keeps x      →  '|'           (vertical run)
+ *   if adx == 0 and ady == 0:                // degenerate same-cell
+ *     try-write 'diag' at (x0, y0);  return
  *
- * The diagonal direction ('\' vs '/') is fixed for the whole line:
- *   sx * sy > 0  (right-down or left-up)   →  '\'
- *   sx * sy < 0  (right-up  or left-down)  →  '/'
+ *   if adx >= ady:                            // SHALLOW: one cell per column
+ *     err = adx / 2
+ *     for x in [x0 .. x1]  step sx:
+ *       glyph = (next_err < 0) ? diag : '-'   // pick BEFORE advancing y
+ *       try-write glyph at (x, y0)
+ *       step++; err -= ady; if err < 0: y0 += sy; err += adx
+ *   else:                                     // STEEP: one cell per row
+ *     err = ady / 2
+ *     for y in [y0 .. y1]  step sy:
+ *       glyph = (next_err < 0) ? diag : '|'
+ *       try-write glyph at (x0, y)
+ *       step++; err -= adx; if err < 0: x0 += sx; err += ady
  *
- * This guarantees at most one diagonal character per row (shallow) or
- * per column (steep) — no doubled '\\'  or '//' anywhere.
+ *   try-write(x, y, glyph):
+ *     if out of bounds OR step % stipple != 0 OR used[y][x]: skip
+ *     used[y][x] = true
+ *     mvaddch(y, x, glyph)
  *
- * `used` is a flat [rows × cols] bool grid; cells already drawn are
- * skipped so overlapping connections do not overwrite each other.
+ * MENTAL MODEL
+ *   Standard Bresenham emits a cell per axis step.  At 45° BOTH axes
+ *   advance every step, so you get two cells per step → the doubled
+ *   diagonal artifact.  Thin-Bresenham emits exactly ONE cell per
+ *   MAJOR-axis step; the minor axis ride-along is folded into the
+ *   glyph selection ('\\'/'/' when it advances, '-'/'|' when it doesn't).
  *
- * Out-of-bounds cells are silently skipped.
+ *   Stipple: instead of antialiasing (which terminals can't do), draw
+ *   only every Nth cell.  stipple=1 means every cell (solid line);
+ *   stipple=2 means every other cell (fading line).  The eye reads
+ *   the stippled lines as "further away" or "fading".
+ *
+ *   The `used` cell grid is the OVERLAP fix.  Without it: line A draws
+ *   '\\' at cell (10, 5); later line B passes through and draws '─' on
+ *   top — you see '─' and the diagonal is gone.  Multiplied across
+ *   dozens of overlapping lines, the lattice becomes a smudged mess.
+ *
+ * INPUTS / OUTPUTS
+ *   w           → destination WINDOW (typically stdscr)
+ *   x0, y0      → segment start in CELL coords
+ *   x1, y1      → segment end   in CELL coords
+ *   attr        → ncurses attribute bundle (COLOR_PAIR + maybe A_BOLD)
+ *   stipple     → 1 = solid; 2 = every other cell; N = every Nth
+ *   cols, rows  → bounds for clipping + indexing `used`
+ *   used        ← flat rows·cols bool grid; mutated (cells get marked)
+ *
+ * UNITS
+ *   All coordinates in CELL space (caller already converted from pixels).
+ *
+ * WHY IT EXISTS (vs inlining one big nested loop in scene_draw)
+ *   Bresenham + thin-line + stipple + overlap-skip in one function is
+ *   long enough that inlining it inside the pair loop would push that
+ *   loop past 100 lines and make the bucket-selection logic harder to
+ *   read.  Splitting also lets the FLASH cross (if we ever add one)
+ *   reuse the same thin Bresenham — just call draw_line with sample
+ *   coordinates from a fixed pattern.
  */
 static void draw_line(WINDOW *w,
                       int x0, int y0, int x1, int y1,
@@ -566,24 +1120,73 @@ static void draw_line(WINDOW *w,
 }
 
 /*
- * scene_draw() — render one frame at interpolated time alpha.
+ * scene_draw — render one frame at sub-frame interpolation alpha.
  *
- * alpha ∈ [0.0, 1.0) is the fractional tick elapsed since the last
- * physics step.  Used to lerp each star between its previous and current
- * tick position:
+ * PURPOSE
+ *   The full per-frame rendering: lerp every star's draw position,
+ *   sweep all C(n, 2) pairs and draw connection lines for pairs
+ *   within CONNECT_DIST, then paint star glyphs on top.  No state
+ *   mutation — `Scene *` is const throughout.
  *
- *   draw_px = prev_px + (px - prev_px) * alpha
- *   draw_py = prev_py + (py - prev_py) * alpha
+ * PSEUDOCODE
+ *   PHASE A — pre-compute lerp'd positions:
+ *     for i = 0..n-1:
+ *       dpx[i] = prev_px + (px - prev_px) · alpha       // pixel space
+ *       dpy[i] = prev_py + (py - prev_py) · alpha
+ *       dcx[i] = px_to_cell_x(dpx[i])  (clamped to [0, cols))
+ *       dcy[i] = px_to_cell_y(dpy[i])  (clamped to [0, rows))
  *
- * Draw order:
- *   1. Connection lines first (drawn into background).
- *   2. Stars after — overwriting any line that passed through the cell —
- *      so star symbols are always fully visible on top of lines.
+ *   PHASE B — connection lines (proximity graph, Tutorial #6):
+ *     cell_used[rows][cols] = 0
+ *     for i = 0..n-2:
+ *       for j = i+1..n-1:
+ *         d² = (dpx[j]-dpx[i])² + (dpy[j]-dpy[i])²
+ *         if d² >= CONNECT_DIST²:  continue           // cull, no sqrt
+ *         ratio = sqrt(d²) / CONNECT_DIST
+ *         (attr, stipple) = bucket(ratio)             // 3-tier brightness
+ *         draw_line(dcx[i], dcy[i], dcx[j], dcy[j],
+ *                    attr, stipple, cell_used)
  *
- * Connection line style by normalised distance ratio = dist / connect_dist:
- *   ratio < 0.50  →  A_BOLD, stipple 1 (every cell)      bright, close
- *   ratio < 0.75  →  normal, stipple 1 (every cell)      medium
- *   ratio < 1.00  →  normal, stipple 2 (every 2nd cell)  fading, far
+ *   PHASE C — stars on top (so glyphs are never hidden by lines):
+ *     for i = 0..n-1:
+ *       mvaddch(dcy[i], dcx[i], stars[i].ch, stars[i].color | A_BOLD)
+ *
+ * MENTAL MODEL
+ *   Two arrays (dpx, dpy) cache the pixel-space lerp; two more (dcx,
+ *   dcy) cache the cell-space rounded positions.  Pre-computing means
+ *   the pair loop only does floating-point math on the distance test,
+ *   then hands integer cell coords to draw_line.  At N=80 stars,
+ *   3160 pairs each doing 2 floats + 1 cmp + 1 sqrt (only if close)
+ *   is well under any modern CPU's frame budget.
+ *
+ *   The order — lines first, stars last — is the painter's algorithm.
+ *   Stars are the foreground; they must overwrite line glyphs that
+ *   pass through their cell.  Reverse the order and stars would
+ *   sometimes hide behind a '\\' or '-'.
+ *
+ *   cell_used is per-frame (zeroed at the start of phase B) and is
+ *   the only allocation in the hot path — a stack VLA sized to the
+ *   current terminal.  See Tutorial #8 for the "why first-writer
+ *   wins" rationale.
+ *
+ * INPUTS / OUTPUTS
+ *   sc          → Scene to read (const — never mutated)
+ *   w           → destination WINDOW
+ *   cols, rows  → terminal extent, used for bounds + cell_used sizing
+ *   alpha       → ∈ [0.0, 1.0); 0 = at last tick, 1 = at next tick
+ *
+ * UNITS
+ *   dpx, dpy:   pixels (interpolated)
+ *   dcx, dcy:   cells (rounded)
+ *   ratio:      dimensionless, ∈ [0, 1]
+ *
+ * WHY IT EXISTS (vs splitting into scene_draw_lines + scene_draw_stars)
+ *   The cache arrays (dpx/dpy/dcx/dcy) are computed once at the top
+ *   and read by both the line loop and the star loop.  Splitting
+ *   would require either re-computing the lerp twice (wasted work)
+ *   or threading a cached-positions struct through both halves
+ *   (more typing for no clarity gain).  At ~70 lines this function
+ *   reads cleanly top-to-bottom as one pipeline.
  */
 static void scene_draw(const Scene *sc, WINDOW *w,
                        int cols, int rows, float alpha)
@@ -675,7 +1278,7 @@ typedef struct {
     int rows;
 } Screen;
 
-static void screen_init(Screen *s)
+static void screen_init(Screen *s, int theme)
 {
     initscr();
     noecho();
@@ -684,7 +1287,7 @@ static void screen_init(Screen *s)
     nodelay(stdscr, TRUE);
     keypad(stdscr, TRUE);
     typeahead(-1);      /* never interrupt output to check for input    */
-    color_init();
+    color_init(theme);
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
@@ -697,6 +1300,13 @@ static void screen_resize(Screen *s)
     getmaxyx(stdscr, s->rows, s->cols);
 }
 
+/*
+ * HUD layout per CLAUDE.md:
+ *   row 0           — fps + stars + conn + spd + theme + state, bright bold yellow (top-right)
+ *   row rows-1      — every interactive key listed, bright bold cyan (bottom-left)
+ * Both pairs (HUD_PAIR=8, HINT_PAIR=9) are theme-independent — they live
+ * outside the 1..7 range that theme_apply touches.
+ */
 static void screen_draw(Screen *s, const Scene *sc,
                         double fps, int sim_fps, float alpha)
 {
@@ -705,16 +1315,23 @@ static void screen_draw(Screen *s, const Scene *sc,
 
     char buf[HUD_COLS + 1];
     snprintf(buf, sizeof buf,
-             "%5.1f fps  stars:%-2d  conn:%-6s  spd:%-2d  %s",
+             " %5.1f fps  stars:%-2d  conn:%-6s  spd:%-2d  [%s]  %s ",
              fps, sc->n,
              k_connect_names[sc->connect_preset],
              sim_fps,
+             k_themes[sc->current_theme].name,
              sc->paused ? "PAUSED " : "running");
-    int hud_x = s->cols - HUD_COLS;
+    int hud_x = s->cols - (int)strlen(buf);
     if (hud_x < 0) hud_x = 0;
     attron(COLOR_PAIR(HUD_PAIR) | A_BOLD);
     mvprintw(0, hud_x, "%s", buf);
     attroff(COLOR_PAIR(HUD_PAIR) | A_BOLD);
+
+    attron(COLOR_PAIR(HINT_PAIR) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q/ESC:quit  spc:pause  +/-:stars  c:connect"
+             "  r:randomise  ]/[:speed  t/T:theme ");
+    attroff(COLOR_PAIR(HINT_PAIR) | A_BOLD);
 }
 
 static void screen_present(void)
@@ -791,6 +1408,15 @@ static bool app_handle_key(App *app, int ch)
         sc->connect_preset = (sc->connect_preset + 1) % N_CONNECT_PRESETS;
         break;
 
+    case 't':
+        sc->current_theme = (sc->current_theme + 1) % N_THEMES;
+        theme_apply(sc->current_theme);
+        break;
+    case 'T':
+        sc->current_theme = (sc->current_theme + N_THEMES - 1) % N_THEMES;
+        theme_apply(sc->current_theme);
+        break;
+
     case ']':
         app->sim_fps += SIM_FPS_STEP;
         if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
@@ -819,7 +1445,7 @@ int main(void)
     app->running = 1;
     app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
+    screen_init(&app->screen, app->scene.current_theme);
     scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
     int64_t frame_time  = clock_ns();

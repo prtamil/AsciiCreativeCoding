@@ -1,6 +1,6 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * newfire.c  —  aalib aafire algorithm, ncurses framework
+ * aafire_port.c  —  aalib aafire algorithm, ncurses framework
  *
  * This is a faithful port of the aafire algorithm from aalib, rewritten
  * without the aalib dependency and rendered through the same dithering +
@@ -58,14 +58,50 @@
  *
  * Sections
  * --------
- *   §1  config
- *   §2  clock
+ *   §1  config         — constants, color pair IDs, fuel/timing knobs
+ *   §2  clock          — monotonic timer + sleep
  *   §3  theme + LUT + dithering pipeline  (shared with fire.c)
- *   §4  bitmap  — uint8 heat buffer + aalib CA
- *   §5  scene
- *   §6  screen  — single stdscr
- *   §7  app
+ *   §4  bitmap         — uint8 heat buffer + aalib CA (the algorithm)
+ *   §5  scene          — owns the Bitmap, pause/clear state
+ *   §6  screen         — single stdscr, HUD + hint draw
+ *   §7  app            — fixed-step loop, key dispatch
+ *
+ * For Phase-3 readers: the prose blocks above this section list
+ * (CONCEPTS + MENTAL MODEL) and below it (HOW TO READ THIS FILE +
+ * GUIDED TUTORIAL) are the textbook layer.  The CA itself is the
+ * code from §4 onwards.
  */
+
+/* ── HOW TO READ THIS FILE ────────────────────────────────────────────── *
+ *
+ * READING ORDER
+ *   1. CONCEPTS + MENTAL MODEL (below) — the algorithm in plain English.
+ *   2. GUIDED TUTORIAL (below) — 8 mini-lessons that build the algorithm
+ *      from "why does fire rise" up to the full aafire pipeline.
+ *   3. §1 config — every constant you'd tweak when experimenting.
+ *   4. §4 bitmap — the heart of the algorithm.  Read in this order:
+ *        gentable() → drawfire() → firemain() → bitmap_draw().
+ *   5. §3 theme + LUT + dithering — the rendering layer.
+ *   6. §7 app — the standard fixed-timestep loop + key dispatch.
+ *
+ * NAMING (where short names survive from the aalib port)
+ *   bmap        uint8 heat grid (the physics state — "bitmap" in aalib speak)
+ *   table[s]    decay lookup: cooled output value for a sum-of-5-neighbours s
+ *   prev[]      last frame's heat, used for diff-based clearing
+ *   dither[]    float work buffer for Floyd-Steinberg error diffusion
+ *   height      frame counter; fuel intensity caps grow during warm-up
+ *   i1, i2      arch-sweep counters (i1 = 1, 5, 9, …; i2 = 4·cols+1, …)
+ *   minus       cooling-per-row constant in the decay table = max(1, 800/rows)
+ *   cap         per-column arch-shape ceiling = min(i1, i2, height)
+ *   last1       running random heat value within one seeding burst
+ *
+ * BACKGROUND ASSUMED
+ *   • Plain C, pointer arithmetic, fixed-size arrays.
+ *   • Cellular automata at a "Game of Life" level (a cell is a function of
+ *     its neighbours).
+ *   • The ncurses double-buffer pattern.  See CLAUDE.md "Core Architecture".
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
@@ -86,6 +122,23 @@
  *                  visible banding when mapping to the ASCII char palette.
  *                  Perceptual LUT: heat → ramp index chosen to match human
  *                  perceived brightness rather than linear heat value.
+ *
+ * Data-structure : Single uint8 grid `bmap[(rows+2) * cols]` (the +2 rows
+ *                  are fuel that firemain() reads from).  A precomputed
+ *                  decay table `table[1280]` for the cooling-and-averaging
+ *                  step.  `prev[]` mirror for diff-based clearing.  No
+ *                  per-frame heap allocations; the whole state is O(cols·rows).
+ *
+ * Performance    : Two O(cols·rows) sweeps per tick (drawfire + firemain)
+ *                  plus one O(cols·rows) sweep for dither+render.  At
+ *                  ~120×40 terminal that's ~14 400 byte ops/tick.  60 fps
+ *                  is easy; the bottleneck is mvaddch, not the CA.
+ *
+ * References     :
+ *   Jan "Yarrick" Olszak, aalib 1.4 (aafire.c, 1999)
+ *     https://aa-project.sourceforge.net/aalib/
+ *   Fabien Sanglard, "How Doom Fire was Done" (2014)
+ *   Floyd & Steinberg, "An Adaptive Algorithm for Spatial Greyscale" (1976)
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -162,8 +215,109 @@
  *  • Pause then unpause; the flame must continue from its current state,
  *    not flash to a fresh seed.
  *  • Every theme should preserve the silhouette — only colours change.
- *  • The HUD line at row 0 should remain readable; ramp_attr for the
- *    hottest index always sets A_BOLD.
+ *  • The HUD line at row 0 should remain readable in bright bold yellow;
+ *    the bottom hint at row rows-1 should remain readable in bright bold
+ *    cyan.  Both pairs are independent of the theme palette.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── GUIDED TUTORIAL ──────────────────────────────────────────────────── *
+ *
+ * Eight mini-lessons.  Read them in order; each ends with the pseudocode
+ * line that maps onto a real function below.
+ *
+ * ─── 1.  Why does fire look like THAT?  ──────────────────────────────── *
+ *   Real fire is a continuous gas under gravity:
+ *       - hot gas is less dense, so it rises;
+ *       - it mixes with cooler air on the way up, so it cools;
+ *       - the brightest part is where reactions are still going (the base).
+ *   So a fire "image" has a bright base, vertical streaks (rising columns),
+ *   and flickering edges (turbulent mixing).  We DON'T simulate gas
+ *   physics.  We capture the SHAPE OF THE OBSERVATION with a tiny CA.
+ *
+ * ─── 2.  Heat as a byte grid  ────────────────────────────────────────── *
+ *   Represent each terminal cell as one uint8 in [0..255]:
+ *       0   = cold/background
+ *       255 = white-hot core
+ *   Render by mapping byte ranges to characters " .:+x*X#@".  A 2-D grid
+ *   of these bytes IS the simulation state.  No particles, no floats in
+ *   the hot path, no per-frame allocation.
+ *
+ *        bmap[y][x]: uint8 ∈ [0, 255]
+ *
+ * ─── 3.  The 5-neighbour stencil  ────────────────────────────────────── *
+ *   To make heat RISE, write a cell as the smoothed average of cells
+ *   BELOW it.  aafire picks five neighbours — 3 in y+1, 2 in y+2:
+ *
+ *                    ·   ·   ·          ← y    (writing here)
+ *                    a   b   c          ← y+1
+ *                    d       e          ← y+2  (NO centre cell!)
+ *
+ *   Why skip the centre on y+2?  Leaving it out biases the stencil
+ *   toward the SIDES of the cell directly below — that's what produces
+ *   blob-shaped tongues of flame instead of straight vertical lines.
+ *
+ *        new[x,y] = (a + b + c + d + e) / 5     minus a constant for cooling
+ *
+ * ─── 4.  The decay table  ────────────────────────────────────────────── *
+ *   The division by 5 averages the [0..1275] sum back into [0..255].
+ *   The "minus a constant" is the cooling per row:
+ *
+ *        minus = 800 / rows     (small for tall screens, big for short ones)
+ *
+ *   Subtracting BEFORE dividing concentrates cooling on LOW sums, which is
+ *   exactly where we want fire to die — at the cold edges.  Build it once
+ *   at startup as a 1280-entry lookup; no division in the inner loop:
+ *
+ *        table[i] = max(0, (i - minus) / 5)     for i = 0 .. 1279
+ *
+ * ─── 5.  Fuel-row seeding (the arch)  ────────────────────────────────── *
+ *   The bottom two rows are FUEL.  Each tick, fill them with random heat
+ *   so the CA above has something to propagate.  But a UNIFORM fuel row
+ *   gives a flat-bottomed flame.  aafire produces the iconic dome shape
+ *   with a SWEEP:
+ *       i1 grows from 1 (small at the left edge)
+ *       i2 shrinks from 4·cols+1 (small at the right edge)
+ *       min(i1, i2) is the per-column ceiling
+ *       min(..., height) clamps during warm-up so flames start small
+ *
+ *           heat ceiling
+ *               ▁▂▃▄▅▆▇█▇▆▅▄▃▂▁     ← the arch
+ *               └───── cols ─────┘
+ *
+ *        cap         = min(i1, i2, height)
+ *        bmap[fuel,x]= rand() % cap × fuel_scale
+ *
+ * ─── 6.  Why gamma + dithering?  ─────────────────────────────────────── *
+ *   Mapping uint8 directly to 9 ramp characters gives visible banding —
+ *   the eye can tell where one band ends and the next begins.  Two fixes:
+ *       gamma:  v = (heat/255)^(1/2.2)
+ *               compresses bright values, expands dark ones; matches
+ *               perceived brightness rather than physical heat.
+ *       dither: distribute quantisation error to neighbours
+ *               (Floyd-Steinberg) so the bands break into a textured
+ *               gradient.
+ *   Without these the flame looks like cheap retro graphics.  With them
+ *   it looks like a continuous-tone image.
+ *
+ * ─── 7.  Diff-clearing vs erase()  ───────────────────────────────────── *
+ *   Calling erase() every frame retransmits the entire screen — flicker
+ *   on slow terminals.  Instead we keep prev[] = last frame's heat, and
+ *   write ' ' ONLY for cells that went from hot to cold.  Most frames
+ *   only touch a handful of cells; ncurses' own diff layer barely notices.
+ *
+ *        if (prev[i] > 0 && now[i] == 0)   mvaddch(' ');
+ *
+ * ─── 8.  Putting it together  ────────────────────────────────────────── *
+ *   Per tick:
+ *        drawfire()    seed fuel rows                       (§4)
+ *        firemain()    propagate via 5-neighbour stencil    (§4)
+ *        bitmap_draw() gamma + dither + LUT + paint         (§4)
+ *
+ *   60 ticks per second × the CA's locality = a fire that feels alive
+ *   without any actual fluid dynamics.  The whole simulation fits in
+ *   ~250 lines of code; everything else in this file is rendering
+ *   pipeline and framework glue.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -237,6 +391,19 @@ static void clock_sleep_ns(int64_t ns)
  */
 static const char k_ramp[] = " .:+x*X#@";
 #define RAMP_N (int)(sizeof k_ramp - 1)
+
+/*
+ * HUD/HINT color pairs sit AFTER the theme palette so theme cycling
+ * (which only touches CP_BASE..CP_BASE+RAMP_N-1) never clobbers them.
+ *
+ *   PAIR_HUD  — bright yellow 226 (8-color fallback: COLOR_YELLOW)
+ *   PAIR_HINT — bright cyan   51  (8-color fallback: COLOR_CYAN)
+ *
+ * Both drawn with A_BOLD per CLAUDE.md HUD standard — never A_DIM, so the
+ * lines stay legible against the brightest theme.
+ */
+#define PAIR_HUD  (CP_BASE + RAMP_N)
+#define PAIR_HINT (CP_BASE + RAMP_N + 1)
 
 static const float k_lut_breaks[RAMP_N] = {
     0.000f, 0.080f, 0.180f, 0.290f, 0.390f,
@@ -322,7 +489,16 @@ static void theme_apply(int t)
             init_pair(CP_BASE+i, th->fg8[i],   COLOR_BLACK);
     }
 }
-static void color_init(int theme) { start_color(); theme_apply(theme); }
+static void color_init(int theme)
+{
+    start_color();
+    use_default_colors();
+    theme_apply(theme);
+
+    /* HUD pairs are theme-independent — init ONCE, theme_apply leaves them alone. */
+    init_pair(PAIR_HUD,  COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
+}
 
 static attr_t ramp_attr(int i, int theme)
 {
@@ -693,19 +869,26 @@ static void screen_draw(Screen *s, Scene *sc, double fps, int sfps)
     }
     scene_draw(sc, s->cols, s->rows);
 
-    /* HUD */
+    /*
+     * HUD layout per CLAUDE.md:
+     *   row 0           — fps + sim-state in bright bold yellow (top-right)
+     *   row rows-1      — every interactive key in bright bold cyan (bottom)
+     * Both use dedicated pairs so theme cycling can't change their colour.
+     */
     char buf[HUD_COLS+1];
     snprintf(buf, sizeof buf,
-             "%4.1f fps  [%s]  fuel:%.2f  sim:%d",
+             " %4.1f fps  [%s]  fuel:%.2f  sim:%d ",
              fps, k_themes[sc->bmap.theme].name, sc->bmap.fuel, sfps);
-    int hx = s->cols - HUD_COLS;
+    int hx = s->cols - (int)strlen(buf);
     if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(CP_BASE + RAMP_N - 1) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
     mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(CP_BASE + RAMP_N - 1) | A_BOLD);
-    attron(COLOR_PAIR(CP_BASE + 2));
-    mvprintw(1, hx, "space=pause  t=theme  g/G=fuel  ]/[=speed");
-    attroff(COLOR_PAIR(CP_BASE + 2));
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q/ESC:quit  space:pause  t:theme  g/G:fuel  ]/[:speed ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 

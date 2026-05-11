@@ -52,11 +52,52 @@
  *   + / =      faster (speed multiplier ×2)
  *   -          slower (÷2)
  *   ] / [      raise / lower tick Hz
+ *   d / D      next / previous debug overlay
+ *              (normal / velocity / heatmap / divergence)
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra particle_systems/curl_noise_particles.c \
  *       -o curl_noise_particles -lncurses -lm
  */
+
+/* ── HOW TO READ THIS FILE ────────────────────────────────────────────── *
+ *
+ * READING ORDER
+ *   1. CONCEPTS + MENTAL MODEL (below) — algorithm in plain English.
+ *   2. GUIDED TUTORIAL (below) — 9 mini-lessons that build curl noise
+ *      from scratch: lattice noise → fBm → curl identity → particle
+ *      advection.
+ *   3. §1 config — every constant you'd tweak.  pattern_params[] is
+ *      the table that defines CALM/TURBULENT/HURRICANE/WIND_TUNNEL.
+ *   4. §4 noise — Perlin 2-D scaffold + fBm octave loop.  Read this
+ *      first to understand what the curl is being computed FROM.
+ *   5. §5 curl — finite-difference curl + pattern-specific overlays.
+ *      This is the heart of the algorithm; reads as ~40 lines.
+ *   6. §6 particle — the actor struct (no logic, just storage).
+ *   7. §7 scene — pool + tick + draw orchestration.
+ *   8. §8 screen / §9 app — ncurses + fixed-step loop boilerplate.
+ *
+ * NAMING
+ *   perm[]                256-element Perlin permutation table
+ *   perlin2d(x, y)        a single 2-D Perlin sample ∈ roughly [-1, 1]
+ *   fbm2(x, y, oct)       fractional Brownian motion = sum of octaves
+ *   curl_velocity_at(...) (∂fBm/∂y, −∂fBm/∂x) via central differences
+ *   Particle              one tracer point + a 4-position ring buffer
+ *   trail[]               ring buffer: previous N positions for rendering
+ *   PatternParams         CALM/TURBULENT/HURRICANE/WIND_TUNNEL knobs
+ *   field_mag             scale applied to curl-derived velocity
+ *   drift_x, drift_y      noise input "scroll" per second (time evolution)
+ *
+ * BACKGROUND ASSUMED
+ *   • Perlin noise at a "lattice + interpolated gradient" level.
+ *     If new to noise, the GUIDED TUTORIAL #2 walks the whole construction.
+ *   • Partial derivatives + the central-difference formula
+ *     (f(x+h) − f(x−h)) / 2h.
+ *   • The vector calculus identity curl(∇φ) = 0 in some form — the
+ *     reason curl noise produces divergence-free flow.
+ *   • Object-pool pattern (fixed array + active flag, no malloc).
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── CONCEPTS ──────────────────────────────────────────────────────────── *
  *
@@ -268,6 +309,150 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── GUIDED TUTORIAL ──────────────────────────────────────────────────── *
+ *
+ * Nine mini-lessons.  Read them in order; each ends with the pseudocode
+ * or formula that maps onto a real symbol below.
+ *
+ * ─── 1.  Why fake a fluid?  ─────────────────────────────────────────── *
+ *   Real fluids obey Navier-Stokes — a coupled PDE system that needs
+ *   a pressure solve every tick (fluid/navier_stokes.c does this in
+ *   ~1000 lines).  The visual look you actually want — smooth swirling
+ *   particles, no clumps, no holes — needs just ONE property:
+ *
+ *       div v = 0     ("the field is incompressible")
+ *
+ *   No conservation of momentum, no viscosity, no pressure projection.
+ *   If you can generate any v(x, y, t) with div v ≡ 0, particles
+ *   advected through it look fluid-like.  Curl noise is the cheap
+ *   way to manufacture exactly that v.
+ *
+ * ─── 2.  Perlin noise in 60 seconds  ────────────────────────────────── *
+ *   Perlin noise is a smooth random-ish 2-D function with values in
+ *   roughly [−1, 1].  Construction:
+ *
+ *       1. Pick a 256-element random permutation perm[].
+ *       2. For each integer lattice point (xi, yi), hash the index
+ *          into perm[] to pick one of 8 unit gradient vectors.
+ *       3. For a sample at (x, y):
+ *            (xi, yi) = (floor x, floor y)
+ *            (fx, fy) = (x − xi, y − yi)       // local fractional pos
+ *            For each of the 4 corners (xi+0/1, yi+0/1):
+ *              dot the corner's gradient with (fx − dx, fy − dy)
+ *          Bilinearly interpolate the 4 dots using the QUINTIC fade
+ *          curve t³(6t² − 15t + 10) for C² continuity.
+ *
+ *   The fade curve matters: without it, derivatives have visible kinks
+ *   at lattice boundaries, and the curl picks them up as bogus sources.
+ *
+ *       perlin2d(x, y)  ∈  ≈ [−0.7, +0.7]
+ *
+ * ─── 3.  fBm — adding octaves for richer noise  ─────────────────────── *
+ *   A single Perlin sample gives noise at ONE spatial frequency.  Real
+ *   fluid eddies span many scales.  fBm (fractional Brownian motion)
+ *   stacks multiple Perlin samples at doubling frequencies:
+ *
+ *       fbm(x, y, octaves) = Σᵢ  perlin(x · 2ⁱ, y · 2ⁱ) · 0.5ⁱ
+ *                           i=0..octaves-1
+ *
+ *   Each octave doubles the frequency and HALVES the amplitude.  The
+ *   sum has detail at every scale up to `octaves`.  At octaves=4 you
+ *   see one big swirl with small eddies inside it — exactly the fluid
+ *   look.  CALM uses 2 octaves; TURBULENT uses 4.
+ *
+ * ─── 4.  The curl identity in 2-D  ──────────────────────────────────── *
+ *   The clever step.  In 2-D, define a velocity field FROM a scalar
+ *   field ψ by:
+ *
+ *       v_x =  ∂ψ/∂y
+ *       v_y = −∂ψ/∂x
+ *
+ *   This is called the STREAM FUNCTION construction.  Take its
+ *   divergence:
+ *
+ *       div v = ∂v_x/∂x + ∂v_y/∂y
+ *             = ∂²ψ/∂x∂y − ∂²ψ/∂y∂x
+ *             = 0          (mixed partials are equal — Schwarz's theorem)
+ *
+ *   So this v is divergence-free BY CONSTRUCTION, for any sufficiently
+ *   smooth ψ.  Choose ψ = fBm and you get a fluid-like velocity field
+ *   without solving any PDE.
+ *
+ * ─── 5.  Central-difference curl (numerical part)  ──────────────────── *
+ *   We can't take symbolic derivatives of fBm (it's defined by a sum
+ *   of hash lookups).  But fBm is smooth, so finite differences work:
+ *
+ *       ∂ψ/∂x ≈ (ψ(x+h, y) − ψ(x−h, y)) / (2h)        ← central diff
+ *       ∂ψ/∂y ≈ (ψ(x, y+h) − ψ(x, y−h)) / (2h)
+ *
+ *   Cost: 4 fBm evaluations per particle per tick (one per offset).
+ *   Choice of h matters:
+ *       too small → numerical precision lost; curl becomes noisy
+ *       too large → over-smoothed; loses local structure
+ *   h = 0.5 cells in physical space hits the sweet spot for our
+ *   pattern frequencies.
+ *
+ * ─── 6.  Divergence-free = "particles can't pile up"  ───────────────── *
+ *   Why is div v = 0 the magic property?  Imagine an infinitesimal
+ *   box around a point.  In Navier-Stokes terms, mass conservation
+ *   says (flux out) − (flux in) = (rate of mass accumulating inside).
+ *   For an incompressible fluid that rate is 0 → flux in = flux out.
+ *
+ *   For our particles: if the velocity field has a SINK (div < 0),
+ *   particles flow toward that point and CLUMP.  If a SOURCE (div > 0),
+ *   they fly away leaving a HOLE.  Either looks wrong.  div = 0
+ *   everywhere means neither happens — the swarm stays evenly
+ *   distributed regardless of how long you run the simulation.
+ *
+ * ─── 7.  Toroidal wrap (no death, no exit)  ─────────────────────────── *
+ *   Particles drift continuously — what happens at the screen edge?
+ *   Two bad options:
+ *       (a) DESTROY at edge → swarm thins out and the screen empties.
+ *       (b) REFLECT at edge → noise field still flows OUTWARD against
+ *           the reflected motion → particles pile up at the boundary.
+ *   The right answer: WRAP.  px = (px + cols) mod cols.  A particle
+ *   exiting the right re-enters from the left.  Treat the screen as
+ *   a torus.  The noise field is conceptually infinite anyway, so
+ *   nothing visual breaks at the seam.
+ *
+ *       px = fmodf(px + cols, cols)        // safe for negative
+ *       py = fmodf(py + rows, rows)
+ *
+ * ─── 8.  Trail ring buffer + speed-coloured ramp  ───────────────────── *
+ *   A single moving dot is barely visible at 60 fps.  Each particle
+ *   keeps a fixed-size ring buffer of its last 4 positions:
+ *
+ *       trail[0] = pos at t-3       ← OLDEST (dimmest)
+ *       trail[1] = pos at t-2
+ *       trail[2] = pos at t-1
+ *       trail[3] = pos at t          ← HEAD (brightest)
+ *
+ *   Each tick: shift down, write current pos to trail[3].  Render
+ *   trail[0..3] with increasing brightness so you SEE the streamline.
+ *
+ *   Colour comes from current SPEED (|v|), mapped to an 8-slot ramp:
+ *       slow particles dim, fast particles bright.
+ *   Speed varies across the field — fast where streamlines bunch up,
+ *   slow where they spread.  The colour gradient makes the field's
+ *   structure visible without overlaying arrows.
+ *
+ * ─── 9.  Pattern overlays — adding flavour without breaking div-free  ─ *
+ *   The base curl noise is one flow type.  Three pattern overlays
+ *   layer extra velocity on top:
+ *
+ *       HURRICANE:    v += ω × (p − centre)   // rotation, still div-free
+ *                     (rotation preserves area — see vorticity theorems)
+ *       WIND_TUNNEL:  v += (WIND, 0)            // uniform drift, ∂vₓ/∂x = 0
+ *       TURBULENT:    no overlay; just more octaves on fBm
+ *       CALM:         no overlay; just FEWER octaves
+ *
+ *   Both HURRICANE and WIND_TUNNEL preserve incompressibility because
+ *   their added fields are also div-free (a uniform field has zero
+ *   divergence; a rigid rotation has zero divergence).  The particle
+ *   distribution stays even.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
@@ -470,8 +655,99 @@ static void color_init(void)
 }
 
 /* ===================================================================== */
+/* §3b debug overlays — turn the simulation into a learning instrument   */
+/* ===================================================================== */
+
+/*
+ * Four rendering modes cycle with d/D.  Each makes one concept visible:
+ *
+ *   DBG_NORMAL      production view — trails + heads, speed-coloured.
+ *
+ *   DBG_VELOCITY    each particle's head replaced with an ASCII arrow
+ *                   showing the local v direction.  You can SEE the
+ *                   streamlines: arrows align along curves, not noise.
+ *
+ *   DBG_HEATMAP     full-screen sweep — sample fBm(x, y, t) at every
+ *                   cell, shade by value.  Lets you see the scalar
+ *                   field ψ that the curl is computed FROM.  Bright
+ *                   ridges = high ψ; dark valleys = low ψ.  Particles
+ *                   follow the contours (perpendicular to ∇ψ).
+ *
+ *   DBG_DIVERGENCE  full-screen sweep — compute div v at every cell
+ *                   via 4 curl_velocity_at samples.  The mathematical
+ *                   identity guarantees div v ≡ 0 ANALYTICALLY; here
+ *                   we see only the NUMERICAL truncation error of the
+ *                   central-difference scheme.  Most cells should be
+ *                   nearly empty (div ≈ 0).  Bright spots = where the
+ *                   finite-difference approximation hits a high-curvature
+ *                   region of the fBm.  Pedagogical use: visually
+ *                   verify the curl identity at runtime.
+ *
+ * The global lets us thread the mode into scene_draw without changing
+ * every signature.  Same pattern as burst.c — file-scope state, no
+ * physics dependency, never persists across runs.
+ */
+typedef enum {
+    DBG_NORMAL     = 0,
+    DBG_VELOCITY   = 1,
+    DBG_HEATMAP    = 2,
+    DBG_DIVERGENCE = 3,
+    DBG_COUNT      = 4,
+} DebugMode;
+
+static const char *const k_debug_names[DBG_COUNT] = {
+    "normal", "velocity", "heatmap", "divergence",
+};
+
+static DebugMode g_debug = DBG_NORMAL;
+
+/*
+ * dir_char — velocity vector → 8-octant ASCII arrow.
+ *
+ * Eight octants centred on cardinals; positive y is DOWN in screen
+ * coords so the diagonals look rotated relative to math convention.
+ * Returns '.' for zero velocity.
+ */
+static char dir_char(float vx, float vy)
+{
+    static const char k_dirs[8] = { '>', '\\', 'v', '/', '<', '\\', '^', '/' };
+    if (vx == 0.0f && vy == 0.0f) return '.';
+    float a = atan2f(vy, vx);
+    if (a < 0.0f) a += 2.0f * (float)M_PI;
+    int idx = (int)((a + (float)M_PI / 8.0f) / ((float)M_PI / 4.0f)) & 7;
+    return k_dirs[idx];
+}
+
+/* ===================================================================== */
 /* §4  noise — Perlin scaffold (copied inline per self-contained-file)   */
 /* ===================================================================== */
+
+/*
+ * §4 PREAMBLE — building the scalar field ψ
+ * ──────────────────────────────────────────
+ *
+ * Curl noise needs ψ(x, y): a smooth, randomly-textured 2-D scalar
+ * field.  This section builds ψ from scratch using two layers:
+ *
+ *   perlin2d(x, y)         ONE octave — one frequency, [-1..+1] range
+ *   fbm2(x, y, octaves)    SUM of octaves at doubling frequencies
+ *                          (1×, 2×, 4×, 8× ...) and halving amplitudes
+ *
+ * The Perlin layer is the textbook implementation: 256-entry
+ * permutation table + hashed gradient vectors + quintic fade.  Why
+ * inline it instead of #include-ing a noise.h?  Per CLAUDE.md project
+ * rule: every .c file is one program — no shared headers, no module
+ * dependencies.  The cost is ~50 lines of duplicated noise scaffold
+ * in every file that uses Perlin.  The benefit is that a learner
+ * reading this file sees the FULL algorithm without chasing pointers.
+ *
+ * The QUINTIC fade function t³(6t² − 15t + 10) is the C²-continuous
+ * smoothstep.  This file uses curl-noise: it differentiates the field
+ * twice (once for ∂ψ/∂x, once for ∂ψ/∂y).  If the fade were only
+ * C¹-continuous (cubic), those derivatives would have visible kinks
+ * at lattice boundaries, and the curl would show spurious sources
+ * exactly where you don't want them.  See GUIDED TUTORIAL #2.
+ */
 
 static uint8_t perm[512];
 
@@ -501,6 +777,46 @@ static inline float grad2(int hash, float x, float y)
     return ((h & 1) ? -u : u) + ((h & 2) ? -2.0f * v : 2.0f * v);
 }
 
+/*
+ * perlin2d — one Perlin noise sample at (x, y).
+ *
+ * PURPOSE
+ *   The atom of the noise field.  Returns a smoothly-interpolated
+ *   value in roughly [-1, +1] that has C²-smooth derivatives everywhere
+ *   (so the curl this file computes from fBm of it is well-defined).
+ *
+ * PSEUDOCODE
+ *   (X, Y)       = (floor x, floor y)   AND  with 255 (perm-table size)
+ *   (fx, fy)     = (x − X, y − Y)        // local fractional in [0, 1)
+ *   (u, v)       = quintic_fade(fx, fy)
+ *   At each of 4 corners (X+dx, Y+dy), dx,dy ∈ {0, 1}:
+ *     g_corner   = grad2(perm-hashed-index, fx − dx, fy − dy)
+ *   noise       = bilerp(g_00, g_10, g_01, g_11, u, v)
+ *   return noise
+ *
+ * MENTAL MODEL
+ *   At every integer lattice point a hidden gradient vector points in
+ *   some direction.  At a sample point (x, y), the contribution from
+ *   each lattice corner is "dot product of that corner's gradient
+ *   with the displacement TO our sample".  Bilinearly weight the
+ *   four corner contributions using the quintic-smoothed fractional
+ *   position.  The result is locally smooth (no jumps), zero exactly
+ *   at lattice corners (because the displacement is zero there), and
+ *   randomly textured between.
+ *
+ * INPUTS / OUTPUTS
+ *   x, y    → sample coordinates (any float, lattice spacing is 1.0)
+ *   return  → noise value in approximately [-1, +1]; mean ≈ 0
+ *
+ * UNITS
+ *   The "lattice unit" — one unit of x or y corresponds to one
+ *   perm[] cell.  fbm2 scales x and y by `freq` to put more or fewer
+ *   lattice cells per pixel.
+ *
+ * WHY IT EXISTS (vs using libnoise or an open_simplex.h)
+ *   Self-contained-file rule.  Also pedagogical: a reader sees the
+ *   ENTIRE algorithm in 14 lines.  No black-box noise function.
+ */
 static float perlin2d(float x, float y)
 {
     int X = (int)floorf(x) & 255;
@@ -516,6 +832,48 @@ static float perlin2d(float x, float y)
     return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
 }
 
+/*
+ * fbm2 — fractional Brownian motion = sum of Perlin octaves.
+ *
+ * PURPOSE
+ *   Stack N copies of perlin2d at doubling frequencies and halving
+ *   amplitudes, then normalise.  The result has interesting structure
+ *   at multiple scales — one big swirl with smaller eddies inside it
+ *   inside it inside it.  Real turbulence has the same scaling
+ *   (Kolmogorov's −5/3 law); fBm approximates it cheaply.
+ *
+ * PSEUDOCODE
+ *   total, amp, freq, max_amp = 0, 1, 1, 0
+ *   for o in 0..octaves-1:
+ *       total   += amp · perlin2d(x · freq, y · freq)
+ *       max_amp += amp
+ *       amp     *= 0.5
+ *       freq    *= 2.0
+ *   return (total / max_amp) · 0.5    // normalise to roughly [-0.5, +0.5]
+ *
+ * MENTAL MODEL
+ *   Octave 0 is the BIG eddies (one full wavelength across the screen).
+ *   Octave 1 adds eddies HALF the size at HALF the amplitude.
+ *   Octave 2 quarter-size, quarter-amplitude.  Etc.
+ *   By octave 4, the smallest features are sub-cell — adding more
+ *   octaves only adds noise that the screen can't display, so we cap
+ *   at 4–5 for performance + visible benefit.
+ *
+ *   CALM uses 2 octaves: clean broad swirls.
+ *   TURBULENT uses 4: complex small-scale chop.  The visual difference
+ *   is dramatic from a one-int change.
+ *
+ * INPUTS / OUTPUTS
+ *   x, y     → sample coordinates (caller scales by `freq` separately)
+ *   octaves  → octave count, typically 2..5
+ *   return   → noise value, approximately [-0.5, +0.5]
+ *
+ * WHY IT EXISTS (vs computing curl from a single perlin2d call)
+ *   Single-octave noise has only one spatial frequency.  The curl
+ *   field then has a uniform feature size — every eddy is the same
+ *   size.  Visually unsatisfying.  fBm gives the multi-scale eddies
+ *   that read as "fluid" instead of "abstract grid pattern".
+ */
 /* fBm with N octaves. Returns roughly [-0.5, 0.5]. */
 static float fbm2(float x, float y, int octaves)
 {
@@ -534,17 +892,97 @@ static float fbm2(float x, float y, int octaves)
 /* ===================================================================== */
 
 /*
- * curl_velocity_at — sample the curl-noise velocity field at the
- * given physical position.
+ * §5 PREAMBLE — turning the scalar field into a velocity field
+ * ─────────────────────────────────────────────────────────────
  *
- * v = (+∂N/∂y, -∂N/∂x)
+ * §4 builds ψ(x, y, t) = fBm of a time-shifted lattice.  §5 turns it
+ * into v(x, y, t) by taking the 2-D curl:
  *
- * Computed by 4 fBm samples (central differences with step CURL_H).
- * Plus pattern-specific additions: time-drift handled by caller (the
- * noise input includes time offset); global rotation and wind bias
- * applied here as additive velocity terms.
+ *      v_x =  ∂ψ/∂y      v_y = −∂ψ/∂x
  *
- * Returns velocity in PHYSICAL coords (caller converts y back to cells).
+ * The whole section is one function — curl_velocity_at — because
+ * curl is one operation.  Pattern-specific overlays (HURRICANE
+ * rotation, WIND_TUNNEL bias) are added INSIDE this function rather
+ * than in a separate step, because they're algebraically just extra
+ * velocity terms that compose with the curl.
+ *
+ * Coordinate-system note: this section works in PHYSICAL space (cells
+ * scaled by ASPECT_Y on the y-axis) so the fBm sees square units.
+ * Without that, the curl would be biased — y derivatives would be
+ * "denser" than x derivatives by a factor of 2 (CELL_H / CELL_W).
+ * The caller (scene_tick) converts cell-space ↔ physical space at
+ * the boundary, NOT inside the curl function.
+ */
+
+/*
+ * curl_velocity_at — sample the curl-noise velocity at one position.
+ *
+ * PURPOSE
+ *   The algorithm's HEART.  Given a position (px_phys, py_phys) and
+ *   the current simulation time t, return the velocity v that an
+ *   advected particle should follow.  v is the 2-D curl of a
+ *   time-drifting fBm, plus pattern-specific overlays for the
+ *   HURRICANE and WIND_TUNNEL variants.
+ *
+ * PSEUDOCODE
+ *   k, tx, ty = pp.fbm_freq, t·pp.time_drift_x, t·pp.time_drift_y
+ *
+ *   // Four fBm samples — east, west, north, south of (px, py).
+ *   n_xp = fbm2((px + h)·k + tx, py·k + ty, octaves)
+ *   n_xm = fbm2((px − h)·k + tx, py·k + ty, octaves)
+ *   n_yp = fbm2(px·k + tx, (py + h)·k + ty, octaves)
+ *   n_ym = fbm2(px·k + tx, (py − h)·k + ty, octaves)
+ *
+ *   // Central-difference partial derivatives.
+ *   ∂ψ/∂x = (n_xp − n_xm) / (2h)
+ *   ∂ψ/∂y = (n_yp − n_ym) / (2h)
+ *
+ *   // The curl identity: (∂ψ/∂y, −∂ψ/∂x).
+ *   v_x =  ∂ψ/∂y · field_mag
+ *   v_y = −∂ψ/∂x · field_mag
+ *
+ *   // Pattern overlays.
+ *   if pp.global_rot > 0:      v += ω × (p − screen_centre)
+ *   if pp.wind_bias != 0:      v_x += pp.wind_bias
+ *
+ * MENTAL MODEL
+ *   Four fBm taps + two subtractions + two divides = full curl.
+ *   That is THE WHOLE PHYSICS — no Navier-Stokes, no pressure solve.
+ *   The cost is 4 · octaves Perlin lookups per particle per tick;
+ *   at N=400 particles × 4 octaves × 4 taps = 6400 Perlin lookups
+ *   per tick, ~12 ms/sec at 60 Hz on a modern CPU.
+ *
+ *   Time drift: by ADDING t·drift to the noise input, we shift the
+ *   lattice each frame.  Particles re-sample at the same screen
+ *   position but find a slightly-different field.  The streamlines
+ *   morph slowly; the swarm follows.  Without drift the field is
+ *   STATIC — particles flow forever along the same fixed streamlines,
+ *   which looks dead after a few seconds.
+ *
+ *   HURRICANE overlay (`v += ω × r`) adds a rigid rotation around the
+ *   centre.  Rotation is div-free (rotating a region preserves area),
+ *   so it composes safely with the curl-noise base without breaking
+ *   incompressibility.  Same for WIND_TUNNEL's uniform `vx` add.
+ *
+ * INPUTS / OUTPUTS
+ *   px_phys, py_phys  → position in PHYSICAL space (cells × aspect)
+ *   t                 → simulation time, seconds (for drift)
+ *   pp                → which PatternParams entry to read knobs from
+ *   screen_cx/cy_phys → centre of the playable rectangle (for HURRICANE)
+ *   *out_vx_phys      ← curl-derived x velocity in physical units
+ *   *out_vy_phys      ← curl-derived y velocity
+ *
+ * UNITS
+ *   px_phys, py_phys:  cells × ASPECT_Y (so units are SQUARE)
+ *   v_phys:            cells × ASPECT_Y / second
+ *   caller divides v_phys.y by ASPECT_Y before applying to a cell
+ *   coordinate
+ *
+ * WHY IT EXISTS (vs inlining in scene_tick)
+ *   Called TWICE per particle per frame: once for advection (in
+ *   scene_tick), once for the speed→colour mapping (in scene_draw).
+ *   Inlining would duplicate the 4-tap fBm sampling.  Splitting
+ *   keeps the algorithm in one place with one set of constants.
  */
 static void curl_velocity_at(float px_phys, float py_phys, float t,
                              const PatternParams *pp,
@@ -613,6 +1051,27 @@ static inline float lcg_unit(uint32_t *st)
 /* ===================================================================== */
 /* §7  scene — pool, advection tick, draw                                */
 /* ===================================================================== */
+
+/*
+ * §7 PREAMBLE — orchestrator
+ * ───────────────────────────
+ *
+ * The Scene owns the particle pool, the time accumulator (drives noise
+ * drift), the active pattern + theme, and the RNG.  It exposes the
+ * two per-frame operations:
+ *
+ *   scene_tick   advance all particles by dt — read field, integrate,
+ *                wrap, push trail.  Pure state mutation; no I/O.
+ *   scene_draw   render trail + head — pure rendering; const Scene *.
+ *
+ * Plus housekeeping: clear, spawn-one, populate-to-target (called
+ * after pattern change to grow/shrink the pool), init, resize, reseed.
+ *
+ * Particles never DIE in this file (no off-screen kill, no lifetime).
+ * They WRAP at the toroidal screen edges and live forever.  Pool size
+ * changes only on pattern change (different patterns have different
+ * target counts) or 'r' reseed.
+ */
 
 typedef struct {
     bool      paused;
@@ -705,8 +1164,61 @@ static void scene_reseed(Scene *s)
 }
 
 /*
- * scene_tick — sample curl-noise velocity at every particle and
- * advance positions. Wrap at screen edges (toroidal). Push trail.
+ * scene_tick — advance every active particle by dt.
+ *
+ * PURPOSE
+ *   The per-frame physics loop.  For each particle: sample the
+ *   curl-noise velocity, integrate position, wrap at screen edges,
+ *   push the new position onto the trail ring buffer.  Trivial
+ *   structure — all the complexity lives in curl_velocity_at.
+ *
+ * PSEUDOCODE
+ *   if paused:  return
+ *   dt *= speed_mul                    // user '+/-' speed dial
+ *   time_accum += dt                    // drives noise time drift
+ *
+ *   for each active particle p:
+ *     px_phys = p.px                     // cell → physical (x: no change)
+ *     py_phys = p.py × ASPECT_Y          // cell → physical (y: square it up)
+ *     curl_velocity_at(px_phys, py_phys, time_accum, pp, ...)
+ *     vx_cell = vx_phys                  // physical → cell (x: no change)
+ *     vy_cell = vy_phys / ASPECT_Y       // physical → cell (y)
+ *     p.px += vx_cell · dt
+ *     p.py += vy_cell · dt
+ *     wrap p.px to [0, cols)             // toroidal
+ *     wrap p.py to [0, rows_eff)
+ *     trail.push(p.px, p.py)             // ring-buffer write
+ *
+ * MENTAL MODEL
+ *   Two coordinate systems converge here:
+ *       CELL space    p.px, p.py — what the renderer wants
+ *       PHYSICAL space  what curl_velocity_at wants (square units)
+ *   The conversion happens at the BOUNDARY of this function (px_phys
+ *   in, vx_cell out) so the curl algorithm doesn't need to know
+ *   about cell aspect ratio, and the renderer doesn't need to know
+ *   about physical units.
+ *
+ *   The toroidal wrap uses `while` rather than `fmodf` because at
+ *   sane dt the position rarely overshoots by more than one wrap,
+ *   so 1–2 iterations cover the common case without the fmodf call
+ *   overhead.  In pathological scenarios (huge dt, paused-then-fast-
+ *   forward) the while loop is still O(overshoot_count) — never
+ *   infinite.
+ *
+ * INPUTS / OUTPUTS
+ *   s    ← Scene (mutated: time_accum + every active particle)
+ *   dt   → frame time in seconds (already speed-multiplied later)
+ *
+ * UNITS
+ *   dt:           seconds (after speed_mul scaling)
+ *   ASPECT_Y:     dimensionless ratio (typically 2.0 for terminal cells)
+ *
+ * WHY IT EXISTS (vs inlining in app's main loop)
+ *   Same separation principle as comet.c and constellation.c: app's
+ *   main loop is "read input, tick, draw, sleep" at orchestrator
+ *   level.  All physics + state mutation lives behind scene_tick().
+ *   A future test harness or batch-render tool can drive the same
+ *   Scene without dragging in ncurses or signal handlers.
  */
 static void scene_tick(Scene *s, float dt)
 {
@@ -757,9 +1269,169 @@ static void scene_tick(Scene *s, float dt)
 }
 
 /*
- * scene_draw — render trail (oldest dim → newest bright) + head with
- * speed-magnitude colour.
+ * scene_draw — paint trail + head for every active particle.
+ *
+ * PURPOSE
+ *   Render one frame.  For each particle: compute current speed
+ *   (one curl_velocity_at call), map speed → 8-slot ramp index,
+ *   draw the trail oldest-first with dimming ramp slots, then the
+ *   head on top with the brightest slot.  No state mutation.
+ *
+ * PSEUDOCODE
+ *   for each active particle:
+ *     v       = curl_velocity_at(p.px, p.py, time_accum, pp)
+ *     speed   = |v|
+ *     f       = clamp(speed / SPEED_REF, 0, 1)
+ *     f       = sqrt(f)                          // pseudo-gamma boost
+ *     head_slot = clamp(f · 8, 1, 7)             // never 0 — must be visible
+ *     for k in 0..trail_count-1:
+ *       (tx, ty)  = trail[(head + 1 + k) mod TRAIL_LEN]
+ *       slot      = max(0, head_slot − (n − 1 − k))   // older = dimmer
+ *       glyph     = pick by slot ('.' / '+' / '*')
+ *       attr      = (head_slot ≥ 6) ? A_BOLD : (head_slot ≤ 1) ? A_DIM : 0
+ *       mvaddch(ty, tx, glyph) in COLOR_PAIR(slot)
+ *     // last iter is the head — overdrawn on top, brightest slot
+ *
+ * MENTAL MODEL
+ *   Three rendering decisions per particle:
+ *     1. COLOUR slot — driven by current SPEED (so faster particles
+ *        glow brighter; you SEE field magnitude as colour intensity).
+ *     2. TRAIL fade — slot drops by 1 per step back into the past
+ *        (so the streamline trails off naturally).
+ *     3. GLYPH — picked from current slot ('.' faint, '+' medium,
+ *        '*' bright).  Three glyphs is enough granularity for ASCII.
+ *
+ *   The sqrt-of-normalised-speed is a CHEAP gamma boost: it pushes
+ *   slow particles into higher slots so they're still visible.
+ *   Without it, most of the swarm clusters at speed ≈ 0.2·SPEED_REF
+ *   and renders in slot 1, which the theme tints make almost
+ *   invisible.  With sqrt, that same speed maps to slot 3 — visible.
+ *
+ *   We call curl_velocity_at AGAIN here (scene_tick already did).
+ *   Caching the speed at tick time would save one fBm batch, but
+ *   would couple two layers: tick would need to know about render's
+ *   colour scheme.  At the current cost (4·octaves Perlin samples ×
+ *   N particles) the duplication is invisible — keep the layers
+ *   separate.
+ *
+ * INPUTS / OUTPUTS
+ *   s    → Scene (const — never mutated)
+ *
+ * UNITS
+ *   speed:      same units as curl_velocity_at returns (physical /s)
+ *   head_slot:  integer 1..7 (index into theme's 8-slot ramp)
+ *
+ * WHY IT EXISTS (vs scattering draws across scene_tick)
+ *   Tick = STATE; draw = PIXELS.  Splitting them means rendering
+ *   tweaks (new glyph table, debug overlay, motion blur) never
+ *   touch physics, and physics changes (new pattern, different field
+ *   model) never touch rendering.  This is the canonical comet.c /
+ *   constellation.c / aafire_port.c split applied here too.
  */
+/*
+ * bg_heatmap_draw — DBG_HEATMAP: shade every cell by fBm(x, y, t).
+ *
+ * Sweep every screen cell, sample the scalar field ψ at the matching
+ * physical position, map ψ ∈ ≈ [−0.5, +0.5] → 0..7 ramp slot, paint
+ * with a density-suggesting glyph.  Cost is cols·rows·octaves Perlin
+ * lookups per frame — ~50 k at 200×60 with 4 octaves, well within
+ * budget at 60 Hz.
+ *
+ * Pedagogical view: lets you see the SCALAR FIELD that the curl is
+ * derived FROM.  Particles flow along level sets (contour lines) of
+ * this field.
+ */
+static void bg_heatmap_draw(const Scene *s)
+{
+    int rows_eff = s->rows - 1;
+    const PatternParams *pp = &pattern_params[s->current_pattern];
+    float k  = pp->fbm_freq;
+    float tx = s->time_accum * pp->time_drift_x;
+    float ty = s->time_accum * pp->time_drift_y;
+
+    for (int row = 0; row < rows_eff; row++) {
+        for (int col = 0; col < s->cols; col++) {
+            float px_phys = (float)col;
+            float py_phys = (float)row * ASPECT_Y;
+            float v = fbm2(px_phys * k + tx, py_phys * k + ty,
+                           pp->fbm_octaves);
+            float f = v + 0.5f;                      /* map [-0.5,+0.5] → [0,1] */
+            if (f < 0.0f) f = 0.0f;
+            if (f > 1.0f) f = 1.0f;
+            int slot = (int)(f * 7.999f);
+
+            char glyph = (slot >= 6) ? '#' :
+                         (slot >= 4) ? '+' :
+                         (slot >= 2) ? '.' : ' ';
+            if (glyph == ' ') continue;
+            int pair = PAIR_RAMP_BASE + slot;
+            attron(COLOR_PAIR(pair));
+            mvaddch(row, col, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair));
+        }
+    }
+}
+
+/*
+ * bg_divergence_draw — DBG_DIVERGENCE: shade every cell by |div v|.
+ *
+ * For each cell, compute div v via 4 curl_velocity_at samples and
+ * map magnitude → ramp slot.  The curl identity guarantees div v ≡ 0
+ * ANALYTICALLY; the only non-zero values here come from the central-
+ * difference truncation error of the curl scheme — so most cells
+ * should be empty (slot 0).
+ *
+ * Sampled every 2 cells (4× cost reduction) since 4 curl evaluations
+ * per cell = 16 fBm samples = ~16 × octaves Perlin lookups per cell.
+ * At 200×60 / 2² × 16 × 4 octaves = 192 000 lookups per frame.
+ *
+ * Pedagogical use: visually verify that curl-of-fBm really is
+ * divergence-free, and SEE where the numerical curl breaks down
+ * (high-curvature regions of the noise field).
+ */
+static void bg_divergence_draw(const Scene *s)
+{
+    int rows_eff = s->rows - 1;
+    const PatternParams *pp = &pattern_params[s->current_pattern];
+    float screen_cx_phys = (float)s->cols * 0.5f;
+    float screen_cy_phys = (float)rows_eff * 0.5f * ASPECT_Y;
+
+    for (int row = 0; row < rows_eff; row += 2) {
+        for (int col = 0; col < s->cols; col += 2) {
+            float px_phys = (float)col;
+            float py_phys = (float)row * ASPECT_Y;
+
+            float vx_xp, vy_xp, vx_xm, vy_xm, vx_yp, vy_yp, vx_ym, vy_ym;
+            curl_velocity_at(px_phys + CURL_H, py_phys, s->time_accum, pp,
+                             screen_cx_phys, screen_cy_phys, &vx_xp, &vy_xp);
+            curl_velocity_at(px_phys - CURL_H, py_phys, s->time_accum, pp,
+                             screen_cx_phys, screen_cy_phys, &vx_xm, &vy_xm);
+            curl_velocity_at(px_phys, py_phys + CURL_H, s->time_accum, pp,
+                             screen_cx_phys, screen_cy_phys, &vx_yp, &vy_yp);
+            curl_velocity_at(px_phys, py_phys - CURL_H, s->time_accum, pp,
+                             screen_cx_phys, screen_cy_phys, &vx_ym, &vy_ym);
+
+            float div = (vx_xp - vx_xm) / (2.0f * CURL_H)
+                      + (vy_yp - vy_ym) / (2.0f * CURL_H);
+            float adiv = fabsf(div);
+
+            /* Threshold tuned so the analytic curl shows ≈ empty;
+             * non-zero pixels are central-diff truncation error. */
+            float f = adiv / 0.02f;
+            if (f < 0.0f) f = 0.0f;
+            if (f > 1.0f) f = 1.0f;
+            int slot = (int)(f * 7.999f);
+            if (slot == 0) continue;
+
+            char glyph = (slot >= 6) ? '#' : (slot >= 3) ? '+' : '.';
+            int pair = PAIR_RAMP_BASE + slot;
+            attron(COLOR_PAIR(pair) | A_BOLD);
+            mvaddch(row, col, (chtype)(unsigned char)glyph);
+            attroff(COLOR_PAIR(pair) | A_BOLD);
+        }
+    }
+}
+
 static void scene_draw(const Scene *s)
 {
     int rows_eff = s->rows - 1;
@@ -767,6 +1439,15 @@ static void scene_draw(const Scene *s)
 
     float screen_cx_phys = (float)s->cols * 0.5f;
     float screen_cy_phys = (float)rows_eff * 0.5f * ASPECT_Y;
+
+    /*
+     * Debug-mode background overlay (drawn FIRST, under particles).
+     * HEATMAP shows ψ; DIVERGENCE shows the curl identity's residual.
+     * Particles still render on top so you can see them flowing
+     * relative to the field they're advected by.
+     */
+    if (g_debug == DBG_HEATMAP)    bg_heatmap_draw(s);
+    if (g_debug == DBG_DIVERGENCE) bg_divergence_draw(s);
 
     for (int i = 0; i < MAX_PARTICLES; i++) {
         const Particle *p = &s->particles[i];
@@ -806,8 +1487,14 @@ static void scene_draw(const Scene *s)
             char glyph;
             int  attr;
             if (k == n - 1) {
-                /* Head */
-                glyph = (head_slot >= 5) ? '*' : (head_slot >= 2) ? '+' : '.';
+                /* Head — in DBG_VELOCITY mode replace glyph with an
+                 * arrow showing v's direction. */
+                if (g_debug == DBG_VELOCITY)
+                    glyph = dir_char(vx_phys, vy_phys);
+                else
+                    glyph = (head_slot >= 5) ? '*'
+                          : (head_slot >= 2) ? '+'
+                          :                    '.';
                 attr  = (head_slot >= 6) ? A_BOLD
                       : (head_slot <= 1) ? A_DIM
                       :                    A_NORMAL;
@@ -856,6 +1543,13 @@ static int scene_active_count(const Scene *s)
     return n;
 }
 
+/*
+ * HUD layout per CLAUDE.md:
+ *   row 0          — fps + theme + pattern + N + oct + freq + dbg,
+ *                    bright bold yellow (top, right-aligned)
+ *   row rows-1     — every interactive key, bright bold cyan (bottom-left)
+ * Debug-mode suffix only shown when non-normal; keeps the top tidy.
+ */
 static void screen_draw(Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
@@ -865,22 +1559,37 @@ static void screen_draw(Screen *sc, const Scene *s,
     int active = scene_active_count(s);
     const PatternParams *pp = &pattern_params[s->current_pattern];
 
-    const char *state_str = s->paused ? "PAUSED     " : pattern_name(s->current_pattern);
+    const char *state_str = s->paused ? "PAUSED"
+                                       : pattern_name(s->current_pattern);
 
-    char buf[210];
-    snprintf(buf, sizeof buf,
-             " CURL_NOISE   %s   theme:%-8s   N:%4d  oct:%d  freq:%.3f   "
-             "%5.1f fps  %3d Hz  speed:%-3d   "
-             "n/p:pat  t/T:theme  +/-:speed  spc:pause  r:reseed  q:quit ",
-             state_str, themes[s->current_theme].name,
-             active, pp->fbm_octaves, (double)pp->fbm_freq,
-             fps, sim_fps, s->speed);
-
-    int row = sc->rows - 1;
+    char top[160];
+    if (g_debug == DBG_NORMAL) {
+        snprintf(top, sizeof top,
+                 " %5.1f fps  %3d Hz  speed:%-3d  %s  theme:%s  "
+                 "N:%d oct:%d freq:%.3f ",
+                 fps, sim_fps, s->speed,
+                 state_str, themes[s->current_theme].name,
+                 active, pp->fbm_octaves, (double)pp->fbm_freq);
+    } else {
+        snprintf(top, sizeof top,
+                 " %5.1f fps  %3d Hz  speed:%-3d  %s  theme:%s  "
+                 "N:%d oct:%d freq:%.3f  [dbg:%s] ",
+                 fps, sim_fps, s->speed,
+                 state_str, themes[s->current_theme].name,
+                 active, pp->fbm_octaves, (double)pp->fbm_freq,
+                 k_debug_names[g_debug]);
+    }
+    int top_x = sc->cols - (int)strlen(top);
+    if (top_x < 0) top_x = 0;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    for (int x = 0; x < sc->cols; x++) mvaddch(row, x, ' ');
-    mvprintw(row, 0, "%s", buf);
+    mvprintw(0, top_x, "%s", top);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(sc->rows - 1, 0,
+             " q/ESC:quit  spc:pause  r:reseed  n/p:pattern"
+             "  t/T:theme  +/-:speed  ]/[:Hz  d/D:debug ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
@@ -952,6 +1661,13 @@ static bool app_handle_key(App *app, int ch)
     case 'p': case 'P':
         s->current_pattern = (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS);
         scene_populate_to_target(s);
+        break;
+
+    case 'd':
+        g_debug = (DebugMode)((g_debug + 1) % DBG_COUNT);
+        break;
+    case 'D':
+        g_debug = (DebugMode)((g_debug + DBG_COUNT - 1) % DBG_COUNT);
         break;
 
     default: break;

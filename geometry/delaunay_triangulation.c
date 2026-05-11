@@ -9,6 +9,13 @@
  * its circumcircle, and verifies no other point lies inside it (the empty
  * circumcircle property).
  *
+ * Study alongside: procedural/generational/delaunay_triangulation.c —
+ *       same Bowyer-Watson algorithm, framed as a generative-art demo
+ *       (12 seeds drop in, edges flash on insert, super-triangle hidden
+ *       at the end).  This file is the algorithmic showcase (random
+ *       points + circumcircle verification phase); that one is the
+ *       generative narrative.
+ *
  * -------------------------------------------------------------------------
  *  Section map
  * -------------------------------------------------------------------------

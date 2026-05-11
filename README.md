@@ -17,10 +17,10 @@
  ╚══════════════════════════════════════════════════════════════════════╝
 ```
 
-273 programs. Pure C. Zero GUI dependencies. Each file complete in itself.
+**327 programs. Pure C. ncurses. No GUI. Each file complete in itself.**
 
-All simulations share a unified architecture and fixed-timestep physics loop.
-Each program can be studied independently or as part of the full simulation framework.
+A unified architecture and a fixed-timestep physics loop run underneath all of
+them; every program can be read standalone or as part of the larger framework.
 
 ---
 
@@ -29,64 +29,49 @@ Each program can be studied independently or as part of the full simulation fram
 > *"Everyone knows the use of the useful, but nobody knows the use of the useless."*
 > — Zhuangzi
 
-I work my life for useful things. Mortgages, dependents, deadlines — the steady
-accumulation of competence the world demands of anyone trying to stay afloat.
-That is the survival arithmetic, and I respect it; nothing here is meant as a
-complaint about it.
+The useful arithmetic — mortgages, deadlines, dependents — is what keeps me
+afloat, and I respect it. This project is the *other* arithmetic. None of
+these programs solves a problem, ships a feature, or earns a thing. They
+exist so I can spend some private hours where the only stake is whether a
+number on the screen matches my idea of what beauty looks like.
 
-This project is the other arithmetic.
+> *"All art is quite useless."* — Oscar Wilde
 
-These programs do not solve a problem. They will not ship. They will not earn
-a thing. They are not on a roadmap and they are not on the road to anywhere.
-I write them so I can live a life that isn't entirely owed — small private
-hours where the only stake is whether a number on the screen matches my idea
-of what beauty looks like. If the useful work is what keeps me alive, this
-useless work is what makes being alive feel honest.
+And here, deliberately, I break all the production-code rules. In day-job
+code, every interface widens with edge cases until the abstraction survives
+every imaginable caller; every helper sits in another file three folders
+away; every level of indirection is another contract to hold in your head.
+By the time you've absorbed the framework, the hour is gone — and so is
+whatever spark made you open the editor.
 
-> *"All art is quite useless."*
-> — Oscar Wilde, *The Picture of Dorian Gray*
-
-And here I break all the rules.
-
-In production code the orthodoxy is to factor and to reuse: shared headers,
-common modules, a build system to glue them together, every interface widened
-with edge cases until the abstraction can survive every imagined caller. I
-have spent enough years inside that orthodoxy to know its tax. Every level of
-indirection is another file to open, another contract to hold in the head,
-another accidental coupling waiting to surprise you when an unrelated change
-ripples three folders away. By the time you have absorbed the framework, the
-hour is gone — and so is whatever spark made you open the editor.
-
-So here, deliberately, I do the opposite. **One file is one program.** Each
-program is **specifically designed for the one problem in front of me — no
-more, no less.** No future-proofing. No configurable knobs for cases that
-may never come. No "we might need this someday" hooks that always come due
-as someone else's bug. The duplication is the whole point. The freedom is
-the whole point.
-
-The technical details of how this plays out — the single-file invariants,
-the shared coordinate model, the framework reference programs — are in
-*Design Choices* below. This section is just the **why**.
+So here, the opposite. **One file is one program.** Each program is
+specifically designed for the one problem in front of me — no more, no less.
+No future-proofing, no configurable knobs for cases that may never come, no
+"we might need this someday" hooks. The duplication is the whole point. The
+freedom is the whole point.
 
 > *"How we spend our days is, of course, how we spend our lives."*
 > — Annie Dillard, *The Writing Life*
-
-The worldly requirements still wait at the door tomorrow morning. But for
-the hours I spend here, the only thing being optimised is my own attention.
-That, I suspect, is the most useful thing this useless project has to offer
-me — and quietly, I hope, to anyone else who reads a file.
 
 ---
 
 ## What This Is
 
-A collection of real-time interactive simulations built entirely in C with ncurses. Every program runs in a terminal window — no OpenGL, no SDL, no graphics library. The constraint is the point: forcing complex physics and rendering through a character grid sharpens the understanding of every algorithm involved.
+A collection of real-time interactive simulations built entirely in C with
+ncurses. Every program runs in a terminal window — no OpenGL, no SDL, no
+graphics library. Forcing complex physics and rendering through a character
+grid sharpens the understanding of every algorithm involved.
 
-Topics span from elementary cellular automata to the Navier-Stokes equations. From Conway's Game of Life to a Crank-Nicolson Schrödinger solver. From a Bresenham wireframe renderer to a full SDF raymarcher with Blinn-Phong shading.
+Topics span from elementary cellular automata to the Navier-Stokes equations.
+From Conway's Game of Life to a Crank-Nicolson Schrödinger solver. From a
+Bresenham wireframe to a full SDF raymarcher with Blinn-Phong shading to a
+Cornell-box Monte Carlo path tracer.
 
-**Build requirement:** `gcc`, `ncurses`, `libm`. That's it.
+**Build requirement:** `gcc`, `ncurses`, `libm`. Nothing else.
 
-For per-program algorithm notes, see [DEMOS.md](DEMOS.md).
+Per-program algorithm notes: [DEMOS.md](DEMOS.md). Folder-level overviews:
+each completed folder has its own `README.md` (e.g. [grids/README.md](grids/README.md),
+[raster/README.md](raster/README.md), [raymarcher/README.md](raymarcher/README.md)).
 
 ---
 
@@ -96,119 +81,103 @@ For per-program algorithm notes, see [DEMOS.md](DEMOS.md).
 >  when there is nothing left to take away."*
 > — Antoine de Saint-Exupéry, *Terre des Hommes*
 
-This project is not a library. It is not a framework. It is not a toolkit.
-It is closer to a sketchbook — 257 individual programs, each complete in itself,
-each existing for no reason other than that it is interesting to build and beautiful to watch.
+This is not a library, not a framework, not a toolkit. It is a sketchbook —
+327 individual programs, each complete in itself, each existing for no
+reason other than that it is interesting to build and beautiful to watch.
 
-The argument for uselessness is older than Wilde. The bricks and mortar of a
-house are what you pay for, but it is the empty space inside the walls that
-you actually live in. The clay shapes a vessel; the hollow is what holds the
-water. The doors and windows are cut out so that the house can be useful at
-all. Substance gives the form, emptiness gives the use. By that older logic,
-*the highest honour for a piece of work is to be deliberately useless* — to
-exist purely as itself, with no claim on anyone's productivity, no roadmap,
-no target market. Useless turns out to be the most useful posture a piece of
-work can take. Many of these programs are trying to earn that kind of
-uselessness.
+**Every file is self-contained by intention — a manual choice, not a
+build-system default.**
+No shared headers, no common modules, no inter-file dependencies. The rule
+is set on purpose and preserved on purpose; nothing about C or ncurses
+required it. After enough years of jumping between fifteen open tabs to
+track where one constant is defined, which helper actually mutates state,
+how one edge case sneaks in from another module — I came to believe the
+search itself is the cost most codebases pretend doesn't exist. When I sit
+down to **learn** how a program works, or to **optimise** one knob inside
+it, I want every line that matters in the file I already have open. There
+is no jumping between files here, because there is nothing in another file
+to jump to.
 
-**Every file is self-contained by intention.**
-No shared headers, no common modules, no inter-file dependencies. After
-enough years of jumping between fifteen open tabs to track down where one
-constant is defined, where one helper actually mutates state, where one
-edge case sneaks in from another module — I came to believe the search
-itself is the cost most codebases pretend doesn't exist. Code duplication
-is a deliberate trade-off against that cost: a repeated 20-line physics
-loop in every file is far better than a shared abstraction that requires
-understanding six other files before you can touch one. Each file solves
-one problem and stops; if a second program needs the same loop, it
-contains the same loop, line for line. When a simulation changes, only
-one file changes. No edge cases bleed across boundaries. No ripple
-effects. You can delete any file and nothing else breaks.
+Code duplication is the deliberate trade-off. A repeated 20-line physics
+loop in every file is better than a shared abstraction that requires
+understanding six other files before you can touch one. If a second program
+needs the same loop, it contains the same loop — sometimes with its own
+switch-case in the middle, because *this* program has an edge case the
+others don't. The duplication is the freedom for each file to be **complete
+and specific to the program it is**. The shared concept stays shared in
+your head, not in a header. Change one simulation, only one file changes.
+No edge cases bleed across boundaries. Delete any file and nothing else
+breaks.
 
-**C, with structures and functions only.**
-The whole project is written in plain C — no classes, no inheritance, no
-interfaces, no module system. After enough years of professional work I came to
-believe that those abstractions, sold as aids to understanding, often hinder it:
-every layer is another file to open, another name to memorise, and another
-contract to hold in your head before reaching the actual computation. When the
-goal is to *understand how something works*, plain `struct`s and free functions
-are the floor of what a program needs to express; anything beyond that has to
-earn its keep. The cost is a little duplication; the benefit is that any program
-can be read top-to-bottom in a single sitting, and every change stays exactly
-where you put it. Easy to read, easy to maintain, hard to lose track of.
+**Plain C — `struct`s and functions only.**
+No classes, no inheritance, no module system. The cost is a little
+duplication; the benefit is that any program can be read top-to-bottom in a
+single sitting, and every change stays exactly where you put it.
 
-**Copying is the intended usage.**
-To run any simulation, copy the file, compile, and run:
+**Copying is the intended workflow.**
 ```bash
 gcc filename.c -lncurses -lm && ./a.out
 ```
-That is the entire workflow. No build system, no CMake, no Makefile, no package
-manager, no project configuration. A single file is a single program. A learner
-can take any file, read it top to bottom, and understand the whole thing.
+That is the workflow. No build system, no CMake, no Makefile, no package
+manager. A single file is a single program.
 
-**Linux terminal only. No Windows, no GUI.**
-Every simulation targets a POSIX terminal with ncurses. The constraint is the
-medium: forcing a Navier-Stokes solver or a path tracer through a character grid
-demands a much sharper understanding of the underlying math than reaching for a
-graphics API would. The terminal is not a limitation — it is the whole point.
-
-**Art for art's sake.**
-None of these simulations solve a practical problem. A falling-sand automaton has
-no business case. A Buddhabrot renderer does not ship a product. A mushroom-cloud
-raymarcher is not on anyone's roadmap. That uselessness is precisely what makes
-them worth building. The best way to understand an algorithm is to make it
-beautiful with no deadline and no stakeholder.
+**POSIX terminal only.**
+No Windows, no GUI. Forcing a Navier-Stokes solver or a path tracer through
+a character grid demands a sharper understanding of the underlying math
+than reaching for a graphics API would. The terminal is not a limitation —
+it is the whole point.
 
 **One physics model, one rendering model, applied uniformly.**
 Every file uses the same fixed-timestep accumulator, the same pixel-space
-coordinate model, and the same ncurses double-buffer sequence. A reader who
-studies one file can read any other. The framework is not hidden — it is the
-first thing documented in every source file.
+coordinate model, and the same ncurses double-buffer sequence. Read one
+file, you can read any other. The framework is not hidden — it's the first
+thing documented in every source file. See [CLAUDE.md](CLAUDE.md) for the
+full convention.
 
 ---
 
 ## Demos
 
-Every program lives in a topic folder; folders are summarised here, and full
-per-program algorithm notes are in [DEMOS.md](DEMOS.md).
+Every program lives in a topic folder. Folders summarised here; per-program
+algorithm notes in [DEMOS.md](DEMOS.md); folder-level READMEs (where
+present) give the reading order and the unifying primitive for that folder.
 
-| Folder | Programs | Summary |
-|--------|---------:|---------|
-| `fluid/` | 17 | Stable fluids (Stam), lattice gas / Boltzmann, FDTD wave solvers, Gray-Scott reaction-diffusion, Lenia, FitzHugh-Nagumo excitable medium, SPH, falling sand, marching squares, vorticity-streamfunction, CFL stability explorer |
-| `physics/` | 31 | Lorenz / N-body / cloth / Ising / Schrödinger; Schwarzschild black hole; quaternion gyroscope; PBD chains; rigid-body cubes & spheres; soft-body jelly; Barnes-Hut O(N log N) gravity; LBM, mass-spring lattice, membrane FDTD; CG and multigrid solver visualisers; RK1/2/4 comparison; spectrogram |
-| `procedural/` | 14 | Mandelbrot / Julia / Buddhabrot / Newton; interactive Julia explorer; Barnsley IFS chaos game; DLA + dielectric breakdown; Lyapunov fractal; logistic bifurcation; Apollonian; L-systems; Lorenz strange attractor |
-| `misc/` | 6 + 4 | Conway Life + variants, 1D Wolfram CA, Langton's ant, hex Life, general 2D outer-totalistic CA; sort visualiser, maze DFS+BFS+A\*, graph search, Drossel-Schwabl forest fire |
-| `raster/` + `raymarcher/` | 13 | SDF raymarcher (Blinn-Phong, shadow rays, primitives, smooth-union gallery); Mandelbulb explorer + rasterizer; UV torus / cube / sphere / displacement raster; Bresenham wireframe; donut; volumetric `nuke` mushroom cloud (2-D axisymmetric Stam stable fluids); `sun_solar` 2-D screen-space sun with arc flares |
-| `raytracing/` | 5 | Analytic ray-tracing of sphere / cube / torus / capsule + Cornell-box Monte Carlo path tracer (Lambertian BRDF, cosine-hemisphere sampling, Russian roulette) |
-| `flocking/` | 9 | Reynolds boids, shepherd herding, crowd steering (6 behaviours), two-faction battle sim, swarm digit animator, ant-colony pheromone, Wa-Tor predator-prey, SIR epidemic, Physarum slime mould |
-| `turtle/` | 1 | Dual turtle polygon animator |
-| `grids/` | 14+4 + 7+4 + 7+4 + 12+24 = 76 | All grid families (rectangular, polar, hexagonal, triangular). Each family has a *displays* sub-folder showing the bare grid and a *placement* sub-folder where a cursor / patterns / paths / scatters deposit objects on it. Triangular family covers regular tilings (1–6), recursive fractals (7–9), aperiodic substitutions (10, 12), and Delaunay (11) |
-| `geometry/` | 16 | Lissajous, spirograph, string-art; Voronoi, convex hull, Delaunay; k-d tree, BSP tree, quadtree; visibility polygon |
-| `artistic/` | ≈30 | Epicycles + Fourier art, FFT visualiser, cymatics; plasma, aurora, Penrose pentagrid; diamond-square + Perlin terrain; Matrix-rain variants (rain / DLA-snowflake / pulsar / sun-mask); LED & particle digit morphing; spiral galaxy, jellyfish, gear, transit map, fireworks-rain; bonsai still-life gallery (5 classical styles), falling leaves, DNA helix, Dune sandworm/rocket |
-| `animation/` + `robots/` | 14 | Hexapod tripod gait, IK spider / arm-reach / tentacle-seek, ragdoll figure & ropes, FK snake / centipede / tentacle-forest / medusa, walking biped, spring-leg jumper, self-balancing Perlin-terrain bot |
-| `particle_systems/` | 8 | Fire (3 algos), smoke (3 algos), fireworks FSM, kaboom shockwave, generic particle sandbox, AAlib fire port, staggered burst, constellation network |
-| `matrix_rain/` | 4 | Classic Matrix rain plus snowflake / pulsar / sun-mask hybrids |
-| `procedural/worldgen/` | 7 | Pure-function worlds: parallax star fields, logarithmic-spiral galaxy, L-system city, anchor-graph constellation, Voronoi tectonic plates, droplet-based hydraulic erosion, fBm cloud layers |
-| `procedural/patterns/` | 5 | Tile / interference / substitution showcases: Truchet, Wang (16-tile complete set), quasicrystal (5/7/11-fold plane-wave interference), Penrose P3 (Robinson-triangle deflation), maze-of-maze (recursive DFS at two scales) |
-| `ncurses_basics/` | — | Framework reference programs (`bounce_ball` lives in `physics/`) |
+| Folder | Files | Summary |
+|--------|------:|---------|
+| `fluid/` | 11 | Stam stable fluids, lattice Boltzmann, FDTD wave, Gray-Scott reaction-diffusion, FitzHugh-Nagumo excitable medium, SPH, falling sand, vorticity-streamfunction, CFL stability explorer |
+| `physics/` | 36 | Lorenz / N-body / cloth / Ising / Schrödinger; Schwarzschild black hole; quaternion gyroscope; PBD chains; rigid-body, soft-body; Barnes-Hut O(N log N) gravity; mass-spring lattice; CG and multigrid visualisers; RK1/2/4 comparison |
+| `procedural/` | 69 | Six sub-folders: chaos, fields, fractals, generational, patterns, worldgen — Mandelbrot / Julia / Buddhabrot / Newton; Barnsley IFS; DLA; Lyapunov; logistic; Apollonian; L-systems; Lorenz; Truchet/Wang/quasicrystal/Penrose; star fields, galaxies, hydraulic erosion, fBm clouds |
+| `grids/` | 76 | Four families (rect/hex/tri/polar) × *drawing* + *placement*. Triangular covers regular tilings (1–6), recursive fractals (7–9), aperiodic substitution (10, 12), and Delaunay (11). See [grids/README.md](grids/README.md) |
+| `raster/` | 14 | Software rasteriser: cube/sphere/torus, deferred pipeline, shadow mapping, SSAO, bloom, neon edges, marching cubes, Mandelbulb raster, the spinning ASCII donut. See [raster/README.md](raster/README.md) |
+| `raymarcher/` | 8 | Sphere tracing on SDFs: primitives, CSG atlas, blend/twist/repeat composition gallery, metaballs, KIFS fractal, Mandelbulb. See [raymarcher/README.md](raymarcher/README.md) |
+| `raytracing/` | 10 | Analytic ray↔primitive: sphere/cube/torus/capsule; tunnel, forest god rays, solar eclipse, ringed Saturn; Cornell-box Monte Carlo path tracer. See [raytracing/README.md](raytracing/README.md) |
+| `artistic/` | 23 | Aesthetic effects: galaxy, aurora, mandalas, plasma, Hindu / Islamic geometric patterns, Penrose pentagrid, cymatics, transit map, bonsai gallery, jellyfish, DNA helix |
+| `animation/` | 14 | Forward + inverse kinematics, ragdoll, Verlet ropes, easing curves, snake / centipede / tentacle / medusa. See [animation/README.md](animation/README.md) |
+| `flocking/` | 7 | Reynolds boids, shepherd herding, crowd steering, faction battle, ant-colony pheromone, predator-prey, Physarum slime mould. See [flocking/README.md](flocking/README.md) |
+| `robots/` | 4 | Hexapod tripod gait, biped, spring-leg jumper, self-balancing Perlin-terrain bot. See [robots/README.md](robots/README.md) |
+| `algorithms/` | 11 | Quadtree / k-d / BSP; convex hull, Voronoi, visibility; BFS/DFS/A\*; sort visualiser; SIR epidemic. See [algorithms/README.md](algorithms/README.md) |
+| `geometry/` | 4 | Lissajous, spirograph, string-art, Delaunay |
+| `signal/` | 10 | DFT, FFT, IDFT, convolution, sampling, time-domain filters, 2-D Fourier. See [signal/README.md](signal/README.md) |
+| `particle_systems/` | 18 | Fire (3 algos), smoke, fireworks, kaboom shockwave, fountain, comet, rain, snow, constellation network |
+| `matrix_rain/` | 5 | Classic Matrix rain + snowflake / pulsar / sun-mask / freeze variants. See [matrix_rain/README.md](matrix_rain/README.md) |
+| `Ai/` | 2 | Genetic Smart Rockets, feed-forward neural-net visualiser. See [Ai/README.md](Ai/README.md) |
+| `turtle/` | 1 | Logo-style turtle polygon animator. See [turtle/README.md](turtle/README.md) |
+| `ncurses_basics/` | 4 | Framework reference programs |
 
 ---
 
 ## Build
 
 ```bash
-# Any single program — same pattern everywhere:
+# Universal pattern — same shape for every file in the repo:
 gcc -std=c11 -O2 -Wall -Wextra <folder>/<file>.c -o <name> -lncurses -lm
 
 # Examples:
-gcc -std=c11 -O2 -Wall -Wextra fluid/navier_stokes.c      -o navier_stokes  -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra physics/lorenz.c            -o lorenz         -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra procedural/fractals/mandelbrot.c -o mandelbrot     -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c     -o raymarcher     -lncurses -lm
-gcc -std=c11 -O2 -Wall -Wextra physics/schrodinger.c       -o schrodinger    -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra fluid/navier_stokes.c           -o navier_stokes -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra physics/lorenz.c                -o lorenz        -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra procedural/fractals/mandelbrot.c -o mandelbrot   -lncurses -lm
+gcc -std=c11 -O2 -Wall -Wextra raymarcher/raymarcher.c         -o raymarcher    -lncurses -lm
 ```
-
-See `CLAUDE.md` for the complete build list.
 
 ---
 
@@ -222,18 +191,26 @@ See `CLAUDE.md` for the complete build list.
 | `+` / `-` | increase / decrease primary parameter |
 | Arrow keys | move / steer (where applicable) |
 | `1`–`5` | switch preset / mode |
-| `Space` | trigger event or jump to next state |
+| `Space` | trigger event / advance state |
 
 ---
 
 ## Documentation
 
-`documentation/learning/` contains a `concept_*.md` file for every program in the project. Each file has two passes:
-
-- **Pass 1** — core idea, mental model, key equations, data structures, non-obvious design decisions, open questions to explore
-- **Pass 2** — pseudocode, module map, data flow diagram, core loop
-
-`documentation/Master.md` is the cross-cutting reference: each technique used in the project is explained from first principles, names the source files where it appears, and (for named algorithms) cites the canonical paper, textbook, or author.
+- [CLAUDE.md](CLAUDE.md) — full project conventions: section maps, comment
+  standards, CONCEPTS / MENTAL MODEL block format, build rules
+- [DEMOS.md](DEMOS.md) — per-program algorithm notes
+- [documentation/Architecture.md](documentation/Architecture.md) — framework
+  design, loop mechanics, coordinate model, per-subsystem deep dives
+- [documentation/Master.md](documentation/Master.md) — every technique used
+  in the project explained from first principles, with source files and
+  canonical references
+- [documentation/Visual.md](documentation/Visual.md) — ncurses field guide
+- [documentation/COLOR.md](documentation/COLOR.md) — palettes, escape-time
+  colouring, 256-colour patterns
+- Folder-level READMEs: `Ai/`, `algorithms/`, `animation/`, `flocking/`,
+  `fluid/`, `grids/`, `matrix_rain/`, `raster/`, `raymarcher/`,
+  `raytracing/`, `robots/`, `signal/`, `turtle/`
 
 ---
 
@@ -241,6 +218,6 @@ See `CLAUDE.md` for the complete build list.
 
 - `gcc` (C11)
 - `libncurses` (`sudo apt install libncurses5-dev` or equivalent)
-- `libm` (standard, always available)
+- `libm` (standard)
 
 Nothing else. No CMake, no package manager, no runtime dependencies.

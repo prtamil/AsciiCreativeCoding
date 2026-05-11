@@ -33,6 +33,14 @@
  *       leaves visible diamond artefacts in spot patterns).
  *
  * Study alongside:
+ *   procedural/fields/reaction_diffusion_gray_scott.c
+ *                                    — same Gray-Scott algorithm, framed
+ *                                      as a pattern-formation demo (5
+ *                                      presets, 5-point Laplacian, lighter
+ *                                      pedagogy).  This file is the
+ *                                      PDE / numerical-methods angle;
+ *                                      that one is the patterns-as-field
+ *                                      angle.
  *   fluid/cfl_stability_explorer.c  — explores the stability bound
  *                                      that limits dt for explicit
  *                                      schemes.  This file lives just

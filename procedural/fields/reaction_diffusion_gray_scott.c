@@ -20,6 +20,10 @@
  *       so you watch the pattern self-organise from a fresh seed.
  *
  * Study alongside:
+ *   ../../fluid/reaction_diffusion.c — same Gray-Scott algorithm, framed
+ *       as PDE / numerical-methods pedagogy: 7 presets, 9-point isotropic
+ *       Laplacian, cross-refs to cfl_stability_explorer.c.  This file is
+ *       the lighter pattern-formation demo; that one is the deep dive.
  *   ./perin_noise_flow_showcase.c — also a "field over the grid", but
  *       the field here EVOLVES via PDE rather than being sampled
  *       from a static noise function. Reaction-diffusion is what

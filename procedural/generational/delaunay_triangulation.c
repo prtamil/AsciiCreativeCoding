@@ -19,6 +19,12 @@
  *       same point set produces both — try the same seed positions
  *       and overlay the diagrams in your head.
  *
+ *       geometry/delaunay_triangulation.c — same Bowyer-Watson, but
+ *       framed as an algorithm showcase: random points + an explicit
+ *       SHOWCASE phase that draws every triangle's circumcircle and
+ *       verifies the empty-circumcircle property.  This file tells
+ *       the story; that one proves the invariant.
+ *
  * Section map:
  *   §1 config   — map size, point count, palette, themes
  *   §2 clock    — monotonic timer + sleep

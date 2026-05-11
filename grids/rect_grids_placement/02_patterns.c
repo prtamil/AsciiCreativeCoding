@@ -13,7 +13,8 @@
  *   §1 config   — per-mode geometry, pattern-size range
  *   §2 clock    — monotonic timer + sleep
  *   §3 color    — 6 pairs
- *   §4 gridctx  — GridCtx, ctx_init, ctx_to_screen, ctx_draw_bg (same as 01)
+ *   §4 gridctx  — GridCtx, per-mode geom (ctx_geom_*) + bg drawers
+ *                 (bg_draw_*), ctx_to_screen, ctx_draw_bg (same as 01)
  *   §5 pool     — Pool (same as 01)
  *   §6 patterns — pattern generators: border, fill, hollow, row, col
  *   §7 cursor   — Cursor struct, move, reset, draw
@@ -251,28 +252,29 @@ typedef struct {
     int min_r, max_r, min_c, max_c;
 } GridCtx;
 
-static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
+/* Per-mode geometry setters — one tiny function per GridMode. */
+
+static void ctx_geom_uniform (GridCtx *g) { g->cw = U_CW;    g->ch = U_CH;  }
+static void ctx_geom_square  (GridCtx *g) { g->cw = SQ_CS*2; g->ch = SQ_CS; }
+static void ctx_geom_fine    (GridCtx *g) { g->cw = FN_CW;   g->ch = FN_CH; }
+static void ctx_geom_coarse  (GridCtx *g) { g->cw = CO_CW;   g->ch = CO_CH; }
+static void ctx_geom_hier    (GridCtx *g) { g->cw = HI_CW;   g->ch = HI_CH; }
+static void ctx_geom_brick_h (GridCtx *g) { g->cw = BH_CW;   g->ch = BH_CH; }
+static void ctx_geom_brick_v (GridCtx *g) { g->cw = BV_CW;   g->ch = BV_CH; }
+/* rotated grids carry an extra `range` for the centred ±range bounds */
+static void ctx_geom_diamond (GridCtx *g) { g->cw = DM_IW; g->ch = DM_IH; g->range = DM_RNG; }
+static void ctx_geom_iso     (GridCtx *g) { g->cw = IS_IW; g->ch = IS_IH; g->range = IS_RNG; }
+static void ctx_geom_cross   (GridCtx *g) { g->cw = CR_CW;   g->ch = CR_CH; }
+static void ctx_geom_check   (GridCtx *g) { g->cw = CK_CW;   g->ch = CK_CH; }
+/* ruled has only horizontal lines — no column step */
+static void ctx_geom_ruled   (GridCtx *g) { g->ch = RL_LS; }
+static void ctx_geom_dot     (GridCtx *g) { g->cw = DT_CW;   g->ch = DT_CH; }
+static void ctx_geom_origin  (GridCtx *g) { g->cw = OR_CW;   g->ch = OR_CH; }
+
+/* Bounds depend on coordinate system: rotated grids use ±range; ruled
+ * grids count whole lines; rect grids count whole cells. */
+static void ctx_set_bounds(GridCtx *g, GridMode m, int rows, int cols)
 {
-    memset(g, 0, sizeof *g);
-    g->mode=m; g->rows=rows; g->cols=cols;
-    g->ox=cols/2; g->oy=rows/2;
-    switch (m) {
-    case GM_UNIFORM:  g->cw=U_CW;    g->ch=U_CH;  break;
-    case GM_SQUARE:   g->cw=SQ_CS*2; g->ch=SQ_CS; break;
-    case GM_FINE:     g->cw=FN_CW;   g->ch=FN_CH; break;
-    case GM_COARSE:   g->cw=CO_CW;   g->ch=CO_CH; break;
-    case GM_HIER:     g->cw=HI_CW;   g->ch=HI_CH; break;
-    case GM_BRICK_H:  g->cw=BH_CW;   g->ch=BH_CH; break;
-    case GM_BRICK_V:  g->cw=BV_CW;   g->ch=BV_CH; break;
-    case GM_DIAMOND:  g->cw=DM_IW;   g->ch=DM_IH; g->range=DM_RNG; break;
-    case GM_ISO:      g->cw=IS_IW;   g->ch=IS_IH; g->range=IS_RNG; break;
-    case GM_CROSS:    g->cw=CR_CW;   g->ch=CR_CH; break;
-    case GM_CHECK:    g->cw=CK_CW;   g->ch=CK_CH; break;
-    case GM_RULED:    g->ch=RL_LS;   break;
-    case GM_DOT:      g->cw=DT_CW;   g->ch=DT_CH; break;
-    case GM_ORIGIN:   g->cw=OR_CW;   g->ch=OR_CH; break;
-    default: g->cw=8; g->ch=4; break;
-    }
     if (m == GM_DIAMOND || m == GM_ISO) {
         g->min_r=-g->range; g->max_r=g->range;
         g->min_c=-g->range; g->max_c=g->range;
@@ -283,6 +285,34 @@ static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
         g->min_r=0; g->max_r=(rows-2)/g->ch;
         g->min_c=0; g->max_c=(cols-1)/g->cw;
     }
+}
+
+/* Dispatcher: routes all 14 GridMode values to their per-mode geometry
+ * setter, then computes coordinate bounds once. */
+static void ctx_init(GridCtx *g, GridMode m, int rows, int cols)
+{
+    memset(g, 0, sizeof *g);
+    g->mode=m; g->rows=rows; g->cols=cols;
+    g->ox=cols/2; g->oy=rows/2;
+
+    switch (m) {
+        case GM_UNIFORM:  ctx_geom_uniform (g); break;
+        case GM_SQUARE:   ctx_geom_square  (g); break;
+        case GM_FINE:     ctx_geom_fine    (g); break;
+        case GM_COARSE:   ctx_geom_coarse  (g); break;
+        case GM_HIER:     ctx_geom_hier    (g); break;
+        case GM_BRICK_H:  ctx_geom_brick_h (g); break;
+        case GM_BRICK_V:  ctx_geom_brick_v (g); break;
+        case GM_DIAMOND:  ctx_geom_diamond (g); break;
+        case GM_ISO:      ctx_geom_iso     (g); break;
+        case GM_CROSS:    ctx_geom_cross   (g); break;
+        case GM_CHECK:    ctx_geom_check   (g); break;
+        case GM_RULED:    ctx_geom_ruled   (g); break;
+        case GM_DOT:      ctx_geom_dot     (g); break;
+        case GM_ORIGIN:   ctx_geom_origin  (g); break;
+        default:          g->cw=8; g->ch=4; break;
+    }
+    ctx_set_bounds(g, m, rows, cols);
 }
 
 static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
@@ -299,88 +329,161 @@ static void ctx_to_screen(const GridCtx *g, int r, int c, int *sr, int *sc)
 
 static int safe_mod(int a, int b) { return ((a%b)+b)%b; }
 
-static void ctx_draw_bg(const GridCtx *g)
+/* ── per-mode background drawers ───────────────────────────────────────── *
+ * One function per grid style.  Pulled out of ctx_draw_bg so a reader
+ * can study one style at a time.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* Plain rect lattice; GM_ORIGIN overlays a highlighted central cross. */
+static void bg_draw_rect_family(const GridCtx *g)
+{
+    int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch, ox=g->ox, oy=g->oy;
+    for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
+        bool hl=(sr%ch==0), vl=(sc%cw==0);
+        if (!hl && !vl) continue;
+        char c=(hl&&vl)?'+': (hl?'-':'|');
+        if (g->mode==GM_ORIGIN && sr==oy) c=(vl?'+':'=');
+        if (g->mode==GM_ORIGIN && sc==ox) c=(hl?'+':'I');
+        mvaddch(sr, sc, (chtype)(unsigned char)c);
+    }
+}
+
+/* Three-tier lattice (major / semi / minor); glyph encodes the tier. */
+static void bg_draw_hier(const GridCtx *g)
 {
     int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
-    int ox=g->ox, oy=g->oy;
+    int major=cw*2, semi=cw;
+    for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
+        bool hm=(sr%major==0), hs=(!hm&&sr%semi==0), hmi=(!hm&&!hs&&sr%ch==0);
+        bool vm=(sc%major==0), vs=(!vm&&sc%semi==0), vmi=(!vm&&!vs&&sc%cw==0);
+        if (!hm&&!hs&&!hmi&&!vm&&!vs&&!vmi) continue;
+        bool hl=hm||hs||hmi, vl=vm||vs||vmi;
+        char c; if(hl&&vl) c='+'; else if(hl) c=(hm?'=':(hs?'-':'.')); else c=(vm?'#':(vs?'|':':'));
+        mvaddch(sr, sc, (chtype)(unsigned char)c);
+    }
+}
+
+/* Brick courses offset every other row by half a brick width. */
+static void bg_draw_brick_h(const GridCtx *g)
+{
+    int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
+    int half=cw/2;
+    for (int sr=0; sr<rows-1; sr++) {
+        bool hl=(sr%ch==0); int rb=sr/ch;
+        for (int sc=0; sc<cols; sc++) {
+            bool vl=((sc+(rb%2)*half)%cw==0);
+            if (!hl&&!vl) continue;
+            mvaddch(sr,sc,(chtype)(hl&&vl?'+': (hl?'-':'|')));
+        }
+    }
+}
+
+/* Vertical brick courses — bricks staggered by half-height per column. */
+static void bg_draw_brick_v(const GridCtx *g)
+{
+    int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
+    int half=ch/2;
+    for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
+        int cb=sc/cw; bool hl=((sr+(cb%2)*half)%ch==0), vl=(sc%cw==0);
+        if (!hl&&!vl) continue;
+        mvaddch(sr,sc,(chtype)(hl&&vl?'+': (hl?'-':'|')));
+    }
+}
+
+/* Two diagonal line families intersect on a 45°-rotated lattice. */
+static void bg_draw_diamond(const GridCtx *g)
+{
+    int rows=g->rows, cols=g->cols, ox=g->ox, oy=g->oy;
+    int mod=2*DM_IW*DM_IH;
+    for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
+        int u=sc-ox, v=sr-oy;
+        bool cl=(safe_mod(u*DM_IH+v*DM_IW,mod)==0);
+        bool rl=(safe_mod(v*DM_IW-u*DM_IH,mod)==0);
+        if (!cl&&!rl) continue;
+        mvaddch(sr,sc,(chtype)(cl&&rl?'+': (cl?'/':'\\')));
+    }
+}
+
+/* Same diagonal scheme as diamond but with a wider (2:1) cell aspect. */
+static void bg_draw_iso(const GridCtx *g)
+{
+    int rows=g->rows, cols=g->cols, ox=g->ox, oy=g->oy;
+    int mod=2*IS_IW*IS_IH;
+    for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
+        int u=sc-ox, v=sr-oy;
+        bool cl=(safe_mod(u*IS_IH+v*IS_IW,mod)==0);
+        bool rl=(safe_mod(v*IS_IW-u*IS_IH,mod)==0);
+        if (!cl&&!rl) continue;
+        mvaddch(sr,sc,(chtype)(cl&&rl?'+': (cl?'/':'\\')));
+    }
+}
+
+/* Rect lattice with two extra diagonal families overlaid (axes + X). */
+static void bg_draw_cross(const GridCtx *g)
+{
+    int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
+    int sa=cw, sb=ch;
+    for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
+        bool hl=(sr%ch==0), vl=(sc%cw==0);
+        bool sl=((sc+sr)%sa==0), bl=(safe_mod(sc-sr,sb)==0);
+        if (!hl&&!vl&&!sl&&!bl) continue;
+        char c; if(hl&&vl) c='+'; else if(hl) c='-'; else if(vl) c='|';
+                else if(sl&&bl) c='X'; else if(sl) c='/'; else c='\\';
+        mvaddch(sr,sc,(chtype)(unsigned char)c);
+    }
+}
+
+/* Lines plus filled "black" squares on alternating cells (chessboard). */
+static void bg_draw_check(const GridCtx *g)
+{
+    int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
+    for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
+        bool hl=(sr%ch==0), vl=(sc%cw==0);
+        if (hl||vl) mvaddch(sr,sc,(chtype)(hl&&vl?'+': (hl?'-':'|')));
+        else if (((sr/ch)+(sc/cw))%2==1) mvaddch(sr,sc,(chtype)'#');
+    }
+}
+
+/* Horizontal rules only — no column structure (row-based grid). */
+static void bg_draw_ruled(const GridCtx *g)
+{
+    int rows=g->rows, cols=g->cols, ch=g->ch;
+    for (int sr=0; sr<rows-1; sr++) {
+        if (sr%ch!=0) continue;
+        for (int sc=0; sc<cols; sc++) mvaddch(sr,sc,(chtype)'-');
+    }
+}
+
+/* Sparse marker at every grid intersection — no connecting lines. */
+static void bg_draw_dot(const GridCtx *g)
+{
+    int rows=g->rows, cols=g->cols, cw=g->cw, ch=g->ch;
+    for (int sr=0; sr<rows-1; sr++) {
+        if (sr%ch!=0) continue;
+        for (int sc=0; sc<cols; sc++) if (sc%cw==0) mvaddch(sr,sc,(chtype)'*');
+    }
+}
+
+/*
+ * ctx_draw_bg — dispatcher.  Routes all 14 GridMode values to a per-mode
+ * bg_draw_*() helper.  The five rect-family modes share one drawer.
+ */
+static void ctx_draw_bg(const GridCtx *g)
+{
     attron(COLOR_PAIR(PAIR_GRID));
     switch (g->mode) {
-    case GM_UNIFORM: case GM_SQUARE: case GM_FINE:
-    case GM_COARSE:  case GM_ORIGIN:
-        for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
-            bool hl=(sr%ch==0), vl=(sc%cw==0);
-            if (!hl && !vl) continue;
-            char c=(hl&&vl)?'+': (hl?'-':'|');
-            if (g->mode==GM_ORIGIN && sr==oy) c=(vl?'+':'=');
-            if (g->mode==GM_ORIGIN && sc==ox) c=(hl?'+':'I');
-            mvaddch(sr, sc, (chtype)(unsigned char)c);
-        } break;
-    case GM_HIER: {
-        int major=cw*2, semi=cw;
-        for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
-            bool hm=(sr%major==0), hs=(!hm&&sr%semi==0), hmi=(!hm&&!hs&&sr%ch==0);
-            bool vm=(sc%major==0), vs=(!vm&&sc%semi==0), vmi=(!vm&&!vs&&sc%cw==0);
-            if (!hm&&!hs&&!hmi&&!vm&&!vs&&!vmi) continue;
-            bool hl=hm||hs||hmi, vl=vm||vs||vmi;
-            char c; if(hl&&vl) c='+'; else if(hl) c=(hm?'=':(hs?'-':'.')); else c=(vm?'#':(vs?'|':':'));
-            mvaddch(sr, sc, (chtype)(unsigned char)c);
-        } break;
-    }
-    case GM_BRICK_H: {
-        int half=cw/2;
-        for (int sr=0; sr<rows-1; sr++) { bool hl=(sr%ch==0); int rb=sr/ch;
-            for (int sc=0; sc<cols; sc++) { bool vl=((sc+(rb%2)*half)%cw==0);
-                if (!hl&&!vl) continue;
-                mvaddch(sr,sc,(chtype)(hl&&vl?'+': (hl?'-':'|'))); } } break;
-    }
-    case GM_BRICK_V: {
-        int half=ch/2;
-        for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
-            int cb=sc/cw; bool hl=((sr+(cb%2)*half)%ch==0), vl=(sc%cw==0);
-            if (!hl&&!vl) continue;
-            mvaddch(sr,sc,(chtype)(hl&&vl?'+': (hl?'-':'|'))); } break;
-    }
-    case GM_DIAMOND: {
-        int mod=2*DM_IW*DM_IH;
-        for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
-            int u=sc-ox, v=sr-oy;
-            bool cl=(safe_mod(u*DM_IH+v*DM_IW,mod)==0);
-            bool rl=(safe_mod(v*DM_IW-u*DM_IH,mod)==0);
-            if (!cl&&!rl) continue;
-            mvaddch(sr,sc,(chtype)(cl&&rl?'+': (cl?'/':'\\'))); } break;
-    }
-    case GM_ISO: {
-        int mod=2*IS_IW*IS_IH;
-        for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
-            int u=sc-ox, v=sr-oy;
-            bool cl=(safe_mod(u*IS_IH+v*IS_IW,mod)==0);
-            bool rl=(safe_mod(v*IS_IW-u*IS_IH,mod)==0);
-            if (!cl&&!rl) continue;
-            mvaddch(sr,sc,(chtype)(cl&&rl?'+': (cl?'/':'\\'))); } break;
-    }
-    case GM_CROSS: {
-        int sa=cw, sb=ch;
-        for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
-            bool hl=(sr%ch==0), vl=(sc%cw==0);
-            bool sl=((sc+sr)%sa==0), bl=(safe_mod(sc-sr,sb)==0);
-            if (!hl&&!vl&&!sl&&!bl) continue;
-            char c; if(hl&&vl) c='+'; else if(hl) c='-'; else if(vl) c='|';
-                    else if(sl&&bl) c='X'; else if(sl) c='/'; else c='\\';
-            mvaddch(sr,sc,(chtype)(unsigned char)c); } break;
-    }
-    case GM_CHECK:
-        for (int sr=0; sr<rows-1; sr++) for (int sc=0; sc<cols; sc++) {
-            bool hl=(sr%ch==0), vl=(sc%cw==0);
-            if (hl||vl) mvaddch(sr,sc,(chtype)(hl&&vl?'+': (hl?'-':'|')));
-            else if (((sr/ch)+(sc/cw))%2==1) mvaddch(sr,sc,(chtype)'#');
-        } break;
-    case GM_RULED:
-        for (int sr=0; sr<rows-1; sr++) { if (sr%ch!=0) continue;
-            for (int sc=0; sc<cols; sc++) mvaddch(sr,sc,(chtype)'-'); } break;
-    case GM_DOT:
-        for (int sr=0; sr<rows-1; sr++) { if (sr%ch!=0) continue;
-            for (int sc=0; sc<cols; sc++) if (sc%cw==0) mvaddch(sr,sc,(chtype)'*'); } break;
-    default: break;
+        case GM_UNIFORM: case GM_SQUARE: case GM_FINE:
+        case GM_COARSE:  case GM_ORIGIN:  bg_draw_rect_family(g); break;
+        case GM_HIER:                     bg_draw_hier       (g); break;
+        case GM_BRICK_H:                  bg_draw_brick_h    (g); break;
+        case GM_BRICK_V:                  bg_draw_brick_v    (g); break;
+        case GM_DIAMOND:                  bg_draw_diamond    (g); break;
+        case GM_ISO:                      bg_draw_iso        (g); break;
+        case GM_CROSS:                    bg_draw_cross      (g); break;
+        case GM_CHECK:                    bg_draw_check      (g); break;
+        case GM_RULED:                    bg_draw_ruled      (g); break;
+        case GM_DOT:                      bg_draw_dot        (g); break;
+        default: break;
     }
     attroff(COLOR_PAIR(PAIR_GRID));
 }

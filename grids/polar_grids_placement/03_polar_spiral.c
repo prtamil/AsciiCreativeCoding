@@ -378,69 +378,171 @@ static void cursor_draw(const Cursor *c, const GridCtx *g)
 /* §7  mode  (polar background dispatcher)                                 */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
+/* Mode 0 — rings + spokes (defaults from polar_grids/01_rings_spokes.c). */
+static void bg_rings_spokes_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double sp = 20.0, rw = 1.6, sw = 0.10;
+    const double sa = two_pi / 12.0;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            double rp   = fmod(r, sp);
+            bool   on_r = rp < rw || rp > sp - rw;
+            double tn   = fmod(th + two_pi, two_pi);
+            double sp2  = fmod(tn, sa);
+            if (on_r || (r > 3.0 && (sp2 < sw || sp2 > sa - sw)))
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 1 — log-polar grid (defaults from polar_grids/02_log_polar.c). */
+static void bg_log_polar_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double rmin = 4.0, ls = 0.25, rwu = 0.08, sw = 0.10;
+    const double sa = two_pi / 12.0;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            bool on_r = false;
+            if (r > rmin) {
+                double u  = log(r / rmin) / ls;
+                double fr = u - floor(u);
+                on_r = fr < rwu || fr > 1.0 - rwu;
+            }
+            double tn  = fmod(th + two_pi, two_pi);
+            double sp2 = fmod(tn, sa);
+            if (on_r || (r > 3.0 && (sp2 < sw || sp2 > sa - sw)))
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 2 — archimedean 2-arm spiral (polar_grids/03_archimedean_spiral.c). */
+static void bg_archimedean_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double pitch = 32.0, sw = 0.20, rmin = 3.0;
+    double a = pitch / two_pi;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            if (r < rmin) continue;
+            double tn = fmod(th + two_pi, two_pi);
+            double ph = fmod(2.0 * (tn - r / a) + 2.0 * two_pi, two_pi);
+            if (ph < sw || ph > two_pi - sw)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 3 — golden log-spiral, 2 arms (polar_grids/04_log_spiral.c). */
+static void bg_log_spiral_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double growth = 2.0 * log(PHI) / M_PI;
+    const double sw = 0.22, rmin = 4.0;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            if (r < rmin) continue;
+            double tn = fmod(th + two_pi, two_pi);
+            double tp = log(r / rmin) / growth;
+            double ph = fmod(2.0 * (tn - tp) + 2.0 * two_pi, two_pi);
+            if (ph < sw || ph > two_pi - sw)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 4 — Vogel sunflower phyllotaxis (polar_grids/05_sunflower.c). */
+static void bg_sunflower_draw(const GridCtx *g)
+{
+    const double sp = 3.5;
+    bool *vis = calloc((size_t)(g->rows * g->cols), 1);
+    if (!vis) return;
+
+    for (int i = 0; i < N_BG_SEEDS; i++) {
+        double r  = sqrt((double)i) * sp;
+        double th = (double)i * GOLDEN_ANGLE;
+        int    c  = g->ox + (int)round(r * cos(th) / CELL_W);
+        int    rw = g->oy + (int)round(r * sin(th) / CELL_H);
+        if (rw < 0 || rw >= g->rows - 1 || c < 0 || c >= g->cols) continue;
+        if (vis[rw * g->cols + c]) continue;
+        vis[rw * g->cols + c] = true;
+        mvaddch(rw, c, (chtype)(unsigned char)'o');
+    }
+    free(vis);
+}
+
+/* Mode 5 — equal-area sector grid (polar_grids/06_sector.c). */
+static void bg_equal_area_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double ru = 18.0, rwf = 0.06, sw = 0.10;
+    const double sa = two_pi / 12.0;
+    double rusq = ru * ru;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            if (r < 3.0) continue;
+            double kf  = (r * r) / rusq;
+            double fr  = kf - floor(kf);
+            double tn  = fmod(th + two_pi, two_pi);
+            double sp2 = fmod(tn, sa);
+            if (fr < rwf || fr > 1.0 - rwf || sp2 < sw || sp2 > sa - sw)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 6 — elliptic ring grid (polar_grids/07_elliptic.c). */
+static void bg_elliptic_draw(const GridCtx *g)
+{
+    const double A = 1.6, B = 1.0, sp = 20.0, rwu = 0.07;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double dx = (double)(col - g->ox) * CELL_W;
+            double dy = (double)(row - g->oy) * CELL_H;
+            double er = sqrt((dx/A)*(dx/A) + (dy/B)*(dy/B));
+            if (er < 0.5) continue;
+            double et = atan2(dy/B, dx/A);
+            double fr = (er / sp) - floor(er / sp);
+            if (fr < rwu || fr > 1.0 - rwu)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(et));
+        }
+    }
+}
+
+/*
+ * draw_polar_bg — dispatch on g->mode and draw the matching polar grid.
+ * Routes to one of seven bg_*_draw helpers (rings_spokes, log_polar,
+ * archimedean, log_spiral, sunflower, equal_area, elliptic).  No mutation.
+ */
 static void draw_polar_bg(const GridCtx *g)
 {
-    int rows = g->rows, cols = g->cols;
-    int ox = g->ox, oy = g->oy;
-    const double two_pi = 2.0 * M_PI;
     attron(COLOR_PAIR(PAIR_GRID));
     switch (g->mode) {
-    case 0: {
-        const double sp=20.0,rw=1.6,sw=0.10,sa=two_pi/12.0;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);
-            double rp=fmod(r,sp);bool on_r=rp<rw||rp>sp-rw;
-            double tn=fmod(th+two_pi,two_pi),sp2=fmod(tn,sa);
-            if(on_r||(r>3.0&&(sp2<sw||sp2>sa-sw)))
-                mvaddch(row,col,(chtype)(unsigned char)angle_char(th));}
-        break;}
-    case 1: {
-        const double rmin=4.0,ls=0.25,rwu=0.08,sw=0.10,sa=two_pi/12.0;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);
-            bool on_r=false;if(r>rmin){double u=log(r/rmin)/ls,fr=u-floor(u);on_r=fr<rwu||fr>1.0-rwu;}
-            double tn=fmod(th+two_pi,two_pi),sp2=fmod(tn,sa);
-            if(on_r||(r>3.0&&(sp2<sw||sp2>sa-sw)))
-                mvaddch(row,col,(chtype)(unsigned char)angle_char(th));}
-        break;}
-    case 2: {
-        const double pitch=32.0,sw=0.20,rmin=3.0;double a=pitch/two_pi;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);if(r<rmin)continue;
-            double ph=fmod(2.0*(fmod(th+two_pi,two_pi)-r/a)+2.0*two_pi,two_pi);
-            if(ph<sw||ph>two_pi-sw) mvaddch(row,col,(chtype)(unsigned char)angle_char(th));}
-        break;}
-    case 3: {
-        const double growth=2.0*log(PHI)/M_PI,sw=0.22,rmin=4.0;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);if(r<rmin)continue;
-            double ph=fmod(2.0*(fmod(th+two_pi,two_pi)-log(r/rmin)/growth)+2.0*two_pi,two_pi);
-            if(ph<sw||ph>two_pi-sw) mvaddch(row,col,(chtype)(unsigned char)angle_char(th));}
-        break;}
-    case 4: {
-        const double sp=3.5;bool *vis=calloc((size_t)(rows*cols),1);if(!vis)break;
-        for(int i=0;i<N_BG_SEEDS;i++){
-            double r=sqrt((double)i)*sp,th=(double)i*GOLDEN_ANGLE;
-            int c=ox+(int)round(r*cos(th)/CELL_W),rw=oy+(int)round(r*sin(th)/CELL_H);
-            if(rw<0||rw>=rows-1||c<0||c>=cols||vis[rw*cols+c])continue;
-            vis[rw*cols+c]=true;mvaddch(rw,c,(chtype)(unsigned char)'o');}
-        free(vis);break;}
-    case 5: {
-        const double ru=18.0,rwf=0.06,sw=0.10,sa=two_pi/12.0;double rusq=ru*ru;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);if(r<3.0)continue;
-            double kf=(r*r)/rusq,fr=kf-floor(kf),tn=fmod(th+two_pi,two_pi),sp2=fmod(tn,sa);
-            if(fr<rwf||fr>1.0-rwf||sp2<sw||sp2>sa-sw)
-                mvaddch(row,col,(chtype)(unsigned char)angle_char(th));}
-        break;}
-    case 6: {
-        const double A=1.6,B=1.0,sp=20.0,rwu=0.07;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double dx=(double)(col-ox)*CELL_W,dy=(double)(row-oy)*CELL_H;
-            double er=sqrt((dx/A)*(dx/A)+(dy/B)*(dy/B));if(er<0.5)continue;
-            double et=atan2(dy/B,dx/A),fr=(er/sp)-floor(er/sp);
-            if(fr<rwu||fr>1.0-rwu) mvaddch(row,col,(chtype)(unsigned char)angle_char(et));}
-        break;}
+    case 0: bg_rings_spokes_draw(g); break;
+    case 1: bg_log_polar_draw   (g); break;
+    case 2: bg_archimedean_draw (g); break;
+    case 3: bg_log_spiral_draw  (g); break;
+    case 4: bg_sunflower_draw   (g); break;
+    case 5: bg_equal_area_draw  (g); break;
+    case 6: bg_elliptic_draw    (g); break;
     }
     attroff(COLOR_PAIR(PAIR_GRID));
 }
@@ -631,8 +733,21 @@ int main(void)
         case 'q': case 27: g_running = 0; break;
         case 'P': paused = !paused; break;
         case 't': theme = (theme+1) % N_THEMES; color_init(theme); break;
-        case 'a': ctx_init(&ctx, (ctx.mode-1+N_BG_TYPES) % N_BG_TYPES, rows, cols); break;
-        case 'e': ctx_init(&ctx, (ctx.mode+1) % N_BG_TYPES, rows, cols); break;
+        case 'a':
+        case 'e': {
+            int m = (ch == 'a') ? (ctx.mode - 1 + N_BG_TYPES) % N_BG_TYPES
+                                : (ctx.mode + 1) % N_BG_TYPES;
+            ctx_init(&ctx, m, rows, cols);
+            /*
+             * Auto-snap spiral law to match the background where applicable:
+             *   mode 2 (archimedean grid): use the grid's pitch
+             *   mode 3 (log-spiral grid):  use the grid's golden growth
+             * Other backgrounds leave the user's last spiral params alone.
+             */
+            if (ctx.mode == 2) { log_mode = false; pitch  = 32.0; }
+            if (ctx.mode == 3) { log_mode = true;  growth = GROWTH_GOLDEN; }
+            break;
+        }
         case 'l': log_mode = false; break;
         case 'o': log_mode = true;  break;
         case ' ':

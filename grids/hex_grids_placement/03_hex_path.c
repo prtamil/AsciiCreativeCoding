@@ -582,6 +582,66 @@ static void endpoint_marker(const GridCtx *g, int q, int r,
     }
 }
 
+/* preview_dot — draw a single '.' at hex (q, r) if visible.  Caller owns the
+ * COLOR_PAIR attron/attroff so all dots in a preview share one attribute set. */
+static void preview_dot(const GridCtx *g, int q, int r)
+{
+    int col, row;
+    ctx_to_screen(g, q, r, &col, &row);
+    if (col >= 0 && col < g->cols && row >= 0 && row < g->rows - 1)
+        mvaddch(row, col, '.');
+}
+
+/* Mirror path_line's lerp+round walk; only A→B is previewed (no-op without A). */
+static void preview_line_draw(const GridCtx *g, const SceneCfg *cfg,
+                               int bQ, int bR)
+{
+    if (!cfg->has_a) return;
+    int N = hex_dist(cfg->aQ, cfg->aR, bQ, bR);
+    for (int i = 0; i <= N; i++) {
+        double t = (N > 0) ? (double)i / (double)N : 0.0;
+        int q, r;
+        hex_lerp_round((double)cfg->aQ, (double)cfg->aR,
+                       (double)bQ,      (double)bR, t, &q, &r);
+        preview_dot(g, q, r);
+    }
+}
+
+/* Mirror path_ring's HEX6 walk; ring is always centered on the live cursor. */
+static void preview_ring_draw(const GridCtx *g, const Cursor *cur,
+                               const SceneCfg *cfg)
+{
+    if (cfg->ring_n == 0) {
+        preview_dot(g, cur->q, cur->r);
+        return;
+    }
+    int q = cur->q + HEX6[4][0] * cfg->ring_n;
+    int r = cur->r + HEX6[4][1] * cfg->ring_n;
+    for (int i = 0; i < 6; i++) {
+        for (int j = 0; j < cfg->ring_n; j++) {
+            preview_dot(g, q, r);
+            q += HEX6[i][0];
+            r += HEX6[i][1];
+        }
+    }
+}
+
+/* Mirror path_lpath's q-leg-then-r-leg walk; r-leg starts at aR+dR to skip the
+ * shared corner cell (bQ, aR) already drawn by the q-leg. */
+static void preview_lpath_draw(const GridCtx *g, const SceneCfg *cfg,
+                                int bQ, int bR)
+{
+    if (!cfg->has_a) return;
+    int dQ = (bQ >= cfg->aQ) ? 1 : -1;
+    for (int q = cfg->aQ; q != bQ + dQ; q += dQ)
+        preview_dot(g, q, cfg->aR);
+    if (cfg->aR != bR) {
+        int dR = (bR >= cfg->aR) ? 1 : -1;
+        for (int r = cfg->aR + dR; r != bR + dR; r += dR)
+            preview_dot(g, bQ, r);
+    }
+}
+
 /*
  * path_preview_draw — show in bright green where SPACE would stamp.
  *
@@ -597,65 +657,10 @@ static void path_preview_draw(const GridCtx *g, const Cursor *cur,
 
     attron(COLOR_PAIR(PAIR_PREVIEW) | A_BOLD);
     switch (cfg->path_mode) {
-    case PATH_LINE: {
-        if (!cfg->has_a) break;
-        int N = hex_dist(cfg->aQ, cfg->aR, bQ, bR);
-        for (int i = 0; i <= N; i++) {
-            double t = (N > 0) ? (double)i / (double)N : 0.0;
-            int q, r;
-            hex_lerp_round((double)cfg->aQ, (double)cfg->aR,
-                           (double)bQ,      (double)bR, t, &q, &r);
-            int col, row;
-            ctx_to_screen(g, q, r, &col, &row);
-            if (col >= 0 && col < g->cols && row >= 0 && row < g->rows - 1)
-                mvaddch(row, col, '.');
-        }
-        break;
-    }
-    case PATH_RING: {
-        /* Ring preview always shows at cursor regardless of A/B */
-        if (cfg->ring_n == 0) {
-            int col, row;
-            ctx_to_screen(g, cur->q, cur->r, &col, &row);
-            if (col >= 0 && col < g->cols && row >= 0 && row < g->rows - 1)
-                mvaddch(row, col, '.');
-        } else {
-            int q = cur->q + HEX6[4][0] * cfg->ring_n;
-            int r = cur->r + HEX6[4][1] * cfg->ring_n;
-            for (int i = 0; i < 6; i++) {
-                for (int j = 0; j < cfg->ring_n; j++) {
-                    int col, row;
-                    ctx_to_screen(g, q, r, &col, &row);
-                    if (col >= 0 && col < g->cols && row >= 0 && row < g->rows - 1)
-                        mvaddch(row, col, '.');
-                    q += HEX6[i][0];
-                    r += HEX6[i][1];
-                }
-            }
-        }
-        break;
-    }
-    case PATH_LPATH: {
-        if (!cfg->has_a) break;
-        int dQ = (bQ >= cfg->aQ) ? 1 : -1;
-        for (int q = cfg->aQ; q != bQ + dQ; q += dQ) {
-            int col, row;
-            ctx_to_screen(g, q, cfg->aR, &col, &row);
-            if (col >= 0 && col < g->cols && row >= 0 && row < g->rows - 1)
-                mvaddch(row, col, '.');
-        }
-        if (cfg->aR != bR) {
-            int dR = (bR >= cfg->aR) ? 1 : -1;
-            for (int r = cfg->aR + dR; r != bR + dR; r += dR) {
-                int col, row;
-                ctx_to_screen(g, bQ, r, &col, &row);
-                if (col >= 0 && col < g->cols && row >= 0 && row < g->rows - 1)
-                    mvaddch(row, col, '.');
-            }
-        }
-        break;
-    }
-    default: break;
+        case PATH_LINE:  preview_line_draw  (g, cfg, bQ, bR); break;
+        case PATH_RING:  preview_ring_draw  (g, cur, cfg);    break;
+        case PATH_LPATH: preview_lpath_draw (g, cfg, bQ, bR); break;
+        default: break;
     }
     attroff(COLOR_PAIR(PAIR_PREVIEW) | A_BOLD);
 }

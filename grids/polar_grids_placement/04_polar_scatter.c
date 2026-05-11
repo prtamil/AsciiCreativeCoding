@@ -216,6 +216,25 @@
 #define RING_SNAP_SP      20.0
 #define RING_SNAP_JITTER   2.0   /* ± pixel jitter around each ring */
 
+/*
+ * BG_* constants — the natural ring/arm/seed laws of the 7 polar
+ * backgrounds (mirror values used by polar_grids/01..07 and the
+ * other polar placement files).  scatter_ringsnap dispatches on
+ * g->mode and samples r from the matching law so the dots actually
+ * land on the active grid's rings instead of an arbitrary fixed step.
+ */
+#define BG_RING_SP        20.0           /* mode 0: rings spacing (px)        */
+#define BG_LOG_RMIN        4.0           /* mode 1: log-polar inner radius    */
+#define BG_LOG_RATIO       0.25          /* mode 1: ln(RATIO) per ring        */
+#define BG_ARCH_PITCH     32.0           /* mode 2: archimedean pitch (px)    */
+#define BG_LOG_GROWTH    (2.0 * log(PHI) / M_PI)  /* mode 3: golden ratio    */
+#define BG_LOG_R0          4.0           /* mode 3: log-spiral inner anchor   */
+#define BG_SEED_SP         3.5           /* mode 4: sunflower seed spacing    */
+#define BG_RUNIT          18.0           /* mode 5: equal-area R_UNIT (px)    */
+#define BG_ELLIP_A         1.6           /* mode 6: elliptic x semi-axis      */
+#define BG_ELLIP_B         1.0           /* mode 6: elliptic y semi-axis      */
+#define BG_ELLIP_SP       20.0           /* mode 6: ring spacing in e_r       */
+
 /* Object pool */
 #define MAX_OBJ        2048
 #define OBJ_GLYPH      'o'
@@ -418,68 +437,171 @@ static void cursor_draw(const Cursor *c, const GridCtx *g)
 /* §7  mode  (polar background dispatcher)                                 */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
+/* Mode 0 — rings + spokes (defaults from polar_grids/01_rings_spokes.c). */
+static void bg_rings_spokes_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double sp = 20.0, rw = 1.6, sw = 0.10;
+    const double sa = two_pi / 12.0;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            double rp  = fmod(r, sp);
+            double tn  = fmod(th + two_pi, two_pi);
+            double sp2 = fmod(tn, sa);
+            if (rp < rw || rp > sp - rw ||
+                (r > 3.0 && (sp2 < sw || sp2 > sa - sw)))
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 1 — log-polar grid (defaults from polar_grids/02_log_polar.c). */
+static void bg_log_polar_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double rmin = 4.0, ls = 0.25, rwu = 0.08, sw = 0.10;
+    const double sa = two_pi / 12.0;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            bool on_r = false;
+            if (r > rmin) {
+                double u  = log(r / rmin) / ls;
+                double fr = u - floor(u);
+                on_r = fr < rwu || fr > 1.0 - rwu;
+            }
+            double tn  = fmod(th + two_pi, two_pi);
+            double sp2 = fmod(tn, sa);
+            if (on_r || (r > 3.0 && (sp2 < sw || sp2 > sa - sw)))
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 2 — archimedean 2-arm spiral (polar_grids/03_archimedean_spiral.c). */
+static void bg_archimedean_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double pitch = 32.0, sw = 0.20, rmin = 3.0;
+    double a = pitch / two_pi;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            if (r < rmin) continue;
+            double tn = fmod(th + two_pi, two_pi);
+            double ph = fmod(2.0 * (tn - r / a) + 2.0 * two_pi, two_pi);
+            if (ph < sw || ph > two_pi - sw)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 3 — golden log-spiral, 2 arms (polar_grids/04_log_spiral.c). */
+static void bg_log_spiral_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double growth = 2.0 * log(PHI) / M_PI;
+    const double sw = 0.22, rmin = 4.0;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            if (r < rmin) continue;
+            double tn = fmod(th + two_pi, two_pi);
+            double tp = log(r / rmin) / growth;
+            double ph = fmod(2.0 * (tn - tp) + 2.0 * two_pi, two_pi);
+            if (ph < sw || ph > two_pi - sw)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 4 — Vogel sunflower phyllotaxis (polar_grids/05_sunflower.c). */
+static void bg_sunflower_draw(const GridCtx *g)
+{
+    const double sp = 3.5;
+    bool *vis = calloc((size_t)(g->rows * g->cols), 1);
+    if (!vis) return;
+
+    for (int i = 0; i < N_BG_SEEDS; i++) {
+        double r  = sqrt((double)i) * sp;
+        double th = (double)i * GOLDEN_ANGLE;
+        int    c  = g->ox + (int)round(r * cos(th) / CELL_W);
+        int    rw = g->oy + (int)round(r * sin(th) / CELL_H);
+        if (rw < 0 || rw >= g->rows - 1 || c < 0 || c >= g->cols) continue;
+        if (vis[rw * g->cols + c]) continue;
+        vis[rw * g->cols + c] = true;
+        mvaddch(rw, c, (chtype)(unsigned char)'o');
+    }
+    free(vis);
+}
+
+/* Mode 5 — equal-area sector grid (polar_grids/06_sector.c). */
+static void bg_equal_area_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double ru = 18.0, rwf = 0.06, sw = 0.10;
+    const double sa = two_pi / 12.0;
+    double rusq = ru * ru;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            if (r < 3.0) continue;
+            double kf  = (r * r) / rusq;
+            double fr  = kf - floor(kf);
+            double tn  = fmod(th + two_pi, two_pi);
+            double sp2 = fmod(tn, sa);
+            if (fr < rwf || fr > 1.0 - rwf || sp2 < sw || sp2 > sa - sw)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 6 — elliptic ring grid (polar_grids/07_elliptic.c). */
+static void bg_elliptic_draw(const GridCtx *g)
+{
+    const double A = 1.6, B = 1.0, sp = 20.0, rwu = 0.07;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double dx = (double)(col - g->ox) * CELL_W;
+            double dy = (double)(row - g->oy) * CELL_H;
+            double er = sqrt((dx/A)*(dx/A) + (dy/B)*(dy/B));
+            if (er < 0.5) continue;
+            double et = atan2(dy/B, dx/A);
+            double fr = (er / sp) - floor(er / sp);
+            if (fr < rwu || fr > 1.0 - rwu)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(et));
+        }
+    }
+}
+
+/*
+ * draw_polar_bg — dispatch on g->mode and draw the matching polar grid.
+ * Routes to one of seven bg_*_draw helpers (rings_spokes, log_polar,
+ * archimedean, log_spiral, sunflower, equal_area, elliptic).  No mutation.
+ */
 static void draw_polar_bg(const GridCtx *g)
 {
-    int rows = g->rows, cols = g->cols;
-    int ox = g->ox, oy = g->oy;
-    const double two_pi = 2.0 * M_PI;
     attron(COLOR_PAIR(PAIR_GRID));
     switch (g->mode) {
-    case 0: {
-        const double sp=20.0,rw=1.6,sw=0.10,sa=two_pi/12.0;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);
-            double rp=fmod(r,sp),tn=fmod(th+two_pi,two_pi),sp2=fmod(tn,sa);
-            if(rp<rw||rp>sp-rw||(r>3.0&&(sp2<sw||sp2>sa-sw)))
-                mvaddch(row,col,(chtype)(unsigned char)angle_char(th));}
-        break;}
-    case 1: {
-        const double rmin=4.0,ls=0.25,rwu=0.08,sw=0.10,sa=two_pi/12.0;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);
-            bool on_r=false;if(r>rmin){double u=log(r/rmin)/ls,fr=u-floor(u);on_r=fr<rwu||fr>1.0-rwu;}
-            double tn=fmod(th+two_pi,two_pi),sp2=fmod(tn,sa);
-            if(on_r||(r>3.0&&(sp2<sw||sp2>sa-sw)))
-                mvaddch(row,col,(chtype)(unsigned char)angle_char(th));}
-        break;}
-    case 2: {
-        const double pitch=32.0,sw=0.20,rmin=3.0;double a=pitch/two_pi;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);if(r<rmin)continue;
-            double ph=fmod(2.0*(fmod(th+two_pi,two_pi)-r/a)+2.0*two_pi,two_pi);
-            if(ph<sw||ph>two_pi-sw) mvaddch(row,col,(chtype)(unsigned char)angle_char(th));}
-        break;}
-    case 3: {
-        const double growth=2.0*log(PHI)/M_PI,sw=0.22,rmin=4.0;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);if(r<rmin)continue;
-            double ph=fmod(2.0*(fmod(th+two_pi,two_pi)-log(r/rmin)/growth)+2.0*two_pi,two_pi);
-            if(ph<sw||ph>two_pi-sw) mvaddch(row,col,(chtype)(unsigned char)angle_char(th));}
-        break;}
-    case 4: {
-        const double sp=3.5;bool *vis=calloc((size_t)(rows*cols),1);if(!vis)break;
-        for(int i=0;i<N_BG_SEEDS;i++){
-            double r=sqrt((double)i)*sp,th=(double)i*GOLDEN_ANGLE;
-            int c=ox+(int)round(r*cos(th)/CELL_W),rw=oy+(int)round(r*sin(th)/CELL_H);
-            if(rw<0||rw>=rows-1||c<0||c>=cols||vis[rw*cols+c])continue;
-            vis[rw*cols+c]=true;mvaddch(rw,c,(chtype)(unsigned char)'o');}
-        free(vis);break;}
-    case 5: {
-        const double ru=18.0,rwf=0.06,sw=0.10,sa=two_pi/12.0;double rusq=ru*ru;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);if(r<3.0)continue;
-            double kf=(r*r)/rusq,fr=kf-floor(kf),tn=fmod(th+two_pi,two_pi),sp2=fmod(tn,sa);
-            if(fr<rwf||fr>1.0-rwf||sp2<sw||sp2>sa-sw)
-                mvaddch(row,col,(chtype)(unsigned char)angle_char(th));}
-        break;}
-    case 6: {
-        const double A=1.6,B=1.0,sp=20.0,rwu=0.07;
-        for(int row=0;row<rows-1;row++) for(int col=0;col<cols;col++){
-            double dx=(double)(col-ox)*CELL_W,dy=(double)(row-oy)*CELL_H;
-            double er=sqrt((dx/A)*(dx/A)+(dy/B)*(dy/B));if(er<0.5)continue;
-            double et=atan2(dy/B,dx/A),fr=(er/sp)-floor(er/sp);
-            if(fr<rwu||fr>1.0-rwu) mvaddch(row,col,(chtype)(unsigned char)angle_char(et));}
-        break;}
+    case 0: bg_rings_spokes_draw(g); break;
+    case 1: bg_log_polar_draw   (g); break;
+    case 2: bg_archimedean_draw (g); break;
+    case 3: bg_log_spiral_draw  (g); break;
+    case 4: bg_sunflower_draw   (g); break;
+    case 5: bg_equal_area_draw  (g); break;
+    case 6: bg_elliptic_draw    (g); break;
     }
     attroff(COLOR_PAIR(PAIR_GRID));
 }
@@ -568,28 +690,137 @@ static void scatter_wedge(Pool *pool, int n, double r_outer,
     }
 }
 
+/* One symmetric ±RING_SNAP_JITTER radial jitter sample (≈ ±2 px). */
+static double ringsnap_jitter(void)
+{
+    return ((double)rand()/(double)RAND_MAX - 0.5) * 2.0 * RING_SNAP_JITTER;
+}
+
+/* Place a single (r, θ) sample with R_INNER clamp into the polar→screen path.
+ * Used by every ringsnap_* mode helper EXCEPT mode 6 (elliptic), which has
+ * its own non-circular conversion. */
+static void ringsnap_place_polar(Pool *pool, double r, double th, const GridCtx *g)
+{
+    if (r < R_INNER) r = R_INNER;
+    int c, row;
+    polar_to_screen(r, th, g->ox, g->oy, &c, &row);
+    pool_place(pool, row, c, g->rows, g->cols, OBJ_GLYPH);
+}
+
+/* Mode 0 — linear rings: r = k × BG_RING_SP, θ uniform on [0, 2π). */
+static void ringsnap_rings_spokes(Pool *pool, int n, double r_outer, const GridCtx *g)
+{
+    int n_rings = (int)(r_outer / BG_RING_SP);
+    if (n_rings < 1) n_rings = 1;
+    for (int i = 0; i < n; i++) {
+        int    k  = 1 + rand() % n_rings;
+        double r  = k * BG_RING_SP + ringsnap_jitter();
+        double th = ((double)rand()/(double)RAND_MAX) * 2.0 * M_PI;
+        ringsnap_place_polar(pool, r, th, g);
+    }
+}
+
+/* Mode 1 — log rings: r = BG_LOG_RMIN × e^(k × BG_LOG_RATIO). */
+static void ringsnap_log_polar(Pool *pool, int n, double r_outer, const GridCtx *g)
+{
+    int n_rings = (int)(log(r_outer / BG_LOG_RMIN) / BG_LOG_RATIO);
+    if (n_rings < 1) n_rings = 1;
+    for (int i = 0; i < n; i++) {
+        int    k  = 1 + rand() % n_rings;
+        double r  = BG_LOG_RMIN * exp(k * BG_LOG_RATIO) + ringsnap_jitter();
+        double th = ((double)rand()/(double)RAND_MAX) * 2.0 * M_PI;
+        ringsnap_place_polar(pool, r, th, g);
+    }
+}
+
+/* Mode 2 — archimedean arm: r = (BG_ARCH_PITCH/2π)·t, θ = t. */
+static void ringsnap_archimedean(Pool *pool, int n, double r_outer, const GridCtx *g)
+{
+    double a     = BG_ARCH_PITCH / (2.0 * M_PI);
+    double t_max = r_outer / a;
+    for (int i = 0; i < n; i++) {
+        double t  = ((double)rand()/(double)RAND_MAX) * t_max;
+        double r  = a * t + ringsnap_jitter();
+        double th = t;
+        ringsnap_place_polar(pool, r, th, g);
+    }
+}
+
+/* Mode 3 — log-spiral arm: r = BG_LOG_R0·e^(BG_LOG_GROWTH·t), θ = t. */
+static void ringsnap_log_spiral(Pool *pool, int n, double r_outer, const GridCtx *g)
+{
+    double t_max = log(r_outer / BG_LOG_R0) / BG_LOG_GROWTH;
+    if (t_max < 0.0) t_max = 0.0;
+    for (int i = 0; i < n; i++) {
+        double t  = ((double)rand()/(double)RAND_MAX) * t_max;
+        double r  = BG_LOG_R0 * exp(BG_LOG_GROWTH * t) + ringsnap_jitter();
+        double th = t;
+        ringsnap_place_polar(pool, r, th, g);
+    }
+}
+
+/* Mode 4 — Vogel seeds: (r, θ) = (√i·BG_SEED_SP, i·GOLDEN_ANGLE) at random i. */
+static void ringsnap_sunflower(Pool *pool, int n, double r_outer, const GridCtx *g)
+{
+    int max_seed = (int)((r_outer / BG_SEED_SP) * (r_outer / BG_SEED_SP));
+    if (max_seed < 1)          max_seed = 1;
+    if (max_seed > N_BG_SEEDS) max_seed = N_BG_SEEDS;
+    for (int i = 0; i < n; i++) {
+        int    seed = rand() % max_seed;
+        double r    = sqrt((double)seed) * BG_SEED_SP + ringsnap_jitter();
+        double th   = (double)seed * GOLDEN_ANGLE;
+        ringsnap_place_polar(pool, r, th, g);
+    }
+}
+
+/* Mode 5 — equal-area rings: r = √k × BG_RUNIT, θ uniform on [0, 2π). */
+static void ringsnap_equal_area(Pool *pool, int n, double r_outer, const GridCtx *g)
+{
+    int n_rings = (int)((r_outer * r_outer) / (BG_RUNIT * BG_RUNIT));
+    if (n_rings < 1) n_rings = 1;
+    for (int i = 0; i < n; i++) {
+        int    k  = 1 + rand() % n_rings;
+        double r  = sqrt((double)k) * BG_RUNIT + ringsnap_jitter();
+        double th = ((double)rand()/(double)RAND_MAX) * 2.0 * M_PI;
+        ringsnap_place_polar(pool, r, th, g);
+    }
+}
+
+/* Mode 6 — elliptic rings: e_r = k × BG_ELLIP_SP, then (dx, dy) = e_r·(A·cos, B·sin).
+ * Bypasses ringsnap_place_polar because the screen conversion uses the ellipse axes,
+ * not the standard polar→screen mapping. */
+static void ringsnap_elliptic(Pool *pool, int n, double r_outer, const GridCtx *g)
+{
+    int n_rings = (int)(r_outer / BG_ELLIP_SP);
+    if (n_rings < 1) n_rings = 1;
+    for (int i = 0; i < n; i++) {
+        int    k    = 1 + rand() % n_rings;
+        double e_r  = k * BG_ELLIP_SP + ringsnap_jitter();
+        double e_th = ((double)rand()/(double)RAND_MAX) * 2.0 * M_PI;
+        int sc = g->ox + (int)round(e_r * BG_ELLIP_A * cos(e_th) / CELL_W);
+        int sr = g->oy + (int)round(e_r * BG_ELLIP_B * sin(e_th) / CELL_H);
+        pool_place(pool, sr, sc, g->rows, g->cols, OBJ_GLYPH);
+    }
+}
+
 /*
- * scatter_ringsnap (D) — objects snap to ring boundaries with jitter.
- *
- * THE FORMULA:
- *   k ∈ {1, …, floor(r_outer / RING_SNAP_SP)} uniformly (integer)
- *   r = k × RING_SNAP_SP + jitter,  jitter ∈ [−RING_SNAP_JITTER, +JITTER]
- *   θ ∈ [0, 2π) uniformly
+ * scatter_ringsnap (D) — objects snap to the ACTIVE grid's natural rings
+ * (or arms / seeds) plus a small radial jitter.  Dispatches on g->mode to
+ * one of seven ringsnap_* helpers so the dots line up with the visible
+ * background (rings_spokes, log_polar, archimedean, log_spiral,
+ * sunflower, equal_area, elliptic).
  */
 static void scatter_ringsnap(Pool *pool, int n, double r_outer,
                               const GridCtx *g)
 {
-    int n_rings = (int)(r_outer / RING_SNAP_SP);
-    if (n_rings < 1) n_rings = 1;
-    for (int i = 0; i < n; i++) {
-        int   k   = 1 + rand() % n_rings;
-        double r  = k * RING_SNAP_SP
-                    + ((double)rand()/(double)RAND_MAX - 0.5) * 2.0 * RING_SNAP_JITTER;
-        if (r < R_INNER) r = R_INNER;
-        double th = ((double)rand()/(double)RAND_MAX) * 2.0 * M_PI;
-        int c, row;
-        polar_to_screen(r, th, g->ox, g->oy, &c, &row);
-        pool_place(pool, row, c, g->rows, g->cols, OBJ_GLYPH);
+    switch (g->mode) {
+    case 0: ringsnap_rings_spokes(pool, n, r_outer, g); break;
+    case 1: ringsnap_log_polar   (pool, n, r_outer, g); break;
+    case 2: ringsnap_archimedean (pool, n, r_outer, g); break;
+    case 3: ringsnap_log_spiral  (pool, n, r_outer, g); break;
+    case 4: ringsnap_sunflower   (pool, n, r_outer, g); break;
+    case 5: ringsnap_equal_area  (pool, n, r_outer, g); break;
+    case 6: ringsnap_elliptic    (pool, n, r_outer, g); break;
     }
 }
 
@@ -704,8 +935,14 @@ int main(void)
         case 'q': case 27: g_running = 0; break;
         case 'P': paused = !paused; break;
         case 't': theme = (theme+1) % N_THEMES; color_init(theme); break;
-        case 'a': ctx_init(&ctx, (ctx.mode-1+N_BG_TYPES) % N_BG_TYPES, rows, cols); break;
-        case 'e': ctx_init(&ctx, (ctx.mode+1) % N_BG_TYPES, rows, cols); break;
+        case 'a':
+            ctx_init(&ctx, (ctx.mode-1+N_BG_TYPES) % N_BG_TYPES, rows, cols);
+            dirty = true;   /* re-sample so any scatter visibly responds to bg */
+            break;
+        case 'e':
+            ctx_init(&ctx, (ctx.mode+1) % N_BG_TYPES, rows, cols);
+            dirty = true;
+            break;
         case 'U': scatter_type = 0; dirty = true; break;
         case 'G': scatter_type = 1; dirty = true; break;
         case 'W': scatter_type = 2; dirty = true; break;

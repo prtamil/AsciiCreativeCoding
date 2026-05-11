@@ -17,7 +17,7 @@
  *   §3 color    — 5 pairs: grid, active, anchor, HUD (yellow), hint (cyan)
  *   §4 gridctx  — GridCtx (mode, origin), cell_to_polar, polar_to_screen
  *   §5 pool     — Pool: place, clear, draw
- *   §6 cursor   — Cursor (row, col, r, theta) + screen-space arrow move
+ *   §6 cursor   — Cursor (r, theta, row, col, seed_idx) + grid-snap arrow move
  *   §7 mode     — draw_polar_bg: 7 inline polar background types in one switch
  *   §8 anchor   — AnchorCtx, 3-state FSM, arc/spoke/ring/radial draw
  *   §9 scene    — hud_draw + scene_draw
@@ -186,6 +186,29 @@
 #define GOLDEN_ANGLE  (2.0 * M_PI / (PHI * PHI))
 #define N_BG_SEEDS    600
 
+/* Minimum cursor radius — avoids origin singularity */
+#define R_POLAR_MIN     4.0
+
+/*
+ * BG_* constants — per-mode step sizes for cursor_move (mirror 01_polar_direct).
+ * Arrows snap the cursor to the natural intersections of each background grid,
+ * so 'p'-anchor + 'o'-ring / 'x'-radial land on visible ring/spoke lines
+ * instead of arbitrary screen positions.
+ */
+#define BG_RING_SP      20.0           /* rings+spokes: ring spacing (px)    */
+#define BG_SPOKE_ANG    (M_PI / 6.0)   /* rings/log/sector/elliptic: 30°     */
+#define BG_LOG_RATIO    0.25           /* log-polar: ln(RATIO) per ring      */
+#define BG_ARCH_PITCH   32.0           /* archimedean: pitch per turn (px)   */
+#define BG_ARCH_ANG     (M_PI / 4.0)   /* archimedean: along-curve step (45°)*/
+#define BG_LOG_ANG      (M_PI / 4.0)   /* log-spiral: along-curve step (45°) */
+#define BG_SEED_SP      3.5            /* sunflower: seed spacing (px)       */
+#define BG_SEED_STEP    1              /* sunflower: seeds per LR press      */
+#define BG_SEED_JUMP   13              /* sunflower: seeds per UD press      */
+#define BG_RUNIT       18.0            /* equal-area: R_UNIT (px)            */
+#define BG_ELLIP_A      1.6            /* elliptic: x semi-axis              */
+#define BG_ELLIP_B      1.0            /* elliptic: y semi-axis              */
+#define BG_ELLIP_SP    20.0            /* elliptic: ring spacing in e_r      */
+
 /* Color pairs */
 #define PAIR_GRID    1
 #define PAIR_ACTIVE  2
@@ -328,32 +351,217 @@ static void pool_clear(Pool *p) { p->count = 0; }
 /* ═══════════════════════════════════════════════════════════════════════ */
 
 /*
- * Cursor — screen-space cursor with cached polar coordinates.
- * Arrow keys move (row, col) one cell at a time; cursor_sync_polar()
- * recomputes (r, theta) so the HUD can show them.
+ * Cursor — POLAR-space cursor with cached screen coordinates.
+ *
+ * (r, theta) is the address; (row, col) is computed from it via cursor_sync().
+ * Arrow keys snap to grid intersections via cursor_move's per-mode dispatch,
+ * so when 'p' captures an anchor and 'o'/'x' draw a ring/radial at that
+ * radius/angle, the result lines up with the visible polar grid.
+ *
+ * Same shape as 01_polar_direct.c.
  */
 typedef struct {
-    int    row, col;
-    double r, theta;
+    double r, theta;  /* polar position: pixels and radians        */
+    int    row, col;  /* terminal cell derived from (r, theta)     */
+    int    seed_idx;  /* Vogel seed index (sunflower bg only)      */
 } Cursor;
 
-static void cursor_sync_polar(Cursor *c, const GridCtx *g)
+/* Recompute (row,col) after polar coords change; clamp to screen. */
+static void cursor_sync(Cursor *c, const GridCtx *g)
 {
-    cell_to_polar(c->col, c->row, g->ox, g->oy, &c->r, &c->theta);
+    polar_to_screen(c->r, c->theta, g->ox, g->oy, &c->col, &c->row);
+    if (c->row < 0)          c->row = 0;
+    if (c->row >= g->rows-1) c->row = g->rows-2;
+    if (c->col < 0)          c->col = 0;
+    if (c->col >= g->cols)   c->col = g->cols-1;
+}
+
+/*
+ * cursor_apply_seed — update (r, θ, row, col) from seed_idx for sunflower bg.
+ * Vogel model: r = sqrt(i) × spacing, θ = i × GOLDEN_ANGLE.
+ */
+static void cursor_apply_seed(Cursor *c, const GridCtx *g)
+{
+    if (c->seed_idx < 0)           c->seed_idx = 0;
+    if (c->seed_idx >= N_BG_SEEDS) c->seed_idx = N_BG_SEEDS - 1;
+    c->r     = sqrt((double)c->seed_idx) * BG_SEED_SP;
+    c->theta = fmod((double)c->seed_idx * GOLDEN_ANGLE + 4.0*M_PI, 2.0*M_PI);
+    if (c->r < R_POLAR_MIN) c->r = R_POLAR_MIN;
+    cursor_sync(c, g);
 }
 
 static void cursor_reset(Cursor *c, const GridCtx *g)
 {
-    c->row = g->oy; c->col = g->ox;
-    cursor_sync_polar(c, g);
+    c->r = 20.0; c->theta = 0.0; c->seed_idx = 0;
+    if (g->mode == 4) cursor_apply_seed(c, g);
+    else              cursor_sync(c, g);
 }
 
-static void cursor_move(Cursor *c, const GridCtx *g, int dr, int dc)
+/* Wrap θ into [0, 2π) and clamp r to R_POLAR_MIN — shared tail of every
+ * (r, θ)-mutating cursor mode (modes 0, 1, 2, 3, 5).  Mode 4 (sunflower)
+ * and mode 6 (elliptic) use bespoke clamps that touch (row, col) directly. */
+static void cursor_normalise_polar(Cursor *c, const GridCtx *g)
 {
-    int nr = c->row + dr, nc = c->col + dc;
-    if (nr >= 0 && nr < g->rows-1) c->row = nr;
-    if (nc >= 0 && nc < g->cols)   c->col = nc;
-    cursor_sync_polar(c, g);
+    const double two_pi = 2.0 * M_PI;
+    if (c->r < R_POLAR_MIN) c->r = R_POLAR_MIN;
+    c->theta = fmod(c->theta + 4.0 * two_pi, two_pi);
+    cursor_sync(c, g);
+}
+
+/* Mode 0 — rings+spokes: UP/DOWN snap to next ring, LEFT/RIGHT to next spoke. */
+static void cursor_move_rings_spokes(Cursor *c, const GridCtx *g, int key)
+{
+    switch (key) {
+    case KEY_UP:    c->r -= BG_RING_SP;       break;
+    case KEY_DOWN:  c->r += BG_RING_SP;       break;
+    case KEY_LEFT:  c->theta -= BG_SPOKE_ANG; break;
+    case KEY_RIGHT: c->theta += BG_SPOKE_ANG; break;
+    default: return;
+    }
+    cursor_normalise_polar(c, g);
+}
+
+/* Mode 1 — log-polar: UP/DOWN multiply r by RATIO=e^0.25, LR snaps to spokes. */
+static void cursor_move_log_polar(Cursor *c, const GridCtx *g, int key)
+{
+    switch (key) {
+    case KEY_UP:    c->r /= exp(BG_LOG_RATIO); break;
+    case KEY_DOWN:  c->r *= exp(BG_LOG_RATIO); break;
+    case KEY_LEFT:  c->theta -= BG_SPOKE_ANG;  break;
+    case KEY_RIGHT: c->theta += BG_SPOKE_ANG;  break;
+    default: return;
+    }
+    cursor_normalise_polar(c, g);
+}
+
+/* Mode 2 — archimedean: LR walks ALONG the curve (Δr = a×Δθ); UD jumps one turn. */
+static void cursor_move_archimedean(Cursor *c, const GridCtx *g, int key)
+{
+    double a = BG_ARCH_PITCH / (2.0 * M_PI);
+    switch (key) {
+    case KEY_LEFT:
+        c->theta -= BG_ARCH_ANG;
+        c->r     -= a * BG_ARCH_ANG;
+        break;
+    case KEY_RIGHT:
+        c->theta += BG_ARCH_ANG;
+        c->r     += a * BG_ARCH_ANG;
+        break;
+    case KEY_UP:    c->r -= BG_ARCH_PITCH; break;
+    case KEY_DOWN:  c->r += BG_ARCH_PITCH; break;
+    default: return;
+    }
+    cursor_normalise_polar(c, g);
+}
+
+/* Mode 3 — log-spiral: LR walks the curve, UD flips between the two golden arms. */
+static void cursor_move_log_spiral(Cursor *c, const GridCtx *g, int key)
+{
+    double scale = exp(2.0 * log(PHI) / M_PI * BG_LOG_ANG);
+    switch (key) {
+    case KEY_LEFT:
+        c->theta -= BG_LOG_ANG;
+        c->r     /= scale;
+        break;
+    case KEY_RIGHT:
+        c->theta += BG_LOG_ANG;
+        c->r     *= scale;
+        break;
+    case KEY_UP:   c->theta -= M_PI; break;  /* 2-arm: arms are π apart */
+    case KEY_DOWN: c->theta += M_PI; break;
+    default: return;
+    }
+    cursor_normalise_polar(c, g);
+}
+
+/* Mode 4 — sunflower: step seed index; cursor_apply_seed snaps to the exact seed. */
+static void cursor_move_sunflower(Cursor *c, const GridCtx *g, int key)
+{
+    switch (key) {
+    case KEY_UP:    c->seed_idx -= BG_SEED_JUMP; break;
+    case KEY_DOWN:  c->seed_idx += BG_SEED_JUMP; break;
+    case KEY_LEFT:  c->seed_idx -= BG_SEED_STEP; break;
+    case KEY_RIGHT: c->seed_idx += BG_SEED_STEP; break;
+    default: return;
+    }
+    cursor_apply_seed(c, g);
+}
+
+/* Mode 5 — equal-area: UP/DOWN snap to sqrt(k)×R_UNIT rings, LR = spokes. */
+static void cursor_move_equal_area(Cursor *c, const GridCtx *g, int key)
+{
+    double kf = (c->r / BG_RUNIT) * (c->r / BG_RUNIT);
+    switch (key) {
+    case KEY_UP: {
+        double k = ceil(kf) - 1.0;
+        if (k < 1.0) k = 1.0;
+        c->r = sqrt(k) * BG_RUNIT;
+        break;
+    }
+    case KEY_DOWN: {
+        double k = floor(kf) + 1.0;
+        c->r = sqrt(k) * BG_RUNIT;
+        break;
+    }
+    case KEY_LEFT:  c->theta -= BG_SPOKE_ANG; break;
+    case KEY_RIGHT: c->theta += BG_SPOKE_ANG; break;
+    default: return;
+    }
+    cursor_normalise_polar(c, g);
+}
+
+/* Mode 6 — elliptic: move in the (e_r, ell_θ) frame, then convert back to (col,row). */
+static void cursor_move_elliptic(Cursor *c, const GridCtx *g, int key)
+{
+    double dx   = (double)(c->col - g->ox) * CELL_W;
+    double dy   = (double)(c->row - g->oy) * CELL_H;
+    double e_r  = sqrt((dx/BG_ELLIP_A)*(dx/BG_ELLIP_A) +
+                       (dy/BG_ELLIP_B)*(dy/BG_ELLIP_B));
+    double e_th = atan2(dy/BG_ELLIP_B, dx/BG_ELLIP_A);
+
+    switch (key) {
+    case KEY_UP: {
+        double k = ceil(e_r / BG_ELLIP_SP) - 1.0;
+        e_r = k * BG_ELLIP_SP;
+        if (e_r < 1.0) e_r = 1.0;
+        break;
+    }
+    case KEY_DOWN: {
+        double k = floor(e_r / BG_ELLIP_SP) + 1.0;
+        e_r = k * BG_ELLIP_SP;
+        break;
+    }
+    case KEY_LEFT:  e_th -= BG_SPOKE_ANG; break;
+    case KEY_RIGHT: e_th += BG_SPOKE_ANG; break;
+    default: return;
+    }
+
+    c->col = g->ox + (int)round(e_r * BG_ELLIP_A * cos(e_th) / CELL_W);
+    c->row = g->oy + (int)round(e_r * BG_ELLIP_B * sin(e_th) / CELL_H);
+    if (c->row < 0)          c->row = 0;
+    if (c->row >= g->rows-1) c->row = g->rows-2;
+    if (c->col < 0)          c->col = 0;
+    if (c->col >= g->cols)   c->col = g->cols-1;
+    cell_to_polar(c->col, c->row, g->ox, g->oy, &c->r, &c->theta);
+    if (c->r < R_POLAR_MIN) c->r = R_POLAR_MIN;
+}
+
+/*
+ * cursor_move — grid-aware movement: dispatches per mode so arrows
+ * always follow the natural geometry of the active background.
+ * Routes to one of seven cursor_move_* helpers (one per BG_NAMES entry).
+ */
+static void cursor_move(Cursor *c, const GridCtx *g, int key)
+{
+    switch (g->mode) {
+    case 0: cursor_move_rings_spokes(c, g, key); break;
+    case 1: cursor_move_log_polar   (c, g, key); break;
+    case 2: cursor_move_archimedean (c, g, key); break;
+    case 3: cursor_move_log_spiral  (c, g, key); break;
+    case 4: cursor_move_sunflower   (c, g, key); break;
+    case 5: cursor_move_equal_area  (c, g, key); break;
+    case 6: cursor_move_elliptic    (c, g, key); break;
+    }
 }
 
 static void cursor_draw(const Cursor *c, const GridCtx *g)
@@ -369,95 +577,176 @@ static void cursor_draw(const Cursor *c, const GridCtx *g)
 /* §7  mode  (polar background dispatcher)                                 */
 /* ═══════════════════════════════════════════════════════════════════════ */
 
+/* Mode 0 — rings + spokes (defaults from polar_grids/01_rings_spokes.c). */
+static void bg_rings_spokes_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double sp = 20.0, rw = 1.6, sw = 0.10;
+    const double sa = two_pi / 12.0;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            double rp     = fmod(r, sp);
+            bool   on_r   = rp < rw || rp > sp - rw;
+            double tn     = fmod(th + two_pi, two_pi);
+            double sp2    = fmod(tn, sa);
+            bool   on_s   = r > 3.0 && (sp2 < sw || sp2 > sa - sw);
+            if (on_r || on_s)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 1 — log-polar grid (defaults from polar_grids/02_log_polar.c). */
+static void bg_log_polar_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double rmin = 4.0, ls = 0.25, rwu = 0.08, sw = 0.10;
+    const double sa = two_pi / 12.0;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            bool on_r = false;
+            if (r > rmin) {
+                double u  = log(r / rmin) / ls;
+                double fr = u - floor(u);
+                on_r = fr < rwu || fr > 1.0 - rwu;
+            }
+            double tn  = fmod(th + two_pi, two_pi);
+            double sp2 = fmod(tn, sa);
+            bool   on_s = r > 3.0 && (sp2 < sw || sp2 > sa - sw);
+            if (on_r || on_s)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 2 — archimedean 2-arm spiral (polar_grids/03_archimedean_spiral.c). */
+static void bg_archimedean_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double pitch = 32.0, sw = 0.20, rmin = 3.0;
+    double a = pitch / two_pi;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            if (r < rmin) continue;
+            double tn  = fmod(th + two_pi, two_pi);
+            double raw = 2.0 * (tn - r / a);
+            double ph  = fmod(raw + 2.0 * two_pi, two_pi);
+            if (ph < sw || ph > two_pi - sw)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 3 — golden log-spiral, 2 arms (polar_grids/04_log_spiral.c). */
+static void bg_log_spiral_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double growth = 2.0 * log(PHI) / M_PI;
+    const double sw = 0.22, rmin = 4.0;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            if (r < rmin) continue;
+            double tn  = fmod(th + two_pi, two_pi);
+            double tp  = log(r / rmin) / growth;
+            double raw = 2.0 * (tn - tp);
+            double ph  = fmod(raw + 2.0 * two_pi, two_pi);
+            if (ph < sw || ph > two_pi - sw)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 4 — Vogel sunflower phyllotaxis (polar_grids/05_sunflower.c). */
+static void bg_sunflower_draw(const GridCtx *g)
+{
+    const double sp = 3.5;
+    bool *vis = calloc((size_t)(g->rows * g->cols), 1);
+    if (!vis) return;
+
+    for (int i = 0; i < N_BG_SEEDS; i++) {
+        double r  = sqrt((double)i) * sp;
+        double th = (double)i * GOLDEN_ANGLE;
+        int    c  = g->ox + (int)round(r * cos(th) / CELL_W);
+        int    rw = g->oy + (int)round(r * sin(th) / CELL_H);
+        if (rw < 0 || rw >= g->rows - 1 || c < 0 || c >= g->cols) continue;
+        if (vis[rw * g->cols + c]) continue;
+        vis[rw * g->cols + c] = true;
+        mvaddch(rw, c, (chtype)(unsigned char)'o');
+    }
+    free(vis);
+}
+
+/* Mode 5 — equal-area sector grid (polar_grids/06_sector.c). */
+static void bg_equal_area_draw(const GridCtx *g)
+{
+    const double two_pi = 2.0 * M_PI;
+    const double ru = 18.0, rwf = 0.06, sw = 0.10;
+    const double sa = two_pi / 12.0;
+    double rusq = ru * ru;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double r, th;
+            cell_to_polar(col, row, g->ox, g->oy, &r, &th);
+            if (r < 3.0) continue;
+            double kf  = (r * r) / rusq;
+            double fr  = kf - floor(kf);
+            bool   on_r = fr < rwf || fr > 1.0 - rwf;
+            double tn  = fmod(th + two_pi, two_pi);
+            double sp2 = fmod(tn, sa);
+            if (on_r || sp2 < sw || sp2 > sa - sw)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(th));
+        }
+    }
+}
+
+/* Mode 6 — elliptic ring grid (polar_grids/07_elliptic.c). */
+static void bg_elliptic_draw(const GridCtx *g)
+{
+    const double A = 1.6, B = 1.0, sp = 20.0, rwu = 0.07;
+
+    for (int row = 0; row < g->rows - 1; row++) {
+        for (int col = 0; col < g->cols; col++) {
+            double dx = (double)(col - g->ox) * CELL_W;
+            double dy = (double)(row - g->oy) * CELL_H;
+            double er = sqrt((dx/A)*(dx/A) + (dy/B)*(dy/B));
+            if (er < 0.5) continue;
+            double et = atan2(dy/B, dx/A);
+            double u  = er / sp, fr = u - floor(u);
+            if (fr < rwu || fr > 1.0 - rwu)
+                mvaddch(row, col, (chtype)(unsigned char)angle_char(et));
+        }
+    }
+}
+
+/*
+ * draw_polar_bg — dispatch on g->mode and draw the matching polar grid.
+ * Routes to one of seven bg_*_draw helpers (rings_spokes, log_polar,
+ * archimedean, log_spiral, sunflower, equal_area, elliptic).  No mutation.
+ */
 static void draw_polar_bg(const GridCtx *g)
 {
-    int rows = g->rows, cols = g->cols;
-    int ox = g->ox, oy = g->oy;
-    const double two_pi = 2.0 * M_PI;
     attron(COLOR_PAIR(PAIR_GRID));
     switch (g->mode) {
-    case 0: {
-        const double sp = 20.0, rw = 1.6, sw = 0.10, sa = two_pi/12.0;
-        for (int row = 0; row < rows-1; row++)
-          for (int col = 0; col < cols; col++) {
-            double r, th; cell_to_polar(col, row, ox, oy, &r, &th);
-            double rp = fmod(r, sp);
-            bool on_r = rp < rw || rp > sp-rw;
-            double tn = fmod(th+two_pi, two_pi), sp2 = fmod(tn, sa);
-            bool on_s = r>3.0 && (sp2<sw || sp2>sa-sw);
-            if (on_r || on_s) mvaddch(row,col,(chtype)(unsigned char)angle_char(th));
-          }
-        break;
-    }
-    case 1: {
-        const double rmin=4.0,ls=0.25,rwu=0.08,sw=0.10,sa=two_pi/12.0;
-        for (int row = 0; row < rows-1; row++)
-          for (int col = 0; col < cols; col++) {
-            double r,th; cell_to_polar(col,row,ox,oy,&r,&th);
-            bool on_r=false;
-            if (r>rmin){double u=log(r/rmin)/ls,fr=u-floor(u);on_r=fr<rwu||fr>1.0-rwu;}
-            double tn=fmod(th+two_pi,two_pi),sp2=fmod(tn,sa);
-            bool on_s=r>3.0&&(sp2<sw||sp2>sa-sw);
-            if (on_r||on_s) mvaddch(row,col,(chtype)(unsigned char)angle_char(th));
-          }
-        break;
-    }
-    case 2: {
-        const double pitch=32.0,sw=0.20,rmin=3.0; double a=pitch/two_pi;
-        for (int row=0;row<rows-1;row++)
-          for (int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);if(r<rmin)continue;
-            double tn=fmod(th+two_pi,two_pi),raw=2.0*(tn-r/a);
-            double ph=fmod(raw+2.0*two_pi,two_pi);
-            if(ph<sw||ph>two_pi-sw) mvaddch(row,col,(chtype)(unsigned char)angle_char(th));
-          }
-        break;
-    }
-    case 3: {
-        const double growth=2.0*log(PHI)/M_PI,sw=0.22,rmin=4.0;
-        for (int row=0;row<rows-1;row++)
-          for (int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);if(r<rmin)continue;
-            double tn=fmod(th+two_pi,two_pi),tp=log(r/rmin)/growth;
-            double ph=fmod(2.0*(tn-tp)+2.0*two_pi,two_pi);
-            if(ph<sw||ph>two_pi-sw) mvaddch(row,col,(chtype)(unsigned char)angle_char(th));
-          }
-        break;
-    }
-    case 4: {
-        const double sp=3.5; bool *vis=calloc((size_t)(rows*cols),1);
-        if(!vis)break;
-        for(int i=0;i<N_BG_SEEDS;i++){
-            double r=sqrt((double)i)*sp,th=(double)i*GOLDEN_ANGLE;
-            int c=ox+(int)round(r*cos(th)/CELL_W),rw=oy+(int)round(r*sin(th)/CELL_H);
-            if(rw<0||rw>=rows-1||c<0||c>=cols||vis[rw*cols+c])continue;
-            vis[rw*cols+c]=true; mvaddch(rw,c,(chtype)(unsigned char)'o');
-        }
-        free(vis); break;
-    }
-    case 5: {
-        const double ru=18.0,rwf=0.06,sw=0.10,sa=two_pi/12.0; double rusq=ru*ru;
-        for(int row=0;row<rows-1;row++)
-          for(int col=0;col<cols;col++){
-            double r,th;cell_to_polar(col,row,ox,oy,&r,&th);if(r<3.0)continue;
-            double kf=(r*r)/rusq,fr=kf-floor(kf);
-            bool on_r=fr<rwf||fr>1.0-rwf;
-            double tn=fmod(th+two_pi,two_pi),sp2=fmod(tn,sa);
-            if(on_r||sp2<sw||sp2>sa-sw) mvaddch(row,col,(chtype)(unsigned char)angle_char(th));
-          }
-        break;
-    }
-    case 6: {
-        const double A=1.6,B=1.0,sp=20.0,rwu=0.07;
-        for(int row=0;row<rows-1;row++)
-          for(int col=0;col<cols;col++){
-            double dx=(double)(col-ox)*CELL_W,dy=(double)(row-oy)*CELL_H;
-            double er=sqrt((dx/A)*(dx/A)+(dy/B)*(dy/B));if(er<0.5)continue;
-            double et=atan2(dy/B,dx/A),u=er/sp,fr=u-floor(u);
-            if(fr<rwu||fr>1.0-rwu) mvaddch(row,col,(chtype)(unsigned char)angle_char(et));
-          }
-        break;
-    }
+    case 0: bg_rings_spokes_draw(g); break;
+    case 1: bg_log_polar_draw   (g); break;
+    case 2: bg_archimedean_draw (g); break;
+    case 3: bg_log_spiral_draw  (g); break;
+    case 4: bg_sunflower_draw   (g); break;
+    case 5: bg_equal_area_draw  (g); break;
+    case 6: bg_elliptic_draw    (g); break;
     }
     attroff(COLOR_PAIR(PAIR_GRID));
 }
@@ -545,6 +834,30 @@ static void radial_draw(Pool *pool, const AnchorCtx *ac, const GridCtx *g)
         int c, row;
         polar_to_screen(r, ac->theta_a, g->ox, g->oy, &c, &row);
         pool_place(pool, row, c, g->rows, g->cols, OBJ_GLYPH);
+    }
+}
+
+/*
+ * anchor_advance — drive the IDLE → ONE → TWO → IDLE state machine.
+ * IDLE: capture cursor as anchor A.  ONE: capture cursor as anchor B.
+ * TWO: clear back to IDLE so the user can restart the two-anchor selection.
+ */
+static void anchor_advance(AnchorCtx *ac, const Cursor *cur)
+{
+    switch (ac->state) {
+    case IDLE:
+        ac->r_a   = cur->r;   ac->theta_a = cur->theta;
+        ac->row_a = cur->row; ac->col_a   = cur->col;
+        ac->state = ONE;
+        break;
+    case ONE:
+        ac->r_b   = cur->r;   ac->theta_b = cur->theta;
+        ac->row_b = cur->row; ac->col_b   = cur->col;
+        ac->state = TWO;
+        break;
+    case TWO:
+        ac->state = IDLE;
+        break;
     }
 }
 
@@ -657,28 +970,28 @@ int main(void)
         case 'P': paused = !paused; break;   /* capital P = pause to avoid clash */
         case 't': theme = (theme+1) % N_THEMES; color_init(theme); break;
         case 'a':
-            if (ac.state == TWO)
+            if (ac.state == TWO) {
                 arc_draw(&pool, &ac, &ctx);
-            else
+            } else {
                 ctx_init(&ctx, (ctx.mode - 1 + N_BG_TYPES) % N_BG_TYPES,
                          rows, cols);
+                /* entering sunflower: snap seed_idx to nearest seed at current r */
+                if (ctx.mode == 4) {
+                    cur.seed_idx = (int)round((cur.r / BG_SEED_SP) *
+                                              (cur.r / BG_SEED_SP));
+                    cursor_apply_seed(&cur, &ctx);
+                }
+            }
             break;
         case 'e':
             ctx_init(&ctx, (ctx.mode + 1) % N_BG_TYPES, rows, cols);
-            break;
-        case 'p':
-            if (ac.state == IDLE) {
-                ac.r_a = cur.r; ac.theta_a = cur.theta;
-                ac.row_a = cur.row; ac.col_a = cur.col;
-                ac.state = ONE;
-            } else if (ac.state == ONE) {
-                ac.r_b = cur.r; ac.theta_b = cur.theta;
-                ac.row_b = cur.row; ac.col_b = cur.col;
-                ac.state = TWO;
-            } else {
-                ac.state = IDLE;
+            if (ctx.mode == 4) {
+                cur.seed_idx = (int)round((cur.r / BG_SEED_SP) *
+                                          (cur.r / BG_SEED_SP));
+                cursor_apply_seed(&cur, &ctx);
             }
             break;
+        case 'p': anchor_advance(&ac, &cur); break;
         case 's':
             if (ac.state == TWO) spoke_draw(&pool, &ac, &ctx);
             break;
@@ -690,10 +1003,10 @@ int main(void)
             break;
         case 'C': pool_clear(&pool); break;
         case 'r': ac.state = IDLE; break;
-        case KEY_UP:    cursor_move(&cur, &ctx, -1,  0); break;
-        case KEY_DOWN:  cursor_move(&cur, &ctx, +1,  0); break;
-        case KEY_LEFT:  cursor_move(&cur, &ctx,  0, -1); break;
-        case KEY_RIGHT: cursor_move(&cur, &ctx,  0, +1); break;
+        case KEY_UP:
+        case KEY_DOWN:
+        case KEY_LEFT:
+        case KEY_RIGHT: cursor_move(&cur, &ctx, ch); break;
         }
 
         int64_t now = clock_ns();

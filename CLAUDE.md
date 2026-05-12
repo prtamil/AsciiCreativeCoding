@@ -12,7 +12,8 @@ A file in this codebase passes through three phases. Each activates a different 
 |---|---|---|---|
 | **Phase 1 — Author** (new file) | "write a new X", "add a demo for Y" | working production version, validated by clean compile + visual inspection. 250-450 lines. | *Learner-Friendly Code Standards / Structure*; *New Simulation Workflow* |
 | **Phase 2 — Iterate** (surgical edit) | bug fix, "change X to Y", visual symptom report | minimum diff that solves the request | §3 *Surgical Changes* |
-| **Phase 3 — Pedagogical refactor** | any phrase combining *refactor/rewrite* with *learn/teach/pedagogy/first principles* | turn validated file into embedded textbook. 1.5×-2× growth. | *Pedagogical Refactor Recipe*; overrides "match existing style" and the 250-450 target |
+| **Phase 3 — LITERATE refactor** | the word `LITERATE`, `/literate <file>`, or any phrase combining *refactor/rewrite* with *learn/teach/pedagogy/first principles* | turn validated file into embedded textbook via the LITERATE 3-step procedure. **Don't read existing prose** — read code only, inventory the algorithm in your own words, write fresh prose from the inventory. Length is whatever the acceptance test requires (typically 1.5×–2× on Phase-1 files; less on already-pedagogical ones). | *LITERATE Refactor Doctrine*; overrides "match existing style" and the 250-450 target |
+| **Phase 3b — UPDATE_LITERATE** (comment-only) | the word `UPDATE_LITERATE`, `/update-literate <file>`, "redo the comments on X" | assumes Step 0 (color/HUD/themes) and Step 1 (code) already done; **read code only**, erase all narrative prose, rewrite the comment layer from scratch via LITERATE Step 2 | *UPDATE_LITERATE Procedure* |
 
 When unsure which mode applies, name it explicitly: *"This is a Surgical edit, so I'll only touch X."*
 
@@ -30,13 +31,32 @@ The user runs the program, reports what they see; converge via surgical edits. O
 
 **End** = explicit user approval ("looks good" / "ship it"). The file is then **validated**.
 
-### Phase 3 — Pedagogical refactor
+### Phase 3 — LITERATE refactor
 
-Add (on top of phase-1 file): HOW TO READ THIS FILE block, GUIDED TUTORIAL, per-function teaching blocks, debug overlays (`d`/`D`), long-name expansion, inline pedagogy. Phase 3 works **because** phase 2 has validated the algorithm.
+Invoked by the trigger word `LITERATE` (or `/literate <filename>`). Turns a validated phase-1 file into an embedded textbook via a fixed 3-step procedure:
+
+```
+  Step 0 ─── color / HUD / themes / debug overlay   (visual scaffolding)
+  Step 1 ─── refactor code from scratch             (pseudocode-shaped bodies)
+  Step 2 ─── refactor comments                      (the textbook around the code)
+```
+
+**STRICTLY clean-slate.** Even when 80–90 % of the existing themes/HUD/code/prose is good and reusable, throw it all out and rebuild from zero. The point is to force a fresh teaching pass at every layer; preserving "good enough" pieces leaks stale framing and prevents the doctrine from doing its job. If the rebuild ends up identical to what was there, that confirms the original was already correct — but the work was still done.
+
+Full procedure: **LITERATE Refactor Doctrine** at the bottom of this file. Phase 3 works **because** phase 2 has validated the algorithm.
+
+### Phase 3b — UPDATE_LITERATE (comment-only refresh)
+
+Invoked by `UPDATE_LITERATE` (or `/update-literate <filename>`). The comment-only sibling of LITERATE — useful when Step 0 (color/HUD/themes/debug) and Step 1 (code structure) are already in good shape but the comment layer is missing, stale, or pre-LITERATE.
+
+Procedure: scan the code to inventory in your own words, **erase EVERY existing prose comment block**, then apply LITERATE Step 2 (all ten subsections) from zero. Code bodies are not touched; only narrative comments are erased and rewritten.
+
+Full procedure: **UPDATE_LITERATE Procedure** at the bottom of this file.
 
 ### Phase violations
 
-- Phase 3 requested before phase 2 ended → ask whether the algorithm is validated. Pedagogy on a buggy algorithm wastes effort.
+- LITERATE requested before phase 2 ended → ask whether the algorithm is validated. Pedagogy on a buggy algorithm wastes effort.
+- UPDATE_LITERATE requested on a file whose code is NOT pseudocode-shaped (no helpers, no named locals, no layer functions) → push back: run LITERATE Step 1 first, then UPDATE_LITERATE.
 - "Phase 1 with phase 3 quality" → warn that the textbook may need rewriting after phase 2 finds bugs; offer minimal phase 1 first.
 - Old file the user wrote alone, never validated → treat as phase-2-pending.
 
@@ -374,37 +394,341 @@ If a reader goes blank: fix prose first, then structure, then — last — code.
 
 ---
 
-# Pedagogical Refactor Recipe
+# LITERATE Refactor Doctrine
 
-Triggered by phrases combining *refactor/rewrite* with *learn/teach/pedagogy/first principles*. NOT a production cleanup — a deep rewrite that turns the file into an embedded textbook.
+> **Trigger:** the word `LITERATE`, `/literate <filename>`, or any phrase combining *refactor/rewrite* with *learn/teach/pedagogy/first principles*.
+
+A LITERATE pass turns a validated Phase-2 file into an embedded textbook. The reader learns the algorithm by reading the file top-to-bottom — no external docs required. Canonical reference: `particle_systems/comet.c`.
 
 ## Mindset
 
 - Clarity over cleverness.
-- Intuition over performance.
+- Intuition over performance — but never tank performance (Step 1 has explicit guardrails).
 - Explicitness over compactness.
 - Mental models over abstraction layers.
 
-Rebuild from first principles. Don't tidy existing code — reconstruct as if explaining to a beginner who knows basic C but nothing about the domain.
+## Preconditions
 
-## Output structure (in order)
+- File passed Phase 2: algorithm validated by visual inspection, no known bugs.
+- Compiles clean with `-Wall -Wextra`.
 
-1. **File header** (per the standard above).
-2. **HOW TO READ THIS FILE** — 15-25 lines: reading order, long-name convention, required background.
-3. **CONCEPTS block** (5 subsections, ≥2 references).
-4. **MENTAL MODEL block** (all 6 subheadings, ≥1 ASCII diagram).
-5. **GUIDED TUTORIAL** — 6-12 numbered mini-tutorials building the algorithm from first principles. Each: opens with a question, plain English first, ASCII diagram or worked example, ends with simplified pseudocode. Cover (in order): core problem, data layout, each transformation step, coordinate-system bridges, render/sim interface.
-6. **§1..§N actual code**, broken into many small sections (≥15 for non-trivial files), each ≤~100 lines, one concept each.
+## Clean-slate rule — read code, never existing prose
 
-## For every section
+**Do NOT read existing prose blocks.** Skip past them on the way to the code. Specifically: file header `/* ... */`, HOW TO READ block, CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL, per-§ section preambles, per-function comment blocks, and multi-line pedagogical comments inside function bodies — all of these are off-limits during a LITERATE pass.
 
-Open with educational preamble: problem being solved, why this logic exists, assumptions, inputs, outputs. The preamble is the reader's running orientation.
+What you DO read: function signatures, struct fields, function bodies, key constants in §1, the call tree implied by who-calls-whom. Build your inventory of the algorithm in your own words from that. Then write fresh prose against the inventory.
 
-## For every function
+Three reasons this rule matters:
+1. **Eliminates stale framing.** Existing prose may carry framing that's wrong, partial, or domain-jargon-heavy. Not reading it removes the temptation to lightly edit it.
+2. **Eliminates phrase leakage.** Reading the original then "rewriting from scratch" still leaves trace borrowings. Skipping it entirely is mechanically simpler and bigger reduction in token cost.
+3. **Forces the cognitive lift.** The work IS re-deriving understanding from code. Skipping that step defeats the doctrine.
 
-Comment block above signature: **Purpose** (one sentence), **Pseudocode** mirroring the body 1:1, **Mental model** (analogy), **Inputs/outputs/units** (with coordinate systems), **Why it exists** (what would break if merged with caller). Body mirrors pseudocode line-for-line with inline concept names. Same length discipline (≤30 target, ≤60 for orchestrators).
+The rule applies to LITERATE first-pass AND refinement-pass AND UPDATE_LITERATE. The output may end up similar to what was there — that's fine; what matters is the fresh pass was done from the code.
 
-## Variable naming — long descriptive names everywhere
+## Up-front clarifying questions
+
+Before reading the file, pause with one tool call asking 2–3 scope questions. Don't burn tokens reading code you're going to skip, or skipping work the user wants done.
+
+**Q1 (always): Scope.**
+- Full LITERATE (Step 0 + 1 + 2).
+- Skip Step 0 — themes / HUD / debug are already correct; refactor code + comments only.
+- Comments only — switch to UPDATE_LITERATE (cheaper, no code touched).
+
+**Q2 (when Step 0 is in scope): Add features not yet present?**
+- Yes: 10 doctrine themes + debug overlay.
+- Themes only.
+- Skip — file already has everything it needs.
+
+**Q3 (when uncertain): Section structure?**
+- Keep current section count if it's natural for the file.
+- Match the canonical breakdown (one section per concept, typically 8–12 for a 1000-line file).
+
+Don't make this a long interrogation — the goal is to narrow scope in 30 seconds before doing real work.
+
+## The procedure — three sequential steps
+
+```
+  Step 0  ─── color / HUD / themes / debug overlay   (visual scaffolding)
+  Step 1  ─── refactor code from scratch             (pseudocode-shaped bodies)
+  Step 2  ─── refactor comments                      (the textbook around the code)
+```
+
+Each step must compile clean and visually verify before the next begins. No step is skipped.
+
+---
+
+## STEP 0 — Color, HUD, themes, debug overlay
+
+Visual scaffolding the textbook hangs off. Done first so Steps 1–2 reference real symbols.
+
+### Color pairs
+
+All ramps + HUD + hints initialised in `color_init()`. `PAIR_HUD` = bright yellow + `A_BOLD`; `PAIR_HINT` = bright cyan + `A_BOLD`. Every palette colour in the BRIGHT half of the 256-cube (see *Theme Palette Brightness*).
+
+### HUD
+
+Two fixed UI lines, both `A_BOLD`:
+
+- Top row (right-aligned): `fps · sim:Hz · STATE`.
+- Bottom row: every interactive key, plus the active theme name.
+
+### Themes — 10 by default
+
+Override only on explicit user request.
+
+| # | Name    | Feel                                       |
+|---|---------|--------------------------------------------|
+| 1 | matrix  | green-on-black, terminal classic            |
+| 2 | neon    | hot magenta + cyan, 80s arcade              |
+| 3 | nova    | white-hot core, red rim                     |
+| 4 | ocean   | deep blue → cyan → white                    |
+| 5 | fire    | red → orange → yellow                       |
+| 6 | toxic   | acid green → yellow                         |
+| 7 | gold    | warm browns → cream                         |
+| 8 | ice     | dark blue → pale cyan                       |
+| 9 | aurora  | green / cyan / magenta multi-hue            |
+| 10| plasma  | purple → pink → cyan                        |
+
+Each theme is an 8-step `ramp[0..7]` (cool/dim → hot/bright) plus dedicated `head`/`halo`/`accent` colours. Cycled with `t` / `T`; theme name shown in HUD.
+
+### Debug overlay
+
+Toggled with `d` / `D`. Cycles through visualisations of intermediate simulation state — ONE piece per overlay. Domain examples:
+
+| Domain         | Overlays                                                       |
+|----------------|----------------------------------------------------------------|
+| Fluid          | density / temperature / velocity / pressure / divergence        |
+| Raymarcher     | depth / normal / step-count / curvature / orbit-trap            |
+| Particle       | spawn-rate / per-pool counts / age histogram                    |
+| Fractal        | iteration-count / escape-ratio                                  |
+| Rasteriser     | per-stage buffers (z / normal / AO / light)                     |
+| Cellular auto. | rule-rate / density / age-since-flip                            |
+
+The debug overlay's source IS part of the lesson — write it as cleanly as the main render.
+
+---
+
+## STEP 1 — Refactor code (pseudocode-shaped bodies)
+
+The body of every function should READ like its pseudocode block. Lever: **helper extraction by activity**, not by line count. Performance preserved by guardrails below.
+
+### Helper categories
+
+Every helper falls in one of these slots. Render (`scene_draw`, `*_draw_*`) and tick (`scene_tick`, `phase*_*`) code in particular should use helpers HEAVILY — that is where readers lose the thread.
+
+| Category         | Purpose                                  | Examples (from `comet.c`)                                        |
+|------------------|------------------------------------------|------------------------------------------------------------------|
+| Calculation      | Pure: inputs → derived value             | `round_to_cell`, `trail_freshness`, `ramp_slot_from_freshness`   |
+| Predicate        | Pure, returns bool                       | `cell_visible`, `comet_off_screen`                               |
+| Update / mutate  | Modifies ONE struct in place             | `comet_apply_plasma_kick`, `comet_emit_trail_particles`          |
+| Algorithmic step | Performs one named activity              | `paint_cell`, `scene_emit_trail`, `blast_ignite`                 |
+| Layer / phase    | Orchestrator over a pool or render stage | `scene_draw_trail_layer`, `phase2_advance_all_comets`            |
+
+### Pattern A — Pull intermediate expressions into named locals
+
+Every non-trivial expression gets a name BEFORE it is used.
+
+```c
+/* BAD — context hides inside expressions */
+int ix = (int)(p->x + 0.5f);
+if (ix < 0 || ix >= cols) continue;
+float f = 1.0f - p->age / p->life;
+int slot = (int)(f * 7.999f);
+
+/* GOOD — each step is a named noun */
+int   cell_x    = round_to_cell(p->x);
+int   cell_y    = round_to_cell(p->y);
+if (!cell_visible(cell_x, cell_y, cols, rows_playable)) continue;
+float freshness = trail_freshness(p->age, p->life);
+int   ramp_slot = ramp_slot_from_freshness(freshness);
+```
+
+A helper pays its way the first time it removes ambiguity at the call site, not the third time it deduplicates code.
+
+### Pattern B — Orchestrators as tables of contents
+
+Long functions become call trees. The reader descends to the level of detail they need.
+
+```c
+static void scene_draw(const Scene *s) {
+    int rows_playable = s->rows - 1;
+    scene_draw_trail_layer (s, rows_playable);   /* background */
+    scene_draw_blast_layer (s, rows_playable);   /* mid-ground */
+    scene_draw_comet_layer (s, rows_playable);   /* foreground */
+}
+```
+
+The §-section preamble (written in Step 2) lists the full call tree so the reader has a roadmap.
+
+### Pattern C — Step-labelled comments inside bodies
+
+When a function's pseudocode block lists N steps, repeat those labels inside the body:
+
+```c
+static void scene_emit_trail(Scene *s, const Comet *c) {
+    /* Step 1 — find an inactive TrailParticle slot; bail if pool full. */
+    int slot_index = trail_pool_find_inactive(s);
+    if (slot_index < 0) return;
+    /* Step 2 — perpendicular unit vector to the comet's flight direction. */
+    float comet_speed = sqrtf(c->vx * c->vx + c->vy * c->vy);
+    ...
+}
+```
+
+### Performance guardrails
+
+Clarity-over-performance is bounded. Pedagogy must not regress frame rate.
+
+- Small helpers (≤ 10 lines) → `static inline`.
+- No malloc in the hot path. All pools allocated in init.
+- Don't recompute a value in two helpers if one helper can pass it as argument.
+- Don't add a 3-layer call chain around a 3-line core — that is over-engineered.
+- If a helper changes a measured benchmark by > 5 %, inline it back and accept the longer function.
+
+### Exception — keep loop ephemera short
+
+`i`, `j`, `dx`, `dy`, `t` remain OK inside ≤ 5-line loop bodies. The naming table in Step 2 applies to *scope-significant* values, not iteration counters. Renaming `i` to `loop_index` is noise.
+
+### Acceptance for Step 1
+
+Read each function body aloud, one line at a time. If a line requires re-reading or mental arithmetic to understand its purpose, it deserves a named helper or a named local. After extraction every function reads as one verb per line. Compile + visual unchanged.
+
+---
+
+## STEP 2 — Refactor comments (the textbook)
+
+Only after Step 1 compiles clean. Each block below is mandatory. Pattern derived from `particle_systems/comet.c` — that file is the canonical template; consult it for full examples of every block.
+
+### 2.1  File header
+
+```c
+/*
+ * <filename>.c — <one-line visual description>
+ *
+ * DEMO: <2-4 sentences. What does the user see? What techniques,
+ *        algorithms, and tricks does it demonstrate?>
+ *
+ * Study alongside:
+ *   <2-3 sibling files. For each: 1 line on what is shared and
+ *    what differs.>
+ *
+ * Section map:
+ *   §1 config   — constants, themes, per-pattern parameters
+ *   §2 clock    — monotonic timer + sleep
+ *   §3 color    — palette pairs + theme cycle
+ *   §4 <entity> — primary struct + spawn + tick
+ *   §5 <entity> — secondary struct(s)
+ *   §6 scene    — pools, tick, draw orchestration
+ *   §7 screen   — ncurses init / draw / resize
+ *   §8 app      — signals, fixed-step main loop
+ *
+ * Keys:
+ *   q / ESC     quit              spc        pause / resume
+ *   r           reseed            d / D      cycle debug overlay
+ *   n / N p / P next / prev pattern
+ *   t / T       next / prev theme
+ *   + / -       faster / slower   ] / [      raise / lower tick Hz
+ *
+ * Build:
+ *   gcc -std=c11 -O2 -Wall -Wextra <path>/<file>.c -o <name> -lncurses -lm
+ */
+```
+
+### 2.2  HOW TO READ THIS FILE
+
+~10–15 lines. TWO subsections (the section map in the file header already gives the reading order, so don't duplicate it):
+
+- **NAMING** — one-line glossary for every significant identifier (struct, key constant, hot helper).
+- **BACKGROUND ASSUMED** — bullet list of prerequisite concepts (object pools, explicit Euler, ncurses double-buffer, etc.).
+
+If a non-obvious section should be read first or last, mark it inline in the file header's section map with `(start here)` / `(skip on first read)`.
+
+### 2.3  CONCEPTS
+
+Four subsections (Rendering is dropped — the section map + per-§ preambles already cover it). 2–5 references.
+
+| Subsection      | Contents                                                          |
+|-----------------|-------------------------------------------------------------------|
+| Algorithm       | One line — name + what it computes                                |
+| Data-structure  | What holds the state and why                                       |
+| Performance     | Why it fits in real time. Big-O per tick                           |
+| References      | 2–5 of: original paper, Wikipedia, textbook chapter, sibling file  |
+
+### 2.4  MENTAL MODEL
+
+Six fixed subheadings IN ORDER:
+
+1. **CORE IDEA** — one paragraph. The single sentence the learner walks away with.
+2. **HOW TO THINK ABOUT IT** — analogy from everyday intuition.
+3. **ALGORITHM IN STEPS** — numbered, plain English, no pseudocode syntax.
+4. **KEY FORMULAS** — every non-trivial equation with a one-line gloss.
+5. **EDGE CASES TO WATCH** — what bites: boundary conditions, off-by-one traps.
+6. **HOW TO VERIFY** — sanity checks the reader can do at runtime.
+
+≥ 1 ASCII diagram somewhere in the file.
+
+### 2.5  GUIDED TUTORIAL
+
+**6–7 numbered mini-lessons.** Tight target — if a lesson overlaps an adjacent one, merge them. Each lesson: opens with a question, plain English first, ASCII diagram or worked example where it helps, ends with the pseudocode or struct that maps onto a real symbol below.
+
+Cover IN ORDER, one lesson each:
+
+1. The core problem (what does the algorithm compute, and why is the obvious approach wrong).
+2. Data layout (what struct holds what, why N structs not one).
+3. The per-tick algorithm phases (one lesson, NOT one-per-phase).
+4. Coordinate-system bridges (cell ↔ pixel, polar ↔ Cartesian) — skip if there are none.
+5. Render / sim interface (the painter's algorithm, layer order).
+6. Themes + debug overlay (what they expose, why they exist).
+
+Lessons 4 and 6 are optional depending on the file. Default landing zone: 6 lessons.
+
+### 2.6  Per-§ section preamble
+
+Length proportional to section size. Don't write a 15-line preamble for a 30-line section.
+
+| Section size                       | Preamble                                                        |
+|------------------------------------|-----------------------------------------------------------------|
+| Small (< 40 lines, 1 struct or 3 small functions) | 2–3 lines: name what's in it, done.                 |
+| Medium (40–100 lines)              | 5–8 lines: what problem it solves + named members.              |
+| Large (orchestrator / CA / pipeline) | 10–15 lines: problem, why-here, inputs/outputs, call tree.    |
+
+### 2.7  Per-function comment block — TIERED
+
+Per-function blocks come in three sizes. Most functions get Tier 1 or Tier 2. **Tier 3 caps at ~10 functions per file** — only the orchestrators and non-obvious math.
+
+**Tier 1 — trivial helper (≤ 10-line body).** One-line comment above the signature.
+```c
+/* round_to_cell — float pos → integer cell index. */
+static inline int round_to_cell(float v) { ... }
+```
+
+**Tier 2 — default for algorithmic steps.** Two fields: Purpose + Pseudocode.
+```c
+/*
+ * paint_cell — wrap mvaddch in attron/off so callers stay one-line-clear.
+ *
+ *   attron(pair | attr); mvaddch(y, x, glyph); attroff(...).
+ */
+```
+
+**Tier 3 — orchestrators, coordinate transforms, non-obvious math.** Four fields:
+- **Purpose** — one sentence.
+- **Pseudocode** — mirrors body 1:1.
+- **Inputs / outputs / units** — with coordinate systems where applicable.
+- **Why it exists** — what would break if merged with caller.
+
+(The previous 5-field block had a "Mental model" sub-field; it's dropped. The file-level MENTAL MODEL section already handles analogies. Per-function analogies were almost always forced restatements of Purpose.)
+
+**Upgrade-to-Tier-3 triggers (any one):**
+- Function owns a call tree (scene_tick, scene_draw, bitmap_draw, main).
+- Function does coordinate-system transformation.
+- Function implements non-obvious math (decay table, FS dithering, gamma, polar emission).
+
+Body mirrors pseudocode line-for-line (Step 1 already enforced this).
+
+### 2.8  Variable naming — long descriptive names
+
+Scope-significant names get expanded (loop ephemera exempt per Step 1):
 
 | Before              | After                                   |
 |---------------------|-----------------------------------------|
@@ -417,24 +741,120 @@ Comment block above signature: **Purpose** (one sentence), **Pseudocode** mirror
 | `ro`, `rd`          | `cam.origin`, `direction`               |
 | `p`, `div`          | `pressure`, `divergence`                |
 | `buf1`, `buf2`      | `scratch_a`, `scratch_b`                |
+| `ix`, `iy`          | `cell_x`, `cell_y`                      |
+| `f`, `slot`         | `freshness`, `ramp_slot`                |
 
 Forbidden: vague names, hidden state, magic numbers, compressed math, premature optimisation, generic abstractions, expert shorthand.
 
-## Inline pedagogy + ASCII diagrams
+### 2.9  Inline pedagogy + ASCII diagrams
 
-Where non-obvious concepts appear (geometry, physics, rendering pipelines, interpolation, coordinate systems, state transitions, numerical approximation, memory layout, signal flow), pause and **teach** inline.
+Pause and teach inline where non-obvious concepts appear: geometry, physics, rendering pipelines, interpolation, coordinate systems, state transitions, numerical approximation, memory layout, signal flow.
 
-ASCII diagrams required for: struct memory layout, coordinate transformations, grid stencils (Laplacian, advection backward-trace), pipeline stages, ray paths through volumes, time-step state transitions, mesh winding, interpolation weighting.
+ASCII diagrams REQUIRED for: struct memory layout, coordinate transformations, grid stencils (Laplacian, advection backward-trace), pipeline stages, ray paths through volumes, time-step state transitions, mesh winding, interpolation weighting.
 
-## Educational debug helpers
+### 2.10  Delete-then-write order
 
-Optional overlays toggled by `d`/`D`. Each visualises one piece of intermediate state. Examples: fluid → density/temperature/velocity-arrows/pressure/divergence; raymarcher → depth/normal/step-count/curvature/orbit-trap; fractal → iteration-count/escape-ratio; rasteriser → per-stage buffers (z, normal, AO, light); CA → rule-rate/density/age-since-flip. The debug helper's source IS part of the lesson.
+Before writing any new prose: delete every existing prose block from the file (file header, HOW TO READ, CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL, per-§ preambles, per-function comment blocks, multi-line pedagogical comments inside function bodies). Then write fresh prose against the inventory you built from the code.
 
-## Expected outcome + acceptance test
+What stays:
+- `static const` data-table column header comments (label data layout, not narrative).
+- `/* Step N — ... */` labels inside function bodies (part of pseudocode-shaped code from Step 1).
+- One-line clarifications next to single tricky expressions.
 
-File length 1.5×-2× the production version — growth is comments, tutorials, debug helpers, never the algorithm itself.
+The delete-first order matters: keeping the old prose visible while writing the new prose invites lightly-edited rewrites and phrase leakage. See the *Clean-slate rule* at the top of this doctrine.
 
-A C programmer new to the technique should, within ten minutes of top-to-bottom reading: name the algorithm, sketch the data flow, predict each function from signature alone, identify which knob in §1 controls which visual effect. If they can't — more prose, more diagrams, more pseudocode. Not more code.
+---
+
+## Length discipline
+
+| Scope                | Target           | Hard cap |
+|----------------------|------------------|----------|
+| Function             | ≤ 30 lines       | ≤ 60 lines (orchestrators only) |
+| §-section            | ≤ 100 lines      | —        |
+
+**Section count: proportional, not absolute.** Roughly 1 section per 80–120 lines of code, with a floor of 5 for non-trivial files. A 400-line file lands at 5–6 sections; a 1500-line file at 10–15. Don't force splits that don't pay for themselves.
+
+**File growth: NOT a target.** The acceptance test drives length. Most first-pass LITERATE runs land at 1.5×–2× the production version; refinement passes land at 1.05×–1.2×. If the read-aloud test passes at 1.1×, ship at 1.1×. If it fails at 2×, keep going past 2×. The multiplier is a sanity check, not a goal.
+
+## Acceptance test (whole file)
+
+A C programmer new to the technique should, within ten minutes of top-to-bottom reading:
+
+1. Name the algorithm.
+2. Sketch the data flow on paper.
+3. Predict each function from its signature alone.
+4. Identify which knob in §1 controls which visible effect.
+
+If they can't, the failure path in order: **prose → structure → code**. Most learner-friendliness problems are explanation problems, not code problems.
+
+**This test is the length governor.** Length is whatever it takes to pass the test, no more.
+
+---
+
+# UPDATE_LITERATE Procedure
+
+> **Trigger:** the word `UPDATE_LITERATE`, `/update-literate <filename>`, or "redo the comments on X".
+
+UPDATE_LITERATE is the comment-only sibling of LITERATE. It assumes Step 0 (color/HUD/themes/debug overlay) and Step 1 (pseudocode-shaped code with extracted helpers) are already done; only the prose layer is rebuilt — from zero.
+
+## When to use
+
+- Code is already pseudocode-shaped from a prior LITERATE pass, but comments are missing, stale, or pre-LITERATE conventions.
+- After a Phase 2 bug fix changed an algorithm — comments now lie.
+- After a Step 1 structural refactor that introduced new helpers/layers — old per-function blocks don't cover the new symbols.
+
+## When NOT to use
+
+- File code structure is monolithic (no helpers, no named locals, no layer functions). Push back: run LITERATE Step 1 first, then UPDATE_LITERATE.
+- Phase 2 not yet validated. Pedagogy on a buggy algorithm wastes effort.
+
+## Procedure
+
+### 1. Scan to inventory — CODE ONLY
+
+Read the file's CODE only. Skip past every existing prose block — file header `/* ... */`, HOW TO READ, CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL, per-§ preambles, per-function comment blocks, multi-line pedagogical comments inside bodies. Do not read them. Do not quote them. Do not paraphrase them.
+
+What you DO read: function signatures, struct fields, function bodies, key constants in §1, the call tree implied by who-calls-whom. In working memory (NOT in a file), build:
+
+- Every `§` section and what it owns.
+- Every struct and its field meanings (from field declarations, not from comments).
+- Every function (signature + 1-sentence summary in your own words).
+- Every key constant in §1.
+- The full call tree of the per-tick + per-frame orchestrators.
+
+If you find yourself reading existing prose to understand the code, that's a signal the code is not pseudocode-shaped and you should be running LITERATE Step 1 first, not UPDATE_LITERATE.
+
+### 2. Erase ALL existing prose
+
+Delete every narrative comment block. Specifically:
+
+- File header `/* ... */` block at top of file.
+- `HOW TO READ THIS FILE` block.
+- `CONCEPTS` block.
+- `MENTAL MODEL` block.
+- `GUIDED TUTORIAL` block.
+- Per-§ section preamble comment blocks.
+- Per-function comment blocks above signatures.
+- Multi-line pedagogical comments inside function bodies.
+
+### 3. Preserve (do NOT erase)
+
+- `#include`s and forward declarations.
+- All function bodies — including `/* Step N — ... */` labels and short inline trick justifications inside bodies. Those are part of Step 1's pseudocode-shaped code, not prose.
+- `static const` data tables (themes, pattern_params, glyph ramps). One-line column-header comments labelling the table layout stay.
+- Signal handlers, `main()` loop skeleton, key handler.
+
+### 4. Apply LITERATE Step 2 from zero
+
+Write all ten Step 2 subsections (2.1 file header → 2.10 clean-slate compliance) against your inventory from step 1, NOT against the deleted prose. Canonical reference: `particle_systems/comet.c`.
+
+## Acceptance
+
+Same 10-minute read-aloud test as LITERATE. Code is unchanged; verify compile + visual are unchanged.
+
+## Length budget
+
+Growth is whatever it takes — typically the file doubles if it had thin comments to start, or grows 1.5× if it had pre-LITERATE prose. The byte count is not the target; the read-aloud test is.
 
 ---
 

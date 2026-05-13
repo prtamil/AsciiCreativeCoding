@@ -4,463 +4,165 @@
  *                 ncurses framework with a gamma → Floyd-Steinberg →
  *                 perceptual-LUT rendering pipeline.
  *
- * DEMO: A flame stands on the bottom edge of the terminal.  Heat
- *       lives in a uint8 grid; each cell reads a five-neighbour sum
- *       from the cells BELOW it (3 from one row below, 2 from two
- *       rows below — no centre on the deeper row), runs that sum
- *       through a precomputed decay lookup, and writes the cooled
- *       result back.  Two extra rows under the visible area are
- *       FUEL: each tick they are reseeded in an arch-shaped sweep
- *       so the flame stands tall in the middle and shorter at the
- *       sides.  The heat field is rendered by gamma-correcting
- *       each byte, dithering with Floyd-Steinberg error diffusion,
- *       looking the dithered float up in a perceptual LUT to pick
- *       one of nine glyphs from ' ' (cold) to '@' (hot), then
- *       painting that glyph in the active theme's colour pair.
- *       Press `t` to cycle 10 palettes; `d` to switch among four
- *       debug overlays that expose the raw CA state, the fuel
- *       band alone, and the un-dithered quantisation.
+ * Heat lives in a uint8 grid; each cell reads a 5-neighbour sum from
+ * the cells BELOW it (3 from one row below, 2 from two rows below — no
+ * centre on the deeper row), passes it through a precomputed decay
+ * table, and writes the cooled result back.  Two extra rows beneath
+ * the visible area are FUEL — reseeded each tick in an arch-shaped
+ * sweep so the flame stands tall in the middle.  The heat field is
+ * rendered by gamma-correcting each byte, dithering with Floyd-
+ * Steinberg error diffusion, looking the dithered float up in a
+ * perceptual LUT to pick one of nine glyphs from ' ' to '@', then
+ * painting that glyph in the active theme's colour pair.  10 themes;
+ * four debug overlays expose raw heat / fuel-only / no-dither.
  *
- * Study alongside:
- *   particle_systems/fire.c     Doom-style fire with a 3-neighbour
- *                               stencil but identical render pipeline.
- *                               Diff the two CAs to see why aafire
- *                               makes rounded blobs and Doom makes
- *                               sharp spires.
- *   particle_systems/embers.c   particle-based fire that uses no CA
- *                               at all.  Contrasts the grid approach
- *                               with the particle approach.
- *   particle_systems/comet.c    canonical reference for the LITERATE
- *                               doctrine this file is built under.
+ * Section map
+ *   §1  config             constants — sim, fuel, timing, palette
+ *   §2  clock              monotonic-ns timer + sleep
+ *   §3  LUT                perceptual heat → ramp bucket
+ *   §4  themes             10 colour palettes + theme_apply
+ *   §5  bitmap state       clamp helpers + Bitmap struct
+ *   §6  decay table        gentable() builds the per-row cooling LUT
+ *   §7  propagation        firemain() applies the 5-neighbour stencil
+ *   §8  fuel seeding       drawfire() seeds the bottom 2 rows in an arch
+ *   §9  bitmap lifecycle   alloc / free / init / per-tick orchestrator
+ *   §10 render pipeline    gamma → FS dither → LUT → paint
+ *   §11 scene              orchestrator: pause, debug-mode, tick, draw
+ *   §12 debug overlay      alternative render modes (raw / fuel / no-dither)
+ *   §13 screen + HUD       ncurses init + HUD strip + hint strip
+ *   §14 app                App struct + signal handlers + key dispatch
+ *   §15 main               fixed-step main loop
+ */
+
+/* ── CONCEPTS & ALGORITHMS ───────────────────────────────────────────── *
  *
- * Section map:
- *   §1  config             — sim constants, fuel knobs, timing
- *   §2  clock              — monotonic timer + sleep
- *   §3  LUT                — perceptual heat → ramp bucket
- *   §4  themes             — 10 colour palettes + theme_apply
- *   §5  bitmap state       — clamp helpers + Bitmap struct
- *   §6  decay table        — gentable() builds the per-row cooling LUT
- *   §7  propagation        — firemain() applies the 5-neighbour stencil
- *   §8  fuel seeding       — drawfire() seeds the bottom 2 rows in an arch
- *   §9  bitmap lifecycle   — alloc / free / init / per-tick
- *   §10 render pipeline    — gamma + Floyd-Steinberg dither + paint
- *   §11 scene              — orchestrator over Bitmap, pause, debug mode
- *   §12 debug overlay      — alternative render modes for inspection
- *   §13 screen + HUD       — ncurses init + bright HUD strip
- *   §14 app                — App struct + signal handlers + key dispatch
- *   §15 main               — fixed-step main loop
+ *   Cellular automaton    5-neighbour stencil reading cells BELOW; one
+ *                         cooled cell per step; rows propagate upward.
+ *                         → Wolfram (1983), Rev. Mod. Phys. 55: 601
  *
- * Keys:
- *   q / ESC    quit                     space      pause / resume
- *   t / T      next / prev theme        d / D      next / prev debug mode
- *   g / G      fuel up / fuel down      ] / [      sim Hz up / down
+ *   aalib fire CA         The exact stencil used by aalib 1.4 aafire.c.
+ *                         3 cells from y+1, 2 from y+2 (no centre).
+ *                         → Hubička, aalib 1.4 (1997-2001), aafire.c
  *
- * Build:
+ *   Floyd-Steinberg       Error-diffusion dithering: 7/16, 3/16, 5/16,
+ *                         1/16 distribution to forward neighbours.
+ *                         → Floyd & Steinberg (1976), Proc SID 17(2): 75
+ *
+ *   Gamma correction      sRGB-style luma·^2.2 power-law transfer.
+ *                         → ITU-R BT.709; Stevens power law for perception
+ *
+ *   Perceptual LUT        9 glyphs ' .:+x*X#@' partitioned by visual
+ *                         density steps; non-uniform breakpoints.
+ *                         → Stevens (1957), Psych. Rev. 64: 153
+ *
+ *   Decay table           Per-row cooling LUT precomputed once; indexed
+ *                         by 5-neighbour sum (0..1275) → cooled byte.
+ *                         → Toffoli & Margolus, Cellular Automata Machines
+ *
+ *   Fixed-step loop       sim_accum + dt-cap; deterministic physics
+ *                         regardless of render Hz.
+ *                         → Glenn Fiedler, "Fix Your Timestep!" (2004)
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── OVERALL PSEUDOCODE ──────────────────────────────────────────────── *
+ *
+ *   init:
+ *     install signals; start ncurses (themes + HUD/HINT pairs)
+ *     bitmap_init: alloc grid (rows + 2 fuel rows below); gentable
+ *
+ *   loop while running:
+ *     if need_resize:        endwin → refresh → bitmap_realloc
+ *     dt = clock_now − last_frame_time      (capped at 100 ms)
+ *     while sim_accum ≥ tick_ns:
+ *       scene_tick:           drawfire (seed fuel) + firemain (propagate)
+ *                              + cycle theme every CYCLE_TICKS
+ *       sim_accum -= tick_ns
+ *     scene_draw:             dispatch on debug_mode →
+ *                              bitmap_draw (full gamma+FS+LUT+paint)  OR
+ *                              scene_draw_debug (raw / fuel / no-dither)
+ *     screen_draw_hud_top_right + screen_draw_hint_bottom + present
+ *     getch + app_handle_key  q/space/t/d/g/]
+ *     sleep to ~60 fps
+ *
+ *   cleanup:
+ *     atexit endwin restores the terminal
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── DRIVER PSEUDOCODE ───────────────────────────────────────────────── *
+ *
+ * bitmap_tick(b):                                       (CA per-step driver)
+ *   drawfire(b)           seed bottom 2 fuel rows with arch-sweep bursts
+ *   firemain(b)           5-neighbour-below propagation + decay table
+ *   cycle_tick++;  if reached CYCLE_TICKS:
+ *     theme = (theme + 1) mod THEME_COUNT;  theme_apply(theme)
+ *     return true                          tells caller to clear screen
+ *   return false
+ *
+ *   Order matters: drawfire must run BEFORE firemain so the new fuel
+ *   bytes are visible to the propagation stencil's y+1 / y+2 reads.
+ *
+ *
+ * firemain(b):                                          (the headline algorithm)
+ *   for each cell (y, x), top-left to bottom-right:
+ *     sum = sample_five_neighbours_below(bmap, cols, x, y)
+ *           = bmap[y+1][x-1] + bmap[y+1][x] + bmap[y+1][x+1]      (3 cells)
+ *           + bmap[y+2][x-1]                + bmap[y+2][x+1]      (2 cells, no centre)
+ *     idx = min(sum, MAXTABLE - 1)                                paranoia clamp
+ *     bmap[y][x] = b->table[idx]                                  cooled byte
+ *
+ *   Skipping the centre cell on y+2 biases the stencil toward the SIDES
+ *   of the cell directly below — that's what gives aafire its rounded
+ *   blob shape rather than vertical streaks.  Edge columns clamp the
+ *   horizontal neighbours to keep reads in-bounds.
+ *
+ *
+ * scene_draw(s, cols, rows):                            (render dispatcher)
+ *   if debug_mode == DEBUG_OFF:  bitmap_draw (full gamma+FS+LUT+paint)
+ *   else:                        scene_draw_debug (raw heat / fuel / no-dither)
+ *
+ *   Two-line dispatcher; the heavy work lives in §10 (full pipeline) or
+ *   §12 (debug overlays).  Splitting this way means turning on a debug
+ *   mode never touches the production render code.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/*
+ * Keys
+ *   q | Q | ESC      quit                space      pause / resume
+ *   t / T            next / prev theme
+ *   d / D            next / prev debug mode
+ *   g / G            fuel up / fuel down
+ *   ] / [            sim Hz up / down
+ *
+ * Build
  *   gcc -std=c11 -O2 -Wall -Wextra particle_systems/aafire_port.c \
  *       -o aafire_port -lncurses -lm
  */
 
-/* ── HOW TO READ THIS FILE ────────────────────────────────────────────── *
+/* ── REFERENCES ──────────────────────────────────────────────────────── *
  *
- * READING ORDER
- *   1. CONCEPTS + MENTAL MODEL (below) — the CA in plain English with the
- *      key formulas and edge cases listed.
- *   2. GUIDED TUTORIAL (below) — eleven mini-lessons that build the
- *      whole system from "why does fire LOOK like that" up to the full
- *      gamma → dither → LUT → paint pipeline, the 10 themes, and the
- *      four debug overlays.
- *   3. §1 config — every constant you would tweak while experimenting.
- *      Read this BEFORE the algorithm so each magic-name has context.
- *   4. §6 bitmap state — the Bitmap struct is the simulation's data
- *      atlas; every later helper operates on this struct.  Skim it so
- *      the §7–§10 functions read with shared context.
- *   5. §7–§9 are the CA core, in execution order: gentable() builds the
- *      decay LUT once at init/resize, drawfire() seeds the fuel rows
- *      every tick, firemain() propagates every tick.
- *   6. §10 render pipeline is three passes over the same buffer.  Read
- *      them in order; each pass has one job.
- *   7. §11–§15 are scene orchestration, the debug overlay, ncurses,
- *      signals, key dispatch, and the main loop — standard framework
- *      glue used in other files in this repo.
+ * PAPERS
+ *   Floyd, R. W. & Steinberg, L. (1976)
+ *     "An Adaptive Algorithm for Spatial Greyscale"
+ *     Proceedings of SID 17(2): 75–77.   (Error-diffusion dither.)
+ *   Wolfram, S. (1983)
+ *     "Statistical mechanics of cellular automata"
+ *     Reviews of Modern Physics 55: 601–644.
+ *   Stevens, S. S. (1957)
+ *     "On the psychophysical law"
+ *     Psychological Review 64(3): 153–181.   (Perceptual power law.)
  *
- * NAMING (one line per significant identifier)
- *   Bitmap            simulation state struct.  Owns bmap / prev / dither
- *                     buffers, the decay table, the warm-up counter,
- *                     fuel intensity, theme + cycle scalars.
- *   bmap[]            uint8 heat grid.  Size cols × (rows + 2).  The
- *                     extra 2 rows on the bottom are FUEL — read by
- *                     firemain but never rendered.
- *   prev[]            uint8 mirror of last frame's bmap — used by the
- *                     diff-clear in pass 2 of the render pipeline.
- *   dither[]          float work buffer for Floyd-Steinberg.  Negative
- *                     value is the cold/skip sentinel.
- *   table[1280]       decay lookup — table[neighbour_sum] = decayed
- *                     output value.  Built once by gentable().
- *   ArchSweep         three counters (column, i1, i2) walking the fuel
- *                     rows.  Their min is the per-column heat ceiling.
- *   FireTheme         { name, fg256[9], fg8[9], attr8[9] } — one named
- *                     palette.  10 are declared in §3.
- *   DebugMode         enum { OFF, RAW, FUEL, NODITHER } — d/D selector.
- *   k_ramp[9]         glyph alphabet " .:+x*X#@".
- *   k_lut_breaks[9]   perceptual thresholds for each glyph bucket.
- *   PAIR_RAMP_BASE    colour pair for ramp bucket 0; bucket k uses
- *                     PAIR_RAMP_BASE + k.
- *   PAIR_HUD/HINT     bright theme-independent HUD pairs.
- *   COLD_SENTINEL     dither[] value used to mean "cell is cold; skip".
- *
- * BACKGROUND ASSUMED
- *   • Plain C, pointer arithmetic, fixed-size arrays.  No threads.
- *   • Cellular automata at a Game-of-Life level — each cell is a
- *     pure function of its neighbours.
- *   • Floyd-Steinberg dithering — distribute quantisation error to
- *     forward-unseen neighbours so banding breaks into a textured
- *     gradient.  Weights 7/3/5/1 over /16.
- *   • Perceptual gamma — eyes are non-linear in brightness.  A 1/2.2
- *     exponent on the [0, 1] linear value approximates a perceptually
- *     uniform response.
- *   • ncurses double-buffer pattern: single stdscr, frame loop is
- *     erase → draw → wnoutrefresh → doupdate.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── CONCEPTS ─────────────────────────────────────────────────────────── *
- *
- * Algorithm      : aafire is a 2-D cellular automaton on a uint8 heat
- *                  grid.  Each tick runs two sweeps over the grid:
- *
- *                    drawfire()    overwrites the bottom 2 rows (FUEL)
- *                                  with new random heat whose per-column
- *                                  ceiling follows an arch profile.
- *                    firemain()    for every cell, replaces its value
- *                                  with table[ Σ five neighbours below ].
- *                                  The decay table cools and averages
- *                                  in a single integer lookup.
- *
- *                  The 5-neighbour stencil reads 3 cells from y + 1 and
- *                  2 cells from y + 2 (skipping y + 2's centre).  That
- *                  asymmetric stencil is what produces the characteristic
- *                  rounded tongue shape:
- *
- *                    .   .   .         ← y         (cell being written)
- *                    a   b   c         ← y + 1
- *                    d       e         ← y + 2     (no centre)
- *
- *                  Decay table: table[s] = max(0, (s − minus) / 5)  with
- *                  minus = max(1, 800 / rows).  Subtraction BEFORE the
- *                  divide concentrates cooling on LOW sums, so dim outer
- *                  edges die fast while the bright core decays slowly.
- *
- * Data-structure : One flat uint8 array bmap[(rows + 2) × cols],
- *                  row-major bmap[y × cols + x].  The +2 phantom rows
- *                  on the bottom are the fuel band.  The decay table is
- *                  a single uint32 array of MAXTABLE = 1280 entries.
- *                  prev[] is a uint8 mirror of last frame's bmap for the
- *                  diff-clear in pass 2.  dither[] is a float work buffer
- *                  for Floyd-Steinberg.  Zero per-frame allocations —
- *                  every buffer is sized at init/resize and reused.
- *
- * Rendering      : Three sequential passes over the visible region:
- *
- *                    Pass 1   gamma-correct each heat byte into the
- *                             float dither buffer.  Cold bytes get a
- *                             COLD_SENTINEL value.
- *                    Pass 2   for each cell, quantise the gamma-corrected
- *                             value to a ramp bucket via k_lut_breaks[],
- *                             diffuse the quantisation error to forward
- *                             neighbours (Floyd-Steinberg 7/3/5/1),
- *                             paint k_ramp[bucket] in the theme's pair.
- *                             Cold cells that WERE lit last frame draw a
- *                             single ' ' to erase the stale glyph.
- *                    Pass 3   memcpy bmap → prev so next frame's pass 2
- *                             can do its diff-clear.
- *
- * Performance    : Three O(cols × rows) sweeps per tick (drawfire,
- *                  firemain, render).  At a 120 × 40 terminal that's
- *                  4 800 byte ops per sweep × 3 = ~14 k ops per tick.
- *                  60 ticks per second still leaves wall-clock budget
- *                  for ncurses I/O, which is the actual bottleneck.
- *                  No malloc/free after init; every per-tick byte
- *                  lives in a buffer allocated up front.
- *
- * References     :
- *   Jan "Yarrick" Olszak, aalib 1.4 — aafire.c (1999).  The original
- *     algorithm; this file ports the CA logic faithfully but rewrites
- *     the rendering layer.    https://aa-project.sourceforge.net/aalib/
- *   Fabien Sanglard, "How Doom Fire Was Done" (2014).  Walks through
- *     the simpler 3-neighbour Doom CA; diff against aafire's stencil
- *     to see why the silhouettes differ.
- *     http://fabiensanglard.net/doom_fire_psx/
- *   Floyd & Steinberg, "An Adaptive Algorithm for Spatial Greyscale"
- *     (SID International Symposium, 1976).  Original FS dithering paper.
- *   particle_systems/fire.c   — sibling file; same render pipeline,
- *                               Doom-style CA instead of aafire.
- *   particle_systems/comet.c  — canonical reference for the LITERATE
- *                               doctrine used by this file.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Fire is not a physics simulation — it is an upside-down convection
- * cellular automaton.  Each cell reads a smoothed-and-cooled average of
- * the cells BELOW it; fresh heat is injected at the bottom in an arch
- * shape; over a few hundred ticks the screen self-organises into the
- * familiar tongue-of-flame silhouette.  Zero floats, zero trigonometry,
- * zero physics in the hot path.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine a chimney filled with smoke detectors.  Every detector reports
- * "average of the five detectors below me, minus a cooling constant."
- * The minus is gravity-as-cooling: heat loses some energy with every
- * row it climbs.  The chimney is fed at the bottom by an uneven gas
- * burner whose flame is taller in the middle and shorter at the sides.
- * Run the chimney for a few thousand frames and you get the same
- * upward-pointing dome you see in a real fire — without a single line
- * of fluid dynamics.
- *
- * ALGORITHM IN STEPS
- * ──────────────────
- *  1. Allocate a (rows + 2) × cols byte grid.  The bottom 2 rows are
- *     FUEL — invisible to the renderer, readable by firemain.
- *  2. Build the decay table once: for every possible neighbour sum in
- *     [0, MAXTABLE − 1], compute max(0, (sum − cooling_per_row) / 5).
- *     cooling_per_row = max(1, 800 / rows).
- *  3. Each tick — drawfire() overwrites the two fuel rows.  An ArchSweep
- *     counter walks across cols; the per-column heat ceiling is
- *     min(i1, i2, height).  Within a burst of up to 6 cells the seed
- *     value walks ±2; the next burst picks its own base from rand()%cap.
- *  4. Each tick — firemain() sweeps the whole grid top-down.  For every
- *     (x, y), sum the 5 neighbours below, look up table[sum], write
- *     the result into bmap[y × cols + x].
- *  5. Render: gamma-correct each heat byte, diffuse Floyd-Steinberg
- *     error to forward neighbours, look up the dithered value in
- *     k_lut_breaks[] for a ramp bucket, paint k_ramp[bucket] in the
- *     theme's pair.  Cells that went hot → cold get a ' ' to erase
- *     the stale glyph.  memcpy bmap → prev for next frame's diff-clear.
- *  6. HUD: bright yellow row 0 with fps / theme / fuel / debug-mode;
- *     bright cyan row rows−1 with every key.
- *
- * KEY FORMULAS
- * ────────────
- *  decay table:    table[s] = max(0, (s − minus) / 5)
- *                  minus    = max(1, 800 / rows)
- *  arch ceiling:   cap      = min(i1, i2, height)
- *                  i1, i2 advance ±4 per cell
- *  seed value:     v        = (rand() % cap) × fuel_intensity
- *  intra-burst:    v        ← clamp(v + rand() % 6 − 2, 0, 255)
- *  perceptual:     g        = (heat / 255) ^ (1 / 2.2)
- *  FS weights:     7/16 right, 3/16 ↙, 5/16 ↓, 1/16 ↘
- *  bucket choice:  largest k such that g ≥ k_lut_breaks[k]
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • THE +2 PHANTOM ROWS.  firemain reads bmap[y + 2] for the bottom
- *    visible row, so the buffer MUST be (rows + 2) tall.  Forgetting
- *    this is the most common port bug — you get garbage flames or a
- *    segfault, depending on the malloc backing.
- *  • 800/rows UNDERFLOW.  On very tall terminals (rows > 800) the
- *    integer division gives 0 and the decay table collapses to all
- *    zeros (no cooling → flame fills the screen).  gentable() clamps
- *    cooling_per_row to ≥ 1.
- *  • CAP < 1.  The arch sweep can produce cap = 0 in early frames or
- *    on very narrow terminals.  rand() % 0 is undefined behaviour;
- *    the cap ≥ 1 floor is critical.
- *  • RESIZE REBUILDS GENTABLE.  The "minus" constant depends on rows,
- *    so a SIGWINCH must call gentable() or the cooling rate becomes
- *    wrong for the new aspect ratio.
- *  • DIFF-CLEAR vs FULL ERASE.  pass 2 writes ' ' only for cells
- *    that were lit LAST frame and cold THIS frame.  Without this,
- *    rapidly cooling cells leave stale glyphs on screen.
- *  • THEME CYCLE rebinds the same colour pair IDs to different RGB
- *    values, so a cell painted with PAIR_RAMP_BASE+5 last frame and
- *    again this frame visually changes colour.  After the cycle we
- *    set needs_clear so the screen redraws fully.
- *  • DEBUG OVERLAYS bypass parts of the pipeline; they must still
- *    set needs_clear when entered or stale glyphs from the previous
- *    render mode hang around.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Cold start: at t = 0 the grid is empty; over ~cols frames the
- *    flame grows as `height` climbs through the warm-up clamp.
- *  • G to lower fuel: the dome shrinks without changing shape.
- *  • Pause then unpause: the flame continues from its current state,
- *    NOT a fresh cold seed.
- *  • t to cycle themes: silhouette unchanged, only colour shifts.
- *  • d into DEBUG_RAW: every cell shows a hex digit 0–F from the raw
- *    heat byte — the bare CA state, no rendering pipeline at all.
- *  • d again into DEBUG_FUEL: only the bottom 2 rows are painted;
- *    you can watch the arch sweep + ±2 walk in isolation.
- *  • d again into DEBUG_NODITHER: visible banding returns; contrast
- *    against DEBUG_OFF to appreciate what dithering buys.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ──────────────────────────────────────────────────── *
- *
- * Eleven mini-lessons in dependency order.  Each opens with a question,
- * answers in plain English, and ends with the pseudocode line that maps
- * onto a real function below.  Read in sequence.
- *
- * ─── 1.  Why does fire LOOK like that?  ──────────────────────────────── *
- *   Real fire is hot gas under gravity.  The hot part is less dense, so
- *   it rises; it mixes with cooler air on the way up, so it cools; the
- *   brightest place is the base, where the reaction is still happening.
- *   We DON'T simulate any of that.  We capture the SHAPE OF THE
- *   OBSERVATION: bright base, vertical streaks, flickering edges.  A
- *   tiny cellular automaton on a byte grid does the job.
- *
- *        observation  →  byte grid  →  per-tick CA  →  rendered image
- *
- * ─── 2.  Heat as a byte grid (no particles, no floats)  ──────────────── *
- *   Each terminal cell is one uint8 in [0, 255]:
- *      0   = cold / background
- *      255 = white-hot core
- *   The whole simulation state is bmap[(rows + 2) × cols] bytes.
- *   Particles would burn memory bandwidth on per-frame heap traffic;
- *   floats would let numerical drift sneak in over thousands of ticks.
- *   Bytes give exact reproducibility and trivial memcpy archiving.
- *
- *        bmap[y, x] : uint8 ∈ [0, 255]
- *
- * ─── 3.  The 5-neighbour stencil  ────────────────────────────────────── *
- *   To make heat RISE, write each cell as the smoothed average of cells
- *   BELOW it.  aafire picks five: three in y + 1 and two in y + 2.  Note
- *   the gap — y + 2 has NO centre cell.
- *
- *                .   .   .         ← y       (cell being written)
- *                a   b   c         ← y + 1   (3 neighbours)
- *                d       e         ← y + 2   (2 neighbours, NO centre)
- *
- *   Leaving the y + 2 centre off biases the stencil toward the SIDES of
- *   the cell directly below — that's what gives aafire its rounded
- *   tongue shape instead of straight vertical streaks.
- *
- *        new[x, y] = (a + b + c + d + e) / 5     minus a cooling constant
- *
- * ─── 4.  The decay table (cool BEFORE divide)  ───────────────────────── *
- *   The division by 5 averages the [0, 1275] sum back into [0, 255].
- *   "Minus a cooling constant" is the gravity-as-cooling step:
- *
- *        minus = max(1, 800 / rows)
- *
- *   Subtraction BEFORE division concentrates cooling on LOW sums, which
- *   is precisely where the flame should die — at the cold edges.  A high
- *   sum (bright core) is barely affected.  Build the table once, never
- *   divide in the hot loop:
- *
- *        table[s] = max(0, (s − minus) / 5)    for s = 0 .. 1279
- *
- *   1280 entries covers the maximum possible sum of 5 × 255 = 1275 with
- *   5 extra slots as paranoia padding.
- *
- * ─── 5.  Fuel-row seeding — the arch  ────────────────────────────────── *
- *   The bottom two rows are FUEL.  Each tick, fill them with random heat
- *   so the CA above has new material to propagate.  A uniform fuel row
- *   gives a flat-bottomed flame; aafire produces the iconic dome by
- *   SWEEPING three counters across cols:
- *
- *      i1     = 1, 5, 9, …         (grows from the LEFT edge by 4 per cell)
- *      i2     = 4·cols+1, …, 1     (shrinks from the RIGHT edge by 4 per cell)
- *      cap    = min(i1, i2, height)
- *
- *      heat ceiling
- *          .,;+x*X#@*Xx+;,.     ← the arch (drawn with the ramp glyphs)
- *          |________________|
- *                  cols
- *
- *   min(i1, i2) creates the dome shape; min(., height) clamps during the
- *   warm-up so flames start tiny and grow over the first ~cols frames.
- *
- *        cap  = min(i1, i2, height)    (≥ 1 floor — see edge cases)
- *        seed = (rand() % cap) × fuel_intensity
- *
- * ─── 6.  Bursts + ±2 random walk  ────────────────────────────────────── *
- *   Within a burst of up to 6 consecutive cells, the seed value is NOT
- *   chosen freshly per cell.  It walks ±2 around its starting value:
- *
- *        v ← seed
- *        for k in 0..burst_length:
- *          fuel_row [col] ← clamp(v)
- *          v             ← v + rand() % 6 − 2
- *          fuel_row2[col] ← clamp(v)
- *          v             ← v + rand() % 6 − 2
- *          advance sweep
- *
- *   This gives intra-burst micro-flicker (adjacent cells differ a little)
- *   while inter-burst macro-flicker is preserved (each burst picks its
- *   own base from rand() % cap).  The flame's texture comes from these
- *   walks more than from the arch sweep itself.
- *
- * ─── 7.  Why gamma correction?  ──────────────────────────────────────── *
- *   Mapping uint8 directly to 9 glyph buckets gives banding the eye can
- *   see — humans are more sensitive to brightness changes at the low
- *   end of the scale.  Gamma correction flattens the response curve:
- *
- *        normalised  = heat / 255                  ∈ [0, 1]
- *        perceptual  = normalised ^ (1 / 2.2)      ≈ perceived brightness
- *
- *   The 1/2.2 exponent compresses bright values and expands dark ones,
- *   so equal steps in `perceptual` correspond to equal steps in perceived
- *   brightness.  Downstream LUT breakpoints can now be evenly spaced
- *   and still look smooth.
- *
- * ─── 8.  Floyd-Steinberg dithering  ──────────────────────────────────── *
- *   Even with gamma correction, 9 glyph buckets across [0, 1] leave
- *   visible bands.  Floyd-Steinberg fixes the banding by distributing
- *   each cell's quantisation error to forward neighbours:
- *
- *                ──► 7/16 to (x + 1, y)
- *      3/16 to  (x − 1, y + 1)
- *      5/16 to  (x,     y + 1)
- *      1/16 to  (x + 1, y + 1)
- *
- *   The numerator weights add to 16; dividing distributes the same
- *   total error.  Over a region the per-cell error averages out to zero,
- *   so banding becomes a textured gradient.
- *
- *        error = perceptual − bucket_midpoint
- *        diffuse(error, 7/16, 3/16, 5/16, 1/16)
- *
- * ─── 9.  Diff-clearing vs erase()  ───────────────────────────────────── *
- *   erase() retransmits the whole screen every frame — visible flicker
- *   on slow terminals.  Instead, pass 3 memcpys bmap → prev; next frame's
- *   pass 2 writes ' ' only for cells that went from prev > 0 to current
- *   == 0.  Most frames touch only a handful of cells; the terminal
- *   repaint cost stays nearly free.
- *
- *        if perceptual == COLD_SENTINEL  AND  prev > 0:  mvaddch(' ')
- *
- * ─── 10.  The ten themes  ────────────────────────────────────────────── *
- *   Each theme is just a 9-colour ramp (cold → hot) plus an 8-colour
- *   fallback table for non-256-colour terminals.  Theme cycling rebinds
- *   the same colour pair IDs to different RGB values, so the flame's
- *   silhouette is preserved exactly — only the palette shifts.
- *
- *      matrix   ocean   ice            cool palettes (green / blue / cyan)
- *      neon     plasma  aurora         saturated mixed palettes
- *      nova     fire    gold   toxic   warm palettes (red / orange / yellow)
- *
- *   `t` advances, `T` retreats.  Auto-advance every CYCLE_TICKS ticks
- *   so an idle demo keeps looking fresh.
- *
- * ─── 11.  Debug overlays  ────────────────────────────────────────────── *
- *   Four render modes selectable with `d` / `D`:
- *
- *      DEBUG_OFF        normal pipeline (default)
- *      DEBUG_RAW        each cell shows the heat byte in hex (0-F);
- *                       reveals the raw CA state without gamma / dither /
- *                       LUT.
- *      DEBUG_FUEL       only the bottom 2 fuel rows are painted; lets
- *                       you watch the arch sweep + ±2 walk in isolation.
- *      DEBUG_NODITHER   gamma + LUT + paint, no Floyd-Steinberg;
- *                       contrast against DEBUG_OFF to see what dithering
- *                       removes.
- *
- *   The debug renderer's source is in §12 and IS part of the lesson.
+ * BOOKS
+ *   Toffoli, T. & Margolus, N. — "Cellular Automata Machines: A New
+ *     Environment for Modeling"  (MIT Press, 1987)
+ *     Ch. 4 covers neighbourhood stencils + table-driven CAs.
+ *   Foley, J. et al. — "Computer Graphics: Principles and Practice"
+ *     (Addison-Wesley, 2nd ed. 1990)
+ *     §13.3.3 derives Floyd-Steinberg + alternative kernels.
+ *   Press et al. — "Numerical Recipes in C"  (3rd ed., 2007)
+ *     §17.x fixed-step integration; §15.x dithering primitives.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -528,47 +230,22 @@ static void clock_sleep_ns(int64_t ns)
 /* §3  LUT — perceptual heat → ramp bucket                                */
 /* ===================================================================== */
 
-/*
- * §3 PREAMBLE — quantising perceptual heat to a glyph bucket
- * ──────────────────────────────────────────────────────────
- *
- * The render pipeline (§10) computes a gamma-corrected float in
- * [0, 1] for each cell.  This section maps that float onto one of
- * 9 glyph buckets, then exposes the bucket's midpoint so Floyd-
- * Steinberg can compute its quantisation error.
- *
- *   k_ramp[9]         the glyph alphabet, cold → hot.
- *   k_lut_breaks[9]   perceptual thresholds, each bucket covers
- *                     roughly equal perceived brightness.
- *   lut_index(v)      which bucket does v belong in?
- *   lut_midpoint(k)   centre of bucket k — used for FS error.
- */
-
-/*
- * Ramp — same 9-level set as fire.c.
- * ' ' = cold/background, '@' = hottest core.
- */
+/* k_ramp — 9 glyphs cold → hot.  Same alphabet as fire.c. */
 static const char k_ramp[] = " .:+x*X#@";
 #define RAMP_N (int)(sizeof k_ramp - 1)
 
-/*
- * HUD/HINT color pairs sit AFTER the theme palette so theme cycling
- * (which only touches CP_BASE..CP_BASE+RAMP_N-1) never clobbers them.
- *
- *   PAIR_HUD  — bright yellow 226 (8-color fallback: COLOR_YELLOW)
- *   PAIR_HINT — bright cyan   51  (8-color fallback: COLOR_CYAN)
- *
- * Both drawn with A_BOLD per CLAUDE.md HUD standard — never A_DIM, so the
- * lines stay legible against the brightest theme.
- */
+/* HUD/HINT pairs sit ABOVE the theme palette so theme cycling
+ * (CP_BASE..CP_BASE+RAMP_N-1) never clobbers them. */
 #define PAIR_HUD  (CP_BASE + RAMP_N)
 #define PAIR_HINT (CP_BASE + RAMP_N + 1)
 
+/* k_lut_breaks — perceptual thresholds; each bucket ≈ equal perceived brightness. */
 static const float k_lut_breaks[RAMP_N] = {
     0.000f, 0.080f, 0.180f, 0.290f, 0.390f,
     0.500f, 0.620f, 0.750f, 0.900f,
 };
 
+/* lut_index — float in [0, 1] → bucket index in [0, RAMP_N). */
 static int lut_index(float v)
 {
     int idx = 0;
@@ -588,19 +265,18 @@ static float lut_midpoint(int idx)
 /* ===================================================================== */
 
 /*
- * §4 PREAMBLE — colour palettes
- * ─────────────────────────────
+ * FireTheme — one palette: 9-entry ramp from cold (bucket 0) to hot (8).
  *
- * Each FireTheme is a 9-entry ramp from cold (bucket 0) to hot
- * (bucket 8).  fg256 is the 256-colour-cube index for terminals that
- * support it; fg8 is the basic-8-colour fallback; attr8 layers
- * A_DIM / A_NORMAL / A_BOLD on top of fg8 to expand the visible
- * brightness range when the palette is small.
+ *   name     cycled label, shown in HUD
+ *   fg256    256-cube colour index per ramp slot (rich terminals)
+ *   fg8      8-colour fallback per ramp slot
+ *   attr8    A_DIM / A_NORMAL / A_BOLD per slot — expands the visible
+ *            brightness range on basic-8 terminals
  *
- * theme_apply() rebinds the 9 ramp pair IDs (CP_BASE+0..+8) to the
- * active theme's colours.  HUD pairs (PAIR_HUD/HINT) are bound once
- * by color_init() and never touched again — so theme cycling can
- * never break the HUD's legibility.
+ * Lifecycle: const table indexed by `Bitmap.theme`.  theme_apply()
+ *   rebinds colour-pair IDs CP_BASE+0..+RAMP_N-1 to the chosen entry.
+ *   HUD/HINT pairs (PAIR_HUD / PAIR_HINT) sit OUTSIDE that range so
+ *   the HUD never changes colour as themes cycle.
  */
 typedef struct {
     const char *name;
@@ -611,21 +287,10 @@ typedef struct {
 
 #define CP_BASE 1
 
-/*
- * The 10 default themes per LITERATE doctrine.  Order matches the
- * doctrine's canonical list:
- *
- *   matrix  neon  nova  ocean  fire  toxic  gold  ice  aurora  plasma
- *
- * Every fg256 in indices 1..8 sits in the BRIGHT HALF of the 256-cube
- * (cube ≥ 24, greys ≥ 244) per CLAUDE.md's Theme Palette Brightness
- * rule.  Index 0 is the "cold/empty" slot — its colour is never
- * visible because k_ramp[0] is the space character, so index 0 can
- * use the otherwise-forbidden 232.
- *
- * attr8[] layers A_DIM / A_NORMAL / A_BOLD on top of the basic-8
- * palette to expand the brightness range on small-palette terminals.
- */
+/* k_themes — 10 palettes (matrix / neon / nova / ocean / fire / toxic /
+ * gold / ice / aurora / plasma).  fg256 indices 1..8 sit in the bright
+ * half of the 256-cube (≥ 24); index 0 is the cold/empty slot whose
+ * colour is never visible (k_ramp[0] == ' '). */
 static const FireTheme k_themes[] = {
     { "matrix",
       { 232,  22,  28,  34,  40,  46,  82, 118, 231 },
@@ -700,6 +365,7 @@ static const FireTheme k_themes[] = {
 };
 #define THEME_COUNT (int)(sizeof k_themes / sizeof k_themes[0])
 
+/* theme_apply — rebind the RAMP_N ramp pair IDs to k_themes[t]. */
 static void theme_apply(int t)
 {
     const FireTheme *th = &k_themes[t];
@@ -710,6 +376,8 @@ static void theme_apply(int t)
             init_pair(CP_BASE+i, th->fg8[i],   COLOR_BLACK);
     }
 }
+
+/* color_init — start_color + apply initial theme + pin HUD/HINT pairs. */
 static void color_init(int theme)
 {
     start_color();
@@ -721,6 +389,7 @@ static void color_init(int theme)
     init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
 }
 
+/* ramp_attr — colour pair + (256-mode) bold for top buckets / (8-mode) attr8. */
 static attr_t ramp_attr(int i, int theme)
 {
     attr_t a = COLOR_PAIR(CP_BASE+i);
@@ -736,45 +405,37 @@ static attr_t ramp_attr(int i, int theme)
 /* §5  bitmap state — clamp helpers + the Bitmap struct                   */
 /* ===================================================================== */
 
-/*
- * §5 PREAMBLE — what holds the simulation state
- * ─────────────────────────────────────────────
- *
- * Two integer-clamp inlines + the Bitmap struct that owns every byte
- * touched by the per-tick code.  Reading this section before §6-§10
- * means every later helper signature reads with full context.
- *
- *   clamp_int       — clamp an integer to a closed interval.
- *   clamp_uchar_int — specialisation for uint8 saturation arithmetic.
- *   Bitmap          — the simulation's single mutable struct.
- */
+/* clamp_int — clamp v to closed interval [lo, hi]. */
 static inline int clamp_int(int v, int lo, int hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+/* clamp_uchar_int — uint8 saturation: clamp v to [0, 255]. */
 static inline int clamp_uchar_int(int v)
 {
     return clamp_int(v, 0, 255);
 }
 
 /*
- * Bitmap — aalib uses a flat uint8 array of (cols × (rows+2)).
- * The extra 2 rows at the bottom are the fuel rows that get seeded.
- * `rows` here is the visible rows; `rows+2` is the full height.
+ * Bitmap — the simulation's single mutable struct.  All per-tick code
+ * operates on this; nothing else holds CA state.
  *
- * table[]  — the decay lookup table built by gentable().
- *            table[sum_of_5_neighbours] = decayed heat value.
+ *   bmap[cols × (rows+2)]   uint8 heat grid; bottom 2 rows are fuel
+ *   prev[cols × rows]       last drawn frame — for diff-based clearing
+ *   dither[cols × rows]     float working buffer for Floyd-Steinberg
+ *   table[MAXTABLE=1280]    decay LUT built by gentable() at init/resize
  *
- * prev[]   — previous frame's bitmap for diff-based clearing.
- *            Only cells that went from hot to cold get erased.
+ *   cols, rows              terminal extent in cells (rows = visible only)
+ *   height                  frame counter; warms up until full brightness
+ *   loop                    fuel-burst countdown (aalib original logic)
+ *   sloop                   fuel-sweep cycle counter
+ *   fuel                    user-adjustable intensity, ∈ [0.1, 1.0]
+ *   theme, cycle_tick       active palette index + auto-cycle counter
  *
- * dither[] — float working buffer for Floyd-Steinberg.
- *
- * height   — frame counter; grows until fuel reaches full brightness.
- * loop     — countdown for fuel seeding bursts (original logic).
- * sloop    — counts seeding cycles.
- * fuel     — user-adjustable intensity [0.1, 1.0].
- * theme, cycle_tick — theme state.
+ * Lifecycle:
+ *   bitmap_alloc / bitmap_init at startup and on SIGWINCH (re-alloc).
+ *   bitmap_free at exit.  Every other operation in §6–§10 reads or
+ *   mutates this struct in place.
  */
 typedef struct {
     unsigned char *bmap;      /* [cols * (rows+2)] heat uint8             */
@@ -796,32 +457,10 @@ typedef struct {
 /* ===================================================================== */
 
 /*
- * §6 PREAMBLE — cool-before-divide as a precomputed table
- * ───────────────────────────────────────────────────────
- *
- * The propagation step in §7 sums 5 heat values from below and needs
- * to look up the cooled-and-averaged result.  Computing
- * max(0, (sum - cooling_per_row) / 5) in the inner loop would force
- * a division per cell; instead we precompute every possible answer
- * once at init / resize, then the hot loop is just an array index.
- *
- *   decay_table_entry  — single-entry calculation.
- *   gentable           — fill the entire 1280-entry table.
- *
- * The cooling rate depends on the row count, so SIGWINCH must call
- * gentable() — see §15.
- */
-
-/*
- * decay_table_entry() — one entry of the lookup table.
- *
- *   The full sum of 5 neighbours lives in [0, 5 × 255] = [0, 1275].
- *
- *   if sum ≤ cooling_per_row:  entry = 0           (cell becomes cold)
- *   else:                       entry = (sum − cooling_per_row) / 5
- *
- *   Subtracting BEFORE dividing concentrates cooling on low sums, which
- *   is precisely where we want the flame to die out.
+ * decay_table_entry — one entry of the cooling lookup table.
+ *   sum ≤ cooling_per_row:  return 0                 (cell goes cold)
+ *   else:                   return (sum - cooling_per_row) / 5
+ * Subtracting BEFORE dividing concentrates cooling on low sums.
  */
 static unsigned int decay_table_entry(int neighbour_sum, int cooling_per_row)
 {
@@ -829,18 +468,7 @@ static unsigned int decay_table_entry(int neighbour_sum, int cooling_per_row)
     return (unsigned int)(neighbour_sum - cooling_per_row) / 5;
 }
 
-/*
- * gentable() — build the entire decay lookup once per resize.
- *
- *   cooling_per_row = max(1, 800 / rows)
- *      • Big terminals (many rows) → small cooling, flame burns higher.
- *      • Small terminals          → big cooling, flame stays squat.
- *      • The max(1, …) guard prevents the table collapsing to all zeros
- *        on huge terminals where 800/rows would be 0.
- *
- *   The result is a 1280-entry table; the inner loop in firemain()
- *   never performs a division.
- */
+/* gentable — build the MAXTABLE decay LUT.  Called at init + on resize. */
 static void gentable(Bitmap *b)
 {
     int cooling_per_row = 800 / b->rows;
@@ -855,36 +483,13 @@ static void gentable(Bitmap *b)
 /* ===================================================================== */
 
 /*
- * §7 PREAMBLE — heat rises by reading the cells below
- * ───────────────────────────────────────────────────
+ * sample_five_neighbours_below — read the 5-cell aafire stencil at (x, y).
  *
- * The CA's signature step.  For every (x, y) in the visible grid we
- * sum 5 cells below — 3 from y+1 and 2 from y+2 — look the sum up in
- * the decay table, write the result back.  Top-down sweep order is
- * important: if we went bottom-up, a freshly-written hot cell could
- * be re-read in the SAME tick as a y+1 neighbour, polluting the
- * propagation with same-tick state.
+ *      .   .   .          ← y    (cell being written)
+ *      a   b   c          ← y+1  (3 neighbours)
+ *      d       e          ← y+2  (2 neighbours; NO centre — gives rounded blobs)
  *
- *   sample_five_neighbours_below  — one cell's neighbour sum.
- *   firemain                       — the full top-down sweep.
- */
-
-/*
- * sample_five_neighbours_below() — read the 5 cells in the aafire stencil.
- *
- *   The five cells live BELOW (x, y) — positive y = down:
- *
- *                    .   .   .          ← y    (cell being written)
- *                    a   b   c          ← y+1  (3 neighbours)
- *                    d       e          ← y+2  (2 neighbours, NO centre)
- *
- *   Skipping the centre on y+2 biases the stencil toward the sides of
- *   the cell directly below; this is what gives aafire its rounded
- *   blob shape instead of vertical streaks.
- *
- *   Edge columns clamp left and right neighbours to the nearest valid
- *   column so the stencil never reads off-grid horizontally.  The
- *   (rows + 2) buffer height ensures the y+2 reads stay in bounds.
+ * Edge columns clamp horizontally; the (rows+2) buffer keeps y+2 in bounds.
  */
 static unsigned int sample_five_neighbours_below(const unsigned char *bmap,
                                                  int cols, int x, int y)
@@ -904,15 +509,34 @@ static unsigned int sample_five_neighbours_below(const unsigned char *bmap,
 }
 
 /*
- * firemain() — propagate heat upward via 5-neighbour averaging.
+ * firemain — DRIVER.  The headline algorithm.  5-neighbour-below
+ *            propagation + decay table; one full top-down sweep per tick.
  *
- *   For every cell from top-left to bottom-right:
- *      neighbour_sum  ← sample the 5 cells below
- *      table_index    ← min(neighbour_sum, MAXTABLE − 1)
- *      bmap[y][x]     ← table[table_index]
+ *   for each cell (y, x), top-left → bottom-right:
+ *     sum ← sample_five_neighbours_below(bmap, cols, x, y)
+ *     idx ← min(sum, MAXTABLE - 1)                paranoia clamp;
+ *                                                  max real sum = 5·255 = 1275
+ *     bmap[y][x] ← b->table[idx]                   cooled byte
  *
- *   The clamp on table_index is paranoia: the stencil's maximum sum is
- *   5 × 255 = 1275, comfortably under MAXTABLE = 1280.
+ * INPUTS / UNITS
+ *   b   Bitmap mutated in place.  Reads from b->bmap, writes back to it.
+ *
+ * WHY TOP-DOWN
+ *   Bottom-up sweep would re-read freshly-written hot cells in the SAME
+ *   tick (the y+1 neighbour might be one we already wrote this pass),
+ *   polluting propagation with same-tick state and visibly speeding the
+ *   flame upward.  Top-down keeps each tick's reads against the PREVIOUS
+ *   tick's bmap state where it matters.
+ *
+ * WHY THIS STENCIL (not a 9-neighbour Moore or 4-neighbour von Neumann)
+ *   3 cells from y+1 + 2 cells from y+2 with NO centre on y+2 biases
+ *   the average toward the SIDES of the immediately-lower row.  That
+ *   side bias is what gives aafire its rounded blob shape rather than
+ *   vertical streaks (which Doom-style 3-cell stencils produce).
+ *
+ * COST
+ *   O(cols × rows) bytes touched per tick.  No allocations, no division
+ *   in the hot loop (the LUT pre-divides everything at init/resize).
  */
 static void firemain(Bitmap *b)
 {
@@ -935,36 +559,16 @@ static void firemain(Bitmap *b)
 /* ===================================================================== */
 
 /*
- * §8 PREAMBLE — feeding the chimney an arch-shaped flame
- * ──────────────────────────────────────────────────────
+ * ArchSweep — three counters traversed together across the fuel row.
  *
- * Without fresh fuel, the propagation in §7 just cools the grid
- * uniformly toward zero.  This section overwrites the bottom two
- * rows of the bitmap (the fuel rows) each tick.  The seed values
- * follow an arch profile so the flame is tall in the middle and
- * short at the edges; within bursts of up to 6 cells they walk
- * ±2 to give the fuel band micro-texture.
+ *   column   current column being seeded (0..cols)
+ *   i1       grows  from 1, +4 per cell           small at LEFT edge
+ *   i2       shrinks from 4·cols+1, -4 per cell   small at RIGHT edge
  *
- *   ArchSweep                       — the three counters that travel
- *                                     together across the fuel rows.
- *   arch_sweep_cap                  — per-column heat ceiling.
- *   arch_sweep_advance_one_cell     — step counters forward.
- *   seed_one_burst                  — write up to 6 consecutive cells.
- *   drawfire                        — sweep the whole row, burst by burst.
- */
-
-/*
- * ArchSweep — three counters that travel together across the fuel row.
- *
- *   column : current column being seeded (0 .. cols)
- *   i1     : grows  from 1, +4 per cell           — small at LEFT edge
- *   i2     : shrinks from 4·cols+1, −4 per cell   — small at RIGHT edge
- *
- *   The per-column arch ceiling is min(i1, i2, height): low at both
- *   edges, peaks in the middle, capped by the warm-up counter.
- *
- *   Both i1 and i2 are advanced by 4 per cell — that's an aalib choice
- *   that makes the arch's edges curve more sharply than a linear ramp.
+ * Per-column arch ceiling = min(i1, i2, height): low at both edges,
+ * peaks in the middle, capped by the warm-up counter.  Both i1 and i2
+ * step by 4 per cell — an aalib choice that gives the arch's edges a
+ * sharper curve than a linear ramp would.
  */
 typedef struct {
     int column;
@@ -972,19 +576,7 @@ typedef struct {
     int i2;
 } ArchSweep;
 
-/*
- * arch_sweep_cap() — per-column heat ceiling = min(i1, i2, warmup).
- *
- *   The three terms encode three independent constraints:
- *      i1     — distance from the LEFT  margin (arch left half)
- *      i2     — distance from the RIGHT margin (arch right half)
- *      height — warm-up frame counter           (start-up clamp)
- *   The minimum is whichever constraint is currently tightest.
- *
- *   The floor (cap < 1 → cap = 1) is essential: rand() % 0 is
- *   undefined behaviour, so we must guarantee cap ≥ 1 before any
- *   rand() % cap.
- */
+/* arch_sweep_cap — per-column heat ceiling = min(i1, i2, warmup); floor at 1. */
 static int arch_sweep_cap(const ArchSweep *sweep, int height)
 {
     int cap = (sweep->i1 < sweep->i2) ? sweep->i1 : sweep->i2;
@@ -993,13 +585,7 @@ static int arch_sweep_cap(const ArchSweep *sweep, int height)
     return cap;
 }
 
-/*
- * arch_sweep_advance_one_cell() — move all three counters forward.
- *
- *   column ++   (move to next column)
- *   i1      += 4 (left-distance grows)
- *   i2      -= 4 (right-distance shrinks)
- */
+/* arch_sweep_advance_one_cell — column++; i1 += 4; i2 -= 4. */
 static void arch_sweep_advance_one_cell(ArchSweep *sweep)
 {
     sweep->column += 1;
@@ -1008,24 +594,9 @@ static void arch_sweep_advance_one_cell(ArchSweep *sweep)
 }
 
 /*
- * seed_one_burst() — write up to 6 consecutive fuel cells.
- *
- *   Algorithm:
- *      cap          ← arch_sweep_cap(sweep, height)
- *      seed_value   ← (rand() % cap) × fuel_intensity
- *      burst_length ← rand() % 6                       (0..5)
- *      repeat burst_length+1 times (or until end of row):
- *          clamp seed_value to [0, 255]
- *          fuel_row [column] ← seed_value
- *          seed_value ← seed_value + rand() % 6 − 2    (±2 walk)
- *          clamp seed_value
- *          fuel_row2[column] ← seed_value
- *          seed_value ← seed_value + rand() % 6 − 2
- *          advance sweep one cell
- *
- *   The ±2 walk inside the burst creates micro-flicker along the fuel
- *   line — adjacent cells differ a little, but neighbouring bursts can
- *   differ a lot (each picks its own base from rand() % cap).
+ * seed_one_burst — write up to 6 consecutive fuel cells with a ±2 walk.
+ * The walk creates micro-flicker along the fuel line; bursts pick
+ * independent bases so neighbouring bursts can differ a lot.
  */
 static void seed_one_burst(Bitmap *b, ArchSweep *sweep,
                            unsigned char *fuel_row,
@@ -1045,16 +616,7 @@ static void seed_one_burst(Bitmap *b, ArchSweep *sweep,
     }
 }
 
-/*
- * drawfire() — seed the two fuel rows at the bottom of the bitmap.
- *
- *   The body reads as the two algorithm steps:
- *      Step 1 — advance frame counter + burst countdown.
- *      Step 2 — sweep across cols: burst, single-cell gap, burst, gap, …
- *
- *   The burst/gap rhythm is what gives the fuel line its textured look;
- *   a uniform fill would produce a flat-bottomed wall of flame.
- */
+/* drawfire — seed the 2 fuel rows: burst → gap → burst → gap → … sweep. */
 static void drawfire(Bitmap *b)
 {
     int            cols       = b->cols;
@@ -1082,22 +644,7 @@ static void drawfire(Bitmap *b)
 /* §9  bitmap lifecycle — alloc / free / init / per-tick                  */
 /* ===================================================================== */
 
-/*
- * §9 PREAMBLE — buffer ownership and the tick orchestrator
- * ────────────────────────────────────────────────────────
- *
- * The Bitmap struct's three malloc'd buffers (bmap, prev, dither) are
- * allocated here, never reallocated in the hot path, and freed at
- * shutdown.  bitmap_tick() chains drawfire (§8) → firemain (§7) and
- * advances the theme auto-cycle counter; it returns true the frame
- * the theme just changed so the scene can mark needs_clear.
- *
- *   bitmap_alloc  — calloc the three buffers, store sizes.
- *   bitmap_free   — free + zero the struct.
- *   bitmap_init   — alloc + reset all scalars + gentable().
- *   bitmap_tick   — one CA step + theme auto-cycle.
- */
-
+/* bitmap_alloc — calloc bmap (cols × rows+2), prev, dither. */
 static void bitmap_alloc(Bitmap *b, int cols, int rows)
 {
     b->cols   = cols;
@@ -1114,6 +661,7 @@ static void bitmap_free(Bitmap *b)
     memset(b, 0, sizeof *b);
 }
 
+/* bitmap_init — alloc buffers + reset scalars + gentable.  Called at startup + on resize. */
 static void bitmap_init(Bitmap *b, int cols, int rows, int theme)
 {
     bitmap_alloc(b, cols, rows);
@@ -1127,8 +675,27 @@ static void bitmap_init(Bitmap *b, int cols, int rows, int theme)
 }
 
 /*
- * bitmap_tick() — one simulation step: seed fuel rows then propagate.
- * Returns true if theme just cycled.
+ * bitmap_tick — DRIVER.  One simulation step.
+ *
+ *   drawfire(b)               seed bottom 2 fuel rows (arch-sweep bursts)
+ *   firemain(b)               5-neighbour-below propagation + decay LUT
+ *   cycle_tick++; if reached CYCLE_TICKS:
+ *     theme = (theme + 1) mod THEME_COUNT;  theme_apply(theme)
+ *     return true                        signals caller to clear screen
+ *   return false
+ *
+ * INPUTS / UNITS
+ *   b   Bitmap mutated; both buffers (bmap, prev) advance one frame.
+ *
+ * WHY drawfire BEFORE firemain
+ *   The propagation stencil reads y+1 and y+2 — those rows are the fuel
+ *   rows.  Seeding fuel AFTER firemain would mean the new fuel doesn't
+ *   visibly propagate until the NEXT tick (a 1-frame stale-flame lag).
+ *
+ * RETURN VALUE CONTRACT
+ *   true  → theme just changed; the caller should clear the screen on
+ *           the next render so old-theme glyphs don't ghost.
+ *   false → theme unchanged; caller can render normally.
  */
 static bool bitmap_tick(Bitmap *b)
 {
@@ -1149,71 +716,19 @@ static bool bitmap_tick(Bitmap *b)
 /* §10  render pipeline — gamma + Floyd-Steinberg dither + paint          */
 /* ===================================================================== */
 
-/*
- * §10 PREAMBLE — three passes from heat to glyph
- * ──────────────────────────────────────────────
- *
- * The CA produces uint8 heat; the terminal can show 9 glyphs in any
- * of N colour pairs.  Bridging the two is a three-pass pipeline:
- *
- *   Pass 1   gamma-correct each byte into a float dither buffer.
- *            Cold bytes get COLD_SENTINEL so pass 2 can distinguish
- *            "draw a glyph" from "erase a stale glyph".
- *   Pass 2   for each cell: lut_index → bucket; quant error =
- *            perceptual − bucket midpoint; Floyd-Steinberg diffuse
- *            to the four forward neighbours; paint the glyph.
- *   Pass 3   memcpy bmap → prev so next frame's pass 2 can do its
- *            diff-clear ("was hot, now cold → write ' '").
- *
- * The 7/16, 3/16, 5/16, 1/16 weights add to 16; dividing distributes
- * the same total error across forward-unseen neighbours.  Over a
- * region, the per-cell error AVERAGES OUT to zero, so the visual
- * bands break into a textured gradient.
- *
- *   gamma_correct_byte             — perceptual conversion.
- *   COLD_SENTINEL                  — dither-buffer "skip" value.
- *   pipeline_pass1_gamma_correct   — pass 1 (per pixel).
- *   pipeline_diffuse_quant_error   — FS distribution from one cell.
- *   pipeline_draw_lit_cell         — quantise + diffuse + paint one cell.
- *   pipeline_pass2_quantise_and_draw — pass 2 (per pixel).
- *   pipeline_pass3_archive_current_frame — pass 3 (memcpy).
- *   bitmap_draw                    — three-pass orchestrator.
- */
-
-/*
- * gamma_correct_byte() — uint8 linear heat → perceptual float in [0, 1].
- *
- *   linear     = heat / 255
- *   perceptual = linear ^ (1 / 2.2)
- *
- * Used by pass 1 of the main pipeline and by the DEBUG_FUEL /
- * DEBUG_NODITHER alternative renders in §12.  static inline so the
- * pixel loop sees the math directly.
- */
+/* gamma_correct_byte — uint8 linear heat → perceptual float (heat/255)^(1/2.2). */
 static inline float gamma_correct_byte(unsigned char heat)
 {
     float linear = (float)heat / 255.f;
     return powf(linear, 1.f / 2.2f);
 }
 
-/*
- * COLD_SENTINEL — value written to the dither buffer for cells whose
- * heat is 0.  Negative so any non-negative entry can be distinguished
- * by a single (>= 0.f) check in the diffusion code.
- */
+/* COLD_SENTINEL — dither-buffer value for heat == 0; negative so a single
+ * (>= 0.f) check distinguishes "skip" from "process". */
 #define COLD_SENTINEL  (-1.0f)
 
-/*
- * pipeline_pass1_gamma_correct() — fill dither_buffer with perceptual heat.
- *
- *   For every cell:
- *      linear_heat  ← bmap[i]              (uint8 in [0, 255])
- *      if cold:     dither_buffer[i] ← COLD_SENTINEL
- *      else:        dither_buffer[i] ← gamma_correct_byte(linear_heat)
- *
- *   The cold sentinel lets pass 2 distinguish "draw a glyph", "erase a
- *   stale glyph", and "do nothing" without re-reading the heat field.
- */
+/* pipeline_pass1_gamma_correct — fill dither_buffer with perceptual heat
+ * (or COLD_SENTINEL where heat == 0). */
 static void pipeline_pass1_gamma_correct(Bitmap *b)
 {
     int                  total_cells   = b->cols * b->rows;
@@ -1230,14 +745,8 @@ static void pipeline_pass1_gamma_correct(Bitmap *b)
     }
 }
 
-/*
- * pipeline_diffuse_quant_error() — push one cell's rounding error to neighbours.
- *
- *   Floyd-Steinberg distribution (cold-tagged neighbours skipped):
- *
- *      ── current ─────► 7/16 → (x+1, y)
- *      3/16 → (x-1, y+1) ── 5/16 → (x, y+1) ── 1/16 → (x+1, y+1)
- */
+/* pipeline_diffuse_quant_error — Floyd-Steinberg: 7/16 right, 3/16 down-left,
+ * 5/16 down, 1/16 down-right.  Cold-tagged neighbours skip. */
 static void pipeline_diffuse_quant_error(float *dither_buffer, int cols, int rows,
                                          int x, int y, float quant_error)
 {
@@ -1256,15 +765,7 @@ static void pipeline_diffuse_quant_error(float *dither_buffer, int cols, int row
     }
 }
 
-/*
- * pipeline_draw_lit_cell() — quantise one cell and draw its glyph.
- *
- *   bucket           ← lut_index(perceptual)
- *   bucket_midpoint  ← lut_midpoint(bucket)
- *   quant_error      ← perceptual − bucket_midpoint
- *   diffuse quant_error to forward neighbours (Floyd-Steinberg)
- *   draw k_ramp[bucket] with the theme's ramp attribute
- */
+/* pipeline_draw_lit_cell — quantise one cell, diffuse error, paint glyph. */
 static void pipeline_draw_lit_cell(Bitmap *b, int x, int y, float perceptual)
 {
     int   bucket          = lut_index(perceptual);
@@ -1279,13 +780,8 @@ static void pipeline_draw_lit_cell(Bitmap *b, int x, int y, float perceptual)
     attroff(glyph_attr);
 }
 
-/*
- * pipeline_pass2_quantise_and_draw() — walk dither_buffer, draw or erase.
- *
- *   For every cell visible to the terminal:
- *      cold sentinel  → if previous frame was lit: write a single ' '
- *      lit            → pipeline_draw_lit_cell()
- */
+/* pipeline_pass2_quantise_and_draw — for each cell: erase stale ' ' if
+ * cold-now-but-was-lit; otherwise quantise + diffuse + paint via pipeline_draw_lit_cell. */
 static void pipeline_pass2_quantise_and_draw(Bitmap *b, int tcols, int trows)
 {
     int                  cols          = b->cols;
@@ -1323,13 +819,7 @@ static void pipeline_pass3_archive_current_frame(Bitmap *b)
     memcpy(b->prev, b->bmap, (size_t)total_cells * sizeof(unsigned char));
 }
 
-/*
- * bitmap_draw() — orchestrate the three render passes.
- *
- *   pass 1   gamma-correct heat into the dither buffer
- *   pass 2   quantise + dither + draw (or erase stale cells)
- *   pass 3   archive current heat so next frame can detect changes
- */
+/* bitmap_draw — three-pass render: gamma → quantise+dither+paint → archive. */
 static void bitmap_draw(Bitmap *b, int tcols, int trows)
 {
     pipeline_pass1_gamma_correct(b);
@@ -1341,43 +831,15 @@ static void bitmap_draw(Bitmap *b, int tcols, int trows)
 /* §11  scene — orchestrator over Bitmap, pause, debug mode               */
 /* ===================================================================== */
 
-/*
- * §11 PREAMBLE — the orchestrator
- * ───────────────────────────────
- *
- * Scene owns the Bitmap plus three small scalars:
- *   paused        — set by space; freezes scene_tick.
- *   needs_clear   — set when the screen content can no longer be
- *                   diff-cleared (theme cycle, resize, debug-mode
- *                   change) so the next frame does a full erase().
- *   debug_mode    — which render path scene_draw dispatches to
- *                   (see §12 for the alternatives).
- *
- * The split keeps scene_tick small (one branch) and lets scene_draw
- * be a 4-line table of contents that picks the render path.
- */
-
-/*
- * DebugMode — which render path scene_draw uses.
- *
- *   DEBUG_OFF        normal gamma + dither + LUT pipeline (§10).
- *   DEBUG_RAW        each cell shows the raw heat byte in hex (0-F).
- *   DEBUG_FUEL       paint only the bottom 2 fuel rows; everything
- *                    else is left as the previous frame so the user
- *                    sees the arch sweep + ±2 walk in isolation.
- *   DEBUG_NODITHER   gamma + LUT + paint, no Floyd-Steinberg.  Lets
- *                    the user see what the dither removes.
- *
- *   DEBUG_COUNT is the sentinel for the d/D cycle.
- */
 typedef enum {
-    DEBUG_OFF      = 0,
-    DEBUG_RAW      = 1,
-    DEBUG_FUEL     = 2,
-    DEBUG_NODITHER = 3,
+    DEBUG_OFF      = 0,    /* normal gamma + dither + LUT pipeline (§10)        */
+    DEBUG_RAW      = 1,    /* show each cell's raw heat byte as a hex digit     */
+    DEBUG_FUEL     = 2,    /* paint only the 2 fuel rows; rest stays as-was     */
+    DEBUG_NODITHER = 3,    /* gamma + LUT + paint, no Floyd-Steinberg dither    */
     DEBUG_COUNT    = 4,
 } DebugMode;
 
+/* debug_mode_name — HUD label for current debug mode. */
 static const char *debug_mode_name(DebugMode m)
 {
     switch (m) {
@@ -1389,6 +851,19 @@ static const char *debug_mode_name(DebugMode m)
     }
 }
 
+/*
+ * Scene — orchestrator over Bitmap.  Three small scalars on top of bmap.
+ *
+ *   bmap           the CA state (everything in §5–§10 reads/writes this)
+ *   paused         set by space; freezes scene_tick early-return
+ *   needs_clear    set on theme cycle / resize / debug-mode change so
+ *                  the next render does a full erase() (the diff-render
+ *                  in §10 can't undo glyphs the new path won't touch)
+ *   debug_mode     dispatch knob for scene_draw (§12 alternative renders)
+ *
+ * Lifecycle: scene_init → scene_tick / scene_draw per frame → scene_free.
+ *   scene_resize on SIGWINCH preserves theme + fuel + debug across realloc.
+ */
 typedef struct {
     Bitmap    bmap;
     bool      paused;
@@ -1399,6 +874,7 @@ typedef struct {
 /* Forward declaration: §12 owns the debug render functions. */
 static void scene_draw_debug(Scene *s, int cols, int rows);
 
+/* scene_init — zero Scene, init Bitmap, default debug_mode = OFF. */
 static void scene_init(Scene *s, int cols, int rows, int theme)
 {
     memset(s, 0, sizeof *s);
@@ -1406,8 +882,10 @@ static void scene_init(Scene *s, int cols, int rows, int theme)
     s->debug_mode = DEBUG_OFF;
 }
 
+/* scene_free — release Bitmap buffers. */
 static void scene_free(Scene *s) { bitmap_free(&s->bmap); }
 
+/* scene_resize — re-alloc Bitmap for new extent; preserve theme/fuel/debug. */
 static void scene_resize(Scene *s, int cols, int rows)
 {
     int       t          = s->bmap.theme;
@@ -1423,13 +901,8 @@ static void scene_resize(Scene *s, int cols, int rows)
     gentable(&s->bmap);   /* rebuild decay table for new rows */
 }
 
-/*
- * scene_cycle_debug_mode() — advance d/D selector and trigger a clear.
- *
- *   step = +1 for `d`, −1 for `D`.  The previous render path may have
- *   left glyphs the next path will not overpaint (e.g. DEBUG_FUEL leaves
- *   the top of the screen untouched), so we force a needs_clear.
- */
+/* scene_cycle_debug_mode — d/D selector; forces needs_clear because the
+ * previous render path may have left glyphs the new one won't overpaint. */
 static void scene_cycle_debug_mode(Scene *s, int step)
 {
     int next = ((int)s->debug_mode + step + DEBUG_COUNT) % DEBUG_COUNT;
@@ -1437,6 +910,7 @@ static void scene_cycle_debug_mode(Scene *s, int step)
     s->needs_clear = true;
 }
 
+/* scene_tick — pause-gated wrapper over bitmap_tick; flips needs_clear on theme cycle. */
 static void scene_tick(Scene *s)
 {
     if (!s->paused) {
@@ -1446,10 +920,19 @@ static void scene_tick(Scene *s)
 }
 
 /*
- * scene_draw() — dispatch to the active render path.
+ * scene_draw — DRIVER.  Render dispatcher.
  *
- *   DEBUG_OFF → §10 bitmap_draw() (the full pipeline).
- *   Anything else → §12 scene_draw_debug() (alternative renders).
+ *   if debug_mode == DEBUG_OFF:  bitmap_draw  (full §10 pipeline)
+ *   else:                        scene_draw_debug  (alternative §12 render)
+ *
+ * INPUTS / UNITS
+ *   s              Scene to render (const-ish; bmap.dither + bmap.prev mutate
+ *                  inside the §10 pipeline as scratch).
+ *   cols, rows     terminal extent in cells.
+ *
+ * Two-line dispatcher; the heavy work lives in §10 (full pipeline) or §12
+ * (debug overlays).  Splitting this way means turning on a debug mode
+ * never touches the production render code.
  */
 static void scene_draw(Scene *s, int cols, int rows)
 {
@@ -1463,53 +946,14 @@ static void scene_draw(Scene *s, int cols, int rows)
 /* §12  debug overlay — alternative render modes for inspection           */
 /* ===================================================================== */
 
-/*
- * §12 PREAMBLE — three windows into the CA
- * ────────────────────────────────────────
- *
- * The full §10 pipeline (gamma → dither → LUT → paint) is so well-
- * tuned that the underlying state is hard to see.  This section
- * provides three alternative renders that bypass one stage each:
- *
- *   DEBUG_RAW       skip the entire pipeline.  Show the raw heat
- *                   byte in hex (0..F).  Reveals the actual CA
- *                   state without ANY post-processing.
- *
- *   DEBUG_FUEL      paint ONLY the two fuel rows at the bottom.
- *                   The rest of the screen keeps the previous
- *                   frame so the reader can watch the arch sweep
- *                   + ±2 walk in isolation.
- *
- *   DEBUG_NODITHER  run gamma + LUT + paint but skip the Floyd-
- *                   Steinberg error diffusion.  Visible banding
- *                   returns; contrast against DEBUG_OFF to
- *                   appreciate what dithering buys.
- *
- * Each branch is a small dedicated function so the dispatch in
- * scene_draw_debug() reads as a 3-way switch with no inline logic.
- */
-
-/*
- * hex_digit_for_heat() — uint8 [0, 255] → ASCII hex digit '0'..'F'.
- *
- *   Maps the top nibble: 0..15 → '0'..'9', 'A'..'F'.  Bucket size 16
- *   gives a fair-coverage display where every hex digit covers
- *   the same heat range.
- */
+/* hex_digit_for_heat — top nibble → '0'..'F'.  Used by DEBUG_RAW. */
 static inline char hex_digit_for_heat(unsigned char heat)
 {
     static const char k_hex[] = "0123456789ABCDEF";
     return k_hex[heat >> 4];
 }
 
-/*
- * debug_render_raw_heat() — print the raw heat byte as a hex digit.
- *
- *   Loops the visible region.  For every cell:
- *      glyph = hex_digit_for_heat(bmap[i])
- *      paint with the theme's ramp pair for bucket (heat >> 5)
- *      (so colour still tracks heat — only glyph + skip-dither change)
- */
+/* debug_render_raw_heat — DEBUG_RAW: paint hex(heat) per cell; colour by top 3 bits. */
 static void debug_render_raw_heat(Scene *s, int tcols, int trows)
 {
     Bitmap *b = &s->bmap;
@@ -1533,14 +977,7 @@ static void debug_render_raw_heat(Scene *s, int tcols, int trows)
     }
 }
 
-/*
- * debug_render_fuel_only() — paint only the bottom 2 fuel rows.
- *
- *   Erases the visible region first (so the previous render's flame
- *   is gone), then paints rows y = rows..rows+1 OF THE BITMAP at
- *   screen rows rows-2 and rows-1.  Each fuel cell renders through
- *   the normal LUT so the colour tracks the seed value.
- */
+/* debug_render_fuel_only — DEBUG_FUEL: erase + paint only the 2 fuel rows. */
 static void debug_render_fuel_only(Scene *s, int tcols, int trows)
 {
     Bitmap *b    = &s->bmap;
@@ -1567,17 +1004,7 @@ static void debug_render_fuel_only(Scene *s, int tcols, int trows)
     }
 }
 
-/*
- * debug_render_no_dither() — gamma + LUT + paint, NO Floyd-Steinberg.
- *
- *   Per cell:
- *      perceptual = gamma_correct_byte(heat)
- *      bucket     = lut_index(perceptual)
- *      paint k_ramp[bucket]
- *
- *   Cold cells erase a stale glyph the same way pass 2 does, so
- *   diff-clear still works inside this mode.
- */
+/* debug_render_no_dither — DEBUG_NODITHER: gamma + LUT + paint, no FS diffusion. */
 static void debug_render_no_dither(Scene *s, int tcols, int trows)
 {
     Bitmap *b    = &s->bmap;
@@ -1606,13 +1033,7 @@ static void debug_render_no_dither(Scene *s, int tcols, int trows)
     memcpy(b->prev, b->bmap, (size_t)(cols * rows) * sizeof(unsigned char));
 }
 
-/*
- * scene_draw_debug() — three-way dispatch on debug_mode.
- *
- *   The DEBUG_OFF branch never gets here (scene_draw filters it out).
- *   Default-case fall-through reuses the full pipeline as a safety
- *   net should DEBUG_COUNT ever grow without a matching case.
- */
+/* scene_draw_debug — dispatch on debug_mode; default falls through to bitmap_draw. */
 static void scene_draw_debug(Scene *s, int cols, int rows)
 {
     switch (s->debug_mode) {
@@ -1639,13 +1060,6 @@ static void screen_init(Screen *s, int theme)
 static void screen_free(Screen *s)   { (void)s; endwin(); }
 static void screen_resize(Screen *s) { endwin(); refresh(); getmaxyx(stdscr,s->rows,s->cols); }
 
-/*
- * screen_draw_hud_top_right() — bright yellow status strip on row 0.
- *
- *   Shows fps · theme · fuel · debug-mode · sim-Hz.  PAIR_HUD is
- *   bound once in color_init() and is theme-independent, so the
- *   strip stays legible no matter which palette is active.
- */
 static void screen_draw_hud_top_right(const Screen *s, const Scene *sc,
                                       double fps, int sim_fps)
 {
@@ -1666,13 +1080,6 @@ static void screen_draw_hud_top_right(const Screen *s, const Scene *sc,
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-/*
- * screen_draw_hint_bottom() — bright cyan key strip on the last row.
- *
- *   Lists every interactive key.  Same theme-independence story as
- *   the top HUD.  Keep this in one line so it survives narrow
- *   terminals; the strip simply right-truncates if cols is small.
- */
 static void screen_draw_hint_bottom(const Screen *s)
 {
     attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
@@ -1681,15 +1088,6 @@ static void screen_draw_hint_bottom(const Screen *s)
     attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-/*
- * screen_draw() — full-frame composite: clear (if needed), CA, HUD strips.
- *
- *   Step 1 — honour scene's needs_clear flag (set by theme cycle, resize,
- *            debug-mode switch).
- *   Step 2 — paint the CA via scene_draw (dispatches on debug_mode).
- *   Step 3 — paint the top HUD strip.
- *   Step 4 — paint the bottom hint strip.
- */
 static void screen_draw(Screen *s, Scene *sc, double fps, int sim_fps)
 {
     if (sc->needs_clear) {
@@ -1706,18 +1104,6 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* §14  app — signals + key dispatch                                      */
 /* ===================================================================== */
 
-/*
- * §14 PREAMBLE — boilerplate, slightly named
- * ──────────────────────────────────────────
- *
- * Signal-safe flag flips (running, need_resize), a small App struct
- * that bundles scene + screen + sim_fps, and the key handler.  Each
- * non-trivial mutation in the key switch delegates to a named helper
- * (app_cycle_theme, app_nudge_fuel, app_nudge_sim_fps,
- * scene_cycle_debug_mode) so the switch reads as one line per
- * behaviour.
- */
-
 typedef struct {
     Scene  scene;
     Screen screen;
@@ -1730,14 +1116,6 @@ static void on_exit  (int s){ (void)s; g_app.running=0; }
 static void on_resize(int s){ (void)s; g_app.need_resize=1; }
 static void cleanup  (void) { endwin(); }
 
-/*
- * app_cycle_theme() — step the theme index by ±1 and rebind ramp pairs.
- *
- *   step = +1 for `t`, −1 for `T`.  Reset the auto-cycle counter so
- *   the user's manual choice has a full CYCLE_TICKS before auto-advance.
- *   needs_clear so the previous palette's diff-clear can't bleed
- *   colour into the new palette.
- */
 static void app_cycle_theme(App *a, int step)
 {
     Bitmap *b = &a->scene.bmap;
@@ -1748,10 +1126,6 @@ static void app_cycle_theme(App *a, int step)
     a->scene.needs_clear = true;
 }
 
-/*
- * app_nudge_fuel() — bump fuel intensity by signed step, clamped to
- *                    [FUEL_MIN, FUEL_MAX].
- */
 static void app_nudge_fuel(App *a, float step)
 {
     Bitmap *b = &a->scene.bmap;
@@ -1761,9 +1135,6 @@ static void app_nudge_fuel(App *a, float step)
     b->fuel = v;
 }
 
-/*
- * app_nudge_sim_fps() — bump simulation Hz by signed step, clamped.
- */
 static void app_nudge_sim_fps(App *a, int step)
 {
     int v = a->sim_fps + step;
@@ -1772,13 +1143,6 @@ static void app_nudge_sim_fps(App *a, int step)
     a->sim_fps = v;
 }
 
-/*
- * app_handle_key() — dispatch one keystroke.
- *
- *   Returns true to keep running, false to quit (q / Q / ESC).  All
- *   non-trivial mutations delegate to a named helper so the switch
- *   reads as one line per behaviour.
- */
 static bool app_handle_key(App *a, int ch)
 {
     switch (ch) {
@@ -1806,22 +1170,6 @@ static bool app_handle_key(App *a, int ch)
 /* §15  main — fixed-step loop                                            */
 /* ===================================================================== */
 
-/*
- * §15 PREAMBLE — wire it all up
- * ─────────────────────────────
- *
- * Standard framework pattern from CLAUDE.md:
- *   1. install signal handlers + atexit
- *   2. screen_init → scene_init
- *   3. while running:
- *        if need_resize: rebuild screen + scene
- *        clock_ns delta → sim_accum += dt
- *        drain sim_accum into scene_tick at the configured Hz
- *        update fps display every FPS_UPDATE_MS
- *        sleep for the remaining wall-clock budget
- *        screen_draw → screen_present
- *        getch → app_handle_key
- */
 int main(void)
 {
     srand((unsigned int)clock_ns());

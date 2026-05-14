@@ -25,9 +25,9 @@
  *   §1 config    — constants, themes, per-pattern parameters
  *   §2 clock     — monotonic timer + sleep
  *   §3 color     — 8-pair theme ramp + pile + sky pairs
- *   §4 flake     — Flake struct, sway position formula
- *   §5 pile      — 1-D accumulation array + neighbour-aware deposit
- *   §6 scene     — pool, tick, draw, prewarm, reseed
+ *   §4 flake     — Flake struct, sway formula, spawn samplers + Euler step
+ *   §5 pile      — column-height array, valley-fill deposit, contact math
+ *   §6 scene     — pool, tick driver + helpers, draw driver + helpers
  *   §7 screen    — ncurses init / draw / resize
  *   §8 app       — signals, fixed-step main loop
  *
@@ -69,11 +69,11 @@
  *                       there instead. This lets falling snow fill
  *                       valleys before peaks — mimicking the angle-of-
  *                       repose behaviour of real snow.
- *                    5. Optionally MELT: every MELT_INTERVAL_S, every
- *                       column with pile > 0 decreases by 1 (slow).
- *                       Without melt, BLIZZARD fills the screen in
- *                       ~30 sec; with melt the pile reaches a steady
- *                       state height that depends on the pattern.
+ *                    5. (No melt.)  The pile caps at PILE_MAX_FRAC =
+ *                       15 % of screen height and stays there.  Once
+ *                       a column reaches the cap, additional flakes
+ *                       die silently in pile_deposit (no-op).  User
+ *                       presses 'c' to wipe the pile and rebuild.
  *
  *                  Flake glyph picked at spawn from a small variety
  *                  set so the falling field reads as different snow
@@ -83,25 +83,174 @@
  *                  as rain.c. pile[MAX_COLS] of int — height per col.
  *                  No malloc at runtime.
  *
- * Rendering      : ASCII only. Flakes use `*`, `+`, `.`, `'`, `,` —
- *                  selected at spawn for variety. Accumulated pile uses
- *                  `*` at the top and `#` below for slight depth feel.
- *                  All cells coloured from the active theme's 8-step
- *                  ramp (head bright, base dimmer for the pile).
+ * Rendering      : ASCII only. Flakes use an 8-step glyph ramp
+ *                  ` ` . ' , : + * * ` indexed by size class (small dim
+ *                  → big bright).  Pile uses three depth tiers:
+ *                  `*` (surface), `#` (packed), `+` (settled).  All
+ *                  cells coloured from the active theme's 8-step ramp.
  *
- * Performance    : O(MAX_FLAKES) per tick + occasional pile melt scan.
- *                  At BLIZZARD 600 flakes × constant work, ~24k mvaddch
- *                  per frame at 60 fps — well inside ncurses budget.
+ * Performance    : O(MAX_FLAKES) per tick.  At BLIZZARD 700 flakes ×
+ *                  constant work, ~28k mvaddch per frame at 60 fps —
+ *                  well inside ncurses budget.
  *
- * References     :
- *   • Reeves, W. T. (1983) — "Particle Systems: A Technique for
- *     Modelling a Class of Fuzzy Objects", *ACM TOG* 2(2):91–108.
- *   • Bak, P., Tang, C. & Wiesenfeld, K. (1987) — "Self-organized
- *     criticality: An explanation of the 1/ƒ noise", *Phys. Rev. Lett.*
- *     59:381. The grain-redistribution rule that the pile-deposit
- *     mechanism here is a one-step approximation of.
- *   • Wikipedia — [Snow](https://en.wikipedia.org/wiki/Snow). Real flake
- *     terminal velocity is ~1 m/s (wet), ~3 m/s (dry).
+ * References
+ * ──────────
+ *   PAPERS
+ *     Reeves, W. T. (1983)
+ *       "Particle Systems — A Technique for Modeling a Class of Fuzzy Objects"
+ *       ACM Transactions on Graphics 2(2): 91-108.
+ *       Foundational paper.  The pool-based flake model used here
+ *       (per-particle x, y, vy, sway phase, lifetime via off-screen
+ *       cull) is exactly Reeves' particle-system design.  §4 discusses
+ *       natural-phenomena pools — snow/rain are explicit examples.
+ *
+ *     Bak, P., Tang, C. & Wiesenfeld, K. (1987)
+ *       "Self-Organized Criticality: An Explanation of 1/f Noise"
+ *       Physical Review Letters 59(4): 381-384.
+ *       The original sandpile cellular automaton.  Our valley-fill
+ *       deposit (a flake landing on a tall column rolls into a lower
+ *       neighbour) is a one-step approximation of Bak/Tang/Wiesenfeld's
+ *       grain-redistribution rule — it gives the pile an emergent
+ *       angle of repose ≈ 45° in cell space without explicit physics.
+ *
+ *   BOOKS
+ *     Bourg, D. M. & Bywalec, B. — "Physics for Game Developers"
+ *       (2nd ed, O'Reilly, 2013).
+ *       Ch. 2-3 covers ballistic motion under gravity + drag (real
+ *       flakes reach terminal velocity in ~1-3 m/s; we model that as
+ *       constant `vy`).  Ch. 8 §1 covers harmonic oscillators — the
+ *       sin-sway pattern x(t) = base + amp·sin(ω·t + φ) is Bourg's
+ *       canonical undamped oscillator.
+ *
+ *     Duran, J. — "Sands, Powders, and Grains: An Introduction
+ *       to the Physics of Granular Materials" (Springer, 2000).
+ *       Ch. 1-2 — angle of repose and column-based pile dynamics.
+ *       Grounds the valley-fill rule used here: a grain landing on
+ *       a slope rolls to the lower of its two neighbours until the
+ *       slope is locally flat.
+ *
+ *     Akenine-Möller, T., Haines, E. & Hoffman, N. — "Real-Time
+ *       Rendering" (4th ed, CRC Press, 2018).
+ *       §13.7 — point-sprite particle rendering.  The size-to-ramp-
+ *       slot glyph mapping used for the FLAKE_GLYPHS ramp here is
+ *       the ASCII analogue of size-by-mass point-sprite sizing.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── ARCHITECTURE — DATA-DRIVEN PATTERN ENGINE ────────────────────────── *
+ *
+ * Three snowfall intensities (FLURRY, SNOWFALL, BLIZZARD) are
+ * produced by a SINGLE generic flake-physics + sandpile engine
+ * driven by an array of PatternParams structs.  scene_tick and
+ * scene_draw never branch on the pattern enum to decide HOW the
+ * physics works — they read pattern_params[s->current_pattern] and
+ * compute accordingly.  Adding a new intensity is a matter of
+ * appending one row to pattern_params[]; no new code paths.
+ *
+ *
+ * THE GENERIC ENGINE (pseudocode)
+ * ───────────────────────────────
+ *
+ *   loop forever (each tick of dt seconds):
+ *
+ *     pp = pattern_params[scene.current_pattern]   # read inputs
+ *
+ *     # 1. SPAWN — top up flake pool toward target density
+ *     while count(active flakes) < pp.target_flakes:
+ *         f = next_inactive_slot()
+ *         f.center_x   = wind_aware_uniform_x(scene.cols, pp.wind_x)
+ *         f.y          = uniform(-6, -1)               # just above top
+ *         f.vy         = pp.fall_speed   · jitter      # terminal velocity
+ *         f.drift_vx   = pp.wind_x       + jitter      # horizontal wind
+ *         f.sway_amp   = uniform(pp.sway_amp_min,  pp.sway_amp_max)
+ *         f.sway_freq  = uniform(pp.sway_freq_min, pp.sway_freq_max)
+ *         f.sway_phase = uniform(0, 2π)
+ *         f.size_idx   = small_biased(0..7)            # r²-weighted
+ *         f.active     = true
+ *
+ *     # 2. INTEGRATE — explicit Euler advances each flake
+ *     for f in active flakes:
+ *         f.center_x += f.drift_vx · dt
+ *         f.y        += f.vy       · dt
+ *         f.age      += dt
+ *         # rendered x = center_x + sway_amp · sin(sway_freq·age + phase)
+ *
+ *     # 3. PILE CONTACT — flake meets the snow pile at its column
+ *     for f in active flakes:
+ *         col = round(rendered_x(f))
+ *         if f.y >= rows - 2 - pile[col]:
+ *             if bernoulli(pp.pile_growth_mul):       # probabilistic
+ *                 pile_deposit(pile, col, max_h)      # valley-fill rule
+ *             f.active = false
+ *
+ *     # 4. CULL — flakes drifted off-screen sideways die quietly
+ *     for f in active flakes:
+ *         if f.center_x off-screen:  f.active = false
+ *
+ *     # 5. RENDER — pile columns + active flakes overlaid
+ *     pile_draw_columns(pile, rows-2)        # *  surface
+ *                                            # #  packed
+ *                                            # +  settled
+ *     for f in active flakes:
+ *         glyph = FLAKE_GLYPHS[f.size_idx]
+ *         pair  = PAIR_FLAKE_BASE + f.size_idx
+ *         paint(rendered_x(f), f.y, glyph, pair)
+ *
+ *
+ * PATTERNPARAMS FIELD → ENGINE HOOK
+ * ─────────────────────────────────
+ *
+ *   target_flakes    →  spawn-loop refill cap        (sky density)
+ *   fall_speed       →  vy at spawn  (× jitter)      (terminal velocity)
+ *   wind_x           →  drift_vx + spawn-x extension (Bourg Ch.3)
+ *   sway_amp_min     →  per-flake sway amplitude     (oscillator A)
+ *   sway_amp_max
+ *   sway_freq_min    →  per-flake sway frequency     (oscillator ω)
+ *   sway_freq_max
+ *   pile_growth_mul  →  Bernoulli p at pile contact  (visual pacing knob)
+ *
+ * Every other engine constant — MAX_FLAKES, MAX_COLS, PILE_MAX_FRAC,
+ * FLAKE_SPEED_VARIANCE, FLAKE_WIND_JITTER, WIND_STEP — is a GLOBAL
+ * tuning knob shared across all patterns.  Patterns differ ONLY in
+ * the eight fields above.
+ *
+ *
+ * ARCHITECTURAL REFERENCES
+ * ────────────────────────
+ *
+ *   Reeves, W. T. (1983)
+ *     "Particle Systems — A Technique for Modeling a Class of
+ *     Fuzzy Objects", ACM TOG 2(2): 91-108.
+ *     §4 makes the explicit argument that ONE engine + a struct
+ *     of physical constants per phenomenon is the right
+ *     architecture for natural-particle simulations — snow is one
+ *     of Reeves' enumerated examples.  This file applies the idea
+ *     literally: three intensity presets, one engine.
+ *
+ *   Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994)
+ *     "Design Patterns" (Addison-Wesley) — STRATEGY pattern (§5.9).
+ *     A family of algorithms (FLURRY / SNOWFALL / BLIZZARD)
+ *     interchangeable behind a single interface (the engine
+ *     reading PatternParams).  In procedural C the "interface" is
+ *     the struct shape; "concrete strategies" are the rows of
+ *     pattern_params[]; "selecting a strategy" is updating
+ *     scene.current_pattern.
+ *
+ *   Acton, M. (2014)
+ *     "Data-Oriented Design and C++" (CppCon 2014 keynote).
+ *     Argues that variation between behaviours should be
+ *     represented as DATA (struct fields) rather than as control
+ *     flow (if/switch on type).  pattern_params[] is a compact
+ *     data table; the engine has no per-pattern code paths.
+ *
+ *   Nystrom, R. (2014)
+ *     "Game Programming Patterns" (Genever Benning).
+ *     TYPE OBJECT chapter — PatternParams is a Type Object: one
+ *     shared instance per "kind" of snowfall, every Flake
+ *     implicitly references it via Scene.current_pattern.  DATA
+ *     LOCALITY chapter — Flake is a flat-laid-out POD swept
+ *     linearly by the integrator each tick, exactly the layout
+ *     Nystrom recommends for hot inner loops.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -115,15 +264,6 @@
  * flake reaches the pile's top at its column, it lands — but if a
  * neighbour column is lower, it rolls there instead. The pile
  * grows column by column as drifts.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine the screen is a glass case full of slow ping-pong balls.
- * Each ball drifts down on its own gentle curve (the sway), with
- * a constant wind blowing them sideways. They hit the bottom of
- * the case and stack — but they ROLL into low spots. The stack
- * grows uneven; some columns get tall while others stay short,
- * and the snow line undulates like real snow drifts.
  *
  * ALGORITHM IN STEPS
  * ──────────────────
@@ -151,16 +291,17 @@
  *       else target = col
  *       pile[target]++   (capped at PILE_MAX_HEIGHT)
  *
- *  5. MELT (every MELT_INTERVAL_S seconds):
- *       for c in 0..cols: if pile[c] > 0: pile[c]--
- *     Keeps the pile from filling the entire screen on long runs.
+ *  5. (No melt — pile is monotonically non-decreasing.)
+ *     pile is capped at PILE_MAX_FRAC × (rows − 2) = 15 % of usable
+ *     height.  Once any column hits the cap, future deposits there
+ *     are no-ops in pile_deposit and the flake dies anyway.
  *
  *  6. RENDER:
  *       For each active flake: render its glyph at (x, y) in a
  *       theme ramp colour based on the flake's "size" (big = bright).
  *       For each column c with pile[c] > 0: draw the pile from
- *       (rows-2) up to (rows-2 - pile[c]+1). Top cell = `*`, deeper
- *       cells = `#`.
+ *       (rows-2) up to (rows-2 - pile[c]+1).  Surface cell = `*`,
+ *       next two = `#`, deeper = `+`.
  *
  *  7. HUD on bottom row.
  *
@@ -179,58 +320,6 @@
  *      if pile[col-1] < pile[col]: target = col-1
  *      elif pile[col+1] < pile[col]: target = col+1
  *    pile[target] = min(pile[target] + 1, PILE_MAX)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • PILE_MAX_HEIGHT cap. Without it, BLIZZARD's high spawn rate
- *    would fill every column to the top of the screen. Cap at
- *    `(rows - 2) · PILE_MAX_FRAC` so even after long runs there's
- *    visible sky for falling flakes to be seen against.
- *
- *  • COLUMN OUT OF RANGE. flake.x can be negative (wind pushed it
- *    off the left edge before it hit pile) or >= cols. We treat
- *    out-of-bounds as "drifted off-screen" — flake quietly dies, no
- *    pile deposit. The active-count gap is filled by the next spawn.
- *
- *  • RESIZE. The pile array is fixed at MAX_COLS but drawn only up
- *    to current cols. On resize, we keep the existing pile data
- *    (truncated if cols shrinks) — no need to clear.
- *
- *  • SWAY AMPLITUDE BIGGER THAN SPACING. With sway_amp = 4 cells, a
- *    flake at cell 100 sways to cell 96 ↔ 104. That's normal — the
- *    flake just appears to glide horizontally. No clipping or wrap.
- *
- *  • DEPOSIT DURING FAST FALL. With BLIZZARD speed ~80 c/s and 60
- *    fps, a flake moves 1.3 cells per frame. The contact check
- *    `y >= floor_y` triggers within one frame so we don't need
- *    sub-frame interpolation; the pile just grows by 1 cell where
- *    the flake landed.
- *
- *  • PAUSE. Skip both flake integration and pile melt when paused.
- *    Drawing continues unchanged.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Pause (space). Flakes freeze mid-sway. Resume: motion continues.
- *
- *  • FLURRY. Sparse, slow, BIG sway — flakes visibly swing left-and-
- *    right as they fall. Pile grows slowly into gentle undulations.
- *
- *  • SNOWFALL. Medium density. Sway visible but smaller. Pile
- *    accumulates noticeably during a 10-sec watch.
- *
- *  • BLIZZARD. Dense, fast, strong wind. Sway barely visible (wind
- *    dominates). Pile builds quickly into clear drifts that lean in
- *    the wind direction.
- *
- *  • Wind override (`w`/`W`). Push flakes left/right interactively;
- *    pile drifts shift accordingly over time.
- *
- *  • Pile clear (`c`). Removes pile but keeps flakes — useful for
- *    watching just the falling motion.
- *
- *  • Theme cycle (`t`/`T`). Each theme produces a distinctively
- *    coloured snowfall + pile.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -287,8 +376,7 @@ enum {
 #define FLAKE_WIND_JITTER     1.0f       /* ±0.5 c/s per flake        */
 
 /* Pile mechanics. */
-#define PILE_MAX_FRAC     0.55f          /* pile capped at 55% screen */
-#define MELT_INTERVAL_S   1.50f          /* every column melts 1 cell */
+#define PILE_MAX_FRAC     0.15f          /* pile capped at 15% screen; sticks at cap (no melt) */
 
 /* Wind override step. */
 #define WIND_STEP         3.0f
@@ -312,15 +400,48 @@ static const char *pattern_name(Pattern p)
 }
 
 /*
- * PatternParams — physics knobs per pattern.
+ * PatternParams — physics + density knobs that distinguish one snow
+ * INTENSITY pattern from another. The simulation engine never branches
+ * on the pattern enum; it reads these fields and behaves accordingly.
+ * Same code, three different snowfalls.  (Reeves 1983 §4 — natural-
+ * phenomena particle pools parameterised by a small struct of physical
+ * constants.)
  *
- *   target_flakes  : steady-state active flake count
- *   fall_speed     : nominal vy in cells/sec
- *   wind_x         : default horizontal drift (cells/sec)
- *   sway_amp_min/max  : sway amplitude range (cells)
- *   sway_freq_min/max : sway frequency range (rad/sec)
- *   pile_growth_mul   : multiplier on pile deposit (BLIZZARD = bigger
- *                       drifts; FLURRY = barely-grown pile)
+ *   target_flakes  : steady-state count of active flakes.  The spawn
+ *                    loop refills toward this each tick (with a per-
+ *                    tick cap so a long pause doesn't dump a flood).
+ *                    Higher = denser sky.
+ *                    FLURRY 120 (sparse), BLIZZARD 700 (whiteout).
+ *
+ *   fall_speed     : nominal vy in cells/sec.  Real snowflakes reach
+ *                    TERMINAL VELOCITY almost immediately (~1 m/s wet,
+ *                    ~3 m/s dry — Bourg & Bywalec Ch. 3); we model that
+ *                    as a constant vy with ± per-flake jitter applied
+ *                    at spawn.  Slow flurries get 10 c/s, blizzards 45 c/s.
+ *
+ *   wind_x         : default horizontal velocity in cells/sec applied
+ *                    at spawn as `drift_vx`.  Sign convention: positive
+ *                    = rightward, negative = leftward.  User adds
+ *                    Scene.wind_override on top via w / W keys.
+ *
+ *   sway_amp_min,  : sway AMPLITUDE range in cells — per-flake amplitude
+ *   sway_amp_max     sampled uniformly between min and max at spawn.
+ *                    The amp · sin(ω·t + φ) sway is a basic UNDAMPED
+ *                    HARMONIC OSCILLATOR (Bourg & Bywalec Ch. 8 §1).
+ *                    FLURRY 1.5..4.0 cells (visible swing); BLIZZARD
+ *                    0.3..1.0 (wind dominates, sway barely visible).
+ *
+ *   sway_freq_min, : sway angular FREQUENCY range in rad/sec — per-flake
+ *   sway_freq_max    frequency sampled at spawn.  FLURRY 0.4..1.3 rad/sec
+ *                    (slow gentle swing); BLIZZARD 0.2..0.8 (slow but
+ *                    invisible under high wind).
+ *
+ *   pile_growth_mul: probability ∈ [0, 1] that an impact actually deposits
+ *                    onto the pile.  BLIZZARD = 1.0 (every hit piles);
+ *                    FLURRY = 0.60 (60 % of hits pile, rest disappear) so
+ *                    a light flurry doesn't build dunes as fast as a
+ *                    blizzard even at the same flake count.  This is
+ *                    NOT physical — it's a knob for visual pacing.
  */
 typedef struct {
     int   target_flakes;
@@ -328,7 +449,7 @@ typedef struct {
     float wind_x;
     float sway_amp_min, sway_amp_max;
     float sway_freq_min, sway_freq_max;
-    float pile_growth_mul;     /* probability of pile deposit on hit */
+    float pile_growth_mul;
 } PatternParams;
 
 static const PatternParams pattern_params[N_PATTERNS] = {
@@ -355,18 +476,18 @@ typedef struct {
 #define N_THEMES 10
 
 static const Theme themes[N_THEMES] = {
-    /* name        flake[0..7]                                       pile[0..7]                                        sky */
+    /* name        flake[0..7]  (small dim → big bright)            pile[0..7]  (deep dark → top bright)            sky */
 
-    { "DEFAULT",  { 153, 159, 195, 195, 230, 231, 255, 255 },        { 244, 246, 248, 250, 252, 253, 254, 255 },       234 },
-    { "ARCTIC",   { 110, 117, 153, 159, 195, 195, 231, 255 },        { 117, 153, 159, 195, 230, 231, 254, 255 },       235 },
-    { "DUSK",     { 138, 175, 211, 217, 218, 224, 230, 231 },        { 138, 174, 175, 211, 218, 224, 254, 255 },       234 },
-    { "AURORA",   {  43,  44,  79,  85, 121, 157, 195, 230 },        {  79, 115, 121, 157, 158, 194, 230, 231 },       234 },
-    { "WARM",     { 215, 216, 222, 223, 224, 229, 230, 231 },        { 138, 180, 187, 223, 230, 231, 254, 255 },       234 },
-    { "NEON",     { 165, 171, 207, 213, 219, 219, 225, 231 },        { 171, 177, 207, 213, 219, 225, 230, 231 },       234 },
-    { "FOREST",   {  79, 115, 121, 157, 158, 194, 230, 255 },        {  43,  79, 115, 121, 157, 194, 230, 255 },       234 },
-    { "MIDNIGHT", {  60,  61,  98, 104, 146, 153, 195, 231 },        {  60,  98, 104, 146, 153, 195, 231, 255 },       232 },
-    { "MONO",     { 244, 246, 248, 250, 252, 253, 254, 255 },        { 244, 246, 248, 250, 252, 253, 254, 255 },       232 },
-    { "VIOLET",   { 134, 135, 176, 177, 213, 219, 225, 231 },        { 134, 135, 176, 213, 219, 225, 230, 231 },       234 },
+    { "MATRIX",   {  28,  34,  40,  46,  82, 118, 154, 190 },        {  28,  34,  40,  46,  82, 118, 154, 190 },       234 },
+    { "FIRE",     {  88, 124, 130, 166, 202, 208, 214, 226 },        {  52,  88, 124, 160, 196, 202, 208, 220 },       233 },
+    { "OCEANIC",  {  24,  31,  38,  44,  51,  87, 159, 195 },        {  24,  25,  31,  38,  44,  51,  87, 159 },       234 },
+    { "NEON",     {  53,  91, 134, 165, 201, 207, 213, 219 },        {  53,  91, 134, 165, 201, 207, 213, 225 },       234 },
+    { "MONO",     { 244, 246, 248, 250, 252, 253, 254, 255 },        { 240, 244, 247, 249, 251, 253, 254, 255 },       232 },
+    { "ICE",      { 117, 153, 159, 195, 225, 231, 254, 255 },        { 110, 117, 153, 159, 195, 231, 254, 255 },       235 },
+    { "NOVA",     {  24,  75, 117, 159, 195, 219, 226, 231 },        {  60,  75, 117, 159, 195, 219, 226, 231 },       234 },
+    { "FOREST",   {  28,  64,  70,  76, 112, 148, 184, 220 },        {  28,  64,  70,  76, 112, 148, 184, 220 },       234 },
+    { "DESERT",   {  94, 130, 137, 173, 179, 215, 222, 229 },        {  94, 130, 137, 143, 179, 215, 222, 229 },       234 },
+    { "ECLIPSE",  {  52,  88,  95, 131, 167, 173, 209, 215 },        {  52,  88,  95, 131, 167, 173, 209, 215 },       232 },
 };
 
 /* Variety of flake glyphs, indexed by SIZE class (small → big). */
@@ -434,16 +555,96 @@ static void color_init(void)
 /* §4  flake                                                              */
 /* ===================================================================== */
 
+/*
+ * Flake — one falling snowflake.
+ *
+ * REFERENCES:
+ *   Reeves, W. T. (1983) "Particle Systems — A Technique for Modeling
+ *     a Class of Fuzzy Objects", ACM TOG 2(2): 91-108.
+ *     The fixed pool + per-particle state + lifetime-via-off-screen-cull
+ *     model is straight from Reeves §3.  §4 specifically mentions snow
+ *     as a natural-phenomena instance of his framework.
+ *
+ *   Bourg, D. M. & Bywalec, B. (2013) "Physics for Game Developers"
+ *     (2nd ed, O'Reilly).  Ch. 3 — terminal velocity (real flakes reach
+ *     it almost immediately, modelled as constant vy); Ch. 8 §1 — the
+ *     undamped harmonic oscillator pattern x(t) = base + amp·sin(ω·t + φ)
+ *     used for the side-to-side sway.
+ *
+ * INTENT: hold every per-flake value the integrator needs in a flat
+ * layout that fits into a fixed-size BSS pool (no malloc after init).
+ * One inactive slot can host the next spawn — `active` is the single
+ * source of truth.
+ *
+ * LIFECYCLE: spawn just above the visible top with random x, jittered
+ * fall speed, jittered sway parameters → integrate forward each tick
+ * (x drifts with wind, y falls at vy, age increments) → when y >=
+ * pile-top OR drifted off-screen sideways, mark inactive (pile may
+ * receive a deposit via pile_deposit if y triggered death).  Slots
+ * are then reused linearly by the next spawn.
+ *
+ * SWAY MODEL: the visible x position is NOT center_x — it's
+ *     x(t) = center_x + sway_amp · sin(sway_freq · age + sway_phase)
+ * Splitting center_x (drift) from the sway oscillation lets the wind
+ * push the AVERAGE position while the flake still wobbles around it.
+ * Per-flake random sway_phase de-correlates the field so flakes don't
+ * all sway in sync (which would look mechanical).
+ *
+ *   center_x   : drift centre in cells.  Advances at drift_vx each tick.
+ *                The flake's RENDERED x is computed via flake_x() which
+ *                adds the sway oscillation on top.  Storing the centre
+ *                separately means wind doesn't fight with the sway.
+ *
+ *   y          : vertical position in cells.  Increases monotonically
+ *                (positive y = downward in ncurses) at rate `vy` until
+ *                pile contact or off-screen exit.
+ *
+ *   vy         : fall speed in cells/sec.  Per-flake jitter ±25 %
+ *                (FLAKE_SPEED_VARIANCE) applied at spawn so the field
+ *                doesn't descend in lockstep (Reeves' "stochastic
+ *                spawn" idea).  Models terminal velocity (Bourg Ch. 3).
+ *
+ *   drift_vx   : horizontal wind component in cells/sec, sampled at
+ *                spawn as (pattern.wind_x + scene.wind_override +
+ *                random jitter).  Constant for the life of the flake.
+ *
+ *   sway_amp   : sway amplitude in cells, sampled per-flake at spawn
+ *                from [pattern.sway_amp_min, pattern.sway_amp_max].
+ *                Bigger amp = wider swing on each oscillation cycle.
+ *
+ *   sway_freq  : sway ANGULAR frequency in rad/sec, sampled per-flake
+ *                from [pattern.sway_freq_min, pattern.sway_freq_max].
+ *                Period of one full sway cycle = 2π / sway_freq seconds.
+ *
+ *   sway_phase : per-flake phase offset ∈ [0, 2π).  De-correlates the
+ *                field so flakes don't all start swaying from the same
+ *                position (which would form an obvious vertical band).
+ *
+ *   age        : seconds since spawn.  Feeds the sway sin() argument.
+ *                Not used to KILL the flake (death comes from y or x
+ *                bounds, not lifetime) — purely a phase clock.
+ *
+ *   size_idx   : 0..7 size class chosen at spawn.  Indexes both the
+ *                FLAKE_GLYPHS ramp (` . ' , : + * *`) and the active
+ *                theme's flake[] colour ramp.  Bigger size = denser
+ *                glyph + brighter colour, mimicking real snow's
+ *                size-to-mass-to-brightness perception (Akenine-Möller
+ *                §13.7 point-sprite analogue).
+ *
+ *   active     : pool-slot occupancy flag.  Inactive slots are skipped
+ *                by every loop; spawn finds the first inactive index
+ *                via flake_pool_find_inactive (linear scan).
+ */
 typedef struct {
-    float center_x;     /* x WITHOUT sway — drifts with wind             */
+    float center_x;
     float y;
-    float vy;           /* fall speed (cells/sec) — variance applied     */
-    float drift_vx;     /* horizontal wind component (cells/sec)         */
-    float sway_amp;     /* sway amplitude (cells)                        */
-    float sway_freq;    /* sway angular frequency (rad/sec)              */
-    float sway_phase;   /* per-flake phase offset                        */
-    float age;          /* seconds since spawn                           */
-    int   size_idx;     /* 0..7 — picks glyph + colour ramp slot         */
+    float vy;
+    float drift_vx;
+    float sway_amp;
+    float sway_freq;
+    float sway_phase;
+    float age;
+    int   size_idx;
     bool  active;
 } Flake;
 
@@ -463,6 +664,69 @@ static inline float flake_x(const Flake *f)
 {
     return f->center_x
          + f->sway_amp * sinf(f->sway_freq * f->age + f->sway_phase);
+}
+
+/* Uniform sample over [lo, hi) — base primitive every other sampler uses. */
+static inline float sample_uniform_in_range(uint32_t *rng, float lo, float hi)
+{
+    return lo + lcg_unit(rng) * (hi - lo);
+}
+
+/* Terminal velocity with stochastic per-flake variance (Bourg Ch. 3).
+ * Returns base_vy · uniform(1 − V/2, 1 + V/2) so the field doesn't fall in lockstep. */
+static inline float sample_terminal_velocity_jittered(uint32_t *rng, float base_vy)
+{
+    float scale = (1.0f - FLAKE_SPEED_VARIANCE * 0.5f)
+                + lcg_unit(rng) * FLAKE_SPEED_VARIANCE;
+    return base_vy * scale;
+}
+
+/* Drift velocity with additive jitter: wind + uniform(−J/2, +J/2). */
+static inline float sample_drift_velocity_jittered(uint32_t *rng, float wind_base)
+{
+    float jitter = (lcg_unit(rng) - 0.5f) * 2.0f * FLAKE_WIND_JITTER;
+    return wind_base + jitter;
+}
+
+/* Random oscillator phase φ ∈ [0, 2π) — de-correlates sin() across the field. */
+static inline float sample_random_phase_2pi(uint32_t *rng)
+{
+    return lcg_unit(rng) * 2.0f * (float)M_PI;
+}
+
+/* Size class 0..7 with small-bias via r² mapping — most flakes small, few big. */
+static inline int sample_size_class_small_biased(uint32_t *rng)
+{
+    float r   = lcg_unit(rng);
+    int   idx = (int)(r * r * 7.999f);
+    if (idx < 0) idx = 0;
+    if (idx > 7) idx = 7;
+    return idx;
+}
+
+/* Spawn x with the range extended UPWIND so wind-blown flakes refill the
+ * visible field uniformly rather than piling up against the leeward edge. */
+static inline float sample_spawn_x_wind_extended(uint32_t *rng, int cols, float wind)
+{
+    float over = fabsf(wind) * 0.5f;
+    float r    = lcg_unit(rng);
+    if (wind >  0.5f) return r * ((float)cols + over) - over;
+    if (wind < -0.5f) return r * ((float)cols + over);
+    return r * (float)cols;
+}
+
+/* Explicit Euler step: drift x by drift_vx·dt, fall y by vy·dt, age the clock. */
+static inline void integrate_flake_euler(Flake *f, float dt)
+{
+    f->center_x += f->drift_vx * dt;
+    f->y        += f->vy       * dt;
+    f->age      += dt;
+}
+
+/* True once the flake's drift centre has crossed the off-screen sideways cull. */
+static inline bool flake_drifted_offscreen_x(const Flake *f, int cols)
+{
+    return f->center_x < -8.0f || f->center_x > (float)(cols + 8);
 }
 
 /* ===================================================================== */
@@ -490,33 +754,126 @@ static void pile_deposit(int *pile, int cols, int col, int max_h)
     if (pile[target] < max_h) pile[target] += 1;
 }
 
-/* Slow background melt — every column with pile > 0 loses 1 cell.
- * Without this BLIZZARD fills the screen in ~30 seconds; with it the
- * pile reaches a steady state where deposit rate = melt rate. */
-static void pile_melt_pass(int *pile, int cols)
+/* Saturation cap for any single column — PILE_MAX_FRAC of usable rows. */
+static inline int compute_pile_height_cap(int rows)
 {
-    for (int c = 0; c < cols; c++)
-        if (pile[c] > 0) pile[c] -= 1;
+    int max_h = (int)((float)(rows - 2) * PILE_MAX_FRAC);
+    return max_h < 1 ? 1 : max_h;
+}
+
+/* World-y of the pile's top surface at a column — flake contacts when y ≥ this. */
+static inline float pile_floor_y(int pile_h, int rows)
+{
+    return (float)(rows - 2 - pile_h);
+}
+
+/* Bernoulli trial: true with probability p ∈ [0,1]. */
+static inline bool bernoulli_trial(uint32_t *rng, float p)
+{
+    return lcg_unit(rng) < p;
 }
 
 /* ===================================================================== */
 /* §6  scene — pool, tick, draw                                          */
 /* ===================================================================== */
 
+/*
+ * Scene — owns every piece of mutable state for the snow simulation.
+ * Two clearly-separated halves:
+ *
+ *   SIMULATION half — what scene_tick reads + writes.  Owns the active
+ *                     pattern, force overrides, RNG, cached terminal
+ *                     dimensions, the clock for the sway phase, the
+ *                     flake pool, and the 1-D pile column-height array.
+ *                     Mutated by scene_tick and the key handler.
+ *
+ *   RENDER half     — what scene_draw consults to pick colours.  Purely
+ *                     visual selection index; never read inside the
+ *                     physics tick.
+ *
+ * REFERENCES (each cited inline at the relevant member):
+ *   Reeves (1983)     — particle pool design
+ *   Bak/Tang/Wiesenfeld (1987) — sandpile valley-fill (used by pile_deposit)
+ *   Duran (2000)      — granular angle of repose
+ *   Bourg/Bywalec (2013) — terminal velocity + harmonic oscillator
+ *
+ * The Scene knows nothing about ncurses — physics writes to the pool +
+ * pile, the render layer reads them.  That separation lets the
+ * simulation be exercised without a terminal.
+ */
 typedef struct {
+    /* ──────────────────────────────────────────────────────────────
+     *  SIMULATION HALF — physics tick reads + writes these
+     * ────────────────────────────────────────────────────────────── */
+
+    /* PAUSE — scene_tick is a no-op when set.  Toggled by space.
+     * Render keeps running so the user sees a frozen frame with
+     * flakes held mid-sway. */
     bool      paused;
+
+    /* SPEED — integer multiplier on dt.  Default SPEED_DEF means
+     * 1× wall clock; +/= keys double, − halves.  Bounded by
+     * SPEED_MIN/MAX.  Doesn't change physics constants — just
+     * compresses or stretches simulated time. */
     int       speed;
-    int       current_theme;
+
+    /* PATTERN — index into pattern_params (FLURRY / SNOWFALL /
+     * BLIZZARD).  Cycled by n / N.  Switching pattern doesn't
+     * rebuild pools — the new target_flakes self-fills / drains
+     * over a few seconds, which reads as a natural intensity change. */
     Pattern   current_pattern;
+
+    /* WIND OVERRIDE — added to pattern.wind_x to compute the actual
+     * drift_vx applied to newly-spawned flakes.  w / W keys add
+     * ±WIND_STEP; persists across pattern switches; reset on 'r'. */
     float     wind_override;
+
+    /* RNG — per-scene LCG state, seeded from clock_ns() at init and
+     * re-seeded (XOR'd) on 'r'.  Used by every randomness consumer:
+     * spawn jitter (x position, fall speed, sway params, size class),
+     * pile_growth_mul probability check at deposit.  No globals —
+     * full state in this byte. */
     uint32_t  rng;
+
+    /* CACHED TERMINAL DIMENSIONS — read every frame by spawn (x range
+     * for the top edge), the integrator (off-screen sideways check),
+     * and the pile renderer.  Cached at init and on SIGWINCH so the
+     * hot path never calls getmaxyx(). */
     int       rows, cols;
 
-    float     time_accum;       /* seconds since start (for sway phase) */
-    float     melt_accum;       /* seconds since last melt pass         */
+    /* CLOCK — seconds since the scene started, advanced by dt each
+     * tick.  Not currently read by the integrator (each flake's `age`
+     * is what feeds the sway sin()), but kept available for future
+     * effects that need a global phase clock. */
+    float     time_accum;
 
+    /* FLAKE POOL — fixed-size BSS array, no allocation after init.
+     * See Flake for per-slot detail.  flake_pool_find_inactive scans
+     * for the first inactive index when spawn needs a slot.
+     * (Reeves 1983 — particle pool.) */
     Flake     flakes[MAX_FLAKES];
-    int       pile  [MAX_COLS];
+
+    /* PILE COLUMN HEIGHTS — 1-D array, pile[c] = current snow height
+     * at column c (in cells, measured up from the bottom HUD row).
+     * MAX_COLS is the hard cap; we draw up to scene.cols only.
+     * Modified by pile_deposit (which applies a valley-fill rule:
+     * Bak/Tang/Wiesenfeld 1987 sandpile + Duran 2000 angle of repose).
+     * Each column saturates at PILE_MAX_FRAC × (rows − 2) = 15 % of
+     * usable height; no melt — pile is monotonically non-decreasing
+     * until 'c' clears it. */
+    int       pile[MAX_COLS];
+
+    /* ──────────────────────────────────────────────────────────────
+     *  RENDER HALF — scene_draw reads this; physics tick ignores it
+     * ────────────────────────────────────────────────────────────── */
+
+    /* THEME — index into themes[].  Cycled by t / T.  Selects the
+     * 8-step flake ramp (size → colour) AND the 8-step pile ramp
+     * (depth → colour).  Pure render concern — flake physics
+     * (count, motion, lifetime, pile dynamics) behaves identically
+     * regardless of which theme is active.  theme_apply rewrites
+     * pairs PAIR_FLAKE_BASE..+7 and PAIR_PILE_BASE..+7 on change. */
+    int       current_theme;
 } Scene;
 
 static int flake_pool_find_inactive(Scene *s)
@@ -528,12 +885,13 @@ static int flake_pool_find_inactive(Scene *s)
 
 /*
  * scene_spawn_flake — activate one flake.
+ *   y_min, y_max : initial-y range.  Normal spawn passes (-6, -1) so
+ *                  the flake enters from just above the visible top;
+ *                  prewarm passes (-6, rows-2) for steady-state fill.
  *
- *   y_min, y_max : range from which to draw initial y. Normal use
- *                  passes (-6, -1); prewarm passes (-6, rows-2).
- *
- * All physics parameters are drawn from the active pattern with
- * per-flake jitter so no two flakes follow the same path.
+ * Each field is filled by a dedicated sampler so the body reads as a
+ * declaration of the flake's INITIAL PHYSICS STATE: position, velocity,
+ * oscillator, size class.  Per-flake jitter lives inside the samplers.
  */
 static void scene_spawn_flake(Scene *s, float y_min, float y_max)
 {
@@ -542,49 +900,17 @@ static void scene_spawn_flake(Scene *s, float y_min, float y_max)
     Flake *f = &s->flakes[idx];
 
     const PatternParams *pp = &pattern_params[s->current_pattern];
+    float wind_total = pp->wind_x + s->wind_override;
 
-    float wind = pp->wind_x + s->wind_override;
-    float over = fabsf(wind) * 0.5f;
-    float rngx = lcg_unit(&s->rng);
-    float spawn_x;
-    if (wind > 0.5f) {
-        spawn_x = rngx * ((float)s->cols + over) - over;
-    } else if (wind < -0.5f) {
-        spawn_x = rngx * ((float)s->cols + over);
-    } else {
-        spawn_x = rngx * (float)s->cols;
-    }
-    float spawn_y = y_min + lcg_unit(&s->rng) * (y_max - y_min);
-
-    /* Per-flake physics jitter — speed variance is the key ingredient
-     * that makes the falling field look like independent particles
-     * rather than a synchronised sheet. */
-    float speed_jitter = (1.0f - FLAKE_SPEED_VARIANCE * 0.5f)
-                       + lcg_unit(&s->rng) * FLAKE_SPEED_VARIANCE;
-    float wind_jitter  = (lcg_unit(&s->rng) - 0.5f) * 2.0f * FLAKE_WIND_JITTER;
-
-    float sway_amp  = pp->sway_amp_min
-                    + lcg_unit(&s->rng) * (pp->sway_amp_max - pp->sway_amp_min);
-    float sway_freq = pp->sway_freq_min
-                    + lcg_unit(&s->rng) * (pp->sway_freq_max - pp->sway_freq_min);
-    float sway_phs  = lcg_unit(&s->rng) * 2.0f * (float)M_PI;
-
-    /* Size classes: weight toward smaller flakes. r in [0,1] →
-     * size 0..7 with bias to lower indices. */
-    float r = lcg_unit(&s->rng);
-    int size_idx = (int)(r * r * 7.999f);   /* squared for skew toward small */
-    if (size_idx < 0) size_idx = 0;
-    if (size_idx > 7) size_idx = 7;
-
-    f->center_x   = spawn_x;
-    f->y          = spawn_y;
-    f->vy         = pp->fall_speed * speed_jitter;
-    f->drift_vx   = wind + wind_jitter;
-    f->sway_amp   = sway_amp;
-    f->sway_freq  = sway_freq;
-    f->sway_phase = sway_phs;
+    f->center_x   = sample_spawn_x_wind_extended    (&s->rng, s->cols, wind_total);
+    f->y          = sample_uniform_in_range         (&s->rng, y_min, y_max);
+    f->vy         = sample_terminal_velocity_jittered(&s->rng, pp->fall_speed);
+    f->drift_vx   = sample_drift_velocity_jittered  (&s->rng, wind_total);
+    f->sway_amp   = sample_uniform_in_range         (&s->rng, pp->sway_amp_min,  pp->sway_amp_max);
+    f->sway_freq  = sample_uniform_in_range         (&s->rng, pp->sway_freq_min, pp->sway_freq_max);
+    f->sway_phase = sample_random_phase_2pi         (&s->rng);
     f->age        = 0.0f;
-    f->size_idx   = size_idx;
+    f->size_idx   = sample_size_class_small_biased  (&s->rng);
     f->active     = true;
 }
 
@@ -630,7 +956,6 @@ static void scene_init(Scene *s, int cols, int rows)
     s->cols            = cols;
     s->rows            = rows;
     s->time_accum      = 0.0f;
-    s->melt_accum      = 0.0f;
     scene_clear_flakes(s);
     scene_clear_pile(s);
     scene_prewarm(s);
@@ -652,121 +977,164 @@ static void scene_reseed(Scene *s)
     scene_prewarm(s);
 }
 
-static void scene_tick(Scene *s, float dt)
+/* Population census — linear scan of the pool's active flags. */
+static int count_active_flakes(const Scene *s)
 {
-    if (s->paused) return;
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    dt *= speed_mul;
+    int n = 0;
+    for (int i = 0; i < MAX_FLAKES; i++) if (s->flakes[i].active) n++;
+    return n;
+}
 
-    s->time_accum += dt;
-    s->melt_accum += dt;
-
-    const PatternParams *pp = &pattern_params[s->current_pattern];
-
-    /* 1. Top up flakes to target. */
-    int active = 0;
-    for (int i = 0; i < MAX_FLAKES; i++)
-        if (s->flakes[i].active) active++;
-
+/* Spawn budget for this tick — refill toward pattern.target_flakes, but
+ * cap the per-tick burst proportional to dt so a long pause doesn't
+ * dump a flood of flakes when the sim resumes. */
+static int compute_spawn_count_for_tick(int active, const PatternParams *pp, float dt)
+{
     int target = pp->target_flakes;
     if (target > MAX_FLAKES) target = MAX_FLAKES;
     int spawn_cap = (int)((float)pp->target_flakes * dt * 4.0f) + 4;
-    int to_spawn  = target - active;
-    if (to_spawn > spawn_cap) to_spawn = spawn_cap;
-    for (int k = 0; k < to_spawn; k++) scene_spawn_flake(s, -6.0f, -1.0f);
+    int n = target - active;
+    if (n < 0)         n = 0;
+    if (n > spawn_cap) n = spawn_cap;
+    return n;
+}
 
-    /* 2. Integrate flakes; check pile contact. */
-    int max_pile_h = (int)((float)(s->rows - 2) * PILE_MAX_FRAC);
-    if (max_pile_h < 1) max_pile_h = 1;
+/* Spawn `n` flakes just above the visible top (y ∈ [-6, -1]). */
+static void flake_pool_topup_from_sky(Scene *s, int n)
+{
+    for (int k = 0; k < n; k++) scene_spawn_flake(s, -6.0f, -1.0f);
+}
 
+/* Resolve one flake against the pile at its swayed column.  On contact:
+ * apply the pattern's growth Bernoulli (so FLURRY accumulates slower than
+ * BLIZZARD) then valley-fill deposit and deactivate.  If the sway pushed
+ * the flake briefly off-screen the contact test is skipped — it stays in
+ * flight and will swing back into a valid column next tick. */
+static void try_pile_contact_and_deposit(Scene *s, Flake *f,
+                                         const PatternParams *pp,
+                                         int max_pile_h)
+{
+    float fx  = flake_x(f);
+    int   col = (int)(fx + 0.5f);
+    if (col < 0 || col >= s->cols) return;
+
+    float floor_y = pile_floor_y(s->pile[col], s->rows);
+    if (f->y < floor_y) return;
+
+    if (bernoulli_trial(&s->rng, pp->pile_growth_mul))
+        pile_deposit(s->pile, s->cols, col, max_pile_h);
+    f->active = false;
+}
+
+static void scene_tick(Scene *s, float dt)
+{
+    if (s->paused) return;
+    dt *= (float)s->speed / (float)SPEED_DEF;
+    s->time_accum += dt;
+
+    const PatternParams *pp = &pattern_params[s->current_pattern];
+
+    /* 1. Top up flake pool toward pattern's target density. */
+    int to_spawn = compute_spawn_count_for_tick(count_active_flakes(s), pp, dt);
+    flake_pool_topup_from_sky(s, to_spawn);
+
+    /* 2. Integrate each flake; resolve off-screen cull and pile contact. */
+    int max_pile_h = compute_pile_height_cap(s->rows);
     for (int i = 0; i < MAX_FLAKES; i++) {
         Flake *f = &s->flakes[i];
         if (!f->active) continue;
 
-        f->center_x += f->drift_vx * dt;
-        f->y        += f->vy * dt;
-        f->age      += dt;
+        integrate_flake_euler(f, dt);
 
-        /* Off-screen sideways → die quietly. */
-        if (f->center_x < -8.0f || f->center_x > (float)(s->cols + 8)) {
-            f->active = false;
-            continue;
-        }
+        if (flake_drifted_offscreen_x(f, s->cols)) { f->active = false; continue; }
 
-        /* Pile contact at flake's CURRENT column (with sway). */
-        float fx     = flake_x(f);
-        int   col    = (int)(fx + 0.5f);
-        if (col < 0 || col >= s->cols) {
-            /* Sway pushed it off-screen but center still on-screen.
-             * Keep alive; it'll sway back next tick. */
-            continue;
-        }
-        int   pile_h = s->pile[col];
-        float floor_y = (float)(s->rows - 2 - pile_h);
-
-        if (f->y >= floor_y) {
-            /* Deposit (with valley-fill) — but skip with probability
-             * (1 - pattern.pile_growth_mul) so FLURRY doesn't pile
-             * up as fast as BLIZZARD even at the same flake count. */
-            float grow_roll = lcg_unit(&s->rng);
-            if (grow_roll < pp->pile_growth_mul)
-                pile_deposit(s->pile, s->cols, col, max_pile_h);
-            f->active = false;
-        }
+        try_pile_contact_and_deposit(s, f, pp, max_pile_h);
     }
+}
 
-    /* 3. Periodic melt. */
-    while (s->melt_accum >= MELT_INTERVAL_S) {
-        pile_melt_pass(s->pile, s->cols);
-        s->melt_accum -= MELT_INTERVAL_S;
+/* Brightness attribute by ramp slot — top of ramp BOLD, bottom DIM.
+ * Shared rule between pile depth-ramp and flake size-ramp so both layers
+ * read the gradient consistently. */
+static inline int ramp_attr_by_brightness_slot(int slot)
+{
+    if (slot >= 6) return A_BOLD;
+    if (slot <= 1) return A_DIM;
+    return A_NORMAL;
+}
+
+/* Pile glyph picked by depth from the surface — `*` snow-cap, `#` packed,
+ * `+` settled.  Encodes the visual "depth feel" without using non-ASCII. */
+static inline char pile_cell_glyph_by_depth(int depth_from_top)
+{
+    if (depth_from_top == 0) return '*';
+    if (depth_from_top <  3) return '#';
+    return '+';
+}
+
+/* Draw one column's stack of pile cells from the bottom row upward.
+ * k=0 is the topmost (surface) cell and gets the brightest ramp slot. */
+static void pile_column_draw(int col, int height, int rows_eff)
+{
+    for (int k = 0; k < height; k++) {
+        int y = (rows_eff - 1) - k;
+        if (y < 0) break;
+
+        int  ramp_slot = 7 - k;
+        if (ramp_slot < 0) ramp_slot = 0;
+
+        char glyph = pile_cell_glyph_by_depth(k);
+        int  attr  = ramp_attr_by_brightness_slot(ramp_slot);
+        int  pair  = PAIR_PILE_BASE + ramp_slot;
+
+        attron(COLOR_PAIR(pair) | attr);
+        mvaddch(y, col, (chtype)(unsigned char)glyph);
+        attroff(COLOR_PAIR(pair) | attr);
+    }
+}
+
+/* Render the pile across every visible column — drawn FIRST so falling
+ * flakes overlay it cleanly. */
+static void pile_draw_all_columns(const Scene *s, int rows_eff)
+{
+    int cap = s->cols < MAX_COLS ? s->cols : MAX_COLS;
+    for (int c = 0; c < cap; c++) {
+        int h = s->pile[c];
+        if (h > 0) pile_column_draw(c, h, rows_eff);
+    }
+}
+
+/* Render one active flake at its current swayed (x, y), using size-class
+ * for glyph (FLAKE_GLYPHS ramp) and colour pair (PAIR_FLAKE_BASE + size). */
+static void flake_draw(const Flake *f, int cols, int rows_eff)
+{
+    int ix = (int)(flake_x(f) + 0.5f);
+    int iy = (int)(f->y       + 0.5f);
+    if (ix < 0 || ix >= cols)     return;
+    if (iy < 0 || iy >= rows_eff) return;
+
+    char glyph = FLAKE_GLYPHS[f->size_idx];
+    int  pair  = PAIR_FLAKE_BASE + f->size_idx;
+    int  attr  = ramp_attr_by_brightness_slot(f->size_idx);
+
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(iy, ix, (chtype)(unsigned char)glyph);
+    attroff(COLOR_PAIR(pair) | attr);
+}
+
+/* Render every active flake on top of the pile. */
+static void flakes_draw_all_active(const Scene *s, int rows_eff)
+{
+    for (int i = 0; i < MAX_FLAKES; i++) {
+        const Flake *f = &s->flakes[i];
+        if (f->active) flake_draw(f, s->cols, rows_eff);
     }
 }
 
 static void scene_draw(const Scene *s)
 {
-    int rows_eff = s->rows - 1;     /* leave bottom for HUD */
-
-    /* ── 1. Pile (drawn first so flakes overlay it) ───────────────── */
-    for (int c = 0; c < s->cols && c < MAX_COLS; c++) {
-        int h = s->pile[c];
-        if (h <= 0) continue;
-        for (int k = 0; k < h; k++) {
-            int y = (rows_eff - 1) - k;
-            if (y < 0) break;
-
-            /* Top cell brightest; deeper cells use lower ramp slots. */
-            int ramp_slot = 7 - k;
-            if (ramp_slot < 0) ramp_slot = 0;
-            char glyph = (k == 0) ? '*' : (k < 3 ? '#' : '+');
-            int  attr  = (ramp_slot >= 6) ? A_BOLD
-                       : (ramp_slot <= 1) ? A_DIM
-                       :                    A_NORMAL;
-            int  pair  = PAIR_PILE_BASE + ramp_slot;
-            attron(COLOR_PAIR(pair) | attr);
-            mvaddch(y, c, (chtype)(unsigned char)glyph);
-            attroff(COLOR_PAIR(pair) | attr);
-        }
-    }
-
-    /* ── 2. Flakes ─────────────────────────────────────────────────── */
-    for (int i = 0; i < MAX_FLAKES; i++) {
-        const Flake *f = &s->flakes[i];
-        if (!f->active) continue;
-        float fx = flake_x(f);
-        int   ix = (int)(fx + 0.5f);
-        int   iy = (int)(f->y + 0.5f);
-        if (ix < 0 || ix >= s->cols) continue;
-        if (iy < 0 || iy >= rows_eff) continue;
-
-        char glyph = FLAKE_GLYPHS[f->size_idx];
-        int  pair  = PAIR_FLAKE_BASE + f->size_idx;
-        int  attr  = (f->size_idx >= 6) ? A_BOLD
-                   : (f->size_idx <= 1) ? A_DIM
-                   :                      A_NORMAL;
-        attron(COLOR_PAIR(pair) | attr);
-        mvaddch(iy, ix, (chtype)(unsigned char)glyph);
-        attroff(COLOR_PAIR(pair) | attr);
-    }
+    int rows_eff = s->rows - 1;          /* leave bottom row for HUD */
+    pile_draw_all_columns (s, rows_eff); /* pile first — flakes overlay */
+    flakes_draw_all_active(s, rows_eff);
 }
 
 /* ===================================================================== */
@@ -808,6 +1176,20 @@ static void scene_counts(const Scene *s, int *out_flakes, int *out_max_pile)
     *out_max_pile = mp;
 }
 
+/*
+ * screen_draw — render the scene, then paint a two-layer HUD over it:
+ *
+ *   Row 0          STATUS LINE.  Bright yellow PAIR_HUD + A_BOLD.
+ *                  Live state: pattern (or PAUSED), theme, flake count,
+ *                  max pile height, wind (cells/sec), fps, sim Hz,
+ *                  speed multiplier.
+ *   Row rows-1     KEY HINT LINE.  Bright cyan PAIR_HINT + A_BOLD.
+ *                  Every interactive key the demo accepts.
+ *
+ * Both rows are pre-filled with their pair colour so the coloured
+ * background spans the full width, and drawn AFTER scene_draw so
+ * flakes never bleed through the bars.
+ */
 static void screen_draw(Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
@@ -821,19 +1203,29 @@ static void screen_draw(Screen *sc, const Scene *s,
 
     const char *state_str = s->paused ? "PAUSED " : pattern_name(s->current_pattern);
 
-    char buf[220];
-    snprintf(buf, sizeof buf,
-             " SNOW   %s   theme:%-8s   flakes:%4d  pile_h:%2d  "
-             "wind:%+5.1f c/s   %5.1f fps  %3d Hz  speed:%-3d   "
-             "n/p:pat  t/T:theme  w/W:wind  c:clear  +/-:speed  spc:pause  r:reseed  q:quit ",
+    /* ── Top row: dynamic status ─────────────────────────────── */
+    char status[220];
+    snprintf(status, sizeof status,
+             " SNOW   %s   theme:%-8s   flakes:%4d  pile_h:%2d   "
+             "wind:%+5.1f c/s   %5.1f fps  %3d Hz  speed:%-3d ",
              state_str, themes[s->current_theme].name,
              flakes, max_pile, (double)wind, fps, sim_fps, s->speed);
 
-    int row = sc->rows - 1;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    for (int x = 0; x < sc->cols; x++) mvaddch(row, x, ' ');
-    mvprintw(row, 0, "%s", buf);
+    for (int x = 0; x < sc->cols; x++) mvaddch(0, x, ' ');
+    mvprintw(0, 0, "%s", status);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    /* ── Bottom row: every interactive key ───────────────────── */
+    const char *hints =
+        " q:quit  spc:pause  r:reseed  c:clear  n/p:pattern  t/T:theme  "
+        "w/W:wind  +/-:speed  ]/[:Hz ";
+
+    int hint_row = sc->rows - 1;
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    for (int x = 0; x < sc->cols; x++) mvaddch(hint_row, x, ' ');
+    mvprintw(hint_row, 0, "%s", hints);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }

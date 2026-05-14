@@ -15,6 +15,7 @@
  *   q / ESC   quit
  *   ]  [      speed up / slow down
  *   =  -      more / fewer rockets
+ *   t  T      next / previous theme
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra -lm fireworks.c -o fireworks -lncurses
@@ -54,35 +55,38 @@
  *                  '.' / '*' / '+' based on age.  Colour pair selected per
  *                  rocket at launch time from a 7-colour palette.
  *
+ * References
+ * ──────────
+ *   PAPERS
+ *     Reeves, W. T. (1983)
+ *       "Particle Systems — A Technique for Modeling a Class of Fuzzy Objects"
+ *       ACM Transactions on Graphics 2(2): 91-108.
+ *       The foundational particle-system paper.  Introduces the rocket-and-
+ *       burst model used here (Genesis fire demo from Star Trek II).
+ *
+ *     Reeves, W. T. & Blau, R. (1985)
+ *       "Approximate and Probabilistic Algorithms for Shading and Rendering
+ *        Structured Particle Systems"
+ *       Computer Graphics (SIGGRAPH '85) 19(3): 313-322.
+ *       Extends (1983) with hierarchical particle pools — same data-layout
+ *       trick we use: each rocket owns its sparks instead of a global pool.
+ *
+ *   BOOKS
+ *     Bourg, D. M. & Bywalec, B. — "Physics for Game Developers" (2nd ed,
+ *       O'Reilly, 2013).  Ch. 2-3: explicit Euler integration for ballistic
+ *       motion — the integrator used by both rocket_tick and particle_tick.
+ *
+ *     Akenine-Möller, T., Haines, E. & Hoffman, N. — "Real-Time Rendering"
+ *       (4th ed, CRC Press, 2018).  §13.7 covers point-sprite particle
+ *       rendering and life-based fade — same brightness-from-life trick.
+ *
+ *     Foley, J. D., van Dam, A., Feiner, S. K. & Hughes, J. F. — "Computer
+ *       Graphics: Principles and Practice" (3rd ed, Addison-Wesley, 2013).
+ *       §17.6.2: particle systems as a stochastic modelling primitive.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
- *
- * CORE IDEA
- * ─────────
- * Each rocket is a tiny finite-state machine: IDLE (waiting), RISING
- * (climbing with deceleration), EXPLODED (its 80 sparks live their
- * own short lives).  The rocket carries its own particle pool — when
- * it reaches the apex (vy crosses zero) it fires all 80 sparks at
- * angles spread evenly around 2π with random speeds.  Each spark
- * then integrates Euler physics with gravity until its life decays
- * to zero.  When all 80 are dead, the rocket flips back to IDLE with
- * a random fuse and the cycle repeats.  The user controls how many
- * rockets exist (1..20) and how fast time runs (sim_fps 10..60).
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a celebration where N firework launchers fire on staggered
- * fuses.  Each launcher has its own paint can full of 80 colour-
- * coded sparks.  A rocket leaves the ground at a random column with
- * a hard-coded upward kick, drag pulls it back down, and at the
- * exact instant its velocity reverses sign — boom, the can spills,
- * 80 sparks hurl outward in a slightly squashed-vertical sphere
- * (because terminal cells are taller than wide).  Each spark is
- * given gravity, a random life bar (0.6..1.0), and a unique colour
- * from the 7-hue palette.  When the can is empty (all sparks dead),
- * the launcher reloads with a random delay (0.5..2.5 seconds) and
- * fires again.  No global particle pool — every rocket owns its own.
  *
  * ALGORITHM IN STEPS  (per tick, per rocket)
  * ──────────────────
@@ -137,51 +141,6 @@
  *      life < 0.20 → A_DIM           dying ember
  *      else        → A_NORMAL
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Apex detection by sign-flip: at very high SIM_FPS the rocket may
- *    overshoot vy=0 by more than one tick.  The condition `vy >= 0`
- *    catches it on the next tick, so the burst happens at most one
- *    tick late — visually invisible.
- *  • Ceiling escape: a rocket launched with the maximum speed at a
- *    short window can reach y < 2 before vy flips.  The OR condition
- *    `y < 2.0` forces the burst at the top so rockets never fly off
- *    screen unhandled.
- *  • Vertical squash 0.5: terminal cells are roughly 2× taller than
- *    wide.  Without the 0.5 multiplier on vy at burst, explosions
- *    look like vertical ovals.  With it they read as round bursts.
- *  • Per-rocket particle pool: 80 × 20 = 1600 particles total at
- *    max load.  All on the stack inside the App struct (no malloc).
- *  • Increasing rocket count via '+': we activate slot[i] with a
- *    short fuse=5 so it fires almost immediately rather than parking
- *    forever.  Decreasing via '-' just stops ticking that slot —
- *    any in-flight rocket above the new count lives out its current
- *    cycle on its own time but won't be ticked next frame, so it
- *    visually freezes on screen.
- *  • Color palette overlap: every spark independently picks one of
- *    7 hues, so a single explosion looks like a chromatic shotgun
- *    blast rather than a monochrome ring.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • One rocket, sim_fps=10: the entire LAUNCH→APEX→FADE cycle should
- *    take ~3 seconds; you can count sparks (~80) and watch them die
- *    one-by-one.  At sim_fps=60 the sequence is ~0.5 s and the burst
- *    looks like a flash.
- *  • Increase to 20 rockets: stagger from show_init (`fuse = i*8`)
- *    means the first 20 launches arrive over ~5 seconds, never all
- *    at once.
- *  • Symmetry test: pause at apex (no pause key here, but lower
- *    sim_fps to 10).  Watch the burst frame-by-frame: 80 sparks
- *    should distribute roughly evenly around 2π.  The angle jitter
- *    (ε=0.3) makes the ring slightly noisy.
- *  • Gravity test: at the bottom of the burst envelope sparks should
- *    accelerate downward; horizontal sparks should curve down within
- *    ~0.5 s.  Top of burst: sparks rise briefly before reversing.
- *  • Resize test: SIGWINCH should clear and re-init show.  In-flight
- *    rockets are reset; new ones start from the bottom of the new
- *    terminal size.
- *
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
@@ -232,6 +191,9 @@ enum {
     /* HUD overlay */
     HUD_COLS         =  30,   /* width of the status bar window       */
     FPS_UPDATE_MS    = 500,   /* re-measure FPS every 500 ms          */
+
+    /* Themes — 10 palettes cycled with t/T */
+    N_THEMES         =  10,
 
     /* Total pool sizes (fixed at compile time) */
     MAX_ROCKETS      =  ROCKETS_MAX,
@@ -287,16 +249,12 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Fireworks use 7 color pairs, one per spectral hue.
- * Pair IDs are named so every site reads as intent.
+ * Pairs 1..7 are the THEMED slots — one per "spark hue" — rebound by
+ * theme_apply() whenever the user cycles themes.  Pairs 8 and 9 are
+ * theme-INVARIANT HUD overlays that stay legible against any animation.
  *
- * 256-color foregrounds (vivid):
- *   RED    196   ORANGE 208   YELLOW 226
- *   GREEN   46   CYAN    51   BLUE    21   MAGENTA 201
- *
- * 8-color fallback (same slot order):
- *   COLOR_RED  COLOR_YELLOW  COLOR_YELLOW
- *   COLOR_GREEN COLOR_CYAN   COLOR_BLUE  COLOR_MAGENTA
+ * Bright-half rule (CLAUDE.md): every theme entry sits at colour index
+ * 30+ in the 256-cube, so even A_DIM particles remain visible.
  */
 typedef enum {
     COL_RED     = 1,
@@ -307,29 +265,65 @@ typedef enum {
     COL_BLUE    = 6,
     COL_MAGENTA = 7,
     COL_COUNT   = 7,
+
+    PAIR_HUD    = 8,   /* bright yellow on default bg — never themed */
+    PAIR_HINT   = 9,   /* bright cyan   on default bg — never themed */
 } ColorID;
+
+/*
+ * Theme — 7-colour palette swapped into pairs 1..7.  Slot names
+ * (RED/ORANGE/...) are abstract labels — what matters is that each
+ * theme provides 7 distinct, bright colours so explosions read as
+ * a multi-hue spray rather than a monochrome ring.
+ */
+typedef struct {
+    const char *name;
+    short       fg[COL_COUNT];   /* 256-cube indices, slot order 1..7 */
+} Theme;
+
+static const Theme themes[N_THEMES] = {
+    /*  name        slot1  2    3    4    5    6    7                      */
+    { "matrix",  {  28,  34,  40,  46,  82, 118, 154 } }, /* greens         */
+    { "neon",    { 201, 207, 165,  51,  87,  45, 213 } }, /* magenta+cyan   */
+    { "nova",    { 196, 202, 208, 220, 226, 231, 255 } }, /* red→white-hot  */
+    { "ocean",   {  33,  39,  45,  51,  87, 123, 195 } }, /* blue→cyan→white*/
+    { "fire",    { 196, 202, 208, 214, 220, 226, 230 } }, /* red→yellow     */
+    { "toxic",   {  46,  82, 118, 154, 190, 226, 220 } }, /* acid green→yel */
+    { "gold",    { 130, 136, 172, 178, 214, 220, 230 } }, /* warm browns    */
+    { "ice",     {  33,  39,  45,  51,  87, 123, 159 } }, /* dark→pale cyan */
+    { "aurora",  {  46,  82,  51,  87, 165, 201, 207 } }, /* green/cyan/mag */
+    { "plasma",  {  93,  99, 165, 201, 207,  51,  87 } }, /* purple→pink→cy */
+};
+
+/* 8-colour fallback palette — used when COLORS < 256, themes inert. */
+static const short k_fallback_fg[COL_COUNT] = {
+    COLOR_RED,    COLOR_YELLOW, COLOR_YELLOW,
+    COLOR_GREEN,  COLOR_CYAN,   COLOR_BLUE,   COLOR_MAGENTA,
+};
+
+/* theme_apply — rebind pairs 1..7 to themes[idx]; HUD pairs untouched. */
+static void theme_apply(int idx)
+{
+    if (COLORS < 256) return;
+    const Theme *t = &themes[idx];
+    for (int i = 0; i < COL_COUNT; i++)
+        init_pair((short)(i + 1), t->fg[i], -1);
+}
 
 static void color_init(void)
 {
     start_color();
+    use_default_colors();
 
     if (COLORS >= 256) {
-        init_pair(COL_RED,     196, COLOR_BLACK);
-        init_pair(COL_ORANGE,  208, COLOR_BLACK);
-        init_pair(COL_YELLOW,  226, COLOR_BLACK);
-        init_pair(COL_GREEN,    46, COLOR_BLACK);
-        init_pair(COL_CYAN,     51, COLOR_BLACK);
-        init_pair(COL_BLUE, 33, COLOR_BLACK);
-        init_pair(COL_MAGENTA, 201, COLOR_BLACK);
+        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
+        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
+        theme_apply(0);                  /* matrix is the startup theme */
     } else {
-        /* 8-color fallback — works in tmux without 256color config */
-        init_pair(COL_RED,     COLOR_RED,     COLOR_BLACK);
-        init_pair(COL_ORANGE,  COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(COL_YELLOW,  COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(COL_GREEN,   COLOR_GREEN,   COLOR_BLACK);
-        init_pair(COL_CYAN,    COLOR_CYAN,    COLOR_BLACK);
-        init_pair(COL_BLUE,    COLOR_BLUE,    COLOR_BLACK);
-        init_pair(COL_MAGENTA, COLOR_MAGENTA, COLOR_BLACK);
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
+        for (int i = 0; i < COL_COUNT; i++)
+            init_pair((short)(i + 1), k_fallback_fg[i], -1);
     }
 }
 
@@ -678,24 +672,39 @@ static void screen_draw_show(Screen *s, const Show *show)
 }
 
 /*
- * screen_draw_hud() — write HUD into stdscr after the scene.
- * Drawn last so it always sits on top of any particle at row 0.
+ * screen_draw_hud — three pieces, all drawn AFTER the scene so they
+ * always overpaint particles:
+ *   row 0 (right):  " <fps> fps  sim:<n> Hz  rkt:<n> "  PAIR_HUD + BOLD
+ *   row 1 (right):  " theme:<name> "                    PAIR_HUD (no bold)
+ *   bottom (left):  " q:quit  ]/[:speed  +/-:rockets  t/T:theme "  PAIR_HINT
  */
 static void screen_draw_hud(Screen *s,
-                              double fps,
-                              int    sim_fps,
-                              int    rockets)
+                            double fps,
+                            int    sim_fps,
+                            int    rockets,
+                            const char *theme_name)
 {
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             "%5.1f fps spd:%d rkt:%d",
+    char top[64];
+    snprintf(top, sizeof top, " %5.1f fps  sim:%2d Hz  rkt:%2d ",
              fps, sim_fps, rockets);
+    int top_x = s->cols - (int)strlen(top);
+    if (top_x < 0) top_x = 0;
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    mvprintw(0, top_x, "%s", top);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    int hx = s->cols - HUD_COLS;
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(COL_YELLOW) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(COL_YELLOW) | A_BOLD);
+    char mid[64];
+    snprintf(mid, sizeof mid, " theme:%s ", theme_name);
+    int mid_x = s->cols - (int)strlen(mid);
+    if (mid_x < 0) mid_x = 0;
+    attron(COLOR_PAIR(PAIR_HUD));
+    mvprintw(1, mid_x, "%s", mid);
+    attroff(COLOR_PAIR(PAIR_HUD));
+
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    mvprintw(s->rows - 1, 0,
+             " q:quit  ]/[:speed  +/-:rockets  t/T:theme ");
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /*
@@ -728,6 +737,7 @@ typedef struct {
     Screen                screen;
     int                   sim_fps;
     int                   rockets;
+    int                   current_theme;     /* index into themes[]   */
     volatile sig_atomic_t running;
     volatile sig_atomic_t need_resize;
 } App;
@@ -831,6 +841,16 @@ static bool app_handle_key(App *app, int ch)
         }
         break;
 
+    case 't':
+        app->current_theme = (app->current_theme + 1) % N_THEMES;
+        theme_apply(app->current_theme);
+        break;
+
+    case 'T':
+        app->current_theme = (app->current_theme + N_THEMES - 1) % N_THEMES;
+        theme_apply(app->current_theme);
+        break;
+
     default:
         break;
     }
@@ -851,10 +871,11 @@ int main(void)
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
-    App *app      = &g_app;
-    app->running  = 1;
-    app->sim_fps  = SIM_FPS_DEFAULT;
-    app->rockets  = ROCKETS_DEFAULT;
+    App *app           = &g_app;
+    app->running       = 1;
+    app->sim_fps       = SIM_FPS_DEFAULT;
+    app->rockets       = ROCKETS_DEFAULT;
+    app->current_theme = 0;
 
     screen_init(&app->screen);
 
@@ -933,7 +954,8 @@ int main(void)
 
         /* ── HUD (into stdscr after scene, drawn on top) ─────────── */
         screen_draw_hud(&app->screen, fps_display,
-                         app->sim_fps, app->rockets);
+                         app->sim_fps, app->rockets,
+                         themes[app->current_theme].name);
 
         screen_present();
 

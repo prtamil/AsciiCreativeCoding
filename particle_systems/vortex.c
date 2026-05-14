@@ -13,13 +13,26 @@
  *       trail, so the spiral arms read clearly even at low
  *       terminal resolution.
  *
- *       Patterns:
- *         WHIRLPOOL    log-spiral inflow, smooth water-vortex feel
- *         TORNADO      strong Kepler boost — tight high-speed core
- *         BLACK_HOLE   extreme inflow + spin near centre, with
- *                      central pulse
- *         SINK         constant inflow + constant ω, classic
- *                      bathtub-drain look
+ *       Patterns (10 total — same engine, different physics tuning):
+ *         WHIRLPOOL    log-spiral inflow, smooth water-vortex feel.
+ *         TORNADO      strong Kepler boost — tight high-speed core.
+ *         BLACK_HOLE   extreme inflow + spin near centre, with central
+ *                      pulse.
+ *         SINK         constant inflow + constant ω, classic bathtub-
+ *                      drain look.
+ *         GALAXY       slow majestic spiral arms — pure log-spiral
+ *                      (no Kepler), highest density, fills the canvas.
+ *         HURRICANE    wide diameter with moderate Kepler boost —
+ *                      visible eye-wall structure, weather-system feel.
+ *         NEBULA       sparse slow drift inward — dust cloud, the
+ *                      calmest pattern.
+ *         CYCLONE      uniform SOLID-BODY rotation — no Kepler boost,
+ *                      every particle shares the same ω regardless of
+ *                      radius, spiral reads like a rotating disc.
+ *         MAELSTROM    everything dialed up + central pulse — chaotic
+ *                      intense storm, the most energetic pattern.
+ *         PULSAR       tight small-radius spiral with strong Kepler +
+ *                      pulsing centre — neutron-star / lighthouse feel.
  *
  * Study alongside:
  *   physics/blackhole.c     — physically-derived gravity gravity-well
@@ -44,7 +57,9 @@
  *   q / ESC    quit
  *   space      pause / resume
  *   r          reseed (clear pool, re-prewarm)
- *   n / N      next pattern   (WHIRLPOOL → TORNADO → BLACK_HOLE → SINK)
+ *   n / N      next pattern   (WHIRLPOOL → TORNADO → BLACK_HOLE → SINK →
+ *                              GALAXY → HURRICANE → NEBULA → CYCLONE →
+ *                              MAELSTROM → PULSAR)
  *   p / P      previous pattern
  *   t / T      next / previous theme
  *   + / =      faster
@@ -107,17 +122,176 @@
  *                  ramp slots than the head.
  *
  * Performance    : O(MAX_PARTICLES · (1 + TRAIL_LEN)) per tick.
- *                  At MAX_PARTICLES = 700 and TRAIL_LEN = 4, ~3500
- *                  mvaddch per frame. Trivial at 60 fps.
+ *                  At MAX_PARTICLES = 1000 and TRAIL_LEN = 4, ~5000
+ *                  mvaddch per frame at peak density.  Trivial at 60 fps.
  *
- * References     :
- *   • Wikipedia — [Logarithmic spiral](https://en.wikipedia.org/wiki/Logarithmic_spiral).
- *     The α_log inflow + β_const angular term produces this exact
- *     shape — `r = r₀ · exp(−α/β · θ)`. Found everywhere in nature
- *     (galaxy arms, nautilus shells, hurricane bands).
- *   • Wikipedia — [Specific angular momentum](https://en.wikipedia.org/wiki/Specific_angular_momentum).
- *     The 1/r angular term is a kinematic stand-in for the
- *     conservation-of-L behaviour of gravitational orbits.
+ * References
+ * ──────────
+ *   PAPERS
+ *     Reeves, W. T. (1983)
+ *       "Particle Systems — A Technique for Modeling a Class of
+ *       Fuzzy Objects"
+ *       ACM Transactions on Graphics 2(2): 91-108.
+ *       Foundational paper.  The pool / spawn / integrate / cull /
+ *       draw skeleton in §5 is straight from Reeves §3.  §4 covers
+ *       parameterised natural-phenomena pools — the PatternParams
+ *       table here is exactly that design.
+ *
+ *     Kepler, J. (1609)
+ *       "Astronomia Nova" — esp. Ch. 32 (second law: equal areas
+ *       in equal times).
+ *       Source of the "ω ∝ 1/r" intuition behind `angular_kepler`.
+ *       Kepler's second law is a statement of angular-momentum
+ *       conservation: the radius vector sweeps equal areas in
+ *       equal time, so when r shrinks, ω must grow to compensate.
+ *       The β_kepler / r term in dθ/dt is the visual analogue —
+ *       it's gentler than the true 1/r² of point-particle gravity
+ *       so the spin-up reads cleanly without blowing up.
+ *
+ *   BOOKS
+ *     Goldstein, H., Poole, C. P. & Safko, J. L. (2002)
+ *       "Classical Mechanics" (3rd ed, Addison-Wesley).
+ *       Ch. 3 — Central-force motion.  Derives the conservation
+ *       of angular momentum L = m·r·v_θ that backs the
+ *       angular_kepler 1/r approximation.  Ch. 1 §1.2 covers
+ *       Lagrangian polar coordinates and the radial / angular
+ *       equations of motion (dr/dt and dθ/dt) that scene_tick
+ *       integrates with explicit Euler.
+ *
+ *     Bourg, D. M. & Bywalec, B. (2013)
+ *       "Physics for Game Developers" (2nd ed, O'Reilly).
+ *       Ch. 8 §1 — polar-coordinate motion and the parametric
+ *       circle x(t) = R·cos(ωt), y(t) = R·sin(ωt) used in
+ *       polar_to_cell().  Ch. 2-3 — the explicit-Euler
+ *       integration step that drives r += dr·dt, θ += dθ·dt.
+ *
+ *     Acheson, D. J. (1990)
+ *       "Elementary Fluid Dynamics" (Oxford University Press).
+ *       Ch. 5 — Vortex motion.  Gives the physical context for
+ *       the ω(r) profiles available here: SOLID-BODY rotation
+ *       (CYCLONE: ω constant across radii), POTENTIAL VORTEX
+ *       (Kepler-like, ω ∝ 1/r — TORNADO, BLACK_HOLE), and the
+ *       RANKINE COMBINED model (interior solid + exterior
+ *       potential, the visual that WHIRLPOOL / HURRICANE evoke).
+ *
+ *     Akenine-Möller, T., Haines, E. & Hoffman, N. (2018)
+ *       "Real-Time Rendering" (4th ed, CRC Press).
+ *       §13.7 — point-sprite particle rendering.  The
+ *       inner-fraction → ramp-slot mapping used for RAMP_GLYPHS
+ *       (outer dim → inner bright) is the ASCII analogue of
+ *       size-by-distance point-sprite sizing described there.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── ARCHITECTURE — DATA-DRIVEN PATTERN ENGINE ────────────────────────── *
+ *
+ * Ten visually distinct vortex effects (WHIRLPOOL, TORNADO,
+ * BLACK_HOLE, SINK, GALAXY, HURRICANE, NEBULA, CYCLONE, MAELSTROM,
+ * PULSAR) are produced by a SINGLE generic polar-physics engine
+ * driven by an array of PatternParams structs.  scene_tick and
+ * scene_draw never branch on the pattern enum to decide HOW the
+ * physics works — they read pattern_params[s->current_pattern] and
+ * compute accordingly.  Adding a new pattern is a matter of
+ * appending one row to pattern_params[]; no new code paths.
+ *
+ *
+ * THE GENERIC ENGINE (pseudocode)
+ * ───────────────────────────────
+ *
+ *   loop forever (each tick of dt seconds):
+ *
+ *     pp = pattern_params[scene.current_pattern]   # read inputs
+ *     r_outer = compute_outer_radius(scene, pp)
+ *
+ *     # 1. SPAWN until population reaches target
+ *     while count(active particles) < pp.target_count:
+ *         p = next_inactive_slot()
+ *         p.theta  = uniform(0, 2π)
+ *         p.r      = uniform(0.85·r_outer, r_outer)
+ *         p.age    = 0
+ *         p.active = true
+ *
+ *     # 2. INTEGRATE every active particle (polar Euler step)
+ *     for p in active particles:
+ *         dr_dt     = -(pp.inflow_log · p.r + pp.inflow_const)
+ *         dtheta_dt =  pp.angular_const + pp.angular_kepler / max(p.r, R_MIN)
+ *         p.r      += dr_dt     · dt
+ *         p.theta  += dtheta_dt · dt
+ *         p.age    += dt
+ *
+ *     # 3. DRAIN — particles that reach the centre die
+ *     for p in active particles:
+ *         if p.r < R_DRAIN:  p.active = false
+ *
+ *     # 4. RENDER — convert (r, θ) → cell, paint heat-ramp glyph
+ *     for p in active particles:
+ *         (cx_p, cy_p) = polar_to_cell(p.r, p.theta, cx, cy)
+ *         slot         = inner_fraction(p.r, r_outer) · 7
+ *         paint(cx_p, cy_p, ramp[slot])
+ *         paint_tangent_trail(p, dr_dt, dtheta_dt)   # back-step on local arc
+ *     paint_centre_glyph(cx, cy, pp.center_glyph,
+ *                        pulse=pp.center_pulse and sin(time)-modulated)
+ *
+ *
+ * PATTERNPARAMS FIELD → ENGINE HOOK
+ * ─────────────────────────────────
+ *
+ *   target_count     →  spawn-loop refill cap        (density)
+ *   r_outer_frac     →  outer spawn radius           (vortex extent)
+ *   inflow_log       →  dr/dt:  −α·r                 (exponential pull)
+ *   inflow_const     →  dr/dt:  −α                   (constant pull)
+ *   angular_const    →  dθ/dt:  +β                   (uniform spin)
+ *   angular_kepler   →  dθ/dt:  +β/r                 (Kepler spin-up)
+ *   center_glyph     →  draw step                    (drain marker)
+ *   center_pulse     →  draw step                    (heartbeat throb)
+ *
+ * Every other engine constant — R_DRAIN_CELLS, ASPECT_Y,
+ * R_MIN_DENOM, TRAIL_LEN, TRAIL_STEP_DT, MAX_PARTICLES — is a
+ * GLOBAL tuning knob shared across all patterns.  Patterns differ
+ * ONLY in the eight fields above.
+ *
+ *
+ * ARCHITECTURAL REFERENCES
+ * ────────────────────────
+ *
+ *   Reeves, W. T. (1983)
+ *     "Particle Systems — A Technique for Modeling a Class of
+ *     Fuzzy Objects", ACM TOG 2(2): 91-108.
+ *     §4 makes the explicit argument that ONE engine + a struct
+ *     of physical constants per phenomenon is the right
+ *     architecture for natural-particle simulations.  Reeves
+ *     enumerates fire, fountains, fireworks, smoke, sparks — all
+ *     driven by the same engine, varying only their parameter
+ *     struct.  This file is a direct application of that idea to
+ *     vortices.
+ *
+ *   Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994)
+ *     "Design Patterns: Elements of Reusable Object-Oriented
+ *     Software" (Addison-Wesley) — STRATEGY pattern (§5.9).
+ *     A family of algorithms (here: ten vortex characters)
+ *     interchangeable behind a single interface (the engine
+ *     reading PatternParams).  In a procedural-C setting the
+ *     "interface" is the struct shape; the "concrete strategies"
+ *     are the rows of pattern_params[]; "selecting a strategy"
+ *     is updating scene.current_pattern.
+ *
+ *   Acton, M. (2014)
+ *     "Data-Oriented Design and C++" (CppCon 2014 keynote).
+ *     Argues that variation between behaviours should be
+ *     represented as DATA (struct fields) rather than as control
+ *     flow (if/switch on type).  pattern_params[] is a compact
+ *     data table; the engine has no per-pattern code paths and
+ *     the cache footprint stays predictable across pattern
+ *     switches.
+ *
+ *   Nystrom, R. (2014)
+ *     "Game Programming Patterns" (Genever Benning).
+ *     TYPE OBJECT chapter — PatternParams is a Type Object: one
+ *     shared instance per "kind" of vortex, every Particle
+ *     implicitly references it via Scene.current_pattern.  DATA
+ *     LOCALITY chapter — Particle is a flat-laid-out POD swept
+ *     linearly by the integrator each tick, exactly the layout
+ *     Nystrom recommends for hot inner loops.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -133,41 +307,48 @@
  * The spiral shape EMERGES from the integration; you never compute
  * a spiral curve directly.
  *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a turntable with a marble on the edge. You slowly
- * shorten its leash to the centre while the turntable keeps
- * spinning. The marble traces a spiral inward. Some patterns
- * (Black Hole) make the marble's leash shrink fast AND the
- * turntable spin faster as it gets closer to the middle, so the
- * marble whips around the centre at the end. Others (Sink) keep
- * a steady spin and steady leash-shortening — a smooth lazy
- * spiral.
- *
  * ALGORITHM IN STEPS
  * ──────────────────
- *  1. SPAWN at the OUTER edge: pick a random angle θ ∈ [0, 2π],
- *     pick r ∈ [r_outer · 0.85, r_outer · 1.0]. Set age = 0.
+ * (Each step names the helper it dispatches to in §5; the drivers
+ * scene_tick and scene_draw are pure pseudocode over these.)
  *
- *  2. INTEGRATE per tick:
- *       dr_dt   = -(α_log · r  +  α_const)
- *       dθ_dt   =   β_const  +  β_kepler / max(r, R_MIN)
- *       r      += dr_dt · dt
- *       θ      += dθ_dt · dt
- *       age    += dt
+ *  1. SPAWN.
+ *       active   = count_active_particles(s)
+ *       to_spawn = compute_spawn_count_for_tick(active, pp, dt)
+ *       particle_pool_topup_at_outer_band(s, r_outer, to_spawn)
+ *     Each new particle drops in at the OUTER edge band:
+ *       θ = uniform(0, 2π);  r = uniform(0.85·r_outer, r_outer)
  *
- *  3. DRAIN: when r < R_DRAIN (small inner radius), deactivate.
+ *  2. INTEGRATE PER PARTICLE.  integrate_particle_polar_euler reads
+ *     scene_polar_rates(pp, r) for (dr, dθ) and applies explicit
+ *     Euler in (r, θ):
+ *       dr/dt = −(α_log · r + α_const)
+ *       dθ/dt =  β_const  + β_kepler / max(r, R_MIN_DENOM)
+ *       r += dr·dt;   θ += dθ·dt;   age += dt
+ *     (Goldstein Ch. 1 §1.2 — polar Lagrangian; Bourg Ch. 2-3 — Euler step.)
  *
- *  4. RENDER. For each particle:
- *       cell_x = cx + r · cos θ
- *       cell_y = cy + r · sin θ / ASPECT_Y    (aspect correction)
- *     Plus tangent trail of TRAIL_LEN cells back-stepped along
- *     the local (dr, dθ).
+ *  3. DRAIN.  particle_drained predicate (r < R_DRAIN_CELLS) — slot
+ *     reclaimed for the next spawn.
  *
- *  5. CENTRE GLYPH: a fixed small glyph at (cx, cy) — `O` for
- *     SINK, `@` for BLACK_HOLE pulse, etc.
+ *  4. RENDER PARTICLES.  particle_pool_draw → trail_draw_one_particle.
+ *     For each active particle:
+ *       head_slot = inner_fraction_to_ramp_slot(r, r_outer)   # outer dim → drain bright
+ *       (dr_back, dθ_back) = compute_trail_back_step(pp, p)   # local arc
+ *       for t in TRAIL_LEN..0:                                # tail → head
+ *         (cell_x, cell_y) = polar_to_cell(r + dr_back·t,
+ *                                          θ − dθ_back·t,
+ *                                          cx, cy)
+ *         slot = head_slot − t
+ *         paint(cell_x, cell_y, RAMP_GLYPHS[slot],
+ *               head_attr_by_brightness_slot(slot))
  *
- *  6. HUD on bottom row.
+ *  5. RENDER CENTRE.  center_drain_draw paints pp.center_glyph at
+ *     (cx, cy) with center_pulse_attr modulating A_BOLD on a 3 rad/s
+ *     sin clock for BLACK_HOLE / MAELSTROM / PULSAR.  Other patterns
+ *     stay statically A_BOLD.
+ *
+ *  6. HUD.  Two-row layout painted by §6 screen — top row (status)
+ *     PAIR_HUD + A_BOLD, bottom row (key hints) PAIR_HINT + A_BOLD.
  *
  * KEY FORMULAS
  * ────────────
@@ -193,61 +374,6 @@
  *  Brightness fraction (for ramp index):
  *    f = clamp(1 − r / r_outer, 0, 1)         // outer = 0, drain = 1
  *    ramp_slot = ⌊f · 7⌋
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • DIVISION BY ZERO at r → 0. The β_kepler / r term blows up at
- *    the centre. We clamp `r` to `R_MIN` (typically 1.0 cell) in
- *    the denominator. Particles are also drained at `R_DRAIN`
- *    (~3 cells) so they vanish before getting close enough to the
- *    singularity to matter.
- *
- *  • ANGULAR WRAP. θ grows monotonically; for cos/sin it's fine to
- *    have huge values. Floating-point precision is plenty even
- *    after thousands of revolutions.
- *
- *  • ASPECT RATIO. Without ASPECT_Y compensation, the spiral
- *    renders as a vertical ellipse — unnatural. Dividing the y
- *    component by ASPECT_Y = 2 makes the spiral look round.
- *
- *  • RESPAWN. When a particle drains, it goes back into the pool.
- *    Next tick the spawn-to-target loop activates it at a fresh
- *    outer-edge position. Steady-state population is maintained.
- *
- *  • TRAIL OFF-SCREEN. Trail cells can fall outside the canvas —
- *    we skip them with a bounds check, no wraparound.
- *
- *  • LARGE TARGET COUNTS at fast spin. With 700 particles all
- *    spinning fast near the drain, the inner ring becomes a
- *    glowing solid mass. Set TARGET reasonably or BLACK_HOLE may
- *    look like a bright disk rather than spiral arms.
- *
- *  • PRE-WARM. On init / reseed / pattern-change we spawn the
- *    full target count at random positions across the FULL valid
- *    radial range (R_DRAIN..R_OUTER) so the spiral fills from
- *    frame 1 instead of growing in from the edge.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Pause (space). Particles freeze on their spiral arc. Resume:
- *    motion continues from where it stopped.
- *
- *  • WHIRLPOOL. Smooth log spiral — equal angles between successive
- *    arm crossings. Particles slowly accelerate as they approach
- *    the centre.
- *
- *  • TORNADO. Tight Kepler-boosted core: outer arms are slow and
- *    visible; inner ring whips around the centre rapidly.
- *
- *  • BLACK_HOLE. Extreme inflow and rotation; the inner ring is
- *    barely a ring — it's a blur. Good "accretion disc" feel.
- *
- *  • SINK. Bathtub drain — constant inflow speed, constant ω.
- *    The spiral has more uniform spacing across radii.
- *
- *  • Theme cycle (`t`/`T`). Each theme produces a recognisably
- *    different vortex character: BLACKHOLE theme is purple/red,
- *    AURORA cycles through rainbow, MONO is greyscale.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -315,7 +441,13 @@ typedef enum {
     PATTERN_TORNADO    = 1,
     PATTERN_BLACK_HOLE = 2,
     PATTERN_SINK       = 3,
-    N_PATTERNS         = 4,
+    PATTERN_GALAXY     = 4,
+    PATTERN_HURRICANE  = 5,
+    PATTERN_NEBULA     = 6,
+    PATTERN_CYCLONE    = 7,
+    PATTERN_MAELSTROM  = 8,
+    PATTERN_PULSAR     = 9,
+    N_PATTERNS         = 10,
 } Pattern;
 
 static const char *pattern_name(Pattern p)
@@ -325,21 +457,120 @@ static const char *pattern_name(Pattern p)
     case PATTERN_TORNADO:    return "TORNADO   ";
     case PATTERN_BLACK_HOLE: return "BLACK_HOLE";
     case PATTERN_SINK:       return "SINK      ";
+    case PATTERN_GALAXY:     return "GALAXY    ";
+    case PATTERN_HURRICANE:  return "HURRICANE ";
+    case PATTERN_NEBULA:     return "NEBULA    ";
+    case PATTERN_CYCLONE:    return "CYCLONE   ";
+    case PATTERN_MAELSTROM:  return "MAELSTROM ";
+    case PATTERN_PULSAR:     return "PULSAR    ";
     default:                 return "?         ";
     }
 }
 
 /*
- * PatternParams — physics knobs per pattern.
+ * PatternParams — per-pattern physics + visual signature for one
+ * of the ten vortex effects.
  *
- *   target_count     : steady-state active particle count
- *   r_outer_frac     : outer radius as fraction of min(cols/2, rows/2·ASPECT_Y)
- *   inflow_log       : α_log — exponential inflow rate (1/s)
- *   inflow_const     : α_const — constant inflow speed (cells/s)
- *   angular_const    : β_const — angular velocity at all radii (rad/s)
- *   angular_kepler   : β_kepler — 1/r angular boost (rad·cell/s)
- *   center_glyph     : single character at the drain centre
- *   center_pulse     : non-zero → centre pulses (BLACK_HOLE)
+ * REFERENCES (each cited at the field it backs):
+ *   Reeves, W. T. (1983) "Particle Systems — A Technique for
+ *     Modeling a Class of Fuzzy Objects", ACM TOG 2(2): 91-108.
+ *     §4 argues that natural-phenomena particle pools should be
+ *     parameterised by a small struct of physical constants.
+ *     PatternParams IS that struct — one row of pattern_params[]
+ *     per effect.  scene_tick never branches on the pattern enum
+ *     for the physics; it just reads these fields.
+ *
+ *   Kepler, J. (1609) "Astronomia Nova" — second law (equal
+ *     areas in equal time).  The `angular_kepler` field weights
+ *     the ω ∝ 1/r term in dθ/dt — Kepler's L-conservation
+ *     visualised as faster spin near the drain.
+ *
+ *   Acheson, D. J. (1990) "Elementary Fluid Dynamics", Ch. 5
+ *     (Vortex motion).  The (angular_const, angular_kepler) pair
+ *     selects between three classical vortex profiles:
+ *       angular_kepler = 0            → SOLID-BODY rotation
+ *                                       (CYCLONE, GALAXY)
+ *       angular_kepler ≫ angular_const → POTENTIAL VORTEX
+ *                                       (TORNADO, BLACK_HOLE, PULSAR)
+ *       both nonzero, balanced       → RANKINE COMBINED model
+ *                                       (WHIRLPOOL, HURRICANE,
+ *                                        MAELSTROM)
+ *
+ *   Bourg, D. M. & Bywalec, B. (2013) "Physics for Game
+ *     Developers", Ch. 2-3.  inflow_log + inflow_const follow
+ *     Bourg's two-term radial-velocity decomposition: an
+ *     exponential-decay term proportional to r plus a constant pull.
+ *
+ * INTENT
+ *   Same simulation engine, ten effects — varying these eight
+ *   fields produces WHIRLPOOL, TORNADO, BLACK_HOLE, SINK, GALAXY,
+ *   HURRICANE, NEBULA, CYCLONE, MAELSTROM, PULSAR.  Tuning a
+ *   pattern is a matter of editing one row of pattern_params[];
+ *   no scene_tick or scene_draw code change is needed for new
+ *   patterns within this parameter space.
+ *
+ * FIELDS:
+ *   target_count    Steady-state active particle count the spawn
+ *                   loop refills toward each tick (per-tick cap
+ *                   proportional to dt so a long pause doesn't
+ *                   dump everyone at once).  Higher = denser
+ *                   spiral.  Range: 300 (NEBULA — sparse drift)
+ *                   to 800 (GALAXY — dense arms).  Reeves 1983 §3
+ *                   — "steady-state pool".
+ *
+ *   r_outer_frac    Outer spawn radius as a fraction of the
+ *                   half-screen size (after ASPECT_Y compensation).
+ *                   Smaller = tighter vortex.  Range: 0.65 (PULSAR
+ *                   — small dense core) to 0.98 (HURRICANE — wide
+ *                   weather-system scale).
+ *
+ *   inflow_log      α_log — exponential inflow rate, units 1/s.
+ *                   dr/dt contribution: −α_log · r.  Solo
+ *                   signature is the log-spiral
+ *                   r(t) = r₀ · exp(−α_log · t) — equal-angle
+ *                   convergence, the GALAXY arm shape.  Range: 0.04
+ *                   (NEBULA, GALAXY — slow drift) to 0.55
+ *                   (BLACK_HOLE — rapid pull).
+ *
+ *   inflow_const    α_const — constant inflow speed, cells/s.
+ *                   dr/dt contribution: −α_const.  Linear inflow
+ *                   that doesn't slow down as r shrinks — the
+ *                   bathtub-drain feel of SINK (α_const = 4.0,
+ *                   α_log = 0).  Range: 0 (GALAXY — pure log
+ *                   inflow) to 4.0 (SINK).
+ *
+ *   angular_const   β_const — steady angular velocity at every
+ *                   radius, rad/s.  dθ/dt contribution: +β_const.
+ *                   Combined with α_log alone produces a clean
+ *                   log-spiral; combined with α_const gives the
+ *                   SINK look.  Range: 0.20 (NEBULA — barely
+ *                   turning) to 2.20 (CYCLONE — fast solid-body
+ *                   rotation).
+ *
+ *   angular_kepler  β_kepler — strength of the ω ∝ 1/r angular
+ *                   boost, units rad·cell/s.  dθ/dt contribution:
+ *                   +β_kepler / max(r, R_MIN_DENOM).  Mimics
+ *                   Kepler's second law — when r shrinks, ω spikes.
+ *                   Three regimes:
+ *                     0       → flat ω profile, particles trace
+ *                               concentric circles at the same
+ *                               rate (CYCLONE, GALAXY, WHIRLPOOL)
+ *                     4 – 5.5 → tight whip near the centre
+ *                               (TORNADO, MAELSTROM, PULSAR)
+ *                     8       → extreme spin-up — accretion disc
+ *                               (BLACK_HOLE)
+ *
+ *   center_glyph    Single ASCII character drawn at the drain
+ *                   centre.  Per-pattern visual signature:
+ *                     '.'  WHIRLPOOL, NEBULA   '*'  TORNADO, GALAXY
+ *                     '@'  BLACK_HOLE, HURRICANE
+ *                     'O'  SINK         'o'  CYCLONE
+ *                     '+'  PULSAR       '#'  MAELSTROM
+ *
+ *   center_pulse    Non-zero → the centre glyph alternates between
+ *                   A_BOLD and A_NORMAL on a sin(time_accum · 3)
+ *                   clock, giving a heartbeat / accretion-disc
+ *                   throb.  Set on BLACK_HOLE, MAELSTROM, PULSAR.
  */
 typedef struct {
     int   target_count;
@@ -353,20 +584,41 @@ typedef struct {
 } PatternParams;
 
 static const PatternParams pattern_params[N_PATTERNS] = {
-    /*                  target  rfrac  inLog  inConst  angC   angKep   ctr  pulse */
+    /*                  target  rfrac  inLog  inConst  angC    angKep  ctr  pulse */
     /* WHIRLPOOL  */ {  500,   0.85f,  0.40f,  0.30f,  1.40f,  0.0f,  '.',  0 },
     /* TORNADO    */ {  600,   0.85f,  0.20f,  1.20f,  0.80f,  4.0f,  '*',  0 },
     /* BLACK_HOLE */ {  700,   0.95f,  0.55f,  2.00f,  0.50f,  8.0f,  '@',  1 },
     /* SINK       */ {  450,   0.85f,  0.00f,  4.00f,  2.00f,  1.0f,  'O',  0 },
+    /* GALAXY     */ {  800,   0.95f,  0.06f,  0.00f,  0.50f,  0.0f,  '*',  0 },
+    /* HURRICANE  */ {  600,   0.98f,  0.15f,  0.10f,  1.00f,  2.5f,  '@',  0 },
+    /* NEBULA     */ {  300,   0.85f,  0.04f,  0.05f,  0.20f,  0.5f,  '.',  0 },
+    /* CYCLONE    */ {  550,   0.90f,  0.20f,  0.50f,  2.20f,  0.0f,  'o',  0 },
+    /* MAELSTROM  */ {  700,   0.85f,  0.45f,  1.80f,  1.60f,  4.0f,  '#',  1 },
+    /* PULSAR     */ {  400,   0.65f,  0.30f,  0.60f,  1.40f,  5.5f,  '+',  1 },
 };
 
 /*
  * Themes — each is an 8-step gradient from OUTER (slot 0, dim) to
- * INNER (slot 7, bright). Particles near the drain take the brightest
- * slot; outer arms fade through the lower slots.
+ * INNER (slot 7, bright).  Particles near the drain take the
+ * brightest slot; outer arms fade through the lower slots.  Each
+ * theme commits to ONE hue family so the t / T cycle is visually
+ * obvious — no two themes share a colour story.  NOVA is the
+ * standout, the only multi-hue ramp (blue → magenta → orange →
+ * yellow → white) so a real supernova spectrum sweeps through the
+ * spiral arms.
+ *
+ *   MATRIX   pure phosphor green        FOREST   olive → leaf → gold
+ *   FIRE     coal → flame → white-hot   DESERT   dune brown → cream
+ *   OCEANIC  deep blue → teal (no white) NEON    purple → hot pink
+ *   ICE      pale frost → pure white    ECLIPSE  void purple → crimson
+ *   NOVA     blue → magenta → yellow    MONO     grayscale
  *
  * All entries sit in the BRIGHT HALF of the 256-colour cube per the
- * CLAUDE.md "Theme Palette Brightness" rule.
+ * CLAUDE.md "Theme Palette Brightness" rule, so even ramp[0]
+ * (the dimmest "outer arm" colour) stays visible against a black
+ * terminal with A_DIM applied.  `center` picks the brightest hue
+ * that complements the ramp — it paints the drain glyph and pops
+ * against the spiral.
  */
 typedef struct {
     const char *name;
@@ -378,18 +630,17 @@ typedef struct {
 #define N_THEMES 10
 
 static const Theme themes[N_THEMES] = {
-    /* name         ramp[0..7]                                       center sky */
-
-    { "DEFAULT",   {  24,  31,  38,  45,  87, 117, 153, 195 },        231,  234 },
-    { "BLACKHOLE", {  53,  91, 134, 165, 207, 213, 219, 231 },        201,  232 },
-    { "TORNADO",   { 240, 244, 248, 250, 252, 253, 254, 255 },        226,  234 },
-    { "FIRE",      {  88, 124, 130, 166, 196, 208, 214, 226 },        231,  234 },
-    { "GREEN",     {  28,  34,  40,  64,  70, 112, 156, 192 },        231,  234 },
-    { "VIOLET",    {  53,  54,  91, 134, 135, 176, 213, 219 },        231,  234 },
-    { "ICE",       {  24,  31,  67, 110, 117, 153, 195, 231 },        231,  234 },
-    { "COPPER",    { 130, 137, 173, 179, 215, 222, 229, 230 },        231,  234 },
-    { "AURORA",    {  43,  79, 115, 121, 157, 195, 230, 231 },        231,  234 },
-    { "MONO",      { 240, 243, 245, 247, 249, 251, 253, 255 },        255,  232 },
+    /* name        ramp[0..7]  (outer dim → inner bright)              center  sky */
+    { "MATRIX",   {  28,  34,  40,  46,  82, 118, 154, 190 },           226,  234 },  /* phosphor green       */
+    { "FIRE",     {  52,  88, 124, 160, 202, 208, 220, 231 },           231,  233 },  /* coal→flame→white-hot */
+    { "OCEANIC",  {  24,  25,  32,  38,  44,  80, 116, 152 },           195,  234 },  /* deep blue → teal     */
+    { "NEON",     {  54,  92, 128, 165, 201, 207, 213, 219 },           225,  234 },  /* purple → hot pink    */
+    { "MONO",     { 240, 244, 247, 250, 252, 253, 254, 255 },           255,  232 },  /* grayscale            */
+    { "ICE",      { 117, 153, 159, 195, 231, 251, 253, 255 },           255,  235 },  /* pale frost → white   */
+    { "NOVA",     {  27,  99, 165, 201, 208, 220, 226, 231 },           231,  234 },  /* SPECTRUM (multi-hue) */
+    { "FOREST",   {  58,  64,  70, 106, 142, 148, 184, 220 },           226,  234 },  /* olive → leaf → gold  */
+    { "DESERT",   {  94, 130, 137, 173, 215, 222, 228, 230 },           230,  234 },  /* dune → sand → cream  */
+    { "ECLIPSE",  {  53,  54,  89, 125, 161, 197, 204, 209 },           219,  232 },  /* void purple → crimson*/
 };
 
 /* Glyphs by inner-fraction (outer→inner). */
@@ -455,9 +706,101 @@ static void color_init(void)
 /* §4  particle                                                           */
 /* ===================================================================== */
 
+/*
+ * Particle — one swirling speck in the vortex.
+ *
+ * REFERENCES:
+ *   Reeves, W. T. (1983) "Particle Systems — A Technique for
+ *     Modeling a Class of Fuzzy Objects", ACM TOG 2(2): 91-108.
+ *     The fixed pool + per-particle state + lifetime-via-drain-cull
+ *     model is straight from Reeves §3.  §4 specifically discusses
+ *     the parameterised natural-phenomena pools that PatternParams
+ *     implements above.
+ *
+ *   Goldstein, H., Poole, C. P. & Safko, J. L. (2002) "Classical
+ *     Mechanics" (3rd ed, Addison-Wesley).  Ch. 1 §1.2 — the
+ *     polar (r, θ) representation that lets a TWO-component
+ *     state describe the same motion that Cartesian would need
+ *     four components for (vx, vy, ax, ay).  Ch. 3 — central-
+ *     force motion: the conservation of angular momentum that
+ *     backs the angular_kepler / r term in dθ/dt.
+ *
+ *   Kepler, J. (1609) "Astronomia Nova" — second law (equal
+ *     areas in equal time).  When r shrinks, ω must grow to
+ *     keep L constant — exactly what scene_polar_rates produces
+ *     via the β_kepler / r term that this struct's `r` field
+ *     feeds.
+ *
+ *   Bourg, D. M. & Bywalec, B. (2013) "Physics for Game
+ *     Developers" (2nd ed, O'Reilly).  Ch. 8 §1 — polar →
+ *     Cartesian conversion (cell coordinates) used in
+ *     polar_to_cell at render time.
+ *
+ * INTENT
+ *   POLAR coords instead of Cartesian.  Each particle's state is
+ *   (r, θ) — radius from drain + angle around drain — so the
+ *   physics integrator only ever computes dr/dt and dθ/dt; the
+ *   spiral curve EMERGES from those scalar updates without ever
+ *   computing a spiral path explicitly.  Cartesian conversion
+ *   happens once at render time in polar_to_cell.
+ *
+ *   Flat layout fits the fixed-size BSS pool — MAX_PARTICLES of
+ *   these allocated once at program start, no malloc after init.
+ *   The `active` flag is the single source of truth for pool-slot
+ *   occupancy; spawn finds the first inactive index via a linear
+ *   scan in particle_pool_find_inactive.
+ *
+ * LIFECYCLE
+ *   SPAWN (scene_spawn_particle):
+ *     random θ ∈ [0, 2π), r near r_outer (or anywhere in the
+ *     valid range during pre-warm), age = 0, active = true.
+ *
+ *   INTEGRATE (scene_tick):
+ *     scene_polar_rates produces (dr, dθ) for the current radius
+ *     under the active pattern.  Explicit Euler:
+ *       r += dr · dt;   θ += dθ · dt;   age += dt
+ *
+ *   DRAIN (scene_tick): r drops below R_DRAIN_CELLS → active=false,
+ *     slot reclaimed for the next spawn.  No outward escape — every
+ *     particle ends at the drain.
+ *
+ *   RENDER (scene_draw):
+ *     polar_to_cell(r, θ) → (ix, iy); colour from inner-fraction
+ *     f = 1 − r / r_outer (outer = dim, drain = bright).  Tangent
+ *     trail back-stepped from the local (dr, dθ) so the streak
+ *     follows the spiral arc.
+ *
+ * FIELDS:
+ *   r            Radius from the drain centre, in cells (after
+ *                ASPECT_Y normalisation, so a polar circle renders
+ *                round on screen instead of a vertical ellipse).
+ *                Always positive; clamped to R_MIN_DENOM in the
+ *                denominator of the β_kepler / r term so the
+ *                integrator can't divide by zero (Kepler 1609 →
+ *                Goldstein Ch. 3 — the 1/r factor for L conservation).
+ *
+ *   theta        Angle around the drain in radians.  Grows
+ *                MONOTONICALLY — no wrap to [0, 2π).  cos/sin
+ *                handle huge values cleanly and float precision
+ *                is plenty even after thousands of revolutions
+ *                (a typical particle dies at r = R_DRAIN before
+ *                completing more than a few turns).
+ *
+ *   age          Seconds since spawn.  Currently unused by the
+ *                integrator (death is r-based, not age-based) and
+ *                unused by the renderer (brightness comes from r,
+ *                not age) — kept available for future per-particle
+ *                age effects (e.g. fade-in at spawn, lifetime cap).
+ *
+ *   active       Pool-slot occupancy flag.  Inactive slots are
+ *                skipped by every loop; spawn finds the first
+ *                inactive index via a linear scan
+ *                (O(MAX_PARTICLES), free at MAX_PARTICLES = 1000
+ *                and 60 fps).  Reeves 1983 §3 — pool slot.
+ */
 typedef struct {
-    float r;        /* radius from centre (in cells, post-aspect) */
-    float theta;    /* angle in radians                          */
+    float r;
+    float theta;
     float age;
     bool  active;
 } Particle;
@@ -477,17 +820,108 @@ static inline float lcg_unit(uint32_t *st)
 /* §5  scene — pool, polar tick, draw                                    */
 /* ===================================================================== */
 
+/*
+ * Scene — owns every piece of mutable state for the vortex demo.
+ *
+ * Two clearly-separated halves:
+ *
+ *   SIMULATION HALF — read + written by scene_tick.  Owns the
+ *                     active pattern, RNG, cached terminal
+ *                     dimensions, the global clock for the centre
+ *                     pulse, and the particle pool.  Mutated by
+ *                     scene_tick and the key handler.
+ *
+ *   RENDER HALF     — what scene_draw consults to pick colours.
+ *                     Purely visual selection index; never read
+ *                     inside the physics tick.
+ *
+ * LOCALITY
+ *   Grouping by access pattern matters for two reasons.
+ *   Conceptually: a reader scanning scene_tick wants every field
+ *   that mutates each frame in one block (not interleaved with
+ *   render-only fields), and vice versa for scene_draw.
+ *   Mechanically: the hot path is the tick — its small simulation
+ *   fields fit in one or two cache lines and stay warm across the
+ *   whole tick.  current_theme sits in the render half because the
+ *   physics tick never touches it.
+ *
+ * REFERENCES (cited inline at the relevant member):
+ *   Reeves (1983)  — particle pool design (Scene.particles[])
+ *   Kepler (1609)  — second law (Scene.particles[].r feeds
+ *                    angular_kepler / r in dθ/dt)
+ *
+ * SEPARATION OF CONCERNS
+ *   The Scene knows nothing about ncurses.  Physics writes to the
+ *   pool + scalar state; the render layer reads them.  That split
+ *   lets the simulation be exercised without a terminal (e.g. for
+ *   profiling) and keeps the layering explicit.
+ */
 typedef struct {
+    /* ──────────────────────────────────────────────────────────────
+     *  SIMULATION HALF — physics tick reads + writes these
+     * ────────────────────────────────────────────────────────────── */
+
+    /* PAUSE — scene_tick early-returns when set.  Render keeps
+     * running, so the user sees a frozen frame with particles
+     * held mid-arc on their spiral.  Toggled by SPACE. */
     bool      paused;
+
+    /* SPEED — integer multiplier on dt.  SPEED_DEF = 1× wall clock;
+     * +/= keys double, − halves; bounded by SPEED_MIN/MAX.  Doesn't
+     * change physics constants — just compresses or stretches
+     * simulated time so the user can slow-mo / fast-forward the
+     * same vortex without altering its character. */
     int       speed;
-    int       current_theme;
+
+    /* PATTERN — index into pattern_params[] (WHIRLPOOL … PULSAR).
+     * Cycled by n / N.  Switching pattern triggers a scene_prewarm
+     * so the new physics has a full population from frame 1.  Read
+     * by scene_tick (every physics term comes from
+     * pattern_params[s->current_pattern]) AND scene_draw (centre
+     * glyph + pulse); the only field used by both halves. */
     Pattern   current_pattern;
+
+    /* RNG — per-scene LCG state, seeded from clock_ns() at init
+     * and re-seeded (XOR'd with a sentinel) on r.  Used by every
+     * randomness consumer: spawn angle θ ∈ [0, 2π), spawn radius
+     * within the outer band.  No globals — full state in this
+     * single 32-bit word. */
     uint32_t  rng;
+
+    /* CACHED TERMINAL DIMENSIONS — read every frame by spawn
+     * (r_outer needs cols/rows after ASPECT_Y compensation), and
+     * the renderer (cell bounds + centre coords).  Cached at init
+     * and on SIGWINCH so the hot path never calls getmaxyx().
+     * Strictly speaking these are SHARED between sim and render —
+     * both halves see the same dimensions — but they're written
+     * only by the tick layer so they live with the SIMULATION block. */
     int       rows, cols;
 
-    float     time_accum;       /* for centre pulse animation        */
+    /* GLOBAL CLOCK — seconds since the scene started, advanced by
+     * dt each tick.  Drives the centre-glyph pulse used by
+     * BLACK_HOLE / MAELSTROM / PULSAR:
+     *   pulse = 0.5 + 0.5 · sin(time_accum · 3.0)
+     * Read by render (scene_draw) but written by tick — sits with
+     * simulation. */
+    float     time_accum;
 
+    /* PARTICLE POOL — fixed-size BSS array, no allocation after
+     * init.  See Particle for per-slot detail.
+     * particle_pool_find_inactive linear-scans for the first
+     * inactive index when spawn needs a slot.  Reeves 1983 §3 —
+     * the particle pool. */
     Particle  particles[MAX_PARTICLES];
+
+    /* ──────────────────────────────────────────────────────────────
+     *  RENDER HALF — scene_draw reads this; physics tick ignores it
+     * ────────────────────────────────────────────────────────────── */
+
+    /* THEME — index into themes[].  Cycled by t / T.  Selects the
+     * 8-step outer-→-inner ramp + drain centre + sky background.
+     * Pure render concern — vortex physics behaves identically
+     * regardless of theme.  theme_apply rewrites pairs
+     * PAIR_RAMP_BASE..+7, PAIR_CENTER, and PAIR_SKY on change. */
+    int       current_theme;
 } Scene;
 
 static int particle_pool_find_inactive(Scene *s)
@@ -588,44 +1022,85 @@ static inline void scene_polar_rates(const PatternParams *pp, float r,
     *out_dtheta = pp->angular_const + pp->angular_kepler / r_safe;
 }
 
+/* ── Tick orchestration helpers ───────────────────────────────────────── */
+
+/* Population census — linear scan of pool's active flags. */
+static int count_active_particles(const Scene *s)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_PARTICLES; i++) if (s->particles[i].active) n++;
+    return n;
+}
+
+/* Spawn budget for this tick — refill toward pattern.target_count,
+ * but cap the per-tick burst proportional to dt so a long pause
+ * doesn't dump the entire pool in a single frame on resume. */
+static int compute_spawn_count_for_tick(int active, const PatternParams *pp,
+                                        float dt)
+{
+    int target = pp->target_count;
+    if (target > MAX_PARTICLES) target = MAX_PARTICLES;
+    int spawn_cap = (int)((float)pp->target_count * dt * 4.0f) + 4;
+    int n = target - active;
+    if (n < 0)         n = 0;
+    if (n > spawn_cap) n = spawn_cap;
+    return n;
+}
+
+/* Spawn `n` new particles in the OUTER edge band [0.85·r_outer,
+ * r_outer] — replenishes the drained-at-centre population by injecting
+ * fresh particles on the periphery, where the pattern's inflow can
+ * carry them all the way to the drain. */
+static void particle_pool_topup_at_outer_band(Scene *s, float r_outer, int n)
+{
+    for (int k = 0; k < n; k++)
+        scene_spawn_particle(s, r_outer * 0.85f, r_outer);
+}
+
+/* Explicit Euler step for one particle in polar coords (Goldstein
+ * Ch. 1 §1.2 — polar Lagrangian).  Reads (dr, dθ) from
+ * scene_polar_rates — the one place engine touches PatternParams'
+ * physics knobs per-particle.  r += dr·dt, θ += dθ·dt, age += dt. */
+static inline void integrate_particle_polar_euler(Particle *p,
+                                                  const PatternParams *pp,
+                                                  float dt)
+{
+    float dr, dtheta;
+    scene_polar_rates(pp, p->r, &dr, &dtheta);
+    p->r     += dr     * dt;
+    p->theta += dtheta * dt;
+    p->age   += dt;
+}
+
+/* Particle has drained at the centre — slot is reclaimable.  R_DRAIN_CELLS
+ * is set far enough out that particles vanish before getting close to
+ * the angular_kepler / r singularity at r = 0. */
+static inline bool particle_drained(const Particle *p)
+{
+    return p->r < R_DRAIN_CELLS;
+}
+
 static void scene_tick(Scene *s, float dt)
 {
     if (s->paused) return;
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    dt *= speed_mul;
-
+    dt *= (float)s->speed / (float)SPEED_DEF;
     s->time_accum += dt;
 
     const PatternParams *pp = &pattern_params[s->current_pattern];
     float r_outer = scene_r_outer(s);
 
-    /* 1. Top up to target. */
-    int active = 0;
-    for (int i = 0; i < MAX_PARTICLES; i++) if (s->particles[i].active) active++;
-    int target    = pp->target_count;
-    if (target > MAX_PARTICLES) target = MAX_PARTICLES;
-    int spawn_cap = (int)((float)pp->target_count * dt * 4.0f) + 4;
-    int to_spawn  = target - active;
-    if (to_spawn > spawn_cap) to_spawn = spawn_cap;
-    /* Re-spawn at the OUTER edge band only — replenishes drained particles. */
-    for (int k = 0; k < to_spawn; k++)
-        scene_spawn_particle(s, r_outer * 0.85f, r_outer);
+    /* 1. Top up particle pool toward pattern's target density. */
+    int active   = count_active_particles(s);
+    int to_spawn = compute_spawn_count_for_tick(active, pp, dt);
+    particle_pool_topup_at_outer_band(s, r_outer, to_spawn);
 
-    /* 2. Integrate polar kinematics. */
+    /* 2. Integrate polar kinematics; drain at the centre. */
     for (int i = 0; i < MAX_PARTICLES; i++) {
         Particle *p = &s->particles[i];
         if (!p->active) continue;
 
-        float dr, dtheta;
-        scene_polar_rates(pp, p->r, &dr, &dtheta);
-
-        p->r     += dr * dt;
-        p->theta += dtheta * dt;
-        p->age   += dt;
-
-        if (p->r < R_DRAIN_CELLS) {
-            p->active = false;
-        }
+        integrate_particle_polar_euler(p, pp, dt);
+        if (particle_drained(p)) p->active = false;
     }
 }
 
@@ -642,73 +1117,132 @@ static inline void polar_to_cell(float r, float theta, float cx, float cy,
     *out_y = cy + r * sinf(theta) / ASPECT_Y;
 }
 
-static void scene_draw(const Scene *s)
+/* ── Render primitives ────────────────────────────────────────────────── */
+
+/* Inner-fraction → ramp-slot mapping.  f = 1 − r/r_outer makes
+ * particles brighter as they fall toward the drain (the "heating up"
+ * visual that mimics gravitational compression / Akenine-Möller §13.7
+ * size-by-distance point-sprite analogue).  Returns slot ∈ [0, 7]. */
+static inline int inner_fraction_to_ramp_slot(float r, float r_outer)
+{
+    float f = 1.0f - r / (r_outer + 1.0f);
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    int slot = (int)(f * 7.0f + 0.5f);
+    if (slot < 0) slot = 0;
+    if (slot > 7) slot = 7;
+    return slot;
+}
+
+/* Brightness attribute by ramp slot — top of ramp BOLD, bottom DIM.
+ * Shared between particle trail/head and drain centre so the gradient
+ * reads consistently across all rendered elements. */
+static inline int head_attr_by_brightness_slot(int slot)
+{
+    if (slot >= 6) return A_BOLD;
+    if (slot <= 1) return A_DIM;
+    return A_NORMAL;
+}
+
+/* Centre-glyph pulse for BLACK_HOLE / MAELSTROM / PULSAR — sinusoidal
+ * heartbeat at 3 rad/sec angular frequency.  pulse = 0.5 + 0.5·sin(t·3);
+ * below 0.4 we drop to A_NORMAL, otherwise stay A_BOLD — produces a
+ * visible accretion-disc throb without fully extinguishing the glyph. */
+static inline int center_pulse_attr(float time_accum)
+{
+    float pulse = 0.5f + 0.5f * sinf(time_accum * 3.0f);
+    return (pulse < 0.4f) ? A_NORMAL : A_BOLD;
+}
+
+/* Back-step deltas for the tangent trail.  scene_polar_rates gives
+ * the INSTANTANEOUS (dr, dθ) at the particle's current radius;
+ * back-stepping by TRAIL_STEP_DT seconds traces along the LOCAL ARC
+ * of the spiral — so the trail follows the spiral curve, not a
+ * straight chord.  dr_back > 0 (r was bigger in the past, spiraling
+ * inward); dtheta_back > 0 (θ was smaller in the past).*/
+static inline void compute_trail_back_step(const PatternParams *pp,
+                                           const Particle *p,
+                                           float *dr_back, float *dtheta_back)
+{
+    float dr, dtheta;
+    scene_polar_rates(pp, p->r, &dr, &dtheta);
+    *dr_back     = -dr     * TRAIL_STEP_DT;
+    *dtheta_back =  dtheta * TRAIL_STEP_DT;
+}
+
+/* Draw one particle as a fading tangent trail (TRAIL_LEN steps back
+ * along the local arc) plus the bright head at t=0.  Older trail
+ * points get cooler ramp slots so the streak fades behind the head.
+ * Render order is tail → head so the head overdraws any earlier
+ * trail cells at intersections (the bright dot the eye tracks is
+ * never shadowed by a passing streak). */
+static void trail_draw_one_particle(const Particle *p, const PatternParams *pp,
+                                    int head_slot,
+                                    float cx, float cy,
+                                    int cols, int rows_eff)
+{
+    float dr_back, dtheta_back;
+    compute_trail_back_step(pp, p, &dr_back, &dtheta_back);
+
+    for (int t = TRAIL_LEN; t >= 0; t--) {
+        float r_at     = p->r     + dr_back     * (float)t;
+        float theta_at = p->theta - dtheta_back * (float)t;
+        float fx, fy;
+        polar_to_cell(r_at, theta_at, cx, cy, &fx, &fy);
+        int ix = (int)(fx + 0.5f);
+        int iy = (int)(fy + 0.5f);
+        if (ix < 0 || ix >= cols)     continue;
+        if (iy < 0 || iy >= rows_eff) continue;
+
+        int slot = head_slot - t;
+        if (slot < 0) slot = 0;
+        char glyph = RAMP_GLYPHS[slot];
+        int  attr  = head_attr_by_brightness_slot(slot);
+        int  pair  = PAIR_RAMP_BASE + slot;
+        attron(COLOR_PAIR(pair) | attr);
+        mvaddch(iy, ix, (chtype)(unsigned char)glyph);
+        attroff(COLOR_PAIR(pair) | attr);
+    }
+}
+
+/* Render every active particle as trail + head — the spiral arms. */
+static void particle_pool_draw(const Scene *s, float cx, float cy, int rows_eff)
 {
     const PatternParams *pp = &pattern_params[s->current_pattern];
-    int rows_eff = s->rows - 1;     /* leave bottom row for HUD */
-    float cx     = (float)s->cols * 0.5f;
-    float cy     = (float)rows_eff * 0.5f;
     float r_outer = scene_r_outer(s);
-
-    /* ── 1. Particles + tangent trails ─────────────────────────────── */
     for (int i = 0; i < MAX_PARTICLES; i++) {
         const Particle *p = &s->particles[i];
         if (!p->active) continue;
-
-        /* Compute brightness slot from radial position: outer = dim,
-         * inner = bright (particle "heats up" approaching drain). */
-        float f = 1.0f - p->r / (r_outer + 1.0f);
-        if (f < 0.0f) f = 0.0f;
-        if (f > 1.0f) f = 1.0f;
-        int head_slot = (int)(f * 7.0f + 0.5f);
-        if (head_slot < 0) head_slot = 0;
-        if (head_slot > 7) head_slot = 7;
-
-        /* Compute back-step deltas for trail (from current dr/dt, dθ/dt). */
-        float dr, dtheta;
-        scene_polar_rates(pp, p->r, &dr, &dtheta);
-        float dr_back     = -dr     * TRAIL_STEP_DT;   /* > 0 — r grew in past   */
-        float dtheta_back =  dtheta * TRAIL_STEP_DT;   /* > 0 — θ smaller in past*/
-
-        /* Render trail (tail to head) so head overdraws trail at intersections. */
-        for (int t = TRAIL_LEN; t >= 0; t--) {
-            float r_at     = p->r     + dr_back     * (float)t;
-            float theta_at = p->theta - dtheta_back * (float)t;
-            float fx, fy;
-            polar_to_cell(r_at, theta_at, cx, cy, &fx, &fy);
-            int ix = (int)(fx + 0.5f);
-            int iy = (int)(fy + 0.5f);
-            if (ix < 0 || ix >= s->cols) continue;
-            if (iy < 0 || iy >= rows_eff) continue;
-
-            int slot = head_slot - t;
-            if (slot < 0) slot = 0;
-            char glyph = RAMP_GLYPHS[slot];
-            int  attr  = (slot >= 6) ? A_BOLD
-                       : (slot <= 1) ? A_DIM
-                       :               A_NORMAL;
-            int  pair  = PAIR_RAMP_BASE + slot;
-            attron(COLOR_PAIR(pair) | attr);
-            mvaddch(iy, ix, (chtype)(unsigned char)glyph);
-            attroff(COLOR_PAIR(pair) | attr);
-        }
+        int head_slot = inner_fraction_to_ramp_slot(p->r, r_outer);
+        trail_draw_one_particle(p, pp, head_slot, cx, cy, s->cols, rows_eff);
     }
+}
 
-    /* ── 2. Centre drain glyph ─────────────────────────────────────── */
+/* Render the central drain glyph — the focal point at (cx, cy).
+ * pulse-enabled patterns (BLACK_HOLE / MAELSTROM / PULSAR) modulate
+ * the attribute via center_pulse_attr; static patterns stay A_BOLD. */
+static void center_drain_draw(const Scene *s, float cx, float cy, int rows_eff)
+{
+    const PatternParams *pp = &pattern_params[s->current_pattern];
     int icx = (int)(cx + 0.5f);
     int icy = (int)(cy + 0.5f);
-    if (icx >= 0 && icx < s->cols && icy >= 0 && icy < rows_eff) {
-        char g = pp->center_glyph;
-        int  attr = A_BOLD;
-        /* BLACK_HOLE pulses: alternate between dim and bold over time. */
-        if (pp->center_pulse) {
-            float pulse = 0.5f + 0.5f * sinf(s->time_accum * 3.0f);
-            if (pulse < 0.4f) attr = A_NORMAL;
-        }
-        attron(COLOR_PAIR(PAIR_CENTER) | attr);
-        mvaddch(icy, icx, (chtype)(unsigned char)g);
-        attroff(COLOR_PAIR(PAIR_CENTER) | attr);
-    }
+    if (icx < 0 || icx >= s->cols)  return;
+    if (icy < 0 || icy >= rows_eff) return;
+
+    int attr = pp->center_pulse ? center_pulse_attr(s->time_accum) : (int)A_BOLD;
+    attron(COLOR_PAIR(PAIR_CENTER) | attr);
+    mvaddch(icy, icx, (chtype)(unsigned char)pp->center_glyph);
+    attroff(COLOR_PAIR(PAIR_CENTER) | attr);
+}
+
+static void scene_draw(const Scene *s)
+{
+    int rows_eff = s->rows - 1;            /* leave bottom row for HUD */
+    float cx = (float)s->cols * 0.5f;
+    float cy = (float)rows_eff * 0.5f;
+
+    particle_pool_draw(s, cx, cy, rows_eff);   /* spiral arms — trails+heads */
+    center_drain_draw (s, cx, cy, rows_eff);   /* drain glyph at the focal pt*/
 }
 
 /* ===================================================================== */
@@ -744,6 +1278,19 @@ static int scene_active_count(const Scene *s)
     return n;
 }
 
+/*
+ * screen_draw — render the scene, then paint a two-layer HUD over it:
+ *
+ *   Row 0        STATUS LINE.  Bright yellow PAIR_HUD + A_BOLD.
+ *                Live state: pattern (or PAUSED), theme, particle
+ *                count, fps, sim Hz, speed multiplier.
+ *   Row rows-1   KEY HINT LINE.  Bright cyan PAIR_HINT + A_BOLD.
+ *                Every interactive key the demo accepts.
+ *
+ * Both rows are pre-filled with their pair colour so the coloured
+ * background spans the full width, and drawn AFTER scene_draw so
+ * the spiral never bleeds through the bars.
+ */
 static void screen_draw(Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
@@ -751,22 +1298,32 @@ static void screen_draw(Screen *sc, const Scene *s,
     scene_draw(s);
 
     int active = scene_active_count(s);
+    const char *state_str = s->paused ? "PAUSED    "
+                                      : pattern_name(s->current_pattern);
 
-    const char *state_str = s->paused ? "PAUSED    " : pattern_name(s->current_pattern);
-
-    char buf[200];
-    snprintf(buf, sizeof buf,
-             " VORTEX   %s   theme:%-10s   particles:%4d   "
-             "%5.1f fps  %3d Hz  speed:%-3d   "
-             "n/p:pat  t/T:theme  +/-:speed  spc:pause  r:reseed  q:quit ",
+    /* ── Top row: dynamic status ─────────────────────────────── */
+    char status[220];
+    snprintf(status, sizeof status,
+             " VORTEX   %s   theme:%-8s   particles:%4d   "
+             "%5.1f fps  %3d Hz  speed:%-3d ",
              state_str, themes[s->current_theme].name, active,
              fps, sim_fps, s->speed);
 
-    int row = sc->rows - 1;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    for (int x = 0; x < sc->cols; x++) mvaddch(row, x, ' ');
-    mvprintw(row, 0, "%s", buf);
+    for (int x = 0; x < sc->cols; x++) mvaddch(0, x, ' ');
+    mvprintw(0, 0, "%s", status);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    /* ── Bottom row: every interactive key ───────────────────── */
+    const char *hints =
+        " q:quit  spc:pause  r:reseed  n/p:pattern  t/T:theme  "
+        "+/-:speed  ]/[:Hz ";
+
+    int hint_row = sc->rows - 1;
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    for (int x = 0; x < sc->cols; x++) mvaddch(hint_row, x, ' ');
+    mvprintw(hint_row, 0, "%s", hints);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }

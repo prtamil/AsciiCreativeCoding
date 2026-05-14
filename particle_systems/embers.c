@@ -158,6 +158,124 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── ARCHITECTURE — DATA-DRIVEN PATTERN ENGINE ────────────────────────── *
+ *
+ * Four ember effects (BONFIRE, FORGE, DRAGON, HEARTH) are produced
+ * by a SINGLE generic buoyancy + cooling engine driven by an array
+ * of PatternParams structs.  scene_tick and scene_draw never branch
+ * on the pattern enum to decide HOW the physics works — they read
+ * pattern_params[s->current_pattern] and compute accordingly.
+ * Adding a new fire is a matter of appending one row to
+ * pattern_params[]; no new code paths.
+ *
+ *
+ * THE GENERIC ENGINE (pseudocode)
+ * ───────────────────────────────
+ *
+ *   loop forever (each tick of dt seconds):
+ *
+ *     pp = pattern_params[scene.current_pattern]   # read inputs
+ *
+ *     # 0. SOURCE OSCILLATION — DRAGON sweeps its source horizontally
+ *     #    via a sine clock; static-source patterns set amp = 0.
+ *     source_x = scene.cols/2 + pp.oscillation_amp_frac · scene.cols
+ *                              · sin(2π · time / pp.oscillation_period)
+ *
+ *     # 1. SPAWN EMBERS — top up pool toward target density
+ *     while count(active embers) < pp.target_embers:
+ *         e = next_inactive_slot()
+ *         e.x      = source_x  + uniform(-pp.source_x_spread,
+ *                                        +pp.source_x_spread)
+ *         e.y      = scene.rows - 1 - pp.source_y_offset
+ *         e.vy     = -pp.vy_init_mag                  # negative = upward
+ *         e.vx     = uniform(-pp.vx_init_spread, +pp.vx_init_spread)
+ *         e.life   = uniform(pp.life_min, pp.life_max)
+ *         e.age    = 0
+ *         e.active = true
+ *
+ *     # 2. INTEGRATE — buoyancy + turbulence + position update
+ *     for e in active embers:
+ *         e.vy += pp.buoyancy_accel · dt              # < 0 → upward
+ *         e.vx += pp.turbulence · uniform(-1, 1) · dt  # noisy lateral kick
+ *         e.x  += e.vx · dt
+ *         e.y  += e.vy · dt
+ *         e.age += dt
+ *
+ *     # 3. KILL — age expires, off-screen, or above the top
+ *     for e in active embers:
+ *         if e.age >= e.life:                e.active = false
+ *         if e.x off-screen or e.y < -1:     e.active = false
+ *
+ *     # 4. RENDER — heat-ramp glyph by remaining-life fraction
+ *     #    T = max(0, 1 − age/life), slot = ⌊T·7.999⌋
+ *     for e in active embers:
+ *         slot  = remaining_life_fraction(e) · 7
+ *         glyph = HEAT_GLYPHS[slot]                    # `· : * # @
+ *         pair  = PAIR_HEAT_BASE + slot
+ *         paint(round(e.x), round(e.y), glyph, pair)
+ *
+ *
+ * PATTERNPARAMS FIELD → ENGINE HOOK
+ * ─────────────────────────────────
+ *
+ *   target_embers          →  spawn-loop refill cap     (fire density)
+ *   source_x_spread        →  spawn-x jitter            (source width)
+ *   source_y_offset        →  spawn-y row               (source height)
+ *   vy_init_mag            →  initial upward velocity   (eruption speed)
+ *   vx_init_spread         →  initial vx jitter         (lateral spread)
+ *   buoyancy_accel         →  vy update each tick       (Boussinesq lift)
+ *   turbulence             →  random vx kick per sec    (noise injection)
+ *   life_min               →  ember lifetime range      (cooling time)
+ *   life_max
+ *   oscillation_amp_frac   →  source sweep amplitude    (DRAGON only)
+ *   oscillation_period     →  source sweep period       (DRAGON only)
+ *
+ * Every other engine constant — MAX_EMBERS, HEAT_GLYPHS layout,
+ * the heat-ramp slot count (8) — is a GLOBAL tuning knob shared
+ * across all patterns.  Patterns differ ONLY in the eleven fields
+ * above.
+ *
+ *
+ * ARCHITECTURAL REFERENCES
+ * ────────────────────────
+ *
+ *   Reeves, W. T. (1983)
+ *     "Particle Systems — A Technique for Modeling a Class of
+ *     Fuzzy Objects", ACM TOG 2(2): 91-108.
+ *     §4 makes the explicit argument that ONE engine + a struct
+ *     of physical constants per phenomenon is the right
+ *     architecture for natural-particle simulations — the Genesis
+ *     fireball Reeves built for Star Trek II is structurally the
+ *     same engine, larger scale.  This file applies the idea to
+ *     bonfires, forges, dragon-breath, and hearths.
+ *
+ *   Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994)
+ *     "Design Patterns" (Addison-Wesley) — STRATEGY pattern (§5.9).
+ *     A family of algorithms (BONFIRE / FORGE / DRAGON / HEARTH)
+ *     interchangeable behind a single interface (the engine
+ *     reading PatternParams).  In procedural C the "interface" is
+ *     the struct shape; "concrete strategies" are the rows of
+ *     pattern_params[]; "selecting a strategy" is updating
+ *     scene.current_pattern.
+ *
+ *   Acton, M. (2014)
+ *     "Data-Oriented Design and C++" (CppCon 2014 keynote).
+ *     Argues that variation between behaviours should be
+ *     represented as DATA (struct fields) rather than as control
+ *     flow (if/switch on type).  pattern_params[] is a compact
+ *     data table; the engine has no per-pattern code paths.
+ *
+ *   Nystrom, R. (2014)
+ *     "Game Programming Patterns" (Genever Benning).
+ *     TYPE OBJECT chapter — PatternParams is a Type Object: one
+ *     shared instance per "kind" of fire, every Ember implicitly
+ *     references it via Scene.current_pattern.  DATA LOCALITY
+ *     chapter — Ember is a flat-laid-out POD swept linearly by
+ *     the integrator each tick, exactly the layout Nystrom
+ *     recommends for hot inner loops.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
  *
  * CORE IDEA
@@ -807,52 +925,59 @@ static float scene_source_cx(const Scene *s)
 }
 
 /*
- * scene_spawn_ember — fill one inactive pool slot with a fresh ember.
+ * Below: five spawn_random_* helpers + scene_spawn_ember.  The helpers
+ * own the per-axis jitter formulas; scene_spawn_ember calls them in
+ * order so each line reads as one field-initialisation step.
  *
- * PURPOSE
- *   Called by scene_tick whenever active count is below target, and
- *   by scene_prewarm at init/reseed/pattern-change.  Picks an inactive
- *   slot via linear scan, jitters position + velocity + life around
- *   the pattern's nominal values.  All randomness is consumed here
- *   so the inner physics loop runs deterministically.
+ * Why jitter at all: without it, neighbouring embers move in lockstep
+ * and the plume reads as a stair-stepped band, not a flame.  Ranges
+ * are tight (±source_x_spread for x, ±30% for vy) so all embers still
+ * look like they came from the SAME source.
  *
- * PSEUDOCODE
- *   slot       = first inactive Ember           // skip if pool full
- *   source_cx  = base_cx + user_offset_x + DRAGON_sin(t)
- *   r1..r5     = 5 LCG uniform draws
- *   e.x        = source_cx + (r1−0.5)·2·source_x_spread
- *   e.y        = source_y  − r2·1.5            // small Y spawn band
- *   e.vx       = (r3−0.5)·2·vx_init_spread
- *   e.vy       = −vy_init_mag · (0.7 + r4·0.6) // NEGATIVE = upward
- *   e.age      = 0
- *   e.life     = life_min + r5·(life_max − life_min)
- *   e.active   = true
+ * Negative-vy convention: screen +y is DOWN, so upward motion is vy<0.
+ * buoyancy_accel is ALSO negative, so it makes the ember rise faster
+ * over time (see ember_apply_buoyancy in scene_tick below).
  *
- * MENTAL MODEL
- *   Jitter ranges are TIGHT (±source_x_spread for x, ±30% for vy) so
- *   embers all look like they came from the SAME source — but no two
- *   embers have identical trajectory.  Without jitter, neighbouring
- *   embers move in lockstep and the plume reads as a stair-stepped
- *   band, not a flame.
- *
- *   The negative-vy convention is consistent throughout: screen +y is
- *   DOWN, so upward motion is vy < 0.  buoyancy_accel is ALSO
- *   negative, so it accelerates `vy` further into negative — i.e.
- *   makes the ember rise faster over time.
- *
- * INPUTS / OUTPUTS
- *   s    ← Scene; one inactive ember becomes active (mutated)
- *
- * UNITS
- *   x, y:          cells (float for sub-cell precision)
- *   vx, vy:        cells/second
- *   age, life:     seconds
- *
- * WHY IT EXISTS (vs inlining in scene_tick's spawn loop)
- *   Three call sites: scene_tick (top-up), scene_prewarm (init), and
- *   the pattern-change handler (via scene_prewarm).  Three different
- *   reasons; one shared implementation.
+ * Three call sites for scene_spawn_ember: scene_tick top-up,
+ * scene_prewarm init, pattern-change handler (via scene_prewarm).
+ * One shared implementation.
  */
+/* spawn_random_x — source centre ± source_x_spread (uniform jitter). */
+static inline float spawn_random_x(uint32_t *rng, float source_cx,
+                                   const PatternParams *pp)
+{
+    float r = lcg_unit(rng);
+    return source_cx + (r - 0.5f) * 2.0f * pp->source_x_spread;
+}
+
+/* spawn_random_y — source row minus small downward jitter (within source band). */
+static inline float spawn_random_y(uint32_t *rng, const PatternParams *pp, int rows)
+{
+    float r = lcg_unit(rng);
+    return (float)(rows - 2 - pp->source_y_offset) - r * 1.5f;
+}
+
+/* spawn_random_vx — uniform ±vx_init_spread.  Lateral wobble at birth. */
+static inline float spawn_random_vx(uint32_t *rng, const PatternParams *pp)
+{
+    float r = lcg_unit(rng);
+    return (r - 0.5f) * 2.0f * pp->vx_init_spread;
+}
+
+/* spawn_random_vy — −vy_init_mag · uniform[0.7, 1.3].  NEGATIVE = upward. */
+static inline float spawn_random_vy(uint32_t *rng, const PatternParams *pp)
+{
+    float r = lcg_unit(rng);
+    return -pp->vy_init_mag * (0.7f + r * 0.6f);
+}
+
+/* spawn_random_life — uniform[life_min, life_max] seconds. */
+static inline float spawn_random_life(uint32_t *rng, const PatternParams *pp)
+{
+    float r = lcg_unit(rng);
+    return pp->life_min + r * (pp->life_max - pp->life_min);
+}
+
 static void scene_spawn_ember(Scene *s)
 {
     int idx = ember_pool_find_inactive(s);
@@ -862,18 +987,12 @@ static void scene_spawn_ember(Scene *s)
     const PatternParams *pp = &pattern_params[s->current_pattern];
     float source_cx = scene_source_cx(s);
 
-    float r1 = lcg_unit(&s->rng);
-    float r2 = lcg_unit(&s->rng);
-    float r3 = lcg_unit(&s->rng);
-    float r4 = lcg_unit(&s->rng);
-    float r5 = lcg_unit(&s->rng);
-
-    e->x      = source_cx + (r1 - 0.5f) * 2.0f * pp->source_x_spread;
-    e->y      = (float)(s->rows - 2 - pp->source_y_offset) - r2 * 1.5f;
-    e->vx     = (r3 - 0.5f) * 2.0f * pp->vx_init_spread;
-    e->vy     = -pp->vy_init_mag * (0.7f + r4 * 0.6f);
+    e->x      = spawn_random_x   (&s->rng, source_cx, pp);
+    e->y      = spawn_random_y   (&s->rng, pp, s->rows);
+    e->vx     = spawn_random_vx  (&s->rng, pp);
+    e->vy     = spawn_random_vy  (&s->rng, pp);
     e->age    = 0.0f;
-    e->life   = pp->life_min + r5 * (pp->life_max - pp->life_min);
+    e->life   = spawn_random_life(&s->rng, pp);
     e->active = true;
 }
 
@@ -945,171 +1064,188 @@ static void scene_reseed(Scene *s)
 }
 
 /*
- * scene_tick — advance the simulation by dt seconds.
+ * Below: physics helpers + scene_tick orchestrator.
  *
- * PURPOSE
- *   Per-frame physics: top up the pool, integrate every active ember
- *   (buoyancy + turbulence), cull dead/off-screen.  Two phases,
- *   strict order.
+ *   count_active_embers           pool scan
+ *   ember_apply_buoyancy          vy += buoyancy_accel · dt    (vy<0 = up)
+ *   ember_apply_turbulence_kick   vx += random walk per tick
+ *   ember_integrate_position      pos += vel · dt;  age += dt
+ *   ember_is_dead                 aged-out OR off-screen
+ *   ember_advance_one             turbulence → buoyancy → integrate → death
  *
- * PSEUDOCODE
- *   if paused: return
- *   dt *= speed_mul                              // user '+/-' time dial
- *   time_accum += dt                              // drives DRAGON oscillation
+ *   topup_ember_pool              phase 1: rate-capped spawning to target
+ *   integrate_all_embers          phase 2: per-ember frame for every slot
+ *   scene_tick                    two-phase orchestrator (top-up + integrate)
  *
- *   PHASE 1 — top up:
- *     active = count active embers
- *     to_spawn = clamp(target − active, 0, spawn_cap)
- *     for i in 0..to_spawn-1:  scene_spawn_ember()
+ * spawn_cap rate-limits per-frame spawning so a big pool gap (e.g. after
+ * pattern change to a wider source) doesn't flash-fill in one frame.
+ * Cap formula: 4 spawns + 4 · target · dt — at 60 fps with target=350
+ * that's ~27 spawns/frame, refilling smoothly over ~13 frames.
  *
- *   PHASE 2 — per-ember integration:
- *     for each active ember e:
- *       turb = (uniform − 0.5) · turbulence
- *       e.vy += buoyancy_accel · dt                // negative → faster up
- *       e.vx += turb · dt                          // random-walk lateral
- *       e.x  += e.vx · dt
- *       e.y  += e.vy · dt
- *       e.age += dt
- *       if e.age ≥ e.life:               e.active = false
- *       elif e.x < −2 or e.x > cols + 2: e.active = false
- *       elif e.y < −2:                   e.active = false
- *
- * MENTAL MODEL
- *   `spawn_cap` rate-limits per-frame spawning so a big pool gap
- *   (e.g. after pattern change to a wider-source pattern) doesn't
- *   flash-fill in one frame.  Cap formula: 4 spawns + 4× target ·
- *   dt — at 60 fps with target=350 that's 4 + 23 = 27 spawns/frame
- *   max, so the pool refills smoothly over 350/27 ≈ 13 frames.
- *
- *   Death conditions are stacked in priority order: age-out first
- *   (most common), then horizontal off-screen (turbulence drift),
- *   then vertical top exit (long-lived embers that rise off-screen
- *   before age-out — rare since buoyancy + life are tuned together).
- *
- * INPUTS / OUTPUTS
- *   s    ← Scene (mutated: time_accum + every ember in the pool)
- *   dt   → frame time, seconds (pre-speed_mul)
- *
- * UNITS
- *   dt:           seconds
- *   buoyancy:     cells/second² (negative)
- *   turbulence:   cells/second² magnitude
- *
- * WHY IT EXISTS (vs inlining in app's main)
- *   Same separation as curl_noise_particles.c, constellation.c: app
- *   stays at "read input → tick → draw → sleep" level.  All physics
- *   lives behind scene_tick, so a future test harness could drive
- *   the same Scene without ncurses.
+ * Death conditions in ember_is_dead are stacked in priority: age-out
+ * first (most common), then horizontal off-screen (turbulence drift),
+ * then vertical top exit (rare; buoyancy + life are tuned together).
  */
-static void scene_tick(Scene *s, float dt)
+/* count_active_embers — linear scan of pool. */
+static int count_active_embers(const Scene *s)
 {
-    if (s->paused) return;
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    dt *= speed_mul;
+    int n = 0;
+    for (int i = 0; i < MAX_EMBERS; i++)
+        if (s->embers[i].active) n++;
+    return n;
+}
 
-    s->time_accum += dt;
+/* ember_apply_buoyancy — vy += buoyancy_accel · dt.  vy<0 = up, accel<0. */
+static inline void ember_apply_buoyancy(Ember *e, const PatternParams *pp, float dt)
+{
+    e->vy += pp->buoyancy_accel * dt;
+}
 
-    const PatternParams *pp = &pattern_params[s->current_pattern];
+/* ember_apply_turbulence_kick — random horizontal kick on vx (per-tick walk). */
+static inline void ember_apply_turbulence_kick(Ember *e, const PatternParams *pp,
+                                               float dt, uint32_t *rng)
+{
+    float turb = (lcg_unit(rng) - 0.5f) * pp->turbulence;
+    e->vx += turb * dt;
+}
 
-    /* 1. Top up to target. */
-    int active = 0;
-    for (int i = 0; i < MAX_EMBERS; i++) if (s->embers[i].active) active++;
+/* ember_integrate_position — explicit Euler: pos += vel · dt; age += dt. */
+static inline void ember_integrate_position(Ember *e, float dt)
+{
+    e->x   += e->vx * dt;
+    e->y   += e->vy * dt;
+    e->age += dt;
+}
+
+/* ember_is_dead — true if aged past life OR drifted off-screen. */
+static inline bool ember_is_dead(const Ember *e, int cols)
+{
+    if (e->age >= e->life)                                return true;
+    if (e->x   <  -2.0f || e->x > (float)(cols + 2))      return true;
+    if (e->y   <  -2.0f)                                  return true;
+    return false;
+}
+
+/* ember_advance_one — full per-ember frame: turbulence + buoyancy + integrate + death. */
+static inline void ember_advance_one(Ember *e, const PatternParams *pp,
+                                     float dt, uint32_t *rng, int cols)
+{
+    ember_apply_turbulence_kick(e, pp, dt, rng);
+    ember_apply_buoyancy       (e, pp, dt);
+    ember_integrate_position   (e, dt);
+    if (ember_is_dead(e, cols)) e->active = false;
+}
+
+/* topup_ember_pool — phase 1: spawn embers up to pp->target_embers (rate-capped). */
+static void topup_ember_pool(Scene *s, const PatternParams *pp, float dt)
+{
+    int active    = count_active_embers(s);
     int target    = pp->target_embers;
     if (target > MAX_EMBERS) target = MAX_EMBERS;
     int spawn_cap = (int)((float)pp->target_embers * dt * 4.0f) + 4;
     int to_spawn  = target - active;
     if (to_spawn > spawn_cap) to_spawn = spawn_cap;
     for (int k = 0; k < to_spawn; k++) scene_spawn_ember(s);
+}
 
-    /* 2. Integrate embers (buoyancy + turbulence + cooling). */
+/* integrate_all_embers — phase 2: per-ember frame for every active slot. */
+static void integrate_all_embers(Scene *s, const PatternParams *pp, float dt)
+{
     for (int i = 0; i < MAX_EMBERS; i++) {
         Ember *e = &s->embers[i];
         if (!e->active) continue;
-
-        /* Random turbulence kick on vx — a per-tick random walk. */
-        float turb = (lcg_unit(&s->rng) - 0.5f) * pp->turbulence;
-
-        e->vy += pp->buoyancy_accel * dt;
-        e->vx += turb * dt;
-        e->x  += e->vx * dt;
-        e->y  += e->vy * dt;
-        e->age += dt;
-
-        /* Death. */
-        if (e->age >= e->life) { e->active = false; continue; }
-        if (e->x < -2.0f || e->x > (float)(s->cols + 2)) {
-            e->active = false; continue;
-        }
-        if (e->y < -2.0f) { e->active = false; continue; }
+        ember_advance_one(e, pp, dt, &s->rng, s->cols);
     }
 }
 
-/*
- * scene_draw — render the plume + the heat-source glow.
- *
- * PURPOSE
- *   Two-phase render in painter's-algorithm order:
- *     phase 1 — base glow at the source (so the fire looks ANCHORED)
- *     phase 2 — per-ember ramp render (cool → hot driven by T)
- *   Plus debug overlays (d/D): VELOCITY arrows, TEMPERATURE digits,
- *   SOURCE strip highlight.
- *
- * PSEUDOCODE
- *   rows_eff = rows − 1                     // bottom row = HUD
- *
- *   PHASE 1 — heat-source glow (DBG_SOURCE OR always):
- *     for dy in {0, 1}:                     // 2-row band
- *       y = source_y_band[dy]
- *       for dx in [−half, +half]:           // source_x_spread cells wide
- *         x = source_cx + dx
- *         slot = clamp((1 − |dx|/half) · 7, 4, 7)   // bright centre
- *         draw '*' or '+' in PAIR_HEAT_BASE+slot
- *
- *   PHASE 2 — per-ember:
- *     for each active ember e:
- *       T = clamp(1 − e.age/e.life, 0, 1)
- *       slot = floor(T · 7.999)
- *       glyph = RAMP_GLYPHS[slot]            // " .,:;-+*" or similar
- *       attr  = BOLD if slot≥6 else DIM if slot≤1 else NORMAL
- *
- *       if g_debug == VELOCITY:     glyph = dir_char(e.vx, e.vy)
- *       if g_debug == TEMPERATURE:  glyph = '0' + floor(T·9)
- *       draw glyph at (ix, iy) in PAIR_HEAT_BASE+slot
- *
- * MENTAL MODEL
- *   Two layers, two colours of glow.  Without the source band the
- *   embers look like floating sparks — no anchor to a fire.  The
- *   source band is a small fake (just bright cells in the spawn
- *   strip) but it sells the visual.
- *
- *   The temperature → ramp → glyph + attr pipeline is the SAME for
- *   normal and debug modes.  Debug just REPLACES the glyph; the
- *   colour stays driven by T so debug overlays inherit the theme
- *   automatically.
- *
- * INPUTS / OUTPUTS
- *   s    → Scene (const — never mutated)
- *
- * UNITS
- *   T:     dimensionless [0, 1]
- *   slot:  integer [0, 7] (index into theme's 8-pair heat ramp)
- *
- * WHY IT EXISTS (vs splitting into source_glow_draw + embers_draw)
- *   The two phases share the rows_eff bound, the source_cx call, and
- *   the PAIR_HEAT_BASE+slot mapping.  Splitting would duplicate
- *   those, or thread them through arguments.  At ~60 lines this
- *   reads cleanly top-to-bottom as one pipeline.
- */
-static void scene_draw(const Scene *s)
+static void scene_tick(Scene *s, float dt)
 {
-    const PatternParams *pp = &pattern_params[s->current_pattern];
-    int rows_eff = s->rows - 1;     /* leave bottom row for HUD */
+    if (s->paused) return;
+    float speed_mul = (float)s->speed / (float)SPEED_DEF;
+    dt *= speed_mul;
+    s->time_accum += dt;
 
-    /* ── 1. Heat-source glow ────────────────────────────────────────
-     * A 2-row band at the source gets an extra-bright fill so the
-     * fire base reads as solid heat rather than just sparse embers.
-     * In DBG_SOURCE the band is drawn in bright magenta as a visual
-     * tracking marker; in all other modes it uses the heat ramp. */
+    const PatternParams *pp = &pattern_params[s->current_pattern];
+
+    topup_ember_pool    (s, pp, dt);   /* phase 1: spawn up to target  */
+    integrate_all_embers(s, pp, dt);   /* phase 2: physics + cull dead */
+}
+
+/*
+ * Below: render helpers + scene_draw orchestrator.  Painter's-algorithm
+ * order: source band painted FIRST (background), per-ember ramp SECOND
+ * (foreground) — so embers always overwrite glow, never the reverse.
+ *
+ *   ember_temperature           T = 1 - age/life  (clamped [0, 1])
+ *   temperature_to_ramp_slot    T → slot ∈ [0, 7]
+ *   attr_for_ramp_slot          slot 6+ BOLD, 0/1 DIM, else NORMAL
+ *   paint_glyph                 mvaddch wrapped in attron/off
+ *   source_band_slot_for_dx     bright at centre, dimmer toward edges (floor 4)
+ *
+ *   draw_source_band            phase 1: 2-row glow at the source
+ *   pick_ember_glyph            debug-mode glyph dispatch (colour stays from T)
+ *   draw_one_ember              phase 2 inner: T → slot → glyph + attr → paint
+ *   draw_all_embers             phase 2: walk pool, paint each active
+ *   scene_draw                  phase 1 then phase 2; const Scene * (no mutation)
+ *
+ * Why the source band exists: without those bright cells the embers
+ * look like floating sparks — no anchor to a fire.  The band is a
+ * small fake (just hot cells in the spawn strip) but it sells the
+ * visual.
+ *
+ * Why one T → slot → glyph + attr pipeline: same code drives normal +
+ * every debug overlay.  Debug REPLACES the glyph (pick_ember_glyph)
+ * but colour stays driven by T, so overlays inherit the active theme
+ * automatically.
+ */
+/* ember_temperature — life-fraction T = 1 - age/life, clamped to [0, 1]. */
+static inline float ember_temperature(const Ember *e)
+{
+    if (e->life <= 0.0f) return 0.0f;
+    float T = 1.0f - e->age / e->life;
+    if (T < 0.0f) T = 0.0f;
+    if (T > 1.0f) T = 1.0f;
+    return T;
+}
+
+/* temperature_to_ramp_slot — T ∈ [0, 1] → slot ∈ [0, 7] (8-step heat ramp). */
+static inline int temperature_to_ramp_slot(float T)
+{
+    int slot = (int)(T * 7.999f);
+    if (slot < 0) slot = 0;
+    if (slot > 7) slot = 7;
+    return slot;
+}
+
+/* attr_for_ramp_slot — slot 6+ BOLD, 0/1 DIM, else NORMAL.  3-tier brightness. */
+static inline int attr_for_ramp_slot(int slot)
+{
+    if (slot >= 6) return A_BOLD;
+    if (slot <= 1) return A_DIM;
+    return A_NORMAL;
+}
+
+/* paint_glyph — one mvaddch wrapped in attron/off so callers stay one-line. */
+static inline void paint_glyph(int y, int x, char glyph, int pair, int attr)
+{
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(y, x, (chtype)(unsigned char)glyph);
+    attroff(COLOR_PAIR(pair) | attr);
+}
+
+/* source_band_slot_for_dx — bright at centre (slot 7), dimmer toward edges; floor 4. */
+static inline int source_band_slot_for_dx(int dx, int half)
+{
+    float r    = (float)abs(dx) / (float)(half + 1);
+    int   slot = (int)((1.0f - r) * 7.0f + 0.5f);
+    if (slot < 4) slot = 4;       /* always reasonably hot   */
+    if (slot > 7) slot = 7;
+    return slot;
+}
+
+/* draw_source_band — phase 1: 2-row glow strip at the source so fire reads anchored. */
+static void draw_source_band(const Scene *s, const PatternParams *pp, int rows_eff)
+{
     float source_cx = scene_source_cx(s);
     int   src_y0    = s->rows - 2 - pp->source_y_offset;
     int   src_y1    = src_y0 + 1;
@@ -1121,70 +1257,67 @@ static void scene_draw(const Scene *s)
         for (int dx = -half; dx <= half; dx++) {
             int x = (int)(source_cx + 0.5f) + dx;
             if (x < 0 || x >= s->cols) continue;
-            /* Bright at centre, dimmer at edges. */
-            float r = (float)abs(dx) / (float)(half + 1);
-            int   slot = (int)((1.0f - r) * 7.0f + 0.5f);
-            if (slot < 4) slot = 4;       /* always reasonably hot   */
-            if (slot > 7) slot = 7;
-            char  glyph = (g_debug == DBG_SOURCE) ? '#'
-                        : (slot >= 6)             ? '*' : '+';
-            int   attr  = A_BOLD;
-            int   pair  = (g_debug == DBG_SOURCE) ? PAIR_HEAT_BASE + 7
-                                                  : PAIR_HEAT_BASE + slot;
-            attron(COLOR_PAIR(pair) | attr);
-            mvaddch(y, x, (chtype)(unsigned char)glyph);
-            attroff(COLOR_PAIR(pair) | attr);
+            int  slot  = source_band_slot_for_dx(dx, half);
+            char glyph = (g_debug == DBG_SOURCE) ? '#'
+                       : (slot >= 6)             ? '*' : '+';
+            int  pair  = (g_debug == DBG_SOURCE) ? PAIR_HEAT_BASE + 7
+                                                 : PAIR_HEAT_BASE + slot;
+            paint_glyph(y, x, glyph, pair, A_BOLD);
         }
     }
+}
 
-    /* ── 2. Embers ──────────────────────────────────────────────── */
+/* pick_ember_glyph — debug-mode glyph dispatch.  Colour stays driven by T. */
+static char pick_ember_glyph(int slot, float T, const Ember *e)
+{
+    switch (g_debug) {
+    case DBG_VELOCITY:
+        return dir_char(e->vx, e->vy);
+    case DBG_TEMPERATURE: {
+        int digit = (int)(T * 9.0f + 0.5f);
+        if (digit < 0) digit = 0;
+        if (digit > 9) digit = 9;
+        return (char)('0' + digit);
+    }
+    case DBG_NORMAL:
+    case DBG_SOURCE:
+    default:
+        return RAMP_GLYPHS[slot];
+    }
+}
+
+/* draw_one_ember — phase 2 inner: temperature → slot → glyph + attr → paint. */
+static void draw_one_ember(const Ember *e, int cols, int rows_eff)
+{
+    int ix = (int)(e->x + 0.5f);
+    int iy = (int)(e->y + 0.5f);
+    if (ix < 0 || ix >= cols)     return;
+    if (iy < 0 || iy >= rows_eff) return;
+
+    float T     = ember_temperature(e);
+    int   slot  = temperature_to_ramp_slot(T);
+    char  glyph = pick_ember_glyph(slot, T, e);
+    int   attr  = attr_for_ramp_slot(slot);
+    paint_glyph(iy, ix, glyph, PAIR_HEAT_BASE + slot, attr);
+}
+
+/* draw_all_embers — phase 2: walk pool, paint each active ember. */
+static void draw_all_embers(const Scene *s, int rows_eff)
+{
     for (int i = 0; i < MAX_EMBERS; i++) {
         const Ember *e = &s->embers[i];
         if (!e->active) continue;
-        int ix = (int)(e->x + 0.5f);
-        int iy = (int)(e->y + 0.5f);
-        if (ix < 0 || ix >= s->cols) continue;
-        if (iy < 0 || iy >= rows_eff) continue;
-
-        /* Temperature → ramp slot (cool → hot). */
-        float T = 1.0f - e->age / e->life;
-        if (T < 0.0f) T = 0.0f;
-        if (T > 1.0f) T = 1.0f;
-        int slot = (int)(T * 7.999f);
-        if (slot < 0) slot = 0;
-        if (slot > 7) slot = 7;
-
-        /*
-         * Debug-mode dispatch — glyph only.  Colour stays driven by T
-         * so debug overlays inherit the theme palette automatically.
-         */
-        char glyph;
-        switch (g_debug) {
-        case DBG_VELOCITY:
-            glyph = dir_char(e->vx, e->vy);
-            break;
-        case DBG_TEMPERATURE: {
-            int digit = (int)(T * 9.0f + 0.5f);
-            if (digit < 0) digit = 0;
-            if (digit > 9) digit = 9;
-            glyph = (char)('0' + digit);
-            break;
-        }
-        case DBG_NORMAL:
-        case DBG_SOURCE:
-        default:
-            glyph = RAMP_GLYPHS[slot];
-            break;
-        }
-
-        int  attr  = (slot >= 6) ? A_BOLD
-                   : (slot <= 1) ? A_DIM
-                   :               A_NORMAL;
-        int  pair  = PAIR_HEAT_BASE + slot;
-        attron(COLOR_PAIR(pair) | attr);
-        mvaddch(iy, ix, (chtype)(unsigned char)glyph);
-        attroff(COLOR_PAIR(pair) | attr);
+        draw_one_ember(e, s->cols, rows_eff);
     }
+}
+
+static void scene_draw(const Scene *s)
+{
+    const PatternParams *pp = &pattern_params[s->current_pattern];
+    int rows_eff = s->rows - 1;     /* leave bottom row for HUD */
+
+    draw_source_band(s, pp, rows_eff);   /* phase 1: anchor glow strip   */
+    draw_all_embers (s, rows_eff);       /* phase 2: per-ember ramp render */
 }
 
 /* ===================================================================== */

@@ -85,14 +85,173 @@
  *                  mvaddch per frame. At 60 fps ≈ 420 k/sec — well
  *                  inside ncurses' write budget.
  *
- * References     :
- *   • Reeves, W. T. (1983) — "Particle Systems: A Technique for
- *     Modelling a Class of Fuzzy Objects", *ACM TOG* 2(2):91–108.
- *     Foundational paper on pool-based particle systems for fire,
- *     explosions, and natural phenomena like rain/snow.
- *   • Wikipedia — [Rain](https://en.wikipedia.org/wiki/Rain).
- *     Real-world drop-size and terminal-velocity tables (drizzle ~9
- *     km/h, heavy storm ~33 km/h).
+ * References
+ * ──────────
+ *   PAPERS
+ *     Reeves, W. T. (1983)
+ *       "Particle Systems — A Technique for Modeling a Class of Fuzzy Objects"
+ *       ACM Transactions on Graphics 2(2): 91-108.
+ *       Foundational paper.  The pool-based two-species model used
+ *       here (drops + impact-triggered splash particles) is exactly
+ *       Reeves' design; splash-on-impact is the canonical "particle
+ *       spawns particles" composition pattern.
+ *
+ *     Garg, K. & Nayar, S. K. (2007)
+ *       "Vision and Rain"
+ *       International Journal of Computer Vision 75(1): 3-27.
+ *       Physical optics of rain streaks: drops reach terminal velocity
+ *       almost immediately, and what cameras see is the motion-blur
+ *       STRETCH along the velocity vector — not a point at the drop's
+ *       current position.  The slope-based glyph ('|' vertical, '/'
+ *       and '\' diagonal) and the multi-cell tail-to-head trail in
+ *       scene_draw are the ASCII analogue of camera-blur streaks.
+ *
+ *   BOOKS
+ *     Bourg, D. M. & Bywalec, B. — "Physics for Game Developers"
+ *       (2nd ed, O'Reilly, 2013).  Chapters 2-4: terminal velocity
+ *       under drag (why real drops — and these — fall at a constant
+ *       speed rather than accelerating indefinitely under gravity);
+ *       ballistic motion + drag for the splash arc.
+ *
+ *     Witkin, A. & Baraff, D. (2001)
+ *       "Physically Based Modeling: Principles and Practice"
+ *       SIGGRAPH course notes (online proceedings).  §1 — particle
+ *       dynamics under constant force fields, the integrator the
+ *       splash species uses (vy += g·dt; vx *= drag; p += v·dt).
+ *
+ *     Akenine-Möller, T., Haines, E. & Hoffman, N. — "Real-Time
+ *       Rendering" (4th ed, CRC Press, 2018).
+ *       §13.7 — point-sprite particle rendering with motion-blur
+ *       smearing; the 8-step tail-to-head density ramp here is the
+ *       cell-grid analogue of camera-blur-stretched point sprites.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── ARCHITECTURE — DATA-DRIVEN PATTERN ENGINE ────────────────────────── *
+ *
+ * Four rain intensities (DRIZZLE, SHOWER, STORM, MONSOON) are
+ * produced by a SINGLE generic two-species engine — falling DROPS
+ * + bouncing SPLASH particles — driven by an array of PatternParams
+ * structs.  scene_tick and scene_draw never branch on the pattern
+ * enum to decide HOW the physics works; they read
+ * pattern_params[s->current_pattern] and compute accordingly.
+ * Adding a new intensity is a matter of appending one row to
+ * pattern_params[]; no new code paths.
+ *
+ *
+ * THE GENERIC ENGINE (pseudocode)
+ * ───────────────────────────────
+ *
+ *   loop forever (each tick of dt seconds):
+ *
+ *     pp = pattern_params[scene.current_pattern]   # read inputs
+ *
+ *     # 1. SPAWN DROPS — top up drop pool toward target density
+ *     while count(active drops) < pp.target_drops:
+ *         d = next_inactive_drop_slot()
+ *         d.x      = wind_aware_uniform_x(scene.cols, pp.wind_x)
+ *         d.y      = uniform(-6, -1)               # just above top
+ *         d.vy     = pp.drop_speed                 # terminal velocity
+ *         d.vx     = pp.wind_x + scene.wind_override
+ *         d.length = uniform(pp.length_min, pp.length_max)
+ *         d.active = true
+ *
+ *     # 2. INTEGRATE DROPS — constant-velocity fall (no gravity:
+ *     #    raindrops reach terminal velocity almost immediately,
+ *     #    Garg & Nayar 2007).
+ *     for d in active drops:
+ *         d.x += d.vx · dt
+ *         d.y += d.vy · dt
+ *
+ *     # 3. FLOOR IMPACT — drop hits the bottom row → spawn splashes
+ *     for d in active drops where d.y >= floor:
+ *         n_splash = round(SPLASH_BASE_PER_DROP · pp.splash_mul)
+ *         for k in 0..n_splash:
+ *             s = next_inactive_splash_slot()
+ *             s.x, s.y = d.x, floor
+ *             (s.vx, s.vy) = polar(angle≈up, speed_jitter)
+ *             s.life       = SPLASH_LIFE
+ *             s.active     = true
+ *         d.active = false      # drop consumed
+ *
+ *     # 4. INTEGRATE SPLASHES — explicit Euler with gravity + drag
+ *     for s in active splashes:
+ *         s.vy += GRAVITY · dt
+ *         s.vx *= SPLASH_DRAG_FACTOR
+ *         s.x  += s.vx · dt
+ *         s.y  += s.vy · dt
+ *         s.age += dt
+ *         if s.age >= s.life:  s.active = false
+ *
+ *     # 5. CULL — drops drifted off-screen sideways die quietly
+ *     for d in active drops:
+ *         if d.x off-screen:  d.active = false
+ *
+ *     # 6. RENDER — drops as 8-step tail→head motion-blur streaks,
+ *     #    splash particles as single dim glyphs.
+ *     for d in active drops:
+ *         glyph = drop_glyph_for_slope(d.vx, d.vy)   # | / \ ~
+ *         paint_motion_blur_streak(d, ramp[0..7])
+ *     for s in active splashes:
+ *         paint(s.x, s.y, '·', PAIR_SPLASH)
+ *
+ *
+ * PATTERNPARAMS FIELD → ENGINE HOOK
+ * ─────────────────────────────────
+ *
+ *   target_drops     →  spawn-loop refill cap        (sky density)
+ *   drop_speed       →  vy at spawn                  (terminal velocity)
+ *   wind_x           →  vx + spawn-x extension       (Garg & Nayar slope)
+ *   length_min       →  motion-blur streak length    (camera-blur stretch)
+ *   length_max
+ *   splash_mul       →  splashes per impact          (= mul·SPLASH_BASE)
+ *
+ * Every other engine constant — MAX_DROPS, MAX_SPLASHES, SPLASH_BASE_PER_DROP,
+ * SPLASH_LIFE, SPLASH_DRAG_FACTOR, GRAVITY, WIND_STEP — is a GLOBAL
+ * tuning knob shared across all patterns.  Patterns differ ONLY in
+ * the six fields above.
+ *
+ *
+ * ARCHITECTURAL REFERENCES
+ * ────────────────────────
+ *
+ *   Reeves, W. T. (1983)
+ *     "Particle Systems — A Technique for Modeling a Class of
+ *     Fuzzy Objects", ACM TOG 2(2): 91-108.
+ *     §4 makes the explicit argument that ONE engine + a struct
+ *     of physical constants per phenomenon is the right
+ *     architecture for natural-particle simulations — rain is one
+ *     of Reeves' enumerated examples.  The two-species design here
+ *     (drops + splashes, each with its own pool) is also Reeves'
+ *     suggestion for compound natural phenomena.
+ *
+ *   Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994)
+ *     "Design Patterns" (Addison-Wesley) — STRATEGY pattern (§5.9).
+ *     A family of algorithms (DRIZZLE / SHOWER / STORM / MONSOON)
+ *     interchangeable behind a single interface (the engine
+ *     reading PatternParams).  In procedural C the "interface" is
+ *     the struct shape; "concrete strategies" are the rows of
+ *     pattern_params[]; "selecting a strategy" is updating
+ *     scene.current_pattern.
+ *
+ *   Acton, M. (2014)
+ *     "Data-Oriented Design and C++" (CppCon 2014 keynote).
+ *     Argues that variation between behaviours should be
+ *     represented as DATA (struct fields) rather than as control
+ *     flow (if/switch on type).  pattern_params[] is a compact
+ *     data table; the engine has no per-pattern code paths and
+ *     the cache footprint stays predictable across pattern
+ *     switches.
+ *
+ *   Nystrom, R. (2014)
+ *     "Game Programming Patterns" (Genever Benning).
+ *     TYPE OBJECT chapter — PatternParams is a Type Object: one
+ *     shared instance per "kind" of rainstorm.  DATA LOCALITY
+ *     chapter — both Drop and Splash are flat-laid-out PODs swept
+ *     linearly by the integrator each tick, exactly the layout
+ *     Nystrom recommends for hot inner loops.  OBJECT POOL chapter
+ *     — the fixed-size BSS arrays here implement Nystrom's pool
+ *     idiom directly (active flag + linear scan for next slot).
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -109,52 +268,49 @@
  * SAME slot is reused next frame for the next drop. Nothing is
  * ever allocated or freed at runtime.
  *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture a rain stage with N hooks on the rafter. Each hook can
- * hold ONE drop at a time. When you need a new drop, walk along
- * the row and grab the first empty hook; when a drop hits the
- * floor you put the hook back. The total drops on stage at any
- * moment is at most N, and we keep refilling as drops die. The
- * splash particles work the same way with their own row of hooks.
- * Wind is just an extra horizontal velocity; gravity is `vy +=
- * GRAVITY · dt`. Drops are a streak along the velocity direction;
- * splashes are a few sparks that arc and fade.
- *
- * ALGORITHM IN STEPS
+ * ALGORITHM IN STEPS  (each step = one helper in §6)
  * ──────────────────
- *  1. ACTIVATE-TO-TARGET. Each tick, count active drops. If less
- *     than `pattern.target`, scan the pool for an inactive slot and
- *     spawn a new drop at a random column above the screen.
+ *  1. EMIT TO TARGET (drops_emit_to_target → scene_spawn_drop):
+ *     count active drops; if below pattern.target_drops, spawn the
+ *     difference, capped at (target × dt × 4 + 4) so a long pause
+ *     doesn't release a flood when the loop resumes. New drops get
+ *     a wind-aware spawn x (drop_spawn_x_wind_aware) so wind-tilted
+ *     streams enter from the side as well as from above.
  *
- *  2. INTEGRATE DROPS:
- *       drop.vy = pattern.drop_speed         // constant terminal velocity
- *       drop.vx = pattern.wind_x + extra
- *       drop.x += drop.vx · dt
- *       drop.y += drop.vy · dt
+ *  2. INTEGRATE DROPS (drops_integrate_and_cull →
+ *     drop_step_constant_velocity):
+ *       drop.vx = pattern.wind_x + scene.wind_override (jittered)
+ *       drop.vy = pattern.drop_speed                   (jittered)
+ *       x += vx · dt;  y += vy · dt
+ *     Terminal-velocity model — no gravity applied to the drop layer
+ *     (real drops reach terminal velocity almost immediately).
  *
- *  3. KILL & SPLASH. When `drop.y >= rows - 2`:
- *       - mark drop inactive
- *       - spawn `K = round(SPLASHES_PER_DROP · pattern.splash_mul)`
- *         splash particles at the impact point with random outward
- *         velocity (small horizontal kick + small upward).
+ *  3. KILL & SPLASH. drops_integrate_and_cull triggers
+ *     scene_emit_splashes when drop.y >= rows - 2: spawn
+ *     K = round(SPLASH_BASE_PER_DROP · pattern.splash_mul) splash
+ *     particles at the impact with random outward velocity (vy
+ *     starts negative for the upward kick + symmetric vx).
  *
- *  4. INTEGRATE SPLASHES (bounce-ball physics):
- *       splash.vy += SPLASH_GRAVITY · dt
- *       splash.vx *= SPLASH_DRAG (per second)
- *       splash.x += splash.vx · dt
- *       splash.y += splash.vy · dt
- *       splash.age += dt
- *       if (splash.age > splash.life) deactivate
+ *  4. INTEGRATE SPLASHES (splashes_integrate_and_cull →
+ *     splash_step_kinematic):
+ *       vy += SPLASH_GRAVITY · dt          (constant gravity)
+ *       vx *= exp(-SPLASH_DRAG · dt)        (closed-form drag)
+ *       x += vx · dt;  y += vy · dt
+ *       age += dt
+ *       deactivate when age ≥ life OR y past kill_y
  *
- *  5. RENDER:
- *       For each active drop: pick glyph from |slope| of (vx, vy);
- *       draw a motion-blur trail of `length` cells along (-vx, -vy)
- *       with glyphs from the airy ramp tail-to-head.
- *       For each active splash: pick `.`, `,` or `'` based on age
- *       (newer → brighter glyph) and render at its current cell.
+ *  5. RENDER (scene_draw):
+ *     drops_render → drop_render_with_trail: drop_glyph_for_slope
+ *       picks the head ('|', '/', '\', '~'); the trail walks BACK
+ *       along (-vx, -vy) for `length` cells with glyphs from the
+ *       tail-to-head airy ramp.
+ *     splashes_render → splash_render: splash_life_phase maps age/life
+ *       to ('*' / '+' / '.', A_BOLD / NORMAL / DIM).
  *
- *  6. HUD on bottom row.
+ *  6. TWO-LAYER HUD (screen_draw):
+ *     top row → screen_paint_status_bar (bright yellow status with
+ *       pattern, theme, drop count, splash count, wind, fps, Hz, speed);
+ *     bottom row → screen_paint_hint_bar (bright cyan key hints).
  *
  * KEY FORMULAS
  * ────────────
@@ -179,64 +335,6 @@
  *    vx0 = SPLASH_KICK_X · (rand·2 - 1)           // ±horizontal
  *    life = 0.30 + rand·0.40                       // seconds
  *    vy += SPLASH_GRAVITY · dt
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • DROP WRAP AT SCREEN EDGE. Wind can push a drop off the side
- *    before it reaches the bottom. We let it die quietly off-screen
- *    (no splash) — the `target_drops` self-correct mechanism just
- *    spawns a replacement.
- *
- *  • SPLASH ARRAY EXHAUSTION. When MONSOON kills 50 drops/sec and
- *    each drops spawns 5 splashes = 250 splash spawns/sec, with
- *    splash life of 0.5 sec we have ~125 active splashes. Sized
- *    MAX_SPLASHES = 600 so this never overflows. If pattern is
- *    pushed harder, splash spawns silently fail and the pattern
- *    just looks slightly less wet — graceful degradation.
- *
- *  • TRAIL OFF SCREEN. The motion-blur trail extends BACKWARDS
- *    from the drop head. Above the screen (y < 0) cells are
- *    skipped via bounds check; the visible trail stays visually
- *    intact as the drop enters from the top.
- *
- *  • PAUSE. Respected by both drop and splash tick — `dt = 0` if
- *    paused, so positions and ages don't advance. Drawing
- *    continues unchanged.
- *
- *  • RESEED. Press `r` to clear all drops + splashes and re-spawn
- *    the pattern at full density immediately. Useful when changing
- *    patterns to skip the warm-up period.
- *
- *  • WIND OVERRIDE. `w`/`W` add ±WIND_STEP cells/sec to whatever
- *    the pattern's base wind is. The wind override persists across
- *    pattern changes; press `r` to also reset wind to pattern base.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Pause (space). Drops freeze mid-fall; splashes freeze mid-arc.
- *    Resume: motion continues from where it stopped.
- *
- *  • DRIZZLE. Light, slow, sparse. Maybe 100 drops on screen at
- *    once. Each drop falls almost vertically. Splashes are tiny.
- *
- *  • SHOWER. Medium intensity. Some visible wind slant. Drops
- *    obviously diagonal. Splash count noticeably higher.
- *
- *  • STORM. Many drops, fast, strong wind. Drops slant heavily;
- *    motion-blur trails are 3–5 cells long. Splashes burst
- *    visibly along the bottom.
- *
- *  • MONSOON. Wall of rain. Drops fast and dense; whole screen
- *    is moving. Wind is dominant. Splashes form a near-continuous
- *    line at the bottom.
- *
- *  • Wind override (`w`/`W`). Press `w` repeatedly to push the
- *    rain to the right; `W` to push left. The slope of every drop
- *    on screen smoothly reflects the new wind.
- *
- *  • Theme cycle (`t`/`T`). Each theme should produce a
- *    distinctively-coloured rain (blue, silver, neon, etc.) while
- *    drop count and motion are unchanged.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -339,13 +437,41 @@ static const char *pattern_name(Pattern p)
 }
 
 /*
- * PatternParams — physics knobs per pattern.
+ * PatternParams — physics + density knobs that distinguish one rain
+ * INTENSITY pattern from another. The simulation engine never branches
+ * on the pattern enum; it reads these fields and behaves accordingly.
+ * Same code, four different storms. Switching pattern (n/N keys) just
+ * swaps which row of this table the spawn loop reads.
  *
- *   target_drops      : steady-state active drop count
- *   drop_speed        : terminal vy in cells/sec
- *   wind_x            : default horizontal velocity in cells/sec
- *   length_min/max    : motion-blur trail length range in cells
- *   splash_mul        : multiplier on SPLASH_BASE_PER_DROP
+ *   target_drops  : steady-state count of active drops on screen.
+ *                   The spawn loop refills toward this each tick.
+ *                   Higher = denser sheet of rain.
+ *                   DRIZZLE 150 (light), MONSOON 800 (wall of water).
+ *
+ *   drop_speed    : drop TERMINAL VELOCITY in cells/sec. Drops fall at
+ *                   constant speed — no gravity is applied to the drop
+ *                   layer because real raindrops reach terminal
+ *                   velocity almost immediately (see Garg & Nayar).
+ *                   Higher = visibly faster streaks.
+ *                   35 c/s drizzle → 190 c/s monsoon.
+ *
+ *   wind_x        : default horizontal velocity in cells/sec applied
+ *                   at spawn. Sign convention: negative = leftward
+ *                   wind, positive = rightward. The (wind_x, drop_speed)
+ *                   pair sets the streak slope that drop_glyph_for_slope
+ *                   reads to pick '|', '/', '\', or '~'. The user adds
+ *                   Scene.wind_override on top via w/W keys.
+ *
+ *   length_min,   : motion-blur trail length range in cells. Per-drop
+ *   length_max     length sampled uniformly between min and max at
+ *                   spawn. Longer = stretched-out streaks (the camera-
+ *                   motion-blur effect Garg & Nayar formalise).
+ *                   DRIZZLE 1.0-2.0 cells; MONSOON 4.0-6.5 cells.
+ *
+ *   splash_mul    : multiplier on SPLASH_BASE_PER_DROP — controls how
+ *                   many splash particles each bottom-row impact spawns.
+ *                   DRIZZLE 0.4 (sparse splatters); MONSOON 1.3 (heavy
+ *                   continuous line of splashes along the bottom).
  */
 typedef struct {
     int   target_drops;
@@ -378,21 +504,22 @@ typedef struct {
     short       sky;
 } Theme;
 
-#define N_THEMES 10
+#define N_THEMES 11
 
 static const Theme themes[N_THEMES] = {
-    /* name          ramp[0..7]                                       splash sky */
+    /* name          ramp[0..7]  (tail dim → head bright)            splash sky */
 
-    { "DEFAULT",    {  24,  25,  31,  38,  45,  87, 117, 195 },        153,  234 },
-    { "STORM",      { 236, 240, 243, 245, 247, 249, 251, 254 },        117,  233 },
-    { "TROPICAL",   {  29,  35,  37,  44,  50,  86, 122, 159 },        158,  234 },
-    { "ARCTIC",     {  24,  31,  67, 110, 117, 153, 195, 231 },        231,  235 },
-    { "DESERT",     { 130, 137, 143, 173, 179, 215, 222, 229 },        222,  234 },
+    { "MATRIX",     {  28,  34,  40,  46,  82, 118, 154, 190 },        154,  234 },
     { "FIRE",       {  88, 124, 130, 166, 196, 208, 214, 226 },        226,  233 },
+    { "OCEANIC",    {  24,  25,  31,  38,  44,  51,  87, 159 },        159,  234 },
     { "NEON",       {  53,  91, 134, 165, 201, 207, 213, 219 },        219,  234 },
-    { "FOREST",     {  28,  34,  40,  64,  70, 112, 156, 192 },        192,  234 },
     { "MONO",       { 240, 243, 245, 247, 249, 251, 253, 255 },        255,  232 },
-    { "VIOLET",     {  53,  54,  91, 134, 135, 176, 213, 219 },        219,  233 },
+    { "ICE",        {  24,  31,  67, 110, 117, 153, 195, 231 },        231,  235 },
+    { "NOVA",       {  24,  75, 117, 159, 195, 219, 226, 231 },        231,  234 },
+    { "FOREST",     {  28,  64,  70,  76, 112, 148, 184, 220 },        184,  234 },
+    { "DESERT",     {  94, 130, 137, 143, 179, 215, 222, 229 },        222,  234 },
+    { "ECLIPSE",    {  52,  88,  95, 131, 167, 173, 209, 215 },        209,  232 },
+    { "TROPICAL",   {  29,  35,  37,  44,  50,  86, 122, 159 },        158,  234 },
 };
 
 /* Tail-to-head density ramp glyphs (project-airy variant). */
@@ -462,11 +589,58 @@ static void color_init(void)
 /* §4  drop — one falling rain particle                                  */
 /* ===================================================================== */
 
+/*
+ * Drop — one falling rain particle.
+ *
+ * INTENT: hold every per-drop value the integrator (§7) and render
+ * pass (§9) need, in a flat layout that fits into a fixed-size BSS
+ * array (no malloc after init). Drops never accelerate — the physics
+ * model is terminal velocity (constant vy), so once spawned the only
+ * way velocity changes is at the user's wind toggle.
+ *
+ * LIFECYCLE: spawn at top edge with a random column + the pattern's
+ * (wind_x + scene.wind_override, drop_speed) velocity → integrate
+ * forward each tick → on bottom-row impact, mark inactive and emit
+ * splash species via scene_emit_splashes. Slots are reused linearly
+ * by the next spawn — pool_find_inactive returns the first inactive
+ * index it sees.
+ *
+ *   x, y    : current position in cell-space FLOAT. Sub-cell precision
+ *             is what lets the motion-blur trail render as smooth
+ *             motion rather than snapping between integer cells each
+ *             frame. Rounding to integer cells happens once, at render
+ *             time, inside scene_draw.
+ *
+ *   vx, vy  : velocity in cells/sec.
+ *               vx = pattern.wind_x + scene.wind_override
+ *                   (signed; negative = leftward, positive = right).
+ *               vy = pattern.drop_speed
+ *                   (always positive = falling; no gravity applied —
+ *                    terminal-velocity model, see PatternParams).
+ *             The (vx, vy) pair drives BOTH the integrator and the
+ *             streak-glyph slope decision in drop_glyph_for_slope —
+ *             vertical slope picks '|', diagonals pick '/' or '\\',
+ *             shallow slope picks '~'.
+ *
+ *   length  : motion-blur trail length in cells, sampled at spawn
+ *             from [pattern.length_min, pattern.length_max]. Longer
+ *             = stretchier streak (the ASCII analogue of the camera-
+ *             motion-blur stretch Garg & Nayar describe).
+ *
+ *   spacing : trail step size in cells — distance between consecutive
+ *             trail glyphs along the (-vx, -vy) direction. Tuned per-
+ *             drop so a slow drizzle drop still shows a recognisable
+ *             trail instead of collapsing onto its head.
+ *
+ *   active  : pool-slot occupancy flag. Inactive slots are skipped by
+ *             every loop; spawn finds the first inactive index via
+ *             linear scan (cheap at MAX_DROPS).
+ */
 typedef struct {
-    float x, y;        /* position — cell coords (float)   */
-    float vx, vy;      /* velocity — cells / second        */
-    float length;      /* motion-blur trail length (cells) */
-    float spacing;     /* trail step size (cells)          */
+    float x, y;
+    float vx, vy;
+    float length;
+    float spacing;
     bool  active;
 } Drop;
 
@@ -507,11 +681,47 @@ static char drop_glyph_for_slope(float vx, float vy)
 /* §5  splash — small particles emitted on drop impact                   */
 /* ===================================================================== */
 
+/*
+ * Splash — short-lived fragment emitted at the impact point when a
+ * Drop hits the bottom row.  Different physics from Drop:
+ *
+ *   Drop    : constant velocity (terminal-velocity model), no gravity.
+ *   Splash  : ballistic motion with gravity AND linear drag — the
+ *             classic bounce-up-then-fall arc you see when raindrops
+ *             hit a puddle.
+ *
+ * LIFECYCLE: born at (impact_x, impact_y) with an upward kick + a
+ * symmetric horizontal kick → integrates under gravity + drag → dies
+ * when age >= life. Pool-slot reuse identical to Drop.
+ *
+ *   x, y    : current position in cells. Initialised by
+ *             scene_emit_splashes to the drop's impact coordinates.
+ *
+ *   vx, vy  : velocity in cells/sec.  At spawn:
+ *               vy starts NEGATIVE (upward kick of magnitude
+ *                  SPLASH_KICK_UP × random ∈ [0.6, 1.0])
+ *               vx is symmetric around zero (±SPLASH_KICK_X)
+ *             so fragments fan outward from the impact.  During
+ *             integration vx decays exponentially via SPLASH_DRAG
+ *             while vy accumulates SPLASH_GRAVITY → the parabolic
+ *             arc.
+ *
+ *   age     : seconds since this splash was emitted. Drives BOTH
+ *             death (age >= life) and the glyph selector in
+ *             scene_draw (fresh → '*', mid → '+', old → '.').
+ *
+ *   life    : random target lifetime drawn at spawn from
+ *             [SPLASH_LIFE_MIN, SPLASH_LIFE_MAX]. Per-splash
+ *             randomness scatters the death moments — what reads as
+ *             organic fade instead of every splash dying in lockstep.
+ *
+ *   active  : pool-slot occupancy flag (same role as Drop.active).
+ */
 typedef struct {
-    float x, y;        /* position — cells     */
-    float vx, vy;      /* velocity — cells/sec */
-    float age;         /* seconds since spawn  */
-    float life;        /* total life (sec)     */
+    float x, y;
+    float vx, vy;
+    float age;
+    float life;
     bool  active;
 } Splash;
 
@@ -519,17 +729,82 @@ typedef struct {
 /* §6  scene — pools, tick, draw                                         */
 /* ===================================================================== */
 
+/*
+ * Scene — owns every piece of mutable state for the rain simulation.
+ * Two clearly-separated halves:
+ *
+ *   SIMULATION half — what the physics tick reads + writes. Owns the
+ *                     active pattern, force overrides, RNG, cached
+ *                     terminal dims, and both particle pools. Mutated
+ *                     by scene_tick() and the key handler.
+ *
+ *   RENDER half     — what scene_draw() consults to pick colours.
+ *                     Purely visual selection index; never read inside
+ *                     the physics tick.
+ *
+ * The Scene knows nothing about ncurses — physics writes to the pools,
+ * the render layer consults them. That separation lets the physics
+ * be exercised without a terminal (useful for headless tests).
+ */
 typedef struct {
+    /* ──────────────────────────────────────────────────────────────
+     *  SIMULATION HALF — physics tick reads + writes these
+     * ────────────────────────────────────────────────────────────── */
+
+    /* PAUSE — scene_tick is a no-op when set. Toggled by space-bar.
+     * Render keeps running so the user sees a frozen frame with
+     * drops + splashes mid-flight. */
     bool      paused;
+
+    /* SPEED — integer multiplier on dt. Default SPEED_DEF means 1×
+     * wall clock; +/= keys double, - halves. Bounded by
+     * SPEED_MIN/MAX. Doesn't change physics constants — just
+     * compresses or stretches simulated time. */
     int       speed;
-    int       current_theme;
+
+    /* PATTERN — index into pattern_params (DRIZZLE / SHOWER / STORM /
+     * MONSOON). Cycled by n / N. Switching pattern doesn't rebuild
+     * pools — the new target_drops self-fills (or self-drains) over
+     * a few seconds, which reads as a natural intensity change rather
+     * than a jarring scene cut. */
     Pattern   current_pattern;
-    float     wind_override;           /* added to pattern.wind_x */
+
+    /* WIND OVERRIDE — added to pattern.wind_x to compute the actual
+     * vx applied to newly-spawned drops. The w / W keys add ±WIND_STEP
+     * here. Persists across pattern switches; reset on 'r' along
+     * with the rest of the scene. Lets the user push the rain
+     * sideways live without rebuilding the pattern table. */
+    float     wind_override;
+
+    /* RNG — per-scene LCG state, seeded from clock_ns() at init and
+     * re-seeded (XOR'd) on 'r'. Used by every randomness consumer:
+     * spawn (column jitter, length, spacing) and splash emission
+     * (kick directions, life). No globals — full state in this byte. */
     uint32_t  rng;
+
+    /* CACHED TERMINAL DIMENSIONS — read every frame by spawn (top
+     * edge x range) and by the integrator (bottom-row kill check).
+     * Cached at init and on SIGWINCH so the hot path never calls
+     * getmaxyx(). */
     int       rows, cols;
 
+    /* PARTICLE POOLS — fixed-size BSS arrays, no allocation after
+     * init. drops[] holds in-flight rain; splashes[] holds the burst
+     * fragments spawned at each drop's bottom impact. Both pools use
+     * the `active` flag as the source-of-truth for occupancy —
+     * spawn linearly scans for the first inactive slot. */
     Drop      drops    [MAX_DROPS];
     Splash    splashes [MAX_SPLASHES];
+
+    /* ──────────────────────────────────────────────────────────────
+     *  RENDER HALF — scene_draw reads this; physics tick ignores it
+     * ────────────────────────────────────────────────────────────── */
+
+    /* THEME — index into themes[]. Cycled by t / T. Selects the
+     * colour-pair palette used by the 8-step trail ramp + splash
+     * colour. Pure render concern — drops behave identically (same
+     * count, motion, lifetime) regardless of which theme is active. */
+    int       current_theme;
 } Scene;
 
 static void scene_clear_pools(Scene *s)
@@ -552,17 +827,70 @@ static int splash_pool_find_inactive(Scene *s)
     return -1;
 }
 
-/*
- * scene_spawn_drop — activate one inactive drop slot.
+/* ── Spawn helpers (one-particle initial conditions) ─────────────── */
+
+/* Wind-aware spawn x: extend the sampling range on the windward edge
+ * so wind-tilted streams enter from the SIDE, not just from directly
+ * above every column. Without this, strong wind makes the top edge
+ * "leak" rain only along the leading half.
  *
- *   y_min, y_max : range from which to draw the spawn y coordinate.
+ *   wind >  0.5  → x ∈ [-over, cols)         (rightward wind, leak from left)
+ *   wind < -0.5  → x ∈ [0,    cols+over)     (leftward wind, leak from right)
+ *   else         → x ∈ [0,    cols)          (still air, uniform)
  *
- * Normal top-of-screen spawn uses (−6, −2) so drops enter from above.
- * Pre-warm at init/reseed/pattern-change uses (−6, rows−2) to scatter
- * drops UNIFORMLY across the visible column — this prevents the
- * "starting line" effect where all drops bunch into a thin band at
- * the top and march downward together.
- */
+ * `over = |wind| · 0.5` scales the overhang with wind strength. */
+static inline float drop_spawn_x_wind_aware(uint32_t *rng, float wind, int cols)
+{
+    float rngx = lcg_unit(rng);
+    float over = fabsf(wind) * 0.5f;
+    if (wind >  0.5f) return rngx * ((float)cols + over) - over;
+    if (wind < -0.5f) return rngx * ((float)cols + over);
+    return rngx * (float)cols;
+}
+
+/* Apply per-drop birth velocity. The pattern provides the AVERAGE
+ *   (vx = wind, vy = drop_speed)
+ * but each drop gets ±DROP_SPEED_VARIANCE/2 multiplicative jitter on
+ * vy and ±DROP_WIND_JITTER additive jitter on vx — this breaks the
+ * "layered marching band" look that comes from every drop having
+ * identical speed. */
+static inline void drop_apply_birth_velocity(Drop *d, uint32_t *rng,
+                                             float drop_speed, float wind)
+{
+    float speed_jitter = (1.0f - DROP_SPEED_VARIANCE * 0.5f)
+                       + lcg_unit(rng) * DROP_SPEED_VARIANCE;
+    float wind_jitter  = (lcg_unit(rng) - 0.5f) * 2.0f * DROP_WIND_JITTER;
+    d->vx = wind + wind_jitter;
+    d->vy = drop_speed * speed_jitter;
+}
+
+/* Apply per-drop trail-render parameters. length sampled from the
+ * pattern's [length_min, length_max]; spacing from the global
+ * [TRAIL_SPACING_MIN, TRAIL_SPACING_MAX]. Per-drop variation makes
+ * the curtain of rain look organic instead of regimented. */
+static inline void drop_apply_birth_trail(Drop *d, uint32_t *rng,
+                                          const PatternParams *pp)
+{
+    d->length  = pp->length_min      + lcg_unit(rng) * (pp->length_max   - pp->length_min);
+    d->spacing = TRAIL_SPACING_MIN   + lcg_unit(rng) * (TRAIL_SPACING_MAX - TRAIL_SPACING_MIN);
+}
+
+/* ── Driver — spawn one drop at a free pool slot ─────────────────── */
+
+/* Pseudocode:
+ *   find an inactive pool slot                  (linear scan)
+ *   compute wind from pattern + scene override
+ *   x = wind-aware spawn x
+ *   y = uniform sample in [y_min, y_max]
+ *   apply birth velocity (jittered around pattern average)
+ *   apply birth trail params (length + spacing)
+ *   flip alive
+ *
+ * The (y_min, y_max) range lets one function serve two callers:
+ *   normal top-edge spawn   uses (-6, -2)        → drops enter from above
+ *   prewarm at init/reseed  uses (-6, rows-2)    → scatter across the
+ *                                                  whole column so the first
+ *                                                  frame already looks full */
 static void scene_spawn_drop(Scene *s, float y_min, float y_max)
 {
     int idx = drop_pool_find_inactive(s);
@@ -570,38 +898,13 @@ static void scene_spawn_drop(Scene *s, float y_min, float y_max)
     Drop *d = &s->drops[idx];
 
     const PatternParams *pp = &pattern_params[s->current_pattern];
-
-    /* Random spawn x covers slightly past the screen on the windward
-     * side so wind-tilted streams enter from the side, not just from
-     * directly above each column. */
     float wind = pp->wind_x + s->wind_override;
-    float rngx = lcg_unit(&s->rng);
-    float over = fabsf(wind) * 0.5f;       /* extension on windward edge */
-    float spawn_x;
-    if (wind > 0.5f) {
-        /* wind blowing right — drops can also enter from the left */
-        spawn_x = rngx * ((float)s->cols + over) - over;
-    } else if (wind < -0.5f) {
-        /* wind blowing left — drops can also enter from the right */
-        spawn_x = rngx * ((float)s->cols + over);
-    } else {
-        spawn_x = rngx * (float)s->cols;
-    }
-    float spawn_y = y_min + lcg_unit(&s->rng) * (y_max - y_min);
 
-    /* Per-drop physics jitter — speed variance is the load-bearing
-     * fix for "layered" appearance at slow patterns. */
-    float speed_jitter = (1.0f - DROP_SPEED_VARIANCE * 0.5f)
-                       + lcg_unit(&s->rng) * DROP_SPEED_VARIANCE;
-    float wind_jitter  = (lcg_unit(&s->rng) - 0.5f) * 2.0f * DROP_WIND_JITTER;
-
-    d->x       = spawn_x;
-    d->y       = spawn_y;
-    d->vx      = wind + wind_jitter;
-    d->vy      = pp->drop_speed * speed_jitter;
-    d->length  = pp->length_min + lcg_unit(&s->rng) * (pp->length_max - pp->length_min);
-    d->spacing = TRAIL_SPACING_MIN + lcg_unit(&s->rng) * (TRAIL_SPACING_MAX - TRAIL_SPACING_MIN);
-    d->active  = true;
+    d->x = drop_spawn_x_wind_aware(&s->rng, wind, s->cols);
+    d->y = y_min + lcg_unit(&s->rng) * (y_max - y_min);
+    drop_apply_birth_velocity(d, &s->rng, pp->drop_speed, wind);
+    drop_apply_birth_trail   (d, &s->rng, pp);
+    d->active = true;
 }
 
 /*
@@ -686,143 +989,231 @@ static void scene_reseed(Scene *s)
     scene_prewarm(s);     /* re-fill screen with new RNG seed */
 }
 
-/*
- * scene_tick — advance physics by dt seconds.
- *  1. Activate-to-target: spawn one new drop per call until pool
- *     hits target. (Limiting to one-per-call avoids big spikes
- *     after a long pause.)
- *  2. Integrate all active drops; kill + splash on bottom contact.
- *  3. Integrate all active splashes; kill on age expiry.
- */
-static void scene_tick(Scene *s, float dt)
+/* ── Tick step helpers ───────────────────────────────────────────── */
+
+/* Count occupied drop slots — feedback signal for the emission-rate
+ * controller in drops_emit_to_target. */
+static int drops_count_active(const Scene *s)
 {
-    if (s->paused) return;
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    dt *= speed_mul;
+    int n = 0;
+    for (int i = 0; i < MAX_DROPS; i++) if (s->drops[i].active) n++;
+    return n;
+}
 
+/* Reeves emission step — refill the pool toward pattern.target_drops,
+ * capped at (target × dt × 4 + 4) per tick. The cap is proportional
+ * to dt so a long pause doesn't dump a flood when the loop resumes;
+ * +4 keeps the spawn alive at small dt. */
+static void drops_emit_to_target(Scene *s, float dt)
+{
     const PatternParams *pp = &pattern_params[s->current_pattern];
-
-    /* 1. Top up to target. */
-    int active_drops = 0;
-    for (int i = 0; i < MAX_DROPS; i++)
-        if (s->drops[i].active) active_drops++;
-
-    int target = pp->target_drops;
+    int active    = drops_count_active(s);
+    int target    = pp->target_drops;
     if (target > MAX_DROPS) target = MAX_DROPS;
-    /* Spawn up to (target − active) new drops this tick — but cap the
-     * burst size proportional to dt so we don't dump a huge spike
-     * after coming out of pause. */
     int spawn_cap = (int)((float)pp->target_drops * dt * 4.0f) + 4;
-    int to_spawn  = target - active_drops;
+    int to_spawn  = target - active;
     if (to_spawn > spawn_cap) to_spawn = spawn_cap;
     for (int k = 0; k < to_spawn; k++) scene_spawn_drop(s, -6.0f, -2.0f);
+}
 
-    /* 2. Integrate drops. */
+/* One drop step under the terminal-velocity model: pure advection
+ *     x ← x + vx · dt
+ *     y ← y + vy · dt
+ * No acceleration — terminal-velocity assumption (Garg & Nayar). */
+static inline void drop_step_constant_velocity(Drop *d, float dt)
+{
+    d->x += d->vx * dt;
+    d->y += d->vy * dt;
+}
+
+/* Advance every drop one step and reap those that died this frame.
+ * Death causes:
+ *   - drifted off screen sideways (off-domain cull, ±8 cells slack)
+ *   - reached the bottom row       (impact event → emit splashes) */
+static void drops_integrate_and_cull(Scene *s, float dt)
+{
     float kill_y = (float)(s->rows - 2);
     for (int i = 0; i < MAX_DROPS; i++) {
         Drop *d = &s->drops[i];
         if (!d->active) continue;
-        d->x += d->vx * dt;
-        d->y += d->vy * dt;
 
-        /* Off-screen sideways → die quietly. */
+        drop_step_constant_velocity(d, dt);
+
         if (d->x < -8.0f || d->x > (float)(s->cols + 8)) {
             d->active = false;
             continue;
         }
-        /* Hit ground → splash. */
         if (d->y >= kill_y) {
             scene_emit_splashes(s, d->x, kill_y);
             d->active = false;
         }
     }
+}
 
-    /* 3. Integrate splashes (gravity + drag). */
+/* One splash step under gravity with linear drag:
+ *     vy ← vy + g · dt              (constant gravity)
+ *     vx ← vx · exp(-k · dt)         (closed-form decay over dt)
+ *     (x, y) ← (x + vx · dt, y + vy · dt)
+ *     age ← age + dt
+ * The drag factor is precomputed once per tick by the caller. */
+static inline void splash_step_kinematic(Splash *sp, float drag_factor, float dt)
+{
+    sp->vy  += SPLASH_GRAVITY * dt;
+    sp->vx  *= drag_factor;
+    sp->x   += sp->vx * dt;
+    sp->y   += sp->vy * dt;
+    sp->age += dt;
+}
+
+/* Advance every splash one step and deactivate those past their life
+ * or that fell below the ground row. */
+static void splashes_integrate_and_cull(Scene *s, float dt)
+{
+    float kill_y      = (float)(s->rows - 2);
     float drag_factor = expf(-SPLASH_DRAG * dt);
+
     for (int i = 0; i < MAX_SPLASHES; i++) {
         Splash *sp = &s->splashes[i];
         if (!sp->active) continue;
-        sp->vy += SPLASH_GRAVITY * dt;
-        sp->vx *= drag_factor;
-        sp->x  += sp->vx * dt;
-        sp->y  += sp->vy * dt;
-        sp->age += dt;
-        if (sp->age >= sp->life || sp->y > kill_y + 1.0f) {
+        splash_step_kinematic(sp, drag_factor, dt);
+        if (sp->age >= sp->life || sp->y > kill_y + 1.0f)
             sp->active = false;
-        }
     }
 }
 
-/*
- * scene_draw — render all active particles to ncurses.
- *
- * Drops: head at (x, y) with the slope-glyph in PAIR_RAIN_BASE+7
- *        (brightest ramp slot); trail BACKWARDS along (-vx, -vy)
- *        with progressively-dimmer ramp slots.
- * Splashes: glyph by remaining life — fresh = '*', mid = '+', old = '.'
- */
-static void scene_draw(const Scene *s)
+/* ── Driver — one simulation tick ────────────────────────────────── */
+
+/* Pseudocode:
+ *   if paused                    → no-op
+ *   dt *= speed multiplier
+ *   drops_emit_to_target         — Reeves emission with per-tick cap
+ *   drops_integrate_and_cull     — advect drops, splash on impact
+ *   splashes_integrate_and_cull  — gravity + drag + life expiry */
+static void scene_tick(Scene *s, float dt)
 {
-    /* ── Drops with motion-blur trails ───────────────────────────── */
+    if (s->paused) return;
+    dt *= (float)s->speed / (float)SPEED_DEF;
+
+    drops_emit_to_target        (s, dt);
+    drops_integrate_and_cull    (s, dt);
+    splashes_integrate_and_cull (s, dt);
+}
+
+/* ── Per-particle render helpers ─────────────────────────────────── */
+
+/* Three-tier emphasis on the 8-step ramp: ends get A_BOLD / A_DIM,
+ * middle stays A_NORMAL — pushes contrast past what 8 palette
+ * entries alone can give. */
+static inline int ramp_slot_attr(int slot)
+{
+    if (slot >= 6) return A_BOLD;
+    if (slot <= 1) return A_DIM;
+    return A_NORMAL;
+}
+
+/* Reverse-direction unit vector — points BACKWARDS along the drop's
+ * velocity, which is the direction the motion-blur trail extends.
+ * Returns false if the drop has no velocity (degenerate). */
+static inline bool drop_trail_unit_back(const Drop *d, float *out_ux, float *out_uy)
+{
+    float vlen = sqrtf(d->vx * d->vx + d->vy * d->vy);
+    if (vlen < 1e-3f) return false;
+    *out_ux = -d->vx / vlen;
+    *out_uy = -d->vy / vlen;
+    return true;
+}
+
+/* Render one drop and its tail-to-head motion-blur trail.
+ *   t = 0  → head glyph (from drop_glyph_for_slope) at ramp slot 7
+ *   t > 0  → trail glyph from RAMP_GLYPHS[slot] at decreasing slots
+ * The trail walks BACKWARDS along the velocity at `spacing` steps. */
+static void drop_render_with_trail(const Drop *d, int cols, int rows)
+{
+    float ux, uy;
+    if (!drop_trail_unit_back(d, &ux, &uy)) return;
+
+    char head_glyph = drop_glyph_for_slope(d->vx, d->vy);
+    int  trail_n    = (int)d->length;
+    if (trail_n < 1) trail_n = 1;
+    if (trail_n > 7) trail_n = 7;          /* cap at ramp depth */
+
+    for (int t = 0; t <= trail_n; t++) {
+        int ix = (int)(d->x + ux * d->spacing * (float)t + 0.5f);
+        int iy = (int)(d->y + uy * d->spacing * (float)t + 0.5f);
+        if (ix < 0 || ix >= cols)        continue;
+        if (iy < 0 || iy >= rows - 1)    continue;
+
+        int  ramp_slot = 7 - t;
+        if (ramp_slot < 0) ramp_slot = 0;
+
+        char glyph = (t == 0) ? head_glyph : RAMP_GLYPHS[ramp_slot];
+        int  attr  = ramp_slot_attr(ramp_slot);
+        int  pair  = PAIR_RAIN_BASE + ramp_slot;
+
+        attron(COLOR_PAIR(pair) | attr);
+        mvaddch(iy, ix, (chtype)(unsigned char)glyph);
+        attroff(COLOR_PAIR(pair) | attr);
+    }
+}
+
+/* Map a splash's age/life ratio ∈ [0, 1] to a (glyph, attr) pair
+ * — three-tier fade matching what the eye reads as bright→fading:
+ *     [0.00, 0.30) → '*' A_BOLD    (fresh, brightest)
+ *     [0.30, 0.65) → '+' A_NORMAL  (mid-life)
+ *     [0.65, 1.00] → '.' A_DIM     (dying) */
+static inline void splash_life_phase(float life_ratio, char *out_g, int *out_attr)
+{
+    if      (life_ratio < 0.30f) { *out_g = '*'; *out_attr = A_BOLD;   }
+    else if (life_ratio < 0.65f) { *out_g = '+'; *out_attr = A_NORMAL; }
+    else                         { *out_g = '.'; *out_attr = A_DIM;    }
+}
+
+/* Render one splash at its current cell. */
+static void splash_render(const Splash *sp, int cols, int rows)
+{
+    int ix = (int)(sp->x + 0.5f);
+    int iy = (int)(sp->y + 0.5f);
+    if (ix < 0 || ix >= cols)     return;
+    if (iy < 0 || iy >= rows - 1) return;
+
+    char glyph;
+    int  attr;
+    splash_life_phase(sp->age / sp->life, &glyph, &attr);
+
+    attron(COLOR_PAIR(PAIR_SPLASH) | attr);
+    mvaddch(iy, ix, (chtype)(unsigned char)glyph);
+    attroff(COLOR_PAIR(PAIR_SPLASH) | attr);
+}
+
+/* Loop the drop layer. Each active drop renders as head + N-cell trail. */
+static void drops_render(const Scene *s)
+{
     for (int i = 0; i < MAX_DROPS; i++) {
         const Drop *d = &s->drops[i];
         if (!d->active) continue;
-
-        /* Velocity unit vector backwards (for the trail direction). */
-        float vlen = sqrtf(d->vx * d->vx + d->vy * d->vy);
-        if (vlen < 1e-3f) continue;
-        float ux = -d->vx / vlen;
-        float uy = -d->vy / vlen;
-
-        char head_glyph = drop_glyph_for_slope(d->vx, d->vy);
-        int  trail_n    = (int)d->length;
-        if (trail_n < 1) trail_n = 1;
-        if (trail_n > 7) trail_n = 7;     /* cap at ramp depth */
-
-        for (int t = 0; t <= trail_n; t++) {
-            float px = d->x + ux * d->spacing * (float)t;
-            float py = d->y + uy * d->spacing * (float)t;
-            int   ix = (int)(px + 0.5f);
-            int   iy = (int)(py + 0.5f);
-            if (ix < 0 || ix >= s->cols) continue;
-            if (iy < 0 || iy >= s->rows - 1) continue;
-
-            /* Ramp slot: head = 7, decreasing along the trail. */
-            int ramp_slot = 7 - t;
-            if (ramp_slot < 0) ramp_slot = 0;
-
-            char glyph = (t == 0) ? head_glyph : RAMP_GLYPHS[ramp_slot];
-            int  attr  = (ramp_slot >= 6) ? A_BOLD
-                       : (ramp_slot <= 1) ? A_DIM
-                       :                    A_NORMAL;
-            int  pair  = PAIR_RAIN_BASE + ramp_slot;
-
-            attron(COLOR_PAIR(pair) | attr);
-            mvaddch(iy, ix, (chtype)(unsigned char)glyph);
-            attroff(COLOR_PAIR(pair) | attr);
-        }
+        drop_render_with_trail(d, s->cols, s->rows);
     }
+}
 
-    /* ── Splashes ─────────────────────────────────────────────────── */
+/* Loop the splash layer. Each active splash renders as one age-faded glyph. */
+static void splashes_render(const Scene *s)
+{
     for (int i = 0; i < MAX_SPLASHES; i++) {
         const Splash *sp = &s->splashes[i];
         if (!sp->active) continue;
-        int ix = (int)(sp->x + 0.5f);
-        int iy = (int)(sp->y + 0.5f);
-        if (ix < 0 || ix >= s->cols) continue;
-        if (iy < 0 || iy >= s->rows - 1) continue;
-
-        float r = sp->age / sp->life;     /* 0=new, 1=dying */
-        char  g;
-        int   attr;
-        if      (r < 0.30f) { g = '*'; attr = A_BOLD;  }
-        else if (r < 0.65f) { g = '+'; attr = A_NORMAL;}
-        else                { g = '.'; attr = A_DIM;   }
-
-        attron(COLOR_PAIR(PAIR_SPLASH) | attr);
-        mvaddch(iy, ix, (chtype)(unsigned char)g);
-        attroff(COLOR_PAIR(PAIR_SPLASH) | attr);
+        splash_render(sp, s->cols, s->rows);
     }
+}
+
+/* ── Driver — render all active particles to ncurses ─────────────── */
+
+/* Pseudocode:
+ *   drops_render     — drops with backward-extending motion-blur trails
+ *   splashes_render  — splash fragments with age-based glyph + colour */
+static void scene_draw(const Scene *s)
+{
+    drops_render   (s);
+    splashes_render(s);
 }
 
 /* ===================================================================== */
@@ -861,32 +1252,68 @@ static void scene_counts(const Scene *s, int *out_drops, int *out_spl)
     *out_spl   = p;
 }
 
+/* ── HUD-bar helpers ─────────────────────────────────────────────── */
+
+/* Top row: dynamic status line. Pre-fills the row with PAIR_HUD as a
+ * background, then overlays the formatted status string. Builds the
+ * status text from live Scene state (pattern, theme, counts, wind,
+ * speed multiplier) plus the loop's fps / sim_fps measurements. */
+static void screen_paint_status_bar(Screen *sc, const Scene *s,
+                                    double fps, int sim_fps)
+{
+    int drops, spls;
+    scene_counts(s, &drops, &spls);
+    const PatternParams *pp = &pattern_params[s->current_pattern];
+    float wind = pp->wind_x + s->wind_override;
+    const char *state_str = s->paused ? "PAUSED " : pattern_name(s->current_pattern);
+
+    char status[200];
+    snprintf(status, sizeof status,
+             " RAIN   %s   theme:%-8s   drops:%4d  splashes:%3d   "
+             "wind:%+5.1f c/s   %5.1f fps  %3d Hz  speed:%-3d ",
+             state_str, themes[s->current_theme].name,
+             drops, spls, (double)wind, fps, sim_fps, s->speed);
+
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    for (int x = 0; x < sc->cols; x++) mvaddch(0, x, ' ');
+    mvprintw(0, 0, "%s", status);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+}
+
+/* Bottom row: static key-hint line. Same pre-fill trick with
+ * PAIR_HINT for the coloured background bar. */
+static void screen_paint_hint_bar(Screen *sc)
+{
+    const char *hints =
+        " q:quit  spc:pause  r:reseed  n/p:pattern  t/T:theme  "
+        "w/W:wind  +/-:speed  ]/[:Hz ";
+
+    int hint_row = sc->rows - 1;
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    for (int x = 0; x < sc->cols; x++) mvaddch(hint_row, x, ' ');
+    mvprintw(hint_row, 0, "%s", hints);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+}
+
+/* ── Driver — render scene, then paint two-layer HUD over it ─────── */
+
+/*
+ * screen_draw — render the scene, then paint a two-layer HUD over it:
+ *
+ *   Row 0          STATUS LINE.  Bright yellow PAIR_HUD + A_BOLD.
+ *   Row rows-1     KEY HINT LINE.  Bright cyan PAIR_HINT + A_BOLD.
+ *
+ * Both rows are pre-filled with their pair colour so the coloured
+ * background spans the full width, and drawn AFTER scene_draw so
+ * drops never bleed through the bars.
+ */
 static void screen_draw(Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
     erase();
     scene_draw(s);
-
-    int drops, spls;
-    scene_counts(s, &drops, &spls);
-    const PatternParams *pp = &pattern_params[s->current_pattern];
-    float wind = pp->wind_x + s->wind_override;
-
-    const char *state_str = s->paused ? "PAUSED " : pattern_name(s->current_pattern);
-
-    char buf[200];
-    snprintf(buf, sizeof buf,
-             " RAIN   %s   theme:%-8s   drops:%4d  splashes:%3d  "
-             "wind:%+5.1f c/s   %5.1f fps  %3d Hz  speed:%-3d   "
-             "n/p:pat  t/T:theme  w/W:wind  +/-:speed  spc:pause  r:reseed  q:quit ",
-             state_str, themes[s->current_theme].name,
-             drops, spls, (double)wind, fps, sim_fps, s->speed);
-
-    int row = sc->rows - 1;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    for (int x = 0; x < sc->cols; x++) mvaddch(row, x, ' ');
-    mvprintw(row, 0, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    screen_paint_status_bar(sc, s, fps, sim_fps);
+    screen_paint_hint_bar  (sc);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }

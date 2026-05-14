@@ -107,13 +107,51 @@
  *                  transitions are O(N²) only if we used optimal
  *                  matching; we use sequential matching which is O(N).
  *
- * References     :
- *   • Wikipedia — [Damped harmonic oscillator](https://en.wikipedia.org/wiki/Harmonic_oscillator).
- *     The K·(target − x) − D·v force pulling particles to their
- *     target is the classic spring-damper equation.
- *   • Adafruit — GFX 5×7 font (public-domain). The bitmap font
- *     embedded here follows the Adafruit-style 7-byte-per-glyph
- *     encoding.
+ * References
+ * ──────────
+ *   PAPERS
+ *     Reeves, W. T. (1983)
+ *       "Particle Systems — A Technique for Modeling a Class of Fuzzy Objects"
+ *       ACM Transactions on Graphics 2(2): 91-108.
+ *       Foundational paper.  The fixed-size pool + per-particle
+ *       independent update used here is the model Reeves defines.
+ *       The DISSOLVE phase pattern set (radial, tangent, downward,
+ *       random) maps directly to Reeves' "stochastic spawn vectors"
+ *       categorisation.
+ *
+ *     Witkin, A. & Baraff, D. (2001)
+ *       "Physically Based Modeling: Principles and Practice"
+ *       SIGGRAPH course notes (online proceedings).
+ *       §3 — soft-body constraints implemented as spring-damper
+ *       forces F = K·(target − x) − D·v, the exact pattern
+ *       ASSEMBLE/HOLD uses to pull particles onto bitmap targets.
+ *
+ *   BOOKS
+ *     Bourg, D. M. & Bywalec, B. — "Physics for Game Developers"
+ *       (2nd ed, O'Reilly, 2013).  Chapter on harmonic oscillators
+ *       and damping — Hooke's law F = -K·x, critical damping
+ *       D_crit = 2√(K·m), why our K=18 / D=8 choice is slightly
+ *       underdamped (gives the "boing" overshoot on settle).
+ *
+ *     Hairer, E., Lubich, C. & Wanner, G. — "Geometric Numerical
+ *       Integration: Structure-Preserving Algorithms for Ordinary
+ *       Differential Equations" (2nd ed, Springer, 2006).
+ *       §I.1 — symplectic Euler analysis: the v-then-x update order
+ *       used in scene_tick keeps the spring oscillator energy-bounded
+ *       over thousands of ticks, where explicit Euler would gradually
+ *       inflate the orbit.
+ *
+ *     Akenine-Möller, T., Haines, E. & Hoffman, N. —
+ *       "Real-Time Rendering" (4th ed, CRC Press, 2018).
+ *       §13.7 — point-sprite particle rendering.  Per-particle glyph
+ *       selection by distance-to-target (`*` settled, `+` flying,
+ *       `.` dispersed) is the ASCII analogue of the size-by-distance
+ *       point sprite pattern.
+ *
+ *   FONT
+ *     Adafruit GFX — public-domain 5×7 bitmap font; the embedded
+ *     font_5x7[256][7] table follows Adafruit's 7-byte-per-glyph
+ *     encoding (one row per byte, MSB = leftmost column).
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -129,43 +167,44 @@
  * turn the spring back on: the particles spring from wherever they
  * happen to be to the new positions.
  *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine 100 fireflies tied to invisible rubber bands, each band
- * fixed to one pixel of a glowing letter. Pluck the bands: the
- * fireflies snap to position and spell out the word. Cut the bands
- * and shoot the fireflies sideways: they scatter. Re-tie the bands
- * to a different word's pixels: they spring to the new positions.
- * That's it.
- *
- * ALGORITHM IN STEPS
+ * ALGORITHM IN STEPS  (each step = one helper in §6)
  * ──────────────────
- *  1. BUILD TARGETS. For the active word, walk each character; for
- *     each "on" pixel of the 5×7 bitmap, append a target position.
- *     Centre the whole word on screen. Total particles = total "on"
- *     pixels (typically 80-150 for 4-8 letter words).
+ *  1. BUILD TARGETS (scene_build_targets → target_color_slot +
+ *     target_emit_pixel_replicas). For the active word, walk each
+ *     character; for each "on" pixel of the 5×7 bitmap, emit
+ *     PARTICLES_PER_PIXEL (=3) targets with sub-cell jitter.  Total
+ *     ≈ on-pixel-count × 3 (≈ 270 for an 8-letter word).
  *
- *  2. PER TICK:
- *     ASSEMBLE / HOLD: damped spring toward target.
+ *  2. PER TICK (scene_tick):
+ *     ASSEMBLE / HOLD → scene_step_spring_layer →
+ *                       particle_integrate_spring:
  *       fx = K · (tx − px) − D · vx
- *       fy = K · (ty − py) − D · vy   (with aspect-correct y)
- *       v += f · dt    p += v · dt
- *       Plus tiny Brownian jitter during HOLD.
+ *       fy = K · (ty − py) / ASPECT_Y − D · vy   (aspect-corrected y)
+ *       v += f · dt;  p += v · dt   (symplectic Euler: v BEFORE p)
+ *       HOLD phase adds Brownian jitter so the word breathes.
  *
- *     DISSOLVE: no spring, only drag.
- *       v *= exp(-DRAG · dt)
+ *     DISSOLVE → scene_step_drift_layer → particle_integrate_drift:
+ *       v *= exp(-DISSOLVE_DRAG · dt)   (closed-form linear drag)
  *       p += v · dt
+ *       PATTERN_RAIN gets an extra vy += RAIN_GRAVITY · dt.
  *
- *  3. PHASE MACHINE: advance phase_t by dt; transition when timer
- *     elapses:
- *       ASSEMBLE → HOLD  after ASSEMBLE_DUR
- *       HOLD     → DISSOLVE after HOLD_DUR  (apply dissolve velocity)
- *       DISSOLVE → ASSEMBLE after DISSOLVE_DUR
- *                  (transition: pick next word, rebuild targets,
- *                   reassign particles, springs back on)
+ *  3. PHASE MACHINE (scene_advance_phase_machine):
+ *     advance phase_t by dt; transition when the timer elapses:
+ *       ASSEMBLE → HOLD     after ASSEMBLE_DUR
+ *       HOLD     → DISSOLVE after HOLD_DUR  + scene_apply_dissolve_velocity
+ *                                            (via particle_kick_explode /
+ *                                             swirl / rain / drift)
+ *       DISSOLVE → ASSEMBLE after DISSOLVE_DUR — LOOPS THE SAME WORD:
+ *                  scene_clear_particles + scene_load_word reload the
+ *                  current (word, theme, pattern). User keys r / t / n
+ *                  are the only way to advance any of those indices.
  *
- *  4. RENDER all active particles at integer cell positions in the
- *     theme's gradient colour by horizontal position.
+ *  4. RENDER (scene_draw): for each active particle,
+ *     particle_phase_glyph maps distance-to-target² to (glyph, attr):
+ *       d² <  1 → '*' A_BOLD   (settled)
+ *       d² < 25 → '+' A_NORMAL (mid-flight)
+ *       else    → '.' A_DIM    (dispersed)
+ *     painted in the theme's left-to-right gradient ramp slot.
  *
  * KEY FORMULAS
  * ────────────
@@ -188,68 +227,6 @@
  *  Aspect-correct spring (cells are 2× taller than wide so vertical
  *  spring needs proportionally less force to look balanced):
  *    fy = (K · (ty − py)) / ASPECT_Y - D · vy
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • PARTICLE COUNT MISMATCH BETWEEN WORDS. Shorter words need
- *    fewer particles than longer. On transition: extras get
- *    deactivated (they fade off as they leave screen during
- *    dissolve); shortfalls get spawned at random off-screen
- *    positions and spring in.
- *
- *  • SEQUENTIAL VS OPTIMAL MATCHING. We assign particle[i] →
- *    target[i] in order. Optimal matching (Hungarian algorithm)
- *    would minimise total travel distance. Sequential is much
- *    cheaper and the visual is nearly indistinguishable — particles
- *    take varied paths, which actually looks MORE organic than
- *    "everything moves the shortest distance".
- *
- *  • TARGET ORDERING. We walk word left-to-right, top-to-bottom.
- *    So targets[0] is top-left of the first letter; targets[N-1]
- *    is bottom-right of the last letter. With sequential matching,
- *    particle[0] ends up roughly top-left consistently, which can
- *    look "ordered". For more chaotic transitions, shuffle
- *    targets[] before assignment.
- *
- *  • BITMAP FONT BIT ORDER. font_5x7[c][row] is a uint8 with the
- *    LSB representing column 4 (rightmost), bit 4 representing
- *    column 0 (leftmost). When extracting bits, mask with
- *    (1 << (4 - col)).
- *
- *  • UNKNOWN CHARACTERS. Character not in the font (e.g. lowercase,
- *    accents) renders as space (no particles emitted). Words with
- *    only A-Z + 0-9 + ! ? . avoid this.
- *
- *  • SPRING STIFFNESS vs DURATION. ASSEMBLE_DUR must be long enough
- *    that the spring (K=18, D=8) has time to settle from the
- *    initial scattered state. Empirically 1.4 sec works.
- *
- *  • PAUSE. Phase timer skips, particle integration skips, but the
- *    HUD timer counts on (small cosmetic — fix later if needed).
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Pause (space) during DISSOLVE. Particles freeze mid-flight.
- *    Resume: motion continues.
- *
- *  • EXPLODE pattern. Particles all fly OUTWARD from word centre,
- *    scattering radially. After dissolve, they spring back from
- *    every direction.
- *
- *  • SWIRL pattern. Particles spin around the word centre — clean
- *    tangential vortex outward. Reform happens by reverse spiral.
- *
- *  • RAIN pattern. Particles all fall DOWN under gravity. Reform:
- *    particles fly up from below to the new word.
- *
- *  • DRIFT pattern. Particles wander randomly — most natural-looking
- *    "smoke fade".
- *
- *  • Word cycle. Watch BOOM → ASCII → PIXEL → MORPH → DUST → CODE
- *    → DISSOLVE → USELESS → back to BOOM.
- *
- *  • Theme cycle (`t`/`T`). Each theme produces a distinctively
- *    coloured word (FIRE = red/orange, ICE = blue/cyan, etc.).
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -283,7 +260,8 @@ enum {
     SPEED_DEF        =   8,
     SPEED_MAX        =  64,
 
-    MAX_PARTICLES    =  400,    /* enough for ~10-letter word at 5×7  */
+    MAX_PARTICLES    = 1500,    /* PARTICLES_PER_PIXEL × longest-word pixel count, with headroom */
+    PARTICLES_PER_PIXEL = 3,    /* particles assigned to each lit pixel — denser-looking word     */
 
     HUD_COLS         =  80,
     FPS_UPDATE_MS    = 500,
@@ -307,10 +285,12 @@ enum {
 #define HOLD_JITTER        4.0f      /* cells/sec² Brownian jitter     */
 #define DISSOLVE_DRAG      0.6f      /* per-second exp damping         */
 
-/* Phase durations (seconds). */
-#define ASSEMBLE_DUR       1.5f
-#define HOLD_DUR           3.0f
-#define DISSOLVE_DUR       1.5f
+/* Phase durations (seconds). Slower default cadence so the word is
+ * legible during HOLD and the dissolve has room to breathe. The user
+ * can still press '+' to speed up. */
+#define ASSEMBLE_DUR       2.5f
+#define HOLD_DUR           6.0f
+#define DISSOLVE_DUR       2.5f
 
 /* Dissolve initial velocity speeds. */
 #define EXPLODE_SPEED      45.0f
@@ -387,6 +367,7 @@ static const char *WORDS[] = {
     "CODE",
     "DISSOLVE",
     "USELESS",
+    "TAMIL",
 };
 #define N_WORDS ((int)(sizeof WORDS / sizeof WORDS[0]))
 
@@ -446,7 +427,10 @@ static const uint8_t font_5x7[256][7] = {
 
 #define FONT_W 5
 #define FONT_H 7
-#define FONT_KERN 1     /* cells between letters */
+#define FONT_KERN 3     /* cells between letters — wider gap so the
+                         * letters read clearly (each glyph is 5 cells
+                         * wide; a 1-cell kern made adjacent strokes
+                         * blur into each other) */
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -565,13 +549,54 @@ static void scene_clear_particles(Scene *s)
     for (int i = 0; i < MAX_PARTICLES; i++) s->particles[i].active = false;
 }
 
-/*
- * scene_build_targets — walk the active word's pixels and fill in the
- * target positions for each "on" pixel. Centres the word horizontally
- * and vertically. Caches centre / width on Scene.
- *
- * Returns the number of targets emitted.
- */
+/* ── Bitmap → target list helpers ────────────────────────────────── */
+
+/* Horizontal position → 8-step ramp slot (left = 0, right = 7).
+ * The whole word inherits the left-to-right gradient; every replica
+ * of one lit pixel shares the same slot. */
+static inline int target_color_slot(float pixel_x, float start_x, int word_w)
+{
+    float frac = (pixel_x - start_x) / (float)(word_w > 1 ? word_w - 1 : 1);
+    int slot = (int)(frac * 7.999f);
+    if (slot < 0) slot = 0;
+    if (slot > 7) slot = 7;
+    return slot;
+}
+
+/* Emit PARTICLES_PER_PIXEL targets for one lit font pixel.
+ *   replica 0     sits dead-centre at (px, py)
+ *   replicas 1..N get sub-cell jitter ±0.25 in x and y
+ * They all converge to (almost) the same spot during ASSEMBLE so the
+ * word reads as a single bright pixel; during DISSOLVE they fan out
+ * independently because each gets its own random initial velocity.
+ * Returns false when n_total has hit max_targets — caller short-circuits. */
+static bool target_emit_pixel_replicas(Scene *s,
+                                       float *out_x, float *out_y, int *out_slot,
+                                       int *n_total, int max_targets,
+                                       float px, float py, int slot)
+{
+    for (int rep = 0; rep < PARTICLES_PER_PIXEL; rep++) {
+        if (*n_total >= max_targets) return false;
+        float jx = (rep == 0) ? 0.0f : (lcg_unit(&s->rng) - 0.5f) * 0.5f;
+        float jy = (rep == 0) ? 0.0f : (lcg_unit(&s->rng) - 0.5f) * 0.5f;
+        out_x   [*n_total] = px + jx;
+        out_y   [*n_total] = py + jy;
+        out_slot[*n_total] = slot;
+        (*n_total)++;
+    }
+    return true;
+}
+
+/* ── Driver — rasterise the word into a target list ──────────────── */
+
+/* Pseudocode:
+ *   compute centred (start_x, start_y) for the whole word
+ *   for each character in word:
+ *       for each (row, col) in the 5×7 grid where the font bit is lit:
+ *           slot = horizontal-position → ramp slot
+ *           emit PARTICLES_PER_PIXEL targets for that pixel
+ *       advance char_x by FONT_W + FONT_KERN
+ *   cache word centre + width on the Scene (read by dissolve patterns) */
 static int scene_build_targets(Scene *s, const char *word,
                                float *out_targets_x,
                                float *out_targets_y,
@@ -579,13 +604,13 @@ static int scene_build_targets(Scene *s, const char *word,
                                int    max_targets)
 {
     int rows_eff = s->rows - 1;
-    int word_w = word_width_cells(word);
+    int word_w   = word_width_cells(word);
     float start_x = (float)(s->cols - word_w) * 0.5f;
     float start_y = (float)(rows_eff - FONT_H) * 0.5f;
 
-    int n_total = 0;
-    float char_x = start_x;
-    int n_chars = (int)strlen(word);
+    int n_total   = 0;
+    float char_x  = start_x;
+    int n_chars   = (int)strlen(word);
 
     for (int c = 0; c < n_chars; c++) {
         unsigned ch = (unsigned char)word[c];
@@ -594,21 +619,16 @@ static int scene_build_targets(Scene *s, const char *word,
         for (int row = 0; row < FONT_H; row++) {
             uint8_t b = bits[row];
             for (int col = 0; col < FONT_W; col++) {
-                if (b & (1 << (FONT_W - 1 - col))) {
-                    if (n_total >= max_targets) goto done;
-                    float tx = char_x + (float)col;
-                    float ty = start_y + (float)row;
-                    /* Colour slot from horizontal position in the word. */
-                    float frac = (float)(tx - start_x) / (float)(word_w > 1 ? word_w - 1 : 1);
-                    int slot = (int)(frac * 7.999f);
-                    if (slot < 0) slot = 0;
-                    if (slot > 7) slot = 7;
+                if (!(b & (1 << (FONT_W - 1 - col)))) continue;
 
-                    out_targets_x  [n_total] = tx;
-                    out_targets_y  [n_total] = ty;
-                    out_color_slots[n_total] = slot;
-                    n_total++;
-                }
+                float px = char_x + (float)col;
+                float py = start_y + (float)row;
+                int   slot = target_color_slot(px, start_x, word_w);
+
+                if (!target_emit_pixel_replicas(s,
+                        out_targets_x, out_targets_y, out_color_slots,
+                        &n_total, max_targets, px, py, slot))
+                    goto done;
             }
         }
         char_x += FONT_W + FONT_KERN;
@@ -620,106 +640,157 @@ done:
     return n_total;
 }
 
-/*
- * scene_load_word — build targets for the current word and reassign
- * particles. If new word needs more particles than currently active,
- * spawn more at random off-screen positions; if fewer, deactivate
- * the surplus.
- */
-static void scene_load_word(Scene *s)
+/* ── Particle inflow helpers ─────────────────────────────────────── */
+
+/* Spawn one particle at a random screen edge (top / left / right /
+ * bottom, ±3 cells beyond the visible region). vx = vy = 0 so the
+ * upcoming ASSEMBLE spring pulls it cleanly toward its target. */
+static inline void particle_spawn_at_edge(Particle *p, uint32_t *rng,
+                                          int cols, int rows)
 {
-    static float targets_x[MAX_PARTICLES];
-    static float targets_y[MAX_PARTICLES];
-    static int   color_slots[MAX_PARTICLES];
-
-    const char *word = WORDS[s->word_idx];
-    int n_targets = scene_build_targets(s, word,
-                                         targets_x, targets_y, color_slots,
-                                         MAX_PARTICLES);
-
-    /* Spawn new particles at random off-screen positions if needed. */
-    while (s->n_particles < n_targets) {
-        Particle *p = &s->particles[s->n_particles];
-        /* Random position around the screen edges. */
-        int edge = (int)(lcg_unit(&s->rng) * 4.0f);
-        float r1 = lcg_unit(&s->rng);
-        switch (edge) {
-        case 0: p->px = r1 * (float)s->cols; p->py = -3.0f; break;
-        case 1: p->px = -3.0f; p->py = r1 * (float)s->rows; break;
-        case 2: p->px = (float)s->cols + 3.0f;
-                p->py = r1 * (float)s->rows; break;
-        default: p->px = r1 * (float)s->cols;
-                 p->py = (float)s->rows + 3.0f; break;
-        }
-        p->vx = 0.0f;
-        p->vy = 0.0f;
-        p->active = true;
-        s->n_particles++;
+    int edge = (int)(lcg_unit(rng) * 4.0f);
+    float r1 = lcg_unit(rng);
+    switch (edge) {
+    case 0:  p->px = r1 * (float)cols;     p->py = -3.0f;             break;
+    case 1:  p->px = -3.0f;                p->py = r1 * (float)rows;  break;
+    case 2:  p->px = (float)cols + 3.0f;   p->py = r1 * (float)rows;  break;
+    default: p->px = r1 * (float)cols;     p->py = (float)rows + 3.0f; break;
     }
+    p->vx = 0.0f;
+    p->vy = 0.0f;
+    p->active = true;
+}
 
-    /* Deactivate surplus. */
-    for (int i = n_targets; i < s->n_particles; i++)
-        s->particles[i].active = false;
-    s->n_particles = n_targets;
-
-    /* Assign targets sequentially. */
-    for (int i = 0; i < n_targets; i++) {
-        Particle *p = &s->particles[i];
-        p->tx         = targets_x[i];
-        p->ty         = targets_y[i];
-        p->color_slot = color_slots[i];
+/* Grow the pool by spawning new edge-particles until n_particles == n_targets. */
+static void particle_pool_grow_to(Scene *s, int n_targets)
+{
+    while (s->n_particles < n_targets) {
+        particle_spawn_at_edge(&s->particles[s->n_particles],
+                               &s->rng, s->cols, s->rows);
+        s->n_particles++;
     }
 }
 
-/*
- * scene_apply_dissolve_velocity — give each particle an outward
- * velocity per the active dissolve pattern.
- */
+/* Shrink the pool by deactivating slots [n_targets, n_particles). */
+static void particle_pool_shrink_to(Scene *s, int n_targets)
+{
+    for (int i = n_targets; i < s->n_particles; i++)
+        s->particles[i].active = false;
+    s->n_particles = n_targets;
+}
+
+/* Sequential target assignment: particle[i] → target[i]. Cheap O(N)
+ * — optimal matching (Hungarian) would minimise total travel but is
+ * visually indistinguishable here; the varied paths actually look
+ * MORE organic than "everything moves the shortest distance". */
+static void particle_pool_assign_targets(Scene *s,
+                                         const float *tx, const float *ty,
+                                         const int *slot, int n)
+{
+    for (int i = 0; i < n; i++) {
+        Particle *p = &s->particles[i];
+        p->tx         = tx  [i];
+        p->ty         = ty  [i];
+        p->color_slot = slot[i];
+    }
+}
+
+/* ── Driver — load current word into the particle pool ───────────── */
+
+/* Pseudocode:
+ *   build target list for the active word
+ *   resize pool: grow with edge-spawns / shrink by deactivation
+ *   assign each particle its target position and colour slot */
+static void scene_load_word(Scene *s)
+{
+    static float targets_x  [MAX_PARTICLES];
+    static float targets_y  [MAX_PARTICLES];
+    static int   color_slots[MAX_PARTICLES];
+
+    int n_targets = scene_build_targets(s, WORDS[s->word_idx],
+                                        targets_x, targets_y, color_slots,
+                                        MAX_PARTICLES);
+
+    particle_pool_grow_to       (s, n_targets);
+    particle_pool_shrink_to     (s, n_targets);
+    particle_pool_assign_targets(s, targets_x, targets_y, color_slots, n_targets);
+}
+
+/* ── Dissolve-kick helpers (one per pattern) ─────────────────────── */
+
+/* Aspect-corrected radial unit vector pointing from word centre to
+ * the particle. If the particle is essentially AT the centre (r < 0.5)
+ * the direction is degenerate, so we pick a uniformly-random angle —
+ * keeps EXPLODE / SWIRL from producing zero-velocity outliers stuck
+ * at the centre. */
+static inline void particle_radial_unit(const Particle *p,
+                                        float cx, float cy, uint32_t *rng,
+                                        float *out_ux, float *out_uy)
+{
+    float dx = p->px - cx;
+    float dy = (p->py - cy) * ASPECT_Y;
+    float r  = sqrtf(dx * dx + dy * dy);
+    if (r < 0.5f) {
+        float ang = lcg_unit(rng) * 2.0f * (float)M_PI;
+        dx = cosf(ang);
+        dy = sinf(ang);
+        r  = 1.0f;
+    }
+    *out_ux = dx / r;
+    *out_uy = dy / r;
+}
+
+/* EXPLODE — radial outward velocity, magnitude EXPLODE_SPEED · [0.7, 1.3]. */
+static inline void particle_kick_explode(Particle *p, float ux, float uy, uint32_t *rng)
+{
+    float speed = EXPLODE_SPEED * (0.7f + lcg_unit(rng) * 0.6f);
+    p->vx = ux * speed;
+    p->vy = uy * speed / ASPECT_Y;
+}
+
+/* SWIRL — tangential velocity (radial rotated 90°), magnitude SWIRL_SPEED · [0.7, 1.3]. */
+static inline void particle_kick_swirl(Particle *p, float ux, float uy, uint32_t *rng)
+{
+    float speed = SWIRL_SPEED * (0.7f + lcg_unit(rng) * 0.6f);
+    p->vx = -uy * speed;                  /* perpendicular to radial */
+    p->vy =  ux * speed / ASPECT_Y;
+}
+
+/* RAIN — small horizontal scatter, strong downward velocity. */
+static inline void particle_kick_rain(Particle *p, uint32_t *rng)
+{
+    p->vx = (lcg_unit(rng) - 0.5f) * 6.0f;
+    p->vy = RAIN_SPEED * (0.7f + lcg_unit(rng) * 0.5f);
+}
+
+/* DRIFT — random isotropic scatter, magnitude DRIFT_SPEED. */
+static inline void particle_kick_drift(Particle *p, uint32_t *rng)
+{
+    p->vx = (lcg_unit(rng) - 0.5f) * 2.0f * DRIFT_SPEED;
+    p->vy = (lcg_unit(rng) - 0.5f) * 2.0f * DRIFT_SPEED / ASPECT_Y;
+}
+
+/* ── Driver — apply the dissolve kick to every active particle ───── */
+
+/* Pseudocode:
+ *   for each active particle:
+ *     compute aspect-corrected radial unit from word centre
+ *     dispatch to the pattern's per-particle kick function */
 static void scene_apply_dissolve_velocity(Scene *s)
 {
     for (int i = 0; i < s->n_particles; i++) {
         Particle *p = &s->particles[i];
         if (!p->active) continue;
 
-        /* Vector from word centre (aspect-corrected for radial calcs). */
-        float dx = p->px - s->word_cx;
-        float dy = (p->py - s->word_cy) * ASPECT_Y;
-        float r = sqrtf(dx * dx + dy * dy);
-        if (r < 0.5f) {
-            /* Particle effectively at centre — pick random direction. */
-            float ang = lcg_unit(&s->rng) * 2.0f * (float)M_PI;
-            dx = cosf(ang);
-            dy = sinf(ang);
-            r  = 1.0f;
-        }
-        float ux = dx / r;
-        float uy = dy / r;
+        float ux, uy;
+        particle_radial_unit(p, s->word_cx, s->word_cy, &s->rng, &ux, &uy);
 
         switch (s->current_pattern) {
-        case PATTERN_EXPLODE: {
-            float speed = EXPLODE_SPEED * (0.7f + lcg_unit(&s->rng) * 0.6f);
-            p->vx = ux * speed;
-            p->vy = uy * speed / ASPECT_Y;
-            break;
-        }
-        case PATTERN_SWIRL: {
-            float speed = SWIRL_SPEED * (0.7f + lcg_unit(&s->rng) * 0.6f);
-            /* Tangent direction: perpendicular to radial. */
-            p->vx = -uy * speed;
-            p->vy =  ux * speed / ASPECT_Y;
-            break;
-        }
-        case PATTERN_RAIN: {
-            p->vx = (lcg_unit(&s->rng) - 0.5f) * 6.0f;
-            p->vy = RAIN_SPEED * (0.7f + lcg_unit(&s->rng) * 0.5f);
-            break;
-        }
-        case PATTERN_DRIFT: {
-            p->vx = (lcg_unit(&s->rng) - 0.5f) * 2.0f * DRIFT_SPEED;
-            p->vy = (lcg_unit(&s->rng) - 0.5f) * 2.0f * DRIFT_SPEED / ASPECT_Y;
-            break;
-        }
-        case N_PATTERNS: break;
+        case PATTERN_EXPLODE: particle_kick_explode(p, ux, uy, &s->rng); break;
+        case PATTERN_SWIRL:   particle_kick_swirl  (p, ux, uy, &s->rng); break;
+        case PATTERN_RAIN:    particle_kick_rain   (p,         &s->rng); break;
+        case PATTERN_DRIFT:   particle_kick_drift  (p,         &s->rng); break;
+        case N_PATTERNS:      break;
         }
     }
 }
@@ -760,106 +831,174 @@ static void scene_reseed(Scene *s)
     scene_load_word(s);
 }
 
-static void scene_tick(Scene *s, float dt)
+/* ── Per-particle integrators (one step, one particle) ──────────── */
+
+/* Damped harmonic oscillator pull toward target:
+ *     fx = K · (tx − px) − D · vx                  (Hooke + viscous damping)
+ *     fy = K · (ty − py) / ASPECT_Y − D · vy        (aspect-corrected)
+ * HOLD phase adds Brownian jitter so the held word visibly breathes.
+ * Explicit Euler then advances v, then p — same v-then-p order used
+ * in the rest of the project's particle code (symplectic Euler). */
+static inline void particle_integrate_spring(Particle *p, float dt,
+                                             bool holding, uint32_t *rng)
 {
-    if (s->paused) return;
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    dt *= speed_mul;
+    float fx = SPRING_K * (p->tx - p->px) - SPRING_D * p->vx;
+    float fy = (SPRING_K * (p->ty - p->py)) / ASPECT_Y - SPRING_D * p->vy;
+    if (holding) {
+        fx += (lcg_unit(rng) - 0.5f) * HOLD_JITTER;
+        fy += (lcg_unit(rng) - 0.5f) * HOLD_JITTER;
+    }
+    p->vx += fx * dt;
+    p->vy += fy * dt;
+    p->px += p->vx * dt;
+    p->py += p->vy * dt;
+}
 
-    s->phase_t += dt;
+/* Free-drift integration during DISSOLVE: linear drag on velocity,
+ * plus an extra gravity term for the RAIN pattern only. The drag
+ * factor is exp(-k·dt), pre-computed once per tick by the caller. */
+static inline void particle_integrate_drift(Particle *p, float drag, float dt,
+                                            bool gravity_on)
+{
+    if (gravity_on) p->vy += RAIN_GRAVITY * dt;
+    p->vx *= drag;
+    p->vy *= drag;
+    p->px += p->vx * dt;
+    p->py += p->vy * dt;
+}
 
-    /* Phase transitions. */
+/* ── Phase machine + layer drivers ───────────────────────────────── */
+
+/* Advance the phase timer and run the transition + entry hook when
+ * the current phase elapses. Phase ASSEMBLE → HOLD → DISSOLVE →
+ * ASSEMBLE (looping same scene; user keys advance word/theme/pattern). */
+static void scene_advance_phase_machine(Scene *s)
+{
     switch (s->phase) {
     case PHASE_ASSEMBLE:
         if (s->phase_t >= ASSEMBLE_DUR) {
-            s->phase = PHASE_HOLD;
+            s->phase   = PHASE_HOLD;
             s->phase_t = 0.0f;
         }
         break;
     case PHASE_HOLD:
         if (s->phase_t >= HOLD_DUR) {
-            s->phase = PHASE_DISSOLVE;
+            s->phase   = PHASE_DISSOLVE;
             s->phase_t = 0.0f;
-            scene_apply_dissolve_velocity(s);
+            scene_apply_dissolve_velocity(s);          /* entry hook */
         }
         break;
     case PHASE_DISSOLVE:
         if (s->phase_t >= DISSOLVE_DUR) {
-            /* Transition to next word: re-target, re-spawn, → ASSEMBLE. */
-            s->word_idx = (s->word_idx + 1) % N_WORDS;
+            /* Loop SAME (word, theme, pattern) — kill all particles
+             * so they respawn fresh at screen edges via scene_load_word.
+             * User keys r / t / n are what change the indices. */
+            scene_clear_particles(s);
             scene_load_word(s);
-            s->phase = PHASE_ASSEMBLE;
+            s->phase   = PHASE_ASSEMBLE;
             s->phase_t = 0.0f;
         }
         break;
     }
+}
 
-    /* Per-particle integration. */
-    if (s->phase == PHASE_DISSOLVE) {
-        /* Free drift with mild drag; RAIN gets gravity. */
-        float drag = expf(-DISSOLVE_DRAG * dt);
-        for (int i = 0; i < s->n_particles; i++) {
-            Particle *p = &s->particles[i];
-            if (!p->active) continue;
-            if (s->current_pattern == PATTERN_RAIN)
-                p->vy += RAIN_GRAVITY * dt;
-            p->vx *= drag;
-            p->vy *= drag;
-            p->px += p->vx * dt;
-            p->py += p->vy * dt;
-        }
-    } else {
-        /* ASSEMBLE / HOLD: damped spring toward target. */
-        float k = SPRING_K;
-        float d = SPRING_D;
-        for (int i = 0; i < s->n_particles; i++) {
-            Particle *p = &s->particles[i];
-            if (!p->active) continue;
-
-            float fx = k * (p->tx - p->px) - d * p->vx;
-            /* Aspect-correct y spring: cells are 2× taller, so a unit
-             * "displacement" in cells corresponds to ASPECT_Y phys units.
-             * Scale spring force by 1/ASPECT_Y so vertical settling
-             * looks balanced. */
-            float fy = (k * (p->ty - p->py)) / ASPECT_Y - d * p->vy;
-
-            if (s->phase == PHASE_HOLD) {
-                fx += (lcg_unit(&s->rng) - 0.5f) * HOLD_JITTER;
-                fy += (lcg_unit(&s->rng) - 0.5f) * HOLD_JITTER;
-            }
-
-            p->vx += fx * dt;
-            p->vy += fy * dt;
-            p->px += p->vx * dt;
-            p->py += p->vy * dt;
-        }
+/* Sweep the pool with the drift integrator (DISSOLVE phase). */
+static void scene_step_drift_layer(Scene *s, float dt)
+{
+    float drag = expf(-DISSOLVE_DRAG * dt);
+    bool  rain_gravity = (s->current_pattern == PATTERN_RAIN);
+    for (int i = 0; i < s->n_particles; i++) {
+        Particle *p = &s->particles[i];
+        if (!p->active) continue;
+        particle_integrate_drift(p, drag, dt, rain_gravity);
     }
 }
 
+/* Sweep the pool with the damped-spring integrator (ASSEMBLE / HOLD). */
+static void scene_step_spring_layer(Scene *s, float dt)
+{
+    bool holding = (s->phase == PHASE_HOLD);
+    for (int i = 0; i < s->n_particles; i++) {
+        Particle *p = &s->particles[i];
+        if (!p->active) continue;
+        particle_integrate_spring(p, dt, holding, &s->rng);
+    }
+}
+
+/* ── Driver — one simulation tick ────────────────────────────────── */
+
+/* Pseudocode:
+ *   if paused                       → no-op
+ *   dt *= speed multiplier
+ *   phase_t += dt
+ *   scene_advance_phase_machine     — handle phase transitions
+ *   if DISSOLVE → drift layer        else → spring layer */
+static void scene_tick(Scene *s, float dt)
+{
+    if (s->paused) return;
+    dt *= (float)s->speed / (float)SPEED_DEF;
+    s->phase_t += dt;
+
+    scene_advance_phase_machine(s);
+
+    if (s->phase == PHASE_DISSOLVE)
+        scene_step_drift_layer(s, dt);
+    else
+        scene_step_spring_layer(s, dt);
+}
+
+/* ── Per-particle render helpers ─────────────────────────────────── */
+
+/* Squared distance from particle to its target.  Used as a cheap
+ * proxy for "where in the phase arc is this particle" — settled
+ * vs. mid-flight vs. dispersed — without taking a sqrt. */
+static inline float particle_target_dist_sq(const Particle *p)
+{
+    float dx = p->tx - p->px;
+    float dy = p->ty - p->py;
+    return dx * dx + dy * dy;
+}
+
+/* Map distance² to (glyph, attr) using three tiers — gives the word
+ * a visible "settled / flying / dispersed" emphasis without needing
+ * a phase parameter:
+ *     d² <  1 → '*' A_BOLD     (on-target — settled bright pixel)
+ *     d² < 25 → '+' A_NORMAL   (mid-flight — assembling or dissolving)
+ *     else    → '.' A_DIM      (far — dispersed) */
+static inline void particle_phase_glyph(const Particle *p,
+                                        char *out_glyph, int *out_attr)
+{
+    float d2 = particle_target_dist_sq(p);
+    if      (d2 <  1.0f) { *out_glyph = '*'; *out_attr = A_BOLD;   }
+    else if (d2 < 25.0f) { *out_glyph = '+'; *out_attr = A_NORMAL; }
+    else                 { *out_glyph = '.'; *out_attr = A_DIM;    }
+}
+
+/* ── Driver — render all active particles ────────────────────────── */
+
+/* Pseudocode:
+ *   for each active particle:
+ *     round pixel position to a (ix, iy) cell
+ *     reject if outside drawable region (skip HUD rows)
+ *     pick glyph + attr from distance-to-target tier
+ *     paint with the gradient pair from the particle's slot */
 static void scene_draw(const Scene *s)
 {
     int rows_eff = s->rows - 1;
     for (int i = 0; i < s->n_particles; i++) {
         const Particle *p = &s->particles[i];
         if (!p->active) continue;
+
         int ix = (int)(p->px + 0.5f);
         int iy = (int)(p->py + 0.5f);
-        if (ix < 0 || ix >= s->cols) continue;
-        if (iy < 0 || iy >= rows_eff) continue;
+        if (ix < 0 || ix >= s->cols)   continue;
+        if (iy < 0 || iy >= rows_eff)  continue;
 
-        /* Glyph by phase: assembled = '*', flying = '+', dispersed = '.'.
-         * Approximate by distance to target. */
-        float dx = p->tx - p->px;
-        float dy = p->ty - p->py;
-        float d2 = dx * dx + dy * dy;
-        char  glyph;
-        int   attr;
-        if      (d2 < 1.0f)  { glyph = '*'; attr = A_BOLD;   }
-        else if (d2 < 25.0f) { glyph = '+'; attr = A_NORMAL; }
-        else                 { glyph = '.'; attr = A_DIM;    }
+        char glyph;
+        int  attr;
+        particle_phase_glyph(p, &glyph, &attr);
 
-        int slot = p->color_slot;
-        int pair = PAIR_RAMP_BASE + slot;
+        int pair = PAIR_RAMP_BASE + p->color_slot;
         attron(COLOR_PAIR(pair) | attr);
         mvaddch(iy, ix, (chtype)(unsigned char)glyph);
         attroff(COLOR_PAIR(pair) | attr);
@@ -902,6 +1041,20 @@ static const char *phase_str(Phase p)
     }
 }
 
+/*
+ * screen_draw — render the scene, then paint a two-layer HUD over it:
+ *
+ *   Row 0          STATUS LINE.  Bright yellow PAIR_HUD + A_BOLD.
+ *                  Live state: pattern (or PAUSED), theme, current
+ *                  word, phase (ASSEMBLE / HOLD / DISSOLVE), particle
+ *                  count, render fps, sim Hz, speed multiplier.
+ *   Row rows-1     KEY HINT LINE.  Bright cyan PAIR_HINT + A_BOLD.
+ *                  Every interactive key the demo accepts.
+ *
+ * Both rows are pre-filled with their pair colour so the coloured
+ * background spans the full width, and drawn AFTER scene_draw so
+ * particles never bleed through the bars.
+ */
 static void screen_draw(Screen *sc, const Scene *s,
                         double fps, int sim_fps)
 {
@@ -910,20 +1063,30 @@ static void screen_draw(Screen *sc, const Scene *s,
 
     const char *state_str = s->paused ? "PAUSED " : pattern_name(s->current_pattern);
 
-    char buf[220];
-    snprintf(buf, sizeof buf,
-             " PIXEL_DISSOLVE   %s   theme:%-8s   word:'%-8s'   phase:%s   N:%3d   "
-             "%5.1f fps  %3d Hz  speed:%-3d   "
-             "n/p:pat  t/T:theme  +/-:speed  spc:pause  r:next  q:quit ",
+    /* ── Top row: dynamic status ─────────────────────────────── */
+    char status[220];
+    snprintf(status, sizeof status,
+             " PIXEL_DISSOLVE   %s   theme:%-8s   word:'%-8s'   phase:%s   "
+             "N:%3d   %5.1f fps  %3d Hz  speed:%-3d ",
              state_str, themes[s->current_theme].name,
              WORDS[s->word_idx], phase_str(s->phase), s->n_particles,
              fps, sim_fps, s->speed);
 
-    int row = sc->rows - 1;
     attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    for (int x = 0; x < sc->cols; x++) mvaddch(row, x, ' ');
-    mvprintw(row, 0, "%s", buf);
+    for (int x = 0; x < sc->cols; x++) mvaddch(0, x, ' ');
+    mvprintw(0, 0, "%s", status);
     attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    /* ── Bottom row: every interactive key ───────────────────── */
+    const char *hints =
+        " q:quit  spc:pause  r:next-word  n/p:pattern  t/T:theme  "
+        "+/-:speed  ]/[:Hz ";
+
+    int hint_row = sc->rows - 1;
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    for (int x = 0; x < sc->cols; x++) mvaddch(hint_row, x, ' ');
+    mvprintw(hint_row, 0, "%s", hints);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }

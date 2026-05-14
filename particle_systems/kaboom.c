@@ -10,13 +10,17 @@
  *   - dt (delta-time) loop drives playback speed independently of CPU, render capped at 60 fps
  *   - SIGWINCH resize: rebuilds scene + restarts blast
  *   - Speed control:   ] = faster   [ = slower
- *   - Restart:         r = replay from frame 0
+ *   - Restart:         r = replay current theme+shape from frame 0
+ *   - Theme cycle:     t / T = next / previous theme (resets blast)
+ *   - Shape cycle:     n / N = next / previous shape (resets blast)
  *   - Clean signal / atexit teardown — terminal always restored
  *
  * Keys:
  *   q / ESC   quit
  *   ]  [      speed up / slow down
- *   r         replay
+ *   r         replay (same theme + shape)
+ *   t / T     next / previous theme  — resets blast immediately
+ *   n / N     next / previous shape  — resets blast immediately
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra kaboom.c -o kaboom -lncurses -lm
@@ -34,23 +38,87 @@
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
- * Algorithm      : 3-D debris particle system projected to 2-D terminal.
- *                  Each blob has (x, y, z) position and velocity in 3-D
- *                  space.  Per tick: vel.z += GRAVITY_Z; pos += vel×dt.
- *                  Perspective projection: screen_x = x / z, screen_y = y / z.
+ * Algorithm      : Two-layer 3-D explosion drawn into a single 2-D
+ *                  Cell back-buffer. Layer A (wave_layer_render) is a
+ *                  scalar field over the screen grid: an aspect-corrected
+ *                  radius modulated by a cos(petal_n·θ) lobe term, sampled
+ *                  per frame to pick a glyph from flash_chars/wave_chars.
+ *                  Layer B (blob_layer_render) is NUM_BLOBS=800 unit
+ *                  directions on a sphere, projected through a pinhole
+ *                  camera. Blobs carry no velocity — position(t) is
+ *                  synthesised as direction · (frame-6) · blob_speed,
+ *                  so the blob array is read-only after init.
  *
- * Math           : Perspective (pin-hole camera) projection: objects farther
- *                  away (larger z) appear smaller.  Depth sorting not needed
- *                  for an explosion since fragments don't occlude each other.
- *                  Rotation matrix applied to initial velocity vectors to
- *                  produce the radial burst pattern in 3-D.
+ * Math           : Pinhole perspective: cx = cols/2 + bx·P/(bz+P)
+ *                  (perspective_project). Aspect-corrected radius
+ *                  √(x² + 4y²) so circles look circular on 2:1 cells
+ *                  (aspect_radius). Petal modulation 1+ripple·cos(n·θ)
+ *                  with a smooth-ring guard at petal_n ≤ 0 (petal_lobe).
+ *                  No depth sorting — last-writer-wins in the cell
+ *                  buffer (blob_layer runs after wave_layer) is enough
+ *                  for an explosion since fragments don't occlude.
  *
- * Performance    : Fixed-size blob pool (N_BLOBS) allocated once; no dynamic
- *                  memory.  dt loop: sim runs at SIM_FPS, render capped at 60 fps.
+ * Performance    : Fixed NUM_BLOBS=800-entry pool reused every frame
+ *                  (no per-frame allocation). The only malloc/calloc in
+ *                  the hot path is Blast.cells, sized cols×rows and
+ *                  released on resize/reset. dt loop: sim runs at
+ *                  SIM_FPS (5–60 Hz), render capped at 60 fps.
  *
- * Rendering      : Blob character selected from a set based on z-depth
- *                  (farther → smaller char); brightness decreases with age.
- *                  Frame buffer written to terminal in a single pass each frame.
+ * Rendering      : Drop glyph picked by depth bucket (blob_depth_bucket):
+ *                  near '@' COL_BLOB_N, mid 'o' COL_BLOB_M, far '.' COL_BLOB_F.
+ *                  Wave glyph picked from the per-shape ramp by
+ *                  (frame − r − 7). All writes go into Cell[] first;
+ *                  blast_draw walks the array and emits one ncurses
+ *                  call per painted cell — empty cells (ch==0) are
+ *                  skipped so the black background needs no fill.
+ *
+ * References
+ * ──────────
+ *   PAPERS
+ *     Reeves, W. T. (1983)
+ *       "Particle Systems — A Technique for Modeling a Class of Fuzzy Objects"
+ *       ACM Transactions on Graphics 2(2): 91-108.
+ *       Foundational paper.  The fixed-size particle pool, the
+ *       stochastic spawn distribution, and the per-particle screen
+ *       projection are all from this paper.  We collapse Reeves'
+ *       per-tick Euler integration into a closed-form position(t) =
+ *       direction · (frame-6) · blob_speed because the only force is
+ *       constant outward velocity — no need to carry vy/dt state.
+ *       §4 of the paper covers fire/explosion specifically.
+ *
+ *     Sims, K. (1990)
+ *       "Particle Animation and Rendering Using Data Parallel Computation"
+ *       SIGGRAPH '90 Proceedings: 405-413.
+ *       Extends Reeves with parallel update + rendering; the
+ *       per-particle independent update we use is the (trivial-case)
+ *       data-parallel pattern Sims formalises.
+ *
+ *   BOOKS
+ *     Knuth, D. E. — "The Art of Computer Programming, Vol. 2:
+ *       Seminumerical Algorithms" (3rd ed, Addison-Wesley, 1997).
+ *       §3.2.1 — analysis of linear congruential generators; the
+ *       multiplier 1488248101 + increment 981577151 used by prng()
+ *       are an LCG of exactly the form Knuth studies.
+ *
+ *     Foley, J. D., van Dam, A., Feiner, S. K. & Hughes, J. F. —
+ *       "Computer Graphics: Principles and Practice" (3rd ed,
+ *       Addison-Wesley, 2013).  §6.5 — pinhole-camera / perspective
+ *       projection; the cx = cols/2 + bx · P/(bz + P) formula is the
+ *       discrete-pixel form of the textbook division-by-z.
+ *
+ *     Akenine-Möller, T., Haines, E. & Hoffman, N. —
+ *       "Real-Time Rendering" (4th ed, CRC Press, 2018).
+ *       §4.7 covers projection matrices end-to-end; §13.7 covers
+ *       point-sprite particle rendering, the depth-bucket glyph
+ *       selection (`.` / `o` / `@`) here is the ASCII analogue of
+ *       size-by-depth point sprites.
+ *
+ *     Press, W. H., Teukolsky, S. A., Vetterling, W. T. & Flannery,
+ *       B. P. — "Numerical Recipes" (3rd ed, Cambridge UP, 2007).
+ *       §7.1 — quality criteria for random number generators and the
+ *       LCG family in particular; useful for understanding why this
+ *       simple prng() is adequate for visual noise but unsuitable
+ *       for Monte-Carlo work.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -58,135 +126,86 @@
  *
  * CORE IDEA
  * ─────────
- * A blast is two layers stacked.  Layer A is a 2-D shockwave: at each
- * cell (x,y) compute r=sqrt(x²+(2y)²), apply a petal modulation
- * cos(petal_n·atan2), and shade the cell from the wave_chars or
- * flash_chars string by `frame − r`.  Layer B is 800 3-D point blobs
- * pre-distributed on a unit sphere, flying outward at speed × frame,
- * projected to the screen by pinhole perspective (cx = bx · P/(bz+P)).
- * Both layers are drawn into a single Cell[] grid, then blitted.  A
- * cycle lasts NUM_FRAMES=150 ticks; on completion (or `r`) the
- * theme + shape index advances and the blast restarts.
+ * A blast is two layers stacked.  Layer A (wave_layer_render) is a
+ * 2-D shockwave: at each cell (x,y) compute r = √(x² + 4y²)
+ * (aspect_radius), apply a petal modulation 1 + ripple·cos(petal_n·θ)
+ * (petal_lobe), and shade the cell from wave_chars / flash_chars
+ * indexed by (frame − r − 7).  Layer B (blob_layer_render) is
+ * NUM_BLOBS=800 3-D point blobs pre-distributed on a unit sphere,
+ * flying outward at direction · (frame-6) · blob_speed, projected to
+ * the screen by pinhole perspective cx = bx·P/(bz+P)
+ * (perspective_project).  Both layers paint into a single Cell[]
+ * back-buffer; blast_draw blits the non-empty entries.  A cycle lasts
+ * NUM_FRAMES=150 ticks.  Auto-end of cycle advances theme + shape;
+ * key 'r' replays the same theme+shape; t / n advance one of them
+ * independently and reset the blast immediately.
  *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine looking head-on at a soap bubble that's exploded outward.
- * The 2-D layer is like a chalk drawing growing on a flat plate —
- * a circle (or 6-pointed star, or 12-petal flower depending on
- * petal_n) thickens outward each frame, with hot inner glyphs and
- * cooler outer glyphs.  The 3-D layer is like a fistful of glitter
- * thrown at a window: each piece flies in its own straight line
- * through 3-space and hits the glass at its own (cx,cy) — far
- * pieces are little dots `.`, mid pieces are `o`, near pieces are
- * `@`.  Each frame, the chalk drawing expands by `disc_speed`
- * cells, the glitter flies outward by `blob_speed` units, and you
- * print whichever layer wrote to that cell last.
- *
- * ALGORITHM IN STEPS  (per tick)
+ * ALGORITHM IN STEPS  (each step = one helper in §4 / §5)
  * ──────────────────
- *  Initial setup:
- *    1. Pre-generate NUM_BLOBS=800 random unit-sphere points (rejection-
- *       free: pick (bx,by,bz) ∈ [-1,1]³, divide by norm, scale by
- *       1.3 + 0.2·rand).
- *    2. Pick theme (colour palette) and shape (petal_n, ripple, …).
+ *  Initial setup (per blast_init / app_reset_blast):
+ *    1. blob_init_pool → blob_sample_unit_direction (×NUM_BLOBS).
+ *       For each blob pick (bx,by,bz) ∈ [-1,1]³, divide by norm,
+ *       multiply y by 0.5 (oblate squish), scale by 1.3 + 0.2·rand.
+ *    2. Read pp = k_themes[theme_idx], sh = k_shapes[shape_idx].
  *
- *  Per frame:
- *    3. Clear cells.  Iterate (x,y) over [-cols/2, cols/2] × [-rows/2, rows/2].
- *    4. frame == 0:    plant a single '*' FLASH at (0,0).
- *    5. frame < 8:     filled disc — r = sqrt(x² + 4y²); if r < frame·disc_speed
- *                       paint '@' FLASH (the initial fireball).
- *    6. frame ≥ 8:    angular shape:
- *           angle = atan2(2y, x)
- *           lobe  = 1 + ripple · cos(petal_n · angle)         petal_n>0
- *           r     = sqrt(x² + 4y²) · (0.5 + prng/3 · lobe·0.3)
- *           v     = frame − r − 7
- *           if v < 0      → flash_chars[frame-8] (INNER)
- *           if v < waveN  → wave_chars[v]; INNER if v<waveN/2 else WAVE
- *    7. Blob layer (frame > 6):
- *           bx = blob.x · (frame-6) · blob_speed
- *           by = blob.y · (frame-6) · blob_speed · y_squash
- *           bz = blob.z · (frame-6) · blob_speed
- *           skip if bz < 5−persp or bz > persp
- *           cx = cols/2 + bx · persp / (bz + persp)
- *           cy = rows/2 + by · persp / (bz + persp)
- *           glyph = '.' if bz>0.8·persp; 'o' if bz>-0.4·persp; else '@'
- *           colour = COL_BLOB_F / _M / _N by depth.
- *    8. Blit cells to stdscr.  Advance frame.  At frame == NUM_FRAMES,
- *       cycle++; restart with (cycle % THEMES, cycle % SHAPES).
+ *  Per frame (blast_render_frame):
+ *    3. wave_layer_render: sweep (x,y) over [-cols/2, +cols/2] ×
+ *       [-rows/2, +rows/2], cell_clear each slot, then branch on frame:
+ *    4.   frame == 0   → cell_paint_origin_flash: single '*' FLASH
+ *                        at (0,0).
+ *    5.   frame  < 8   → cell_paint_disc: aspect_radius < frame·disc_speed
+ *                        → '@' FLASH (the initial fireball).
+ *    6.   frame ≥ 8   → cell_paint_shockwave:
+ *           lobe = petal_lobe(x, y, petal_n, ripple)
+ *           r    = aspect_radius(x,y) · (0.5 + prng/3 · lobe · 0.3)
+ *           v    = frame − r − 7
+ *           v < 0      → flash_chars[frame-8] (INNER colour)
+ *           v < waveN  → wave_chars[v]; INNER half / WAVE half.
+ *    7. blob_layer_render (only when frame > 6): for each blob,
+ *       blob_paint_projected:
+ *           bx,by,bz = blob.{x,y·y_squash,z} · (frame-6) · blob_speed
+ *           skip if bz outside [5-persp, persp]
+ *           cx,cy = cols/2,rows/2 + perspective_project(b{x,y}, bz, P)
+ *           skip if outside the screen rectangle
+ *           blob_depth_bucket: bz > 0.8·P → '.' COL_BLOB_F,
+ *                              bz > -0.4·P → 'o' COL_BLOB_M,
+ *                              else       → '@' COL_BLOB_N.
+ *
+ *  Per frame (after blast_tick advances `frame`):
+ *    8. blast_draw → cell_blit per painted cell. Empty cells (ch==0)
+ *       are skipped so the black background needs no fill pass.
+ *    9. At frame == NUM_FRAMES, blast_tick returns false; the main
+ *       loop bumps theme_idx + shape_idx (each mod its COUNT) and
+ *       calls app_reset_blast which goes back to step 1.
  *
  * KEY FORMULAS
  * ────────────
- *  Aspect-corrected radius:
+ *  Aspect-corrected radius    (aspect_radius):
  *      r  = sqrt(x² + 4·y²)            terminal cells 2× tall as wide
  *
- *  Disc growth (frames 1..7):
+ *  Disc growth (frames 1..7)  (cell_paint_disc):
  *      r  < frame · disc_speed         filled '@' fireball
  *
- *  Angular petal modulation:
+ *  Angular petal modulation   (petal_lobe + cell_paint_shockwave):
  *      angle = atan2(2y + ε, x + ε)
  *      lobe  = 1 + ripple · cos(petal_n · angle)
  *      r     = base_r · (0.5 + prng/3 · lobe · 0.3)
  *      v     = frame − r − 7           ramp index into wave_chars
  *
- *  Pinhole projection (3-D blobs to 2-D screen):
+ *  Pinhole projection         (perspective_project):
  *      cx = cols/2 + bx · P / (bz + P)
  *      cy = rows/2 + by · P / (bz + P)
  *      with P = sh.persp ∈ {25..80}
  *
- *  Blob outward velocity (per frame):
- *      bx = sphere.x · (frame−6) · blob_speed
- *      by = sphere.y · (frame−6) · blob_speed · y_squash
- *      bz = sphere.z · (frame−6) · blob_speed
+ *  Blob outward sweep         (blob_paint_projected, no per-tick state):
+ *      bx = blob.x · (frame−6) · blob_speed
+ *      by = blob.y · (frame−6) · blob_speed · y_squash
+ *      bz = blob.z · (frame−6) · blob_speed
  *
- *  Depth → glyph:
+ *  Depth → glyph              (blob_depth_bucket):
  *      bz > 0.8·P  → '.' COL_BLOB_F   (far, small)
  *      bz > -0.4·P → 'o' COL_BLOB_M   (middle)
  *      else        → '@' COL_BLOB_N   (near, big)
- *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • Custom prng(): the LCG seed is `static long long s = 1` — never
- *    re-seeded.  Every blast renders the same blob distribution.  This
- *    is intentional (deterministic look) but means the same blast
- *    pattern repeats; only the theme/shape varies between cycles.
- *  • Off-by-one on minx/maxx: the frame buffer iterates (x,y) over
- *    [−cols/2, cols+minx−1] which equals [−cols/2, +cols/2−1] for
- *    even cols, slightly asymmetric for odd.  Cells written off the
- *    grid would corrupt memory — the bounds clamp prevents that.
- *  • Aspect factor `4·y²` (not `y²`): without the ×4, the blast would
- *    look like a vertical ellipse on a typical 2:1 cell-aspect terminal.
- *  • Layer ordering: blobs draw AFTER the wave, so blobs overwrite
- *    wave glyphs at the same cell.  This is desired — blobs always
- *    pop on top of the shockwave.
- *  • Petal_n = 0 path: cos(0·angle) = 1, but a guard `petal_n > 0`
- *    skips the multiply so the smooth-sphere shape ("ring") looks
- *    perfectly round, no angular ripple.
- *  • At frame > NUM_FRAMES, blast_tick returns false and the main loop
- *    cycles to the next theme/shape via `app->cycle++`.  cycle is an
- *    int — at int max it wraps to negative and `% N` becomes -1; in
- *    practice the loop is bounded by user runtime, never an issue.
- *  • Replay key 'r' increments cycle but does NOT change blob seed,
- *    so blob pattern repeats.  Theme and shape change.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Frame-by-frame at SIM_FPS=5: the disc grows from frame 0 to 7,
- *    then the wave starts emitting from frame 8, then blobs join in
- *    from frame > 6.  Three-stage emergence should be visible.
- *  • Theme cycle 'r': fire → ice → poison → plasma → gold → blood →
- *    fire.  6 themes total.  Background stays black; only foreground
- *    chars change colour.
- *  • Shape cycle 'r' (same key advances both): classic → star → ring →
- *    cross → nova → pulse → classic.  6 shapes total.  Star has 6
- *    visible lobes; cross has 4; ring is smooth circle; nova has 12.
- *  • Symmetry: at frame 30+, the wave_chars layer should be (k-fold)
- *    rotationally symmetric for petal_n ∈ {4, 6, 8, 12, 16}.  Count
- *    petals to verify petal_n.
- *  • Blob count: at full expansion (frame ~30) you can roughly count
- *    visible '@'/o/. characters — should be on the order of a few
- *    hundred (some blobs are off-screen or culled by z-bounds).
- *  • Restart 'r' resets frame to 0 and advances theme+shape cycle.
- *    NUM_FRAMES auto-restart after 150 ticks (5 s at 30 Hz).
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -264,23 +283,70 @@ typedef enum {
     COL_BLOB_F = 4,
     COL_BLOB_M = 5,
     COL_BLOB_N = 6,
-    COL_HUD    = 7,
+    COL_HUD    = 7,    /* top-row status bar — bright yellow on black  */
+    COL_HINT   = 8,    /* bottom-row key hints — bright cyan on black  */
 } ColorID;
 
 /*
- * BlastTheme — one colour set for a full blast cycle.
+ * BlastTheme — one colour palette for an entire blast cycle.
  *
- * Each theme has 5 blast colours (FLASH, INNER, WAVE, BLOB_F, BLOB_M,
- * BLOB_N) in 256-color xterm indices, plus 8-color fallbacks.
- * A theme name appears in the HUD so you can see which is active.
+ * Each theme defines six foreground colours (FLASH, INNER, WAVE,
+ * BLOB_F, BLOB_M, BLOB_N) as 256-colour xterm indices, plus an
+ * 8-colour fallback set so terminals without 256-colour support
+ * still get a sensible look (chosen automatically via the COLORS >=
+ * 256 branch in color_theme_apply). Background is always COLOR_BLACK
+ * so blast glyphs read cleanly against the dark frame.
  *
- * Themes:
- *   0 fire    — classic orange/red (original look)
- *   1 ice     — white core, cyan body, blue shockwave
- *   2 poison  — white flash, bright green inner, dark green wave
- *   3 plasma  — white flash, magenta inner, purple wave
- *   4 gold    — white flash, bright yellow, dark amber wave
- *   5 blood   — white flash, red inner, dark crimson wave
+ * Roles, from hottest to coolest:
+ *   FLASH   = the initial '@'/'*' fireball — usually pure white so
+ *             A_BOLD makes it punch.
+ *   INNER   = the pre-wave bright region rendered with flash_chars.
+ *   WAVE    = the trailing shockwave rendered with wave_chars.
+ *   BLOB_F  = far 3-D debris (depth glyph '.') — usually washed out.
+ *   BLOB_M  = mid-depth 3-D debris (depth glyph 'o').
+ *   BLOB_N  = near 3-D debris (depth glyph '@') — usually saturated.
+ *
+ * Members:
+ *   name      : short label shown in the HUD. ≤ 8 chars to fit the
+ *               %-7s column without truncation.
+ *   flash     : 256-colour index for COL_FLASH (the initial fireball
+ *               and any cell painted in the pre-wave disc phase).
+ *               White (231) for almost every theme — the bright punch
+ *               at frame 0 reads best as pure white regardless of
+ *               theme so the eye is drawn to the centre.
+ *   inner     : 256-colour index for COL_INNER (the bright body of
+ *               the wave). The "theme colour" most viewers will
+ *               identify the blast by — green for MATRIX, orange for
+ *               FIRE, etc.
+ *   wave      : 256-colour index for COL_WAVE (the trailing edge of
+ *               the shockwave). Usually a DARKER, COOLER variant of
+ *               `inner` so the wave reads as fading outward.
+ *   blob_f    : COL_BLOB_F — far-depth debris glyph. Often white or
+ *               pale so distant chunks look bright + tiny against
+ *               the dark.
+ *   blob_m    : COL_BLOB_M — middle-depth debris.
+ *   blob_n    : COL_BLOB_N — near-depth debris. Usually the
+ *               saturated/dark end of the palette so close debris
+ *               reads as heavy and 'in the foreground'.
+ *   f8_flash  : 8-colour fallback for FLASH (typically COLOR_WHITE).
+ *   f8_inner  : 8-colour fallback for INNER.
+ *   f8_wave   : 8-colour fallback for WAVE.
+ *   f8_bm     : 8-colour fallback for BLOB_M.
+ *   f8_bn     : 8-colour fallback for BLOB_N. (BLOB_F reuses
+ *               f8_flash in color_theme_apply since the 8-colour
+ *               palette has no "pale" variant.)
+ *
+ * Themes (cycle order on `t`; `T` reverses):
+ *   0 MATRIX   — digital green rain: white flash, lime inner, dark green wave
+ *   1 FIRE     — classic orange/red: white flash, orange inner, amber wave
+ *   2 OCEANIC  — deep sea: white flash, pale aqua inner, teal wave
+ *   3 NEON     — retro arcade: white flash, hot pink inner, purple wave
+ *   4 MONO     — grayscale: white flash through gray ramp
+ *   5 ICE      — frozen: white flash, bright cyan inner, blue wave
+ *   6 NOVA     — supernova: white flash, yellow inner, orange-red wave
+ *   7 FOREST   — woodland: cream flash, lime inner, dark olive wave
+ *   8 DESERT   — sand storm: cream flash, sandy peach inner, brown wave
+ *   9 ECLIPSE  — bloodmoon: white flash, orange inner, dark red wave
  */
 typedef struct {
     const char *name;
@@ -289,18 +355,27 @@ typedef struct {
 } BlastTheme;
 
 static const BlastTheme k_themes[] = {
-    { "fire",   231, 214,  94, 250, 220, 196,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_RED,    COLOR_YELLOW, COLOR_RED    },
-    { "ice",    231,  51,  21, 195, 123,  27,
-      COLOR_WHITE, COLOR_CYAN,   COLOR_BLUE,   COLOR_CYAN,   COLOR_BLUE   },
-    { "poison", 231,  82,  28, 193, 118,  34,
-      COLOR_WHITE, COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN  },
-    { "plasma", 231, 201,  93, 225, 171, 129,
-      COLOR_WHITE, COLOR_MAGENTA,COLOR_MAGENTA,COLOR_MAGENTA,COLOR_MAGENTA},
-    { "gold",   231, 226, 136, 229, 214, 130,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_RED    },
-    { "blood",  231, 196,  88, 210, 160,  52,
-      COLOR_WHITE, COLOR_RED,    COLOR_RED,    COLOR_RED,    COLOR_RED    },
+    /* name       flash inner wave  blob_f blob_m blob_n   8-color: flash       inner          wave           bm             bn */
+    { "MATRIX",   231,  118,   40,  250,   154,    46,
+      COLOR_WHITE, COLOR_GREEN,   COLOR_GREEN,   COLOR_GREEN,   COLOR_GREEN   },
+    { "FIRE",     231,  214,   94,  250,   220,   196,
+      COLOR_WHITE, COLOR_YELLOW,  COLOR_RED,     COLOR_YELLOW,  COLOR_RED     },
+    { "OCEANIC",  231,  159,   31,  195,    87,    39,
+      COLOR_WHITE, COLOR_CYAN,    COLOR_BLUE,    COLOR_CYAN,    COLOR_BLUE    },
+    { "NEON",     231,  201,   93,  219,   207,   165,
+      COLOR_WHITE, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA },
+    { "MONO",     231,  253,  245,  251,   247,   244,
+      COLOR_WHITE, COLOR_WHITE,   COLOR_WHITE,   COLOR_WHITE,   COLOR_WHITE   },
+    { "ICE",      231,   51,   27,  195,   123,    39,
+      COLOR_WHITE, COLOR_CYAN,    COLOR_BLUE,    COLOR_CYAN,    COLOR_BLUE    },
+    { "NOVA",     231,  226,  202,  255,   220,   208,
+      COLOR_WHITE, COLOR_YELLOW,  COLOR_YELLOW,  COLOR_YELLOW,  COLOR_YELLOW  },
+    { "FOREST",   230,  154,   64,  230,   184,    70,
+      COLOR_WHITE, COLOR_GREEN,   COLOR_GREEN,   COLOR_YELLOW,  COLOR_GREEN   },
+    { "DESERT",   230,  223,  130,  230,   215,   172,
+      COLOR_WHITE, COLOR_YELLOW,  COLOR_RED,     COLOR_YELLOW,  COLOR_RED     },
+    { "ECLIPSE",  231,  208,   52,  250,   202,    88,
+      COLOR_WHITE, COLOR_RED,     COLOR_RED,     COLOR_RED,     COLOR_RED     },
 };
 
 #define THEME_COUNT (int)(sizeof k_themes / sizeof k_themes[0])
@@ -321,6 +396,7 @@ static void color_theme_apply(int t)
         init_pair(COL_BLOB_M, th->blob_m, COLOR_BLACK);
         init_pair(COL_BLOB_N, th->blob_n, COLOR_BLACK);
         init_pair(COL_HUD,    226,        COLOR_BLACK);
+        init_pair(COL_HINT,    51,        COLOR_BLACK);
     } else {
         init_pair(COL_FLASH,  th->f8_flash, COLOR_BLACK);
         init_pair(COL_INNER,  th->f8_inner, COLOR_BLACK);
@@ -329,6 +405,7 @@ static void color_theme_apply(int t)
         init_pair(COL_BLOB_M, th->f8_bm,   COLOR_BLACK);
         init_pair(COL_BLOB_N, th->f8_bn,   COLOR_BLACK);
         init_pair(COL_HUD,    COLOR_YELLOW, COLOR_BLACK);
+        init_pair(COL_HINT,   COLOR_CYAN,   COLOR_BLACK);
     }
 }
 
@@ -342,6 +419,26 @@ static void color_init(int theme)
 /* §4  blob                                                               */
 /* ===================================================================== */
 
+/*
+ * Blob — one piece of 3-D debris in the explosion's blob cloud.
+ *
+ * (x, y, z) is a UNIT DIRECTION from the blast centre, pre-sampled
+ * once per cycle in blob_init_pool (rejection-free sphere sampling:
+ * pick from [-1,1]³, divide by norm, scale by 1.3 + 0.2·rand). The
+ * Blob itself is never mutated after init — outward motion is
+ * synthesised every frame as position(t) = blob * (frame-6) *
+ * blob_speed, so the same pool feeds every tick at zero cost.
+ *
+ * Three doubles even though each blob ends up as a single cell,
+ * because the visible (cx, cy) comes from perspective division
+ * cx = bx · P/(bz + P) — both bx and bz need full precision. The z
+ * axis also drives the depth-bucket glyph (bz > 0.8·P → '.' far,
+ * > -0.4·P → 'o' mid, else → '@' near), so without it every blob
+ * would project at the same rate and the burst would read as flat
+ * 2-D fireworks. The y component is multiplied by sh.y_squash at
+ * render time, which lets the SAME sphere read as flat disc, sphere,
+ * or tall column per shape — no per-shape pool needed.
+ */
 typedef struct {
     double x, y, z;
 } Blob;
@@ -353,45 +450,103 @@ static double prng(void)
     return ((s % 65536) - 32768) / 32768.0;
 }
 
+/*
+ * blob_sample_unit_direction — sample one (oblate) unit direction.
+ *
+ *   1. Pick a random point (bx, by, bz) ∈ [-1, 1]³ from the LCG.
+ *   2. Divide by ‖(bx, by, bz)‖ to project onto the unit sphere.
+ *      This is rejection-free — accepts the cube-corner bias since
+ *      visually it's indistinguishable for an explosion.
+ *   3. Multiply y by 0.5 BEFORE storing → the cloud is squashed
+ *      vertically into an oblate spheroid, which renders better on
+ *      a 2:1-cell-aspect terminal where pure spheres look stretched.
+ *   4. Scale each axis by 1.3 + 0.2·rand so the cloud has a slight
+ *      radial thickness instead of every blob leaving at exactly
+ *      the same rate.
+ */
+static void blob_sample_unit_direction(Blob *out)
+{
+    double bx = prng();
+    double by = prng();
+    double bz = prng();
+    double br = sqrt(bx*bx + by*by + bz*bz);
+    out->x = (bx / br)         * (1.3 + 0.2 * prng());
+    out->y = (0.5 * by / br)   * (1.3 + 0.2 * prng());
+    out->z = (bz / br)         * (1.3 + 0.2 * prng());
+}
+
+/* Fill the pool with NUM_BLOBS independent direction samples. */
 static void blob_init_pool(Blob *blobs)
 {
-    for (int i = 0; i < NUM_BLOBS; i++) {
-        double bx = prng();
-        double by = prng();
-        double bz = prng();
-        double br = sqrt(bx*bx + by*by + bz*bz);
-        blobs[i].x = (bx / br) * (1.3 + 0.2 * prng());
-        blobs[i].y = (0.5 * by / br) * (1.3 + 0.2 * prng());
-        blobs[i].z = (bz / br) * (1.3 + 0.2 * prng());
-    }
+    for (int i = 0; i < NUM_BLOBS; i++)
+        blob_sample_unit_direction(&blobs[i]);
 }
 
 /*
- * BlastShape — per-cycle physical parameters that change the look.
+ * BlastShape — physical + visual knobs that distinguish one blast
+ * "shape" from another. blast_render_frame reads these every tick;
+ * the rendering algorithm itself never branches on shape index. Same
+ * code, six very different blasts — change shape via the n/N keys.
  *
- * petal_n      cos(petal_n * atan2(...)) — number of symmetry lobes.
- *              4 = cross, 6 = hex star, 8 = classic, 16 = spiky ring,
- *              1 = asymmetric teardrop, 0 = smooth sphere (no petals).
- * ripple       amplitude of the angular ripple (0 = smooth, 0.5 = very jagged)
- * disc_speed   how fast the initial disc expands (1.5 = slow, 3.0 = fast)
- * y_squash     vertical squash of the blob cloud (0.3 = flat disc, 1.0 = sphere,
- *              1.8 = tall column)
- * persp        perspective depth of the blob cloud (20 = flat, 80 = deep 3D)
- * blob_speed   how fast blobs fly outward (multiplied against i0)
- * flash_chars  character sequence for the initial fireball phase
- * wave_chars   character sequence for the expanding shockwave
- * name         shown in HUD
+ *   name        : short label shown in the HUD so the viewer can see
+ *                 which shape is active.
+ *   petal_n     : angular frequency of the cos(petal_n · atan2(2y,x))
+ *                 lobe modulation. INTEGER counts of lobes:
+ *                 0 = smooth ring (no angular modulation; cos drops out
+ *                     via the petal_n > 0 guard in blast_render_frame);
+ *                 1 = asymmetric teardrop; 4 = cross; 6 = hex-star;
+ *                 8 = classic; 12 = nova; 16 = spiky.
+ *                 Why a double? — passed to libm's cos() which wants
+ *                 a double anyway, and fractional values can give
+ *                 chaotic non-symmetric shapes if ever needed.
+ *   ripple      : amplitude of the angular ripple. 0 = perfectly
+ *                 smooth ring (the ring shape); 0.3 = subtle classic
+ *                 lobes; 0.6 = very jagged pulse. Multiplies the cos
+ *                 term so it controls how DEEPLY the lobes cut.
+ *   disc_speed  : cells/frame at which the initial fireball disc
+ *                 grows during frames 1..7 (the pre-wave bloom).
+ *                 1.5 = slow puff (star), 3.5 = explosive flash (nova).
+ *                 Picked together with the wave_chars length so the
+ *                 disc-to-wave handoff at frame 8 looks smooth.
+ *   y_squash    : vertical scale applied to blob.y at render time.
+ *                 0.3 = flat puck (ring); 1.0 = true sphere; 1.6 =
+ *                 tall column (star). Lets every shape reuse the
+ *                 same pre-sampled Blob pool but read as a different
+ *                 silhouette.
+ *   persp       : "P" in the pinhole projection cx = cols/2 + bx·P/(bz+P).
+ *                 SMALL persp (25 = pulse) flattens the cloud — every
+ *                 blob looks roughly the same size; LARGE persp (80
+ *                 = nova) opens up depth — near blobs balloon, far
+ *                 blobs shrink to dots. Also the z-cull bounds use
+ *                 persp directly (bz < 5-persp or bz > persp).
+ *   blob_speed  : outward velocity scale for the 3-D blob cloud.
+ *                 Multiplied against (frame - 6) so each blob travels
+ *                 at blob * blob_speed * (frame-6). 0.7 = slow drift
+ *                 (pulse); 1.6 = blast outward (nova). Tune together
+ *                 with persp so blobs don't all rocket off-screen
+ *                 before the shockwave catches up.
+ *   flash_chars : character ramp for the INNER pre-wave region
+ *                 (frames 8..8+len, color = COL_INNER). First char
+ *                 hottest, last char coolest; the index into this
+ *                 string is (frame - 8). Length controls how long
+ *                 the bright core lingers before the wave takes over.
+ *   wave_chars  : character ramp for the EXPANDING shockwave. Each
+ *                 cell looks up wave_chars[frame - r - 7]; the index
+ *                 grows with frame so the same cell cycles through
+ *                 the whole ramp as the wave sweeps past. First
+ *                 char = leading edge (faint), last char = trailing
+ *                 (densest). Length controls wave THICKNESS in cells.
  */
 typedef struct {
     const char *name;
-    double      petal_n;     /* angular frequency of lobes              */
-    double      ripple;      /* lobe amplitude                          */
-    double      disc_speed;  /* initial disc expansion rate             */
-    double      y_squash;    /* blob cloud vertical scale               */
-    double      persp;       /* blob perspective depth                  */
-    double      blob_speed;  /* blob outward velocity scale             */
-    const char *flash_chars; /* chars for inner fireball (frame 8-18)  */
-    const char *wave_chars;  /* chars for shockwave (20 levels)         */
+    double      petal_n;
+    double      ripple;
+    double      disc_speed;
+    double      y_squash;
+    double      persp;
+    double      blob_speed;
+    const char *flash_chars;
+    const char *wave_chars;
 } BlastShape;
 
 static const BlastShape k_shapes[] = {
@@ -439,19 +594,97 @@ static const BlastShape k_shapes[] = {
 /* §5  blast                                                              */
 /* ===================================================================== */
 
+/*
+ * Cell — one slot in the staging frame buffer Cell[cols*rows].
+ *
+ * The blast renders into this back-buffer first; only after every
+ * layer (disc, wave, blobs) has written does blast_draw blit the
+ * non-empty cells to stdscr. This decouples the layer-overlap logic
+ * ("last writer wins" — blobs paint on top of the wave because they
+ * loop second) from the ncurses I/O, so overlap resolution is plain
+ * memory writes. `ch == 0` is the empty sentinel: blast_draw tests
+ * `!c.ch` to skip cells no layer wrote, which is how the black
+ * background stays black without an explicit fill pass. `color` is
+ * a ColorID picked at write time; COL_FLASH additionally gets
+ * A_BOLD in blast_draw so the initial fireball pops brighter than
+ * everything else on screen.
+ */
 typedef struct {
     char    ch;
     ColorID color;
 } Cell;
 
+/*
+ * Blast — the entire simulation state for ONE explosion cycle.
+ * Allocated once at startup; torn down and rebuilt on resize and on
+ * theme/shape change (see app_reset_blast). blast_tick advances
+ * `frame`; blast_render_frame writes the wave + blobs into cells[];
+ * blast_draw blits the non-empty entries to stdscr.
+ *
+ *   blobs[NUM_BLOBS]
+ *           Pre-distributed 3-D debris cloud (see Blob). 800
+ *           unit-direction vectors, generated once per blast in
+ *           blob_init_pool. The LCG inside prng() never resets, so
+ *           successive blasts within one run get DIFFERENT
+ *           distributions — every cycle looks fresh.
+ *
+ *   cells   Pointer to a calloc'd Cell[cols*rows] back-buffer.
+ *           Allocated once per blast (one of the very few mallocs
+ *           in the program — see "Memory Allocation" in CLAUDE.md).
+ *           blast_render_frame fills it; blast_draw drains it. Kept
+ *           separate from stdscr so the layer-overlap logic
+ *           (wave-then-blobs, last-writer-wins) is plain memory
+ *           writes, not ncurses calls.
+ *
+ *   cols    Cached terminal column count at the moment of init/resize.
+ *           Used everywhere as the basis for the centred coordinate
+ *           system [-cols/2, +cols/2] in which the algorithm thinks.
+ *           Cached locally so the inner render loop never calls
+ *           getmaxyx() — that would re-read the terminfo state.
+ *
+ *   rows    Cached terminal row count (same role as cols, vertical).
+ *           The aspect-correction factor `4·y²` (terminal cells are
+ *           ~2× tall as wide) is applied at the radius computation
+ *           so a circle in cell-space looks circular on screen.
+ *
+ *   frame   Tick counter, 0..NUM_FRAMES-1. Drives the THREE stages
+ *           of the visual algorithm:
+ *             frame == 0     → single '*' FLASH at origin
+ *             frame  < 8     → filled disc fireball, radius
+ *                              = frame · disc_speed
+ *             frame >= 8     → angular shockwave + 3-D blobs
+ *           Also feeds the blob outward velocity formula (multiplied
+ *           by frame-6). When frame reaches NUM_FRAMES the cycle
+ *           ends; the main loop advances theme + shape and calls
+ *           app_reset_blast.
+ *
+ *   theme   Index into k_themes — selects the FLASH / INNER / WAVE /
+ *           BLOB_F / BLOB_M / BLOB_N colour-pair set. Mutated by
+ *           t / T keys or by the auto-end path; the value here is
+ *           "the palette currently being painted". Also displayed
+ *           in the HUD so the viewer can identify the active theme.
+ *
+ *   shape   Index into k_shapes — selects every per-shape parameter
+ *           (petal_n, ripple, disc_speed, y_squash, persp,
+ *           blob_speed, flash_chars, wave_chars). Mutated by n / N
+ *           keys or by the auto-end path. Decoupling shape from
+ *           theme lets the viewer e.g. watch all 10 colour palettes
+ *           on the same "classic" silhouette.
+ *
+ *   done    Sticky one-shot end-of-cycle flag set when frame reaches
+ *           NUM_FRAMES. blast_tick checks it on entry and returns
+ *           false immediately, signalling the main loop to schedule
+ *           an app_reset_blast (which clears `done` along with
+ *           everything else).
+ */
 typedef struct {
     Blob  blobs[NUM_BLOBS];
     Cell *cells;
     int   cols;
     int   rows;
     int   frame;
-    int   theme;    /* index into k_themes — changes each cycle        */
-    int   shape;    /* index into k_shapes — changes each cycle        */
+    int   theme;
+    int   shape;
     bool  done;
 } Blast;
 
@@ -479,7 +712,112 @@ static void blast_free(Blast *b)
     *b = (Blast){0};
 }
 
-static void blast_render_frame(Blast *b)
+/* ── Pure-math helpers ───────────────────────────────────────────── */
+
+/* Aspect-corrected radius — terminal cells are ~2× tall as wide, so
+ * y² is weighted ×4 to keep a circle in cell-space looking circular
+ * on screen. Used by both the disc layer (frames 1-7) and the
+ * shockwave layer (frames ≥ 8). */
+static inline double aspect_radius(int x, int y)
+{
+    return sqrt((double)(x * x) + 4.0 * (double)(y * y));
+}
+
+/* Angular lobe modulation: 1 + ripple·cos(petal_n · θ), with θ
+ * computed in the same aspect-corrected coordinate frame (2·y, x).
+ * The tiny + 0.01 offsets keep atan2 well-defined at the origin.
+ * petal_n ≤ 0 is the "smooth ring" guard — cos(0) = 1 would still
+ * add a constant amplitude bump, so we short-circuit to 1.0 to keep
+ * the ring perfectly round. */
+static inline double petal_lobe(int x, int y, double petal_n, double ripple)
+{
+    if (petal_n <= 0.0) return 1.0;
+    double angle = atan2((double)y * 2.0 + 0.01, (double)x + 0.01);
+    return 1.0 + ripple * cos(petal_n * angle);
+}
+
+/* Pinhole projection along one axis: b_screen = b · P / (bz + P).
+ * Called twice per blob, once each for x and y. The same P also
+ * appears in the z-cull bounds and the depth-bucket cutoffs. */
+static inline double perspective_project(double b, double bz, double persp)
+{
+    return b * persp / (bz + persp);
+}
+
+/* ── Per-cell painters (one cell, one frame phase) ───────────────── */
+
+/* Reset a cell to "empty". ch == 0 is the sentinel blast_draw uses to
+ * skip cells no layer wrote, which is how the black background stays
+ * black without an explicit fill pass. Default colour is COL_WAVE so
+ * callers only assign colour when they paint a different layer. */
+static inline void cell_clear(Cell *c)
+{
+    c->ch    = 0;
+    c->color = COL_WAVE;
+}
+
+/* Frame 0: plant a single bright '*' at the blast origin so the eye is
+ * drawn there before the disc bloom and shockwave take over. */
+static inline void cell_paint_origin_flash(Cell *c, int x, int y)
+{
+    if (x == 0 && y == 0) {
+        c->ch    = '*';
+        c->color = COL_FLASH;
+    }
+}
+
+/* Frames 1..7: filled '@' fireball disc growing at disc_speed cells
+ * per frame. Uniform colour, no angular modulation. The disc-to-wave
+ * handoff happens implicitly at frame == 8 when the caller switches
+ * to cell_paint_shockwave. */
+static inline void cell_paint_disc(Cell *c, int x, int y,
+                                   int frame, double disc_speed)
+{
+    if (aspect_radius(x, y) < (double)frame * disc_speed) {
+        c->ch    = '@';
+        c->color = COL_FLASH;
+    }
+}
+
+/* Frames ≥ 8: angular shockwave with petal-modulated radius.
+ *
+ *   r = aspect_radius · (0.5 + prng/3 · lobe · 0.3)
+ *   v = frame − r − 7              ramp index into the wave
+ *
+ *     v < 0          → INNER bright core, glyph = flash_chars[frame-8]
+ *     0 ≤ v < waveN  → wave_chars[v], INNER colour first half,
+ *                                     WAVE colour second half
+ *     v ≥ waveN      → cell stays empty (wave has passed this cell)
+ *
+ * The per-cell prng() call jitters the radius so the wave is not a
+ * perfectly regular curve — gives the explosion a noisy, organic edge. */
+static inline void cell_paint_shockwave(Cell *c, int x, int y, int frame,
+                                        const BlastShape *sh,
+                                        int flash_len, int wave_len)
+{
+    double lobe = petal_lobe(x, y, sh->petal_n, sh->ripple);
+    double r    = aspect_radius(x, y) * (0.5 + (prng() / 3.0) * lobe * 0.3);
+    int    v    = frame - (int)r - 7;
+
+    if (v < 0) {
+        int fi = frame - 8;
+        if (fi >= 0 && fi < flash_len) {
+            c->ch    = sh->flash_chars[fi];
+            c->color = COL_INNER;
+        }
+    } else if (v < wave_len) {
+        c->ch    = sh->wave_chars[v];
+        c->color = (v < wave_len / 2) ? COL_INNER : COL_WAVE;
+    }
+}
+
+/* ── Wave-layer driver (the (x, y) double loop) ──────────────────── */
+
+/* Sweep every cell in the screen-centred grid and paint whichever
+ * phase-of-blast applies for this frame. The frame-phase decision
+ * happens once per cell (cheap branch the predictor nails), so a
+ * single loop fans out into three distinct visual stages. */
+static void wave_layer_render(Blast *b)
 {
     const int cols  = b->cols;
     const int rows  = b->rows;
@@ -495,86 +833,88 @@ static void blast_render_frame(Blast *b)
     const int wave_len  = (int)strlen(sh->wave_chars);
 
     Cell *p = b->cells;
-
     for (int y = miny; y <= maxy; y++) {
         for (int x = minx; x <= maxx; x++) {
-
-            p->ch    = 0;
-            p->color = COL_WAVE;
-
-            if (frame == 0) {
-                if (x == 0 && y == 0) {
-                    p->ch    = '*';
-                    p->color = COL_FLASH;
-                }
-
-            } else if (frame < 8) {
-                /* Initial disc — speed controlled by disc_speed */
-                double r = sqrt((double)(x*x) + 4.0*(double)(y*y));
-                if (r < frame * sh->disc_speed) {
-                    p->ch    = '@';
-                    p->color = COL_FLASH;
-                }
-
-            } else {
-                /*
-                 * Blast wave — shape controlled by petal_n and ripple.
-                 * petal_n == 0 means a smooth sphere (no angular modulation).
-                 */
-                double angle = atan2(y * 2.0 + 0.01, x + 0.01);
-                double lobe  = (sh->petal_n > 0.0)
-                             ? (1.0 + sh->ripple * cos(sh->petal_n * angle))
-                             : 1.0;
-                double r = sqrt((double)(x*x) + 4.0*(double)(y*y))
-                         * (0.5 + (prng() / 3.0) * lobe * 0.3);
-
-                int v = frame - (int)r - 7;
-
-                if (v < 0) {
-                    if (frame < 8 + flash_len) {
-                        int fi = frame - 8;
-                        if (fi >= 0 && fi < flash_len) {
-                            p->ch    = sh->flash_chars[fi];
-                            p->color = COL_INNER;
-                        }
-                    }
-                } else if (v < wave_len) {
-                    p->ch    = sh->wave_chars[v];
-                    p->color = (v < wave_len / 2) ? COL_INNER : COL_WAVE;
-                }
-            }
-
+            cell_clear(p);
+            if      (frame == 0) cell_paint_origin_flash(p, x, y);
+            else if (frame  < 8) cell_paint_disc       (p, x, y, frame, sh->disc_speed);
+            else                 cell_paint_shockwave  (p, x, y, frame, sh,
+                                                        flash_len, wave_len);
             p++;
         }
     }
+}
 
-    /* 3-D debris blobs — y_squash and persp vary per shape */
-    if (frame > 6) {
-        const double persp  = sh->persp;
-        const double bspeed = sh->blob_speed;
-        const int    i0     = frame - 6;
+/* ── Per-blob painter and blob-layer driver ──────────────────────── */
 
-        for (int j = 0; j < NUM_BLOBS; j++) {
-            double bx = b->blobs[j].x * i0 * bspeed;
-            double by = b->blobs[j].y * i0 * bspeed * sh->y_squash;
-            double bz = b->blobs[j].z * i0 * bspeed;
+/* Resolve the depth-bucket glyph and colour for one blob based on its
+ * z-position relative to the perspective depth P.
+ *   bz >  0.8·P → '.' COL_BLOB_F  (far — distant dot)
+ *   bz > -0.4·P → 'o' COL_BLOB_M  (middle distance)
+ *   else        → '@' COL_BLOB_N  (near — bold lump)
+ */
+static inline void blob_depth_bucket(double bz, double persp,
+                                     char *out_glyph, ColorID *out_color)
+{
+    if      (bz >  persp * 0.8) { *out_glyph = '.'; *out_color = COL_BLOB_F; }
+    else if (bz > -persp * 0.4) { *out_glyph = 'o'; *out_color = COL_BLOB_M; }
+    else                        { *out_glyph = '@'; *out_color = COL_BLOB_N; }
+}
 
-            if (bz < 5.0 - persp || bz > persp) continue;
+/* Project one 3-D blob to a 2-D Cell, or cull it.
+ *   outward sweep:  position(t) = blob · (frame - 6) · blob_speed
+ *   y-squash:       by *= sh->y_squash  (per-shape silhouette)
+ *   z-cull:         keep only blobs with bz ∈ [5 - persp, persp]
+ *   projection:     cx = cols/2 + bx·P/(bz + P)  (likewise cy)
+ *   x/y bounds:     skip if the projected pixel falls off screen
+ *   depth glyph:    via blob_depth_bucket
+ * The single Cell write at the end overwrites whatever the wave layer
+ * left in that slot — this is the "blobs on top" layer ordering rule. */
+static void blob_paint_projected(const Blob *blob, Cell *cells,
+                                 int cols, int rows,
+                                 int frame, const BlastShape *sh)
+{
+    const double persp  = sh->persp;
+    const double bspeed = sh->blob_speed;
+    const int    t      = frame - 6;
 
-            int cx = cols / 2 + (int)(bx * persp / (bz + persp));
-            int cy = rows / 2 + (int)(by * persp / (bz + persp));
+    double bx = blob->x * t * bspeed;
+    double by = blob->y * t * bspeed * sh->y_squash;
+    double bz = blob->z * t * bspeed;
 
-            if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
+    if (bz < 5.0 - persp || bz > persp) return;
 
-            Cell *c  = &b->cells[cy * cols + cx];
-            c->color = (bz > persp * 0.8)  ? COL_BLOB_F
-                     : (bz > -persp * 0.4)  ? COL_BLOB_M
-                     :                         COL_BLOB_N;
-            c->ch    = (bz > persp * 0.8) ? '.'
-                     : (bz > -persp * 0.4) ? 'o'
-                     :                        '@';
-        }
+    int cx = cols / 2 + (int)perspective_project(bx, bz, persp);
+    int cy = rows / 2 + (int)perspective_project(by, bz, persp);
+    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+
+    Cell *c = &cells[cy * cols + cx];
+    blob_depth_bucket(bz, persp, &c->ch, &c->color);
+}
+
+/* Sweep the whole blob cloud and project each into the cell buffer.
+ * Called only when frame > 6 — earlier ticks belong entirely to the
+ * disc/origin-flash layers. Runs AFTER wave_layer_render so blobs
+ * overdraw the shockwave at any cell they both touch. */
+static void blob_layer_render(Blast *b)
+{
+    const BlastShape *sh = &k_shapes[b->shape];
+    for (int j = 0; j < NUM_BLOBS; j++) {
+        blob_paint_projected(&b->blobs[j], b->cells,
+                             b->cols, b->rows, b->frame, sh);
     }
+}
+
+/* ── Driver — pseudocode for one frame ──────────────────────────── */
+
+/* Render one frame into the cell buffer:
+ *   1. wave layer  — origin spark / disc / angular shockwave
+ *   2. blob layer  — 3-D debris (frame > 6), overdraws the wave
+ */
+static void blast_render_frame(Blast *b)
+{
+    wave_layer_render(b);
+    if (b->frame > 6) blob_layer_render(b);
 }
 
 static bool blast_tick(Blast *b)
@@ -592,30 +932,27 @@ static bool blast_tick(Blast *b)
     return true;
 }
 
-/*
- * blast_draw now takes WINDOW* so it works with stdscr or any window.
- */
+/* Blit one cell to the window if it was painted (ch != 0).
+ * COL_FLASH additionally turns on A_BOLD so the initial fireball
+ * and disc reads brighter than the wave / blob layers. */
+static inline void cell_blit(WINDOW *w, int x, int y, Cell c)
+{
+    if (!c.ch) return;
+    attr_t attr = COLOR_PAIR(c.color);
+    if (c.color == COL_FLASH) attr |= A_BOLD;
+    wattron(w, attr);
+    mvwaddch(w, y, x, (chtype)(unsigned char)c.ch);
+    wattroff(w, attr);
+}
+
+/* Walk the back-buffer and emit ncurses writes for every painted cell.
+ * Takes WINDOW* so the same routine drives stdscr or any sub-window. */
 static void blast_draw(const Blast *b, WINDOW *w)
 {
-    const int cols  = b->cols;
-    const int rows  = b->rows;
-    const int total = cols * rows;
-
-    for (int i = 0; i < total; i++) {
-        Cell c = b->cells[i];
-        if (!c.ch) continue;
-
-        int y = i / cols;
-        int x = i % cols;
-        if (x >= b->cols || y >= b->rows) continue;
-
-        attr_t attr = COLOR_PAIR(c.color);
-        if (c.color == COL_FLASH) attr |= A_BOLD;
-
-        wattron(w, attr);
-        mvwaddch(w, y, x, (chtype)(unsigned char)c.ch);
-        wattroff(w, attr);
-    }
+    const int cols = b->cols;
+    const int rows = b->rows;
+    for (int i = 0; i < cols * rows; i++)
+        cell_blit(w, i % cols, i / cols, b->cells[i]);
 }
 
 /* ===================================================================== */
@@ -671,20 +1008,43 @@ static void screen_draw_blast(Screen *s, const Blast *b)
     blast_draw(b, stdscr);
 }
 
+/*
+ * screen_draw_hud — paint a two-layer HUD over the blast:
+ *
+ *   Row 0          — STATUS LINE.  Bright yellow COL_HUD + A_BOLD.
+ *                    Shows theme, shape, frame counter, render fps, sim Hz.
+ *   Row rows-1     — KEY HINT LINE.  Bright cyan COL_HINT + A_BOLD.
+ *                    Lists every interactive key the demo accepts.
+ *
+ * Both rows are cleared with their pair colour first so the coloured
+ * background spans the full width. Drawn AFTER blast_draw so blast
+ * glyphs never bleed through.
+ */
 static void screen_draw_hud(Screen *s, double fps, int sim_fps,
                               int frame, int theme, int shape)
 {
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             "%4.1f fps [%s/%s] %d/%d",
-             fps, k_themes[theme].name, k_shapes[shape].name,
-             frame, NUM_FRAMES);
+    /* ── Top row: status ──────────────────────────────────────── */
+    char status[200];
+    snprintf(status, sizeof status,
+             " KABOOM   theme:%-7s   shape:%-8s   frame:%3d/%3d   "
+             "%4.1f fps  %2d Hz ",
+             k_themes[theme].name, k_shapes[shape].name,
+             frame, NUM_FRAMES, fps, sim_fps);
 
-    int hx = s->cols - HUD_COLS;
-    if (hx < 0) hx = 0;
     attron(COLOR_PAIR(COL_HUD) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
+    for (int x = 0; x < s->cols; x++) mvaddch(0, x, ' ');
+    mvprintw(0, 0, "%s", status);
     attroff(COLOR_PAIR(COL_HUD) | A_BOLD);
+
+    /* ── Bottom row: key hints (every interactive key) ────────── */
+    const char *hints =
+        " q:quit  r:replay  t/T:theme  n/N:shape  ]/[:speed ";
+
+    int hint_row = s->rows - 1;
+    attron(COLOR_PAIR(COL_HINT) | A_BOLD);
+    for (int x = 0; x < s->cols; x++) mvaddch(hint_row, x, ' ');
+    mvprintw(hint_row, 0, "%s", hints);
+    attroff(COLOR_PAIR(COL_HINT) | A_BOLD);
 }
 
 static void screen_present(void)
@@ -701,7 +1061,8 @@ typedef struct {
     Blast                 blast;
     Screen                screen;
     int                   sim_fps;
-    int                   cycle;      /* increments each restart → next theme */
+    int                   theme_idx;  /* live theme; t/T mutate, auto-end bumps */
+    int                   shape_idx;  /* live shape; n/N mutate, auto-end bumps */
     volatile sig_atomic_t running;
     volatile sig_atomic_t need_resize;
 } App;
@@ -712,13 +1073,21 @@ static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
 static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
+/* Restart the blast from frame 0 with the current theme + shape indices.
+ * Called by r, t, T, n, N, and the auto-end-of-cycle path. */
+static void app_reset_blast(App *app)
+{
+    blast_free(&app->blast);
+    blast_init(&app->blast, app->screen.cols, app->screen.rows,
+               app->theme_idx, app->shape_idx);
+}
+
 static void app_do_resize(App *app)
 {
     blast_free(&app->blast);
     screen_resize(&app->screen);
     blast_init(&app->blast, app->screen.cols, app->screen.rows,
-               app->cycle % THEME_COUNT,
-               app->cycle % SHAPE_COUNT);
+               app->theme_idx, app->shape_idx);
     app->need_resize = 0;
 }
 
@@ -737,11 +1106,25 @@ static bool app_handle_key(App *app, int ch)
         break;
 
     case 'r': case 'R':
-        app->cycle++;
-        blast_free(&app->blast);
-        blast_init(&app->blast, app->screen.cols, app->screen.rows,
-                   app->cycle % THEME_COUNT,
-                   app->cycle % SHAPE_COUNT);
+        app_reset_blast(app);
+        break;
+
+    case 't':
+        app->theme_idx = (app->theme_idx + 1) % THEME_COUNT;
+        app_reset_blast(app);
+        break;
+    case 'T':
+        app->theme_idx = (app->theme_idx + THEME_COUNT - 1) % THEME_COUNT;
+        app_reset_blast(app);
+        break;
+
+    case 'n':
+        app->shape_idx = (app->shape_idx + 1) % SHAPE_COUNT;
+        app_reset_blast(app);
+        break;
+    case 'N':
+        app->shape_idx = (app->shape_idx + SHAPE_COUNT - 1) % SHAPE_COUNT;
+        app_reset_blast(app);
         break;
 
     default: break;
@@ -758,15 +1141,15 @@ int main(void)
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
-    app->cycle   = 0;
+    App *app       = &g_app;
+    app->running   = 1;
+    app->sim_fps   = SIM_FPS_DEFAULT;
+    app->theme_idx = 0;
+    app->shape_idx = 0;
 
     screen_init(&app->screen);
     blast_init(&app->blast, app->screen.cols, app->screen.rows,
-               app->cycle % THEME_COUNT,
-               app->cycle % SHAPE_COUNT);
+               app->theme_idx, app->shape_idx);
 
     int64_t frame_time  = clock_ns();
     int64_t sim_accum   = 0;
@@ -794,11 +1177,9 @@ int main(void)
         sim_accum += dt;
         while (sim_accum >= tick_ns) {
             if (!blast_tick(&app->blast)) {
-                app->cycle++;
-                blast_free(&app->blast);
-                blast_init(&app->blast, app->screen.cols, app->screen.rows,
-                           app->cycle % THEME_COUNT,
-                           app->cycle % SHAPE_COUNT);
+                app->theme_idx = (app->theme_idx + 1) % THEME_COUNT;
+                app->shape_idx = (app->shape_idx + 1) % SHAPE_COUNT;
+                app_reset_blast(app);
             }
             sim_accum -= tick_ns;
         }

@@ -13,15 +13,16 @@
  *     Wind deflects the emitter spray so the stream leans.
  *
  *   Per-grain age — each grain accumulates age each tick it is
- *     stationary.  Age drives the visual character:
- *       newly falling / spawned   '`'  pale yellow   (airborne)
- *       just landed               '.'  pale yellow   (fresh)
- *       settling                  'o'  golden        (light pack)
- *       settled surface           'O'  amber         (mid pack)
- *       compressed mid            '0'  dark amber    (packed)
- *       deep compressed base      '#'  dark brown    (dense)
+ *     stationary.  Age drives both the GLYPH and the COLOUR RAMP:
+ *       newly falling / spawned   '`'  ramp[0]  (airborne / brightest)
+ *       just landed               '.'  ramp[1]  (fresh)
+ *       settling                  'o'  ramp[2]  (light pack)
+ *       settled surface           'O'  ramp[3]  (mid pack)
+ *       compressed mid            '0'  ramp[4]  (packed)
+ *       deep compressed base      '#'  ramp[5]  (dense / darkest)
  *     New grains are bright and individual.  Buried grains darken
- *     and show as dense packed material.
+ *     to dense packed material.  The actual ramp colours come from
+ *     the active theme (t / T cycle through 10 themes).
  *
  * Keys:
  *   q / ESC     quit
@@ -34,6 +35,7 @@
  *   w           wind right (press multiple times to strengthen)
  *   W           wind left
  *   0           calm — no wind
+ *   t  T        next / previous colour theme
  *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra sand.c -o sand -lncurses
@@ -80,6 +82,59 @@
  *                  where freshly fallen grains glow bright and gradually darken
  *                  as they become buried — analogous to porosity decreasing under
  *                  compressive weight in real granular materials.
+ *
+ * References
+ * ──────────
+ *   PAPERS
+ *     Bak, P., Tang, C. & Wiesenfeld, K. (1987)
+ *       "Self-Organized Criticality: An Explanation of 1/f Noise"
+ *       Physical Review Letters 59(4): 381-384.
+ *       The original sandpile cellular automaton.  Exactly the
+ *       topology grid_tick uses: a 2-D cell grid, a gravity-biased
+ *       rule applied tick-by-tick, avalanches of arbitrary size
+ *       emerging from local rules.  Reading this paper is the
+ *       cleanest path to seeing why the ~45° pile angle emerges
+ *       from a two-diagonal slide rule.
+ *
+ *     Wolfram, S. (1984)
+ *       "Cellular Automata as Models of Complexity"
+ *       Nature 311: 419-424.
+ *       Foundational CA paper. Frames the probabilistic update
+ *       order + shuffled column scan we use as a "stochastic CA",
+ *       a refinement of classical CAs that breaks directional
+ *       bias without changing the rule set.
+ *
+ *     Jaeger, H. M., Nagel, S. R. & Behringer, R. P. (1996)
+ *       "Granular solids, liquids, and gases"
+ *       Reviews of Modern Physics 68(4): 1259-1273.
+ *       Comprehensive review of granular-media physics.  §III
+ *       covers the angle of repose (real dry sand 30-35°; why
+ *       static and dynamic angles differ) — useful context for
+ *       understanding why our CA's ~45° is higher than the real
+ *       physical angle.
+ *
+ *   BOOKS
+ *     Wolfram, S. — "A New Kind of Science"
+ *       (Wolfram Media, 2002).  Chapter 6 covers CAs as models
+ *       for physical phenomena including granular flow; the
+ *       per-row column-shuffle trick used in grid_tick to remove
+ *       leftward drift bias is one of the refinements Wolfram
+ *       discusses.
+ *
+ *     Duran, J. — "Sands, Powders, and Grains: An Introduction
+ *       to the Physics of Granular Materials"
+ *       (Springer, 2000).  Definitive textbook on granular
+ *       physics.  Chapters 1-2 cover the angle of repose and
+ *       compaction under weight — direct support for the per-
+ *       grain age → ramp-tint visual encoding (older grains live
+ *       under more compaction → darker tint).
+ *
+ *     Bagnold, R. A. — "The Physics of Blown Sand and Desert Dunes"
+ *       (Methuen, 1941; reprinted Dover, 2005).
+ *       The classic on aeolian (wind-driven) sand transport.
+ *       §1-3 motivate why only LIGHT (young, age < AGE_SMALL)
+ *       grains drift in wind — heavier embedded grains resist
+ *       lift-off.  The same threshold our wind rule uses.
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
@@ -161,28 +216,74 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 enum {
-    CP_NEW    = 1,   /* very pale yellow — airborne / spawned           */
-    CP_GRAIN  = 2,   /* pale yellow      — freshly landed               */
-    CP_LIGHT  = 3,   /* golden           — settling                     */
-    CP_MID    = 4,   /* amber            — settled                      */
-    CP_PACK   = 5,   /* dark amber       — packed mid-layer             */
-    CP_DENSE  = 6,   /* dark brown       — compressed base              */
-    CP_SOURCE = 7,   /* bright yellow    — emitter marker               */
-    CP_WIND   = 8,   /* light blue       — wind indicator               */
+    CP_NEW    =  1,  /* ramp[0] — airborne / freshly spawned (brightest) */
+    CP_GRAIN  =  2,  /* ramp[1] — freshly landed                         */
+    CP_LIGHT  =  3,  /* ramp[2] — settling                               */
+    CP_MID    =  4,  /* ramp[3] — settled                                */
+    CP_PACK   =  5,  /* ramp[4] — packed mid-layer                       */
+    CP_DENSE  =  6,  /* ramp[5] — compressed base (darkest)              */
+    CP_SOURCE =  7,  /* bright yellow    — emitter marker                */
+    CP_WIND   =  8,  /* light blue       — wind indicator                */
+    PAIR_HUD  =  9,  /* top status bar    — bright yellow on black       */
+    PAIR_HINT = 10,  /* bottom key hints  — bright cyan   on black       */
 };
+
+/*
+ * Theme — one 6-step grain-age ramp: bright (just-landed / airborne)
+ * at ramp[0] → dark (compressed base) at ramp[5]. Selects the foreground
+ * colour for CP_NEW..CP_DENSE; CP_SOURCE / CP_WIND / HUD / HINT pairs
+ * stay theme-independent for consistent legibility.
+ *
+ * All entries sit in the BRIGHT HALF of the 256-colour cube per the
+ * CLAUDE.md "Theme Palette Brightness" rule (≥ 24 in cube, ≥ 240 in gray;
+ * 24-29 and 240-243 used only at the darkest ramp tier).
+ */
+typedef struct {
+    const char *name;
+    short       ramp[6];   /* NEW (bright) → DENSE (dark)                */
+} Theme;
+
+#define N_THEMES 10
+
+static const Theme themes[N_THEMES] = {
+    /* name        ramp[0..5]  (NEW → DENSE) */
+    { "MATRIX",  { 193, 157, 121,  84,  46,  28 } },
+    { "FIRE",    { 229, 220, 208, 196, 124,  88 } },
+    { "OCEANIC", { 195, 159,  87,  38,  31,  24 } },
+    { "NEON",    { 225, 219, 213, 207, 165,  91 } },
+    { "MONO",    { 255, 252, 248, 246, 244, 240 } },
+    { "ICE",     { 231, 195, 153, 117,  67,  24 } },
+    { "NOVA",    { 231, 226, 220, 208, 202, 130 } },
+    { "FOREST",  { 192, 156, 112,  70,  64,  28 } },
+    { "DESERT",  { 230, 229, 220, 178, 136, 130 } },
+    { "ECLIPSE", { 217, 209, 173, 167,  95,  52 } },
+};
+
+/* Reload the 6 grain-age pairs from one theme. Safe to call mid-run;
+ * takes effect on the next rendered frame. 8-colour fallback ignores
+ * themes — the gradient is subtle and only meaningful in 256-colour. */
+static void theme_apply(int idx)
+{
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    if (COLORS < 256) return;
+    const Theme *t = &themes[idx];
+    init_pair(CP_NEW,   t->ramp[0], COLOR_BLACK);
+    init_pair(CP_GRAIN, t->ramp[1], COLOR_BLACK);
+    init_pair(CP_LIGHT, t->ramp[2], COLOR_BLACK);
+    init_pair(CP_MID,   t->ramp[3], COLOR_BLACK);
+    init_pair(CP_PACK,  t->ramp[4], COLOR_BLACK);
+    init_pair(CP_DENSE, t->ramp[5], COLOR_BLACK);
+}
 
 static void color_init(void)
 {
     start_color();
     if (COLORS >= 256) {
-        init_pair(CP_NEW,    230, COLOR_BLACK);
-        init_pair(CP_GRAIN,  229, COLOR_BLACK);
-        init_pair(CP_LIGHT,  220, COLOR_BLACK);
-        init_pair(CP_MID,    178, COLOR_BLACK);
-        init_pair(CP_PACK,   136, COLOR_BLACK);
-        init_pair(CP_DENSE,  130, COLOR_BLACK);
+        /* Grain-age ramp is set by theme_apply below. */
         init_pair(CP_SOURCE, 226, COLOR_BLACK);
         init_pair(CP_WIND,   117, COLOR_BLACK);
+        init_pair(PAIR_HUD,  226, COLOR_BLACK);   /* bright yellow */
+        init_pair(PAIR_HINT,  51, COLOR_BLACK);   /* bright cyan   */
     } else {
         init_pair(CP_NEW,    COLOR_WHITE,  COLOR_BLACK);
         init_pair(CP_GRAIN,  COLOR_YELLOW, COLOR_BLACK);
@@ -192,31 +293,85 @@ static void color_init(void)
         init_pair(CP_DENSE,  COLOR_RED,    COLOR_BLACK);
         init_pair(CP_SOURCE, COLOR_WHITE,  COLOR_BLACK);
         init_pair(CP_WIND,   COLOR_CYAN,   COLOR_BLACK);
+        init_pair(PAIR_HUD,  COLOR_YELLOW, COLOR_BLACK);
+        init_pair(PAIR_HINT, COLOR_CYAN,   COLOR_BLACK);
     }
+    theme_apply(0);   /* default = MATRIX (first in cycle) */
 }
 
 /* ===================================================================== */
 /* §4  grid  — CA + per-grain age + wind                                 */
 /* ===================================================================== */
 
-/*
- * Each cell is 0=empty or 1=sand.
- * A parallel age[] array tracks how many consecutive ticks each grain
- * has been stationary.  Age drives the visual character selection.
- * Age resets to 0 when a grain moves; increments by 1 when at rest.
- */
-
 typedef uint8_t Cell;
 
+/*
+ * Grid — the cellular-automaton state.
+ *
+ * INTENT: hold the whole sand world (occupancy + per-grain compaction
+ * history + wind) in a flat layout that fits in BSS (allocated once at
+ * init, freed only on resize/exit; never reallocated per-tick).
+ *
+ * DOUBLE-BUFFER PATTERN: every tick reads from cur/age and writes the
+ * result to nxt/nxt_age; the buffers swap at end-of-tick. Without
+ * this, in-place writes during the scan would let a grain see itself
+ * as already-moved one row later — grains would teleport to the floor
+ * in a single tick. The `moved[]` flag layers a second guard on top
+ * so a grain that fell from row y → y+1 is not re-scanned and fallen
+ * again at y+1 within the same tick.
+ *
+ *   cur     : [rows*cols] CURRENT-frame cell state. 0 = empty,
+ *             1 = sand. Read-only during a tick. Read by every rule
+ *             check and by grid_neighbors (which informs the visual
+ *             compaction count).
+ *
+ *   nxt     : [rows*cols] NEXT-frame cell state — the write target
+ *             during the tick. Swapped into cur at end-of-tick.
+ *
+ *   age     : [rows*cols] stationary-tick counter per grain, byte
+ *             [0, 255] saturating. Drives the colour-ramp lookup:
+ *             age 0 → ramp[0] (bright fresh) up to age ≥ AGE_DENSE
+ *             → ramp[5] (dark packed). RESETS to 0 the moment a
+ *             grain moves — so a freshly-fallen grain glows bright,
+ *             and only undisturbed pile interiors darken over time.
+ *
+ *   nxt_age : [rows*cols] age for next state. Same double-buffer
+ *             role as nxt — written during the tick, swapped at end.
+ *
+ *   moved   : [rows*cols] per-tick guard flag, cleared at the top of
+ *             each tick. Set on every cell whose grain has been
+ *             processed this tick (either kept put or relocated to)
+ *             so the scan does not revisit the same grain from its
+ *             new position. Critical for keeping grains to a single-
+ *             cell move per tick rather than free-fall in one step.
+ *
+ *   cols    : grid width in cells. Cached at alloc time; matches the
+ *             terminal column count at init/resize. Used by every
+ *             loop and the gidx(g,x,y) index helper.
+ *
+ *   rows    : grid height in cells. Same role as cols, vertical.
+ *
+ *   wind    : signed horizontal wind, range [-WIND_MAX, +WIND_MAX].
+ *             Positive = blowing right, negative = blowing left,
+ *             zero = calm. Mutated by w / W / 0 keys; persists across
+ *             pause and resize. Drives TWO behaviours:
+ *               1. source_emit shifts the spawn column by `wind` so
+ *                  the stream visually leans INTO the wind.
+ *               2. grid_tick adds horizontal drift to YOUNG grains
+ *                  (age < AGE_SMALL) with probability
+ *                  |wind| / WIND_PROB_DEN — heavy buried grains
+ *                  resist lift-off (Bagnold), the same threshold
+ *                  the wind rule uses.
+ */
 typedef struct {
-    Cell    *cur;      /* [rows*cols]  0=empty  1=sand                  */
-    Cell    *nxt;      /* [rows*cols]  next state                        */
-    uint8_t *age;      /* [rows*cols]  stationary ticks                  */
-    uint8_t *nxt_age;  /* [rows*cols]  age for next state                */
-    bool    *moved;    /* [rows*cols]  processed this tick?              */
+    Cell    *cur;
+    Cell    *nxt;
+    uint8_t *age;
+    uint8_t *nxt_age;
+    bool    *moved;
     int      cols;
     int      rows;
-    int      wind;     /* -WIND_MAX..+WIND_MAX  positive=right           */
+    int      wind;
 } Grid;
 
 static void grid_alloc(Grid *g, int cols, int rows)
@@ -374,6 +529,30 @@ static void grain_visual(uint8_t age, int nb, char *ch_out, attr_t *attr_out)
 /* §5  source                                                             */
 /* ===================================================================== */
 
+/*
+ * Source — the sand spigot at the top of the grid.
+ *
+ * INTENT: deposit one grain at each of `w` cells centred on `col`
+ * (offset by grid.wind so the stream leans into the wind) at row
+ * SOURCE_ROW, once per tick when `on` is true.  The source itself
+ * is not a grain — source_emit just sets cur[x, SOURCE_ROW] = 1
+ * with age = 0, then the CA in grid_tick takes over.
+ *
+ *   col : horizontal CENTRE of the emitter, in cells. Initialised to
+ *         the middle of the grid by source_init. Mutated by LEFT /
+ *         RIGHT arrow keys; clamped to [1, cols-2] so the full spray
+ *         always stays on screen even at maximum width.
+ *
+ *   w   : full width of the spray in cells (NOT half-width — internal
+ *         use is w/2 as the half-extent). Adjusted by + / - keys,
+ *         clamped to [SOURCE_W_MIN, SOURCE_W_MAX]. Wider = thicker
+ *         column of sand; narrower = thin stream.
+ *
+ *   on  : emission enabled? Toggled by space. When OFF the source
+ *         MARKER still draws (so the user can see where it would
+ *         spray) but no new grains are deposited — useful for
+ *         watching an existing pile settle without new arrivals.
+ */
 typedef struct { int col, w; bool on; } Source;
 
 static void source_init(Source *s, int cols)
@@ -403,7 +582,62 @@ static void source_emit(const Source *s, Grid *g)
 /* §6  scene                                                              */
 /* ===================================================================== */
 
-typedef struct { Grid grid; Source source; bool paused; } Scene;
+/*
+ * Scene — owns every piece of mutable state for the sand simulation.
+ * Two clearly-separated halves:
+ *
+ *   SIMULATION half — what scene_tick reads + writes. Owns the CA
+ *                     grid (with double-buffers, age counters, and
+ *                     wind), the spawn source, and the pause flag.
+ *                     Mutated by scene_tick and the key handler.
+ *
+ *   RENDER half     — what scene_draw / screen_draw consult to pick
+ *                     colours. Purely visual selection index; never
+ *                     read inside the physics tick.
+ *
+ * The Scene knows nothing about ncurses — physics writes to the grid,
+ * the render layer reads it. That separation lets the CA be
+ * exercised without a terminal (useful for headless tests or
+ * snapshot dumps).
+ */
+typedef struct {
+    /* ──────────────────────────────────────────────────────────────
+     *  SIMULATION HALF — physics tick reads + writes these
+     * ────────────────────────────────────────────────────────────── */
+
+    /* CELL GRID — the CA state. Holds the cur/nxt double-buffers,
+     * the per-grain age counter, the moved-this-tick guard, the
+     * grid dimensions, and the wind value. See Grid documentation
+     * for per-field detail.  Allocated once at scene_init and freed
+     * at scene_free; on resize, freed and reallocated to the new
+     * terminal dims (wind value preserved across resize). */
+    Grid      grid;
+
+    /* SAND SPIGOT — where new grains spawn. Position + width are
+     * mutated by arrow keys and +/- keys; on/off toggled by space.
+     * source_emit writes grains into grid.cur at row SOURCE_ROW
+     * each tick (offset by grid.wind so the stream leans into the
+     * wind). */
+    Source    source;
+
+    /* PAUSE FLAG — scene_tick is a no-op when set. Toggled by p / P.
+     * Render keeps running so the user sees the frozen pile + any
+     * mid-air grains held in place. Useful for inspecting the
+     * pile shape after an avalanche. */
+    bool      paused;
+
+    /* ──────────────────────────────────────────────────────────────
+     *  RENDER HALF — scene_draw reads this; physics tick ignores it
+     * ────────────────────────────────────────────────────────────── */
+
+    /* THEME — index into themes[]. Cycled by t / T. Selects the
+     * 6-step grain-age ramp (NEW → DENSE) that maps to CP_NEW..
+     * CP_DENSE pair indices. Pure render concern — grain physics
+     * (CA rules, age accumulation, wind drift) behaves identically
+     * regardless of which theme is active. theme_apply(idx) re-runs
+     * init_pair for the six ramp pairs whenever this changes. */
+    int       current_theme;
+} Scene;
 
 static void scene_init(Scene *s, int cols, int rows)
 {
@@ -427,51 +661,94 @@ static void scene_tick(Scene *s)
     grid_tick(&s->grid);
 }
 
+/* ── Per-cell render helpers ─────────────────────────────────────── */
+
+/* Paint one occupied cell. Looks up its compaction signal
+ *   (age, neighbour-count)
+ * → picks glyph + attr via grain_visual → writes to the window.
+ * Caller has already confirmed cur[x,y] == 1. */
+static inline void grain_paint_one(WINDOW *w, const Grid *g, int x, int y)
+{
+    uint8_t age = g->age[gidx(g, x, y)];
+    int     nb  = grid_neighbors(g, x, y);
+    char    ch;
+    attr_t  attr;
+    grain_visual(age, nb, &ch, &attr);
+
+    wattron (w, attr);
+    mvwaddch(w, y, x, (chtype)(unsigned char)ch);
+    wattroff(w, attr);
+}
+
+/* ── Layer renderers ─────────────────────────────────────────────── */
+
+/* GRAIN LAYER — sweep the cell grid, paint every occupied cell.
+ * O(cols·rows) per frame with an early-skip on empty cells, so
+ * a screen that's 10% full only pays for the occupied cells. */
+static void grid_render_grains(WINDOW *w, const Grid *g)
+{
+    for (int y = 0; y < g->rows; y++) {
+        for (int x = 0; x < g->cols; x++) {
+            if (g->cur[gidx(g, x, y)] == 0) continue;
+            grain_paint_one(w, g, x, y);
+        }
+    }
+}
+
+/* SOURCE MARKER — chevron strip ('v') above the emitter row showing
+ * where new grains will spawn this tick. The strip is offset by
+ * grid.wind so it visually leans INTO the wind, matching where
+ * source_emit will actually deposit. */
+static void source_render_marker(WINDOW *w, const Source *src, const Grid *g)
+{
+    int half = src->w / 2;
+    int wo   = g->wind;
+
+    wattron(w, COLOR_PAIR(CP_SOURCE) | A_BOLD);
+    for (int dx = -half; dx <= half; dx++) {
+        int mx = src->col + dx + wo;
+        if (mx >= 0 && mx < g->cols)
+            mvwaddch(w, SOURCE_ROW - 1, mx, 'v');
+    }
+    wattroff(w, COLOR_PAIR(CP_SOURCE) | A_BOLD);
+}
+
+/* WIND INDICATOR — arrows along the bottom row whose count = |wind|
+ * and direction = sign(wind). Capped at cols/4 so a high wind never
+ * overwhelms the bottom-row HUD. Layout:
+ *   wind > 0  → arrows on the RIGHT edge pointing '>'
+ *   wind < 0  → arrows on the LEFT edge pointing '<'
+ *   wind == 0 → no indicator (caller short-circuits). */
+static void wind_render_indicator(WINDOW *w, const Grid *g)
+{
+    char wc   = (g->wind > 0) ? '>' : '<';
+    int  wabs = abs(g->wind);
+    int  cap  = g->cols / 4;
+
+    wattron(w, COLOR_PAIR(CP_WIND) | A_BOLD);
+    for (int i = 0; i < wabs && i < cap; i++) {
+        int wx = (g->wind > 0) ? g->cols - 1 - i : i;
+        if (wx >= 0 && wx < g->cols && g->rows > 1)
+            mvwaddch(w, g->rows - 1, wx, (chtype)(unsigned char)wc);
+    }
+    wattroff(w, COLOR_PAIR(CP_WIND) | A_BOLD);
+}
+
+/* ── Driver — render all scene layers in z-order ─────────────────── */
+
+/* Pseudocode (back-to-front so later layers overdraw earlier ones):
+ *   grid_render_grains       — sand cells via per-grain age+neighbour glyph
+ *   source_render_marker     — emitter chevrons (only when on)
+ *   wind_render_indicator    — bottom-row direction gauge (only when wind != 0) */
 static void scene_draw(const Scene *s, WINDOW *w)
 {
-    const Grid *g    = &s->grid;
-    int         cols = g->cols;
-    int         rows = g->rows;
+    grid_render_grains(w, &s->grid);
 
-    /* Sand grains */
-    for (int y = 0; y < rows; y++) {
-        for (int x = 0; x < cols; x++) {
-            if (g->cur[gidx(g,x,y)] == 0) continue;
-            uint8_t age = g->age[gidx(g,x,y)];
-            int     nb  = grid_neighbors(g,x,y);
-            char   ch; attr_t attr;
-            grain_visual(age, nb, &ch, &attr);
-            wattron(w,attr);
-            mvwaddch(w,y,x,(chtype)(unsigned char)ch);
-            wattroff(w,attr);
-        }
-    }
+    if (s->source.on)
+        source_render_marker(w, &s->source, &s->grid);
 
-    /* Emitter marker — lean with wind */
-    if (s->source.on) {
-        int half = s->source.w/2;
-        int wo   = g->wind;
-        wattron(w, COLOR_PAIR(CP_SOURCE)|A_BOLD);
-        for (int dx = -half; dx <= half; dx++) {
-            int mx = s->source.col + dx + wo;
-            if (mx>=0 && mx<cols)
-                mvwaddch(w, SOURCE_ROW-1, mx, 'v');
-        }
-        wattroff(w, COLOR_PAIR(CP_SOURCE)|A_BOLD);
-    }
-
-    /* Wind indicator — arrows at bottom corners */
-    if (g->wind != 0) {
-        char wc   = (g->wind > 0) ? '>' : '<';
-        int  wabs = abs(g->wind);
-        wattron(w, COLOR_PAIR(CP_WIND)|A_BOLD);
-        for (int i = 0; i < wabs && i < cols/4; i++) {
-            int wx = (g->wind > 0) ? cols-1-i : i;
-            if (wx>=0 && wx<cols && rows>1)
-                mvwaddch(w, rows-1, wx, (chtype)(unsigned char)wc);
-        }
-        wattroff(w, COLOR_PAIR(CP_WIND)|A_BOLD);
-    }
+    if (s->grid.wind != 0)
+        wind_render_indicator(w, &s->grid);
 }
 
 /* ===================================================================== */
@@ -490,28 +767,56 @@ static void screen_init(Screen *s)
 static void screen_free(Screen *s)   { (void)s; endwin(); }
 static void screen_resize(Screen *s) { endwin(); refresh(); getmaxyx(stdscr,s->rows,s->cols); }
 
+/*
+ * screen_draw — render the grid, then paint a two-layer HUD over it:
+ *
+ *   Row 0          STATUS LINE.  Bright yellow PAIR_HUD + A_BOLD.
+ *                  Live state: paused/run, emitter on/off, source
+ *                  column + width, wind direction + magnitude, fps,
+ *                  sim Hz.
+ *   Row rows-1     KEY HINT LINE.  Bright cyan PAIR_HINT + A_BOLD.
+ *                  Every interactive key the demo accepts.
+ *
+ * Both rows are pre-filled with their pair colour so the coloured
+ * background spans the full width, and drawn AFTER scene_draw so
+ * sand grains never bleed through the bars.
+ */
 static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps)
 {
     erase();
     scene_draw(sc, stdscr);
 
-    char buf[HUD_COLS+1];
-    const char *wstr = sc->grid.wind > 0 ? ">>>" :
-                       sc->grid.wind < 0 ? "<<<" : "---";
-    snprintf(buf, sizeof buf,
-             "%5.1f fps  %s  emit:%s  w:%d  wind:%s  sim:%d",
-             fps,
-             sc->paused ? "PAUSED" : "run",
-             sc->source.on ? "on" : "off",
-             sc->source.w, wstr, sim_fps);
-    int hx = s->cols - HUD_COLS;
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(CP_LIGHT)|A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(CP_LIGHT)|A_BOLD);
-    attron(COLOR_PAIR(CP_GRAIN));
-    mvprintw(1, hx, "w/W=wind  0=calm  space=emit  r=clear  p=pause");
-    attroff(COLOR_PAIR(CP_GRAIN));
+    /* ── Top row: dynamic status ─────────────────────────────── */
+    const char *wstr =
+        sc->grid.wind > 0 ? ">>>" :
+        sc->grid.wind < 0 ? "<<<" : "---";
+
+    char status[200];
+    snprintf(status, sizeof status,
+             " SAND   %s   theme:%-7s   emit:%s   src col:%3d  w:%d   "
+             "wind:%s (%+d)   %5.1f fps  %3d Hz ",
+             sc->paused     ? "PAUSED " : "running",
+             themes[sc->current_theme].name,
+             sc->source.on  ? "ON " : "OFF",
+             sc->source.col, sc->source.w,
+             wstr, sc->grid.wind,
+             fps, sim_fps);
+
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    for (int x = 0; x < s->cols; x++) mvaddch(0, x, ' ');
+    mvprintw(0, 0, "%s", status);
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+
+    /* ── Bottom row: every interactive key ───────────────────── */
+    const char *hints =
+        " q:quit  spc:emit  p:pause  r:clear  </>:move  +/-:width  "
+        "w/W:wind  0:calm  t/T:theme  ]/[:Hz ";
+
+    int hint_row = s->rows - 1;
+    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+    for (int x = 0; x < s->cols; x++) mvaddch(hint_row, x, ' ');
+    mvprintw(hint_row, 0, "%s", hints);
+    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
@@ -567,12 +872,23 @@ static bool app_handle_key(App *app, int ch)
     case '0':
         g->wind = 0; break;
 
+    case 't':
+        sc->current_theme = (sc->current_theme + 1) % N_THEMES;
+        theme_apply(sc->current_theme);
+        break;
+    case 'T':
+        sc->current_theme = (sc->current_theme + N_THEMES - 1) % N_THEMES;
+        theme_apply(sc->current_theme);
+        break;
+
     case ']':
-        app->sim_fps+=SIM_FPS_STEP;
-        if (app->sim_fps>SIM_FPS_MAX) app->sim_fps=SIM_FPS_MAX; break;
+        app->sim_fps += SIM_FPS_STEP;
+        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
+        break;
     case '[':
-        app->sim_fps-=SIM_FPS_STEP;
-        if (app->sim_fps<SIM_FPS_MIN) app->sim_fps=SIM_FPS_MIN; break;
+        app->sim_fps -= SIM_FPS_STEP;
+        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
+        break;
 
     default: break;
     }

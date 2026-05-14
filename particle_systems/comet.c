@@ -57,6 +57,147 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── ARCHITECTURE — DATA-DRIVEN PATTERN ENGINE ────────────────────────── *
+ *
+ * Three comet effects (SHOOTING_STAR, FIREBALL, PLASMA_BOLT) are
+ * produced by a SINGLE generic moving-emitter + trail engine driven
+ * by an array of PatternParams structs.  scene_tick reads
+ * pattern_params[s->current_pattern] and behaves accordingly — the
+ * four phases (top-up / advance comets / advance trail / advance
+ * blasts) never branch on the pattern enum to decide HOW the physics
+ * works.  Adding a new comet effect is a matter of appending one row
+ * to pattern_params[]; no new code paths.
+ *
+ *
+ * THE GENERIC ENGINE (pseudocode)
+ * ───────────────────────────────
+ *
+ *   loop forever (each tick of dt seconds):
+ *
+ *     pp = pattern_params[scene.current_pattern]   # read inputs
+ *
+ *     # 1. TOP UP COMET POOL — spawn until count == pp.max_comets
+ *     while count(active comets) < pp.max_comets:
+ *         c = next_inactive_comet_slot()
+ *         edge      = pick_spawn_edge_weighted(rng)        # TOP/L/R/BOT
+ *         spawn_pt  = compute_spawn_point(edge, scene)
+ *         target_pt = compute_target_point(edge, scene)    # opposite quad
+ *         speed     = pp.speed · jitter(±pp.speed_jitter)
+ *         c.pos     = spawn_pt
+ *         c.vel     = unit(target_pt − spawn_pt) · speed
+ *         c.active  = true
+ *
+ *     # 2. ADVANCE EACH COMET — angular kick + integrate + emit trail
+ *     for c in active comets:
+ *         apply_2d_rotation(c.vel, uniform(-pp.angular_kick,
+ *                                          +pp.angular_kick))  # |v| preserved
+ *         c.pos += c.vel · dt
+ *         # Bresenham fractional accumulator: fire pp.emit_rate Hz
+ *         c.emit_carry += pp.emit_rate · dt
+ *         while c.emit_carry >= 1:
+ *             scene_emit_trail(c, pp)                          # see THE TRICK
+ *             c.emit_carry -= 1
+ *         if c.pos exits screen + EDGE_MARGIN:
+ *             blast_ignite(s, c.pos)                           # impact flash
+ *             c.active = false
+ *
+ *     # 3. ADVANCE TRAIL POOL — exponential drag + Euler + age
+ *     drag = exp(-pp.trail_drag · dt)
+ *     for p in active trail:
+ *         p.vel *= drag
+ *         p.pos += p.vel · dt
+ *         p.age += dt
+ *         if p.age >= p.life:  p.active = false
+ *
+ *     # 4. ADVANCE BLAST POOL — flash TTL + per-spark tick (independent
+ *     #    of pp; uses BLAST_* global constants).
+ *     for b in active blasts:
+ *         b.flash_ttl -= dt
+ *         for sp in b.parts:  blast_spark_tick(sp, dt)
+ *         if all sparks dead:  b.active = false
+ *
+ *   # Render — 3-layer painter's algorithm (Newell, Newell & Sancha 1972):
+ *   scene_draw_trail_layer    # background
+ *   scene_draw_blast_layer    # mid
+ *   scene_draw_comet_layer    # foreground (head glyph: pp.head_glyph)
+ *
+ *
+ *   THE TRICK (scene_emit_trail) — moving emitter, decoupled trail vel:
+ *     perp = perpendicular(c.vel)                              # 90° CCW
+ *     kick = uniform(-1, 1) · 2 · pp.particle_spread
+ *     p.pos = c.pos + perp · kick                              # offset
+ *     p.vel = perp · kick · pp.spread_drift_factor             # NOT c.vel!
+ *     p.life = pp.particle_life · uniform(0.7, 1.3)
+ *
+ *   p.vel deliberately does NOT inherit from c.vel — that's why the
+ *   trail "falls behind" as a tapered streak instead of flying along
+ *   with the comet.  Reeves (1983) called this the moving-emitter trick.
+ *
+ *
+ * PATTERNPARAMS FIELD → ENGINE HOOK
+ * ─────────────────────────────────
+ *
+ *   max_comets            →  spawn-loop refill cap        (concurrent count)
+ *   speed                 →  spawn velocity magnitude     (× jitter)
+ *   speed_jitter          →  ± fraction on speed at spawn
+ *   angular_kick          →  per-tick rotation amplitude  (rotation matrix)
+ *   emit_rate             →  trail emission rate (Hz)     (Bresenham accum)
+ *   particle_life         →  trail lifetime               (× uniform 0.7-1.3)
+ *   particle_spread       →  ± perpendicular spawn offset (cells)
+ *   spread_drift_factor   →  perp_kick · this = p.vel     (0 = static trail)
+ *   trail_drag            →  drag = exp(-rate·dt)         (Millington Ch.6)
+ *   head_glyph            →  comet-layer paint glyph      (visual identity)
+ *
+ * Every other engine constant — MAX_COMETS, MAX_TRAIL, MAX_BLASTS,
+ * EDGE_MARGIN, plus the BLAST_* tuning knobs — is a GLOBAL knob
+ * shared across all patterns.  Patterns differ ONLY in the ten
+ * fields above.  Note that BLAST_* parameters are NOT per-pattern
+ * (every comet's impact uses the same blast tuning); this is a
+ * deliberate uniformity choice, not an oversight — the impact
+ * flash should read consistently across patterns.
+ *
+ *
+ * ARCHITECTURAL REFERENCES
+ * ────────────────────────
+ *
+ *   Reeves, W. T. (1983)
+ *     "Particle Systems — A Technique for Modeling a Class of
+ *     Fuzzy Objects", ACM TOG 2(2): 91-108.
+ *     §4 makes the explicit argument that ONE engine + a struct
+ *     of physical constants per phenomenon is the right
+ *     architecture for natural-particle simulations.  The moving-
+ *     emitter trick (decoupled trail velocity) appears in §3.2 of
+ *     Reeves' paper as the canonical mechanism for trailing
+ *     phenomena — comets, missiles, fireballs.
+ *
+ *   Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994)
+ *     "Design Patterns" (Addison-Wesley) — STRATEGY pattern (§5.9).
+ *     A family of algorithms (SHOOTING_STAR / FIREBALL /
+ *     PLASMA_BOLT) interchangeable behind a single interface (the
+ *     engine reading PatternParams).  In procedural C the
+ *     "interface" is the struct shape; "concrete strategies" are
+ *     the rows of pattern_params[]; "selecting a strategy" is
+ *     updating scene.current_pattern.
+ *
+ *   Acton, M. (2014)
+ *     "Data-Oriented Design and C++" (CppCon 2014 keynote).
+ *     Argues that variation between behaviours should be
+ *     represented as DATA (struct fields) rather than as control
+ *     flow (if/switch on type).  pattern_params[] is a compact
+ *     data table; scene_tick has zero per-pattern code paths.
+ *
+ *   Nystrom, R. (2014)
+ *     "Game Programming Patterns" (Genever Benning).
+ *     TYPE OBJECT chapter — PatternParams is a Type Object: one
+ *     shared instance per "kind" of comet.  OBJECT POOL chapter —
+ *     three independent fixed-size BSS pools (comets / trail /
+ *     blasts) implement Nystrom's pool idiom directly.  PAINTER'S
+ *     ALGORITHM chapter — the three-layer z-by-category render
+ *     order (trail → blasts → comets) is Nystrom's preferred
+ *     ordering for layered 2-D scenes.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ── OVERALL PSEUDOCODE ──────────────────────────────────────────────── *
  *
  *   init:

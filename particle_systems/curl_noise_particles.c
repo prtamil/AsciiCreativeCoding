@@ -172,6 +172,146 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
+/* ── ARCHITECTURE — DATA-DRIVEN PATTERN ENGINE ────────────────────────── *
+ *
+ * Four flow patterns (CALM, TURBULENT, HURRICANE, WIND_TUNNEL) are
+ * produced by a SINGLE generic curl-noise advection engine driven
+ * by an array of PatternParams structs.  scene_tick and scene_draw
+ * never branch on the pattern enum to decide HOW the physics works —
+ * they read pattern_params[s->current_pattern] and compute the
+ * velocity field accordingly.  Adding a new flow effect is a matter
+ * of appending one row to pattern_params[]; no new code paths.
+ *
+ *
+ * THE GENERIC ENGINE (pseudocode)
+ * ───────────────────────────────
+ *
+ *   loop forever (each tick of dt seconds):
+ *
+ *     pp = pattern_params[scene.current_pattern]   # read inputs
+ *
+ *     # 1. SPAWN — top up particle pool toward target density
+ *     while count(active particles) < pp.target_count:
+ *         p = next_inactive_slot()
+ *         p.x, p.y = uniform_in_screen(scene)
+ *         p.life   = uniform(LIFE_MIN, LIFE_MAX)
+ *         p.active = true
+ *
+ *     # 2. ADVECT — compute curl-noise velocity at each particle's
+ *     #    position, integrate forward.  This is the hot loop.
+ *     scene.noise_t += dt
+ *     for p in active particles:
+ *         # Sample fBm at p's position with TIME-DRIFTING input —
+ *         # makes the field non-stationary so flow EVOLVES, not
+ *         # just animates particles through a fixed pattern.
+ *         nx = p.x · pp.fbm_freq + scene.noise_t · pp.time_drift_x
+ *         ny = p.y · pp.fbm_freq + scene.noise_t · pp.time_drift_y
+ *         psi    = fbm(nx, ny, octaves=pp.fbm_octaves)
+ *         # CURL of scalar field ψ → divergence-free 2-D velocity
+ *         # (Bridson et al. 2007):  v = (∂ψ/∂y, −∂ψ/∂x)
+ *         vx, vy = (∂fbm/∂y · pp.field_mag, −∂fbm/∂x · pp.field_mag)
+ *         # Optional ROTATION around screen centre (HURRICANE)
+ *         if pp.global_rot != 0:
+ *             (rx, ry) = (p.x − cx, p.y − cy)
+ *             vx += −ry · pp.global_rot
+ *             vy +=  rx · pp.global_rot
+ *         # Optional WIND bias (WIND_TUNNEL)
+ *         vx += pp.wind_bias
+ *         # Explicit Euler advect
+ *         p.x  += vx · dt
+ *         p.y  += vy · dt
+ *         p.age += dt
+ *         p.speed = √(vx² + vy²)        # for render-time colour ramp
+ *
+ *     # 3. KILL — particles that age out, leave the canvas, or
+ *     #    end up in a stagnant cell are recycled.
+ *     for p in active particles:
+ *         if p.age >= p.life or off-screen(p):  p.active = false
+ *
+ *     # 4. RENDER — particles painted by SPEED → ramp slot mapping.
+ *     #    Theme ramp[8] is indexed by (p.speed / SPEED_MAX) · 7,
+ *     #    so the velocity field's structure (slow zones, fast
+ *     #    bands) reads as colour temperature.
+ *     for p in active particles:
+ *         slot = clamp(p.speed / SPEED_MAX, 0, 1) · 7
+ *         paint(round(p.x), round(p.y), GLYPHS[slot], ramp[slot])
+ *
+ *
+ * PATTERNPARAMS FIELD → ENGINE HOOK
+ * ─────────────────────────────────
+ *
+ *   target_count    →  spawn-loop refill cap        (visual density)
+ *   fbm_octaves     →  fbm() octave count           (Perlin/fBm depth;
+ *                                                   1 = smooth sines,
+ *                                                   4 = rich turbulence)
+ *   fbm_freq        →  noise input scale (1/cells)  (small = wide cells,
+ *                                                   large = small cells)
+ *   field_mag       →  curl velocity multiplier     (compensates for the
+ *                                                   k-magnitude scaling
+ *                                                   of fBm gradients)
+ *   time_drift_x    →  fBm input translation rate   (field evolves over
+ *   time_drift_y                                    time, not stationary)
+ *   global_rot      →  added angular velocity        (Goldstein Ch.4 — solid-
+ *                      around screen centre          body rotation overlay;
+ *                                                   HURRICANE only)
+ *   wind_bias       →  added horizontal velocity    (uniform drift overlay;
+ *                                                   WIND_TUNNEL only)
+ *
+ * Every other engine constant — MAX_PARTICLES, SPEED_MAX, LIFE_MIN,
+ * LIFE_MAX, the GLYPHS ramp, the fbm() implementation itself — is a
+ * GLOBAL tuning knob shared across all patterns.  Patterns differ
+ * ONLY in the eight fields above.
+ *
+ *
+ * ARCHITECTURAL REFERENCES
+ * ────────────────────────
+ *
+ *   Bridson, R., Houriham, J. & Nordenstam, M. (2007)
+ *     "Curl-Noise for Procedural Fluid Flow", ACM TOG 26(3)
+ *     (SIGGRAPH).  The paper that introduced the technique whose
+ *     parameterisation is exactly what PatternParams exposes.
+ *     Bridson treats noise frequency, magnitude, and time-drift as
+ *     independent knobs — the table here surfaces those knobs as
+ *     pattern-selectable rows.
+ *
+ *   Reeves, W. T. (1983)
+ *     "Particle Systems — A Technique for Modeling a Class of
+ *     Fuzzy Objects", ACM TOG 2(2): 91-108.
+ *     §4 makes the explicit argument that ONE engine + a struct
+ *     of physical constants per phenomenon is the right
+ *     architecture for natural-particle simulations.  This file
+ *     applies the idea to four flow regimes; the engine is the
+ *     curl-noise advector, the struct is PatternParams.
+ *
+ *   Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994)
+ *     "Design Patterns" (Addison-Wesley) — STRATEGY pattern (§5.9).
+ *     A family of algorithms (CALM / TURBULENT / HURRICANE /
+ *     WIND_TUNNEL) interchangeable behind a single interface (the
+ *     engine reading PatternParams).  In procedural C the
+ *     "interface" is the struct shape; "concrete strategies" are
+ *     the rows of pattern_params[]; "selecting a strategy" is
+ *     updating scene.current_pattern.
+ *
+ *   Acton, M. (2014)
+ *     "Data-Oriented Design and C++" (CppCon 2014 keynote).
+ *     Argues that variation between behaviours should be
+ *     represented as DATA (struct fields) rather than as control
+ *     flow (if/switch on type).  pattern_params[] is a compact
+ *     data table; the engine has no per-pattern code paths and
+ *     the cache footprint stays predictable across pattern
+ *     switches — particularly important here where the hot loop
+ *     evaluates fBm at every particle every tick.
+ *
+ *   Nystrom, R. (2014)
+ *     "Game Programming Patterns" (Genever Benning).
+ *     TYPE OBJECT chapter — PatternParams is a Type Object: one
+ *     shared instance per "kind" of flow.  DATA LOCALITY chapter —
+ *     Particle is a flat-laid-out POD swept linearly by the
+ *     advector each tick, exactly the layout Nystrom recommends
+ *     for hot inner loops.
+ *
+ * ─────────────────────────────────────────────────────────────────────── */
+
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
  *
  * CORE IDEA

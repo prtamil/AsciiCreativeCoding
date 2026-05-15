@@ -128,7 +128,7 @@ Reference implementation: `basics/bounce_ball.c`
 91. [Sort Visualiser — misc/sort_vis.c](#91-sort-visualiser--miscsort_visc)
 92. [Aspect Ratio Demo — ncurses_basics/aspect_ratio.c](#92-aspect-ratio-demo--ncurses_basicsaspect_ratioc)
 93. [Lines and Cols Query — ncurses_basics/tst_lines_cols.c](#93-lines-and-cols-query--ncurses_basicstst_lines_colsc)
-94. [2-Stroke Engine — physics/2stroke.c](#94-2-stroke-engine--physics2strokec)
+94. [Stroke Engine Gallery — physics/stroke_engine.c](#94-stroke-engine-gallery--physicsstroke_enginec)
 95. [Black Hole — physics/blackhole.c](#95-black-hole--physicsblackholec)
 96. [Bubble Chamber — physics/bubble_chamber.c](#96-bubble-chamber--physicsbubble_chamberc)
 97. [Elastic Collision — physics/elastic_collision.c](#97-elastic-collision--physicselastic_collisionc)
@@ -3790,17 +3790,29 @@ After `initscr()`, ncurses sets the global `LINES` (row count) and `COLS` (colum
 
 ---
 
-## 94. 2-Stroke Engine — physics/2stroke.c
+## 94. Stroke Engine Gallery — physics/stroke_engine.c
 
-Cross-section animation of a 2-stroke internal combustion engine. The crank angle θ advances each tick via slider-crank kinematics; the piston, connecting rod, and crankshaft are redrawn each frame.
+Cross-section animation of three reciprocating engine cycles in one program, runtime-switchable with `n` / `p`: 2-stroke (Schnürle scavenging), 4-stroke (Otto cycle), and 6-stroke (Crower water-injection). The slider-crank kinematics are identical across all three; what differs is the cycle state machine and the gas-exchange geometry.
 
 ### Slider-Crank Kinematics
 
-Piston position from crank center: `y_wrist = R·cos θ + √(L² − R²·sin²θ)` (exact, not approximated). Crank radius CRANK_R=4, connecting rod CONROD_L=9. The 2-stroke cycle phase is determined by θ: exhaust port uncovers at ~75°, transfer port at ~90°, BDC at 180°, ports close on compression stroke, TDC spark at 0°. Each phase is labeled and port visibility is toggled by comparing θ to port-open thresholds.
+Piston position from crank center: `y_wrist = R·cos θ + √(L² − R²·sin²θ)` (exact, not approximated). Crank radius CRANK_R=4, connecting rod CONROD_L=9. `cycle_angle ∈ [0, strokes·π)` advances continuously; crank angle (drives piston) is `cycle_angle mod 2π`.
 
-The HUD shows RPM; `]/[` keys adjust speed. Rendering uses ASCII line-drawing primitives for the cylinder walls, piston rectangle, and connecting rod line.
+### Cycle State Machines
 
-*Files: `physics/2stroke.c`*
+The phase enum spans all three cycles: INTAKE / COMPRESS / IGNITE / POWER / EXHAUST / SCAVENGE / WATER_INJ / STEAM_POWER / STEAM_EXHAUST. `engine_derive_state()` dispatches on `EngineType`:
+
+- **2-stroke**: phase derived from port states (geometric — piston covers/uncovers wall ports). Cycle = 360°.
+- **4-stroke**: phase chosen from cycle-angle sextant; intake valve open in [0, π), exhaust valve in [3π, 4π). Cycle = 720°.
+- **6-stroke**: 4-stroke plus WATER_INJ near 4π, STEAM_POWER in [4π, 5π), STEAM_EXHAUST in [5π, 6π). Cycle = 1080°.
+
+### Visual Differentiation
+
+Each engine type has distinct geometry: 2-stroke shows wall ports with always-visible exhaust pipe / transfer duct stubs (dim when closed, bright with flow chars when open); 4-stroke replaces these with poppet valves in the head row (`#` seated, `v` lifted) and head-side manifolds; 6-stroke adds a `W`/`w` water injector marker above the head. Gas above the piston is rendered with a per-phase glyph and colour. A bracketed stroke timeline below the engine shows 2 / 4 / 6 labeled blocks with a position caret, making cycle structure unmistakable.
+
+HUD shows the engine name and a cycle subtitle ("Schnürle scavenging", "Otto cycle", "Crower water-injection") plus rev count. 10 themes (MATRIX / FIRE / OCEANIC / NEON / MONO / ICE / NOVA / FOREST / DESERT / ECLIPSE) cycled with `t`/`T`.
+
+*Files: `physics/stroke_engine.c`*
 
 ---
 

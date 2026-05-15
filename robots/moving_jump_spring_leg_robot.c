@@ -41,7 +41,7 @@
  * Study alongside:
  *   robots/diff_drive_robot.c       — wheeled contrast: rolling
  *                                      instead of jumping.
- *   particle_systems/2stroke.c      — slider-crank kinematics
+ *   physics/stroke_engine.c         — slider-crank kinematics
  *                                      (similar "stored energy
  *                                      released cyclically" theme).
  *   matrix_rain/fireworks_rain.c    — also has a state machine

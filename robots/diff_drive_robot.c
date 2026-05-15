@@ -29,7 +29,7 @@
  *   robots/walking_robot.c           — bipedal contrast: legs
  *                                      instead of wheels.
  *   animation/hexpod_tripod.c        — 6-leg insect locomotion.
- *   particle_systems/2stroke.c       — slider-crank kinematics
+ *   physics/stroke_engine.c          — slider-crank kinematics
  *                                      (similar idea: gears/wheels
  *                                       drive position).
  *   matrix_rain/matrix_rain.c        — same project conventions

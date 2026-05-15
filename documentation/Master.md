@@ -1851,8 +1851,8 @@ wrist_row = crank_centre_row - R·cos(θ) - rod_vert
 
 This is exact geometry with no small-angle approximation. Port timing (when the exhaust and transfer ports open and close) is derived directly from the piston crown position rather than from a separate lookup table: `ex_open = (crown_row > engine_top + EX_PORT_OFF)`. This keeps timing numerically consistent with the drawn geometry at any engine speed.
 
-A 2-stroke cycle completes its five phases in a single crankshaft revolution: compression → ignition (TDC spark) → power stroke → exhaust port opens (burned gas escapes) → transfer port opens (fresh mixture scavenges cylinder). Detecting the current phase from crank angle and port state drives character and color changes for the gas above the piston, exhaust flow, and transfer flow — an animated cross-section that teaches engine thermodynamics entirely through ASCII character choices.
-*Files: `physics/2stroke.c`*
+A 2-stroke cycle completes its five phases in a single crankshaft revolution: compression → ignition (TDC spark) → power stroke → exhaust port opens (burned gas escapes) → transfer port opens (fresh mixture scavenges cylinder). Detecting the current phase from crank angle and port state drives character and color changes for the gas above the piston, exhaust flow, and transfer flow — an animated cross-section that teaches engine thermodynamics entirely through ASCII character choices. The same file also hosts the 4-stroke Otto cycle (poppet valves in the head, cycle = 720°) and the 6-stroke Crower water-injection cycle (Otto plus a steam expansion stroke from waste heat, cycle = 1080°); the engine type is runtime-switchable with `n` / `p`.
+*Files: `physics/stroke_engine.c`*
 
 ---
 

@@ -1,4 +1,4 @@
-# Pass 1 — 2stroke.c: 2-stroke engine cross-section animation
+# Pass 1 — stroke_engine.c: 2-stroke engine cross-section animation
 
 ## Core Idea
 
@@ -150,7 +150,7 @@ The port gap in the cylinder wall is drawn unconditionally when ex_open (or tr_o
 | `EX_PORT_OFF`, `TR_PORT_OFF` | `int` constants | N/A | row offsets at which exhaust (6) and transfer (7) ports open |
 | `scene` (struct) | composite | ~100 B | owns Engine + HUD state; tick advances θ by RPM·dt |
 
-# Pass 2 — 2stroke: Pseudocode
+# Pass 2 — stroke_engine: Pseudocode
 
 ## Module Map
 

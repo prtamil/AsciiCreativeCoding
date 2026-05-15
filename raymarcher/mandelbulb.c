@@ -498,80 +498,80 @@
 
 /* §1.1 frame rate + UI layout. */
 enum {
-    SIM_FPS_MIN      =  10,
-    SIM_FPS_DEFAULT  =  60,
-    SIM_FPS_MAX      = 120,
-    SIM_FPS_STEP     =  10,
-    FPS_UPDATE_MS    = 500,
-    HUD_ROWS         =   2,    /* row 0 status + last row hint */
-    ITERS_MIN        =   3,
-    ITERS_MAX        =  14,
-    ITERS_DEFAULT    =   8,    /* the canonical Mandelbulb at p = 8 */
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 60,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
+  FPS_UPDATE_MS = 500,
+  HUD_ROWS = 2, /* row 0 status + last row hint */
+  ITERS_MIN = 3,
+  ITERS_MAX = 14,
+  ITERS_DEFAULT = 8, /* the canonical Mandelbulb at p = 8 */
 };
 
 /* §1.2 colour-pair IDs. */
 enum {
-    PAIR_HUD         =  1,     /* yellow + bold — top status row     */
-    PAIR_HINT        =  2,     /* cyan   + bold — last row key hint  */
-    PAIR_RAMP_BASE   =  3,     /* +0..+7 — depth ramp                */
+  PAIR_HUD = 1,       /* yellow + bold — top status row     */
+  PAIR_HINT = 2,      /* cyan   + bold — last row key hint  */
+  PAIR_RAMP_BASE = 3, /* +0..+7 — depth ramp                */
 };
 
 /* §1.3 time helpers + cell aspect. */
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(f)      (NS_PER_SEC / (f))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
 
-#define CELL_ASPECT      2.0f      /* terminal cell h / w */
+#define CELL_ASPECT 2.0f /* terminal cell h / w */
 
 /* §1.4 Mandelbulb iteration. */
-#define MANDELBULB_POWER 8.0f      /* the canonical power; T3 derives why */
-#define BAILOUT          4.0f      /* |z| > this → escaped; T1            */
+#define MANDELBULB_POWER 8.0f /* the canonical power; T3 derives why */
+#define BAILOUT 4.0f          /* |z| > this → escaped; T1            */
 
 /* §1.5 sphere trace (with the two fractal-specific knobs from T5). */
-#define MAX_STEPS        90
-#define HIT_EPS          1.0e-3f
-#define ADAPTIVE_FACTOR  0.012f    /* ε grows with t                      */
-#define MAX_T            6.0f
-#define STEP_RELAX       0.85f     /* α < 1: under-relax for safe stepping */
+#define MAX_STEPS 90
+#define HIT_EPS 1.0e-3f
+#define ADAPTIVE_FACTOR 0.012f /* ε grows with t                      */
+#define MAX_T 6.0f
+#define STEP_RELAX 0.85f /* α < 1: under-relax for safe stepping */
 
 /* §1.6 normal estimator epsilon. */
-#define NORMAL_EPS       3.5e-3f
+#define NORMAL_EPS 3.5e-3f
 
 /* §1.7 soft shadow (Christensen).
  *      SHADOW_K       hardness — bigger = sharper shadow edge
  *      SHADOW_FLOOR   minimum factor (cells in shadow stay this lit)
  */
-#define SHADOW_STEPS     16
-#define SHADOW_NEAR      0.012f
-#define SHADOW_FAR       2.5f
-#define SHADOW_K         32.0f
-#define SHADOW_FLOOR     0.30f
+#define SHADOW_STEPS 16
+#define SHADOW_NEAR 0.012f
+#define SHADOW_FAR 2.5f
+#define SHADOW_K 32.0f
+#define SHADOW_FLOOR 0.30f
 
 /* §1.8 lighting + AO + ambient. */
-#define AMBIENT          0.18f
-#define AO_FLOOR         0.35f
-#define AO_STRENGTH      0.70f
+#define AMBIENT 0.18f
+#define AO_FLOOR 0.35f
+#define AO_STRENGTH 0.70f
 
 /* Light direction (normalised at use). */
-#define LIGHT_X          0.55f
-#define LIGHT_Y          0.75f
-#define LIGHT_Z         -0.25f
+#define LIGHT_X 0.55f
+#define LIGHT_Y 0.75f
+#define LIGHT_Z -0.25f
 
 /* §1.9 camera. */
-#define CAM_DIST_DEFAULT  3.2f
-#define CAM_DIST_MIN      1.5f      /* outside the bulb's bounding sphere */
-#define CAM_DIST_MAX      8.0f
-#define CAM_DIST_STEP     0.20f
-#define FOV_DEG          45.0f
-#define ORBIT_YAW_RATE    0.30f     /* rad / sec auto-orbit               */
-#define ORBIT_PITCH_DEF   0.25f     /* default static tilt above equator  */
-#define MANUAL_YAW_STEP   0.12f
+#define CAM_DIST_DEFAULT 3.2f
+#define CAM_DIST_MIN 1.5f /* outside the bulb's bounding sphere */
+#define CAM_DIST_MAX 8.0f
+#define CAM_DIST_STEP 0.20f
+#define FOV_DEG 45.0f
+#define ORBIT_YAW_RATE 0.30f  /* rad / sec auto-orbit               */
+#define ORBIT_PITCH_DEF 0.25f /* default static tilt above equator  */
+#define MANUAL_YAW_STEP 0.12f
 #define MANUAL_PITCH_STEP 0.08f
-#define MANUAL_PITCH_MAX  1.30f     /* clamp short of the poles           */
+#define MANUAL_PITCH_MAX 1.30f /* clamp short of the poles           */
 
 /* §1.10 quantisation — number of glyph / colour slots. */
-#define LUMA_SLOTS       8
-#define LUMA_SLOT_FLT    7.999f     /* (LUMA_SLOTS - 0.001) */
+#define LUMA_SLOTS 8
+#define LUMA_SLOT_FLT 7.999f /* (LUMA_SLOTS - 0.001) */
 
 /* §1.11 themes — five 8-tier 256-colour ramps.
  *
@@ -586,9 +586,9 @@ enum {
  * which would invert the brightness intent against a light bg).
  */
 typedef struct {
-    const char *name;
-    short       ramp[LUMA_SLOTS];
-    bool        inverted;
+  const char *name;
+  short ramp[LUMA_SLOTS];
+  bool inverted;
 } Theme;
 
 #define N_THEMES 5
@@ -596,48 +596,41 @@ typedef struct {
 static const Theme THEMES[N_THEMES] = {
     /* CLASSIC: warm crimson → red → orange → amber → bone — Daniel
      * White's iconic "alien fruit lit by sunset" palette. */
-    { "CLASSIC ",
-      { 124, 160, 196, 202, 208, 214, 220, 229 }, false },
+    {"CLASSIC ", {124, 160, 196, 202, 208, 214, 220, 229}, false},
 
     /* ICE: deep teal → bright cyan → ice → near-white. */
-    { "ICE     ",
-      {  30,  37,  44,  51,  87, 123, 159, 195 }, false },
+    {"ICE     ", {30, 37, 44, 51, 87, 123, 159, 195}, false},
 
     /* PLASMA: high-saturation neon arc — magenta → cyan → yellow. */
-    { "PLASMA  ",
-      { 125, 165, 207, 213,  87, 123, 220, 229 }, false },
+    {"PLASMA  ", {125, 165, 207, 213, 87, 123, 220, 229}, false},
 
     /* MONO: clean grayscale — best for studying fractal shape. */
-    { "MONO    ",
-      { 240, 244, 247, 250, 252, 253, 254, 231 }, false },
+    {"MONO    ", {240, 244, 247, 250, 252, 253, 254, 231}, false},
 
     /* NEGATIVE: photographic-negative inversion (see comment above). */
-    { "NEGATIVE",
-      { 253, 250, 245, 240, 237, 234, 232,  16 }, true  },
+    {"NEGATIVE", {253, 250, 245, 240, 237, 234, 232, 16}, true},
 };
 
 /* §1.12 luminance ramp — slot 0 = `.` (faint), slot 7 = `@` (solid).
  * No space at slot 0 so even the dimmest hit pixel paints something
  * visible against the background. */
-static const char LUMA_GLYPHS[LUMA_SLOTS] = {
-    '.', ',', ':', ';', '+', '*', '#', '@'
-};
+static const char LUMA_GLYPHS[LUMA_SLOTS] = {'.', ',', ':', ';',
+                                             '+', '*', '#', '@'};
 
 /* ── §2 clock — monotonic timer + sleep ──────────────────────────────── */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = { .tv_sec  = (time_t)(ns / NS_PER_SEC),
-                            .tv_nsec = (long)  (ns % NS_PER_SEC) };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {.tv_sec = (time_t)(ns / NS_PER_SEC),
+                         .tv_nsec = (long)(ns % NS_PER_SEC)};
+  nanosleep(&req, NULL);
 }
 
 /* ── §3 color — depth ramp + HUD/hint pairs ──────────────────────────── *
@@ -651,66 +644,71 @@ static void clock_sleep_ns(int64_t ns)
  * fractal draws over it.
  */
 
-static void theme_apply(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    const Theme *t = &THEMES[idx];
-    short bg256 = t->inverted ? 231        : -1;
-    short bg8   = t->inverted ? COLOR_WHITE : -1;
+static void theme_apply(int idx) {
+  if (idx < 0 || idx >= N_THEMES)
+    idx = 0;
+  const Theme *t = &THEMES[idx];
+  short bg256 = t->inverted ? 231 : -1;
+  short bg8 = t->inverted ? COLOR_WHITE : -1;
 
-    if (COLORS >= 256) {
-        for (int i = 0; i < LUMA_SLOTS; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], bg256);
-    } else {
-        static const short FB[LUMA_SLOTS] = {
-            COLOR_BLUE, COLOR_BLUE, COLOR_MAGENTA, COLOR_MAGENTA,
-            COLOR_RED,  COLOR_RED,  COLOR_YELLOW,  COLOR_WHITE,
-        };
-        for (int i = 0; i < LUMA_SLOTS; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i),
-                      t->inverted ? COLOR_BLACK : FB[i], bg8);
-    }
+  if (COLORS >= 256) {
+    for (int i = 0; i < LUMA_SLOTS; i++)
+      init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], bg256);
+  } else {
+    static const short FB[LUMA_SLOTS] = {
+        COLOR_BLUE, COLOR_BLUE, COLOR_MAGENTA, COLOR_MAGENTA,
+        COLOR_RED,  COLOR_RED,  COLOR_YELLOW,  COLOR_WHITE,
+    };
+    for (int i = 0; i < LUMA_SLOTS; i++)
+      init_pair((short)(PAIR_RAMP_BASE + i), t->inverted ? COLOR_BLACK : FB[i],
+                bg8);
+  }
 }
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
-        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
-    theme_apply(0);
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
+  theme_apply(0);
 }
 
 /* ── §4 vec3 — value-type 3-D math ───────────────────────────────────── */
 
-typedef struct { float x, y, z; } V3;
+typedef struct {
+  float x, y, z;
+} V3;
 
-static inline V3    v3   (float x, float y, float z) { return (V3){x, y, z}; }
-static inline V3    v3add(V3 a, V3 b)                { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
-static inline V3    v3sub(V3 a, V3 b)                { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
-static inline V3    v3scale(float s, V3 a)           { return v3(s*a.x, s*a.y, s*a.z); }
-static inline float v3dot(V3 a, V3 b)                { return a.x*b.x + a.y*b.y + a.z*b.z; }
-static inline V3    v3cross(V3 a, V3 b)
-{
-    return v3(a.y*b.z - a.z*b.y,
-              a.z*b.x - a.x*b.z,
-              a.x*b.y - a.y*b.x);
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
+static inline V3 v3add(V3 a, V3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline V3 v3sub(V3 a, V3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline V3 v3scale(float s, V3 a) {
+  return v3(s * a.x, s * a.y, s * a.z);
+}
+static inline float v3dot(V3 a, V3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline V3 v3cross(V3 a, V3 b) {
+  return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x);
 }
 static inline float v3len(V3 a) { return sqrtf(v3dot(a, a)); }
-static inline V3    v3norm(V3 a)
-{
-    float L = v3len(a);
-    return (L > 1e-12f) ? v3scale(1.0f / L, a) : v3(0, 1, 0);
+static inline V3 v3norm(V3 a) {
+  float L = v3len(a);
+  return (L > 1e-12f) ? v3scale(1.0f / L, a) : v3(0, 1, 0);
 }
 
-static inline float clampf(float x, float lo, float hi)
-{
-    return x < lo ? lo : (x > hi ? hi : x);
+static inline float clampf(float x, float lo, float hi) {
+  return x < lo ? lo : (x > hi ? hi : x);
 }
 
 /* ── §5 mandelbulb — iteration + DE + smooth iter + normal ───────────── *
@@ -723,35 +721,33 @@ static inline float clampf(float x, float lo, float hi)
  */
 
 /* z in spherical coords: r = |z|, θ = polar from +y, φ = azimuth in xz */
-typedef struct { float r, theta, phi; } Spherical;
+typedef struct {
+  float r, theta, phi;
+} Spherical;
 
-static inline Spherical to_spherical(V3 z)
-{
-    float r = sqrtf(z.x*z.x + z.y*z.y + z.z*z.z);
-    Spherical s = { r, 0.0f, 0.0f };
-    if (r > 1e-20f) {
-        s.theta = acosf(z.y / r);
-        s.phi   = atan2f(z.z, z.x);
-    }
-    return s;
+static inline Spherical to_spherical(V3 z) {
+  float r = sqrtf(z.x * z.x + z.y * z.y + z.z * z.z);
+  Spherical s = {r, 0.0f, 0.0f};
+  if (r > 1e-20f) {
+    s.theta = acosf(z.y / r);
+    s.phi = atan2f(z.z, z.x);
+  }
+  return s;
 }
 
 /* dr_new = p · r^(p−1) · dr + 1   (running derivative magnitude, T4) */
-static inline float update_dr(float dr, float r)
-{
-    return powf(r, MANDELBULB_POWER - 1.0f) * MANDELBULB_POWER * dr + 1.0f;
+static inline float update_dr(float dr, float r) {
+  return powf(r, MANDELBULB_POWER - 1.0f) * MANDELBULB_POWER * dr + 1.0f;
 }
 
 /* z' = r^p · (sin pθ · cos pφ, cos pθ, sin pθ · sin pφ) + c   (T3) */
-static inline V3 apply_power_and_add(Spherical s, V3 c)
-{
-    float zr     = powf(s.r, MANDELBULB_POWER);
-    float p_th   = MANDELBULB_POWER * s.theta;
-    float p_ph   = MANDELBULB_POWER * s.phi;
-    float sin_th = sinf(p_th);
-    return v3(zr * sin_th * cosf(p_ph) + c.x,
-              zr * cosf(p_th)          + c.y,
-              zr * sin_th * sinf(p_ph) + c.z);
+static inline V3 apply_power_and_add(Spherical s, V3 c) {
+  float zr = powf(s.r, MANDELBULB_POWER);
+  float p_th = MANDELBULB_POWER * s.theta;
+  float p_ph = MANDELBULB_POWER * s.phi;
+  float sin_th = sinf(p_th);
+  return v3(zr * sin_th * cosf(p_ph) + c.x, zr * cosf(p_th) + c.y,
+            zr * sin_th * sinf(p_ph) + c.z);
 }
 
 /*
@@ -760,36 +756,35 @@ static inline V3 apply_power_and_add(Spherical s, V3 c)
  * writes the smooth (continuous) escape iteration count.  Pass NULL
  * when computing normals (no need for the smooth count there).
  */
-static float mandelbulb_de(V3 p, int max_iter, float *smooth_out)
-{
-    V3        z         = p;
-    float     dr        = 1.0f;
-    Spherical s         = { 0.0f, 0.0f, 0.0f };
-    int       i;
+static float mandelbulb_de(V3 p, int max_iter, float *smooth_out) {
+  V3 z = p;
+  float dr = 1.0f;
+  Spherical s = {0.0f, 0.0f, 0.0f};
+  int i;
 
-    const float log2_power = log2f(MANDELBULB_POWER);
-    const float log_bail   = logf(BAILOUT);
+  const float log2_power = log2f(MANDELBULB_POWER);
+  const float log_bail = logf(BAILOUT);
 
-    for (i = 0; i < max_iter; i++) {
-        s  = to_spherical(z);
-        if (s.r > BAILOUT) break;
-        dr = update_dr(dr, s.r);
-        z  = apply_power_and_add(s, p);
+  for (i = 0; i < max_iter; i++) {
+    s = to_spherical(z);
+    if (s.r > BAILOUT)
+      break;
+    dr = update_dr(dr, s.r);
+    z = apply_power_and_add(s, p);
+  }
+
+  if (smooth_out) {
+    if (i >= max_iter) {
+      *smooth_out = (float)max_iter; /* didn't escape */
+    } else {
+      float ln_r = logf(s.r);
+      if (ln_r > 0.0f && log_bail > 0.0f)
+        *smooth_out = (float)i + 1.0f - log2f(ln_r / log_bail) / log2_power;
+      else
+        *smooth_out = (float)i;
     }
-
-    if (smooth_out) {
-        if (i >= max_iter) {
-            *smooth_out = (float)max_iter;       /* didn't escape */
-        } else {
-            float ln_r = logf(s.r);
-            if (ln_r > 0.0f && log_bail > 0.0f)
-                *smooth_out = (float)i + 1.0f
-                            - log2f(ln_r / log_bail) / log2_power;
-            else
-                *smooth_out = (float)i;
-        }
-    }
-    return 0.5f * logf(s.r) * s.r / dr;
+  }
+  return 0.5f * logf(s.r) * s.r / dr;
 }
 
 /*
@@ -797,16 +792,15 @@ static float mandelbulb_de(V3 p, int max_iter, float *smooth_out)
  * Two DE evals per axis × 3 axes = 6 DEs total (no smooth count needed).
  * Symmetric around p so the resulting N has no octant bias.
  */
-static V3 mandelbulb_normal(V3 p, int max_iter)
-{
-    float e = NORMAL_EPS;
-    float dx = mandelbulb_de(v3(p.x + e, p.y, p.z), max_iter, NULL)
-             - mandelbulb_de(v3(p.x - e, p.y, p.z), max_iter, NULL);
-    float dy = mandelbulb_de(v3(p.x, p.y + e, p.z), max_iter, NULL)
-             - mandelbulb_de(v3(p.x, p.y - e, p.z), max_iter, NULL);
-    float dz = mandelbulb_de(v3(p.x, p.y, p.z + e), max_iter, NULL)
-             - mandelbulb_de(v3(p.x, p.y, p.z - e), max_iter, NULL);
-    return v3norm(v3(dx, dy, dz));
+static V3 mandelbulb_normal(V3 p, int max_iter) {
+  float e = NORMAL_EPS;
+  float dx = mandelbulb_de(v3(p.x + e, p.y, p.z), max_iter, NULL) -
+             mandelbulb_de(v3(p.x - e, p.y, p.z), max_iter, NULL);
+  float dy = mandelbulb_de(v3(p.x, p.y + e, p.z), max_iter, NULL) -
+             mandelbulb_de(v3(p.x, p.y - e, p.z), max_iter, NULL);
+  float dz = mandelbulb_de(v3(p.x, p.y, p.z + e), max_iter, NULL) -
+             mandelbulb_de(v3(p.x, p.y, p.z - e), max_iter, NULL);
+  return v3norm(v3(dx, dy, dz));
 }
 
 /* ── §6 march — sphere trace + soft shadow + AO + Phong shade ────────── *
@@ -819,33 +813,33 @@ static V3 mandelbulb_normal(V3 p, int max_iter)
  */
 
 typedef struct {
-    bool  hit;
-    V3    p;
-    int   march_steps;     /* AO signal: more steps = more occluded */
+  bool hit;
+  V3 p;
+  int march_steps; /* AO signal: more steps = more occluded */
 } TraceResult;
 
-static TraceResult sphere_trace(V3 origin, V3 dir, int max_iter)
-{
-    TraceResult tr = { false, {0, 0, 0}, 0 };
-    float t = 0.0f;
-    int   step;
+static TraceResult sphere_trace(V3 origin, V3 dir, int max_iter) {
+  TraceResult tr = {false, {0, 0, 0}, 0};
+  float t = 0.0f;
+  int step;
 
-    for (step = 0; step < MAX_STEPS; step++) {
-        V3    p   = v3add(origin, v3scale(t, dir));
-        float d   = mandelbulb_de(p, max_iter, NULL);
-        float eps = HIT_EPS * (1.0f + t * ADAPTIVE_FACTOR);
+  for (step = 0; step < MAX_STEPS; step++) {
+    V3 p = v3add(origin, v3scale(t, dir));
+    float d = mandelbulb_de(p, max_iter, NULL);
+    float eps = HIT_EPS * (1.0f + t * ADAPTIVE_FACTOR);
 
-        if (d < eps) {
-            tr.hit         = true;
-            tr.p           = p;
-            tr.march_steps = step;
-            return tr;
-        }
-        if (t > MAX_T) break;
-        t += d * STEP_RELAX;
+    if (d < eps) {
+      tr.hit = true;
+      tr.p = p;
+      tr.march_steps = step;
+      return tr;
     }
-    tr.march_steps = step;
-    return tr;
+    if (t > MAX_T)
+      break;
+    t += d * STEP_RELAX;
+  }
+  tr.march_steps = step;
+  return tr;
 }
 
 /*
@@ -854,24 +848,26 @@ static TraceResult sphere_trace(V3 origin, V3 dir, int max_iter)
  * minimum SHADOW_K · DE / t over the shadow march; that minimum
  * naturally produces a soft penumbra without any extra rays.
  */
-static float soft_shadow(V3 origin, V3 light_dir, int max_iter)
-{
-    float result = 1.0f;
-    float t      = SHADOW_NEAR;     /* offset off the surface to avoid self-shadow */
+static float soft_shadow(V3 origin, V3 light_dir, int max_iter) {
+  float result = 1.0f;
+  float t = SHADOW_NEAR; /* offset off the surface to avoid self-shadow */
 
-    for (int i = 0; i < SHADOW_STEPS; i++) {
-        V3    p = v3add(origin, v3scale(t, light_dir));
-        float d = mandelbulb_de(p, max_iter, NULL);
+  for (int i = 0; i < SHADOW_STEPS; i++) {
+    V3 p = v3add(origin, v3scale(t, light_dir));
+    float d = mandelbulb_de(p, max_iter, NULL);
 
-        if (d < HIT_EPS) return SHADOW_FLOOR;     /* fully blocked */
+    if (d < HIT_EPS)
+      return SHADOW_FLOOR; /* fully blocked */
 
-        float k = SHADOW_K * d / t;
-        if (k < result) result = k;
+    float k = SHADOW_K * d / t;
+    if (k < result)
+      result = k;
 
-        t += d;
-        if (t > SHADOW_FAR) break;
-    }
-    return clampf(result, SHADOW_FLOOR, 1.0f);
+    t += d;
+    if (t > SHADOW_FAR)
+      break;
+  }
+  return clampf(result, SHADOW_FLOOR, 1.0f);
 }
 
 /*
@@ -879,118 +875,115 @@ static float soft_shadow(V3 origin, V3 light_dir, int max_iter)
  *      L = AMBIENT + (1 − AMBIENT) · max(0, N·L_dir) · soft · ao
  * The cheap AO uses the trace's step count as a concavity proxy (T6).
  */
-static float shade(V3 hit_p, V3 normal, V3 light_dir,
-                   int max_iter, int march_steps)
-{
-    float ndl = v3dot(normal, light_dir);
-    if (ndl < 0.0f) ndl = 0.0f;
+static float shade(V3 hit_p, V3 normal, V3 light_dir, int max_iter,
+                   int march_steps) {
+  float ndl = v3dot(normal, light_dir);
+  if (ndl < 0.0f)
+    ndl = 0.0f;
 
-    float soft = soft_shadow(hit_p, light_dir, max_iter);
+  float soft = soft_shadow(hit_p, light_dir, max_iter);
 
-    float ao = 1.0f - ((float)march_steps / (float)MAX_STEPS) * AO_STRENGTH;
-    if (ao < AO_FLOOR) ao = AO_FLOOR;
+  float ao = 1.0f - ((float)march_steps / (float)MAX_STEPS) * AO_STRENGTH;
+  if (ao < AO_FLOOR)
+    ao = AO_FLOOR;
 
-    return clampf(AMBIENT + (1.0f - AMBIENT) * ndl * soft * ao, 0.0f, 1.0f);
+  return clampf(AMBIENT + (1.0f - AMBIENT) * ndl * soft * ao, 0.0f, 1.0f);
 }
 
 /* ── §7 scene — camera basis, ray gen, decorate + emit, render ───────── */
 
 typedef struct {
-    bool   paused;
-    int    current_theme;
-    int    iters;
-    int    cols, rows;
+  bool paused;
+  int current_theme;
+  int iters;
+  int cols, rows;
 
-    /* Camera (T8). */
-    float  cam_dist;
-    float  orbit_yaw;            /* auto-advancing                    */
-    float  orbit_pitch;          /* fixed default tilt                */
-    float  user_yaw, user_pitch; /* manual offsets via arrow keys     */
+  /* Camera (T8). */
+  float cam_dist;
+  float orbit_yaw;            /* auto-advancing                    */
+  float orbit_pitch;          /* fixed default tilt                */
+  float user_yaw, user_pitch; /* manual offsets via arrow keys     */
 } Scene;
 
-static void scene_init(Scene *s, int cols, int rows)
-{
-    memset(s, 0, sizeof *s);
-    s->paused        = false;
-    s->current_theme = 0;
-    s->iters         = ITERS_DEFAULT;
-    s->cols          = cols;
-    s->rows          = rows;
-    s->cam_dist      = CAM_DIST_DEFAULT;
-    s->orbit_yaw     = 0.5f;
-    s->orbit_pitch   = ORBIT_PITCH_DEF;
-    s->user_yaw      = 0.0f;
-    s->user_pitch    = 0.0f;
+static void scene_init(Scene *s, int cols, int rows) {
+  memset(s, 0, sizeof *s);
+  s->paused = false;
+  s->current_theme = 0;
+  s->iters = ITERS_DEFAULT;
+  s->cols = cols;
+  s->rows = rows;
+  s->cam_dist = CAM_DIST_DEFAULT;
+  s->orbit_yaw = 0.5f;
+  s->orbit_pitch = ORBIT_PITCH_DEF;
+  s->user_yaw = 0.0f;
+  s->user_pitch = 0.0f;
 }
 
-static void scene_resize(Scene *s, int cols, int rows)
-{
-    s->cols = cols;
-    s->rows = rows;
+static void scene_resize(Scene *s, int cols, int rows) {
+  s->cols = cols;
+  s->rows = rows;
 }
 
-static void scene_reset_cam(Scene *s)
-{
-    s->cam_dist     = CAM_DIST_DEFAULT;
-    s->orbit_yaw    = 0.5f;
-    s->orbit_pitch  = ORBIT_PITCH_DEF;
-    s->user_yaw     = 0.0f;
-    s->user_pitch   = 0.0f;
+static void scene_reset_cam(Scene *s) {
+  s->cam_dist = CAM_DIST_DEFAULT;
+  s->orbit_yaw = 0.5f;
+  s->orbit_pitch = ORBIT_PITCH_DEF;
+  s->user_yaw = 0.0f;
+  s->user_pitch = 0.0f;
 }
 
-static void scene_tick(Scene *s, float dt)
-{
-    if (s->paused) return;
-    s->orbit_yaw += ORBIT_YAW_RATE * dt;
-    if (s->orbit_yaw >  (float)(2.0 * M_PI)) s->orbit_yaw -= (float)(2.0 * M_PI);
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
+  s->orbit_yaw += ORBIT_YAW_RATE * dt;
+  if (s->orbit_yaw > (float)(2.0 * M_PI))
+    s->orbit_yaw -= (float)(2.0 * M_PI);
 }
 
 /* §7.1 camera basis + per-pixel ray generation (T8). */
 
 typedef struct {
-    V3    origin;
-    V3    fwd, right, up;
-    float fov_t;
-    float phys_aspect;
+  V3 origin;
+  V3 fwd, right, up;
+  float fov_t;
+  float phys_aspect;
 } Camera;
 
-static Camera camera_basis(const Scene *s, int rows_eff)
-{
-    float yaw   = s->orbit_yaw   + s->user_yaw;
-    float pitch = clampf(s->orbit_pitch + s->user_pitch,
-                         -MANUAL_PITCH_MAX, MANUAL_PITCH_MAX);
+static Camera camera_basis(const Scene *s, int rows_eff) {
+  float yaw = s->orbit_yaw + s->user_yaw;
+  float pitch = clampf(s->orbit_pitch + s->user_pitch, -MANUAL_PITCH_MAX,
+                       MANUAL_PITCH_MAX);
 
-    Camera c;
-    c.origin = v3(s->cam_dist * cosf(pitch) * cosf(yaw),
-                  s->cam_dist * sinf(pitch),
-                  s->cam_dist * cosf(pitch) * sinf(yaw));
-    c.fwd         = v3norm(v3sub(v3(0, 0, 0), c.origin));
-    V3 wup        = v3(0, 1, 0);
-    c.right       = v3norm(v3cross(c.fwd, wup));
-    c.up          = v3cross(c.right, c.fwd);
-    c.fov_t       = tanf(FOV_DEG * (float)M_PI / 180.0f * 0.5f);
-    c.phys_aspect = ((float)rows_eff * CELL_ASPECT) / (float)s->cols;
-    return c;
+  Camera c;
+  c.origin =
+      v3(s->cam_dist * cosf(pitch) * cosf(yaw), s->cam_dist * sinf(pitch),
+         s->cam_dist * cosf(pitch) * sinf(yaw));
+  c.fwd = v3norm(v3sub(v3(0, 0, 0), c.origin));
+  V3 wup = v3(0, 1, 0);
+  c.right = v3norm(v3cross(c.fwd, wup));
+  c.up = v3cross(c.right, c.fwd);
+  c.fov_t = tanf(FOV_DEG * (float)M_PI / 180.0f * 0.5f);
+  c.phys_aspect = ((float)rows_eff * CELL_ASPECT) / (float)s->cols;
+  return c;
 }
 
-static V3 pixel_ray(int col, int row, int cols, int rows_eff, const Camera *c)
-{
-    float u =  ((float)col + 0.5f) / (float)cols     * 2.0f - 1.0f;
-    float v = -(((float)row + 0.5f) / (float)rows_eff * 2.0f - 1.0f);
-    V3 sx = v3scale(u * c->fov_t,                  c->right);
-    V3 sy = v3scale(v * c->fov_t * c->phys_aspect, c->up);
-    return v3norm(v3add(c->fwd, v3add(sx, sy)));
+static V3 pixel_ray(int col, int row, int cols, int rows_eff, const Camera *c) {
+  float u = ((float)col + 0.5f) / (float)cols * 2.0f - 1.0f;
+  float v = -(((float)row + 0.5f) / (float)rows_eff * 2.0f - 1.0f);
+  V3 sx = v3scale(u * c->fov_t, c->right);
+  V3 sy = v3scale(v * c->fov_t * c->phys_aspect, c->up);
+  return v3norm(v3add(c->fwd, v3add(sx, sy)));
 }
 
 /* §7.2 hit assembly + cell decoration. */
 
 typedef struct {
-    bool  hit;
-    V3    p;
-    V3    normal;
-    float smooth;          /* smooth iteration count (for colour)   */
-    float luminance;       /* final shaded value in [0, 1]          */
-    int   march_steps;
+  bool hit;
+  V3 p;
+  V3 normal;
+  float smooth;    /* smooth iteration count (for colour)   */
+  float luminance; /* final shaded value in [0, 1]          */
+  int march_steps;
 } Hit;
 
 /*
@@ -998,29 +991,34 @@ typedef struct {
  * luminance.  Concentrates every per-hit DE evaluation in one place
  * so the cost is auditable.
  */
-static Hit assemble_hit(TraceResult tr, int max_iter, V3 light)
-{
-    Hit h = { tr.hit, tr.p, v3(0, 1, 0), 0.0f, 0.0f, tr.march_steps };
-    if (!tr.hit) return h;
-
-    h.normal = mandelbulb_normal(tr.p, max_iter);
-    (void)mandelbulb_de(tr.p, max_iter, &h.smooth);
-    h.luminance = shade(tr.p, h.normal, light, max_iter, tr.march_steps);
+static Hit assemble_hit(TraceResult tr, int max_iter, V3 light) {
+  Hit h = {tr.hit, tr.p, v3(0, 1, 0), 0.0f, 0.0f, tr.march_steps};
+  if (!tr.hit)
     return h;
+
+  h.normal = mandelbulb_normal(tr.p, max_iter);
+  (void)mandelbulb_de(tr.p, max_iter, &h.smooth);
+  h.luminance = shade(tr.p, h.normal, light, max_iter, tr.march_steps);
+  return h;
 }
 
 /*
  * Cell — (glyph, colour pair, attribute) for one terminal cell.
  * pair < 0 is the miss sentinel (don't paint anything).
  */
-typedef struct { char glyph; int pair; attr_t attr; } Cell;
+typedef struct {
+  char glyph;
+  int pair;
+  attr_t attr;
+} Cell;
 
-static int to_slot(float x_01)
-{
-    int s = (int)(x_01 * LUMA_SLOT_FLT);
-    if (s < 0)             s = 0;
-    if (s >= LUMA_SLOTS)   s = LUMA_SLOTS - 1;
-    return s;
+static int to_slot(float x_01) {
+  int s = (int)(x_01 * LUMA_SLOT_FLT);
+  if (s < 0)
+    s = 0;
+  if (s >= LUMA_SLOTS)
+    s = LUMA_SLOTS - 1;
+  return s;
 }
 
 /*
@@ -1028,110 +1026,121 @@ static int to_slot(float x_01)
  * for inverted themes because A_BOLD's "lighter" effect REDUCES
  * contrast against a white bg.
  */
-static attr_t luma_attr(int slot, bool inverted)
-{
-    if (inverted)        return A_NORMAL;
-    if (slot >= 6)       return A_BOLD;
-    if (slot <= 1)       return A_DIM;
-    return                      A_NORMAL;
+static attr_t luma_attr(int slot, bool inverted) {
+  if (inverted)
+    return A_NORMAL;
+  if (slot >= 6)
+    return A_BOLD;
+  if (slot <= 1)
+    return A_DIM;
+  return A_NORMAL;
 }
 
 /* shade_hit — per-pixel decoration (Hit → Cell).  Glyph from
  * luminance slot; colour pair from smooth-iter slot. */
-static Cell shade_hit(const Hit *h, int max_iter, bool inverted)
-{
-    if (!h->hit) {
-        return (Cell){ ' ', -1, 0 };       /* miss → don't paint */
-    }
-    int s_lum = to_slot(h->luminance);
-    int s_clr = to_slot(h->smooth / (float)max_iter);
-    return (Cell){
-        .glyph = LUMA_GLYPHS[s_lum],
-        .pair  = PAIR_RAMP_BASE + s_clr,
-        .attr  = luma_attr(s_lum, inverted),
-    };
+static Cell shade_hit(const Hit *h, int max_iter, bool inverted) {
+  if (!h->hit) {
+    return (Cell){' ', -1, 0}; /* miss → don't paint */
+  }
+  int s_lum = to_slot(h->luminance);
+  int s_clr = to_slot(h->smooth / (float)max_iter);
+  return (Cell){
+      .glyph = LUMA_GLYPHS[s_lum],
+      .pair = PAIR_RAMP_BASE + s_clr,
+      .attr = luma_attr(s_lum, inverted),
+  };
 }
 
 /*
  * emit_cell — paint one cell with attron/attroff batched on (pair, attr)
  * change.  Halves attribute thrash on uniform regions.
  */
-static void emit_cell(int row, int col, Cell c,
-                      int *last_pair, attr_t *last_attr)
-{
-    if (c.pair < 0) return;       /* miss — leave the cell as-is */
+static void emit_cell(int row, int col, Cell c, int *last_pair,
+                      attr_t *last_attr) {
+  if (c.pair < 0)
+    return; /* miss — leave the cell as-is */
 
-    if (c.pair != *last_pair || c.attr != *last_attr) {
-        if (*last_pair >= 0) attroff(COLOR_PAIR(*last_pair) | *last_attr);
-        attron(COLOR_PAIR(c.pair) | c.attr);
-        *last_pair = c.pair;
-        *last_attr = c.attr;
-    }
-    mvaddch(row, col, (chtype)(unsigned char)c.glyph);
+  if (c.pair != *last_pair || c.attr != *last_attr) {
+    if (*last_pair >= 0)
+      attroff(COLOR_PAIR(*last_pair) | *last_attr);
+    attron(COLOR_PAIR(c.pair) | c.attr);
+    *last_pair = c.pair;
+    *last_attr = c.attr;
+  }
+  mvaddch(row, col, (chtype)(unsigned char)c.glyph);
 }
 
 /* prefill_canvas — paint the canvas region white before fractal
  * draws over it (inverted themes only).  Misses then naturally
  * show through as white. */
-static void prefill_canvas(int y0, int rows_eff, int cols, bool inverted)
-{
-    if (!inverted) return;
-    attron(COLOR_PAIR(PAIR_RAMP_BASE));
-    for (int row = 0; row < rows_eff; row++)
-        for (int col = 0; col < cols; col++)
-            mvaddch(y0 + row, col, ' ');
-    attroff(COLOR_PAIR(PAIR_RAMP_BASE));
+static void prefill_canvas(int y0, int rows_eff, int cols, bool inverted) {
+  if (!inverted)
+    return;
+  attron(COLOR_PAIR(PAIR_RAMP_BASE));
+  for (int row = 0; row < rows_eff; row++)
+    for (int col = 0; col < cols; col++)
+      mvaddch(y0 + row, col, ' ');
+  attroff(COLOR_PAIR(PAIR_RAMP_BASE));
 }
 
 /* §7.3 scene_render — full-frame raymarch, four-line body. */
-static void scene_render(const Scene *s)
-{
-    int rows_eff = s->rows - HUD_ROWS;
-    if (rows_eff < 1) return;
+static void scene_render(const Scene *s) {
+  int rows_eff = s->rows - HUD_ROWS;
+  if (rows_eff < 1)
+    return;
 
-    bool inverted = THEMES[s->current_theme].inverted;
-    int  y0       = 1;            /* shift down 1 for the top HUD row */
+  bool inverted = THEMES[s->current_theme].inverted;
+  int y0 = 1; /* shift down 1 for the top HUD row */
 
-    prefill_canvas(y0, rows_eff, s->cols, inverted);
+  prefill_canvas(y0, rows_eff, s->cols, inverted);
 
-    Camera cam   = camera_basis(s, rows_eff);
-    V3     light = v3norm(v3(LIGHT_X, LIGHT_Y, LIGHT_Z));
+  Camera cam = camera_basis(s, rows_eff);
+  V3 light = v3norm(v3(LIGHT_X, LIGHT_Y, LIGHT_Z));
 
-    int    last_pair = inverted ? PAIR_RAMP_BASE : -1;
-    attr_t last_attr = 0;
+  int last_pair = inverted ? PAIR_RAMP_BASE : -1;
+  attr_t last_attr = 0;
 
-    for (int row = 0; row < rows_eff; row++) {
-        for (int col = 0; col < s->cols; col++) {
-            V3          ray = pixel_ray(col, row, s->cols, rows_eff, &cam);
-            TraceResult tr  = sphere_trace(cam.origin, ray, s->iters);
-            Hit         h   = assemble_hit(tr, s->iters, light);
-            Cell        c   = shade_hit(&h, s->iters, inverted);
-            emit_cell(y0 + row, col, c, &last_pair, &last_attr);
-        }
+  for (int row = 0; row < rows_eff; row++) {
+    for (int col = 0; col < s->cols; col++) {
+      V3 ray = pixel_ray(col, row, s->cols, rows_eff, &cam);
+      TraceResult tr = sphere_trace(cam.origin, ray, s->iters);
+      Hit h = assemble_hit(tr, s->iters, light);
+      Cell c = shade_hit(&h, s->iters, inverted);
+      emit_cell(y0 + row, col, c, &last_pair, &last_attr);
     }
+  }
 
-    if (last_pair >= 0) attroff(COLOR_PAIR(last_pair) | last_attr);
+  if (last_pair >= 0)
+    attroff(COLOR_PAIR(last_pair) | last_attr);
 }
 
 /* ── §8 screen — ncurses init / resize / HUD / present ───────────────── */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *sc)
-{
-    initscr();
-    noecho(); cbreak(); curs_set(0);
-    nodelay(stdscr, TRUE); keypad(stdscr, TRUE); typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, sc->rows, sc->cols);
+static void screen_init(Screen *sc) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
-static void screen_free        (Screen *sc) { (void)sc; endwin(); }
+static void screen_free(Screen *sc) {
+  (void)sc;
+  endwin();
+}
 
-static void screen_resize_curses(Screen *sc)
-{
-    endwin(); refresh();
-    getmaxyx(stdscr, sc->rows, sc->cols);
+static void screen_resize_curses(Screen *sc) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
 /* HUD layout (CLAUDE.md spec):
@@ -1140,172 +1149,205 @@ static void screen_resize_curses(Screen *sc)
  * Both rows always use A_BOLD so the HUD stays legible against any
  * fractal colour (including inverted-theme white).
  */
-static void hud_draw(const Screen *sc, const Scene *s,
-                     double fps, int sim_fps)
-{
-    char status[140];
-    snprintf(status, sizeof status,
-             " %5.1f fps  %3d Hz  theme:%s  iters:%2d  dist:%4.2f  %s ",
-             fps, sim_fps,
-             THEMES[s->current_theme].name,
-             s->iters, (double)s->cam_dist,
-             s->paused ? "PAUSED" : "running");
-    int slen = (int)strlen(status); if (slen > sc->cols) slen = sc->cols;
+static void hud_draw(const Screen *sc, const Scene *s, double fps,
+                     int sim_fps) {
+  char status[140];
+  snprintf(status, sizeof status,
+           " %5.1f fps  %3d Hz  theme:%s  iters:%2d  dist:%4.2f  %s ", fps,
+           sim_fps, THEMES[s->current_theme].name, s->iters,
+           (double)s->cam_dist, s->paused ? "PAUSED" : "running");
+  int slen = (int)strlen(status);
+  if (slen > sc->cols)
+    slen = sc->cols;
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, sc->cols - slen, "%s", status);
-    mvprintw(0, 0, " MANDELBULB ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, sc->cols - slen, "%s", status);
+  mvprintw(0, 0, " MANDELBULB ");
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " q:quit  spc:pause  r:reset  t/T:theme  i/I:iters  "
-             "z/Z:zoom  arrows:orbit ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(sc->rows - 1, 0,
+           " q:quit  spc:pause  r:reset  t/T:theme  i/I:iters  "
+           "z/Z:zoom  arrows:orbit ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
-{
-    erase();
-    scene_render(s);
-    hud_draw(sc, s, fps, sim_fps);
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+  erase();
+  scene_render(s);
+  hud_draw(sc, s, fps, sim_fps);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ── §9 app — main loop, signals, key handling ───────────────────────── */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup         (void)    { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void app_do_resize(App *app)
-{
-    screen_resize_curses(&app->screen);
-    scene_resize(&app->scene, app->screen.cols, app->screen.rows);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  screen_resize_curses(&app->screen);
+  scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':           s->paused = !s->paused;                       break;
-    case 'r': case 'R': scene_reset_cam(s); s->iters = ITERS_DEFAULT; break;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_reset_cam(s);
+    s->iters = ITERS_DEFAULT;
+    break;
 
-    case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
-        theme_apply(s->current_theme);
-        break;
-    case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
-        theme_apply(s->current_theme);
-        break;
+  case 't':
+    s->current_theme = (s->current_theme + 1) % N_THEMES;
+    theme_apply(s->current_theme);
+    break;
+  case 'T':
+    s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
+    theme_apply(s->current_theme);
+    break;
 
-    case 'i': if (s->iters > ITERS_MIN) s->iters--; break;
-    case 'I': if (s->iters < ITERS_MAX) s->iters++; break;
+  case 'i':
+    if (s->iters > ITERS_MIN)
+      s->iters--;
+    break;
+  case 'I':
+    if (s->iters < ITERS_MAX)
+      s->iters++;
+    break;
 
-    case 'z':
-        s->cam_dist -= CAM_DIST_STEP;
-        if (s->cam_dist < CAM_DIST_MIN) s->cam_dist = CAM_DIST_MIN;
-        break;
-    case 'Z':
-        s->cam_dist += CAM_DIST_STEP;
-        if (s->cam_dist > CAM_DIST_MAX) s->cam_dist = CAM_DIST_MAX;
-        break;
+  case 'z':
+    s->cam_dist -= CAM_DIST_STEP;
+    if (s->cam_dist < CAM_DIST_MIN)
+      s->cam_dist = CAM_DIST_MIN;
+    break;
+  case 'Z':
+    s->cam_dist += CAM_DIST_STEP;
+    if (s->cam_dist > CAM_DIST_MAX)
+      s->cam_dist = CAM_DIST_MAX;
+    break;
 
-    case KEY_LEFT:  s->user_yaw   -= MANUAL_YAW_STEP;   break;
-    case KEY_RIGHT: s->user_yaw   += MANUAL_YAW_STEP;   break;
-    case KEY_UP:    s->user_pitch += MANUAL_PITCH_STEP; break;
-    case KEY_DOWN:  s->user_pitch -= MANUAL_PITCH_STEP; break;
+  case KEY_LEFT:
+    s->user_yaw -= MANUAL_YAW_STEP;
+    break;
+  case KEY_RIGHT:
+    s->user_yaw += MANUAL_YAW_STEP;
+    break;
+  case KEY_UP:
+    s->user_pitch += MANUAL_PITCH_STEP;
+    break;
+  case KEY_DOWN:
+    s->user_pitch -= MANUAL_PITCH_STEP;
+    break;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    default: break;
-    }
-    return true;
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+int main(void) {
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
-    scene_init (&app->scene, app->screen.cols, app->screen.rows);
+  screen_init(&app->screen);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
-
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accum -= tick_ns;
-        }
-
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        screen_draw   (&app->screen, &app->scene, fps_display, app->sim_fps);
-        screen_present();
-
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns();
+      sim_accum = 0;
     }
 
-    screen_free(&app->screen);
-    return 0;
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > 100 * NS_PER_MS)
+      dt = 100 * NS_PER_MS;
+
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
+
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, dt_sec);
+      sim_accum -= tick_ns;
+    }
+
+    frame_count++;
+    fps_accum += dt;
+    if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display =
+          (double)frame_count / ((double)fps_accum / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accum = 0;
+    }
+
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
+    screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
+    screen_present();
+
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  screen_free(&app->screen);
+  return 0;
 }

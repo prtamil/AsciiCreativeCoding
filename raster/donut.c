@@ -378,10 +378,9 @@
  *         ╲       ╱                              ●
  *          ╲     ╱                          (a)  ●  ────────────●  ← x/z big
  *           ╲   ╱                                ●    z = 2
- *            ╲ ╱                          (b)  ●  ────────────────●  ← x/z small
- *      world point ●                            ●         z = 5
- *                                          two points with same
- *                                          x but different z
+ *            ╲ ╱                          (b)  ●  ────────────────●  ← x/z
+ * small world point ●                            ●         z = 5 two points
+ * with same x but different z
  *
  * The minus sign on screen_row is the standard screen-Y-flip
  * (terminal rows grow downward, world y grows upward).  Y_ASPECT
@@ -518,7 +517,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -526,10 +525,10 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ── §1 config — every tunable, every magic number named ─────────────── *
  *
@@ -540,17 +539,17 @@
 
 /* §1.1 — frame rate + UI layout. */
 enum {
-    SIM_FPS_DEFAULT  = 30,
-    FPS_UPDATE_MS    = 500,
-    HUD_STATUS_COLS  = 90,
+  SIM_FPS_DEFAULT = 30,
+  FPS_UPDATE_MS = 500,
+  HUD_STATUS_COLS = 90,
 };
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(fps)    (NS_PER_SEC / (fps))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(fps) (NS_PER_SEC / (fps))
 
 /* §1.2 — angles and π helpers. */
-#define TWO_PI          (2.0f * (float)M_PI)
+#define TWO_PI (2.0f * (float)M_PI)
 
 /* §1.3 — rotation speeds (radians per second).
  *
@@ -559,11 +558,11 @@ enum {
  * Both rates multiply by SPEED_SCALE per ] keypress (and divide on
  * [).  This preserves the relative tumble:spin ratio.
  */
-#define ROT_RATE_A_DEFAULT  1.2f
-#define ROT_RATE_B_DEFAULT  0.6f
-#define SPEED_SCALE         1.3f
-#define SPEED_MIN           0.05f
-#define SPEED_MAX          12.0f
+#define ROT_RATE_A_DEFAULT 1.2f
+#define ROT_RATE_B_DEFAULT 0.6f
+#define SPEED_SCALE 1.3f
+#define SPEED_MIN 0.05f
+#define SPEED_MAX 12.0f
 
 /* §1.4 — torus geometry.
  *
@@ -574,9 +573,9 @@ enum {
  *   TORUS_K2  viewer distance — added to z so the donut sits in
  *             front of the camera (z always positive).
  */
-#define TORUS_R1        1.0f
-#define TORUS_R2        2.0f
-#define TORUS_K2        5.0f
+#define TORUS_R1 1.0f
+#define TORUS_R2 2.0f
+#define TORUS_K2 5.0f
 
 /* §1.5 — perspective sizing (auto-fit + user scale).
  *
@@ -585,10 +584,10 @@ enum {
  * terminal half-dimension.  TORUS_SIZE_SCALE is the user-controlled
  * multiplier on K1, adjustable via = / -.
  */
-#define TORUS_TARGET_FILL   0.42f
-#define TORUS_SIZE_SCALE    1.15f
-#define TORUS_SIZE_MIN      0.30f
-#define TORUS_SIZE_MAX      5.00f
+#define TORUS_TARGET_FILL 0.42f
+#define TORUS_SIZE_SCALE 1.15f
+#define TORUS_SIZE_MIN 0.30f
+#define TORUS_SIZE_MAX 5.00f
 
 /* §1.6 — sample density.
  *
@@ -601,8 +600,8 @@ enum {
  *   N_φ samples  ≈  2π / 0.02  ≈  314
  *   total samples ≈ 28 000 per frame.
  */
-#define THETA_STEP      0.07f
-#define PHI_STEP        0.02f
+#define THETA_STEP 0.07f
+#define PHI_STEP 0.02f
 
 /* §1.7 — terminal cell aspect correction.
  *
@@ -612,7 +611,7 @@ enum {
  * Applied as a multiplier on the projected y so the donut reads as a
  * round shape rather than a vertically stretched ellipse.
  */
-#define Y_ASPECT        0.5f
+#define Y_ASPECT 0.5f
 
 /* §1.8 — luminance ramp.  Twelve glyphs, dim → bright.
  *
@@ -620,7 +619,7 @@ enum {
  * is picked from the same index quantised to LUMI_LEVELS slots.
  */
 static const char LUMI_RAMP[] = ".,-~:;=!*#$@";
-#define LUMI_RAMP_LEN   ((int)(sizeof LUMI_RAMP - 1))   /* = 12 */
+#define LUMI_RAMP_LEN ((int)(sizeof LUMI_RAMP - 1)) /* = 12 */
 
 /* §1.9 — colour-pair scheme.
  *
@@ -632,10 +631,10 @@ static const char LUMI_RAMP[] = ".,-~:;=!*#$@";
  *   PAIR_HINT            bright cyan   (key-hint row, CLAUDE.md spec)
  */
 enum {
-    LUMI_LEVELS      = 8,
-    PAIR_LUMI_BASE   = 1,                     /* +0..+7 */
-    PAIR_HUD         = PAIR_LUMI_BASE + LUMI_LEVELS,    /* = 9  */
-    PAIR_HINT        = PAIR_HUD + 1,                    /* = 10 */
+  LUMI_LEVELS = 8,
+  PAIR_LUMI_BASE = 1,                      /* +0..+7 */
+  PAIR_HUD = PAIR_LUMI_BASE + LUMI_LEVELS, /* = 9  */
+  PAIR_HINT = PAIR_HUD + 1,                /* = 10 */
 };
 
 /* §1.10 — colour themes.
@@ -653,8 +652,8 @@ enum {
  * Press `t` (or `T`) to cycle.  CLASSIC is the default (slot 0).
  */
 typedef struct {
-    const char *display_name;
-    short       ramp_256[LUMI_LEVELS];     /* slot 0 dim → slot 7 bright */
+  const char *display_name;
+  short ramp_256[LUMI_LEVELS]; /* slot 0 dim → slot 7 bright */
 } Theme;
 
 #define THEME_COUNT 6
@@ -662,29 +661,23 @@ typedef struct {
 static const Theme THEMES[THEME_COUNT] = {
     /* CLASSIC — eight greys in the bright half (240..255).
      * The original donut.c look — neutral, professional. */
-    { "CLASSIC ",
-      { 240, 243, 246, 248, 250, 252, 254, 255 } },
+    {"CLASSIC ", {240, 243, 246, 248, 250, 252, 254, 255}},
 
     /* AMBER — old phosphor-monitor amber, deep brown → bright gold.
      * Channels the 1980s green-screen-but-orange aesthetic. */
-    { "AMBER   ",
-      { 130, 136, 166, 172, 178, 208, 214, 220 } },
+    {"AMBER   ", {130, 136, 166, 172, 178, 208, 214, 220}},
 
     /* MATRIX — eight green shades, deep moss → lime.  Cyberpunk. */
-    { "MATRIX  ",
-      {  28,  34,  40,  46,  82, 118, 154, 190 } },
+    {"MATRIX  ", {28, 34, 40, 46, 82, 118, 154, 190}},
 
     /* NEON — magenta → pink → fuchsia → cream-pink.  Synthwave. */
-    { "NEON    ",
-      {  53,  91, 129, 165, 201, 207, 213, 227 } },
+    {"NEON    ", {53, 91, 129, 165, 201, 207, 213, 227}},
 
     /* ICE — navy → bright cyan.  Cool / cold-storage look. */
-    { "ICE     ",
-      {  25,  31,  38,  45,  51,  87, 123, 159 } },
+    {"ICE     ", {25, 31, 38, 45, 51, 87, 123, 159}},
 
     /* COPPER — bronze → orange → amber.  Warm metallic. */
-    { "COPPER  ",
-      {  94, 130, 136, 166, 172, 208, 214, 220 } },
+    {"COPPER  ", {94, 130, 136, 166, 172, 208, 214, 220}},
 };
 
 /* §1.11 — framebuffer sizing.
@@ -693,9 +686,9 @@ static const Theme THEMES[THEME_COUNT] = {
  * clipped — we'd need to malloc to avoid that, but 512 × 256 =
  * 131 072 cells handles every realistic terminal.
  */
-#define TORUS_MAX_COLS    512
-#define TORUS_MAX_ROWS    256
-#define TORUS_MAX_CELLS   (TORUS_MAX_COLS * TORUS_MAX_ROWS)
+#define TORUS_MAX_COLS 512
+#define TORUS_MAX_ROWS 256
+#define TORUS_MAX_CELLS (TORUS_MAX_COLS * TORUS_MAX_ROWS)
 
 /* §1.12 — debug overlays (educational helpers).
  *
@@ -710,18 +703,21 @@ static const Theme THEMES[THEME_COUNT] = {
  *   DEBUG_NO_ZBUF   skip z-buffer test — see what z-buffer prevents
  */
 typedef enum {
-    DEBUG_NORMAL    = 0,
-    DEBUG_DEPTH     = 1,
-    DEBUG_WIRE      = 2,
-    DEBUG_NO_ZBUF   = 3,
-    DEBUG_MODE_COUNT = 4,
+  DEBUG_NORMAL = 0,
+  DEBUG_DEPTH = 1,
+  DEBUG_WIRE = 2,
+  DEBUG_NO_ZBUF = 3,
+  DEBUG_MODE_COUNT = 4,
 } DebugMode;
 
 static const char *DEBUG_MODE_NAMES[DEBUG_MODE_COUNT] = {
-    "NORMAL ", "DEPTH  ", "WIRE   ", "NO_ZBUF",
+    "NORMAL ",
+    "DEPTH  ",
+    "WIRE   ",
+    "NO_ZBUF",
 };
 
-#define DEBUG_WIRE_STRIDE  10        /* paint 1 in every 10 samples */
+#define DEBUG_WIRE_STRIDE 10 /* paint 1 in every 10 samples */
 
 /* ── §2 clock — monotonic timer + sleep ──────────────────────────────── *
  *
@@ -730,21 +726,20 @@ static const char *DEBUG_MODE_NAMES[DEBUG_MODE_COUNT] = {
  * last frame" measurements.
  */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t nanoseconds)
-{
-    if (nanoseconds <= 0) return;
-    struct timespec request = {
-        .tv_sec  = (time_t)(nanoseconds / NS_PER_SEC),
-        .tv_nsec = (long)  (nanoseconds % NS_PER_SEC),
-    };
-    nanosleep(&request, NULL);
+static void clock_sleep_ns(int64_t nanoseconds) {
+  if (nanoseconds <= 0)
+    return;
+  struct timespec request = {
+      .tv_sec = (time_t)(nanoseconds / NS_PER_SEC),
+      .tv_nsec = (long)(nanoseconds % NS_PER_SEC),
+  };
+  nanosleep(&request, NULL);
 }
 
 /* ── §3 color — luminance pairs + theme apply + HUD/hint pairs ───────── *
@@ -767,36 +762,34 @@ static void clock_sleep_ns(int64_t nanoseconds)
  * The eight PAIR_LUMI_BASE pairs simply get re-pointed at new
  * 256-colour codes; nothing else in the program changes.
  */
-static void theme_apply(int theme_index)
-{
-    if (theme_index < 0 || theme_index >= THEME_COUNT) theme_index = 0;
-    const Theme *theme = &THEMES[theme_index];
+static void theme_apply(int theme_index) {
+  if (theme_index < 0 || theme_index >= THEME_COUNT)
+    theme_index = 0;
+  const Theme *theme = &THEMES[theme_index];
 
-    if (COLORS >= 256) {
-        for (int slot = 0; slot < LUMI_LEVELS; slot++)
-            init_pair((short)(PAIR_LUMI_BASE + slot),
-                      theme->ramp_256[slot], -1);
-    } else {
-        /* 8-colour fallback — themes have no effect; we layer
-         * A_DIM/A_BOLD via lumi_attr to fake brightness levels. */
-        for (int slot = 0; slot < LUMI_LEVELS; slot++)
-            init_pair((short)(PAIR_LUMI_BASE + slot), COLOR_WHITE, -1);
-    }
+  if (COLORS >= 256) {
+    for (int slot = 0; slot < LUMI_LEVELS; slot++)
+      init_pair((short)(PAIR_LUMI_BASE + slot), theme->ramp_256[slot], -1);
+  } else {
+    /* 8-colour fallback — themes have no effect; we layer
+     * A_DIM/A_BOLD via lumi_attr to fake brightness levels. */
+    for (int slot = 0; slot < LUMI_LEVELS; slot++)
+      init_pair((short)(PAIR_LUMI_BASE + slot), COLOR_WHITE, -1);
+  }
 }
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
+static void color_init(void) {
+  start_color();
+  use_default_colors();
 
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
-        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
-    theme_apply(0);                      /* default to CLASSIC */
+  if (COLORS >= 256) {
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
+  theme_apply(0); /* default to CLASSIC */
 }
 
 /*
@@ -807,17 +800,20 @@ static void color_init(void)
  *     pair so eight slots still produce three visibly distinct
  *     brightnesses.
  */
-static attr_t lumi_attr(int slot)
-{
-    if (slot < 0)              slot = 0;
-    if (slot > LUMI_LEVELS-1)  slot = LUMI_LEVELS - 1;
+static attr_t lumi_attr(int slot) {
+  if (slot < 0)
+    slot = 0;
+  if (slot > LUMI_LEVELS - 1)
+    slot = LUMI_LEVELS - 1;
 
-    attr_t attr = COLOR_PAIR(PAIR_LUMI_BASE + slot);
-    if (COLORS < 256) {
-        if      (slot < 3) attr |= A_DIM;
-        else if (slot > 5) attr |= A_BOLD;
-    }
-    return attr;
+  attr_t attr = COLOR_PAIR(PAIR_LUMI_BASE + slot);
+  if (COLORS < 256) {
+    if (slot < 3)
+      attr |= A_DIM;
+    else if (slot > 5)
+      attr |= A_BOLD;
+  }
+  return attr;
 }
 
 /* ── §4 math — V2 / V3 / Rot constructors mirror the formulas ────────── *
@@ -832,8 +828,12 @@ static attr_t lumi_attr(int slot)
  * algebra.
  */
 
-typedef struct { float x, y;       } V2;
-typedef struct { float x, y, z;    } V3;
+typedef struct {
+  float x, y;
+} V2;
+typedef struct {
+  float x, y, z;
+} V3;
 
 /*
  * Rot — the four trig values we need at every (θ, φ) sample.
@@ -843,26 +843,21 @@ typedef struct { float x, y, z;    } V3;
  * (each θ × each φ would re-evaluate sin_A and cos_A otherwise).
  */
 typedef struct {
-    float sin_A, cos_A;     /* Euler angle around X (tumble) */
-    float sin_B, cos_B;     /* Euler angle around Z (spin)   */
+  float sin_A, cos_A; /* Euler angle around X (tumble) */
+  float sin_B, cos_B; /* Euler angle around Z (spin)   */
 } Rot;
 
-static inline V2 v2(float x, float y)
-{
-    return (V2){ x, y };
-}
+static inline V2 v2(float x, float y) { return (V2){x, y}; }
 
-static inline V3 v3(float x, float y, float z)
-{
-    return (V3){ x, y, z };
-}
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
 
-static inline Rot rot_make(float angle_A, float angle_B)
-{
-    return (Rot){
-        .sin_A = sinf(angle_A), .cos_A = cosf(angle_A),
-        .sin_B = sinf(angle_B), .cos_B = cosf(angle_B),
-    };
+static inline Rot rot_make(float angle_A, float angle_B) {
+  return (Rot){
+      .sin_A = sinf(angle_A),
+      .cos_A = cosf(angle_A),
+      .sin_B = sinf(angle_B),
+      .cos_B = cosf(angle_B),
+  };
 }
 
 /* ── §5 framebuffer — Torus state + buffers + clear ──────────────────── *
@@ -895,25 +890,25 @@ static inline Rot rot_make(float angle_A, float angle_B)
  */
 
 typedef struct {
-    /* Rotation state. */
-    float    angle_A;          /* tumble (around X), radians  */
-    float    angle_B;          /* spin   (around Z), radians  */
-    float    rot_rate_A;       /* tumble rate, rad/sec        */
-    float    rot_rate_B;       /* spin   rate, rad/sec        */
+  /* Rotation state. */
+  float angle_A;    /* tumble (around X), radians  */
+  float angle_B;    /* spin   (around Z), radians  */
+  float rot_rate_A; /* tumble rate, rad/sec        */
+  float rot_rate_B; /* spin   rate, rad/sec        */
 
-    /* Size + control state. */
-    float    k1_user_scale;    /* multiplier on K1 (=/- keys) */
-    bool     paused;
-    int      theme_index;      /* index into THEMES[] (t/T keys) */
-    DebugMode debug_mode;
+  /* Size + control state. */
+  float k1_user_scale; /* multiplier on K1 (=/- keys) */
+  bool paused;
+  int theme_index; /* index into THEMES[] (t/T keys) */
+  DebugMode debug_mode;
 
-    /* Terminal dimensions. */
-    int      cols, rows;
+  /* Terminal dimensions. */
+  int cols, rows;
 
-    /* Flat framebuffers. */
-    float    zbuf [TORUS_MAX_CELLS];
-    char     glyph[TORUS_MAX_CELLS];
-    uint8_t  luma [TORUS_MAX_CELLS];
+  /* Flat framebuffers. */
+  float zbuf[TORUS_MAX_CELLS];
+  char glyph[TORUS_MAX_CELLS];
+  uint8_t luma[TORUS_MAX_CELLS];
 } Torus;
 
 /*
@@ -921,26 +916,24 @@ typedef struct {
  * once at startup; resize doesn't re-init (the buffers are already
  * sized for the worst case).
  */
-static void torus_init(Torus *torus, int cols, int rows)
-{
-    memset(torus, 0, sizeof *torus);
-    torus->rot_rate_A    = ROT_RATE_A_DEFAULT;
-    torus->rot_rate_B    = ROT_RATE_B_DEFAULT;
-    torus->k1_user_scale = 1.0f;
-    torus->cols          = cols;
-    torus->rows          = rows;
-    torus->theme_index   = 0;             /* CLASSIC */
-    torus->debug_mode    = DEBUG_NORMAL;
+static void torus_init(Torus *torus, int cols, int rows) {
+  memset(torus, 0, sizeof *torus);
+  torus->rot_rate_A = ROT_RATE_A_DEFAULT;
+  torus->rot_rate_B = ROT_RATE_B_DEFAULT;
+  torus->k1_user_scale = 1.0f;
+  torus->cols = cols;
+  torus->rows = rows;
+  torus->theme_index = 0; /* CLASSIC */
+  torus->debug_mode = DEBUG_NORMAL;
 }
 
 /*
  * torus_resize — terminal grew or shrank; just update cols/rows.
  * The static buffers already hold enough room.
  */
-static void torus_resize(Torus *torus, int cols, int rows)
-{
-    torus->cols = cols;
-    torus->rows = rows;
+static void torus_resize(Torus *torus, int cols, int rows) {
+  torus->cols = cols;
+  torus->rows = rows;
 }
 
 /*
@@ -952,12 +945,11 @@ static void torus_resize(Torus *torus, int cols, int rows)
  *
  * One memset call each.  Cheap.
  */
-static void torus_clear_buffers(Torus *torus)
-{
-    int total_cells = torus->cols * torus->rows;
-    memset(torus->zbuf,  0,   sizeof(float)   * (size_t)total_cells);
-    memset(torus->glyph, ' ', sizeof(char)    * (size_t)total_cells);
-    memset(torus->luma,  0,   sizeof(uint8_t) * (size_t)total_cells);
+static void torus_clear_buffers(Torus *torus) {
+  int total_cells = torus->cols * torus->rows;
+  memset(torus->zbuf, 0, sizeof(float) * (size_t)total_cells);
+  memset(torus->glyph, ' ', sizeof(char) * (size_t)total_cells);
+  memset(torus->luma, 0, sizeof(uint8_t) * (size_t)total_cells);
 }
 
 /* ── §6 perspective — K1 sizing (auto-fit) ───────────────────────────── *
@@ -980,16 +972,15 @@ static void torus_clear_buffers(Torus *torus)
  * user-controlled `k1_user_scale` so = / - keys grow / shrink it.
  */
 
-static float compute_k1(const Torus *torus)
-{
-    float half_width    = (float)torus->cols * 0.5f;
-    float full_height   = (float)torus->rows;
-    float min_half_dim  = (half_width < full_height ? half_width : full_height);
-    float target_pixels = min_half_dim * TORUS_TARGET_FILL;
+static float compute_k1(const Torus *torus) {
+  float half_width = (float)torus->cols * 0.5f;
+  float full_height = (float)torus->rows;
+  float min_half_dim = (half_width < full_height ? half_width : full_height);
+  float target_pixels = min_half_dim * TORUS_TARGET_FILL;
 
-    float k1 = target_pixels * (TORUS_K2 + TORUS_R2 + TORUS_R1)
-                             / (TORUS_R2 + TORUS_R1);
-    return k1 * torus->k1_user_scale;
+  float k1 =
+      target_pixels * (TORUS_K2 + TORUS_R2 + TORUS_R1) / (TORUS_R2 + TORUS_R1);
+  return k1 * torus->k1_user_scale;
 }
 
 /* ── §7 tick — advance rotation angles ───────────────────────────────── *
@@ -1006,11 +997,11 @@ static float compute_k1(const Torus *torus)
  * stationary donut every frame (useful for inspecting a held pose).
  */
 
-static void torus_tick(Torus *torus, float dt_seconds)
-{
-    if (torus->paused) return;
-    torus->angle_A += torus->rot_rate_A * dt_seconds;
-    torus->angle_B += torus->rot_rate_B * dt_seconds;
+static void torus_tick(Torus *torus, float dt_seconds) {
+  if (torus->paused)
+    return;
+  torus->angle_A += torus->rot_rate_A * dt_seconds;
+  torus->angle_B += torus->rot_rate_B * dt_seconds;
 }
 
 /* ── §8 tube point — sample one point on the tube cross-section ──────── *
@@ -1030,10 +1021,8 @@ static void torus_tick(Torus *torus, float dt_seconds)
  *   axis by φ.  After revolution it'll have all three of (x, y, z).
  */
 
-static V2 tube_point(float cos_theta, float sin_theta)
-{
-    return v2(TORUS_R2 + TORUS_R1 * cos_theta,
-                         TORUS_R1 * sin_theta);
+static V2 tube_point(float cos_theta, float sin_theta) {
+  return v2(TORUS_R2 + TORUS_R1 * cos_theta, TORUS_R1 * sin_theta);
 }
 
 /* ── §9 surface point — full 3-D surface position ────────────────────── *
@@ -1058,16 +1047,14 @@ static V2 tube_point(float cos_theta, float sin_theta)
  * both the surface point AND the luminance.
  */
 
-static V3 surface_point(V2 tube, float cos_phi, float sin_phi, Rot rot)
-{
-    return v3(
-        tube.x * (rot.cos_B * cos_phi + rot.sin_A * rot.sin_B * sin_phi)
-      - tube.y *  rot.cos_A * rot.sin_B,
+static V3 surface_point(V2 tube, float cos_phi, float sin_phi, Rot rot) {
+  return v3(tube.x * (rot.cos_B * cos_phi + rot.sin_A * rot.sin_B * sin_phi) -
+                tube.y * rot.cos_A * rot.sin_B,
 
-        tube.x * (rot.sin_B * cos_phi - rot.sin_A * rot.cos_B * sin_phi)
-      + tube.y *  rot.cos_A * rot.cos_B,
+            tube.x * (rot.sin_B * cos_phi - rot.sin_A * rot.cos_B * sin_phi) +
+                tube.y * rot.cos_A * rot.cos_B,
 
-        TORUS_K2 + rot.cos_A * tube.x * sin_phi + tube.y * rot.sin_A);
+            TORUS_K2 + rot.cos_A * tube.x * sin_phi + tube.y * rot.sin_A);
 }
 
 /* ── §10 project to screen — perspective divide + bounds ─────────────── *
@@ -1094,19 +1081,18 @@ static V3 surface_point(V2 tube, float cos_phi, float sin_phi, Rot rot)
  */
 
 typedef struct {
-    int   col;          /* projected pixel column, in [0, cols) when in_bounds */
-    int   row;          /* projected pixel row,    in [0, rows) when in_bounds */
-    float one_over_z;   /* 1/z — bigger = closer (z-buffer feeds this directly) */
-    bool  in_bounds;
+  int col;          /* projected pixel column, in [0, cols) when in_bounds */
+  int row;          /* projected pixel row,    in [0, rows) when in_bounds */
+  float one_over_z; /* 1/z — bigger = closer (z-buffer feeds this directly) */
+  bool in_bounds;
 } ScreenPos;
 
-static ScreenPos project_to_screen(V3 world, int cols, int rows, float K1)
-{
-    float one_over_z = 1.0f / world.z;
-    int   col = (int)((float)cols * 0.5f + K1 * one_over_z * world.x);
-    int   row = (int)((float)rows * 0.5f - K1 * one_over_z * world.y * Y_ASPECT);
-    bool  in_bounds = (col >= 0 && col < cols && row >= 0 && row < rows);
-    return (ScreenPos){ col, row, one_over_z, in_bounds };
+static ScreenPos project_to_screen(V3 world, int cols, int rows, float K1) {
+  float one_over_z = 1.0f / world.z;
+  int col = (int)((float)cols * 0.5f + K1 * one_over_z * world.x);
+  int row = (int)((float)rows * 0.5f - K1 * one_over_z * world.y * Y_ASPECT);
+  bool in_bounds = (col >= 0 && col < cols && row >= 0 && row < rows);
+  return (ScreenPos){col, row, one_over_z, in_bounds};
 }
 
 /* ── §11 surface luminance — Lambert dot product (closed form) ───────── *
@@ -1131,14 +1117,11 @@ static ScreenPos project_to_screen(V3 world, int cols, int rows, float K1)
  * facing surface (skip).  L > 0 maps to a glyph-ramp slot.
  */
 
-static float surface_luminance(float cos_theta, float sin_theta,
-                                float cos_phi,   float sin_phi,
-                                Rot rot)
-{
-    return cos_phi  * cos_theta * rot.sin_B
-         - rot.cos_A * cos_theta * sin_phi
-         - rot.sin_A * sin_theta
-         + rot.cos_B * (rot.cos_A * sin_theta - cos_theta * rot.sin_A * sin_phi);
+static float surface_luminance(float cos_theta, float sin_theta, float cos_phi,
+                               float sin_phi, Rot rot) {
+  return cos_phi * cos_theta * rot.sin_B - rot.cos_A * cos_theta * sin_phi -
+         rot.sin_A * sin_theta +
+         rot.cos_B * (rot.cos_A * sin_theta - cos_theta * rot.sin_A * sin_phi);
 }
 
 /* ── §12 emit pixel — z-buffer test + glyph store ────────────────────── *
@@ -1162,28 +1145,30 @@ static float surface_luminance(float cos_theta, float sin_theta,
  */
 
 static void try_emit_pixel(Torus *torus, ScreenPos sp, float L,
-                            bool force_overwrite)
-{
-    if (L <= 0.0f || !sp.in_bounds) return;
+                           bool force_overwrite) {
+  if (L <= 0.0f || !sp.in_bounds)
+    return;
 
-    int cell_index = sp.row * torus->cols + sp.col;
-    if (!force_overwrite && sp.one_over_z <= torus->zbuf[cell_index]) {
-        return;     /* lost the depth test */
-    }
+  int cell_index = sp.row * torus->cols + sp.col;
+  if (!force_overwrite && sp.one_over_z <= torus->zbuf[cell_index]) {
+    return; /* lost the depth test */
+  }
 
-    /* Pick a glyph slot from the luminance.  L is clamped to the
-     * [0, ramp_len) range; the cast truncates the fractional part. */
-    int glyph_slot = (int)(L * (float)LUMI_RAMP_LEN);
-    if (glyph_slot < 0)                  glyph_slot = 0;
-    if (glyph_slot >= LUMI_RAMP_LEN)     glyph_slot = LUMI_RAMP_LEN - 1;
+  /* Pick a glyph slot from the luminance.  L is clamped to the
+   * [0, ramp_len) range; the cast truncates the fractional part. */
+  int glyph_slot = (int)(L * (float)LUMI_RAMP_LEN);
+  if (glyph_slot < 0)
+    glyph_slot = 0;
+  if (glyph_slot >= LUMI_RAMP_LEN)
+    glyph_slot = LUMI_RAMP_LEN - 1;
 
-    torus->zbuf [cell_index] = sp.one_over_z;
-    torus->glyph[cell_index] = LUMI_RAMP[glyph_slot];
+  torus->zbuf[cell_index] = sp.one_over_z;
+  torus->glyph[cell_index] = LUMI_RAMP[glyph_slot];
 
-    /* Map the 0..LUMI_RAMP_LEN-1 glyph slot down to the 0..LUMI_LEVELS-1
-     * colour slot — the painter (§14) reads this. */
-    torus->luma[cell_index] =
-        (uint8_t)((glyph_slot * LUMI_LEVELS) / LUMI_RAMP_LEN);
+  /* Map the 0..LUMI_RAMP_LEN-1 glyph slot down to the 0..LUMI_LEVELS-1
+   * colour slot — the painter (§14) reads this. */
+  torus->luma[cell_index] =
+      (uint8_t)((glyph_slot * LUMI_LEVELS) / LUMI_RAMP_LEN);
 }
 
 /* ── §13 render — orchestrator that walks (θ, φ) and calls §8..§12 ───── *
@@ -1209,38 +1194,35 @@ static void try_emit_pixel(Torus *torus, ScreenPos sp, float L,
  * the z-buffer test in try_emit_pixel is skipped.
  */
 
-static void torus_render(Torus *torus, int wire_stride, bool force_overwrite)
-{
-    torus_clear_buffers(torus);
+static void torus_render(Torus *torus, int wire_stride, bool force_overwrite) {
+  torus_clear_buffers(torus);
 
-    Rot   rot = rot_make(torus->angle_A, torus->angle_B);
-    float K1  = compute_k1(torus);
+  Rot rot = rot_make(torus->angle_A, torus->angle_B);
+  float K1 = compute_k1(torus);
 
-    int sample_index = 0;
-    for (float theta = 0.f; theta < TWO_PI; theta += THETA_STEP) {
-        float cos_theta = cosf(theta);
-        float sin_theta = sinf(theta);
-        V2    tube      = tube_point(cos_theta, sin_theta);
+  int sample_index = 0;
+  for (float theta = 0.f; theta < TWO_PI; theta += THETA_STEP) {
+    float cos_theta = cosf(theta);
+    float sin_theta = sinf(theta);
+    V2 tube = tube_point(cos_theta, sin_theta);
 
-        for (float phi = 0.f; phi < TWO_PI; phi += PHI_STEP) {
-            sample_index++;
+    for (float phi = 0.f; phi < TWO_PI; phi += PHI_STEP) {
+      sample_index++;
 
-            /* WIRE overlay: skip most samples to expose the (θ,φ) grid. */
-            if (wire_stride > 1 && (sample_index % wire_stride) != 0)
-                continue;
+      /* WIRE overlay: skip most samples to expose the (θ,φ) grid. */
+      if (wire_stride > 1 && (sample_index % wire_stride) != 0)
+        continue;
 
-            float cos_phi = cosf(phi);
-            float sin_phi = sinf(phi);
+      float cos_phi = cosf(phi);
+      float sin_phi = sinf(phi);
 
-            V3        world = surface_point   (tube, cos_phi, sin_phi, rot);
-            ScreenPos sp    = project_to_screen(world,
-                                                torus->cols, torus->rows, K1);
-            float     L     = surface_luminance(cos_theta, sin_theta,
-                                                cos_phi,   sin_phi,   rot);
+      V3 world = surface_point(tube, cos_phi, sin_phi, rot);
+      ScreenPos sp = project_to_screen(world, torus->cols, torus->rows, K1);
+      float L = surface_luminance(cos_theta, sin_theta, cos_phi, sin_phi, rot);
 
-            try_emit_pixel(torus, sp, L, force_overwrite);
-        }
+      try_emit_pixel(torus, sp, L, force_overwrite);
     }
+  }
 }
 
 /* ── §14 draw — paint the framebuffer to the terminal ────────────────── *
@@ -1253,21 +1235,20 @@ static void torus_render(Torus *torus, int wire_stride, bool force_overwrite)
  * so the painter doesn't need to back-derive it (no strchr search).
  */
 
-static void torus_draw(const Torus *torus, WINDOW *window)
-{
-    int cols = torus->cols;
-    int total_cells = cols * torus->rows;
+static void torus_draw(const Torus *torus, WINDOW *window) {
+  int cols = torus->cols;
+  int total_cells = cols * torus->rows;
 
-    for (int idx = 0; idx < total_cells; idx++) {
-        char glyph = torus->glyph[idx];
-        if (glyph == ' ') continue;
+  for (int idx = 0; idx < total_cells; idx++) {
+    char glyph = torus->glyph[idx];
+    if (glyph == ' ')
+      continue;
 
-        attr_t attr = lumi_attr(torus->luma[idx]);
-        wattron(window, attr);
-        mvwaddch(window, idx / cols, idx % cols,
-                 (chtype)(unsigned char)glyph);
-        wattroff(window, attr);
-    }
+    attr_t attr = lumi_attr(torus->luma[idx]);
+    wattron(window, attr);
+    mvwaddch(window, idx / cols, idx % cols, (chtype)(unsigned char)glyph);
+    wattroff(window, attr);
+  }
 }
 
 /* ── §15 debug overlays — see what the algorithm is doing ────────────── *
@@ -1298,94 +1279,107 @@ static void torus_draw(const Torus *torus, WINDOW *window)
  * 1/z values), then paint glyphs by reading zbuf[] directly.
  */
 
-static void render_debug_depth(Torus *torus, WINDOW *window)
-{
-    /* Production render fills zbuf[] for us. */
-    torus_render(torus, 1, false);
+static void render_debug_depth(Torus *torus, WINDOW *window) {
+  /* Production render fills zbuf[] for us. */
+  torus_render(torus, 1, false);
 
-    int cols = torus->cols;
-    int total_cells = cols * torus->rows;
+  int cols = torus->cols;
+  int total_cells = cols * torus->rows;
 
-    /* Find the maximum 1/z value (the closest sample) for normalisation. */
-    float max_one_over_z = 0.0f;
-    for (int idx = 0; idx < total_cells; idx++)
-        if (torus->zbuf[idx] > max_one_over_z)
-            max_one_over_z = torus->zbuf[idx];
-    if (max_one_over_z < 1e-6f) return;
+  /* Find the maximum 1/z value (the closest sample) for normalisation. */
+  float max_one_over_z = 0.0f;
+  for (int idx = 0; idx < total_cells; idx++)
+    if (torus->zbuf[idx] > max_one_over_z)
+      max_one_over_z = torus->zbuf[idx];
+  if (max_one_over_z < 1e-6f)
+    return;
 
-    /* Paint each filled cell with a depth-based glyph. */
-    for (int idx = 0; idx < total_cells; idx++) {
-        if (torus->zbuf[idx] < 1e-6f) continue;
+  /* Paint each filled cell with a depth-based glyph. */
+  for (int idx = 0; idx < total_cells; idx++) {
+    if (torus->zbuf[idx] < 1e-6f)
+      continue;
 
-        float depth_normalised = torus->zbuf[idx] / max_one_over_z;
-        int   slot = (int)(depth_normalised * (float)(LUMI_RAMP_LEN - 1) + 0.5f);
-        if (slot < 0)                slot = 0;
-        if (slot >= LUMI_RAMP_LEN)   slot = LUMI_RAMP_LEN - 1;
+    float depth_normalised = torus->zbuf[idx] / max_one_over_z;
+    int slot = (int)(depth_normalised * (float)(LUMI_RAMP_LEN - 1) + 0.5f);
+    if (slot < 0)
+      slot = 0;
+    if (slot >= LUMI_RAMP_LEN)
+      slot = LUMI_RAMP_LEN - 1;
 
-        char glyph = LUMI_RAMP[slot];
-        attr_t attr = lumi_attr((slot * LUMI_LEVELS) / LUMI_RAMP_LEN);
-        wattron(window, attr);
-        mvwaddch(window, idx / cols, idx % cols,
-                 (chtype)(unsigned char)glyph);
-        wattroff(window, attr);
-    }
+    char glyph = LUMI_RAMP[slot];
+    attr_t attr = lumi_attr((slot * LUMI_LEVELS) / LUMI_RAMP_LEN);
+    wattron(window, attr);
+    mvwaddch(window, idx / cols, idx % cols, (chtype)(unsigned char)glyph);
+    wattroff(window, attr);
+  }
 }
 
-static void render_debug_wire(Torus *torus, WINDOW *window)
-{
-    /* Same render path, but only every Nth sample is emitted. */
-    torus_render(torus, DEBUG_WIRE_STRIDE, false);
-    torus_draw  (torus, window);
+static void render_debug_wire(Torus *torus, WINDOW *window) {
+  /* Same render path, but only every Nth sample is emitted. */
+  torus_render(torus, DEBUG_WIRE_STRIDE, false);
+  torus_draw(torus, window);
 }
 
-static void render_debug_no_zbuf(Torus *torus, WINDOW *window)
-{
-    /* Same render path, but z-buffer test is skipped — front and
-     * back samples both paint, in iteration order.  You can see the
-     * back surface bleed through the front. */
-    torus_render(torus, 1, true);
-    torus_draw  (torus, window);
+static void render_debug_no_zbuf(Torus *torus, WINDOW *window) {
+  /* Same render path, but z-buffer test is skipped — front and
+   * back samples both paint, in iteration order.  You can see the
+   * back surface bleed through the front. */
+  torus_render(torus, 1, true);
+  torus_draw(torus, window);
 }
 
 /*
  * draw_active_view — dispatch by debug mode.
  */
-static void draw_active_view(Torus *torus, WINDOW *window)
-{
-    switch (torus->debug_mode) {
-    case DEBUG_NORMAL:
-        torus_render(torus, 1, false);
-        torus_draw  (torus, window);
-        break;
-    case DEBUG_DEPTH:    render_debug_depth   (torus, window); break;
-    case DEBUG_WIRE:     render_debug_wire    (torus, window); break;
-    case DEBUG_NO_ZBUF:  render_debug_no_zbuf (torus, window); break;
-    default:
-        torus_render(torus, 1, false);
-        torus_draw  (torus, window);
-        break;
-    }
+static void draw_active_view(Torus *torus, WINDOW *window) {
+  switch (torus->debug_mode) {
+  case DEBUG_NORMAL:
+    torus_render(torus, 1, false);
+    torus_draw(torus, window);
+    break;
+  case DEBUG_DEPTH:
+    render_debug_depth(torus, window);
+    break;
+  case DEBUG_WIRE:
+    render_debug_wire(torus, window);
+    break;
+  case DEBUG_NO_ZBUF:
+    render_debug_no_zbuf(torus, window);
+    break;
+  default:
+    torus_render(torus, 1, false);
+    torus_draw(torus, window);
+    break;
+  }
 }
 
 /* ── §16 screen — ncurses init / resize / HUD draw / present ─────────── */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *screen)
-{
-    initscr();
-    noecho(); cbreak(); curs_set(0);
-    nodelay(stdscr, TRUE); keypad(stdscr, TRUE); typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, screen->rows, screen->cols);
+static void screen_init(Screen *screen) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, screen->rows, screen->cols);
 }
 
-static void screen_free(Screen *screen) { (void)screen; endwin(); }
+static void screen_free(Screen *screen) {
+  (void)screen;
+  endwin();
+}
 
-static void screen_resize(Screen *screen)
-{
-    endwin(); refresh();
-    getmaxyx(stdscr, screen->rows, screen->cols);
+static void screen_resize(Screen *screen) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, screen->rows, screen->cols);
 }
 
 /*
@@ -1395,200 +1389,218 @@ static void screen_resize(Screen *screen)
  *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
  *   row rows-1     PAIR_HINT (cyan   + bold) — key hint
  */
-static void screen_draw(Screen *screen, Torus *torus, double fps)
-{
-    erase();
-    draw_active_view(torus, stdscr);
+static void screen_draw(Screen *screen, Torus *torus, double fps) {
+  erase();
+  draw_active_view(torus, stdscr);
 
-    /* Top row — yellow status. */
-    char status[HUD_STATUS_COLS + 1];
-    snprintf(status, sizeof status,
-             " %5.1f fps  spd:%4.2f  size:%4.2f  theme:%s  debug:%s%s ",
-             fps, (double)torus->rot_rate_A,
-             (double)torus->k1_user_scale,
-             THEMES[torus->theme_index].display_name,
-             DEBUG_MODE_NAMES[torus->debug_mode],
-             torus->paused ? "  PAUSED" : "");
-    int slen = (int)strlen(status); if (slen > screen->cols) slen = screen->cols;
+  /* Top row — yellow status. */
+  char status[HUD_STATUS_COLS + 1];
+  snprintf(status, sizeof status,
+           " %5.1f fps  spd:%4.2f  size:%4.2f  theme:%s  debug:%s%s ", fps,
+           (double)torus->rot_rate_A, (double)torus->k1_user_scale,
+           THEMES[torus->theme_index].display_name,
+           DEBUG_MODE_NAMES[torus->debug_mode],
+           torus->paused ? "  PAUSED" : "");
+  int slen = (int)strlen(status);
+  if (slen > screen->cols)
+    slen = screen->cols;
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, screen->cols - slen, "%s", status);
-    mvprintw(0, 0, " DONUT ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, screen->cols - slen, "%s", status);
+  mvprintw(0, 0, " DONUT ");
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* Bottom row — cyan key hint. */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(screen->rows - 1, 0,
-             " q:quit  spc:pause  ]/[:speed  +/-:size  t/T:theme  d/D:debug ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  /* Bottom row — cyan key hint. */
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(screen->rows - 1, 0,
+           " q:quit  spc:pause  ]/[:speed  +/-:size  t/T:theme  d/D:debug ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ── §17 app — main loop, signals, key handling, cleanup ─────────────── */
 
 typedef struct {
-    Torus                 torus;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Torus torus;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup         (void)    { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void app_do_resize(App *app)
-{
-    screen_resize(&app->screen);
-    torus_resize (&app->torus, app->screen.cols, app->screen.rows);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  screen_resize(&app->screen);
+  torus_resize(&app->torus, app->screen.cols, app->screen.rows);
+  app->need_resize = 0;
 }
 
 /*
  * app_handle_key — returns false to quit.  Keys are listed in the
  * file header.
  */
-static bool app_handle_key(App *app, int ch)
-{
-    Torus *torus = &app->torus;
+static bool app_handle_key(App *app, int ch) {
+  Torus *torus = &app->torus;
 
-    switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':                              torus->paused = !torus->paused; break;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    torus->paused = !torus->paused;
+    break;
 
-    case ']':
-        torus->rot_rate_A *= SPEED_SCALE;
-        torus->rot_rate_B *= SPEED_SCALE;
-        if (torus->rot_rate_A > SPEED_MAX) torus->rot_rate_A = SPEED_MAX;
-        if (torus->rot_rate_B > SPEED_MAX) torus->rot_rate_B = SPEED_MAX;
-        break;
+  case ']':
+    torus->rot_rate_A *= SPEED_SCALE;
+    torus->rot_rate_B *= SPEED_SCALE;
+    if (torus->rot_rate_A > SPEED_MAX)
+      torus->rot_rate_A = SPEED_MAX;
+    if (torus->rot_rate_B > SPEED_MAX)
+      torus->rot_rate_B = SPEED_MAX;
+    break;
 
-    case '[':
-        torus->rot_rate_A /= SPEED_SCALE;
-        torus->rot_rate_B /= SPEED_SCALE;
-        if (torus->rot_rate_A < SPEED_MIN) torus->rot_rate_A = SPEED_MIN;
-        if (torus->rot_rate_B < SPEED_MIN) torus->rot_rate_B = SPEED_MIN;
-        break;
+  case '[':
+    torus->rot_rate_A /= SPEED_SCALE;
+    torus->rot_rate_B /= SPEED_SCALE;
+    if (torus->rot_rate_A < SPEED_MIN)
+      torus->rot_rate_A = SPEED_MIN;
+    if (torus->rot_rate_B < SPEED_MIN)
+      torus->rot_rate_B = SPEED_MIN;
+    break;
 
-    case '=': case '+':
-        torus->k1_user_scale *= TORUS_SIZE_SCALE;
-        if (torus->k1_user_scale > TORUS_SIZE_MAX) torus->k1_user_scale = TORUS_SIZE_MAX;
-        break;
+  case '=':
+  case '+':
+    torus->k1_user_scale *= TORUS_SIZE_SCALE;
+    if (torus->k1_user_scale > TORUS_SIZE_MAX)
+      torus->k1_user_scale = TORUS_SIZE_MAX;
+    break;
 
-    case '-':
-        torus->k1_user_scale /= TORUS_SIZE_SCALE;
-        if (torus->k1_user_scale < TORUS_SIZE_MIN) torus->k1_user_scale = TORUS_SIZE_MIN;
-        break;
+  case '-':
+    torus->k1_user_scale /= TORUS_SIZE_SCALE;
+    if (torus->k1_user_scale < TORUS_SIZE_MIN)
+      torus->k1_user_scale = TORUS_SIZE_MIN;
+    break;
 
-    case 't':
-        torus->theme_index = (torus->theme_index + 1) % THEME_COUNT;
-        theme_apply(torus->theme_index);
-        break;
-    case 'T':
-        torus->theme_index =
-            (torus->theme_index + THEME_COUNT - 1) % THEME_COUNT;
-        theme_apply(torus->theme_index);
-        break;
+  case 't':
+    torus->theme_index = (torus->theme_index + 1) % THEME_COUNT;
+    theme_apply(torus->theme_index);
+    break;
+  case 'T':
+    torus->theme_index = (torus->theme_index + THEME_COUNT - 1) % THEME_COUNT;
+    theme_apply(torus->theme_index);
+    break;
 
-    case 'd':
-        torus->debug_mode =
-            (DebugMode)((torus->debug_mode + 1) % DEBUG_MODE_COUNT);
-        break;
-    case 'D':
-        torus->debug_mode =
-            (DebugMode)((torus->debug_mode + DEBUG_MODE_COUNT - 1) % DEBUG_MODE_COUNT);
-        break;
+  case 'd':
+    torus->debug_mode = (DebugMode)((torus->debug_mode + 1) % DEBUG_MODE_COUNT);
+    break;
+  case 'D':
+    torus->debug_mode = (DebugMode)((torus->debug_mode + DEBUG_MODE_COUNT - 1) %
+                                    DEBUG_MODE_COUNT);
+    break;
 
-    default: break;
-    }
-    return true;
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+int main(void) {
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
-    torus_init (&app->torus, app->screen.cols, app->screen.rows);
+  screen_init(&app->screen);
+  torus_init(&app->torus, app->screen.cols, app->screen.rows);
 
-    /*
-     * dt-loop state — same scaffold as the rest of the project.
-     *
-     * Pseudo-code:
-     *   while running:
-     *       handle resize
-     *       compute dt
-     *       advance simulation by dt (fixed step)
-     *       update fps counter
-     *       sleep until next frame deadline
-     *       render screen
-     *       handle key input
-     */
-    int64_t frame_time_ns = clock_ns();
-    int64_t sim_accumulator_ns = 0;
-    int64_t fps_accumulator_ns = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  /*
+   * dt-loop state — same scaffold as the rest of the project.
+   *
+   * Pseudo-code:
+   *   while running:
+   *       handle resize
+   *       compute dt
+   *       advance simulation by dt (fixed step)
+   *       update fps counter
+   *       sleep until next frame deadline
+   *       render screen
+   *       handle key input
+   */
+  int64_t frame_time_ns = clock_ns();
+  int64_t sim_accumulator_ns = 0;
+  int64_t fps_accumulator_ns = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time_ns      = clock_ns();
-            sim_accumulator_ns = 0;
-        }
-
-        /* ── compute real dt since last frame ────────────────────── */
-        int64_t now_ns = clock_ns();
-        int64_t dt_ns  = now_ns - frame_time_ns;
-        frame_time_ns  = now_ns;
-        if (dt_ns > 100 * NS_PER_MS) dt_ns = 100 * NS_PER_MS;
-
-        /* ── fixed-step sim accumulator ──────────────────────────── */
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accumulator_ns += dt_ns;
-        while (sim_accumulator_ns >= tick_ns) {
-            torus_tick(&app->torus, dt_sec);
-            sim_accumulator_ns -= tick_ns;
-        }
-
-        /* ── fps counter (rolling window) ────────────────────────── */
-        frame_count++;
-        fps_accumulator_ns += dt_ns;
-        if (fps_accumulator_ns >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accumulator_ns / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accumulator_ns = 0;
-        }
-
-        /* ── frame cap (sleep BEFORE I/O so writes don't drift) ──── */
-        int64_t elapsed_ns = clock_ns() - frame_time_ns + dt_ns;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed_ns);
-
-        /* ── draw + present ──────────────────────────────────────── */
-        screen_draw   (&app->screen, &app->torus, fps_display);
-        screen_present();
-
-        /* ── input ───────────────────────────────────────────────── */
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time_ns = clock_ns();
+      sim_accumulator_ns = 0;
     }
 
-    screen_free(&app->screen);
-    return 0;
+    /* ── compute real dt since last frame ────────────────────── */
+    int64_t now_ns = clock_ns();
+    int64_t dt_ns = now_ns - frame_time_ns;
+    frame_time_ns = now_ns;
+    if (dt_ns > 100 * NS_PER_MS)
+      dt_ns = 100 * NS_PER_MS;
+
+    /* ── fixed-step sim accumulator ──────────────────────────── */
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
+
+    sim_accumulator_ns += dt_ns;
+    while (sim_accumulator_ns >= tick_ns) {
+      torus_tick(&app->torus, dt_sec);
+      sim_accumulator_ns -= tick_ns;
+    }
+
+    /* ── fps counter (rolling window) ────────────────────────── */
+    frame_count++;
+    fps_accumulator_ns += dt_ns;
+    if (fps_accumulator_ns >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display = (double)frame_count /
+                    ((double)fps_accumulator_ns / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accumulator_ns = 0;
+    }
+
+    /* ── frame cap (sleep BEFORE I/O so writes don't drift) ──── */
+    int64_t elapsed_ns = clock_ns() - frame_time_ns + dt_ns;
+    clock_sleep_ns(NS_PER_SEC / 60 - elapsed_ns);
+
+    /* ── draw + present ──────────────────────────────────────── */
+    screen_draw(&app->screen, &app->torus, fps_display);
+    screen_present();
+
+    /* ── input ───────────────────────────────────────────────── */
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  screen_free(&app->screen);
+  return 0;
 }

@@ -502,7 +502,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <float.h>
@@ -511,35 +511,35 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ── §1 config ───────────────────────────────────────────────────────── */
 
 /* §1.1 frame rate + scene capacity */
 enum {
-    FPS_TARGET    = 60,
-    FPS_UPDATE_MS = 500,
-    HUD_ROWS      = 5,           /* yellow row 0 + 3 educational rows + cyan hint */
-    MAX_OBJECTS   = 4,           /* one sphere — extras reserved for later        */
-    MAX_LIGHTS    = 8,           /* 3 RGB primaries + 5 'l'-key extras            */
+  FPS_TARGET = 60,
+  FPS_UPDATE_MS = 500,
+  HUD_ROWS = 5,    /* yellow row 0 + 3 educational rows + cyan hint */
+  MAX_OBJECTS = 4, /* one sphere — extras reserved for later        */
+  MAX_LIGHTS = 8,  /* 3 RGB primaries + 5 'l'-key extras            */
 };
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define DT_CAP_NS       (100 * NS_PER_MS)
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define DT_CAP_NS (100 * NS_PER_MS)
 
 /* §1.2 G-buffer dimensions (static, no malloc).
  * Sized for the largest expected terminal. Pixels outside are skipped. */
-#define GBUF_MAX_W   300
-#define GBUF_MAX_H    80
+#define GBUF_MAX_W 300
+#define GBUF_MAX_H 80
 
 /* §1.3 view geometry */
-#define CAM_FOV       (55.0f * (float)M_PI / 180.0f)
-#define CAM_NEAR      0.1f
-#define CAM_FAR       20.0f
+#define CAM_FOV (55.0f * (float)M_PI / 180.0f)
+#define CAM_NEAR 0.1f
+#define CAM_FAR 20.0f
 
 /* CAM_DIST is the DEFAULT eye Z distance; +/- keys slide the eye between
  * CAM_DIST_MIN (close-up — sphere fills the screen) and CAM_DIST_MAX
@@ -547,17 +547,17 @@ enum {
  * at once). MIN is kept above BALL_RADIUS (0.95) so the camera never
  * crosses inside the sphere; MAX is well within CAM_FAR (20.0) so the
  * sphere never falls past the far plane. */
-#define CAM_DIST      3.8f       /* default eye Z distance (world units) */
-#define CAM_DIST_MIN  1.8f       /* closest zoom — just outside sphere   */
-#define CAM_DIST_MAX  8.0f       /* farthest zoom                        */
-#define CAM_ZOOM_STEP 0.2f       /* world units moved per +/- press      */
+#define CAM_DIST 3.8f      /* default eye Z distance (world units) */
+#define CAM_DIST_MIN 1.8f  /* closest zoom — just outside sphere   */
+#define CAM_DIST_MAX 8.0f  /* farthest zoom                        */
+#define CAM_ZOOM_STEP 0.2f /* world units moved per +/- press      */
 
-#define CELL_W        8     /* terminal cell width  (pixels)              */
-#define CELL_H       16     /* terminal cell height (pixels)              */
+#define CELL_W 8  /* terminal cell width  (pixels)              */
+#define CELL_H 16 /* terminal cell height (pixels)              */
 
 /* §1.4 lighting */
-#define SHININESS    32.0f
-#define AMBIENT_STR   0.06f
+#define SHININESS 32.0f
+#define AMBIENT_STR 0.06f
 
 /* §1.5 RGB-lights demo geometry (world units) */
 
@@ -566,120 +566,130 @@ enum {
  * of room to be visible. Pure-white albedo (1, 1, 1) means coloured
  * lights show as their UNFILTERED hue — red light × white surface =
  * pure red, never pink-tinted-by-the-surface. */
-#define BALL_RADIUS      0.95f
-#define BALL_RINGS       16
-#define BALL_SEGS        24
+#define BALL_RADIUS 0.95f
+#define BALL_RINGS 16
+#define BALL_SEGS 24
 
 /* CAMERA — fixed pose, looking straight at the sphere from +Z, slight
  * elevation. When the only things moving are the LIGHTS, the eye
  * locks onto their coloured pools instead of tracking the viewpoint.
  * Pixel changes between frames ⇒ LIGHTING changes, never camera. */
-#define CAM_EYE_Y        0.30f      /* slight elevation for some depth    */
-#define CAM_LOOK_Y       0.0f       /* aim straight at sphere centre      */
+#define CAM_EYE_Y 0.30f /* slight elevation for some depth    */
+#define CAM_LOOK_Y 0.0f /* aim straight at sphere centre      */
 
 /* §1.6 character ramp — Paul Bourke 92-char density ladder. */
 static const char k_bourke[] =
-    " `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
+    " `.-':_,^=;><+!rc*/"
+    "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 #define BOURKE_LEN ((int)(sizeof k_bourke - 1))
 
 /* §1.7 Bayer 4×4 dither (k_bayer[py%4][px%4] in [0,1)). */
 static const float k_bayer[4][4] = {
-    {  0/16.f,  8/16.f,  2/16.f, 10/16.f },
-    { 12/16.f,  4/16.f, 14/16.f,  6/16.f },
-    {  3/16.f, 11/16.f,  1/16.f,  9/16.f },
-    { 15/16.f,  7/16.f, 13/16.f,  5/16.f },
+    {0 / 16.f, 8 / 16.f, 2 / 16.f, 10 / 16.f},
+    {12 / 16.f, 4 / 16.f, 14 / 16.f, 6 / 16.f},
+    {3 / 16.f, 11 / 16.f, 1 / 16.f, 9 / 16.f},
+    {15 / 16.f, 7 / 16.f, 13 / 16.f, 5 / 16.f},
 };
-#define DITHER_AMP   0.12f
+#define DITHER_AMP 0.12f
 
 /* §1.8 ncurses pair IDs.
  * Same layout as cube_raster / raytracers: 216 RGB cube pairs at
  * PAIR_CUBE_BASE, plus yellow PAIR_HUD and cyan PAIR_HINT for the
  * CLAUDE.md HUD spec. */
-#define PAIR_CUBE_BASE   1
-#define PAIR_HUD       217
-#define PAIR_HINT      218
+#define PAIR_CUBE_BASE 1
+#define PAIR_HUD 217
+#define PAIR_HINT 218
 
 /* ── §2 clock ────────────────────────────────────────────────────────── */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec r = { .tv_sec  = (time_t)(ns / NS_PER_SEC),
-                          .tv_nsec = (long)  (ns % NS_PER_SEC) };
-    nanosleep(&r, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec r = {.tv_sec = (time_t)(ns / NS_PER_SEC),
+                       .tv_nsec = (long)(ns % NS_PER_SEC)};
+  nanosleep(&r, NULL);
 }
 
 /* ── §3 math (V3, V4, Mat4) ──────────────────────────────────────────── */
 
-typedef struct { float x, y, z;    } Vec3;
-typedef struct { float x, y, z, w; } Vec4;
-typedef struct { float m[4][4];     } Mat4;
+typedef struct {
+  float x, y, z;
+} Vec3;
+typedef struct {
+  float x, y, z, w;
+} Vec4;
+typedef struct {
+  float m[4][4];
+} Mat4;
 
-static inline Vec3 v3(float x, float y, float z)         { return (Vec3){x,y,z}; }
-static inline Vec4 v4(float x, float y, float z, float w){ return (Vec4){x,y,z,w}; }
-
-static inline Vec3  v3_add  (Vec3 a, Vec3 b)  { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
-static inline Vec3  v3_sub  (Vec3 a, Vec3 b)  { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
-static inline Vec3  v3_scale(Vec3 a, float s) { return v3(a.x*s, a.y*s, a.z*s); }
-static inline float v3_dot  (Vec3 a, Vec3 b)  { return a.x*b.x + a.y*b.y + a.z*b.z; }
-static inline float v3_len  (Vec3 a)          { return sqrtf(v3_dot(a, a)); }
-static inline Vec3  v3_norm (Vec3 a)
-{
-    float l = v3_len(a);
-    return l > 1e-7f ? v3_scale(a, 1.f/l) : v3(0, 1, 0);
-}
-static inline Vec3 v3_bary(Vec3 p0, Vec3 p1, Vec3 p2,
-                           float b0, float b1, float b2)
-{
-    return v3(b0*p0.x + b1*p1.x + b2*p2.x,
-              b0*p0.y + b1*p1.y + b2*p2.y,
-              b0*p0.z + b1*p1.z + b2*p2.z);
+static inline Vec3 v3(float x, float y, float z) { return (Vec3){x, y, z}; }
+static inline Vec4 v4(float x, float y, float z, float w) {
+  return (Vec4){x, y, z, w};
 }
 
-static inline Mat4 m4_identity(void)
-{
-    Mat4 m = {{{0}}};
-    m.m[0][0] = m.m[1][1] = m.m[2][2] = m.m[3][3] = 1.f;
-    return m;
+static inline Vec3 v3_add(Vec3 a, Vec3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline Vec3 v3_sub(Vec3 a, Vec3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline Vec3 v3_scale(Vec3 a, float s) {
+  return v3(a.x * s, a.y * s, a.z * s);
+}
+static inline float v3_dot(Vec3 a, Vec3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+static inline Vec3 v3_norm(Vec3 a) {
+  float l = v3_len(a);
+  return l > 1e-7f ? v3_scale(a, 1.f / l) : v3(0, 1, 0);
+}
+static inline Vec3 v3_bary(Vec3 p0, Vec3 p1, Vec3 p2, float b0, float b1,
+                           float b2) {
+  return v3(b0 * p0.x + b1 * p1.x + b2 * p2.x,
+            b0 * p0.y + b1 * p1.y + b2 * p2.y,
+            b0 * p0.z + b1 * p1.z + b2 * p2.z);
 }
 
-static inline Vec4 m4_mul_v4(Mat4 m, Vec4 v)
-{
-    return v4(m.m[0][0]*v.x + m.m[0][1]*v.y + m.m[0][2]*v.z + m.m[0][3]*v.w,
-              m.m[1][0]*v.x + m.m[1][1]*v.y + m.m[1][2]*v.z + m.m[1][3]*v.w,
-              m.m[2][0]*v.x + m.m[2][1]*v.y + m.m[2][2]*v.z + m.m[2][3]*v.w,
-              m.m[3][0]*v.x + m.m[3][1]*v.y + m.m[3][2]*v.z + m.m[3][3]*v.w);
+static inline Mat4 m4_identity(void) {
+  Mat4 m = {{{0}}};
+  m.m[0][0] = m.m[1][1] = m.m[2][2] = m.m[3][3] = 1.f;
+  return m;
 }
 
-static inline Mat4 m4_mul(Mat4 a, Mat4 b)
-{
-    Mat4 r = {{{0}}};
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 4; k++)
-                r.m[i][j] += a.m[i][k] * b.m[k][j];
-    return r;
+static inline Vec4 m4_mul_v4(Mat4 m, Vec4 v) {
+  return v4(
+      m.m[0][0] * v.x + m.m[0][1] * v.y + m.m[0][2] * v.z + m.m[0][3] * v.w,
+      m.m[1][0] * v.x + m.m[1][1] * v.y + m.m[1][2] * v.z + m.m[1][3] * v.w,
+      m.m[2][0] * v.x + m.m[2][1] * v.y + m.m[2][2] * v.z + m.m[2][3] * v.w,
+      m.m[3][0] * v.x + m.m[3][1] * v.y + m.m[3][2] * v.z + m.m[3][3] * v.w);
+}
+
+static inline Mat4 m4_mul(Mat4 a, Mat4 b) {
+  Mat4 r = {{{0}}};
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < 4; j++)
+      for (int k = 0; k < 4; k++)
+        r.m[i][j] += a.m[i][k] * b.m[k][j];
+  return r;
 }
 
 /* m4_pt  — point  transform (w=1, translation applies). */
-static inline Vec3 m4_pt(Mat4 m, Vec3 p)
-{
-    Vec4 r = m4_mul_v4(m, v4(p.x, p.y, p.z, 1.f));
-    return v3(r.x, r.y, r.z);
+static inline Vec3 m4_pt(Mat4 m, Vec3 p) {
+  Vec4 r = m4_mul_v4(m, v4(p.x, p.y, p.z, 1.f));
+  return v3(r.x, r.y, r.z);
 }
 
 /* m4_dir — direction transform (w=0, translation does not apply). */
-static inline Vec3 m4_dir(Mat4 m, Vec3 d)
-{
-    Vec4 r = m4_mul_v4(m, v4(d.x, d.y, d.z, 0.f));
-    return v3(r.x, r.y, r.z);
+static inline Vec3 m4_dir(Mat4 m, Vec3 d) {
+  Vec4 r = m4_mul_v4(m, v4(d.x, d.y, d.z, 0.f));
+  return v3(r.x, r.y, r.z);
 }
 
 /*
@@ -694,32 +704,37 @@ static inline Vec3 m4_dir(Mat4 m, Vec3 d)
  * After m4_mul_v4, clip.w = -z_view; dividing x,y,z by w is the
  * perspective divide that makes far things smaller.
  */
-static Mat4 m4_perspective(float fovy, float aspect, float near, float far)
-{
-    Mat4 m = {{{0}}};
-    float f = 1.f / tanf(fovy * 0.5f);
-    m.m[0][0] = f / aspect;
-    m.m[1][1] = f;
-    m.m[2][2] = (far + near) / (near - far);
-    m.m[2][3] = (2.f * far * near) / (near - far);
-    m.m[3][2] = -1.f;
-    return m;
+static Mat4 m4_perspective(float fovy, float aspect, float near, float far) {
+  Mat4 m = {{{0}}};
+  float f = 1.f / tanf(fovy * 0.5f);
+  m.m[0][0] = f / aspect;
+  m.m[1][1] = f;
+  m.m[2][2] = (far + near) / (near - far);
+  m.m[2][3] = (2.f * far * near) / (near - far);
+  m.m[3][2] = -1.f;
+  return m;
 }
 
-static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up)
-{
-    Vec3 f = v3_norm(v3_sub(at, eye));
-    Vec3 r = v3_norm(v3(f.z*up.y - f.y*up.z,
-                        f.x*up.z - f.z*up.x,
-                        f.y*up.x - f.x*up.y));
-    Vec3 u = v3(r.y*f.z - r.z*f.y,
-                r.z*f.x - r.x*f.z,
-                r.x*f.y - r.y*f.x);
-    Mat4 m = m4_identity();
-    m.m[0][0] = r.x; m.m[0][1] = r.y; m.m[0][2] = r.z; m.m[0][3] = -v3_dot(r, eye);
-    m.m[1][0] = u.x; m.m[1][1] = u.y; m.m[1][2] = u.z; m.m[1][3] = -v3_dot(u, eye);
-    m.m[2][0] = -f.x; m.m[2][1] = -f.y; m.m[2][2] = -f.z; m.m[2][3] = v3_dot(f, eye);
-    return m;
+static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up) {
+  Vec3 f = v3_norm(v3_sub(at, eye));
+  Vec3 r = v3_norm(v3(f.z * up.y - f.y * up.z, f.x * up.z - f.z * up.x,
+                      f.y * up.x - f.x * up.y));
+  Vec3 u =
+      v3(r.y * f.z - r.z * f.y, r.z * f.x - r.x * f.z, r.x * f.y - r.y * f.x);
+  Mat4 m = m4_identity();
+  m.m[0][0] = r.x;
+  m.m[0][1] = r.y;
+  m.m[0][2] = r.z;
+  m.m[0][3] = -v3_dot(r, eye);
+  m.m[1][0] = u.x;
+  m.m[1][1] = u.y;
+  m.m[1][2] = u.z;
+  m.m[1][3] = -v3_dot(u, eye);
+  m.m[2][0] = -f.x;
+  m.m[2][1] = -f.y;
+  m.m[2][2] = -f.z;
+  m.m[2][3] = v3_dot(f, eye);
+  return m;
 }
 
 /*
@@ -729,19 +744,18 @@ static Mat4 m4_lookat(Vec3 eye, Vec3 at, Vec3 up)
  * rotation this equals the rotation matrix; for non-uniform scale it
  * differs in a way that preserves perpendicularity to the surface.
  */
-static Mat4 m4_normal_mat(Mat4 m)
-{
-    Mat4 n = m4_identity();
-    n.m[0][0] = m.m[1][1]*m.m[2][2] - m.m[1][2]*m.m[2][1];
-    n.m[0][1] = m.m[1][2]*m.m[2][0] - m.m[1][0]*m.m[2][2];
-    n.m[0][2] = m.m[1][0]*m.m[2][1] - m.m[1][1]*m.m[2][0];
-    n.m[1][0] = m.m[0][2]*m.m[2][1] - m.m[0][1]*m.m[2][2];
-    n.m[1][1] = m.m[0][0]*m.m[2][2] - m.m[0][2]*m.m[2][0];
-    n.m[1][2] = m.m[0][1]*m.m[2][0] - m.m[0][0]*m.m[2][1];
-    n.m[2][0] = m.m[0][1]*m.m[1][2] - m.m[0][2]*m.m[1][1];
-    n.m[2][1] = m.m[0][2]*m.m[1][0] - m.m[0][0]*m.m[1][2];
-    n.m[2][2] = m.m[0][0]*m.m[1][1] - m.m[0][1]*m.m[1][0];
-    return n;
+static Mat4 m4_normal_mat(Mat4 m) {
+  Mat4 n = m4_identity();
+  n.m[0][0] = m.m[1][1] * m.m[2][2] - m.m[1][2] * m.m[2][1];
+  n.m[0][1] = m.m[1][2] * m.m[2][0] - m.m[1][0] * m.m[2][2];
+  n.m[0][2] = m.m[1][0] * m.m[2][1] - m.m[1][1] * m.m[2][0];
+  n.m[1][0] = m.m[0][2] * m.m[2][1] - m.m[0][1] * m.m[2][2];
+  n.m[1][1] = m.m[0][0] * m.m[2][2] - m.m[0][2] * m.m[2][0];
+  n.m[1][2] = m.m[0][1] * m.m[2][0] - m.m[0][0] * m.m[2][1];
+  n.m[2][0] = m.m[0][1] * m.m[1][2] - m.m[0][2] * m.m[1][1];
+  n.m[2][1] = m.m[0][2] * m.m[1][0] - m.m[0][0] * m.m[1][2];
+  n.m[2][2] = m.m[0][0] * m.m[1][1] - m.m[0][1] * m.m[1][0];
+  return n;
 }
 
 /* ── §4 paint (216 RGB cube + Bourke ramp) ───────────────────────────── */
@@ -753,26 +767,27 @@ static int g_256;
  * yellow PAIR_HUD and cyan PAIR_HINT for the HUD spec, plus PAIR_HUD_DIM
  * for the educational mid-rows of this file's verbose HUD.
  */
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    g_256 = (COLORS >= 256);
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  g_256 = (COLORS >= 256);
 
-    if (g_256) {
-        for (int i = 0; i < 216; i++)
-            init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
-        init_pair(PAIR_HUD,  226, -1);     /* bright yellow */
-        init_pair(PAIR_HINT,  51, -1);     /* bright cyan   */
-    } else {
-        init_pair(PAIR_CUBE_BASE, COLOR_WHITE,  -1);
-        init_pair(PAIR_HUD,       COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,      COLOR_CYAN,   -1);
-    }
+  if (g_256) {
+    for (int i = 0; i < 216; i++)
+      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+  } else {
+    init_pair(PAIR_CUBE_BASE, COLOR_WHITE, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
-static inline float clamp01  (float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
-static inline float reinhard (float x) { return x / (1.f + x); }
+static inline float clamp01(float x) {
+  return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
+}
+static inline float reinhard(float x) { return x / (1.f + x); }
 static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
 
 /*
@@ -791,46 +806,71 @@ static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
  * HDR puts every bright pixel into one cube cell; Reinhard opens the
  * dynamic range so colours spread.
  */
-static void paint_cell(int sx, int sy, Vec3 col)
-{
-    float r = gamma_enc(reinhard(col.x));
-    float g = gamma_enc(reinhard(col.y));
-    float b = gamma_enc(reinhard(col.z));
+static void paint_cell(int sx, int sy, Vec3 col) {
+  float r = gamma_enc(reinhard(col.x));
+  float g = gamma_enc(reinhard(col.y));
+  float b = gamma_enc(reinhard(col.z));
 
-    float luma  = 0.2126f*r + 0.7152f*g + 0.0722f*b;
-    float dith  = (k_bayer[sy & 3][sx & 3] - 0.5f) * DITHER_AMP;
-    float lum_d = clamp01(luma + dith);
+  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  float dith = (k_bayer[sy & 3][sx & 3] - 0.5f) * DITHER_AMP;
+  float lum_d = clamp01(luma + dith);
 
-    int pair;
-    if (g_256) {
-        int r5 = (int)(r * 5.f + 0.5f); if (r5 > 5) r5 = 5; if (r5 < 0) r5 = 0;
-        int g5 = (int)(g * 5.f + 0.5f); if (g5 > 5) g5 = 5; if (g5 < 0) g5 = 0;
-        int b5 = (int)(b * 5.f + 0.5f); if (b5 > 5) b5 = 5; if (b5 < 0) b5 = 0;
-        pair = PAIR_CUBE_BASE + r5*36 + g5*6 + b5;
-    } else {
-        pair = PAIR_CUBE_BASE;
-    }
+  int pair;
+  if (g_256) {
+    int r5 = (int)(r * 5.f + 0.5f);
+    if (r5 > 5)
+      r5 = 5;
+    if (r5 < 0)
+      r5 = 0;
+    int g5 = (int)(g * 5.f + 0.5f);
+    if (g5 > 5)
+      g5 = 5;
+    if (g5 < 0)
+      g5 = 0;
+    int b5 = (int)(b * 5.f + 0.5f);
+    if (b5 > 5)
+      b5 = 5;
+    if (b5 < 0)
+      b5 = 0;
+    pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
+  } else {
+    pair = PAIR_CUBE_BASE;
+  }
 
-    int idx = (int)(lum_d * (BOURKE_LEN - 1) + 0.5f);
-    if (idx < 0)            idx = 0;
-    if (idx >= BOURKE_LEN)  idx = BOURKE_LEN - 1;
+  int idx = (int)(lum_d * (BOURKE_LEN - 1) + 0.5f);
+  if (idx < 0)
+    idx = 0;
+  if (idx >= BOURKE_LEN)
+    idx = BOURKE_LEN - 1;
 
-    int attr = (luma > 0.85f) ? A_BOLD
-             : (luma < 0.15f) ? A_DIM
-             :                  A_NORMAL;
+  int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
 
-    attron(COLOR_PAIR(pair) | attr);
-    mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[idx]);
-    attroff(COLOR_PAIR(pair) | attr);
+  attron(COLOR_PAIR(pair) | attr);
+  mvaddch(sy, sx, (chtype)(unsigned char)k_bourke[idx]);
+  attroff(COLOR_PAIR(pair) | attr);
 }
 
 /* ── §5 mesh ─────────────────────────────────────────────────────────── */
 
-typedef struct { Vec3 pos; Vec3 normal; float u, v; } Vertex;
-typedef struct { int v[3]; } Triangle;
-typedef struct { Vertex *verts; Triangle *tris; int nvert, ntri; } Mesh;
+typedef struct {
+  Vec3 pos;
+  Vec3 normal;
+  float u, v;
+} Vertex;
+typedef struct {
+  int v[3];
+} Triangle;
+typedef struct {
+  Vertex *verts;
+  Triangle *tris;
+  int nvert, ntri;
+} Mesh;
 
-static void mesh_free(Mesh *m) { free(m->verts); free(m->tris); *m = (Mesh){0}; }
+static void mesh_free(Mesh *m) {
+  free(m->verts);
+  free(m->tris);
+  *m = (Mesh){0};
+}
 
 /* §5 ── tessellate_sphere: UV sphere with smooth normals ────────────── */
 
@@ -846,43 +886,43 @@ static void mesh_free(Mesh *m) { free(m->verts); free(m->tris); *m = (Mesh){0}; 
  * shading): adjacent vertices have slightly different normals, and
  * barycentric interpolation in the rasteriser blends them per-pixel.
  */
-static Mesh tessellate_sphere(float radius, int rings, int segs)
-{
-    int n_verts = (rings + 1) * (segs + 1);
-    int n_tris  = rings * segs * 2;
-    Mesh m;
-    m.verts = malloc((size_t)n_verts * sizeof(Vertex));
-    m.tris  = malloc((size_t)n_tris  * sizeof(Triangle));
-    m.nvert = 0; m.ntri = 0;
+static Mesh tessellate_sphere(float radius, int rings, int segs) {
+  int n_verts = (rings + 1) * (segs + 1);
+  int n_tris = rings * segs * 2;
+  Mesh m;
+  m.verts = malloc((size_t)n_verts * sizeof(Vertex));
+  m.tris = malloc((size_t)n_tris * sizeof(Triangle));
+  m.nvert = 0;
+  m.ntri = 0;
 
-    for (int i = 0; i <= rings; i++) {
-        float theta = (float)M_PI * (float)i / (float)rings;
-        float st = sinf(theta), ct = cosf(theta);
-        for (int j = 0; j <= segs; j++) {
-            float phi = 2.f * (float)M_PI * (float)j / (float)segs;
-            float x = radius * st * cosf(phi);
-            float y = radius * ct;
-            float z = radius * st * sinf(phi);
-            Vec3 pos = v3(x, y, z);
-            Vec3 nrm = v3(x/radius, y/radius, z/radius);
-            float u  = (float)j / (float)segs;
-            float vv = (float)i / (float)rings;
-            m.verts[m.nvert++] = (Vertex){ pos, nrm, u, vv };
-        }
+  for (int i = 0; i <= rings; i++) {
+    float theta = (float)M_PI * (float)i / (float)rings;
+    float st = sinf(theta), ct = cosf(theta);
+    for (int j = 0; j <= segs; j++) {
+      float phi = 2.f * (float)M_PI * (float)j / (float)segs;
+      float x = radius * st * cosf(phi);
+      float y = radius * ct;
+      float z = radius * st * sinf(phi);
+      Vec3 pos = v3(x, y, z);
+      Vec3 nrm = v3(x / radius, y / radius, z / radius);
+      float u = (float)j / (float)segs;
+      float vv = (float)i / (float)rings;
+      m.verts[m.nvert++] = (Vertex){pos, nrm, u, vv};
     }
+  }
 
-    /* Wire vertex grid into quads, each split into 2 CCW triangles. */
-    for (int i = 0; i < rings; i++) {
-        for (int j = 0; j < segs; j++) {
-            int v00 =  i      * (segs + 1) + j;
-            int v10 = (i + 1) * (segs + 1) + j;
-            int v11 = (i + 1) * (segs + 1) + (j + 1);
-            int v01 =  i      * (segs + 1) + (j + 1);
-            m.tris[m.ntri++] = (Triangle){{ v00, v10, v01 }};
-            m.tris[m.ntri++] = (Triangle){{ v10, v11, v01 }};
-        }
+  /* Wire vertex grid into quads, each split into 2 CCW triangles. */
+  for (int i = 0; i < rings; i++) {
+    for (int j = 0; j < segs; j++) {
+      int v00 = i * (segs + 1) + j;
+      int v10 = (i + 1) * (segs + 1) + j;
+      int v11 = (i + 1) * (segs + 1) + (j + 1);
+      int v01 = i * (segs + 1) + (j + 1);
+      m.tris[m.ntri++] = (Triangle){{v00, v10, v01}};
+      m.tris[m.ntri++] = (Triangle){{v10, v11, v01}};
     }
-    return m;
+  }
+  return m;
 }
 
 /* ── §6 G-buffer — geometry pass ─────────────────────────────────────── */
@@ -908,12 +948,12 @@ static Mesh tessellate_sphere(float radius, int rings, int segs)
  * Unity HDRP packs them as: Albedo+Roughness, Normal+Metallic,
  * Spec+AO, Emissive — same idea, more channels.
  */
-static Vec3    g_pos   [GBUF_MAX_H][GBUF_MAX_W];
-static Vec3    g_normal[GBUF_MAX_H][GBUF_MAX_W];
-static Vec3    g_albedo[GBUF_MAX_H][GBUF_MAX_W];
-static float   g_zbuf  [GBUF_MAX_H][GBUF_MAX_W];
-static uint8_t g_valid [GBUF_MAX_H][GBUF_MAX_W];
-static Vec3    g_light [GBUF_MAX_H][GBUF_MAX_W];
+static Vec3 g_pos[GBUF_MAX_H][GBUF_MAX_W];
+static Vec3 g_normal[GBUF_MAX_H][GBUF_MAX_W];
+static Vec3 g_albedo[GBUF_MAX_H][GBUF_MAX_W];
+static float g_zbuf[GBUF_MAX_H][GBUF_MAX_W];
+static uint8_t g_valid[GBUF_MAX_H][GBUF_MAX_W];
+static Vec3 g_light[GBUF_MAX_H][GBUF_MAX_W];
 
 /*
  * gbuffer_clear — reset depth + valid flags before each frame.
@@ -923,14 +963,13 @@ static Vec3    g_light [GBUF_MAX_H][GBUF_MAX_W];
  *
  * OpenGL equivalent: glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT)
  */
-static void gbuffer_clear(int cols, int rows)
-{
-    for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
-        for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-            g_zbuf [r][c] = 1.0f;     /* NDC far plane */
-            g_valid[r][c] = 0;
-        }
+static void gbuffer_clear(int cols, int rows) {
+  for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
+    for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
+      g_zbuf[r][c] = 1.0f; /* NDC far plane */
+      g_valid[r][c] = 0;
     }
+  }
 }
 
 /* §6.2 ── barycentric (Möller signed-area form) ─────────────────────── */
@@ -945,15 +984,17 @@ static void gbuffer_clear(int cols, int rows)
  *
  * If d ≈ 0 (degenerate triangle), return -1s so caller skips the pixel.
  */
-static void barycentric(const float sx[3], const float sy[3],
-                        float px, float py, float b[3])
-{
-    float d = (sy[1] - sy[2]) * (sx[0] - sx[2])
-            + (sx[2] - sx[1]) * (sy[0] - sy[2]);
-    if (fabsf(d) < 1e-6f) { b[0] = b[1] = b[2] = -1.f; return; }
-    b[0] = ((sy[1] - sy[2]) * (px - sx[2]) + (sx[2] - sx[1]) * (py - sy[2])) / d;
-    b[1] = ((sy[2] - sy[0]) * (px - sx[2]) + (sx[0] - sx[2]) * (py - sy[2])) / d;
-    b[2] = 1.f - b[0] - b[1];
+static void barycentric(const float sx[3], const float sy[3], float px,
+                        float py, float b[3]) {
+  float d =
+      (sy[1] - sy[2]) * (sx[0] - sx[2]) + (sx[2] - sx[1]) * (sy[0] - sy[2]);
+  if (fabsf(d) < 1e-6f) {
+    b[0] = b[1] = b[2] = -1.f;
+    return;
+  }
+  b[0] = ((sy[1] - sy[2]) * (px - sx[2]) + (sx[2] - sx[1]) * (py - sy[2])) / d;
+  b[1] = ((sy[2] - sy[0]) * (px - sx[2]) + (sx[0] - sx[2]) * (py - sy[2])) / d;
+  b[2] = 1.f - b[0] - b[1];
 }
 
 /* §6.3 ── rasterize_object — vertex → cull → raster → G-buffer write ── */
@@ -980,67 +1021,69 @@ static void barycentric(const float sx[3], const float sy[3],
  * NO LIGHTING IS DONE HERE — that's what makes deferred rendering
  * deferred. The mesh is rasterised once; lighting is a separate pass.
  */
-static void rasterize_object(const Mesh *mesh, Vec3 albedo,
-                             Mat4 mvp, Mat4 model, Mat4 norm_mat,
-                             int cols, int rows)
-{
-    for (int ti = 0; ti < mesh->ntri; ti++) {
-        const Triangle *tri = &mesh->tris[ti];
+static void rasterize_object(const Mesh *mesh, Vec3 albedo, Mat4 mvp,
+                             Mat4 model, Mat4 norm_mat, int cols, int rows) {
+  for (int ti = 0; ti < mesh->ntri; ti++) {
+    const Triangle *tri = &mesh->tris[ti];
 
-        /* STAGE 1: vertex transform. */
-        Vec4 clip[3];
-        Vec3 wpos[3], wnrm[3];
-        for (int vi = 0; vi < 3; vi++) {
-            const Vertex *v = &mesh->verts[tri->v[vi]];
-            clip[vi] = m4_mul_v4(mvp, v4(v->pos.x, v->pos.y, v->pos.z, 1.f));
-            wpos[vi] = m4_pt(model, v->pos);
-            wnrm[vi] = v3_norm(m4_dir(norm_mat, v->normal));
-        }
-
-        /* Skip triangles entirely behind the near plane. */
-        if (clip[0].w < 0.001f && clip[1].w < 0.001f && clip[2].w < 0.001f)
-            continue;
-
-        /* STAGE 2: perspective divide → screen. */
-        float sx[3], sy[3], sz[3];
-        for (int vi = 0; vi < 3; vi++) {
-            float w = clip[vi].w; if (fabsf(w) < 1e-6f) w = 1e-6f;
-            sx[vi] = ( clip[vi].x / w + 1.f) * 0.5f * (float)cols;
-            sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows;   /* Y-flip */
-            sz[vi] =   clip[vi].z / w;
-        }
-
-        /* Back-face cull: positive area = CCW = front face. */
-        float area = (sx[1] - sx[0]) * (sy[2] - sy[0])
-                   - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-        if (area <= 0.f) continue;
-
-        /* Bounding box clamped to G-buffer. */
-        int x0 = (int)fmaxf(0.f,        floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
-        int x1 = (int)fminf(cols - 1.f,  ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
-        int y0 = (int)fmaxf(0.f,        floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
-        int y1 = (int)fminf(rows - 1.f,  ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
-
-        /* STAGE 3: fragment / G-buffer write. */
-        for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
-            for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
-                float b[3];
-                barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
-                if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f) continue;
-
-                float z = b[0]*sz[0] + b[1]*sz[1] + b[2]*sz[2];
-                if (z >= g_zbuf[py][px]) continue;
-
-                g_zbuf  [py][px] = z;
-                g_pos   [py][px] = v3_bary(wpos[0], wpos[1], wpos[2],
-                                           b[0], b[1], b[2]);
-                g_normal[py][px] = v3_norm(v3_bary(wnrm[0], wnrm[1], wnrm[2],
-                                                   b[0], b[1], b[2]));
-                g_albedo[py][px] = albedo;
-                g_valid [py][px] = 1;
-            }
-        }
+    /* STAGE 1: vertex transform. */
+    Vec4 clip[3];
+    Vec3 wpos[3], wnrm[3];
+    for (int vi = 0; vi < 3; vi++) {
+      const Vertex *v = &mesh->verts[tri->v[vi]];
+      clip[vi] = m4_mul_v4(mvp, v4(v->pos.x, v->pos.y, v->pos.z, 1.f));
+      wpos[vi] = m4_pt(model, v->pos);
+      wnrm[vi] = v3_norm(m4_dir(norm_mat, v->normal));
     }
+
+    /* Skip triangles entirely behind the near plane. */
+    if (clip[0].w < 0.001f && clip[1].w < 0.001f && clip[2].w < 0.001f)
+      continue;
+
+    /* STAGE 2: perspective divide → screen. */
+    float sx[3], sy[3], sz[3];
+    for (int vi = 0; vi < 3; vi++) {
+      float w = clip[vi].w;
+      if (fabsf(w) < 1e-6f)
+        w = 1e-6f;
+      sx[vi] = (clip[vi].x / w + 1.f) * 0.5f * (float)cols;
+      sy[vi] = (-clip[vi].y / w + 1.f) * 0.5f * (float)rows; /* Y-flip */
+      sz[vi] = clip[vi].z / w;
+    }
+
+    /* Back-face cull: positive area = CCW = front face. */
+    float area =
+        (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+    if (area <= 0.f)
+      continue;
+
+    /* Bounding box clamped to G-buffer. */
+    int x0 = (int)fmaxf(0.f, floorf(fminf(sx[0], fminf(sx[1], sx[2]))));
+    int x1 = (int)fminf(cols - 1.f, ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2]))));
+    int y0 = (int)fmaxf(0.f, floorf(fminf(sy[0], fminf(sy[1], sy[2]))));
+    int y1 = (int)fminf(rows - 1.f, ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2]))));
+
+    /* STAGE 3: fragment / G-buffer write. */
+    for (int py = y0; py <= y1 && py < GBUF_MAX_H; py++) {
+      for (int px = x0; px <= x1 && px < GBUF_MAX_W; px++) {
+        float b[3];
+        barycentric(sx, sy, (float)px + 0.5f, (float)py + 0.5f, b);
+        if (b[0] < 0.f || b[1] < 0.f || b[2] < 0.f)
+          continue;
+
+        float z = b[0] * sz[0] + b[1] * sz[1] + b[2] * sz[2];
+        if (z >= g_zbuf[py][px])
+          continue;
+
+        g_zbuf[py][px] = z;
+        g_pos[py][px] = v3_bary(wpos[0], wpos[1], wpos[2], b[0], b[1], b[2]);
+        g_normal[py][px] =
+            v3_norm(v3_bary(wnrm[0], wnrm[1], wnrm[2], b[0], b[1], b[2]));
+        g_albedo[py][px] = albedo;
+        g_valid[py][px] = 1;
+      }
+    }
+  }
 }
 
 /* §6.4 ── render_gbuffer — geometry pass over all scene objects ────── */
@@ -1057,18 +1100,16 @@ static void rasterize_object(const Mesh *mesh, Vec3 albedo,
  *   glBindFramebuffer(GL_FRAMEBUFFER, 0);
  */
 static void render_gbuffer(const Mesh *meshes, const Vec3 *albedos,
-                           const Mat4 *models, int n_objects,
-                           const Mat4 *view,   const Mat4 *proj,
-                           int cols, int rows)
-{
-    gbuffer_clear(cols, rows);
-    for (int oi = 0; oi < n_objects; oi++) {
-        Mat4 mv   = m4_mul(*view, models[oi]);
-        Mat4 mvp  = m4_mul(*proj, mv);
-        Mat4 nmat = m4_normal_mat(models[oi]);
-        rasterize_object(&meshes[oi], albedos[oi], mvp, models[oi], nmat,
-                         cols, rows);
-    }
+                           const Mat4 *models, int n_objects, const Mat4 *view,
+                           const Mat4 *proj, int cols, int rows) {
+  gbuffer_clear(cols, rows);
+  for (int oi = 0; oi < n_objects; oi++) {
+    Mat4 mv = m4_mul(*view, models[oi]);
+    Mat4 mvp = m4_mul(*proj, mv);
+    Mat4 nmat = m4_normal_mat(models[oi]);
+    rasterize_object(&meshes[oi], albedos[oi], mvp, models[oi], nmat, cols,
+                     rows);
+  }
 }
 
 /* ── §7 lightpass — Blinn-Phong shading ─────────────────────────────── */
@@ -1083,12 +1124,12 @@ static void render_gbuffer(const Mesh *meshes, const Vec3 *albedos,
  * not from different orbit planes. Simpler, and easier to predict.
  */
 typedef struct {
-    Vec3  color;
-    float orbit_radius;
-    float orbit_speed;       /* radians / second                   */
-    float height;            /* y-coord of the orbit ring          */
-    float orbit_angle;       /* current θ, accumulated each tick   */
-    Vec3  pos;               /* world-space position (derived)     */
+  Vec3 color;
+  float orbit_radius;
+  float orbit_speed; /* radians / second                   */
+  float height;      /* y-coord of the orbit ring          */
+  float orbit_angle; /* current θ, accumulated each tick   */
+  Vec3 pos;          /* world-space position (derived)     */
 } PointLight;
 
 /* §7.2 ── blinn_phong — one light's contribution at a pixel ────────── */
@@ -1116,19 +1157,18 @@ typedef struct {
  *   float spec = pow(max(dot(N, H), 0.0), shininess);
  *   color += albedo * light.color * diff + light.color * spec * 0.35;
  */
-static Vec3 blinn_phong(Vec3 P, Vec3 N, Vec3 albedo,
-                        Vec3 light_pos, Vec3 light_col, Vec3 cam_pos)
-{
-    Vec3 L = v3_norm(v3_sub(light_pos, P));
-    Vec3 V = v3_norm(v3_sub(cam_pos,   P));
-    Vec3 H = v3_norm(v3_add(L, V));
+static Vec3 blinn_phong(Vec3 P, Vec3 N, Vec3 albedo, Vec3 light_pos,
+                        Vec3 light_col, Vec3 cam_pos) {
+  Vec3 L = v3_norm(v3_sub(light_pos, P));
+  Vec3 V = v3_norm(v3_sub(cam_pos, P));
+  Vec3 H = v3_norm(v3_add(L, V));
 
-    float diff = fmaxf(0.f, v3_dot(N, L));
-    float spec = powf(fmaxf(0.f, v3_dot(N, H)), SHININESS);
+  float diff = fmaxf(0.f, v3_dot(N, L));
+  float spec = powf(fmaxf(0.f, v3_dot(N, H)), SHININESS);
 
-    return v3(albedo.x * light_col.x * diff + light_col.x * spec * 0.35f,
-              albedo.y * light_col.y * diff + light_col.y * spec * 0.35f,
-              albedo.z * light_col.z * diff + light_col.z * spec * 0.35f);
+  return v3(albedo.x * light_col.x * diff + light_col.x * spec * 0.35f,
+            albedo.y * light_col.y * diff + light_col.y * spec * 0.35f,
+            albedo.z * light_col.z * diff + light_col.z * spec * 0.35f);
 }
 
 /* §7.3 ── render_lightpass — accumulate Blinn-Phong over G-buffer ──── */
@@ -1146,36 +1186,35 @@ static Vec3 blinn_phong(Vec3 P, Vec3 N, Vec3 albedo,
  * more iteration of the inner loop, NOT another mesh rasterisation.
  */
 static void render_lightpass(const PointLight *lights, int n_lights,
-                             Vec3 cam_pos, int cols, int rows)
-{
-    Vec3 ambient = v3(AMBIENT_STR, AMBIENT_STR, AMBIENT_STR * 1.1f);
+                             Vec3 cam_pos, int cols, int rows) {
+  Vec3 ambient = v3(AMBIENT_STR, AMBIENT_STR, AMBIENT_STR * 1.1f);
 
-    for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
-        for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-            if (!g_valid[r][c]) { g_light[r][c] = v3(0, 0, 0); continue; }
+  for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
+    for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
+      if (!g_valid[r][c]) {
+        g_light[r][c] = v3(0, 0, 0);
+        continue;
+      }
 
-            Vec3 P      = g_pos   [r][c];
-            Vec3 N      = g_normal[r][c];
-            Vec3 albedo = g_albedo[r][c];
+      Vec3 P = g_pos[r][c];
+      Vec3 N = g_normal[r][c];
+      Vec3 albedo = g_albedo[r][c];
 
-            Vec3 lit = v3(ambient.x * albedo.x,
-                          ambient.y * albedo.y,
-                          ambient.z * albedo.z);
+      Vec3 lit =
+          v3(ambient.x * albedo.x, ambient.y * albedo.y, ambient.z * albedo.z);
 
-            for (int li = 0; li < n_lights; li++) {
-                Vec3 contrib = blinn_phong(P, N, albedo,
-                                           lights[li].pos, lights[li].color,
-                                           cam_pos);
-                lit.x += contrib.x;
-                lit.y += contrib.y;
-                lit.z += contrib.z;
-            }
+      for (int li = 0; li < n_lights; li++) {
+        Vec3 contrib = blinn_phong(P, N, albedo, lights[li].pos,
+                                   lights[li].color, cam_pos);
+        lit.x += contrib.x;
+        lit.y += contrib.y;
+        lit.z += contrib.z;
+      }
 
-            g_light[r][c] = v3(fminf(1.f, lit.x),
-                               fminf(1.f, lit.y),
-                               fminf(1.f, lit.z));
-        }
+      g_light[r][c] =
+          v3(fminf(1.f, lit.x), fminf(1.f, lit.y), fminf(1.f, lit.z));
     }
+  }
 }
 
 /* ── §8 scene ────────────────────────────────────────────────────────── */
@@ -1183,15 +1222,18 @@ static void render_lightpass(const PointLight *lights, int n_lights,
 /* §8.1 ── GBufMode + Scene ──────────────────────────────────────────── */
 
 typedef enum {
-    MODE_POSITION = 0,
-    MODE_NORMAL,
-    MODE_ALBEDO,
-    MODE_LIGHTING,
-    MODE_COUNT,
+  MODE_POSITION = 0,
+  MODE_NORMAL,
+  MODE_ALBEDO,
+  MODE_LIGHTING,
+  MODE_COUNT,
 } GBufMode;
 
 static const char *k_mode_names[MODE_COUNT] = {
-    "POSITION", "NORMAL", "ALBEDO", "LIGHTING",
+    "POSITION",
+    "NORMAL",
+    "ALBEDO",
+    "LIGHTING",
 };
 
 /* Scene holds three parallel arrays describing every renderable object:
@@ -1227,63 +1269,70 @@ static const char *k_mode_names[MODE_COUNT] = {
  *   lighting accumulation grows.
  */
 static const struct {
-    Vec3  color;
-    float orbit_radius, orbit_speed, height;
-    float angle_start;
+  Vec3 color;
+  float orbit_radius, orbit_speed, height;
+  float angle_start;
 } LIGHT_PRESETS[MAX_LIGHTS] = {
     /* ── The three primaries — same orbit, 120° apart on a horizontal
      * ring just above the sphere's equator. The equilateral arrangement
      * is preserved as they sweep, so you always see the three coloured
      * pools in a clear triangular relationship. ── */
-    { {1.00f, 0.00f, 0.00f}, 1.55f, 0.45f, 0.40f, 0.0000f },  /* RED   @ 0°  */
-    { {0.00f, 1.00f, 0.00f}, 1.55f, 0.45f, 0.40f, 2.0944f },  /* GREEN @ 120° (2π/3) */
-    { {0.00f, 0.00f, 1.00f}, 1.55f, 0.45f, 0.40f, 4.1888f },  /* BLUE  @ 240° (4π/3) */
+    {{1.00f, 0.00f, 0.00f}, 1.55f, 0.45f, 0.40f, 0.0000f}, /* RED   @ 0°  */
+    {{0.00f, 1.00f, 0.00f},
+     1.55f,
+     0.45f,
+     0.40f,
+     2.0944f}, /* GREEN @ 120° (2π/3) */
+    {{0.00f, 0.00f, 1.00f},
+     1.55f,
+     0.45f,
+     0.40f,
+     4.1888f}, /* BLUE  @ 240° (4π/3) */
 
     /* ── Progression extras — 'l'-key adds one at a time. Variety comes
      * from differing radius / speed / height / phase. Press 'l' until
      * 8 lights are active — the geometry pass cost stays fixed; only
      * the lighting accumulation grows. ── */
-    { {1.00f, 1.00f, 0.00f}, 1.30f, 0.65f, -0.30f, 1.000f },  /* YELLOW   */
-    { {0.00f, 1.00f, 1.00f}, 1.30f, 0.65f, -0.30f, 3.000f },  /* CYAN     */
-    { {1.00f, 0.00f, 1.00f}, 1.30f, 0.65f, -0.30f, 5.000f },  /* MAGENTA  */
-    { {1.00f, 1.00f, 1.00f}, 1.80f, 0.30f,  1.20f, 0.500f },  /* WHITE    */
-    { {1.00f, 0.55f, 0.00f}, 1.20f, 0.80f,  0.00f, 2.500f },  /* ORANGE   */
+    {{1.00f, 1.00f, 0.00f}, 1.30f, 0.65f, -0.30f, 1.000f}, /* YELLOW   */
+    {{0.00f, 1.00f, 1.00f}, 1.30f, 0.65f, -0.30f, 3.000f}, /* CYAN     */
+    {{1.00f, 0.00f, 1.00f}, 1.30f, 0.65f, -0.30f, 5.000f}, /* MAGENTA  */
+    {{1.00f, 1.00f, 1.00f}, 1.80f, 0.30f, 1.20f, 0.500f},  /* WHITE    */
+    {{1.00f, 0.55f, 0.00f}, 1.20f, 0.80f, 0.00f, 2.500f},  /* ORANGE   */
 };
 
 typedef struct {
-    /* Renderable objects — three parallel arrays. */
-    Mesh        meshes [MAX_OBJECTS];
-    Vec3        albedos[MAX_OBJECTS];
-    Mat4        models [MAX_OBJECTS];
-    int         n_objects;
+  /* Renderable objects — three parallel arrays. */
+  Mesh meshes[MAX_OBJECTS];
+  Vec3 albedos[MAX_OBJECTS];
+  Mat4 models[MAX_OBJECTS];
+  int n_objects;
 
-    /* Lights. */
-    PointLight  lights[MAX_LIGHTS];
-    int         n_lights;
+  /* Lights. */
+  PointLight lights[MAX_LIGHTS];
+  int n_lights;
 
-    /* Camera + projection. Pose is fixed except for +/- zoom, which
-     * slides cam_pos along +Z (the eye axis). cam_dist is the live Z
-     * distance — modifying it and calling scene_set_zoom() rebuilds
-     * cam_pos and the view matrix. */
-    Mat4        view, proj;
-    Vec3        cam_pos;
-    float       cam_dist;
+  /* Camera + projection. Pose is fixed except for +/- zoom, which
+   * slides cam_pos along +Z (the eye axis). cam_dist is the live Z
+   * distance — modifying it and calling scene_set_zoom() rebuilds
+   * cam_pos and the view matrix. */
+  Mat4 view, proj;
+  Vec3 cam_pos;
+  float cam_dist;
 
-    /* UI / framing. */
-    GBufMode    mode;
-    bool        paused;
-    int         scene_cols;
-    int         scene_rows;
+  /* UI / framing. */
+  GBufMode mode;
+  bool paused;
+  int scene_cols;
+  int scene_rows;
 } Scene;
 
 /* §8.3 ── scene_init / scene_set_zoom / scene_tick ──────────────────── */
 
-static void scene_rebuild_proj(Scene *s, int cols, int rows)
-{
-    /* Aspect from PIXEL counts (cols·CELL_W, rows·CELL_H), NOT cell counts.
-     * Without this the cube renders as a vertically squashed rectangle. */
-    float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
-    s->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
+static void scene_rebuild_proj(Scene *s, int cols, int rows) {
+  /* Aspect from PIXEL counts (cols·CELL_W, rows·CELL_H), NOT cell counts.
+   * Without this the cube renders as a vertically squashed rectangle. */
+  float aspect = (float)(cols * CELL_W) / (float)(rows * CELL_H);
+  s->proj = m4_perspective(CAM_FOV, aspect, CAM_NEAR, CAM_FAR);
 }
 
 /*
@@ -1298,10 +1347,9 @@ static void scene_rebuild_proj(Scene *s, int cols, int rows)
  *
  * Equivalent to scene_set_zoom() in raster/cube_raster.c.
  */
-static void scene_set_zoom(Scene *s)
-{
-    s->cam_pos = v3(0.f, CAM_EYE_Y, s->cam_dist);
-    s->view    = m4_lookat(s->cam_pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
+static void scene_set_zoom(Scene *s) {
+  s->cam_pos = v3(0.f, CAM_EYE_Y, s->cam_dist);
+  s->view = m4_lookat(s->cam_pos, v3(0, CAM_LOOK_Y, 0), v3(0, 1, 0));
 }
 
 /*
@@ -1311,7 +1359,8 @@ static void scene_set_zoom(Scene *s)
  *   meshes[0]               :  one white sphere at the origin
  *   models[0]               :  identity (sphere stays at origin)
  *   lights[0..2]            :  RED, GREEN, BLUE primaries (active by default)
- *   lights[3..7]            :  reserved progression extras (press 'l' to enable)
+ *   lights[3..7]            :  reserved progression extras (press 'l' to
+ * enable)
  *
  * Why this minimal layout? A single white sphere + three saturated
  * primaries is the canonical "additive light" demo every graphics
@@ -1319,43 +1368,43 @@ static void scene_set_zoom(Scene *s)
  * can see the deferred lighting pass accumulate one light at a time
  * by pressing 'l'.
  */
-static void scene_init(Scene *s, int total_cols, int total_rows)
-{
-    /* Free meshes from previous scene (reset / resize). */
-    for (int i = 0; i < s->n_objects; i++) mesh_free(&s->meshes[i]);
+static void scene_init(Scene *s, int total_cols, int total_rows) {
+  /* Free meshes from previous scene (reset / resize). */
+  for (int i = 0; i < s->n_objects; i++)
+    mesh_free(&s->meshes[i]);
 
-    memset(s, 0, sizeof *s);
-    s->scene_cols = total_cols;
-    s->scene_rows = total_rows - HUD_ROWS;
-    s->mode       = MODE_LIGHTING;
+  memset(s, 0, sizeof *s);
+  s->scene_cols = total_cols;
+  s->scene_rows = total_rows - HUD_ROWS;
+  s->mode = MODE_LIGHTING;
 
-    /* Camera — pose is fixed except for +/- zoom. cam_dist lives in
-     * Scene so the user can move the eye at runtime; scene_set_zoom
-     * derives cam_pos and the view matrix from it. */
-    s->cam_dist = CAM_DIST;
-    scene_set_zoom(s);
-    scene_rebuild_proj(s, total_cols, s->scene_rows);
+  /* Camera — pose is fixed except for +/- zoom. cam_dist lives in
+   * Scene so the user can move the eye at runtime; scene_set_zoom
+   * derives cam_pos and the view matrix from it. */
+  s->cam_dist = CAM_DIST;
+  scene_set_zoom(s);
+  scene_rebuild_proj(s, total_cols, s->scene_rows);
 
-    /* ── The one and only object: a white sphere at the origin. ── */
-    s->meshes [0] = tessellate_sphere(BALL_RADIUS, BALL_RINGS, BALL_SEGS);
-    s->albedos[0] = v3(1.0f, 1.0f, 1.0f);     /* pure white — no filtering  */
-    s->models [0] = m4_identity();             /* at origin, no rotation     */
-    s->n_objects  = 1;
+  /* ── The one and only object: a white sphere at the origin. ── */
+  s->meshes[0] = tessellate_sphere(BALL_RADIUS, BALL_RINGS, BALL_SEGS);
+  s->albedos[0] = v3(1.0f, 1.0f, 1.0f); /* pure white — no filtering  */
+  s->models[0] = m4_identity();         /* at origin, no rotation     */
+  s->n_objects = 1;
 
-    /* ── Three RGB primaries active by default. Press 'l' to enable
-     * one more (up to MAX_LIGHTS). ── */
-    s->n_lights = 3;
+  /* ── Three RGB primaries active by default. Press 'l' to enable
+   * one more (up to MAX_LIGHTS). ── */
+  s->n_lights = 3;
 
-    /* Seed every preset's state — even the inactive extras, so 'l' just
-     * bumps n_lights without re-seeding mid-animation. */
-    for (int li = 0; li < MAX_LIGHTS; li++) {
-        PointLight *l = &s->lights[li];
-        l->color        = LIGHT_PRESETS[li].color;
-        l->orbit_radius = LIGHT_PRESETS[li].orbit_radius;
-        l->orbit_speed  = LIGHT_PRESETS[li].orbit_speed;
-        l->height       = LIGHT_PRESETS[li].height;
-        l->orbit_angle  = LIGHT_PRESETS[li].angle_start;
-    }
+  /* Seed every preset's state — even the inactive extras, so 'l' just
+   * bumps n_lights without re-seeding mid-animation. */
+  for (int li = 0; li < MAX_LIGHTS; li++) {
+    PointLight *l = &s->lights[li];
+    l->color = LIGHT_PRESETS[li].color;
+    l->orbit_radius = LIGHT_PRESETS[li].orbit_radius;
+    l->orbit_speed = LIGHT_PRESETS[li].orbit_speed;
+    l->height = LIGHT_PRESETS[li].height;
+    l->orbit_angle = LIGHT_PRESETS[li].angle_start;
+  }
 }
 
 /*
@@ -1365,18 +1414,16 @@ static void scene_init(Scene *s, int total_cols, int total_rows)
  * static. The whole tick is just: each light's angle += speed·dt, then
  * rebuild its (x, y, z) position from (radius, angle, height).
  */
-static void scene_tick(Scene *s, float dt)
-{
-    if (s->paused) return;
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
 
-    for (int li = 0; li < MAX_LIGHTS; li++) {
-        PointLight *l = &s->lights[li];
-        l->orbit_angle += l->orbit_speed * dt;
-        float r = l->orbit_radius;
-        l->pos  = v3(r * cosf(l->orbit_angle),
-                     l->height,
-                     r * sinf(l->orbit_angle));
-    }
+  for (int li = 0; li < MAX_LIGHTS; li++) {
+    PointLight *l = &s->lights[li];
+    l->orbit_angle += l->orbit_speed * dt;
+    float r = l->orbit_radius;
+    l->pos = v3(r * cosf(l->orbit_angle), l->height, r * sinf(l->orbit_angle));
+  }
 }
 
 /* §8.4 ── mode_to_rgb — G-buffer layer → RGB at one pixel ───────────── */
@@ -1393,32 +1440,33 @@ static void scene_tick(Scene *s, float dt)
  *   ALBEDO    — raw g_albedo, no lighting at all.
  *   LIGHTING  — final shaded result from g_light.
  */
-static Vec3 mode_to_rgb(GBufMode mode, int r, int c)
-{
-    if (!g_valid[r][c]) return v3(0, 0, 0);
+static Vec3 mode_to_rgb(GBufMode mode, int r, int c) {
+  if (!g_valid[r][c])
+    return v3(0, 0, 0);
 
-    switch (mode) {
-    case MODE_POSITION: {
-        /* NDC-z ranges from -1 (near) to +1 (far). Remap to t∈[0,1]. */
-        float t = (g_zbuf[r][c] + 1.f) * 0.5f;
-        if (t < 0.f) t = 0.f;
-        if (t > 1.f) t = 1.f;
-        /* Warm (red/yellow) near, cool (blue) far. */
-        return v3(0.95f - t*0.7f,
-                  0.55f - t*0.3f + (1.f-t)*0.2f,
-                  0.30f + t*0.65f);
-    }
-    case MODE_NORMAL: {
-        Vec3 N = g_normal[r][c];
-        return v3(N.x*0.5f + 0.5f, N.y*0.5f + 0.5f, N.z*0.5f + 0.5f);
-    }
-    case MODE_ALBEDO:
-        return g_albedo[r][c];
-    case MODE_LIGHTING:
-        return g_light[r][c];
-    default:
-        return v3(0, 0, 0);
-    }
+  switch (mode) {
+  case MODE_POSITION: {
+    /* NDC-z ranges from -1 (near) to +1 (far). Remap to t∈[0,1]. */
+    float t = (g_zbuf[r][c] + 1.f) * 0.5f;
+    if (t < 0.f)
+      t = 0.f;
+    if (t > 1.f)
+      t = 1.f;
+    /* Warm (red/yellow) near, cool (blue) far. */
+    return v3(0.95f - t * 0.7f, 0.55f - t * 0.3f + (1.f - t) * 0.2f,
+              0.30f + t * 0.65f);
+  }
+  case MODE_NORMAL: {
+    Vec3 N = g_normal[r][c];
+    return v3(N.x * 0.5f + 0.5f, N.y * 0.5f + 0.5f, N.z * 0.5f + 0.5f);
+  }
+  case MODE_ALBEDO:
+    return g_albedo[r][c];
+  case MODE_LIGHTING:
+    return g_light[r][c];
+  default:
+    return v3(0, 0, 0);
+  }
 }
 
 /* ── §9 screen — render_scene + HUD spec compliance ──────────────────── */
@@ -1434,18 +1482,18 @@ static Vec3 mode_to_rgb(GBufMode mode, int r, int c)
  * NORMAL, and ALBEDO views are pixel-perfect identical to before —
  * that's the deferred-rendering guarantee, plainly visible.
  */
-static void render_scene(const Scene *s)
-{
-    int cols = s->scene_cols;
-    int rows = s->scene_rows;
+static void render_scene(const Scene *s) {
+  int cols = s->scene_cols;
+  int rows = s->scene_rows;
 
-    for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
-        for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
-            if (!g_valid[r][c]) continue;
-            Vec3 col = mode_to_rgb(s->mode, r, c);
-            paint_cell(c, r, col);
-        }
+  for (int r = 0; r < rows && r < GBUF_MAX_H; r++) {
+    for (int c = 0; c < cols && c < GBUF_MAX_W; c++) {
+      if (!g_valid[r][c])
+        continue;
+      Vec3 col = mode_to_rgb(s->mode, r, c);
+      paint_cell(c, r, col);
     }
+  }
 }
 
 /*
@@ -1456,12 +1504,11 @@ static void render_scene(const Scene *s)
  * loop doesn't re-derive (r5, g5, b5) twice (once for attron, once
  * for attroff — the previous version had that dual-derivation bug).
  */
-static int cube_pair(Vec3 col)
-{
-    int r5 = (int)(clamp01(col.x) * 5.f + 0.5f);
-    int g5 = (int)(clamp01(col.y) * 5.f + 0.5f);
-    int b5 = (int)(clamp01(col.z) * 5.f + 0.5f);
-    return PAIR_CUBE_BASE + r5*36 + g5*6 + b5;
+static int cube_pair(Vec3 col) {
+  int r5 = (int)(clamp01(col.x) * 5.f + 0.5f);
+  int g5 = (int)(clamp01(col.y) * 5.f + 0.5f);
+  int b5 = (int)(clamp01(col.z) * 5.f + 0.5f);
+  return PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
 }
 
 /*
@@ -1472,217 +1519,251 @@ static int cube_pair(Vec3 col)
  *   scene_rows + 0 PAIR_HUD                  — algorithm cost summary
  *   scene_rows + 1 PAIR_HUD                  — mode-specific explanation
  *   scene_rows + 2 PAIR_HUD                  — light colour swatches
- *   scene_rows + 3 PAIR_HUD                  — blank spacer (gives breathing room)
- *   scene_rows + 4 PAIR_HINT (cyan + bold)   — key hint
+ *   scene_rows + 3 PAIR_HUD                  — blank spacer (gives breathing
+ * room) scene_rows + 4 PAIR_HINT (cyan + bold)   — key hint
  */
-static void hud_draw(const Scene *s, double fps)
-{
-    int hr   = s->scene_rows;     /* first HUD row = first row past scene */
-    int cols = s->scene_cols;
+static void hud_draw(const Scene *s, double fps) {
+  int hr = s->scene_rows; /* first HUD row = first row past scene */
+  int cols = s->scene_cols;
 
-    int total_tris = 0;
-    for (int i = 0; i < s->n_objects; i++) total_tris += s->meshes[i].ntri;
+  int total_tris = 0;
+  for (int i = 0; i < s->n_objects; i++)
+    total_tris += s->meshes[i].ntri;
 
-    int fwd_calls   = s->n_objects * s->n_lights;       /* obj × lights    */
-    int defer_calls = s->n_objects + s->n_lights;       /* obj + lights    */
-    int saved_pct   = fwd_calls > 0
-                    ? 100 * (fwd_calls - defer_calls) / fwd_calls : 0;
+  int fwd_calls = s->n_objects * s->n_lights;   /* obj × lights    */
+  int defer_calls = s->n_objects + s->n_lights; /* obj + lights    */
+  int saved_pct =
+      fwd_calls > 0 ? 100 * (fwd_calls - defer_calls) / fwd_calls : 0;
 
-    /* ── Row 0: title left, status right (yellow + bold per spec). ── */
-    char status[120];
-    snprintf(status, sizeof status,
-             " %5.1f fps  mode:%s  lights:%d  zoom:%.1f  tris:%d  %s ",
-             fps, k_mode_names[s->mode],
-             s->n_lights, (double)s->cam_dist, total_tris,
-             s->paused ? "PAUSED" : "running");
-    int slen = (int)strlen(status); if (slen > cols) slen = cols;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - slen, "%s", status);
-    mvprintw(0, 0, " DEFERRED · RGB ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  /* ── Row 0: title left, status right (yellow + bold per spec). ── */
+  char status[120];
+  snprintf(status, sizeof status,
+           " %5.1f fps  mode:%s  lights:%d  zoom:%.1f  tris:%d  %s ", fps,
+           k_mode_names[s->mode], s->n_lights, (double)s->cam_dist, total_tris,
+           s->paused ? "PAUSED" : "running");
+  int slen = (int)strlen(status);
+  if (slen > cols)
+    slen = cols;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, cols - slen, "%s", status);
+  mvprintw(0, 0, " DEFERRED · RGB ");
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* ── Educational rows (yellow, no bold so they sit under the
-     *    primary status row visually). ── */
-    attron(COLOR_PAIR(PAIR_HUD));
+  /* ── Educational rows (yellow, no bold so they sit under the
+   *    primary status row visually). ── */
+  attron(COLOR_PAIR(PAIR_HUD));
 
-    mvprintw(hr + 0, 1,
-             "fwd = %d (obj × lights)   def = %d (obj + lights)   saved = %d%%",
-             fwd_calls, defer_calls, saved_pct);
+  mvprintw(hr + 0, 1,
+           "fwd = %d (obj × lights)   def = %d (obj + lights)   saved = %d%%",
+           fwd_calls, defer_calls, saved_pct);
 
-    const char *explain = "";
-    switch (s->mode) {
-    case MODE_POSITION:
-        explain = "POSITION: warm-near → cool-far depth. 3-D layout BEFORE lighting.";
-        break;
-    case MODE_NORMAL:
-        explain = "NORMAL: (N+1)/2 RGB. Smooth sphere → smooth gradient.";
-        break;
-    case MODE_ALBEDO:
-        explain = "ALBEDO: flat surface colour, NO lighting. 'l' never changes this.";
-        break;
-    case MODE_LIGHTING:
-        explain = "LIGHTING: Blinn-Phong over G-buffer. 'l' adds a light, geometry stays.";
-        break;
-    default: break;
-    }
-    mvprintw(hr + 1, 1, "%s", explain);
+  const char *explain = "";
+  switch (s->mode) {
+  case MODE_POSITION:
+    explain =
+        "POSITION: warm-near → cool-far depth. 3-D layout BEFORE lighting.";
+    break;
+  case MODE_NORMAL:
+    explain = "NORMAL: (N+1)/2 RGB. Smooth sphere → smooth gradient.";
+    break;
+  case MODE_ALBEDO:
+    explain =
+        "ALBEDO: flat surface colour, NO lighting. 'l' never changes this.";
+    break;
+  case MODE_LIGHTING:
+    explain = "LIGHTING: Blinn-Phong over G-buffer. 'l' adds a light, geometry "
+              "stays.";
+    break;
+  default:
+    break;
+  }
+  mvprintw(hr + 1, 1, "%s", explain);
 
-    /* Light swatch — one '@' per active light, painted in that light's
-     * own colour pair so red light shows red, green shows green, etc. */
-    mvprintw(hr + 2, 1, "Lights:");
-    attroff(COLOR_PAIR(PAIR_HUD));
-    int lx = 9;
-    for (int li = 0; li < s->n_lights && lx < cols - 2; li++) {
-        int pair = cube_pair(s->lights[li].color);
-        attron(COLOR_PAIR(pair) | A_BOLD);
-        mvaddch(hr + 2, lx, (chtype)(unsigned char)'@');
-        attroff(COLOR_PAIR(pair) | A_BOLD);
-        lx += 2;
-    }
+  /* Light swatch — one '@' per active light, painted in that light's
+   * own colour pair so red light shows red, green shows green, etc. */
+  mvprintw(hr + 2, 1, "Lights:");
+  attroff(COLOR_PAIR(PAIR_HUD));
+  int lx = 9;
+  for (int li = 0; li < s->n_lights && lx < cols - 2; li++) {
+    int pair = cube_pair(s->lights[li].color);
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvaddch(hr + 2, lx, (chtype)(unsigned char)'@');
+    attroff(COLOR_PAIR(pair) | A_BOLD);
+    lx += 2;
+  }
 
-    /* ── Cyan hint bottom row (per spec: A_BOLD, never A_DIM). ── */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(hr + HUD_ROWS - 1, 0,
-             " q:quit  spc:pause  g:layer  l:add-light  +/-:zoom  r:reset ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  /* ── Cyan hint bottom row (per spec: A_BOLD, never A_DIM). ── */
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(hr + HUD_ROWS - 1, 0,
+           " q:quit  spc:pause  g:layer  l:add-light  +/-:zoom  r:reset ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ── §10 app ─────────────────────────────────────────────────────────── */
 
 typedef struct {
-    Scene                 scene;
-    int                   total_cols;
-    int                   total_rows;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  int total_cols;
+  int total_rows;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup         (void)    { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void screen_init(void)
-{
-    initscr();
-    noecho(); cbreak(); curs_set(0);
-    nodelay(stdscr, TRUE); keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init();
+static void screen_init(void) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
 }
 
-static void app_do_resize(App *app)
-{
-    endwin(); refresh();
-    getmaxyx(stdscr, app->total_rows, app->total_cols);
-    scene_init(&app->scene, app->total_cols, app->total_rows);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, app->total_rows, app->total_cols);
+  scene_init(&app->scene, app->total_cols, app->total_rows);
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_init(s, app->total_cols, app->total_rows);
+    break;
+  case 'g':
+  case 'G':
+    s->mode = (GBufMode)((s->mode + 1) % MODE_COUNT);
+    break;
+  case 'l':
+  case 'L':
+    s->n_lights = (s->n_lights >= MAX_LIGHTS) ? 1 : s->n_lights + 1;
+    break;
+  case '=':
+  case '+':
+    s->cam_dist -= CAM_ZOOM_STEP;
+    if (s->cam_dist < CAM_DIST_MIN)
+      s->cam_dist = CAM_DIST_MIN;
+    scene_set_zoom(s);
+    break;
+  case '-':
+  case '_':
+    s->cam_dist += CAM_ZOOM_STEP;
+    if (s->cam_dist > CAM_DIST_MAX)
+      s->cam_dist = CAM_DIST_MAX;
+    scene_set_zoom(s);
+    break;
+  default:
+    break;
+  }
+  return true;
+}
+
+int main(void) {
+  srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
+
+  App *app = &g_app;
+  app->running = 1;
+
+  screen_init();
+  getmaxyx(stdscr, app->total_rows, app->total_cols);
+  scene_init(&app->scene, app->total_cols, app->total_rows);
+
+  int64_t frame_time = clock_ns();
+  int64_t fps_acc = 0;
+  int fps_cnt = 0;
+  double fps_display = 0.0;
+
+  while (app->running) {
+
+    /* §10.1 resize. */
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns();
+    }
+
+    /* §10.2 timing. */
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > DT_CAP_NS)
+      dt = DT_CAP_NS;
+    float dt_sec = (float)dt / (float)NS_PER_SEC;
+
+    /* §10.3 advance scene. */
+    scene_tick(&app->scene, dt_sec);
+
+    /* §10.4 fps rolling average. */
+    fps_cnt++;
+    fps_acc += dt;
+    if (fps_acc >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display = (double)fps_cnt / ((double)fps_acc / (double)NS_PER_SEC);
+      fps_cnt = 0;
+      fps_acc = 0;
+    }
+
+    /* §10.5 frame cap. */
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
+
+    /* §10.6 THE FULL DEFERRED RENDERING PIPELINE.
+     *
+     *   PASS 1 — render_gbuffer:   geometry → G-buffer (pos/normal/albedo)
+     *   PASS 2 — render_lightpass: G-buffer + lights → g_light
+     *   PASS 3 — render_scene:     mode_to_rgb per pixel → paint_cell
+     *   PASS 4 — hud_draw:         yellow status + cyan hint + edu rows
+     */
     Scene *s = &app->scene;
-    switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':           s->paused = !s->paused; break;
-    case 'r': case 'R': scene_init(s, app->total_cols, app->total_rows); break;
-    case 'g': case 'G': s->mode = (GBufMode)((s->mode + 1) % MODE_COUNT); break;
-    case 'l': case 'L':
-        s->n_lights = (s->n_lights >= MAX_LIGHTS) ? 1 : s->n_lights + 1;
-        break;
-    case '=': case '+':
-        s->cam_dist -= CAM_ZOOM_STEP;
-        if (s->cam_dist < CAM_DIST_MIN) s->cam_dist = CAM_DIST_MIN;
-        scene_set_zoom(s);
-        break;
-    case '-': case '_':
-        s->cam_dist += CAM_ZOOM_STEP;
-        if (s->cam_dist > CAM_DIST_MAX) s->cam_dist = CAM_DIST_MAX;
-        scene_set_zoom(s);
-        break;
-    default: break;
-    }
-    return true;
-}
+    erase();
+    render_gbuffer(s->meshes, s->albedos, s->models, s->n_objects, &s->view,
+                   &s->proj, s->scene_cols, s->scene_rows);
+    render_lightpass(s->lights, s->n_lights, s->cam_pos, s->scene_cols,
+                     s->scene_rows);
+    render_scene(s);
+    hud_draw(s, fps_display);
+    screen_present();
 
-int main(void)
-{
-    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+    /* §10.7 input. */
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
 
-    App *app = &g_app;
-    app->running = 1;
+  for (int i = 0; i < app->scene.n_objects; i++)
+    mesh_free(&app->scene.meshes[i]);
 
-    screen_init();
-    getmaxyx(stdscr, app->total_rows, app->total_cols);
-    scene_init(&app->scene, app->total_cols, app->total_rows);
-
-    int64_t frame_time  = clock_ns();
-    int64_t fps_acc     = 0;
-    int     fps_cnt     = 0;
-    double  fps_display = 0.0;
-
-    while (app->running) {
-
-        /* §10.1 resize. */
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-        }
-
-        /* §10.2 timing. */
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > DT_CAP_NS) dt = DT_CAP_NS;
-        float dt_sec = (float)dt / (float)NS_PER_SEC;
-
-        /* §10.3 advance scene. */
-        scene_tick(&app->scene, dt_sec);
-
-        /* §10.4 fps rolling average. */
-        fps_cnt++;
-        fps_acc += dt;
-        if (fps_acc >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)fps_cnt / ((double)fps_acc / (double)NS_PER_SEC);
-            fps_cnt = 0; fps_acc = 0;
-        }
-
-        /* §10.5 frame cap. */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / FPS_TARGET - elapsed);
-
-        /* §10.6 THE FULL DEFERRED RENDERING PIPELINE.
-         *
-         *   PASS 1 — render_gbuffer:   geometry → G-buffer (pos/normal/albedo)
-         *   PASS 2 — render_lightpass: G-buffer + lights → g_light
-         *   PASS 3 — render_scene:     mode_to_rgb per pixel → paint_cell
-         *   PASS 4 — hud_draw:         yellow status + cyan hint + edu rows
-         */
-        Scene *s = &app->scene;
-        erase();
-        render_gbuffer(s->meshes, s->albedos, s->models, s->n_objects,
-                       &s->view, &s->proj, s->scene_cols, s->scene_rows);
-        render_lightpass(s->lights, s->n_lights, s->cam_pos,
-                         s->scene_cols, s->scene_rows);
-        render_scene(s);
-        hud_draw(s, fps_display);
-        screen_present();
-
-        /* §10.7 input. */
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch)) app->running = 0;
-    }
-
-    for (int i = 0; i < app->scene.n_objects; i++)
-        mesh_free(&app->scene.meshes[i]);
-
-    endwin();
-    return 0;
+  endwin();
+  return 0;
 }

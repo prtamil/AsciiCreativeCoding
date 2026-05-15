@@ -889,39 +889,39 @@
 #include <time.h>
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 /* ── §1 config ──────────────────────────────────────────────────────── */
 
 /* §1.1 frame-rate / motion knobs. */
 enum {
-    SIM_FPS_MIN     =  10,
-    SIM_FPS_DEFAULT =  30,
-    SIM_FPS_MAX     = 120,
-    SIM_FPS_STEP    =  10,
-    SPEED_MIN       =   1,
-    SPEED_DEF       =   8,
-    SPEED_MAX       =  64,
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 30,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
+  SPEED_MIN = 1,
+  SPEED_DEF = 8,
+  SPEED_MAX = 64,
 };
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(f)      (NS_PER_SEC / (f))
-#define DT_CAP_NS       (100 * NS_PER_MS)
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
+#define DT_CAP_NS (100 * NS_PER_MS)
 
 /* §1.2 view geometry — pinhole camera with pitch (T7). */
-#define ASPECT_Y        2.0f
-#define FOV_H_BASE      0.55f
-#define ZOOM_MIN        0.25f
-#define ZOOM_MAX        4.0f
-#define ZOOM_STEP       1.25f
+#define ASPECT_Y 2.0f
+#define FOV_H_BASE 0.55f
+#define ZOOM_MIN 0.25f
+#define ZOOM_MAX 4.0f
+#define ZOOM_STEP 1.25f
 
-#define CAMERA_HEIGHT   1.6f          /* eye level above floor (m)        */
+#define CAMERA_HEIGHT 1.6f /* eye level above floor (m)        */
 
 /* §1.3 wall + room geometry. */
-#define WALL_Z          4.0f
-#define FLOOR_Y         0.0f
+#define WALL_Z 4.0f
+#define FLOOR_Y 0.0f
 
 /* §1.4 windows — 2 rows × 5 cols of POINTED ARCHES (T6).
  *
@@ -930,20 +930,20 @@ enum {
  *   arch_h   = √3 · half_w ≈ 0.208 m  (peak above rect top)
  *   total_h  ≈ 0.528 m
  */
-#define WIN_ROWS         2
-#define WIN_COLS         5
-#define WIN_COUNT        (WIN_ROWS * WIN_COLS)
+#define WIN_ROWS 2
+#define WIN_COLS 5
+#define WIN_COUNT (WIN_ROWS * WIN_COLS)
 
-#define WIN_HALF_W       0.12f
-#define WIN_RECT_H       0.32f
-#define WIN_PERIOD_X     0.30f         /* col-to-col spacing            */
-#define WIN_ROW_GAP_FRAC 0.30f         /* row gap as fraction of total_h */
+#define WIN_HALF_W 0.12f
+#define WIN_RECT_H 0.32f
+#define WIN_PERIOD_X 0.30f     /* col-to-col spacing            */
+#define WIN_ROW_GAP_FRAC 0.30f /* row gap as fraction of total_h */
 
-#define WIN_SILL0_OFFSET_Y 0.05f       /* lower-row sill above eye      */
-#define WIN_JITTER_POS   0.08f         /* ±fraction of WIN_PERIOD_X     */
+#define WIN_SILL0_OFFSET_Y 0.05f /* lower-row sill above eye      */
+#define WIN_JITTER_POS 0.08f     /* ±fraction of WIN_PERIOD_X     */
 
 /* sqrt(3) for the arch peak height. */
-#define WIN_SQRT3        1.7320508f
+#define WIN_SQRT3 1.7320508f
 
 /* §1.5 atmospheric medium — uniform mist (T2).
  *
@@ -952,11 +952,11 @@ enum {
  *   MARCH_STEPS = 32 across at most ~5m gives step_length ≈ 0.16 m.
  *   HG_G = 0.55 — moderate forward bias.
  */
-#define MIST_SIGMA       0.20f         /* per metre — extinction coeff. */
-#define HG_G             0.55f         /* HG anisotropy in (-1, 1)      */
-#define MARCH_STEPS      32
-#define FAR_CLIP         (WALL_Z + 1.0f)
-#define INSCATTER_GAIN   1.6f          /* arbitrary brightness scale     */
+#define MIST_SIGMA 0.20f /* per metre — extinction coeff. */
+#define HG_G 0.55f       /* HG anisotropy in (-1, 1)      */
+#define MARCH_STEPS 32
+#define FAR_CLIP (WALL_Z + 1.0f)
+#define INSCATTER_GAIN 1.6f /* arbitrary brightness scale     */
 
 /* §1.6 sun (DIRECTIONAL — circular orbit, T8).
  *
@@ -971,38 +971,38 @@ enum {
  * the wall (1.88 m ↔ 2.55 m), so the sun disc passes through both
  * rows during one orbit.
  */
-#define SUN_ANG_RADIUS    0.10f        /* rad — apparent disc          */
-#define SUN_EMIT_HDR     14.0f         /* HDR brightness multiplier    */
+#define SUN_ANG_RADIUS 0.10f /* rad — apparent disc          */
+#define SUN_EMIT_HDR 14.0f   /* HDR brightness multiplier    */
 
-#define SUN_EL_BASE       0.15f        /* rad — ~8.6° median           */
-#define SUN_EL_AMP        0.08f        /* rad — ±4.6°                  */
-#define SUN_AZ_BASE       0.0f
-#define SUN_AZ_AMP        0.20f        /* rad — ±11.5° azimuth         */
-#define SUN_EL_PERIOD_S 200.0f         /* full orbit period (seconds)  */
+#define SUN_EL_BASE 0.15f /* rad — ~8.6° median           */
+#define SUN_EL_AMP 0.08f  /* rad — ±4.6°                  */
+#define SUN_AZ_BASE 0.0f
+#define SUN_AZ_AMP 0.20f       /* rad — ±11.5° azimuth         */
+#define SUN_EL_PERIOD_S 200.0f /* full orbit period (seconds)  */
 
 /* §1.7 surfaces. */
-#define WALL_R          0.10f
-#define WALL_G          0.09f
-#define WALL_B          0.07f
+#define WALL_R 0.10f
+#define WALL_G 0.09f
+#define WALL_B 0.07f
 
-#define FLOOR_R         0.20f
-#define FLOOR_G         0.15f
-#define FLOOR_B         0.09f
+#define FLOOR_R 0.20f
+#define FLOOR_G 0.15f
+#define FLOOR_B 0.09f
 
-#define SKY_ZENITH_R    0.10f
-#define SKY_ZENITH_G    0.13f
-#define SKY_ZENITH_B    0.20f
+#define SKY_ZENITH_R 0.10f
+#define SKY_ZENITH_G 0.13f
+#define SKY_ZENITH_B 0.20f
 #define SKY_HORIZON_FAC 0.50f
 
 /* §1.8 buffer + ncurses pair-id reservations. */
-#define BUF_MAX_W       400
-#define BUF_MAX_H       200
+#define BUF_MAX_W 400
+#define BUF_MAX_H 200
 
 enum {
-    PAIR_HUD          =  1,
-    PAIR_HINT         =  2,
-    PAIR_SUN_FALLBACK =  3,
-    PAIR_CUBE_BASE    = 16,           /* + 0..215 = 6×6×6 cube         */
+  PAIR_HUD = 1,
+  PAIR_HINT = 2,
+  PAIR_SUN_FALLBACK = 3,
+  PAIR_CUBE_BASE = 16, /* + 0..215 = 6×6×6 cube         */
 };
 
 /* §1.9 ASCII glyph ramp (16 levels). */
@@ -1010,13 +1010,16 @@ static const char k_ramp[] = " .'`,-_:;~=+*oO0";
 #define RAMP_LEN ((int)(sizeof k_ramp - 1))
 
 /* §1.10 kelvin presets (T9). */
-typedef struct { const char *name; float kelvin; } KelvinPreset;
+typedef struct {
+  const char *name;
+  float kelvin;
+} KelvinPreset;
 
 static const KelvinPreset KELVINS[] = {
-    { "DAWN  ", 2000.0f },
-    { "GOLDEN", 3500.0f },
-    { "NOON  ", 5500.0f },
-    { "DUSK  ", 2500.0f },
+    {"DAWN  ", 2000.0f},
+    {"GOLDEN", 3500.0f},
+    {"NOON  ", 5500.0f},
+    {"DUSK  ", 2500.0f},
 };
 #define N_KELVINS ((int)(sizeof KELVINS / sizeof KELVINS[0]))
 
@@ -1028,22 +1031,26 @@ static const KelvinPreset KELVINS[] = {
  *   MODE_TR         gray-scale eye-ray transmittance at far hit
  */
 typedef enum {
-    MODE_NORMAL  = 0,
-    MODE_SCATTER = 1,
-    MODE_SURFACE = 2,
-    MODE_TR      = 3,
-    MODE_N       = 4,
+  MODE_NORMAL = 0,
+  MODE_SCATTER = 1,
+  MODE_SURFACE = 2,
+  MODE_TR = 3,
+  MODE_N = 4,
 } DebugMode;
 
-static const char *debug_mode_name(DebugMode m)
-{
-    switch (m) {
-    case MODE_NORMAL:  return "NORMAL ";
-    case MODE_SCATTER: return "SCATTER";
-    case MODE_SURFACE: return "SURFACE";
-    case MODE_TR:      return "TR     ";
-    default:           return "?      ";
-    }
+static const char *debug_mode_name(DebugMode m) {
+  switch (m) {
+  case MODE_NORMAL:
+    return "NORMAL ";
+  case MODE_SCATTER:
+    return "SCATTER";
+  case MODE_SURFACE:
+    return "SURFACE";
+  case MODE_TR:
+    return "TR     ";
+  default:
+    return "?      ";
+  }
 }
 
 /* ── §2 clock ───────────────────────────────────────────────────────── */
@@ -1053,25 +1060,24 @@ static const char *debug_mode_name(DebugMode m)
  *
  * CLOCK_MONOTONIC never goes backward across NTP / DST / suspend.
  */
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
 /*
  * clock_sleep_ns — best-effort sleep. Used to cap render rate
  * without burning CPU at 100%.
  */
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ── §3 vec3 math ────────────────────────────────────────────────────── *
@@ -1081,24 +1087,32 @@ static void clock_sleep_ns(int64_t ns)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-typedef struct { float x, y, z; } V3;
+typedef struct {
+  float x, y, z;
+} V3;
 
-static inline V3    v3 (float x, float y, float z) { return (V3){x,y,z}; }
-static inline V3    v3_add(V3 a, V3 b)   { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
-static inline V3    v3_sub(V3 a, V3 b)   { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
-static inline V3    v3_scl(V3 a, float s){ return v3(a.x*s, a.y*s, a.z*s);     }
-static inline float v3_dot(V3 a, V3 b)   { return a.x*b.x + a.y*b.y + a.z*b.z; }
-static inline float v3_len(V3 a)         { return sqrtf(v3_dot(a, a));         }
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
+static inline V3 v3_add(V3 a, V3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline V3 v3_sub(V3 a, V3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline V3 v3_scl(V3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+static inline float v3_dot(V3 a, V3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3_len(V3 a) { return sqrtf(v3_dot(a, a)); }
 
 /*
  * v3_norm — return a unit vector in the same direction as `a',
  * or (0,0,0) if `a' is zero-length (avoids NaN propagation).
  */
-static inline V3 v3_norm(V3 a)
-{
-    float length = v3_len(a);
-    if (length < 1e-12f) return v3(0, 0, 0);
-    return v3_scl(a, 1.0f / length);
+static inline V3 v3_norm(V3 a) {
+  float length = v3_len(a);
+  if (length < 1e-12f)
+    return v3(0, 0, 0);
+  return v3_scl(a, 1.0f / length);
 }
 
 /* ── §4 rgb math ─────────────────────────────────────────────────────── *
@@ -1108,18 +1122,31 @@ static inline V3 v3_norm(V3 a)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-typedef struct { float r, g, b; } RGB;
+typedef struct {
+  float r, g, b;
+} RGB;
 
-static inline RGB rgb_make(float r, float g, float b) { return (RGB){r,g,b}; }
-static inline RGB rgb_add (RGB a, RGB b)   { return rgb_make(a.r+b.r, a.g+b.g, a.b+b.b); }
-static inline RGB rgb_mul (RGB a, RGB b)   { return rgb_make(a.r*b.r, a.g*b.g, a.b*b.b); }
-static inline RGB rgb_scl (RGB a, float s) { return rgb_make(a.r*s, a.g*s, a.b*s);       }
-static inline RGB rgb_lerp(RGB a, RGB b, float t)
-{ return rgb_make(a.r+(b.r-a.r)*t, a.g+(b.g-a.g)*t, a.b+(b.b-a.b)*t); }
+static inline RGB rgb_make(float r, float g, float b) { return (RGB){r, g, b}; }
+static inline RGB rgb_add(RGB a, RGB b) {
+  return rgb_make(a.r + b.r, a.g + b.g, a.b + b.b);
+}
+static inline RGB rgb_mul(RGB a, RGB b) {
+  return rgb_make(a.r * b.r, a.g * b.g, a.b * b.b);
+}
+static inline RGB rgb_scl(RGB a, float s) {
+  return rgb_make(a.r * s, a.g * s, a.b * s);
+}
+static inline RGB rgb_lerp(RGB a, RGB b, float t) {
+  return rgb_make(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
+                  a.b + (b.b - a.b) * t);
+}
 
-static inline float clamp01 (float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
-static inline float luma_of (RGB c)
-{ return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b; }
+static inline float clamp01(float x) {
+  return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
+}
+static inline float luma_of(RGB c) {
+  return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+}
 
 /* ── §5 blackbody (Tanner-Helland) ──────────────────────────────────── *
  *
@@ -1146,22 +1173,28 @@ static inline float luma_of (RGB c)
  *       138.52 · log(K-10)     - 305.04 / 255   otherwise
  *   return clamp01((r, g, b))
  */
-static RGB blackbody_rgb(float kelvin)
-{
-    float K = kelvin / 100.0f;
-    float r, g, b;
+static RGB blackbody_rgb(float kelvin) {
+  float K = kelvin / 100.0f;
+  float r, g, b;
 
-    if (K <= 66.0f) r = 1.0f;
-    else            r = 329.7f * powf(K - 60.0f, -0.1332f) / 255.0f;
+  if (K <= 66.0f)
+    r = 1.0f;
+  else
+    r = 329.7f * powf(K - 60.0f, -0.1332f) / 255.0f;
 
-    if (K <= 66.0f) g = (99.47f  * logf(K)            - 161.12f) / 255.0f;
-    else            g =  288.12f * powf(K - 60.0f, -0.0755f)      / 255.0f;
+  if (K <= 66.0f)
+    g = (99.47f * logf(K) - 161.12f) / 255.0f;
+  else
+    g = 288.12f * powf(K - 60.0f, -0.0755f) / 255.0f;
 
-    if (K >= 66.0f)      b = 1.0f;
-    else if (K <= 19.0f) b = 0.0f;
-    else                 b = (138.52f * logf(K - 10.0f) - 305.04f) / 255.0f;
+  if (K >= 66.0f)
+    b = 1.0f;
+  else if (K <= 19.0f)
+    b = 0.0f;
+  else
+    b = (138.52f * logf(K - 10.0f) - 305.04f) / 255.0f;
 
-    return rgb_make(clamp01(r), clamp01(g), clamp01(b));
+  return rgb_make(clamp01(r), clamp01(g), clamp01(b));
 }
 
 /* ── §6 tone map ─────────────────────────────────────────────────────── *
@@ -1175,7 +1208,7 @@ static RGB blackbody_rgb(float kelvin)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-static inline float reinhard (float x) { return x / (1.f + x); }
+static inline float reinhard(float x) { return x / (1.f + x); }
 static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
 
 /* ── §7 atmospheric medium ───────────────────────────────────────────── *
@@ -1195,11 +1228,12 @@ static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
  *   Inside the room (z < WALL_Z, y > FLOOR_Y): MIST_SIGMA.
  *   Outside: 0 (vacuum).
  */
-static inline float sigma_e_at(V3 scatter_point)
-{
-    if (scatter_point.z >= WALL_Z) return 0.0f;
-    if (scatter_point.y <= FLOOR_Y) return 0.0f;
-    return MIST_SIGMA;
+static inline float sigma_e_at(V3 scatter_point) {
+  if (scatter_point.z >= WALL_Z)
+    return 0.0f;
+  if (scatter_point.y <= FLOOR_Y)
+    return 0.0f;
+  return MIST_SIGMA;
 }
 
 /* §7.2 ── Tr_to_sun: medium transmittance from p toward sun ────────── */
@@ -1219,14 +1253,16 @@ static inline float sigma_e_at(V3 scatter_point)
  * there. Inside the medium, σ is constant — closed form. NO second
  * march required (cf. §18 trace_ray's eye-ray march).
  */
-static inline float tr_to_sun(V3 scatter_point, V3 sun_dir)
-{
-    if (sun_dir.z < 1e-3f) return 0.0f;
-    if (scatter_point.z >= WALL_Z) return 1.0f;
-    float distance_to_wall = (WALL_Z - scatter_point.z) / sun_dir.z;
-    if (distance_to_wall < 0.0f) return 1.0f;
-    float optical_depth = MIST_SIGMA * distance_to_wall;
-    return expf(-optical_depth);
+static inline float tr_to_sun(V3 scatter_point, V3 sun_dir) {
+  if (sun_dir.z < 1e-3f)
+    return 0.0f;
+  if (scatter_point.z >= WALL_Z)
+    return 1.0f;
+  float distance_to_wall = (WALL_Z - scatter_point.z) / sun_dir.z;
+  if (distance_to_wall < 0.0f)
+    return 1.0f;
+  float optical_depth = MIST_SIGMA * distance_to_wall;
+  return expf(-optical_depth);
 }
 
 /* ── §8 phase function ───────────────────────────────────────────────── *
@@ -1252,14 +1288,13 @@ static inline float tr_to_sun(V3 scatter_point, V3 sun_dir)
  * Returns a number ≥ 0; INTEGRATES to 1 over the full sphere — so
  * the value at any one angle is a DENSITY, not a probability.
  */
-static inline float hg_phase(float cos_angle_eye_to_sun)
-{
-    float g  = HG_G;
-    float g2 = g * g;
-    float denom = 1.0f + g2 - 2.0f * g * cos_angle_eye_to_sun;
-    if (denom < 1e-9f) denom = 1e-9f;
-    return (1.0f - g2)
-         / (4.0f * (float)M_PI * powf(denom, 1.5f));
+static inline float hg_phase(float cos_angle_eye_to_sun) {
+  float g = HG_G;
+  float g2 = g * g;
+  float denom = 1.0f + g2 - 2.0f * g * cos_angle_eye_to_sun;
+  if (denom < 1e-9f)
+    denom = 1e-9f;
+  return (1.0f - g2) / (4.0f * (float)M_PI * powf(denom, 1.5f));
 }
 
 /* ── §9 RNG (hash3 / hash01 — window x-jitter only) ─────────────────── *
@@ -1274,24 +1309,23 @@ static inline float hg_phase(float cos_angle_eye_to_sun)
  * hash3 — mix three integer keys into a 32-bit hash. Three large
  * odd primes followed by xorshift-mul rounds. Standard recipe.
  */
-static inline uint32_t hash3(int kx, int ky, int kz)
-{
-    uint32_t h = (uint32_t)kx * 73856093u
-               ^ (uint32_t)ky * 19349663u
-               ^ (uint32_t)kz * 83492791u;
-    h ^= h >> 16; h *= 0x85ebca6bu;
-    h ^= h >> 13; h *= 0xc2b2ae35u;
-    h ^= h >> 16;
-    return h;
+static inline uint32_t hash3(int kx, int ky, int kz) {
+  uint32_t h = (uint32_t)kx * 73856093u ^ (uint32_t)ky * 19349663u ^
+               (uint32_t)kz * 83492791u;
+  h ^= h >> 16;
+  h *= 0x85ebca6bu;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35u;
+  h ^= h >> 16;
+  return h;
 }
 
 /*
  * hash01 — uniform float in [0, 1). Drops the top byte of a 32-bit
  * hash to avoid the rounding-to-1 issue on extreme values.
  */
-static inline float hash01(uint32_t h)
-{
-    return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
+static inline float hash01(uint32_t h) {
+  return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
 }
 
 /* ── §10 ncurses paint ───────────────────────────────────────────────── *
@@ -1303,21 +1337,20 @@ static inline float hash01(uint32_t h)
 
 static int g_have_256;
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    g_have_256 = (COLORS >= 256);
-    if (g_have_256) {
-        for (int i = 0; i < 216; i++)
-            init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
-        init_pair(PAIR_HUD,  226, -1);
-        init_pair(PAIR_HINT,  51, -1);
-    } else {
-        init_pair(PAIR_SUN_FALLBACK, COLOR_YELLOW, -1);
-        init_pair(PAIR_HUD,          COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,         COLOR_CYAN,   -1);
-    }
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  g_have_256 = (COLORS >= 256);
+  if (g_have_256) {
+    for (int i = 0; i < 216; i++)
+      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
+    init_pair(PAIR_HUD, 226, -1);
+    init_pair(PAIR_HINT, 51, -1);
+  } else {
+    init_pair(PAIR_SUN_FALLBACK, COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
 /*
@@ -1337,32 +1370,43 @@ static void color_init(void)
  *     pair = PAIR_SUN_FALLBACK
  *   draw glyph at (sx, sy) with pair + attr
  */
-static void paint_cell(int sx, int sy, RGB col)
-{
-    float r = gamma_enc(reinhard(col.r));
-    float g = gamma_enc(reinhard(col.g));
-    float b = gamma_enc(reinhard(col.b));
-    float luma = 0.2126f*r + 0.7152f*g + 0.0722f*b;
-    int   ri   = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
-    if (ri < 0)         ri = 0;
-    if (ri >= RAMP_LEN) ri = RAMP_LEN - 1;
+static void paint_cell(int sx, int sy, RGB col) {
+  float r = gamma_enc(reinhard(col.r));
+  float g = gamma_enc(reinhard(col.g));
+  float b = gamma_enc(reinhard(col.b));
+  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  int ri = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
+  if (ri < 0)
+    ri = 0;
+  if (ri >= RAMP_LEN)
+    ri = RAMP_LEN - 1;
 
-    if (g_have_256) {
-        int r5 = (int)(r * 5.f + 0.5f); if (r5 > 5) r5 = 5; if (r5 < 0) r5 = 0;
-        int g5 = (int)(g * 5.f + 0.5f); if (g5 > 5) g5 = 5; if (g5 < 0) g5 = 0;
-        int b5 = (int)(b * 5.f + 0.5f); if (b5 > 5) b5 = 5; if (b5 < 0) b5 = 0;
-        int pair = PAIR_CUBE_BASE + r5*36 + g5*6 + b5;
-        int attr = (luma > 0.85f) ? A_BOLD
-                 : (luma < 0.15f) ? A_DIM
-                 :                  A_NORMAL;
-        attron(COLOR_PAIR(pair) | attr);
-        mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
-        attroff(COLOR_PAIR(pair) | attr);
-    } else {
-        attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
-        mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
-        attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
-    }
+  if (g_have_256) {
+    int r5 = (int)(r * 5.f + 0.5f);
+    if (r5 > 5)
+      r5 = 5;
+    if (r5 < 0)
+      r5 = 0;
+    int g5 = (int)(g * 5.f + 0.5f);
+    if (g5 > 5)
+      g5 = 5;
+    if (g5 < 0)
+      g5 = 0;
+    int b5 = (int)(b * 5.f + 0.5f);
+    if (b5 > 5)
+      b5 = 5;
+    if (b5 < 0)
+      b5 = 0;
+    int pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
+    int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    attroff(COLOR_PAIR(pair) | attr);
+  } else {
+    attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
+    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
+  }
 }
 
 /* ── §11 ray-plane intersection ─────────────────────────────────────── *
@@ -1385,14 +1429,15 @@ static void paint_cell(int sx, int sy, RGB col)
  * The `ray_dir.y > -ε' guard means we register hits ONLY where the
  * ray is heading DOWN through the plane.
  */
-static bool ray_plane_y(V3 ray_origin, V3 ray_dir,
-                        float plane_y, float *out_t)
-{
-    if (ray_dir.y > -1e-6f) return false;
-    float t = (plane_y - ray_origin.y) / ray_dir.y;
-    if (t < 1e-3f) return false;
-    *out_t = t;
-    return true;
+static bool ray_plane_y(V3 ray_origin, V3 ray_dir, float plane_y,
+                        float *out_t) {
+  if (ray_dir.y > -1e-6f)
+    return false;
+  float t = (plane_y - ray_origin.y) / ray_dir.y;
+  if (t < 1e-3f)
+    return false;
+  *out_t = t;
+  return true;
 }
 
 /* ── §12 arch geometry — pointed (lancet) arches (T6) ───────────────── *
@@ -1417,7 +1462,7 @@ static bool ray_plane_y(V3 ray_origin, V3 ray_dir,
  * Arch peak height above sill = rect_h + sqrt(3)·half_w  (see T6).
  */
 typedef struct {
-    float cx, cy_base, half_w, rect_h;
+  float cx, cy_base, half_w, rect_h;
 } Window;
 
 static Window g_windows[WIN_COUNT];
@@ -1444,27 +1489,25 @@ static Window g_windows[WIN_COUNT];
  *
  * Only x-position is jittered; the count is fixed at 2×5 = 10.
  */
-static void place_windows(int seed)
-{
-    float total_h    = WIN_RECT_H + WIN_SQRT3 * WIN_HALF_W;
-    float row_period = total_h * (1.0f + WIN_ROW_GAP_FRAC);
-    float row0_sill  = CAMERA_HEIGHT + WIN_SILL0_OFFSET_Y;
-    float x0         = -(float)(WIN_COLS - 1) * WIN_PERIOD_X * 0.5f;
+static void place_windows(int seed) {
+  float total_h = WIN_RECT_H + WIN_SQRT3 * WIN_HALF_W;
+  float row_period = total_h * (1.0f + WIN_ROW_GAP_FRAC);
+  float row0_sill = CAMERA_HEIGHT + WIN_SILL0_OFFSET_Y;
+  float x0 = -(float)(WIN_COLS - 1) * WIN_PERIOD_X * 0.5f;
 
-    for (int row = 0; row < WIN_ROWS; row++) {
-        for (int col = 0; col < WIN_COLS; col++) {
-            int idx = row * WIN_COLS + col;
-            uint32_t pos_hash = hash3(idx, seed, 0xA12CE001);
-            float jitter = (hash01(pos_hash) - 0.5f) * 2.0f
-                         * WIN_JITTER_POS * WIN_PERIOD_X;
+  for (int row = 0; row < WIN_ROWS; row++) {
+    for (int col = 0; col < WIN_COLS; col++) {
+      int idx = row * WIN_COLS + col;
+      uint32_t pos_hash = hash3(idx, seed, 0xA12CE001);
+      float jitter =
+          (hash01(pos_hash) - 0.5f) * 2.0f * WIN_JITTER_POS * WIN_PERIOD_X;
 
-            g_windows[idx].cx       = x0 + (float)col * WIN_PERIOD_X
-                                          + jitter;
-            g_windows[idx].cy_base  = row0_sill + (float)row * row_period;
-            g_windows[idx].half_w   = WIN_HALF_W;
-            g_windows[idx].rect_h   = WIN_RECT_H;
-        }
+      g_windows[idx].cx = x0 + (float)col * WIN_PERIOD_X + jitter;
+      g_windows[idx].cy_base = row0_sill + (float)row * row_period;
+      g_windows[idx].half_w = WIN_HALF_W;
+      g_windows[idx].rect_h = WIN_RECT_H;
     }
+  }
 }
 
 /* §12.3 ── xy_in_any_window: point-in-pointed-arch test (T6) ───────── */
@@ -1490,34 +1533,40 @@ static void place_windows(int seed)
  *   §13 ray_wall (eye-ray hits wall)
  *   §15 scene_blocked_to_sun (NEE shadow-ray test)
  */
-static bool xy_in_any_window(float x, float y)
-{
-    float arc_radius_sq = 4.0f * WIN_HALF_W * WIN_HALF_W;
-    float arch_max      = WIN_SQRT3 * WIN_HALF_W;
+static bool xy_in_any_window(float x, float y) {
+  float arc_radius_sq = 4.0f * WIN_HALF_W * WIN_HALF_W;
+  float arch_max = WIN_SQRT3 * WIN_HALF_W;
 
-    for (int i = 0; i < WIN_COUNT; i++) {
-        const Window *w = &g_windows[i];
-        float dx = x - w->cx;
-        if (fabsf(dx) > w->half_w) continue;
+  for (int i = 0; i < WIN_COUNT; i++) {
+    const Window *w = &g_windows[i];
+    float dx = x - w->cx;
+    if (fabsf(dx) > w->half_w)
+      continue;
 
-        float dy = y - w->cy_base;
-        if (dy < 0.0f)        continue;
-        if (dy <= w->rect_h)  return true;          /* rectangle body */
+    float dy = y - w->cy_base;
+    if (dy < 0.0f)
+      continue;
+    if (dy <= w->rect_h)
+      return true; /* rectangle body */
 
-        float ay = dy - w->rect_h;
-        if (ay > arch_max) continue;                /* above peak     */
+    float ay = dy - w->rect_h;
+    if (ay > arch_max)
+      continue; /* above peak     */
 
-        /* Left arc: centre at (cx + half_w, cy_top); offset = (dx − half_w, ay). */
-        float left_dx = dx - w->half_w;
-        if (left_dx * left_dx + ay * ay > arc_radius_sq) continue;
+    /* Left arc: centre at (cx + half_w, cy_top); offset = (dx − half_w, ay). */
+    float left_dx = dx - w->half_w;
+    if (left_dx * left_dx + ay * ay > arc_radius_sq)
+      continue;
 
-        /* Right arc: centre at (cx − half_w, cy_top); offset = (dx + half_w, ay). */
-        float right_dx = dx + w->half_w;
-        if (right_dx * right_dx + ay * ay > arc_radius_sq) continue;
+    /* Right arc: centre at (cx − half_w, cy_top); offset = (dx + half_w, ay).
+     */
+    float right_dx = dx + w->half_w;
+    if (right_dx * right_dx + ay * ay > arc_radius_sq)
+      continue;
 
-        return true;                                /* inside arch    */
-    }
-    return false;
+    return true; /* inside arch    */
+  }
+  return false;
 }
 
 /* ── §13 ray-wall intersection (slit-aware) ─────────────────────────── *
@@ -1541,17 +1590,20 @@ static bool xy_in_any_window(float x, float y)
  *   if xy_in_any_window(x, y):  passes through opening → MISS
  *   *out_t = t; HIT
  */
-static bool ray_wall(V3 ray_origin, V3 ray_dir, float *out_t)
-{
-    if (ray_dir.z < 1e-6f) return false;
-    float t = (WALL_Z - ray_origin.z) / ray_dir.z;
-    if (t < 1e-3f) return false;
-    float hit_x = ray_origin.x + t * ray_dir.x;
-    float hit_y = ray_origin.y + t * ray_dir.y;
-    if (hit_y < 0.0f) return false;
-    if (xy_in_any_window(hit_x, hit_y)) return false;
-    *out_t = t;
-    return true;
+static bool ray_wall(V3 ray_origin, V3 ray_dir, float *out_t) {
+  if (ray_dir.z < 1e-6f)
+    return false;
+  float t = (WALL_Z - ray_origin.z) / ray_dir.z;
+  if (t < 1e-3f)
+    return false;
+  float hit_x = ray_origin.x + t * ray_dir.x;
+  float hit_y = ray_origin.y + t * ray_dir.y;
+  if (hit_y < 0.0f)
+    return false;
+  if (xy_in_any_window(hit_x, hit_y))
+    return false;
+  *out_t = t;
+  return true;
 }
 
 /* ── §14 scene_hit (find nearest of {wall, floor, sky}) ─────────────── */
@@ -1559,8 +1611,8 @@ static bool ray_wall(V3 ray_origin, V3 ray_dir, float *out_t)
 typedef enum { HIT_SKY = 0, HIT_WALL = 1, HIT_FLOOR = 2 } HitType;
 
 typedef struct {
-    HitType type;
-    float   t;
+  HitType type;
+  float t;
 } Hit;
 
 /*
@@ -1572,27 +1624,26 @@ typedef struct {
  *   try ray_wall (slit-aware)   → if closer, set HIT_WALL
  *   return best
  */
-static Hit scene_hit(V3 ray_origin, V3 ray_dir)
-{
-    Hit hit = { HIT_SKY, 1e30f };
+static Hit scene_hit(V3 ray_origin, V3 ray_dir) {
+  Hit hit = {HIT_SKY, 1e30f};
 
-    float t_floor;
-    if (ray_plane_y(ray_origin, ray_dir, FLOOR_Y, &t_floor)) {
-        if (t_floor < hit.t) {
-            hit.type = HIT_FLOOR;
-            hit.t    = t_floor;
-        }
+  float t_floor;
+  if (ray_plane_y(ray_origin, ray_dir, FLOOR_Y, &t_floor)) {
+    if (t_floor < hit.t) {
+      hit.type = HIT_FLOOR;
+      hit.t = t_floor;
     }
+  }
 
-    float t_wall;
-    if (ray_wall(ray_origin, ray_dir, &t_wall)) {
-        if (t_wall < hit.t) {
-            hit.type = HIT_WALL;
-            hit.t    = t_wall;
-        }
+  float t_wall;
+  if (ray_wall(ray_origin, ray_dir, &t_wall)) {
+    if (t_wall < hit.t) {
+      hit.type = HIT_WALL;
+      hit.t = t_wall;
     }
+  }
 
-    return hit;
+  return hit;
 }
 
 /* ── §15 sun visibility (slit-aware NEE test, T5) ───────────────────── *
@@ -1618,17 +1669,21 @@ static Hit scene_hit(V3 ray_origin, V3 ray_dir)
  *   if xy_in_any_window(x, y):      through window → not blocked
  *   else:                           hits solid wall → BLOCKED
  */
-static bool scene_blocked_to_sun(V3 scatter_point, V3 sun_dir)
-{
-    if (sun_dir.z < 1e-6f) return false;
-    if (scatter_point.z >= WALL_Z) return false;
-    float t = (WALL_Z - scatter_point.z) / sun_dir.z;
-    if (t < 1e-3f) return false;
-    float x = scatter_point.x + t * sun_dir.x;
-    float y = scatter_point.y + t * sun_dir.y;
-    if (y < 0.0f) return true;
-    if (xy_in_any_window(x, y)) return false;
+static bool scene_blocked_to_sun(V3 scatter_point, V3 sun_dir) {
+  if (sun_dir.z < 1e-6f)
+    return false;
+  if (scatter_point.z >= WALL_Z)
+    return false;
+  float t = (WALL_Z - scatter_point.z) / sun_dir.z;
+  if (t < 1e-3f)
+    return false;
+  float x = scatter_point.x + t * sun_dir.x;
+  float y = scatter_point.y + t * sun_dir.y;
+  if (y < 0.0f)
     return true;
+  if (xy_in_any_window(x, y))
+    return false;
+  return true;
 }
 
 /* ── §16 sky / sun radiance ──────────────────────────────────────────── *
@@ -1654,24 +1709,25 @@ static bool scene_blocked_to_sun(V3 scatter_point, V3 sun_dir)
  *     sky += sun_em · edge
  *   return sky
  */
-static RGB sky_radiance(V3 ray_dir, V3 sun_dir, RGB sun_em, RGB horizon_col)
-{
-    float h = ray_dir.y;
-    if (h < 0.f) h = 0.f;
-    if (h > 1.f) h = 1.f;
+static RGB sky_radiance(V3 ray_dir, V3 sun_dir, RGB sun_em, RGB horizon_col) {
+  float h = ray_dir.y;
+  if (h < 0.f)
+    h = 0.f;
+  if (h > 1.f)
+    h = 1.f;
 
-    RGB zenith = rgb_make(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
-    RGB sky    = rgb_lerp(horizon_col, zenith, h);
+  RGB zenith = rgb_make(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
+  RGB sky = rgb_lerp(horizon_col, zenith, h);
 
-    float cos_ray_to_sun = v3_dot(ray_dir, sun_dir);
-    float cos_disc_edge  = cosf(SUN_ANG_RADIUS);
-    if (cos_ray_to_sun > cos_disc_edge) {
-        float t_edge = (cos_ray_to_sun - cos_disc_edge)
-                     / (1.0f - cos_disc_edge);
-        if (t_edge > 1.f) t_edge = 1.f;
-        sky = rgb_add(sky, rgb_scl(sun_em, t_edge));
-    }
-    return sky;
+  float cos_ray_to_sun = v3_dot(ray_dir, sun_dir);
+  float cos_disc_edge = cosf(SUN_ANG_RADIUS);
+  if (cos_ray_to_sun > cos_disc_edge) {
+    float t_edge = (cos_ray_to_sun - cos_disc_edge) / (1.0f - cos_disc_edge);
+    if (t_edge > 1.f)
+      t_edge = 1.f;
+    sky = rgb_add(sky, rgb_scl(sun_em, t_edge));
+  }
+  return sky;
 }
 
 /* ── §17 surface shading ─────────────────────────────────────────────── *
@@ -1682,10 +1738,7 @@ static RGB sky_radiance(V3 ray_dir, V3 sun_dir, RGB sun_em, RGB horizon_col)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-static RGB shade_wall(void)
-{
-    return rgb_make(WALL_R, WALL_G, WALL_B);
-}
+static RGB shade_wall(void) { return rgb_make(WALL_R, WALL_G, WALL_B); }
 
 /*
  * shade_floor — Lambertian floor with NEE direct sun + sky ambient.
@@ -1699,23 +1752,23 @@ static RGB shade_wall(void)
  *   ambient = horizon_col · albedo · 0.20         faint sky term
  *   return direct + ambient
  */
-static RGB shade_floor(V3 floor_point, V3 sun_dir,
-                       RGB sun_em, RGB horizon_col)
-{
-    RGB albedo = rgb_make(FLOOR_R, FLOOR_G, FLOOR_B);
-    float cos_normal_to_sun = sun_dir.y;
-    if (cos_normal_to_sun < 0.f) cos_normal_to_sun = 0.f;
+static RGB shade_floor(V3 floor_point, V3 sun_dir, RGB sun_em,
+                       RGB horizon_col) {
+  RGB albedo = rgb_make(FLOOR_R, FLOOR_G, FLOOR_B);
+  float cos_normal_to_sun = sun_dir.y;
+  if (cos_normal_to_sun < 0.f)
+    cos_normal_to_sun = 0.f;
 
-    RGB direct = rgb_make(0.f, 0.f, 0.f);
-    if (cos_normal_to_sun > 0.f) {
-        bool blocked = scene_blocked_to_sun(floor_point, sun_dir);
-        if (!blocked) {
-            float lambert = cos_normal_to_sun / (float)M_PI;
-            direct = rgb_scl(rgb_mul(sun_em, albedo), lambert);
-        }
+  RGB direct = rgb_make(0.f, 0.f, 0.f);
+  if (cos_normal_to_sun > 0.f) {
+    bool blocked = scene_blocked_to_sun(floor_point, sun_dir);
+    if (!blocked) {
+      float lambert = cos_normal_to_sun / (float)M_PI;
+      direct = rgb_scl(rgb_mul(sun_em, albedo), lambert);
     }
-    RGB ambient = rgb_scl(rgb_mul(horizon_col, albedo), 0.20f);
-    return rgb_add(direct, ambient);
+  }
+  RGB ambient = rgb_scl(rgb_mul(horizon_col, albedo), 0.20f);
+  return rgb_add(direct, ambient);
 }
 
 /* ── §18 trace_ray (THE CORE — volumetric path tracer) ──────────────── *
@@ -1733,10 +1786,10 @@ static RGB shade_floor(V3 floor_point, V3 sun_dir,
  * ─────────────────────────────────────────────────────────────────── */
 
 typedef struct {
-    RGB   total;                /* in_scatter + surface · T_far     */
-    RGB   in_scatter;           /* in-scatter accumulator only      */
-    RGB   surface;              /* surface radiance (un-dimmed)     */
-    float t_far_transmittance;  /* T(0, march_distance)             */
+  RGB total;                 /* in_scatter + surface · T_far     */
+  RGB in_scatter;            /* in-scatter accumulator only      */
+  RGB surface;               /* surface radiance (un-dimmed)     */
+  float t_far_transmittance; /* T(0, march_distance)             */
 } Radiance;
 
 /*
@@ -1771,106 +1824,104 @@ typedef struct {
  * Iterative, not recursive — the for-loop is the integrator. The
  * NEE check inside the inner block is the entire god-ray trick.
  */
-static Radiance trace_ray(V3 ray_origin, V3 ray_dir,
-                          V3 sun_dir, RGB sun_em, RGB horizon_col)
-{
-    /* Stage 2 — scene intersection. */
-    Hit scene_hit_record = scene_hit(ray_origin, ray_dir);
+static Radiance trace_ray(V3 ray_origin, V3 ray_dir, V3 sun_dir, RGB sun_em,
+                          RGB horizon_col) {
+  /* Stage 2 — scene intersection. */
+  Hit scene_hit_record = scene_hit(ray_origin, ray_dir);
 
-    /* march_distance: surface hit or wall-plane crossing for SKY. */
-    float march_distance;
-    if (scene_hit_record.type == HIT_SKY) {
-        if (ray_dir.z > 1e-6f) {
-            march_distance = (WALL_Z - ray_origin.z) / ray_dir.z;
-            if (march_distance > FAR_CLIP) march_distance = FAR_CLIP;
-        } else {
-            march_distance = FAR_CLIP;
-        }
+  /* march_distance: surface hit or wall-plane crossing for SKY. */
+  float march_distance;
+  if (scene_hit_record.type == HIT_SKY) {
+    if (ray_dir.z > 1e-6f) {
+      march_distance = (WALL_Z - ray_origin.z) / ray_dir.z;
+      if (march_distance > FAR_CLIP)
+        march_distance = FAR_CLIP;
     } else {
-        march_distance = scene_hit_record.t;
+      march_distance = FAR_CLIP;
     }
-    if (march_distance < 1e-3f) march_distance = 1e-3f;
+  } else {
+    march_distance = scene_hit_record.t;
+  }
+  if (march_distance < 1e-3f)
+    march_distance = 1e-3f;
 
-    /* Stage 3 — march setup. */
-    float step_length     = march_distance / (float)MARCH_STEPS;
-    float cos_eye_to_sun  = v3_dot(ray_dir, sun_dir);
-    float phase_value     = hg_phase(cos_eye_to_sun);
+  /* Stage 3 — march setup. */
+  float step_length = march_distance / (float)MARCH_STEPS;
+  float cos_eye_to_sun = v3_dot(ray_dir, sun_dir);
+  float phase_value = hg_phase(cos_eye_to_sun);
 
-    RGB   in_scatter_radiance      = rgb_make(0.f, 0.f, 0.f);
-    float transmittance_along_eye  = 1.0f;
+  RGB in_scatter_radiance = rgb_make(0.f, 0.f, 0.f);
+  float transmittance_along_eye = 1.0f;
 
-    /* Stages 3-6 — march loop. */
-    for (int i = 0; i < MARCH_STEPS; i++) {
-        if (transmittance_along_eye <= 1e-3f) break;       /* early out */
+  /* Stages 3-6 — march loop. */
+  for (int i = 0; i < MARCH_STEPS; i++) {
+    if (transmittance_along_eye <= 1e-3f)
+      break; /* early out */
 
-        float step_t           = ((float)i + 0.5f) * step_length;
-        V3    scatter_point    = v3_add(ray_origin, v3_scl(ray_dir, step_t));
-        float extinction       = sigma_e_at(scatter_point);
+    float step_t = ((float)i + 0.5f) * step_length;
+    V3 scatter_point = v3_add(ray_origin, v3_scl(ray_dir, step_t));
+    float extinction = sigma_e_at(scatter_point);
 
-        if (extinction > 1e-6f) {
-            /* Stage 4 — NEE: is the sun visible from here? */
-            bool blocked = scene_blocked_to_sun(scatter_point, sun_dir);
+    if (extinction > 1e-6f) {
+      /* Stage 4 — NEE: is the sun visible from here? */
+      bool blocked = scene_blocked_to_sun(scatter_point, sun_dir);
 
-            if (!blocked) {
-                /* Stage 5 — in-scatter contribution at this step. */
-                float transmittance_to_sun = tr_to_sun(scatter_point, sun_dir);
-                float step_contribution    = extinction * phase_value
-                                            * transmittance_to_sun
-                                            * INSCATTER_GAIN
-                                            * step_length;
-                RGB add = rgb_scl(rgb_scl(sun_em, step_contribution),
-                                  transmittance_along_eye);
-                in_scatter_radiance = rgb_add(in_scatter_radiance, add);
-            }
+      if (!blocked) {
+        /* Stage 5 — in-scatter contribution at this step. */
+        float transmittance_to_sun = tr_to_sun(scatter_point, sun_dir);
+        float step_contribution = extinction * phase_value *
+                                  transmittance_to_sun * INSCATTER_GAIN *
+                                  step_length;
+        RGB add = rgb_scl(rgb_scl(sun_em, step_contribution),
+                          transmittance_along_eye);
+        in_scatter_radiance = rgb_add(in_scatter_radiance, add);
+      }
 
-            /* Stage 6 — eye-ray transmittance update. */
-            transmittance_along_eye *= expf(-extinction * step_length);
-        }
+      /* Stage 6 — eye-ray transmittance update. */
+      transmittance_along_eye *= expf(-extinction * step_length);
     }
+  }
 
-    /* Stage 7 — surface contribution at the far end. */
-    RGB surface_radiance;
-    switch (scene_hit_record.type) {
-    case HIT_WALL:
-        surface_radiance = shade_wall();
-        break;
-    case HIT_FLOOR: {
-        V3 floor_point = v3_add(ray_origin,
-                                v3_scl(ray_dir, scene_hit_record.t));
-        surface_radiance = shade_floor(floor_point, sun_dir,
-                                       sun_em, horizon_col);
-        break;
-    }
-    case HIT_SKY:
-    default:
-        surface_radiance = sky_radiance(ray_dir, sun_dir,
-                                        sun_em, horizon_col);
-        break;
-    }
+  /* Stage 7 — surface contribution at the far end. */
+  RGB surface_radiance;
+  switch (scene_hit_record.type) {
+  case HIT_WALL:
+    surface_radiance = shade_wall();
+    break;
+  case HIT_FLOOR: {
+    V3 floor_point = v3_add(ray_origin, v3_scl(ray_dir, scene_hit_record.t));
+    surface_radiance = shade_floor(floor_point, sun_dir, sun_em, horizon_col);
+    break;
+  }
+  case HIT_SKY:
+  default:
+    surface_radiance = sky_radiance(ray_dir, sun_dir, sun_em, horizon_col);
+    break;
+  }
 
-    /* Final radiance = in-scatter + surface · remaining T. */
-    RGB total = rgb_add(in_scatter_radiance,
-                        rgb_scl(surface_radiance, transmittance_along_eye));
+  /* Final radiance = in-scatter + surface · remaining T. */
+  RGB total = rgb_add(in_scatter_radiance,
+                      rgb_scl(surface_radiance, transmittance_along_eye));
 
-    Radiance result = {
-        .total                 = total,
-        .in_scatter            = in_scatter_radiance,
-        .surface               = surface_radiance,
-        .t_far_transmittance   = transmittance_along_eye,
-    };
-    return result;
+  Radiance result = {
+      .total = total,
+      .in_scatter = in_scatter_radiance,
+      .surface = surface_radiance,
+      .t_far_transmittance = transmittance_along_eye,
+  };
+  return result;
 }
 
 /* ── §19 scene state + sun motion (T8) ──────────────────────────────── */
 
 typedef struct {
-    bool      paused;
-    int       speed;
-    int       kelvin_idx;
-    float     zoom;
-    float     time_secs;
-    int       seed;
-    DebugMode debug_mode;
+  bool paused;
+  int speed;
+  int kelvin_idx;
+  float zoom;
+  float time_secs;
+  int seed;
+  DebugMode debug_mode;
 } Scene;
 
 /*
@@ -1886,13 +1937,12 @@ typedef struct {
  * The cos/sin pairing locks the choreography: high el coincides with
  * az going L→R, low el with R→L (T8).
  */
-static V3 scene_sun_dir(const Scene *s)
-{
-    float omega = 2.0f * (float)M_PI / SUN_EL_PERIOD_S;
-    float el = SUN_EL_BASE + SUN_EL_AMP * cosf(omega * s->time_secs);
-    float az = SUN_AZ_BASE + SUN_AZ_AMP * sinf(omega * s->time_secs);
-    float ce = cosf(el);
-    return v3_norm(v3(sinf(az) * ce, sinf(el), cosf(az) * ce));
+static V3 scene_sun_dir(const Scene *s) {
+  float omega = 2.0f * (float)M_PI / SUN_EL_PERIOD_S;
+  float el = SUN_EL_BASE + SUN_EL_AMP * cosf(omega * s->time_secs);
+  float az = SUN_AZ_BASE + SUN_AZ_AMP * sinf(omega * s->time_secs);
+  float ce = cosf(el);
+  return v3_norm(v3(sinf(az) * ce, sinf(el), cosf(az) * ce));
 }
 
 /*
@@ -1900,39 +1950,37 @@ static V3 scene_sun_dir(const Scene *s)
  * Mixes the current time into the new seed so successive presses
  * of `r' don't repeat layouts.
  */
-static void scene_reseed(Scene *s)
-{
-    uint32_t h = hash3((int)(s->time_secs * 1000.0f), s->seed, 0xC0FFEE);
-    s->seed = (int)(h ^ 0x5A5A5A5Au);
-    place_windows(s->seed);
+static void scene_reseed(Scene *s) {
+  uint32_t h = hash3((int)(s->time_secs * 1000.0f), s->seed, 0xC0FFEE);
+  s->seed = (int)(h ^ 0x5A5A5A5Au);
+  place_windows(s->seed);
 }
 
-static void scene_init(Scene *s)
-{
-    memset(s, 0, sizeof *s);
-    s->paused     = false;
-    s->speed      = SPEED_DEF;
-    s->kelvin_idx = 1;     /* GOLDEN by default */
-    s->zoom       = 1.0f;
-    s->seed       = 0xA12CE001;
-    s->debug_mode = MODE_NORMAL;
-    place_windows(s->seed);
+static void scene_init(Scene *s) {
+  memset(s, 0, sizeof *s);
+  s->paused = false;
+  s->speed = SPEED_DEF;
+  s->kelvin_idx = 1; /* GOLDEN by default */
+  s->zoom = 1.0f;
+  s->seed = 0xA12CE001;
+  s->debug_mode = MODE_NORMAL;
+  place_windows(s->seed);
 }
 
-static void scene_tick(Scene *s, float dt)
-{
-    if (s->paused) return;
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    s->time_secs += dt * speed_mul;
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
+  float speed_mul = (float)s->speed / (float)SPEED_DEF;
+  s->time_secs += dt * speed_mul;
 }
 
 /* ── §20 camera (pinhole + pitch — T7) ──────────────────────────────── */
 
 typedef struct {
-    V3    pos;
-    float fov_h, fov_v;
-    float cos_pitch, sin_pitch;
-    int   cols, rows;
+  V3 pos;
+  float fov_h, fov_v;
+  float cos_pitch, sin_pitch;
+  int cols, rows;
 } Camera;
 
 /*
@@ -1950,22 +1998,21 @@ typedef struct {
  *   pitch      = atan(mid_y_above / WALL_Z)
  *   cos_pitch  = cos(pitch); sin_pitch = sin(pitch)
  */
-static void camera_make(Camera *c, int cols, int rows, float fov_h)
-{
-    c->cols  = cols;
-    c->rows  = rows;
-    c->pos   = v3(0.0f, CAMERA_HEIGHT, 0.0f);
-    c->fov_h = fov_h;
-    c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
+static void camera_make(Camera *c, int cols, int rows, float fov_h) {
+  c->cols = cols;
+  c->rows = rows;
+  c->pos = v3(0.0f, CAMERA_HEIGHT, 0.0f);
+  c->fov_h = fov_h;
+  c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
 
-    float total_h    = WIN_RECT_H + WIN_SQRT3 * WIN_HALF_W;
-    float row_period = total_h * (1.0f + WIN_ROW_GAP_FRAC);
-    float row0_centre_above = WIN_SILL0_OFFSET_Y + 0.5f * total_h;
-    float row1_centre_above = row0_centre_above + row_period;
-    float mid_y_above = 0.5f * (row0_centre_above + row1_centre_above);
-    float pitch = atanf(mid_y_above / WALL_Z);
-    c->cos_pitch = cosf(pitch);
-    c->sin_pitch = sinf(pitch);
+  float total_h = WIN_RECT_H + WIN_SQRT3 * WIN_HALF_W;
+  float row_period = total_h * (1.0f + WIN_ROW_GAP_FRAC);
+  float row0_centre_above = WIN_SILL0_OFFSET_Y + 0.5f * total_h;
+  float row1_centre_above = row0_centre_above + row_period;
+  float mid_y_above = 0.5f * (row0_centre_above + row1_centre_above);
+  float pitch = atanf(mid_y_above / WALL_Z);
+  c->cos_pitch = cosf(pitch);
+  c->sin_pitch = sinf(pitch);
 }
 
 /*
@@ -1981,40 +2028,39 @@ static void camera_make(Camera *c, int cols, int rows, float fov_h)
  *
  * The flip on v converts from "screen y down" to "world y up".
  */
-static V3 camera_ray(const Camera *c, int sx, int sy)
-{
-    float u = ( (2.0f * (float)sx + 1.0f) - (float)c->cols)
-            / (float)c->cols * c->fov_h;
-    float v = -((2.0f * (float)sy + 1.0f) - (float)c->rows)
-            / (float)c->rows * c->fov_v;
+static V3 camera_ray(const Camera *c, int sx, int sy) {
+  float u =
+      ((2.0f * (float)sx + 1.0f) - (float)c->cols) / (float)c->cols * c->fov_h;
+  float v =
+      -((2.0f * (float)sy + 1.0f) - (float)c->rows) / (float)c->rows * c->fov_v;
 
-    float ry =  v * c->cos_pitch + c->sin_pitch;
-    float rz = -v * c->sin_pitch + c->cos_pitch;
-    return v3_norm(v3(u, ry, rz));
+  float ry = v * c->cos_pitch + c->sin_pitch;
+  float rz = -v * c->sin_pitch + c->cos_pitch;
+  return v3_norm(v3(u, ry, rz));
 }
 
 /* ── §21 screen + scene_draw (with debug overlays) ──────────────────── */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *s)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
 static RGB g_buf[BUF_MAX_H][BUF_MAX_W];
@@ -2029,56 +2075,59 @@ static RGB g_buf[BUF_MAX_H][BUF_MAX_W];
  *     g_buf[r][c] = SELECT(scene.debug_mode, rad)
  *   for each pixel: paint_cell(c, r + offset, g_buf[r][c])
  */
-static void scene_draw(const Screen *sc, const Scene *s)
-{
-    int rows_eff = sc->rows - 2;
-    int row_off  = 1;
-    if (rows_eff < 4) { rows_eff = sc->rows; row_off = 0; }
-    if (rows_eff > BUF_MAX_H) rows_eff = BUF_MAX_H;
-    int cols_eff = sc->cols;
-    if (cols_eff > BUF_MAX_W) cols_eff = BUF_MAX_W;
+static void scene_draw(const Screen *sc, const Scene *s) {
+  int rows_eff = sc->rows - 2;
+  int row_off = 1;
+  if (rows_eff < 4) {
+    rows_eff = sc->rows;
+    row_off = 0;
+  }
+  if (rows_eff > BUF_MAX_H)
+    rows_eff = BUF_MAX_H;
+  int cols_eff = sc->cols;
+  if (cols_eff > BUF_MAX_W)
+    cols_eff = BUF_MAX_W;
 
-    Camera cam;
-    camera_make(&cam, cols_eff, rows_eff, FOV_H_BASE / s->zoom);
+  Camera cam;
+  camera_make(&cam, cols_eff, rows_eff, FOV_H_BASE / s->zoom);
 
-    V3   sun_dir   = scene_sun_dir(s);
-    float kelvin   = KELVINS[s->kelvin_idx].kelvin;
-    RGB sun_chrom  = blackbody_rgb(kelvin);
-    RGB sun_em     = rgb_scl(sun_chrom, SUN_EMIT_HDR);
-    RGB horizon    = rgb_scl(sun_chrom, SKY_HORIZON_FAC);
+  V3 sun_dir = scene_sun_dir(s);
+  float kelvin = KELVINS[s->kelvin_idx].kelvin;
+  RGB sun_chrom = blackbody_rgb(kelvin);
+  RGB sun_em = rgb_scl(sun_chrom, SUN_EMIT_HDR);
+  RGB horizon = rgb_scl(sun_chrom, SKY_HORIZON_FAC);
 
-    for (int r = 0; r < rows_eff; r++) {
-        for (int c = 0; c < cols_eff; c++) {
-            V3       ray_dir = camera_ray(&cam, c, r);
-            Radiance rad     = trace_ray(cam.pos, ray_dir, sun_dir,
-                                         sun_em, horizon);
+  for (int r = 0; r < rows_eff; r++) {
+    for (int c = 0; c < cols_eff; c++) {
+      V3 ray_dir = camera_ray(&cam, c, r);
+      Radiance rad = trace_ray(cam.pos, ray_dir, sun_dir, sun_em, horizon);
 
-            /* Debug-overlay selection (T11). */
-            switch (s->debug_mode) {
-            default:
-            case MODE_NORMAL:
-                g_buf[r][c] = rad.total;
-                break;
-            case MODE_SCATTER:
-                g_buf[r][c] = rad.in_scatter;
-                break;
-            case MODE_SURFACE:
-                g_buf[r][c] = rad.surface;
-                break;
-            case MODE_TR: {
-                float t = rad.t_far_transmittance;
-                g_buf[r][c] = rgb_make(t, t, t);
-                break;
-            }
-            }
-        }
+      /* Debug-overlay selection (T11). */
+      switch (s->debug_mode) {
+      default:
+      case MODE_NORMAL:
+        g_buf[r][c] = rad.total;
+        break;
+      case MODE_SCATTER:
+        g_buf[r][c] = rad.in_scatter;
+        break;
+      case MODE_SURFACE:
+        g_buf[r][c] = rad.surface;
+        break;
+      case MODE_TR: {
+        float t = rad.t_far_transmittance;
+        g_buf[r][c] = rgb_make(t, t, t);
+        break;
+      }
+      }
     }
+  }
 
-    for (int r = 0; r < rows_eff; r++) {
-        for (int c = 0; c < cols_eff; c++) {
-            paint_cell(c, r + row_off, g_buf[r][c]);
-        }
+  for (int r = 0; r < rows_eff; r++) {
+    for (int c = 0; c < cols_eff; c++) {
+      paint_cell(c, r + row_off, g_buf[r][c]);
     }
+  }
 }
 
 /* ── §22 HUD ────────────────────────────────────────────────────────── */
@@ -2090,184 +2139,208 @@ static void scene_draw(const Screen *sc, const Scene *s)
  *   row 0 left     yellow title (subtitle banner)
  *   bottom row     cyan key-hint strip (BOLD, ASCII only)
  */
-static void hud_draw(const Screen *sc, const Scene *s,
-                     double fps, int sim_fps)
-{
-    const KelvinPreset *k = &KELVINS[s->kelvin_idx];
-    V3    sd     = scene_sun_dir(s);
-    float el_deg = asinf(sd.y) * 180.0f / (float)M_PI;
-    float az_deg = atan2f(sd.x, sd.z) * 180.0f / (float)M_PI;
+static void hud_draw(const Screen *sc, const Scene *s, double fps,
+                     int sim_fps) {
+  const KelvinPreset *k = &KELVINS[s->kelvin_idx];
+  V3 sd = scene_sun_dir(s);
+  float el_deg = asinf(sd.y) * 180.0f / (float)M_PI;
+  float az_deg = atan2f(sd.x, sd.z) * 180.0f / (float)M_PI;
 
-    char buf[256];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps %3d Hz  %s  %s %5.0fK  sun:el%4.1f deg az%+5.1f deg  z:%3.1fx  spd:%d  %dx%d  %s ",
-             fps, sim_fps,
-             s->paused ? "PAUSED" : "      ",
-             k->name, (double)k->kelvin,
-             (double)el_deg, (double)az_deg,
-             (double)s->zoom, s->speed,
-             WIN_COLS, WIN_ROWS,
-             debug_mode_name(s->debug_mode));
-    int len = (int)strlen(buf);
-    if (len > sc->cols) len = sc->cols;
+  char buf[256];
+  snprintf(buf, sizeof buf,
+           " %5.1f fps %3d Hz  %s  %s %5.0fK  sun:el%4.1f deg az%+5.1f deg  "
+           "z:%3.1fx  spd:%d  %dx%d  %s ",
+           fps, sim_fps, s->paused ? "PAUSED" : "      ", k->name,
+           (double)k->kelvin, (double)el_deg, (double)az_deg, (double)s->zoom,
+           s->speed, WIN_COLS, WIN_ROWS, debug_mode_name(s->debug_mode));
+  int len = (int)strlen(buf);
+  if (len > sc->cols)
+    len = sc->cols;
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, sc->cols - len, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, sc->cols - len, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(0, 0, " GOD-RAYS-WINDOW · ISLAMIC ARCHES ");
-    attroff(COLOR_PAIR(PAIR_HUD));
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(0, 0, " GOD-RAYS-WINDOW · ISLAMIC ARCHES ");
+  attroff(COLOR_PAIR(PAIR_HUD));
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " q:quit  spc:pause  r:reseed  d:debug  t/T:kelvin  z/Z:zoom  +/-:spd  []:Hz ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(sc->rows - 1, 0,
+           " q:quit  spc:pause  r:reseed  d:debug  t/T:kelvin  z/Z:zoom  "
+           "+/-:spd  []:Hz ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
-{
-    erase();
-    scene_draw(sc, s);
-    hud_draw(sc, s, fps, sim_fps);
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+  erase();
+  scene_draw(sc, s);
+  hud_draw(sc, s, fps, sim_fps);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ── §23 app (signals, main loop) ───────────────────────────────────── */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':           s->paused = !s->paused; break;
-    case 'r': case 'R': scene_reseed(s); break;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_reseed(s);
+    break;
 
-    case 'd': case 'D':
-        s->debug_mode = (DebugMode)((s->debug_mode + 1) % MODE_N);
-        break;
+  case 'd':
+  case 'D':
+    s->debug_mode = (DebugMode)((s->debug_mode + 1) % MODE_N);
+    break;
 
-    case '=': case '+':
-        if (s->speed < SPEED_MAX) s->speed *= 2;
-        break;
-    case '-': case '_':
-        s->speed /= 2;
-        if (s->speed < SPEED_MIN) s->speed = SPEED_MIN;
-        break;
+  case '=':
+  case '+':
+    if (s->speed < SPEED_MAX)
+      s->speed *= 2;
+    break;
+  case '-':
+  case '_':
+    s->speed /= 2;
+    if (s->speed < SPEED_MIN)
+      s->speed = SPEED_MIN;
+    break;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    case 't':
-        s->kelvin_idx = (s->kelvin_idx + 1) % N_KELVINS;
-        break;
-    case 'T':
-        s->kelvin_idx = (s->kelvin_idx + N_KELVINS - 1) % N_KELVINS;
-        break;
+  case 't':
+    s->kelvin_idx = (s->kelvin_idx + 1) % N_KELVINS;
+    break;
+  case 'T':
+    s->kelvin_idx = (s->kelvin_idx + N_KELVINS - 1) % N_KELVINS;
+    break;
 
-    case 'z':
-        s->zoom *= ZOOM_STEP;
-        if (s->zoom > ZOOM_MAX) s->zoom = ZOOM_MAX;
+  case 'z':
+    s->zoom *= ZOOM_STEP;
+    if (s->zoom > ZOOM_MAX)
+      s->zoom = ZOOM_MAX;
+    break;
+  case 'Z':
+    s->zoom /= ZOOM_STEP;
+    if (s->zoom < ZOOM_MIN)
+      s->zoom = ZOOM_MIN;
+    break;
+  }
+  return true;
+}
+
+static void app_init(App *app) {
+  memset(app, 0, sizeof *app);
+  scene_init(&app->scene);
+  screen_init(&app->screen);
+  app->sim_fps = SIM_FPS_DEFAULT;
+  app->running = 1;
+}
+
+static void app_run(App *app) {
+  int64_t prev = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t frame_count = 0;
+  int64_t fps_window_start = prev;
+  double fps_meas = 0.0;
+
+  struct sigaction sa = {0};
+  sa.sa_handler = on_exit_signal;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  sa.sa_handler = on_resize_signal;
+  sigaction(SIGWINCH, &sa, NULL);
+  atexit(cleanup);
+
+  while (app->running) {
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (!app_handle_key(app, ch)) {
+        app->running = 0;
         break;
-    case 'Z':
-        s->zoom /= ZOOM_STEP;
-        if (s->zoom < ZOOM_MIN) s->zoom = ZOOM_MIN;
-        break;
+      }
     }
-    return true;
-}
-
-static void app_init(App *app)
-{
-    memset(app, 0, sizeof *app);
-    scene_init(&app->scene);
-    screen_init(&app->screen);
-    app->sim_fps = SIM_FPS_DEFAULT;
-    app->running = 1;
-}
-
-static void app_run(App *app)
-{
-    int64_t prev = clock_ns();
-    int64_t sim_accum = 0;
-    int64_t frame_count = 0;
-    int64_t fps_window_start = prev;
-    double  fps_meas = 0.0;
-
-    struct sigaction sa = {0};
-    sa.sa_handler = on_exit_signal;
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sa.sa_handler = on_resize_signal;
-    sigaction(SIGWINCH, &sa, NULL);
-    atexit(cleanup);
-
-    while (app->running) {
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (!app_handle_key(app, ch)) { app->running = 0; break; }
-        }
-        if (!app->running) break;
-        if (app->need_resize) {
-            screen_resize(&app->screen);
-            app->need_resize = 0;
-        }
-
-        int64_t now = clock_ns();
-        int64_t dt  = now - prev;
-        if (dt > DT_CAP_NS) dt = DT_CAP_NS;
-        prev = now;
-
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, (float)tick_ns / (float)NS_PER_SEC);
-            sim_accum -= tick_ns;
-        }
-
-        screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
-        screen_present();
-
-        frame_count++;
-        if (now - fps_window_start >= NS_PER_SEC) {
-            fps_meas = (double)frame_count
-                     * (double)NS_PER_SEC
-                     / (double)(now - fps_window_start);
-            frame_count = 0;
-            fps_window_start = now;
-        }
-
-        int64_t target = clock_ns();
-        int64_t left   = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
-        if (left > 0) clock_sleep_ns(left);
+    if (!app->running)
+      break;
+    if (app->need_resize) {
+      screen_resize(&app->screen);
+      app->need_resize = 0;
     }
+
+    int64_t now = clock_ns();
+    int64_t dt = now - prev;
+    if (dt > DT_CAP_NS)
+      dt = DT_CAP_NS;
+    prev = now;
+
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, (float)tick_ns / (float)NS_PER_SEC);
+      sim_accum -= tick_ns;
+    }
+
+    screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
+    screen_present();
+
+    frame_count++;
+    if (now - fps_window_start >= NS_PER_SEC) {
+      fps_meas = (double)frame_count * (double)NS_PER_SEC /
+                 (double)(now - fps_window_start);
+      frame_count = 0;
+      fps_window_start = now;
+    }
+
+    int64_t target = clock_ns();
+    int64_t left = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
+    if (left > 0)
+      clock_sleep_ns(left);
+  }
 }
 
-int main(void)
-{
-    app_init(&g_app);
-    app_run(&g_app);
-    cleanup();
-    return 0;
+int main(void) {
+  app_init(&g_app);
+  app_run(&g_app);
+  cleanup();
+  return 0;
 }

@@ -611,17 +611,17 @@
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
 #include <ncurses.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ── §1 config ───────────────────────────────────────────────────────── */
 
@@ -632,83 +632,85 @@
  * cost of jerky rotation; the trig cache (§7) makes full-frame
  * affordable.
  */
-#define CANVAS_MAX_W  220
-#define CANVAS_MAX_H   55
-#define ROWS_PER_TICK 55          /* = CANVAS_MAX_H — full frame per tick */
-#define CELL_ASPECT   2.1f        /* terminal cell h / w                  */
-#define FOV_HALF_TAN  0.57f       /* tan(30°): 60° vertical FOV           */
+#define CANVAS_MAX_W 220
+#define CANVAS_MAX_H 55
+#define ROWS_PER_TICK 55   /* = CANVAS_MAX_H — full frame per tick */
+#define CELL_ASPECT 2.1f   /* terminal cell h / w                  */
+#define FOV_HALF_TAN 0.57f /* tan(30°): 60° vertical FOV           */
 
 /* §1.2 sphere-trace tunables.  MARCH_TW is a smaller step for the twist
  * scene (its DE is non-Lipschitz; full step over-shoots — see T5/§10). */
-#define MARCH_MAX     120
-#define MARCH_EPS    0.0015f
-#define MARCH_FAR    18.0f
-#define MARCH_STEP   0.85f
-#define MARCH_TW     0.60f
+#define MARCH_MAX 120
+#define MARCH_EPS 0.0015f
+#define MARCH_FAR 18.0f
+#define MARCH_STEP 0.85f
+#define MARCH_TW 0.60f
 
 /* §1.3 normals + shadow + AO. */
-#define NORM_H       0.007f       /* tetrahedral normal epsilon (T6)       */
-#define SH_STEPS       24
-#define SH_K          12.0f
-#define SH_FLOOR      0.12f       /* never fully-black shadow             */
-#define AO_STEPS        5
-#define AO_STEP       0.12f
-#define AO_DECAY      0.72f
+#define NORM_H 0.007f /* tetrahedral normal epsilon (T6)       */
+#define SH_STEPS 24
+#define SH_K 12.0f
+#define SH_FLOOR 0.12f /* never fully-black shadow             */
+#define AO_STEPS 5
+#define AO_STEP 0.12f
+#define AO_DECAY 0.72f
 
 /* §1.4 Phong shading coefficients (used in mode 1). */
-#define KA    0.10f
-#define KD    0.72f
-#define KS    0.26f
-#define SHIN  24.0f
-#define FILL_STR  0.14f           /* fill-light strength                  */
-#define RIM_STR   0.09f           /* rim-light strength                   */
+#define KA 0.10f
+#define KD 0.72f
+#define KS 0.26f
+#define SHIN 24.0f
+#define FILL_STR 0.14f /* fill-light strength                  */
+#define RIM_STR 0.09f  /* rim-light strength                   */
 
 /* §1.5 camera + zoom limits.  CAM_DIST_MIN keeps the eye outside the
  * larger primitives; closer than ~1.0 the marcher starts inside. */
-#define CAM_DIST_DEF   2.8f
-#define CAM_DIST_MIN   1.0f
-#define CAM_DIST_MAX  10.0f
-#define CAM_ZOOM_STEP  0.20f
-#define CAM_THETA_DEF  0.38f
-#define CAM_PHI_DEF    0.0f
-#define CAM_ORBIT_DEF  0.30f
+#define CAM_DIST_DEF 2.8f
+#define CAM_DIST_MIN 1.0f
+#define CAM_DIST_MAX 10.0f
+#define CAM_ZOOM_STEP 0.20f
+#define CAM_THETA_DEF 0.38f
+#define CAM_PHI_DEF 0.0f
+#define CAM_ORBIT_DEF 0.30f
 
 /* §1.6 colour pair indices.
  *      CP_HUD     bright yellow + bold — top status row 0
  *      CP_HINT    bright cyan   + bold — bottom key hint row
  *      CP_BASE..  +0..+(N_THEMES·GRAD_N − 1) — gradient pairs per theme
  */
-#define GRAD_N    8
-#define N_THEMES  5
-#define CP_HUD    1
-#define CP_HINT   2
-#define CP_BASE  20
+#define GRAD_N 8
+#define N_THEMES 5
+#define CP_HUD 1
+#define CP_HINT 2
+#define CP_BASE 20
 
 /* §1.7 luminance ramp.  Slot 0 = ' ' (no-hit); slots 1..7 are the
  * actual visible glyphs.  Same ramp pattern as mandelbulb. */
-#define BOURKE_LEN  8
+#define BOURKE_LEN 8
 static const char k_bourke[BOURKE_LEN + 1] = " .:=+*#@";
 
 /* §1.8 debug overlays — d / D cycles between them. */
 typedef enum {
-    DEBUG_NORMAL    = 0,    /* full lit scene (production view)        */
-    DEBUG_NORMALS   = 1,    /* surface normal direction → colour       */
-    DEBUG_DEPTH     = 2,    /* hit distance t → brightness             */
-    DEBUG_STEPS     = 3,    /* march step count → brightness           */
-    DEBUG_MODE_COUNT = 4,
+  DEBUG_NORMAL = 0,  /* full lit scene (production view)        */
+  DEBUG_NORMALS = 1, /* surface normal direction → colour       */
+  DEBUG_DEPTH = 2,   /* hit distance t → brightness             */
+  DEBUG_STEPS = 3,   /* march step count → brightness           */
+  DEBUG_MODE_COUNT = 4,
 } DebugMode;
 
 static const char *DEBUG_MODE_NAMES[DEBUG_MODE_COUNT] = {
-    "NORMAL ", "NORMALS", "DEPTH  ", "STEPS  ",
+    "NORMAL ",
+    "NORMALS",
+    "DEPTH  ",
+    "STEPS  ",
 };
 
 /* ── §2 clock — monotonic timer ──────────────────────────────────────── */
 
-static double clock_now(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
+static double clock_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
 /* ── §3 color — themes + 2-pair HUD spec ─────────────────────────────── *
@@ -729,34 +731,32 @@ static const short k_palette[N_THEMES][GRAD_N] = {
     /* 1 Ember    red → orange → yellow fire (r=5 throughout)      */
     {196, 202, 203, 208, 209, 214, 220, 226},
     /* 2 Arctic   cyan → sky → lavender → white                    */
-    { 51,  87, 123, 159, 153, 189, 225, 231},
+    {51, 87, 123, 159, 153, 189, 225, 231},
     /* 3 Toxic    bright green → lime → yellow-green               */
-    { 46,  82, 118, 119, 154, 155, 190, 226},
+    {46, 82, 118, 119, 154, 155, 190, 226},
     /* 4 Neon     magenta → violet → pink → white                  */
     {201, 165, 171, 207, 177, 213, 219, 231},
 };
 
-static int g_theme        = 0;
-static int g_color_offset = 0;    /* rotated each tick for palette anim  */
+static int g_theme = 0;
+static int g_color_offset = 0; /* rotated each tick for palette anim  */
 
-static void colors_init(void)
-{
-    start_color();
-    use_default_colors();
+static void colors_init(void) {
+  start_color();
+  use_default_colors();
 
-    /* HUD pairs — theme-independent yellow + cyan per CLAUDE.md spec. */
-    if (COLORS >= 256) {
-        init_pair(CP_HUD,  226, -1);   /* bright yellow */
-        init_pair(CP_HINT,  51, -1);   /* bright cyan   */
-    } else {
-        init_pair(CP_HUD,  COLOR_YELLOW, -1);
-        init_pair(CP_HINT, COLOR_CYAN,   -1);
-    }
+  /* HUD pairs — theme-independent yellow + cyan per CLAUDE.md spec. */
+  if (COLORS >= 256) {
+    init_pair(CP_HUD, 226, -1); /* bright yellow */
+    init_pair(CP_HINT, 51, -1); /* bright cyan   */
+  } else {
+    init_pair(CP_HUD, COLOR_YELLOW, -1);
+    init_pair(CP_HINT, COLOR_CYAN, -1);
+  }
 
-    for (int th = 0; th < N_THEMES; th++)
-        for (int i = 0; i < GRAD_N; i++)
-            init_pair((short)(CP_BASE + th * GRAD_N + i),
-                      k_palette[th][i], -1);
+  for (int th = 0; th < N_THEMES; th++)
+    for (int i = 0; i < GRAD_N; i++)
+      init_pair((short)(CP_BASE + th * GRAD_N + i), k_palette[th][i], -1);
 }
 
 /*
@@ -772,41 +772,50 @@ static void colors_init(void)
  *   animation.  Pair index = CP_BASE + theme · GRAD_N + (col_idx +
  *   offset) mod GRAD_N.
  */
-static void pixel_to_cell(float luma, float col,
-                          char *ch_out, attr_t *attr_out)
-{
-    float lg = powf(luma > 0.0f ? luma : 0.0f, 0.45f);
-    int ri = (int)(lg * (float)(BOURKE_LEN - 1) + 0.5f);
-    if (ri < 1)            ri = 1;
-    if (ri >= BOURKE_LEN)  ri = BOURKE_LEN - 1;
-    *ch_out = k_bourke[ri];
+static void pixel_to_cell(float luma, float col, char *ch_out,
+                          attr_t *attr_out) {
+  float lg = powf(luma > 0.0f ? luma : 0.0f, 0.45f);
+  int ri = (int)(lg * (float)(BOURKE_LEN - 1) + 0.5f);
+  if (ri < 1)
+    ri = 1;
+  if (ri >= BOURKE_LEN)
+    ri = BOURKE_LEN - 1;
+  *ch_out = k_bourke[ri];
 
-    int gi = (int)(col * (float)(GRAD_N - 1) + 0.5f + g_color_offset) % GRAD_N;
-    if (gi < 0) gi += GRAD_N;
-    *attr_out = COLOR_PAIR(CP_BASE + g_theme * GRAD_N + gi) | A_BOLD;
+  int gi = (int)(col * (float)(GRAD_N - 1) + 0.5f + g_color_offset) % GRAD_N;
+  if (gi < 0)
+    gi += GRAD_N;
+  *attr_out = COLOR_PAIR(CP_BASE + g_theme * GRAD_N + gi) | A_BOLD;
 }
 
 /* ── §4 vec3 — value-type 3-D math ───────────────────────────────────── */
 
-typedef struct { float x, y, z; } Vec3;
+typedef struct {
+  float x, y, z;
+} Vec3;
 
-static inline Vec3  v3(float x, float y, float z) { return (Vec3){x,y,z}; }
-static inline Vec3  v3add(Vec3 a, Vec3 b)  { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
-static inline Vec3  v3sub(Vec3 a, Vec3 b)  { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
-static inline Vec3  v3mul(Vec3 a, float s) { return v3(a.x*s,   a.y*s,   a.z*s);   }
-static inline float v3dot(Vec3 a, Vec3 b)  { return a.x*b.x + a.y*b.y + a.z*b.z;   }
-static inline float v3len(Vec3 a)          { return sqrtf(v3dot(a,a));               }
-static inline Vec3  v3neg(Vec3 a)          { return v3(-a.x,-a.y,-a.z);             }
-static inline Vec3  v3cross(Vec3 a, Vec3 b)
-{
-    return v3(a.y*b.z - a.z*b.y,
-              a.z*b.x - a.x*b.z,
-              a.x*b.y - a.y*b.x);
+static inline Vec3 v3(float x, float y, float z) { return (Vec3){x, y, z}; }
+static inline Vec3 v3add(Vec3 a, Vec3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
-static inline Vec3 v3norm(Vec3 a)
-{
-    float l = v3len(a);
-    return l > 1e-9f ? v3mul(a, 1.0f / l) : v3(0, 1, 0);
+static inline Vec3 v3sub(Vec3 a, Vec3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline Vec3 v3mul(Vec3 a, float s) {
+  return v3(a.x * s, a.y * s, a.z * s);
+}
+static inline float v3dot(Vec3 a, Vec3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3len(Vec3 a) { return sqrtf(v3dot(a, a)); }
+static inline Vec3 v3neg(Vec3 a) { return v3(-a.x, -a.y, -a.z); }
+static inline Vec3 v3cross(Vec3 a, Vec3 b) {
+  return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x);
+}
+static inline Vec3 v3norm(Vec3 a) {
+  float l = v3len(a);
+  return l > 1e-9f ? v3mul(a, 1.0f / l) : v3(0, 1, 0);
 }
 
 /* ── §5 SDF primitives ───────────────────────────────────────────────── *
@@ -817,46 +826,45 @@ static inline Vec3 v3norm(Vec3 a)
  *   SDF2 — distance + material colour signal (T3).  Every scene
  *   returns this; the renderer reads .d to march and .col to colour.
  */
-typedef struct { float d; float col; } SDF2;
+typedef struct {
+  float d;
+  float col;
+} SDF2;
 
 /* Sphere centred at origin, radius r. */
-static float sdSphere(Vec3 p, float r)
-{
-    return v3len(p) - r;
-}
+static float sdSphere(Vec3 p, float r) { return v3len(p) - r; }
 
 /* Capsule — line segment from a to b, radius r. */
-static float sdCapsule(Vec3 p, Vec3 a, Vec3 b, float r)
-{
-    Vec3  ab = v3sub(b, a);
-    Vec3  ap = v3sub(p, a);
-    float t  = v3dot(ap, ab) / v3dot(ab, ab);
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
-    return v3len(v3sub(p, v3add(a, v3mul(ab, t)))) - r;
+static float sdCapsule(Vec3 p, Vec3 a, Vec3 b, float r) {
+  Vec3 ab = v3sub(b, a);
+  Vec3 ap = v3sub(p, a);
+  float t = v3dot(ap, ab) / v3dot(ab, ab);
+  if (t < 0.0f)
+    t = 0.0f;
+  if (t > 1.0f)
+    t = 1.0f;
+  return v3len(v3sub(p, v3add(a, v3mul(ab, t)))) - r;
 }
 
 /* Torus in the xz plane.  Major radius R (centre circle), tube r. */
-static float sdTorus(Vec3 p, float R, float r)
-{
-    float qx = sqrtf(p.x*p.x + p.z*p.z) - R;
-    return sqrtf(qx*qx + p.y*p.y) - r;
+static float sdTorus(Vec3 p, float R, float r) {
+  float qx = sqrtf(p.x * p.x + p.z * p.z) - R;
+  return sqrtf(qx * qx + p.y * p.y) - r;
 }
 
 /*
  * Round box: half-extents b, corner radius r.  Quílez exact box SDF
  * minus r to offset the surface outward (rounded corners).
  */
-static float sdRoundBox(Vec3 p, Vec3 b, float r)
-{
-    float qx = fabsf(p.x) - b.x;
-    float qy = fabsf(p.y) - b.y;
-    float qz = fabsf(p.z) - b.z;
-    float ex  = qx > 0.0f ? qx : 0.0f;
-    float ey  = qy > 0.0f ? qy : 0.0f;
-    float ez  = qz > 0.0f ? qz : 0.0f;
-    float ins = fminf(fmaxf(qx, fmaxf(qy, qz)), 0.0f);
-    return sqrtf(ex*ex + ey*ey + ez*ez) + ins - r;
+static float sdRoundBox(Vec3 p, Vec3 b, float r) {
+  float qx = fabsf(p.x) - b.x;
+  float qy = fabsf(p.y) - b.y;
+  float qz = fabsf(p.z) - b.z;
+  float ex = qx > 0.0f ? qx : 0.0f;
+  float ey = qy > 0.0f ? qy : 0.0f;
+  float ez = qz > 0.0f ? qz : 0.0f;
+  float ins = fminf(fmaxf(qx, fmaxf(qy, qz)), 0.0f);
+  return sqrtf(ex * ex + ey * ey + ez * ez) + ins - r;
 }
 
 /* ── §6 SDF operators — smin, twist, domain repetition ───────────────── *
@@ -873,29 +881,27 @@ static float sdRoundBox(Vec3 p, Vec3 b, float r)
 
 /* smin — Quílez polynomial smooth-min (T4).  k controls the bead
  * width; k = 0 is a hard min (sharp join). */
-static float smin(float a, float b, float k)
-{
-    if (k < 1e-6f) return a < b ? a : b;
-    float h = fmaxf(k - fabsf(a - b), 0.0f) / k;
-    return fminf(a, b) - h * h * k * 0.25f;
+static float smin(float a, float b, float k) {
+  if (k < 1e-6f)
+    return a < b ? a : b;
+  float h = fmaxf(k - fabsf(a - b), 0.0f) / k;
+  return fminf(a, b) - h * h * k * 0.25f;
 }
 
 /* twist — rotate p around the Y axis by angle = p.y · k.  Bottom
  * (p.y → 0) is unrotated; top (p.y → 1) is rotated by k radians.
  * Apply BEFORE evaluating the SDF.  T4. */
-static Vec3 twist(Vec3 p, float k)
-{
-    float angle = p.y * k;
-    float c = cosf(angle), s = sinf(angle);
-    return v3(c*p.x - s*p.z, p.y, s*p.x + c*p.z);
+static Vec3 twist(Vec3 p, float k) {
+  float angle = p.y * k;
+  float c = cosf(angle), s = sinf(angle);
+  return v3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
 }
 
 /* domain_rep_xz — fold p into a single cell on the xz lattice.  T4. */
-static Vec3 domain_rep_xz(Vec3 p, float cell)
-{
-    p.x -= cell * roundf(p.x / cell);
-    p.z -= cell * roundf(p.z / cell);
-    return p;
+static Vec3 domain_rep_xz(Vec3 p, float cell) {
+  p.x -= cell * roundf(p.x / cell);
+  p.z -= cell * roundf(p.z / cell);
+  return p;
 }
 
 /* ── §7 scene cache — per-frame trig hoisted out of the SDF hot loop ── *
@@ -910,33 +916,32 @@ static Vec3 domain_rep_xz(Vec3 p, float cell)
  * (and treat the `t` parameter as decorative).
  */
 typedef struct {
-    /* scene 1: blend */
-    float scene1_sep;            /* 0.55 + 0.38 · cos(t · 0.70)         */
-    float scene1_k;              /* 0.14 + 0.11 · sin(t · 0.50)         */
-    /* scene 2: boolean — Y-rotation matrix entries */
-    float scene2_rot_c, scene2_rot_s;     /* cos/sin(t · 0.28)          */
-    /* scene 3: twist — current twist strength */
-    float scene3_twist_k;        /* 1.85 · sin(t · 0.48)                */
-    /* scene 5: sculpt — Y-rotation matrix entries */
-    float scene5_rot_c, scene5_rot_s;     /* cos/sin(t · 0.38)          */
+  /* scene 1: blend */
+  float scene1_sep; /* 0.55 + 0.38 · cos(t · 0.70)         */
+  float scene1_k;   /* 0.14 + 0.11 · sin(t · 0.50)         */
+  /* scene 2: boolean — Y-rotation matrix entries */
+  float scene2_rot_c, scene2_rot_s; /* cos/sin(t · 0.28)          */
+  /* scene 3: twist — current twist strength */
+  float scene3_twist_k; /* 1.85 · sin(t · 0.48)                */
+  /* scene 5: sculpt — Y-rotation matrix entries */
+  float scene5_rot_c, scene5_rot_s; /* cos/sin(t · 0.38)          */
 } SceneCache;
 
 static SceneCache g_scene_cache;
 
-static void scene_cache_update(float t)
-{
-    g_scene_cache.scene1_sep    = 0.55f + 0.38f * cosf(t * 0.70f);
-    g_scene_cache.scene1_k      = 0.14f + 0.11f * sinf(t * 0.50f);
+static void scene_cache_update(float t) {
+  g_scene_cache.scene1_sep = 0.55f + 0.38f * cosf(t * 0.70f);
+  g_scene_cache.scene1_k = 0.14f + 0.11f * sinf(t * 0.50f);
 
-    float a2 = t * 0.28f;
-    g_scene_cache.scene2_rot_c  = cosf(a2);
-    g_scene_cache.scene2_rot_s  = sinf(a2);
+  float a2 = t * 0.28f;
+  g_scene_cache.scene2_rot_c = cosf(a2);
+  g_scene_cache.scene2_rot_s = sinf(a2);
 
-    g_scene_cache.scene3_twist_k = 1.85f * sinf(t * 0.48f);
+  g_scene_cache.scene3_twist_k = 1.85f * sinf(t * 0.48f);
 
-    float a5 = t * 0.38f;
-    g_scene_cache.scene5_rot_c  = cosf(a5);
-    g_scene_cache.scene5_rot_s  = sinf(a5);
+  float a5 = t * 0.38f;
+  g_scene_cache.scene5_rot_c = cosf(a5);
+  g_scene_cache.scene5_rot_s = sinf(a5);
 }
 
 /* ── §8 scene 1: blend — smooth union of sphere + sphere + torus ─────── *
@@ -951,21 +956,20 @@ static void scene_cache_update(float t)
  * col = radial distance from origin / 1.3 — shows how the surface
  * gradient varies from centre to edge.
  */
-static SDF2 scene1_blend(Vec3 p, float t)
-{
-    (void)t;                                /* trig hoisted to g_scene_cache */
-    float sep = g_scene_cache.scene1_sep;
-    float k   = g_scene_cache.scene1_k;
+static SDF2 scene1_blend(Vec3 p, float t) {
+  (void)t; /* trig hoisted to g_scene_cache */
+  float sep = g_scene_cache.scene1_sep;
+  float k = g_scene_cache.scene1_k;
 
-    float s1 = sdSphere(v3sub(p, v3(-sep,  0.0f, 0.0f)), 0.48f);
-    float s2 = sdSphere(v3sub(p, v3( sep,  0.0f, 0.0f)), 0.48f);
-    float to = sdTorus(p, 0.62f, 0.17f);
+  float s1 = sdSphere(v3sub(p, v3(-sep, 0.0f, 0.0f)), 0.48f);
+  float s2 = sdSphere(v3sub(p, v3(sep, 0.0f, 0.0f)), 0.48f);
+  float to = sdTorus(p, 0.62f, 0.17f);
 
-    float d = smin(smin(s1, s2, k), to, k * 0.75f);
+  float d = smin(smin(s1, s2, k), to, k * 0.75f);
 
-    float r   = v3len(p) / 1.3f;
-    float col = r > 1.0f ? 1.0f : (r < 0.0f ? 0.0f : r);
-    return (SDF2){d, col};
+  float r = v3len(p) / 1.3f;
+  float col = r > 1.0f ? 1.0f : (r < 0.0f ? 0.0f : r);
+  return (SDF2){d, col};
 }
 
 /* ── §9 scene 2: boolean — union / intersection / subtraction ────────── *
@@ -980,39 +984,46 @@ static SDF2 scene1_blend(Vec3 p, float t)
  * with its colour band (col = 0.15 / 0.50 / 0.85).  A slow Y rotation
  * is applied to the whole scene so all sides become visible.
  */
-static SDF2 scene2_boolean(Vec3 p, float t)
-{
-    (void)t;                                /* trig hoisted to g_scene_cache */
-    /* slow Y rotation around the whole scene */
-    float c = g_scene_cache.scene2_rot_c;
-    float s = g_scene_cache.scene2_rot_s;
-    Vec3  pr = v3(c*p.x - s*p.z, p.y, s*p.x + c*p.z);
+static SDF2 scene2_boolean(Vec3 p, float t) {
+  (void)t; /* trig hoisted to g_scene_cache */
+  /* slow Y rotation around the whole scene */
+  float c = g_scene_cache.scene2_rot_c;
+  float s = g_scene_cache.scene2_rot_s;
+  Vec3 pr = v3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
 
-    /* LEFT — union of sphere and round box */
-    Vec3  pl  = v3sub(pr, v3(-2.0f, 0.0f, 0.0f));
-    float la  = sdSphere(pl, 0.60f);
-    float lb  = sdRoundBox(v3sub(pl, v3(0.25f,0.25f,0.25f)),
-                            v3(0.38f,0.38f,0.38f), 0.05f);
-    float ld  = fminf(la, lb);                /* min = union */
+  /* LEFT — union of sphere and round box */
+  Vec3 pl = v3sub(pr, v3(-2.0f, 0.0f, 0.0f));
+  float la = sdSphere(pl, 0.60f);
+  float lb = sdRoundBox(v3sub(pl, v3(0.25f, 0.25f, 0.25f)),
+                        v3(0.38f, 0.38f, 0.38f), 0.05f);
+  float ld = fminf(la, lb); /* min = union */
 
-    /* CENTRE — intersection of sphere and round box */
-    float ca  = sdSphere(pr, 0.65f);
-    float cb  = sdRoundBox(pr, v3(0.46f,0.46f,0.46f), 0.05f);
-    float cd  = fmaxf(ca, cb);                /* max = intersection */
+  /* CENTRE — intersection of sphere and round box */
+  float ca = sdSphere(pr, 0.65f);
+  float cb = sdRoundBox(pr, v3(0.46f, 0.46f, 0.46f), 0.05f);
+  float cd = fmaxf(ca, cb); /* max = intersection */
 
-    /* RIGHT — subtraction: sphere minus capsule */
-    Vec3  prr = v3sub(pr, v3(2.0f, 0.0f, 0.0f));
-    float ra  = sdSphere(prr, 0.62f);
-    float rb  = sdCapsule(prr, v3(0.0f,-0.75f,0.0f), v3(0.0f,0.75f,0.0f), 0.24f);
-    float rd  = fmaxf(ra, -rb);               /* max(a, −b) = subtraction */
+  /* RIGHT — subtraction: sphere minus capsule */
+  Vec3 prr = v3sub(pr, v3(2.0f, 0.0f, 0.0f));
+  float ra = sdSphere(prr, 0.62f);
+  float rb =
+      sdCapsule(prr, v3(0.0f, -0.75f, 0.0f), v3(0.0f, 0.75f, 0.0f), 0.24f);
+  float rd = fmaxf(ra, -rb); /* max(a, −b) = subtraction */
 
-    /* Argmin over the three columns; tag with that column's colour. */
-    float d, col;
-    if (ld <= cd && ld <= rd) { d = ld; col = 0.15f; }
-    else if (cd <= rd)        { d = cd; col = 0.50f; }
-    else                      { d = rd; col = 0.85f; }
+  /* Argmin over the three columns; tag with that column's colour. */
+  float d, col;
+  if (ld <= cd && ld <= rd) {
+    d = ld;
+    col = 0.15f;
+  } else if (cd <= rd) {
+    d = cd;
+    col = 0.50f;
+  } else {
+    d = rd;
+    col = 0.85f;
+  }
 
-    return (SDF2){d, col};
+  return (SDF2){d, col};
 }
 
 /* ── §10 scene 3: twist — rotated query point before SDF ─────────────── *
@@ -1027,16 +1038,15 @@ static SDF2 scene2_boolean(Vec3 p, float t)
  *
  * col = vertical position so the twist gradient is visible.
  */
-static SDF2 scene3_twist(Vec3 p, float t)
-{
-    (void)t;                                /* trig hoisted to g_scene_cache */
-    float twist_k = g_scene_cache.scene3_twist_k;
-    Vec3  tp      = twist(p, twist_k);
-    float d       = sdRoundBox(tp, v3(0.33f, 1.10f, 0.33f), 0.08f);
+static SDF2 scene3_twist(Vec3 p, float t) {
+  (void)t; /* trig hoisted to g_scene_cache */
+  float twist_k = g_scene_cache.scene3_twist_k;
+  Vec3 tp = twist(p, twist_k);
+  float d = sdRoundBox(tp, v3(0.33f, 1.10f, 0.33f), 0.08f);
 
-    float col = (p.y + 1.1f) / 2.2f;
-    col = col > 1.0f ? 1.0f : (col < 0.0f ? 0.0f : col);
-    return (SDF2){d, col};
+  float col = (p.y + 1.1f) / 2.2f;
+  col = col > 1.0f ? 1.0f : (col < 0.0f ? 0.0f : col);
+  return (SDF2){d, col};
 }
 
 /* ── §11 scene 4: repeat — domain-repeated sphere lattice ────────────── *
@@ -1049,19 +1059,18 @@ static SDF2 scene3_twist(Vec3 p, float t)
  * BEFORE the wrap — so the rainbow tint sweeps across the lattice
  * rather than repeating per cell.
  */
-static SDF2 scene4_repeat(Vec3 p, float t)
-{
-    (void)t;
-    float cell = 2.2f;
+static SDF2 scene4_repeat(Vec3 p, float t) {
+  (void)t;
+  float cell = 2.2f;
 
-    /* azimuth on ORIGINAL p — captured before the wrap */
-    float ang  = atan2f(p.z, p.x) / (2.0f * (float)M_PI) + 0.5f;
+  /* azimuth on ORIGINAL p — captured before the wrap */
+  float ang = atan2f(p.z, p.x) / (2.0f * (float)M_PI) + 0.5f;
 
-    /* fold p into a single cell */
-    Vec3 pr = domain_rep_xz(p, cell);
+  /* fold p into a single cell */
+  Vec3 pr = domain_rep_xz(p, cell);
 
-    float d = sdSphere(pr, 0.72f);
-    return (SDF2){d, ang};
+  float d = sdSphere(pr, 0.72f);
+  return (SDF2){d, ang};
 }
 
 /* ── §12 scene 5: sculpt — humanoid from seven smin'd primitives ─────── *
@@ -1076,56 +1085,59 @@ static SDF2 scene4_repeat(Vec3 p, float t)
  * Slow Y rotation (cached in g_scene_cache) so all four arms become
  * visible over time.
  */
-static SDF2 scene5_sculpt(Vec3 p, float t)
-{
-    (void)t;                                /* trig hoisted to g_scene_cache */
-    /* slow Y rotation */
-    float c = g_scene_cache.scene5_rot_c;
-    float s = g_scene_cache.scene5_rot_s;
-    Vec3  pr = v3(c*p.x - s*p.z, p.y, s*p.x + c*p.z);
+static SDF2 scene5_sculpt(Vec3 p, float t) {
+  (void)t; /* trig hoisted to g_scene_cache */
+  /* slow Y rotation */
+  float c = g_scene_cache.scene5_rot_c;
+  float s = g_scene_cache.scene5_rot_s;
+  Vec3 pr = v3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
 
-    float k  = 0.10f;             /* normal blend strength               */
-    float k2 = 0.06f;             /* tighter blend for the belt          */
+  float k = 0.10f;  /* normal blend strength               */
+  float k2 = 0.06f; /* tighter blend for the belt          */
 
-    float body = sdRoundBox(v3sub(pr, v3(0.0f, -0.35f, 0.0f)),
-                             v3(0.40f, 0.44f, 0.30f), 0.14f);
-    float head = sdSphere(v3sub(pr, v3(0.0f, 0.82f, 0.0f)), 0.27f);
-    float neck = sdCapsule(pr, v3(0.0f, 0.20f, 0.0f),
-                                v3(0.0f, 0.58f, 0.0f), 0.13f);
-    float belt = sdTorus(v3sub(pr, v3(0.0f, -0.62f, 0.0f)), 0.43f, 0.075f);
-    float armL = sdCapsule(pr, v3(-0.42f,-0.10f, 0.0f),
-                                v3(-0.86f,-0.52f, 0.0f), 0.10f);
-    float armR = sdCapsule(pr, v3( 0.42f,-0.10f, 0.0f),
-                                v3( 0.86f,-0.52f, 0.0f), 0.10f);
-    float armF = sdCapsule(pr, v3( 0.0f,-0.10f,  0.40f),
-                                v3( 0.0f,-0.52f,  0.82f), 0.09f);
-    float armB = sdCapsule(pr, v3( 0.0f,-0.10f, -0.40f),
-                                v3( 0.0f,-0.52f, -0.82f), 0.09f);
+  float body = sdRoundBox(v3sub(pr, v3(0.0f, -0.35f, 0.0f)),
+                          v3(0.40f, 0.44f, 0.30f), 0.14f);
+  float head = sdSphere(v3sub(pr, v3(0.0f, 0.82f, 0.0f)), 0.27f);
+  float neck =
+      sdCapsule(pr, v3(0.0f, 0.20f, 0.0f), v3(0.0f, 0.58f, 0.0f), 0.13f);
+  float belt = sdTorus(v3sub(pr, v3(0.0f, -0.62f, 0.0f)), 0.43f, 0.075f);
+  float armL =
+      sdCapsule(pr, v3(-0.42f, -0.10f, 0.0f), v3(-0.86f, -0.52f, 0.0f), 0.10f);
+  float armR =
+      sdCapsule(pr, v3(0.42f, -0.10f, 0.0f), v3(0.86f, -0.52f, 0.0f), 0.10f);
+  float armF =
+      sdCapsule(pr, v3(0.0f, -0.10f, 0.40f), v3(0.0f, -0.52f, 0.82f), 0.09f);
+  float armB =
+      sdCapsule(pr, v3(0.0f, -0.10f, -0.40f), v3(0.0f, -0.52f, -0.82f), 0.09f);
 
-    float d = smin(body, head, k);
-    d = smin(d, neck, k);
-    d = smin(d, belt, k2);
-    d = smin(d, armL, k);
-    d = smin(d, armR, k);
-    d = smin(d, armF, k);
-    d = smin(d, armB, k);
+  float d = smin(body, head, k);
+  d = smin(d, neck, k);
+  d = smin(d, belt, k2);
+  d = smin(d, armL, k);
+  d = smin(d, armR, k);
+  d = smin(d, armF, k);
+  d = smin(d, armB, k);
 
-    float col = (pr.y + 1.0f) / 2.2f;
-    col = col > 1.0f ? 1.0f : (col < 0.0f ? 0.0f : col);
-    return (SDF2){d, col};
+  float col = (pr.y + 1.0f) / 2.2f;
+  col = col > 1.0f ? 1.0f : (col < 0.0f ? 0.0f : col);
+  return (SDF2){d, col};
 }
 
 /* ── §13 scene_map — dispatch by preset index (T1) ───────────────────── */
 
-static SDF2 scene_map(int preset, Vec3 p, float t)
-{
-    switch (preset) {
-    case 0: return scene1_blend  (p, t);
-    case 1: return scene2_boolean(p, t);
-    case 2: return scene3_twist  (p, t);
-    case 3: return scene4_repeat (p, t);
-    default: return scene5_sculpt(p, t);
-    }
+static SDF2 scene_map(int preset, Vec3 p, float t) {
+  switch (preset) {
+  case 0:
+    return scene1_blend(p, t);
+  case 1:
+    return scene2_boolean(p, t);
+  case 2:
+    return scene3_twist(p, t);
+  case 3:
+    return scene4_repeat(p, t);
+  default:
+    return scene5_sculpt(p, t);
+  }
 }
 
 /* ── §14 march — 4-tap normal, shadow, AO, trace + step count ────────── */
@@ -1144,22 +1156,21 @@ static SDF2 scene_map(int preset, Vec3 p, float t)
  * offsets share an axis → cleaner normals at sharp features (the
  * smin'd corner regions in scene 5, the box edges in scene 3).
  */
-static Vec3 sdf_normal(int preset, Vec3 p, float t)
-{
-    const float e = NORM_H;
-    Vec3 k0 = v3( e, -e, -e);
-    Vec3 k1 = v3(-e, -e,  e);
-    Vec3 k2 = v3(-e,  e, -e);
-    Vec3 k3 = v3( e,  e,  e);
+static Vec3 sdf_normal(int preset, Vec3 p, float t) {
+  const float e = NORM_H;
+  Vec3 k0 = v3(e, -e, -e);
+  Vec3 k1 = v3(-e, -e, e);
+  Vec3 k2 = v3(-e, e, -e);
+  Vec3 k3 = v3(e, e, e);
 
-    float d0 = scene_map(preset, v3add(p, k0), t).d;
-    float d1 = scene_map(preset, v3add(p, k1), t).d;
-    float d2 = scene_map(preset, v3add(p, k2), t).d;
-    float d3 = scene_map(preset, v3add(p, k3), t).d;
+  float d0 = scene_map(preset, v3add(p, k0), t).d;
+  float d1 = scene_map(preset, v3add(p, k1), t).d;
+  float d2 = scene_map(preset, v3add(p, k2), t).d;
+  float d3 = scene_map(preset, v3add(p, k3), t).d;
 
-    Vec3 n = v3add(v3add(v3mul(k0, d0), v3mul(k1, d1)),
-                   v3add(v3mul(k2, d2), v3mul(k3, d3)));
-    return v3norm(n);
+  Vec3 n = v3add(v3add(v3mul(k0, d0), v3mul(k1, d1)),
+                 v3add(v3mul(k2, d2), v3mul(k3, d3)));
+  return v3norm(n);
 }
 
 /*
@@ -1167,18 +1178,19 @@ static Vec3 sdf_normal(int preset, Vec3 p, float t)
  * visibility in [SH_FLOOR, 1].  SH_FLOOR keeps fully-shadowed
  * pixels readable rather than collapsing to ' '.
  */
-static float sdf_shadow(int preset, Vec3 ro, Vec3 rd, float t)
-{
-    float res = 1.0f;
-    float tm  = 0.025f;
-    for (int i = 0; i < SH_STEPS && tm < MARCH_FAR; i++) {
-        float d = scene_map(preset, v3add(ro, v3mul(rd, tm)), t).d;
-        if (d < MARCH_EPS) return SH_FLOOR;
-        float r = SH_K * d / tm;
-        if (r < res) res = r;
-        tm += d;
-    }
-    return res < SH_FLOOR ? SH_FLOOR : res;
+static float sdf_shadow(int preset, Vec3 ro, Vec3 rd, float t) {
+  float res = 1.0f;
+  float tm = 0.025f;
+  for (int i = 0; i < SH_STEPS && tm < MARCH_FAR; i++) {
+    float d = scene_map(preset, v3add(ro, v3mul(rd, tm)), t).d;
+    if (d < MARCH_EPS)
+      return SH_FLOOR;
+    float r = SH_K * d / tm;
+    if (r < res)
+      res = r;
+    tm += d;
+  }
+  return res < SH_FLOOR ? SH_FLOOR : res;
 }
 
 /*
@@ -1186,17 +1198,16 @@ static float sdf_shadow(int preset, Vec3 ro, Vec3 rd, float t)
  * Accumulates the deficit between marched distance and SDF reading;
  * larger deficit ⇒ more nearby geometry ⇒ more occlusion.
  */
-static float sdf_ao(int preset, Vec3 p, Vec3 N, float t)
-{
-    float occ = 0.0f, wt = 1.0f;
-    for (int i = 1; i <= AO_STEPS; i++) {
-        float dist = (float)i * AO_STEP;
-        float d    = scene_map(preset, v3add(p, v3mul(N, dist)), t).d;
-        occ += wt * (dist - d);
-        wt  *= AO_DECAY;
-    }
-    float ao = 1.0f - 2.0f * occ;
-    return ao < 0.0f ? 0.0f : (ao > 1.0f ? 1.0f : ao);
+static float sdf_ao(int preset, Vec3 p, Vec3 N, float t) {
+  float occ = 0.0f, wt = 1.0f;
+  for (int i = 1; i <= AO_STEPS; i++) {
+    float dist = (float)i * AO_STEP;
+    float d = scene_map(preset, v3add(p, v3mul(N, dist)), t).d;
+    occ += wt * (dist - d);
+    wt *= AO_DECAY;
+  }
+  float ao = 1.0f - 2.0f * occ;
+  return ao < 0.0f ? 0.0f : (ao > 1.0f ? 1.0f : ao);
 }
 
 /*
@@ -1205,25 +1216,25 @@ static float sdf_ao(int preset, Vec3 p, Vec3 N, float t)
  * via *out_steps.  Twist scene uses MARCH_TW (smaller step) because
  * its DE is non-Lipschitz (T5).
  */
-static float sdf_march(int preset, Vec3 ro, Vec3 rd, float t,
-                       float *col_out, int *out_steps)
-{
-    float step_scale = (preset == 2) ? MARCH_TW : MARCH_STEP;
-    float tm = 0.0f;
-    int   step;
-    for (step = 0; step < MARCH_MAX; step++) {
-        Vec3 p = v3add(ro, v3mul(rd, tm));
-        SDF2 s = scene_map(preset, p, t);
-        if (s.d < MARCH_EPS) {
-            *col_out   = s.col;
-            *out_steps = step + 1;
-            return tm;
-        }
-        if (tm > MARCH_FAR) break;
-        tm += s.d * step_scale;
+static float sdf_march(int preset, Vec3 ro, Vec3 rd, float t, float *col_out,
+                       int *out_steps) {
+  float step_scale = (preset == 2) ? MARCH_TW : MARCH_STEP;
+  float tm = 0.0f;
+  int step;
+  for (step = 0; step < MARCH_MAX; step++) {
+    Vec3 p = v3add(ro, v3mul(rd, tm));
+    SDF2 s = scene_map(preset, p, t);
+    if (s.d < MARCH_EPS) {
+      *col_out = s.col;
+      *out_steps = step + 1;
+      return tm;
     }
-    *out_steps = step;
-    return -1.0f;
+    if (tm > MARCH_FAR)
+      break;
+    tm += s.d * step_scale;
+  }
+  *out_steps = step;
+  return -1.0f;
 }
 
 /* ── §15 shade — three lighting modes (T7) ───────────────────────────── *
@@ -1234,41 +1245,40 @@ static float sdf_march(int preset, Vec3 ro, Vec3 rd, float t,
  *                            + RIM_STR·KD·ndl_rim
  *      mode 2 (Flat)    1.0  (col only, no shape gradient)
  */
-static float shade_luma(int preset, Vec3 hit, Vec3 N, Vec3 V,
-                        Vec3 key_L, Vec3 fill_L, Vec3 rim_L,
-                        float t, bool do_shadow, bool do_ao, int light_mode)
-{
-    if (light_mode == 2) return 1.0f;
+static float shade_luma(int preset, Vec3 hit, Vec3 N, Vec3 V, Vec3 key_L,
+                        Vec3 fill_L, Vec3 rim_L, float t, bool do_shadow,
+                        bool do_ao, int light_mode) {
+  if (light_mode == 2)
+    return 1.0f;
 
-    float ao = 1.0f;
-    if (do_ao) ao = sdf_ao(preset, hit, N, t);
+  float ao = 1.0f;
+  if (do_ao)
+    ao = sdf_ao(preset, hit, N, t);
 
-    if (light_mode == 0) {
-        /* N·V — brightness from how directly surface faces the camera */
-        float ndv  = fmaxf(0.0f, v3dot(N, V));
-        float luma = KA + KD * ndv * ao;
-        return luma > 1.0f ? 1.0f : luma;
-    }
-
-    /* Phong (light_mode == 1) */
-    float ndl_key  = fmaxf(0.0f, v3dot(N, key_L));
-    float ndl_fill = fmaxf(0.0f, v3dot(N, fill_L));
-    float ndl_rim  = fmaxf(0.0f, v3dot(N, rim_L));
-
-    Vec3  R    = v3sub(v3mul(N, 2.0f * ndl_key), key_L);
-    float spec = powf(fmaxf(0.0f, v3dot(R, V)), SHIN);
-
-    float sh = 1.0f;
-    if (do_shadow) {
-        Vec3 sro = v3add(hit, v3mul(N, 0.010f));      /* offset off surface */
-        sh = sdf_shadow(preset, sro, key_L, t);
-    }
-
-    float luma = KA
-               + (KD * ndl_key + KS * spec) * sh * ao
-               + FILL_STR * KD * ndl_fill * ao
-               + RIM_STR  * KD * ndl_rim;
+  if (light_mode == 0) {
+    /* N·V — brightness from how directly surface faces the camera */
+    float ndv = fmaxf(0.0f, v3dot(N, V));
+    float luma = KA + KD * ndv * ao;
     return luma > 1.0f ? 1.0f : luma;
+  }
+
+  /* Phong (light_mode == 1) */
+  float ndl_key = fmaxf(0.0f, v3dot(N, key_L));
+  float ndl_fill = fmaxf(0.0f, v3dot(N, fill_L));
+  float ndl_rim = fmaxf(0.0f, v3dot(N, rim_L));
+
+  Vec3 R = v3sub(v3mul(N, 2.0f * ndl_key), key_L);
+  float spec = powf(fmaxf(0.0f, v3dot(R, V)), SHIN);
+
+  float sh = 1.0f;
+  if (do_shadow) {
+    Vec3 sro = v3add(hit, v3mul(N, 0.010f)); /* offset off surface */
+    sh = sdf_shadow(preset, sro, key_L, t);
+  }
+
+  float luma = KA + (KD * ndl_key + KS * spec) * sh * ao +
+               FILL_STR * KD * ndl_fill * ao + RIM_STR * KD * ndl_rim;
+  return luma > 1.0f ? 1.0f : luma;
 }
 
 /* ── §16 cast_pixel — full per-pixel pipeline → Pixel ────────────────── *
@@ -1279,50 +1289,47 @@ static float shade_luma(int preset, Vec3 hit, Vec3 N, Vec3 V,
  * remapping).
  */
 typedef struct {
-    float luma;
-    float col;
-    Vec3  N;            /* surface normal at hit (for DEBUG_NORMALS)    */
-    float hit_t;        /* ray distance at hit   (for DEBUG_DEPTH)      */
-    int   steps;        /* march iterations      (for DEBUG_STEPS)      */
-    bool  hit;
+  float luma;
+  float col;
+  Vec3 N;      /* surface normal at hit (for DEBUG_NORMALS)    */
+  float hit_t; /* ray distance at hit   (for DEBUG_DEPTH)      */
+  int steps;   /* march iterations      (for DEBUG_STEPS)      */
+  bool hit;
 } Pixel;
 
-static Pixel cast_pixel(int px, int py, int cw, int ch,
-                        Vec3 cam_pos, Vec3 fwd, Vec3 right, Vec3 up,
-                        int preset, float scene_t,
-                        Vec3 key_L, Vec3 fill_L, Vec3 rim_L,
-                        bool do_shadow, bool do_ao, int light_mode)
-{
-    Pixel out = {0.0f, 0.0f, {0,0,1}, 0.0f, 0, false};
+static Pixel cast_pixel(int px, int py, int cw, int ch, Vec3 cam_pos, Vec3 fwd,
+                        Vec3 right, Vec3 up, int preset, float scene_t,
+                        Vec3 key_L, Vec3 fill_L, Vec3 rim_L, bool do_shadow,
+                        bool do_ao, int light_mode) {
+  Pixel out = {0.0f, 0.0f, {0, 0, 1}, 0.0f, 0, false};
 
-    float u      = ((float)px + 0.5f) / (float)cw * 2.0f - 1.0f;
-    float v      = -(((float)py + 0.5f) / (float)ch * 2.0f - 1.0f);
-    float aspect = ((float)ch * CELL_ASPECT) / (float)cw;
+  float u = ((float)px + 0.5f) / (float)cw * 2.0f - 1.0f;
+  float v = -(((float)py + 0.5f) / (float)ch * 2.0f - 1.0f);
+  float aspect = ((float)ch * CELL_ASPECT) / (float)cw;
 
-    Vec3 rd = v3norm(v3add(
-        v3add(v3mul(right, u * FOV_HALF_TAN),
-              v3mul(up,    v * FOV_HALF_TAN * aspect)),
-        fwd));
+  Vec3 rd = v3norm(v3add(v3add(v3mul(right, u * FOV_HALF_TAN),
+                               v3mul(up, v * FOV_HALF_TAN * aspect)),
+                         fwd));
 
-    float col_val = 0.0f;
-    int   steps   = 0;
-    float hit_t   = sdf_march(preset, cam_pos, rd, scene_t, &col_val, &steps);
-    out.steps = steps;
-    if (hit_t < 0.0f) return out;
-
-    out.hit   = true;
-    out.col   = col_val;
-    out.hit_t = hit_t;
-
-    Vec3 hit = v3add(cam_pos, v3mul(rd, hit_t));
-    Vec3 N   = sdf_normal(preset, hit, scene_t);
-    Vec3 V   = v3norm(v3sub(cam_pos, hit));
-    out.N    = N;
-
-    out.luma = shade_luma(preset, hit, N, V,
-                          key_L, fill_L, rim_L,
-                          scene_t, do_shadow, do_ao, light_mode);
+  float col_val = 0.0f;
+  int steps = 0;
+  float hit_t = sdf_march(preset, cam_pos, rd, scene_t, &col_val, &steps);
+  out.steps = steps;
+  if (hit_t < 0.0f)
     return out;
+
+  out.hit = true;
+  out.col = col_val;
+  out.hit_t = hit_t;
+
+  Vec3 hit = v3add(cam_pos, v3mul(rd, hit_t));
+  Vec3 N = sdf_normal(preset, hit, scene_t);
+  Vec3 V = v3norm(v3sub(cam_pos, hit));
+  out.N = N;
+
+  out.luma = shade_luma(preset, hit, N, V, key_L, fill_L, rim_L, scene_t,
+                        do_shadow, do_ao, light_mode);
+  return out;
 }
 
 /* ── §17 canvas — full-frame render + production draw + debug ────────── *
@@ -1339,24 +1346,24 @@ static Pixel cast_pixel(int px, int py, int cw, int ch,
  * camera, even though cam_phi advances every tick.
  */
 
-static Pixel g_fbuf  [CANVAS_MAX_H][CANVAS_MAX_W];
+static Pixel g_fbuf[CANVAS_MAX_H][CANVAS_MAX_W];
 static Pixel g_stable[CANVAS_MAX_H][CANVAS_MAX_W];
-static int   g_render_row = 0;
-static bool  g_dirty      = true;
+static int g_render_row = 0;
+static bool g_dirty = true;
 
 static Vec3 g_snap_cam, g_snap_fwd, g_snap_right, g_snap_up;
 
 static void camera_basis(float cam_dist, float cam_theta, float cam_phi,
-                         Vec3 *cam_pos, Vec3 *fwd, Vec3 *right, Vec3 *up)
-{
-    float ct = cosf(cam_theta), st = sinf(cam_theta);
-    float cp = cosf(cam_phi),   sp = sinf(cam_phi);
-    *cam_pos = v3mul(v3(ct*cp, st, ct*sp), cam_dist);
-    *fwd     = v3norm(v3neg(*cam_pos));
-    /* gimbal-lock guard: swap world-up when fwd nearly aligns with it */
-    Vec3 wup = (fabsf(v3dot(*fwd, v3(0,1,0))) > 0.99f) ? v3(0,0,1) : v3(0,1,0);
-    *right   = v3norm(v3cross(*fwd, wup));
-    *up      = v3cross(*right, *fwd);
+                         Vec3 *cam_pos, Vec3 *fwd, Vec3 *right, Vec3 *up) {
+  float ct = cosf(cam_theta), st = sinf(cam_theta);
+  float cp = cosf(cam_phi), sp = sinf(cam_phi);
+  *cam_pos = v3mul(v3(ct * cp, st, ct * sp), cam_dist);
+  *fwd = v3norm(v3neg(*cam_pos));
+  /* gimbal-lock guard: swap world-up when fwd nearly aligns with it */
+  Vec3 wup =
+      (fabsf(v3dot(*fwd, v3(0, 1, 0))) > 0.99f) ? v3(0, 0, 1) : v3(0, 1, 0);
+  *right = v3norm(v3cross(*fwd, wup));
+  *up = v3cross(*right, *fwd);
 }
 
 /*
@@ -1365,33 +1372,28 @@ static void camera_basis(float cam_dist, float cam_theta, float cam_phi,
  * always trips after `ch` rows — so each call returns true (frame
  * complete) and copies g_fbuf → g_stable.
  */
-static bool canvas_render_rows(int cw, int ch,
-                               int preset, float scene_t,
+static bool canvas_render_rows(int cw, int ch, int preset, float scene_t,
                                float cam_dist, float cam_theta, float cam_phi,
                                Vec3 key_L, Vec3 fill_L, Vec3 rim_L,
-                               bool do_shadow, bool do_ao, int light_mode)
-{
-    if (g_render_row == 0)
-        camera_basis(cam_dist, cam_theta, cam_phi,
-                     &g_snap_cam, &g_snap_fwd, &g_snap_right, &g_snap_up);
+                               bool do_shadow, bool do_ao, int light_mode) {
+  if (g_render_row == 0)
+    camera_basis(cam_dist, cam_theta, cam_phi, &g_snap_cam, &g_snap_fwd,
+                 &g_snap_right, &g_snap_up);
 
-    for (int k = 0; k < ROWS_PER_TICK; k++) {
-        int py = g_render_row;
-        for (int px = 0; px < cw; px++) {
-            g_fbuf[py][px] = cast_pixel(px, py, cw, ch,
-                                        g_snap_cam,
-                                        g_snap_fwd, g_snap_right, g_snap_up,
-                                        preset, scene_t,
-                                        key_L, fill_L, rim_L,
-                                        do_shadow, do_ao, light_mode);
-        }
-        if (++g_render_row >= ch) {
-            g_render_row = 0;
-            memcpy(g_stable, g_fbuf, sizeof g_stable);
-            return true;
-        }
+  for (int k = 0; k < ROWS_PER_TICK; k++) {
+    int py = g_render_row;
+    for (int px = 0; px < cw; px++) {
+      g_fbuf[py][px] = cast_pixel(
+          px, py, cw, ch, g_snap_cam, g_snap_fwd, g_snap_right, g_snap_up,
+          preset, scene_t, key_L, fill_L, rim_L, do_shadow, do_ao, light_mode);
     }
-    return false;
+    if (++g_render_row >= ch) {
+      g_render_row = 0;
+      memcpy(g_stable, g_fbuf, sizeof g_stable);
+      return true;
+    }
+  }
+  return false;
 }
 
 /* §17.1 production draw + three debug overlays.
@@ -1401,10 +1403,9 @@ static bool canvas_render_rows(int cw, int ch,
  * visualisation isn't smeared by perceptual remapping.
  */
 
-static const Pixel *canvas_row(int vy, int cw)
-{
-    (void)cw;
-    return (vy < g_render_row) ? g_fbuf[vy] : g_stable[vy];
+static const Pixel *canvas_row(int vy, int cw) {
+  (void)cw;
+  return (vy < g_render_row) ? g_fbuf[vy] : g_stable[vy];
 }
 
 /*
@@ -1412,292 +1413,311 @@ static const Pixel *canvas_row(int vy, int cw)
  * row 0 for the yellow status HUD and the last row for the cyan key
  * hint (CLAUDE.md spec).  Canvas occupies rows 1..rows-2.
  */
-static void canvas_offsets(int cw, int ch, int cols, int rows,
-                           int *out_off_x, int *out_off_y)
-{
-    *out_off_x = (cols - cw) / 2;
-    *out_off_y = 1 + (rows - 2 - ch) / 2;
-    if (*out_off_y < 1) *out_off_y = 1;
+static void canvas_offsets(int cw, int ch, int cols, int rows, int *out_off_x,
+                           int *out_off_y) {
+  *out_off_x = (cols - cw) / 2;
+  *out_off_y = 1 + (rows - 2 - ch) / 2;
+  if (*out_off_y < 1)
+    *out_off_y = 1;
 }
 
-static void canvas_draw(int cw, int ch, int cols, int rows)
-{
-    int off_x, off_y;
-    canvas_offsets(cw, ch, cols, rows, &off_x, &off_y);
+static void canvas_draw(int cw, int ch, int cols, int rows) {
+  int off_x, off_y;
+  canvas_offsets(cw, ch, cols, rows, &off_x, &off_y);
 
-    for (int vy = 0; vy < ch && vy < CANVAS_MAX_H; vy++) {
-        const Pixel *row_src = canvas_row(vy, cw);
-        for (int vx = 0; vx < cw && vx < CANVAS_MAX_W; vx++) {
-            const Pixel *px = &row_src[vx];
-            if (!px->hit) continue;
+  for (int vy = 0; vy < ch && vy < CANVAS_MAX_H; vy++) {
+    const Pixel *row_src = canvas_row(vy, cw);
+    for (int vx = 0; vx < cw && vx < CANVAS_MAX_W; vx++) {
+      const Pixel *px = &row_src[vx];
+      if (!px->hit)
+        continue;
 
-            char   ch_c;
-            attr_t attr;
-            pixel_to_cell(px->luma, px->col, &ch_c, &attr);
+      char ch_c;
+      attr_t attr;
+      pixel_to_cell(px->luma, px->col, &ch_c, &attr);
 
-            int tx = off_x + vx;
-            int ty = off_y + vy;
-            if (tx < 0 || tx >= cols || ty < 0 || ty >= rows - 1) continue;
-            attron(attr);
-            mvaddch(ty, tx, (chtype)(unsigned char)ch_c);
-            attroff(attr);
-        }
+      int tx = off_x + vx;
+      int ty = off_y + vy;
+      if (tx < 0 || tx >= cols || ty < 0 || ty >= rows - 1)
+        continue;
+      attron(attr);
+      mvaddch(ty, tx, (chtype)(unsigned char)ch_c);
+      attroff(attr);
     }
+  }
 }
 
 /* Simple glyph + slot for debug overlays — bypasses gamma. */
 static const char DEBUG_GLYPHS[] = " .:=+*#@";
 #define DEBUG_GLYPHS_N ((int)(sizeof DEBUG_GLYPHS - 1))
 
-static char debug_glyph(float v)
-{
-    int idx = (int)(v * (float)(DEBUG_GLYPHS_N - 1) + 0.5f);
-    if (idx < 1)              idx = 1;
-    if (idx >= DEBUG_GLYPHS_N) idx = DEBUG_GLYPHS_N - 1;
-    return DEBUG_GLYPHS[idx];
+static char debug_glyph(float v) {
+  int idx = (int)(v * (float)(DEBUG_GLYPHS_N - 1) + 0.5f);
+  if (idx < 1)
+    idx = 1;
+  if (idx >= DEBUG_GLYPHS_N)
+    idx = DEBUG_GLYPHS_N - 1;
+  return DEBUG_GLYPHS[idx];
 }
 
-static attr_t debug_attr(float v)
-{
-    int gi = (int)(v * (float)(GRAD_N - 1) + 0.5f) % GRAD_N;
-    if (gi < 0) gi += GRAD_N;
-    return COLOR_PAIR(CP_BASE + g_theme * GRAD_N + gi) | A_BOLD;
+static attr_t debug_attr(float v) {
+  int gi = (int)(v * (float)(GRAD_N - 1) + 0.5f) % GRAD_N;
+  if (gi < 0)
+    gi += GRAD_N;
+  return COLOR_PAIR(CP_BASE + g_theme * GRAD_N + gi) | A_BOLD;
 }
 
 /* NORMALS — hue from atan2(N.x, N.z); glyph from N.y · 0.5 + 0.5. */
-static void canvas_draw_normals(int cw, int ch, int cols, int rows)
-{
-    int off_x, off_y;
-    canvas_offsets(cw, ch, cols, rows, &off_x, &off_y);
+static void canvas_draw_normals(int cw, int ch, int cols, int rows) {
+  int off_x, off_y;
+  canvas_offsets(cw, ch, cols, rows, &off_x, &off_y);
 
-    for (int vy = 0; vy < ch && vy < CANVAS_MAX_H; vy++) {
-        const Pixel *row_src = canvas_row(vy, cw);
-        for (int vx = 0; vx < cw && vx < CANVAS_MAX_W; vx++) {
-            const Pixel *px = &row_src[vx];
-            if (!px->hit) continue;
+  for (int vy = 0; vy < ch && vy < CANVAS_MAX_H; vy++) {
+    const Pixel *row_src = canvas_row(vy, cw);
+    for (int vx = 0; vx < cw && vx < CANVAS_MAX_W; vx++) {
+      const Pixel *px = &row_src[vx];
+      if (!px->hit)
+        continue;
 
-            Vec3  N       = px->N;
-            float azimuth = atan2f(N.x, N.z) / (2.0f * (float)M_PI) + 0.5f;
-            float y_lit   = N.y * 0.5f + 0.5f;
-            if (y_lit < 0.0f) y_lit = 0.0f;
-            if (y_lit > 1.0f) y_lit = 1.0f;
+      Vec3 N = px->N;
+      float azimuth = atan2f(N.x, N.z) / (2.0f * (float)M_PI) + 0.5f;
+      float y_lit = N.y * 0.5f + 0.5f;
+      if (y_lit < 0.0f)
+        y_lit = 0.0f;
+      if (y_lit > 1.0f)
+        y_lit = 1.0f;
 
-            int tx = off_x + vx;
-            int ty = off_y + vy;
-            if (tx < 0 || tx >= cols || ty < 0 || ty >= rows - 1) continue;
-            attr_t attr = debug_attr(azimuth);
-            attron(attr);
-            mvaddch(ty, tx, (chtype)(unsigned char)debug_glyph(y_lit));
-            attroff(attr);
-        }
+      int tx = off_x + vx;
+      int ty = off_y + vy;
+      if (tx < 0 || tx >= cols || ty < 0 || ty >= rows - 1)
+        continue;
+      attr_t attr = debug_attr(azimuth);
+      attron(attr);
+      mvaddch(ty, tx, (chtype)(unsigned char)debug_glyph(y_lit));
+      attroff(attr);
     }
+  }
 }
 
 /* DEPTH — hit distance t → brightness.  Closer = brighter. */
 static void canvas_draw_depth(int cw, int ch, int cols, int rows,
-                              float cam_dist)
-{
-    int off_x, off_y;
-    canvas_offsets(cw, ch, cols, rows, &off_x, &off_y);
+                              float cam_dist) {
+  int off_x, off_y;
+  canvas_offsets(cw, ch, cols, rows, &off_x, &off_y);
 
-    /* Bracket t by camera distance so closer hits ≈ 1. */
-    float t_min = cam_dist - 1.5f;
-    float t_max = cam_dist + 1.5f;
-    if (t_min < 0.0f) t_min = 0.0f;
+  /* Bracket t by camera distance so closer hits ≈ 1. */
+  float t_min = cam_dist - 1.5f;
+  float t_max = cam_dist + 1.5f;
+  if (t_min < 0.0f)
+    t_min = 0.0f;
 
-    for (int vy = 0; vy < ch && vy < CANVAS_MAX_H; vy++) {
-        const Pixel *row_src = canvas_row(vy, cw);
-        for (int vx = 0; vx < cw && vx < CANVAS_MAX_W; vx++) {
-            const Pixel *px = &row_src[vx];
-            if (!px->hit) continue;
+  for (int vy = 0; vy < ch && vy < CANVAS_MAX_H; vy++) {
+    const Pixel *row_src = canvas_row(vy, cw);
+    for (int vx = 0; vx < cw && vx < CANVAS_MAX_W; vx++) {
+      const Pixel *px = &row_src[vx];
+      if (!px->hit)
+        continue;
 
-            float depth_n = (t_max - px->hit_t) / (t_max - t_min);
-            if (depth_n < 0.0f) depth_n = 0.0f;
-            if (depth_n > 1.0f) depth_n = 1.0f;
+      float depth_n = (t_max - px->hit_t) / (t_max - t_min);
+      if (depth_n < 0.0f)
+        depth_n = 0.0f;
+      if (depth_n > 1.0f)
+        depth_n = 1.0f;
 
-            int tx = off_x + vx;
-            int ty = off_y + vy;
-            if (tx < 0 || tx >= cols || ty < 0 || ty >= rows - 1) continue;
-            attr_t attr = debug_attr(depth_n);
-            attron(attr);
-            mvaddch(ty, tx, (chtype)(unsigned char)debug_glyph(depth_n));
-            attroff(attr);
-        }
+      int tx = off_x + vx;
+      int ty = off_y + vy;
+      if (tx < 0 || tx >= cols || ty < 0 || ty >= rows - 1)
+        continue;
+      attr_t attr = debug_attr(depth_n);
+      attron(attr);
+      mvaddch(ty, tx, (chtype)(unsigned char)debug_glyph(depth_n));
+      attroff(attr);
     }
+  }
 }
 
 /* STEPS — march iteration count → brightness.  Silhouette glow. */
-static void canvas_draw_steps(int cw, int ch, int cols, int rows)
-{
-    int off_x, off_y;
-    canvas_offsets(cw, ch, cols, rows, &off_x, &off_y);
+static void canvas_draw_steps(int cw, int ch, int cols, int rows) {
+  int off_x, off_y;
+  canvas_offsets(cw, ch, cols, rows, &off_x, &off_y);
 
-    for (int vy = 0; vy < ch && vy < CANVAS_MAX_H; vy++) {
-        const Pixel *row_src = canvas_row(vy, cw);
-        for (int vx = 0; vx < cw && vx < CANVAS_MAX_W; vx++) {
-            const Pixel *px = &row_src[vx];
-            if (!px->hit) continue;
+  for (int vy = 0; vy < ch && vy < CANVAS_MAX_H; vy++) {
+    const Pixel *row_src = canvas_row(vy, cw);
+    for (int vx = 0; vx < cw && vx < CANVAS_MAX_W; vx++) {
+      const Pixel *px = &row_src[vx];
+      if (!px->hit)
+        continue;
 
-            float steps_n = (float)px->steps / (float)MARCH_MAX;
-            if (steps_n > 1.0f) steps_n = 1.0f;
+      float steps_n = (float)px->steps / (float)MARCH_MAX;
+      if (steps_n > 1.0f)
+        steps_n = 1.0f;
 
-            int tx = off_x + vx;
-            int ty = off_y + vy;
-            if (tx < 0 || tx >= cols || ty < 0 || ty >= rows - 1) continue;
-            attr_t attr = debug_attr(steps_n);
-            attron(attr);
-            mvaddch(ty, tx, (chtype)(unsigned char)debug_glyph(steps_n));
-            attroff(attr);
-        }
+      int tx = off_x + vx;
+      int ty = off_y + vy;
+      if (tx < 0 || tx >= cols || ty < 0 || ty >= rows - 1)
+        continue;
+      attr_t attr = debug_attr(steps_n);
+      attron(attr);
+      mvaddch(ty, tx, (chtype)(unsigned char)debug_glyph(steps_n));
+      attroff(attr);
     }
+  }
 }
 
 /* ── §18 app — main loop, signals, key handling ──────────────────────── */
 
-static const char *k_preset_names[5] = {
-    "1:Blend", "2:Boolean", "3:Twist", "4:Repeat", "5:Sculpt"
-};
-static const char *k_theme_names[N_THEMES] = {
-    "Studio", "Ember", "Arctic", "Toxic", "Neon"
-};
+static const char *k_preset_names[5] = {"1:Blend", "2:Boolean", "3:Twist",
+                                        "4:Repeat", "5:Sculpt"};
+static const char *k_theme_names[N_THEMES] = {"Studio", "Ember", "Arctic",
+                                              "Toxic", "Neon"};
 
 typedef struct {
-    int   cw, ch;        /* canvas dimensions in characters         */
-    int   preset;        /* current scene index 0..4                */
+  int cw, ch; /* canvas dimensions in characters         */
+  int preset; /* current scene index 0..4                */
 
-    float cam_dist;
-    float cam_theta;
-    float cam_phi;
-    float orbit_spd;
+  float cam_dist;
+  float cam_theta;
+  float cam_phi;
+  float orbit_spd;
 
-    bool      paused;
-    bool      do_shadow;
-    bool      do_ao;
-    int       light_mode;     /* 0=N·V  1=Phong  2=Flat              */
-    DebugMode debug_mode;     /* 0=NORMAL 1=NORMALS 2=DEPTH 3=STEPS  */
+  bool paused;
+  bool do_shadow;
+  bool do_ao;
+  int light_mode;       /* 0=N·V  1=Phong  2=Flat              */
+  DebugMode debug_mode; /* 0=NORMAL 1=NORMALS 2=DEPTH 3=STEPS  */
 
-    float scene_t;            /* time fed to scene functions         */
-    float color_phase;        /* accumulates for palette animation   */
+  float scene_t;     /* time fed to scene functions         */
+  float color_phase; /* accumulates for palette animation   */
 
-    bool  quit;
+  bool quit;
 } App;
 
 static volatile sig_atomic_t g_resize = 0;
-static void on_sigwinch(int sig) { (void)sig; g_resize = 1; }
-
-static void app_init(App *a, int cols, int rows)
-{
-    memset(a, 0, sizeof *a);
-    a->cw         = (cols > CANVAS_MAX_W) ? CANVAS_MAX_W : cols;
-    /* Reserve TWO rows for the HUD: row 0 (yellow status) + last row
-     * (cyan hint).  Canvas occupies rows 1..rows-2. */
-    a->ch         = (rows - 2 > CANVAS_MAX_H) ? CANVAS_MAX_H : rows - 2;
-    a->preset     = 0;
-    a->cam_dist   = CAM_DIST_DEF;
-    a->cam_theta  = CAM_THETA_DEF;
-    a->cam_phi    = CAM_PHI_DEF;
-    a->orbit_spd  = CAM_ORBIT_DEF;
-    a->do_ao      = true;
-    a->do_shadow  = false;        /* off by default for speed */
-    a->light_mode = 0;            /* N·V default */
-    a->debug_mode = DEBUG_NORMAL;
-
-    memset(g_fbuf,   0, sizeof g_fbuf);
-    memset(g_stable, 0, sizeof g_stable);
-    g_render_row = 0;
-    g_dirty      = true;
-
-    camera_basis(a->cam_dist, a->cam_theta, a->cam_phi,
-                 &g_snap_cam, &g_snap_fwd, &g_snap_right, &g_snap_up);
+static void on_sigwinch(int sig) {
+  (void)sig;
+  g_resize = 1;
 }
 
-static void app_resize(App *a, int cols, int rows)
-{
-    a->cw = (cols > CANVAS_MAX_W) ? CANVAS_MAX_W : cols;
-    a->ch = (rows - 2 > CANVAS_MAX_H) ? CANVAS_MAX_H : rows - 2;
-    g_render_row = 0;
-    g_dirty      = true;
+static void app_init(App *a, int cols, int rows) {
+  memset(a, 0, sizeof *a);
+  a->cw = (cols > CANVAS_MAX_W) ? CANVAS_MAX_W : cols;
+  /* Reserve TWO rows for the HUD: row 0 (yellow status) + last row
+   * (cyan hint).  Canvas occupies rows 1..rows-2. */
+  a->ch = (rows - 2 > CANVAS_MAX_H) ? CANVAS_MAX_H : rows - 2;
+  a->preset = 0;
+  a->cam_dist = CAM_DIST_DEF;
+  a->cam_theta = CAM_THETA_DEF;
+  a->cam_phi = CAM_PHI_DEF;
+  a->orbit_spd = CAM_ORBIT_DEF;
+  a->do_ao = true;
+  a->do_shadow = false; /* off by default for speed */
+  a->light_mode = 0;    /* N·V default */
+  a->debug_mode = DEBUG_NORMAL;
+
+  memset(g_fbuf, 0, sizeof g_fbuf);
+  memset(g_stable, 0, sizeof g_stable);
+  g_render_row = 0;
+  g_dirty = true;
+
+  camera_basis(a->cam_dist, a->cam_theta, a->cam_phi, &g_snap_cam, &g_snap_fwd,
+               &g_snap_right, &g_snap_up);
 }
 
-static void app_handle_key(App *a, int ch)
-{
-    switch (ch) {
-    case '1': case '2': case '3': case '4': case '5':
-        if (a->preset != ch - '1') {
-            a->preset    = ch - '1';
-            g_dirty      = true;
-            a->scene_t   = 0.0f;
-        }
-        break;
-    case 't':
-        g_theme = (g_theme + 1) % N_THEMES;
-        break;
-    case 'p': case ' ':
-        a->paused = !a->paused;
-        break;
-    case 's':
-        a->do_shadow = !a->do_shadow;
-        g_dirty = true;
-        break;
-    case 'o':
-        a->do_ao = !a->do_ao;
-        g_dirty  = true;
-        break;
-    case 'l':
-        a->light_mode = (a->light_mode + 1) % 3;
-        g_dirty       = true;
-        break;
-    case 'd':
-        a->debug_mode = (DebugMode)((a->debug_mode + 1) % DEBUG_MODE_COUNT);
-        break;
-    case 'D':
-        a->debug_mode =
-            (DebugMode)((a->debug_mode + DEBUG_MODE_COUNT - 1) % DEBUG_MODE_COUNT);
-        break;
-    case '+': case '=':
-        a->orbit_spd += 0.05f;
-        break;
-    case '-':
-        a->orbit_spd -= 0.05f;
-        if (a->orbit_spd < 0.0f) a->orbit_spd = 0.0f;
-        break;
-    case 'z':
-        /* zoom IN — closer camera, smaller cam_dist */
-        a->cam_dist -= CAM_ZOOM_STEP;
-        if (a->cam_dist < CAM_DIST_MIN) a->cam_dist = CAM_DIST_MIN;
-        g_dirty = true;
-        break;
-    case 'Z':
-        /* zoom OUT — farther camera, larger cam_dist */
-        a->cam_dist += CAM_ZOOM_STEP;
-        if (a->cam_dist > CAM_DIST_MAX) a->cam_dist = CAM_DIST_MAX;
-        g_dirty = true;
-        break;
-    case 'r':
-        a->cam_dist  = CAM_DIST_DEF;
-        a->cam_theta = CAM_THETA_DEF;
-        a->cam_phi   = CAM_PHI_DEF;
-        a->orbit_spd = CAM_ORBIT_DEF;
-        g_dirty      = true;
-        break;
-    case 'q': case 27:    /* ESC */
-        a->quit = true;
-        break;
-    default:
-        break;
+static void app_resize(App *a, int cols, int rows) {
+  a->cw = (cols > CANVAS_MAX_W) ? CANVAS_MAX_W : cols;
+  a->ch = (rows - 2 > CANVAS_MAX_H) ? CANVAS_MAX_H : rows - 2;
+  g_render_row = 0;
+  g_dirty = true;
+}
+
+static void app_handle_key(App *a, int ch) {
+  switch (ch) {
+  case '1':
+  case '2':
+  case '3':
+  case '4':
+  case '5':
+    if (a->preset != ch - '1') {
+      a->preset = ch - '1';
+      g_dirty = true;
+      a->scene_t = 0.0f;
     }
+    break;
+  case 't':
+    g_theme = (g_theme + 1) % N_THEMES;
+    break;
+  case 'p':
+  case ' ':
+    a->paused = !a->paused;
+    break;
+  case 's':
+    a->do_shadow = !a->do_shadow;
+    g_dirty = true;
+    break;
+  case 'o':
+    a->do_ao = !a->do_ao;
+    g_dirty = true;
+    break;
+  case 'l':
+    a->light_mode = (a->light_mode + 1) % 3;
+    g_dirty = true;
+    break;
+  case 'd':
+    a->debug_mode = (DebugMode)((a->debug_mode + 1) % DEBUG_MODE_COUNT);
+    break;
+  case 'D':
+    a->debug_mode =
+        (DebugMode)((a->debug_mode + DEBUG_MODE_COUNT - 1) % DEBUG_MODE_COUNT);
+    break;
+  case '+':
+  case '=':
+    a->orbit_spd += 0.05f;
+    break;
+  case '-':
+    a->orbit_spd -= 0.05f;
+    if (a->orbit_spd < 0.0f)
+      a->orbit_spd = 0.0f;
+    break;
+  case 'z':
+    /* zoom IN — closer camera, smaller cam_dist */
+    a->cam_dist -= CAM_ZOOM_STEP;
+    if (a->cam_dist < CAM_DIST_MIN)
+      a->cam_dist = CAM_DIST_MIN;
+    g_dirty = true;
+    break;
+  case 'Z':
+    /* zoom OUT — farther camera, larger cam_dist */
+    a->cam_dist += CAM_ZOOM_STEP;
+    if (a->cam_dist > CAM_DIST_MAX)
+      a->cam_dist = CAM_DIST_MAX;
+    g_dirty = true;
+    break;
+  case 'r':
+    a->cam_dist = CAM_DIST_DEF;
+    a->cam_theta = CAM_THETA_DEF;
+    a->cam_phi = CAM_PHI_DEF;
+    a->orbit_spd = CAM_ORBIT_DEF;
+    g_dirty = true;
+    break;
+  case 'q':
+  case 27: /* ESC */
+    a->quit = true;
+    break;
+  default:
+    break;
+  }
 }
 
-static void app_tick(App *a, float dt)
-{
-    if (a->paused) return;
+static void app_tick(App *a, float dt) {
+  if (a->paused)
+    return;
 
-    a->scene_t  += dt;
-    a->cam_phi  += a->orbit_spd * dt;
+  a->scene_t += dt;
+  a->cam_phi += a->orbit_spd * dt;
 
-    /* palette animation: g_color_offset shifts slowly through GRAD_N */
-    a->color_phase += 0.4f * dt;
-    g_color_offset  = (int)(a->color_phase) % GRAD_N;
+  /* palette animation: g_color_offset shifts slowly through GRAD_N */
+  a->color_phase += 0.4f * dt;
+  g_color_offset = (int)(a->color_phase) % GRAD_N;
 }
 
 /*
@@ -1705,15 +1725,24 @@ static void app_tick(App *a, float dt)
  * overlays.  Production view goes through pixel_to_cell (gamma +
  * theme); overlays use a simpler direct mapping.
  */
-static void draw_active(const App *a, int cols, int rows)
-{
-    switch (a->debug_mode) {
-    case DEBUG_NORMAL:  canvas_draw         (a->cw, a->ch, cols, rows);                break;
-    case DEBUG_NORMALS: canvas_draw_normals (a->cw, a->ch, cols, rows);                break;
-    case DEBUG_DEPTH:   canvas_draw_depth   (a->cw, a->ch, cols, rows, a->cam_dist);   break;
-    case DEBUG_STEPS:   canvas_draw_steps   (a->cw, a->ch, cols, rows);                break;
-    default:            canvas_draw         (a->cw, a->ch, cols, rows);                break;
-    }
+static void draw_active(const App *a, int cols, int rows) {
+  switch (a->debug_mode) {
+  case DEBUG_NORMAL:
+    canvas_draw(a->cw, a->ch, cols, rows);
+    break;
+  case DEBUG_NORMALS:
+    canvas_draw_normals(a->cw, a->ch, cols, rows);
+    break;
+  case DEBUG_DEPTH:
+    canvas_draw_depth(a->cw, a->ch, cols, rows, a->cam_dist);
+    break;
+  case DEBUG_STEPS:
+    canvas_draw_steps(a->cw, a->ch, cols, rows);
+    break;
+  default:
+    canvas_draw(a->cw, a->ch, cols, rows);
+    break;
+  }
 }
 
 /*
@@ -1724,129 +1753,124 @@ static void draw_active(const App *a, int cols, int rows)
  * FPS lives in the LEFT label so it stays visible even when the
  * settings status string is wider than the terminal.
  */
-static void draw_hud(const App *a, double fps, int cols, int rows)
-{
-    char left[48];
-    snprintf(left, sizeof left, " SDF GALLERY  %5.1f fps ", fps);
-    int llen = (int)strlen(left);
+static void draw_hud(const App *a, double fps, int cols, int rows) {
+  char left[48];
+  snprintf(left, sizeof left, " SDF GALLERY  %5.1f fps ", fps);
+  int llen = (int)strlen(left);
 
-    char status[220];
-    snprintf(status, sizeof status,
-             " scene:%s  theme:%s  light:%s  debug:%s  "
-             "shadow:%s  ao:%s  zoom:%.2f  orbit:%.2f  %s ",
-             k_preset_names[a->preset],
-             k_theme_names[g_theme],
-             a->light_mode == 1 ? "Phong" : (a->light_mode == 2 ? "Flat" : "N·V"),
-             DEBUG_MODE_NAMES[a->debug_mode],
-             a->do_shadow ? "on" : "off",
-             a->do_ao     ? "on" : "off",
-             (double)a->cam_dist,
-             (double)a->orbit_spd,
-             a->paused ? "PAUSED" : "running");
-    int slen = (int)strlen(status);
-    /* clamp so status doesn't overlap the left label */
-    int max_slen = cols - llen;
-    if (max_slen < 0)    max_slen = 0;
-    if (slen > max_slen) slen     = max_slen;
+  char status[220];
+  snprintf(status, sizeof status,
+           " scene:%s  theme:%s  light:%s  debug:%s  "
+           "shadow:%s  ao:%s  zoom:%.2f  orbit:%.2f  %s ",
+           k_preset_names[a->preset], k_theme_names[g_theme],
+           a->light_mode == 1 ? "Phong" : (a->light_mode == 2 ? "Flat" : "N·V"),
+           DEBUG_MODE_NAMES[a->debug_mode], a->do_shadow ? "on" : "off",
+           a->do_ao ? "on" : "off", (double)a->cam_dist, (double)a->orbit_spd,
+           a->paused ? "PAUSED" : "running");
+  int slen = (int)strlen(status);
+  /* clamp so status doesn't overlap the left label */
+  int max_slen = cols - llen;
+  if (max_slen < 0)
+    max_slen = 0;
+  if (slen > max_slen)
+    slen = max_slen;
 
-    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvprintw(0, 0, "%s", left);
-    if (slen > 0)
-        mvprintw(0, cols - slen, "%.*s", slen, status);
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+  attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+  mvprintw(0, 0, "%s", left);
+  if (slen > 0)
+    mvprintw(0, cols - slen, "%.*s", slen, status);
+  attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-    /* Bottom row — cyan key hint. */
-    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
-    mvprintw(rows - 1, 0,
-             " q:quit  spc:pause  1-5:scene  l:light  d/D:debug  "
-             "t:theme  s:shadow  o:ao  z/Z:zoom  +/-:orbit  r:reset ");
-    clrtoeol();
-    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
+  /* Bottom row — cyan key hint. */
+  attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+  mvprintw(rows - 1, 0,
+           " q:quit  spc:pause  1-5:scene  l:light  d/D:debug  "
+           "t:theme  s:shadow  o:ao  z/Z:zoom  +/-:orbit  r:reset ");
+  clrtoeol();
+  attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-int main(void)
-{
-    signal(SIGWINCH, on_sigwinch);
+int main(void) {
+  signal(SIGWINCH, on_sigwinch);
 
-    initscr();
-    noecho();
-    cbreak();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    colors_init();
+  initscr();
+  noecho();
+  cbreak();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  colors_init();
 
-    int cols, rows;
-    getmaxyx(stdscr, rows, cols);
+  int cols, rows;
+  getmaxyx(stdscr, rows, cols);
 
-    App a;
-    app_init(&a, cols, rows);
+  App a;
+  app_init(&a, cols, rows);
 
-    double t_prev      = clock_now();
-    double fps_window  = 0.0;          /* accumulated dt within window */
-    int    fps_frames  = 0;            /* frames in current window     */
-    double fps_display = 0.0;          /* most recent measured fps     */
+  double t_prev = clock_now();
+  double fps_window = 0.0;  /* accumulated dt within window */
+  int fps_frames = 0;       /* frames in current window     */
+  double fps_display = 0.0; /* most recent measured fps     */
 
-    while (!a.quit) {
-        if (g_resize) {
-            g_resize = 0;
-            endwin();
-            refresh();
-            getmaxyx(stdscr, rows, cols);
-            app_resize(&a, cols, rows);
-        }
-
-        int ch;
-        while ((ch = getch()) != ERR)
-            app_handle_key(&a, ch);
-
-        double t_now = clock_now();
-        float  dt    = (float)(t_now - t_prev);
-        if (dt > 0.1f) dt = 0.1f;
-        t_prev = t_now;
-
-        app_tick(&a, dt);
-
-        /* FPS measurement window — refresh every ~0.5 s. */
-        fps_frames++;
-        fps_window += dt;
-        if (fps_window >= 0.5) {
-            fps_display = (double)fps_frames / fps_window;
-            fps_frames  = 0;
-            fps_window  = 0.0;
-        }
-
-        /* 3-point lighting directions (used in Phong mode). */
-        float kang  = a.scene_t * 0.40f;
-        Vec3  key_L = v3norm(v3( cosf(kang) * 0.70f, 0.65f, sinf(kang) * 0.70f));
-        Vec3 fill_L = v3norm(v3(-1.5f,  0.50f, -1.2f));
-        Vec3  rim_L = v3norm(v3( 0.0f, -0.40f, -1.0f));
-
-        if (g_dirty) {
-            g_render_row = 0;
-            memset(g_fbuf, 0, sizeof(Pixel) * (size_t)a.ch * CANVAS_MAX_W);
-            g_dirty = false;
-        }
-
-        /* Hoist per-frame trig out of every SDF call (T8). */
-        scene_cache_update(a.scene_t);
-
-        canvas_render_rows(a.cw, a.ch,
-                           a.preset, a.scene_t,
-                           a.cam_dist, a.cam_theta, a.cam_phi,
-                           key_L, fill_L, rim_L,
-                           a.do_shadow, a.do_ao, a.light_mode);
-
-        erase();
-        draw_active(&a, cols, rows);
-        draw_hud(&a, fps_display, cols, rows);
-        wnoutrefresh(stdscr);
-        doupdate();
-
-        struct timespec sl = {0, 16000000L};
-        nanosleep(&sl, NULL);
+  while (!a.quit) {
+    if (g_resize) {
+      g_resize = 0;
+      endwin();
+      refresh();
+      getmaxyx(stdscr, rows, cols);
+      app_resize(&a, cols, rows);
     }
 
-    endwin();
-    return 0;
+    int ch;
+    while ((ch = getch()) != ERR)
+      app_handle_key(&a, ch);
+
+    double t_now = clock_now();
+    float dt = (float)(t_now - t_prev);
+    if (dt > 0.1f)
+      dt = 0.1f;
+    t_prev = t_now;
+
+    app_tick(&a, dt);
+
+    /* FPS measurement window — refresh every ~0.5 s. */
+    fps_frames++;
+    fps_window += dt;
+    if (fps_window >= 0.5) {
+      fps_display = (double)fps_frames / fps_window;
+      fps_frames = 0;
+      fps_window = 0.0;
+    }
+
+    /* 3-point lighting directions (used in Phong mode). */
+    float kang = a.scene_t * 0.40f;
+    Vec3 key_L = v3norm(v3(cosf(kang) * 0.70f, 0.65f, sinf(kang) * 0.70f));
+    Vec3 fill_L = v3norm(v3(-1.5f, 0.50f, -1.2f));
+    Vec3 rim_L = v3norm(v3(0.0f, -0.40f, -1.0f));
+
+    if (g_dirty) {
+      g_render_row = 0;
+      memset(g_fbuf, 0, sizeof(Pixel) * (size_t)a.ch * CANVAS_MAX_W);
+      g_dirty = false;
+    }
+
+    /* Hoist per-frame trig out of every SDF call (T8). */
+    scene_cache_update(a.scene_t);
+
+    canvas_render_rows(a.cw, a.ch, a.preset, a.scene_t, a.cam_dist, a.cam_theta,
+                       a.cam_phi, key_L, fill_L, rim_L, a.do_shadow, a.do_ao,
+                       a.light_mode);
+
+    erase();
+    draw_active(&a, cols, rows);
+    draw_hud(&a, fps_display, cols, rows);
+    wnoutrefresh(stdscr);
+    doupdate();
+
+    struct timespec sl = {0, 16000000L};
+    nanosleep(&sl, NULL);
+  }
+
+  endwin();
+  return 0;
 }

@@ -257,7 +257,8 @@
  * Sway (camera position within the can):
  *      O.x = sway_amp · sin(time · SWAY_FREQ_X)
  *      O.y = sway_amp · cos(time · SWAY_FREQ_Y) · 0.55
- *      O.z = 0                                  (forward motion is FAKE — see T4)
+ *      O.z = 0                                  (forward motion is FAKE — see
+ * T4)
  *
  * Per-pixel ray direction (NDC in [−1, +1]):
  *      u =  (col + 0.5) / cols · 2 − 1
@@ -580,71 +581,75 @@
 /* ── §1 config ───────────────────────────────────────────────────────── */
 
 enum {
-    SIM_FPS_MIN      =  10,
-    SIM_FPS_DEFAULT  =  60,
-    SIM_FPS_MAX      = 120,
-    SIM_FPS_STEP     =  10,
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 60,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
 
-    FPS_UPDATE_MS    = 500,
+  FPS_UPDATE_MS = 500,
 
-    /* Color pair indices. */
-    PAIR_HUD         =   1,    /* yellow + bold — top status row     */
-    PAIR_HINT        =   2,    /* cyan   + bold — bottom hint row    */
-    PAIR_DEPTH_BASE  =   3,    /* +0..+7 — depth ramp (far → near)   */
-    PAIR_VANISH      =  11,    /* vanishing-point crosshair          */
-    PAIR_ACCENT      =  12,    /* secondary accent (reserved)        */
+  /* Color pair indices. */
+  PAIR_HUD = 1,        /* yellow + bold — top status row     */
+  PAIR_HINT = 2,       /* cyan   + bold — bottom hint row    */
+  PAIR_DEPTH_BASE = 3, /* +0..+7 — depth ramp (far → near)   */
+  PAIR_VANISH = 11,    /* vanishing-point crosshair          */
+  PAIR_ACCENT = 12,    /* secondary accent (reserved)        */
 };
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(f)      (NS_PER_SEC / (f))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
 
-#define CELL_ASPECT      2.0f      /* terminal cell h / w                */
+#define CELL_ASPECT 2.0f /* terminal cell h / w                */
 
 /* Tunnel geometry. */
-#define TUNNEL_RADIUS    2.0f
-#define FOV_DEG         70.0f
+#define TUNNEL_RADIUS 2.0f
+#define FOV_DEG 70.0f
 
 /* Camera flow + sway. */
-#define SPEED_DEFAULT    8.0f
-#define SPEED_MIN        0.5f
-#define SPEED_MAX       40.0f
+#define SPEED_DEFAULT 8.0f
+#define SPEED_MIN 0.5f
+#define SPEED_MAX 40.0f
 #define SPEED_STEP_FACTOR 1.30f
 
-#define SWAY_AMP_DEFAULT 1.30f     /* max horizontal offset (cells)      */
-#define SWAY_AMP_MIN     0.0f
-#define SWAY_AMP_MAX     1.65f     /* < TUNNEL_RADIUS · 0.85             */
-#define SWAY_AMP_STEP    0.10f
-#define SWAY_FREQ_X      0.55f     /* rad / sec                          */
-#define SWAY_FREQ_Y      0.31f
-#define ROLL_RATE        0.18f     /* rad / sec — texture spin           */
+#define SWAY_AMP_DEFAULT 1.30f /* max horizontal offset (cells)      */
+#define SWAY_AMP_MIN 0.0f
+#define SWAY_AMP_MAX 1.65f /* < TUNNEL_RADIUS · 0.85             */
+#define SWAY_AMP_STEP 0.10f
+#define SWAY_FREQ_X 0.55f /* rad / sec                          */
+#define SWAY_FREQ_Y 0.31f
+#define ROLL_RATE 0.18f /* rad / sec — texture spin           */
 
 /* Numerical tolerances. */
-#define EPS_PARALLEL     1.5e-3f   /* ray-axis-parallel threshold        */
-#define T_MAX           80.0f      /* far clip — vanishing point         */
+#define EPS_PARALLEL 1.5e-3f /* ray-axis-parallel threshold        */
+#define T_MAX 80.0f          /* far clip — vanishing point         */
 
 /* Distance fog (T8). */
-#define FOG_DENSITY      0.030f    /* exp(−t · FOG_DENSITY)              */
-#define FOG_FLOOR        0.18f     /* never fade below this — keep walls */
+#define FOG_DENSITY 0.030f /* exp(−t · FOG_DENSITY)              */
+#define FOG_FLOOR 0.18f    /* never fade below this — keep walls */
 
 /* Pattern enum. */
 typedef enum {
-    PATTERN_RINGS   = 0,
-    PATTERN_CHECKER = 1,
-    PATTERN_SPOKES  = 2,
-    PATTERN_GRID    = 3,
-    N_PATTERNS      = 4,
+  PATTERN_RINGS = 0,
+  PATTERN_CHECKER = 1,
+  PATTERN_SPOKES = 2,
+  PATTERN_GRID = 3,
+  N_PATTERNS = 4,
 } Pattern;
 
-static const char *pattern_name(Pattern p)
-{
-    switch (p) {
-    case PATTERN_RINGS:   return "RINGS  ";
-    case PATTERN_CHECKER: return "CHECKER";
-    case PATTERN_SPOKES:  return "SPOKES ";
-    case PATTERN_GRID:    return "GRID   ";
-    default:              return "?      ";
-    }
+static const char *pattern_name(Pattern p) {
+  switch (p) {
+  case PATTERN_RINGS:
+    return "RINGS  ";
+  case PATTERN_CHECKER:
+    return "CHECKER";
+  case PATTERN_SPOKES:
+    return "SPOKES ";
+  case PATTERN_GRID:
+    return "GRID   ";
+  default:
+    return "?      ";
+  }
 }
 
 /*
@@ -658,18 +663,18 @@ static const char *pattern_name(Pattern p)
  *   line_thick     : fraction of cell occupied by GRID line
  */
 typedef struct {
-    int   stripes_around;
-    float stripes_long;
-    float ring_freq;
-    float line_thick;
+  int stripes_around;
+  float stripes_long;
+  float ring_freq;
+  float line_thick;
 } PatternParams;
 
 static const PatternParams patterns[N_PATTERNS] = {
     /*                  around  long   ring_freq  line_thick */
-    /* RINGS   */     { 16,     0.55f,  1.55f,    0.30f },
-    /* CHECKER */     { 16,     0.55f,  0.0f,     0.0f  },
-    /* SPOKES  */     { 24,     0.0f,   0.0f,     0.0f  },
-    /* GRID    */     { 16,     0.55f,  0.0f,     0.20f },
+    /* RINGS   */ {16, 0.55f, 1.55f, 0.30f},
+    /* CHECKER */ {16, 0.55f, 0.0f, 0.0f},
+    /* SPOKES  */ {24, 0.0f, 0.0f, 0.0f},
+    /* GRID    */ {16, 0.55f, 0.0f, 0.20f},
 };
 
 /*
@@ -678,63 +683,62 @@ static const PatternParams patterns[N_PATTERNS] = {
  * the 256-colour cube per the CLAUDE.md theme-brightness rule.
  */
 typedef struct {
-    const char *name;
-    short       depth[8];
-    short       vanish;
-    short       accent;
+  const char *name;
+  short depth[8];
+  short vanish;
+  short accent;
 } Theme;
 
 #define N_THEMES 6
 
 static const Theme themes[N_THEMES] = {
     /* WARP — magenta/violet hyperdrive */
-    { "WARP    ", {  53,  91, 134, 165, 207, 213, 219, 225 }, 231, 213 },
+    {"WARP    ", {53, 91, 134, 165, 207, 213, 219, 225}, 231, 213},
 
     /* INFERNO — red/orange/yellow lava tube */
-    { "INFERNO ", {  88, 124, 160, 202, 208, 214, 220, 226 }, 231, 220 },
+    {"INFERNO ", {88, 124, 160, 202, 208, 214, 220, 226}, 231, 220},
 
     /* ELECTRIC — cyan/blue/white energy conduit */
-    { "ELECTRIC", {  24,  26,  31,  39,  45,  51, 123, 195 }, 231,  51 },
+    {"ELECTRIC", {24, 26, 31, 39, 45, 51, 123, 195}, 231, 51},
 
     /* VOID — deep teal-blue cold space */
-    { "VOID    ", {  24,  25,  31,  38,  45,  51, 117, 195 }, 195,  87 },
+    {"VOID    ", {24, 25, 31, 38, 45, 51, 117, 195}, 195, 87},
 
     /* MATRIX — neon-green cyber */
-    { "MATRIX  ", {  28,  34,  76,  82, 118, 154, 190, 226 }, 231, 154 },
+    {"MATRIX  ", {28, 34, 76, 82, 118, 154, 190, 226}, 231, 154},
 
     /* GOLD — amber/bone treasure passage */
-    { "GOLD    ", { 130, 137, 173, 179, 215, 222, 229, 230 }, 231, 226 },
+    {"GOLD    ", {130, 137, 173, 179, 215, 222, 229, 230}, 231, 226},
 };
 
 /* Glyph ramp (dim → bright). */
-static const char LUMA_GLYPHS[8] = { ' ', '.', ',', ':', '+', '*', '#', '@' };
+static const char LUMA_GLYPHS[8] = {' ', '.', ',', ':', '+', '*', '#', '@'};
 
 /*
  * Vanishing-point cursor — a small 5-cell crosshair (`+` centre, `o`
  * at N/E/S/W) drawn LAST over the rendered tunnel.  Non-intrusive
  * marker that anchors the eye on the tunnel axis (T9).
  */
-#define VANISH_CENTER_GLYPH  '+'
-#define VANISH_ARM_GLYPH     'o'
-#define ACCENT_GLYPH         '*'
+#define VANISH_CENTER_GLYPH '+'
+#define VANISH_ARM_GLYPH 'o'
+#define ACCENT_GLYPH '*'
 
 /* ── §2 clock — monotonic timer + sleep ──────────────────────────────── */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ── §3 color — themes + 2-pair HUD spec ─────────────────────────────── *
@@ -745,54 +749,59 @@ static void clock_sleep_ns(int64_t ns)
  * (PAIR_VANISH, PAIR_ACCENT) are theme-specific colours used by
  * the crosshair and reserved for future bright pulses.
  */
-static void theme_apply(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        for (int i = 0; i < 8; i++)
-            init_pair((short)(PAIR_DEPTH_BASE + i), t->depth[i], -1);
-        init_pair(PAIR_VANISH, t->vanish, -1);
-        init_pair(PAIR_ACCENT, t->accent, -1);
-    } else {
-        static const short fb[8] = {
-            COLOR_BLUE,    COLOR_BLUE,    COLOR_MAGENTA, COLOR_MAGENTA,
-            COLOR_CYAN,    COLOR_CYAN,    COLOR_WHITE,   COLOR_WHITE,
-        };
-        for (int i = 0; i < 8; i++)
-            init_pair((short)(PAIR_DEPTH_BASE + i), fb[i], -1);
-        init_pair(PAIR_VANISH, COLOR_WHITE,  -1);
-        init_pair(PAIR_ACCENT, COLOR_YELLOW, -1);
-    }
+static void theme_apply(int idx) {
+  if (idx < 0 || idx >= N_THEMES)
+    idx = 0;
+  if (COLORS >= 256) {
+    const Theme *t = &themes[idx];
+    for (int i = 0; i < 8; i++)
+      init_pair((short)(PAIR_DEPTH_BASE + i), t->depth[i], -1);
+    init_pair(PAIR_VANISH, t->vanish, -1);
+    init_pair(PAIR_ACCENT, t->accent, -1);
+  } else {
+    static const short fb[8] = {
+        COLOR_BLUE, COLOR_BLUE, COLOR_MAGENTA, COLOR_MAGENTA,
+        COLOR_CYAN, COLOR_CYAN, COLOR_WHITE,   COLOR_WHITE,
+    };
+    for (int i = 0; i < 8; i++)
+      init_pair((short)(PAIR_DEPTH_BASE + i), fb[i], -1);
+    init_pair(PAIR_VANISH, COLOR_WHITE, -1);
+    init_pair(PAIR_ACCENT, COLOR_YELLOW, -1);
+  }
 }
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,  226, -1);
-        init_pair(PAIR_HINT,  51, -1);
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
-    theme_apply(0);
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(PAIR_HUD, 226, -1);
+    init_pair(PAIR_HINT, 51, -1);
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
+  theme_apply(0);
 }
 
 /* ── §4 vec3 — value-type 3-D math ───────────────────────────────────── */
 
-typedef struct { float x, y, z; } V3;
+typedef struct {
+  float x, y, z;
+} V3;
 
-static inline V3    v3(float x, float y, float z)   { return (V3){x, y, z}; }
-static inline V3    v3add(V3 a, V3 b)               { return (V3){a.x+b.x, a.y+b.y, a.z+b.z}; }
-static inline V3    v3scale(float s, V3 a)          { return (V3){s*a.x, s*a.y, s*a.z}; }
-static inline float v3len(V3 a)                     {
-    return sqrtf(a.x*a.x + a.y*a.y + a.z*a.z);
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
+static inline V3 v3add(V3 a, V3 b) {
+  return (V3){a.x + b.x, a.y + b.y, a.z + b.z};
 }
-static inline V3    v3norm(V3 a) {
-    float L = v3len(a);
-    return L > 1e-12f ? v3scale(1.0f / L, a) : v3(0, 0, 1);
+static inline V3 v3scale(float s, V3 a) {
+  return (V3){s * a.x, s * a.y, s * a.z};
+}
+static inline float v3len(V3 a) {
+  return sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
+}
+static inline V3 v3norm(V3 a) {
+  float L = v3len(a);
+  return L > 1e-12f ? v3scale(1.0f / L, a) : v3(0, 0, 1);
 }
 
 /* ── §5 ray-cylinder intersection — closed-form (T1, T2) ─────────────── *
@@ -813,20 +822,20 @@ static inline V3    v3norm(V3 a) {
  * parallel flag tells the caller to render that pixel as the
  * vanishing-point fog tier.
  */
-static inline float cylinder_hit(V3 O, V3 D, float R, bool *parallel)
-{
-    float a = D.x * D.x + D.y * D.y;
-    if (a < EPS_PARALLEL) {
-        *parallel = true;
-        return -1.0f;
-    }
-    *parallel = false;
-    float b    = O.x * D.x + O.y * D.y;
-    float c    = O.x * O.x + O.y * O.y - R * R;
-    float disc = b * b - a * c;
-    if (disc < 0.0f) return -1.0f;        /* impossible inside, defensive */
-    float t = (-b + sqrtf(disc)) / a;
-    return t;
+static inline float cylinder_hit(V3 O, V3 D, float R, bool *parallel) {
+  float a = D.x * D.x + D.y * D.y;
+  if (a < EPS_PARALLEL) {
+    *parallel = true;
+    return -1.0f;
+  }
+  *parallel = false;
+  float b = O.x * D.x + O.y * D.y;
+  float c = O.x * O.x + O.y * O.y - R * R;
+  float disc = b * b - a * c;
+  if (disc < 0.0f)
+    return -1.0f; /* impossible inside, defensive */
+  float t = (-b + sqrtf(disc)) / a;
+  return t;
 }
 
 /* ── §6 pattern: RINGS — sinusoidal axial bands (T7) ─────────────────── *
@@ -837,9 +846,8 @@ static inline float cylinder_hit(V3 O, V3 D, float R, bool *parallel)
  * pattern, since rolling rotates u_tex but RINGS ignores u.
  * Visible motion = axial flow + sway.
  */
-static inline float pattern_rings(float v_tex, const PatternParams *pp)
-{
-    return sinf(v_tex * pp->ring_freq) * 0.5f + 0.5f;
+static inline float pattern_rings(float v_tex, const PatternParams *pp) {
+  return sinf(v_tex * pp->ring_freq) * 0.5f + 0.5f;
 }
 
 /* ── §7 pattern: CHECKER — alternating squares (T7) ──────────────────── *
@@ -850,11 +858,11 @@ static inline float pattern_rings(float v_tex, const PatternParams *pp)
  * bright/dark squares.  Both u and v matter, so roll, flow, and
  * sway are all visible.
  */
-static inline float pattern_checker(float u_tex, float v_tex, const PatternParams *pp)
-{
-    int gu = (int)floorf(u_tex * (float)pp->stripes_around);
-    int gv = (int)floorf(v_tex * pp->stripes_long);
-    return ((gu + gv) & 1) ? 1.0f : 0.0f;
+static inline float pattern_checker(float u_tex, float v_tex,
+                                    const PatternParams *pp) {
+  int gu = (int)floorf(u_tex * (float)pp->stripes_around);
+  int gv = (int)floorf(v_tex * pp->stripes_long);
+  return ((gu + gv) & 1) ? 1.0f : 0.0f;
 }
 
 /* ── §8 pattern: SPOKES — radial stripe parity (T7) ──────────────────── *
@@ -864,10 +872,9 @@ static inline float pattern_checker(float u_tex, float v_tex, const PatternParam
  * Pure azimuthal stripes; no v dependence → axial flow and sway
  * are INVISIBLE against this pattern.  Roll, however, IS visible.
  */
-static inline float pattern_spokes(float u_tex, const PatternParams *pp)
-{
-    int gu = (int)floorf(u_tex * (float)pp->stripes_around);
-    return (gu & 1) ? 1.0f : 0.0f;
+static inline float pattern_spokes(float u_tex, const PatternParams *pp) {
+  int gu = (int)floorf(u_tex * (float)pp->stripes_around);
+  return (gu & 1) ? 1.0f : 0.0f;
 }
 
 /* ── §9 pattern: GRID — line-thickness threshold cross-hatch (T7) ────── *
@@ -879,17 +886,18 @@ static inline float pattern_spokes(float u_tex, const PatternParams *pp)
  * Bright cross-hatch lines on a dark base.  thick = 0.20 means each
  * line is 20% of one cell wide.  Both u and v matter.
  */
-static inline float pattern_grid(float u_tex, float v_tex, const PatternParams *pp)
-{
-    float u_pos  = u_tex * (float)pp->stripes_around;
-    float v_pos  = v_tex * pp->stripes_long;
-    float u_frac = u_pos - floorf(u_pos);
-    float v_frac = v_pos - floorf(v_pos);
-    float u_dist = fminf(u_frac, 1.0f - u_frac);
-    float v_dist = fminf(v_frac, 1.0f - v_frac);
-    float thick  = pp->line_thick;
-    if (u_dist < thick || v_dist < thick) return 1.0f;
-    return 0.0f;
+static inline float pattern_grid(float u_tex, float v_tex,
+                                 const PatternParams *pp) {
+  float u_pos = u_tex * (float)pp->stripes_around;
+  float v_pos = v_tex * pp->stripes_long;
+  float u_frac = u_pos - floorf(u_pos);
+  float v_frac = v_pos - floorf(v_pos);
+  float u_dist = fminf(u_frac, 1.0f - u_frac);
+  float v_dist = fminf(v_frac, 1.0f - v_frac);
+  float thick = pp->line_thick;
+  if (u_dist < thick || v_dist < thick)
+    return 1.0f;
+  return 0.0f;
 }
 
 /* ── §10 pattern dispatch + cylindrical UV mapping (T3) ──────────────── *
@@ -900,16 +908,19 @@ static inline float pattern_grid(float u_tex, float v_tex, const PatternParams *
  * extra-smooth visual; the others return 0 or 1 plus the fog
  * smoothing.
  */
-static float pattern_sample(float u_tex, float v_tex, int pattern_idx)
-{
-    const PatternParams *pp = &patterns[pattern_idx];
-    switch (pattern_idx) {
-    case PATTERN_RINGS:   return pattern_rings(v_tex, pp);
-    case PATTERN_CHECKER: return pattern_checker(u_tex, v_tex, pp);
-    case PATTERN_SPOKES:  return pattern_spokes(u_tex, pp);
-    case PATTERN_GRID:
-    default:              return pattern_grid(u_tex, v_tex, pp);
-    }
+static float pattern_sample(float u_tex, float v_tex, int pattern_idx) {
+  const PatternParams *pp = &patterns[pattern_idx];
+  switch (pattern_idx) {
+  case PATTERN_RINGS:
+    return pattern_rings(v_tex, pp);
+  case PATTERN_CHECKER:
+    return pattern_checker(u_tex, v_tex, pp);
+  case PATTERN_SPOKES:
+    return pattern_spokes(u_tex, pp);
+  case PATTERN_GRID:
+  default:
+    return pattern_grid(u_tex, v_tex, pp);
+  }
 }
 
 /* ── §11 distance fog — exp(−t · density) with floor (T8) ────────────── *
@@ -921,53 +932,47 @@ static float pattern_sample(float u_tex, float v_tex, int pattern_idx)
  * fully black so we still see the tunnel structure at the
  * vanishing point.
  */
-static inline float fog_intensity(float t, float brightness)
-{
-    float fog = expf(-t * FOG_DENSITY);
-    return fog * (FOG_FLOOR + brightness * (1.0f - FOG_FLOOR));
+static inline float fog_intensity(float t, float brightness) {
+  float fog = expf(-t * FOG_DENSITY);
+  return fog * (FOG_FLOOR + brightness * (1.0f - FOG_FLOOR));
 }
 
 /* ── §12 scene state — struct + init + tick + reset ──────────────────── */
 
 typedef struct {
-    bool   paused;
-    int    current_pattern;
-    int    current_theme;
-    int    cols, rows;
+  bool paused;
+  int current_pattern;
+  int current_theme;
+  int cols, rows;
 
-    float  time;             /* accumulated seconds for sway / texture   */
-    float  speed;            /* texture flow speed (units / sec)         */
-    float  sway_amp;         /* horizontal sway amplitude (cells)        */
+  float time;     /* accumulated seconds for sway / texture   */
+  float speed;    /* texture flow speed (units / sec)         */
+  float sway_amp; /* horizontal sway amplitude (cells)        */
 } Scene;
 
-static void scene_init(Scene *s, int cols, int rows)
-{
-    memset(s, 0, sizeof *s);
-    s->paused          = false;
-    s->current_pattern = PATTERN_RINGS;
-    s->current_theme   = 0;
-    s->cols            = cols;
-    s->rows            = rows;
-    s->time            = 0.0f;
-    s->speed           = SPEED_DEFAULT;
-    s->sway_amp        = SWAY_AMP_DEFAULT;
+static void scene_init(Scene *s, int cols, int rows) {
+  memset(s, 0, sizeof *s);
+  s->paused = false;
+  s->current_pattern = PATTERN_RINGS;
+  s->current_theme = 0;
+  s->cols = cols;
+  s->rows = rows;
+  s->time = 0.0f;
+  s->speed = SPEED_DEFAULT;
+  s->sway_amp = SWAY_AMP_DEFAULT;
 }
 
-static void scene_resize(Scene *s, int cols, int rows)
-{
-    s->cols = cols;
-    s->rows = rows;
+static void scene_resize(Scene *s, int cols, int rows) {
+  s->cols = cols;
+  s->rows = rows;
 }
 
-static void scene_reset(Scene *s)
-{
-    s->time = 0.0f;
-}
+static void scene_reset(Scene *s) { s->time = 0.0f; }
 
-static void scene_tick(Scene *s, float dt)
-{
-    if (s->paused) return;
-    s->time += dt;
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
+  s->time += dt;
 }
 
 /* ── §13 camera basis — sway position + roll basis (T5, T6) ──────────── *
@@ -986,31 +991,27 @@ static void scene_tick(Scene *s, float dt)
  *       up      = (−sin r,  cos r, 0)
  */
 typedef struct {
-    V3    O;                 /* camera origin (sway)                      */
-    V3    fwd, right, up;    /* basis (with roll)                         */
-    float fov_t;             /* tan(FOV/2)                                */
-    float phys_aspect;       /* aspect for cell-shape compensation        */
+  V3 O;              /* camera origin (sway)                      */
+  V3 fwd, right, up; /* basis (with roll)                         */
+  float fov_t;       /* tan(FOV/2)                                */
+  float phys_aspect; /* aspect for cell-shape compensation        */
 } Camera;
 
-static Camera build_camera(const Scene *s, int rows_eff)
-{
-    Camera c;
-    c.O = (V3){
-        s->sway_amp * sinf(s->time * SWAY_FREQ_X),
-        s->sway_amp * cosf(s->time * SWAY_FREQ_Y) * 0.55f,
-        0.0f
-    };
+static Camera build_camera(const Scene *s, int rows_eff) {
+  Camera c;
+  c.O = (V3){s->sway_amp * sinf(s->time * SWAY_FREQ_X),
+             s->sway_amp * cosf(s->time * SWAY_FREQ_Y) * 0.55f, 0.0f};
 
-    float r  = s->time * ROLL_RATE;
-    float cr = cosf(r);
-    float sr = sinf(r);
-    c.fwd   = v3(0.0f, 0.0f, 1.0f);
-    c.right = v3( cr,  sr, 0.0f);
-    c.up    = v3(-sr,  cr, 0.0f);
+  float r = s->time * ROLL_RATE;
+  float cr = cosf(r);
+  float sr = sinf(r);
+  c.fwd = v3(0.0f, 0.0f, 1.0f);
+  c.right = v3(cr, sr, 0.0f);
+  c.up = v3(-sr, cr, 0.0f);
 
-    c.fov_t       = tanf(FOV_DEG * (float)M_PI / 180.0f * 0.5f);
-    c.phys_aspect = ((float)rows_eff * CELL_ASPECT) / (float)s->cols;
-    return c;
+  c.fov_t = tanf(FOV_DEG * (float)M_PI / 180.0f * 0.5f);
+  c.phys_aspect = ((float)rows_eff * CELL_ASPECT) / (float)s->cols;
+  return c;
 }
 
 /* ── §14 scene_render — per-pixel orchestrator ───────────────────────── *
@@ -1030,139 +1031,142 @@ static Camera build_camera(const Scene *s, int rows_eff)
  * The vanishing-point crosshair (T9, §15) is drawn LAST, on top of
  * the rendered tunnel.
  */
-static void scene_render(const Scene *s)
-{
-    /* Reserve top + bottom HUD rows.  Tunnel renders into 1..rows-2. */
-    int rows_eff = s->rows - 2;
-    int y_offset = 1;
-    if (rows_eff < 1) return;
+static void scene_render(const Scene *s) {
+  /* Reserve top + bottom HUD rows.  Tunnel renders into 1..rows-2. */
+  int rows_eff = s->rows - 2;
+  int y_offset = 1;
+  if (rows_eff < 1)
+    return;
 
-    Camera cam = build_camera(s, rows_eff);
+  Camera cam = build_camera(s, rows_eff);
 
-    /* Texture flow offset — subtract from v so pattern moves toward us. */
-    float v_flow = s->speed * s->time;
+  /* Texture flow offset — subtract from v so pattern moves toward us. */
+  float v_flow = s->speed * s->time;
 
-    int     last_pair = -1;
-    attr_t  last_attr = 0;
+  int last_pair = -1;
+  attr_t last_attr = 0;
 
-    for (int row = 0; row < rows_eff; row++) {
-        for (int col = 0; col < s->cols; col++) {
-            /* NDC for this cell. */
-            float u =  ((float)col + 0.5f) / (float)s->cols * 2.0f - 1.0f;
-            float v = -(((float)row + 0.5f) / (float)rows_eff * 2.0f - 1.0f);
+  for (int row = 0; row < rows_eff; row++) {
+    for (int col = 0; col < s->cols; col++) {
+      /* NDC for this cell. */
+      float u = ((float)col + 0.5f) / (float)s->cols * 2.0f - 1.0f;
+      float v = -(((float)row + 0.5f) / (float)rows_eff * 2.0f - 1.0f);
 
-            /* Ray direction (unit) from camera basis. */
-            V3 D = v3norm(v3add(cam.fwd,
-                v3add(v3scale(u * cam.fov_t, cam.right),
-                      v3scale(v * cam.fov_t * cam.phys_aspect, cam.up))));
+      /* Ray direction (unit) from camera basis. */
+      V3 D = v3norm(v3add(
+          cam.fwd, v3add(v3scale(u * cam.fov_t, cam.right),
+                         v3scale(v * cam.fov_t * cam.phys_aspect, cam.up))));
 
-            int    pair;
-            attr_t attr;
-            char   glyph;
+      int pair;
+      attr_t attr;
+      char glyph;
 
-            bool  parallel = false;
-            float t        = cylinder_hit(cam.O, D, TUNNEL_RADIUS, &parallel);
+      bool parallel = false;
+      float t = cylinder_hit(cam.O, D, TUNNEL_RADIUS, &parallel);
 
-            if (parallel || t > T_MAX || t < 0.0f) {
-                /* Far / parallel ray — render as deepest fog tier
-                 * (the natural darkening AT the screen centre IS the
-                 * tunnel exit; the crosshair is drawn on top). */
-                pair  = PAIR_DEPTH_BASE + 0;
-                attr  = A_DIM;
-                glyph = LUMA_GLYPHS[0];
-            } else {
-                /* Hit point and cylindrical UV (T3). */
-                V3 P = v3add(cam.O, v3scale(t, D));
-                float u_tex = (atan2f(P.y, P.x) + (float)M_PI)
-                            * (1.0f / (2.0f * (float)M_PI));
-                float v_tex = P.z - v_flow;     /* T4 — fake forward motion */
+      if (parallel || t > T_MAX || t < 0.0f) {
+        /* Far / parallel ray — render as deepest fog tier
+         * (the natural darkening AT the screen centre IS the
+         * tunnel exit; the crosshair is drawn on top). */
+        pair = PAIR_DEPTH_BASE + 0;
+        attr = A_DIM;
+        glyph = LUMA_GLYPHS[0];
+      } else {
+        /* Hit point and cylindrical UV (T3). */
+        V3 P = v3add(cam.O, v3scale(t, D));
+        float u_tex =
+            (atan2f(P.y, P.x) + (float)M_PI) * (1.0f / (2.0f * (float)M_PI));
+        float v_tex = P.z - v_flow; /* T4 — fake forward motion */
 
-                float bright    = pattern_sample(u_tex, v_tex,
-                                                 s->current_pattern);
-                float intensity = fog_intensity(t, bright);
+        float bright = pattern_sample(u_tex, v_tex, s->current_pattern);
+        float intensity = fog_intensity(t, bright);
 
-                int slot = (int)(intensity * 7.999f);
-                if (slot < 0) slot = 0;
-                if (slot > 7) slot = 7;
+        int slot = (int)(intensity * 7.999f);
+        if (slot < 0)
+          slot = 0;
+        if (slot > 7)
+          slot = 7;
 
-                glyph = LUMA_GLYPHS[slot];
-                pair  = PAIR_DEPTH_BASE + slot;
-                attr  = (slot >= 6) ? A_BOLD
-                      : (slot <= 1) ? A_DIM
-                      :               A_NORMAL;
-            }
+        glyph = LUMA_GLYPHS[slot];
+        pair = PAIR_DEPTH_BASE + slot;
+        attr = (slot >= 6) ? A_BOLD : (slot <= 1) ? A_DIM : A_NORMAL;
+      }
 
-            /* Batched attron/attroff: cache last (pair, attr); switch
-             * only on change.  Adjacent same-depth cells share one
-             * attron call. */
-            if (pair != last_pair || attr != last_attr) {
-                if (last_pair >= 0)
-                    attroff(COLOR_PAIR(last_pair) | last_attr);
-                attron(COLOR_PAIR(pair) | attr);
-                last_pair = pair;
-                last_attr = attr;
-            }
-            mvaddch(row + y_offset, col, (chtype)(unsigned char)glyph);
-        }
+      /* Batched attron/attroff: cache last (pair, attr); switch
+       * only on change.  Adjacent same-depth cells share one
+       * attron call. */
+      if (pair != last_pair || attr != last_attr) {
+        if (last_pair >= 0)
+          attroff(COLOR_PAIR(last_pair) | last_attr);
+        attron(COLOR_PAIR(pair) | attr);
+        last_pair = pair;
+        last_attr = attr;
+      }
+      mvaddch(row + y_offset, col, (chtype)(unsigned char)glyph);
     }
-    if (last_pair >= 0) attroff(COLOR_PAIR(last_pair) | last_attr);
+  }
+  if (last_pair >= 0)
+    attroff(COLOR_PAIR(last_pair) | last_attr);
 
-    /* ── §15 vanishing-point crosshair (drawn last, T9) ───────────────
-     *
-     *   . o .
-     *   o + o    ← drawn at screen centre, on top of fog falloff
-     *   . o .
-     *
-     * Forward = (0, 0, 1) → the axis direction projects exactly to
-     * (cols/2, rows_eff/2) regardless of camera sway.  Sway is
-     * parallel to the screen plane and shifts WHICH cylinder rays
-     * hit, but it doesn't move the projected vanishing point of
-     * the AXIS DIRECTION itself.  The `+` is bold; the four `o`
-     * arms are normal-weight.  Eye-anchor that doesn't compete
-     * with the tunnel motion.
-     */
-    int cx = s->cols / 2;
-    int cy = rows_eff / 2;
-    if (cx >= 0 && cx < s->cols && cy >= 0 && cy < rows_eff) {
-        attron(COLOR_PAIR(PAIR_VANISH) | A_BOLD);
-        mvaddch(cy + y_offset, cx, (chtype)(unsigned char)VANISH_CENTER_GLYPH);
-        attroff(COLOR_PAIR(PAIR_VANISH) | A_BOLD);
+  /* ── §15 vanishing-point crosshair (drawn last, T9) ───────────────
+   *
+   *   . o .
+   *   o + o    ← drawn at screen centre, on top of fog falloff
+   *   . o .
+   *
+   * Forward = (0, 0, 1) → the axis direction projects exactly to
+   * (cols/2, rows_eff/2) regardless of camera sway.  Sway is
+   * parallel to the screen plane and shifts WHICH cylinder rays
+   * hit, but it doesn't move the projected vanishing point of
+   * the AXIS DIRECTION itself.  The `+` is bold; the four `o`
+   * arms are normal-weight.  Eye-anchor that doesn't compete
+   * with the tunnel motion.
+   */
+  int cx = s->cols / 2;
+  int cy = rows_eff / 2;
+  if (cx >= 0 && cx < s->cols && cy >= 0 && cy < rows_eff) {
+    attron(COLOR_PAIR(PAIR_VANISH) | A_BOLD);
+    mvaddch(cy + y_offset, cx, (chtype)(unsigned char)VANISH_CENTER_GLYPH);
+    attroff(COLOR_PAIR(PAIR_VANISH) | A_BOLD);
 
-        attron(COLOR_PAIR(PAIR_VANISH));
-        if (cy - 1 >= 0)
-            mvaddch(cy - 1 + y_offset, cx, (chtype)(unsigned char)VANISH_ARM_GLYPH);
-        if (cy + 1 < rows_eff)
-            mvaddch(cy + 1 + y_offset, cx, (chtype)(unsigned char)VANISH_ARM_GLYPH);
-        if (cx - 1 >= 0)
-            mvaddch(cy + y_offset, cx - 1, (chtype)(unsigned char)VANISH_ARM_GLYPH);
-        if (cx + 1 < s->cols)
-            mvaddch(cy + y_offset, cx + 1, (chtype)(unsigned char)VANISH_ARM_GLYPH);
-        attroff(COLOR_PAIR(PAIR_VANISH));
-    }
+    attron(COLOR_PAIR(PAIR_VANISH));
+    if (cy - 1 >= 0)
+      mvaddch(cy - 1 + y_offset, cx, (chtype)(unsigned char)VANISH_ARM_GLYPH);
+    if (cy + 1 < rows_eff)
+      mvaddch(cy + 1 + y_offset, cx, (chtype)(unsigned char)VANISH_ARM_GLYPH);
+    if (cx - 1 >= 0)
+      mvaddch(cy + y_offset, cx - 1, (chtype)(unsigned char)VANISH_ARM_GLYPH);
+    if (cx + 1 < s->cols)
+      mvaddch(cy + y_offset, cx + 1, (chtype)(unsigned char)VANISH_ARM_GLYPH);
+    attroff(COLOR_PAIR(PAIR_VANISH));
+  }
 }
 
 /* ── §16 screen — ncurses init / 2-row HUD / present ─────────────────── */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *sc)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, sc->rows, sc->cols);
+static void screen_init(Screen *sc) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, sc->rows, sc->cols);
 }
-static void screen_free(Screen *sc) { (void)sc; endwin(); }
-static void screen_resize_curses(Screen *sc)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, sc->rows, sc->cols);
+static void screen_free(Screen *sc) {
+  (void)sc;
+  endwin();
+}
+static void screen_resize_curses(Screen *sc) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
 /*
@@ -1173,189 +1177,210 @@ static void screen_resize_curses(Screen *sc)
  * FPS lives in the LEFT label so it stays visible even when the
  * settings status overflows the terminal width.
  */
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
-{
-    erase();
-    scene_render(s);
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+  erase();
+  scene_render(s);
 
-    /* Top row — title + fps left, settings status right (truncated). */
-    char left[48];
-    snprintf(left, sizeof left, " TUNNEL  %5.1f fps ", fps);
-    int llen = (int)strlen(left);
+  /* Top row — title + fps left, settings status right (truncated). */
+  char left[48];
+  snprintf(left, sizeof left, " TUNNEL  %5.1f fps ", fps);
+  int llen = (int)strlen(left);
 
-    char status[200];
-    snprintf(status, sizeof status,
-             " %s  pat:%s  theme:%s  speed:%4.1f  sway:%4.2f  sim:%3dHz ",
-             s->paused ? "PAUSED" : "FLYING",
-             pattern_name(s->current_pattern),
-             themes[s->current_theme].name,
-             (double)s->speed, (double)s->sway_amp,
-             sim_fps);
-    int slen = (int)strlen(status);
-    int max_slen = sc->cols - llen;
-    if (max_slen < 0)    max_slen = 0;
-    if (slen > max_slen) slen     = max_slen;
+  char status[200];
+  snprintf(status, sizeof status,
+           " %s  pat:%s  theme:%s  speed:%4.1f  sway:%4.2f  sim:%3dHz ",
+           s->paused ? "PAUSED" : "FLYING", pattern_name(s->current_pattern),
+           themes[s->current_theme].name, (double)s->speed, (double)s->sway_amp,
+           sim_fps);
+  int slen = (int)strlen(status);
+  int max_slen = sc->cols - llen;
+  if (max_slen < 0)
+    max_slen = 0;
+  if (slen > max_slen)
+    slen = max_slen;
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, 0, "%s", left);
-    if (slen > 0)
-        mvprintw(0, sc->cols - slen, "%.*s", slen, status);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, 0, "%s", left);
+  if (slen > 0)
+    mvprintw(0, sc->cols - slen, "%.*s", slen, status);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* Bottom row — cyan key hint. */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " q:quit  spc:pause  r:reset  n/N:pat  t/T:theme  "
-             "+/-:speed  s/S:sway  ]/[:fps ");
-    clrtoeol();
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  /* Bottom row — cyan key hint. */
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(sc->rows - 1, 0,
+           " q:quit  spc:pause  r:reset  n/N:pat  t/T:theme  "
+           "+/-:speed  s/S:sway  ]/[:fps ");
+  clrtoeol();
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ── §17 app — main loop, signals, key handling ──────────────────────── */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void app_do_resize(App *app)
-{
-    screen_resize_curses(&app->screen);
-    scene_resize(&app->scene, app->screen.cols, app->screen.rows);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  screen_resize_curses(&app->screen);
+  scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':           s->paused = !s->paused;                       break;
-    case 'r': case 'R': scene_reset(s);                               break;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_reset(s);
+    break;
 
-    case 'n':
-        s->current_pattern = (s->current_pattern + 1) % N_PATTERNS;
-        break;
-    case 'N':
-        s->current_pattern = (s->current_pattern + N_PATTERNS - 1) % N_PATTERNS;
-        break;
+  case 'n':
+    s->current_pattern = (s->current_pattern + 1) % N_PATTERNS;
+    break;
+  case 'N':
+    s->current_pattern = (s->current_pattern + N_PATTERNS - 1) % N_PATTERNS;
+    break;
 
-    case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
-        theme_apply(s->current_theme);
-        break;
-    case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
-        theme_apply(s->current_theme);
-        break;
+  case 't':
+    s->current_theme = (s->current_theme + 1) % N_THEMES;
+    theme_apply(s->current_theme);
+    break;
+  case 'T':
+    s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
+    theme_apply(s->current_theme);
+    break;
 
-    case '=': case '+':
-        s->speed *= SPEED_STEP_FACTOR;
-        if (s->speed > SPEED_MAX) s->speed = SPEED_MAX;
-        break;
-    case '-':
-        s->speed /= SPEED_STEP_FACTOR;
-        if (s->speed < SPEED_MIN) s->speed = SPEED_MIN;
-        break;
+  case '=':
+  case '+':
+    s->speed *= SPEED_STEP_FACTOR;
+    if (s->speed > SPEED_MAX)
+      s->speed = SPEED_MAX;
+    break;
+  case '-':
+    s->speed /= SPEED_STEP_FACTOR;
+    if (s->speed < SPEED_MIN)
+      s->speed = SPEED_MIN;
+    break;
 
-    case 's':
-        s->sway_amp += SWAY_AMP_STEP;
-        if (s->sway_amp > SWAY_AMP_MAX) s->sway_amp = SWAY_AMP_MAX;
-        break;
-    case 'S':
-        s->sway_amp -= SWAY_AMP_STEP;
-        if (s->sway_amp < SWAY_AMP_MIN) s->sway_amp = SWAY_AMP_MIN;
-        break;
+  case 's':
+    s->sway_amp += SWAY_AMP_STEP;
+    if (s->sway_amp > SWAY_AMP_MAX)
+      s->sway_amp = SWAY_AMP_MAX;
+    break;
+  case 'S':
+    s->sway_amp -= SWAY_AMP_STEP;
+    if (s->sway_amp < SWAY_AMP_MIN)
+      s->sway_amp = SWAY_AMP_MIN;
+    break;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    default: break;
-    }
-    return true;
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+int main(void) {
+  srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+  screen_init(&app->screen);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
-
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accum -= tick_ns;
-        }
-
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
-        screen_present();
-
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns();
+      sim_accum = 0;
     }
 
-    screen_free(&app->screen);
-    return 0;
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > 100 * NS_PER_MS)
+      dt = 100 * NS_PER_MS;
+
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
+
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, dt_sec);
+      sim_accum -= tick_ns;
+    }
+
+    frame_count++;
+    fps_accum += dt;
+    if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display =
+          (double)frame_count / ((double)fps_accum / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accum = 0;
+    }
+
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
+    screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
+    screen_present();
+
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  screen_free(&app->screen);
+  return 0;
 }

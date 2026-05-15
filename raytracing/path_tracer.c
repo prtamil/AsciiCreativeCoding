@@ -899,40 +899,40 @@
  * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 199309L
-#include <ncurses.h>
 #include <math.h>
+#include <ncurses.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
-#include <signal.h>
 #include <time.h>
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 /* ── §1 config ──────────────────────────────────────────────────────── */
 
 /* §1.1 frame rate. PT is compute-heavy so we target 30 Hz, not 60. */
-#define TARGET_FPS    30
-#define DT_CAP_NS     200000000LL          /* 0.2 s — spiral-of-death cap */
+#define TARGET_FPS 30
+#define DT_CAP_NS 200000000LL /* 0.2 s — spiral-of-death cap */
 
 /* §1.2 view geometry. */
-#define ASPECT        0.47f                /* terminal cell W/H ratio    */
-#define FOV_DEG       66.0f                /* horizontal FOV             */
+#define ASPECT 0.47f  /* terminal cell W/H ratio    */
+#define FOV_DEG 66.0f /* horizontal FOV             */
 
 /* §1.3 path tracing. */
-#define MAX_DEPTH     7                    /* hard depth cap per path     */
-#define RR_DEPTH      3                    /* RR starts at this depth     */
-#define SPP_DEFAULT   2                    /* samples per pixel per frame */
-#define SPP_MIN       1
-#define SPP_MAX       8
-#define ACCUM_CAP     8192                 /* auto-pause once converged   */
-#define RAY_EPS       1e-4f                /* origin offset along N       */
+#define MAX_DEPTH 7   /* hard depth cap per path     */
+#define RR_DEPTH 3    /* RR starts at this depth     */
+#define SPP_DEFAULT 2 /* samples per pixel per frame */
+#define SPP_MIN 1
+#define SPP_MAX 8
+#define ACCUM_CAP 8192 /* auto-pause once converged   */
+#define RAY_EPS 1e-4f  /* origin offset along N       */
 
-#define MAX_W         320                  /* static accumulator width    */
-#define MAX_H         100                  /* static accumulator height   */
+#define MAX_W 320 /* static accumulator width    */
+#define MAX_H 100 /* static accumulator height   */
 
 /*
  * §1.4 Cornell box coordinate system:
@@ -942,21 +942,22 @@
  *   Camera at (0, 0.05, -1.5) looking toward +Z. The front face
  *   (z = 0) is open so the camera sees in.
  */
-#define CAM_X         0.00f
-#define CAM_Y         0.05f
-#define CAM_Z        -1.50f
+#define CAM_X 0.00f
+#define CAM_Y 0.05f
+#define CAM_Z -1.50f
 
 /* §1.5 character ramp — Paul Bourke 92-char density ladder. */
 static const char k_ramp[] =
-    " `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
-#define RAMP_LEN  ((int)(sizeof k_ramp - 1))
+    " `.-':_,^=;><+!rc*/"
+    "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
+#define RAMP_LEN ((int)(sizeof k_ramp - 1))
 
 /* §1.6 ncurses pair IDs. */
-#define PAIR_CUBE_BASE   1                 /* + 0..215 = 6×6×6 cube       */
-#define PAIR_HUD       217                 /* yellow row 0 status         */
-#define PAIR_HINT      218                 /* cyan bottom hint strip      */
-#define PAIR_BAR_FILL  219                 /* progress-bar filled cells   */
-#define PAIR_BAR_EMPTY 220                 /* progress-bar empty cells    */
+#define PAIR_CUBE_BASE 1   /* + 0..215 = 6×6×6 cube       */
+#define PAIR_HUD 217       /* yellow row 0 status         */
+#define PAIR_HINT 218      /* cyan bottom hint strip      */
+#define PAIR_BAR_FILL 219  /* progress-bar filled cells   */
+#define PAIR_BAR_EMPTY 220 /* progress-bar empty cells    */
 
 /* §1.7 shade-mode enum (cycled with 'd'). See T12 + §14.
  *
@@ -972,22 +973,26 @@ static const char k_ramp[] =
  * average would produce incoherent results).
  */
 typedef enum {
-    MODE_PT     = 0,
-    MODE_NORMAL = 1,
-    MODE_ALBEDO = 2,
-    MODE_DEPTH  = 3,
-    MODE_N      = 4,
+  MODE_PT = 0,
+  MODE_NORMAL = 1,
+  MODE_ALBEDO = 2,
+  MODE_DEPTH = 3,
+  MODE_N = 4,
 } ShadeMode;
 
-static const char *shade_mode_name(ShadeMode m)
-{
-    switch (m) {
-    case MODE_PT:     return "PT    ";
-    case MODE_NORMAL: return "NORMAL";
-    case MODE_ALBEDO: return "ALBEDO";
-    case MODE_DEPTH:  return "DEPTH ";
-    default:          return "?     ";
-    }
+static const char *shade_mode_name(ShadeMode m) {
+  switch (m) {
+  case MODE_PT:
+    return "PT    ";
+  case MODE_NORMAL:
+    return "NORMAL";
+  case MODE_ALBEDO:
+    return "ALBEDO";
+  case MODE_DEPTH:
+    return "DEPTH ";
+  default:
+    return "?     ";
+  }
 }
 
 /* ── §2 clock ───────────────────────────────────────────────────────── */
@@ -999,11 +1004,10 @@ static const char *shade_mode_name(ShadeMode m)
  * dt), not wall date. CLOCK_MONOTONIC never goes backward across NTP
  * adjustments, DST shifts, or system clock changes.
  */
-static long long clock_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
 /*
@@ -1013,11 +1017,11 @@ static long long clock_ns(void)
  * at 100%; we subtract elapsed work time from the target frame and
  * sleep the remainder.
  */
-static void clock_sleep_ns(long long ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(long long ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
 }
 
 /* ── §3 vec3 ────────────────────────────────────────────────────────── *
@@ -1027,34 +1031,39 @@ static void clock_sleep_ns(long long ns)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-typedef struct { float x, y, z; } V3;
+typedef struct {
+  float x, y, z;
+} V3;
 
-static inline V3    v3     (float x, float y, float z) { return (V3){x,y,z}; }
-static inline V3    v3add  (V3 a, V3 b)     { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
-static inline V3    v3sub  (V3 a, V3 b)     { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
-static inline V3    v3mul  (V3 a, V3 b)     { return v3(a.x*b.x, a.y*b.y, a.z*b.z); }
-static inline V3    v3s    (float s, V3 a)  { return v3(s*a.x,   s*a.y,   s*a.z);   }
-static inline float v3dot  (V3 a, V3 b)     { return a.x*b.x + a.y*b.y + a.z*b.z;   }
-static inline float v3len  (V3 a)           { return sqrtf(v3dot(a, a));            }
-static inline V3    v3norm (V3 a)
-{
-    float length = v3len(a);
-    return length > 1e-9f ? v3s(1.f/length, a) : v3(0, 1, 0);
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
+static inline V3 v3add(V3 a, V3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
-static inline V3    v3cross(V3 a, V3 b)
-{
-    return v3(a.y*b.z - a.z*b.y,
-              a.z*b.x - a.x*b.z,
-              a.x*b.y - a.y*b.x);
+static inline V3 v3sub(V3 a, V3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline V3 v3mul(V3 a, V3 b) {
+  return v3(a.x * b.x, a.y * b.y, a.z * b.z);
+}
+static inline V3 v3s(float s, V3 a) { return v3(s * a.x, s * a.y, s * a.z); }
+static inline float v3dot(V3 a, V3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3len(V3 a) { return sqrtf(v3dot(a, a)); }
+static inline V3 v3norm(V3 a) {
+  float length = v3len(a);
+  return length > 1e-9f ? v3s(1.f / length, a) : v3(0, 1, 0);
+}
+static inline V3 v3cross(V3 a, V3 b) {
+  return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x);
 }
 
 /* v3maxc — maximum channel of a V3. Used by Russian roulette to pick
  * the survival probability (T9: max, not mean, to keep paths whose
  * energy is concentrated in a single colour band). */
-static inline float v3maxc(V3 a)
-{
-    return a.x > a.y ? (a.x > a.z ? a.x : a.z)
-                     : (a.y > a.z ? a.y : a.z);
+static inline float v3maxc(V3 a) {
+  return a.x > a.y ? (a.x > a.z ? a.x : a.z) : (a.y > a.z ? a.y : a.z);
 }
 
 /* ── §4 RNG (xorshift32, decorrelated per pixel per frame) ──────────── *
@@ -1079,12 +1088,11 @@ typedef uint32_t Rng;
  * masked off (>>1) so the result is non-negative when reinterpreted
  * via the integer-to-float divide.
  */
-static float rng_f(Rng *rng_state)
-{
-    *rng_state ^= *rng_state << 13;
-    *rng_state ^= *rng_state >> 17;
-    *rng_state ^= *rng_state << 5;
-    return (float)(*rng_state >> 1) * (1.f / (float)0x7FFFFFFF);
+static float rng_f(Rng *rng_state) {
+  *rng_state ^= *rng_state << 13;
+  *rng_state ^= *rng_state >> 17;
+  *rng_state ^= *rng_state << 5;
+  return (float)(*rng_state >> 1) * (1.f / (float)0x7FFFFFFF);
 }
 
 /*
@@ -1095,16 +1103,12 @@ static float rng_f(Rng *rng_state)
  * sequences. Without decorrelation, neighbouring pixels would receive
  * the same sample sequence and the noise would form visible streaks.
  */
-static Rng rng_seed(int pixel_x, int pixel_y, int frame)
-{
-    uint32_t s = (uint32_t)(pixel_x * 1973
-                          + pixel_y * 9277
-                          + frame   * 26699
-                          + 1);
-    s ^= s << 13;
-    s ^= s >> 7;
-    s ^= s << 17;
-    return s ? s : 1u;
+static Rng rng_seed(int pixel_x, int pixel_y, int frame) {
+  uint32_t s = (uint32_t)(pixel_x * 1973 + pixel_y * 9277 + frame * 26699 + 1);
+  s ^= s << 13;
+  s ^= s >> 7;
+  s ^= s << 17;
+  return s ? s : 1u;
 }
 
 /* ── §5 scene (Cornell box) ─────────────────────────────────────────── *
@@ -1135,20 +1139,22 @@ static Rng rng_seed(int pixel_x, int pixel_y, int frame)
  * to weight = albedo. This is why "throughput *= albedo" is the
  * entire bounce update (§10 + §12).
  */
-typedef struct { V3 albedo; V3 emit; } Mat;
+typedef struct {
+  V3 albedo;
+  V3 emit;
+} Mat;
 
 static const Mat k_mats[] = {
-    /* 0  white  */ { {0.73f, 0.73f, 0.73f}, {  0,    0,    0 } },
-    /* 1  red    */ { {0.65f, 0.05f, 0.05f}, {  0,    0,    0 } },
-    /* 2  green  */ { {0.12f, 0.45f, 0.15f}, {  0,    0,    0 } },
-    /* 3  light  */ { {  0,     0,     0  }, { 15.f, 14.f, 11.f} }, /* warm */
-    /* 4  gold   */ { {0.80f, 0.58f, 0.18f}, {  0,    0,    0 } },
-    /* 5  indigo */ { {0.22f, 0.28f, 0.82f}, {  0,    0,    0 } },
+    /* 0  white  */ {{0.73f, 0.73f, 0.73f}, {0, 0, 0}},
+    /* 1  red    */ {{0.65f, 0.05f, 0.05f}, {0, 0, 0}},
+    /* 2  green  */ {{0.12f, 0.45f, 0.15f}, {0, 0, 0}},
+    /* 3  light  */ {{0, 0, 0}, {15.f, 14.f, 11.f}}, /* warm */
+    /* 4  gold   */ {{0.80f, 0.58f, 0.18f}, {0, 0, 0}},
+    /* 5  indigo */ {{0.22f, 0.28f, 0.82f}, {0, 0, 0}},
 };
 
-static inline bool mat_is_light(const Mat *m)
-{
-    return m->emit.x > 0.f || m->emit.y > 0.f || m->emit.z > 0.f;
+static inline bool mat_is_light(const Mat *m) {
+  return m->emit.x > 0.f || m->emit.y > 0.f || m->emit.z > 0.f;
 }
 
 /* §5.2 ── Quad (axis-aligned rectangular plane) ───────────────────── */
@@ -1164,10 +1170,10 @@ static inline bool mat_is_light(const Mat *m)
  * far cheaper than a triangle.
  */
 typedef struct {
-    int   axis;        /* 0=X plane, 1=Y plane, 2=Z plane              */
-    float pos;         /* coordinate of the plane on its fixed axis    */
-    float lo[2], hi[2];/* bounds in the two free axes                  */
-    int   mat;         /* material index into k_mats                   */
+  int axis;           /* 0=X plane, 1=Y plane, 2=Z plane              */
+  float pos;          /* coordinate of the plane on its fixed axis    */
+  float lo[2], hi[2]; /* bounds in the two free axes                  */
+  int mat;            /* material index into k_mats                   */
 } Quad;
 
 /*
@@ -1176,14 +1182,20 @@ typedef struct {
  * before the ceiling (smaller t) and pick up the emission.
  */
 static const Quad k_quads[] = {
-    /* floor    y=-1   x∈[-1,1] z∈[0,2] */ { 1,-1.0f, {-1.f, 0.f}, {1.f, 2.f}, 0 },
-    /* ceiling  y=+1   x∈[-1,1] z∈[0,2] */ { 1, 1.0f, {-1.f, 0.f}, {1.f, 2.f}, 0 },
-    /* back     z=+2   x∈[-1,1] y∈[-1,1]*/ { 2, 2.0f, {-1.f,-1.f}, {1.f, 1.f}, 0 },
-    /* left     x=-1   y∈[-1,1] z∈[0,2] */ { 0,-1.0f, {-1.f, 0.f}, {1.f, 2.f}, 1 },
-    /* right    x=+1   y∈[-1,1] z∈[0,2] */ { 0, 1.0f, {-1.f, 0.f}, {1.f, 2.f}, 2 },
-    /* light    y=0.98 centred overhead */ { 1, 0.98f,{-0.36f,0.62f},{0.36f,1.38f},3 },
+    /* floor    y=-1   x∈[-1,1] z∈[0,2] */ {
+        1, -1.0f, {-1.f, 0.f}, {1.f, 2.f}, 0},
+    /* ceiling  y=+1   x∈[-1,1] z∈[0,2] */
+    {1, 1.0f, {-1.f, 0.f}, {1.f, 2.f}, 0},
+    /* back     z=+2   x∈[-1,1] y∈[-1,1]*/
+    {2, 2.0f, {-1.f, -1.f}, {1.f, 1.f}, 0},
+    /* left     x=-1   y∈[-1,1] z∈[0,2] */
+    {0, -1.0f, {-1.f, 0.f}, {1.f, 2.f}, 1},
+    /* right    x=+1   y∈[-1,1] z∈[0,2] */
+    {0, 1.0f, {-1.f, 0.f}, {1.f, 2.f}, 2},
+    /* light    y=0.98 centred overhead */
+    {1, 0.98f, {-0.36f, 0.62f}, {0.36f, 1.38f}, 3},
 };
-#define N_QUADS  ((int)(sizeof k_quads / sizeof k_quads[0]))
+#define N_QUADS ((int)(sizeof k_quads / sizeof k_quads[0]))
 
 /* §5.3 ── Sphere ───────────────────────────────────────────────────── */
 
@@ -1192,11 +1204,15 @@ static const Quad k_quads[] = {
  * floor at y = -1.0, leaving a small gap to avoid numerical
  * self-intersection between sphere and floor.
  */
-typedef struct { V3 c; float r; int mat; } Sphere;
+typedef struct {
+  V3 c;
+  float r;
+  int mat;
+} Sphere;
 
 static const Sphere k_spheres[] = {
-    { {-0.46f, -0.60f, 0.82f}, 0.38f, 4 },   /* gold  , left  */
-    { { 0.44f, -0.60f, 1.16f}, 0.38f, 5 },   /* indigo, right */
+    {{-0.46f, -0.60f, 0.82f}, 0.38f, 4}, /* gold  , left  */
+    {{0.44f, -0.60f, 1.16f}, 0.38f, 5},  /* indigo, right */
 };
 #define N_SPHERES ((int)(sizeof k_spheres / sizeof k_spheres[0]))
 
@@ -1218,7 +1234,10 @@ static const Sphere k_spheres[] = {
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-typedef struct { V3 origin; V3 dir; } Ray;
+typedef struct {
+  V3 origin;
+  V3 dir;
+} Ray;
 
 /*
  * camera_ray — produce a primary ray for pixel (col, row).
@@ -1244,27 +1263,24 @@ typedef struct { V3 origin; V3 dir; } Ray;
  * sample's primary ray pierces a slightly different sub-pixel point;
  * averaging filters out staircase aliasing along edges.
  */
-static Ray camera_ray(int col, int row, int cols, int rows,
-                      float jitter_x, float jitter_y)
-{
-    (void)rows;                              /* v normalised by cols */
-    float centre_x = cols * 0.5f;
-    float centre_y = rows * 0.5f;
-    float tan_half = tanf(FOV_DEG * (float)M_PI / 360.f);
+static Ray camera_ray(int col, int row, int cols, int rows, float jitter_x,
+                      float jitter_y) {
+  (void)rows; /* v normalised by cols */
+  float centre_x = cols * 0.5f;
+  float centre_y = rows * 0.5f;
+  float tan_half = tanf(FOV_DEG * (float)M_PI / 360.f);
 
-    float u =  ((col + jitter_x) - centre_x) / centre_x * tan_half;
-    float v = -((row + jitter_y) - centre_y) / centre_x * tan_half / ASPECT;
+  float u = ((col + jitter_x) - centre_x) / centre_x * tan_half;
+  float v = -((row + jitter_y) - centre_y) / centre_x * tan_half / ASPECT;
 
-    V3 forward = v3(0, 0, 1);
-    V3 right   = v3(1, 0, 0);
-    V3 up      = v3(0, 1, 0);
+  V3 forward = v3(0, 0, 1);
+  V3 right = v3(1, 0, 0);
+  V3 up = v3(0, 1, 0);
 
-    Ray ray;
-    ray.origin = v3(CAM_X, CAM_Y, CAM_Z);
-    ray.dir    = v3norm(v3add(forward,
-                       v3add(v3s(u, right),
-                             v3s(v, up))));
-    return ray;
+  Ray ray;
+  ray.origin = v3(CAM_X, CAM_Y, CAM_Z);
+  ray.dir = v3norm(v3add(forward, v3add(v3s(u, right), v3s(v, up))));
+  return ray;
 }
 
 /* ── §7 PASS 2 — SCENE INTERSECTION ─────────────────────────────────── *
@@ -1287,7 +1303,11 @@ static Ray camera_ray(int col, int row, int cols, int rows,
  * hemisphere sampling in §9 always produces directions on the
  * outgoing side without needing a flip later.
  */
-typedef struct { float t; V3 P, N; int mat; } Hit;
+typedef struct {
+  float t;
+  V3 P, N;
+  int mat;
+} Hit;
 
 /* §7.1 ── ray vs axis-aligned quad ─────────────────────────────────── */
 
@@ -1312,44 +1332,69 @@ typedef struct { float t; V3 P, N; int mat; } Hit;
  *   sign chosen to FACE the incoming ray (so subsequent hemisphere
  *   sampling puts directions on the outgoing side automatically).
  */
-static int ray_quad(Ray ray, const Quad *quad,
-                    float t_min, float *out_t, V3 *out_normal)
-{
-    float dir_a, origin_a;
-    switch (quad->axis) {
-    case 0:  dir_a = ray.dir.x; origin_a = ray.origin.x; break;
-    case 1:  dir_a = ray.dir.y; origin_a = ray.origin.y; break;
-    default: dir_a = ray.dir.z; origin_a = ray.origin.z; break;
-    }
-    if (fabsf(dir_a) < 1e-9f) return 0;            /* parallel to plane */
+static int ray_quad(Ray ray, const Quad *quad, float t_min, float *out_t,
+                    V3 *out_normal) {
+  float dir_a, origin_a;
+  switch (quad->axis) {
+  case 0:
+    dir_a = ray.dir.x;
+    origin_a = ray.origin.x;
+    break;
+  case 1:
+    dir_a = ray.dir.y;
+    origin_a = ray.origin.y;
+    break;
+  default:
+    dir_a = ray.dir.z;
+    origin_a = ray.origin.z;
+    break;
+  }
+  if (fabsf(dir_a) < 1e-9f)
+    return 0; /* parallel to plane */
 
-    float t = (quad->pos - origin_a) / dir_a;
-    if (t < t_min) return 0;
+  float t = (quad->pos - origin_a) / dir_a;
+  if (t < t_min)
+    return 0;
 
-    float hit_x = ray.origin.x + t * ray.dir.x;
-    float hit_y = ray.origin.y + t * ray.dir.y;
-    float hit_z = ray.origin.z + t * ray.dir.z;
+  float hit_x = ray.origin.x + t * ray.dir.x;
+  float hit_y = ray.origin.y + t * ray.dir.y;
+  float hit_z = ray.origin.z + t * ray.dir.z;
 
-    float free_axis_u, free_axis_v;
-    switch (quad->axis) {
-    case 0:  free_axis_u = hit_y; free_axis_v = hit_z; break;
-    case 1:  free_axis_u = hit_x; free_axis_v = hit_z; break;
-    default: free_axis_u = hit_x; free_axis_v = hit_y; break;
-    }
-    if (free_axis_u < quad->lo[0] || free_axis_u > quad->hi[0]
-     || free_axis_v < quad->lo[1] || free_axis_v > quad->hi[1])
-        return 0;
+  float free_axis_u, free_axis_v;
+  switch (quad->axis) {
+  case 0:
+    free_axis_u = hit_y;
+    free_axis_v = hit_z;
+    break;
+  case 1:
+    free_axis_u = hit_x;
+    free_axis_v = hit_z;
+    break;
+  default:
+    free_axis_u = hit_x;
+    free_axis_v = hit_y;
+    break;
+  }
+  if (free_axis_u < quad->lo[0] || free_axis_u > quad->hi[0] ||
+      free_axis_v < quad->lo[1] || free_axis_v > quad->hi[1])
+    return 0;
 
-    /* Outward normal: basis vector of fixed axis, sign opposing ray. */
-    V3 normal = {0, 0, 0};
-    switch (quad->axis) {
-    case 0:  normal.x = (dir_a > 0.f) ? -1.f : 1.f; break;
-    case 1:  normal.y = (dir_a > 0.f) ? -1.f : 1.f; break;
-    default: normal.z = (dir_a > 0.f) ? -1.f : 1.f; break;
-    }
-    *out_t      = t;
-    *out_normal = normal;
-    return 1;
+  /* Outward normal: basis vector of fixed axis, sign opposing ray. */
+  V3 normal = {0, 0, 0};
+  switch (quad->axis) {
+  case 0:
+    normal.x = (dir_a > 0.f) ? -1.f : 1.f;
+    break;
+  case 1:
+    normal.y = (dir_a > 0.f) ? -1.f : 1.f;
+    break;
+  default:
+    normal.z = (dir_a > 0.f) ? -1.f : 1.f;
+    break;
+  }
+  *out_t = t;
+  *out_normal = normal;
+  return 1;
 }
 
 /* §7.2 ── ray vs sphere ─────────────────────────────────────────────── */
@@ -1370,21 +1415,23 @@ static int ray_quad(Ray ray, const Quad *quad,
  * starts INSIDE the sphere, which can't happen here — diffuse
  * surfaces don't let rays in).
  */
-static int ray_sphere(Ray ray, const Sphere *sphere,
-                      float t_min, float *out_t)
-{
-    V3    origin_to_centre = v3sub(ray.origin, sphere->c);
-    float b    = v3dot(ray.dir, origin_to_centre);
-    float disc = b * b - v3dot(origin_to_centre, origin_to_centre)
-                       + sphere->r * sphere->r;
-    if (disc < 0.f) return 0;
+static int ray_sphere(Ray ray, const Sphere *sphere, float t_min,
+                      float *out_t) {
+  V3 origin_to_centre = v3sub(ray.origin, sphere->c);
+  float b = v3dot(ray.dir, origin_to_centre);
+  float disc =
+      b * b - v3dot(origin_to_centre, origin_to_centre) + sphere->r * sphere->r;
+  if (disc < 0.f)
+    return 0;
 
-    float sq = sqrtf(disc);
-    float t  = -b - sq;
-    if (t < t_min) t = -b + sq;
-    if (t < t_min) return 0;
-    *out_t = t;
-    return 1;
+  float sq = sqrtf(disc);
+  float t = -b - sq;
+  if (t < t_min)
+    t = -b + sq;
+  if (t < t_min)
+    return 0;
+  *out_t = t;
+  return 1;
 }
 
 /* §7.3 ── scene_hit (find nearest surface) ─────────────────────────── */
@@ -1401,42 +1448,37 @@ static int ray_sphere(Ray ray, const Sphere *sphere,
  * (ensuring the hemisphere sampler gets a normal on the outgoing
  * side, regardless of front/back hit).
  */
-static int scene_hit(Ray ray, float t_min, Hit *out_hit)
-{
-    float t_best = 1e30f;
-    int   any    = 0;
+static int scene_hit(Ray ray, float t_min, Hit *out_hit) {
+  float t_best = 1e30f;
+  int any = 0;
 
-    for (int i = 0; i < N_QUADS; i++) {
-        float t;
-        V3    normal;
-        if (ray_quad(ray, &k_quads[i], t_min, &t, &normal)
-            && t < t_best)
-        {
-            t_best       = t;
-            out_hit->t   = t;
-            out_hit->P   = v3add(ray.origin, v3s(t, ray.dir));
-            out_hit->N   = normal;
-            out_hit->mat = k_quads[i].mat;
-            any          = 1;
-        }
+  for (int i = 0; i < N_QUADS; i++) {
+    float t;
+    V3 normal;
+    if (ray_quad(ray, &k_quads[i], t_min, &t, &normal) && t < t_best) {
+      t_best = t;
+      out_hit->t = t;
+      out_hit->P = v3add(ray.origin, v3s(t, ray.dir));
+      out_hit->N = normal;
+      out_hit->mat = k_quads[i].mat;
+      any = 1;
     }
-    for (int i = 0; i < N_SPHERES; i++) {
-        float t;
-        if (ray_sphere(ray, &k_spheres[i], t_min, &t)
-            && t < t_best)
-        {
-            t_best       = t;
-            out_hit->t   = t;
-            out_hit->P   = v3add(ray.origin, v3s(t, ray.dir));
-            V3 outward_n = v3norm(v3sub(out_hit->P, k_spheres[i].c));
-            /* Flip outward normal to face the incoming ray. */
-            out_hit->N   = (v3dot(outward_n, ray.dir) < 0.f)
-                           ? outward_n : v3s(-1.f, outward_n);
-            out_hit->mat = k_spheres[i].mat;
-            any          = 1;
-        }
+  }
+  for (int i = 0; i < N_SPHERES; i++) {
+    float t;
+    if (ray_sphere(ray, &k_spheres[i], t_min, &t) && t < t_best) {
+      t_best = t;
+      out_hit->t = t;
+      out_hit->P = v3add(ray.origin, v3s(t, ray.dir));
+      V3 outward_n = v3norm(v3sub(out_hit->P, k_spheres[i].c));
+      /* Flip outward normal to face the incoming ray. */
+      out_hit->N =
+          (v3dot(outward_n, ray.dir) < 0.f) ? outward_n : v3s(-1.f, outward_n);
+      out_hit->mat = k_spheres[i].mat;
+      any = 1;
     }
-    return any;
+  }
+  return any;
 }
 
 /* ── §8 PASS 3 — SHADING DECISION ───────────────────────────────────── *
@@ -1457,10 +1499,7 @@ static int scene_hit(Ray ray, float t_min, Hit *out_hit)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-static const Mat *shade_at_hit(const Hit *hit)
-{
-    return &k_mats[hit->mat];
-}
+static const Mat *shade_at_hit(const Hit *hit) { return &k_mats[hit->mat]; }
 
 /* ── §9 PASS 4 — BOUNCE DIRECTION SAMPLING ──────────────────────────── *
  *
@@ -1487,11 +1526,10 @@ static const Mat *shade_at_hit(const Hit *hit)
  * 0.9) use Y as the seed; otherwise use X. Either way `up × n` is
  * non-zero, so v3cross produces a valid perpendicular.
  */
-static void onb(V3 normal, V3 *out_u, V3 *out_v)
-{
-    V3 up = (fabsf(normal.x) < 0.9f) ? v3(1, 0, 0) : v3(0, 1, 0);
-    *out_u = v3norm(v3cross(up, normal));
-    *out_v = v3cross(normal, *out_u);
+static void onb(V3 normal, V3 *out_u, V3 *out_v) {
+  V3 up = (fabsf(normal.x) < 0.9f) ? v3(1, 0, 0) : v3(0, 1, 0);
+  *out_u = v3norm(v3cross(up, normal));
+  *out_v = v3cross(normal, *out_u);
 }
 
 /* §9.2 ── sample_bounce: cosine-weighted hemisphere sample ──────────── */
@@ -1517,20 +1555,18 @@ static void onb(V3 normal, V3 *out_u, V3 *out_v)
  *
  * See tutorial T7 for the diagram.
  */
-static V3 sample_bounce(V3 normal, Rng *rng_state)
-{
-    float r1   = rng_f(rng_state);
-    float r2   = rng_f(rng_state);
-    float phi  = 2.f * (float)M_PI * r1;
-    float sr2  = sqrtf(r2);                          /* sinθ */
-    float local_x = cosf(phi) * sr2;
-    float local_y = sinf(phi) * sr2;
-    float local_z = sqrtf(1.f - r2);                 /* cosθ */
-    V3 basis_u, basis_v;
-    onb(normal, &basis_u, &basis_v);
-    return v3norm(v3add(v3s(local_x, basis_u),
-                  v3add(v3s(local_y, basis_v),
-                        v3s(local_z, normal))));
+static V3 sample_bounce(V3 normal, Rng *rng_state) {
+  float r1 = rng_f(rng_state);
+  float r2 = rng_f(rng_state);
+  float phi = 2.f * (float)M_PI * r1;
+  float sr2 = sqrtf(r2); /* sinθ */
+  float local_x = cosf(phi) * sr2;
+  float local_y = sinf(phi) * sr2;
+  float local_z = sqrtf(1.f - r2); /* cosθ */
+  V3 basis_u, basis_v;
+  onb(normal, &basis_u, &basis_v);
+  return v3norm(v3add(v3s(local_x, basis_u),
+                      v3add(v3s(local_y, basis_v), v3s(local_z, normal))));
 }
 
 /* ── §10 PASS 5 — THROUGHPUT CHAIN ──────────────────────────────────── *
@@ -1559,9 +1595,8 @@ static V3 sample_bounce(V3 normal, Rng *rng_state)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-static inline V3 throughput_chain(V3 throughput, V3 albedo)
-{
-    return v3mul(throughput, albedo);
+static inline V3 throughput_chain(V3 throughput, V3 albedo) {
+  return v3mul(throughput, albedo);
 }
 
 /* ── §11 PASS 6 — TERMINATION ───────────────────────────────────────── *
@@ -1599,13 +1634,14 @@ static inline V3 throughput_chain(V3 throughput, V3 albedo)
  * is meaningful in the red channel; killing it because the average
  * is 0.17 would erase real red contributions.
  */
-static bool russian_roulette(V3 *throughput, Rng *rng_state)
-{
-    float p = v3maxc(*throughput);
-    if (p < 1e-4f)              return false;     /* throughput too low */
-    if (rng_f(rng_state) > p)   return false;     /* rolled the kill   */
-    *throughput = v3s(1.f / p, *throughput);      /* compensate       */
-    return true;                                  /* survived         */
+static bool russian_roulette(V3 *throughput, Rng *rng_state) {
+  float p = v3maxc(*throughput);
+  if (p < 1e-4f)
+    return false; /* throughput too low */
+  if (rng_f(rng_state) > p)
+    return false;                          /* rolled the kill   */
+  *throughput = v3s(1.f / p, *throughput); /* compensate       */
+  return true;                             /* survived         */
 }
 
 /* ── §12 path_trace (orchestrator: combines passes 2-6) ─────────────── *
@@ -1642,37 +1678,37 @@ static bool russian_roulette(V3 *throughput, Rng *rng_state)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-static V3 path_trace(Ray ray, Rng *rng_state)
-{
-    V3 color      = v3(0, 0, 0);
-    V3 throughput = v3(1, 1, 1);
+static V3 path_trace(Ray ray, Rng *rng_state) {
+  V3 color = v3(0, 0, 0);
+  V3 throughput = v3(1, 1, 1);
 
-    for (int depth = 0; depth < MAX_DEPTH; depth++) {
+  for (int depth = 0; depth < MAX_DEPTH; depth++) {
 
-        /* PASS 2 — SCENE INTERSECTION. */
-        Hit hit;
-        if (!scene_hit(ray, RAY_EPS, &hit)) break;
+    /* PASS 2 — SCENE INTERSECTION. */
+    Hit hit;
+    if (!scene_hit(ray, RAY_EPS, &hit))
+      break;
 
-        /* PASS 3 — SHADING DECISION. */
-        const Mat *mat = shade_at_hit(&hit);
-        if (mat_is_light(mat)) {
-            /* Emissive: contribute throughput · emission and stop. */
-            color = v3add(color, v3mul(throughput, mat->emit));
-            break;
-        }
-
-        /* PASS 6 — TERMINATION (Russian roulette after depth warm-up). */
-        if (depth >= RR_DEPTH && !russian_roulette(&throughput, rng_state))
-            break;
-
-        /* PASS 5 — THROUGHPUT CHAIN. */
-        throughput = throughput_chain(throughput, mat->albedo);
-
-        /* PASS 4 — BOUNCE DIRECTION SAMPLING.  Push origin off surface. */
-        ray.dir    = sample_bounce(hit.N, rng_state);
-        ray.origin = v3add(hit.P, v3s(RAY_EPS, hit.N));
+    /* PASS 3 — SHADING DECISION. */
+    const Mat *mat = shade_at_hit(&hit);
+    if (mat_is_light(mat)) {
+      /* Emissive: contribute throughput · emission and stop. */
+      color = v3add(color, v3mul(throughput, mat->emit));
+      break;
     }
-    return color;
+
+    /* PASS 6 — TERMINATION (Russian roulette after depth warm-up). */
+    if (depth >= RR_DEPTH && !russian_roulette(&throughput, rng_state))
+      break;
+
+    /* PASS 5 — THROUGHPUT CHAIN. */
+    throughput = throughput_chain(throughput, mat->albedo);
+
+    /* PASS 4 — BOUNCE DIRECTION SAMPLING.  Push origin off surface. */
+    ray.dir = sample_bounce(hit.N, rng_state);
+    ray.origin = v3add(hit.P, v3s(RAY_EPS, hit.N));
+  }
+  return color;
 }
 
 /* ── §13 PASS 7 — ACCUMULATION + TONE MAPPING ───────────────────────── *
@@ -1696,12 +1732,11 @@ static V3 path_trace(Ray ray, Rng *rng_state)
 /* §13.1 ── accumulator + reset ──────────────────────────────────────── */
 
 static float g_accum[MAX_H][MAX_W][3];
-static int   g_samples = 0;
+static int g_samples = 0;
 
-static void accum_reset(void)
-{
-    memset(g_accum, 0, sizeof g_accum);
-    g_samples = 0;
+static void accum_reset(void) {
+  memset(g_accum, 0, sizeof g_accum);
+  g_samples = 0;
 }
 
 /* forward declaration — debug overlays defined in §14. */
@@ -1736,50 +1771,45 @@ static V3 first_hit_viz(Ray ray, ShadeMode mode);
  * frames don't redraw the same noise pattern.
  */
 static void accum_add_frame(int cols, int rows, int spp, int frame_idx,
-                            ShadeMode mode)
-{
-    for (int row = 0; row < rows - 1 && row < MAX_H; row++) {
-        for (int col = 0; col < cols && col < MAX_W; col++) {
-            float sum_r = 0.f, sum_g = 0.f, sum_b = 0.f;
+                            ShadeMode mode) {
+  for (int row = 0; row < rows - 1 && row < MAX_H; row++) {
+    for (int col = 0; col < cols && col < MAX_W; col++) {
+      float sum_r = 0.f, sum_g = 0.f, sum_b = 0.f;
 
-            for (int s = 0; s < spp; s++) {
-                Rng rng_state = rng_seed(col, row, frame_idx * spp + s);
+      for (int s = 0; s < spp; s++) {
+        Rng rng_state = rng_seed(col, row, frame_idx * spp + s);
 
-                /* Sub-pixel jitter for free anti-aliasing. */
-                float jitter_x = rng_f(&rng_state) - 0.5f;
-                float jitter_y = rng_f(&rng_state) - 0.5f;
+        /* Sub-pixel jitter for free anti-aliasing. */
+        float jitter_x = rng_f(&rng_state) - 0.5f;
+        float jitter_y = rng_f(&rng_state) - 0.5f;
 
-                /* PASS 1 — primary ray. */
-                Ray primary = camera_ray(col, row, cols, rows,
-                                         jitter_x, jitter_y);
+        /* PASS 1 — primary ray. */
+        Ray primary = camera_ray(col, row, cols, rows, jitter_x, jitter_y);
 
-                /* PASSES 2-6 (or debug short-circuit). */
-                V3 radiance = (mode == MODE_PT)
-                              ? path_trace(primary, &rng_state)
-                              : first_hit_viz(primary, mode);
-                sum_r += radiance.x;
-                sum_g += radiance.y;
-                sum_b += radiance.z;
-            }
+        /* PASSES 2-6 (or debug short-circuit). */
+        V3 radiance = (mode == MODE_PT) ? path_trace(primary, &rng_state)
+                                        : first_hit_viz(primary, mode);
+        sum_r += radiance.x;
+        sum_g += radiance.y;
+        sum_b += radiance.z;
+      }
 
-            g_accum[row][col][0] += sum_r;
-            g_accum[row][col][1] += sum_g;
-            g_accum[row][col][2] += sum_b;
-        }
+      g_accum[row][col][0] += sum_r;
+      g_accum[row][col][1] += sum_g;
+      g_accum[row][col][2] += sum_b;
     }
-    g_samples += spp;
+  }
+  g_samples += spp;
 }
 
 /* §13.3 ── tone-mapping + draw ──────────────────────────────────────── */
 
 static inline float reinhard(float x) { return x / (1.f + x); }
-static inline float gamma_enc(float x)
-{
-    return powf(x < 0.f ? 0.f : (x > 1.f ? 1.f : x), 1.f / 2.2f);
+static inline float gamma_enc(float x) {
+  return powf(x < 0.f ? 0.f : (x > 1.f ? 1.f : x), 1.f / 2.2f);
 }
-static inline float rec601_luma(float r, float g, float b)
-{
-    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+static inline float rec601_luma(float r, float g, float b) {
+  return 0.2126f * r + 0.7152f * g + 0.0722f * b;
 }
 
 /*
@@ -1796,44 +1826,51 @@ static inline float rec601_luma(float r, float g, float b)
  * samples is not the same as N times the tone-map of a single sample.
  * (Tone-map is non-linear.)
  */
-static void accum_draw(int cols, int rows)
-{
-    if (g_samples == 0) return;
-    float inv_samples = 1.f / (float)g_samples;
+static void accum_draw(int cols, int rows) {
+  if (g_samples == 0)
+    return;
+  float inv_samples = 1.f / (float)g_samples;
 
-    for (int row = 0; row < rows - 1 && row < MAX_H; row++) {
-        for (int col = 0; col < cols && col < MAX_W; col++) {
-            float r = g_accum[row][col][0] * inv_samples;
-            float g = g_accum[row][col][1] * inv_samples;
-            float b = g_accum[row][col][2] * inv_samples;
+  for (int row = 0; row < rows - 1 && row < MAX_H; row++) {
+    for (int col = 0; col < cols && col < MAX_W; col++) {
+      float r = g_accum[row][col][0] * inv_samples;
+      float g = g_accum[row][col][1] * inv_samples;
+      float b = g_accum[row][col][2] * inv_samples;
 
-            r = gamma_enc(reinhard(r));
-            g = gamma_enc(reinhard(g));
-            b = gamma_enc(reinhard(b));
+      r = gamma_enc(reinhard(r));
+      g = gamma_enc(reinhard(g));
+      b = gamma_enc(reinhard(b));
 
-            float luma = rec601_luma(r, g, b);
-            int   ramp_index = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
-            if (ramp_index < 0)            ramp_index = 0;
-            if (ramp_index >= RAMP_LEN)    ramp_index = RAMP_LEN - 1;
-            char ch = k_ramp[ramp_index];
+      float luma = rec601_luma(r, g, b);
+      int ramp_index = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
+      if (ramp_index < 0)
+        ramp_index = 0;
+      if (ramp_index >= RAMP_LEN)
+        ramp_index = RAMP_LEN - 1;
+      char ch = k_ramp[ramp_index];
 
-            int red_5bit   = (int)(r * 5.f + 0.5f);
-            int green_5bit = (int)(g * 5.f + 0.5f);
-            int blue_5bit  = (int)(b * 5.f + 0.5f);
-            if (red_5bit   > 5) red_5bit   = 5;
-            if (red_5bit   < 0) red_5bit   = 0;
-            if (green_5bit > 5) green_5bit = 5;
-            if (green_5bit < 0) green_5bit = 0;
-            if (blue_5bit  > 5) blue_5bit  = 5;
-            if (blue_5bit  < 0) blue_5bit  = 0;
-            int pair_index = PAIR_CUBE_BASE + red_5bit * 36
-                                            + green_5bit * 6
-                                            + blue_5bit;
-            attron(COLOR_PAIR(pair_index) | A_BOLD);
-            mvaddch(row, col, (chtype)(unsigned char)ch);
-            attroff(COLOR_PAIR(pair_index) | A_BOLD);
-        }
+      int red_5bit = (int)(r * 5.f + 0.5f);
+      int green_5bit = (int)(g * 5.f + 0.5f);
+      int blue_5bit = (int)(b * 5.f + 0.5f);
+      if (red_5bit > 5)
+        red_5bit = 5;
+      if (red_5bit < 0)
+        red_5bit = 0;
+      if (green_5bit > 5)
+        green_5bit = 5;
+      if (green_5bit < 0)
+        green_5bit = 0;
+      if (blue_5bit > 5)
+        blue_5bit = 5;
+      if (blue_5bit < 0)
+        blue_5bit = 0;
+      int pair_index =
+          PAIR_CUBE_BASE + red_5bit * 36 + green_5bit * 6 + blue_5bit;
+      attron(COLOR_PAIR(pair_index) | A_BOLD);
+      mvaddch(row, col, (chtype)(unsigned char)ch);
+      attroff(COLOR_PAIR(pair_index) | A_BOLD);
     }
+  }
 }
 
 /* ── §14 debug overlays (visualise individual passes) ───────────────── *
@@ -1851,41 +1888,39 @@ static void accum_draw(int cols, int rows)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-static V3 first_hit_viz(Ray ray, ShadeMode mode)
-{
-    Hit hit;
-    if (!scene_hit(ray, RAY_EPS, &hit))
-        return v3(0, 0, 0);                                /* miss */
+static V3 first_hit_viz(Ray ray, ShadeMode mode) {
+  Hit hit;
+  if (!scene_hit(ray, RAY_EPS, &hit))
+    return v3(0, 0, 0); /* miss */
 
-    const Mat *mat = shade_at_hit(&hit);
+  const Mat *mat = shade_at_hit(&hit);
 
-    switch (mode) {
-    case MODE_NORMAL:
-        /* Encode normal as RGB ∈ [0, 1]³ — each component −1..1 → 0..1. */
-        return v3(hit.N.x * 0.5f + 0.5f,
-                  hit.N.y * 0.5f + 0.5f,
-                  hit.N.z * 0.5f + 0.5f);
+  switch (mode) {
+  case MODE_NORMAL:
+    /* Encode normal as RGB ∈ [0, 1]³ — each component −1..1 → 0..1. */
+    return v3(hit.N.x * 0.5f + 0.5f, hit.N.y * 0.5f + 0.5f,
+              hit.N.z * 0.5f + 0.5f);
 
-    case MODE_ALBEDO:
-        /* Material body colour. Lights show as a clamped slice of
-         * emission so they read bright but don't blow out the cube. */
-        if (mat_is_light(mat)) {
-            return v3(fminf(mat->emit.x * 0.06f, 1.f),
-                      fminf(mat->emit.y * 0.06f, 1.f),
-                      fminf(mat->emit.z * 0.06f, 1.f));
-        }
-        return mat->albedo;
-
-    case MODE_DEPTH: {
-        /* 1 / (1 + t): closer surfaces brighter, distant darker.
-         * Output as gray (R=G=B). */
-        float v = 1.f / (1.f + hit.t);
-        return v3(v, v, v);
+  case MODE_ALBEDO:
+    /* Material body colour. Lights show as a clamped slice of
+     * emission so they read bright but don't blow out the cube. */
+    if (mat_is_light(mat)) {
+      return v3(fminf(mat->emit.x * 0.06f, 1.f),
+                fminf(mat->emit.y * 0.06f, 1.f),
+                fminf(mat->emit.z * 0.06f, 1.f));
     }
+    return mat->albedo;
 
-    default:
-        return v3(0, 0, 0);
-    }
+  case MODE_DEPTH: {
+    /* 1 / (1 + t): closer surfaces brighter, distant darker.
+     * Output as gray (R=G=B). */
+    float v = 1.f / (1.f + hit.t);
+    return v3(v, v, v);
+  }
+
+  default:
+    return v3(0, 0, 0);
+  }
 }
 
 /* ── §15 screen ─────────────────────────────────────────────────────── */
@@ -1894,27 +1929,26 @@ static int g_have_256 = 0;
 
 /* §15.1 ── color_init: 6×6×6 cube + reserved HUD/HINT/bar pairs ────── */
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    g_have_256 = (COLORS >= 256);
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  g_have_256 = (COLORS >= 256);
 
-    if (g_have_256) {
-        /* 216-colour xterm cube: pairs PAIR_CUBE_BASE..+215. */
-        for (int i = 0; i < 216; i++)
-            init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
-        init_pair(PAIR_HUD,        226, -1);  /* bright yellow         */
-        init_pair(PAIR_HINT,        51, -1);  /* bright cyan           */
-        init_pair(PAIR_BAR_FILL,    46, -1);  /* bright green (filled) */
-        init_pair(PAIR_BAR_EMPTY,  240, -1);  /* dim grey (empty)      */
-    } else {
-        init_pair(PAIR_CUBE_BASE,  COLOR_WHITE,  -1);
-        init_pair(PAIR_HUD,        COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,       COLOR_CYAN,   -1);
-        init_pair(PAIR_BAR_FILL,   COLOR_GREEN,  -1);
-        init_pair(PAIR_BAR_EMPTY,  COLOR_WHITE,  -1);
-    }
+  if (g_have_256) {
+    /* 216-colour xterm cube: pairs PAIR_CUBE_BASE..+215. */
+    for (int i = 0; i < 216; i++)
+      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
+    init_pair(PAIR_HUD, 226, -1);       /* bright yellow         */
+    init_pair(PAIR_HINT, 51, -1);       /* bright cyan           */
+    init_pair(PAIR_BAR_FILL, 46, -1);   /* bright green (filled) */
+    init_pair(PAIR_BAR_EMPTY, 240, -1); /* dim grey (empty)      */
+  } else {
+    init_pair(PAIR_CUBE_BASE, COLOR_WHITE, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+    init_pair(PAIR_BAR_FILL, COLOR_GREEN, -1);
+    init_pair(PAIR_BAR_EMPTY, COLOR_WHITE, -1);
+  }
 }
 
 /* §15.2 ── progress bar (samples / ACCUM_CAP) ───────────────────────── */
@@ -1929,28 +1963,30 @@ static void color_init(void)
  * Width scales to ≈ cols/3 with bounds [8, 60] so it stays useful on
  * both narrow and wide terminals.
  */
-static void draw_progress_bar(int row, int cols, int samples)
-{
-    int bar_width = cols / 3;
-    if (bar_width < 8)  bar_width = 8;
-    if (bar_width > 60) bar_width = 60;
-    int filled = (int)((float)samples / (float)ACCUM_CAP * bar_width);
-    if (filled > bar_width) filled = bar_width;
+static void draw_progress_bar(int row, int cols, int samples) {
+  int bar_width = cols / 3;
+  if (bar_width < 8)
+    bar_width = 8;
+  if (bar_width > 60)
+    bar_width = 60;
+  int filled = (int)((float)samples / (float)ACCUM_CAP * bar_width);
+  if (filled > bar_width)
+    filled = bar_width;
 
-    int x = 1;
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvaddch(row, x++, '[');
-    for (int i = 0; i < bar_width; i++) {
-        bool on   = (i < filled);
-        int  pair = on ? PAIR_BAR_FILL : PAIR_BAR_EMPTY;
-        int  attr = on ? A_BOLD        : A_DIM;
-        attron(COLOR_PAIR(pair) | attr);
-        mvaddch(row, x++, (chtype)(unsigned char)(on ? '=' : '-'));
-        attroff(COLOR_PAIR(pair) | attr);
-    }
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvaddch(row, x++, ']');
-    attroff(COLOR_PAIR(PAIR_HUD));
+  int x = 1;
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvaddch(row, x++, '[');
+  for (int i = 0; i < bar_width; i++) {
+    bool on = (i < filled);
+    int pair = on ? PAIR_BAR_FILL : PAIR_BAR_EMPTY;
+    int attr = on ? A_BOLD : A_DIM;
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(row, x++, (chtype)(unsigned char)(on ? '=' : '-'));
+    attroff(COLOR_PAIR(pair) | attr);
+  }
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvaddch(row, x++, ']');
+  attroff(COLOR_PAIR(PAIR_HUD));
 }
 
 /* §15.3 ── hud_draw (HUD spec compliant) ────────────────────────────── */
@@ -1963,146 +1999,175 @@ static void draw_progress_bar(int row, int cols, int samples)
  *   row 1 (top, yellow + progress bar) convergence visualisation
  *   row rows-1 (bottom, cyan + BOLD)   key hint strip
  */
-static void hud_draw(int cols, int rows, float fps,
-                     int spp, int samples, ShadeMode mode, bool paused)
-{
-    /* §15.3.1 status — top-right. */
-    char buf[140];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  spp:%d  samples:%-5d  mode:%s  %s ",
-             (double)fps, spp, samples, shade_mode_name(mode),
-             paused                ? "PAUSED   "
-             : (mode != MODE_PT)   ? "instant  "
-             : samples >= ACCUM_CAP? "CONVERGED"
-                                   : "tracing  ");
-    int len = (int)strlen(buf);
-    if (len > cols) len = cols;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - len, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+static void hud_draw(int cols, int rows, float fps, int spp, int samples,
+                     ShadeMode mode, bool paused) {
+  /* §15.3.1 status — top-right. */
+  char buf[140];
+  snprintf(buf, sizeof buf, " %5.1f fps  spp:%d  samples:%-5d  mode:%s  %s ",
+           (double)fps, spp, samples, shade_mode_name(mode),
+           paused                 ? "PAUSED   "
+           : (mode != MODE_PT)    ? "instant  "
+           : samples >= ACCUM_CAP ? "CONVERGED"
+                                  : "tracing  ");
+  int len = (int)strlen(buf);
+  if (len > cols)
+    len = cols;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, cols - len, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* §15.3.2 title — top-left, same row. */
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(0, 0, " PATH TRACER · CORNELL BOX ");
-    attroff(COLOR_PAIR(PAIR_HUD));
+  /* §15.3.2 title — top-left, same row. */
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(0, 0, " PATH TRACER · CORNELL BOX ");
+  attroff(COLOR_PAIR(PAIR_HUD));
 
-    /* §15.3.3 progress bar — row 1. Only meaningful in PT mode (debug
-     * modes converge in 1 sample so the bar would just show "tiny
-     * progress, full bar"). Hide it in debug modes. */
-    if (rows > 4 && mode == MODE_PT) draw_progress_bar(1, cols, samples);
+  /* §15.3.3 progress bar — row 1. Only meaningful in PT mode (debug
+   * modes converge in 1 sample so the bar would just show "tiny
+   * progress, full bar"). Hide it in debug modes. */
+  if (rows > 4 && mode == MODE_PT)
+    draw_progress_bar(1, cols, samples);
 
-    /* §15.3.4 hint — bottom row, cyan + BOLD. */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(rows - 1, 0,
-             " q:quit  spc/p:pause  r:reset  d:mode  +/-:spp ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  /* §15.3.4 hint — bottom row, cyan + BOLD. */
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(rows - 1, 0, " q:quit  spc/p:pause  r:reset  d:mode  +/-:spp ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ── §16 app ────────────────────────────────────────────────────────── */
 
-static volatile sig_atomic_t g_run    = 1;
+static volatile sig_atomic_t g_run = 1;
 static volatile sig_atomic_t g_resize = 0;
-static void on_sigint  (int s) { (void)s; g_run    = 0; }
-static void on_sigwinch(int s) { (void)s; g_resize = 1; }
-static void cleanup(void)      { endwin(); }
+static void on_sigint(int s) {
+  (void)s;
+  g_run = 0;
+}
+static void on_sigwinch(int s) {
+  (void)s;
+  g_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-int main(void)
-{
-    signal(SIGINT,   on_sigint);
-    signal(SIGTERM,  on_sigint);
-    signal(SIGWINCH, on_sigwinch);
-    atexit(cleanup);
+int main(void) {
+  signal(SIGINT, on_sigint);
+  signal(SIGTERM, on_sigint);
+  signal(SIGWINCH, on_sigwinch);
+  atexit(cleanup);
 
-    initscr();
-    cbreak(); noecho(); curs_set(0);
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    typeahead(-1);                          /* prevent input tearing */
+  initscr();
+  cbreak();
+  noecho();
+  curs_set(0);
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  typeahead(-1); /* prevent input tearing */
 
-    int cols, rows;
-    getmaxyx(stdscr, rows, cols);
-    color_init();
-    accum_reset();
+  int cols, rows;
+  getmaxyx(stdscr, rows, cols);
+  color_init();
+  accum_reset();
 
-    int       spp        = SPP_DEFAULT;
-    bool      paused     = false;
-    ShadeMode mode       = MODE_PT;
-    float     fps        = 0.f;
-    long long fps_acc    = 0;
-    int       fps_cnt    = 0;
-    long long frame_ns   = 1000000000LL / TARGET_FPS;
-    long long last       = clock_ns();
-    int       frame_idx  = 0;
+  int spp = SPP_DEFAULT;
+  bool paused = false;
+  ShadeMode mode = MODE_PT;
+  float fps = 0.f;
+  long long fps_acc = 0;
+  int fps_cnt = 0;
+  long long frame_ns = 1000000000LL / TARGET_FPS;
+  long long last = clock_ns();
+  int frame_idx = 0;
 
-    while (g_run) {
+  while (g_run) {
 
-        /* §16.1 resize — invalidate accumulator, restart frame indexing. */
-        if (g_resize) {
-            g_resize = 0;
-            endwin(); refresh();
-            getmaxyx(stdscr, rows, cols);
-            accum_reset();
-            frame_idx = 0;
-        }
-
-        /* §16.2 timing — wall clock dt with cap. */
-        long long now = clock_ns();
-        long long dt  = now - last;
-        if (dt > DT_CAP_NS) dt = DT_CAP_NS;
-        last = now;
-
-        /* §16.3 fps rolling average over half-second windows. */
-        fps_acc += dt; fps_cnt++;
-        if (fps_acc >= 500000000LL) {
-            fps     = (float)fps_cnt * 1e9f / (float)fps_acc;
-            fps_acc = 0; fps_cnt = 0;
-        }
-
-        /* §16.4 add samples — auto-pause once converged in PT mode.
-         *
-         * Debug modes (NORMAL/ALBEDO/DEPTH) are deterministic so we
-         * add one frame's worth and stop (no point re-rendering the
-         * same image every frame). */
-        bool can_sample = !paused && (
-            mode != MODE_PT ? (g_samples == 0)
-                            : (g_samples < ACCUM_CAP));
-        if (can_sample)
-            accum_add_frame(cols, rows, spp, frame_idx++, mode);
-
-        /* §16.5 paint frame. */
-        long long frame_start = clock_ns();
-        erase();
-        accum_draw(cols, rows);
-        hud_draw(cols, rows, fps, spp, g_samples, mode, paused);
-        wnoutrefresh(stdscr);
-        doupdate();
-
-        /* §16.6 input. Resetting the accumulator on +/- (SPP changes)
-         * and on 'd' (mode changes) because the average mixes paths
-         * with different sampling rates / output ranges otherwise. */
-        int ch = getch();
-        switch (ch) {
-        case 'q': case 'Q': case 27 /* ESC */:
-            g_run = 0; break;
-        case ' ': case 'p': case 'P':
-            paused = !paused; break;
-        case 'r': case 'R':
-            accum_reset(); frame_idx = 0; break;
-        case '+': case '=':
-            if (spp < SPP_MAX) spp++;
-            accum_reset(); frame_idx = 0; break;
-        case '-': case '_':
-            if (spp > SPP_MIN) spp--;
-            accum_reset(); frame_idx = 0; break;
-        case 'd': case 'D':
-            mode = (ShadeMode)((mode + 1) % MODE_N);
-            accum_reset(); frame_idx = 0;
-            break;
-        default: break;
-        }
-
-        /* §16.7 frame cap. */
-        clock_sleep_ns(frame_ns - (clock_ns() - frame_start));
+    /* §16.1 resize — invalidate accumulator, restart frame indexing. */
+    if (g_resize) {
+      g_resize = 0;
+      endwin();
+      refresh();
+      getmaxyx(stdscr, rows, cols);
+      accum_reset();
+      frame_idx = 0;
     }
-    return 0;
+
+    /* §16.2 timing — wall clock dt with cap. */
+    long long now = clock_ns();
+    long long dt = now - last;
+    if (dt > DT_CAP_NS)
+      dt = DT_CAP_NS;
+    last = now;
+
+    /* §16.3 fps rolling average over half-second windows. */
+    fps_acc += dt;
+    fps_cnt++;
+    if (fps_acc >= 500000000LL) {
+      fps = (float)fps_cnt * 1e9f / (float)fps_acc;
+      fps_acc = 0;
+      fps_cnt = 0;
+    }
+
+    /* §16.4 add samples — auto-pause once converged in PT mode.
+     *
+     * Debug modes (NORMAL/ALBEDO/DEPTH) are deterministic so we
+     * add one frame's worth and stop (no point re-rendering the
+     * same image every frame). */
+    bool can_sample = !paused && (mode != MODE_PT ? (g_samples == 0)
+                                                  : (g_samples < ACCUM_CAP));
+    if (can_sample)
+      accum_add_frame(cols, rows, spp, frame_idx++, mode);
+
+    /* §16.5 paint frame. */
+    long long frame_start = clock_ns();
+    erase();
+    accum_draw(cols, rows);
+    hud_draw(cols, rows, fps, spp, g_samples, mode, paused);
+    wnoutrefresh(stdscr);
+    doupdate();
+
+    /* §16.6 input. Resetting the accumulator on +/- (SPP changes)
+     * and on 'd' (mode changes) because the average mixes paths
+     * with different sampling rates / output ranges otherwise. */
+    int ch = getch();
+    switch (ch) {
+    case 'q':
+    case 'Q':
+    case 27 /* ESC */:
+      g_run = 0;
+      break;
+    case ' ':
+    case 'p':
+    case 'P':
+      paused = !paused;
+      break;
+    case 'r':
+    case 'R':
+      accum_reset();
+      frame_idx = 0;
+      break;
+    case '+':
+    case '=':
+      if (spp < SPP_MAX)
+        spp++;
+      accum_reset();
+      frame_idx = 0;
+      break;
+    case '-':
+    case '_':
+      if (spp > SPP_MIN)
+        spp--;
+      accum_reset();
+      frame_idx = 0;
+      break;
+    case 'd':
+    case 'D':
+      mode = (ShadeMode)((mode + 1) % MODE_N);
+      accum_reset();
+      frame_idx = 0;
+      break;
+    default:
+      break;
+    }
+
+    /* §16.7 frame cap. */
+    clock_sleep_ns(frame_ns - (clock_ns() - frame_start));
+  }
+  return 0;
 }

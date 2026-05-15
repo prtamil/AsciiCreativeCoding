@@ -344,59 +344,63 @@
 /* ===================================================================== */
 
 enum {
-    SIM_FPS_MIN      =  10,
-    SIM_FPS_DEFAULT  =  60,
-    SIM_FPS_MAX      = 120,
-    SIM_FPS_STEP     =  10,
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 60,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
 
-    SPEED_MIN        =   1,
-    SPEED_DEF        =   8,
-    SPEED_MAX        =  64,
+  SPEED_MIN = 1,
+  SPEED_DEF = 8,
+  SPEED_MAX = 64,
 
-    MAX_FLAKES       =  900,
-    MAX_COLS         =  800,    /* fixed-size pile array              */
+  MAX_FLAKES = 900,
+  MAX_COLS = 800, /* fixed-size pile array              */
 
-    HUD_COLS         =  80,
-    FPS_UPDATE_MS    = 500,
+  HUD_COLS = 80,
+  FPS_UPDATE_MS = 500,
 
-    /* Color pair indices. PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
-    PAIR_HUD         =   1,
-    PAIR_HINT        =   2,
-    PAIR_FLAKE_BASE  =   3,    /* +0..+7 = 8 flake tints (small→big) */
-    PAIR_PILE_BASE   =  11,    /* +0..+7 = 8 pile tints (deep→top)   */
-    PAIR_SKY         =  19,
+  /* Color pair indices. PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+  PAIR_HUD = 1,
+  PAIR_HINT = 2,
+  PAIR_FLAKE_BASE = 3, /* +0..+7 = 8 flake tints (small→big) */
+  PAIR_PILE_BASE = 11, /* +0..+7 = 8 pile tints (deep→top)   */
+  PAIR_SKY = 19,
 };
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(f)      (NS_PER_SEC / (f))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
 
 /* Per-flake physics jitter — same idea as rain.c. */
-#define FLAKE_SPEED_VARIANCE  0.50f      /* ±25% per-flake fall speed */
-#define FLAKE_WIND_JITTER     1.0f       /* ±0.5 c/s per flake        */
+#define FLAKE_SPEED_VARIANCE 0.50f /* ±25% per-flake fall speed */
+#define FLAKE_WIND_JITTER 1.0f     /* ±0.5 c/s per flake        */
 
 /* Pile mechanics. */
-#define PILE_MAX_FRAC     0.15f          /* pile capped at 15% screen; sticks at cap (no melt) */
+#define PILE_MAX_FRAC                                                          \
+  0.15f /* pile capped at 15% screen; sticks at cap (no melt) */
 
 /* Wind override step. */
-#define WIND_STEP         3.0f
+#define WIND_STEP 3.0f
 
 /* Pattern enum. */
 typedef enum {
-    PATTERN_FLURRY   = 0,
-    PATTERN_SNOWFALL = 1,
-    PATTERN_BLIZZARD = 2,
-    N_PATTERNS       = 3,
+  PATTERN_FLURRY = 0,
+  PATTERN_SNOWFALL = 1,
+  PATTERN_BLIZZARD = 2,
+  N_PATTERNS = 3,
 } Pattern;
 
-static const char *pattern_name(Pattern p)
-{
-    switch (p) {
-    case PATTERN_FLURRY:   return "FLURRY  ";
-    case PATTERN_SNOWFALL: return "SNOWFALL";
-    case PATTERN_BLIZZARD: return "BLIZZARD";
-    default:               return "?       ";
-    }
+static const char *pattern_name(Pattern p) {
+  switch (p) {
+  case PATTERN_FLURRY:
+    return "FLURRY  ";
+  case PATTERN_SNOWFALL:
+    return "SNOWFALL";
+  case PATTERN_BLIZZARD:
+    return "BLIZZARD";
+  default:
+    return "?       ";
+  }
 }
 
 /*
@@ -444,18 +448,18 @@ static const char *pattern_name(Pattern p)
  *                    NOT physical — it's a knob for visual pacing.
  */
 typedef struct {
-    int   target_flakes;
-    float fall_speed;
-    float wind_x;
-    float sway_amp_min, sway_amp_max;
-    float sway_freq_min, sway_freq_max;
-    float pile_growth_mul;
+  int target_flakes;
+  float fall_speed;
+  float wind_x;
+  float sway_amp_min, sway_amp_max;
+  float sway_freq_min, sway_freq_max;
+  float pile_growth_mul;
 } PatternParams;
 
 static const PatternParams pattern_params[N_PATTERNS] = {
-    /* FLURRY    */ { 120,  10.0f,  3.0f, 1.5f, 4.0f, 0.40f, 1.30f, 0.60f },
-    /* SNOWFALL  */ { 320,  18.0f,  6.0f, 0.8f, 2.5f, 0.30f, 1.10f, 0.85f },
-    /* BLIZZARD  */ { 700,  45.0f, 22.0f, 0.3f, 1.0f, 0.20f, 0.80f, 1.00f },
+    /* FLURRY    */ {120, 10.0f, 3.0f, 1.5f, 4.0f, 0.40f, 1.30f, 0.60f},
+    /* SNOWFALL  */ {320, 18.0f, 6.0f, 0.8f, 2.5f, 0.30f, 1.10f, 0.85f},
+    /* BLIZZARD  */ {700, 45.0f, 22.0f, 0.3f, 1.0f, 0.20f, 0.80f, 1.00f},
 };
 
 /*
@@ -467,88 +471,117 @@ static const PatternParams pattern_params[N_PATTERNS] = {
  * CLAUDE.md "Theme Palette Brightness" rule.
  */
 typedef struct {
-    const char *name;
-    short       flake[8];   /* small → big   */
-    short       pile [8];   /* deep  → top   */
-    short       sky;
+  const char *name;
+  short flake[8]; /* small → big   */
+  short pile[8];  /* deep  → top   */
+  short sky;
 } Theme;
 
 #define N_THEMES 10
 
 static const Theme themes[N_THEMES] = {
-    /* name        flake[0..7]  (small dim → big bright)            pile[0..7]  (deep dark → top bright)            sky */
+    /* name        flake[0..7]  (small dim → big bright)            pile[0..7]
+       (deep dark → top bright)            sky */
 
-    { "MATRIX",   {  28,  34,  40,  46,  82, 118, 154, 190 },        {  28,  34,  40,  46,  82, 118, 154, 190 },       234 },
-    { "FIRE",     {  88, 124, 130, 166, 202, 208, 214, 226 },        {  52,  88, 124, 160, 196, 202, 208, 220 },       233 },
-    { "OCEANIC",  {  24,  31,  38,  44,  51,  87, 159, 195 },        {  24,  25,  31,  38,  44,  51,  87, 159 },       234 },
-    { "NEON",     {  53,  91, 134, 165, 201, 207, 213, 219 },        {  53,  91, 134, 165, 201, 207, 213, 225 },       234 },
-    { "MONO",     { 244, 246, 248, 250, 252, 253, 254, 255 },        { 240, 244, 247, 249, 251, 253, 254, 255 },       232 },
-    { "ICE",      { 117, 153, 159, 195, 225, 231, 254, 255 },        { 110, 117, 153, 159, 195, 231, 254, 255 },       235 },
-    { "NOVA",     {  24,  75, 117, 159, 195, 219, 226, 231 },        {  60,  75, 117, 159, 195, 219, 226, 231 },       234 },
-    { "FOREST",   {  28,  64,  70,  76, 112, 148, 184, 220 },        {  28,  64,  70,  76, 112, 148, 184, 220 },       234 },
-    { "DESERT",   {  94, 130, 137, 173, 179, 215, 222, 229 },        {  94, 130, 137, 143, 179, 215, 222, 229 },       234 },
-    { "ECLIPSE",  {  52,  88,  95, 131, 167, 173, 209, 215 },        {  52,  88,  95, 131, 167, 173, 209, 215 },       232 },
+    {"MATRIX",
+     {28, 34, 40, 46, 82, 118, 154, 190},
+     {28, 34, 40, 46, 82, 118, 154, 190},
+     234},
+    {"FIRE",
+     {88, 124, 130, 166, 202, 208, 214, 226},
+     {52, 88, 124, 160, 196, 202, 208, 220},
+     233},
+    {"OCEANIC",
+     {24, 31, 38, 44, 51, 87, 159, 195},
+     {24, 25, 31, 38, 44, 51, 87, 159},
+     234},
+    {"NEON",
+     {53, 91, 134, 165, 201, 207, 213, 219},
+     {53, 91, 134, 165, 201, 207, 213, 225},
+     234},
+    {"MONO",
+     {244, 246, 248, 250, 252, 253, 254, 255},
+     {240, 244, 247, 249, 251, 253, 254, 255},
+     232},
+    {"ICE",
+     {117, 153, 159, 195, 225, 231, 254, 255},
+     {110, 117, 153, 159, 195, 231, 254, 255},
+     235},
+    {"NOVA",
+     {24, 75, 117, 159, 195, 219, 226, 231},
+     {60, 75, 117, 159, 195, 219, 226, 231},
+     234},
+    {"FOREST",
+     {28, 64, 70, 76, 112, 148, 184, 220},
+     {28, 64, 70, 76, 112, 148, 184, 220},
+     234},
+    {"DESERT",
+     {94, 130, 137, 173, 179, 215, 222, 229},
+     {94, 130, 137, 143, 179, 215, 222, 229},
+     234},
+    {"ECLIPSE",
+     {52, 88, 95, 131, 167, 173, 209, 215},
+     {52, 88, 95, 131, 167, 173, 209, 215},
+     232},
 };
 
 /* Variety of flake glyphs, indexed by SIZE class (small → big). */
-static const char FLAKE_GLYPHS[8] = { '`', '.', '\'', ',', ':', '+', '*', '*' };
+static const char FLAKE_GLYPHS[8] = {'`', '.', '\'', ',', ':', '+', '*', '*'};
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ===================================================================== */
 /* §3  color                                                              */
 /* ===================================================================== */
 
-static void theme_apply(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        for (int i = 0; i < 8; i++) {
-            init_pair((short)(PAIR_FLAKE_BASE + i), t->flake[i], -1);
-            init_pair((short)(PAIR_PILE_BASE  + i), t->pile [i], -1);
-        }
-        init_pair(PAIR_SKY, t->sky, -1);
-    } else {
-        for (int i = 0; i < 8; i++) {
-            init_pair((short)(PAIR_FLAKE_BASE + i), COLOR_WHITE, -1);
-            init_pair((short)(PAIR_PILE_BASE  + i), COLOR_WHITE, -1);
-        }
-        init_pair(PAIR_SKY, COLOR_BLACK, -1);
+static void theme_apply(int idx) {
+  if (idx < 0 || idx >= N_THEMES)
+    idx = 0;
+  if (COLORS >= 256) {
+    const Theme *t = &themes[idx];
+    for (int i = 0; i < 8; i++) {
+      init_pair((short)(PAIR_FLAKE_BASE + i), t->flake[i], -1);
+      init_pair((short)(PAIR_PILE_BASE + i), t->pile[i], -1);
     }
+    init_pair(PAIR_SKY, t->sky, -1);
+  } else {
+    for (int i = 0; i < 8; i++) {
+      init_pair((short)(PAIR_FLAKE_BASE + i), COLOR_WHITE, -1);
+      init_pair((short)(PAIR_PILE_BASE + i), COLOR_WHITE, -1);
+    }
+    init_pair(PAIR_SKY, COLOR_BLACK, -1);
+  }
 }
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,  226, -1);
-        init_pair(PAIR_HINT,  51, -1);
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
-    theme_apply(0);
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(PAIR_HUD, 226, -1);
+    init_pair(PAIR_HINT, 51, -1);
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
+  theme_apply(0);
 }
 
 /* ===================================================================== */
@@ -636,97 +669,98 @@ static void color_init(void)
  *                via flake_pool_find_inactive (linear scan).
  */
 typedef struct {
-    float center_x;
-    float y;
-    float vy;
-    float drift_vx;
-    float sway_amp;
-    float sway_freq;
-    float sway_phase;
-    float age;
-    int   size_idx;
-    bool  active;
+  float center_x;
+  float y;
+  float vy;
+  float drift_vx;
+  float sway_amp;
+  float sway_freq;
+  float sway_phase;
+  float age;
+  int size_idx;
+  bool active;
 } Flake;
 
 /* Cheap LCG — per-scene state, no global aliasing */
-static inline uint32_t lcg_next(uint32_t *st)
-{
-    *st = *st * 1664525u + 1013904223u;
-    return *st;
+static inline uint32_t lcg_next(uint32_t *st) {
+  *st = *st * 1664525u + 1013904223u;
+  return *st;
 }
-static inline float lcg_unit(uint32_t *st)
-{
-    return (float)(lcg_next(st) >> 8) / (float)(1u << 24);    /* [0, 1) */
+static inline float lcg_unit(uint32_t *st) {
+  return (float)(lcg_next(st) >> 8) / (float)(1u << 24); /* [0, 1) */
 }
 
 /* Compute a flake's actual screen x at this moment. */
-static inline float flake_x(const Flake *f)
-{
-    return f->center_x
-         + f->sway_amp * sinf(f->sway_freq * f->age + f->sway_phase);
+static inline float flake_x(const Flake *f) {
+  return f->center_x +
+         f->sway_amp * sinf(f->sway_freq * f->age + f->sway_phase);
 }
 
 /* Uniform sample over [lo, hi) — base primitive every other sampler uses. */
-static inline float sample_uniform_in_range(uint32_t *rng, float lo, float hi)
-{
-    return lo + lcg_unit(rng) * (hi - lo);
+static inline float sample_uniform_in_range(uint32_t *rng, float lo, float hi) {
+  return lo + lcg_unit(rng) * (hi - lo);
 }
 
 /* Terminal velocity with stochastic per-flake variance (Bourg Ch. 3).
- * Returns base_vy · uniform(1 − V/2, 1 + V/2) so the field doesn't fall in lockstep. */
-static inline float sample_terminal_velocity_jittered(uint32_t *rng, float base_vy)
-{
-    float scale = (1.0f - FLAKE_SPEED_VARIANCE * 0.5f)
-                + lcg_unit(rng) * FLAKE_SPEED_VARIANCE;
-    return base_vy * scale;
+ * Returns base_vy · uniform(1 − V/2, 1 + V/2) so the field doesn't fall in
+ * lockstep. */
+static inline float sample_terminal_velocity_jittered(uint32_t *rng,
+                                                      float base_vy) {
+  float scale = (1.0f - FLAKE_SPEED_VARIANCE * 0.5f) +
+                lcg_unit(rng) * FLAKE_SPEED_VARIANCE;
+  return base_vy * scale;
 }
 
 /* Drift velocity with additive jitter: wind + uniform(−J/2, +J/2). */
-static inline float sample_drift_velocity_jittered(uint32_t *rng, float wind_base)
-{
-    float jitter = (lcg_unit(rng) - 0.5f) * 2.0f * FLAKE_WIND_JITTER;
-    return wind_base + jitter;
+static inline float sample_drift_velocity_jittered(uint32_t *rng,
+                                                   float wind_base) {
+  float jitter = (lcg_unit(rng) - 0.5f) * 2.0f * FLAKE_WIND_JITTER;
+  return wind_base + jitter;
 }
 
-/* Random oscillator phase φ ∈ [0, 2π) — de-correlates sin() across the field. */
-static inline float sample_random_phase_2pi(uint32_t *rng)
-{
-    return lcg_unit(rng) * 2.0f * (float)M_PI;
+/* Random oscillator phase φ ∈ [0, 2π) — de-correlates sin() across the field.
+ */
+static inline float sample_random_phase_2pi(uint32_t *rng) {
+  return lcg_unit(rng) * 2.0f * (float)M_PI;
 }
 
-/* Size class 0..7 with small-bias via r² mapping — most flakes small, few big. */
-static inline int sample_size_class_small_biased(uint32_t *rng)
-{
-    float r   = lcg_unit(rng);
-    int   idx = (int)(r * r * 7.999f);
-    if (idx < 0) idx = 0;
-    if (idx > 7) idx = 7;
-    return idx;
+/* Size class 0..7 with small-bias via r² mapping — most flakes small, few big.
+ */
+static inline int sample_size_class_small_biased(uint32_t *rng) {
+  float r = lcg_unit(rng);
+  int idx = (int)(r * r * 7.999f);
+  if (idx < 0)
+    idx = 0;
+  if (idx > 7)
+    idx = 7;
+  return idx;
 }
 
 /* Spawn x with the range extended UPWIND so wind-blown flakes refill the
  * visible field uniformly rather than piling up against the leeward edge. */
-static inline float sample_spawn_x_wind_extended(uint32_t *rng, int cols, float wind)
-{
-    float over = fabsf(wind) * 0.5f;
-    float r    = lcg_unit(rng);
-    if (wind >  0.5f) return r * ((float)cols + over) - over;
-    if (wind < -0.5f) return r * ((float)cols + over);
-    return r * (float)cols;
+static inline float sample_spawn_x_wind_extended(uint32_t *rng, int cols,
+                                                 float wind) {
+  float over = fabsf(wind) * 0.5f;
+  float r = lcg_unit(rng);
+  if (wind > 0.5f)
+    return r * ((float)cols + over) - over;
+  if (wind < -0.5f)
+    return r * ((float)cols + over);
+  return r * (float)cols;
 }
 
-/* Explicit Euler step: drift x by drift_vx·dt, fall y by vy·dt, age the clock. */
-static inline void integrate_flake_euler(Flake *f, float dt)
-{
-    f->center_x += f->drift_vx * dt;
-    f->y        += f->vy       * dt;
-    f->age      += dt;
+/* Explicit Euler step: drift x by drift_vx·dt, fall y by vy·dt, age the clock.
+ */
+static inline void integrate_flake_euler(Flake *f, float dt) {
+  f->center_x += f->drift_vx * dt;
+  f->y += f->vy * dt;
+  f->age += dt;
 }
 
-/* True once the flake's drift centre has crossed the off-screen sideways cull. */
-static inline bool flake_drifted_offscreen_x(const Flake *f, int cols)
-{
-    return f->center_x < -8.0f || f->center_x > (float)(cols + 8);
+/* True once the flake's drift centre has crossed the off-screen sideways cull.
+ */
+static inline bool flake_drifted_offscreen_x(const Flake *f, int cols) {
+  return f->center_x < -8.0f || f->center_x > (float)(cols + 8);
 }
 
 /* ===================================================================== */
@@ -743,34 +777,35 @@ static inline bool flake_drifted_offscreen_x(const Flake *f, int cols)
  *
  * Deposit fails silently (no-op) if all three columns are at PILE_MAX.
  */
-static void pile_deposit(int *pile, int cols, int col, int max_h)
-{
-    if (col < 0 || col >= cols) return;
+static void pile_deposit(int *pile, int cols, int col, int max_h) {
+  if (col < 0 || col >= cols)
+    return;
 
-    int target = col;
-    if (col > 0       && pile[col - 1] < pile[target]) target = col - 1;
-    if (col < cols-1  && pile[col + 1] < pile[target]) target = col + 1;
+  int target = col;
+  if (col > 0 && pile[col - 1] < pile[target])
+    target = col - 1;
+  if (col < cols - 1 && pile[col + 1] < pile[target])
+    target = col + 1;
 
-    if (pile[target] < max_h) pile[target] += 1;
+  if (pile[target] < max_h)
+    pile[target] += 1;
 }
 
 /* Saturation cap for any single column — PILE_MAX_FRAC of usable rows. */
-static inline int compute_pile_height_cap(int rows)
-{
-    int max_h = (int)((float)(rows - 2) * PILE_MAX_FRAC);
-    return max_h < 1 ? 1 : max_h;
+static inline int compute_pile_height_cap(int rows) {
+  int max_h = (int)((float)(rows - 2) * PILE_MAX_FRAC);
+  return max_h < 1 ? 1 : max_h;
 }
 
-/* World-y of the pile's top surface at a column — flake contacts when y ≥ this. */
-static inline float pile_floor_y(int pile_h, int rows)
-{
-    return (float)(rows - 2 - pile_h);
+/* World-y of the pile's top surface at a column — flake contacts when y ≥ this.
+ */
+static inline float pile_floor_y(int pile_h, int rows) {
+  return (float)(rows - 2 - pile_h);
 }
 
 /* Bernoulli trial: true with probability p ∈ [0,1]. */
-static inline bool bernoulli_trial(uint32_t *rng, float p)
-{
-    return lcg_unit(rng) < p;
+static inline bool bernoulli_trial(uint32_t *rng, float p) {
+  return lcg_unit(rng) < p;
 }
 
 /* ===================================================================== */
@@ -802,85 +837,85 @@ static inline bool bernoulli_trial(uint32_t *rng, float p)
  * simulation be exercised without a terminal.
  */
 typedef struct {
-    /* ──────────────────────────────────────────────────────────────
-     *  SIMULATION HALF — physics tick reads + writes these
-     * ────────────────────────────────────────────────────────────── */
+  /* ──────────────────────────────────────────────────────────────
+   *  SIMULATION HALF — physics tick reads + writes these
+   * ────────────────────────────────────────────────────────────── */
 
-    /* PAUSE — scene_tick is a no-op when set.  Toggled by space.
-     * Render keeps running so the user sees a frozen frame with
-     * flakes held mid-sway. */
-    bool      paused;
+  /* PAUSE — scene_tick is a no-op when set.  Toggled by space.
+   * Render keeps running so the user sees a frozen frame with
+   * flakes held mid-sway. */
+  bool paused;
 
-    /* SPEED — integer multiplier on dt.  Default SPEED_DEF means
-     * 1× wall clock; +/= keys double, − halves.  Bounded by
-     * SPEED_MIN/MAX.  Doesn't change physics constants — just
-     * compresses or stretches simulated time. */
-    int       speed;
+  /* SPEED — integer multiplier on dt.  Default SPEED_DEF means
+   * 1× wall clock; +/= keys double, − halves.  Bounded by
+   * SPEED_MIN/MAX.  Doesn't change physics constants — just
+   * compresses or stretches simulated time. */
+  int speed;
 
-    /* PATTERN — index into pattern_params (FLURRY / SNOWFALL /
-     * BLIZZARD).  Cycled by n / N.  Switching pattern doesn't
-     * rebuild pools — the new target_flakes self-fills / drains
-     * over a few seconds, which reads as a natural intensity change. */
-    Pattern   current_pattern;
+  /* PATTERN — index into pattern_params (FLURRY / SNOWFALL /
+   * BLIZZARD).  Cycled by n / N.  Switching pattern doesn't
+   * rebuild pools — the new target_flakes self-fills / drains
+   * over a few seconds, which reads as a natural intensity change. */
+  Pattern current_pattern;
 
-    /* WIND OVERRIDE — added to pattern.wind_x to compute the actual
-     * drift_vx applied to newly-spawned flakes.  w / W keys add
-     * ±WIND_STEP; persists across pattern switches; reset on 'r'. */
-    float     wind_override;
+  /* WIND OVERRIDE — added to pattern.wind_x to compute the actual
+   * drift_vx applied to newly-spawned flakes.  w / W keys add
+   * ±WIND_STEP; persists across pattern switches; reset on 'r'. */
+  float wind_override;
 
-    /* RNG — per-scene LCG state, seeded from clock_ns() at init and
-     * re-seeded (XOR'd) on 'r'.  Used by every randomness consumer:
-     * spawn jitter (x position, fall speed, sway params, size class),
-     * pile_growth_mul probability check at deposit.  No globals —
-     * full state in this byte. */
-    uint32_t  rng;
+  /* RNG — per-scene LCG state, seeded from clock_ns() at init and
+   * re-seeded (XOR'd) on 'r'.  Used by every randomness consumer:
+   * spawn jitter (x position, fall speed, sway params, size class),
+   * pile_growth_mul probability check at deposit.  No globals —
+   * full state in this byte. */
+  uint32_t rng;
 
-    /* CACHED TERMINAL DIMENSIONS — read every frame by spawn (x range
-     * for the top edge), the integrator (off-screen sideways check),
-     * and the pile renderer.  Cached at init and on SIGWINCH so the
-     * hot path never calls getmaxyx(). */
-    int       rows, cols;
+  /* CACHED TERMINAL DIMENSIONS — read every frame by spawn (x range
+   * for the top edge), the integrator (off-screen sideways check),
+   * and the pile renderer.  Cached at init and on SIGWINCH so the
+   * hot path never calls getmaxyx(). */
+  int rows, cols;
 
-    /* CLOCK — seconds since the scene started, advanced by dt each
-     * tick.  Not currently read by the integrator (each flake's `age`
-     * is what feeds the sway sin()), but kept available for future
-     * effects that need a global phase clock. */
-    float     time_accum;
+  /* CLOCK — seconds since the scene started, advanced by dt each
+   * tick.  Not currently read by the integrator (each flake's `age`
+   * is what feeds the sway sin()), but kept available for future
+   * effects that need a global phase clock. */
+  float time_accum;
 
-    /* FLAKE POOL — fixed-size BSS array, no allocation after init.
-     * See Flake for per-slot detail.  flake_pool_find_inactive scans
-     * for the first inactive index when spawn needs a slot.
-     * (Reeves 1983 — particle pool.) */
-    Flake     flakes[MAX_FLAKES];
+  /* FLAKE POOL — fixed-size BSS array, no allocation after init.
+   * See Flake for per-slot detail.  flake_pool_find_inactive scans
+   * for the first inactive index when spawn needs a slot.
+   * (Reeves 1983 — particle pool.) */
+  Flake flakes[MAX_FLAKES];
 
-    /* PILE COLUMN HEIGHTS — 1-D array, pile[c] = current snow height
-     * at column c (in cells, measured up from the bottom HUD row).
-     * MAX_COLS is the hard cap; we draw up to scene.cols only.
-     * Modified by pile_deposit (which applies a valley-fill rule:
-     * Bak/Tang/Wiesenfeld 1987 sandpile + Duran 2000 angle of repose).
-     * Each column saturates at PILE_MAX_FRAC × (rows − 2) = 15 % of
-     * usable height; no melt — pile is monotonically non-decreasing
-     * until 'c' clears it. */
-    int       pile[MAX_COLS];
+  /* PILE COLUMN HEIGHTS — 1-D array, pile[c] = current snow height
+   * at column c (in cells, measured up from the bottom HUD row).
+   * MAX_COLS is the hard cap; we draw up to scene.cols only.
+   * Modified by pile_deposit (which applies a valley-fill rule:
+   * Bak/Tang/Wiesenfeld 1987 sandpile + Duran 2000 angle of repose).
+   * Each column saturates at PILE_MAX_FRAC × (rows − 2) = 15 % of
+   * usable height; no melt — pile is monotonically non-decreasing
+   * until 'c' clears it. */
+  int pile[MAX_COLS];
 
-    /* ──────────────────────────────────────────────────────────────
-     *  RENDER HALF — scene_draw reads this; physics tick ignores it
-     * ────────────────────────────────────────────────────────────── */
+  /* ──────────────────────────────────────────────────────────────
+   *  RENDER HALF — scene_draw reads this; physics tick ignores it
+   * ────────────────────────────────────────────────────────────── */
 
-    /* THEME — index into themes[].  Cycled by t / T.  Selects the
-     * 8-step flake ramp (size → colour) AND the 8-step pile ramp
-     * (depth → colour).  Pure render concern — flake physics
-     * (count, motion, lifetime, pile dynamics) behaves identically
-     * regardless of which theme is active.  theme_apply rewrites
-     * pairs PAIR_FLAKE_BASE..+7 and PAIR_PILE_BASE..+7 on change. */
-    int       current_theme;
+  /* THEME — index into themes[].  Cycled by t / T.  Selects the
+   * 8-step flake ramp (size → colour) AND the 8-step pile ramp
+   * (depth → colour).  Pure render concern — flake physics
+   * (count, motion, lifetime, pile dynamics) behaves identically
+   * regardless of which theme is active.  theme_apply rewrites
+   * pairs PAIR_FLAKE_BASE..+7 and PAIR_PILE_BASE..+7 on change. */
+  int current_theme;
 } Scene;
 
-static int flake_pool_find_inactive(Scene *s)
-{
-    for (int i = 0; i < MAX_FLAKES; i++)
-        if (!s->flakes[i].active) return i;
-    return -1;
+static int flake_pool_find_inactive(Scene *s) {
+  for (int i = 0; i < MAX_FLAKES; i++)
+    if (!s->flakes[i].active)
+      return i;
+  return -1;
 }
 
 /*
@@ -893,116 +928,117 @@ static int flake_pool_find_inactive(Scene *s)
  * declaration of the flake's INITIAL PHYSICS STATE: position, velocity,
  * oscillator, size class.  Per-flake jitter lives inside the samplers.
  */
-static void scene_spawn_flake(Scene *s, float y_min, float y_max)
-{
-    int idx = flake_pool_find_inactive(s);
-    if (idx < 0) return;
-    Flake *f = &s->flakes[idx];
+static void scene_spawn_flake(Scene *s, float y_min, float y_max) {
+  int idx = flake_pool_find_inactive(s);
+  if (idx < 0)
+    return;
+  Flake *f = &s->flakes[idx];
 
-    const PatternParams *pp = &pattern_params[s->current_pattern];
-    float wind_total = pp->wind_x + s->wind_override;
+  const PatternParams *pp = &pattern_params[s->current_pattern];
+  float wind_total = pp->wind_x + s->wind_override;
 
-    f->center_x   = sample_spawn_x_wind_extended    (&s->rng, s->cols, wind_total);
-    f->y          = sample_uniform_in_range         (&s->rng, y_min, y_max);
-    f->vy         = sample_terminal_velocity_jittered(&s->rng, pp->fall_speed);
-    f->drift_vx   = sample_drift_velocity_jittered  (&s->rng, wind_total);
-    f->sway_amp   = sample_uniform_in_range         (&s->rng, pp->sway_amp_min,  pp->sway_amp_max);
-    f->sway_freq  = sample_uniform_in_range         (&s->rng, pp->sway_freq_min, pp->sway_freq_max);
-    f->sway_phase = sample_random_phase_2pi         (&s->rng);
-    f->age        = 0.0f;
-    f->size_idx   = sample_size_class_small_biased  (&s->rng);
-    f->active     = true;
+  f->center_x = sample_spawn_x_wind_extended(&s->rng, s->cols, wind_total);
+  f->y = sample_uniform_in_range(&s->rng, y_min, y_max);
+  f->vy = sample_terminal_velocity_jittered(&s->rng, pp->fall_speed);
+  f->drift_vx = sample_drift_velocity_jittered(&s->rng, wind_total);
+  f->sway_amp =
+      sample_uniform_in_range(&s->rng, pp->sway_amp_min, pp->sway_amp_max);
+  f->sway_freq =
+      sample_uniform_in_range(&s->rng, pp->sway_freq_min, pp->sway_freq_max);
+  f->sway_phase = sample_random_phase_2pi(&s->rng);
+  f->age = 0.0f;
+  f->size_idx = sample_size_class_small_biased(&s->rng);
+  f->active = true;
 }
 
-static void scene_clear_flakes(Scene *s)
-{
-    for (int i = 0; i < MAX_FLAKES; i++) s->flakes[i].active = false;
+static void scene_clear_flakes(Scene *s) {
+  for (int i = 0; i < MAX_FLAKES; i++)
+    s->flakes[i].active = false;
 }
 
-static void scene_clear_pile(Scene *s)
-{
-    memset(s->pile, 0, sizeof s->pile);
-}
+static void scene_clear_pile(Scene *s) { memset(s->pile, 0, sizeof s->pile); }
 
 /*
  * scene_prewarm — fill the flake pool to target with flakes scattered
  * uniformly across the visible y range so the screen looks like
  * steady-state snow from frame 1, not a marching-band wave at the top.
  */
-static void scene_prewarm(Scene *s)
-{
-    const PatternParams *pp = &pattern_params[s->current_pattern];
-    int target = pp->target_flakes;
-    if (target > MAX_FLAKES) target = MAX_FLAKES;
+static void scene_prewarm(Scene *s) {
+  const PatternParams *pp = &pattern_params[s->current_pattern];
+  int target = pp->target_flakes;
+  if (target > MAX_FLAKES)
+    target = MAX_FLAKES;
 
-    int active = 0;
-    for (int i = 0; i < MAX_FLAKES; i++)
-        if (s->flakes[i].active) active++;
+  int active = 0;
+  for (int i = 0; i < MAX_FLAKES; i++)
+    if (s->flakes[i].active)
+      active++;
 
-    float y_max = (float)(s->rows - 2);
-    for (int k = active; k < target; k++)
-        scene_spawn_flake(s, -6.0f, y_max);
+  float y_max = (float)(s->rows - 2);
+  for (int k = active; k < target; k++)
+    scene_spawn_flake(s, -6.0f, y_max);
 }
 
-static void scene_init(Scene *s, int cols, int rows)
-{
-    memset(s, 0, sizeof *s);
-    s->paused          = false;
-    s->speed           = SPEED_DEF;
-    s->current_theme   = 0;
-    s->current_pattern = PATTERN_SNOWFALL;
-    s->wind_override   = 0.0f;
-    s->rng             = (uint32_t)clock_ns();
-    s->cols            = cols;
-    s->rows            = rows;
-    s->time_accum      = 0.0f;
-    scene_clear_flakes(s);
-    scene_clear_pile(s);
-    scene_prewarm(s);
+static void scene_init(Scene *s, int cols, int rows) {
+  memset(s, 0, sizeof *s);
+  s->paused = false;
+  s->speed = SPEED_DEF;
+  s->current_theme = 0;
+  s->current_pattern = PATTERN_SNOWFALL;
+  s->wind_override = 0.0f;
+  s->rng = (uint32_t)clock_ns();
+  s->cols = cols;
+  s->rows = rows;
+  s->time_accum = 0.0f;
+  scene_clear_flakes(s);
+  scene_clear_pile(s);
+  scene_prewarm(s);
 }
 
-static void scene_resize(Scene *s, int cols, int rows)
-{
-    s->cols = cols;
-    s->rows = rows;
-    /* Pile data preserved (truncated if cols shrinks). */
+static void scene_resize(Scene *s, int cols, int rows) {
+  s->cols = cols;
+  s->rows = rows;
+  /* Pile data preserved (truncated if cols shrinks). */
 }
 
-static void scene_reseed(Scene *s)
-{
-    s->rng = (uint32_t)clock_ns() ^ 0xC0FFEEu;
-    s->wind_override = 0.0f;
-    scene_clear_flakes(s);
-    scene_clear_pile(s);
-    scene_prewarm(s);
+static void scene_reseed(Scene *s) {
+  s->rng = (uint32_t)clock_ns() ^ 0xC0FFEEu;
+  s->wind_override = 0.0f;
+  scene_clear_flakes(s);
+  scene_clear_pile(s);
+  scene_prewarm(s);
 }
 
 /* Population census — linear scan of the pool's active flags. */
-static int count_active_flakes(const Scene *s)
-{
-    int n = 0;
-    for (int i = 0; i < MAX_FLAKES; i++) if (s->flakes[i].active) n++;
-    return n;
+static int count_active_flakes(const Scene *s) {
+  int n = 0;
+  for (int i = 0; i < MAX_FLAKES; i++)
+    if (s->flakes[i].active)
+      n++;
+  return n;
 }
 
 /* Spawn budget for this tick — refill toward pattern.target_flakes, but
  * cap the per-tick burst proportional to dt so a long pause doesn't
  * dump a flood of flakes when the sim resumes. */
-static int compute_spawn_count_for_tick(int active, const PatternParams *pp, float dt)
-{
-    int target = pp->target_flakes;
-    if (target > MAX_FLAKES) target = MAX_FLAKES;
-    int spawn_cap = (int)((float)pp->target_flakes * dt * 4.0f) + 4;
-    int n = target - active;
-    if (n < 0)         n = 0;
-    if (n > spawn_cap) n = spawn_cap;
-    return n;
+static int compute_spawn_count_for_tick(int active, const PatternParams *pp,
+                                        float dt) {
+  int target = pp->target_flakes;
+  if (target > MAX_FLAKES)
+    target = MAX_FLAKES;
+  int spawn_cap = (int)((float)pp->target_flakes * dt * 4.0f) + 4;
+  int n = target - active;
+  if (n < 0)
+    n = 0;
+  if (n > spawn_cap)
+    n = spawn_cap;
+  return n;
 }
 
 /* Spawn `n` flakes just above the visible top (y ∈ [-6, -1]). */
-static void flake_pool_topup_from_sky(Scene *s, int n)
-{
-    for (int k = 0; k < n; k++) scene_spawn_flake(s, -6.0f, -1.0f);
+static void flake_pool_topup_from_sky(Scene *s, int n) {
+  for (int k = 0; k < n; k++)
+    scene_spawn_flake(s, -6.0f, -1.0f);
 }
 
 /* Resolve one flake against the pile at its swayed column.  On contact:
@@ -1012,168 +1048,182 @@ static void flake_pool_topup_from_sky(Scene *s, int n)
  * flight and will swing back into a valid column next tick. */
 static void try_pile_contact_and_deposit(Scene *s, Flake *f,
                                          const PatternParams *pp,
-                                         int max_pile_h)
-{
-    float fx  = flake_x(f);
-    int   col = (int)(fx + 0.5f);
-    if (col < 0 || col >= s->cols) return;
+                                         int max_pile_h) {
+  float fx = flake_x(f);
+  int col = (int)(fx + 0.5f);
+  if (col < 0 || col >= s->cols)
+    return;
 
-    float floor_y = pile_floor_y(s->pile[col], s->rows);
-    if (f->y < floor_y) return;
+  float floor_y = pile_floor_y(s->pile[col], s->rows);
+  if (f->y < floor_y)
+    return;
 
-    if (bernoulli_trial(&s->rng, pp->pile_growth_mul))
-        pile_deposit(s->pile, s->cols, col, max_pile_h);
-    f->active = false;
+  if (bernoulli_trial(&s->rng, pp->pile_growth_mul))
+    pile_deposit(s->pile, s->cols, col, max_pile_h);
+  f->active = false;
 }
 
-static void scene_tick(Scene *s, float dt)
-{
-    if (s->paused) return;
-    dt *= (float)s->speed / (float)SPEED_DEF;
-    s->time_accum += dt;
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
+  dt *= (float)s->speed / (float)SPEED_DEF;
+  s->time_accum += dt;
 
-    const PatternParams *pp = &pattern_params[s->current_pattern];
+  const PatternParams *pp = &pattern_params[s->current_pattern];
 
-    /* 1. Top up flake pool toward pattern's target density. */
-    int to_spawn = compute_spawn_count_for_tick(count_active_flakes(s), pp, dt);
-    flake_pool_topup_from_sky(s, to_spawn);
+  /* 1. Top up flake pool toward pattern's target density. */
+  int to_spawn = compute_spawn_count_for_tick(count_active_flakes(s), pp, dt);
+  flake_pool_topup_from_sky(s, to_spawn);
 
-    /* 2. Integrate each flake; resolve off-screen cull and pile contact. */
-    int max_pile_h = compute_pile_height_cap(s->rows);
-    for (int i = 0; i < MAX_FLAKES; i++) {
-        Flake *f = &s->flakes[i];
-        if (!f->active) continue;
+  /* 2. Integrate each flake; resolve off-screen cull and pile contact. */
+  int max_pile_h = compute_pile_height_cap(s->rows);
+  for (int i = 0; i < MAX_FLAKES; i++) {
+    Flake *f = &s->flakes[i];
+    if (!f->active)
+      continue;
 
-        integrate_flake_euler(f, dt);
+    integrate_flake_euler(f, dt);
 
-        if (flake_drifted_offscreen_x(f, s->cols)) { f->active = false; continue; }
-
-        try_pile_contact_and_deposit(s, f, pp, max_pile_h);
+    if (flake_drifted_offscreen_x(f, s->cols)) {
+      f->active = false;
+      continue;
     }
+
+    try_pile_contact_and_deposit(s, f, pp, max_pile_h);
+  }
 }
 
 /* Brightness attribute by ramp slot — top of ramp BOLD, bottom DIM.
  * Shared rule between pile depth-ramp and flake size-ramp so both layers
  * read the gradient consistently. */
-static inline int ramp_attr_by_brightness_slot(int slot)
-{
-    if (slot >= 6) return A_BOLD;
-    if (slot <= 1) return A_DIM;
-    return A_NORMAL;
+static inline int ramp_attr_by_brightness_slot(int slot) {
+  if (slot >= 6)
+    return A_BOLD;
+  if (slot <= 1)
+    return A_DIM;
+  return A_NORMAL;
 }
 
 /* Pile glyph picked by depth from the surface — `*` snow-cap, `#` packed,
  * `+` settled.  Encodes the visual "depth feel" without using non-ASCII. */
-static inline char pile_cell_glyph_by_depth(int depth_from_top)
-{
-    if (depth_from_top == 0) return '*';
-    if (depth_from_top <  3) return '#';
-    return '+';
+static inline char pile_cell_glyph_by_depth(int depth_from_top) {
+  if (depth_from_top == 0)
+    return '*';
+  if (depth_from_top < 3)
+    return '#';
+  return '+';
 }
 
 /* Draw one column's stack of pile cells from the bottom row upward.
  * k=0 is the topmost (surface) cell and gets the brightest ramp slot. */
-static void pile_column_draw(int col, int height, int rows_eff)
-{
-    for (int k = 0; k < height; k++) {
-        int y = (rows_eff - 1) - k;
-        if (y < 0) break;
+static void pile_column_draw(int col, int height, int rows_eff) {
+  for (int k = 0; k < height; k++) {
+    int y = (rows_eff - 1) - k;
+    if (y < 0)
+      break;
 
-        int  ramp_slot = 7 - k;
-        if (ramp_slot < 0) ramp_slot = 0;
+    int ramp_slot = 7 - k;
+    if (ramp_slot < 0)
+      ramp_slot = 0;
 
-        char glyph = pile_cell_glyph_by_depth(k);
-        int  attr  = ramp_attr_by_brightness_slot(ramp_slot);
-        int  pair  = PAIR_PILE_BASE + ramp_slot;
+    char glyph = pile_cell_glyph_by_depth(k);
+    int attr = ramp_attr_by_brightness_slot(ramp_slot);
+    int pair = PAIR_PILE_BASE + ramp_slot;
 
-        attron(COLOR_PAIR(pair) | attr);
-        mvaddch(y, col, (chtype)(unsigned char)glyph);
-        attroff(COLOR_PAIR(pair) | attr);
-    }
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(y, col, (chtype)(unsigned char)glyph);
+    attroff(COLOR_PAIR(pair) | attr);
+  }
 }
 
 /* Render the pile across every visible column — drawn FIRST so falling
  * flakes overlay it cleanly. */
-static void pile_draw_all_columns(const Scene *s, int rows_eff)
-{
-    int cap = s->cols < MAX_COLS ? s->cols : MAX_COLS;
-    for (int c = 0; c < cap; c++) {
-        int h = s->pile[c];
-        if (h > 0) pile_column_draw(c, h, rows_eff);
-    }
+static void pile_draw_all_columns(const Scene *s, int rows_eff) {
+  int cap = s->cols < MAX_COLS ? s->cols : MAX_COLS;
+  for (int c = 0; c < cap; c++) {
+    int h = s->pile[c];
+    if (h > 0)
+      pile_column_draw(c, h, rows_eff);
+  }
 }
 
 /* Render one active flake at its current swayed (x, y), using size-class
  * for glyph (FLAKE_GLYPHS ramp) and colour pair (PAIR_FLAKE_BASE + size). */
-static void flake_draw(const Flake *f, int cols, int rows_eff)
-{
-    int ix = (int)(flake_x(f) + 0.5f);
-    int iy = (int)(f->y       + 0.5f);
-    if (ix < 0 || ix >= cols)     return;
-    if (iy < 0 || iy >= rows_eff) return;
+static void flake_draw(const Flake *f, int cols, int rows_eff) {
+  int ix = (int)(flake_x(f) + 0.5f);
+  int iy = (int)(f->y + 0.5f);
+  if (ix < 0 || ix >= cols)
+    return;
+  if (iy < 0 || iy >= rows_eff)
+    return;
 
-    char glyph = FLAKE_GLYPHS[f->size_idx];
-    int  pair  = PAIR_FLAKE_BASE + f->size_idx;
-    int  attr  = ramp_attr_by_brightness_slot(f->size_idx);
+  char glyph = FLAKE_GLYPHS[f->size_idx];
+  int pair = PAIR_FLAKE_BASE + f->size_idx;
+  int attr = ramp_attr_by_brightness_slot(f->size_idx);
 
-    attron(COLOR_PAIR(pair) | attr);
-    mvaddch(iy, ix, (chtype)(unsigned char)glyph);
-    attroff(COLOR_PAIR(pair) | attr);
+  attron(COLOR_PAIR(pair) | attr);
+  mvaddch(iy, ix, (chtype)(unsigned char)glyph);
+  attroff(COLOR_PAIR(pair) | attr);
 }
 
 /* Render every active flake on top of the pile. */
-static void flakes_draw_all_active(const Scene *s, int rows_eff)
-{
-    for (int i = 0; i < MAX_FLAKES; i++) {
-        const Flake *f = &s->flakes[i];
-        if (f->active) flake_draw(f, s->cols, rows_eff);
-    }
+static void flakes_draw_all_active(const Scene *s, int rows_eff) {
+  for (int i = 0; i < MAX_FLAKES; i++) {
+    const Flake *f = &s->flakes[i];
+    if (f->active)
+      flake_draw(f, s->cols, rows_eff);
+  }
 }
 
-static void scene_draw(const Scene *s)
-{
-    int rows_eff = s->rows - 1;          /* leave bottom row for HUD */
-    pile_draw_all_columns (s, rows_eff); /* pile first — flakes overlay */
-    flakes_draw_all_active(s, rows_eff);
+static void scene_draw(const Scene *s) {
+  int rows_eff = s->rows - 1;         /* leave bottom row for HUD */
+  pile_draw_all_columns(s, rows_eff); /* pile first — flakes overlay */
+  flakes_draw_all_active(s, rows_eff);
 }
 
 /* ===================================================================== */
 /* §7  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *sc)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, sc->rows, sc->cols);
+static void screen_init(Screen *sc) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, sc->rows, sc->cols);
 }
-static void screen_free(Screen *sc) { (void)sc; endwin(); }
-static void screen_resize_curses(Screen *sc)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, sc->rows, sc->cols);
+static void screen_free(Screen *sc) {
+  (void)sc;
+  endwin();
+}
+static void screen_resize_curses(Screen *sc) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
 /* Active flake count + max pile height for HUD. */
-static void scene_counts(const Scene *s, int *out_flakes, int *out_max_pile)
-{
-    int n = 0;
-    for (int i = 0; i < MAX_FLAKES; i++) if (s->flakes[i].active) n++;
-    *out_flakes = n;
+static void scene_counts(const Scene *s, int *out_flakes, int *out_max_pile) {
+  int n = 0;
+  for (int i = 0; i < MAX_FLAKES; i++)
+    if (s->flakes[i].active)
+      n++;
+  *out_flakes = n;
 
-    int mp = 0;
-    int cap = s->cols < MAX_COLS ? s->cols : MAX_COLS;
-    for (int c = 0; c < cap; c++) if (s->pile[c] > mp) mp = s->pile[c];
-    *out_max_pile = mp;
+  int mp = 0;
+  int cap = s->cols < MAX_COLS ? s->cols : MAX_COLS;
+  for (int c = 0; c < cap; c++)
+    if (s->pile[c] > mp)
+      mp = s->pile[c];
+  *out_max_pile = mp;
 }
 
 /*
@@ -1190,191 +1240,219 @@ static void scene_counts(const Scene *s, int *out_flakes, int *out_max_pile)
  * background spans the full width, and drawn AFTER scene_draw so
  * flakes never bleed through the bars.
  */
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
-{
-    erase();
-    scene_draw(s);
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+  erase();
+  scene_draw(s);
 
-    int flakes, max_pile;
-    scene_counts(s, &flakes, &max_pile);
-    const PatternParams *pp = &pattern_params[s->current_pattern];
-    float wind = pp->wind_x + s->wind_override;
+  int flakes, max_pile;
+  scene_counts(s, &flakes, &max_pile);
+  const PatternParams *pp = &pattern_params[s->current_pattern];
+  float wind = pp->wind_x + s->wind_override;
 
-    const char *state_str = s->paused ? "PAUSED " : pattern_name(s->current_pattern);
+  const char *state_str =
+      s->paused ? "PAUSED " : pattern_name(s->current_pattern);
 
-    /* ── Top row: dynamic status ─────────────────────────────── */
-    char status[220];
-    snprintf(status, sizeof status,
-             " SNOW   %s   theme:%-8s   flakes:%4d  pile_h:%2d   "
-             "wind:%+5.1f c/s   %5.1f fps  %3d Hz  speed:%-3d ",
-             state_str, themes[s->current_theme].name,
-             flakes, max_pile, (double)wind, fps, sim_fps, s->speed);
+  /* ── Top row: dynamic status ─────────────────────────────── */
+  char status[220];
+  snprintf(status, sizeof status,
+           " SNOW   %s   theme:%-8s   flakes:%4d  pile_h:%2d   "
+           "wind:%+5.1f c/s   %5.1f fps  %3d Hz  speed:%-3d ",
+           state_str, themes[s->current_theme].name, flakes, max_pile,
+           (double)wind, fps, sim_fps, s->speed);
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    for (int x = 0; x < sc->cols; x++) mvaddch(0, x, ' ');
-    mvprintw(0, 0, "%s", status);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  for (int x = 0; x < sc->cols; x++)
+    mvaddch(0, x, ' ');
+  mvprintw(0, 0, "%s", status);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* ── Bottom row: every interactive key ───────────────────── */
-    const char *hints =
-        " q:quit  spc:pause  r:reseed  c:clear  n/p:pattern  t/T:theme  "
-        "w/W:wind  +/-:speed  ]/[:Hz ";
+  /* ── Bottom row: every interactive key ───────────────────── */
+  const char *hints =
+      " q:quit  spc:pause  r:reseed  c:clear  n/p:pattern  t/T:theme  "
+      "w/W:wind  +/-:speed  ]/[:Hz ";
 
-    int hint_row = sc->rows - 1;
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    for (int x = 0; x < sc->cols; x++) mvaddch(hint_row, x, ' ');
-    mvprintw(hint_row, 0, "%s", hints);
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  int hint_row = sc->rows - 1;
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  for (int x = 0; x < sc->cols; x++)
+    mvaddch(hint_row, x, ' ');
+  mvprintw(hint_row, 0, "%s", hints);
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ===================================================================== */
 /* §8  app                                                                */
 /* ===================================================================== */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void app_do_resize(App *app)
-{
-    screen_resize_curses(&app->screen);
-    scene_resize(&app->scene, app->screen.cols, app->screen.rows);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  screen_resize_curses(&app->screen);
+  scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':           s->paused = !s->paused;                     break;
-    case 'r': case 'R': scene_reseed(s);                            break;
-    case 'c':           scene_clear_pile(s);                        break;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_reseed(s);
+    break;
+  case 'c':
+    scene_clear_pile(s);
+    break;
 
-    case '=': case '+':
-        if (s->speed < SPEED_MAX) s->speed *= 2;
-        if (s->speed > SPEED_MAX) s->speed  = SPEED_MAX;
-        break;
-    case '-':
-        s->speed /= 2;
-        if (s->speed < SPEED_MIN) s->speed  = SPEED_MIN;
-        break;
+  case '=':
+  case '+':
+    if (s->speed < SPEED_MAX)
+      s->speed *= 2;
+    if (s->speed > SPEED_MAX)
+      s->speed = SPEED_MAX;
+    break;
+  case '-':
+    s->speed /= 2;
+    if (s->speed < SPEED_MIN)
+      s->speed = SPEED_MIN;
+    break;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
-        theme_apply(s->current_theme);
-        break;
-    case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
-        theme_apply(s->current_theme);
-        break;
+  case 't':
+    s->current_theme = (s->current_theme + 1) % N_THEMES;
+    theme_apply(s->current_theme);
+    break;
+  case 'T':
+    s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
+    theme_apply(s->current_theme);
+    break;
 
-    case 'n': case 'N':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS);
-        scene_prewarm(s);
-        break;
-    case 'p': case 'P':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS);
-        scene_prewarm(s);
-        break;
+  case 'n':
+  case 'N':
+    s->current_pattern = (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS);
+    scene_prewarm(s);
+    break;
+  case 'p':
+  case 'P':
+    s->current_pattern =
+        (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS);
+    scene_prewarm(s);
+    break;
 
-    case 'w':
-        s->wind_override += WIND_STEP;
-        break;
-    case 'W':
-        s->wind_override -= WIND_STEP;
-        break;
+  case 'w':
+    s->wind_override += WIND_STEP;
+    break;
+  case 'W':
+    s->wind_override -= WIND_STEP;
+    break;
 
-    default: break;
-    }
-    return true;
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+int main(void) {
+  srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+  screen_init(&app->screen);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
-
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accum -= tick_ns;
-        }
-
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
-        screen_present();
-
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns();
+      sim_accum = 0;
     }
 
-    screen_free(&app->screen);
-    return 0;
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > 100 * NS_PER_MS)
+      dt = 100 * NS_PER_MS;
+
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
+
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, dt_sec);
+      sim_accum -= tick_ns;
+    }
+
+    frame_count++;
+    fps_accum += dt;
+    if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display =
+          (double)frame_count / ((double)fps_accum / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accum = 0;
+    }
+
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
+    screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
+    screen_present();
+
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  screen_free(&app->screen);
+  return 0;
 }

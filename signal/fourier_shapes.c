@@ -664,77 +664,76 @@
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
-#include <ncurses.h>
 #include <math.h>
-#include <stdlib.h>
-#include <string.h>
+#include <ncurses.h>
 #include <signal.h>
-#include <time.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 /* ===================================================================== */
 /* §1  config — every constant + enum lives here                         */
 /* ===================================================================== */
 
-#define N_SAMPLES         256     /* DFT input size; also max epicycles    */
-#define TRAIL_LEN         512     /* tip-trail ring buffer                  */
-#define RENDER_FPS         30
-#define RENDER_NS         (1000000000LL / RENDER_FPS)
-#define CYCLE_FRAMES      360     /* frames per full reconstruction cycle   */
-#define AUTO_ADD_FRAMES     8     /* frames between auto-adding one arm     */
-#define N_CIRCLES           5     /* max orbit-guide rings drawn            */
-#define SHAPE_SCALE        0.38f  /* fraction of min(pw, ph)/2 used as size */
-#define CELL_W              8     /* sub-pixels per terminal column         */
-#define CELL_H             16     /* sub-pixels per terminal row            */
+#define N_SAMPLES 256 /* DFT input size; also max epicycles    */
+#define TRAIL_LEN 512 /* tip-trail ring buffer                  */
+#define RENDER_FPS 30
+#define RENDER_NS (1000000000LL / RENDER_FPS)
+#define CYCLE_FRAMES 360  /* frames per full reconstruction cycle   */
+#define AUTO_ADD_FRAMES 8 /* frames between auto-adding one arm     */
+#define N_CIRCLES 5       /* max orbit-guide rings drawn            */
+#define SHAPE_SCALE 0.38f /* fraction of min(pw, ph)/2 used as size */
+#define CELL_W 8          /* sub-pixels per terminal column         */
+#define CELL_H 16         /* sub-pixels per terminal row            */
 
 /* Colour pair IDs.  HUD/HINT/ENERGY tiers are theme-INVARIANT per
  * CLAUDE.md HUD Standard, so the status bar and Parseval bar are
  * always legible regardless of the active animation theme. */
 enum {
-    /* themable animation pairs (10) */
-    CP_ARM_HI     =  1,   /* large-amplitude arm                          */
-    CP_ARM_MID    =  2,   /* medium arm                                    */
-    CP_ARM_LO     =  3,   /* tiny arm                                      */
-    CP_CIRCLE     =  4,   /* orbit ring dots                               */
-    CP_TRAIL_1    =  5,   /* trail newest                                  */
-    CP_TRAIL_2    =  6,   /* trail mid                                     */
-    CP_TRAIL_3    =  7,   /* trail oldest                                  */
-    CP_BOB        =  8,   /* tip dot                                       */
-    CP_PIVOT      =  9,   /* pivot marker                                  */
-    CP_GHOST      = 10,   /* ghost source-sample dots                      */
-    /* theme-invariant pairs (5) */
-    CP_HUD        = 11,   /* HUD top status — bright yellow + bold         */
-    CP_HINT       = 12,   /* bottom hint    — bright cyan   + bold         */
-    CP_ENERGY     = 13,   /* energy bar tier — green (>= 80%)               */
-    CP_ENERGY_MID = 14,   /* energy bar tier — yellow (50..80%)             */
-    CP_ENERGY_LO  = 15,   /* energy bar tier — red    (< 50%)               */
+  /* themable animation pairs (10) */
+  CP_ARM_HI = 1,  /* large-amplitude arm                          */
+  CP_ARM_MID = 2, /* medium arm                                    */
+  CP_ARM_LO = 3,  /* tiny arm                                      */
+  CP_CIRCLE = 4,  /* orbit ring dots                               */
+  CP_TRAIL_1 = 5, /* trail newest                                  */
+  CP_TRAIL_2 = 6, /* trail mid                                     */
+  CP_TRAIL_3 = 7, /* trail oldest                                  */
+  CP_BOB = 8,     /* tip dot                                       */
+  CP_PIVOT = 9,   /* pivot marker                                  */
+  CP_GHOST = 10,  /* ghost source-sample dots                      */
+  /* theme-invariant pairs (5) */
+  CP_HUD = 11,        /* HUD top status — bright yellow + bold         */
+  CP_HINT = 12,       /* bottom hint    — bright cyan   + bold         */
+  CP_ENERGY = 13,     /* energy bar tier — green (>= 80%)               */
+  CP_ENERGY_MID = 14, /* energy bar tier — yellow (50..80%)             */
+  CP_ENERGY_LO = 15,  /* energy bar tier — red    (< 50%)               */
 };
 
 /* ===================================================================== */
 /* §2  clock — monotonic ns timer + sleep                                */
 /* ===================================================================== */
 
-static long long clock_ns(void)
-{
-    /* Purpose : monotonic clock in ns.  Used by the main loop to
-     *           figure out how long to sleep before the next frame. */
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_ns(void) {
+  /* Purpose : monotonic clock in ns.  Used by the main loop to
+   *           figure out how long to sleep before the next frame. */
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(long long ns)
-{
-    /* Block for `ns` nanoseconds.  Without this, the main loop would
-     * spin a CPU at 100% just to redraw 30 times a second. */
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(long long ns) {
+  /* Block for `ns` nanoseconds.  Without this, the main loop would
+   * spin a CPU at 100% just to redraw 30 times a second. */
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -754,84 +753,89 @@ static void clock_sleep_ns(long long ns)
  */
 
 typedef struct {
-    const char *name;
-    /* 256-colour foregrounds */
-    short arm_hi, arm_mid, arm_lo;
-    short circle;
-    short trail_1, trail_2, trail_3;
-    short bob, pivot;
-    short ghost;
-    /* 8-colour fallbacks */
-    short arm_hi8, arm_mid8, arm_lo8;
-    short circle8;
-    short trail_1_8, trail_2_8, trail_3_8;
-    short bob8, pivot8;
-    short ghost8;
+  const char *name;
+  /* 256-colour foregrounds */
+  short arm_hi, arm_mid, arm_lo;
+  short circle;
+  short trail_1, trail_2, trail_3;
+  short bob, pivot;
+  short ghost;
+  /* 8-colour fallbacks */
+  short arm_hi8, arm_mid8, arm_lo8;
+  short circle8;
+  short trail_1_8, trail_2_8, trail_3_8;
+  short bob8, pivot8;
+  short ghost8;
 } Theme;
 
 #define N_THEMES 10
 
 static const Theme k_themes[N_THEMES] = {
     /*  0  Classic   — bright white arms, gold/orange/red trail */
-    { "Classic   ",
-      231,  87, 246,  243,  226, 208, 196,  231, 220,  240,
-      COLOR_WHITE, COLOR_CYAN,  COLOR_WHITE,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_YELLOW, COLOR_RED,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_WHITE },
+    {"Classic   ", 231,          87,         246,         243,
+     226,          208,          196,        231,         220,
+     240,          COLOR_WHITE,  COLOR_CYAN, COLOR_WHITE, COLOR_WHITE,
+     COLOR_YELLOW, COLOR_YELLOW, COLOR_RED,  COLOR_WHITE, COLOR_YELLOW,
+     COLOR_WHITE},
     /*  1  Fire      — red/orange spectrum, peach guides */
-    { "Fire      ",
-      208, 202, 130,  215,  226, 214, 196,  231, 208,  240,
-      COLOR_RED, COLOR_RED, COLOR_RED,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_YELLOW, COLOR_RED,
-      COLOR_WHITE, COLOR_RED, COLOR_WHITE },
+    {"Fire      ", 208,          202,       130,         215,
+     226,          214,          196,       231,         208,
+     240,          COLOR_RED,    COLOR_RED, COLOR_RED,   COLOR_WHITE,
+     COLOR_YELLOW, COLOR_YELLOW, COLOR_RED, COLOR_WHITE, COLOR_RED,
+     COLOR_WHITE},
     /*  2  Neon      — magenta/violet/pink, lavender guides */
-    { "Neon      ",
-      207, 165, 105,  141,  219, 213, 201,  231, 207,  240,
-      COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA,
-      COLOR_WHITE, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA,
-      COLOR_WHITE, COLOR_MAGENTA, COLOR_WHITE },
+    {"Neon      ",  207,           165,           105,           141,
+     219,           213,           201,           231,           207,
+     240,           COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_WHITE,
+     COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_WHITE,   COLOR_MAGENTA,
+     COLOR_WHITE},
     /*  3  Ocean     — teal/blue spectrum */
-    { "Ocean     ",
-      123,  45,  31,  110,  159,  87,  51,  231,  45,  240,
-      COLOR_CYAN, COLOR_BLUE, COLOR_BLUE,
-      COLOR_WHITE, COLOR_CYAN, COLOR_CYAN, COLOR_BLUE,
-      COLOR_WHITE, COLOR_CYAN, COLOR_WHITE },
+    {"Ocean     ", 123,        45,          31,         110,        159,
+     87,           51,         231,         45,         240,        COLOR_CYAN,
+     COLOR_BLUE,   COLOR_BLUE, COLOR_WHITE, COLOR_CYAN, COLOR_CYAN, COLOR_BLUE,
+     COLOR_WHITE,  COLOR_CYAN, COLOR_WHITE},
     /*  4  Matrix    — green spectrum, classic terminal look */
-    { "Matrix    ",
-      118,  46,  28,   64,  154, 118,  46,  231, 118,  240,
-      COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
-      COLOR_WHITE, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
-      COLOR_WHITE, COLOR_GREEN, COLOR_WHITE },
+    {"Matrix    ", 118,         46,          28,          64,
+     154,          118,         46,          231,         118,
+     240,          COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_WHITE,
+     COLOR_GREEN,  COLOR_GREEN, COLOR_GREEN, COLOR_WHITE, COLOR_GREEN,
+     COLOR_WHITE},
     /*  5  Sunset    — peach/pink/magenta gradient */
-    { "Sunset    ",
-      215, 209, 174,  217,  226, 213, 198,  231, 220,  240,
-      COLOR_RED, COLOR_RED, COLOR_RED,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_MAGENTA, COLOR_RED,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_WHITE },
+    {"Sunset    ", 215,           209,       174,         217,
+     226,          213,           198,       231,         220,
+     240,          COLOR_RED,     COLOR_RED, COLOR_RED,   COLOR_WHITE,
+     COLOR_YELLOW, COLOR_MAGENTA, COLOR_RED, COLOR_WHITE, COLOR_YELLOW,
+     COLOR_WHITE},
     /*  6  Nova      — cosmic stellar: bright white core, orange explosion */
-    { "Nova      ",
-      231, 220, 175,  145,  226, 208, 197,  231, 175,  240,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_MAGENTA,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_RED, COLOR_MAGENTA,
-      COLOR_WHITE, COLOR_MAGENTA, COLOR_WHITE },
+    {"Nova      ", 231,         220,           175,           145,
+     226,          208,         197,           231,           175,
+     240,          COLOR_WHITE, COLOR_YELLOW,  COLOR_MAGENTA, COLOR_WHITE,
+     COLOR_YELLOW, COLOR_RED,   COLOR_MAGENTA, COLOR_WHITE,   COLOR_MAGENTA,
+     COLOR_WHITE},
     /*  7  Mono      — high-contrast greyscale */
-    { "Mono      ",
-      231, 252, 245,  240,  255, 250, 244,  231, 246,  240,
-      COLOR_WHITE, COLOR_WHITE, COLOR_WHITE,
-      COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE,
-      COLOR_WHITE, COLOR_WHITE, COLOR_WHITE },
+    {"Mono      ", 231,         252,         245,         240,
+     255,          250,         244,         231,         246,
+     240,          COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE,
+     COLOR_WHITE,  COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE,
+     COLOR_WHITE},
     /*  8  Forest    — green/olive/brown earthy palette */
-    { "Forest    ",
-      154,  70,  28,  100,  226, 178, 130,  231, 178,  240,
-      COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_YELLOW, COLOR_RED,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_WHITE },
+    {"Forest    ", 154,          70,          28,          100,
+     226,          178,          130,         231,         178,
+     240,          COLOR_GREEN,  COLOR_GREEN, COLOR_GREEN, COLOR_WHITE,
+     COLOR_YELLOW, COLOR_YELLOW, COLOR_RED,   COLOR_WHITE, COLOR_YELLOW,
+     COLOR_WHITE},
     /*  9  Cyberpunk — electric cyan + hot pink high-contrast */
-    { "Cyberpunk ",
-       51, 207, 165,  141,  226, 207, 197,  231, 207,  240,
-      COLOR_CYAN, COLOR_MAGENTA, COLOR_MAGENTA,
-      COLOR_WHITE, COLOR_YELLOW, COLOR_MAGENTA, COLOR_RED,
-      COLOR_WHITE, COLOR_MAGENTA, COLOR_MAGENTA },
+    {"Cyberpunk ",  51,
+     207,           165,
+     141,           226,
+     207,           197,
+     231,           207,
+     240,           COLOR_CYAN,
+     COLOR_MAGENTA, COLOR_MAGENTA,
+     COLOR_WHITE,   COLOR_YELLOW,
+     COLOR_MAGENTA, COLOR_RED,
+     COLOR_WHITE,   COLOR_MAGENTA,
+     COLOR_MAGENTA},
 };
 
 static int g_active_theme_index = 0;
@@ -841,33 +845,33 @@ static int g_active_theme_index = 0;
  * palette.  HUD / HINT / ENERGY pairs are NOT touched here so the
  * status bar and Parseval bar stay legible across all themes.
  */
-static void apply_theme(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    const Theme *t = &k_themes[idx];
-    if (COLORS >= 256) {
-        init_pair(CP_ARM_HI,  t->arm_hi,  -1);
-        init_pair(CP_ARM_MID, t->arm_mid, -1);
-        init_pair(CP_ARM_LO,  t->arm_lo,  -1);
-        init_pair(CP_CIRCLE,  t->circle,  -1);
-        init_pair(CP_TRAIL_1, t->trail_1, -1);
-        init_pair(CP_TRAIL_2, t->trail_2, -1);
-        init_pair(CP_TRAIL_3, t->trail_3, -1);
-        init_pair(CP_BOB,     t->bob,     -1);
-        init_pair(CP_PIVOT,   t->pivot,   -1);
-        init_pair(CP_GHOST,   t->ghost,   -1);
-    } else {
-        init_pair(CP_ARM_HI,  t->arm_hi8,   -1);
-        init_pair(CP_ARM_MID, t->arm_mid8,  -1);
-        init_pair(CP_ARM_LO,  t->arm_lo8,   -1);
-        init_pair(CP_CIRCLE,  t->circle8,   -1);
-        init_pair(CP_TRAIL_1, t->trail_1_8, -1);
-        init_pair(CP_TRAIL_2, t->trail_2_8, -1);
-        init_pair(CP_TRAIL_3, t->trail_3_8, -1);
-        init_pair(CP_BOB,     t->bob8,      -1);
-        init_pair(CP_PIVOT,   t->pivot8,    -1);
-        init_pair(CP_GHOST,   t->ghost8,    -1);
-    }
+static void apply_theme(int idx) {
+  if (idx < 0 || idx >= N_THEMES)
+    idx = 0;
+  const Theme *t = &k_themes[idx];
+  if (COLORS >= 256) {
+    init_pair(CP_ARM_HI, t->arm_hi, -1);
+    init_pair(CP_ARM_MID, t->arm_mid, -1);
+    init_pair(CP_ARM_LO, t->arm_lo, -1);
+    init_pair(CP_CIRCLE, t->circle, -1);
+    init_pair(CP_TRAIL_1, t->trail_1, -1);
+    init_pair(CP_TRAIL_2, t->trail_2, -1);
+    init_pair(CP_TRAIL_3, t->trail_3, -1);
+    init_pair(CP_BOB, t->bob, -1);
+    init_pair(CP_PIVOT, t->pivot, -1);
+    init_pair(CP_GHOST, t->ghost, -1);
+  } else {
+    init_pair(CP_ARM_HI, t->arm_hi8, -1);
+    init_pair(CP_ARM_MID, t->arm_mid8, -1);
+    init_pair(CP_ARM_LO, t->arm_lo8, -1);
+    init_pair(CP_CIRCLE, t->circle8, -1);
+    init_pair(CP_TRAIL_1, t->trail_1_8, -1);
+    init_pair(CP_TRAIL_2, t->trail_2_8, -1);
+    init_pair(CP_TRAIL_3, t->trail_3_8, -1);
+    init_pair(CP_BOB, t->bob8, -1);
+    init_pair(CP_PIVOT, t->pivot8, -1);
+    init_pair(CP_GHOST, t->ghost8, -1);
+  }
 }
 
 /*
@@ -875,40 +879,44 @@ static void apply_theme(int idx)
  * apply default theme.  Subsequent theme changes go through
  * apply_theme and leave HUD/HINT/ENERGY tiers alone.
  */
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(CP_HUD,        226, -1);   /* bright yellow */
-        init_pair(CP_HINT,        51, -1);   /* bright cyan   */
-        init_pair(CP_ENERGY,      46, -1);   /* green  (>= 80%) */
-        init_pair(CP_ENERGY_MID, 226, -1);   /* yellow (50..80%) */
-        init_pair(CP_ENERGY_LO,  196, -1);   /* red    (< 50%) */
-    } else {
-        init_pair(CP_HUD,        COLOR_YELLOW, -1);
-        init_pair(CP_HINT,       COLOR_CYAN,   -1);
-        init_pair(CP_ENERGY,     COLOR_GREEN,  -1);
-        init_pair(CP_ENERGY_MID, COLOR_YELLOW, -1);
-        init_pair(CP_ENERGY_LO,  COLOR_RED,    -1);
-    }
-    apply_theme(0);
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(CP_HUD, 226, -1);        /* bright yellow */
+    init_pair(CP_HINT, 51, -1);        /* bright cyan   */
+    init_pair(CP_ENERGY, 46, -1);      /* green  (>= 80%) */
+    init_pair(CP_ENERGY_MID, 226, -1); /* yellow (50..80%) */
+    init_pair(CP_ENERGY_LO, 196, -1);  /* red    (< 50%) */
+  } else {
+    init_pair(CP_HUD, COLOR_YELLOW, -1);
+    init_pair(CP_HINT, COLOR_CYAN, -1);
+    init_pair(CP_ENERGY, COLOR_GREEN, -1);
+    init_pair(CP_ENERGY_MID, COLOR_YELLOW, -1);
+    init_pair(CP_ENERGY_LO, COLOR_RED, -1);
+  }
+  apply_theme(0);
 }
 
 /* ===================================================================== */
 /* §4  shape_helpers — gcd, polygon, hypotrochoid, epitrochoid           */
 /* ===================================================================== */
 
-typedef struct { float re, im; } Cplx;
+typedef struct {
+  float re, im;
+} Cplx;
 
 /*
  * gcd_int — Euclid's algorithm.  Used by hypotrochoid / epitrochoid
  * to compute their closing period: 2*pi * r / gcd(R, r).
  */
-static int gcd_int(int a, int b)
-{
-    while (b) { int t = b; b = a % b; a = t; }
-    return a;
+static int gcd_int(int a, int b) {
+  while (b) {
+    int t = b;
+    b = a % b;
+    a = t;
+  }
+  return a;
 }
 
 /*
@@ -927,17 +935,16 @@ static int gcd_int(int a, int b)
  * Fourier reconstruction — see T6.  Used by Square, Arrow, Star-7,
  * Lightning.
  */
-static void sample_poly(const float *vx, const float *vy, int nv,
-                        Cplx *out, int N)
-{
-    for (int i = 0; i < N; i++) {
-        float t        = (float)i / (float)N * (float)nv;
-        int   seg      = (int)t % nv;
-        float fraction = t - floorf(t);
-        int   nxt      = (seg + 1) % nv;
-        out[i].re = vx[seg] + (vx[nxt] - vx[seg]) * fraction;
-        out[i].im = vy[seg] + (vy[nxt] - vy[seg]) * fraction;
-    }
+static void sample_poly(const float *vx, const float *vy, int nv, Cplx *out,
+                        int N) {
+  for (int i = 0; i < N; i++) {
+    float t = (float)i / (float)N * (float)nv;
+    int seg = (int)t % nv;
+    float fraction = t - floorf(t);
+    int nxt = (seg + 1) % nv;
+    out[i].re = vx[seg] + (vx[nxt] - vx[seg]) * fraction;
+    out[i].im = vy[seg] + (vy[nxt] - vy[seg]) * fraction;
+  }
 }
 
 /*
@@ -956,18 +963,18 @@ static void sample_poly(const float *vx, const float *vy, int nv,
  * rotation rates), regardless of how intricate the on-screen
  * rosette looks.  Energy bar fills to ~100% by M = 4.
  */
-static void sample_hypotrochoid(int R, int r, float d, Cplx *out, int N)
-{
-    int   reps   = r / gcd_int(R, r);
-    float period = 2.f * (float)M_PI * (float)reps;
-    float diff   = (float)(R - r);
-    float scale  = ((float)(R - r) + d);
-    if (scale <= 0.001f) scale = 1.f;
-    for (int k = 0; k < N; k++) {
-        float t   = period * (float)k / (float)N;
-        out[k].re = (diff * cosf(t) + d * cosf(diff / (float)r * t)) / scale;
-        out[k].im = (diff * sinf(t) - d * sinf(diff / (float)r * t)) / scale;
-    }
+static void sample_hypotrochoid(int R, int r, float d, Cplx *out, int N) {
+  int reps = r / gcd_int(R, r);
+  float period = 2.f * (float)M_PI * (float)reps;
+  float diff = (float)(R - r);
+  float scale = ((float)(R - r) + d);
+  if (scale <= 0.001f)
+    scale = 1.f;
+  for (int k = 0; k < N; k++) {
+    float t = period * (float)k / (float)N;
+    out[k].re = (diff * cosf(t) + d * cosf(diff / (float)r * t)) / scale;
+    out[k].im = (diff * sinf(t) - d * sinf(diff / (float)r * t)) / scale;
+  }
 }
 
 /*
@@ -980,18 +987,18 @@ static void sample_hypotrochoid(int R, int r, float d, Cplx *out, int N)
  * Same 2-bin spectral fingerprint as hypotrochoid — yet visually
  * distinct (limaçon-like loops instead of inner rosettes).
  */
-static void sample_epitrochoid(int R, int r, float d, Cplx *out, int N)
-{
-    int   reps   = r / gcd_int(R, r);
-    float period = 2.f * (float)M_PI * (float)reps;
-    float sum    = (float)(R + r);
-    float scale  = sum + d;
-    if (scale <= 0.001f) scale = 1.f;
-    for (int k = 0; k < N; k++) {
-        float t   = period * (float)k / (float)N;
-        out[k].re = (sum * cosf(t) - d * cosf(sum / (float)r * t)) / scale;
-        out[k].im = (sum * sinf(t) - d * sinf(sum / (float)r * t)) / scale;
-    }
+static void sample_epitrochoid(int R, int r, float d, Cplx *out, int N) {
+  int reps = r / gcd_int(R, r);
+  float period = 2.f * (float)M_PI * (float)reps;
+  float sum = (float)(R + r);
+  float scale = sum + d;
+  if (scale <= 0.001f)
+    scale = 1.f;
+  for (int k = 0; k < N; k++) {
+    float t = period * (float)k / (float)N;
+    out[k].re = (sum * cosf(t) - d * cosf(sum / (float)r * t)) / scale;
+    out[k].im = (sum * sinf(t) - d * sinf(sum / (float)r * t)) / scale;
+  }
 }
 
 /* ===================================================================== */
@@ -1037,311 +1044,323 @@ static void sample_epitrochoid(int R, int r, float d, Cplx *out, int N)
  */
 
 static const char *k_shape_names[] = {
-    "Square          ",  "Arrow           ",  "Star-7          ",
-    "Cardioid        ",  "Lissajous 3:2   ",  "Rose r=cos(2t)  ",
-    "Lissajous 5:4   ",  "Lissajous 7:3   ",  "Hypotrochoid 5:3",
-    "Hypotrochoid 7:4",  "Epitrochoid 3:1 ",  "Deltoid (3-cusp)",
-    "Hypocycloid 5   ",  "Gear 8-tooth    ",  "Crescent        ",
+    "Square          ",
+    "Arrow           ",
+    "Star-7          ",
+    "Cardioid        ",
+    "Lissajous 3:2   ",
+    "Rose r=cos(2t)  ",
+    "Lissajous 5:4   ",
+    "Lissajous 7:3   ",
+    "Hypotrochoid 5:3",
+    "Hypotrochoid 7:4",
+    "Epitrochoid 3:1 ",
+    "Deltoid (3-cusp)",
+    "Hypocycloid 5   ",
+    "Gear 8-tooth    ",
+    "Crescent        ",
     "Lightning       ",
     /* +5 patterns each carrying a distinct NEW lesson */
-    "Lissajous 11:7  ",  "Beaded circle   ",  "Compound spiro  ",
-    "Closed spiral   ",  "Torus knot 2:5  ",
+    "Lissajous 11:7  ",
+    "Beaded circle   ",
+    "Compound spiro  ",
+    "Closed spiral   ",
+    "Torus knot 2:5  ",
 };
 #define N_SHAPES 21
 
-static void sample_path(int si, Cplx *out, int N)
-{
-    switch (si) {
+static void sample_path(int si, Cplx *out, int N) {
+  switch (si) {
 
-    case 0: {
-        /* SQUARE — 4 sharp corners.  Polygon family.
-         * Spectrum: Gibbs ringing.  Energy bar climbs slowly. */
-        static const float sx[] = {-1.f,  1.f,  1.f, -1.f};
-        static const float sy[] = {-1.f, -1.f,  1.f,  1.f};
-        sample_poly(sx, sy, 4, out, N);
-        break;
-    }
+  case 0: {
+    /* SQUARE — 4 sharp corners.  Polygon family.
+     * Spectrum: Gibbs ringing.  Energy bar climbs slowly. */
+    static const float sx[] = {-1.f, 1.f, 1.f, -1.f};
+    static const float sy[] = {-1.f, -1.f, 1.f, 1.f};
+    sample_poly(sx, sy, 4, out, N);
+    break;
+  }
 
-    case 1: {
-        /* ARROW — 7-vertex polygon (notched tail adds re-entrant
-         * corners).  More corners than Square → slower convergence. */
-        static const float ax[] = { 0.f,  .65f,  .30f,  .30f, -.30f, -.30f, -.65f};
-        static const float ay[] = { 1.f,  .10f,  .10f, -.85f, -.85f,  .10f,  .10f};
-        sample_poly(ax, ay, 7, out, N);
-        break;
-    }
+  case 1: {
+    /* ARROW — 7-vertex polygon (notched tail adds re-entrant
+     * corners).  More corners than Square → slower convergence. */
+    static const float ax[] = {0.f, .65f, .30f, .30f, -.30f, -.30f, -.65f};
+    static const float ay[] = {1.f, .10f, .10f, -.85f, -.85f, .10f, .10f};
+    sample_poly(ax, ay, 7, out, N);
+    break;
+  }
 
-    case 2: {
-        /* 7-POINTED STAR — alternating outer (r=1) and inner (r=0.40)
-         * radii at 14 vertices.  Spiky → many corners → slow convergence. */
-        float vx[14], vy[14];
-        for (int i = 0; i < 14; i++) {
-            float r = (i % 2 == 0) ? 1.f : 0.40f;
-            float a = -(float)M_PI/2.f + (float)i * (float)M_PI / 7.f;
-            vx[i] = r * cosf(a);
-            vy[i] = r * sinf(a);
-        }
-        sample_poly(vx, vy, 14, out, N);
-        break;
+  case 2: {
+    /* 7-POINTED STAR — alternating outer (r=1) and inner (r=0.40)
+     * radii at 14 vertices.  Spiky → many corners → slow convergence. */
+    float vx[14], vy[14];
+    for (int i = 0; i < 14; i++) {
+      float r = (i % 2 == 0) ? 1.f : 0.40f;
+      float a = -(float)M_PI / 2.f + (float)i * (float)M_PI / 7.f;
+      vx[i] = r * cosf(a);
+      vy[i] = r * sinf(a);
     }
+    sample_poly(vx, vy, 14, out, N);
+    break;
+  }
 
-    case 3: {
-        /* CARDIOID — r = 1 - cos(t) recentered.  Smooth.
-         * Centroid is offset; we subtract it numerically.
-         * Energy bar to 100% at M ≈ 5. */
-        float cx = 0.f;
-        for (int k = 0; k < N; k++) {
-            float t   = 2.f*(float)M_PI*(float)k/(float)N;
-            float r   = 0.5f * (1.f - cosf(t));
-            out[k].re = r * cosf(t);
-            out[k].im = r * sinf(t);
-            cx       += out[k].re;
-        }
-        cx /= (float)N;
-        for (int k = 0; k < N; k++) out[k].re -= cx;
-        break;
+  case 3: {
+    /* CARDIOID — r = 1 - cos(t) recentered.  Smooth.
+     * Centroid is offset; we subtract it numerically.
+     * Energy bar to 100% at M ≈ 5. */
+    float cx = 0.f;
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      float r = 0.5f * (1.f - cosf(t));
+      out[k].re = r * cosf(t);
+      out[k].im = r * sinf(t);
+      cx += out[k].re;
     }
+    cx /= (float)N;
+    for (int k = 0; k < N; k++)
+      out[k].re -= cx;
+    break;
+  }
 
-    case 4: {
-        /* LISSAJOUS 3:2 with pi/4 phase offset.  Pure 4-bin spectrum
-         * at signed frequencies ±3 and ±2.  Energy → 100% at M = 4. */
-        for (int k = 0; k < N; k++) {
-            float t   = 2.f*(float)M_PI*(float)k/(float)N;
-            out[k].re = sinf(3.f*t + (float)M_PI/4.f);
-            out[k].im = sinf(2.f*t);
-        }
-        break;
+  case 4: {
+    /* LISSAJOUS 3:2 with pi/4 phase offset.  Pure 4-bin spectrum
+     * at signed frequencies ±3 and ±2.  Energy → 100% at M = 4. */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      out[k].re = sinf(3.f * t + (float)M_PI / 4.f);
+      out[k].im = sinf(2.f * t);
     }
+    break;
+  }
 
-    case 5: {
-        /* 4-PETAL ROSE — r = cos(2t).  r goes negative (back-projection);
-         * curve traces all 4 petals over [0, 2*pi].  Cusps at origin. */
-        for (int k = 0; k < N; k++) {
-            float t   = 2.f*(float)M_PI*(float)k/(float)N;
-            float r   = cosf(2.f*t);
-            out[k].re = r * cosf(t);
-            out[k].im = r * sinf(t);
-        }
-        break;
+  case 5: {
+    /* 4-PETAL ROSE — r = cos(2t).  r goes negative (back-projection);
+     * curve traces all 4 petals over [0, 2*pi].  Cusps at origin. */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      float r = cosf(2.f * t);
+      out[k].re = r * cosf(t);
+      out[k].im = r * sinf(t);
     }
+    break;
+  }
 
-    case 6: {
-        /* LISSAJOUS 5:4 — denser weaving than 3:2.  Spectrum: 4
-         * dominant bins (±5, ±4) → energy 100% at M = 4. */
-        for (int k = 0; k < N; k++) {
-            float t   = 2.f*(float)M_PI*(float)k/(float)N;
-            out[k].re = sinf(5.f*t + (float)M_PI/3.f);
-            out[k].im = sinf(4.f*t);
-        }
-        break;
+  case 6: {
+    /* LISSAJOUS 5:4 — denser weaving than 3:2.  Spectrum: 4
+     * dominant bins (±5, ±4) → energy 100% at M = 4. */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      out[k].re = sinf(5.f * t + (float)M_PI / 3.f);
+      out[k].im = sinf(4.f * t);
     }
+    break;
+  }
 
-    case 7: {
-        /* LISSAJOUS 7:3 — wider ratio, "flower-like" intersections.
-         * Spectrum: 4 dominant bins (±7, ±3) → energy 100% at M = 4. */
-        for (int k = 0; k < N; k++) {
-            float t   = 2.f*(float)M_PI*(float)k/(float)N;
-            out[k].re = sinf(7.f*t);
-            out[k].im = sinf(3.f*t);
-        }
-        break;
+  case 7: {
+    /* LISSAJOUS 7:3 — wider ratio, "flower-like" intersections.
+     * Spectrum: 4 dominant bins (±7, ±3) → energy 100% at M = 4. */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      out[k].re = sinf(7.f * t);
+      out[k].im = sinf(3.f * t);
     }
+    break;
+  }
 
-    case 8: {
-        /* HYPOTROCHOID (R=5, r=3, d=5) — spirograph rosette.
-         * 2-bin spectrum (the two integer rotation rates). */
-        sample_hypotrochoid(5, 3, 5.f, out, N);
-        break;
-    }
+  case 8: {
+    /* HYPOTROCHOID (R=5, r=3, d=5) — spirograph rosette.
+     * 2-bin spectrum (the two integer rotation rates). */
+    sample_hypotrochoid(5, 3, 5.f, out, N);
+    break;
+  }
 
-    case 9: {
-        /* HYPOTROCHOID (R=7, r=4, d=6) — different gear ratio,
-         * more intricate but still 2-bin spectrum. */
-        sample_hypotrochoid(7, 4, 6.f, out, N);
-        break;
-    }
+  case 9: {
+    /* HYPOTROCHOID (R=7, r=4, d=6) — different gear ratio,
+     * more intricate but still 2-bin spectrum. */
+    sample_hypotrochoid(7, 4, 6.f, out, N);
+    break;
+  }
 
-    case 10: {
-        /* EPITROCHOID (R=3, r=1, d=2) — limaçon-like outer-rolling
-         * curve.  2-bin spectrum. */
-        sample_epitrochoid(3, 1, 2.f, out, N);
-        break;
-    }
+  case 10: {
+    /* EPITROCHOID (R=3, r=1, d=2) — limaçon-like outer-rolling
+     * curve.  2-bin spectrum. */
+    sample_epitrochoid(3, 1, 2.f, out, N);
+    break;
+  }
 
-    case 11: {
-        /* DELTOID — 3-cusp hypocycloid.  R=3, r=1, d=1.
-         * Cusp at every 120° → 3-fold symmetric spectral comb.
-         *   x(t) = (2 cos t + cos 2t) / 3
-         *   y(t) = (2 sin t - sin 2t) / 3                      */
-        for (int k = 0; k < N; k++) {
-            float t   = 2.f*(float)M_PI*(float)k/(float)N;
-            out[k].re = (2.f * cosf(t) + cosf(2.f*t)) / 3.f;
-            out[k].im = (2.f * sinf(t) - sinf(2.f*t)) / 3.f;
-        }
-        break;
+  case 11: {
+    /* DELTOID — 3-cusp hypocycloid.  R=3, r=1, d=1.
+     * Cusp at every 120° → 3-fold symmetric spectral comb.
+     *   x(t) = (2 cos t + cos 2t) / 3
+     *   y(t) = (2 sin t - sin 2t) / 3                      */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      out[k].re = (2.f * cosf(t) + cosf(2.f * t)) / 3.f;
+      out[k].im = (2.f * sinf(t) - sinf(2.f * t)) / 3.f;
     }
+    break;
+  }
 
-    case 12: {
-        /* 5-CUSP HYPOCYCLOID — R=5, r=1, d=1.  5-fold spectral comb.
-         *   x(t) = (4 cos t + cos 4t) / 5
-         *   y(t) = (4 sin t - sin 4t) / 5                      */
-        for (int k = 0; k < N; k++) {
-            float t   = 2.f*(float)M_PI*(float)k/(float)N;
-            out[k].re = (4.f * cosf(t) + cosf(4.f*t)) / 5.f;
-            out[k].im = (4.f * sinf(t) - sinf(4.f*t)) / 5.f;
-        }
-        break;
+  case 12: {
+    /* 5-CUSP HYPOCYCLOID — R=5, r=1, d=1.  5-fold spectral comb.
+     *   x(t) = (4 cos t + cos 4t) / 5
+     *   y(t) = (4 sin t - sin 4t) / 5                      */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      out[k].re = (4.f * cosf(t) + cosf(4.f * t)) / 5.f;
+      out[k].im = (4.f * sinf(t) - sinf(4.f * t)) / 5.f;
     }
+    break;
+  }
 
-    case 13: {
-        /* GEAR 8-TOOTH — radial square wave.  Radius alternates
-         * sharply between R_outer and R_inner with period 2*pi/8.
-         * Discontinuous derivative at every tooth → many high-freq
-         * harmonics → slow energy convergence.  Bar still climbing
-         * past M = 30. */
-        for (int k = 0; k < N; k++) {
-            float t = 2.f*(float)M_PI*(float)k/(float)N;
-            float r = 0.6f + 0.3f * (sinf(8.f*t) > 0.f ? 1.f : -1.f);
-            out[k].re = r * cosf(t);
-            out[k].im = r * sinf(t);
-        }
-        break;
+  case 13: {
+    /* GEAR 8-TOOTH — radial square wave.  Radius alternates
+     * sharply between R_outer and R_inner with period 2*pi/8.
+     * Discontinuous derivative at every tooth → many high-freq
+     * harmonics → slow energy convergence.  Bar still climbing
+     * past M = 30. */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      float r = 0.6f + 0.3f * (sinf(8.f * t) > 0.f ? 1.f : -1.f);
+      out[k].re = r * cosf(t);
+      out[k].im = r * sinf(t);
     }
+    break;
+  }
 
-    case 14: {
-        /* CRESCENT — outer right semicircle + inner left semicircle
-         * (offset).  Smooth except at the two join points → energy
-         * converges fast initially then has a slow tail from the
-         * corner singularities. */
-        for (int k = 0; k < N; k++) {
-            float t = 2.f*(float)M_PI*(float)k/(float)N;
-            if (t < (float)M_PI) {
-                /* outer semicircle, top → bottom on right side */
-                float theta = (float)M_PI/2.f - t;
-                out[k].re = cosf(theta);
-                out[k].im = sinf(theta);
-            } else {
-                /* inner semicircle, bottom → top, offset right */
-                float theta = -(float)M_PI/2.f + (t - (float)M_PI);
-                out[k].re = 0.30f + 0.70f * cosf(theta);
-                out[k].im = 0.70f * sinf(theta);
-            }
-        }
-        break;
+  case 14: {
+    /* CRESCENT — outer right semicircle + inner left semicircle
+     * (offset).  Smooth except at the two join points → energy
+     * converges fast initially then has a slow tail from the
+     * corner singularities. */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      if (t < (float)M_PI) {
+        /* outer semicircle, top → bottom on right side */
+        float theta = (float)M_PI / 2.f - t;
+        out[k].re = cosf(theta);
+        out[k].im = sinf(theta);
+      } else {
+        /* inner semicircle, bottom → top, offset right */
+        float theta = -(float)M_PI / 2.f + (t - (float)M_PI);
+        out[k].re = 0.30f + 0.70f * cosf(theta);
+        out[k].im = 0.70f * sinf(theta);
+      }
     }
+    break;
+  }
 
-    case 15: {
-        /* LIGHTNING BOLT — piecewise-linear zigzag through 7 vertices.
-         * Sharp angle at every vertex → many harmonics.  Slowest
-         * convergence in the catalog: ~50% at M = 5, ~85% at M = 30,
-         * 95% at M = 60+. */
-        static const float lx[] = { 0.00f,  0.55f, -0.20f,
-                                    0.30f, -0.40f,  0.20f,  0.00f };
-        static const float ly[] = { 1.00f,  0.40f,  0.10f,
-                                   -0.30f, -0.60f, -1.00f,  0.00f };
-        sample_poly(lx, ly, 7, out, N);
-        break;
-    }
+  case 15: {
+    /* LIGHTNING BOLT — piecewise-linear zigzag through 7 vertices.
+     * Sharp angle at every vertex → many harmonics.  Slowest
+     * convergence in the catalog: ~50% at M = 5, ~85% at M = 30,
+     * 95% at M = 60+. */
+    static const float lx[] = {0.00f,  0.55f, -0.20f, 0.30f,
+                               -0.40f, 0.20f, 0.00f};
+    static const float ly[] = {1.00f,  0.40f,  0.10f, -0.30f,
+                               -0.60f, -1.00f, 0.00f};
+    sample_poly(lx, ly, 7, out, N);
+    break;
+  }
 
-    case 16: {
-        /* LISSAJOUS 11:7 — close-to-irrational ratio that visually
-         * packs the screen with intersecting curves.
-         *
-         * NEW LESSON: visual complexity does NOT imply spectral
-         * complexity.  Spectrum is still ONLY 4 dominant bins
-         * (±11, ±7) — energy bar reaches 100% at M = 4 just like
-         * the simpler Lissajous 3:2. */
-        for (int k = 0; k < N; k++) {
-            float t = 2.f*(float)M_PI*(float)k/(float)N;
-            out[k].re = sinf(11.f*t + (float)M_PI/4.f);
-            out[k].im = sinf(7.f*t);
-        }
-        break;
+  case 16: {
+    /* LISSAJOUS 11:7 — close-to-irrational ratio that visually
+     * packs the screen with intersecting curves.
+     *
+     * NEW LESSON: visual complexity does NOT imply spectral
+     * complexity.  Spectrum is still ONLY 4 dominant bins
+     * (±11, ±7) — energy bar reaches 100% at M = 4 just like
+     * the simpler Lissajous 3:2. */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      out[k].re = sinf(11.f * t + (float)M_PI / 4.f);
+      out[k].im = sinf(7.f * t);
     }
+    break;
+  }
 
-    case 17: {
-        /* BEADED CIRCLE — circle of radius 1 with a small high-freq
-         * VECTOR offset added per sample.  Looks like a string of
-         * 8 beads on a necklace.
-         *
-         * NEW LESSON: vector AM places spectral energy at the TWO
-         * carrier frequencies (±1 and ±8), NOT at sum/diff.
-         * Compare with Gear 8-tooth: gear's RADIAL modulation
-         * creates many sidebands; beaded's VECTOR modulation
-         * creates just 4 bins.  Same "8" parameter, totally
-         * different spectra. */
-        for (int k = 0; k < N; k++) {
-            float t = 2.f*(float)M_PI*(float)k/(float)N;
-            out[k].re = cosf(t) + 0.25f*cosf(8.f*t);
-            out[k].im = sinf(t) + 0.25f*sinf(8.f*t);
-        }
-        break;
+  case 17: {
+    /* BEADED CIRCLE — circle of radius 1 with a small high-freq
+     * VECTOR offset added per sample.  Looks like a string of
+     * 8 beads on a necklace.
+     *
+     * NEW LESSON: vector AM places spectral energy at the TWO
+     * carrier frequencies (±1 and ±8), NOT at sum/diff.
+     * Compare with Gear 8-tooth: gear's RADIAL modulation
+     * creates many sidebands; beaded's VECTOR modulation
+     * creates just 4 bins.  Same "8" parameter, totally
+     * different spectra. */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      out[k].re = cosf(t) + 0.25f * cosf(8.f * t);
+      out[k].im = sinf(t) + 0.25f * sinf(8.f * t);
     }
+    break;
+  }
 
-    case 18: {
-        /* COMPOUND SPIROGRAPH — sum of TWO hypotrochoids that share
-         * the same period.  Each by itself has a 2-bin spectrum;
-         * the sum has 4.
-         *
-         * NEW LESSON: the DFT is LINEAR.  Coefficients of (curve_A +
-         * curve_B) are exactly (coefs_A + coefs_B). */
-        Cplx tmp[N_SAMPLES];
-        sample_hypotrochoid(4, 2, 2.f, out, N);
-        sample_hypotrochoid(6, 3, 2.f, tmp, N);
-        for (int k = 0; k < N; k++) {
-            out[k].re = 0.5f * (out[k].re + tmp[k].re);
-            out[k].im = 0.5f * (out[k].im + tmp[k].im);
-        }
-        break;
+  case 18: {
+    /* COMPOUND SPIROGRAPH — sum of TWO hypotrochoids that share
+     * the same period.  Each by itself has a 2-bin spectrum;
+     * the sum has 4.
+     *
+     * NEW LESSON: the DFT is LINEAR.  Coefficients of (curve_A +
+     * curve_B) are exactly (coefs_A + coefs_B). */
+    Cplx tmp[N_SAMPLES];
+    sample_hypotrochoid(4, 2, 2.f, out, N);
+    sample_hypotrochoid(6, 3, 2.f, tmp, N);
+    for (int k = 0; k < N; k++) {
+      out[k].re = 0.5f * (out[k].re + tmp[k].re);
+      out[k].im = 0.5f * (out[k].im + tmp[k].im);
     }
+    break;
+  }
 
-    case 19: {
-        /* CLOSED ARCHIMEDEAN SPIRAL — r(t) = a*t for t in [0, 4*pi],
-         * then a straight closing chord from spiral end to origin.
-         *
-         * NEW LESSON: PERIODICITY MATTERS.  The closing chord is a
-         * sharp DISCONTINUITY in derivative; the spiral itself is
-         * not periodic in 2*pi (it grows).  Energy spreads across
-         * many bins.  Bar climbs slowly even though the visible
-         * shape looks smooth. */
-        int spiral_end = N * 9 / 10;     /* 90% of samples on spiral */
-        for (int k = 0; k < spiral_end; k++) {
-            float t = 4.f * (float)M_PI * (float)k / (float)spiral_end;
-            float r = 0.95f * t / (4.f * (float)M_PI);
-            out[k].re = r * cosf(t);
-            out[k].im = r * sinf(t);
-        }
-        float end_re = out[spiral_end - 1].re;
-        float end_im = out[spiral_end - 1].im;
-        for (int k = spiral_end; k < N; k++) {
-            float frac = (float)(k - spiral_end) / (float)(N - spiral_end);
-            out[k].re = end_re * (1.f - frac);
-            out[k].im = end_im * (1.f - frac);
-        }
-        break;
+  case 19: {
+    /* CLOSED ARCHIMEDEAN SPIRAL — r(t) = a*t for t in [0, 4*pi],
+     * then a straight closing chord from spiral end to origin.
+     *
+     * NEW LESSON: PERIODICITY MATTERS.  The closing chord is a
+     * sharp DISCONTINUITY in derivative; the spiral itself is
+     * not periodic in 2*pi (it grows).  Energy spreads across
+     * many bins.  Bar climbs slowly even though the visible
+     * shape looks smooth. */
+    int spiral_end = N * 9 / 10; /* 90% of samples on spiral */
+    for (int k = 0; k < spiral_end; k++) {
+      float t = 4.f * (float)M_PI * (float)k / (float)spiral_end;
+      float r = 0.95f * t / (4.f * (float)M_PI);
+      out[k].re = r * cosf(t);
+      out[k].im = r * sinf(t);
     }
+    float end_re = out[spiral_end - 1].re;
+    float end_im = out[spiral_end - 1].im;
+    for (int k = spiral_end; k < N; k++) {
+      float frac = (float)(k - spiral_end) / (float)(N - spiral_end);
+      out[k].re = end_re * (1.f - frac);
+      out[k].im = end_im * (1.f - frac);
+    }
+    break;
+  }
 
-    case 20: {
-        /* TORUS KNOT (2, 5) — a closed curve that, in 3-D, is a
-         * non-trivial knot wrapping a torus 5 times the short way
-         * and 2 times the long way.  Projected to 2-D:
-         *   x(t) = (2 + cos(5t)) * cos(2t) / 3
-         *   y(t) = (2 + cos(5t)) * sin(2t) / 3
-         *
-         * NEW LESSON: knotted/torus closed curves have multi-frequency
-         * spectra structured around their (p, q) winding parameters.
-         * 5-fold modulation atop 2-rev carrier puts dominant energy
-         * at signed bins ±2, ±3 (= 2-5), ±7 (= 2+5). */
-        for (int k = 0; k < N; k++) {
-            float t = 2.f*(float)M_PI*(float)k/(float)N;
-            float r = 2.f + cosf(5.f*t);
-            out[k].re = r * cosf(2.f*t) / 3.f;
-            out[k].im = r * sinf(2.f*t) / 3.f;
-        }
-        break;
+  case 20: {
+    /* TORUS KNOT (2, 5) — a closed curve that, in 3-D, is a
+     * non-trivial knot wrapping a torus 5 times the short way
+     * and 2 times the long way.  Projected to 2-D:
+     *   x(t) = (2 + cos(5t)) * cos(2t) / 3
+     *   y(t) = (2 + cos(5t)) * sin(2t) / 3
+     *
+     * NEW LESSON: knotted/torus closed curves have multi-frequency
+     * spectra structured around their (p, q) winding parameters.
+     * 5-fold modulation atop 2-rev carrier puts dominant energy
+     * at signed bins ±2, ±3 (= 2-5), ±7 (= 2+5). */
+    for (int k = 0; k < N; k++) {
+      float t = 2.f * (float)M_PI * (float)k / (float)N;
+      float r = 2.f + cosf(5.f * t);
+      out[k].re = r * cosf(2.f * t) / 3.f;
+      out[k].im = r * sinf(2.f * t) / 3.f;
     }
-
-    }
+    break;
+  }
+  }
 }
 
 /* ===================================================================== */
@@ -1383,26 +1402,26 @@ static const Tier k_shape_tier[N_SHAPES] = {
     /* 20 Torus knot 2:5   */ TIER_MED,
 };
 
-static const char *k_tier_name[TIER_COUNT] = { "Fast", "Med ", "Slow" };
+static const char *k_tier_name[TIER_COUNT] = {"Fast", "Med ", "Slow"};
 
 /*
  * shape_tier_position — for the active shape, compute its tier name,
  * its position within that tier (1-indexed), and the total count
  * of shapes in that tier.  HUD prints "[Fast 5/9]" using this.
  */
-static void shape_tier_position(int shape_idx,
-                                const char **out_tier_name,
-                                int *out_pos, int *out_total)
-{
-    Tier t = k_shape_tier[shape_idx];
-    *out_tier_name = k_tier_name[t];
-    *out_pos = 0;
-    *out_total = 0;
-    for (int i = 0; i < N_SHAPES; i++) {
-        if (k_shape_tier[i] != t) continue;
-        (*out_total)++;
-        if (i <= shape_idx) *out_pos = *out_total;
-    }
+static void shape_tier_position(int shape_idx, const char **out_tier_name,
+                                int *out_pos, int *out_total) {
+  Tier t = k_shape_tier[shape_idx];
+  *out_tier_name = k_tier_name[t];
+  *out_pos = 0;
+  *out_total = 0;
+  for (int i = 0; i < N_SHAPES; i++) {
+    if (k_shape_tier[i] != t)
+      continue;
+    (*out_total)++;
+    if (i <= shape_idx)
+      *out_pos = *out_total;
+  }
 }
 
 /* ===================================================================== */
@@ -1426,29 +1445,27 @@ static void shape_tier_position(int shape_idx,
  *  Cost            : O(N^2) — at N = 256, ~65k complex multiplies.
  *                    Sub-millisecond.
  */
-static void compute_dft(const Cplx *in, Cplx *out, int N)
-{
-    for (int n = 0; n < N; n++) {
-        float twiddle_step_re = cosf(-2.f * (float)M_PI * (float)n / (float)N);
-        float twiddle_step_im = sinf(-2.f * (float)M_PI * (float)n / (float)N);
-        float twiddle_re = 1.f, twiddle_im = 0.f;
-        float acc_re     = 0.f, acc_im     = 0.f;
+static void compute_dft(const Cplx *in, Cplx *out, int N) {
+  for (int n = 0; n < N; n++) {
+    float twiddle_step_re = cosf(-2.f * (float)M_PI * (float)n / (float)N);
+    float twiddle_step_im = sinf(-2.f * (float)M_PI * (float)n / (float)N);
+    float twiddle_re = 1.f, twiddle_im = 0.f;
+    float acc_re = 0.f, acc_im = 0.f;
 
-        for (int k = 0; k < N; k++) {
-            /* acc += in[k] * twiddle  (complex mul spelled out) */
-            acc_re += in[k].re * twiddle_re - in[k].im * twiddle_im;
-            acc_im += in[k].re * twiddle_im + in[k].im * twiddle_re;
+    for (int k = 0; k < N; k++) {
+      /* acc += in[k] * twiddle  (complex mul spelled out) */
+      acc_re += in[k].re * twiddle_re - in[k].im * twiddle_im;
+      acc_im += in[k].re * twiddle_im + in[k].im * twiddle_re;
 
-            /* twiddle = twiddle * twiddle_step  (advance W^k -> W^(k+1)) */
-            float next_re = twiddle_re * twiddle_step_re
-                          - twiddle_im * twiddle_step_im;
-            twiddle_im    = twiddle_re * twiddle_step_im
-                          + twiddle_im * twiddle_step_re;
-            twiddle_re    = next_re;
-        }
-        out[n].re = acc_re;
-        out[n].im = acc_im;
+      /* twiddle = twiddle * twiddle_step  (advance W^k -> W^(k+1)) */
+      float next_re =
+          twiddle_re * twiddle_step_re - twiddle_im * twiddle_step_im;
+      twiddle_im = twiddle_re * twiddle_step_im + twiddle_im * twiddle_step_re;
+      twiddle_re = next_re;
     }
+    out[n].re = acc_re;
+    out[n].im = acc_im;
+  }
 }
 
 /* ===================================================================== */
@@ -1456,9 +1473,9 @@ static void compute_dft(const Cplx *in, Cplx *out, int N)
 /* ===================================================================== */
 
 typedef struct {
-    float amp;    /* normalised arm length = |Z[n]| / N           */
-    float phase;  /* arg(Z[n])                                    */
-    int   freq;   /* signed rotation rate (cycles per shape trace)*/
+  float amp;   /* normalised arm length = |Z[n]| / N           */
+  float phase; /* arg(Z[n])                                    */
+  int freq;    /* signed rotation rate (cycles per shape trace)*/
 } Epicycle;
 
 /*
@@ -1466,16 +1483,15 @@ typedef struct {
  * build_epicycles to sort the arm table.  Sorting descending is
  * what makes the partial sums energy-OPTIMAL (T3).
  */
-static int epic_cmp(const void *a, const void *b)
-{
-    float da = ((const Epicycle *)a)->amp;
-    float db = ((const Epicycle *)b)->amp;
-    return (da < db) - (da > db);
+static int epic_cmp(const void *a, const void *b) {
+  float da = ((const Epicycle *)a)->amp;
+  float db = ((const Epicycle *)b)->amp;
+  return (da < db) - (da > db);
 }
 
 static Epicycle g_epicycle_table[N_SAMPLES];
-static int      g_total_epicycle_count = 0;
-static int      g_active_epicycle_count = 0;
+static int g_total_epicycle_count = 0;
+static int g_active_epicycle_count = 0;
 
 /*
  * g_cumulative_energy_fraction[k] — fraction of total signal power
@@ -1515,36 +1531,32 @@ static Cplx g_resampled_source[N_SAMPLES];
  *                 and on reset ('r').  Keeps the DFT cost out of
  *                 the per-frame hot path.
  */
-static void build_epicycles(int shape_idx)
-{
-    Cplx dft[N_SAMPLES];
-    sample_path(shape_idx, g_resampled_source, N_SAMPLES);
-    compute_dft(g_resampled_source, dft, N_SAMPLES);
+static void build_epicycles(int shape_idx) {
+  Cplx dft[N_SAMPLES];
+  sample_path(shape_idx, g_resampled_source, N_SAMPLES);
+  compute_dft(g_resampled_source, dft, N_SAMPLES);
 
-    float inv_N = 1.f / (float)N_SAMPLES;
-    for (int n = 0; n < N_SAMPLES; n++) {
-        float re = dft[n].re, im = dft[n].im;
-        int   f  = (n <= N_SAMPLES/2) ? n : n - N_SAMPLES;   /* signed freq */
-        g_epicycle_table[n] = (Epicycle){
-            sqrtf(re*re + im*im) * inv_N, atan2f(im, re), f
-        };
-    }
-    qsort(g_epicycle_table, N_SAMPLES, sizeof(Epicycle), epic_cmp);
-    g_total_epicycle_count = N_SAMPLES;
+  float inv_N = 1.f / (float)N_SAMPLES;
+  for (int n = 0; n < N_SAMPLES; n++) {
+    float re = dft[n].re, im = dft[n].im;
+    int f = (n <= N_SAMPLES / 2) ? n : n - N_SAMPLES; /* signed freq */
+    g_epicycle_table[n] =
+        (Epicycle){sqrtf(re * re + im * im) * inv_N, atan2f(im, re), f};
+  }
+  qsort(g_epicycle_table, N_SAMPLES, sizeof(Epicycle), epic_cmp);
+  g_total_epicycle_count = N_SAMPLES;
 
-    /* Build cumulative energy table (Parseval). */
-    g_total_signal_energy = 0.f;
-    for (int n = 0; n < N_SAMPLES; n++)
-        g_total_signal_energy +=
-            g_epicycle_table[n].amp * g_epicycle_table[n].amp;
+  /* Build cumulative energy table (Parseval). */
+  g_total_signal_energy = 0.f;
+  for (int n = 0; n < N_SAMPLES; n++)
+    g_total_signal_energy += g_epicycle_table[n].amp * g_epicycle_table[n].amp;
 
-    float acc = 0.f;
-    for (int n = 0; n < N_SAMPLES; n++) {
-        acc += g_epicycle_table[n].amp * g_epicycle_table[n].amp;
-        g_cumulative_energy_fraction[n] =
-            (g_total_signal_energy > 0.f)
-            ? acc / g_total_signal_energy : 0.f;
-    }
+  float acc = 0.f;
+  for (int n = 0; n < N_SAMPLES; n++) {
+    acc += g_epicycle_table[n].amp * g_epicycle_table[n].amp;
+    g_cumulative_energy_fraction[n] =
+        (g_total_signal_energy > 0.f) ? acc / g_total_signal_energy : 0.f;
+  }
 }
 
 /* ===================================================================== */
@@ -1552,42 +1564,41 @@ static void build_epicycles(int shape_idx)
 /* ===================================================================== */
 
 typedef struct {
-    float pixel_x[TRAIL_LEN];
-    float pixel_y[TRAIL_LEN];
-    int   write_head;
-    int   filled_count;
+  float pixel_x[TRAIL_LEN];
+  float pixel_y[TRAIL_LEN];
+  int write_head;
+  int filled_count;
 } Trail;
 
-static void trail_push(Trail *t, float pixel_x, float pixel_y)
-{
-    /* Append (x, y); advance head; saturate count at TRAIL_LEN. */
-    t->pixel_x[t->write_head] = pixel_x;
-    t->pixel_y[t->write_head] = pixel_y;
-    t->write_head = (t->write_head + 1) % TRAIL_LEN;
-    if (t->filled_count < TRAIL_LEN) t->filled_count++;
+static void trail_push(Trail *t, float pixel_x, float pixel_y) {
+  /* Append (x, y); advance head; saturate count at TRAIL_LEN. */
+  t->pixel_x[t->write_head] = pixel_x;
+  t->pixel_y[t->write_head] = pixel_y;
+  t->write_head = (t->write_head + 1) % TRAIL_LEN;
+  if (t->filled_count < TRAIL_LEN)
+    t->filled_count++;
 }
 
-static void trail_clear(Trail *t)
-{
-    /* Logically empty without zeroing the data array. */
-    t->write_head = 0;
-    t->filled_count = 0;
+static void trail_clear(Trail *t) {
+  /* Logically empty without zeroing the data array. */
+  t->write_head = 0;
+  t->filled_count = 0;
 }
 
 /* ===================================================================== */
 /* §11  scene_state — globals + reset/init                               */
 /* ===================================================================== */
 
-static int   g_screen_rows, g_screen_cols;
-static float g_pivot_pixel_x, g_pivot_pixel_y;   /* chain origin in pixel space */
-static float g_pixel_scale;                       /* normalised → pixel        */
-static float g_animation_phase_radians;           /* phi ∈ [0, 2*pi)            */
-static int   g_auto_add_counter;
-static bool  g_simulation_paused;
-static bool  g_auto_add_enabled;
-static bool  g_show_orbit_circles;
-static bool  g_show_ghost_overlay;
-static int   g_active_shape_index;
+static int g_screen_rows, g_screen_cols;
+static float g_pivot_pixel_x, g_pivot_pixel_y; /* chain origin in pixel space */
+static float g_pixel_scale;                    /* normalised → pixel        */
+static float g_animation_phase_radians; /* phi ∈ [0, 2*pi)            */
+static int g_auto_add_counter;
+static bool g_simulation_paused;
+static bool g_auto_add_enabled;
+static bool g_show_orbit_circles;
+static bool g_show_ghost_overlay;
+static int g_active_shape_index;
 static Trail g_tip_trail;
 
 /* Joint positions in pixel space; joint[0] = pivot, joint[i+1] is
@@ -1595,8 +1606,12 @@ static Trail g_tip_trail;
 static float g_joint_pixel_x[N_SAMPLES + 1];
 static float g_joint_pixel_y[N_SAMPLES + 1];
 
-static int px_cx(float pixel_x) { return (int)(pixel_x / (float)CELL_W + 0.5f); }
-static int px_cy(float pixel_y) { return (int)(pixel_y / (float)CELL_H + 0.5f); }
+static int px_cx(float pixel_x) {
+  return (int)(pixel_x / (float)CELL_W + 0.5f);
+}
+static int px_cy(float pixel_y) {
+  return (int)(pixel_y / (float)CELL_H + 0.5f);
+}
 
 /* ===================================================================== */
 /* §12  scene_chain — compute joint positions from epicycle table        */
@@ -1623,21 +1638,19 @@ static int px_cy(float pixel_y) { return (int)(pixel_y / (float)CELL_H + 0.5f); 
  *                    arm parameters.  Computing joints once per frame
  *                    avoids redundant work.
  */
-static void scene_compute_chain(void)
-{
-    float x = g_pivot_pixel_x, y = g_pivot_pixel_y;
-    g_joint_pixel_x[0] = x;
-    g_joint_pixel_y[0] = y;
-    for (int i = 0; i < g_active_epicycle_count; i++) {
-        float ang = (float)g_epicycle_table[i].freq
-                  * g_animation_phase_radians
-                  + g_epicycle_table[i].phase;
-        float r   = g_epicycle_table[i].amp * g_pixel_scale;
-        x += r * cosf(ang);
-        y += r * sinf(ang);
-        g_joint_pixel_x[i+1] = x;
-        g_joint_pixel_y[i+1] = y;
-    }
+static void scene_compute_chain(void) {
+  float x = g_pivot_pixel_x, y = g_pivot_pixel_y;
+  g_joint_pixel_x[0] = x;
+  g_joint_pixel_y[0] = y;
+  for (int i = 0; i < g_active_epicycle_count; i++) {
+    float ang = (float)g_epicycle_table[i].freq * g_animation_phase_radians +
+                g_epicycle_table[i].phase;
+    float r = g_epicycle_table[i].amp * g_pixel_scale;
+    x += r * cosf(ang);
+    y += r * sinf(ang);
+    g_joint_pixel_x[i + 1] = x;
+    g_joint_pixel_y[i + 1] = y;
+  }
 }
 
 /* ===================================================================== */
@@ -1652,59 +1665,54 @@ static void scene_compute_chain(void)
  *    2. Advance phi; on wrap, clear the trail.
  *    3. Recompute chain joints; push tip into trail.
  */
-static void scene_reset(int shape_idx)
-{
-    g_active_shape_index = shape_idx;
-    g_animation_phase_radians = 0.f;
-    g_auto_add_counter = 0;
-    g_active_epicycle_count = 1;
+static void scene_reset(int shape_idx) {
+  g_active_shape_index = shape_idx;
+  g_animation_phase_radians = 0.f;
+  g_auto_add_counter = 0;
+  g_active_epicycle_count = 1;
+  trail_clear(&g_tip_trail);
+  build_epicycles(g_active_shape_index);
+  scene_compute_chain();
+}
+
+static void scene_init(int rows, int cols) {
+  g_screen_rows = rows;
+  g_screen_cols = cols;
+  g_pivot_pixel_x = (float)(cols * CELL_W) * 0.5f;
+  g_pivot_pixel_y = (float)(rows * CELL_H) * 0.5f;
+  float min_pixels = fminf((float)(cols * CELL_W), (float)(rows * CELL_H));
+  g_pixel_scale = min_pixels * SHAPE_SCALE;
+  g_simulation_paused = false;
+  g_auto_add_enabled = true;
+  g_show_orbit_circles = true;
+  g_show_ghost_overlay = true;
+  scene_reset(0);
+}
+
+static void scene_tick(void) {
+  if (g_simulation_paused)
+    return;
+
+  /* ── Step 1 — auto-add one arm at intervals ───────────────── */
+  if (g_auto_add_enabled && g_active_epicycle_count < g_total_epicycle_count) {
+    g_auto_add_counter++;
+    if (g_auto_add_counter >= AUTO_ADD_FRAMES) {
+      g_auto_add_counter = 0;
+      g_active_epicycle_count++;
+    }
+  }
+
+  /* ── Step 2 — advance phi; clear trail at cycle wrap ────── */
+  g_animation_phase_radians += 2.f * (float)M_PI / (float)CYCLE_FRAMES;
+  if (g_animation_phase_radians >= 2.f * (float)M_PI) {
+    g_animation_phase_radians -= 2.f * (float)M_PI;
     trail_clear(&g_tip_trail);
-    build_epicycles(g_active_shape_index);
-    scene_compute_chain();
-}
+  }
 
-static void scene_init(int rows, int cols)
-{
-    g_screen_rows = rows;
-    g_screen_cols = cols;
-    g_pivot_pixel_x = (float)(cols * CELL_W) * 0.5f;
-    g_pivot_pixel_y = (float)(rows * CELL_H) * 0.5f;
-    float min_pixels = fminf((float)(cols * CELL_W),
-                             (float)(rows * CELL_H));
-    g_pixel_scale = min_pixels * SHAPE_SCALE;
-    g_simulation_paused   = false;
-    g_auto_add_enabled    = true;
-    g_show_orbit_circles  = true;
-    g_show_ghost_overlay  = true;
-    scene_reset(0);
-}
-
-static void scene_tick(void)
-{
-    if (g_simulation_paused) return;
-
-    /* ── Step 1 — auto-add one arm at intervals ───────────────── */
-    if (g_auto_add_enabled
-     && g_active_epicycle_count < g_total_epicycle_count) {
-        g_auto_add_counter++;
-        if (g_auto_add_counter >= AUTO_ADD_FRAMES) {
-            g_auto_add_counter = 0;
-            g_active_epicycle_count++;
-        }
-    }
-
-    /* ── Step 2 — advance phi; clear trail at cycle wrap ────── */
-    g_animation_phase_radians += 2.f * (float)M_PI / (float)CYCLE_FRAMES;
-    if (g_animation_phase_radians >= 2.f * (float)M_PI) {
-        g_animation_phase_radians -= 2.f * (float)M_PI;
-        trail_clear(&g_tip_trail);
-    }
-
-    /* ── Step 3 — recompute chain; record tip ─────────────────── */
-    scene_compute_chain();
-    trail_push(&g_tip_trail,
-               g_joint_pixel_x[g_active_epicycle_count],
-               g_joint_pixel_y[g_active_epicycle_count]);
+  /* ── Step 3 — recompute chain; record tip ─────────────────── */
+  scene_compute_chain();
+  trail_push(&g_tip_trail, g_joint_pixel_x[g_active_epicycle_count],
+             g_joint_pixel_y[g_active_epicycle_count]);
 }
 
 /* ===================================================================== */
@@ -1717,27 +1725,31 @@ static void scene_tick(void)
  *   Mostly-vertical   segments → '|'
  *   Diagonal (\ or /)         → '\\' / '/'
  */
-static void draw_line_seg(int x0, int y0, int x1, int y1, attr_t attr)
-{
-    int dx = abs(x1-x0), dy = abs(y1-y0);
-    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
-    int err = dx - dy;
-    for (;;) {
-        if (x0 >= 0 && x0 < g_screen_cols
-         && y0 >= 0 && y0 < g_screen_rows) {
-            int  e2 = 2 * err;
-            bool bx = e2 > -dy, by = e2 < dx;
-            chtype ch = (bx && by) ? (sx == sy ? '\\' : '/')
-                      :  bx ? '-' : '|';
-            attron(attr);
-            mvaddch(y0, x0, ch);
-            attroff(attr);
-        }
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 > -dy) { err -= dy; x0 += sx; }
-        if (e2 <  dx) { err += dx; y0 += sy; }
+static void draw_line_seg(int x0, int y0, int x1, int y1, attr_t attr) {
+  int dx = abs(x1 - x0), dy = abs(y1 - y0);
+  int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  int err = dx - dy;
+  for (;;) {
+    if (x0 >= 0 && x0 < g_screen_cols && y0 >= 0 && y0 < g_screen_rows) {
+      int e2 = 2 * err;
+      bool bx = e2 > -dy, by = e2 < dx;
+      chtype ch = (bx && by) ? (sx == sy ? '\\' : '/') : bx ? '-' : '|';
+      attron(attr);
+      mvaddch(y0, x0, ch);
+      attroff(attr);
     }
+    if (x0 == x1 && y0 == y1)
+      break;
+    int e2 = 2 * err;
+    if (e2 > -dy) {
+      err -= dy;
+      x0 += sx;
+    }
+    if (e2 < dx) {
+      err += dx;
+      y0 += sy;
+    }
+  }
 }
 
 /*
@@ -1745,111 +1757,106 @@ static void draw_line_seg(int x0, int y0, int x1, int y1, attr_t attr)
  * space radius r_px.  In CELL space the orbit is an ellipse because
  * cells are CELL_H/CELL_W = 2x as tall as wide.
  */
-static void draw_orbit(float piv_px, float piv_py, float r_px)
-{
-    if (r_px < (float)CELL_W * 0.5f) return;   /* skip sub-cell orbits */
-    float rx    = r_px / (float)CELL_W;
-    float ry    = r_px / (float)CELL_H;
-    int   pcx   = px_cx(piv_px), pcy = px_cy(piv_py);
-    int   steps = (int)(2.f * (float)M_PI * fmaxf(rx, ry)) + 4;
-    for (int i = 0; i < steps; i++) {
-        float a = 2.f * (float)M_PI * (float)i / (float)steps;
-        int x   = pcx + (int)(rx * cosf(a) + 0.5f);
-        int y   = pcy + (int)(ry * sinf(a) + 0.5f);
-        if (x >= 0 && x < g_screen_cols
-         && y >= 0 && y < g_screen_rows) {
-            attron(COLOR_PAIR(CP_CIRCLE));
-            mvaddch(y, x, '.');
-            attroff(COLOR_PAIR(CP_CIRCLE));
-        }
+static void draw_orbit(float piv_px, float piv_py, float r_px) {
+  if (r_px < (float)CELL_W * 0.5f)
+    return; /* skip sub-cell orbits */
+  float rx = r_px / (float)CELL_W;
+  float ry = r_px / (float)CELL_H;
+  int pcx = px_cx(piv_px), pcy = px_cy(piv_py);
+  int steps = (int)(2.f * (float)M_PI * fmaxf(rx, ry)) + 4;
+  for (int i = 0; i < steps; i++) {
+    float a = 2.f * (float)M_PI * (float)i / (float)steps;
+    int x = pcx + (int)(rx * cosf(a) + 0.5f);
+    int y = pcy + (int)(ry * sinf(a) + 0.5f);
+    if (x >= 0 && x < g_screen_cols && y >= 0 && y < g_screen_rows) {
+      attron(COLOR_PAIR(CP_CIRCLE));
+      mvaddch(y, x, '.');
+      attroff(COLOR_PAIR(CP_CIRCLE));
     }
+  }
 }
 
 /* ===================================================================== */
 /* §15  draw_layers — ghost / orbits / trail / chain / markers           */
 /* ===================================================================== */
 
-static void scene_draw(void)
-{
-    /* ── Layer 1.  GHOST overlay — source samples as ':' dots ──── */
-    /*
-     * Every other sample is drawn (i += 2) to keep density readable.
-     * Shows where the "true" shape lies so the viewer can compare
-     * the reconstruction's accuracy directly against the target.
-     */
-    if (g_show_ghost_overlay) {
-        attron(COLOR_PAIR(CP_GHOST));
-        for (int k = 0; k < N_SAMPLES; k += 2) {
-            float px = g_pivot_pixel_x + g_resampled_source[k].re * g_pixel_scale;
-            float py = g_pivot_pixel_y + g_resampled_source[k].im * g_pixel_scale;
-            int   cx = px_cx(px), cy = px_cy(py);
-            if (cx >= 0 && cx < g_screen_cols
-             && cy >= 0 && cy < g_screen_rows)
-                mvaddch(cy, cx, ':');
-        }
-        attroff(COLOR_PAIR(CP_GHOST));
+static void scene_draw(void) {
+  /* ── Layer 1.  GHOST overlay — source samples as ':' dots ──── */
+  /*
+   * Every other sample is drawn (i += 2) to keep density readable.
+   * Shows where the "true" shape lies so the viewer can compare
+   * the reconstruction's accuracy directly against the target.
+   */
+  if (g_show_ghost_overlay) {
+    attron(COLOR_PAIR(CP_GHOST));
+    for (int k = 0; k < N_SAMPLES; k += 2) {
+      float px = g_pivot_pixel_x + g_resampled_source[k].re * g_pixel_scale;
+      float py = g_pivot_pixel_y + g_resampled_source[k].im * g_pixel_scale;
+      int cx = px_cx(px), cy = px_cy(py);
+      if (cx >= 0 && cx < g_screen_cols && cy >= 0 && cy < g_screen_rows)
+        mvaddch(cy, cx, ':');
     }
+    attroff(COLOR_PAIR(CP_GHOST));
+  }
 
-    /* ── Layer 2.  ORBIT circles for the largest arms ───────────── */
-    if (g_show_orbit_circles) {
-        int nc = g_active_epicycle_count < N_CIRCLES
-               ? g_active_epicycle_count : N_CIRCLES;
-        for (int i = 0; i < nc; i++)
-            draw_orbit(g_joint_pixel_x[i], g_joint_pixel_y[i],
-                       g_epicycle_table[i].amp * g_pixel_scale);
-    }
+  /* ── Layer 2.  ORBIT circles for the largest arms ───────────── */
+  if (g_show_orbit_circles) {
+    int nc = g_active_epicycle_count < N_CIRCLES ? g_active_epicycle_count
+                                                 : N_CIRCLES;
+    for (int i = 0; i < nc; i++)
+      draw_orbit(g_joint_pixel_x[i], g_joint_pixel_y[i],
+                 g_epicycle_table[i].amp * g_pixel_scale);
+  }
 
-    /* ── Layer 3.  TRAIL — fading dots from oldest to newest ───── */
-    {
-        int draw  = g_tip_trail.filled_count;
-        int start = (g_tip_trail.write_head - draw + TRAIL_LEN) % TRAIL_LEN;
-        for (int i = 0; i < draw; i++) {
-            int   idx = (start + i) % TRAIL_LEN;
-            int   cx  = px_cx(g_tip_trail.pixel_x[idx]);
-            int   cy  = px_cy(g_tip_trail.pixel_y[idx]);
-            if (cx < 0 || cx >= g_screen_cols
-             || cy < 0 || cy >= g_screen_rows) continue;
-            float age = (float)i / (float)draw;   /* 0 = oldest, 1 = newest */
-            int   cp  = age > 0.70f ? CP_TRAIL_1
-                      : age > 0.35f ? CP_TRAIL_2 : CP_TRAIL_3;
-            attron(COLOR_PAIR(cp) | A_BOLD);
-            mvaddch(cy, cx, '*');
-            attroff(COLOR_PAIR(cp) | A_BOLD);
-        }
+  /* ── Layer 3.  TRAIL — fading dots from oldest to newest ───── */
+  {
+    int draw = g_tip_trail.filled_count;
+    int start = (g_tip_trail.write_head - draw + TRAIL_LEN) % TRAIL_LEN;
+    for (int i = 0; i < draw; i++) {
+      int idx = (start + i) % TRAIL_LEN;
+      int cx = px_cx(g_tip_trail.pixel_x[idx]);
+      int cy = px_cy(g_tip_trail.pixel_y[idx]);
+      if (cx < 0 || cx >= g_screen_cols || cy < 0 || cy >= g_screen_rows)
+        continue;
+      float age = (float)i / (float)draw; /* 0 = oldest, 1 = newest */
+      int cp = age > 0.70f ? CP_TRAIL_1 : age > 0.35f ? CP_TRAIL_2 : CP_TRAIL_3;
+      attron(COLOR_PAIR(cp) | A_BOLD);
+      mvaddch(cy, cx, '*');
+      attroff(COLOR_PAIR(cp) | A_BOLD);
     }
+  }
 
-    /* ── Layer 4.  ARM CHAIN — Bresenham segments per arm ──────── */
-    for (int i = 0; i < g_active_epicycle_count; i++) {
-        float r_px = g_epicycle_table[i].amp * g_pixel_scale;
-        int   cp   = r_px > g_pixel_scale * 0.10f ? CP_ARM_HI
-                   : r_px > g_pixel_scale * 0.02f ? CP_ARM_MID : CP_ARM_LO;
-        draw_line_seg(px_cx(g_joint_pixel_x[i]),   px_cy(g_joint_pixel_y[i]),
-                      px_cx(g_joint_pixel_x[i+1]), px_cy(g_joint_pixel_y[i+1]),
-                      COLOR_PAIR(cp) | A_BOLD);
-    }
+  /* ── Layer 4.  ARM CHAIN — Bresenham segments per arm ──────── */
+  for (int i = 0; i < g_active_epicycle_count; i++) {
+    float r_px = g_epicycle_table[i].amp * g_pixel_scale;
+    int cp = r_px > g_pixel_scale * 0.10f   ? CP_ARM_HI
+             : r_px > g_pixel_scale * 0.02f ? CP_ARM_MID
+                                            : CP_ARM_LO;
+    draw_line_seg(px_cx(g_joint_pixel_x[i]), px_cy(g_joint_pixel_y[i]),
+                  px_cx(g_joint_pixel_x[i + 1]), px_cy(g_joint_pixel_y[i + 1]),
+                  COLOR_PAIR(cp) | A_BOLD);
+  }
 
-    /* ── Layer 5a.  TIP BOB — '@' at chain end ──────────────────── */
-    {
-        int bx = px_cx(g_joint_pixel_x[g_active_epicycle_count]);
-        int by = px_cy(g_joint_pixel_y[g_active_epicycle_count]);
-        if (bx >= 0 && bx < g_screen_cols
-         && by >= 0 && by < g_screen_rows) {
-            attron(COLOR_PAIR(CP_BOB) | A_BOLD);
-            mvaddch(by, bx, '@');
-            attroff(COLOR_PAIR(CP_BOB) | A_BOLD);
-        }
+  /* ── Layer 5a.  TIP BOB — '@' at chain end ──────────────────── */
+  {
+    int bx = px_cx(g_joint_pixel_x[g_active_epicycle_count]);
+    int by = px_cy(g_joint_pixel_y[g_active_epicycle_count]);
+    if (bx >= 0 && bx < g_screen_cols && by >= 0 && by < g_screen_rows) {
+      attron(COLOR_PAIR(CP_BOB) | A_BOLD);
+      mvaddch(by, bx, '@');
+      attroff(COLOR_PAIR(CP_BOB) | A_BOLD);
     }
+  }
 
-    /* ── Layer 5b.  PIVOT MARKER — '+' at chain origin ─────────── */
-    {
-        int pcx = px_cx(g_pivot_pixel_x), pcy = px_cy(g_pivot_pixel_y);
-        if (pcx >= 0 && pcx < g_screen_cols
-         && pcy >= 0 && pcy < g_screen_rows) {
-            attron(COLOR_PAIR(CP_PIVOT) | A_BOLD);
-            mvaddch(pcy, pcx, '+');
-            attroff(COLOR_PAIR(CP_PIVOT) | A_BOLD);
-        }
+  /* ── Layer 5b.  PIVOT MARKER — '+' at chain origin ─────────── */
+  {
+    int pcx = px_cx(g_pivot_pixel_x), pcy = px_cy(g_pivot_pixel_y);
+    if (pcx >= 0 && pcx < g_screen_cols && pcy >= 0 && pcy < g_screen_rows) {
+      attron(COLOR_PAIR(CP_PIVOT) | A_BOLD);
+      mvaddch(pcy, pcx, '+');
+      attroff(COLOR_PAIR(CP_PIVOT) | A_BOLD);
     }
+  }
 }
 
 /* ===================================================================== */
@@ -1867,206 +1874,223 @@ static void scene_draw(void)
  *    row LINES-1     : bottom-left hint (bright cyan + bold)
  */
 
-static void scene_draw_hud(void)
-{
-    float efrac = (g_active_epicycle_count > 0 && g_total_signal_energy > 0.f)
-                ? g_cumulative_energy_fraction[g_active_epicycle_count - 1]
-                : 0.f;
+static void scene_draw_hud(void) {
+  float efrac = (g_active_epicycle_count > 0 && g_total_signal_energy > 0.f)
+                    ? g_cumulative_energy_fraction[g_active_epicycle_count - 1]
+                    : 0.f;
 
-    /* ── status (top-right) ── */
-    {
-        const char *tier_name;
-        int tier_pos = 0, tier_total = 0;
-        shape_tier_position(g_active_shape_index, &tier_name, &tier_pos, &tier_total);
+  /* ── status (top-right) ── */
+  {
+    const char *tier_name;
+    int tier_pos = 0, tier_total = 0;
+    shape_tier_position(g_active_shape_index, &tier_name, &tier_pos,
+                        &tier_total);
 
-        char buf[220];
-        snprintf(buf, sizeof buf,
-                 " FourierShapes  %s [%s %d/%d]  arms:%3d/%d  energy:%5.1f%%  thm:%s  %s%s%s ",
-                 k_shape_names[g_active_shape_index],
-                 tier_name, tier_pos, tier_total,
-                 g_active_epicycle_count, g_total_epicycle_count,
-                 efrac * 100.f,
-                 k_themes[g_active_theme_index].name,
-                 g_auto_add_enabled    ? "auto "    : "       ",
-                 g_show_orbit_circles  ? "circles " : "        ",
-                 g_show_ghost_overlay  ? "ghost"    : "     ");
-        int x = g_screen_cols - (int)strlen(buf);
-        if (x < 0) x = 0;
-        attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-        mvprintw(0, x, "%s", buf);
-        attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
-    }
+    char buf[220];
+    snprintf(buf, sizeof buf,
+             " FourierShapes  %s [%s %d/%d]  arms:%3d/%d  energy:%5.1f%%  "
+             "thm:%s  %s%s%s ",
+             k_shape_names[g_active_shape_index], tier_name, tier_pos,
+             tier_total, g_active_epicycle_count, g_total_epicycle_count,
+             efrac * 100.f, k_themes[g_active_theme_index].name,
+             g_auto_add_enabled ? "auto " : "       ",
+             g_show_orbit_circles ? "circles " : "        ",
+             g_show_ghost_overlay ? "ghost" : "     ");
+    int x = g_screen_cols - (int)strlen(buf);
+    if (x < 0)
+      x = 0;
+    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+    mvprintw(0, x, "%s", buf);
+    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+  }
 
-    /* ── PAUSED chip (top-left) ── */
-    if (g_simulation_paused) {
-        attron(COLOR_PAIR(CP_HUD) | A_BOLD | A_REVERSE);
-        mvprintw(0, 0, " PAUSED ");
-        attroff(COLOR_PAIR(CP_HUD) | A_BOLD | A_REVERSE);
-    }
+  /* ── PAUSED chip (top-left) ── */
+  if (g_simulation_paused) {
+    attron(COLOR_PAIR(CP_HUD) | A_BOLD | A_REVERSE);
+    mvprintw(0, 0, " PAUSED ");
+    attroff(COLOR_PAIR(CP_HUD) | A_BOLD | A_REVERSE);
+  }
 
-    /* ── ENERGY BAR with colour tier (row 1) ── */
-    {
-        int bar_col = 1, bar_row = 1, bar_w = 50;
-        if (bar_col + bar_w + 16 >= g_screen_cols)
-            bar_w = g_screen_cols - bar_col - 17;
-        if (bar_w < 12) bar_w = 12;
+  /* ── ENERGY BAR with colour tier (row 1) ── */
+  {
+    int bar_col = 1, bar_row = 1, bar_w = 50;
+    if (bar_col + bar_w + 16 >= g_screen_cols)
+      bar_w = g_screen_cols - bar_col - 17;
+    if (bar_w < 12)
+      bar_w = 12;
 
-        /* Pick colour tier by energy fraction. */
-        int bar_pair = (efrac >= 0.80f) ? CP_ENERGY
-                     : (efrac >= 0.50f) ? CP_ENERGY_MID
-                                        : CP_ENERGY_LO;
+    /* Pick colour tier by energy fraction. */
+    int bar_pair = (efrac >= 0.80f)   ? CP_ENERGY
+                   : (efrac >= 0.50f) ? CP_ENERGY_MID
+                                      : CP_ENERGY_LO;
 
-        /* "[" border + filled "=" + empty "-" + "]" border + label */
-        attron(COLOR_PAIR(CP_HUD));
-        mvaddch(bar_row, bar_col,             '[');
-        mvaddch(bar_row, bar_col + bar_w - 1, ']');
-        attroff(COLOR_PAIR(CP_HUD));
+    /* "[" border + filled "=" + empty "-" + "]" border + label */
+    attron(COLOR_PAIR(CP_HUD));
+    mvaddch(bar_row, bar_col, '[');
+    mvaddch(bar_row, bar_col + bar_w - 1, ']');
+    attroff(COLOR_PAIR(CP_HUD));
 
-        int filled = (int)(efrac * (float)(bar_w - 2));
-        attron(COLOR_PAIR(bar_pair) | A_BOLD);
-        for (int i = 0; i < filled; i++)
-            mvaddch(bar_row, bar_col + 1 + i, '=');
-        attroff(COLOR_PAIR(bar_pair) | A_BOLD);
+    int filled = (int)(efrac * (float)(bar_w - 2));
+    attron(COLOR_PAIR(bar_pair) | A_BOLD);
+    for (int i = 0; i < filled; i++)
+      mvaddch(bar_row, bar_col + 1 + i, '=');
+    attroff(COLOR_PAIR(bar_pair) | A_BOLD);
 
-        attron(COLOR_PAIR(CP_HUD));
-        for (int i = filled; i < bar_w - 2; i++)
-            mvaddch(bar_row, bar_col + 1 + i, '-');
-        mvprintw(bar_row, bar_col + bar_w + 1, "Parseval power");
-        attroff(COLOR_PAIR(CP_HUD));
-    }
+    attron(COLOR_PAIR(CP_HUD));
+    for (int i = filled; i < bar_w - 2; i++)
+      mvaddch(bar_row, bar_col + 1 + i, '-');
+    mvprintw(bar_row, bar_col + bar_w + 1, "Parseval power");
+    attroff(COLOR_PAIR(CP_HUD));
+  }
 
-    /* ── bottom-left hint ── */
-    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
-    mvprintw(g_screen_rows - 1, 0,
-             " q:quit  spc:pause  n/p:shape  +/-:arms  r:reset  a:auto  c:circles  g:ghost  t/T:theme ");
-    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
+  /* ── bottom-left hint ── */
+  attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+  mvprintw(g_screen_rows - 1, 0,
+           " q:quit  spc:pause  n/p:shape  +/-:arms  r:reset  a:auto  "
+           "c:circles  g:ghost  t/T:theme ");
+  attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §17  screen — ncurses init / cleanup / present                        */
 /* ===================================================================== */
 
-static void screen_init(void)
-{
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    color_init();
+static void screen_init(void) {
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  color_init();
 }
 
-static void screen_present(void)
-{
-    wnoutrefresh(stdscr);
-    doupdate();
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §18  app — signal handlers + main loop + key dispatch                 */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_should_quit    = 0;
+static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
 
-static void on_signal(int s)
-{
-    if (s == SIGINT  || s == SIGTERM) g_should_quit    = 1;
-    if (s == SIGWINCH)                g_resize_pending = 1;
+static void on_signal(int s) {
+  if (s == SIGINT || s == SIGTERM)
+    g_should_quit = 1;
+  if (s == SIGWINCH)
+    g_resize_pending = 1;
 }
 
 static void cleanup(void) { endwin(); }
 
-int main(void)
-{
-    atexit(cleanup);
-    signal(SIGINT,   on_signal);
-    signal(SIGTERM,  on_signal);
-    signal(SIGWINCH, on_signal);
+int main(void) {
+  atexit(cleanup);
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGWINCH, on_signal);
 
-    screen_init();
+  screen_init();
 
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    scene_init(rows, cols);
+  int rows, cols;
+  getmaxyx(stdscr, rows, cols);
+  scene_init(rows, cols);
 
-    long long last_ns = clock_ns();
+  long long last_ns = clock_ns();
 
-    while (!g_should_quit) {
+  while (!g_should_quit) {
 
-        /* ── resize ────────────────────────────────────────────── */
-        if (g_resize_pending) {
-            g_resize_pending = 0;
-            endwin();
-            refresh();
-            getmaxyx(stdscr, rows, cols);
-            scene_init(rows, cols);
-            last_ns = clock_ns();
-            continue;
-        }
-
-        /* ── input ─────────────────────────────────────────────── */
-        int ch = getch();
-        switch (ch) {
-        case 'q': case 'Q': case 27:
-            g_should_quit = 1; break;
-        case ' ':
-            g_simulation_paused = !g_simulation_paused; break;
-        case 'n': case 'N':
-            scene_reset((g_active_shape_index + 1) % N_SHAPES); break;
-        case 'p': case 'P':
-            scene_reset((g_active_shape_index + N_SHAPES - 1) % N_SHAPES);
-            break;
-        case '+': case '=':
-            if (g_active_epicycle_count < g_total_epicycle_count)
-                g_active_epicycle_count++;
-            break;
-        case '-':
-            if (g_active_epicycle_count > 1) {
-                g_active_epicycle_count--;
-                trail_clear(&g_tip_trail);
-            }
-            break;
-        case 'r': case 'R':
-            scene_reset(g_active_shape_index); break;
-        case 'a': case 'A':
-            g_auto_add_enabled = !g_auto_add_enabled; break;
-        case 'c': case 'C':
-            g_show_orbit_circles = !g_show_orbit_circles; break;
-        case 'g': case 'G':
-            g_show_ghost_overlay = !g_show_ghost_overlay; break;
-        case 't':
-            g_active_theme_index = (g_active_theme_index + 1) % N_THEMES;
-            apply_theme(g_active_theme_index);
-            break;
-        case 'T':
-            g_active_theme_index =
-                (g_active_theme_index + N_THEMES - 1) % N_THEMES;
-            apply_theme(g_active_theme_index);
-            break;
-        default: break;
-        }
-
-        /* ── tick ──────────────────────────────────────────────── */
-        long long now_ns = clock_ns();
-        long long dt     = now_ns - last_ns;
-        last_ns = now_ns;
-        if (dt > 100000000LL) dt = 100000000LL;   /* pause-guard */
-        (void)dt;
-
-        scene_tick();
-
-        /* ── draw + present ────────────────────────────────────── */
-        erase();
-        scene_draw();
-        scene_draw_hud();
-        screen_present();
-
-        /* ── frame cap ─────────────────────────────────────────── */
-        clock_sleep_ns(RENDER_NS - (clock_ns() - now_ns));
+    /* ── resize ────────────────────────────────────────────── */
+    if (g_resize_pending) {
+      g_resize_pending = 0;
+      endwin();
+      refresh();
+      getmaxyx(stdscr, rows, cols);
+      scene_init(rows, cols);
+      last_ns = clock_ns();
+      continue;
     }
 
-    return 0;
+    /* ── input ─────────────────────────────────────────────── */
+    int ch = getch();
+    switch (ch) {
+    case 'q':
+    case 'Q':
+    case 27:
+      g_should_quit = 1;
+      break;
+    case ' ':
+      g_simulation_paused = !g_simulation_paused;
+      break;
+    case 'n':
+    case 'N':
+      scene_reset((g_active_shape_index + 1) % N_SHAPES);
+      break;
+    case 'p':
+    case 'P':
+      scene_reset((g_active_shape_index + N_SHAPES - 1) % N_SHAPES);
+      break;
+    case '+':
+    case '=':
+      if (g_active_epicycle_count < g_total_epicycle_count)
+        g_active_epicycle_count++;
+      break;
+    case '-':
+      if (g_active_epicycle_count > 1) {
+        g_active_epicycle_count--;
+        trail_clear(&g_tip_trail);
+      }
+      break;
+    case 'r':
+    case 'R':
+      scene_reset(g_active_shape_index);
+      break;
+    case 'a':
+    case 'A':
+      g_auto_add_enabled = !g_auto_add_enabled;
+      break;
+    case 'c':
+    case 'C':
+      g_show_orbit_circles = !g_show_orbit_circles;
+      break;
+    case 'g':
+    case 'G':
+      g_show_ghost_overlay = !g_show_ghost_overlay;
+      break;
+    case 't':
+      g_active_theme_index = (g_active_theme_index + 1) % N_THEMES;
+      apply_theme(g_active_theme_index);
+      break;
+    case 'T':
+      g_active_theme_index = (g_active_theme_index + N_THEMES - 1) % N_THEMES;
+      apply_theme(g_active_theme_index);
+      break;
+    default:
+      break;
+    }
+
+    /* ── tick ──────────────────────────────────────────────── */
+    long long now_ns = clock_ns();
+    long long dt = now_ns - last_ns;
+    last_ns = now_ns;
+    if (dt > 100000000LL)
+      dt = 100000000LL; /* pause-guard */
+    (void)dt;
+
+    scene_tick();
+
+    /* ── draw + present ────────────────────────────────────── */
+    erase();
+    scene_draw();
+    scene_draw_hud();
+    screen_present();
+
+    /* ── frame cap ─────────────────────────────────────────── */
+    clock_sleep_ns(RENDER_NS - (clock_ns() - now_ns));
+  }
+
+  return 0;
 }

@@ -711,63 +711,64 @@
  * ─────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 199309L
-#include <ncurses.h>
 #include <math.h>
+#include <ncurses.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <signal.h>
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 /* ── §1 config ──────────────────────────────────────────────────────── */
 
 /* §1.1 frame rate. */
-#define TARGET_FPS    60
-#define DT_CAP_NS     100000000LL          /* 0.1 s — spiral-of-death cap   */
+#define TARGET_FPS 60
+#define DT_CAP_NS 100000000LL /* 0.1 s — spiral-of-death cap   */
 
 /* §1.2 view geometry — terminal cell aspect (W/H) and full vertical FOV. */
-#define ASPECT        0.47f
-#define FOV_DEG       55.0f
+#define ASPECT 0.47f
+#define FOV_DEG 55.0f
 
 /* §1.3 cube (object space, axis-aligned, centred on origin). */
-#define CUBE_S        0.80f                /* half-extent: spans [-S, +S]   */
+#define CUBE_S 0.80f /* half-extent: spans [-S, +S]   */
 
 /* §1.4 wireframe mode. */
-#define WIRE_THRESH   0.055f               /* edge band as fraction of S    */
+#define WIRE_THRESH 0.055f /* edge band as fraction of S    */
 
 /* §1.5 rotation rates (rad/sec). */
-#define ROT_Y         0.52f                /* primary spin around Y         */
-#define ROT_X         0.35f                /* tilt around X                 */
+#define ROT_Y 0.52f /* primary spin around Y         */
+#define ROT_X 0.35f /* tilt around X                 */
 
 /* §1.6 camera distance (orbits along −Z; bigger = cube looks smaller). */
-#define CAM_DIST_DEF  3.2f
-#define CAM_DIST_MIN  1.5f
-#define CAM_DIST_MAX  7.0f
+#define CAM_DIST_DEF 3.2f
+#define CAM_DIST_MIN 1.5f
+#define CAM_DIST_MAX 7.0f
 #define CAM_DIST_STEP 0.25f
 
 /* §1.7 shading constants. */
-#define AMBIENT       0.20f
-#define SHININESS     75.0f                /* phong exponent — high = metal */
+#define AMBIENT 0.20f
+#define SHININESS 75.0f /* phong exponent — high = metal */
 
 /* §1.8 character ramp — Paul Bourke 92-char density ladder. */
 static const char k_ramp[] =
-    " `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
-#define RAMP_LEN  ((int)(sizeof k_ramp - 1))
+    " `.-':_,^=;><+!rc*/"
+    "z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
+#define RAMP_LEN ((int)(sizeof k_ramp - 1))
 
 /* §1.9 ncurses pair IDs (216 cube + reserved HUD/HINT). */
-#define PAIR_CUBE_BASE   1
-#define PAIR_HUD       217
-#define PAIR_HINT      218
+#define PAIR_CUBE_BASE 1
+#define PAIR_HUD 217
+#define PAIR_HINT 218
 
 /* §1.10 numerical epsilons. */
-#define T_EPS         1e-4f                /* reject t < this (self-hit)    */
-#define PARALLEL_EPS  1e-9f                /* |ray_dir_i| below this = parallel */
+#define T_EPS 1e-4f        /* reject t < this (self-hit)    */
+#define PARALLEL_EPS 1e-9f /* |ray_dir_i| below this = parallel */
 
 /* §1.11 dummy "infinity" used as initial t_enter / t_exit. */
-#define BIG_T         1e30f
+#define BIG_T 1e30f
 
 /* ── §2 clock ───────────────────────────────────────────────────────── */
 
@@ -778,11 +779,10 @@ static const char k_ramp[] =
  * dt), not wall date. CLOCK_MONOTONIC never goes backward across NTP
  * adjustments, DST shifts, or system clock changes.
  */
-static long long clock_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
 /*
@@ -792,14 +792,12 @@ static long long clock_ns(void)
  * CPU at 100%; we subtract (clock_ns() - frame_start) from the target
  * frame time and sleep the remainder.
  */
-static void clock_sleep_ns(long long nanoseconds)
-{
-    if (nanoseconds <= 0) return;
-    struct timespec request = {
-        nanoseconds / 1000000000LL,
-        nanoseconds % 1000000000LL
-    };
-    nanosleep(&request, NULL);
+static void clock_sleep_ns(long long nanoseconds) {
+  if (nanoseconds <= 0)
+    return;
+  struct timespec request = {nanoseconds / 1000000000LL,
+                             nanoseconds % 1000000000LL};
+  nanosleep(&request, NULL);
 }
 
 /* ── §3 math (V3 + Mat3) ────────────────────────────────────────────── *
@@ -812,18 +810,27 @@ static void clock_sleep_ns(long long nanoseconds)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-typedef struct { float x, y, z; } V3;
+typedef struct {
+  float x, y, z;
+} V3;
 
-static inline V3    v3add   (V3 a, V3 b)    { return (V3){a.x+b.x, a.y+b.y, a.z+b.z}; }
-static inline V3    v3sub   (V3 a, V3 b)    { return (V3){a.x-b.x, a.y-b.y, a.z-b.z}; }
-static inline V3    v3scale (float s, V3 a) { return (V3){s*a.x, s*a.y, s*a.z};       }
-static inline float v3dot   (V3 a, V3 b)    { return a.x*b.x + a.y*b.y + a.z*b.z;     }
-static inline float v3len   (V3 a)          { return sqrtf(v3dot(a, a));              }
+static inline V3 v3add(V3 a, V3 b) {
+  return (V3){a.x + b.x, a.y + b.y, a.z + b.z};
+}
+static inline V3 v3sub(V3 a, V3 b) {
+  return (V3){a.x - b.x, a.y - b.y, a.z - b.z};
+}
+static inline V3 v3scale(float s, V3 a) {
+  return (V3){s * a.x, s * a.y, s * a.z};
+}
+static inline float v3dot(V3 a, V3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3len(V3 a) { return sqrtf(v3dot(a, a)); }
 
-static inline V3 v3norm(V3 a)
-{
-    float length = v3len(a);
-    return (length > 1e-9f) ? v3scale(1.f/length, a) : (V3){0.f, 1.f, 0.f};
+static inline V3 v3norm(V3 a) {
+  float length = v3len(a);
+  return (length > 1e-9f) ? v3scale(1.f / length, a) : (V3){0.f, 1.f, 0.f};
 }
 
 /*
@@ -836,21 +843,25 @@ static inline V3 v3norm(V3 a)
  * so the function's "outgoing" semantics match: light-as-outgoing
  * reflects to viewing-as-outgoing.
  */
-static inline V3 v3reflect(V3 v, V3 n)
-{
-    return v3sub(v, v3scale(2.f * v3dot(v, n), n));
+static inline V3 v3reflect(V3 v, V3 n) {
+  return v3sub(v, v3scale(2.f * v3dot(v, n), n));
 }
 
-static inline V3 v3clamp01(V3 v)
-{
-    return (V3){
-        v.x < 0.f ? 0.f : v.x > 1.f ? 1.f : v.x,
-        v.y < 0.f ? 0.f : v.y > 1.f ? 1.f : v.y,
-        v.z < 0.f ? 0.f : v.z > 1.f ? 1.f : v.z
-    };
+static inline V3 v3clamp01(V3 v) {
+  return (V3){v.x < 0.f   ? 0.f
+              : v.x > 1.f ? 1.f
+                          : v.x,
+              v.y < 0.f   ? 0.f
+              : v.y > 1.f ? 1.f
+                          : v.y,
+              v.z < 0.f   ? 0.f
+              : v.z > 1.f ? 1.f
+                          : v.z};
 }
 
-typedef struct { V3 row[3]; } Mat3;
+typedef struct {
+  V3 row[3];
+} Mat3;
 
 /*
  * mat3_rotation — composed rotation Rx(angle_x) · Ry(angle_y).
@@ -867,15 +878,14 @@ typedef struct { V3 row[3]; } Mat3;
  * INVERSE of this matrix. Since rotations are orthogonal, the inverse
  * is the transpose — see mat3_mulT below.
  */
-static Mat3 mat3_rotation(float angle_x, float angle_y)
-{
-    float cos_x = cosf(angle_x), sin_x = sinf(angle_x);
-    float cos_y = cosf(angle_y), sin_y = sinf(angle_y);
-    Mat3 m;
-    m.row[0] = (V3){  cos_y,            0.f,    sin_y          };
-    m.row[1] = (V3){  sin_x * sin_y,    cos_x, -sin_x * cos_y  };
-    m.row[2] = (V3){ -cos_x * sin_y,    sin_x,  cos_x * cos_y  };
-    return m;
+static Mat3 mat3_rotation(float angle_x, float angle_y) {
+  float cos_x = cosf(angle_x), sin_x = sinf(angle_x);
+  float cos_y = cosf(angle_y), sin_y = sinf(angle_y);
+  Mat3 m;
+  m.row[0] = (V3){cos_y, 0.f, sin_y};
+  m.row[1] = (V3){sin_x * sin_y, cos_x, -sin_x * cos_y};
+  m.row[2] = (V3){-cos_x * sin_y, sin_x, cos_x * cos_y};
+  return m;
 }
 
 /*
@@ -885,13 +895,8 @@ static Mat3 mat3_rotation(float angle_x, float angle_y)
  * Used in §8 to bring the OBJECT-space surface normal back to WORLD
  * space for shading.
  */
-static V3 mat3_mul(Mat3 m, V3 v)
-{
-    return (V3){
-        v3dot(m.row[0], v),
-        v3dot(m.row[1], v),
-        v3dot(m.row[2], v)
-    };
+static V3 mat3_mul(Mat3 m, V3 v) {
+  return (V3){v3dot(m.row[0], v), v3dot(m.row[1], v), v3dot(m.row[2], v)};
 }
 
 /*
@@ -904,13 +909,10 @@ static V3 mat3_mul(Mat3 m, V3 v)
  * Used in §8 to push the WORLD-space ray into OBJECT space where
  * the cube is axis-aligned.
  */
-static V3 mat3_mulT(Mat3 m, V3 v)
-{
-    return (V3){
-        m.row[0].x * v.x + m.row[1].x * v.y + m.row[2].x * v.z,
-        m.row[0].y * v.x + m.row[1].y * v.y + m.row[2].y * v.z,
-        m.row[0].z * v.x + m.row[1].z * v.y + m.row[2].z * v.z
-    };
+static V3 mat3_mulT(Mat3 m, V3 v) {
+  return (V3){m.row[0].x * v.x + m.row[1].x * v.y + m.row[2].x * v.z,
+              m.row[0].y * v.x + m.row[1].y * v.y + m.row[2].y * v.z,
+              m.row[0].z * v.x + m.row[1].z * v.y + m.row[2].z * v.z};
 }
 
 /* ── §4 colour & themes ─────────────────────────────────────────────── *
@@ -963,11 +965,11 @@ static V3 mat3_mulT(Mat3 m, V3 v)
  * for terminal-renderer contrast.
  * ─────────────────────────────────────────────────────────────────── */
 typedef struct {
-    V3          albedo;         /* body diffuse colour                      */
-    V3          specular;       /* F0 — metal: matches albedo; die: white   */
-    V3          emissive;       /* self-glow (added after lighting)         */
-    float       diffuse_weight; /* 0.10..0.90 — metal/dielectric scale      */
-    const char *name;
+  V3 albedo;            /* body diffuse colour                      */
+  V3 specular;          /* F0 — metal: matches albedo; die: white   */
+  V3 emissive;          /* self-glow (added after lighting)         */
+  float diffuse_weight; /* 0.10..0.90 — metal/dielectric scale      */
+  const char *name;
 } Theme;
 
 static const Theme g_themes[] = {
@@ -977,53 +979,129 @@ static const Theme g_themes[] = {
      * giving each metal its signature colour. */
 
     /* gold     — warm yellow precious metal                            */
-    {{1.00f,0.77f,0.34f}, {1.00f,0.77f,0.34f}, {0.f,0.f,0.f}, 0.15f, "gold"},
+    {{1.00f, 0.77f, 0.34f},
+     {1.00f, 0.77f, 0.34f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "gold"},
     /* silver   — bright cool precious metal, near-pure white           */
-    {{0.97f,0.96f,0.92f}, {0.97f,0.96f,0.92f}, {0.f,0.f,0.f}, 0.15f, "silver"},
+    {{0.97f, 0.96f, 0.92f},
+     {0.97f, 0.96f, 0.92f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "silver"},
     /* copper   — warm orange-red metal                                 */
-    {{0.96f,0.64f,0.54f}, {0.96f,0.64f,0.54f}, {0.f,0.f,0.f}, 0.15f, "copper"},
+    {{0.96f, 0.64f, 0.54f},
+     {0.96f, 0.64f, 0.54f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "copper"},
     /* bronze   — warm brown alloy (Cu+Sn)                              */
-    {{0.78f,0.55f,0.30f}, {0.78f,0.55f,0.30f}, {0.f,0.f,0.f}, 0.15f, "bronze"},
+    {{0.78f, 0.55f, 0.30f},
+     {0.78f, 0.55f, 0.30f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "bronze"},
     /* brass    — yellow-green alloy (Cu+Zn)                            */
-    {{0.85f,0.70f,0.25f}, {0.85f,0.70f,0.25f}, {0.f,0.f,0.f}, 0.15f, "brass"},
+    {{0.85f, 0.70f, 0.25f},
+     {0.85f, 0.70f, 0.25f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "brass"},
     /* platinum — cool greyish-white precious metal                     */
-    {{0.83f,0.81f,0.78f}, {0.83f,0.81f,0.78f}, {0.f,0.f,0.f}, 0.15f, "platinum"},
+    {{0.83f, 0.81f, 0.78f},
+     {0.83f, 0.81f, 0.78f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "platinum"},
     /* titanium — dark silvery metal                                    */
-    {{0.62f,0.60f,0.55f}, {0.62f,0.60f,0.55f}, {0.f,0.f,0.f}, 0.15f, "titanium"},
+    {{0.62f, 0.60f, 0.55f},
+     {0.62f, 0.60f, 0.55f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "titanium"},
     /* iron     — neutral grey base metal                               */
-    {{0.56f,0.57f,0.58f}, {0.56f,0.57f,0.58f}, {0.f,0.f,0.f}, 0.15f, "iron"},
+    {{0.56f, 0.57f, 0.58f},
+     {0.56f, 0.57f, 0.58f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "iron"},
     /* steel    — cool blue-grey alloy                                  */
-    {{0.65f,0.70f,0.78f}, {0.65f,0.70f,0.78f}, {0.f,0.f,0.f}, 0.15f, "steel"},
+    {{0.65f, 0.70f, 0.78f},
+     {0.65f, 0.70f, 0.78f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "steel"},
     /* chrome   — mirror-bright cool metal                              */
-    {{0.92f,0.94f,0.96f}, {0.92f,0.94f,0.96f}, {0.f,0.f,0.f}, 0.15f, "chrome"},
+    {{0.92f, 0.94f, 0.96f},
+     {0.92f, 0.94f, 0.96f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "chrome"},
     /* mercury  — liquid silver                                         */
-    {{0.85f,0.85f,0.88f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.15f, "mercury"},
+    {{0.85f, 0.85f, 0.88f},
+     {1.00f, 1.00f, 1.00f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "mercury"},
     /* aluminum — pale neutral metal                                    */
-    {{0.91f,0.92f,0.92f}, {0.91f,0.92f,0.92f}, {0.f,0.f,0.f}, 0.15f, "aluminum"},
+    {{0.91f, 0.92f, 0.92f},
+     {0.91f, 0.92f, 0.92f},
+     {0.f, 0.f, 0.f},
+     0.15f,
+     "aluminum"},
 
     /* === GEMS (4) — saturated body + WHITE spec, mid diffuse_weight =
      * Gems are dielectrics; their Fresnel reflectance is achromatic.
      * Body colour comes from absorption inside the crystal. */
 
     /* ruby     — red corundum (Cr-doped)                               */
-    {{0.85f,0.10f,0.18f}, {1.00f,0.95f,0.95f}, {0.f,0.f,0.f}, 0.70f, "ruby"},
+    {{0.85f, 0.10f, 0.18f},
+     {1.00f, 0.95f, 0.95f},
+     {0.f, 0.f, 0.f},
+     0.70f,
+     "ruby"},
     /* emerald  — green beryl (Cr-doped)                                */
-    {{0.10f,0.70f,0.30f}, {0.95f,1.00f,0.95f}, {0.f,0.f,0.f}, 0.70f, "emerald"},
+    {{0.10f, 0.70f, 0.30f},
+     {0.95f, 1.00f, 0.95f},
+     {0.f, 0.f, 0.f},
+     0.70f,
+     "emerald"},
     /* sapphire — blue corundum (Fe/Ti-doped)                           */
-    {{0.10f,0.30f,0.88f}, {0.95f,0.95f,1.00f}, {0.f,0.f,0.f}, 0.70f, "sapphire"},
+    {{0.10f, 0.30f, 0.88f},
+     {0.95f, 0.95f, 1.00f},
+     {0.f, 0.f, 0.f},
+     0.70f,
+     "sapphire"},
     /* amethyst — purple quartz                                         */
-    {{0.55f,0.30f,0.85f}, {1.00f,0.95f,1.00f}, {0.f,0.f,0.f}, 0.70f, "amethyst"},
+    {{0.55f, 0.30f, 0.85f},
+     {1.00f, 0.95f, 1.00f},
+     {0.f, 0.f, 0.f},
+     0.70f,
+     "amethyst"},
 
     /* === DIELECTRICS (3) — body colour + WHITE spec ===================
      * Plastics, ceramics, and glass. F0 is achromatic (~4%); body
      * colour comes from sub-surface absorption. */
 
     /* plastic  — saturated blue plastic, full body colour              */
-    {{0.20f,0.40f,0.92f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.85f, "plastic"},
+    {{0.20f, 0.40f, 0.92f},
+     {1.00f, 1.00f, 1.00f},
+     {0.f, 0.f, 0.f},
+     0.85f,
+     "plastic"},
     /* glass    — dark base + bright spec fakes transparency            */
-    {{0.10f,0.12f,0.16f}, {1.00f,1.00f,1.00f}, {0.f,0.f,0.f}, 0.10f, "glass"},
+    {{0.10f, 0.12f, 0.16f},
+     {1.00f, 1.00f, 1.00f},
+     {0.f, 0.f, 0.f},
+     0.10f,
+     "glass"},
     /* ceramic  — soft warm-cream porcelain                             */
-    {{0.92f,0.90f,0.85f}, {1.00f,0.98f,0.95f}, {0.f,0.f,0.f}, 0.85f, "ceramic"},
+    {{0.92f, 0.90f, 0.85f},
+     {1.00f, 0.98f, 0.95f},
+     {0.f, 0.f, 0.f},
+     0.85f,
+     "ceramic"},
 
     /* === EMISSIVE (1) — neon glow ====================================
      * Neon plasma is a self-emissive material. The albedo is the dim
@@ -1031,11 +1109,15 @@ static const Theme g_themes[] = {
      * shadow because emissive is added AFTER lighting. */
 
     /* neon     — hot pink/magenta self-glow                            */
-    {{0.05f,0.02f,0.10f}, {0.80f,0.80f,1.00f}, {1.00f,0.20f,0.85f}, 0.20f, "neon"},
+    {{0.05f, 0.02f, 0.10f},
+     {0.80f, 0.80f, 1.00f},
+     {1.00f, 0.20f, 0.85f},
+     0.20f,
+     "neon"},
 };
 #define THEME_N ((int)(sizeof g_themes / sizeof g_themes[0]))
 
-static int g_have_256;     /* 1 if 256-colour cube is available, 0 = mono */
+static int g_have_256; /* 1 if 256-colour cube is available, 0 = mono */
 
 /*
  * color_init — bind ncurses colour pairs.
@@ -1045,17 +1127,16 @@ static int g_have_256;     /* 1 if 256-colour cube is available, 0 = mono */
  *   217       PAIR_HUD  — bright yellow on default bg.
  *   218       PAIR_HINT — bright cyan on default bg.
  */
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    g_have_256 = (COLORS >= 256);
-    if (g_have_256) {
-        for (int i = 0; i < 216; i++)
-            init_pair(PAIR_CUBE_BASE + i, 16 + i, -1);
-    }
-    init_pair(PAIR_HUD,  226, -1);
-    init_pair(PAIR_HINT,  51, -1);
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  g_have_256 = (COLORS >= 256);
+  if (g_have_256) {
+    for (int i = 0; i < 216; i++)
+      init_pair(PAIR_CUBE_BASE + i, 16 + i, -1);
+  }
+  init_pair(PAIR_HUD, 226, -1);
+  init_pair(PAIR_HINT, 51, -1);
 }
 
 /*
@@ -1065,23 +1146,30 @@ static void color_init(void)
  *          colour         0..1 RGB triplet
  *          luminance      0..1 brightness picking the ramp character
  */
-static void draw_color(int row, int col, V3 colour, float luminance)
-{
-    if (luminance < 0.f) luminance = 0.f;
-    if (luminance > 1.f) luminance = 1.f;
-    char ch = k_ramp[(int)(luminance * (RAMP_LEN - 1))];
+static void draw_color(int row, int col, V3 colour, float luminance) {
+  if (luminance < 0.f)
+    luminance = 0.f;
+  if (luminance > 1.f)
+    luminance = 1.f;
+  char ch = k_ramp[(int)(luminance * (RAMP_LEN - 1))];
 
-    if (g_have_256) {
-        int red_5   = (int)(colour.x * 5.f + 0.5f); if (red_5   > 5) red_5   = 5;
-        int green_5 = (int)(colour.y * 5.f + 0.5f); if (green_5 > 5) green_5 = 5;
-        int blue_5  = (int)(colour.z * 5.f + 0.5f); if (blue_5  > 5) blue_5  = 5;
-        int pair_idx = PAIR_CUBE_BASE + red_5 * 36 + green_5 * 6 + blue_5;
-        attron(COLOR_PAIR(pair_idx));
-        mvaddch(row, col, (chtype)(unsigned char)ch);
-        attroff(COLOR_PAIR(pair_idx));
-    } else {
-        mvaddch(row, col, (chtype)(unsigned char)ch);
-    }
+  if (g_have_256) {
+    int red_5 = (int)(colour.x * 5.f + 0.5f);
+    if (red_5 > 5)
+      red_5 = 5;
+    int green_5 = (int)(colour.y * 5.f + 0.5f);
+    if (green_5 > 5)
+      green_5 = 5;
+    int blue_5 = (int)(colour.z * 5.f + 0.5f);
+    if (blue_5 > 5)
+      blue_5 = 5;
+    int pair_idx = PAIR_CUBE_BASE + red_5 * 36 + green_5 * 6 + blue_5;
+    attron(COLOR_PAIR(pair_idx));
+    mvaddch(row, col, (chtype)(unsigned char)ch);
+    attroff(COLOR_PAIR(pair_idx));
+  } else {
+    mvaddch(row, col, (chtype)(unsigned char)ch);
+  }
 }
 
 /* ── §5 ray-AABB intersection (THE CORE) ────────────────────────────── *
@@ -1105,13 +1193,13 @@ static void draw_color(int row, int col, V3 colour, float luminance)
  * ─────────────────────────────────────────────────────────────────── */
 
 typedef struct {
-    int   hit;            /* 0 or 1                                        */
-    int   axis_at_enter;  /* {0,1,2} — which axis tightened t_enter        */
-    float t_hit;          /* either t_enter (entry) or t_exit (inside)     */
-    float t_enter;        /* exposed for the INTERVAL debug overlay        */
-    float t_exit;         /* exposed for the INTERVAL debug overlay        */
-    V3    normal_obj;     /* one of ±X, ±Y, ±Z in OBJECT space             */
-    int   inside;         /* 1 if camera origin was inside the box         */
+  int hit;           /* 0 or 1                                        */
+  int axis_at_enter; /* {0,1,2} — which axis tightened t_enter        */
+  float t_hit;       /* either t_enter (entry) or t_exit (inside)     */
+  float t_enter;     /* exposed for the INTERVAL debug overlay        */
+  float t_exit;      /* exposed for the INTERVAL debug overlay        */
+  V3 normal_obj;     /* one of ±X, ±Y, ±Z in OBJECT space             */
+  int inside;        /* 1 if camera origin was inside the box         */
 } BoxHit;
 
 /*
@@ -1154,25 +1242,29 @@ typedef struct {
  */
 static int slab_test(float ray_origin_i, float ray_dir_i, float half_extent,
                      float *out_t_enter, float *out_t_exit,
-                     float *out_enter_sign)
-{
-    if (fabsf(ray_dir_i) < PARALLEL_EPS) {
-        /* Parallel to the two walls of this slab. */
-        if (ray_origin_i < -half_extent || ray_origin_i > half_extent)
-            return 0;                            /* outside → permanent miss */
-        *out_t_enter   = -BIG_T;                 /* slab imposes no bound    */
-        *out_t_exit    =  BIG_T;
-        *out_enter_sign = 0.f;                   /* no entry face contribution */
-        return 1;
-    }
-    float inv_dir = 1.f / ray_dir_i;
-    float t0 = (-half_extent - ray_origin_i) * inv_dir;
-    float t1 = ( half_extent - ray_origin_i) * inv_dir;
-    if (t0 < t1) { *out_t_enter = t0; *out_t_exit = t1; }
-    else         { *out_t_enter = t1; *out_t_exit = t0; }
-    /* Entry-face outward normal: opposite sign to ray direction. */
-    *out_enter_sign = (ray_dir_i > 0.f) ? -1.f : 1.f;
+                     float *out_enter_sign) {
+  if (fabsf(ray_dir_i) < PARALLEL_EPS) {
+    /* Parallel to the two walls of this slab. */
+    if (ray_origin_i < -half_extent || ray_origin_i > half_extent)
+      return 0;            /* outside → permanent miss */
+    *out_t_enter = -BIG_T; /* slab imposes no bound    */
+    *out_t_exit = BIG_T;
+    *out_enter_sign = 0.f; /* no entry face contribution */
     return 1;
+  }
+  float inv_dir = 1.f / ray_dir_i;
+  float t0 = (-half_extent - ray_origin_i) * inv_dir;
+  float t1 = (half_extent - ray_origin_i) * inv_dir;
+  if (t0 < t1) {
+    *out_t_enter = t0;
+    *out_t_exit = t1;
+  } else {
+    *out_t_enter = t1;
+    *out_t_exit = t0;
+  }
+  /* Entry-face outward normal: opposite sign to ray direction. */
+  *out_enter_sign = (ray_dir_i > 0.f) ? -1.f : 1.f;
+  return 1;
 }
 
 /*
@@ -1212,83 +1304,89 @@ static int slab_test(float ray_origin_i, float ray_dir_i, float half_extent,
  * shrinks (min-of-slabs). The moment they cross, no t can satisfy
  * all three slabs and we early-exit.
  */
-static BoxHit ray_aabb(V3 ray_origin, V3 ray_dir, float half_extent)
-{
-    /* Pack components into arrays for a clean axis loop. */
-    float ray_origin_arr[3] = { ray_origin.x, ray_origin.y, ray_origin.z };
-    float ray_dir_arr   [3] = { ray_dir.x,    ray_dir.y,    ray_dir.z    };
+static BoxHit ray_aabb(V3 ray_origin, V3 ray_dir, float half_extent) {
+  /* Pack components into arrays for a clean axis loop. */
+  float ray_origin_arr[3] = {ray_origin.x, ray_origin.y, ray_origin.z};
+  float ray_dir_arr[3] = {ray_dir.x, ray_dir.y, ray_dir.z};
 
-    BoxHit out = { .hit = 0 };
+  BoxHit out = {.hit = 0};
 
-    float t_enter = -BIG_T, t_exit = BIG_T;
-    int   axis_at_enter = -1;
-    float enter_sign    = 0.f;
+  float t_enter = -BIG_T, t_exit = BIG_T;
+  int axis_at_enter = -1;
+  float enter_sign = 0.f;
 
+  for (int axis = 0; axis < 3; axis++) {
+    float t_enter_slab, t_exit_slab, slab_enter_sign;
+    if (!slab_test(ray_origin_arr[axis], ray_dir_arr[axis], half_extent,
+                   &t_enter_slab, &t_exit_slab, &slab_enter_sign))
+      return out; /* parallel & outside → MISS */
+
+    /* Tighten entry: take the LATEST start. */
+    if (t_enter_slab > t_enter) {
+      t_enter = t_enter_slab;
+      axis_at_enter = axis;
+      enter_sign = slab_enter_sign;
+    }
+    /* Tighten exit: take the EARLIEST end. */
+    if (t_exit_slab < t_exit)
+      t_exit = t_exit_slab;
+
+    /* Empty intersection? No t can satisfy all three slabs. */
+    if (t_enter > t_exit)
+      return out;
+  }
+
+  if (t_exit < T_EPS)
+    return out; /* whole interval behind us */
+
+  out.t_enter = t_enter;
+  out.t_exit = t_exit;
+
+  /* Two cases:
+   *   t_enter > T_EPS  → ordinary entry hit, t_hit = t_enter.
+   *   t_enter ≤ T_EPS  → ray ORIGIN is INSIDE the box → return the
+   *                       EXIT (t_hit = t_exit) and the exit-face
+   *                       normal. We rebuild that normal from
+   *                       sign(ray_dir) on the axis whose t_exit
+   *                       matched the global t_exit. */
+  float t_hit;
+  if (t_enter > T_EPS) {
+    t_hit = t_enter;
+    out.inside = 0;
+  } else {
+    t_hit = t_exit;
+    out.inside = 1;
+    /* Find which axis owns t_exit, and use sign(ray_dir) — the ray
+     * is LEAVING through that wall, so the normal points the same
+     * way as ray_dir on that axis. */
     for (int axis = 0; axis < 3; axis++) {
-        float t_enter_slab, t_exit_slab, slab_enter_sign;
-        if (!slab_test(ray_origin_arr[axis], ray_dir_arr[axis], half_extent,
-                       &t_enter_slab, &t_exit_slab, &slab_enter_sign))
-            return out;                          /* parallel & outside → MISS */
-
-        /* Tighten entry: take the LATEST start. */
-        if (t_enter_slab > t_enter) {
-            t_enter       = t_enter_slab;
-            axis_at_enter = axis;
-            enter_sign    = slab_enter_sign;
-        }
-        /* Tighten exit: take the EARLIEST end. */
-        if (t_exit_slab < t_exit) t_exit = t_exit_slab;
-
-        /* Empty intersection? No t can satisfy all three slabs. */
-        if (t_enter > t_exit) return out;
+      float t_enter_slab, t_exit_slab, slab_enter_sign;
+      if (!slab_test(ray_origin_arr[axis], ray_dir_arr[axis], half_extent,
+                     &t_enter_slab, &t_exit_slab, &slab_enter_sign))
+        return out;
+      if (fabsf(t_exit_slab - t_exit) < 1e-6f) {
+        axis_at_enter = axis;
+        enter_sign = (ray_dir_arr[axis] > 0.f) ? +1.f : -1.f;
+        break;
+      }
     }
+    if (axis_at_enter < 0)
+      return out;
+  }
 
-    if (t_exit < T_EPS) return out;              /* whole interval behind us */
+  /* Face normal: the axis basis vector with the recorded sign. */
+  out.normal_obj = (V3){0.f, 0.f, 0.f};
+  if (axis_at_enter == 0)
+    out.normal_obj.x = enter_sign;
+  else if (axis_at_enter == 1)
+    out.normal_obj.y = enter_sign;
+  else
+    out.normal_obj.z = enter_sign;
 
-    out.t_enter = t_enter;
-    out.t_exit  = t_exit;
-
-    /* Two cases:
-     *   t_enter > T_EPS  → ordinary entry hit, t_hit = t_enter.
-     *   t_enter ≤ T_EPS  → ray ORIGIN is INSIDE the box → return the
-     *                       EXIT (t_hit = t_exit) and the exit-face
-     *                       normal. We rebuild that normal from
-     *                       sign(ray_dir) on the axis whose t_exit
-     *                       matched the global t_exit. */
-    float t_hit;
-    if (t_enter > T_EPS) {
-        t_hit       = t_enter;
-        out.inside  = 0;
-    } else {
-        t_hit       = t_exit;
-        out.inside  = 1;
-        /* Find which axis owns t_exit, and use sign(ray_dir) — the ray
-         * is LEAVING through that wall, so the normal points the same
-         * way as ray_dir on that axis. */
-        for (int axis = 0; axis < 3; axis++) {
-            float t_enter_slab, t_exit_slab, slab_enter_sign;
-            if (!slab_test(ray_origin_arr[axis], ray_dir_arr[axis], half_extent,
-                           &t_enter_slab, &t_exit_slab, &slab_enter_sign))
-                return out;
-            if (fabsf(t_exit_slab - t_exit) < 1e-6f) {
-                axis_at_enter = axis;
-                enter_sign    = (ray_dir_arr[axis] > 0.f) ? +1.f : -1.f;
-                break;
-            }
-        }
-        if (axis_at_enter < 0) return out;
-    }
-
-    /* Face normal: the axis basis vector with the recorded sign. */
-    out.normal_obj = (V3){0.f, 0.f, 0.f};
-    if      (axis_at_enter == 0) out.normal_obj.x = enter_sign;
-    else if (axis_at_enter == 1) out.normal_obj.y = enter_sign;
-    else                         out.normal_obj.z = enter_sign;
-
-    out.t_hit         = t_hit;
-    out.axis_at_enter = axis_at_enter;
-    out.hit           = 1;
-    return out;
+  out.t_hit = t_hit;
+  out.axis_at_enter = axis_at_enter;
+  out.hit = 1;
+  return out;
 }
 
 /*
@@ -1316,16 +1414,22 @@ static BoxHit ray_aabb(V3 ray_origin, V3 ray_dir, float half_extent)
  * Returned value is 0 exactly on an edge of the face and 1 at the
  * face centre. Wireframe mode draws cells with value < WIRE_THRESH.
  */
-static float face_edge_dist(V3 point_obj, V3 normal_obj, float half_extent)
-{
-    float u, v;
-    if      (fabsf(normal_obj.x) > 0.5f) { u = point_obj.y; v = point_obj.z; }
-    else if (fabsf(normal_obj.y) > 0.5f) { u = point_obj.x; v = point_obj.z; }
-    else                                 { u = point_obj.x; v = point_obj.y; }
+static float face_edge_dist(V3 point_obj, V3 normal_obj, float half_extent) {
+  float u, v;
+  if (fabsf(normal_obj.x) > 0.5f) {
+    u = point_obj.y;
+    v = point_obj.z;
+  } else if (fabsf(normal_obj.y) > 0.5f) {
+    u = point_obj.x;
+    v = point_obj.z;
+  } else {
+    u = point_obj.x;
+    v = point_obj.y;
+  }
 
-    float du = half_extent - fabsf(u);
-    float dv = half_extent - fabsf(v);
-    return fminf(du, dv) / half_extent;
+  float du = half_extent - fabsf(u);
+  float dv = half_extent - fabsf(v);
+  return fminf(du, dv) / half_extent;
 }
 
 /*
@@ -1336,14 +1440,20 @@ static float face_edge_dist(V3 point_obj, V3 normal_obj, float half_extent)
  * and a corner reports (±1, ±1).
  */
 static void face_uv(V3 point_obj, V3 normal_obj, float half_extent,
-                    float *out_u, float *out_v)
-{
-    float u, v;
-    if      (fabsf(normal_obj.x) > 0.5f) { u = point_obj.y; v = point_obj.z; }
-    else if (fabsf(normal_obj.y) > 0.5f) { u = point_obj.x; v = point_obj.z; }
-    else                                 { u = point_obj.x; v = point_obj.y; }
-    *out_u = u / half_extent;
-    *out_v = v / half_extent;
+                    float *out_u, float *out_v) {
+  float u, v;
+  if (fabsf(normal_obj.x) > 0.5f) {
+    u = point_obj.y;
+    v = point_obj.z;
+  } else if (fabsf(normal_obj.y) > 0.5f) {
+    u = point_obj.x;
+    v = point_obj.z;
+  } else {
+    u = point_obj.x;
+    v = point_obj.y;
+  }
+  *out_u = u / half_extent;
+  *out_v = v / half_extent;
 }
 
 /* ── §6 shading ─────────────────────────────────────────────────────── *
@@ -1354,15 +1464,14 @@ static void face_uv(V3 point_obj, V3 normal_obj, float half_extent,
  * ─────────────────────────────────────────────────────────────────── */
 
 typedef enum {
-    MODE_PHONG = 0,
-    MODE_NORMAL,
-    MODE_WIRE,
-    MODE_DEPTH,
-    MODE_N
+  MODE_PHONG = 0,
+  MODE_NORMAL,
+  MODE_WIRE,
+  MODE_DEPTH,
+  MODE_N
 } ShadeMode;
-static const char *const k_mode_names[] = {
-    "phong", "normals", "wireframe", "depth"
-};
+static const char *const k_mode_names[] = {"phong", "normals", "wireframe",
+                                           "depth"};
 
 /* Three fixed world-space lights — POSITIONS, not directions.
  * Cinematic three-point setup:
@@ -1370,9 +1479,9 @@ static const char *const k_mode_names[] = {
  *   FILL = cool low-front-left    (lifts the shadow side)
  *   RIM  = bright back-low        (separates silhouette from bg)
  */
-static const V3 LIGHT_KEY  = { 3.0f,  4.0f, -2.0f };
-static const V3 LIGHT_FILL = {-4.0f,  1.0f, -1.0f };
-static const V3 LIGHT_RIM  = { 0.5f, -1.0f,  5.0f };
+static const V3 LIGHT_KEY = {3.0f, 4.0f, -2.0f};
+static const V3 LIGHT_FILL = {-4.0f, 1.0f, -1.0f};
+static const V3 LIGHT_RIM = {0.5f, -1.0f, 5.0f};
 
 /*
  * shade_phong — three-point Phong with PURE WHITE lights.
@@ -1410,53 +1519,45 @@ static const V3 LIGHT_RIM  = { 0.5f, -1.0f,  5.0f };
  * of the same face. The visual result is six flat-shaded quads.
  */
 static V3 shade_phong(V3 point_world, V3 normal_world, V3 view_dir,
-                      const Theme *th)
-{
-    /* Ambient: dim version of body albedo. */
-    V3 colour = v3scale(AMBIENT, th->albedo);
+                      const Theme *th) {
+  /* Ambient: dim version of body albedo. */
+  V3 colour = v3scale(AMBIENT, th->albedo);
 
-    /* §6.1 KEY light — primary diffuse + sharp specular (white). */
-    {
-        V3    light_dir   = v3norm(v3sub(LIGHT_KEY, point_world));
-        float diffuse     = fmaxf(0.f, v3dot(normal_world, light_dir));
-        V3    reflect_dir = v3reflect(v3scale(-1.f, light_dir), normal_world);
-        float specular    = powf(fmaxf(0.f, v3dot(reflect_dir, view_dir)),
-                                 SHININESS);
-        /* Diffuse: white light × albedo × diffuse_weight. */
-        colour = v3add(colour,
-                       v3scale(diffuse * th->diffuse_weight * 1.00f,
-                               th->albedo));
-        /* Specular: white light × spec colour. METAL: tinted spec
-         * tints the highlight (gold). DIELECTRIC: white spec → white peak. */
-        colour = v3add(colour,
-                       v3scale(specular * 1.30f, th->specular));
-    }
-    /* §6.2 FILL light — soft diffuse, no specular. Lifts shadow side. */
-    {
-        V3    light_dir = v3norm(v3sub(LIGHT_FILL, point_world));
-        float diffuse   = fmaxf(0.f, v3dot(normal_world, light_dir));
-        colour = v3add(colour,
-                       v3scale(diffuse * th->diffuse_weight * 0.55f,
-                               th->albedo));
-    }
-    /* §6.3 RIM light — wide specular kissing the back silhouette. */
-    {
-        V3    light_dir   = v3norm(v3sub(LIGHT_RIM, point_world));
-        float diffuse     = fmaxf(0.f, v3dot(normal_world, light_dir));
-        V3    reflect_dir = v3reflect(v3scale(-1.f, light_dir), normal_world);
-        float specular    = powf(fmaxf(0.f, v3dot(reflect_dir, view_dir)),
-                                 10.f);
-        colour = v3add(colour,
-                       v3scale(diffuse * th->diffuse_weight * 0.40f,
-                               th->albedo));
-        colour = v3add(colour,
-                       v3scale(specular * 1.20f, th->specular));
-    }
-    /* §6.4 Emissive — added BEFORE clamp, AFTER lighting. Lets neon
-     * glow regardless of light position. (0,0,0) for everything else. */
-    colour = v3add(colour, th->emissive);
+  /* §6.1 KEY light — primary diffuse + sharp specular (white). */
+  {
+    V3 light_dir = v3norm(v3sub(LIGHT_KEY, point_world));
+    float diffuse = fmaxf(0.f, v3dot(normal_world, light_dir));
+    V3 reflect_dir = v3reflect(v3scale(-1.f, light_dir), normal_world);
+    float specular = powf(fmaxf(0.f, v3dot(reflect_dir, view_dir)), SHININESS);
+    /* Diffuse: white light × albedo × diffuse_weight. */
+    colour = v3add(colour,
+                   v3scale(diffuse * th->diffuse_weight * 1.00f, th->albedo));
+    /* Specular: white light × spec colour. METAL: tinted spec
+     * tints the highlight (gold). DIELECTRIC: white spec → white peak. */
+    colour = v3add(colour, v3scale(specular * 1.30f, th->specular));
+  }
+  /* §6.2 FILL light — soft diffuse, no specular. Lifts shadow side. */
+  {
+    V3 light_dir = v3norm(v3sub(LIGHT_FILL, point_world));
+    float diffuse = fmaxf(0.f, v3dot(normal_world, light_dir));
+    colour = v3add(colour,
+                   v3scale(diffuse * th->diffuse_weight * 0.55f, th->albedo));
+  }
+  /* §6.3 RIM light — wide specular kissing the back silhouette. */
+  {
+    V3 light_dir = v3norm(v3sub(LIGHT_RIM, point_world));
+    float diffuse = fmaxf(0.f, v3dot(normal_world, light_dir));
+    V3 reflect_dir = v3reflect(v3scale(-1.f, light_dir), normal_world);
+    float specular = powf(fmaxf(0.f, v3dot(reflect_dir, view_dir)), 10.f);
+    colour = v3add(colour,
+                   v3scale(diffuse * th->diffuse_weight * 0.40f, th->albedo));
+    colour = v3add(colour, v3scale(specular * 1.20f, th->specular));
+  }
+  /* §6.4 Emissive — added BEFORE clamp, AFTER lighting. Lets neon
+   * glow regardless of light position. (0,0,0) for everything else. */
+  colour = v3add(colour, th->emissive);
 
-    return v3clamp01(colour);
+  return v3clamp01(colour);
 }
 
 /*
@@ -1471,13 +1572,9 @@ static V3 shade_phong(V3 point_world, V3 normal_world, V3 view_dir,
  *   +Z (0.5, 0.5, 1.0)   −Z (0.5, 0.5, 0.0)
  * Cleanest possible diagnostic for normal correctness.
  */
-static V3 shade_normal(V3 normal_world)
-{
-    return (V3){
-        normal_world.x * 0.5f + 0.5f,
-        normal_world.y * 0.5f + 0.5f,
-        normal_world.z * 0.5f + 0.5f
-    };
+static V3 shade_normal(V3 normal_world) {
+  return (V3){normal_world.x * 0.5f + 0.5f, normal_world.y * 0.5f + 0.5f,
+              normal_world.z * 0.5f + 0.5f};
 }
 
 /*
@@ -1488,13 +1585,12 @@ static V3 shade_normal(V3 normal_world)
  * and falls farther away. The face's normal-encoded colour serves as
  * the base hue so each edge inherits its face's colour.
  */
-static V3 shade_wire(V3 normal_world, float edge_dist)
-{
-    V3 colour = shade_normal(normal_world);
-    /* Saturation peaks at the edge centre (k=1) and fades to k=0 at
-     * the WIRE_THRESH boundary. */
-    float k = 1.f - edge_dist / WIRE_THRESH;
-    return v3clamp01(v3scale(0.6f + 0.4f * k, colour));
+static V3 shade_wire(V3 normal_world, float edge_dist) {
+  V3 colour = shade_normal(normal_world);
+  /* Saturation peaks at the edge centre (k=1) and fades to k=0 at
+   * the WIRE_THRESH boundary. */
+  float k = 1.f - edge_dist / WIRE_THRESH;
+  return v3clamp01(v3scale(0.6f + 0.4f * k, colour));
 }
 
 /*
@@ -1506,11 +1602,10 @@ static V3 shade_wire(V3 normal_world, float edge_dist)
  * Sanity check: in DEPTH mode, the brightest pixel sits at the
  * nearest point on the visible silhouette.
  */
-static V3 shade_depth(float t_hit, float distance_max, const Theme *th)
-{
-    float depth_norm = 1.f - fminf(t_hit / distance_max, 1.f);
-    depth_norm = depth_norm * depth_norm;
-    return v3clamp01(v3scale(depth_norm, th->albedo));
+static V3 shade_depth(float t_hit, float distance_max, const Theme *th) {
+  float depth_norm = 1.f - fminf(t_hit / distance_max, 1.f);
+  depth_norm = depth_norm * depth_norm;
+  return v3clamp01(v3scale(depth_norm, th->albedo));
 }
 
 /*
@@ -1520,9 +1615,8 @@ static V3 shade_depth(float t_hit, float distance_max, const Theme *th)
  *
  * Used to choose the ASCII ramp character for a coloured pixel.
  */
-static inline float rec601_luma(V3 c)
-{
-    return 0.299f * c.x + 0.587f * c.y + 0.114f * c.z;
+static inline float rec601_luma(V3 c) {
+  return 0.299f * c.x + 0.587f * c.y + 0.114f * c.z;
 }
 
 /* ── §7 debug overlays ──────────────────────────────────────────────── *
@@ -1539,28 +1633,25 @@ static inline float rec601_luma(V3 c)
  * ─────────────────────────────────────────────────────────────────── */
 
 typedef enum {
-    DEBUG_OFF = 0,
-    DEBUG_AXIS,                /* colour by axis_at_enter (R/G/B = X/Y/Z)    */
-    DEBUG_INTERVAL,             /* brightness from t_exit − t_enter           */
-    DEBUG_FACE_UV,              /* colour by in-face UV coordinates           */
-    DEBUG_N
+  DEBUG_OFF = 0,
+  DEBUG_AXIS,     /* colour by axis_at_enter (R/G/B = X/Y/Z)    */
+  DEBUG_INTERVAL, /* brightness from t_exit − t_enter           */
+  DEBUG_FACE_UV,  /* colour by in-face UV coordinates           */
+  DEBUG_N
 } DebugMode;
-static const char *const k_debug_names[] = {
-    "off", "axis", "interval", "face-uv"
-};
+static const char *const k_debug_names[] = {"off", "axis", "interval",
+                                            "face-uv"};
 
 /* Helper: simple two-stop colour gradient driven by t ∈ [0,1]. */
-static V3 gradient_cold_hot(float t)
-{
-    if (t < 0.f) t = 0.f;
-    if (t > 1.f) t = 1.f;
-    V3 cold = (V3){ 0.10f, 0.20f, 0.95f };
-    V3 hot  = (V3){ 1.00f, 0.85f, 0.20f };
-    return (V3){
-        cold.x + (hot.x - cold.x) * t,
-        cold.y + (hot.y - cold.y) * t,
-        cold.z + (hot.z - cold.z) * t
-    };
+static V3 gradient_cold_hot(float t) {
+  if (t < 0.f)
+    t = 0.f;
+  if (t > 1.f)
+    t = 1.f;
+  V3 cold = (V3){0.10f, 0.20f, 0.95f};
+  V3 hot = (V3){1.00f, 0.85f, 0.20f};
+  return (V3){cold.x + (hot.x - cold.x) * t, cold.y + (hot.y - cold.y) * t,
+              cold.z + (hot.z - cold.z) * t};
 }
 
 /*
@@ -1586,49 +1677,57 @@ static V3 gradient_cold_hot(float t)
  * Outputs are written to *out_colour and *out_luminance. The caller
  * passes them straight to draw_color().
  */
-static void apply_debug(DebugMode mode, const BoxHit *hit,
-                        V3 hit_point_obj, float half_extent,
-                        V3 *out_colour, float *out_luminance)
-{
-    switch (mode) {
-    case DEBUG_AXIS: {
-        V3 c = (V3){ 0.f, 0.f, 0.f };
-        switch (hit->axis_at_enter) {
-        case 0: c = (V3){ 0.95f, 0.20f, 0.20f }; break;   /* red    */
-        case 1: c = (V3){ 0.20f, 0.95f, 0.30f }; break;   /* green  */
-        case 2: c = (V3){ 0.30f, 0.40f, 1.00f }; break;   /* blue   */
-        default: break;
-        }
-        *out_colour    = c;
-        *out_luminance = 0.85f;
-        break;
-    }
-    case DEBUG_INTERVAL: {
-        /* Interval thickness in object-space units, normalised by
-         * the cube's diagonal (≈ 2·sqrt(3)·half_extent ≈ 3.46·h).
-         * For a head-on view through the centre the thickness is
-         * 2·half_extent, normalised to ≈ 0.58 — comfortably bright. */
-        float thickness = hit->t_exit - hit->t_enter;
-        float norm      = thickness / (2.f * sqrtf(3.f) * half_extent);
-        if (norm < 0.f) norm = 0.f;
-        if (norm > 1.f) norm = 1.f;
-        *out_colour    = gradient_cold_hot(norm);
-        *out_luminance = 0.3f + 0.65f * norm;
-        break;
-    }
-    case DEBUG_FACE_UV: {
-        float u, v;
-        face_uv(hit_point_obj, hit->normal_obj, half_extent, &u, &v);
-        /* (u,v) ∈ [-1,+1] → (R,G) ∈ [0,1]. Blue stays at 0.5 so the
-         * overall brightness is constant — only hue changes. */
-        *out_colour    = (V3){ u * 0.5f + 0.5f, v * 0.5f + 0.5f, 0.5f };
-        *out_luminance = 0.85f;
-        break;
-    }
+static void apply_debug(DebugMode mode, const BoxHit *hit, V3 hit_point_obj,
+                        float half_extent, V3 *out_colour,
+                        float *out_luminance) {
+  switch (mode) {
+  case DEBUG_AXIS: {
+    V3 c = (V3){0.f, 0.f, 0.f};
+    switch (hit->axis_at_enter) {
+    case 0:
+      c = (V3){0.95f, 0.20f, 0.20f};
+      break; /* red    */
+    case 1:
+      c = (V3){0.20f, 0.95f, 0.30f};
+      break; /* green  */
+    case 2:
+      c = (V3){0.30f, 0.40f, 1.00f};
+      break; /* blue   */
     default:
-        /* DEBUG_OFF — caller keeps its own colour. */
-        break;
+      break;
     }
+    *out_colour = c;
+    *out_luminance = 0.85f;
+    break;
+  }
+  case DEBUG_INTERVAL: {
+    /* Interval thickness in object-space units, normalised by
+     * the cube's diagonal (≈ 2·sqrt(3)·half_extent ≈ 3.46·h).
+     * For a head-on view through the centre the thickness is
+     * 2·half_extent, normalised to ≈ 0.58 — comfortably bright. */
+    float thickness = hit->t_exit - hit->t_enter;
+    float norm = thickness / (2.f * sqrtf(3.f) * half_extent);
+    if (norm < 0.f)
+      norm = 0.f;
+    if (norm > 1.f)
+      norm = 1.f;
+    *out_colour = gradient_cold_hot(norm);
+    *out_luminance = 0.3f + 0.65f * norm;
+    break;
+  }
+  case DEBUG_FACE_UV: {
+    float u, v;
+    face_uv(hit_point_obj, hit->normal_obj, half_extent, &u, &v);
+    /* (u,v) ∈ [-1,+1] → (R,G) ∈ [0,1]. Blue stays at 0.5 so the
+     * overall brightness is constant — only hue changes. */
+    *out_colour = (V3){u * 0.5f + 0.5f, v * 0.5f + 0.5f, 0.5f};
+    *out_luminance = 0.85f;
+    break;
+  }
+  default:
+    /* DEBUG_OFF — caller keeps its own colour. */
+    break;
+  }
 }
 
 /* ── §8 render frame ────────────────────────────────────────────────── *
@@ -1652,107 +1751,104 @@ static void apply_debug(DebugMode mode, const BoxHit *hit,
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-static void render(int cols, int rows,
-                   float angle_x, float angle_y, float cam_dist,
-                   int theme_idx, ShadeMode shade_mode,
-                   DebugMode debug_mode)
-{
-    const Theme *th    = &g_themes[theme_idx % THEME_N];
-    float fov_half_tan = tanf(FOV_DEG * (float)M_PI / 360.f);
+static void render(int cols, int rows, float angle_x, float angle_y,
+                   float cam_dist, int theme_idx, ShadeMode shade_mode,
+                   DebugMode debug_mode) {
+  const Theme *th = &g_themes[theme_idx % THEME_N];
+  float fov_half_tan = tanf(FOV_DEG * (float)M_PI / 360.f);
 
-    /* §8.1 — WORLD↔OBJECT rotation. (Mᵀ goes WORLD→OBJECT for the ray;
-     *         M goes OBJECT→WORLD for the normal.) */
-    Mat3 rotation = mat3_rotation(angle_x, angle_y);
+  /* §8.1 — WORLD↔OBJECT rotation. (Mᵀ goes WORLD→OBJECT for the ray;
+   *         M goes OBJECT→WORLD for the normal.) */
+  Mat3 rotation = mat3_rotation(angle_x, angle_y);
 
-    /* §8.2 — camera basis (fixed). */
-    V3 camera_origin = { 0.f, 0.f, -cam_dist };
-    V3 view_forward  = { 0.f, 0.f,  1.f };
-    V3 view_right    = { 1.f, 0.f,  0.f };
-    V3 view_up       = { 0.f, 1.f,  0.f };
+  /* §8.2 — camera basis (fixed). */
+  V3 camera_origin = {0.f, 0.f, -cam_dist};
+  V3 view_forward = {0.f, 0.f, 1.f};
+  V3 view_right = {1.f, 0.f, 0.f};
+  V3 view_up = {0.f, 1.f, 0.f};
 
-    float screen_centre_x = cols * 0.5f;
-    float screen_centre_y = rows * 0.5f;
+  float screen_centre_x = cols * 0.5f;
+  float screen_centre_y = rows * 0.5f;
 
-    /* §8.3 — Mᵀ applied to the camera origin once (it doesn't depend
-     *         on the pixel). */
-    V3 ray_origin_obj = mat3_mulT(rotation, camera_origin);
+  /* §8.3 — Mᵀ applied to the camera origin once (it doesn't depend
+   *         on the pixel). */
+  V3 ray_origin_obj = mat3_mulT(rotation, camera_origin);
 
-    /* §8.4 — primary loop. */
-    for (int row = 0; row < rows - 1; row++) {
-        for (int col = 0; col < cols; col++) {
-            /* Screen → camera. FOV scale applied to both axes; the
-             * vertical axis is additionally divided by ASPECT (≈0.47)
-             * because terminal cells are taller than wide — without
-             * that division a square cube would render as a vertical
-             * rectangle. */
-            float screen_u =  (col - screen_centre_x) / screen_centre_x
-                              * fov_half_tan;
-            float screen_v = -(row - screen_centre_y) / screen_centre_x
-                              * fov_half_tan / ASPECT;
+  /* §8.4 — primary loop. */
+  for (int row = 0; row < rows - 1; row++) {
+    for (int col = 0; col < cols; col++) {
+      /* Screen → camera. FOV scale applied to both axes; the
+       * vertical axis is additionally divided by ASPECT (≈0.47)
+       * because terminal cells are taller than wide — without
+       * that division a square cube would render as a vertical
+       * rectangle. */
+      float screen_u = (col - screen_centre_x) / screen_centre_x * fov_half_tan;
+      float screen_v =
+          -(row - screen_centre_y) / screen_centre_x * fov_half_tan / ASPECT;
 
-            V3 ray_dir_world = v3norm(v3add(view_forward,
-                                            v3add(v3scale(screen_u, view_right),
-                                                  v3scale(screen_v, view_up))));
+      V3 ray_dir_world =
+          v3norm(v3add(view_forward, v3add(v3scale(screen_u, view_right),
+                                           v3scale(screen_v, view_up))));
 
-            /* Push ray into cube object space (T7). */
-            V3 ray_dir_obj = mat3_mulT(rotation, ray_dir_world);
+      /* Push ray into cube object space (T7). */
+      V3 ray_dir_obj = mat3_mulT(rotation, ray_dir_world);
 
-            BoxHit hit = ray_aabb(ray_origin_obj, ray_dir_obj, CUBE_S);
-            if (!hit.hit) continue;
+      BoxHit hit = ray_aabb(ray_origin_obj, ray_dir_obj, CUBE_S);
+      if (!hit.hit)
+        continue;
 
-            /* Hit point in OBJECT and WORLD space. t is the same in
-             * both spaces (rotation preserves distance). */
-            V3 hit_point_obj   = v3add(ray_origin_obj,
-                                       v3scale(hit.t_hit, ray_dir_obj));
-            V3 hit_point_world = v3add(camera_origin,
-                                       v3scale(hit.t_hit, ray_dir_world));
+      /* Hit point in OBJECT and WORLD space. t is the same in
+       * both spaces (rotation preserves distance). */
+      V3 hit_point_obj = v3add(ray_origin_obj, v3scale(hit.t_hit, ray_dir_obj));
+      V3 hit_point_world =
+          v3add(camera_origin, v3scale(hit.t_hit, ray_dir_world));
 
-            /* Normal: object → world. */
-            V3 normal_world = mat3_mul(rotation, hit.normal_obj);
+      /* Normal: object → world. */
+      V3 normal_world = mat3_mul(rotation, hit.normal_obj);
 
-            /* View direction at the hit point (for specular). */
-            V3 view_dir = v3norm(v3sub(camera_origin, hit_point_world));
+      /* View direction at the hit point (for specular). */
+      V3 view_dir = v3norm(v3sub(camera_origin, hit_point_world));
 
-            V3    colour;
-            float luminance;
+      V3 colour;
+      float luminance;
 
-            switch (shade_mode) {
-            default:
-            case MODE_PHONG:
-                colour    = shade_phong(hit_point_world, normal_world, view_dir, th);
-                luminance = rec601_luma(colour);
-                break;
-            case MODE_NORMAL:
-                colour    = shade_normal(normal_world);
-                /* Green-weighted luma matches the eye's intuition that
-                 * "green is brightest" in RGB-encoded normals. */
-                luminance = (normal_world.x * 0.5f + 0.5f) * 0.30f
-                          + (normal_world.y * 0.5f + 0.5f) * 0.60f
-                          + (normal_world.z * 0.5f + 0.5f) * 0.10f;
-                break;
-            case MODE_WIRE: {
-                float edge_dist = face_edge_dist(hit_point_obj, hit.normal_obj,
-                                                 CUBE_S);
-                if (edge_dist > WIRE_THRESH) continue;     /* face interior */
-                colour    = shade_wire(normal_world, edge_dist);
-                luminance = 0.7f + 0.3f * (1.f - edge_dist / WIRE_THRESH);
-                break;
-            }
-            case MODE_DEPTH:
-                colour    = shade_depth(hit.t_hit, cam_dist * 2.f, th);
-                luminance = rec601_luma(colour);
-                break;
-            }
+      switch (shade_mode) {
+      default:
+      case MODE_PHONG:
+        colour = shade_phong(hit_point_world, normal_world, view_dir, th);
+        luminance = rec601_luma(colour);
+        break;
+      case MODE_NORMAL:
+        colour = shade_normal(normal_world);
+        /* Green-weighted luma matches the eye's intuition that
+         * "green is brightest" in RGB-encoded normals. */
+        luminance = (normal_world.x * 0.5f + 0.5f) * 0.30f +
+                    (normal_world.y * 0.5f + 0.5f) * 0.60f +
+                    (normal_world.z * 0.5f + 0.5f) * 0.10f;
+        break;
+      case MODE_WIRE: {
+        float edge_dist = face_edge_dist(hit_point_obj, hit.normal_obj, CUBE_S);
+        if (edge_dist > WIRE_THRESH)
+          continue; /* face interior */
+        colour = shade_wire(normal_world, edge_dist);
+        luminance = 0.7f + 0.3f * (1.f - edge_dist / WIRE_THRESH);
+        break;
+      }
+      case MODE_DEPTH:
+        colour = shade_depth(hit.t_hit, cam_dist * 2.f, th);
+        luminance = rec601_luma(colour);
+        break;
+      }
 
-            /* Debug overlay (re-tints the pixel if active). */
-            if (debug_mode != DEBUG_OFF) {
-                apply_debug(debug_mode, &hit, hit_point_obj, CUBE_S,
-                            &colour, &luminance);
-            }
+      /* Debug overlay (re-tints the pixel if active). */
+      if (debug_mode != DEBUG_OFF) {
+        apply_debug(debug_mode, &hit, hit_point_obj, CUBE_S, &colour,
+                    &luminance);
+      }
 
-            draw_color(row, col, colour, luminance);
-        }
+      draw_color(row, col, colour, luminance);
     }
+  }
 }
 
 /* ── §9 screen / HUD ────────────────────────────────────────────────── *
@@ -1764,149 +1860,177 @@ static void render(int cols, int rows,
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-static void hud_draw(int cols, int rows, float fps,
-                     int theme_idx, ShadeMode shade_mode,
-                     DebugMode debug_mode,
-                     float cam_dist, int paused)
-{
-    /* §9.1 right-aligned status. fps lives here so it never gets
-     * clipped by a long mode label on narrow terminals. */
-    char status[96];
-    snprintf(status, sizeof status,
-             " %5.1f fps  dist:%.1f  %-9s  %s ",
-             (double)fps, (double)cam_dist,
-             g_themes[theme_idx % THEME_N].name,
-             paused ? "PAUSED " : "running");
-    int status_len = (int)strlen(status);
-    if (status_len > cols) status_len = cols;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, cols - status_len, "%s", status);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+static void hud_draw(int cols, int rows, float fps, int theme_idx,
+                     ShadeMode shade_mode, DebugMode debug_mode, float cam_dist,
+                     int paused) {
+  /* §9.1 right-aligned status. fps lives here so it never gets
+   * clipped by a long mode label on narrow terminals. */
+  char status[96];
+  snprintf(status, sizeof status, " %5.1f fps  dist:%.1f  %-9s  %s ",
+           (double)fps, (double)cam_dist, g_themes[theme_idx % THEME_N].name,
+           paused ? "PAUSED " : "running");
+  int status_len = (int)strlen(status);
+  if (status_len > cols)
+    status_len = cols;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, cols - status_len, "%s", status);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* §9.2 left-aligned mode + debug labels (yellow without bold). */
-    char left_label[80];
-    snprintf(left_label, sizeof left_label,
-             " mode:%-9s  debug:%-8s ",
-             k_mode_names[shade_mode], k_debug_names[debug_mode]);
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(0, 0, "%s", left_label);
-    attroff(COLOR_PAIR(PAIR_HUD));
+  /* §9.2 left-aligned mode + debug labels (yellow without bold). */
+  char left_label[80];
+  snprintf(left_label, sizeof left_label, " mode:%-9s  debug:%-8s ",
+           k_mode_names[shade_mode], k_debug_names[debug_mode]);
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(0, 0, "%s", left_label);
+  attroff(COLOR_PAIR(PAIR_HUD));
 
-    /* §9.3 bottom-left cyan key-hint strip (BOLD, ASCII only). */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(rows - 1, 0,
-             " q:quit  spc/p:pause  s:mode  d:debug  t:theme  r:reset  +/-:zoom ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  /* §9.3 bottom-left cyan key-hint strip (BOLD, ASCII only). */
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(
+      rows - 1, 0,
+      " q:quit  spc/p:pause  s:mode  d:debug  t:theme  r:reset  +/-:zoom ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ── §10 app ────────────────────────────────────────────────────────── */
 
-static volatile sig_atomic_t g_run    = 1;
+static volatile sig_atomic_t g_run = 1;
 static volatile sig_atomic_t g_resize = 0;
-static void on_sigint  (int s) { (void)s; g_run    = 0; }
-static void on_sigwinch(int s) { (void)s; g_resize = 1; }
+static void on_sigint(int s) {
+  (void)s;
+  g_run = 0;
+}
+static void on_sigwinch(int s) {
+  (void)s;
+  g_resize = 1;
+}
 
 static void cleanup(void) { endwin(); }
 
-int main(void)
-{
-    signal(SIGINT,   on_sigint);
-    signal(SIGTERM,  on_sigint);
-    signal(SIGWINCH, on_sigwinch);
+int main(void) {
+  signal(SIGINT, on_sigint);
+  signal(SIGTERM, on_sigint);
+  signal(SIGWINCH, on_sigwinch);
 
-    initscr();
-    cbreak(); noecho(); curs_set(0);
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    typeahead(-1);                          /* prevent input tearing */
-    atexit(cleanup);
-    color_init();
+  initscr();
+  cbreak();
+  noecho();
+  curs_set(0);
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  typeahead(-1); /* prevent input tearing */
+  atexit(cleanup);
+  color_init();
 
-    int cols, rows;
-    getmaxyx(stdscr, rows, cols);
+  int cols, rows;
+  getmaxyx(stdscr, rows, cols);
 
-    int       theme_idx  = 0;
-    ShadeMode shade_mode = MODE_PHONG;
-    DebugMode debug_mode = DEBUG_OFF;
-    float     cam_dist   = CAM_DIST_DEF;
-    float     angle_x    = 0.f;
-    float     angle_y    = 0.f;
-    int       paused     = 0;
+  int theme_idx = 0;
+  ShadeMode shade_mode = MODE_PHONG;
+  DebugMode debug_mode = DEBUG_OFF;
+  float cam_dist = CAM_DIST_DEF;
+  float angle_x = 0.f;
+  float angle_y = 0.f;
+  int paused = 0;
 
-    float     fps        = 0.f;
-    long long fps_acc    = 0;
-    int       fps_cnt    = 0;
-    long long frame_ns   = 1000000000LL / TARGET_FPS;
-    long long last       = clock_ns();
+  float fps = 0.f;
+  long long fps_acc = 0;
+  int fps_cnt = 0;
+  long long frame_ns = 1000000000LL / TARGET_FPS;
+  long long last = clock_ns();
 
-    while (g_run) {
-        /* §10.1 resize. */
-        if (g_resize) {
-            g_resize = 0;
-            endwin(); refresh();
-            getmaxyx(stdscr, rows, cols);
-        }
-
-        /* §10.2 wall-clock dt with spiral-of-death cap. */
-        long long now = clock_ns();
-        long long dt  = now - last;
-        if (dt > DT_CAP_NS) dt = DT_CAP_NS;
-        last = now;
-
-        /* §10.3 advance rotation if not paused. */
-        if (!paused) {
-            float seconds = (float)dt * 1e-9f;
-            angle_y += ROT_Y * seconds;
-            angle_x += ROT_X * seconds;
-        }
-
-        /* §10.4 fps rolling average over half-second windows. */
-        fps_acc += dt; fps_cnt++;
-        if (fps_acc >= 500000000LL) {
-            fps     = (float)fps_cnt * 1e9f / (float)fps_acc;
-            fps_acc = 0; fps_cnt = 0;
-        }
-
-        /* §10.5 paint frame. */
-        long long frame_start = clock_ns();
-        erase();
-        render(cols, rows, angle_x, angle_y, cam_dist,
-               theme_idx, shade_mode, debug_mode);
-        hud_draw(cols, rows, fps, theme_idx, shade_mode, debug_mode,
-                 cam_dist, paused);
-        wnoutrefresh(stdscr);
-        doupdate();
-
-        /* §10.6 input. */
-        int ch = getch();
-        switch (ch) {
-        case 'q': case 'Q': case 27 /* ESC */:
-            g_run = 0; break;
-        case ' ': case 'p': case 'P':
-            paused = !paused; break;
-        case 'r': case 'R':
-            angle_x = 0.f; angle_y = 0.f; break;
-        case 's': case 'S':
-            shade_mode = (ShadeMode)((shade_mode + 1) % MODE_N); break;
-        case 'd': case 'D':
-            debug_mode = (DebugMode)((debug_mode + 1) % DEBUG_N); break;
-        case 't':
-            theme_idx = (theme_idx + 1) % THEME_N; break;
-        case 'T':
-            theme_idx = (theme_idx + THEME_N - 1) % THEME_N; break;
-        case '+': case '=':
-            cam_dist -= CAM_DIST_STEP;
-            if (cam_dist < CAM_DIST_MIN) cam_dist = CAM_DIST_MIN;
-            break;
-        case '-': case '_':
-            cam_dist += CAM_DIST_STEP;
-            if (cam_dist > CAM_DIST_MAX) cam_dist = CAM_DIST_MAX;
-            break;
-        default: break;
-        }
-
-        /* §10.7 frame cap. */
-        clock_sleep_ns(frame_ns - (clock_ns() - frame_start));
+  while (g_run) {
+    /* §10.1 resize. */
+    if (g_resize) {
+      g_resize = 0;
+      endwin();
+      refresh();
+      getmaxyx(stdscr, rows, cols);
     }
-    return 0;
+
+    /* §10.2 wall-clock dt with spiral-of-death cap. */
+    long long now = clock_ns();
+    long long dt = now - last;
+    if (dt > DT_CAP_NS)
+      dt = DT_CAP_NS;
+    last = now;
+
+    /* §10.3 advance rotation if not paused. */
+    if (!paused) {
+      float seconds = (float)dt * 1e-9f;
+      angle_y += ROT_Y * seconds;
+      angle_x += ROT_X * seconds;
+    }
+
+    /* §10.4 fps rolling average over half-second windows. */
+    fps_acc += dt;
+    fps_cnt++;
+    if (fps_acc >= 500000000LL) {
+      fps = (float)fps_cnt * 1e9f / (float)fps_acc;
+      fps_acc = 0;
+      fps_cnt = 0;
+    }
+
+    /* §10.5 paint frame. */
+    long long frame_start = clock_ns();
+    erase();
+    render(cols, rows, angle_x, angle_y, cam_dist, theme_idx, shade_mode,
+           debug_mode);
+    hud_draw(cols, rows, fps, theme_idx, shade_mode, debug_mode, cam_dist,
+             paused);
+    wnoutrefresh(stdscr);
+    doupdate();
+
+    /* §10.6 input. */
+    int ch = getch();
+    switch (ch) {
+    case 'q':
+    case 'Q':
+    case 27 /* ESC */:
+      g_run = 0;
+      break;
+    case ' ':
+    case 'p':
+    case 'P':
+      paused = !paused;
+      break;
+    case 'r':
+    case 'R':
+      angle_x = 0.f;
+      angle_y = 0.f;
+      break;
+    case 's':
+    case 'S':
+      shade_mode = (ShadeMode)((shade_mode + 1) % MODE_N);
+      break;
+    case 'd':
+    case 'D':
+      debug_mode = (DebugMode)((debug_mode + 1) % DEBUG_N);
+      break;
+    case 't':
+      theme_idx = (theme_idx + 1) % THEME_N;
+      break;
+    case 'T':
+      theme_idx = (theme_idx + THEME_N - 1) % THEME_N;
+      break;
+    case '+':
+    case '=':
+      cam_dist -= CAM_DIST_STEP;
+      if (cam_dist < CAM_DIST_MIN)
+        cam_dist = CAM_DIST_MIN;
+      break;
+    case '-':
+    case '_':
+      cam_dist += CAM_DIST_STEP;
+      if (cam_dist > CAM_DIST_MAX)
+        cam_dist = CAM_DIST_MAX;
+      break;
+    default:
+      break;
+    }
+
+    /* §10.7 frame cap. */
+    clock_sleep_ns(frame_ns - (clock_ns() - frame_start));
+  }
+  return 0;
 }

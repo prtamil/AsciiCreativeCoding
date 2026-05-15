@@ -288,8 +288,8 @@
  *
  *   Auto-sweep frequency:
  *     animation_phase_radians += 2*pi / SWEEP_PERIOD_FRAMES
- *     g_freq_bin = FREQ_LO + (sin(animation_phase) + 1) / 2 * (FREQ_HI - FREQ_LO)
- *     (sin gives a smooth there-and-back motion, not a sawtooth jump)
+ *     g_freq_bin = FREQ_LO + (sin(animation_phase) + 1) / 2 * (FREQ_HI -
+ * FREQ_LO) (sin gives a smooth there-and-back motion, not a sawtooth jump)
  *
  * EDGE CASES TO WATCH
  *   - N MUST be a power of 2.  Bit-reversal and butterfly stages both
@@ -719,7 +719,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -736,54 +736,53 @@
 /* §1  config — every constant + enum lives here                         */
 /* ===================================================================== */
 
-#define N                  32        /* MUST be a power of 2.  Both the   */
-                                     /* bit-reverse and the butterfly     */
-                                     /* loop depend on this.              */
-#define LOG2_N              5        /* log_2(N).  HARD-CODED — keep      */
-                                     /* in sync with N above.             */
-#define N_HALF             (N / 2)
-#define RENDER_FPS         30
-#define RENDER_TICK_NS     (1000000000LL / RENDER_FPS)
-#define SWEEP_PERIOD_FRAMES 90       /* one full sweep ≈ 3 seconds        */
-#define FREQ_LO            1.0f
-#define FREQ_HI            ((float)N * 0.5f - 1.0f)
-#define ARM_TABLE_ROWS      8        /* 'D' overlay shows top N bins      */
+#define N 32     /* MUST be a power of 2.  Both the   */
+                 /* bit-reverse and the butterfly     */
+                 /* loop depend on this.              */
+#define LOG2_N 5 /* log_2(N).  HARD-CODED — keep      */
+                 /* in sync with N above.             */
+#define N_HALF (N / 2)
+#define RENDER_FPS 30
+#define RENDER_TICK_NS (1000000000LL / RENDER_FPS)
+#define SWEEP_PERIOD_FRAMES 90 /* one full sweep ≈ 3 seconds        */
+#define FREQ_LO 1.0f
+#define FREQ_HI ((float)N * 0.5f - 1.0f)
+#define ARM_TABLE_ROWS 8 /* 'D' overlay shows top N bins      */
 
 /* Colour pair IDs.  PAIR_HUD/HINT are theme-invariant per CLAUDE.md
  * HUD Standard.  PAIR_GHOST is reserved for the phase panel's midline. */
 enum {
-    PAIR_SIG    = 1,     /* time-domain wave              */
-    PAIR_SPEC   = 2,     /* spectrum bars (medium)        */
-    PAIR_SPIKE  = 3,     /* spectrum bar at the peak bin  */
-    PAIR_LABEL  = 4,     /* panel labels                  */
-    PAIR_HUD    = 5,     /* HUD top status                */
-    PAIR_HINT   = 6,     /* bottom hint                   */
-    PAIR_PHASE_POS = 7,  /* phase panel positive bars     */
-    PAIR_PHASE_NEG = 8,  /* phase panel negative bars     */
+  PAIR_SIG = 1,       /* time-domain wave              */
+  PAIR_SPEC = 2,      /* spectrum bars (medium)        */
+  PAIR_SPIKE = 3,     /* spectrum bar at the peak bin  */
+  PAIR_LABEL = 4,     /* panel labels                  */
+  PAIR_HUD = 5,       /* HUD top status                */
+  PAIR_HINT = 6,      /* bottom hint                   */
+  PAIR_PHASE_POS = 7, /* phase panel positive bars     */
+  PAIR_PHASE_NEG = 8, /* phase panel negative bars     */
 };
 
 /* ===================================================================== */
 /* §2  clock — monotonic ns timer + nanosecond sleep                     */
 /* ===================================================================== */
 
-static long long clock_now_ns(void)
-{
-    /* Purpose : return monotonic clock in nanoseconds.
-     * Why     : the main loop subtracts now() values to figure out
-     *           how long to sleep before the next frame slot. */
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_now_ns(void) {
+  /* Purpose : return monotonic clock in nanoseconds.
+   * Why     : the main loop subtracts now() values to figure out
+   *           how long to sleep before the next frame slot. */
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(long long ns)
-{
-    /* Block until `ns` nanoseconds have elapsed.  Without this, the
-     * main loop would spin a CPU at 100% just to redraw 30 times a
-     * second. */
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(long long ns) {
+  /* Block until `ns` nanoseconds have elapsed.  Without this, the
+   * main loop would spin a CPU at 100% just to redraw 30 times a
+   * second. */
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -824,17 +823,16 @@ static void clock_sleep_ns(long long ns)
  */
 
 typedef struct {
-    float re;     /* real part      (the "x" coordinate)  */
-    float im;     /* imaginary part (the "y" coordinate)  */
+  float re; /* real part      (the "x" coordinate)  */
+  float im; /* imaginary part (the "y" coordinate)  */
 } ComplexNumber;
 
 /* Identities. */
-static const ComplexNumber complex_zero = { 0.0f, 0.0f };
-static const ComplexNumber complex_one  = { 1.0f, 0.0f };
+static const ComplexNumber complex_zero = {0.0f, 0.0f};
+static const ComplexNumber complex_one = {1.0f, 0.0f};
 
-static inline ComplexNumber complex_make(float real_part, float imag_part)
-{
-    return (ComplexNumber){ real_part, imag_part };
+static inline ComplexNumber complex_make(float real_part, float imag_part) {
+  return (ComplexNumber){real_part, imag_part};
 }
 
 /*
@@ -843,25 +841,22 @@ static inline ComplexNumber complex_make(float real_part, float imag_part)
  *   bridge between an angle and a complex multiplication; the FFT uses
  *   it everywhere a "twiddle" is needed.
  */
-static inline ComplexNumber complex_from_angle(float angle_radians)
-{
-    return complex_make(cosf(angle_radians), sinf(angle_radians));
+static inline ComplexNumber complex_from_angle(float angle_radians) {
+  return complex_make(cosf(angle_radians), sinf(angle_radians));
 }
 
 /*
  * complex_add — vector addition (head-to-tail).
  */
-static inline ComplexNumber complex_add(ComplexNumber a, ComplexNumber b)
-{
-    return complex_make(a.re + b.re, a.im + b.im);
+static inline ComplexNumber complex_add(ComplexNumber a, ComplexNumber b) {
+  return complex_make(a.re + b.re, a.im + b.im);
 }
 
 /*
  * complex_sub — vector subtraction.  a - b is the arrow from b to a.
  */
-static inline ComplexNumber complex_sub(ComplexNumber a, ComplexNumber b)
-{
-    return complex_make(a.re - b.re, a.im - b.im);
+static inline ComplexNumber complex_sub(ComplexNumber a, ComplexNumber b) {
+  return complex_make(a.re - b.re, a.im - b.im);
 }
 
 /*
@@ -876,10 +871,8 @@ static inline ComplexNumber complex_sub(ComplexNumber a, ComplexNumber b)
  *   = a.re*b.re + i*a.re*b.im + i*a.im*b.re + i^2*a.im*b.im
  *   = (a.re*b.re - a.im*b.im) + i*(a.re*b.im + a.im*b.re)
  */
-static inline ComplexNumber complex_mul(ComplexNumber a, ComplexNumber b)
-{
-    return complex_make(a.re * b.re - a.im * b.im,
-                        a.re * b.im + a.im * b.re);
+static inline ComplexNumber complex_mul(ComplexNumber a, ComplexNumber b) {
+  return complex_make(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re);
 }
 
 /*
@@ -888,9 +881,8 @@ static inline ComplexNumber complex_mul(ComplexNumber a, ComplexNumber b)
  *   is real-valued).
  */
 static inline ComplexNumber complex_scale_by_real(float scale,
-                                                  ComplexNumber z)
-{
-    return complex_make(scale * z.re, scale * z.im);
+                                                  ComplexNumber z) {
+  return complex_make(scale * z.re, scale * z.im);
 }
 
 /*
@@ -899,38 +891,36 @@ static inline ComplexNumber complex_scale_by_real(float scale,
  *   verification step (max bin-by-bin difference between FFT and DFT).
  *   Phase is discarded.
  */
-static inline float complex_magnitude(ComplexNumber z)
-{
-    return sqrtf(z.re * z.re + z.im * z.im);
+static inline float complex_magnitude(ComplexNumber z) {
+  return sqrtf(z.re * z.re + z.im * z.im);
 }
 
 /* ===================================================================== */
 /* §4  colors — palette pair init                                        */
 /* ===================================================================== */
 
-static void colors_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_SIG,        51, -1);   /* bright cyan    */
-        init_pair(PAIR_SPEC,      154, -1);   /* yellow-green   */
-        init_pair(PAIR_SPIKE,      46, -1);   /* bright green   */
-        init_pair(PAIR_LABEL,     244, -1);   /* mid grey       */
-        init_pair(PAIR_HUD,       226, -1);   /* bright yellow  */
-        init_pair(PAIR_HINT,       51, -1);   /* bright cyan    */
-        init_pair(PAIR_PHASE_POS, 213, -1);   /* magenta-pink   */
-        init_pair(PAIR_PHASE_NEG, 117, -1);   /* sky blue       */
-    } else {
-        init_pair(PAIR_SIG,        COLOR_CYAN,    -1);
-        init_pair(PAIR_SPEC,       COLOR_GREEN,   -1);
-        init_pair(PAIR_SPIKE,      COLOR_GREEN,   -1);
-        init_pair(PAIR_LABEL,      COLOR_WHITE,   -1);
-        init_pair(PAIR_HUD,        COLOR_YELLOW,  -1);
-        init_pair(PAIR_HINT,       COLOR_CYAN,    -1);
-        init_pair(PAIR_PHASE_POS,  COLOR_MAGENTA, -1);
-        init_pair(PAIR_PHASE_NEG,  COLOR_BLUE,    -1);
-    }
+static void colors_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(PAIR_SIG, 51, -1);        /* bright cyan    */
+    init_pair(PAIR_SPEC, 154, -1);      /* yellow-green   */
+    init_pair(PAIR_SPIKE, 46, -1);      /* bright green   */
+    init_pair(PAIR_LABEL, 244, -1);     /* mid grey       */
+    init_pair(PAIR_HUD, 226, -1);       /* bright yellow  */
+    init_pair(PAIR_HINT, 51, -1);       /* bright cyan    */
+    init_pair(PAIR_PHASE_POS, 213, -1); /* magenta-pink   */
+    init_pair(PAIR_PHASE_NEG, 117, -1); /* sky blue       */
+  } else {
+    init_pair(PAIR_SIG, COLOR_CYAN, -1);
+    init_pair(PAIR_SPEC, COLOR_GREEN, -1);
+    init_pair(PAIR_SPIKE, COLOR_GREEN, -1);
+    init_pair(PAIR_LABEL, COLOR_WHITE, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+    init_pair(PAIR_PHASE_POS, COLOR_MAGENTA, -1);
+    init_pair(PAIR_PHASE_NEG, COLOR_BLUE, -1);
+  }
 }
 
 /* ===================================================================== */
@@ -967,36 +957,28 @@ static void colors_init(void)
  *                    label appears as long as the agreement is below
  *                    1e-4 (typically ~1e-7).
  */
-static void compute_dft_naive(const float   *input_signal,
-                              ComplexNumber *output_spectrum)
-{
-    for (int output_bin_index = 0;
-         output_bin_index < N;
-         output_bin_index++) {
+static void compute_dft_naive(const float *input_signal,
+                              ComplexNumber *output_spectrum) {
+  for (int output_bin_index = 0; output_bin_index < N; output_bin_index++) {
 
-        ComplexNumber running_sum = complex_zero;
+    ComplexNumber running_sum = complex_zero;
 
-        for (int input_sample_index = 0;
-             input_sample_index < N;
-             input_sample_index++) {
+    for (int input_sample_index = 0; input_sample_index < N;
+         input_sample_index++) {
 
-            float twist_angle_radians =
-                -2.0f * (float)M_PI
-                * (float)output_bin_index
-                * (float)input_sample_index
-                / (float)N;
+      float twist_angle_radians = -2.0f * (float)M_PI *
+                                  (float)output_bin_index *
+                                  (float)input_sample_index / (float)N;
 
-            ComplexNumber twist =
-                complex_from_angle(twist_angle_radians);
-            ComplexNumber twisted =
-                complex_scale_by_real(input_signal[input_sample_index],
-                                      twist);
+      ComplexNumber twist = complex_from_angle(twist_angle_radians);
+      ComplexNumber twisted =
+          complex_scale_by_real(input_signal[input_sample_index], twist);
 
-            running_sum = complex_add(running_sum, twisted);
-        }
-
-        output_spectrum[output_bin_index] = running_sum;
+      running_sum = complex_add(running_sum, twisted);
     }
+
+    output_spectrum[output_bin_index] = running_sum;
+  }
 }
 
 /* ===================================================================== */
@@ -1015,22 +997,21 @@ static void compute_dft_naive(const float   *input_signal,
  *  the elemental operation §7 needs once per index.
  */
 
-static int reverse_low_bits(int value, int bit_count)
-{
-    /* For value = 13 (binary 01101), bit_count = 5:
-     *   bit 0 of value is 1 → goes to position 4 in result
-     *   bit 1 of value is 0 → goes to position 3
-     *   bit 2 of value is 1 → goes to position 2
-     *   bit 3 of value is 1 → goes to position 1
-     *   bit 4 of value is 0 → goes to position 0
-     *   result = 10110 = 22.
-     * O(bit_count) work per call; called N times during permutation.
-     */
-    int reversed_value = 0;
-    for (int bit_position = 0; bit_position < bit_count; bit_position++)
-        reversed_value |=
-            ((value >> bit_position) & 1) << (bit_count - 1 - bit_position);
-    return reversed_value;
+static int reverse_low_bits(int value, int bit_count) {
+  /* For value = 13 (binary 01101), bit_count = 5:
+   *   bit 0 of value is 1 → goes to position 4 in result
+   *   bit 1 of value is 0 → goes to position 3
+   *   bit 2 of value is 1 → goes to position 2
+   *   bit 3 of value is 1 → goes to position 1
+   *   bit 4 of value is 0 → goes to position 0
+   *   result = 10110 = 22.
+   * O(bit_count) work per call; called N times during permutation.
+   */
+  int reversed_value = 0;
+  for (int bit_position = 0; bit_position < bit_count; bit_position++)
+    reversed_value |= ((value >> bit_position) & 1)
+                      << (bit_count - 1 - bit_position);
+  return reversed_value;
 }
 
 /* ===================================================================== */
@@ -1063,16 +1044,15 @@ static int reverse_low_bits(int value, int bit_count)
  *                    bit operations + 12 swaps — instant.
  */
 
-static void bit_reverse_permute(ComplexNumber *buffer)
-{
-    for (int original_index = 0; original_index < N; original_index++) {
-        int reversed_index = reverse_low_bits(original_index, LOG2_N);
-        if (reversed_index > original_index) {
-            ComplexNumber temp           = buffer[original_index];
-            buffer[original_index]       = buffer[reversed_index];
-            buffer[reversed_index]       = temp;
-        }
+static void bit_reverse_permute(ComplexNumber *buffer) {
+  for (int original_index = 0; original_index < N; original_index++) {
+    int reversed_index = reverse_low_bits(original_index, LOG2_N);
+    if (reversed_index > original_index) {
+      ComplexNumber temp = buffer[original_index];
+      buffer[original_index] = buffer[reversed_index];
+      buffer[reversed_index] = temp;
     }
+  }
 }
 
 /* ===================================================================== */
@@ -1116,37 +1096,34 @@ static void bit_reverse_permute(ComplexNumber *buffer)
  *  pay (in `complex_from_angle`).
  */
 
-static void run_butterfly_stage(ComplexNumber *buffer, int stage_width)
-{
-    int half = stage_width / 2;
+static void run_butterfly_stage(ComplexNumber *buffer, int stage_width) {
+  int half = stage_width / 2;
 
-    ComplexNumber twiddle_step =
-        complex_from_angle(-2.0f * (float)M_PI / (float)stage_width);
+  ComplexNumber twiddle_step =
+      complex_from_angle(-2.0f * (float)M_PI / (float)stage_width);
 
-    for (int group_start = 0; group_start < N; group_start += stage_width) {
+  for (int group_start = 0; group_start < N; group_start += stage_width) {
 
-        /* Twiddle starts at W^0 = 1 + 0i, advances by twiddle_step. */
-        ComplexNumber twiddle = complex_one;
+    /* Twiddle starts at W^0 = 1 + 0i, advances by twiddle_step. */
+    ComplexNumber twiddle = complex_one;
 
-        for (int j = 0; j < half; j++) {
-            int even_slot_index = group_start + j;
-            int odd_slot_index  = even_slot_index + half;
+    for (int j = 0; j < half; j++) {
+      int even_slot_index = group_start + j;
+      int odd_slot_index = even_slot_index + half;
 
-            /* t          = twiddle * buffer[odd_slot]   (twist of O[k])  */
-            ComplexNumber t = complex_mul(twiddle, buffer[odd_slot_index]);
+      /* t          = twiddle * buffer[odd_slot]   (twist of O[k])  */
+      ComplexNumber t = complex_mul(twiddle, buffer[odd_slot_index]);
 
-            /* buffer[odd_slot]  = buffer[even_slot] - t  (lower output) */
-            buffer[odd_slot_index] =
-                complex_sub(buffer[even_slot_index], t);
+      /* buffer[odd_slot]  = buffer[even_slot] - t  (lower output) */
+      buffer[odd_slot_index] = complex_sub(buffer[even_slot_index], t);
 
-            /* buffer[even_slot] = buffer[even_slot] + t  (upper output) */
-            buffer[even_slot_index] =
-                complex_add(buffer[even_slot_index], t);
+      /* buffer[even_slot] = buffer[even_slot] + t  (upper output) */
+      buffer[even_slot_index] = complex_add(buffer[even_slot_index], t);
 
-            /* Advance W^j → W^(j+1) — see T7 for the recurrence. */
-            twiddle = complex_mul(twiddle, twiddle_step);
-        }
+      /* Advance W^j → W^(j+1) — see T7 for the recurrence. */
+      twiddle = complex_mul(twiddle, twiddle_step);
     }
+  }
 }
 
 /* ===================================================================== */
@@ -1166,65 +1143,60 @@ static void run_butterfly_stage(ComplexNumber *buffer, int stage_width)
  *  interesting is in §7 bit_reverse_permute and §8 run_butterfly_stage.
  */
 
-static void fft(ComplexNumber *buffer)
-{
-    bit_reverse_permute(buffer);
-    for (int stage_width = 2; stage_width <= N; stage_width <<= 1)
-        run_butterfly_stage(buffer, stage_width);
+static void fft(ComplexNumber *buffer) {
+  bit_reverse_permute(buffer);
+  for (int stage_width = 2; stage_width <= N; stage_width <<= 1)
+    run_butterfly_stage(buffer, stage_width);
 }
 
 /* ===================================================================== */
 /* §10  signal — generate the test input                                 */
 /* ===================================================================== */
 
-static void generate_cosine(float frequency_bin, float *output_signal)
-{
-    /* x[n] = cos(2*pi * frequency_bin * n / N).
-     *
-     * frequency_bin can be FRACTIONAL.  Off-integer values cause
-     * spectral leakage: the spike spreads across nearby bins.  This
-     * is normal DFT behaviour, not a bug.  See T10 in the tutorial.
-     *
-     * Pseudocode:
-     *   for n in 0..N-1:
-     *     phase = 2 * pi * frequency_bin * n / N
-     *     output_signal[n] = cos(phase)
-     */
-    for (int sample_index = 0; sample_index < N; sample_index++) {
-        float phase_radians = 2.0f * (float)M_PI
-                            * frequency_bin
-                            * (float)sample_index
-                            / (float)N;
-        output_signal[sample_index] = cosf(phase_radians);
-    }
+static void generate_cosine(float frequency_bin, float *output_signal) {
+  /* x[n] = cos(2*pi * frequency_bin * n / N).
+   *
+   * frequency_bin can be FRACTIONAL.  Off-integer values cause
+   * spectral leakage: the spike spreads across nearby bins.  This
+   * is normal DFT behaviour, not a bug.  See T10 in the tutorial.
+   *
+   * Pseudocode:
+   *   for n in 0..N-1:
+   *     phase = 2 * pi * frequency_bin * n / N
+   *     output_signal[n] = cos(phase)
+   */
+  for (int sample_index = 0; sample_index < N; sample_index++) {
+    float phase_radians =
+        2.0f * (float)M_PI * frequency_bin * (float)sample_index / (float)N;
+    output_signal[sample_index] = cosf(phase_radians);
+  }
 }
 
 /* ===================================================================== */
 /* §11  scene_state — globals + reset                                    */
 /* ===================================================================== */
 
-static float         g_signal[N];                    /* time-domain wave   */
-static ComplexNumber g_fft_workspace_buffer[N];      /* X[k] from FFT      */
-static ComplexNumber g_dft_reference_buffer[N];      /* X[k] from DFT      */
-static float         g_magnitude[N_HALF + 1];        /* |X[k]| (one-sided) */
-static float         g_magnitude_peak = 1.0f;        /* for autoscale      */
-static float         g_max_verification_error = 0.0f;
+static float g_signal[N];                       /* time-domain wave   */
+static ComplexNumber g_fft_workspace_buffer[N]; /* X[k] from FFT      */
+static ComplexNumber g_dft_reference_buffer[N]; /* X[k] from DFT      */
+static float g_magnitude[N_HALF + 1];           /* |X[k]| (one-sided) */
+static float g_magnitude_peak = 1.0f;           /* for autoscale      */
+static float g_max_verification_error = 0.0f;
 
-static float g_freq_bin              = FREQ_LO;
-static bool  g_simulation_paused     = false;
-static bool  g_auto_sweep_enabled    = true;
-static float g_animation_phase_radians = 0.0f;       /* sweep's own phase  */
+static float g_freq_bin = FREQ_LO;
+static bool g_simulation_paused = false;
+static bool g_auto_sweep_enabled = true;
+static float g_animation_phase_radians = 0.0f; /* sweep's own phase  */
 
 /* Debug overlay toggles. */
-static bool  g_show_phase_panel      = false;
-static bool  g_show_arm_table        = false;
+static bool g_show_phase_panel = false;
+static bool g_show_arm_table = false;
 
-static void scene_reset(void)
-{
-    g_freq_bin                 = FREQ_LO;
-    g_auto_sweep_enabled       = true;
-    g_animation_phase_radians  = 0.0f;
-    g_simulation_paused        = false;
+static void scene_reset(void) {
+  g_freq_bin = FREQ_LO;
+  g_auto_sweep_enabled = true;
+  g_animation_phase_radians = 0.0f;
+  g_simulation_paused = false;
 }
 
 /* ===================================================================== */
@@ -1247,70 +1219,70 @@ static void scene_reset(void)
  *  No render work happens here — render functions live in §15-§19
  *  and only READ this state.
  */
-static void scene_tick(void)
-{
-    if (g_simulation_paused) return;
+static void scene_tick(void) {
+  if (g_simulation_paused)
+    return;
 
-    /* ── Step 1.  auto-sweep frequency ─────────────────────────── */
-    if (g_auto_sweep_enabled) {
-        g_animation_phase_radians +=
-            2.0f * (float)M_PI / (float)SWEEP_PERIOD_FRAMES;
-        if (g_animation_phase_radians > 2.0f * (float)M_PI)
-            g_animation_phase_radians -= 2.0f * (float)M_PI;
+  /* ── Step 1.  auto-sweep frequency ─────────────────────────── */
+  if (g_auto_sweep_enabled) {
+    g_animation_phase_radians +=
+        2.0f * (float)M_PI / (float)SWEEP_PERIOD_FRAMES;
+    if (g_animation_phase_radians > 2.0f * (float)M_PI)
+      g_animation_phase_radians -= 2.0f * (float)M_PI;
 
-        /* sin in [-1, +1] → unit interval → [FREQ_LO, FREQ_HI]. */
-        float sin_normalised_to_unit =
-            (sinf(g_animation_phase_radians) + 1.0f) * 0.5f;
-        g_freq_bin = FREQ_LO
-                   + sin_normalised_to_unit * (FREQ_HI - FREQ_LO);
-    }
+    /* sin in [-1, +1] → unit interval → [FREQ_LO, FREQ_HI]. */
+    float sin_normalised_to_unit =
+        (sinf(g_animation_phase_radians) + 1.0f) * 0.5f;
+    g_freq_bin = FREQ_LO + sin_normalised_to_unit * (FREQ_HI - FREQ_LO);
+  }
 
-    /* ── Step 2.  generate test cosine ─────────────────────────── */
-    generate_cosine(g_freq_bin, g_signal);
+  /* ── Step 2.  generate test cosine ─────────────────────────── */
+  generate_cosine(g_freq_bin, g_signal);
 
-    /* ── Step 3.  promote real signal into complex workspace ──── */
-    for (int sample_index = 0; sample_index < N; sample_index++)
-        g_fft_workspace_buffer[sample_index] =
-            complex_make(g_signal[sample_index], 0.0f);
+  /* ── Step 3.  promote real signal into complex workspace ──── */
+  for (int sample_index = 0; sample_index < N; sample_index++)
+    g_fft_workspace_buffer[sample_index] =
+        complex_make(g_signal[sample_index], 0.0f);
 
-    /* ── Step 4.  run the FFT in place ─────────────────────────── */
-    fft(g_fft_workspace_buffer);
+  /* ── Step 4.  run the FFT in place ─────────────────────────── */
+  fft(g_fft_workspace_buffer);
 
-    /* ── Step 5.  one-sided magnitude spectrum + autoscale peak ── */
-    g_magnitude_peak = 1e-6f;
-    for (int bin_index = 0; bin_index <= N_HALF; bin_index++) {
-        g_magnitude[bin_index] =
-            complex_magnitude(g_fft_workspace_buffer[bin_index]);
-        if (g_magnitude[bin_index] > g_magnitude_peak)
-            g_magnitude_peak = g_magnitude[bin_index];
-    }
+  /* ── Step 5.  one-sided magnitude spectrum + autoscale peak ── */
+  g_magnitude_peak = 1e-6f;
+  for (int bin_index = 0; bin_index <= N_HALF; bin_index++) {
+    g_magnitude[bin_index] =
+        complex_magnitude(g_fft_workspace_buffer[bin_index]);
+    if (g_magnitude[bin_index] > g_magnitude_peak)
+      g_magnitude_peak = g_magnitude[bin_index];
+  }
 
-    /* ── Step 6.  reference DFT for verification ───────────────── */
-    compute_dft_naive(g_signal, g_dft_reference_buffer);
+  /* ── Step 6.  reference DFT for verification ───────────────── */
+  compute_dft_naive(g_signal, g_dft_reference_buffer);
 
-    /* ── Step 7.  max bin-by-bin error |fft - dft| ─────────────── */
-    g_max_verification_error = 0.0f;
-    for (int bin_index = 0; bin_index < N; bin_index++) {
-        ComplexNumber difference =
-            complex_sub(g_fft_workspace_buffer[bin_index],
-                        g_dft_reference_buffer[bin_index]);
-        float bin_error = complex_magnitude(difference);
-        if (bin_error > g_max_verification_error)
-            g_max_verification_error = bin_error;
-    }
+  /* ── Step 7.  max bin-by-bin error |fft - dft| ─────────────── */
+  g_max_verification_error = 0.0f;
+  for (int bin_index = 0; bin_index < N; bin_index++) {
+    ComplexNumber difference = complex_sub(g_fft_workspace_buffer[bin_index],
+                                           g_dft_reference_buffer[bin_index]);
+    float bin_error = complex_magnitude(difference);
+    if (bin_error > g_max_verification_error)
+      g_max_verification_error = bin_error;
+  }
 }
 
 /* ===================================================================== */
 /* §13  scene_input — manual frequency adjustment                        */
 /* ===================================================================== */
 
-static void scene_adjust_freq(float delta_bins)
-{
-    /* No-op while auto-sweep is on; otherwise clamp to [FREQ_LO, FREQ_HI]. */
-    if (g_auto_sweep_enabled) return;
-    g_freq_bin += delta_bins;
-    if (g_freq_bin < FREQ_LO) g_freq_bin = FREQ_LO;
-    if (g_freq_bin > FREQ_HI) g_freq_bin = FREQ_HI;
+static void scene_adjust_freq(float delta_bins) {
+  /* No-op while auto-sweep is on; otherwise clamp to [FREQ_LO, FREQ_HI]. */
+  if (g_auto_sweep_enabled)
+    return;
+  g_freq_bin += delta_bins;
+  if (g_freq_bin < FREQ_LO)
+    g_freq_bin = FREQ_LO;
+  if (g_freq_bin > FREQ_HI)
+    g_freq_bin = FREQ_HI;
 }
 
 /* ===================================================================== */
@@ -1318,49 +1290,48 @@ static void scene_adjust_freq(float delta_bins)
 /* ===================================================================== */
 
 static void draw_bar(int column, int baseline_row, int bar_height_cells,
-                     bool growing_upward, int colour_pair)
-{
-    /* Stamp a vertical column of glyphs starting at baseline_row,
-     * growing either upward or downward.  Used by every panel. */
-    if (bar_height_cells <= 0) return;
-    attron(COLOR_PAIR(colour_pair) | A_BOLD);
-    for (int dy = 0; dy < bar_height_cells; dy++) {
-        int row = growing_upward ? (baseline_row - dy)
-                                 : (baseline_row + dy + 1);
-        if (row < 0 || row >= LINES) continue;
-        if (column < 0 || column >= COLS)  continue;
-        mvaddch(row, column, growing_upward ? '|' : '.');
-    }
-    attroff(COLOR_PAIR(colour_pair) | A_BOLD);
+                     bool growing_upward, int colour_pair) {
+  /* Stamp a vertical column of glyphs starting at baseline_row,
+   * growing either upward or downward.  Used by every panel. */
+  if (bar_height_cells <= 0)
+    return;
+  attron(COLOR_PAIR(colour_pair) | A_BOLD);
+  for (int dy = 0; dy < bar_height_cells; dy++) {
+    int row = growing_upward ? (baseline_row - dy) : (baseline_row + dy + 1);
+    if (row < 0 || row >= LINES)
+      continue;
+    if (column < 0 || column >= COLS)
+      continue;
+    mvaddch(row, column, growing_upward ? '|' : '.');
+  }
+  attroff(COLOR_PAIR(colour_pair) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §15  draw_signal — TIME panel renderer                                */
 /* ===================================================================== */
 
-static void draw_signal_panel(int top_row, int height_rows)
-{
-    /* Per sample: vertical bar from the panel midline.  Positive
-     * samples grow upward as '|', negative grow downward as '.'. */
-    int half_height = height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = top_row + half_height;
+static void draw_signal_panel(int top_row, int height_rows) {
+  /* Per sample: vertical bar from the panel midline.  Positive
+   * samples grow upward as '|', negative grow downward as '.'. */
+  int half_height = height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = top_row + half_height;
 
-    int columns_to_draw = (COLS < N) ? COLS : N;
-    int spacing_per_sample = (COLS / N >= 2) ? 2 : 1;
+  int columns_to_draw = (COLS < N) ? COLS : N;
+  int spacing_per_sample = (COLS / N >= 2) ? 2 : 1;
 
-    for (int sample_index = 0;
-         sample_index < columns_to_draw;
-         sample_index++) {
+  for (int sample_index = 0; sample_index < columns_to_draw; sample_index++) {
 
-        float v   = g_signal[sample_index];
-        bool  pos = (v >= 0.0f);
-        int   h   = (int)(fabsf(v) * (float)half_height + 0.5f);
+    float v = g_signal[sample_index];
+    bool pos = (v >= 0.0f);
+    int h = (int)(fabsf(v) * (float)half_height + 0.5f);
 
-        for (int s = 0; s < spacing_per_sample; s++)
-            draw_bar(sample_index * spacing_per_sample + s,
-                     midline_row, h, pos, PAIR_SIG);
-    }
+    for (int s = 0; s < spacing_per_sample; s++)
+      draw_bar(sample_index * spacing_per_sample + s, midline_row, h, pos,
+               PAIR_SIG);
+  }
 }
 
 /* ===================================================================== */
@@ -1368,31 +1339,29 @@ static void draw_signal_panel(int top_row, int height_rows)
 /* ===================================================================== */
 
 static void draw_spectrum_panel(int top_row, int height_rows,
-                                int *out_dominant_bin)
-{
-    /* Magnitude per bin as upward bars from panel bottom.  Spike bin
-     * (the loudest one) is highlighted in bright green. */
-    int baseline_row = top_row + height_rows - 1;
-    int bin_w        = (COLS / (N_HALF + 1) >= 3) ? 3 : 2;
-    int max_bins     = COLS / bin_w;
-    if (max_bins > N_HALF + 1) max_bins = N_HALF + 1;
+                                int *out_dominant_bin) {
+  /* Magnitude per bin as upward bars from panel bottom.  Spike bin
+   * (the loudest one) is highlighted in bright green. */
+  int baseline_row = top_row + height_rows - 1;
+  int bin_w = (COLS / (N_HALF + 1) >= 3) ? 3 : 2;
+  int max_bins = COLS / bin_w;
+  if (max_bins > N_HALF + 1)
+    max_bins = N_HALF + 1;
 
-    int dominant_bin = 0;
-    for (int bin_index = 1; bin_index <= N_HALF; bin_index++)
-        if (g_magnitude[bin_index] > g_magnitude[dominant_bin])
-            dominant_bin = bin_index;
-    *out_dominant_bin = dominant_bin;
+  int dominant_bin = 0;
+  for (int bin_index = 1; bin_index <= N_HALF; bin_index++)
+    if (g_magnitude[bin_index] > g_magnitude[dominant_bin])
+      dominant_bin = bin_index;
+  *out_dominant_bin = dominant_bin;
 
-    for (int bin_index = 0; bin_index < max_bins; bin_index++) {
-        float v    = g_magnitude[bin_index]
-                   / (g_magnitude_peak + 1e-6f);
-        int   h    = (int)(v * (float)height_rows + 0.5f);
-        int   pair = (bin_index == dominant_bin) ? PAIR_SPIKE : PAIR_SPEC;
+  for (int bin_index = 0; bin_index < max_bins; bin_index++) {
+    float v = g_magnitude[bin_index] / (g_magnitude_peak + 1e-6f);
+    int h = (int)(v * (float)height_rows + 0.5f);
+    int pair = (bin_index == dominant_bin) ? PAIR_SPIKE : PAIR_SPEC;
 
-        for (int bx = 0; bx < bin_w - 1; bx++)
-            draw_bar(bin_index * bin_w + bx, baseline_row,
-                     h, true, pair);
-    }
+    for (int bx = 0; bx < bin_w - 1; bx++)
+      draw_bar(bin_index * bin_w + bx, baseline_row, h, true, pair);
+  }
 }
 
 /* ===================================================================== */
@@ -1404,39 +1373,41 @@ static void draw_spectrum_panel(int top_row, int height_rows,
  *  Magnitude alone discards phase — toggle this overlay to see what
  *  got thrown away.
  */
-static void draw_phase_panel(int top_row, int height_rows)
-{
-    if (height_rows < 3) return;
+static void draw_phase_panel(int top_row, int height_rows) {
+  if (height_rows < 3)
+    return;
 
-    int half_height = height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = top_row + half_height;
+  int half_height = height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = top_row + half_height;
 
-    int bin_w    = (COLS / (N_HALF + 1) >= 3) ? 3 : 2;
-    int max_bins = COLS / bin_w;
-    if (max_bins > N_HALF + 1) max_bins = N_HALF + 1;
+  int bin_w = (COLS / (N_HALF + 1) >= 3) ? 3 : 2;
+  int max_bins = COLS / bin_w;
+  if (max_bins > N_HALF + 1)
+    max_bins = N_HALF + 1;
 
-    for (int bin_index = 0; bin_index < max_bins; bin_index++) {
-        ComplexNumber z = g_fft_workspace_buffer[bin_index];
-        /* Skip phase for near-zero magnitude bins (noise). */
-        if (complex_magnitude(z) < 1e-3f) continue;
+  for (int bin_index = 0; bin_index < max_bins; bin_index++) {
+    ComplexNumber z = g_fft_workspace_buffer[bin_index];
+    /* Skip phase for near-zero magnitude bins (noise). */
+    if (complex_magnitude(z) < 1e-3f)
+      continue;
 
-        float phase_radians = atan2f(z.im, z.re);
-        float fraction      = phase_radians / (float)M_PI;   /* in (-1, 1] */
-        bool  pos           = (phase_radians >= 0.0f);
-        int   h             = (int)(fabsf(fraction) * (float)half_height + 0.5f);
+    float phase_radians = atan2f(z.im, z.re);
+    float fraction = phase_radians / (float)M_PI; /* in (-1, 1] */
+    bool pos = (phase_radians >= 0.0f);
+    int h = (int)(fabsf(fraction) * (float)half_height + 0.5f);
 
-        for (int bx = 0; bx < bin_w - 1; bx++)
-            draw_bar(bin_index * bin_w + bx, midline_row,
-                     h, pos,
-                     pos ? PAIR_PHASE_POS : PAIR_PHASE_NEG);
-    }
+    for (int bx = 0; bx < bin_w - 1; bx++)
+      draw_bar(bin_index * bin_w + bx, midline_row, h, pos,
+               pos ? PAIR_PHASE_POS : PAIR_PHASE_NEG);
+  }
 
-    /* Midline marker so the user can see "zero phase". */
-    attron(COLOR_PAIR(PAIR_LABEL));
-    for (int x = 0; x < COLS && x < max_bins * bin_w; x++)
-        mvaddch(midline_row, x, '-');
-    attroff(COLOR_PAIR(PAIR_LABEL));
+  /* Midline marker so the user can see "zero phase". */
+  attron(COLOR_PAIR(PAIR_LABEL));
+  for (int x = 0; x < COLS && x < max_bins * bin_w; x++)
+    mvaddch(midline_row, x, '-');
+  attroff(COLOR_PAIR(PAIR_LABEL));
 }
 
 /* ===================================================================== */
@@ -1447,203 +1418,228 @@ static void draw_phase_panel(int top_row, int height_rows)
  *  prints (bin, |X[k]|, arg(X[k])) for the first ARM_TABLE_ROWS.
  *  Useful for verifying decode by hand.
  */
-static void draw_arm_table(void)
-{
-    /* Selection-sort the first N/2 bin indices by descending
-     * magnitude — only the top ARM_TABLE_ROWS positions matter. */
-    int sorted_bin_indices[N_HALF + 1];
-    for (int i = 0; i <= N_HALF; i++) sorted_bin_indices[i] = i;
-    for (int i = 0; i < ARM_TABLE_ROWS && i <= N_HALF; i++) {
-        int max_at = i;
-        for (int j = i + 1; j <= N_HALF; j++)
-            if (g_magnitude[sorted_bin_indices[j]]
-              > g_magnitude[sorted_bin_indices[max_at]])
-                max_at = j;
-        int tmp                 = sorted_bin_indices[i];
-        sorted_bin_indices[i]   = sorted_bin_indices[max_at];
-        sorted_bin_indices[max_at] = tmp;
-    }
+static void draw_arm_table(void) {
+  /* Selection-sort the first N/2 bin indices by descending
+   * magnitude — only the top ARM_TABLE_ROWS positions matter. */
+  int sorted_bin_indices[N_HALF + 1];
+  for (int i = 0; i <= N_HALF; i++)
+    sorted_bin_indices[i] = i;
+  for (int i = 0; i < ARM_TABLE_ROWS && i <= N_HALF; i++) {
+    int max_at = i;
+    for (int j = i + 1; j <= N_HALF; j++)
+      if (g_magnitude[sorted_bin_indices[j]] >
+          g_magnitude[sorted_bin_indices[max_at]])
+        max_at = j;
+    int tmp = sorted_bin_indices[i];
+    sorted_bin_indices[i] = sorted_bin_indices[max_at];
+    sorted_bin_indices[max_at] = tmp;
+  }
 
-    int x = 2, y = 2;
-    if (y + ARM_TABLE_ROWS + 1 >= LINES - 1) return;
+  int x = 2, y = 2;
+  if (y + ARM_TABLE_ROWS + 1 >= LINES - 1)
+    return;
 
-    attron(COLOR_PAIR(PAIR_HINT));
-    mvprintw(y, x, " bin   |X[k]|     arg(rad)");
-    attroff(COLOR_PAIR(PAIR_HINT));
+  attron(COLOR_PAIR(PAIR_HINT));
+  mvprintw(y, x, " bin   |X[k]|     arg(rad)");
+  attroff(COLOR_PAIR(PAIR_HINT));
 
-    for (int row = 0; row < ARM_TABLE_ROWS && row <= N_HALF; row++) {
-        int bin_index   = sorted_bin_indices[row];
-        ComplexNumber z = g_fft_workspace_buffer[bin_index];
-        float phase     = atan2f(z.im, z.re);
-        attron(COLOR_PAIR(PAIR_SPIKE) | A_BOLD);
-        mvprintw(y + 1 + row, x,
-                 "  %2d   %7.3f   %+6.3f",
-                 bin_index, (double)g_magnitude[bin_index], (double)phase);
-        attroff(COLOR_PAIR(PAIR_SPIKE) | A_BOLD);
-    }
+  for (int row = 0; row < ARM_TABLE_ROWS && row <= N_HALF; row++) {
+    int bin_index = sorted_bin_indices[row];
+    ComplexNumber z = g_fft_workspace_buffer[bin_index];
+    float phase = atan2f(z.im, z.re);
+    attron(COLOR_PAIR(PAIR_SPIKE) | A_BOLD);
+    mvprintw(y + 1 + row, x, "  %2d   %7.3f   %+6.3f", bin_index,
+             (double)g_magnitude[bin_index], (double)phase);
+    attroff(COLOR_PAIR(PAIR_SPIKE) | A_BOLD);
+  }
 }
 
 /* ===================================================================== */
 /* §19  hud — status top-right + hint bottom + frame composer            */
 /* ===================================================================== */
 
-static void draw_hud(int dominant_bin)
-{
-    int dft_ops = N * N;
-    int fft_ops = (N / 2) * LOG2_N;
+static void draw_hud(int dominant_bin) {
+  int dft_ops = N * N;
+  int fft_ops = (N / 2) * LOG2_N;
 
-    char status[200];
-    snprintf(status, sizeof status,
-             " FFT helloworld  N=%d  freq=%5.2f (peak bin=%d)  "
-             "FFT %d vs DFT %d ops  err=%.1e %s  %s  %s ",
-             N, (double)g_freq_bin, dominant_bin,
-             fft_ops, dft_ops,
-             (double)g_max_verification_error,
-             (g_max_verification_error < 1e-4f) ? "[FFT == DFT]" : "[FFT != DFT]",
-             g_auto_sweep_enabled ? "AUTO  " : "MANUAL",
-             g_simulation_paused  ? "PAUSED" : "      ");
-    int x = COLS - (int)strlen(status);
-    if (x < 0) x = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, x, "%s", status);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  char status[200];
+  snprintf(status, sizeof status,
+           " FFT helloworld  N=%d  freq=%5.2f (peak bin=%d)  "
+           "FFT %d vs DFT %d ops  err=%.1e %s  %s  %s ",
+           N, (double)g_freq_bin, dominant_bin, fft_ops, dft_ops,
+           (double)g_max_verification_error,
+           (g_max_verification_error < 1e-4f) ? "[FFT == DFT]" : "[FFT != DFT]",
+           g_auto_sweep_enabled ? "AUTO  " : "MANUAL",
+           g_simulation_paused ? "PAUSED" : "      ");
+  int x = COLS - (int)strlen(status);
+  if (x < 0)
+    x = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, x, "%s", status);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void draw_hint(void)
-{
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(LINES - 1, 0,
-             " q:quit  spc:pause  a:auto/manual  +/-:freq  ,/.:fine "
-             " d:phase  D:bins  r:reset ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void draw_hint(void) {
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(LINES - 1, 0,
+           " q:quit  spc:pause  a:auto/manual  +/-:freq  ,/.:fine "
+           " d:phase  D:bins  r:reset ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void render_frame(void)
-{
-    erase();
+static void render_frame(void) {
+  erase();
 
-    /* Reserved rows: 1 hud + 2 panel labels + 1 hint = 4. */
-    int rows_for_panels = LINES - 4;
-    if (rows_for_panels < 6) rows_for_panels = 6;
+  /* Reserved rows: 1 hud + 2 panel labels + 1 hint = 4. */
+  int rows_for_panels = LINES - 4;
+  if (rows_for_panels < 6)
+    rows_for_panels = 6;
 
-    /* Phase panel "steals" a chunk of vertical space when toggled. */
-    int phase_h = g_show_phase_panel ? rows_for_panels / 4 : 0;
-    int main_h  = rows_for_panels - phase_h;
-    int sig_h   = main_h / 2;
-    int spec_h  = main_h - sig_h;
+  /* Phase panel "steals" a chunk of vertical space when toggled. */
+  int phase_h = g_show_phase_panel ? rows_for_panels / 4 : 0;
+  int main_h = rows_for_panels - phase_h;
+  int sig_h = main_h / 2;
+  int spec_h = main_h - sig_h;
 
-    int sig_label_row    = 1;
-    int sig_top_row      = 2;
-    int spec_label_row   = 2 + sig_h;
-    int spec_top_row     = 3 + sig_h;
-    int phase_top_row    = 3 + sig_h + spec_h;   /* used only if show_phase */
+  int sig_label_row = 1;
+  int sig_top_row = 2;
+  int spec_label_row = 2 + sig_h;
+  int spec_top_row = 3 + sig_h;
+  int phase_top_row = 3 + sig_h + spec_h; /* used only if show_phase */
 
-    /* Panel labels. */
-    attron(COLOR_PAIR(PAIR_LABEL));
-    mvprintw(sig_label_row,  0, "Input x[n] = cos(2*pi * freq * n / N)");
-    mvprintw(spec_label_row, 0, "FFT magnitude |X[k]|  (bins 0..%d)", N_HALF);
-    if (g_show_phase_panel)
-        mvprintw(phase_top_row - 1, 0,
-                 "FFT phase arg(X[k])  (magenta = +, sky = -)");
-    attroff(COLOR_PAIR(PAIR_LABEL));
+  /* Panel labels. */
+  attron(COLOR_PAIR(PAIR_LABEL));
+  mvprintw(sig_label_row, 0, "Input x[n] = cos(2*pi * freq * n / N)");
+  mvprintw(spec_label_row, 0, "FFT magnitude |X[k]|  (bins 0..%d)", N_HALF);
+  if (g_show_phase_panel)
+    mvprintw(phase_top_row - 1, 0,
+             "FFT phase arg(X[k])  (magenta = +, sky = -)");
+  attroff(COLOR_PAIR(PAIR_LABEL));
 
-    /* Panels. */
-    draw_signal_panel(sig_top_row, sig_h);
-    int dominant_bin = 0;
-    draw_spectrum_panel(spec_top_row, spec_h, &dominant_bin);
-    if (g_show_phase_panel)
-        draw_phase_panel(phase_top_row, phase_h);
+  /* Panels. */
+  draw_signal_panel(sig_top_row, sig_h);
+  int dominant_bin = 0;
+  draw_spectrum_panel(spec_top_row, spec_h, &dominant_bin);
+  if (g_show_phase_panel)
+    draw_phase_panel(phase_top_row, phase_h);
 
-    /* Debug overlay (drawn on top of panels but under HUD). */
-    if (g_show_arm_table)
-        draw_arm_table();
+  /* Debug overlay (drawn on top of panels but under HUD). */
+  if (g_show_arm_table)
+    draw_arm_table();
 
-    /* HUD always last. */
-    draw_hud(dominant_bin);
-    draw_hint();
+  /* HUD always last. */
+  draw_hud(dominant_bin);
+  draw_hint();
 
-    wnoutrefresh(stdscr);
-    doupdate();
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §20  app — signal handlers + main loop + key dispatch                 */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_should_quit    = 0;
+static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
 
-static void on_signal(int sig)
-{
-    /* Async-signal-safe: only set flags; main loop handles them. */
-    if (sig == SIGWINCH) g_resize_pending = 1;
-    else                 g_should_quit    = 1;
+static void on_signal(int sig) {
+  /* Async-signal-safe: only set flags; main loop handles them. */
+  if (sig == SIGWINCH)
+    g_resize_pending = 1;
+  else
+    g_should_quit = 1;
 }
 
 static void cleanup_screen(void) { endwin(); }
 
-static bool app_handle_key(int ch)
-{
-    switch (ch) {
-        case 'q': case 'Q': case 27:  return true;
-        case ' ':                     g_simulation_paused = !g_simulation_paused; break;
-        case 'a': case 'A':           g_auto_sweep_enabled = !g_auto_sweep_enabled; break;
-        case '+': case '=':           scene_adjust_freq(+1.0f); break;
-        case '-':                     scene_adjust_freq(-1.0f); break;
-        case '.':                     scene_adjust_freq(+0.1f); break;
-        case ',':                     scene_adjust_freq(-0.1f); break;
-        case 'd':                     g_show_phase_panel = !g_show_phase_panel; break;
-        case 'D':                     g_show_arm_table   = !g_show_arm_table;   break;
-        case 'r': case 'R':           scene_reset(); break;
-        default: break;
-    }
-    return false;
+static bool app_handle_key(int ch) {
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return true;
+  case ' ':
+    g_simulation_paused = !g_simulation_paused;
+    break;
+  case 'a':
+  case 'A':
+    g_auto_sweep_enabled = !g_auto_sweep_enabled;
+    break;
+  case '+':
+  case '=':
+    scene_adjust_freq(+1.0f);
+    break;
+  case '-':
+    scene_adjust_freq(-1.0f);
+    break;
+  case '.':
+    scene_adjust_freq(+0.1f);
+    break;
+  case ',':
+    scene_adjust_freq(-0.1f);
+    break;
+  case 'd':
+    g_show_phase_panel = !g_show_phase_panel;
+    break;
+  case 'D':
+    g_show_arm_table = !g_show_arm_table;
+    break;
+  case 'r':
+  case 'R':
+    scene_reset();
+    break;
+  default:
+    break;
+  }
+  return false;
 }
 
-int main(void)
-{
-    atexit(cleanup_screen);
-    signal(SIGINT,   on_signal);
-    signal(SIGTERM,  on_signal);
-    signal(SIGWINCH, on_signal);
+int main(void) {
+  atexit(cleanup_screen);
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGWINCH, on_signal);
 
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    colors_init();
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  colors_init();
 
-    scene_reset();
+  scene_reset();
 
-    long long next_frame_ns = clock_now_ns();
+  long long next_frame_ns = clock_now_ns();
 
-    while (!g_should_quit) {
-        if (g_resize_pending) {
-            g_resize_pending = 0;
-            endwin();
-            refresh();
-        }
-
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (app_handle_key(ch)) { g_should_quit = 1; break; }
-        }
-
-        long long now = clock_now_ns();
-        if (now >= next_frame_ns) {
-            scene_tick();
-            render_frame();
-            next_frame_ns += RENDER_TICK_NS;
-            /* Snap forward if we fell badly behind (e.g. terminal hidden). */
-            if (clock_now_ns() > next_frame_ns + 5 * RENDER_TICK_NS)
-                next_frame_ns = clock_now_ns() + RENDER_TICK_NS;
-        } else {
-            clock_sleep_ns(next_frame_ns - now);
-        }
+  while (!g_should_quit) {
+    if (g_resize_pending) {
+      g_resize_pending = 0;
+      endwin();
+      refresh();
     }
 
-    return 0;
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (app_handle_key(ch)) {
+        g_should_quit = 1;
+        break;
+      }
+    }
+
+    long long now = clock_now_ns();
+    if (now >= next_frame_ns) {
+      scene_tick();
+      render_frame();
+      next_frame_ns += RENDER_TICK_NS;
+      /* Snap forward if we fell badly behind (e.g. terminal hidden). */
+      if (clock_now_ns() > next_frame_ns + 5 * RENDER_TICK_NS)
+        next_frame_ns = clock_now_ns() + RENDER_TICK_NS;
+    } else {
+      clock_sleep_ns(next_frame_ns - now);
+    }
+  }
+
+  return 0;
 }

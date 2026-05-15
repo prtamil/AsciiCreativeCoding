@@ -163,12 +163,11 @@
  *     for Procedural Fluid Flow", *ACM TOG* 26(3) (SIGGRAPH).
  *     The paper that introduced this technique. It also shows how
  *     to extend to 3-D and how to enforce no-flow boundaries.
- *   • Wikipedia — [Stream function](https://en.wikipedia.org/wiki/Stream_function).
- *     The 2-D equivalent: any scalar function ψ defines a
- *     divergence-free velocity field via (∂ψ/∂y, −∂ψ/∂x). curl-
- *     noise is exactly this with ψ = fBm.
- *   • Iñigo Quílez — "Domain warping" / curl noise tutorials,
- *     https://iquilezles.org/articles/warp/.
+ *   • Wikipedia — [Stream
+ * function](https://en.wikipedia.org/wiki/Stream_function). The 2-D equivalent:
+ * any scalar function ψ defines a divergence-free velocity field via (∂ψ/∂y,
+ * −∂ψ/∂x). curl- noise is exactly this with ψ = fBm. • Iñigo Quílez — "Domain
+ * warping" / curl noise tutorials, https://iquilezles.org/articles/warp/.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -614,60 +613,64 @@
 /* ===================================================================== */
 
 enum {
-    SIM_FPS_MIN      =  10,
-    SIM_FPS_DEFAULT  =  60,
-    SIM_FPS_MAX      = 120,
-    SIM_FPS_STEP     =  10,
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 60,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
 
-    SPEED_MIN        =   1,
-    SPEED_DEF        =   8,
-    SPEED_MAX        =  64,
+  SPEED_MIN = 1,
+  SPEED_DEF = 8,
+  SPEED_MAX = 64,
 
-    MAX_PARTICLES    =  600,
-    TRAIL_LEN        =    4,
+  MAX_PARTICLES = 600,
+  TRAIL_LEN = 4,
 
-    HUD_COLS         =  80,
-    FPS_UPDATE_MS    = 500,
+  HUD_COLS = 80,
+  FPS_UPDATE_MS = 500,
 
-    /* Color pair indices. PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
-    PAIR_HUD         =   1,
-    PAIR_HINT        =   2,
-    PAIR_RAMP_BASE   =   3,    /* +0..+7 = 8 speed-magnitude tints    */
-    PAIR_SKY         =  11,
+  /* Color pair indices. PAIR_HUD/PAIR_HINT reserved per CLAUDE.md. */
+  PAIR_HUD = 1,
+  PAIR_HINT = 2,
+  PAIR_RAMP_BASE = 3, /* +0..+7 = 8 speed-magnitude tints    */
+  PAIR_SKY = 11,
 };
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(f)      (NS_PER_SEC / (f))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
 
-#define ASPECT_Y          2.0f       /* terminal cells 2× taller       */
+#define ASPECT_Y 2.0f /* terminal cells 2× taller       */
 
 /* Curl finite-difference step (physical units). */
-#define CURL_H            0.5f
+#define CURL_H 0.5f
 
 /* Speed → ramp slot reference (cells/sec). With sqrt mapping below,
  * a particle at exactly SPEED_REF c/s renders in slot 7 (brightest).
  * Lower → slow particles look brighter. */
-#define SPEED_REF        25.0f
+#define SPEED_REF 25.0f
 
 /* Pattern enum. */
 typedef enum {
-    PATTERN_CALM        = 0,
-    PATTERN_TURBULENT   = 1,
-    PATTERN_HURRICANE   = 2,
-    PATTERN_WIND_TUNNEL = 3,
-    N_PATTERNS          = 4,
+  PATTERN_CALM = 0,
+  PATTERN_TURBULENT = 1,
+  PATTERN_HURRICANE = 2,
+  PATTERN_WIND_TUNNEL = 3,
+  N_PATTERNS = 4,
 } Pattern;
 
-static const char *pattern_name(Pattern p)
-{
-    switch (p) {
-    case PATTERN_CALM:        return "CALM       ";
-    case PATTERN_TURBULENT:   return "TURBULENT  ";
-    case PATTERN_HURRICANE:   return "HURRICANE  ";
-    case PATTERN_WIND_TUNNEL: return "WIND_TUNNEL";
-    default:                  return "?          ";
-    }
+static const char *pattern_name(Pattern p) {
+  switch (p) {
+  case PATTERN_CALM:
+    return "CALM       ";
+  case PATTERN_TURBULENT:
+    return "TURBULENT  ";
+  case PATTERN_HURRICANE:
+    return "HURRICANE  ";
+  case PATTERN_WIND_TUNNEL:
+    return "WIND_TUNNEL";
+  default:
+    return "?          ";
+  }
 }
 
 /*
@@ -683,14 +686,14 @@ static const char *pattern_name(Pattern p)
  *   wind_bias      : added horizontal velocity (cells/sec)
  */
 typedef struct {
-    int   target_count;
-    int   fbm_octaves;
-    float fbm_freq;
-    float field_mag;
-    float time_drift_x;
-    float time_drift_y;
-    float global_rot;
-    float wind_bias;
+  int target_count;
+  int fbm_octaves;
+  float fbm_freq;
+  float field_mag;
+  float time_drift_x;
+  float time_drift_y;
+  float global_rot;
+  float wind_bias;
 } PatternParams;
 
 /*
@@ -703,10 +706,10 @@ typedef struct {
  */
 static const PatternParams pattern_params[N_PATTERNS] = {
     /*                  cnt  oct   freq    mag     tdx    tdy    rot    wind */
-    /* CALM         */ { 280,  2,  0.025f,  800.0f, 0.30f, 0.20f, 0.00f,  0.0f },
-    /* TURBULENT    */ { 450,  4,  0.060f, 1100.0f, 0.80f, 0.50f, 0.00f,  0.0f },
-    /* HURRICANE    */ { 380,  2,  0.020f,  500.0f, 0.30f, 0.20f, 0.40f,  0.0f },
-    /* WIND_TUNNEL  */ { 380,  3,  0.045f,  600.0f, 0.50f, 0.30f, 0.00f, 18.0f },
+    /* CALM         */ {280, 2, 0.025f, 800.0f, 0.30f, 0.20f, 0.00f, 0.0f},
+    /* TURBULENT    */ {450, 4, 0.060f, 1100.0f, 0.80f, 0.50f, 0.00f, 0.0f},
+    /* HURRICANE    */ {380, 2, 0.020f, 500.0f, 0.30f, 0.20f, 0.40f, 0.0f},
+    /* WIND_TUNNEL  */ {380, 3, 0.045f, 600.0f, 0.50f, 0.30f, 0.00f, 18.0f},
 };
 
 /*
@@ -718,9 +721,9 @@ static const PatternParams pattern_params[N_PATTERNS] = {
  * CLAUDE.md "Theme Palette Brightness" rule.
  */
 typedef struct {
-    const char *name;
-    short       ramp[8];   /* slow → fast */
-    short       sky;
+  const char *name;
+  short ramp[8]; /* slow → fast */
+  short sky;
 } Theme;
 
 #define N_THEMES 10
@@ -728,70 +731,68 @@ typedef struct {
 static const Theme themes[N_THEMES] = {
     /* name         ramp[0..7]  (slow → fast)                          sky */
 
-    { "DEFAULT",   {  24,  31,  38,  45,  87, 117, 153, 195 },          234 },
-    { "TROPICAL",  {  29,  35,  37,  44,  50,  86, 122, 159 },          234 },
-    { "FIRE",      {  88, 124, 130, 166, 196, 208, 214, 226 },          233 },
-    { "AURORA",    {  43,  79, 115, 121, 157, 195, 230, 231 },          234 },
-    { "VIOLET",    {  53,  91, 134, 165, 207, 213, 219, 225 },          234 },
-    { "ICE",       {  24,  31,  67, 110, 117, 153, 195, 231 },          235 },
-    { "NEON",      { 199, 213, 207, 219, 225, 231, 195, 153 },          234 },
-    { "COPPER",    { 130, 137, 173, 179, 215, 222, 229, 230 },          234 },
-    { "MONO",      { 240, 243, 245, 247, 249, 251, 253, 255 },          232 },
-    { "INFRARED",  {  17,  21,  39,  46, 154, 226, 208, 196 },          233 },
+    {"DEFAULT", {24, 31, 38, 45, 87, 117, 153, 195}, 234},
+    {"TROPICAL", {29, 35, 37, 44, 50, 86, 122, 159}, 234},
+    {"FIRE", {88, 124, 130, 166, 196, 208, 214, 226}, 233},
+    {"AURORA", {43, 79, 115, 121, 157, 195, 230, 231}, 234},
+    {"VIOLET", {53, 91, 134, 165, 207, 213, 219, 225}, 234},
+    {"ICE", {24, 31, 67, 110, 117, 153, 195, 231}, 235},
+    {"NEON", {199, 213, 207, 219, 225, 231, 195, 153}, 234},
+    {"COPPER", {130, 137, 173, 179, 215, 222, 229, 230}, 234},
+    {"MONO", {240, 243, 245, 247, 249, 251, 253, 255}, 232},
+    {"INFRARED", {17, 21, 39, 46, 154, 226, 208, 196}, 233},
 };
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ===================================================================== */
 /* §3  color                                                              */
 /* ===================================================================== */
 
-static void theme_apply(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &themes[idx];
-        for (int i = 0; i < 8; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], -1);
-        init_pair(PAIR_SKY, t->sky, -1);
-    } else {
-        for (int i = 0; i < 8; i++)
-            init_pair((short)(PAIR_RAMP_BASE + i), COLOR_CYAN, -1);
-        init_pair(PAIR_SKY, COLOR_BLACK, -1);
-    }
+static void theme_apply(int idx) {
+  if (idx < 0 || idx >= N_THEMES)
+    idx = 0;
+  if (COLORS >= 256) {
+    const Theme *t = &themes[idx];
+    for (int i = 0; i < 8; i++)
+      init_pair((short)(PAIR_RAMP_BASE + i), t->ramp[i], -1);
+    init_pair(PAIR_SKY, t->sky, -1);
+  } else {
+    for (int i = 0; i < 8; i++)
+      init_pair((short)(PAIR_RAMP_BASE + i), COLOR_CYAN, -1);
+    init_pair(PAIR_SKY, COLOR_BLACK, -1);
+  }
 }
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,  226, -1);
-        init_pair(PAIR_HINT,  51, -1);
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
-    theme_apply(0);
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(PAIR_HUD, 226, -1);
+    init_pair(PAIR_HINT, 51, -1);
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
+  theme_apply(0);
 }
 
 /* ===================================================================== */
@@ -828,15 +829,18 @@ static void color_init(void)
  * physics dependency, never persists across runs.
  */
 typedef enum {
-    DBG_NORMAL     = 0,
-    DBG_VELOCITY   = 1,
-    DBG_HEATMAP    = 2,
-    DBG_DIVERGENCE = 3,
-    DBG_COUNT      = 4,
+  DBG_NORMAL = 0,
+  DBG_VELOCITY = 1,
+  DBG_HEATMAP = 2,
+  DBG_DIVERGENCE = 3,
+  DBG_COUNT = 4,
 } DebugMode;
 
 static const char *const k_debug_names[DBG_COUNT] = {
-    "normal", "velocity", "heatmap", "divergence",
+    "normal",
+    "velocity",
+    "heatmap",
+    "divergence",
 };
 
 static DebugMode g_debug = DBG_NORMAL;
@@ -848,14 +852,15 @@ static DebugMode g_debug = DBG_NORMAL;
  * coords so the diagonals look rotated relative to math convention.
  * Returns '.' for zero velocity.
  */
-static char dir_char(float vx, float vy)
-{
-    static const char k_dirs[8] = { '>', '\\', 'v', '/', '<', '\\', '^', '/' };
-    if (vx == 0.0f && vy == 0.0f) return '.';
-    float a = atan2f(vy, vx);
-    if (a < 0.0f) a += 2.0f * (float)M_PI;
-    int idx = (int)((a + (float)M_PI / 8.0f) / ((float)M_PI / 4.0f)) & 7;
-    return k_dirs[idx];
+static char dir_char(float vx, float vy) {
+  static const char k_dirs[8] = {'>', '\\', 'v', '/', '<', '\\', '^', '/'};
+  if (vx == 0.0f && vy == 0.0f)
+    return '.';
+  float a = atan2f(vy, vx);
+  if (a < 0.0f)
+    a += 2.0f * (float)M_PI;
+  int idx = (int)((a + (float)M_PI / 8.0f) / ((float)M_PI / 4.0f)) & 7;
+  return k_dirs[idx];
 }
 
 /* ===================================================================== */
@@ -891,30 +896,35 @@ static char dir_char(float vx, float vy)
 
 static uint8_t perm[512];
 
-static void perm_shuffle(int seed)
-{
-    uint8_t base[256];
-    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
-    uint32_t st = (uint32_t)seed * 2654435761u;
-    for (int i = 255; i > 0; i--) {
-        st = st * 1664525u + 1013904223u;
-        int j = (int)(st >> 16) % (i + 1);
-        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
-    }
-    for (int i = 0; i < 256; i++) {
-        perm[i      ] = base[i];
-        perm[i + 256] = base[i];
-    }
+static void perm_shuffle(int seed) {
+  uint8_t base[256];
+  for (int i = 0; i < 256; i++)
+    base[i] = (uint8_t)i;
+  uint32_t st = (uint32_t)seed * 2654435761u;
+  for (int i = 255; i > 0; i--) {
+    st = st * 1664525u + 1013904223u;
+    int j = (int)(st >> 16) % (i + 1);
+    uint8_t t = base[i];
+    base[i] = base[j];
+    base[j] = t;
+  }
+  for (int i = 0; i < 256; i++) {
+    perm[i] = base[i];
+    perm[i + 256] = base[i];
+  }
 }
 
-static inline float fade_q(float t) { return t*t*t*(t*(t*6.f-15.f)+10.f); }
-static inline float lerp_f(float a, float b, float t) { return a + t * (b - a); }
-static inline float grad2(int hash, float x, float y)
-{
-    int h = hash & 7;
-    float u = (h < 4) ? x : y;
-    float v = (h < 4) ? y : x;
-    return ((h & 1) ? -u : u) + ((h & 2) ? -2.0f * v : 2.0f * v);
+static inline float fade_q(float t) {
+  return t * t * t * (t * (t * 6.f - 15.f) + 10.f);
+}
+static inline float lerp_f(float a, float b, float t) {
+  return a + t * (b - a);
+}
+static inline float grad2(int hash, float x, float y) {
+  int h = hash & 7;
+  float u = (h < 4) ? x : y;
+  float v = (h < 4) ? y : x;
+  return ((h & 1) ? -u : u) + ((h & 2) ? -2.0f * v : 2.0f * v);
 }
 
 /*
@@ -957,19 +967,19 @@ static inline float grad2(int hash, float x, float y)
  *   Self-contained-file rule.  Also pedagogical: a reader sees the
  *   ENTIRE algorithm in 14 lines.  No black-box noise function.
  */
-static float perlin2d(float x, float y)
-{
-    int X = (int)floorf(x) & 255;
-    int Y = (int)floorf(y) & 255;
-    x -= floorf(x); y -= floorf(y);
-    float u = fade_q(x), v = fade_q(y);
-    int A = perm[X    ] + Y;
-    int B = perm[X + 1] + Y;
-    float n00 = grad2(perm[A    ], x,        y       );
-    float n10 = grad2(perm[B    ], x - 1.0f, y       );
-    float n01 = grad2(perm[A + 1], x,        y - 1.0f);
-    float n11 = grad2(perm[B + 1], x - 1.0f, y - 1.0f);
-    return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
+static float perlin2d(float x, float y) {
+  int X = (int)floorf(x) & 255;
+  int Y = (int)floorf(y) & 255;
+  x -= floorf(x);
+  y -= floorf(y);
+  float u = fade_q(x), v = fade_q(y);
+  int A = perm[X] + Y;
+  int B = perm[X + 1] + Y;
+  float n00 = grad2(perm[A], x, y);
+  float n10 = grad2(perm[B], x - 1.0f, y);
+  float n01 = grad2(perm[A + 1], x, y - 1.0f);
+  float n11 = grad2(perm[B + 1], x - 1.0f, y - 1.0f);
+  return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
 }
 
 /*
@@ -1015,16 +1025,15 @@ static float perlin2d(float x, float y)
  *   that read as "fluid" instead of "abstract grid pattern".
  */
 /* fBm with N octaves. Returns roughly [-0.5, 0.5]. */
-static float fbm2(float x, float y, int octaves)
-{
-    float total = 0, amp = 1, freq = 1, max_amp = 0;
-    for (int o = 0; o < octaves; o++) {
-        total += amp * perlin2d(x * freq, y * freq);
-        max_amp += amp;
-        amp  *= 0.5f;
-        freq *= 2.0f;
-    }
-    return (total / max_amp) * 0.5f + 0.0f;
+static float fbm2(float x, float y, int octaves) {
+  float total = 0, amp = 1, freq = 1, max_amp = 0;
+  for (int o = 0; o < octaves; o++) {
+    total += amp * perlin2d(x * freq, y * freq);
+    max_amp += amp;
+    amp *= 0.5f;
+    freq *= 2.0f;
+  }
+  return (total / max_amp) * 0.5f + 0.0f;
 }
 
 /* ===================================================================== */
@@ -1125,43 +1134,42 @@ static float fbm2(float x, float y, int octaves)
  *   keeps the algorithm in one place with one set of constants.
  */
 static void curl_velocity_at(float px_phys, float py_phys, float t,
-                             const PatternParams *pp,
-                             float screen_cx_phys, float screen_cy_phys,
-                             float *out_vx_phys, float *out_vy_phys)
-{
-    float k = pp->fbm_freq;
-    float tx = t * pp->time_drift_x;
-    float ty = t * pp->time_drift_y;
+                             const PatternParams *pp, float screen_cx_phys,
+                             float screen_cy_phys, float *out_vx_phys,
+                             float *out_vy_phys) {
+  float k = pp->fbm_freq;
+  float tx = t * pp->time_drift_x;
+  float ty = t * pp->time_drift_y;
 
-    float n_xp = fbm2((px_phys + CURL_H) * k + tx, py_phys * k + ty,
-                     pp->fbm_octaves);
-    float n_xm = fbm2((px_phys - CURL_H) * k + tx, py_phys * k + ty,
-                     pp->fbm_octaves);
-    float n_yp = fbm2(px_phys * k + tx, (py_phys + CURL_H) * k + ty,
-                     pp->fbm_octaves);
-    float n_ym = fbm2(px_phys * k + tx, (py_phys - CURL_H) * k + ty,
-                     pp->fbm_octaves);
+  float n_xp =
+      fbm2((px_phys + CURL_H) * k + tx, py_phys * k + ty, pp->fbm_octaves);
+  float n_xm =
+      fbm2((px_phys - CURL_H) * k + tx, py_phys * k + ty, pp->fbm_octaves);
+  float n_yp =
+      fbm2(px_phys * k + tx, (py_phys + CURL_H) * k + ty, pp->fbm_octaves);
+  float n_ym =
+      fbm2(px_phys * k + tx, (py_phys - CURL_H) * k + ty, pp->fbm_octaves);
 
-    float dN_dx = (n_xp - n_xm) / (2.0f * CURL_H);
-    float dN_dy = (n_yp - n_ym) / (2.0f * CURL_H);
+  float dN_dx = (n_xp - n_xm) / (2.0f * CURL_H);
+  float dN_dy = (n_yp - n_ym) / (2.0f * CURL_H);
 
-    float vx =  dN_dy * pp->field_mag;
-    float vy = -dN_dx * pp->field_mag;
+  float vx = dN_dy * pp->field_mag;
+  float vy = -dN_dx * pp->field_mag;
 
-    /* HURRICANE: global rotation around screen centre. */
-    if (pp->global_rot > 0.0f) {
-        float dx = px_phys - screen_cx_phys;
-        float dy = py_phys - screen_cy_phys;
-        vx += -dy * pp->global_rot;
-        vy +=  dx * pp->global_rot;
-    }
-    /* WIND_TUNNEL: constant +x bias. */
-    if (pp->wind_bias != 0.0f) {
-        vx += pp->wind_bias;
-    }
+  /* HURRICANE: global rotation around screen centre. */
+  if (pp->global_rot > 0.0f) {
+    float dx = px_phys - screen_cx_phys;
+    float dy = py_phys - screen_cy_phys;
+    vx += -dy * pp->global_rot;
+    vy += dx * pp->global_rot;
+  }
+  /* WIND_TUNNEL: constant +x bias. */
+  if (pp->wind_bias != 0.0f) {
+    vx += pp->wind_bias;
+  }
 
-    *out_vx_phys = vx;
-    *out_vy_phys = vy;
+  *out_vx_phys = vx;
+  *out_vy_phys = vy;
 }
 
 /* ===================================================================== */
@@ -1169,23 +1177,21 @@ static void curl_velocity_at(float px_phys, float py_phys, float t,
 /* ===================================================================== */
 
 typedef struct {
-    float px, py;        /* current cell-space position                 */
-    float trail_x[TRAIL_LEN];
-    float trail_y[TRAIL_LEN];
-    int   trail_head;
-    int   trail_count;
-    bool  active;
+  float px, py; /* current cell-space position                 */
+  float trail_x[TRAIL_LEN];
+  float trail_y[TRAIL_LEN];
+  int trail_head;
+  int trail_count;
+  bool active;
 } Particle;
 
 /* Cheap LCG. */
-static inline uint32_t lcg_next(uint32_t *st)
-{
-    *st = *st * 1664525u + 1013904223u;
-    return *st;
+static inline uint32_t lcg_next(uint32_t *st) {
+  *st = *st * 1664525u + 1013904223u;
+  return *st;
 }
-static inline float lcg_unit(uint32_t *st)
-{
-    return (float)(lcg_next(st) >> 8) / (float)(1u << 24);
+static inline float lcg_unit(uint32_t *st) {
+  return (float)(lcg_next(st) >> 8) / (float)(1u << 24);
 }
 
 /* ===================================================================== */
@@ -1214,93 +1220,91 @@ static inline float lcg_unit(uint32_t *st)
  */
 
 typedef struct {
-    bool      paused;
-    int       speed;
-    int       current_theme;
-    Pattern   current_pattern;
-    uint32_t  rng;
-    int       rows, cols;
+  bool paused;
+  int speed;
+  int current_theme;
+  Pattern current_pattern;
+  uint32_t rng;
+  int rows, cols;
 
-    float     time_accum;       /* drives noise time evolution         */
+  float time_accum; /* drives noise time evolution         */
 
-    Particle  particles[MAX_PARTICLES];
+  Particle particles[MAX_PARTICLES];
 } Scene;
 
-static void scene_clear_particles(Scene *s)
-{
-    for (int i = 0; i < MAX_PARTICLES; i++) s->particles[i].active = false;
+static void scene_clear_particles(Scene *s) {
+  for (int i = 0; i < MAX_PARTICLES; i++)
+    s->particles[i].active = false;
 }
 
-static void scene_spawn_particle(Scene *s, int idx)
-{
-    Particle *p = &s->particles[idx];
-    p->px = lcg_unit(&s->rng) * (float)s->cols;
-    p->py = lcg_unit(&s->rng) * (float)(s->rows - 1);
-    p->trail_head  = 0;
-    p->trail_count = 0;
-    /* Pre-fill trail with current position. */
-    for (int k = 0; k < TRAIL_LEN; k++) {
-        p->trail_x[k] = p->px;
-        p->trail_y[k] = p->py;
+static void scene_spawn_particle(Scene *s, int idx) {
+  Particle *p = &s->particles[idx];
+  p->px = lcg_unit(&s->rng) * (float)s->cols;
+  p->py = lcg_unit(&s->rng) * (float)(s->rows - 1);
+  p->trail_head = 0;
+  p->trail_count = 0;
+  /* Pre-fill trail with current position. */
+  for (int k = 0; k < TRAIL_LEN; k++) {
+    p->trail_x[k] = p->px;
+    p->trail_y[k] = p->py;
+  }
+  p->active = true;
+}
+
+static void scene_populate_to_target(Scene *s) {
+  const PatternParams *pp = &pattern_params[s->current_pattern];
+  int target = pp->target_count;
+  if (target > MAX_PARTICLES)
+    target = MAX_PARTICLES;
+  int active = 0;
+  for (int i = 0; i < MAX_PARTICLES; i++)
+    if (s->particles[i].active)
+      active++;
+  /* Spawn shortfall in first inactive slots. */
+  int spawned = 0;
+  for (int i = 0; i < MAX_PARTICLES && spawned < target - active; i++) {
+    if (!s->particles[i].active) {
+      scene_spawn_particle(s, i);
+      spawned++;
     }
-    p->active = true;
-}
-
-static void scene_populate_to_target(Scene *s)
-{
-    const PatternParams *pp = &pattern_params[s->current_pattern];
-    int target = pp->target_count;
-    if (target > MAX_PARTICLES) target = MAX_PARTICLES;
-    int active = 0;
-    for (int i = 0; i < MAX_PARTICLES; i++) if (s->particles[i].active) active++;
-    /* Spawn shortfall in first inactive slots. */
-    int spawned = 0;
-    for (int i = 0; i < MAX_PARTICLES && spawned < target - active; i++) {
-        if (!s->particles[i].active) {
-            scene_spawn_particle(s, i);
-            spawned++;
-        }
+  }
+  /* Deactivate surplus from end of pool. */
+  if (active > target) {
+    int to_remove = active - target;
+    for (int i = MAX_PARTICLES - 1; i >= 0 && to_remove > 0; i--) {
+      if (s->particles[i].active) {
+        s->particles[i].active = false;
+        to_remove--;
+      }
     }
-    /* Deactivate surplus from end of pool. */
-    if (active > target) {
-        int to_remove = active - target;
-        for (int i = MAX_PARTICLES - 1; i >= 0 && to_remove > 0; i--) {
-            if (s->particles[i].active) {
-                s->particles[i].active = false;
-                to_remove--;
-            }
-        }
-    }
+  }
 }
 
-static void scene_init(Scene *s, int cols, int rows)
-{
-    memset(s, 0, sizeof *s);
-    s->paused          = false;
-    s->speed           = SPEED_DEF;
-    s->current_theme   = 0;
-    s->current_pattern = PATTERN_CALM;
-    s->rng             = (uint32_t)clock_ns();
-    s->cols            = cols;
-    s->rows            = rows;
-    s->time_accum      = 0.0f;
-    perm_shuffle((int)(s->rng & 0xFFFF));
-    scene_clear_particles(s);
-    scene_populate_to_target(s);
+static void scene_init(Scene *s, int cols, int rows) {
+  memset(s, 0, sizeof *s);
+  s->paused = false;
+  s->speed = SPEED_DEF;
+  s->current_theme = 0;
+  s->current_pattern = PATTERN_CALM;
+  s->rng = (uint32_t)clock_ns();
+  s->cols = cols;
+  s->rows = rows;
+  s->time_accum = 0.0f;
+  perm_shuffle((int)(s->rng & 0xFFFF));
+  scene_clear_particles(s);
+  scene_populate_to_target(s);
 }
 
-static void scene_resize(Scene *s, int cols, int rows)
-{
-    s->cols = cols;
-    s->rows = rows;
+static void scene_resize(Scene *s, int cols, int rows) {
+  s->cols = cols;
+  s->rows = rows;
 }
 
-static void scene_reseed(Scene *s)
-{
-    s->rng = (uint32_t)clock_ns() ^ 0xC0FFEEu;
-    perm_shuffle((int)(s->rng & 0xFFFF));
-    scene_clear_particles(s);
-    scene_populate_to_target(s);
+static void scene_reseed(Scene *s) {
+  s->rng = (uint32_t)clock_ns() ^ 0xC0FFEEu;
+  perm_shuffle((int)(s->rng & 0xFFFF));
+  scene_clear_particles(s);
+  scene_populate_to_target(s);
 }
 
 /*
@@ -1360,52 +1364,57 @@ static void scene_reseed(Scene *s)
  *   A future test harness or batch-render tool can drive the same
  *   Scene without dragging in ncurses or signal handlers.
  */
-static void scene_tick(Scene *s, float dt)
-{
-    if (s->paused) return;
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    dt *= speed_mul;
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
+  float speed_mul = (float)s->speed / (float)SPEED_DEF;
+  dt *= speed_mul;
 
-    s->time_accum += dt;
+  s->time_accum += dt;
 
-    const PatternParams *pp = &pattern_params[s->current_pattern];
+  const PatternParams *pp = &pattern_params[s->current_pattern];
 
-    int rows_eff = s->rows - 1;
-    float screen_cx_phys = (float)s->cols * 0.5f;
-    float screen_cy_phys = (float)rows_eff * 0.5f * ASPECT_Y;
+  int rows_eff = s->rows - 1;
+  float screen_cx_phys = (float)s->cols * 0.5f;
+  float screen_cy_phys = (float)rows_eff * 0.5f * ASPECT_Y;
 
-    for (int i = 0; i < MAX_PARTICLES; i++) {
-        Particle *p = &s->particles[i];
-        if (!p->active) continue;
+  for (int i = 0; i < MAX_PARTICLES; i++) {
+    Particle *p = &s->particles[i];
+    if (!p->active)
+      continue;
 
-        /* Convert cell position → physical position for noise sampling. */
-        float px_phys = p->px;
-        float py_phys = p->py * ASPECT_Y;
+    /* Convert cell position → physical position for noise sampling. */
+    float px_phys = p->px;
+    float py_phys = p->py * ASPECT_Y;
 
-        float vx_phys, vy_phys;
-        curl_velocity_at(px_phys, py_phys, s->time_accum, pp,
-                         screen_cx_phys, screen_cy_phys,
-                         &vx_phys, &vy_phys);
+    float vx_phys, vy_phys;
+    curl_velocity_at(px_phys, py_phys, s->time_accum, pp, screen_cx_phys,
+                     screen_cy_phys, &vx_phys, &vy_phys);
 
-        /* Convert physical velocity back to cell-space. */
-        float vx_cell = vx_phys;
-        float vy_cell = vy_phys / ASPECT_Y;
+    /* Convert physical velocity back to cell-space. */
+    float vx_cell = vx_phys;
+    float vy_cell = vy_phys / ASPECT_Y;
 
-        p->px += vx_cell * dt;
-        p->py += vy_cell * dt;
+    p->px += vx_cell * dt;
+    p->py += vy_cell * dt;
 
-        /* Toroidal wrap. */
-        while (p->px < 0.0f)              p->px += (float)s->cols;
-        while (p->px >= (float)s->cols)   p->px -= (float)s->cols;
-        while (p->py < 0.0f)              p->py += (float)rows_eff;
-        while (p->py >= (float)rows_eff)  p->py -= (float)rows_eff;
+    /* Toroidal wrap. */
+    while (p->px < 0.0f)
+      p->px += (float)s->cols;
+    while (p->px >= (float)s->cols)
+      p->px -= (float)s->cols;
+    while (p->py < 0.0f)
+      p->py += (float)rows_eff;
+    while (p->py >= (float)rows_eff)
+      p->py -= (float)rows_eff;
 
-        /* Push trail. */
-        p->trail_head = (p->trail_head + 1) % TRAIL_LEN;
-        p->trail_x[p->trail_head] = p->px;
-        p->trail_y[p->trail_head] = p->py;
-        if (p->trail_count < TRAIL_LEN) p->trail_count++;
-    }
+    /* Push trail. */
+    p->trail_head = (p->trail_head + 1) % TRAIL_LEN;
+    p->trail_x[p->trail_head] = p->px;
+    p->trail_y[p->trail_head] = p->py;
+    if (p->trail_count < TRAIL_LEN)
+      p->trail_count++;
+  }
 }
 
 /*
@@ -1481,35 +1490,37 @@ static void scene_tick(Scene *s, float dt)
  * derived FROM.  Particles flow along level sets (contour lines) of
  * this field.
  */
-static void bg_heatmap_draw(const Scene *s)
-{
-    int rows_eff = s->rows - 1;
-    const PatternParams *pp = &pattern_params[s->current_pattern];
-    float k  = pp->fbm_freq;
-    float tx = s->time_accum * pp->time_drift_x;
-    float ty = s->time_accum * pp->time_drift_y;
+static void bg_heatmap_draw(const Scene *s) {
+  int rows_eff = s->rows - 1;
+  const PatternParams *pp = &pattern_params[s->current_pattern];
+  float k = pp->fbm_freq;
+  float tx = s->time_accum * pp->time_drift_x;
+  float ty = s->time_accum * pp->time_drift_y;
 
-    for (int row = 0; row < rows_eff; row++) {
-        for (int col = 0; col < s->cols; col++) {
-            float px_phys = (float)col;
-            float py_phys = (float)row * ASPECT_Y;
-            float v = fbm2(px_phys * k + tx, py_phys * k + ty,
-                           pp->fbm_octaves);
-            float f = v + 0.5f;                      /* map [-0.5,+0.5] → [0,1] */
-            if (f < 0.0f) f = 0.0f;
-            if (f > 1.0f) f = 1.0f;
-            int slot = (int)(f * 7.999f);
+  for (int row = 0; row < rows_eff; row++) {
+    for (int col = 0; col < s->cols; col++) {
+      float px_phys = (float)col;
+      float py_phys = (float)row * ASPECT_Y;
+      float v = fbm2(px_phys * k + tx, py_phys * k + ty, pp->fbm_octaves);
+      float f = v + 0.5f; /* map [-0.5,+0.5] → [0,1] */
+      if (f < 0.0f)
+        f = 0.0f;
+      if (f > 1.0f)
+        f = 1.0f;
+      int slot = (int)(f * 7.999f);
 
-            char glyph = (slot >= 6) ? '#' :
-                         (slot >= 4) ? '+' :
-                         (slot >= 2) ? '.' : ' ';
-            if (glyph == ' ') continue;
-            int pair = PAIR_RAMP_BASE + slot;
-            attron(COLOR_PAIR(pair));
-            mvaddch(row, col, (chtype)(unsigned char)glyph);
-            attroff(COLOR_PAIR(pair));
-        }
+      char glyph = (slot >= 6)   ? '#'
+                   : (slot >= 4) ? '+'
+                   : (slot >= 2) ? '.'
+                                 : ' ';
+      if (glyph == ' ')
+        continue;
+      int pair = PAIR_RAMP_BASE + slot;
+      attron(COLOR_PAIR(pair));
+      mvaddch(row, col, (chtype)(unsigned char)glyph);
+      attroff(COLOR_PAIR(pair));
     }
+  }
 }
 
 /*
@@ -1529,158 +1540,168 @@ static void bg_heatmap_draw(const Scene *s)
  * divergence-free, and SEE where the numerical curl breaks down
  * (high-curvature regions of the noise field).
  */
-static void bg_divergence_draw(const Scene *s)
-{
-    int rows_eff = s->rows - 1;
-    const PatternParams *pp = &pattern_params[s->current_pattern];
-    float screen_cx_phys = (float)s->cols * 0.5f;
-    float screen_cy_phys = (float)rows_eff * 0.5f * ASPECT_Y;
+static void bg_divergence_draw(const Scene *s) {
+  int rows_eff = s->rows - 1;
+  const PatternParams *pp = &pattern_params[s->current_pattern];
+  float screen_cx_phys = (float)s->cols * 0.5f;
+  float screen_cy_phys = (float)rows_eff * 0.5f * ASPECT_Y;
 
-    for (int row = 0; row < rows_eff; row += 2) {
-        for (int col = 0; col < s->cols; col += 2) {
-            float px_phys = (float)col;
-            float py_phys = (float)row * ASPECT_Y;
+  for (int row = 0; row < rows_eff; row += 2) {
+    for (int col = 0; col < s->cols; col += 2) {
+      float px_phys = (float)col;
+      float py_phys = (float)row * ASPECT_Y;
 
-            float vx_xp, vy_xp, vx_xm, vy_xm, vx_yp, vy_yp, vx_ym, vy_ym;
-            curl_velocity_at(px_phys + CURL_H, py_phys, s->time_accum, pp,
-                             screen_cx_phys, screen_cy_phys, &vx_xp, &vy_xp);
-            curl_velocity_at(px_phys - CURL_H, py_phys, s->time_accum, pp,
-                             screen_cx_phys, screen_cy_phys, &vx_xm, &vy_xm);
-            curl_velocity_at(px_phys, py_phys + CURL_H, s->time_accum, pp,
-                             screen_cx_phys, screen_cy_phys, &vx_yp, &vy_yp);
-            curl_velocity_at(px_phys, py_phys - CURL_H, s->time_accum, pp,
-                             screen_cx_phys, screen_cy_phys, &vx_ym, &vy_ym);
+      float vx_xp, vy_xp, vx_xm, vy_xm, vx_yp, vy_yp, vx_ym, vy_ym;
+      curl_velocity_at(px_phys + CURL_H, py_phys, s->time_accum, pp,
+                       screen_cx_phys, screen_cy_phys, &vx_xp, &vy_xp);
+      curl_velocity_at(px_phys - CURL_H, py_phys, s->time_accum, pp,
+                       screen_cx_phys, screen_cy_phys, &vx_xm, &vy_xm);
+      curl_velocity_at(px_phys, py_phys + CURL_H, s->time_accum, pp,
+                       screen_cx_phys, screen_cy_phys, &vx_yp, &vy_yp);
+      curl_velocity_at(px_phys, py_phys - CURL_H, s->time_accum, pp,
+                       screen_cx_phys, screen_cy_phys, &vx_ym, &vy_ym);
 
-            float div = (vx_xp - vx_xm) / (2.0f * CURL_H)
-                      + (vy_yp - vy_ym) / (2.0f * CURL_H);
-            float adiv = fabsf(div);
+      float div =
+          (vx_xp - vx_xm) / (2.0f * CURL_H) + (vy_yp - vy_ym) / (2.0f * CURL_H);
+      float adiv = fabsf(div);
 
-            /* Threshold tuned so the analytic curl shows ≈ empty;
-             * non-zero pixels are central-diff truncation error. */
-            float f = adiv / 0.02f;
-            if (f < 0.0f) f = 0.0f;
-            if (f > 1.0f) f = 1.0f;
-            int slot = (int)(f * 7.999f);
-            if (slot == 0) continue;
+      /* Threshold tuned so the analytic curl shows ≈ empty;
+       * non-zero pixels are central-diff truncation error. */
+      float f = adiv / 0.02f;
+      if (f < 0.0f)
+        f = 0.0f;
+      if (f > 1.0f)
+        f = 1.0f;
+      int slot = (int)(f * 7.999f);
+      if (slot == 0)
+        continue;
 
-            char glyph = (slot >= 6) ? '#' : (slot >= 3) ? '+' : '.';
-            int pair = PAIR_RAMP_BASE + slot;
-            attron(COLOR_PAIR(pair) | A_BOLD);
-            mvaddch(row, col, (chtype)(unsigned char)glyph);
-            attroff(COLOR_PAIR(pair) | A_BOLD);
-        }
+      char glyph = (slot >= 6) ? '#' : (slot >= 3) ? '+' : '.';
+      int pair = PAIR_RAMP_BASE + slot;
+      attron(COLOR_PAIR(pair) | A_BOLD);
+      mvaddch(row, col, (chtype)(unsigned char)glyph);
+      attroff(COLOR_PAIR(pair) | A_BOLD);
     }
+  }
 }
 
-static void scene_draw(const Scene *s)
-{
-    int rows_eff = s->rows - 1;
-    const PatternParams *pp = &pattern_params[s->current_pattern];
+static void scene_draw(const Scene *s) {
+  int rows_eff = s->rows - 1;
+  const PatternParams *pp = &pattern_params[s->current_pattern];
 
-    float screen_cx_phys = (float)s->cols * 0.5f;
-    float screen_cy_phys = (float)rows_eff * 0.5f * ASPECT_Y;
+  float screen_cx_phys = (float)s->cols * 0.5f;
+  float screen_cy_phys = (float)rows_eff * 0.5f * ASPECT_Y;
 
-    /*
-     * Debug-mode background overlay (drawn FIRST, under particles).
-     * HEATMAP shows ψ; DIVERGENCE shows the curl identity's residual.
-     * Particles still render on top so you can see them flowing
-     * relative to the field they're advected by.
-     */
-    if (g_debug == DBG_HEATMAP)    bg_heatmap_draw(s);
-    if (g_debug == DBG_DIVERGENCE) bg_divergence_draw(s);
+  /*
+   * Debug-mode background overlay (drawn FIRST, under particles).
+   * HEATMAP shows ψ; DIVERGENCE shows the curl identity's residual.
+   * Particles still render on top so you can see them flowing
+   * relative to the field they're advected by.
+   */
+  if (g_debug == DBG_HEATMAP)
+    bg_heatmap_draw(s);
+  if (g_debug == DBG_DIVERGENCE)
+    bg_divergence_draw(s);
 
-    for (int i = 0; i < MAX_PARTICLES; i++) {
-        const Particle *p = &s->particles[i];
-        if (!p->active) continue;
+  for (int i = 0; i < MAX_PARTICLES; i++) {
+    const Particle *p = &s->particles[i];
+    if (!p->active)
+      continue;
 
-        /* Compute current speed for colour slot. */
-        float vx_phys, vy_phys;
-        curl_velocity_at(p->px, p->py * ASPECT_Y, s->time_accum, pp,
-                         screen_cx_phys, screen_cy_phys,
-                         &vx_phys, &vy_phys);
-        float speed = sqrtf(vx_phys * vx_phys + vy_phys * vy_phys);
-        /* sqrt mapping pushes low speeds into higher ramp slots
-         * (a particle at 25% of SPEED_REF gets slot 50% of brightest
-         * instead of 25%). Otherwise most particles cluster in slot 0
-         * and disappear into the dark theme tints. */
-        float f = speed / SPEED_REF;
-        if (f < 0.0f) f = 0.0f;
-        if (f > 1.0f) f = 1.0f;
-        f = sqrtf(f);
-        int head_slot = (int)(f * 7.999f);
-        if (head_slot < 1) head_slot = 1;     /* always visible */
-        if (head_slot > 7) head_slot = 7;
+    /* Compute current speed for colour slot. */
+    float vx_phys, vy_phys;
+    curl_velocity_at(p->px, p->py * ASPECT_Y, s->time_accum, pp, screen_cx_phys,
+                     screen_cy_phys, &vx_phys, &vy_phys);
+    float speed = sqrtf(vx_phys * vx_phys + vy_phys * vy_phys);
+    /* sqrt mapping pushes low speeds into higher ramp slots
+     * (a particle at 25% of SPEED_REF gets slot 50% of brightest
+     * instead of 25%). Otherwise most particles cluster in slot 0
+     * and disappear into the dark theme tints. */
+    float f = speed / SPEED_REF;
+    if (f < 0.0f)
+      f = 0.0f;
+    if (f > 1.0f)
+      f = 1.0f;
+    f = sqrtf(f);
+    int head_slot = (int)(f * 7.999f);
+    if (head_slot < 1)
+      head_slot = 1; /* always visible */
+    if (head_slot > 7)
+      head_slot = 7;
 
-        /* Trail (oldest → newest); head overdraws last. */
-        int n = p->trail_count;
-        for (int k = 0; k < n; k++) {
-            int idx = (p->trail_head + 1 + k) % TRAIL_LEN;
-            float tx = p->trail_x[idx];
-            float ty = p->trail_y[idx];
-            int ix = (int)(tx + 0.5f);
-            int iy = (int)(ty + 0.5f);
-            if (ix < 0 || ix >= s->cols) continue;
-            if (iy < 0 || iy >= rows_eff) continue;
+    /* Trail (oldest → newest); head overdraws last. */
+    int n = p->trail_count;
+    for (int k = 0; k < n; k++) {
+      int idx = (p->trail_head + 1 + k) % TRAIL_LEN;
+      float tx = p->trail_x[idx];
+      float ty = p->trail_y[idx];
+      int ix = (int)(tx + 0.5f);
+      int iy = (int)(ty + 0.5f);
+      if (ix < 0 || ix >= s->cols)
+        continue;
+      if (iy < 0 || iy >= rows_eff)
+        continue;
 
-            int slot = head_slot - (n - 1 - k);
-            if (slot < 0) slot = 0;
-            char glyph;
-            int  attr;
-            if (k == n - 1) {
-                /* Head — in DBG_VELOCITY mode replace glyph with an
-                 * arrow showing v's direction. */
-                if (g_debug == DBG_VELOCITY)
-                    glyph = dir_char(vx_phys, vy_phys);
-                else
-                    glyph = (head_slot >= 5) ? '*'
-                          : (head_slot >= 2) ? '+'
-                          :                    '.';
-                attr  = (head_slot >= 6) ? A_BOLD
-                      : (head_slot <= 1) ? A_DIM
-                      :                    A_NORMAL;
-            } else {
-                glyph = (slot >= 4) ? '+' : (slot >= 1) ? '.' : '`';
-                attr  = (slot <= 1) ? A_DIM : A_NORMAL;
-            }
-            int pair = PAIR_RAMP_BASE + slot;
-            attron(COLOR_PAIR(pair) | attr);
-            mvaddch(iy, ix, (chtype)(unsigned char)glyph);
-            attroff(COLOR_PAIR(pair) | attr);
-        }
+      int slot = head_slot - (n - 1 - k);
+      if (slot < 0)
+        slot = 0;
+      char glyph;
+      int attr;
+      if (k == n - 1) {
+        /* Head — in DBG_VELOCITY mode replace glyph with an
+         * arrow showing v's direction. */
+        if (g_debug == DBG_VELOCITY)
+          glyph = dir_char(vx_phys, vy_phys);
+        else
+          glyph = (head_slot >= 5) ? '*' : (head_slot >= 2) ? '+' : '.';
+        attr = (head_slot >= 6) ? A_BOLD : (head_slot <= 1) ? A_DIM : A_NORMAL;
+      } else {
+        glyph = (slot >= 4) ? '+' : (slot >= 1) ? '.' : '`';
+        attr = (slot <= 1) ? A_DIM : A_NORMAL;
+      }
+      int pair = PAIR_RAMP_BASE + slot;
+      attron(COLOR_PAIR(pair) | attr);
+      mvaddch(iy, ix, (chtype)(unsigned char)glyph);
+      attroff(COLOR_PAIR(pair) | attr);
     }
+  }
 }
 
 /* ===================================================================== */
 /* §8  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *sc)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, sc->rows, sc->cols);
+static void screen_init(Screen *sc) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, sc->rows, sc->cols);
 }
-static void screen_free(Screen *sc) { (void)sc; endwin(); }
-static void screen_resize_curses(Screen *sc)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, sc->rows, sc->cols);
+static void screen_free(Screen *sc) {
+  (void)sc;
+  endwin();
+}
+static void screen_resize_curses(Screen *sc) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
-static int scene_active_count(const Scene *s)
-{
-    int n = 0;
-    for (int i = 0; i < MAX_PARTICLES; i++) if (s->particles[i].active) n++;
-    return n;
+static int scene_active_count(const Scene *s) {
+  int n = 0;
+  for (int i = 0; i < MAX_PARTICLES; i++)
+    if (s->particles[i].active)
+      n++;
+  return n;
 }
 
 /*
@@ -1690,194 +1711,216 @@ static int scene_active_count(const Scene *s)
  *   row rows-1     — every interactive key, bright bold cyan (bottom-left)
  * Debug-mode suffix only shown when non-normal; keeps the top tidy.
  */
-static void screen_draw(Screen *sc, const Scene *s,
-                        double fps, int sim_fps)
-{
-    erase();
-    scene_draw(s);
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+  erase();
+  scene_draw(s);
 
-    int active = scene_active_count(s);
-    const PatternParams *pp = &pattern_params[s->current_pattern];
+  int active = scene_active_count(s);
+  const PatternParams *pp = &pattern_params[s->current_pattern];
 
-    const char *state_str = s->paused ? "PAUSED"
-                                       : pattern_name(s->current_pattern);
+  const char *state_str =
+      s->paused ? "PAUSED" : pattern_name(s->current_pattern);
 
-    char top[160];
-    if (g_debug == DBG_NORMAL) {
-        snprintf(top, sizeof top,
-                 " %5.1f fps  %3d Hz  speed:%-3d  %s  theme:%s  "
-                 "N:%d oct:%d freq:%.3f ",
-                 fps, sim_fps, s->speed,
-                 state_str, themes[s->current_theme].name,
-                 active, pp->fbm_octaves, (double)pp->fbm_freq);
-    } else {
-        snprintf(top, sizeof top,
-                 " %5.1f fps  %3d Hz  speed:%-3d  %s  theme:%s  "
-                 "N:%d oct:%d freq:%.3f  [dbg:%s] ",
-                 fps, sim_fps, s->speed,
-                 state_str, themes[s->current_theme].name,
-                 active, pp->fbm_octaves, (double)pp->fbm_freq,
-                 k_debug_names[g_debug]);
-    }
-    int top_x = sc->cols - (int)strlen(top);
-    if (top_x < 0) top_x = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, top_x, "%s", top);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  char top[160];
+  if (g_debug == DBG_NORMAL) {
+    snprintf(top, sizeof top,
+             " %5.1f fps  %3d Hz  speed:%-3d  %s  theme:%s  "
+             "N:%d oct:%d freq:%.3f ",
+             fps, sim_fps, s->speed, state_str, themes[s->current_theme].name,
+             active, pp->fbm_octaves, (double)pp->fbm_freq);
+  } else {
+    snprintf(top, sizeof top,
+             " %5.1f fps  %3d Hz  speed:%-3d  %s  theme:%s  "
+             "N:%d oct:%d freq:%.3f  [dbg:%s] ",
+             fps, sim_fps, s->speed, state_str, themes[s->current_theme].name,
+             active, pp->fbm_octaves, (double)pp->fbm_freq,
+             k_debug_names[g_debug]);
+  }
+  int top_x = sc->cols - (int)strlen(top);
+  if (top_x < 0)
+    top_x = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, top_x, "%s", top);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " q/ESC:quit  spc:pause  r:reseed  n/p:pattern"
-             "  t/T:theme  +/-:speed  ]/[:Hz  d/D:debug ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(sc->rows - 1, 0,
+           " q/ESC:quit  spc:pause  r:reseed  n/p:pattern"
+           "  t/T:theme  +/-:speed  ]/[:Hz  d/D:debug ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ===================================================================== */
 /* §9  app                                                                */
 /* ===================================================================== */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void app_do_resize(App *app)
-{
-    screen_resize_curses(&app->screen);
-    scene_resize(&app->scene, app->screen.cols, app->screen.rows);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  screen_resize_curses(&app->screen);
+  scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':           s->paused = !s->paused;                       break;
-    case 'r': case 'R': scene_reseed(s);                              break;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_reseed(s);
+    break;
 
-    case '=': case '+':
-        if (s->speed < SPEED_MAX) s->speed *= 2;
-        if (s->speed > SPEED_MAX) s->speed  = SPEED_MAX;
-        break;
-    case '-':
-        s->speed /= 2;
-        if (s->speed < SPEED_MIN) s->speed  = SPEED_MIN;
-        break;
+  case '=':
+  case '+':
+    if (s->speed < SPEED_MAX)
+      s->speed *= 2;
+    if (s->speed > SPEED_MAX)
+      s->speed = SPEED_MAX;
+    break;
+  case '-':
+    s->speed /= 2;
+    if (s->speed < SPEED_MIN)
+      s->speed = SPEED_MIN;
+    break;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
-        theme_apply(s->current_theme);
-        break;
-    case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
-        theme_apply(s->current_theme);
-        break;
+  case 't':
+    s->current_theme = (s->current_theme + 1) % N_THEMES;
+    theme_apply(s->current_theme);
+    break;
+  case 'T':
+    s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
+    theme_apply(s->current_theme);
+    break;
 
-    case 'n': case 'N':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS);
-        scene_populate_to_target(s);
-        break;
-    case 'p': case 'P':
-        s->current_pattern = (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS);
-        scene_populate_to_target(s);
-        break;
+  case 'n':
+  case 'N':
+    s->current_pattern = (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS);
+    scene_populate_to_target(s);
+    break;
+  case 'p':
+  case 'P':
+    s->current_pattern =
+        (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS);
+    scene_populate_to_target(s);
+    break;
 
-    case 'd':
-        g_debug = (DebugMode)((g_debug + 1) % DBG_COUNT);
-        break;
-    case 'D':
-        g_debug = (DebugMode)((g_debug + DBG_COUNT - 1) % DBG_COUNT);
-        break;
+  case 'd':
+    g_debug = (DebugMode)((g_debug + 1) % DBG_COUNT);
+    break;
+  case 'D':
+    g_debug = (DebugMode)((g_debug + DBG_COUNT - 1) % DBG_COUNT);
+    break;
 
-    default: break;
-    }
-    return true;
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+int main(void) {
+  srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+  screen_init(&app->screen);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
-
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accum -= tick_ns;
-        }
-
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
-        screen_present();
-
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns();
+      sim_accum = 0;
     }
 
-    screen_free(&app->screen);
-    return 0;
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > 100 * NS_PER_MS)
+      dt = 100 * NS_PER_MS;
+
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
+
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, dt_sec);
+      sim_accum -= tick_ns;
+    }
+
+    frame_count++;
+    fps_accum += dt;
+    if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display =
+          (double)frame_count / ((double)fps_accum / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accum = 0;
+    }
+
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
+    screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
+    screen_present();
+
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  screen_free(&app->screen);
+  return 0;
 }

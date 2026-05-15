@@ -69,20 +69,17 @@
  *   §3   complex           ComplexNumber + 6 helpers (for the DFT)
  *   §4   colors            palette pairs (HUD/HINT theme-invariant)
  *   §5   sinc_helper       the sin(pi*x)/(pi*x) helper alone
- *   §6   windows           4 window functions (Rect / Hann / Hamming / Blackman)
- *   §7   filter_design     low-pass sinc, then design_filter (the recipe)
- *   §8   convolve          apply filter to signal
- *   §9   dft_response      DFT of zero-padded filter for |H[k]| + arg(H[k])
- *   §10  signals           input signal generators
- *   §11  scene_state       per-frame state + reset
- *   §12  scene_tick        per-frame update orchestrator
- *   §13  scene_input       handle keys
- *   §14  draw_bar          vertical-bar primitive
- *   §15  draw_signal       signal panel renderer
- *   §16  draw_filter       impulse + magnitude + phase response panels
- *   §17  draw_debug        'D' kernel numeric table
- *   §18  hud               status top-right + hint bottom + frame composer
- *   §19  app               signal handlers + main loop + key dispatch
+ *   §6   windows           4 window functions (Rect / Hann / Hamming /
+ * Blackman) §7   filter_design     low-pass sinc, then design_filter (the
+ * recipe) §8   convolve          apply filter to signal §9   dft_response DFT
+ * of zero-padded filter for |H[k]| + arg(H[k]) §10  signals           input
+ * signal generators §11  scene_state       per-frame state + reset §12
+ * scene_tick        per-frame update orchestrator §13  scene_input       handle
+ * keys §14  draw_bar          vertical-bar primitive §15  draw_signal signal
+ * panel renderer §16  draw_filter       impulse + magnitude + phase response
+ * panels §17  draw_debug        'D' kernel numeric table §18  hud status
+ * top-right + hint bottom + frame composer §19  app               signal
+ * handlers + main loop + key dispatch
  *
  * Keys
  *   q | Q | ESC      quit
@@ -789,7 +786,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -806,42 +803,42 @@
 /* §1  config                                                            */
 /* ===================================================================== */
 
-#define N                  64        /* input signal length             */
-#define K                  21        /* filter length (must be odd for
-                                       * symmetric centered design)     */
-#define K_CENTER           (K / 2)
-#define N_HALF             (N / 2)
-#define RENDER_FPS         30
-#define RENDER_TICK_NS     (1000000000LL / RENDER_FPS)
-#define SWEEP_PERIOD_FRAMES 120      /* one full cutoff sweep ≈ 4 seconds */
+#define N 64 /* input signal length             */
+#define K                                                                      \
+  21 /* filter length (must be odd for                                         \
+      * symmetric centered design)     */
+#define K_CENTER (K / 2)
+#define N_HALF (N / 2)
+#define RENDER_FPS 30
+#define RENDER_TICK_NS (1000000000LL / RENDER_FPS)
+#define SWEEP_PERIOD_FRAMES 120 /* one full cutoff sweep ≈ 4 seconds */
 
 enum {
-    PAIR_INPUT     = 1,    /* input wave bars                              */
-    PAIR_OUTPUT    = 2,    /* output (filtered) wave bars                  */
-    PAIR_FILTER    = 3,    /* filter impulse response bars                 */
-    PAIR_MAGRESP   = 4,    /* magnitude response bars                      */
-    PAIR_PHRESP    = 5,    /* phase response bars (debug)                  */
-    PAIR_LABEL     = 6,    /* panel labels                                 */
-    PAIR_HUD       = 7,    /* HUD top status                               */
-    PAIR_HINT      = 8,    /* bottom hint                                  */
+  PAIR_INPUT = 1,   /* input wave bars                              */
+  PAIR_OUTPUT = 2,  /* output (filtered) wave bars                  */
+  PAIR_FILTER = 3,  /* filter impulse response bars                 */
+  PAIR_MAGRESP = 4, /* magnitude response bars                      */
+  PAIR_PHRESP = 5,  /* phase response bars (debug)                  */
+  PAIR_LABEL = 6,   /* panel labels                                 */
+  PAIR_HUD = 7,     /* HUD top status                               */
+  PAIR_HINT = 8,    /* bottom hint                                  */
 };
 
 /* ===================================================================== */
 /* §2  clock                                                             */
 /* ===================================================================== */
 
-static long long clock_now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(long long ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(long long ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -853,65 +850,59 @@ static void clock_sleep_ns(long long ns)
  */
 
 typedef struct {
-    float re;
-    float im;
+  float re;
+  float im;
 } ComplexNumber;
 
-static const ComplexNumber complex_zero = { 0.0f, 0.0f };
+static const ComplexNumber complex_zero = {0.0f, 0.0f};
 
-static inline ComplexNumber complex_make(float re, float im)
-{
-    return (ComplexNumber){ re, im };
+static inline ComplexNumber complex_make(float re, float im) {
+  return (ComplexNumber){re, im};
 }
 
-static inline ComplexNumber complex_from_angle(float angle_radians)
-{
-    return complex_make(cosf(angle_radians), sinf(angle_radians));
+static inline ComplexNumber complex_from_angle(float angle_radians) {
+  return complex_make(cosf(angle_radians), sinf(angle_radians));
 }
 
-static inline ComplexNumber complex_add(ComplexNumber a, ComplexNumber b)
-{
-    return complex_make(a.re + b.re, a.im + b.im);
+static inline ComplexNumber complex_add(ComplexNumber a, ComplexNumber b) {
+  return complex_make(a.re + b.re, a.im + b.im);
 }
 
 static inline ComplexNumber complex_scale_by_real(float scale,
-                                                  ComplexNumber z)
-{
-    return complex_make(scale * z.re, scale * z.im);
+                                                  ComplexNumber z) {
+  return complex_make(scale * z.re, scale * z.im);
 }
 
-static inline float complex_magnitude(ComplexNumber z)
-{
-    return sqrtf(z.re * z.re + z.im * z.im);
+static inline float complex_magnitude(ComplexNumber z) {
+  return sqrtf(z.re * z.re + z.im * z.im);
 }
 
 /* ===================================================================== */
 /* §4  colors                                                            */
 /* ===================================================================== */
 
-static void colors_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_INPUT,    51, -1);   /* bright cyan      */
-        init_pair(PAIR_OUTPUT,  154, -1);   /* yellow-green     */
-        init_pair(PAIR_FILTER,  213, -1);   /* magenta-pink     */
-        init_pair(PAIR_MAGRESP, 220, -1);   /* gold             */
-        init_pair(PAIR_PHRESP,  117, -1);   /* sky blue         */
-        init_pair(PAIR_LABEL,   244, -1);   /* mid grey         */
-        init_pair(PAIR_HUD,     226, -1);   /* bright yellow    */
-        init_pair(PAIR_HINT,     51, -1);   /* bright cyan      */
-    } else {
-        init_pair(PAIR_INPUT,    COLOR_CYAN,    -1);
-        init_pair(PAIR_OUTPUT,   COLOR_GREEN,   -1);
-        init_pair(PAIR_FILTER,   COLOR_MAGENTA, -1);
-        init_pair(PAIR_MAGRESP,  COLOR_YELLOW,  -1);
-        init_pair(PAIR_PHRESP,   COLOR_BLUE,    -1);
-        init_pair(PAIR_LABEL,    COLOR_WHITE,   -1);
-        init_pair(PAIR_HUD,      COLOR_YELLOW,  -1);
-        init_pair(PAIR_HINT,     COLOR_CYAN,    -1);
-    }
+static void colors_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(PAIR_INPUT, 51, -1);    /* bright cyan      */
+    init_pair(PAIR_OUTPUT, 154, -1);  /* yellow-green     */
+    init_pair(PAIR_FILTER, 213, -1);  /* magenta-pink     */
+    init_pair(PAIR_MAGRESP, 220, -1); /* gold             */
+    init_pair(PAIR_PHRESP, 117, -1);  /* sky blue         */
+    init_pair(PAIR_LABEL, 244, -1);   /* mid grey         */
+    init_pair(PAIR_HUD, 226, -1);     /* bright yellow    */
+    init_pair(PAIR_HINT, 51, -1);     /* bright cyan      */
+  } else {
+    init_pair(PAIR_INPUT, COLOR_CYAN, -1);
+    init_pair(PAIR_OUTPUT, COLOR_GREEN, -1);
+    init_pair(PAIR_FILTER, COLOR_MAGENTA, -1);
+    init_pair(PAIR_MAGRESP, COLOR_YELLOW, -1);
+    init_pair(PAIR_PHRESP, COLOR_BLUE, -1);
+    init_pair(PAIR_LABEL, COLOR_WHITE, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
 /* ===================================================================== */
@@ -931,11 +922,11 @@ static void colors_init(void)
  *  We use float epsilon to detect x ≈ 0 and return 1 directly,
  *  avoiding the divide-by-zero.
  */
-static float sinc(float x)
-{
-    if (fabsf(x) < 1e-7f) return 1.0f;
-    float pi_x = (float)M_PI * x;
-    return sinf(pi_x) / pi_x;
+static float sinc(float x) {
+  if (fabsf(x) < 1e-7f)
+    return 1.0f;
+  float pi_x = (float)M_PI * x;
+  return sinf(pi_x) / pi_x;
 }
 
 /* ===================================================================== */
@@ -943,16 +934,15 @@ static float sinc(float x)
 /* ===================================================================== */
 
 typedef enum {
-    WIN_RECT = 0,    /* no taper — worst ringing (-13 dB sidelobes)   */
-    WIN_HANN,        /* good general-purpose         (-32 dB)         */
-    WIN_HAMMING,     /* slightly better sidelobes    (-42 dB)         */
-    WIN_BLACKMAN,    /* best sidelobes, widest main  (-58 dB)         */
-    WIN_COUNT
+  WIN_RECT = 0, /* no taper — worst ringing (-13 dB sidelobes)   */
+  WIN_HANN,     /* good general-purpose         (-32 dB)         */
+  WIN_HAMMING,  /* slightly better sidelobes    (-42 dB)         */
+  WIN_BLACKMAN, /* best sidelobes, widest main  (-58 dB)         */
+  WIN_COUNT
 } WindowKind;
 
-static const char *window_name[WIN_COUNT] = {
-    "Rectangular", "Hann       ", "Hamming    ", "Blackman   "
-};
+static const char *window_name[WIN_COUNT] = {"Rectangular", "Hann       ",
+                                             "Hamming    ", "Blackman   "};
 
 /*
  * window_coefficient — return w[i] for filter tap i in [0, K-1].
@@ -962,21 +952,21 @@ static const char *window_name[WIN_COUNT] = {
  *
  *   See T4 for the sidelobe-vs-main-lobe trade-off between windows.
  */
-static float window_coefficient(WindowKind kind, int i)
-{
-    float two_pi_over_K_minus_1 = 2.0f * (float)M_PI / (float)(K - 1);
-    switch (kind) {
-        case WIN_RECT:     return 1.0f;
-        case WIN_HANN:
-            return 0.5f - 0.5f * cosf(two_pi_over_K_minus_1 * (float)i);
-        case WIN_HAMMING:
-            return 0.54f - 0.46f * cosf(two_pi_over_K_minus_1 * (float)i);
-        case WIN_BLACKMAN:
-            return 0.42f
-                 - 0.5f  * cosf(two_pi_over_K_minus_1 * (float)i)
-                 + 0.08f * cosf(2.0f * two_pi_over_K_minus_1 * (float)i);
-        default: return 1.0f;
-    }
+static float window_coefficient(WindowKind kind, int i) {
+  float two_pi_over_K_minus_1 = 2.0f * (float)M_PI / (float)(K - 1);
+  switch (kind) {
+  case WIN_RECT:
+    return 1.0f;
+  case WIN_HANN:
+    return 0.5f - 0.5f * cosf(two_pi_over_K_minus_1 * (float)i);
+  case WIN_HAMMING:
+    return 0.54f - 0.46f * cosf(two_pi_over_K_minus_1 * (float)i);
+  case WIN_BLACKMAN:
+    return 0.42f - 0.5f * cosf(two_pi_over_K_minus_1 * (float)i) +
+           0.08f * cosf(2.0f * two_pi_over_K_minus_1 * (float)i);
+  default:
+    return 1.0f;
+  }
 }
 
 /* ===================================================================== */
@@ -984,15 +974,14 @@ static float window_coefficient(WindowKind kind, int i)
 /* ===================================================================== */
 
 typedef enum {
-    FILT_LOW_PASS = 0,
-    FILT_HIGH_PASS,
-    FILT_BAND_PASS,
-    FILT_COUNT
+  FILT_LOW_PASS = 0,
+  FILT_HIGH_PASS,
+  FILT_BAND_PASS,
+  FILT_COUNT
 } FilterKind;
 
-static const char *filter_name[FILT_COUNT] = {
-    "low-pass  ", "high-pass ", "band-pass "
-};
+static const char *filter_name[FILT_COUNT] = {"low-pass  ", "high-pass ",
+                                              "band-pass "};
 
 /*
  *  lowpass_sinc — fill h[0..K-1] with the IDEAL (un-windowed) low-
@@ -1010,13 +999,12 @@ static const char *filter_name[FILT_COUNT] = {
  *  then sin/x oscillations on either side.  See T2 for why this
  *  particular formula is the ideal low-pass impulse response.
  */
-static void lowpass_sinc(float fc, float *h)
-{
-    float center = (float)(K - 1) * 0.5f;     /* (K-1)/2 in floats */
-    for (int i = 0; i < K; i++) {
-        float x = 2.0f * fc * ((float)i - center);
-        h[i] = 2.0f * fc * sinc(x);
-    }
+static void lowpass_sinc(float fc, float *h) {
+  float center = (float)(K - 1) * 0.5f; /* (K-1)/2 in floats */
+  for (int i = 0; i < K; i++) {
+    float x = 2.0f * fc * ((float)i - center);
+    h[i] = 2.0f * fc * sinc(x);
+  }
 }
 
 /*
@@ -1040,55 +1028,59 @@ static void lowpass_sinc(float fc, float *h)
  *
  *  In code each step is one block in the switch + a final loop.
  */
-static void design_filter(FilterKind kind, int cutoff_bin,
-                          WindowKind window, float *h)
-{
-    /* Convert cutoff bin to normalized cutoff frequency in cycles
-     * per sample.  bin / N is the standard normalisation. */
-    float cutoff_normalised = (float)cutoff_bin / (float)N;
+static void design_filter(FilterKind kind, int cutoff_bin, WindowKind window,
+                          float *h) {
+  /* Convert cutoff bin to normalized cutoff frequency in cycles
+   * per sample.  bin / N is the standard normalisation. */
+  float cutoff_normalised = (float)cutoff_bin / (float)N;
 
-    /* ── Step 1.  Build the ideal impulse response ─────────────── */
-    switch (kind) {
-        case FILT_LOW_PASS: {
-            /* Ideal low-pass = sinc.  See T2. */
-            lowpass_sinc(cutoff_normalised, h);
-            break;
-        }
-        case FILT_HIGH_PASS: {
-            /* Spectral inversion: h_hp = identity - h_lp.  See T5.
-             *   First compute h_lp.
-             *   Then negate every tap.
-             *   Then add 1 at the centre (identity at centre, 0 elsewhere).
-             */
-            lowpass_sinc(cutoff_normalised, h);
-            for (int i = 0; i < K; i++) h[i] = -h[i];
-            h[K_CENTER] += 1.0f;
-            break;
-        }
-        case FILT_BAND_PASS: {
-            /* Spectral difference: h_bp = h_lp(f_high) - h_lp(f_low).
-             * See T6.  We use a fixed half-width of 3 bins for a
-             * moderately narrow passband.  The cutoff knob acts as
-             * the CENTER of the band. */
-            float band_half_bins = 3.0f;
-            float fc_lo = ((float)cutoff_bin - band_half_bins) / (float)N;
-            float fc_hi = ((float)cutoff_bin + band_half_bins) / (float)N;
-            if (fc_lo < 0.01f) fc_lo = 0.01f;
-            if (fc_hi > 0.49f) fc_hi = 0.49f;
-            float h_lo[K], h_hi[K];
-            lowpass_sinc(fc_lo, h_lo);
-            lowpass_sinc(fc_hi, h_hi);
-            for (int i = 0; i < K; i++) h[i] = h_hi[i] - h_lo[i];
-            break;
-        }
-        default: break;
-    }
-
-    /* ── Step 2.  Apply the window function ─────────────────────
-     * Tapers the truncation edges.  Trades sharper transition for
-     * smaller sidelobes.  See T3 / T4. */
+  /* ── Step 1.  Build the ideal impulse response ─────────────── */
+  switch (kind) {
+  case FILT_LOW_PASS: {
+    /* Ideal low-pass = sinc.  See T2. */
+    lowpass_sinc(cutoff_normalised, h);
+    break;
+  }
+  case FILT_HIGH_PASS: {
+    /* Spectral inversion: h_hp = identity - h_lp.  See T5.
+     *   First compute h_lp.
+     *   Then negate every tap.
+     *   Then add 1 at the centre (identity at centre, 0 elsewhere).
+     */
+    lowpass_sinc(cutoff_normalised, h);
     for (int i = 0; i < K; i++)
-        h[i] *= window_coefficient(window, i);
+      h[i] = -h[i];
+    h[K_CENTER] += 1.0f;
+    break;
+  }
+  case FILT_BAND_PASS: {
+    /* Spectral difference: h_bp = h_lp(f_high) - h_lp(f_low).
+     * See T6.  We use a fixed half-width of 3 bins for a
+     * moderately narrow passband.  The cutoff knob acts as
+     * the CENTER of the band. */
+    float band_half_bins = 3.0f;
+    float fc_lo = ((float)cutoff_bin - band_half_bins) / (float)N;
+    float fc_hi = ((float)cutoff_bin + band_half_bins) / (float)N;
+    if (fc_lo < 0.01f)
+      fc_lo = 0.01f;
+    if (fc_hi > 0.49f)
+      fc_hi = 0.49f;
+    float h_lo[K], h_hi[K];
+    lowpass_sinc(fc_lo, h_lo);
+    lowpass_sinc(fc_hi, h_hi);
+    for (int i = 0; i < K; i++)
+      h[i] = h_hi[i] - h_lo[i];
+    break;
+  }
+  default:
+    break;
+  }
+
+  /* ── Step 2.  Apply the window function ─────────────────────
+   * Tapers the truncation edges.  Trades sharper transition for
+   * smaller sidelobes.  See T3 / T4. */
+  for (int i = 0; i < K; i++)
+    h[i] *= window_coefficient(window, i);
 }
 
 /* ===================================================================== */
@@ -1121,44 +1113,37 @@ static void design_filter(FilterKind kind, int cutoff_bin,
  *                    function produces the filtered output that the
  *                    bottom panel displays.
  */
-static void convolve(const float *input_signal,
-                     const float *kernel_taps,
-                     float *output_signal)
-{
-    /* Largest valid output position.  Beyond this the kernel would
-     * read past the end of the input. */
-    int last_valid_output_position = N - K;
+static void convolve(const float *input_signal, const float *kernel_taps,
+                     float *output_signal) {
+  /* Largest valid output position.  Beyond this the kernel would
+   * read past the end of the input. */
+  int last_valid_output_position = N - K;
 
-    for (int output_position = 0;
-         output_position <= last_valid_output_position;
-         output_position++) {
+  for (int output_position = 0; output_position <= last_valid_output_position;
+       output_position++) {
 
-        float weighted_sum = 0.0f;
+    float weighted_sum = 0.0f;
 
-        for (int kernel_tap_index = 0;
-             kernel_tap_index < K;
-             kernel_tap_index++) {
+    for (int kernel_tap_index = 0; kernel_tap_index < K; kernel_tap_index++) {
 
-            /* ── STEP 1 — read the kernel weight ───────────────── */
-            float kernel_weight = kernel_taps[kernel_tap_index];
+      /* ── STEP 1 — read the kernel weight ───────────────── */
+      float kernel_weight = kernel_taps[kernel_tap_index];
 
-            /* ── STEP 2 — read the corresponding input sample ── */
-            float input_sample = input_signal[output_position
-                                              + kernel_tap_index];
+      /* ── STEP 2 — read the corresponding input sample ── */
+      float input_sample = input_signal[output_position + kernel_tap_index];
 
-            /* ── STEP 3 — multiply and accumulate ─────────────── */
-            weighted_sum += kernel_weight * input_sample;
-        }
-
-        output_signal[output_position] = weighted_sum;
+      /* ── STEP 3 — multiply and accumulate ─────────────── */
+      weighted_sum += kernel_weight * input_sample;
     }
 
-    /* Boundary: outputs past N - K are not well-defined.  Zero them. */
-    for (int output_position = last_valid_output_position + 1;
-         output_position < N;
-         output_position++) {
-        output_signal[output_position] = 0.0f;
-    }
+    output_signal[output_position] = weighted_sum;
+  }
+
+  /* Boundary: outputs past N - K are not well-defined.  Zero them. */
+  for (int output_position = last_valid_output_position + 1;
+       output_position < N; output_position++) {
+    output_signal[output_position] = 0.0f;
+  }
 }
 
 /* ===================================================================== */
@@ -1177,28 +1162,25 @@ static void convolve(const float *input_signal,
  *  We could use the FFT but the helloworld vibes call for the
  *  textbook DFT.
  */
-static void compute_filter_response(const float *h,
-                                    float *out_magnitude,
-                                    float *out_phase)
-{
-    /* Zero-pad. */
-    float padded[N];
-    for (int i = 0; i < N; i++)
-        padded[i] = (i < K) ? h[i] : 0.0f;
+static void compute_filter_response(const float *h, float *out_magnitude,
+                                    float *out_phase) {
+  /* Zero-pad. */
+  float padded[N];
+  for (int i = 0; i < N; i++)
+    padded[i] = (i < K) ? h[i] : 0.0f;
 
-    /* DFT (real input). */
-    for (int k = 0; k <= N_HALF; k++) {
-        ComplexNumber acc = complex_zero;
-        for (int n = 0; n < N; n++) {
-            float angle = -2.0f * (float)M_PI * (float)k * (float)n
-                        / (float)N;
-            ComplexNumber twist   = complex_from_angle(angle);
-            ComplexNumber twisted = complex_scale_by_real(padded[n], twist);
-            acc = complex_add(acc, twisted);
-        }
-        out_magnitude[k] = complex_magnitude(acc);
-        out_phase[k]     = atan2f(acc.im, acc.re);
+  /* DFT (real input). */
+  for (int k = 0; k <= N_HALF; k++) {
+    ComplexNumber acc = complex_zero;
+    for (int n = 0; n < N; n++) {
+      float angle = -2.0f * (float)M_PI * (float)k * (float)n / (float)N;
+      ComplexNumber twist = complex_from_angle(angle);
+      ComplexNumber twisted = complex_scale_by_real(padded[n], twist);
+      acc = complex_add(acc, twisted);
     }
+    out_magnitude[k] = complex_magnitude(acc);
+    out_phase[k] = atan2f(acc.im, acc.re);
+  }
 }
 
 /* ===================================================================== */
@@ -1206,84 +1188,83 @@ static void compute_filter_response(const float *h,
 /* ===================================================================== */
 
 typedef enum {
-    SIG_SINES = 0,    /* sum of three sines at bins 3, 11, 23           */
-    SIG_CHIRP,        /* frequency sweeps across the buffer             */
-    SIG_SQUARE,       /* periodic square wave                           */
-    SIG_IMPULSE,      /* one tall sample early in the buffer            */
-    SIG_NOISE,        /* repeatable pseudo-random                       */
-    SIG_COUNT
+  SIG_SINES = 0, /* sum of three sines at bins 3, 11, 23           */
+  SIG_CHIRP,     /* frequency sweeps across the buffer             */
+  SIG_SQUARE,    /* periodic square wave                           */
+  SIG_IMPULSE,   /* one tall sample early in the buffer            */
+  SIG_NOISE,     /* repeatable pseudo-random                       */
+  SIG_COUNT
 } SignalKind;
 
 static const char *signal_name[SIG_COUNT] = {
-    "Sum sines", "Chirp    ", "Square   ", "Impulse  ", "Noise    "
-};
+    "Sum sines", "Chirp    ", "Square   ", "Impulse  ", "Noise    "};
 
 /*
  *  generate_signal — fill output_signal[0..N-1] with the chosen test
  *    signal.  All signals are bounded by ±1 so the panel auto-
  *    scaling is consistent.
  */
-static void generate_signal(SignalKind kind, float *output_signal)
-{
-    switch (kind) {
-        case SIG_SINES: {
-            /* Sum of three pure sines at well-separated bins.  The
-             * default test signal.  Cycle through filter types and
-             * watch which sines survive. */
-            for (int n = 0; n < N; n++) {
-                float t = (float)n / (float)N;
-                output_signal[n] =
-                    0.5f * cosf(2.0f * (float)M_PI * 3.0f  * t)
-                  + 0.4f * cosf(2.0f * (float)M_PI * 11.0f * t)
-                  + 0.3f * cosf(2.0f * (float)M_PI * 23.0f * t);
-            }
-            break;
-        }
-        case SIG_CHIRP: {
-            /* Linear chirp: instantaneous frequency varies linearly
-             * from bin 1 to bin N/2 - 1 across the buffer.  Phase is
-             * the integral of frequency, so it carries an n^2 term. */
-            for (int n = 0; n < N; n++) {
-                float t = (float)n / (float)N;
-                float lo = 1.0f, hi = (float)N * 0.5f - 1.0f;
-                float phase_cycles = lo * t + (hi - lo) * t * t * 0.5f;
-                output_signal[n] = sinf(2.0f * (float)M_PI * phase_cycles);
-            }
-            break;
-        }
-        case SIG_SQUARE: {
-            /* Periodic square wave at 3 cycles per buffer.  Sharp
-             * edges → many high harmonics → showcases low-pass
-             * smoothing dramatically. */
-            for (int n = 0; n < N; n++) {
-                float t = (float)n / (float)N;
-                float arg = 2.0f * (float)M_PI * 3.0f * t;
-                output_signal[n] = sinf(arg) >= 0.0f ? 0.7f : -0.7f;
-            }
-            break;
-        }
-        case SIG_IMPULSE: {
-            /* Zero everywhere except a single 1 at index N/4.  The
-             * output of any filter on an impulse IS that filter's
-             * impulse response (definition demo). */
-            for (int n = 0; n < N; n++) output_signal[n] = 0.0f;
-            output_signal[N / 4] = 1.0f;
-            break;
-        }
-        case SIG_NOISE: {
-            /* Repeatable pseudo-random.  Useful for seeing how the
-             * filter shapes broadband noise — output will have only
-             * the frequencies in the filter's passband. */
-            unsigned int seed = 1;
-            for (int n = 0; n < N; n++) {
-                seed = seed * 1664525u + 1013904223u;
-                float r = (float)(seed >> 16) / 65535.0f;
-                output_signal[n] = (r - 0.5f) * 1.6f;
-            }
-            break;
-        }
-        default: break;
+static void generate_signal(SignalKind kind, float *output_signal) {
+  switch (kind) {
+  case SIG_SINES: {
+    /* Sum of three pure sines at well-separated bins.  The
+     * default test signal.  Cycle through filter types and
+     * watch which sines survive. */
+    for (int n = 0; n < N; n++) {
+      float t = (float)n / (float)N;
+      output_signal[n] = 0.5f * cosf(2.0f * (float)M_PI * 3.0f * t) +
+                         0.4f * cosf(2.0f * (float)M_PI * 11.0f * t) +
+                         0.3f * cosf(2.0f * (float)M_PI * 23.0f * t);
     }
+    break;
+  }
+  case SIG_CHIRP: {
+    /* Linear chirp: instantaneous frequency varies linearly
+     * from bin 1 to bin N/2 - 1 across the buffer.  Phase is
+     * the integral of frequency, so it carries an n^2 term. */
+    for (int n = 0; n < N; n++) {
+      float t = (float)n / (float)N;
+      float lo = 1.0f, hi = (float)N * 0.5f - 1.0f;
+      float phase_cycles = lo * t + (hi - lo) * t * t * 0.5f;
+      output_signal[n] = sinf(2.0f * (float)M_PI * phase_cycles);
+    }
+    break;
+  }
+  case SIG_SQUARE: {
+    /* Periodic square wave at 3 cycles per buffer.  Sharp
+     * edges → many high harmonics → showcases low-pass
+     * smoothing dramatically. */
+    for (int n = 0; n < N; n++) {
+      float t = (float)n / (float)N;
+      float arg = 2.0f * (float)M_PI * 3.0f * t;
+      output_signal[n] = sinf(arg) >= 0.0f ? 0.7f : -0.7f;
+    }
+    break;
+  }
+  case SIG_IMPULSE: {
+    /* Zero everywhere except a single 1 at index N/4.  The
+     * output of any filter on an impulse IS that filter's
+     * impulse response (definition demo). */
+    for (int n = 0; n < N; n++)
+      output_signal[n] = 0.0f;
+    output_signal[N / 4] = 1.0f;
+    break;
+  }
+  case SIG_NOISE: {
+    /* Repeatable pseudo-random.  Useful for seeing how the
+     * filter shapes broadband noise — output will have only
+     * the frequencies in the filter's passband. */
+    unsigned int seed = 1;
+    for (int n = 0; n < N; n++) {
+      seed = seed * 1664525u + 1013904223u;
+      float r = (float)(seed >> 16) / 65535.0f;
+      output_signal[n] = (r - 0.5f) * 1.6f;
+    }
+    break;
+  }
+  default:
+    break;
+  }
 }
 
 /* ===================================================================== */
@@ -1299,27 +1280,26 @@ static float g_output_signal[N];
 static float g_input_peak = 1.0f;
 static float g_output_peak = 1.0f;
 
-static SignalKind g_signal_kind   = SIG_SINES;
-static FilterKind g_filter_kind   = FILT_LOW_PASS;
-static WindowKind g_window_kind   = WIN_HANN;
-static int        g_cutoff_bin    = 5;
-static bool       g_simulation_paused   = false;
-static bool       g_auto_sweep_cutoff   = true;
-static float      g_sweep_phase_radians = 0.0f;
+static SignalKind g_signal_kind = SIG_SINES;
+static FilterKind g_filter_kind = FILT_LOW_PASS;
+static WindowKind g_window_kind = WIN_HANN;
+static int g_cutoff_bin = 5;
+static bool g_simulation_paused = false;
+static bool g_auto_sweep_cutoff = true;
+static float g_sweep_phase_radians = 0.0f;
 
 /* Debug overlay toggles. */
-static bool       g_show_phase_panel    = false;
-static bool       g_show_kernel_table   = false;
+static bool g_show_phase_panel = false;
+static bool g_show_kernel_table = false;
 
-static void scene_reset(void)
-{
-    g_signal_kind         = SIG_SINES;
-    g_filter_kind         = FILT_LOW_PASS;
-    g_window_kind         = WIN_HANN;
-    g_cutoff_bin          = 5;
-    g_simulation_paused   = false;
-    g_auto_sweep_cutoff   = true;
-    g_sweep_phase_radians = 0.0f;
+static void scene_reset(void) {
+  g_signal_kind = SIG_SINES;
+  g_filter_kind = FILT_LOW_PASS;
+  g_window_kind = WIN_HANN;
+  g_cutoff_bin = 5;
+  g_simulation_paused = false;
+  g_auto_sweep_cutoff = true;
+  g_sweep_phase_radians = 0.0f;
 }
 
 /* ===================================================================== */
@@ -1328,81 +1308,80 @@ static void scene_reset(void)
 /*
  *  Six numbered steps that match T10 of the GUIDED TUTORIAL.
  */
-static void scene_tick(void)
-{
-    if (g_simulation_paused) return;
+static void scene_tick(void) {
+  if (g_simulation_paused)
+    return;
 
-    /* Auto-sweep cutoff.  sin gives smooth there-and-back motion. */
-    if (g_auto_sweep_cutoff) {
-        g_sweep_phase_radians +=
-            2.0f * (float)M_PI / (float)SWEEP_PERIOD_FRAMES;
-        if (g_sweep_phase_radians > 2.0f * (float)M_PI)
-            g_sweep_phase_radians -= 2.0f * (float)M_PI;
-        float s = (sinf(g_sweep_phase_radians) + 1.0f) * 0.5f;
-        /* Cutoff in [3, N/2 - 3] so band-pass has room on both sides. */
-        g_cutoff_bin = 3 + (int)(s * ((float)N * 0.5f - 6.0f) + 0.5f);
-    }
+  /* Auto-sweep cutoff.  sin gives smooth there-and-back motion. */
+  if (g_auto_sweep_cutoff) {
+    g_sweep_phase_radians += 2.0f * (float)M_PI / (float)SWEEP_PERIOD_FRAMES;
+    if (g_sweep_phase_radians > 2.0f * (float)M_PI)
+      g_sweep_phase_radians -= 2.0f * (float)M_PI;
+    float s = (sinf(g_sweep_phase_radians) + 1.0f) * 0.5f;
+    /* Cutoff in [3, N/2 - 3] so band-pass has room on both sides. */
+    g_cutoff_bin = 3 + (int)(s * ((float)N * 0.5f - 6.0f) + 0.5f);
+  }
 
-    /* ── Step 1.  generate input ──────────────────────────────── */
-    generate_signal(g_signal_kind, g_input_signal);
+  /* ── Step 1.  generate input ──────────────────────────────── */
+  generate_signal(g_signal_kind, g_input_signal);
 
-    /* ── Step 2.  DESIGN filter (the headline of this file) ──── */
-    design_filter(g_filter_kind, g_cutoff_bin, g_window_kind,
-                  g_kernel_taps);
+  /* ── Step 2.  DESIGN filter (the headline of this file) ──── */
+  design_filter(g_filter_kind, g_cutoff_bin, g_window_kind, g_kernel_taps);
 
-    /* ── Step 3.  APPLY filter (convolve) ─────────────────────── */
-    convolve(g_input_signal, g_kernel_taps, g_output_signal);
+  /* ── Step 3.  APPLY filter (convolve) ─────────────────────── */
+  convolve(g_input_signal, g_kernel_taps, g_output_signal);
 
-    /* ── Step 4.  compute filter response (for visualization) ── */
-    compute_filter_response(g_kernel_taps, g_magnitude_response,
-                            g_phase_response);
+  /* ── Step 4.  compute filter response (for visualization) ── */
+  compute_filter_response(g_kernel_taps, g_magnitude_response,
+                          g_phase_response);
 
-    /* ── Step 5.  peaks for autoscale ─────────────────────────── */
-    g_input_peak = 1e-6f;
-    for (int n = 0; n < N; n++) {
-        float a = fabsf(g_input_signal[n]);
-        if (a > g_input_peak) g_input_peak = a;
-    }
-    g_output_peak = 1e-6f;
-    for (int n = 0; n < N; n++) {
-        float a = fabsf(g_output_signal[n]);
-        if (a > g_output_peak) g_output_peak = a;
-    }
-    g_magnitude_peak = 1e-6f;
-    for (int k = 0; k <= N_HALF; k++) {
-        if (g_magnitude_response[k] > g_magnitude_peak)
-            g_magnitude_peak = g_magnitude_response[k];
-    }
+  /* ── Step 5.  peaks for autoscale ─────────────────────────── */
+  g_input_peak = 1e-6f;
+  for (int n = 0; n < N; n++) {
+    float a = fabsf(g_input_signal[n]);
+    if (a > g_input_peak)
+      g_input_peak = a;
+  }
+  g_output_peak = 1e-6f;
+  for (int n = 0; n < N; n++) {
+    float a = fabsf(g_output_signal[n]);
+    if (a > g_output_peak)
+      g_output_peak = a;
+  }
+  g_magnitude_peak = 1e-6f;
+  for (int k = 0; k <= N_HALF; k++) {
+    if (g_magnitude_response[k] > g_magnitude_peak)
+      g_magnitude_peak = g_magnitude_response[k];
+  }
 }
 
 /* ===================================================================== */
 /* §13  scene_input — handle keys                                        */
 /* ===================================================================== */
 
-static void scene_cycle_filter(int direction)
-{
-    g_filter_kind = (FilterKind)((g_filter_kind + direction + FILT_COUNT)
-                                 % FILT_COUNT);
+static void scene_cycle_filter(int direction) {
+  g_filter_kind =
+      (FilterKind)((g_filter_kind + direction + FILT_COUNT) % FILT_COUNT);
 }
 
-static void scene_cycle_window(int direction)
-{
-    g_window_kind = (WindowKind)((g_window_kind + direction + WIN_COUNT)
-                                 % WIN_COUNT);
+static void scene_cycle_window(int direction) {
+  g_window_kind =
+      (WindowKind)((g_window_kind + direction + WIN_COUNT) % WIN_COUNT);
 }
 
-static void scene_cycle_signal(int direction)
-{
-    g_signal_kind = (SignalKind)((g_signal_kind + direction + SIG_COUNT)
-                                 % SIG_COUNT);
+static void scene_cycle_signal(int direction) {
+  g_signal_kind =
+      (SignalKind)((g_signal_kind + direction + SIG_COUNT) % SIG_COUNT);
 }
 
-static void scene_adjust_cutoff(int delta)
-{
-    if (g_auto_sweep_cutoff) return;
-    g_cutoff_bin += delta;
-    if (g_cutoff_bin < 3) g_cutoff_bin = 3;
-    if (g_cutoff_bin > N_HALF - 3) g_cutoff_bin = N_HALF - 3;
+static void scene_adjust_cutoff(int delta) {
+  if (g_auto_sweep_cutoff)
+    return;
+  g_cutoff_bin += delta;
+  if (g_cutoff_bin < 3)
+    g_cutoff_bin = 3;
+  if (g_cutoff_bin > N_HALF - 3)
+    g_cutoff_bin = N_HALF - 3;
 }
 
 /* ===================================================================== */
@@ -1410,150 +1389,158 @@ static void scene_adjust_cutoff(int delta)
 /* ===================================================================== */
 
 static void draw_bar(int column, int baseline_row, int bar_height_cells,
-                     bool growing_upward, int colour_pair)
-{
-    if (bar_height_cells <= 0) return;
-    attron(COLOR_PAIR(colour_pair) | A_BOLD);
-    for (int dy = 0; dy < bar_height_cells; dy++) {
-        int row = growing_upward ? (baseline_row - dy)
-                                 : (baseline_row + dy + 1);
-        if (row < 0 || row >= LINES) continue;
-        if (column < 0 || column >= COLS)  continue;
-        mvaddch(row, column, growing_upward ? '|' : '.');
-    }
-    attroff(COLOR_PAIR(colour_pair) | A_BOLD);
+                     bool growing_upward, int colour_pair) {
+  if (bar_height_cells <= 0)
+    return;
+  attron(COLOR_PAIR(colour_pair) | A_BOLD);
+  for (int dy = 0; dy < bar_height_cells; dy++) {
+    int row = growing_upward ? (baseline_row - dy) : (baseline_row + dy + 1);
+    if (row < 0 || row >= LINES)
+      continue;
+    if (column < 0 || column >= COLS)
+      continue;
+    mvaddch(row, column, growing_upward ? '|' : '.');
+  }
+  attroff(COLOR_PAIR(colour_pair) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §15  draw_signal — input + output panels                              */
 /* ===================================================================== */
 
-static void draw_signal_panel(const float *signal, int top_row,
-                              int height_rows, float peak,
-                              int colour_pair)
-{
-    int half_height = height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = top_row + half_height;
+static void draw_signal_panel(const float *signal, int top_row, int height_rows,
+                              float peak, int colour_pair) {
+  int half_height = height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = top_row + half_height;
 
-    int spacing = (COLS / N >= 2) ? 2 : 1;
-    int columns = (COLS / spacing < N) ? COLS / spacing : N;
+  int spacing = (COLS / N >= 2) ? 2 : 1;
+  int columns = (COLS / spacing < N) ? COLS / spacing : N;
 
-    for (int n = 0; n < columns; n++) {
-        float v   = signal[n] / (peak + 1e-6f);
-        bool  pos = (v >= 0.0f);
-        int   h   = (int)(fabsf(v) * (float)half_height + 0.5f);
-        for (int s = 0; s < spacing; s++)
-            draw_bar(n * spacing + s, midline_row, h, pos, colour_pair);
-    }
+  for (int n = 0; n < columns; n++) {
+    float v = signal[n] / (peak + 1e-6f);
+    bool pos = (v >= 0.0f);
+    int h = (int)(fabsf(v) * (float)half_height + 0.5f);
+    for (int s = 0; s < spacing; s++)
+      draw_bar(n * spacing + s, midline_row, h, pos, colour_pair);
+  }
 }
 
 /* ===================================================================== */
 /* §16  draw_filter — impulse + magnitude + phase response panels        */
 /* ===================================================================== */
 
-static void draw_impulse_response_panel(int top_row, int height_rows)
-{
-    /* Impulse response h[0..K-1] as bars centered horizontally on
-     * the panel.  Positive grows up, negative grows down. */
-    int half_height = height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = top_row + half_height;
+static void draw_impulse_response_panel(int top_row, int height_rows) {
+  /* Impulse response h[0..K-1] as bars centered horizontally on
+   * the panel.  Positive grows up, negative grows down. */
+  int half_height = height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = top_row + half_height;
 
-    /* Find filter peak for normalisation. */
-    float peak = 0.0f;
-    for (int i = 0; i < K; i++) {
-        float a = fabsf(g_kernel_taps[i]);
-        if (a > peak) peak = a;
+  /* Find filter peak for normalisation. */
+  float peak = 0.0f;
+  for (int i = 0; i < K; i++) {
+    float a = fabsf(g_kernel_taps[i]);
+    if (a > peak)
+      peak = a;
+  }
+  if (peak < 1e-6f)
+    peak = 1.0f;
+
+  /* Center the K-tap kernel on the screen.  3 cells per tap. */
+  int tap_w = 3;
+  int total_w = K * tap_w;
+  int left = (COLS - total_w) / 2;
+  if (left < 0)
+    left = 0;
+
+  for (int i = 0; i < K; i++) {
+    float v = g_kernel_taps[i] / peak;
+    bool pos = (v >= 0.0f);
+    int h = (int)(fabsf(v) * (float)half_height + 0.5f);
+    for (int s = 0; s < tap_w - 1; s++) {
+      int col = left + i * tap_w + s;
+      draw_bar(col, midline_row, h, pos, PAIR_FILTER);
     }
-    if (peak < 1e-6f) peak = 1.0f;
+  }
 
-    /* Center the K-tap kernel on the screen.  3 cells per tap. */
-    int tap_w = 3;
-    int total_w = K * tap_w;
-    int left = (COLS - total_w) / 2;
-    if (left < 0) left = 0;
-
-    for (int i = 0; i < K; i++) {
-        float v   = g_kernel_taps[i] / peak;
-        bool  pos = (v >= 0.0f);
-        int   h   = (int)(fabsf(v) * (float)half_height + 0.5f);
-        for (int s = 0; s < tap_w - 1; s++) {
-            int col = left + i * tap_w + s;
-            draw_bar(col, midline_row, h, pos, PAIR_FILTER);
-        }
-    }
-
-    /* Midline marker. */
-    attron(COLOR_PAIR(PAIR_LABEL));
-    int mid_left = left;
-    int mid_right = left + total_w;
-    if (mid_left < 0) mid_left = 0;
-    if (mid_right > COLS) mid_right = COLS;
-    for (int x = mid_left; x < mid_right; x++)
-        mvaddch(midline_row, x, '-');
-    attroff(COLOR_PAIR(PAIR_LABEL));
+  /* Midline marker. */
+  attron(COLOR_PAIR(PAIR_LABEL));
+  int mid_left = left;
+  int mid_right = left + total_w;
+  if (mid_left < 0)
+    mid_left = 0;
+  if (mid_right > COLS)
+    mid_right = COLS;
+  for (int x = mid_left; x < mid_right; x++)
+    mvaddch(midline_row, x, '-');
+  attroff(COLOR_PAIR(PAIR_LABEL));
 }
 
-static void draw_magnitude_response_panel(int top_row, int height_rows)
-{
-    /* |H[k]| for k=0..N/2 as upward bars from panel bottom. */
-    int baseline_row = top_row + height_rows - 1;
-    int bin_w = (COLS / (N_HALF + 1) >= 3) ? 3 : 2;
-    int max_bins = COLS / bin_w;
-    if (max_bins > N_HALF + 1) max_bins = N_HALF + 1;
+static void draw_magnitude_response_panel(int top_row, int height_rows) {
+  /* |H[k]| for k=0..N/2 as upward bars from panel bottom. */
+  int baseline_row = top_row + height_rows - 1;
+  int bin_w = (COLS / (N_HALF + 1) >= 3) ? 3 : 2;
+  int max_bins = COLS / bin_w;
+  if (max_bins > N_HALF + 1)
+    max_bins = N_HALF + 1;
 
-    for (int k = 0; k < max_bins; k++) {
-        float v = g_magnitude_response[k] / (g_magnitude_peak + 1e-6f);
-        int   h = (int)(v * (float)height_rows + 0.5f);
-        for (int bx = 0; bx < bin_w - 1; bx++)
-            draw_bar(k * bin_w + bx, baseline_row, h, true, PAIR_MAGRESP);
-    }
+  for (int k = 0; k < max_bins; k++) {
+    float v = g_magnitude_response[k] / (g_magnitude_peak + 1e-6f);
+    int h = (int)(v * (float)height_rows + 0.5f);
+    for (int bx = 0; bx < bin_w - 1; bx++)
+      draw_bar(k * bin_w + bx, baseline_row, h, true, PAIR_MAGRESP);
+  }
 
-    /* Cutoff marker — vertical ':' at the cutoff column. */
-    if (g_cutoff_bin <= max_bins) {
-        attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-        for (int dy = 0; dy < height_rows; dy++) {
-            int row = top_row + dy;
-            int col = g_cutoff_bin * bin_w + bin_w / 2;
-            if (col < COLS && row < LINES)
-                mvaddch(row, col, ':');
-        }
-        attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  /* Cutoff marker — vertical ':' at the cutoff column. */
+  if (g_cutoff_bin <= max_bins) {
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    for (int dy = 0; dy < height_rows; dy++) {
+      int row = top_row + dy;
+      int col = g_cutoff_bin * bin_w + bin_w / 2;
+      if (col < COLS && row < LINES)
+        mvaddch(row, col, ':');
     }
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  }
 }
 
-static void draw_phase_response_panel(int top_row, int height_rows)
-{
-    /* arg(H[k]) for k=0..N/2 as ± bars from a midline.  For
-     * symmetric kernels the phase is LINEAR in k → ramp pattern
-     * with ±pi wraparounds (T9). */
-    if (height_rows < 3) return;
+static void draw_phase_response_panel(int top_row, int height_rows) {
+  /* arg(H[k]) for k=0..N/2 as ± bars from a midline.  For
+   * symmetric kernels the phase is LINEAR in k → ramp pattern
+   * with ±pi wraparounds (T9). */
+  if (height_rows < 3)
+    return;
 
-    int half_height = height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = top_row + half_height;
+  int half_height = height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = top_row + half_height;
 
-    int bin_w = (COLS / (N_HALF + 1) >= 3) ? 3 : 2;
-    int max_bins = COLS / bin_w;
-    if (max_bins > N_HALF + 1) max_bins = N_HALF + 1;
+  int bin_w = (COLS / (N_HALF + 1) >= 3) ? 3 : 2;
+  int max_bins = COLS / bin_w;
+  if (max_bins > N_HALF + 1)
+    max_bins = N_HALF + 1;
 
-    for (int k = 0; k < max_bins; k++) {
-        /* Skip near-zero magnitude bins (phase would be noise). */
-        if (g_magnitude_response[k] < 1e-3f * g_magnitude_peak) continue;
+  for (int k = 0; k < max_bins; k++) {
+    /* Skip near-zero magnitude bins (phase would be noise). */
+    if (g_magnitude_response[k] < 1e-3f * g_magnitude_peak)
+      continue;
 
-        float fraction = g_phase_response[k] / (float)M_PI;
-        bool  pos      = (g_phase_response[k] >= 0.0f);
-        int   h        = (int)(fabsf(fraction) * (float)half_height + 0.5f);
-        for (int bx = 0; bx < bin_w - 1; bx++)
-            draw_bar(k * bin_w + bx, midline_row, h, pos, PAIR_PHRESP);
-    }
+    float fraction = g_phase_response[k] / (float)M_PI;
+    bool pos = (g_phase_response[k] >= 0.0f);
+    int h = (int)(fabsf(fraction) * (float)half_height + 0.5f);
+    for (int bx = 0; bx < bin_w - 1; bx++)
+      draw_bar(k * bin_w + bx, midline_row, h, pos, PAIR_PHRESP);
+  }
 
-    /* Midline marker. */
-    attron(COLOR_PAIR(PAIR_LABEL));
-    for (int x = 0; x < COLS && x < max_bins * bin_w; x++)
-        mvaddch(midline_row, x, '-');
-    attroff(COLOR_PAIR(PAIR_LABEL));
+  /* Midline marker. */
+  attron(COLOR_PAIR(PAIR_LABEL));
+  for (int x = 0; x < COLS && x < max_bins * bin_w; x++)
+    mvaddch(midline_row, x, '-');
+  attroff(COLOR_PAIR(PAIR_LABEL));
 }
 
 /* ===================================================================== */
@@ -1563,202 +1550,235 @@ static void draw_phase_response_panel(int top_row, int height_rows)
  *  Print the K filter taps as a numeric table, top-left.  Useful for
  *  reading off the actual kernel weights.
  */
-static void draw_kernel_table_overlay(void)
-{
-    if (!g_show_kernel_table) return;
+static void draw_kernel_table_overlay(void) {
+  if (!g_show_kernel_table)
+    return;
 
-    int x = 2, y = 2;
-    if (y + K + 2 >= LINES - 1) return;
+  int x = 2, y = 2;
+  if (y + K + 2 >= LINES - 1)
+    return;
 
-    attron(COLOR_PAIR(PAIR_HINT));
-    mvprintw(y, x, "Kernel taps  %s  (K = %d, win = %s)",
-             filter_name[g_filter_kind], K,
-             window_name[g_window_kind]);
-    attroff(COLOR_PAIR(PAIR_HINT));
+  attron(COLOR_PAIR(PAIR_HINT));
+  mvprintw(y, x, "Kernel taps  %s  (K = %d, win = %s)",
+           filter_name[g_filter_kind], K, window_name[g_window_kind]);
+  attroff(COLOR_PAIR(PAIR_HINT));
 
-    /* Two columns of K/2 taps for compactness. */
-    int rows_per_col = (K + 1) / 2;
-    for (int i = 0; i < K; i++) {
-        int row_offset = i % rows_per_col;
-        int col_offset = (i / rows_per_col) * 22;
-        attron(COLOR_PAIR(PAIR_FILTER) | A_BOLD);
-        mvprintw(y + 1 + row_offset, x + col_offset,
-                 "  k[%2d] = %+8.5f", i, (double)g_kernel_taps[i]);
-        attroff(COLOR_PAIR(PAIR_FILTER) | A_BOLD);
-    }
+  /* Two columns of K/2 taps for compactness. */
+  int rows_per_col = (K + 1) / 2;
+  for (int i = 0; i < K; i++) {
+    int row_offset = i % rows_per_col;
+    int col_offset = (i / rows_per_col) * 22;
+    attron(COLOR_PAIR(PAIR_FILTER) | A_BOLD);
+    mvprintw(y + 1 + row_offset, x + col_offset, "  k[%2d] = %+8.5f", i,
+             (double)g_kernel_taps[i]);
+    attroff(COLOR_PAIR(PAIR_FILTER) | A_BOLD);
+  }
 }
 
 /* ===================================================================== */
 /* §18  hud — status + hint + paused chip                                */
 /* ===================================================================== */
 
-static void draw_hud(void)
-{
-    char status[200];
-    snprintf(status, sizeof status,
-             " FIR filter  N=%d K=%d  signal:%s  filter:%s  win:%s  "
-             "cutoff:%2d  %s  %s ",
-             N, K, signal_name[g_signal_kind],
-             filter_name[g_filter_kind], window_name[g_window_kind],
-             g_cutoff_bin,
-             g_auto_sweep_cutoff ? "AUTO  " : "MANUAL",
-             g_simulation_paused ? "PAUSED" : "      ");
-    int x = COLS - (int)strlen(status);
-    if (x < 0) x = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, x, "%s", status);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+static void draw_hud(void) {
+  char status[200];
+  snprintf(status, sizeof status,
+           " FIR filter  N=%d K=%d  signal:%s  filter:%s  win:%s  "
+           "cutoff:%2d  %s  %s ",
+           N, K, signal_name[g_signal_kind], filter_name[g_filter_kind],
+           window_name[g_window_kind], g_cutoff_bin,
+           g_auto_sweep_cutoff ? "AUTO  " : "MANUAL",
+           g_simulation_paused ? "PAUSED" : "      ");
+  int x = COLS - (int)strlen(status);
+  if (x < 0)
+    x = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, x, "%s", status);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void draw_hint(void)
-{
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(LINES - 1, 0,
-             " q:quit  spc:pause  f:filter  w:window  s:signal "
-             " a:auto/manual  +/-:cutoff  d:phase  D:taps  r:reset ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void draw_hint(void) {
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(LINES - 1, 0,
+           " q:quit  spc:pause  f:filter  w:window  s:signal "
+           " a:auto/manual  +/-:cutoff  d:phase  D:taps  r:reset ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void render_frame(void)
-{
-    erase();
+static void render_frame(void) {
+  erase();
 
-    /* Layout: 1 hud + 4 labels + 4 panels + 1 hint = 6 reserved.
-     * Phase panel "steals" some vertical space when toggled on. */
-    int rows_for_panels = LINES - 6;
-    if (rows_for_panels < 12) rows_for_panels = 12;
+  /* Layout: 1 hud + 4 labels + 4 panels + 1 hint = 6 reserved.
+   * Phase panel "steals" some vertical space when toggled on. */
+  int rows_for_panels = LINES - 6;
+  if (rows_for_panels < 12)
+    rows_for_panels = 12;
 
-    int phase_h    = g_show_phase_panel ? rows_for_panels / 5 : 0;
-    int main_h     = rows_for_panels - phase_h;
-    int input_h    = main_h / 4;
-    int filter_h   = main_h / 4;
-    int magresp_h  = main_h / 4;
-    int output_h   = main_h - input_h - filter_h - magresp_h;
+  int phase_h = g_show_phase_panel ? rows_for_panels / 5 : 0;
+  int main_h = rows_for_panels - phase_h;
+  int input_h = main_h / 4;
+  int filter_h = main_h / 4;
+  int magresp_h = main_h / 4;
+  int output_h = main_h - input_h - filter_h - magresp_h;
 
-    int input_label_row    = 1;
-    int input_top_row      = 2;
-    int filter_label_row   = 2 + input_h;
-    int filter_top_row     = 3 + input_h;
-    int magresp_label_row  = 3 + input_h + filter_h;
-    int magresp_top_row    = 4 + input_h + filter_h;
-    int output_label_row   = 4 + input_h + filter_h + magresp_h;
-    int output_top_row     = 5 + input_h + filter_h + magresp_h;
-    int phase_top_row      = output_top_row + output_h
-                           + (g_show_phase_panel ? 1 : 0);
+  int input_label_row = 1;
+  int input_top_row = 2;
+  int filter_label_row = 2 + input_h;
+  int filter_top_row = 3 + input_h;
+  int magresp_label_row = 3 + input_h + filter_h;
+  int magresp_top_row = 4 + input_h + filter_h;
+  int output_label_row = 4 + input_h + filter_h + magresp_h;
+  int output_top_row = 5 + input_h + filter_h + magresp_h;
+  int phase_top_row = output_top_row + output_h + (g_show_phase_panel ? 1 : 0);
 
-    /* Panel labels. */
-    attron(COLOR_PAIR(PAIR_LABEL));
-    mvprintw(input_label_row,   0, "Input x[n]");
-    mvprintw(filter_label_row,  0,
-             "Filter h[i]  (K = %d taps, centered)", K);
-    mvprintw(magresp_label_row, 0,
-             "Magnitude response |H[k]|  (cutoff marked with ':')");
-    mvprintw(output_label_row,  0, "Output y[n] = h * x");
-    if (g_show_phase_panel)
-        mvprintw(phase_top_row - 1, 0,
-                 "Phase response arg(H[k])  (linear ramp = linear phase)");
-    attroff(COLOR_PAIR(PAIR_LABEL));
+  /* Panel labels. */
+  attron(COLOR_PAIR(PAIR_LABEL));
+  mvprintw(input_label_row, 0, "Input x[n]");
+  mvprintw(filter_label_row, 0, "Filter h[i]  (K = %d taps, centered)", K);
+  mvprintw(magresp_label_row, 0,
+           "Magnitude response |H[k]|  (cutoff marked with ':')");
+  mvprintw(output_label_row, 0, "Output y[n] = h * x");
+  if (g_show_phase_panel)
+    mvprintw(phase_top_row - 1, 0,
+             "Phase response arg(H[k])  (linear ramp = linear phase)");
+  attroff(COLOR_PAIR(PAIR_LABEL));
 
-    draw_signal_panel(g_input_signal, input_top_row, input_h,
-                      g_input_peak, PAIR_INPUT);
-    draw_impulse_response_panel(filter_top_row, filter_h);
-    draw_magnitude_response_panel(magresp_top_row, magresp_h);
-    draw_signal_panel(g_output_signal, output_top_row, output_h,
-                      g_output_peak, PAIR_OUTPUT);
-    if (g_show_phase_panel)
-        draw_phase_response_panel(phase_top_row, phase_h);
+  draw_signal_panel(g_input_signal, input_top_row, input_h, g_input_peak,
+                    PAIR_INPUT);
+  draw_impulse_response_panel(filter_top_row, filter_h);
+  draw_magnitude_response_panel(magresp_top_row, magresp_h);
+  draw_signal_panel(g_output_signal, output_top_row, output_h, g_output_peak,
+                    PAIR_OUTPUT);
+  if (g_show_phase_panel)
+    draw_phase_response_panel(phase_top_row, phase_h);
 
-    /* Debug overlay. */
-    draw_kernel_table_overlay();
+  /* Debug overlay. */
+  draw_kernel_table_overlay();
 
-    /* HUD always last. */
-    draw_hud();
-    draw_hint();
+  /* HUD always last. */
+  draw_hud();
+  draw_hint();
 
-    wnoutrefresh(stdscr);
-    doupdate();
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §19  app — signal handlers + main loop + key dispatch                 */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_should_quit    = 0;
+static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
 
-static void on_signal(int sig)
-{
-    if (sig == SIGWINCH) g_resize_pending = 1;
-    else                 g_should_quit    = 1;
+static void on_signal(int sig) {
+  if (sig == SIGWINCH)
+    g_resize_pending = 1;
+  else
+    g_should_quit = 1;
 }
 
 static void cleanup_screen(void) { endwin(); }
 
-static bool app_handle_key(int ch)
-{
-    switch (ch) {
-        case 'q': case 'Q': case 27:  return true;
-        case ' ':                     g_simulation_paused = !g_simulation_paused; break;
-        case 'f':                     scene_cycle_filter(+1); break;
-        case 'F':                     scene_cycle_filter(-1); break;
-        case 'w':                     scene_cycle_window(+1); break;
-        case 'W':                     scene_cycle_window(-1); break;
-        case 's':                     scene_cycle_signal(+1); break;
-        case 'S':                     scene_cycle_signal(-1); break;
-        case 'a': case 'A':           g_auto_sweep_cutoff = !g_auto_sweep_cutoff; break;
-        case '+': case '=': case '.': scene_adjust_cutoff(+1); break;
-        case '-':           case ',': scene_adjust_cutoff(-1); break;
-        case 'd':                     g_show_phase_panel  = !g_show_phase_panel; break;
-        case 'D':                     g_show_kernel_table = !g_show_kernel_table; break;
-        case 'r': case 'R':           scene_reset(); break;
-        default: break;
-    }
-    return false;
+static bool app_handle_key(int ch) {
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return true;
+  case ' ':
+    g_simulation_paused = !g_simulation_paused;
+    break;
+  case 'f':
+    scene_cycle_filter(+1);
+    break;
+  case 'F':
+    scene_cycle_filter(-1);
+    break;
+  case 'w':
+    scene_cycle_window(+1);
+    break;
+  case 'W':
+    scene_cycle_window(-1);
+    break;
+  case 's':
+    scene_cycle_signal(+1);
+    break;
+  case 'S':
+    scene_cycle_signal(-1);
+    break;
+  case 'a':
+  case 'A':
+    g_auto_sweep_cutoff = !g_auto_sweep_cutoff;
+    break;
+  case '+':
+  case '=':
+  case '.':
+    scene_adjust_cutoff(+1);
+    break;
+  case '-':
+  case ',':
+    scene_adjust_cutoff(-1);
+    break;
+  case 'd':
+    g_show_phase_panel = !g_show_phase_panel;
+    break;
+  case 'D':
+    g_show_kernel_table = !g_show_kernel_table;
+    break;
+  case 'r':
+  case 'R':
+    scene_reset();
+    break;
+  default:
+    break;
+  }
+  return false;
 }
 
-int main(void)
-{
-    atexit(cleanup_screen);
-    signal(SIGINT,   on_signal);
-    signal(SIGTERM,  on_signal);
-    signal(SIGWINCH, on_signal);
+int main(void) {
+  atexit(cleanup_screen);
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGWINCH, on_signal);
 
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    colors_init();
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  colors_init();
 
-    scene_reset();
+  scene_reset();
 
-    long long next_frame_ns = clock_now_ns();
+  long long next_frame_ns = clock_now_ns();
 
-    while (!g_should_quit) {
-        if (g_resize_pending) {
-            g_resize_pending = 0;
-            endwin();
-            refresh();
-        }
-
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (app_handle_key(ch)) { g_should_quit = 1; break; }
-        }
-
-        long long now = clock_now_ns();
-        if (now >= next_frame_ns) {
-            scene_tick();
-            render_frame();
-            next_frame_ns += RENDER_TICK_NS;
-            if (clock_now_ns() > next_frame_ns + 5 * RENDER_TICK_NS)
-                next_frame_ns = clock_now_ns() + RENDER_TICK_NS;
-        } else {
-            clock_sleep_ns(next_frame_ns - now);
-        }
+  while (!g_should_quit) {
+    if (g_resize_pending) {
+      g_resize_pending = 0;
+      endwin();
+      refresh();
     }
 
-    return 0;
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (app_handle_key(ch)) {
+        g_should_quit = 1;
+        break;
+      }
+    }
+
+    long long now = clock_now_ns();
+    if (now >= next_frame_ns) {
+      scene_tick();
+      render_frame();
+      next_frame_ns += RENDER_TICK_NS;
+      if (clock_now_ns() > next_frame_ns + 5 * RENDER_TICK_NS)
+        next_frame_ns = clock_now_ns() + RENDER_TICK_NS;
+    } else {
+      clock_sleep_ns(next_frame_ns - now);
+    }
+  }
+
+  return 0;
 }

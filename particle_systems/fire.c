@@ -436,10 +436,10 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ===================================================================== */
 /* §2  loop presets                                                       */
@@ -454,25 +454,25 @@
  */
 
 enum {
-    SIM_FPS_MIN     =  5,    /* lower bound for [/] cycling                */
-    SIM_FPS_DEFAULT = 30,    /* initial simulation rate                    */
-    SIM_FPS_MAX     = 60,    /* upper bound for [/] cycling                */
-    SIM_FPS_STEP    =  5,    /* one press of [/] adjusts by this many Hz   */
+  SIM_FPS_MIN = 5,      /* lower bound for [/] cycling                */
+  SIM_FPS_DEFAULT = 30, /* initial simulation rate                    */
+  SIM_FPS_MAX = 60,     /* upper bound for [/] cycling                */
+  SIM_FPS_STEP = 5,     /* one press of [/] adjusts by this many Hz   */
 
-    HUD_COLS        = 64,    /* max width of any HUD status string         */
-    FPS_UPDATE_MS   = 500,   /* render-fps averaging window                */
+  HUD_COLS = 64,       /* max width of any HUD status string         */
+  FPS_UPDATE_MS = 500, /* render-fps averaging window                */
 
-    N_ALGOS         =  3,    /* CA, Particle, Plasma                       */
-    N_DEBUG_MODES   =  4,    /* off, raw heat, gamma-only, arch envelope   */
-    MAX_FIRE_PARTS  = 800,   /* particle pool size                         */
+  N_ALGOS = 3,          /* CA, Particle, Plasma                       */
+  N_DEBUG_MODES = 4,    /* off, raw heat, gamma-only, arch envelope   */
+  MAX_FIRE_PARTS = 800, /* particle pool size                         */
 };
 
-#define MAX_HEAT    1.0f    /* heat-grid ceiling; cells live in [0, MAX_HEAT] */
-#define WIND_MAX    3       /* maximum |wind| in cells / tick                 */
+#define MAX_HEAT 1.0f /* heat-grid ceiling; cells live in [0, MAX_HEAT] */
+#define WIND_MAX 3    /* maximum |wind| in cells / tick                 */
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(hz)     (NS_PER_SEC / (hz))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(hz) (NS_PER_SEC / (hz))
 
 /* ===================================================================== */
 /* §3  source presets                                                     */
@@ -488,10 +488,10 @@ enum {
  *   existence.
  */
 
-#define ARCH_MARGIN_FRAC   0.04f   /* 4 % of cols kept cold at each side       */
-#define FUEL_JITTER_BASE   0.82f   /* min random multiplier on fuel             */
-#define FUEL_JITTER_RANGE  0.18f   /* additional random range 0 → 0.18          */
-#define WARMUP_TICKS       80      /* linear 0 → 1 over the first 80 ticks      */
+#define ARCH_MARGIN_FRAC 0.04f  /* 4 % of cols kept cold at each side       */
+#define FUEL_JITTER_BASE 0.82f  /* min random multiplier on fuel             */
+#define FUEL_JITTER_RANGE 0.18f /* additional random range 0 → 0.18 */
+#define WARMUP_TICKS 80 /* linear 0 → 1 over the first 80 ticks      */
 
 /* ===================================================================== */
 /* §4  ca presets                                                         */
@@ -505,11 +505,15 @@ enum {
  *   tiny terminals (rows < 5) from collapsing the decay to zero.
  */
 
-#define CA_REACH_FRAC      0.75f   /* expected flame peak at 75 % of rows       */
-#define CA_DECAY_BASE_FRAC 0.55f   /* base decay   = avg_decay × this            */
-#define CA_DECAY_RAND_FRAC 0.90f   /* random range = avg_decay × this            */
-#define CA_DECAY_BASE_MIN  0.010f  /* floor for tiny terminals                   */
-#define CA_DECAY_RAND_MIN  0.015f  /* floor for tiny terminals                   */
+#define CA_REACH_FRAC 0.75f /* expected flame peak at 75 % of rows       */
+#define CA_DECAY_BASE_FRAC                                                     \
+  0.55f /* base decay   = avg_decay × this            */
+#define CA_DECAY_RAND_FRAC                                                     \
+  0.90f /* random range = avg_decay × this            */
+#define CA_DECAY_BASE_MIN                                                      \
+  0.010f /* floor for tiny terminals                   */
+#define CA_DECAY_RAND_MIN                                                      \
+  0.015f /* floor for tiny terminals                   */
 
 /* ===================================================================== */
 /* §5  particle presets                                                   */
@@ -524,14 +528,14 @@ enum {
  *   is the equilibrium birth rate at full warmup.
  */
 
-#define PART_LIFE_MIN      15.f    /* minimum lifetime, in ticks                 */
-#define PART_LIFE_RANGE    20.f    /* uniform random range added on top          */
-#define PART_VY_BASE        0.5f   /* minimum upward speed (cells / tick)        */
-#define PART_VY_RANGE       0.8f   /* uniform random extra upward speed          */
-#define PART_VX_SPREAD      0.5f   /* width of birth lateral kick (±SPREAD/2)    */
-#define PART_TURB_STEP      0.15f  /* per-tick random nudge on vx                */
-#define PART_VX_DAMP        0.96f  /* lateral damping per tick                   */
-#define SPAWN_PER_TICK      20     /* equilibrium birth rate at full warmup      */
+#define PART_LIFE_MIN 15.f   /* minimum lifetime, in ticks                 */
+#define PART_LIFE_RANGE 20.f /* uniform random range added on top          */
+#define PART_VY_BASE 0.5f    /* minimum upward speed (cells / tick)        */
+#define PART_VY_RANGE 0.8f   /* uniform random extra upward speed          */
+#define PART_VX_SPREAD 0.5f  /* width of birth lateral kick (±SPREAD/2)    */
+#define PART_TURB_STEP 0.15f /* per-tick random nudge on vx                */
+#define PART_VX_DAMP 0.96f   /* lateral damping per tick                   */
+#define SPAWN_PER_TICK 20    /* equilibrium birth rate at full warmup      */
 
 /* ===================================================================== */
 /* §6  plasma presets                                                     */
@@ -545,17 +549,17 @@ enum {
  *   screen, TSPD counts radians-per-tick of phase drift.
  */
 
-#define PLASMA_TIME_STEP   0.07f
-#define PLASMA_BASE        0.50f
-#define PLASMA_H1_AMP      0.28f
-#define PLASMA_H1_XFREQ    5.0f
-#define PLASMA_H1_TSPD     2.2f
-#define PLASMA_H2_AMP      0.18f
-#define PLASMA_H2_XFREQ   11.0f
-#define PLASMA_H2_TSPD     1.6f
-#define PLASMA_H3_AMP      0.10f
-#define PLASMA_H3_XFREQ    3.0f
-#define PLASMA_H3_TSPD     0.7f
+#define PLASMA_TIME_STEP 0.07f
+#define PLASMA_BASE 0.50f
+#define PLASMA_H1_AMP 0.28f
+#define PLASMA_H1_XFREQ 5.0f
+#define PLASMA_H1_TSPD 2.2f
+#define PLASMA_H2_AMP 0.18f
+#define PLASMA_H2_XFREQ 11.0f
+#define PLASMA_H2_TSPD 1.6f
+#define PLASMA_H3_AMP 0.10f
+#define PLASMA_H3_XFREQ 3.0f
+#define PLASMA_H3_TSPD 0.7f
 
 /* ===================================================================== */
 /* §7  monotonic clock                                                    */
@@ -572,19 +576,16 @@ enum {
  * clock_ns() — read the monotonic clock in nanoseconds.
  *
  *   Purpose      : single source of time for the fixed-timestep loop.
- *   Pseudocode   : t ← clock_gettime(CLOCK_MONOTONIC); return t.sec * 1e9 + t.nsec
- *   Mental model : a stopwatch that never resets and never jumps even
- *                  when the wall clock is adjusted by NTP.
- *   Inputs       : none
- *   Output       : int64_t nanoseconds since an unspecified epoch
- *   Why it lives here: the simulation must never depend on system time
- *                      changes; CLOCK_MONOTONIC guarantees that.
+ *   Pseudocode   : t ← clock_gettime(CLOCK_MONOTONIC); return t.sec * 1e9 +
+ * t.nsec Mental model : a stopwatch that never resets and never jumps even when
+ * the wall clock is adjusted by NTP. Inputs       : none Output       : int64_t
+ * nanoseconds since an unspecified epoch Why it lives here: the simulation must
+ * never depend on system time changes; CLOCK_MONOTONIC guarantees that.
  */
-static int64_t clock_ns(void)
-{
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (int64_t)now.tv_sec * NS_PER_SEC + now.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (int64_t)now.tv_sec * NS_PER_SEC + now.tv_nsec;
 }
 
 /*
@@ -599,11 +600,11 @@ static int64_t clock_ns(void)
  *   Why it lives here: keeps sleep duration encapsulated so the main
  *                      loop reads as one line.
  */
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = { (time_t)(ns / NS_PER_SEC), (long)(ns % NS_PER_SEC) };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {(time_t)(ns / NS_PER_SEC), (long)(ns % NS_PER_SEC)};
+  nanosleep(&req, NULL);
 }
 
 /* ===================================================================== */
@@ -633,18 +634,18 @@ static void clock_sleep_ns(int64_t ns)
  */
 
 static const char k_ramp[] = " .:+x*X#@";
-#define RAMP_N (int)(sizeof k_ramp - 1)   /* 9 visible glyphs */
+#define RAMP_N (int)(sizeof k_ramp - 1) /* 9 visible glyphs */
 
 static const float k_lut_breaks[RAMP_N] = {
-    0.000f,  /* ' '  cold      */
-    0.080f,  /* '.'  ember     */
-    0.180f,  /* ':'  low       */
-    0.290f,  /* '+'  mid-low   */
-    0.390f,  /* 'x'  mid       */
-    0.500f,  /* '*'  mid-high  */
-    0.620f,  /* 'X'  hot       */
-    0.750f,  /* '#'  very hot  */
-    0.900f,  /* '@'  core      */
+    0.000f, /* ' '  cold      */
+    0.080f, /* '.'  ember     */
+    0.180f, /* ':'  low       */
+    0.290f, /* '+'  mid-low   */
+    0.390f, /* 'x'  mid       */
+    0.500f, /* '*'  mid-high  */
+    0.620f, /* 'X'  hot       */
+    0.750f, /* '#'  very hot  */
+    0.900f, /* '@'  core      */
 };
 
 /*
@@ -659,12 +660,14 @@ static const float k_lut_breaks[RAMP_N] = {
  *   Why it lives here: the only spot that maps continuous heat to
  *                      discrete glyphs; centralises the staircase.
  */
-static int lut_index(float v)
-{
-    int bucket = 0;
-    for (int i = RAMP_N - 1; i >= 0; i--)
-        if (v >= k_lut_breaks[i]) { bucket = i; break; }
-    return bucket;
+static int lut_index(float v) {
+  int bucket = 0;
+  for (int i = RAMP_N - 1; i >= 0; i--)
+    if (v >= k_lut_breaks[i]) {
+      bucket = i;
+      break;
+    }
+  return bucket;
 }
 
 /*
@@ -681,11 +684,12 @@ static int lut_index(float v)
  *   Why it lives here: Floyd-Steinberg needs a representative value
  *                      per bucket to compute the error to diffuse.
  */
-static float lut_midpoint(int idx)
-{
-    if (idx <= 0)          return 0.f;
-    if (idx >= RAMP_N - 1) return 1.f;
-    return (k_lut_breaks[idx] + k_lut_breaks[idx + 1]) * 0.5f;
+static float lut_midpoint(int idx) {
+  if (idx <= 0)
+    return 0.f;
+  if (idx >= RAMP_N - 1)
+    return 1.f;
+  return (k_lut_breaks[idx] + k_lut_breaks[idx + 1]) * 0.5f;
 }
 
 /* ===================================================================== */
@@ -706,71 +710,61 @@ static float lut_midpoint(int idx)
  */
 
 typedef struct {
-    const char *name;
-    int         fg256[RAMP_N];   /* xterm 256-colour indices, per bucket */
-    int         fg8[RAMP_N];     /* 8-colour fallback                    */
-    attr_t      attr8[RAMP_N];   /* fallback attribute (DIM/NORMAL/BOLD) */
+  const char *name;
+  int fg256[RAMP_N];    /* xterm 256-colour indices, per bucket */
+  int fg8[RAMP_N];      /* 8-colour fallback                    */
+  attr_t attr8[RAMP_N]; /* fallback attribute (DIM/NORMAL/BOLD) */
 } FireTheme;
 
-#define CP_BASE   1                       /* ramp pairs: CP_BASE .. CP_BASE+RAMP_N-1 */
-#define PAIR_HUD  (CP_BASE + RAMP_N)      /* bright yellow status (row 0 / row 1)    */
-#define PAIR_HINT (CP_BASE + RAMP_N + 1)  /* bright cyan key hint (row rows-1)       */
+#define CP_BASE 1 /* ramp pairs: CP_BASE .. CP_BASE+RAMP_N-1 */
+#define PAIR_HUD                                                               \
+  (CP_BASE + RAMP_N) /* bright yellow status (row 0 / row 1)    */
+#define PAIR_HINT                                                              \
+  (CP_BASE + RAMP_N + 1) /* bright cyan key hint (row rows-1)       */
 
 static const FireTheme k_themes[] = {
-    {   /* 0  fire — classic red / orange / yellow */
-        "fire",
-        {  88, 124, 160, 196, 202, 208, 214, 220, 231 },
-        {  COLOR_RED,    COLOR_RED,    COLOR_RED,    COLOR_RED,
-           COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW,
-           COLOR_WHITE  },
-        {  A_NORMAL, A_NORMAL, A_BOLD, A_BOLD,
-           A_DIM,    A_NORMAL, A_BOLD, A_BOLD, A_BOLD }
-    },
-    {   /* 1  ice — sky blue / cyan / white */
-        "ice",
-        {  25, 27, 33, 39, 45, 51, 87, 159, 231 },
-        {  COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_CYAN,
-           COLOR_CYAN, COLOR_CYAN, COLOR_WHITE, COLOR_WHITE,
-           COLOR_WHITE  },
-        {  A_NORMAL, A_BOLD, A_NORMAL, A_NORMAL,
-           A_BOLD,   A_BOLD, A_BOLD,  A_BOLD, A_BOLD }
-    },
-    {   /* 2  plasma — violet / magenta / white */
-        "plasma",
-        {  55, 91, 93, 129, 165, 201, 207, 213, 231 },
-        {  COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA,
-           COLOR_MAGENTA, COLOR_MAGENTA, COLOR_WHITE,   COLOR_WHITE,
-           COLOR_WHITE    },
-        {  A_NORMAL, A_NORMAL, A_BOLD, A_BOLD,
-           A_BOLD,   A_BOLD,   A_DIM,  A_NORMAL, A_BOLD }
-    },
-    {   /* 3  nova — green / lime / white */
-        "nova",
-        {  28, 34, 40, 46, 82, 118, 154, 190, 231 },
-        {  COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
-           COLOR_GREEN, COLOR_GREEN, COLOR_WHITE, COLOR_WHITE,
-           COLOR_WHITE  },
-        {  A_NORMAL, A_BOLD, A_BOLD, A_BOLD,
-           A_BOLD,   A_BOLD, A_BOLD, A_BOLD, A_BOLD }
-    },
-    {   /* 4  poison — olive / yellow-green / white */
-        "poison",
-        {  58, 64, 70, 76, 118, 154, 184, 220, 231 },
-        {  COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN,  COLOR_YELLOW,
-           COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE,
-           COLOR_WHITE   },
-        {  A_NORMAL, A_NORMAL, A_BOLD, A_BOLD,
-           A_BOLD,   A_BOLD,   A_BOLD, A_BOLD, A_BOLD }
-    },
-    {   /* 5  gold — amber / orange / yellow */
-        "gold",
-        {  130, 136, 172, 178, 208, 214, 220, 226, 231 },
-        {  COLOR_RED,    COLOR_RED,    COLOR_YELLOW, COLOR_YELLOW,
-           COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE,
-           COLOR_WHITE   },
-        {  A_NORMAL, A_BOLD, A_NORMAL, A_BOLD,
-           A_BOLD,   A_BOLD,  A_BOLD,  A_BOLD, A_BOLD }
-    },
+    {/* 0  fire — classic red / orange / yellow */
+     "fire",
+     {88, 124, 160, 196, 202, 208, 214, 220, 231},
+     {COLOR_RED, COLOR_RED, COLOR_RED, COLOR_RED, COLOR_YELLOW, COLOR_YELLOW,
+      COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE},
+     {A_NORMAL, A_NORMAL, A_BOLD, A_BOLD, A_DIM, A_NORMAL, A_BOLD, A_BOLD,
+      A_BOLD}},
+    {/* 1  ice — sky blue / cyan / white */
+     "ice",
+     {25, 27, 33, 39, 45, 51, 87, 159, 231},
+     {COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_CYAN, COLOR_CYAN, COLOR_CYAN,
+      COLOR_WHITE, COLOR_WHITE, COLOR_WHITE},
+     {A_NORMAL, A_BOLD, A_NORMAL, A_NORMAL, A_BOLD, A_BOLD, A_BOLD, A_BOLD,
+      A_BOLD}},
+    {/* 2  plasma — violet / magenta / white */
+     "plasma",
+     {55, 91, 93, 129, 165, 201, 207, 213, 231},
+     {COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA,
+      COLOR_MAGENTA, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE},
+     {A_NORMAL, A_NORMAL, A_BOLD, A_BOLD, A_BOLD, A_BOLD, A_DIM, A_NORMAL,
+      A_BOLD}},
+    {/* 3  nova — green / lime / white */
+     "nova",
+     {28, 34, 40, 46, 82, 118, 154, 190, 231},
+     {COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
+      COLOR_GREEN, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE},
+     {A_NORMAL, A_BOLD, A_BOLD, A_BOLD, A_BOLD, A_BOLD, A_BOLD, A_BOLD,
+      A_BOLD}},
+    {/* 4  poison — olive / yellow-green / white */
+     "poison",
+     {58, 64, 70, 76, 118, 154, 184, 220, 231},
+     {COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_YELLOW, COLOR_YELLOW,
+      COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE, COLOR_WHITE},
+     {A_NORMAL, A_NORMAL, A_BOLD, A_BOLD, A_BOLD, A_BOLD, A_BOLD, A_BOLD,
+      A_BOLD}},
+    {/* 5  gold — amber / orange / yellow */
+     "gold",
+     {130, 136, 172, 178, 208, 214, 220, 226, 231},
+     {COLOR_RED, COLOR_RED, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW,
+      COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE, COLOR_WHITE},
+     {A_NORMAL, A_BOLD, A_NORMAL, A_BOLD, A_BOLD, A_BOLD, A_BOLD, A_BOLD,
+      A_BOLD}},
 };
 
 #define THEME_COUNT (int)(sizeof k_themes / sizeof k_themes[0])
@@ -799,15 +793,14 @@ static const FireTheme k_themes[] = {
  *   Why it lives here: separation of concerns — theme_apply touches
  *                      only ramp pairs, color_init also touches HUD pairs.
  */
-static void theme_apply(int theme_index)
-{
-    const FireTheme *theme = &k_themes[theme_index];
-    for (int i = 0; i < RAMP_N; i++) {
-        if (COLORS >= 256)
-            init_pair(CP_BASE + i, theme->fg256[i], COLOR_BLACK);
-        else
-            init_pair(CP_BASE + i, theme->fg8[i],   COLOR_BLACK);
-    }
+static void theme_apply(int theme_index) {
+  const FireTheme *theme = &k_themes[theme_index];
+  for (int i = 0; i < RAMP_N; i++) {
+    if (COLORS >= 256)
+      init_pair(CP_BASE + i, theme->fg256[i], COLOR_BLACK);
+    else
+      init_pair(CP_BASE + i, theme->fg8[i], COLOR_BLACK);
+  }
 }
 
 /*
@@ -827,18 +820,17 @@ static void theme_apply(int theme_index)
  *                      every subsequent theme cycle, so this is the
  *                      one function that must touch them.
  */
-static void color_init(int initial_theme)
-{
-    start_color();
-    theme_apply(initial_theme);
+static void color_init(int initial_theme) {
+  start_color();
+  theme_apply(initial_theme);
 
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,  226, COLOR_BLACK);   /* bright yellow */
-        init_pair(PAIR_HINT,  51, COLOR_BLACK);   /* bright cyan   */
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, COLOR_BLACK);
-        init_pair(PAIR_HINT, COLOR_CYAN,   COLOR_BLACK);
-    }
+  if (COLORS >= 256) {
+    init_pair(PAIR_HUD, 226, COLOR_BLACK); /* bright yellow */
+    init_pair(PAIR_HINT, 51, COLOR_BLACK); /* bright cyan   */
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, COLOR_BLACK);
+    init_pair(PAIR_HINT, COLOR_CYAN, COLOR_BLACK);
+  }
 }
 
 /*
@@ -859,15 +851,15 @@ static void color_init(int initial_theme)
  *   Why it lives here: keeps the per-bucket attribute decision in one
  *                      spot, so the renderer reads as one line.
  */
-static attr_t ramp_attr(int idx, int theme_index)
-{
-    attr_t attr = COLOR_PAIR(CP_BASE + idx);
-    if (COLORS >= 256) {
-        if (idx >= RAMP_N - 2) attr |= A_BOLD;
-    } else {
-        attr |= k_themes[theme_index].attr8[idx];
-    }
-    return attr;
+static attr_t ramp_attr(int idx, int theme_index) {
+  attr_t attr = COLOR_PAIR(CP_BASE + idx);
+  if (COLORS >= 256) {
+    if (idx >= RAMP_N - 2)
+      attr |= A_BOLD;
+  } else {
+    attr |= k_themes[theme_index].attr8[idx];
+  }
+  return attr;
 }
 
 /* ===================================================================== */
@@ -890,11 +882,11 @@ static attr_t ramp_attr(int idx, int theme_index)
  *   slots are recycled by fire_part_spawn().
  */
 typedef struct {
-    float x, y;       /* current position in grid-cell coordinates           */
-    float vx, vy;     /* velocity in cells / tick; vy < 0 = upward            */
-    float heat;       /* current heat, fades from 1 toward 0                  */
-    float decay;      /* heat lost per tick (= 1 / lifetime)                  */
-    bool  active;     /* false slots are available for re-spawning            */
+  float x, y;   /* current position in grid-cell coordinates           */
+  float vx, vy; /* velocity in cells / tick; vy < 0 = upward            */
+  float heat;   /* current heat, fades from 1 toward 0                  */
+  float decay;  /* heat lost per tick (= 1 / lifetime)                  */
+  bool active;  /* false slots are available for re-spawning            */
 } FirePart;
 
 /*
@@ -906,21 +898,21 @@ typedef struct {
  *   has to relocate it.
  */
 typedef struct {
-    float    *heat;          /* [rows × cols] current heat                   */
-    float    *prev_heat;     /* [rows × cols] last frame's heat              */
-    float    *dither;        /* [rows × cols] FS scratch buffer              */
-    int       cols, rows;
+  float *heat;      /* [rows × cols] current heat                   */
+  float *prev_heat; /* [rows × cols] last frame's heat              */
+  float *dither;    /* [rows × cols] FS scratch buffer              */
+  int cols, rows;
 
-    float     fuel;          /* user-controlled fuel intensity in [0.1, 1.0] */
-    int       wind;          /* user-controlled wind in [-WIND_MAX, WIND_MAX] */
-    int       wind_acc;      /* accumulated wind offset for arch shifting    */
-    int       theme;         /* index into k_themes                          */
-    int       warmup;        /* counts up 0 → WARMUP_TICKS, then sticks      */
-    int       algo;          /* 0=CA   1=Particle   2=Plasma                 */
-    float     plasma_t;      /* plasma phase counter, advanced each tick     */
+  float fuel;     /* user-controlled fuel intensity in [0.1, 1.0] */
+  int wind;       /* user-controlled wind in [-WIND_MAX, WIND_MAX] */
+  int wind_acc;   /* accumulated wind offset for arch shifting    */
+  int theme;      /* index into k_themes                          */
+  int warmup;     /* counts up 0 → WARMUP_TICKS, then sticks      */
+  int algo;       /* 0=CA   1=Particle   2=Plasma                 */
+  float plasma_t; /* plasma phase counter, advanced each tick     */
 
-    FirePart  parts[MAX_FIRE_PARTS];
-    int       part_idx;      /* round-robin spawn cursor                     */
+  FirePart parts[MAX_FIRE_PARTS];
+  int part_idx; /* round-robin spawn cursor                     */
 } Grid;
 
 /*
@@ -934,13 +926,12 @@ typedef struct {
  *   Why it lives here: keeps allocation in one spot; the hot path is
  *                      malloc-free as required by project guidelines.
  */
-static void grid_alloc(Grid *grid, int cols, int rows)
-{
-    grid->cols      = cols;
-    grid->rows      = rows;
-    grid->heat      = calloc((size_t)(cols * rows), sizeof(float));
-    grid->prev_heat = calloc((size_t)(cols * rows), sizeof(float));
-    grid->dither    = calloc((size_t)(cols * rows), sizeof(float));
+static void grid_alloc(Grid *grid, int cols, int rows) {
+  grid->cols = cols;
+  grid->rows = rows;
+  grid->heat = calloc((size_t)(cols * rows), sizeof(float));
+  grid->prev_heat = calloc((size_t)(cols * rows), sizeof(float));
+  grid->dither = calloc((size_t)(cols * rows), sizeof(float));
 }
 
 /*
@@ -949,12 +940,11 @@ static void grid_alloc(Grid *grid, int cols, int rows)
  *   Pseudocode   : free three buffers; zero the struct.
  *   Mental model : demolish the three slabs, level the lot.
  */
-static void grid_free(Grid *grid)
-{
-    free(grid->heat);
-    free(grid->prev_heat);
-    free(grid->dither);
-    memset(grid, 0, sizeof *grid);
+static void grid_free(Grid *grid) {
+  free(grid->heat);
+  free(grid->prev_heat);
+  free(grid->dither);
+  memset(grid, 0, sizeof *grid);
 }
 
 /*
@@ -964,10 +954,9 @@ static void grid_free(Grid *grid)
  *   Mental model : terminal resize blows the world away — the next
  *                  tick repopulates from fresh fuel + warmup ramp.
  */
-static void grid_resize(Grid *grid, int cols, int rows)
-{
-    grid_free(grid);
-    grid_alloc(grid, cols, rows);
+static void grid_resize(Grid *grid, int cols, int rows) {
+  grid_free(grid);
+  grid_alloc(grid, cols, rows);
 }
 
 /*
@@ -978,17 +967,16 @@ static void grid_resize(Grid *grid, int cols, int rows)
  *   Mental model : factory defaults: classic Doom fire, full fuel,
  *                  no wind, starting from cold.
  */
-static void grid_init(Grid *grid, int cols, int rows, int theme)
-{
-    grid_alloc(grid, cols, rows);
-    grid->fuel     = 1.0f;
-    grid->wind     = 0;
-    grid->wind_acc = 0;
-    grid->theme    = theme;
-    grid->warmup   = 0;
-    grid->algo     = 0;
-    grid->plasma_t = 0.f;
-    grid->part_idx = 0;
+static void grid_init(Grid *grid, int cols, int rows, int theme) {
+  grid_alloc(grid, cols, rows);
+  grid->fuel = 1.0f;
+  grid->wind = 0;
+  grid->wind_acc = 0;
+  grid->theme = theme;
+  grid->warmup = 0;
+  grid->algo = 0;
+  grid->plasma_t = 0.f;
+  grid->part_idx = 0;
 }
 
 /* ===================================================================== */
@@ -1008,14 +996,12 @@ static void grid_init(Grid *grid, int cols, int rows, int theme)
  *   Algorithm 0 and 1 additionally use seed_fuel_row() / splat3x3().
  */
 
-static inline float clampf(float v, float lo, float hi)
-{
-    return v < lo ? lo : (v > hi ? hi : v);
+static inline float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
 }
 
-static inline int clamp_int(int v, int lo, int hi)
-{
-    return v < lo ? lo : (v > hi ? hi : v);
+static inline int clamp_int(int v, int lo, int hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
 }
 
 /*
@@ -1028,9 +1014,9 @@ static inline int clamp_int(int v, int lo, int hi)
  *   rand_signed_unit()    — uniform sample in [-0.5, 0.5)
  *   rand_lateral_jitter() — uniform integer in {-1, 0, +1}
  */
-static inline float rand_unit(void)           { return (float)rand() / RAND_MAX; }
-static inline float rand_signed_unit(void)    { return rand_unit() - 0.5f; }
-static inline int   rand_lateral_jitter(void) { return (rand() % 3) - 1; }
+static inline float rand_unit(void) { return (float)rand() / RAND_MAX; }
+static inline float rand_signed_unit(void) { return rand_unit() - 0.5f; }
+static inline int rand_lateral_jitter(void) { return (rand() % 3) - 1; }
 
 /*
  * warmup_scale_factor() — 0 → 1 ramp over the first WARMUP_TICKS ticks.
@@ -1049,13 +1035,13 @@ static inline int   rand_lateral_jitter(void) { return (rand() % 3) - 1; }
  *   Why it lives here: every algorithm needs the same ramp behaviour,
  *                      so the counter and the formula live together.
  */
-static float warmup_scale_factor(Grid *grid)
-{
-    float scale = (grid->warmup < WARMUP_TICKS)
-                  ? (float)grid->warmup / (float)WARMUP_TICKS
-                  : 1.f;
-    if (grid->warmup < WARMUP_TICKS) grid->warmup++;
-    return scale;
+static float warmup_scale_factor(Grid *grid) {
+  float scale = (grid->warmup < WARMUP_TICKS)
+                    ? (float)grid->warmup / (float)WARMUP_TICKS
+                    : 1.f;
+  if (grid->warmup < WARMUP_TICKS)
+    grid->warmup++;
+  return scale;
 }
 
 /*
@@ -1071,12 +1057,10 @@ static float warmup_scale_factor(Grid *grid)
  *   Why it lives here: every algorithm passes wind_acc to arch_envelope,
  *                      so the accumulator lives in one place.
  */
-static void advance_wind(Grid *grid)
-{
-    grid->wind_acc += grid->wind;
-    if (grid->wind_acc >=  grid->cols ||
-        grid->wind_acc <= -grid->cols)
-        grid->wind_acc = 0;
+static void advance_wind(Grid *grid) {
+  grid->wind_acc += grid->wind;
+  if (grid->wind_acc >= grid->cols || grid->wind_acc <= -grid->cols)
+    grid->wind_acc = 0;
 }
 
 /*
@@ -1099,16 +1083,16 @@ static void advance_wind(Grid *grid)
  *   Output       : float weight in [0, 1]
  *   Why it lives here: shared by every algorithm's source step.
  */
-static float arch_envelope(int x, int cols, int wind_acc)
-{
-    float margin     = (float)cols * ARCH_MARGIN_FRAC;
-    float span       = (float)cols - 2.f * margin;
-    float shifted_x  = (float)x - margin - (float)wind_acc;
-    float t          = (span > 0.f) ? shifted_x / span : 0.f;
-    if (t < 0.f || t > 1.f) return 0.f;
-    float edge       = (t < 0.5f) ? t : 1.f - t;
-    float weight     = edge * 2.f;
-    return weight * weight;
+static float arch_envelope(int x, int cols, int wind_acc) {
+  float margin = (float)cols * ARCH_MARGIN_FRAC;
+  float span = (float)cols - 2.f * margin;
+  float shifted_x = (float)x - margin - (float)wind_acc;
+  float t = (span > 0.f) ? shifted_x / span : 0.f;
+  if (t < 0.f || t > 1.f)
+    return 0.f;
+  float edge = (t < 0.5f) ? t : 1.f - t;
+  float weight = edge * 2.f;
+  return weight * weight;
 }
 
 /*
@@ -1128,24 +1112,23 @@ static float arch_envelope(int x, int cols, int wind_acc)
  *                      algorithm explicitly touches the source, so it
  *                      is centralised.
  */
-static void seed_fuel_row(Grid *grid, float warmup_scale)
-{
-    int    cols       = grid->cols;
-    int    fuel_y     = grid->rows - 1;
-    float *heat_grid  = grid->heat;
+static void seed_fuel_row(Grid *grid, float warmup_scale) {
+  int cols = grid->cols;
+  int fuel_y = grid->rows - 1;
+  float *heat_grid = grid->heat;
 
-    for (int x = 0; x < cols; x++) {
-        float arch_weight = arch_envelope(x, cols, grid->wind_acc);
-        if (arch_weight <= 0.f) {
-            heat_grid[fuel_y * cols + x] = 0.f;
-            continue;
-        }
-
-        float random_jitter   = FUEL_JITTER_BASE + FUEL_JITTER_RANGE * rand_unit();
-        float fuel_at_column  = MAX_HEAT * grid->fuel * arch_weight
-                              * random_jitter * warmup_scale;
-        heat_grid[fuel_y * cols + x] = fuel_at_column;
+  for (int x = 0; x < cols; x++) {
+    float arch_weight = arch_envelope(x, cols, grid->wind_acc);
+    if (arch_weight <= 0.f) {
+      heat_grid[fuel_y * cols + x] = 0.f;
+      continue;
     }
+
+    float random_jitter = FUEL_JITTER_BASE + FUEL_JITTER_RANGE * rand_unit();
+    float fuel_at_column =
+        MAX_HEAT * grid->fuel * arch_weight * random_jitter * warmup_scale;
+    heat_grid[fuel_y * cols + x] = fuel_at_column;
+  }
 }
 
 /*
@@ -1165,21 +1148,20 @@ static void seed_fuel_row(Grid *grid, float warmup_scale)
  *   Why it lives here: shared with future splat-based effects; also
  *                      neatly encapsulates the kernel constants.
  */
-static void splat3x3(float *heat_grid, int cols, int rows,
-                     int cx, int cy, float v)
-{
-    static const float kernel[3][3] = {
-        { 0.0625f, 0.125f, 0.0625f },
-        { 0.125f,  0.25f,  0.125f  },
-        { 0.0625f, 0.125f, 0.0625f },
-    };
-    for (int dy = -1; dy <= 1; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-            int nx = cx + dx, ny = cy + dy;
-            if (nx >= 0 && nx < cols && ny >= 0 && ny < rows)
-                heat_grid[ny * cols + nx] += v * kernel[dy + 1][dx + 1];
-        }
+static void splat3x3(float *heat_grid, int cols, int rows, int cx, int cy,
+                     float v) {
+  static const float kernel[3][3] = {
+      {0.0625f, 0.125f, 0.0625f},
+      {0.125f, 0.25f, 0.125f},
+      {0.0625f, 0.125f, 0.0625f},
+  };
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      int nx = cx + dx, ny = cy + dy;
+      if (nx >= 0 && nx < cols && ny >= 0 && ny < rows)
+        heat_grid[ny * cols + nx] += v * kernel[dy + 1][dx + 1];
     }
+  }
 }
 
 /* ===================================================================== */
@@ -1213,22 +1195,22 @@ static void splat3x3(float *heat_grid, int cols, int rows,
  *      *decay_base, *decay_range — used in the propagation loop as
  *      decay = base + rand_unit() × range.
  */
-static void ca_compute_adaptive_decay(int rows,
-                                      float *decay_base_out,
-                                      float *decay_range_out)
-{
-    float reach_height_in_rows   = (float)rows * CA_REACH_FRAC;
-    float average_decay_per_step = (reach_height_in_rows > 1.f)
-                                   ? (MAX_HEAT / reach_height_in_rows)
-                                   : MAX_HEAT;
+static void ca_compute_adaptive_decay(int rows, float *decay_base_out,
+                                      float *decay_range_out) {
+  float reach_height_in_rows = (float)rows * CA_REACH_FRAC;
+  float average_decay_per_step = (reach_height_in_rows > 1.f)
+                                     ? (MAX_HEAT / reach_height_in_rows)
+                                     : MAX_HEAT;
 
-    float decay_base  = average_decay_per_step * CA_DECAY_BASE_FRAC;
-    float decay_range = average_decay_per_step * CA_DECAY_RAND_FRAC;
-    if (decay_base  < CA_DECAY_BASE_MIN) decay_base  = CA_DECAY_BASE_MIN;
-    if (decay_range < CA_DECAY_RAND_MIN) decay_range = CA_DECAY_RAND_MIN;
+  float decay_base = average_decay_per_step * CA_DECAY_BASE_FRAC;
+  float decay_range = average_decay_per_step * CA_DECAY_RAND_FRAC;
+  if (decay_base < CA_DECAY_BASE_MIN)
+    decay_base = CA_DECAY_BASE_MIN;
+  if (decay_range < CA_DECAY_RAND_MIN)
+    decay_range = CA_DECAY_RAND_MIN;
 
-    *decay_base_out  = decay_base;
-    *decay_range_out = decay_range;
+  *decay_base_out = decay_base;
+  *decay_range_out = decay_range;
 }
 
 /*
@@ -1244,48 +1226,44 @@ static void ca_compute_adaptive_decay(int rows,
  *   Returning the new value (rather than mutating in place) keeps the
  *   inner loop a single assignment.
  */
-static float ca_propagate_one_cell(const float *heat_grid,
-                                   int cols, int x, int y,
-                                   float decay_base, float decay_range)
-{
-    int   lateral_offset    = rand_lateral_jitter();
-    int   source_column     = clamp_int(x + lateral_offset, 0, cols - 1);
-    float source_heat       = heat_grid[(y + 1) * cols + source_column];
-    float energy_lost       = decay_base + rand_unit() * decay_range;
-    float propagated_heat   = source_heat - energy_lost;
-    return (propagated_heat < 0.f) ? 0.f : propagated_heat;
+static float ca_propagate_one_cell(const float *heat_grid, int cols, int x,
+                                   int y, float decay_base, float decay_range) {
+  int lateral_offset = rand_lateral_jitter();
+  int source_column = clamp_int(x + lateral_offset, 0, cols - 1);
+  float source_heat = heat_grid[(y + 1) * cols + source_column];
+  float energy_lost = decay_base + rand_unit() * decay_range;
+  float propagated_heat = source_heat - energy_lost;
+  return (propagated_heat < 0.f) ? 0.f : propagated_heat;
 }
 
 /*
  * ca_fire_tick() — orchestrate one Doom-CA frame.  The body reads as
  * the four algorithm steps, one per line.
  */
-static void ca_fire_tick(Grid *grid)
-{
-    int    cols      = grid->cols;
-    int    rows      = grid->rows;
-    float *heat_grid = grid->heat;
+static void ca_fire_tick(Grid *grid) {
+  int cols = grid->cols;
+  int rows = grid->rows;
+  float *heat_grid = grid->heat;
 
-    /* Step 1 — warmup ramp + per-tick wind shift of the source. */
-    float warmup_scale = warmup_scale_factor(grid);
-    advance_wind(grid);
+  /* Step 1 — warmup ramp + per-tick wind shift of the source. */
+  float warmup_scale = warmup_scale_factor(grid);
+  advance_wind(grid);
 
-    /* Step 2 — refresh the bottom-row fuel arch. */
-    seed_fuel_row(grid, warmup_scale);
+  /* Step 2 — refresh the bottom-row fuel arch. */
+  seed_fuel_row(grid, warmup_scale);
 
-    /* Step 3 — calibrate decay so the average flame top lands at
-     *          CA_REACH_FRAC of the terminal height. */
-    float decay_base, decay_range;
-    ca_compute_adaptive_decay(rows, &decay_base, &decay_range);
+  /* Step 3 — calibrate decay so the average flame top lands at
+   *          CA_REACH_FRAC of the terminal height. */
+  float decay_base, decay_range;
+  ca_compute_adaptive_decay(rows, &decay_base, &decay_range);
 
-    /* Step 4 — propagate heat upward, row by row, bottom-most up. */
-    for (int y = 0; y < rows - 1; y++) {
-        for (int x = 0; x < cols; x++) {
-            heat_grid[y * cols + x] =
-                ca_propagate_one_cell(heat_grid, cols, x, y,
-                                      decay_base, decay_range);
-        }
+  /* Step 4 — propagate heat upward, row by row, bottom-most up. */
+  for (int y = 0; y < rows - 1; y++) {
+    for (int x = 0; x < cols; x++) {
+      heat_grid[y * cols + x] =
+          ca_propagate_one_cell(heat_grid, cols, x, y, decay_base, decay_range);
     }
+  }
 }
 
 /* ===================================================================== */
@@ -1344,24 +1322,23 @@ static void ca_fire_tick(Grid *grid)
  *   a CDF: the arch_weight × fuel × warmup product IS the probability
  *   that a candidate is kept.  Centre columns are kept more often.
  */
-static float rejection_sample_birth_column(Grid *grid, float warmup_scale)
-{
-    int   cols              = grid->cols;
-    float source_margin     = (float)cols * ARCH_MARGIN_FRAC;
-    float source_span       = (float)cols - 2.f * source_margin;
-    float fallback_centre   = (float)cols * 0.5f;
+static float rejection_sample_birth_column(Grid *grid, float warmup_scale) {
+  int cols = grid->cols;
+  float source_margin = (float)cols * ARCH_MARGIN_FRAC;
+  float source_span = (float)cols - 2.f * source_margin;
+  float fallback_centre = (float)cols * 0.5f;
 
-    for (int dart = 0; dart < 8; dart++) {
-        float t                  = rand_unit();
-        float candidate_column   = source_margin + t * source_span
-                                 + (float)grid->wind_acc;
-        float edge_distance      = (t < 0.5f) ? t : 1.f - t;
-        float arch_weight        = (edge_distance * 2.f) * (edge_distance * 2.f);
-        float acceptance_prob    = arch_weight * grid->fuel * warmup_scale;
-        if (rand_unit() < acceptance_prob)
-            return candidate_column;
-    }
-    return fallback_centre;
+  for (int dart = 0; dart < 8; dart++) {
+    float t = rand_unit();
+    float candidate_column =
+        source_margin + t * source_span + (float)grid->wind_acc;
+    float edge_distance = (t < 0.5f) ? t : 1.f - t;
+    float arch_weight = (edge_distance * 2.f) * (edge_distance * 2.f);
+    float acceptance_prob = arch_weight * grid->fuel * warmup_scale;
+    if (rand_unit() < acceptance_prob)
+      return candidate_column;
+  }
+  return fallback_centre;
 }
 
 /*
@@ -1370,26 +1347,26 @@ static float rejection_sample_birth_column(Grid *grid, float warmup_scale)
  *   The body is four labelled steps: pick column → set position →
  *   set velocity → set lifetime.  No nested arithmetic.
  */
-static void fire_part_spawn(FirePart *particle, Grid *grid, float warmup_scale)
-{
-    /* Step 1 — pick a birth column, biased toward the arch centre. */
-    float birth_column = rejection_sample_birth_column(grid, warmup_scale);
+static void fire_part_spawn(FirePart *particle, Grid *grid,
+                            float warmup_scale) {
+  /* Step 1 — pick a birth column, biased toward the arch centre. */
+  float birth_column = rejection_sample_birth_column(grid, warmup_scale);
 
-    /* Step 2 — birth position lives on the bottom row. */
-    particle->x = birth_column;
-    particle->y = (float)(grid->rows - 1);
+  /* Step 2 — birth position lives on the bottom row. */
+  particle->x = birth_column;
+  particle->y = (float)(grid->rows - 1);
 
-    /* Step 3 — initial velocity: small lateral kick, large upward thrust. */
-    float initial_vx = rand_signed_unit() * PART_VX_SPREAD;
-    float initial_vy = -(PART_VY_BASE + rand_unit() * PART_VY_RANGE);
-    particle->vx = initial_vx;
-    particle->vy = initial_vy;
+  /* Step 3 — initial velocity: small lateral kick, large upward thrust. */
+  float initial_vx = rand_signed_unit() * PART_VX_SPREAD;
+  float initial_vy = -(PART_VY_BASE + rand_unit() * PART_VY_RANGE);
+  particle->vx = initial_vx;
+  particle->vy = initial_vy;
 
-    /* Step 4 — lifetime → per-tick heat decay rate. */
-    float lifetime_ticks    = PART_LIFE_MIN + rand_unit() * PART_LIFE_RANGE;
-    particle->heat          = 1.0f;
-    particle->decay         = 1.0f / lifetime_ticks;
-    particle->active        = true;
+  /* Step 4 — lifetime → per-tick heat decay rate. */
+  float lifetime_ticks = PART_LIFE_MIN + rand_unit() * PART_LIFE_RANGE;
+  particle->heat = 1.0f;
+  particle->decay = 1.0f / lifetime_ticks;
+  particle->active = true;
 }
 
 /*
@@ -1401,32 +1378,31 @@ static void fire_part_spawn(FirePart *particle, Grid *grid, float warmup_scale)
  *   heat              ← heat - decay
  *   active            ← heat > 0  AND  ember still on grid
  */
-static void particle_advance_one(FirePart *ember, int cols)
-{
-    float turbulence_kick = rand_signed_unit() * PART_TURB_STEP;
-    ember->vx            = (ember->vx + turbulence_kick) * PART_VX_DAMP;
-    ember->x             += ember->vx;
-    ember->y             += ember->vy;
-    ember->heat          -= ember->decay;
+static void particle_advance_one(FirePart *ember, int cols) {
+  float turbulence_kick = rand_signed_unit() * PART_TURB_STEP;
+  ember->vx = (ember->vx + turbulence_kick) * PART_VX_DAMP;
+  ember->x += ember->vx;
+  ember->y += ember->vy;
+  ember->heat -= ember->decay;
 
-    bool burned_out      = (ember->heat <= 0.f);
-    bool left_top_edge   = (ember->y    <  0.f);
-    bool left_side_edge  = (ember->x    <  0.f) || (ember->x >= (float)cols);
-    if (burned_out || left_top_edge || left_side_edge)
-        ember->active = false;
+  bool burned_out = (ember->heat <= 0.f);
+  bool left_top_edge = (ember->y < 0.f);
+  bool left_side_edge = (ember->x < 0.f) || (ember->x >= (float)cols);
+  if (burned_out || left_top_edge || left_side_edge)
+    ember->active = false;
 }
 
 /*
  * phase_a_advance_active_particles() — move every alive ember one tick.
  */
-static void phase_a_advance_active_particles(Grid *grid)
-{
-    int cols = grid->cols;
-    for (int i = 0; i < MAX_FIRE_PARTS; i++) {
-        FirePart *ember = &grid->parts[i];
-        if (!ember->active) continue;
-        particle_advance_one(ember, cols);
-    }
+static void phase_a_advance_active_particles(Grid *grid) {
+  int cols = grid->cols;
+  for (int i = 0; i < MAX_FIRE_PARTS; i++) {
+    FirePart *ember = &grid->parts[i];
+    if (!ember->active)
+      continue;
+    particle_advance_one(ember, cols);
+  }
 }
 
 /*
@@ -1435,20 +1411,19 @@ static void phase_a_advance_active_particles(Grid *grid)
  *   For each desired spawn, walk round-robin through the pool until an
  *   inactive slot is found; initialise it via fire_part_spawn.
  */
-static void phase_b_spawn_new_particles(Grid *grid, float warmup_scale)
-{
-    int spawn_target = (int)((float)SPAWN_PER_TICK * warmup_scale) + 1;
+static void phase_b_spawn_new_particles(Grid *grid, float warmup_scale) {
+  int spawn_target = (int)((float)SPAWN_PER_TICK * warmup_scale) + 1;
 
-    for (int s = 0; s < spawn_target; s++) {
-        for (int tries = 0; tries < MAX_FIRE_PARTS; tries++) {
-            grid->part_idx = (grid->part_idx + 1) % MAX_FIRE_PARTS;
-            FirePart *slot = &grid->parts[grid->part_idx];
-            if (!slot->active) {
-                fire_part_spawn(slot, grid, warmup_scale);
-                break;
-            }
-        }
+  for (int s = 0; s < spawn_target; s++) {
+    for (int tries = 0; tries < MAX_FIRE_PARTS; tries++) {
+      grid->part_idx = (grid->part_idx + 1) % MAX_FIRE_PARTS;
+      FirePart *slot = &grid->parts[grid->part_idx];
+      if (!slot->active) {
+        fire_part_spawn(slot, grid, warmup_scale);
+        break;
+      }
     }
+  }
 }
 
 /*
@@ -1457,19 +1432,20 @@ static void phase_b_spawn_new_particles(Grid *grid, float warmup_scale)
  *   Converts the Lagrangian particle pool back to an Eulerian grid that
  *   the shared renderer can consume.
  */
-static void phase_c_splat_all_to_grid(Grid *grid)
-{
-    int cols = grid->cols, rows = grid->rows;
+static void phase_c_splat_all_to_grid(Grid *grid) {
+  int cols = grid->cols, rows = grid->rows;
 
-    memset(grid->heat, 0, (size_t)(cols * rows) * sizeof(float));
+  memset(grid->heat, 0, (size_t)(cols * rows) * sizeof(float));
 
-    for (int i = 0; i < MAX_FIRE_PARTS; i++) {
-        const FirePart *ember = &grid->parts[i];
-        if (!ember->active) continue;
-        int splat_centre_x = (int)(ember->x + 0.5f);
-        int splat_centre_y = (int)(ember->y + 0.5f);
-        splat3x3(grid->heat, cols, rows, splat_centre_x, splat_centre_y, ember->heat);
-    }
+  for (int i = 0; i < MAX_FIRE_PARTS; i++) {
+    const FirePart *ember = &grid->parts[i];
+    if (!ember->active)
+      continue;
+    int splat_centre_x = (int)(ember->x + 0.5f);
+    int splat_centre_y = (int)(ember->y + 0.5f);
+    splat3x3(grid->heat, cols, rows, splat_centre_x, splat_centre_y,
+             ember->heat);
+  }
 }
 
 /*
@@ -1479,26 +1455,25 @@ static void phase_c_splat_all_to_grid(Grid *grid)
  *   embers may occupy overlapping neighbourhoods.  Cap the sum at
  *   MAX_HEAT so the gamma + dither passes see a value in [0, 1].
  */
-static void phase_d_clamp_oversaturation(Grid *grid)
-{
-    int total_cells = grid->cols * grid->rows;
-    for (int i = 0; i < total_cells; i++)
-        if (grid->heat[i] > MAX_HEAT) grid->heat[i] = MAX_HEAT;
+static void phase_d_clamp_oversaturation(Grid *grid) {
+  int total_cells = grid->cols * grid->rows;
+  for (int i = 0; i < total_cells; i++)
+    if (grid->heat[i] > MAX_HEAT)
+      grid->heat[i] = MAX_HEAT;
 }
 
 /*
  * particle_fire_tick() — orchestrate one particle frame.  The body
  * is six lines, one per algorithm phase.
  */
-static void particle_fire_tick(Grid *grid)
-{
-    float warmup_scale = warmup_scale_factor(grid);
-    advance_wind(grid);
+static void particle_fire_tick(Grid *grid) {
+  float warmup_scale = warmup_scale_factor(grid);
+  advance_wind(grid);
 
-    phase_a_advance_active_particles(grid);
-    phase_b_spawn_new_particles(grid, warmup_scale);
-    phase_c_splat_all_to_grid(grid);
-    phase_d_clamp_oversaturation(grid);
+  phase_a_advance_active_particles(grid);
+  phase_b_spawn_new_particles(grid, warmup_scale);
+  phase_c_splat_all_to_grid(grid);
+  phase_d_clamp_oversaturation(grid);
 }
 
 /* ===================================================================== */
@@ -1535,19 +1510,19 @@ static void particle_fire_tick(Grid *grid)
  */
 static float plasma_tongue_height(float wind_shifted_x, float phase_t,
                                   float fuel, float warmup_scale,
-                                  float arch_weight)
-{
-    float harmonic_1 = PLASMA_H1_AMP *
-        sinf(wind_shifted_x * PLASMA_H1_XFREQ + phase_t * PLASMA_H1_TSPD);
-    float harmonic_2 = PLASMA_H2_AMP *
-        sinf(wind_shifted_x * PLASMA_H2_XFREQ - phase_t * PLASMA_H2_TSPD);
-    float harmonic_3 = PLASMA_H3_AMP *
-        sinf(wind_shifted_x * PLASMA_H3_XFREQ + phase_t * PLASMA_H3_TSPD);
+                                  float arch_weight) {
+  float harmonic_1 = PLASMA_H1_AMP * sinf(wind_shifted_x * PLASMA_H1_XFREQ +
+                                          phase_t * PLASMA_H1_TSPD);
+  float harmonic_2 = PLASMA_H2_AMP * sinf(wind_shifted_x * PLASMA_H2_XFREQ -
+                                          phase_t * PLASMA_H2_TSPD);
+  float harmonic_3 = PLASMA_H3_AMP * sinf(wind_shifted_x * PLASMA_H3_XFREQ +
+                                          phase_t * PLASMA_H3_TSPD);
 
-    float raw_tongue       = PLASMA_BASE + harmonic_1 + harmonic_2 + harmonic_3;
-    float clamped_tongue   = clampf(raw_tongue, 0.f, 1.f);
-    float final_tongue     = clamped_tongue * fuel * warmup_scale * sqrtf(arch_weight);
-    return final_tongue;
+  float raw_tongue = PLASMA_BASE + harmonic_1 + harmonic_2 + harmonic_3;
+  float clamped_tongue = clampf(raw_tongue, 0.f, 1.f);
+  float final_tongue =
+      clamped_tongue * fuel * warmup_scale * sqrtf(arch_weight);
+  return final_tongue;
 }
 
 /*
@@ -1561,29 +1536,29 @@ static float plasma_tongue_height(float wind_shifted_x, float phase_t,
  *   The cell at the bottom (normalised_y = 1) gets heat ≈ 1, the cell
  *   at the tongue tip gets 0, and rows above the tip get 0 by clamp.
  */
-static void plasma_shade_column(Grid *grid, int x, float tongue_height)
-{
-    int   cols           = grid->cols;
-    int   rows           = grid->rows;
-    float inverse_tongue = (tongue_height > 0.01f) ? (1.f / tongue_height) : 100.f;
-    float tongue_tip_ny  = 1.f - tongue_height;
+static void plasma_shade_column(Grid *grid, int x, float tongue_height) {
+  int cols = grid->cols;
+  int rows = grid->rows;
+  float inverse_tongue =
+      (tongue_height > 0.01f) ? (1.f / tongue_height) : 100.f;
+  float tongue_tip_ny = 1.f - tongue_height;
 
-    for (int y = 0; y < rows; y++) {
-        float normalised_y    = (float)y / (float)rows;
-        float above_tongue_tip = normalised_y - tongue_tip_ny;
-        float heat_value      = clampf(above_tongue_tip * inverse_tongue, 0.f, 1.f);
-        grid->heat[y * cols + x] = heat_value;
-    }
+  for (int y = 0; y < rows; y++) {
+    float normalised_y = (float)y / (float)rows;
+    float above_tongue_tip = normalised_y - tongue_tip_ny;
+    float heat_value = clampf(above_tongue_tip * inverse_tongue, 0.f, 1.f);
+    grid->heat[y * cols + x] = heat_value;
+  }
 }
 
 /*
  * plasma_clear_column() — zero an entire column (used outside the arch).
  */
-static void plasma_clear_column(Grid *grid, int x)
-{
-    int cols = grid->cols;
-    int rows = grid->rows;
-    for (int y = 0; y < rows; y++) grid->heat[y * cols + x] = 0.f;
+static void plasma_clear_column(Grid *grid, int x) {
+  int cols = grid->cols;
+  int rows = grid->rows;
+  for (int y = 0; y < rows; y++)
+    grid->heat[y * cols + x] = 0.f;
 }
 
 /*
@@ -1591,34 +1566,32 @@ static void plasma_clear_column(Grid *grid, int x)
  * loop body reads as the algorithm: compute coordinates → measure arch
  * weight → either clear or compute-tongue-and-shade.
  */
-static void plasma_fire_tick(Grid *grid)
-{
-    int cols = grid->cols;
+static void plasma_fire_tick(Grid *grid) {
+  int cols = grid->cols;
 
-    /* Step 1 — warmup ramp + per-tick wind shift. */
-    float warmup_scale = warmup_scale_factor(grid);
-    advance_wind(grid);
+  /* Step 1 — warmup ramp + per-tick wind shift. */
+  float warmup_scale = warmup_scale_factor(grid);
+  advance_wind(grid);
 
-    /* Step 2 — advance the global phase counter. */
-    float phase_t      = grid->plasma_t;
-    grid->plasma_t    += PLASMA_TIME_STEP;
+  /* Step 2 — advance the global phase counter. */
+  float phase_t = grid->plasma_t;
+  grid->plasma_t += PLASMA_TIME_STEP;
 
-    /* Step 3 — for each column: compute tongue height, then shade rows. */
-    for (int x = 0; x < cols; x++) {
-        float normalised_x   = (float)x / (float)cols;
-        float wind_shifted_x = normalised_x + (float)grid->wind_acc / (float)cols;
-        float arch_weight    = arch_envelope(x, cols, grid->wind_acc);
+  /* Step 3 — for each column: compute tongue height, then shade rows. */
+  for (int x = 0; x < cols; x++) {
+    float normalised_x = (float)x / (float)cols;
+    float wind_shifted_x = normalised_x + (float)grid->wind_acc / (float)cols;
+    float arch_weight = arch_envelope(x, cols, grid->wind_acc);
 
-        if (arch_weight <= 0.f) {
-            plasma_clear_column(grid, x);
-            continue;
-        }
-
-        float tongue_height = plasma_tongue_height(wind_shifted_x, phase_t,
-                                                   grid->fuel, warmup_scale,
-                                                   arch_weight);
-        plasma_shade_column(grid, x, tongue_height);
+    if (arch_weight <= 0.f) {
+      plasma_clear_column(grid, x);
+      continue;
     }
+
+    float tongue_height = plasma_tongue_height(
+        wind_shifted_x, phase_t, grid->fuel, warmup_scale, arch_weight);
+    plasma_shade_column(grid, x, tongue_height);
+  }
 }
 
 /* ===================================================================== */
@@ -1634,14 +1607,20 @@ static void plasma_fire_tick(Grid *grid)
 /*
  * grid_tick() — dispatch to the selected algorithm's tick function.
  */
-static void grid_tick(Grid *grid)
-{
-    switch (grid->algo) {
-    case 0: ca_fire_tick(grid);       break;
-    case 1: particle_fire_tick(grid); break;
-    case 2: plasma_fire_tick(grid);   break;
-    default: break;
-    }
+static void grid_tick(Grid *grid) {
+  switch (grid->algo) {
+  case 0:
+    ca_fire_tick(grid);
+    break;
+  case 1:
+    particle_fire_tick(grid);
+    break;
+  case 2:
+    plasma_fire_tick(grid);
+    break;
+  default:
+    break;
+  }
 }
 
 /* ===================================================================== */
@@ -1669,10 +1648,10 @@ static void grid_tick(Grid *grid)
  * Forward declaration for the debug-overlay helpers — defined in §18.
  */
 typedef enum {
-    DEBUG_OFF             = 0,
-    DEBUG_RAW_HEAT        = 1,
-    DEBUG_GAMMA_NO_DITHER = 2,
-    DEBUG_ARCH_ENVELOPE   = 3,
+  DEBUG_OFF = 0,
+  DEBUG_RAW_HEAT = 1,
+  DEBUG_GAMMA_NO_DITHER = 2,
+  DEBUG_ARCH_ENVELOPE = 3,
 } DebugMode;
 
 static DebugMode g_debug_mode = DEBUG_OFF;
@@ -1692,48 +1671,48 @@ static void debug_fill_dither_buffer(Grid *grid);
  *   The −1 sentinel lets pass 2 distinguish "draw a glyph", "erase a
  *   stale glyph", and "do nothing" without re-reading the heat field.
  */
-static void pipeline_pass1_gamma_correct(Grid *grid)
-{
-    int    total_cells   = grid->cols * grid->rows;
-    float *heat_grid     = grid->heat;
-    float *dither_buffer = grid->dither;
+static void pipeline_pass1_gamma_correct(Grid *grid) {
+  int total_cells = grid->cols * grid->rows;
+  float *heat_grid = grid->heat;
+  float *dither_buffer = grid->dither;
 
-    for (int i = 0; i < total_cells; i++) {
-        float linear_heat = heat_grid[i];
-        if (linear_heat <= 0.f) {
-            dither_buffer[i] = -1.f;
-            continue;
-        }
-        float saturated_heat = fminf(1.f, linear_heat / MAX_HEAT);
-        float perceptual     = powf(saturated_heat, 1.f / 2.2f);
-        dither_buffer[i]     = perceptual;
+  for (int i = 0; i < total_cells; i++) {
+    float linear_heat = heat_grid[i];
+    if (linear_heat <= 0.f) {
+      dither_buffer[i] = -1.f;
+      continue;
     }
+    float saturated_heat = fminf(1.f, linear_heat / MAX_HEAT);
+    float perceptual = powf(saturated_heat, 1.f / 2.2f);
+    dither_buffer[i] = perceptual;
+  }
 }
 
 /*
- * pipeline_diffuse_quant_error() — push one cell's rounding error to neighbours.
+ * pipeline_diffuse_quant_error() — push one cell's rounding error to
+ * neighbours.
  *
  *   Floyd-Steinberg distribution (cold-tagged neighbours skipped):
  *
  *      ── current ─────► 7/16 → (x+1, y)
  *      3/16 → (x-1, y+1) ── 5/16 → (x, y+1) ── 1/16 → (x+1, y+1)
  */
-static void pipeline_diffuse_quant_error(float *dither_buffer, int cols, int rows,
-                                         int x, int y, float quant_error)
-{
-    int i = y * cols + x;
+static void pipeline_diffuse_quant_error(float *dither_buffer, int cols,
+                                         int rows, int x, int y,
+                                         float quant_error) {
+  int i = y * cols + x;
 
-    if (x + 1 < cols && dither_buffer[i + 1] >= 0.f)
-        dither_buffer[i + 1] += quant_error * (7.f / 16.f);
+  if (x + 1 < cols && dither_buffer[i + 1] >= 0.f)
+    dither_buffer[i + 1] += quant_error * (7.f / 16.f);
 
-    if (y + 1 < rows) {
-        if (x - 1 >= 0 && dither_buffer[i + cols - 1] >= 0.f)
-            dither_buffer[i + cols - 1] += quant_error * (3.f / 16.f);
-        if (dither_buffer[i + cols] >= 0.f)
-            dither_buffer[i + cols]     += quant_error * (5.f / 16.f);
-        if (x + 1 < cols && dither_buffer[i + cols + 1] >= 0.f)
-            dither_buffer[i + cols + 1] += quant_error * (1.f / 16.f);
-    }
+  if (y + 1 < rows) {
+    if (x - 1 >= 0 && dither_buffer[i + cols - 1] >= 0.f)
+      dither_buffer[i + cols - 1] += quant_error * (3.f / 16.f);
+    if (dither_buffer[i + cols] >= 0.f)
+      dither_buffer[i + cols] += quant_error * (5.f / 16.f);
+    if (x + 1 < cols && dither_buffer[i + cols + 1] >= 0.f)
+      dither_buffer[i + cols + 1] += quant_error * (1.f / 16.f);
+  }
 }
 
 /*
@@ -1744,22 +1723,21 @@ static void pipeline_diffuse_quant_error(float *dither_buffer, int cols, int row
  *                 diffuse error to four-cell forward neighbourhood
  *   draw k_ramp[bucket] with the theme's ramp attribute
  */
-static void pipeline_draw_lit_cell(Grid *grid, int x, int y,
-                                   float perceptual, bool apply_dither)
-{
-    int   bucket          = lut_index(perceptual);
+static void pipeline_draw_lit_cell(Grid *grid, int x, int y, float perceptual,
+                                   bool apply_dither) {
+  int bucket = lut_index(perceptual);
 
-    if (apply_dither) {
-        float bucket_midpoint = lut_midpoint(bucket);
-        float quant_error     = perceptual - bucket_midpoint;
-        pipeline_diffuse_quant_error(grid->dither, grid->cols, grid->rows,
-                                     x, y, quant_error);
-    }
+  if (apply_dither) {
+    float bucket_midpoint = lut_midpoint(bucket);
+    float quant_error = perceptual - bucket_midpoint;
+    pipeline_diffuse_quant_error(grid->dither, grid->cols, grid->rows, x, y,
+                                 quant_error);
+  }
 
-    attr_t glyph_attr = ramp_attr(bucket, grid->theme);
-    attron(glyph_attr);
-    mvaddch(y, x, (chtype)(unsigned char)k_ramp[bucket]);
-    attroff(glyph_attr);
+  attr_t glyph_attr = ramp_attr(bucket, grid->theme);
+  attron(glyph_attr);
+  mvaddch(y, x, (chtype)(unsigned char)k_ramp[bucket]);
+  attroff(glyph_attr);
 }
 
 /*
@@ -1770,29 +1748,30 @@ static void pipeline_draw_lit_cell(Grid *grid, int x, int y,
  *      lit                  → pipeline_draw_lit_cell()
  */
 static void pipeline_pass2_quantise_and_draw(Grid *grid, int tcols, int trows,
-                                             bool apply_dither)
-{
-    int    cols          = grid->cols;
-    int    rows          = grid->rows;
-    float *dither_buffer = grid->dither;
-    float *previous_heat = grid->prev_heat;
+                                             bool apply_dither) {
+  int cols = grid->cols;
+  int rows = grid->rows;
+  float *dither_buffer = grid->dither;
+  float *previous_heat = grid->prev_heat;
 
-    for (int y = 0; y < rows; y++) {
-        for (int x = 0; x < cols; x++) {
-            if (x >= tcols || y >= trows) continue;
+  for (int y = 0; y < rows; y++) {
+    for (int x = 0; x < cols; x++) {
+      if (x >= tcols || y >= trows)
+        continue;
 
-            int   i           = y * cols + x;
-            float perceptual  = dither_buffer[i];
+      int i = y * cols + x;
+      float perceptual = dither_buffer[i];
 
-            if (perceptual < 0.f) {
-                bool was_lit_last_frame = (previous_heat[i] > 0.f);
-                if (was_lit_last_frame) mvaddch(y, x, ' ');
-                continue;
-            }
+      if (perceptual < 0.f) {
+        bool was_lit_last_frame = (previous_heat[i] > 0.f);
+        if (was_lit_last_frame)
+          mvaddch(y, x, ' ');
+        continue;
+      }
 
-            pipeline_draw_lit_cell(grid, x, y, perceptual, apply_dither);
-        }
+      pipeline_draw_lit_cell(grid, x, y, perceptual, apply_dither);
     }
+  }
 }
 
 /*
@@ -1803,13 +1782,12 @@ static void pipeline_pass2_quantise_and_draw(Grid *grid, int tcols, int trows,
  *                                 buffer, and pass 2 can compare against
  *                                 prev to detect just-extinguished cells)
  */
-static void pipeline_pass3_archive_current_frame(Grid *grid)
-{
-    int   total_cells = grid->cols * grid->rows;
-    float *tmp        = grid->prev_heat;
-    grid->prev_heat   = grid->heat;
-    grid->heat        = tmp;
-    memcpy(grid->heat, grid->prev_heat, (size_t)total_cells * sizeof(float));
+static void pipeline_pass3_archive_current_frame(Grid *grid) {
+  int total_cells = grid->cols * grid->rows;
+  float *tmp = grid->prev_heat;
+  grid->prev_heat = grid->heat;
+  grid->heat = tmp;
+  memcpy(grid->heat, grid->prev_heat, (size_t)total_cells * sizeof(float));
 }
 
 /*
@@ -1819,19 +1797,20 @@ static void pipeline_pass3_archive_current_frame(Grid *grid)
  *      pass 3   archive current frame for next frame's "did this cell
  *               just go cold?" decision
  */
-static void grid_draw(Grid *grid, int tcols, int trows)
-{
-    bool is_normal_render = (g_debug_mode == DEBUG_OFF);
+static void grid_draw(Grid *grid, int tcols, int trows) {
+  bool is_normal_render = (g_debug_mode == DEBUG_OFF);
 
-    /* Pass 1 — fill dither_buffer from gamma or a debug overlay. */
-    if (is_normal_render) pipeline_pass1_gamma_correct(grid);
-    else                  debug_fill_dither_buffer(grid);
+  /* Pass 1 — fill dither_buffer from gamma or a debug overlay. */
+  if (is_normal_render)
+    pipeline_pass1_gamma_correct(grid);
+  else
+    debug_fill_dither_buffer(grid);
 
-    /* Pass 2 — quantise + draw; dithering only in normal-render mode. */
-    pipeline_pass2_quantise_and_draw(grid, tcols, trows, is_normal_render);
+  /* Pass 2 — quantise + draw; dithering only in normal-render mode. */
+  pipeline_pass2_quantise_and_draw(grid, tcols, trows, is_normal_render);
 
-    /* Pass 3 — archive current frame so next frame can detect changes. */
-    pipeline_pass3_archive_current_frame(grid);
+  /* Pass 3 — archive current frame so next frame can detect changes. */
+  pipeline_pass3_archive_current_frame(grid);
 }
 
 /* ===================================================================== */
@@ -1877,58 +1856,70 @@ static void grid_draw(Grid *grid, int tcols, int trows)
  *   Why it lives here: keeps every diagnostic mapping in one place; the
  *                      hot path stays free of overlay code paths.
  */
-static void debug_fill_dither_buffer(Grid *grid)
-{
-    int    cols              = grid->cols;
-    int    rows              = grid->rows;
-    float *heat_grid         = grid->heat;
-    float *dither_buffer     = grid->dither;
+static void debug_fill_dither_buffer(Grid *grid) {
+  int cols = grid->cols;
+  int rows = grid->rows;
+  float *heat_grid = grid->heat;
+  float *dither_buffer = grid->dither;
 
-    for (int y = 0; y < rows; y++) {
-        for (int x = 0; x < cols; x++) {
-            int   i = y * cols + x;
-            float v;
+  for (int y = 0; y < rows; y++) {
+    for (int x = 0; x < cols; x++) {
+      int i = y * cols + x;
+      float v;
 
-            switch (g_debug_mode) {
-            case DEBUG_RAW_HEAT:
-                v = heat_grid[i];
-                if (v <= 0.f) { dither_buffer[i] = -1.f; continue; }
-                v = fminf(1.f, v / MAX_HEAT);
-                break;
-
-            case DEBUG_GAMMA_NO_DITHER:
-                v = heat_grid[i];
-                if (v <= 0.f) { dither_buffer[i] = -1.f; continue; }
-                v = powf(fminf(1.f, v / MAX_HEAT), 1.f / 2.2f);
-                break;
-
-            case DEBUG_ARCH_ENVELOPE:
-                v = arch_envelope(x, cols, grid->wind_acc);
-                if (v <= 0.f) { dither_buffer[i] = -1.f; continue; }
-                break;
-
-            default:
-                dither_buffer[i] = -1.f;
-                continue;
-            }
-
-            dither_buffer[i] = v;
+      switch (g_debug_mode) {
+      case DEBUG_RAW_HEAT:
+        v = heat_grid[i];
+        if (v <= 0.f) {
+          dither_buffer[i] = -1.f;
+          continue;
         }
+        v = fminf(1.f, v / MAX_HEAT);
+        break;
+
+      case DEBUG_GAMMA_NO_DITHER:
+        v = heat_grid[i];
+        if (v <= 0.f) {
+          dither_buffer[i] = -1.f;
+          continue;
+        }
+        v = powf(fminf(1.f, v / MAX_HEAT), 1.f / 2.2f);
+        break;
+
+      case DEBUG_ARCH_ENVELOPE:
+        v = arch_envelope(x, cols, grid->wind_acc);
+        if (v <= 0.f) {
+          dither_buffer[i] = -1.f;
+          continue;
+        }
+        break;
+
+      default:
+        dither_buffer[i] = -1.f;
+        continue;
+      }
+
+      dither_buffer[i] = v;
     }
+  }
 }
 
 /*
  * debug_mode_name() — short label for the active overlay.
  */
-static const char *debug_mode_name(DebugMode mode)
-{
-    switch (mode) {
-    case DEBUG_OFF:             return "off";
-    case DEBUG_RAW_HEAT:        return "raw-heat";
-    case DEBUG_GAMMA_NO_DITHER: return "gamma-only";
-    case DEBUG_ARCH_ENVELOPE:   return "arch";
-    default:                    return "?";
-    }
+static const char *debug_mode_name(DebugMode mode) {
+  switch (mode) {
+  case DEBUG_OFF:
+    return "off";
+  case DEBUG_RAW_HEAT:
+    return "raw-heat";
+  case DEBUG_GAMMA_NO_DITHER:
+    return "gamma-only";
+  case DEBUG_ARCH_ENVELOPE:
+    return "arch";
+  default:
+    return "?";
+  }
 }
 
 /* ===================================================================== */
@@ -1944,15 +1935,14 @@ static const char *debug_mode_name(DebugMode mode)
  */
 
 typedef struct {
-    Grid  grid;
-    bool  paused;
-    bool  needs_clear;
+  Grid grid;
+  bool paused;
+  bool needs_clear;
 } Scene;
 
-static void scene_init(Scene *scene, int cols, int rows, int theme)
-{
-    memset(scene, 0, sizeof *scene);
-    grid_init(&scene->grid, cols, rows, theme);
+static void scene_init(Scene *scene, int cols, int rows, int theme) {
+  memset(scene, 0, sizeof *scene);
+  grid_init(&scene->grid, cols, rows, theme);
 }
 
 static void scene_free(Scene *scene) { grid_free(&scene->grid); }
@@ -1967,32 +1957,30 @@ static void scene_free(Scene *scene) { grid_free(&scene->grid); }
  *   Mental model : the world map is redrawn but the player's choices
  *                  (theme, fuel, wind, algo) survive the redraw.
  */
-static void scene_resize(Scene *scene, int cols, int rows)
-{
-    int   saved_theme = scene->grid.theme;
-    float saved_fuel  = scene->grid.fuel;
-    int   saved_wind  = scene->grid.wind;
-    int   saved_algo  = scene->grid.algo;
+static void scene_resize(Scene *scene, int cols, int rows) {
+  int saved_theme = scene->grid.theme;
+  float saved_fuel = scene->grid.fuel;
+  int saved_wind = scene->grid.wind;
+  int saved_algo = scene->grid.algo;
 
-    grid_resize(&scene->grid, cols, rows);
+  grid_resize(&scene->grid, cols, rows);
 
-    scene->grid.fuel   = saved_fuel;
-    scene->grid.wind   = saved_wind;
-    scene->grid.theme  = saved_theme;
-    scene->grid.algo   = saved_algo;
-    scene->grid.warmup = 0;
-    scene->needs_clear = true;
+  scene->grid.fuel = saved_fuel;
+  scene->grid.wind = saved_wind;
+  scene->grid.theme = saved_theme;
+  scene->grid.algo = saved_algo;
+  scene->grid.warmup = 0;
+  scene->needs_clear = true;
 }
 
-static void scene_tick(Scene *scene)
-{
-    if (scene->paused) return;
-    grid_tick(&scene->grid);
+static void scene_tick(Scene *scene) {
+  if (scene->paused)
+    return;
+  grid_tick(&scene->grid);
 }
 
-static void scene_draw(Scene *scene, int cols, int rows)
-{
-    grid_draw(&scene->grid, cols, rows);
+static void scene_draw(Scene *scene, int cols, int rows) {
+  grid_draw(&scene->grid, cols, rows);
 }
 
 /* ===================================================================== */
@@ -2011,38 +1999,44 @@ static void scene_draw(Scene *scene, int cols, int rows)
  *     row rows - 1    — bright cyan + bold:   every interactive key
  */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *screen, int initial_theme)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);                /* don't let input interrupt diff write */
-    color_init(initial_theme);
-    getmaxyx(stdscr, screen->rows, screen->cols);
+static void screen_init(Screen *screen, int initial_theme) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1); /* don't let input interrupt diff write */
+  color_init(initial_theme);
+  getmaxyx(stdscr, screen->rows, screen->cols);
 }
 
-static void screen_free(Screen *screen) { (void)screen; endwin(); }
-
-static void screen_resize(Screen *screen)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, screen->rows, screen->cols);
+static void screen_free(Screen *screen) {
+  (void)screen;
+  endwin();
 }
 
-static const char *algo_name(int algo_index)
-{
-    switch (algo_index) {
-    case 0:  return "CA";
-    case 1:  return "particles";
-    case 2:  return "plasma";
-    default: return "?";
-    }
+static void screen_resize(Screen *screen) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, screen->rows, screen->cols);
+}
+
+static const char *algo_name(int algo_index) {
+  switch (algo_index) {
+  case 0:
+    return "CA";
+  case 1:
+    return "particles";
+  case 2:
+    return "plasma";
+  default:
+    return "?";
+  }
 }
 
 /*
@@ -2059,44 +2053,52 @@ static const char *algo_name(int algo_index)
  *   Why it lives here: §20 is the only place that knows where the HUD
  *                      anchors live (row 0, row 1, row -1).
  */
-static void screen_draw(Screen *screen, Scene *scene, double fps, int sim_fps)
-{
-    if (scene->needs_clear) { erase(); scene->needs_clear = false; }
-    scene_draw(scene, screen->cols, screen->rows);
+static void screen_draw(Screen *screen, Scene *scene, double fps, int sim_fps) {
+  if (scene->needs_clear) {
+    erase();
+    scene->needs_clear = false;
+  }
+  scene_draw(scene, screen->cols, screen->rows);
 
-    const Grid *grid = &scene->grid;
-    char buf[HUD_COLS + 1];
+  const Grid *grid = &scene->grid;
+  char buf[HUD_COLS + 1];
 
-    /* row 0 — primary status (bright yellow + bold, right-aligned) */
-    snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  %s ",
-             fps, sim_fps, scene->paused ? "PAUSED " : "running");
-    int row0_x = screen->cols - (int)strlen(buf);
-    if (row0_x < 0) row0_x = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, row0_x, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  /* row 0 — primary status (bright yellow + bold, right-aligned) */
+  snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  %s ", fps, sim_fps,
+           scene->paused ? "PAUSED " : "running");
+  int row0_x = screen->cols - (int)strlen(buf);
+  if (row0_x < 0)
+    row0_x = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, row0_x, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* row 1 — secondary readouts (same pair, no bold, right-aligned) */
-    const char *wind_arrow = grid->wind > 0 ? ">>>"
-                          : grid->wind < 0 ? "<<<" : "---";
-    snprintf(buf, sizeof buf,
-             " theme:%s  algo:%s  fuel:%.2f  wind:%s  dbg:%s ",
-             k_themes[grid->theme].name, algo_name(grid->algo),
-             grid->fuel, wind_arrow, debug_mode_name(g_debug_mode));
-    int row1_x = screen->cols - (int)strlen(buf);
-    if (row1_x < 0) row1_x = 0;
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, row1_x, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD));
+  /* row 1 — secondary readouts (same pair, no bold, right-aligned) */
+  const char *wind_arrow = grid->wind > 0   ? ">>>"
+                           : grid->wind < 0 ? "<<<"
+                                            : "---";
+  snprintf(buf, sizeof buf, " theme:%s  algo:%s  fuel:%.2f  wind:%s  dbg:%s ",
+           k_themes[grid->theme].name, algo_name(grid->algo), grid->fuel,
+           wind_arrow, debug_mode_name(g_debug_mode));
+  int row1_x = screen->cols - (int)strlen(buf);
+  if (row1_x < 0)
+    row1_x = 0;
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(1, row1_x, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD));
 
-    /* row rows-1 — key hint (bright cyan + bold, left-aligned) */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(screen->rows - 1, 0,
-        " q:quit  spc:pause  a:algo  t:theme  g/G:fuel  w/W:wind  0:calm  [/]:Hz  d/D:debug ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  /* row rows-1 — key hint (bright cyan + bold, left-aligned) */
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(screen->rows - 1, 0,
+           " q:quit  spc:pause  a:algo  t:theme  g/G:fuel  w/W:wind  0:calm  "
+           "[/]:Hz  d/D:debug ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ===================================================================== */
 /* §21 application                                                        */
@@ -2111,17 +2113,23 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
  */
 
 typedef struct {
-    Scene  scene;
-    Screen screen;
-    int    sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
-static App  g_app;
-static void on_exit_signal  (int s) { (void)s; g_app.running     = 0; }
-static void on_resize_signal(int s) { (void)s; g_app.need_resize = 1; }
-static void cleanup_on_exit (void)  { endwin(); }
+static App g_app;
+static void on_exit_signal(int s) {
+  (void)s;
+  g_app.running = 0;
+}
+static void on_resize_signal(int s) {
+  (void)s;
+  g_app.need_resize = 1;
+}
+static void cleanup_on_exit(void) { endwin(); }
 
 /*
  * app_handle_key() — dispatch one key press.
@@ -2149,76 +2157,85 @@ static void cleanup_on_exit (void)  { endwin(); }
  *   Why it lives here: keeps every state mutation triggered by user
  *                      input in exactly one function.
  */
-static bool app_handle_key(App *app, int ch)
-{
-    Grid *grid = &app->scene.grid;
-    switch (ch) {
-    case 'q': case 'Q': case 27:
-        return false;
+static bool app_handle_key(App *app, int ch) {
+  Grid *grid = &app->scene.grid;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-    case ' ':
-        app->scene.paused = !app->scene.paused;
-        break;
+  case ' ':
+    app->scene.paused = !app->scene.paused;
+    break;
 
-    case 'a': case 'A':
-        grid->algo               = (grid->algo + 1) % N_ALGOS;
-        grid->warmup             = 0;
-        grid->wind_acc           = 0;
-        memset(grid->parts, 0, sizeof grid->parts);
-        grid->part_idx           = 0;
-        app->scene.needs_clear   = true;
-        break;
+  case 'a':
+  case 'A':
+    grid->algo = (grid->algo + 1) % N_ALGOS;
+    grid->warmup = 0;
+    grid->wind_acc = 0;
+    memset(grid->parts, 0, sizeof grid->parts);
+    grid->part_idx = 0;
+    app->scene.needs_clear = true;
+    break;
 
-    case 't': case 'T':
-        grid->theme              = (grid->theme + 1) % THEME_COUNT;
-        theme_apply(grid->theme);
-        app->scene.needs_clear   = true;
-        break;
+  case 't':
+  case 'T':
+    grid->theme = (grid->theme + 1) % THEME_COUNT;
+    theme_apply(grid->theme);
+    app->scene.needs_clear = true;
+    break;
 
-    case 'g':
-        grid->fuel += 0.05f;
-        if (grid->fuel > 1.0f) grid->fuel = 1.0f;
-        break;
-    case 'G':
-        grid->fuel -= 0.05f;
-        if (grid->fuel < 0.1f) grid->fuel = 0.1f;
-        break;
+  case 'g':
+    grid->fuel += 0.05f;
+    if (grid->fuel > 1.0f)
+      grid->fuel = 1.0f;
+    break;
+  case 'G':
+    grid->fuel -= 0.05f;
+    if (grid->fuel < 0.1f)
+      grid->fuel = 0.1f;
+    break;
 
-    case 'w':
-        grid->wind++;
-        if (grid->wind >  WIND_MAX) grid->wind =  WIND_MAX;
-        break;
-    case 'W':
-        grid->wind--;
-        if (grid->wind < -WIND_MAX) grid->wind = -WIND_MAX;
-        break;
-    case '0':
-        grid->wind = 0;
-        break;
+  case 'w':
+    grid->wind++;
+    if (grid->wind > WIND_MAX)
+      grid->wind = WIND_MAX;
+    break;
+  case 'W':
+    grid->wind--;
+    if (grid->wind < -WIND_MAX)
+      grid->wind = -WIND_MAX;
+    break;
+  case '0':
+    grid->wind = 0;
+    break;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    case 'd':
-        g_debug_mode = (DebugMode)(((int)g_debug_mode + 1) % N_DEBUG_MODES);
-        app->scene.needs_clear = true;
-        break;
-    case 'D':
-        g_debug_mode = (DebugMode)(((int)g_debug_mode + N_DEBUG_MODES - 1)
-                                   % N_DEBUG_MODES);
-        app->scene.needs_clear = true;
-        break;
+  case 'd':
+    g_debug_mode = (DebugMode)(((int)g_debug_mode + 1) % N_DEBUG_MODES);
+    app->scene.needs_clear = true;
+    break;
+  case 'D':
+    g_debug_mode =
+        (DebugMode)(((int)g_debug_mode + N_DEBUG_MODES - 1) % N_DEBUG_MODES);
+    app->scene.needs_clear = true;
+    break;
 
-    default:
-        break;
-    }
-    return true;
+  default:
+    break;
+  }
+  return true;
 }
 
 /*
@@ -2246,68 +2263,69 @@ static bool app_handle_key(App *app, int ch)
  *   Mental model : a heartbeat — every cycle does the same six things
  *                  in the same order.
  */
-int main(void)
-{
-    srand((unsigned int)clock_ns());
-    atexit(cleanup_on_exit);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+int main(void) {
+  srand((unsigned int)clock_ns());
+  atexit(cleanup_on_exit);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app      = &g_app;
-    app->running  = 1;
-    app->sim_fps  = SIM_FPS_DEFAULT;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen, 0);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows, 0);
+  screen_init(&app->screen, 0);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows, 0);
 
-    int64_t frame_time_ns   = clock_ns();
-    int64_t sim_accum_ns    = 0;
-    int64_t fps_window_ns   = 0;
-    int     fps_frame_count = 0;
-    double  fps_smoothed    = 0.0;
+  int64_t frame_time_ns = clock_ns();
+  int64_t sim_accum_ns = 0;
+  int64_t fps_window_ns = 0;
+  int fps_frame_count = 0;
+  double fps_smoothed = 0.0;
 
-    while (app->running) {
-        if (app->need_resize) {
-            screen_resize(&app->screen);
-            scene_resize(&app->scene, app->screen.cols, app->screen.rows);
-            app->need_resize  = 0;
-            frame_time_ns     = clock_ns();
-            sim_accum_ns      = 0;
-        }
-
-        int64_t now          = clock_ns();
-        int64_t delta_ns     = now - frame_time_ns;
-        frame_time_ns        = now;
-        if (delta_ns > 100 * NS_PER_MS) delta_ns = 100 * NS_PER_MS;
-
-        int64_t tick_period_ns = TICK_NS(app->sim_fps);
-        sim_accum_ns          += delta_ns;
-        while (sim_accum_ns >= tick_period_ns) {
-            scene_tick(&app->scene);
-            sim_accum_ns -= tick_period_ns;
-        }
-
-        fps_frame_count++;
-        fps_window_ns += delta_ns;
-        if (fps_window_ns >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_smoothed   = (double)fps_frame_count /
-                             ((double)fps_window_ns / (double)NS_PER_SEC);
-            fps_frame_count = 0;
-            fps_window_ns   = 0;
-        }
-
-        int64_t elapsed_this_iteration = clock_ns() - frame_time_ns + delta_ns;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed_this_iteration);
-
-        screen_draw(&app->screen, &app->scene, fps_smoothed, app->sim_fps);
-        screen_present();
-
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch)) app->running = 0;
+  while (app->running) {
+    if (app->need_resize) {
+      screen_resize(&app->screen);
+      scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+      app->need_resize = 0;
+      frame_time_ns = clock_ns();
+      sim_accum_ns = 0;
     }
 
-    scene_free(&app->scene);
-    screen_free(&app->screen);
-    return 0;
+    int64_t now = clock_ns();
+    int64_t delta_ns = now - frame_time_ns;
+    frame_time_ns = now;
+    if (delta_ns > 100 * NS_PER_MS)
+      delta_ns = 100 * NS_PER_MS;
+
+    int64_t tick_period_ns = TICK_NS(app->sim_fps);
+    sim_accum_ns += delta_ns;
+    while (sim_accum_ns >= tick_period_ns) {
+      scene_tick(&app->scene);
+      sim_accum_ns -= tick_period_ns;
+    }
+
+    fps_frame_count++;
+    fps_window_ns += delta_ns;
+    if (fps_window_ns >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_smoothed = (double)fps_frame_count /
+                     ((double)fps_window_ns / (double)NS_PER_SEC);
+      fps_frame_count = 0;
+      fps_window_ns = 0;
+    }
+
+    int64_t elapsed_this_iteration = clock_ns() - frame_time_ns + delta_ns;
+    clock_sleep_ns(NS_PER_SEC / 60 - elapsed_this_iteration);
+
+    screen_draw(&app->screen, &app->scene, fps_smoothed, app->sim_fps);
+    screen_present();
+
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  scene_free(&app->scene);
+  screen_free(&app->screen);
+  return 0;
 }

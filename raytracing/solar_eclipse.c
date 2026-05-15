@@ -694,7 +694,7 @@
 #include <time.h>
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 /* ── §0 forward types ────────────────────────────────────────────────── *
@@ -713,8 +713,12 @@
  * happens in §5).
  */
 
-typedef struct { float x, y, z; } V3;
-typedef struct { float r, g, b; } RGB;
+typedef struct {
+  float x, y, z;
+} V3;
+typedef struct {
+  float r, g, b;
+} RGB;
 
 /* ── §1 configuration ────────────────────────────────────────────────── *
  *
@@ -739,20 +743,20 @@ typedef struct { float r, g, b; } RGB;
  * that, SPEED_MIN is 1/8×. The scale is multiplicative.
  */
 enum {
-    SIM_FPS_MIN     =  10,
-    SIM_FPS_DEFAULT =  30,
-    SIM_FPS_MAX     = 120,
-    SIM_FPS_STEP    =  10,
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 30,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
 
-    SPEED_MIN       =   1,
-    SPEED_DEF       =   8,
-    SPEED_MAX       =  64,
+  SPEED_MIN = 1,
+  SPEED_DEF = 8,
+  SPEED_MAX = 64,
 };
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(f)      (NS_PER_SEC / (f))
-#define DT_CAP_NS       (100 * NS_PER_MS)   /* spiral-of-death guard */
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
+#define DT_CAP_NS (100 * NS_PER_MS) /* spiral-of-death guard */
 
 /* §1.2 view geometry and zoom.
  *
@@ -766,11 +770,11 @@ enum {
  * compact, vivid disc. Zooming to 4× or 8× brings totality details
  * (chromosphere ring, prominences, beads) into focus.
  */
-#define ASPECT_Y        2.0f
-#define FOV_H_BASE      0.40f
-#define ZOOM_MIN        0.25f
-#define ZOOM_MAX        8.0f
-#define ZOOM_STEP       1.25f
+#define ASPECT_Y 2.0f
+#define FOV_H_BASE 0.40f
+#define ZOOM_MIN 0.25f
+#define ZOOM_MAX 8.0f
+#define ZOOM_STEP 1.25f
 
 /* §1.3 scene geometry — sun far, moon close.
  *
@@ -794,20 +798,20 @@ enum {
  * either side of centre. Setting it < 1 gives a near-miss; 1.5 gives
  * a clean enter/exit cycle.
  */
-#define SUN_Z              50.0f
-#define SUN_R               3.5f
-#define MOON_Z              5.0f
-#define MOON_BASE_R_TOTAL   0.62f
+#define SUN_Z 50.0f
+#define SUN_R 3.5f
+#define MOON_Z 5.0f
+#define MOON_BASE_R_TOTAL 0.62f
 #define MOON_BASE_R_ANNULAR 0.32f
 #define MOON_BASE_R_TRANSIT 0.04f
 
-#define MOON_SCALE_MIN      0.5f
-#define MOON_SCALE_MAX      2.0f
-#define MOON_SCALE_STEP     1.10f
+#define MOON_SCALE_MIN 0.5f
+#define MOON_SCALE_MAX 2.0f
+#define MOON_SCALE_STEP 1.10f
 
-#define ECLIPSE_PERIOD_S    30.0f
-#define MOON_ORBIT_X_FRAC   1.5f
-#define PARTIAL_Y_OFFSET    0.025f
+#define ECLIPSE_PERIOD_S 30.0f
+#define MOON_ORBIT_X_FRAC 1.5f
+#define PARTIAL_Y_OFFSET 0.025f
 
 /* §1.4 corona scattering coefficient.
  *
@@ -824,9 +828,9 @@ enum {
  * [0.05, 0.6] range — this is a display scaling, not a physics hack;
  * the radial decay shape stays correct.
  */
-#define CORONA_REACH         8.0f
-#define CORONA_SIGMA0        0.18f
-#define CORONA_DECAY         3.0f
+#define CORONA_REACH 8.0f
+#define CORONA_SIGMA0 0.18f
+#define CORONA_DECAY 3.0f
 
 /* §1.5 chromosphere shell.
  *
@@ -839,8 +843,8 @@ enum {
  * [0,1] — sharper than a quadratic, reads as a thin band rather than
  * a soft glow.
  */
-#define CHROMOS_THICK        0.025f
-#define CHROMOS_SIGMA0       6.0f
+#define CHROMOS_THICK 0.025f
+#define CHROMOS_SIGMA0 6.0f
 
 /* §1.6 chromosphere spicule fBm.
  *
@@ -856,10 +860,10 @@ enum {
  * The factor multiplies chromos_emission. Hot peaks (high fBm) shift
  * the Hα colour toward yellow for thermal variation.
  */
-#define SPICULE_FREQ_PHI    12.0f
-#define SPICULE_FREQ_TH      6.0f
-#define SPICULE_BASE         0.5f
-#define SPICULE_AMP          1.2f
+#define SPICULE_FREQ_PHI 12.0f
+#define SPICULE_FREQ_TH 6.0f
+#define SPICULE_BASE 0.5f
+#define SPICULE_AMP 1.2f
 
 /* §1.7 prominences — dense Hα loops.
  *
@@ -871,10 +875,10 @@ enum {
  * don't contribute to the radial transmittance LUT (only to the
  * additive emission term).
  */
-#define PROM_COUNT           5
-#define PROM_HEIGHT          0.18f
-#define PROM_LATERAL         0.18f
-#define PROM_SIGMA0          8.0f
+#define PROM_COUNT 5
+#define PROM_HEIGHT 0.18f
+#define PROM_LATERAL 0.18f
+#define PROM_SIGMA0 8.0f
 
 /* §1.8 path tracer parameters.
  *
@@ -900,13 +904,13 @@ enum {
  * samples from R_sun to (REACH+2)·R_sun is plenty given the smooth
  * power-law σ — bilinear interpolation has sub-cell accuracy.
  */
-#define MARCH_STEPS         96
-#define MARCH_T_MAX         (SUN_Z + SUN_R * 6.0f)
-#define LUT_SIZE            256
-#define LUT_R_MAX           (SUN_R * (CORONA_REACH + 2.0f))
-#define IN_SCATTER_GAIN     14.0f
-#define SUN_EMIT_HDR         8.0f
-#define HA_EMIT_GAIN         3.0f
+#define MARCH_STEPS 96
+#define MARCH_T_MAX (SUN_Z + SUN_R * 6.0f)
+#define LUT_SIZE 256
+#define LUT_R_MAX (SUN_R * (CORONA_REACH + 2.0f))
+#define IN_SCATTER_GAIN 14.0f
+#define SUN_EMIT_HDR 8.0f
+#define HA_EMIT_GAIN 3.0f
 
 /* §1.9 eye-adaptation gate.
  *
@@ -919,8 +923,8 @@ enum {
  * preserves a faint baseline glow always — change one constant to
  * switch behaviour. See Tutorial 10.
  */
-#define CORONA_GATE_FLOOR    0.00f
-#define CORONA_GATE_RANGE    1.00f
+#define CORONA_GATE_FLOOR 0.00f
+#define CORONA_GATE_RANGE 1.00f
 
 /* §1.10 surface BRDF parameters.
  *
@@ -935,11 +939,11 @@ enum {
  * via earthshine. EARTHSHINE_GAIN scales the constant ambient term we
  * apply.
  */
-#define LIMB_AMBIENT         0.40f
-#define LIMB_GAIN            0.60f
-#define MOON_ALBEDO          0.12f
-#define EARTH_ALBEDO_BLUE    0.45f
-#define EARTHSHINE_GAIN      0.10f
+#define LIMB_AMBIENT 0.40f
+#define LIMB_GAIN 0.60f
+#define MOON_ALBEDO 0.12f
+#define EARTH_ALBEDO_BLUE 0.45f
+#define EARTHSHINE_GAIN 0.10f
 
 /* §1.11 lunar terrain — Bailey's-bead silhouette perturbation.
  *
@@ -956,17 +960,17 @@ enum {
  * "pop in" sharply on the sharp side and fade out on the gradual side,
  * mimicking real mountain shadows.
  */
-#define LUNAR_VALLEY_COUNT  14
-#define LUNAR_VALLEY_DEPTH   0.020f
-#define LUNAR_VALLEY_WIDTH   0.06f
-#define LUNAR_VALLEY_ASYM    0.45f
-#define LUNAR_DIAMOND_BOOST  2.5f
+#define LUNAR_VALLEY_COUNT 14
+#define LUNAR_VALLEY_DEPTH 0.020f
+#define LUNAR_VALLEY_WIDTH 0.06f
+#define LUNAR_VALLEY_ASYM 0.45f
+#define LUNAR_DIAMOND_BOOST 2.5f
 
-#define LUNAR_MICRO_COUNT   30
-#define LUNAR_MICRO_DEPTH    0.010f
-#define LUNAR_MICRO_WIDTH    0.025f
+#define LUNAR_MICRO_COUNT 30
+#define LUNAR_MICRO_DEPTH 0.010f
+#define LUNAR_MICRO_WIDTH 0.025f
 
-#define LUNAR_LUT_SIZE     512
+#define LUNAR_LUT_SIZE 512
 
 /* §1.12 background stars.
  *
@@ -979,10 +983,10 @@ enum {
  * STAR_DENSITY = 250 means roughly 1 star per 250 sky cells; tune
  * down for a denser field, up for sparser.
  */
-#define STAR_DENSITY       250
-#define STAR_OCC_VISIBLE     0.85f
-#define STAR_K_MIN        3000.0f
-#define STAR_K_MAX       30000.0f
+#define STAR_DENSITY 250
+#define STAR_OCC_VISIBLE 0.85f
+#define STAR_K_MIN 3000.0f
+#define STAR_K_MAX 30000.0f
 
 /* §1.13 framebuffer dimensions.
  *
@@ -990,8 +994,8 @@ enum {
  * per-frame g_buf array; if your terminal is bigger than that you'll
  * see clipping (rare; 400×200 is generous).
  */
-#define BUF_MAX_W           400
-#define BUF_MAX_H           200
+#define BUF_MAX_W 400
+#define BUF_MAX_H 200
 
 /* §1.14 ncurses pair IDs and ASCII glyph ramp.
  *
@@ -1003,11 +1007,11 @@ enum {
  * pixels. `#` and `@` are deliberately absent.
  */
 enum {
-    PAIR_HUD          =  1,
-    PAIR_HINT         =  2,
-    PAIR_SUN_FALLBACK =  3,
-    PAIR_EVENT_HOT    =  4,
-    PAIR_CUBE_BASE    = 16,
+  PAIR_HUD = 1,
+  PAIR_HINT = 2,
+  PAIR_SUN_FALLBACK = 3,
+  PAIR_EVENT_HOT = 4,
+  PAIR_CUBE_BASE = 16,
 };
 
 static const char k_ramp[] = " .'`,-_:;~=+*oO0";
@@ -1019,22 +1023,26 @@ static const char k_ramp[] = " .'`,-_:;~=+*oO0";
  * applies the corresponding moon radius and y-offset.
  */
 typedef enum {
-    PATTERN_TOTAL    = 0,
-    PATTERN_PARTIAL  = 1,
-    PATTERN_ANNULAR  = 2,
-    PATTERN_TRANSIT  = 3,
-    N_PATTERNS       = 4,
+  PATTERN_TOTAL = 0,
+  PATTERN_PARTIAL = 1,
+  PATTERN_ANNULAR = 2,
+  PATTERN_TRANSIT = 3,
+  N_PATTERNS = 4,
 } Pattern;
 
-static const char *pattern_name(Pattern p)
-{
-    switch (p) {
-    case PATTERN_TOTAL:   return "TOTAL  ";
-    case PATTERN_PARTIAL: return "PARTIAL";
-    case PATTERN_ANNULAR: return "ANNULAR";
-    case PATTERN_TRANSIT: return "TRANSIT";
-    default:              return "?      ";
-    }
+static const char *pattern_name(Pattern p) {
+  switch (p) {
+  case PATTERN_TOTAL:
+    return "TOTAL  ";
+  case PATTERN_PARTIAL:
+    return "PARTIAL";
+  case PATTERN_ANNULAR:
+    return "ANNULAR";
+  case PATTERN_TRANSIT:
+    return "TRANSIT";
+  default:
+    return "?      ";
+  }
 }
 
 /* §1.16 stellar classes — main-sequence spectral types.
@@ -1049,16 +1057,13 @@ static const char *pattern_name(Pattern p)
  * a hot blue one — these are real spectral types.
  */
 typedef struct {
-    const char *name;
-    float       kelvin;
+  const char *name;
+  float kelvin;
 } Star;
 
 static const Star STARS[] = {
-    { "M-DWARF",  3500.0f },
-    { "K-STAR ",  4500.0f },
-    { "G-STAR ",  5778.0f },
-    { "A-STAR ",  9500.0f },
-    { "B-STAR ", 18000.0f },
+    {"M-DWARF", 3500.0f}, {"K-STAR ", 4500.0f},  {"G-STAR ", 5778.0f},
+    {"A-STAR ", 9500.0f}, {"B-STAR ", 18000.0f},
 };
 #define N_STARS ((int)(sizeof STARS / sizeof STARS[0]))
 
@@ -1081,11 +1086,10 @@ static const Star STARS[] = {
  * Why:        the simulation's accumulator-based loop in §16 needs
  *             a robust dt source. CLOCK_MONOTONIC is that.
  */
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
 /*
@@ -1098,14 +1102,14 @@ static int64_t clock_ns(void)
  * Why:        used by the main loop to cap the maximum FPS — without
  *             it we'd burn 100% of a CPU core.
  */
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ── §3 math + colour ────────────────────────────────────────────────── *
@@ -1128,17 +1132,23 @@ static void clock_sleep_ns(int64_t ns)
  * a chord might collapse during the orbit.
  */
 
-static inline V3    v3 (float x, float y, float z) { return (V3){x,y,z}; }
-static inline V3    v3_add(V3 a, V3 b)  { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
-static inline V3    v3_sub(V3 a, V3 b)  { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
-static inline V3    v3_scl(V3 a, float s){ return v3(a.x*s, a.y*s, a.z*s);     }
-static inline float v3_dot(V3 a, V3 b)  { return a.x*b.x + a.y*b.y + a.z*b.z;  }
-static inline float v3_len(V3 a)        { return sqrtf(v3_dot(a, a));          }
-static inline V3    v3_norm(V3 a)
-{
-    float l = v3_len(a);
-    if (l < 1e-12f) return v3(0, 0, 0);
-    return v3_scl(a, 1.0f / l);
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
+static inline V3 v3_add(V3 a, V3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline V3 v3_sub(V3 a, V3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline V3 v3_scl(V3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+static inline float v3_dot(V3 a, V3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3_len(V3 a) { return sqrtf(v3_dot(a, a)); }
+static inline V3 v3_norm(V3 a) {
+  float l = v3_len(a);
+  if (l < 1e-12f)
+    return v3(0, 0, 0);
+  return v3_scl(a, 1.0f / l);
 }
 
 /* §3.2 RGB ops — channel-wise arithmetic.
@@ -1148,10 +1158,16 @@ static inline V3    v3_norm(V3 a)
  * earthshine tint".
  */
 
-static inline RGB rgb_make(float r, float g, float b) { return (RGB){r,g,b}; }
-static inline RGB rgb_add (RGB a, RGB b)   { return rgb_make(a.r+b.r, a.g+b.g, a.b+b.b); }
-static inline RGB rgb_mul (RGB a, RGB b)   { return rgb_make(a.r*b.r, a.g*b.g, a.b*b.b); }
-static inline RGB rgb_scl (RGB a, float s) { return rgb_make(a.r*s, a.g*s, a.b*s);       }
+static inline RGB rgb_make(float r, float g, float b) { return (RGB){r, g, b}; }
+static inline RGB rgb_add(RGB a, RGB b) {
+  return rgb_make(a.r + b.r, a.g + b.g, a.b + b.b);
+}
+static inline RGB rgb_mul(RGB a, RGB b) {
+  return rgb_make(a.r * b.r, a.g * b.g, a.b * b.b);
+}
+static inline RGB rgb_scl(RGB a, float s) {
+  return rgb_make(a.r * s, a.g * s, a.b * s);
+}
 
 /* §3.3 tone-map + gamma + luma.
  *
@@ -1164,11 +1180,14 @@ static inline RGB rgb_scl (RGB a, float s) { return rgb_make(a.r*s, a.g*s, a.b*s
  * 6×6×6 cube + glyph. paint_cell (§5.2) is the only call site.
  */
 
-static inline float clamp01 (float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
-static inline float reinhard (float x) { return x / (1.f + x); }
+static inline float clamp01(float x) {
+  return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
+}
+static inline float reinhard(float x) { return x / (1.f + x); }
 static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
-static inline float luma_of  (RGB c)
-{ return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b; }
+static inline float luma_of(RGB c) {
+  return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+}
 
 /* §3.4 blackbody → RGB (Tanner Helland approximation).
  *
@@ -1196,22 +1215,28 @@ static inline float luma_of  (RGB c)
  *          piecewise log formula otherwise
  *      return clamp01(r), clamp01(g), clamp01(b)
  */
-static RGB blackbody_rgb(float kelvin)
-{
-    float K = kelvin / 100.0f;
-    float r, g, b;
+static RGB blackbody_rgb(float kelvin) {
+  float K = kelvin / 100.0f;
+  float r, g, b;
 
-    if (K <= 66.0f) r = 1.0f;
-    else            r = 329.7f * powf(K - 60.0f, -0.1332f) / 255.0f;
+  if (K <= 66.0f)
+    r = 1.0f;
+  else
+    r = 329.7f * powf(K - 60.0f, -0.1332f) / 255.0f;
 
-    if (K <= 66.0f) g = (99.47f  * logf(K)            - 161.12f) / 255.0f;
-    else            g =  288.12f * powf(K - 60.0f, -0.0755f)      / 255.0f;
+  if (K <= 66.0f)
+    g = (99.47f * logf(K) - 161.12f) / 255.0f;
+  else
+    g = 288.12f * powf(K - 60.0f, -0.0755f) / 255.0f;
 
-    if (K >= 66.0f)      b = 1.0f;
-    else if (K <= 19.0f) b = 0.0f;
-    else                 b = (138.52f * logf(K - 10.0f) - 305.04f) / 255.0f;
+  if (K >= 66.0f)
+    b = 1.0f;
+  else if (K <= 19.0f)
+    b = 0.0f;
+  else
+    b = (138.52f * logf(K - 10.0f) - 305.04f) / 255.0f;
 
-    return rgb_make(clamp01(r), clamp01(g), clamp01(b));
+  return rgb_make(clamp01(r), clamp01(g), clamp01(b));
 }
 
 /* ── §4 rng + noise ──────────────────────────────────────────────────── *
@@ -1233,20 +1258,19 @@ static RGB blackbody_rgb(float kelvin)
  * different inputs produce well-distributed outputs.
  */
 
-static inline uint32_t hash3(int wx, int wy, int wz)
-{
-    uint32_t h = (uint32_t)wx * 73856093u
-               ^ (uint32_t)wy * 19349663u
-               ^ (uint32_t)wz * 83492791u;
-    h ^= h >> 16; h *= 0x85ebca6bu;
-    h ^= h >> 13; h *= 0xc2b2ae35u;
-    h ^= h >> 16;
-    return h;
+static inline uint32_t hash3(int wx, int wy, int wz) {
+  uint32_t h = (uint32_t)wx * 73856093u ^ (uint32_t)wy * 19349663u ^
+               (uint32_t)wz * 83492791u;
+  h ^= h >> 16;
+  h *= 0x85ebca6bu;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35u;
+  h ^= h >> 16;
+  return h;
 }
 
-static inline float hash01(uint32_t h)
-{
-    return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
+static inline float hash01(uint32_t h) {
+  return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
 }
 
 /* §4.2 Perlin noise.
@@ -1260,45 +1284,50 @@ static inline float hash01(uint32_t h)
 
 static uint8_t perm[512];
 
-static void perm_shuffle(int seed)
-{
-    uint8_t base[256];
-    for (int i = 0; i < 256; i++) base[i] = (uint8_t)i;
-    uint32_t st = (uint32_t)seed * 2654435761u;
-    for (int i = 255; i > 0; i--) {
-        st = st * 1664525u + 1013904223u;
-        int j = (int)(st >> 16) % (i + 1);
-        uint8_t t = base[i]; base[i] = base[j]; base[j] = t;
-    }
-    for (int i = 0; i < 256; i++) {
-        perm[i      ] = base[i];
-        perm[i + 256] = base[i];
-    }
+static void perm_shuffle(int seed) {
+  uint8_t base[256];
+  for (int i = 0; i < 256; i++)
+    base[i] = (uint8_t)i;
+  uint32_t st = (uint32_t)seed * 2654435761u;
+  for (int i = 255; i > 0; i--) {
+    st = st * 1664525u + 1013904223u;
+    int j = (int)(st >> 16) % (i + 1);
+    uint8_t t = base[i];
+    base[i] = base[j];
+    base[j] = t;
+  }
+  for (int i = 0; i < 256; i++) {
+    perm[i] = base[i];
+    perm[i + 256] = base[i];
+  }
 }
 
-static inline float fade_q(float t) { return t*t*t*(t*(t*6.f-15.f)+10.f); }
-static inline float lerp_f(float a, float b, float t) { return a + t*(b-a); }
-static inline float grad2(int hash, float x, float y)
-{
-    int h = hash & 7;
-    float u = (h < 4) ? x : y;
-    float v = (h < 4) ? y : x;
-    return ((h & 1) ? -u : u) + ((h & 2) ? -2.f*v : 2.f*v);
+static inline float fade_q(float t) {
+  return t * t * t * (t * (t * 6.f - 15.f) + 10.f);
+}
+static inline float lerp_f(float a, float b, float t) {
+  return a + t * (b - a);
+}
+static inline float grad2(int hash, float x, float y) {
+  int h = hash & 7;
+  float u = (h < 4) ? x : y;
+  float v = (h < 4) ? y : x;
+  return ((h & 1) ? -u : u) + ((h & 2) ? -2.f * v : 2.f * v);
 }
 
-static float perlin2d(float x, float y)
-{
-    int X = (int)floorf(x) & 255;
-    int Y = (int)floorf(y) & 255;
-    x -= floorf(x); y -= floorf(y);
-    float u = fade_q(x), v = fade_q(y);
-    int A = perm[X    ] + Y;
-    int B = perm[X + 1] + Y;
-    float n00 = grad2(perm[A    ], x,        y       );
-    float n10 = grad2(perm[B    ], x - 1.f,  y       );
-    float n01 = grad2(perm[A + 1], x,        y - 1.f );
-    float n11 = grad2(perm[B + 1], x - 1.f,  y - 1.f );
-    return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
+static float perlin2d(float x, float y) {
+  int X = (int)floorf(x) & 255;
+  int Y = (int)floorf(y) & 255;
+  x -= floorf(x);
+  y -= floorf(y);
+  float u = fade_q(x), v = fade_q(y);
+  int A = perm[X] + Y;
+  int B = perm[X + 1] + Y;
+  float n00 = grad2(perm[A], x, y);
+  float n10 = grad2(perm[B], x - 1.f, y);
+  float n01 = grad2(perm[A + 1], x, y - 1.f);
+  float n11 = grad2(perm[B + 1], x - 1.f, y - 1.f);
+  return lerp_f(lerp_f(n00, n10, u), lerp_f(n01, n11, u), v);
 }
 
 /* §4.3 fractal Brownian motion (fBm).
@@ -1309,16 +1338,15 @@ static float perlin2d(float x, float y)
  * texture.
  */
 
-static float fbm2(float x, float y)
-{
-    float total = 0.f, amp = 1.f, freq = 1.f, max_amp = 0.f;
-    for (int o = 0; o < 3; o++) {
-        total   += amp * perlin2d(x * freq, y * freq);
-        max_amp += amp;
-        amp     *= 0.5f;
-        freq    *= 2.0f;
-    }
-    return (total / max_amp) * 0.5f + 0.5f;
+static float fbm2(float x, float y) {
+  float total = 0.f, amp = 1.f, freq = 1.f, max_amp = 0.f;
+  for (int o = 0; o < 3; o++) {
+    total += amp * perlin2d(x * freq, y * freq);
+    max_amp += amp;
+    amp *= 0.5f;
+    freq *= 2.0f;
+  }
+  return (total / max_amp) * 0.5f + 0.5f;
 }
 
 /* ── §5 terminal painting ────────────────────────────────────────────── *
@@ -1335,7 +1363,7 @@ static float fbm2(float x, float y)
  * still works visually, just mono-yellow.
  */
 
-static int g_256;          /* 1 if terminal supports 256 colours */
+static int g_256; /* 1 if terminal supports 256 colours */
 
 /*
  * color_init — set up ncurses pair table.
@@ -1347,23 +1375,22 @@ static int g_256;          /* 1 if terminal supports 256 colours */
  *              uses PAIR_HUD / PAIR_HINT / PAIR_EVENT_HOT. Doing this
  *              once keeps the per-cell paint cheap.
  */
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    g_256 = (COLORS >= 256);
-    if (g_256) {
-        for (int i = 0; i < 216; i++)
-            init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
-        init_pair(PAIR_HUD,       226, -1);
-        init_pair(PAIR_HINT,       51, -1);
-        init_pair(PAIR_EVENT_HOT, 196, -1);
-    } else {
-        init_pair(PAIR_SUN_FALLBACK, COLOR_YELLOW, -1);
-        init_pair(PAIR_HUD,          COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,         COLOR_CYAN,   -1);
-        init_pair(PAIR_EVENT_HOT,    COLOR_RED,    -1);
-    }
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  g_256 = (COLORS >= 256);
+  if (g_256) {
+    for (int i = 0; i < 216; i++)
+      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
+    init_pair(PAIR_HUD, 226, -1);
+    init_pair(PAIR_HINT, 51, -1);
+    init_pair(PAIR_EVENT_HOT, 196, -1);
+  } else {
+    init_pair(PAIR_SUN_FALLBACK, COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+    init_pair(PAIR_EVENT_HOT, COLOR_RED, -1);
+  }
 }
 
 /*
@@ -1392,32 +1419,43 @@ static void color_init(void)
  * bloom pass or post-process, this is where it would land — but
  * currently we go straight from g_buf to mvaddch.
  */
-static void paint_cell(int sx, int sy, RGB col)
-{
-    float r = gamma_enc(reinhard(col.r));
-    float g = gamma_enc(reinhard(col.g));
-    float b = gamma_enc(reinhard(col.b));
-    float luma = 0.2126f*r + 0.7152f*g + 0.0722f*b;
-    int   ri   = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
-    if (ri < 0)         ri = 0;
-    if (ri >= RAMP_LEN) ri = RAMP_LEN - 1;
+static void paint_cell(int sx, int sy, RGB col) {
+  float r = gamma_enc(reinhard(col.r));
+  float g = gamma_enc(reinhard(col.g));
+  float b = gamma_enc(reinhard(col.b));
+  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  int ri = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
+  if (ri < 0)
+    ri = 0;
+  if (ri >= RAMP_LEN)
+    ri = RAMP_LEN - 1;
 
-    if (g_256) {
-        int r5 = (int)(r * 5.f + 0.5f); if (r5 > 5) r5 = 5; if (r5 < 0) r5 = 0;
-        int g5 = (int)(g * 5.f + 0.5f); if (g5 > 5) g5 = 5; if (g5 < 0) g5 = 0;
-        int b5 = (int)(b * 5.f + 0.5f); if (b5 > 5) b5 = 5; if (b5 < 0) b5 = 0;
-        int pair = PAIR_CUBE_BASE + r5*36 + g5*6 + b5;
-        int attr = (luma > 0.85f) ? A_BOLD
-                 : (luma < 0.15f) ? A_DIM
-                 :                  A_NORMAL;
-        attron(COLOR_PAIR(pair) | attr);
-        mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
-        attroff(COLOR_PAIR(pair) | attr);
-    } else {
-        attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
-        mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
-        attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
-    }
+  if (g_256) {
+    int r5 = (int)(r * 5.f + 0.5f);
+    if (r5 > 5)
+      r5 = 5;
+    if (r5 < 0)
+      r5 = 0;
+    int g5 = (int)(g * 5.f + 0.5f);
+    if (g5 > 5)
+      g5 = 5;
+    if (g5 < 0)
+      g5 = 0;
+    int b5 = (int)(b * 5.f + 0.5f);
+    if (b5 > 5)
+      b5 = 5;
+    if (b5 < 0)
+      b5 = 0;
+    int pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
+    int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    attroff(COLOR_PAIR(pair) | attr);
+  } else {
+    attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
+    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
+  }
 }
 
 /* ── §6 ray-sphere intersection ──────────────────────────────────────── *
@@ -1462,19 +1500,21 @@ static void paint_cell(int sx, int sy, RGB col)
  * Why: the photosphere is the only purely-spherical primitive we hit
  * in the eye-ray pass. The moon needs a perturbed variant — see §7.
  */
-static bool ray_sphere(V3 ro, V3 rd, V3 c, float r, float *out_t)
-{
-    V3    oc   = v3_sub(ro, c);
-    float b    = v3_dot(oc, rd);
-    float cc   = v3_dot(oc, oc) - r * r;
-    float disc = b * b - cc;
-    if (disc < 0) return false;
-    float sq = sqrtf(disc);
-    float t  = -b - sq;
-    if (t < 1e-3f) t = -b + sq;
-    if (t < 1e-3f) return false;
-    *out_t = t;
-    return true;
+static bool ray_sphere(V3 ro, V3 rd, V3 c, float r, float *out_t) {
+  V3 oc = v3_sub(ro, c);
+  float b = v3_dot(oc, rd);
+  float cc = v3_dot(oc, oc) - r * r;
+  float disc = b * b - cc;
+  if (disc < 0)
+    return false;
+  float sq = sqrtf(disc);
+  float t = -b - sq;
+  if (t < 1e-3f)
+    t = -b + sq;
+  if (t < 1e-3f)
+    return false;
+  *out_t = t;
+  return true;
 }
 
 /* ── §7 lunar terrain — Bailey's-bead silhouette ─────────────────────── *
@@ -1528,76 +1568,76 @@ static float lunar_lut[LUNAR_LUT_SIZE];
  *              the bilinear interp at lookup gives sub-cell precision
  *              when the 0.06-rad valleys are ~10 LUT cells wide.
  */
-static void build_lunar_lut(int seed)
-{
-    /* Macro valleys (wide, asymmetric, the main silhouette features). */
-    float phi_v       [LUNAR_VALLEY_COUNT];
-    float w2_left_v   [LUNAR_VALLEY_COUNT];
-    float w2_right_v  [LUNAR_VALLEY_COUNT];
-    float d_v         [LUNAR_VALLEY_COUNT];
+static void build_lunar_lut(int seed) {
+  /* Macro valleys (wide, asymmetric, the main silhouette features). */
+  float phi_v[LUNAR_VALLEY_COUNT];
+  float w2_left_v[LUNAR_VALLEY_COUNT];
+  float w2_right_v[LUNAR_VALLEY_COUNT];
+  float d_v[LUNAR_VALLEY_COUNT];
 
-    /* Pick which macro valley is the diamond-ring (extra depth). */
-    uint32_t dr_h        = hash3(0, seed, 0xD1A47000u);
-    int      diamond_idx = (int)(hash01(dr_h)
-                                 * (float)LUNAR_VALLEY_COUNT);
-    if (diamond_idx >= LUNAR_VALLEY_COUNT) diamond_idx = LUNAR_VALLEY_COUNT - 1;
+  /* Pick which macro valley is the diamond-ring (extra depth). */
+  uint32_t dr_h = hash3(0, seed, 0xD1A47000u);
+  int diamond_idx = (int)(hash01(dr_h) * (float)LUNAR_VALLEY_COUNT);
+  if (diamond_idx >= LUNAR_VALLEY_COUNT)
+    diamond_idx = LUNAR_VALLEY_COUNT - 1;
 
+  for (int k = 0; k < LUNAR_VALLEY_COUNT; k++) {
+    uint32_t h = hash3(k, seed, 0x1A11E1);
+    phi_v[k] = (hash01(h) - 0.5f) * 2.0f * (float)M_PI;
+    float w_base = LUNAR_VALLEY_WIDTH * (0.5f + 1.0f * hash01(h ^ 0xE1u));
+
+    /* Asymmetry: one side narrower (sharp), one wider (gradual).
+     * `asym_sign` ∈ {-1, +1} chooses which side is sharp per seed. */
+    float asym_sign = (hash01(h ^ 0xAA00u) > 0.5f) ? 1.0f : -1.0f;
+    float w_left = w_base * (1.0f + asym_sign * LUNAR_VALLEY_ASYM);
+    float w_right = w_base * (1.0f - asym_sign * LUNAR_VALLEY_ASYM);
+    w2_left_v[k] = w_left * w_left;
+    w2_right_v[k] = w_right * w_right;
+
+    float d_k = LUNAR_VALLEY_DEPTH * (0.4f + 0.6f * hash01(h ^ 0xD0u));
+    if (k == diamond_idx)
+      d_k *= LUNAR_DIAMOND_BOOST;
+    d_v[k] = d_k;
+  }
+
+  /* Micro valleys (narrow, symmetric — sharper beads). */
+  float phi_s[LUNAR_MICRO_COUNT];
+  float w2_s[LUNAR_MICRO_COUNT];
+  float d_s[LUNAR_MICRO_COUNT];
+  for (int k = 0; k < LUNAR_MICRO_COUNT; k++) {
+    uint32_t h = hash3(k, seed, 0xCAFEBABEu);
+    phi_s[k] = (hash01(h) - 0.5f) * 2.0f * (float)M_PI;
+    float w_k = LUNAR_MICRO_WIDTH * (0.6f + 0.8f * hash01(h ^ 0xE2u));
+    w2_s[k] = w_k * w_k;
+    d_s[k] = LUNAR_MICRO_DEPTH * (0.5f + 0.7f * hash01(h ^ 0xD1u));
+  }
+
+  for (int i = 0; i < LUNAR_LUT_SIZE; i++) {
+    float phi = ((float)i / (float)LUNAR_LUT_SIZE) * 2.0f * (float)M_PI -
+                (float)M_PI; /* phi ∈ [-π, π) */
+
+    float total = 0.0f;
+    /* Macro contribution — asymmetric Gaussian. */
     for (int k = 0; k < LUNAR_VALLEY_COUNT; k++) {
-        uint32_t h = hash3(k, seed, 0x1A11E1);
-        phi_v[k] = (hash01(h) - 0.5f) * 2.0f * (float)M_PI;
-        float w_base = LUNAR_VALLEY_WIDTH
-                     * (0.5f + 1.0f * hash01(h ^ 0xE1u));
-
-        /* Asymmetry: one side narrower (sharp), one wider (gradual).
-         * `asym_sign` ∈ {-1, +1} chooses which side is sharp per seed. */
-        float asym_sign = (hash01(h ^ 0xAA00u) > 0.5f) ?  1.0f : -1.0f;
-        float w_left    = w_base * (1.0f + asym_sign * LUNAR_VALLEY_ASYM);
-        float w_right   = w_base * (1.0f - asym_sign * LUNAR_VALLEY_ASYM);
-        w2_left_v [k] = w_left  * w_left;
-        w2_right_v[k] = w_right * w_right;
-
-        float d_k = LUNAR_VALLEY_DEPTH
-                  * (0.4f + 0.6f * hash01(h ^ 0xD0u));
-        if (k == diamond_idx) d_k *= LUNAR_DIAMOND_BOOST;
-        d_v[k] = d_k;
+      float dphi = phi - phi_v[k];
+      while (dphi > (float)M_PI)
+        dphi -= 2.0f * (float)M_PI;
+      while (dphi < -(float)M_PI)
+        dphi += 2.0f * (float)M_PI;
+      float w2 = (dphi < 0.0f) ? w2_left_v[k] : w2_right_v[k];
+      total += d_v[k] * expf(-(dphi * dphi) / w2);
     }
-
-    /* Micro valleys (narrow, symmetric — sharper beads). */
-    float phi_s[LUNAR_MICRO_COUNT];
-    float w2_s [LUNAR_MICRO_COUNT];
-    float d_s  [LUNAR_MICRO_COUNT];
+    /* Micro contribution — symmetric. */
     for (int k = 0; k < LUNAR_MICRO_COUNT; k++) {
-        uint32_t h = hash3(k, seed, 0xCAFEBABEu);
-        phi_s[k] = (hash01(h) - 0.5f) * 2.0f * (float)M_PI;
-        float w_k = LUNAR_MICRO_WIDTH
-                  * (0.6f + 0.8f * hash01(h ^ 0xE2u));
-        w2_s[k] = w_k * w_k;
-        d_s [k] = LUNAR_MICRO_DEPTH
-                * (0.5f + 0.7f * hash01(h ^ 0xD1u));
+      float dphi = phi - phi_s[k];
+      while (dphi > (float)M_PI)
+        dphi -= 2.0f * (float)M_PI;
+      while (dphi < -(float)M_PI)
+        dphi += 2.0f * (float)M_PI;
+      total += d_s[k] * expf(-(dphi * dphi) / w2_s[k]);
     }
-
-    for (int i = 0; i < LUNAR_LUT_SIZE; i++) {
-        float phi = ((float)i / (float)LUNAR_LUT_SIZE) * 2.0f * (float)M_PI
-                  - (float)M_PI;            /* phi ∈ [-π, π) */
-
-        float total = 0.0f;
-        /* Macro contribution — asymmetric Gaussian. */
-        for (int k = 0; k < LUNAR_VALLEY_COUNT; k++) {
-            float dphi = phi - phi_v[k];
-            while (dphi >  (float)M_PI) dphi -= 2.0f * (float)M_PI;
-            while (dphi < -(float)M_PI) dphi += 2.0f * (float)M_PI;
-            float w2 = (dphi < 0.0f) ? w2_left_v[k] : w2_right_v[k];
-            total += d_v[k] * expf(-(dphi * dphi) / w2);
-        }
-        /* Micro contribution — symmetric. */
-        for (int k = 0; k < LUNAR_MICRO_COUNT; k++) {
-            float dphi = phi - phi_s[k];
-            while (dphi >  (float)M_PI) dphi -= 2.0f * (float)M_PI;
-            while (dphi < -(float)M_PI) dphi += 2.0f * (float)M_PI;
-            total += d_s[k] * expf(-(dphi * dphi) / w2_s[k]);
-        }
-        lunar_lut[i] = total;
-    }
+    lunar_lut[i] = total;
+  }
 }
 
 /* §7.2 lunar_R_at.
@@ -1621,20 +1661,19 @@ static void build_lunar_lut(int seed)
  * (§7.3) at the closest-approach point of a chord. Bilinear lookup
  * ensures smooth transitions between LUT cells.
  */
-static float lunar_R_at(V3 from_centre, float moon_R_base, int seed)
-{
-    (void)seed;     /* baked into the LUT at build time */
-    float phi = atan2f(from_centre.y, from_centre.x);     /* (-π, π] */
-    float u   = (phi + (float)M_PI) / (2.0f * (float)M_PI)
-              * (float)LUNAR_LUT_SIZE;
-    if (u < 0.0f)              u += (float)LUNAR_LUT_SIZE;
-    if (u >= LUNAR_LUT_SIZE)   u -= (float)LUNAR_LUT_SIZE;
-    int   i0 = (int)u;
-    int   i1 = (i0 + 1) % LUNAR_LUT_SIZE;
-    float fr = u - (float)i0;
-    float depth = lunar_lut[i0] * (1.0f - fr)
-                + lunar_lut[i1] * fr;
-    return moon_R_base * (1.0f - depth);
+static float lunar_R_at(V3 from_centre, float moon_R_base, int seed) {
+  (void)seed; /* baked into the LUT at build time */
+  float phi = atan2f(from_centre.y, from_centre.x); /* (-π, π] */
+  float u = (phi + (float)M_PI) / (2.0f * (float)M_PI) * (float)LUNAR_LUT_SIZE;
+  if (u < 0.0f)
+    u += (float)LUNAR_LUT_SIZE;
+  if (u >= LUNAR_LUT_SIZE)
+    u -= (float)LUNAR_LUT_SIZE;
+  int i0 = (int)u;
+  int i1 = (i0 + 1) % LUNAR_LUT_SIZE;
+  float fr = u - (float)i0;
+  float depth = lunar_lut[i0] * (1.0f - fr) + lunar_lut[i1] * fr;
+  return moon_R_base * (1.0f - depth);
 }
 
 /* §7.3 ray_moon — perturbed ray-vs-moon intersection.
@@ -1670,35 +1709,39 @@ static float lunar_R_at(V3 from_centre, float moon_R_base, int seed)
  * uses §8 instead — there the moon-disc-vs-sun-disc geometry is the
  * point, and the penumbra formula handles partial coverage analytically.
  */
-static bool ray_moon(V3 ro, V3 rd, V3 c, float moon_R_base,
-                     int seed, float *out_t)
-{
-    V3    oc = v3_sub(ro, c);
-    float b  = v3_dot(oc, rd);
+static bool ray_moon(V3 ro, V3 rd, V3 c, float moon_R_base, int seed,
+                     float *out_t) {
+  V3 oc = v3_sub(ro, c);
+  float b = v3_dot(oc, rd);
 
-    /* Cheap reject against base sphere. */
-    float oc2  = v3_dot(oc, oc);
-    float r2   = moon_R_base * moon_R_base;
-    float disc = b * b - (oc2 - r2);
-    if (disc < 0) return false;
-    float sq    = sqrtf(disc);
-    float t_far = -b + sq;
-    if (t_far < 1e-3f) return false;
+  /* Cheap reject against base sphere. */
+  float oc2 = v3_dot(oc, oc);
+  float r2 = moon_R_base * moon_R_base;
+  float disc = b * b - (oc2 - r2);
+  if (disc < 0)
+    return false;
+  float sq = sqrtf(disc);
+  float t_far = -b + sq;
+  if (t_far < 1e-3f)
+    return false;
 
-    /* Now evaluate perturbation. */
-    V3    nearest = v3_add(ro, v3_scl(rd, -b));
-    V3    radial  = v3_sub(nearest, c);
-    float r_eff   = lunar_R_at(v3_norm(radial), moon_R_base, seed);
+  /* Now evaluate perturbation. */
+  V3 nearest = v3_add(ro, v3_scl(rd, -b));
+  V3 radial = v3_sub(nearest, c);
+  float r_eff = lunar_R_at(v3_norm(radial), moon_R_base, seed);
 
-    float cc_p   = oc2 - r_eff * r_eff;
-    float disc_p = b * b - cc_p;
-    if (disc_p < 0) return false;
-    float sq_p = sqrtf(disc_p);
-    float t    = -b - sq_p;
-    if (t < 1e-3f) t = -b + sq_p;
-    if (t < 1e-3f) return false;
-    *out_t = t;
-    return true;
+  float cc_p = oc2 - r_eff * r_eff;
+  float disc_p = b * b - cc_p;
+  if (disc_p < 0)
+    return false;
+  float sq_p = sqrtf(disc_p);
+  float t = -b - sq_p;
+  if (t < 1e-3f)
+    t = -b + sq_p;
+  if (t < 1e-3f)
+    return false;
+  *out_t = t;
+  return true;
 }
 
 /* ── §8 penumbra — analytic visible-fraction-of-sun-disc ─────────────── *
@@ -1754,61 +1797,73 @@ static bool ray_moon(V3 ro, V3 rd, V3 c, float moon_R_base,
  * penumbra). Trying to combine both into one function gives tangled
  * formulas; separate is cleaner.
  */
-static float visible_fraction_sun(V3 p, V3 sun_pos, V3 moon_pos,
-                                  float moon_R)
-{
-    V3    to_sun_v  = v3_sub(sun_pos, p);
-    V3    to_moon_v = v3_sub(moon_pos, p);
-    float dist_sun  = v3_len(to_sun_v);
-    float dist_moon = v3_len(to_moon_v);
-    if (dist_sun  < SUN_R + 1e-3f)  return 0.0f;
-    if (dist_moon < moon_R + 1e-3f) return 0.0f;
+static float visible_fraction_sun(V3 p, V3 sun_pos, V3 moon_pos, float moon_R) {
+  V3 to_sun_v = v3_sub(sun_pos, p);
+  V3 to_moon_v = v3_sub(moon_pos, p);
+  float dist_sun = v3_len(to_sun_v);
+  float dist_moon = v3_len(to_moon_v);
+  if (dist_sun < SUN_R + 1e-3f)
+    return 0.0f;
+  if (dist_moon < moon_R + 1e-3f)
+    return 0.0f;
 
-    float a_sun  = asinf(SUN_R  / dist_sun);
-    float a_moon = asinf(moon_R / dist_moon);
+  float a_sun = asinf(SUN_R / dist_sun);
+  float a_moon = asinf(moon_R / dist_moon);
 
-    V3    d_sun  = v3_scl(to_sun_v,  1.0f / dist_sun);
-    V3    d_moon = v3_scl(to_moon_v, 1.0f / dist_moon);
-    float cos_g  = v3_dot(d_sun, d_moon);
-    if (cos_g >  1.0f) cos_g =  1.0f;
-    if (cos_g < -1.0f) cos_g = -1.0f;
-    float gamma  = acosf(cos_g);
+  V3 d_sun = v3_scl(to_sun_v, 1.0f / dist_sun);
+  V3 d_moon = v3_scl(to_moon_v, 1.0f / dist_moon);
+  float cos_g = v3_dot(d_sun, d_moon);
+  if (cos_g > 1.0f)
+    cos_g = 1.0f;
+  if (cos_g < -1.0f)
+    cos_g = -1.0f;
+  float gamma = acosf(cos_g);
 
-    if (gamma >= a_sun + a_moon) return 1.0f;
-    if (gamma <= fabsf(a_sun - a_moon)) {
-        if (a_moon >= a_sun) return 0.0f;
-        float r = a_moon / a_sun;
-        return 1.0f - r * r;
-    }
+  if (gamma >= a_sun + a_moon)
+    return 1.0f;
+  if (gamma <= fabsf(a_sun - a_moon)) {
+    if (a_moon >= a_sun)
+      return 0.0f;
+    float r = a_moon / a_sun;
+    return 1.0f - r * r;
+  }
 
-    /* Partial overlap: circle-circle intersection area in angle space. */
-    float d   = gamma;
-    float r1  = a_sun,  r2 = a_moon;
-    float r1s = r1 * r1, r2s = r2 * r2;
-    float a1_arg = (d * d + r1s - r2s) / (2.0f * d * r1);
-    float a2_arg = (d * d + r2s - r1s) / (2.0f * d * r2);
-    if (a1_arg >  1.0f) a1_arg =  1.0f;
-    if (a1_arg < -1.0f) a1_arg = -1.0f;
-    if (a2_arg >  1.0f) a2_arg =  1.0f;
-    if (a2_arg < -1.0f) a2_arg = -1.0f;
-    float A1 = r1s * acosf(a1_arg);
-    float A2 = r2s * acosf(a2_arg);
+  /* Partial overlap: circle-circle intersection area in angle space. */
+  float d = gamma;
+  float r1 = a_sun, r2 = a_moon;
+  float r1s = r1 * r1, r2s = r2 * r2;
+  float a1_arg = (d * d + r1s - r2s) / (2.0f * d * r1);
+  float a2_arg = (d * d + r2s - r1s) / (2.0f * d * r2);
+  if (a1_arg > 1.0f)
+    a1_arg = 1.0f;
+  if (a1_arg < -1.0f)
+    a1_arg = -1.0f;
+  if (a2_arg > 1.0f)
+    a2_arg = 1.0f;
+  if (a2_arg < -1.0f)
+    a2_arg = -1.0f;
+  float A1 = r1s * acosf(a1_arg);
+  float A2 = r2s * acosf(a2_arg);
 
-    float t1 = -d + r1 + r2;
-    float t2 =  d + r1 - r2;
-    float t3 =  d - r1 + r2;
-    float t4 =  d + r1 + r2;
-    float prod = t1 * t2 * t3 * t4;
-    if (prod < 0.0f) prod = 0.0f;
-    float A3 = 0.5f * sqrtf(prod);
+  float t1 = -d + r1 + r2;
+  float t2 = d + r1 - r2;
+  float t3 = d - r1 + r2;
+  float t4 = d + r1 + r2;
+  float prod = t1 * t2 * t3 * t4;
+  if (prod < 0.0f)
+    prod = 0.0f;
+  float A3 = 0.5f * sqrtf(prod);
 
-    float overlap = A1 + A2 - A3;
-    float sun_a   = (float)M_PI * r1s;
-    if (sun_a < 1e-9f) return 1.0f;
-    float vis = 1.0f - overlap / sun_a;
-    if (vis < 0.0f) vis = 0.0f;
-    if (vis > 1.0f) vis = 1.0f;
-    return vis;
+  float overlap = A1 + A2 - A3;
+  float sun_a = (float)M_PI * r1s;
+  if (sun_a < 1e-9f)
+    return 1.0f;
+  float vis = 1.0f - overlap / sun_a;
+  if (vis < 0.0f)
+    vis = 0.0f;
+  if (vis > 1.0f)
+    vis = 1.0f;
+  return vis;
 }
 
 /* ── §9 coronal medium ───────────────────────────────────────────────── *
@@ -1836,10 +1891,10 @@ static float visible_fraction_sun(V3 p, V3 sun_pos, V3 moon_pos,
  * are filled in by medium_reseed (§12.3) when 'r' is pressed.
  */
 typedef struct {
-    float kelvin;                    /* photosphere temperature        */
-    float prom_phi   [PROM_COUNT];   /* angular position (rad)         */
-    float prom_height[PROM_COUNT];   /* angular reach × R_sun          */
-    float prom_amp   [PROM_COUNT];   /* density multiplier             */
+  float kelvin;                  /* photosphere temperature        */
+  float prom_phi[PROM_COUNT];    /* angular position (rad)         */
+  float prom_height[PROM_COUNT]; /* angular reach × R_sun          */
+  float prom_amp[PROM_COUNT];    /* density multiplier             */
 } Medium;
 
 /* §9.2 sigma_sph — spherically-symmetric σ at radius r.
@@ -1868,21 +1923,22 @@ typedef struct {
  * contribute to the volume rendering integral as additive emission
  * but not to the radial transmittance.
  */
-static float sigma_sph(float r)
-{
-    if (r < SUN_R)               return 0.0f;
-    if (r > SUN_R * CORONA_REACH) return 0.0f;
+static float sigma_sph(float r) {
+  if (r < SUN_R)
+    return 0.0f;
+  if (r > SUN_R * CORONA_REACH)
+    return 0.0f;
 
-    float u   = SUN_R / r;
-    float cor = CORONA_SIGMA0 * powf(u, CORONA_DECAY);
+  float u = SUN_R / r;
+  float cor = CORONA_SIGMA0 * powf(u, CORONA_DECAY);
 
-    float h     = (r - SUN_R) / (SUN_R * CHROMOS_THICK);
-    float chrom = 0.0f;
-    if (h >= 0.0f && h <= 1.0f) {
-        float fade = 1.0f - h;
-        chrom = CHROMOS_SIGMA0 * fade * fade;
-    }
-    return cor + chrom;
+  float h = (r - SUN_R) / (SUN_R * CHROMOS_THICK);
+  float chrom = 0.0f;
+  if (h >= 0.0f && h <= 1.0f) {
+    float fade = 1.0f - h;
+    chrom = CHROMOS_SIGMA0 * fade * fade;
+  }
+  return cor + chrom;
 }
 
 /* §9.3 sigma_prom — additive prominence density.
@@ -1914,29 +1970,34 @@ static float sigma_sph(float r)
  * Prominences emit Hα strongly (see emission_at) — they're the
  * brightest features at totality apart from the photosphere itself.
  */
-static float sigma_prom(const Medium *m, V3 p_local)
-{
-    float r = v3_len(p_local);
-    if (r < SUN_R)                            return 0.0f;
-    if (r > SUN_R * (1.0f + PROM_HEIGHT))     return 0.0f;
+static float sigma_prom(const Medium *m, V3 p_local) {
+  float r = v3_len(p_local);
+  if (r < SUN_R)
+    return 0.0f;
+  if (r > SUN_R * (1.0f + PROM_HEIGHT))
+    return 0.0f;
 
-    float phi      = atan2f(p_local.x, p_local.z);
-    float h_above  = (r - SUN_R) / SUN_R;
-    if (h_above > PROM_HEIGHT) return 0.0f;
+  float phi = atan2f(p_local.x, p_local.z);
+  float h_above = (r - SUN_R) / SUN_R;
+  if (h_above > PROM_HEIGHT)
+    return 0.0f;
 
-    float total = 0.0f;
-    for (int k = 0; k < PROM_COUNT; k++) {
-        float reach_k = m->prom_height[k];
-        if (h_above > reach_k) continue;
-        float dphi = phi - m->prom_phi[k];
-        while (dphi >  (float)M_PI) dphi -= 2.0f * (float)M_PI;
-        while (dphi < -(float)M_PI) dphi += 2.0f * (float)M_PI;
-        float lat   = expf(-(dphi * dphi) / (PROM_LATERAL * PROM_LATERAL));
-        float t_rad = h_above / reach_k;
-        float rad   = (1.0f - t_rad) * (1.0f - t_rad);
-        total += m->prom_amp[k] * lat * rad;
-    }
-    return PROM_SIGMA0 * total;
+  float total = 0.0f;
+  for (int k = 0; k < PROM_COUNT; k++) {
+    float reach_k = m->prom_height[k];
+    if (h_above > reach_k)
+      continue;
+    float dphi = phi - m->prom_phi[k];
+    while (dphi > (float)M_PI)
+      dphi -= 2.0f * (float)M_PI;
+    while (dphi < -(float)M_PI)
+      dphi += 2.0f * (float)M_PI;
+    float lat = expf(-(dphi * dphi) / (PROM_LATERAL * PROM_LATERAL));
+    float t_rad = h_above / reach_k;
+    float rad = (1.0f - t_rad) * (1.0f - t_rad);
+    total += m->prom_amp[k] * lat * rad;
+  }
+  return PROM_SIGMA0 * total;
 }
 
 /* §9.4 density_total + emission_at — the path tracer's entry points.
@@ -1950,10 +2011,9 @@ static float sigma_prom(const Medium *m, V3 p_local)
  * prominence part stays at the cool baseline Hα colour.
  */
 
-static float density_total(const Medium *m, V3 p_local)
-{
-    float r = v3_len(p_local);
-    return sigma_sph(r) + sigma_prom(m, p_local);
+static float density_total(const Medium *m, V3 p_local) {
+  float r = v3_len(p_local);
+  return sigma_sph(r) + sigma_prom(m, p_local);
 }
 
 /*
@@ -1991,45 +2051,46 @@ static float density_total(const Medium *m, V3 p_local)
  * streaks on the visible chromos ring. Hot peaks lean yellow because
  * real spicule heating shifts emission lines.
  */
-static RGB emission_at(const Medium *m, V3 p_local)
-{
-    float r = v3_len(p_local);
-    if (r < SUN_R)                            return rgb_make(0,0,0);
-    if (r > SUN_R * (1.0f + PROM_HEIGHT))     return rgb_make(0,0,0);
+static RGB emission_at(const Medium *m, V3 p_local) {
+  float r = v3_len(p_local);
+  if (r < SUN_R)
+    return rgb_make(0, 0, 0);
+  if (r > SUN_R * (1.0f + PROM_HEIGHT))
+    return rgb_make(0, 0, 0);
 
-    RGB ha_cool = rgb_make(1.00f, 0.18f, 0.12f);
-    RGB ha_hot  = rgb_make(1.00f, 0.45f, 0.18f);
+  RGB ha_cool = rgb_make(1.00f, 0.18f, 0.12f);
+  RGB ha_hot = rgb_make(1.00f, 0.45f, 0.18f);
 
-    float chr_em    = 0.0f;
-    float spicule_n = 0.0f;
-    float h = (r - SUN_R) / (SUN_R * CHROMOS_THICK);
-    if (h >= 0.0f && h <= 1.0f) {
-        float fade = 1.0f - h;
-        fade = fade * fade * fade * fade;
+  float chr_em = 0.0f;
+  float spicule_n = 0.0f;
+  float h = (r - SUN_R) / (SUN_R * CHROMOS_THICK);
+  if (h >= 0.0f && h <= 1.0f) {
+    float fade = 1.0f - h;
+    fade = fade * fade * fade * fade;
 
-        float r_safe = fmaxf(r, 1e-6f);
-        float yy     = p_local.y / r_safe;
-        if (yy >  1.0f) yy =  1.0f;
-        if (yy < -1.0f) yy = -1.0f;
-        float theta  = acosf(yy);
-        float phi    = atan2f(p_local.x, p_local.z);
-        spicule_n    = fbm2(phi   * SPICULE_FREQ_PHI,
-                            theta * SPICULE_FREQ_TH);
-        float spicule_factor = SPICULE_BASE + SPICULE_AMP * spicule_n;
+    float r_safe = fmaxf(r, 1e-6f);
+    float yy = p_local.y / r_safe;
+    if (yy > 1.0f)
+      yy = 1.0f;
+    if (yy < -1.0f)
+      yy = -1.0f;
+    float theta = acosf(yy);
+    float phi = atan2f(p_local.x, p_local.z);
+    spicule_n = fbm2(phi * SPICULE_FREQ_PHI, theta * SPICULE_FREQ_TH);
+    float spicule_factor = SPICULE_BASE + SPICULE_AMP * spicule_n;
 
-        chr_em = CHROMOS_SIGMA0 * fade * spicule_factor;
-    }
+    chr_em = CHROMOS_SIGMA0 * fade * spicule_factor;
+  }
 
-    float pr_em = sigma_prom(m, p_local);
+  float pr_em = sigma_prom(m, p_local);
 
-    RGB chr_col = rgb_make(
-        ha_cool.r + (ha_hot.r - ha_cool.r) * spicule_n,
-        ha_cool.g + (ha_hot.g - ha_cool.g) * spicule_n,
-        ha_cool.b + (ha_hot.b - ha_cool.b) * spicule_n);
+  RGB chr_col = rgb_make(ha_cool.r + (ha_hot.r - ha_cool.r) * spicule_n,
+                         ha_cool.g + (ha_hot.g - ha_cool.g) * spicule_n,
+                         ha_cool.b + (ha_hot.b - ha_cool.b) * spicule_n);
 
-    RGB out = rgb_scl(chr_col, chr_em);
-    out    = rgb_add(out, rgb_scl(ha_cool, pr_em));
-    return out;
+  RGB out = rgb_scl(chr_col, chr_em);
+  out = rgb_add(out, rgb_scl(ha_cool, pr_em));
+  return out;
 }
 
 /* ── §10 transmittance LUT ───────────────────────────────────────────── *
@@ -2069,23 +2130,22 @@ static float trans_lut[LUT_SIZE];
  * Why: cumulative storage means lookup_transmittance can do a
  * one-bilinear-interp constant-time fetch.
  */
-static void build_trans_lut(void)
-{
-    const int N_INT = 32;
-    trans_lut[0] = 0.0f;
-    float r_prev = SUN_R;
-    for (int i = 1; i < LUT_SIZE; i++) {
-        float r_curr = SUN_R + (LUT_R_MAX - SUN_R)
-                     * ((float)i / (float)(LUT_SIZE - 1));
-        float ds = (r_curr - r_prev) / (float)N_INT;
-        float tau = trans_lut[i - 1];
-        for (int j = 0; j < N_INT; j++) {
-            float s = r_prev + (j + 0.5f) * ds;
-            tau += sigma_sph(s) * ds;
-        }
-        trans_lut[i] = tau;
-        r_prev = r_curr;
+static void build_trans_lut(void) {
+  const int N_INT = 32;
+  trans_lut[0] = 0.0f;
+  float r_prev = SUN_R;
+  for (int i = 1; i < LUT_SIZE; i++) {
+    float r_curr =
+        SUN_R + (LUT_R_MAX - SUN_R) * ((float)i / (float)(LUT_SIZE - 1));
+    float ds = (r_curr - r_prev) / (float)N_INT;
+    float tau = trans_lut[i - 1];
+    for (int j = 0; j < N_INT; j++) {
+      float s = r_prev + (j + 0.5f) * ds;
+      tau += sigma_sph(s) * ds;
     }
+    trans_lut[i] = tau;
+    r_prev = r_curr;
+  }
 }
 
 /* §10.2 lookup_transmittance — fetch Tr at world point p_local.
@@ -2109,19 +2169,22 @@ static void build_trans_lut(void)
  * three multiplies, one expf — that's the entire NEE-transmittance
  * cost per active step.
  */
-static float lookup_transmittance(V3 p_local)
-{
-    float r = v3_len(p_local);
-    if (r < SUN_R)        return 0.0f;
-    if (r > LUT_R_MAX)    return 1.0f;
+static float lookup_transmittance(V3 p_local) {
+  float r = v3_len(p_local);
+  if (r < SUN_R)
+    return 0.0f;
+  if (r > LUT_R_MAX)
+    return 1.0f;
 
-    float fr = (r - SUN_R) / (LUT_R_MAX - SUN_R) * (float)(LUT_SIZE - 1);
-    int   ir = (int)fr;
-    if (ir < 0)             ir = 0;
-    if (ir > LUT_SIZE - 2)  ir = LUT_SIZE - 2;
-    float t   = fr - (float)ir;
-    float tau = trans_lut[ir] * (1.0f - t) + trans_lut[ir + 1] * t;
-    return expf(-tau);
+  float fr = (r - SUN_R) / (LUT_R_MAX - SUN_R) * (float)(LUT_SIZE - 1);
+  int ir = (int)fr;
+  if (ir < 0)
+    ir = 0;
+  if (ir > LUT_SIZE - 2)
+    ir = LUT_SIZE - 2;
+  float t = fr - (float)ir;
+  float tau = trans_lut[ir] * (1.0f - t) + trans_lut[ir + 1] * t;
+  return expf(-tau);
 }
 
 /* ── §11 path tracer ─────────────────────────────────────────────────── *
@@ -2163,9 +2226,8 @@ static float lookup_transmittance(V3 p_local)
  * different phases here. Thomson is correct for free electrons in
  * the K-corona.
  */
-static inline float thomson_phase(float cos_theta)
-{
-    return (3.0f / (16.0f * (float)M_PI)) * (1.0f + cos_theta * cos_theta);
+static inline float thomson_phase(float cos_theta) {
+  return (3.0f / (16.0f * (float)M_PI)) * (1.0f + cos_theta * cos_theta);
 }
 
 /* §11.2 trace_ray — the path tracer kernel.
@@ -2229,130 +2291,130 @@ static inline float thomson_phase(float cos_theta)
  * of feeding it the right inputs and rendering its output. Read it
  * after Tutorials 4, 5, 6, 7, and 10.
  */
-static RGB trace_ray(V3 ro, V3 rd, const Medium *m,
-                     V3 sun_pos, V3 moon_pos, float moon_R, int seed,
-                     RGB sun_em, RGB earth_tint, float corona_gate)
-{
-    /* Surface intersections — moon uses perturbed-radius variant for
-     * Bailey's-bead-correct silhouette (see Tutorial 8). */
-    float t_sun = 0.f, t_moon = 0.f;
-    bool  hit_sun  = ray_sphere(ro, rd, sun_pos, SUN_R, &t_sun);
-    bool  hit_moon = ray_moon  (ro, rd, moon_pos, moon_R, seed, &t_moon);
+static RGB trace_ray(V3 ro, V3 rd, const Medium *m, V3 sun_pos, V3 moon_pos,
+                     float moon_R, int seed, RGB sun_em, RGB earth_tint,
+                     float corona_gate) {
+  /* Surface intersections — moon uses perturbed-radius variant for
+   * Bailey's-bead-correct silhouette (see Tutorial 8). */
+  float t_sun = 0.f, t_moon = 0.f;
+  bool hit_sun = ray_sphere(ro, rd, sun_pos, SUN_R, &t_sun);
+  bool hit_moon = ray_moon(ro, rd, moon_pos, moon_R, seed, &t_moon);
 
-    float t_max;
-    int   surf_type = 0;        /* 0 sky · 1 sun · 2 moon */
-    if (hit_moon && (!hit_sun || t_moon < t_sun)) {
-        t_max     = t_moon;
-        surf_type = 2;
-    } else if (hit_sun) {
-        t_max     = t_sun;
-        surf_type = 1;
-    } else {
-        t_max     = MARCH_T_MAX;
-        surf_type = 0;
+  float t_max;
+  int surf_type = 0; /* 0 sky · 1 sun · 2 moon */
+  if (hit_moon && (!hit_sun || t_moon < t_sun)) {
+    t_max = t_moon;
+    surf_type = 2;
+  } else if (hit_sun) {
+    t_max = t_sun;
+    surf_type = 1;
+  } else {
+    t_max = MARCH_T_MAX;
+    surf_type = 0;
+  }
+
+  /* Adaptive step size: fine inside corona reach, 4× coarse outside.
+   * Outside CORONA_REACH·R_sun, σ_sph ≡ 0 (and prominences live
+   * close to the photosphere too) — coarse strides through truly
+   * empty space contribute nothing regardless of length. The 0.5×
+   * margin in the boundary keeps the chromosphere shell on the
+   * fine-step side. */
+  float dt_fine = t_max / (float)MARCH_STEPS;
+  float dt_coarse = dt_fine * 4.0f;
+  float corona_outer = SUN_R * (CORONA_REACH + 0.5f);
+  float corona_outer_R2 = corona_outer * corona_outer;
+
+  RGB radiance_accum = rgb_make(0.f, 0.f, 0.f);
+  float transmittance = 1.0f;
+  float t_along_ray = 0.0f;
+
+  while (t_along_ray < t_max && transmittance > 1e-3f) {
+    /* Pick step size based on distance from sun at the start of
+     * the step. */
+    V3 p_now = v3_add(ro, v3_scl(rd, t_along_ray));
+    V3 p_now_loc = v3_sub(p_now, sun_pos);
+    float r2_now = v3_dot(p_now_loc, p_now_loc);
+    float dt = (r2_now < corona_outer_R2) ? dt_fine : dt_coarse;
+    if (t_along_ray + dt > t_max)
+      dt = t_max - t_along_ray;
+
+    /* Sample at midpoint of this step. */
+    float t_mid = t_along_ray + 0.5f * dt;
+    V3 p = v3_add(ro, v3_scl(rd, t_mid));
+    V3 p_local = v3_sub(p, sun_pos);
+    float density = density_total(m, p_local);
+
+    if (density >= 1e-6f) {
+      V3 to_sun_v = v3_sub(sun_pos, p);
+      float dist_sun = v3_len(to_sun_v);
+      V3 to_sun = v3_scl(to_sun_v, 1.0f / fmaxf(dist_sun, 1e-6f));
+
+      /* Continuous penumbra — soft moon shadow at the edge. */
+      float vis = visible_fraction_sun(p, sun_pos, moon_pos, moon_R);
+
+      if (vis > 1e-4f) {
+        float sin_a = SUN_R / fmaxf(dist_sun, SUN_R + 1e-3f);
+        if (sin_a > 1.0f)
+          sin_a = 1.0f;
+        float cos_a = sqrtf(fmaxf(1.0f - sin_a * sin_a, 0.0f));
+        float omega = 2.0f * (float)M_PI * (1.0f - cos_a);
+
+        float tr_to_sun = lookup_transmittance(p_local);
+        float cos_th = v3_dot(rd, to_sun);
+        float phase = thomson_phase(cos_th);
+        float in_sc = density * phase * tr_to_sun * omega * vis *
+                      IN_SCATTER_GAIN * dt * corona_gate;
+        radiance_accum = rgb_add(
+            radiance_accum, rgb_scl(rgb_scl(sun_em, in_sc), transmittance));
+      }
+
+      RGB em = emission_at(m, p_local);
+      if (em.r + em.g + em.b > 0.f) {
+        radiance_accum = rgb_add(
+            radiance_accum,
+            rgb_scl(em, transmittance * dt * HA_EMIT_GAIN * corona_gate));
+      }
+
+      transmittance *= expf(-density * dt);
     }
+    t_along_ray += dt;
+  }
 
-    /* Adaptive step size: fine inside corona reach, 4× coarse outside.
-     * Outside CORONA_REACH·R_sun, σ_sph ≡ 0 (and prominences live
-     * close to the photosphere too) — coarse strides through truly
-     * empty space contribute nothing regardless of length. The 0.5×
-     * margin in the boundary keeps the chromosphere shell on the
-     * fine-step side. */
-    float dt_fine          = t_max / (float)MARCH_STEPS;
-    float dt_coarse        = dt_fine * 4.0f;
-    float corona_outer     = SUN_R * (CORONA_REACH + 0.5f);
-    float corona_outer_R2  = corona_outer * corona_outer;
+  /* Surface contribution. */
+  if (surf_type == 1) {
+    /* Photosphere — emissive with Eddington limb darkening. */
+    V3 p = v3_add(ro, v3_scl(rd, t_sun));
+    V3 N = v3_norm(v3_sub(p, sun_pos));
+    float mu = -v3_dot(N, rd);
+    if (mu < 0.f)
+      mu = 0.f;
+    float lim = LIMB_AMBIENT + LIMB_GAIN * mu;
+    radiance_accum =
+        rgb_add(radiance_accum, rgb_scl(rgb_scl(sun_em, lim), transmittance));
+  } else if (surf_type == 2) {
+    /* Moon — Lambertian. In eclipse geometry cos(N, sun) ≤ 0 (moon
+     * faces away from sun), so direct Lambertian sun-light is
+     * essentially zero. Earthshine fills the dim cool-blue glow on
+     * the moon's night side. */
+    V3 p = v3_add(ro, v3_scl(rd, t_moon));
+    V3 N = v3_norm(v3_sub(p, moon_pos));
+    V3 to_sun_v = v3_sub(sun_pos, p);
+    float dist_sun = v3_len(to_sun_v);
+    V3 to_sun = v3_scl(to_sun_v, 1.0f / fmaxf(dist_sun, 1e-6f));
+    float cos_sn = v3_dot(N, to_sun);
 
-    RGB   radiance_accum = rgb_make(0.f, 0.f, 0.f);
-    float transmittance  = 1.0f;
-    float t_along_ray    = 0.0f;
-
-    while (t_along_ray < t_max && transmittance > 1e-3f) {
-        /* Pick step size based on distance from sun at the start of
-         * the step. */
-        V3    p_now      = v3_add(ro, v3_scl(rd, t_along_ray));
-        V3    p_now_loc  = v3_sub(p_now, sun_pos);
-        float r2_now     = v3_dot(p_now_loc, p_now_loc);
-        float dt         = (r2_now < corona_outer_R2) ? dt_fine : dt_coarse;
-        if (t_along_ray + dt > t_max) dt = t_max - t_along_ray;
-
-        /* Sample at midpoint of this step. */
-        float t_mid   = t_along_ray + 0.5f * dt;
-        V3    p       = v3_add(ro, v3_scl(rd, t_mid));
-        V3    p_local = v3_sub(p, sun_pos);
-        float density = density_total(m, p_local);
-
-        if (density >= 1e-6f) {
-            V3    to_sun_v = v3_sub(sun_pos, p);
-            float dist_sun = v3_len(to_sun_v);
-            V3    to_sun   = v3_scl(to_sun_v, 1.0f / fmaxf(dist_sun, 1e-6f));
-
-            /* Continuous penumbra — soft moon shadow at the edge. */
-            float vis = visible_fraction_sun(p, sun_pos, moon_pos, moon_R);
-
-            if (vis > 1e-4f) {
-                float sin_a = SUN_R / fmaxf(dist_sun, SUN_R + 1e-3f);
-                if (sin_a > 1.0f) sin_a = 1.0f;
-                float cos_a = sqrtf(fmaxf(1.0f - sin_a * sin_a, 0.0f));
-                float omega = 2.0f * (float)M_PI * (1.0f - cos_a);
-
-                float tr_to_sun = lookup_transmittance(p_local);
-                float cos_th    = v3_dot(rd, to_sun);
-                float phase     = thomson_phase(cos_th);
-                float in_sc     = density * phase * tr_to_sun * omega
-                                * vis * IN_SCATTER_GAIN * dt
-                                * corona_gate;
-                radiance_accum  = rgb_add(radiance_accum,
-                                          rgb_scl(rgb_scl(sun_em, in_sc),
-                                                  transmittance));
-            }
-
-            RGB em = emission_at(m, p_local);
-            if (em.r + em.g + em.b > 0.f) {
-                radiance_accum = rgb_add(radiance_accum,
-                    rgb_scl(em, transmittance * dt * HA_EMIT_GAIN
-                                                   * corona_gate));
-            }
-
-            transmittance *= expf(-density * dt);
-        }
-        t_along_ray += dt;
+    RGB direct = rgb_make(0.f, 0.f, 0.f);
+    if (cos_sn > 0.0f) {
+      float Lf = MOON_ALBEDO / (float)M_PI * cos_sn;
+      direct = rgb_scl(sun_em, Lf);
     }
+    RGB earth = rgb_scl(earth_tint, EARTHSHINE_GAIN);
+    radiance_accum =
+        rgb_add(radiance_accum, rgb_scl(rgb_add(direct, earth), transmittance));
+  }
+  /* Sky case: no extra surface term. */
 
-    /* Surface contribution. */
-    if (surf_type == 1) {
-        /* Photosphere — emissive with Eddington limb darkening. */
-        V3    p   = v3_add(ro, v3_scl(rd, t_sun));
-        V3    N   = v3_norm(v3_sub(p, sun_pos));
-        float mu  = -v3_dot(N, rd);
-        if (mu < 0.f) mu = 0.f;
-        float lim = LIMB_AMBIENT + LIMB_GAIN * mu;
-        radiance_accum = rgb_add(radiance_accum,
-                                 rgb_scl(rgb_scl(sun_em, lim), transmittance));
-    } else if (surf_type == 2) {
-        /* Moon — Lambertian. In eclipse geometry cos(N, sun) ≤ 0 (moon
-         * faces away from sun), so direct Lambertian sun-light is
-         * essentially zero. Earthshine fills the dim cool-blue glow on
-         * the moon's night side. */
-        V3    p        = v3_add(ro, v3_scl(rd, t_moon));
-        V3    N        = v3_norm(v3_sub(p, moon_pos));
-        V3    to_sun_v = v3_sub(sun_pos, p);
-        float dist_sun = v3_len(to_sun_v);
-        V3    to_sun   = v3_scl(to_sun_v, 1.0f / fmaxf(dist_sun, 1e-6f));
-        float cos_sn   = v3_dot(N, to_sun);
-
-        RGB direct = rgb_make(0.f, 0.f, 0.f);
-        if (cos_sn > 0.0f) {
-            float Lf = MOON_ALBEDO / (float)M_PI * cos_sn;
-            direct = rgb_scl(sun_em, Lf);
-        }
-        RGB earth = rgb_scl(earth_tint, EARTHSHINE_GAIN);
-        radiance_accum = rgb_add(radiance_accum,
-            rgb_scl(rgb_add(direct, earth), transmittance));
-    }
-    /* Sky case: no extra surface term. */
-
-    return radiance_accum;
+  return radiance_accum;
 }
 
 /* ── §12 scene state ─────────────────────────────────────────────────── *
@@ -2381,24 +2443,24 @@ static RGB trace_ray(V3 ro, V3 rd, const Medium *m,
  */
 
 typedef struct {
-    float moon_world_r;
-    float moon_y_world;
-    bool  totality_possible;
-    bool  show_corona;            /* unused at runtime, kept for HUD */
+  float moon_world_r;
+  float moon_y_world;
+  bool totality_possible;
+  bool show_corona; /* unused at runtime, kept for HUD */
 } PatternParams;
 
 typedef struct {
-    bool          paused;
-    int           speed;
-    int           star_idx;
-    float         zoom;            /* effective FOV = FOV_H_BASE / zoom */
-    float         moon_scale;      /* live moon-radius multiplier */
-    Pattern       current_pattern;
-    PatternParams pp;
-    float         time_secs;
-    float         seed_phase;
-    int           seed;
-    Medium        medium;
+  bool paused;
+  int speed;
+  int star_idx;
+  float zoom;       /* effective FOV = FOV_H_BASE / zoom */
+  float moon_scale; /* live moon-radius multiplier */
+  Pattern current_pattern;
+  PatternParams pp;
+  float time_secs;
+  float seed_phase;
+  int seed;
+  Medium medium;
 } Scene;
 
 /* §12.2 pattern_set.
@@ -2418,31 +2480,31 @@ typedef struct {
  * tracer, we change the world geometry. Same kernel renders all four
  * patterns by reading current Scene state.
  */
-static void pattern_set(Scene *s, Pattern p)
-{
-    s->current_pattern = p;
-    PatternParams *pp = &s->pp;
-    pp->moon_world_r      = MOON_BASE_R_TOTAL;
-    pp->moon_y_world      = 0.0f;
-    pp->totality_possible = false;
-    pp->show_corona       = true;
-    switch (p) {
-    case PATTERN_TOTAL:
-        pp->moon_world_r      = MOON_BASE_R_TOTAL;
-        pp->totality_possible = true;
-        break;
-    case PATTERN_PARTIAL:
-        pp->moon_world_r = MOON_BASE_R_TOTAL;
-        pp->moon_y_world = PARTIAL_Y_OFFSET * MOON_Z;
-        break;
-    case PATTERN_ANNULAR:
-        pp->moon_world_r = MOON_BASE_R_ANNULAR;
-        break;
-    case PATTERN_TRANSIT:
-        pp->moon_world_r = MOON_BASE_R_TRANSIT;
-        break;
-    case N_PATTERNS: break;
-    }
+static void pattern_set(Scene *s, Pattern p) {
+  s->current_pattern = p;
+  PatternParams *pp = &s->pp;
+  pp->moon_world_r = MOON_BASE_R_TOTAL;
+  pp->moon_y_world = 0.0f;
+  pp->totality_possible = false;
+  pp->show_corona = true;
+  switch (p) {
+  case PATTERN_TOTAL:
+    pp->moon_world_r = MOON_BASE_R_TOTAL;
+    pp->totality_possible = true;
+    break;
+  case PATTERN_PARTIAL:
+    pp->moon_world_r = MOON_BASE_R_TOTAL;
+    pp->moon_y_world = PARTIAL_Y_OFFSET * MOON_Z;
+    break;
+  case PATTERN_ANNULAR:
+    pp->moon_world_r = MOON_BASE_R_ANNULAR;
+    break;
+  case PATTERN_TRANSIT:
+    pp->moon_world_r = MOON_BASE_R_TRANSIT;
+    break;
+  case N_PATTERNS:
+    break;
+  }
 }
 
 /* §12.3 reseeding + init + tick.
@@ -2454,51 +2516,47 @@ static void pattern_set(Scene *s, Pattern p)
  * proportional to user-set speed.
  */
 
-static void medium_reseed(Medium *m, int seed)
-{
-    /* Random prominence positions (angle, height, amplitude). */
-    for (int k = 0; k < PROM_COUNT; k++) {
-        uint32_t h = hash3(k, seed, 0xF1A3E);
-        m->prom_phi   [k] = hash01(h)              * 2.0f * (float)M_PI;
-        m->prom_height[k] = PROM_HEIGHT
-                          * (0.40f + 0.60f * hash01(h ^ 0xA1u));
-        m->prom_amp   [k] = 0.50f + 0.50f * hash01(h ^ 0xB2u);
-    }
-    /* Bake the moon's silhouette perturbation. */
-    build_lunar_lut(seed);
+static void medium_reseed(Medium *m, int seed) {
+  /* Random prominence positions (angle, height, amplitude). */
+  for (int k = 0; k < PROM_COUNT; k++) {
+    uint32_t h = hash3(k, seed, 0xF1A3E);
+    m->prom_phi[k] = hash01(h) * 2.0f * (float)M_PI;
+    m->prom_height[k] = PROM_HEIGHT * (0.40f + 0.60f * hash01(h ^ 0xA1u));
+    m->prom_amp[k] = 0.50f + 0.50f * hash01(h ^ 0xB2u);
+  }
+  /* Bake the moon's silhouette perturbation. */
+  build_lunar_lut(seed);
 
-    /* Shuffle Perlin permutation table for spicule fBm. */
-    perm_shuffle(seed);
+  /* Shuffle Perlin permutation table for spicule fBm. */
+  perm_shuffle(seed);
 }
 
-static void scene_reseed(Scene *s)
-{
-    uint32_t h = hash3((int)(s->time_secs * 1000.0f),
-                       (int)(s->seed_phase * 100.0f), 0xC0FFEE);
-    s->seed_phase = ((float)(h & 0xFFFFu) / 65536.0f) * 2.0f * (float)M_PI;
-    s->seed       = (int)(h ^ 0x5A5A5A5Au);
-    medium_reseed(&s->medium, s->seed);
+static void scene_reseed(Scene *s) {
+  uint32_t h = hash3((int)(s->time_secs * 1000.0f),
+                     (int)(s->seed_phase * 100.0f), 0xC0FFEE);
+  s->seed_phase = ((float)(h & 0xFFFFu) / 65536.0f) * 2.0f * (float)M_PI;
+  s->seed = (int)(h ^ 0x5A5A5A5Au);
+  medium_reseed(&s->medium, s->seed);
 }
 
-static void scene_init(Scene *s)
-{
-    memset(s, 0, sizeof *s);
-    s->paused      = false;
-    s->speed       = SPEED_DEF;
-    s->star_idx    = 2;            /* G-STAR (the Sun) by default */
-    s->zoom        = 1.0f;
-    s->moon_scale  = 1.0f;
-    s->seed_phase  = 0.0f;
-    s->seed        = 0xDECAF;
-    medium_reseed(&s->medium, s->seed);
-    pattern_set(s, PATTERN_TOTAL);
+static void scene_init(Scene *s) {
+  memset(s, 0, sizeof *s);
+  s->paused = false;
+  s->speed = SPEED_DEF;
+  s->star_idx = 2; /* G-STAR (the Sun) by default */
+  s->zoom = 1.0f;
+  s->moon_scale = 1.0f;
+  s->seed_phase = 0.0f;
+  s->seed = 0xDECAF;
+  medium_reseed(&s->medium, s->seed);
+  pattern_set(s, PATTERN_TOTAL);
 }
 
-static void scene_tick(Scene *s, float dt)
-{
-    if (s->paused) return;
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    s->time_secs += dt * speed_mul;
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
+  float speed_mul = (float)s->speed / (float)SPEED_DEF;
+  s->time_secs += dt * speed_mul;
 }
 
 /* §12.4 derived geometry queries.
@@ -2516,44 +2574,46 @@ static void scene_tick(Scene *s, float dt)
  * NOT covered, returned as a continuous value.
  */
 
-static inline float scene_moon_r(const Scene *s)
-{
-    return s->pp.moon_world_r * s->moon_scale;
+static inline float scene_moon_r(const Scene *s) {
+  return s->pp.moon_world_r * s->moon_scale;
 }
 
-static V3 scene_moon_pos(const Scene *s)
-{
-    float sun_a  = atanf(SUN_R            / SUN_Z );
-    float moon_a = atanf(scene_moon_r(s)  / MOON_Z);
-    float orbit_x_world = MOON_Z * (sun_a + moon_a) * MOON_ORBIT_X_FRAC;
-    float omega = 2.0f * (float)M_PI / ECLIPSE_PERIOD_S;
-    float phase = omega * s->time_secs + s->seed_phase;
-    float mx = orbit_x_world * sinf(phase);
-    return v3(mx, s->pp.moon_y_world, MOON_Z);
+static V3 scene_moon_pos(const Scene *s) {
+  float sun_a = atanf(SUN_R / SUN_Z);
+  float moon_a = atanf(scene_moon_r(s) / MOON_Z);
+  float orbit_x_world = MOON_Z * (sun_a + moon_a) * MOON_ORBIT_X_FRAC;
+  float omega = 2.0f * (float)M_PI / ECLIPSE_PERIOD_S;
+  float phase = omega * s->time_secs + s->seed_phase;
+  float mx = orbit_x_world * sinf(phase);
+  return v3(mx, s->pp.moon_y_world, MOON_Z);
 }
 
-static float scene_occlusion(const Scene *s)
-{
-    V3 sun_pos  = v3(0, 0, SUN_Z);
-    V3 moon_pos = scene_moon_pos(s);
-    V3 sun_dir  = v3_norm(sun_pos);
-    V3 moon_dir = v3_norm(moon_pos);
-    float cos_b = v3_dot(sun_dir, moon_dir);
-    if (cos_b > 1.f)  cos_b = 1.f;
-    if (cos_b < -1.f) cos_b = -1.f;
-    float sep    = acosf(cos_b);
-    float sun_a  = atanf(SUN_R           / SUN_Z );
-    float moon_a = atanf(scene_moon_r(s) / MOON_Z);
-    float sum    = sun_a + moon_a;
-    float dif    = fabsf(sun_a - moon_a);
-    if (sep >= sum) return 0.f;
-    if (sep <= dif) {
-        if (moon_a >= sun_a) return 1.f;
-        return (moon_a / sun_a) * (moon_a / sun_a);
-    }
-    float t = (sum - sep) / (2.0f * fminf(sun_a, moon_a));
-    if (moon_a >= sun_a) return t;
-    return t * (moon_a / sun_a) * (moon_a / sun_a);
+static float scene_occlusion(const Scene *s) {
+  V3 sun_pos = v3(0, 0, SUN_Z);
+  V3 moon_pos = scene_moon_pos(s);
+  V3 sun_dir = v3_norm(sun_pos);
+  V3 moon_dir = v3_norm(moon_pos);
+  float cos_b = v3_dot(sun_dir, moon_dir);
+  if (cos_b > 1.f)
+    cos_b = 1.f;
+  if (cos_b < -1.f)
+    cos_b = -1.f;
+  float sep = acosf(cos_b);
+  float sun_a = atanf(SUN_R / SUN_Z);
+  float moon_a = atanf(scene_moon_r(s) / MOON_Z);
+  float sum = sun_a + moon_a;
+  float dif = fabsf(sun_a - moon_a);
+  if (sep >= sum)
+    return 0.f;
+  if (sep <= dif) {
+    if (moon_a >= sun_a)
+      return 1.f;
+    return (moon_a / sun_a) * (moon_a / sun_a);
+  }
+  float t = (sum - sep) / (2.0f * fminf(sun_a, moon_a));
+  if (moon_a >= sun_a)
+    return t;
+  return t * (moon_a / sun_a) * (moon_a / sun_a);
 }
 
 /* ── §13 camera ──────────────────────────────────────────────────────── *
@@ -2566,27 +2626,25 @@ static float scene_occlusion(const Scene *s)
  */
 
 typedef struct {
-    V3   pos;
-    float fov_h, fov_v;
-    int  cols, rows;
+  V3 pos;
+  float fov_h, fov_v;
+  int cols, rows;
 } Camera;
 
-static void camera_make(Camera *c, int cols, int rows, float fov_h)
-{
-    c->cols  = cols;
-    c->rows  = rows;
-    c->pos   = v3(0, 0, 0);
-    c->fov_h = fov_h;
-    c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
+static void camera_make(Camera *c, int cols, int rows, float fov_h) {
+  c->cols = cols;
+  c->rows = rows;
+  c->pos = v3(0, 0, 0);
+  c->fov_h = fov_h;
+  c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
 }
 
-static V3 camera_ray(const Camera *c, int sx, int sy)
-{
-    float u = ( (2.0f * (float)sx + 1.0f) - (float)c->cols)
-            / (float)c->cols * c->fov_h;
-    float v = -((2.0f * (float)sy + 1.0f) - (float)c->rows)
-            / (float)c->rows * c->fov_v;
-    return v3_norm(v3(u, v, 1.0f));
+static V3 camera_ray(const Camera *c, int sx, int sy) {
+  float u =
+      ((2.0f * (float)sx + 1.0f) - (float)c->cols) / (float)c->cols * c->fov_h;
+  float v =
+      -((2.0f * (float)sy + 1.0f) - (float)c->rows) / (float)c->rows * c->fov_v;
+  return v3_norm(v3(u, v, 1.0f));
 }
 
 /* ── §14 screen + scene_draw ─────────────────────────────────────────── *
@@ -2602,7 +2660,9 @@ static V3 camera_ray(const Camera *c, int sx, int sy)
  *   §14.2 scene_draw
  */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
 /* §14.1 screen lifecycle.
  *
@@ -2613,24 +2673,22 @@ typedef struct { int cols, rows; } Screen;
  * handler in §16.
  */
 
-static void screen_init(Screen *s)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
 /* §14.2 scene_draw — per-frame orchestration.
@@ -2667,73 +2725,73 @@ static void screen_resize(Screen *s)
 
 static RGB g_buf[BUF_MAX_H][BUF_MAX_W];
 
-static void scene_draw(const Screen *sc, const Scene *s)
-{
-    int rows_eff = sc->rows - 2;
-    int row_off  = 1;
-    if (rows_eff < 4) { rows_eff = sc->rows; row_off = 0; }
-    if (rows_eff > BUF_MAX_H) rows_eff = BUF_MAX_H;
-    int cols_eff = sc->cols;
-    if (cols_eff > BUF_MAX_W) cols_eff = BUF_MAX_W;
+static void scene_draw(const Screen *sc, const Scene *s) {
+  int rows_eff = sc->rows - 2;
+  int row_off = 1;
+  if (rows_eff < 4) {
+    rows_eff = sc->rows;
+    row_off = 0;
+  }
+  if (rows_eff > BUF_MAX_H)
+    rows_eff = BUF_MAX_H;
+  int cols_eff = sc->cols;
+  if (cols_eff > BUF_MAX_W)
+    cols_eff = BUF_MAX_W;
 
-    Camera cam;
-    camera_make(&cam, cols_eff, rows_eff, FOV_H_BASE / s->zoom);
+  Camera cam;
+  camera_make(&cam, cols_eff, rows_eff, FOV_H_BASE / s->zoom);
 
-    V3    sun_pos  = v3(0, 0, SUN_Z);
-    V3    moon_pos = scene_moon_pos(s);
-    float moon_R   = scene_moon_r(s);
+  V3 sun_pos = v3(0, 0, SUN_Z);
+  V3 moon_pos = scene_moon_pos(s);
+  float moon_R = scene_moon_r(s);
 
-    Medium m_local = s->medium;
-    m_local.kelvin = STARS[s->star_idx].kelvin;
+  Medium m_local = s->medium;
+  m_local.kelvin = STARS[s->star_idx].kelvin;
 
-    RGB sun_chrom = blackbody_rgb(m_local.kelvin);
-    RGB sun_em    = rgb_scl(sun_chrom, SUN_EMIT_HDR);
+  RGB sun_chrom = blackbody_rgb(m_local.kelvin);
+  RGB sun_em = rgb_scl(sun_chrom, SUN_EMIT_HDR);
 
-    /* Earthshine: rough Earth-as-mirror with Rayleigh-blue albedo. */
-    RGB earth_alb   = rgb_make(0.30f, 0.45f, EARTH_ALBEDO_BLUE);
-    RGB earth_tint  = rgb_mul(sun_em, earth_alb);
+  /* Earthshine: rough Earth-as-mirror with Rayleigh-blue albedo. */
+  RGB earth_alb = rgb_make(0.30f, 0.45f, EARTH_ALBEDO_BLUE);
+  RGB earth_tint = rgb_mul(sun_em, earth_alb);
 
-    /* Eye-adaptation gate — one number per frame. */
-    float cam_vis_sun = visible_fraction_sun(cam.pos, sun_pos,
-                                             moon_pos, moon_R);
-    float corona_gate = CORONA_GATE_FLOOR
-                      + CORONA_GATE_RANGE * (1.0f - cam_vis_sun);
+  /* Eye-adaptation gate — one number per frame. */
+  float cam_vis_sun = visible_fraction_sun(cam.pos, sun_pos, moon_pos, moon_R);
+  float corona_gate =
+      CORONA_GATE_FLOOR + CORONA_GATE_RANGE * (1.0f - cam_vis_sun);
 
-    /* PASS 1 — path tracer for each cell. */
-    for (int r = 0; r < rows_eff; r++) {
-        for (int c = 0; c < cols_eff; c++) {
-            V3 ray_d = camera_ray(&cam, c, r);
-            RGB col = trace_ray(cam.pos, ray_d, &m_local,
-                                sun_pos, moon_pos, moon_R, s->seed,
-                                sun_em, earth_tint, corona_gate);
+  /* PASS 1 — path tracer for each cell. */
+  for (int r = 0; r < rows_eff; r++) {
+    for (int c = 0; c < cols_eff; c++) {
+      V3 ray_d = camera_ray(&cam, c, r);
+      RGB col = trace_ray(cam.pos, ray_d, &m_local, sun_pos, moon_pos, moon_R,
+                          s->seed, sun_em, earth_tint, corona_gate);
 
-            /* Background stars — only at near-totality and only for
-             * "sky" cells (luma below threshold from the path
-             * tracer). Per-cell hash keeps positions stable across
-             * frames; per-star Kelvin is log-uniform in [3000, 30000]
-             * for a chromaticity spread. */
-            if (luma_of(col) < 0.04f
-                && scene_occlusion(s) > STAR_OCC_VISIBLE) {
-                uint32_t h = hash3(c, r, s->seed);
-                if ((h % STAR_DENSITY) == 0u) {
-                    float br  = 0.6f + hash01(h >> 8) * 0.4f;
-                    float u_K = hash01(h ^ 0xC0DEC0DEu);
-                    float kK  = STAR_K_MIN
-                              * powf(STAR_K_MAX / STAR_K_MIN, u_K);
-                    col = rgb_add(col, rgb_scl(blackbody_rgb(kK), br));
-                }
-            }
-
-            g_buf[r][c] = col;
+      /* Background stars — only at near-totality and only for
+       * "sky" cells (luma below threshold from the path
+       * tracer). Per-cell hash keeps positions stable across
+       * frames; per-star Kelvin is log-uniform in [3000, 30000]
+       * for a chromaticity spread. */
+      if (luma_of(col) < 0.04f && scene_occlusion(s) > STAR_OCC_VISIBLE) {
+        uint32_t h = hash3(c, r, s->seed);
+        if ((h % STAR_DENSITY) == 0u) {
+          float br = 0.6f + hash01(h >> 8) * 0.4f;
+          float u_K = hash01(h ^ 0xC0DEC0DEu);
+          float kK = STAR_K_MIN * powf(STAR_K_MAX / STAR_K_MIN, u_K);
+          col = rgb_add(col, rgb_scl(blackbody_rgb(kK), br));
         }
-    }
+      }
 
-    /* PASS 2 — paint to screen. */
-    for (int r = 0; r < rows_eff; r++) {
-        for (int c = 0; c < cols_eff; c++) {
-            paint_cell(c, r + row_off, g_buf[r][c]);
-        }
+      g_buf[r][c] = col;
     }
+  }
+
+  /* PASS 2 — paint to screen. */
+  for (int r = 0; r < rows_eff; r++) {
+    for (int c = 0; c < cols_eff; c++) {
+      paint_cell(c, r + row_off, g_buf[r][c]);
+    }
+  }
 }
 
 /* ── §15 hud ─────────────────────────────────────────────────────────── *
@@ -2762,64 +2820,68 @@ static void scene_draw(const Screen *sc, const Scene *s)
  * Why: separated from scene_draw so the path tracer's framebuffer
  * doesn't need to know about the HUD's row reservation.
  */
-static void hud_draw(const Screen *sc, const Scene *s,
-                     double fps, int sim_fps)
-{
-    float occ = scene_occlusion(s);
+static void hud_draw(const Screen *sc, const Scene *s, double fps,
+                     int sim_fps) {
+  float occ = scene_occlusion(s);
 
-    int  bar_w    = 10;
-    int  bar_fill = (int)(occ * (float)bar_w + 0.5f);
-    if (bar_fill > bar_w) bar_fill = bar_w;
-    if (bar_fill < 0)     bar_fill = 0;
-    char bar[16] = {0};
-    for (int i = 0; i < bar_w; i++) bar[i] = (i < bar_fill) ? '#' : '.';
+  int bar_w = 10;
+  int bar_fill = (int)(occ * (float)bar_w + 0.5f);
+  if (bar_fill > bar_w)
+    bar_fill = bar_w;
+  if (bar_fill < 0)
+    bar_fill = 0;
+  char bar[16] = {0};
+  for (int i = 0; i < bar_w; i++)
+    bar[i] = (i < bar_fill) ? '#' : '.';
 
-    const Star *st     = &STARS[s->star_idx];
-    float       sun_a  = atanf(SUN_R           / SUN_Z) * 180.f / (float)M_PI;
-    float       moon_a = atanf(scene_moon_r(s) / MOON_Z) * 180.f / (float)M_PI;
-    char buf[300];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps %3d Hz  %s  %s %5.0fK  s:%4.2f m:%4.2f deg  [%s] %3.0f%%  z:%3.1fx mz:%3.1fx  spd:%d ",
-             fps, sim_fps,
-             s->paused ? "PAUSED " : pattern_name(s->current_pattern),
-             st->name, (double)st->kelvin,
-             (double)sun_a, (double)moon_a,
-             bar, (double)(occ * 100.0f),
-             (double)s->zoom, (double)s->moon_scale,
-             s->speed);
-    int len = (int)strlen(buf);
-    if (len > sc->cols) len = sc->cols;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, sc->cols - len, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  const Star *st = &STARS[s->star_idx];
+  float sun_a = atanf(SUN_R / SUN_Z) * 180.f / (float)M_PI;
+  float moon_a = atanf(scene_moon_r(s) / MOON_Z) * 180.f / (float)M_PI;
+  char buf[300];
+  snprintf(
+      buf, sizeof buf,
+      " %5.1f fps %3d Hz  %s  %s %5.0fK  s:%4.2f m:%4.2f deg  [%s] %3.0f%%  "
+      "z:%3.1fx mz:%3.1fx  spd:%d ",
+      fps, sim_fps, s->paused ? "PAUSED " : pattern_name(s->current_pattern),
+      st->name, (double)st->kelvin, (double)sun_a, (double)moon_a, bar,
+      (double)(occ * 100.0f), (double)s->zoom, (double)s->moon_scale, s->speed);
+  int len = (int)strlen(buf);
+  if (len > sc->cols)
+    len = sc->cols;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, sc->cols - len, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(0, 0, " SOLAR-ECLIPSE-PT · PATH-TRACED ");
-    attroff(COLOR_PAIR(PAIR_HUD));
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(0, 0, " SOLAR-ECLIPSE-PT · PATH-TRACED ");
+  attroff(COLOR_PAIR(PAIR_HUD));
 
-    /* Totality event flash. */
-    if (s->pp.totality_possible && occ > 0.99f) {
-        const char *lab = " [ TOTALITY ] ";
-        int elen = (int)strlen(lab);
-        attron(COLOR_PAIR(PAIR_EVENT_HOT) | A_BOLD);
-        mvprintw(0, sc->cols - len - elen - 1, "%s", lab);
-        attroff(COLOR_PAIR(PAIR_EVENT_HOT) | A_BOLD);
-    }
+  /* Totality event flash. */
+  if (s->pp.totality_possible && occ > 0.99f) {
+    const char *lab = " [ TOTALITY ] ";
+    int elen = (int)strlen(lab);
+    attron(COLOR_PAIR(PAIR_EVENT_HOT) | A_BOLD);
+    mvprintw(0, sc->cols - len - elen - 1, "%s", lab);
+    attroff(COLOR_PAIR(PAIR_EVENT_HOT) | A_BOLD);
+  }
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " q:quit  spc:pause  n/p:pat  t/T:star  z/Z:zoom  m/M:moon  +/-:spd  []:Hz  r:reseed ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(sc->rows - 1, 0,
+           " q:quit  spc:pause  n/p:pat  t/T:star  z/Z:zoom  m/M:moon  +/-:spd "
+           " []:Hz  r:reseed ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
-{
-    erase();
-    scene_draw(sc, s);
-    hud_draw(sc, s, fps, sim_fps);
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+  erase();
+  scene_draw(sc, s);
+  hud_draw(sc, s, fps, sim_fps);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ── §16 app — signals + fixed-step main loop ────────────────────────── *
  *
@@ -2838,11 +2900,11 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
  */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
@@ -2850,75 +2912,101 @@ static App g_app;
 /* §16.1 signal handlers. Set flags, return immediately — the main loop
  * checks them after the next getch() / scene_tick. */
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
 /* §16.2 app_handle_key — process one key.
  *
  * Returns true to keep running, false to quit. The cases mirror the
  * "Keys" section of the file header — one switch case per key.
  */
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':           s->paused = !s->paused; break;
-    case 'r': case 'R': scene_reseed(s); break;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_reseed(s);
+    break;
 
-    case '=': case '+':
-        if (s->speed < SPEED_MAX) s->speed *= 2;
-        if (s->speed > SPEED_MAX) s->speed  = SPEED_MAX;
-        break;
-    case '-': case '_':
-        s->speed /= 2;
-        if (s->speed < SPEED_MIN) s->speed = SPEED_MIN;
-        break;
+  case '=':
+  case '+':
+    if (s->speed < SPEED_MAX)
+      s->speed *= 2;
+    if (s->speed > SPEED_MAX)
+      s->speed = SPEED_MAX;
+    break;
+  case '-':
+  case '_':
+    s->speed /= 2;
+    if (s->speed < SPEED_MIN)
+      s->speed = SPEED_MIN;
+    break;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    case 't':
-        s->star_idx = (s->star_idx + 1) % N_STARS;
-        break;
-    case 'T':
-        s->star_idx = (s->star_idx + N_STARS - 1) % N_STARS;
-        break;
+  case 't':
+    s->star_idx = (s->star_idx + 1) % N_STARS;
+    break;
+  case 'T':
+    s->star_idx = (s->star_idx + N_STARS - 1) % N_STARS;
+    break;
 
-    case 'z':
-        s->zoom *= ZOOM_STEP;
-        if (s->zoom > ZOOM_MAX) s->zoom = ZOOM_MAX;
-        break;
-    case 'Z':
-        s->zoom /= ZOOM_STEP;
-        if (s->zoom < ZOOM_MIN) s->zoom = ZOOM_MIN;
-        break;
+  case 'z':
+    s->zoom *= ZOOM_STEP;
+    if (s->zoom > ZOOM_MAX)
+      s->zoom = ZOOM_MAX;
+    break;
+  case 'Z':
+    s->zoom /= ZOOM_STEP;
+    if (s->zoom < ZOOM_MIN)
+      s->zoom = ZOOM_MIN;
+    break;
 
-    case 'm':
-        s->moon_scale /= MOON_SCALE_STEP;
-        if (s->moon_scale < MOON_SCALE_MIN) s->moon_scale = MOON_SCALE_MIN;
-        break;
-    case 'M':
-        s->moon_scale *= MOON_SCALE_STEP;
-        if (s->moon_scale > MOON_SCALE_MAX) s->moon_scale = MOON_SCALE_MAX;
-        break;
+  case 'm':
+    s->moon_scale /= MOON_SCALE_STEP;
+    if (s->moon_scale < MOON_SCALE_MIN)
+      s->moon_scale = MOON_SCALE_MIN;
+    break;
+  case 'M':
+    s->moon_scale *= MOON_SCALE_STEP;
+    if (s->moon_scale > MOON_SCALE_MAX)
+      s->moon_scale = MOON_SCALE_MAX;
+    break;
 
-    case 'n': case 'N':
-        pattern_set(s, (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS));
-        break;
-    case 'p': case 'P':
-        pattern_set(s,
-            (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS));
-        break;
-    }
-    return true;
+  case 'n':
+  case 'N':
+    pattern_set(s, (Pattern)(((int)s->current_pattern + 1) % N_PATTERNS));
+    break;
+  case 'p':
+  case 'P':
+    pattern_set(
+        s, (Pattern)(((int)s->current_pattern + N_PATTERNS - 1) % N_PATTERNS));
+    break;
+  }
+  return true;
 }
 
 /* §16.3 app_init / app_run / main.
@@ -2930,77 +3018,79 @@ static bool app_handle_key(App *app, int ch)
  * main wires it all up.
  */
 
-static void app_init(App *app)
-{
-    memset(app, 0, sizeof *app);
-    scene_init(&app->scene);
-    screen_init(&app->screen);
-    app->sim_fps = SIM_FPS_DEFAULT;
-    app->running = 1;
-    build_trans_lut();
+static void app_init(App *app) {
+  memset(app, 0, sizeof *app);
+  scene_init(&app->scene);
+  screen_init(&app->screen);
+  app->sim_fps = SIM_FPS_DEFAULT;
+  app->running = 1;
+  build_trans_lut();
 }
 
-static void app_run(App *app)
-{
-    int64_t prev = clock_ns();
-    int64_t sim_accum = 0;
-    int64_t frame_count = 0;
-    int64_t fps_window_start = prev;
-    double  fps_meas = 0.0;
+static void app_run(App *app) {
+  int64_t prev = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t frame_count = 0;
+  int64_t fps_window_start = prev;
+  double fps_meas = 0.0;
 
-    struct sigaction sa = {0};
-    sa.sa_handler = on_exit_signal;
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sa.sa_handler = on_resize_signal;
-    sigaction(SIGWINCH, &sa, NULL);
-    atexit(cleanup);
+  struct sigaction sa = {0};
+  sa.sa_handler = on_exit_signal;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  sa.sa_handler = on_resize_signal;
+  sigaction(SIGWINCH, &sa, NULL);
+  atexit(cleanup);
 
-    while (app->running) {
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (!app_handle_key(app, ch)) { app->running = 0; break; }
-        }
-        if (!app->running) break;
-        if (app->need_resize) {
-            screen_resize(&app->screen);
-            app->need_resize = 0;
-        }
-
-        int64_t now = clock_ns();
-        int64_t dt  = now - prev;
-        if (dt > DT_CAP_NS) dt = DT_CAP_NS;
-        prev = now;
-
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, (float)tick_ns / (float)NS_PER_SEC);
-            sim_accum -= tick_ns;
-        }
-
-        screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
-        screen_present();
-
-        frame_count++;
-        if (now - fps_window_start >= NS_PER_SEC) {
-            fps_meas = (double)frame_count
-                     * (double)NS_PER_SEC
-                     / (double)(now - fps_window_start);
-            frame_count = 0;
-            fps_window_start = now;
-        }
-
-        int64_t target = clock_ns();
-        int64_t left   = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
-        if (left > 0) clock_sleep_ns(left);
+  while (app->running) {
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (!app_handle_key(app, ch)) {
+        app->running = 0;
+        break;
+      }
     }
+    if (!app->running)
+      break;
+    if (app->need_resize) {
+      screen_resize(&app->screen);
+      app->need_resize = 0;
+    }
+
+    int64_t now = clock_ns();
+    int64_t dt = now - prev;
+    if (dt > DT_CAP_NS)
+      dt = DT_CAP_NS;
+    prev = now;
+
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, (float)tick_ns / (float)NS_PER_SEC);
+      sim_accum -= tick_ns;
+    }
+
+    screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
+    screen_present();
+
+    frame_count++;
+    if (now - fps_window_start >= NS_PER_SEC) {
+      fps_meas = (double)frame_count * (double)NS_PER_SEC /
+                 (double)(now - fps_window_start);
+      frame_count = 0;
+      fps_window_start = now;
+    }
+
+    int64_t target = clock_ns();
+    int64_t left = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
+    if (left > 0)
+      clock_sleep_ns(left);
+  }
 }
 
-int main(void)
-{
-    app_init(&g_app);
-    app_run(&g_app);
-    cleanup();
-    return 0;
+int main(void) {
+  app_init(&g_app);
+  app_run(&g_app);
+  cleanup();
+  return 0;
 }

@@ -705,7 +705,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -722,71 +722,69 @@
 /* §1  config                                                            */
 /* ===================================================================== */
 
-#define N                  64        /* input signal length              */
-#define KERNEL_MAX         15        /* max kernel length                 */
-#define RENDER_FPS         30
-#define RENDER_TICK_NS     (1000000000LL / RENDER_FPS)
-#define AUTO_SLIDE_FRAMES  3         /* frames between auto-slide steps   */
+#define N 64          /* input signal length              */
+#define KERNEL_MAX 15 /* max kernel length                 */
+#define RENDER_FPS 30
+#define RENDER_TICK_NS (1000000000LL / RENDER_FPS)
+#define AUTO_SLIDE_FRAMES 3 /* frames between auto-slide steps   */
 
 /* Colour pair IDs.  HUD/HINT are theme-invariant per CLAUDE.md
  * HUD Standard. */
 enum {
-    PAIR_INPUT     = 1,    /* input wave bars                              */
-    PAIR_OUTPUT    = 2,    /* output wave bars                             */
-    PAIR_KERNEL    = 3,    /* kernel weight bars                           */
-    PAIR_KERNEL_HI = 4,    /* highlight on input samples under the kernel  */
-    PAIR_LABEL     = 5,    /* panel labels                                 */
-    PAIR_HUD       = 6,    /* HUD top status                               */
-    PAIR_HINT      = 7,    /* bottom hint                                  */
+  PAIR_INPUT = 1,     /* input wave bars                              */
+  PAIR_OUTPUT = 2,    /* output wave bars                             */
+  PAIR_KERNEL = 3,    /* kernel weight bars                           */
+  PAIR_KERNEL_HI = 4, /* highlight on input samples under the kernel  */
+  PAIR_LABEL = 5,     /* panel labels                                 */
+  PAIR_HUD = 6,       /* HUD top status                               */
+  PAIR_HINT = 7,      /* bottom hint                                  */
 };
 
 /* ===================================================================== */
 /* §2  clock                                                             */
 /* ===================================================================== */
 
-static long long clock_now_ns(void)
-{
-    /* Purpose : monotonic clock in ns.  Used by the main loop to
-     *           figure out how long to sleep before the next frame. */
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_now_ns(void) {
+  /* Purpose : monotonic clock in ns.  Used by the main loop to
+   *           figure out how long to sleep before the next frame. */
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(long long ns)
-{
-    /* Block for `ns` nanoseconds.  Without this the main loop would
-     * spin a CPU at 100% to redraw 30 times a second. */
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(long long ns) {
+  /* Block for `ns` nanoseconds.  Without this the main loop would
+   * spin a CPU at 100% to redraw 30 times a second. */
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
 /* §3  colors                                                            */
 /* ===================================================================== */
 
-static void colors_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_INPUT,      51, -1);   /* bright cyan      */
-        init_pair(PAIR_OUTPUT,    154, -1);   /* yellow-green     */
-        init_pair(PAIR_KERNEL,    213, -1);   /* magenta-pink     */
-        init_pair(PAIR_KERNEL_HI, 226, -1);   /* bright yellow    */
-        init_pair(PAIR_LABEL,     244, -1);   /* mid grey         */
-        init_pair(PAIR_HUD,       226, -1);   /* bright yellow    */
-        init_pair(PAIR_HINT,       51, -1);   /* bright cyan      */
-    } else {
-        init_pair(PAIR_INPUT,      COLOR_CYAN,    -1);
-        init_pair(PAIR_OUTPUT,     COLOR_GREEN,   -1);
-        init_pair(PAIR_KERNEL,     COLOR_MAGENTA, -1);
-        init_pair(PAIR_KERNEL_HI,  COLOR_YELLOW,  -1);
-        init_pair(PAIR_LABEL,      COLOR_WHITE,   -1);
-        init_pair(PAIR_HUD,        COLOR_YELLOW,  -1);
-        init_pair(PAIR_HINT,       COLOR_CYAN,    -1);
-    }
+static void colors_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(PAIR_INPUT, 51, -1);      /* bright cyan      */
+    init_pair(PAIR_OUTPUT, 154, -1);    /* yellow-green     */
+    init_pair(PAIR_KERNEL, 213, -1);    /* magenta-pink     */
+    init_pair(PAIR_KERNEL_HI, 226, -1); /* bright yellow    */
+    init_pair(PAIR_LABEL, 244, -1);     /* mid grey         */
+    init_pair(PAIR_HUD, 226, -1);       /* bright yellow    */
+    init_pair(PAIR_HINT, 51, -1);       /* bright cyan      */
+  } else {
+    init_pair(PAIR_INPUT, COLOR_CYAN, -1);
+    init_pair(PAIR_OUTPUT, COLOR_GREEN, -1);
+    init_pair(PAIR_KERNEL, COLOR_MAGENTA, -1);
+    init_pair(PAIR_KERNEL_HI, COLOR_YELLOW, -1);
+    init_pair(PAIR_LABEL, COLOR_WHITE, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
 /* ===================================================================== */
@@ -794,17 +792,16 @@ static void colors_init(void)
 /* ===================================================================== */
 
 typedef enum {
-    SIG_IMPULSE = 0,    /* one tall sample at the centre                */
-    SIG_STEP,           /* zero, then jumps to 1 at the centre          */
-    SIG_SINES,          /* sum of two sines                             */
-    SIG_SQUARE,         /* periodic square wave                         */
-    SIG_NOISE,          /* repeatable pseudo-random                     */
-    SIG_COUNT
+  SIG_IMPULSE = 0, /* one tall sample at the centre                */
+  SIG_STEP,        /* zero, then jumps to 1 at the centre          */
+  SIG_SINES,       /* sum of two sines                             */
+  SIG_SQUARE,      /* periodic square wave                         */
+  SIG_NOISE,       /* repeatable pseudo-random                     */
+  SIG_COUNT
 } SignalKind;
 
 static const char *signal_name[SIG_COUNT] = {
-    "Impulse  ", "Step     ", "Sum sines", "Square   ", "Noise    "
-};
+    "Impulse  ", "Step     ", "Sum sines", "Square   ", "Noise    "};
 
 /* ===================================================================== */
 /* §5  signal_generators — fill the input signal                         */
@@ -820,63 +817,63 @@ static const char *signal_name[SIG_COUNT] = {
  * particular signals (Impulse and Step are the "test patterns" that
  * define the impulse and step response of any filter).
  */
-static void generate_signal(SignalKind kind, float *output_signal)
-{
-    switch (kind) {
-        case SIG_IMPULSE: {
-            /* Zero everywhere except a single 1 at the centre.
-             * Convolving any kernel with this gives the kernel back —
-             * see T5 (the impulse response identity). */
-            for (int n = 0; n < N; n++) output_signal[n] = 0.0f;
-            output_signal[N / 2] = 1.0f;
-            break;
-        }
-        case SIG_STEP: {
-            /* Two-level signal: -0.5 for the first half, +0.5 for the
-             * second.  Used to demonstrate the "step response" of
-             * each kernel — Box smoothes the step into a ramp; Edge
-             * produces a single spike at the step location. */
-            for (int n = 0; n < N; n++)
-                output_signal[n] = (n < N / 2) ? -0.5f : 0.5f;
-            break;
-        }
-        case SIG_SINES: {
-            /* Two cosines added: 3 cycles + 11 cycles in the buffer.
-             * Demonstrates that low-pass kernels keep the slow 3-cycle
-             * component and kill the fast 11-cycle one. */
-            for (int n = 0; n < N; n++) {
-                float t = (float)n / (float)N;
-                output_signal[n] =
-                    0.6f * sinf(2.0f * (float)M_PI * 3.0f  * t)
-                  + 0.4f * sinf(2.0f * (float)M_PI * 11.0f * t);
-            }
-            break;
-        }
-        case SIG_SQUARE: {
-            /* Periodic square wave at 5 cycles per buffer.  Sharp
-             * vertical edges expose Gibbs ringing in low-pass
-             * kernels and produce strong responses from Edge. */
-            for (int n = 0; n < N; n++) {
-                float t = (float)n / (float)N;
-                float arg = 2.0f * (float)M_PI * 5.0f * t;
-                output_signal[n] = sinf(arg) >= 0.0f ? 0.7f : -0.7f;
-            }
-            break;
-        }
-        case SIG_NOISE: {
-            /* Repeatable pseudo-random using a linear congruential
-             * generator with seed 1.  Same noise every frame so the
-             * convolution result is stable (not jittering). */
-            unsigned int seed = 1;
-            for (int n = 0; n < N; n++) {
-                seed = seed * 1664525u + 1013904223u;
-                float r = (float)(seed >> 16) / 65535.0f;
-                output_signal[n] = (r - 0.5f) * 1.6f;
-            }
-            break;
-        }
-        default: break;
+static void generate_signal(SignalKind kind, float *output_signal) {
+  switch (kind) {
+  case SIG_IMPULSE: {
+    /* Zero everywhere except a single 1 at the centre.
+     * Convolving any kernel with this gives the kernel back —
+     * see T5 (the impulse response identity). */
+    for (int n = 0; n < N; n++)
+      output_signal[n] = 0.0f;
+    output_signal[N / 2] = 1.0f;
+    break;
+  }
+  case SIG_STEP: {
+    /* Two-level signal: -0.5 for the first half, +0.5 for the
+     * second.  Used to demonstrate the "step response" of
+     * each kernel — Box smoothes the step into a ramp; Edge
+     * produces a single spike at the step location. */
+    for (int n = 0; n < N; n++)
+      output_signal[n] = (n < N / 2) ? -0.5f : 0.5f;
+    break;
+  }
+  case SIG_SINES: {
+    /* Two cosines added: 3 cycles + 11 cycles in the buffer.
+     * Demonstrates that low-pass kernels keep the slow 3-cycle
+     * component and kill the fast 11-cycle one. */
+    for (int n = 0; n < N; n++) {
+      float t = (float)n / (float)N;
+      output_signal[n] = 0.6f * sinf(2.0f * (float)M_PI * 3.0f * t) +
+                         0.4f * sinf(2.0f * (float)M_PI * 11.0f * t);
     }
+    break;
+  }
+  case SIG_SQUARE: {
+    /* Periodic square wave at 5 cycles per buffer.  Sharp
+     * vertical edges expose Gibbs ringing in low-pass
+     * kernels and produce strong responses from Edge. */
+    for (int n = 0; n < N; n++) {
+      float t = (float)n / (float)N;
+      float arg = 2.0f * (float)M_PI * 5.0f * t;
+      output_signal[n] = sinf(arg) >= 0.0f ? 0.7f : -0.7f;
+    }
+    break;
+  }
+  case SIG_NOISE: {
+    /* Repeatable pseudo-random using a linear congruential
+     * generator with seed 1.  Same noise every frame so the
+     * convolution result is stable (not jittering). */
+    unsigned int seed = 1;
+    for (int n = 0; n < N; n++) {
+      seed = seed * 1664525u + 1013904223u;
+      float r = (float)(seed >> 16) / 65535.0f;
+      output_signal[n] = (r - 0.5f) * 1.6f;
+    }
+    break;
+  }
+  default:
+    break;
+  }
 }
 
 /* ===================================================================== */
@@ -884,19 +881,18 @@ static void generate_signal(SignalKind kind, float *output_signal)
 /* ===================================================================== */
 
 typedef enum {
-    KERN_IDENTITY = 0,    /* {0, 0, 1, 0, 0}     identity (no change)   */
-    KERN_BOX,             /* {1, 1, 1, 1, 1}/5   moving average         */
-    KERN_GAUSSIAN,        /* {1, 4, 6, 4, 1}/16  Gaussian-ish blur      */
-    KERN_EDGE,            /* {-1, 0, 1}          derivative              */
-    KERN_SHARPEN,         /* {-1,-1, 5,-1,-1}    high-pass amplifier     */
-    KERN_INVERSE,         /* {0, 0,-1, 0, 0}     negation                 */
-    KERN_COUNT
+  KERN_IDENTITY = 0, /* {0, 0, 1, 0, 0}     identity (no change)   */
+  KERN_BOX,          /* {1, 1, 1, 1, 1}/5   moving average         */
+  KERN_GAUSSIAN,     /* {1, 4, 6, 4, 1}/16  Gaussian-ish blur      */
+  KERN_EDGE,         /* {-1, 0, 1}          derivative              */
+  KERN_SHARPEN,      /* {-1,-1, 5,-1,-1}    high-pass amplifier     */
+  KERN_INVERSE,      /* {0, 0,-1, 0, 0}     negation                 */
+  KERN_COUNT
 } KernelKind;
 
-static const char *kernel_name[KERN_COUNT] = {
-    "Identity ", "Box      ", "Gaussian ",
-    "Edge     ", "Sharpen  ", "Inverse  "
-};
+static const char *kernel_name[KERN_COUNT] = {"Identity ", "Box      ",
+                                              "Gaussian ", "Edge     ",
+                                              "Sharpen  ", "Inverse  "};
 
 /* ===================================================================== */
 /* §7  kernel_generators — fill the kernel weights                       */
@@ -909,67 +905,75 @@ static const char *kernel_name[KERN_COUNT] = {
  * Each kernel is hand-coded for clarity.  T4 in the GUIDED TUTORIAL
  * walks through what each one does and why.
  */
-static void generate_kernel(KernelKind kind,
-                            float *kernel_weights, int *out_length)
-{
-    switch (kind) {
-        case KERN_IDENTITY: {
-            /* Single 1 at the centre, zeros elsewhere.  Output of
-             * convolving with this equals the input (shifted by K/2). */
-            *out_length = 5;
-            kernel_weights[0] = 0.0f; kernel_weights[1] = 0.0f;
-            kernel_weights[2] = 1.0f;
-            kernel_weights[3] = 0.0f; kernel_weights[4] = 0.0f;
-            break;
-        }
-        case KERN_BOX: {
-            /* Equal weights summing to 1.  Computes the average of
-             * K neighbouring samples → smoothing low-pass filter. */
-            *out_length = 5;
-            for (int i = 0; i < 5; i++) kernel_weights[i] = 0.2f;
-            break;
-        }
-        case KERN_GAUSSIAN: {
-            /* Bell-curve weights {1, 4, 6, 4, 1} / 16.  Smoother
-             * smoother than Box — less ringing on sharp edges. */
-            *out_length = 5;
-            const float w[] = { 1.0f, 4.0f, 6.0f, 4.0f, 1.0f };
-            for (int i = 0; i < 5; i++) kernel_weights[i] = w[i] / 16.0f;
-            break;
-        }
-        case KERN_EDGE: {
-            /* {-1, 0, +1}.  Subtracts left from right → discrete
-             * derivative.  Output is large where the input changes
-             * rapidly, ~0 where the input is constant. */
-            *out_length = 3;
-            kernel_weights[0] = -1.0f; kernel_weights[1] = 0.0f;
-            kernel_weights[2] = +1.0f;
-            break;
-        }
-        case KERN_SHARPEN: {
-            /* {-1, -1, +5, -1, -1}.  Centre amplifies, sides
-             * subtract.  Sums to 1 (preserves DC) but amplifies
-             * deviations from local average → edges get sharper. */
-            *out_length = 5;
-            kernel_weights[0] = -1.0f; kernel_weights[1] = -1.0f;
-            kernel_weights[2] = +5.0f;
-            kernel_weights[3] = -1.0f; kernel_weights[4] = -1.0f;
-            break;
-        }
-        case KERN_INVERSE: {
-            /* Identity but negated.  Output = -input.  Mostly a
-             * sanity check that negative kernels work. */
-            *out_length = 5;
-            kernel_weights[0] = 0.0f; kernel_weights[1] = 0.0f;
-            kernel_weights[2] = -1.0f;
-            kernel_weights[3] = 0.0f; kernel_weights[4] = 0.0f;
-            break;
-        }
-        default:
-            *out_length = 1;
-            kernel_weights[0] = 1.0f;
-            break;
-    }
+static void generate_kernel(KernelKind kind, float *kernel_weights,
+                            int *out_length) {
+  switch (kind) {
+  case KERN_IDENTITY: {
+    /* Single 1 at the centre, zeros elsewhere.  Output of
+     * convolving with this equals the input (shifted by K/2). */
+    *out_length = 5;
+    kernel_weights[0] = 0.0f;
+    kernel_weights[1] = 0.0f;
+    kernel_weights[2] = 1.0f;
+    kernel_weights[3] = 0.0f;
+    kernel_weights[4] = 0.0f;
+    break;
+  }
+  case KERN_BOX: {
+    /* Equal weights summing to 1.  Computes the average of
+     * K neighbouring samples → smoothing low-pass filter. */
+    *out_length = 5;
+    for (int i = 0; i < 5; i++)
+      kernel_weights[i] = 0.2f;
+    break;
+  }
+  case KERN_GAUSSIAN: {
+    /* Bell-curve weights {1, 4, 6, 4, 1} / 16.  Smoother
+     * smoother than Box — less ringing on sharp edges. */
+    *out_length = 5;
+    const float w[] = {1.0f, 4.0f, 6.0f, 4.0f, 1.0f};
+    for (int i = 0; i < 5; i++)
+      kernel_weights[i] = w[i] / 16.0f;
+    break;
+  }
+  case KERN_EDGE: {
+    /* {-1, 0, +1}.  Subtracts left from right → discrete
+     * derivative.  Output is large where the input changes
+     * rapidly, ~0 where the input is constant. */
+    *out_length = 3;
+    kernel_weights[0] = -1.0f;
+    kernel_weights[1] = 0.0f;
+    kernel_weights[2] = +1.0f;
+    break;
+  }
+  case KERN_SHARPEN: {
+    /* {-1, -1, +5, -1, -1}.  Centre amplifies, sides
+     * subtract.  Sums to 1 (preserves DC) but amplifies
+     * deviations from local average → edges get sharper. */
+    *out_length = 5;
+    kernel_weights[0] = -1.0f;
+    kernel_weights[1] = -1.0f;
+    kernel_weights[2] = +5.0f;
+    kernel_weights[3] = -1.0f;
+    kernel_weights[4] = -1.0f;
+    break;
+  }
+  case KERN_INVERSE: {
+    /* Identity but negated.  Output = -input.  Mostly a
+     * sanity check that negative kernels work. */
+    *out_length = 5;
+    kernel_weights[0] = 0.0f;
+    kernel_weights[1] = 0.0f;
+    kernel_weights[2] = -1.0f;
+    kernel_weights[3] = 0.0f;
+    kernel_weights[4] = 0.0f;
+    break;
+  }
+  default:
+    *out_length = 1;
+    kernel_weights[0] = 1.0f;
+    break;
+  }
 }
 
 /* ===================================================================== */
@@ -1044,93 +1048,85 @@ static void generate_kernel(KernelKind kind,
  *      options (zero-padding, circular).
  */
 
-static void convolve(const float *input_signal,
-                     const float *kernel_weights,
-                     int kernel_length,
-                     float *output_signal)
-{
-    /* Largest valid output position.  Beyond this the kernel would
-     * read past the end of the input. */
-    int last_valid_output_position = N - kernel_length;
+static void convolve(const float *input_signal, const float *kernel_weights,
+                     int kernel_length, float *output_signal) {
+  /* Largest valid output position.  Beyond this the kernel would
+   * read past the end of the input. */
+  int last_valid_output_position = N - kernel_length;
 
-    /* Pseudocode line: "for each output position n in [0, N - K]" */
-    for (int output_position = 0;
-         output_position <= last_valid_output_position;
-         output_position++) {
+  /* Pseudocode line: "for each output position n in [0, N - K]" */
+  for (int output_position = 0; output_position <= last_valid_output_position;
+       output_position++) {
 
-        /* Pseudocode line: "start with weighted_sum = 0". */
-        float weighted_sum = 0.0f;
+    /* Pseudocode line: "start with weighted_sum = 0". */
+    float weighted_sum = 0.0f;
 
-        /* Pseudocode line: "for each kernel tap i in [0, K)" */
-        for (int kernel_tap_index = 0;
-             kernel_tap_index < kernel_length;
-             kernel_tap_index++) {
+    /* Pseudocode line: "for each kernel tap i in [0, K)" */
+    for (int kernel_tap_index = 0; kernel_tap_index < kernel_length;
+         kernel_tap_index++) {
 
-            /* ── STEP 1 — read the kernel weight ──────────────────
-             * The kernel doesn't move relative to itself: tap 0 is
-             * always the leftmost weight, tap K-1 is the rightmost.
-             */
-            float kernel_weight = kernel_weights[kernel_tap_index];
+      /* ── STEP 1 — read the kernel weight ──────────────────
+       * The kernel doesn't move relative to itself: tap 0 is
+       * always the leftmost weight, tap K-1 is the rightmost.
+       */
+      float kernel_weight = kernel_weights[kernel_tap_index];
 
-            /* ── STEP 2 — read the corresponding input sample ────
-             * The input WINDOW slides: at output position n we read
-             * x[n + 0], x[n + 1], ..., x[n + K - 1].  Each output
-             * position reads K consecutive input samples; the window
-             * advances by 1 for the next output position. */
-            float input_sample = input_signal[output_position
-                                              + kernel_tap_index];
+      /* ── STEP 2 — read the corresponding input sample ────
+       * The input WINDOW slides: at output position n we read
+       * x[n + 0], x[n + 1], ..., x[n + K - 1].  Each output
+       * position reads K consecutive input samples; the window
+       * advances by 1 for the next output position. */
+      float input_sample = input_signal[output_position + kernel_tap_index];
 
-            /* ── STEP 3 — multiply and accumulate ─────────────────
-             * The product (weight × sample) is one term of the
-             * weighted sum.  We add K such terms; the running total
-             * after the inner loop is the value of this output
-             * sample. */
-            weighted_sum += kernel_weight * input_sample;
-        }
-
-        /* Pseudocode line: "store weighted_sum as output_signal[n]". */
-        output_signal[output_position] = weighted_sum;
+      /* ── STEP 3 — multiply and accumulate ─────────────────
+       * The product (weight × sample) is one term of the
+       * weighted sum.  We add K such terms; the running total
+       * after the inner loop is the value of this output
+       * sample. */
+      weighted_sum += kernel_weight * input_sample;
     }
 
-    /* Boundary: outputs past N - K are not well-defined because the
-     * kernel would run off the end of the input.  Zero them.
-     * See T6 for alternative boundary-handling strategies. */
-    for (int output_position = last_valid_output_position + 1;
-         output_position < N;
-         output_position++) {
-        output_signal[output_position] = 0.0f;
-    }
+    /* Pseudocode line: "store weighted_sum as output_signal[n]". */
+    output_signal[output_position] = weighted_sum;
+  }
+
+  /* Boundary: outputs past N - K are not well-defined because the
+   * kernel would run off the end of the input.  Zero them.
+   * See T6 for alternative boundary-handling strategies. */
+  for (int output_position = last_valid_output_position + 1;
+       output_position < N; output_position++) {
+    output_signal[output_position] = 0.0f;
+  }
 }
 
 /* ===================================================================== */
 /* §9  scene_state                                                       */
 /* ===================================================================== */
 
-static float       g_input_signal[N];
-static float       g_output_signal[N];
-static float       g_kernel_weights[KERNEL_MAX];
-static int         g_kernel_length;
-static int         g_kernel_position = 0;     /* current slide position    */
+static float g_input_signal[N];
+static float g_output_signal[N];
+static float g_kernel_weights[KERNEL_MAX];
+static int g_kernel_length;
+static int g_kernel_position = 0; /* current slide position    */
 
-static SignalKind  g_signal_kind     = SIG_SINES;
-static KernelKind  g_kernel_kind     = KERN_GAUSSIAN;
+static SignalKind g_signal_kind = SIG_SINES;
+static KernelKind g_kernel_kind = KERN_GAUSSIAN;
 
-static bool        g_simulation_paused      = false;
-static bool        g_auto_slide_enabled     = true;
-static int         g_auto_slide_counter     = 0;
+static bool g_simulation_paused = false;
+static bool g_auto_slide_enabled = true;
+static int g_auto_slide_counter = 0;
 
 /* Debug overlay toggles (preserved across kernel/signal cycling). */
-static bool        g_show_live_arithmetic   = false;   /* 'd' overlay */
-static bool        g_show_kernel_table      = false;   /* 'D' overlay */
+static bool g_show_live_arithmetic = false; /* 'd' overlay */
+static bool g_show_kernel_table = false;    /* 'D' overlay */
 
-static void scene_reset(void)
-{
-    g_kernel_position    = 0;
-    g_auto_slide_counter = 0;
-    g_simulation_paused  = false;
-    g_auto_slide_enabled = true;
-    generate_signal(g_signal_kind, g_input_signal);
-    generate_kernel(g_kernel_kind, g_kernel_weights, &g_kernel_length);
+static void scene_reset(void) {
+  g_kernel_position = 0;
+  g_auto_slide_counter = 0;
+  g_simulation_paused = false;
+  g_auto_slide_enabled = true;
+  generate_signal(g_signal_kind, g_input_signal);
+  generate_kernel(g_kernel_kind, g_kernel_weights, &g_kernel_length);
 }
 
 /* ===================================================================== */
@@ -1140,56 +1136,54 @@ static void scene_reset(void)
  *  Three numbered steps that match the per-frame portion of
  *  ALGORITHM IN STEPS in the MENTAL MODEL block.
  */
-static void scene_tick(void)
-{
-    if (g_simulation_paused) return;
+static void scene_tick(void) {
+  if (g_simulation_paused)
+    return;
 
-    /* ── Step 1.  auto-slide kernel position by 1 ──────────────── */
-    if (g_auto_slide_enabled) {
-        g_auto_slide_counter++;
-        if (g_auto_slide_counter >= AUTO_SLIDE_FRAMES) {
-            g_auto_slide_counter = 0;
-            g_kernel_position++;
-            if (g_kernel_position > N - g_kernel_length)
-                g_kernel_position = 0;       /* wrap to start */
-        }
+  /* ── Step 1.  auto-slide kernel position by 1 ──────────────── */
+  if (g_auto_slide_enabled) {
+    g_auto_slide_counter++;
+    if (g_auto_slide_counter >= AUTO_SLIDE_FRAMES) {
+      g_auto_slide_counter = 0;
+      g_kernel_position++;
+      if (g_kernel_position > N - g_kernel_length)
+        g_kernel_position = 0; /* wrap to start */
     }
+  }
 
-    /* ── Step 2.  compute the FULL output via convolution ───── */
-    convolve(g_input_signal, g_kernel_weights, g_kernel_length,
-             g_output_signal);
+  /* ── Step 2.  compute the FULL output via convolution ───── */
+  convolve(g_input_signal, g_kernel_weights, g_kernel_length, g_output_signal);
 
-    /* (Step 3 — render — happens in the main loop after this.) */
+  /* (Step 3 — render — happens in the main loop after this.) */
 }
 
 /* ===================================================================== */
 /* §11  scene_input — handle keys                                        */
 /* ===================================================================== */
 
-static void scene_step_kernel(int delta)
-{
-    /* Manual slide.  No-op while auto-slide is on. */
-    if (g_auto_slide_enabled) return;
-    g_kernel_position += delta;
-    if (g_kernel_position < 0) g_kernel_position = 0;
-    if (g_kernel_position > N - g_kernel_length)
-        g_kernel_position = N - g_kernel_length;
+static void scene_step_kernel(int delta) {
+  /* Manual slide.  No-op while auto-slide is on. */
+  if (g_auto_slide_enabled)
+    return;
+  g_kernel_position += delta;
+  if (g_kernel_position < 0)
+    g_kernel_position = 0;
+  if (g_kernel_position > N - g_kernel_length)
+    g_kernel_position = N - g_kernel_length;
 }
 
-static void scene_cycle_kernel(int direction)
-{
-    g_kernel_kind = (KernelKind)((g_kernel_kind + direction + KERN_COUNT)
-                                 % KERN_COUNT);
-    generate_kernel(g_kernel_kind, g_kernel_weights, &g_kernel_length);
-    if (g_kernel_position > N - g_kernel_length)
-        g_kernel_position = N - g_kernel_length;
+static void scene_cycle_kernel(int direction) {
+  g_kernel_kind =
+      (KernelKind)((g_kernel_kind + direction + KERN_COUNT) % KERN_COUNT);
+  generate_kernel(g_kernel_kind, g_kernel_weights, &g_kernel_length);
+  if (g_kernel_position > N - g_kernel_length)
+    g_kernel_position = N - g_kernel_length;
 }
 
-static void scene_cycle_signal(int direction)
-{
-    g_signal_kind = (SignalKind)((g_signal_kind + direction + SIG_COUNT)
-                                 % SIG_COUNT);
-    generate_signal(g_signal_kind, g_input_signal);
+static void scene_cycle_signal(int direction) {
+  g_signal_kind =
+      (SignalKind)((g_signal_kind + direction + SIG_COUNT) % SIG_COUNT);
+  generate_signal(g_signal_kind, g_input_signal);
 }
 
 /* ===================================================================== */
@@ -1197,94 +1191,98 @@ static void scene_cycle_signal(int direction)
 /* ===================================================================== */
 
 static void draw_bar(int column, int baseline_row, int bar_height_cells,
-                     bool growing_upward, int colour_pair)
-{
-    /* Stamp a vertical column of glyphs starting at baseline_row,
-     * growing either upward or downward.  Used by every panel. */
-    if (bar_height_cells <= 0) return;
-    attron(COLOR_PAIR(colour_pair) | A_BOLD);
-    for (int dy = 0; dy < bar_height_cells; dy++) {
-        int row = growing_upward ? (baseline_row - dy)
-                                 : (baseline_row + dy + 1);
-        if (row < 0 || row >= LINES) continue;
-        if (column < 0 || column >= COLS)  continue;
-        mvaddch(row, column, growing_upward ? '|' : '.');
-    }
-    attroff(COLOR_PAIR(colour_pair) | A_BOLD);
+                     bool growing_upward, int colour_pair) {
+  /* Stamp a vertical column of glyphs starting at baseline_row,
+   * growing either upward or downward.  Used by every panel. */
+  if (bar_height_cells <= 0)
+    return;
+  attron(COLOR_PAIR(colour_pair) | A_BOLD);
+  for (int dy = 0; dy < bar_height_cells; dy++) {
+    int row = growing_upward ? (baseline_row - dy) : (baseline_row + dy + 1);
+    if (row < 0 || row >= LINES)
+      continue;
+    if (column < 0 || column >= COLS)
+      continue;
+    mvaddch(row, column, growing_upward ? '|' : '.');
+  }
+  attroff(COLOR_PAIR(colour_pair) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §13  draw_signal_panel — input + output panel renderer                */
 /* ===================================================================== */
 
-static void draw_signal_panel(const float *signal, int top_row,
-                              int height_rows, int colour_pair,
-                              int highlight_left, int highlight_right)
-{
-    /* Per sample: vertical bar from the panel midline.  Positive
-     * grows up, negative grows down.  Samples in the half-open
-     * range [highlight_left, highlight_right) get an alternate
-     * pair (used by the input panel to show which samples the
-     * kernel is currently multiplying). */
-    int half_height = height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = top_row + half_height;
+static void draw_signal_panel(const float *signal, int top_row, int height_rows,
+                              int colour_pair, int highlight_left,
+                              int highlight_right) {
+  /* Per sample: vertical bar from the panel midline.  Positive
+   * grows up, negative grows down.  Samples in the half-open
+   * range [highlight_left, highlight_right) get an alternate
+   * pair (used by the input panel to show which samples the
+   * kernel is currently multiplying). */
+  int half_height = height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = top_row + half_height;
 
-    int spacing = (COLS / N >= 2) ? 2 : 1;
-    int columns_to_draw = (COLS / spacing < N) ? COLS / spacing : N;
+  int spacing = (COLS / N >= 2) ? 2 : 1;
+  int columns_to_draw = (COLS / spacing < N) ? COLS / spacing : N;
 
-    for (int n = 0; n < columns_to_draw; n++) {
-        float v   = signal[n];
-        bool  pos = (v >= 0.0f);
-        int   h   = (int)(fabsf(v) * (float)half_height + 0.5f);
-        int   pair = (n >= highlight_left && n < highlight_right)
-                   ? PAIR_KERNEL_HI : colour_pair;
-        for (int s = 0; s < spacing; s++)
-            draw_bar(n * spacing + s, midline_row, h, pos, pair);
-    }
+  for (int n = 0; n < columns_to_draw; n++) {
+    float v = signal[n];
+    bool pos = (v >= 0.0f);
+    int h = (int)(fabsf(v) * (float)half_height + 0.5f);
+    int pair = (n >= highlight_left && n < highlight_right) ? PAIR_KERNEL_HI
+                                                            : colour_pair;
+    for (int s = 0; s < spacing; s++)
+      draw_bar(n * spacing + s, midline_row, h, pos, pair);
+  }
 }
 
 /* ===================================================================== */
 /* §14  draw_kernel_panel — kernel weights at current slide position    */
 /* ===================================================================== */
 
-static void draw_kernel_panel(int top_row, int height_rows)
-{
-    /* Draw the kernel's K bars positioned over the input samples
-     * the kernel is currently multiplying.  Bar height encodes the
-     * kernel weight (signed: positive grows up, negative grows down).
-     * Weights are normalised by the kernel's peak so all kernels
-     * fit the panel uniformly. */
-    int half_height = height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = top_row + half_height;
+static void draw_kernel_panel(int top_row, int height_rows) {
+  /* Draw the kernel's K bars positioned over the input samples
+   * the kernel is currently multiplying.  Bar height encodes the
+   * kernel weight (signed: positive grows up, negative grows down).
+   * Weights are normalised by the kernel's peak so all kernels
+   * fit the panel uniformly. */
+  int half_height = height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = top_row + half_height;
 
-    int spacing = (COLS / N >= 2) ? 2 : 1;
+  int spacing = (COLS / N >= 2) ? 2 : 1;
 
-    /* Find the kernel's weight peak so all weights normalise to fit. */
-    float peak = 0.0f;
-    for (int i = 0; i < g_kernel_length; i++) {
-        float a = fabsf(g_kernel_weights[i]);
-        if (a > peak) peak = a;
-    }
-    if (peak < 1e-6f) peak = 1.0f;
+  /* Find the kernel's weight peak so all weights normalise to fit. */
+  float peak = 0.0f;
+  for (int i = 0; i < g_kernel_length; i++) {
+    float a = fabsf(g_kernel_weights[i]);
+    if (a > peak)
+      peak = a;
+  }
+  if (peak < 1e-6f)
+    peak = 1.0f;
 
-    for (int i = 0; i < g_kernel_length; i++) {
-        int n = g_kernel_position + i;
-        if (n >= N) continue;
-        float v   = g_kernel_weights[i] / peak;
-        bool  pos = (v >= 0.0f);
-        int   h   = (int)(fabsf(v) * (float)half_height + 0.5f);
-        for (int s = 0; s < spacing; s++)
-            draw_bar(n * spacing + s, midline_row, h, pos, PAIR_KERNEL);
-    }
+  for (int i = 0; i < g_kernel_length; i++) {
+    int n = g_kernel_position + i;
+    if (n >= N)
+      continue;
+    float v = g_kernel_weights[i] / peak;
+    bool pos = (v >= 0.0f);
+    int h = (int)(fabsf(v) * (float)half_height + 0.5f);
+    for (int s = 0; s < spacing; s++)
+      draw_bar(n * spacing + s, midline_row, h, pos, PAIR_KERNEL);
+  }
 
-    /* Midline marker so the user can see "zero weight". */
-    attron(COLOR_PAIR(PAIR_LABEL));
-    int mid_w = N * spacing;
-    for (int x = 0; x < mid_w && x < COLS; x++)
-        mvaddch(midline_row, x, '-');
-    attroff(COLOR_PAIR(PAIR_LABEL));
+  /* Midline marker so the user can see "zero weight". */
+  attron(COLOR_PAIR(PAIR_LABEL));
+  int mid_w = N * spacing;
+  for (int x = 0; x < mid_w && x < COLS; x++)
+    mvaddch(midline_row, x, '-');
+  attroff(COLOR_PAIR(PAIR_LABEL));
 }
 
 /* ===================================================================== */
@@ -1302,221 +1300,250 @@ static void draw_kernel_panel(int top_row, int height_rows)
  *         weight as a numeric value.
  */
 
-static void draw_live_arithmetic_overlay(void)
-{
-    if (!g_show_live_arithmetic) return;
-    int x = 2, y = 2;
-    if (y + g_kernel_length + 2 >= LINES - 1) return;
+static void draw_live_arithmetic_overlay(void) {
+  if (!g_show_live_arithmetic)
+    return;
+  int x = 2, y = 2;
+  if (y + g_kernel_length + 2 >= LINES - 1)
+    return;
 
-    /* Header. */
-    attron(COLOR_PAIR(PAIR_HINT));
-    mvprintw(y, x, "Live arithmetic for y[%d]:", g_kernel_position);
-    attroff(COLOR_PAIR(PAIR_HINT));
+  /* Header. */
+  attron(COLOR_PAIR(PAIR_HINT));
+  mvprintw(y, x, "Live arithmetic for y[%d]:", g_kernel_position);
+  attroff(COLOR_PAIR(PAIR_HINT));
 
-    /* Per-tap line: weight * sample = product. */
-    float running_sum = 0.0f;
-    for (int i = 0; i < g_kernel_length; i++) {
-        float w = g_kernel_weights[i];
-        float s = g_input_signal[g_kernel_position + i];
-        float p = w * s;
-        running_sum += p;
-        attron(COLOR_PAIR(PAIR_KERNEL_HI) | A_BOLD);
-        mvprintw(y + 1 + i, x, "  k[%d]*x[%2d] = %+.3f * %+.3f = %+.4f",
-                 i, g_kernel_position + i, (double)w, (double)s, (double)p);
-        attroff(COLOR_PAIR(PAIR_KERNEL_HI) | A_BOLD);
-    }
+  /* Per-tap line: weight * sample = product. */
+  float running_sum = 0.0f;
+  for (int i = 0; i < g_kernel_length; i++) {
+    float w = g_kernel_weights[i];
+    float s = g_input_signal[g_kernel_position + i];
+    float p = w * s;
+    running_sum += p;
+    attron(COLOR_PAIR(PAIR_KERNEL_HI) | A_BOLD);
+    mvprintw(y + 1 + i, x, "  k[%d]*x[%2d] = %+.3f * %+.3f = %+.4f", i,
+             g_kernel_position + i, (double)w, (double)s, (double)p);
+    attroff(COLOR_PAIR(PAIR_KERNEL_HI) | A_BOLD);
+  }
 
-    /* Total. */
-    attron(COLOR_PAIR(PAIR_OUTPUT) | A_BOLD);
-    mvprintw(y + 1 + g_kernel_length, x,
-             "  ── sum = %+.4f  =  y[%d]",
-             (double)running_sum, g_kernel_position);
-    attroff(COLOR_PAIR(PAIR_OUTPUT) | A_BOLD);
+  /* Total. */
+  attron(COLOR_PAIR(PAIR_OUTPUT) | A_BOLD);
+  mvprintw(y + 1 + g_kernel_length, x, "  ── sum = %+.4f  =  y[%d]",
+           (double)running_sum, g_kernel_position);
+  attroff(COLOR_PAIR(PAIR_OUTPUT) | A_BOLD);
 }
 
-static void draw_kernel_table_overlay(void)
-{
-    if (!g_show_kernel_table) return;
-    int x = 2, y = 2;
-    /* Push table down if the live-arithmetic overlay is on so they
-     * don't collide. */
-    if (g_show_live_arithmetic) y += g_kernel_length + 3;
-    if (y + g_kernel_length + 2 >= LINES - 1) return;
+static void draw_kernel_table_overlay(void) {
+  if (!g_show_kernel_table)
+    return;
+  int x = 2, y = 2;
+  /* Push table down if the live-arithmetic overlay is on so they
+   * don't collide. */
+  if (g_show_live_arithmetic)
+    y += g_kernel_length + 3;
+  if (y + g_kernel_length + 2 >= LINES - 1)
+    return;
 
-    attron(COLOR_PAIR(PAIR_HINT));
-    mvprintw(y, x, "Kernel table:  %s  (K = %d)",
-             kernel_name[g_kernel_kind], g_kernel_length);
-    attroff(COLOR_PAIR(PAIR_HINT));
+  attron(COLOR_PAIR(PAIR_HINT));
+  mvprintw(y, x, "Kernel table:  %s  (K = %d)", kernel_name[g_kernel_kind],
+           g_kernel_length);
+  attroff(COLOR_PAIR(PAIR_HINT));
 
-    for (int i = 0; i < g_kernel_length; i++) {
-        attron(COLOR_PAIR(PAIR_KERNEL) | A_BOLD);
-        mvprintw(y + 1 + i, x, "  k[%2d] = %+.4f",
-                 i, (double)g_kernel_weights[i]);
-        attroff(COLOR_PAIR(PAIR_KERNEL) | A_BOLD);
-    }
+  for (int i = 0; i < g_kernel_length; i++) {
+    attron(COLOR_PAIR(PAIR_KERNEL) | A_BOLD);
+    mvprintw(y + 1 + i, x, "  k[%2d] = %+.4f", i, (double)g_kernel_weights[i]);
+    attroff(COLOR_PAIR(PAIR_KERNEL) | A_BOLD);
+  }
 }
 
 /* ===================================================================== */
 /* §16  hud — status top-right + hint bottom + frame composer            */
 /* ===================================================================== */
 
-static void draw_hud(void)
-{
-    char status[200];
-    snprintf(status, sizeof status,
-             " Convolution  N=%d K=%d  signal:%s  kernel:%s  pos:%2d/%-2d  %s  %s ",
-             N, g_kernel_length,
-             signal_name[g_signal_kind],
-             kernel_name[g_kernel_kind],
-             g_kernel_position, N - g_kernel_length,
-             g_auto_slide_enabled ? "AUTO  " : "MANUAL",
-             g_simulation_paused  ? "PAUSED" : "      ");
-    int x = COLS - (int)strlen(status);
-    if (x < 0) x = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, x, "%s", status);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+static void draw_hud(void) {
+  char status[200];
+  snprintf(
+      status, sizeof status,
+      " Convolution  N=%d K=%d  signal:%s  kernel:%s  pos:%2d/%-2d  %s  %s ", N,
+      g_kernel_length, signal_name[g_signal_kind], kernel_name[g_kernel_kind],
+      g_kernel_position, N - g_kernel_length,
+      g_auto_slide_enabled ? "AUTO  " : "MANUAL",
+      g_simulation_paused ? "PAUSED" : "      ");
+  int x = COLS - (int)strlen(status);
+  if (x < 0)
+    x = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, x, "%s", status);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void draw_hint(void)
-{
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(LINES - 1, 0,
-             " q:quit  spc:pause  a:auto/manual  </>:slide  k:kernel "
-             " s:signal  d:arith  D:table  r:reset ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void draw_hint(void) {
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(LINES - 1, 0,
+           " q:quit  spc:pause  a:auto/manual  </>:slide  k:kernel "
+           " s:signal  d:arith  D:table  r:reset ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void render_frame(void)
-{
-    erase();
+static void render_frame(void) {
+  erase();
 
-    /* Layout: 1 HUD + 3 labels + 3 panels + 1 hint = 5 reserved
-     * rows.  Split the rest evenly into 3 panels. */
-    int rows_for_panels = LINES - 5;
-    if (rows_for_panels < 9) rows_for_panels = 9;
-    int input_h  = rows_for_panels / 3;
-    int kernel_h = rows_for_panels / 3;
-    int output_h = rows_for_panels - input_h - kernel_h;
+  /* Layout: 1 HUD + 3 labels + 3 panels + 1 hint = 5 reserved
+   * rows.  Split the rest evenly into 3 panels. */
+  int rows_for_panels = LINES - 5;
+  if (rows_for_panels < 9)
+    rows_for_panels = 9;
+  int input_h = rows_for_panels / 3;
+  int kernel_h = rows_for_panels / 3;
+  int output_h = rows_for_panels - input_h - kernel_h;
 
-    int input_label_row  = 1;
-    int input_top_row    = 2;
-    int kernel_label_row = 2 + input_h;
-    int kernel_top_row   = 3 + input_h;
-    int output_label_row = 3 + input_h + kernel_h;
-    int output_top_row   = 4 + input_h + kernel_h;
+  int input_label_row = 1;
+  int input_top_row = 2;
+  int kernel_label_row = 2 + input_h;
+  int kernel_top_row = 3 + input_h;
+  int output_label_row = 3 + input_h + kernel_h;
+  int output_top_row = 4 + input_h + kernel_h;
 
-    /* Panel labels. */
-    attron(COLOR_PAIR(PAIR_LABEL));
-    mvprintw(input_label_row,  0,
-             "Input x[n]   (yellow = under the kernel right now)");
-    mvprintw(kernel_label_row, 0,
-             "Kernel k[i]  (positive grows up, negative grows down)");
-    mvprintw(output_label_row, 0,
-             "Output y[n]  =  sum_i  k[i] * x[n + i]");
-    attroff(COLOR_PAIR(PAIR_LABEL));
+  /* Panel labels. */
+  attron(COLOR_PAIR(PAIR_LABEL));
+  mvprintw(input_label_row, 0,
+           "Input x[n]   (yellow = under the kernel right now)");
+  mvprintw(kernel_label_row, 0,
+           "Kernel k[i]  (positive grows up, negative grows down)");
+  mvprintw(output_label_row, 0, "Output y[n]  =  sum_i  k[i] * x[n + i]");
+  attroff(COLOR_PAIR(PAIR_LABEL));
 
-    /* Panels. */
-    draw_signal_panel(g_input_signal, input_top_row, input_h, PAIR_INPUT,
-                      g_kernel_position,
-                      g_kernel_position + g_kernel_length);
-    draw_kernel_panel(kernel_top_row, kernel_h);
-    draw_signal_panel(g_output_signal, output_top_row, output_h,
-                      PAIR_OUTPUT, -1, -1);   /* no highlight */
+  /* Panels. */
+  draw_signal_panel(g_input_signal, input_top_row, input_h, PAIR_INPUT,
+                    g_kernel_position, g_kernel_position + g_kernel_length);
+  draw_kernel_panel(kernel_top_row, kernel_h);
+  draw_signal_panel(g_output_signal, output_top_row, output_h, PAIR_OUTPUT, -1,
+                    -1); /* no highlight */
 
-    /* Debug overlays (drawn over panels but under HUD). */
-    draw_live_arithmetic_overlay();
-    draw_kernel_table_overlay();
+  /* Debug overlays (drawn over panels but under HUD). */
+  draw_live_arithmetic_overlay();
+  draw_kernel_table_overlay();
 
-    /* HUD + hint always last. */
-    draw_hud();
-    draw_hint();
+  /* HUD + hint always last. */
+  draw_hud();
+  draw_hint();
 
-    wnoutrefresh(stdscr);
-    doupdate();
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §17  app — signal handlers + main loop + key dispatch                 */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_should_quit    = 0;
+static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
 
-static void on_signal(int sig)
-{
-    /* Async-signal-safe: only set flags; main loop does the work. */
-    if (sig == SIGWINCH) g_resize_pending = 1;
-    else                 g_should_quit    = 1;
+static void on_signal(int sig) {
+  /* Async-signal-safe: only set flags; main loop does the work. */
+  if (sig == SIGWINCH)
+    g_resize_pending = 1;
+  else
+    g_should_quit = 1;
 }
 
 static void cleanup_screen(void) { endwin(); }
 
-static bool app_handle_key(int ch)
-{
-    /* Returns true on quit. */
-    switch (ch) {
-        case 'q': case 'Q': case 27:  return true;
-        case ' ':                     g_simulation_paused = !g_simulation_paused; break;
-        case 'a': case 'A':           g_auto_slide_enabled = !g_auto_slide_enabled; break;
-        case '<': case ',':           scene_step_kernel(-1); break;
-        case '>': case '.':           scene_step_kernel(+1); break;
-        case 'k':                     scene_cycle_kernel(+1); break;
-        case 'K':                     scene_cycle_kernel(-1); break;
-        case 's':                     scene_cycle_signal(+1); break;
-        case 'S':                     scene_cycle_signal(-1); break;
-        case 'd':                     g_show_live_arithmetic = !g_show_live_arithmetic; break;
-        case 'D':                     g_show_kernel_table    = !g_show_kernel_table;    break;
-        case 'r': case 'R':           scene_reset(); break;
-        default: break;
-    }
-    return false;
+static bool app_handle_key(int ch) {
+  /* Returns true on quit. */
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return true;
+  case ' ':
+    g_simulation_paused = !g_simulation_paused;
+    break;
+  case 'a':
+  case 'A':
+    g_auto_slide_enabled = !g_auto_slide_enabled;
+    break;
+  case '<':
+  case ',':
+    scene_step_kernel(-1);
+    break;
+  case '>':
+  case '.':
+    scene_step_kernel(+1);
+    break;
+  case 'k':
+    scene_cycle_kernel(+1);
+    break;
+  case 'K':
+    scene_cycle_kernel(-1);
+    break;
+  case 's':
+    scene_cycle_signal(+1);
+    break;
+  case 'S':
+    scene_cycle_signal(-1);
+    break;
+  case 'd':
+    g_show_live_arithmetic = !g_show_live_arithmetic;
+    break;
+  case 'D':
+    g_show_kernel_table = !g_show_kernel_table;
+    break;
+  case 'r':
+  case 'R':
+    scene_reset();
+    break;
+  default:
+    break;
+  }
+  return false;
 }
 
-int main(void)
-{
-    atexit(cleanup_screen);
-    signal(SIGINT,   on_signal);
-    signal(SIGTERM,  on_signal);
-    signal(SIGWINCH, on_signal);
+int main(void) {
+  atexit(cleanup_screen);
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGWINCH, on_signal);
 
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    colors_init();
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  colors_init();
 
-    scene_reset();
+  scene_reset();
 
-    long long next_frame_ns = clock_now_ns();
+  long long next_frame_ns = clock_now_ns();
 
-    while (!g_should_quit) {
-        if (g_resize_pending) {
-            g_resize_pending = 0;
-            endwin();
-            refresh();
-        }
-
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (app_handle_key(ch)) { g_should_quit = 1; break; }
-        }
-
-        long long now = clock_now_ns();
-        if (now >= next_frame_ns) {
-            scene_tick();
-            render_frame();
-            next_frame_ns += RENDER_TICK_NS;
-            /* Snap forward if we fell badly behind (e.g. terminal hidden). */
-            if (clock_now_ns() > next_frame_ns + 5 * RENDER_TICK_NS)
-                next_frame_ns = clock_now_ns() + RENDER_TICK_NS;
-        } else {
-            clock_sleep_ns(next_frame_ns - now);
-        }
+  while (!g_should_quit) {
+    if (g_resize_pending) {
+      g_resize_pending = 0;
+      endwin();
+      refresh();
     }
 
-    return 0;
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (app_handle_key(ch)) {
+        g_should_quit = 1;
+        break;
+      }
+    }
+
+    long long now = clock_now_ns();
+    if (now >= next_frame_ns) {
+      scene_tick();
+      render_frame();
+      next_frame_ns += RENDER_TICK_NS;
+      /* Snap forward if we fell badly behind (e.g. terminal hidden). */
+      if (clock_now_ns() > next_frame_ns + 5 * RENDER_TICK_NS)
+        next_frame_ns = clock_now_ns() + RENDER_TICK_NS;
+    } else {
+      clock_sleep_ns(next_frame_ns - now);
+    }
+  }
+
+  return 0;
 }

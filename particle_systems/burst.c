@@ -165,7 +165,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -173,35 +173,35 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ===================================================================== */
 /* §1  config                                                             */
 /* ===================================================================== */
 
 enum {
-    SIM_FPS_MIN      =  5,
-    SIM_FPS_DEFAULT  = 24,
-    SIM_FPS_MAX      = 60,
-    SIM_FPS_STEP     =  4,
+  SIM_FPS_MIN = 5,
+  SIM_FPS_DEFAULT = 24,
+  SIM_FPS_MAX = 60,
+  SIM_FPS_STEP = 4,
 
-    BURSTS_MIN       =  1,
-    BURSTS_DEFAULT   =  5,
-    BURSTS_MAX       = 16,
+  BURSTS_MIN = 1,
+  BURSTS_DEFAULT = 5,
+  BURSTS_MAX = 16,
 
-    PARTICLES        = 48,    /* sparks per burst                          */
-    BURST_TICKS      = 22,    /* max LIVE-state duration                   */
-    FUSE_MIN         =  8,    /* idle-fuse minimum (ticks)                 */
-    FUSE_RANGE       = 20,    /* idle-fuse extra uniform range             */
+  PARTICLES = 48,   /* sparks per burst                          */
+  BURST_TICKS = 22, /* max LIVE-state duration                   */
+  FUSE_MIN = 8,     /* idle-fuse minimum (ticks)                 */
+  FUSE_RANGE = 20,  /* idle-fuse extra uniform range             */
 
-    BURST_WAVES      =  4,    /* concentric rings inside one burst         */
-    BURST_MAX_DELAY  =  5,    /* outermost wave's spawn delay (ticks)      */
+  BURST_WAVES = 4,     /* concentric rings inside one burst         */
+  BURST_MAX_DELAY = 5, /* outermost wave's spawn delay (ticks)      */
 
-    HUD_COLS         = 64,    /* fits fps + spd + burst + [theme] + dbg    */
-    FPS_UPDATE_MS    = 500,
+  HUD_COLS = 64, /* fits fps + spd + burst + [theme] + dbg    */
+  FPS_UPDATE_MS = 500,
 };
 
 /*
@@ -209,43 +209,42 @@ enum {
  * concept and annotated with units / role so the inner loops below stay
  * pure mechanics — every magic number lives here.
  */
-#define DRAG_FACTOR              0.82f   /* per-tick velocity retention (≈18% loss) */
-#define FLASH_LIFE_THRESHOLD     0.65f   /* sparks bold while life > this           */
+#define DRAG_FACTOR 0.82f /* per-tick velocity retention (≈18% loss) */
+#define FLASH_LIFE_THRESHOLD 0.65f /* sparks bold while life > this */
 
-#define BURST_ANGLE_JITTER       0.2f    /* radians of extra angle per spark        */
-#define BURST_SPEED_MIN          1.8f    /* pixels / tick (lower bound)             */
-#define BURST_SPEED_MAX          4.6f    /* pixels / tick (upper bound)             */
+#define BURST_ANGLE_JITTER 0.2f /* radians of extra angle per spark        */
+#define BURST_SPEED_MIN 1.8f    /* pixels / tick (lower bound)             */
+#define BURST_SPEED_MAX 4.6f    /* pixels / tick (upper bound)             */
 
-#define PARTICLE_LIFE_MIN        0.8f    /* fresh-spawn life (lower bound)          */
-#define PARTICLE_LIFE_MAX        1.0f    /* fresh-spawn life (upper bound)          */
-#define PARTICLE_DECAY_MIN       0.05f   /* per-tick life decay (lower bound)       */
-#define PARTICLE_DECAY_MAX       0.09f   /* per-tick life decay (upper bound)       */
+#define PARTICLE_LIFE_MIN 0.8f   /* fresh-spawn life (lower bound)          */
+#define PARTICLE_LIFE_MAX 1.0f   /* fresh-spawn life (upper bound)          */
+#define PARTICLE_DECAY_MIN 0.05f /* per-tick life decay (lower bound)       */
+#define PARTICLE_DECAY_MAX 0.09f /* per-tick life decay (upper bound)       */
 
-#define FUSE_NEVER               (INT32_MAX / 2)   /* idle slot's fuse: never fires */
+#define FUSE_NEVER (INT32_MAX / 2) /* idle slot's fuse: never fires */
 
-#define NS_PER_SEC   1000000000LL
-#define NS_PER_MS    1000000LL
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
 #define TICK_NS(fps) (NS_PER_SEC / (fps))
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ===================================================================== */
@@ -254,11 +253,12 @@ static void clock_sleep_ns(int64_t ns)
 
 /* rand_unit / rand_range / rand_int_below / clamp_int — named primitives. */
 static inline float rand_unit(void) { return (float)rand() / RAND_MAX; }
-static inline float rand_range(float lo, float hi) { return lo + rand_unit() * (hi - lo); }
-static inline int   rand_int_below(int n) { return rand() % n; }
-static inline int   clamp_int(int v, int lo, int hi)
-{
-    return v < lo ? lo : (v > hi ? hi : v);
+static inline float rand_range(float lo, float hi) {
+  return lo + rand_unit() * (hi - lo);
+}
+static inline int rand_int_below(int n) { return rand() % n; }
+static inline int clamp_int(int v, int lo, int hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
 }
 
 /* ===================================================================== */
@@ -266,20 +266,20 @@ static inline int   clamp_int(int v, int lo, int hi)
 /* ===================================================================== */
 
 typedef enum {
-    C_RED     = 1,
-    C_ORANGE  = 2,
-    C_YELLOW  = 3,
-    C_GREEN   = 4,
-    C_CYAN    = 5,
-    C_BLUE    = 6,
-    C_MAGENTA = 7,
-    C_COUNT   = 7,
+  C_RED = 1,
+  C_ORANGE = 2,
+  C_YELLOW = 3,
+  C_GREEN = 4,
+  C_CYAN = 5,
+  C_BLUE = 6,
+  C_MAGENTA = 7,
+  C_COUNT = 7,
 } Hue;
 
 /* HUD/HINT pairs sit OUTSIDE the 7-hue rendering range so theme cycling
  * never clobbers them. */
-#define PAIR_HUD   8
-#define PAIR_HINT  9
+#define PAIR_HUD 8
+#define PAIR_HINT 9
 
 /*
  * BurstTheme — one palette: 7 hue slots indexed by the Hue enum.
@@ -294,93 +294,93 @@ typedef enum {
  *   mvaddch — no clear, no flicker.
  */
 typedef struct {
-    const char *name;
-    int         fg256[C_COUNT];
-    int         fg8  [C_COUNT];
+  const char *name;
+  int fg256[C_COUNT];
+  int fg8[C_COUNT];
 } BurstTheme;
 
-#define THEME_COUNT  10
+#define THEME_COUNT 10
 
 static const BurstTheme k_themes[THEME_COUNT] = {
-    { "matrix",
-      {  22,  28,  34,  40,  46,  82, 118 },
-      { COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
-        COLOR_GREEN, COLOR_GREEN, COLOR_WHITE } },
-    { "neon",
-      { 201, 207, 213, 159, 226, 195,  51 },
-      { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_CYAN,
-        COLOR_YELLOW,  COLOR_CYAN,    COLOR_CYAN } },
-    { "nova",
-      {  52,  88, 124, 160, 196, 208, 220 },
-      { COLOR_RED,    COLOR_RED,    COLOR_RED,    COLOR_RED,
-        COLOR_RED,    COLOR_YELLOW, COLOR_YELLOW } },
-    { "ocean",
-      {  24,  31,  39,  45,  51, 123, 195 },
-      { COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_CYAN,
-        COLOR_CYAN, COLOR_WHITE, COLOR_WHITE } },
-    { "fire",
-      { 196, 202, 208, 214, 220, 226, 231 },
-      { COLOR_RED,    COLOR_RED,    COLOR_RED,    COLOR_YELLOW,
-        COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE } },
-    { "toxic",
-      {  28,  40,  46, 154, 190, 226, 220 },
-      { COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN,  COLOR_YELLOW,
-        COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW } },
-    { "gold",
-      { 130, 136, 178, 214, 220, 226, 230 },
-      { COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW,
-        COLOR_YELLOW, COLOR_WHITE,  COLOR_WHITE } },
-    { "ice",
-      {  21,  27,  33,  39,  45,  51, 195 },
-      { COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_CYAN,
-        COLOR_CYAN, COLOR_CYAN, COLOR_WHITE } },
-    { "aurora",
-      {  28,  35,  50,  86, 121, 207, 219 },
-      { COLOR_GREEN, COLOR_GREEN, COLOR_CYAN, COLOR_CYAN,
-        COLOR_CYAN,  COLOR_MAGENTA, COLOR_MAGENTA } },
-    { "plasma",
-      {  53,  91, 129, 165, 207, 213,  51 },
-      { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA,
-        COLOR_MAGENTA, COLOR_CYAN,    COLOR_CYAN } },
+    {"matrix",
+     {22, 28, 34, 40, 46, 82, 118},
+     {COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
+      COLOR_GREEN, COLOR_WHITE}},
+    {"neon",
+     {201, 207, 213, 159, 226, 195, 51},
+     {COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_CYAN, COLOR_YELLOW,
+      COLOR_CYAN, COLOR_CYAN}},
+    {"nova",
+     {52, 88, 124, 160, 196, 208, 220},
+     {COLOR_RED, COLOR_RED, COLOR_RED, COLOR_RED, COLOR_RED, COLOR_YELLOW,
+      COLOR_YELLOW}},
+    {"ocean",
+     {24, 31, 39, 45, 51, 123, 195},
+     {COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_CYAN, COLOR_CYAN, COLOR_WHITE,
+      COLOR_WHITE}},
+    {"fire",
+     {196, 202, 208, 214, 220, 226, 231},
+     {COLOR_RED, COLOR_RED, COLOR_RED, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW,
+      COLOR_WHITE}},
+    {"toxic",
+     {28, 40, 46, 154, 190, 226, 220},
+     {COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_YELLOW, COLOR_YELLOW,
+      COLOR_YELLOW, COLOR_YELLOW}},
+    {"gold",
+     {130, 136, 178, 214, 220, 226, 230},
+     {COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW,
+      COLOR_WHITE, COLOR_WHITE}},
+    {"ice",
+     {21, 27, 33, 39, 45, 51, 195},
+     {COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_CYAN, COLOR_CYAN, COLOR_CYAN,
+      COLOR_WHITE}},
+    {"aurora",
+     {28, 35, 50, 86, 121, 207, 219},
+     {COLOR_GREEN, COLOR_GREEN, COLOR_CYAN, COLOR_CYAN, COLOR_CYAN,
+      COLOR_MAGENTA, COLOR_MAGENTA}},
+    {"plasma",
+     {53, 91, 129, 165, 207, 213, 51},
+     {COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA,
+      COLOR_CYAN, COLOR_CYAN}},
 };
 
 /* theme_apply — rebind the 7 hue pair IDs (1..C_COUNT) to k_themes[theme]. */
-static void theme_apply(int theme)
-{
-    const BurstTheme *th = &k_themes[theme];
-    for (int i = 0; i < C_COUNT; i++) {
-        int slot = i + 1;        /* C_RED=1 .. C_MAGENTA=7 */
-        if (COLORS >= 256)
-            init_pair(slot, th->fg256[i], COLOR_BLACK);
-        else
-            init_pair(slot, th->fg8[i],   COLOR_BLACK);
-    }
+static void theme_apply(int theme) {
+  const BurstTheme *th = &k_themes[theme];
+  for (int i = 0; i < C_COUNT; i++) {
+    int slot = i + 1; /* C_RED=1 .. C_MAGENTA=7 */
+    if (COLORS >= 256)
+      init_pair(slot, th->fg256[i], COLOR_BLACK);
+    else
+      init_pair(slot, th->fg8[i], COLOR_BLACK);
+  }
 }
 
-/* color_init — start_color + apply initial theme + pin HUD/HINT + debug pairs. */
-static void color_init(int theme)
-{
-    start_color();
-    use_default_colors();
-    theme_apply(theme);
+/* color_init — start_color + apply initial theme + pin HUD/HINT + debug pairs.
+ */
+static void color_init(int theme) {
+  start_color();
+  use_default_colors();
+  theme_apply(theme);
 
-    /* HUD pairs are theme-independent — init ONCE, theme_apply leaves them alone. */
-    init_pair(PAIR_HUD,  COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
-    init_pair(PAIR_HINT, COLORS >= 256 ?  51 : COLOR_CYAN,   -1);
+  /* HUD pairs are theme-independent — init ONCE, theme_apply leaves them alone.
+   */
+  init_pair(PAIR_HUD, COLORS >= 256 ? 226 : COLOR_YELLOW, -1);
+  init_pair(PAIR_HINT, COLORS >= 256 ? 51 : COLOR_CYAN, -1);
 
-    /* Debug overlay pairs (pairs 10..13) — also theme-independent.
-     * Used only by debug rendering modes; reserved bright distinct hues. */
-    if (COLORS >= 256) {
-        init_pair(10, 196, -1);   /* wave 0: red       */
-        init_pair(11, 226, -1);   /* wave 1: yellow    */
-        init_pair(12,  46, -1);   /* wave 2: green     */
-        init_pair(13,  51, -1);   /* wave 3: cyan      */
-    } else {
-        init_pair(10, COLOR_RED,    -1);
-        init_pair(11, COLOR_YELLOW, -1);
-        init_pair(12, COLOR_GREEN,  -1);
-        init_pair(13, COLOR_CYAN,   -1);
-    }
+  /* Debug overlay pairs (pairs 10..13) — also theme-independent.
+   * Used only by debug rendering modes; reserved bright distinct hues. */
+  if (COLORS >= 256) {
+    init_pair(10, 196, -1); /* wave 0: red       */
+    init_pair(11, 226, -1); /* wave 1: yellow    */
+    init_pair(12, 46, -1);  /* wave 2: green     */
+    init_pair(13, 51, -1);  /* wave 3: cyan      */
+  } else {
+    init_pair(10, COLOR_RED, -1);
+    init_pair(11, COLOR_YELLOW, -1);
+    init_pair(12, COLOR_GREEN, -1);
+    init_pair(13, COLOR_CYAN, -1);
+  }
 }
 
 static Hue hue_rand(void) { return (Hue)(1 + rand() % C_COUNT); }
@@ -390,27 +390,30 @@ static Hue hue_rand(void) { return (Hue)(1 + rand() % C_COUNT); }
 /* ===================================================================== */
 
 typedef enum {
-    DBG_NORMAL   = 0,    /* production rendering (artistic view)            */
-    DBG_WAVES    = 1,    /* colour each spark by wave index (visible stagger)*/
-    DBG_VELOCITY = 2,    /* replace glyph with arrow showing velocity dir   */
-    DBG_FUSE     = 3,    /* write FSM countdown/age as number at centre    */
-    DBG_COUNT    = 4,
+  DBG_NORMAL = 0,   /* production rendering (artistic view)            */
+  DBG_WAVES = 1,    /* colour each spark by wave index (visible stagger)*/
+  DBG_VELOCITY = 2, /* replace glyph with arrow showing velocity dir   */
+  DBG_FUSE = 3,     /* write FSM countdown/age as number at centre    */
+  DBG_COUNT = 4,
 } DebugMode;
 
 static const char *const k_debug_names[DBG_COUNT] = {
-    "normal", "waves", "velocity", "fuse",
+    "normal",
+    "waves",
+    "velocity",
+    "fuse",
 };
 
 static DebugMode g_debug = DBG_NORMAL;
 
 /* dir_char — atan2(vy, vx) → 8-octant ASCII arrow for DBG_VELOCITY. */
-static char dir_char(float vx, float vy)
-{
-    static const char k_dirs[8] = { '>', '\\', 'v', '/', '<', '\\', '^', '/' };
-    float a = atan2f(vy, vx);
-    if (a < 0.0f) a += 2.0f * (float)M_PI;
-    int idx = (int)((a + (float)M_PI / 8.0f) / ((float)M_PI / 4.0f)) & 7;
-    return k_dirs[idx];
+static char dir_char(float vx, float vy) {
+  static const char k_dirs[8] = {'>', '\\', 'v', '/', '<', '\\', '^', '/'};
+  float a = atan2f(vy, vx);
+  if (a < 0.0f)
+    a += 2.0f * (float)M_PI;
+  int idx = (int)((a + (float)M_PI / 8.0f) / ((float)M_PI / 4.0f)) & 7;
+  return k_dirs[idx];
 }
 
 /* Wave index → debug-palette colour pair (10..13). */
@@ -446,50 +449,48 @@ static int wave_pair(int wave) { return 10 + (wave & 3); }
  * 2× faster than vertical at the same |vx|=|vy|.
  */
 typedef struct {
-    float cx, cy;
-    float rx, ry;
-    float vx, vy;
-    float life;
-    float decay;
-    int   delay;
-    int   wave;
-    char  sym;
-    Hue   hue;
-    bool  alive;
+  float cx, cy;
+  float rx, ry;
+  float vx, vy;
+  float life;
+  float decay;
+  int delay;
+  int wave;
+  char sym;
+  Hue hue;
+  bool alive;
 } Particle;
 
 static const char k_syms[] = "*.+o#@%&$!^~-=|/\\:;,`'\"";
 #define NSYMS (int)(sizeof k_syms - 1)
 
 /* particle_spawn — fill one Particle at burst-ignite time. */
-static void particle_spawn(Particle *p, float cx, float cy,
-                            float angle, float speed,
-                            int delay_ticks, int wave)
-{
-    /* Anchor — burst centre in CELL space, never moves after spawn. */
-    p->cx    = cx;
-    p->cy    = cy;
+static void particle_spawn(Particle *p, float cx, float cy, float angle,
+                           float speed, int delay_ticks, int wave) {
+  /* Anchor — burst centre in CELL space, never moves after spawn. */
+  p->cx = cx;
+  p->cy = cy;
 
-    /* Offset — pixel-space deviation from centre, grows during tick. */
-    p->rx    = 0.0f;
-    p->ry    = 0.0f;
+  /* Offset — pixel-space deviation from centre, grows during tick. */
+  p->rx = 0.0f;
+  p->ry = 0.0f;
 
-    /* Velocity — radial outward fan (polar → Cartesian). */
-    p->vx    = cosf(angle) * speed;
-    p->vy    = sinf(angle) * speed;
+  /* Velocity — radial outward fan (polar → Cartesian). */
+  p->vx = cosf(angle) * speed;
+  p->vy = sinf(angle) * speed;
 
-    /* Life budget — fresh in [LIFE_MIN, LIFE_MAX), drains by `decay`/tick. */
-    p->life  = rand_range(PARTICLE_LIFE_MIN,  PARTICLE_LIFE_MAX);
-    p->decay = rand_range(PARTICLE_DECAY_MIN, PARTICLE_DECAY_MAX);
+  /* Life budget — fresh in [LIFE_MIN, LIFE_MAX), drains by `decay`/tick. */
+  p->life = rand_range(PARTICLE_LIFE_MIN, PARTICLE_LIFE_MAX);
+  p->decay = rand_range(PARTICLE_DECAY_MIN, PARTICLE_DECAY_MAX);
 
-    /* FSM bookkeeping — wave index and per-spark spawn delay. */
-    p->delay = delay_ticks;
-    p->wave  = wave;
+  /* FSM bookkeeping — wave index and per-spark spawn delay. */
+  p->delay = delay_ticks;
+  p->wave = wave;
 
-    /* Appearance — glyph and hue fixed at spawn so the eye can track. */
-    p->sym   = k_syms[rand_int_below(NSYMS)];
-    p->hue   = hue_rand();
-    p->alive = true;
+  /* Appearance — glyph and hue fixed at spawn so the eye can track. */
+  p->sym = k_syms[rand_int_below(NSYMS)];
+  p->hue = hue_rand();
+  p->alive = true;
 }
 
 /*
@@ -522,84 +523,89 @@ static void particle_spawn(Particle *p, float cx, float cy,
  *   per-spark physics here means burst_tick stays at FSM level — no
  *   mixing of state-machine and integrator concerns.
  */
-static void particle_tick(Particle *p, int cols, int rows)
-{
-    /* Gate 1 — dead sparks are inert. */
-    if (!p->alive) return;
+static void particle_tick(Particle *p, int cols, int rows) {
+  /* Gate 1 — dead sparks are inert. */
+  if (!p->alive)
+    return;
 
-    /* Gate 2 — wave-stagger delay holds the spark in its starting cell. */
-    if (p->delay > 0) { p->delay--; return; }
+  /* Gate 2 — wave-stagger delay holds the spark in its starting cell. */
+  if (p->delay > 0) {
+    p->delay--;
+    return;
+  }
 
-    /* Step 1 — multiplicative drag (Stokes-like: force ∝ velocity). */
-    p->vx *= DRAG_FACTOR;
-    p->vy *= DRAG_FACTOR;
+  /* Step 1 — multiplicative drag (Stokes-like: force ∝ velocity). */
+  p->vx *= DRAG_FACTOR;
+  p->vy *= DRAG_FACTOR;
 
-    /* Step 2 — explicit Euler integration in pixel space. */
-    p->rx += p->vx;
-    p->ry += p->vy;
+  /* Step 2 — explicit Euler integration in pixel space. */
+  p->rx += p->vx;
+  p->ry += p->vy;
 
-    /* Step 3 — age the life counter. */
-    p->life -= p->decay;
+  /* Step 3 — age the life counter. */
+  p->life -= p->decay;
 
-    /* Step 4 — die if life is exhausted OR the spark left the screen.
-     *           ASPECT compensation applied so the bounds test matches
-     *           what particle_draw will actually paint. */
-    float screen_x   = p->cx + p->rx * ASPECT;
-    float screen_y   = p->cy + p->ry;
-    bool  burned_out = (p->life <= 0.0f);
-    bool  off_screen = (screen_x < 0.f || screen_x >= (float)cols
-                     || screen_y < 0.f || screen_y >= (float)rows);
-    if (burned_out || off_screen) p->alive = false;
+  /* Step 4 — die if life is exhausted OR the spark left the screen.
+   *           ASPECT compensation applied so the bounds test matches
+   *           what particle_draw will actually paint. */
+  float screen_x = p->cx + p->rx * ASPECT;
+  float screen_y = p->cy + p->ry;
+  bool burned_out = (p->life <= 0.0f);
+  bool off_screen = (screen_x < 0.f || screen_x >= (float)cols ||
+                     screen_y < 0.f || screen_y >= (float)rows);
+  if (burned_out || off_screen)
+    p->alive = false;
 }
 
 /* particle_pixel_to_cell — pixel-space → terminal cell with ×ASPECT in x. */
-static void particle_pixel_to_cell(const Particle *p, int *cell_x, int *cell_y)
-{
-    *cell_x = (int)(p->cx + p->rx * ASPECT);
-    *cell_y = (int)(p->cy + p->ry);
+static void particle_pixel_to_cell(const Particle *p, int *cell_x,
+                                   int *cell_y) {
+  *cell_x = (int)(p->cx + p->rx * ASPECT);
+  *cell_y = (int)(p->cy + p->ry);
 }
 
 /* particle_draw — paint one spark; switches on g_debug for overlay modes. */
-static void particle_draw(const Particle *p, WINDOW *w, int cols, int rows)
-{
-    /* Gates — same suppression rules as particle_tick. */
-    if (!p->alive || p->delay > 0) return;
+static void particle_draw(const Particle *p, WINDOW *w, int cols, int rows) {
+  /* Gates — same suppression rules as particle_tick. */
+  if (!p->alive || p->delay > 0)
+    return;
 
-    int cell_x, cell_y;
-    particle_pixel_to_cell(p, &cell_x, &cell_y);
-    if (cell_x < 0 || cell_x >= cols || cell_y < 0 || cell_y >= rows) return;
+  int cell_x, cell_y;
+  particle_pixel_to_cell(p, &cell_x, &cell_y);
+  if (cell_x < 0 || cell_x >= cols || cell_y < 0 || cell_y >= rows)
+    return;
 
-    /*
-     * Debug-mode dispatch — pick (glyph, attr) per mode.  Physics is
-     * identical across modes; only the rendering changes.
-     */
-    chtype glyph;
-    attr_t attr;
-    switch (g_debug) {
-    case DBG_WAVES:
-        /* Colour by wave (0..3) so staggered emission is legible. */
-        glyph = (chtype)(unsigned char)p->sym;
-        attr  = COLOR_PAIR(wave_pair(p->wave)) | A_BOLD;
-        break;
-    case DBG_VELOCITY:
-        /* Replace glyph with an arrow showing velocity direction. */
-        glyph = (chtype)(unsigned char)dir_char(p->vx, p->vy);
-        attr  = COLOR_PAIR(p->hue) | A_BOLD;
-        break;
-    case DBG_FUSE:
-    case DBG_NORMAL:
-    default: {
-        /* Production view — fixed glyph + fading bold gate. */
-        bool is_fresh_spark = (p->life > FLASH_LIFE_THRESHOLD);
-        glyph = (chtype)(unsigned char)p->sym;
-        attr  = COLOR_PAIR(p->hue) | (is_fresh_spark ? A_BOLD : 0);
-        break;
-    }
-    }
+  /*
+   * Debug-mode dispatch — pick (glyph, attr) per mode.  Physics is
+   * identical across modes; only the rendering changes.
+   */
+  chtype glyph;
+  attr_t attr;
+  switch (g_debug) {
+  case DBG_WAVES:
+    /* Colour by wave (0..3) so staggered emission is legible. */
+    glyph = (chtype)(unsigned char)p->sym;
+    attr = COLOR_PAIR(wave_pair(p->wave)) | A_BOLD;
+    break;
+  case DBG_VELOCITY:
+    /* Replace glyph with an arrow showing velocity direction. */
+    glyph = (chtype)(unsigned char)dir_char(p->vx, p->vy);
+    attr = COLOR_PAIR(p->hue) | A_BOLD;
+    break;
+  case DBG_FUSE:
+  case DBG_NORMAL:
+  default: {
+    /* Production view — fixed glyph + fading bold gate. */
+    bool is_fresh_spark = (p->life > FLASH_LIFE_THRESHOLD);
+    glyph = (chtype)(unsigned char)p->sym;
+    attr = COLOR_PAIR(p->hue) | (is_fresh_spark ? A_BOLD : 0);
+    break;
+  }
+  }
 
-    wattron(w, attr);
-    mvwaddch(w, cell_y, cell_x, glyph);
-    wattroff(w, attr);
+  wattron(w, attr);
+  mvwaddch(w, cell_y, cell_x, glyph);
+  wattroff(w, attr);
 }
 
 /* ===================================================================== */
@@ -607,9 +613,9 @@ static void particle_draw(const Particle *p, WINDOW *w, int cols, int rows)
 /* ===================================================================== */
 
 typedef enum {
-    BS_IDLE  = 0,    /* fuse counting down; no visible state                */
-    BS_FLASH = 1,    /* exactly ONE tick of central '*+' cross flash        */
-    BS_LIVE  = 2,    /* particles flying; transitions back to IDLE when all dead */
+  BS_IDLE = 0,  /* fuse counting down; no visible state                */
+  BS_FLASH = 1, /* exactly ONE tick of central '*+' cross flash        */
+  BS_LIVE = 2,  /* particles flying; transitions back to IDLE when all dead */
 } BurstState;
 
 /*
@@ -637,34 +643,34 @@ typedef enum {
  * — no global scheduler.
  */
 typedef struct {
-    float      cx, cy;
-    BurstState state;
-    int        ticks;
-    int        fuse;
-    Particle   parts[PARTICLES];
+  float cx, cy;
+  BurstState state;
+  int ticks;
+  int fuse;
+  Particle parts[PARTICLES];
 } Burst;
 
-/* pick_detonation_centre — random (cx, cy) inside a safe area for the FLASH cross. */
-static void pick_detonation_centre(int cols, int rows, float *cx, float *cy)
-{
-    int safe_cols_extent = (cols - 4) > 1 ? (cols - 4) : 1;
-    int safe_rows_extent = (rows - 2) > 1 ? (rows - 2) : 1;
-    *cx = (float)(2 + rand_int_below(safe_cols_extent));
-    *cy = (float)(1 + rand_int_below(safe_rows_extent));
+/* pick_detonation_centre — random (cx, cy) inside a safe area for the FLASH
+ * cross. */
+static void pick_detonation_centre(int cols, int rows, float *cx, float *cy) {
+  int safe_cols_extent = (cols - 4) > 1 ? (cols - 4) : 1;
+  int safe_rows_extent = (rows - 2) > 1 ? (rows - 2) : 1;
+  *cx = (float)(2 + rand_int_below(safe_cols_extent));
+  *cy = (float)(1 + rand_int_below(safe_rows_extent));
 }
 
-/* compute_emission_angle — (i/total)·2π + small jitter; organic, not mathematical. */
-static float compute_emission_angle(int i, int total_particles)
-{
-    float evenly_spaced = ((float)i / (float)total_particles) * 2.0f * (float)M_PI;
-    float jitter        = rand_unit() * BURST_ANGLE_JITTER;
-    return evenly_spaced + jitter;
+/* compute_emission_angle — (i/total)·2π + small jitter; organic, not
+ * mathematical. */
+static float compute_emission_angle(int i, int total_particles) {
+  float evenly_spaced =
+      ((float)i / (float)total_particles) * 2.0f * (float)M_PI;
+  float jitter = rand_unit() * BURST_ANGLE_JITTER;
+  return evenly_spaced + jitter;
 }
 
 /* compute_emission_speed — uniform in [BURST_SPEED_MIN, BURST_SPEED_MAX). */
-static float compute_emission_speed(void)
-{
-    return rand_range(BURST_SPEED_MIN, BURST_SPEED_MAX);
+static float compute_emission_speed(void) {
+  return rand_range(BURST_SPEED_MIN, BURST_SPEED_MAX);
 }
 
 /*
@@ -674,10 +680,10 @@ static float compute_emission_speed(void)
  *   delay = wave × MAX_DELAY / (waves - 1)
  *   With waves=4, MAX_DELAY=5 → delays 0, 1 (rounded down), 3, 5 ticks.
  */
-static int compute_wave_delay(int wave, int wave_count, int max_delay)
-{
-    if (wave_count <= 1) return 0;
-    return (wave * max_delay) / (wave_count - 1);
+static int compute_wave_delay(int wave, int wave_count, int max_delay) {
+  if (wave_count <= 1)
+    return 0;
+  return (wave * max_delay) / (wave_count - 1);
 }
 
 /*
@@ -688,48 +694,48 @@ static int compute_wave_delay(int wave, int wave_count, int max_delay)
  *     Step 2 — enter FLASH state for exactly one tick.
  *     Step 3 — spawn PARTICLES sparks in a wave-staggered radial fan.
  */
-static void burst_ignite(Burst *b, int cols, int rows)
-{
-    /* Step 1 — detonation point. */
-    pick_detonation_centre(cols, rows, &b->cx, &b->cy);
+static void burst_ignite(Burst *b, int cols, int rows) {
+  /* Step 1 — detonation point. */
+  pick_detonation_centre(cols, rows, &b->cx, &b->cy);
 
-    /* Step 2 — enter FLASH state. */
-    b->state = BS_FLASH;
-    b->ticks = 0;
+  /* Step 2 — enter FLASH state. */
+  b->state = BS_FLASH;
+  b->ticks = 0;
 
-    /* Step 3 — spawn the radial fan. */
-    for (int i = 0; i < PARTICLES; i++) {
-        float angle = compute_emission_angle(i, PARTICLES);
-        float speed = compute_emission_speed();
-        int   wave  = i % BURST_WAVES;
-        int   delay = compute_wave_delay(wave, BURST_WAVES, BURST_MAX_DELAY);
-        particle_spawn(&b->parts[i], b->cx, b->cy, angle, speed, delay, wave);
-    }
+  /* Step 3 — spawn the radial fan. */
+  for (int i = 0; i < PARTICLES; i++) {
+    float angle = compute_emission_angle(i, PARTICLES);
+    float speed = compute_emission_speed();
+    int wave = i % BURST_WAVES;
+    int delay = compute_wave_delay(wave, BURST_WAVES, BURST_MAX_DELAY);
+    particle_spawn(&b->parts[i], b->cx, b->cy, angle, speed, delay, wave);
+  }
 }
 
 /* ===================================================================== */
 /* §8  burst tick — FSM advance + complete + re-arm                       */
 /* ===================================================================== */
 
-/* burst_advance_live_particles — tick every spark; return whether any survived. */
-static bool burst_advance_live_particles(Burst *b, int cols, int rows)
-{
-    bool any_alive = false;
-    for (int i = 0; i < PARTICLES; i++) {
-        particle_tick(&b->parts[i], cols, rows);
-        if (b->parts[i].alive) any_alive = true;
-    }
-    return any_alive;
+/* burst_advance_live_particles — tick every spark; return whether any survived.
+ */
+static bool burst_advance_live_particles(Burst *b, int cols, int rows) {
+  bool any_alive = false;
+  for (int i = 0; i < PARTICLES; i++) {
+    particle_tick(&b->parts[i], cols, rows);
+    if (b->parts[i].alive)
+      any_alive = true;
+  }
+  return any_alive;
 }
 
 /* burst_complete_and_rearm — fire scorch_cb; set new random fuse; → IDLE. */
 static void burst_complete_and_rearm(Burst *b,
                                      void (*scorch_cb)(int, int, void *),
-                                     void *ud)
-{
-    if (scorch_cb) scorch_cb((int)b->cx, (int)b->cy, ud);
-    b->fuse  = FUSE_MIN + rand_int_below(FUSE_RANGE);
-    b->state = BS_IDLE;
+                                     void *ud) {
+  if (scorch_cb)
+    scorch_cb((int)b->cx, (int)b->cy, ud);
+  b->fuse = FUSE_MIN + rand_int_below(FUSE_RANGE);
+  b->state = BS_IDLE;
 }
 
 /*
@@ -759,65 +765,74 @@ static void burst_complete_and_rearm(Burst *b,
  *   clock and never knows other bursts exist.
  */
 static void burst_tick(Burst *b, int cols, int rows,
-                       void (*scorch_cb)(int x, int y, void *ud), void *ud)
-{
-    switch (b->state) {
-    case BS_IDLE:
-        /* Countdown the fuse; ignite at zero. */
-        b->fuse--;
-        if (b->fuse <= 0) burst_ignite(b, cols, rows);
-        break;
+                       void (*scorch_cb)(int x, int y, void *ud), void *ud) {
+  switch (b->state) {
+  case BS_IDLE:
+    /* Countdown the fuse; ignite at zero. */
+    b->fuse--;
+    if (b->fuse <= 0)
+      burst_ignite(b, cols, rows);
+    break;
 
-    case BS_FLASH:
-        /* FLASH lasts exactly one tick. */
-        b->state = BS_LIVE;
-        b->ticks = 0;
-        break;
+  case BS_FLASH:
+    /* FLASH lasts exactly one tick. */
+    b->state = BS_LIVE;
+    b->ticks = 0;
+    break;
 
-    case BS_LIVE: {
-        bool any_alive   = burst_advance_live_particles(b, cols, rows);
-        b->ticks++;
-        bool out_of_time = (b->ticks >= BURST_TICKS);
-        if (!any_alive || out_of_time)
-            burst_complete_and_rearm(b, scorch_cb, ud);
-        break;
-    }
-    }
+  case BS_LIVE: {
+    bool any_alive = burst_advance_live_particles(b, cols, rows);
+    b->ticks++;
+    bool out_of_time = (b->ticks >= BURST_TICKS);
+    if (!any_alive || out_of_time)
+      burst_complete_and_rearm(b, scorch_cb, ud);
+    break;
+  }
+  }
 }
 
 /* ===================================================================== */
 /* §9  burst render — flash cross + fuse overlay + burst_draw             */
 /* ===================================================================== */
 
-/* draw_flash_cross — central '*' + four cardinal '+' in bright yellow + bold. */
-static void draw_flash_cross(WINDOW *w, int cx, int cy, int cols, int rows)
-{
-    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+/* draw_flash_cross — central '*' + four cardinal '+' in bright yellow + bold.
+ */
+static void draw_flash_cross(WINDOW *w, int cx, int cy, int cols, int rows) {
+  if (cx < 0 || cx >= cols || cy < 0 || cy >= rows)
+    return;
 
-    wattron(w, COLOR_PAIR(C_YELLOW) | A_BOLD);
-    mvwaddch(w, cy, cx, '*');
-    if (cx > 0)       mvwaddch(w, cy,     cx - 1, '+');
-    if (cx < cols-1)  mvwaddch(w, cy,     cx + 1, '+');
-    if (cy > 0)       mvwaddch(w, cy - 1, cx,     '+');
-    if (cy < rows-1)  mvwaddch(w, cy + 1, cx,     '+');
-    wattroff(w, COLOR_PAIR(C_YELLOW) | A_BOLD);
+  wattron(w, COLOR_PAIR(C_YELLOW) | A_BOLD);
+  mvwaddch(w, cy, cx, '*');
+  if (cx > 0)
+    mvwaddch(w, cy, cx - 1, '+');
+  if (cx < cols - 1)
+    mvwaddch(w, cy, cx + 1, '+');
+  if (cy > 0)
+    mvwaddch(w, cy - 1, cx, '+');
+  if (cy < rows - 1)
+    mvwaddch(w, cy + 1, cx, '+');
+  wattroff(w, COLOR_PAIR(C_YELLOW) | A_BOLD);
 }
 
-/* draw_fuse_overlay — DBG_FUSE annotation: "f<fuse>" (IDLE) or "t<ticks>" (LIVE). */
-static void draw_fuse_overlay(const Burst *b, WINDOW *w,
-                              int cx, int cy, int cols, int rows)
-{
-    bool centre_in_bounds = (cx >= 0 && cx < cols - 3 && cy >= 0 && cy < rows);
-    if (!centre_in_bounds) return;
+/* draw_fuse_overlay — DBG_FUSE annotation: "f<fuse>" (IDLE) or "t<ticks>"
+ * (LIVE). */
+static void draw_fuse_overlay(const Burst *b, WINDOW *w, int cx, int cy,
+                              int cols, int rows) {
+  bool centre_in_bounds = (cx >= 0 && cx < cols - 3 && cy >= 0 && cy < rows);
+  if (!centre_in_bounds)
+    return;
 
-    char label[8];
-    if      (b->state == BS_IDLE) snprintf(label, sizeof label, "f%d", b->fuse);
-    else if (b->state == BS_LIVE) snprintf(label, sizeof label, "t%d", b->ticks);
-    else return;
+  char label[8];
+  if (b->state == BS_IDLE)
+    snprintf(label, sizeof label, "f%d", b->fuse);
+  else if (b->state == BS_LIVE)
+    snprintf(label, sizeof label, "t%d", b->ticks);
+  else
+    return;
 
-    wattron(w, COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvwaddstr(w, cy, cx, label);
-    wattroff(w, COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  wattron(w, COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvwaddstr(w, cy, cx, label);
+  wattroff(w, COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
 /*
@@ -843,22 +858,22 @@ static void draw_fuse_overlay(const Burst *b, WINDOW *w,
  *   logic stays here.  Adding a new state's visual touches ONLY this
  *   function.
  */
-static void burst_draw(const Burst *b, WINDOW *w, int cols, int rows)
-{
-    int cx = (int)b->cx;
-    int cy = (int)b->cy;
+static void burst_draw(const Burst *b, WINDOW *w, int cols, int rows) {
+  int cx = (int)b->cx;
+  int cy = (int)b->cy;
 
-    if (b->state == BS_FLASH) {
-        draw_flash_cross(w, cx, cy, cols, rows);
-        return;
-    }
+  if (b->state == BS_FLASH) {
+    draw_flash_cross(w, cx, cy, cols, rows);
+    return;
+  }
 
-    if (b->state == BS_LIVE) {
-        for (int i = 0; i < PARTICLES; i++)
-            particle_draw(&b->parts[i], w, cols, rows);
-    }
+  if (b->state == BS_LIVE) {
+    for (int i = 0; i < PARTICLES; i++)
+      particle_draw(&b->parts[i], w, cols, rows);
+  }
 
-    if (g_debug == DBG_FUSE) draw_fuse_overlay(b, w, cx, cy, cols, rows);
+  if (g_debug == DBG_FUSE)
+    draw_fuse_overlay(b, w, cx, cy, cols, rows);
 }
 
 /* ===================================================================== */
@@ -882,84 +897,80 @@ static void burst_draw(const Burst *b, WINDOW *w, int cols, int rows)
  * a memoryless "sky" variant.
  */
 typedef struct {
-    Burst  bursts[BURSTS_MAX];
-    char  *scorch;
-    int    cols;
-    int    rows;
-    int    active_bursts;
+  Burst bursts[BURSTS_MAX];
+  char *scorch;
+  int cols;
+  int rows;
+  int active_bursts;
 } Field;
 
 /* field_scorch_cb — burst_tick LIVE→IDLE callback; stamps '.' at (x, y). */
-static void field_scorch_cb(int x, int y, void *ud)
-{
-    Field *f = (Field *)ud;
-    if (x >= 0 && x < f->cols && y >= 0 && y < f->rows)
-        f->scorch[y * f->cols + x] = '.';
+static void field_scorch_cb(int x, int y, void *ud) {
+  Field *f = (Field *)ud;
+  if (x >= 0 && x < f->cols && y >= 0 && y < f->rows)
+    f->scorch[y * f->cols + x] = '.';
 }
 
-/* field_init — alloc scorch + init all slots; active slots get staggered fuses. */
-static void field_init(Field *f, int cols, int rows, int burst_count)
-{
-    f->cols          = cols;
-    f->rows          = rows;
-    f->active_bursts = burst_count;
-    f->scorch        = calloc((size_t)(cols * rows), sizeof(char));
+/* field_init — alloc scorch + init all slots; active slots get staggered fuses.
+ */
+static void field_init(Field *f, int cols, int rows, int burst_count) {
+  f->cols = cols;
+  f->rows = rows;
+  f->active_bursts = burst_count;
+  f->scorch = calloc((size_t)(cols * rows), sizeof(char));
 
-    /* Active slots get staggered fuses so they don't all fire on frame 0;
-     * inactive slots sit at FUSE_NEVER until '+' wakes them. */
-    int stagger_step = FUSE_MIN + (burst_count > 0 ? FUSE_RANGE / burst_count : 0);
+  /* Active slots get staggered fuses so they don't all fire on frame 0;
+   * inactive slots sit at FUSE_NEVER until '+' wakes them. */
+  int stagger_step =
+      FUSE_MIN + (burst_count > 0 ? FUSE_RANGE / burst_count : 0);
 
-    for (int i = 0; i < BURSTS_MAX; i++) {
-        memset(&f->bursts[i], 0, sizeof(Burst));
-        f->bursts[i].state = BS_IDLE;
-        f->bursts[i].fuse  = (i < burst_count) ? (i * stagger_step)
-                                               : FUSE_NEVER;
-    }
+  for (int i = 0; i < BURSTS_MAX; i++) {
+    memset(&f->bursts[i], 0, sizeof(Burst));
+    f->bursts[i].state = BS_IDLE;
+    f->bursts[i].fuse = (i < burst_count) ? (i * stagger_step) : FUSE_NEVER;
+  }
 }
 
 /* field_free — free scorch grid; zero the struct. */
-static void field_free(Field *f)
-{
-    free(f->scorch);
-    *f = (Field){0};
+static void field_free(Field *f) {
+  free(f->scorch);
+  *f = (Field){0};
 }
 
 /* field_tick — burst_tick over every active slot. */
-static void field_tick(Field *f)
-{
-    for (int i = 0; i < f->active_bursts; i++)
-        burst_tick(&f->bursts[i], f->cols, f->rows, field_scorch_cb, f);
+static void field_tick(Field *f) {
+  for (int i = 0; i < f->active_bursts; i++)
+    burst_tick(&f->bursts[i], f->cols, f->rows, field_scorch_cb, f);
 }
 
 /* field_draw_scorch_layer — paint every non-zero scorch cell in dim orange.
  * Drawn first so live sparks overlay it. */
-static void field_draw_scorch_layer(const Field *f, WINDOW *w)
-{
-    int total_cells = f->cols * f->rows;
+static void field_draw_scorch_layer(const Field *f, WINDOW *w) {
+  int total_cells = f->cols * f->rows;
 
-    wattron(w, COLOR_PAIR(C_ORANGE) | A_DIM);
-    for (int i = 0; i < total_cells; i++) {
-        char scorch_glyph = f->scorch[i];
-        if (!scorch_glyph) continue;
-        int cell_y = i / f->cols;
-        int cell_x = i % f->cols;
-        mvwaddch(w, cell_y, cell_x, (chtype)(unsigned char)scorch_glyph);
-    }
-    wattroff(w, COLOR_PAIR(C_ORANGE) | A_DIM);
+  wattron(w, COLOR_PAIR(C_ORANGE) | A_DIM);
+  for (int i = 0; i < total_cells; i++) {
+    char scorch_glyph = f->scorch[i];
+    if (!scorch_glyph)
+      continue;
+    int cell_y = i / f->cols;
+    int cell_x = i % f->cols;
+    mvwaddch(w, cell_y, cell_x, (chtype)(unsigned char)scorch_glyph);
+  }
+  wattroff(w, COLOR_PAIR(C_ORANGE) | A_DIM);
 }
 
-/* field_draw_active_bursts — burst_draw over every active slot (atop scorch). */
-static void field_draw_active_bursts(const Field *f, WINDOW *w)
-{
-    for (int i = 0; i < f->active_bursts; i++)
-        burst_draw(&f->bursts[i], w, f->cols, f->rows);
+/* field_draw_active_bursts — burst_draw over every active slot (atop scorch).
+ */
+static void field_draw_active_bursts(const Field *f, WINDOW *w) {
+  for (int i = 0; i < f->active_bursts; i++)
+    burst_draw(&f->bursts[i], w, f->cols, f->rows);
 }
 
 /* field_draw — two passes: scorch underneath, active bursts on top. */
-static void field_draw(const Field *f, WINDOW *w)
-{
-    field_draw_scorch_layer (f, w);
-    field_draw_active_bursts(f, w);
+static void field_draw(const Field *f, WINDOW *w) {
+  field_draw_scorch_layer(f, w);
+  field_draw_active_bursts(f, w);
 }
 
 /* ===================================================================== */
@@ -967,81 +978,75 @@ static void field_draw(const Field *f, WINDOW *w)
 /* ===================================================================== */
 
 typedef struct {
-    int cols;
-    int rows;
+  int cols;
+  int rows;
 } Screen;
 
-static void screen_init(Screen *s, int theme)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init(theme);
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s, int theme) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init(theme);
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_free(Screen *s)
-{
-    (void)s;
-    endwin();
+static void screen_free(Screen *s) {
+  (void)s;
+  endwin();
 }
 
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_draw_field(Screen *s, const Field *f)
-{
-    (void)s;     /* s only needed for HUD; field draw uses stdscr directly */
-    erase();
-    field_draw(f, stdscr);
+static void screen_draw_field(Screen *s, const Field *f) {
+  (void)s; /* s only needed for HUD; field draw uses stdscr directly */
+  erase();
+  field_draw(f, stdscr);
 }
 
 /*
  * HUD layout per CLAUDE.md:
- *   row 0        — fps + sim_fps + burst count in bright bold yellow (top-right)
- *   row rows-1   — every interactive key in bright bold cyan (bottom-left)
- * Both pairs are dedicated (PAIR_HUD / PAIR_HINT), never reused by sparks
- * or scorch, so the colour stays stable across all bursts.
+ *   row 0        — fps + sim_fps + burst count in bright bold yellow
+ * (top-right) row rows-1   — every interactive key in bright bold cyan
+ * (bottom-left) Both pairs are dedicated (PAIR_HUD / PAIR_HINT), never reused
+ * by sparks or scorch, so the colour stays stable across all bursts.
  */
 static void screen_draw_hud(Screen *s, double fps, int sim_fps, int bursts,
-                            int theme)
-{
-    char buf[HUD_COLS + 1];
-    /* Debug-mode suffix only shown when non-normal; keeps top-right tidy. */
-    if (g_debug == DBG_NORMAL) {
-        snprintf(buf, sizeof buf, " %5.1f fps  spd:%d  burst:%d  [%s] ",
-                 fps, sim_fps, bursts, k_themes[theme].name);
-    } else {
-        snprintf(buf, sizeof buf,
-                 " %5.1f fps  spd:%d  burst:%d  [%s]  dbg:%s ",
-                 fps, sim_fps, bursts, k_themes[theme].name,
-                 k_debug_names[g_debug]);
-    }
-    int hx = s->cols - (int)strlen(buf);
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+                            int theme) {
+  char buf[HUD_COLS + 1];
+  /* Debug-mode suffix only shown when non-normal; keeps top-right tidy. */
+  if (g_debug == DBG_NORMAL) {
+    snprintf(buf, sizeof buf, " %5.1f fps  spd:%d  burst:%d  [%s] ", fps,
+             sim_fps, bursts, k_themes[theme].name);
+  } else {
+    snprintf(buf, sizeof buf, " %5.1f fps  spd:%d  burst:%d  [%s]  dbg:%s ",
+             fps, sim_fps, bursts, k_themes[theme].name,
+             k_debug_names[g_debug]);
+  }
+  int hx = s->cols - (int)strlen(buf);
+  if (hx < 0)
+    hx = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, hx, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(s->rows - 1, 0,
-             " q/ESC:quit  ]/[:speed  +/-:bursts  r:clear-scorch"
-             "  t/T:theme  d/D:debug ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(s->rows - 1, 0,
+           " q/ESC:quit  ]/[:speed  +/-:bursts  r:clear-scorch"
+           "  t/T:theme  d/D:debug ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void)
-{
-    wnoutrefresh(stdscr);
-    doupdate();
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
@@ -1049,167 +1054,178 @@ static void screen_present(void)
 /* ===================================================================== */
 
 typedef struct {
-    Field                 field;
-    Screen                screen;
-    int                   sim_fps;
-    int                   bursts;
-    int                   theme;      /* index into k_themes[] */
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Field field;
+  Screen screen;
+  int sim_fps;
+  int bursts;
+  int theme; /* index into k_themes[] */
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void app_do_resize(App *app)
-{
-    field_free(&app->field);
-    screen_resize(&app->screen);
-    field_init(&app->field, app->screen.cols, app->screen.rows, app->bursts);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  field_free(&app->field);
+  screen_resize(&app->screen);
+  field_init(&app->field, app->screen.cols, app->screen.rows, app->bursts);
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
-    switch (ch) {
-    case 'q': case 'Q': case 27: return false;
+static bool app_handle_key(App *app, int ch) {
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    case '=': case '+':
-        if (app->bursts < BURSTS_MAX) {
-            int i = app->bursts;
-            memset(&app->field.bursts[i], 0, sizeof(Burst));
-            app->field.bursts[i].state = BS_IDLE;
-            app->field.bursts[i].fuse  = 2 + rand() % FUSE_RANGE;
-            app->bursts++;
-            app->field.active_bursts = app->bursts;
-        }
-        break;
-    case '-':
-        if (app->bursts > BURSTS_MIN) {
-            app->bursts--;
-            app->field.active_bursts = app->bursts;
-        }
-        break;
-
-    case 'r': case 'R':
-        field_free(&app->field);
-        field_init(&app->field, app->screen.cols, app->screen.rows,
-                   app->bursts);
-        break;
-
-    case 't':
-        app->theme = (app->theme + 1) % THEME_COUNT;
-        theme_apply(app->theme);
-        break;
-    case 'T':
-        app->theme = (app->theme + THEME_COUNT - 1) % THEME_COUNT;
-        theme_apply(app->theme);
-        break;
-
-    case 'd':
-        g_debug = (DebugMode)((g_debug + 1) % DBG_COUNT);
-        break;
-    case 'D':
-        g_debug = (DebugMode)((g_debug + DBG_COUNT - 1) % DBG_COUNT);
-        break;
-
-    default: break;
+  case '=':
+  case '+':
+    if (app->bursts < BURSTS_MAX) {
+      int i = app->bursts;
+      memset(&app->field.bursts[i], 0, sizeof(Burst));
+      app->field.bursts[i].state = BS_IDLE;
+      app->field.bursts[i].fuse = 2 + rand() % FUSE_RANGE;
+      app->bursts++;
+      app->field.active_bursts = app->bursts;
     }
-    return true;
+    break;
+  case '-':
+    if (app->bursts > BURSTS_MIN) {
+      app->bursts--;
+      app->field.active_bursts = app->bursts;
+    }
+    break;
+
+  case 'r':
+  case 'R':
+    field_free(&app->field);
+    field_init(&app->field, app->screen.cols, app->screen.rows, app->bursts);
+    break;
+
+  case 't':
+    app->theme = (app->theme + 1) % THEME_COUNT;
+    theme_apply(app->theme);
+    break;
+  case 'T':
+    app->theme = (app->theme + THEME_COUNT - 1) % THEME_COUNT;
+    theme_apply(app->theme);
+    break;
+
+  case 'd':
+    g_debug = (DebugMode)((g_debug + 1) % DBG_COUNT);
+    break;
+  case 'D':
+    g_debug = (DebugMode)((g_debug + DBG_COUNT - 1) % DBG_COUNT);
+    break;
+
+  default:
+    break;
+  }
+  return true;
 }
 
 /* ===================================================================== */
 /* §13  main — fixed-step loop                                            */
 /* ===================================================================== */
 
-int main(void)
-{
-    srand((unsigned int)clock_ns());
+int main(void) {
+  srand((unsigned int)clock_ns());
 
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
-    app->bursts  = BURSTS_DEFAULT;
-    app->theme   = 0;       /* start on "rainbow" */
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
+  app->bursts = BURSTS_DEFAULT;
+  app->theme = 0; /* start on "rainbow" */
 
-    screen_init(&app->screen, app->theme);
-    field_init(&app->field, app->screen.cols, app->screen.rows, app->bursts);
+  screen_init(&app->screen, app->theme);
+  field_init(&app->field, app->screen.cols, app->screen.rows, app->bursts);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        /* ── resize ──────────────────────────────────────────────── */
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
-
-        /* ── dt ──────────────────────────────────────────────────── */
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        /* ── sim accumulator ─────────────────────────────────────── */
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            field_tick(&app->field);
-            sim_accum -= tick_ns;
-        }
-        float alpha = (float)sim_accum / (float)tick_ns;
-        (void)alpha;
-
-        /* ── HUD counter ─────────────────────────────────────────── */
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        /* ── render + HUD ────────────────────────────────────────── */
-        screen_draw_field(&app->screen, &app->field);
-        screen_draw_hud(&app->screen, fps_display,
-                         app->sim_fps, app->bursts, app->theme);
-        screen_present();
-
-        /* ── input ───────────────────────────────────────────────── */
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    /* ── resize ──────────────────────────────────────────────── */
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns();
+      sim_accum = 0;
     }
 
-    field_free(&app->field);
-    screen_free(&app->screen);
-    return 0;
+    /* ── dt ──────────────────────────────────────────────────── */
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > 100 * NS_PER_MS)
+      dt = 100 * NS_PER_MS;
+
+    /* ── sim accumulator ─────────────────────────────────────── */
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      field_tick(&app->field);
+      sim_accum -= tick_ns;
+    }
+    float alpha = (float)sim_accum / (float)tick_ns;
+    (void)alpha;
+
+    /* ── HUD counter ─────────────────────────────────────────── */
+    frame_count++;
+    fps_accum += dt;
+    if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display =
+          (double)frame_count / ((double)fps_accum / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accum = 0;
+    }
+
+    /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
+    /* ── render + HUD ────────────────────────────────────────── */
+    screen_draw_field(&app->screen, &app->field);
+    screen_draw_hud(&app->screen, fps_display, app->sim_fps, app->bursts,
+                    app->theme);
+    screen_present();
+
+    /* ── input ───────────────────────────────────────────────── */
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  field_free(&app->field);
+  screen_free(&app->screen);
+  return 0;
 }

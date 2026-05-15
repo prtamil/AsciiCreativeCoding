@@ -192,10 +192,8 @@
  *                       ●                                      ▼
  *                                                       CONTRACT step
  *                                                       p ← p · scale
- *                                                            − offset · (scale−1)
- *               result ●                                           │
- *                                                                  ▼
- *                                                           [next iter]
+ *                                                            − offset ·
+ * (scale−1) result ●                                           │ ▼ [next iter]
  *
  * Repeat ~10 times → attractor leaf.  The DE at the leaf is just
  * sphere_de or box_de (depending on preset) divided by scale^iters.
@@ -236,7 +234,8 @@
  *
  * Contraction (toward fixed point `offset`, multiplier `scale`):
  *      p ← p · scale  −  offset · (scale − 1)
- *      verify: offset is the fixed point: offset·scale − offset·(scale−1) = offset
+ *      verify: offset is the fixed point: offset·scale − offset·(scale−1) =
+ * offset
  *
  * KIFS distance estimator (after iters folds + contracts):
  *      DE(p) = primitive_de(p_final) · scale^(−iters)
@@ -497,61 +496,61 @@
 
 /* §1.1 frame rate + UI layout. */
 enum {
-    SIM_FPS_MIN      =  10,
-    SIM_FPS_DEFAULT  =  60,
-    SIM_FPS_MAX      = 120,
-    SIM_FPS_STEP     =  10,
-    FPS_UPDATE_MS    = 500,
-    HUD_ROWS         =   2,         /* row 0 status + last row hint */
-    ITERS_MIN        =   3,
-    ITERS_MAX        =  18,
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 60,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
+  FPS_UPDATE_MS = 500,
+  HUD_ROWS = 2, /* row 0 status + last row hint */
+  ITERS_MIN = 3,
+  ITERS_MAX = 18,
 };
 
 /* §1.2 colour-pair IDs. */
 enum {
-    PAIR_HUD         =  1,          /* yellow status row 0          */
-    PAIR_HINT        =  2,          /* cyan key-hint last row       */
-    PAIR_TRAP_BASE   =  3,          /* +0..+7 — orbit-trap ramp     */
-    PAIR_BG          = 11,          /* fractal "miss" background    */
+  PAIR_HUD = 1,       /* yellow status row 0          */
+  PAIR_HINT = 2,      /* cyan key-hint last row       */
+  PAIR_TRAP_BASE = 3, /* +0..+7 — orbit-trap ramp     */
+  PAIR_BG = 11,       /* fractal "miss" background    */
 };
 
 /* §1.3 time helpers. */
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(f)      (NS_PER_SEC / (f))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
 
 /* §1.4 camera. */
-#define CAM_DIST_DEFAULT  3.6f
-#define CAM_DIST_MIN      1.6f      /* don't enter the fractal hull */
-#define CAM_DIST_MAX     12.0f
-#define CAM_DIST_STEP     0.20f
-#define FOV_DEG          55.0f
-#define CELL_ASPECT       2.0f      /* terminal cell h / w           */
-#define ORBIT_YAW_RATE    0.35f     /* rad / sec — auto orbit         */
-#define FOLD_ROT_RATE     0.18f     /* rad / sec — KIFS_ROT animation */
-#define MANUAL_YAW_STEP   0.12f
+#define CAM_DIST_DEFAULT 3.6f
+#define CAM_DIST_MIN 1.6f /* don't enter the fractal hull */
+#define CAM_DIST_MAX 12.0f
+#define CAM_DIST_STEP 0.20f
+#define FOV_DEG 55.0f
+#define CELL_ASPECT 2.0f     /* terminal cell h / w           */
+#define ORBIT_YAW_RATE 0.35f /* rad / sec — auto orbit         */
+#define FOLD_ROT_RATE 0.18f  /* rad / sec — KIFS_ROT animation */
+#define MANUAL_YAW_STEP 0.12f
 #define MANUAL_PITCH_STEP 0.08f
-#define MANUAL_PITCH_MAX  1.20f     /* clamp short of the poles      */
+#define MANUAL_PITCH_MAX 1.20f /* clamp short of the poles      */
 
 /* §1.5 sphere-trace tunables. */
-#define MAX_STEPS         70
-#define HIT_EPS           1.5e-3f
-#define MAX_T            14.0f
-#define NORMAL_EPS        6.0e-3f   /* ≈ 4·HIT_EPS empirically        */
+#define MAX_STEPS 70
+#define HIT_EPS 1.5e-3f
+#define MAX_T 14.0f
+#define NORMAL_EPS 6.0e-3f /* ≈ 4·HIT_EPS empirically        */
 
 /* §1.6 lighting + shading.
  *      lum = AMBIENT_LUM + DIFFUSE_LUM · max(0, N·L)
  *      ao  = max(AO_FLOOR, 1 − steps / MAX_STEPS)
  */
-#define AMBIENT_LUM       0.18f
-#define DIFFUSE_LUM       0.82f
-#define AO_FLOOR          0.60f
+#define AMBIENT_LUM 0.18f
+#define DIFFUSE_LUM 0.82f
+#define AO_FLOOR 0.60f
 
 /* §1.7 quantisation. */
-#define LUMA_SLOTS         8
-#define LUMA_SLOT_FLT      7.999f       /* (LUMA_SLOTS - 0.001) */
-#define TRAP_NORM_RANGE    1.4f         /* empirical max trap value */
-#define TRAP_NORM_INV      (1.0f / TRAP_NORM_RANGE)
+#define LUMA_SLOTS 8
+#define LUMA_SLOT_FLT 7.999f /* (LUMA_SLOTS - 0.001) */
+#define TRAP_NORM_RANGE 1.4f /* empirical max trap value */
+#define TRAP_NORM_INV (1.0f / TRAP_NORM_RANGE)
 
 /* §1.8 fractal preset table.
  *
@@ -560,79 +559,80 @@ enum {
  * primitive DE to evaluate after the folds.
  */
 typedef enum {
-    PRESET_TETRA    = 0,
-    PRESET_MENGER   = 1,
-    PRESET_KIFS_ROT = 2,
-    N_PRESETS       = 3,
+  PRESET_TETRA = 0,
+  PRESET_MENGER = 1,
+  PRESET_KIFS_ROT = 2,
+  N_PRESETS = 3,
 } Preset;
 
 typedef struct {
-    const char *name;
-    int   default_iters;
-    float scale;
-    float offset_x, offset_y, offset_z;
-    int   primitive;            /* 0 = sphere, 1 = box */
-    float bound_radius;         /* hint for camera distance */
+  const char *name;
+  int default_iters;
+  float scale;
+  float offset_x, offset_y, offset_z;
+  int primitive;      /* 0 = sphere, 1 = box */
+  float bound_radius; /* hint for camera distance */
 } PresetParams;
 
 static const PresetParams PRESETS[N_PRESETS] = {
     /*   name        iters scale  offx offy offz  prim  bound */
-    /* TETRA   */  { "TETRA   ", 12, 2.00f, 1.00f, 1.00f, 1.00f,  0,  1.8f },
-    /* MENGER  */  { "MENGER  ",  7, 3.00f, 1.00f, 1.00f, 1.00f,  1,  1.8f },
-    /* KIFS_ROT*/  { "KIFS_ROT", 10, 2.05f, 0.85f, 1.10f, 0.85f,  0,  1.8f },
+    /* TETRA   */ {"TETRA   ", 12, 2.00f, 1.00f, 1.00f, 1.00f, 0, 1.8f},
+    /* MENGER  */ {"MENGER  ", 7, 3.00f, 1.00f, 1.00f, 1.00f, 1, 1.8f},
+    /* KIFS_ROT*/ {"KIFS_ROT", 10, 2.05f, 0.85f, 1.10f, 0.85f, 0, 1.8f},
 };
 
 /* §1.9 themes — 8-step orbit-trap ramp.  Per CLAUDE.md, every entry
  * sits in the bright half of the 256-colour cube. */
 typedef struct {
-    const char *name;
-    short       trap[LUMA_SLOTS];
+  const char *name;
+  short trap[LUMA_SLOTS];
 } Theme;
 
 #define N_THEMES 6
 
 static const Theme THEMES[N_THEMES] = {
-    { "GOLD   ", { 130, 137, 173, 215, 222, 229, 230, 231 } },
-    { "ICE    ", {  24,  31,  38,  45,  87, 153, 195, 231 } },
-    { "COBALT ", {  25,  26,  27,  33,  39,  45,  51, 159 } },
-    { "COPPER ", { 130, 166, 173, 209, 215, 222, 229, 230 } },
-    { "ALIEN  ", {  53,  91, 134, 165, 207, 213, 219, 159 } },
-    { "MONO   ", { 244, 246, 248, 250, 252, 253, 254, 255 } },
+    {"GOLD   ", {130, 137, 173, 215, 222, 229, 230, 231}},
+    {"ICE    ", {24, 31, 38, 45, 87, 153, 195, 231}},
+    {"COBALT ", {25, 26, 27, 33, 39, 45, 51, 159}},
+    {"COPPER ", {130, 166, 173, 209, 215, 222, 229, 230}},
+    {"ALIEN  ", {53, 91, 134, 165, 207, 213, 219, 159}},
+    {"MONO   ", {244, 246, 248, 250, 252, 253, 254, 255}},
 };
 
 /* §1.10 luminance ramp — dim → bright. */
-static const char LUMA_GLYPHS[LUMA_SLOTS] = {
-    '`', '.', ',', ':', '-', '+', '*', '#'
-};
+static const char LUMA_GLYPHS[LUMA_SLOTS] = {'`', '.', ',', ':',
+                                             '-', '+', '*', '#'};
 
 /* §1.11 debug overlays — d / D cycles between them. */
 typedef enum {
-    DEBUG_NORMAL    = 0,    /* full lit fractal (production view)        */
-    DEBUG_TRAP      = 1,    /* orbit trap value as glyph + colour        */
-    DEBUG_STEPS     = 2,    /* march step count → AO signal source       */
-    DEBUG_NORMALS   = 3,    /* surface normal direction → hue band       */
-    DEBUG_MODE_COUNT = 4,
+  DEBUG_NORMAL = 0,  /* full lit fractal (production view)        */
+  DEBUG_TRAP = 1,    /* orbit trap value as glyph + colour        */
+  DEBUG_STEPS = 2,   /* march step count → AO signal source       */
+  DEBUG_NORMALS = 3, /* surface normal direction → hue band       */
+  DEBUG_MODE_COUNT = 4,
 } DebugMode;
 
 static const char *DEBUG_MODE_NAMES[DEBUG_MODE_COUNT] = {
-    "NORMAL ", "TRAP   ", "STEPS  ", "NORMALS",
+    "NORMAL ",
+    "TRAP   ",
+    "STEPS  ",
+    "NORMALS",
 };
 
 /* ── §2 clock — monotonic timer + sleep ──────────────────────────────── */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = { .tv_sec  = (time_t)(ns / NS_PER_SEC),
-                            .tv_nsec = (long)  (ns % NS_PER_SEC) };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {.tv_sec = (time_t)(ns / NS_PER_SEC),
+                         .tv_nsec = (long)(ns % NS_PER_SEC)};
+  nanosleep(&req, NULL);
 }
 
 /* ── §3 color — orbit-trap palette + HUD/hint pairs ──────────────────── *
@@ -642,64 +642,69 @@ static void clock_sleep_ns(int64_t ns)
  * PAIR_TRAP_BASE+slot to paint a cell.
  */
 
-static void theme_apply(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &THEMES[idx];
-        for (int i = 0; i < LUMA_SLOTS; i++)
-            init_pair((short)(PAIR_TRAP_BASE + i), t->trap[i], -1);
-    } else {
-        static const short FB[LUMA_SLOTS] = {
-            COLOR_BLUE,    COLOR_MAGENTA, COLOR_CYAN,    COLOR_GREEN,
-            COLOR_YELLOW,  COLOR_YELLOW,  COLOR_WHITE,   COLOR_WHITE,
-        };
-        for (int i = 0; i < LUMA_SLOTS; i++)
-            init_pair((short)(PAIR_TRAP_BASE + i), FB[i], -1);
-    }
+static void theme_apply(int idx) {
+  if (idx < 0 || idx >= N_THEMES)
+    idx = 0;
+  if (COLORS >= 256) {
+    const Theme *t = &THEMES[idx];
+    for (int i = 0; i < LUMA_SLOTS; i++)
+      init_pair((short)(PAIR_TRAP_BASE + i), t->trap[i], -1);
+  } else {
+    static const short FB[LUMA_SLOTS] = {
+        COLOR_BLUE,   COLOR_MAGENTA, COLOR_CYAN,  COLOR_GREEN,
+        COLOR_YELLOW, COLOR_YELLOW,  COLOR_WHITE, COLOR_WHITE,
+    };
+    for (int i = 0; i < LUMA_SLOTS; i++)
+      init_pair((short)(PAIR_TRAP_BASE + i), FB[i], -1);
+  }
 }
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
-        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
-        init_pair(PAIR_BG,   242, -1);
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-        init_pair(PAIR_BG,   COLOR_BLACK,  -1);
-    }
-    theme_apply(0);
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+    init_pair(PAIR_BG, 242, -1);
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+    init_pair(PAIR_BG, COLOR_BLACK, -1);
+  }
+  theme_apply(0);
 }
 
 /* ── §4 vec3 — value-type 3-D math ───────────────────────────────────── */
 
-typedef struct { float x, y, z; } V3;
+typedef struct {
+  float x, y, z;
+} V3;
 
-static inline V3    v3   (float x, float y, float z) { return (V3){x, y, z}; }
-static inline V3    v3add(V3 a, V3 b)                { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
-static inline V3    v3sub(V3 a, V3 b)                { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
-static inline V3    v3scale(float s, V3 a)           { return v3(s*a.x, s*a.y, s*a.z); }
-static inline float v3dot(V3 a, V3 b)                { return a.x*b.x + a.y*b.y + a.z*b.z; }
-static inline V3    v3cross(V3 a, V3 b)
-{
-    return v3(a.y*b.z - a.z*b.y,
-              a.z*b.x - a.x*b.z,
-              a.x*b.y - a.y*b.x);
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
+static inline V3 v3add(V3 a, V3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline V3 v3sub(V3 a, V3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline V3 v3scale(float s, V3 a) {
+  return v3(s * a.x, s * a.y, s * a.z);
+}
+static inline float v3dot(V3 a, V3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline V3 v3cross(V3 a, V3 b) {
+  return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x);
 }
 static inline float v3len(V3 a) { return sqrtf(v3dot(a, a)); }
-static inline V3    v3norm(V3 a)
-{
-    float L = v3len(a);
-    return (L > 1e-12f) ? v3scale(1.0f / L, a) : v3(0, 1, 0);
+static inline V3 v3norm(V3 a) {
+  float L = v3len(a);
+  return (L > 1e-12f) ? v3scale(1.0f / L, a) : v3(0, 1, 0);
 }
 
-static inline float clampf(float x, float lo, float hi)
-{
-    return x < lo ? lo : (x > hi ? hi : x);
+static inline float clampf(float x, float lo, float hi) {
+  return x < lo ? lo : (x > hi ? hi : x);
 }
 
 /* ── §5 KifsParams — per-frame view of all DE parameters ─────────────── *
@@ -710,14 +715,14 @@ static inline float clampf(float x, float lo, float hi)
  * Scene state; every DE-related helper takes a `const KifsParams *`.
  */
 typedef struct {
-    int   preset;          /* TETRA / MENGER / KIFS_ROT */
-    int   iters;           /* fold iterations (3..18)   */
-    float scale;           /* contraction multiplier    */
-    float sm1;             /* scale − 1 (cached)        */
-    float offx, offy, offz;          /* contraction fixed point   */
-    float fold_rot_c;      /* cos(fold_rot) — KIFS_ROT only */
-    float fold_rot_s;      /* sin(fold_rot) — KIFS_ROT only */
-    float inv_scale_pow;   /* scale^(−iters), cached    */
+  int preset;             /* TETRA / MENGER / KIFS_ROT */
+  int iters;              /* fold iterations (3..18)   */
+  float scale;            /* contraction multiplier    */
+  float sm1;              /* scale − 1 (cached)        */
+  float offx, offy, offz; /* contraction fixed point   */
+  float fold_rot_c;       /* cos(fold_rot) — KIFS_ROT only */
+  float fold_rot_s;       /* sin(fold_rot) — KIFS_ROT only */
+  float inv_scale_pow;    /* scale^(−iters), cached    */
 } KifsParams;
 
 /* ── §6 fold helpers — three preset-specific reflections ─────────────── *
@@ -727,30 +732,60 @@ typedef struct {
  */
 
 /* TETRA: three plane-fold reflections (see T4). */
-static inline void fold_iter_tetra(V3 *p)
-{
-    if (p->x + p->y < 0) { float t = -p->y; p->y = -p->x; p->x = t; }
-    if (p->x + p->z < 0) { float t = -p->z; p->z = -p->x; p->x = t; }
-    if (p->y + p->z < 0) { float t = -p->z; p->z = -p->y; p->y = t; }
+static inline void fold_iter_tetra(V3 *p) {
+  if (p->x + p->y < 0) {
+    float t = -p->y;
+    p->y = -p->x;
+    p->x = t;
+  }
+  if (p->x + p->z < 0) {
+    float t = -p->z;
+    p->z = -p->x;
+    p->x = t;
+  }
+  if (p->y + p->z < 0) {
+    float t = -p->z;
+    p->z = -p->y;
+    p->y = t;
+  }
 }
 
 /* MENGER: abs-fold + descending sort (see T5). */
-static inline void fold_iter_menger(V3 *p)
-{
-    p->x = fabsf(p->x); p->y = fabsf(p->y); p->z = fabsf(p->z);
-    if (p->x < p->y) { float t = p->x; p->x = p->y; p->y = t; }
-    if (p->x < p->z) { float t = p->x; p->x = p->z; p->z = t; }
-    if (p->y < p->z) { float t = p->y; p->y = p->z; p->z = t; }
+static inline void fold_iter_menger(V3 *p) {
+  p->x = fabsf(p->x);
+  p->y = fabsf(p->y);
+  p->z = fabsf(p->z);
+  if (p->x < p->y) {
+    float t = p->x;
+    p->x = p->y;
+    p->y = t;
+  }
+  if (p->x < p->z) {
+    float t = p->x;
+    p->x = p->z;
+    p->z = t;
+  }
+  if (p->y < p->z) {
+    float t = p->y;
+    p->y = p->z;
+    p->z = t;
+  }
 }
 
 /* KIFS_ROT: Y-rotation + abs-fold + ONE swap (see T6). */
-static inline void fold_iter_rot(V3 *p, float c, float s)
-{
-    float xr = p->x * c - p->z * s;
-    float zr = p->x * s + p->z * c;
-    p->x = xr; p->z = zr;
-    p->x = fabsf(p->x); p->y = fabsf(p->y); p->z = fabsf(p->z);
-    if (p->x < p->y) { float t = p->x; p->x = p->y; p->y = t; }
+static inline void fold_iter_rot(V3 *p, float c, float s) {
+  float xr = p->x * c - p->z * s;
+  float zr = p->x * s + p->z * c;
+  p->x = xr;
+  p->z = zr;
+  p->x = fabsf(p->x);
+  p->y = fabsf(p->y);
+  p->z = fabsf(p->z);
+  if (p->x < p->y) {
+    float t = p->x;
+    p->x = p->y;
+    p->y = t;
+  }
 }
 
 /* ── §7 fold dispatch — pick the right helper by preset ──────────────── *
@@ -759,13 +794,18 @@ static inline void fold_iter_rot(V3 *p, float c, float s)
  * a value that's constant within a frame.  Outside the hot loop
  * the dispatch cost is invisible.
  */
-static inline void fold_iter(V3 *p, const KifsParams *kp)
-{
-    switch (kp->preset) {
-    case PRESET_TETRA:    fold_iter_tetra (p);                                 break;
-    case PRESET_MENGER:   fold_iter_menger(p);                                 break;
-    case PRESET_KIFS_ROT: fold_iter_rot   (p, kp->fold_rot_c, kp->fold_rot_s); break;
-    }
+static inline void fold_iter(V3 *p, const KifsParams *kp) {
+  switch (kp->preset) {
+  case PRESET_TETRA:
+    fold_iter_tetra(p);
+    break;
+  case PRESET_MENGER:
+    fold_iter_menger(p);
+    break;
+  case PRESET_KIFS_ROT:
+    fold_iter_rot(p, kp->fold_rot_c, kp->fold_rot_s);
+    break;
+  }
 }
 
 /* ── §8 contract — the contractive map after each fold ───────────────── *
@@ -774,11 +814,10 @@ static inline void fold_iter(V3 *p, const KifsParams *kp)
  *      p ← p · scale  −  offset · (scale − 1)
  * Fixed point: offset.  Verify: offset · scale − offset · (scale−1) = offset.
  */
-static inline void contract_toward_offset(V3 *p, const KifsParams *kp)
-{
-    p->x = p->x * kp->scale - kp->offx * kp->sm1;
-    p->y = p->y * kp->scale - kp->offy * kp->sm1;
-    p->z = p->z * kp->scale - kp->offz * kp->sm1;
+static inline void contract_toward_offset(V3 *p, const KifsParams *kp) {
+  p->x = p->x * kp->scale - kp->offx * kp->sm1;
+  p->y = p->y * kp->scale - kp->offy * kp->sm1;
+  p->z = p->z * kp->scale - kp->offz * kp->sm1;
 }
 
 /* ── §9 menger z-foldback — MENGER-only post-step ────────────────────── *
@@ -789,10 +828,9 @@ static inline void contract_toward_offset(V3 *p, const KifsParams *kp)
  * this line for the Menger preset; without it the central column
  * reads the wrong distance and the recursion ladder visibly breaks.
  */
-static inline void menger_z_foldback(V3 *p, const KifsParams *kp)
-{
-    if (p->z < -0.5f * kp->offz * kp->sm1)
-        p->z += kp->offz * kp->sm1;
+static inline void menger_z_foldback(V3 *p, const KifsParams *kp) {
+  if (p->z < -0.5f * kp->offz * kp->sm1)
+    p->z += kp->offz * kp->sm1;
 }
 
 /* ── §10 orbit trap — track running min |p|² during folding ──────────── *
@@ -800,10 +838,10 @@ static inline void menger_z_foldback(V3 *p, const KifsParams *kp)
  * Tutorial T8 explained the idea.  We track squared magnitude (skip
  * sqrt per iteration) and sqrt once at the end.
  */
-static inline void track_orbit_trap(V3 p, float *trap_sq)
-{
-    float r2 = p.x*p.x + p.y*p.y + p.z*p.z;
-    if (r2 < *trap_sq) *trap_sq = r2;
+static inline void track_orbit_trap(V3 p, float *trap_sq) {
+  float r2 = p.x * p.x + p.y * p.y + p.z * p.z;
+  if (r2 < *trap_sq)
+    *trap_sq = r2;
 }
 
 /* ── §11 primitive DEs — sphere + box (Quílez form) ──────────────────── *
@@ -818,21 +856,19 @@ static inline void track_orbit_trap(V3 p, float *trap_sq)
 static inline float sphere_de(V3 p) { return v3len(p) - 1.0f; }
 
 /* box of half-side 1 centred at origin — Quílez exact box DE */
-static inline float box_de(V3 p)
-{
-    float qx = fabsf(p.x) - 1.0f;
-    float qy = fabsf(p.y) - 1.0f;
-    float qz = fabsf(p.z) - 1.0f;
-    float dx = fmaxf(qx, 0), dy = fmaxf(qy, 0), dz = fmaxf(qz, 0);
-    float outside = sqrtf(dx*dx + dy*dy + dz*dz);
-    float inside  = fminf(fmaxf(qx, fmaxf(qy, qz)), 0.0f);
-    return outside + inside;
+static inline float box_de(V3 p) {
+  float qx = fabsf(p.x) - 1.0f;
+  float qy = fabsf(p.y) - 1.0f;
+  float qz = fabsf(p.z) - 1.0f;
+  float dx = fmaxf(qx, 0), dy = fmaxf(qy, 0), dz = fmaxf(qz, 0);
+  float outside = sqrtf(dx * dx + dy * dy + dz * dz);
+  float inside = fminf(fmaxf(qx, fmaxf(qy, qz)), 0.0f);
+  return outside + inside;
 }
 
 /* dispatch: only MENGER uses the box; the others use sphere. */
-static inline float primitive_de(int preset, V3 p)
-{
-    return (preset == PRESET_MENGER) ? box_de(p) : sphere_de(p);
+static inline float primitive_de(int preset, V3 p) {
+  return (preset == PRESET_MENGER) ? box_de(p) : sphere_de(p);
 }
 
 /* ── §12 DE orchestrator — the kifs_de loop body ─────────────────────── *
@@ -845,26 +881,25 @@ static inline float primitive_de(int preset, V3 p)
  * trap_out is optional — pass NULL when marching (don't need the
  * trap during the trace, only on hit).
  */
-static float kifs_de_with_trap(V3 p, const KifsParams *kp, float *trap_out)
-{
-    float trap_sq = 1e10f;
+static float kifs_de_with_trap(V3 p, const KifsParams *kp, float *trap_out) {
+  float trap_sq = 1e10f;
 
-    for (int i = 0; i < kp->iters; i++) {
-        fold_iter              (&p, kp);
-        contract_toward_offset (&p, kp);
-        if (kp->preset == PRESET_MENGER)
-            menger_z_foldback  (&p, kp);
-        track_orbit_trap       (p, &trap_sq);
-    }
+  for (int i = 0; i < kp->iters; i++) {
+    fold_iter(&p, kp);
+    contract_toward_offset(&p, kp);
+    if (kp->preset == PRESET_MENGER)
+      menger_z_foldback(&p, kp);
+    track_orbit_trap(p, &trap_sq);
+  }
 
-    if (trap_out) *trap_out = sqrtf(trap_sq);
-    return primitive_de(kp->preset, p) * kp->inv_scale_pow;
+  if (trap_out)
+    *trap_out = sqrtf(trap_sq);
+  return primitive_de(kp->preset, p) * kp->inv_scale_pow;
 }
 
 /* thin wrapper for the common case (no trap output) */
-static inline float kifs_de(V3 p, const KifsParams *kp)
-{
-    return kifs_de_with_trap(p, kp, NULL);
+static inline float kifs_de(V3 p, const KifsParams *kp) {
+  return kifs_de_with_trap(p, kp, NULL);
 }
 
 /* ── §13 normal — central-difference gradient of DE ──────────────────── *
@@ -877,16 +912,15 @@ static inline float kifs_de(V3 p, const KifsParams *kp)
  * — visible as skewed shading on highly-folded surfaces.  6 is
  * worth it.
  */
-static V3 kifs_normal(V3 p, const KifsParams *kp)
-{
-    float e = NORMAL_EPS;
-    float dx = kifs_de(v3(p.x + e, p.y, p.z), kp)
-             - kifs_de(v3(p.x - e, p.y, p.z), kp);
-    float dy = kifs_de(v3(p.x, p.y + e, p.z), kp)
-             - kifs_de(v3(p.x, p.y - e, p.z), kp);
-    float dz = kifs_de(v3(p.x, p.y, p.z + e), kp)
-             - kifs_de(v3(p.x, p.y, p.z - e), kp);
-    return v3norm(v3(dx, dy, dz));
+static V3 kifs_normal(V3 p, const KifsParams *kp) {
+  float e = NORMAL_EPS;
+  float dx =
+      kifs_de(v3(p.x + e, p.y, p.z), kp) - kifs_de(v3(p.x - e, p.y, p.z), kp);
+  float dy =
+      kifs_de(v3(p.x, p.y + e, p.z), kp) - kifs_de(v3(p.x, p.y - e, p.z), kp);
+  float dz =
+      kifs_de(v3(p.x, p.y, p.z + e), kp) - kifs_de(v3(p.x, p.y, p.z - e), kp);
+  return v3norm(v3(dx, dy, dz));
 }
 
 /* ── §14 sphere trace — Hart 1996 march along a ray ──────────────────── *
@@ -899,38 +933,38 @@ static V3 kifs_normal(V3 p, const KifsParams *kp)
  */
 
 typedef struct {
-    bool  hit;
-    V3    p;
-    V3    normal;
-    float trap;        /* orbit trap, normalised to [0, 1] */
-    int   steps;
+  bool hit;
+  V3 p;
+  V3 normal;
+  float trap; /* orbit trap, normalised to [0, 1] */
+  int steps;
 } Hit;
 
-static Hit sphere_trace(V3 origin, V3 dir, const KifsParams *kp)
-{
-    Hit out = { false, {0,0,0}, {0,1,0}, 0.0f, 0 };
-    float t = 0.0f;
+static Hit sphere_trace(V3 origin, V3 dir, const KifsParams *kp) {
+  Hit out = {false, {0, 0, 0}, {0, 1, 0}, 0.0f, 0};
+  float t = 0.0f;
 
-    for (int i = 0; i < MAX_STEPS; i++) {
-        V3    p = v3add(origin, v3scale(t, dir));
-        float d = kifs_de(p, kp);
+  for (int i = 0; i < MAX_STEPS; i++) {
+    V3 p = v3add(origin, v3scale(t, dir));
+    float d = kifs_de(p, kp);
 
-        if (d < HIT_EPS) {
-            float trap = 0.0f;
-            (void)kifs_de_with_trap(p, kp, &trap);
+    if (d < HIT_EPS) {
+      float trap = 0.0f;
+      (void)kifs_de_with_trap(p, kp, &trap);
 
-            out.hit    = true;
-            out.p      = p;
-            out.steps  = i;
-            out.trap   = clampf(trap * TRAP_NORM_INV, 0.0f, 1.0f);
-            out.normal = kifs_normal(p, kp);
-            return out;
-        }
-
-        if (t > MAX_T) break;
-        t += d;
+      out.hit = true;
+      out.p = p;
+      out.steps = i;
+      out.trap = clampf(trap * TRAP_NORM_INV, 0.0f, 1.0f);
+      out.normal = kifs_normal(p, kp);
+      return out;
     }
-    return out;
+
+    if (t > MAX_T)
+      break;
+    t += d;
+  }
+  return out;
 }
 
 /* Forward declaration — Scene's full definition lives in §18, but
@@ -958,25 +992,23 @@ typedef struct Scene Scene;
  */
 
 typedef struct {
-    V3    origin;
-    V3    fwd, right, up;
-    float fov_t;
-    float phys_aspect;
+  V3 origin;
+  V3 fwd, right, up;
+  float fov_t;
+  float phys_aspect;
 } Camera;
 
 /* camera_basis is forward-declared because Scene's full definition
  * (and hence camera_basis's ability to read from it) lives in §18.
  * The actual definition is at the bottom of §18. */
-static Camera camera_basis(const Scene *s, int rows_eff)
-;
+static Camera camera_basis(const Scene *s, int rows_eff);
 
-static V3 pixel_ray(int col, int row, int cols, int rows_eff, const Camera *c)
-{
-    float u =  ((float)col + 0.5f) / (float)cols     * 2.0f - 1.0f;
-    float v = -(((float)row + 0.5f) / (float)rows_eff * 2.0f - 1.0f);
-    V3 sx = v3scale(u * c->fov_t,                  c->right);
-    V3 sy = v3scale(v * c->fov_t * c->phys_aspect, c->up);
-    return v3norm(v3add(c->fwd, v3add(sx, sy)));
+static V3 pixel_ray(int col, int row, int cols, int rows_eff, const Camera *c) {
+  float u = ((float)col + 0.5f) / (float)cols * 2.0f - 1.0f;
+  float v = -(((float)row + 0.5f) / (float)rows_eff * 2.0f - 1.0f);
+  V3 sx = v3scale(u * c->fov_t, c->right);
+  V3 sy = v3scale(v * c->fov_t * c->phys_aspect, c->up);
+  return v3norm(v3add(c->fwd, v3add(sx, sy)));
 }
 
 /* ── §16 lighting — Lambert + step-count AO ──────────────────────────── *
@@ -991,176 +1023,179 @@ static V3 pixel_ray(int col, int row, int cols, int rows_eff, const Camera *c)
  * darker crevices.  Geometrically nonsense but visually convincing
  * and free.
  */
-static float lambert_with_ao(V3 normal, int steps, V3 light)
-{
-    float ndl = v3dot(normal, light);
-    if (ndl < 0.0f) ndl = 0.0f;
-    float lum = AMBIENT_LUM + DIFFUSE_LUM * ndl;
+static float lambert_with_ao(V3 normal, int steps, V3 light) {
+  float ndl = v3dot(normal, light);
+  if (ndl < 0.0f)
+    ndl = 0.0f;
+  float lum = AMBIENT_LUM + DIFFUSE_LUM * ndl;
 
-    float ao = 1.0f - (float)steps / (float)MAX_STEPS;
-    if (ao < AO_FLOOR) ao = AO_FLOOR;
-    return lum * ao;
+  float ao = 1.0f - (float)steps / (float)MAX_STEPS;
+  if (ao < AO_FLOOR)
+    ao = AO_FLOOR;
+  return lum * ao;
 }
 
 /* ── §17 cell decoration + emit ──────────────────────────────────────── */
 
-static int to_slot(float x_01)
-{
-    int s = (int)(x_01 * LUMA_SLOT_FLT);
-    if (s < 0)               s = 0;
-    if (s >= LUMA_SLOTS)     s = LUMA_SLOTS - 1;
-    return s;
+static int to_slot(float x_01) {
+  int s = (int)(x_01 * LUMA_SLOT_FLT);
+  if (s < 0)
+    s = 0;
+  if (s >= LUMA_SLOTS)
+    s = LUMA_SLOTS - 1;
+  return s;
 }
 
 /* Cell — (glyph, colour pair, attribute) for one terminal cell. */
-typedef struct { char glyph; int pair; attr_t attr; } Cell;
+typedef struct {
+  char glyph;
+  int pair;
+  attr_t attr;
+} Cell;
 
 /* Production-view cell: glyph from luma, colour pair from orbit trap. */
-static Cell shade_hit(const Hit *h, V3 light)
-{
-    if (!h->hit) {
-        return (Cell){ ' ', PAIR_BG, A_NORMAL };
-    }
+static Cell shade_hit(const Hit *h, V3 light) {
+  if (!h->hit) {
+    return (Cell){' ', PAIR_BG, A_NORMAL};
+  }
 
-    float lum    = lambert_with_ao(h->normal, h->steps, light);
-    int   s_lum  = to_slot(lum);
-    int   s_clr  = to_slot(h->trap);
+  float lum = lambert_with_ao(h->normal, h->steps, light);
+  int s_lum = to_slot(lum);
+  int s_clr = to_slot(h->trap);
 
-    return (Cell){
-        .glyph = LUMA_GLYPHS[s_lum],
-        .pair  = PAIR_TRAP_BASE + s_clr,
-        .attr  = (s_lum >= 6) ? A_BOLD
-               : (s_lum <= 1) ? A_DIM
-               :                A_NORMAL,
-    };
+  return (Cell){
+      .glyph = LUMA_GLYPHS[s_lum],
+      .pair = PAIR_TRAP_BASE + s_clr,
+      .attr = (s_lum >= 6)   ? A_BOLD
+              : (s_lum <= 1) ? A_DIM
+                             : A_NORMAL,
+  };
 }
 
 /* emit_cell — paint one cell with attron/attroff batched on (pair,
  * attr) change.  Halves attribute thrash on uniform regions. */
-static void emit_cell(int row, int col, Cell c,
-                      int *last_pair, attr_t *last_attr)
-{
-    if (c.pair != *last_pair || c.attr != *last_attr) {
-        if (*last_pair >= 0) attroff(COLOR_PAIR(*last_pair) | *last_attr);
-        attron(COLOR_PAIR(c.pair) | c.attr);
-        *last_pair = c.pair;
-        *last_attr = c.attr;
-    }
-    mvaddch(row, col, (chtype)(unsigned char)c.glyph);
+static void emit_cell(int row, int col, Cell c, int *last_pair,
+                      attr_t *last_attr) {
+  if (c.pair != *last_pair || c.attr != *last_attr) {
+    if (*last_pair >= 0)
+      attroff(COLOR_PAIR(*last_pair) | *last_attr);
+    attron(COLOR_PAIR(c.pair) | c.attr);
+    *last_pair = c.pair;
+    *last_attr = c.attr;
+  }
+  mvaddch(row, col, (chtype)(unsigned char)c.glyph);
 }
 
 /* ── §18 scene state — Scene struct + tick + build_kifs ──────────────── */
 
 struct Scene {
-    bool       paused;
-    int        current_preset;
-    int        current_theme;
-    int        iters_override;       /* 0 = use preset default */
-    DebugMode  debug_mode;
-    int        cols, rows;
+  bool paused;
+  int current_preset;
+  int current_theme;
+  int iters_override; /* 0 = use preset default */
+  DebugMode debug_mode;
+  int cols, rows;
 
-    /* Camera state (yaw + pitch around origin). */
-    float  cam_dist;
-    float  orbit_yaw;             /* auto-advancing */
-    float  orbit_pitch;
-    float  user_yaw, user_pitch;  /* manual offsets via arrow keys */
+  /* Camera state (yaw + pitch around origin). */
+  float cam_dist;
+  float orbit_yaw; /* auto-advancing */
+  float orbit_pitch;
+  float user_yaw, user_pitch; /* manual offsets via arrow keys */
 
-    /* KIFS_ROT animated angle. */
-    float  fold_rot;
+  /* KIFS_ROT animated angle. */
+  float fold_rot;
 };
 
-static int scene_iters(const Scene *s)
-{
-    int it = (s->iters_override > 0)
-           ? s->iters_override
-           : PRESETS[s->current_preset].default_iters;
-    if (it < ITERS_MIN) it = ITERS_MIN;
-    if (it > ITERS_MAX) it = ITERS_MAX;
-    return it;
+static int scene_iters(const Scene *s) {
+  int it = (s->iters_override > 0) ? s->iters_override
+                                   : PRESETS[s->current_preset].default_iters;
+  if (it < ITERS_MIN)
+    it = ITERS_MIN;
+  if (it > ITERS_MAX)
+    it = ITERS_MAX;
+  return it;
 }
 
-static void scene_init(Scene *s, int cols, int rows)
-{
-    memset(s, 0, sizeof *s);
-    s->paused          = false;
-    s->current_preset  = PRESET_TETRA;
-    s->current_theme   = 0;
-    s->iters_override  = 0;
-    s->debug_mode      = DEBUG_NORMAL;
-    s->cols            = cols;
-    s->rows            = rows;
-    s->cam_dist        = CAM_DIST_DEFAULT;
-    s->orbit_yaw       = 0.5f;
-    s->orbit_pitch     = 0.25f;
-    s->user_yaw        = 0.0f;
-    s->user_pitch      = 0.0f;
-    s->fold_rot        = 0.4f;
+static void scene_init(Scene *s, int cols, int rows) {
+  memset(s, 0, sizeof *s);
+  s->paused = false;
+  s->current_preset = PRESET_TETRA;
+  s->current_theme = 0;
+  s->iters_override = 0;
+  s->debug_mode = DEBUG_NORMAL;
+  s->cols = cols;
+  s->rows = rows;
+  s->cam_dist = CAM_DIST_DEFAULT;
+  s->orbit_yaw = 0.5f;
+  s->orbit_pitch = 0.25f;
+  s->user_yaw = 0.0f;
+  s->user_pitch = 0.0f;
+  s->fold_rot = 0.4f;
 }
 
-static void scene_resize(Scene *s, int cols, int rows)
-{
-    s->cols = cols;
-    s->rows = rows;
+static void scene_resize(Scene *s, int cols, int rows) {
+  s->cols = cols;
+  s->rows = rows;
 }
 
-static void scene_reset_cam(Scene *s)
-{
-    s->cam_dist    = CAM_DIST_DEFAULT;
-    s->orbit_yaw   = 0.5f;
-    s->orbit_pitch = 0.25f;
-    s->user_yaw    = 0.0f;
-    s->user_pitch  = 0.0f;
+static void scene_reset_cam(Scene *s) {
+  s->cam_dist = CAM_DIST_DEFAULT;
+  s->orbit_yaw = 0.5f;
+  s->orbit_pitch = 0.25f;
+  s->user_yaw = 0.0f;
+  s->user_pitch = 0.0f;
 }
 
-static void scene_tick(Scene *s, float dt)
-{
-    if (s->paused) return;
-    s->orbit_yaw += ORBIT_YAW_RATE * dt;
-    if (s->orbit_yaw >  (float)(2.0 * M_PI)) s->orbit_yaw -= (float)(2.0 * M_PI);
-    if (s->orbit_yaw < -(float)(2.0 * M_PI)) s->orbit_yaw += (float)(2.0 * M_PI);
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
+  s->orbit_yaw += ORBIT_YAW_RATE * dt;
+  if (s->orbit_yaw > (float)(2.0 * M_PI))
+    s->orbit_yaw -= (float)(2.0 * M_PI);
+  if (s->orbit_yaw < -(float)(2.0 * M_PI))
+    s->orbit_yaw += (float)(2.0 * M_PI);
 
-    s->fold_rot  += FOLD_ROT_RATE * dt;
-    if (s->fold_rot >  (float)(2.0 * M_PI)) s->fold_rot -= (float)(2.0 * M_PI);
+  s->fold_rot += FOLD_ROT_RATE * dt;
+  if (s->fold_rot > (float)(2.0 * M_PI))
+    s->fold_rot -= (float)(2.0 * M_PI);
 }
 
 /* scene_build_kifs — pack per-frame state into a flat KifsParams the
  * DE inner loop can read without chasing pointers.  Caches
  * inv_scale_pow = scale^(−iters) so per-pixel DE doesn't recompute. */
-static void scene_build_kifs(const Scene *s, KifsParams *kp)
-{
-    const PresetParams *pp = &PRESETS[s->current_preset];
-    int iters = scene_iters(s);
+static void scene_build_kifs(const Scene *s, KifsParams *kp) {
+  const PresetParams *pp = &PRESETS[s->current_preset];
+  int iters = scene_iters(s);
 
-    kp->preset        = s->current_preset;
-    kp->iters         = iters;
-    kp->scale         = pp->scale;
-    kp->sm1           = pp->scale - 1.0f;
-    kp->offx          = pp->offset_x;
-    kp->offy          = pp->offset_y;
-    kp->offz          = pp->offset_z;
-    kp->fold_rot_c    = cosf(s->fold_rot);
-    kp->fold_rot_s    = sinf(s->fold_rot);
-    kp->inv_scale_pow = expf(-(float)iters * logf(pp->scale));
+  kp->preset = s->current_preset;
+  kp->iters = iters;
+  kp->scale = pp->scale;
+  kp->sm1 = pp->scale - 1.0f;
+  kp->offx = pp->offset_x;
+  kp->offy = pp->offset_y;
+  kp->offz = pp->offset_z;
+  kp->fold_rot_c = cosf(s->fold_rot);
+  kp->fold_rot_s = sinf(s->fold_rot);
+  kp->inv_scale_pow = expf(-(float)iters * logf(pp->scale));
 }
 
 /* camera_basis — definition (forward-declared in §15). */
-static Camera camera_basis(const Scene *s, int rows_eff)
-{
-    float yaw   = s->orbit_yaw   + s->user_yaw;
-    float pitch = clampf(s->orbit_pitch + s->user_pitch,
-                         -MANUAL_PITCH_MAX, MANUAL_PITCH_MAX);
+static Camera camera_basis(const Scene *s, int rows_eff) {
+  float yaw = s->orbit_yaw + s->user_yaw;
+  float pitch = clampf(s->orbit_pitch + s->user_pitch, -MANUAL_PITCH_MAX,
+                       MANUAL_PITCH_MAX);
 
-    Camera c;
-    c.origin = v3(s->cam_dist * cosf(pitch) * cosf(yaw),
-                  s->cam_dist * sinf(pitch),
-                  s->cam_dist * cosf(pitch) * sinf(yaw));
-    c.fwd        = v3norm(v3sub(v3(0, 0, 0), c.origin));
-    V3 wup       = v3(0, 1, 0);
-    c.right      = v3norm(v3cross(c.fwd, wup));
-    c.up         = v3cross(c.right, c.fwd);
-    c.fov_t      = tanf(FOV_DEG * (float)M_PI / 180.0f * 0.5f);
-    c.phys_aspect = ((float)rows_eff * CELL_ASPECT) / (float)s->cols;
-    return c;
+  Camera c;
+  c.origin =
+      v3(s->cam_dist * cosf(pitch) * cosf(yaw), s->cam_dist * sinf(pitch),
+         s->cam_dist * cosf(pitch) * sinf(yaw));
+  c.fwd = v3norm(v3sub(v3(0, 0, 0), c.origin));
+  V3 wup = v3(0, 1, 0);
+  c.right = v3norm(v3cross(c.fwd, wup));
+  c.up = v3cross(c.right, c.fwd);
+  c.fov_t = tanf(FOV_DEG * (float)M_PI / 180.0f * 0.5f);
+  c.phys_aspect = ((float)rows_eff * CELL_ASPECT) / (float)s->cols;
+  return c;
 }
 
 /* ── §19 render — orchestrator: walk pixels, trace, decorate ─────────── *
@@ -1168,30 +1203,31 @@ static Camera camera_basis(const Scene *s, int rows_eff)
  * Production view.  Reads top-to-bottom as the algorithm pseudocode:
  * each line is one named helper from §6..§17.
  */
-static void render_normal(const Scene *s)
-{
-    int rows_eff = s->rows - HUD_ROWS;
-    if (rows_eff < 1) return;
+static void render_normal(const Scene *s) {
+  int rows_eff = s->rows - HUD_ROWS;
+  if (rows_eff < 1)
+    return;
 
-    Camera     cam   = camera_basis(s, rows_eff);
-    V3         light = v3norm(v3(0.55f, 0.75f, 0.35f));
-    KifsParams kp;
-    scene_build_kifs(s, &kp);
+  Camera cam = camera_basis(s, rows_eff);
+  V3 light = v3norm(v3(0.55f, 0.75f, 0.35f));
+  KifsParams kp;
+  scene_build_kifs(s, &kp);
 
-    int    last_pair = -1;
-    attr_t last_attr = 0;
-    int    y0        = 1;       /* shift down 1 for top HUD row */
+  int last_pair = -1;
+  attr_t last_attr = 0;
+  int y0 = 1; /* shift down 1 for top HUD row */
 
-    for (int row = 0; row < rows_eff; row++) {
-        for (int col = 0; col < s->cols; col++) {
-            V3   ray = pixel_ray (col, row, s->cols, rows_eff, &cam);
-            Hit  h   = sphere_trace(cam.origin, ray, &kp);
-            Cell c   = shade_hit (&h, light);
-            emit_cell(y0 + row, col, c, &last_pair, &last_attr);
-        }
+  for (int row = 0; row < rows_eff; row++) {
+    for (int col = 0; col < s->cols; col++) {
+      V3 ray = pixel_ray(col, row, s->cols, rows_eff, &cam);
+      Hit h = sphere_trace(cam.origin, ray, &kp);
+      Cell c = shade_hit(&h, light);
+      emit_cell(y0 + row, col, c, &last_pair, &last_attr);
     }
+  }
 
-    if (last_pair >= 0) attroff(COLOR_PAIR(last_pair) | last_attr);
+  if (last_pair >= 0)
+    attroff(COLOR_PAIR(last_pair) | last_attr);
 }
 
 /* ── §20 debug overlays — see the raw rendering signals ──────────────── *
@@ -1208,303 +1244,349 @@ static void render_normal(const Scene *s)
  *             lighting interference.
  */
 
-static Cell debug_cell_for_trap(const Hit *h)
-{
-    if (!h->hit) return (Cell){ ' ', PAIR_BG, A_NORMAL };
-    int s_clr = to_slot(h->trap);
-    return (Cell){
-        .glyph = LUMA_GLYPHS[s_clr],
-        .pair  = PAIR_TRAP_BASE + s_clr,
-        .attr  = A_NORMAL,
-    };
+static Cell debug_cell_for_trap(const Hit *h) {
+  if (!h->hit)
+    return (Cell){' ', PAIR_BG, A_NORMAL};
+  int s_clr = to_slot(h->trap);
+  return (Cell){
+      .glyph = LUMA_GLYPHS[s_clr],
+      .pair = PAIR_TRAP_BASE + s_clr,
+      .attr = A_NORMAL,
+  };
 }
 
-static Cell debug_cell_for_steps(const Hit *h)
-{
-    if (!h->hit) return (Cell){ ' ', PAIR_BG, A_NORMAL };
-    float t = (float)h->steps / (float)(MAX_STEPS - 1);
-    int   slot = to_slot(t);
-    return (Cell){
-        .glyph = LUMA_GLYPHS[slot],
-        .pair  = PAIR_TRAP_BASE + slot,
-        .attr  = (slot >= 6) ? A_BOLD : A_NORMAL,
-    };
+static Cell debug_cell_for_steps(const Hit *h) {
+  if (!h->hit)
+    return (Cell){' ', PAIR_BG, A_NORMAL};
+  float t = (float)h->steps / (float)(MAX_STEPS - 1);
+  int slot = to_slot(t);
+  return (Cell){
+      .glyph = LUMA_GLYPHS[slot],
+      .pair = PAIR_TRAP_BASE + slot,
+      .attr = (slot >= 6) ? A_BOLD : A_NORMAL,
+  };
 }
 
-static Cell debug_cell_for_normals(const Hit *h)
-{
-    if (!h->hit) return (Cell){ ' ', PAIR_BG, A_NORMAL };
-    float azimuth = atan2f(h->normal.z, h->normal.x);   /* −π..+π */
-    float t = (azimuth + (float)M_PI) / (2.0f * (float)M_PI);
-    int   slot = to_slot(t);
-    float y_lit = (h->normal.y * 0.5f + 0.5f);          /* 0..1 */
-    int   g_slot = to_slot(y_lit);
-    return (Cell){
-        .glyph = LUMA_GLYPHS[g_slot],
-        .pair  = PAIR_TRAP_BASE + slot,
-        .attr  = A_NORMAL,
-    };
+static Cell debug_cell_for_normals(const Hit *h) {
+  if (!h->hit)
+    return (Cell){' ', PAIR_BG, A_NORMAL};
+  float azimuth = atan2f(h->normal.z, h->normal.x); /* −π..+π */
+  float t = (azimuth + (float)M_PI) / (2.0f * (float)M_PI);
+  int slot = to_slot(t);
+  float y_lit = (h->normal.y * 0.5f + 0.5f); /* 0..1 */
+  int g_slot = to_slot(y_lit);
+  return (Cell){
+      .glyph = LUMA_GLYPHS[g_slot],
+      .pair = PAIR_TRAP_BASE + slot,
+      .attr = A_NORMAL,
+  };
 }
 
 /* render_debug — same outer loop as render_normal; only the cell
  * decorator differs. */
-static void render_debug(const Scene *s, DebugMode mode)
-{
-    int rows_eff = s->rows - HUD_ROWS;
-    if (rows_eff < 1) return;
+static void render_debug(const Scene *s, DebugMode mode) {
+  int rows_eff = s->rows - HUD_ROWS;
+  if (rows_eff < 1)
+    return;
 
-    Camera     cam = camera_basis(s, rows_eff);
-    KifsParams kp;
-    scene_build_kifs(s, &kp);
+  Camera cam = camera_basis(s, rows_eff);
+  KifsParams kp;
+  scene_build_kifs(s, &kp);
 
-    int    last_pair = -1;
-    attr_t last_attr = 0;
-    int    y0        = 1;
+  int last_pair = -1;
+  attr_t last_attr = 0;
+  int y0 = 1;
 
-    for (int row = 0; row < rows_eff; row++) {
-        for (int col = 0; col < s->cols; col++) {
-            V3  ray = pixel_ray(col, row, s->cols, rows_eff, &cam);
-            Hit h   = sphere_trace(cam.origin, ray, &kp);
+  for (int row = 0; row < rows_eff; row++) {
+    for (int col = 0; col < s->cols; col++) {
+      V3 ray = pixel_ray(col, row, s->cols, rows_eff, &cam);
+      Hit h = sphere_trace(cam.origin, ray, &kp);
 
-            Cell c;
-            switch (mode) {
-            case DEBUG_TRAP:    c = debug_cell_for_trap   (&h); break;
-            case DEBUG_STEPS:   c = debug_cell_for_steps  (&h); break;
-            case DEBUG_NORMALS: c = debug_cell_for_normals(&h); break;
-            default:            c = (Cell){ ' ', PAIR_BG, A_NORMAL }; break;
-            }
-            emit_cell(y0 + row, col, c, &last_pair, &last_attr);
-        }
+      Cell c;
+      switch (mode) {
+      case DEBUG_TRAP:
+        c = debug_cell_for_trap(&h);
+        break;
+      case DEBUG_STEPS:
+        c = debug_cell_for_steps(&h);
+        break;
+      case DEBUG_NORMALS:
+        c = debug_cell_for_normals(&h);
+        break;
+      default:
+        c = (Cell){' ', PAIR_BG, A_NORMAL};
+        break;
+      }
+      emit_cell(y0 + row, col, c, &last_pair, &last_attr);
     }
+  }
 
-    if (last_pair >= 0) attroff(COLOR_PAIR(last_pair) | last_attr);
+  if (last_pair >= 0)
+    attroff(COLOR_PAIR(last_pair) | last_attr);
 }
 
-static void render_active_view(const Scene *s)
-{
-    if (s->debug_mode == DEBUG_NORMAL) render_normal(s);
-    else                               render_debug (s, s->debug_mode);
+static void render_active_view(const Scene *s) {
+  if (s->debug_mode == DEBUG_NORMAL)
+    render_normal(s);
+  else
+    render_debug(s, s->debug_mode);
 }
 
 /* ── §21 screen — ncurses init / HUD / present ───────────────────────── */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *sc)
-{
-    initscr();
-    noecho(); cbreak(); curs_set(0);
-    nodelay(stdscr, TRUE); keypad(stdscr, TRUE); typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, sc->rows, sc->cols);
+static void screen_init(Screen *sc) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
-static void screen_free        (Screen *sc) { (void)sc; endwin(); }
+static void screen_free(Screen *sc) {
+  (void)sc;
+  endwin();
+}
 
-static void screen_resize_curses(Screen *sc)
-{
-    endwin(); refresh();
-    getmaxyx(stdscr, sc->rows, sc->cols);
+static void screen_resize_curses(Screen *sc) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, sc->rows, sc->cols);
 }
 
 /* HUD layout (CLAUDE.md spec):
  *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
  *   row rows-1     PAIR_HINT (cyan   + bold) — key hint */
-static void hud_draw(const Screen *sc, const Scene *s,
-                     double fps, int sim_fps)
-{
-    char status[160];
-    snprintf(status, sizeof status,
-             " %5.1f fps  %3d Hz  preset:%s  theme:%s  iters:%2d  "
-             "debug:%s  dist:%4.2f  %s ",
-             fps, sim_fps,
-             PRESETS[s->current_preset].name,
-             THEMES[s->current_theme].name,
-             scene_iters(s),
-             DEBUG_MODE_NAMES[s->debug_mode],
-             (double)s->cam_dist,
-             s->paused ? "PAUSED" : "running");
-    int slen = (int)strlen(status); if (slen > sc->cols) slen = sc->cols;
+static void hud_draw(const Screen *sc, const Scene *s, double fps,
+                     int sim_fps) {
+  char status[160];
+  snprintf(status, sizeof status,
+           " %5.1f fps  %3d Hz  preset:%s  theme:%s  iters:%2d  "
+           "debug:%s  dist:%4.2f  %s ",
+           fps, sim_fps, PRESETS[s->current_preset].name,
+           THEMES[s->current_theme].name, scene_iters(s),
+           DEBUG_MODE_NAMES[s->debug_mode], (double)s->cam_dist,
+           s->paused ? "PAUSED" : "running");
+  int slen = (int)strlen(status);
+  if (slen > sc->cols)
+    slen = sc->cols;
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, sc->cols - slen, "%s", status);
-    mvprintw(0, 0, " KIFS · FRACTAL ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, sc->cols - slen, "%s", status);
+  mvprintw(0, 0, " KIFS · FRACTAL ");
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " q:quit  spc:pause  r:reset  n/N:preset  t/T:theme  "
-             "d/D:debug  i/I:iters  z/Z:zoom  arrows:orbit ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(sc->rows - 1, 0,
+           " q:quit  spc:pause  r:reset  n/N:preset  t/T:theme  "
+           "d/D:debug  i/I:iters  z/Z:zoom  arrows:orbit ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
-{
-    erase();
-    render_active_view(s);
-    hud_draw(sc, s, fps, sim_fps);
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+  erase();
+  render_active_view(s);
+  hud_draw(sc, s, fps, sim_fps);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ── §22 app — main loop, signals, key handling ──────────────────────── */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup         (void)    { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void app_do_resize(App *app)
-{
-    screen_resize_curses(&app->screen);
-    scene_resize(&app->scene, app->screen.cols, app->screen.rows);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  screen_resize_curses(&app->screen);
+  scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':           s->paused = !s->paused;                       break;
-    case 'r': case 'R': scene_reset_cam(s); s->iters_override = 0;    break;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_reset_cam(s);
+    s->iters_override = 0;
+    break;
 
-    case 'n':
-        s->current_preset = (s->current_preset + 1) % N_PRESETS;
-        s->iters_override = 0;
-        break;
-    case 'N':
-        s->current_preset = (s->current_preset + N_PRESETS - 1) % N_PRESETS;
-        s->iters_override = 0;
-        break;
+  case 'n':
+    s->current_preset = (s->current_preset + 1) % N_PRESETS;
+    s->iters_override = 0;
+    break;
+  case 'N':
+    s->current_preset = (s->current_preset + N_PRESETS - 1) % N_PRESETS;
+    s->iters_override = 0;
+    break;
 
-    case 't':
-        s->current_theme = (s->current_theme + 1) % N_THEMES;
-        theme_apply(s->current_theme);
-        break;
-    case 'T':
-        s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
-        theme_apply(s->current_theme);
-        break;
+  case 't':
+    s->current_theme = (s->current_theme + 1) % N_THEMES;
+    theme_apply(s->current_theme);
+    break;
+  case 'T':
+    s->current_theme = (s->current_theme + N_THEMES - 1) % N_THEMES;
+    theme_apply(s->current_theme);
+    break;
 
-    case 'd':
-        s->debug_mode = (DebugMode)((s->debug_mode + 1) % DEBUG_MODE_COUNT);
-        break;
-    case 'D':
-        s->debug_mode =
-            (DebugMode)((s->debug_mode + DEBUG_MODE_COUNT - 1) % DEBUG_MODE_COUNT);
-        break;
+  case 'd':
+    s->debug_mode = (DebugMode)((s->debug_mode + 1) % DEBUG_MODE_COUNT);
+    break;
+  case 'D':
+    s->debug_mode =
+        (DebugMode)((s->debug_mode + DEBUG_MODE_COUNT - 1) % DEBUG_MODE_COUNT);
+    break;
 
-    case 'i': {
-        int it = scene_iters(s);
-        if (it > ITERS_MIN) s->iters_override = it - 1;
-        break;
-    }
-    case 'I': {
-        int it = scene_iters(s);
-        if (it < ITERS_MAX) s->iters_override = it + 1;
-        break;
-    }
+  case 'i': {
+    int it = scene_iters(s);
+    if (it > ITERS_MIN)
+      s->iters_override = it - 1;
+    break;
+  }
+  case 'I': {
+    int it = scene_iters(s);
+    if (it < ITERS_MAX)
+      s->iters_override = it + 1;
+    break;
+  }
 
-    case 'z':
-        s->cam_dist += CAM_DIST_STEP;
-        if (s->cam_dist > CAM_DIST_MAX) s->cam_dist = CAM_DIST_MAX;
-        break;
-    case 'Z':
-        s->cam_dist -= CAM_DIST_STEP;
-        if (s->cam_dist < CAM_DIST_MIN) s->cam_dist = CAM_DIST_MIN;
-        break;
+  case 'z':
+    s->cam_dist += CAM_DIST_STEP;
+    if (s->cam_dist > CAM_DIST_MAX)
+      s->cam_dist = CAM_DIST_MAX;
+    break;
+  case 'Z':
+    s->cam_dist -= CAM_DIST_STEP;
+    if (s->cam_dist < CAM_DIST_MIN)
+      s->cam_dist = CAM_DIST_MIN;
+    break;
 
-    case KEY_LEFT:  s->user_yaw   -= MANUAL_YAW_STEP;   break;
-    case KEY_RIGHT: s->user_yaw   += MANUAL_YAW_STEP;   break;
-    case KEY_UP:    s->user_pitch += MANUAL_PITCH_STEP; break;
-    case KEY_DOWN:  s->user_pitch -= MANUAL_PITCH_STEP; break;
+  case KEY_LEFT:
+    s->user_yaw -= MANUAL_YAW_STEP;
+    break;
+  case KEY_RIGHT:
+    s->user_yaw += MANUAL_YAW_STEP;
+    break;
+  case KEY_UP:
+    s->user_pitch += MANUAL_PITCH_STEP;
+    break;
+  case KEY_DOWN:
+    s->user_pitch -= MANUAL_PITCH_STEP;
+    break;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    default: break;
-    }
-    return true;
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+int main(void) {
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
-    scene_init (&app->scene, app->screen.cols, app->screen.rows);
+  screen_init(&app->screen);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
-
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accum -= tick_ns;
-        }
-
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        screen_draw   (&app->screen, &app->scene, fps_display, app->sim_fps);
-        screen_present();
-
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns();
+      sim_accum = 0;
     }
 
-    screen_free(&app->screen);
-    return 0;
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > 100 * NS_PER_MS)
+      dt = 100 * NS_PER_MS;
+
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
+
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, dt_sec);
+      sim_accum -= tick_ns;
+    }
+
+    frame_count++;
+    fps_accum += dt;
+    if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display =
+          (double)frame_count / ((double)fps_accum / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accum = 0;
+    }
+
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
+    screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps);
+    screen_present();
+
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  screen_free(&app->screen);
+  return 0;
 }

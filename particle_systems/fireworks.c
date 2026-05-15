@@ -5,7 +5,8 @@
  * Features:
  *   - Single-threaded, no pthreads
  *   - Single stdscr, ncurses internal double buffer — no flicker
- *   - dt (delta-time) loop — physics runs at fixed SIM_FPS, render capped at 60 fps
+ *   - dt (delta-time) loop — physics runs at fixed SIM_FPS, render capped at 60
+ * fps
  *   - SIGWINCH resize: rebuilds show to new terminal dimensions
  *   - Speed control:   ] = faster   [ = slower
  *   - Rocket control:  = = more     - = fewer rockets
@@ -147,7 +148,7 @@
 
 /* M_PI is not guaranteed by C99/C11 — define it explicitly. */
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -155,10 +156,10 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ===================================================================== */
 /* §1  config                                                             */
@@ -169,41 +170,41 @@
  * Hard limits and fixed constants live here.
  */
 enum {
-    /* Simulation speed — ticks per second */
-    SIM_FPS_MIN      =  10,   /* slowest selectable speed             */
-    SIM_FPS_DEFAULT  =  30,   /* startup speed                        */
-    SIM_FPS_MAX      =  60,   /* fastest selectable speed             */
-    SIM_FPS_STEP     =   5,   /* ] / [ increment                      */
+  /* Simulation speed — ticks per second */
+  SIM_FPS_MIN = 10,     /* slowest selectable speed             */
+  SIM_FPS_DEFAULT = 30, /* startup speed                        */
+  SIM_FPS_MAX = 60,     /* fastest selectable speed             */
+  SIM_FPS_STEP = 5,     /* ] / [ increment                      */
 
-    /* Rockets */
-    ROCKETS_MIN      =   1,   /* minimum live rockets                 */
-    ROCKETS_DEFAULT  =   6,   /* startup rocket count                 */
-    ROCKETS_MAX      =  20,   /* maximum live rockets                 */
-    ROCKETS_STEP     =   1,   /* = / - increment                      */
+  /* Rockets */
+  ROCKETS_MIN = 1,     /* minimum live rockets                 */
+  ROCKETS_DEFAULT = 6, /* startup rocket count                 */
+  ROCKETS_MAX = 20,    /* maximum live rockets                 */
+  ROCKETS_STEP = 1,    /* = / - increment                      */
 
-    /* Particles per explosion */
-    PARTICLES_PER_BURST = 80,
+  /* Particles per explosion */
+  PARTICLES_PER_BURST = 80,
 
-    /* Physics */
-    LAUNCH_SPEED_MIN =   3,   /* rows/sec upward at launch            */
-    LAUNCH_SPEED_MAX =   8,   /* rows/sec upward at launch            */
+  /* Physics */
+  LAUNCH_SPEED_MIN = 3, /* rows/sec upward at launch            */
+  LAUNCH_SPEED_MAX = 8, /* rows/sec upward at launch            */
 
-    /* HUD overlay */
-    HUD_COLS         =  30,   /* width of the status bar window       */
-    FPS_UPDATE_MS    = 500,   /* re-measure FPS every 500 ms          */
+  /* HUD overlay */
+  HUD_COLS = 30,       /* width of the status bar window       */
+  FPS_UPDATE_MS = 500, /* re-measure FPS every 500 ms          */
 
-    /* Themes — 10 palettes cycled with t/T */
-    N_THEMES         =  10,
+  /* Themes — 10 palettes cycled with t/T */
+  N_THEMES = 10,
 
-    /* Total pool sizes (fixed at compile time) */
-    MAX_ROCKETS      =  ROCKETS_MAX,
-    MAX_PARTICLES    =  MAX_ROCKETS * PARTICLES_PER_BURST,
+  /* Total pool sizes (fixed at compile time) */
+  MAX_ROCKETS = ROCKETS_MAX,
+  MAX_PARTICLES = MAX_ROCKETS * PARTICLES_PER_BURST,
 };
 
 /* Nanosecond helpers */
-#define NS_PER_SEC    1000000000LL
-#define NS_PER_MS     1000000LL
-#define TICK_NS(fps)  (NS_PER_SEC / (fps))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(fps) (NS_PER_SEC / (fps))
 
 /*
  * ROCKET_DRAG — deceleration applied to ascending rockets (rows/sec²).
@@ -213,8 +214,8 @@ enum {
  *   Lower than ROCKET_DRAG so particles spread in all directions before
  *   gravity pulls them down.
  */
-#define ROCKET_DRAG   9.8f
-#define GRAVITY       4.0f
+#define ROCKET_DRAG 9.8f
+#define GRAVITY 4.0f
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -224,24 +225,23 @@ enum {
  * clock_ns() — wall-clock nanoseconds via CLOCK_MONOTONIC.
  * Never jumps backward — the only correct choice for a dt loop.
  */
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
 /*
  * clock_sleep_ns() — sleep the requested nanoseconds.
  */
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ===================================================================== */
@@ -257,17 +257,17 @@ static void clock_sleep_ns(int64_t ns)
  * 30+ in the 256-cube, so even A_DIM particles remain visible.
  */
 typedef enum {
-    COL_RED     = 1,
-    COL_ORANGE  = 2,
-    COL_YELLOW  = 3,
-    COL_GREEN   = 4,
-    COL_CYAN    = 5,
-    COL_BLUE    = 6,
-    COL_MAGENTA = 7,
-    COL_COUNT   = 7,
+  COL_RED = 1,
+  COL_ORANGE = 2,
+  COL_YELLOW = 3,
+  COL_GREEN = 4,
+  COL_CYAN = 5,
+  COL_BLUE = 6,
+  COL_MAGENTA = 7,
+  COL_COUNT = 7,
 
-    PAIR_HUD    = 8,   /* bright yellow on default bg — never themed */
-    PAIR_HINT   = 9,   /* bright cyan   on default bg — never themed */
+  PAIR_HUD = 8,  /* bright yellow on default bg — never themed */
+  PAIR_HINT = 9, /* bright cyan   on default bg — never themed */
 } ColorID;
 
 /*
@@ -277,61 +277,57 @@ typedef enum {
  * a multi-hue spray rather than a monochrome ring.
  */
 typedef struct {
-    const char *name;
-    short       fg[COL_COUNT];   /* 256-cube indices, slot order 1..7 */
+  const char *name;
+  short fg[COL_COUNT]; /* 256-cube indices, slot order 1..7 */
 } Theme;
 
 static const Theme themes[N_THEMES] = {
     /*  name        slot1  2    3    4    5    6    7                      */
-    { "matrix",  {  28,  34,  40,  46,  82, 118, 154 } }, /* greens         */
-    { "neon",    { 201, 207, 165,  51,  87,  45, 213 } }, /* magenta+cyan   */
-    { "nova",    { 196, 202, 208, 220, 226, 231, 255 } }, /* red→white-hot  */
-    { "ocean",   {  33,  39,  45,  51,  87, 123, 195 } }, /* blue→cyan→white*/
-    { "fire",    { 196, 202, 208, 214, 220, 226, 230 } }, /* red→yellow     */
-    { "toxic",   {  46,  82, 118, 154, 190, 226, 220 } }, /* acid green→yel */
-    { "gold",    { 130, 136, 172, 178, 214, 220, 230 } }, /* warm browns    */
-    { "ice",     {  33,  39,  45,  51,  87, 123, 159 } }, /* dark→pale cyan */
-    { "aurora",  {  46,  82,  51,  87, 165, 201, 207 } }, /* green/cyan/mag */
-    { "plasma",  {  93,  99, 165, 201, 207,  51,  87 } }, /* purple→pink→cy */
+    {"matrix", {28, 34, 40, 46, 82, 118, 154}},    /* greens         */
+    {"neon", {201, 207, 165, 51, 87, 45, 213}},    /* magenta+cyan   */
+    {"nova", {196, 202, 208, 220, 226, 231, 255}}, /* red→white-hot  */
+    {"ocean", {33, 39, 45, 51, 87, 123, 195}},     /* blue→cyan→white*/
+    {"fire", {196, 202, 208, 214, 220, 226, 230}}, /* red→yellow     */
+    {"toxic", {46, 82, 118, 154, 190, 226, 220}},  /* acid green→yel */
+    {"gold", {130, 136, 172, 178, 214, 220, 230}}, /* warm browns    */
+    {"ice", {33, 39, 45, 51, 87, 123, 159}},       /* dark→pale cyan */
+    {"aurora", {46, 82, 51, 87, 165, 201, 207}},   /* green/cyan/mag */
+    {"plasma", {93, 99, 165, 201, 207, 51, 87}},   /* purple→pink→cy */
 };
 
 /* 8-colour fallback palette — used when COLORS < 256, themes inert. */
 static const short k_fallback_fg[COL_COUNT] = {
-    COLOR_RED,    COLOR_YELLOW, COLOR_YELLOW,
-    COLOR_GREEN,  COLOR_CYAN,   COLOR_BLUE,   COLOR_MAGENTA,
+    COLOR_RED,  COLOR_YELLOW, COLOR_YELLOW,  COLOR_GREEN,
+    COLOR_CYAN, COLOR_BLUE,   COLOR_MAGENTA,
 };
 
 /* theme_apply — rebind pairs 1..7 to themes[idx]; HUD pairs untouched. */
-static void theme_apply(int idx)
-{
-    if (COLORS < 256) return;
-    const Theme *t = &themes[idx];
-    for (int i = 0; i < COL_COUNT; i++)
-        init_pair((short)(i + 1), t->fg[i], -1);
+static void theme_apply(int idx) {
+  if (COLORS < 256)
+    return;
+  const Theme *t = &themes[idx];
+  for (int i = 0; i < COL_COUNT; i++)
+    init_pair((short)(i + 1), t->fg[i], -1);
 }
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
+static void color_init(void) {
+  start_color();
+  use_default_colors();
 
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
-        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
-        theme_apply(0);                  /* matrix is the startup theme */
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-        for (int i = 0; i < COL_COUNT; i++)
-            init_pair((short)(i + 1), k_fallback_fg[i], -1);
-    }
+  if (COLORS >= 256) {
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+    theme_apply(0);               /* matrix is the startup theme */
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+    for (int i = 0; i < COL_COUNT; i++)
+      init_pair((short)(i + 1), k_fallback_fg[i], -1);
+  }
 }
 
 /* Return a random ColorID in [COL_RED, COL_COUNT]. */
-static ColorID color_rand(void)
-{
-    return (ColorID)(1 + rand() % COL_COUNT);
-}
+static ColorID color_rand(void) { return (ColorID)(1 + rand() % COL_COUNT); }
 
 /* ===================================================================== */
 /* §4  particle                                                           */
@@ -347,13 +343,13 @@ static ColorID color_rand(void)
  * and never change — they identify this particle for its lifetime.
  */
 typedef struct {
-    float   x, y;
-    float   vx, vy;
-    float   life;       /* 1.0 = fresh, 0.0 = dead                  */
-    float   decay;      /* life subtracted per tick                 */
-    char    symbol;
-    ColorID color;
-    bool    active;
+  float x, y;
+  float vx, vy;
+  float life;  /* 1.0 = fresh, 0.0 = dead                  */
+  float decay; /* life subtracted per tick                 */
+  char symbol;
+  ColorID color;
+  bool active;
 } Particle;
 
 /* Pure 7-bit ASCII only — no UTF-8 bytes. */
@@ -369,60 +365,63 @@ static const char k_particle_symbols[] = "*+.,`'^-~=o#@%&$!|\\/:;";
  * explosion looks like a sphere rather than a uniform ring.
  * Each particle gets a random lifetime so the burst fades out gradually.
  */
-static void particle_burst(Particle *p, int count, float x, float y)
-{
-    for (int i = 0; i < count; i++) {
-        float angle = ((float)i / count) * 2.0f * (float)M_PI
-                      + ((float)rand() / RAND_MAX) * 0.3f;
-        float speed = 1.5f + ((float)rand() / RAND_MAX) * 3.5f;
+static void particle_burst(Particle *p, int count, float x, float y) {
+  for (int i = 0; i < count; i++) {
+    float angle = ((float)i / count) * 2.0f * (float)M_PI +
+                  ((float)rand() / RAND_MAX) * 0.3f;
+    float speed = 1.5f + ((float)rand() / RAND_MAX) * 3.5f;
 
-        p[i].x      = x;
-        p[i].y      = y;
-        p[i].vx     = cosf(angle) * speed;
-        p[i].vy     = sinf(angle) * speed * 0.5f;  /* squash vertical */
-        p[i].life   = 0.6f + ((float)rand() / RAND_MAX) * 0.4f;
-        p[i].decay  = 0.03f + ((float)rand() / RAND_MAX) * 0.04f;
-        p[i].symbol = k_particle_symbols[rand() % PARTICLE_SYM_COUNT];
-        p[i].color  = color_rand();   /* every particle its own color */
-        p[i].active = true;
-    }
+    p[i].x = x;
+    p[i].y = y;
+    p[i].vx = cosf(angle) * speed;
+    p[i].vy = sinf(angle) * speed * 0.5f; /* squash vertical */
+    p[i].life = 0.6f + ((float)rand() / RAND_MAX) * 0.4f;
+    p[i].decay = 0.03f + ((float)rand() / RAND_MAX) * 0.04f;
+    p[i].symbol = k_particle_symbols[rand() % PARTICLE_SYM_COUNT];
+    p[i].color = color_rand(); /* every particle its own color */
+    p[i].active = true;
+  }
 }
 
 /*
  * particle_tick() — advance one simulation step for a single particle.
  * dt_sec is the fixed sim tick duration in seconds.
  */
-static void particle_tick(Particle *p, float dt_sec)
-{
-    if (!p->active) return;
+static void particle_tick(Particle *p, float dt_sec) {
+  if (!p->active)
+    return;
 
-    p->x  += p->vx * dt_sec * 8.0f;   /* scale to terminal columns    */
-    p->y  += p->vy * dt_sec * 8.0f;   /* scale to terminal rows       */
-    p->vy += GRAVITY * dt_sec;         /* gravity pulls downward       */
-    p->life -= p->decay;
+  p->x += p->vx * dt_sec * 8.0f; /* scale to terminal columns    */
+  p->y += p->vy * dt_sec * 8.0f; /* scale to terminal rows       */
+  p->vy += GRAVITY * dt_sec;     /* gravity pulls downward       */
+  p->life -= p->decay;
 
-    if (p->life <= 0.0f) p->active = false;
+  if (p->life <= 0.0f)
+    p->active = false;
 }
 
 /*
  * particle_draw() — render one particle into a WINDOW.
  * Brightness is derived from life: bright when fresh, dim when fading.
  */
-static void particle_draw(const Particle *p, WINDOW *w, int cols, int rows)
-{
-    if (!p->active) return;
+static void particle_draw(const Particle *p, WINDOW *w, int cols, int rows) {
+  if (!p->active)
+    return;
 
-    int x = (int)p->x;
-    int y = (int)p->y;
-    if (x < 0 || x >= cols || y < 0 || y >= rows) return;
+  int x = (int)p->x;
+  int y = (int)p->y;
+  if (x < 0 || x >= cols || y < 0 || y >= rows)
+    return;
 
-    attr_t attr = COLOR_PAIR(p->color);
-    if (p->life > 0.6f)       attr |= A_BOLD;
-    else if (p->life < 0.2f)  attr |= A_DIM;
+  attr_t attr = COLOR_PAIR(p->color);
+  if (p->life > 0.6f)
+    attr |= A_BOLD;
+  else if (p->life < 0.2f)
+    attr |= A_DIM;
 
-    wattron(w, attr);
-    mvwaddch(w, y, x, (chtype)(unsigned char)p->symbol);
-    wattroff(w, attr);
+  wattron(w, attr);
+  mvwaddch(w, y, x, (chtype)(unsigned char)p->symbol);
+  wattroff(w, attr);
 }
 
 /* ===================================================================== */
@@ -445,108 +444,104 @@ static void particle_draw(const Particle *p, WINDOW *w, int cols, int rows)
  * fuse        countdown ticks before an IDLE rocket relaunches.
  */
 typedef enum {
-    RS_IDLE     = 0,
-    RS_RISING   = 1,
-    RS_EXPLODED = 2,
+  RS_IDLE = 0,
+  RS_RISING = 1,
+  RS_EXPLODED = 2,
 } RocketState;
 
 typedef struct {
-    float       x, y;
-    float       vy;             /* upward velocity (negative = up)     */
-    ColorID     color;
-    RocketState state;
-    int         fuse;           /* ticks until relaunch from IDLE      */
-    Particle    particles[PARTICLES_PER_BURST];
+  float x, y;
+  float vy; /* upward velocity (negative = up)     */
+  ColorID color;
+  RocketState state;
+  int fuse; /* ticks until relaunch from IDLE      */
+  Particle particles[PARTICLES_PER_BURST];
 } Rocket;
 
 /*
  * rocket_launch() — reset a rocket for a new flight.
  * Starts at the bottom of the screen in a random column.
  */
-static void rocket_launch(Rocket *r, int cols, int rows)
-{
-    r->x     = (float)(rand() % cols);
-    r->y     = (float)(rows - 1);
-    r->vy    = -(float)(LAUNCH_SPEED_MIN
-                + rand() % (LAUNCH_SPEED_MAX - LAUNCH_SPEED_MIN + 1));
-    r->color = color_rand();
-    r->state = RS_RISING;
+static void rocket_launch(Rocket *r, int cols, int rows) {
+  r->x = (float)(rand() % cols);
+  r->y = (float)(rows - 1);
+  r->vy = -(float)(LAUNCH_SPEED_MIN +
+                   rand() % (LAUNCH_SPEED_MAX - LAUNCH_SPEED_MIN + 1));
+  r->color = color_rand();
+  r->state = RS_RISING;
 
-    /* Deactivate any lingering particles from the previous burst. */
-    for (int i = 0; i < PARTICLES_PER_BURST; i++)
-        r->particles[i].active = false;
+  /* Deactivate any lingering particles from the previous burst. */
+  for (int i = 0; i < PARTICLES_PER_BURST; i++)
+    r->particles[i].active = false;
 }
 
 /*
  * rocket_tick() — advance one simulation step.
  * dt_sec is the fixed sim tick in seconds.
  */
-static void rocket_tick(Rocket *r, float dt_sec, int cols, int rows)
-{
-    switch (r->state) {
+static void rocket_tick(Rocket *r, float dt_sec, int cols, int rows) {
+  switch (r->state) {
 
-    case RS_IDLE:
-        if (--r->fuse <= 0)
-            rocket_launch(r, cols, rows);
-        break;
+  case RS_IDLE:
+    if (--r->fuse <= 0)
+      rocket_launch(r, cols, rows);
+    break;
 
-    case RS_RISING:
-        r->y  += r->vy * dt_sec * 6.0f;
-        r->vy += ROCKET_DRAG * dt_sec * 0.5f;   /* decelerate to apex */
+  case RS_RISING:
+    r->y += r->vy * dt_sec * 6.0f;
+    r->vy += ROCKET_DRAG * dt_sec * 0.5f; /* decelerate to apex */
 
-        /* Explode at apex (vy crosses zero) or if it exits top. */
-        if (r->vy >= 0.0f || r->y < 2.0f) {
-            particle_burst(r->particles, PARTICLES_PER_BURST,
-                           r->x, r->y);
-            r->state = RS_EXPLODED;
-        }
-        break;
-
-    case RS_EXPLODED: {
-        /* Tick particles; transition to IDLE once all are dead. */
-        bool any_alive = false;
-        for (int i = 0; i < PARTICLES_PER_BURST; i++) {
-            particle_tick(&r->particles[i], dt_sec);
-            if (r->particles[i].active) any_alive = true;
-        }
-        if (!any_alive) {
-            /* Random fuse 0.5–2.5 s before next launch. */
-            int ticks_per_sec = (int)(1.0f / dt_sec);
-            r->fuse  = ticks_per_sec / 2
-                       + rand() % (ticks_per_sec * 2);
-            r->state = RS_IDLE;
-        }
-        break;
+    /* Explode at apex (vy crosses zero) or if it exits top. */
+    if (r->vy >= 0.0f || r->y < 2.0f) {
+      particle_burst(r->particles, PARTICLES_PER_BURST, r->x, r->y);
+      r->state = RS_EXPLODED;
     }
-    } /* switch */
+    break;
+
+  case RS_EXPLODED: {
+    /* Tick particles; transition to IDLE once all are dead. */
+    bool any_alive = false;
+    for (int i = 0; i < PARTICLES_PER_BURST; i++) {
+      particle_tick(&r->particles[i], dt_sec);
+      if (r->particles[i].active)
+        any_alive = true;
+    }
+    if (!any_alive) {
+      /* Random fuse 0.5–2.5 s before next launch. */
+      int ticks_per_sec = (int)(1.0f / dt_sec);
+      r->fuse = ticks_per_sec / 2 + rand() % (ticks_per_sec * 2);
+      r->state = RS_IDLE;
+    }
+    break;
+  }
+  } /* switch */
 }
 
 /*
  * rocket_draw() — render rocket body and its particles into a WINDOW.
  */
-static void rocket_draw(const Rocket *r, WINDOW *w, int cols, int rows)
-{
-    if (r->state == RS_RISING) {
-        int x = (int)r->x;
-        int y = (int)r->y;
-        if (x >= 0 && x < cols && y >= 0 && y < rows) {
-            wattron(w, COLOR_PAIR(r->color) | A_BOLD);
-            mvwaddch(w, y, x, '|');
-            wattroff(w, COLOR_PAIR(r->color) | A_BOLD);
+static void rocket_draw(const Rocket *r, WINDOW *w, int cols, int rows) {
+  if (r->state == RS_RISING) {
+    int x = (int)r->x;
+    int y = (int)r->y;
+    if (x >= 0 && x < cols && y >= 0 && y < rows) {
+      wattron(w, COLOR_PAIR(r->color) | A_BOLD);
+      mvwaddch(w, y, x, '|');
+      wattroff(w, COLOR_PAIR(r->color) | A_BOLD);
 
-            /* Draw a short exhaust trail below the rocket. */
-            if (y + 1 < rows) {
-                wattron(w, COLOR_PAIR(r->color));
-                mvwaddch(w, y + 1, x, '\'');
-                wattroff(w, COLOR_PAIR(r->color));
-            }
-        }
+      /* Draw a short exhaust trail below the rocket. */
+      if (y + 1 < rows) {
+        wattron(w, COLOR_PAIR(r->color));
+        mvwaddch(w, y + 1, x, '\'');
+        wattroff(w, COLOR_PAIR(r->color));
+      }
     }
+  }
 
-    if (r->state == RS_EXPLODED) {
-        for (int i = 0; i < PARTICLES_PER_BURST; i++)
-            particle_draw(&r->particles[i], w, cols, rows);
-    }
+  if (r->state == RS_EXPLODED) {
+    for (int i = 0; i < PARTICLES_PER_BURST; i++)
+      particle_draw(&r->particles[i], w, cols, rows);
+  }
 }
 
 /* ===================================================================== */
@@ -563,33 +558,31 @@ static void rocket_draw(const Rocket *r, WINDOW *w, int cols, int rows)
  * active_rockets is runtime-mutable (= / - keys).
  */
 typedef struct {
-    Rocket rockets[MAX_ROCKETS];
-    int    active_rockets;   /* how many slots are actually used      */
+  Rocket rockets[MAX_ROCKETS];
+  int active_rockets; /* how many slots are actually used      */
 } Show;
 
-static void show_init(Show *s, int cols, int rows, int rocket_count)
-{
-    s->active_rockets = rocket_count;
+static void show_init(Show *s, int cols, int rows, int rocket_count) {
+  s->active_rockets = rocket_count;
 
-    for (int i = 0; i < MAX_ROCKETS; i++) {
-        if (i < rocket_count) {
-            /* Stagger initial launches so they don't all fire at once. */
-            rocket_launch(&s->rockets[i], cols, rows);
-            s->rockets[i].fuse  = i * 8;        /* spread them out     */
-            s->rockets[i].state = RS_IDLE;
-        } else {
-            s->rockets[i].state = RS_IDLE;
-            s->rockets[i].fuse  = INT32_MAX / 2; /* effectively parked  */
-            for (int j = 0; j < PARTICLES_PER_BURST; j++)
-                s->rockets[i].particles[j].active = false;
-        }
+  for (int i = 0; i < MAX_ROCKETS; i++) {
+    if (i < rocket_count) {
+      /* Stagger initial launches so they don't all fire at once. */
+      rocket_launch(&s->rockets[i], cols, rows);
+      s->rockets[i].fuse = i * 8; /* spread them out     */
+      s->rockets[i].state = RS_IDLE;
+    } else {
+      s->rockets[i].state = RS_IDLE;
+      s->rockets[i].fuse = INT32_MAX / 2; /* effectively parked  */
+      for (int j = 0; j < PARTICLES_PER_BURST; j++)
+        s->rockets[i].particles[j].active = false;
     }
+  }
 }
 
-static void show_free(Show *s)
-{
-    /* No heap allocations in Show — just zero the struct for safety. */
-    memset(s, 0, sizeof *s);
+static void show_free(Show *s) {
+  /* No heap allocations in Show — just zero the struct for safety. */
+  memset(s, 0, sizeof *s);
 }
 
 /*
@@ -598,20 +591,18 @@ static void show_free(Show *s)
  * dt_sec is the duration of one simulation tick in seconds.
  * Only the first active_rockets slots are ticked; the rest stay parked.
  */
-static void show_tick(Show *s, float dt_sec, int cols, int rows)
-{
-    for (int i = 0; i < s->active_rockets; i++)
-        rocket_tick(&s->rockets[i], dt_sec, cols, rows);
+static void show_tick(Show *s, float dt_sec, int cols, int rows) {
+  for (int i = 0; i < s->active_rockets; i++)
+    rocket_tick(&s->rockets[i], dt_sec, cols, rows);
 }
 
 /*
  * show_draw() — paint all rockets and particles into a WINDOW.
  * werase() is called by the screen layer before this, not here.
  */
-static void show_draw(const Show *s, WINDOW *w, int cols, int rows)
-{
-    for (int i = 0; i < s->active_rockets; i++)
-        rocket_draw(&s->rockets[i], w, cols, rows);
+static void show_draw(const Show *s, WINDOW *w, int cols, int rows) {
+  for (int i = 0; i < s->active_rockets; i++)
+    rocket_draw(&s->rockets[i], w, cols, rows);
 }
 
 /* ===================================================================== */
@@ -631,44 +622,40 @@ static void show_draw(const Show *s, WINDOW *w, int cols, int rows)
  * which causes tearing on fast terminals.
  */
 typedef struct {
-    int cols;
-    int rows;
+  int cols;
+  int rows;
 } Screen;
 
-static void screen_init(Screen *s)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_free(Screen *s)
-{
-    (void)s;
-    endwin();
+static void screen_free(Screen *s) {
+  (void)s;
+  endwin();
 }
 
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
 /*
  * screen_draw_show() — erase newscr then paint all rockets into stdscr.
  * Nothing reaches the terminal until screen_present() is called.
  */
-static void screen_draw_show(Screen *s, const Show *show)
-{
-    erase();
-    show_draw(show, stdscr, s->cols, s->rows);
+static void screen_draw_show(Screen *s, const Show *show) {
+  erase();
+  show_draw(show, stdscr, s->cols, s->rows);
 }
 
 /*
@@ -678,43 +665,39 @@ static void screen_draw_show(Screen *s, const Show *show)
  *   row 1 (right):  " theme:<name> "                    PAIR_HUD (no bold)
  *   bottom (left):  " q:quit  ]/[:speed  +/-:rockets  t/T:theme "  PAIR_HINT
  */
-static void screen_draw_hud(Screen *s,
-                            double fps,
-                            int    sim_fps,
-                            int    rockets,
-                            const char *theme_name)
-{
-    char top[64];
-    snprintf(top, sizeof top, " %5.1f fps  sim:%2d Hz  rkt:%2d ",
-             fps, sim_fps, rockets);
-    int top_x = s->cols - (int)strlen(top);
-    if (top_x < 0) top_x = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, top_x, "%s", top);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+static void screen_draw_hud(Screen *s, double fps, int sim_fps, int rockets,
+                            const char *theme_name) {
+  char top[64];
+  snprintf(top, sizeof top, " %5.1f fps  sim:%2d Hz  rkt:%2d ", fps, sim_fps,
+           rockets);
+  int top_x = s->cols - (int)strlen(top);
+  if (top_x < 0)
+    top_x = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, top_x, "%s", top);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    char mid[64];
-    snprintf(mid, sizeof mid, " theme:%s ", theme_name);
-    int mid_x = s->cols - (int)strlen(mid);
-    if (mid_x < 0) mid_x = 0;
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, mid_x, "%s", mid);
-    attroff(COLOR_PAIR(PAIR_HUD));
+  char mid[64];
+  snprintf(mid, sizeof mid, " theme:%s ", theme_name);
+  int mid_x = s->cols - (int)strlen(mid);
+  if (mid_x < 0)
+    mid_x = 0;
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(1, mid_x, "%s", mid);
+  attroff(COLOR_PAIR(PAIR_HUD));
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(s->rows - 1, 0,
-             " q:quit  ]/[:speed  +/-:rockets  t/T:theme ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(s->rows - 1, 0, " q:quit  ]/[:speed  +/-:rockets  t/T:theme ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /*
  * screen_present() — flush newscr to the terminal.
  * wnoutrefresh marks stdscr ready; doupdate sends only changed cells.
  */
-static void screen_present(void)
-{
-    wnoutrefresh(stdscr);
-    doupdate();
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
@@ -733,41 +716,38 @@ static void screen_present(void)
  *   need_resize  set to 1 by SIGWINCH
  */
 typedef struct {
-    Show                  show;
-    Screen                screen;
-    int                   sim_fps;
-    int                   rockets;
-    int                   current_theme;     /* index into themes[]   */
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Show show;
+  Screen screen;
+  int sim_fps;
+  int rockets;
+  int current_theme; /* index into themes[]   */
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
-static App g_app;   /* global — signal handlers reach it via this */
+static App g_app; /* global — signal handlers reach it via this */
 
 /* -------------------------------------------------------------------- */
 /* signal handlers                                                       */
 /* -------------------------------------------------------------------- */
 
-static void on_exit_signal(int sig)
-{
-    (void)sig;
-    g_app.running = 0;
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
 }
 
-static void on_resize_signal(int sig)
-{
-    (void)sig;
-    g_app.need_resize = 1;
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
 }
 
 /* -------------------------------------------------------------------- */
 /* atexit cleanup                                                        */
 /* -------------------------------------------------------------------- */
 
-static void cleanup(void)
-{
-    /* endwin() is idempotent — safe even if never fully initialised. */
-    endwin();
+static void cleanup(void) {
+  /* endwin() is idempotent — safe even if never fully initialised. */
+  endwin();
 }
 
 /* -------------------------------------------------------------------- */
@@ -779,12 +759,11 @@ static void cleanup(void)
  * show_free + show_init restarts the fireworks at the new size.
  * sim_fps and rockets are preserved across the resize.
  */
-static void app_do_resize(App *app)
-{
-    show_free(&app->show);
-    screen_resize(&app->screen);
-    show_init(&app->show, app->screen.cols, app->screen.rows, app->rockets);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  show_free(&app->show);
+  screen_resize(&app->screen);
+  show_init(&app->show, app->screen.cols, app->screen.rows, app->rockets);
+  app->need_resize = 0;
 }
 
 /* -------------------------------------------------------------------- */
@@ -804,170 +783,172 @@ static void app_do_resize(App *app)
  * Rocket count changes update show.active_rockets in-place — no restart.
  * Newly activated slots have already been zeroed / parked in show_init.
  */
-static bool app_handle_key(App *app, int ch)
-{
-    switch (ch) {
+static bool app_handle_key(App *app, int ch) {
+  switch (ch) {
 
-    case 'q': case 'Q': case 27 /* ESC */:
-        return false;
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
 
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    case '=': case '+':
-        if (app->rockets < ROCKETS_MAX) {
-            /* Activate the next parked slot with a short fuse. */
-            int i = app->rockets;
-            rocket_launch(&app->show.rockets[i],
-                          app->screen.cols, app->screen.rows);
-            app->show.rockets[i].fuse  = 5;
-            app->show.rockets[i].state = RS_IDLE;
-            app->rockets++;
-            app->show.active_rockets = app->rockets;
-        }
-        break;
-
-    case '-':
-        if (app->rockets > ROCKETS_MIN) {
-            app->rockets--;
-            app->show.active_rockets = app->rockets;
-        }
-        break;
-
-    case 't':
-        app->current_theme = (app->current_theme + 1) % N_THEMES;
-        theme_apply(app->current_theme);
-        break;
-
-    case 'T':
-        app->current_theme = (app->current_theme + N_THEMES - 1) % N_THEMES;
-        theme_apply(app->current_theme);
-        break;
-
-    default:
-        break;
+  case '=':
+  case '+':
+    if (app->rockets < ROCKETS_MAX) {
+      /* Activate the next parked slot with a short fuse. */
+      int i = app->rockets;
+      rocket_launch(&app->show.rockets[i], app->screen.cols, app->screen.rows);
+      app->show.rockets[i].fuse = 5;
+      app->show.rockets[i].state = RS_IDLE;
+      app->rockets++;
+      app->show.active_rockets = app->rockets;
     }
+    break;
 
-    return true;
+  case '-':
+    if (app->rockets > ROCKETS_MIN) {
+      app->rockets--;
+      app->show.active_rockets = app->rockets;
+    }
+    break;
+
+  case 't':
+    app->current_theme = (app->current_theme + 1) % N_THEMES;
+    theme_apply(app->current_theme);
+    break;
+
+  case 'T':
+    app->current_theme = (app->current_theme + N_THEMES - 1) % N_THEMES;
+    theme_apply(app->current_theme);
+    break;
+
+  default:
+    break;
+  }
+
+  return true;
 }
 
 /* -------------------------------------------------------------------- */
 /* main — dt simulation loop                                             */
 /* -------------------------------------------------------------------- */
 
-int main(void)
-{
-    srand((unsigned int)clock_ns());
+int main(void) {
+  srand((unsigned int)clock_ns());
 
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app           = &g_app;
-    app->running       = 1;
-    app->sim_fps       = SIM_FPS_DEFAULT;
-    app->rockets       = ROCKETS_DEFAULT;
-    app->current_theme = 0;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
+  app->rockets = ROCKETS_DEFAULT;
+  app->current_theme = 0;
 
-    screen_init(&app->screen);
+  screen_init(&app->screen);
 
-    int cols = app->screen.cols;
-    int rows = app->screen.rows;
+  int cols = app->screen.cols;
+  int rows = app->screen.rows;
 
-    show_init(&app->show, cols, rows, app->rockets);
+  show_init(&app->show, cols, rows, app->rockets);
 
-    /*
-     * dt loop state
-     * -------------
-     * frame_time   — absolute ns timestamp at start of last frame
-     * sim_accum    — ns banked but not yet consumed by sim ticks
-     * fps_accum    — ns elapsed since last FPS measurement
-     * frame_count  — frames rendered in the current FPS window
-     * fps_display  — last computed FPS value shown in HUD
-     */
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  /*
+   * dt loop state
+   * -------------
+   * frame_time   — absolute ns timestamp at start of last frame
+   * sim_accum    — ns banked but not yet consumed by sim ticks
+   * fps_accum    — ns elapsed since last FPS measurement
+   * frame_count  — frames rendered in the current FPS window
+   * fps_display  — last computed FPS value shown in HUD
+   */
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        /* ── resize check ────────────────────────────────────────── */
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();   /* reset dt after stall */
-            sim_accum  = 0;
-        }
-
-        /* ── dt measurement ──────────────────────────────────────── */
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-
-        /* Clamp: don't try to catch up after a stall > 100 ms. */
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        /* ── simulation accumulator ──────────────────────────────── */
-        /*
-         * sim_fps is read fresh each iteration so ] / [ take effect
-         * immediately without restarting or resetting anything.
-         * dt_sec is computed once per tick batch so physics is stable.
-         */
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            show_tick(&app->show, dt_sec, app->screen.cols, app->screen.rows);
-            sim_accum -= tick_ns;
-        }
-
-        float alpha = (float)sim_accum / (float)tick_ns;
-        (void)alpha;
-
-        /* ── HUD counter ─────────────────────────────────────────── */
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        int64_t budget  = NS_PER_SEC / 60;
-        clock_sleep_ns(budget - elapsed);
-
-        /* ── render ──────────────────────────────────────────────── */
-        screen_draw_show(&app->screen, &app->show);
-
-        /* ── HUD (into stdscr after scene, drawn on top) ─────────── */
-        screen_draw_hud(&app->screen, fps_display,
-                         app->sim_fps, app->rockets,
-                         themes[app->current_theme].name);
-
-        screen_present();
-
-        /* ── input ───────────────────────────────────────────────── */
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    /* ── resize check ────────────────────────────────────────── */
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns(); /* reset dt after stall */
+      sim_accum = 0;
     }
 
-    /* ── cleanup ─────────────────────────────────────────────────── */
-    show_free(&app->show);
-    screen_free(&app->screen);   /* calls endwin() */
+    /* ── dt measurement ──────────────────────────────────────── */
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
 
-    return 0;
+    /* Clamp: don't try to catch up after a stall > 100 ms. */
+    if (dt > 100 * NS_PER_MS)
+      dt = 100 * NS_PER_MS;
+
+    /* ── simulation accumulator ──────────────────────────────── */
+    /*
+     * sim_fps is read fresh each iteration so ] / [ take effect
+     * immediately without restarting or resetting anything.
+     * dt_sec is computed once per tick batch so physics is stable.
+     */
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
+
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      show_tick(&app->show, dt_sec, app->screen.cols, app->screen.rows);
+      sim_accum -= tick_ns;
+    }
+
+    float alpha = (float)sim_accum / (float)tick_ns;
+    (void)alpha;
+
+    /* ── HUD counter ─────────────────────────────────────────── */
+    frame_count++;
+    fps_accum += dt;
+    if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display =
+          (double)frame_count / ((double)fps_accum / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accum = 0;
+    }
+
+    /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    int64_t budget = NS_PER_SEC / 60;
+    clock_sleep_ns(budget - elapsed);
+
+    /* ── render ──────────────────────────────────────────────── */
+    screen_draw_show(&app->screen, &app->show);
+
+    /* ── HUD (into stdscr after scene, drawn on top) ─────────── */
+    screen_draw_hud(&app->screen, fps_display, app->sim_fps, app->rockets,
+                    themes[app->current_theme].name);
+
+    screen_present();
+
+    /* ── input ───────────────────────────────────────────────── */
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  /* ── cleanup ─────────────────────────────────────────────────── */
+  show_free(&app->show);
+  screen_free(&app->screen); /* calls endwin() */
+
+  return 0;
 }

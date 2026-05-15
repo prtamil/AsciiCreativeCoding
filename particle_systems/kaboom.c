@@ -7,7 +7,8 @@
  *   - Single stdscr, ncurses internal double buffer — no flicker
  *   - typeahead(-1) — no mid-flush input polling, no tearing
  *   - HUD written into stdscr after blast (always on top)
- *   - dt (delta-time) loop drives playback speed independently of CPU, render capped at 60 fps
+ *   - dt (delta-time) loop drives playback speed independently of CPU, render
+ * capped at 60 fps
  *   - SIGWINCH resize: rebuilds scene + restarts blast
  *   - Speed control:   ] = faster   [ = slower
  *   - Restart:         r = replay current theme+shape from frame 0
@@ -212,10 +213,10 @@
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 #ifndef M_1_PI
-#  define M_1_PI (1.0 / M_PI)
+#define M_1_PI (1.0 / M_PI)
 #endif
 
 #include <math.h>
@@ -223,53 +224,52 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ===================================================================== */
 /* §1  config                                                             */
 /* ===================================================================== */
 
 enum {
-    SIM_FPS_MIN     =  5,
-    SIM_FPS_DEFAULT = 30,
-    SIM_FPS_MAX     = 60,
-    SIM_FPS_STEP    =  5,
+  SIM_FPS_MIN = 5,
+  SIM_FPS_DEFAULT = 30,
+  SIM_FPS_MAX = 60,
+  SIM_FPS_STEP = 5,
 
-    NUM_FRAMES      = 150,
-    NUM_BLOBS       = 800,
+  NUM_FRAMES = 150,
+  NUM_BLOBS = 800,
 
-    HUD_COLS        =  28,
-    FPS_UPDATE_MS   = 500,
+  HUD_COLS = 28,
+  FPS_UPDATE_MS = 500,
 };
 
-#define NS_PER_SEC    1000000000LL
-#define NS_PER_MS     1000000LL
-#define TICK_NS(fps)  (NS_PER_SEC / (fps))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(fps) (NS_PER_SEC / (fps))
 
-#define PERSPECTIVE   50.0
+#define PERSPECTIVE 50.0
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ===================================================================== */
@@ -277,14 +277,14 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 typedef enum {
-    COL_FLASH  = 1,
-    COL_INNER  = 2,
-    COL_WAVE   = 3,
-    COL_BLOB_F = 4,
-    COL_BLOB_M = 5,
-    COL_BLOB_N = 6,
-    COL_HUD    = 7,    /* top-row status bar — bright yellow on black  */
-    COL_HINT   = 8,    /* bottom-row key hints — bright cyan on black  */
+  COL_FLASH = 1,
+  COL_INNER = 2,
+  COL_WAVE = 3,
+  COL_BLOB_F = 4,
+  COL_BLOB_M = 5,
+  COL_BLOB_N = 6,
+  COL_HUD = 7,  /* top-row status bar — bright yellow on black  */
+  COL_HINT = 8, /* bottom-row key hints — bright cyan on black  */
 } ColorID;
 
 /*
@@ -349,33 +349,34 @@ typedef enum {
  *   9 ECLIPSE  — bloodmoon: white flash, orange inner, dark red wave
  */
 typedef struct {
-    const char *name;
-    int flash, inner, wave, blob_f, blob_m, blob_n;    /* 256-color    */
-    int f8_flash, f8_inner, f8_wave, f8_bm, f8_bn;     /* 8-color      */
+  const char *name;
+  int flash, inner, wave, blob_f, blob_m, blob_n; /* 256-color    */
+  int f8_flash, f8_inner, f8_wave, f8_bm, f8_bn;  /* 8-color      */
 } BlastTheme;
 
 static const BlastTheme k_themes[] = {
-    /* name       flash inner wave  blob_f blob_m blob_n   8-color: flash       inner          wave           bm             bn */
-    { "MATRIX",   231,  118,   40,  250,   154,    46,
-      COLOR_WHITE, COLOR_GREEN,   COLOR_GREEN,   COLOR_GREEN,   COLOR_GREEN   },
-    { "FIRE",     231,  214,   94,  250,   220,   196,
-      COLOR_WHITE, COLOR_YELLOW,  COLOR_RED,     COLOR_YELLOW,  COLOR_RED     },
-    { "OCEANIC",  231,  159,   31,  195,    87,    39,
-      COLOR_WHITE, COLOR_CYAN,    COLOR_BLUE,    COLOR_CYAN,    COLOR_BLUE    },
-    { "NEON",     231,  201,   93,  219,   207,   165,
-      COLOR_WHITE, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA },
-    { "MONO",     231,  253,  245,  251,   247,   244,
-      COLOR_WHITE, COLOR_WHITE,   COLOR_WHITE,   COLOR_WHITE,   COLOR_WHITE   },
-    { "ICE",      231,   51,   27,  195,   123,    39,
-      COLOR_WHITE, COLOR_CYAN,    COLOR_BLUE,    COLOR_CYAN,    COLOR_BLUE    },
-    { "NOVA",     231,  226,  202,  255,   220,   208,
-      COLOR_WHITE, COLOR_YELLOW,  COLOR_YELLOW,  COLOR_YELLOW,  COLOR_YELLOW  },
-    { "FOREST",   230,  154,   64,  230,   184,    70,
-      COLOR_WHITE, COLOR_GREEN,   COLOR_GREEN,   COLOR_YELLOW,  COLOR_GREEN   },
-    { "DESERT",   230,  223,  130,  230,   215,   172,
-      COLOR_WHITE, COLOR_YELLOW,  COLOR_RED,     COLOR_YELLOW,  COLOR_RED     },
-    { "ECLIPSE",  231,  208,   52,  250,   202,    88,
-      COLOR_WHITE, COLOR_RED,     COLOR_RED,     COLOR_RED,     COLOR_RED     },
+    /* name       flash inner wave  blob_f blob_m blob_n   8-color: flash inner
+       wave           bm             bn */
+    {"MATRIX", 231, 118, 40, 250, 154, 46, COLOR_WHITE, COLOR_GREEN,
+     COLOR_GREEN, COLOR_GREEN, COLOR_GREEN},
+    {"FIRE", 231, 214, 94, 250, 220, 196, COLOR_WHITE, COLOR_YELLOW, COLOR_RED,
+     COLOR_YELLOW, COLOR_RED},
+    {"OCEANIC", 231, 159, 31, 195, 87, 39, COLOR_WHITE, COLOR_CYAN, COLOR_BLUE,
+     COLOR_CYAN, COLOR_BLUE},
+    {"NEON", 231, 201, 93, 219, 207, 165, COLOR_WHITE, COLOR_MAGENTA,
+     COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA},
+    {"MONO", 231, 253, 245, 251, 247, 244, COLOR_WHITE, COLOR_WHITE,
+     COLOR_WHITE, COLOR_WHITE, COLOR_WHITE},
+    {"ICE", 231, 51, 27, 195, 123, 39, COLOR_WHITE, COLOR_CYAN, COLOR_BLUE,
+     COLOR_CYAN, COLOR_BLUE},
+    {"NOVA", 231, 226, 202, 255, 220, 208, COLOR_WHITE, COLOR_YELLOW,
+     COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW},
+    {"FOREST", 230, 154, 64, 230, 184, 70, COLOR_WHITE, COLOR_GREEN,
+     COLOR_GREEN, COLOR_YELLOW, COLOR_GREEN},
+    {"DESERT", 230, 223, 130, 230, 215, 172, COLOR_WHITE, COLOR_YELLOW,
+     COLOR_RED, COLOR_YELLOW, COLOR_RED},
+    {"ECLIPSE", 231, 208, 52, 250, 202, 88, COLOR_WHITE, COLOR_RED, COLOR_RED,
+     COLOR_RED, COLOR_RED},
 };
 
 #define THEME_COUNT (int)(sizeof k_themes / sizeof k_themes[0])
@@ -385,34 +386,32 @@ static const BlastTheme k_themes[] = {
  * Safe to call mid-run; takes effect on the next rendered frame.
  * COL_HUD stays yellow in every theme for consistent readability.
  */
-static void color_theme_apply(int t)
-{
-    const BlastTheme *th = &k_themes[t];
-    if (COLORS >= 256) {
-        init_pair(COL_FLASH,  th->flash,  COLOR_BLACK);
-        init_pair(COL_INNER,  th->inner,  COLOR_BLACK);
-        init_pair(COL_WAVE,   th->wave,   COLOR_BLACK);
-        init_pair(COL_BLOB_F, th->blob_f, COLOR_BLACK);
-        init_pair(COL_BLOB_M, th->blob_m, COLOR_BLACK);
-        init_pair(COL_BLOB_N, th->blob_n, COLOR_BLACK);
-        init_pair(COL_HUD,    226,        COLOR_BLACK);
-        init_pair(COL_HINT,    51,        COLOR_BLACK);
-    } else {
-        init_pair(COL_FLASH,  th->f8_flash, COLOR_BLACK);
-        init_pair(COL_INNER,  th->f8_inner, COLOR_BLACK);
-        init_pair(COL_WAVE,   th->f8_wave,  COLOR_BLACK);
-        init_pair(COL_BLOB_F, th->f8_flash, COLOR_BLACK);
-        init_pair(COL_BLOB_M, th->f8_bm,   COLOR_BLACK);
-        init_pair(COL_BLOB_N, th->f8_bn,   COLOR_BLACK);
-        init_pair(COL_HUD,    COLOR_YELLOW, COLOR_BLACK);
-        init_pair(COL_HINT,   COLOR_CYAN,   COLOR_BLACK);
-    }
+static void color_theme_apply(int t) {
+  const BlastTheme *th = &k_themes[t];
+  if (COLORS >= 256) {
+    init_pair(COL_FLASH, th->flash, COLOR_BLACK);
+    init_pair(COL_INNER, th->inner, COLOR_BLACK);
+    init_pair(COL_WAVE, th->wave, COLOR_BLACK);
+    init_pair(COL_BLOB_F, th->blob_f, COLOR_BLACK);
+    init_pair(COL_BLOB_M, th->blob_m, COLOR_BLACK);
+    init_pair(COL_BLOB_N, th->blob_n, COLOR_BLACK);
+    init_pair(COL_HUD, 226, COLOR_BLACK);
+    init_pair(COL_HINT, 51, COLOR_BLACK);
+  } else {
+    init_pair(COL_FLASH, th->f8_flash, COLOR_BLACK);
+    init_pair(COL_INNER, th->f8_inner, COLOR_BLACK);
+    init_pair(COL_WAVE, th->f8_wave, COLOR_BLACK);
+    init_pair(COL_BLOB_F, th->f8_flash, COLOR_BLACK);
+    init_pair(COL_BLOB_M, th->f8_bm, COLOR_BLACK);
+    init_pair(COL_BLOB_N, th->f8_bn, COLOR_BLACK);
+    init_pair(COL_HUD, COLOR_YELLOW, COLOR_BLACK);
+    init_pair(COL_HINT, COLOR_CYAN, COLOR_BLACK);
+  }
 }
 
-static void color_init(int theme)
-{
-    start_color();
-    color_theme_apply(theme);
+static void color_init(int theme) {
+  start_color();
+  color_theme_apply(theme);
 }
 
 /* ===================================================================== */
@@ -440,14 +439,13 @@ static void color_init(int theme)
  * or tall column per shape — no per-shape pool needed.
  */
 typedef struct {
-    double x, y, z;
+  double x, y, z;
 } Blob;
 
-static double prng(void)
-{
-    static long long s = 1;
-    s = s * 1488248101LL + 981577151LL;
-    return ((s % 65536) - 32768) / 32768.0;
+static double prng(void) {
+  static long long s = 1;
+  s = s * 1488248101LL + 981577151LL;
+  return ((s % 65536) - 32768) / 32768.0;
 }
 
 /*
@@ -464,22 +462,20 @@ static double prng(void)
  *      radial thickness instead of every blob leaving at exactly
  *      the same rate.
  */
-static void blob_sample_unit_direction(Blob *out)
-{
-    double bx = prng();
-    double by = prng();
-    double bz = prng();
-    double br = sqrt(bx*bx + by*by + bz*bz);
-    out->x = (bx / br)         * (1.3 + 0.2 * prng());
-    out->y = (0.5 * by / br)   * (1.3 + 0.2 * prng());
-    out->z = (bz / br)         * (1.3 + 0.2 * prng());
+static void blob_sample_unit_direction(Blob *out) {
+  double bx = prng();
+  double by = prng();
+  double bz = prng();
+  double br = sqrt(bx * bx + by * by + bz * bz);
+  out->x = (bx / br) * (1.3 + 0.2 * prng());
+  out->y = (0.5 * by / br) * (1.3 + 0.2 * prng());
+  out->z = (bz / br) * (1.3 + 0.2 * prng());
 }
 
 /* Fill the pool with NUM_BLOBS independent direction samples. */
-static void blob_init_pool(Blob *blobs)
-{
-    for (int i = 0; i < NUM_BLOBS; i++)
-        blob_sample_unit_direction(&blobs[i]);
+static void blob_init_pool(Blob *blobs) {
+  for (int i = 0; i < NUM_BLOBS; i++)
+    blob_sample_unit_direction(&blobs[i]);
 }
 
 /*
@@ -538,54 +534,35 @@ static void blob_init_pool(Blob *blobs)
  *                 (densest). Length controls wave THICKNESS in cells.
  */
 typedef struct {
-    const char *name;
-    double      petal_n;
-    double      ripple;
-    double      disc_speed;
-    double      y_squash;
-    double      persp;
-    double      blob_speed;
-    const char *flash_chars;
-    const char *wave_chars;
+  const char *name;
+  double petal_n;
+  double ripple;
+  double disc_speed;
+  double y_squash;
+  double persp;
+  double blob_speed;
+  const char *flash_chars;
+  const char *wave_chars;
 } BlastShape;
 
 static const BlastShape k_shapes[] = {
-    {   /* 0  classic — original algorithm */
-        "classic",
-        16.0, 0.3, 2.0, 0.5, 50.0, 1.0,
-        "T%@W#H=+~-:.",
-        " .:!HIOMW#%$&@08O=+-"
-    },
-    {   /* 1  star — 6-pointed, slow thick wave, tall blob column */
-        "star",
-        6.0,  0.45, 1.5, 1.6, 35.0, 0.8,
-        "*+oO0@#%&$!^~",
-        " `.-:=+*oO0#@%$"
-    },
-    {   /* 2  ring — smooth sphere, fast thin ring, flat disc blobs */
-        "ring",
-        0.0,  0.0,  3.0, 0.3, 70.0, 1.4,
-        "o0OQ@#%&$()[]{}",
-        " .,:;!|/\\-=+~*oO"
-    },
-    {   /* 3  cross — 4 lobes, medium speed, medium depth */
-        "cross",
-        4.0,  0.5,  2.5, 0.8, 45.0, 1.1,
-        "#@WMH+|=~-:.",
-        " :-=+|H#@WM0O%$"
-    },
-    {   /* 4  nova — 12 lobes, very fast, deep 3D blobs */
-        "nova",
-        12.0, 0.35, 3.5, 1.0, 80.0, 1.6,
-        "%$&#@!*+~-:.",
-        " .`'^-~=+*#@$%&!"
-    },
-    {   /* 5  pulse — asymmetric teardrop, slow, very flat blobs */
-        "pulse",
-        3.0,  0.6,  1.2, 0.25, 25.0, 0.7,
-        "~-:.+=#@*oO0Q",
-        " ..,::==++##@@%%"
-    },
+    {/* 0  classic — original algorithm */
+     "classic", 16.0, 0.3, 2.0, 0.5, 50.0, 1.0, "T%@W#H=+~-:.",
+     " .:!HIOMW#%$&@08O=+-"},
+    {/* 1  star — 6-pointed, slow thick wave, tall blob column */
+     "star", 6.0, 0.45, 1.5, 1.6, 35.0, 0.8, "*+oO0@#%&$!^~",
+     " `.-:=+*oO0#@%$"},
+    {/* 2  ring — smooth sphere, fast thin ring, flat disc blobs */
+     "ring", 0.0, 0.0, 3.0, 0.3, 70.0, 1.4, "o0OQ@#%&$()[]{}",
+     " .,:;!|/\\-=+~*oO"},
+    {/* 3  cross — 4 lobes, medium speed, medium depth */
+     "cross", 4.0, 0.5, 2.5, 0.8, 45.0, 1.1, "#@WMH+|=~-:.", " :-=+|H#@WM0O%$"},
+    {/* 4  nova — 12 lobes, very fast, deep 3D blobs */
+     "nova", 12.0, 0.35, 3.5, 1.0, 80.0, 1.6, "%$&#@!*+~-:.",
+     " .`'^-~=+*#@$%&!"},
+    {/* 5  pulse — asymmetric teardrop, slow, very flat blobs */
+     "pulse", 3.0, 0.6, 1.2, 0.25, 25.0, 0.7, "~-:.+=#@*oO0Q",
+     " ..,::==++##@@%%"},
 };
 
 #define SHAPE_COUNT (int)(sizeof k_shapes / sizeof k_shapes[0])
@@ -610,8 +587,8 @@ static const BlastShape k_shapes[] = {
  * everything else on screen.
  */
 typedef struct {
-    char    ch;
-    ColorID color;
+  char ch;
+  ColorID color;
 } Cell;
 
 /*
@@ -678,38 +655,35 @@ typedef struct {
  *           everything else).
  */
 typedef struct {
-    Blob  blobs[NUM_BLOBS];
-    Cell *cells;
-    int   cols;
-    int   rows;
-    int   frame;
-    int   theme;
-    int   shape;
-    bool  done;
+  Blob blobs[NUM_BLOBS];
+  Cell *cells;
+  int cols;
+  int rows;
+  int frame;
+  int theme;
+  int shape;
+  bool done;
 } Blast;
 
-static void blast_alloc_cells(Blast *b)
-{
-    b->cells = calloc((size_t)(b->cols * b->rows), sizeof(Cell));
+static void blast_alloc_cells(Blast *b) {
+  b->cells = calloc((size_t)(b->cols * b->rows), sizeof(Cell));
 }
 
-static void blast_init(Blast *b, int cols, int rows, int theme, int shape)
-{
-    b->cols  = cols;
-    b->rows  = rows;
-    b->frame = 0;
-    b->theme = theme;
-    b->shape = shape;
-    b->done  = false;
-    blast_alloc_cells(b);
-    blob_init_pool(b->blobs);
-    color_theme_apply(theme);
+static void blast_init(Blast *b, int cols, int rows, int theme, int shape) {
+  b->cols = cols;
+  b->rows = rows;
+  b->frame = 0;
+  b->theme = theme;
+  b->shape = shape;
+  b->done = false;
+  blast_alloc_cells(b);
+  blob_init_pool(b->blobs);
+  color_theme_apply(theme);
 }
 
-static void blast_free(Blast *b)
-{
-    free(b->cells);
-    *b = (Blast){0};
+static void blast_free(Blast *b) {
+  free(b->cells);
+  *b = (Blast){0};
 }
 
 /* ── Pure-math helpers ───────────────────────────────────────────── */
@@ -718,9 +692,8 @@ static void blast_free(Blast *b)
  * y² is weighted ×4 to keep a circle in cell-space looking circular
  * on screen. Used by both the disc layer (frames 1-7) and the
  * shockwave layer (frames ≥ 8). */
-static inline double aspect_radius(int x, int y)
-{
-    return sqrt((double)(x * x) + 4.0 * (double)(y * y));
+static inline double aspect_radius(int x, int y) {
+  return sqrt((double)(x * x) + 4.0 * (double)(y * y));
 }
 
 /* Angular lobe modulation: 1 + ripple·cos(petal_n · θ), with θ
@@ -729,19 +702,18 @@ static inline double aspect_radius(int x, int y)
  * petal_n ≤ 0 is the "smooth ring" guard — cos(0) = 1 would still
  * add a constant amplitude bump, so we short-circuit to 1.0 to keep
  * the ring perfectly round. */
-static inline double petal_lobe(int x, int y, double petal_n, double ripple)
-{
-    if (petal_n <= 0.0) return 1.0;
-    double angle = atan2((double)y * 2.0 + 0.01, (double)x + 0.01);
-    return 1.0 + ripple * cos(petal_n * angle);
+static inline double petal_lobe(int x, int y, double petal_n, double ripple) {
+  if (petal_n <= 0.0)
+    return 1.0;
+  double angle = atan2((double)y * 2.0 + 0.01, (double)x + 0.01);
+  return 1.0 + ripple * cos(petal_n * angle);
 }
 
 /* Pinhole projection along one axis: b_screen = b · P / (bz + P).
  * Called twice per blob, once each for x and y. The same P also
  * appears in the z-cull bounds and the depth-bucket cutoffs. */
-static inline double perspective_project(double b, double bz, double persp)
-{
-    return b * persp / (bz + persp);
+static inline double perspective_project(double b, double bz, double persp) {
+  return b * persp / (bz + persp);
 }
 
 /* ── Per-cell painters (one cell, one frame phase) ───────────────── */
@@ -750,33 +722,30 @@ static inline double perspective_project(double b, double bz, double persp)
  * skip cells no layer wrote, which is how the black background stays
  * black without an explicit fill pass. Default colour is COL_WAVE so
  * callers only assign colour when they paint a different layer. */
-static inline void cell_clear(Cell *c)
-{
-    c->ch    = 0;
-    c->color = COL_WAVE;
+static inline void cell_clear(Cell *c) {
+  c->ch = 0;
+  c->color = COL_WAVE;
 }
 
 /* Frame 0: plant a single bright '*' at the blast origin so the eye is
  * drawn there before the disc bloom and shockwave take over. */
-static inline void cell_paint_origin_flash(Cell *c, int x, int y)
-{
-    if (x == 0 && y == 0) {
-        c->ch    = '*';
-        c->color = COL_FLASH;
-    }
+static inline void cell_paint_origin_flash(Cell *c, int x, int y) {
+  if (x == 0 && y == 0) {
+    c->ch = '*';
+    c->color = COL_FLASH;
+  }
 }
 
 /* Frames 1..7: filled '@' fireball disc growing at disc_speed cells
  * per frame. Uniform colour, no angular modulation. The disc-to-wave
  * handoff happens implicitly at frame == 8 when the caller switches
  * to cell_paint_shockwave. */
-static inline void cell_paint_disc(Cell *c, int x, int y,
-                                   int frame, double disc_speed)
-{
-    if (aspect_radius(x, y) < (double)frame * disc_speed) {
-        c->ch    = '@';
-        c->color = COL_FLASH;
-    }
+static inline void cell_paint_disc(Cell *c, int x, int y, int frame,
+                                   double disc_speed) {
+  if (aspect_radius(x, y) < (double)frame * disc_speed) {
+    c->ch = '@';
+    c->color = COL_FLASH;
+  }
 }
 
 /* Frames ≥ 8: angular shockwave with petal-modulated radius.
@@ -792,23 +761,22 @@ static inline void cell_paint_disc(Cell *c, int x, int y,
  * The per-cell prng() call jitters the radius so the wave is not a
  * perfectly regular curve — gives the explosion a noisy, organic edge. */
 static inline void cell_paint_shockwave(Cell *c, int x, int y, int frame,
-                                        const BlastShape *sh,
-                                        int flash_len, int wave_len)
-{
-    double lobe = petal_lobe(x, y, sh->petal_n, sh->ripple);
-    double r    = aspect_radius(x, y) * (0.5 + (prng() / 3.0) * lobe * 0.3);
-    int    v    = frame - (int)r - 7;
+                                        const BlastShape *sh, int flash_len,
+                                        int wave_len) {
+  double lobe = petal_lobe(x, y, sh->petal_n, sh->ripple);
+  double r = aspect_radius(x, y) * (0.5 + (prng() / 3.0) * lobe * 0.3);
+  int v = frame - (int)r - 7;
 
-    if (v < 0) {
-        int fi = frame - 8;
-        if (fi >= 0 && fi < flash_len) {
-            c->ch    = sh->flash_chars[fi];
-            c->color = COL_INNER;
-        }
-    } else if (v < wave_len) {
-        c->ch    = sh->wave_chars[v];
-        c->color = (v < wave_len / 2) ? COL_INNER : COL_WAVE;
+  if (v < 0) {
+    int fi = frame - 8;
+    if (fi >= 0 && fi < flash_len) {
+      c->ch = sh->flash_chars[fi];
+      c->color = COL_INNER;
     }
+  } else if (v < wave_len) {
+    c->ch = sh->wave_chars[v];
+    c->color = (v < wave_len / 2) ? COL_INNER : COL_WAVE;
+  }
 }
 
 /* ── Wave-layer driver (the (x, y) double loop) ──────────────────── */
@@ -817,32 +785,33 @@ static inline void cell_paint_shockwave(Cell *c, int x, int y, int frame,
  * phase-of-blast applies for this frame. The frame-phase decision
  * happens once per cell (cheap branch the predictor nails), so a
  * single loop fans out into three distinct visual stages. */
-static void wave_layer_render(Blast *b)
-{
-    const int cols  = b->cols;
-    const int rows  = b->rows;
-    const int frame = b->frame;
-    const BlastShape *sh = &k_shapes[b->shape];
+static void wave_layer_render(Blast *b) {
+  const int cols = b->cols;
+  const int rows = b->rows;
+  const int frame = b->frame;
+  const BlastShape *sh = &k_shapes[b->shape];
 
-    const int minx = -(cols / 2);
-    const int maxx = cols + minx - 1;
-    const int miny = -(rows / 2);
-    const int maxy = rows + miny - 1;
+  const int minx = -(cols / 2);
+  const int maxx = cols + minx - 1;
+  const int miny = -(rows / 2);
+  const int maxy = rows + miny - 1;
 
-    const int flash_len = (int)strlen(sh->flash_chars);
-    const int wave_len  = (int)strlen(sh->wave_chars);
+  const int flash_len = (int)strlen(sh->flash_chars);
+  const int wave_len = (int)strlen(sh->wave_chars);
 
-    Cell *p = b->cells;
-    for (int y = miny; y <= maxy; y++) {
-        for (int x = minx; x <= maxx; x++) {
-            cell_clear(p);
-            if      (frame == 0) cell_paint_origin_flash(p, x, y);
-            else if (frame  < 8) cell_paint_disc       (p, x, y, frame, sh->disc_speed);
-            else                 cell_paint_shockwave  (p, x, y, frame, sh,
-                                                        flash_len, wave_len);
-            p++;
-        }
+  Cell *p = b->cells;
+  for (int y = miny; y <= maxy; y++) {
+    for (int x = minx; x <= maxx; x++) {
+      cell_clear(p);
+      if (frame == 0)
+        cell_paint_origin_flash(p, x, y);
+      else if (frame < 8)
+        cell_paint_disc(p, x, y, frame, sh->disc_speed);
+      else
+        cell_paint_shockwave(p, x, y, frame, sh, flash_len, wave_len);
+      p++;
     }
+  }
 }
 
 /* ── Per-blob painter and blob-layer driver ──────────────────────── */
@@ -853,12 +822,18 @@ static void wave_layer_render(Blast *b)
  *   bz > -0.4·P → 'o' COL_BLOB_M  (middle distance)
  *   else        → '@' COL_BLOB_N  (near — bold lump)
  */
-static inline void blob_depth_bucket(double bz, double persp,
-                                     char *out_glyph, ColorID *out_color)
-{
-    if      (bz >  persp * 0.8) { *out_glyph = '.'; *out_color = COL_BLOB_F; }
-    else if (bz > -persp * 0.4) { *out_glyph = 'o'; *out_color = COL_BLOB_M; }
-    else                        { *out_glyph = '@'; *out_color = COL_BLOB_N; }
+static inline void blob_depth_bucket(double bz, double persp, char *out_glyph,
+                                     ColorID *out_color) {
+  if (bz > persp * 0.8) {
+    *out_glyph = '.';
+    *out_color = COL_BLOB_F;
+  } else if (bz > -persp * 0.4) {
+    *out_glyph = 'o';
+    *out_color = COL_BLOB_M;
+  } else {
+    *out_glyph = '@';
+    *out_color = COL_BLOB_N;
+  }
 }
 
 /* Project one 3-D blob to a 2-D Cell, or cull it.
@@ -870,39 +845,38 @@ static inline void blob_depth_bucket(double bz, double persp,
  *   depth glyph:    via blob_depth_bucket
  * The single Cell write at the end overwrites whatever the wave layer
  * left in that slot — this is the "blobs on top" layer ordering rule. */
-static void blob_paint_projected(const Blob *blob, Cell *cells,
-                                 int cols, int rows,
-                                 int frame, const BlastShape *sh)
-{
-    const double persp  = sh->persp;
-    const double bspeed = sh->blob_speed;
-    const int    t      = frame - 6;
+static void blob_paint_projected(const Blob *blob, Cell *cells, int cols,
+                                 int rows, int frame, const BlastShape *sh) {
+  const double persp = sh->persp;
+  const double bspeed = sh->blob_speed;
+  const int t = frame - 6;
 
-    double bx = blob->x * t * bspeed;
-    double by = blob->y * t * bspeed * sh->y_squash;
-    double bz = blob->z * t * bspeed;
+  double bx = blob->x * t * bspeed;
+  double by = blob->y * t * bspeed * sh->y_squash;
+  double bz = blob->z * t * bspeed;
 
-    if (bz < 5.0 - persp || bz > persp) return;
+  if (bz < 5.0 - persp || bz > persp)
+    return;
 
-    int cx = cols / 2 + (int)perspective_project(bx, bz, persp);
-    int cy = rows / 2 + (int)perspective_project(by, bz, persp);
-    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+  int cx = cols / 2 + (int)perspective_project(bx, bz, persp);
+  int cy = rows / 2 + (int)perspective_project(by, bz, persp);
+  if (cx < 0 || cx >= cols || cy < 0 || cy >= rows)
+    return;
 
-    Cell *c = &cells[cy * cols + cx];
-    blob_depth_bucket(bz, persp, &c->ch, &c->color);
+  Cell *c = &cells[cy * cols + cx];
+  blob_depth_bucket(bz, persp, &c->ch, &c->color);
 }
 
 /* Sweep the whole blob cloud and project each into the cell buffer.
  * Called only when frame > 6 — earlier ticks belong entirely to the
  * disc/origin-flash layers. Runs AFTER wave_layer_render so blobs
  * overdraw the shockwave at any cell they both touch. */
-static void blob_layer_render(Blast *b)
-{
-    const BlastShape *sh = &k_shapes[b->shape];
-    for (int j = 0; j < NUM_BLOBS; j++) {
-        blob_paint_projected(&b->blobs[j], b->cells,
-                             b->cols, b->rows, b->frame, sh);
-    }
+static void blob_layer_render(Blast *b) {
+  const BlastShape *sh = &k_shapes[b->shape];
+  for (int j = 0; j < NUM_BLOBS; j++) {
+    blob_paint_projected(&b->blobs[j], b->cells, b->cols, b->rows, b->frame,
+                         sh);
+  }
 }
 
 /* ── Driver — pseudocode for one frame ──────────────────────────── */
@@ -911,48 +885,48 @@ static void blob_layer_render(Blast *b)
  *   1. wave layer  — origin spark / disc / angular shockwave
  *   2. blob layer  — 3-D debris (frame > 6), overdraws the wave
  */
-static void blast_render_frame(Blast *b)
-{
-    wave_layer_render(b);
-    if (b->frame > 6) blob_layer_render(b);
+static void blast_render_frame(Blast *b) {
+  wave_layer_render(b);
+  if (b->frame > 6)
+    blob_layer_render(b);
 }
 
-static bool blast_tick(Blast *b)
-{
-    if (b->done) return false;
+static bool blast_tick(Blast *b) {
+  if (b->done)
+    return false;
 
-    blast_render_frame(b);
-    b->frame++;
+  blast_render_frame(b);
+  b->frame++;
 
-    if (b->frame >= NUM_FRAMES) {
-        b->done = true;
-        return false;
-    }
+  if (b->frame >= NUM_FRAMES) {
+    b->done = true;
+    return false;
+  }
 
-    return true;
+  return true;
 }
 
 /* Blit one cell to the window if it was painted (ch != 0).
  * COL_FLASH additionally turns on A_BOLD so the initial fireball
  * and disc reads brighter than the wave / blob layers. */
-static inline void cell_blit(WINDOW *w, int x, int y, Cell c)
-{
-    if (!c.ch) return;
-    attr_t attr = COLOR_PAIR(c.color);
-    if (c.color == COL_FLASH) attr |= A_BOLD;
-    wattron(w, attr);
-    mvwaddch(w, y, x, (chtype)(unsigned char)c.ch);
-    wattroff(w, attr);
+static inline void cell_blit(WINDOW *w, int x, int y, Cell c) {
+  if (!c.ch)
+    return;
+  attr_t attr = COLOR_PAIR(c.color);
+  if (c.color == COL_FLASH)
+    attr |= A_BOLD;
+  wattron(w, attr);
+  mvwaddch(w, y, x, (chtype)(unsigned char)c.ch);
+  wattroff(w, attr);
 }
 
 /* Walk the back-buffer and emit ncurses writes for every painted cell.
  * Takes WINDOW* so the same routine drives stdscr or any sub-window. */
-static void blast_draw(const Blast *b, WINDOW *w)
-{
-    const int cols = b->cols;
-    const int rows = b->rows;
-    for (int i = 0; i < cols * rows; i++)
-        cell_blit(w, i % cols, i / cols, b->cells[i]);
+static void blast_draw(const Blast *b, WINDOW *w) {
+  const int cols = b->cols;
+  const int rows = b->rows;
+  for (int i = 0; i < cols * rows; i++)
+    cell_blit(w, i % cols, i / cols, b->cells[i]);
 }
 
 /* ===================================================================== */
@@ -972,40 +946,36 @@ static void blast_draw(const Blast *b, WINDOW *w)
  * stdin, eliminating tearing at high tick rates.
  */
 typedef struct {
-    int cols;
-    int rows;
+  int cols;
+  int rows;
 } Screen;
 
-static void screen_init(Screen *s)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init(0);
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init(0);
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_free(Screen *s)
-{
-    (void)s;
-    endwin();
+static void screen_free(Screen *s) {
+  (void)s;
+  endwin();
 }
 
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_draw_blast(Screen *s, const Blast *b)
-{
-    erase();
-    blast_draw(b, stdscr);
+static void screen_draw_blast(Screen *s, const Blast *b) {
+  erase();
+  blast_draw(b, stdscr);
 }
 
 /*
@@ -1020,37 +990,36 @@ static void screen_draw_blast(Screen *s, const Blast *b)
  * background spans the full width. Drawn AFTER blast_draw so blast
  * glyphs never bleed through.
  */
-static void screen_draw_hud(Screen *s, double fps, int sim_fps,
-                              int frame, int theme, int shape)
-{
-    /* ── Top row: status ──────────────────────────────────────── */
-    char status[200];
-    snprintf(status, sizeof status,
-             " KABOOM   theme:%-7s   shape:%-8s   frame:%3d/%3d   "
-             "%4.1f fps  %2d Hz ",
-             k_themes[theme].name, k_shapes[shape].name,
-             frame, NUM_FRAMES, fps, sim_fps);
+static void screen_draw_hud(Screen *s, double fps, int sim_fps, int frame,
+                            int theme, int shape) {
+  /* ── Top row: status ──────────────────────────────────────── */
+  char status[200];
+  snprintf(status, sizeof status,
+           " KABOOM   theme:%-7s   shape:%-8s   frame:%3d/%3d   "
+           "%4.1f fps  %2d Hz ",
+           k_themes[theme].name, k_shapes[shape].name, frame, NUM_FRAMES, fps,
+           sim_fps);
 
-    attron(COLOR_PAIR(COL_HUD) | A_BOLD);
-    for (int x = 0; x < s->cols; x++) mvaddch(0, x, ' ');
-    mvprintw(0, 0, "%s", status);
-    attroff(COLOR_PAIR(COL_HUD) | A_BOLD);
+  attron(COLOR_PAIR(COL_HUD) | A_BOLD);
+  for (int x = 0; x < s->cols; x++)
+    mvaddch(0, x, ' ');
+  mvprintw(0, 0, "%s", status);
+  attroff(COLOR_PAIR(COL_HUD) | A_BOLD);
 
-    /* ── Bottom row: key hints (every interactive key) ────────── */
-    const char *hints =
-        " q:quit  r:replay  t/T:theme  n/N:shape  ]/[:speed ";
+  /* ── Bottom row: key hints (every interactive key) ────────── */
+  const char *hints = " q:quit  r:replay  t/T:theme  n/N:shape  ]/[:speed ";
 
-    int hint_row = s->rows - 1;
-    attron(COLOR_PAIR(COL_HINT) | A_BOLD);
-    for (int x = 0; x < s->cols; x++) mvaddch(hint_row, x, ' ');
-    mvprintw(hint_row, 0, "%s", hints);
-    attroff(COLOR_PAIR(COL_HINT) | A_BOLD);
+  int hint_row = s->rows - 1;
+  attron(COLOR_PAIR(COL_HINT) | A_BOLD);
+  for (int x = 0; x < s->cols; x++)
+    mvaddch(hint_row, x, ' ');
+  mvprintw(hint_row, 0, "%s", hints);
+  attroff(COLOR_PAIR(COL_HINT) | A_BOLD);
 }
 
-static void screen_present(void)
-{
-    wnoutrefresh(stdscr);
-    doupdate();
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
@@ -1058,163 +1027,172 @@ static void screen_present(void)
 /* ===================================================================== */
 
 typedef struct {
-    Blast                 blast;
-    Screen                screen;
-    int                   sim_fps;
-    int                   theme_idx;  /* live theme; t/T mutate, auto-end bumps */
-    int                   shape_idx;  /* live shape; n/N mutate, auto-end bumps */
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Blast blast;
+  Screen screen;
+  int sim_fps;
+  int theme_idx; /* live theme; t/T mutate, auto-end bumps */
+  int shape_idx; /* live shape; n/N mutate, auto-end bumps */
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
 /* Restart the blast from frame 0 with the current theme + shape indices.
  * Called by r, t, T, n, N, and the auto-end-of-cycle path. */
-static void app_reset_blast(App *app)
-{
-    blast_free(&app->blast);
-    blast_init(&app->blast, app->screen.cols, app->screen.rows,
-               app->theme_idx, app->shape_idx);
+static void app_reset_blast(App *app) {
+  blast_free(&app->blast);
+  blast_init(&app->blast, app->screen.cols, app->screen.rows, app->theme_idx,
+             app->shape_idx);
 }
 
-static void app_do_resize(App *app)
-{
-    blast_free(&app->blast);
-    screen_resize(&app->screen);
-    blast_init(&app->blast, app->screen.cols, app->screen.rows,
-               app->theme_idx, app->shape_idx);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  blast_free(&app->blast);
+  screen_resize(&app->screen);
+  blast_init(&app->blast, app->screen.cols, app->screen.rows, app->theme_idx,
+             app->shape_idx);
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
-    switch (ch) {
-    case 'q': case 'Q': case 27: return false;
+static bool app_handle_key(App *app, int ch) {
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    case 'r': case 'R':
-        app_reset_blast(app);
-        break;
+  case 'r':
+  case 'R':
+    app_reset_blast(app);
+    break;
 
-    case 't':
+  case 't':
+    app->theme_idx = (app->theme_idx + 1) % THEME_COUNT;
+    app_reset_blast(app);
+    break;
+  case 'T':
+    app->theme_idx = (app->theme_idx + THEME_COUNT - 1) % THEME_COUNT;
+    app_reset_blast(app);
+    break;
+
+  case 'n':
+    app->shape_idx = (app->shape_idx + 1) % SHAPE_COUNT;
+    app_reset_blast(app);
+    break;
+  case 'N':
+    app->shape_idx = (app->shape_idx + SHAPE_COUNT - 1) % SHAPE_COUNT;
+    app_reset_blast(app);
+    break;
+
+  default:
+    break;
+  }
+  return true;
+}
+
+int main(void) {
+  srand((unsigned int)clock_ns());
+
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
+
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
+  app->theme_idx = 0;
+  app->shape_idx = 0;
+
+  screen_init(&app->screen);
+  blast_init(&app->blast, app->screen.cols, app->screen.rows, app->theme_idx,
+             app->shape_idx);
+
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
+
+  while (app->running) {
+
+    /* ── resize ──────────────────────────────────────────────── */
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns();
+      sim_accum = 0;
+    }
+
+    /* ── dt ──────────────────────────────────────────────────── */
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > 100 * NS_PER_MS)
+      dt = 100 * NS_PER_MS;
+
+    /* ── sim accumulator ─────────────────────────────────────── */
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      if (!blast_tick(&app->blast)) {
         app->theme_idx = (app->theme_idx + 1) % THEME_COUNT;
-        app_reset_blast(app);
-        break;
-    case 'T':
-        app->theme_idx = (app->theme_idx + THEME_COUNT - 1) % THEME_COUNT;
-        app_reset_blast(app);
-        break;
-
-    case 'n':
         app->shape_idx = (app->shape_idx + 1) % SHAPE_COUNT;
         app_reset_blast(app);
-        break;
-    case 'N':
-        app->shape_idx = (app->shape_idx + SHAPE_COUNT - 1) % SHAPE_COUNT;
-        app_reset_blast(app);
-        break;
-
-    default: break;
+      }
+      sim_accum -= tick_ns;
     }
-    return true;
-}
+    float alpha = (float)sim_accum / (float)tick_ns;
+    (void)alpha;
 
-int main(void)
-{
-    srand((unsigned int)clock_ns());
-
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
-
-    App *app       = &g_app;
-    app->running   = 1;
-    app->sim_fps   = SIM_FPS_DEFAULT;
-    app->theme_idx = 0;
-    app->shape_idx = 0;
-
-    screen_init(&app->screen);
-    blast_init(&app->blast, app->screen.cols, app->screen.rows,
-               app->theme_idx, app->shape_idx);
-
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
-
-    while (app->running) {
-
-        /* ── resize ──────────────────────────────────────────────── */
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
-
-        /* ── dt ──────────────────────────────────────────────────── */
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        /* ── sim accumulator ─────────────────────────────────────── */
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            if (!blast_tick(&app->blast)) {
-                app->theme_idx = (app->theme_idx + 1) % THEME_COUNT;
-                app->shape_idx = (app->shape_idx + 1) % SHAPE_COUNT;
-                app_reset_blast(app);
-            }
-            sim_accum -= tick_ns;
-        }
-        float alpha = (float)sim_accum / (float)tick_ns;
-        (void)alpha;
-
-        /* ── HUD counter ─────────────────────────────────────────── */
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        int64_t budget  = NS_PER_SEC / 60;
-        clock_sleep_ns(budget - elapsed);
-
-        /* ── render + HUD ────────────────────────────────────────── */
-        screen_draw_blast(&app->screen, &app->blast);
-        screen_draw_hud(&app->screen, fps_display,
-                         app->sim_fps, app->blast.frame,
-                         app->blast.theme, app->blast.shape);
-        screen_present();
-
-        /* ── input ───────────────────────────────────────────────── */
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    /* ── HUD counter ─────────────────────────────────────────── */
+    frame_count++;
+    fps_accum += dt;
+    if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display =
+          (double)frame_count / ((double)fps_accum / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accum = 0;
     }
 
-    blast_free(&app->blast);
-    screen_free(&app->screen);
-    return 0;
+    /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    int64_t budget = NS_PER_SEC / 60;
+    clock_sleep_ns(budget - elapsed);
+
+    /* ── render + HUD ────────────────────────────────────────── */
+    screen_draw_blast(&app->screen, &app->blast);
+    screen_draw_hud(&app->screen, fps_display, app->sim_fps, app->blast.frame,
+                    app->blast.theme, app->blast.shape);
+    screen_present();
+
+    /* ── input ───────────────────────────────────────────────── */
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  blast_free(&app->blast);
+  screen_free(&app->screen);
+  return 0;
 }

@@ -266,7 +266,8 @@
  *     Rectangular  w[n] = 1
  *     Hann         w[n] = 0.5  - 0.5  · cos(2π · n / M)
  *     Hamming      w[n] = 0.54 - 0.46 · cos(2π · n / M)
- *     Blackman     w[n] = 0.42 - 0.5  · cos(2π · n / M) + 0.08 · cos(4π · n / M)
+ *     Blackman     w[n] = 0.42 - 0.5  · cos(2π · n / M) + 0.08 · cos(4π · n /
+ * M)
  *
  *   Magnitude spectrum (one-sided, scale chosen so unit sine → unit peak)
  *     |X[k]| / (N/2)         for k = 0 .. N/2
@@ -775,7 +776,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -805,30 +806,30 @@
  * dynamic log calculation (which would also be a runtime trap if the
  * two constants got out of sync).
  */
-#define N_FFT             128
-#define LOG2_N_FFT          7    /* = log2(128); MUST equal log2(N_FFT)  */
+#define N_FFT 128
+#define LOG2_N_FFT 7 /* = log2(128); MUST equal log2(N_FFT)  */
 
 /* §1.2 — sine-sum mode component count ------------------------------ */
-#define N_SINE_COMPONENTS   3
+#define N_SINE_COMPONENTS 3
 
 /* §1.3 — render frame rate ------------------------------------------ */
-#define RENDER_FPS         30
-#define RENDER_TICK_NS    (1000000000LL / RENDER_FPS)
+#define RENDER_FPS 30
+#define RENDER_TICK_NS (1000000000LL / RENDER_FPS)
 
 /* §1.4 — noise-burst envelope ('n' key) ----------------------------- */
-#define NOISE_AMP_PEAK    0.30f      /* burst amplitude              */
-#define NOISE_DECAY_RATE  0.03f      /* per-frame decay; ~1 s to fade */
+#define NOISE_AMP_PEAK 0.30f   /* burst amplitude              */
+#define NOISE_DECAY_RATE 0.03f /* per-frame decay; ~1 s to fade */
 
 /* §1.5 — animation drift step (advances per frame when not paused) - */
-#define ANIMATION_PHASE_STEP_RAD   0.06f
+#define ANIMATION_PHASE_STEP_RAD 0.06f
 
 /* §1.6 — spectrogram history depth (rows) --------------------------- */
-#define SPEC_HISTORY_LEN  120
+#define SPEC_HISTORY_LEN 120
 
 /* §1.7 — selectable-table sizes ------------------------------------- */
-#define N_THEMES            5
-#define N_WINDOWS           4
-#define N_SIGNAL_MODES      7
+#define N_THEMES 5
+#define N_WINDOWS 4
+#define N_SIGNAL_MODES 7
 
 /* §1.8 — colour-pair IDs (bound by §11 init_colors) ----------------- *
  * Pair 0 is reserved by ncurses for the default background.  Our
@@ -836,45 +837,44 @@
  * HUD Standard.
  */
 enum {
-    PAIR_BG       = 1,
-    PAIR_TIME_POS,                /* time-domain positive lobe       */
-    PAIR_TIME_NEG,                /* time-domain negative lobe       */
-    PAIR_FREQ_LOW,                /* freq bar — small magnitude      */
-    PAIR_FREQ_HIGH,               /* freq bar — large magnitude      */
-    PAIR_HUD,                     /* yellow + bold; theme-invariant  */
-    PAIR_HINT,                    /* cyan   + bold; theme-invariant  */
+  PAIR_BG = 1,
+  PAIR_TIME_POS,  /* time-domain positive lobe       */
+  PAIR_TIME_NEG,  /* time-domain negative lobe       */
+  PAIR_FREQ_LOW,  /* freq bar — small magnitude      */
+  PAIR_FREQ_HIGH, /* freq bar — large magnitude      */
+  PAIR_HUD,       /* yellow + bold; theme-invariant  */
+  PAIR_HINT,      /* cyan   + bold; theme-invariant  */
 };
 
 /* ===================================================================== */
 /* §2  clock — monotonic ns timer + nanosecond sleep                     */
 /* ===================================================================== */
 
-static long long clock_now_ns(void)
-{
-    /* Purpose         : return monotonic clock in nanoseconds.
-     * Pseudocode      : ts = clock_gettime; return ts.sec*1e9 + ts.nsec.
-     * Mental model    : a wall clock that only moves forward, never
-     *                   resets, never jumps backward (CLOCK_MONOTONIC
-     *                   is immune to NTP and DST).
-     * Inputs / outputs: none / int64_t-as-long-long ns.
-     * Why it exists   : the main loop subtracts now() values to figure
-     *                   out how long to sleep before the next frame.
-     */
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_now_ns(void) {
+  /* Purpose         : return monotonic clock in nanoseconds.
+   * Pseudocode      : ts = clock_gettime; return ts.sec*1e9 + ts.nsec.
+   * Mental model    : a wall clock that only moves forward, never
+   *                   resets, never jumps backward (CLOCK_MONOTONIC
+   *                   is immune to NTP and DST).
+   * Inputs / outputs: none / int64_t-as-long-long ns.
+   * Why it exists   : the main loop subtracts now() values to figure
+   *                   out how long to sleep before the next frame.
+   */
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(long long ns)
-{
-    /* Purpose : block the calling thread for `ns` nanoseconds.
-     * Mental model : "sit still until next frame slot".
-     * Why it exists : without this the main loop would spin a CPU at
-     *                 100% just to repeat the FFT 30,000 times a sec.
-     */
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(long long ns) {
+  /* Purpose : block the calling thread for `ns` nanoseconds.
+   * Mental model : "sit still until next frame slot".
+   * Why it exists : without this the main loop would spin a CPU at
+   *                 100% just to repeat the FFT 30,000 times a sec.
+   */
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -914,49 +914,50 @@ static void clock_sleep_ns(long long ns)
  * cheap, called once per FFT.
  */
 
-static int reverse_low_bits(int value, int bit_count)
-{
-    /* Purpose         : flip the low `bit_count` bits of `value`.
-     * Pseudocode      : reversed = 0
-     *                   for b in 0..bit_count-1:
-     *                     bit = (value >> b) & 1
-     *                     reversed |= bit << (bit_count - 1 - b)
-     *                   return reversed
-     * Mental model    : write the binary digits down, then read them
-     *                   right-to-left.
-     * Inputs / outputs: value, bit_count / int.
-     * Why it exists   : called once per index by bit_reverse_permute.
-     */
-    int reversed = 0;
-    for (int b = 0; b < bit_count; b++)
-        reversed |= ((value >> b) & 1) << (bit_count - 1 - b);
-    return reversed;
+static int reverse_low_bits(int value, int bit_count) {
+  /* Purpose         : flip the low `bit_count` bits of `value`.
+   * Pseudocode      : reversed = 0
+   *                   for b in 0..bit_count-1:
+   *                     bit = (value >> b) & 1
+   *                     reversed |= bit << (bit_count - 1 - b)
+   *                   return reversed
+   * Mental model    : write the binary digits down, then read them
+   *                   right-to-left.
+   * Inputs / outputs: value, bit_count / int.
+   * Why it exists   : called once per index by bit_reverse_permute.
+   */
+  int reversed = 0;
+  for (int b = 0; b < bit_count; b++)
+    reversed |= ((value >> b) & 1) << (bit_count - 1 - b);
+  return reversed;
 }
 
-static void bit_reverse_permute(float *real_buffer,
-                                float *imag_buffer,
-                                int    sample_count)
-{
-    /* Purpose         : swap each (real, imag) pair at index i with
-     *                   the pair at bit-reversed index, IF the swap
-     *                   moves an element to a higher slot — otherwise
-     *                   we'd undo a previous swap.
-     * Pseudocode      : for i in 0..N-1:
-     *                     j = reverse_low_bits(i, log2 N)
-     *                     if j > i: swap(buf[i], buf[j])
-     * Mental model    : a one-pass unsorting.  The "if j > i" rule
-     *                   ensures each pair is touched exactly once.
-     * Inputs / outputs: real/imag arrays, length / mutates them.
-     * Why it exists   : preconditions the input for the butterfly.
-     */
-    for (int i = 0; i < sample_count; i++) {
-        int j = reverse_low_bits(i, LOG2_N_FFT);
-        if (j > i) {
-            float tmp;
-            tmp = real_buffer[i]; real_buffer[i] = real_buffer[j]; real_buffer[j] = tmp;
-            tmp = imag_buffer[i]; imag_buffer[i] = imag_buffer[j]; imag_buffer[j] = tmp;
-        }
+static void bit_reverse_permute(float *real_buffer, float *imag_buffer,
+                                int sample_count) {
+  /* Purpose         : swap each (real, imag) pair at index i with
+   *                   the pair at bit-reversed index, IF the swap
+   *                   moves an element to a higher slot — otherwise
+   *                   we'd undo a previous swap.
+   * Pseudocode      : for i in 0..N-1:
+   *                     j = reverse_low_bits(i, log2 N)
+   *                     if j > i: swap(buf[i], buf[j])
+   * Mental model    : a one-pass unsorting.  The "if j > i" rule
+   *                   ensures each pair is touched exactly once.
+   * Inputs / outputs: real/imag arrays, length / mutates them.
+   * Why it exists   : preconditions the input for the butterfly.
+   */
+  for (int i = 0; i < sample_count; i++) {
+    int j = reverse_low_bits(i, LOG2_N_FFT);
+    if (j > i) {
+      float tmp;
+      tmp = real_buffer[i];
+      real_buffer[i] = real_buffer[j];
+      real_buffer[j] = tmp;
+      tmp = imag_buffer[i];
+      imag_buffer[i] = imag_buffer[j];
+      imag_buffer[j] = tmp;
     }
+  }
 }
 
 /* ===================================================================== */
@@ -974,7 +975,8 @@ static void bit_reverse_permute(float *real_buffer,
  *
  *     t           = twiddle · in[group_start + j + half]      // = W^j · O[j]
  *     in[j+half]  = in[j] - t
- *     in[j]       = in[j] + t                                  // X[j] = E[j] + t
+ *     in[j]       = in[j] + t                                  // X[j] = E[j] +
+ * t
  *
  * The twiddle starts at W^0 = 1 for j = 0 and is multiplied by the
  * stage's W = exp(-i · 2π / stage_width) at every iteration.  This
@@ -990,89 +992,84 @@ static void bit_reverse_permute(float *real_buffer,
  *      in[j+half] ──●─────────●──── out[j+half] = in[j] - W^j · in[j+half]
  */
 
-static void run_butterfly_stage(float *real_buffer,
-                                float *imag_buffer,
-                                int    sample_count,
-                                int    stage_width)
-{
-    /* Purpose         : run one Cooley-Tukey radix-2 DIT stage in place.
-     * Pseudocode      :
-     *     half       = stage_width / 2
-     *     step_angle = -2π / stage_width
-     *     step       = exp(i · step_angle)
-     *     for i in [0, N) step stage_width:
-     *       twiddle = 1
-     *       for j in [0, half):
-     *         t        = twiddle · buf[i+j+half]
-     *         buf[i+j+half] = buf[i+j] - t
-     *         buf[i+j]      = buf[i+j] + t
-     *         twiddle  = twiddle · step
-     *
-     * Mental model    : N/(2·stage_width) groups, each running half
-     *                   butterflies with twiddles W^0, W^1, ... W^(half-1).
-     * Inputs / outputs: real/imag arrays, length, stage_width / mutates.
-     * Why it exists   : split out from `fft()` so this section can be
-     *                   read on its own and the comments can teach the
-     *                   butterfly without a wall of code around them.
-     */
-    int   half = stage_width >> 1;
-    float twiddle_step_angle = -2.0f * (float)M_PI / (float)stage_width;
-    float twiddle_step_re    = cosf(twiddle_step_angle);
-    float twiddle_step_im    = sinf(twiddle_step_angle);
+static void run_butterfly_stage(float *real_buffer, float *imag_buffer,
+                                int sample_count, int stage_width) {
+  /* Purpose         : run one Cooley-Tukey radix-2 DIT stage in place.
+   * Pseudocode      :
+   *     half       = stage_width / 2
+   *     step_angle = -2π / stage_width
+   *     step       = exp(i · step_angle)
+   *     for i in [0, N) step stage_width:
+   *       twiddle = 1
+   *       for j in [0, half):
+   *         t        = twiddle · buf[i+j+half]
+   *         buf[i+j+half] = buf[i+j] - t
+   *         buf[i+j]      = buf[i+j] + t
+   *         twiddle  = twiddle · step
+   *
+   * Mental model    : N/(2·stage_width) groups, each running half
+   *                   butterflies with twiddles W^0, W^1, ... W^(half-1).
+   * Inputs / outputs: real/imag arrays, length, stage_width / mutates.
+   * Why it exists   : split out from `fft()` so this section can be
+   *                   read on its own and the comments can teach the
+   *                   butterfly without a wall of code around them.
+   */
+  int half = stage_width >> 1;
+  float twiddle_step_angle = -2.0f * (float)M_PI / (float)stage_width;
+  float twiddle_step_re = cosf(twiddle_step_angle);
+  float twiddle_step_im = sinf(twiddle_step_angle);
 
-    for (int i = 0; i < sample_count; i += stage_width) {
-        float twiddle_re = 1.0f;        /* W^0 = 1 + 0i */
-        float twiddle_im = 0.0f;
+  for (int i = 0; i < sample_count; i += stage_width) {
+    float twiddle_re = 1.0f; /* W^0 = 1 + 0i */
+    float twiddle_im = 0.0f;
 
-        for (int j = 0; j < half; j++) {
-            /* t = W^j · in[i + j + half]  (complex multiplication
-             *   spelled out; (a+bi)(c+di) = (ac - bd) + (ad + bc)i) */
-            float t_re = twiddle_re * real_buffer[i + j + half]
-                       - twiddle_im * imag_buffer[i + j + half];
-            float t_im = twiddle_re * imag_buffer[i + j + half]
-                       + twiddle_im * real_buffer[i + j + half];
+    for (int j = 0; j < half; j++) {
+      /* t = W^j · in[i + j + half]  (complex multiplication
+       *   spelled out; (a+bi)(c+di) = (ac - bd) + (ad + bc)i) */
+      float t_re = twiddle_re * real_buffer[i + j + half] -
+                   twiddle_im * imag_buffer[i + j + half];
+      float t_im = twiddle_re * imag_buffer[i + j + half] +
+                   twiddle_im * real_buffer[i + j + half];
 
-            /* in[i + j + half] = in[i + j] - t */
-            real_buffer[i + j + half] = real_buffer[i + j] - t_re;
-            imag_buffer[i + j + half] = imag_buffer[i + j] - t_im;
+      /* in[i + j + half] = in[i + j] - t */
+      real_buffer[i + j + half] = real_buffer[i + j] - t_re;
+      imag_buffer[i + j + half] = imag_buffer[i + j] - t_im;
 
-            /* in[i + j] += t */
-            real_buffer[i + j] += t_re;
-            imag_buffer[i + j] += t_im;
+      /* in[i + j] += t */
+      real_buffer[i + j] += t_re;
+      imag_buffer[i + j] += t_im;
 
-            /* Advance twiddle: W^(j+1) = W^j · W^1.  Save next-real in
-             * a temp because we'd otherwise clobber `twiddle_re` before
-             * `twiddle_im` is updated.  Same shape as complex_mul. */
-            float next_twiddle_re = twiddle_re * twiddle_step_re
-                                  - twiddle_im * twiddle_step_im;
-            twiddle_im            = twiddle_re * twiddle_step_im
-                                  + twiddle_im * twiddle_step_re;
-            twiddle_re            = next_twiddle_re;
-        }
+      /* Advance twiddle: W^(j+1) = W^j · W^1.  Save next-real in
+       * a temp because we'd otherwise clobber `twiddle_re` before
+       * `twiddle_im` is updated.  Same shape as complex_mul. */
+      float next_twiddle_re =
+          twiddle_re * twiddle_step_re - twiddle_im * twiddle_step_im;
+      twiddle_im = twiddle_re * twiddle_step_im + twiddle_im * twiddle_step_re;
+      twiddle_re = next_twiddle_re;
     }
+  }
 }
 
 /* ===================================================================== */
 /* §5  fft — driver: bit-reverse then run log₂N butterfly stages         */
 /* ===================================================================== */
 
-static void fft(float *real_buffer, float *imag_buffer, int sample_count)
-{
-    /* Purpose         : in-place forward FFT of a complex sequence.
-     * Pseudocode      : bit_reverse(buf)
-     *                   for stage_width in [2, 4, 8, ..., N]:
-     *                     run_butterfly_stage(buf, stage_width)
-     * Mental model    : permute the input into "iterative-friendly"
-     *                   order, then climb the log₂N stages combining
-     *                   pairs into 4-tuples into 8-tuples ... into N.
-     * Inputs / outputs: real/imag input arrays, length / arrays now
-     *                   hold the FFT output.
-     * Why it exists   : tiny three-line driver makes the algorithm
-     *                   structure visible at a glance.
-     */
-    bit_reverse_permute(real_buffer, imag_buffer, sample_count);
-    for (int stage_width = 2; stage_width <= sample_count; stage_width <<= 1)
-        run_butterfly_stage(real_buffer, imag_buffer, sample_count, stage_width);
+static void fft(float *real_buffer, float *imag_buffer, int sample_count) {
+  /* Purpose         : in-place forward FFT of a complex sequence.
+   * Pseudocode      : bit_reverse(buf)
+   *                   for stage_width in [2, 4, 8, ..., N]:
+   *                     run_butterfly_stage(buf, stage_width)
+   * Mental model    : permute the input into "iterative-friendly"
+   *                   order, then climb the log₂N stages combining
+   *                   pairs into 4-tuples into 8-tuples ... into N.
+   * Inputs / outputs: real/imag input arrays, length / arrays now
+   *                   hold the FFT output.
+   * Why it exists   : tiny three-line driver makes the algorithm
+   *                   structure visible at a glance.
+   */
+  bit_reverse_permute(real_buffer, imag_buffer, sample_count);
+  for (int stage_width = 2; stage_width <= sample_count; stage_width <<= 1)
+    run_butterfly_stage(real_buffer, imag_buffer, sample_count, stage_width);
 }
 
 /* ===================================================================== */
@@ -1092,75 +1089,74 @@ static void fft(float *real_buffer, float *imag_buffer, int sample_count)
  */
 
 typedef enum {
-    WINDOW_RECT     = 0,
-    WINDOW_HANN,
-    WINDOW_HAMMING,
-    WINDOW_BLACKMAN,
+  WINDOW_RECT = 0,
+  WINDOW_HANN,
+  WINDOW_HAMMING,
+  WINDOW_BLACKMAN,
 } WindowKind;
 
 static const char *window_name[N_WINDOWS] = {
-    "Rectangular", "Hann       ", "Hamming    ", "Blackman   ",
+    "Rectangular",
+    "Hann       ",
+    "Hamming    ",
+    "Blackman   ",
 };
 
 /* Compute one window coefficient at index `n` for buffer length `N`.
  * Used both by apply_window (in §6) and by the debug overlay in §17. */
-static float window_coefficient(WindowKind kind, int n, int N)
-{
-    if (kind == WINDOW_RECT) return 1.0f;
-    float two_pi_over_M = 2.0f * (float)M_PI / (float)(N - 1);
-    switch (kind) {
-        case WINDOW_HANN:
-            return 0.5f - 0.5f * cosf(two_pi_over_M * (float)n);
-        case WINDOW_HAMMING:
-            return 0.54f - 0.46f * cosf(two_pi_over_M * (float)n);
-        case WINDOW_BLACKMAN:
-            return 0.42f
-                 - 0.5f  * cosf(two_pi_over_M * (float)n)
-                 + 0.08f * cosf(2.0f * two_pi_over_M * (float)n);
-        default:
-            return 1.0f;
-    }
+static float window_coefficient(WindowKind kind, int n, int N) {
+  if (kind == WINDOW_RECT)
+    return 1.0f;
+  float two_pi_over_M = 2.0f * (float)M_PI / (float)(N - 1);
+  switch (kind) {
+  case WINDOW_HANN:
+    return 0.5f - 0.5f * cosf(two_pi_over_M * (float)n);
+  case WINDOW_HAMMING:
+    return 0.54f - 0.46f * cosf(two_pi_over_M * (float)n);
+  case WINDOW_BLACKMAN:
+    return 0.42f - 0.5f * cosf(two_pi_over_M * (float)n) +
+           0.08f * cosf(2.0f * two_pi_over_M * (float)n);
+  default:
+    return 1.0f;
+  }
 }
 
-static void apply_window(float *signal, int N, WindowKind kind)
-{
-    /* Purpose         : multiply signal[0..N-1] by the chosen window
-     *                   coefficient in place.
-     * Pseudocode      : for n in 0..N-1: signal[n] *= w_kind(n).
-     * Mental model    : a smooth bell-curve mask laid over the signal.
-     * Inputs / outputs: signal array, length, kind / mutates signal.
-     * Why it exists   : called once per frame in app_compute on the
-     *                   FFT input array, AFTER copying from the raw
-     *                   signal so the time panel can still show the
-     *                   un-windowed waveform.
-     */
-    if (kind == WINDOW_RECT) return;
-    for (int n = 0; n < N; n++)
-        signal[n] *= window_coefficient(kind, n, N);
+static void apply_window(float *signal, int N, WindowKind kind) {
+  /* Purpose         : multiply signal[0..N-1] by the chosen window
+   *                   coefficient in place.
+   * Pseudocode      : for n in 0..N-1: signal[n] *= w_kind(n).
+   * Mental model    : a smooth bell-curve mask laid over the signal.
+   * Inputs / outputs: signal array, length, kind / mutates signal.
+   * Why it exists   : called once per frame in app_compute on the
+   *                   FFT input array, AFTER copying from the raw
+   *                   signal so the time panel can still show the
+   *                   un-windowed waveform.
+   */
+  if (kind == WINDOW_RECT)
+    return;
+  for (int n = 0; n < N; n++)
+    signal[n] *= window_coefficient(kind, n, N);
 }
 
 /* ===================================================================== */
 /* §7  signal_helpers — periodic_phase                                   */
 /* ===================================================================== */
 
-static inline float periodic_phase(int sample_index,
-                                   float frequency_bin,
-                                   float animation_phase_radians)
-{
-    /* Purpose         : given a sample index n and a frequency in
-     *                   cycles-per-buffer, return the fractional
-     *                   position within one cycle, ∈ [0, 1).
-     * Mental model    : "if the wave repeats every k samples, where
-     *                   are we within the current cycle?"  Used by
-     *                   square / sawtooth / triangle generators.
-     * Inputs / outputs: n, freq, anim_phase / float in [0, 1).
-     * Why it exists   : factors out the same arithmetic from three
-     *                   periodic-waveform samplers.
-     */
-    float t = frequency_bin * (float)sample_index / (float)N_FFT
-            + animation_phase_radians * frequency_bin
-              / (2.0f * (float)M_PI);
-    return t - floorf(t);
+static inline float periodic_phase(int sample_index, float frequency_bin,
+                                   float animation_phase_radians) {
+  /* Purpose         : given a sample index n and a frequency in
+   *                   cycles-per-buffer, return the fractional
+   *                   position within one cycle, ∈ [0, 1).
+   * Mental model    : "if the wave repeats every k samples, where
+   *                   are we within the current cycle?"  Used by
+   *                   square / sawtooth / triangle generators.
+   * Inputs / outputs: n, freq, anim_phase / float in [0, 1).
+   * Why it exists   : factors out the same arithmetic from three
+   *                   periodic-waveform samplers.
+   */
+  float t = frequency_bin * (float)sample_index / (float)N_FFT +
+            animation_phase_radians * frequency_bin / (2.0f * (float)M_PI);
+  return t - floorf(t);
 }
 
 /* ===================================================================== */
@@ -1173,62 +1169,58 @@ static inline float periodic_phase(int sample_index,
  * paints in the freq panel.
  */
 
-static float square_sample(int n, float freq, float anim_phase)
-{
-    /* +1 for the first half of each cycle, -1 for the second.
-     * Spectrum: odd harmonics, magnitudes ∝ 1/n. */
-    return periodic_phase(n, freq, anim_phase) < 0.5f ? 1.0f : -1.0f;
+static float square_sample(int n, float freq, float anim_phase) {
+  /* +1 for the first half of each cycle, -1 for the second.
+   * Spectrum: odd harmonics, magnitudes ∝ 1/n. */
+  return periodic_phase(n, freq, anim_phase) < 0.5f ? 1.0f : -1.0f;
 }
 
-static float sawtooth_sample(int n, float freq, float anim_phase)
-{
-    /* Linear ramp from -1 to +1, repeated.  Spectrum: all harmonics,
-     * magnitudes ∝ 1/n. */
-    return 2.0f * periodic_phase(n, freq, anim_phase) - 1.0f;
+static float sawtooth_sample(int n, float freq, float anim_phase) {
+  /* Linear ramp from -1 to +1, repeated.  Spectrum: all harmonics,
+   * magnitudes ∝ 1/n. */
+  return 2.0f * periodic_phase(n, freq, anim_phase) - 1.0f;
 }
 
-static float triangle_sample(int n, float freq, float anim_phase)
-{
-    /* /\/\/\/\ shape.  Spectrum: odd harmonics, magnitudes ∝ 1/n²
-     * — much faster decay than square. */
-    float p = periodic_phase(n, freq, anim_phase);
-    return 4.0f * fabsf(p - 0.5f) - 1.0f;
+static float triangle_sample(int n, float freq, float anim_phase) {
+  /* /\/\/\/\ shape.  Spectrum: odd harmonics, magnitudes ∝ 1/n²
+   * — much faster decay than square. */
+  float p = periodic_phase(n, freq, anim_phase);
+  return 4.0f * fabsf(p - 0.5f) - 1.0f;
 }
 
-static float chirp_sample(int n, float lo, float hi)
-{
-    /* Linear chirp: instantaneous frequency varies linearly from lo
-     * (at n=0) to hi (at n=N-1).  Phase is the integral of frequency
-     * over time, which carries an n² term:
-     *   φ(n) = 2π · (lo · t + (hi - lo) · t² / 2)   where t = n / N
-     * Spectrum: a smear from lo to hi.  Spectrogram: a clean
-     * diagonal line. */
-    float t = (float)n / (float)N_FFT;
-    float phase_cycles = lo * t + (hi - lo) * t * t * 0.5f;
-    return sinf(2.0f * (float)M_PI * phase_cycles);
+static float chirp_sample(int n, float lo, float hi) {
+  /* Linear chirp: instantaneous frequency varies linearly from lo
+   * (at n=0) to hi (at n=N-1).  Phase is the integral of frequency
+   * over time, which carries an n² term:
+   *   φ(n) = 2π · (lo · t + (hi - lo) · t² / 2)   where t = n / N
+   * Spectrum: a smear from lo to hi.  Spectrogram: a clean
+   * diagonal line. */
+  float t = (float)n / (float)N_FFT;
+  float phase_cycles = lo * t + (hi - lo) * t * t * 0.5f;
+  return sinf(2.0f * (float)M_PI * phase_cycles);
 }
 
-static float am_sample(int n, float carrier_freq, float mod_freq, float anim_phase)
-{
-    /* Amplitude-modulated sine:
-     *   x(t) = (1 + ½ cos ω_m t) · cos ω_c t
-     * Algebraic identity: x = cos ω_c t + ¼ cos(ω_c+ω_m)t + ¼ cos(ω_c-ω_m)t.
-     * Spectrum: three spikes — carrier and ± modulator sidebands. */
-    float t          = (float)n / (float)N_FFT;
-    float modulator  = cosf(2.0f * (float)M_PI * mod_freq * t
-                          + anim_phase * mod_freq);
-    float carrier_s  = cosf(2.0f * (float)M_PI * carrier_freq * t
-                          + anim_phase * carrier_freq);
-    return (1.0f + 0.5f * modulator) * carrier_s * 0.55f;
+static float am_sample(int n, float carrier_freq, float mod_freq,
+                       float anim_phase) {
+  /* Amplitude-modulated sine:
+   *   x(t) = (1 + ½ cos ω_m t) · cos ω_c t
+   * Algebraic identity: x = cos ω_c t + ¼ cos(ω_c+ω_m)t + ¼ cos(ω_c-ω_m)t.
+   * Spectrum: three spikes — carrier and ± modulator sidebands. */
+  float t = (float)n / (float)N_FFT;
+  float modulator =
+      cosf(2.0f * (float)M_PI * mod_freq * t + anim_phase * mod_freq);
+  float carrier_s =
+      cosf(2.0f * (float)M_PI * carrier_freq * t + anim_phase * carrier_freq);
+  return (1.0f + 0.5f * modulator) * carrier_s * 0.55f;
 }
 
-static float impulse_sample(int n, int period)
-{
-    /* Periodic delta function: non-zero every `period` samples.
-     * The Fourier transform of a Dirac comb is itself a Dirac comb
-     * — spikes every N/period bins in the freq panel. */
-    if (period <= 0) period = 1;
-    return (n % period == 0) ? 0.85f : 0.0f;
+static float impulse_sample(int n, int period) {
+  /* Periodic delta function: non-zero every `period` samples.
+   * The Fourier transform of a Dirac comb is itself a Dirac comb
+   * — spikes every N/period bins in the freq panel. */
+  if (period <= 0)
+    period = 1;
+  return (n % period == 0) ? 0.85f : 0.0f;
 }
 
 /* ===================================================================== */
@@ -1236,19 +1228,19 @@ static float impulse_sample(int n, int period)
 /* ===================================================================== */
 
 typedef struct {
-    float frequency_bin;     /* in [1, N/2-1]  */
-    float amplitude;         /* in [0, 1]       */
-    bool  enabled;
+  float frequency_bin; /* in [1, N/2-1]  */
+  float amplitude;     /* in [0, 1]       */
+  bool enabled;
 } SineComponent;
 
 typedef enum {
-    MODE_SINE_SUM = 0,
-    MODE_SQUARE,
-    MODE_SAWTOOTH,
-    MODE_TRIANGLE,
-    MODE_CHIRP,
-    MODE_AM,
-    MODE_IMPULSE,
+  MODE_SINE_SUM = 0,
+  MODE_SQUARE,
+  MODE_SAWTOOTH,
+  MODE_TRIANGLE,
+  MODE_CHIRP,
+  MODE_AM,
+  MODE_IMPULSE,
 } SignalMode;
 
 static const char *mode_name[N_SIGNAL_MODES] = {
@@ -1257,14 +1249,14 @@ static const char *mode_name[N_SIGNAL_MODES] = {
 };
 
 typedef struct {
-    SignalMode    mode;
-    SineComponent sine_components[N_SINE_COMPONENTS];
-    float         frequency_single_bin;   /* used by square/saw/triangle */
-    float         chirp_lo_bin;
-    float         chirp_hi_bin;
-    float         am_carrier_bin;
-    float         am_modulator_bin;
-    int           impulse_period_samples;
+  SignalMode mode;
+  SineComponent sine_components[N_SINE_COMPONENTS];
+  float frequency_single_bin; /* used by square/saw/triangle */
+  float chirp_lo_bin;
+  float chirp_hi_bin;
+  float am_carrier_bin;
+  float am_modulator_bin;
+  int impulse_period_samples;
 } SignalParams;
 
 /* One-shot noise burst.  When the user presses 'n' we fill this with
@@ -1273,59 +1265,57 @@ typedef struct {
 static float g_noise_buffer[N_FFT];
 static float g_noise_decay_envelope = 0.0f;
 
-static void build_signal(const SignalParams *p,
-                         float *out_signal,
-                         float anim_phase)
-{
-    /* Purpose : fill out_signal[0..N-1] with one buffer of the chosen
-     *           waveform plus the active noise burst.
-     * Pseudocode :
-     *     for n in [0, N):
-     *       v = mode_specific_sample(p, n)
-     *       v += g_noise_buffer[n] * g_noise_decay_envelope
-     *       out_signal[n] = v
-     * Mental model : a switch on mode picks the right waveform formula.
-     *                The noise term is added on top so noise+signal
-     *                experiments work regardless of mode.
-     * Inputs / outputs : params struct, output array, animation phase
-     *                    / mutates output array.
-     */
-    for (int n = 0; n < N_FFT; n++) {
-        float v = 0.0f;
-        switch (p->mode) {
-            case MODE_SINE_SUM: {
-                for (int c = 0; c < N_SINE_COMPONENTS; c++) {
-                    if (!p->sine_components[c].enabled) continue;
-                    float freq = p->sine_components[c].frequency_bin;
-                    float t    = (float)n / (float)N_FFT;
-                    v += p->sine_components[c].amplitude
-                       * sinf(2.0f * (float)M_PI * freq * t
-                            + anim_phase * freq);
-                }
-                break;
-            }
-            case MODE_SQUARE:
-                v = 0.7f * square_sample  (n, p->frequency_single_bin, anim_phase);
-                break;
-            case MODE_SAWTOOTH:
-                v = 0.7f * sawtooth_sample(n, p->frequency_single_bin, anim_phase);
-                break;
-            case MODE_TRIANGLE:
-                v = 0.8f * triangle_sample(n, p->frequency_single_bin, anim_phase);
-                break;
-            case MODE_CHIRP:
-                v = 0.8f * chirp_sample(n, p->chirp_lo_bin, p->chirp_hi_bin);
-                break;
-            case MODE_AM:
-                v = am_sample(n, p->am_carrier_bin, p->am_modulator_bin, anim_phase);
-                break;
-            case MODE_IMPULSE:
-                v = impulse_sample(n, p->impulse_period_samples);
-                break;
-        }
-        v += g_noise_buffer[n] * g_noise_decay_envelope;
-        out_signal[n] = v;
+static void build_signal(const SignalParams *p, float *out_signal,
+                         float anim_phase) {
+  /* Purpose : fill out_signal[0..N-1] with one buffer of the chosen
+   *           waveform plus the active noise burst.
+   * Pseudocode :
+   *     for n in [0, N):
+   *       v = mode_specific_sample(p, n)
+   *       v += g_noise_buffer[n] * g_noise_decay_envelope
+   *       out_signal[n] = v
+   * Mental model : a switch on mode picks the right waveform formula.
+   *                The noise term is added on top so noise+signal
+   *                experiments work regardless of mode.
+   * Inputs / outputs : params struct, output array, animation phase
+   *                    / mutates output array.
+   */
+  for (int n = 0; n < N_FFT; n++) {
+    float v = 0.0f;
+    switch (p->mode) {
+    case MODE_SINE_SUM: {
+      for (int c = 0; c < N_SINE_COMPONENTS; c++) {
+        if (!p->sine_components[c].enabled)
+          continue;
+        float freq = p->sine_components[c].frequency_bin;
+        float t = (float)n / (float)N_FFT;
+        v += p->sine_components[c].amplitude *
+             sinf(2.0f * (float)M_PI * freq * t + anim_phase * freq);
+      }
+      break;
     }
+    case MODE_SQUARE:
+      v = 0.7f * square_sample(n, p->frequency_single_bin, anim_phase);
+      break;
+    case MODE_SAWTOOTH:
+      v = 0.7f * sawtooth_sample(n, p->frequency_single_bin, anim_phase);
+      break;
+    case MODE_TRIANGLE:
+      v = 0.8f * triangle_sample(n, p->frequency_single_bin, anim_phase);
+      break;
+    case MODE_CHIRP:
+      v = 0.8f * chirp_sample(n, p->chirp_lo_bin, p->chirp_hi_bin);
+      break;
+    case MODE_AM:
+      v = am_sample(n, p->am_carrier_bin, p->am_modulator_bin, anim_phase);
+      break;
+    case MODE_IMPULSE:
+      v = impulse_sample(n, p->impulse_period_samples);
+      break;
+    }
+    v += g_noise_buffer[n] * g_noise_decay_envelope;
+    out_signal[n] = v;
+  }
 }
 
 /* ===================================================================== */
@@ -1340,84 +1330,83 @@ static void build_signal(const SignalParams *p,
  */
 
 typedef struct {
-    const char *display_name;
-    short time_pos_color;
-    short time_neg_color;
-    short freq_low_color;
-    short freq_high_color;
-    short reserved_color;        /* future-proof slot, unused for now */
+  const char *display_name;
+  short time_pos_color;
+  short time_neg_color;
+  short freq_low_color;
+  short freq_high_color;
+  short reserved_color; /* future-proof slot, unused for now */
 } ThemePalette;
 
 static const ThemePalette theme_table[N_THEMES] = {
-    { "Cyan-Green",  51,  39,  46,  82,  82 },
-    { "Fire      ", 196, 202, 208, 226, 226 },
-    { "Purple    ", 201, 171, 141, 231, 231 },
-    { "Mono      ", 252, 245, 244, 255, 255 },
-    { "Ocean     ", 195, 117,  75,  39,  39 },
+    {"Cyan-Green", 51, 39, 46, 82, 82},
+    {"Fire      ", 196, 202, 208, 226, 226},
+    {"Purple    ", 201, 171, 141, 231, 231},
+    {"Mono      ", 252, 245, 244, 255, 255},
+    {"Ocean     ", 195, 117, 75, 39, 39},
 };
 
 /* ===================================================================== */
 /* §11  colors — ncurses colour-pair init + apply_theme                  */
 /* ===================================================================== */
 
-static void apply_theme(int theme_index)
-{
-    /* Purpose : rebind the four animation colour pairs to a theme's
-     *           palette.  HUD/HINT pairs are NOT touched.
-     * Mental model : a stylesheet swap.
-     */
-    if (theme_index < 0 || theme_index >= N_THEMES) theme_index = 0;
-    const ThemePalette *t = &theme_table[theme_index];
-    init_pair(PAIR_BG,        -1,                 -1);
-    init_pair(PAIR_TIME_POS,  t->time_pos_color,  -1);
-    init_pair(PAIR_TIME_NEG,  t->time_neg_color,  -1);
-    init_pair(PAIR_FREQ_LOW,  t->freq_low_color,  -1);
-    init_pair(PAIR_FREQ_HIGH, t->freq_high_color, -1);
+static void apply_theme(int theme_index) {
+  /* Purpose : rebind the four animation colour pairs to a theme's
+   *           palette.  HUD/HINT pairs are NOT touched.
+   * Mental model : a stylesheet swap.
+   */
+  if (theme_index < 0 || theme_index >= N_THEMES)
+    theme_index = 0;
+  const ThemePalette *t = &theme_table[theme_index];
+  init_pair(PAIR_BG, -1, -1);
+  init_pair(PAIR_TIME_POS, t->time_pos_color, -1);
+  init_pair(PAIR_TIME_NEG, t->time_neg_color, -1);
+  init_pair(PAIR_FREQ_LOW, t->freq_low_color, -1);
+  init_pair(PAIR_FREQ_HIGH, t->freq_high_color, -1);
 }
 
-static void colors_init(int initial_theme_index)
-{
-    /* Bind theme-invariant pairs once at startup, then apply the
-     * default theme.  Subsequent theme changes go through apply_theme
-     * and leave HUD/HINT alone. */
-    start_color();
-    use_default_colors();
-    init_pair(PAIR_HUD,  226, -1);    /* bright yellow */
-    init_pair(PAIR_HINT,  51, -1);    /* bright cyan   */
-    apply_theme(initial_theme_index);
+static void colors_init(int initial_theme_index) {
+  /* Bind theme-invariant pairs once at startup, then apply the
+   * default theme.  Subsequent theme changes go through apply_theme
+   * and leave HUD/HINT alone. */
+  start_color();
+  use_default_colors();
+  init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+  init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+  apply_theme(initial_theme_index);
 }
 
 /* ===================================================================== */
 /* §12  draw_bar — vertical-bar primitive                                */
 /* ===================================================================== */
 
-static void draw_bar(int column, int baseline_row,
-                     int bar_height_cells, bool growing_upward,
-                     int colour_pair)
-{
-    /* Purpose : stamp a vertical column of glyphs starting at the
-     *           baseline row, growing either upward or downward.
-     * Pseudocode :
-     *     if h <= 0: return
-     *     for dy in 0..h-1:
-     *       row = upward ? baseline - dy : baseline + dy + 1
-     *       mvaddch(row, col, upward ? '|' : '.')
-     * Mental model : positive-going lobe uses '|' growing UP from the
-     *                baseline; negative-going lobe uses '.' growing
-     *                DOWN.  Two glyphs let the eye distinguish sign
-     *                without needing a colour difference (though we
-     *                supply colour anyway).
-     */
-    if (bar_height_cells <= 0) return;
-    attron(COLOR_PAIR(colour_pair));
-    for (int dy = 0; dy < bar_height_cells; dy++) {
-        int row = growing_upward ? (baseline_row - dy)
-                                 : (baseline_row + dy + 1);
-        if (row < 0 || row >= LINES) continue;
-        if (column < 0 || column >= COLS) continue;
-        mvaddch(row, column, growing_upward ? '|' : '.');
-    }
-    attroff(COLOR_PAIR(colour_pair));
+static void draw_bar(int column, int baseline_row, int bar_height_cells,
+                     bool growing_upward, int colour_pair) {
+  /* Purpose : stamp a vertical column of glyphs starting at the
+   *           baseline row, growing either upward or downward.
+   * Pseudocode :
+   *     if h <= 0: return
+   *     for dy in 0..h-1:
+   *       row = upward ? baseline - dy : baseline + dy + 1
+   *       mvaddch(row, col, upward ? '|' : '.')
+   * Mental model : positive-going lobe uses '|' growing UP from the
+   *                baseline; negative-going lobe uses '.' growing
+   *                DOWN.  Two glyphs let the eye distinguish sign
+   *                without needing a colour difference (though we
+   *                supply colour anyway).
+   */
+  if (bar_height_cells <= 0)
+    return;
+  attron(COLOR_PAIR(colour_pair));
+  for (int dy = 0; dy < bar_height_cells; dy++) {
+    int row = growing_upward ? (baseline_row - dy) : (baseline_row + dy + 1);
+    if (row < 0 || row >= LINES)
+      continue;
+    if (column < 0 || column >= COLS)
+      continue;
+    mvaddch(row, column, growing_upward ? '|' : '.');
+  }
+  attroff(COLOR_PAIR(colour_pair));
 }
 
 /* ===================================================================== */
@@ -1445,89 +1434,108 @@ static void draw_bar(int column, int baseline_row,
  *      └────────────────────────────────────────────────────────┘
  */
 
-#define DEBUG_NOTE_STUB_so_section_below_is_clean  1
+#define DEBUG_NOTE_STUB_so_section_below_is_clean 1
 
 static unsigned char spec_history_buffer[SPEC_HISTORY_LEN][N_FFT / 2];
-static int           spec_history_head_index   = 0;
-static int           spec_history_filled_count = 0;
+static int spec_history_head_index = 0;
+static int spec_history_filled_count = 0;
 
-static unsigned char quantise_intensity(float fraction_of_max)
-{
-    /* Map a normalised magnitude [0, 1] to a 5-tier glyph index.
-     * Hard thresholds; could be made gamma-aware but the simple
-     * version is plenty pedagogical. */
-    if (fraction_of_max < 0.10f) return 0;
-    if (fraction_of_max < 0.30f) return 1;
-    if (fraction_of_max < 0.55f) return 2;
-    if (fraction_of_max < 0.80f) return 3;
-    return 4;
+static unsigned char quantise_intensity(float fraction_of_max) {
+  /* Map a normalised magnitude [0, 1] to a 5-tier glyph index.
+   * Hard thresholds; could be made gamma-aware but the simple
+   * version is plenty pedagogical. */
+  if (fraction_of_max < 0.10f)
+    return 0;
+  if (fraction_of_max < 0.30f)
+    return 1;
+  if (fraction_of_max < 0.55f)
+    return 2;
+  if (fraction_of_max < 0.80f)
+    return 3;
+  return 4;
 }
 
-static void spec_history_push(const float *magnitude, float magnitude_peak)
-{
-    /* Push one column of quantised magnitudes into the ring at
-     * spec_head; advance head; saturate count. */
-    for (int k = 0; k < N_FFT / 2; k++) {
-        float frac = magnitude[k] / (magnitude_peak + 1e-6f);
-        spec_history_buffer[spec_history_head_index][k]
-            = quantise_intensity(frac);
+static void spec_history_push(const float *magnitude, float magnitude_peak) {
+  /* Push one column of quantised magnitudes into the ring at
+   * spec_head; advance head; saturate count. */
+  for (int k = 0; k < N_FFT / 2; k++) {
+    float frac = magnitude[k] / (magnitude_peak + 1e-6f);
+    spec_history_buffer[spec_history_head_index][k] = quantise_intensity(frac);
+  }
+  spec_history_head_index = (spec_history_head_index + 1) % SPEC_HISTORY_LEN;
+  if (spec_history_filled_count < SPEC_HISTORY_LEN)
+    spec_history_filled_count++;
+}
+
+static void spec_history_clear(void) {
+  spec_history_head_index = 0;
+  spec_history_filled_count = 0;
+  memset(spec_history_buffer, 0, sizeof spec_history_buffer);
+}
+
+static void draw_waterfall(int top_row, int left_col, int height_rows,
+                           int width_cols) {
+  /* Purpose : draw the spectrogram in [top_row, top_row + height_rows)
+   *           with bin k in column (left_col + k).  Newest spectrum
+   *           at the BOTTOM of the panel; older spectra above.
+   * Pseudocode :
+   *     for offset_from_newest in 0 .. min(height, count) - 1:
+   *       idx = (head - 1 - offset + LEN) % LEN
+   *       y   = top + height - 1 - offset
+   *       for k in 0 .. width:
+   *         glyph, pair = lookup_tier(spec_history[idx][k])
+   *         if pair: mvaddch(y, x, glyph)
+   */
+  if (height_rows <= 0)
+    return;
+  if (width_cols > N_FFT / 2)
+    width_cols = N_FFT / 2;
+
+  int rows_to_draw = (height_rows < spec_history_filled_count)
+                         ? height_rows
+                         : spec_history_filled_count;
+
+  for (int offset = 0; offset < rows_to_draw; offset++) {
+    int idx = (spec_history_head_index - 1 - offset + SPEC_HISTORY_LEN) %
+              SPEC_HISTORY_LEN;
+    int y = top_row + height_rows - 1 - offset;
+    if (y < 0 || y >= LINES)
+      continue;
+
+    for (int k = 0; k < width_cols; k++) {
+      int x = left_col + k;
+      if (x < 0 || x >= COLS)
+        continue;
+      unsigned char tier = spec_history_buffer[idx][k];
+      if (tier == 0)
+        continue;
+      char glyph;
+      int pair;
+      switch (tier) {
+      default:
+        continue;
+      case 1:
+        glyph = '.';
+        pair = PAIR_FREQ_LOW;
+        break;
+      case 2:
+        glyph = '+';
+        pair = PAIR_FREQ_LOW;
+        break;
+      case 3:
+        glyph = 'o';
+        pair = PAIR_FREQ_HIGH;
+        break;
+      case 4:
+        glyph = '#';
+        pair = PAIR_FREQ_HIGH;
+        break;
+      }
+      attron(COLOR_PAIR(pair) | A_BOLD);
+      mvaddch(y, x, glyph);
+      attroff(COLOR_PAIR(pair) | A_BOLD);
     }
-    spec_history_head_index = (spec_history_head_index + 1) % SPEC_HISTORY_LEN;
-    if (spec_history_filled_count < SPEC_HISTORY_LEN)
-        spec_history_filled_count++;
-}
-
-static void spec_history_clear(void)
-{
-    spec_history_head_index   = 0;
-    spec_history_filled_count = 0;
-    memset(spec_history_buffer, 0, sizeof spec_history_buffer);
-}
-
-static void draw_waterfall(int top_row, int left_col,
-                           int height_rows, int width_cols)
-{
-    /* Purpose : draw the spectrogram in [top_row, top_row + height_rows)
-     *           with bin k in column (left_col + k).  Newest spectrum
-     *           at the BOTTOM of the panel; older spectra above.
-     * Pseudocode :
-     *     for offset_from_newest in 0 .. min(height, count) - 1:
-     *       idx = (head - 1 - offset + LEN) % LEN
-     *       y   = top + height - 1 - offset
-     *       for k in 0 .. width:
-     *         glyph, pair = lookup_tier(spec_history[idx][k])
-     *         if pair: mvaddch(y, x, glyph)
-     */
-    if (height_rows <= 0) return;
-    if (width_cols  >  N_FFT / 2) width_cols = N_FFT / 2;
-
-    int rows_to_draw = (height_rows < spec_history_filled_count)
-                     ? height_rows : spec_history_filled_count;
-
-    for (int offset = 0; offset < rows_to_draw; offset++) {
-        int idx = (spec_history_head_index - 1 - offset + SPEC_HISTORY_LEN)
-                  % SPEC_HISTORY_LEN;
-        int y = top_row + height_rows - 1 - offset;
-        if (y < 0 || y >= LINES) continue;
-
-        for (int k = 0; k < width_cols; k++) {
-            int x = left_col + k;
-            if (x < 0 || x >= COLS) continue;
-            unsigned char tier = spec_history_buffer[idx][k];
-            if (tier == 0) continue;
-            char glyph; int pair;
-            switch (tier) {
-                default: continue;
-                case 1: glyph = '.'; pair = PAIR_FREQ_LOW;  break;
-                case 2: glyph = '+'; pair = PAIR_FREQ_LOW;  break;
-                case 3: glyph = 'o'; pair = PAIR_FREQ_HIGH; break;
-                case 4: glyph = '#'; pair = PAIR_FREQ_HIGH; break;
-            }
-            attron(COLOR_PAIR(pair) | A_BOLD);
-            mvaddch(y, x, glyph);
-            attroff(COLOR_PAIR(pair) | A_BOLD);
-        }
-    }
+  }
 }
 
 /* ===================================================================== */
@@ -1553,118 +1561,123 @@ static void draw_waterfall(int top_row, int left_col,
  */
 
 typedef struct {
-    int time_label_row,  time_top_row,  time_height_rows,  time_baseline_row;
-    int freq_label_row,  freq_top_row,  freq_height_rows,  freq_baseline_row;
-    int water_label_row, water_top_row, water_height_rows;
-    int status_row, hint_row;
+  int time_label_row, time_top_row, time_height_rows, time_baseline_row;
+  int freq_label_row, freq_top_row, freq_height_rows, freq_baseline_row;
+  int water_label_row, water_top_row, water_height_rows;
+  int status_row, hint_row;
 } PanelLayout;
 
-static PanelLayout compute_layout(bool show_waterfall)
-{
-    /* Reserved rows: 1 HUD top + 1 status + 1 hint + 1 time-label
-     * + 1 freq-label + (1 if waterfall else 0) for waterfall-label. */
-    int reserved = 5 + (show_waterfall ? 1 : 0);
-    int avail    = LINES - reserved;
-    if (avail < 6) avail = 6;
+static PanelLayout compute_layout(bool show_waterfall) {
+  /* Reserved rows: 1 HUD top + 1 status + 1 hint + 1 time-label
+   * + 1 freq-label + (1 if waterfall else 0) for waterfall-label. */
+  int reserved = 5 + (show_waterfall ? 1 : 0);
+  int avail = LINES - reserved;
+  if (avail < 6)
+    avail = 6;
 
-    int time_h, freq_h, water_h;
-    if (show_waterfall) {
-        time_h  = avail / 4; if (time_h  < 3) time_h  = 3;
-        freq_h  = avail / 4; if (freq_h  < 3) freq_h  = 3;
-        water_h = avail - time_h - freq_h;
-        if (water_h < 3) water_h = 3;
-    } else {
-        time_h  = avail / 2; if (time_h < 3) time_h = 3;
-        freq_h  = avail - time_h;
-        water_h = 0;
-    }
+  int time_h, freq_h, water_h;
+  if (show_waterfall) {
+    time_h = avail / 4;
+    if (time_h < 3)
+      time_h = 3;
+    freq_h = avail / 4;
+    if (freq_h < 3)
+      freq_h = 3;
+    water_h = avail - time_h - freq_h;
+    if (water_h < 3)
+      water_h = 3;
+  } else {
+    time_h = avail / 2;
+    if (time_h < 3)
+      time_h = 3;
+    freq_h = avail - time_h;
+    water_h = 0;
+  }
 
-    PanelLayout L;
-    L.time_label_row    = 1;
-    L.time_top_row      = L.time_label_row + 1;
-    L.time_height_rows  = time_h;
-    L.time_baseline_row = L.time_top_row + time_h - 1;
+  PanelLayout L;
+  L.time_label_row = 1;
+  L.time_top_row = L.time_label_row + 1;
+  L.time_height_rows = time_h;
+  L.time_baseline_row = L.time_top_row + time_h - 1;
 
-    L.freq_label_row    = L.time_baseline_row + 1;
-    L.freq_top_row      = L.freq_label_row + 1;
-    L.freq_height_rows  = freq_h;
-    L.freq_baseline_row = L.freq_top_row + freq_h - 1;
+  L.freq_label_row = L.time_baseline_row + 1;
+  L.freq_top_row = L.freq_label_row + 1;
+  L.freq_height_rows = freq_h;
+  L.freq_baseline_row = L.freq_top_row + freq_h - 1;
 
-    if (show_waterfall) {
-        L.water_label_row    = L.freq_baseline_row + 1;
-        L.water_top_row      = L.water_label_row + 1;
-        L.water_height_rows  = water_h;
-    } else {
-        L.water_label_row    = 0;
-        L.water_top_row      = 0;
-        L.water_height_rows  = 0;
-    }
-    L.status_row = LINES - 2;
-    L.hint_row   = LINES - 1;
-    return L;
+  if (show_waterfall) {
+    L.water_label_row = L.freq_baseline_row + 1;
+    L.water_top_row = L.water_label_row + 1;
+    L.water_height_rows = water_h;
+  } else {
+    L.water_label_row = 0;
+    L.water_top_row = 0;
+    L.water_height_rows = 0;
+  }
+  L.status_row = LINES - 2;
+  L.hint_row = LINES - 1;
+  return L;
 }
 
 /* ===================================================================== */
 /* §15  draw_time — TIME panel                                           */
 /* ===================================================================== */
 
-static void draw_time_panel(const float *signal_pre_window,
-                            float        signal_peak,
-                            const PanelLayout *L)
-{
-    /* Purpose : render the time-domain waveform as ± vertical bars
-     *           around a horizontal midline at the panel's centre.
-     * Pseudocode :
-     *     half_height = panel_h / 2
-     *     midline = top + half_height
-     *     for n in 0 .. min(N, COLS):
-     *       v = signal[n] / peak   (auto-scaled)
-     *       h = round(|v| · half_height)
-     *       draw_bar(n, midline, h, v >= 0, sign-coloured)
-     * Mental model : positive samples grow as '|' upward; negative
-     *                samples grow as '.' downward.
-     */
-    int half_height = L->time_height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = L->time_top_row + half_height;
+static void draw_time_panel(const float *signal_pre_window, float signal_peak,
+                            const PanelLayout *L) {
+  /* Purpose : render the time-domain waveform as ± vertical bars
+   *           around a horizontal midline at the panel's centre.
+   * Pseudocode :
+   *     half_height = panel_h / 2
+   *     midline = top + half_height
+   *     for n in 0 .. min(N, COLS):
+   *       v = signal[n] / peak   (auto-scaled)
+   *       h = round(|v| · half_height)
+   *       draw_bar(n, midline, h, v >= 0, sign-coloured)
+   * Mental model : positive samples grow as '|' upward; negative
+   *                samples grow as '.' downward.
+   */
+  int half_height = L->time_height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = L->time_top_row + half_height;
 
-    int columns_to_draw = COLS < N_FFT ? COLS : N_FFT;
-    for (int n = 0; n < columns_to_draw; n++) {
-        float v   = signal_pre_window[n] / (signal_peak + 1e-6f);
-        bool  pos = v >= 0.0f;
-        int   h   = (int)(fabsf(v) * (float)half_height + 0.5f);
-        draw_bar(n, midline_row, h, pos, pos ? PAIR_TIME_POS : PAIR_TIME_NEG);
-    }
+  int columns_to_draw = COLS < N_FFT ? COLS : N_FFT;
+  for (int n = 0; n < columns_to_draw; n++) {
+    float v = signal_pre_window[n] / (signal_peak + 1e-6f);
+    bool pos = v >= 0.0f;
+    int h = (int)(fabsf(v) * (float)half_height + 0.5f);
+    draw_bar(n, midline_row, h, pos, pos ? PAIR_TIME_POS : PAIR_TIME_NEG);
+  }
 }
 
 /* ===================================================================== */
 /* §16  draw_freq — FREQ panel                                           */
 /* ===================================================================== */
 
-static int draw_freq_panel(const float *magnitude,
-                           float        magnitude_peak,
-                           const PanelLayout *L)
-{
-    /* Purpose : render the magnitude spectrum as upward bars from a
-     *           baseline at the bottom of the panel.  Each bin uses
-     *           1 or 2 columns depending on terminal width.
-     * Returns : the maximum bin index actually drawn (so the
-     *           waterfall can match its width).
-     */
-    int bin_width_cells = (COLS / (N_FFT / 2)) >= 2 ? 2 : 1;
-    int max_bins        = COLS / bin_width_cells;
-    if (max_bins > N_FFT / 2) max_bins = N_FFT / 2;
+static int draw_freq_panel(const float *magnitude, float magnitude_peak,
+                           const PanelLayout *L) {
+  /* Purpose : render the magnitude spectrum as upward bars from a
+   *           baseline at the bottom of the panel.  Each bin uses
+   *           1 or 2 columns depending on terminal width.
+   * Returns : the maximum bin index actually drawn (so the
+   *           waterfall can match its width).
+   */
+  int bin_width_cells = (COLS / (N_FFT / 2)) >= 2 ? 2 : 1;
+  int max_bins = COLS / bin_width_cells;
+  if (max_bins > N_FFT / 2)
+    max_bins = N_FFT / 2;
 
-    for (int k = 0; k < max_bins; k++) {
-        float v       = magnitude[k] / (magnitude_peak + 1e-6f);
-        int   h       = (int)(v * (float)L->freq_height_rows + 0.5f);
-        int   pair_id = (h > L->freq_height_rows / 2)
-                      ? PAIR_FREQ_HIGH : PAIR_FREQ_LOW;
-        for (int bx = 0; bx < bin_width_cells; bx++)
-            draw_bar(k * bin_width_cells + bx, L->freq_baseline_row,
-                     h, true, pair_id);
-    }
-    return max_bins;
+  for (int k = 0; k < max_bins; k++) {
+    float v = magnitude[k] / (magnitude_peak + 1e-6f);
+    int h = (int)(v * (float)L->freq_height_rows + 0.5f);
+    int pair_id =
+        (h > L->freq_height_rows / 2) ? PAIR_FREQ_HIGH : PAIR_FREQ_LOW;
+    for (int bx = 0; bx < bin_width_cells; bx++)
+      draw_bar(k * bin_width_cells + bx, L->freq_baseline_row, h, true,
+               pair_id);
+  }
+  return max_bins;
 }
 
 /* ===================================================================== */
@@ -1685,97 +1698,97 @@ static int draw_freq_panel(const float *magnitude,
  *                        un-pause (showing what magnitude throws away).
  */
 
-#define DEBUG_PHASE_TABLE_ROWS  8
+#define DEBUG_PHASE_TABLE_ROWS 8
 
-static void draw_debug_window_overlay(WindowKind kind, const PanelLayout *L)
-{
-    /* Trace y = window_coefficient(n) over the time panel as '*'
-     * marks at the height that the value would reach if it were a
-     * positive-going time sample. */
-    if (kind == WINDOW_RECT) return;   /* nothing to show */
-    int half_height = L->time_height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = L->time_top_row + half_height;
+static void draw_debug_window_overlay(WindowKind kind, const PanelLayout *L) {
+  /* Trace y = window_coefficient(n) over the time panel as '*'
+   * marks at the height that the value would reach if it were a
+   * positive-going time sample. */
+  if (kind == WINDOW_RECT)
+    return; /* nothing to show */
+  int half_height = L->time_height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = L->time_top_row + half_height;
 
-    int columns = COLS < N_FFT ? COLS : N_FFT;
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    for (int n = 0; n < columns; n++) {
-        float w = window_coefficient(kind, n, N_FFT);
-        int   h = (int)(w * (float)half_height + 0.5f);
-        int   y = midline_row - h;
-        if (y >= 0 && y < LINES) mvaddch(y, n, '*');
-    }
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  int columns = COLS < N_FFT ? COLS : N_FFT;
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  for (int n = 0; n < columns; n++) {
+    float w = window_coefficient(kind, n, N_FFT);
+    int h = (int)(w * (float)half_height + 0.5f);
+    int y = midline_row - h;
+    if (y >= 0 && y < LINES)
+      mvaddch(y, n, '*');
+  }
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void draw_debug_phase_table(const float *fft_real,
-                                   const float *fft_imag,
-                                   const float *magnitude)
-{
-    /* Sort bin indices by descending magnitude (selection sort over
-     * the first N/2 bins is fine — N/2 = 64).  Print the top
-     * DEBUG_PHASE_TABLE_ROWS entries. */
-    int sorted_bin_indices[N_FFT / 2];
-    for (int i = 0; i < N_FFT / 2; i++) sorted_bin_indices[i] = i;
-    for (int i = 0; i < DEBUG_PHASE_TABLE_ROWS && i < N_FFT / 2; i++) {
-        int max_at = i;
-        for (int j = i + 1; j < N_FFT / 2; j++)
-            if (magnitude[sorted_bin_indices[j]]
-              > magnitude[sorted_bin_indices[max_at]])
-                max_at = j;
-        int tmp = sorted_bin_indices[i];
-        sorted_bin_indices[i]      = sorted_bin_indices[max_at];
-        sorted_bin_indices[max_at] = tmp;
-    }
+static void draw_debug_phase_table(const float *fft_real, const float *fft_imag,
+                                   const float *magnitude) {
+  /* Sort bin indices by descending magnitude (selection sort over
+   * the first N/2 bins is fine — N/2 = 64).  Print the top
+   * DEBUG_PHASE_TABLE_ROWS entries. */
+  int sorted_bin_indices[N_FFT / 2];
+  for (int i = 0; i < N_FFT / 2; i++)
+    sorted_bin_indices[i] = i;
+  for (int i = 0; i < DEBUG_PHASE_TABLE_ROWS && i < N_FFT / 2; i++) {
+    int max_at = i;
+    for (int j = i + 1; j < N_FFT / 2; j++)
+      if (magnitude[sorted_bin_indices[j]] >
+          magnitude[sorted_bin_indices[max_at]])
+        max_at = j;
+    int tmp = sorted_bin_indices[i];
+    sorted_bin_indices[i] = sorted_bin_indices[max_at];
+    sorted_bin_indices[max_at] = tmp;
+  }
 
-    int x = 2, y = 2;
-    if (y + DEBUG_PHASE_TABLE_ROWS + 1 >= LINES) return;
+  int x = 2, y = 2;
+  if (y + DEBUG_PHASE_TABLE_ROWS + 1 >= LINES)
+    return;
 
-    attron(COLOR_PAIR(PAIR_HINT));
-    mvprintw(y, x, "  bin   |X[k]|     arg(rad)");
-    attroff(COLOR_PAIR(PAIR_HINT));
+  attron(COLOR_PAIR(PAIR_HINT));
+  mvprintw(y, x, "  bin   |X[k]|     arg(rad)");
+  attroff(COLOR_PAIR(PAIR_HINT));
 
-    for (int i = 0; i < DEBUG_PHASE_TABLE_ROWS && i < N_FFT / 2; i++) {
-        int k = sorted_bin_indices[i];
-        float phase_radians = atan2f(fft_imag[k], fft_real[k]);
-        attron(COLOR_PAIR(PAIR_FREQ_HIGH) | A_BOLD);
-        mvprintw(y + 1 + i, x, " %4d  %7.4f   %+6.3f",
-                 k, (double)magnitude[k], (double)phase_radians);
-        attroff(COLOR_PAIR(PAIR_FREQ_HIGH) | A_BOLD);
-    }
+  for (int i = 0; i < DEBUG_PHASE_TABLE_ROWS && i < N_FFT / 2; i++) {
+    int k = sorted_bin_indices[i];
+    float phase_radians = atan2f(fft_imag[k], fft_real[k]);
+    attron(COLOR_PAIR(PAIR_FREQ_HIGH) | A_BOLD);
+    mvprintw(y + 1 + i, x, " %4d  %7.4f   %+6.3f", k, (double)magnitude[k],
+             (double)phase_radians);
+    attroff(COLOR_PAIR(PAIR_FREQ_HIGH) | A_BOLD);
+  }
 }
 
 /* ===================================================================== */
 /* §18  draw_hud — HUD top-right + bottom hint                           */
 /* ===================================================================== */
 
-static void draw_hud_top(int theme_index, bool paused)
-{
-    char buf[160];
-    snprintf(buf, sizeof buf,
-             " FFT  N=%d  FFT %d ops vs DFT %d ops  thm:%s ",
-             N_FFT, N_FFT * LOG2_N_FFT, N_FFT * N_FFT,
-             theme_table[theme_index].display_name);
-    int x = COLS - (int)strlen(buf);
-    if (x < 0) x = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, x, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+static void draw_hud_top(int theme_index, bool paused) {
+  char buf[160];
+  snprintf(buf, sizeof buf, " FFT  N=%d  FFT %d ops vs DFT %d ops  thm:%s ",
+           N_FFT, N_FFT * LOG2_N_FFT, N_FFT * N_FFT,
+           theme_table[theme_index].display_name);
+  int x = COLS - (int)strlen(buf);
+  if (x < 0)
+    x = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, x, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    if (paused) {
-        attron(COLOR_PAIR(PAIR_HUD) | A_BOLD | A_REVERSE);
-        mvprintw(0, 0, " PAUSED ");
-        attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD | A_REVERSE);
-    }
+  if (paused) {
+    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD | A_REVERSE);
+    mvprintw(0, 0, " PAUSED ");
+    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD | A_REVERSE);
+  }
 }
 
-static void draw_hud_hint(int hint_row)
-{
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(hint_row, 0,
-             " q:quit spc:pause m/M:mode w/W:win 1-3 j/k +/- ,/. n:noise"
-             " g:waterfall t/T:theme d:wenv D:phase r:reset ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void draw_hud_hint(int hint_row) {
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(hint_row, 0,
+           " q:quit spc:pause m/M:mode w/W:win 1-3 j/k +/- ,/. n:noise"
+           " g:waterfall t/T:theme d:wenv D:phase r:reset ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
@@ -1783,430 +1796,430 @@ static void draw_hud_hint(int hint_row)
 /* ===================================================================== */
 
 typedef struct {
-    SignalParams sig_params;
-    int          selected_component_index;
-    WindowKind   active_window;
-    int          active_theme_index;
-    bool         paused;
-    bool         show_waterfall;
-    bool         show_debug_window_overlay;
-    bool         show_debug_phase_table;
+  SignalParams sig_params;
+  int selected_component_index;
+  WindowKind active_window;
+  int active_theme_index;
+  bool paused;
+  bool show_waterfall;
+  bool show_debug_window_overlay;
+  bool show_debug_phase_table;
 
-    float        animation_phase_radians;
+  float animation_phase_radians;
 
-    /* Working buffers */
-    float        signal_pre_window [N_FFT];
-    float        fft_real_buffer   [N_FFT];
-    float        fft_imag_buffer   [N_FFT];
-    float        magnitude         [N_FFT / 2];
-    float        magnitude_peak;
-    float        signal_peak;
+  /* Working buffers */
+  float signal_pre_window[N_FFT];
+  float fft_real_buffer[N_FFT];
+  float fft_imag_buffer[N_FFT];
+  float magnitude[N_FFT / 2];
+  float magnitude_peak;
+  float signal_peak;
 } App;
 
-static void app_set_defaults(App *a)
-{
-    a->sig_params.mode                    = MODE_SINE_SUM;
-    a->sig_params.sine_components[0]      = (SineComponent){  4.0f, 1.0f, true };
-    a->sig_params.sine_components[1]      = (SineComponent){ 11.0f, 0.6f, true };
-    a->sig_params.sine_components[2]      = (SineComponent){ 23.0f, 0.4f, true };
-    a->sig_params.frequency_single_bin    = 5.0f;
-    a->sig_params.chirp_lo_bin            = 2.0f;
-    a->sig_params.chirp_hi_bin            = 30.0f;
-    a->sig_params.am_carrier_bin          = 16.0f;
-    a->sig_params.am_modulator_bin        = 3.0f;
-    a->sig_params.impulse_period_samples  = 16;
+static void app_set_defaults(App *a) {
+  a->sig_params.mode = MODE_SINE_SUM;
+  a->sig_params.sine_components[0] = (SineComponent){4.0f, 1.0f, true};
+  a->sig_params.sine_components[1] = (SineComponent){11.0f, 0.6f, true};
+  a->sig_params.sine_components[2] = (SineComponent){23.0f, 0.4f, true};
+  a->sig_params.frequency_single_bin = 5.0f;
+  a->sig_params.chirp_lo_bin = 2.0f;
+  a->sig_params.chirp_hi_bin = 30.0f;
+  a->sig_params.am_carrier_bin = 16.0f;
+  a->sig_params.am_modulator_bin = 3.0f;
+  a->sig_params.impulse_period_samples = 16;
 
-    a->selected_component_index           = 0;
-    a->active_window                      = WINDOW_RECT;
-    a->active_theme_index                 = 0;
-    a->paused                             = false;
-    a->show_waterfall                     = true;
-    a->show_debug_window_overlay          = false;
-    a->show_debug_phase_table             = false;
-    a->animation_phase_radians            = 0.0f;
-    spec_history_clear();
+  a->selected_component_index = 0;
+  a->active_window = WINDOW_RECT;
+  a->active_theme_index = 0;
+  a->paused = false;
+  a->show_waterfall = true;
+  a->show_debug_window_overlay = false;
+  a->show_debug_phase_table = false;
+  a->animation_phase_radians = 0.0f;
+  spec_history_clear();
 }
 
-static void app_adjust_freq(App *a, float delta_bins)
-{
-    /* Coarse and fine '+'/'-'/','/'.' keys both come through here.
-     * Which parameter we adjust depends on the active mode. */
-    float lo = 1.0f, hi = (float)N_FFT * 0.5f - 1.0f;
-    switch (a->sig_params.mode) {
-        case MODE_SINE_SUM: {
-            SineComponent *c =
-                &a->sig_params.sine_components[a->selected_component_index];
-            c->frequency_bin += delta_bins;
-            if (c->frequency_bin < lo) c->frequency_bin = lo;
-            if (c->frequency_bin > hi) c->frequency_bin = hi;
-            break;
-        }
-        case MODE_CHIRP:
-            a->sig_params.chirp_hi_bin += delta_bins;
-            if (a->sig_params.chirp_hi_bin < a->sig_params.chirp_lo_bin + 1.0f)
-                a->sig_params.chirp_hi_bin = a->sig_params.chirp_lo_bin + 1.0f;
-            if (a->sig_params.chirp_hi_bin > hi)
-                a->sig_params.chirp_hi_bin = hi;
-            break;
-        case MODE_AM:
-            a->sig_params.am_carrier_bin += delta_bins;
-            if (a->sig_params.am_carrier_bin
-              < a->sig_params.am_modulator_bin + 1.0f)
-                a->sig_params.am_carrier_bin
-                  = a->sig_params.am_modulator_bin + 1.0f;
-            if (a->sig_params.am_carrier_bin > hi)
-                a->sig_params.am_carrier_bin = hi;
-            break;
-        case MODE_IMPULSE: {
-            int step = (delta_bins >=  0.5f) ?  1
-                     : (delta_bins <= -0.5f) ? -1 : 0;
-            a->sig_params.impulse_period_samples += step;
-            if (a->sig_params.impulse_period_samples < 2)
-                a->sig_params.impulse_period_samples = 2;
-            if (a->sig_params.impulse_period_samples > N_FFT / 2)
-                a->sig_params.impulse_period_samples = N_FFT / 2;
-            break;
-        }
-        default:
-            a->sig_params.frequency_single_bin += delta_bins;
-            if (a->sig_params.frequency_single_bin < lo)
-                a->sig_params.frequency_single_bin = lo;
-            if (a->sig_params.frequency_single_bin > hi)
-                a->sig_params.frequency_single_bin = hi;
-            break;
-    }
+static void app_adjust_freq(App *a, float delta_bins) {
+  /* Coarse and fine '+'/'-'/','/'.' keys both come through here.
+   * Which parameter we adjust depends on the active mode. */
+  float lo = 1.0f, hi = (float)N_FFT * 0.5f - 1.0f;
+  switch (a->sig_params.mode) {
+  case MODE_SINE_SUM: {
+    SineComponent *c =
+        &a->sig_params.sine_components[a->selected_component_index];
+    c->frequency_bin += delta_bins;
+    if (c->frequency_bin < lo)
+      c->frequency_bin = lo;
+    if (c->frequency_bin > hi)
+      c->frequency_bin = hi;
+    break;
+  }
+  case MODE_CHIRP:
+    a->sig_params.chirp_hi_bin += delta_bins;
+    if (a->sig_params.chirp_hi_bin < a->sig_params.chirp_lo_bin + 1.0f)
+      a->sig_params.chirp_hi_bin = a->sig_params.chirp_lo_bin + 1.0f;
+    if (a->sig_params.chirp_hi_bin > hi)
+      a->sig_params.chirp_hi_bin = hi;
+    break;
+  case MODE_AM:
+    a->sig_params.am_carrier_bin += delta_bins;
+    if (a->sig_params.am_carrier_bin < a->sig_params.am_modulator_bin + 1.0f)
+      a->sig_params.am_carrier_bin = a->sig_params.am_modulator_bin + 1.0f;
+    if (a->sig_params.am_carrier_bin > hi)
+      a->sig_params.am_carrier_bin = hi;
+    break;
+  case MODE_IMPULSE: {
+    int step = (delta_bins >= 0.5f) ? 1 : (delta_bins <= -0.5f) ? -1 : 0;
+    a->sig_params.impulse_period_samples += step;
+    if (a->sig_params.impulse_period_samples < 2)
+      a->sig_params.impulse_period_samples = 2;
+    if (a->sig_params.impulse_period_samples > N_FFT / 2)
+      a->sig_params.impulse_period_samples = N_FFT / 2;
+    break;
+  }
+  default:
+    a->sig_params.frequency_single_bin += delta_bins;
+    if (a->sig_params.frequency_single_bin < lo)
+      a->sig_params.frequency_single_bin = lo;
+    if (a->sig_params.frequency_single_bin > hi)
+      a->sig_params.frequency_single_bin = hi;
+    break;
+  }
 }
 
-static void mode_param_summary(const App *a, char *buf, size_t buflen)
-{
-    /* One-line summary of the active mode's frequency parameter,
-     * shown next to the TIME panel label. */
-    const SignalParams *p = &a->sig_params;
-    switch (p->mode) {
-        case MODE_SINE_SUM:
-            snprintf(buf, buflen, "[c%d f=%.1f]",
-                     a->selected_component_index + 1,
-                     (double)p->sine_components[a->selected_component_index]
-                       .frequency_bin);
-            break;
-        case MODE_CHIRP:
-            snprintf(buf, buflen, "lo=%.1f hi=%.1f",
-                     (double)p->chirp_lo_bin, (double)p->chirp_hi_bin);
-            break;
-        case MODE_AM:
-            snprintf(buf, buflen, "carrier=%.1f mod=%.1f",
-                     (double)p->am_carrier_bin, (double)p->am_modulator_bin);
-            break;
-        case MODE_IMPULSE:
-            snprintf(buf, buflen, "period=%d", p->impulse_period_samples);
-            break;
-        default:
-            snprintf(buf, buflen, "f=%.1f", (double)p->frequency_single_bin);
-            break;
-    }
+static void mode_param_summary(const App *a, char *buf, size_t buflen) {
+  /* One-line summary of the active mode's frequency parameter,
+   * shown next to the TIME panel label. */
+  const SignalParams *p = &a->sig_params;
+  switch (p->mode) {
+  case MODE_SINE_SUM:
+    snprintf(
+        buf, buflen, "[c%d f=%.1f]", a->selected_component_index + 1,
+        (double)p->sine_components[a->selected_component_index].frequency_bin);
+    break;
+  case MODE_CHIRP:
+    snprintf(buf, buflen, "lo=%.1f hi=%.1f", (double)p->chirp_lo_bin,
+             (double)p->chirp_hi_bin);
+    break;
+  case MODE_AM:
+    snprintf(buf, buflen, "carrier=%.1f mod=%.1f", (double)p->am_carrier_bin,
+             (double)p->am_modulator_bin);
+    break;
+  case MODE_IMPULSE:
+    snprintf(buf, buflen, "period=%d", p->impulse_period_samples);
+    break;
+  default:
+    snprintf(buf, buflen, "f=%.1f", (double)p->frequency_single_bin);
+    break;
+  }
 }
 
 /* ===================================================================== */
 /* §20  app_compute — per-frame orchestration                            */
 /* ===================================================================== */
 
-static void app_compute(App *a)
-{
-    /* Purpose : run one full frame of the signal pipeline.
-     * Pseudocode :
-     *     build_signal           → signal_pre_window
-     *     copy + apply_window    → fft_real_buffer (imag := 0)
-     *     fft                    → fft_real_buffer + fft_imag_buffer
-     *     magnitude_normalised   → magnitude[]
-     *     spec_history_push      (only when not paused)
-     *     compute peaks for auto-scaling time + freq panels
-     */
-    build_signal(&a->sig_params, a->signal_pre_window,
-                 a->animation_phase_radians);
+static void app_compute(App *a) {
+  /* Purpose : run one full frame of the signal pipeline.
+   * Pseudocode :
+   *     build_signal           → signal_pre_window
+   *     copy + apply_window    → fft_real_buffer (imag := 0)
+   *     fft                    → fft_real_buffer + fft_imag_buffer
+   *     magnitude_normalised   → magnitude[]
+   *     spec_history_push      (only when not paused)
+   *     compute peaks for auto-scaling time + freq panels
+   */
+  build_signal(&a->sig_params, a->signal_pre_window,
+               a->animation_phase_radians);
 
-    for (int n = 0; n < N_FFT; n++) {
-        a->fft_real_buffer[n] = a->signal_pre_window[n];
-        a->fft_imag_buffer[n] = 0.0f;
-    }
-    apply_window(a->fft_real_buffer, N_FFT, a->active_window);
+  for (int n = 0; n < N_FFT; n++) {
+    a->fft_real_buffer[n] = a->signal_pre_window[n];
+    a->fft_imag_buffer[n] = 0.0f;
+  }
+  apply_window(a->fft_real_buffer, N_FFT, a->active_window);
 
-    fft(a->fft_real_buffer, a->fft_imag_buffer, N_FFT);
+  fft(a->fft_real_buffer, a->fft_imag_buffer, N_FFT);
 
-    a->magnitude_peak = 1e-6f;
-    for (int k = 0; k < N_FFT / 2; k++) {
-        a->magnitude[k] = sqrtf(a->fft_real_buffer[k] * a->fft_real_buffer[k]
-                              + a->fft_imag_buffer[k] * a->fft_imag_buffer[k])
-                        / ((float)N_FFT * 0.5f);
-        if (a->magnitude[k] > a->magnitude_peak)
-            a->magnitude_peak = a->magnitude[k];
-    }
+  a->magnitude_peak = 1e-6f;
+  for (int k = 0; k < N_FFT / 2; k++) {
+    a->magnitude[k] = sqrtf(a->fft_real_buffer[k] * a->fft_real_buffer[k] +
+                            a->fft_imag_buffer[k] * a->fft_imag_buffer[k]) /
+                      ((float)N_FFT * 0.5f);
+    if (a->magnitude[k] > a->magnitude_peak)
+      a->magnitude_peak = a->magnitude[k];
+  }
 
-    a->signal_peak = 1e-6f;
-    for (int n = 0; n < N_FFT; n++) {
-        float av = fabsf(a->signal_pre_window[n]);
-        if (av > a->signal_peak) a->signal_peak = av;
-    }
+  a->signal_peak = 1e-6f;
+  for (int n = 0; n < N_FFT; n++) {
+    float av = fabsf(a->signal_pre_window[n]);
+    if (av > a->signal_peak)
+      a->signal_peak = av;
+  }
 
-    if (!a->paused && a->show_waterfall)
-        spec_history_push(a->magnitude, a->magnitude_peak);
+  if (!a->paused && a->show_waterfall)
+    spec_history_push(a->magnitude, a->magnitude_peak);
 }
 
-static void app_draw(const App *a)
-{
-    /* Compose the frame: erase, panels, debug overlays, HUD, present.
-     * Layer order matters — later layers paint over earlier in any
-     * cells they share.  HUD/HINT always last. */
-    erase();
-    PanelLayout L = compute_layout(a->show_waterfall);
+static void app_draw(const App *a) {
+  /* Compose the frame: erase, panels, debug overlays, HUD, present.
+   * Layer order matters — later layers paint over earlier in any
+   * cells they share.  HUD/HINT always last. */
+  erase();
+  PanelLayout L = compute_layout(a->show_waterfall);
 
-    /* Panel labels */
-    char param_buf[64];
-    mode_param_summary(a, param_buf, sizeof param_buf);
-    attron(COLOR_PAIR(PAIR_HINT));
-    mvprintw(L.time_label_row, 0,
-             "TIME x[n]   mode:%s   win:%s   %s",
-             mode_name[a->sig_params.mode],
-             window_name[a->active_window],
+  /* Panel labels */
+  char param_buf[64];
+  mode_param_summary(a, param_buf, sizeof param_buf);
+  attron(COLOR_PAIR(PAIR_HINT));
+  mvprintw(L.time_label_row, 0, "TIME x[n]   mode:%s   win:%s   %s",
+           mode_name[a->sig_params.mode], window_name[a->active_window],
+           param_buf);
+  mvprintw(L.freq_label_row, 0, "FREQ |X[k]|   bins 0..%d   peak=%.3f",
+           N_FFT / 2 - 1, (double)a->magnitude_peak);
+  if (a->show_waterfall) {
+    mvprintw(L.water_label_row, 0, "SPECTROGRAM  newest=bottom  history=%d",
+             spec_history_filled_count);
+  }
+  attroff(COLOR_PAIR(PAIR_HINT));
+
+  /* Panels */
+  draw_time_panel(a->signal_pre_window, a->signal_peak, &L);
+  int max_bins_drawn = draw_freq_panel(a->magnitude, a->magnitude_peak, &L);
+  if (a->show_waterfall && L.water_height_rows > 0)
+    draw_waterfall(L.water_top_row, 0, L.water_height_rows, max_bins_drawn);
+
+  /* Debug overlays */
+  if (a->show_debug_window_overlay)
+    draw_debug_window_overlay(a->active_window, &L);
+  if (a->show_debug_phase_table)
+    draw_debug_phase_table(a->fft_real_buffer, a->fft_imag_buffer,
+                           a->magnitude);
+
+  /* Status row */
+  attron(COLOR_PAIR(PAIR_HUD));
+  if (a->sig_params.mode == MODE_SINE_SUM) {
+    mvprintw(L.status_row, 0, "Components: ");
+    for (int c = 0; c < N_SINE_COMPONENTS; c++) {
+      if (c == a->selected_component_index)
+        attron(A_REVERSE);
+      if (a->sig_params.sine_components[c].enabled)
+        attron(A_BOLD);
+      printw("[%d] f=%.1f a=%.1f%s  ", c + 1,
+             (double)a->sig_params.sine_components[c].frequency_bin,
+             (double)a->sig_params.sine_components[c].amplitude,
+             a->sig_params.sine_components[c].enabled ? "" : " OFF");
+      attroff(A_BOLD);
+      attroff(A_REVERSE);
+    }
+  } else {
+    mvprintw(L.status_row, 0, "Mode: %s   %s", mode_name[a->sig_params.mode],
              param_buf);
-    mvprintw(L.freq_label_row, 0,
-             "FREQ |X[k]|   bins 0..%d   peak=%.3f",
-             N_FFT / 2 - 1, (double)a->magnitude_peak);
-    if (a->show_waterfall) {
-        mvprintw(L.water_label_row, 0,
-                 "SPECTROGRAM  newest=bottom  history=%d",
-                 spec_history_filled_count);
-    }
-    attroff(COLOR_PAIR(PAIR_HINT));
+  }
+  attroff(COLOR_PAIR(PAIR_HUD));
 
-    /* Panels */
-    draw_time_panel(a->signal_pre_window, a->signal_peak, &L);
-    int max_bins_drawn = draw_freq_panel(a->magnitude, a->magnitude_peak, &L);
-    if (a->show_waterfall && L.water_height_rows > 0)
-        draw_waterfall(L.water_top_row, 0,
-                       L.water_height_rows, max_bins_drawn);
+  /* HUD top + hint bottom */
+  draw_hud_top(a->active_theme_index, a->paused);
+  draw_hud_hint(L.hint_row);
 
-    /* Debug overlays */
-    if (a->show_debug_window_overlay)
-        draw_debug_window_overlay(a->active_window, &L);
-    if (a->show_debug_phase_table)
-        draw_debug_phase_table(a->fft_real_buffer,
-                               a->fft_imag_buffer,
-                               a->magnitude);
-
-    /* Status row */
-    attron(COLOR_PAIR(PAIR_HUD));
-    if (a->sig_params.mode == MODE_SINE_SUM) {
-        mvprintw(L.status_row, 0, "Components: ");
-        for (int c = 0; c < N_SINE_COMPONENTS; c++) {
-            if (c == a->selected_component_index) attron(A_REVERSE);
-            if (a->sig_params.sine_components[c].enabled) attron(A_BOLD);
-            printw("[%d] f=%.1f a=%.1f%s  ", c + 1,
-                   (double)a->sig_params.sine_components[c].frequency_bin,
-                   (double)a->sig_params.sine_components[c].amplitude,
-                   a->sig_params.sine_components[c].enabled ? "" : " OFF");
-            attroff(A_BOLD); attroff(A_REVERSE);
-        }
-    } else {
-        mvprintw(L.status_row, 0, "Mode: %s   %s",
-                 mode_name[a->sig_params.mode], param_buf);
-    }
-    attroff(COLOR_PAIR(PAIR_HUD));
-
-    /* HUD top + hint bottom */
-    draw_hud_top(a->active_theme_index, a->paused);
-    draw_hud_hint(L.hint_row);
-
-    wnoutrefresh(stdscr);
-    doupdate();
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §21  app_input — key dispatch                                         */
 /* ===================================================================== */
 
-static bool app_handle_key(App *a, int ch)
-{
-    /* Returns true if the program should quit, false otherwise. */
-    switch (ch) {
-        case 'q': case 'Q': case 27:
-            return true;
+static bool app_handle_key(App *a, int ch) {
+  /* Returns true if the program should quit, false otherwise. */
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return true;
 
-        case ' ':
-            a->paused = !a->paused;
-            break;
+  case ' ':
+    a->paused = !a->paused;
+    break;
 
-        /* ── sine-sum component controls (no-op outside MODE_SINE_SUM) ── */
-        case '1':
-            if (a->sig_params.mode == MODE_SINE_SUM)
-                a->sig_params.sine_components[0].enabled =
-                    !a->sig_params.sine_components[0].enabled;
-            break;
-        case '2':
-            if (a->sig_params.mode == MODE_SINE_SUM)
-                a->sig_params.sine_components[1].enabled =
-                    !a->sig_params.sine_components[1].enabled;
-            break;
-        case '3':
-            if (a->sig_params.mode == MODE_SINE_SUM)
-                a->sig_params.sine_components[2].enabled =
-                    !a->sig_params.sine_components[2].enabled;
-            break;
-        case 'j':
-            if (a->sig_params.mode == MODE_SINE_SUM)
-                a->selected_component_index =
-                    (a->selected_component_index + 1) % N_SINE_COMPONENTS;
-            break;
-        case 'k':
-            if (a->sig_params.mode == MODE_SINE_SUM)
-                a->selected_component_index =
-                    (a->selected_component_index + N_SINE_COMPONENTS - 1)
-                    % N_SINE_COMPONENTS;
-            break;
+  /* ── sine-sum component controls (no-op outside MODE_SINE_SUM) ── */
+  case '1':
+    if (a->sig_params.mode == MODE_SINE_SUM)
+      a->sig_params.sine_components[0].enabled =
+          !a->sig_params.sine_components[0].enabled;
+    break;
+  case '2':
+    if (a->sig_params.mode == MODE_SINE_SUM)
+      a->sig_params.sine_components[1].enabled =
+          !a->sig_params.sine_components[1].enabled;
+    break;
+  case '3':
+    if (a->sig_params.mode == MODE_SINE_SUM)
+      a->sig_params.sine_components[2].enabled =
+          !a->sig_params.sine_components[2].enabled;
+    break;
+  case 'j':
+    if (a->sig_params.mode == MODE_SINE_SUM)
+      a->selected_component_index =
+          (a->selected_component_index + 1) % N_SINE_COMPONENTS;
+    break;
+  case 'k':
+    if (a->sig_params.mode == MODE_SINE_SUM)
+      a->selected_component_index =
+          (a->selected_component_index + N_SINE_COMPONENTS - 1) %
+          N_SINE_COMPONENTS;
+    break;
 
-        /* ── frequency adjustment ── */
-        case '+': case '=':  app_adjust_freq(a, +1.0f); break;
-        case '-':            app_adjust_freq(a, -1.0f); break;
-        case '.':            app_adjust_freq(a, +0.1f); break;
-        case ',':            app_adjust_freq(a, -0.1f); break;
+  /* ── frequency adjustment ── */
+  case '+':
+  case '=':
+    app_adjust_freq(a, +1.0f);
+    break;
+  case '-':
+    app_adjust_freq(a, -1.0f);
+    break;
+  case '.':
+    app_adjust_freq(a, +0.1f);
+    break;
+  case ',':
+    app_adjust_freq(a, -0.1f);
+    break;
 
-        /* ── mode + window cycling ── */
-        case 'm':
-            a->sig_params.mode = (SignalMode)((a->sig_params.mode + 1)
-                                              % N_SIGNAL_MODES);
-            spec_history_clear();
-            break;
-        case 'M':
-            a->sig_params.mode = (SignalMode)((a->sig_params.mode
-                                              + N_SIGNAL_MODES - 1)
-                                              % N_SIGNAL_MODES);
-            spec_history_clear();
-            break;
-        case 'w':
-            a->active_window = (WindowKind)((a->active_window + 1)
-                                            % N_WINDOWS);
-            break;
-        case 'W':
-            a->active_window = (WindowKind)((a->active_window + N_WINDOWS - 1)
-                                            % N_WINDOWS);
-            break;
+  /* ── mode + window cycling ── */
+  case 'm':
+    a->sig_params.mode =
+        (SignalMode)((a->sig_params.mode + 1) % N_SIGNAL_MODES);
+    spec_history_clear();
+    break;
+  case 'M':
+    a->sig_params.mode =
+        (SignalMode)((a->sig_params.mode + N_SIGNAL_MODES - 1) %
+                     N_SIGNAL_MODES);
+    spec_history_clear();
+    break;
+  case 'w':
+    a->active_window = (WindowKind)((a->active_window + 1) % N_WINDOWS);
+    break;
+  case 'W':
+    a->active_window =
+        (WindowKind)((a->active_window + N_WINDOWS - 1) % N_WINDOWS);
+    break;
 
-        /* ── overlays + misc ── */
-        case 'g': case 'G':
-            a->show_waterfall = !a->show_waterfall;
-            spec_history_clear();
-            break;
-        case 'd':
-            a->show_debug_window_overlay = !a->show_debug_window_overlay;
-            break;
-        case 'D':
-            a->show_debug_phase_table = !a->show_debug_phase_table;
-            break;
-        case 'n': case 'N':
-            for (int i = 0; i < N_FFT; i++)
-                g_noise_buffer[i] = ((float)rand() / (float)RAND_MAX
-                                     * 2.0f - 1.0f) * NOISE_AMP_PEAK;
-            g_noise_decay_envelope = 1.0f;
-            break;
-        case 't':
-            a->active_theme_index = (a->active_theme_index + 1) % N_THEMES;
-            apply_theme(a->active_theme_index);
-            break;
-        case 'T':
-            a->active_theme_index = (a->active_theme_index + N_THEMES - 1)
-                                    % N_THEMES;
-            apply_theme(a->active_theme_index);
-            break;
-        case 'r': case 'R':
-            app_set_defaults(a);
-            apply_theme(a->active_theme_index);
-            break;
+  /* ── overlays + misc ── */
+  case 'g':
+  case 'G':
+    a->show_waterfall = !a->show_waterfall;
+    spec_history_clear();
+    break;
+  case 'd':
+    a->show_debug_window_overlay = !a->show_debug_window_overlay;
+    break;
+  case 'D':
+    a->show_debug_phase_table = !a->show_debug_phase_table;
+    break;
+  case 'n':
+  case 'N':
+    for (int i = 0; i < N_FFT; i++)
+      g_noise_buffer[i] =
+          ((float)rand() / (float)RAND_MAX * 2.0f - 1.0f) * NOISE_AMP_PEAK;
+    g_noise_decay_envelope = 1.0f;
+    break;
+  case 't':
+    a->active_theme_index = (a->active_theme_index + 1) % N_THEMES;
+    apply_theme(a->active_theme_index);
+    break;
+  case 'T':
+    a->active_theme_index = (a->active_theme_index + N_THEMES - 1) % N_THEMES;
+    apply_theme(a->active_theme_index);
+    break;
+  case 'r':
+  case 'R':
+    app_set_defaults(a);
+    apply_theme(a->active_theme_index);
+    break;
 
-        default: break;
-    }
-    return false;
+  default:
+    break;
+  }
+  return false;
 }
 
 /* ===================================================================== */
 /* §22  app_main — signal handlers + main loop                           */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_should_quit    = 0;
+static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
 
-static void on_signal(int sig)
-{
-    /* Async-signal-safe: only set flags; the main loop handles them. */
-    if (sig == SIGWINCH) g_resize_pending = 1;
-    else                 g_should_quit    = 1;
+static void on_signal(int sig) {
+  /* Async-signal-safe: only set flags; the main loop handles them. */
+  if (sig == SIGWINCH)
+    g_resize_pending = 1;
+  else
+    g_should_quit = 1;
 }
 
-static void cleanup_screen(void)
-{
-    endwin();
-}
+static void cleanup_screen(void) { endwin(); }
 
-int main(void)
-{
-    signal(SIGINT,   on_signal);
-    signal(SIGTERM,  on_signal);
-    signal(SIGWINCH, on_signal);
-    atexit(cleanup_screen);
+int main(void) {
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGWINCH, on_signal);
+  atexit(cleanup_screen);
 
-    initscr();
-    cbreak();
-    noecho();
-    curs_set(0);
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    typeahead(-1);                /* don't let stdin peek interrupt blits */
+  initscr();
+  cbreak();
+  noecho();
+  curs_set(0);
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  typeahead(-1); /* don't let stdin peek interrupt blits */
 
-    App a;
-    app_set_defaults(&a);
-    colors_init(a.active_theme_index);
+  App a;
+  app_set_defaults(&a);
+  colors_init(a.active_theme_index);
 
-    long long next_frame_ns = clock_now_ns();
+  long long next_frame_ns = clock_now_ns();
 
-    while (!g_should_quit) {
-        /* ── resize handling ── */
-        if (g_resize_pending) {
-            g_resize_pending = 0;
-            endwin();
-            refresh();
-            spec_history_clear();   /* widths may have changed */
-        }
-
-        /* ── input ── */
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (app_handle_key(&a, ch)) {
-                g_should_quit = 1;
-                break;
-            }
-        }
-
-        /* ── tick + render at the frame slot ── */
-        long long now = clock_now_ns();
-        if (now >= next_frame_ns) {
-            if (!a.paused) {
-                a.animation_phase_radians += ANIMATION_PHASE_STEP_RAD;
-                if (a.animation_phase_radians > 2.0f * (float)M_PI)
-                    a.animation_phase_radians -= 2.0f * (float)M_PI;
-                if (g_noise_decay_envelope > 0.0f)
-                    g_noise_decay_envelope -= NOISE_DECAY_RATE;
-                if (g_noise_decay_envelope < 0.0f)
-                    g_noise_decay_envelope = 0.0f;
-            }
-            app_compute(&a);
-            app_draw(&a);
-            next_frame_ns += RENDER_TICK_NS;
-            /* Snap forward if the terminal was suspended/hidden so we
-             * don't spend the next several frames "catching up". */
-            if (clock_now_ns() > next_frame_ns + 5 * RENDER_TICK_NS)
-                next_frame_ns = clock_now_ns() + RENDER_TICK_NS;
-        } else {
-            clock_sleep_ns(next_frame_ns - now);
-        }
+  while (!g_should_quit) {
+    /* ── resize handling ── */
+    if (g_resize_pending) {
+      g_resize_pending = 0;
+      endwin();
+      refresh();
+      spec_history_clear(); /* widths may have changed */
     }
 
-    return 0;
+    /* ── input ── */
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (app_handle_key(&a, ch)) {
+        g_should_quit = 1;
+        break;
+      }
+    }
+
+    /* ── tick + render at the frame slot ── */
+    long long now = clock_now_ns();
+    if (now >= next_frame_ns) {
+      if (!a.paused) {
+        a.animation_phase_radians += ANIMATION_PHASE_STEP_RAD;
+        if (a.animation_phase_radians > 2.0f * (float)M_PI)
+          a.animation_phase_radians -= 2.0f * (float)M_PI;
+        if (g_noise_decay_envelope > 0.0f)
+          g_noise_decay_envelope -= NOISE_DECAY_RATE;
+        if (g_noise_decay_envelope < 0.0f)
+          g_noise_decay_envelope = 0.0f;
+      }
+      app_compute(&a);
+      app_draw(&a);
+      next_frame_ns += RENDER_TICK_NS;
+      /* Snap forward if the terminal was suspended/hidden so we
+       * don't spend the next several frames "catching up". */
+      if (clock_now_ns() > next_frame_ns + 5 * RENDER_TICK_NS)
+        next_frame_ns = clock_now_ns() + RENDER_TICK_NS;
+    } else {
+      clock_sleep_ns(next_frame_ns - now);
+    }
+  }
+
+  return 0;
 }

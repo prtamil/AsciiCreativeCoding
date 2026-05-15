@@ -823,27 +823,27 @@
 #include <time.h>
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 /* ── §1 config ──────────────────────────────────────────────────────── */
 
 /* §1.1 frame-rate and motion knobs. */
 enum {
-    SIM_FPS_MIN     =  10,
-    SIM_FPS_DEFAULT =  30,
-    SIM_FPS_MAX     = 120,
-    SIM_FPS_STEP    =  10,
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 30,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
 
-    SPEED_MIN       =   1,
-    SPEED_DEF       =   8,
-    SPEED_MAX       =  64,
+  SPEED_MIN = 1,
+  SPEED_DEF = 8,
+  SPEED_MAX = 64,
 };
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(f)      (NS_PER_SEC / (f))
-#define DT_CAP_NS       (100 * NS_PER_MS)
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
+#define DT_CAP_NS (100 * NS_PER_MS)
 
 /* §1.2 view geometry — pinhole camera, no pitch.
  *
@@ -853,13 +853,13 @@ enum {
  * sun moves, the trees vary per seed — so we keep the camera straight
  * and let the sun drift through the upper part of the frame.
  */
-#define ASPECT_Y        2.0f
-#define FOV_H_BASE      0.55f
-#define ZOOM_MIN        0.25f
-#define ZOOM_MAX        4.0f
-#define ZOOM_STEP       1.25f
+#define ASPECT_Y 2.0f
+#define FOV_H_BASE 0.55f
+#define ZOOM_MIN 0.25f
+#define ZOOM_MAX 4.0f
+#define ZOOM_STEP 1.25f
 
-#define CAMERA_HEIGHT   1.6f          /* eye level above ground (m)       */
+#define CAMERA_HEIGHT 1.6f /* eye level above ground (m)       */
 
 /* §1.3 sun (treated as DIRECTIONAL — at infinity, T9).
  *
@@ -876,14 +876,14 @@ enum {
  * SUN_ANG_RADIUS is exaggerated from real (0.5°/0.0087 rad) so the
  * disc registers at terminal resolution.
  */
-#define SUN_DIST       1000.0f
-#define SUN_ANG_RADIUS    0.07f       /* rad — ~4° apparent disc          */
-#define SUN_EMIT_HDR     14.0f        /* HDR brightness multiplier        */
+#define SUN_DIST 1000.0f
+#define SUN_ANG_RADIUS 0.07f /* rad — ~4° apparent disc          */
+#define SUN_EMIT_HDR 14.0f   /* HDR brightness multiplier        */
 
-#define SUN_EL_BASE       0.22f       /* rad — ~12.6° median elevation   */
-#define SUN_EL_AMP        0.044f      /* rad — ±2.5°                     */
-#define SUN_AZ_BASE       0.0f
-#define SUN_AZ_AMP        0.087f      /* rad — ±5° azimuth               */
+#define SUN_EL_BASE 0.22f /* rad — ~12.6° median elevation   */
+#define SUN_EL_AMP 0.044f /* rad — ±2.5°                     */
+#define SUN_AZ_BASE 0.0f
+#define SUN_AZ_AMP 0.087f /* rad — ±5° azimuth               */
 #define SUN_EL_PERIOD_S 200.0f
 #define SUN_AZ_PERIOD_S 280.0f
 
@@ -902,23 +902,23 @@ enum {
  * TREE_Z_MIN = 3.5 m — closer than that, a single trunk dominates
  * the frame. TREE_Z_MAX = 28 m sets the visible far range.
  */
-#define N_AZIM_BINS      5
-#define N_DEPTH_BINS     4
-#define N_TREES          (N_AZIM_BINS * N_DEPTH_BINS)
-#define TREE_FILL_PROB   0.70f       /* per-cell probability of tree     */
-#define TREE_Z_MIN       3.5f
-#define TREE_Z_MAX      28.0f
-#define AZIMUTH_HALF     0.55f       /* rad (~31°), wider than camera FOV */
-#define TREE_R_MIN       0.08f
-#define TREE_R_MAX       0.22f
-#define TREE_H_MIN       4.5f
-#define TREE_H_MAX       9.0f
+#define N_AZIM_BINS 5
+#define N_DEPTH_BINS 4
+#define N_TREES (N_AZIM_BINS * N_DEPTH_BINS)
+#define TREE_FILL_PROB 0.70f /* per-cell probability of tree     */
+#define TREE_Z_MIN 3.5f
+#define TREE_Z_MAX 28.0f
+#define AZIMUTH_HALF 0.55f /* rad (~31°), wider than camera FOV */
+#define TREE_R_MIN 0.08f
+#define TREE_R_MAX 0.22f
+#define TREE_H_MIN 4.5f
+#define TREE_H_MAX 9.0f
 
 /* §1.5 ground plane — flat horizontal plane at y = 0. */
-#define GROUND_Y         0.0f
-#define GROUND_ALBEDO_R  0.18f
-#define GROUND_ALBEDO_G  0.13f
-#define GROUND_ALBEDO_B  0.08f
+#define GROUND_Y 0.0f
+#define GROUND_ALBEDO_R 0.18f
+#define GROUND_ALBEDO_G 0.13f
+#define GROUND_ALBEDO_B 0.08f
 
 /* §1.6 atmospheric medium — height-decaying mist (T2).
  *
@@ -935,29 +935,29 @@ enum {
  * forward bias; cones get geometric definition from tree gaps so
  * the phase function doesn't have to do all the work.
  */
-#define MIST_SIGMA       0.25f      /* peak σ at y = 0                   */
-#define MIST_SCALE_H     1.0f       /* e-folding height (m)              */
-#define HG_G             0.55f      /* HG anisotropy in (-1, 1)          */
-#define MARCH_STEPS      32
-#define FAR_CLIP        40.0f       /* march t_max for sky-bound rays    */
-#define SUN_NEE_DIST    50.0f       /* tree-block test distance to sun   */
-#define INSCATTER_GAIN   2.25f      /* shaft visibility multiplier        */
+#define MIST_SIGMA 0.25f  /* peak σ at y = 0                   */
+#define MIST_SCALE_H 1.0f /* e-folding height (m)              */
+#define HG_G 0.55f        /* HG anisotropy in (-1, 1)          */
+#define MARCH_STEPS 32
+#define FAR_CLIP 40.0f       /* march t_max for sky-bound rays    */
+#define SUN_NEE_DIST 50.0f   /* tree-block test distance to sun   */
+#define INSCATTER_GAIN 2.25f /* shaft visibility multiplier        */
 
 /* §1.7 sky gradient — orange near horizon, deep blue overhead (T8). */
-#define SKY_ZENITH_R     0.08f
-#define SKY_ZENITH_G     0.12f
-#define SKY_ZENITH_B     0.22f
-#define SKY_HORIZON_FAC  0.40f       /* horizon = sun_chrom · this        */
+#define SKY_ZENITH_R 0.08f
+#define SKY_ZENITH_G 0.12f
+#define SKY_ZENITH_B 0.22f
+#define SKY_HORIZON_FAC 0.40f /* horizon = sun_chrom · this        */
 
 /* §1.8 buffer and ncurses pair-id reservations. */
-#define BUF_MAX_W        400
-#define BUF_MAX_H        200
+#define BUF_MAX_W 400
+#define BUF_MAX_H 200
 
 enum {
-    PAIR_HUD          =  1,
-    PAIR_HINT         =  2,
-    PAIR_SUN_FALLBACK =  3,
-    PAIR_CUBE_BASE    = 16,           /* + 0..215 = 6×6×6 cube           */
+  PAIR_HUD = 1,
+  PAIR_HINT = 2,
+  PAIR_SUN_FALLBACK = 3,
+  PAIR_CUBE_BASE = 16, /* + 0..215 = 6×6×6 cube           */
 };
 
 /* §1.9 ASCII glyph ramp (16 levels). */
@@ -966,15 +966,15 @@ static const char k_ramp[] = " .'`,-_:;~=+*oO0";
 
 /* §1.10 kelvin presets (T9). */
 typedef struct {
-    const char *name;
-    float       kelvin;
+  const char *name;
+  float kelvin;
 } KelvinPreset;
 
 static const KelvinPreset KELVINS[] = {
-    { "DAWN  ", 2000.0f },
-    { "GOLDEN", 3500.0f },
-    { "NOON  ", 5500.0f },
-    { "DUSK  ", 2500.0f },
+    {"DAWN  ", 2000.0f},
+    {"GOLDEN", 3500.0f},
+    {"NOON  ", 5500.0f},
+    {"DUSK  ", 2500.0f},
 };
 #define N_KELVINS ((int)(sizeof KELVINS / sizeof KELVINS[0]))
 
@@ -986,22 +986,26 @@ static const KelvinPreset KELVINS[] = {
  *   MODE_TR         gray-scale eye-ray transmittance at far hit
  */
 typedef enum {
-    MODE_NORMAL  = 0,
-    MODE_SCATTER = 1,
-    MODE_SURFACE = 2,
-    MODE_TR      = 3,
-    MODE_N       = 4,
+  MODE_NORMAL = 0,
+  MODE_SCATTER = 1,
+  MODE_SURFACE = 2,
+  MODE_TR = 3,
+  MODE_N = 4,
 } DebugMode;
 
-static const char *debug_mode_name(DebugMode m)
-{
-    switch (m) {
-    case MODE_NORMAL:  return "NORMAL ";
-    case MODE_SCATTER: return "SCATTER";
-    case MODE_SURFACE: return "SURFACE";
-    case MODE_TR:      return "TR     ";
-    default:           return "?      ";
-    }
+static const char *debug_mode_name(DebugMode m) {
+  switch (m) {
+  case MODE_NORMAL:
+    return "NORMAL ";
+  case MODE_SCATTER:
+    return "SCATTER";
+  case MODE_SURFACE:
+    return "SURFACE";
+  case MODE_TR:
+    return "TR     ";
+  default:
+    return "?      ";
+  }
 }
 
 /* ── §2 clock ───────────────────────────────────────────────────────── */
@@ -1012,11 +1016,10 @@ static const char *debug_mode_name(DebugMode m)
  * CLOCK_MONOTONIC never goes backward across NTP / DST / suspend;
  * the right choice for animation dt and fps measurement.
  */
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
 /*
@@ -1024,14 +1027,14 @@ static int64_t clock_ns(void)
  * without burning CPU at 100%; subtract elapsed work and sleep
  * the remainder.
  */
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ── §3 vec3 math ────────────────────────────────────────────────────── *
@@ -1041,24 +1044,32 @@ static void clock_sleep_ns(int64_t ns)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-typedef struct { float x, y, z; } V3;
+typedef struct {
+  float x, y, z;
+} V3;
 
-static inline V3    v3 (float x, float y, float z) { return (V3){x,y,z}; }
-static inline V3    v3_add(V3 a, V3 b)   { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
-static inline V3    v3_sub(V3 a, V3 b)   { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
-static inline V3    v3_scl(V3 a, float s){ return v3(a.x*s, a.y*s, a.z*s);     }
-static inline float v3_dot(V3 a, V3 b)   { return a.x*b.x + a.y*b.y + a.z*b.z; }
-static inline float v3_len(V3 a)         { return sqrtf(v3_dot(a, a));         }
+static inline V3 v3(float x, float y, float z) { return (V3){x, y, z}; }
+static inline V3 v3_add(V3 a, V3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline V3 v3_sub(V3 a, V3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline V3 v3_scl(V3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+static inline float v3_dot(V3 a, V3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3_len(V3 a) { return sqrtf(v3_dot(a, a)); }
 
 /*
  * v3_norm — return a unit vector in the same direction as `a',
  * or (0,0,0) if `a' is zero-length (avoids NaN propagation).
  */
-static inline V3 v3_norm(V3 a)
-{
-    float length = v3_len(a);
-    if (length < 1e-12f) return v3(0, 0, 0);
-    return v3_scl(a, 1.0f / length);
+static inline V3 v3_norm(V3 a) {
+  float length = v3_len(a);
+  if (length < 1e-12f)
+    return v3(0, 0, 0);
+  return v3_scl(a, 1.0f / length);
 }
 
 /* ── §4 rgb math ─────────────────────────────────────────────────────── *
@@ -1068,18 +1079,31 @@ static inline V3 v3_norm(V3 a)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-typedef struct { float r, g, b; } RGB;
+typedef struct {
+  float r, g, b;
+} RGB;
 
-static inline RGB rgb_make(float r, float g, float b) { return (RGB){r,g,b}; }
-static inline RGB rgb_add (RGB a, RGB b)   { return rgb_make(a.r+b.r, a.g+b.g, a.b+b.b); }
-static inline RGB rgb_mul (RGB a, RGB b)   { return rgb_make(a.r*b.r, a.g*b.g, a.b*b.b); }
-static inline RGB rgb_scl (RGB a, float s) { return rgb_make(a.r*s, a.g*s, a.b*s);       }
-static inline RGB rgb_lerp(RGB a, RGB b, float t)
-{ return rgb_make(a.r+(b.r-a.r)*t, a.g+(b.g-a.g)*t, a.b+(b.b-a.b)*t); }
+static inline RGB rgb_make(float r, float g, float b) { return (RGB){r, g, b}; }
+static inline RGB rgb_add(RGB a, RGB b) {
+  return rgb_make(a.r + b.r, a.g + b.g, a.b + b.b);
+}
+static inline RGB rgb_mul(RGB a, RGB b) {
+  return rgb_make(a.r * b.r, a.g * b.g, a.b * b.b);
+}
+static inline RGB rgb_scl(RGB a, float s) {
+  return rgb_make(a.r * s, a.g * s, a.b * s);
+}
+static inline RGB rgb_lerp(RGB a, RGB b, float t) {
+  return rgb_make(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
+                  a.b + (b.b - a.b) * t);
+}
 
-static inline float clamp01 (float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
-static inline float luma_of (RGB c)
-{ return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b; }
+static inline float clamp01(float x) {
+  return x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
+}
+static inline float luma_of(RGB c) {
+  return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+}
 
 /* ── §5 blackbody (Tanner-Helland) ──────────────────────────────────── *
  *
@@ -1107,22 +1131,28 @@ static inline float luma_of (RGB c)
  *       138.52 · log(K-10)     - 305.04 / 255   otherwise
  *   return clamp01((r, g, b))
  */
-static RGB blackbody_rgb(float kelvin)
-{
-    float K = kelvin / 100.0f;
-    float r, g, b;
+static RGB blackbody_rgb(float kelvin) {
+  float K = kelvin / 100.0f;
+  float r, g, b;
 
-    if (K <= 66.0f) r = 1.0f;
-    else            r = 329.7f * powf(K - 60.0f, -0.1332f) / 255.0f;
+  if (K <= 66.0f)
+    r = 1.0f;
+  else
+    r = 329.7f * powf(K - 60.0f, -0.1332f) / 255.0f;
 
-    if (K <= 66.0f) g = (99.47f  * logf(K)            - 161.12f) / 255.0f;
-    else            g =  288.12f * powf(K - 60.0f, -0.0755f)      / 255.0f;
+  if (K <= 66.0f)
+    g = (99.47f * logf(K) - 161.12f) / 255.0f;
+  else
+    g = 288.12f * powf(K - 60.0f, -0.0755f) / 255.0f;
 
-    if (K >= 66.0f)      b = 1.0f;
-    else if (K <= 19.0f) b = 0.0f;
-    else                 b = (138.52f * logf(K - 10.0f) - 305.04f) / 255.0f;
+  if (K >= 66.0f)
+    b = 1.0f;
+  else if (K <= 19.0f)
+    b = 0.0f;
+  else
+    b = (138.52f * logf(K - 10.0f) - 305.04f) / 255.0f;
 
-    return rgb_make(clamp01(r), clamp01(g), clamp01(b));
+  return rgb_make(clamp01(r), clamp01(g), clamp01(b));
 }
 
 /* ── §6 tone map ─────────────────────────────────────────────────────── *
@@ -1136,7 +1166,7 @@ static RGB blackbody_rgb(float kelvin)
  *
  * ─────────────────────────────────────────────────────────────────── */
 
-static inline float reinhard (float x) { return x / (1.f + x); }
+static inline float reinhard(float x) { return x / (1.f + x); }
 static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
 
 /* ── §7 atmospheric medium ───────────────────────────────────────────── *
@@ -1161,10 +1191,9 @@ static inline float gamma_enc(float x) { return powf(clamp01(x), 1.f / 2.2f); }
  * up. In practice scatter points always have y >= 0 in our scene
  * (camera at y = 1.6, ground at y = 0).
  */
-static inline float sigma_e_at(V3 scatter_point)
-{
-    float y = (scatter_point.y < 0.f) ? 0.f : scatter_point.y;
-    return MIST_SIGMA * expf(-y / MIST_SCALE_H);
+static inline float sigma_e_at(V3 scatter_point) {
+  float y = (scatter_point.y < 0.f) ? 0.f : scatter_point.y;
+  return MIST_SIGMA * expf(-y / MIST_SCALE_H);
 }
 
 /* §7.2 ── Tr_to_sun: medium transmittance from p toward sun ────────── */
@@ -1190,13 +1219,13 @@ static inline float sigma_e_at(V3 scatter_point)
  * varied differently (linearly, gaussian) we'd need a numerical
  * integral here.
  */
-static inline float tr_to_sun(V3 scatter_point, V3 sun_dir)
-{
-    if (sun_dir.y < 1e-3f) return 0.0f;
-    float y   = (scatter_point.y < 0.f) ? 0.f : scatter_point.y;
-    float optical_depth = MIST_SIGMA * expf(-y / MIST_SCALE_H)
-                        * MIST_SCALE_H / sun_dir.y;
-    return expf(-optical_depth);
+static inline float tr_to_sun(V3 scatter_point, V3 sun_dir) {
+  if (sun_dir.y < 1e-3f)
+    return 0.0f;
+  float y = (scatter_point.y < 0.f) ? 0.f : scatter_point.y;
+  float optical_depth =
+      MIST_SIGMA * expf(-y / MIST_SCALE_H) * MIST_SCALE_H / sun_dir.y;
+  return expf(-optical_depth);
 }
 
 /* ── §8 phase function ───────────────────────────────────────────────── *
@@ -1222,14 +1251,13 @@ static inline float tr_to_sun(V3 scatter_point, V3 sun_dir)
  * Returns a number ≥ 0; INTEGRATES to 1 over the full sphere — so
  * the value at any one angle is a DENSITY, not a probability.
  */
-static inline float hg_phase(float cos_angle_eye_to_sun)
-{
-    float g  = HG_G;
-    float g2 = g * g;
-    float denom = 1.0f + g2 - 2.0f * g * cos_angle_eye_to_sun;
-    if (denom < 1e-9f) denom = 1e-9f;
-    return (1.0f - g2)
-         / (4.0f * (float)M_PI * powf(denom, 1.5f));
+static inline float hg_phase(float cos_angle_eye_to_sun) {
+  float g = HG_G;
+  float g2 = g * g;
+  float denom = 1.0f + g2 - 2.0f * g * cos_angle_eye_to_sun;
+  if (denom < 1e-9f)
+    denom = 1e-9f;
+  return (1.0f - g2) / (4.0f * (float)M_PI * powf(denom, 1.5f));
 }
 
 /* ── §9 RNG (hash3 / hash01 — forest layout only) ───────────────────── *
@@ -1245,24 +1273,23 @@ static inline float hg_phase(float cos_angle_eye_to_sun)
  * hash3 — mix three integer keys into a 32-bit hash. Three large
  * odd primes followed by xorshift-mul rounds. Standard recipe.
  */
-static inline uint32_t hash3(int kx, int ky, int kz)
-{
-    uint32_t h = (uint32_t)kx * 73856093u
-               ^ (uint32_t)ky * 19349663u
-               ^ (uint32_t)kz * 83492791u;
-    h ^= h >> 16; h *= 0x85ebca6bu;
-    h ^= h >> 13; h *= 0xc2b2ae35u;
-    h ^= h >> 16;
-    return h;
+static inline uint32_t hash3(int kx, int ky, int kz) {
+  uint32_t h = (uint32_t)kx * 73856093u ^ (uint32_t)ky * 19349663u ^
+               (uint32_t)kz * 83492791u;
+  h ^= h >> 16;
+  h *= 0x85ebca6bu;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35u;
+  h ^= h >> 16;
+  return h;
 }
 
 /*
  * hash01 — uniform float in [0, 1). Drops the top byte of a 32-bit
  * hash to avoid the rounding-to-1 issue on extreme values.
  */
-static inline float hash01(uint32_t h)
-{
-    return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
+static inline float hash01(uint32_t h) {
+  return (float)(h & 0xFFFFFFu) * (1.f / (float)0x1000000u);
 }
 
 /* ── §10 ncurses paint ───────────────────────────────────────────────── *
@@ -1274,21 +1301,20 @@ static inline float hash01(uint32_t h)
 
 static int g_have_256;
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
-    g_have_256 = (COLORS >= 256);
-    if (g_have_256) {
-        for (int i = 0; i < 216; i++)
-            init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
-        init_pair(PAIR_HUD,  226, -1);
-        init_pair(PAIR_HINT,  51, -1);
-    } else {
-        init_pair(PAIR_SUN_FALLBACK, COLOR_YELLOW, -1);
-        init_pair(PAIR_HUD,          COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,         COLOR_CYAN,   -1);
-    }
+static void color_init(void) {
+  start_color();
+  use_default_colors();
+  g_have_256 = (COLORS >= 256);
+  if (g_have_256) {
+    for (int i = 0; i < 216; i++)
+      init_pair((short)(PAIR_CUBE_BASE + i), (short)(16 + i), -1);
+    init_pair(PAIR_HUD, 226, -1);
+    init_pair(PAIR_HINT, 51, -1);
+  } else {
+    init_pair(PAIR_SUN_FALLBACK, COLOR_YELLOW, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
 /*
@@ -1308,32 +1334,43 @@ static void color_init(void)
  *     pair = PAIR_SUN_FALLBACK
  *   draw glyph at (sx, sy) with pair + attr
  */
-static void paint_cell(int sx, int sy, RGB col)
-{
-    float r = gamma_enc(reinhard(col.r));
-    float g = gamma_enc(reinhard(col.g));
-    float b = gamma_enc(reinhard(col.b));
-    float luma = 0.2126f*r + 0.7152f*g + 0.0722f*b;
-    int   ri   = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
-    if (ri < 0)         ri = 0;
-    if (ri >= RAMP_LEN) ri = RAMP_LEN - 1;
+static void paint_cell(int sx, int sy, RGB col) {
+  float r = gamma_enc(reinhard(col.r));
+  float g = gamma_enc(reinhard(col.g));
+  float b = gamma_enc(reinhard(col.b));
+  float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  int ri = (int)(luma * (float)(RAMP_LEN - 1) + 0.5f);
+  if (ri < 0)
+    ri = 0;
+  if (ri >= RAMP_LEN)
+    ri = RAMP_LEN - 1;
 
-    if (g_have_256) {
-        int r5 = (int)(r * 5.f + 0.5f); if (r5 > 5) r5 = 5; if (r5 < 0) r5 = 0;
-        int g5 = (int)(g * 5.f + 0.5f); if (g5 > 5) g5 = 5; if (g5 < 0) g5 = 0;
-        int b5 = (int)(b * 5.f + 0.5f); if (b5 > 5) b5 = 5; if (b5 < 0) b5 = 0;
-        int pair = PAIR_CUBE_BASE + r5*36 + g5*6 + b5;
-        int attr = (luma > 0.85f) ? A_BOLD
-                 : (luma < 0.15f) ? A_DIM
-                 :                  A_NORMAL;
-        attron(COLOR_PAIR(pair) | attr);
-        mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
-        attroff(COLOR_PAIR(pair) | attr);
-    } else {
-        attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
-        mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
-        attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
-    }
+  if (g_have_256) {
+    int r5 = (int)(r * 5.f + 0.5f);
+    if (r5 > 5)
+      r5 = 5;
+    if (r5 < 0)
+      r5 = 0;
+    int g5 = (int)(g * 5.f + 0.5f);
+    if (g5 > 5)
+      g5 = 5;
+    if (g5 < 0)
+      g5 = 0;
+    int b5 = (int)(b * 5.f + 0.5f);
+    if (b5 > 5)
+      b5 = 5;
+    if (b5 < 0)
+      b5 = 0;
+    int pair = PAIR_CUBE_BASE + r5 * 36 + g5 * 6 + b5;
+    int attr = (luma > 0.85f) ? A_BOLD : (luma < 0.15f) ? A_DIM : A_NORMAL;
+    attron(COLOR_PAIR(pair) | attr);
+    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    attroff(COLOR_PAIR(pair) | attr);
+  } else {
+    attron(COLOR_PAIR(PAIR_SUN_FALLBACK));
+    mvaddch(sy, sx, (chtype)(unsigned char)k_ramp[ri]);
+    attroff(COLOR_PAIR(PAIR_SUN_FALLBACK));
+  }
 }
 
 /* ── §11 ray-plane intersection ─────────────────────────────────────── *
@@ -1356,14 +1393,15 @@ static void paint_cell(int sx, int sy, RGB col)
  * ray is heading DOWN through the plane. If the camera is above the
  * plane and the ray goes up, no hit.
  */
-static bool ray_plane_y(V3 ray_origin, V3 ray_dir,
-                        float plane_y, float *out_t)
-{
-    if (ray_dir.y > -1e-6f) return false;
-    float t = (plane_y - ray_origin.y) / ray_dir.y;
-    if (t < 1e-3f) return false;
-    *out_t = t;
-    return true;
+static bool ray_plane_y(V3 ray_origin, V3 ray_dir, float plane_y,
+                        float *out_t) {
+  if (ray_dir.y > -1e-6f)
+    return false;
+  float t = (plane_y - ray_origin.y) / ray_dir.y;
+  if (t < 1e-3f)
+    return false;
+  *out_t = t;
+  return true;
 }
 
 /* ── §12 ray-cylinder intersection (T6) ─────────────────────────────── *
@@ -1398,39 +1436,41 @@ static bool ray_plane_y(V3 ray_origin, V3 ray_dir,
  * below — physically inside the cylinder column but missing the
  * trunk because the trunk is shorter than the column.
  */
-static bool ray_cylinder(V3 ray_origin, V3 ray_dir,
-                         V3 base, float r, float h,
-                         float *out_t)
-{
-    float dx = ray_origin.x - base.x;
-    float dz = ray_origin.z - base.z;
-    float a  = ray_dir.x * ray_dir.x + ray_dir.z * ray_dir.z;
-    if (a < 1e-9f) return false;
-    float b  = 2.0f * (dx * ray_dir.x + dz * ray_dir.z);
-    float c  = dx * dx + dz * dz - r * r;
-    float disc = b * b - 4.0f * a * c;
-    if (disc < 0) return false;
-    float sq = sqrtf(disc);
-    float t_near = (-b - sq) / (2.0f * a);
-    float t_far  = (-b + sq) / (2.0f * a);
-    if (t_far < 1e-3f) return false;
+static bool ray_cylinder(V3 ray_origin, V3 ray_dir, V3 base, float r, float h,
+                         float *out_t) {
+  float dx = ray_origin.x - base.x;
+  float dz = ray_origin.z - base.z;
+  float a = ray_dir.x * ray_dir.x + ray_dir.z * ray_dir.z;
+  if (a < 1e-9f)
+    return false;
+  float b = 2.0f * (dx * ray_dir.x + dz * ray_dir.z);
+  float c = dx * dx + dz * dz - r * r;
+  float disc = b * b - 4.0f * a * c;
+  if (disc < 0)
+    return false;
+  float sq = sqrtf(disc);
+  float t_near = (-b - sq) / (2.0f * a);
+  float t_far = (-b + sq) / (2.0f * a);
+  if (t_far < 1e-3f)
+    return false;
 
-    /* Try near intersection first; fall back to far if near is
-     * outside the height range (e.g. ray crosses the cylinder
-     * column above or below the trunk's top/base). */
-    float t = (t_near >= 1e-3f) ? t_near : t_far;
-    float y_at = ray_origin.y + t * ray_dir.y;
-    if (y_at < base.y || y_at > base.y + h) {
-        if (t == t_near) {
-            t = t_far;
-            y_at = ray_origin.y + t * ray_dir.y;
-            if (y_at < base.y || y_at > base.y + h) return false;
-        } else {
-            return false;
-        }
+  /* Try near intersection first; fall back to far if near is
+   * outside the height range (e.g. ray crosses the cylinder
+   * column above or below the trunk's top/base). */
+  float t = (t_near >= 1e-3f) ? t_near : t_far;
+  float y_at = ray_origin.y + t * ray_dir.y;
+  if (y_at < base.y || y_at > base.y + h) {
+    if (t == t_near) {
+      t = t_far;
+      y_at = ray_origin.y + t * ray_dir.y;
+      if (y_at < base.y || y_at > base.y + h)
+        return false;
+    } else {
+      return false;
     }
-    *out_t = t;
-    return true;
+  }
+  *out_t = t;
+  return true;
 }
 
 /* ── §13 scene layout — trees + sun-block test ──────────────────────── *
@@ -1445,21 +1485,21 @@ static bool ray_cylinder(V3 ray_origin, V3 ray_dir,
 /* §13.1 ── Tree struct + globals ───────────────────────────────────── */
 
 typedef struct {
-    V3    base;          /* (x, 0, z) — rooted on ground plane          */
-    float radius;
-    float height;
+  V3 base; /* (x, 0, z) — rooted on ground plane          */
+  float radius;
+  float height;
 } Tree;
 
 typedef enum { HIT_SKY = 0, HIT_TREE = 1, HIT_GROUND = 2 } HitType;
 
 typedef struct {
-    HitType type;
-    float   t;
-    int     tree_idx;        /* valid iff type == HIT_TREE              */
+  HitType type;
+  float t;
+  int tree_idx; /* valid iff type == HIT_TREE              */
 } Hit;
 
 static Tree g_trees[N_TREES];
-static int  g_n_trees_placed;
+static int g_n_trees_placed;
 
 /* §13.2 ── place_trees: jittered grid layout ───────────────────────── */
 
@@ -1484,47 +1524,47 @@ static int  g_n_trees_placed;
  * independent (a single hash for "this cell" would correlate the
  * draws and produce visible patterns).
  */
-static void place_trees(int seed)
-{
-    int idx = 0;
-    for (int dz = 0; dz < N_DEPTH_BINS; dz++) {
-        for (int ax = 0; ax < N_AZIM_BINS; ax++) {
-            uint32_t fill_hash = hash3(ax, dz, seed ^ 0x05000);
-            float    fill      = hash01(fill_hash);
-            if (fill > TREE_FILL_PROB) continue;
+static void place_trees(int seed) {
+  int idx = 0;
+  for (int dz = 0; dz < N_DEPTH_BINS; dz++) {
+    for (int ax = 0; ax < N_AZIM_BINS; ax++) {
+      uint32_t fill_hash = hash3(ax, dz, seed ^ 0x05000);
+      float fill = hash01(fill_hash);
+      if (fill > TREE_FILL_PROB)
+        continue;
 
-            uint32_t z_hash = hash3(ax, dz, seed ^ 0x10000);
-            uint32_t a_hash = hash3(ax, dz, seed ^ 0x20000);
-            uint32_t r_hash = hash3(ax, dz, seed ^ 0x30000);
-            uint32_t h_hash = hash3(ax, dz, seed ^ 0x40000);
+      uint32_t z_hash = hash3(ax, dz, seed ^ 0x10000);
+      uint32_t a_hash = hash3(ax, dz, seed ^ 0x20000);
+      uint32_t r_hash = hash3(ax, dz, seed ^ 0x30000);
+      uint32_t h_hash = hash3(ax, dz, seed ^ 0x40000);
 
-            /* Log-spaced depth bin: closer cells span small ranges,
-             * far cells span large ranges. */
-            float u_z0 = (float) dz      / (float)N_DEPTH_BINS;
-            float u_z1 = (float)(dz + 1) / (float)N_DEPTH_BINS;
-            float z0   = TREE_Z_MIN * powf(TREE_Z_MAX / TREE_Z_MIN, u_z0);
-            float z1   = TREE_Z_MIN * powf(TREE_Z_MAX / TREE_Z_MIN, u_z1);
-            float jz   = hash01(z_hash);
-            float z    = z0 + jz * (z1 - z0);
+      /* Log-spaced depth bin: closer cells span small ranges,
+       * far cells span large ranges. */
+      float u_z0 = (float)dz / (float)N_DEPTH_BINS;
+      float u_z1 = (float)(dz + 1) / (float)N_DEPTH_BINS;
+      float z0 = TREE_Z_MIN * powf(TREE_Z_MAX / TREE_Z_MIN, u_z0);
+      float z1 = TREE_Z_MIN * powf(TREE_Z_MAX / TREE_Z_MIN, u_z1);
+      float jz = hash01(z_hash);
+      float z = z0 + jz * (z1 - z0);
 
-            /* Linear azimuth bin within ±AZIMUTH_HALF. */
-            float u_a0 = ((float)(ax)     / (float)N_AZIM_BINS - 0.5f) * 2.0f;
-            float u_a1 = ((float)(ax + 1) / (float)N_AZIM_BINS - 0.5f) * 2.0f;
-            float ja   = hash01(a_hash);
-            float u_a  = u_a0 + ja * (u_a1 - u_a0);
-            float angle = u_a * AZIMUTH_HALF;
-            float x     = z * tanf(angle);
+      /* Linear azimuth bin within ±AZIMUTH_HALF. */
+      float u_a0 = ((float)(ax) / (float)N_AZIM_BINS - 0.5f) * 2.0f;
+      float u_a1 = ((float)(ax + 1) / (float)N_AZIM_BINS - 0.5f) * 2.0f;
+      float ja = hash01(a_hash);
+      float u_a = u_a0 + ja * (u_a1 - u_a0);
+      float angle = u_a * AZIMUTH_HALF;
+      float x = z * tanf(angle);
 
-            float u_r = hash01(r_hash);
-            float u_h = hash01(h_hash);
+      float u_r = hash01(r_hash);
+      float u_h = hash01(h_hash);
 
-            g_trees[idx].base   = v3(x, 0.0f, z);
-            g_trees[idx].radius = TREE_R_MIN + u_r * (TREE_R_MAX - TREE_R_MIN);
-            g_trees[idx].height = TREE_H_MIN + u_h * (TREE_H_MAX - TREE_H_MIN);
-            idx++;
-        }
+      g_trees[idx].base = v3(x, 0.0f, z);
+      g_trees[idx].radius = TREE_R_MIN + u_r * (TREE_R_MAX - TREE_R_MIN);
+      g_trees[idx].height = TREE_H_MIN + u_h * (TREE_H_MAX - TREE_H_MIN);
+      idx++;
     }
-    g_n_trees_placed = idx;
+  }
+  g_n_trees_placed = idx;
 }
 
 /* §13.4 ── scene_blocked_to_sun: NEE shadow-ray block test ─────────── */
@@ -1550,17 +1590,16 @@ static void place_trees(int seed)
  *   §17    trace_ray      at every march step (the in-scatter NEE)
  */
 static bool scene_blocked_to_sun(V3 scatter_point, V3 sun_dir,
-                                 float max_distance)
-{
-    for (int i = 0; i < g_n_trees_placed; i++) {
-        float t_tree;
-        if (ray_cylinder(scatter_point, sun_dir,
-                         g_trees[i].base, g_trees[i].radius,
-                         g_trees[i].height, &t_tree)) {
-            if (t_tree > 1e-3f && t_tree < max_distance) return true;
-        }
+                                 float max_distance) {
+  for (int i = 0; i < g_n_trees_placed; i++) {
+    float t_tree;
+    if (ray_cylinder(scatter_point, sun_dir, g_trees[i].base, g_trees[i].radius,
+                     g_trees[i].height, &t_tree)) {
+      if (t_tree > 1e-3f && t_tree < max_distance)
+        return true;
     }
-    return false;
+  }
+  return false;
 }
 
 /* ── §14 scene_hit (find nearest of {tree, ground, sky}) ────────────── */
@@ -1578,34 +1617,33 @@ static bool scene_blocked_to_sun(V3 scatter_point, V3 sun_dir,
  * Sky is the FALLBACK — represents "the ray exits the scene without
  * hitting tree or ground". Always reaches t = INF in that case.
  */
-static Hit scene_hit(V3 ray_origin, V3 ray_dir)
-{
-    Hit hit = { HIT_SKY, 1e30f, -1 };
+static Hit scene_hit(V3 ray_origin, V3 ray_dir) {
+  Hit hit = {HIT_SKY, 1e30f, -1};
 
-    /* Ground. */
-    float t_ground;
-    if (ray_plane_y(ray_origin, ray_dir, GROUND_Y, &t_ground)) {
-        if (t_ground < hit.t) {
-            hit.type     = HIT_GROUND;
-            hit.t        = t_ground;
-            hit.tree_idx = -1;
-        }
+  /* Ground. */
+  float t_ground;
+  if (ray_plane_y(ray_origin, ray_dir, GROUND_Y, &t_ground)) {
+    if (t_ground < hit.t) {
+      hit.type = HIT_GROUND;
+      hit.t = t_ground;
+      hit.tree_idx = -1;
     }
+  }
 
-    /* Trees. */
-    for (int i = 0; i < g_n_trees_placed; i++) {
-        float t_tree;
-        if (ray_cylinder(ray_origin, ray_dir, g_trees[i].base,
-                         g_trees[i].radius, g_trees[i].height, &t_tree)) {
-            if (t_tree < hit.t) {
-                hit.type     = HIT_TREE;
-                hit.t        = t_tree;
-                hit.tree_idx = i;
-            }
-        }
+  /* Trees. */
+  for (int i = 0; i < g_n_trees_placed; i++) {
+    float t_tree;
+    if (ray_cylinder(ray_origin, ray_dir, g_trees[i].base, g_trees[i].radius,
+                     g_trees[i].height, &t_tree)) {
+      if (t_tree < hit.t) {
+        hit.type = HIT_TREE;
+        hit.t = t_tree;
+        hit.tree_idx = i;
+      }
     }
+  }
 
-    return hit;
+  return hit;
 }
 
 /* ── §15 sky / sun radiance (T8) ────────────────────────────────────── *
@@ -1629,24 +1667,25 @@ static Hit scene_hit(V3 ray_origin, V3 ray_dir)
  *     sky += sun_em · edge
  *   return sky
  */
-static RGB sky_radiance(V3 ray_dir, V3 sun_dir, RGB sun_em, RGB horizon_col)
-{
-    float h = ray_dir.y;
-    if (h < 0.f) h = 0.f;
-    if (h > 1.f) h = 1.f;
+static RGB sky_radiance(V3 ray_dir, V3 sun_dir, RGB sun_em, RGB horizon_col) {
+  float h = ray_dir.y;
+  if (h < 0.f)
+    h = 0.f;
+  if (h > 1.f)
+    h = 1.f;
 
-    RGB zenith = rgb_make(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
-    RGB sky    = rgb_lerp(horizon_col, zenith, h);
+  RGB zenith = rgb_make(SKY_ZENITH_R, SKY_ZENITH_G, SKY_ZENITH_B);
+  RGB sky = rgb_lerp(horizon_col, zenith, h);
 
-    float cos_ray_to_sun = v3_dot(ray_dir, sun_dir);
-    float cos_disc_edge  = cosf(SUN_ANG_RADIUS);
-    if (cos_ray_to_sun > cos_disc_edge) {
-        float t_edge = (cos_ray_to_sun - cos_disc_edge)
-                     / (1.0f - cos_disc_edge);
-        if (t_edge > 1.f) t_edge = 1.f;
-        sky = rgb_add(sky, rgb_scl(sun_em, t_edge));
-    }
-    return sky;
+  float cos_ray_to_sun = v3_dot(ray_dir, sun_dir);
+  float cos_disc_edge = cosf(SUN_ANG_RADIUS);
+  if (cos_ray_to_sun > cos_disc_edge) {
+    float t_edge = (cos_ray_to_sun - cos_disc_edge) / (1.0f - cos_disc_edge);
+    if (t_edge > 1.f)
+      t_edge = 1.f;
+    sky = rgb_add(sky, rgb_scl(sun_em, t_edge));
+  }
+  return sky;
 }
 
 /* ── §16 surface shading ─────────────────────────────────────────────── *
@@ -1674,23 +1713,23 @@ static RGB sky_radiance(V3 ray_dir, V3 sun_dir, RGB sun_em, RGB horizon_col)
  * The block-to-sun test uses scene_blocked_to_sun — the ground stays
  * in its own shadow zone where any tree blocks the chord-to-sun.
  */
-static RGB shade_ground(V3 ground_point, V3 sun_dir,
-                        RGB sun_em, RGB horizon_col)
-{
-    RGB albedo = rgb_make(GROUND_ALBEDO_R, GROUND_ALBEDO_G, GROUND_ALBEDO_B);
-    float cos_normal_to_sun = sun_dir.y;
-    if (cos_normal_to_sun < 0.f) cos_normal_to_sun = 0.f;
+static RGB shade_ground(V3 ground_point, V3 sun_dir, RGB sun_em,
+                        RGB horizon_col) {
+  RGB albedo = rgb_make(GROUND_ALBEDO_R, GROUND_ALBEDO_G, GROUND_ALBEDO_B);
+  float cos_normal_to_sun = sun_dir.y;
+  if (cos_normal_to_sun < 0.f)
+    cos_normal_to_sun = 0.f;
 
-    RGB direct = rgb_make(0.f, 0.f, 0.f);
-    if (cos_normal_to_sun > 0.f) {
-        bool blocked = scene_blocked_to_sun(ground_point, sun_dir, SUN_DIST);
-        if (!blocked) {
-            float lambert = cos_normal_to_sun / (float)M_PI;
-            direct = rgb_scl(rgb_mul(sun_em, albedo), lambert);
-        }
+  RGB direct = rgb_make(0.f, 0.f, 0.f);
+  if (cos_normal_to_sun > 0.f) {
+    bool blocked = scene_blocked_to_sun(ground_point, sun_dir, SUN_DIST);
+    if (!blocked) {
+      float lambert = cos_normal_to_sun / (float)M_PI;
+      direct = rgb_scl(rgb_mul(sun_em, albedo), lambert);
     }
-    RGB ambient = rgb_scl(rgb_mul(horizon_col, albedo), 0.25f);
-    return rgb_add(direct, ambient);
+  }
+  RGB ambient = rgb_scl(rgb_mul(horizon_col, albedo), 0.25f);
+  return rgb_add(direct, ambient);
 }
 
 /* §16.2 ── shade_tree ───────────────────────────────────────────────── */
@@ -1703,10 +1742,9 @@ static RGB shade_ground(V3 ground_point, V3 sun_dir,
  * version could add subtle rim lighting from earthshine on the lit
  * side, but the silhouette is what matters for the demo.
  */
-static RGB shade_tree(int tree_idx)
-{
-    (void)tree_idx;
-    return rgb_make(0.025f, 0.020f, 0.015f);
+static RGB shade_tree(int tree_idx) {
+  (void)tree_idx;
+  return rgb_make(0.025f, 0.020f, 0.015f);
 }
 
 /* ── §17 trace_ray (THE CORE — volumetric path tracer) ──────────────── *
@@ -1726,10 +1764,10 @@ static RGB shade_tree(int tree_idx)
  * seven stages of T3. ────────────────────────────────────────────── */
 
 typedef struct {
-    RGB   total;                /* in_scatter + surface · T_far     */
-    RGB   in_scatter;           /* in-scatter accumulator only      */
-    RGB   surface;              /* surface radiance (un-dimmed)     */
-    float t_far_transmittance;  /* T(0, march_distance)             */
+  RGB total;                 /* in_scatter + surface · T_far     */
+  RGB in_scatter;            /* in-scatter accumulator only      */
+  RGB surface;               /* surface radiance (un-dimmed)     */
+  float t_far_transmittance; /* T(0, march_distance)             */
 } Radiance;
 
 /*
@@ -1764,101 +1802,96 @@ typedef struct {
  * Iterative, not recursive — the for-loop is the integrator. The
  * NEE check inside the inner block is the entire shafts trick.
  */
-static Radiance trace_ray(V3 ray_origin, V3 ray_dir,
-                          V3 sun_dir, RGB sun_em, RGB horizon_col)
-{
-    /* Stage 2 — scene intersection. */
-    Hit scene_hit_record = scene_hit(ray_origin, ray_dir);
+static Radiance trace_ray(V3 ray_origin, V3 ray_dir, V3 sun_dir, RGB sun_em,
+                          RGB horizon_col) {
+  /* Stage 2 — scene intersection. */
+  Hit scene_hit_record = scene_hit(ray_origin, ray_dir);
 
-    /* march_distance: surface hit, or FAR_CLIP for a sky-bound ray.
-     * (Sky-bound rays still march so we accumulate scatter through
-     * the whole near-camera mist column.) */
-    float march_distance = (scene_hit_record.type == HIT_SKY)
-                         ? FAR_CLIP
-                         : scene_hit_record.t;
-    if (march_distance > FAR_CLIP) march_distance = FAR_CLIP;
+  /* march_distance: surface hit, or FAR_CLIP for a sky-bound ray.
+   * (Sky-bound rays still march so we accumulate scatter through
+   * the whole near-camera mist column.) */
+  float march_distance =
+      (scene_hit_record.type == HIT_SKY) ? FAR_CLIP : scene_hit_record.t;
+  if (march_distance > FAR_CLIP)
+    march_distance = FAR_CLIP;
 
-    /* Stage 3 — march setup. */
-    float step_length    = march_distance / (float)MARCH_STEPS;
-    float cos_eye_to_sun = v3_dot(ray_dir, sun_dir);
-    float phase_value    = hg_phase(cos_eye_to_sun);
+  /* Stage 3 — march setup. */
+  float step_length = march_distance / (float)MARCH_STEPS;
+  float cos_eye_to_sun = v3_dot(ray_dir, sun_dir);
+  float phase_value = hg_phase(cos_eye_to_sun);
 
-    RGB   in_scatter_radiance      = rgb_make(0.f, 0.f, 0.f);
-    float transmittance_along_eye  = 1.0f;
+  RGB in_scatter_radiance = rgb_make(0.f, 0.f, 0.f);
+  float transmittance_along_eye = 1.0f;
 
-    /* Stages 3-6 — march loop. */
-    for (int i = 0; i < MARCH_STEPS; i++) {
-        if (transmittance_along_eye <= 1e-3f) break;       /* early out */
+  /* Stages 3-6 — march loop. */
+  for (int i = 0; i < MARCH_STEPS; i++) {
+    if (transmittance_along_eye <= 1e-3f)
+      break; /* early out */
 
-        float step_t        = ((float)i + 0.5f) * step_length;
-        V3    scatter_point = v3_add(ray_origin, v3_scl(ray_dir, step_t));
-        float extinction    = sigma_e_at(scatter_point);
+    float step_t = ((float)i + 0.5f) * step_length;
+    V3 scatter_point = v3_add(ray_origin, v3_scl(ray_dir, step_t));
+    float extinction = sigma_e_at(scatter_point);
 
-        if (extinction > 1e-6f) {
-            /* Stage 4 — NEE: any tree blocks the chord to the sun? */
-            bool blocked = scene_blocked_to_sun(scatter_point, sun_dir,
-                                                SUN_NEE_DIST);
+    if (extinction > 1e-6f) {
+      /* Stage 4 — NEE: any tree blocks the chord to the sun? */
+      bool blocked = scene_blocked_to_sun(scatter_point, sun_dir, SUN_NEE_DIST);
 
-            if (!blocked) {
-                /* Stage 5 — in-scatter contribution. */
-                float transmittance_to_sun = tr_to_sun(scatter_point, sun_dir);
-                float step_contribution    = extinction * phase_value
-                                            * transmittance_to_sun
-                                            * INSCATTER_GAIN
-                                            * step_length;
-                RGB add = rgb_scl(rgb_scl(sun_em, step_contribution),
-                                  transmittance_along_eye);
-                in_scatter_radiance = rgb_add(in_scatter_radiance, add);
-            }
+      if (!blocked) {
+        /* Stage 5 — in-scatter contribution. */
+        float transmittance_to_sun = tr_to_sun(scatter_point, sun_dir);
+        float step_contribution = extinction * phase_value *
+                                  transmittance_to_sun * INSCATTER_GAIN *
+                                  step_length;
+        RGB add = rgb_scl(rgb_scl(sun_em, step_contribution),
+                          transmittance_along_eye);
+        in_scatter_radiance = rgb_add(in_scatter_radiance, add);
+      }
 
-            /* Stage 6 — eye-ray transmittance update. */
-            transmittance_along_eye *= expf(-extinction * step_length);
-        }
+      /* Stage 6 — eye-ray transmittance update. */
+      transmittance_along_eye *= expf(-extinction * step_length);
     }
+  }
 
-    /* Stage 7 — surface contribution at the far end. */
-    RGB surface_radiance;
-    switch (scene_hit_record.type) {
-    case HIT_TREE:
-        surface_radiance = shade_tree(scene_hit_record.tree_idx);
-        break;
-    case HIT_GROUND: {
-        V3 ground_point = v3_add(ray_origin,
-                                 v3_scl(ray_dir, scene_hit_record.t));
-        surface_radiance = shade_ground(ground_point, sun_dir,
-                                        sun_em, horizon_col);
-        break;
-    }
-    case HIT_SKY:
-    default:
-        surface_radiance = sky_radiance(ray_dir, sun_dir,
-                                        sun_em, horizon_col);
-        break;
-    }
+  /* Stage 7 — surface contribution at the far end. */
+  RGB surface_radiance;
+  switch (scene_hit_record.type) {
+  case HIT_TREE:
+    surface_radiance = shade_tree(scene_hit_record.tree_idx);
+    break;
+  case HIT_GROUND: {
+    V3 ground_point = v3_add(ray_origin, v3_scl(ray_dir, scene_hit_record.t));
+    surface_radiance = shade_ground(ground_point, sun_dir, sun_em, horizon_col);
+    break;
+  }
+  case HIT_SKY:
+  default:
+    surface_radiance = sky_radiance(ray_dir, sun_dir, sun_em, horizon_col);
+    break;
+  }
 
-    /* Final radiance = in-scatter + surface · remaining T. */
-    RGB total = rgb_add(in_scatter_radiance,
-                        rgb_scl(surface_radiance, transmittance_along_eye));
+  /* Final radiance = in-scatter + surface · remaining T. */
+  RGB total = rgb_add(in_scatter_radiance,
+                      rgb_scl(surface_radiance, transmittance_along_eye));
 
-    Radiance result = {
-        .total                 = total,
-        .in_scatter            = in_scatter_radiance,
-        .surface               = surface_radiance,
-        .t_far_transmittance   = transmittance_along_eye,
-    };
-    return result;
+  Radiance result = {
+      .total = total,
+      .in_scatter = in_scatter_radiance,
+      .surface = surface_radiance,
+      .t_far_transmittance = transmittance_along_eye,
+  };
+  return result;
 }
 
 /* ── §18 scene state + sun motion ───────────────────────────────────── */
 
 typedef struct {
-    bool      paused;
-    int       speed;
-    int       kelvin_idx;
-    float     zoom;
-    float     time_secs;
-    int       seed;
-    DebugMode debug_mode;
+  bool paused;
+  int speed;
+  int kelvin_idx;
+  float zoom;
+  float time_secs;
+  int seed;
+  DebugMode debug_mode;
 } Scene;
 
 /*
@@ -1875,14 +1908,13 @@ typedef struct {
  * For this scene the sun is always above the horizon
  * (el_min = SUN_EL_BASE − SUN_EL_AMP > 0).
  */
-static V3 scene_sun_dir(const Scene *s)
-{
-    float omega_el = 2.0f * (float)M_PI / SUN_EL_PERIOD_S;
-    float omega_az = 2.0f * (float)M_PI / SUN_AZ_PERIOD_S;
-    float el = SUN_EL_BASE + SUN_EL_AMP * sinf(omega_el * s->time_secs);
-    float az = SUN_AZ_BASE + SUN_AZ_AMP * sinf(omega_az * s->time_secs);
-    float ce = cosf(el);
-    return v3_norm(v3(sinf(az) * ce, sinf(el), cosf(az) * ce));
+static V3 scene_sun_dir(const Scene *s) {
+  float omega_el = 2.0f * (float)M_PI / SUN_EL_PERIOD_S;
+  float omega_az = 2.0f * (float)M_PI / SUN_AZ_PERIOD_S;
+  float el = SUN_EL_BASE + SUN_EL_AMP * sinf(omega_el * s->time_secs);
+  float az = SUN_AZ_BASE + SUN_AZ_AMP * sinf(omega_az * s->time_secs);
+  float ce = cosf(el);
+  return v3_norm(v3(sinf(az) * ce, sinf(el), cosf(az) * ce));
 }
 
 /*
@@ -1891,38 +1923,36 @@ static V3 scene_sun_dir(const Scene *s)
  * Mixes the current time into the new seed so successive presses
  * of `r' don't repeat layouts.
  */
-static void scene_reseed(Scene *s)
-{
-    uint32_t h = hash3((int)(s->time_secs * 1000.0f), s->seed, 0xC0FFEE);
-    s->seed = (int)(h ^ 0x5A5A5A5Au);
-    place_trees(s->seed);
+static void scene_reseed(Scene *s) {
+  uint32_t h = hash3((int)(s->time_secs * 1000.0f), s->seed, 0xC0FFEE);
+  s->seed = (int)(h ^ 0x5A5A5A5Au);
+  place_trees(s->seed);
 }
 
-static void scene_init(Scene *s)
-{
-    memset(s, 0, sizeof *s);
-    s->paused     = false;
-    s->speed      = SPEED_DEF;
-    s->kelvin_idx = 1;     /* GOLDEN by default */
-    s->zoom       = 1.0f;
-    s->seed       = 0xF0E57u;
-    s->debug_mode = MODE_NORMAL;
-    place_trees(s->seed);
+static void scene_init(Scene *s) {
+  memset(s, 0, sizeof *s);
+  s->paused = false;
+  s->speed = SPEED_DEF;
+  s->kelvin_idx = 1; /* GOLDEN by default */
+  s->zoom = 1.0f;
+  s->seed = 0xF0E57u;
+  s->debug_mode = MODE_NORMAL;
+  place_trees(s->seed);
 }
 
-static void scene_tick(Scene *s, float dt)
-{
-    if (s->paused) return;
-    float speed_mul = (float)s->speed / (float)SPEED_DEF;
-    s->time_secs += dt * speed_mul;
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
+  float speed_mul = (float)s->speed / (float)SPEED_DEF;
+  s->time_secs += dt * speed_mul;
 }
 
 /* ── §19 camera (pinhole, no pitch) ─────────────────────────────────── */
 
 typedef struct {
-    V3    pos;
-    float fov_h, fov_v;
-    int   cols, rows;
+  V3 pos;
+  float fov_h, fov_v;
+  int cols, rows;
 } Camera;
 
 /*
@@ -1933,13 +1963,12 @@ typedef struct {
  * Looking straight down +Z with no pitch — the sun drifts naturally
  * through the upper part of the frame.
  */
-static void camera_make(Camera *c, int cols, int rows, float fov_h)
-{
-    c->cols  = cols;
-    c->rows  = rows;
-    c->pos   = v3(0.0f, CAMERA_HEIGHT, 0.0f);
-    c->fov_h = fov_h;
-    c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
+static void camera_make(Camera *c, int cols, int rows, float fov_h) {
+  c->cols = cols;
+  c->rows = rows;
+  c->pos = v3(0.0f, CAMERA_HEIGHT, 0.0f);
+  c->fov_h = fov_h;
+  c->fov_v = fov_h * (float)rows * ASPECT_Y / (float)cols;
 }
 
 /*
@@ -1952,37 +1981,36 @@ static void camera_make(Camera *c, int cols, int rows, float fov_h)
  *
  * The flip on v converts from "screen y down" to "world y up".
  */
-static V3 camera_ray(const Camera *c, int sx, int sy)
-{
-    float u = ( (2.0f * (float)sx + 1.0f) - (float)c->cols)
-            / (float)c->cols * c->fov_h;
-    float v = -((2.0f * (float)sy + 1.0f) - (float)c->rows)
-            / (float)c->rows * c->fov_v;
-    return v3_norm(v3(u, v, 1.0f));
+static V3 camera_ray(const Camera *c, int sx, int sy) {
+  float u =
+      ((2.0f * (float)sx + 1.0f) - (float)c->cols) / (float)c->cols * c->fov_h;
+  float v =
+      -((2.0f * (float)sy + 1.0f) - (float)c->rows) / (float)c->rows * c->fov_v;
+  return v3_norm(v3(u, v, 1.0f));
 }
 
 /* ── §20 screen + scene_draw (with debug overlays) ──────────────────── */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *s)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
 static RGB g_buf[BUF_MAX_H][BUF_MAX_W];
@@ -2001,56 +2029,59 @@ static RGB g_buf[BUF_MAX_H][BUF_MAX_W];
  * has already produced all four components, we just decide which
  * one(s) to display.
  */
-static void scene_draw(const Screen *sc, const Scene *s)
-{
-    int rows_eff = sc->rows - 2;
-    int row_off  = 1;
-    if (rows_eff < 4) { rows_eff = sc->rows; row_off = 0; }
-    if (rows_eff > BUF_MAX_H) rows_eff = BUF_MAX_H;
-    int cols_eff = sc->cols;
-    if (cols_eff > BUF_MAX_W) cols_eff = BUF_MAX_W;
+static void scene_draw(const Screen *sc, const Scene *s) {
+  int rows_eff = sc->rows - 2;
+  int row_off = 1;
+  if (rows_eff < 4) {
+    rows_eff = sc->rows;
+    row_off = 0;
+  }
+  if (rows_eff > BUF_MAX_H)
+    rows_eff = BUF_MAX_H;
+  int cols_eff = sc->cols;
+  if (cols_eff > BUF_MAX_W)
+    cols_eff = BUF_MAX_W;
 
-    Camera cam;
-    camera_make(&cam, cols_eff, rows_eff, FOV_H_BASE / s->zoom);
+  Camera cam;
+  camera_make(&cam, cols_eff, rows_eff, FOV_H_BASE / s->zoom);
 
-    V3   sun_dir   = scene_sun_dir(s);
-    float kelvin   = KELVINS[s->kelvin_idx].kelvin;
-    RGB sun_chrom  = blackbody_rgb(kelvin);
-    RGB sun_em     = rgb_scl(sun_chrom, SUN_EMIT_HDR);
-    RGB horizon    = rgb_scl(sun_chrom, SKY_HORIZON_FAC);
+  V3 sun_dir = scene_sun_dir(s);
+  float kelvin = KELVINS[s->kelvin_idx].kelvin;
+  RGB sun_chrom = blackbody_rgb(kelvin);
+  RGB sun_em = rgb_scl(sun_chrom, SUN_EMIT_HDR);
+  RGB horizon = rgb_scl(sun_chrom, SKY_HORIZON_FAC);
 
-    for (int r = 0; r < rows_eff; r++) {
-        for (int c = 0; c < cols_eff; c++) {
-            V3       ray_dir = camera_ray(&cam, c, r);
-            Radiance rad     = trace_ray(cam.pos, ray_dir, sun_dir,
-                                         sun_em, horizon);
+  for (int r = 0; r < rows_eff; r++) {
+    for (int c = 0; c < cols_eff; c++) {
+      V3 ray_dir = camera_ray(&cam, c, r);
+      Radiance rad = trace_ray(cam.pos, ray_dir, sun_dir, sun_em, horizon);
 
-            /* Debug-overlay selection (T11). */
-            switch (s->debug_mode) {
-            default:
-            case MODE_NORMAL:
-                g_buf[r][c] = rad.total;
-                break;
-            case MODE_SCATTER:
-                g_buf[r][c] = rad.in_scatter;
-                break;
-            case MODE_SURFACE:
-                g_buf[r][c] = rad.surface;
-                break;
-            case MODE_TR: {
-                float t = rad.t_far_transmittance;
-                g_buf[r][c] = rgb_make(t, t, t);
-                break;
-            }
-            }
-        }
+      /* Debug-overlay selection (T11). */
+      switch (s->debug_mode) {
+      default:
+      case MODE_NORMAL:
+        g_buf[r][c] = rad.total;
+        break;
+      case MODE_SCATTER:
+        g_buf[r][c] = rad.in_scatter;
+        break;
+      case MODE_SURFACE:
+        g_buf[r][c] = rad.surface;
+        break;
+      case MODE_TR: {
+        float t = rad.t_far_transmittance;
+        g_buf[r][c] = rgb_make(t, t, t);
+        break;
+      }
+      }
     }
+  }
 
-    for (int r = 0; r < rows_eff; r++) {
-        for (int c = 0; c < cols_eff; c++) {
-            paint_cell(c, r + row_off, g_buf[r][c]);
-        }
+  for (int r = 0; r < rows_eff; r++) {
+    for (int c = 0; c < cols_eff; c++) {
+      paint_cell(c, r + row_off, g_buf[r][c]);
     }
+  }
 }
 
 /* ── §21 HUD ────────────────────────────────────────────────────────── */
@@ -2062,183 +2093,208 @@ static void scene_draw(const Screen *sc, const Scene *s)
  *   row 0 left     yellow title (subtitle banner)
  *   bottom row     cyan key-hint strip (BOLD, ASCII only)
  */
-static void hud_draw(const Screen *sc, const Scene *s,
-                     double fps, int sim_fps)
-{
-    const KelvinPreset *k = &KELVINS[s->kelvin_idx];
-    V3    sd     = scene_sun_dir(s);
-    float el_deg = asinf(sd.y) * 180.0f / (float)M_PI;
-    float az_deg = atan2f(sd.x, sd.z) * 180.0f / (float)M_PI;
+static void hud_draw(const Screen *sc, const Scene *s, double fps,
+                     int sim_fps) {
+  const KelvinPreset *k = &KELVINS[s->kelvin_idx];
+  V3 sd = scene_sun_dir(s);
+  float el_deg = asinf(sd.y) * 180.0f / (float)M_PI;
+  float az_deg = atan2f(sd.x, sd.z) * 180.0f / (float)M_PI;
 
-    char buf[256];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps %3d Hz  %s  %s %5.0fK  sun:el%4.1f deg az%+5.1f deg  z:%3.1fx  spd:%d  %s ",
-             fps, sim_fps,
-             s->paused ? "PAUSED" : "      ",
-             k->name, (double)k->kelvin,
-             (double)el_deg, (double)az_deg,
-             (double)s->zoom, s->speed,
-             debug_mode_name(s->debug_mode));
-    int len = (int)strlen(buf);
-    if (len > sc->cols) len = sc->cols;
+  char buf[256];
+  snprintf(buf, sizeof buf,
+           " %5.1f fps %3d Hz  %s  %s %5.0fK  sun:el%4.1f deg az%+5.1f deg  "
+           "z:%3.1fx  spd:%d  %s ",
+           fps, sim_fps, s->paused ? "PAUSED" : "      ", k->name,
+           (double)k->kelvin, (double)el_deg, (double)az_deg, (double)s->zoom,
+           s->speed, debug_mode_name(s->debug_mode));
+  int len = (int)strlen(buf);
+  if (len > sc->cols)
+    len = sc->cols;
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, sc->cols - len, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, sc->cols - len, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(0, 0, " FOREST-GOD-RAYS · VOLUMETRIC PT ");
-    attroff(COLOR_PAIR(PAIR_HUD));
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(0, 0, " FOREST-GOD-RAYS · VOLUMETRIC PT ");
+  attroff(COLOR_PAIR(PAIR_HUD));
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(sc->rows - 1, 0,
-             " q:quit  spc:pause  r:reseed  d:debug  t/T:kelvin  z/Z:zoom  +/-:spd  []:Hz ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(sc->rows - 1, 0,
+           " q:quit  spc:pause  r:reseed  d:debug  t/T:kelvin  z/Z:zoom  "
+           "+/-:spd  []:Hz ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps)
-{
-    erase();
-    scene_draw(sc, s);
-    hud_draw(sc, s, fps, sim_fps);
+static void screen_draw(Screen *sc, const Scene *s, double fps, int sim_fps) {
+  erase();
+  scene_draw(sc, s);
+  hud_draw(sc, s, fps, sim_fps);
 }
 
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
+}
 
 /* ── §22 app (signals, main loop) ───────────────────────────────────── */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    switch (ch) {
-    case 'q': case 'Q': case 27 /* ESC */: return false;
-    case ' ':           s->paused = !s->paused; break;
-    case 'r': case 'R': scene_reseed(s); break;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27 /* ESC */:
+    return false;
+  case ' ':
+    s->paused = !s->paused;
+    break;
+  case 'r':
+  case 'R':
+    scene_reseed(s);
+    break;
 
-    case 'd': case 'D':
-        s->debug_mode = (DebugMode)((s->debug_mode + 1) % MODE_N);
-        break;
+  case 'd':
+  case 'D':
+    s->debug_mode = (DebugMode)((s->debug_mode + 1) % MODE_N);
+    break;
 
-    case '=': case '+':
-        if (s->speed < SPEED_MAX) s->speed *= 2;
-        break;
-    case '-': case '_':
-        s->speed /= 2;
-        if (s->speed < SPEED_MIN) s->speed = SPEED_MIN;
-        break;
+  case '=':
+  case '+':
+    if (s->speed < SPEED_MAX)
+      s->speed *= 2;
+    break;
+  case '-':
+  case '_':
+    s->speed /= 2;
+    if (s->speed < SPEED_MIN)
+      s->speed = SPEED_MIN;
+    break;
 
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
 
-    case 't':
-        s->kelvin_idx = (s->kelvin_idx + 1) % N_KELVINS;
-        break;
-    case 'T':
-        s->kelvin_idx = (s->kelvin_idx + N_KELVINS - 1) % N_KELVINS;
-        break;
+  case 't':
+    s->kelvin_idx = (s->kelvin_idx + 1) % N_KELVINS;
+    break;
+  case 'T':
+    s->kelvin_idx = (s->kelvin_idx + N_KELVINS - 1) % N_KELVINS;
+    break;
 
-    case 'z':
-        s->zoom *= ZOOM_STEP;
-        if (s->zoom > ZOOM_MAX) s->zoom = ZOOM_MAX;
+  case 'z':
+    s->zoom *= ZOOM_STEP;
+    if (s->zoom > ZOOM_MAX)
+      s->zoom = ZOOM_MAX;
+    break;
+  case 'Z':
+    s->zoom /= ZOOM_STEP;
+    if (s->zoom < ZOOM_MIN)
+      s->zoom = ZOOM_MIN;
+    break;
+  }
+  return true;
+}
+
+static void app_init(App *app) {
+  memset(app, 0, sizeof *app);
+  scene_init(&app->scene);
+  screen_init(&app->screen);
+  app->sim_fps = SIM_FPS_DEFAULT;
+  app->running = 1;
+}
+
+static void app_run(App *app) {
+  int64_t prev = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t frame_count = 0;
+  int64_t fps_window_start = prev;
+  double fps_meas = 0.0;
+
+  struct sigaction sa = {0};
+  sa.sa_handler = on_exit_signal;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  sa.sa_handler = on_resize_signal;
+  sigaction(SIGWINCH, &sa, NULL);
+  atexit(cleanup);
+
+  while (app->running) {
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (!app_handle_key(app, ch)) {
+        app->running = 0;
         break;
-    case 'Z':
-        s->zoom /= ZOOM_STEP;
-        if (s->zoom < ZOOM_MIN) s->zoom = ZOOM_MIN;
-        break;
+      }
     }
-    return true;
-}
-
-static void app_init(App *app)
-{
-    memset(app, 0, sizeof *app);
-    scene_init(&app->scene);
-    screen_init(&app->screen);
-    app->sim_fps = SIM_FPS_DEFAULT;
-    app->running = 1;
-}
-
-static void app_run(App *app)
-{
-    int64_t prev = clock_ns();
-    int64_t sim_accum = 0;
-    int64_t frame_count = 0;
-    int64_t fps_window_start = prev;
-    double  fps_meas = 0.0;
-
-    struct sigaction sa = {0};
-    sa.sa_handler = on_exit_signal;
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sa.sa_handler = on_resize_signal;
-    sigaction(SIGWINCH, &sa, NULL);
-    atexit(cleanup);
-
-    while (app->running) {
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (!app_handle_key(app, ch)) { app->running = 0; break; }
-        }
-        if (!app->running) break;
-        if (app->need_resize) {
-            screen_resize(&app->screen);
-            app->need_resize = 0;
-        }
-
-        int64_t now = clock_ns();
-        int64_t dt  = now - prev;
-        if (dt > DT_CAP_NS) dt = DT_CAP_NS;
-        prev = now;
-
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, (float)tick_ns / (float)NS_PER_SEC);
-            sim_accum -= tick_ns;
-        }
-
-        screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
-        screen_present();
-
-        frame_count++;
-        if (now - fps_window_start >= NS_PER_SEC) {
-            fps_meas = (double)frame_count
-                     * (double)NS_PER_SEC
-                     / (double)(now - fps_window_start);
-            frame_count = 0;
-            fps_window_start = now;
-        }
-
-        int64_t target = clock_ns();
-        int64_t left   = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
-        if (left > 0) clock_sleep_ns(left);
+    if (!app->running)
+      break;
+    if (app->need_resize) {
+      screen_resize(&app->screen);
+      app->need_resize = 0;
     }
+
+    int64_t now = clock_ns();
+    int64_t dt = now - prev;
+    if (dt > DT_CAP_NS)
+      dt = DT_CAP_NS;
+    prev = now;
+
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, (float)tick_ns / (float)NS_PER_SEC);
+      sim_accum -= tick_ns;
+    }
+
+    screen_draw(&app->screen, &app->scene, fps_meas, app->sim_fps);
+    screen_present();
+
+    frame_count++;
+    if (now - fps_window_start >= NS_PER_SEC) {
+      fps_meas = (double)frame_count * (double)NS_PER_SEC /
+                 (double)(now - fps_window_start);
+      frame_count = 0;
+      fps_window_start = now;
+    }
+
+    int64_t target = clock_ns();
+    int64_t left = TICK_NS(SIM_FPS_DEFAULT * 2) - (target - now);
+    if (left > 0)
+      clock_sleep_ns(left);
+  }
 }
 
-int main(void)
-{
-    app_init(&g_app);
-    app_run(&g_app);
-    cleanup();
-    return 0;
+int main(void) {
+  app_init(&g_app);
+  app_run(&g_app);
+  cleanup();
+  return 0;
 }

@@ -535,7 +535,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -543,10 +543,10 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ── §1 config ───────────────────────────────────────────────────────── *
  *
@@ -556,11 +556,11 @@
 
 /* §1.1 frame rate. */
 enum {
-    SIM_FPS_MIN     =  5,
-    SIM_FPS_DEFAULT = 24,
-    SIM_FPS_MAX     = 60,
-    SIM_FPS_STEP    =  5,
-    FPS_UPDATE_MS   = 500,
+  SIM_FPS_MIN = 5,
+  SIM_FPS_DEFAULT = 24,
+  SIM_FPS_MAX = 60,
+  SIM_FPS_STEP = 5,
+  FPS_UPDATE_MS = 500,
 };
 
 /* §1.2 canvas / cell mapping.
@@ -570,59 +570,59 @@ enum {
  * the sphere renders round on cells that are about twice as tall
  * as they are wide.
  */
-#define CELL_W       1
-#define CELL_H       1
-#define CELL_ASPECT  2.0f   /* physical height ÷ width of one terminal cell */
+#define CELL_W 1
+#define CELL_H 1
+#define CELL_ASPECT 2.0f /* physical height ÷ width of one terminal cell */
 
 static inline int canvas_w_from_cols(int cols) { return cols / CELL_W; }
 static inline int canvas_h_from_rows(int rows) { return rows / CELL_H; }
 
 /* §1.3 sphere tracing limits. */
-#define RM_MAX_STEPS   80     /* hard cap per ray                    */
-#define RM_HIT_EPS     0.002f /* "touching the surface" threshold    */
-#define RM_MAX_DIST    20.0f  /* ray-length budget before declaring miss */
+#define RM_MAX_STEPS 80   /* hard cap per ray                    */
+#define RM_HIT_EPS 0.002f /* "touching the surface" threshold    */
+#define RM_MAX_DIST 20.0f /* ray-length budget before declaring miss */
 
 /* §1.4 camera (zoom). */
-#define CAM_Z_DEFAULT  4.0f
-#define CAM_Z_MIN      2.0f   /* keep camera outside SPHERE_R_MAX sphere */
-#define CAM_Z_MAX     12.0f
-#define CAM_ZOOM_STEP  0.30f
-#define FOV_HALF_TAN   0.7f   /* tan(FOV/2); 0.7 ≈ 70° wide          */
+#define CAM_Z_DEFAULT 4.0f
+#define CAM_Z_MIN 2.0f /* keep camera outside SPHERE_R_MAX sphere */
+#define CAM_Z_MAX 12.0f
+#define CAM_ZOOM_STEP 0.30f
+#define FOV_HALF_TAN 0.7f /* tan(FOV/2); 0.7 ≈ 70° wide          */
 
 /* §1.5 sphere radius. */
-#define SPHERE_R_DEFAULT  1.1f
-#define SPHERE_R_STEP     1.15f
-#define SPHERE_R_MIN      0.2f
-#define SPHERE_R_MAX      3.0f
+#define SPHERE_R_DEFAULT 1.1f
+#define SPHERE_R_STEP 1.15f
+#define SPHERE_R_MIN 0.2f
+#define SPHERE_R_MAX 3.0f
 
 /* §1.6 light orbit speed (radians/sec). */
 #define LIGHT_SPD_DEFAULT 0.8f
-#define LIGHT_SPD_STEP    1.35f
-#define LIGHT_SPD_MIN     0.02f
-#define LIGHT_SPD_MAX     8.0f
+#define LIGHT_SPD_STEP 1.35f
+#define LIGHT_SPD_MIN 0.02f
+#define LIGHT_SPD_MAX 8.0f
 
 /* §1.7 light orbit shape (Lissajous parameters). */
-#define LIGHT_RADIUS_X    3.0f
-#define LIGHT_BIAS_Y      1.5f
+#define LIGHT_RADIUS_X 3.0f
+#define LIGHT_BIAS_Y 1.5f
 #define LIGHT_AMPLITUDE_Y 1.0f
-#define LIGHT_RATE_Y      0.7f
-#define LIGHT_HEIGHT_Z    2.5f
+#define LIGHT_RATE_Y 0.7f
+#define LIGHT_HEIGHT_Z 2.5f
 
 /* §1.8 Phong shading coefficients. */
-#define KA   0.10f   /* ambient                                       */
-#define KD   0.78f   /* diffuse                                       */
-#define KS   0.55f   /* specular                                      */
-#define SHIN 40.0f   /* specular sharpness — bigger = tighter spot    */
+#define KA 0.10f   /* ambient                                       */
+#define KD 0.78f   /* diffuse                                       */
+#define KS 0.55f   /* specular                                      */
+#define SHIN 40.0f /* specular sharpness — bigger = tighter spot    */
 
 /* §1.9 luma ramp + colour pair indices. */
 enum {
-    LUMI_N    = 8,           /* 8 colour pairs hold the luma ramp   */
-    PAIR_HUD  = LUMI_N + 1,  /* yellow + bold — top status row      */
-    PAIR_HINT = LUMI_N + 2,  /* cyan   + bold — bottom hint row     */
+  LUMI_N = 8,             /* 8 colour pairs hold the luma ramp   */
+  PAIR_HUD = LUMI_N + 1,  /* yellow + bold — top status row      */
+  PAIR_HINT = LUMI_N + 2, /* cyan   + bold — bottom hint row     */
 };
 
 static const char LUMA_RAMP[] = " .,:;+*oxOX#@";
-#define RAMP_LEN  ((int)(sizeof LUMA_RAMP - 1))   /* = 13 */
+#define RAMP_LEN ((int)(sizeof LUMA_RAMP - 1)) /* = 13 */
 
 /* §1.10 themes — six 8-band 256-colour ramps, one active at a time.
  *
@@ -633,38 +633,41 @@ static const char LUMA_RAMP[] = " .,:;+*oxOX#@";
  * visible against a black terminal background.
  */
 typedef struct {
-    const char *display_name;
-    short       ramp_256[LUMI_N];
+  const char *display_name;
+  short ramp_256[LUMI_N];
 } Theme;
 
 #define THEME_COUNT 6
 
 static const Theme THEMES[THEME_COUNT] = {
-    { "CLASSIC ", { 235, 238, 241, 244, 247, 250, 253, 255 } },
-    { "AMBER   ", { 130, 136, 166, 172, 178, 208, 214, 220 } },
-    { "MATRIX  ", {  28,  34,  40,  46,  82, 118, 154, 190 } },
-    { "NEON    ", {  53,  91, 129, 165, 201, 207, 213, 227 } },
-    { "ICE     ", {  25,  31,  38,  45,  51,  87, 123, 159 } },
-    { "COPPER  ", {  94, 130, 136, 166, 172, 208, 214, 220 } },
+    {"CLASSIC ", {235, 238, 241, 244, 247, 250, 253, 255}},
+    {"AMBER   ", {130, 136, 166, 172, 178, 208, 214, 220}},
+    {"MATRIX  ", {28, 34, 40, 46, 82, 118, 154, 190}},
+    {"NEON    ", {53, 91, 129, 165, 201, 207, 213, 227}},
+    {"ICE     ", {25, 31, 38, 45, 51, 87, 123, 159}},
+    {"COPPER  ", {94, 130, 136, 166, 172, 208, 214, 220}},
 };
 
 /* §1.11 debug overlays — d / D cycles between them. */
 typedef enum {
-    DEBUG_NORMAL     = 0,    /* full Phong + theme (production view) */
-    DEBUG_NORMALS    = 1,    /* normal direction → colour band       */
-    DEBUG_DEPTH      = 2,    /* hit distance t → brightness          */
-    DEBUG_STEPS      = 3,    /* march iterations → brightness        */
-    DEBUG_MODE_COUNT = 4,
+  DEBUG_NORMAL = 0,  /* full Phong + theme (production view) */
+  DEBUG_NORMALS = 1, /* normal direction → colour band       */
+  DEBUG_DEPTH = 2,   /* hit distance t → brightness          */
+  DEBUG_STEPS = 3,   /* march iterations → brightness        */
+  DEBUG_MODE_COUNT = 4,
 } DebugMode;
 
 static const char *DEBUG_MODE_NAMES[DEBUG_MODE_COUNT] = {
-    "NORMAL ", "NORMALS", "DEPTH  ", "STEPS  ",
+    "NORMAL ",
+    "NORMALS",
+    "DEPTH  ",
+    "STEPS  ",
 };
 
 /* §1.12 time helpers. */
-#define NS_PER_SEC   1000000000LL
-#define NS_PER_MS    1000000LL
-#define TICK_NS(f)   (NS_PER_SEC / (f))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
 
 /* ── §2 clock — monotonic timer + sleep ──────────────────────────────── *
  *
@@ -672,21 +675,20 @@ static const char *DEBUG_MODE_NAMES[DEBUG_MODE_COUNT] = {
  * jumps — exactly what a frame timer wants.
  */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ── §3 color — themes + HUD/hint pairs ──────────────────────────────── *
@@ -697,48 +699,50 @@ static void clock_sleep_ns(int64_t ns)
  * for status, cyan + bold for hints.
  */
 
-static void theme_apply(int theme_index)
-{
-    if (theme_index < 0 || theme_index >= THEME_COUNT) theme_index = 0;
-    const Theme *theme = &THEMES[theme_index];
+static void theme_apply(int theme_index) {
+  if (theme_index < 0 || theme_index >= THEME_COUNT)
+    theme_index = 0;
+  const Theme *theme = &THEMES[theme_index];
 
-    if (COLORS >= 256) {
-        for (int i = 0; i < LUMI_N; i++)
-            init_pair((short)(i + 1), theme->ramp_256[i], COLOR_BLACK);
-    } else {
-        /* 8-colour fallback: themes have no effect; lumi_attr fakes
-         * brightness via A_DIM / A_BOLD on COLOR_WHITE. */
-        for (int i = 0; i < LUMI_N; i++)
-            init_pair((short)(i + 1), COLOR_WHITE, COLOR_BLACK);
-    }
+  if (COLORS >= 256) {
+    for (int i = 0; i < LUMI_N; i++)
+      init_pair((short)(i + 1), theme->ramp_256[i], COLOR_BLACK);
+  } else {
+    /* 8-colour fallback: themes have no effect; lumi_attr fakes
+     * brightness via A_DIM / A_BOLD on COLOR_WHITE. */
+    for (int i = 0; i < LUMI_N; i++)
+      init_pair((short)(i + 1), COLOR_WHITE, COLOR_BLACK);
+  }
 }
 
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
+static void color_init(void) {
+  start_color();
+  use_default_colors();
 
-    if (COLORS >= 256) {
-        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
-        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
+  if (COLORS >= 256) {
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 
-    theme_apply(0);
+  theme_apply(0);
 }
 
-static attr_t lumi_attr(int l)
-{
-    if (l < 0)         l = 0;
-    if (l > LUMI_N-1)  l = LUMI_N-1;
-    attr_t a = COLOR_PAIR(l + 1);
-    if (COLORS < 256) {
-        if      (l < 3)  a |= A_DIM;
-        else if (l >= 6) a |= A_BOLD;
-    }
-    return a;
+static attr_t lumi_attr(int l) {
+  if (l < 0)
+    l = 0;
+  if (l > LUMI_N - 1)
+    l = LUMI_N - 1;
+  attr_t a = COLOR_PAIR(l + 1);
+  if (COLORS < 256) {
+    if (l < 3)
+      a |= A_DIM;
+    else if (l >= 6)
+      a |= A_BOLD;
+  }
+  return a;
 }
 
 /* ── §4 vec3 — value-type 3-D math ───────────────────────────────────── *
@@ -747,18 +751,27 @@ static attr_t lumi_attr(int l)
  * inlines to register operations — no heap, no aliasing concerns.
  */
 
-typedef struct { float x, y, z; } Vec3;
+typedef struct {
+  float x, y, z;
+} Vec3;
 
-static inline Vec3  v3   (float x, float y, float z) { return (Vec3){x, y, z}; }
-static inline Vec3  v3add(Vec3 a, Vec3 b)            { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
-static inline Vec3  v3sub(Vec3 a, Vec3 b)            { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
-static inline Vec3  v3mul(Vec3 a, float s)           { return v3(a.x*s,   a.y*s,   a.z*s); }
-static inline float v3dot(Vec3 a, Vec3 b)            { return a.x*b.x + a.y*b.y + a.z*b.z; }
-static inline float v3len(Vec3 a)                    { return sqrtf(v3dot(a, a)); }
-static inline Vec3  v3norm(Vec3 a)
-{
-    float L = v3len(a);
-    return (L > 1e-7f) ? v3mul(a, 1.0f / L) : v3(0, 0, 1);
+static inline Vec3 v3(float x, float y, float z) { return (Vec3){x, y, z}; }
+static inline Vec3 v3add(Vec3 a, Vec3 b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline Vec3 v3sub(Vec3 a, Vec3 b) {
+  return v3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline Vec3 v3mul(Vec3 a, float s) {
+  return v3(a.x * s, a.y * s, a.z * s);
+}
+static inline float v3dot(Vec3 a, Vec3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline float v3len(Vec3 a) { return sqrtf(v3dot(a, a)); }
+static inline Vec3 v3norm(Vec3 a) {
+  float L = v3len(a);
+  return (L > 1e-7f) ? v3mul(a, 1.0f / L) : v3(0, 0, 1);
 }
 
 /* ── §5 sphere SDF — the canonical |p|−R distance function ───────────── *
@@ -771,10 +784,7 @@ static inline Vec3  v3norm(Vec3 a)
  * tracing.  Positive outside, zero on the surface, negative
  * (negated radial distance) inside.
  */
-static float sdf_sphere(Vec3 p, float radius)
-{
-    return v3len(p) - radius;
-}
+static float sdf_sphere(Vec3 p, float radius) { return v3len(p) - radius; }
 
 /* ── §6 sphere trace — Hart 1996 march loop ──────────────────────────── *
  *
@@ -783,22 +793,24 @@ static float sdf_sphere(Vec3 p, float radius)
  * via out_steps (used by the STEPS debug overlay; pass NULL to
  * ignore).
  */
-static float sphere_trace(Vec3 origin, Vec3 dir, float radius, int *out_steps)
-{
-    float t = 0.0f;
-    int   step;
-    for (step = 0; step < RM_MAX_STEPS; step++) {
-        Vec3  p = v3add(origin, v3mul(dir, t));
-        float d = sdf_sphere(p, radius);
-        if (d < RM_HIT_EPS) {
-            if (out_steps) *out_steps = step + 1;
-            return t;
-        }
-        if (t > RM_MAX_DIST) break;
-        t += d;
+static float sphere_trace(Vec3 origin, Vec3 dir, float radius, int *out_steps) {
+  float t = 0.0f;
+  int step;
+  for (step = 0; step < RM_MAX_STEPS; step++) {
+    Vec3 p = v3add(origin, v3mul(dir, t));
+    float d = sdf_sphere(p, radius);
+    if (d < RM_HIT_EPS) {
+      if (out_steps)
+        *out_steps = step + 1;
+      return t;
     }
-    if (out_steps) *out_steps = step;
-    return -1.0f;
+    if (t > RM_MAX_DIST)
+      break;
+    t += d;
+  }
+  if (out_steps)
+    *out_steps = step;
+  return -1.0f;
 }
 
 /* ── §7 sphere normal — closed form (no finite differences needed) ───── *
@@ -814,28 +826,26 @@ static float sphere_trace(Vec3 origin, Vec3 dir, float radius, int *out_steps)
  * specifically, four SDF evaluations per pixel are saved by using
  * this one-line closed form.
  */
-static Vec3 sphere_normal(Vec3 p)
-{
-    return v3norm(p);
-}
+static Vec3 sphere_normal(Vec3 p) { return v3norm(p); }
 
 /* ── §8 Phong shade — ambient + diffuse + specular ───────────────────── *
  *
  * Tutorial T6 derived the formula.  Implementation walks each
  * component in order and clamps the final intensity to [0, 1].
  */
-static float phong(Vec3 hit, Vec3 N, Vec3 cam, Vec3 light)
-{
-    Vec3  L = v3norm(v3sub(light, hit));
-    Vec3  V = v3norm(v3sub(cam,   hit));
-    float ndl = fmaxf(0.0f, v3dot(N, L));
-    Vec3  R   = v3sub(v3mul(N, 2.0f * ndl), L);
-    float spec = powf(fmaxf(0.0f, v3dot(R, V)), SHIN);
+static float phong(Vec3 hit, Vec3 N, Vec3 cam, Vec3 light) {
+  Vec3 L = v3norm(v3sub(light, hit));
+  Vec3 V = v3norm(v3sub(cam, hit));
+  float ndl = fmaxf(0.0f, v3dot(N, L));
+  Vec3 R = v3sub(v3mul(N, 2.0f * ndl), L);
+  float spec = powf(fmaxf(0.0f, v3dot(R, V)), SHIN);
 
-    float I = KA + KD * ndl + KS * spec;
-    if (I < 0.0f) I = 0.0f;
-    if (I > 1.0f) I = 1.0f;
-    return I;
+  float I = KA + KD * ndl + KS * spec;
+  if (I < 0.0f)
+    I = 0.0f;
+  if (I > 1.0f)
+    I = 1.0f;
+  return I;
 }
 
 /* ── §9 cast_ray — one pixel's full pipeline → Hit ───────────────────── *
@@ -850,45 +860,42 @@ static float phong(Vec3 hit, Vec3 N, Vec3 cam, Vec3 light)
  */
 
 typedef struct {
-    bool  hit;
-    Vec3  hit_point;
-    Vec3  normal;
-    float intensity;        /* Phong result in [0,1]                    */
-    float trace_distance;   /* ray parameter at hit (DEBUG_DEPTH input) */
-    int   step_count;       /* march iterations    (DEBUG_STEPS input)  */
+  bool hit;
+  Vec3 hit_point;
+  Vec3 normal;
+  float intensity;      /* Phong result in [0,1]                    */
+  float trace_distance; /* ray parameter at hit (DEBUG_DEPTH input) */
+  int step_count;       /* march iterations    (DEBUG_STEPS input)  */
 } Hit;
 
 static Hit cast_ray(int col, int row, int canvas_w, int canvas_h,
-                    float sphere_radius, Vec3 light, float cam_z)
-{
-    Hit h = { false, {0,0,0}, {0,0,1}, 0.0f, 0.0f, 0 };
+                    float sphere_radius, Vec3 light, float cam_z) {
+  Hit h = {false, {0, 0, 0}, {0, 0, 1}, 0.0f, 0.0f, 0};
 
-    /* NDC for the cell centre (T7). */
-    float u =  ((float)col + 0.5f) / (float)canvas_w * 2.0f - 1.0f;
-    float v = -((float)row + 0.5f) / (float)canvas_h * 2.0f + 1.0f;
+  /* NDC for the cell centre (T7). */
+  float u = ((float)col + 0.5f) / (float)canvas_w * 2.0f - 1.0f;
+  float v = -((float)row + 0.5f) / (float)canvas_h * 2.0f + 1.0f;
 
-    /* Aspect: terminal cells are ~2× taller than wide.  Scale v
-     * so equal physical distance per unit in both axes. */
-    float phys_aspect = ((float)canvas_h * CELL_ASPECT)
-                       / (float)canvas_w;
+  /* Aspect: terminal cells are ~2× taller than wide.  Scale v
+   * so equal physical distance per unit in both axes. */
+  float phys_aspect = ((float)canvas_h * CELL_ASPECT) / (float)canvas_w;
 
-    Vec3 ro = v3(0.0f, 0.0f, cam_z);
-    Vec3 rd = v3norm(v3(u * FOV_HALF_TAN,
-                        v * FOV_HALF_TAN * phys_aspect,
-                        -1.0f));
+  Vec3 ro = v3(0.0f, 0.0f, cam_z);
+  Vec3 rd = v3norm(v3(u * FOV_HALF_TAN, v * FOV_HALF_TAN * phys_aspect, -1.0f));
 
-    int   steps = 0;
-    float t = sphere_trace(ro, rd, sphere_radius, &steps);
-    h.step_count = steps;
+  int steps = 0;
+  float t = sphere_trace(ro, rd, sphere_radius, &steps);
+  h.step_count = steps;
 
-    if (t < 0.0f) return h;
-
-    h.hit            = true;
-    h.trace_distance = t;
-    h.hit_point      = v3add(ro, v3mul(rd, t));
-    h.normal         = sphere_normal(h.hit_point);
-    h.intensity      = phong(h.hit_point, h.normal, ro, light);
+  if (t < 0.0f)
     return h;
+
+  h.hit = true;
+  h.trace_distance = t;
+  h.hit_point = v3add(ro, v3mul(rd, t));
+  h.normal = sphere_normal(h.hit_point);
+  h.intensity = phong(h.hit_point, h.normal, ro, light);
+  return h;
 }
 
 /* ── §10 canvas — the Hit framebuffer ────────────────────────────────── *
@@ -899,22 +906,20 @@ static Hit cast_ray(int col, int row, int canvas_w, int canvas_h,
  */
 
 typedef struct {
-    int  w, h;
-    Hit *hits;
+  int w, h;
+  Hit *hits;
 } Canvas;
 
-static void canvas_alloc(Canvas *c, int cols, int rows)
-{
-    c->w    = canvas_w_from_cols(cols);
-    c->h    = canvas_h_from_rows(rows);
-    c->hits = calloc((size_t)(c->w * c->h), sizeof(Hit));
+static void canvas_alloc(Canvas *c, int cols, int rows) {
+  c->w = canvas_w_from_cols(cols);
+  c->h = canvas_h_from_rows(rows);
+  c->hits = calloc((size_t)(c->w * c->h), sizeof(Hit));
 }
 
-static void canvas_free(Canvas *c)
-{
-    free(c->hits);
-    c->hits = NULL;
-    c->w = c->h = 0;
+static void canvas_free(Canvas *c) {
+  free(c->hits);
+  c->hits = NULL;
+  c->w = c->h = 0;
 }
 
 /* ── §11 render — fill the Hit array for one frame ───────────────────── *
@@ -922,14 +927,14 @@ static void canvas_free(Canvas *c)
  * Pure math.  Knows nothing about glyphs, colour, or terminals.
  * cam_z is a parameter (not a constant) so the user can zoom.
  */
-static void canvas_render(Canvas *c, float sphere_radius, Vec3 light, float cam_z)
-{
-    for (int py = 0; py < c->h; py++) {
-        for (int px = 0; px < c->w; px++) {
-            c->hits[py * c->w + px] =
-                cast_ray(px, py, c->w, c->h, sphere_radius, light, cam_z);
-        }
+static void canvas_render(Canvas *c, float sphere_radius, Vec3 light,
+                          float cam_z) {
+  for (int py = 0; py < c->h; py++) {
+    for (int px = 0; px < c->w; px++) {
+      c->hits[py * c->w + px] =
+          cast_ray(px, py, c->w, c->h, sphere_radius, light, cam_z);
     }
+  }
 }
 
 /* ── §12 draw — production overlay (Hit → glyph + theme colour) ──────── *
@@ -940,63 +945,63 @@ static void canvas_render(Canvas *c, float sphere_radius, Vec3 light, float cam_
  * loop.
  */
 
-static char intensity_to_glyph(float intensity)
-{
-    int idx = (int)(intensity * (float)(RAMP_LEN - 1) + 0.5f);
-    if (idx < 0)         idx = 0;
-    if (idx >= RAMP_LEN) idx = RAMP_LEN - 1;
-    return LUMA_RAMP[idx];
+static char intensity_to_glyph(float intensity) {
+  int idx = (int)(intensity * (float)(RAMP_LEN - 1) + 0.5f);
+  if (idx < 0)
+    idx = 0;
+  if (idx >= RAMP_LEN)
+    idx = RAMP_LEN - 1;
+  return LUMA_RAMP[idx];
 }
 
-static attr_t intensity_to_attr(float intensity)
-{
-    int idx  = (int)(intensity * (float)(RAMP_LEN - 1) + 0.5f);
-    int slot = (idx * LUMI_N) / RAMP_LEN;
-    return lumi_attr(slot);
+static attr_t intensity_to_attr(float intensity) {
+  int idx = (int)(intensity * (float)(RAMP_LEN - 1) + 0.5f);
+  int slot = (idx * LUMI_N) / RAMP_LEN;
+  return lumi_attr(slot);
 }
 
 static void canvas_offsets(const Canvas *c, int term_cols, int term_rows,
-                           int *out_off_x, int *out_off_y)
-{
-    int total_w = c->w * CELL_W;
-    int total_h = c->h * CELL_H;
-    *out_off_x  = (term_cols - total_w) / 2;
-    *out_off_y  = (term_rows - total_h) / 2;
+                           int *out_off_x, int *out_off_y) {
+  int total_w = c->w * CELL_W;
+  int total_h = c->h * CELL_H;
+  *out_off_x = (term_cols - total_w) / 2;
+  *out_off_y = (term_rows - total_h) / 2;
 }
 
-static void emit_block(int tx0, int ty0, char glyph, attr_t attr,
-                       int term_cols, int term_rows)
-{
-    attron(attr);
-    for (int by = 0; by < CELL_H; by++) {
-        for (int bx = 0; bx < CELL_W; bx++) {
-            int tx = tx0 + bx;
-            int ty = ty0 + by;
-            if (tx < 0 || tx >= term_cols) continue;
-            if (ty < 0 || ty >= term_rows) continue;
-            mvaddch(ty, tx, (chtype)(unsigned char)glyph);
-        }
+static void emit_block(int tx0, int ty0, char glyph, attr_t attr, int term_cols,
+                       int term_rows) {
+  attron(attr);
+  for (int by = 0; by < CELL_H; by++) {
+    for (int bx = 0; bx < CELL_W; bx++) {
+      int tx = tx0 + bx;
+      int ty = ty0 + by;
+      if (tx < 0 || tx >= term_cols)
+        continue;
+      if (ty < 0 || ty >= term_rows)
+        continue;
+      mvaddch(ty, tx, (chtype)(unsigned char)glyph);
     }
-    attroff(attr);
+  }
+  attroff(attr);
 }
 
-static void canvas_draw(const Canvas *c, int term_cols, int term_rows)
-{
-    int off_x, off_y;
-    canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
+static void canvas_draw(const Canvas *c, int term_cols, int term_rows) {
+  int off_x, off_y;
+  canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
 
-    for (int py = 0; py < c->h; py++) {
-        for (int px = 0; px < c->w; px++) {
-            const Hit *h = &c->hits[py * c->w + px];
-            if (!h->hit) continue;
+  for (int py = 0; py < c->h; py++) {
+    for (int px = 0; px < c->w; px++) {
+      const Hit *h = &c->hits[py * c->w + px];
+      if (!h->hit)
+        continue;
 
-            char   glyph = intensity_to_glyph(h->intensity);
-            attr_t attr  = intensity_to_attr (h->intensity);
-            int    tx0   = off_x + px * CELL_W;
-            int    ty0   = off_y + py * CELL_H;
-            emit_block(tx0, ty0, glyph, attr, term_cols, term_rows);
-        }
+      char glyph = intensity_to_glyph(h->intensity);
+      attr_t attr = intensity_to_attr(h->intensity);
+      int tx0 = off_x + px * CELL_W;
+      int ty0 = off_y + py * CELL_H;
+      emit_block(tx0, ty0, glyph, attr, term_cols, term_rows);
     }
+  }
 }
 
 /* ── §13 debug overlays — see the rendering signals raw ──────────────── *
@@ -1017,94 +1022,100 @@ static void canvas_draw(const Canvas *c, int term_cols, int term_rows)
  *            at the silhouette.
  */
 
-static void canvas_draw_normals(const Canvas *c, int term_cols, int term_rows)
-{
-    int off_x, off_y;
-    canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
+static void canvas_draw_normals(const Canvas *c, int term_cols, int term_rows) {
+  int off_x, off_y;
+  canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
 
-    for (int py = 0; py < c->h; py++) {
-        for (int px = 0; px < c->w; px++) {
-            const Hit *h = &c->hits[py * c->w + px];
-            if (!h->hit) continue;
+  for (int py = 0; py < c->h; py++) {
+    for (int px = 0; px < c->w; px++) {
+      const Hit *h = &c->hits[py * c->w + px];
+      if (!h->hit)
+        continue;
 
-            Vec3  N        = h->normal;
-            float azimuth  = atan2f(N.x, N.z) / (2.0f * (float)M_PI) + 0.5f;
-            float y_lit    = N.y * 0.5f + 0.5f;
-            if (y_lit < 0.0f) y_lit = 0.0f;
-            if (y_lit > 1.0f) y_lit = 1.0f;
+      Vec3 N = h->normal;
+      float azimuth = atan2f(N.x, N.z) / (2.0f * (float)M_PI) + 0.5f;
+      float y_lit = N.y * 0.5f + 0.5f;
+      if (y_lit < 0.0f)
+        y_lit = 0.0f;
+      if (y_lit > 1.0f)
+        y_lit = 1.0f;
 
-            char   glyph = intensity_to_glyph(y_lit);
-            attr_t attr  = intensity_to_attr (azimuth);   /* hue from azimuth */
-            int    tx0   = off_x + px * CELL_W;
-            int    ty0   = off_y + py * CELL_H;
-            emit_block(tx0, ty0, glyph, attr, term_cols, term_rows);
-        }
+      char glyph = intensity_to_glyph(y_lit);
+      attr_t attr = intensity_to_attr(azimuth); /* hue from azimuth */
+      int tx0 = off_x + px * CELL_W;
+      int ty0 = off_y + py * CELL_H;
+      emit_block(tx0, ty0, glyph, attr, term_cols, term_rows);
     }
+  }
 }
 
 static void canvas_draw_depth(const Canvas *c, int term_cols, int term_rows,
-                              float cam_z)
-{
-    int off_x, off_y;
-    canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
+                              float cam_z) {
+  int off_x, off_y;
+  canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
 
-    /* Closer hits get higher depth_n.  Sphere extends ±SPHERE_R_MAX
-     * around the origin in any direction. */
-    float t_min = cam_z - SPHERE_R_MAX;
-    float t_max = cam_z + SPHERE_R_MAX;
-    if (t_min < 0.0f) t_min = 0.0f;
+  /* Closer hits get higher depth_n.  Sphere extends ±SPHERE_R_MAX
+   * around the origin in any direction. */
+  float t_min = cam_z - SPHERE_R_MAX;
+  float t_max = cam_z + SPHERE_R_MAX;
+  if (t_min < 0.0f)
+    t_min = 0.0f;
 
-    for (int py = 0; py < c->h; py++) {
-        for (int px = 0; px < c->w; px++) {
-            const Hit *h = &c->hits[py * c->w + px];
-            if (!h->hit) continue;
+  for (int py = 0; py < c->h; py++) {
+    for (int px = 0; px < c->w; px++) {
+      const Hit *h = &c->hits[py * c->w + px];
+      if (!h->hit)
+        continue;
 
-            float depth_n = (t_max - h->trace_distance) / (t_max - t_min);
-            if (depth_n < 0.0f) depth_n = 0.0f;
-            if (depth_n > 1.0f) depth_n = 1.0f;
+      float depth_n = (t_max - h->trace_distance) / (t_max - t_min);
+      if (depth_n < 0.0f)
+        depth_n = 0.0f;
+      if (depth_n > 1.0f)
+        depth_n = 1.0f;
 
-            char   glyph = intensity_to_glyph(depth_n);
-            attr_t attr  = intensity_to_attr (depth_n);
-            int    tx0   = off_x + px * CELL_W;
-            int    ty0   = off_y + py * CELL_H;
-            emit_block(tx0, ty0, glyph, attr, term_cols, term_rows);
-        }
+      char glyph = intensity_to_glyph(depth_n);
+      attr_t attr = intensity_to_attr(depth_n);
+      int tx0 = off_x + px * CELL_W;
+      int ty0 = off_y + py * CELL_H;
+      emit_block(tx0, ty0, glyph, attr, term_cols, term_rows);
     }
+  }
 }
 
-static void canvas_draw_steps(const Canvas *c, int term_cols, int term_rows)
-{
-    int off_x, off_y;
-    canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
+static void canvas_draw_steps(const Canvas *c, int term_cols, int term_rows) {
+  int off_x, off_y;
+  canvas_offsets(c, term_cols, term_rows, &off_x, &off_y);
 
-    for (int py = 0; py < c->h; py++) {
-        for (int px = 0; px < c->w; px++) {
-            const Hit *h = &c->hits[py * c->w + px];
-            if (!h->hit) continue;
+  for (int py = 0; py < c->h; py++) {
+    for (int px = 0; px < c->w; px++) {
+      const Hit *h = &c->hits[py * c->w + px];
+      if (!h->hit)
+        continue;
 
-            float steps_n = (float)h->step_count / (float)RM_MAX_STEPS;
-            if (steps_n > 1.0f) steps_n = 1.0f;
+      float steps_n = (float)h->step_count / (float)RM_MAX_STEPS;
+      if (steps_n > 1.0f)
+        steps_n = 1.0f;
 
-            char   glyph = intensity_to_glyph(steps_n);
-            attr_t attr  = intensity_to_attr (steps_n);
-            int    tx0   = off_x + px * CELL_W;
-            int    ty0   = off_y + py * CELL_H;
-            emit_block(tx0, ty0, glyph, attr, term_cols, term_rows);
-        }
+      char glyph = intensity_to_glyph(steps_n);
+      attr_t attr = intensity_to_attr(steps_n);
+      int tx0 = off_x + px * CELL_W;
+      int ty0 = off_y + py * CELL_H;
+      emit_block(tx0, ty0, glyph, attr, term_cols, term_rows);
     }
+  }
 }
 
 /* ── §14 scene — Scene struct + light + tick ─────────────────────────── */
 
 typedef struct {
-    Canvas    canvas;
-    float     time;
-    float     light_spd;
-    float     sphere_r;
-    float     cam_z;          /* camera z; smaller = zoomed-in */
-    int       theme_index;    /* index into THEMES[] (t/T keys) */
-    DebugMode debug_mode;
-    bool      paused;
+  Canvas canvas;
+  float time;
+  float light_spd;
+  float sphere_r;
+  float cam_z;     /* camera z; smaller = zoomed-in */
+  int theme_index; /* index into THEMES[] (t/T keys) */
+  DebugMode debug_mode;
+  bool paused;
 } Scene;
 
 /* Lissajous orbit:
@@ -1112,266 +1123,290 @@ typedef struct {
  *      L(α) = (LIGHT_RADIUS_X · cos α,
  *              LIGHT_BIAS_Y + LIGHT_AMPLITUDE_Y · sin(LIGHT_RATE_Y · α),
  *              LIGHT_HEIGHT_Z)                                        */
-static Vec3 scene_light(const Scene *s)
-{
-    float t = s->time * s->light_spd;
-    return v3(LIGHT_RADIUS_X * cosf(t),
-              LIGHT_BIAS_Y   + LIGHT_AMPLITUDE_Y * sinf(LIGHT_RATE_Y * t),
-              LIGHT_HEIGHT_Z);
+static Vec3 scene_light(const Scene *s) {
+  float t = s->time * s->light_spd;
+  return v3(LIGHT_RADIUS_X * cosf(t),
+            LIGHT_BIAS_Y + LIGHT_AMPLITUDE_Y * sinf(LIGHT_RATE_Y * t),
+            LIGHT_HEIGHT_Z);
 }
 
-static void scene_init(Scene *s, int cols, int rows)
-{
-    memset(s, 0, sizeof *s);
-    canvas_alloc(&s->canvas, cols, rows);
-    s->time        = 0.0f;
-    s->light_spd   = LIGHT_SPD_DEFAULT;
-    s->sphere_r    = SPHERE_R_DEFAULT;
-    s->cam_z       = CAM_Z_DEFAULT;
-    s->theme_index = 0;
-    s->debug_mode  = DEBUG_NORMAL;
-    s->paused      = false;
+static void scene_init(Scene *s, int cols, int rows) {
+  memset(s, 0, sizeof *s);
+  canvas_alloc(&s->canvas, cols, rows);
+  s->time = 0.0f;
+  s->light_spd = LIGHT_SPD_DEFAULT;
+  s->sphere_r = SPHERE_R_DEFAULT;
+  s->cam_z = CAM_Z_DEFAULT;
+  s->theme_index = 0;
+  s->debug_mode = DEBUG_NORMAL;
+  s->paused = false;
 }
 
-static void scene_free(Scene *s)
-{
-    canvas_free(&s->canvas);
+static void scene_free(Scene *s) { canvas_free(&s->canvas); }
+
+static void scene_resize(Scene *s, int cols, int rows) {
+  canvas_free(&s->canvas);
+  canvas_alloc(&s->canvas, cols, rows);
 }
 
-static void scene_resize(Scene *s, int cols, int rows)
-{
-    canvas_free(&s->canvas);
-    canvas_alloc(&s->canvas, cols, rows);
+static void scene_tick(Scene *s, float dt_sec) {
+  if (!s->paused)
+    s->time += dt_sec;
 }
 
-static void scene_tick(Scene *s, float dt_sec)
-{
-    if (!s->paused) s->time += dt_sec;
-}
-
-static void scene_render(Scene *s)
-{
-    canvas_render(&s->canvas, s->sphere_r, scene_light(s), s->cam_z);
+static void scene_render(Scene *s) {
+  canvas_render(&s->canvas, s->sphere_r, scene_light(s), s->cam_z);
 }
 
 /* dispatch to the active overlay */
-static void scene_draw_active(const Scene *s, int cols, int rows)
-{
-    switch (s->debug_mode) {
-    case DEBUG_NORMAL:  canvas_draw         (&s->canvas, cols, rows);            break;
-    case DEBUG_NORMALS: canvas_draw_normals (&s->canvas, cols, rows);            break;
-    case DEBUG_DEPTH:   canvas_draw_depth   (&s->canvas, cols, rows, s->cam_z);  break;
-    case DEBUG_STEPS:   canvas_draw_steps   (&s->canvas, cols, rows);            break;
-    default:            canvas_draw         (&s->canvas, cols, rows);            break;
-    }
+static void scene_draw_active(const Scene *s, int cols, int rows) {
+  switch (s->debug_mode) {
+  case DEBUG_NORMAL:
+    canvas_draw(&s->canvas, cols, rows);
+    break;
+  case DEBUG_NORMALS:
+    canvas_draw_normals(&s->canvas, cols, rows);
+    break;
+  case DEBUG_DEPTH:
+    canvas_draw_depth(&s->canvas, cols, rows, s->cam_z);
+    break;
+  case DEBUG_STEPS:
+    canvas_draw_steps(&s->canvas, cols, rows);
+    break;
+  default:
+    canvas_draw(&s->canvas, cols, rows);
+    break;
+  }
 }
 
 /* ── §15 screen — ncurses init / HUD / present ───────────────────────── */
 
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *s)
-{
-    initscr();
-    noecho(); cbreak(); curs_set(0);
-    nodelay(stdscr, TRUE); keypad(stdscr, TRUE); typeahead(-1);
-    color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_free(Screen *s) { (void)s; endwin(); }
+static void screen_free(Screen *s) {
+  (void)s;
+  endwin();
+}
 
-static void screen_resize(Screen *s)
-{
-    endwin(); refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
 /* HUD layout (CLAUDE.md spec):
  *   row 0          PAIR_HUD  (yellow + bold) — title left, status right
  *   row rows-1     PAIR_HINT (cyan   + bold) — key hint
  */
-static void screen_draw(Screen *s, const Scene *sc, double fps)
-{
-    erase();
-    scene_draw_active(sc, s->cols, s->rows);
+static void screen_draw(Screen *s, const Scene *sc, double fps) {
+  erase();
+  scene_draw_active(sc, s->cols, s->rows);
 
-    char status[200];
-    snprintf(status, sizeof status,
-             " %5.1f fps  spd:%.2f  r:%.2f  zoom:%.2f  theme:%s  "
-             "debug:%s  [%dx%d]  %s ",
-             fps, sc->light_spd, sc->sphere_r, sc->cam_z,
-             THEMES[sc->theme_index].display_name,
-             DEBUG_MODE_NAMES[sc->debug_mode],
-             sc->canvas.w, sc->canvas.h,
-             sc->paused ? "PAUSED" : "running");
-    int slen = (int)strlen(status); if (slen > s->cols) slen = s->cols;
+  char status[200];
+  snprintf(status, sizeof status,
+           " %5.1f fps  spd:%.2f  r:%.2f  zoom:%.2f  theme:%s  "
+           "debug:%s  [%dx%d]  %s ",
+           fps, sc->light_spd, sc->sphere_r, sc->cam_z,
+           THEMES[sc->theme_index].display_name,
+           DEBUG_MODE_NAMES[sc->debug_mode], sc->canvas.w, sc->canvas.h,
+           sc->paused ? "PAUSED" : "running");
+  int slen = (int)strlen(status);
+  if (slen > s->cols)
+    slen = s->cols;
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, s->cols - slen, "%s", status);
-    mvprintw(0, 0, " RAYMARCHER ");
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, s->cols - slen, "%s", status);
+  mvprintw(0, 0, " RAYMARCHER ");
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(s->rows - 1, 0,
-             " q:quit  spc:pause  ]/[:light-speed  +/-:size  z/Z:zoom  "
-             "t/T:theme  d/D:debug ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(s->rows - 1, 0,
+           " q:quit  spc:pause  ]/[:light-speed  +/-:size  z/Z:zoom  "
+           "t/T:theme  d/D:debug ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void)
-{
-    wnoutrefresh(stdscr);
-    doupdate();
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ── §16 app — main loop, signals, key handling ──────────────────────── */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal  (int sig) { (void)sig; g_app.running     = 0; }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup         (void)    { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void app_do_resize(App *app)
-{
-    screen_resize(&app->screen);
-    scene_resize (&app->scene, app->screen.cols, app->screen.rows);
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  screen_resize(&app->screen);
+  scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    switch (ch) {
-    case 'q': case 'Q': case 27: return false;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-    case ' ':
-        s->paused = !s->paused;
-        break;
+  case ' ':
+    s->paused = !s->paused;
+    break;
 
-    case ']':
-        s->light_spd *= LIGHT_SPD_STEP;
-        if (s->light_spd > LIGHT_SPD_MAX) s->light_spd = LIGHT_SPD_MAX;
-        break;
-    case '[':
-        s->light_spd /= LIGHT_SPD_STEP;
-        if (s->light_spd < LIGHT_SPD_MIN) s->light_spd = LIGHT_SPD_MIN;
-        break;
+  case ']':
+    s->light_spd *= LIGHT_SPD_STEP;
+    if (s->light_spd > LIGHT_SPD_MAX)
+      s->light_spd = LIGHT_SPD_MAX;
+    break;
+  case '[':
+    s->light_spd /= LIGHT_SPD_STEP;
+    if (s->light_spd < LIGHT_SPD_MIN)
+      s->light_spd = LIGHT_SPD_MIN;
+    break;
 
-    case '=': case '+':
-        s->sphere_r *= SPHERE_R_STEP;
-        if (s->sphere_r > SPHERE_R_MAX) s->sphere_r = SPHERE_R_MAX;
-        break;
-    case '-':
-        s->sphere_r /= SPHERE_R_STEP;
-        if (s->sphere_r < SPHERE_R_MIN) s->sphere_r = SPHERE_R_MIN;
-        break;
+  case '=':
+  case '+':
+    s->sphere_r *= SPHERE_R_STEP;
+    if (s->sphere_r > SPHERE_R_MAX)
+      s->sphere_r = SPHERE_R_MAX;
+    break;
+  case '-':
+    s->sphere_r /= SPHERE_R_STEP;
+    if (s->sphere_r < SPHERE_R_MIN)
+      s->sphere_r = SPHERE_R_MIN;
+    break;
 
-    case 'z':
-        s->cam_z -= CAM_ZOOM_STEP;
-        if (s->cam_z < CAM_Z_MIN) s->cam_z = CAM_Z_MIN;
-        break;
-    case 'Z':
-        s->cam_z += CAM_ZOOM_STEP;
-        if (s->cam_z > CAM_Z_MAX) s->cam_z = CAM_Z_MAX;
-        break;
+  case 'z':
+    s->cam_z -= CAM_ZOOM_STEP;
+    if (s->cam_z < CAM_Z_MIN)
+      s->cam_z = CAM_Z_MIN;
+    break;
+  case 'Z':
+    s->cam_z += CAM_ZOOM_STEP;
+    if (s->cam_z > CAM_Z_MAX)
+      s->cam_z = CAM_Z_MAX;
+    break;
 
-    case 't':
-        s->theme_index = (s->theme_index + 1) % THEME_COUNT;
-        theme_apply(s->theme_index);
-        break;
-    case 'T':
-        s->theme_index = (s->theme_index + THEME_COUNT - 1) % THEME_COUNT;
-        theme_apply(s->theme_index);
-        break;
+  case 't':
+    s->theme_index = (s->theme_index + 1) % THEME_COUNT;
+    theme_apply(s->theme_index);
+    break;
+  case 'T':
+    s->theme_index = (s->theme_index + THEME_COUNT - 1) % THEME_COUNT;
+    theme_apply(s->theme_index);
+    break;
 
-    case 'd':
-        s->debug_mode = (DebugMode)((s->debug_mode + 1) % DEBUG_MODE_COUNT);
-        break;
-    case 'D':
-        s->debug_mode =
-            (DebugMode)((s->debug_mode + DEBUG_MODE_COUNT - 1) % DEBUG_MODE_COUNT);
-        break;
+  case 'd':
+    s->debug_mode = (DebugMode)((s->debug_mode + 1) % DEBUG_MODE_COUNT);
+    break;
+  case 'D':
+    s->debug_mode =
+        (DebugMode)((s->debug_mode + DEBUG_MODE_COUNT - 1) % DEBUG_MODE_COUNT);
+    break;
 
-    default: break;
-    }
-    return true;
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+int main(void) {
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
-    scene_init (&app->scene, app->screen.cols, app->screen.rows);
+  screen_init(&app->screen);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
-
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accum -= tick_ns;
-        }
-
-        scene_render(&app->scene);
-
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        screen_draw   (&app->screen, &app->scene, fps_display);
-        screen_present();
-
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns();
+      sim_accum = 0;
     }
 
-    scene_free (&app->scene);
-    screen_free(&app->screen);
-    return 0;
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > 100 * NS_PER_MS)
+      dt = 100 * NS_PER_MS;
+
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
+
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, dt_sec);
+      sim_accum -= tick_ns;
+    }
+
+    scene_render(&app->scene);
+
+    frame_count++;
+    fps_accum += dt;
+    if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display =
+          (double)frame_count / ((double)fps_accum / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accum = 0;
+    }
+
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
+    screen_draw(&app->screen, &app->scene, fps_display);
+    screen_present();
+
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  scene_free(&app->scene);
+  screen_free(&app->screen);
+  return 0;
 }

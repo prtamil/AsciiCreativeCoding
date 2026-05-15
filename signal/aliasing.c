@@ -684,7 +684,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -701,71 +701,69 @@
 /* §1  config                                                            */
 /* ===================================================================== */
 
-#define N                  32        /* sample rate (samples / buffer)  */
-#define HIGH_RES_FACTOR     8        /* sub-samples per actual sample    */
-#define HIGH_RES_N          (N * HIGH_RES_FACTOR)
-#define RENDER_FPS         30
-#define RENDER_TICK_NS     (1000000000LL / RENDER_FPS)
-#define SWEEP_PERIOD_FRAMES 240      /* one full freq sweep ≈ 8 seconds  */
-#define FREQ_LO            0.5f
-#define FREQ_HI            ((float)N * 2.0f)   /* sweep to 2 * sample rate */
+#define N 32              /* sample rate (samples / buffer)  */
+#define HIGH_RES_FACTOR 8 /* sub-samples per actual sample    */
+#define HIGH_RES_N (N * HIGH_RES_FACTOR)
+#define RENDER_FPS 30
+#define RENDER_TICK_NS (1000000000LL / RENDER_FPS)
+#define SWEEP_PERIOD_FRAMES 240 /* one full freq sweep ≈ 8 seconds  */
+#define FREQ_LO 0.5f
+#define FREQ_HI ((float)N * 2.0f) /* sweep to 2 * sample rate */
 
 enum {
-    PAIR_CONTINUOUS = 1,    /* continuous signal bars                     */
-    PAIR_SAMPLE     = 2,    /* sample-point markers                       */
-    PAIR_RECON      = 3,    /* reconstructed line segments                */
-    PAIR_GHOST      = 4,    /* faint ghost of continuous in bottom panel */
-    PAIR_LABEL      = 5,    /* panel labels                               */
-    PAIR_HUD        = 6,    /* HUD top status                             */
-    PAIR_HINT       = 7,    /* bottom hint                                */
-    PAIR_NYQUIST    = 8,    /* "ALIASED" warning text                     */
+  PAIR_CONTINUOUS = 1, /* continuous signal bars                     */
+  PAIR_SAMPLE = 2,     /* sample-point markers                       */
+  PAIR_RECON = 3,      /* reconstructed line segments                */
+  PAIR_GHOST = 4,      /* faint ghost of continuous in bottom panel */
+  PAIR_LABEL = 5,      /* panel labels                               */
+  PAIR_HUD = 6,        /* HUD top status                             */
+  PAIR_HINT = 7,       /* bottom hint                                */
+  PAIR_NYQUIST = 8,    /* "ALIASED" warning text                     */
 };
 
 /* ===================================================================== */
 /* §2  clock                                                             */
 /* ===================================================================== */
 
-static long long clock_now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(long long ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(long long ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
 /* §3  colors                                                            */
 /* ===================================================================== */
 
-static void colors_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_CONTINUOUS, 51, -1);   /* bright cyan      */
-        init_pair(PAIR_SAMPLE,    226, -1);   /* bright yellow    */
-        init_pair(PAIR_RECON,     154, -1);   /* yellow-green     */
-        init_pair(PAIR_GHOST,     244, -1);   /* mid grey         */
-        init_pair(PAIR_LABEL,     244, -1);   /* mid grey         */
-        init_pair(PAIR_HUD,       226, -1);   /* bright yellow    */
-        init_pair(PAIR_HINT,       51, -1);   /* bright cyan      */
-        init_pair(PAIR_NYQUIST,   196, -1);   /* bright red       */
-    } else {
-        init_pair(PAIR_CONTINUOUS, COLOR_CYAN,    -1);
-        init_pair(PAIR_SAMPLE,     COLOR_YELLOW,  -1);
-        init_pair(PAIR_RECON,      COLOR_GREEN,   -1);
-        init_pair(PAIR_GHOST,      COLOR_WHITE,   -1);
-        init_pair(PAIR_LABEL,      COLOR_WHITE,   -1);
-        init_pair(PAIR_HUD,        COLOR_YELLOW,  -1);
-        init_pair(PAIR_HINT,       COLOR_CYAN,    -1);
-        init_pair(PAIR_NYQUIST,    COLOR_RED,     -1);
-    }
+static void colors_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(PAIR_CONTINUOUS, 51, -1); /* bright cyan      */
+    init_pair(PAIR_SAMPLE, 226, -1);    /* bright yellow    */
+    init_pair(PAIR_RECON, 154, -1);     /* yellow-green     */
+    init_pair(PAIR_GHOST, 244, -1);     /* mid grey         */
+    init_pair(PAIR_LABEL, 244, -1);     /* mid grey         */
+    init_pair(PAIR_HUD, 226, -1);       /* bright yellow    */
+    init_pair(PAIR_HINT, 51, -1);       /* bright cyan      */
+    init_pair(PAIR_NYQUIST, 196, -1);   /* bright red       */
+  } else {
+    init_pair(PAIR_CONTINUOUS, COLOR_CYAN, -1);
+    init_pair(PAIR_SAMPLE, COLOR_YELLOW, -1);
+    init_pair(PAIR_RECON, COLOR_GREEN, -1);
+    init_pair(PAIR_GHOST, COLOR_WHITE, -1);
+    init_pair(PAIR_LABEL, COLOR_WHITE, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+    init_pair(PAIR_NYQUIST, COLOR_RED, -1);
+  }
 }
 
 /* ===================================================================== */
@@ -839,15 +837,15 @@ static void colors_init(void)
  *    call it, or visualise the result.
  */
 
-static float aliased_frequency(float true_freq, float sample_rate)
-{
-    /* ── STEP 1 — handle frequency wrap (f and f + k*fs alias) ──── */
-    float f_mod = fmodf(fabsf(true_freq), sample_rate);
+static float aliased_frequency(float true_freq, float sample_rate) {
+  /* ── STEP 1 — handle frequency wrap (f and f + k*fs alias) ──── */
+  float f_mod = fmodf(fabsf(true_freq), sample_rate);
 
-    /* ── STEP 2 — handle sign-flip symmetry (fold upper half down) ─ */
-    if (f_mod > sample_rate * 0.5f) f_mod = sample_rate - f_mod;
+  /* ── STEP 2 — handle sign-flip symmetry (fold upper half down) ─ */
+  if (f_mod > sample_rate * 0.5f)
+    f_mod = sample_rate - f_mod;
 
-    return f_mod;
+  return f_mod;
 }
 
 /* ===================================================================== */
@@ -856,24 +854,23 @@ static float aliased_frequency(float true_freq, float sample_rate)
 
 static float g_continuous[HIGH_RES_N];
 
-static void generate_continuous_signal(float frequency_cycles_per_buffer)
-{
-    /*
-     * Fill g_continuous[0..HIGH_RES_N - 1] with cos(2*pi * f * t)
-     * where t is the position within the buffer normalised to [0, 1].
-     * HIGH_RES_FACTOR sub-samples per actual sample give us a smooth
-     * curve at terminal resolution.
-     *
-     * Pseudocode:
-     *   for i in 0..HIGH_RES_N - 1:
-     *     t = i / HIGH_RES_N
-     *     g_continuous[i] = cos(2*pi * f * t)
-     */
-    for (int i = 0; i < HIGH_RES_N; i++) {
-        float t = (float)i / (float)HIGH_RES_N;
-        g_continuous[i] = cosf(2.0f * (float)M_PI
-                             * frequency_cycles_per_buffer * t);
-    }
+static void generate_continuous_signal(float frequency_cycles_per_buffer) {
+  /*
+   * Fill g_continuous[0..HIGH_RES_N - 1] with cos(2*pi * f * t)
+   * where t is the position within the buffer normalised to [0, 1].
+   * HIGH_RES_FACTOR sub-samples per actual sample give us a smooth
+   * curve at terminal resolution.
+   *
+   * Pseudocode:
+   *   for i in 0..HIGH_RES_N - 1:
+   *     t = i / HIGH_RES_N
+   *     g_continuous[i] = cos(2*pi * f * t)
+   */
+  for (int i = 0; i < HIGH_RES_N; i++) {
+    float t = (float)i / (float)HIGH_RES_N;
+    g_continuous[i] =
+        cosf(2.0f * (float)M_PI * frequency_cycles_per_buffer * t);
+  }
 }
 
 /* ===================================================================== */
@@ -882,50 +879,47 @@ static void generate_continuous_signal(float frequency_cycles_per_buffer)
 
 static float g_sampled[N];
 
-static void generate_sampled_signal(float frequency_cycles_per_buffer)
-{
-    /*
-     * Fill g_sampled[0..N-1] with the ACTUAL sample values at sample
-     * rate fs = N.  Same formula as continuous but t = n/N, so we
-     * get exactly N values across the buffer.
-     *
-     * Pseudocode:
-     *   for n in 0..N-1:
-     *     t = n / N
-     *     g_sampled[n] = cos(2*pi * f * t)
-     *
-     * This is what the digital system "sees" — only these N values,
-     * nothing in between.  The aliasing happens because these N
-     * values can be EXPLAINED by many different continuous signals,
-     * and the system has no way to choose between them.
-     */
-    for (int n = 0; n < N; n++) {
-        float t = (float)n / (float)N;
-        g_sampled[n] = cosf(2.0f * (float)M_PI
-                          * frequency_cycles_per_buffer * t);
-    }
+static void generate_sampled_signal(float frequency_cycles_per_buffer) {
+  /*
+   * Fill g_sampled[0..N-1] with the ACTUAL sample values at sample
+   * rate fs = N.  Same formula as continuous but t = n/N, so we
+   * get exactly N values across the buffer.
+   *
+   * Pseudocode:
+   *   for n in 0..N-1:
+   *     t = n / N
+   *     g_sampled[n] = cos(2*pi * f * t)
+   *
+   * This is what the digital system "sees" — only these N values,
+   * nothing in between.  The aliasing happens because these N
+   * values can be EXPLAINED by many different continuous signals,
+   * and the system has no way to choose between them.
+   */
+  for (int n = 0; n < N; n++) {
+    float t = (float)n / (float)N;
+    g_sampled[n] = cosf(2.0f * (float)M_PI * frequency_cycles_per_buffer * t);
+  }
 }
 
 /* ===================================================================== */
 /* §7  scene_state                                                       */
 /* ===================================================================== */
 
-static float g_true_frequency_cycles_per_buffer    = FREQ_LO;
+static float g_true_frequency_cycles_per_buffer = FREQ_LO;
 static float g_aliased_frequency_cycles_per_buffer = 0.0f;
-static bool  g_simulation_paused                   = false;
-static bool  g_auto_sweep_enabled                  = true;
-static float g_animation_phase_radians             = 0.0f;
+static bool g_simulation_paused = false;
+static bool g_auto_sweep_enabled = true;
+static float g_animation_phase_radians = 0.0f;
 
 /* Debug overlay toggles. */
-static bool  g_show_foldback_overlay               = false;   /* 'd' */
-static bool  g_show_frequency_table                = false;   /* 'D' */
+static bool g_show_foldback_overlay = false; /* 'd' */
+static bool g_show_frequency_table = false;  /* 'D' */
 
-static void scene_reset(void)
-{
-    g_true_frequency_cycles_per_buffer = FREQ_LO;
-    g_simulation_paused                = false;
-    g_auto_sweep_enabled               = true;
-    g_animation_phase_radians          = 0.0f;
+static void scene_reset(void) {
+  g_true_frequency_cycles_per_buffer = FREQ_LO;
+  g_simulation_paused = false;
+  g_auto_sweep_enabled = true;
+  g_animation_phase_radians = 0.0f;
 }
 
 /* ===================================================================== */
@@ -935,138 +929,144 @@ static void scene_reset(void)
  *  Five numbered steps that match the ALGORITHM IN STEPS section
  *  of the MENTAL MODEL block.
  */
-static void scene_tick(void)
-{
-    if (g_simulation_paused) return;
+static void scene_tick(void) {
+  if (g_simulation_paused)
+    return;
 
-    /* ── Step 1.  auto-sweep frequency ──────────────────────────
-     * sin gives smooth there-and-back motion between FREQ_LO and
-     * FREQ_HI.  Sweep covers below + above Nyquist + above sample
-     * rate so the demo shows multiple folds. */
-    if (g_auto_sweep_enabled) {
-        g_animation_phase_radians +=
-            2.0f * (float)M_PI / (float)SWEEP_PERIOD_FRAMES;
-        if (g_animation_phase_radians > 2.0f * (float)M_PI)
-            g_animation_phase_radians -= 2.0f * (float)M_PI;
-        float s = (sinf(g_animation_phase_radians) + 1.0f) * 0.5f;
-        g_true_frequency_cycles_per_buffer =
-            FREQ_LO + s * (FREQ_HI - FREQ_LO);
-    }
+  /* ── Step 1.  auto-sweep frequency ──────────────────────────
+   * sin gives smooth there-and-back motion between FREQ_LO and
+   * FREQ_HI.  Sweep covers below + above Nyquist + above sample
+   * rate so the demo shows multiple folds. */
+  if (g_auto_sweep_enabled) {
+    g_animation_phase_radians +=
+        2.0f * (float)M_PI / (float)SWEEP_PERIOD_FRAMES;
+    if (g_animation_phase_radians > 2.0f * (float)M_PI)
+      g_animation_phase_radians -= 2.0f * (float)M_PI;
+    float s = (sinf(g_animation_phase_radians) + 1.0f) * 0.5f;
+    g_true_frequency_cycles_per_buffer = FREQ_LO + s * (FREQ_HI - FREQ_LO);
+  }
 
-    /* ── Step 2.  generate "continuous" signal (ground truth) ── */
-    generate_continuous_signal(g_true_frequency_cycles_per_buffer);
+  /* ── Step 2.  generate "continuous" signal (ground truth) ── */
+  generate_continuous_signal(g_true_frequency_cycles_per_buffer);
 
-    /* ── Step 3.  generate sampled signal (the ADC output) ──── */
-    generate_sampled_signal(g_true_frequency_cycles_per_buffer);
+  /* ── Step 3.  generate sampled signal (the ADC output) ──── */
+  generate_sampled_signal(g_true_frequency_cycles_per_buffer);
 
-    /* ── Step 4.  compute the aliased frequency for the HUD ── */
-    g_aliased_frequency_cycles_per_buffer =
-        aliased_frequency(g_true_frequency_cycles_per_buffer,
-                          (float)N);
+  /* ── Step 4.  compute the aliased frequency for the HUD ── */
+  g_aliased_frequency_cycles_per_buffer =
+      aliased_frequency(g_true_frequency_cycles_per_buffer, (float)N);
 
-    /* (Step 5 — render — happens in the main loop after this.) */
+  /* (Step 5 — render — happens in the main loop after this.) */
 }
 
 /* ===================================================================== */
 /* §9  scene_input — handle keys                                         */
 /* ===================================================================== */
 
-static void scene_adjust_freq(float delta)
-{
-    /* No-op while auto-sweep is on; otherwise clamp to [FREQ_LO, FREQ_HI]. */
-    if (g_auto_sweep_enabled) return;
-    g_true_frequency_cycles_per_buffer += delta;
-    if (g_true_frequency_cycles_per_buffer < FREQ_LO)
-        g_true_frequency_cycles_per_buffer = FREQ_LO;
-    if (g_true_frequency_cycles_per_buffer > FREQ_HI)
-        g_true_frequency_cycles_per_buffer = FREQ_HI;
+static void scene_adjust_freq(float delta) {
+  /* No-op while auto-sweep is on; otherwise clamp to [FREQ_LO, FREQ_HI]. */
+  if (g_auto_sweep_enabled)
+    return;
+  g_true_frequency_cycles_per_buffer += delta;
+  if (g_true_frequency_cycles_per_buffer < FREQ_LO)
+    g_true_frequency_cycles_per_buffer = FREQ_LO;
+  if (g_true_frequency_cycles_per_buffer > FREQ_HI)
+    g_true_frequency_cycles_per_buffer = FREQ_HI;
 }
 
 /* ===================================================================== */
 /* §10  draw_continuous — top panel renderer                             */
 /* ===================================================================== */
 
-static void draw_continuous_panel(int top_row, int height_rows)
-{
-    /*
-     * Draw the high-res continuous signal as ONE column per cell.
-     * For each terminal column c we pick the closest sub-sample
-     * and use its value as the bar height.  Positive grows up
-     * from the midline, negative grows down.
-     */
-    int half_height = height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = top_row + half_height;
+static void draw_continuous_panel(int top_row, int height_rows) {
+  /*
+   * Draw the high-res continuous signal as ONE column per cell.
+   * For each terminal column c we pick the closest sub-sample
+   * and use its value as the bar height.  Positive grows up
+   * from the midline, negative grows down.
+   */
+  int half_height = height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = top_row + half_height;
 
-    for (int c = 0; c < COLS; c++) {
-        /* Map column c to a sub-sample index.  At HIGH_RES_FACTOR=8
-         * and N=32, HIGH_RES_N = 256.  COLS varies; we pick the
-         * sub-sample closest to fraction c/COLS of the buffer. */
-        int idx = (int)((float)c / (float)COLS * (float)HIGH_RES_N);
-        if (idx < 0) idx = 0;
-        if (idx >= HIGH_RES_N) idx = HIGH_RES_N - 1;
-        float v   = g_continuous[idx];
-        bool  pos = (v >= 0.0f);
-        int   h   = (int)(fabsf(v) * (float)half_height + 0.5f);
+  for (int c = 0; c < COLS; c++) {
+    /* Map column c to a sub-sample index.  At HIGH_RES_FACTOR=8
+     * and N=32, HIGH_RES_N = 256.  COLS varies; we pick the
+     * sub-sample closest to fraction c/COLS of the buffer. */
+    int idx = (int)((float)c / (float)COLS * (float)HIGH_RES_N);
+    if (idx < 0)
+      idx = 0;
+    if (idx >= HIGH_RES_N)
+      idx = HIGH_RES_N - 1;
+    float v = g_continuous[idx];
+    bool pos = (v >= 0.0f);
+    int h = (int)(fabsf(v) * (float)half_height + 0.5f);
 
-        attron(COLOR_PAIR(PAIR_CONTINUOUS) | A_BOLD);
-        for (int dy = 0; dy < h; dy++) {
-            int row = pos ? (midline_row - dy) : (midline_row + dy + 1);
-            if (row < 0 || row >= LINES) continue;
-            mvaddch(row, c, pos ? '|' : '.');
-        }
-        attroff(COLOR_PAIR(PAIR_CONTINUOUS) | A_BOLD);
+    attron(COLOR_PAIR(PAIR_CONTINUOUS) | A_BOLD);
+    for (int dy = 0; dy < h; dy++) {
+      int row = pos ? (midline_row - dy) : (midline_row + dy + 1);
+      if (row < 0 || row >= LINES)
+        continue;
+      mvaddch(row, c, pos ? '|' : '.');
     }
+    attroff(COLOR_PAIR(PAIR_CONTINUOUS) | A_BOLD);
+  }
 }
 
 /* ===================================================================== */
 /* §11  draw_ghost — ghost overlay helper                                */
 /* ===================================================================== */
 
-static void draw_ghost_at_column(int col, int midline_row, int half_height)
-{
-    /* Draw one cell of the faint ghost (continuous signal) at the
-     * given column.  Used by the sampled panel as a comparison
-     * reference. */
-    int idx = (int)((float)col / (float)COLS * (float)HIGH_RES_N);
-    if (idx < 0 || idx >= HIGH_RES_N) return;
-    float v = g_continuous[idx];
-    int   row = midline_row - (int)(v * (float)half_height + 0.5f);
-    if (row >= 0 && row < LINES) {
-        attron(COLOR_PAIR(PAIR_GHOST));
-        mvaddch(row, col, '.');
-        attroff(COLOR_PAIR(PAIR_GHOST));
-    }
+static void draw_ghost_at_column(int col, int midline_row, int half_height) {
+  /* Draw one cell of the faint ghost (continuous signal) at the
+   * given column.  Used by the sampled panel as a comparison
+   * reference. */
+  int idx = (int)((float)col / (float)COLS * (float)HIGH_RES_N);
+  if (idx < 0 || idx >= HIGH_RES_N)
+    return;
+  float v = g_continuous[idx];
+  int row = midline_row - (int)(v * (float)half_height + 0.5f);
+  if (row >= 0 && row < LINES) {
+    attron(COLOR_PAIR(PAIR_GHOST));
+    mvaddch(row, col, '.');
+    attroff(COLOR_PAIR(PAIR_GHOST));
+  }
 }
 
 /* ===================================================================== */
 /* §12  draw_recon — Bresenham segment helper                            */
 /* ===================================================================== */
 
-static void draw_recon_segment(int col0, int row0, int col1, int row1)
-{
-    /* Bresenham line segment between (col0, row0) and (col1, row1).
-     * Used to draw the linear-interpolation reconstruction of the
-     * sampled signal — the "what you'd reconstruct from samples"
-     * version, drawn as connecting line segments. */
-    int dx = abs(col1 - col0), dy = abs(row1 - row0);
-    int sx = col0 < col1 ? 1 : -1, sy = row0 < row1 ? 1 : -1;
-    int err = dx - dy;
-    attron(COLOR_PAIR(PAIR_RECON) | A_BOLD);
-    for (;;) {
-        if (col0 >= 0 && col0 < COLS && row0 >= 0 && row0 < LINES) {
-            int   e2 = 2 * err;
-            bool  bx = e2 > -dy, by = e2 < dx;
-            chtype ch = (bx && by) ? (sx == sy ? '\\' : '/')
-                       : bx ? '-' : '|';
-            mvaddch(row0, col0, ch);
-        }
-        if (col0 == col1 && row0 == row1) break;
-        int e2 = 2 * err;
-        if (e2 > -dy) { err -= dy; col0 += sx; }
-        if (e2 <  dx) { err += dx; row0 += sy; }
+static void draw_recon_segment(int col0, int row0, int col1, int row1) {
+  /* Bresenham line segment between (col0, row0) and (col1, row1).
+   * Used to draw the linear-interpolation reconstruction of the
+   * sampled signal — the "what you'd reconstruct from samples"
+   * version, drawn as connecting line segments. */
+  int dx = abs(col1 - col0), dy = abs(row1 - row0);
+  int sx = col0 < col1 ? 1 : -1, sy = row0 < row1 ? 1 : -1;
+  int err = dx - dy;
+  attron(COLOR_PAIR(PAIR_RECON) | A_BOLD);
+  for (;;) {
+    if (col0 >= 0 && col0 < COLS && row0 >= 0 && row0 < LINES) {
+      int e2 = 2 * err;
+      bool bx = e2 > -dy, by = e2 < dx;
+      chtype ch = (bx && by) ? (sx == sy ? '\\' : '/') : bx ? '-' : '|';
+      mvaddch(row0, col0, ch);
     }
-    attroff(COLOR_PAIR(PAIR_RECON) | A_BOLD);
+    if (col0 == col1 && row0 == row1)
+      break;
+    int e2 = 2 * err;
+    if (e2 > -dy) {
+      err -= dy;
+      col0 += sx;
+    }
+    if (e2 < dx) {
+      err += dx;
+      row0 += sy;
+    }
+  }
+  attroff(COLOR_PAIR(PAIR_RECON) | A_BOLD);
 }
 
 /* ===================================================================== */
@@ -1080,44 +1080,45 @@ static void draw_recon_segment(int col0, int row0, int col1, int row1)
  *    Layer 3.  Bright yellow MARKERS at the sample positions
  *              (the actual data the digital system has).
  */
-static void draw_sampled_panel(int top_row, int height_rows)
-{
-    int half_height = height_rows / 2;
-    if (half_height < 1) half_height = 1;
-    int midline_row = top_row + half_height;
+static void draw_sampled_panel(int top_row, int height_rows) {
+  int half_height = height_rows / 2;
+  if (half_height < 1)
+    half_height = 1;
+  int midline_row = top_row + half_height;
 
-    /* Layer 1.  Faint continuous ghost (every 2nd column). */
-    for (int c = 0; c < COLS; c += 2)
-        draw_ghost_at_column(c, midline_row, half_height);
+  /* Layer 1.  Faint continuous ghost (every 2nd column). */
+  for (int c = 0; c < COLS; c += 2)
+    draw_ghost_at_column(c, midline_row, half_height);
 
-    /* Layer 2.  Linear-interpolation reconstruction line segments
-     * between consecutive samples.  Pre-compute all sample
-     * positions, then draw N-1 segments. */
-    int sample_columns[N];
-    int sample_rows[N];
-    for (int n = 0; n < N; n++) {
-        sample_columns[n] = (int)(((float)n + 0.5f) / (float)N
-                                  * (float)COLS);
-        if (sample_columns[n] < 0) sample_columns[n] = 0;
-        if (sample_columns[n] >= COLS) sample_columns[n] = COLS - 1;
-        sample_rows[n] = midline_row
-                       - (int)(g_sampled[n] * (float)half_height + 0.5f);
-    }
-    for (int n = 0; n + 1 < N; n++) {
-        draw_recon_segment(sample_columns[n], sample_rows[n],
-                           sample_columns[n + 1], sample_rows[n + 1]);
-    }
+  /* Layer 2.  Linear-interpolation reconstruction line segments
+   * between consecutive samples.  Pre-compute all sample
+   * positions, then draw N-1 segments. */
+  int sample_columns[N];
+  int sample_rows[N];
+  for (int n = 0; n < N; n++) {
+    sample_columns[n] = (int)(((float)n + 0.5f) / (float)N * (float)COLS);
+    if (sample_columns[n] < 0)
+      sample_columns[n] = 0;
+    if (sample_columns[n] >= COLS)
+      sample_columns[n] = COLS - 1;
+    sample_rows[n] =
+        midline_row - (int)(g_sampled[n] * (float)half_height + 0.5f);
+  }
+  for (int n = 0; n + 1 < N; n++) {
+    draw_recon_segment(sample_columns[n], sample_rows[n], sample_columns[n + 1],
+                       sample_rows[n + 1]);
+  }
 
-    /* Layer 3.  Bright sample markers on top of the lines. */
-    for (int n = 0; n < N; n++) {
-        int col = sample_columns[n];
-        int row = sample_rows[n];
-        if (row >= 0 && row < LINES && col >= 0 && col < COLS) {
-            attron(COLOR_PAIR(PAIR_SAMPLE) | A_BOLD);
-            mvaddch(row, col, '*');
-            attroff(COLOR_PAIR(PAIR_SAMPLE) | A_BOLD);
-        }
+  /* Layer 3.  Bright sample markers on top of the lines. */
+  for (int n = 0; n < N; n++) {
+    int col = sample_columns[n];
+    int row = sample_rows[n];
+    if (row >= 0 && row < LINES && col >= 0 && col < COLS) {
+      attron(COLOR_PAIR(PAIR_SAMPLE) | A_BOLD);
+      mvaddch(row, col, '*');
+      attroff(COLOR_PAIR(PAIR_SAMPLE) | A_BOLD);
     }
+  }
 }
 
 /* ===================================================================== */
@@ -1136,240 +1137,266 @@ static void draw_sampled_panel(int top_row, int height_rows)
  *        precise readings when in manual mode.
  */
 
-static void draw_foldback_overlay(void)
-{
-    if (!g_show_foldback_overlay) return;
-    int x = 2, y = 2;
-    if (y + 8 >= LINES - 1) return;
+static void draw_foldback_overlay(void) {
+  if (!g_show_foldback_overlay)
+    return;
+  int x = 2, y = 2;
+  if (y + 8 >= LINES - 1)
+    return;
 
-    float true_f = g_true_frequency_cycles_per_buffer;
-    float fs     = (float)N;
-    float f_mod  = fmodf(fabsf(true_f), fs);
-    bool  folded = (f_mod > fs * 0.5f);
-    float alias  = folded ? (fs - f_mod) : f_mod;
+  float true_f = g_true_frequency_cycles_per_buffer;
+  float fs = (float)N;
+  float f_mod = fmodf(fabsf(true_f), fs);
+  bool folded = (f_mod > fs * 0.5f);
+  float alias = folded ? (fs - f_mod) : f_mod;
 
-    attron(COLOR_PAIR(PAIR_HINT));
-    mvprintw(y, x, "Fold-back arithmetic for true_f = %.2f:", (double)true_f);
-    attroff(COLOR_PAIR(PAIR_HINT));
+  attron(COLOR_PAIR(PAIR_HINT));
+  mvprintw(y, x, "Fold-back arithmetic for true_f = %.2f:", (double)true_f);
+  attroff(COLOR_PAIR(PAIR_HINT));
 
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(y + 1, x, "  Step 1:  f_mod = %.2f mod %.0f = %.2f",
-             (double)fabsf(true_f), (double)fs, (double)f_mod);
-    if (folded) {
-        mvprintw(y + 2, x,
-                 "  Step 2:  f_mod (%.2f) > fs/2 (%.0f), so:",
-                 (double)f_mod, (double)(fs * 0.5f));
-        mvprintw(y + 3, x,
-                 "           alias = %.0f - %.2f = %.2f",
-                 (double)fs, (double)f_mod, (double)alias);
-    } else {
-        mvprintw(y + 2, x,
-                 "  Step 2:  f_mod (%.2f) <= fs/2 (%.0f), so:",
-                 (double)f_mod, (double)(fs * 0.5f));
-        mvprintw(y + 3, x,
-                 "           alias = f_mod = %.2f",
-                 (double)alias);
-    }
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(y + 1, x, "  Step 1:  f_mod = %.2f mod %.0f = %.2f",
+           (double)fabsf(true_f), (double)fs, (double)f_mod);
+  if (folded) {
+    mvprintw(y + 2, x,
+             "  Step 2:  f_mod (%.2f) > fs/2 (%.0f), so:", (double)f_mod,
+             (double)(fs * 0.5f));
+    mvprintw(y + 3, x, "           alias = %.0f - %.2f = %.2f", (double)fs,
+             (double)f_mod, (double)alias);
+  } else {
+    mvprintw(y + 2, x,
+             "  Step 2:  f_mod (%.2f) <= fs/2 (%.0f), so:", (double)f_mod,
+             (double)(fs * 0.5f));
+    mvprintw(y + 3, x, "           alias = f_mod = %.2f", (double)alias);
+  }
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    attron(COLOR_PAIR(folded ? PAIR_NYQUIST : PAIR_RECON) | A_BOLD);
-    mvprintw(y + 5, x, "  → Apparent frequency: %.2f cycles/buffer",
-             (double)alias);
-    if (folded)
-        mvprintw(y + 6, x, "  → ALIASED (true content lost)");
-    else
-        mvprintw(y + 6, x, "  → Faithful (below Nyquist)");
-    attroff(COLOR_PAIR(folded ? PAIR_NYQUIST : PAIR_RECON) | A_BOLD);
+  attron(COLOR_PAIR(folded ? PAIR_NYQUIST : PAIR_RECON) | A_BOLD);
+  mvprintw(y + 5, x, "  → Apparent frequency: %.2f cycles/buffer",
+           (double)alias);
+  if (folded)
+    mvprintw(y + 6, x, "  → ALIASED (true content lost)");
+  else
+    mvprintw(y + 6, x, "  → Faithful (below Nyquist)");
+  attroff(COLOR_PAIR(folded ? PAIR_NYQUIST : PAIR_RECON) | A_BOLD);
 }
 
-static void draw_frequency_table(void)
-{
-    if (!g_show_frequency_table) return;
-    /* Push table down if the fold-back overlay is on so they don't
-     * collide. */
-    int x = 2, y = 2;
-    if (g_show_foldback_overlay) y += 8;
-    if (y + 6 >= LINES - 1) return;
+static void draw_frequency_table(void) {
+  if (!g_show_frequency_table)
+    return;
+  /* Push table down if the fold-back overlay is on so they don't
+   * collide. */
+  int x = 2, y = 2;
+  if (g_show_foldback_overlay)
+    y += 8;
+  if (y + 6 >= LINES - 1)
+    return;
 
-    float fs           = (float)N;
-    float nyquist      = fs * 0.5f;
-    float true_f       = g_true_frequency_cycles_per_buffer;
-    float alias_f      = g_aliased_frequency_cycles_per_buffer;
-    float true_norm    = true_f / fs;     /* cycles per sample */
-    float alias_norm   = alias_f / fs;
+  float fs = (float)N;
+  float nyquist = fs * 0.5f;
+  float true_f = g_true_frequency_cycles_per_buffer;
+  float alias_f = g_aliased_frequency_cycles_per_buffer;
+  float true_norm = true_f / fs; /* cycles per sample */
+  float alias_norm = alias_f / fs;
 
-    attron(COLOR_PAIR(PAIR_HINT));
-    mvprintw(y, x, "Frequency table:");
-    attroff(COLOR_PAIR(PAIR_HINT));
+  attron(COLOR_PAIR(PAIR_HINT));
+  mvprintw(y, x, "Frequency table:");
+  attroff(COLOR_PAIR(PAIR_HINT));
 
-    attron(COLOR_PAIR(PAIR_CONTINUOUS) | A_BOLD);
-    mvprintw(y + 1, x, "  sample rate fs       %6.2f cyc/buf  (= N)", (double)fs);
-    mvprintw(y + 2, x, "  Nyquist limit fs/2   %6.2f cyc/buf", (double)nyquist);
-    mvprintw(y + 3, x, "  true frequency       %6.2f cyc/buf  (= %.4f cyc/sample)",
-             (double)true_f, (double)true_norm);
-    mvprintw(y + 4, x, "  alias frequency      %6.2f cyc/buf  (= %.4f cyc/sample)",
-             (double)alias_f, (double)alias_norm);
-    attroff(COLOR_PAIR(PAIR_CONTINUOUS) | A_BOLD);
+  attron(COLOR_PAIR(PAIR_CONTINUOUS) | A_BOLD);
+  mvprintw(y + 1, x, "  sample rate fs       %6.2f cyc/buf  (= N)", (double)fs);
+  mvprintw(y + 2, x, "  Nyquist limit fs/2   %6.2f cyc/buf", (double)nyquist);
+  mvprintw(y + 3, x,
+           "  true frequency       %6.2f cyc/buf  (= %.4f cyc/sample)",
+           (double)true_f, (double)true_norm);
+  mvprintw(y + 4, x,
+           "  alias frequency      %6.2f cyc/buf  (= %.4f cyc/sample)",
+           (double)alias_f, (double)alias_norm);
+  attroff(COLOR_PAIR(PAIR_CONTINUOUS) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §15  hud — status + hint + paused chip + frame composer               */
 /* ===================================================================== */
 
-static void draw_hud(void)
-{
-    char status[200];
-    bool above_nyquist = (g_true_frequency_cycles_per_buffer
-                          > (float)N * 0.5f + 1e-3f);
-    bool at_nyquist    = (fabsf(g_true_frequency_cycles_per_buffer
-                              - (float)N * 0.5f) < 0.01f);
+static void draw_hud(void) {
+  char status[200];
+  bool above_nyquist =
+      (g_true_frequency_cycles_per_buffer > (float)N * 0.5f + 1e-3f);
+  bool at_nyquist =
+      (fabsf(g_true_frequency_cycles_per_buffer - (float)N * 0.5f) < 0.01f);
 
-    const char *status_label =
-        at_nyquist    ? "AT NYQUIST"
-        : above_nyquist ? "ALIASED   "
-        :                 "BELOW NYQ ";
+  const char *status_label = at_nyquist      ? "AT NYQUIST"
+                             : above_nyquist ? "ALIASED   "
+                                             : "BELOW NYQ ";
 
-    snprintf(status, sizeof status,
-             " Aliasing  N=%d  fs/2=%.1f  true_f=%5.2f  alias_f=%5.2f  %s  %s  %s ",
-             N, (double)((float)N * 0.5f),
-             (double)g_true_frequency_cycles_per_buffer,
-             (double)g_aliased_frequency_cycles_per_buffer,
-             status_label,
-             g_auto_sweep_enabled ? "AUTO  " : "MANUAL",
-             g_simulation_paused  ? "PAUSED" : "      ");
-    int x = COLS - (int)strlen(status);
-    if (x < 0) x = 0;
-    int pair = above_nyquist ? PAIR_NYQUIST : PAIR_HUD;
-    attron(COLOR_PAIR(pair) | A_BOLD);
-    mvprintw(0, x, "%s", status);
-    attroff(COLOR_PAIR(pair) | A_BOLD);
+  snprintf(
+      status, sizeof status,
+      " Aliasing  N=%d  fs/2=%.1f  true_f=%5.2f  alias_f=%5.2f  %s  %s  %s ", N,
+      (double)((float)N * 0.5f), (double)g_true_frequency_cycles_per_buffer,
+      (double)g_aliased_frequency_cycles_per_buffer, status_label,
+      g_auto_sweep_enabled ? "AUTO  " : "MANUAL",
+      g_simulation_paused ? "PAUSED" : "      ");
+  int x = COLS - (int)strlen(status);
+  if (x < 0)
+    x = 0;
+  int pair = above_nyquist ? PAIR_NYQUIST : PAIR_HUD;
+  attron(COLOR_PAIR(pair) | A_BOLD);
+  mvprintw(0, x, "%s", status);
+  attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
-static void draw_hint(void)
-{
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(LINES - 1, 0,
-             " q:quit  spc:pause  a:auto/manual  +/-:freq  ,/.:fine "
-             " d:foldback  D:table  r:reset ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void draw_hint(void) {
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(LINES - 1, 0,
+           " q:quit  spc:pause  a:auto/manual  +/-:freq  ,/.:fine "
+           " d:foldback  D:table  r:reset ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void render_frame(void)
-{
-    erase();
+static void render_frame(void) {
+  erase();
 
-    /* Layout: 1 hud + 2 labels + 2 panels + 1 hint = 4 reserved.
-     * Split rest evenly into 2 panels. */
-    int rows_for_panels = LINES - 4;
-    if (rows_for_panels < 8) rows_for_panels = 8;
-    int top_h    = rows_for_panels / 2;
-    int bottom_h = rows_for_panels - top_h;
+  /* Layout: 1 hud + 2 labels + 2 panels + 1 hint = 4 reserved.
+   * Split rest evenly into 2 panels. */
+  int rows_for_panels = LINES - 4;
+  if (rows_for_panels < 8)
+    rows_for_panels = 8;
+  int top_h = rows_for_panels / 2;
+  int bottom_h = rows_for_panels - top_h;
 
-    int top_label_row    = 1;
-    int top_panel_top    = 2;
-    int bottom_label_row = 2 + top_h;
-    int bottom_panel_top = 3 + top_h;
+  int top_label_row = 1;
+  int top_panel_top = 2;
+  int bottom_label_row = 2 + top_h;
+  int bottom_panel_top = 3 + top_h;
 
-    /* Panel labels. */
-    attron(COLOR_PAIR(PAIR_LABEL));
-    mvprintw(top_label_row, 0,
-             "Continuous signal x(t)  (the truth)");
-    mvprintw(bottom_label_row, 0,
-             "Sampled at fs=%d   '*'=sample point  green=reconstruction  "
-             "grey=true ghost", N);
-    attroff(COLOR_PAIR(PAIR_LABEL));
+  /* Panel labels. */
+  attron(COLOR_PAIR(PAIR_LABEL));
+  mvprintw(top_label_row, 0, "Continuous signal x(t)  (the truth)");
+  mvprintw(bottom_label_row, 0,
+           "Sampled at fs=%d   '*'=sample point  green=reconstruction  "
+           "grey=true ghost",
+           N);
+  attroff(COLOR_PAIR(PAIR_LABEL));
 
-    draw_continuous_panel(top_panel_top, top_h);
-    draw_sampled_panel(bottom_panel_top, bottom_h);
+  draw_continuous_panel(top_panel_top, top_h);
+  draw_sampled_panel(bottom_panel_top, bottom_h);
 
-    /* Debug overlays (drawn over panels but under HUD). */
-    draw_foldback_overlay();
-    draw_frequency_table();
+  /* Debug overlays (drawn over panels but under HUD). */
+  draw_foldback_overlay();
+  draw_frequency_table();
 
-    /* HUD always last. */
-    draw_hud();
-    draw_hint();
+  /* HUD always last. */
+  draw_hud();
+  draw_hint();
 
-    wnoutrefresh(stdscr);
-    doupdate();
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §16  app — signal handlers + main loop + key dispatch                 */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_should_quit    = 0;
+static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
 
-static void on_signal(int sig)
-{
-    if (sig == SIGWINCH) g_resize_pending = 1;
-    else                 g_should_quit    = 1;
+static void on_signal(int sig) {
+  if (sig == SIGWINCH)
+    g_resize_pending = 1;
+  else
+    g_should_quit = 1;
 }
 
 static void cleanup_screen(void) { endwin(); }
 
-static bool app_handle_key(int ch)
-{
-    switch (ch) {
-        case 'q': case 'Q': case 27:  return true;
-        case ' ':                     g_simulation_paused = !g_simulation_paused; break;
-        case 'a': case 'A':           g_auto_sweep_enabled = !g_auto_sweep_enabled; break;
-        case '+': case '=':           scene_adjust_freq(+0.5f); break;
-        case '-':                     scene_adjust_freq(-0.5f); break;
-        case '.':                     scene_adjust_freq(+0.1f); break;
-        case ',':                     scene_adjust_freq(-0.1f); break;
-        case 'd':                     g_show_foldback_overlay = !g_show_foldback_overlay; break;
-        case 'D':                     g_show_frequency_table  = !g_show_frequency_table;  break;
-        case 'r': case 'R':           scene_reset(); break;
-        default: break;
-    }
-    return false;
+static bool app_handle_key(int ch) {
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return true;
+  case ' ':
+    g_simulation_paused = !g_simulation_paused;
+    break;
+  case 'a':
+  case 'A':
+    g_auto_sweep_enabled = !g_auto_sweep_enabled;
+    break;
+  case '+':
+  case '=':
+    scene_adjust_freq(+0.5f);
+    break;
+  case '-':
+    scene_adjust_freq(-0.5f);
+    break;
+  case '.':
+    scene_adjust_freq(+0.1f);
+    break;
+  case ',':
+    scene_adjust_freq(-0.1f);
+    break;
+  case 'd':
+    g_show_foldback_overlay = !g_show_foldback_overlay;
+    break;
+  case 'D':
+    g_show_frequency_table = !g_show_frequency_table;
+    break;
+  case 'r':
+  case 'R':
+    scene_reset();
+    break;
+  default:
+    break;
+  }
+  return false;
 }
 
-int main(void)
-{
-    atexit(cleanup_screen);
-    signal(SIGINT,   on_signal);
-    signal(SIGTERM,  on_signal);
-    signal(SIGWINCH, on_signal);
+int main(void) {
+  atexit(cleanup_screen);
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGWINCH, on_signal);
 
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    colors_init();
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  colors_init();
 
-    scene_reset();
+  scene_reset();
 
-    long long next_frame_ns = clock_now_ns();
+  long long next_frame_ns = clock_now_ns();
 
-    while (!g_should_quit) {
-        if (g_resize_pending) {
-            g_resize_pending = 0;
-            endwin();
-            refresh();
-        }
-
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (app_handle_key(ch)) { g_should_quit = 1; break; }
-        }
-
-        long long now = clock_now_ns();
-        if (now >= next_frame_ns) {
-            scene_tick();
-            render_frame();
-            next_frame_ns += RENDER_TICK_NS;
-            if (clock_now_ns() > next_frame_ns + 5 * RENDER_TICK_NS)
-                next_frame_ns = clock_now_ns() + RENDER_TICK_NS;
-        } else {
-            clock_sleep_ns(next_frame_ns - now);
-        }
+  while (!g_should_quit) {
+    if (g_resize_pending) {
+      g_resize_pending = 0;
+      endwin();
+      refresh();
     }
 
-    return 0;
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (app_handle_key(ch)) {
+        g_should_quit = 1;
+        break;
+      }
+    }
+
+    long long now = clock_now_ns();
+    if (now >= next_frame_ns) {
+      scene_tick();
+      render_frame();
+      next_frame_ns += RENDER_TICK_NS;
+      if (clock_now_ns() > next_frame_ns + 5 * RENDER_TICK_NS)
+        next_frame_ns = clock_now_ns() + RENDER_TICK_NS;
+    } else {
+      clock_sleep_ns(next_frame_ns - now);
+    }
+  }
+
+  return 0;
 }

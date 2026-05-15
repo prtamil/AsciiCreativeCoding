@@ -10,3 +10,5 @@ particle_systems/
 
  We are learning not refactoring. make it count
  
+
+ physics/cloth.c next

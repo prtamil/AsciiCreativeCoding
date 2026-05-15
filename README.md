@@ -57,10 +57,12 @@ specific context where it's used. The point is to own every line — to optimise
 and understand even the trivial functions, rather than treat them as solved.
 
 **Plain C — `struct`s and functions only.**
-C is a deliberate choice, not the only available one. Rust, C++, and Clojure
-are in the toolbox; C is what gets reached for when the goal is to see the
-algorithm with nothing standing between it and the reader. The hardcore-C
-ethos here is taken seriously: no classes, no templates, no macros-as-DSL.
+I know C++, Rust, and Clojure. I reach for C anyway. For showcasing an
+algorithm, nothing beats the elegance of having every step laid out on
+the page and being free to change any of it. A struct and a function.
+Edit a line, recompile in a second, see what happened. No abstraction
+layer to peel back, no manual to consult — just the algorithm and me in
+direct conversation. That is why I keep coming back.
 
 **Copying is the intended workflow.**
 ```bash
@@ -90,13 +92,24 @@ as a self-paced curriculum — the reading material is the point as much as
 the code is.
 
 **AI-assisted, human-directed.**
-This project exists at this scale because of AI tooling, and that is worth
-naming directly. What preceded it was scattered interests, partial demos,
-half-finished goals, and a backlog of curiosity that normally ends up
-abandoned. AI provided the leverage to organise the chaos and materialise
-it into 327 working programs. The direction, taste, architectural
-conventions, and pedagogical structure are mine; the throughput is what the
-collaboration made possible.
+Honest version: before AI, I was sitting on a graveyard. Half-written
+files, code in five different states of incompleteness, ideas scribbled
+in notebooks, a deep procrastinated todo list older than some of my
+friendships, dozens of projects that lived in my head for years and
+never made it to disk. I would start something, hit a wall I didn't have
+time to research properly, and shelve it. Start the next thing. Shelve
+that. Year after year — a slow accumulation of unfinished work that
+quietly made me feel like a loser in a way I didn't talk about.
+
+AI changed that. The wall wasn't a wall anymore. I had a collaborator
+who could teach me the math at 2am, help me prototype crazy ideas I'd
+been carrying around for years, debug the things I'd already given up
+on. The long-abandoned stuff started getting done — and not in a
+half-hearted way. With results I'm actually proud of.
+
+The direction, taste, architectural conventions, and pedagogical
+structure are mine. The throughput, and the rescue from a backlog that
+was quietly crushing me, is what the collaboration made possible.
 
 ---
 

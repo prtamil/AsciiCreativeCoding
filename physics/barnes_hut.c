@@ -7,8 +7,14 @@
  *   if  s / d  <  θ  →  treat node as a single point mass
  *   else             →  recurse into children
  *
- * Rendering: a brightness glow layer (decays over time) + direct body
- * glyphs drawn on top, coloured by speed.  Bodies are ALWAYS visible.
+ * Rendering: layered for depth.  An additive brightness buffer captures
+ * Bresenham streaks along each body's orbit arc and decays at 0.93/frame,
+ * so paths persist as glowing trails.  Per-body glyphs sit on top,
+ * coloured by speed with two glyph variants per band so the cloud reads
+ * as textured rather than stencilled.  The central black hole pulses
+ * with a sin() phase and is wreathed in a small aspect-corrected
+ * accretion halo, so the mass anchor visibly acts the part.  Seven
+ * themes recolour everything without touching the physics (t / T).
  *
  * Framework: follows framework.c §1–§8 skeleton.
  *
@@ -45,7 +51,8 @@
  *   p / space pause / resume
  *   r         reset current preset
  *   1 / 2 / 3 select preset
- *   t / T     theme next / prev
+ *   t / T     theme next / prev (7 themes: Galaxy / Nebula / Fire / Ice /
+ *                                 Mono / Aurora / Plasma)
  *   o         toggle quadtree overlay
  *   f         toggle fast-forward (4× speed)
  *   + / -     add / remove bodies (±50)
@@ -81,6 +88,34 @@
  *                  force evaluations vs 400² / 2 = 80000 for brute force.
  *                  QT_MAX_DEPTH=32 caps recursion; NODE_POOL_MAX=16000 supports
  *                  up to 800 bodies in a well-distributed quadtree.
+ *
+ * References     : 1. Barnes, J. & Hut, P. — "A hierarchical O(N log N)
+ *                     force-calculation algorithm", Nature 324, pp. 446-
+ *                     449 (1986).  The original paper.  Defines the
+ *                     s/d < θ opening criterion the §6 quadtree
+ *                     implements; θ = 0.5 is the value Barnes & Hut
+ *                     recommended for general-purpose accuracy.
+ *                  2. Aarseth, S. J. — "Gravitational N-Body Simulations:
+ *                     Tools and Algorithms", Cambridge Univ. Press (2003).
+ *                     Comprehensive textbook on N-body methods: softening
+ *                     (our ε² in F = G·m·M/(d²+ε²)^(3/2)), time integration,
+ *                     tree-code variants, energy diagnostics.
+ *                  3. Binney, J. & Tremaine, S. — "Galactic Dynamics",
+ *                     2nd ed., Princeton Univ. Press (2008).  The
+ *                     galactic-dynamics standard.  Keplerian orbits,
+ *                     virial theorem, spiral-structure formation through
+ *                     differential rotation — directly justifies the
+ *                     setup of all three presets (galaxy / cluster / binary).
+ *                  4. Foley, J. D.; van Dam, A.; Feiner, S. K.; Hughes,
+ *                     J. F. — "Computer Graphics: Principles and Practice",
+ *                     3rd ed., Addison-Wesley (2013).  Ch. 2 covers
+ *                     Bresenham's line algorithm, used by streak_glow()
+ *                     to lay orbit arcs into the brightness buffer.
+ *                  5. Ware, C. — "Information Visualization: Perception
+ *                     for Design", 4th ed., Morgan Kaufmann (2020).
+ *                     Perceptually-ordered colour and luminance ramps —
+ *                     backs the 5-level brightness palette (CP_L1..CP_L5)
+ *                     and the per-band glyph density ramp '.:*o@'.
  * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
@@ -119,7 +154,7 @@ enum {
     GRID_COLS_MAX    = 400,
 
     N_PRESETS        = 3,
-    N_THEMES         = 5,
+    N_THEMES         = 7,
 };
 
 #define NS_PER_SEC      1000000000LL
@@ -172,14 +207,15 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 enum {
-    CP_HUD  = 1,
-    CP_L1   = 2,   /* dim  — slow/far glow     */
+    CP_HUD  = 1,   /* top status bar (bright yellow)         */
+    CP_L1   = 2,   /* dim  — slow/far glow                   */
     CP_L2   = 3,
     CP_L3   = 4,
     CP_L4   = 5,
-    CP_L5   = 6,   /* bright — fast/dense      */
+    CP_L5   = 6,   /* bright — fast/dense                    */
     CP_TREE = 7,
-    CP_BH   = 8,   /* central black hole       */
+    CP_BH   = 8,   /* central black hole                     */
+    CP_HINT = 9,   /* bottom hint bar (bright cyan)          */
 };
 
 typedef struct {
@@ -213,15 +249,27 @@ static const Theme k_themes[N_THEMES] = {
     },
     {   /* Ice — blues/cyans */
         "Ice",
-        { 17, 27, 39, 75, 159 },
+        { 24, 31, 39, 75, 159 },
         { COLOR_BLUE, COLOR_BLUE, COLOR_CYAN, COLOR_CYAN, COLOR_WHITE },
-        237, COLOR_CYAN, 201, COLOR_MAGENTA,
+        244, COLOR_CYAN, 201, COLOR_MAGENTA,
     },
     {   /* Mono — grays */
         "Mono",
-        { 235, 238, 242, 246, 252 },
+        { 240, 244, 247, 250, 254 },
         { COLOR_BLACK, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE },
-        234, COLOR_WHITE, 231, COLOR_WHITE,
+        242, COLOR_WHITE, 231, COLOR_WHITE,
+    },
+    {   /* Aurora — green -> cyan -> white, magenta anchor */
+        "Aurora",
+        { 28, 36, 49, 87, 159 },
+        { COLOR_GREEN, COLOR_GREEN, COLOR_CYAN, COLOR_CYAN, COLOR_WHITE },
+        244, COLOR_GREEN, 201, COLOR_MAGENTA,
+    },
+    {   /* Plasma — purple -> pink -> yellow, cyan anchor */
+        "Plasma",
+        { 53, 92, 165, 213, 226 },
+        { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_YELLOW, COLOR_WHITE },
+        240, COLOR_MAGENTA, 51, COLOR_CYAN,
     },
 };
 
@@ -231,13 +279,15 @@ static void color_init(int theme)
     use_default_colors();
     const Theme *th = &k_themes[theme];
     if (COLORS >= 256) {
-        init_pair(CP_HUD,  231,          -1);
+        init_pair(CP_HUD,  226,          -1);   /* bright yellow */
+        init_pair(CP_HINT,  51,          -1);   /* bright cyan   */
         init_pair(CP_TREE, th->tree256,  -1);
         init_pair(CP_BH,   th->bh256,    -1);
         for (int i = 0; i < 5; i++)
             init_pair(CP_L1 + i, th->hi256[i], -1);
     } else {
-        init_pair(CP_HUD,  COLOR_WHITE,  -1);
+        init_pair(CP_HUD,  COLOR_YELLOW, -1);
+        init_pair(CP_HINT, COLOR_CYAN,   -1);
         init_pair(CP_TREE, th->tree8,    -1);
         init_pair(CP_BH,   th->bh8,      -1);
         for (int i = 0; i < 5; i++)
@@ -265,18 +315,67 @@ static inline int px_to_cell_y(float py)
 /* §5  entity — Body                                                      */
 /* ===================================================================== */
 
+/*
+ * Body — one gravitational mass point in the N-body system.
+ *
+ * Lifecycle:
+ *   - created by a preset (preset_galaxy / preset_cluster / preset_binary)
+ *   - integrated each sim tick by scene_tick() unless anchor=true
+ *   - may be deactivated if it escapes far outside the view bounds
+ *   - rendered each draw frame in scene_draw()
+ *
+ * Why pixel-space (not cell-space) positions:
+ *   The integrator advances positions smoothly between cells at sub-cell
+ *   precision so orbits look continuous. px_to_cell_x/y rounds to a
+ *   character cell only at render time. Storing px/py in cells would
+ *   discretise every motion to integer steps — slow bodies would appear
+ *   stationary for many frames, fast bodies would teleport.
+ *
+ * Why prev_px / prev_py:
+ *   scene_tick snapshots the pre-step position into these before
+ *   advancing px/py. streak_glow() then draws a Bresenham line from
+ *   (prev_*, prev_*) to (px, py) into the brightness buffer, so fast
+ *   bodies leave visible orbit arcs instead of flickering trails of
+ *   isolated cells. Without this, a body moving 4 cells/frame would
+ *   skip 3 cells between draws.
+ *
+ * Why both active and anchor flags (and not just one):
+ *   active=false bodies are skipped entirely by both integrator and
+ *   renderer; used to remove escapees (positions beyond an extended
+ *   bound) cheaply without reallocating arrays.
+ *   anchor=true bodies stay active and visible but skip force
+ *   integration — they never move regardless of net force. Models a
+ *   central black hole that is much heavier than the disk and (in our
+ *   approximation) fixed at the centre. Galaxy preset uses one anchor;
+ *   cluster and binary use none.
+ *
+ * Integration scheme — symplectic Euler:
+ *   v += a · dt   (kick)
+ *   x += v · dt   (drift)
+ *   Symplectic schemes conserve a "shadow" Hamiltonian over long runs,
+ *   so total energy stays bounded indefinitely — critical for galaxy
+ *   stability over the thousands of ticks a long-running disc needs.
+ *
+ * Algorithm refs (header [n]):
+ *   Softened gravity   F = G·mᵢ·M/(d²+ε²)^(3/2)   — Aarseth §2.4 [2]
+ *   Symplectic Euler                              — Aarseth §2.2 [2]
+ *   Keplerian initial conditions (galaxy preset)  — Binney&Tremaine §3.1 [3]
+ *   Cold-collapse virialisation (cluster preset)  — Binney&Tremaine §8.5.4 [3]
+ */
 typedef struct {
-    float px, py;
-    float vx, vy;
-    float mass;
-    bool  active;
-    bool  anchor;   /* true = skip force integration (central BH) */
+    float px, py;             /* current position, pixel space             */
+    float prev_px, prev_py;   /* position one sim step ago — for streak    */
+    float vx, vy;              /* current velocity, pixel-units/sim-second  */
+    float mass;                /* gravitational mass; 1.0 for ordinary
+                                * bodies, ≫1 for the central anchor        */
+    bool  active;              /* false = removed (escapee or unused slot)  */
+    bool  anchor;              /* true = skip force integration entirely    */
 } Body;
 
-static Body  g_bodies[N_BODIES_MAX];
-static int   g_n_bodies  = N_BODIES_DEF;
-static float g_G         = G_DEF;
-static float g_v_max     = 1.0f;   /* rolling max speed for color mapping */
+/* Body instances live in the §7 Scene struct (defined just below in
+ * §6 for forward-declaration reasons). The deterministic RNG state
+ * below is kept at file scope so the rng_*() pure utilities don't
+ * need a Scene*. */
 
 /* Simple LCG */
 static uint32_t g_rng = 12345u;
@@ -288,22 +387,163 @@ static float    rng_range(float lo, float hi) { return lo + rng_f() * (hi - lo);
 /* §6  quadtree                                                           */
 /* ===================================================================== */
 
+/*
+ * QNode — one node of the Barnes–Hut quadtree.
+ *
+ * Why a tree at all:
+ *   Direct N-body force evaluation is O(N²): for N=400 that's 80 000
+ *   pair computations per tick.  Barnes & Hut (1986) showed that a
+ *   hierarchical spatial decomposition lets you approximate the
+ *   gravitational influence of distant body clusters as a single point
+ *   mass at their centre of mass, dropping the cost to O(N log N).
+ *
+ * Why quadtree specifically:
+ *   We simulate in 2-D, so a quadtree (2-D space → 4 children per node)
+ *   is the right shape.  3-D would use an octree with 8 children; the
+ *   algorithm structure is identical.
+ *
+ * Node anatomy:
+ *   x0, y0, x1, y1     Axis-aligned bounding box in pixel space.
+ *                      Side length s = (x1 - x0) — the size used by
+ *                      the BH opening criterion s/d < θ.
+ *   total_mass         Σ mass of every body inside this subtree.
+ *                      Updated incrementally during qt_insert so we
+ *                      avoid a separate aggregation pass.
+ *   cx, cy             Centre of mass of every body inside the subtree:
+ *                        cx = Σ(mᵢ · pxᵢ) / Σ mᵢ
+ *                        cy = Σ(mᵢ · pyᵢ) / Σ mᵢ
+ *                      Also incremental — qt_insert does one weighted
+ *                      average per inserted body.
+ *   child[4]           Quadrant children: NW=0, NE=1, SW=2, SE=3.
+ *                      -1 in any slot means "no body in that quadrant".
+ *                      Leaves have all four slots = -1 (no children);
+ *                      internal nodes have at least one ≥ 0.
+ *   body_idx           ≥0 only for a leaf containing exactly one body
+ *                      (the index into scene.bodies[]). -1 for empty leaves
+ *                      and for all internal nodes. When a second body
+ *                      arrives at a single-body leaf, qt_insert pushes
+ *                      the resident body into a subdivided quadrant and
+ *                      sets body_idx = -1.
+ *   depth              Distance from the root (root = 0). Used to cap
+ *                      recursion at QT_MAX_DEPTH so that two bodies at
+ *                      numerically-identical positions don't subdivide
+ *                      forever.
+ *
+ * Force evaluation — the Barnes–Hut opening criterion (see qt_force):
+ *
+ *     s = x1 - x0         (this node's side length)
+ *     d = |p_body − COM|  (distance from query body to node COM)
+ *
+ *     if s / d < θ:
+ *         treat node as a single point mass at (cx, cy)
+ *         contribute F = G · m_body · total_mass / (d² + ε²)^(3/2)
+ *     else:
+ *         recurse into the four children
+ *
+ *   θ = 0.5 is Barnes & Hut's recommended value — small enough for
+ *   ~1% RMS force error on a typical body distribution, large enough
+ *   to keep the cost near O(N log N) in practice.  Smaller θ → more
+ *   accurate, more expensive; θ = 0 → exact O(N²) brute force.
+ *
+ * Pool allocation:
+ *   Every node lives in a static pool scene.pool[NODE_POOL_MAX]; qt_alloc()
+ *   bumps an integer (no malloc/free in the hot path).  The whole tree
+ *   is rebuilt every sim tick from scene.pool_top = 0; building from scratch
+ *   is cheap and avoids the bookkeeping of incremental tree updates.
+ *
+ * Algorithm refs (header [n]):
+ *   The original tree-code paper            — Barnes & Hut (1986) [1]
+ *   Practical tree-code performance / θ     — Aarseth §6.2 [2]
+ *   Incremental COM update                  — Aarseth §6.2 [2]
+ */
 typedef struct {
-    float x0, y0, x1, y1;
-    float total_mass, cx, cy;
-    int   child[4];   /* NW=0, NE=1, SW=2, SE=3; -1 = absent */
-    int   body_idx;   /* ≥0 if leaf with one body, else -1    */
-    int   depth;
+    float x0, y0, x1, y1;     /* bounding box, pixel space             */
+    float total_mass;          /* Σ mass of all bodies in this subtree  */
+    float cx, cy;              /* centre of mass of all bodies below    */
+    int   child[4];            /* NW=0, NE=1, SW=2, SE=3; -1 = absent   */
+    int   body_idx;            /* ≥0 if leaf with one body, else -1     */
+    int   depth;               /* distance from root, capped at QT_MAX  */
 } QNode;
 
-static QNode g_pool[NODE_POOL_MAX];
-static int   g_pool_top = 0;
+/* ─────────────────────────────────────────────────────────────────────── *
+ * Scene — all state that persists between scene_tick() and scene_draw().
+ *
+ * Defined here (rather than in §7 with the scene_* functions) because §6
+ * quadtree functions below reference scene.pool / scene.pool_top, so the
+ * Scene type and instance must exist before they're used.  All scene_*
+ * functions and presets that follow in §7 use this same `scene` global.
+ *
+ * Fields are split into two clearly-labelled groups:
+ *
+ *   Simulation params — advanced by scene_tick(); mutated only by
+ *     physics-affecting input (pause / preset / reset / +/- bodies /
+ *     g/G gravity / f fast-forward).
+ *
+ *   Rendering params  — read by scene_draw() and the HUD; do NOT alter
+ *     physics in any way.  A theme change or overlay toggle drawn
+ *     against the same Scene must produce identical body positions,
+ *     velocities, and tree structure.
+ *
+ * Locality rationale:
+ *   The split between sim and render fields exists for the READER, not
+ *   the CPU.  A new sim flag accidentally placed in the rendering block
+ *   would silently couple physics to display state — exactly the bug
+ *   the separation prevents.  Future changes know which side to land on.
+ *
+ * One global instance (`static Scene scene`):
+ *   The struct is large (Bodies + QNode pool + brightness grid ≈ 760 KB)
+ *   so it lives in .bss as a single file-static, accessed as
+ *   `scene.<field>` throughout.
+ *
+ * State kept OUTSIDE this struct (intentionally):
+ *   g_rng     deterministic RNG state used by rng_*().  Kept separate
+ *             so the pure-utility rng helpers don't need a Scene*.
+ *   g_resize  signal-handler flag; must be a file-static volatile
+ *             sig_atomic_t for async-signal safety.
+ * ─────────────────────────────────────────────────────────────────────── */
+typedef struct {
+    /* ── Simulation parameters ─────────────────────────────────── */
+    Body  bodies[N_BODIES_MAX];   /* all body slots (active + inactive) */
+    int   n_bodies;               /* current body count (+/- adjustable) */
+    float G;                       /* gravitational constant (g/G keys)  */
+    bool  paused;                  /* if true, scene_tick is a no-op     */
+    int   preset;                  /* index into preset_* dispatch       */
+    bool  fastfwd;                 /* 4× sim time per render frame       */
+    float sim_dt;                  /* fixed-timestep (sim seconds)       */
+
+    /* Quadtree scratch — rebuilt from pool_top=0 every sim tick. */
+    QNode pool[NODE_POOL_MAX];     /* pre-allocated node pool            */
+    int   pool_top;                /* bump pointer into pool[]           */
+    int   qt_root;                 /* root index into pool[]             */
+
+    /* ── Rendering parameters ──────────────────────────────────── */
+    float bright[GRID_ROWS_MAX][GRID_COLS_MAX];   /* additive glow buffer
+                                                   * (streaks + body
+                                                   * deposits + halo;
+                                                   * decays 0.93/frame) */
+    float bright_max;              /* EMA-smoothed max for colour norm   */
+    float v_max;                   /* rolling max speed for colour bands;
+                                    * tracked from physics, used only by
+                                    * the renderer for colour mapping    */
+    int   theme;                   /* index into k_themes[] (§3)         */
+    bool  overlay;                 /* draw quadtree on top               */
+    int   frame_tick;              /* monotonic counter; drives BH pulse
+                                    * and accretion-halo phase           */
+} Scene;
+
+static Scene scene = {
+    .n_bodies   = N_BODIES_DEF,
+    .G          = G_DEF,
+    .sim_dt     = 1.0f / (float)SIM_HZ,
+    .bright_max = 1.0f,
+    .v_max      = 1.0f,
+};
 
 static int qt_alloc(float x0, float y0, float x1, float y1, int depth)
 {
-    if (g_pool_top >= NODE_POOL_MAX) return -1;
-    int idx = g_pool_top++;
-    QNode *n = &g_pool[idx];
+    if (scene.pool_top >= NODE_POOL_MAX) return -1;
+    int idx = scene.pool_top++;
+    QNode *n = &scene.pool[idx];
     n->x0 = x0; n->y0 = y0; n->x1 = x1; n->y1 = y1;
     n->total_mass = 0.0f; n->cx = 0.0f; n->cy = 0.0f;
     n->child[0] = n->child[1] = n->child[2] = n->child[3] = -1;
@@ -332,8 +572,8 @@ static void qt_subdivide(QNode *n)
 static void qt_insert(int ni, int bi)
 {
     if (ni < 0) return;
-    QNode *n = &g_pool[ni];
-    Body  *b = &g_bodies[bi];
+    QNode *n = &scene.pool[ni];
+    Body  *b = &scene.bodies[bi];
 
     /* Incremental COM update */
     float new_mass = n->total_mass + b->mass;
@@ -353,7 +593,7 @@ static void qt_insert(int ni, int bi)
         int existing = n->body_idx;
         n->body_idx = -1;
         qt_subdivide(n);
-        int q = qt_quadrant(n, g_bodies[existing].px, g_bodies[existing].py);
+        int q = qt_quadrant(n, scene.bodies[existing].px, scene.bodies[existing].py);
         qt_insert(n->child[q], existing);
     } else if (n->child[0] < 0) {
         qt_subdivide(n);
@@ -364,21 +604,21 @@ static void qt_insert(int ni, int bi)
 
 static int qt_build(int cols, int rows)
 {
-    g_pool_top = 0;
+    scene.pool_top = 0;
     int root = qt_alloc(0.0f, 0.0f, (float)pw(cols), (float)ph(rows), 0);
-    for (int i = 0; i < g_n_bodies; i++)
-        if (g_bodies[i].active) qt_insert(root, i);
+    for (int i = 0; i < scene.n_bodies; i++)
+        if (scene.bodies[i].active) qt_insert(root, i);
     return root;
 }
 
 static void qt_force(int ni, int bi, float *fx, float *fy)
 {
     if (ni < 0) return;
-    QNode *n = &g_pool[ni];
+    QNode *n = &scene.pool[ni];
     if (n->total_mass == 0.0f) return;
     if (n->body_idx == bi) return;   /* skip self at leaf */
 
-    Body  *b  = &g_bodies[bi];
+    Body  *b  = &scene.bodies[bi];
     float  dx = n->cx - b->px;
     float  dy = n->cy - b->py;
     float  d2 = dx*dx + dy*dy + SOFT2;
@@ -386,7 +626,7 @@ static void qt_force(int ni, int bi, float *fx, float *fy)
     float  s  = n->x1 - n->x0;
 
     if ((s / d) < THETA_DEF || n->child[0] < 0) {
-        float inv = g_G * n->total_mass / (d2 * d);
+        float inv = scene.G * n->total_mass / (d2 * d);
         *fx += inv * dx * b->mass;
         *fy += inv * dy * b->mass;
         return;
@@ -399,7 +639,7 @@ static void qt_force(int ni, int bi, float *fx, float *fy)
 static void qt_draw_overlay(int ni, int rows, int cols)
 {
     if (ni < 0) return;
-    QNode *n = &g_pool[ni];
+    QNode *n = &scene.pool[ni];
     if (n->total_mass == 0.0f || n->depth > 3) return;
 
     int cx0 = px_to_cell_x(n->x0), cx1 = px_to_cell_x(n->x1);
@@ -409,88 +649,135 @@ static void qt_draw_overlay(int ni, int rows, int cols)
 
     if ((cx1 - cx0) < 2 || (cy1 - cy0) < 2) return;
 
-    attron(COLOR_PAIR(CP_TREE));
+    attron(COLOR_PAIR(CP_TREE) | A_DIM);
     for (int c = cx0+1; c < cx1 && c < cols; c++)
-        if (myc >= 0 && myc < rows) mvaddch(myc, c, ACS_HLINE);
+        if (myc >= 0 && myc < rows) mvaddch(myc, c, '-');
     for (int r = cy0+1; r < cy1 && r < rows; r++)
-        if (mxc >= 0 && mxc < cols) mvaddch(r, mxc, ACS_VLINE);
+        if (mxc >= 0 && mxc < cols) mvaddch(r, mxc, '|');
     if (myc >= 0 && myc < rows && mxc >= 0 && mxc < cols)
-        mvaddch(myc, mxc, ACS_PLUS);
-    attroff(COLOR_PAIR(CP_TREE));
+        mvaddch(myc, mxc, '+');
+    attroff(COLOR_PAIR(CP_TREE) | A_DIM);
 
     for (int c = 0; c < 4; c++)
         qt_draw_overlay(n->child[c], rows, cols);
 }
 
 /* ===================================================================== */
-/* §7  scene                                                              */
+/* §7  scene — state that spans across ticks and frames                   */
 /* ===================================================================== */
 
-static float g_bright[GRID_ROWS_MAX][GRID_COLS_MAX];
-static bool  g_paused   = false;
-static bool  g_overlay  = false;
-static bool  g_fastfwd  = false;
-static int   g_preset   = 0;
-static int   g_theme    = 0;
-static float g_sim_dt   = 1.0f / (float)SIM_HZ;
-static int   g_qt_root  = 0;
+/* The Scene struct is defined in §6 (just after QNode) because the
+ * quadtree functions above reference scene.pool.  The presets and the
+ * scene_* functions below all operate on the same `scene` instance. */
 
 /* ── Presets ─────────────────────────────────────────────────────────── */
 
 /*
  * Preset 1 — Galaxy
  *
- * Body 0 = central black hole (anchor, mass = N×BH_MASS_FACTOR).
- * Remaining bodies in Keplerian circular orbits: v = sqrt(G·M_bh / r).
- * Differential rotation (inner orbits faster) shears the disk and
- * spontaneously generates spiral structure over a few orbital periods.
+ * Body 0 = central black hole (anchor, mass = N × BH_MASS_FACTOR).
+ * Remaining bodies on Keplerian circular orbits: v = √(G · M_bh / r).
+ * Differential rotation (inner orbits faster than outer) shears the
+ * disk into spontaneous spiral structure over a few orbital periods.
+ *
+ * Pseudocode:
+ *   compute disk geometry (centre, radius, M_bh)
+ *   spawn the central black hole at body 0
+ *   for each remaining body i:
+ *       spawn one Keplerian orbiter at a uniform-area random radius
  */
+
+/* Place a stationary anchor body of mass M at (cx, cy). Anchor means
+ * the integrator will skip it — see Body.anchor field. */
+static void spawn_central_bh(int idx, float cx, float cy, float M)
+{
+    scene.bodies[idx].px     = cx;
+    scene.bodies[idx].py     = cy;
+    scene.bodies[idx].vx     = 0.0f;
+    scene.bodies[idx].vy     = 0.0f;
+    scene.bodies[idx].mass   = M;
+    scene.bodies[idx].active = true;
+    scene.bodies[idx].anchor = true;
+}
+
+/*
+ * sample_disk_radius_uniform_area — sample a radius r in [r_min·R, R]
+ * such that the resulting points distribute UNIFORMLY by area (not by
+ * radius). Picking r linearly would concentrate bodies near the centre
+ * because the circle area at radius r grows as 2πr — equal-radius
+ * shells have unequal area. The √(u) inverse-CDF gives equal area
+ * per body, so the rendered disk looks uniformly dense.
+ *
+ * Mathematically:
+ *   PDF over r ∝ r   (area weight)
+ *   CDF: F(r) = (r/R)²
+ *   Inverse: r = R · √u  where u ~ U(0,1)
+ * We additionally clamp away from the very centre (0.08·R) so bodies
+ * don't spawn inside the BH.
+ */
+static float sample_disk_radius_uniform_area(float R)
+{
+    return R * (0.08f + 0.92f * sqrtf(rng_f()));
+}
+
+/*
+ * spawn_keplerian_body — place body idx at a random point on a disk of
+ * radius R around (cx, cy), with a velocity that produces a circular
+ * orbit around a central point mass M_bh.
+ *
+ *   v_kep = √(G · M_bh / r)         (Keplerian circular velocity)
+ *   direction: tangent to the radial vector, CCW
+ *   small ±6% scatter on |v| → slightly elliptical orbits so the disk
+ *   looks dynamically rich rather than perfectly regular.
+ *
+ * Algorithm refs (header [n]):
+ *   Keplerian initial conditions    — Binney & Tremaine §3.1 [3]
+ *   Inverse-CDF sampling             — standard MC technique
+ */
+static void spawn_keplerian_body(int idx, float cx, float cy, float R, float M_bh)
+{
+    float r     = sample_disk_radius_uniform_area(R);
+    float theta = rng_f() * 2.0f * (float)M_PI;
+
+    float bx = cx + cosf(theta) * r;
+    float by = cy + sinf(theta) * r;
+
+    float v_kep = sqrtf(scene.G * M_bh / r);
+    float v     = v_kep * (1.0f + rng_range(-0.06f, 0.06f));
+
+    /* Unit tangent: perpendicular to radius, CCW (cross product with +z) */
+    float tx = -(by - cy) / r;
+    float ty =  (bx - cx) / r;
+
+    scene.bodies[idx].px     = bx;
+    scene.bodies[idx].py     = by;
+    scene.bodies[idx].vx     = tx * v;
+    scene.bodies[idx].vy     = ty * v;
+    scene.bodies[idx].mass   = 1.0f;
+    scene.bodies[idx].active = true;
+    scene.bodies[idx].anchor = false;
+}
+
 static void preset_galaxy(int cols, int rows)
 {
-    float cx = (float)pw(cols) * 0.5f;
-    float cy = (float)ph(rows) * 0.5f;
-
-    /* Choose disk radius to fit in the smaller screen dimension */
-    float half = (float)(pw(cols) < ph(rows) ? pw(cols) : ph(rows)) * 0.5f;
+    /* 1. Disk geometry: centred on screen, radius fits the shorter axis. */
+    float cx   = (float)pw(cols) * 0.5f;
+    float cy   = (float)ph(rows) * 0.5f;
+    float half = (float)pw(cols);
+    if (ph(rows) < pw(cols)) half = (float)ph(rows);
+    half *= 0.5f;
     float R    = half * 0.75f;
 
-    float M_bh = (float)g_n_bodies * BH_MASS_FACTOR;
+    /* 2. Central black hole mass scales with body count so the
+     *    orbital periods stay roughly constant across +/- presses. */
+    float M_bh = (float)scene.n_bodies * BH_MASS_FACTOR;
 
-    /* Body 0 = central black hole (anchor — very heavy, not integrated) */
-    g_bodies[0].px     = cx;
-    g_bodies[0].py     = cy;
-    g_bodies[0].vx     = 0.0f;
-    g_bodies[0].vy     = 0.0f;
-    g_bodies[0].mass   = M_bh;
-    g_bodies[0].active = true;
-    g_bodies[0].anchor = true;
+    /* 3. Spawn the anchor at body 0. */
+    spawn_central_bh(0, cx, cy, M_bh);
 
-    /* Disk bodies: uniform area distribution */
-    for (int i = 1; i < g_n_bodies; i++) {
-        /* sqrt gives uniform area density */
-        float r     = R * (0.08f + 0.92f * sqrtf(rng_f()));
-        float theta = rng_f() * 2.0f * (float)M_PI;
-
-        float bx = cx + cosf(theta) * r;
-        float by = cy + sinf(theta) * r;   /* circles in pixel space */
-
-        /* Keplerian velocity: v = sqrt(G * M_bh / r) */
-        float v_kep = sqrtf(g_G * M_bh / r);
-        /* Small scatter keeps orbits slightly elliptical — more interesting */
-        float v = v_kep * (1.0f + rng_range(-0.06f, 0.06f));
-
-        /* Tangential direction (perpendicular to radius, CCW) */
-        float nx = -(by - cy) / r;
-        float ny =  (bx - cx) / r;
-
-        g_bodies[i].px     = bx;
-        g_bodies[i].py     = by;
-        g_bodies[i].vx     = nx * v;
-        g_bodies[i].vy     = ny * v;
-        g_bodies[i].mass   = 1.0f;
-        g_bodies[i].active = true;
-        g_bodies[i].anchor = false;
-    }
+    /* 4. Spawn N-1 disk orbiters with Keplerian velocities. */
+    for (int i = 1; i < scene.n_bodies; i++)
+        spawn_keplerian_body(i, cx, cy, R, M_bh);
 }
 
 /*
@@ -508,10 +795,10 @@ static void preset_cluster(int cols, int rows)
     float R  = (float)(pw(cols) < ph(rows) ? pw(cols) : ph(rows)) * 0.28f;
 
     /* Slight spin so it doesn't just collapse to a point */
-    float M_tot = (float)g_n_bodies;
-    float v_spin = sqrtf(g_G * M_tot / R) * 0.12f;   /* 12% of virial speed */
+    float M_tot = (float)scene.n_bodies;
+    float v_spin = sqrtf(scene.G * M_tot / R) * 0.12f;   /* 12% of virial speed */
 
-    for (int i = 0; i < g_n_bodies; i++) {
+    for (int i = 0; i < scene.n_bodies; i++) {
         float r     = R * sqrtf(rng_f());
         float theta = rng_f() * 2.0f * (float)M_PI;
         float bx    = cx + cosf(theta) * r;
@@ -521,13 +808,13 @@ static void preset_cluster(int cols, int rows)
         float nx = -(by - cy) / (r + 1.0f);
         float ny =  (bx - cx) / (r + 1.0f);
 
-        g_bodies[i].px     = bx;
-        g_bodies[i].py     = by;
-        g_bodies[i].vx     = nx * v_spin;
-        g_bodies[i].vy     = ny * v_spin;
-        g_bodies[i].mass   = 1.0f;
-        g_bodies[i].active = true;
-        g_bodies[i].anchor = false;
+        scene.bodies[i].px     = bx;
+        scene.bodies[i].py     = by;
+        scene.bodies[i].vx     = nx * v_spin;
+        scene.bodies[i].vy     = ny * v_spin;
+        scene.bodies[i].mass   = 1.0f;
+        scene.bodies[i].active = true;
+        scene.bodies[i].anchor = false;
     }
 }
 
@@ -544,14 +831,14 @@ static void preset_binary(int cols, int rows)
     float R  = (float)(pw(cols) < ph(rows) ? pw(cols) : ph(rows)) * 0.18f;
     float sep = R * 2.4f;
 
-    int half = g_n_bodies / 2;
+    int half = scene.n_bodies / 2;
 
     /* Approach velocity: clusters meet in ~5 seconds at default SIM_HZ */
     float approach = sep / (5.0f * (float)SIM_HZ);
 
     /* Internal spin speed */
     float M_half  = (float)half;
-    float v_spin  = sqrtf(g_G * M_half / R) * 0.35f;
+    float v_spin  = sqrtf(scene.G * M_half / R) * 0.35f;
 
     for (int k = 0; k < 2; k++) {
         float ox = cx + (k == 0 ? -sep : sep);
@@ -560,7 +847,7 @@ static void preset_binary(int cols, int rows)
         float spin_dir = (k == 0 ? 1.0f : -1.0f);   /* counter-rotate */
 
         int start = k * half;
-        int end   = (k == 1) ? g_n_bodies : half;
+        int end   = (k == 1) ? scene.n_bodies : half;
 
         for (int i = start; i < end; i++) {
             float r     = R * sqrtf(rng_f());
@@ -570,191 +857,424 @@ static void preset_binary(int cols, int rows)
             float nx    = -(by - oy) / (r + 1.0f);
             float ny    =  (bx - ox) / (r + 1.0f);
 
-            g_bodies[i].px     = bx;
-            g_bodies[i].py     = by;
-            g_bodies[i].vx     = vx_drift + spin_dir * nx * v_spin;
-            g_bodies[i].vy     = spin_dir * ny * v_spin;
-            g_bodies[i].mass   = 1.0f;
-            g_bodies[i].active = true;
-            g_bodies[i].anchor = false;
+            scene.bodies[i].px     = bx;
+            scene.bodies[i].py     = by;
+            scene.bodies[i].vx     = vx_drift + spin_dir * nx * v_spin;
+            scene.bodies[i].vy     = spin_dir * ny * v_spin;
+            scene.bodies[i].mass   = 1.0f;
+            scene.bodies[i].active = true;
+            scene.bodies[i].anchor = false;
         }
     }
 }
 
 static void scene_reset(int cols, int rows)
 {
-    memset(g_bright, 0, sizeof(g_bright));
-    memset(g_bodies, 0, sizeof(Body) * N_BODIES_MAX);
-    g_v_max = 1.0f;
+    memset(scene.bright, 0, sizeof(scene.bright));
+    memset(scene.bodies, 0, sizeof(Body) * N_BODIES_MAX);
+    scene.v_max = 1.0f;
     g_rng   = 99991u;
 
-    switch (g_preset) {
+    switch (scene.preset) {
         case 0: preset_galaxy (cols, rows); break;
         case 1: preset_cluster(cols, rows); break;
         case 2: preset_binary (cols, rows); break;
+    }
+
+    /* Initialise prev position to current so the first frame draws a
+     * single point per body, not a streak from (0,0). */
+    for (int i = 0; i < scene.n_bodies; i++) {
+        scene.bodies[i].prev_px = scene.bodies[i].px;
+        scene.bodies[i].prev_py = scene.bodies[i].py;
     }
 }
 
 /* ── scene_tick ──────────────────────────────────────────────────────── */
 
+/*
+ * rebuild_force_tree — fresh O(N log N) Barnes–Hut tree over the active
+ * bodies. The tree is thrown away and rebuilt every sim step (no
+ * incremental updates) because that is cheaper than maintaining
+ * positions inside a long-lived tree.
+ */
+static void rebuild_force_tree(int cols, int rows)
+{
+    scene.qt_root = qt_build(cols, rows);
+}
+
+/*
+ * mark_inactive_if_escaped — bodies that have wandered far beyond the
+ * visible region cannot meaningfully participate in the scene any more.
+ * Setting active=false makes the integrator and renderer skip them on
+ * subsequent ticks, which keeps the per-frame cost bounded.
+ *
+ * The slack zone (2× width horizontally, 3× height vertically) gives
+ * room for hyperbolic trajectories to swing past the edge and come
+ * back before we deactivate them.
+ */
+static void mark_inactive_if_escaped(Body *b, float W, float H)
+{
+    if (b->px < -W       || b->px > 2.0f * W) b->active = false;
+    if (b->py < -H * 2.0f || b->py > 3.0f * H) b->active = false;
+}
+
+/*
+ * integrate_body_symplectic_euler — one sim step for body i.
+ *
+ *   v += (F / m) · dt     (kick)
+ *   x += v          · dt  (drift)
+ *
+ * Symplectic Euler conserves a "shadow" Hamiltonian over long runs so
+ * orbital energy stays bounded — important for galaxy stability over
+ * the thousands of ticks a long-running disc accumulates.  Force is
+ * computed via the Barnes–Hut criterion in qt_force (§6).
+ *
+ * Side effects per call:
+ *   - snapshot pre-step position for the renderer's streak pass
+ *   - mark body inactive if it has escaped the slack zone
+ *   - update scene.v_max for colour-band normalisation
+ */
+static void integrate_body_symplectic_euler(int i, float W, float H)
+{
+    Body *b = &scene.bodies[i];
+    if (!b->active || b->anchor) return;
+
+    /* Snapshot pre-step position for streak rendering. */
+    b->prev_px = b->px;
+    b->prev_py = b->py;
+
+    /* Force from the Barnes–Hut tree (excludes self at leaf). */
+    float fx = 0.0f, fy = 0.0f;
+    qt_force(scene.qt_root, i, &fx, &fy);
+
+    /* Kick — accelerate from current force. */
+    float ax = fx / b->mass;
+    float ay = fy / b->mass;
+    b->vx += ax * scene.sim_dt;
+    b->vy += ay * scene.sim_dt;
+
+    /* Drift — advance position using the new velocity. */
+    b->px += b->vx * scene.sim_dt;
+    b->py += b->vy * scene.sim_dt;
+
+    mark_inactive_if_escaped(b, W, H);
+
+    /* Update rolling max speed for the renderer's colour bands. */
+    float spd = sqrtf(b->vx * b->vx + b->vy * b->vy);
+    if (spd > scene.v_max) scene.v_max = spd;
+}
+
+/*
+ * relax_speed_normalisation — slowly decay the rolling max speed so the
+ * colour scale tracks the CURRENT dynamics rather than the fastest body
+ * the simulation has ever produced (which would never come back down
+ * after a single hot transient).  Decay factor and floor are tuned so
+ * a galaxy disk settles within a few seconds.
+ */
+static void relax_speed_normalisation(void)
+{
+    scene.v_max *= 0.9995f;
+    if (scene.v_max < 0.1f) scene.v_max = 0.1f;
+}
+
+/* Top-level: one fixed-timestep simulation step. */
 static void scene_tick(int cols, int rows)
 {
-    g_qt_root = qt_build(cols, rows);
+    /* 1. Rebuild the Barnes–Hut force tree for this step. */
+    rebuild_force_tree(cols, rows);
 
+    /* 2. Advance every active, non-anchor body one symplectic Euler step. */
     float W = (float)pw(cols);
     float H = (float)ph(rows);
+    for (int i = 0; i < scene.n_bodies; i++)
+        integrate_body_symplectic_euler(i, W, H);
 
-    for (int i = 0; i < g_n_bodies; i++) {
-        if (!g_bodies[i].active || g_bodies[i].anchor) continue;
-
-        float fx = 0.0f, fy = 0.0f;
-        qt_force(g_qt_root, i, &fx, &fy);
-
-        float ax = fx / g_bodies[i].mass;
-        float ay = fy / g_bodies[i].mass;
-
-        g_bodies[i].vx += ax * g_sim_dt;
-        g_bodies[i].vy += ay * g_sim_dt;
-        g_bodies[i].px += g_bodies[i].vx * g_sim_dt;
-        g_bodies[i].py += g_bodies[i].vy * g_sim_dt;
-
-        /* Deactivate escapees */
-        if (g_bodies[i].px < -W      || g_bodies[i].px > 2.0f * W ||
-            g_bodies[i].py < -H * 2  || g_bodies[i].py > 3.0f * H)
-            g_bodies[i].active = false;
-
-        /* Track max speed for coloring */
-        float spd = sqrtf(g_bodies[i].vx*g_bodies[i].vx
-                        + g_bodies[i].vy*g_bodies[i].vy);
-        if (spd > g_v_max) g_v_max = spd;
-    }
-
-    /* Slowly decay v_max so colormap adapts to current dynamics */
-    g_v_max *= 0.9995f;
-    if (g_v_max < 0.1f) g_v_max = 0.1f;
+    /* 3. Adapt the colour normalisation toward current dynamics. */
+    relax_speed_normalisation();
 }
 
 /* ── scene_draw ──────────────────────────────────────────────────────── */
 
-static void scene_draw(int cols, int rows, float alpha)
+/*
+ * streak_glow — additive Bresenham line from (x0,y0) to (x1,y1) in
+ * pixel space, depositing `intensity` units of brightness into each
+ * cell the line passes through. Skips the endpoint so the body's own
+ * per-frame deposit isn't doubled. Hard cap on iterations prevents
+ * runaway streaks if a body's position jumped wildly (e.g. resize).
+ */
+static void streak_glow(float x0, float y0, float x1, float y1,
+                        float intensity, int rows, int cols)
 {
-    (void)alpha;
-
-    /* ── 1. Accumulate glow for this frame ───────────────────────────── */
-    for (int i = 0; i < g_n_bodies; i++) {
-        if (!g_bodies[i].active) continue;
-        int cr = px_to_cell_y(g_bodies[i].py);
-        int cc = px_to_cell_x(g_bodies[i].px);
-        if (cr >= 0 && cr < rows && cc >= 0 && cc < cols)
-            g_bright[cr][cc] += g_bodies[i].mass > 1.0f ? 4.0f : 1.0f;
+    int r0 = px_to_cell_y(y0), c0 = px_to_cell_x(x0);
+    int r1 = px_to_cell_y(y1), c1 = px_to_cell_x(x1);
+    int dr = abs(r1 - r0), dc = abs(c1 - c0);
+    int sr = -1; if (r0 < r1) sr = 1;
+    int sc = -1; if (c0 < c1) sc = 1;
+    int err = dr - dc;
+    for (int i = 0; i < 32; i++) {
+        if (r0 == r1 && c0 == c1) break;   /* endpoint = body draws there */
+        if (r0 >= 0 && r0 < rows && c0 >= 0 && c0 < cols)
+            scene.bright[r0][c0] += intensity;
+        int e2 = 2 * err;
+        if (e2 > -dc) { err -= dc; r0 += sr; }
+        if (e2 <  dr) { err += dr; c0 += sc; }
     }
+}
 
-    /* ── 2. Find max brightness for normalisation ────────────────────── */
-    float b_max = 1.0f;
+/*
+ * deposit_accretion_halo — bleed extra brightness into the cells around
+ * the anchor, aspect-corrected so the halo appears circular on the
+ * terminal grid (each row is ~2× as tall as wide, so column offsets
+ * count quarter-weight in the distance norm: d² = dr² + (dc/2)²).
+ *
+ * Intensity falls as 1 / (1 + d²) so the central cell is brightest and
+ * the halo fades by the edge. The pulse argument modulates total
+ * brightness with the BH's sinusoidal phase.
+ */
+static void deposit_accretion_halo(int cr, int cc, int rows, int cols, float pulse)
+{
+    for (int dr = -2; dr <= 2; dr++) {
+        for (int dc = -4; dc <= 4; dc++) {
+            if (dr == 0 && dc == 0) continue;
+            int rr = cr + dr;
+            int ccc = cc + dc;
+            if (rr < 0 || rr >= rows || ccc < 0 || ccc >= cols) continue;
+            float d2 = (float)(dr * dr) + (float)(dc * dc) * 0.25f;
+            scene.bright[rr][ccc] += 3.0f * pulse / (1.0f + d2);
+        }
+    }
+}
+
+/*
+ * accumulate_glow_field — for each active body, deposit brightness at
+ * its current cell plus a half-strength streak along its motion arc
+ * from prev → current (Bresenham, via streak_glow). The anchor instead
+ * gets an aspect-corrected accretion halo so it visibly pulls light.
+ *
+ * After this pass, scene.bright[][] holds the additive glow snapshot
+ * for the frame and is ready for normalisation + painting.
+ */
+static void accumulate_glow_field(int cols, int rows)
+{
+    float halo_pulse = 1.0f + 0.4f * sinf((float)scene.frame_tick * 0.18f);
+
+    for (int i = 0; i < scene.n_bodies; i++) {
+        Body *b = &scene.bodies[i];
+        if (!b->active) continue;
+
+        int cr = px_to_cell_y(b->py);
+        int cc = px_to_cell_x(b->px);
+        float deposit = 1.0f;
+        if (b->mass > 1.0f) deposit = 4.0f;   /* anchor brighter */
+
+        if (cr >= 0 && cr < rows && cc >= 0 && cc < cols)
+            scene.bright[cr][cc] += deposit;
+
+        if (b->anchor) {
+            deposit_accretion_halo(cr, cc, rows, cols, halo_pulse);
+        } else {
+            streak_glow(b->prev_px, b->prev_py, b->px, b->py,
+                        deposit * 0.5f, rows, cols);
+        }
+    }
+}
+
+/*
+ * update_brightness_norm — EMA-smooth the max of scene.bright[][] used
+ * for colour normalisation. Plain frame-by-frame max would let a single
+ * bright transient (close pass, flyby) rescale the whole field for ~30
+ * frames as the decay slowly chews it down. 85/15 mix adapts over ~7
+ * frames — fast enough to track real changes, slow enough to ignore
+ * spikes.
+ */
+static void update_brightness_norm(int cols, int rows)
+{
+    float frame_max = 1.0f;
     for (int r = 0; r < rows; r++)
         for (int c = 0; c < cols; c++)
-            if (g_bright[r][c] > b_max) b_max = g_bright[r][c];
+            if (scene.bright[r][c] > frame_max) frame_max = scene.bright[r][c];
+    scene.bright_max = scene.bright_max * 0.85f + frame_max * 0.15f;
+    if (scene.bright_max < 1.0f) scene.bright_max = 1.0f;
+}
 
-    /* ── 3. Render glow layer and decay ──────────────────────────────── */
-    static const char k_glow[] = ".:+oO";
+/*
+ * paint_glow_layer — render the brightness buffer to the screen, then
+ * apply the per-frame decay multiplier. Density ramp '.' → '@'; top
+ * two tiers get A_BOLD so hot cells punch through.
+ */
+static void paint_glow_layer(int cols, int rows)
+{
+    static const char k_glow[] = ".:*o@";
+    float b_max = scene.bright_max;
+
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
-            float b = g_bright[r][c];
-            g_bright[r][c] *= DECAY;
+            float b = scene.bright[r][c];
+            scene.bright[r][c] *= DECAY;
             if (b < 0.4f) continue;
+
             float norm = b / b_max;
             int   lvl  = (int)(norm * 4.9f);
             if (lvl > 4) lvl = 4;
-            int    pair = CP_L1 + lvl;
-            attr_t attr = COLOR_PAIR(pair);
+
+            attr_t attr = COLOR_PAIR(CP_L1 + lvl);
             if (lvl >= 3) attr |= A_BOLD;
             mvaddch(r, c, (chtype)k_glow[lvl] | attr);
         }
     }
+}
 
-    /* ── 4. Draw each body directly on top (always visible) ─────────── */
-    for (int i = 0; i < g_n_bodies; i++) {
-        if (!g_bodies[i].active) continue;
+/*
+ * paint_anchor_pulse — animated black-hole glyph. Phase from the same
+ * frame_tick × 0.18 sin() used for the halo, so the core compresses
+ * ('@') and brackets brighten in time with the halo's expansion, then
+ * relaxes ('*') with dimmed brackets.
+ */
+static void paint_anchor_pulse(int cr, int cc, int cols)
+{
+    float ph = sinf((float)scene.frame_tick * 0.18f);
 
-        int cr = px_to_cell_y(g_bodies[i].py);
-        int cc = px_to_cell_x(g_bodies[i].px);
+    chtype core_attr = COLOR_PAIR(CP_BH) | A_BOLD;
+    chtype edge_attr = COLOR_PAIR(CP_BH);
+    if      (ph >  0.6f) edge_attr |= A_BOLD;
+    else if (ph < -0.4f) edge_attr |= A_DIM;
+
+    char core = '*';
+    if (ph > 0.0f) core = '@';
+
+    mvaddch(cr, cc, (chtype)core | core_attr);
+    if (cc > 0)        mvaddch(cr, cc - 1, (chtype)'(' | edge_attr);
+    if (cc < cols - 1) mvaddch(cr, cc + 1, (chtype)')' | edge_attr);
+}
+
+/*
+ * paint_field_body — non-anchor body. Speed-band colour with a two-
+ * variant glyph picked by (i & 1) so a swarm of bodies at the same
+ * speed reads as a textured cloud, not a stencil pattern.
+ */
+static void paint_field_body(int i, const Body *b, int cr, int cc)
+{
+    float spd  = sqrtf(b->vx * b->vx + b->vy * b->vy);
+    float norm = spd / scene.v_max;
+
+    int    pair;
+    chtype ch;
+    int    variant = i & 1;
+    if (norm > 0.80f) {
+        pair = CP_L5; ch = '*'; if (variant) ch = '#';
+    } else if (norm > 0.55f) {
+        pair = CP_L4; ch = '+'; if (variant) ch = 'x';
+    } else if (norm > 0.30f) {
+        pair = CP_L3; ch = 'o'; if (variant) ch = '0';
+    } else if (norm > 0.10f) {
+        pair = CP_L2; ch = '.'; if (variant) ch = ',';
+    } else {
+        pair = CP_L1; ch = ','; if (variant) ch = '`';
+    }
+    mvaddch(cr, cc, ch | COLOR_PAIR(pair) | A_BOLD);
+}
+
+/*
+ * paint_bodies — render every active body's glyph on top of the glow
+ * layer. The anchor uses its own pulsing renderer; everything else
+ * uses the speed-banded body renderer.
+ */
+static void paint_bodies(int cols, int rows)
+{
+    for (int i = 0; i < scene.n_bodies; i++) {
+        const Body *b = &scene.bodies[i];
+        if (!b->active) continue;
+
+        int cr = px_to_cell_y(b->py);
+        int cc = px_to_cell_x(b->px);
         if (cr < 1 || cr >= rows - 1 || cc < 0 || cc >= cols) continue;
 
-        if (g_bodies[i].anchor) {
-            /* Central black hole — distinctive glyph */
-            mvaddch(cr,   cc,   (chtype)'@' | COLOR_PAIR(CP_BH) | A_BOLD);
-            if (cc > 0)   mvaddch(cr, cc-1, (chtype)'(' | COLOR_PAIR(CP_BH));
-            if (cc < cols-1) mvaddch(cr, cc+1, (chtype)')' | COLOR_PAIR(CP_BH));
-            continue;
-        }
-
-        /* Color by speed relative to current v_max */
-        float spd  = sqrtf(g_bodies[i].vx*g_bodies[i].vx
-                          + g_bodies[i].vy*g_bodies[i].vy);
-        float norm = spd / g_v_max;
-
-        int pair;
-        chtype ch;
-        if (norm > 0.80f) {
-            pair = CP_L5; ch = '*';
-        } else if (norm > 0.55f) {
-            pair = CP_L4; ch = '+';
-        } else if (norm > 0.30f) {
-            pair = CP_L3; ch = 'o';
-        } else if (norm > 0.10f) {
-            pair = CP_L2; ch = '.';
-        } else {
-            pair = CP_L1; ch = ',';
-        }
-
-        mvaddch(cr, cc, ch | COLOR_PAIR(pair) | A_BOLD);
+        if (b->anchor) paint_anchor_pulse(cr, cc, cols);
+        else           paint_field_body(i, b, cr, cc);
     }
+}
 
-    /* ── 5. Optional quadtree overlay ───────────────────────────────── */
-    if (g_overlay)
-        qt_draw_overlay(g_qt_root, rows, cols);
+/* Top-level: one frame as five named passes. */
+static void scene_draw(int cols, int rows, float alpha)
+{
+    (void)alpha;
+    scene.frame_tick++;
+
+    /* 1. Deposit body + streak + accretion-halo brightness for this frame. */
+    accumulate_glow_field(cols, rows);
+
+    /* 2. EMA-smooth the brightness normalisation against transients. */
+    update_brightness_norm(cols, rows);
+
+    /* 3. Paint the glow buffer (with per-frame decay multiplier). */
+    paint_glow_layer(cols, rows);
+
+    /* 4. Paint body glyphs on top of the glow (anchor pulses, others
+     *    are speed-band coloured with two-variant glyphs). */
+    paint_bodies(cols, rows);
+
+    /* 5. Optional quadtree overlay for the Barnes–Hut decomposition. */
+    if (scene.overlay)
+        qt_draw_overlay(scene.qt_root, rows, cols);
 }
 
 /* ===================================================================== */
 /* §8  screen / HUD                                                       */
 /* ===================================================================== */
 
+/*
+ * Two-bar HUD per CLAUDE.md convention:
+ *   row 0 right    — bright yellow + bold: live status (N, G, theme, fps, ...)
+ *   row 1 left     — bright yellow:        preset name + description
+ *   row rows-1     — bright cyan + bold:   key hints
+ *
+ * Paused indicator is folded into the top status string so it sits with
+ * the other live state (rather than a separate inline tag).
+ */
 static void hud_draw(int cols, int rows, double fps)
 {
-    /* Count active (non-anchor) bodies */
+    /* Count active (non-anchor) bodies. */
     int active = 0;
-    for (int i = 0; i < g_n_bodies; i++)
-        if (g_bodies[i].active && !g_bodies[i].anchor) active++;
+    for (int i = 0; i < scene.n_bodies; i++)
+        if (scene.bodies[i].active && !scene.bodies[i].anchor) active++;
 
+    /* Row 0 — right-aligned live status. */
+    char top[160];
+    const char *state = "running";
+    if (scene.paused)       state = "PAUSED ";
+    else if (scene.fastfwd) state = "4x     ";
+    snprintf(top, sizeof top,
+             " Barnes-Hut  N=%d(%d)  G=%.0f  theme:%s  %s  %.0f fps ",
+             scene.n_bodies, active, scene.G, k_themes[scene.theme].name, state, fps);
+    int top_len = (int)strlen(top);
+    int top_col = cols - top_len;
+    if (top_col < 0) top_col = 0;
     attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+    mvaddnstr(0, top_col, top, cols);
+    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-    mvprintw(0, 0, "Barnes-Hut  N=%d(%d)  G=%.0f  %s%s",
-             g_n_bodies, active, g_G,
-             k_themes[g_theme].name,
-             g_fastfwd ? "  [4x]" : "");
-
-    char fps_buf[24];
-    snprintf(fps_buf, sizeof(fps_buf), "%.0f fps", fps);
-    mvprintw(0, cols - (int)strlen(fps_buf) - 1, "%s", fps_buf);
-
-    /* Preset description */
+    /* Row 1 — left-aligned preset name and tagline. */
     static const char *k_desc[N_PRESETS] = {
         "Galaxy: BH disk — watch spiral arms form",
         "Cluster: cold collapse — core bounce incoming",
         "Binary merger — tidal streams + chaotic ejections",
     };
-    mvprintw(1, 0, "[%d] %s%s", g_preset + 1, k_desc[g_preset],
-             g_paused ? "  [PAUSED]" : "");
+    char sub[120];
+    snprintf(sub, sizeof sub, " [%d] %s ", scene.preset + 1, k_desc[scene.preset]);
+    attron(COLOR_PAIR(CP_HUD));
+    mvaddnstr(1, 0, sub, cols);
+    attroff(COLOR_PAIR(CP_HUD));
 
-    /* Bottom controls */
-    const char *ctrl =
-        "q:quit  p:pause  r:reset  1-3:preset  t/T:theme  o:overlay  f:4x  +/-:bodies  g/G:grav";
-    if ((int)strlen(ctrl) < cols - 1)
-        mvprintw(rows - 1, 0, "%s", ctrl);
-    else
-        mvprintw(rows - 1, 0, "q:quit  p/space:pause  r:reset  1-3:preset  f:4x  t:theme");
-
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+    /* Row rows-1 — bottom hint bar. */
+    const char *hint_full =
+        " q:quit  p:pause  r:reset  1-3:preset  t/T:theme  o:overlay  f:4x  +/-:bodies  g/G:grav ";
+    const char *hint_short =
+        " q:quit  p:pause  r:reset  1-3:preset  f:4x  t:theme ";
+    const char *hint = hint_full;
+    if ((int)strlen(hint_full) >= cols - 1) hint = hint_short;
+    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+    mvaddnstr(rows - 1, 0, hint, cols);
+    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
@@ -775,7 +1295,7 @@ int main(void)
     nodelay(stdscr, TRUE);
     curs_set(0);
 
-    color_init(g_theme);
+    color_init(scene.theme);
 
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
@@ -795,7 +1315,7 @@ int main(void)
             endwin(); refresh();
             getmaxyx(stdscr, rows, cols);
             scene_reset(cols, rows);
-            color_init(g_theme);
+            color_init(scene.theme);
         }
 
         int ch;
@@ -805,7 +1325,7 @@ int main(void)
                     endwin(); return 0;
 
                 case 'p': case ' ':
-                    g_paused = !g_paused;
+                    scene.paused = !scene.paused;
                     break;
 
                 case 'r':
@@ -813,48 +1333,48 @@ int main(void)
                     break;
 
                 case '1': case '2': case '3':
-                    g_preset = ch - '1';
+                    scene.preset = ch - '1';
                     scene_reset(cols, rows);
                     break;
 
                 case 't':
-                    g_theme = (g_theme + 1) % N_THEMES;
-                    color_init(g_theme);
+                    scene.theme = (scene.theme + 1) % N_THEMES;
+                    color_init(scene.theme);
                     break;
 
                 case 'T':
-                    g_theme = (g_theme + N_THEMES - 1) % N_THEMES;
-                    color_init(g_theme);
+                    scene.theme = (scene.theme + N_THEMES - 1) % N_THEMES;
+                    color_init(scene.theme);
                     break;
 
                 case 'o':
-                    g_overlay = !g_overlay;
+                    scene.overlay = !scene.overlay;
                     break;
 
                 case 'f':
-                    g_fastfwd = !g_fastfwd;
+                    scene.fastfwd = !scene.fastfwd;
                     break;
 
                 case '+': case '=':
-                    g_n_bodies += N_BODIES_STEP;
-                    if (g_n_bodies > N_BODIES_MAX) g_n_bodies = N_BODIES_MAX;
+                    scene.n_bodies += N_BODIES_STEP;
+                    if (scene.n_bodies > N_BODIES_MAX) scene.n_bodies = N_BODIES_MAX;
                     scene_reset(cols, rows);
                     break;
 
                 case '-':
-                    g_n_bodies -= N_BODIES_STEP;
-                    if (g_n_bodies < N_BODIES_STEP) g_n_bodies = N_BODIES_STEP;
+                    scene.n_bodies -= N_BODIES_STEP;
+                    if (scene.n_bodies < N_BODIES_STEP) scene.n_bodies = N_BODIES_STEP;
                     scene_reset(cols, rows);
                     break;
 
                 case 'g':
-                    g_G += G_STEP;
-                    if (g_G > G_MAX) g_G = G_MAX;
+                    scene.G += G_STEP;
+                    if (scene.G > G_MAX) scene.G = G_MAX;
                     break;
 
                 case 'G':
-                    g_G -= G_STEP;
-                    if (g_G < G_MIN) g_G = G_MIN;
+                    scene.G -= G_STEP;
+                    if (scene.G < G_MIN) scene.G = G_MIN;
                     break;
             }
         }
@@ -864,9 +1384,9 @@ int main(void)
         sim_acc += now - t_last_sim;
         t_last_sim = now;
 
-        if (!g_paused) {
+        if (!scene.paused) {
             /* Fast-forward: allow 4× the normal budget */
-            int64_t cap = g_fastfwd ? sim_ns * 16 : sim_ns * 4;
+            int64_t cap = scene.fastfwd ? sim_ns * 16 : sim_ns * 4;
             if (sim_acc > cap) sim_acc = cap;
             while (sim_acc >= sim_ns) {
                 scene_tick(cols, rows);

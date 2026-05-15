@@ -4,6 +4,7 @@ raytracer/
 raymarcher/
 raster/
 signal/
+particle_systems/
  
  completed rest start from scratch
 

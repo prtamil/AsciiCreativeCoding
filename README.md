@@ -50,19 +50,40 @@ and their reading order.
 ## Design Choices
 
 **Every file is self-contained — by intention, not by accident.**
-Self-containment is the goal, the explicit anti-thesis to code reuse. Forbidding
-shared helpers forces re-deriving every primitive in the file that needs it.
-Even a trivial `clamp()` or `lerp()` gets read, audited, and tuned in the
-specific context where it's used. The point is to own every line — to optimise
-and understand even the trivial functions, rather than treat them as solved.
+A deliberate rejection of framework reuse. Math, state, update loop, and
+rendering live in one file, readable top-to-bottom — demoscene and UNIX
+tradition. The whole program fits in working memory; cause and effect
+stay adjacent, artefacts trace directly to the equations producing them.
+Even `clamp()` and `lerp()` are re-derived locally so every assumption
+stays visible. The priority is not DRYness but learnability and mutation
+speed: copy a file, mutate aggressively, keep the version that taught
+something.
 
 **Plain C — `struct`s and functions only.**
-I know C++, Rust, and Clojure. I reach for C anyway. For showcasing an
-algorithm, nothing beats the elegance of having every step laid out on
-the page and being free to change any of it. A struct and a function.
+I know C++, Rust, Clojure, and Go. I reach for C anyway. For showcasing
+an algorithm, nothing beats the elegance of having every step laid out
+on the page and being free to change any of it. A struct and a function.
 Edit a line, recompile in a second, see what happened. No abstraction
 layer to peel back, no manual to consult — just the algorithm and me in
 direct conversation. That is why I keep coming back.
+
+The bigger reason is what C *carries* — the culture that grew up around
+it, which I'm trying to inherit:
+
+- **Demoscene energy** — the hardware-poking, push-the-pixels spirit that
+  produced 64K intros and 4K megademos. Constraints as creative fuel.
+- **UNIX philosophy** — one tool does one thing well. No framework between
+  you and the bytes. One file, one program, pipe-able, hackable.
+- **id Software-era experimentation** — Carmack-style "ship a demo, learn
+  the math, write the renderer, repeat." See it on screen, throw it
+  away, try the next thing.
+- **Computational art notebook** — every file is a self-contained little
+  experiment, like a page in a sketchbook. Copy, modify, riff.
+- **"Learn by rebuilding everything yourself"** — no shared `clamp()`,
+  no shared `lerp()`, no shared anything. You re-derive every primitive
+  in the context it's used. The repetition IS the point.
+
+These aren't features of the language. They're the spirit it carries.
 
 **Copying is the intended workflow.**
 ```bash
@@ -85,31 +106,27 @@ thing documented in every source file. See [CLAUDE.md](CLAUDE.md) for the
 full convention.
 
 **Documentation as a first-class artefact.**
-Every source file opens with a CONCEPTS and MENTAL MODEL block; the
-`documentation/` directory carries long-form essays on the algorithms,
-visual techniques, and ncurses idioms used throughout. The project doubles
-as a self-paced curriculum — the reading material is the point as much as
-the code is.
+The goal is to expose the thinking behind the simulation, not just the
+final output. Every file carries an overview, controls, build command,
+and CONCEPTS / MENTAL MODEL blocks covering math, numerical method,
+rendering pipeline, stability constraints, performance characteristics,
+and historical lineage. Comments answer *why* the algorithm works and
+how its equations map onto the terminal image — not API trivia.
+References cite foundational papers, SIGGRAPH notes, numerical-analysis
+texts, and classic graphics literature, so each program acts as a bridge
+between research and executable code. The model is old demoscene source
+releases and UNIX manpages: theory, implementation, and experimentation
+in one place. The `documentation/` directory carries the long-form
+essays that span across files.
 
 **AI-assisted, human-directed.**
-Honest version: before AI, I was sitting on a graveyard. Half-written
-files, code in five different states of incompleteness, ideas scribbled
-in notebooks, a deep procrastinated todo list older than some of my
-friendships, dozens of projects that lived in my head for years and
-never made it to disk. I would start something, hit a wall I didn't have
-time to research properly, and shelve it. Start the next thing. Shelve
-that. Year after year — a slow accumulation of unfinished work that
-quietly made me feel like a loser in a way I didn't talk about.
+AI changed the workflow completely. Years of half-finished experiments,
+abandoned prototypes, and postponed ideas finally became executable. The
+collaborator that never got tired of debugging, explaining math, or
+helping explore strange ideas at 2am turned a backlog into finished work.
 
-AI changed that. The wall wasn't a wall anymore. I had a collaborator
-who could teach me the math at 2am, help me prototype crazy ideas I'd
-been carrying around for years, debug the things I'd already given up
-on. The long-abandoned stuff started getting done — and not in a
-half-hearted way. With results I'm actually proud of.
-
-The direction, taste, architectural conventions, and pedagogical
-structure are mine. The throughput, and the rescue from a backlog that
-was quietly crushing me, is what the collaboration made possible.
+The direction, taste, architecture, conventions, and educational structure
+are mine. The acceleration and persistence came from collaboration with AI.
 
 ---
 

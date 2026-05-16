@@ -184,8 +184,8 @@
 #define TANG_SCALE        0.5f
 #define SPARK_KICK_MIN   35.0f
 #define SPARK_KICK_MAX  120.0f
-#define SPARK_SCATTER    55.0f
-#define SPARK_TURB       40.0f
+#define SPARK_SCATTER    25.0f   /* was 55 — lower scatter → directional streaks */
+#define SPARK_TURB       15.0f   /* was 40 — less per-frame jitter for clean trails */
 #define SPARK_GRAVITY    28.0f
 #define SPARK_DRAG        0.4f
 #define SPARK_LIFE        1.9f
@@ -581,6 +581,19 @@ static void draw_gear(WINDOW *win, const Gear *g, int cols, int rows)
                 ch = line_char(ang_g + TAU * 0.25f);
                 at = A_BOLD; cp = CP_GEAR;
             }
+            /* Fill passes — only fire when no wireframe edge matched, so
+             * the thin bright outline always wins over the dim fill.    */
+            else if (in_tooth && rad > Ri && rad < Ro) {
+                /* Tooth interior — medium density, gives teeth visual mass */
+                ch = ':';  at = A_DIM;    cp = CP_GEAR;
+            } else if (rad > Rh + THRESH_CIRC * 0.5f
+                       && rad < Ri - THRESH_CIRC * 0.5f) {
+                /* Body interior between hub ring and inner ring — light
+                 * texture so the gear reads as one solid disc, not a
+                 * skeleton.  Skip cells near hub/inner rings to leave a
+                 * clean breathing-room band around each circle.           */
+                ch = '.';  at = A_DIM;    cp = CP_GEAR_DIM;
+            }
 
             if (!ch) continue;
             wattron(win, COLOR_PAIR(cp) | at);
@@ -591,30 +604,113 @@ static void draw_gear(WINDOW *win, const Gear *g, int cols, int rows)
 }
 
 /*
- * Draw sparks using the active theme's per-stage color/char/attr.
- * Stages run freshest (0) → deadest (6), driven by STAGE_THRESH[].
+ * direction_glyph — line glyph picked from the velocity's angle.
+ *   ~horizontal   → '-'
+ *   ~vertical     → '|'
+ *   diagonal NE/SW→ '/'
+ *   diagonal NW/SE→ '\'
+ * Eight 45°-sectors covering the full circle.
+ */
+static chtype direction_glyph(float vx, float vy)
+{
+    float a = atan2f(vy, vx);
+    if (a < 0.0f) a += TAU;
+    if (a < TAU/16.0f || a >= TAU*15.0f/16.0f) return '-';
+    if (a < TAU* 3.0f/16.0f) return '\\';
+    if (a < TAU* 5.0f/16.0f) return '|';
+    if (a < TAU* 7.0f/16.0f) return '/';
+    if (a < TAU* 9.0f/16.0f) return '-';
+    if (a < TAU*11.0f/16.0f) return '\\';
+    if (a < TAU*13.0f/16.0f) return '|';
+    return '/';
+}
+
+/* paint_cell — bounds-checked single-glyph put with given attr. */
+static void paint_cell(WINDOW *win, int r, int c, chtype ch,
+                       int cp, attr_t at, int cols, int rows)
+{
+    if (c < 0 || c >= cols || r < 0 || r >= rows) return;
+    wattron(win, COLOR_PAIR(cp) | at);
+    mvwaddch(win, r, c, ch);
+    wattroff(win, COLOR_PAIR(cp) | at);
+}
+
+/*
+ * draw_spark_streak — fresh spark rendered as a directional streak.
+ *
+ * One bright "head" at the spark's current position painted with a
+ * line-shaped glyph picked from the velocity angle, followed by
+ * `n_tail` dim cells stepping BACKWARD along velocity.  Tail step is
+ * 1 cell wide / 1 cell tall (anisotropic — terminal cells are
+ * CELL_W × CELL_H px), so each tail cell sits roughly one cell behind
+ * its predecessor regardless of direction.
+ *
+ * The cascading head→tail brightness reads as a comet (bright leading
+ * tip, fading trail) — much more "spray of streaks" than scattered
+ * dots.
+ */
+static void draw_spark_streak(WINDOW *win, const Spark *s, int st,
+                              int cp, attr_t head_attr, int n_tail,
+                              int cols, int rows)
+{
+    chtype glyph = direction_glyph(s->vx, s->vy);
+    paint_cell(win, px_row(s->py), px_col(s->px), glyph, cp, head_attr,
+               cols, rows);
+
+    /* Tail — only meaningful if the spark is actually moving. */
+    float speed = sqrtf(s->vx * s->vx + s->vy * s->vy);
+    if (speed < 1.0f) return;
+    float ux = s->vx / speed;
+    float uy = s->vy / speed;
+    for (int k = 1; k <= n_tail; k++) {
+        float tx = s->px - ux * CELL_W * (float)k;
+        float ty = s->py - uy * CELL_H * (float)k;
+        paint_cell(win, px_row(ty), px_col(tx), glyph, cp, A_DIM,
+                   cols, rows);
+    }
+    (void)st;   /* kept for future per-stage tail tuning */
+}
+
+/* draw_spark_dot — cooled spark rendered as the theme's dot glyph. */
+static void draw_spark_dot(WINDOW *win, const Spark *s, const Theme *th,
+                           int st, int cols, int rows)
+{
+    chtype ch = (chtype)(unsigned char)th->spark_ch[st];
+    attr_t at = ATTR_DEC[th->spark_at[st]];
+    int    cp = CP_S0 + st;
+    paint_cell(win, px_row(s->py), px_col(s->px), ch, cp, at,
+               cols, rows);
+}
+
+/*
+ * Draw sparks.  Fresh sparks (stages 0..2) render as directional
+ * streaks with fading tails; cooler sparks (stages 3..6) fall back
+ * to the theme's per-stage dot glyph so they fade into the background.
+ *
+ *   stage 0  head + 2 dim tails    (comet — longest streak)
+ *   stage 1  head + 1 dim tail
+ *   stage 2  head only (still directional)
+ *   stage 3+ theme dot glyph (current behaviour)
  */
 static void draw_sparks(WINDOW *win, const Gear *g,
                         int cols, int rows, int theme_idx)
 {
     const Theme *th = &THEMES[theme_idx];
+    static const int TAIL_PER_STAGE[3] = { 2, 1, 0 };
 
     for (int i = 0; i < MAX_SPARKS; i++) {
         const Spark *s = &g->sparks[i];
         if (s->life <= 0.0f) continue;
 
-        int c = px_col(s->px);
-        int r = px_row(s->py);
-        if (c < 0 || c >= cols || r < 0 || r >= rows) continue;
-
-        int    st = spark_stage(s->life);
-        chtype ch = (chtype)(unsigned char)th->spark_ch[st];
-        attr_t at = ATTR_DEC[th->spark_at[st]];
-        int    cp = CP_S0 + st;
-
-        wattron(win, COLOR_PAIR(cp) | at);
-        mvwaddch(win, r, c, ch);
-        wattroff(win, COLOR_PAIR(cp) | at);
+        int st = spark_stage(s->life);
+        if (st <= 2) {
+            int    cp        = CP_S0 + st;
+            attr_t head_attr = ATTR_DEC[th->spark_at[st]];
+            draw_spark_streak(win, s, st, cp, head_attr,
+                              TAIL_PER_STAGE[st], cols, rows);
+        } else {
+            draw_spark_dot(win, s, th, st, cols, rows);
+        }
     }
 }
 

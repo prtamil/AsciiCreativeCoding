@@ -3,27 +3,88 @@
  * lattice_boltzman_fluid_simulator.c — D2Q9 Lattice Boltzmann Fluid Simulator
  *
  * ═══════════════════════════════════════════════════════════════════════
- *  WHAT YOU SEE
+ *  WHAT YOU SEE ON SCREEN
  * ═══════════════════════════════════════════════════════════════════════
  *
- *  Flow past a circular cylinder (Kármán vortex street).
- *  Each terminal cell = one LBM lattice node.
- *  Fluid enters from the left, cylinder generates alternating vortices.
+ *  A 2-D fluid flowing left-to-right past a circular cylinder, painted
+ *  one terminal cell per LBM lattice node.  Within ~30 wall-clock
+ *  seconds the classic KÁRMÁN VORTEX STREET emerges [6, 7]: alternating
+ *  clockwise and counter-clockwise vortices peel off the cylinder's
+ *  flanks and drift downstream as a staggered double row of swirls.
+ *  Reynolds number at startup is ≈ 50 on a typical 80×30 terminal —
+ *  just above the shedding threshold Re ≈ 47, so the wake is laminar
+ *  and the shedding is rhythmic (Strouhal number St ≈ 0.2, period ≈ 20
+ *  simulation steps).
  *
- *  Visualization modes (press v/o/d to cycle):
- *    VELOCITY  — speed magnitude shaded dark-blue → red heat-map
- *    VORTICITY — curl field, blue=clockwise, red=counter-clockwise
- *    DENSITY   — pressure field (rho deviation from 1.0)
+ *  THREE VIEW MODES — cycle with v / o / d:
  *
- *  Streamline overlay (press s): arrow chars show local flow direction.
+ *    VELOCITY  (v)  speed magnitude |u|, painted as an 8-step
+ *                   SEQUENTIAL heat ramp [8] from the active theme's
+ *                   COLD anchor to its HOT anchor.  Bright cells =
+ *                   fast flow (accelerated channels around the
+ *                   cylinder, wake jet); dark cells = slow (stagnation
+ *                   point upstream of the cylinder nose, recirculation
+ *                   pocket immediately downstream).
+ *
+ *    VORTICITY (o)  ω_z = ∂uy/∂x − ∂ux/∂y — the curl of u.  Painted
+ *                   as a DIVERGING two-hue scheme [9]: one theme hue
+ *                   for clockwise rotation, the other for counter-
+ *                   clockwise, with intensity (A_DIM → A_NORMAL →
+ *                   A_BOLD) encoding magnitude.  The most dramatic
+ *                   view of the vortex street.
+ *
+ *    DENSITY   (d)  pressure proxy (p = cs²·ρ = ρ/3 in LBM units).
+ *                   Reveals the high-pressure stagnation region upstream
+ *                   of the cylinder and the low-pressure cores at the
+ *                   centre of each shed vortex.
+ *
+ *  STREAMLINE OVERLAY (s): sparse ASCII arrows (8 compass headings)
+ *  drawn on top of any base mode, so you can read direction at a glance
+ *  without losing the underlying scalar field.
+ *
+ *  PATTERNS (n / p): 10 obstacle geometries — each shows the SAME
+ *  D2Q9 BGK fluid physics flowing around a DIFFERENT shape, so you
+ *  can compare how the same Reynolds number, viscosity, and inlet
+ *  conditions produce qualitatively different wakes:
+ *    0 Cylinder    canonical Kármán vortex street
+ *    1 Square      sharp-corner separation, wider wake
+ *    2 Diamond     L1 ball, vertex-pointing upstream
+ *    3 Airfoil     tilted ellipse — wake deflects downward (lift)
+ *    4 Twin        tandem cylinders, gap-flow interaction
+ *    5 Array       3×3 porous-medium proxy
+ *    6 Step        backward-facing step, recirculation bubble
+ *    7 Venturi     symmetric constriction, Bernoulli speed-up
+ *    8 Splitter    cylinder + plate, shedding suppressed
+ *    9 Wedge       triangular bluff body, symmetric wake
+ *  Switching pattern resets the flow to equilibrium around the new
+ *  obstacle; your view mode (v/o/d), streamline overlay, pause, τ,
+ *  and inlet speed are preserved across the switch.
+ *
+ *  THEMES (t / T): 10 eight-colour palettes — Ocean, Sunset, Forest,
+ *  Fire, Lava, Aurora, Plasma, Arctic, Mono, Toxic.  Each theme is
+ *  literally 8 hand-picked xterm-256 indices forming a cold-to-hot
+ *  velocity heat-ramp; vorticity reuses the ramp's endpoints (cold for
+ *  clockwise, hot for counter-clockwise), so the whole figure shares
+ *  one coherent palette story.  Themes are pure rendering — the
+ *  physics is identical across all 10.
+ *
+ *  TUNING knobs: +/- changes τ (viscosity, hence Reynolds number);
+ *  w/W changes the inlet speed.  Push Re much above ~200 and the
+ *  weakly-compressible 2-D BGK-LBM can no longer resolve the wake
+ *  cleanly — distributions ring, then diverge [2].
+ *
+ *  HUD: top row (bright yellow) shows live diagnostics — mode, active
+ *  theme, τ, ν, Re, density range, peak |u|, step count, fps, paused
+ *  state.  Bottom row (bright cyan) lists every keystroke.
  *
  * ═══════════════════════════════════════════════════════════════════════
  *  THEORY — DISTRIBUTION FUNCTIONS
  * ═══════════════════════════════════════════════════════════════════════
  *
- *  In the LBM, instead of tracking individual molecules, we track the
- *  probability f_i(x,t) that a "particle" at lattice node x moves in
- *  direction i at time t.  The D2Q9 model uses 9 directions:
+ *  In the LBM [1, 5], instead of tracking individual molecules, we
+ *  track the probability f_i(x,t) that a "particle" at lattice node x
+ *  moves in direction i at time t.  The D2Q9 model [4] uses 9
+ *  directions:
  *
  *    6  2  5          Direction  (ex,ey)   Weight w
  *    3  0  1          ─────────────────────────────
@@ -40,7 +101,9 @@
  *  THEORY — EQUILIBRIUM MODEL
  * ═══════════════════════════════════════════════════════════════════════
  *
- *  The Maxwell-Boltzmann equilibrium distribution truncated to 2nd order:
+ *  The Maxwell-Boltzmann equilibrium distribution truncated to 2nd
+ *  order [4] (the truncation that makes BGK-LBM recover Navier-Stokes
+ *  via Chapman-Enskog expansion):
  *
  *    f^eq_i = w_i · ρ · [1 + (e_i·u)/cs² + (e_i·u)²/(2cs⁴) - u²/(2cs²)]
  *
@@ -55,7 +118,8 @@
  *  THEORY — COLLISION RELAXATION (BGK)
  * ═══════════════════════════════════════════════════════════════════════
  *
- *  Bhatnagar-Gross-Krook (BGK) collision: relax f toward f^eq at rate ω:
+ *  Bhatnagar-Gross-Krook (BGK) collision [3]: relax f toward f^eq at
+ *  rate ω:
  *
  *    f_i* = f_i − ω·(f_i − f^eq_i)      ω = 1/τ
  *
@@ -74,7 +138,7 @@
  *  BOUNDARY CONDITIONS
  * ═══════════════════════════════════════════════════════════════════════
  *
- *  BOUNCE-BACK (no-slip walls + cylinder):
+ *  BOUNCE-BACK (no-slip walls + cylinder) [2]:
  *    When a particle streams into a solid node, it reflects back with
  *    reversed direction: f_OPP(i) at source ← f_i streamed value.
  *    This enforces zero velocity at the wall (no-slip condition).
@@ -84,13 +148,86 @@
  *  TOP/BOTTOM: bounce-back walls.
  *
  * ═══════════════════════════════════════════════════════════════════════
+ *  REFERENCES  (cite inline as [n])
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ *  ── LBM theory & practice ──────────────────────────────────────────
+ *
+ *   [1] Succi, S. (2001) — *The Lattice Boltzmann Equation for Fluid
+ *       Dynamics and Beyond*, Oxford University Press.  The canonical
+ *       theoretical text: Chapman-Enskog derivation, lattice tensor
+ *       symmetries, BGK derivation, boundary conditions.  Start here
+ *       for the WHY of LBM.
+ *
+ *   [2] Krüger, T.; Kusumaatmaja, H.; Kuzmin, A.; Shardt, O.;
+ *       Silva, G.; Viggen, E. M. (2017) — *The Lattice Boltzmann
+ *       Method: Principles and Practice*, Springer.  Modern
+ *       practitioner's handbook; the single clearest source for the
+ *       D2Q9 implementation in this file, bounce-back recipes, the
+ *       viscosity–τ map, and stability bounds.  The code most closely
+ *       mirrors Ch. 3–4 of this book.
+ *
+ *   [3] Bhatnagar, P. L.; Gross, E. P.; Krook, M. (1954) — "A Model
+ *       for Collision Processes in Gases…", *Physical Review* 94,
+ *       511–525.  The original single-relaxation-time collision
+ *       operator — the BGK in BGK-LBM.  Backs the collide() function
+ *       in §6.
+ *
+ *   [4] Qian, Y. H.; d'Humières, D.; Lallemand, P. (1992) — "Lattice
+ *       BGK Models for Navier-Stokes Equation", *Europhysics Letters*
+ *       17 (6), 479–484.  Defines the D2Q9 model used here: the 9
+ *       discrete velocities, weights w_i, and the proof that the
+ *       2nd-order equilibrium f^eq recovers Navier-Stokes via the
+ *       Chapman-Enskog expansion.
+ *
+ *   [5] Chen, S.; Doolen, G. D. (1998) — "Lattice Boltzmann Method
+ *       for Fluid Flows", *Annual Review of Fluid Mechanics* 30,
+ *       329–364.  Foundational LBM review.  Read this first as a
+ *       gentle entry point before tackling [1] or [2].
+ *
+ *  ── Cylinder wake & vortex-shedding physics ────────────────────────
+ *
+ *   [6] von Kármán, T. (1911) — "Über den Mechanismus des
+ *       Widerstandes, den ein bewegter Körper in einer Flüssigkeit
+ *       erfährt", *Nachr. K. Ges. Wiss. Göttingen*, 509–517.  The
+ *       paper that first described the staggered double row of
+ *       vortices behind a bluff body — the eponymous "Kármán vortex
+ *       street" that this demo reproduces.
+ *
+ *   [7] Williamson, C. H. K. (1996) — "Vortex Dynamics in the
+ *       Cylinder Wake", *Annual Review of Fluid Mechanics* 28,
+ *       477–539.  Authoritative modern review of cylinder-wake
+ *       physics: Reynolds-number regime map, shedding onset
+ *       (Re ≈ 47, a Hopf bifurcation), the Strouhal St(Re) curve,
+ *       and the 3-D transition (Re > 190 — beyond what this 2-D LBM
+ *       can represent).  Backs the physical-regime statements in
+ *       WHAT YOU SEE.
+ *
+ *  ── Scientific visualisation / colour ──────────────────────────────
+ *
+ *   [8] Ware, C. (2020) — *Information Visualization: Perception
+ *       for Design*, 4th ed., Morgan Kaufmann.  Ch. 4 on perceptual
+ *       contrast and SEQUENTIAL colour mapping — backs the
+ *       monotone-luminance ramp generated from each theme's
+ *       (vel_cold, vel_hot) anchor pair for the velocity heatmap.
+ *
+ *   [9] Brewer, C. A. (1994) — "Color Use Guidelines for Mapping
+ *       and Visualization", in *Visualization in Modern
+ *       Cartography*, Pergamon, 123–147.  Defines the sequential /
+ *       DIVERGING / qualitative colour-map taxonomy — backs the
+ *       two-hue divergent encoding for signed vorticity (one hue
+ *       per rotation direction, intensity = magnitude).
+ *
+ * ═══════════════════════════════════════════════════════════════════════
  *  Controls:
  *    q/ESC   quit          space   pause/resume
  *    v       velocity mode  o       vorticity mode   d  density mode
  *    s       streamline overlay toggle
  *    +/-     increase/decrease tau (viscosity)
- *    r       reset simulation    n   new obstacle position
  *    w/W     speed up/slow inlet velocity
+ *    n/p     next/previous obstacle pattern (10 shapes)
+ *    t/T     next/previous theme (10 four-anchor palettes)
+ *    r       reset simulation
  *
  *  Build:
  *    gcc -std=c11 -O2 -Wall -Wextra \
@@ -148,24 +285,25 @@ enum {
     VIS_DENSITY   = 2,
     VIS_COUNT     = 3,
 
-    /* Color pair IDs */
-    CP_VEL0 =  1,   /* slowest — dark blue  */
-    CP_VEL1 =  2,
-    CP_VEL2 =  3,
-    CP_VEL3 =  4,
-    CP_VEL4 =  5,
-    CP_VEL5 =  6,
-    CP_VEL6 =  7,
-    CP_VEL7 =  8,   /* fastest — bright red */
-    CP_VNEG0=  9,   /* vorticity negative — light blue  */
-    CP_VNEG1= 10,
-    CP_VNEG2= 11,   /* strong negative — deep blue      */
-    CP_VPOS0= 12,   /* vorticity positive — light red   */
-    CP_VPOS1= 13,
-    CP_VPOS2= 14,   /* strong positive — deep red       */
-    CP_SOLID= 15,   /* obstacle / wall                  */
-    CP_HUD  = 16,   /* status bar                       */
-    CP_ARROW= 17,   /* streamline arrows                */
+    /* Color pair IDs.  CP_VEL0..7 are theme-dependent (regenerated by
+     * theme_apply via the 4-anchor ramp); CP_VNEG / CP_VPOS are theme-
+     * dependent single pairs (intensity comes from A_DIM/NORMAL/BOLD,
+     * not from extra pairs); CP_HUD / CP_HINT / CP_SOLID / CP_ARROW
+     * are fixed across themes. */
+    CP_VEL0  =  1,   /* coldest end of velocity ramp                    */
+    CP_VEL1  =  2,
+    CP_VEL2  =  3,
+    CP_VEL3  =  4,
+    CP_VEL4  =  5,
+    CP_VEL5  =  6,
+    CP_VEL6  =  7,
+    CP_VEL7  =  8,   /* hottest end of velocity ramp                    */
+    CP_VNEG  =  9,   /* vorticity clockwise — 3 levels via attr         */
+    CP_VPOS  = 10,   /* vorticity CCW       — 3 levels via attr         */
+    CP_SOLID = 11,   /* obstacle / wall (theme-independent gray)        */
+    CP_HUD   = 12,   /* status bar — canonical bright yellow (226)      */
+    CP_HINT  = 13,   /* action keys — canonical bright cyan  (51)       */
+    CP_ARROW = 14,   /* streamline arrows                                */
 };
 
 /*
@@ -288,55 +426,135 @@ static void clock_sleep_ns(int64_t ns)
 }
 
 /* ===================================================================== */
-/* §3  color                                                              */
+/* §3  color / theme                                                      */
 /* ===================================================================== */
 
+/*
+ * Theme — an 8-colour velocity ramp.  That's the whole theme.
+ *
+ * Each row of THEMES[] is literally 8 numbers — 256-colour palette
+ * indices forming the velocity heat-ramp from "coldest" (ramp[0])
+ * to "hottest" (ramp[7]).  Pick a theme = pick 8 nice colours that
+ * go cold → hot.  No anchor fields, no interpolation, no generator.
+ *
+ * Vorticity reuses the ramp's endpoints:
+ *   CW  rotation  →  ramp[0]  (coldest)
+ *   CCW rotation  →  ramp[7]  (hottest)
+ * So the velocity heatmap and the vorticity diverging map share the
+ * same palette story — guaranteed coherent across all 10 themes.
+ *
+ * WHY one CP per vorticity sign (not 3 per sign):
+ *   render_vorticity expresses intensity via A_DIM / A_NORMAL / A_BOLD
+ *   on a single colour pair, so 3 levels need only one pair each.
+ *   Intensity = brightness; sign = hue.
+ *
+ * Fixed pairs across all themes:
+ *   CP_HUD   — status bar         bright yellow 226 (CLAUDE.md canonical)
+ *   CP_HINT  — action keys        bright cyan   51  (CLAUDE.md canonical)
+ *   CP_SOLID — obstacle / walls   mid gray      240 (theme-neutral)
+ *   CP_ARROW — streamline arrows  near-white    255 (theme-neutral)
+ */
+typedef struct {
+    const char *name;
+    short ramp[8];   /* 8-step velocity heat ramp, cold → hot           */
+} Theme;
+
+/*
+ * 10 themes — hand-picked 8-step ramps in the 256-colour palette.
+ *
+ *   Ocean    — deep blue   → bright cyan
+ *   Sunset   — indigo      → gold
+ *   Forest   — dark green  → yellow-green
+ *   Fire     — dark red    → bright yellow
+ *   Lava     — navy        → bright red
+ *   Aurora   — purple      → green (through blue / cyan)
+ *   Plasma   — magenta     → yellow (electric)
+ *   Arctic   — dusky gray  → ice cyan
+ *   Mono     — pure greyscale
+ *   Toxic    — dark green  → lime
+ *
+ * Numbers are xterm-256 palette indices.  Edit by eye: pick 8 colours
+ * along a smooth path in the 6×6×6 cube (16..231) or in the greyscale
+ * ramp (232..255) and the gradient will read cleanly.
+ */
+static const Theme THEMES[] = {
+  /* name       0    1    2    3    4    5    6    7      (cold → hot) */
+  { "Ocean",  {  17,  18,  24,  25,  31,  38,  45,  51 } },
+  { "Sunset", {  17,  53,  91, 161, 167, 173, 215, 220 } },
+  { "Forest", {  22,  28,  34,  64, 100, 142, 178, 226 } },
+  { "Fire",   {  52,  88, 124, 160, 196, 202, 208, 220 } },
+  { "Lava",   {  18,  19,  91, 125, 161, 196, 202, 226 } },
+  { "Aurora", {  54,  91,  99, 105,  81,  49,  47,  82 } },
+  { "Plasma", {  53,  91, 161, 199, 207, 213, 220, 226 } },
+  { "Arctic", {  59,  60,  67,  74,  81, 123, 159, 195 } },
+  { "Mono",   { 232, 235, 238, 242, 246, 250, 253, 255 } },
+  { "Toxic",  {  22,  28,  34,  40,  76, 112, 118, 154 } },
+};
+#define N_THEMES ((int)(sizeof THEMES / sizeof THEMES[0]))
+
+/* Active theme index — cycled by t/T keys.  File-scope because the
+ * theme is a pure rendering choice with no place in the LBM physics
+ * state, and a single global keeps theme_apply() callable from both
+ * startup (color_init) and the runtime key handler. */
+static int g_theme_idx = 0;
+
+/*
+ * theme_apply — rebuild the THEME-DEPENDENT colour pairs for theme
+ * `idx`.  Just copies ramp[i] → CP_VEL0+i and uses the ramp endpoints
+ * for the two vorticity pairs.  Fixed pairs (HUD / HINT / SOLID /
+ * ARROW) are NOT touched — they live in color_init().
+ *
+ * On 8-colour terminals the 256-cube isn't available; we fall back to
+ * a fixed blue→red ANSI ramp so the demo still runs.
+ */
+static void theme_apply(int idx)
+{
+    if (idx < 0 || idx >= N_THEMES) return;
+    const Theme *t = &THEMES[idx];
+
+    if (COLORS >= 256) {
+        for (int i = 0; i < 8; i++)
+            init_pair((short)(CP_VEL0 + i), t->ramp[i], -1);
+        init_pair(CP_VNEG, t->ramp[0], -1);   /* CW: coldest hue  */
+        init_pair(CP_VPOS, t->ramp[7], -1);   /* CCW: hottest hue */
+    } else {
+        /* 8-colour ANSI fallback — themes collapse to one fixed ramp */
+        init_pair(CP_VEL0, COLOR_BLUE,   -1);
+        init_pair(CP_VEL1, COLOR_BLUE,   -1);
+        init_pair(CP_VEL2, COLOR_CYAN,   -1);
+        init_pair(CP_VEL3, COLOR_CYAN,   -1);
+        init_pair(CP_VEL4, COLOR_GREEN,  -1);
+        init_pair(CP_VEL5, COLOR_YELLOW, -1);
+        init_pair(CP_VEL6, COLOR_RED,    -1);
+        init_pair(CP_VEL7, COLOR_RED,    -1);
+        init_pair(CP_VNEG, COLOR_BLUE,   -1);
+        init_pair(CP_VPOS, COLOR_RED,    -1);
+    }
+}
+
+/*
+ * color_init — one-shot at startup.  Initialises ncurses colour state,
+ * binds the four FIXED pairs (HUD, HINT, SOLID, ARROW) once, then
+ * delegates the theme-dependent pairs to theme_apply().
+ */
 static void color_init(void)
 {
     start_color();
     use_default_colors();
 
     if (COLORS >= 256) {
-        /* Velocity: dark-blue → cyan → green → yellow → orange → red */
-        init_pair(CP_VEL0, 25,  COLOR_BLACK);
-        init_pair(CP_VEL1, 27,  COLOR_BLACK);
-        init_pair(CP_VEL2, 27,  COLOR_BLACK);
-        init_pair(CP_VEL3, 45,  COLOR_BLACK);
-        init_pair(CP_VEL4, 46,  COLOR_BLACK);
-        init_pair(CP_VEL5, 226, COLOR_BLACK);
-        init_pair(CP_VEL6, 208, COLOR_BLACK);
-        init_pair(CP_VEL7, 196, COLOR_BLACK);
-        /* Vorticity negative (clockwise) — blue shades */
-        init_pair(CP_VNEG0, 153, COLOR_BLACK);
-        init_pair(CP_VNEG1,  33, COLOR_BLACK);
-        init_pair(CP_VNEG2, 25, COLOR_BLACK);
-        /* Vorticity positive (CCW) — red shades */
-        init_pair(CP_VPOS0, 217, COLOR_BLACK);
-        init_pair(CP_VPOS1, 160, COLOR_BLACK);
-        init_pair(CP_VPOS2,  52, COLOR_BLACK);
-        /* Misc */
-        init_pair(CP_SOLID, 240, COLOR_BLACK);
-        init_pair(CP_HUD,    51, COLOR_BLACK);
-        init_pair(CP_ARROW, 255, COLOR_BLACK);
+        init_pair(CP_HUD,   226, -1);   /* canonical bright yellow */
+        init_pair(CP_HINT,   51, -1);   /* canonical bright cyan   */
+        init_pair(CP_SOLID, 240, -1);   /* mid gray (theme-neutral)*/
+        init_pair(CP_ARROW, 255, -1);   /* near-white               */
     } else {
-        init_pair(CP_VEL0, COLOR_BLUE,    COLOR_BLACK);
-        init_pair(CP_VEL1, COLOR_BLUE,    COLOR_BLACK);
-        init_pair(CP_VEL2, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(CP_VEL3, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(CP_VEL4, COLOR_GREEN,   COLOR_BLACK);
-        init_pair(CP_VEL5, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(CP_VEL6, COLOR_RED,     COLOR_BLACK);
-        init_pair(CP_VEL7, COLOR_RED,     COLOR_BLACK);
-        init_pair(CP_VNEG0, COLOR_BLUE,   COLOR_BLACK);
-        init_pair(CP_VNEG1, COLOR_BLUE,   COLOR_BLACK);
-        init_pair(CP_VNEG2, COLOR_BLUE,   COLOR_BLACK);
-        init_pair(CP_VPOS0, COLOR_RED,    COLOR_BLACK);
-        init_pair(CP_VPOS1, COLOR_RED,    COLOR_BLACK);
-        init_pair(CP_VPOS2, COLOR_RED,    COLOR_BLACK);
-        init_pair(CP_SOLID, COLOR_WHITE,  COLOR_BLACK);
-        init_pair(CP_HUD,   COLOR_YELLOW, COLOR_BLACK);
-        init_pair(CP_ARROW, COLOR_WHITE,  COLOR_BLACK);
+        init_pair(CP_HUD,   COLOR_YELLOW, -1);
+        init_pair(CP_HINT,  COLOR_CYAN,   -1);
+        init_pair(CP_SOLID, COLOR_WHITE,  -1);
+        init_pair(CP_ARROW, COLOR_WHITE,  -1);
     }
+
+    theme_apply(g_theme_idx);
 }
 
 /* ===================================================================== */
@@ -407,81 +625,181 @@ static inline float feq(int i, float rho, float ux, float uy)
 /* ===================================================================== */
 
 /*
- * LBM struct — all simulation state in one place.
+ * LBM — the entire D2Q9 BGK simulation world in one struct.
  *
- * Memory layout notes:
+ * WHY a struct (and not loose globals): the LBM state is naturally a
+ *   container — 7 lattice buffers + 3 physics knobs + obstacle
+ *   geometry + diagnostic stats + UI latches all share the same
+ *   lifetime (born at lbm_alloc, die at lbm_free, refit on resize).
+ *   Bundling them lets a single `LBM *g` argument carry the whole
+ *   world through collide / stream / compute_macroscopic / render
+ *   without 20-argument function signatures.
  *
- *   f[ny*nx*9]
- *     The 9 distribution functions for every lattice node, laid out as
- *     f[(y*nx + x)*9 + i].  Total memory ≈ 9 × 4 × nx × ny bytes
- *     (floats).  For a 200×50 grid that is ~360 KB — fits in L2 cache
- *     on most CPUs, which is why LBM is cache-friendly.
+ * WHY ONE struct (not separate SimState + RenderState):
+ *   the diagnostic stats (vel_max, rho_min, …) are produced by the
+ *   SIMULATION (compute_macroscopic computes them) and consumed by
+ *   the RENDERER (normalises colour maps), so splitting would force
+ *   either a shared "stats" struct or duplicated pointers.  Keeping
+ *   one struct + an internal divider is simpler.
  *
- *   ftmp[ny*nx*9]
- *     Streaming scratch buffer (double-buffering).  During the stream
- *     step we write into ftmp while reading from f.  Without this
- *     second buffer, a streamed value could be read again in the same
- *     pass, causing race-condition-like errors even in single-threaded
- *     code.  After streaming, f and ftmp are swapped via pointer swap
- *     (O(1), no copy).
+ * LOCALITY INTENT: fields below are grouped into FIVE blocks with
+ * divider comments — LATTICE GEOMETRY / LATTICE BUFFERS / PHYSICS /
+ * OBSTACLE / DIAGNOSTICS / UI.  Reading the struct top-to-bottom
+ * tells you exactly what makes one frame, no scrolling needed.
  *
- *   rho[ny*nx], ux[ny*nx], uy[ny*nx]
- *     Macroscopic fields: density and velocity components.  These are
- *     the zeroth and first moments of f (computed in
- *     compute_macroscopic).  Used by collision (feq) and rendering.
+ *   SIMULATION half (advances the lattice):
+ *     nx, ny                       — grid dimensions
+ *     f, ftmp                      — distribution functions (double buf)
+ *     rho, ux, uy                  — macroscopic fields (moments of f)
+ *     vort                         — derived field ω_z = ∇×u
+ *     solid                        — obstacle / wall mask
+ *     tau, omega, u_in             — physics knobs
+ *     cyl_x, cyl_y, cyl_r          — obstacle reference geometry
  *
- *   vort[ny*nx]
- *     Vorticity (curl of u), computed on demand only when vis_mode ==
- *     VIS_VORTICITY.  Skipping this computation in other modes saves
- *     a full O(nx×ny) pass every step.
+ *   SHARED (sim writes, renderer + HUD read):
+ *     vel_max, rho_min, rho_max,
+ *     vort_max, step_count         — per-frame diagnostic stats
  *
- *   solid[ny*nx]
- *     Obstacle/wall mask: 1 = solid node, 0 = fluid node.  Checked
- *     before every collision and stream step.  Solid nodes never have
- *     meaningful distribution functions — bounce-back handles them at
- *     the boundary.
+ *   RENDERING / UI latches (renderer reads, key handler writes):
+ *     vis_mode, show_stream        — view selectors
+ *     paused                       — UI freeze flag
  *
- *   tau / omega
- *     tau  = relaxation time (user-controllable via +/- keys).
- *     omega = 1/tau, cached so the inner collision loop does a multiply
- *     instead of a divide (division is ~5× slower on most FPUs).
- *     Updated together whenever tau changes.
- *
- *   cyl_x, cyl_y, cyl_r
- *     Cylinder obstacle geometry in grid-cell units.  Derived from the
- *     CYL_*_FRAC constants scaled to the current terminal size.
- *
- *   vel_max / rho_min / rho_max
- *     Per-frame statistics collected inside compute_macroscopic.  Used
- *     by the render functions to normalize color maps and by the HUD
- *     overlay to display physical quantities.
+ * Field semantics cite: [1, 2] for the LBM container as a whole,
+ * [4] for f / f^eq, [3] for τ / ω, [7] for cylinder Re mapping.
  */
 typedef struct {
-    int    nx, ny;        /* grid dimensions (= terminal cols, rows-2)     */
-    float *f;             /* distribution functions [ny*nx*9]               */
-    float *ftmp;          /* streaming scratch buffer                        */
-    float *rho;           /* macroscopic density       [ny*nx]              */
-    float *ux, *uy;       /* macroscopic velocity      [ny*nx]              */
-    float *vort;          /* vorticity field (curl uy/dx - curl ux/dy)      */
-    uint8_t *solid;       /* 1 = solid (wall/obstacle), 0 = fluid           */
 
-    float  tau;           /* relaxation time                                 */
-    float  omega;         /* 1/tau (cached)                                  */
-    float  u_in;          /* inlet velocity magnitude                        */
+    /* ── SIMULATION: lattice geometry ──────────────────────────────── */
 
-    /* cylinder obstacle */
+    int    nx, ny;
+        /* Live grid dimensions.  nx = terminal cols, ny = terminal
+         * rows − 2 (top + bottom HUD rows).  Recomputed and the
+         * buffers below re-allocated by scene_resize on SIGWINCH.
+         * The hot loops in §6 / §7 / §8 / §9 iterate to these — not
+         * to any compile-time max — so resize Just Works.            */
+
+    /* ── SIMULATION: lattice buffers (all heap, sized nx×ny) ──────── */
+
+    float *f;
+        /* The 9 distribution functions f_i(x,t) for every node,
+         * laid out as f[(y·nx + x)·9 + i].  Total memory:
+         * 9 × 4 × nx × ny bytes — ~430 KB for 200×60, fits in L2.
+         * Cache locality is the WHY behind packing the 9 directions
+         * contiguously per node (AoS layout): collide() touches all
+         * 9 at one node before moving on. [1, §3] [2, ch.3]         */
+
+    float *ftmp;
+        /* Double-buffer scratch for the stream step.  Streaming reads
+         * from f, writes to ftmp; we then SWAP THE POINTERS so the
+         * caller sees fresh data with no copy.  Without this buffer,
+         * a streamed value could be re-streamed in the same pass —
+         * a single-threaded race that produces wrong but plausible
+         * output. [2, ch.4]                                          */
+
+    float *rho;
+        /* Macroscopic density ρ(x) — the ZEROTH moment of f at each
+         * node (Σ_i f_i).  Computed by compute_macroscopic each
+         * step; consumed by collide (feeds f^eq) and by
+         * render_density (heatmap source: p = ρ/3 in LBM units).   */
+
+    float *ux, *uy;
+        /* Macroscopic velocity u(x).  FIRST moments of f divided by
+         * ρ (Σ_i f_i·e_i / ρ).  Consumed by collide, by
+         * compute_vorticity (∇×u), by render_velocity (|u| heatmap),
+         * and by render_streamlines (direction arrows).             */
+
+    float *vort;
+        /* Vorticity ω_z = ∂uy/∂x − ∂ux/∂y.  ONLY computed when
+         * vis_mode == VIS_VORTICITY (saves an O(nx·ny) pass + a
+         * second-order finite-diff stencil in the other two modes).
+         * Source for render_vorticity.                             */
+
+    uint8_t *solid;
+        /* Obstacle / wall mask.  1 = solid (never has meaningful f),
+         * 0 = fluid.  Built by the active pattern's pat_* function
+         * in §5 (Cylinder, Square, Diamond, Airfoil, …).  Read by
+         * stream (bounce-back at solid boundaries), by collide (skip
+         * solid cells — they have no fluid), and by every render
+         * mode (paint solids as '#'). [2, ch.5 bounce-back]        */
+
+    /* ── SIMULATION: physics parameters ────────────────────────────── */
+
+    float  tau;
+        /* BGK relaxation time τ in lattice units.  Single-knob
+         * control of viscosity via the Chapman-Enskog result
+         * ν = cs²(τ − ½) = (τ − ½)/3 [3, 4].  Adjustable via +/-
+         * keys, clamped to [TAU_MIN, TAU_MAX].  τ → 0.5 → ν → 0 +
+         * numerically unstable; τ → ∞ → very viscous (low Re).    */
+
+    float  omega;
+        /* Cached 1/τ.  collide() multiplies by omega per cell per
+         * step — caching avoids the per-iteration division (~5×
+         * slower than a multiply on most FPUs).  Updated together
+         * with τ whenever the user changes it.                     */
+
+    float  u_in;
+        /* Inlet velocity magnitude in lattice units (lu/step).  Must
+         * satisfy u ≪ cs = 1/√3 ≈ 0.577 (low-Mach LBM assumption);
+         * above u ≈ 0.3 compressibility errors in the weakly-
+         * compressible scheme grow rapidly.  Adjustable via w/W,
+         * capped at 0.30.                                          */
+
+    /* ── SIMULATION: obstacle reference geometry ───────────────────── */
+
     int    cyl_x, cyl_y, cyl_r;
+        /* Canonical obstacle reference point.  Derived once per init
+         * from CYL_*_FRAC × grid dims, so every pattern's geometry
+         * scales with the terminal.  Every pat_* function in §5 uses
+         * these as its size reference — a Square's half-side is
+         * cyl_r, a Diamond's vertex distance is cyl_r, etc. — so all
+         * 10 patterns occupy comparable terminal real-estate.  The
+         * HUD's Reynolds-number estimate uses D = 2·cyl_r as the
+         * obstacle diameter. [7]                                    */
 
-    /* runtime visualization state */
-    int    vis_mode;
-    bool   show_stream;
-    bool   paused;
+    /* ── SHARED: per-frame diagnostic stats ────────────────────────── */
+    /* Written by compute_macroscopic + compute_vorticity (SIM side); */
+    /* read by the render functions + render_overlay (RENDER side).   */
 
-    /* per-frame stats (computed by compute_macroscopic) */
     float  vel_max;
+        /* Peak |u| this frame.  Used by render_velocity to normalise
+         * the heatmap into [0, vel_max] before mapping to the 8
+         * colour tiers of the active theme.                         */
+
     float  rho_min, rho_max;
+        /* Density range this frame.  Used by render_density to
+         * stretch the colour scale across [min, max] so tiny
+         * ~0.001 pressure variations are still visible.            */
+
     float  vort_max;
+        /* Peak |ω_z| this frame (only set in vorticity mode).  Used
+         * by render_vorticity to normalise the diverging map into
+         * three intensity tiers per rotation sign.                 */
+
     int    step_count;
+        /* Physics steps elapsed since the last full re-init.  Pure
+         * diagnostic — shown in the HUD as "step:N" so the user can
+         * tell whether the flow has had enough time to equilibrate
+         * after a tuning change (τ, u_in, pattern).                */
+
+    /* ── RENDERING / UI latches ────────────────────────────────────── */
+    /* Written by handle_key (RENDER side); read by scene_tick /      */
+    /* scene_draw / render_overlay.  These NEVER influence the BGK   */
+    /* update — flipping vis_mode does not perturb f or u.           */
+
+    int    vis_mode;
+        /* Active view: VIS_VELOCITY / VIS_VORTICITY / VIS_DENSITY.
+         * Cycled by v/o/d keys.  scene_tick() reads this to decide
+         * whether to spend an extra pass on compute_vorticity. */
+
+    bool   show_stream;
+        /* Streamline overlay toggle (s key).  When true,
+         * render_streamlines draws sparse ASCII direction arrows on
+         * top of whatever base mode is active.                     */
+
+    bool   paused;
+        /* When true, scene_tick() returns immediately — physics
+         * frozen but the renderer keeps painting (so the user can
+         * inspect the lattice without it changing under them).    */
 } LBM;
 
 static int lbm_alloc(LBM *g, int nx, int ny)
@@ -506,58 +824,388 @@ static void lbm_free(LBM *g)
     free(g->ux); free(g->uy);   free(g->vort); free(g->solid);
 }
 
-static void lbm_build_solid(LBM *g)
+/* ── Pattern subsystem — 10 obstacle geometries ─────────────────────── *
+ *
+ * Each pat_* function fills g->solid[] with a different OBSTACLE
+ * configuration; the rest of the simulation (D2Q9, BGK collision,
+ * streaming, bounce-back, inlet/outlet) is unchanged.  Switching
+ * patterns is a way to compare how the SAME fluid physics produces
+ * different flow phenomena around different shapes [2, 7].
+ *
+ * All patterns share three primitives:
+ *   pat_walls(g)             — clear mask + stamp top/bottom walls
+ *   stamp_disc(g, cx, cy, r) — filled circular disc
+ *   stamp_rect(g, x0..y1)    — filled axis-aligned rectangle
+ *
+ * Most patterns derive their scale from the (cyl_x, cyl_y, cyl_r)
+ * reference point lbm_init() computes from CYL_*_FRAC, so every
+ * pattern occupies comparable terminal real-estate regardless of the
+ * specific shape — a Square's half-side is cyl_r, a Diamond's vertex
+ * distance is cyl_r, etc.                                              */
+
+static void pat_walls(LBM *g)
 {
     int nx = g->nx, ny = g->ny;
     memset(g->solid, 0, nx * ny);
-
-    /* Top and bottom walls */
     for (int x = 0; x < nx; x++) {
-        g->solid[0 * nx + x]        = 1;
-        g->solid[(ny-1) * nx + x]   = 1;
+        g->solid[0 * nx + x]      = 1;
+        g->solid[(ny-1) * nx + x] = 1;
     }
+}
 
-    /* Circular cylinder */
+static void stamp_disc(LBM *g, int cx, int cy, int r)
+{
+    int nx = g->nx, ny = g->ny;
+    int r2 = r * r;
     for (int y = 0; y < ny; y++)
         for (int x = 0; x < nx; x++) {
-            int dx = x - g->cyl_x, dy = y - g->cyl_y;
-            if (dx*dx + dy*dy <= g->cyl_r * g->cyl_r)
+            int dx = x - cx, dy = y - cy;
+            if (dx*dx + dy*dy <= r2)
                 g->solid[y * nx + x] = 1;
         }
 }
 
-static void lbm_init(LBM *g, int nx, int ny, float tau, float u_in)
+static void stamp_rect(LBM *g, int x0, int y0, int x1, int y1)
 {
-    g->tau      = tau;
-    g->omega    = 1.0f / tau;
-    g->u_in     = u_in;
-    g->vis_mode = VIS_VELOCITY;
+    int nx = g->nx, ny = g->ny;
+    if (x0 < 0)   x0 = 0;
+    if (y0 < 0)   y0 = 0;
+    if (x1 >= nx) x1 = nx - 1;
+    if (y1 >= ny) y1 = ny - 1;
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++)
+            g->solid[y * nx + x] = 1;
+}
+
+/* ── The 10 obstacle patterns ──────────────────────────────────────── */
+
+/* Cylinder — the canonical bluff body.  Above Re ≈ 47 sheds the
+ * Kármán vortex street with Strouhal St ≈ 0.2 [7]. */
+static void pat_cylinder(LBM *g)
+{
+    pat_walls(g);
+    stamp_disc(g, g->cyl_x, g->cyl_y, g->cyl_r);
+}
+
+/* Square — sharp leading-edge corners trigger separation immediately
+ * (no smooth pressure-rise lead-in).  Wake is wider than a cylinder
+ * of equal frontal area; St lower (~0.13). */
+static void pat_square(LBM *g)
+{
+    pat_walls(g);
+    int cx = g->cyl_x, cy = g->cyl_y, r = g->cyl_r;
+    stamp_rect(g, cx - r, cy - r, cx + r, cy + r);
+}
+
+/* Diamond — square rotated 45° (the L1/taxicab ball of radius r).
+ * Vertex points upstream so flow splits cleanly at the nose; trailing
+ * apex sheds a narrower wake than the square. */
+static void pat_diamond(LBM *g)
+{
+    pat_walls(g);
+    int cx = g->cyl_x, cy = g->cyl_y, r = g->cyl_r;
+    for (int y = 0; y < g->ny; y++)
+        for (int x = 0; x < g->nx; x++) {
+            int dx = x - cx, dy = y - cy;
+            int adx = dx < 0 ? -dx : dx;
+            int ady = dy < 0 ? -dy : dy;
+            if (adx + ady <= r)
+                g->solid[y * g->nx + x] = 1;
+        }
+}
+
+/* Airfoil — tilted ellipse, major axis 3·cyl_r, minor cyl_r/2,
+ * angle of attack ~12°.  Asymmetric wake; flow deflects downward
+ * — the textbook signature of lift generation. */
+static void pat_airfoil(LBM *g)
+{
+    pat_walls(g);
+    int cx = g->cyl_x, cy = g->cyl_y;
+    float r = (float)g->cyl_r;
+    float c = cosf(0.2094f), s = sinf(0.2094f);   /* 12° in radians */
+    float a = 3.0f * r, b = 0.5f * r;
+    float ia2 = 1.0f / (a*a), ib2 = 1.0f / (b*b);
+    for (int y = 0; y < g->ny; y++)
+        for (int x = 0; x < g->nx; x++) {
+            float dx = (float)(x - cx), dy = (float)(y - cy);
+            float u =  c*dx + s*dy;     /* rotate into chord-aligned frame */
+            float v = -s*dx + c*dy;
+            if (u*u*ia2 + v*v*ib2 <= 1.0f)
+                g->solid[y * g->nx + x] = 1;
+        }
+}
+
+/* Tandem cylinders — two equal cylinders inline, separated by 4·cyl_r.
+ * The downstream cylinder sits inside the upstream wake; shedding from
+ * the leader is suppressed at small gaps and locked-in at larger ones. */
+static void pat_twin(LBM *g)
+{
+    pat_walls(g);
+    int cx = g->cyl_x, cy = g->cyl_y, r = g->cyl_r;
+    stamp_disc(g, cx,         cy, r);
+    stamp_disc(g, cx + 4 * r, cy, r);
+}
+
+/* 3×3 cylinder array — porous-medium / tube-bundle proxy.  Small
+ * cylinders (cyl_r/2) on a 2·cyl_r grid form local channels between
+ * each other; flow accelerates through gaps, recirculates behind each. */
+static void pat_array(LBM *g)
+{
+    pat_walls(g);
+    int cx = g->cyl_x, cy = g->cyl_y, r = g->cyl_r;
+    int rs = r / 2;
+    if (rs < 1) rs = 1;
+    for (int ry = -1; ry <= 1; ry++)
+        for (int rx = -1; rx <= 1; rx++)
+            stamp_disc(g, cx + 2*r*rx, cy + 2*r*ry, rs);
+}
+
+/* Backward-facing step — solid block at the top-left fills the upper
+ * 40% of the channel for the first 2·cyl_x columns, then ends.  The
+ * downstream corner traps a stationary recirculation bubble — the
+ * canonical separated-flow benchmark. */
+static void pat_step(LBM *g)
+{
+    pat_walls(g);
+    int step_h = (int)(g->ny * 0.4f);
+    stamp_rect(g, 0, 0, 2 * g->cyl_x, step_h);
+}
+
+/* Venturi constriction — symmetric wedges from top and bottom narrow
+ * the channel to a 2·cyl_r-wide throat at x = cyl_x.  Speed peaks at
+ * the throat (mass conservation), density dips (Bernoulli) — most
+ * dramatic in DENSITY mode. */
+static void pat_venturi(LBM *g)
+{
+    pat_walls(g);
+    int nx = g->nx, ny = g->ny;
+    int cx = g->cyl_x;
+    int half_gap  = g->cyl_r;
+    int wedge_len = 3 * g->cyl_r;
+    int wall_max  = ny / 2 - half_gap;
+    if (wall_max < 1) wall_max = 1;
+    for (int x = 0; x < nx; x++) {
+        int d = x - cx;
+        if (d < 0) d = -d;
+        if (d > wedge_len) continue;
+        int taper = wedge_len - d;                /* peaks at center */
+        int wall  = taper * wall_max / wedge_len;
+        for (int y = 0; y <= wall; y++)
+            g->solid[y * nx + x] = 1;
+        for (int y = ny - 1 - wall; y < ny; y++)
+            g->solid[y * nx + x] = 1;
+    }
+}
+
+/* Cylinder + horizontal splitter plate.  The plate (1 cell thick,
+ * 4·cyl_r long) extends downstream from the cylinder's rear, preventing
+ * the upper and lower shear layers from interacting.  Vortex shedding
+ * suppressed — wake becomes steady. */
+static void pat_splitter(LBM *g)
+{
+    pat_walls(g);
+    int cx = g->cyl_x, cy = g->cyl_y, r = g->cyl_r;
+    stamp_disc(g, cx, cy, r);
+    stamp_rect(g, cx + r, cy, cx + r + 4 * r, cy);
+}
+
+/* Triangular wedge pointing upstream — vertex at x = cyl_x − cyl_r,
+ * base at x = cyl_x + cyl_r.  Symmetric wake; equally strong shear
+ * layers shed in phase from the two trailing-edge corners. */
+static void pat_wedge(LBM *g)
+{
+    pat_walls(g);
+    int cx = g->cyl_x, cy = g->cyl_y, r = g->cyl_r;
+    int x0 = cx - r, x1 = cx + r;
+    for (int x = x0; x <= x1; x++) {
+        if (x < 0 || x >= g->nx) continue;
+        int progress = x - x0;               /* 0 at vertex, 2r at base */
+        int half_h   = progress / 2;
+        for (int y = cy - half_h; y <= cy + half_h; y++)
+            if (y >= 0 && y < g->ny)
+                g->solid[y * g->nx + x] = 1;
+    }
+}
+
+/* ── Pattern table + dispatcher ─────────────────────────────────────── */
+
+/*
+ * Pattern — one entry in the n/p obstacle-cycle.
+ *
+ * WHY a struct of {name, build-fn} (function-pointer table):
+ *   the n/p key needs to walk a list of arbitrary obstacle-mask
+ *   builders AND show a human label for the current one in the HUD.
+ *   Function-pointer + name is the minimum machinery; PATTERNS[]
+ *   becomes a single editable table you extend by appending one row
+ *   to add a new geometry — no switch statements, no enum-to-string
+ *   maps, no per-key branches in handle_key.
+ *
+ * WHY obstacle patterns matter (the pedagogical point):
+ *   the entire D2Q9 BGK fluid physics [4] is UNCHANGED across
+ *   patterns — only the solid mask varies.  Watching the same
+ *   Reynolds number produce a Kármán street behind a Cylinder, a
+ *   wider wake behind a Square, a deflected wake behind an Airfoil
+ *   (lift), and a stabilised wake behind a Splitter, makes the
+ *   relationship between SHAPE and WAKE PHYSICS legible without
+ *   touching a single equation.  Williamson [7] §3 catalogues these
+ *   regime differences in real-world wind-tunnel data.
+ *
+ * WHY build() takes LBM* (not just g->solid): build functions need
+ *   to read g->nx, g->ny, and g->cyl_x/y/r to size and place their
+ *   geometry; some (pat_array, pat_venturi) also need bounds checks
+ *   into the lattice.  Easier than threading those parameters
+ *   through three or four separate arguments.
+ *
+ * Every build function starts by calling pat_walls(g) (clear mask +
+ * stamp top/bottom channel walls) so callers don't have to remember.
+ */
+typedef struct {
+    const char *name;        /* HUD label: "Cylinder", "Airfoil", …      */
+    void      (*build)(LBM *g);
+                             /* fills g->solid[] with this pattern's
+                              * obstacle geometry; always starts with
+                              * pat_walls(g) for the channel walls.    */
+} Pattern;
+
+static const Pattern PATTERNS[] = {
+    { "Cylinder", pat_cylinder },   /* 0 — canonical vortex street      */
+    { "Square",   pat_square   },   /* 1 — sharp leading-edge corners   */
+    { "Diamond",  pat_diamond  },   /* 2 — taxicab/L1 ball, vertex up   */
+    { "Airfoil",  pat_airfoil  },   /* 3 — tilted ellipse, lift demo    */
+    { "Twin",     pat_twin     },   /* 4 — tandem cylinders             */
+    { "Array",    pat_array    },   /* 5 — 3x3 porous-medium proxy      */
+    { "Step",     pat_step     },   /* 6 — backward-facing step         */
+    { "Venturi",  pat_venturi  },   /* 7 — symmetric constriction       */
+    { "Splitter", pat_splitter },   /* 8 — cylinder + wake stabiliser   */
+    { "Wedge",    pat_wedge    },   /* 9 — triangular bluff body        */
+};
+#define N_PATTERNS ((int)(sizeof PATTERNS / sizeof PATTERNS[0]))
+
+/* Active pattern index — cycled by n/p keys.  File-scope so
+ * lbm_build_solid() (called from lbm_init()) can read it without
+ * threading another parameter through. */
+static int g_pattern_idx = 0;
+
+/* Dispatcher — the lbm_init call site doesn't need to know which
+ * geometry is active; it just calls lbm_build_solid which forwards
+ * to PATTERNS[g_pattern_idx].build. */
+static void lbm_build_solid(LBM *g)
+{
+    PATTERNS[g_pattern_idx].build(g);
+}
+
+/* ── lbm_init step-helpers ──────────────────────────────────────────── *
+ *
+ * lbm_init is a five-step recipe — tune the physics, reset the UI,
+ * compute obstacle geometry, build the solid mask (via the active
+ * pattern), and seed the fluid to equilibrium.  Each step gets a
+ * named helper so the orchestrator reads top-to-bottom as the recipe.
+ *                                                                       */
+
+/* (1) PHYSICS KNOBS — τ, ω = 1/τ (cached for the inner collision loop),
+ *     and inlet speed u_in (lattice units, must be ≪ cs = 1/√3). */
+static void lbm_set_physics_knobs(LBM *g, float tau, float u_in)
+{
+    g->tau   = tau;
+    g->omega = 1.0f / tau;
+    g->u_in  = u_in;
+}
+
+/* (2) UI / VIEW LATCHES — defaults.  pattern_apply() restores any
+ *     previously-active view on top of these after init, so n/p
+ *     pattern switching doesn't kick the user out of vorticity mode. */
+static void lbm_reset_ui_state(LBM *g)
+{
+    g->vis_mode    = VIS_VELOCITY;
     g->show_stream = false;
-    g->paused   = false;
-    g->step_count = 0;
+    g->paused      = false;
+    g->step_count  = 0;
+}
 
-    g->cyl_x = (int)(nx * CYL_X_FRAC);
-    g->cyl_y = (int)(ny * CYL_Y_FRAC);
-    g->cyl_r = (int)(ny * CYL_R_FRAC);
+/* (3) OBSTACLE REFERENCE GEOMETRY — derive (cyl_x, cyl_y, cyl_r) from
+ *     the CYL_*_FRAC constants × current grid dims.  Every pat_*
+ *     function in §5 uses these as its size reference, so the 10
+ *     obstacle shapes occupy comparable terminal real-estate. */
+static void lbm_compute_obstacle_geometry(LBM *g)
+{
+    g->cyl_x = (int)(g->nx * CYL_X_FRAC);
+    g->cyl_y = (int)(g->ny * CYL_Y_FRAC);
+    g->cyl_r = (int)(g->ny * CYL_R_FRAC);
     if (g->cyl_r < 2) g->cyl_r = 2;
+}
 
-    lbm_build_solid(g);
-
-    /* Initialize all fluid cells to equilibrium at (rho=1, ux=u_in, uy=0)
-     * Add tiny random uy perturbation to break symmetry and seed shedding. */
+/* (5) FLUID INITIALISATION — fill every fluid node with the Maxwell-
+ *     Boltzmann equilibrium f^eq at (ρ=1, u=u_in, v≈0).  A tiny
+ *     random uy perturbation breaks top/bottom symmetry of the
+ *     channel so vortex shedding can develop — a perfectly symmetric
+ *     channel preserves symmetry forever (the Hopf bifurcation [7]
+ *     needs a finite-amplitude seed to break it).
+ *
+ *     Fixed RNG seed → reproducible runs: same pattern + same τ +
+ *     same u_in always produces the same wake at the same step. */
+static void lbm_seed_fluid_to_equilibrium(LBM *g)
+{
+    int nx = g->nx, ny = g->ny;
     srand(12345);
     for (int y = 0; y < ny; y++) {
         for (int x = 0; x < nx; x++) {
             int idx = y * nx + x;
-            float perturb = g->solid[idx] ? 0.0f
-                          : (float)(rand() % 200 - 100) * 0.00005f;
+            float perturb = g->solid[idx]
+                ? 0.0f
+                : (float)(rand() % 200 - 100) * 0.00005f;
             for (int i = 0; i < 9; i++)
-                g->f[idx * 9 + i] = feq(i, 1.0f, u_in, perturb);
+                g->f[idx * 9 + i] = feq(i, 1.0f, g->u_in, perturb);
             g->rho[idx] = 1.0f;
-            g->ux[idx]  = g->solid[idx] ? 0.0f : u_in;
+            g->ux[idx]  = g->solid[idx] ? 0.0f : g->u_in;
             g->uy[idx]  = g->solid[idx] ? 0.0f : perturb;
         }
     }
+}
+
+/*
+ * lbm_init — five-step recipe; body reads as the recipe.
+ */
+static void lbm_init(LBM *g, int nx, int ny, float tau, float u_in)
+{
+    g->nx = nx;
+    g->ny = ny;
+    lbm_set_physics_knobs(g, tau, u_in);          /* (1) tune physics    */
+    lbm_reset_ui_state(g);                        /* (2) UI defaults     */
+    lbm_compute_obstacle_geometry(g);             /* (3) cyl reference   */
+    lbm_build_solid(g);                           /* (4) PATTERNS[].build*/
+    lbm_seed_fluid_to_equilibrium(g);             /* (5) f → f^eq        */
+}
+
+/*
+ * pattern_apply — switch to pattern `idx` and re-initialise the fluid
+ * to equilibrium around the new obstacle.  USER VIEW STATE (vis_mode,
+ * show_stream, paused) is preserved across the reset, so flipping
+ * patterns with n/p doesn't kick the user out of vorticity view back
+ * to the default velocity view.
+ *
+ * Physics state (τ, u_in) is also preserved — you keep your tuning.
+ *
+ * The full lbm_init re-runs because changing the obstacle geometry
+ * invalidates the existing distribution functions (a cell that was
+ * fluid may now be solid, and vice versa); restarting from equilibrium
+ * is the cleanest way to get a physically meaningful state.
+ */
+static void pattern_apply(LBM *g, int idx)
+{
+    if (idx < 0 || idx >= N_PATTERNS) return;
+    g_pattern_idx = idx;
+
+    int   vm   = g->vis_mode;
+    bool  ss   = g->show_stream;
+    bool  pp   = g->paused;
+    float tau  = g->tau;
+    float u_in = g->u_in;
+
+    lbm_init(g, g->nx, g->ny, tau, u_in);
+
+    g->vis_mode    = vm;
+    g->show_stream = ss;
+    g->paused      = pp;
 }
 
 /* ===================================================================== */
@@ -610,49 +1258,51 @@ static void collide(LBM *g)
 }
 
 /* ===================================================================== */
-/* §7  stream() — propagation + bounce-back boundaries                    */
+/* §7  stream — propagation + bounce-back + inlet/outlet BCs              */
 /* ===================================================================== */
 
-/*
- * Streaming: propagate post-collision distributions to neighbouring nodes.
- * Each f_i(x) moves to the node at (x + e_i) — think of it as each
- * "particle packet" sliding one lattice step in its direction of travel.
+/* ── stream step-helpers ────────────────────────────────────────────── *
  *
- * --- Bounce-back and the no-slip condition ---
- * When the destination node (x + e_i) is a solid cell (wall or cylinder),
- * the particle cannot enter.  Instead it is reflected back: it arrives
- * at the SAME source node x but in the OPPOSITE direction OPP[i].
- *   fnew[x, OPP[i]] += f[x, i]
- * This means the net momentum contribution of that distribution is
- * reversed — the wall exerts an equal and opposite force.  Summing over
- * all directions at the wall node gives net velocity = 0 (no-slip).
+ * The LBM streaming step is five distinct sub-steps; splitting them
+ * into named helpers makes the orchestrator (stream() below) read as
+ * the textbook recipe:
  *
- * --- Inlet boundary condition (x = 0) ---
- * After streaming, the inlet column is OVERWRITTEN with f^eq at
- * (rho=1, u=u_in, uy=0).  This models an infinite reservoir upstream
- * that continuously supplies fluid at the prescribed velocity,
- * regardless of what the interior flow delivered to x=0.
+ *   (1) zero the scratch buffer ftmp
+ *   (2) propagate-or-bounce: for each (cell, direction) either
+ *       stream to the neighbour or reflect at a solid (bounce-back)
+ *   (3) swap pointers f ↔ ftmp (O(1), no copy)
+ *   (4) overwrite inlet column with Dirichlet f^eq at u_in
+ *   (5) copy outlet column from its neighbour (Neumann, zero-gradient)
+ *                                                                       */
+
+/* (1) ftmp is the destination of this pass; previous contents are
+ *     stale.  Zero it once so the += accumulations in step (2) start
+ *     from a clean slate (a single solid cell can receive multiple
+ *     bounced-back distributions from different directions). */
+static void stream_clear_scratch(LBM *g)
+{
+    memset(g->ftmp, 0, g->nx * g->ny * 9 * sizeof(float));
+}
+
+/* (2) The core of streaming: for every fluid cell and every direction
+ *     i, look at the cell at (x+EX[i], y+EY[i]).
  *
- * --- Outlet boundary condition (x = nx-1) ---
- * The outlet uses a zero-gradient (Neumann) condition: f at the last
- * column is copied from the penultimate column (nx-2).  This is the
- * simplest open boundary: it prevents artificial pressure waves from
- * reflecting back into the domain — the same idea as the "absorbing
- * outlet" used in the acoustic wave solver.
+ *       NEIGHBOUR is FLUID   → propagate: fnew[neighbour, i] += f[here, i]
+ *       NEIGHBOUR is SOLID   → bounce-back: fnew[here, OPP[i]] += f[here, i]
+ *                              (the particle reverses direction at the
+ *                              wall; sum of incoming + reflected gives
+ *                              zero net velocity → no-slip [2, ch.5])
  *
- * --- Buffer swap ---
- * We write the streamed result into ftmp while reading from f, then
- * swap the pointers in O(1) — the same double-buffer trick used by the
- * acoustic solver's p/p_old swap.  No data is copied; only two pointers
- * are exchanged.
- */
-static void stream(LBM *g)
+ *     Vertical out-of-bounds (y=0 / y=ny-1) is treated as solid wall.
+ *     Horizontal out-of-bounds (x=0 / x=nx-1) is CLAMPED — the inlet
+ *     and outlet BCs in steps (4) and (5) overwrite those columns
+ *     unconditionally, so any propagation into x<0 or x≥nx is fine
+ *     to clamp to the boundary column (the value gets clobbered). */
+static void stream_propagate_or_bounce(LBM *g)
 {
     int nx = g->nx, ny = g->ny;
     float *f    = g->f;
     float *fnew = g->ftmp;
-
-    memset(fnew, 0, nx * ny * 9 * sizeof(float));
 
     for (int y = 0; y < ny; y++) {
         for (int x = 0; x < nx; x++) {
@@ -664,104 +1314,157 @@ static void stream(LBM *g)
                 int nx2 = x + EX[i];
                 int ny2 = y + EY[i];
 
-                /* Vertical out-of-bounds or solid → bounce back */
                 bool bounce = (ny2 < 0 || ny2 >= ny);
                 if (!bounce && nx2 >= 0 && nx2 < nx)
                     bounce = (g->solid[ny2 * nx + nx2] != 0);
 
                 if (bounce) {
-                    /* Reflect back to source cell in opposite direction */
                     fnew[(y * nx + x) * 9 + OPP[i]] += src[i];
                 } else {
-                    /* Clamp x for inlet/outlet (handled below) */
                     int tx = nx2 < 0 ? 0 : (nx2 >= nx ? nx - 1 : nx2);
                     fnew[(ny2 * nx + tx) * 9 + i] += src[i];
                 }
             }
         }
     }
+}
 
-    /* Swap buffers — g->f now holds the streamed result */
+/* (3) O(1) pointer swap — ftmp now holds the post-stream state, so
+ *     swap it into the g->f slot.  No memcpy: the next step expects
+ *     to read from g->f, and the next stream() call will overwrite
+ *     g->ftmp (the old f) anyway. */
+static void stream_swap_buffers(LBM *g)
+{
     float *tmp = g->f;
-    g->f = g->ftmp;
-    g->ftmp = tmp;
+    g->f      = g->ftmp;
+    g->ftmp   = tmp;
+}
 
-    /* ── Inlet BC (x=0): force equilibrium at u_in ── */
+/* (4) INLET Dirichlet BC at x=0.  Overwrite the inlet column with
+ *     f^eq at (ρ=1, u=u_in, v=0) — models an infinite upstream
+ *     reservoir feeding fluid at the prescribed velocity, regardless
+ *     of what the interior delivered to x=0 during step (2). */
+static void stream_apply_inlet_bc(LBM *g)
+{
+    int nx = g->nx, ny = g->ny;
     for (int y = 1; y < ny - 1; y++) {
         if (g->solid[y * nx + 0]) continue;
         float *fi = g->f + (y * nx + 0) * 9;
         for (int i = 0; i < 9; i++)
             fi[i] = feq(i, 1.0f, g->u_in, 0.0f);
     }
+}
 
-    /* ── Outlet BC (x=nx-1): zero-gradient extrapolation ── */
+/* (5) OUTLET Neumann BC at x=nx-1.  Copy f from the penultimate
+ *     column (zero-gradient ∂f/∂x = 0).  Simplest open boundary —
+ *     prevents pressure waves from reflecting back into the domain,
+ *     same idea as the absorbing outlet in the acoustic solver. */
+static void stream_apply_outlet_bc(LBM *g)
+{
+    int nx = g->nx, ny = g->ny;
     for (int y = 0; y < ny; y++) {
-        float *dst = g->f + (y * nx + (nx-1)) * 9;
+        float *dst  = g->f + (y * nx + (nx-1)) * 9;
         float *src2 = g->f + (y * nx + (nx-2)) * 9;
         memcpy(dst, src2, 9 * sizeof(float));
     }
 }
 
+/*
+ * stream — five-step LBM streaming recipe.  Body reads as the recipe.
+ */
+static void stream(LBM *g)
+{
+    stream_clear_scratch(g);            /* (1) zero ftmp                */
+    stream_propagate_or_bounce(g);      /* (2) f → ftmp + bounce-back   */
+    stream_swap_buffers(g);             /* (3) f ↔ ftmp                  */
+    stream_apply_inlet_bc(g);           /* (4) Dirichlet at x=0          */
+    stream_apply_outlet_bc(g);          /* (5) Neumann   at x=nx-1       */
+}
+
 /* ===================================================================== */
-/* §8  compute_macroscopic() — ρ, u from distribution moments             */
+/* §8  compute_macroscopic — ρ, u from distribution moments               */
 /* ===================================================================== */
 
+/* ── compute_macroscopic moment primitives ──────────────────────────── *
+ *
+ * Recovering (ρ, u) from the distribution functions is the canonical
+ * "moment problem": the macroscopic fields are statistical moments of
+ * the discrete distribution {f_i}.  Two named primitives express the
+ * math; a third handles the solid-cell sentinel values.  Mass and
+ * momentum conservation drop out of the moment definitions [1, §3]
+ * [2, §3.2].
+ *                                                                       */
+
+/* ρ = Σ_i f_i — the ZEROTH moment of f at one node.  Total probability
+ * mass at this cell = local fluid density.  Mass conservation. */
+static inline float density_zeroth_moment(const float *fi)
+{
+    float r = 0.0f;
+    for (int i = 0; i < 9; i++) r += fi[i];
+    return r;
+}
+
+/* u = (Σ_i f_i e_i) / ρ — the FIRST moment of f, normalised by ρ.
+ * Σ f_i e_i is momentum density (mass flux); dividing by mass gives
+ * velocity.  Momentum conservation, written as velocity. */
+static inline void velocity_first_moment(const float *fi, float rho,
+                                          float *ux, float *uy)
+{
+    float ru = 0.0f, rv = 0.0f;
+    for (int i = 0; i < 9; i++) {
+        ru += fi[i] * (float)EX[i];
+        rv += fi[i] * (float)EY[i];
+    }
+    *ux = ru / rho;
+    *uy = rv / rho;
+}
+
+/* Solid nodes hold no fluid.  Set sentinel values so renderers reading
+ * rho/ux/uy don't see garbage and the inlet BC (which uses feq at u_in
+ * for fluid cells only) stays sensible at wall-adjacent cells. */
+static inline void set_node_solid_defaults(LBM *g, int idx)
+{
+    g->rho[idx] = 1.0f;
+    g->ux[idx]  = 0.0f;
+    g->uy[idx]  = 0.0f;
+}
+
 /*
- * Recover the macroscopic fields (density and velocity) from the 9
- * distribution functions via their statistical moments.
- *
- * --- Zeroth moment: density ---
- *   ρ = Σ_i f_i
- * Sum all 9 distributions at a node.  This is mass conservation: the
- * total "probability mass" equals the fluid density at that node.
- *
- * --- First moment: momentum ---
- *   ρ·u = Σ_i f_i · e_i
- * Weighted sum of distributions with their lattice velocities e_i.
- * This is momentum conservation.  Dividing by ρ gives velocity u = ρu/ρ.
- * The e_i vectors are the D2Q9 unit directions defined in EX[] / EY[].
- *
- * Solid cells are set to rho=1, u=0 (no fluid, no flow).
- *
- * Stats (vel_max, rho_min, rho_max) are collected here in the same
- * O(nx×ny) pass, so the render functions and HUD can use them without
- * an extra traversal.
+ * compute_macroscopic — recover (ρ, u) at every node from f via the
+ * zeroth and first moments, AND collect per-frame stats (vel_max,
+ * rho_min, rho_max) in the same O(nx·ny) pass for the renderer's
+ * colour-map normalisation.
  */
 static void compute_macroscopic(LBM *g)
 {
-    int nx = g->nx, ny = g->ny;
     float vmax = 0.0f, rmin = 1e9f, rmax = -1e9f;
 
-    for (int y = 0; y < ny; y++) {
-        for (int x = 0; x < nx; x++) {
-            int idx = y * nx + x;
+    for (int y = 0; y < g->ny; y++) {
+        for (int x = 0; x < g->nx; x++) {
+            int idx = y * g->nx + x;
+
             if (g->solid[idx]) {
-                g->rho[idx] = 1.0f;
-                g->ux[idx]  = 0.0f;
-                g->uy[idx]  = 0.0f;
+                set_node_solid_defaults(g, idx);
                 continue;
             }
-            float *fi = g->f + idx * 9;
-            float r = 0.0f, ru = 0.0f, rv = 0.0f;
-            for (int i = 0; i < 9; i++) {
-                r  += fi[i];
-                ru += fi[i] * (float)EX[i];
-                rv += fi[i] * (float)EY[i];
-            }
-            if (r < 1e-6f) r = 1e-6f;
-            g->rho[idx] = r;
-            g->ux[idx]  = ru / r;
-            g->uy[idx]  = rv / r;
 
-            float vm = sqrtf(g->ux[idx]*g->ux[idx] + g->uy[idx]*g->uy[idx]);
-            if (vm > vmax)  vmax = vm;
-            if (r  < rmin)  rmin = r;
-            if (r  > rmax)  rmax = r;
+            const float *fi = g->f + idx * 9;
+            float r = density_zeroth_moment(fi);
+            if (r < 1e-6f) r = 1e-6f;            /* ÷0 guard */
+            g->rho[idx] = r;
+            velocity_first_moment(fi, r, &g->ux[idx], &g->uy[idx]);
+
+            float vm = sqrtf(g->ux[idx]*g->ux[idx]
+                           + g->uy[idx]*g->uy[idx]);
+            if (vm > vmax) vmax = vm;
+            if (r  < rmin) rmin = r;
+            if (r  > rmax) rmax = r;
         }
     }
-    g->vel_max  = vmax > 1e-6f ? vmax : 1e-6f;
-    g->rho_min  = rmin;
-    g->rho_max  = rmax;
+
+    g->vel_max = vmax > 1e-6f ? vmax : 1e-6f;
+    g->rho_min = rmin;
+    g->rho_max = rmax;
 }
 
 /* ===================================================================== */
@@ -879,9 +1582,12 @@ static void render_vorticity(const LBM *g, int cols, int rows)
     float inv = 2.9f / g->vort_max;   /* scale to [−3, +3] */
 
     static const char VOR_CHARS[6] = { '#', 'x', '.', '.', 'x', '#' };
-    /* index: 0-2 = negative (blue), 3-5 = positive (red) */
-    static const int  VOR_CP[6] = {
-        CP_VNEG2, CP_VNEG1, CP_VNEG0, CP_VPOS0, CP_VPOS1, CP_VPOS2
+    /* index 0..2 = clockwise (CP_VNEG side), 3..5 = CCW (CP_VPOS side).
+     * Intensity is encoded via the attribute, not via a separate colour
+     * pair — so all 6 levels share just 2 colour pairs. */
+    static const attr_t VOR_ATTR[6] = {
+        A_BOLD, A_NORMAL, A_DIM,    /* CW: strong → weak */
+        A_DIM,  A_NORMAL, A_BOLD    /* CCW: weak → strong */
     };
 
     for (int y = 0; y < ny && y < rows; y++) {
@@ -907,10 +1613,11 @@ static void render_vorticity(const LBM *g, int cols, int rows)
                 lv = 3 + lv;               /* 3=weak, 5=strong */
             }
 
-            attr_t at = (lv == 0 || lv == 5) ? A_BOLD : A_NORMAL;
-            attron(COLOR_PAIR(VOR_CP[lv]) | at);
+            short  cp = (lv < 3) ? CP_VNEG : CP_VPOS;
+            attr_t at = VOR_ATTR[lv];
+            attron(COLOR_PAIR(cp) | at);
             mvaddch(y + 1, x, (chtype)VOR_CHARS[lv]);
-            attroff(COLOR_PAIR(VOR_CP[lv]) | at);
+            attroff(COLOR_PAIR(cp) | at);
         }
     }
 }
@@ -1010,6 +1717,19 @@ static void render_streamlines(const LBM *g, int cols, int rows)
 
 static const char *VIS_NAMES[VIS_COUNT] = { "VELOCITY ", "VORTICITY", "DENSITY  " };
 
+/*
+ * render_overlay — canonical CLAUDE.md two-row HUD.
+ *
+ *   Row 0           : STATUS — mode, theme, viscosity, Reynolds, density
+ *                     range, peak speed, step count, fps, paused state.
+ *                     CP_HUD (bright yellow 226) + A_BOLD.
+ *   Row rows-1      : ACTION key legend.  CP_HINT (bright cyan 51) +
+ *                     A_BOLD — NEVER A_DIM (CLAUDE.md HUD Standard:
+ *                     dim text vanishes against bright animation).
+ *
+ * Pause state appears inline in the status (no centred overlay) so the
+ * HUD never occludes the flow.
+ */
 static void render_overlay(const LBM *g, int cols, int rows, double fps)
 {
     /* Reynolds estimate: Re = U·D / ν,  ν = (τ−0.5)/3 */
@@ -1017,39 +1737,72 @@ static void render_overlay(const LBM *g, int cols, int rows, double fps)
     float re = (nu > 1e-6f)
              ? (g->u_in * (float)(2 * g->cyl_r) / nu) : 0.0f;
 
+    /* ── Top row 0: STATUS ───────────────────────────────────────── */
     char top[256];
     snprintf(top, sizeof top,
-        " LBM D2Q9 | [%s]%s | τ=%.3f ν=%.4f Re≈%.0f"
-        " | ρ[%.3f,%.3f] |u|_max=%.4f | step:%-6d | %.0ffps ",
+        " LBM D2Q9  [%s]%s  pat:%s  theme:%s  tau=%.3f nu=%.4f Re~%.0f"
+        "  rho[%.3f,%.3f] |u|max=%.4f  step:%-6d  %.0ffps  %s",
         VIS_NAMES[g->vis_mode],
         g->show_stream ? "+stream" : "       ",
+        PATTERNS[g_pattern_idx].name,
+        THEMES[g_theme_idx].name,
         g->tau, nu, re,
         g->rho_min, g->rho_max, g->vel_max,
-        g->step_count, fps);
+        g->step_count, fps,
+        g->paused ? "PAUSED " : "running");
 
     attron(COLOR_PAIR(CP_HUD) | A_BOLD);
     mvaddnstr(0, 0, top, cols);
     attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-    /* Bottom key help */
-    attron(COLOR_PAIR(CP_HUD) | A_DIM);
+    /* ── Bottom row: ACTION keys ─────────────────────────────────── */
+    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
     mvprintw(rows - 1, 0,
-        " q:quit  spc:pause  v:velocity  o:vorticity  d:density"
-        "  s:streamlines  +/-:tau  r:reset  w/W:speed ");
-    attroff(COLOR_PAIR(CP_HUD) | A_DIM);
-
-    if (g->paused) {
-        attron(COLOR_PAIR(CP_VEL6) | A_BOLD);
-        mvprintw(rows / 2, cols / 2 - 4, " PAUSED ");
-        attroff(COLOR_PAIR(CP_VEL6) | A_BOLD);
-    }
+        " q:quit  spc:pause  v:vel  o:vort  d:density  s:stream"
+        "  n/p:pattern  +/-:tau  w/W:speed  t/T:theme  r:reset ");
+    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §12  scene                                                              */
 /* ===================================================================== */
 
-typedef struct { LBM lbm; } Scene;
+/*
+ * Scene — thin wrapper around the LBM container.
+ *
+ * Right now the Scene holds a single LBM, which IS the world state
+ * for this demo — the LBM struct already contains both the simulation
+ * half (lattice buffers, physics knobs, obstacle geometry, diagnostic
+ * stats) and the rendering/UI latches (vis_mode, show_stream, paused).
+ *
+ * WHY wrap it in a Scene then?  Forward cover.  If we ever need
+ *   per-scene state that doesn't belong inside the LBM struct — a
+ *   particle-tracer overlay, a recording buffer, a side-by-side
+ *   second lattice for A/B comparison — it goes here as a new field
+ *   without churning every function signature that already takes
+ *   Scene*.  scene_init / scene_tick / scene_draw / scene_resize
+ *   form a stable per-frame contract; adding to Scene leaves them
+ *   untouched.
+ *
+ * LOCALITY: the simulation-vs-rendering separation lives INSIDE the
+ * LBM struct (see its "SIMULATION half / SHARED / RENDERING half"
+ * field groups in §5), not at the Scene level.  Scene is currently
+ * just a placeholder ready for future per-scene additions.
+ *
+ * The full pipeline for one frame:
+ *   scene_init   — alloc + first-time lbm_init with the active pattern
+ *   scene_tick   — STEPS_PER_FRAME × {macro → collide → stream → macro}
+ *                  (+ compute_vorticity in vorticity mode); paused short-
+ *                  circuits.
+ *   scene_draw   — render_* (per mode) + render_streamlines + render_overlay.
+ *   scene_resize — free + alloc + lbm_init at new dims (preserves view).
+ *   scene_free   — release all heap buffers.
+ */
+typedef struct {
+    LBM lbm;    /* the entire D2Q9 BGK world — see §5 for the field
+                 * breakdown (lattice / physics / obstacle / stats /
+                 * UI latches all live in here). */
+} Scene;
 
 static void scene_init(Scene *sc, int cols, int rows)
 {
@@ -1119,7 +1872,29 @@ static void scene_draw(const Scene *sc, int cols, int rows, double fps)
 /* §13  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal-geometry container.
+ *
+ * Distinct from the simulation lattice dims (LBM.nx, LBM.ny) so the
+ * two can change INDEPENDENTLY:
+ *
+ *   - SIGWINCH fires → screen_resize re-reads cols/rows from ncurses
+ *     into this struct.  Then scene_resize attempts a re-fit of the
+ *     lattice; if that fails (e.g. terminal shrunk below the minimum
+ *     ny < 4), the lattice keeps its prior dims and the renderer
+ *     just clamps its loops to whatever fits.
+ *
+ *   - Bottom HUD / top HUD live at screen rows 0 and rows−1; lattice
+ *     rendering occupies rows [1, rows−2].  Render functions take
+ *     (cols, rows−2) explicitly so they paint into the right band
+ *     without knowing the HUD layout.
+ *
+ * Recomputed by screen_init at startup and by screen_resize on
+ * SIGWINCH.  Holds no allocation — it's purely a (cols, rows) pair.
+ */
+typedef struct {
+    int cols, rows;    /* current terminal width × height in cells */
+} Screen;
 
 static void screen_init(Screen *s)
 {
@@ -1141,11 +1916,44 @@ static void screen_resize(Screen *s)
 /* §14  app                                                                */
 /* ===================================================================== */
 
+/*
+ * App — top-level lifecycle container; everything in one place.
+ *
+ * WHY a struct (and not loose globals): the App lifecycle is well-
+ *   defined — born at main() init, dies at main() return.  Bundling
+ *   lets a single App* propagate through the main-loop helpers
+ *   (handle_key, the resize handler) without a forest of unrelated
+ *   globals.
+ *
+ * WHY signal flags live INSIDE App (with the volatile sig_atomic_t
+ * dance):
+ *
+ *   The C signal-handler signature is `void handler(int)` — no place
+ *   to pass an App* into it.  So we keep a SINGLE static App g_app
+ *   instance at file scope; on_exit / on_resize write to its flags.
+ *
+ *   The flags themselves MUST be `volatile sig_atomic_t` because:
+ *     - volatile      — the main-loop read can't be optimised away
+ *                       (the compiler doesn't know a signal will fire)
+ *     - sig_atomic_t  — the C standard guarantees these reads/writes
+ *                       are atomic w.r.t. signal interruption; other
+ *                       integer types may not be.
+ *
+ *   Signal handlers only set flags; the main loop reads them and
+ *   does the real work (endwin/refresh on resize, clean exit on
+ *   quit).  Doing the work IN the handler is unsafe — endwin /
+ *   ncurses calls / malloc / free are not signal-safe.
+ *
+ *   running       — clear (= 0) to break the main loop and exit
+ *                   cleanly through atexit(cleanup).
+ *   need_resize   — set on SIGWINCH; main loop services it by
+ *                   re-fitting Screen + Scene to the new terminal.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    Scene                 scene;         /* §12 — the world container   */
+    Screen                screen;        /* §13 — terminal geometry     */
+    volatile sig_atomic_t running;       /* SIGINT/SIGTERM → 0 → exit   */
+    volatile sig_atomic_t need_resize;   /* SIGWINCH → 1 → resize next  */
 } App;
 
 static App g_app;
@@ -1183,6 +1991,20 @@ static bool handle_key(App *app, int ch)
         break;
     case 'r': case 'R':
         scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+        break;
+    case 'n':
+        pattern_apply(g, (g_pattern_idx + 1) % N_PATTERNS);
+        break;
+    case 'p':
+        pattern_apply(g, (g_pattern_idx + N_PATTERNS - 1) % N_PATTERNS);
+        break;
+    case 't':
+        g_theme_idx = (g_theme_idx + 1) % N_THEMES;
+        theme_apply(g_theme_idx);
+        break;
+    case 'T':
+        g_theme_idx = (g_theme_idx + N_THEMES - 1) % N_THEMES;
+        theme_apply(g_theme_idx);
         break;
     default: break;
     }

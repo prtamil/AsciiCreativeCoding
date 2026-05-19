@@ -88,16 +88,72 @@
  *                 trail push + 4 trail samples + 6 IK solves + 7 tail
  *                 FK iterations. Microseconds total.
  *
- * References    :
- *   Reynolds, "Steering Behaviors for Autonomous Characters" (1999) —
- *     framework for the heading-toward-target interpolation pattern.
- *     https://www.red3d.com/cwr/steer/
- *   Wikipedia, "Inverse kinematics" — derives the 2-joint
- *     law-of-cosines solver used in solve_ik().
- *   Wikipedia, "Scorpion" — anatomy reference for the curving tail
- *     geometry (cauda raised over the back).
- *   Glenn Fiedler, "Fix Your Timestep!" (gafferongames.com) — case
- *     for fixed-step (stiff sims); we don't qualify, hence variable.
+ * References
+ * ──────────
+ *   ── Analytical 2-joint IK (the §5f solver) ───────────────────────
+ *   [1] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
+ *       and Control" (3rd ed.), Pearson — Ch. 4 derives the law-of-
+ *       cosines 2-link solution that solve_ik() implements verbatim;
+ *       §4.4 "Solvability" justifies the reachable-annulus clamp.
+ *   [2] Spong, M. W., Hutchinson, S. & Vidyasagar, M. (2005), "Robot
+ *       Modeling and Control", Wiley — alternative canonical text;
+ *       Ch. 4 covers the knee-up/knee-down configuration ambiguity.
+ *   [3] al-Kāshī, J. (1427), "Miftāḥ al-Hisāb" — earliest known
+ *       trigonometric form of the law of cosines (Euclid II.12-13
+ *       has the geometric form ~300 BCE); both drive solve_ik.
+ *
+ *   ── Procedural motion / steering ─────────────────────────────────
+ *   [4] Reynolds, C. (1999), "Steering Behaviors for Autonomous
+ *       Characters", GDC — the slew-rate-limited heading-toward-
+ *       target pattern in steer_heading.
+ *       https://www.red3d.com/cwr/steer/
+ *
+ *   ── Biological gait + travelling-wave bodies ────────────────────
+ *   [5] Wilson, D. M. (1966), "Insect Walking", Annual Review of
+ *       Entomology 11, pp. 103-122 — basis for the alternating
+ *       support-leg pattern; the "≤ N_LEGS/2 airborne" guard in
+ *       §5g update_steps follows this rule.
+ *   [6] Cruse, H. (1990), "What mechanisms coordinate leg movement
+ *       in walking arthropods?", Trends in Neurosciences 13(1) —
+ *       inter-leg coordination rules behind step triggering.
+ *   [7] Hirose, S. (1993), "Biologically Inspired Robots: Snake-Like
+ *       Locomotors and Manipulators", Oxford — the serpenoid curve
+ *       and travelling-wave body articulation; tail_bend_at_segment
+ *       implements a discrete version.
+ *
+ *   ── Differential geometry (2-D Frenet–Serret) ────────────────────
+ *   [8] do Carmo, M. P. (1976), "Differential Geometry of Curves
+ *       and Surfaces", Prentice-Hall — Ch. 1 §6: the Frenet frame.
+ *       lateral_normal_at_spine is the 2-D normal of the spine
+ *       polyline (rotate tangent by π/2).
+ *
+ *   ── Anatomy reference ──────────────────────────────────────────
+ *   [9] Polis, G. A., ed. (1990), "The Biology of Scorpions",
+ *       Stanford — Ch. 1 morphology + locomotion; basis for the
+ *       6-leg + curving cauda silhouette.
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *  [10] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
+ *       — when fixed-step matters; this file uses variable-step
+ *       because solve_ik is closed-form and the tail FK is stateless.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *  [11] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       the integer line algorithm; §5i draw_chain_line uses the
+ *       simpler parametric oversample because float math is already
+ *       paid for in the FK pipeline.
+ *  [12] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the high-contrast glyph ramp.
+ *  [13] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the diff pipeline §7 relies on.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [14] https://en.wikipedia.org/wiki/Inverse_kinematics
+ *  [15] https://en.wikipedia.org/wiki/Law_of_cosines
+ *  [16] https://en.wikipedia.org/wiki/Frenet%E2%80%93Serret_formulas
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -559,22 +615,43 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Per-theme palette. Pairs 1..7 set by the theme; HUD/HINT pairs are
- * theme-independent (CLAUDE.md HUD spec).
+ * Theme — one scorpion colour palette (xterm-256 fg indices).
  *
- * Pair semantics:
- *   col[0..2] body gradient (tail → head)  — col[2] is the main scorpion colour
- *   col[3..4] leg segments (upper / lower)
- *   col[5]    tail + planted feet '*' + stinger '#'  (bright accent)
- *   col[6]    swinging foot '.'                       (dim trailing accent)
+ * Intent
+ *   Each theme rebinds the seven body-rendering pairs (1..7) in one
+ *   shot via init_pair (see theme_apply). HUD/HINT pairs are
+ *   theme-independent (PAIR_HUD = bright yellow, PAIR_HINT = bright
+ *   cyan) so the status bar stays readable against any animation
+ *   behind it — CLAUDE.md HUD spec.
  *
- * All entries sit in the bright half of the 256-colour space:
- *   - cube colours: ≥ 24 (brightness rule)
- *   - grayscale:    ≥ 240 (the 232-239 zone vanishes under A_DIM)
+ * Slot semantics (col[0..6] map to pairs 1..7)
+ *   [0] body gradient — tail end (dimmest)
+ *   [1] body gradient — mid
+ *   [2] body gradient — head end (main scorpion colour)
+ *   [3] upper leg segment (femur)
+ *   [4] lower leg segment (tibia)
+ *   [5] BRIGHT accent — tail spine + planted-foot '*' + stinger '#'
+ *   [6] DIM accent    — swinging-foot '.' (visual cue: foot is in flight)
+ *
+ *   The tail-to-head gradient ([0]→[2]) lets the eye trace the body
+ *   without joint-numbering overlay. The bright/dim split on feet
+ *   [5]/[6] encodes ground contact: planted (in-contact) reads
+ *   brighter than swinging (in-flight). Ref [12] Bourke.
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness")
+ *   Every entry sits in the BRIGHT HALF of the 256-colour space:
+ *     - cube colours: ≥ 24  (avoid 16-23; invisible under A_DIM)
+ *     - grayscale  : ≥ 240 (avoid 232-239; same reason)
+ *   Theme character comes from the RELATIVE gradient, not absolute
+ *   darkness.
+ *
+ * References [12] Bourke for the gradient-as-depth pattern;
+ *   [13] Raymond §init_pair for the rebind mechanism.
  */
 typedef struct {
-    const char *name;
-    int col[N_PAIRS];   /* pairs 1..7 */
+    const char *name;            /* HUD-displayable theme name        */
+    int         col[N_PAIRS];    /* xterm-256 fg index per pair slot; *
+                                  * pair p = col[p-1] at apply time   */
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -645,7 +722,43 @@ static inline int px_to_cell_y(float py)
 
 /* Vec2 — 2-D position vector in pixel space.
  * x increases eastward; y increases downward (terminal convention). */
-typedef struct { float x, y; } Vec2;
+/*
+ * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
+ *
+ * Intent
+ *   Body kinematics, IK, hip placement, gait interpolation, and the
+ *   tail FK chain all live in pixel space. Each character cell is
+ *   CELL_W × CELL_H sub-pixels (8 × 16), so a walking scorpion reads
+ *   as continuous motion instead of jumping cell-to-cell. The
+ *   conversion to cell space happens only inside §5i rendering
+ *   helpers via px_to_cell_x/y — the project's "one conversion
+ *   point" rule.
+ *
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right of screen).
+ *   y : SOUTHWARD pixel coordinate (positive → down the screen).
+ *
+ *   Angles are MATH-CONVENTION (positive CCW from +X). Because y
+ *   points DOWN on screen, a math-CCW rotation displays as CW —
+ *   this matters in solve_ik's port/starboard sign convention and
+ *   in compute_hips's lateral-normal rotation (90° CCW = port).
+ *
+ * Why a value type
+ *   8 bytes; passes in registers. solve_ik takes/returns Vec2 by
+ *   value, vec2_add/sub/scale/lerp/norm all by value — -O2 inlines
+ *   them into straight-line code with no allocation.
+ *
+ * Why named (x, y) instead of two loose floats
+ *   Type-checking catches (col, row) confusion at compile time
+ *   rather than via visual debugging.
+ *
+ * References [1] Craig §2 "Spatial descriptions"; [8] do Carmo for
+ *   the 2-D vector formalism used in compute_hips.
+ */
+typedef struct {
+    float x;   /* eastward  pixel coordinate (positive → right) */
+    float y;   /* southward pixel coordinate (positive → down)  */
+} Vec2;
 
 /* ── §5a  vec2 + small helpers ──────────────────────────────────────── */
 
@@ -695,34 +808,112 @@ static inline Vec2 rotate2d(Vec2 v, float angle)
 
 /* ── Scorpion state ──────────────────────────────────────────────────── */
 
+/*
+ * Scorpion — the full creature state. Four interlocked subsystems
+ * sharing one record:
+ *
+ *   1. BODY  — trail-buffer FK. A circular log of past head positions;
+ *              body_joint[1..N] sample the trail at arc-lengths
+ *              i·BODY_SEG_LEN backward, so the body follows the path
+ *              the head carved. No per-segment angle math, no IK.
+ *              The same primitive as fk_centipede.c. Refs [1] Craig §3.
+ *
+ *   2. LEGS  — 2-joint analytical IK (law of cosines) + alternating
+ *              gait state machine. Per leg: (hip, foot_pos) drive an
+ *              IK solve that places (knee). Stepping flag + step_t
+ *              run a smoothstep-eased swing between foot_old and
+ *              step_target. The "≤ N_LEGS/2 airborne at once" guard
+ *              gives biological tripod-like stability. Refs [1][5][6].
+ *
+ *   3. TAIL  — stateless cumulative-angle FK chain anchored at the
+ *              abdomen joint. Each segment adds a base curl plus a
+ *              travelling-wave sin perturbation; total integrated
+ *              curl sweeps the stinger over the back (the iconic
+ *              scorpion silhouette). Refs [7] Hirose, [9] Polis.
+ *
+ *   4. STEERING — short-arc heading lerp toward target_heading,
+ *                 rate-limited to TURN_RATE rad/s. Ref [4] Reynolds.
+ *
+ *   Subsystems are UNCOUPLED in time: body integrates from heading;
+ *   hips read body_joint; gait reads hip; IK reads (hip, foot_pos);
+ *   tail reads body_joint[N]. No feedback loop — scene_tick walks
+ *   the dependency chain top-to-bottom once per frame.
+ *
+ * Why per-leg parallel arrays (SoA), not array-of-structs
+ *   N_LEGS is small (≤8) and most loops walk ONE field across all
+ *   legs at a time (renderer touches all foot_pos[]; gait touches
+ *   all stepping[]). SoA matches that access pattern; static config
+ *   tables (LEG_ANGLE, HIP_BODY_T) are parallel arrays too, so the
+ *   convention is consistent.
+ *
+ * Why trail is a CIRCULAR buffer (not a regular array)
+ *   Trail samples are pushed at the head and consumed at every
+ *   distance along the body. Circular indexing means no O(N) shift
+ *   per frame; trail_head walks mod TRAIL_CAP. Same idea as
+ *   fk_centipede.c's body chain.
+ *
+ * Why knee[] is CACHED (recomputed each tick)
+ *   solve_ik is cheap but not free. The renderer (legs, joint
+ *   markers) reads knee multiple times per frame; computing once
+ *   in update_steps lets the rest of the frame skip the math.
+ *
+ * Why hip_dist is DERIVED (not a compile-time constant)
+ *   Scaled to terminal height so legs spread proportionally. Recomputed
+ *   on SIGWINCH (in scene_init/app_do_resize).
+ *
+ * Why wave_time is SEPARATE from any frame-counter
+ *   It's the master clock for the tail's CLOSED-FORM FK — same
+ *   wave_time ⇒ same tail pose, regardless of how it got there.
+ *   Pausing freezes wave_time so the tail resumes in phase. Refs [7].
+ *
+ * References [1] Craig §3-§4 for FK + IK; [4] Reynolds for steering;
+ *   [5][6] Wilson + Cruse for the gait stability rule; [7] Hirose
+ *   for the serpenoid wave used in compute_tail; [9] Polis for the
+ *   anatomy that motivates the layout.
+ */
 typedef struct {
-    /* body — trail-buffer FK */
-    Vec2  trail[TRAIL_CAP];
-    int   trail_head, trail_count;
-    Vec2  body_joint[N_BODY_SEGS + 1];     /* [0]=head, [N]=tail joint    */
+    /* ── Body trail-buffer FK ─────────────────────────────────── *
+     * Circular log of recent head positions; body_joint[] is the *
+     * arc-length-sampled output, rewritten each tick.            */
+    Vec2 trail[TRAIL_CAP];
+    int  trail_head;                  /* index of newest entry, mod TRAIL_CAP */
+    int  trail_count;                 /* valid entries, saturates at TRAIL_CAP*/
+    Vec2 body_joint[N_BODY_SEGS + 1]; /* [0]=head joint, [N]=abdomen end      */
 
-    /* body kinematics */
-    float heading;
-    float target_heading;
-    float move_speed;
+    /* ── Body kinematics (rigid-body in world pixel space) ───── *
+     * heading is integrated from a slew-limited turn toward     *
+     * target_heading; body_joint[0] integrates along heading.   */
+    float heading;                    /* current direction (rad), 0 = +x      */
+    float target_heading;             /* steered toward this each tick        */
+    float move_speed;                 /* magnitude (px/s) along heading       */
 
-    /* per-leg state */
-    Vec2  hip[N_LEGS];
-    Vec2  knee[N_LEGS];
-    Vec2  foot_pos[N_LEGS];
-    Vec2  foot_old[N_LEGS];
-    Vec2  step_target[N_LEGS];
-    bool  stepping[N_LEGS];
-    float step_t[N_LEGS];
+    /* ── Per-leg state (SoA, length N_LEGS) ──────────────────── *
+     * hip and knee are derived (output of compute_hips/solve_ik). *
+     * foot_pos is in/out of the gait state machine; foot_old +   *
+     * step_target + step_t + stepping describe an active swing. */
+    Vec2  hip        [N_LEGS];        /* derived: world hip per tick          */
+    Vec2  knee       [N_LEGS];        /* derived: IK output per tick          */
+    Vec2  foot_pos   [N_LEGS];        /* current IK target (planted or arcing)*/
+    Vec2  foot_old   [N_LEGS];        /* foot at step start (lerp anchor)     */
+    Vec2  step_target[N_LEGS];        /* landing point this swing aims at     */
+    bool  stepping   [N_LEGS];        /* in-flight flag                       */
+    float step_t     [N_LEGS];        /* swing progress in [0, 1]             */
 
-    /* tail — stateless FK chain anchored at the abdomen */
-    Vec2  tail[N_TAIL_SEGS + 1];
-    float wave_time;          /* phase accumulator for tail oscillation */
+    /* ── Tail (closed-form cumulative-angle FK) ──────────────── *
+     * Stateless: tail[] is a pure function of (body_joint[N],   *
+     * heading, wave_time). wave_time is the ONLY persistent     *
+     * state — freezing it freezes the tail in phase.            */
+    Vec2  tail[N_TAIL_SEGS + 1];      /* [0]=anchor, [N]=stinger              */
+    float wave_time;                  /* phase accumulator (s) for tail sway  */
 
-    /* derived */
-    float hip_dist;
+    /* ── Resize-derived geometry ─────────────────────────────── *
+     * Scaled at init+resize so legs spread proportionally to    *
+     * terminal size.                                            */
+    float hip_dist;                   /* lateral offset of hip from spine (px)*/
 
-    /* ui state */
+    /* ── UI / control state ─────────────────────────────────── *
+     * paused gates scene_tick (render still runs);              *
+     * theme_idx selects the §3 palette.                         */
     bool  paused;
     int   theme_idx;
 } Scorpion;
@@ -764,27 +955,105 @@ static Vec2 trail_sample(const Scorpion *sc, float dist)
 
 /* ── §5c  body motion ──────────────────────────────────────────────── */
 
-static void steer_heading(Scorpion *sc, float dt)
+/*
+ * shortest_signed_angle — wrap a heading difference to [-π, π].
+ *
+ *   Heading lives on a circle; raw subtraction can give a delta of
+ *   e.g. +5π/3 when the true short rotation is -π/3. Wrapping makes
+ *   the scorpion always turn the SHORT way round the circle — critical
+ *   when target_heading and current heading straddle the π / -π
+ *   discontinuity.
+ */
+static float shortest_signed_angle(float diff)
 {
-    float diff = sc->target_heading - sc->heading;
     while (diff >  (float)M_PI) diff -= 2.0f * (float)M_PI;
     while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
-    sc->heading += clampf(diff, -TURN_RATE * dt, TURN_RATE * dt);
+    return diff;
 }
 
-static void translate_body(Scorpion *sc, float dt, int cols, int rows)
+/*
+ * clamp_to_max_turn_per_dt — apply rate limit on angular velocity.
+ *
+ *   This is a SLEW-RATE LIMITER (Reynolds steering): the heading
+ *   can change by at most TURN_RATE · dt radians per tick, no
+ *   matter how far away target_heading is. Produces a smooth
+ *   constant-angular-velocity turn instead of an instant snap.
+ */
+static float clamp_to_max_turn_per_dt(float diff, float dt)
+{
+    float max_step = TURN_RATE * dt;
+    return clampf(diff, -max_step, max_step);
+}
+
+/*
+ * steer_heading — rate-limited rotation toward target_heading.
+ *
+ *   1. shortest_signed_angle    : pick the SHORT direction.
+ *   2. clamp_to_max_turn_per_dt : slew-rate limit (max angular vel).
+ *   3. heading += clamped step.
+ *
+ * Reference: Reynolds (1999) "Steering Behaviors for Autonomous
+ * Characters", §"Wander / Seek" — the rate-limited heading-
+ * correction pattern.
+ */
+static void steer_heading(Scorpion *sc, float dt)
+{
+    float diff    = shortest_signed_angle(sc->target_heading - sc->heading);
+    float clamped = clamp_to_max_turn_per_dt(diff, dt);
+    sc->heading  += clamped;
+}
+
+/*
+ * integrate_position_along_heading — explicit Euler step.
+ *
+ *   x(t+dt) = x(t) + v · cos(θ) · dt
+ *   y(t+dt) = y(t) + v · sin(θ) · dt
+ *
+ *   Move_speed is constant magnitude; heading vector (cos, sin) is the
+ *   unit direction. Explicit Euler is unconditionally stable here
+ *   because there is no acceleration term — body is kinematic.
+ */
+static void integrate_position_along_heading(Scorpion *sc, float dt)
 {
     sc->body_joint[0].x += sc->move_speed * cosf(sc->heading) * dt;
     sc->body_joint[0].y += sc->move_speed * sinf(sc->heading) * dt;
+}
 
+/*
+ * wrap_position_to_toroidal_world — modular boundary.
+ *
+ *   The screen is treated as a TORUS — exiting the right edge
+ *   re-enters from the left, exiting the bottom re-enters from the
+ *   top. Mathematically:  pos ≡ pos  (mod world_size)
+ *
+ *   Subtract/add one world span instead of `fmodf` so a one-tick
+ *   overshoot resolves in O(1) without floating-point modulus
+ *   precision loss. Assumes |step| < world_size, which holds for
+ *   realistic dt + move_speed combinations.
+ */
+static void wrap_position_to_toroidal_world(Scorpion *sc, int cols, int rows)
+{
     float wpx = (float)(cols * CELL_W);
     float hpx = (float)(rows * CELL_H);
     if (sc->body_joint[0].x <  0.0f) sc->body_joint[0].x += wpx;
     if (sc->body_joint[0].x >= wpx)  sc->body_joint[0].x -= wpx;
     if (sc->body_joint[0].y <  0.0f) sc->body_joint[0].y += hpx;
     if (sc->body_joint[0].y >= hpx)  sc->body_joint[0].y -= hpx;
+}
 
-    trail_push(sc, sc->body_joint[0]);
+/*
+ * translate_body — advance head one tick and record the trail.
+ *
+ *   1. integrate_position_along_heading  : Euler step in heading dir.
+ *   2. wrap_position_to_toroidal_world   : modular boundary.
+ *   3. trail_push                        : FK source-of-truth update —
+ *                                          body_joints follow the head.
+ */
+static void translate_body(Scorpion *sc, float dt, int cols, int rows)
+{
+    integrate_position_along_heading  (sc, dt);
+    wrap_position_to_toroidal_world   (sc, cols, rows);
+    trail_push                        (sc, sc->body_joint[0]);
 }
 
 /* ── §5d  body joints (trail-buffer FK) ──────────────────────────── */
@@ -805,46 +1074,184 @@ static Vec2 body_local_forward(const Scorpion *sc, int seg_idx)
                               sc->body_joint[seg_idx + 1]));
 }
 
+/*
+ * attachment_point_along_spine — find world-space point at fractional
+ * arc-length t along the body-joint chain.
+ *
+ *   The spine is a polyline through body_joint[0..N_BODY_SEGS].
+ *   HIP_BODY_T[i] ∈ [0,1] is leg i's normalised position along it.
+ *   Multiply by N_BODY_SEGS to get a real-valued index, split into
+ *   integer (segment) + fractional (interpolation weight) parts,
+ *   then linearly interpolate between the two bracketing joints.
+ *
+ *   This is PIECEWISE-LINEAR ARC-LENGTH PARAMETERISATION — the same
+ *   trick a tessellator uses to walk along a curve at constant rate.
+ *
+ *   Outputs the spine point AND the segment index whose tangent the
+ *   caller will need (so compute_hips doesn't recompute it).
+ */
+static Vec2 attachment_point_along_spine(const Scorpion *sc, float t_norm,
+                                         int *seg_idx_out)
+{
+    float t_body  = t_norm * (float)N_BODY_SEGS;
+    int   seg_idx = (int)t_body;
+    if (seg_idx >= N_BODY_SEGS) seg_idx = N_BODY_SEGS - 1;
+    float frac    = t_body - (float)seg_idx;
+
+    *seg_idx_out = seg_idx;
+    return vec2_lerp(sc->body_joint[seg_idx],
+                     sc->body_joint[seg_idx + 1], frac);
+}
+
+/*
+ * lateral_normal_at_spine — 90° rotation of the local body tangent.
+ *
+ *   In 2-D the LEFT-HAND NORMAL of a unit tangent (tx, ty) is
+ *   (-ty, tx) — a +π/2 rotation. Multiplying by `side` ∈ {+1,-1}
+ *   gives port (left) or starboard (right) lateral direction.
+ *
+ *   This is the Frenet–Serret normal for a 2-D planar curve; in 3-D
+ *   it becomes one of two principal normals and the math gets harder.
+ *   In 2-D we just rotate by 90°.
+ */
+static Vec2 lateral_normal_at_spine(const Scorpion *sc, int seg_idx, float side)
+{
+    Vec2 fwd       = body_local_forward(sc, seg_idx);
+    Vec2 left_norm = (Vec2){ -fwd.y, fwd.x };           /* +π/2 rotation */
+    return vec2_scale(left_norm, side);
+}
+
+/*
+ * compute_hips — place all N_LEGS hips by stepping laterally off the
+ * spine.
+ *
+ *   For each leg i:
+ *     1. attachment_point_along_spine : where on the body chain this
+ *                                       leg pair hangs from.
+ *     2. lateral_normal_at_spine      : ± Frenet normal (port/starboard).
+ *     3. hip = attachment + hip_dist · normal.
+ *
+ *   side = +1 for even i (port), −1 for odd (starboard). hip_dist is
+ *   scaled to terminal height so legs spread proportionally.
+ */
 static void compute_hips(Scorpion *sc)
 {
     for (int i = 0; i < N_LEGS; i++) {
-        float t_body  = HIP_BODY_T[i] * (float)N_BODY_SEGS;
-        int   seg_idx = (int)t_body;
-        if (seg_idx >= N_BODY_SEGS) seg_idx = N_BODY_SEGS - 1;
-        float frac    = t_body - (float)seg_idx;
-        Vec2  attach  = vec2_lerp(sc->body_joint[seg_idx],
-                                  sc->body_joint[seg_idx + 1], frac);
+        int  seg_idx;
+        Vec2 attach = attachment_point_along_spine(sc, HIP_BODY_T[i], &seg_idx);
 
-        Vec2  fwd       = body_local_forward(sc, seg_idx);
-        Vec2  left_norm = (Vec2){ -fwd.y, fwd.x };
-        float side      = (i % 2 == 0) ? 1.0f : -1.0f;
+        float side  = (i % 2 == 0) ? 1.0f : -1.0f;
+        Vec2  out   = lateral_normal_at_spine(sc, seg_idx, side);
 
-        sc->hip[i] = vec2_add(attach,
-                              vec2_scale(left_norm, side * sc->hip_dist));
+        sc->hip[i]  = vec2_add(attach, vec2_scale(out, sc->hip_dist));
     }
 }
 
 /* ── §5f  2-joint analytical IK ──────────────────────────────────── */
 
+/*
+ * clamp_to_reachable_annulus — pull distance into the IK-solvable range.
+ *
+ *   A 2-link chain (lengths U, L) can reach exactly the points whose
+ *   distance from the hip lies in the closed interval [|U-L|, U+L]:
+ *     - INNER boundary |U-L|: legs folded flat against each other.
+ *     - OUTER boundary  U+L : legs fully extended in a straight line.
+ *   Outside this annulus there is no real triangle and acos's argument
+ *   leaves [-1, 1]. The ±1 px margin keeps cos_h strictly interior so
+ *   floating-point round-off can't push it onto the singular boundary.
+ *
+ *   Geometric reference: triangle inequality.
+ */
+static float clamp_to_reachable_annulus(float dist)
+{
+    return clampf(dist,
+                  fabsf(UPPER_LEN - LOWER_LEN) + 1.0f,
+                  UPPER_LEN + LOWER_LEN        - 1.0f);
+}
+
+/*
+ * law_of_cosines_apex_angle — angle at the hip in the triangle
+ * (hip, knee, foot).
+ *
+ *   Sides:  U = hip→knee, L = knee→foot, d = hip→foot.
+ *   Law of cosines at the HIP vertex (opposite side L):
+ *
+ *       L² = U² + d² − 2·U·d·cos(α)
+ *       cos(α) = (d² + U² − L²) / (2·d·U)
+ *       α      = acos(cos(α))
+ *
+ *   α is the angle between the U-side (upper leg) and the d-side
+ *   (line to target). It is ALWAYS positive (acos ∈ [0, π]); the
+ *   knee-up vs knee-down ambiguity is resolved in the caller by
+ *   adding or subtracting α from `base`.
+ *
+ *   Reference: law of cosines — geometric form in Euclid's Elements
+ *   II.12-13 (~300 BCE), trigonometric form in al-Kāshī's "Miftāḥ
+ *   al-Hisāb" (1427).
+ */
+static float law_of_cosines_apex_angle(float dist)
+{
+    float cos_h = (dist * dist + UPPER_LEN * UPPER_LEN
+                                - LOWER_LEN * LOWER_LEN)
+                  / (2.0f * dist * UPPER_LEN);
+    return acosf(clampf(cos_h, -1.0f, 1.0f));
+}
+
+/*
+ * place_knee_at_angle — walk UPPER_LEN from hip along a given angle.
+ *
+ *   knee = hip + U · (cos θ, sin θ)
+ *
+ *   This is the FK PRIMITIVE (one rigid link from a base) applied
+ *   once. After this, the lower leg is implicit — it runs straight
+ *   from knee to foot (and is LOWER_LEN long iff dist was inside
+ *   the reachable annulus, guaranteed by the clamp above).
+ */
+static Vec2 place_knee_at_angle(Vec2 hip, float angle)
+{
+    return (Vec2){ hip.x + UPPER_LEN * cosf(angle),
+                   hip.y + UPPER_LEN * sinf(angle) };
+}
+
+/*
+ * solve_ik — analytical 2-joint IK by law of cosines.
+ *
+ *   Geometry — triangle (hip, knee, foot):
+ *
+ *       hip *────────── U ──────────* knee
+ *            \                      /
+ *             \                    /
+ *               d                 L
+ *                \              /
+ *                 \           /
+ *                  *────────* foot (= target)
+ *
+ *   1. d = |target − hip|
+ *   2. clamp_to_reachable_annulus(d)  — keep the triangle valid.
+ *   3. base = atan2(target − hip)     — direction from hip to target.
+ *   4. α    = law_of_cosines_apex_angle(d)
+ *        offset of the knee from the d-line.
+ *   5. knee_angle = base ± α          — sign picks knee-up / knee-down.
+ *      Left-side legs: +α (knee on port side).
+ *      Right-side legs: -α (knee on starboard side).
+ *   6. place_knee_at_angle(hip, knee_angle).
+ *
+ * Closed-form, branchless except for the L/R sign and the safety
+ * clamps. References: Wikipedia "Inverse kinematics" §"Analytical
+ * 2-link" derivation; Craig "Introduction to Robotics" Ch. 4
+ * "Solvability".
+ */
 static void solve_ik(Vec2 hip, Vec2 target, bool is_left, Vec2 *knee_out)
 {
     float dx   = target.x - hip.x;
     float dy   = target.y - hip.y;
-    float dist = sqrtf(dx * dx + dy * dy);
+    float dist = clamp_to_reachable_annulus(sqrtf(dx * dx + dy * dy));
 
-    dist = clampf(dist,
-                  fabsf(UPPER_LEN - LOWER_LEN) + 1.0f,
-                  UPPER_LEN + LOWER_LEN - 1.0f);
+    float base        = atan2f(dy, dx);
+    float alpha       = law_of_cosines_apex_angle(dist);
+    float knee_angle  = is_left ? (base + alpha) : (base - alpha);
 
-    float base    = atan2f(dy, dx);
-    float cos_h   = (dist * dist + UPPER_LEN * UPPER_LEN
-                                  - LOWER_LEN * LOWER_LEN)
-                    / (2.0f * dist * UPPER_LEN);
-    float ah      = acosf(clampf(cos_h, -1.0f, 1.0f));
-    float ka      = is_left ? (base + ah) : (base - ah);
-
-    knee_out->x = hip.x + UPPER_LEN * cosf(ka);
-    knee_out->y = hip.y + UPPER_LEN * sinf(ka);
+    *knee_out = place_knee_at_angle(hip, knee_angle);
 }
 
 /* ── §5g  step gait ──────────────────────────────────────────────── */
@@ -909,20 +1316,41 @@ static bool advance_swing(Scorpion *sc, int i, float dt)
     return false;
 }
 
+/*
+ * update_steps — one gait-tick orchestrator.
+ *
+ *   Per-leg dispatch (mutually exclusive): each leg is in exactly one
+ *   of three states this tick, with airborne-count book-keeping to
+ *   enforce the "≤ N_LEGS / 2 in flight at once" stability rule.
+ *
+ *     STATE                  ACTION                       n_air delta
+ *     ─────                  ──────                       ───────────
+ *     OVERSTRETCHED          snap_overstretched_foot      -1 (lands)
+ *     IN-FLIGHT              advance_swing                -1 if lands
+ *     PLANTED + drift/strain maybe_trigger_step           +1 if takes off
+ *
+ *   The stability rule (≤ half airborne) is the same constraint
+ *   real arthropods follow — see Wilson "Insect Walking" 1966 and
+ *   Cruse "What mechanisms coordinate leg movement" 1990.
+ *
+ *   After dispatch, run analytical 2-joint IK on every leg so the
+ *   knee always matches the current foot position. is_left = (i%2==0)
+ *   mirrors solve_ik's port/starboard sign convention.
+ */
 static void update_steps(Scorpion *sc, float dt)
 {
     int n_air = count_airborne(sc);
 
+    /* PHASE 1 — advance per-leg state machine */
     for (int i = 0; i < N_LEGS; i++) {
-        if (snap_overstretched_foot(sc, i)) n_air--;
+        if      (snap_overstretched_foot(sc, i))    n_air--;
         else if (sc->stepping[i]) {
-            if (advance_swing(sc, i, dt))   n_air--;
+            if (advance_swing(sc, i, dt))           n_air--;
         }
-        else {
-            if (maybe_trigger_step(sc, i, n_air)) n_air++;
-        }
+        else if (maybe_trigger_step(sc, i, n_air))  n_air++;
     }
 
+    /* PHASE 2 — recompute knee positions from updated feet */
     for (int i = 0; i < N_LEGS; i++)
         solve_ik(sc->hip[i], sc->foot_pos[i], (i % 2 == 0), &sc->knee[i]);
 }
@@ -930,39 +1358,60 @@ static void update_steps(Scorpion *sc, float dt)
 /* ── §5h  tail FK ────────────────────────────────────────────────── */
 
 /*
- * compute_tail — stateless FK chain for the curving tail.
+ * tail_bend_at_segment — per-segment bend angle δᵢ for the tail FK.
  *
- * Tail is anchored at body_joint[N_BODY_SEGS] (the abdomen-end joint).
- * Cumulative angle starts at (heading + π) so the tail initially points
- * REARWARD from the abdomen. Each segment then adds:
+ *     δᵢ = BASE_CURL + SWAY_AMP · sin(ω·t + i·PSEG)
  *
- *     δᵢ = TAIL_BASE_CURL + TAIL_SWAY_AMP · sin(wave_time · TAIL_FREQ
- *                                                + i · TAIL_PHASE_PER_SEG)
+ *   BASE_CURL : constant additive bend (each segment curls a bit
+ *               further than its predecessor → cumulative curve).
+ *   SWAY_AMP  : amplitude of the sinusoidal travelling-wave sway.
+ *   PSEG      : per-segment phase offset; with PSEG > 0 the wave
+ *               propagates FROM ROOT TO TIP along the tail (the
+ *               serpenoid pattern — see Hirose 1993 §"Wave
+ *               propagation in articulated bodies").
  *
- * The cumulative effect of N_TAIL_SEGS · TAIL_BASE_CURL ≈ 2.4 rad ≈ 136°
- * sweeps the tail UP and OVER the body, ending with the stinger pointing
- * forward-and-up — the iconic scorpion silhouette.
+ *   Reference: Frisch-Hasslacher-Pomeau showed wave-propagation
+ *   patterns can be reproduced by simple per-cell rules; the same
+ *   intuition applies here to per-segment angles.
+ */
+static float tail_bend_at_segment(const Scorpion *sc, int i)
+{
+    float wave = TAIL_SWAY_AMP * sinf(sc->wave_time * TAIL_FREQ
+                                      + (float)i * TAIL_PHASE_PER_SEG);
+    return TAIL_BASE_CURL + wave;
+}
+
+/*
+ * compute_tail — stateless cumulative-angle FK chain for the tail.
  *
- * The sin perturbation makes a wave roll along the tail (phase offset
- * i · TAIL_PHASE_PER_SEG per segment), so the stinger visibly sways
- * over the wave_time period (~6.3 s at default).
+ *   1. ANCHOR    tail[0] = body_joint[N_BODY_SEGS]   (abdomen end)
+ *   2. SEED      cumulative_angle = heading + π     (point rearward)
+ *   3. FOR each segment i ∈ [0, N_TAIL_SEGS):
+ *        a. δᵢ = tail_bend_at_segment(i)
+ *        b. cumulative_angle += δᵢ                  (chain-of-rotations)
+ *        c. tail[i+1] = tail[i] + L · (cos, sin)(cumulative_angle)
  *
- * No iteration, no state across frames except wave_time. The tail is
- * a closed-form function of (body pose, wave_time).
+ *   Total integrated curl ≈ N_TAIL_SEGS · TAIL_BASE_CURL ≈ 2.4 rad ≈ 136°
+ *   sweeps the tail UP and OVER the body, ending with the stinger
+ *   pointing forward-and-up — the iconic scorpion silhouette.
+ *
+ *   STATELESS: closed-form function of (body pose, wave_time). Same
+ *   inputs ⇒ same tail; no integrator state crosses frames.
+ *
+ *   This is the same cumulative-angle FK used in fk_tentacle_forest.c;
+ *   here it's anchored to a moving abdomen rather than a fixed root.
  */
 static void compute_tail(Scorpion *sc)
 {
-    sc->tail[0] = sc->body_joint[N_BODY_SEGS];   /* anchor at abdomen */
+    sc->tail[0] = sc->body_joint[N_BODY_SEGS];   /* PHASE 1: anchor */
 
-    float angle = sc->heading + (float)M_PI;     /* point rearward */
+    float cumulative_angle = sc->heading + (float)M_PI;  /* PHASE 2: seed */
 
-    for (int i = 0; i < N_TAIL_SEGS; i++) {
-        float wave  = TAIL_SWAY_AMP * sinf(sc->wave_time * TAIL_FREQ
-                                           + (float)i * TAIL_PHASE_PER_SEG);
-        angle += TAIL_BASE_CURL + wave;
+    for (int i = 0; i < N_TAIL_SEGS; i++) {              /* PHASE 3: walk */
+        cumulative_angle += tail_bend_at_segment(sc, i);
 
-        sc->tail[i + 1].x = sc->tail[i].x + TAIL_SEG_LEN * cosf(angle);
-        sc->tail[i + 1].y = sc->tail[i].y + TAIL_SEG_LEN * sinf(angle);
+        sc->tail[i + 1].x = sc->tail[i].x + TAIL_SEG_LEN * cosf(cumulative_angle);
+        sc->tail[i + 1].y = sc->tail[i].y + TAIL_SEG_LEN * sinf(cumulative_angle);
     }
 }
 
@@ -1167,7 +1616,45 @@ static void render_scorpion(const Scorpion *sc, WINDOW *w, int cols, int rows)
 /* §6  scene — thin wrapper around Scorpion                              */
 /* ===================================================================== */
 
-typedef struct { Scorpion scorpion; } Scene;
+/*
+ * Scene — composition root for §6.
+ *
+ * Intent
+ *   In this demo the simulation IS one scorpion. We keep a Scene
+ *   wrapper anyway so the framework loop (scene_init / scene_tick /
+ *   scene_draw) reads identically to every other file in the repo.
+ *   If a future variant adds prey, obstacles, pheromone trails, or
+ *   a swarm of scorpions, they slot in here as siblings of `scorpion`
+ *   without changing the loop.
+ *
+ * Simulation vs Rendering locality
+ *   The Scorpion struct itself already separates Body / Legs / Tail /
+ *   Steering / UI. Within Scene there is no further split needed yet
+ *   — one field, one concern. When adding a new member, place it
+ *   as follows:
+ *
+ *     ── Simulation state ──   things scene_tick READS+WRITES
+ *                              (prey[], obstacle_grid, pheromones, …)
+ *     ── Render-only state ──  things scene_draw READS, never the
+ *                              physics path (camera, shake, FX layers)
+ *
+ * Things that DO NOT live here
+ *   - fps / sim_fps counters → §8 App (frame-timing concern, not
+ *     part of the world being simulated).
+ *   - terminal extents (cols, rows) → §7 Screen.
+ *   - signal flags (running, need_resize) → §8 App.
+ *   - Per-leg geometry tables HIP_BODY_T, LEG_ANGLE → §5a
+ *     (file-scope `static const`; never mutates).
+ *
+ * One Scene per program; passed by pointer to every §6 entry point.
+ */
+typedef struct {
+    /* ── Simulation state ─────────────────────────────────────── */
+    Scorpion scorpion;         /* the world: body + 6 legs + tail   */
+
+    /* (no render-only state yet — theme_idx + paused live inside
+     *  Scorpion because they're user-toggled in the same keymap)  */
+} Scene;
 
 /*
  * scene_init — place scorpion at screen centre with a pre-populated
@@ -1246,7 +1733,31 @@ static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows)
 /* §7  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal-extent snapshot in CHARACTER CELLS.
+ *
+ * Intent
+ *   Caches the current terminal size so every §6 entry point reads
+ *   (cols, rows) as plain ints rather than re-querying ncurses each
+ *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
+ *   propagated to scene_init via app_do_resize.
+ *
+ * Why a separate struct (not just two ints in App)
+ *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
+ *   except this struct. Carving it out makes screen_resize pure and
+ *   isolates the ncurses dependency from the simulation layer.
+ *
+ * Why cells, not pixels
+ *   ncurses' coordinate system is cells. Pixel space (CELL_W ×
+ *   CELL_H sub-pixels per cell) lives only inside §5 — converted at
+ *   the draw boundary, per the project's "one conversion point" rule.
+ *
+ * References [13] Raymond, NCURSES Programming HOWTO.
+ */
+typedef struct {
+    int cols;   /* terminal width  in CHARACTER CELLS */
+    int rows;   /* terminal height in CHARACTER CELLS */
+} Screen;
 
 static void screen_init(Screen *s)
 {
@@ -1315,12 +1826,51 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* §8  app                                                                */
 /* ===================================================================== */
 
+/*
+ * App — top-level container; everything outside the world.
+ *
+ * Intent
+ *   Bundles the simulated world (Scene), the host terminal (Screen),
+ *   and the loop-control flags into one record so main() reads as
+ *   four-line phases: init / service signals / step+draw / shutdown.
+ *   Declared file-scope (g_app) so signal handlers — which cannot
+ *   take a user argument — can write `running` and `need_resize`
+ *   without globals scattered through the file.
+ *
+ * Locality of concern
+ *   ── Owned subsystems ── nouns the app composes
+ *      scene       — the world being simulated (§6)
+ *      screen      — the terminal extent it draws to (§7)
+ *
+ *   ── Loop control ─── verbs the loop reads each frame
+ *      time_scale  — wall-clock dt multiplier ([ / ] adjust)
+ *      running     — clear → loop exits; set by SIGINT/SIGTERM
+ *      need_resize — set by SIGWINCH; cleared after Screen refresh
+ *
+ * Why volatile sig_atomic_t (not bool, not int)
+ *   `volatile`    : the compiler must not cache the flag across a
+ *                   signal-handler write — every loop iteration must
+ *                   re-read it from memory.
+ *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
+ *                   signals; a plain `int` could be observed half-
+ *                   written on architectures where stores are split.
+ *   See [13] Raymond §"Signal handling".
+ *
+ * Things that DO NOT live here
+ *   - Wall-clock timestamps / fps counters — main() locals; no
+ *     other code path needs them.
+ *   - Scorpion tuning values (move_speed, theme_idx) — user-state
+ *     in §5 Scorpion.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    float                 time_scale;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* ── Owned subsystems ─────────────────────────────────────── */
+    Scene  scene;              /* the world (§6)                       */
+    Screen screen;             /* terminal extent (§7)                 */
+
+    /* ── Loop control ─────────────────────────────────────────── */
+    float                 time_scale;   /* dt multiplier; 1.0 = realtime */
+    volatile sig_atomic_t running;      /* main loop predicate            */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH pending               */
 } App;
 
 static App g_app;

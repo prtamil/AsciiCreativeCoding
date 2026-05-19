@@ -80,13 +80,68 @@
  *                  32 joints at 60 Hz this is well under 1 µs per frame.
  *                  ncurses doupdate transmits only changed cells.
  *
- * References     : Khoshrou, "Snake Robot Locomotion," 2009 — analysis of
- *                    serpentine FK on a moving curve.
- *                  Reynolds, "Steering Behaviors for Autonomous Characters,"
- *                    1999 — the seminal source for edge-bias / containment.
- *                  Wikipedia: "Forward kinematics" — chained-frame model.
- *                  Red Blob Games, "2D Visibility / Field of View" — the
- *                    cell-walk pattern reused here for bead rendering.
+ * References
+ * ──────────
+ *   ── Forward kinematics + canonical robotics ──────────────────────
+ *   [1] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
+ *       and Control" (3rd ed.), Pearson — Ch. 3 derives chained-frame
+ *       FK; this file uses the path-following (trail-buffer) variant
+ *       instead of explicit joint angles.
+ *   [2] Spong, M. W., Hutchinson, S. & Vidyasagar, M. (2005), "Robot
+ *       Modeling and Control", Wiley — alternative canonical text;
+ *       Ch. 3 covers the same composition cleanly.
+ *
+ *   ── Snake / serpentine locomotion ────────────────────────────────
+ *   [3] Hirose, S. (1993), "Biologically Inspired Robots: Snake-Like
+ *       Locomotors and Manipulators", Oxford — the "serpenoid curve"
+ *       and travelling-wave snake locomotion model; the sinusoidal
+ *       CPG in cpg_turn_rate() implements a discrete version.
+ *   [4] Khoshrou, S. (2009), "Snake Robot Locomotion: Theory and
+ *       Simulation" — analysis of serpentine FK on a moving curve;
+ *       direct inspiration for trail-buffer body following.
+ *   [5] Manton, S. M. (1952), "The evolution of arthropodan
+ *       locomotory mechanisms", J. Linn. Soc. Zoology — biological
+ *       reference for central pattern generators (CPGs) that drive
+ *       autonomous gait without sensory feedback.
+ *
+ *   ── Procedural motion / steering ─────────────────────────────────
+ *   [6] Reynolds, C. (1999), "Steering Behaviors for Autonomous
+ *       Characters", GDC — the seminal source for soft-fence
+ *       containment behind edge_bias_turn(); also the slew-rate-
+ *       limited heading-correction pattern.
+ *       https://www.red3d.com/cwr/steer/
+ *
+ *   ── Path / arc-length parameterisation (trail_sample) ───────────
+ *   [7] Foley, J. D., van Dam, A. et al. (1995), "Computer Graphics:
+ *       Principles and Practice" (2nd ed.) — §11.2 spline / curve
+ *       arc-length parameterisation; trail_sample applies the same
+ *       walk-and-interpolate technique to a polyline.
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *   [8] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com —
+ *       the fixed-step accumulator pattern this file uses; alpha
+ *       interpolation between prev_joint and joint comes from here.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *   [9] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       the integer line algorithm; §5d draw_segment_beads uses the
+ *       simpler parametric oversample because float math is already
+ *       paid for in trail_sample.
+ *  [10] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — basis for
+ *       the head-to-tail brightness gradient.
+ *  [11] Patel, A. (Red Blob Games), "2D Visibility / Field of View" —
+ *       the cell-walk pattern reused for bead rendering.
+ *       https://www.redblobgames.com/articles/visibility/
+ *  [12] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the diff pipeline §7 relies on.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [13] https://en.wikipedia.org/wiki/Forward_kinematics
+ *  [14] https://en.wikipedia.org/wiki/Central_pattern_generator
+ *  [15] https://en.wikipedia.org/wiki/Snake_robot
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -705,23 +760,42 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Theme — one named body palette.
+ * Theme — one named multi-colour body palette (xterm-256 fg indices).
  *
- *   name   — displayed in the HUD status bar.
- *   body[] — 7 xterm-256 foreground indices for pairs 1..7 (head→tail).
+ * Intent
+ *   Each theme rebinds the seven body-rendering pairs (1..N_PAIRS)
+ *   in one shot via init_pair (see theme_apply). HUD/HINT pairs are
+ *   NOT theme-bound — they stay bright yellow / bright cyan across
+ *   every theme so the status bar remains readable against any
+ *   palette (CLAUDE.md HUD spec).
  *
- * Brightness rule: every body[] entry is in the bright half of the
- * 256-colour cube (≥ 24).  Indices 16–23 (cube near-blacks) and 232–239
- * (gray near-blacks) become invisible under A_DIM at the tail-quarter
- * of the body, so they are avoided.
+ * Slot semantics (body[0..6] → pairs 1..7; head → tail gradient)
+ *   [0] head      — joint[0] + first body bead (brightest, eye-grab)
+ *   [1] near-head — joint 1-2 region
+ *   [2] mid       — joint 3-4 region
+ *   [3] mid       — joint 5-6 region
+ *   [4] mid       — joint 7-8 region
+ *   [5] near-tail — joint 9-10 region
+ *   [6] tail tip  — joint[N_SEGS] (dimmest, A_DIM-attenuated)
  *
- * theme_apply() calls init_pair() live; switching themes takes effect on
- * the very next frame.  PAIR_HUD/PAIR_HINT are theme-independent and are
- * configured once in color_init().
+ *   The HEAD→TAIL brightness gradient lets the eye trace which way
+ *   the snake is swimming without joint-numbering overlay. Ref [10]
+ *   Bourke for the gradient-as-depth pattern.
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness")
+ *   Every entry sits in the BRIGHT HALF of the 256-colour cube:
+ *     - cube colours: ≥ 24  (avoid 16-23; invisible under A_DIM)
+ *     - grayscale  : ≥ 240 (avoid 232-239; same reason)
+ *   The tail quarter renders with A_DIM, so without the brightness
+ *   rule the tail would simply disappear on dark terminals.
+ *
+ * References [10] Bourke for the gradient pattern; [12] Raymond
+ *   §init_pair for the rebind mechanism.
  */
 typedef struct {
-    const char *name;
-    int         body[N_PAIRS];
+    const char *name;            /* HUD-displayable theme name        */
+    int         body[N_PAIRS];   /* xterm-256 fg per pair slot;       *
+                                  * pair p = body[p-1] at apply time  */
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -828,75 +902,143 @@ static inline int px_to_cell_y(float py)
 /* ===================================================================== */
 
 /*
- * Vec2 — lightweight 2-D position vector in pixel space.
- * x increases eastward; y increases downward (terminal convention).
- */
-typedef struct { float x, y; } Vec2;
-
-/*
- * Snake — complete simulation state for the swimming snake.
+ * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
  *
- * TRAIL BUFFER (circular, newest entry at trail[trail_head]):
+ * Intent
+ *   Every §5 simulation quantity — head position, trail samples,
+ *   body joints, edge-bias forces — lives in pixel space. Each
+ *   character cell is CELL_W × CELL_H sub-pixels (8 × 16), giving
+ *   sub-cell precision so a swimming snake reads as continuous
+ *   motion instead of jumping cell-to-cell. The conversion to cell
+ *   space happens only inside §5d rendering helpers via
+ *   px_to_cell_x/y — the project's "one conversion point" rule.
  *
- *   trail[]      Array of Vec2 pixel positions, one pushed per sim tick.
- *                Oldest entry is silently overwritten once the buffer fills.
- *                Indexed via trail_at(k): k=0 = newest, k=1 = one older.
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right of screen).
+ *   y : SOUTHWARD pixel coordinate (positive → DOWN the screen).
  *
- *   trail_head   Write cursor (index of the most recently pushed entry).
- *                Advances by 1 (mod TRAIL_CAP) on each push.
+ *   Angles are MATH-CONVENTION (positive CCW from +X). Because y
+ *   points DOWN on screen, a math-CCW rotation displays as CW —
+ *   "heading = π/2" means SOUTH on screen, not north. cpg_turn_rate
+ *   doesn't care (it just adds to dθ/dt); only the initial heading
+ *   in scene_init reads this convention.
  *
- *   trail_count  Number of valid entries, clamped to TRAIL_CAP.
- *                Reaches TRAIL_CAP after TRAIL_CAP ticks (~68 s at 60 Hz)
- *                and stays there for the life of the simulation.
+ * Why a value type
+ *   8 bytes; passes in registers on every modern ABI.
+ *   polyline_segment_length, lerp_between_points, inward_repulsion_
+ *   from_walls all take/return Vec2 by value — -O2 inlines them
+ *   into straight-line code with no allocation.
  *
- * BODY POSITIONS:
+ * Why named (x, y) instead of two loose floats
+ *   Type-checking catches (col, row) confusion at compile time
+ *   rather than via visual debugging.
  *
- *   joint[0]        Head — set by move_head() each tick.
- *   joint[1..N_SEGS] Body and tail — set by compute_joints() from the trail.
- *                    joint[N_SEGS] is the tail tip (farthest from head).
- *
- *   prev_joint[]    Snapshot of joint[] at the START of the current tick,
- *                   saved before any physics runs.  render_chain() lerps
- *                   between prev_joint and joint using alpha ∈ [0,1) to
- *                   produce sub-tick smooth motion at any render frame rate.
- *                   Without prev_joint, motion would stutter visibly at the
- *                   tick boundary when sim Hz < render Hz.
- *
- * WAVE (autonomous steering):
- *
- *   heading      Current travel direction in radians.  0 = east, π/2 = south
- *                (y increases downward in terminal space).  Updated each tick
- *                by integrating the sinusoidal turn rate.
- *
- *   wave_time    Accumulated simulation time (seconds), scaled by speed_scale.
- *                Drives the sin() argument: frequency × wave_time.
- *                Separated from wall time so speed_scale can stretch/compress
- *                the wave without touching heading or move_speed.
- *
- *   amplitude    Peak turn rate for auto-swim (rad/s).  Larger = wider arcs.
- *   frequency    Oscillation angular frequency (rad/s).  Larger = faster zigzag.
- *   speed_scale  Multiplier on wave_time advancement.  Does not affect move_speed.
- *   move_speed   Head translation speed (px/s), constant each tick.
- *
- *   paused       When true, move_head() and compute_joints() are skipped;
- *                prev_joint is still saved so alpha lerp freezes cleanly.
+ * References [1] Craig §2 "Spatial descriptions".
  */
 typedef struct {
-    Vec2  trail[TRAIL_CAP];        /* circular position history            */
-    int   trail_head;              /* write pointer (most recent entry)    */
-    int   trail_count;             /* valid entries, ≤ TRAIL_CAP           */
+    float x;   /* eastward  pixel coordinate (positive → right) */
+    float y;   /* southward pixel coordinate (positive → down)  */
+} Vec2;
 
-    Vec2  joint[N_SEGS + 1];      /* [0]=head … [N_SEGS]=tail tip         */
-    Vec2  prev_joint[N_SEGS + 1]; /* joint[] at start of tick (for α lerp)*/
+/*
+ * Snake — the full creature state. Four interlocked subsystems
+ * sharing one record:
+ *
+ *   1. TRAIL BUFFER — circular log of past head positions, oldest
+ *      silently overwritten. This is the FK source-of-truth: the
+ *      body just remembers where the head has been. No per-joint
+ *      angles, no constraint solver, no IK. Refs [3] Hirose, [4]
+ *      Khoshrou, [1] Craig §3.
+ *
+ *   2. BODY JOINTS — joint[0] is the head (driven by move_head);
+ *      joint[1..N_SEGS] are placed by compute_joints sampling the
+ *      trail at arc-lengths i·SEG_LEN_PX backward. This is the
+ *      arc-length-parameterisation pattern (see trail_sample, ref
+ *      [7] Foley & van Dam §11.2). prev_joint is a sub-tick render
+ *      anchor for the alpha lerp.
+ *
+ *   3. CPG OSCILLATOR — (wave_time, amplitude, frequency, speed_scale)
+ *      drives the autonomous lateral undulation. Output is a pure
+ *      sinusoid in wave_time read by cpg_turn_rate. The
+ *      "wave_time vs wall time" separation lets speed_scale stretch
+ *      or compress the wave without touching move_speed. Ref [5]
+ *      Manton on biological CPGs.
+ *
+ *   4. STEERING — (heading, move_speed) — heading is integrated each
+ *      tick from CPG output + edge bias; move_speed is constant and
+ *      directly multiplies (cos θ, sin θ) into position. Ref [6]
+ *      Reynolds for the composite-steering pattern.
+ *
+ *   The subsystems are uncoupled in time: trail records what the
+ *   head did; joints sample the trail; CPG advances independently;
+ *   steering reads CPG + edge bias. No feedback loop — scene_tick
+ *   walks the dependency chain top-to-bottom each frame.
+ *
+ * Why trail is a CIRCULAR buffer (not a regular array)
+ *   Samples are PUSHED at the head end every tick and CONSUMED at
+ *   every arc-length along the body. Circular indexing means no
+ *   O(N) shift per frame; trail_head walks mod TRAIL_CAP. Once the
+ *   buffer fills (after TRAIL_CAP ticks ≈ 68 s at 60 Hz), oldest
+ *   entries are silently overwritten — trail_count saturates at
+ *   TRAIL_CAP and stays there for the life of the simulation.
+ *
+ * Why prev_joint AND joint (two body-position arrays)
+ *   - joint     : the CURRENT body pose; mutated by compute_joints
+ *                  every tick.
+ *   - prev_joint: the body pose at the START of the current tick;
+ *                  anchor for sub-tick render interpolation.
+ *   prev_joint is FROZEN at tick start (before move_head runs) so
+ *   render_chain can lerp prev_joint → joint by alpha smoothly.
+ *   Conflating them would either overshoot the lerp or corrupt the
+ *   trail-sampling pipeline. Ref [8] Fiedler.
+ *
+ * Why wave_time is SEPARATE from heading (two phase variables)
+ *   wave_time is the CPG clock; heading is the integrated direction
+ *   of travel. The user can adjust frequency or speed_scale mid-run
+ *   without producing a phase jump in heading — the CPG argument
+ *   (frequency × wave_time) recomputes smoothly even when the
+ *   knob changes.
+ *
+ * References [1][3] for FK + serpentine locomotion;
+ *   [5][6] Manton + Reynolds for the steering/CPG model;
+ *   [7][8] Foley + Fiedler for trail sampling + alpha interpolation.
+ */
+typedef struct {
+    /* ── Trail buffer (FK source-of-truth) ────────────────────── *
+     * Circular log of past head positions; trail_sample arc-     *
+     * length-samples this to place body joints. trail[0] is at   *
+     * trail_head (newest); trail_at(k) returns the k-th-newest.  */
+    Vec2 trail[TRAIL_CAP];
+    int  trail_head;                  /* index of newest entry, mod TRAIL_CAP*/
+    int  trail_count;                 /* valid entries, saturates at TRAIL_CAP*/
 
-    float heading;     /* travel direction, radians                        */
-    float move_speed;  /* translation speed, px/s                          */
-    float wave_time;   /* accumulated scaled time driving sin()            */
-    float amplitude;   /* auto-swim peak turn rate, rad/s                  */
-    float frequency;   /* auto-swim oscillation frequency, rad/s           */
-    float speed_scale; /* wave_time advancement multiplier                 */
+    /* ── Body joints (output of compute_joints) ──────────────── *
+     * joint[0] = head (set by move_head each tick).              *
+     * joint[1..N_SEGS] = body+tail (set by compute_joints).      *
+     * prev_joint = snapshot at tick start (sub-tick lerp anchor).*/
+    Vec2 joint     [N_SEGS + 1];
+    Vec2 prev_joint[N_SEGS + 1];
 
-    int   theme_idx;   /* index into THEMES[]; t/T keys cycle it           */
+    /* ── Steering (integrated by move_head) ──────────────────── *
+     * heading is the CURRENT direction of travel (radians,       *
+     * MATH convention; 0 = east, π/2 = south on screen).        *
+     * move_speed is the constant head speed (px/s).             */
+    float heading;
+    float move_speed;
+
+    /* ── CPG oscillator (autonomous lateral undulation) ──────── *
+     * Closed-form ω(t) = amplitude · sin(frequency · wave_time). *
+     * wave_time is SEPARATE from wall time so speed_scale can   *
+     * stretch/compress the wave without touching move_speed.    */
+    float wave_time;                  /* CPG clock (s · speed_scale)         */
+    float amplitude;                  /* peak |ω| (rad/s)                    */
+    float frequency;                  /* angular frequency (rad/s)           */
+    float speed_scale;                /* wave_time advancement multiplier    */
+
+    /* ── UI / control state ─────────────────────────────────── *
+     * paused gates scene_tick (renderer still runs);            *
+     * theme_idx selects the §3 palette via theme_apply.         */
+    int   theme_idx;                  /* index into THEMES[]; t/T cycles    */
     bool  paused;
 } Snake;
 
@@ -977,29 +1119,96 @@ static inline Vec2 trail_at(const Snake *s, int k)
  *   zero when two consecutive trail entries are at the same pixel (head
  *   standing still while paused — though pausing skips trail_push).
  */
+/*
+ * polyline_segment_length — Euclidean distance between two trail points.
+ *
+ *     |b − a| = √((b.x − a.x)² + (b.y − a.y)²)
+ *
+ *   The trail is a POLYLINE (piecewise-linear curve through stored
+ *   points). Its arc length is the sum of these segment lengths.
+ *   trail_sample walks the polyline summing this primitive until the
+ *   target arc-length is bracketed.
+ */
+static inline float polyline_segment_length(Vec2 a, Vec2 b)
+{
+    float dx = b.x - a.x;
+    float dy = b.y - a.y;
+    return sqrtf(dx * dx + dy * dy);
+}
+
+/*
+ * lerp_between_points — linear interpolation a + t·(b − a).
+ *
+ *     t = 0  →  a            (start of segment)
+ *     t = 1  →  b            (end   of segment)
+ *     t ∈ (0,1)  →  intermediate point on the line segment a→b
+ *
+ *   Used to interpolate the EXACT target position WITHIN the
+ *   bracketing trail segment so the body joint lands at exactly
+ *   the requested arc length, not at the nearest stored sample.
+ */
+static inline Vec2 lerp_between_points(Vec2 a, Vec2 b, float t)
+{
+    return (Vec2){
+        a.x + (b.x - a.x) * t,
+        a.y + (b.y - a.y) * t,
+    };
+}
+
+/*
+ * trail_sample — arc-length parameterisation along the trail polyline.
+ *
+ *   Walk newest → oldest accumulating polyline_segment_length until the
+ *   running total brackets the requested arc length `dist`. Then
+ *   linearly interpolate WITHIN that bracketing segment to land at the
+ *   exact target distance.
+ *
+ *   Pseudocode:
+ *     accum ← 0
+ *     a     ← trail[0]                       (newest = current head)
+ *     for k = 1 .. trail_count − 1:
+ *         b   ← trail[k]                     (one tick older)
+ *         seg ← polyline_segment_length(a, b)
+ *         if accum + seg ≥ dist:             (target inside [a, b])
+ *             t ← (dist − accum) / seg       (fractional position)
+ *             return lerp_between_points(a, b, t)
+ *         accum ← accum + seg
+ *         a     ← b
+ *     return trail[trail_count − 1]          (trail exhausted)
+ *
+ *   This is the standard ARC-LENGTH SAMPLING pattern used in
+ *   tessellators and motion-capture playback: parameterise a polyline
+ *   not by index (which gives uneven spacing) but by ARC LENGTH
+ *   (which gives even spacing along the curve regardless of how it
+ *   was sampled in time).
+ *
+ *   Numerical guard: divide-by-zero on seg ≈ 0 (two consecutive trail
+ *   points coincident, e.g. head momentarily stationary) — clamp the
+ *   denominator to 1e-4 so t collapses to "start of segment".
+ *
+ *   Reference: any computer-graphics text on Bezier / spline length
+ *   parameterisation; e.g. Foley & van Dam, "Computer Graphics:
+ *   Principles and Practice" §11.2.
+ */
 static Vec2 trail_sample(const Snake *s, float dist)
 {
     float accum = 0.0f;
-    Vec2  a     = trail_at(s, 0);   /* newest trail entry = current head */
+    Vec2  a     = trail_at(s, 0);              /* newest = current head */
 
     for (int k = 1; k < s->trail_count; k++) {
-        Vec2  b   = trail_at(s, k);          /* one tick older than a    */
-        float dx  = b.x - a.x;
-        float dy  = b.y - a.y;
-        float seg = sqrtf(dx * dx + dy * dy); /* distance between a and b */
+        Vec2  b   = trail_at(s, k);            /* one tick older than a */
+        float seg = polyline_segment_length(a, b);
 
-        if (accum + seg >= dist) {
-            /* Target distance falls within this segment; interpolate */
+        if (accum + seg >= dist) {             /* target inside [a, b] */
             float t = (dist - accum) / (seg > 1e-4f ? seg : 1e-4f);
-            return (Vec2){ a.x + dx * t, a.y + dy * t };
+            return lerp_between_points(a, b, t);
         }
 
-        accum += seg;   /* haven't reached dist yet; keep walking */
+        accum += seg;                          /* keep walking back     */
         a      = b;
     }
 
-    /* Trail exhausted before reaching dist; return oldest known point */
-    return trail_at(s, s->trail_count - 1);
+    return trail_at(s, s->trail_count - 1);    /* trail exhausted       */
 }
 
 /* ── §5b  move_head ─────────────────────────────────────────────────── */
@@ -1051,22 +1260,66 @@ static inline float wrap_pi(float a)
  *   the wall — visually it looks like the snake "notices" the wall and
  *   curves away, rather than slapping into a hard reflection.
  */
-static float edge_bias_turn(const Snake *s, float wpx, float hpx)
+/*
+ * inward_repulsion_from_walls — soft-fence potential gradient.
+ *
+ *   For each wall within EDGE_MARGIN_PX of the head, accumulate a
+ *   linear repulsion ramp along that wall's inward normal:
+ *
+ *     left wall (x = 0):     ramp = (margin − x) / margin       if x < margin
+ *     right wall (x = wpx):  ramp = (x − (wpx − margin)) / margin  if x > wpx − margin
+ *
+ *   The ramp is ZERO at the margin boundary, ONE at the wall — a
+ *   linear soft-edge potential. The result vector points AWAY from
+ *   every active wall toward open space; its magnitude indicates how
+ *   strongly the head is repelled (0 outside any margin band, up to
+ *   ≈ √2 in a corner where two walls activate).
+ *
+ *   Reference: Reynolds (1999), "Steering Behaviors for Autonomous
+ *   Characters", §"Containment" — the soft-edge containment pattern.
+ */
+static Vec2 inward_repulsion_from_walls(Vec2 head, float wpx, float hpx)
 {
     float margin = EDGE_MARGIN_PX;
-    float x = s->joint[0].x;
-    float y = s->joint[0].y;
+    Vec2  force  = { 0.0f, 0.0f };
 
-    float fx = 0.0f, fy = 0.0f;
-    if (x < margin)          fx += (margin - x)         / margin;
-    if (x > wpx - margin)    fx -= (x - (wpx - margin)) / margin;
-    if (y < margin)          fy += (margin - y)         / margin;
-    if (y > hpx - margin)    fy -= (y - (hpx - margin)) / margin;
+    if (head.x < margin)         force.x += (margin - head.x)         / margin;
+    if (head.x > wpx - margin)   force.x -= (head.x - (wpx - margin)) / margin;
+    if (head.y < margin)         force.y += (margin - head.y)         / margin;
+    if (head.y > hpx - margin)   force.y -= (head.y - (hpx - margin)) / margin;
 
-    if (fx == 0.0f && fy == 0.0f) return 0.0f;
+    return force;
+}
 
-    float strength = sqrtf(fx * fx + fy * fy);
-    float desired  = atan2f(fy, fx);
+/*
+ * edge_bias_turn — Reynolds soft-fence converted to a heading bias.
+ *
+ *   1. inward_repulsion_from_walls : sample the soft-fence potential
+ *      gradient at the head; vector points toward OPEN SPACE.
+ *   2. if force is zero (well clear of every wall) → return 0.
+ *   3. strength = |force|, desired = atan2(force).
+ *   4. delta = wrap_pi(desired − heading)   (SHORT-WAY angular diff)
+ *   5. return delta × strength × EDGE_TURN_GAIN  (rad/s contribution).
+ *
+ *   Step 4's wrap_pi is critical: heading lives on a circle, so raw
+ *   subtraction can pick the LONG way around when desired ≈ +π and
+ *   heading ≈ −π (or vice-versa). wrap_pi folds the result into
+ *   (−π, π] so the snake always turns the short way.
+ *
+ *   This is added to scene_tick's overall heading rate alongside the
+ *   sinusoidal "wave" turn — so the snake combines wandering with
+ *   wall-avoidance into one composite ω(t).
+ *
+ *   Reference: Reynolds (1999), §"Steering" — the
+ *   composite-force pattern this implements.
+ */
+static float edge_bias_turn(const Snake *s, float wpx, float hpx)
+{
+    Vec2 force = inward_repulsion_from_walls(s->joint[0], wpx, hpx);
+    if (force.x == 0.0f && force.y == 0.0f) return 0.0f;
+
+    float strength = sqrtf(force.x * force.x + force.y * force.y);
+    float desired  = atan2f(force.y, force.x);
     float delta    = wrap_pi(desired - s->heading);
     return delta * strength * EDGE_TURN_GAIN;
 }
@@ -1096,32 +1349,107 @@ static float edge_bias_turn(const Snake *s, float wpx, float hpx)
  * jerk when the heading crosses the wrap boundary.  edge_bias_turn() does
  * its own wrap-pi on the angular delta, so unbounded heading is fine here.
  */
-static void move_head(Snake *s, float dt, int cols, int rows)
+/*
+ * advance_wave_clock — tick the autonomous-locomotion phase variable.
+ *
+ *   wave_time is the master clock the sinusoidal CPG reads from.
+ *   Scaled by speed_scale so [/]-cycling time-scale (slow-mo /
+ *   fast-fwd) compresses or dilates the wave period symmetrically.
+ *
+ *   wave_time is NEVER normalised — sin is periodic and growing the
+ *   argument indefinitely is fine. (Compare: heading IS unbounded
+ *   too, for the same reason.)
+ */
+static inline void advance_wave_clock(Snake *s, float dt)
 {
-    /* Step 1: advance the wave clock */
     s->wave_time += dt * s->speed_scale;
+}
 
-    /* Step 2: sinusoidal autonomous turn */
-    float turn_wave = s->amplitude * sinf(s->frequency * s->wave_time);
+/*
+ * cpg_turn_rate — Central Pattern Generator output (rad/s).
+ *
+ *     ω_wave(t) = amplitude · sin(frequency · wave_time)
+ *
+ *   Pure closed-form sinusoid in wave_time. The CPG idea — gait
+ *   timing driven by an internal oscillator, not by sensory
+ *   feedback — comes from neurobiology. For a snake, the wave is
+ *   the lateral undulation that propagates from head to tail.
+ *
+ *   amplitude → peak |ω| (how sharp the curves are).
+ *   frequency → cycles/sec (how fast left↔right alternates).
+ *
+ *   Reference: any classical-mechanics text on simple harmonic
+ *   motion; Manton (1952), "The evolution of arthropodan
+ *   locomotory mechanisms" for biological CPG inspiration.
+ */
+static inline float cpg_turn_rate(const Snake *s)
+{
+    return s->amplitude * sinf(s->frequency * s->wave_time);
+}
 
-    /* Step 3: edge-bias turn (zero unless within EDGE_MARGIN_PX of an edge) */
-    float wpx       = (float)(cols * CELL_W);
-    float hpx       = (float)(rows * CELL_H);
-    float turn_edge = edge_bias_turn(s, wpx, hpx);
-
-    s->heading += (turn_wave + turn_edge) * dt;
-
-    /* Step 4: translate head in pixel space */
+/*
+ * integrate_heading_then_position — semi-implicit Euler kinematic step.
+ *
+ *   θ ← θ + ω·dt           (turn first)
+ *   x ← x + v·cos(θ)·dt    (then move along the NEW heading)
+ *   y ← y + v·sin(θ)·dt
+ *
+ *   Mathematically equivalent to explicit Euler at first order, but
+ *   reads "turn then move", matching physical intuition. The snake
+ *   is purely kinematic (no acceleration term), so explicit/semi-
+ *   implicit Euler are both unconditionally stable at any sane dt.
+ */
+static inline void integrate_heading_then_position(Snake *s, float omega,
+                                                   float dt)
+{
+    s->heading    += omega * dt;
     s->joint[0].x += s->move_speed * cosf(s->heading) * dt;
     s->joint[0].y += s->move_speed * sinf(s->heading) * dt;
+}
 
-    /* Step 5: hard clamp — safety net for the highest speeds */
+/*
+ * clamp_head_to_pixel_bounds — defensive screen-rect clip.
+ *
+ *   edge_bias_turn normally keeps the head inside under normal dt,
+ *   but a single large-dt frame (debugger pause + resume, suspend +
+ *   wake) can fling the head past the wall before the bias can
+ *   redirect. The clamp is the safety net for that worst case.
+ */
+static inline void clamp_head_to_pixel_bounds(Snake *s, float wpx, float hpx)
+{
     if (s->joint[0].x < 0.0f) s->joint[0].x = 0.0f;
     if (s->joint[0].x > wpx)  s->joint[0].x = wpx;
     if (s->joint[0].y < 0.0f) s->joint[0].y = 0.0f;
     if (s->joint[0].y > hpx)  s->joint[0].y = hpx;
+}
 
-    /* Step 6: record this tick's head position in the trail */
+/*
+ * move_head — advance the head one tick under CPG + edge avoidance.
+ *
+ *   1. advance_wave_clock                   (wave_time += dt · scale)
+ *   2. ω = cpg_turn_rate + edge_bias_turn   (composite turn rate)
+ *   3. integrate_heading_then_position      (semi-implicit Euler)
+ *   4. clamp_head_to_pixel_bounds           (defensive clip)
+ *   5. trail_push                           (FK source-of-truth update —
+ *                                            compute_joints reads this
+ *                                            trail next.)
+ *
+ *   See ALGORITHM §2-§6 and Snake struct doc. heading is intentionally
+ *   NOT wrapped to (−π, π] here — sin/cos are periodic, and skipping
+ *   the wrap prevents a one-frame direction jerk at the boundary.
+ *   edge_bias_turn does its own wrap_pi on the angular delta.
+ */
+static void move_head(Snake *s, float dt, int cols, int rows)
+{
+    float wpx = (float)(cols * CELL_W);
+    float hpx = (float)(rows * CELL_H);
+
+    advance_wave_clock(s, dt);
+
+    float omega = cpg_turn_rate(s) + edge_bias_turn(s, wpx, hpx);
+    integrate_heading_then_position(s, omega, dt);
+
+    clamp_head_to_pixel_bounds(s, wpx, hpx);
     trail_push(s, s->joint[0]);
 }
 
@@ -1407,7 +1735,42 @@ static void render_chain(const Snake *s, WINDOW *w,
 /* §6  scene                                                              */
 /* ===================================================================== */
 
-typedef struct { Snake snake; } Scene;
+/*
+ * Scene — composition root for §6.
+ *
+ * Intent
+ *   In this demo the simulation IS one snake. We keep a Scene
+ *   wrapper anyway so the framework loop (scene_init / scene_tick /
+ *   scene_draw) reads identically to every other file in the repo.
+ *   If a future variant adds e.g. prey, obstacles, or a multi-snake
+ *   swarm, they slot in here as siblings of `snake` without
+ *   changing the loop.
+ *
+ * Simulation vs Rendering locality
+ *   The Snake struct itself already separates trail buffer / body
+ *   joints / CPG oscillator / steering / UI. Within Scene there is
+ *   no further split needed yet — one field, one concern. When
+ *   adding a new member, place it as follows:
+ *
+ *     ── Simulation state ──   things scene_tick READS+WRITES
+ *                              (prey[], obstacles[], goal_point, …)
+ *     ── Render-only state ──  things scene_draw READS, never the
+ *                              physics path (camera, shake, FX layers)
+ *
+ * Things that DO NOT live here
+ *   - fps / sim_fps counters → §8 App (frame-timing concern, not
+ *     part of the world being simulated).
+ *   - terminal extents (cols, rows) → §7 Screen.
+ *   - signal flags (running, need_resize) → §8 App.
+ *   - Theme + Preset tables → file-scope `static const`; never
+ *     duplicated per scene.
+ *
+ * One Scene per program; passed by pointer to every §6 entry point.
+ */
+typedef struct {
+    /* ── Simulation state ─────────────────────────────────────── */
+    Snake snake;               /* the world: trail + body + CPG + steering */
+} Scene;
 
 /*
  * scene_init() — initialise the snake to a clean, immediately-animated state.
@@ -1544,7 +1907,31 @@ static void scene_draw(const Scene *sc, WINDOW *w,
  * resize.  See framework.c §7 for the full double-buffer architecture
  * rationale (erase → draw → wnoutrefresh → doupdate).
  */
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal-extent snapshot in CHARACTER CELLS.
+ *
+ * Intent
+ *   Caches the current terminal size so every §6 entry point reads
+ *   (cols, rows) as plain ints rather than re-querying ncurses each
+ *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
+ *   propagated to scene_init via app_do_resize.
+ *
+ * Why a separate struct (not just two ints in App)
+ *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
+ *   except this struct. Carving it out makes screen_resize pure and
+ *   isolates the ncurses dependency from the simulation layer.
+ *
+ * Why cells, not pixels
+ *   ncurses' coordinate system is cells. Pixel space (CELL_W × CELL_H
+ *   sub-pixels per cell) lives only inside §5 — converted at the
+ *   draw boundary, per the project's "one conversion point" rule.
+ *
+ * References [12] Raymond, NCURSES Programming HOWTO.
+ */
+typedef struct {
+    int cols;   /* terminal width  in CHARACTER CELLS */
+    int rows;   /* terminal height in CHARACTER CELLS */
+} Screen;
 
 /*
  * screen_init() — configure the terminal for animation.
@@ -1668,25 +2055,55 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — top-level application state, accessible from signal handlers.
+ * App — top-level container; everything outside the world.
  *
- * Declared as a file-scope global (g_app) because POSIX signal handlers
- * receive no user-defined argument; they can only communicate through
- * globals.
+ * Intent
+ *   Bundles the simulated world (Scene), the host terminal (Screen),
+ *   and the session-level loop-control flags into one record so
+ *   main() reads as four-line phases: init / service signals /
+ *   step+draw / shutdown. Declared file-scope (g_app) so signal
+ *   handlers — which cannot take a user argument — can write
+ *   `running` and `need_resize` without globals scattered through
+ *   the file.
  *
- * running and need_resize are volatile sig_atomic_t because:
- *   volatile     — prevents the compiler from caching the value in a
- *                  register across the signal-handler write.
- *   sig_atomic_t — the only integer type POSIX guarantees can be read
- *                  and written atomically from a signal handler on all
- *                  conforming implementations.
+ * Locality of concern
+ *   ── Owned subsystems ── nouns the app composes
+ *      scene       — the world being simulated (§6)
+ *      screen      — the terminal extent it draws to (§7)
+ *
+ *   ── Session state ── settings the user controls across resets
+ *      sim_fps     — physics tick rate (cycled with [ / ])
+ *
+ *   ── Loop control ── verbs the loop reads each frame
+ *      running     — clear → loop exits; set by SIGINT/SIGTERM
+ *      need_resize — set by SIGWINCH; cleared after Screen refresh
+ *
+ * Why volatile sig_atomic_t (not bool, not int)
+ *   `volatile`    : the compiler must not cache the flag across a
+ *                   signal-handler write — every loop iteration must
+ *                   re-read it from memory.
+ *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
+ *                   signals; a plain `int` could be observed half-
+ *                   written on architectures where stores are split.
+ *   See [12] Raymond §"Signal handling".
+ *
+ * Things that DO NOT live here
+ *   - Wall-clock timestamps / fps counters — main() locals; no
+ *     other code path needs them.
+ *   - Snake tuning values (amplitude, frequency, theme_idx) —
+ *     simulation/render state in §5 Snake.
  */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* ── Owned subsystems ─────────────────────────────────────── */
+    Scene  scene;              /* the world (§6)                       */
+    Screen screen;             /* terminal extent (§7)                 */
+
+    /* ── Session state ────────────────────────────────────────── */
+    int    sim_fps;            /* physics tick rate (Hz)               */
+
+    /* ── Loop control ─────────────────────────────────────────── */
+    volatile sig_atomic_t running;      /* main loop predicate            */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH pending               */
 } App;
 
 static App g_app;

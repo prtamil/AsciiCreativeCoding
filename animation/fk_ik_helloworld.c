@@ -135,16 +135,63 @@
  *   teaches "more joints = more ambiguity = pick a strategy".
  *
  * References
- *   Wikipedia, "Inverse kinematics" — closed-form vs iterative
- *     solver families.  https://en.wikipedia.org/wiki/Inverse_kinematics
- *   Wikipedia, "Forward kinematics" — derivation for serial chains.
- *     https://en.wikipedia.org/wiki/Forward_kinematics
- *   Aristidou & Lasenby, "FABRIK: A fast, iterative solver for the
- *     IK problem" (Graphical Models 73(5), 2011) — the iterative
- *     family for 3+ link chains. See ik_arm_reach.c.
- *   Craig, "Introduction to Robotics: Mechanics and Control" (3rd
- *     ed., 2005) — Denavit–Hartenberg, the algebraic IK casework
- *     the hybrid approach side-steps.
+ * ──────────
+ *   ── Canonical robotics textbooks (FK + IK side-by-side) ──────────
+ *   [1] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
+ *       and Control" (3rd ed.), Pearson — the standard textbook;
+ *       Ch. 3 (FK), Ch. 4 (IK casework). The 2-link analytical IK
+ *       in §5 solve_ik2 follows Craig's law-of-cosines derivation
+ *       directly.
+ *   [2] Spong, M. W., Hutchinson, S. & Vidyasagar, M. (2005),
+ *       "Robot Modeling and Control", Wiley — alternative canonical
+ *       text; Ch. 3 (FK), Ch. 4 (IK) cover the same ground with
+ *       cleaner notation.
+ *   [3] Murray, R. M., Li, Z. & Sastry, S. S. (1994), "A Mathematical
+ *       Introduction to Robotic Manipulation", CRC — rigorous
+ *       Lie-group treatment; read once you want to see FK/IK as
+ *       SE(2)/SE(3) maps.
+ *
+ *   ── Inverse kinematics: solver families ──────────────────────────
+ *   [4] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
+ *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
+ *       UCSD course notes — the Jacobian-iterative family of
+ *       solvers, contrast with the analytical 2-link IK used here.
+ *   [5] Aristidou, A. & Lasenby, J. (2011), "FABRIK: a fast,
+ *       iterative solver for the inverse kinematics problem",
+ *       Graphical Models 73(5), pp. 243-260 — the iterative
+ *       alternative to the 2+1 hybrid used here; FABRIK scales
+ *       cleanly to many-link chains where analytical IK does not.
+ *   [6] Tolani, D., Goswami, A. & Badler, N. I. (2000), "Real-time
+ *       inverse kinematics techniques for anthropomorphic limbs",
+ *       Graphical Models 62(5), pp. 353-388 — surveys closed-form
+ *       solutions for 3-DOF chains; the 2+1 hybrid is one entry.
+ *
+ *   ── Formal notation (multi-joint scaling) ────────────────────────
+ *   [7] Denavit, J. & Hartenberg, R. S. (1955), "A kinematic
+ *       notation for lower-pair mechanisms based on matrices",
+ *       J. Appl. Mech. 22, pp. 215-221 — the DH formalism every
+ *       multi-link FK algorithm follows.
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *   [8] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
+ *       — when fixed-step matters; we use variable-step because
+ *       both solvers are unconditionally stable.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *   [9] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       integer line drawing; we use the parametric oversample
+ *       (draw_line_px in §6) because float math is already paid for.
+ *  [10] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the high-contrast glyph choice ('@', 'O', 'o', '*', '+').
+ *  [11] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the newscr/curscr diff pipeline.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [12] https://en.wikipedia.org/wiki/Forward_kinematics
+ *  [13] https://en.wikipedia.org/wiki/Inverse_kinematics
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -712,7 +759,44 @@ static inline float cells_to_px_h(int rows){ return (float)rows * CELL_H; }
 /* §5  ik_fk — Vec2 + compute_fk + solve_ik2 + solve_ik3                  */
 /* ===================================================================== */
 
-typedef struct { float x, y; } Vec2;
+/*
+ * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
+ *
+ * Intent
+ *   Everything in §5 (FK + IK solvers) does arithmetic in pixel space,
+ *   not character cells. Each cell is CELL_W × CELL_H sub-pixels
+ *   (8 × 16 by default), so a swinging arm reads as continuous motion
+ *   instead of jumping cell-to-cell. The conversion to cell space
+ *   happens at exactly ONE place — px_to_cell_x/y in §6 draw_line_px
+ *   — per the project's "one conversion point" rule.
+ *
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right of screen).
+ *   y : SOUTHWARD pixel coordinate (positive → down the screen).
+ *
+ *   Angles are MATH-CONVENTION (positive CCW around +X), so a CCW
+ *   rotation in the math becomes CW on screen because y points DOWN.
+ *   acosf in solve_ik2 yields the same angle either way — only the
+ *   HUD readout ever needs to think about it.
+ *
+ * Why a value type (not a pointer)
+ *   Sized 8 bytes; passed in registers on every modern ABI. The
+ *   solvers return ArmPose / TwoLinkPose BY VALUE — -O2 lowers the
+ *   call to the same straight-line code as if the caller wrote the
+ *   trig inline. Encapsulation costs nothing here.
+ *
+ * Why not just two loose floats
+ *   Named fields catch a whole class of bugs at compile time:
+ *   passing (col, row) where (x, y) is expected becomes a type error
+ *   rather than a visual debugging session.
+ *
+ * References [1] Craig §2 "Spatial descriptions"; [3] Murray et al.
+ *   for the formal R² convention.
+ */
+typedef struct {
+    float x;   /* eastward  pixel coordinate (positive → right) */
+    float y;   /* southward pixel coordinate (positive → down)  */
+} Vec2;
 
 static inline Vec2  vec2(float x, float y)    { return (Vec2){x, y}; }
 static inline Vec2  vec2_add(Vec2 a, Vec2 b)  { return (Vec2){a.x+b.x, a.y+b.y}; }
@@ -747,8 +831,44 @@ static inline float wrap_pi(float a)
     return a;
 }
 
-/* ArmPose — the three computed positions of one arm evaluation. */
-typedef struct { Vec2 elbow, wrist, hand; } ArmPose;
+/*
+ * ArmPose — the three computed joint positions of one arm evaluation.
+ *
+ * Intent
+ *   Both solvers (compute_fk in FK mode, solve_ik3 in IK mode) return
+ *   the SAME shape, so the main loop can dispatch on Mode and write
+ *   to one cache:
+ *
+ *       ArmPose pose = (scene.mode == MODE_FK)
+ *                    ? compute_fk(S, θ1, θ2, θ3)
+ *                    : solve_ik3(S, T, elbow_up);
+ *       scene.elbow = pose.elbow; scene.wrist = pose.wrist; scene.hand = pose.hand;
+ *
+ *   This is the file's TEACHING POINT: FK and IK are two algorithms
+ *   that produce the same RECORD (joint positions) from different
+ *   INPUTS (angles vs target). Same output schema, opposite data flow.
+ *
+ * Why ONE struct for both solvers
+ *   If FK and IK returned different shapes, the call site would need
+ *   to branch on Mode TWICE (once to pick the solver, once to read
+ *   the result). One shared output type collapses the second branch
+ *   into a single set of field assignments.
+ *
+ * Field origin (in pixel space)
+ *   elbow : E — joint 1, derived from S and the first angle/length pair
+ *   wrist : W — joint 2, derived from E and the second angle/length pair
+ *   hand  : H — joint 3 (end-effector), derived from W and the third
+ *
+ *   In FK these are sequential cosf/sinf walks of cumulative angles
+ *   (θ1, θ1+θ2, θ1+θ2+θ3). In IK they fall out of the 2+1 hybrid
+ *   (Step 2 places E and W via law of cosines; Step 3 aims H at T).
+ *   See CONCEPTS §"Algorithm" and [1] Craig §3-§4.
+ */
+typedef struct {
+    Vec2 elbow;   /* E — first  joint, end of upper arm (L1 from S) */
+    Vec2 wrist;   /* W — second joint, end of forearm   (L2 from E) */
+    Vec2 hand;    /* H — third  joint / end-effector    (L3 from W) */
+} ArmPose;
 
 /*
  * compute_fk — three-link forward kinematics.
@@ -773,8 +893,42 @@ static ArmPose compute_fk(Vec2 S, float th1, float th2, float th3)
     return (ArmPose){E, W, H};
 }
 
-/* TwoLinkPose — internal return type of solve_ik2. */
-typedef struct { Vec2 elbow, tip; } TwoLinkPose;
+/*
+ * TwoLinkPose — internal return type of solve_ik2.
+ *
+ * Intent
+ *   solve_ik2 is the analytical 2-link IK kernel — the same law of
+ *   cosines you would use for ik_helloworld.c. It returns BOTH the
+ *   computed elbow position AND the 2-link tip:
+ *
+ *     elbow : E — solved by the law of cosines from S, T, L1, L2.
+ *     tip   : W — placed at L2 from E along E→T. EQUALS T exactly
+ *                 when T is reachable (within [|L1-L2|, L1+L2] of S);
+ *                 otherwise points AT T but stays at length L2 from E.
+ *
+ *   Why a struct and not two out-parameters? solve_ik3 needs BOTH
+ *   the elbow (to draw S→E) AND the tip (to place the third link's
+ *   base); returning by value bundles them into one assignment.
+ *
+ * Why "tip" instead of "wrist"
+ *   In the 2-link sub-problem there is no wrist — the second segment
+ *   ENDS at the tip. The name `tip` keeps the 2-link kernel
+ *   independent of the 3-link context that consumes it. solve_ik3
+ *   THEN treats this tip as the wrist of the larger arm.
+ *
+ * Why this is a separate type from ArmPose
+ *   ArmPose has three joints (E, W, H); TwoLinkPose has two (E, tip).
+ *   Conflating them would force the 2-link kernel to invent a fake
+ *   third joint, hiding the algorithm. Two types make the dataflow
+ *   explicit: solve_ik2 → TwoLinkPose, solve_ik3 → ArmPose.
+ *
+ * References [1] Craig §4.4 "Solvability"; the law-of-cosines
+ *   derivation is in [2] Spong et al. §4.2.
+ */
+typedef struct {
+    Vec2 elbow;   /* E — law-of-cosines solution at the shoulder vertex */
+    Vec2 tip;    /* W — end of the second link; = T when reachable     */
+} TwoLinkPose;
 
 /*
  * solve_ik2 — analytical 2-link IK, the same law of cosines as
@@ -842,24 +996,105 @@ static ArmPose solve_ik3(Vec2 S, Vec2 T, bool elbow_up)
 /* §6  scene — Scene state, input dispatch, draw                          */
 /* ===================================================================== */
 
+/*
+ * Mode — which solver runs this frame.
+ *
+ *   MODE_FK : compute_fk(S, θ1, θ2, θ3) → ArmPose
+ *             User edits ANGLES; positions FALL OUT.
+ *   MODE_IK : solve_ik3(S, T, elbow_up) → ArmPose
+ *             User edits the TARGET; angles FALL OUT (implicit).
+ *
+ * One toggle, two data-flow directions. The keymap and the HUD
+ * also branch on Mode — see scene_input + screen_hud. The Mode
+ * value lives in Scene so signal-handler-free code (scene_input)
+ * can switch by mutating it.
+ */
 typedef enum { MODE_FK, MODE_IK } Mode;
 
+/*
+ * Scene — all per-frame state of the FK/IK demo.
+ *
+ * Intent
+ *   The file's whole purpose is to put FK and IK back-to-back. Scene
+ *   therefore holds the inputs for BOTH solvers simultaneously, plus
+ *   ONE shared output cache (elbow, wrist, hand) that the renderer
+ *   reads. Mode picks which input set the current frame consumes;
+ *   the OTHER set is preserved across the toggle so flipping back is
+ *   instant.
+ *
+ *   Read direction (what the data-flow arrow looks like):
+ *
+ *     FK mode:  theta1/2/3 ──compute_fk──► elbow,wrist,hand
+ *     IK mode:  target     ──solve_ik3──► elbow,wrist,hand
+ *
+ *   Same OUTPUT slots, different INPUT slots. The renderer never
+ *   needs to know which solver ran — it just reads the cache.
+ *
+ * Simulation vs Rendering locality
+ *   ── Simulation state ── read+written by scene_input + solvers:
+ *      shoulder              S, pinned origin (resets on SIGWINCH).
+ *      theta1, theta2, theta3 FK INPUTS — a/d, w/s, z/x edit (in FK mode).
+ *      target                IK INPUT — arrow keys edit (in IK mode).
+ *      elbow_up              IK CONFIG — 'f' selects one of two valid
+ *                            elbow configurations (Craig §4.4).
+ *      elbow, wrist, hand    Cached SOLVER OUTPUTS — written each
+ *                            frame, read by scene_draw + HUD.
+ *
+ *   ── Rendering / control state ── read only by scene_draw + HUD:
+ *      mode                  Which solver runs (also gates the '+'
+ *                            target glyph: drawn only in IK mode).
+ *      paused                Frozen frame; solver path skipped,
+ *                            render unchanged.
+ *      rows, cols            Terminal extent in CELLS (resize cache).
+ *
+ *   Why mode counts as RENDER-CONTROL not SIM
+ *     Because it doesn't change WORLD state — it changes WHICH
+ *     pipeline transforms world state. The simulation that runs
+ *     under MODE_FK and the one under MODE_IK both produce the
+ *     same kind of output; the Mode bit just routes to one of them.
+ *
+ *   Why elbow_up is SIM (not RENDER-CONTROL)
+ *     It changes the SOLVED CONFIGURATION (elbow up vs down). Two
+ *     valid mathematical solutions, only one is realised — that's
+ *     part of the math, not of the camera. Compare with `mode`,
+ *     which doesn't change the answer, only the question.
+ *
+ * Things that DO NOT live here
+ *   - Link lengths L1_PX, L2_PX, L3_PX → §1 config (compile-time).
+ *   - Movement step sizes ANGLE_STEP_RAD, TARGET_STEP_PX → §1.
+ *   - fps counter → main() local (display-only, not per-frame state).
+ *   - Signal flags g_running / g_need_resize → §8 file-scope (must
+ *     be writable from a signal handler that takes no user pointer).
+ *
+ * References [1] Craig §3 (FK) + §4 (IK casework); [4] Buss for the
+ *   Jacobian alternative this file's IK is NOT.
+ */
 typedef struct {
-    Vec2  shoulder;             /* S — pinned                            */
+    /* ── Simulation state: anchor ─────────────────────────────── */
+    Vec2  shoulder;     /* S — pinned origin; resets on SIGWINCH    */
 
-    /* FK inputs */
-    float theta1, theta2, theta3;
+    /* ── Simulation state: FK inputs (active in MODE_FK) ──────── */
+    float theta1;       /* shoulder angle (rad), abs from +X        */
+    float theta2;       /* elbow    angle (rad), REL to upper arm   */
+    float theta3;       /* wrist    angle (rad), REL to forearm     */
 
-    /* IK inputs */
-    Vec2  target;               /* T — IK only, drawn as '+'             */
-    bool  elbow_up;             /* IK only — pick one of two solutions   */
+    /* ── Simulation state: IK inputs (active in MODE_IK) ──────── */
+    Vec2  target;       /* T — IK only; drawn as '+'                */
+    bool  elbow_up;     /* IK only; selects 1 of 2 valid solutions  */
 
-    /* Cached output of whichever solver ran this frame. */
-    Vec2  elbow, wrist, hand;
+    /* ── Simulation state: cached solver outputs (both modes) ─── *
+     * Written each frame by whichever solver Mode selects; read   *
+     * by scene_draw and the HUD without recomputing.              */
+    Vec2  elbow;        /* E                                        */
+    Vec2  wrist;        /* W                                        */
+    Vec2  hand;         /* H — also the IK end-effector             */
 
-    Mode  mode;
-    bool  paused;
-    int   rows, cols;
+    /* ── Rendering / control state ────────────────────────────── *
+     * Read only by scene_draw and the HUD. mode also routes the   *
+     * solver in the main loop, but does not itself BECOME state.  */
+    Mode  mode;         /* MODE_FK or MODE_IK                       */
+    bool  paused;       /* freezes solver path; render unchanged    */
+    int   rows, cols;   /* terminal extent in CHARACTER CELLS       */
 } Scene;
 
 static Vec2 clamp_to_screen(Vec2 p, int rows, int cols)

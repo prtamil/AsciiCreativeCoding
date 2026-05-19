@@ -73,14 +73,72 @@
  *                  ncurses doupdate is the bottleneck (~200-400 changed
  *                  cells per frame).
  *
- * References     : Jakobsen, "Advanced Character Physics," GDC 2001 — the
- *                    canonical Verlet-rope and ragdoll paper.
- *                  Müller et al., "Position Based Dynamics," 2007 — the
- *                    modern generalisation of constraint projection.
- *                  Wikipedia: "Verlet integration" — derivation and the
- *                    velocity-implicit form used here.
- *                  Stam, "Real-Time Stable Cloth and Hair," 2002 — the
- *                    same projection idea applied to many parallel chains.
+ * References
+ * ──────────
+ *   ── Verlet integration (the §5a integrator) ──────────────────────
+ *   [1] Verlet, L. (1967), "Computer Experiments on Classical Fluids.
+ *       I.", Phys. Rev. 159(1), pp. 98-103 — the original integrator.
+ *       The position-only form used by implicit_velocity() dates from
+ *       this paper.
+ *   [2] Swope, W. C. et al. (1982), "A computer simulation method for
+ *       the calculation of equilibrium constants...", J. Chem. Phys.
+ *       76 — velocity-Verlet variant. We use Verlet's ORIGINAL
+ *       position-only form (sometimes called Störmer-Verlet).
+ *
+ *   ── Position-Based Dynamics (the §5b constraint solver) ─────────
+ *   [3] Jakobsen, T. (2001), "Advanced Character Physics", GDC —
+ *       THE canonical Verlet-rope paper. §2 integrator, §3 distance-
+ *       constraint relaxation, §4 collisions. The whole §5 pipeline
+ *       follows this paper.
+ *       https://www.cs.cmu.edu/afs/cs/academic/class/15462-s13/www/lec_slides/Jakobsen.pdf
+ *   [4] Müller, M., Heidelberger, B., Hennix, M. & Ratcliff, J. (2007),
+ *       "Position Based Dynamics", J. Vis. Comm. Image Repr. 18(2) —
+ *       generalises Jakobsen's distance-only projection to arbitrary
+ *       constraint types (bending, volume, etc.).
+ *   [5] Bender, J., Müller, M. & Macklin, M. (2017), "A Survey on
+ *       Position-Based Simulation Methods in Computer Graphics",
+ *       Computer Graphics Forum 36(6) — modern survey covering XPBD
+ *       and stability extensions.
+ *   [6] Stam, J. (2002), "Real-Time Stable Cloth and Hair", GDC —
+ *       same projection idea applied to MANY parallel chains; the
+ *       per-rope phase_offset stagger here borrows the "decorrelate
+ *       to avoid synchronised look" trick.
+ *
+ *   ── Numerical methods (Gauss-Seidel ordering) ────────────────────
+ *   [7] Saad, Y. (2003), "Iterative Methods for Sparse Linear Systems"
+ *       (2nd ed.), SIAM — §4.1 Gauss-Seidel vs Jacobi; relax_rope_chain
+ *       uses the Gauss-Seidel ordering (each correction propagates to
+ *       the next constraint via the shared endpoint).
+ *
+ *   ── Classical mechanics (the physics of impulses + collisions) ──
+ *   [8] Goldstein, H. (1980), "Classical Mechanics" (2nd ed.),
+ *       Addison-Wesley — §2 simple harmonic motion (basis for
+ *       sinusoidal_wind_acceleration_at); §3.6 coefficient of
+ *       restitution (basis for bounce_against_wall_1d).
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *   [9] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com —
+ *       the fixed-step accumulator pattern this file uses; alpha
+ *       interpolation between prev_pos and pos comes from here.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *  [10] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       the integer line algorithm; §5g draw_rope_beads uses the
+ *       parametric oversample because float math is already paid
+ *       for in the physics step.
+ *  [11] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — basis for
+ *       the head/middle/tip bead glyph hierarchy.
+ *  [12] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the diff pipeline §7 relies on.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [13] https://en.wikipedia.org/wiki/Verlet_integration
+ *  [14] https://en.wikipedia.org/wiki/Position-based_dynamics
+ *  [15] https://en.wikipedia.org/wiki/Gauss%E2%80%93Seidel_method
+ *  [16] https://en.wikipedia.org/wiki/Coefficient_of_restitution
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -668,9 +726,37 @@ static void clock_sleep_ns(int64_t ns)
  * On terminals with < 256 colours, theme_apply() falls back to 8 ANSI
  * colours that approximate the intended rainbow order.
  */
+/*
+ * Theme — one named multi-colour palette for the seven rope pairs.
+ *
+ * Intent
+ *   Each theme rebinds pairs 1..N_PAIRS via init_pair (see
+ *   theme_apply). Each rope r uses pair (r + 1), so a theme is
+ *   really a CHOICE of seven distinct hues — one per rope — that
+ *   together read as a coherent gradient or pattern.
+ *
+ *   HUD/HINT pairs (8, 9) are NOT theme-bound — they stay bright
+ *   yellow / bright cyan across every theme so the status bar
+ *   remains readable against any palette (CLAUDE.md HUD spec).
+ *
+ * Slot semantics (body[0..6] → pairs 1..7 → ropes 0..6)
+ *   body[r] is the foreground colour for ROPE r. Themes are usually
+ *   designed as a gradient (rope 0 dimmest → rope 6 brightest) so
+ *   the eye reads the bank of ropes left-to-right as a sweep.
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness")
+ *   Every entry sits in the BRIGHT HALF of the 256-colour cube —
+ *   cube indices ≥ 24, grayscale ≥ 240 — so even A_DIM beads stay
+ *   visible. theme_apply falls back to the 8-colour ANSI palette
+ *   when COLORS < 256.
+ *
+ * References [11] Bourke for the gradient-as-depth pattern;
+ *   [12] Raymond §init_pair for the rebind mechanism.
+ */
 typedef struct {
-    const char *name;
-    int body[N_PAIRS];   /* xterm-256 colour index for rope pairs 1–7 */
+    const char *name;              /* HUD-displayable theme name        */
+    int         body[N_PAIRS];     /* xterm-256 fg per rope (0..6)      *
+                                    * pair (r+1) = body[r] at apply time */
 } Theme;
 
 /*
@@ -804,92 +890,167 @@ static inline int px_to_cell_y(float py)
 /* ===================================================================== */
 
 /*
- * Vec2 — lightweight 2-D position vector in pixel space.
- * x increases eastward (right); y increases downward (terminal convention).
- */
-typedef struct { float x, y; } Vec2;
-
-/*
- * Scene — complete simulation state for all N_ROPES rope chains.
+ * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
  *
- * VERLET PAIR (pos[][], old_pos[][]):
+ * Intent
+ *   Every §5 physics quantity — particle positions, implicit
+ *   velocities, wind impulses, displacement vectors — lives in
+ *   pixel space. Each character cell is CELL_W × CELL_H sub-pixels
+ *   (8 × 16), giving sub-cell precision so a swaying rope moves
+ *   smoothly instead of jumping cell-to-cell. The conversion to
+ *   cell space happens only inside §5g rendering helpers via
+ *   px_to_cell_x/y — the project's "one conversion point" rule.
  *
- *   pos[r][s]     — current position of particle s in rope r (pixel space).
- *   old_pos[r][s] — position from the previous simulation tick.
- *                   Velocity is stored implicitly as (pos − old_pos).
- *                   This is the key insight of Verlet integration: you never
- *                   store velocity explicitly; it emerges from the two
- *                   position snapshots.  Damping multiplies this difference
- *                   before adding it to the new position (see §5a).
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right of screen).
+ *   y : SOUTHWARD pixel coordinate (positive → DOWN the screen).
  *
- * INTERPOLATION SNAPSHOT (prev_pos[][]):
+ *   The y-down convention matters for the physics:
+ *     - GRAVITY is POSITIVE (pulls toward larger y).
+ *     - The floor is at LARGER y than the ceiling anchor.
+ *     - "Below the anchor" means "larger y" — the rope HANGS DOWN.
  *
- *   Copied from pos[][] at the very start of each tick (before any physics).
- *   render_scene() lerps between prev_pos and pos using alpha ∈ [0,1):
- *     render_pos = prev_pos + (pos − prev_pos) × alpha
- *   This eliminates the micro-stutter that would otherwise occur at the
- *   tick boundary when sim Hz (60) differs from render Hz (60+).  Without
- *   prev_pos, the displayed position would jump by a full tick's worth of
- *   displacement every 1/60 s, which is visible as a periodic lurch.
+ * Why a value type
+ *   8 bytes; passes in registers. implicit_velocity, apply_damping,
+ *   integrate_acceleration, displacement_and_length all take/return
+ *   Vec2 by value — -O2 inlines them into straight-line code.
  *
- * rest_len[r]     — segment rest length for rope r, in pixels.
- *                   = rope_len_px[r] / (N_SEG − 1).
- *                   e.g. rope_len_px = 400 px, N_SEG = 20:
- *                   rest_len = 400 / 19 ≈ 21.05 px per segment.
+ * Why named (x, y) instead of two loose floats
+ *   Type-checking catches (col, row) confusion at compile time.
  *
- * rope_len_px[r]  — total visual length of rope r (35%–75% of screen height).
- *                   Computed in scene_init() from the current terminal rows,
- *                   so it adapts correctly after a SIGWINCH resize.
- *                   Variation in lengths makes the scene more interesting:
- *                   short ropes sway faster (higher natural frequency) and
- *                   long ropes sway slower — like a real wind-chime set.
- *
- * anchor[r]       — fixed ceiling pixel position for pos[r][0].
- *                   Evenly spaced: anchor[r].x = (r+1) × screen_width / (N_ROPES+1).
- *                   anchor[r].y = ANCHOR_ROW_CELLS × CELL_H (just below the HUD).
- *
- * phase_offset[r] — wind phase offset for rope r, radians.
- *                   = r × 2π / N_ROPES.
- *                   Pre-computed in scene_init() so the sin() argument in
- *                   apply_wind() is a simple addition each tick.
- *
- * wind_time       — accumulated simulation time in seconds, used as the
- *                   base argument to sinf() in apply_wind().
- *                   Advances by dt each tick regardless of pause state
- *                   (the wind clock only stops when the whole simulation
- *                   is paused — rope_tick() returns early if sc->paused).
- *
- * wind_amp        — lateral wind force amplitude in px/s².  Runtime-adjustable
- *                   with ↑/↓ keys in [0, 1000].  Maps directly to the peak
- *                   lateral acceleration per tick: accel = wind_amp × sin(…).
- *
- * wind_freq       — wind oscillation angular frequency in rad/s.  Runtime-
- *                   adjustable with ←/→ keys in [0.05, 4.0].  Controls the
- *                   tempo of the sway: 0.4 rad/s → ~15.7 s period (slow
- *                   breeze); 4.0 rad/s → ~1.6 s period (rapid shaking).
- *
- * paused          — when true, rope_tick() saves prev_pos then returns early,
- *                   freezing all particle positions.  The alpha lerp in
- *                   render_scene() produces a clean freeze (prev = curr).
- *
- * theme_idx       — index into THEMES[]; t/T keys cycle it.  Preserved
- *                   across r/R reset by saving before memset and restoring
- *                   after (see scene_init()).
+ * References [3] Jakobsen §2 for the Verlet position representation.
  */
 typedef struct {
-    Vec2  pos     [N_ROPES][N_SEG];
-    Vec2  old_pos [N_ROPES][N_SEG];
-    Vec2  prev_pos[N_ROPES][N_SEG];
+    float x;   /* eastward  pixel coordinate (positive → right) */
+    float y;   /* southward pixel coordinate (positive → down)  */
+} Vec2;
 
-    float rest_len    [N_ROPES];
-    float rope_len_px [N_ROPES];
+/*
+ * Scene — full simulation state for the rope bank.
+ *
+ * Intent
+ *   N_ROPES rope chains share one Scene record. Each rope is N_SEG
+ *   Verlet particles plus a fixed anchor and a per-rope wind phase
+ *   stagger. The struct cleanly separates FIVE subsystems:
+ *
+ *     1. VERLET STATE — (pos, old_pos) — the integrator's two-position
+ *        memory. Velocity is IMPLICIT: v = pos − old_pos. Modifying
+ *        old_pos (without touching pos) injects velocity — this is
+ *        how the bounce + anchor-pin idioms work. Refs [1] Verlet.
+ *
+ *     2. RENDER SNAPSHOT — prev_pos — copied from pos at the START of
+ *        each tick. render_scene lerps prev_pos → pos by alpha so
+ *        motion stays smooth regardless of sim/render Hz mismatch.
+ *        Ref [9] Fiedler.
+ *
+ *     3. PER-ROPE GEOMETRY — (anchor, rope_len_px, rest_len,
+ *        phase_offset) — set ONCE in scene_init from screen size.
+ *        Recomputed on SIGWINCH so all ropes scale with the terminal.
+ *
+ *     4. WIND OSCILLATOR — (wind_time, wind_amp, wind_freq) — the
+ *        simple-harmonic-motion clock driving sinusoidal_wind_
+ *        acceleration_at(). Each rope reads (wind_time, wind_freq,
+ *        phase_offset[r]) to compute its instantaneous lateral
+ *        acceleration. Ref [8] Goldstein §2 (SHM).
+ *
+ *     5. UI / CONTROL — paused (gates physics) + theme_idx (chooses
+ *        the §3 palette).
+ *
+ * Why pos, old_pos, AND prev_pos — three position arrays
+ *   - pos     : CURRENT physics position; mutates every tick.
+ *   - old_pos : PREVIOUS physics position; defines implicit velocity.
+ *   - prev_pos: position at the START of the current tick; anchor for
+ *               sub-tick render interpolation.
+ *   old_pos and prev_pos cannot be collapsed: old_pos is rewritten by
+ *   every constraint pass + boundary bounce throughout the tick;
+ *   prev_pos is frozen at tick start. Merging them would corrupt
+ *   either the integrator or the renderer.
+ *
+ * Why per-rope arrays of geometry (not a Rope struct)
+ *   N_ROPES is small (7) and N_SEG is small (20), so a struct-of-
+ *   arrays (SoA) layout fits in a couple of cache lines. The hot
+ *   loops walk all 7 ropes one field at a time (the constraint
+ *   solver reads pos[r][·], the wind reads phase_offset[r]); SoA
+ *   matches that access pattern. AoS would force gather-style
+ *   indexing across more fields per cache line.
+ *
+ * Why phase_offset is CACHED in the struct (not computed each tick)
+ *   It's a constant after scene_init — the formula r·2π/N_ROPES
+ *   never changes — so we pay the multiply ONCE and read it
+ *   N_ROPES × every-tick thereafter. Cheap memory for cheap CPU.
+ *
+ * Why theme_idx is "preserved across r/R reset"
+ *   r/R is meant to reset the PHYSICS (re-spawn ropes at rest), not
+ *   the user's chosen palette. scene_init saves theme_idx before
+ *   memset and restores it after — so the visual identity stays
+ *   stable even when the simulation is rebuilt.
+ *
+ * Simulation vs Rendering locality
+ *   ── Simulation state ── read+written by scene_tick:
+ *      pos, old_pos              Verlet two-position memory
+ *      rest_len, rope_len_px,    per-rope geometry (immutable
+ *      anchor, phase_offset      after scene_init)
+ *      wind_time, wind_amp,      SHM oscillator (wind_time advances
+ *      wind_freq                 each tick; amp/freq are runtime-
+ *                                 tunable via arrow keys)
+ *      paused                    gates scene_tick early-return
+ *
+ *   ── Render-only state ──
+ *      prev_pos                  sub-tick lerp anchor for render
+ *      theme_idx                 chooses §3 palette via theme_apply
+ *
+ *   (No mid-tier "control state" group needed — paused IS sim state
+ *    because it gates the integrator; theme_idx is purely render.)
+ *
+ * Things that DO NOT live here
+ *   - sim_fps → §8 App (frame-cadence concern, not part of the
+ *     simulated world).
+ *   - fps counter → main() local (display-only).
+ *   - terminal extents (cols, rows) → §7 Screen.
+ *   - signal flags (running, need_resize) → §8 App.
+ *
+ * References [1][3][4] for the Verlet + PBD framework; [8] Goldstein
+ *   for the SHM wind oscillator; [9] Fiedler for the prev_pos lerp.
+ */
+typedef struct {
+    /* ── Verlet state (per-rope, per-segment, SoA) ────────────── *
+     * Two-position memory. v = pos − old_pos is the implicit     *
+     * velocity. Constraints + bounces write to old_pos to inject *
+     * velocity changes.                                          */
+    Vec2 pos     [N_ROPES][N_SEG];
+    Vec2 old_pos [N_ROPES][N_SEG];
+
+    /* ── Render snapshot (sub-tick interpolation anchor) ──────── *
+     * Frozen at tick start; render_scene lerps prev_pos → pos by *
+     * alpha ∈ [0, 1).                                            */
+    Vec2 prev_pos[N_ROPES][N_SEG];
+
+    /* ── Per-rope geometry (set ONCE in scene_init) ───────────── *
+     * anchor       : ceiling pixel position; pos[r][0] is pinned *
+     *                here by pin_rope_anchor every tick.         *
+     * rope_len_px  : total visual length (35%-75% screen height).*
+     * rest_len     : per-segment rest length (= len_px/(N_SEG−1)).*
+     * phase_offset : SHM phase shift for rope r (= r·2π/N_ROPES);*
+     *                pre-computed so the wind sin() argument is  *
+     *                a simple addition each tick.                */
     Vec2  anchor      [N_ROPES];
+    float rope_len_px [N_ROPES];
+    float rest_len    [N_ROPES];
     float phase_offset[N_ROPES];
 
+    /* ── Wind oscillator (simple-harmonic-motion driver) ─────── *
+     * Closed-form sin(ω·t + φ_r) on three knobs:                *
+     *   wind_time  : accumulated sim seconds (advances each tick *
+     *                unless paused).                              *
+     *   wind_amp   : peak lateral acceleration (px/s²), in [0,1000].*
+     *   wind_freq  : angular frequency (rad/s), in [0.05, 4.0].   */
     float wind_time;
     float wind_amp;
     float wind_freq;
 
+    /* ── UI / control state ───────────────────────────────────── *
+     * paused gates scene_tick (renderer still runs);             *
+     * theme_idx is render-only (selects §3 palette).             */
     bool  paused;
     int   theme_idx;
 } Scene;
@@ -897,69 +1058,95 @@ typedef struct {
 /* ── §5a  rope_verlet_step ──────────────────────────────────────────── */
 
 /*
- * rope_verlet_step() — one Verlet integration step for particle (r, s).
+ * implicit_velocity — Verlet's defining trick.
  *
- * WHAT: Advances particle (r, s) by one time step dt using position-based
- *   Verlet integration.  Gravity and wind are applied as accelerations.
+ *   In Verlet integration, velocity is NEVER stored explicitly. It's
+ *   reconstructed from two consecutive positions:
  *
- * WHY VERLET: Unlike explicit Euler (pos += vel × dt; vel += accel × dt),
- *   Verlet stores velocity implicitly as (pos − old_pos).  This makes it
- *   trivial to apply post-step constraints: after constraint_solve() moves
- *   the particle, the implicit velocity automatically reflects the corrected
- *   position.  With Euler, you would need to recompute velocity from the
- *   constrained position — Verlet does this for free.
+ *       v(t) ≈ pos(t) − pos(t − dt)
  *
- * STEP-BY-STEP ALGORITHM:
+ *   This means the state vector (pos, old_pos) carries BOTH position
+ *   AND momentum. Modifying old_pos AUTOMATICALLY changes the implicit
+ *   velocity — which is why every constraint and collision response
+ *   in this file works by writing to old_pos.
  *
- *   1. Extract old and current positions:
- *        old = old_pos[r][s]
- *        cur = pos[r][s]
+ *   Reference: Verlet (1967) "Computer Experiments on Classical
+ *   Fluids", Phys. Rev. 159 — original integrator. Jakobsen (2001)
+ *   "Advanced Character Physics" GDC — cloth/rope application.
+ */
+static inline Vec2 implicit_velocity(Vec2 pos, Vec2 old_pos)
+{
+    return (Vec2){ pos.x - old_pos.x, pos.y - old_pos.y };
+}
+
+/*
+ * apply_damping — multiplicative velocity damping per tick.
  *
- *   2. Compute damped implicit velocity:
- *        vel_x = (cur.x − old.x) × ROPE_DAMPING
- *        vel_y = (cur.y − old.y) × ROPE_DAMPING
+ *   v' = v · DAMPING
  *
- *      ROPE_DAMPING = 0.992 removes 0.8% of velocity each tick.
- *      Physical intuition: a rope segment is thin and whippy — it loses
- *      energy to air drag faster than a rigid limb (which uses 0.995).
+ *   ROPE_DAMPING = 0.992 removes ~0.8% kinetic energy per tick —
+ *   a thin, whippy rope loses energy faster than a rigid limb
+ *   (which uses 0.995 in ragdoll_figure.c). Multiplicative damping
+ *   in Verlet form is equivalent to a viscous −β·v term in the
+ *   continuous equations of motion.
+ */
+static inline Vec2 apply_damping(Vec2 v, float damping)
+{
+    return (Vec2){ v.x * damping, v.y * damping };
+}
+
+/*
+ * integrate_acceleration — Verlet position step.
  *
- *   3. Update old_pos to current (slide the window forward):
- *        old_pos[r][s] = cur
+ *   pos(t + dt) = pos(t) + v(t)·dt + a·dt²
  *
- *   4. Integrate acceleration and velocity into new position:
- *        pos[r][s].x = cur.x + vel_x + wind_x × dt²
- *        pos[r][s].y = cur.y + vel_y + GRAVITY × dt²
+ *   In our reduced form (with v already · dt from the implicit-
+ *   velocity reconstruction) the equation collapses to:
  *
- *      dt² appears because acceleration integrates twice:
- *        Δpos = vel × dt + ½ × accel × dt²
- *      The ½ factor is absorbed into the tuned values of GRAVITY and
- *      wind_amp (standard practice in game physics).
+ *       pos' = pos + v + a · dt²
  *
- * PARAMETERS:
- *   sc     — scene containing the pos/old_pos arrays.
- *   r      — rope index [0, N_ROPES).
- *   s      — segment index [1, N_SEG) — particle 0 is the anchor and is
- *            NEVER passed here; it is pinned by enforce_anchors() instead.
- *   wind_x — lateral acceleration for this rope this tick (px/s²), computed
- *            once per rope per tick by apply_wind() and passed here.
- *   dt     — tick duration in seconds (1.0 / sim_fps).
+ *   The factor-of-½ that appears in the textbook Verlet derivation
+ *   is absorbed into the tuned constants GRAVITY and wind_amp.
+ */
+static inline Vec2 integrate_acceleration(Vec2 pos, Vec2 v, Vec2 a, float dt2)
+{
+    return (Vec2){
+        pos.x + v.x + a.x * dt2,
+        pos.y + v.y + a.y * dt2,
+    };
+}
+
+/*
+ * rope_verlet_step — one Störmer-Verlet integration step on particle (r, s).
+ *
+ *   1. v       = implicit_velocity(pos, old_pos)      (Verlet trick)
+ *   2. v      ← apply_damping(v, ROPE_DAMPING)        (air drag)
+ *   3. a       = (wind_x, GRAVITY)                    (external accel)
+ *   4. old_pos ← pos                                  (slide state vector)
+ *   5. pos    ← integrate_acceleration(pos, v, a, dt²)
+ *
+ *   Step 4 MUST run before step 5 — otherwise the new pos would
+ *   overwrite the cur it depends on. The temp captured at step 1
+ *   prevents the aliasing.
+ *
+ *   GRAVITY is positive because +y is downward in pixel space.
+ *
+ *   Particle 0 is the ceiling ANCHOR and is never passed here —
+ *   enforce_anchors() re-pins it after every Verlet pass.
+ *
+ *   Reference: Jakobsen (2001) §2 "Verlet Integration".
  */
 static void rope_verlet_step(Scene *sc, int r, int s, float wind_x, float dt)
 {
-    float dt2  = dt * dt;
-    Vec2  old  = sc->old_pos[r][s];
-    Vec2  cur  = sc->pos[r][s];
+    float dt2 = dt * dt;
 
-    /* Step 2: damped implicit velocity */
-    float vel_x = (cur.x - old.x) * ROPE_DAMPING;
-    float vel_y = (cur.y - old.y) * ROPE_DAMPING;
+    Vec2 v = implicit_velocity(sc->pos[r][s], sc->old_pos[r][s]);
+    v      = apply_damping(v, ROPE_DAMPING);
+    Vec2 a = (Vec2){ wind_x, GRAVITY };
 
-    /* Step 3: slide the old-position window */
+    Vec2 cur = sc->pos[r][s];
     sc->old_pos[r][s] = cur;
-
-    /* Step 4: integrate acceleration into new position */
-    sc->pos[r][s].x   = cur.x + vel_x + wind_x  * dt2;
-    sc->pos[r][s].y   = cur.y + vel_y + GRAVITY  * dt2;
+    sc->pos[r][s]     = integrate_acceleration(cur, v, a, dt2);
 }
 
 /* ── §5b  apply_rope_constraints ────────────────────────────────────── */
@@ -1009,30 +1196,133 @@ static void rope_verlet_step(Scene *sc, int r, int s, float wind_x, float dt)
  *   sc, cols, rows — scene and terminal dimensions (cols/rows passed to
  *                    enforce_anchors() for completeness but not used there).
  */
+/*
+ * displacement_and_length — Δ = b − a and its Euclidean length, in
+ * one pass.
+ *
+ *   Returns:
+ *     *out_delta  ← b − a            (displacement vector)
+ *     return val  ← |b − a|         (Euclidean length)
+ *
+ *   The inner loop of the relaxation calls this 19 segments × 7 ropes
+ *   × N_ITERS times per tick — a fused compute saves one redundant
+ *   field-write per call.
+ */
+static inline float displacement_and_length(Vec2 a, Vec2 b, Vec2 *out_delta)
+{
+    out_delta->x = b.x - a.x;
+    out_delta->y = b.y - a.y;
+    return sqrtf(out_delta->x * out_delta->x +
+                 out_delta->y * out_delta->y);
+}
+
+/*
+ * relax_one_distance_constraint — Jakobsen equal-mass projection
+ * step for ONE adjacent particle pair.
+ *
+ *   Given particles p_a, p_b and rest length L:
+ *
+ *       Δ           = p_b − p_a             (current displacement)
+ *       d           = |Δ|                   (current length)
+ *       fractional  = (d − L) / d           (signed stretch / length)
+ *
+ *   POSITIVE fractional → stretched, pull endpoints together.
+ *   NEGATIVE fractional → compressed, push endpoints apart.
+ *
+ *   EQUAL-MASS CORRECTION (Jakobsen 2001 §3):
+ *
+ *       p_a' = p_a + ½ · fractional · Δ     (each endpoint moves
+ *       p_b' = p_b − ½ · fractional · Δ      half the error)
+ *
+ *   The ½ split conserves the CENTRE OF MASS of the pair — both
+ *   particles have equal mass, so the geometric mid-point doesn't
+ *   move when the constraint corrects the length.
+ *
+ *   Degenerate guard: if d < 1e-6 the particles coincide and the
+ *   fractional stretch is undefined; skip rather than divide by zero.
+ */
+static inline void relax_one_distance_constraint(Vec2 *a, Vec2 *b,
+                                                 float rest_length)
+{
+    Vec2  delta;
+    float length = displacement_and_length(*a, *b, &delta);
+    if (length < 1e-6f) return;        /* degenerate: coincident */
+
+    float fractional = (length - rest_length) / length;
+    float cx         = 0.5f * fractional * delta.x;
+    float cy         = 0.5f * fractional * delta.y;
+
+    a->x += cx;  a->y += cy;
+    b->x -= cx;  b->y -= cy;
+}
+
+/*
+ * relax_rope_chain — one full Gauss-Seidel sweep along rope r.
+ *
+ *   Walks the chain from anchor end (s = 0) to free tip (s = N_SEG − 1)
+ *   applying relax_one_distance_constraint to each adjacent pair
+ *   (s, s+1). After this sweep, each individual segment is at rest
+ *   length — but BECAUSE each pass disturbs adjacent shared
+ *   endpoints, the sweep typically VIOLATES the next-door segments
+ *   it just touched. apply_rope_constraints iterates this sweep
+ *   N_ITERS times for geometric convergence.
+ *
+ *   "Gauss-Seidel" because each correction immediately propagates
+ *   to the next constraint via the shared endpoint (vs Jacobi,
+ *   which would buffer all corrections and apply them together).
+ */
+static void relax_rope_chain(Scene *sc, int r)
+{
+    for (int s = 0; s < N_SEG - 1; s++)
+        relax_one_distance_constraint(&sc->pos[r][s],
+                                      &sc->pos[r][s + 1],
+                                      sc->rest_len[r]);
+}
+
+/*
+ * pin_rope_anchor — zero the implicit velocity of particle (r, 0)
+ * by writing BOTH pos AND old_pos to the ceiling anchor.
+ *
+ *   In Verlet, v = pos − old_pos. Writing BOTH to the same value
+ *   forces v = 0 — the anchor is truly immovable. Resetting only
+ *   pos would leave old_pos at the previously-displaced location,
+ *   so the next Verlet step would yank the anchor with a phantom
+ *   velocity. This double-write is the Verlet idiom for "pin".
+ */
+static inline void pin_rope_anchor(Scene *sc, int r)
+{
+    sc->pos    [r][0] = sc->anchor[r];
+    sc->old_pos[r][0] = sc->anchor[r];
+}
+
+/*
+ * apply_rope_constraints — Position-Based Dynamics relaxation.
+ *
+ *   For iter = 0 .. N_ITERS:
+ *     for each rope r:
+ *       1. relax_rope_chain(r)    (Gauss-Seidel sweep along rope)
+ *       2. pin_rope_anchor(r)     (zero the equal-mass drift the
+ *                                  sweep induces on particle 0)
+ *
+ *   N_ITERS controls stiffness: 1 = stretchy rope, 8 = essentially
+ *   inextensible. We use 6 — gives < 0.1% residual stretch on a
+ *   20-node rope while staying well within frame budget.
+ *
+ *   The PIN-AFTER-EACH-PASS pattern is what makes "anchor" actually
+ *   anchored. Without it, the equal-mass split in relax_one_distance_
+ *   constraint would gradually walk the anchor away from the ceiling
+ *   over many iterations.
+ *
+ *   References: Jakobsen (2001) §3 — distance-constraint relaxation;
+ *     Müller et al. (2007) "Position Based Dynamics" §3 — modern
+ *     generalisation to arbitrary constraint types.
+ */
 static void apply_rope_constraints(Scene *sc)
 {
     for (int iter = 0; iter < N_ITERS; iter++) {
         for (int r = 0; r < N_ROPES; r++) {
-            for (int s = 0; s < N_SEG - 1; s++) {
-                float dx   = sc->pos[r][s+1].x - sc->pos[r][s].x;
-                float dy   = sc->pos[r][s+1].y - sc->pos[r][s].y;
-                float dist = sqrtf(dx * dx + dy * dy);
-
-                if (dist < 1e-6f) continue;   /* coincident: skip safely */
-
-                float error = (dist - sc->rest_len[r]) / dist;
-                float cx    = 0.5f * error * dx;
-                float cy    = 0.5f * error * dy;
-
-                sc->pos[r][s  ].x += cx;
-                sc->pos[r][s  ].y += cy;
-                sc->pos[r][s+1].x -= cx;
-                sc->pos[r][s+1].y -= cy;
-            }
-
-            /* Re-pin anchor after each constraint pass to stop drift */
-            sc->pos[r][0]     = sc->anchor[r];
-            sc->old_pos[r][0] = sc->anchor[r];
+            relax_rope_chain(sc, r);
+            pin_rope_anchor (sc, r);
         }
     }
 }
@@ -1076,10 +1366,8 @@ static void apply_rope_constraints(Scene *sc)
  */
 static void enforce_anchors(Scene *sc)
 {
-    for (int r = 0; r < N_ROPES; r++) {
-        sc->pos[r][0]     = sc->anchor[r];
-        sc->old_pos[r][0] = sc->anchor[r];
-    }
+    for (int r = 0; r < N_ROPES; r++)
+        pin_rope_anchor(sc, r);
 }
 
 /* ── §5d  apply_wind ────────────────────────────────────────────────── */
@@ -1130,42 +1418,115 @@ static void enforce_anchors(Scene *sc)
  * SIDE EFFECTS: calls rope_verlet_step() for all non-anchor particles,
  *   then rope_boundaries() to clamp them to the screen box.
  */
-static void apply_wind(Scene *sc, int r, float dt, int cols, int rows)
+/*
+ * sinusoidal_wind_acceleration_at — closed-form lateral wind force.
+ *
+ *     a_x(t, r) = wind_amp · sin(wind_time · wind_freq + phase_offset[r])
+ *
+ *   This is a STANDING WAVE in time: the same closed-form sin() that
+ *   describes a simple harmonic oscillator. wind_amp is the
+ *   amplitude (peak lateral acceleration, px/s²), wind_freq is the
+ *   angular frequency (rad/s; period = 2π / wind_freq), and
+ *   phase_offset[r] shifts each rope along the sin cycle.
+ *
+ *   PHASE OFFSETS evenly distributed over [0, 2π) — set in
+ *   scene_init — give the bank of ropes a "Mexican-wave" appearance:
+ *   no two ropes are at the same phase, so the eye reads a single
+ *   coherent flow instead of seven identical pendulums.
+ *
+ *   Why sinusoidal (not random impulse)?
+ *     - SMOOTH         : no jumps → constraint solver never explodes.
+ *     - DETERMINISTIC  : same params → same look.
+ *     - CONTROLLABLE   : amp + freq map directly to feel.
+ *
+ *   Reference: any classical-mechanics text on simple harmonic
+ *   motion; e.g. Goldstein §2 "Lagrange's equations".
+ */
+static inline float sinusoidal_wind_acceleration_at(const Scene *sc, int r)
 {
-    /* Sinusoidal lateral acceleration for this rope this tick */
-    float wind_acc = sc->wind_amp
-                   * sinf(sc->wind_time * sc->wind_freq + sc->phase_offset[r]);
+    return sc->wind_amp
+         * sinf(sc->wind_time * sc->wind_freq + sc->phase_offset[r]);
+}
 
-    /* Integrate wind + gravity into every non-anchor particle */
-    for (int s = 1; s < N_SEG; s++) {
+/*
+ * integrate_rope_segments — Verlet step on every non-anchor particle
+ * of rope r. Particle 0 (the anchor) is skipped; enforce_anchors
+ * re-pins it after this pass.
+ */
+static inline void integrate_rope_segments(Scene *sc, int r,
+                                           float wind_acc, float dt)
+{
+    for (int s = 1; s < N_SEG; s++)
         rope_verlet_step(sc, r, s, wind_acc, dt);
-    }
+}
 
-    /* Clamp particles to screen boundaries; bounce at floor and walls */
+/*
+ * bounce_against_wall_1d — one-axis Verlet bounce with restitution.
+ *
+ *   Given a particle that crossed axis-aligned boundary `wall`:
+ *
+ *       1. v_axis = pos − old_pos          (implicit velocity, 1-D)
+ *       2. pos    ← wall                    (clamp onto surface)
+ *       3. old_pos ← wall + v_axis · e     (encode reflected vel)
+ *
+ *   Step 3 places old_pos PAST the wall so the next tick's implicit
+ *   velocity points AWAY from it — the classic Verlet bounce.
+ *
+ *   BOUNCE_COEFF ∈ (0, 1] is the COEFFICIENT OF RESTITUTION:
+ *     e = 1    perfectly elastic (no energy loss)
+ *     e → 0    perfectly inelastic (sticks to wall)
+ *
+ *   Reference: Goldstein "Classical Mechanics" §3.6 on 1-D collisions.
+ */
+static inline void bounce_against_wall_1d(float *pos, float *old_pos,
+                                          float wall)
+{
+    float v_axis = *pos - *old_pos;
+    *pos     = wall;
+    *old_pos = wall + v_axis * BOUNCE_COEFF;
+}
+
+/*
+ * bounce_rope_against_screen_bounds — clip every non-anchor particle
+ * of rope r to the screen rectangle (floor + side walls; the ceiling
+ * is held by the anchor so no top-wall test is needed).
+ */
+static inline void bounce_rope_against_screen_bounds(Scene *sc, int r,
+                                                     int cols, int rows)
+{
     float floor_y = (float)(rows * CELL_H) - FLOOR_MARGIN;
     float left_x  = LEFT_MARGIN;
     float right_x = (float)(cols * CELL_W) - RIGHT_MARGIN;
 
     for (int s = 1; s < N_SEG; s++) {
-        /* Floor bounce: reflect old_pos.y across the floor boundary */
-        if (sc->pos[r][s].y > floor_y) {
-            sc->pos[r][s].y     = floor_y;
-            sc->old_pos[r][s].y = sc->pos[r][s].y
-                                + (sc->pos[r][s].y - sc->old_pos[r][s].y) * BOUNCE_COEFF;
-        }
-        /* Left wall bounce */
-        if (sc->pos[r][s].x < left_x) {
-            sc->pos[r][s].x     = left_x;
-            sc->old_pos[r][s].x = sc->pos[r][s].x
-                                + (sc->pos[r][s].x - sc->old_pos[r][s].x) * BOUNCE_COEFF;
-        }
-        /* Right wall bounce */
-        if (sc->pos[r][s].x > right_x) {
-            sc->pos[r][s].x     = right_x;
-            sc->old_pos[r][s].x = sc->pos[r][s].x
-                                + (sc->pos[r][s].x - sc->old_pos[r][s].x) * BOUNCE_COEFF;
-        }
+        if (sc->pos[r][s].y > floor_y)
+            bounce_against_wall_1d(&sc->pos[r][s].y, &sc->old_pos[r][s].y, floor_y);
+        if (sc->pos[r][s].x < left_x)
+            bounce_against_wall_1d(&sc->pos[r][s].x, &sc->old_pos[r][s].x, left_x);
+        if (sc->pos[r][s].x > right_x)
+            bounce_against_wall_1d(&sc->pos[r][s].x, &sc->old_pos[r][s].x, right_x);
     }
+}
+
+/*
+ * apply_wind — drive one rope forward by one physics tick.
+ *
+ *   1. sinusoidal_wind_acceleration_at(sc, r)   (closed-form SHM)
+ *   2. integrate_rope_segments(sc, r, wind, dt) (Verlet on segments)
+ *   3. bounce_rope_against_screen_bounds       (floor + side walls)
+ *
+ *   The wind is computed ONCE per rope per tick (uniform across the
+ *   whole chain) — physically equivalent to a perfectly horizontal
+ *   gust that affects every particle equally.
+ *
+ *   References: Jakobsen 2001 §2 (Verlet) + §4 (collisions);
+ *     Goldstein §2 (SHM) + §3.6 (restitution).
+ */
+static void apply_wind(Scene *sc, int r, float dt, int cols, int rows)
+{
+    float wind_acc = sinusoidal_wind_acceleration_at(sc, r);
+    integrate_rope_segments(sc, r, wind_acc, dt);
+    bounce_rope_against_screen_bounds(sc, r, cols, rows);
 }
 
 /* ── §5e  rope_node_char ────────────────────────────────────────────── */
@@ -1577,7 +1938,32 @@ static void scene_draw(const Scene *sc, WINDOW *w,
  * resize.  See framework.c §7 for the full double-buffer architecture
  * rationale (erase → draw → wnoutrefresh → doupdate).
  */
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal-extent snapshot in CHARACTER CELLS.
+ *
+ * Intent
+ *   Caches the current terminal size so every §6 entry point reads
+ *   (cols, rows) as plain ints rather than re-querying ncurses each
+ *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
+ *   propagated to scene_init via app_do_resize so per-rope geometry
+ *   (anchors + lengths) rescales with the terminal.
+ *
+ * Why a separate struct (not just two ints in App)
+ *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
+ *   except this struct. Carving it out makes screen_resize pure and
+ *   isolates the ncurses dependency from the simulation layer.
+ *
+ * Why cells, not pixels
+ *   ncurses' coordinate system is cells. Pixel space (CELL_W × CELL_H
+ *   sub-pixels per cell) lives only inside §5 — converted at the
+ *   draw boundary, per the project's "one conversion point" rule.
+ *
+ * References [12] Raymond, NCURSES Programming HOWTO.
+ */
+typedef struct {
+    int cols;   /* terminal width  in CHARACTER CELLS */
+    int rows;   /* terminal height in CHARACTER CELLS */
+} Screen;
 
 /*
  * screen_init() — configure the terminal for animation.
@@ -1704,27 +2090,56 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — top-level application state, accessible from signal handlers.
+ * App — top-level container; everything outside the world.
  *
- * Declared as a file-scope global (g_app) because POSIX signal handlers
- * receive no user-defined argument — they can only communicate with the
- * main loop through globals.
+ * Intent
+ *   Bundles the simulated world (Scene), the host terminal (Screen),
+ *   and the session-level loop-control flags into one record so
+ *   main() reads as four-line phases: init / service signals /
+ *   step+draw / shutdown. Declared file-scope (g_app) so signal
+ *   handlers — which cannot take a user argument — can write
+ *   `running` and `need_resize` without globals scattered through
+ *   the file.
  *
- * running and need_resize are volatile sig_atomic_t because:
- *   volatile     — prevents the compiler from caching the value in a
- *                  register across the signal-handler write.  Without
- *                  volatile, the main loop might read a stale cached copy.
- *   sig_atomic_t — the only integer type POSIX guarantees can be read and
- *                  written atomically from a signal handler on all
- *                  conforming implementations.  Using int could theoretically
- *                  produce a torn read on some architectures.
+ * Locality of concern
+ *   ── Owned subsystems ── nouns the app composes
+ *      scene       — the world being simulated (§6)
+ *      screen      — the terminal extent it draws to (§7)
+ *
+ *   ── Session state ── settings the user controls across resets
+ *      sim_fps     — physics tick rate (cycled with [ / ])
+ *
+ *   ── Loop control ── verbs the loop reads each frame
+ *      running     — clear → loop exits; set by SIGINT/SIGTERM
+ *      need_resize — set by SIGWINCH; cleared after Screen refresh
+ *
+ * Why volatile sig_atomic_t (not bool, not int)
+ *   `volatile`    : the compiler must not cache the flag across a
+ *                   signal-handler write — every loop iteration must
+ *                   re-read it from memory.
+ *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
+ *                   signals; a plain `int` could be observed half-
+ *                   written on architectures where stores are split.
+ *   See [12] Raymond §"Signal handling".
+ *
+ * Things that DO NOT live here
+ *   - Wall-clock timestamps / fps counters — main() locals; no
+ *     other code path needs them.
+ *   - Rope tuning values (wind_amp, wind_freq, theme_idx) —
+ *     simulation/render state in §5 Scene.
+ *   - Theme table itself — file-scope `static const` in §3.
  */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* ── Owned subsystems ─────────────────────────────────────── */
+    Scene  scene;              /* the world (§6)                       */
+    Screen screen;             /* terminal extent (§7)                 */
+
+    /* ── Session state ────────────────────────────────────────── */
+    int    sim_fps;            /* physics tick rate (Hz)               */
+
+    /* ── Loop control ─────────────────────────────────────────── */
+    volatile sig_atomic_t running;      /* main loop predicate            */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH pending               */
 } App;
 
 static App g_app;

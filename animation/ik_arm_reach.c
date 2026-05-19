@@ -90,18 +90,70 @@
  *                 passes ≈ 120 simple ops; typically converges in 3–5
  *                 iterations so ~30 ops. Microseconds total.
  *
- * References    :
- *   Aristidou & Lasenby, "FABRIK: A fast, iterative solver for the
- *     Inverse Kinematics problem" (Graphical Models 2011) — the
- *     foundational paper, including the convergence proof.
- *     https://www.andreasaristidou.com/FABRIK.html
- *   Wikipedia, "Inverse kinematics" — broader context including the
- *     Jacobian alternatives that FABRIK avoids.
- *   Wikipedia, "Lissajous curve" — derivation of the figure-8 shape
- *     for fx:fy = 1:2 frequency ratio with phase offset.
- *   Glenn Fiedler, "Fix Your Timestep!" (gafferongames.com) — the
- *     case for fixed-step (stiff sims); we don't qualify, hence
- *     variable dt.
+ * References
+ * ──────────
+ *   ── FABRIK (the §5b solver) ──────────────────────────────────────
+ *   [1] Aristidou, A. & Lasenby, J. (2011), "FABRIK: A fast,
+ *       iterative solver for the inverse kinematics problem",
+ *       Graphical Models 73(5), pp. 243-260 — the foundational
+ *       paper, including the convergence proof; §5b implements
+ *       the two geometric passes line-by-line.
+ *       https://www.andreasaristidou.com/FABRIK.html
+ *   [2] Aristidou, A., Chrysanthou, Y. & Lasenby, J. (2016),
+ *       "Extending FABRIK with model constraints", Computer
+ *       Animation and Virtual Worlds 27(1) — joint-limit
+ *       extensions; relevant if you ever add elbow constraints
+ *       (currently unconstrained, see EDGE CASES).
+ *
+ *   ── IK families FABRIK avoids ────────────────────────────────────
+ *   [3] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
+ *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
+ *       UCSD course notes — the Jacobian-iterative family; FABRIK
+ *       converges faster and skips matrix inverses entirely.
+ *   [4] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
+ *       and Control" (3rd ed.), Pearson — Ch. 4 derives the
+ *       ANALYTICAL closed-form 2-link IK (law of cosines); read
+ *       to feel the contrast between analytical and iterative
+ *       solvers. Analytical solutions don't scale past 3 links.
+ *   [5] Wang, L.-C. T. & Chen, C. C. (1991), "A combined
+ *       optimization method for solving the inverse kinematics
+ *       problem of mechanical manipulators", IEEE TRA 7(4) —
+ *       CCD (Cyclic Coordinate Descent), the IK-iteration scheme
+ *       FABRIK improved upon.
+ *
+ *   ── Lissajous / target path ──────────────────────────────────────
+ *   [6] Lissajous, J. A. (1857), "Mémoire sur l'étude optique des
+ *       mouvements vibratoires", Annales de Chimie et de Physique
+ *       51 — original derivation of the figure family. The 1:2
+ *       frequency ratio with π/4 phase shift gives the clean ∞ in
+ *       this demo.
+ *   [7] Cundy, H. M. & Rollett, A. P. (1961), "Mathematical Models",
+ *       Oxford — Ch. 5 enumerates Lissajous curves by ratio and
+ *       phase; reference for picking different target patterns.
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *   [8] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
+ *       — when fixed-step matters; this file uses variable-step
+ *       because FABRIK and the Lissajous oscillator are
+ *       unconditionally stable.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *   [9] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       the integer line algorithm; the §5d line rasteriser uses
+ *       the simpler parametric oversample because float math is
+ *       already paid for in FABRIK.
+ *  [10] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the root→tip brightness ramp.
+ *  [11] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the diff pipeline §7 relies on.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [12] https://en.wikipedia.org/wiki/Inverse_kinematics
+ *  [13] https://en.wikipedia.org/wiki/Lissajous_curve
+ *  [14] https://en.wikipedia.org/wiki/FABRIK
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -631,17 +683,41 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Theme — body gradient (pairs 1..N_ARM_COLORS, root → tip).
- * HUD/HINT pairs are theme-independent (CLAUDE.md HUD spec) — they
- * stay readable against any animation behind them.
+ * Theme — one arm colour palette (xterm-256 fg indices).
  *
- * All entries sit in the bright half of the 256-colour space:
- *   - cube colours: ≥ 24 (brightness rule)
- *   - grayscale  : ≥ 240 (the 232-239 zone vanishes under A_DIM)
+ * Intent
+ *   Each theme rebinds only the FIVE arm pairs (1..5) via
+ *   init_pair. The two SEMANTIC pairs — target red (6) and reach-
+ *   horizon yellow (7) — are theme-INDEPENDENT because their colour
+ *   carries meaning the user must learn once and then trust across
+ *   every theme. HUD/HINT (8/9) are also theme-independent.
+ *
+ * Slot semantics (arm[0..4] map to pairs 1..5; root → tip gradient)
+ *   [0] pair 1 — root link (dimmest); shoulder end of chain.
+ *   [1] pair 2 — second link.
+ *   [2] pair 3 — middle link.
+ *   [3] pair 4 — fourth link.
+ *   [4] pair 5 — tip link (brightest); end-effector end of chain.
+ *
+ *   The root→tip brightness gradient lets the eye trace the chain
+ *   without joint-numbering overlay. Refs [10] Bourke for the
+ *   depth-cued character/colour pairing pattern.
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness")
+ *   Every entry sits in the BRIGHT HALF of the 256-colour space:
+ *     - cube colours: ≥ 24  (avoid 16-23; invisible under A_DIM)
+ *     - grayscale  : ≥ 240 (avoid 232-239; same reason)
+ *   Theme character comes from the RELATIVE gradient, not absolute
+ *   darkness — push the dimmest slot up by a few indices to keep
+ *   the look and gain legibility.
+ *
+ * References [10] Bourke for the gradient-as-depth pattern;
+ *   [11] Raymond §init_pair for the rebind mechanism.
  */
 typedef struct {
-    const char *name;
-    int arm[N_ARM_COLORS];   /* pairs 1..5: root → tip */
+    const char *name;              /* HUD-displayable theme name        */
+    int         arm[N_ARM_COLORS]; /* xterm-256 fg indices, root → tip; *
+                                    * pair (i+1) = arm[i] at apply time */
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -719,8 +795,40 @@ static inline int px_to_cell_y(float py)
 /* §5  entity — Arm                                                       */
 /* ===================================================================== */
 
-/* Vec2 — 2-D position vector in pixel space. */
-typedef struct { float x, y; } Vec2;
+/*
+ * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
+ *
+ * Intent
+ *   FABRIK arithmetic and Lissajous integration both live in pixel
+ *   space. Each character cell is CELL_W × CELL_H sub-pixels
+ *   (8 × 16), so a sweeping arm and a moving target read as
+ *   continuous motion instead of jumping cell-to-cell. The
+ *   conversion to cell space happens only inside §5d rendering
+ *   helpers via px_to_cell_x/y — the project's "one conversion
+ *   point" rule.
+ *
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right of screen).
+ *   y : SOUTHWARD pixel coordinate (positive → down the screen).
+ *
+ *   FABRIK is direction-AGNOSTIC — every step works purely on
+ *   distances and unit vectors. The screen-y-down convention costs
+ *   nothing: the solver doesn't compute angles, just positions.
+ *
+ * Why a value type
+ *   8 bytes; passes in registers on every modern ABI. Joints are
+ *   stored Vec2 pos[N_JOINTS] (5 entries → 40 bytes); the inner
+ *   FABRIK loop walks this array with no indirection.
+ *
+ * Why named (x, y) instead of two loose floats
+ *   Type-checking catches (col, row) confusion at compile time.
+ *
+ * References [4] Craig §2 "Spatial descriptions".
+ */
+typedef struct {
+    float x;   /* eastward  pixel coordinate (positive → right) */
+    float y;   /* southward pixel coordinate (positive → down)  */
+} Vec2;
 
 /* ── §5a  vec2 helpers ──────────────────────────────────────────────── */
 
@@ -742,31 +850,98 @@ static inline Vec2 vec2_norm(Vec2 v)
     return (Vec2){v.x / l, v.y / l};
 }
 
-/* Arm — full IK arm state. */
+/*
+ * Arm — the full IK arm state.
+ *
+ * Intent
+ *   Two cleanly-separated sub-systems share one record:
+ *
+ *     1. CHAIN — N_JOINTS joints, N_LINKS fixed-length segments
+ *        between them. pos[0] is the root (pinned to the screen-
+ *        centre anchor); pos[N_LINKS] is the tip (end-effector).
+ *        FABRIK rewrites pos[] in full each tick. Refs [1].
+ *
+ *     2. TARGET OSCILLATOR — a Lissajous(1, 2, π/4) figure-8 that
+ *        the chain chases. Output = (lis_ax·cos(t), lis_ay·sin(2t+
+ *        π/4)) shifted to (root_px, root_py). The arm has no will
+ *        of its own; this oscillator is what gives the demo motion.
+ *        Refs [6][7].
+ *
+ *   The sub-systems are UNCOUPLED in time: the target advances on
+ *   wall-clock time; the chain reacts to wherever it ended up.
+ *   No feedback loop, no shared state besides `target`.
+ *
+ * Why pos[] has N_JOINTS = N_LINKS + 1 entries
+ *   A chain with N links has N+1 joints (one per link end + the
+ *   root). pos[0] = root anchor; pos[N_LINKS] = tip. The "+1" is a
+ *   constant trap to remember — index it wrong and FABRIK silently
+ *   shortens the chain by one.
+ *
+ * Why total_len is CACHED (not recomputed)
+ *   The reachability test "is |target - root| > Σ link_len?" runs
+ *   every tick. Σ link_len doesn't change after scene_init, so cache
+ *   it once. Lets the hot path skip an O(N) sum and one sqrtf
+ *   per frame.
+ *
+ * Why TRAIL_SIZE is a CIRCULAR buffer (not a growing list)
+ *   The renderer walks the most recent TRAIL_SIZE samples backward
+ *   from trail_head. Circular indexing means no allocation, no
+ *   shifting; trail_head walks mod TRAIL_SIZE forward, oldest entry
+ *   is overwritten. trail_count caps at TRAIL_SIZE on warm-up so
+ *   the renderer doesn't read uninitialised entries on frame 1.
+ *
+ * Why root anchor is stored (not just hard-coded)
+ *   SIGWINCH triggers a recompute (in app_do_resize) — the anchor
+ *   moves to the new screen centre, and the Lissajous re-centres
+ *   around it. Caching it here means the resize path is one
+ *   assignment, not a re-derivation in every helper.
+ *
+ * The `at_limit` flag
+ *   Set true when reachability fails (target outside Σ link_len
+ *   radius). Two readers care:
+ *     - solver: skips FABRIK iteration, calls stretch_arm_straight.
+ *     - renderer: draws the yellow reach-horizon circle.
+ *   Recomputed every tick, never persists across frames.
+ *
+ * References [1][2] Aristidou & Lasenby for FABRIK; [6] Lissajous
+ *   original derivation; [3][4] Buss + Craig for the IK families
+ *   this file's solver is NOT.
+ */
 typedef struct {
-    /* joint chain */
-    Vec2  pos[N_JOINTS];           /* current positions (pixels)         */
-    float link_len[N_LINKS];       /* fixed lengths, set in scene_init   */
-    float total_len;               /* Σ link_len — reachability test     */
+    /* ── Chain state (FABRIK rewrites pos[] each tick) ─────────── */
+    Vec2  pos     [N_JOINTS];  /* joint positions; [0]=root, [N]=tip */
+    float link_len[N_LINKS];   /* fixed segment lengths; set once    */
+    float total_len;           /* cache of Σ link_len for reach test */
 
-    /* root anchor (Lissajous centre too) */
-    float root_px, root_py;
+    /* ── Root anchor (Lissajous centre coincides) ──────────────── *
+     * Re-set on SIGWINCH so a resize re-centres both the chain    *
+     * root and the figure-8 path the target traces.               */
+    float root_px;             /* pixel-space x of arm root         */
+    float root_py;             /* pixel-space y of arm root         */
 
-    /* Lissajous target oscillator */
-    Vec2  target;                  /* current Lissajous output (pixels)  */
-    float scene_time;              /* phase accumulator (s)              */
-    float speed_scale;              /* +/- multiplier on scene_time      */
-    float lis_ax, lis_ay;           /* amplitudes (pixels)               */
+    /* ── Lissajous target oscillator (closed-form, stateless) ─── *
+     * target is a pure function of scene_time + lis_ax/lis_ay +   *
+     * root anchor. scene_time advances by dt·speed_scale per tick;*
+     * pausing freezes scene_time so motion can resume in phase.   */
+    Vec2  target;              /* current oscillator output         */
+    float scene_time;          /* phase accumulator (s)             */
+    float speed_scale;         /* +/- user-tunable multiplier       */
+    float lis_ax;              /* amplitude in x (pixels)           */
+    float lis_ay;              /* amplitude in y (pixels)           */
 
-    /* trail ring buffer — recent target positions */
+    /* ── Target trail (circular buffer of recent positions) ───── *
+     * Rendered as a faint dotted ∞ behind the live target so the  *
+     * eye can see the path being traced.                           */
     Vec2  trail[TRAIL_SIZE];
-    int   trail_head;              /* newest entry index                 */
-    int   trail_count;             /* valid entries, ≤ TRAIL_SIZE        */
+    int   trail_head;          /* index of newest entry, mod size   */
+    int   trail_count;         /* valid entries, saturates at SIZE  */
 
-    /* state flags */
-    bool  at_limit;                /* target out of reach this tick      */
-    bool  paused;
-    int   theme_idx;
+    /* ── Reachability + UI flags ───────────────────────────────── *
+     * at_limit: recomputed each tick (NOT persistent state).      *
+     * paused / theme_idx: user control flags.                     */
+    bool  at_limit;            /* target outside Σ link_len radius  */
+    bool  paused;              /* freezes scene_time; chain freezes */
+    int   theme_idx;           /* index into §3 THEMES[]            */
 } Arm;
 
 /* ── §5b  FABRIK solver ─────────────────────────────────────────────── */
@@ -1052,7 +1227,44 @@ static void render_arm(const Arm *a, WINDOW *w, int cols, int rows)
 /* §6  scene — thin wrapper around Arm                                   */
 /* ===================================================================== */
 
-typedef struct { Arm arm; } Scene;
+/*
+ * Scene — composition root for §6.
+ *
+ * Intent
+ *   In this demo the simulation IS one arm + one Lissajous target.
+ *   We keep a Scene wrapper anyway so the framework loop (scene_init
+ *   / scene_tick / scene_draw) reads identically to every other file
+ *   in the repo. If a future variant adds e.g. obstacles for the arm
+ *   to avoid, secondary targets, or a goal-switcher, those slot in
+ *   here as siblings of `arm` without changing the loop.
+ *
+ * Simulation vs Rendering locality
+ *   The Arm struct itself already separates CHAIN STATE (FABRIK
+ *   output) from TARGET OSCILLATOR (sim verbs) from TRAIL (render-
+ *   only cache) from REACHABILITY/UI FLAGS. Within Scene there is
+ *   no further split needed yet — one field, one concern. When
+ *   adding a new member, place it as follows:
+ *
+ *     ── Simulation state ──   things scene_tick READS+WRITES
+ *                              (obstacles[], secondary_target, …)
+ *     ── Render-only state ──  things scene_draw READS, never the
+ *                              physics path (camera, shake, …)
+ *
+ * Things that DO NOT live here
+ *   - fps / sim_fps counters → §8 App (frame-timing concern, not
+ *     part of the world being simulated).
+ *   - terminal extents (cols, rows) → §7 Screen.
+ *   - signal flags (running, need_resize) → §8 App.
+ *
+ * One Scene per program; passed by pointer to every §6 entry point.
+ */
+typedef struct {
+    /* ── Simulation state ─────────────────────────────────────── */
+    Arm arm;                   /* the world: chain + target + trail */
+
+    /* (no render-only state yet — theme_idx + trail live inside
+     *  Arm because trail is also used by the reach-check overlay) */
+} Scene;
 
 /*
  * scene_init — place the arm at screen centre with all geometry sized
@@ -1138,7 +1350,31 @@ static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows)
 /* §7  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal-extent snapshot in CHARACTER CELLS.
+ *
+ * Intent
+ *   Caches the current terminal size so every §6 entry point reads
+ *   (cols, rows) as plain ints rather than re-querying ncurses each
+ *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
+ *   propagated to scene_init via app_do_resize.
+ *
+ * Why a separate struct (not just two ints in App)
+ *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
+ *   except this struct. Carving it out makes screen_resize pure and
+ *   isolates the ncurses dependency from the simulation layer.
+ *
+ * Why cells, not pixels
+ *   ncurses' coordinate system is cells. Pixel space (CELL_W ×
+ *   CELL_H sub-pixels per cell) lives only inside §5 — converted at
+ *   the draw boundary, per the project's "one conversion point" rule.
+ *
+ * References [11] Raymond, NCURSES Programming HOWTO.
+ */
+typedef struct {
+    int cols;   /* terminal width  in CHARACTER CELLS */
+    int rows;   /* terminal height in CHARACTER CELLS */
+} Screen;
 
 /* The non-obvious call here is typeahead(-1): without it, ncurses peeks
  * at stdin during output writes, which can tear frames mid-update. */
@@ -1207,12 +1443,51 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* §8  app                                                                */
 /* ===================================================================== */
 
+/*
+ * App — top-level container; everything outside the world.
+ *
+ * Intent
+ *   Bundles the simulated world (Scene), the host terminal (Screen),
+ *   and the loop-control flags into one record so main() reads as
+ *   four-line phases: init / service signals / step+draw / shutdown.
+ *   Declared file-scope (g_app) so signal handlers — which cannot
+ *   take a user argument — can write `running` and `need_resize`
+ *   without globals scattered through the file.
+ *
+ * Locality of concern
+ *   ── Owned subsystems ── nouns the app composes
+ *      scene       — the world being simulated (§6)
+ *      screen      — the terminal extent it draws to (§7)
+ *
+ *   ── Loop control ─── verbs the loop reads each frame
+ *      time_scale  — wall-clock dt multiplier ([ / ] adjust)
+ *      running     — clear → loop exits; set by SIGINT/SIGTERM
+ *      need_resize — set by SIGWINCH; cleared after Screen refresh
+ *
+ * Why volatile sig_atomic_t (not bool, not int)
+ *   `volatile`    : the compiler must not cache the flag across a
+ *                   signal-handler write — every loop iteration must
+ *                   re-read it from memory.
+ *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
+ *                   signals; a plain `int` could be observed half-
+ *                   written on architectures where stores are split.
+ *   See [11] Raymond §"Signal handling".
+ *
+ * Things that DO NOT live here
+ *   - Wall-clock timestamps / fps counters — main() locals; no
+ *     other code path needs them.
+ *   - Arm tuning values (speed_scale, theme_idx) — user-state in
+ *     §5 Arm.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    float                 time_scale;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* ── Owned subsystems ─────────────────────────────────────── */
+    Scene  scene;              /* the world (§6)                       */
+    Screen screen;             /* terminal extent (§7)                 */
+
+    /* ── Loop control ─────────────────────────────────────────── */
+    float                 time_scale;   /* dt multiplier; 1.0 = realtime */
+    volatile sig_atomic_t running;      /* main loop predicate            */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH pending               */
 } App;
 
 static App g_app;

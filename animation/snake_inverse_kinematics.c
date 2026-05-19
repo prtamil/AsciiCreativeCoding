@@ -79,14 +79,89 @@
  *                  with 32 joints at 60 Hz this is well under 1 µs/frame.
  *                  ncurses doupdate transmits only changed cells.
  *
- * References     : Reynolds, "Steering Behaviors for Autonomous Characters,"
- *                    1999 — the canonical wander + arrival + containment.
- *                  Wikipedia: "Inverse kinematics" — analytic form for the
- *                    one-link case used here (atan2 + step).
- *                  Stam, "Real-Time Stable Cloth and Hair," 2002 — same
- *                    trail-following FK applied to per-strand chains.
- *                  Khoshrou, "Snake Robot Locomotion," 2009 — a survey of
- *                    serpentine FK on a moving curve, the body model used.
+ * References
+ * ──────────
+ *   ── Inverse kinematics (the §5b head solver) ─────────────────────
+ *   [1] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
+ *       and Control" (3rd ed.), Pearson — Ch. 4 derives analytical
+ *       IK; the 1-link case used by analytic_one_link_ik_step() is
+ *       the trivial subset (atan2 + step).
+ *   [2] Spong, M. W., Hutchinson, S. & Vidyasagar, M. (2005), "Robot
+ *       Modeling and Control", Wiley — alternative canonical text;
+ *       Ch. 4 covers the 1-/2-link solvability conditions cleanly.
+ *
+ *   ── Iterative IK alternatives (the contrast) ─────────────────────
+ *   [3] Aristidou, A. & Lasenby, J. (2011), "FABRIK: a fast,
+ *       iterative solver for the inverse kinematics problem",
+ *       Graphical Models 73(5) — iterative IK for long chains.
+ *       This file does NOT use FABRIK; the body follows the head's
+ *       PATH (FK trail-sampling) while the HEAD does 1-link IK.
+ *       Two-stage hybrid: pure analytic at the head, FK for the body.
+ *   [4] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
+ *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
+ *       UCSD course notes — the Jacobian-iterative family we
+ *       DON'T need here.
+ *
+ *   ── Steering / autonomous wander (the target's motion) ──────────
+ *   [5] Reynolds, C. (1999), "Steering Behaviors for Autonomous
+ *       Characters", GDC — wander + arrival + containment patterns;
+ *       multi_harmonic_steering_turn() implements §"Wander" with
+ *       three sinusoids instead of one.
+ *       https://www.red3d.com/cwr/steer/
+ *   [6] Reynolds, C. (1987), "Flocks, Herds, and Schools: A
+ *       Distributed Behavioral Model", SIGGRAPH '87 — earlier work
+ *       establishing the autonomous-character motion pattern this
+ *       file's target follows.
+ *
+ *   ── Central pattern generators (biology) ────────────────────────
+ *   [7] Manton, S. M. (1952), "The evolution of arthropodan
+ *       locomotory mechanisms", J. Linn. Soc. Zoology — biological
+ *       reference for CPGs: gait timing from an internal oscillator,
+ *       not sensory feedback. The wander target's CPG is a
+ *       computer-science analogue.
+ *
+ *   ── Path / arc-length parameterisation (the §5a trail walk) ─────
+ *   [8] Foley, J. D., van Dam, A. et al. (1995), "Computer Graphics:
+ *       Principles and Practice" (2nd ed.) — §11.2 spline / curve
+ *       arc-length parameterisation; trail_sample applies the same
+ *       walk-and-interpolate technique to a polyline.
+ *   [9] Khoshrou, S. (2009), "Snake Robot Locomotion: Theory and
+ *       Simulation" — analysis of serpentine FK on a moving curve.
+ *
+ *   ── Signal processing (the §5b IIR low-pass) ────────────────────
+ *  [10] Oppenheim, A. V. & Schafer, R. W. (2010), "Discrete-Time
+ *       Signal Processing" (3rd ed.), Pearson — §3.6 first-order
+ *       IIR (leaky integrator); first_order_low_pass() is the
+ *       discrete-time form of that filter.
+ *
+ *   ── Classical mechanics (the wall reflections) ─────────────────
+ *  [11] Goldstein, H. (1980), "Classical Mechanics" (2nd ed.),
+ *       Addison-Wesley — §3.6 elastic collisions with axis-aligned
+ *       walls; basis for reflect_direction_about_{vertical,
+ *       horizontal}_wall() in bounce_target().
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *  [12] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com —
+ *       the fixed-step accumulator pattern this file uses; alpha
+ *       interpolation between prev_joint and joint comes from here.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *  [13] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       the integer line algorithm; §5d draw_segment_beads uses the
+ *       simpler parametric oversample because float math is already
+ *       paid for in trail_sample.
+ *  [14] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — basis for
+ *       the head-to-tail brightness gradient.
+ *  [15] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the diff pipeline §7 relies on.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [16] https://en.wikipedia.org/wiki/Inverse_kinematics
+ *  [17] https://en.wikipedia.org/wiki/Forward_kinematics
+ *  [18] https://en.wikipedia.org/wiki/Infinite_impulse_response
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -543,9 +618,38 @@ static void clock_sleep_ns(int64_t ns)
  * PAIR_HUD / PAIR_HINT / PAIR_GHOST are theme-independent and configured
  * once in color_init().
  */
+/*
+ * Theme — one named multi-colour body palette (xterm-256 fg indices).
+ *
+ * Intent
+ *   Each theme rebinds the seven body pairs (1..N_PAIRS) via init_pair
+ *   in one shot (see theme_apply). HUD/HINT/GHOST pairs are NOT
+ *   theme-bound — they stay bright yellow / bright cyan / faint
+ *   target-ghost across every theme so the status bar + target trail
+ *   remain legible against any palette (CLAUDE.md HUD spec).
+ *
+ * Slot semantics (body[0..6] → pairs 1..7; head → tail gradient)
+ *   [0] head      — joint[0] + first body bead (brightest)
+ *   [1..5] body   — mid-body region (smooth gradient)
+ *   [6] tail tip  — joint[N_SEGS] (dimmest, A_DIM-attenuated)
+ *
+ *   The head → tail brightness gradient lets the eye trace which way
+ *   the snake is swimming. Ref [14] Bourke.
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness")
+ *   Every entry sits in the BRIGHT HALF of the 256-colour cube:
+ *     - cube colours: ≥ 24  (avoid 16-23; invisible under A_DIM)
+ *     - grayscale  : ≥ 240 (avoid 232-239; same reason)
+ *   The tail quarter renders with A_DIM, so without the brightness
+ *   rule the tail would simply disappear on dark terminals.
+ *
+ * References [14] Bourke for the gradient-as-depth pattern;
+ *   [15] Raymond §init_pair for the rebind mechanism.
+ */
 typedef struct {
-    const char *name;
-    int         body[N_PAIRS];
+    const char *name;            /* HUD-displayable theme name        */
+    int         body[N_PAIRS];   /* xterm-256 fg per pair slot;       *
+                                  * pair p = body[p-1] at apply time  */
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -631,57 +735,153 @@ static inline int px_to_cell_y(float py)
 /* §5  entity — Snake: trail buffer + IK head + bead renderer            */
 /* ===================================================================== */
 
-typedef struct { float x, y; } Vec2;
-
 /*
- * Snake — complete simulation state.
+ * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
  *
- * TRAIL BUFFER — same as snake_forward_kinematics.c:
- *   Circular buffer of head positions; trail_at(k) returns the entry
- *   k ticks back from newest.  Body joints sampled from this by
- *   arc-length (see trail_sample, compute_joints).
+ * Intent
+ *   Every §5 simulation quantity — wander target position, head
+ *   position, trail samples, body joints — lives in pixel space.
+ *   Each character cell is CELL_W × CELL_H sub-pixels (8 × 16),
+ *   giving sub-cell precision so a chasing snake reads as continuous
+ *   motion instead of jumping cell-to-cell. The conversion to cell
+ *   space happens only inside §5d rendering helpers via
+ *   px_to_cell_x/y — the project's "one conversion point" rule.
  *
- * IK FIELDS:
- *   tgt_time       simulation time accumulator for the wander harmonics
- *   tgt_speed      wander target translation speed (px/s); adjusted by +/-
- *   tgt_dir        current heading of the wander target (radians)
- *   tgt_pos        current pixel position of the wander target
- *   actual_target  smoothly-tracked position (lerp toward tgt_pos)
- *   heading        head's current travel direction (radians); head arrow
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right of screen).
+ *   y : SOUTHWARD pixel coordinate (positive → DOWN the screen).
  *
- * TARGET TRAIL:
- *   tgt_trail[]    circular buffer of recent actual_target positions
- *   tgt_head       write pointer
- *   tgt_count      valid entries
+ *   Angles are MATH-CONVENTION (positive CCW from +X). Because y
+ *   points DOWN on screen, a math-CCW rotation displays as CW.
+ *   reflect_direction_about_horizontal_wall (θ' = −θ) handles the
+ *   y-axis-flipped reflection correctly in this convention because
+ *   sin(−θ) = −sin θ regardless of whether y points up or down.
  *
- * theme_idx — index into THEMES[]; adjusted by t/T keys.
+ * Why a value type
+ *   8 bytes; passes in registers on every modern ABI. The §5b helpers
+ *   (polyline_segment_length, lerp_between_points, first_order_low_pass)
+ *   all take/return Vec2 by value — -O2 inlines them into straight-
+ *   line code with no allocation.
+ *
+ * Why named (x, y) instead of two loose floats
+ *   Type-checking catches (col, row) confusion at compile time
+ *   rather than via visual debugging.
+ *
+ * References [1] Craig §2 "Spatial descriptions".
  */
 typedef struct {
-    /* Trail buffer */
-    Vec2  trail[TRAIL_CAP];
-    int   trail_head;
-    int   trail_count;
+    float x;   /* eastward  pixel coordinate (positive → right) */
+    float y;   /* southward pixel coordinate (positive → down)  */
+} Vec2;
 
-    /* Body joints */
-    Vec2  joint[N_SEGS + 1];
-    Vec2  prev_joint[N_SEGS + 1];
+/*
+ * Snake — the full state of the IK demo.
+ *
+ * Two animals coexist on screen, both stored in this one record:
+ *
+ *   1. WANDER TARGET — an autonomous mover driven by a three-harmonic
+ *      CPG. State: (tgt_time, tgt_pos, tgt_dir, tgt_speed). Bounces
+ *      off the bounded region. Refs [5][6] Reynolds, [7] Manton.
+ *
+ *   2. SNAKE — chases the smoothed target via 1-link analytical IK
+ *      at the head; the body follows the head's path via FK trail-
+ *      sampling. The architecture is a "two-stage hybrid": analytic
+ *      IK at the head, FK arc-length sampling for the body.
+ *      Refs [1][9] Craig + Khoshrou.
+ *
+ *   The smoothing layer (actual_target, first_order_low_pass) sits
+ *   BETWEEN them: it reads tgt_pos (the wander target's raw output)
+ *   and produces actual_target (what the head actually chases). The
+ *   IIR low-pass rounds bounce-corners so the head's pursuit looks
+ *   deliberate, not jittery. Ref [10] Oppenheim & Schafer.
+ *
+ * Data-flow arrow (one direction, no feedback loop):
+ *
+ *     wander CPG          → tgt_pos  (raw target, bounces off walls)
+ *     first_order_low_pass → actual_target  (IIR-smoothed target)
+ *     analytic_one_link_ik → head position + heading
+ *     trail_push           → trail buffer
+ *     compute_joints       → body joints (arc-length sample of trail)
+ *
+ * Why trail is a CIRCULAR buffer (not a regular array)
+ *   Trail samples are PUSHED at the head every tick and CONSUMED at
+ *   every arc-length along the body. Circular indexing means no
+ *   O(N) shift per frame; trail_head walks mod TRAIL_CAP. Once
+ *   filled, oldest entries are silently overwritten.
+ *
+ * Why prev_joint AND joint (two body-position arrays)
+ *   - joint     : the CURRENT body pose; rewritten each tick.
+ *   - prev_joint: pose at the START of the current tick; anchor for
+ *                  sub-tick render interpolation.
+ *   render_chain lerps prev_joint → joint by alpha ∈ [0, 1) for
+ *   smooth motion at any sim/render Hz mismatch. Ref [12] Fiedler.
+ *
+ * Why tgt_pos AND actual_target (two target positions)
+ *   - tgt_pos      : the RAW wander-CPG output. Jumps sharply when
+ *                     bounce_target reflects off a wall.
+ *   - actual_target: IIR-smoothed version that the IK chases.
+ *   Without the smoothing layer, the head would snap-pursue every
+ *   bounce corner — visually unpleasant. Smoothing converts each
+ *   sharp bounce into a smooth quarter-circle curve around the
+ *   reflected corner.
+ *
+ * Why tgt_trail (separate ghost-trail buffer)
+ *   Renders as a faint dotted breadcrumb path behind the target
+ *   so the viewer can see where the head is HEADING. Shorter cap
+ *   than the body trail (TARGET_TRAIL_CAP < TRAIL_CAP) because we
+ *   only need a few seconds of memory for the visual hint.
+ *
+ * References [1] Craig §4 (1-link IK); [5] Reynolds wander;
+ *   [7] Manton CPG; [8] Foley & van Dam arc-length sampling;
+ *   [10] Oppenheim & Schafer IIR low-pass; [12] Fiedler.
+ */
+typedef struct {
+    /* ── Trail buffer (FK source-of-truth for body) ──────────── *
+     * Circular log of past head positions; compute_joints arc-  *
+     * length-samples this to place body joints.                 */
+    Vec2 trail[TRAIL_CAP];
+    int  trail_head;                 /* index of newest entry, mod TRAIL_CAP*/
+    int  trail_count;                /* valid entries, saturates at TRAIL_CAP*/
 
-    /* IK / wander target */
-    Vec2  actual_target;
-    Vec2  tgt_pos;
-    float tgt_time;
-    float tgt_speed;
-    float tgt_dir;
+    /* ── Body joints (FK output) ─────────────────────────────── *
+     * joint[0] = head (set by move_head's IK step).             *
+     * joint[1..N_SEGS] = body+tail (set by compute_joints).     *
+     * prev_joint = snapshot at tick start (sub-tick lerp anchor).*/
+    Vec2 joint     [N_SEGS + 1];
+    Vec2 prev_joint[N_SEGS + 1];
+
+    /* ── Head steering (output of 1-link IK) ─────────────────── *
+     * heading is the CURRENT direction of travel; written by    *
+     * analytic_one_link_ik_step from atan2(target − head).      *
+     * move_speed is the constant head pursuit speed (px/s).     */
     float heading;
     float move_speed;
 
-    /* Target ghost trail */
-    Vec2  tgt_trail[TARGET_TRAIL_CAP];
-    int   tgt_head;
-    int   tgt_count;
+    /* ── Wander target (input to the IK system) ──────────────── *
+     * tgt_pos/dir/speed are the WANDER CPG's state. tgt_time is *
+     * the CPG clock; tgt_pos jumps sharply at wall bounces.     */
+    Vec2  tgt_pos;
+    float tgt_time;                  /* CPG clock (s)                       */
+    float tgt_speed;                 /* wander target speed (px/s)          */
+    float tgt_dir;                   /* wander target heading (rad)         */
 
-    int   theme_idx;
-    bool  paused;
+    /* ── Smoothing layer (between raw target and head) ──────── *
+     * IIR low-pass output that the head's IK actually chases.   *
+     * Decouples the sharp wander bounces from the head's chase. */
+    Vec2  actual_target;
+
+    /* ── Target ghost trail (renderer-visible breadcrumbs) ──── *
+     * Short circular buffer of recent actual_target positions; *
+     * rendered as a faint dotted hint of where the head will go.*/
+    Vec2 tgt_trail[TARGET_TRAIL_CAP];
+    int  tgt_head;                   /* index of newest entry             */
+    int  tgt_count;                  /* valid entries, saturates at CAP   */
+
+    /* ── UI / control state ─────────────────────────────────── *
+     * paused gates scene_tick (renderer still runs);            *
+     * theme_idx selects the §3 palette.                         */
+    int  theme_idx;                  /* index into THEMES[]; t/T cycles    */
+    bool paused;
 } Snake;
 
 /* ── §5a  trail helpers ─────────────────────────────────────────────── */
@@ -699,31 +899,91 @@ static inline Vec2 trail_at(const Snake *s, int k)
 }
 
 /*
- * trail_sample() — interpolated position at arc-length dist from head.
- * Walks the trail from newest entry, accumulating distances, until the
- * cumulative arc equals dist, then linearly interpolates.
+ * polyline_segment_length — Euclidean distance between two trail points.
+ *
+ *     |b − a| = √((b.x − a.x)² + (b.y − a.y)²)
+ *
+ *   The trail is a POLYLINE (piecewise-linear curve through stored
+ *   samples). Its arc length is the sum of these segment lengths.
+ *   trail_sample walks the polyline summing this primitive until the
+ *   target arc-length is bracketed.
+ */
+static inline float polyline_segment_length(Vec2 a, Vec2 b)
+{
+    float dx = b.x - a.x;
+    float dy = b.y - a.y;
+    return sqrtf(dx * dx + dy * dy);
+}
+
+/*
+ * lerp_between_points — linear interpolation a + t·(b − a).
+ *
+ *     t = 0  →  a            (start of segment)
+ *     t = 1  →  b            (end   of segment)
+ *     t ∈ (0,1)  →  intermediate point on the line segment a→b
+ *
+ *   Used to land a body joint at exactly the requested arc length,
+ *   not at the nearest stored sample — sub-sample precision is what
+ *   keeps the chain looking smooth as the head curves.
+ */
+static inline Vec2 lerp_between_points(Vec2 a, Vec2 b, float t)
+{
+    return (Vec2){
+        a.x + (b.x - a.x) * t,
+        a.y + (b.y - a.y) * t,
+    };
+}
+
+/*
+ * trail_sample — arc-length parameterisation along the trail polyline.
+ *
+ *   Walk newest → oldest accumulating polyline_segment_length until
+ *   the running total brackets the requested arc length `dist`. Then
+ *   linearly interpolate WITHIN that bracketing segment.
+ *
+ *   Pseudocode:
+ *     accum ← 0
+ *     a     ← trail[0]                       (newest = current head)
+ *     for k = 1 .. trail_count − 1:
+ *         b   ← trail[k]                     (one tick older)
+ *         seg ← polyline_segment_length(a, b)
+ *         if accum + seg ≥ dist:             (target inside [a, b])
+ *             t ← (dist − accum) / seg       (fractional position)
+ *             return lerp_between_points(a, b, t)
+ *         accum ← accum + seg
+ *         a     ← b
+ *     return trail[trail_count − 1]          (trail exhausted)
+ *
+ *   This is the standard ARC-LENGTH SAMPLING pattern used in
+ *   tessellators and motion-capture playback: parameterise the
+ *   polyline by ARC LENGTH (even spacing along the curve), not by
+ *   INDEX (uneven spacing that depends on how fast samples arrived).
+ *
+ *   Numerical guard: divide-by-zero on seg ≈ 0 — clamp the
+ *   denominator to 1e-4 so t collapses to "start of segment".
+ *
+ *   Reference: Foley & van Dam, "Computer Graphics: Principles and
+ *   Practice" §11.2 on spline / curve arc-length parameterisation.
  */
 static Vec2 trail_sample(const Snake *s, float dist)
 {
     float accum = 0.0f;
-    Vec2  a     = trail_at(s, 0);
+    Vec2  a     = trail_at(s, 0);              /* newest = current head */
 
     for (int k = 1; k < s->trail_count; k++) {
-        Vec2  b   = trail_at(s, k);
-        float dx  = b.x - a.x;
-        float dy  = b.y - a.y;
-        float seg = sqrtf(dx * dx + dy * dy);
+        Vec2  b   = trail_at(s, k);            /* one tick older than a */
+        float seg = polyline_segment_length(a, b);
 
-        if (accum + seg >= dist) {
+        if (accum + seg >= dist) {             /* target inside [a, b] */
             float t = (dist - accum) / (seg > 1e-4f ? seg : 1e-4f);
-            return (Vec2){ a.x + dx * t, a.y + dy * t };
+            return lerp_between_points(a, b, t);
         }
 
-        accum += seg;
+        accum += seg;                          /* keep walking back    */
         a      = b;
     }
 
-    return trail_at(s, s->trail_count - 1);
+    return trail_at(s, s->trail_count - 1);    /* trail exhausted      */
 }
 
 /* ── §5b  move_head — IK goal-seeking ──────────────────────────────── */
@@ -755,91 +1015,261 @@ static void tgt_push(Snake *s, Vec2 pos)
  * After a bounce, actual_target lerps toward the new tgt_pos at 8×/s, so
  * the head's chase smoothly rounds the corner rather than snapping.
  */
+/*
+ * reflect_direction_about_vertical_wall — left/right wall reflection.
+ *
+ *   A wall parallel to the y-axis (i.e. vertical: x = constant) has
+ *   normal along ±x. Reflecting a direction θ about that normal flips
+ *   the x component of (cos θ, sin θ) while leaving y untouched:
+ *
+ *       (cos θ, sin θ)   →   (−cos θ, sin θ)
+ *
+ *   In angle form: θ' = π − θ. (Substitute and verify:
+ *   cos(π − θ) = −cos θ, sin(π − θ) = sin θ. ✓)
+ *
+ *   Reference: any classical mechanics text on elastic collisions
+ *   with axis-aligned walls; e.g. Goldstein §3.6.
+ */
+static inline float reflect_direction_about_vertical_wall(float dir)
+{
+    return (float)M_PI - dir;
+}
+
+/*
+ * reflect_direction_about_horizontal_wall — top/bottom wall reflection.
+ *
+ *   A wall parallel to the x-axis has normal along ±y. Reflection
+ *   flips the y component of (cos θ, sin θ):
+ *
+ *       (cos θ, sin θ)   →   (cos θ, −sin θ)
+ *
+ *   In angle form: θ' = −θ. (cos(−θ) = cos θ, sin(−θ) = −sin θ. ✓)
+ */
+static inline float reflect_direction_about_horizontal_wall(float dir)
+{
+    return -dir;
+}
+
+/*
+ * bounce_target — reflect tgt_dir off any wall the target has crossed,
+ * AND clamp tgt_pos back inside the bounded region.
+ *
+ *   Bounded region: [m, wpx−m] × [m, hpx−m] where m = EDGE_MARGIN_PX.
+ *
+ *   For each axis-aligned wall the target crossed this tick:
+ *     1. Clamp the position back to the wall (so the next tick
+ *        doesn't keep finding the target outside).
+ *     2. Reflect the direction about the wall's normal.
+ *
+ *   THE CLAMP IS ESSENTIAL — at high tgt_speed a single tick can
+ *   carry the target several pixels past the wall. Without the
+ *   clamp, the next tick would still find tgt_pos outside, reflect
+ *   AGAIN, and the target would oscillate in place at the wall.
+ *
+ *   After a bounce, actual_target lerps toward the new tgt_pos at
+ *   8× per second (first_order_low_pass below), so the head's chase
+ *   smoothly rounds the corner rather than snapping.
+ */
 static void bounce_target(Snake *s, float wpx, float hpx)
 {
-    float m  = EDGE_MARGIN_PX;
+    float m    = EDGE_MARGIN_PX;
     float lo_x = m, hi_x = wpx - m;
     float lo_y = m, hi_y = hpx - m;
 
     if (s->tgt_pos.x < lo_x) {
         s->tgt_pos.x = lo_x;
-        s->tgt_dir   = (float)M_PI - s->tgt_dir;
+        s->tgt_dir   = reflect_direction_about_vertical_wall(s->tgt_dir);
     } else if (s->tgt_pos.x > hi_x) {
         s->tgt_pos.x = hi_x;
-        s->tgt_dir   = (float)M_PI - s->tgt_dir;
+        s->tgt_dir   = reflect_direction_about_vertical_wall(s->tgt_dir);
     }
     if (s->tgt_pos.y < lo_y) {
         s->tgt_pos.y = lo_y;
-        s->tgt_dir   = -s->tgt_dir;
+        s->tgt_dir   = reflect_direction_about_horizontal_wall(s->tgt_dir);
     } else if (s->tgt_pos.y > hi_y) {
         s->tgt_pos.y = hi_y;
-        s->tgt_dir   = -s->tgt_dir;
+        s->tgt_dir   = reflect_direction_about_horizontal_wall(s->tgt_dir);
     }
 }
 
 /*
- * move_head() — IK goal-seek: head chases a wall-bouncing wander target.
+ * multi_harmonic_steering_turn — three-harmonic CPG output (rad/s).
  *
- * STEP 1 — advance wander target via three-harmonic steering.
- *          turn_rate = ΣAᵢ·sin(fᵢ·t + φᵢ); integrate into tgt_dir; step.
- * STEP 2 — bounce target off the bounded region's walls.  Reflecting the
- *          heading AND clamping the position prevents oscillation.
- * STEP 3 — low-pass filter actual_target → tgt_pos at TGT_SMOOTH_RATE.
- *          Smooths the bounce corner so the head's chase looks deliberate.
- * STEP 4 — analytic 1-link IK: heading = atan2(target − head); step at
- *          move_speed, clamped so the head cannot overshoot the target.
- * STEP 5 — hard-clamp head position to the screen box (safety net at the
- *          highest speeds where dt × move_speed could overshoot).
- * STEP 6 — push the new head position into the trail; push actual_target
- *          into the short ghost-trail buffer for rendering.
+ *     ω(t) = A₁·sin(f₁·t) + A₂·sin(f₂·t + φ₂) + A₃·sin(f₃·t + φ₃)
+ *
+ *   A SINGLE sinusoid produces a strictly periodic wander pattern —
+ *   the target traces the same Lissajous figure forever and the eye
+ *   reads the repetition. Summing three sinusoids with INCOMMENSURATE
+ *   frequencies (f₁, f₂, f₃ chosen so no two are rational multiples)
+ *   produces a QUASI-PERIODIC signal that never exactly repeats over
+ *   any human-scale time window.
+ *
+ *   This is a discrete-time central pattern generator (CPG): the
+ *   composite output drives autonomous motion without sensory
+ *   feedback. Three is the minimum that gives convincing wander —
+ *   one is too periodic, two often beat audibly.
+ *
+ *   Reference: Manton (1952) on biological CPGs; Reynolds (1999)
+ *   §"Wander" — the multi-harmonic stagger pattern.
+ */
+static inline float multi_harmonic_steering_turn(float t)
+{
+    return TGT_TURN_AMP1 * sinf(TGT_TURN_FREQ1 * t)
+         + TGT_TURN_AMP2 * sinf(TGT_TURN_FREQ2 * t + TGT_TURN_PHASE2)
+         + TGT_TURN_AMP3 * sinf(TGT_TURN_FREQ3 * t + TGT_TURN_PHASE3);
+}
+
+/*
+ * advance_wander_target — semi-implicit Euler step on the target's
+ * (direction, position) state.
+ *
+ *     dir' = dir + turn · dt          (integrate heading first)
+ *     pos' = pos + v · (cos dir', sin dir') · dt
+ *
+ *   "Semi-implicit" because we use the NEW dir to integrate position.
+ *   Equivalent to explicit Euler at first order but reads "turn then
+ *   move", which matches the physical intuition: the target rotates
+ *   first, then walks in the rotated direction.
+ */
+static inline void advance_wander_target(Snake *s, float turn, float dt)
+{
+    s->tgt_dir += turn * dt;
+    s->tgt_pos.x += s->tgt_speed * cosf(s->tgt_dir) * dt;
+    s->tgt_pos.y += s->tgt_speed * sinf(s->tgt_dir) * dt;
+}
+
+/*
+ * first_order_low_pass — exponential-moving-average smoother.
+ *
+ *     y_new = y_old + (x_raw − y_old) · α
+ *
+ *   Discrete-time form of the first-order linear IIR filter
+ *   y' + (1/τ)·y = (1/τ)·x with α = dt/τ:
+ *     α → 0  : output frozen (infinite smoothing)
+ *     α → 1  : output follows input exactly (no smoothing)
+ *
+ *   α is clamped to [0, 1] so a large dt (e.g. paused frame) can't
+ *   overshoot. Used here to round the target's sharp bounce-corners
+ *   so the head's chase looks deliberate, not jittery.
+ *
+ *   Reference: Oppenheim & Schafer, "Discrete-Time Signal Processing"
+ *   §3.6 — first-order IIR (leaky integrator).
+ */
+static inline Vec2 first_order_low_pass(Vec2 current, Vec2 raw, float alpha)
+{
+    if (alpha > 1.0f) alpha = 1.0f;
+    if (alpha < 0.0f) alpha = 0.0f;
+    return (Vec2){
+        current.x + (raw.x - current.x) * alpha,
+        current.y + (raw.y - current.y) * alpha,
+    };
+}
+
+/*
+ * analytic_one_link_ik_step — closed-form IK for a single rigid link.
+ *
+ *   The "arm" here has ONE link: the snake head. Goal-seeking it is
+ *   trivial — no triangle, no law of cosines, no iteration:
+ *
+ *       1. Δ      = target − head            (displacement)
+ *       2. d      = |Δ|                       (distance to target)
+ *       3. if d < ε: already there, do nothing.
+ *       4. heading = atan2(Δ.y, Δ.x)         (face the target)
+ *       5. step = min(max_step, d)            (clip to not overshoot)
+ *       6. head ← head + (Δ / d) · step      (walk forward)
+ *
+ *   The step CLIP is the IK-specific guard: a 1-link arm can land
+ *   exactly on its target every frame, so without the clip the head
+ *   would overshoot and bounce-back jitter at the apex of every
+ *   pursuit. Clipping to `d` makes the head SETTLE on the target
+ *   when it catches up.
+ *
+ *   Reference: Craig "Introduction to Robotics" §4 (analytical IK,
+ *   1-link case is the trivial subset of the 2-link law of cosines).
+ */
+static inline void analytic_one_link_ik_step(Snake *s, Vec2 target,
+                                             float max_step)
+{
+    float dx   = target.x - s->joint[0].x;
+    float dy   = target.y - s->joint[0].y;
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist <= 0.5f) return;             /* already at target */
+
+    s->heading = atan2f(dy, dx);
+    float step = (max_step < dist) ? max_step : dist;
+    s->joint[0].x += (dx / dist) * step;
+    s->joint[0].y += (dy / dist) * step;
+}
+
+/*
+ * clamp_head_to_pixel_bounds — defensive screen-rect clip.
+ *
+ *   The analytic IK clip + target bouncing normally keep the head
+ *   inside the screen. But a single large-dt frame (debugger pause,
+ *   suspend + resume) can fling the head past the wall before the
+ *   target's wall-reflection has a chance to redirect it. This is
+ *   the safety net for that worst case.
+ */
+static inline void clamp_head_to_pixel_bounds(Snake *s, float wpx, float hpx)
+{
+    if (s->joint[0].x < 0.0f) s->joint[0].x = 0.0f;
+    if (s->joint[0].x > wpx)  s->joint[0].x = wpx;
+    if (s->joint[0].y < 0.0f) s->joint[0].y = 0.0f;
+    if (s->joint[0].y > hpx)  s->joint[0].y = hpx;
+}
+
+/*
+ * move_head — IK goal-seek pipeline: the head chases a wall-bouncing
+ * wander target.
+ *
+ *   PHASE 1 — wander target self-propels:
+ *     1. tgt_time += dt
+ *     2. turn  = multi_harmonic_steering_turn(tgt_time)   (CPG)
+ *     3. advance_wander_target(turn, dt)                  (Euler)
+ *     4. bounce_target                                    (walls)
+ *
+ *   PHASE 2 — smooth raw target into actual_target:
+ *     5. actual_target ← first_order_low_pass(actual_target, tgt_pos,
+ *                                             dt · TGT_SMOOTH_RATE)
+ *
+ *   PHASE 3 — head pursues actual_target via 1-link IK:
+ *     6. analytic_one_link_ik_step(head, actual_target,
+ *                                  move_speed · dt)
+ *     7. clamp_head_to_pixel_bounds                       (safety)
+ *
+ *   PHASE 4 — record:
+ *     8. trail_push(head)        — FK chain follows this trail
+ *     9. tgt_push(actual_target) — ghost-trail behind the target
+ *
+ *   The wander target is the INPUT to the IK system; the head is its
+ *   OUTPUT. The head's chase is purely analytical 1-link IK (atan2 +
+ *   clipped step) — no Jacobian, no iteration, no overshoot.
+ *
+ *   References: Manton + Reynolds for the CPG; Oppenheim & Schafer
+ *   for the IIR low-pass; Craig §4 for the IK math.
  */
 static void move_head(Snake *s, float dt, int cols, int rows)
 {
     float wpx = (float)(cols * CELL_W);
     float hpx = (float)(rows * CELL_H);
 
-    /* Step 1: advance wander target via multi-harmonic steering */
+    /* PHASE 1 — wander target self-propels */
     s->tgt_time += dt;
-
-    float turn = TGT_TURN_AMP1 * sinf(TGT_TURN_FREQ1 * s->tgt_time)
-               + TGT_TURN_AMP2 * sinf(TGT_TURN_FREQ2 * s->tgt_time + TGT_TURN_PHASE2)
-               + TGT_TURN_AMP3 * sinf(TGT_TURN_FREQ3 * s->tgt_time + TGT_TURN_PHASE3);
-    s->tgt_dir += turn * dt;
-
-    s->tgt_pos.x += s->tgt_speed * cosf(s->tgt_dir) * dt;
-    s->tgt_pos.y += s->tgt_speed * sinf(s->tgt_dir) * dt;
-
-    /* Step 2: bounce target off bounded region (no toroidal wrap) */
+    float turn = multi_harmonic_steering_turn(s->tgt_time);
+    advance_wander_target(s, turn, dt);
     bounce_target(s, wpx, hpx);
 
-    /* Step 3: smooth actual_target toward tgt_pos */
-    float k = dt * TGT_SMOOTH_RATE;
-    if (k > 1.0f) k = 1.0f;
-    s->actual_target.x += (s->tgt_pos.x - s->actual_target.x) * k;
-    s->actual_target.y += (s->tgt_pos.y - s->actual_target.y) * k;
+    /* PHASE 2 — IIR low-pass smooths bounce corners */
+    s->actual_target = first_order_low_pass(s->actual_target, s->tgt_pos,
+                                            dt * TGT_SMOOTH_RATE);
 
-    /* Step 4: steer head toward actual_target */
-    float dx   = s->actual_target.x - s->joint[0].x;
-    float dy   = s->actual_target.y - s->joint[0].y;
-    float dist = sqrtf(dx * dx + dy * dy);
+    /* PHASE 3 — head pursues smoothed target via 1-link IK */
+    analytic_one_link_ik_step(s, s->actual_target, s->move_speed * dt);
+    clamp_head_to_pixel_bounds(s, wpx, hpx);
 
-    if (dist > 0.5f) {
-        s->heading  = atan2f(dy, dx);
-        float step  = s->move_speed * dt;
-        if (step > dist) step = dist;   /* don't overshoot */
-        s->joint[0].x += (dx / dist) * step;
-        s->joint[0].y += (dy / dist) * step;
-    }
-
-    /* Step 5: hard-clamp head to screen box (safety net) */
-    if (s->joint[0].x < 0.0f) s->joint[0].x = 0.0f;
-    if (s->joint[0].x > wpx)  s->joint[0].x = wpx;
-    if (s->joint[0].y < 0.0f) s->joint[0].y = 0.0f;
-    if (s->joint[0].y > hpx)  s->joint[0].y = hpx;
-
-    /* Step 6: record into trail and target ghost trail */
+    /* PHASE 4 — record into trails */
     trail_push(s, s->joint[0]);
-    tgt_push(s, s->actual_target);
+    tgt_push  (s, s->actual_target);
 }
 
 /* ── §5c  compute_joints ────────────────────────────────────────────── */
@@ -1079,7 +1509,42 @@ static void render_chain(const Snake *s, WINDOW *w,
 /* §6  scene                                                              */
 /* ===================================================================== */
 
-typedef struct { Snake snake; } Scene;
+/*
+ * Scene — composition root for §6.
+ *
+ * Intent
+ *   In this demo the simulation IS one snake chasing one wander
+ *   target (both stored inside the Snake struct). We keep a Scene
+ *   wrapper anyway so the framework loop (scene_init / scene_tick /
+ *   scene_draw) reads identically to every other file in the repo.
+ *   If a future variant adds e.g. obstacles, secondary targets,
+ *   or a swarm, they slot in here as siblings of `snake` without
+ *   changing the loop.
+ *
+ * Simulation vs Rendering locality
+ *   The Snake struct itself already separates trail / body / IK head
+ *   / wander target / smoothing / ghost trail / UI. Within Scene
+ *   there is no further split needed yet — one field, one concern.
+ *   When adding a new member, place it as follows:
+ *
+ *     ── Simulation state ──   things scene_tick READS+WRITES
+ *                              (prey[], obstacles[], goal switcher)
+ *     ── Render-only state ──  things scene_draw READS, never the
+ *                              physics path (camera, shake, FX)
+ *
+ * Things that DO NOT live here
+ *   - fps / sim_fps counters → §8 App (frame-timing concern, not
+ *     part of the world being simulated).
+ *   - terminal extents (cols, rows) → §7 Screen.
+ *   - signal flags (running, need_resize) → §8 App.
+ *   - Theme table → file-scope `static const` in §3.
+ *
+ * One Scene per program; passed by pointer to every §6 entry point.
+ */
+typedef struct {
+    /* ── Simulation state ─────────────────────────────────────── */
+    Snake snake;               /* world: trail + body + IK + target */
+} Scene;
 
 /*
  * scene_init() — initialise snake to a clean, immediately-animated state.
@@ -1160,7 +1625,31 @@ static void scene_draw(const Scene *sc, WINDOW *w,
 /* §7  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal-extent snapshot in CHARACTER CELLS.
+ *
+ * Intent
+ *   Caches the current terminal size so every §6 entry point reads
+ *   (cols, rows) as plain ints rather than re-querying ncurses each
+ *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
+ *   propagated to scene_init via app_do_resize.
+ *
+ * Why a separate struct (not just two ints in App)
+ *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
+ *   except this struct. Carving it out makes screen_resize pure and
+ *   isolates the ncurses dependency from the simulation layer.
+ *
+ * Why cells, not pixels
+ *   ncurses' coordinate system is cells. Pixel space (CELL_W × CELL_H
+ *   sub-pixels per cell) lives only inside §5 — converted at the
+ *   draw boundary, per the project's "one conversion point" rule.
+ *
+ * References [15] Raymond, NCURSES Programming HOWTO.
+ */
+typedef struct {
+    int cols;   /* terminal width  in CHARACTER CELLS */
+    int rows;   /* terminal height in CHARACTER CELLS */
+} Screen;
 
 static void screen_init(Screen *s, int initial_theme)
 {
@@ -1226,12 +1715,56 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* §8  app                                                                */
 /* ===================================================================== */
 
+/*
+ * App — top-level container; everything outside the world.
+ *
+ * Intent
+ *   Bundles the simulated world (Scene), the host terminal (Screen),
+ *   and the session-level loop-control flags into one record so
+ *   main() reads as four-line phases: init / service signals /
+ *   step+draw / shutdown. Declared file-scope (g_app) so signal
+ *   handlers — which cannot take a user argument — can write
+ *   `running` and `need_resize` without globals scattered through
+ *   the file.
+ *
+ * Locality of concern
+ *   ── Owned subsystems ── nouns the app composes
+ *      scene       — the world being simulated (§6)
+ *      screen      — the terminal extent it draws to (§7)
+ *
+ *   ── Session state ── user settings that survive a reset
+ *      sim_fps     — physics tick rate (cycled with [ / ])
+ *
+ *   ── Loop control ── verbs the loop reads each frame
+ *      running     — clear → loop exits; set by SIGINT/SIGTERM
+ *      need_resize — set by SIGWINCH; cleared after Screen refresh
+ *
+ * Why volatile sig_atomic_t (not bool, not int)
+ *   `volatile`    : the compiler must not cache the flag across a
+ *                   signal-handler write — every loop iteration must
+ *                   re-read it from memory.
+ *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
+ *                   signals; a plain `int` could be observed half-
+ *                   written on architectures where stores are split.
+ *   See [15] Raymond §"Signal handling".
+ *
+ * Things that DO NOT live here
+ *   - Wall-clock timestamps / fps counters — main() locals; no
+ *     other code path needs them.
+ *   - Snake tuning values (tgt_speed, move_speed, theme_idx) —
+ *     simulation/render state in §5 Snake.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* ── Owned subsystems ─────────────────────────────────────── */
+    Scene  scene;              /* the world (§6)                       */
+    Screen screen;             /* terminal extent (§7)                 */
+
+    /* ── Session state ────────────────────────────────────────── */
+    int    sim_fps;            /* physics tick rate (Hz)               */
+
+    /* ── Loop control ─────────────────────────────────────────── */
+    volatile sig_atomic_t running;      /* main loop predicate            */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH pending               */
 } App;
 
 static App g_app;

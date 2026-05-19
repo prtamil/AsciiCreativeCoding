@@ -86,15 +86,68 @@
  *                 1 acosf), gait state machine, body integration,
  *                 ~30 cell stamps for legs + body. Microseconds total.
  *
- * References    :
- *   Wikipedia, "Tripod gait" — biological reference for the alternating
- *     three-leg pattern used by insects and 6-legged robots.
- *   Wikipedia, "Inverse kinematics" — derives the law-of-cosines
- *     2-joint solver used in solve_ik().
- *   Hirose, "Biologically Inspired Robots: Snake-Like Locomotors and
- *     Manipulators" (1993) — foundational hexapod gait references.
- *   Reynolds, "Steering Behaviors for Autonomous Characters" (1999) —
- *     the heading-toward-target interpolation pattern used here.
+ * References
+ * ──────────
+ *   ── 2-joint IK (the §5b solver) ──────────────────────────────────
+ *   [1] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
+ *       and Control" (3rd ed.), Pearson — Ch. 4 derives the law-of-
+ *       cosines closed-form for 2-link arms; solve_ik() implements
+ *       exactly this with a left/right knee-side sign flip.
+ *   [2] Spong, M. W., Hutchinson, S. & Vidyasagar, M. (2005),
+ *       "Robot Modeling and Control", Wiley — alternative canonical
+ *       text; Ch. 4 covers solvability and the two configurations
+ *       (knee-up / knee-down) that map to elbow_up here.
+ *   [3] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
+ *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
+ *       UCSD course notes — the iterative IK family this file
+ *       AVOIDS by staying analytical at 2 joints per leg.
+ *
+ *   ── Biological gait + tripod pattern ─────────────────────────────
+ *   [4] Wilson, D. M. (1966), "Insect Walking", Annual Review of
+ *       Entomology 11, pp. 103-122 — the experimental basis for the
+ *       alternating-tripod gait; insects switch between A/B tripods
+ *       on a metronome much like §5e gait_tick.
+ *   [5] Full, R. J. & Tu, M. S. (1991), "Mechanics of a rapid running
+ *       insect: two-, four- and six-legged locomotion", J. Exp. Biol.
+ *       156, pp. 215-231 — quantitative reference for stance/swing
+ *       duty cycles in 6-legged locomotion.
+ *   [6] Hirose, S. (1993), "Biologically Inspired Robots: Snake-Like
+ *       Locomotors and Manipulators", Oxford — engineering text on
+ *       multi-leg gaits; the TRIPOD_A / TRIPOD_B partition follows
+ *       Hirose's "support pattern" framework.
+ *   [7] Cruse, H. (1990), "What mechanisms coordinate leg movement
+ *       in walking arthropods?", Trends in Neurosciences 13(1) —
+ *       on the inter-leg coordination rules that justify the
+ *       "swap only when every swinging foot has landed" guard in
+ *       §5e launch_tripod().
+ *
+ *   ── Procedural motion / steering ─────────────────────────────────
+ *   [8] Reynolds, C. (1999), "Steering Behaviors for Autonomous
+ *       Characters", Game Developers Conference — the short-arc
+ *       heading-toward-target interpolation in §5f hexapod_tick.
+ *       https://www.red3d.com/cwr/steer/
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *   [9] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
+ *       — when fixed-step matters; this file uses variable-step
+ *       because both the IK solve and the gait state machine are
+ *       unconditionally stable.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *  [10] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       the integer line-drawing algorithm; §5g draw_leg_line uses
+ *       the simpler parametric oversample for the same effect.
+ *  [11] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the depth-cued ASCII line glyphs.
+ *  [12] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the diff pipeline §7 relies on.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [13] https://en.wikipedia.org/wiki/Tripod_gait
+ *  [14] https://en.wikipedia.org/wiki/Inverse_kinematics
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -580,18 +633,43 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Per-theme body palette (pairs 1..N_PAIRS). HUD/HINT pairs are theme-
- * independent (CLAUDE.md HUD spec) — they stay readable against any
- * theme.
+ * Theme — one robot colour palette (xterm-256 fg indices).
  *
- * All entries sit in the bright half of the 256-colour space:
- *   - cube colours: ≥ 24 (brightness rule)
- *   - grayscale  : ≥ 240 (the dim-grayscale 232-239 zone is invisible
- *                  under A_DIM and therefore avoided here)
+ * Intent
+ *   Each theme rebinds the seven body-rendering pairs (pairs 1..7)
+ *   in one shot via init_pair (see theme_apply). HUD/HINT pairs are
+ *   NOT included here — they live at PAIR_HUD / PAIR_HINT and stay
+ *   bright yellow / bright cyan across every theme so the status
+ *   bar always reads against any animation behind it (CLAUDE.md
+ *   HUD spec).
+ *
+ * Slot semantics (col[0..6] map to pairs 1..7)
+ *   [0] body     — body rectangle + cross-braces
+ *   [1] femur    — upper leg segment (hip → knee)
+ *   [2] tibia    — lower leg segment (knee → foot)
+ *   [3] plant    — planted-foot marker '*' (high-saturation green;
+ *                  green 46 across every theme = "ground contact"
+ *                  reads identically whatever the robot's colour)
+ *   [4] step     — swinging-foot marker 'o'
+ *   [5] knee     — knee joint marker
+ *   [6] reserved — currently unused; held in reserve for future
+ *                  accent (antenna, eye, etc.) without renumbering
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness")
+ *   Every entry sits in the BRIGHT HALF of the 256-colour space:
+ *     - cube colours: ≥ 24  (avoid 16-23; invisible under A_DIM)
+ *     - grayscale  : ≥ 240 (avoid 232-239; same reason)
+ *   Theme character comes from RELATIVE gradient, not absolute
+ *   darkness — pushing the dimmest slot up by a few indices keeps
+ *   the look and gains legibility.
+ *
+ * References [11] Bourke for the depth-cued glyph/colour pairing;
+ *   [12] Raymond §init_pair for the rebind mechanism.
  */
 typedef struct {
-    const char *name;
-    int col[N_PAIRS];   /* pairs 1..7 */
+    const char *name;          /* HUD-displayable theme name           */
+    int         col[N_PAIRS];  /* xterm-256 fg index per pair slot     *
+                                * (pair p = col[p-1] at apply time)    */
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -666,7 +744,46 @@ static inline int px_to_cell_y(float py)
 
 /* ── §5a  vec helpers + per-leg static tables ─────────────────────── */
 
-typedef struct { float x, y; } Vec2;
+/*
+ * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
+ *
+ * Intent
+ *   Body kinematics, leg IK, and foot interpolation all live in
+ *   pixel space. Each character cell is CELL_W × CELL_H sub-pixels
+ *   (8 × 16), so a walking robot reads as continuous motion instead
+ *   of jumping cell-to-cell. The conversion to cell space happens
+ *   only inside §5g draw_leg_line / §5h hexapod_draw via
+ *   px_to_cell_x/y — the project's "one conversion point" rule.
+ *
+ * Convention (body-LOCAL space, used by HIP_LOCAL_*, REST_*)
+ *   +x : forward along the body axis (walk direction)
+ *   +y : down on screen → "right" side of body
+ *   −y : up   on screen → "left"  side of body
+ *
+ * Convention (WORLD space, used by foot_pos, hip[], knee[])
+ *   +x : eastward  (positive → right of screen)
+ *   +y : southward (positive → down  the screen)
+ *   rotate2d composes the two: world = body_center + R(heading)·local
+ *
+ *   Angles are MATH-CONVENTION (positive CCW from +X); because y
+ *   points DOWN on screen, a math-CCW rotation displays as CW. Only
+ *   the left/right knee-side sign flip in §5b solve_ik cares.
+ *
+ * Why a value type
+ *   8 bytes; passes in registers. solve_ik / rotate2d / vec2_lerp
+ *   all take and return Vec2 by value — -O2 lowers them to
+ *   straight-line code.
+ *
+ * Why named (x, y) instead of two loose floats
+ *   Type-checking catches (col, row) confusion at compile time
+ *   rather than via visual debugging.
+ *
+ * References [1] Craig §2 "Spatial descriptions".
+ */
+typedef struct {
+    float x;   /* see Convention notes above (body-local vs world)  */
+    float y;
+} Vec2;
 
 static inline float clampf(float v, float lo, float hi)
 {
@@ -747,30 +864,99 @@ static const float REST_SIDE[N_LEGS] = {
 static const int TRIPOD_A[3] = { 0, 3, 4 };
 static const int TRIPOD_B[3] = { 1, 2, 5 };
 
-/* Hexapod — full robot state. */
+/*
+ * Hexapod — the full robot state.
+ *
+ * Intent
+ *   The robot is THREE INTERLOCKED SUB-SYSTEMS sharing one record:
+ *
+ *     1. BODY KINEMATICS — a rigid 2-D body that slides along its
+ *        heading at body_speed. Heading interpolates toward
+ *        target_heading at TURN_RATE rad/s (short-arc through ±π).
+ *        Refs [8] Reynolds steering.
+ *
+ *     2. GAIT STATE MACHINE — a metronome that alternates between
+ *        two interlocked tripods. At any moment exactly one tripod
+ *        is PLANTED (forming a stable support triangle) while the
+ *        other is SWINGING (lifting off and arcing forward to new
+ *        rest targets). The handoff happens only when phase_timer
+ *        expires AND every swinging foot has finished its arc —
+ *        never mid-stride. Refs [4][6][7].
+ *
+ *     3. PER-LEG IK — for each leg, recompute the world hip from
+ *        the body pose, then solve law-of-cosines IK to place the
+ *        knee. Left/right legs flip the knee-side sign so left
+ *        knees break to −y and right knees to +y. Refs [1][2].
+ *
+ *   The three sub-systems are deliberately UNCOUPLED in time: body
+ *   integrates from heading; gait reads body_x/y to choose step
+ *   targets; IK reads (hip, foot_pos) to place knees. No feedback
+ *   loop, no constraints — order of operations in hexapod_tick
+ *   makes the dependency chain explicit and one-way.
+ *
+ * Per-leg parallel-array design
+ *   The five per-leg arrays (foot_pos, foot_old, step_target,
+ *   stepping, step_t) describe ONE leg per index i ∈ [0, N_LEGS).
+ *   Parallel arrays instead of an array-of-struct because:
+ *     - The whole row of a leg is read together — cache-friendly
+ *       either way for N_LEGS = 6 (fits in one cache line).
+ *     - Most loops walk one field at a time (e.g., the rendering
+ *       pass walks foot_pos[i] for all i); SoA is the natural fit.
+ *     - Static tables HIP_LOCAL_*, REST_*, TRIPOD_A/B are also
+ *       parallel arrays, so the convention is consistent.
+ *
+ * Why `hip` and `knee` are CACHED (not recomputed at every reader)
+ *   Both depend only on body pose + foot target. Caching them once
+ *   per tick lets the renderer (which reads them many times across
+ *   leg lines, joint markers, attachment points) skip the cosine /
+ *   sine / IK math entirely. Marked "derived" so a reader knows
+ *   they're outputs of hexapod_tick, not user inputs.
+ *
+ * Reach budget (CONFIRMED at init in §5e)
+ *   sqrt(REST_FORWARD_max² + REST_SIDE_max²) ≈ √(32² + 50²) ≈ 60 px
+ *   UPPER + LOWER = 76 px, so even the maximum rest offset stays
+ *   inside the IK reachable annulus with margin for step lookahead.
+ *
+ * References [1] Craig §4 (2-link IK); [4][7] Wilson + Cruse for
+ *   the tripod handoff rule; [8] Reynolds for the heading lerp.
+ */
 typedef struct {
-    /* body kinematics */
-    float body_x, body_y;       /* center in pixel space                 */
-    float body_speed;           /* px/s along heading                    */
-    float heading;              /* current direction (rad, 0 = +x)       */
-    float target_heading;       /* desired direction (steered toward)    */
+    /* ── Body kinematics (rigid body in world pixel space) ─────── *
+     * Three scalars + one derived: body_x/y is integrated each    *
+     * tick from body_speed along heading; heading lerps toward    *
+     * target_heading via short-arc rotation (Reynolds).           */
+    float body_x;             /* body centre x, world pixel space  */
+    float body_y;             /* body centre y, world pixel space  */
+    float body_speed;         /* magnitude (px/s) along heading    */
+    float heading;            /* current direction (rad), 0 = +x   */
+    float target_heading;     /* steered toward this each tick     */
 
-    /* per-leg state */
-    Vec2  foot_pos[N_LEGS];     /* current IK target (planted or arcing) */
-    Vec2  foot_old[N_LEGS];     /* foot at step start — lerp anchor      */
-    Vec2  step_target[N_LEGS];  /* where this foot is stepping to        */
-    bool  stepping[N_LEGS];     /* true while leg is in flight           */
-    float step_t[N_LEGS];       /* swing progress in [0, 1]              */
+    /* ── Per-leg simulation state (SoA, length N_LEGS) ─────────── *
+     * Five parallel arrays describing each leg's gait phase. A    *
+     * leg is in one of two modes:                                 *
+     *   stepping[i] = false → foot_pos[i] is planted; ignore step_t *
+     *   stepping[i] = true  → foot_pos[i] = lerp(foot_old, step_target, *
+     *                                            smoothstep(step_t)) + arc */
+    Vec2  foot_pos   [N_LEGS]; /* current IK target each frame      */
+    Vec2  foot_old   [N_LEGS]; /* foot at step start; lerp anchor   */
+    Vec2  step_target[N_LEGS]; /* landing point this swing aims at  */
+    bool  stepping   [N_LEGS]; /* in-flight flag                    */
+    float step_t     [N_LEGS]; /* swing progress in [0, 1]          */
 
-    /* per-leg derived (recomputed each frame) */
-    Vec2  hip[N_LEGS];          /* world hip from rotated body pose      */
-    Vec2  knee[N_LEGS];         /* IK-computed mid-joint                 */
+    /* ── Per-leg DERIVED (outputs of hexapod_tick) ─────────────── *
+     * Recomputed each frame from body pose + foot target.         *
+     * Cached so the renderer reads positions without re-doing     *
+     * the rotation / IK math.                                     */
+    Vec2  hip [N_LEGS];        /* world hip = body + R(heading)·local */
+    Vec2  knee[N_LEGS];        /* solve_ik(hip, foot_pos, side)     */
 
-    /* gait state machine */
-    int   gait_phase;           /* 0 = group A swings, 1 = group B       */
-    float phase_timer;          /* time elapsed in current half-cycle    */
+    /* ── Gait state machine (Wilson / Cruse handoff) ─────────── */
+    int   gait_phase;          /* 0 → group A swings, 1 → group B    */
+    float phase_timer;         /* elapsed time in current half-cycle */
 
-    /* ui state */
+    /* ── UI / control state ─────────────────────────────────── *
+     * paused gates the sim path (renderer still runs);          *
+     * theme_idx selects the palette in §3 THEMES[].             */
     bool  paused;
     int   theme_idx;
 } Hexapod;
@@ -1141,7 +1327,46 @@ static void hexapod_draw(const Hexapod *h, WINDOW *w, int cols, int rows)
 /* §6  scene — thin wrapper around Hexapod                               */
 /* ===================================================================== */
 
-typedef struct { Hexapod hexapod; } Scene;
+/*
+ * Scene — composition root for §6.
+ *
+ * Intent
+ *   In this demo the simulation IS one hexapod. We keep a Scene
+ *   wrapper anyway so the framework loop (scene_init / scene_tick /
+ *   scene_draw) reads identically to every other file in the repo.
+ *   If a future variant adds e.g. obstacles, a swarm, or a goal
+ *   point for the body to steer to, those slot in here as siblings
+ *   of `hexapod` without changing the loop.
+ *
+ * Simulation vs Rendering locality
+ *   The Hexapod struct itself already separates BODY KINEMATICS
+ *   (verbs) from PER-LEG STATE (nouns) from DERIVED CACHE (outputs)
+ *   from GAIT MACHINE from UI/CONTROL. Within Scene there is no
+ *   further split needed yet — one field, one concern. When adding
+ *   a new member, place it as follows:
+ *
+ *     ── Simulation state ──   things scene_tick READS+WRITES
+ *                              (obstacles[], goal_point, pheromones)
+ *     ── Render-only state ──  things scene_draw READS, never the
+ *                              physics path (camera, shake, trail FX)
+ *
+ * Things that DO NOT live here
+ *   - fps / sim_fps counters → §8 App (frame-timing concern, not
+ *     part of the world being simulated).
+ *   - terminal extents (cols, rows) → §7 Screen.
+ *   - signal flags (running, need_resize) → §8 App.
+ *   - Per-leg geometry tables HIP_LOCAL_*, REST_*, TRIPOD_A/B
+ *     → §5a (file-scope `static const`; never mutates).
+ *
+ * One Scene per program; passed by pointer to every §6 entry point.
+ */
+typedef struct {
+    /* ── Simulation state ─────────────────────────────────────── */
+    Hexapod hexapod;           /* the world: body + 6 legs + gait    */
+
+    /* (no render-only state yet — theme_idx lives inside Hexapod
+     *  because it's user-toggled via the same keymap as paused)  */
+} Scene;
 
 /*
  * scene_init — place the robot at screen centre with all feet at rest,
@@ -1197,7 +1422,31 @@ static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows)
 /* §7  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal-extent snapshot in CHARACTER CELLS.
+ *
+ * Intent
+ *   Caches the current terminal size so every §6 entry point reads
+ *   (cols, rows) as plain ints rather than re-querying ncurses each
+ *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
+ *   propagated to scene_init via app_do_resize.
+ *
+ * Why a separate struct (not just two ints in App)
+ *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
+ *   except this struct. Carving it out makes screen_resize pure and
+ *   isolates the ncurses dependency from the simulation layer.
+ *
+ * Why cells, not pixels
+ *   ncurses' coordinate system is cells. Pixel space (CELL_W ×
+ *   CELL_H sub-pixels per cell) lives only inside §5 — converted at
+ *   the draw boundary, per the project's "one conversion point" rule.
+ *
+ * References [12] Raymond, NCURSES Programming HOWTO.
+ */
+typedef struct {
+    int cols;   /* terminal width  in CHARACTER CELLS */
+    int rows;   /* terminal height in CHARACTER CELLS */
+} Screen;
 
 /* The non-obvious call here is typeahead(-1): without it, ncurses peeks
  * at stdin during output writes, which can tear frames mid-update. */
@@ -1279,12 +1528,51 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* §8  app                                                                */
 /* ===================================================================== */
 
+/*
+ * App — top-level container; everything outside the world.
+ *
+ * Intent
+ *   Bundles the simulated world (Scene), the host terminal (Screen),
+ *   and the loop-control flags into one record so main() reads as
+ *   four-line phases: init / service signals / step+draw / shutdown.
+ *   Declared file-scope (g_app) so signal handlers — which cannot
+ *   take a user argument — can write `running` and `need_resize`
+ *   without globals scattered through the file.
+ *
+ * Locality of concern
+ *   ── Owned subsystems ── nouns the app composes
+ *      scene       — the world being simulated (§6)
+ *      screen      — the terminal extent it draws to (§7)
+ *
+ *   ── Loop control ─── verbs the loop reads each frame
+ *      time_scale  — wall-clock dt multiplier ([ / ] adjust)
+ *      running     — clear → loop exits; set by SIGINT/SIGTERM
+ *      need_resize — set by SIGWINCH; cleared after Screen refresh
+ *
+ * Why volatile sig_atomic_t (not bool, not int)
+ *   `volatile`    : the compiler must not cache the flag across a
+ *                   signal-handler write — every loop iteration must
+ *                   re-read it from memory.
+ *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
+ *                   signals; a plain `int` could be observed half-
+ *                   written on architectures where stores are split.
+ *   See [12] Raymond §"Signal handling".
+ *
+ * Things that DO NOT live here
+ *   - Wall-clock timestamps / fps counters — main() locals; no
+ *     other code path needs them.
+ *   - Hexapod tuning values (body_speed, theme_idx) — user-state in
+ *     §5 Hexapod.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    float                 time_scale;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* ── Owned subsystems ─────────────────────────────────────── */
+    Scene  scene;              /* the world (§6)                       */
+    Screen screen;             /* terminal extent (§7)                 */
+
+    /* ── Loop control ─────────────────────────────────────────── */
+    float                 time_scale;   /* dt multiplier; 1.0 = realtime */
+    volatile sig_atomic_t running;      /* main loop predicate            */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH pending               */
 } App;
 
 static App g_app;

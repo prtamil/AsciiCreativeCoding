@@ -83,16 +83,67 @@
  * case analyses. For a hello-world, the closed form IS the lesson.
  *
  * References
- *   Wikipedia, "Inverse kinematics" — closed-form solutions for
- *     low-DOF chains. https://en.wikipedia.org/wiki/Inverse_kinematics
- *   Wikipedia, "Law of cosines" — the equation that drives the
- *     entire solver. https://en.wikipedia.org/wiki/Law_of_cosines
- *   Buss, "Introduction to Inverse Kinematics with Jacobian
- *     Transpose, Pseudoinverse and Damped Least Squares methods"
- *     (2009) — the iterative numerical alternatives.
- *   Aristidou & Lasenby, "FABRIK: A fast, iterative solver for the
- *     IK problem" (Graphical Models 73(5), 2011) — the iterative
- *     successor for longer chains; see ik_arm_reach.c.
+ * ──────────
+ *   ── Canonical robotics textbooks (analytical IK) ─────────────────
+ *   [1] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
+ *       and Control" (3rd ed.), Pearson — Ch. 4 derives the law-of-
+ *       cosines 2-link solution that solve_ik() implements verbatim.
+ *       Also §4.4 "Solvability" — the reachability discussion that
+ *       clamp_to_reach() enforces.
+ *   [2] Spong, M. W., Hutchinson, S. & Vidyasagar, M. (2005), "Robot
+ *       Modeling and Control", Wiley — alternative canonical text;
+ *       Ch. 4 covers the same derivation with cleaner notation.
+ *   [3] Murray, R. M., Li, Z. & Sastry, S. S. (1994), "A Mathematical
+ *       Introduction to Robotic Manipulation", CRC — rigorous Lie-
+ *       group treatment; read once you want to see IK as solving a
+ *       map on SE(2)/SE(3).
+ *
+ *   ── Iterative IK alternatives (what we DON'T need) ────────────────
+ *   [4] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
+ *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
+ *       UCSD course notes — the Jacobian-iterative family. Read to
+ *       see what closed-form 2-link IK lets you SKIP.
+ *   [5] Aristidou, A. & Lasenby, J. (2011), "FABRIK: a fast,
+ *       iterative solver for the inverse kinematics problem",
+ *       Graphical Models 73(5), pp. 243-260 — the iterative
+ *       successor for longer chains; see ik_arm_reach.c.
+ *   [6] Wang, L.-C. T. & Chen, C. C. (1991), "A combined
+ *       optimization method for solving the inverse kinematics
+ *       problem of mechanical manipulators", IEEE TRA 7(4) — CCD
+ *       (Cyclic Coordinate Descent), one of the iteration schemes
+ *       FABRIK improved on.
+ *
+ *   ── The math driving the solver ──────────────────────────────────
+ *   [7] Heath, T. L. (1908), "The Thirteen Books of Euclid's
+ *       Elements", Cambridge — Book II Proposition 12-13: the
+ *       geometric law of cosines, 300 BCE, still the load-bearing
+ *       theorem in §5.
+ *   [8] al-Kāshī, J. (1427), "Miftāḥ al-Hisāb" ("Key of Arithmetic")
+ *       — earliest known trigonometric form of the law of cosines
+ *       used here.
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *   [9] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
+ *       — when fixed-step matters; this file uses variable-step
+ *       because solve_ik is one closed-form call, unconditionally
+ *       stable.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *  [10] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       the integer line algorithm; we use the simpler parametric
+ *       oversample (draw_line_px in §6) because float math is
+ *       already paid for in solve_ik.
+ *  [11] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the high-contrast glyph choice ('@', 'O', '*', '#').
+ *  [12] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the diff pipeline §7 relies on.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [13] https://en.wikipedia.org/wiki/Inverse_kinematics
+ *  [14] https://en.wikipedia.org/wiki/Law_of_cosines
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -591,7 +642,43 @@ static inline float cells_to_px_h(int rows){ return (float)rows * CELL_H; }
 /* §5  ik — Vec2 + solve_ik(S, T) → E                                     */
 /* ===================================================================== */
 
-typedef struct { float x, y; } Vec2;
+/*
+ * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
+ *
+ * Intent
+ *   The §5 IK algebra lives in pixel space, not cells. Each cell is
+ *   CELL_W × CELL_H sub-pixels (8 × 16 by default), giving the math
+ *   sub-cell resolution so a moving target reads as continuous
+ *   motion instead of jumping cell-to-cell. The conversion to cell
+ *   space happens at the §6 render boundary (px_to_cell_x/y) — the
+ *   project's "one conversion point" rule.
+ *
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right of screen).
+ *   y : SOUTHWARD pixel coordinate (positive → down the screen).
+ *
+ *   atan2f(d_vec.y, d_vec.x) in solve_ik returns φ in screen-space
+ *   conventions; the `elbow_up` sign flip (−1 vs +1) chooses which
+ *   side of the S→T baseline the elbow lands on. Because y points
+ *   DOWN on screen, "elbow_up = true" actually pushes the elbow
+ *   toward smaller y (which appears UP on screen). The convention
+ *   matches the visual, not the math y-axis.
+ *
+ * Why a value type (not a pointer)
+ *   Sized 8 bytes; passes in registers on every modern ABI.
+ *   solve_ik returns Vec2 by value; -O2 lowers it to the same
+ *   straight-line code as direct field writes.
+ *
+ * Why named (x, y) instead of two loose floats
+ *   Type-checking catches (col, row) confusion at compile time
+ *   rather than via visual debugging.
+ *
+ * References [1] Craig §2 "Spatial descriptions".
+ */
+typedef struct {
+    float x;   /* eastward  pixel coordinate (positive → right) */
+    float y;   /* southward pixel coordinate (positive → down)  */
+} Vec2;
 
 static inline Vec2  vec2(float x, float y)    { return (Vec2){x, y}; }
 static inline Vec2  vec2_add(Vec2 a, Vec2 b)  { return (Vec2){a.x+b.x, a.y+b.y}; }
@@ -635,13 +722,74 @@ static Vec2 solve_ik(Vec2 S, Vec2 T, bool elbow_up)
 /* §6  scene — Scene state, input, draw                                   */
 /* ===================================================================== */
 
+/*
+ * Scene — all per-frame state of the IK demo.
+ *
+ * Intent
+ *   The scene holds three KINDS of data, kept separate so a reader
+ *   can see the data-flow direction this file exists to teach:
+ *
+ *     ANCHOR   (fixed per resize) : shoulder              ← SIGWINCH
+ *     INPUTS   (user-controlled)  : target, elbow_up      ← arrow keys / 'f'
+ *     OUTPUT   (derived each frame): elbow                 ← solve_ik
+ *
+ *   The main loop's order is exactly: read INPUTS → run solve_ik →
+ *   write OUTPUT → render. That arrow ALWAYS points the same way;
+ *   no field ever flows backwards. Compare with fk_helloworld.c,
+ *   where the user controls theta1/theta2 (angles) and elbow falls
+ *   out — same struct shape, opposite data-flow direction. THAT is
+ *   the IK/FK contrast.
+ *
+ * Simulation vs Rendering locality
+ *   ── Simulation state ── read+written by scene_input + solve_ik:
+ *      shoulder        S — pinned origin per resize.
+ *      target          T — user-controlled via arrow keys; constrained
+ *                          to lie inside the reach disc (see [1]
+ *                          Craig §4.4 "Solvability" and clamp_to_reach).
+ *      elbow_up        Selects 1 of 2 valid elbow positions
+ *                          (knee-up / knee-down — the analytical
+ *                          ambiguity that Craig §4 enumerates).
+ *      elbow           E — cached solver output; refreshed each frame.
+ *
+ *   ── Rendering / control state ── read only by scene_draw + HUD:
+ *      paused          Frozen frame; solver skipped, render unchanged.
+ *      rows, cols      Terminal extent in CELLS (resize cache).
+ *
+ *   Note: rows/cols live HERE rather than in a separate Screen struct
+ *   (cf. fk_centipede.c / hexpod_tripod.c) because this demo is small
+ *   enough that one Scene argument carries everything draw needs. No
+ *   App struct either — main() holds the signal flags directly. Trade-
+ *   off: simpler reading vs the canonical multi-struct framework.
+ *
+ * Why elbow_up is SIM (not RENDER-CONTROL)
+ *   It changes the SOLVED CONFIGURATION (knee up vs down). Two valid
+ *   mathematical solutions, only one is realised — that's part of
+ *   the math, not of the camera.
+ *
+ * Things that DO NOT live here
+ *   - Link lengths L1_PX, L2_PX → §1 config (compile-time constants).
+ *   - Target step size KEY_STEP_PX → §1 config.
+ *   - fps counter → main() local (display-only, not part of the scene).
+ *   - Signal flags g_running / g_need_resize → §8 file-scope (must
+ *     be writable from a signal handler that takes no user pointer).
+ *
+ * References [1] Craig §4 (IK casework + solvability); [4] Buss for
+ *   the Jacobian alternative this file is the foil for.
+ */
 typedef struct {
-    Vec2 shoulder;       /* S — pinned                               */
-    Vec2 target;         /* T — user-controlled                      */
-    Vec2 elbow;          /* E — refreshed each frame by solve_ik     */
-    bool elbow_up;       /* which of the two valid solutions to draw */
-    bool paused;
-    int  rows, cols;
+    /* ── Simulation state ─────────────────────────────────────── *
+     * Anchor + inputs + cached IK output. scene_input writes T   *
+     * and elbow_up; solve_ik reads (S, T, elbow_up) and writes E.*/
+    Vec2 shoulder;       /* S — pinned origin; resets on SIGWINCH    */
+    Vec2 target;         /* T — user-controlled; clamped to reach    */
+    Vec2 elbow;          /* E — cached IK output, refreshed per frame*/
+    bool elbow_up;       /* selects one of two valid solutions       */
+
+    /* ── Rendering / control state ────────────────────────────── *
+     * Read only by scene_draw and the HUD. paused gates the sim   *
+     * but not the renderer; rows/cols clip draws to terminal.     */
+    bool paused;         /* user-toggled freeze; sim skipped, draw same */
+    int  rows, cols;     /* terminal extent in CHARACTER CELLS         */
 } Scene;
 
 static Vec2 clamp_to_screen(Vec2 p, int rows, int cols)

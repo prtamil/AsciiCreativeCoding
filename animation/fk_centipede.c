@@ -87,17 +87,59 @@
  *                 cells_per_segment); ncurses doupdate() sends only
  *                 changed cells.
  *
- * References    :
- *   Reynolds, "Steering Behaviors for Autonomous Characters" (1999) —
- *     path following motivates the trail buffer; obstacle avoidance
- *     motivates the boundary repulsion steering.
- *     https://www.red3d.com/cwr/steer/
- *   Aristidou & Lasenby, "FABRIK: a fast, iterative solver" (2011) —
- *     IK counterpart; useful contrast for why FK is so much simpler.
- *   Manton, "The evolution of arthropodan locomotory mechanisms"
- *     (J. Linn. Soc., 1952) — biological reference for myriapod gaits.
- *   Glenn Fiedler, "Fix Your Timestep!" (gafferongames.com) — articulates
- *     when fixed step matters and when variable step is the better tool.
+ * References
+ * ──────────
+ *   ── Forward kinematics + IK contrast ─────────────────────────────
+ *   [1] Aristidou, A. & Lasenby, J. (2011), "FABRIK: a fast, iterative
+ *       solver for the inverse kinematics problem", Graphical Models
+ *       73(5), pp. 243-260 — the iterative-IK paper that the trail-
+ *       following body chain is the FK COUNTERPART of.  Read it for
+ *       why FK (this file) is so much simpler than the inverse
+ *       problem most posing tools have to solve.
+ *   [2] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
+ *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
+ *       UCSD course notes — the standard IK reference; useful for
+ *       readers who want to understand what FK is NOT doing.
+ *
+ *   ── Procedural locomotion / steering ─────────────────────────────
+ *   [3] Reynolds, C. (1999), "Steering Behaviors for Autonomous
+ *       Characters", Game Developers Conference — path following
+ *       motivates the trail buffer; obstacle avoidance motivates the
+ *       boundary-repulsion steering term in §move_head.
+ *       https://www.red3d.com/cwr/steer/
+ *   [4] Reynolds, C. (1987), "Flocks, Herds, and Schools: A
+ *       Distributed Behavioral Model", SIGGRAPH '87 — earlier work
+ *       establishing the local-rules → emergent-behaviour pattern
+ *       that this file's leg-phase scheduler follows.
+ *
+ *   ── Biological gait references ───────────────────────────────────
+ *   [5] Manton, S. M. (1952), "The evolution of arthropodan
+ *       locomotory mechanisms", J. Linn. Soc. London (Zoology) 42,
+ *       pp. 93-117 — biological reference for myriapod gaits;
+ *       informs the wave-front leg-phase pattern in §compute_legs.
+ *   [6] Full, R. J. & Tu, M. S. (1991), "Mechanics of a rapid running
+ *       insect: two-, four- and six-legged locomotion", J. Exp. Biol.
+ *       156, pp. 215-231 — quantitative reference for leg-pair phase
+ *       offsets in segmented arthropods.
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *   [7] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
+ *       — articulates when fixed-step matters and when variable-step
+ *       is the better tool; this file uses variable-step because
+ *       the FK chain is unconditionally stable.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *   [8] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the body-segment glyph ramp.
+ *   [9] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the newscr/curscr diff pipeline used
+ *       in scene_draw().
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [10] https://en.wikipedia.org/wiki/Forward_kinematics
+ *  [11] https://en.wikipedia.org/wiki/Inverse_kinematics
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -660,17 +702,36 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Theme — body gradient (tail at index 0 → head at index N_PAIRS-1).
- * HUD/HINT pairs are theme-independent (CLAUDE.md HUD spec) — they
- * stay readable against any animation behind them.
+ * Theme — palette for ONE of the 10 named looks (Amber, Matrix, …).
  *
- * All body palettes obey the brightness rule: every entry sits in the
- * bright half of the 256-colour space (>= 24 in the 6×6×6 cube,
- * >= 240 in the grayscale strip).
+ * Intent
+ *   The centipede's body is rendered as a GRADIENT from tail to head:
+ *   index 0 = tail-most segment, index N_PAIRS-1 = head.  Each theme
+ *   names one such gradient — a tail-to-head sweep of N_PAIRS xterm-
+ *   256 colour indices.  HUD/HINT pairs are NOT themed; they stay
+ *   bright-yellow / bright-cyan forever per CLAUDE.md HUD spec so the
+ *   status text reads cleanly against any animation underneath.
+ *
+ * Why "tail → head" ordering, not "head → tail"
+ *   ncurses pair indices count UP from 1; aligning the array with the
+ *   pair numbering means pair (i+1) gets body[i] and the body renderer
+ *   can do `init_pair(i + 1, ...)` in a single loop.  Reversing the
+ *   convention would force a `(N_PAIRS - 1 - i)` index everywhere it
+ *   appears.
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness")
+ *   Every entry sits in the bright half of the 256-colour space (≥ 24
+ *   in the 6×6×6 cube, ≥ 240 in the gray ramp).  Cube indices 16-23
+ *   and gray 232-239 render as black against the default background
+ *   and would make the tail invisible.
+ *
+ * Reference [9] Raymond's NCURSES HOWTO §6 — init_pair() semantics
+ *   that turn these palette arrays into live colour pairs.
  */
 typedef struct {
-    const char *name;
-    int body[N_PAIRS];   /* xterm-256 fg colors; pair (i+1) gets body[i] */
+    const char *name;            /* short ASCII label shown in HUD     */
+    int         body[N_PAIRS];   /* xterm-256 fg indices, tail → head  *
+                                  * pair (i+1) = body[i] at render time*/
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -746,9 +807,27 @@ static inline int px_to_cell_y(float py)
 /* §5  entity — Centipede                                                 */
 /* ===================================================================== */
 
-/* Vec2 — 2-D position vector in pixel space.
- * x increases eastward; y increases downward (terminal convention). */
-typedef struct { float x, y; } Vec2;
+/*
+ * Vec2 — 2-D position / direction vector in pixel space.
+ *
+ * Intent
+ *   Every spatial quantity in this file (joints, legs, trail samples,
+ *   antennae) lives in SQUARE PIXEL space — 1 unit = 1 pixel.  The
+ *   8:16 cell aspect ratio is applied ONCE per draw in §4 coords,
+ *   never inside the simulation.  Keeping pixel space square means
+ *   distance, turn rate and leg phase math all read like classical
+ *   vector geometry without aspect-correction littering them.
+ *
+ * Convention
+ *   x increases eastward; y increases downward (terminal convention,
+ *   inverted from cartesian).  All angles are measured from +x axis
+ *   in the math sense (counterclockwise positive), so heading = 0
+ *   points east and heading = π/2 points SOUTH (because y is flipped).
+ */
+typedef struct {
+    float x;   /* eastward pixel coordinate     */
+    float y;   /* southward pixel coordinate    */
+} Vec2;
 
 static inline float vec2_len(Vec2 v)
 {
@@ -761,36 +840,89 @@ static inline Vec2 vec2_norm(Vec2 v)
     return (Vec2){v.x / l, v.y / l};
 }
 
-/* Centipede — full simulation state. */
+/*
+ * Centipede — the full simulation state for one segmented creature.
+ *
+ * Intent
+ *   Three subsystems share one body, each with its own time scale:
+ *     - HEAD       moves continuously, recording every position.
+ *     - BODY       follows the head via FORWARD KINEMATICS (FK):
+ *                  sample the trail at evenly-spaced arc lengths so
+ *                  each segment "remembers" where the head was N
+ *                  cells ago.  Ref [1] Aristidou & Lasenby contrast
+ *                  this with inverse kinematics (FABRIK).
+ *     - LEGS       are kinematically attached to body segments and
+ *                  phase-offset along the body so a travelling wave
+ *                  of footsteps moves tail-to-head (the metachronal
+ *                  gait of real myriapods).  Refs [5][6].
+ *
+ *   The trail-following pattern is FK because we KNOW where the head
+ *   has been; we just look up the right past position for each
+ *   segment.  Inverse kinematics — the alternative — would solve for
+ *   joint angles that put the END EFFECTOR at a target, which is
+ *   what FABRIK ([1]) does.  FK is roughly 10× simpler in code and
+ *   100× faster — appropriate here because we don't need physical
+ *   joint constraints.
+ *
+ * Why a single struct
+ *   The three subsystems share state (trail, joints) extensively;
+ *   threading separate Body/Legs/Head structs through every helper
+ *   would obscure the FK math.  One Centipede instance, all helpers
+ *   take `Centipede *`.
+ *
+ * Why the trail is a CIRCULAR buffer (not a regular array)
+ *   Trail samples are pushed at the head and consumed at every
+ *   distance along the body.  Circular indexing means no O(N) shift
+ *   per frame; head_index walks mod TRAIL_CAP.  See [3] Reynolds for
+ *   the path-following pattern this buffer implements.
+ *
+ * References [1][2] for the FK / IK contrast, [3][4] Reynolds for
+ *   path-following + steering, [5][6] for the biological gait that
+ *   inspires the leg phasing.
+ */
 typedef struct {
-    /* trail buffer — circular head-position log driving body FK */
-    Vec2  trail[TRAIL_CAP];
-    int   trail_head;        /* index of newest entry              */
-    int   trail_count;       /* valid entries, clamped to TRAIL_CAP */
+    /* ── Trail buffer (FK source-of-truth) ───────────────────────── *
+     * Circular head-position log.  Each push records the head's     *
+     * current pixel position; body segments arc-length-sample this  *
+     * buffer to position themselves in compute_joints().            */
+    Vec2 trail[TRAIL_CAP];
+    int  trail_head;           /* index of newest entry, mod TRAIL_CAP */
+    int  trail_count;          /* valid entries, saturates at TRAIL_CAP*/
 
-    /* body joints — joint[0] = head, joint[1..N] = body segments,
-     * placed each frame by arc-length sampling along the trail */
-    Vec2  joint[BODY_SEGS + 1];
+    /* ── Body joints (FK output) ────────────────────────────────── *
+     * joint[0] = head pixel position; joint[1..N] = body segments,  *
+     * placed each frame by arc-length sampling along the trail.     *
+     * Read by render_centipede + leg solver, not directly mutated   *
+     * by the user.                                                  */
+    Vec2 joint[BODY_SEGS + 1];
 
-    /* legs — re-derived each frame from body joints + wave_time;
-     * [i][0]=hip [i][1]=knee [i][2]=foot for each pair i */
-    Vec2  leg_left [N_LEGS][3];
-    Vec2  leg_right[N_LEGS][3];
+    /* ── Legs (kinematic derivation of body + wave_time) ────────── *
+     * [i][0]=hip, [i][1]=knee, [i][2]=foot for each pair i.  Hips   *
+     * are attached to body joints; knees and feet derive from a    *
+     * 3-link FK chain whose joint angles are functions of phase.   */
+    Vec2 leg_left [N_LEGS][3];
+    Vec2 leg_right[N_LEGS][3];
 
-    /* motion state — integrated each tick */
-    float heading;           /* travel direction (rad), 0=east, π/2=south */
-    float wave_time;         /* master clock (s), drives legs + antennae   */
-    float turn_phase;        /* ∫ turn_freq*dt — own accumulator avoids
-                                phase jumps when turn_freq is adjusted     */
+    /* ── Motion state (integrated each tick) ────────────────────── *
+     * The "verbs" of the simulation.  Heading drives the head's    *
+     * direction; wave_time is the master clock that animates legs  *
+     * and antennae; turn_phase is a SEPARATE accumulator so the    *
+     * user can adjust turn_freq mid-flight without phase jumps.    */
+    float heading;             /* travel direction (rad), 0=east       */
+    float wave_time;           /* master clock (s)                     */
+    float turn_phase;          /* ∫ turn_freq · dt                     */
 
-    /* user-tunable parameters */
-    float move_speed;        /* px/s                                       */
-    float turn_amp;          /* peak turn rate (rad/s)                     */
-    float turn_freq;         /* undulation frequency (rad/s)               */
+    /* ── User-tunable parameters (HUD-driven) ───────────────────── *
+     * Adjusted via keypress; reset values come from §1 config.     */
+    float move_speed;          /* px/s                                 */
+    float turn_amp;            /* peak turn rate (rad/s)               */
+    float turn_freq;           /* undulation frequency (rad/s)         */
 
-    /* ui state */
-    int   theme_idx;         /* current entry into THEMES[]                */
-    bool  paused;
+    /* ── UI state (control flags + render-only choice) ──────────── *
+     * theme_idx is PURE RENDER (paint colour pair).                *
+     * paused is CONTROL (gates scene_tick).                        */
+    int  theme_idx;            /* 0..N_THEMES-1                        */
+    bool paused;
 } Centipede;
 
 /* ── §5a  trail helpers ─────────────────────────────────────────────── */
@@ -842,44 +974,72 @@ static Vec2 trail_sample(const Centipede *c, float dist)
 /* ── §5b  edge_bias + move_head ─────────────────────────────────────── */
 
 /*
- * edge_bias — Reynolds-style soft fence.
+ * Quadratic repulsion field — gradient of a soft potential well.
  *
- * For each axis, compute a unit-less "push" away from whichever edge is
- * within REPEL_MARGIN. push grows quadratically as the head approaches
- * the edge, so the centipede begins to feel the boundary gently and
- * commits firmly only when it would otherwise leave.
+ *   For each wall within REPEL_MARGIN of the head, accumulate a push
+ *   along its inward normal with magnitude  u² where u = 1 - d/MARGIN.
+ *   The quadratic falloff gives F=0 at the margin and F=1 at the wall,
+ *   so the centipede FEELS the boundary gently before COMMITTING to
+ *   the turn. Mathematically: -∇Φ for Φ(d) = (MARGIN - d)³ / 3.
  *
- * The (push_x, push_y) vector points toward open space. Convert that
- * desired direction into a heading bias by taking the signed angular
- * difference from the current heading and scaling by REPEL_GAIN.
- *
- * Returns radians/second to add to the heading rate.
+ *   Output vector points toward open space, magnitude ∈ [0, ≈√2].
+ *   See [3] Reynolds §"Containment".
  */
-static float edge_bias(const Centipede *c, int cols, int rows)
+static Vec2 quadratic_repulsion_from_walls(const Centipede *c,
+                                           int cols, int rows)
 {
     float wpx = (float)cols * (float)CELL_W;
     float hpx = (float)rows * (float)CELL_H;
     float x = c->joint[0].x, y = c->joint[0].y;
 
-    float dl = x;             /* distance to left   edge */
-    float dr = wpx - x;       /* distance to right  edge */
-    float dt = y;             /* distance to top    edge */
-    float db = hpx - y;       /* distance to bottom edge */
+    float d_left   = x;
+    float d_right  = wpx - x;
+    float d_top    = y;
+    float d_bottom = hpx - y;
 
-    float push_x = 0.0f, push_y = 0.0f;
-    if (dl < REPEL_MARGIN) { float u = 1.0f - dl / REPEL_MARGIN; push_x += u * u; }
-    if (dr < REPEL_MARGIN) { float u = 1.0f - dr / REPEL_MARGIN; push_x -= u * u; }
-    if (dt < REPEL_MARGIN) { float u = 1.0f - dt / REPEL_MARGIN; push_y += u * u; }
-    if (db < REPEL_MARGIN) { float u = 1.0f - db / REPEL_MARGIN; push_y -= u * u; }
+    Vec2 push = { 0.0f, 0.0f };
+    if (d_left   < REPEL_MARGIN) { float u = 1.0f - d_left   / REPEL_MARGIN; push.x += u * u; }
+    if (d_right  < REPEL_MARGIN) { float u = 1.0f - d_right  / REPEL_MARGIN; push.x -= u * u; }
+    if (d_top    < REPEL_MARGIN) { float u = 1.0f - d_top    / REPEL_MARGIN; push.y += u * u; }
+    if (d_bottom < REPEL_MARGIN) { float u = 1.0f - d_bottom / REPEL_MARGIN; push.y -= u * u; }
+    return push;
+}
 
-    float mag2 = push_x * push_x + push_y * push_y;
-    if (mag2 < 1e-8f) return 0.0f;       /* well clear of every edge */
-
-    float desired = atan2f(push_y, push_x);
-    float diff    = desired - c->heading;
-    /* Wrap diff to [-π, π] so we always take the short way around. */
+/*
+ * shortest_signed_angle — wrap a heading difference to [-π, π].
+ *
+ *   Heading is on a circle; raw subtraction can give a delta of e.g.
+ *   +5π/3 when the true short rotation is -π/3. Wrapping ensures we
+ *   always rotate the SHORT way round the circle — important when
+ *   the desired-vs-current pair straddles the π / -π discontinuity.
+ */
+static float shortest_signed_angle(float diff)
+{
     while (diff >  (float)M_PI) diff -= 2.0f * (float)M_PI;
     while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
+    return diff;
+}
+
+/*
+ * edge_bias — Reynolds soft fence, expressed as a heading correction.
+ *
+ *   1. quadratic_repulsion_from_walls : gradient of soft potential.
+ *   2. if push is negligible          : well clear; no correction.
+ *   3. atan2f(push)                   : desired heading toward open space.
+ *   4. shortest_signed_angle(Δθ)      : short-way rotation needed.
+ *   5. clamp ‖push‖ to 1 and scale by REPEL_GAIN.
+ *
+ * Returns rad/s contribution to dθ/dt. Ref [3] Reynolds 1999.
+ */
+static float edge_bias(const Centipede *c, int cols, int rows)
+{
+    Vec2 push = quadratic_repulsion_from_walls(c, cols, rows);
+
+    float mag2 = push.x * push.x + push.y * push.y;
+    if (mag2 < 1e-8f) return 0.0f;            /* well clear of every wall */
+
+    float desired = atan2f(push.y, push.x);
+    float diff    = shortest_signed_angle(desired - c->heading);
 
     float strength = sqrtf(mag2);
     if (strength > 1.0f) strength = 1.0f;
@@ -887,34 +1047,81 @@ static float edge_bias(const Centipede *c, int cols, int rows)
 }
 
 /*
- * move_head — advance the head and record the trail. See ALGORITHM §2-§6.
+ * advance_locomotion_clocks — tick the two phase variables a CPG needs.
  *
- * The undulation phase is accumulated separately from wave_time because
- * its frequency (turn_freq) is user-adjustable mid-run; if we computed
- * sin(turn_freq * wave_time) directly, changing turn_freq would jump
- * the phase argument and whip the body into a sudden curve.
+ *   wave_time   : master clock; reads from legs, antennae.
+ *   turn_phase  : ∫ turn_freq · dt — kept SEPARATE from wave_time so
+ *                 the user can adjust turn_freq mid-run without
+ *                 producing a phase jump (which would whip the body
+ *                 into a sudden curve).
+ *
+ *   This is the neurobiological "central pattern generator" pattern:
+ *   gait timing is driven by an internal oscillator, not by sensory
+ *   feedback. Ref [5] Manton 1952, [6] Full & Tu 1991.
  */
-static void move_head(Centipede *c, float dt, int cols, int rows)
+static void advance_locomotion_clocks(Centipede *c, float dt)
 {
     c->wave_time  += dt;
     c->turn_phase += c->turn_freq * dt;
+}
 
-    float turn = c->turn_amp * sinf(c->turn_phase);
-    float bias = edge_bias(c, cols, rows);
-    c->heading += (turn + bias) * dt;
+/* CPG output: pure sinusoid in turn_phase, scaled by user amplitude.
+ * Units: rad/s contribution to dθ/dt. */
+static float cpg_turn_rate(const Centipede *c)
+{
+    return c->turn_amp * sinf(c->turn_phase);
+}
 
+/*
+ * integrate_heading_then_position — semi-implicit Euler step.
+ *
+ *   θ ← θ + ω·dt           (turn first)
+ *   x ← x + v·cos(θ)·dt     (then move along the NEW heading)
+ *   y ← y + v·sin(θ)·dt
+ *
+ *   Mathematically equivalent to explicit Euler at first order, but
+ *   reads "turn then move", matching the physical intuition.
+ */
+static void integrate_heading_then_position(Centipede *c,
+                                            float omega, float dt)
+{
+    c->heading    += omega * dt;
     c->joint[0].x += c->move_speed * cosf(c->heading) * dt;
     c->joint[0].y += c->move_speed * sinf(c->heading) * dt;
+}
 
-    /* Defensive clamp — edge_bias keeps the head inside under normal
-     * conditions, but a SIGWINCH can drop the screen out from under it. */
+/* Defensive bounds clip — edge_bias keeps the head inside under
+ * normal conditions, but SIGWINCH can shrink the screen out from
+ * under it between integration and the next bias evaluation. */
+static void clamp_head_to_pixel_bounds(Centipede *c, int cols, int rows)
+{
     float wpx = (float)cols * (float)CELL_W;
     float hpx = (float)rows * (float)CELL_H;
-    if (c->joint[0].x < 0.0f)  c->joint[0].x = 0.0f;
-    if (c->joint[0].x >= wpx)  c->joint[0].x = wpx - 1.0f;
-    if (c->joint[0].y < 0.0f)  c->joint[0].y = 0.0f;
-    if (c->joint[0].y >= hpx)  c->joint[0].y = hpx - 1.0f;
+    if (c->joint[0].x < 0.0f) c->joint[0].x = 0.0f;
+    if (c->joint[0].x >= wpx) c->joint[0].x = wpx - 1.0f;
+    if (c->joint[0].y < 0.0f) c->joint[0].y = 0.0f;
+    if (c->joint[0].y >= hpx) c->joint[0].y = hpx - 1.0f;
+}
 
+/*
+ * move_head — advance the head one step under CPG + edge avoidance.
+ *
+ *   1. advance_locomotion_clocks         (wave_time, turn_phase)
+ *   2. ω = cpg_turn_rate + edge_bias     (steering composition)
+ *   3. integrate_heading_then_position   (semi-implicit Euler)
+ *   4. clamp_head_to_pixel_bounds        (defensive)
+ *   5. trail_push                        (FK source-of-truth update)
+ *
+ * See ALGORITHM §2-§6 and Centipede struct doc.
+ */
+static void move_head(Centipede *c, float dt, int cols, int rows)
+{
+    advance_locomotion_clocks(c, dt);
+
+    float omega = cpg_turn_rate(c) + edge_bias(c, cols, rows);
+    integrate_heading_then_position(c, omega, dt);
+
+    clamp_head_to_pixel_bounds(c, cols, rows);
     trail_push(c, c->joint[0]);
 }
 
@@ -957,38 +1164,100 @@ static float body_dir_at(const Centipede *c, int j)
 }
 
 /*
- * compute_legs — stateless FK for all leg pairs. See ALGORITHM §8 and
- * KEY FORMULAS for the math; the only state read is wave_time and the
- * body joint positions, so the same inputs always yield the same pose
- * regardless of how the simulation got there.
+ * attachment_joint_for_pair — pick the body joint that leg-pair i hangs
+ * from. N_LEGS pairs are spread evenly across joints 1..BODY_SEGS-1;
+ * joint 0 (head) and joint BODY_SEGS (tail-tip) are skipped so the
+ * silhouette retains a "feeler" head and tapering tail.
+ */
+static int attachment_joint_for_pair(int i)
+{
+    return 1 + i * (BODY_SEGS - 2) / (N_LEGS - 1);
+}
+
+/*
+ * hips_from_body_normal — place port + starboard hips by stepping
+ * BODY_OFFSET pixels along the lateral normals of the body spine at
+ * `spine`. Lateral normals are body_dir ± π/2 — the rotation by 90°
+ * that converts a tangent vector into a side-pointing vector.
+ */
+static void hips_from_body_normal(Vec2 spine, float body_dir, float offset,
+                                  Vec2 *hip_L, Vec2 *hip_R)
+{
+    const float half_pi = (float)M_PI * 0.5f;
+    float n_L = body_dir + half_pi;
+    float n_R = body_dir - half_pi;
+    hip_L->x = spine.x + offset * cosf(n_L);
+    hip_L->y = spine.y + offset * sinf(n_L);
+    hip_R->x = spine.x + offset * cosf(n_R);
+    hip_R->y = spine.y + offset * sinf(n_R);
+}
+
+/*
+ * metachronal_gait_phases — phase pair for leg pair i.
+ *
+ *   φ_L = ω·t + i · π/N    →  travelling wave FRONT TO REAR:
+ *                              successive pairs lag by π/N rad,
+ *                              producing the characteristic
+ *                              "ripple" of myriapod feet. [5][6]
+ *   φ_R = φ_L + π          →  contralateral antiphase (when L pushes,
+ *                              R lifts).
+ */
+static void metachronal_gait_phases(int i, float wave_time,
+                                    float *phi_L, float *phi_R)
+{
+    const float pi_f = (float)M_PI;
+    *phi_L = wave_time * GAIT_FREQ + (float)i * (pi_f / (float)N_LEGS);
+    *phi_R = *phi_L + pi_f;
+}
+
+/*
+ * swing_angles_from_phase — modulate the 2-DOF leg posture sinusoidally.
+ *
+ *   upper(φ) = body_dir + side·LEG_SPLAY + A·sin(φ)
+ *   lower(φ) = upper(φ) + LEG_BEND       + a·sin(φ + π/4)
+ *
+ *   `side` is +1 for port, -1 for starboard (mirrors splay).
+ *   The π/4 phase shift between upper and lower swings yields the
+ *   classic "knee leads, foot trails" walking-leg arc.
+ */
+static void swing_angles_from_phase(float body_dir, float side, float phi,
+                                    float *upper, float *lower)
+{
+    const float quarter_pi = (float)M_PI * 0.25f;
+    *upper = body_dir + side * LEG_SPLAY + SWING_AMP   * sinf(phi);
+    *lower = *upper  + LEG_BEND          + LOWER_SWING * sinf(phi + quarter_pi);
+}
+
+/*
+ * compute_legs — stateless FK over all leg pairs.
+ *
+ *   For each pair i:
+ *     1. attachment_joint_for_pair   (which spine joint hosts this pair)
+ *     2. body_dir_at                 (smoothed spine tangent there)
+ *     3. hips_from_body_normal       (port + starboard hips ± normal)
+ *     4. metachronal_gait_phases     (travelling-wave φ_L, φ_R)
+ *     5. swing_angles_from_phase ×2  (port: +splay, starboard: -splay)
+ *     6. leg_fk ×2                   (hip → knee → foot chain)
+ *
+ *   Pure function of (joint[], wave_time): same inputs ⇒ same pose,
+ *   no hidden integrator state. See ALGORITHM §8 and Centipede doc.
  */
 static void compute_legs(Centipede *c)
 {
-    const float pi_f = (float)M_PI;
-
     for (int i = 0; i < N_LEGS; i++) {
-        /* Attachment joint — N_LEGS pairs spread evenly across
-         * joints 1..BODY_SEGS-1 (skip head and tail-tip for aesthetics). */
-        int   j        = 1 + i * (BODY_SEGS - 2) / (N_LEGS - 1);
+        int   j        = attachment_joint_for_pair(i);
         float body_dir = body_dir_at(c, j);
 
-        /* Lateral normals — perpendicular to body direction. */
-        float n_L = body_dir + pi_f * 0.5f;
-        float n_R = body_dir - pi_f * 0.5f;
-        Vec2  hip_L = { c->joint[j].x + BODY_OFFSET * cosf(n_L),
-                        c->joint[j].y + BODY_OFFSET * sinf(n_L) };
-        Vec2  hip_R = { c->joint[j].x + BODY_OFFSET * cosf(n_R),
-                        c->joint[j].y + BODY_OFFSET * sinf(n_R) };
+        Vec2 hip_L, hip_R;
+        hips_from_body_normal(c->joint[j], body_dir, BODY_OFFSET,
+                              &hip_L, &hip_R);
 
-        /* Gait phases — travelling wave front-to-rear, R = L + π. */
-        float phi_L = c->wave_time * GAIT_FREQ + (float)i * (pi_f / (float)N_LEGS);
-        float phi_R = phi_L + pi_f;
+        float phi_L, phi_R;
+        metachronal_gait_phases(i, c->wave_time, &phi_L, &phi_R);
 
-        /* Joint angles — sinusoidal modulation around base posture. */
-        float upper_L = body_dir + LEG_SPLAY + SWING_AMP   * sinf(phi_L);
-        float upper_R = body_dir - LEG_SPLAY + SWING_AMP   * sinf(phi_R);
-        float lower_L = upper_L  + LEG_BEND  + LOWER_SWING * sinf(phi_L + pi_f * 0.25f);
-        float lower_R = upper_R  + LEG_BEND  + LOWER_SWING * sinf(phi_R + pi_f * 0.25f);
+        float upper_L, lower_L, upper_R, lower_R;
+        swing_angles_from_phase(body_dir, +1.0f, phi_L, &upper_L, &lower_L);
+        swing_angles_from_phase(body_dir, -1.0f, phi_R, &upper_R, &lower_R);
 
         leg_fk(hip_L, upper_L, lower_L, c->leg_left [i]);
         leg_fk(hip_R, upper_R, lower_R, c->leg_right[i]);
@@ -1064,24 +1333,74 @@ static chtype head_glyph(float heading)
 }
 
 /*
- * draw_line_dense — stamp a direction glyph at every cell the line a→b
- * passes through.
+ * sample_count_for_dense_raster — number of parametric samples that
+ * guarantees AT LEAST ONE sample per cell along a line of `length` px.
  *
- * WHY DENSE STEPPING? A cell is CELL_W=8 px wide. Drawing only at
- * endpoints leaves visible gaps on segments longer than one cell. By
- * stepping every DRAW_STEP_PX=5 px (< CELL_W=8) we guarantee at least
- * one sample per cell along the segment.
+ *   Pixel cells are CELL_W=8 px wide; DRAW_STEP_PX=5 px keeps adjacent
+ *   samples strictly < CELL_W apart so no traversed cell is skipped.
+ *   The +1 accounts for the inclusive-endpoint final sample.
  *
- * DEDUPLICATION CURSOR (prev_cx, prev_cy): caller-owned so it persists
- * across multiple draw_line_dense calls in the same pass. Initialise to
- * a sentinel (-9999) before the first call so the first cell always
- * draws. Use independent cursors for independent passes.
+ *   Alternative: Bresenham [7] yields one cell per step natively; we
+ *   stay with parametric oversampling because float arithmetic is
+ *   already paid for elsewhere this frame.
+ */
+static int sample_count_for_dense_raster(float length_px)
+{
+    return (int)ceilf(length_px / DRAW_STEP_PX) + 1;
+}
+
+/*
+ * stamp_glyph_at_pixel — place one glyph at the cell containing pixel
+ * (px, py), with cell-level dedup against the caller-owned cursor.
+ *
+ *   1. Convert pixel → cell coords.
+ *   2. If same cell as last sample, skip (dedup).
+ *   3. If off-screen, skip clip.
+ *   4. Stamp.
+ *
+ *   The caller passes its own (prev_cx, prev_cy) so the cursor persists
+ *   across multiple draw_line_dense calls — a centipede leg drawn as
+ *   two segments (hip→knee, knee→foot) won't double-stamp at the knee.
+ */
+static void stamp_glyph_at_pixel(WINDOW *w, float px, float py,
+                                 chtype glyph,
+                                 int pair, attr_t attr,
+                                 int cols, int rows,
+                                 int *prev_cx, int *prev_cy)
+{
+    int cx = px_to_cell_x(px);
+    int cy = px_to_cell_y(py);
+
+    if (cx == *prev_cx && cy == *prev_cy) return;     /* same-cell dedup */
+    *prev_cx = cx;
+    *prev_cy = cy;
+
+    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) return;
+
+    wattron(w, COLOR_PAIR(pair) | attr);
+    mvwaddch(w, cy, cx, glyph);
+    wattroff(w, COLOR_PAIR(pair) | attr);
+}
+
+/*
+ * draw_line_dense — direction-glyph line rasteriser with cell dedup.
+ *
+ *   1. Compute Δ = b - a and length; bail on zero-length lines.
+ *   2. seg_glyph(Δ)               : ONE glyph for the whole line based
+ *                                   on its angle (-, /, |, \).
+ *   3. sample_count_for_dense_raster(length) : samples ≥ cells crossed.
+ *   4. For t = 0..n stamp_glyph_at_pixel along the parametric line.
+ *      Caller-owned (prev_cx, prev_cy) lives across calls — sentinel
+ *      (-9999) before the first call so the opening cell stamps.
+ *
+ * Used by render_centipede / render_antennae for body and leg lines.
+ * See [7] Bresenham 1965 for the bit-twiddling alternative.
  */
 static void draw_line_dense(WINDOW *w,
-                             Vec2 a, Vec2 b,
-                             int pair, attr_t attr,
-                             int cols, int rows,
-                             int *prev_cx, int *prev_cy)
+                            Vec2 a, Vec2 b,
+                            int pair, attr_t attr,
+                            int cols, int rows,
+                            int *prev_cx, int *prev_cy)
 {
     float dx  = b.x - a.x;
     float dy  = b.y - a.y;
@@ -1089,22 +1408,13 @@ static void draw_line_dense(WINDOW *w,
     if (len < 0.1f) return;
 
     chtype glyph  = seg_glyph(dx, dy);
-    int    nsteps = (int)ceilf(len / DRAW_STEP_PX) + 1;
+    int    nsteps = sample_count_for_dense_raster(len);
 
     for (int t = 0; t <= nsteps; t++) {
-        float u  = (float)t / (float)nsteps;
-        int   cx = px_to_cell_x(a.x + dx * u);
-        int   cy = px_to_cell_y(a.y + dy * u);
-
-        if (cx == *prev_cx && cy == *prev_cy) continue;
-        *prev_cx = cx;
-        *prev_cy = cy;
-
-        if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
-
-        wattron(w, COLOR_PAIR(pair) | attr);
-        mvwaddch(w, cy, cx, glyph);
-        wattroff(w, COLOR_PAIR(pair) | attr);
+        float u = (float)t / (float)nsteps;
+        stamp_glyph_at_pixel(w, a.x + dx * u, a.y + dy * u,
+                             glyph, pair, attr,
+                             cols, rows, prev_cx, prev_cy);
     }
 }
 
@@ -1230,44 +1540,131 @@ static void render_antennae(const Centipede *c, WINDOW *w, int cols, int rows)
 /* §6  scene                                                              */
 /* ===================================================================== */
 
-typedef struct { Centipede centipede; } Scene;
-
 /*
- * scene_init — clean, immediately-animated start state.
+ * Scene — composition root for §6.
  *
- * The non-obvious bits:
- *  • turn_phase = π/2 starts the sine integrator at peak rate, so the
- *    head curves on frame 1 (instead of crawling straight for ~0.5 s).
- *  • Trail is pre-filled with TRAIL_CAP entries 1 px apart behind the
- *    starting heading. Without this the body would appear as a single
- *    cell and grow tail-first — see EDGE CASES "Trail starvation".
+ * Intent
+ *   In this demo the simulation IS one centipede.  We keep a Scene
+ *   wrapper anyway so the framework loop (scene_init / scene_tick /
+ *   scene_draw) reads identically to every other file in the repo.
+ *   If a future variant adds e.g. obstacles, predators, or pheromone
+ *   trails, they slot in here as siblings of `centipede` without
+ *   changing the loop.
+ *
+ * Simulation vs Rendering locality
+ *   The Centipede struct itself already separates VERBS (heading,
+ *   wave_time, move_speed) from NOUNS (joint, leg_left, leg_right)
+ *   from RENDER-ONLY (theme_idx).  Within Scene there is no further
+ *   split needed yet — one field, one concern.  When adding a new
+ *   member, place it as follows:
+ *
+ *     ── Simulation state ──   things scene_tick READS+WRITES
+ *                              (obstacles[], pheromone_grid, …)
+ *     ── Render-only state ──  things scene_draw READS, never the
+ *                              physics path (camera, screenshake, …)
+ *
+ * Things that DO NOT live here
+ *   - fps / sim_fps counters → §8 App (frame-timing concern, not
+ *     part of the world being simulated).
+ *   - terminal extents (cols, rows) → §7 Screen.
+ *   - signal flags (running, need_resize) → §8 App.
+ *
+ * One Scene per program; passed by pointer to every §6 entry point.
  */
-static void scene_init(Scene *sc, int cols, int rows)
+typedef struct {
+    /* ── Simulation state ─────────────────────────────────────── */
+    Centipede centipede;       /* the world: trail, joints, legs, motion */
+
+    /* (no render-only state yet — theme_idx lives inside Centipede
+     *  because it's user-toggled via the same keymap as paused) */
+} Scene;
+
+/* Apply the user-tunable defaults from §1 config. These are the
+ * baseline gait parameters the centipede reverts to on reset. */
+static void apply_default_tunables(Centipede *c)
 {
-    memset(sc, 0, sizeof *sc);
-    Centipede *c = &sc->centipede;
     c->move_speed = MOVE_SPEED;
     c->turn_amp   = TURN_AMP;
     c->turn_freq  = TURN_FREQ;
     c->theme_idx  = 0;
     c->paused     = false;
-    c->wave_time  = 0.0f;
-    c->turn_phase = (float)M_PI * 0.5f;       /* start at peak of sin */
-    c->heading    = (float)M_PI / 8.0f;       /* slight south-east tilt */
+}
 
-    /* Off-centre starting position — leaves room for the first curve. */
+/*
+ * seed_central_pattern_generator — initial phase + heading of the CPG.
+ *
+ *   wave_time   = 0           : master clock at start.
+ *   turn_phase  = π/2         : sin() integrator at its PEAK, so the
+ *                                first sample produces MAX turn rate
+ *                                instead of near-zero for ~half a
+ *                                period — the centipede curves on
+ *                                frame 1, not after a long crawl.
+ *   heading     = π/8         : slight south-east tilt so the visible
+ *                                arc is across the screen, not along
+ *                                an edge.
+ *
+ *   Ref [5][6] for the CPG model this seeds.
+ */
+static void seed_central_pattern_generator(Centipede *c)
+{
+    c->wave_time  = 0.0f;
+    c->turn_phase = (float)M_PI * 0.5f;
+    c->heading    = (float)M_PI / 8.0f;
+}
+
+/* Place the head at 38% of width × 50% of height. The off-centre choice
+ * leaves room for the first half-period of curvature to fit on screen
+ * without an immediate wall bounce. */
+static void place_head_off_centre(Centipede *c, int cols, int rows)
+{
     c->joint[0].x = (float)(cols * CELL_W) * 0.38f;
     c->joint[0].y = (float)(rows * CELL_H) * 0.50f;
+}
 
-    /* Trail pre-fill: one 1-px step backward from head, TRAIL_CAP times. */
-    float bx = cosf(c->heading + (float)M_PI);
-    float by = sinf(c->heading + (float)M_PI);
+/*
+ * prefill_trail_behind_heading — seed the FK trail buffer.
+ *
+ *   Synthesises TRAIL_CAP virtual past positions, each 1 px BACKWARD
+ *   along the starting heading from the previous one. Mathematically
+ *   equivalent to saying "the centipede has been walking straight for
+ *   the last TRAIL_CAP frames, and arrived HERE now".
+ *
+ *   Without this pre-fill, compute_joints() would have only one valid
+ *   sample, and the body would appear as a single cell that grows
+ *   tail-first over ~TRAIL_CAP frames. See Centipede struct doc
+ *   "Trail buffer" and EDGE CASES "Trail starvation".
+ */
+static void prefill_trail_behind_heading(Centipede *c)
+{
+    float back_x = cosf(c->heading + (float)M_PI);
+    float back_y = sinf(c->heading + (float)M_PI);
     for (int k = 0; k < TRAIL_CAP; k++) {
-        c->trail[k].x = c->joint[0].x + (float)k * bx;
-        c->trail[k].y = c->joint[0].y + (float)k * by;
+        c->trail[k].x = c->joint[0].x + (float)k * back_x;
+        c->trail[k].y = c->joint[0].y + (float)k * back_y;
     }
     c->trail_head  = 0;
     c->trail_count = TRAIL_CAP;
+}
+
+/*
+ * scene_init — clean, immediately-animated start state.
+ *
+ *   1. memset to zero                  (default everything)
+ *   2. apply_default_tunables          (speed, gait amplitudes, theme)
+ *   3. seed_central_pattern_generator  (wave/turn phase + heading)
+ *   4. place_head_off_centre           (room for first curve)
+ *   5. prefill_trail_behind_heading    (avoid tail starvation)
+ *   6. compute_joints + compute_legs   (derive renderable pose)
+ */
+static void scene_init(Scene *sc, int cols, int rows)
+{
+    memset(sc, 0, sizeof *sc);
+    Centipede *c = &sc->centipede;
+
+    apply_default_tunables(c);
+    seed_central_pattern_generator(c);
+    place_head_off_centre(c, cols, rows);
+    prefill_trail_behind_heading(c);
 
     compute_joints(c);
     compute_legs(c);
@@ -1309,7 +1706,30 @@ static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows)
 /* §7  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal-extent snapshot.
+ *
+ * Intent
+ *   Caches the current terminal size in CELLS (not pixels) so every
+ *   §6 entry point can take (cols, rows) as plain ints rather than
+ *   re-querying ncurses each frame.  Refreshed only when SIGWINCH
+ *   sets App::need_resize.
+ *
+ * Why this is a separate struct (not just two ints in App)
+ *   Resize logic touches NOTHING in App except this struct; carving
+ *   it out makes screen_resize() pure and testable without faking
+ *   the rest of the app.  Also matches Raymond's [8] convention of
+ *   isolating the terminal-state concern.
+ *
+ * Why cells, not pixels
+ *   ncurses' coordinate system is cells.  Pixel space (CELL_W×CELL_H
+ *   sub-pixels per cell) lives only inside §6 — converting at the
+ *   draw boundary, per the project's "one conversion point" rule.
+ */
+typedef struct {
+    int cols;                  /* terminal width  in CHARACTER CELLS   */
+    int rows;                  /* terminal height in CHARACTER CELLS   */
+} Screen;
 
 /*
  * screen_init — configure terminal for animation.
@@ -1383,18 +1803,48 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — top-level state. Declared file-scope so signal handlers (no
- * user argument) can write the running / need_resize flags.
+ * App — top-level container; everything outside the world.
  *
- * volatile sig_atomic_t: volatile prevents register caching across
- * handler writes; sig_atomic_t guarantees atomic read/write on POSIX.
+ * Intent
+ *   Bundles the simulated world (Scene), the host terminal (Screen),
+ *   and the loop-control flags into one record so main() reads as
+ *   four-line phases: init / per-frame service / per-frame work /
+ *   shutdown.  Declared file-scope (g_app) so signal handlers — which
+ *   cannot take a user argument — can write `running` and
+ *   `need_resize` without globals scattered through the file.
+ *
+ * Locality of concern
+ *   ── Owned subsystems ── nouns the app composes
+ *      scene       — the world being simulated  (§6)
+ *      screen      — the terminal extent it draws to  (§7)
+ *   ── Loop control ───── verbs the loop reads each frame
+ *      time_scale  — wall-clock dt multiplier (slow-mo / fast-fwd)
+ *      running     — clear → loop exits; set by SIGINT/SIGTERM
+ *      need_resize — set by SIGWINCH; cleared after Screen refresh
+ *
+ * Why volatile sig_atomic_t (not bool, not int)
+ *   `volatile`    : the compiler must not cache the flag across a
+ *                   signal-handler write — every loop iteration must
+ *                   re-read it from memory.
+ *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
+ *                   signals; a plain `int` could be observed half-
+ *                   written on architectures where stores are split.
+ *   See Raymond [8] §"Signal handling".
+ *
+ * Things that DO NOT live here
+ *   - Wall-clock timestamps / fps counters — local to main(), no
+ *     other code path needs them.
+ *   - Centipede tuning values — those are user-state in §6.
  */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    float                 time_scale;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* ── Owned subsystems ─────────────────────────────────────── */
+    Scene  scene;              /* the world (§6)                       */
+    Screen screen;             /* terminal extent (§7)                 */
+
+    /* ── Loop control ─────────────────────────────────────────── */
+    float                 time_scale;   /* dt multiplier; 1.0 = realtime */
+    volatile sig_atomic_t running;      /* main loop predicate           */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH pending              */
 } App;
 
 static App g_app;

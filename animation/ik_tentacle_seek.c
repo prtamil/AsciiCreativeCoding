@@ -93,18 +93,82 @@
  *                 ≈ 680 vector ops + 16 constraint clamps. Microseconds
  *                 total. ncurses doupdate sends only changed cells.
  *
- * References    :
- *   Aristidou & Lasenby, "FABRIK: A fast, iterative solver for the
- *     inverse kinematics problem" (Graphical Models 2011) — original
- *     paper including the convergence proof.
- *     https://www.andreasaristidou.com/FABRIK.html
- *   Aristidou & Lasenby, "Inverse kinematics solutions using conformal
- *     geometric algebra" (2011) — extension showing joint constraints
- *     can bolt onto FABRIK without breaking convergence.
- *   Wikipedia, "Lissajous curve" — derives why a non-integer frequency
- *     ratio gives a quasi-periodic figure.
- *   Glenn Fiedler, "Fix Your Timestep!" (gafferongames.com) — case
- *     for fixed-step (stiff sims); we don't qualify, hence variable.
+ * References
+ * ──────────
+ *   ── FABRIK (the §5c solver) ──────────────────────────────────────
+ *   [1] Aristidou, A. & Lasenby, J. (2011), "FABRIK: a fast,
+ *       iterative solver for the inverse kinematics problem",
+ *       Graphical Models 73(5), pp. 243-260 — the foundational
+ *       paper including the convergence proof; §5c implements
+ *       its two geometric passes line-by-line via the shared
+ *       snap_to_link_length primitive.
+ *       https://www.andreasaristidou.com/FABRIK.html
+ *   [2] Aristidou, A., Chrysanthou, Y. & Lasenby, J. (2016),
+ *       "Extending FABRIK with model constraints", Computer
+ *       Animation and Virtual Worlds 27(1), pp. 35-57 —
+ *       joint-limit extension to the 2011 paper; the source for
+ *       the §5b apply_joint_constraint approach.
+ *
+ *   ── IK families FABRIK avoids ────────────────────────────────────
+ *   [3] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
+ *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
+ *       UCSD course notes — Jacobian-iterative family; FABRIK
+ *       converges faster on long chains and skips matrix inversion.
+ *   [4] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
+ *       and Control" (3rd ed.), Pearson — Ch. 4 derives ANALYTICAL
+ *       closed-form 2-link IK. Read to feel the contrast: analytical
+ *       solutions don't scale past ~3 links, FABRIK does.
+ *
+ *   ── Alternating projections (the math behind FABRIK) ─────────────
+ *   [5] von Neumann, J. (1949), "On rings of operators. Reduction
+ *       theory", Annals of Mathematics 50(2) — the original
+ *       alternating-projections theorem for convex sets. FABRIK
+ *       is a non-convex variant of the same idea.
+ *   [6] Bauschke, H. & Borwein, J. (1996), "On projection algorithms
+ *       for solving convex feasibility problems", SIAM Review 38(3)
+ *       — modern survey; useful to see what FABRIK is and is not
+ *       guaranteed (convex case proves convergence; FABRIK only
+ *       proves monotone error decrease).
+ *
+ *   ── Lissajous / target path ──────────────────────────────────────
+ *   [7] Lissajous, J. A. (1857), "Mémoire sur l'étude optique des
+ *       mouvements vibratoires", Annales de Chimie et de Physique
+ *       51 — original derivation of the figure family. The non-
+ *       integer ω_x / ω_y ratio gives a quasi-periodic figure.
+ *   [8] Cundy, H. M. & Rollett, A. P. (1961), "Mathematical Models",
+ *       Oxford — Ch. 5 enumerates Lissajous curves by ratio and
+ *       phase; reference for picking different target patterns.
+ *
+ *   ── Signal processing (the low-pass on raw target) ──────────────
+ *   [9] Oppenheim, A. V. & Schafer, R. W. (2010), "Discrete-Time
+ *       Signal Processing" (3rd ed.), Pearson — §3.6 first-order
+ *       IIR filter (leaky integrator). update_target uses the
+ *       discrete-time form to smooth raw Lissajous output.
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *  [10] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
+ *       — when fixed-step matters; this file uses variable-step
+ *       because FABRIK + low-pass + Lissajous are all unconditionally
+ *       stable.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *  [11] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       the integer line algorithm; §5g draw_link_beads uses the
+ *       simpler parametric oversample because float math is already
+ *       paid for in FABRIK.
+ *  [12] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the root → tip brightness ramp.
+ *  [13] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the diff pipeline §7 relies on.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [14] https://en.wikipedia.org/wiki/Inverse_kinematics
+ *  [15] https://en.wikipedia.org/wiki/Lissajous_curve
+ *  [16] https://en.wikipedia.org/wiki/FABRIK
+ *  [17] https://en.wikipedia.org/wiki/Infinite_impulse_response
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -595,16 +659,42 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * Per-theme body palette (pairs 1..N_PAIRS, root → tip). HUD/HINT
- * pairs are theme-independent (CLAUDE.md HUD spec).
+ * Theme — one tentacle colour palette (xterm-256 fg indices).
  *
- * All entries sit in the bright half of the 256-colour space:
- *   - cube colours: ≥ 24 (brightness rule)
- *   - grayscale:    ≥ 240 (the 232-239 zone vanishes under A_DIM)
+ * Intent
+ *   Each theme rebinds the seven body-rendering pairs (1..7) in
+ *   one shot via init_pair (see theme_apply). HUD/HINT pairs are
+ *   theme-independent (PAIR_HUD = bright yellow, PAIR_HINT = bright
+ *   cyan) so the status bar stays readable against any animation
+ *   behind it — CLAUDE.md HUD spec.
+ *
+ * Slot semantics (body[0..6] map to pairs 1..7; root → tip gradient)
+ *   [0] pair 1 — root joint (dimmest); anchored end of chain.
+ *   [1] pair 2 — second joint.
+ *   [2] pair 3 — third joint.
+ *   [3] pair 4 — middle joint.
+ *   [4] pair 5 — fifth joint.
+ *   [5] pair 6 — sixth joint.
+ *   [6] pair 7 — tip joint (brightest); end-effector that chases target.
+ *
+ *   The root → tip brightness gradient lets the eye trace the chain
+ *   without joint-numbering overlay, and makes it obvious which end
+ *   is the IK target-chaser. Ref [12] Bourke.
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness")
+ *   Every entry sits in the BRIGHT HALF of the 256-colour space:
+ *     - cube colours: ≥ 24  (avoid 16-23; invisible under A_DIM)
+ *     - grayscale  : ≥ 240 (avoid 232-239; same reason)
+ *   Theme character comes from the RELATIVE gradient, not absolute
+ *   darkness.
+ *
+ * References [12] Bourke for the gradient-as-depth pattern;
+ *   [13] Raymond §init_pair for the rebind mechanism.
  */
 typedef struct {
-    const char *name;
-    int body[N_PAIRS];   /* pairs 1..7 */
+    const char *name;            /* HUD-displayable theme name        */
+    int         body[N_PAIRS];   /* xterm-256 fg indices, root → tip; *
+                                  * pair p = body[p-1] at apply time  */
 } Theme;
 
 static const Theme THEMES[N_THEMES] = {
@@ -679,7 +769,43 @@ static inline int px_to_cell_y(float py)
 /* ===================================================================== */
 
 /* Vec2 — 2-D position vector in pixel space. */
-typedef struct { float x, y; } Vec2;
+/*
+ * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
+ *
+ * Intent
+ *   FABRIK arithmetic, joint-angle constraints, the Lissajous
+ *   oscillator and the IIR low-pass all live in pixel space. Each
+ *   character cell is CELL_W × CELL_H sub-pixels (8 × 16), so a
+ *   swinging tentacle reads as continuous motion instead of jumping
+ *   cell-to-cell. The conversion to cell space happens only inside
+ *   §5g rendering helpers via px_to_cell_x/y — the project's "one
+ *   conversion point" rule.
+ *
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right of screen).
+ *   y : SOUTHWARD pixel coordinate (positive → down the screen).
+ *
+ *   FABRIK is direction-AGNOSTIC — every step works on distances and
+ *   unit vectors, not on angles. The signed-angle math in §5b
+ *   apply_joint_constraint uses atan2(cross, dot), which gives the
+ *   correct sign in either y-convention.
+ *
+ * Why a value type
+ *   8 bytes; passes in registers. FABRIK's tight inner loop calls
+ *   vec2_add / vec2_sub / vec2_norm / vec2_scale dozens of times
+ *   per iteration; -O2 inlines them all into straight-line code
+ *   with no allocation.
+ *
+ * Why named (x, y) instead of two loose floats
+ *   Type-checking catches (col, row) confusion at compile time
+ *   rather than via visual debugging.
+ *
+ * References [4] Craig §2 "Spatial descriptions".
+ */
+typedef struct {
+    float x;   /* eastward  pixel coordinate (positive → right) */
+    float y;   /* southward pixel coordinate (positive → down)  */
+} Vec2;
 
 /* ── §5a  vec2 helpers ──────────────────────────────────────────────── */
 
@@ -731,29 +857,109 @@ static inline Vec2 vec2_rotate(Vec2 v, float angle)
 
 /* ── Tentacle state ─────────────────────────────────────────────────── */
 
+/*
+ * Tentacle — the full IK chain state.
+ *
+ * Intent
+ *   Three loosely-coupled subsystems share one record:
+ *
+ *     1. JOINT CHAIN — pos[N_JOINTS] are the joint positions in
+ *        pixel space; link_len[N_LINKS] are the fixed segment
+ *        lengths between them. FABRIK rewrites pos[] in full each
+ *        tick, preserving link lengths exactly. Joint-bend
+ *        constraints (MAX_JOINT_BEND) keep the chain looking
+ *        whip-like rather than zig-zagging. Refs [1][2].
+ *
+ *     2. LISSAJOUS TARGET — closed-form (cos ω_x t, sin(ω_y t + φ))
+ *        traces a figure-8 / open curve around the anchor. Non-
+ *        integer ω_x/ω_y gives a quasi-periodic figure that does
+ *        not exactly repeat. Refs [7] Lissajous 1857, [8] Cundy.
+ *
+ *     3. IIR LOW-PASS — actual_target lags the raw Lissajous output
+ *        via a first-order exponential moving average. Without
+ *        this smoothing, sudden Lissajous direction changes (at
+ *        the figure's apex) would push the joint-bend clamp every
+ *        frame and produce a visible "kink". Ref [9] Oppenheim & Schafer.
+ *
+ *   Time flow:  scene_time → raw Lissajous → IIR → actual_target →
+ *               FABRIK → pos[]  → renderer.  One-way chain, no
+ *               feedback. scene_tick walks the chain in order.
+ *
+ * Why pos[] has N_JOINTS = N_LINKS + 1 entries
+ *   A chain with N links has N+1 joints (one per link end + the
+ *   root). pos[0] is the anchor end; pos[N_LINKS] is the tip
+ *   end-effector. The "+1" is a constant trap to remember —
+ *   index it wrong and FABRIK silently shortens the chain by one.
+ *
+ * Why anchor is stored (not just hard-coded)
+ *   SIGWINCH triggers a recompute (in app_do_resize) — the anchor
+ *   moves to the new screen centre, and the Lissajous re-centres
+ *   around it via lissajous_at(anchor, ...). Caching it here means
+ *   the resize path is one assignment, not a re-derivation in
+ *   every helper.
+ *
+ * Why actual_target is SEPARATE from the raw Lissajous output
+ *   It's the smoothed FK CHASE TARGET. The renderer draws the
+ *   trail of `actual_target` (the smoothed path the tip actually
+ *   follows), NOT the raw Lissajous skeleton — what you SEE is
+ *   what the IK CHASES.
+ *
+ * Why TRAIL_POINTS is a CIRCULAR buffer (not a growing list)
+ *   Trail samples are pushed every tick and consumed at every
+ *   render. Circular indexing means no allocation, no shifting;
+ *   trail_write walks mod TRAIL_POINTS. trail_fill caps at
+ *   TRAIL_POINTS on warm-up so the renderer doesn't read
+ *   uninitialised entries on frame 1.
+ *
+ * Why last_iter is CACHED
+ *   The HUD displays the iteration count from the previous
+ *   solve. Stored here rather than returned-and-discarded so
+ *   the renderer can read it without re-running FABRIK.
+ *
+ * The `at_limit` flag
+ *   Set true when reachability fails (|target − anchor| ≥
+ *   Σ link_len). Two readers care:
+ *     - solver: takes the stretch_collinear fallback path.
+ *     - HUD:   shows "AT LIMIT" indicator.
+ *   Recomputed every tick, never persists across frames.
+ *
+ * References [1][2] Aristidou & Lasenby for FABRIK + joint
+ *   constraints; [7] Lissajous original derivation; [9] Oppenheim
+ *   & Schafer for the IIR low-pass; [3][4] Buss + Craig for the
+ *   IK families this file's solver is NOT.
+ */
 typedef struct {
-    /* joint chain (pixel space) */
-    Vec2  pos[N_JOINTS];
-    float link_len[N_LINKS];
+    /* ── Joint chain (FABRIK rewrites pos[] each tick) ────────── */
+    Vec2  pos     [N_JOINTS];  /* joint positions; [0]=root, [N]=tip */
+    float link_len[N_LINKS];   /* fixed segment lengths; set once    */
 
-    /* fixed root */
-    Vec2  anchor;
+    /* ── Fixed root anchor ──────────────────────────────────── *
+     * Re-set on SIGWINCH so a resize moves the root to the new *
+     * screen centre, and the Lissajous re-centres around it.   */
+    Vec2  anchor;              /* tentacle root, pixel space        */
 
-    /* Lissajous target oscillator + smoothing */
-    Vec2  actual_target;       /* low-pass filtered target tracked by IK   */
-    float scene_time;          /* phase accumulator (s)                     */
-    float speed_scale;         /* user-tunable Lissajous time multiplier    */
+    /* ── Lissajous target oscillator + IIR smoothing ────────── *
+     * scene_time advances by dt · speed_scale; raw output is   *
+     * sampled per tick from lissajous_at(); actual_target is   *
+     * the IIR-smoothed value that FABRIK chases.               */
+    Vec2  actual_target;       /* smoothed target tracked by IK     */
+    float scene_time;          /* parametric clock (s)              */
+    float speed_scale;         /* user-tunable Lissajous time multiplier */
 
-    /* trail ring buffer — recent actual_target positions */
+    /* ── Trail ring buffer (renderer-visible path) ──────────── *
+     * Logs `actual_target` (the smoothed curve), not the raw   *
+     * Lissajous output. Rendered as a faint dotted trail.      */
     Vec2  trail_pts[TRAIL_POINTS];
-    int   trail_write;          /* next-write index                          */
-    int   trail_fill;           /* valid entries, ≤ TRAIL_POINTS             */
+    int   trail_write;         /* next-write index, mod TRAIL_POINTS */
+    int   trail_fill;          /* valid entries, saturates at SIZE   */
 
-    /* state flags */
-    int   last_iter;            /* iterations the last fabrik_solve used    */
-    bool  at_limit;             /* target out of reach this tick            */
-    bool  paused;
-    int   theme_idx;
+    /* ── Reachability + UI flags ────────────────────────────── *
+     * last_iter / at_limit: recomputed per tick (NOT persistent *
+     * state). paused / theme_idx: user control flags.           */
+    int   last_iter;           /* iterations the last fabrik_solve used */
+    bool  at_limit;            /* target outside Σ link_len radius      */
+    bool  paused;              /* freezes scene_time; chain freezes     */
+    int   theme_idx;           /* index into §3 THEMES[]                */
 } Tentacle;
 
 /* ── §5b  joint angle constraint ───────────────────────────────────── */
@@ -773,6 +979,73 @@ typedef struct {
  * Endpoints have nothing to clamp: joint 0 has no incoming link, joint
  * N−1 has no outgoing link. Caller guards i ∈ [1, N−2].
  */
+/*
+ * signed_angle_between_unit_vectors — angle from `a` to `b` in [-π, π].
+ *
+ *   For unit vectors a, b:
+ *     cos θ = a · b              (dot product)
+ *     sin θ = a × b              (2-D cross product = scalar z-component
+ *                                  of the 3-D cross product)
+ *     θ     = atan2(sin θ, cos θ)
+ *
+ *   atan2(cross, dot) gives the SIGNED angle (positive CCW, negative CW)
+ *   — critical here because we need to know which WAY the link bends
+ *   in order to rotate it back. acos(dot) would give |θ| only, losing
+ *   the sign and forcing branchy direction guessing.
+ *
+ *   Reference: any vector calculus text; e.g. Strang "Introduction to
+ *   Linear Algebra" §4.1 (geometric interpretation of dot + cross).
+ */
+static float signed_angle_between_unit_vectors(Vec2 a, Vec2 b)
+{
+    float sin_theta = vec2_cross(a, b);
+    float cos_theta = vec2_dot  (a, b);
+    return atan2f(sin_theta, cos_theta);
+}
+
+/*
+ * place_child_along_direction — write pos[i+1] at fixed link length
+ * along a chosen direction from pos[i].
+ *
+ *   pos[i+1] = pos[i] + link_len[i] · direction
+ *
+ *   This is one half of the FABRIK primitive (the other half being
+ *   "compute the direction"). Pulled out so apply_joint_constraint
+ *   can repurpose it after rotating the outgoing direction by the
+ *   clamp delta.
+ */
+static void place_child_along_direction(Tentacle *t, int i, Vec2 direction)
+{
+    t->pos[i + 1] = vec2_add(t->pos[i],
+                             vec2_scale(direction, t->link_len[i]));
+}
+
+/*
+ * apply_joint_constraint — clamp the bend angle at joint i to
+ * ±MAX_JOINT_BEND.
+ *
+ *   Called inside the FABRIK BACKWARD pass right after pos[i] is
+ *   repositioned. pos[i+1] still holds its (now possibly over-bent)
+ *   position from the previous iteration; we may rotate the outgoing
+ *   link to bring the bend within bounds, then write pos[i+1] back.
+ *
+ *   Algorithm (math-named pseudocode):
+ *
+ *     1. dir_in  = unit vector along the INCOMING  link (i-1 → i).
+ *     2. dir_out = unit vector along the OUTGOING  link (i → i+1).
+ *     3. θ = signed_angle_between_unit_vectors(dir_in, dir_out).
+ *     4. if |θ| ≤ MAX_JOINT_BEND : nothing to do, return.
+ *     5. δ = clamp(θ) − θ                  (the correction we need)
+ *     6. new_dir = rotate(dir_out, δ)      (closed-form fix)
+ *     7. place_child_along_direction(i, new_dir).
+ *
+ *   Endpoints have nothing to clamp: joint 0 has no incoming link,
+ *   joint N-1 has no outgoing link. Caller guards i ∈ [1, N-2].
+ *
+ *   Reference: Aristidou, Chrysanthou & Lasenby (2016) "Extending
+ *   FABRIK with model constraints" — joint-limit extension to the
+ *   2011 FABRIK paper.
+ */
 static void apply_joint_constraint(Tentacle *t, int i)
 {
     if (i < 1 || i >= N_JOINTS - 1) return;
@@ -780,17 +1053,14 @@ static void apply_joint_constraint(Tentacle *t, int i)
     Vec2 dir_in  = vec2_norm(vec2_sub(t->pos[i],     t->pos[i - 1]));
     Vec2 dir_out = vec2_norm(vec2_sub(t->pos[i + 1], t->pos[i]));
 
-    float cr    = vec2_cross(dir_in, dir_out);   /* sin θ */
-    float dt    = vec2_dot  (dir_in, dir_out);   /* cos θ */
-    float angle = atan2f(cr, dt);                /* signed θ in [−π, π] */
-
+    float angle = signed_angle_between_unit_vectors(dir_in, dir_out);
     if (fabsf(angle) <= MAX_JOINT_BEND) return;
 
-    float clamped = clampf(angle, -MAX_JOINT_BEND, MAX_JOINT_BEND);
-    float delta   = clamped - angle;
-    Vec2  new_dir = vec2_rotate(dir_out, delta);
-    t->pos[i + 1] = vec2_add(t->pos[i],
-                             vec2_scale(new_dir, t->link_len[i]));
+    float clamped_angle = clampf(angle, -MAX_JOINT_BEND, MAX_JOINT_BEND);
+    float correction    = clamped_angle - angle;
+    Vec2  new_dir       = vec2_rotate(dir_out, correction);
+
+    place_child_along_direction(t, i, new_dir);
 }
 
 /* ── §5c  FABRIK solver ─────────────────────────────────────────────── */
@@ -803,8 +1073,41 @@ static float total_link_length(const Tentacle *t)
     return total;
 }
 
-/* stretch_collinear — out-of-reach posture. Lay all joints along the
- * unit vector from anchor toward target. */
+/*
+ * snap_to_link_length — FABRIK's core primitive.
+ *
+ *   Given a `base` joint and a `endpoint` that is currently at the
+ *   wrong distance from it, snap `endpoint` onto the sphere of radius
+ *   `len` centred at `base`:
+ *
+ *       endpoint' = base + len · (endpoint − base) / |endpoint − base|
+ *
+ *   Geometrically: walk `len` units from `base` along the line toward
+ *   the current `endpoint`. After this, |endpoint' − base| = len.
+ *
+ *   Both FABRIK passes share this primitive; they differ only in
+ *   which joint is the `base` (anchor end for forward pass, tip end
+ *   for backward pass). Reference: Aristidou & Lasenby (2011) §3.
+ */
+static Vec2 snap_to_link_length(Vec2 base, Vec2 endpoint, float len)
+{
+    Vec2 dir = vec2_norm(vec2_sub(endpoint, base));
+    return vec2_add(base, vec2_scale(dir, len));
+}
+
+/*
+ * stretch_collinear — out-of-reach posture.
+ *
+ *   When |target − anchor| ≥ Σ link_len there is NO IK solution.
+ *   Best we can do is lay the chain in a straight line from anchor
+ *   toward target, accepting that the tip falls short of target by
+ *   |target − anchor| − Σ link_len.
+ *
+ *   Joint i lands at:  anchor + (Σ_{k<i} link_len[k]) · dir
+ *   This is the FK FORWARD MAP along a fixed direction — the same
+ *   "walk segments end-to-end" pattern as fk_helloworld.c, just with
+ *   all angles set equal so the chain is straight.
+ */
 static void stretch_collinear(Tentacle *t, Vec2 anchor, Vec2 target)
 {
     Vec2  dir   = vec2_norm(vec2_sub(target, anchor));
@@ -816,54 +1119,111 @@ static void stretch_collinear(Tentacle *t, Vec2 anchor, Vec2 target)
     }
 }
 
-/* fabrik_backward_pass — pin tip to target, walk root-ward restoring
- * link lengths. Apply joint clamp after each interior repositioning. */
+/*
+ * fabrik_backward_pass — first half of one FABRIK iteration.
+ *
+ *   Invariant established by this pass:
+ *     - pos[N-1] = target              (tip pinned to target)
+ *     - |pos[i] − pos[i+1]| = link_len[i] for all i
+ *     - |angle bend| ≤ MAX_JOINT_BEND for every interior joint
+ *
+ *   Invariant BROKEN (will be re-established by forward pass):
+ *     - pos[0] has drifted off `anchor`.
+ *
+ *   Walk root-ward:
+ *     1. pin tip to target
+ *     2. for i = N-2 .. 0:
+ *          a. pos[i] = snap_to_link_length(pos[i+1], pos[i], link_len[i])
+ *          b. if interior, apply_joint_constraint(i)
+ *
+ *   Reference: Aristidou & Lasenby (2011) §3 "Backward reaching".
+ */
 static void fabrik_backward_pass(Tentacle *t, Vec2 target)
 {
     t->pos[N_JOINTS - 1] = target;
     for (int i = N_JOINTS - 2; i >= 0; i--) {
-        Vec2 dir  = vec2_norm(vec2_sub(t->pos[i], t->pos[i + 1]));
-        t->pos[i] = vec2_add(t->pos[i + 1],
-                             vec2_scale(dir, t->link_len[i]));
+        t->pos[i] = snap_to_link_length(t->pos[i + 1], t->pos[i],
+                                        t->link_len[i]);
         if (i > 0) apply_joint_constraint(t, i);
     }
 }
 
-/* fabrik_forward_pass — pin root to anchor, walk tip-ward restoring
- * link lengths. */
+/*
+ * fabrik_forward_pass — second half of one FABRIK iteration.
+ *
+ *   Invariant established by this pass:
+ *     - pos[0] = anchor                (root pinned)
+ *     - |pos[i+1] − pos[i]| = link_len[i] for all i
+ *
+ *   Invariant BROKEN (will be re-established by next backward pass):
+ *     - pos[N-1] no longer exactly on target — but BY LESS than
+ *       before, provably (Aristidou & Lasenby §3 convergence proof).
+ *
+ *   Walk tip-ward:
+ *     1. pin root to anchor
+ *     2. for i = 0 .. N-2:
+ *          pos[i+1] = snap_to_link_length(pos[i], pos[i+1], link_len[i])
+ *
+ *   No joint clamp here — the backward pass already produced bends
+ *   inside the limit, and snap_to_link_length preserves directions.
+ */
 static void fabrik_forward_pass(Tentacle *t, Vec2 anchor)
 {
     t->pos[0] = anchor;
     for (int i = 0; i < N_JOINTS - 1; i++) {
-        Vec2 dir      = vec2_norm(vec2_sub(t->pos[i + 1], t->pos[i]));
-        t->pos[i + 1] = vec2_add(t->pos[i],
-                                 vec2_scale(dir, t->link_len[i]));
+        t->pos[i + 1] = snap_to_link_length(t->pos[i], t->pos[i + 1],
+                                            t->link_len[i]);
     }
 }
 
 /*
- * fabrik_solve — orchestrator. Reachability check first; if reachable,
- * iterate backward + forward passes until the tip is within CONV_TOL
- * of target or MAX_ITER iterations have run.
+ * tip_to_target_error — Euclidean distance from end-effector to target.
+ *   This is the FABRIK convergence metric. The 2011 paper proves the
+ *   metric STRICTLY DECREASES each iteration (for reachable targets),
+ *   so we stop as soon as it falls below CONV_TOL.
+ */
+static float tip_to_target_error(const Tentacle *t, Vec2 target)
+{
+    return vec2_dist(t->pos[N_JOINTS - 1], target);
+}
+
+/*
+ * fabrik_solve — iterative IK orchestrator.
  *
- * Returns the iteration count actually used (for the HUD). Updates
- * t->at_limit.
+ *   PHASE 1 — reachability check
+ *     If |target − anchor| ≥ Σ link_len  there is no solution.
+ *     Fall back to stretch_collinear; set at_limit; return.
+ *
+ *   PHASE 2 — alternating-projection iteration
+ *     Repeat until convergence or MAX_ITER:
+ *       a. fabrik_backward_pass  (pin tip → restore link lens + clamps)
+ *       b. fabrik_forward_pass   (pin root → restore link lens)
+ *       c. if tip_to_target_error < CONV_TOL: done.
+ *
+ *   This is an example of ALTERNATING PROJECTIONS onto two constraint
+ *   sets: "tip = target" and "root = anchor", with link-length and
+ *   angle-limit constraints baked into each projection. Both sets
+ *   are non-convex, but FABRIK converges in 3-5 iterations on typical
+ *   chains in practice. The 2011 paper proves monotone decrease.
+ *
+ *   Returns iteration count actually used (for HUD); updates at_limit.
  */
 static int fabrik_solve(Tentacle *t, Vec2 target, Vec2 anchor)
 {
+    /* PHASE 1 — reachability gate */
     float total = total_link_length(t);
     t->at_limit = (vec2_dist(anchor, target) >= total);
-
     if (t->at_limit) {
         stretch_collinear(t, anchor, target);
         return 1;
     }
 
+    /* PHASE 2 — iterate until convergence */
     int iter = 0;
     for (iter = 0; iter < MAX_ITER; iter++) {
         fabrik_backward_pass(t, target);
         fabrik_forward_pass (t, anchor);
-        if (vec2_dist(t->pos[N_JOINTS - 1], target) < CONV_TOL) {
+        if (tip_to_target_error(t, target) < CONV_TOL) {
             iter++;
             break;
         }
@@ -897,21 +1257,61 @@ static Vec2 lissajous_at(Vec2 anchor, int cols, int rows, float t)
 }
 
 /*
- * update_target — advance scene_time, lerp actual_target toward the
- * raw Lissajous, push into trail buffer.
+ * advance_phase_clock — accumulate scaled wall-clock time.
  *
- * The exponential lerp `actual += (raw − actual) · rate` is a first-
- * order IIR low-pass: sudden velocity changes in the raw target are
- * absorbed into smooth curves the FABRIK solver can track without
- * the joint clamp firing aggressively.
+ *   scene_time is the parametric argument to the Lissajous curve.
+ *   speed_scale lets the user dilate or compress how fast the
+ *   target traces the figure-8 without changing its SHAPE — same
+ *   curve, different rate. dscene = dt · speed_scale.
+ */
+static void advance_phase_clock(Tentacle *t, float dt)
+{
+    t->scene_time += dt * t->speed_scale;
+}
+
+/*
+ * first_order_low_pass — exponential-moving-average smoother.
+ *
+ *   y_new = y_old + (x_raw − y_old) · rate
+ *
+ *   This is the discrete-time form of the first-order linear IIR
+ *   filter y' + (1/τ)·y = (1/τ)·x, with α = dt/τ:
+ *     - α → 0  : output frozen (infinite smoothing)
+ *     - α → 1  : output follows input exactly (no smoothing)
+ *
+ *   We clamp α ∈ [0, 1] so that large dt (e.g. a paused frame) can't
+ *   overshoot. Used here to absorb sudden velocity changes in the
+ *   raw Lissajous output — keeps the IK solver from hitting the
+ *   joint-bend clamp every frame.
+ *
+ *   Reference: Oppenheim & Schafer, "Discrete-Time Signal Processing"
+ *   §3.6 — first-order IIR / leaky integrator.
+ */
+static Vec2 first_order_low_pass(Vec2 current, Vec2 raw, float rate)
+{
+    rate = clampf(rate, 0.0f, 1.0f);
+    return vec2_lerp(current, raw, rate);
+}
+
+/*
+ * update_target — advance the tracking target one tick.
+ *
+ *   1. advance_phase_clock        : scene_time += dt · speed_scale.
+ *   2. sample raw Lissajous       : lissajous_at(anchor, cols, rows, t).
+ *   3. first_order_low_pass       : actual_target → smoothed toward raw.
+ *   4. trail_push                 : circular log for the trail renderer.
+ *
+ *   The smoothed `actual_target` (NOT `raw`) is what FABRIK chases;
+ *   the trail visualises actual_target so users can see the
+ *   smoothed path, not the raw Lissajous skeleton.
  */
 static void update_target(Tentacle *t, float dt, int cols, int rows)
 {
-    t->scene_time += dt * t->speed_scale;
+    advance_phase_clock(t, dt);
 
     Vec2  raw  = lissajous_at(t->anchor, cols, rows, t->scene_time);
-    float rate = clampf(dt * TARGET_SMOOTH, 0.0f, 1.0f);
-    t->actual_target = vec2_lerp(t->actual_target, raw, rate);
+    float rate = dt * TARGET_SMOOTH;
+    t->actual_target = first_order_low_pass(t->actual_target, raw, rate);
 
     trail_push(t, t->actual_target);
 }
@@ -1083,7 +1483,44 @@ static void render_tentacle(const Tentacle *t, WINDOW *w, int cols, int rows)
 /* §6  scene — thin wrapper around Tentacle                              */
 /* ===================================================================== */
 
-typedef struct { Tentacle tentacle; } Scene;
+/*
+ * Scene — composition root for §6.
+ *
+ * Intent
+ *   In this demo the simulation IS one tentacle + one Lissajous
+ *   target. We keep a Scene wrapper anyway so the framework loop
+ *   (scene_init / scene_tick / scene_draw) reads identically to
+ *   every other file in the repo. If a future variant adds e.g.
+ *   obstacles, a second tentacle, or a goal-switcher, those slot
+ *   in here as siblings of `tentacle` without changing the loop.
+ *
+ * Simulation vs Rendering locality
+ *   The Tentacle struct itself already separates JOINT CHAIN (IK
+ *   solver state) from TARGET OSCILLATOR (sim verbs) from TRAIL
+ *   (render-only cache) from REACHABILITY/UI FLAGS. Within Scene
+ *   there is no further split needed yet — one field, one concern.
+ *   When adding a new member, place it as follows:
+ *
+ *     ── Simulation state ──   things scene_tick READS+WRITES
+ *                              (obstacles[], second_target, …)
+ *     ── Render-only state ──  things scene_draw READS, never the
+ *                              physics path (camera, screen-shake, …)
+ *
+ * Things that DO NOT live here
+ *   - fps / sim_fps counters → §8 App (frame-timing concern, not
+ *     part of the world being simulated).
+ *   - terminal extents (cols, rows) → §7 Screen.
+ *   - signal flags (running, need_resize) → §8 App.
+ *
+ * One Scene per program; passed by pointer to every §6 entry point.
+ */
+typedef struct {
+    /* ── Simulation state ─────────────────────────────────────── */
+    Tentacle tentacle;         /* the world: chain + target + trail */
+
+    /* (no render-only state yet — theme_idx + paused live inside
+     *  Tentacle because they're user-toggled by the same keymap)  */
+} Scene;
 
 /*
  * scene_init — place tentacle anchored at screen centre with all joints
@@ -1154,7 +1591,31 @@ static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows)
 /* §7  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal-extent snapshot in CHARACTER CELLS.
+ *
+ * Intent
+ *   Caches the current terminal size so every §6 entry point reads
+ *   (cols, rows) as plain ints rather than re-querying ncurses each
+ *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
+ *   propagated to scene_init via app_do_resize.
+ *
+ * Why a separate struct (not just two ints in App)
+ *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
+ *   except this struct. Carving it out makes screen_resize pure and
+ *   isolates the ncurses dependency from the simulation layer.
+ *
+ * Why cells, not pixels
+ *   ncurses' coordinate system is cells. Pixel space (CELL_W ×
+ *   CELL_H sub-pixels per cell) lives only inside §5 — converted at
+ *   the draw boundary, per the project's "one conversion point" rule.
+ *
+ * References [13] Raymond, NCURSES Programming HOWTO.
+ */
+typedef struct {
+    int cols;   /* terminal width  in CHARACTER CELLS */
+    int rows;   /* terminal height in CHARACTER CELLS */
+} Screen;
 
 /* The non-obvious call here is typeahead(-1): without it, ncurses peeks
  * at stdin during output writes, which can tear frames mid-update. */
@@ -1223,12 +1684,51 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* §8  app                                                                */
 /* ===================================================================== */
 
+/*
+ * App — top-level container; everything outside the world.
+ *
+ * Intent
+ *   Bundles the simulated world (Scene), the host terminal (Screen),
+ *   and the loop-control flags into one record so main() reads as
+ *   four-line phases: init / service signals / step+draw / shutdown.
+ *   Declared file-scope (g_app) so signal handlers — which cannot
+ *   take a user argument — can write `running` and `need_resize`
+ *   without globals scattered through the file.
+ *
+ * Locality of concern
+ *   ── Owned subsystems ── nouns the app composes
+ *      scene       — the world being simulated (§6)
+ *      screen      — the terminal extent it draws to (§7)
+ *
+ *   ── Loop control ─── verbs the loop reads each frame
+ *      time_scale  — wall-clock dt multiplier ([ / ] adjust)
+ *      running     — clear → loop exits; set by SIGINT/SIGTERM
+ *      need_resize — set by SIGWINCH; cleared after Screen refresh
+ *
+ * Why volatile sig_atomic_t (not bool, not int)
+ *   `volatile`    : the compiler must not cache the flag across a
+ *                   signal-handler write — every loop iteration must
+ *                   re-read it from memory.
+ *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
+ *                   signals; a plain `int` could be observed half-
+ *                   written on architectures where stores are split.
+ *   See [13] Raymond §"Signal handling".
+ *
+ * Things that DO NOT live here
+ *   - Wall-clock timestamps / fps counters — main() locals; no
+ *     other code path needs them.
+ *   - Tentacle tuning values (speed_scale, theme_idx) — user-state
+ *     in §5 Tentacle.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    float                 time_scale;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* ── Owned subsystems ─────────────────────────────────────── */
+    Scene  scene;              /* the world (§6)                       */
+    Screen screen;             /* terminal extent (§7)                 */
+
+    /* ── Loop control ─────────────────────────────────────────── */
+    float                 time_scale;   /* dt multiplier; 1.0 = realtime */
+    volatile sig_atomic_t running;      /* main loop predicate            */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH pending               */
 } App;
 
 static App g_app;

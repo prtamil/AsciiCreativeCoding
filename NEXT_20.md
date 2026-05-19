@@ -6,6 +6,7 @@ raster/
 signal/
 particle_systems/
 physics/
+animation/
 fluid/
 grids/
  
@@ -14,4 +15,3 @@ grids/
  We are learning not refactoring. make it count
  
 
- physics/cloth.c next

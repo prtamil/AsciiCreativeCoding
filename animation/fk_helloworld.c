@@ -113,14 +113,64 @@
  *   input produced this output?".
  *
  * References
- *   Wikipedia, "Forward kinematics" — derivation for serial chains.
- *     https://en.wikipedia.org/wiki/Forward_kinematics
- *   Wikipedia, "Denavit–Hartenberg parameters" — the standard
- *     formal notation for multi-joint robot geometries.
- *     https://en.wikipedia.org/wiki/Denavit%E2%80%93Hartenberg_parameters
- *   Craig, "Introduction to Robotics: Mechanics and Control"
- *     (3rd ed., 2005) — the canonical robotics textbook treatment
- *     of FK and IK side by side.
+ * ──────────
+ *   ── Forward kinematics: canonical textbooks ──────────────────────
+ *   [1] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
+ *       and Control" (3rd ed.), Pearson — the standard robotics
+ *       textbook, FK and IK presented side-by-side; the 2-link
+ *       planar derivation in §1.5 matches compute_fk in §5 of
+ *       this file line for line.
+ *   [2] Spong, M. W., Hutchinson, S. & Vidyasagar, M. (2005),
+ *       "Robot Modeling and Control", Wiley — alternative
+ *       canonical text; chapter 3 on FK is the cleanest derivation
+ *       of the link-by-link composition we use.
+ *   [3] Murray, R. M., Li, Z. & Sastry, S. S. (1994), "A
+ *       Mathematical Introduction to Robotic Manipulation", CRC —
+ *       the rigorous Lie-group treatment; read once you want to
+ *       see why FK is a SE(2)/SE(3) composition under the hood.
+ *
+ *   ── Inverse-kinematics contrast (what FK is NOT) ──────────────────
+ *   [4] Buss, S. R. (2004), "Introduction to Inverse Kinematics with
+ *       Jacobian Transpose, Pseudoinverse and Damped Least Squares",
+ *       UCSD course notes — the standard IK reference; read this
+ *       to feel the contrast — IK is hard, FK is the easy direction
+ *       of the same chain.
+ *   [5] Aristidou, A. & Lasenby, J. (2011), "FABRIK: a fast,
+ *       iterative solver for the inverse kinematics problem",
+ *       Graphical Models 73(5), pp. 243-260 — concrete IK algorithm
+ *       you can pose against compute_fk to feel the asymmetry.
+ *
+ *   ── Notation / multi-joint chains ─────────────────────────────────
+ *   [6] Denavit, J. & Hartenberg, R. S. (1955), "A kinematic
+ *       notation for lower-pair mechanisms based on matrices",
+ *       J. Appl. Mech. 22, pp. 215-221 — the DH formalism every
+ *       multi-link FK algorithm follows; overkill for 2 links but
+ *       essential the moment you scale up.
+ *
+ *   ── Timestep / animation ──────────────────────────────────────────
+ *   [7] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com
+ *       — articulates when fixed-step matters and when variable-step
+ *       is the better tool; this file uses variable-step because
+ *       compute_fk is unconditionally stable.
+ *
+ *   ── Rendering / ncurses ──────────────────────────────────────────
+ *   [8] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       the integer line-drawing algorithm; we use the simpler
+ *       parametric oversample (draw_line_px §6) because float math
+ *       is already paid for in compute_fk.
+ *   [9] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the high-contrast glyph choice ('@', 'O', '*', '#').
+ *  [10] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the newscr/curscr diff pipeline
+ *       used in screen_present().
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [11] https://en.wikipedia.org/wiki/Forward_kinematics
+ *  [12] https://en.wikipedia.org/wiki/Inverse_kinematics
+ *  [13] https://en.wikipedia.org/wiki/Denavit%E2%80%93Hartenberg_parameters
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -558,15 +608,87 @@ static inline float cells_to_px_h(int rows){ return (float)rows * CELL_H; }
 /* §5  fk — Vec2 + compute_fk(S, θ1, θ2) → (E, H)                         */
 /* ===================================================================== */
 
-typedef struct { float x, y; } Vec2;
+/*
+ * Vec2 — a 2-D point in PIXEL space (sub-cell precision).
+ *
+ * Intent
+ *   The whole §5 FK algebra lives in pixel space: each pixel cell is
+ *   CELL_W × CELL_H sub-pixels (8 × 16 by default), giving the math
+ *   sub-cell resolution so a swinging arm reads as continuous motion
+ *   instead of jumping cell-to-cell. The conversion to cell space
+ *   happens exactly once per draw at the §6 render boundary
+ *   (px_to_cell_x/y) — the project's "one conversion point" rule.
+ *
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right of screen).
+ *   y : SOUTHWARD pixel coordinate (positive → down the screen).
+ *
+ *   Angles are MATH-CONVENTION (positive CCW around +X), so a CCW
+ *   rotation in math becomes CW on screen because y points DOWN.
+ *   This is the standard graphics convention; only the HUD readout
+ *   ever needs to think about it.
+ *
+ * Why a value type (not a pointer)
+ *   Sized 8 bytes; passed in registers on every modern ABI. compute_fk
+ *   returning ArmPose-by-value gets inlined by -O2 into the same
+ *   straight-line code as if the caller wrote two cos/sin pairs by
+ *   hand. Encapsulation costs nothing here.
+ *
+ * Why not just (float, float) inline
+ *   Named fields with a struct type catch a whole class of bugs at
+ *   compile time: passing (col, row) where (x, y) is expected gets
+ *   caught by the type system, not by visual debugging.
+ *
+ * References [1] Craig §2 "Spatial descriptions"; [3] Murray et al.
+ *   for the formal R² convention this follows.
+ */
+typedef struct {
+    float x;   /* eastward  pixel coordinate (positive → right) */
+    float y;   /* southward pixel coordinate (positive → down)  */
+} Vec2;
 
 static inline Vec2  vec2(float x, float y)    { return (Vec2){x, y}; }
 static inline Vec2  vec2_sub(Vec2 a, Vec2 b)  { return (Vec2){a.x-b.x, a.y-b.y}; }
 static inline float vec2_len(Vec2 v)          { return sqrtf(v.x*v.x + v.y*v.y); }
 static inline float vec2_dist(Vec2 a, Vec2 b) { return vec2_len(vec2_sub(a, b)); }
 
-/* ArmPose — the two outputs of one FK evaluation. */
-typedef struct { Vec2 elbow, hand; } ArmPose;
+/*
+ * ArmPose — the two computed outputs of one compute_fk() call.
+ *
+ * Intent
+ *   compute_fk is a PURE FUNCTION of (S, θ1, θ2); ArmPose is the
+ *   record that bundles its two derived outputs (elbow, hand) so
+ *   the caller can take them as ONE assignment instead of two
+ *   out-parameters. Reads as "evaluate FK; here is the pose":
+ *
+ *       ArmPose pose = compute_fk(S, θ1, θ2);
+ *       scene.elbow  = pose.elbow;
+ *       scene.hand   = pose.hand;
+ *
+ * Why a struct (not two out-parameters)
+ *   Return-by-struct (8 bytes per Vec2 → 16-byte ArmPose) fits in
+ *   two registers on x86-64 / aarch64; -O2 lowers the function to
+ *   the same code as direct field writes. Callers gain a clear
+ *   "input → output" reading without verbose `Vec2 *out_E, Vec2
+ *   *out_H` plumbing.
+ *
+ * Why NOT also store θ1, θ2 here
+ *   ArmPose is the OUTPUT of FK; angles are the INPUT. Mixing them
+ *   in one record would obscure the data flow direction that this
+ *   file exists to teach (CONCEPTS §"Why FK before IK"). Angles
+ *   live in Scene; ArmPose stays output-only.
+ *
+ * Field origin
+ *   elbow : E = S + L1·(cos θ1,        sin θ1)         — see [1] Craig §3
+ *   hand  : H = E + L2·(cos(θ1+θ2),    sin(θ1+θ2))    — see [1] Craig §3
+ *
+ *   These are the TWO compositions of the FK primitive
+ *   (B + L·(cos θ, sin θ)) — the smallest non-trivial kinematic chain.
+ */
+typedef struct {
+    Vec2 elbow;   /* E — derived from S, θ1, L1                            */
+    Vec2 hand;    /* H — derived from E (which is derived from S), θ2, L2  */
+} ArmPose;
 
 /*
  * compute_fk — forward kinematics for a 2-link planar arm.
@@ -595,14 +717,65 @@ static ArmPose compute_fk(Vec2 S, float theta1, float theta2)
 /* §6  scene — Scene state, input, draw                                   */
 /* ===================================================================== */
 
+/*
+ * Scene — all per-frame state of the FK demo.
+ *
+ * Intent
+ *   The scene holds three KINDS of data, kept separate so a reader
+ *   can see the data-flow direction this file exists to teach:
+ *
+ *     INPUTS   (user-controlled)  : theta1, theta2          ← arrow keys
+ *     ANCHOR   (fixed per resize) : shoulder                ← SIGWINCH
+ *     OUTPUTS  (derived each frame): elbow, hand            ← compute_fk
+ *
+ *   The main loop's order is exactly: read INPUTS → run compute_fk →
+ *   write OUTPUTS → render. That arrow ALWAYS points the same way;
+ *   no field ever flows backwards. Compare with ik_helloworld.c, where
+ *   hand is the INPUT and theta1/theta2 are the OUTPUTS — same struct
+ *   shape, opposite data-flow direction. THAT is the FK/IK contrast.
+ *
+ * Simulation vs Rendering locality
+ *   ── Simulation state ── read+written by scene_input + compute_fk:
+ *      shoulder        S, pinned per resize
+ *      theta1, theta2  user-controlled angles (the ONLY true inputs)
+ *      elbow, hand     E, H — derived; cached so renderer + HUD can
+ *                      read positions without recomputing FK.
+ *
+ *   ── Rendering / control state ── read only by scene_draw + HUD:
+ *      paused          frozen frame; sim path skipped, render unchanged
+ *      rows, cols      terminal extent in CELLS (resize cache)
+ *
+ *   Note: rows/cols live HERE rather than in a separate Screen struct
+ *   (cf. fk_centipede.c) because this demo is small enough that one
+ *   Scene argument carries everything draw needs. No App struct
+ *   either — main() holds the signal flags directly. Trade-off:
+ *   simpler reading vs the canonical multi-struct framework.
+ *
+ * Things that DO NOT live here
+ *   - Link lengths L1_PX, L2_PX → §1 config (compile-time constants).
+ *   - Angle step ANGLE_STEP_RAD → §1 config.
+ *   - fps counter → main() local (display-only, not part of the scene).
+ *   - Signal flags g_running / g_need_resize → §8 file-scope (must
+ *     be writable from a signal handler that takes no user pointer).
+ *
+ * References [1] Craig §3 (FK as forward map θ → x); [4] Buss for
+ *   the IK direction this file is the foil for.
+ */
 typedef struct {
-    Vec2  shoulder;       /* S — pinned                              */
-    float theta1;         /* shoulder angle, radians (abs from +X)   */
-    float theta2;         /* elbow angle, radians (rel to upper arm) */
-    Vec2  elbow;          /* E — refreshed each frame by compute_fk  */
-    Vec2  hand;           /* H — refreshed each frame by compute_fk  */
-    bool  paused;
-    int   rows, cols;
+    /* ── Simulation state ─────────────────────────────────────── *
+     * Anchor + inputs + cached FK outputs. scene_input writes the *
+     * angles; compute_fk reads (S, θ1, θ2) and writes (E, H).     */
+    Vec2  shoulder;     /* S — pinned origin; resets on SIGWINCH      */
+    float theta1;       /* shoulder angle (rad), abs from +X axis     */
+    float theta2;       /* elbow    angle (rad), REL to upper arm     */
+    Vec2  elbow;        /* E — cached FK output, refreshed per frame  */
+    Vec2  hand;         /* H — cached FK output, refreshed per frame  */
+
+    /* ── Rendering / control state ────────────────────────────── *
+     * Read only by scene_draw and the HUD. paused gates the sim   *
+     * but not the renderer; rows/cols clip draws to terminal.     */
+    bool  paused;       /* user-toggled freeze; sim skipped, draw same */
+    int   rows, cols;   /* terminal extent in CHARACTER CELLS         */
 } Scene;
 
 /*

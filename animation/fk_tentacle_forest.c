@@ -76,17 +76,67 @@
  *                 Per frame: O(N_TENTACLES · N_SEGS) — 8 · 16 = 128
  *                 sinf/cosf calls, microseconds total.
  *
- * References    :
- *   Reynolds, "Steering Behaviors for Autonomous Characters" (1999) —
- *     framework for stateless analytic motion. The "wander" behaviour
- *     in particular is conceptually the per-segment δθᵢ used here.
- *     https://www.red3d.com/cwr/steer/
- *   Glenn Fiedler, "Fix Your Timestep!" (gafferongames.com) —
- *     articulates when fixed-step matters and when variable step is
- *     the better tool. Non-stiff sin-based sims fall in the latter camp.
- *   Wikipedia, "Forward kinematics" — the chain-of-rotations method
- *     used in tentacle_tick(); accumulating local bends is the joint-
- *     space FK transform restricted to 2-D.
+ * References
+ * ──────────
+ *   ── Forward kinematics (cumulative-angle chains) ─────────────────
+ *   [1] Craig, J. J. (2005), "Introduction to Robotics: Mechanics
+ *       and Control" (3rd ed.), Pearson — the canonical FK textbook;
+ *       Ch. 3 derives the link-by-link composition that
+ *       tentacle_tick() implements in 2-D.
+ *   [2] Spong, M. W., Hutchinson, S. & Vidyasagar, M. (2005), "Robot
+ *       Modeling and Control", Wiley — alternative canonical text;
+ *       Ch. 3 is the cleanest derivation of cumulative-angle FK.
+ *   [3] Denavit, J. & Hartenberg, R. S. (1955), "A kinematic
+ *       notation for lower-pair mechanisms based on matrices",
+ *       J. Appl. Mech. 22, pp. 215-221 — the DH formalism every
+ *       multi-link FK algorithm follows; this file uses a
+ *       restricted 2-D version (one DOF per joint, no twist).
+ *
+ *   ── Procedural / stateless motion ────────────────────────────────
+ *   [4] Reynolds, C. (1999), "Steering Behaviors for Autonomous
+ *       Characters", Game Developers Conference — framework for
+ *       stateless analytic motion. The "wander" behaviour is
+ *       conceptually the per-segment δθᵢ used here.
+ *       https://www.red3d.com/cwr/steer/
+ *   [5] Perlin, K. (1995), "Real Time Responsive Animation with
+ *       Personality", IEEE TVCG 1(1) — argues for closed-form
+ *       sinusoidal animation layers; the per-strand `root_phase` +
+ *       `freq_offset` design follows Perlin's "noise + phase
+ *       stagger" recipe for non-synchronising groups.
+ *
+ *   ── Biological inspiration (continuum mechanics) ─────────────────
+ *   [6] Sumbre, G. et al. (2001), "Control of octopus arm extension
+ *       by a peripheral motor program", Science 293, pp. 1845-1848
+ *       — biological reference for sinusoidal-wave propagation as a
+ *       locomotor primitive in soft-bodied appendages.
+ *   [7] Hirose, S. (1993), "Biologically Inspired Robots: Snake-like
+ *       Locomotors and Manipulators", Oxford — engineering treatment
+ *       of travelling-wave control; the i·PHASE_PER_SEG offset is a
+ *       discrete version of Hirose's "serpenoid curve".
+ *
+ *   ── Timestep / animation ─────────────────────────────────────────
+ *   [8] Fiedler, G. (2004), "Fix Your Timestep!", gafferongames.com —
+ *       articulates when fixed-step matters and when variable-step
+ *       is the better tool; non-stiff sin-based sims fall in the
+ *       latter camp.
+ *
+ *   ── Rendering / ncurses ─────────────────────────────────────────
+ *   [9] Bresenham, J. E. (1965), "Algorithm for computer control of
+ *       a digital plotter", IBM Systems Journal 4(1), pp. 25-30 —
+ *       integer line drawing; we use the simpler parametric
+ *       oversample (draw_segment_dense §5c) because float math is
+ *       already paid for in tentacle_tick.
+ *  [10] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the depth-cued glyph ramp.
+ *  [11] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the newscr/curscr diff pipeline
+ *       used in screen_present().
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [12] https://en.wikipedia.org/wiki/Forward_kinematics
+ *  [13] https://en.wikipedia.org/wiki/Phase_(waves)
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -592,27 +642,99 @@ static inline int px_to_cell_y(float py)
 /* §5  entity — Tentacle: stateless FK chain                             */
 /* ===================================================================== */
 
-/* Vec2 — 2-D position vector in pixel space.
- * x increases eastward; y increases downward (terminal convention). */
-typedef struct { float x, y; } Vec2;
-
 /*
- * Tentacle — one seaweed strand.
+ * Vec2 — a 2-D position in PIXEL space (sub-cell precision).
  *
- * The five state fields divide cleanly into "fixed at init" (all of
- * them) and "computed each frame" (joint[]). No prev/cur snapshot is
- * needed: the entire chain is a closed-form function of wave_time.
+ * Intent
+ *   All §5 FK math lives in pixel space. Each character cell is
+ *   CELL_W × CELL_H sub-pixels (8 × 16), giving sub-cell resolution
+ *   so a swaying tentacle reads as continuous motion instead of
+ *   jumping cell-to-cell. The conversion to cell space happens only
+ *   inside draw_segment_dense (§5c), per the project's "one
+ *   conversion point" rule.
+ *
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right of screen).
+ *   y : SOUTHWARD pixel coordinate (positive → down the screen).
+ *
+ *   Angles are MATH-CONVENTION (positive CCW from +X). Because y
+ *   points DOWN on screen, a math-CCW rotation displays as CW; this
+ *   matters only when reading the −π/2 seed in tentacle_tick (which
+ *   points UP on screen), nowhere else.
+ *
+ * Why a value type
+ *   Sized 8 bytes; passes in registers on every modern ABI. Each
+ *   tentacle stores (N_SEGS+1) joints by value — no allocations,
+ *   cache-friendly.
+ *
+ * Why not just two floats inline in Tentacle
+ *   Named (x, y) gives compile-time type-checking against accidental
+ *   (col, row) confusion and lets tentacle_tick read like the math.
+ *
+ * References [1] Craig §2 "Spatial descriptions".
  */
 typedef struct {
-    /* fixed root anchor (pixel space) */
-    float root_px, root_py;
+    float x;   /* eastward  pixel coordinate (positive → right) */
+    float y;   /* southward pixel coordinate (positive → down)  */
+} Vec2;
 
-    /* per-strand wave constants — set once in scene_init */
-    float root_phase;     /* phase stagger (0..2π)                   */
-    float freq_offset;    /* tiny freq detuning, prevents re-sync     */
+/*
+ * Tentacle — one seaweed strand: a stateless FK chain.
+ *
+ * Intent
+ *   A tentacle is a closed-form function of (wave_time, shared
+ *   amplitude, shared frequency). Each frame the chain is rebuilt
+ *   FROM SCRATCH; no integrator state, no prev/cur snapshots, no
+ *   trail buffer. The math:
+ *
+ *       δθᵢ              = amp · sin((ω + freq_offset)·t
+ *                                    + root_phase + i·PHASE_PER_SEG)
+ *       cumulative_angle = −π/2 + Σᵢ δθᵢ          (−π/2 = straight up)
+ *       joint[i+1]       = joint[i] + seg_len·(cos, sin)(cumulative)
+ *
+ *   The two per-strand wave constants (root_phase, freq_offset) are
+ *   what BREAK lockstep — without them, eight identical chains would
+ *   sway in mechanical synchrony.
+ *
+ * Why "fixed at init" + "computed each frame" split
+ *   The first four fields (root_px, root_py + two wave constants)
+ *   are set ONCE in scene_init and never mutate. The joint[] array
+ *   is the OUTPUT of tentacle_tick() — rewritten in full each frame.
+ *   This split makes the closed-form nature obvious: no state
+ *   crosses frames except wave_time, which lives in Scene.
+ *
+ * Why joint[] stores N_SEGS+1 entries
+ *   A chain with N segments has N+1 joints (one per segment end +
+ *   the root). joint[0] is the fixed root; joint[N_SEGS] is the tip.
+ *
+ * Why freq_offset is symmetric around 0 (set in scene_init)
+ *   So the AVERAGE wave frequency across the forest equals the
+ *   user-tunable `Scene::frequency`. Asymmetric offsets would drift
+ *   the average and confuse the HUD readout.
+ *
+ * Why root_phase is uniformly distributed over [0, 2π)
+ *   Maximises initial desynchronisation (any two strands start
+ *   max-separated in phase). See [5] Perlin §"Noise + phase stagger".
+ *
+ * References [1] Craig §3 (chain FK); [4] Reynolds "wander" for the
+ *   stateless analytic motion pattern; [7] Hirose for the
+ *   travelling-wave (serpenoid) inspiration behind i·PHASE_PER_SEG.
+ */
+typedef struct {
+    /* ── Fixed-at-init: anchor + per-strand wave constants ─────── *
+     * Set ONCE in scene_init; never mutated thereafter. The two   *
+     * wave constants are what give each strand its individual     *
+     * "personality" and prevent forest-wide lockstep.             */
+    float root_px;        /* root x in pixel space (fixed anchor)    */
+    float root_py;        /* root y in pixel space (fixed anchor)    */
+    float root_phase;     /* phase stagger (rad), uniform on [0,2π)  */
+    float freq_offset;    /* tiny freq detuning (rad/s), symmetric   *
+                           * about 0 across the forest               */
 
-    /* joint chain — computed each frame */
-    Vec2  joint[N_SEGS + 1];   /* [0]=root, [N_SEGS]=tip            */
+    /* ── Computed each frame: the FK chain output ──────────────── *
+     * Rewritten in full by tentacle_tick(); no value carries       *
+     * across frames. [0] = root (pinned), [N_SEGS] = tip.          */
+    Vec2  joint[N_SEGS + 1];
 } Tentacle;
 
 /* ── §5a  tentacle_tick ─────────────────────────────────────────────── */
@@ -816,33 +938,83 @@ static void render_tentacle(const Tentacle *t, WINDOW *w,
 /* ===================================================================== */
 
 /*
- * Scene — the tentacle forest. All strands share wave_time, amplitude,
- * frequency, and seg_len_px (recomputed on resize from terminal height).
+ * Scene — the tentacle forest.
+ *
+ * Intent
+ *   The eight tentacles share three wave parameters (wave_time,
+ *   amplitude, frequency) plus a screen-derived seg_len_px. Per-
+ *   strand variation comes only from Tentacle::{root_phase,
+ *   freq_offset} — see Tentacle struct doc. The Scene IS the
+ *   forest: one composition root, scene_init / scene_tick /
+ *   scene_draw all take Scene* and nothing else of the world.
+ *
+ * Why one master clock for the forest
+ *   wave_time is the SINGLE persistent simulation state — all eight
+ *   tentacles read the same clock value each frame. This is what
+ *   makes the simulation closed-form: same wave_time ⇒ same forest,
+ *   regardless of how it got there. Compare with fk_centipede.c
+ *   where each segment has its own trail history.
+ *
+ * Simulation vs Rendering locality
+ *   ── Simulation state ── read+written by scene_tick:
+ *      t[]            N_TENTACLES strands; each holds its FK chain.
+ *      wave_time      Master clock; the ONLY value that crosses
+ *                     frames. Frozen when paused.
+ *      amplitude      Peak per-segment bend (rad). User-tunable
+ *                     via a/d; broadcast to every tentacle each tick.
+ *      frequency      Base oscillation rate (rad/s). User-tunable
+ *                     via w/s; broadcast similarly.
+ *      seg_len_px     Segment length (pixels). Recomputed in
+ *                     scene_init + on resize so tentacles stay
+ *                     proportional to terminal height (~55%).
+ *
+ *   ── Control / render-gate state ──
+ *      paused         Freezes scene_tick (wave_time stops). Render
+ *                     still runs — the forest just sits frozen.
+ *
+ * Why seg_len_px is SIM state (not render state)
+ *   Because it changes the SHAPE the tentacle takes — joint
+ *   positions multiply by it. It's geometry the solver uses, not a
+ *   camera choice. Resize triggers a recompute (in scene_init).
+ *
+ * Why no theme_idx / colour state
+ *   Themes are baked at compile time via §3 color_init(); no
+ *   runtime cycling in this demo. If a future variant adds theme
+ *   cycling, it would slot in next to `paused` as render state.
+ *
+ * Things that DO NOT live here
+ *   - Per-strand wave constants (root_phase, freq_offset) → Tentacle.
+ *   - Tunable defaults (AMP_DEFAULT, FREQ_DEFAULT, FREQ_OFFSET_MAG)
+ *     → §1 config (compile-time constants).
+ *   - fps / time_scale → §8 App (frame-timing concern, not part of
+ *     the world being simulated).
+ *   - Terminal extent (cols, rows) → §7 Screen.
+ *   - Signal flags → §8 App.
+ *
+ * References [1] Craig §3 (chain FK); [4] Reynolds for the
+ *   stateless-motion framework; [8] Fiedler for the timestep choice.
  */
 typedef struct {
-    Tentacle t[N_TENTACLES];
+    /* ── Simulation state ─────────────────────────────────────── */
+    Tentacle t[N_TENTACLES];   /* the forest                        */
+    float wave_time;           /* master sim clock (s)              */
+    float amplitude;           /* peak per-segment bend (rad)       */
+    float frequency;           /* base oscillation rate (rad/s)     */
+    float seg_len_px;          /* segment length (px); from screen  */
 
-    /* shared simulation state */
-    float wave_time;       /* monotonic sim clock (s)                */
-    float amplitude;       /* peak per-segment bend (rad), tunable   */
-    float frequency;       /* base oscillation rate (rad/s), tunable */
-    float seg_len_px;      /* segment length (px), set from screen   */
-
-    bool  paused;
+    /* ── Control / render-gate ────────────────────────────────── */
+    bool  paused;              /* freezes scene_tick; render unchanged */
 } Scene;
 
 /*
  * scene_init — distribute roots evenly along the sea floor and assign
  * per-strand phase + frequency offsets.
  *
- * Non-obvious bits:
+ * Init-site choices (rationale for per-strand wave constants lives
+ * in the Tentacle struct doc):
  *  - Root spacing uses (N_TENTACLES + 1) divisor so no strand sits at
  *    the screen edge — fractions 1/9, 2/9, ... 8/9 give equal margins.
  *  - root_py = bottom − 4 px places roots inside the seabed '~' row.
- *  - root_phase is evenly distributed over [0, 2π) for max initial
- *    desynchronisation.
- *  - freq_offset is centred symmetrically around 0 so the average
- *    frequency equals the user's `frequency` value (no global drift).
  *  - seg_len_px = 55% of screen height divided across N_SEGS — tips
  *    visually terminate near mid-screen even at full sway amplitude.
  */
@@ -918,7 +1090,31 @@ static void scene_draw(const Scene *sc, WINDOW *w, int cols, int rows)
 /* §7  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal-extent snapshot in CHARACTER CELLS.
+ *
+ * Intent
+ *   Caches the current terminal size so every §6 entry point reads
+ *   (cols, rows) as plain ints rather than re-querying ncurses each
+ *   frame. Refreshed only when SIGWINCH sets App::need_resize, then
+ *   propagated to scene_init via app_do_resize.
+ *
+ * Why a separate struct (not just two ints in App)
+ *   Resize logic (endwin + refresh + getmaxyx) touches NOTHING in App
+ *   except this struct. Carving it out makes screen_resize pure and
+ *   isolates the ncurses dependency from the simulation layer.
+ *
+ * Why cells, not pixels
+ *   ncurses' coordinate system is cells. Pixel space (CELL_W ×
+ *   CELL_H sub-pixels per cell) lives only inside §5 — converted at
+ *   the draw boundary, per the project's "one conversion point" rule.
+ *
+ * References [11] Raymond, NCURSES Programming HOWTO.
+ */
+typedef struct {
+    int cols;   /* terminal width  in CHARACTER CELLS */
+    int rows;   /* terminal height in CHARACTER CELLS */
+} Screen;
 
 /* The non-obvious call here is typeahead(-1): without it, ncurses peeks
  * at stdin during output writes, which can tear frames mid-update. */
@@ -986,18 +1182,49 @@ static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 /* ===================================================================== */
 
 /*
- * App — top-level state. File-scope global so signal handlers (no user
- * argument) can write the running / need_resize flags.
+ * App — top-level container; everything outside the forest.
  *
- * volatile sig_atomic_t: volatile prevents register caching across
- * handler writes; sig_atomic_t guarantees atomic read/write on POSIX.
+ * Intent
+ *   Bundles the simulated world (Scene), the host terminal (Screen),
+ *   and the loop-control flags into one record so main() reads as
+ *   four-line phases: init / service signals / step+draw / shutdown.
+ *   Declared file-scope (g_app) so signal handlers — which cannot
+ *   take a user argument — can write `running` and `need_resize`
+ *   without globals scattered through the file.
+ *
+ * Locality of concern
+ *   ── Owned subsystems ── nouns the app composes
+ *      scene       — the world being simulated (§6)
+ *      screen      — the terminal extent it draws to (§7)
+ *
+ *   ── Loop control ─── verbs the loop reads each frame
+ *      time_scale  — wall-clock dt multiplier ([ / ] adjust)
+ *      running     — clear → loop exits; set by SIGINT/SIGTERM
+ *      need_resize — set by SIGWINCH; cleared after Screen refresh
+ *
+ * Why volatile sig_atomic_t (not bool, not int)
+ *   `volatile`    : the compiler must not cache the flag across a
+ *                   signal-handler write — every loop iteration must
+ *                   re-read it from memory.
+ *   `sig_atomic_t`: POSIX-guaranteed atomic with respect to async
+ *                   signals; a plain `int` could be observed half-
+ *                   written on architectures where stores are split.
+ *   See [11] Raymond §"Signal handling".
+ *
+ * Things that DO NOT live here
+ *   - Wall-clock timestamps / fps counters — main() locals; no other
+ *     code path needs them.
+ *   - Forest tuning values — those are user-state in Scene.
  */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    float                 time_scale;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    /* ── Owned subsystems ─────────────────────────────────────── */
+    Scene  scene;              /* the forest (§6)                       */
+    Screen screen;             /* terminal extent (§7)                  */
+
+    /* ── Loop control ─────────────────────────────────────────── */
+    float                 time_scale;   /* dt multiplier; 1.0 = realtime */
+    volatile sig_atomic_t running;      /* main loop predicate            */
+    volatile sig_atomic_t need_resize;  /* SIGWINCH pending               */
 } App;
 
 static App g_app;

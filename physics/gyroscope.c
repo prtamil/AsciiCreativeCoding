@@ -108,7 +108,8 @@
  *   6 CYBER    7 PASTEL   8 TWILIGHT 9 SODIUM   10 ECLIPSE 11 MONO
  *
  * Build:
- *   gcc -std=c11 -O2 -Wall -Wextra physics/gyroscope.c -o gyroscope -lncurses -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra physics/gyroscope.c -o gyroscope -lncurses
+ * -lm
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -257,33 +258,33 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ===================================================================== */
 /* §1  config                                                             */
 /* ===================================================================== */
 
 enum {
-    SIM_FPS_MIN      = 20,
-    SIM_FPS_DEFAULT  = 60,
-    SIM_FPS_MAX      = 120,
-    SIM_FPS_STEP     =  10,
+  SIM_FPS_MIN = 20,
+  SIM_FPS_DEFAULT = 60,
+  SIM_FPS_MAX = 120,
+  SIM_FPS_STEP = 10,
 
-    SUB_STEPS        =   8,   /* RK4 sub-steps per sim tick (stability) */
-    TRAIL_LEN        = 300,   /* polhode trail ring-buffer length        */
-    DISC_PTS         =  32,   /* points on the body-disc equator         */
-    GROUND_PTS       =  48,   /* points on the ground reference ring     */
-    FPS_UPDATE_MS    = 500,
-    N_COLORS         =   7,
-    N_PRESETS        =   8,
+  SUB_STEPS = 8,   /* RK4 sub-steps per sim tick (stability) */
+  TRAIL_LEN = 300, /* polhode trail ring-buffer length        */
+  DISC_PTS = 32,   /* points on the body-disc equator         */
+  GROUND_PTS = 48, /* points on the ground reference ring     */
+  FPS_UPDATE_MS = 500,
+  N_COLORS = 7,
+  N_PRESETS = 8,
 };
 
-#define NS_PER_SEC  1000000000LL
-#define NS_PER_MS   1000000LL
-#define TICK_NS(f)  (NS_PER_SEC / (f))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
 
 /* ── Preset table ────────────────────────────────────────────────────── */
 
@@ -330,13 +331,13 @@ enum {
  *                  symmetric top.
  */
 typedef struct {
-    const char *name;      /* preset display name (HUD row 1)             */
-    float I1, I2, I3;      /* principal moments of inertia                */
-    float omega[3];        /* initial angular velocity, body frame (rad/s)*/
-    float tilt_deg;        /* initial nutation: tilt body-Z from world-Z  */
-    float tilt_axis[3];    /* world axis to tilt around (auto-normalised) */
-    bool  gravity;         /* false=Euler torque-free; true=Lagrange top  */
-    float mgl;             /* mg·l (gravity torque scale, N·m)            */
+  const char *name;   /* preset display name (HUD row 1)             */
+  float I1, I2, I3;   /* principal moments of inertia                */
+  float omega[3];     /* initial angular velocity, body frame (rad/s)*/
+  float tilt_deg;     /* initial nutation: tilt body-Z from world-Z  */
+  float tilt_axis[3]; /* world axis to tilt around (auto-normalised) */
+  bool gravity;       /* false=Euler torque-free; true=Lagrange top  */
+  float mgl;          /* mg·l (gravity torque scale, N·m)            */
 } GPreset;
 
 /*
@@ -388,83 +389,106 @@ typedef struct {
  *   complete intermediate-axis-theorem demo.
  */
 static const GPreset PRESETS[N_PRESETS] = {
-    {   /* Euler's Top */
-        "Euler\\'s Top   (torque-free, symmetric)",
-        2.0f, 2.0f, 1.0f,
-        { 0.8f, 0.0f, 8.0f },
-        18.0f, { 1.0f, 0.0f, 0.0f },
-        false, 0.0f
-    },
-    {   /* Gravity Top */
-        "Gravity Top    (precession + nutation)",
-        2.0f, 2.0f, 1.0f,
-        { 0.0f, 0.0f, 12.0f },
-        25.0f, { 1.0f, 0.0f, 0.0f },
-        true, 1.5f
-    },
-    {   /* Dzhanibekov effect */
-        "Dzhanibekov    (intermediate-axis flip)",
-        1.0f, 2.5f, 3.5f,
-        { 0.05f, 8.0f, 0.05f },
-        10.0f, { 0.0f, 0.0f, 1.0f },
-        false, 0.0f
-    },
-    {   /* Oblate Top — opposite-sign precession from preset 0 */
-        "Oblate Top     (opposite precession)",
-        2.0f, 2.0f, 3.0f,
-        { 0.5f, 0.0f, 5.0f },
-        18.0f, { 1.0f, 0.0f, 0.0f },
-        false, 0.0f
-    },
-    {   /* Sleeping Top — fast spin, almost upright */
-        "Sleeping Top   (fast spin under gravity)",
-        2.0f, 2.0f, 1.0f,
-        { 0.0f, 0.0f, 25.0f },
-        3.0f, { 1.0f, 0.0f, 0.0f },
-        true, 1.5f
-    },
-    {   /* Slow Heavy Top — wide precession, cusped nutation */
-        "Slow Heavy Top (wide precession circles)",
-        2.0f, 2.0f, 1.0f,
-        { 0.0f, 0.0f, 4.0f },
-        40.0f, { 1.0f, 0.0f, 0.0f },
-        true, 2.0f
-    },
-    {   /* Stable Major — asymmetric, spin on max-I axis */
-        "Stable Major   (asym, spin on max-I axis)",
-        1.0f, 2.5f, 3.5f,
-        { 0.05f, 0.05f, 6.0f },
-        15.0f, { 1.0f, 0.0f, 0.0f },
-        false, 0.0f
-    },
-    {   /* Stable Minor — asymmetric, spin on min-I axis */
-        "Stable Minor   (asym, spin on min-I axis)",
-        1.0f, 2.5f, 3.5f,
-        { 6.0f, 0.05f, 0.05f },
-        15.0f, { 0.0f, 0.0f, 1.0f },
-        false, 0.0f
-    },
+    {/* Euler's Top */
+     "Euler\\'s Top   (torque-free, symmetric)",
+     2.0f,
+     2.0f,
+     1.0f,
+     {0.8f, 0.0f, 8.0f},
+     18.0f,
+     {1.0f, 0.0f, 0.0f},
+     false,
+     0.0f},
+    {/* Gravity Top */
+     "Gravity Top    (precession + nutation)",
+     2.0f,
+     2.0f,
+     1.0f,
+     {0.0f, 0.0f, 12.0f},
+     25.0f,
+     {1.0f, 0.0f, 0.0f},
+     true,
+     1.5f},
+    {/* Dzhanibekov effect */
+     "Dzhanibekov    (intermediate-axis flip)",
+     1.0f,
+     2.5f,
+     3.5f,
+     {0.05f, 8.0f, 0.05f},
+     10.0f,
+     {0.0f, 0.0f, 1.0f},
+     false,
+     0.0f},
+    {/* Oblate Top — opposite-sign precession from preset 0 */
+     "Oblate Top     (opposite precession)",
+     2.0f,
+     2.0f,
+     3.0f,
+     {0.5f, 0.0f, 5.0f},
+     18.0f,
+     {1.0f, 0.0f, 0.0f},
+     false,
+     0.0f},
+    {/* Sleeping Top — fast spin, almost upright */
+     "Sleeping Top   (fast spin under gravity)",
+     2.0f,
+     2.0f,
+     1.0f,
+     {0.0f, 0.0f, 25.0f},
+     3.0f,
+     {1.0f, 0.0f, 0.0f},
+     true,
+     1.5f},
+    {/* Slow Heavy Top — wide precession, cusped nutation */
+     "Slow Heavy Top (wide precession circles)",
+     2.0f,
+     2.0f,
+     1.0f,
+     {0.0f, 0.0f, 4.0f},
+     40.0f,
+     {1.0f, 0.0f, 0.0f},
+     true,
+     2.0f},
+    {/* Stable Major — asymmetric, spin on max-I axis */
+     "Stable Major   (asym, spin on max-I axis)",
+     1.0f,
+     2.5f,
+     3.5f,
+     {0.05f, 0.05f, 6.0f},
+     15.0f,
+     {1.0f, 0.0f, 0.0f},
+     false,
+     0.0f},
+    {/* Stable Minor — asymmetric, spin on min-I axis */
+     "Stable Minor   (asym, spin on min-I axis)",
+     1.0f,
+     2.5f,
+     3.5f,
+     {6.0f, 0.05f, 0.05f},
+     15.0f,
+     {0.0f, 0.0f, 1.0f},
+     false,
+     0.0f},
 };
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ===================================================================== */
@@ -477,15 +501,15 @@ static void clock_sleep_ns(int64_t ns)
  * these enum names; theme cycling re-runs init_pair() to remap them.
  */
 enum {
-    CP_AXIS_X  = 1,   /* body X axis                                     */
-    CP_AXIS_Y  = 2,   /* body Y axis                                     */
-    CP_AXIS_Z  = 3,   /* body Z axis (spin axis — most prominent)        */
-    CP_MOM     = 4,   /* angular momentum L                              */
-    CP_GROUND  = 5,   /* ground ring + world-Z reference (rendered A_DIM)*/
-    CP_TRAIL   = 6,   /* polhode trail                                   */
-    CP_DISC    = 7,   /* body-disc equator                               */
-    PAIR_HUD   = 8,   /* HUD parameter line (yellow, canonical)          */
-    PAIR_HINT  = 9,   /* key-legend line (cyan, canonical)               */
+  CP_AXIS_X = 1, /* body X axis                                     */
+  CP_AXIS_Y = 2, /* body Y axis                                     */
+  CP_AXIS_Z = 3, /* body Z axis (spin axis — most prominent)        */
+  CP_MOM = 4,    /* angular momentum L                              */
+  CP_GROUND = 5, /* ground ring + world-Z reference (rendered A_DIM)*/
+  CP_TRAIL = 6,  /* polhode trail                                   */
+  CP_DISC = 7,   /* body-disc equator                               */
+  PAIR_HUD = 8,  /* HUD parameter line (yellow, canonical)          */
+  PAIR_HINT = 9, /* key-legend line (cyan, canonical)               */
 };
 
 /*
@@ -529,28 +553,65 @@ enum {
  * 232-239) AND the "lowest tier only" zone (24-29 / 240-243).
  */
 typedef struct {
-    const char *name;
-    short       ramp[8];   /* 8-step bipolar gradient (cool → bright → warm) */
-    short       trail;     /* dedicated polhode trail color                  */
-    short       sky;       /* unused in gyroscope; kept for table parity     */
+  const char *name;
+  short ramp[8]; /* 8-step bipolar gradient (cool → bright → warm) */
+  short trail;   /* dedicated polhode trail color                  */
+  short sky;     /* unused in gyroscope; kept for table parity     */
 } Theme;
 
 #define N_THEMES 12
 
 static const Theme THEMES[N_THEMES] = {
-    /*  name        ramp[0..7]  (cool extreme → neutral → warm extreme)        trail sky */
-    { "VOLT",     {  81, 117, 123, 159, 230, 220, 214, 203 },                  250,  246 }, /* electric blue → yellow → red (tri)     */
-    { "COPPER",   { 110, 117, 153, 195, 230, 222, 215, 209 },                  250,  246 }, /* steel blue → cream → copper red (di)   */
-    { "NEON",     {  75, 117, 159, 195, 230, 218, 213, 205 },                  250,  246 }, /* blue → cyan → pink (tri)               */
-    { "ICE_FIRE", {  81, 117, 159, 195, 230, 215, 209, 196 },                  250,  246 }, /* ice blue → flame red (di, classic)     */
-    { "AURORA",   {  84, 120, 156, 195, 230, 218, 213, 205 },                  250,  246 }, /* green → pink (di, aurora-like)         */
-    { "VIOLET",   {  99, 141, 177, 219, 230, 224, 217, 203 },                  250,  246 }, /* violet → red (di)                      */
-    { "CYBER",    {  82, 120, 158, 195, 230, 220, 215, 197 },                  250,  246 }, /* green → cyan → red (tri)               */
-    { "PASTEL",   { 117, 153, 195, 219, 230, 224, 218, 211 },                  250,  246 }, /* soft blue → soft pink (di, all light)  */
-    { "TWILIGHT", {  99, 141, 177, 219, 230, 217, 215, 203 },                  250,  246 }, /* indigo → coral (di)                    */
-    { "SODIUM",   { 215, 222, 215, 230, 195, 159, 123, 117 },                  250,  246 }, /* sodium amber → mercury cyan (di, rev)  */
-    { "ECLIPSE",  { 247, 250, 252, 253, 203, 209, 215, 220 },                  250,  246 }, /* light gray → corona gold (di)          */
-    { "MONO",     { 247, 248, 250, 251, 252, 253, 254, 255 },                  250,  246 }, /* bright grayscale reference             */
+    /*  name        ramp[0..7]  (cool extreme → neutral → warm extreme) trail
+       sky */
+    {"VOLT",
+     {81, 117, 123, 159, 230, 220, 214, 203},
+     250,
+     246}, /* electric blue → yellow → red (tri)     */
+    {"COPPER",
+     {110, 117, 153, 195, 230, 222, 215, 209},
+     250,
+     246}, /* steel blue → cream → copper red (di)   */
+    {"NEON",
+     {75, 117, 159, 195, 230, 218, 213, 205},
+     250,
+     246}, /* blue → cyan → pink (tri)               */
+    {"ICE_FIRE",
+     {81, 117, 159, 195, 230, 215, 209, 196},
+     250,
+     246}, /* ice blue → flame red (di, classic)     */
+    {"AURORA",
+     {84, 120, 156, 195, 230, 218, 213, 205},
+     250,
+     246}, /* green → pink (di, aurora-like)         */
+    {"VIOLET",
+     {99, 141, 177, 219, 230, 224, 217, 203},
+     250,
+     246}, /* violet → red (di)                      */
+    {"CYBER",
+     {82, 120, 158, 195, 230, 220, 215, 197},
+     250,
+     246}, /* green → cyan → red (tri)               */
+    {"PASTEL",
+     {117, 153, 195, 219, 230, 224, 218, 211},
+     250,
+     246}, /* soft blue → soft pink (di, all light)  */
+    {"TWILIGHT",
+     {99, 141, 177, 219, 230, 217, 215, 203},
+     250,
+     246}, /* indigo → coral (di)                    */
+    {"SODIUM",
+     {215, 222, 215, 230, 195, 159, 123, 117},
+     250,
+     246}, /* sodium amber → mercury cyan (di, rev)  */
+    {"ECLIPSE",
+     {247, 250, 252, 253, 203, 209, 215, 220},
+     250,
+     246}, /* light gray → corona gold (di)          */
+    {"MONO",
+     {247, 248, 250, 251, 252, 253, 254, 255},
+     250,
+     246}, /* bright grayscale reference             */
 };
 
 /*
@@ -564,40 +625,39 @@ static const Theme THEMES[N_THEMES] = {
  * 8-color fallback uses standard ANSI colours; cycling has no effect
  * on terminals that can't reach the 256-cube.
  */
-static void color_apply_theme(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    const Theme *th = &THEMES[idx];
-    if (COLORS >= 256) {
-        /* Bipolar ramp → role mapping (see Theme docstring above) */
-        init_pair(CP_AXIS_X, th->ramp[1], -1);   /* cool side mid          */
-        init_pair(CP_AXIS_Y, th->ramp[6], -1);   /* warm side mid          */
-        init_pair(CP_AXIS_Z, th->ramp[7], -1);   /* warm extreme — spin    */
-        init_pair(CP_MOM,    th->ramp[0], -1);   /* cool extreme — L       */
-        init_pair(CP_GROUND, th->ramp[3], -1);   /* cool neutral (A_DIM)   */
-        init_pair(CP_TRAIL,  th->trail,   -1);   /* dedicated trail colour */
-        init_pair(CP_DISC,   th->ramp[4], -1);   /* warm neutral (A_DIM)   */
-        init_pair(PAIR_HUD,  226, -1);
-        init_pair(PAIR_HINT,  51, -1);
-    } else {
-        /* 8-color fallback: keep axes distinguishable on legacy terminals */
-        init_pair(CP_AXIS_X, COLOR_BLUE,    -1);   /* cool side             */
-        init_pair(CP_AXIS_Y, COLOR_YELLOW,  -1);   /* warm side             */
-        init_pair(CP_AXIS_Z, COLOR_RED,     -1);   /* warm extreme — spin   */
-        init_pair(CP_MOM,    COLOR_CYAN,    -1);   /* cool extreme — L      */
-        init_pair(CP_GROUND, COLOR_WHITE,   -1);
-        init_pair(CP_TRAIL,  COLOR_MAGENTA, -1);
-        init_pair(CP_DISC,   COLOR_GREEN,   -1);
-        init_pair(PAIR_HUD,  COLOR_YELLOW,  -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,    -1);
-    }
+static void color_apply_theme(int idx) {
+  if (idx < 0 || idx >= N_THEMES)
+    idx = 0;
+  const Theme *th = &THEMES[idx];
+  if (COLORS >= 256) {
+    /* Bipolar ramp → role mapping (see Theme docstring above) */
+    init_pair(CP_AXIS_X, th->ramp[1], -1); /* cool side mid          */
+    init_pair(CP_AXIS_Y, th->ramp[6], -1); /* warm side mid          */
+    init_pair(CP_AXIS_Z, th->ramp[7], -1); /* warm extreme — spin    */
+    init_pair(CP_MOM, th->ramp[0], -1);    /* cool extreme — L       */
+    init_pair(CP_GROUND, th->ramp[3], -1); /* cool neutral (A_DIM)   */
+    init_pair(CP_TRAIL, th->trail, -1);    /* dedicated trail colour */
+    init_pair(CP_DISC, th->ramp[4], -1);   /* warm neutral (A_DIM)   */
+    init_pair(PAIR_HUD, 226, -1);
+    init_pair(PAIR_HINT, 51, -1);
+  } else {
+    /* 8-color fallback: keep axes distinguishable on legacy terminals */
+    init_pair(CP_AXIS_X, COLOR_BLUE, -1);   /* cool side             */
+    init_pair(CP_AXIS_Y, COLOR_YELLOW, -1); /* warm side             */
+    init_pair(CP_AXIS_Z, COLOR_RED, -1);    /* warm extreme — spin   */
+    init_pair(CP_MOM, COLOR_CYAN, -1);      /* cool extreme — L      */
+    init_pair(CP_GROUND, COLOR_WHITE, -1);
+    init_pair(CP_TRAIL, COLOR_MAGENTA, -1);
+    init_pair(CP_DISC, COLOR_GREEN, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
-static void color_init(int theme)
-{
-    start_color();
-    use_default_colors();
-    color_apply_theme(theme);
+static void color_init(int theme) {
+  start_color();
+  use_default_colors();
+  color_apply_theme(theme);
 }
 
 /* ===================================================================== */
@@ -617,67 +677,68 @@ static void color_init(int theme)
  *   2. Elevation θ: tilt the scene so the viewer is above the horizon.
  * Depth (sz) is used for depth-cueing (A_BOLD for near, A_DIM for far).
  */
-#define CELL_W   8
-#define CELL_H  16
-#define ASPECT   ((float)CELL_W / (float)CELL_H)   /* ≈ 0.5 */
+#define CELL_W 8
+#define CELL_H 16
+#define ASPECT ((float)CELL_W / (float)CELL_H) /* ≈ 0.5 */
 
-static void project(float wx, float wy, float wz,
-                    float phi, float theta, float scale,
-                    int cx, int cy,
-                    int *col, int *row, float *depth)
-{
-    float rx =  wx * cosf(phi) + wy * sinf(phi);
-    float ry = -wx * sinf(phi) + wy * cosf(phi);
+static void project(float wx, float wy, float wz, float phi, float theta,
+                    float scale, int cx, int cy, int *col, int *row,
+                    float *depth) {
+  float rx = wx * cosf(phi) + wy * sinf(phi);
+  float ry = -wx * sinf(phi) + wy * cosf(phi);
 
-    float sx  = rx;
-    float sy  = ry * cosf(theta) + wz * sinf(theta);
-    *depth    = -ry * sinf(theta) + wz * cosf(theta);
+  float sx = rx;
+  float sy = ry * cosf(theta) + wz * sinf(theta);
+  *depth = -ry * sinf(theta) + wz * cosf(theta);
 
-    *col = cx + (int)roundf(sx * scale);
-    *row = cy - (int)roundf(sy * scale * ASPECT);
+  *col = cx + (int)roundf(sx * scale);
+  *row = cy - (int)roundf(sy * scale * ASPECT);
 }
 
 /* Direction-aware character for a 2-D segment angle */
-static char dir_char(float angle)
-{
-    float a = fmodf(angle, (float)M_PI);
-    if (a < 0.0f) a += (float)M_PI;
-    if (a < (float)M_PI / 8.0f || a >= 7.0f * (float)M_PI / 8.0f) return '-';
-    if (a < 3.0f * (float)M_PI / 8.0f) return '/';
-    if (a < 5.0f * (float)M_PI / 8.0f) return '|';
-    return '\\';
+static char dir_char(float angle) {
+  float a = fmodf(angle, (float)M_PI);
+  if (a < 0.0f)
+    a += (float)M_PI;
+  if (a < (float)M_PI / 8.0f || a >= 7.0f * (float)M_PI / 8.0f)
+    return '-';
+  if (a < 3.0f * (float)M_PI / 8.0f)
+    return '/';
+  if (a < 5.0f * (float)M_PI / 8.0f)
+    return '|';
+  return '\\';
 }
 
 /* Draw a 3-D line segment (from origin to endpoint) using DDA */
-static void draw_seg3d(WINDOW *w,
-                       float ox3, float oy3, float oz3,
-                       float ex3, float ey3, float ez3,
-                       float phi, float theta, float scale,
-                       int cx, int cy, int cols, int rows,
-                       chtype attr)
-{
-    int c0, r0; float d0;
-    int c1, r1; float d1;
-    project(ox3, oy3, oz3, phi, theta, scale, cx, cy, &c0, &r0, &d0);
-    project(ex3, ey3, ez3, phi, theta, scale, cx, cy, &c1, &r1, &d1);
+static void draw_seg3d(WINDOW *w, float ox3, float oy3, float oz3, float ex3,
+                       float ey3, float ez3, float phi, float theta,
+                       float scale, int cx, int cy, int cols, int rows,
+                       chtype attr) {
+  int c0, r0;
+  float d0;
+  int c1, r1;
+  float d1;
+  project(ox3, oy3, oz3, phi, theta, scale, cx, cy, &c0, &r0, &d0);
+  project(ex3, ey3, ez3, phi, theta, scale, cx, cy, &c1, &r1, &d1);
 
-    float ang = atan2f((float)(r1 - r0), (float)(c1 - c0));
-    char  ch  = dir_char(ang);
+  float ang = atan2f((float)(r1 - r0), (float)(c1 - c0));
+  char ch = dir_char(ang);
 
-    int dx = c1 - c0, dy = r1 - r0;
-    int steps = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
-    if (steps < 1) steps = 1;
+  int dx = c1 - c0, dy = r1 - r0;
+  int steps = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
+  if (steps < 1)
+    steps = 1;
 
-    for (int i = 0; i <= steps; i++) {
-        float t  = (float)i / (float)steps;
-        int   c  = c0 + (int)roundf(dx * t);
-        int   r  = r0 + (int)roundf(dy * t);
-        if (c >= 0 && c < cols && r >= 1 && r < rows - 1) {
-            wattron(w, attr);
-            mvwaddch(w, r, c, (chtype)(unsigned char)ch);
-            wattroff(w, attr);
-        }
+  for (int i = 0; i <= steps; i++) {
+    float t = (float)i / (float)steps;
+    int c = c0 + (int)roundf(dx * t);
+    int r = r0 + (int)roundf(dy * t);
+    if (c >= 0 && c < cols && r >= 1 && r < rows - 1) {
+      wattron(w, attr);
+      mvwaddch(w, r, c, (chtype)(unsigned char)ch);
+      wattroff(w, attr);
     }
+  }
 }
 
 /* ===================================================================== */
@@ -708,19 +769,21 @@ static void draw_seg3d(WINDOW *w,
  *   intermediate state to evaluate k₂, k₃, k₄; integrating them in
  *   two separate passes would break the implicit coupling.
  */
-typedef struct { float v[7]; } State7;
+typedef struct {
+  float v[7];
+} State7;
 
-static State7 s7_add(State7 a, State7 b)
-{
-    State7 r;
-    for (int i = 0; i < 7; i++) r.v[i] = a.v[i] + b.v[i];
-    return r;
+static State7 s7_add(State7 a, State7 b) {
+  State7 r;
+  for (int i = 0; i < 7; i++)
+    r.v[i] = a.v[i] + b.v[i];
+  return r;
 }
-static State7 s7_scale(State7 a, float s)
-{
-    State7 r;
-    for (int i = 0; i < 7; i++) r.v[i] = a.v[i] * s;
-    return r;
+static State7 s7_scale(State7 a, float s) {
+  State7 r;
+  for (int i = 0; i < 7; i++)
+    r.v[i] = a.v[i] * s;
+  return r;
 }
 
 /* ── physics building blocks (consumed by gyro_deriv below) ───────── */
@@ -738,13 +801,11 @@ static State7 s7_scale(State7 a, float s)
  * its own axis), so only tau_x and tau_y are returned.
  */
 static void gravity_torque_body_frame(float qw, float qx, float qy, float qz,
-                                       float mgl,
-                                       float *tau_x, float *tau_y)
-{
-    float gz_bx = 2.0f * (qx * qz - qw * qy);
-    float gz_by = 2.0f * (qy * qz + qw * qx);
-    *tau_x =  mgl * gz_by;
-    *tau_y = -mgl * gz_bx;
+                                      float mgl, float *tau_x, float *tau_y) {
+  float gz_bx = 2.0f * (qx * qz - qw * qy);
+  float gz_by = 2.0f * (qy * qz + qw * qx);
+  *tau_x = mgl * gz_by;
+  *tau_y = -mgl * gz_bx;
 }
 
 /*
@@ -759,14 +820,13 @@ static void gravity_torque_body_frame(float qw, float qx, float qy, float qz,
  * them you get Euler precession, nutation, AND the intermediate-axis
  * instability [3] for free.
  */
-static void euler_equations_omega_dot(float I1, float I2, float I3,
-                                       float wx, float wy, float wz,
-                                       float tau_x, float tau_y,
-                                       float *dwx, float *dwy, float *dwz)
-{
-    *dwx = ((I2 - I3) * wy * wz + tau_x) / I1;
-    *dwy = ((I3 - I1) * wz * wx + tau_y) / I2;
-    *dwz = ((I1 - I2) * wx * wy)          / I3;
+static void euler_equations_omega_dot(float I1, float I2, float I3, float wx,
+                                      float wy, float wz, float tau_x,
+                                      float tau_y, float *dwx, float *dwy,
+                                      float *dwz) {
+  *dwx = ((I2 - I3) * wy * wz + tau_x) / I1;
+  *dwy = ((I3 - I1) * wz * wx + tau_y) / I2;
+  *dwz = ((I1 - I2) * wx * wy) / I3;
 }
 
 /*
@@ -785,14 +845,12 @@ static void euler_equations_omega_dot(float I1, float I2, float I3,
  * after each integration step.
  */
 static void quaternion_kinematics(float qw, float qx, float qy, float qz,
-                                   float wx, float wy, float wz,
-                                   float *dqw, float *dqx,
-                                   float *dqy, float *dqz)
-{
-    *dqw = 0.5f * (-qx * wx - qy * wy - qz * wz);
-    *dqx = 0.5f * ( qw * wx + qy * wz - qz * wy);
-    *dqy = 0.5f * ( qw * wy - qx * wz + qz * wx);
-    *dqz = 0.5f * ( qw * wz + qx * wy - qy * wx);
+                                  float wx, float wy, float wz, float *dqw,
+                                  float *dqx, float *dqy, float *dqz) {
+  *dqw = 0.5f * (-qx * wx - qy * wy - qz * wz);
+  *dqx = 0.5f * (qw * wx + qy * wz - qz * wy);
+  *dqy = 0.5f * (qw * wy - qx * wz + qz * wx);
+  *dqz = 0.5f * (qw * wz + qx * wy - qy * wx);
 }
 
 /*
@@ -807,32 +865,35 @@ static void quaternion_kinematics(float qw, float qx, float qy, float qz,
  *   3. quaternion kinematics → q̇
  *   4. pack ω̇ and q̇ into State7
  */
-static State7 gyro_deriv(State7 s, float I1, float I2, float I3,
-                          float mgl, bool gravity)
-{
-    float wx = s.v[0], wy = s.v[1], wz = s.v[2];
-    float qw = s.v[3], qx = s.v[4], qy = s.v[5], qz = s.v[6];
+static State7 gyro_deriv(State7 s, float I1, float I2, float I3, float mgl,
+                         bool gravity) {
+  float wx = s.v[0], wy = s.v[1], wz = s.v[2];
+  float qw = s.v[3], qx = s.v[4], qy = s.v[5], qz = s.v[6];
 
-    /* 1. external torque (Lagrange-top gravity, or zero) */
-    float tau_x = 0.0f, tau_y = 0.0f;
-    if (gravity)
-        gravity_torque_body_frame(qw, qx, qy, qz, mgl, &tau_x, &tau_y);
+  /* 1. external torque (Lagrange-top gravity, or zero) */
+  float tau_x = 0.0f, tau_y = 0.0f;
+  if (gravity)
+    gravity_torque_body_frame(qw, qx, qy, qz, mgl, &tau_x, &tau_y);
 
-    /* 2. Euler's equations → angular acceleration */
-    float dwx, dwy, dwz;
-    euler_equations_omega_dot(I1, I2, I3, wx, wy, wz, tau_x, tau_y,
-                              &dwx, &dwy, &dwz);
+  /* 2. Euler's equations → angular acceleration */
+  float dwx, dwy, dwz;
+  euler_equations_omega_dot(I1, I2, I3, wx, wy, wz, tau_x, tau_y, &dwx, &dwy,
+                            &dwz);
 
-    /* 3. quaternion kinematics → quaternion rate */
-    float dqw, dqx, dqy, dqz;
-    quaternion_kinematics(qw, qx, qy, qz, wx, wy, wz,
-                          &dqw, &dqx, &dqy, &dqz);
+  /* 3. quaternion kinematics → quaternion rate */
+  float dqw, dqx, dqy, dqz;
+  quaternion_kinematics(qw, qx, qy, qz, wx, wy, wz, &dqw, &dqx, &dqy, &dqz);
 
-    /* 4. pack into State7 (same positional layout as input s) */
-    State7 d;
-    d.v[0]=dwx; d.v[1]=dwy; d.v[2]=dwz;
-    d.v[3]=dqw; d.v[4]=dqx; d.v[5]=dqy; d.v[6]=dqz;
-    return d;
+  /* 4. pack into State7 (same positional layout as input s) */
+  State7 d;
+  d.v[0] = dwx;
+  d.v[1] = dwy;
+  d.v[2] = dwz;
+  d.v[3] = dqw;
+  d.v[4] = dqx;
+  d.v[5] = dqy;
+  d.v[6] = dqz;
+  return d;
 }
 
 /* ── quaternion → rotation axes ─────────────────────────────────────── */
@@ -847,21 +908,20 @@ static State7 gyro_deriv(State7 s, float I1, float I2, float I3,
  *
  * Standard formula from unit quaternion q = (qw, qx, qy, qz):
  */
-static void quat_to_axes(const float q[4],
-                          float ex[3], float ey[3], float ez[3])
-{
-    float qw=q[0], qx=q[1], qy=q[2], qz=q[3];
-    ex[0] = 1.0f - 2.0f*(qy*qy + qz*qz);
-    ex[1] = 2.0f*(qx*qy + qw*qz);
-    ex[2] = 2.0f*(qx*qz - qw*qy);
+static void quat_to_axes(const float q[4], float ex[3], float ey[3],
+                         float ez[3]) {
+  float qw = q[0], qx = q[1], qy = q[2], qz = q[3];
+  ex[0] = 1.0f - 2.0f * (qy * qy + qz * qz);
+  ex[1] = 2.0f * (qx * qy + qw * qz);
+  ex[2] = 2.0f * (qx * qz - qw * qy);
 
-    ey[0] = 2.0f*(qx*qy - qw*qz);
-    ey[1] = 1.0f - 2.0f*(qx*qx + qz*qz);
-    ey[2] = 2.0f*(qy*qz + qw*qx);
+  ey[0] = 2.0f * (qx * qy - qw * qz);
+  ey[1] = 1.0f - 2.0f * (qx * qx + qz * qz);
+  ey[2] = 2.0f * (qy * qz + qw * qx);
 
-    ez[0] = 2.0f*(qx*qz + qw*qy);
-    ez[1] = 2.0f*(qy*qz - qw*qx);
-    ez[2] = 1.0f - 2.0f*(qx*qx + qy*qy);
+  ez[0] = 2.0f * (qx * qz + qw * qy);
+  ez[1] = 2.0f * (qy * qz - qw * qx);
+  ez[2] = 1.0f - 2.0f * (qx * qx + qy * qy);
 }
 
 /*
@@ -875,22 +935,31 @@ static void quat_to_axes(const float q[4],
  *   e2 ← normalize(e2 − (e2·e1)·e1)
  *   e3 ← e1 × e2                       (always exactly orthogonal)
  */
-static void gram_schmidt(float e1[3], float e2[3], float e3[3])
-{
-    /* Normalise e1 */
-    float n = sqrtf(e1[0]*e1[0] + e1[1]*e1[1] + e1[2]*e1[2]);
-    if (n > 1e-9f) { e1[0]/=n; e1[1]/=n; e1[2]/=n; }
+static void gram_schmidt(float e1[3], float e2[3], float e3[3]) {
+  /* Normalise e1 */
+  float n = sqrtf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+  if (n > 1e-9f) {
+    e1[0] /= n;
+    e1[1] /= n;
+    e1[2] /= n;
+  }
 
-    /* Remove e1 component from e2, normalise */
-    float d = e2[0]*e1[0] + e2[1]*e1[1] + e2[2]*e1[2];
-    e2[0] -= d*e1[0]; e2[1] -= d*e1[1]; e2[2] -= d*e1[2];
-    n = sqrtf(e2[0]*e2[0] + e2[1]*e2[1] + e2[2]*e2[2]);
-    if (n > 1e-9f) { e2[0]/=n; e2[1]/=n; e2[2]/=n; }
+  /* Remove e1 component from e2, normalise */
+  float d = e2[0] * e1[0] + e2[1] * e1[1] + e2[2] * e1[2];
+  e2[0] -= d * e1[0];
+  e2[1] -= d * e1[1];
+  e2[2] -= d * e1[2];
+  n = sqrtf(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
+  if (n > 1e-9f) {
+    e2[0] /= n;
+    e2[1] /= n;
+    e2[2] /= n;
+  }
 
-    /* e3 = e1 × e2 (guaranteed orthonormal) */
-    e3[0] = e1[1]*e2[2] - e1[2]*e2[1];
-    e3[1] = e1[2]*e2[0] - e1[0]*e2[2];
-    e3[2] = e1[0]*e2[1] - e1[1]*e2[0];
+  /* e3 = e1 × e2 (guaranteed orthonormal) */
+  e3[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  e3[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  e3[2] = e1[0] * e2[1] - e1[1] * e2[0];
 }
 
 /* ── trail ring-buffer ───────────────────────────────────────────────── */
@@ -911,7 +980,9 @@ static void gram_schmidt(float e1[3], float e2[3], float e3[3])
  * stale), (b) the user toggles trail off, (c) preset switch / reset
  * (the polhode belongs to the previous body state).
  */
-typedef struct { int col, row; } TrailPt;
+typedef struct {
+  int col, row;
+} TrailPt;
 
 /* ─────────────────────────────────────────────────────────────────────── *
  * Gyro — the complete state of one rigid-body simulation.
@@ -972,38 +1043,38 @@ typedef struct { int col, row; } TrailPt;
  *                       pointer.
  * ─────────────────────────────────────────────────────────────────────── */
 typedef struct {
-    /* ── Physics state (integrated by gyro_step) ──────────────────── */
-    float omega[3];           /* angular velocity in body frame (rad/s)   */
-    float quat[4];            /* orientation quaternion [qw,qx,qy,qz];
-                               * |q|=1 maintained by post-step projection */
+  /* ── Physics state (integrated by gyro_step) ──────────────────── */
+  float omega[3]; /* angular velocity in body frame (rad/s)   */
+  float quat[4];  /* orientation quaternion [qw,qx,qy,qz];
+                   * |q|=1 maintained by post-step projection */
 
-    /* ── Derived (recomputed in gyro_step from quat / omega) ──────── */
-    float ex[3];              /* body X axis in world frame               */
-    float ey[3];              /* body Y axis in world frame               */
-    float ez[3];              /* body Z axis (spin axis) in world frame   */
-    float L[3];               /* angular momentum L = Σ Ii·ωi·ei (world)  */
+  /* ── Derived (recomputed in gyro_step from quat / omega) ──────── */
+  float ex[3]; /* body X axis in world frame               */
+  float ey[3]; /* body Y axis in world frame               */
+  float ez[3]; /* body Z axis (spin axis) in world frame   */
+  float L[3];  /* angular momentum L = Σ Ii·ωi·ei (world)  */
 
-    /* ── Body parameters (loaded from active GPreset) ─────────────── */
-    float I1, I2, I3;         /* principal moments of inertia (kg·m²)     */
+  /* ── Body parameters (loaded from active GPreset) ─────────────── */
+  float I1, I2, I3; /* principal moments of inertia (kg·m²)     */
 
-    bool  gravity;            /* false → Euler torque-free
-                               * true  → Lagrange top, gravity torque on  */
-    float mgl;                /* mass·g·l, gravity-torque scale (N·m)     */
+  bool gravity; /* false → Euler torque-free
+                 * true  → Lagrange top, gravity torque on  */
+  float mgl;    /* mass·g·l, gravity-torque scale (N·m)     */
 
-    /* ── Polhode trail (ring buffer in SCREEN space) ──────────────── */
-    TrailPt trail[TRAIL_LEN]; /* body-Z tip positions, oldest first       */
-    int     trail_head;       /* next-write index (mod TRAIL_LEN)         */
-    int     trail_fill;       /* live entries; saturates at TRAIL_LEN     */
-    bool    show_trail;       /* l / L toggles                            */
+  /* ── Polhode trail (ring buffer in SCREEN space) ──────────────── */
+  TrailPt trail[TRAIL_LEN]; /* body-Z tip positions, oldest first       */
+  int trail_head;           /* next-write index (mod TRAIL_LEN)         */
+  int trail_fill;           /* live entries; saturates at TRAIL_LEN     */
+  bool show_trail;          /* l / L toggles                            */
 
-    /* ── View camera (preserved across r-reset) ───────────────────── */
-    float   view_phi;         /* azimuth, radians; auto-rotates slowly    */
-    float   view_theta;       /* elevation, radians; clamped to [0.1,1.4] */
+  /* ── View camera (preserved across r-reset) ───────────────────── */
+  float view_phi;   /* azimuth, radians; auto-rotates slowly    */
+  float view_theta; /* elevation, radians; clamped to [0.1,1.4] */
 
-    /* ── Control flags ────────────────────────────────────────────── */
-    int     preset;           /* active index into PRESETS[]; n / p cycle */
-    bool    paused;           /* space toggles; scene_tick is a no-op
-                               * when true                                */
+  /* ── Control flags ────────────────────────────────────────────── */
+  int preset;  /* active index into PRESETS[]; n / p cycle */
+  bool paused; /* space toggles; scene_tick is a no-op
+                * when true                                */
 } Gyro;
 
 /* ── initialisation building blocks ──────────────────────────────────── */
@@ -1018,17 +1089,17 @@ typedef struct {
  * body-Z away from world-Z by tilt_deg so gravity has a lever arm).
  */
 static void axis_angle_to_quat(float angle_rad, const float axis[3],
-                                float q[4])
-{
-    float half = angle_rad * 0.5f;
-    float sh   = sinf(half);
-    float ax = axis[0], ay = axis[1], az = axis[2];
-    float n  = sqrtf(ax*ax + ay*ay + az*az);
-    if (n < 1e-9f) n = 1.0f;
-    q[0] = cosf(half);
-    q[1] = sh * ax / n;
-    q[2] = sh * ay / n;
-    q[3] = sh * az / n;
+                               float q[4]) {
+  float half = angle_rad * 0.5f;
+  float sh = sinf(half);
+  float ax = axis[0], ay = axis[1], az = axis[2];
+  float n = sqrtf(ax * ax + ay * ay + az * az);
+  if (n < 1e-9f)
+    n = 1.0f;
+  q[0] = cosf(half);
+  q[1] = sh * ax / n;
+  q[2] = sh * ay / n;
+  q[3] = sh * az / n;
 }
 
 /*
@@ -1040,10 +1111,9 @@ static void axis_angle_to_quat(float angle_rad, const float axis[3],
  * cached body axes that draw / HUD read are always consistent with
  * the live orientation.
  */
-static void refresh_body_axes(Gyro *g)
-{
-    quat_to_axes(g->quat, g->ex, g->ey, g->ez);
-    gram_schmidt(g->ex, g->ey, g->ez);
+static void refresh_body_axes(Gyro *g) {
+  quat_to_axes(g->quat, g->ex, g->ey, g->ez);
+  gram_schmidt(g->ex, g->ey, g->ez);
 }
 
 /*
@@ -1051,10 +1121,9 @@ static void refresh_body_axes(Gyro *g)
  * preset switch, r-reset, l-trail-toggle-off, and resize — the
  * stored screen-space points are stale in every one of those cases.
  */
-static void clear_polhode_trail(Gyro *g)
-{
-    g->trail_head = 0;
-    g->trail_fill = 0;
+static void clear_polhode_trail(Gyro *g) {
+  g->trail_head = 0;
+  g->trail_fill = 0;
 }
 
 /*
@@ -1063,14 +1132,15 @@ static void clear_polhode_trail(Gyro *g)
  * Gyro.  Does NOT touch quat or the trail (those are reset by their
  * own helpers in gyro_set_preset).
  */
-static void load_body_parameters(Gyro *g, const GPreset *pr)
-{
-    g->gravity = pr->gravity;
-    g->mgl     = pr->mgl;
-    g->I1 = pr->I1; g->I2 = pr->I2; g->I3 = pr->I3;
-    g->omega[0] = pr->omega[0];
-    g->omega[1] = pr->omega[1];
-    g->omega[2] = pr->omega[2];
+static void load_body_parameters(Gyro *g, const GPreset *pr) {
+  g->gravity = pr->gravity;
+  g->mgl = pr->mgl;
+  g->I1 = pr->I1;
+  g->I2 = pr->I2;
+  g->I3 = pr->I3;
+  g->omega[0] = pr->omega[0];
+  g->omega[1] = pr->omega[1];
+  g->omega[2] = pr->omega[2];
 }
 
 /*
@@ -1083,47 +1153,51 @@ static void load_body_parameters(Gyro *g, const GPreset *pr)
  *   4. refresh body axes from the new quaternion
  *   5. clear polhode trail (belongs to the previous body state)
  */
-static void gyro_set_preset(Gyro *g, int p)
-{
-    const GPreset *pr = &PRESETS[p];
-    g->preset = p;
+static void gyro_set_preset(Gyro *g, int p) {
+  const GPreset *pr = &PRESETS[p];
+  g->preset = p;
 
-    load_body_parameters(g, pr);
+  load_body_parameters(g, pr);
 
-    float tilt_rad = pr->tilt_deg * (float)M_PI / 180.0f;
-    axis_angle_to_quat(tilt_rad, pr->tilt_axis, g->quat);
+  float tilt_rad = pr->tilt_deg * (float)M_PI / 180.0f;
+  axis_angle_to_quat(tilt_rad, pr->tilt_axis, g->quat);
 
-    refresh_body_axes(g);
-    clear_polhode_trail(g);
+  refresh_body_axes(g);
+  clear_polhode_trail(g);
 }
 
-static void gyro_init(Gyro *g)
-{
-    memset(g, 0, sizeof *g);
-    g->view_phi   = 0.4f;
-    g->view_theta = 0.6f;
-    g->show_trail = true;
-    gyro_set_preset(g, 0);
+static void gyro_init(Gyro *g) {
+  memset(g, 0, sizeof *g);
+  g->view_phi = 0.4f;
+  g->view_theta = 0.6f;
+  g->show_trail = true;
+  gyro_set_preset(g, 0);
 }
 
 /* ── RK4 building blocks (consumed by gyro_step below) ─────────────── */
 
 /* Pack the live Gyro state into the flat RK4 vector. */
-static State7 pack_gyro_into_state7(const Gyro *g)
-{
-    State7 s;
-    s.v[0] = g->omega[0]; s.v[1] = g->omega[1]; s.v[2] = g->omega[2];
-    s.v[3] = g->quat[0];  s.v[4] = g->quat[1];
-    s.v[5] = g->quat[2];  s.v[6] = g->quat[3];
-    return s;
+static State7 pack_gyro_into_state7(const Gyro *g) {
+  State7 s;
+  s.v[0] = g->omega[0];
+  s.v[1] = g->omega[1];
+  s.v[2] = g->omega[2];
+  s.v[3] = g->quat[0];
+  s.v[4] = g->quat[1];
+  s.v[5] = g->quat[2];
+  s.v[6] = g->quat[3];
+  return s;
 }
 
 /* Inverse of pack_gyro_into_state7 — store the RK4 result back. */
-static void unpack_state7_into_gyro(State7 s, Gyro *g)
-{
-    g->omega[0] = s.v[0]; g->omega[1] = s.v[1]; g->omega[2] = s.v[2];
-    g->quat[0]  = s.v[3]; g->quat[1]  = s.v[4];
-    g->quat[2]  = s.v[5]; g->quat[3]  = s.v[6];
+static void unpack_state7_into_gyro(State7 s, Gyro *g) {
+  g->omega[0] = s.v[0];
+  g->omega[1] = s.v[1];
+  g->omega[2] = s.v[2];
+  g->quat[0] = s.v[3];
+  g->quat[1] = s.v[4];
+  g->quat[2] = s.v[5];
+  g->quat[3] = s.v[6];
 }
 
 /*
@@ -1140,18 +1214,18 @@ static void unpack_state7_into_gyro(State7 s, Gyro *g)
  * below the fastest oscillation period in any preset (Dzhanibekov
  * flips at ~1 Hz, nutation at ~6 Hz, ω_z up to 25 rad/s).
  */
-static State7 rk4_classical_step(State7 s, float dt,
-                                  float I1, float I2, float I3,
-                                  float mgl, bool gravity)
-{
-    State7 k1 = gyro_deriv(s,                              I1, I2, I3, mgl, gravity);
-    State7 k2 = gyro_deriv(s7_add(s, s7_scale(k1, dt*0.5f)), I1, I2, I3, mgl, gravity);
-    State7 k3 = gyro_deriv(s7_add(s, s7_scale(k2, dt*0.5f)), I1, I2, I3, mgl, gravity);
-    State7 k4 = gyro_deriv(s7_add(s, s7_scale(k3, dt)),      I1, I2, I3, mgl, gravity);
+static State7 rk4_classical_step(State7 s, float dt, float I1, float I2,
+                                 float I3, float mgl, bool gravity) {
+  State7 k1 = gyro_deriv(s, I1, I2, I3, mgl, gravity);
+  State7 k2 =
+      gyro_deriv(s7_add(s, s7_scale(k1, dt * 0.5f)), I1, I2, I3, mgl, gravity);
+  State7 k3 =
+      gyro_deriv(s7_add(s, s7_scale(k2, dt * 0.5f)), I1, I2, I3, mgl, gravity);
+  State7 k4 = gyro_deriv(s7_add(s, s7_scale(k3, dt)), I1, I2, I3, mgl, gravity);
 
-    State7 sum = s7_add(s7_add(k1, s7_scale(k2, 2.0f)),
-                        s7_add(s7_scale(k3, 2.0f), k4));
-    return s7_add(s, s7_scale(sum, dt / 6.0f));
+  State7 sum =
+      s7_add(s7_add(k1, s7_scale(k2, 2.0f)), s7_add(s7_scale(k3, 2.0f), k4));
+  return s7_add(s, s7_scale(sum, dt / 6.0f));
 }
 
 /*
@@ -1161,10 +1235,14 @@ static State7 rk4_classical_step(State7 s, float dt,
  * the geometric-integration projection method [5] and is enough to
  * stay on the manifold for our integration horizons.
  */
-static void project_quaternion_to_unit(float q[4])
-{
-    float n = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-    if (n > 1e-9f) { q[0]/=n; q[1]/=n; q[2]/=n; q[3]/=n; }
+static void project_quaternion_to_unit(float q[4]) {
+  float n = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  if (n > 1e-9f) {
+    q[0] /= n;
+    q[1] /= n;
+    q[2] /= n;
+    q[3] /= n;
+  }
 }
 
 /*
@@ -1176,13 +1254,11 @@ static void project_quaternion_to_unit(float q[4])
  * presets) — a free visual sanity check: in preset 0 the L vector
  * stays put while the body precesses around it.
  */
-static void recompute_angular_momentum_world(Gyro *g)
-{
-    for (int k = 0; k < 3; k++) {
-        g->L[k] = g->I1 * g->omega[0] * g->ex[k]
-                + g->I2 * g->omega[1] * g->ey[k]
-                + g->I3 * g->omega[2] * g->ez[k];
-    }
+static void recompute_angular_momentum_world(Gyro *g) {
+  for (int k = 0; k < 3; k++) {
+    g->L[k] = g->I1 * g->omega[0] * g->ex[k] + g->I2 * g->omega[1] * g->ey[k] +
+              g->I3 * g->omega[2] * g->ez[k];
+  }
 }
 
 /*
@@ -1196,17 +1272,15 @@ static void recompute_angular_momentum_world(Gyro *g)
  *   5. refresh body axes from the new quaternion (+ Gram-Schmidt)
  *   6. recompute world-frame angular momentum L
  */
-static void gyro_step(Gyro *g, float dt)
-{
-    State7 s  = pack_gyro_into_state7(g);
-    State7 ns = rk4_classical_step(s, dt,
-                                   g->I1, g->I2, g->I3,
-                                   g->mgl, g->gravity);
-    unpack_state7_into_gyro(ns, g);
+static void gyro_step(Gyro *g, float dt) {
+  State7 s = pack_gyro_into_state7(g);
+  State7 ns =
+      rk4_classical_step(s, dt, g->I1, g->I2, g->I3, g->mgl, g->gravity);
+  unpack_state7_into_gyro(ns, g);
 
-    project_quaternion_to_unit(g->quat);
-    refresh_body_axes(g);
-    recompute_angular_momentum_world(g);
+  project_quaternion_to_unit(g->quat);
+  refresh_body_axes(g);
+  recompute_angular_momentum_world(g);
 }
 
 /* ── drawing — viewport + per-layer helpers consumed by gyro_draw ──── */
@@ -1217,10 +1291,10 @@ static void gyro_step(Gyro *g, float dt)
  * pointer to each layer helper so they don't drag 7+ args around.
  */
 typedef struct {
-    float phi, theta;     /* camera azimuth + elevation (radians)        */
-    float scale;          /* pixels per world unit (see compute_*)       */
-    int   cx, cy;         /* terminal centre cell                        */
-    int   cols, rows;     /* viewport extent (for clipping)              */
+  float phi, theta; /* camera azimuth + elevation (radians)        */
+  float scale;      /* pixels per world unit (see compute_*)       */
+  int cx, cy;       /* terminal centre cell                        */
+  int cols, rows;   /* viewport extent (for clipping)              */
 } Viewport;
 
 /*
@@ -1229,25 +1303,23 @@ typedef struct {
  * because terminal cells are ~2× taller than wide (ASPECT correction
  * is applied later inside project()).
  */
-static float compute_render_scale(int cols, int rows)
-{
-    float sc_h = (float)cols / 7.0f;
-    float sc_v = (float)(rows - 2) * 2.0f / 7.0f;
-    float s    = sc_h < sc_v ? sc_h : sc_v;
-    return s < 1.0f ? 1.0f : s;
+static float compute_render_scale(int cols, int rows) {
+  float sc_h = (float)cols / 7.0f;
+  float sc_v = (float)(rows - 2) * 2.0f / 7.0f;
+  float s = sc_h < sc_v ? sc_h : sc_v;
+  return s < 1.0f ? 1.0f : s;
 }
 
-static Viewport make_viewport(const Gyro *g, int cols, int rows)
-{
-    Viewport v;
-    v.phi   = g->view_phi;
-    v.theta = g->view_theta;
-    v.cx    = cols / 2;
-    v.cy    = (rows + 1) / 2;
-    v.cols  = cols;
-    v.rows  = rows;
-    v.scale = compute_render_scale(cols, rows);
-    return v;
+static Viewport make_viewport(const Gyro *g, int cols, int rows) {
+  Viewport v;
+  v.phi = g->view_phi;
+  v.theta = g->view_theta;
+  v.cx = cols / 2;
+  v.cy = (rows + 1) / 2;
+  v.cols = cols;
+  v.rows = rows;
+  v.scale = compute_render_scale(cols, rows);
+  return v;
 }
 
 /*
@@ -1255,20 +1327,19 @@ static Viewport make_viewport(const Gyro *g, int cols, int rows)
  * Gives the viewer a fixed horizon to read body tilt against;
  * without it the gyroscope would float in a featureless void.
  */
-static void draw_ground_ring(WINDOW *w, const Viewport *v)
-{
-    const float gr = 1.2f;   /* ring radius (world units) */
-    wattron(w, COLOR_PAIR(CP_GROUND) | A_DIM);
-    for (int i = 0; i < GROUND_PTS; i++) {
-        float t  = 2.0f * (float)M_PI * i / GROUND_PTS;
-        float wx = gr * cosf(t), wy = gr * sinf(t);
-        int c, r; float d;
-        project(wx, wy, 0.0f, v->phi, v->theta, v->scale, v->cx, v->cy,
-                &c, &r, &d);
-        if (c >= 0 && c < v->cols && r >= 1 && r < v->rows - 1)
-            mvwaddch(w, r, c, '.');
-    }
-    wattroff(w, COLOR_PAIR(CP_GROUND) | A_DIM);
+static void draw_ground_ring(WINDOW *w, const Viewport *v) {
+  const float gr = 1.2f; /* ring radius (world units) */
+  wattron(w, COLOR_PAIR(CP_GROUND) | A_DIM);
+  for (int i = 0; i < GROUND_PTS; i++) {
+    float t = 2.0f * (float)M_PI * i / GROUND_PTS;
+    float wx = gr * cosf(t), wy = gr * sinf(t);
+    int c, r;
+    float d;
+    project(wx, wy, 0.0f, v->phi, v->theta, v->scale, v->cx, v->cy, &c, &r, &d);
+    if (c >= 0 && c < v->cols && r >= 1 && r < v->rows - 1)
+      mvwaddch(w, r, c, '.');
+  }
+  wattroff(w, COLOR_PAIR(CP_GROUND) | A_DIM);
 }
 
 /*
@@ -1276,11 +1347,9 @@ static void draw_ground_ring(WINDOW *w, const Viewport *v)
  * Together with the ground ring it makes "upright" visually concrete,
  * so the tilt of body-Z away from world-Z reads as nutation angle.
  */
-static void draw_world_z_reference(WINDOW *w, const Viewport *v)
-{
-    draw_seg3d(w, 0,0,0, 0,0,1.3f,
-               v->phi, v->theta, v->scale, v->cx, v->cy, v->cols, v->rows,
-               (chtype)(COLOR_PAIR(CP_GROUND) | A_DIM));
+static void draw_world_z_reference(WINDOW *w, const Viewport *v) {
+  draw_seg3d(w, 0, 0, 0, 0, 0, 1.3f, v->phi, v->theta, v->scale, v->cx, v->cy,
+             v->cols, v->rows, (chtype)(COLOR_PAIR(CP_GROUND) | A_DIM));
 }
 
 /*
@@ -1292,25 +1361,24 @@ static void draw_world_z_reference(WINDOW *w, const Viewport *v)
  * disc wobble — without committing to any particular rigid shape.
  */
 static void draw_body_disc_equator(WINDOW *w, const Gyro *g,
-                                    const Viewport *v)
-{
-    const float dr = 0.45f;
-    chtype attr   = (chtype)(COLOR_PAIR(CP_DISC) | A_DIM);
-    for (int i = 0; i < DISC_PTS; i++) {
-        float t  = 2.0f * (float)M_PI * i / DISC_PTS;
-        float ct = cosf(t), st = sinf(t);
-        float wx = dr * (ct * g->ex[0] + st * g->ey[0]);
-        float wy = dr * (ct * g->ex[1] + st * g->ey[1]);
-        float wz = dr * (ct * g->ex[2] + st * g->ey[2]);
-        int c, r; float d;
-        project(wx, wy, wz, v->phi, v->theta, v->scale, v->cx, v->cy,
-                &c, &r, &d);
-        if (c >= 0 && c < v->cols && r >= 1 && r < v->rows - 1) {
-            wattron(w, attr);
-            mvwaddch(w, r, c, 'o');
-            wattroff(w, attr);
-        }
+                                   const Viewport *v) {
+  const float dr = 0.45f;
+  chtype attr = (chtype)(COLOR_PAIR(CP_DISC) | A_DIM);
+  for (int i = 0; i < DISC_PTS; i++) {
+    float t = 2.0f * (float)M_PI * i / DISC_PTS;
+    float ct = cosf(t), st = sinf(t);
+    float wx = dr * (ct * g->ex[0] + st * g->ey[0]);
+    float wy = dr * (ct * g->ex[1] + st * g->ey[1]);
+    float wz = dr * (ct * g->ex[2] + st * g->ey[2]);
+    int c, r;
+    float d;
+    project(wx, wy, wz, v->phi, v->theta, v->scale, v->cx, v->cy, &c, &r, &d);
+    if (c >= 0 && c < v->cols && r >= 1 && r < v->rows - 1) {
+      wattron(w, attr);
+      mvwaddch(w, r, c, 'o');
+      wattroff(w, attr);
     }
+  }
 }
 
 /*
@@ -1322,24 +1390,28 @@ static void draw_body_disc_equator(WINDOW *w, const Gyro *g,
  * intermediate-axis presets.  Trail points are stored in screen space
  * (see TrailPt docstring), so this loop is pure ncurses output.
  */
-static void draw_polhode_trail(WINDOW *w, const Gyro *g, const Viewport *v)
-{
-    if (!g->show_trail || g->trail_fill == 0) return;
+static void draw_polhode_trail(WINDOW *w, const Gyro *g, const Viewport *v) {
+  if (!g->show_trail || g->trail_fill == 0)
+    return;
 
-    int n = g->trail_fill;
-    for (int i = 0; i < n; i++) {
-        int idx = (g->trail_head - n + i + TRAIL_LEN) % TRAIL_LEN;
-        int c = g->trail[idx].col, r = g->trail[idx].row;
-        if (c < 0 || c >= v->cols || r < 1 || r >= v->rows - 1) continue;
+  int n = g->trail_fill;
+  for (int i = 0; i < n; i++) {
+    int idx = (g->trail_head - n + i + TRAIL_LEN) % TRAIL_LEN;
+    int c = g->trail[idx].col, r = g->trail[idx].row;
+    if (c < 0 || c >= v->cols || r < 1 || r >= v->rows - 1)
+      continue;
 
-        chtype attr;
-        if      (i > n * 3 / 4) attr = (chtype)(COLOR_PAIR(CP_TRAIL) | A_BOLD);
-        else if (i > n / 2)     attr = (chtype)(COLOR_PAIR(CP_TRAIL));
-        else                    attr = (chtype)(COLOR_PAIR(CP_TRAIL) | A_DIM);
-        wattron(w, attr);
-        mvwaddch(w, r, c, '.');
-        wattroff(w, attr);
-    }
+    chtype attr;
+    if (i > n * 3 / 4)
+      attr = (chtype)(COLOR_PAIR(CP_TRAIL) | A_BOLD);
+    else if (i > n / 2)
+      attr = (chtype)(COLOR_PAIR(CP_TRAIL));
+    else
+      attr = (chtype)(COLOR_PAIR(CP_TRAIL) | A_DIM);
+    wattron(w, attr);
+    mvwaddch(w, r, c, '.');
+    wattroff(w, attr);
+  }
 }
 
 /*
@@ -1352,51 +1424,57 @@ static void draw_polhode_trail(WINDOW *w, const Gyro *g, const Viewport *v)
  * doesn't fight the line glyph for the last cell.
  */
 static void draw_body_axes_depth_sorted(WINDOW *w, const Gyro *g,
-                                         const Viewport *v)
-{
-    struct { const float *axis; const char *label; int pair; } axes[3] = {
-        { g->ex, "X", CP_AXIS_X },
-        { g->ey, "Y", CP_AXIS_Y },
-        { g->ez, "Z", CP_AXIS_Z },
-    };
+                                        const Viewport *v) {
+  struct {
+    const float *axis;
+    const char *label;
+    int pair;
+  } axes[3] = {
+      {g->ex, "X", CP_AXIS_X},
+      {g->ey, "Y", CP_AXIS_Y},
+      {g->ez, "Z", CP_AXIS_Z},
+  };
 
-    /* Probe tip depth for each axis */
-    float depths[3];
-    for (int i = 0; i < 3; i++) {
-        int c, r; float d;
-        project(axes[i].axis[0], axes[i].axis[1], axes[i].axis[2],
-                v->phi, v->theta, v->scale, v->cx, v->cy, &c, &r, &d);
-        depths[i] = d;
+  /* Probe tip depth for each axis */
+  float depths[3];
+  for (int i = 0; i < 3; i++) {
+    int c, r;
+    float d;
+    project(axes[i].axis[0], axes[i].axis[1], axes[i].axis[2], v->phi, v->theta,
+            v->scale, v->cx, v->cy, &c, &r, &d);
+    depths[i] = d;
+  }
+
+  /* Bubble-sort indices by depth descending (farthest first) */
+  int order[3] = {0, 1, 2};
+  for (int i = 0; i < 2; i++)
+    for (int j = i + 1; j < 3; j++)
+      if (depths[order[i]] < depths[order[j]]) {
+        int t = order[i];
+        order[i] = order[j];
+        order[j] = t;
+      }
+
+  for (int oi = 0; oi < 3; oi++) {
+    int i = order[oi];
+    const float *ax = axes[i].axis;
+    chtype attr =
+        (chtype)(COLOR_PAIR(axes[i].pair) | (depths[i] < 0.0f ? A_BOLD : 0u));
+
+    draw_seg3d(w, 0, 0, 0, ax[0], ax[1], ax[2], v->phi, v->theta, v->scale,
+               v->cx, v->cy, v->cols, v->rows, attr);
+
+    /* Tip label, slightly beyond the unit-length tip */
+    int c, r;
+    float d;
+    project(ax[0] * 1.15f, ax[1] * 1.15f, ax[2] * 1.15f, v->phi, v->theta,
+            v->scale, v->cx, v->cy, &c, &r, &d);
+    if (c >= 0 && c < v->cols && r >= 1 && r < v->rows - 1) {
+      wattron(w, attr);
+      mvwaddch(w, r, c, (chtype)(unsigned char)axes[i].label[0]);
+      wattroff(w, attr);
     }
-
-    /* Bubble-sort indices by depth descending (farthest first) */
-    int order[3] = {0, 1, 2};
-    for (int i = 0; i < 2; i++)
-        for (int j = i+1; j < 3; j++)
-            if (depths[order[i]] < depths[order[j]]) {
-                int t = order[i]; order[i] = order[j]; order[j] = t;
-            }
-
-    for (int oi = 0; oi < 3; oi++) {
-        int i = order[oi];
-        const float *ax = axes[i].axis;
-        chtype attr = (chtype)(COLOR_PAIR(axes[i].pair) |
-                       (depths[i] < 0.0f ? A_BOLD : 0u));
-
-        draw_seg3d(w, 0,0,0, ax[0], ax[1], ax[2],
-                   v->phi, v->theta, v->scale, v->cx, v->cy,
-                   v->cols, v->rows, attr);
-
-        /* Tip label, slightly beyond the unit-length tip */
-        int c, r; float d;
-        project(ax[0]*1.15f, ax[1]*1.15f, ax[2]*1.15f,
-                v->phi, v->theta, v->scale, v->cx, v->cy, &c, &r, &d);
-        if (c >= 0 && c < v->cols && r >= 1 && r < v->rows-1) {
-            wattron(w, attr);
-            mvwaddch(w, r, c, (chtype)(unsigned char)axes[i].label[0]);
-            wattroff(w, attr);
-        }
-    }
+  }
 }
 
 /*
@@ -1408,24 +1486,24 @@ static void draw_body_axes_depth_sorted(WINDOW *w, const Gyro *g,
  * label 'L' 15 % beyond the unit tip, matching the body-axis style.
  */
 static void draw_angular_momentum_vector(WINDOW *w, const Gyro *g,
-                                          const Viewport *v)
-{
-    float Lmag = sqrtf(g->L[0]*g->L[0] + g->L[1]*g->L[1] + g->L[2]*g->L[2]);
-    if (Lmag < 1e-9f) return;
+                                         const Viewport *v) {
+  float Lmag = sqrtf(g->L[0] * g->L[0] + g->L[1] * g->L[1] + g->L[2] * g->L[2]);
+  if (Lmag < 1e-9f)
+    return;
 
-    float Ldx = g->L[0]/Lmag, Ldy = g->L[1]/Lmag, Ldz = g->L[2]/Lmag;
-    draw_seg3d(w, 0,0,0, Ldx, Ldy, Ldz,
-               v->phi, v->theta, v->scale, v->cx, v->cy, v->cols, v->rows,
-               (chtype)(COLOR_PAIR(CP_MOM) | A_BOLD));
+  float Ldx = g->L[0] / Lmag, Ldy = g->L[1] / Lmag, Ldz = g->L[2] / Lmag;
+  draw_seg3d(w, 0, 0, 0, Ldx, Ldy, Ldz, v->phi, v->theta, v->scale, v->cx,
+             v->cy, v->cols, v->rows, (chtype)(COLOR_PAIR(CP_MOM) | A_BOLD));
 
-    int c, r; float d;
-    project(Ldx*1.15f, Ldy*1.15f, Ldz*1.15f,
-            v->phi, v->theta, v->scale, v->cx, v->cy, &c, &r, &d);
-    if (c >= 0 && c < v->cols && r >= 1 && r < v->rows-1) {
-        wattron(w, COLOR_PAIR(CP_MOM) | A_BOLD);
-        mvwaddch(w, r, c, 'L');
-        wattroff(w, COLOR_PAIR(CP_MOM) | A_BOLD);
-    }
+  int c, r;
+  float d;
+  project(Ldx * 1.15f, Ldy * 1.15f, Ldz * 1.15f, v->phi, v->theta, v->scale,
+          v->cx, v->cy, &c, &r, &d);
+  if (c >= 0 && c < v->cols && r >= 1 && r < v->rows - 1) {
+    wattron(w, COLOR_PAIR(CP_MOM) | A_BOLD);
+    mvwaddch(w, r, c, 'L');
+    wattroff(w, COLOR_PAIR(CP_MOM) | A_BOLD);
+  }
 }
 
 /*
@@ -1443,31 +1521,32 @@ static void draw_angular_momentum_vector(WINDOW *w, const Gyro *g,
  *   draw_body_axes_depth_sorted      // X / Y / Z with tip labels
  *   draw_angular_momentum_vector     // top — L vector with tip label
  */
-static void gyro_draw(const Gyro *g, WINDOW *w, int cols, int rows)
-{
-    Viewport vp = make_viewport(g, cols, rows);
+static void gyro_draw(const Gyro *g, WINDOW *w, int cols, int rows) {
+  Viewport vp = make_viewport(g, cols, rows);
 
-    draw_ground_ring             (w,    &vp);
-    draw_world_z_reference       (w,    &vp);
-    draw_body_disc_equator       (w, g, &vp);
-    draw_polhode_trail           (w, g, &vp);
-    draw_body_axes_depth_sorted  (w, g, &vp);
-    draw_angular_momentum_vector (w, g, &vp);
+  draw_ground_ring(w, &vp);
+  draw_world_z_reference(w, &vp);
+  draw_body_disc_equator(w, g, &vp);
+  draw_polhode_trail(w, g, &vp);
+  draw_body_axes_depth_sorted(w, g, &vp);
+  draw_angular_momentum_vector(w, g, &vp);
 }
 
 /* ── trail update ────────────────────────────────────────────────────── */
 
-static void gyro_update_trail(Gyro *g, int cx, int cy,
-                               float scale, int cols, int rows)
-{
-    int c, r; float d;
-    project(g->ez[0], g->ez[1], g->ez[2],
-            g->view_phi, g->view_theta, scale, cx, cy, &c, &r, &d);
-    g->trail[g->trail_head] = (TrailPt){ c, r };
-    g->trail_head = (g->trail_head + 1) % TRAIL_LEN;
-    if (g->trail_fill < TRAIL_LEN) g->trail_fill++;
+static void gyro_update_trail(Gyro *g, int cx, int cy, float scale, int cols,
+                              int rows) {
+  int c, r;
+  float d;
+  project(g->ez[0], g->ez[1], g->ez[2], g->view_phi, g->view_theta, scale, cx,
+          cy, &c, &r, &d);
+  g->trail[g->trail_head] = (TrailPt){c, r};
+  g->trail_head = (g->trail_head + 1) % TRAIL_LEN;
+  if (g->trail_fill < TRAIL_LEN)
+    g->trail_fill++;
 
-    (void)cols; (void)rows;
+  (void)cols;
+  (void)rows;
 }
 
 /* ===================================================================== */
@@ -1518,20 +1597,19 @@ static void gyro_update_trail(Gyro *g, int cx, int cy,
  * than being passed by value anywhere.
  * ─────────────────────────────────────────────────────────────────────── */
 typedef struct {
-    /* ── Simulation parameters (read & written by scene_tick) ──────── */
-    Gyro gyro;        /* physics state — see Gyro docstring §5         */
+  /* ── Simulation parameters (read & written by scene_tick) ──────── */
+  Gyro gyro; /* physics state — see Gyro docstring §5         */
 
-    /* ── Rendering parameters (no physics side-effects) ────────────── */
-    int  theme;       /* index into THEMES[] in §3; t / T cycles.
-                       * Purely cosmetic — physics is identical
-                       * across all 12 themes                          */
+  /* ── Rendering parameters (no physics side-effects) ────────────── */
+  int theme; /* index into THEMES[] in §3; t / T cycles.
+              * Purely cosmetic — physics is identical
+              * across all 12 themes                          */
 } Scene;
 
-static void scene_init(Scene *s)
-{
-    memset(s, 0, sizeof *s);
-    /* memset → theme = 0 (VOLT); keep current theme on r-reset */
-    gyro_init(&s->gyro);
+static void scene_init(Scene *s) {
+  memset(s, 0, sizeof *s);
+  /* memset → theme = 0 (VOLT); keep current theme on r-reset */
+  gyro_init(&s->gyro);
 }
 
 /*
@@ -1543,25 +1621,25 @@ static void scene_init(Scene *s)
  *
  * The view azimuth auto-rotates at 0.15 rad/s for a cinematic view.
  */
-static void scene_tick(Scene *s, float dt, int cols, int rows)
-{
-    Gyro *g = &s->gyro;
-    if (g->paused) return;
+static void scene_tick(Scene *s, float dt, int cols, int rows) {
+  Gyro *g = &s->gyro;
+  if (g->paused)
+    return;
 
-    float sub_dt = dt / (float)SUB_STEPS;
-    for (int i = 0; i < SUB_STEPS; i++)
-        gyro_step(g, sub_dt);
+  float sub_dt = dt / (float)SUB_STEPS;
+  for (int i = 0; i < SUB_STEPS; i++)
+    gyro_step(g, sub_dt);
 
-    /* Slow auto-rotation of view */
-    g->view_phi += 0.15f * dt;
+  /* Slow auto-rotation of view */
+  g->view_phi += 0.15f * dt;
 
-    /* Update polhode trail (once per tick, not sub-step) */
-    if (g->show_trail) {
-        float sc_h  = (float)cols / 7.0f;
-        float sc_v  = (float)(rows - 2) * 2.0f / 7.0f;
-        float scale = sc_h < sc_v ? sc_h : sc_v;
-        gyro_update_trail(g, cols/2, (rows+1)/2, scale, cols, rows);
-    }
+  /* Update polhode trail (once per tick, not sub-step) */
+  if (g->show_trail) {
+    float sc_h = (float)cols / 7.0f;
+    float sc_v = (float)(rows - 2) * 2.0f / 7.0f;
+    float scale = sc_h < sc_v ? sc_h : sc_v;
+    gyro_update_trail(g, cols / 2, (rows + 1) / 2, scale, cols, rows);
+  }
 }
 
 /*
@@ -1571,11 +1649,11 @@ static void scene_tick(Scene *s, float dt, int cols, int rows)
  * the gyroscope uses rigid-body physics where the draw position IS
  * the physics position (no separate interpolation needed at 60 Hz).
  */
-static void scene_draw(Scene *s, WINDOW *w, int cols, int rows,
-                       float alpha, float dt_sec)
-{
-    (void)alpha; (void)dt_sec;
-    gyro_draw(&s->gyro, w, cols, rows);
+static void scene_draw(Scene *s, WINDOW *w, int cols, int rows, float alpha,
+                       float dt_sec) {
+  (void)alpha;
+  (void)dt_sec;
+  gyro_draw(&s->gyro, w, cols, rows);
 }
 
 /* ===================================================================== */
@@ -1591,20 +1669,30 @@ static void scene_draw(Scene *s, WINDOW *w, int cols, int rows,
  * left-alignment on row 1, and last-row positioning of the key
  * legend.  gyro_draw also reads them to clip line segments.
  */
-typedef struct { int cols, rows; } Screen;
+typedef struct {
+  int cols, rows;
+} Screen;
 
-static void screen_init(Screen *s, int theme)
-{
-    initscr();
-    noecho(); cbreak(); curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init(theme);
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s, int theme) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init(theme);
+  getmaxyx(stdscr, s->rows, s->cols);
 }
-static void screen_free(Screen *s)  { (void)s; endwin(); }
-static void screen_resize(Screen *s){ endwin(); refresh(); getmaxyx(stdscr, s->rows, s->cols); }
+static void screen_free(Screen *s) {
+  (void)s;
+  endwin();
+}
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
+}
 
 /*
  * Canonical two-row HUD (CLAUDE.md):
@@ -1613,53 +1701,47 @@ static void screen_resize(Screen *s){ endwin(); refresh(); getmaxyx(stdscr, s->r
  *                 PAIR_HUD without A_BOLD so row 0 stays dominant
  *   Last row    : key legend — PAIR_HINT + A_BOLD
  */
-static void screen_draw(Screen *s, Scene *sc,
-                        double fps, int sim_fps,
-                        float alpha, float dt_sec)
-{
-    erase();
-    scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
+static void screen_draw(Screen *s, Scene *sc, double fps, int sim_fps,
+                        float alpha, float dt_sec) {
+  erase();
+  scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
 
-    const Gyro    *g  = &sc->gyro;
-    const GPreset *pr = &PRESETS[g->preset];
+  const Gyro *g = &sc->gyro;
+  const GPreset *pr = &PRESETS[g->preset];
 
-    float omag = sqrtf(g->omega[0]*g->omega[0]
-                      +g->omega[1]*g->omega[1]
-                      +g->omega[2]*g->omega[2]);
+  float omag = sqrtf(g->omega[0] * g->omega[0] + g->omega[1] * g->omega[1] +
+                     g->omega[2] * g->omega[2]);
 
-    /* ── Row 0 right: canonical fps / sim / paused ── */
-    char top[80];
-    snprintf(top, sizeof top, " %5.1f fps  sim:%3d Hz  %s ",
-             fps, sim_fps, g->paused ? "PAUSED " : "running");
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, s->cols - (int)strlen(top), "%s", top);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  /* ── Row 0 right: canonical fps / sim / paused ── */
+  char top[80];
+  snprintf(top, sizeof top, " %5.1f fps  sim:%3d Hz  %s ", fps, sim_fps,
+           g->paused ? "PAUSED " : "running");
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, s->cols - (int)strlen(top), "%s", top);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 
-    /* ── Row 1 left: parameter readouts ── */
-    char params[200];
-    snprintf(params, sizeof params,
-             " preset:%d %s  I=(%.1f,%.1f,%.1f)  |ω|=%.1f rad/s"
-             "  g:%s  theme:[%d] %s ",
-             g->preset, pr->name,
-             g->I1, g->I2, g->I3, omag,
-             g->gravity ? "ON " : "OFF",
-             sc->theme, THEMES[sc->theme].name);
-    attron(COLOR_PAIR(PAIR_HUD));
-    mvprintw(1, 0, "%.*s", s->cols, params);
-    attroff(COLOR_PAIR(PAIR_HUD));
+  /* ── Row 1 left: parameter readouts ── */
+  char params[200];
+  snprintf(params, sizeof params,
+           " preset:%d %s  I=(%.1f,%.1f,%.1f)  |ω|=%.1f rad/s"
+           "  g:%s  theme:[%d] %s ",
+           g->preset, pr->name, g->I1, g->I2, g->I3, omag,
+           g->gravity ? "ON " : "OFF", sc->theme, THEMES[sc->theme].name);
+  attron(COLOR_PAIR(PAIR_HUD));
+  mvprintw(1, 0, "%.*s", s->cols, params);
+  attroff(COLOR_PAIR(PAIR_HUD));
 
-    /* ── Bottom row: key legend ── */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(s->rows-1, 0,
-             " q:quit  spc:pause  n/p:preset  r:restart  g:gravity"
-             "  l:trail  t/T:theme  arrows:view  ]/[:simHz ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  /* ── Bottom row: key legend ── */
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(s->rows - 1, 0,
+           " q:quit  spc:pause  n/p:preset  r:restart  g:gravity"
+           "  l:trail  t/T:theme  arrows:view  ]/[:simHz ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
-static void screen_present(void)
-{
-    wnoutrefresh(stdscr);
-    doupdate();
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
@@ -1694,99 +1776,121 @@ static void screen_present(void)
  *                         signal handler and main thread.
  */
 typedef struct {
-    /* ── Owned subsystems ─────────────────────────────────────────── */
-    Scene                 scene;        /* sim + render state (§6)      */
-    Screen                screen;       /* terminal geometry (§7)       */
+  /* ── Owned subsystems ─────────────────────────────────────────── */
+  Scene scene;   /* sim + render state (§6)      */
+  Screen screen; /* terminal geometry (§7)       */
 
-    /* ── Tick-rate knob ───────────────────────────────────────────── */
-    int                   sim_fps;      /* fixed-dt sim Hz; ] / [ keys
-                                         * clamped [SIM_FPS_MIN, MAX]  */
+  /* ── Tick-rate knob ───────────────────────────────────────────── */
+  int sim_fps; /* fixed-dt sim Hz; ] / [ keys
+                * clamped [SIM_FPS_MIN, MAX]  */
 
-    /* ── Signal-handler I/O (async-signal-safe access only) ───────── */
-    volatile sig_atomic_t running;      /* 0 ⇒ main loop exits         */
-    volatile sig_atomic_t need_resize;  /* 1 ⇒ main loop calls
-                                         *      app_do_resize next tick */
+  /* ── Signal-handler I/O (async-signal-safe access only) ───────── */
+  volatile sig_atomic_t running;     /* 0 ⇒ main loop exits         */
+  volatile sig_atomic_t need_resize; /* 1 ⇒ main loop calls
+                                      *      app_do_resize next tick */
 } App;
 
 static App g_app;
 
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void app_do_resize(App *app)
-{
-    screen_resize(&app->screen);
-    app->scene.gyro.trail_head = 0;
-    app->scene.gyro.trail_fill = 0;
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  screen_resize(&app->screen);
+  app->scene.gyro.trail_head = 0;
+  app->scene.gyro.trail_fill = 0;
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *sc = &app->scene;
-    Gyro  *g  = &sc->gyro;
+static bool app_handle_key(App *app, int ch) {
+  Scene *sc = &app->scene;
+  Gyro *g = &sc->gyro;
 
-    switch (ch) {
-    case 'q': case 'Q': case 27: return false;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-    case ' ':
-        g->paused = !g->paused;
-        break;
+  case ' ':
+    g->paused = !g->paused;
+    break;
 
-    case 'n':
-        gyro_set_preset(g, (g->preset + 1) % N_PRESETS);
-        break;
+  case 'n':
+    gyro_set_preset(g, (g->preset + 1) % N_PRESETS);
+    break;
 
-    case 'p':
-        gyro_set_preset(g, (g->preset + N_PRESETS - 1) % N_PRESETS);
-        break;
+  case 'p':
+    gyro_set_preset(g, (g->preset + N_PRESETS - 1) % N_PRESETS);
+    break;
 
-    case 'r': case 'R':
-        gyro_set_preset(g, g->preset);
-        break;
+  case 'r':
+  case 'R':
+    gyro_set_preset(g, g->preset);
+    break;
 
-    case 'g': case 'G':
-        g->gravity = !g->gravity;
-        break;
+  case 'g':
+  case 'G':
+    g->gravity = !g->gravity;
+    break;
 
-    case 'l': case 'L':
-        g->show_trail = !g->show_trail;
-        if (!g->show_trail) { g->trail_head = 0; g->trail_fill = 0; }
-        break;
-
-    case 't':
-        sc->theme = (sc->theme + 1) % N_THEMES;
-        color_apply_theme(sc->theme);
-        break;
-    case 'T':
-        sc->theme = (sc->theme + N_THEMES - 1) % N_THEMES;
-        color_apply_theme(sc->theme);
-        break;
-
-    case KEY_LEFT:  g->view_phi   -= 0.1f; break;
-    case KEY_RIGHT: g->view_phi   += 0.1f; break;
-    case KEY_UP:
-        g->view_theta += 0.05f;
-        if (g->view_theta > 1.4f) g->view_theta = 1.4f;
-        break;
-    case KEY_DOWN:
-        g->view_theta -= 0.05f;
-        if (g->view_theta < 0.1f) g->view_theta = 0.1f;
-        break;
-
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
-
-    default: break;
+  case 'l':
+  case 'L':
+    g->show_trail = !g->show_trail;
+    if (!g->show_trail) {
+      g->trail_head = 0;
+      g->trail_fill = 0;
     }
-    return true;
+    break;
+
+  case 't':
+    sc->theme = (sc->theme + 1) % N_THEMES;
+    color_apply_theme(sc->theme);
+    break;
+  case 'T':
+    sc->theme = (sc->theme + N_THEMES - 1) % N_THEMES;
+    color_apply_theme(sc->theme);
+    break;
+
+  case KEY_LEFT:
+    g->view_phi -= 0.1f;
+    break;
+  case KEY_RIGHT:
+    g->view_phi += 0.1f;
+    break;
+  case KEY_UP:
+    g->view_theta += 0.05f;
+    if (g->view_theta > 1.4f)
+      g->view_theta = 1.4f;
+    break;
+  case KEY_DOWN:
+    g->view_theta -= 0.05f;
+    if (g->view_theta < 0.1f)
+      g->view_theta = 0.1f;
+    break;
+
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
+
+  default:
+    break;
+  }
+  return true;
 }
 
 /* ── main-loop building blocks ───────────────────────────────────────── */
@@ -1797,12 +1901,11 @@ static bool app_handle_key(App *app, int ch)
  * shutdown; SIGWINCH triggers a viewport rebuild on the next tick.
  * Handlers must be async-signal-safe — they only flip volatile flags.
  */
-static void install_signal_handlers(void)
-{
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+static void install_signal_handlers(void) {
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 }
 
 /*
@@ -1812,14 +1915,13 @@ static void install_signal_handlers(void)
  * resize handler was running; pretend we're starting fresh so the
  * next dt doesn't blow up).
  */
-static void handle_resize_pending(App *app,
-                                   int64_t *frame_time,
-                                   int64_t *sim_accum)
-{
-    if (!app->need_resize) return;
-    app_do_resize(app);
-    *frame_time = clock_ns();
-    *sim_accum  = 0;
+static void handle_resize_pending(App *app, int64_t *frame_time,
+                                  int64_t *sim_accum) {
+  if (!app->need_resize)
+    return;
+  app_do_resize(app);
+  *frame_time = clock_ns();
+  *sim_accum = 0;
 }
 
 /*
@@ -1835,18 +1937,14 @@ static void handle_resize_pending(App *app,
  * so accuracy (per the RK4 truncation bound) is independent of frame
  * rate.  sim_accum carries any leftover < tick_ns to the next frame.
  */
-static void step_simulation_fixed_dt(Scene *scene,
-                                      int64_t *sim_accum,
-                                      int64_t  dt_ns,
-                                      int64_t  tick_ns,
-                                      float    dt_sec,
-                                      int      cols, int rows)
-{
-    *sim_accum += dt_ns;
-    while (*sim_accum >= tick_ns) {
-        scene_tick(scene, dt_sec, cols, rows);
-        *sim_accum -= tick_ns;
-    }
+static void step_simulation_fixed_dt(Scene *scene, int64_t *sim_accum,
+                                     int64_t dt_ns, int64_t tick_ns,
+                                     float dt_sec, int cols, int rows) {
+  *sim_accum += dt_ns;
+  while (*sim_accum >= tick_ns) {
+    scene_tick(scene, dt_sec, cols, rows);
+    *sim_accum -= tick_ns;
+  }
 }
 
 /*
@@ -1855,19 +1953,16 @@ static void step_simulation_fixed_dt(Scene *scene,
  * read.  Without the averaging window the readout would jitter wildly
  * frame-to-frame even at steady throughput.
  */
-static void update_fps_counter(int64_t dt_ns,
-                                int64_t *fps_accum,
-                                int     *frame_count,
-                                double  *fps_display)
-{
-    (*frame_count)++;
-    *fps_accum += dt_ns;
-    if (*fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-        *fps_display = (double)(*frame_count)
-                     / ((double)(*fps_accum) / (double)NS_PER_SEC);
-        *frame_count = 0;
-        *fps_accum   = 0;
-    }
+static void update_fps_counter(int64_t dt_ns, int64_t *fps_accum,
+                               int *frame_count, double *fps_display) {
+  (*frame_count)++;
+  *fps_accum += dt_ns;
+  if (*fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+    *fps_display =
+        (double)(*frame_count) / ((double)(*fps_accum) / (double)NS_PER_SEC);
+    *frame_count = 0;
+    *fps_accum = 0;
+  }
 }
 
 /*
@@ -1878,10 +1973,9 @@ static void update_fps_counter(int64_t dt_ns,
  * consistent visual cadence on every terminal.
  */
 static void cap_to_render_framerate(int64_t frame_start_ns,
-                                     int64_t prev_frame_dt_ns)
-{
-    int64_t elapsed = clock_ns() - frame_start_ns + prev_frame_dt_ns;
-    clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+                                    int64_t prev_frame_dt_ns) {
+  int64_t elapsed = clock_ns() - frame_start_ns + prev_frame_dt_ns;
+  clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
 }
 
 /*
@@ -1901,58 +1995,57 @@ static void cap_to_render_framerate(int64_t frame_start_ns,
  *     screen_draw + screen_present
  *     poll input → app_handle_key (returns false ⇒ quit)
  */
-int main(void)
-{
-    srand((unsigned int)(clock_ns() & 0xFFFFFFFFu));
-    install_signal_handlers();
+int main(void) {
+  srand((unsigned int)(clock_ns() & 0xFFFFFFFFu));
+  install_signal_handlers();
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
 
-    scene_init(&app->scene);                          /* theme = 0 (VOLT) */
-    screen_init(&app->screen, app->scene.theme);      /* color_init wants theme */
+  scene_init(&app->scene);                     /* theme = 0 (VOLT) */
+  screen_init(&app->screen, app->scene.theme); /* color_init wants theme */
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
-        handle_resize_pending(app, &frame_time, &sim_accum);
+  while (app->running) {
+    handle_resize_pending(app, &frame_time, &sim_accum);
 
-        /* wall-clock dt since previous frame (clamped to 100 ms to
-         * prevent spiral-of-death after a hiccup or breakpoint pause) */
-        int64_t now    = clock_ns();
-        int64_t dt_ns  = now - frame_time;
-        frame_time     = now;
-        if (dt_ns > 100 * NS_PER_MS) dt_ns = 100 * NS_PER_MS;
+    /* wall-clock dt since previous frame (clamped to 100 ms to
+     * prevent spiral-of-death after a hiccup or breakpoint pause) */
+    int64_t now = clock_ns();
+    int64_t dt_ns = now - frame_time;
+    frame_time = now;
+    if (dt_ns > 100 * NS_PER_MS)
+      dt_ns = 100 * NS_PER_MS;
 
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
 
-        step_simulation_fixed_dt(&app->scene, &sim_accum, dt_ns,
-                                 tick_ns, dt_sec,
-                                 app->screen.cols, app->screen.rows);
+    step_simulation_fixed_dt(&app->scene, &sim_accum, dt_ns, tick_ns, dt_sec,
+                             app->screen.cols, app->screen.rows);
 
-        /* alpha ∈ [0,1) — render interpolation factor for sub-tick
-         * smoothing.  gyroscope draws at physics position directly
-         * (alpha unused), kept for framework signature parity. */
-        float alpha = (float)sim_accum / (float)tick_ns;
+    /* alpha ∈ [0,1) — render interpolation factor for sub-tick
+     * smoothing.  gyroscope draws at physics position directly
+     * (alpha unused), kept for framework signature parity. */
+    float alpha = (float)sim_accum / (float)tick_ns;
 
-        update_fps_counter(dt_ns, &fps_accum, &frame_count, &fps_display);
-        cap_to_render_framerate(now, dt_ns);
+    update_fps_counter(dt_ns, &fps_accum, &frame_count, &fps_display);
+    cap_to_render_framerate(now, dt_ns);
 
-        screen_draw(&app->screen, &app->scene,
-                    fps_display, app->sim_fps, alpha, dt_sec);
-        screen_present();
+    screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps, alpha,
+                dt_sec);
+    screen_present();
 
-        int key = getch();
-        if (key != ERR && !app_handle_key(app, key))
-            app->running = 0;
-    }
+    int key = getch();
+    if (key != ERR && !app_handle_key(app, key))
+      app->running = 0;
+  }
 
-    screen_free(&app->screen);
-    return 0;
+  screen_free(&app->screen);
+  return 0;
 }

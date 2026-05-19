@@ -1,6 +1,25 @@
 /* Copyright (c) 2026 Tamilselvan R  SPDX-License-Identifier: MIT */
 /*
- * rigid_body.c — 2D Rigid Body Simulation (translation only, no rotation)
+ * rigid_multiple_bodies.c — 2D Rigid Body Simulation, multi-preset edition
+ *                            (translation only, no rotation)
+ *
+ * Same physics engine as rigid_body.c — AABB-overlap collisions, iterative
+ * impulse solver, Baumgarte stabilisation, sleep system — but the initial
+ * world layout is one of N_PRESETS canned scenes, cycled with n / N:
+ *
+ *   1. Brick Wall   — 4×5 grid of small bricks; light bodies that
+ *                     scatter dramatically on impact.
+ *   2. Beam Stack   — 5 long horizontal beams piled like lumber; heavy
+ *                     bodies that topple slowly when the base goes.
+ *   3. Tower        — narrow vertical column of cubes; the classic
+ *                     "knock it over from the side" demo.
+ *   4. Pyramid      — triangular 4-3-2-1 stack; stack-stability test —
+ *                     base survives a glancing hit, dead-centre topples.
+ *
+ * Each preset stages a STRUCTURE on the right side of the world.  The
+ * user fires projectile balls in from the left with SPACE — each press
+ * spawns one sphere at near-cap horizontal velocity.  Multiple balls
+ * can be in flight at once; the only cap is MAX_BODIES.
  *
  * Bodies: cube (AABB rectangle) · sphere (drawn as circle, AABB physics).
  * Implicit floor at the bottom of the screen.  Bodies never penetrate.
@@ -39,13 +58,14 @@
  * Sleep: SLEEP_FRAMES quiet frames → frozen.  Woken by impulse > WAKE_IMP
  *        or by positional correction > WAKE_IMP (sleep heuristic [2]).
  *
- * Keys  c add cube     s add sphere    x remove last   r reset
- *       p / SPC pause  g gravity       e/E restitution
- *       t/T theme      q quit
+ * Keys  SPACE fire ball     n/N cycle preset     r reset current preset
+ *       c add cube          s add sphere         x remove last
+ *       p pause             g gravity            t/T theme
+ *       q quit
  *
  * Build
- *   gcc -std=c11 -O2 -Wall -Wextra physics/rigid_body.c -o rigid_body -lncurses
- * -lm
+ *   gcc -std=c11 -O2 -Wall -Wextra physics/rigid_multiple_bodies.c -o
+ * rigid_multiple_bodies -lncurses -lm
  *
  * Sections  §1 config  §2 clock  §3 color  §4 body + scene  §5 framebuf
  *           §6 physics §7 scene  §8 draw   §9 screen §10 app
@@ -177,6 +197,12 @@
  * literal array length; the t / T key handlers wrap modulo this. */
 #define N_THEMES 10
 
+/* N_PRESETS — number of canned initial layouts (§7).  Must match the
+ * length of k_preset_names[] and the Preset enum below; n / N keys
+ * wrap modulo this.  Cycling presets calls scene_init(new_preset)
+ * which fully rebuilds the body pool. */
+#define N_PRESETS 4
+
 /* HUD_TOP_PX — pixel units (one cell-row = 2 px in this sim) reserved
  * at the top of the world for the status bar.  resolve_ceiling (§6)
  * treats this as the ceiling so bodies never draw into row 0, leaving
@@ -306,6 +332,29 @@
  * and a typical sphere ≈ 1.02 — bodies feel "equivalent" so a sphere
  * doesn't punt a cube across the screen on first contact. */
 #define DENSITY 0.008f
+
+/* BRICK_HW / BRICK_HH — half-extents of the small bricks used by the
+ * Brick Wall preset (§7).  Sized so a 4×5 wall fits comfortably in
+ * 80 cols / 24 rows and so each brick is much lighter than the
+ * projectile sphere (DENSITY · 4·3·2 = 0.192 vs sphere's 1.02 — the
+ * sphere has ~5× more mass, which is what makes the demo dramatic). */
+#define BRICK_HW 3.0f
+#define BRICK_HH 2.0f
+
+/* BEAM_HW / BEAM_HH — half-extents of the long beams used by the
+ * Beam Stack preset.  Long-and-thin (16 cols × 3 cell-rows visual) so
+ * the stack reads as horizontal lumber.  Mass per beam ≈ 0.384, about
+ * 2.7× lighter than the projectile — enough that a direct hit topples
+ * the bottom beam without the ball stopping dead. */
+#define BEAM_HW 8.0f
+#define BEAM_HH 1.5f
+
+/* PROJECTILE_VX — horizontal velocity given to the ball when fire_
+ * projectile() runs (SPACE key).  Just under MAX_SPEED so the cap
+ * doesn't immediately clip it; high enough that DAMPING doesn't
+ * drain it before impact (DAMPING^N×PROJECTILE_VX reaches the right
+ * edge of an 80-col world in ~5 ticks while still moving fast). */
+#define PROJECTILE_VX 18.0f
 
 /* ── timing ──────────────────────────────────────────────────────────── */
 
@@ -699,6 +748,13 @@ typedef struct {
    * and initial-vx randomness.  Re-seeded from time() at boot and at
    * every reset so two runs of the demo differ. */
   uint32_t rng;
+
+  /* preset — which canned initial layout is currently loaded.  Index
+   * into k_preset_names[] (§7); also drives the scene_init() switch.
+   * Changing it rebuilds the world from scratch — physics state DOES
+   * change, hence the field lives in the simulation group rather
+   * than the rendering one.  Cycled by n / N. */
+  int preset;
 
   /* ── Rendering parameters ─────────────────────────────────────────
    * Pure cosmetic state.  Mutating these MUST be a no-op for the
@@ -1323,34 +1379,227 @@ static void scene_remove_last(void) {
     g_scene.nb--;
 }
 
+/* ─────────────────────────────────────────────────────────────────────── *
+ * Preset infrastructure.
+ *
+ * A "preset" is a deterministic initial body layout.  Each preset_*()
+ * builder appends bodies to a freshly-cleared g_scene.b[] using the
+ * scene_place_body() helper below; no preset is supposed to mutate
+ * solver constants (rest, grav) — those stay user-tunable across
+ * preset cycles so the demo state survives n / N.
+ *
+ * Adding a new preset:
+ *   1. extend the Preset enum + bump N_PRESETS in §1
+ *   2. add an entry to k_preset_names[]
+ *   3. write preset_<name>() that calls scene_place_body() in a loop
+ *   4. add a switch arm in scene_init()
+ * ─────────────────────────────────────────────────────────────────────── */
+typedef enum {
+  PRESET_BRICK_WALL = 0, /* 4×5 grid of small light bricks      */
+  PRESET_BEAMS,          /* 5-tall pile of long horizontal beams */
+  PRESET_TOWER,          /* narrow vertical column of cubes      */
+  PRESET_PYRAMID,        /* 4-3-2-1 triangular stack             */
+} Preset;
+
+static const char *k_preset_names[N_PRESETS] = {
+    "Brick Wall",
+    "Beam Stack",
+    "Tower",
+    "Pyramid",
+};
+
 /*
- * scene_init — initial-world setup: clears the pool, reseeds the RNG,
- * and places a sleeping cube on the floor with a sphere dropping from
- * the ceiling onto it.  Called at boot and on every r / R reset.
+ * scene_place_body — append a fully-specified body to g_scene.b[].
+ * Returns silently on a full pool (caller should size presets to fit
+ * MAX_BODIES, but truncation is preferable to OOB writes).  Also bumps
+ * ncubes / nsphs so the colour-pair cycle in scene_add_*() stays in
+ * sync after a preset reload.
  */
-static void scene_init(void) {
+static void scene_place_body(Kind kind, float x, float y, float hw, float hh,
+                             int cp, float vx, float vy, bool start_sleeping) {
+  if (g_scene.nb >= MAX_BODIES)
+    return;
+  Body b = {0};
+  body_init_shape(&b, kind, hw, hh, cp);
+  b.x = x;
+  b.y = y;
+  b.vx = vx;
+  b.vy = vy;
+  b.sleeping = start_sleeping;
+  g_scene.b[g_scene.nb++] = b;
+  if (kind == KIND_CUBE)
+    g_scene.ncubes++;
+  else
+    g_scene.nsphs++;
+}
+
+/*
+ * fire_projectile — spawn a ball at the left edge of the world with
+ * PROJECTILE_VX horizontal velocity, aimed across the world toward
+ * whatever structure the current preset has staged on the right.
+ * Bound to SPACE in main; pressing repeatedly stacks balls in flight
+ * (capped only by MAX_BODIES).  Returns silently on a full pool.
+ *
+ * Spawn position — CRITICAL for the demo to work:
+ *
+ *   x = 2·SPH_R           one sphere-diameter inside the left wall
+ *                          (clear of resolve_left_wall's snap)
+ *   y = WH() − 4·SPH_R    chest height — one ball-DIAMETER above the
+ *                          floor, NOT one ball-radius
+ *
+ * Why chest height and not floor level:
+ *   resolve_floor (§6) applies a slide-friction multiplier of
+ *   (1 − μ(1+e_eff)) = (1 − 0.35·1) = 0.65 to vx every time the ball
+ *   touches the floor.  A ball spawned at y = wh − 2·SPH_R has its
+ *   bottom exactly at the floor — gravity immediately pulls it into
+ *   the friction band and vx decays by ~35 %/tick (compounding), so
+ *   after only ~5 ticks (≈ 250 ms) the ball is essentially stopped
+ *   and never reaches the structure ≈ 70 % of the world away.
+ *
+ *   Spawning at y = wh − 4·SPH_R puts the ball one full diameter above
+ *   the floor.  Gravity makes it arc downward, but it takes ~18 ticks
+ *   to fall to the floor, by which time the projectile has already
+ *   crossed the world (it covers ~80 px in ~5 ticks at PROJECTILE_VX
+ *   with DAMPING).  Impact lands at the structure's middle/upper rows
+ *   — visually more dramatic than a floor-grazing shot.
+ */
+static void fire_projectile(void) {
+  float wh = WH();
+  scene_place_body(KIND_SPHERE, 2.f * SPH_R, wh - 4.f * SPH_R, SPH_R,
+                   2.f * SPH_R, 1 + (g_scene.nsphs % 6), PROJECTILE_VX, 0.f,
+                   false);
+}
+
+/*
+ * preset_brick_wall — 4 × 5 wall of small bricks on the right.  No
+ * projectile is auto-fired; the user is expected to press SPACE.
+ *
+ * Layout:
+ *   - bricks on a cell-grid centred on wall_cx, stacked from floor up
+ *   - small inter-brick gap (0.2 px) so AABB overlap doesn't trigger
+ *     on tick 0 — Pass A would correct it but a clean start reads
+ *     better visually
+ *   - all bricks start sleeping; the first projectile wakes them
+ *
+ * Mass ratio sphere : brick ≈ 5 : 1 — what makes the wall scatter.
+ */
+static void preset_brick_wall(void) {
+  float ww = WW(), wh = WH();
+
+  const int wall_cols = 4;
+  const int wall_rows = 5;
+  const float gap = 0.2f;
+  const float pitch_x = 2.f * BRICK_HW + gap;
+  const float pitch_y = 2.f * BRICK_HH + gap;
+  const float wall_cx = ww * 0.78f;
+  const float wall_bot_y = wh - BRICK_HH;
+
+  for (int r = 0; r < wall_rows; r++) {
+    for (int c = 0; c < wall_cols; c++) {
+      float x = wall_cx + (c - (wall_cols - 1) / 2.f) * pitch_x;
+      float y = wall_bot_y - r * pitch_y;
+      int cp = 1 + ((r * wall_cols + c) % 6);
+      scene_place_body(KIND_CUBE, x, y, BRICK_HW, BRICK_HH, cp, 0.f, 0.f, true);
+    }
+  }
+}
+
+/*
+ * preset_beams — 5 long horizontal beams stacked on top of each other,
+ * lumber-pile style.  Beams are wider (BEAM_HW=8) but thinner (BEAM_HH
+ * =1.5) than bricks; the heavy beams topple together as a unit rather
+ * than scatter individually, giving a very different visual to the
+ * Brick Wall preset.
+ *
+ * Stack sits at x = 75 % of the world width.  Aligned (not staggered
+ * jenga-style) — a single deep hit at the base sends the whole pile
+ * sideways.
+ */
+static void preset_beams(void) {
+  float ww = WW(), wh = WH();
+  const int beam_count = 5;
+  const float gap = 0.2f;
+  const float pitch_y = 2.f * BEAM_HH + gap;
+  const float stack_cx = ww * 0.75f;
+
+  for (int r = 0; r < beam_count; r++) {
+    scene_place_body(KIND_CUBE, stack_cx, wh - BEAM_HH - r * pitch_y, BEAM_HW,
+                     BEAM_HH, 1 + (r % 6), 0.f, 0.f, true);
+  }
+}
+
+/*
+ * preset_tower — narrow vertical column of full-size cubes at 75 % of
+ * the world width.  A SPACE-fired ball travelling along the floor hits
+ * the bottom cube and the whole tower topples sideways (the classic
+ * "kick the foundation" test).  Height capped at 6 cubes so the top
+ * stays clear of the ceiling on a 24-row terminal.
+ */
+static void preset_tower(void) {
+  float ww = WW(), wh = WH();
+  const int rows = 6;
+  const float gap = 0.1f;
+  const float pitch_y = 2.f * CUBE_HH + gap;
+
+  for (int r = 0; r < rows; r++) {
+    scene_place_body(KIND_CUBE, ww * 0.75f, wh - CUBE_HH - r * pitch_y, CUBE_HW,
+                     CUBE_HH, 1 + (r % 6), 0.f, 0.f, true);
+  }
+}
+
+/*
+ * preset_pyramid — triangular 4-3-2-1 stack (10 cubes) sitting at 70 %
+ * of world width on the floor.  Stack-stability test: a well-tuned
+ * solver keeps the pyramid standing under gravity; a SPACE-fired ball
+ * hitting the base scatters the bottom row first, the upper layers
+ * tumble after as their supports disappear.
+ */
+static void preset_pyramid(void) {
+  float ww = WW(), wh = WH();
+  const int base_rows = 4; /* 4 + 3 + 2 + 1 = 10 cubes */
+  const float gap = 0.2f;
+  const float pitch_x = 2.f * CUBE_HW + gap;
+  const float pitch_y = 2.f * CUBE_HH + gap;
+  const float pyramid_cx = ww * 0.70f;
+
+  int idx = 0;
+  for (int r = 0; r < base_rows; r++) {
+    int n = base_rows - r;
+    for (int c = 0; c < n; c++) {
+      float x = pyramid_cx + (c - (n - 1) / 2.f) * pitch_x;
+      float y = wh - CUBE_HH - r * pitch_y;
+      scene_place_body(KIND_CUBE, x, y, CUBE_HW, CUBE_HH, 1 + (idx++ % 6), 0.f,
+                       0.f, true);
+    }
+  }
+}
+
+/*
+ * scene_init — dispatcher.  Clears the body pool, reseeds the RNG,
+ * normalises the preset index, then calls the matching preset_*()
+ * builder.  Called at boot, on r/R reset, on SIGWINCH (rebuilds the
+ * world for the new geometry), and on every n / N press.
+ */
+static void scene_init(int preset) {
   g_scene.nb = g_scene.ncubes = g_scene.nsphs = 0;
   g_scene.tick = 0;
   g_scene.rng = (uint32_t)time(NULL) ^ 0xDEAD1234u;
+  g_scene.preset = ((preset % N_PRESETS) + N_PRESETS) % N_PRESETS;
 
-  float ww = WW(), wh = WH();
-
-  /* cube pre-placed at rest on floor (sleeping so it doesn't drift). */
-  Body c = {0};
-  body_init_shape(&c, KIND_CUBE, CUBE_HW, CUBE_HH, 1);
-  c.x = ww * 0.50f;
-  c.y = wh - CUBE_HH;
-  c.sleeping = true;
-  g_scene.b[g_scene.nb++] = c;
-  g_scene.ncubes++;
-
-  /* sphere dropping from the ceiling — falls onto the cube. */
-  Body s = {0};
-  body_init_shape(&s, KIND_SPHERE, SPH_R, 2.f * SPH_R, 4);
-  s.x = ww * 0.50f;
-  s.y = s.hh + HUD_TOP_PX;
-  g_scene.b[g_scene.nb++] = s;
-  g_scene.nsphs++;
+  switch (g_scene.preset) {
+  case PRESET_BRICK_WALL:
+    preset_brick_wall();
+    break;
+  case PRESET_BEAMS:
+    preset_beams();
+    break;
+  case PRESET_TOWER:
+    preset_tower();
+    break;
+  case PRESET_PYRAMID:
+    preset_pyramid();
+    break;
+  }
 }
 
 /* ===================================================================== */
@@ -1390,20 +1639,12 @@ static void draw_body(const Body *b) {
  *   row rows-1  left  (CP_HINT bright cyan   + bold) — actions / keys
  */
 static void draw_hud_top(int fps) {
-  int nc = 0, ns = 0;
-  for (int i = 0; i < g_scene.nb; i++) {
-    if (g_scene.b[i].kind == KIND_CUBE)
-      nc++;
-    else
-      ns++;
-  }
-  char buf[200];
-  snprintf(
-      buf, sizeof buf,
-      " cubes:%d  spheres:%d/%d  rest:%.2f  grav:%s  theme:%s  %s  %d fps ", nc,
-      ns, MAX_BODIES, g_scene.rest, g_scene.grav ? "on" : "off",
-      k_themes[g_scene.theme].name, g_scene.paused ? "PAUSED " : "running",
-      fps);
+  char buf[220];
+  snprintf(buf, sizeof buf,
+           " preset:%s  bodies:%d/%d  grav:%s  theme:%s  %s  %d fps ",
+           k_preset_names[g_scene.preset], g_scene.nb, MAX_BODIES,
+           g_scene.grav ? "on" : "off", k_themes[g_scene.theme].name,
+           g_scene.paused ? "PAUSED " : "running", fps);
   int len = (int)strlen(buf);
   int col = g_cols - len;
   if (col < 0)
@@ -1414,9 +1655,10 @@ static void draw_hud_top(int fps) {
 }
 
 static void draw_hud_bottom(void) {
-  const char *full = " q:quit  p:pause  r:reset  c:cube  s:sphere  x:del  "
-                     "e/E:rest  g:gravity  t/T:theme ";
-  const char *shrt = " q:quit  p:pause  r:reset  c:cube  s:sphere  t:theme ";
+  const char *full = " q:quit  SPACE:fire ball  n/N:preset  r:reset  "
+                     "p:pause  c/s:cube/sph  x:del  g:grav  t/T:theme ";
+  const char *shrt =
+      " q:quit  SPACE:fire  n:preset  r:reset  p:pause  t:theme ";
   const char *h = full;
   if ((int)strlen(full) >= g_cols - 1)
     h = shrt;
@@ -1501,7 +1743,7 @@ int main(void) {
     g_rows = (r < ROWS_MAX) ? r : ROWS_MAX;
     g_cols = (c < COLS_MAX) ? c : COLS_MAX;
   }
-  scene_init();
+  scene_init(PRESET_BRICK_WALL);
 
   int64_t next = clock_ns();
   int64_t fps_window_start = next;
@@ -1516,12 +1758,15 @@ int main(void) {
       case 27:
         g_quit = 1;
         break;
-      case 'p':
       case ' ':
+        fire_projectile();
+        break;
+      case 'p':
+      case 'P':
         g_scene.paused = !g_scene.paused;
         break;
       case 'r':
-        scene_init();
+        scene_init(g_scene.preset);
         break;
       case 'c':
         scene_add_cube();
@@ -1535,13 +1780,11 @@ int main(void) {
       case 'g':
         g_scene.grav = !g_scene.grav;
         break;
-      case 'e':
-        if (g_scene.rest < 0.95f)
-          g_scene.rest += REST_STEP;
+      case 'n':
+        scene_init(g_scene.preset + 1);
         break;
-      case 'E':
-        if (g_scene.rest > 0.05f)
-          g_scene.rest -= REST_STEP;
+      case 'N':
+        scene_init(g_scene.preset - 1 + N_PRESETS);
         break;
       case 't':
         g_scene.theme = (g_scene.theme + 1) % N_THEMES;
@@ -1556,7 +1799,7 @@ int main(void) {
 
     if (g_resize) {
       screen_resize();
-      scene_init();
+      scene_init(g_scene.preset);
     }
 
     int64_t now = clock_ns();

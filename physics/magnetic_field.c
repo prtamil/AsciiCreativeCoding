@@ -178,63 +178,62 @@
 /* ===================================================================== */
 
 enum {
-    SIM_FPS_DEFAULT = 30,
-    SIM_FPS_MIN     = 5,
-    SIM_FPS_MAX     = 60,
-    SIM_FPS_STEP    = 5,
+  SIM_FPS_DEFAULT = 30,
+  SIM_FPS_MIN = 5,
+  SIM_FPS_MAX = 60,
+  SIM_FPS_STEP = 5,
 
-    MAX_MONOPOLES   = 8,    /* max magnetic charges (2 per dipole)        */
-    MAX_DIPOLES     = 4,    /* max bar magnets                            */
-    N_SEEDS         = 16,   /* field lines seeded around each + pole      */
-    MAX_LINE_STEPS  = 600,  /* max RK4 steps per field line               */
-    MAX_LINES       = MAX_DIPOLES * N_SEEDS,  /* total lines to trace     */
+  MAX_MONOPOLES = 8,    /* max magnetic charges (2 per dipole)        */
+  MAX_DIPOLES = 4,      /* max bar magnets                            */
+  N_SEEDS = 16,         /* field lines seeded around each + pole      */
+  MAX_LINE_STEPS = 600, /* max RK4 steps per field line               */
+  MAX_LINES = MAX_DIPOLES * N_SEEDS, /* total lines to trace     */
 
-    N_PRESETS       = 4,
-    N_THEMES        = 5,
+  N_PRESETS = 4,
+  N_THEMES = 5,
 
-    LINES_PER_TICK_DEF = 2, /* field lines traced per tick                */
-    LINES_PER_TICK_MIN = 1,
-    LINES_PER_TICK_MAX = 8,
+  LINES_PER_TICK_DEF = 2, /* field lines traced per tick                */
+  LINES_PER_TICK_MIN = 1,
+  LINES_PER_TICK_MAX = 8,
 
-    ROWS_MAX        = 128,
-    COLS_MAX        = 512,
+  ROWS_MAX = 128,
+  COLS_MAX = 512,
 };
 
-#define NS_PER_SEC      1000000000LL
-#define TICK_NS(f)      (NS_PER_SEC / (f))
+#define NS_PER_SEC 1000000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
 
 /* RK4 step size in normalised cell units */
-#define RK4_H           0.35f
+#define RK4_H 0.35f
 /* Stop tracing if |B| < this (near null points) */
-#define B_MIN           1e-6f
+#define B_MIN 1e-6f
 /* Monopole softening radius in cell units */
-#define SOFT            0.8f
+#define SOFT 0.8f
 /* Seed circle radius around a pole, in cell units */
-#define SEED_R          1.2f
+#define SEED_R 1.2f
 /* Arrow placed every ARR_STRIDE steps along a line */
-#define ARR_STRIDE      18
+#define ARR_STRIDE 18
 /* Aspect ratio correction: terminal cells are ~2x taller than wide */
-#define ASPECT_R        2.0f
+#define ASPECT_R 2.0f
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)(ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ===================================================================== */
@@ -257,14 +256,14 @@ static void clock_sleep_ns(int64_t ns)
  * remain legible against any field-line palette.
  */
 enum {
-    CP_LINE_DIM = 1,
-    CP_LINE_MID = 2,
-    CP_LINE_BRT = 3,
-    CP_NORTH    = 4,
-    CP_SOUTH    = 5,
-    CP_BODY     = 6,
-    CP_HUD      = 7,
-    CP_HINT     = 8,
+  CP_LINE_DIM = 1,
+  CP_LINE_MID = 2,
+  CP_LINE_BRT = 3,
+  CP_NORTH = 4,
+  CP_SOUTH = 5,
+  CP_BODY = 6,
+  CP_HUD = 7,
+  CP_HINT = 8,
 };
 
 /* HUD inset rows reserved at the top + bottom of the terminal.  Field
@@ -305,96 +304,89 @@ enum {
  * 16-23 / 232-239 become invisible against default-black + A_DIM).
  */
 typedef struct {
-    /* ── 256-colour palette (preferred when COLORS >= 256) ────────── *
-     * Indices into the xterm-256 cube.  Listed in the order they
-     * appear visually on a traced line — dim at the far/null end,
-     * brightest at the source-pole end. */
-    short line_dim;   /* CP_LINE_DIM — tail of line near a null point or
-                       *               the opposite pole; LOWEST luminance
-                       *               tier of the ramp [ref 8]            */
-    short line_mid;   /* CP_LINE_MID — middle third of the line;
-                       *               medium luminance tier               */
-    short line_brt;   /* CP_LINE_BRT — first third near the source pole,
-                       *               the "freshest" look; BRIGHTEST tier */
-    short north;      /* CP_NORTH    — 'N' pole marker, bold accent —
-                       *               must POP against the ramp           */
-    short south;      /* CP_SOUTH    — 'S' pole marker, contrasting accent
-                       *               (typically the colour-wheel opposite
-                       *               of `north` for visual polarity)     */
-    short body;       /* CP_BODY     — '=' body line drawn between N and S
-                       *               poles of the same magnet; subdued
-                       *               so it doesn't compete with the ramp */
+  /* ── 256-colour palette (preferred when COLORS >= 256) ────────── *
+   * Indices into the xterm-256 cube.  Listed in the order they
+   * appear visually on a traced line — dim at the far/null end,
+   * brightest at the source-pole end. */
+  short line_dim; /* CP_LINE_DIM — tail of line near a null point or
+                   *               the opposite pole; LOWEST luminance
+                   *               tier of the ramp [ref 8]            */
+  short line_mid; /* CP_LINE_MID — middle third of the line;
+                   *               medium luminance tier               */
+  short line_brt; /* CP_LINE_BRT — first third near the source pole,
+                   *               the "freshest" look; BRIGHTEST tier */
+  short north;    /* CP_NORTH    — 'N' pole marker, bold accent —
+                   *               must POP against the ramp           */
+  short south;    /* CP_SOUTH    — 'S' pole marker, contrasting accent
+                   *               (typically the colour-wheel opposite
+                   *               of `north` for visual polarity)     */
+  short body;     /* CP_BODY     — '=' body line drawn between N and S
+                   *               poles of the same magnet; subdued
+                   *               so it doesn't compete with the ramp */
 
-    /* ── 8-colour ANSI fallback (used when COLORS < 256) ──────────── *
-     * Same semantic roles as above, expressed in the 8-colour ANSI
-     * basis (COLOR_RED, COLOR_BLUE, …).  Granularity is coarser, so
-     * the ramp here uses one accent colour repeated rather than three
-     * luminance tiers — readability is preserved by relying on
-     * line-density gradients instead of colour-tier separation. */
-    short line_dim8, line_mid8, line_brt8;
-    short north8, south8, body8;
+  /* ── 8-colour ANSI fallback (used when COLORS < 256) ──────────── *
+   * Same semantic roles as above, expressed in the 8-colour ANSI
+   * basis (COLOR_RED, COLOR_BLUE, …).  Granularity is coarser, so
+   * the ramp here uses one accent colour repeated rather than three
+   * luminance tiers — readability is preserved by relying on
+   * line-density gradients instead of colour-tier separation. */
+  short line_dim8, line_mid8, line_brt8;
+  short north8, south8, body8;
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
     /* Electric — cyan field on black */
-    { 51, 87, 231,  196, 21,  250,
-      COLOR_CYAN, COLOR_CYAN, COLOR_WHITE,
-      COLOR_RED, COLOR_BLUE, COLOR_WHITE },
+    {51, 87, 231, 196, 21, 250, COLOR_CYAN, COLOR_CYAN, COLOR_WHITE, COLOR_RED,
+     COLOR_BLUE, COLOR_WHITE},
     /* Plasma — magenta/violet */
-    { 93, 165, 207,  226, 57,  248,
-      COLOR_MAGENTA, COLOR_MAGENTA, COLOR_WHITE,
-      COLOR_YELLOW, COLOR_BLUE, COLOR_WHITE },
+    {93, 165, 207, 226, 57, 248, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_WHITE,
+     COLOR_YELLOW, COLOR_BLUE, COLOR_WHITE},
     /* Fire — red/orange field */
-    { 124, 208, 226,  231, 21,  250,
-      COLOR_RED, COLOR_RED, COLOR_YELLOW,
-      COLOR_WHITE, COLOR_BLUE, COLOR_WHITE },
+    {124, 208, 226, 231, 21, 250, COLOR_RED, COLOR_RED, COLOR_YELLOW,
+     COLOR_WHITE, COLOR_BLUE, COLOR_WHITE},
     /* Ocean — blue/teal */
-    { 25, 39, 123,  196, 226,  250,
-      COLOR_BLUE, COLOR_CYAN, COLOR_WHITE,
-      COLOR_RED, COLOR_YELLOW, COLOR_WHITE },
+    {25, 39, 123, 196, 226, 250, COLOR_BLUE, COLOR_CYAN, COLOR_WHITE, COLOR_RED,
+     COLOR_YELLOW, COLOR_WHITE},
     /* Matrix — green */
-    { 22, 46, 118,  196, 21,  250,
-      COLOR_GREEN, COLOR_GREEN, COLOR_WHITE,
-      COLOR_RED, COLOR_BLUE, COLOR_WHITE },
+    {22, 46, 118, 196, 21, 250, COLOR_GREEN, COLOR_GREEN, COLOR_WHITE,
+     COLOR_RED, COLOR_BLUE, COLOR_WHITE},
 };
 
 /* Theme-dependent pairs only — CP_HUD / CP_HINT live in color_init(). */
-static void theme_apply(int t)
-{
-    const Theme *th = &k_themes[t];
-    if (COLORS >= 256) {
-        init_pair(CP_LINE_DIM, th->line_dim, COLOR_BLACK);
-        init_pair(CP_LINE_MID, th->line_mid, COLOR_BLACK);
-        init_pair(CP_LINE_BRT, th->line_brt, COLOR_BLACK);
-        init_pair(CP_NORTH,    th->north,    COLOR_BLACK);
-        init_pair(CP_SOUTH,    th->south,    COLOR_BLACK);
-        init_pair(CP_BODY,     th->body,     COLOR_BLACK);
-    } else {
-        init_pair(CP_LINE_DIM, th->line_dim8, COLOR_BLACK);
-        init_pair(CP_LINE_MID, th->line_mid8, COLOR_BLACK);
-        init_pair(CP_LINE_BRT, th->line_brt8, COLOR_BLACK);
-        init_pair(CP_NORTH,    th->north8,    COLOR_BLACK);
-        init_pair(CP_SOUTH,    th->south8,    COLOR_BLACK);
-        init_pair(CP_BODY,     th->body8,     COLOR_BLACK);
-    }
+static void theme_apply(int t) {
+  const Theme *th = &k_themes[t];
+  if (COLORS >= 256) {
+    init_pair(CP_LINE_DIM, th->line_dim, COLOR_BLACK);
+    init_pair(CP_LINE_MID, th->line_mid, COLOR_BLACK);
+    init_pair(CP_LINE_BRT, th->line_brt, COLOR_BLACK);
+    init_pair(CP_NORTH, th->north, COLOR_BLACK);
+    init_pair(CP_SOUTH, th->south, COLOR_BLACK);
+    init_pair(CP_BODY, th->body, COLOR_BLACK);
+  } else {
+    init_pair(CP_LINE_DIM, th->line_dim8, COLOR_BLACK);
+    init_pair(CP_LINE_MID, th->line_mid8, COLOR_BLACK);
+    init_pair(CP_LINE_BRT, th->line_brt8, COLOR_BLACK);
+    init_pair(CP_NORTH, th->north8, COLOR_BLACK);
+    init_pair(CP_SOUTH, th->south8, COLOR_BLACK);
+    init_pair(CP_BODY, th->body8, COLOR_BLACK);
+  }
 }
 
 /* One-shot at startup — binds the two CANONICAL HUD pairs (bright
  * yellow status, bright cyan hint) then applies the initial theme. */
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
+static void color_init(void) {
+  start_color();
+  use_default_colors();
 
-    if (COLORS >= 256) {
-        init_pair(CP_HUD,  226, -1);   /* canonical bright yellow */
-        init_pair(CP_HINT,  51, -1);   /* canonical bright cyan   */
-    } else {
-        init_pair(CP_HUD,  COLOR_YELLOW, -1);
-        init_pair(CP_HINT, COLOR_CYAN,   -1);
-    }
+  if (COLORS >= 256) {
+    init_pair(CP_HUD, 226, -1); /* canonical bright yellow */
+    init_pair(CP_HINT, 51, -1); /* canonical bright cyan   */
+  } else {
+    init_pair(CP_HUD, COLOR_YELLOW, -1);
+    init_pair(CP_HINT, COLOR_CYAN, -1);
+  }
 
-    theme_apply(0);
+  theme_apply(0);
 }
 
 /* ===================================================================== */
@@ -434,19 +426,19 @@ static void color_init(void)
  *   — that's the modelling trick this struct encodes.
  */
 typedef struct {
-    float cx, cy;  /* centre in CELL coords (not pixels) — physics and
-                    * rendering share the same grid, so no coordinate
-                    * conversion is needed between field_at() and
-                    * scene_draw().  Floats because the integrator
-                    * advances in sub-cell RK4 steps (RK4_H = 0.35). */
-    float q;       /* magnetic "charge":
-                    *   +1.0f = NORTH  (field SOURCE — lines emerge),
-                    *   -1.0f = SOUTH  (field SINK   — lines converge).
-                    * Magnitude is in ARBITRARY UNITS — only the
-                    * ratio between poles affects line shape.  |B|'s
-                    * absolute scale is normalised away by the
-                    * unit-arc-length ODE in trace_line(), which
-                    * divides by |B| at every step. */
+  float cx, cy; /* centre in CELL coords (not pixels) — physics and
+                 * rendering share the same grid, so no coordinate
+                 * conversion is needed between field_at() and
+                 * scene_draw().  Floats because the integrator
+                 * advances in sub-cell RK4 steps (RK4_H = 0.35). */
+  float q;      /* magnetic "charge":
+                 *   +1.0f = NORTH  (field SOURCE — lines emerge),
+                 *   -1.0f = SOUTH  (field SINK   — lines converge).
+                 * Magnitude is in ARBITRARY UNITS — only the
+                 * ratio between poles affects line shape.  |B|'s
+                 * absolute scale is normalised away by the
+                 * unit-arc-length ODE in trace_line(), which
+                 * divides by |B| at every step. */
 } Monopole;
 
 /*
@@ -474,19 +466,19 @@ typedef struct {
  *   Neither pass ever touches the other's array.
  */
 typedef struct {
-    float nx, ny;  /* NORTH pole position (cell coords) — matches the
-                    * q=+1 monopole that scene_add_dipole() spawned for
-                    * this magnet.  Duplicates information in mp[] but
-                    * spares scene_draw() a search through mp[]. */
-    float sx, sy;  /* SOUTH pole position (cell coords) — matches the
-                    * q=−1 monopole partner of (nx, ny). */
-    int   color;   /* colour-pair index for the body glyph (the '='
-                    * line between N and S).  Currently always CP_BODY;
-                    * field is reserved for per-magnet tinting if a
-                    * future preset wants colour-coded magnets (e.g.
-                    * red for the "active" one).  Kept as a struct
-                    * field rather than a global so the choice is
-                    * per-dipole rather than per-frame. */
+  float nx, ny; /* NORTH pole position (cell coords) — matches the
+                 * q=+1 monopole that scene_add_dipole() spawned for
+                 * this magnet.  Duplicates information in mp[] but
+                 * spares scene_draw() a search through mp[]. */
+  float sx, sy; /* SOUTH pole position (cell coords) — matches the
+                 * q=−1 monopole partner of (nx, ny). */
+  int color;    /* colour-pair index for the body glyph (the '='
+                 * line between N and S).  Currently always CP_BODY;
+                 * field is reserved for per-magnet tinting if a
+                 * future preset wants colour-coded magnets (e.g.
+                 * red for the "active" one).  Kept as a struct
+                 * field rather than a global so the choice is
+                 * per-dipole rather than per-frame. */
 } Dipole;
 
 /*
@@ -494,20 +486,19 @@ typedef struct {
  * B += q_i * (r - r_i) / |r - r_i|^3
  * Softening avoids divergence at the pole center.
  */
-static void field_at(const Monopole *mp, int nm,
-                     float px, float py,
-                     float *bx, float *by)
-{
-    *bx = 0.0f; *by = 0.0f;
-    for (int i = 0; i < nm; i++) {
-        float dx = px - mp[i].cx;
-        float dy = (py - mp[i].cy) * ASPECT_R;  /* aspect correction */
-        float r2 = dx*dx + dy*dy + SOFT*SOFT;
-        float r  = sqrtf(r2);
-        float inv3 = mp[i].q / (r2 * r);
-        *bx += inv3 * dx;
-        *by += inv3 * dy / ASPECT_R;
-    }
+static void field_at(const Monopole *mp, int nm, float px, float py, float *bx,
+                     float *by) {
+  *bx = 0.0f;
+  *by = 0.0f;
+  for (int i = 0; i < nm; i++) {
+    float dx = px - mp[i].cx;
+    float dy = (py - mp[i].cy) * ASPECT_R; /* aspect correction */
+    float r2 = dx * dx + dy * dy + SOFT * SOFT;
+    float r = sqrtf(r2);
+    float inv3 = mp[i].q / (r2 * r);
+    *bx += inv3 * dx;
+    *by += inv3 * dy / ASPECT_R;
+  }
 }
 
 /* ===================================================================== */
@@ -559,36 +550,36 @@ static void field_at(const Monopole *mp, int nm,
  * (CLAUDE.md Memory rule).
  */
 typedef struct {
-    /* Pre-rasterised cell trail.  ALL four arrays share index i:
-     * index 0 = seed cell near the +pole, index len-1 = terminus
-     * (off-grid, near a null, or step cap).  Entries past `len` are
-     * uninitialised — DO NOT read past len. */
-    int  col[MAX_LINE_STEPS];   /* terminal COLUMN of step i (cell coords) */
-    int  row[MAX_LINE_STEPS];   /* terminal ROW    of step i (cell coords) */
-    char ch[MAX_LINE_STEPS];    /* glyph chosen at TRACE TIME from the
-                                 * tangent direction:
-                                 *   '- | / \'  line segment (line_char,
-                                 *              8-way angle bucket)
-                                 *   '> v < ^'  ARROW glyph every
-                                 *              ARR_STRIDE steps
-                                 *              (direction_arrow) so the
-                                 *              reader sees the FLOW
-                                 *              DIRECTION, not just the
-                                 *              line geometry            */
-    int  cp[MAX_LINE_STEPS];    /* CP_LINE_DIM / MID / BRT — distance-
-                                 * from-source brightness ramp [ref 8].
-                                 * Filled AFTER the full trace (need to
-                                 * know `len` to split into three tiers
-                                 * — see line_color_pair).               */
-    int  len;                   /* steps actually used (0..MAX_LINE_STEPS).
-                                 * 0 means the seed was already at a
-                                 * null/off-grid — caller still treats
-                                 * the line as done.                     */
-    bool done;                  /* trace completed marker — set true at
-                                 * the END of trace_line().  Guards the
-                                 * render pass from drawing a partially-
-                                 * traced line if tracing ever becomes
-                                 * incremental in the future.            */
+  /* Pre-rasterised cell trail.  ALL four arrays share index i:
+   * index 0 = seed cell near the +pole, index len-1 = terminus
+   * (off-grid, near a null, or step cap).  Entries past `len` are
+   * uninitialised — DO NOT read past len. */
+  int col[MAX_LINE_STEPS]; /* terminal COLUMN of step i (cell coords) */
+  int row[MAX_LINE_STEPS]; /* terminal ROW    of step i (cell coords) */
+  char ch[MAX_LINE_STEPS]; /* glyph chosen at TRACE TIME from the
+                            * tangent direction:
+                            *   '- | / \'  line segment (line_char,
+                            *              8-way angle bucket)
+                            *   '> v < ^'  ARROW glyph every
+                            *              ARR_STRIDE steps
+                            *              (direction_arrow) so the
+                            *              reader sees the FLOW
+                            *              DIRECTION, not just the
+                            *              line geometry            */
+  int cp[MAX_LINE_STEPS];  /* CP_LINE_DIM / MID / BRT — distance-
+                            * from-source brightness ramp [ref 8].
+                            * Filled AFTER the full trace (need to
+                            * know `len` to split into three tiers
+                            * — see line_color_pair).               */
+  int len;                 /* steps actually used (0..MAX_LINE_STEPS).
+                            * 0 means the seed was already at a
+                            * null/off-grid — caller still treats
+                            * the line as done.                     */
+  bool done;               /* trace completed marker — set true at
+                            * the END of trace_line().  Guards the
+                            * render pass from drawing a partially-
+                            * traced line if tracing ever becomes
+                            * incremental in the future.            */
 } FieldLine;
 
 /*
@@ -641,67 +632,67 @@ typedef struct {
  * frame; no dynamic allocation.
  */
 typedef struct {
-    /* ── (A) PHYSICS DATA ─────────────────────────────────────────── *
-     * Flat array of magnetic point charges, the INPUT to field_at().
-     * Order is arbitrary — superposition is commutative (refs [1, 2])
-     * — so a single uniform loop handles N dipoles of any orientation.
-     * Indexed 0 .. nm-1; entries past nm are uninitialised garbage. */
-    Monopole  mp[MAX_MONOPOLES];   /* the point charges (2 per dipole) */
-    int       nm;                  /* live count — ALWAYS even (poles
-                                    * come in N/S pairs)              */
+  /* ── (A) PHYSICS DATA ─────────────────────────────────────────── *
+   * Flat array of magnetic point charges, the INPUT to field_at().
+   * Order is arbitrary — superposition is commutative (refs [1, 2])
+   * — so a single uniform loop handles N dipoles of any orientation.
+   * Indexed 0 .. nm-1; entries past nm are uninitialised garbage. */
+  Monopole mp[MAX_MONOPOLES]; /* the point charges (2 per dipole) */
+  int nm;                     /* live count — ALWAYS even (poles
+                               * come in N/S pairs)              */
 
-    /* ── (B) RENDER DATA — visual representation, decoupled from (A) ─ *
-     * Two sub-pools:
-     *   dp[]     — magnet bodies (knowing which N and S pair up)
-     *   lines[]  — pre-rasterised streamlines, traced ONCE in
-     *              scene_seed_lines() then redrawn every frame.
-     * scene_draw() touches ONLY this region (+ region D); the physics
-     * arrays are never read during rendering. */
-    Dipole    dp[MAX_DIPOLES];     /* magnet bodies (N→S geometry pairs) */
-    int       nd;                  /* live dipole count                  */
+  /* ── (B) RENDER DATA — visual representation, decoupled from (A) ─ *
+   * Two sub-pools:
+   *   dp[]     — magnet bodies (knowing which N and S pair up)
+   *   lines[]  — pre-rasterised streamlines, traced ONCE in
+   *              scene_seed_lines() then redrawn every frame.
+   * scene_draw() touches ONLY this region (+ region D); the physics
+   * arrays are never read during rendering. */
+  Dipole dp[MAX_DIPOLES]; /* magnet bodies (N→S geometry pairs) */
+  int nd;                 /* live dipole count                  */
 
-    FieldLine lines[MAX_LINES];    /* pre-rasterised streamlines, BSS-
-                                    * resident — no malloc on hot path  */
-    int       n_lines;             /* total lines TRACED for this preset
-                                    * (set once during seeding)         */
-    int       lines_traced;        /* lines REVEALED to the viewer so far
-                                    * (≤ n_lines).  Progressive reveal:
-                                    * scene_draw() paints only
-                                    * lines[0 .. lines_traced) so the
-                                    * startup isn't a blocking pause —
-                                    * the user sees field lines appear
-                                    * one batch per tick.               */
+  FieldLine lines[MAX_LINES]; /* pre-rasterised streamlines, BSS-
+                               * resident — no malloc on hot path  */
+  int n_lines;                /* total lines TRACED for this preset
+                               * (set once during seeding)         */
+  int lines_traced;           /* lines REVEALED to the viewer so far
+                               * (≤ n_lines).  Progressive reveal:
+                               * scene_draw() paints only
+                               * lines[0 .. lines_traced) so the
+                               * startup isn't a blocking pause —
+                               * the user sees field lines appear
+                               * one batch per tick.               */
 
-    /* ── (C) ANIMATION CONTROL — user-tunable per-frame state ────── *
-     * These are the keybind targets — every value here is owned by
-     * the input handler in main() and read by tick + HUD draw.  No
-     * physics ever depends on these (changing preset/theme rebuilds
-     * regions A/B from scratch via scene_init).                       */
-    int       lines_per_tick;      /* [/]+ keys — lines revealed per
-                                    * tick.  Visual PACING only; the
-                                    * underlying trace work is already
-                                    * done at seed time.               */
-    bool      paused;              /* space / p — freeze the reveal
-                                    * animation.  Physics is static, so
-                                    * "pause" only halts incrementing
-                                    * lines_traced.                    */
-    int       preset;              /* 0 .. N_PRESETS-1 active scenario
-                                    * (Dipole / Quadrupole / Attract /
-                                    * Repel).  Changing this triggers a
-                                    * full scene rebuild.              */
-    int       theme;               /* 0 .. N_THEMES-1 active palette.
-                                    * Changing this re-binds colour
-                                    * pairs but does NOT rebuild lines
-                                    * — line geometry is theme-free.   */
+  /* ── (C) ANIMATION CONTROL — user-tunable per-frame state ────── *
+   * These are the keybind targets — every value here is owned by
+   * the input handler in main() and read by tick + HUD draw.  No
+   * physics ever depends on these (changing preset/theme rebuilds
+   * regions A/B from scratch via scene_init).                       */
+  int lines_per_tick; /* [/]+ keys — lines revealed per
+                       * tick.  Visual PACING only; the
+                       * underlying trace work is already
+                       * done at seed time.               */
+  bool paused;        /* space / p — freeze the reveal
+                       * animation.  Physics is static, so
+                       * "pause" only halts incrementing
+                       * lines_traced.                    */
+  int preset;         /* 0 .. N_PRESETS-1 active scenario
+                       * (Dipole / Quadrupole / Attract /
+                       * Repel).  Changing this triggers a
+                       * full scene rebuild.              */
+  int theme;          /* 0 .. N_THEMES-1 active palette.
+                       * Changing this re-binds colour
+                       * pairs but does NOT rebuild lines
+                       * — line geometry is theme-free.   */
 
-    /* ── (D) GEOMETRY — render-band dimensions ───────────────────── *
-     * The INSET render band size, NOT full terminal dimensions:
-     *   rows = term_rows − HUD_TOP_ROWS − HUD_BOT_ROWS
-     *   cols = term_cols
-     * The HUD rows live OUTSIDE this coordinate system — scene_draw()
-     * shifts every mvaddch by HUD_TOP_ROWS so the canvas starts at
-     * terminal row 1.  Set once per init/resize and frozen thereafter. */
-    int       cols, rows;
+  /* ── (D) GEOMETRY — render-band dimensions ───────────────────── *
+   * The INSET render band size, NOT full terminal dimensions:
+   *   rows = term_rows − HUD_TOP_ROWS − HUD_BOT_ROWS
+   *   cols = term_cols
+   * The HUD rows live OUTSIDE this coordinate system — scene_draw()
+   * shifts every mvaddch by HUD_TOP_ROWS so the canvas starts at
+   * terminal row 1.  Set once per init/resize and frozen thereafter. */
+  int cols, rows;
 } Scene;
 
 /* ── Arrow glyph from tangent direction (4-way, picked from 8 sectors) ─ *
@@ -710,40 +701,46 @@ typedef struct {
  * '>' / '<', ↓ and ↑ onto 'v' / '^'.  4 distinct outputs is enough — a
  * field line at 90° vs 270° points the SAME way along its trail; only
  * the cardinal direction matters for the reader.                       */
-static char direction_arrow(float dx, float dy)
-{
-    float angle = atan2f(dy * ASPECT_R, dx);
-    if (angle < 0) angle += 2.0f * (float)M_PI;            /* → [0, 2π)  */
-    int sector = (int)(angle / ((float)M_PI / 4.0f) + 0.5f) % 8;
-    static const char sym[4] = { '>', 'v', '<', '^' };
-    return sym[sector % 4];
+static char direction_arrow(float dx, float dy) {
+  float angle = atan2f(dy * ASPECT_R, dx);
+  if (angle < 0)
+    angle += 2.0f * (float)M_PI; /* → [0, 2π)  */
+  int sector = (int)(angle / ((float)M_PI / 4.0f) + 0.5f) % 8;
+  static const char sym[4] = {'>', 'v', '<', '^'};
+  return sym[sector % 4];
 }
 
 /* ── Line character from direction ────────────────────────────────── */
 
-static char line_char(float dx, float dy)
-{
-    float angle = atan2f(dy * ASPECT_R, dx);
-    if (angle < 0) angle += (float)M_PI;
-    if (angle >= (float)M_PI) angle -= (float)M_PI;
-    /* normalize to [0, pi) and pick character */
-    float deg = angle * 180.0f / (float)M_PI;
-    if (deg < 22.5f || deg >= 157.5f) return '-';
-    if (deg < 67.5f)  return '\\';
-    if (deg < 112.5f) return '|';
-    return '/';
+static char line_char(float dx, float dy) {
+  float angle = atan2f(dy * ASPECT_R, dx);
+  if (angle < 0)
+    angle += (float)M_PI;
+  if (angle >= (float)M_PI)
+    angle -= (float)M_PI;
+  /* normalize to [0, pi) and pick character */
+  float deg = angle * 180.0f / (float)M_PI;
+  if (deg < 22.5f || deg >= 157.5f)
+    return '-';
+  if (deg < 67.5f)
+    return '\\';
+  if (deg < 112.5f)
+    return '|';
+  return '/';
 }
 
 /* ── Color pair for a step along a line based on distance from pole ── */
 
-static int line_color_pair(int step, int total)
-{
-    /* bright near source pole, dim farther away */
-    if (total <= 0) return CP_LINE_DIM;
-    int third = total / 3;
-    if (step < third)       return CP_LINE_BRT;
-    if (step < 2 * third)   return CP_LINE_MID;
+static int line_color_pair(int step, int total) {
+  /* bright near source pole, dim farther away */
+  if (total <= 0)
     return CP_LINE_DIM;
+  int third = total / 3;
+  if (step < third)
+    return CP_LINE_BRT;
+  if (step < 2 * third)
+    return CP_LINE_MID;
+  return CP_LINE_DIM;
 }
 
 /* ── Helpers for trace_line — each one names a single algorithmic step ─ */
@@ -753,17 +750,17 @@ static int line_color_pair(int step, int total)
  * as the rounded cell index (defensive against floor/ceil rounding at
  * the boundary).  Returns the rounded cell via out-params so the caller
  * doesn't repeat the same rounding. */
-static bool cell_in_grid(float px, float py, int cols, int rows,
-                         int *out_col, int *out_row)
-{
-    if (px < 0 || px >= (float)cols || py < 0 || py >= (float)rows)
-        return false;
-    int col = (int)(px + 0.5f);
-    int row = (int)(py + 0.5f);
-    if (col < 0 || col >= cols || row < 0 || row >= rows) return false;
-    *out_col = col;
-    *out_row = row;
-    return true;
+static bool cell_in_grid(float px, float py, int cols, int rows, int *out_col,
+                         int *out_row) {
+  if (px < 0 || px >= (float)cols || py < 0 || py >= (float)rows)
+    return false;
+  int col = (int)(px + 0.5f);
+  int row = (int)(py + 0.5f);
+  if (col < 0 || col >= cols || row < 0 || row >= rows)
+    return false;
+  *out_col = col;
+  *out_row = row;
+  return true;
 }
 
 /* CLASSICAL RK4 EVALUATION (Numerical Recipes Ch.17 [ref 5]) —
@@ -781,24 +778,23 @@ static bool cell_in_grid(float px, float py, int cols, int rows,
  *
  * Returns false when |B̄| < B_MIN — the position is at a NULL POINT
  * [ref 6] where the tangent is undefined and integration must stop. */
-static bool rk4_unit_tangent(const Monopole *mp, int nm,
-                             float px, float py, float h,
-                             float *tx, float *ty)
-{
-    float k1x, k1y, k2x, k2y, k3x, k3y, k4x, k4y;
-    field_at(mp, nm, px,             py,             &k1x, &k1y);
-    field_at(mp, nm, px+0.5f*h*k1x,  py+0.5f*h*k1y,  &k2x, &k2y);
-    field_at(mp, nm, px+0.5f*h*k2x,  py+0.5f*h*k2y,  &k3x, &k3y);
-    field_at(mp, nm, px+h*k3x,       py+h*k3y,       &k4x, &k4y);
+static bool rk4_unit_tangent(const Monopole *mp, int nm, float px, float py,
+                             float h, float *tx, float *ty) {
+  float k1x, k1y, k2x, k2y, k3x, k3y, k4x, k4y;
+  field_at(mp, nm, px, py, &k1x, &k1y);
+  field_at(mp, nm, px + 0.5f * h * k1x, py + 0.5f * h * k1y, &k2x, &k2y);
+  field_at(mp, nm, px + 0.5f * h * k2x, py + 0.5f * h * k2y, &k3x, &k3y);
+  field_at(mp, nm, px + h * k3x, py + h * k3y, &k4x, &k4y);
 
-    float bx = (k1x + 2.0f*k2x + 2.0f*k3x + k4x) / 6.0f;
-    float by = (k1y + 2.0f*k2y + 2.0f*k3y + k4y) / 6.0f;
-    float bmag = sqrtf(bx*bx + by*by);
-    if (bmag < B_MIN) return false;          /* null point — stop */
+  float bx = (k1x + 2.0f * k2x + 2.0f * k3x + k4x) / 6.0f;
+  float by = (k1y + 2.0f * k2y + 2.0f * k3y + k4y) / 6.0f;
+  float bmag = sqrtf(bx * bx + by * by);
+  if (bmag < B_MIN)
+    return false; /* null point — stop */
 
-    *tx = bx / bmag;                          /* unit-arc-length tangent */
-    *ty = by / bmag;
-    return true;
+  *tx = bx / bmag; /* unit-arc-length tangent */
+  *ty = by / bmag;
+  return true;
 }
 
 /* GLYPH SELECTION — every ARR_STRIDE steps we punctuate the trail with
@@ -806,23 +802,20 @@ static bool rk4_unit_tangent(const Monopole *mp, int nm,
  * line point?); the steps in between get the 4-way angle-bucketed line
  * glyph for shape.  Step 0 is always a line glyph — placing an arrow on
  * the seed cell would visually compete with the 'N' pole marker. */
-static char glyph_for_step(int step, float tx, float ty)
-{
-    bool is_arrow_step = (step > 0 && step % ARR_STRIDE == 0);
-    return is_arrow_step ? direction_arrow(tx, ty)
-                         : line_char(tx, ty);
+static char glyph_for_step(int step, float tx, float ty) {
+  bool is_arrow_step = (step > 0 && step % ARR_STRIDE == 0);
+  return is_arrow_step ? direction_arrow(tx, ty) : line_char(tx, ty);
 }
 
 /* APPEND ONE TRACED CELL — pure side-effect on fl, no math.  Colour
  * pair is left at 0 (= "unassigned"); the full-trace distance ramp
  * fills it in after the loop, once `len` is known. */
-static void record_traced_cell(FieldLine *fl, int col, int row, char ch)
-{
-    fl->col[fl->len] = col;
-    fl->row[fl->len] = row;
-    fl->ch[fl->len]  = ch;
-    fl->cp[fl->len]  = 0;
-    fl->len++;
+static void record_traced_cell(FieldLine *fl, int col, int row, char ch) {
+  fl->col[fl->len] = col;
+  fl->row[fl->len] = row;
+  fl->ch[fl->len] = ch;
+  fl->cp[fl->len] = 0;
+  fl->len++;
 }
 
 /* DISTANCE-FROM-SOURCE BRIGHTNESS RAMP [Ware ref 8] — split the line
@@ -830,11 +823,10 @@ static void record_traced_cell(FieldLine *fl, int col, int row, char ch)
  * terminus (null point or off-grid).  Runs AFTER the trace because the
  * three tiers are defined relative to `len`, which is only known when
  * the integrator stops. */
-static void apply_distance_brightness_ramp(FieldLine *fl)
-{
-    for (int i = 0; i < fl->len; i++) {
-        fl->cp[i] = line_color_pair(i, fl->len);
-    }
+static void apply_distance_brightness_ramp(FieldLine *fl) {
+  for (int i = 0; i < fl->len; i++) {
+    fl->cp[i] = line_color_pair(i, fl->len);
+  }
 }
 
 /* ── RK4 streamline trace — Faraday field line from one seed ─────────
@@ -851,45 +843,44 @@ static void apply_distance_brightness_ramp(FieldLine *fl)
  *         position ← position + h · tangent
  *     colour the trail by distance from source
  */
-static void trace_line(FieldLine *fl, const Monopole *mp, int nm,
-                       float sx, float sy, int cols, int rows)
-{
-    fl->len  = 0;
-    fl->done = true;
+static void trace_line(FieldLine *fl, const Monopole *mp, int nm, float sx,
+                       float sy, int cols, int rows) {
+  fl->len = 0;
+  fl->done = true;
 
-    float px = sx, py = sy;
+  float px = sx, py = sy;
 
-    for (int step = 0; step < MAX_LINE_STEPS; step++) {
-        int col, row;
-        if (!cell_in_grid(px, py, cols, rows, &col, &row)) break;
+  for (int step = 0; step < MAX_LINE_STEPS; step++) {
+    int col, row;
+    if (!cell_in_grid(px, py, cols, rows, &col, &row))
+      break;
 
-        float tx, ty;
-        if (!rk4_unit_tangent(mp, nm, px, py, RK4_H, &tx, &ty)) break;
+    float tx, ty;
+    if (!rk4_unit_tangent(mp, nm, px, py, RK4_H, &tx, &ty))
+      break;
 
-        record_traced_cell(fl, col, row, glyph_for_step(step, tx, ty));
+    record_traced_cell(fl, col, row, glyph_for_step(step, tx, ty));
 
-        px += RK4_H * tx;
-        py += RK4_H * ty;
-    }
+    px += RK4_H * tx;
+    py += RK4_H * ty;
+  }
 
-    apply_distance_brightness_ramp(fl);
+  apply_distance_brightness_ramp(fl);
 }
 
 /* ── Add a dipole: north at (nx,ny), south at (sx,sy) ────────────── */
 
-static void scene_add_dipole(Scene *s,
-                              float nx, float ny,
-                              float sx, float sy)
-{
-    if (s->nd >= MAX_DIPOLES || s->nm + 2 > MAX_MONOPOLES) return;
+static void scene_add_dipole(Scene *s, float nx, float ny, float sx, float sy) {
+  if (s->nd >= MAX_DIPOLES || s->nm + 2 > MAX_MONOPOLES)
+    return;
 
-    s->mp[s->nm] = (Monopole){ nx, ny, +1.0f };
-    s->nm++;
-    s->mp[s->nm] = (Monopole){ sx, sy, -1.0f };
-    s->nm++;
+  s->mp[s->nm] = (Monopole){nx, ny, +1.0f};
+  s->nm++;
+  s->mp[s->nm] = (Monopole){sx, sy, -1.0f};
+  s->nm++;
 
-    s->dp[s->nd] = (Dipole){ nx, ny, sx, sy, CP_BODY };
-    s->nd++;
+  s->dp[s->nd] = (Dipole){nx, ny, sx, sy, CP_BODY};
+  s->nd++;
 }
 
 /* ── Seed field lines from every north pole ──────────────────────────
@@ -900,24 +891,23 @@ static void scene_add_dipole(Scene *s,
  * each.  Tracing is done eagerly here — the per-tick "reveal" later
  * only advances the visible count, not the trace itself.
  */
-static void scene_seed_lines(Scene *s)
-{
-    s->n_lines      = 0;
-    s->lines_traced = 0;
+static void scene_seed_lines(Scene *s) {
+  s->n_lines = 0;
+  s->lines_traced = 0;
 
-    for (int i = 0; i < s->nm && s->n_lines < MAX_LINES; i++) {
-        if (s->mp[i].q < 0) continue;   /* only +q (north) poles seed lines */
+  for (int i = 0; i < s->nm && s->n_lines < MAX_LINES; i++) {
+    if (s->mp[i].q < 0)
+      continue; /* only +q (north) poles seed lines */
 
-        for (int k = 0; k < N_SEEDS && s->n_lines < MAX_LINES; k++) {
-            float angle = (float)k / (float)N_SEEDS * 2.0f * (float)M_PI;
-            float sx    = s->mp[i].cx + SEED_R * cosf(angle);
-            float sy    = s->mp[i].cy + SEED_R * sinf(angle) / ASPECT_R;
+    for (int k = 0; k < N_SEEDS && s->n_lines < MAX_LINES; k++) {
+      float angle = (float)k / (float)N_SEEDS * 2.0f * (float)M_PI;
+      float sx = s->mp[i].cx + SEED_R * cosf(angle);
+      float sy = s->mp[i].cy + SEED_R * sinf(angle) / ASPECT_R;
 
-            trace_line(&s->lines[s->n_lines], s->mp, s->nm,
-                       sx, sy, s->cols, s->rows);
-            s->n_lines++;
-        }
+      trace_line(&s->lines[s->n_lines], s->mp, s->nm, sx, sy, s->cols, s->rows);
+      s->n_lines++;
     }
+  }
 }
 
 /* ── Preset layouts — one helper per magnetic configuration ──────────
@@ -932,11 +922,9 @@ static void scene_seed_lines(Scene *s)
 /* PRESET 0 — single bar magnet, horizontal.  Classic CLOSED-LOOP field
  * lines emerging from N, sweeping around, returning to S.  The most
  * basic dipole pattern (Griffiths §5 [ref 1]). */
-static void preset_single_bar_magnet(Scene *s, float cx, float cy, float dx)
-{
-    scene_add_dipole(s,
-        cx - dx, cy,    /* north pole — left */
-        cx + dx, cy);   /* south pole — right */
+static void preset_single_bar_magnet(Scene *s, float cx, float cy, float dx) {
+  scene_add_dipole(s, cx - dx, cy, /* north pole — left */
+                   cx + dx, cy);   /* south pole — right */
 }
 
 /* PRESET 1 — magnetic QUADRUPOLE.  Two crossed dipoles share a centre:
@@ -944,14 +932,12 @@ static void preset_single_bar_magnet(Scene *s, float cx, float cy, float dx)
  * symmetric arrangement whose superposed field has a CRITICAL POINT
  * of saddle topology (X-shaped null) at the centre — the canonical
  * "X-type neutral point" of Helman & Hesselink [ref 6]. */
-static void preset_quadrupole(Scene *s, float cx, float cy, float dx, float dy)
-{
-    scene_add_dipole(s,
-        cx, cy - dy * 0.8f,    /* vertical dipole: N on top */
-        cx, cy + dy * 0.8f);   /*                  S on bottom */
-    scene_add_dipole(s,
-        cx - dx * 1.4f, cy,    /* horizontal dipole: N far-left */
-        cx + dx * 1.4f, cy);   /*                    S far-right */
+static void preset_quadrupole(Scene *s, float cx, float cy, float dx,
+                              float dy) {
+  scene_add_dipole(s, cx, cy - dy * 0.8f, /* vertical dipole: N on top */
+                   cx, cy + dy * 0.8f);   /*                  S on bottom */
+  scene_add_dipole(s, cx - dx * 1.4f, cy, /* horizontal dipole: N far-left */
+                   cx + dx * 1.4f, cy);   /*                    S far-right */
 }
 
 /* PRESET 2 — ATTRACT pair (N→S facing N→S).  Two horizontal magnets
@@ -962,14 +948,13 @@ static void preset_quadrupole(Scene *s, float cx, float cy, float dx, float dy)
  *
  * Equivalent to one long bar magnet — field lines stream continuously
  * from the far-left N to the far-right S through the inner S/N pair. */
-static void preset_attract_pair(Scene *s, float cx, float cy, float dx)
-{
-    scene_add_dipole(s,
-        cx - dx * 1.8f, cy,    /* LEFT magnet:  N far-left,  S near-centre */
-        cx - dx * 0.4f, cy);
-    scene_add_dipole(s,
-        cx + dx * 0.4f, cy,    /* RIGHT magnet: N near-centre, S far-right */
-        cx + dx * 1.8f, cy);
+static void preset_attract_pair(Scene *s, float cx, float cy, float dx) {
+  scene_add_dipole(s, cx - dx * 1.8f,
+                   cy, /* LEFT magnet:  N far-left,  S near-centre */
+                   cx - dx * 0.4f, cy);
+  scene_add_dipole(s, cx + dx * 0.4f,
+                   cy, /* RIGHT magnet: N near-centre, S far-right */
+                   cx + dx * 1.8f, cy);
 }
 
 /* PRESET 3 — REPEL pair (N→N facing N→N).  Two horizontal magnets laid
@@ -981,14 +966,13 @@ static void preset_attract_pair(Scene *s, float cx, float cy, float dx)
  * The two near-centre N poles push each other away — the field has a
  * null point between them (Helman & Hesselink saddle [ref 6]).  Lines
  * curve sharply outward, never crossing the midplane. */
-static void preset_repel_pair(Scene *s, float cx, float cy, float dx)
-{
-    scene_add_dipole(s,
-        cx - dx * 0.4f, cy,    /* LEFT magnet:  N near-centre, S far-left  */
-        cx - dx * 1.8f, cy);
-    scene_add_dipole(s,
-        cx + dx * 0.4f, cy,    /* RIGHT magnet: N near-centre, S far-right */
-        cx + dx * 1.8f, cy);
+static void preset_repel_pair(Scene *s, float cx, float cy, float dx) {
+  scene_add_dipole(s, cx - dx * 0.4f,
+                   cy, /* LEFT magnet:  N near-centre, S far-left  */
+                   cx - dx * 1.8f, cy);
+  scene_add_dipole(s, cx + dx * 0.4f,
+                   cy, /* RIGHT magnet: N near-centre, S far-right */
+                   cx + dx * 1.8f, cy);
 }
 
 /*
@@ -996,49 +980,55 @@ static void preset_repel_pair(Scene *s, float cx, float cy, float dx)
  * magnetic configurations above.  Reads as pure preset SELECTION; all
  * placement math lives in the named helpers.
  */
-static void scene_build_preset(Scene *s)
-{
-    /* Reference frame for placement: scene centre + scaled half-spans.
-     * Layouts express positions as cx ± k·dx, cy ± k·dy so they
-     * auto-scale with the terminal size. */
-    float cx = (float)s->cols * 0.5f;
-    float cy = (float)s->rows * 0.5f;
-    float dx = (float)s->cols * 0.18f;
-    float dy = (float)s->rows * 0.28f;
+static void scene_build_preset(Scene *s) {
+  /* Reference frame for placement: scene centre + scaled half-spans.
+   * Layouts express positions as cx ± k·dx, cy ± k·dy so they
+   * auto-scale with the terminal size. */
+  float cx = (float)s->cols * 0.5f;
+  float cy = (float)s->rows * 0.5f;
+  float dx = (float)s->cols * 0.18f;
+  float dy = (float)s->rows * 0.28f;
 
-    s->nm = 0;
-    s->nd = 0;
+  s->nm = 0;
+  s->nd = 0;
 
-    switch (s->preset) {
-    case 0: preset_single_bar_magnet(s, cx, cy, dx);     break;
-    case 1: preset_quadrupole       (s, cx, cy, dx, dy); break;
-    case 2: preset_attract_pair     (s, cx, cy, dx);     break;
-    case 3: preset_repel_pair       (s, cx, cy, dx);     break;
-    }
+  switch (s->preset) {
+  case 0:
+    preset_single_bar_magnet(s, cx, cy, dx);
+    break;
+  case 1:
+    preset_quadrupole(s, cx, cy, dx, dy);
+    break;
+  case 2:
+    preset_attract_pair(s, cx, cy, dx);
+    break;
+  case 3:
+    preset_repel_pair(s, cx, cy, dx);
+    break;
+  }
 }
 
-static void scene_init(Scene *s, int cols, int rows, int preset, int theme)
-{
-    memset(s, 0, sizeof *s);
-    s->cols           = cols;
-    s->rows           = rows;
-    s->preset         = preset;
-    s->theme          = theme;
-    s->lines_per_tick = LINES_PER_TICK_DEF;
+static void scene_init(Scene *s, int cols, int rows, int preset, int theme) {
+  memset(s, 0, sizeof *s);
+  s->cols = cols;
+  s->rows = rows;
+  s->preset = preset;
+  s->theme = theme;
+  s->lines_per_tick = LINES_PER_TICK_DEF;
 
-    scene_build_preset(s);
-    scene_seed_lines(s);
+  scene_build_preset(s);
+  scene_seed_lines(s);
 }
 
 /* ── Tick: reveal next batch of lines ────────────────────────────── */
 
-static void scene_tick(Scene *s)
-{
-    if (s->paused) return;
-    int to_reveal = s->lines_per_tick;
-    while (to_reveal-- > 0 && s->lines_traced < s->n_lines) {
-        s->lines_traced++;
-    }
+static void scene_tick(Scene *s) {
+  if (s->paused)
+    return;
+  int to_reveal = s->lines_per_tick;
+  while (to_reveal-- > 0 && s->lines_traced < s->n_lines) {
+    s->lines_traced++;
+  }
 }
 
 /* ── Render helpers — one per visual element of the scene ────────────
@@ -1053,74 +1043,69 @@ static void scene_tick(Scene *s)
  */
 
 /* Paint one cell with a glyph + attribute, clipped to the scene grid. */
-static void paint_cell(int row, int col, char ch, int attr,
-                       int grid_cols, int grid_rows)
-{
-    if (row < 0 || row >= grid_rows || col < 0 || col >= grid_cols) return;
-    mvaddch(row + HUD_TOP_ROWS, col, (chtype)(unsigned char)ch | attr);
+static void paint_cell(int row, int col, char ch, int attr, int grid_cols,
+                       int grid_rows) {
+  if (row < 0 || row >= grid_rows || col < 0 || col >= grid_cols)
+    return;
+  mvaddch(row + HUD_TOP_ROWS, col, (chtype)(unsigned char)ch | attr);
 }
 
 /* LAYER 1 — paint a single pre-rasterised streamline cell-by-cell.
  * Distance ramp colour is stored per cell at trace time, so this is
  * pure mvaddch — no math, no field_at calls. */
-static void draw_field_line(const FieldLine *fl,
-                            int grid_cols, int grid_rows)
-{
-    for (int i = 0; i < fl->len; i++) {
-        int cp = fl->cp[i] ? fl->cp[i] : CP_LINE_DIM;
-        paint_cell(fl->row[i], fl->col[i], fl->ch[i],
-                   COLOR_PAIR(cp), grid_cols, grid_rows);
-    }
+static void draw_field_line(const FieldLine *fl, int grid_cols, int grid_rows) {
+  for (int i = 0; i < fl->len; i++) {
+    int cp = fl->cp[i] ? fl->cp[i] : CP_LINE_DIM;
+    paint_cell(fl->row[i], fl->col[i], fl->ch[i], COLOR_PAIR(cp), grid_cols,
+               grid_rows);
+  }
 }
 
 /* LAYER 1 driver — paint the REVEALED portion of the streamline pool
  * (lines[0 .. lines_traced)).  Lines past lines_traced are still being
  * "revealed" by the progressive-reveal animation and stay hidden. */
-static void draw_revealed_field_lines(const Scene *s)
-{
-    for (int li = 0; li < s->lines_traced; li++) {
-        draw_field_line(&s->lines[li], s->cols, s->rows);
-    }
+static void draw_revealed_field_lines(const Scene *s) {
+  for (int li = 0; li < s->lines_traced; li++) {
+    draw_field_line(&s->lines[li], s->cols, s->rows);
+  }
 }
 
 /* LAYER 2a — '=' line connecting the N and S poles of one magnet.
  * Sampled at 2 points per cell of pole-to-pole distance so the line
  * stays continuous at any angle without explicit Bresenham.  A_DIM so
  * the body subdues itself behind the bright N/S markers. */
-static void draw_magnet_body_line(const Dipole *dp,
-                                  int grid_cols, int grid_rows)
-{
-    float dx = dp->sx - dp->nx;
-    float dy = dp->sy - dp->ny;
-    float dist = sqrtf(dx*dx + dy*dy);
-    if (dist <= 0.5f) return;                /* coincident poles — skip */
+static void draw_magnet_body_line(const Dipole *dp, int grid_cols,
+                                  int grid_rows) {
+  float dx = dp->sx - dp->nx;
+  float dy = dp->sy - dp->ny;
+  float dist = sqrtf(dx * dx + dy * dy);
+  if (dist <= 0.5f)
+    return; /* coincident poles — skip */
 
-    int steps = (int)(dist * 2);
-    int attr  = COLOR_PAIR(CP_BODY) | A_DIM;
-    for (int k = 0; k <= steps; k++) {
-        float t = (float)k / (float)steps;   /* parametric in [0,1]    */
-        int c = (int)(dp->nx + t * dx + 0.5f);
-        int r = (int)(dp->ny + t * dy + 0.5f);
-        paint_cell(r, c, '=', attr, grid_cols, grid_rows);
-    }
+  int steps = (int)(dist * 2);
+  int attr = COLOR_PAIR(CP_BODY) | A_DIM;
+  for (int k = 0; k <= steps; k++) {
+    float t = (float)k / (float)steps; /* parametric in [0,1]    */
+    int c = (int)(dp->nx + t * dx + 0.5f);
+    int r = (int)(dp->ny + t * dy + 0.5f);
+    paint_cell(r, c, '=', attr, grid_cols, grid_rows);
+  }
 }
 
 /* LAYER 2b — bold 'N' / 'S' marker.  These sit ON TOP of the body line
  * (painter's algorithm) so the pole identity always wins legibility. */
 static void draw_pole_marker(float px, float py, char glyph, int cp,
-                             int grid_cols, int grid_rows)
-{
-    int r = (int)(py + 0.5f);
-    int c = (int)(px + 0.5f);
-    paint_cell(r, c, glyph, COLOR_PAIR(cp) | A_BOLD, grid_cols, grid_rows);
+                             int grid_cols, int grid_rows) {
+  int r = (int)(py + 0.5f);
+  int c = (int)(px + 0.5f);
+  paint_cell(r, c, glyph, COLOR_PAIR(cp) | A_BOLD, grid_cols, grid_rows);
 }
 
 /* LAYER 2 driver — one full magnet (body line + both pole markers). */
-static void draw_magnet(const Dipole *dp, int grid_cols, int grid_rows)
-{
-    draw_magnet_body_line(dp, grid_cols, grid_rows);
-    draw_pole_marker(dp->nx, dp->ny, 'N', CP_NORTH, grid_cols, grid_rows);
-    draw_pole_marker(dp->sx, dp->sy, 'S', CP_SOUTH, grid_cols, grid_rows);
+static void draw_magnet(const Dipole *dp, int grid_cols, int grid_rows) {
+  draw_magnet_body_line(dp, grid_cols, grid_rows);
+  draw_pole_marker(dp->nx, dp->ny, 'N', CP_NORTH, grid_cols, grid_rows);
+  draw_pole_marker(dp->sx, dp->sy, 'S', CP_SOUTH, grid_cols, grid_rows);
 }
 
 /*
@@ -1135,27 +1120,25 @@ static void draw_magnet(const Dipole *dp, int grid_cols, int grid_rows)
  * terminal row 1.  The bottom HUD row is excluded by sizing:
  *     s->rows = term_rows − HUD_TOP_ROWS − HUD_BOT_ROWS.
  */
-static void scene_draw(const Scene *s)
-{
-    draw_revealed_field_lines(s);
+static void scene_draw(const Scene *s) {
+  draw_revealed_field_lines(s);
 
-    for (int i = 0; i < s->nd; i++) {
-        draw_magnet(&s->dp[i], s->cols, s->rows);
-    }
+  for (int i = 0; i < s->nd; i++) {
+    draw_magnet(&s->dp[i], s->cols, s->rows);
+  }
 }
 
 /* ===================================================================== */
 /* §6  screen / HUD                                                       */
 /* ===================================================================== */
 
-static void screen_init(void)
-{
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
+static void screen_init(void) {
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
 }
 
 /*
@@ -1174,44 +1157,36 @@ static void screen_init(void)
  * terminal height, so passing term_rows separately keeps the HUD at
  * the screen edges regardless of scene sizing.
  */
-static void screen_draw_hud(const Scene *s, int cols, int term_rows, int fps)
-{
-    static const char *preset_names[N_PRESETS] = {
-        "Dipole", "Quadrupole", "Attract", "Repel"
-    };
-    static const char *theme_names[N_THEMES] = {
-        "Electric", "Plasma", "Fire", "Ocean", "Matrix"
-    };
+static void screen_draw_hud(const Scene *s, int cols, int term_rows, int fps) {
+  static const char *preset_names[N_PRESETS] = {"Dipole", "Quadrupole",
+                                                "Attract", "Repel"};
+  static const char *theme_names[N_THEMES] = {"Electric", "Plasma", "Fire",
+                                              "Ocean", "Matrix"};
 
-    int pct = s->n_lines > 0
-            ? s->lines_traced * 100 / s->n_lines
-            : 100;
+  int pct = s->n_lines > 0 ? s->lines_traced * 100 / s->n_lines : 100;
 
-    /* ── Top row 0: STATUS (canonical yellow + A_BOLD) ─────────────── */
-    move(0, 0);
-    clrtoeol();
-    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvprintw(0, 0,
-             " MagField  preset:%-10s  theme:%-8s  speed:%d"
-             "  progress:%3d%%  %2dfps  %s",
-             preset_names[s->preset],
-             theme_names[s->theme],
-             s->lines_per_tick,
-             pct, fps,
-             s->paused ? "PAUSED " : "running");
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+  /* ── Top row 0: STATUS (canonical yellow + A_BOLD) ─────────────── */
+  move(0, 0);
+  clrtoeol();
+  attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+  mvprintw(0, 0,
+           " MagField  preset:%-10s  theme:%-8s  speed:%d"
+           "  progress:%3d%%  %2dfps  %s",
+           preset_names[s->preset], theme_names[s->theme], s->lines_per_tick,
+           pct, fps, s->paused ? "PAUSED " : "running");
+  attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-    /* ── Bottom row term_rows-1: ACTION keys (canonical cyan + BOLD) ─ */
-    int bot = term_rows - 1;
-    move(bot, 0);
-    clrtoeol();
-    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
-    mvprintw(bot, 0,
-             " q:quit  r:reset  n/N:preset  t/T:theme  [/]:speed"
-             "  p|spc:pause ");
-    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
+  /* ── Bottom row term_rows-1: ACTION keys (canonical cyan + BOLD) ─ */
+  int bot = term_rows - 1;
+  move(bot, 0);
+  clrtoeol();
+  attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+  mvprintw(bot, 0,
+           " q:quit  r:reset  n/N:preset  t/T:theme  [/]:speed"
+           "  p|spc:pause ");
+  attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 
-    (void)cols;   /* clrtoeol takes the row; cols reserved for future */
+  (void)cols; /* clrtoeol takes the row; cols reserved for future */
 }
 
 /* ===================================================================== */
@@ -1219,10 +1194,16 @@ static void screen_draw_hud(const Scene *s, int cols, int term_rows, int fps)
 /* ===================================================================== */
 
 static volatile sig_atomic_t g_resize = 0;
-static volatile sig_atomic_t g_quit   = 0;
+static volatile sig_atomic_t g_quit = 0;
 
-static void handle_sigwinch(int s) { (void)s; g_resize = 1; }
-static void handle_sigterm(int s)  { (void)s; g_quit   = 1; }
+static void handle_sigwinch(int s) {
+  (void)s;
+  g_resize = 1;
+}
+static void handle_sigterm(int s) {
+  (void)s;
+  g_quit = 1;
+}
 
 /* ===================================================================== */
 /* §8  main loop                                                          */
@@ -1233,31 +1214,26 @@ static void handle_sigterm(int s)  { (void)s; g_quit   = 1; }
 /* Wire SIGINT / SIGTERM → graceful quit and SIGWINCH → deferred resize.
  * The handlers themselves only flip volatile flags — all real work
  * happens synchronously from the main loop. */
-static void install_signal_handlers(void)
-{
-    signal(SIGWINCH, handle_sigwinch);
-    signal(SIGTERM,  handle_sigterm);
-    signal(SIGINT,   handle_sigterm);
+static void install_signal_handlers(void) {
+  signal(SIGWINCH, handle_sigwinch);
+  signal(SIGTERM, handle_sigterm);
+  signal(SIGINT, handle_sigterm);
 }
 
 /* Build (or REBUILD) the scene for the current terminal size.  Hides
  * the HUD inset arithmetic (`rows − HUD_TOP_ROWS − HUD_BOT_ROWS`) at
  * the single call site that needs to know it. */
-static void rebuild_scene_for_terminal(Scene *scene,
-                                       int term_rows, int term_cols,
-                                       int preset, int theme)
-{
-    scene_init(scene, term_cols,
-               term_rows - HUD_TOP_ROWS - HUD_BOT_ROWS,
-               preset, theme);
+static void rebuild_scene_for_terminal(Scene *scene, int term_rows,
+                                       int term_cols, int preset, int theme) {
+  scene_init(scene, term_cols, term_rows - HUD_TOP_ROWS - HUD_BOT_ROWS, preset,
+             theme);
 }
 
 /* Modular cyclic step (+1 / −1 with wrap-around).  Named so the keybind
  * cases read as "advance preset by +1, wrap mod N_PRESETS" instead of
  * the slightly cryptic `(x + N - 1) % N` reverse-wrap trick. */
-static void cycle_index(int *value, int step, int n)
-{
-    *value = (*value + n + step) % n;
+static void cycle_index(int *value, int step, int n) {
+  *value = (*value + n + step) % n;
 }
 
 /* ── Per-frame stage helpers — each one is one phase of the sim loop ── */
@@ -1265,86 +1241,85 @@ static void cycle_index(int *value, int step, int n)
 /* RESIZE handling — SIGWINCH set the flag asynchronously; we drain it
  * here, ask ncurses for fresh terminal dimensions, and rebuild the
  * scene to match (line geometry depends on grid size). */
-static void consume_resize_event(Scene *scene, int *rows, int *cols,
-                                 int preset, int theme)
-{
-    if (!g_resize) return;
-    g_resize = 0;
-    endwin();
-    refresh();
-    getmaxyx(stdscr, *rows, *cols);
-    rebuild_scene_for_terminal(scene, *rows, *cols, preset, theme);
+static void consume_resize_event(Scene *scene, int *rows, int *cols, int preset,
+                                 int theme) {
+  if (!g_resize)
+    return;
+  g_resize = 0;
+  endwin();
+  refresh();
+  getmaxyx(stdscr, *rows, *cols);
+  rebuild_scene_for_terminal(scene, *rows, *cols, preset, theme);
 }
 
 /* INPUT — drain every queued key and dispatch.  Mutates scene state +
  * the three "session" knobs (preset, theme, sim_fps).  Sets g_quit on
  * q/ESC.  Keeps `rows`/`cols` as plain values since they're only read. */
-static void process_input(Scene *scene,
-                          int *cur_preset, int *cur_theme, int *sim_fps,
-                          int rows, int cols)
-{
-    int ch;
-    while ((ch = getch()) != ERR) {
-        switch (ch) {
-        case 'q': case 27:                 /* 27 = ESC */
-            g_quit = 1;
-            break;
-        case 'r':                          /* reset current preset */
-            rebuild_scene_for_terminal(scene, rows, cols,
-                                       *cur_preset, *cur_theme);
-            break;
-        case 'n':                          /* next preset */
-            cycle_index(cur_preset, +1, N_PRESETS);
-            rebuild_scene_for_terminal(scene, rows, cols,
-                                       *cur_preset, *cur_theme);
-            break;
-        case 'N':                          /* previous preset */
-            cycle_index(cur_preset, -1, N_PRESETS);
-            rebuild_scene_for_terminal(scene, rows, cols,
-                                       *cur_preset, *cur_theme);
-            break;
-        case 't':                          /* next theme (no rebuild) */
-            cycle_index(cur_theme, +1, N_THEMES);
-            scene->theme = *cur_theme;
-            theme_apply(*cur_theme);
-            break;
-        case 'T':                          /* previous theme */
-            cycle_index(cur_theme, -1, N_THEMES);
-            scene->theme = *cur_theme;
-            theme_apply(*cur_theme);
-            break;
-        case ']':                          /* reveal faster */
-            if (scene->lines_per_tick < LINES_PER_TICK_MAX)
-                scene->lines_per_tick++;
-            break;
-        case '[':                          /* reveal slower */
-            if (scene->lines_per_tick > LINES_PER_TICK_MIN)
-                scene->lines_per_tick--;
-            break;
-        case 'p': case ' ':                /* pause toggle */
-            scene->paused = !scene->paused;
-            break;
-        case '+': case '=':                /* sim Hz up */
-            if (*sim_fps < SIM_FPS_MAX) *sim_fps += SIM_FPS_STEP;
-            break;
-        case '-':                          /* sim Hz down */
-            if (*sim_fps > SIM_FPS_MIN) *sim_fps -= SIM_FPS_STEP;
-            break;
-        }
+static void process_input(Scene *scene, int *cur_preset, int *cur_theme,
+                          int *sim_fps, int rows, int cols) {
+  int ch;
+  while ((ch = getch()) != ERR) {
+    switch (ch) {
+    case 'q':
+    case 27: /* 27 = ESC */
+      g_quit = 1;
+      break;
+    case 'r': /* reset current preset */
+      rebuild_scene_for_terminal(scene, rows, cols, *cur_preset, *cur_theme);
+      break;
+    case 'n': /* next preset */
+      cycle_index(cur_preset, +1, N_PRESETS);
+      rebuild_scene_for_terminal(scene, rows, cols, *cur_preset, *cur_theme);
+      break;
+    case 'N': /* previous preset */
+      cycle_index(cur_preset, -1, N_PRESETS);
+      rebuild_scene_for_terminal(scene, rows, cols, *cur_preset, *cur_theme);
+      break;
+    case 't': /* next theme (no rebuild) */
+      cycle_index(cur_theme, +1, N_THEMES);
+      scene->theme = *cur_theme;
+      theme_apply(*cur_theme);
+      break;
+    case 'T': /* previous theme */
+      cycle_index(cur_theme, -1, N_THEMES);
+      scene->theme = *cur_theme;
+      theme_apply(*cur_theme);
+      break;
+    case ']': /* reveal faster */
+      if (scene->lines_per_tick < LINES_PER_TICK_MAX)
+        scene->lines_per_tick++;
+      break;
+    case '[': /* reveal slower */
+      if (scene->lines_per_tick > LINES_PER_TICK_MIN)
+        scene->lines_per_tick--;
+      break;
+    case 'p':
+    case ' ': /* pause toggle */
+      scene->paused = !scene->paused;
+      break;
+    case '+':
+    case '=': /* sim Hz up */
+      if (*sim_fps < SIM_FPS_MAX)
+        *sim_fps += SIM_FPS_STEP;
+      break;
+    case '-': /* sim Hz down */
+      if (*sim_fps > SIM_FPS_MIN)
+        *sim_fps -= SIM_FPS_STEP;
+      break;
     }
+  }
 }
 
 /* RENDER one frame: clear → paint scene → paint HUD → flush.
  * Uses `wnoutrefresh + doupdate` (single diff write) instead of
  * plain `refresh()` to avoid flicker on slow terminals — CLAUDE.md
  * ncurses Bug Table. */
-static void render_frame(const Scene *scene, int rows, int cols, int fps_disp)
-{
-    erase();
-    scene_draw(scene);
-    screen_draw_hud(scene, cols, rows, fps_disp);
-    wnoutrefresh(stdscr);
-    doupdate();
+static void render_frame(const Scene *scene, int rows, int cols, int fps_disp) {
+  erase();
+  scene_draw(scene);
+  screen_draw_hud(scene, cols, rows, fps_disp);
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* FRAME PACING — fixed-timestep cap to sim_fps.  Sleeps the leftover of
@@ -1353,14 +1328,13 @@ static void render_frame(const Scene *scene, int rows, int cols, int fps_disp)
  * Writes the measured frame-work time via out-param so the FPS counter
  * can use the same measurement without re-reading the clock. */
 static int64_t pace_frame_to_fps(int64_t t_last, int sim_fps,
-                                 int64_t *out_work_ns)
-{
-    int64_t t_now  = clock_ns();
-    int64_t t_work = t_now - t_last;
-    int64_t t_tick = TICK_NS(sim_fps);
-    clock_sleep_ns(t_tick - t_work);     /* clamped to 0 inside sleep */
-    *out_work_ns = t_work;
-    return clock_ns();
+                                 int64_t *out_work_ns) {
+  int64_t t_now = clock_ns();
+  int64_t t_work = t_now - t_last;
+  int64_t t_tick = TICK_NS(sim_fps);
+  clock_sleep_ns(t_tick - t_work); /* clamped to 0 inside sleep */
+  *out_work_ns = t_work;
+  return clock_ns();
 }
 
 /* FPS COUNTER — accumulate per-frame elapsed time; every half second,
@@ -1368,18 +1342,17 @@ static int64_t pace_frame_to_fps(int64_t t_last, int sim_fps,
  * fact that `work + max(0, tick − work) = max(work, tick)` to count
  * either a budgeted or a busted frame correctly without a branch on
  * the displayed value. */
-static void update_fps_counter(int64_t work_ns, int sim_fps,
-                               int64_t *fps_acc, int *fps_cnt, int *fps_disp)
-{
-    int64_t t_tick = TICK_NS(sim_fps);
-    int64_t slack  = t_tick - work_ns;
-    *fps_acc += work_ns + (slack > 0 ? slack : 0);
-    (*fps_cnt)++;
-    if (*fps_acc >= NS_PER_SEC / 2) {
-        *fps_disp = *fps_cnt * 2;        /* half-second window → ×2 */
-        *fps_acc  = 0;
-        *fps_cnt  = 0;
-    }
+static void update_fps_counter(int64_t work_ns, int sim_fps, int64_t *fps_acc,
+                               int *fps_cnt, int *fps_disp) {
+  int64_t t_tick = TICK_NS(sim_fps);
+  int64_t slack = t_tick - work_ns;
+  *fps_acc += work_ns + (slack > 0 ? slack : 0);
+  (*fps_cnt)++;
+  if (*fps_acc >= NS_PER_SEC / 2) {
+    *fps_disp = *fps_cnt * 2; /* half-second window → ×2 */
+    *fps_acc = 0;
+    *fps_cnt = 0;
+  }
 }
 
 /* AUTO-ADVANCE — once all field lines for the current preset are fully
@@ -1388,19 +1361,19 @@ static void update_fps_counter(int64_t work_ns, int sim_fps,
  * self-running showreel feel; user input can override at any time
  * (process_input mutates cur_preset, which `hold_ticks` doesn't care
  * about — the wraparound stays consistent). */
-static void auto_advance_preset_if_complete(Scene *scene,
-                                            int *cur_preset, int cur_theme,
-                                            int sim_fps, int rows, int cols)
-{
-    if (!(scene->lines_traced >= scene->n_lines && !scene->paused)) return;
+static void auto_advance_preset_if_complete(Scene *scene, int *cur_preset,
+                                            int cur_theme, int sim_fps,
+                                            int rows, int cols) {
+  if (!(scene->lines_traced >= scene->n_lines && !scene->paused))
+    return;
 
-    static int hold_ticks = 0;
-    hold_ticks++;
-    if (hold_ticks >= sim_fps * 3) {
-        hold_ticks = 0;
-        cycle_index(cur_preset, +1, N_PRESETS);
-        rebuild_scene_for_terminal(scene, rows, cols, *cur_preset, cur_theme);
-    }
+  static int hold_ticks = 0;
+  hold_ticks++;
+  if (hold_ticks >= sim_fps * 3) {
+    hold_ticks = 0;
+    cycle_index(cur_preset, +1, N_PRESETS);
+    rebuild_scene_for_terminal(scene, rows, cols, *cur_preset, cur_theme);
+  }
 }
 
 /*
@@ -1419,41 +1392,40 @@ static void auto_advance_preset_if_complete(Scene *scene,
  *         auto-advance        (cycle preset once current one is done)
  *     teardown terminal
  */
-int main(void)
-{
-    install_signal_handlers();
-    screen_init();
-    color_init();
+int main(void) {
+  install_signal_handlers();
+  screen_init();
+  color_init();
 
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
+  int rows, cols;
+  getmaxyx(stdscr, rows, cols);
 
-    int   sim_fps    = SIM_FPS_DEFAULT;
-    int   cur_preset = 0;
-    int   cur_theme  = 0;
+  int sim_fps = SIM_FPS_DEFAULT;
+  int cur_preset = 0;
+  int cur_theme = 0;
 
-    Scene scene;
-    rebuild_scene_for_terminal(&scene, rows, cols, cur_preset, cur_theme);
+  Scene scene;
+  rebuild_scene_for_terminal(&scene, rows, cols, cur_preset, cur_theme);
 
-    int64_t t_last   = clock_ns();
-    int64_t fps_acc  = 0;
-    int     fps_cnt  = 0;
-    int     fps_disp = 0;
+  int64_t t_last = clock_ns();
+  int64_t fps_acc = 0;
+  int fps_cnt = 0;
+  int fps_disp = 0;
 
-    while (!g_quit) {
-        consume_resize_event(&scene, &rows, &cols, cur_preset, cur_theme);
-        process_input(&scene, &cur_preset, &cur_theme, &sim_fps, rows, cols);
-        scene_tick(&scene);
-        render_frame(&scene, rows, cols, fps_disp);
+  while (!g_quit) {
+    consume_resize_event(&scene, &rows, &cols, cur_preset, cur_theme);
+    process_input(&scene, &cur_preset, &cur_theme, &sim_fps, rows, cols);
+    scene_tick(&scene);
+    render_frame(&scene, rows, cols, fps_disp);
 
-        int64_t work_ns;
-        t_last = pace_frame_to_fps(t_last, sim_fps, &work_ns);
-        update_fps_counter(work_ns, sim_fps, &fps_acc, &fps_cnt, &fps_disp);
+    int64_t work_ns;
+    t_last = pace_frame_to_fps(t_last, sim_fps, &work_ns);
+    update_fps_counter(work_ns, sim_fps, &fps_acc, &fps_cnt, &fps_disp);
 
-        auto_advance_preset_if_complete(&scene, &cur_preset, cur_theme,
-                                        sim_fps, rows, cols);
-    }
+    auto_advance_preset_if_complete(&scene, &cur_preset, cur_theme, sim_fps,
+                                    rows, cols);
+  }
 
-    endwin();
-    return 0;
+  endwin();
+  return 0;
 }

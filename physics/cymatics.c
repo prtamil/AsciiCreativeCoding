@@ -43,8 +43,8 @@
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
  *
  * Algorithm      : Analytic Chladni figure computation — no simulation, no PDE.
- *                  The nodal pattern is computed by evaluating the 2D mode shape
- *                  function at every cell and testing if |Z| < threshold.
+ *                  The nodal pattern is computed by evaluating the 2D mode
+ * shape function at every cell and testing if |Z| < threshold.
  *
  * Physics        : Chladni figures (Ernst Chladni, 1787): when a plate vibrates
  *                  at a resonant frequency, sand on the plate migrates to nodal
@@ -54,10 +54,10 @@
  * Math           : Square plate mode shape function:
  *                    Z(x,y) = cos(m·π·x)·cos(n·π·y) − cos(n·π·x)·cos(m·π·y)
  *                  Nodal lines are where Z(x,y) = 0.  The cos−cos structure
- *                  comes from satisfying Neumann boundary conditions (free edge).
- *                  Resonant frequency: f_mn ∝ √(m² + n²) — Pythagorean relationship.
- *                  Modes with m=n are degenerate: Z=0 everywhere (trivial solution);
- *                  interesting patterns require m ≠ n.
+ *                  comes from satisfying Neumann boundary conditions (free
+ * edge). Resonant frequency: f_mn ∝ √(m² + n²) — Pythagorean relationship.
+ *                  Modes with m=n are degenerate: Z=0 everywhere (trivial
+ * solution); interesting patterns require m ≠ n.
  *
  * Rendering      : Analytic band-thresholding — evaluate Z at every cell,
  *                  bucket |Z| into 5 bands (0.04, 0.10, 0.18, 0.28, 0.40),
@@ -178,27 +178,27 @@
 
 #include <math.h>
 #include <ncurses.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
 #include <time.h>
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 /* ── §1 config ───────────────────────────────────────────────────────── */
 
-#define TICK_NS       33333333LL
-#define HOLD_DEFAULT  120          /* ~4 s default hold before morphing   */
-#define HOLD_MIN      0            /* +/- floor — continuous showcase     */
-#define HOLD_MAX      300          /* +/- ceiling — ~10 s dwell per mode  */
-#define HOLD_STEP     15           /* +/- increment, ~0.5 s per press     */
-#define MORPH_SPEED   0.025f       /* t increment per tick (~1.3 s morph) */
-#define NODAL_THRESH  0.04f        /* |Z| < this → centre nodal char      */
+#define TICK_NS 33333333LL
+#define HOLD_DEFAULT 120   /* ~4 s default hold before morphing   */
+#define HOLD_MIN 0         /* +/- floor — continuous showcase     */
+#define HOLD_MAX 300       /* +/- ceiling — ~10 s dwell per mode  */
+#define HOLD_STEP 15       /* +/- increment, ~0.5 s per press     */
+#define MORPH_SPEED 0.025f /* t increment per tick (~1.3 s morph) */
+#define NODAL_THRESH 0.04f /* |Z| < this → centre nodal char      */
 
 enum { ST_HOLD = 0, ST_MORPH };
-enum { CP_POS=1, CP_NEG, CP_NODE, CP_HUD, CP_HINT };
+enum { CP_POS = 1, CP_NEG, CP_NODE, CP_HUD, CP_HINT };
 
 /* ─────────────────────────────────────────────────────────────────────
  * MODES — table of Chladni mode pairs (m, n) the demo cycles through.
@@ -284,55 +284,84 @@ enum { CP_POS=1, CP_NEG, CP_NODE, CP_HUD, CP_HINT };
  * ───────────────────────────────────────────────────────────────────── */
 static const int MODES[][2] = {
     /* n = 2..6 (the lower-mode classics) */
-    {1,2},
-    {1,3},{2,3},
-    {1,4},{2,4},{3,4},
-    {1,5},{2,5},{3,5},{4,5},
-    {1,6},{2,6},{3,6},{4,6},{5,6},
+    {1, 2},
+    {1, 3},
+    {2, 3},
+    {1, 4},
+    {2, 4},
+    {3, 4},
+    {1, 5},
+    {2, 5},
+    {3, 5},
+    {4, 5},
+    {1, 6},
+    {2, 6},
+    {3, 6},
+    {4, 6},
+    {5, 6},
     /* n = 7..9 (intricate mid-range) */
-    {1,7},{2,7},{3,7},{4,7},{5,7},{6,7},
-    {1,8},{2,8},{3,8},{4,8},{5,8},{6,8},{7,8},
-    {1,9},{2,9},{3,9},{4,9},{5,9},{6,9},{7,9},{8,9},
+    {1, 7},
+    {2, 7},
+    {3, 7},
+    {4, 7},
+    {5, 7},
+    {6, 7},
+    {1, 8},
+    {2, 8},
+    {3, 8},
+    {4, 8},
+    {5, 8},
+    {6, 8},
+    {7, 8},
+    {1, 9},
+    {2, 9},
+    {3, 9},
+    {4, 9},
+    {5, 9},
+    {6, 9},
+    {7, 9},
+    {8, 9},
     /* n = 10 (fine-lattice showcase) */
-    {1,10},{2,10},{3,10},{4,10},
+    {1, 10},
+    {2, 10},
+    {3, 10},
+    {4, 10},
 };
-#define N_MODES  (int)(sizeof(MODES)/sizeof(MODES[0]))
+#define N_MODES (int)(sizeof(MODES) / sizeof(MODES[0]))
 
 #define N_THEMES 4
 /* theme[theme][0]=pos fg, [1]=neg fg */
 static const short THEMES_256[N_THEMES][2] = {
-    {  51, 196 },   /* Classic:  cyan / red      */
-    {  45,  30 },   /* Ocean:    blue / teal      */
-    { 202, 160 },   /* Ember:  orange / dark-red  */
-    {  82, 201 },   /* Neon:    green / magenta   */
+    {51, 196},  /* Classic:  cyan / red      */
+    {45, 30},   /* Ocean:    blue / teal      */
+    {202, 160}, /* Ember:  orange / dark-red  */
+    {82, 201},  /* Neon:    green / magenta   */
 };
 static const short THEMES_8[N_THEMES][2] = {
-    { COLOR_CYAN,    COLOR_RED     },
-    { COLOR_BLUE,    COLOR_CYAN    },
-    { COLOR_YELLOW,  COLOR_RED     },
-    { COLOR_GREEN,   COLOR_MAGENTA },
+    {COLOR_CYAN, COLOR_RED},
+    {COLOR_BLUE, COLOR_CYAN},
+    {COLOR_YELLOW, COLOR_RED},
+    {COLOR_GREEN, COLOR_MAGENTA},
 };
-static const char *THEME_NAMES[N_THEMES] = {
-    "Classic", "Ocean", "Ember", "Neon"
-};
+static const char *THEME_NAMES[N_THEMES] = {"Classic", "Ocean", "Ember",
+                                            "Neon"};
 
 /* density chars: distance from nodal line → char brightness */
-static const char NODAL_CHARS[] = "@#*+.";   /* closest → farthest  */
+static const char NODAL_CHARS[] = "@#*+."; /* closest → farthest  */
 #define N_NCHARS (int)(sizeof(NODAL_CHARS) - 1)
 
 /* ── §2 clock ────────────────────────────────────────────────────────── */
 
-static long long clock_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
-static void clock_sleep_ns(long long ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(long long ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
 }
 
 /* ── §3 color ────────────────────────────────────────────────────────── */
@@ -345,21 +374,20 @@ static void clock_sleep_ns(long long ns)
  * bright cyan bottom action bar — fixed across themes so the figure
  * highlights and the HUD stay legible whichever palette is active.
  */
-static void color_apply(int t)
-{
-    short pos, neg;
-    if (COLORS >= 256) {
-        pos = THEMES_256[t][0];
-        neg = THEMES_256[t][1];
-    } else {
-        pos = THEMES_8[t][0];
-        neg = THEMES_8[t][1];
-    }
-    init_pair(CP_POS,  pos,                                   -1);
-    init_pair(CP_NEG,  neg,                                   -1);
-    init_pair(CP_NODE, (COLORS >= 256) ? 231 : COLOR_WHITE,   -1);
-    init_pair(CP_HUD,  (COLORS >= 256) ? 226 : COLOR_YELLOW,  -1);
-    init_pair(CP_HINT, (COLORS >= 256) ?  51 : COLOR_CYAN,    -1);
+static void color_apply(int t) {
+  short pos, neg;
+  if (COLORS >= 256) {
+    pos = THEMES_256[t][0];
+    neg = THEMES_256[t][1];
+  } else {
+    pos = THEMES_8[t][0];
+    neg = THEMES_8[t][1];
+  }
+  init_pair(CP_POS, pos, -1);
+  init_pair(CP_NEG, neg, -1);
+  init_pair(CP_NODE, (COLORS >= 256) ? 231 : COLOR_WHITE, -1);
+  init_pair(CP_HUD, (COLORS >= 256) ? 226 : COLOR_YELLOW, -1);
+  init_pair(CP_HINT, (COLORS >= 256) ? 51 : COLOR_CYAN, -1);
 }
 
 /* ── §4 field math (pure functions) ──────────────────────────────────── */
@@ -369,10 +397,9 @@ static void color_apply(int t)
  *     Z(x, y) = cos(mπx)·cos(nπy) − cos(nπx)·cos(mπy)
  * Nodal lines are where Z = 0.  See CONCEPTS header for derivation.
  */
-static float chladni_z(float x, float y, int m, int n)
-{
-    return cosf((float)m * (float)M_PI * x) * cosf((float)n * (float)M_PI * y)
-         - cosf((float)n * (float)M_PI * x) * cosf((float)m * (float)M_PI * y);
+static float chladni_z(float x, float y, int m, int n) {
+  return cosf((float)m * (float)M_PI * x) * cosf((float)n * (float)M_PI * y) -
+         cosf((float)n * (float)M_PI * x) * cosf((float)m * (float)M_PI * y);
 }
 
 /* ── §5 scene — state struct + mutators ──────────────────────────────── */
@@ -418,81 +445,79 @@ static float chladni_z(float x, float y, int m, int n)
  *     decomposition of plates: every Chladni figure is one eigenmode.
  * ───────────────────────────────────────────────────────────────────── */
 typedef struct {
-    /* ─ CHLADNI MODE STATE ─────────────────────────────────────────── *
-     *
-     * One Chladni figure is fully specified by an integer pair (m, n)
-     * from MODES[]; mode_idx is the index into that table.  scene_tick
-     * advances mode_idx by one each time a MORPH cycle completes, and
-     * the n/p keys jump it manually (via scene_advance_mode).
-     *
-     * The state machine (state, hold_ctr, hold_ticks, t) sequences the
-     * animation:
-     *
-     *   ST_HOLD : dwell on the current figure.  If auto_advance is on,
-     *             hold_ctr ticks up to hold_ticks, then enter ST_MORPH.
-     *
-     *   ST_MORPH: cross-fade toward MODES[(mode_idx+1) % N_MODES].  The
-     *             renderer's z_at_cell blends Z_current and Z_next as
-     *             (1−t)·Z_cur + t·Z_next.  When t ≥ 1.0, mode_idx
-     *             advances and the machine returns to ST_HOLD.
-     *
-     * hold_ticks is user-tunable via +/- (scene_adjust_hold) so the
-     * dwell can run from 0 ticks (continuous showcase morphing) up to
-     * HOLD_MAX (slow study).                                            */
-    int   mode_idx;     /* 0..N_MODES-1 — index into MODES[] (40 figures)*/
-    int   state;        /* ST_HOLD (0) or ST_MORPH (1)                   */
-    int   hold_ctr;     /* dwell counter, 0..hold_ticks-1; resets per HOLD*/
-    int   hold_ticks;   /* dwell duration, clamped to [HOLD_MIN, HOLD_MAX]*/
-    float t;            /* morph cross-fade ∈ [0, 1); 0 ⇒ pure current
-                           figure, → 1 ⇒ pure next figure                */
+  /* ─ CHLADNI MODE STATE ─────────────────────────────────────────── *
+   *
+   * One Chladni figure is fully specified by an integer pair (m, n)
+   * from MODES[]; mode_idx is the index into that table.  scene_tick
+   * advances mode_idx by one each time a MORPH cycle completes, and
+   * the n/p keys jump it manually (via scene_advance_mode).
+   *
+   * The state machine (state, hold_ctr, hold_ticks, t) sequences the
+   * animation:
+   *
+   *   ST_HOLD : dwell on the current figure.  If auto_advance is on,
+   *             hold_ctr ticks up to hold_ticks, then enter ST_MORPH.
+   *
+   *   ST_MORPH: cross-fade toward MODES[(mode_idx+1) % N_MODES].  The
+   *             renderer's z_at_cell blends Z_current and Z_next as
+   *             (1−t)·Z_cur + t·Z_next.  When t ≥ 1.0, mode_idx
+   *             advances and the machine returns to ST_HOLD.
+   *
+   * hold_ticks is user-tunable via +/- (scene_adjust_hold) so the
+   * dwell can run from 0 ticks (continuous showcase morphing) up to
+   * HOLD_MAX (slow study).                                            */
+  int mode_idx;   /* 0..N_MODES-1 — index into MODES[] (40 figures)*/
+  int state;      /* ST_HOLD (0) or ST_MORPH (1)                   */
+  int hold_ctr;   /* dwell counter, 0..hold_ticks-1; resets per HOLD*/
+  int hold_ticks; /* dwell duration, clamped to [HOLD_MIN, HOLD_MAX]*/
+  float t;        /* morph cross-fade ∈ [0, 1); 0 ⇒ pure current
+                     figure, → 1 ⇒ pure next figure                */
 
-    /* ─ UI STATE ───────────────────────────────────────────────────── *
-     *
-     * Set only by app_handle_key (which calls the scene_toggle_* /
-     * scene_cycle_* / scene_adjust_* mutators) so the keypress switch
-     * stays a declarative dispatch table.  Read by scene_tick (paused,
-     * auto_advance) and by the renderers (theme).                       */
-    int   auto_advance; /* 'a': true → HOLD auto-promotes to MORPH;
-                           false → freeze on current figure forever      */
-    int   paused;       /* spc: true → scene_tick is a no-op (everything
-                           frozen, including any in-progress morph)      */
-    int   theme;        /* 't'/'T': 0..N_THEMES-1 — index into THEMES_*
-                           tables; scene_cycle_theme calls color_apply   */
+  /* ─ UI STATE ───────────────────────────────────────────────────── *
+   *
+   * Set only by app_handle_key (which calls the scene_toggle_* /
+   * scene_cycle_* / scene_adjust_* mutators) so the keypress switch
+   * stays a declarative dispatch table.  Read by scene_tick (paused,
+   * auto_advance) and by the renderers (theme).                       */
+  int auto_advance; /* 'a': true → HOLD auto-promotes to MORPH;
+                       false → freeze on current figure forever      */
+  int paused;       /* spc: true → scene_tick is a no-op (everything
+                       frozen, including any in-progress morph)      */
+  int theme;        /* 't'/'T': 0..N_THEMES-1 — index into THEMES_*
+                       tables; scene_cycle_theme calls color_apply   */
 
-    /* ─ SCREEN DIMENSIONS ──────────────────────────────────────────── *
-     *
-     * Cell-space dimensions of the terminal, including the HUD chrome
-     * rows.  The chladni field renderer (render_field) draws rows
-     * 1..rows-2 — leaving row 0 for the top HUD and row rows-1 for the
-     * bottom action bar.  Refreshed only by scene_resize, which the
-     * main loop calls after the SIGWINCH signal sets g_need_resize.    */
-    int   rows;         /* total terminal rows (HUD chrome included)    */
-    int   cols;         /* total terminal columns                        */
+  /* ─ SCREEN DIMENSIONS ──────────────────────────────────────────── *
+   *
+   * Cell-space dimensions of the terminal, including the HUD chrome
+   * rows.  The chladni field renderer (render_field) draws rows
+   * 1..rows-2 — leaving row 0 for the top HUD and row rows-1 for the
+   * bottom action bar.  Refreshed only by scene_resize, which the
+   * main loop calls after the SIGWINCH signal sets g_need_resize.    */
+  int rows; /* total terminal rows (HUD chrome included)    */
+  int cols; /* total terminal columns                        */
 } Scene;
 
 /* scene_init — boot defaults: first mode, hold state, auto on, theme 0. */
-static void scene_init(Scene *sc)
-{
-    sc->mode_idx     = 0;
-    sc->state        = ST_HOLD;
-    sc->hold_ctr     = 0;
-    sc->hold_ticks   = HOLD_DEFAULT;
-    sc->t            = 0.0f;
-    sc->auto_advance = 1;
-    sc->paused       = 0;
-    sc->theme        = 0;
-    sc->rows         = 0;
-    sc->cols         = 0;
+static void scene_init(Scene *sc) {
+  sc->mode_idx = 0;
+  sc->state = ST_HOLD;
+  sc->hold_ctr = 0;
+  sc->hold_ticks = HOLD_DEFAULT;
+  sc->t = 0.0f;
+  sc->auto_advance = 1;
+  sc->paused = 0;
+  sc->theme = 0;
+  sc->rows = 0;
+  sc->cols = 0;
 }
 
 /* scene_resize — read the current terminal size into the scene. */
-static void scene_resize(Scene *sc)
-{
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    sc->rows = rows;
-    sc->cols = cols;
-    erase();
+static void scene_resize(Scene *sc) {
+  int rows, cols;
+  getmaxyx(stdscr, rows, cols);
+  sc->rows = rows;
+  sc->cols = cols;
+  erase();
 }
 
 /*
@@ -505,47 +530,45 @@ static void scene_resize(Scene *sc)
  *
  * If paused, do nothing.
  */
-static void scene_tick(Scene *sc)
-{
-    if (sc->paused) return;
+static void scene_tick(Scene *sc) {
+  if (sc->paused)
+    return;
 
-    if (sc->state == ST_HOLD) {
-        if (sc->auto_advance) {
-            if (++sc->hold_ctr >= sc->hold_ticks) {
-                sc->state = ST_MORPH;
-                sc->t     = 0.0f;
-            }
-        }
-        return;
+  if (sc->state == ST_HOLD) {
+    if (sc->auto_advance) {
+      if (++sc->hold_ctr >= sc->hold_ticks) {
+        sc->state = ST_MORPH;
+        sc->t = 0.0f;
+      }
     }
+    return;
+  }
 
-    /* ST_MORPH */
-    sc->t += MORPH_SPEED;
-    if (sc->t >= 1.0f) {
-        sc->t        = 0.0f;
-        sc->mode_idx = (sc->mode_idx + 1) % N_MODES;
-        sc->state    = ST_HOLD;
-        sc->hold_ctr = 0;
-    }
+  /* ST_MORPH */
+  sc->t += MORPH_SPEED;
+  if (sc->t >= 1.0f) {
+    sc->t = 0.0f;
+    sc->mode_idx = (sc->mode_idx + 1) % N_MODES;
+    sc->state = ST_HOLD;
+    sc->hold_ctr = 0;
+  }
 }
 
 /* scene_advance_mode — manual n/p jump.  Aborts any in-progress morph. */
-static void scene_advance_mode(Scene *sc, int dir)
-{
-    sc->mode_idx = ((sc->mode_idx + dir) % N_MODES + N_MODES) % N_MODES;
-    sc->state    = ST_HOLD;
-    sc->hold_ctr = 0;
-    sc->t        = 0.0f;
+static void scene_advance_mode(Scene *sc, int dir) {
+  sc->mode_idx = ((sc->mode_idx + dir) % N_MODES + N_MODES) % N_MODES;
+  sc->state = ST_HOLD;
+  sc->hold_ctr = 0;
+  sc->t = 0.0f;
 }
 
-static void scene_toggle_pause(Scene *sc) { sc->paused       ^= 1; }
-static void scene_toggle_auto (Scene *sc) { sc->auto_advance ^= 1; }
+static void scene_toggle_pause(Scene *sc) { sc->paused ^= 1; }
+static void scene_toggle_auto(Scene *sc) { sc->auto_advance ^= 1; }
 
 /* scene_cycle_theme — bump theme index and re-install the palette. */
-static void scene_cycle_theme(Scene *sc)
-{
-    sc->theme = (sc->theme + 1) % N_THEMES;
-    color_apply(sc->theme);
+static void scene_cycle_theme(Scene *sc) {
+  sc->theme = (sc->theme + 1) % N_THEMES;
+  color_apply(sc->theme);
 }
 
 /*
@@ -553,11 +576,12 @@ static void scene_cycle_theme(Scene *sc)
  * Positive delta = slower; negative = faster.  Clamped to [HOLD_MIN,
  * HOLD_MAX]; floor = continuous showcase morphing with no dwell.
  */
-static void scene_adjust_hold(Scene *sc, int delta)
-{
-    sc->hold_ticks += delta;
-    if (sc->hold_ticks < HOLD_MIN) sc->hold_ticks = HOLD_MIN;
-    if (sc->hold_ticks > HOLD_MAX) sc->hold_ticks = HOLD_MAX;
+static void scene_adjust_hold(Scene *sc, int delta) {
+  sc->hold_ticks += delta;
+  if (sc->hold_ticks < HOLD_MIN)
+    sc->hold_ticks = HOLD_MIN;
+  if (sc->hold_ticks > HOLD_MAX)
+    sc->hold_ticks = HOLD_MAX;
 }
 
 /*
@@ -567,19 +591,19 @@ static void scene_adjust_hold(Scene *sc, int delta)
  * morph parameter t doing the cross-fade.  At t=0 only the current
  * mode is evaluated (one chladni_z call instead of two).
  */
-static float z_at_cell(const Scene *sc, int r, int c)
-{
-    float x = (sc->cols > 1) ? (float)c / (float)(sc->cols - 1) : 0.5f;
-    float y = (sc->rows > 1) ? (float)r / (float)(sc->rows - 1) : 0.5f;
+static float z_at_cell(const Scene *sc, int r, int c) {
+  float x = (sc->cols > 1) ? (float)c / (float)(sc->cols - 1) : 0.5f;
+  float y = (sc->rows > 1) ? (float)r / (float)(sc->rows - 1) : 0.5f;
 
-    int cm = MODES[sc->mode_idx][0], cn = MODES[sc->mode_idx][1];
-    float z1 = chladni_z(x, y, cm, cn);
-    if (sc->t <= 0.0f) return z1;
+  int cm = MODES[sc->mode_idx][0], cn = MODES[sc->mode_idx][1];
+  float z1 = chladni_z(x, y, cm, cn);
+  if (sc->t <= 0.0f)
+    return z1;
 
-    int nm = MODES[(sc->mode_idx + 1) % N_MODES][0];
-    int nn = MODES[(sc->mode_idx + 1) % N_MODES][1];
-    float z2 = chladni_z(x, y, nm, nn);
-    return (1.0f - sc->t) * z1 + sc->t * z2;
+  int nm = MODES[(sc->mode_idx + 1) % N_MODES][0];
+  int nn = MODES[(sc->mode_idx + 1) % N_MODES][1];
+  float z2 = chladni_z(x, y, nm, nn);
+  return (1.0f - sc->t) * z1 + sc->t * z2;
 }
 
 /* ── §6 rendering — band-threshold pipeline + composers ──────────────── */
@@ -593,49 +617,46 @@ static float z_at_cell(const Scene *sc, int r, int c)
  *   < 0.40  band 4 — antinode hint (. pos/neg colour,  DIM )
  *   else    band -1 → blank cell
  */
-static const float BAND_THRESH[] = { 0.04f, 0.10f, 0.18f, 0.28f, 0.40f };
+static const float BAND_THRESH[] = {0.04f, 0.10f, 0.18f, 0.28f, 0.40f};
 
 /* band_for_amplitude — quantise |Z| into one of the five bands, or -1. */
-static int band_for_amplitude(float az)
-{
-    for (int b = 0; b < N_NCHARS; b++)
-        if (az < BAND_THRESH[b]) return b;
-    return -1;
+static int band_for_amplitude(float az) {
+  for (int b = 0; b < N_NCHARS; b++)
+    if (az < BAND_THRESH[b])
+      return b;
+  return -1;
 }
 
 /* pair_for_band — nodal core white; outer bands tinted by sign(z). */
-static int pair_for_band(int band, float z)
-{
-    if (band == 0) return CP_NODE;
-    return (z > 0.0f) ? CP_POS : CP_NEG;
+static int pair_for_band(int band, float z) {
+  if (band == 0)
+    return CP_NODE;
+  return (z > 0.0f) ? CP_POS : CP_NEG;
 }
 
 /* attr_for_band — inner two bands BOLD (bright sand grain); rest DIM. */
-static attr_t attr_for_band(int band, int pair)
-{
-    return (band <= 1) ? (COLOR_PAIR(pair) | A_BOLD)
-                       : (COLOR_PAIR(pair) | A_DIM);
+static attr_t attr_for_band(int band, int pair) {
+  return (band <= 1) ? (COLOR_PAIR(pair) | A_BOLD) : (COLOR_PAIR(pair) | A_DIM);
 }
 
 /*
  * paint_field_cell — band-threshold one cell and paint its glyph.
  * Cells outside the outermost band stay blank.
  */
-static void paint_field_cell(const Scene *sc, int r, int c)
-{
-    float z  = z_at_cell(sc, r, c);
-    float az = fabsf(z);
+static void paint_field_cell(const Scene *sc, int r, int c) {
+  float z = z_at_cell(sc, r, c);
+  float az = fabsf(z);
 
-    int band = band_for_amplitude(az);
-    if (band < 0) {
-        mvaddch(r, c, ' ');
-        return;
-    }
-    int    pair = pair_for_band(band, z);
-    attr_t attr = attr_for_band(band, pair);
-    attron(attr);
-    mvaddch(r, c, (chtype)(unsigned char)NODAL_CHARS[band]);
-    attroff(attr);
+  int band = band_for_amplitude(az);
+  if (band < 0) {
+    mvaddch(r, c, ' ');
+    return;
+  }
+  int pair = pair_for_band(band, z);
+  attr_t attr = attr_for_band(band, pair);
+  attron(attr);
+  mvaddch(r, c, (chtype)(unsigned char)NODAL_CHARS[band]);
+  attroff(attr);
 }
 
 /*
@@ -643,11 +664,10 @@ static void paint_field_cell(const Scene *sc, int r, int c)
  * Row 0 (top HUD) and row rows-1 (bottom HUD) are skipped so chrome
  * stays intact.
  */
-static void render_field(const Scene *sc)
-{
-    for (int r = 1; r < sc->rows - 1; r++)
-        for (int c = 0; c < sc->cols - 1; c++)
-            paint_field_cell(sc, r, c);
+static void render_field(const Scene *sc) {
+  for (int r = 1; r < sc->rows - 1; r++)
+    for (int c = 0; c < sc->cols - 1; c++)
+      paint_field_cell(sc, r, c);
 }
 
 /*
@@ -655,33 +675,30 @@ static void render_field(const Scene *sc)
  * Right-aligned: current → next mode, state, t, hold time, theme,
  * auto/manual, paused/running.  CP_HUD (bright yellow + bold).
  */
-static void render_hud_top(const Scene *sc)
-{
-    int cm = MODES[sc->mode_idx][0], cn = MODES[sc->mode_idx][1];
-    int nm = MODES[(sc->mode_idx + 1) % N_MODES][0];
-    int nn = MODES[(sc->mode_idx + 1) % N_MODES][1];
-    const char *state_str = (sc->state == ST_MORPH) ? "morphing" : "hold";
+static void render_hud_top(const Scene *sc) {
+  int cm = MODES[sc->mode_idx][0], cn = MODES[sc->mode_idx][1];
+  int nm = MODES[(sc->mode_idx + 1) % N_MODES][0];
+  int nn = MODES[(sc->mode_idx + 1) % N_MODES][1];
+  const char *state_str = (sc->state == ST_MORPH) ? "morphing" : "hold";
 
-    /* Hold time in seconds (TICK_NS is 33.3 ms → 30 fps). */
-    double hold_sec = (double)sc->hold_ticks / 30.0;
+  /* Hold time in seconds (TICK_NS is 33.3 ms → 30 fps). */
+  double hold_sec = (double)sc->hold_ticks / 30.0;
 
-    char buf[200];
-    snprintf(buf, sizeof buf,
-             " mode(%d,%d)->(%d,%d)  [%d/%d]  %s t=%.2f  hold:%.1fs  "
-             "theme:%s  %s  %s ",
-             cm, cn, nm, nn,
-             sc->mode_idx + 1, N_MODES, state_str, (double)sc->t,
-             hold_sec,
-             THEME_NAMES[sc->theme],
-             sc->auto_advance ? "auto" : "man.",
-             sc->paused       ? "PAUSED" : "running");
-    int len = (int)strlen(buf);
-    int col = sc->cols - len;
-    if (col < 0) col = 0;
+  char buf[200];
+  snprintf(buf, sizeof buf,
+           " mode(%d,%d)->(%d,%d)  [%d/%d]  %s t=%.2f  hold:%.1fs  "
+           "theme:%s  %s  %s ",
+           cm, cn, nm, nn, sc->mode_idx + 1, N_MODES, state_str, (double)sc->t,
+           hold_sec, THEME_NAMES[sc->theme], sc->auto_advance ? "auto" : "man.",
+           sc->paused ? "PAUSED" : "running");
+  int len = (int)strlen(buf);
+  int col = sc->cols - len;
+  if (col < 0)
+    col = 0;
 
-    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvaddnstr(0, col, buf, sc->cols);
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+  attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+  mvaddnstr(0, col, buf, sc->cols);
+  attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
 /*
@@ -689,44 +706,44 @@ static void render_hud_top(const Scene *sc)
  * Left-aligned key list; short fallback when the terminal is narrow.
  * CP_HINT (bright cyan + bold).
  */
-static void render_hud_bottom(const Scene *sc)
-{
-    const char *hint_full =
-        " q:quit  spc:pause  n/p:mode  t:theme  a:auto  +/-:hold ";
-    const char *hint_short = " q:quit  n:mode  t:theme  +/-:hold ";
-    const char *hint = hint_full;
-    if ((int)strlen(hint_full) >= sc->cols - 1) hint = hint_short;
+static void render_hud_bottom(const Scene *sc) {
+  const char *hint_full =
+      " q:quit  spc:pause  n/p:mode  t:theme  a:auto  +/-:hold ";
+  const char *hint_short = " q:quit  n:mode  t:theme  +/-:hold ";
+  const char *hint = hint_full;
+  if ((int)strlen(hint_full) >= sc->cols - 1)
+    hint = hint_short;
 
-    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
-    mvaddnstr(sc->rows - 1, 0, hint, sc->cols);
-    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
+  attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+  mvaddnstr(sc->rows - 1, 0, hint, sc->cols);
+  attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
 /* ── §7 screen + app ─────────────────────────────────────────────────── */
 
-static void screen_init(void)
-{
-    initscr();
-    cbreak();
-    noecho();
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    start_color();
-    use_default_colors();
-    color_apply(0);   /* boot palette; scene_cycle_theme rotates it later */
+static void screen_init(void) {
+  initscr();
+  cbreak();
+  noecho();
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  start_color();
+  use_default_colors();
+  color_apply(0); /* boot palette; scene_cycle_theme rotates it later */
 }
 
 /* Signal-handler flags must be globals — the C signal API has no
  * context pointer, so any per-Scene state can't be reached from here.  */
-static volatile sig_atomic_t g_running     = 1;
+static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_need_resize = 0;
 
-static void sig_handler(int sig)
-{
-    if (sig == SIGWINCH) g_need_resize = 1;
-    else                 g_running = 0;
+static void sig_handler(int sig) {
+  if (sig == SIGWINCH)
+    g_need_resize = 1;
+  else
+    g_running = 0;
 }
 static void cleanup(void) { endwin(); }
 
@@ -734,58 +751,80 @@ static void cleanup(void) { endwin(); }
  * app_handle_key — route one keypress to the matching scene mutator.
  * Returns 0 on quit, 1 otherwise.
  */
-static int app_handle_key(Scene *sc, int ch)
-{
-    switch (ch) {
-    case 'q': case 'Q': return 0;
-    case ' ':           scene_toggle_pause(sc);            break;
-    case 'a': case 'A': scene_toggle_auto(sc);             break;
-    case 'n':           scene_advance_mode(sc, +1);        break;
-    case 'p':           scene_advance_mode(sc, -1);        break;
-    case 't': case 'T': scene_cycle_theme(sc);             break;
-    case '+': case '=': scene_adjust_hold(sc, -HOLD_STEP); break;
-    case '-': case '_': scene_adjust_hold(sc, +HOLD_STEP); break;
-    }
-    return 1;
+static int app_handle_key(Scene *sc, int ch) {
+  switch (ch) {
+  case 'q':
+  case 'Q':
+    return 0;
+  case ' ':
+    scene_toggle_pause(sc);
+    break;
+  case 'a':
+  case 'A':
+    scene_toggle_auto(sc);
+    break;
+  case 'n':
+    scene_advance_mode(sc, +1);
+    break;
+  case 'p':
+    scene_advance_mode(sc, -1);
+    break;
+  case 't':
+  case 'T':
+    scene_cycle_theme(sc);
+    break;
+  case '+':
+  case '=':
+    scene_adjust_hold(sc, -HOLD_STEP);
+    break;
+  case '-':
+  case '_':
+    scene_adjust_hold(sc, +HOLD_STEP);
+    break;
+  }
+  return 1;
 }
 
-int main(void)
-{
-    signal(SIGINT,   sig_handler);
-    signal(SIGTERM,  sig_handler);
-    signal(SIGWINCH, sig_handler);
-    atexit(cleanup);
+int main(void) {
+  signal(SIGINT, sig_handler);
+  signal(SIGTERM, sig_handler);
+  signal(SIGWINCH, sig_handler);
+  atexit(cleanup);
 
-    screen_init();
+  screen_init();
 
-    Scene scene;
-    scene_init(&scene);
-    scene_resize(&scene);
+  Scene scene;
+  scene_init(&scene);
+  scene_resize(&scene);
 
-    long long next = clock_ns();
+  long long next = clock_ns();
 
-    while (g_running) {
-        if (g_need_resize) {
-            g_need_resize = 0;
-            endwin(); refresh();
-            scene_resize(&scene);
-        }
-
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (!app_handle_key(&scene, ch)) { g_running = 0; break; }
-        }
-
-        scene_tick(&scene);
-        erase();
-        render_field(&scene);
-        render_hud_top(&scene);
-        render_hud_bottom(&scene);
-        wnoutrefresh(stdscr);
-        doupdate();
-
-        next += TICK_NS;
-        clock_sleep_ns(next - clock_ns());
+  while (g_running) {
+    if (g_need_resize) {
+      g_need_resize = 0;
+      endwin();
+      refresh();
+      scene_resize(&scene);
     }
-    return 0;
+
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (!app_handle_key(&scene, ch)) {
+        g_running = 0;
+        break;
+      }
+    }
+
+    scene_tick(&scene);
+    erase();
+    render_field(&scene);
+    render_hud_top(&scene);
+    render_hud_bottom(&scene);
+    wnoutrefresh(stdscr);
+    doupdate();
+
+    next += TICK_NS;
+    clock_sleep_ns(next - clock_ns());
+  }
+  return 0;
 }

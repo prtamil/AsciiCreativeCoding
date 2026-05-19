@@ -5,6 +5,7 @@ raymarcher/
 raster/
 signal/
 particle_systems/
+physics/
  
  completed rest start from scratch
 

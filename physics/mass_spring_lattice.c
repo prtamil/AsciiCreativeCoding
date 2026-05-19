@@ -19,20 +19,22 @@
  * ═════════════════════════════════════════════════════════════════════
  *
  *  ┌───────────────────────────────────────────────────────────────┐
- *  │ MassSpring  scenario:Center  theme:Classic  k=60  E=…  60fps  │ ← row 0  HUD STATUS (bright yellow + bold)
- *  │                                                               │
- *  │   . . . . . . . . . . . . . . . . . . . . . .                 │ ← faint '.' = rest-state NODES.  Every dot is a
- *  │   . . . . . . . . . . . . . . . . . . . . . .                 │   point mass at its anchor position; they form
- *  │   . . . . #=#=*           . . . . . . . . . .                 │   the LATTICE you'd see if everything were quiet.
- *  │   . . #=#=O O=#-          . . . . . . . . . .                 │
- *  │   . . *=#=*=#-            . . . . . . . . . .                 │ ← bright glyphs = STRESSED SPRINGS.
- *  │   . . . . . . . . . . . . . . . . . . . . . .                 │     -  |   mild stress   (dim colour)
- *  │   . . . . . . . . . . . . . . . . . . . . . .                 │     =  H   medium stress (bright colour)
- *  │   . . . . . . . . . . . . . . . . . . . . . .                 │     #      EXTREME stress (bright + bold)
- *  │                                                               │   COLOUR encodes sign:
- *  │ q:quit  spc:pause  r:reset  n:next  t/T:theme  k/K:stiff …    │ ← row n-1  CYAN ↘ compressed (springs pushed in)
- *  └───────────────────────────────────────────────────────────────┘   YELLOW/RED ↗ stretched (springs pulled out)
- *                                                                     bright cyan + bold
+ *  │ MassSpring  scenario:Center  theme:Classic  k=60  E=…  60fps  │ ← row 0
+ * HUD STATUS (bright yellow + bold) │ │ │   . . . . . . . . . . . . . . . . . .
+ * . . . .                 │ ← faint '.' = rest-state NODES.  Every dot is a │
+ * . . . . . . . . . . . . . . . . . . . . . .                 │   point mass at
+ * its anchor position; they form │   . . . . #=#=*           . . . . . . . . .
+ * .                 │   the LATTICE you'd see if everything were quiet. │   . .
+ * #=#=O O=#-          . . . . . . . . . .                 │ │   . . *=#=*=#- .
+ * . . . . . . . . .                 │ ← bright glyphs = STRESSED SPRINGS. │   .
+ * . . . . . . . . . . . . . . . . . . . . .                 │     -  |   mild
+ * stress   (dim colour) │   . . . . . . . . . . . . . . . . . . . . . . │     =
+ * H   medium stress (bright colour) │   . . . . . . . . . . . . . . . . . . . .
+ * . .                 │     #      EXTREME stress (bright + bold) │ │   COLOUR
+ * encodes sign: │ q:quit  spc:pause  r:reset  n:next  t/T:theme  k/K:stiff … │
+ * ← row n-1  CYAN ↘ compressed (springs pushed in)
+ *  └───────────────────────────────────────────────────────────────┘ YELLOW/RED
+ * ↗ stretched (springs pulled out) bright cyan + bold
  *
  *   MOVING NODES — overlay the rest-grid dots:
  *     .    rest    (speed < 0.6 cell/s)   — almost still
@@ -220,69 +222,68 @@
  * ════════════════════════════════════════════════════════════════════ */
 
 enum {
-    TARGET_FPS      = 60,
-    SUBSTEPS        = 2,        /* physics sub-steps per render frame */
+  TARGET_FPS = 60,
+  SUBSTEPS = 2, /* physics sub-steps per render frame */
 
-    NODE_DX         = 4,        /* cell columns between adjacent nodes */
-    NODE_DY         = 2,        /* cell rows between adjacent nodes */
-    MAX_NX          = 40,
-    MAX_NY          = 18,
-    MAX_NODES       = MAX_NX * MAX_NY,
-    MAX_SPRINGS     = MAX_NX * MAX_NY * 2,
+  NODE_DX = 4, /* cell columns between adjacent nodes */
+  NODE_DY = 2, /* cell rows between adjacent nodes */
+  MAX_NX = 40,
+  MAX_NY = 18,
+  MAX_NODES = MAX_NX * MAX_NY,
+  MAX_SPRINGS = MAX_NX * MAX_NY * 2,
 
-    SCENARIO_COUNT  = 4,
-    SCENARIO_TICKS  = 12 * TARGET_FPS,   /* ~12 s per scenario */
+  SCENARIO_COUNT = 4,
+  SCENARIO_TICKS = 12 * TARGET_FPS, /* ~12 s per scenario */
 
-    N_THEMES        = 3,
+  N_THEMES = 3,
 };
 
-#define MASS_DEF        1.0f
-#define K_DEF           60.0f
-#define DAMPING_DEF     1.5f
-#define IMPULSE_VEL     14.0f
-#define HAMMER_VEL      30.0f
+#define MASS_DEF 1.0f
+#define K_DEF 60.0f
+#define DAMPING_DEF 1.5f
+#define IMPULSE_VEL 14.0f
+#define HAMMER_VEL 30.0f
 
-#define K_STEP          5.0f
-#define K_MIN           10.0f
-#define K_MAX           300.0f
-#define DAMPING_STEP    0.25f
-#define DAMPING_MIN     0.0f
-#define DAMPING_MAX     8.0f
+#define K_STEP 5.0f
+#define K_MIN 10.0f
+#define K_MAX 300.0f
+#define DAMPING_STEP 0.25f
+#define DAMPING_MIN 0.0f
+#define DAMPING_MAX 8.0f
 
 /* Strain magnitude thresholds — boundaries between visual tiers */
-#define STRAIN_NULL     0.04f   /* below → spring not drawn (THE GLOW) */
-#define STRAIN_MID      0.15f   /* low → mid tier                       */
-#define STRAIN_HIGH     0.35f   /* mid → high tier                      */
+#define STRAIN_NULL 0.04f /* below → spring not drawn (THE GLOW) */
+#define STRAIN_MID 0.15f  /* low → mid tier                       */
+#define STRAIN_HIGH 0.35f /* mid → high tier                      */
 
 /* Speed thresholds — boundaries between node visual tiers */
-#define SPEED_REST      0.6f
-#define SPEED_FAST      5.0f
+#define SPEED_REST 0.6f
+#define SPEED_FAST 5.0f
 
-#define HUD_TOP_ROWS    1
-#define HUD_BOT_ROWS    1
+#define HUD_TOP_ROWS 1
+#define HUD_BOT_ROWS 1
 
 /* ════════════════════════════════════════════════════════════════════
  * §2  CLOCK
  * ════════════════════════════════════════════════════════════════════ */
 
-#define NS_PER_SEC      1000000000LL
-#define TICK_NS(fps)    (NS_PER_SEC / (fps))
+#define NS_PER_SEC 1000000000LL
+#define TICK_NS(fps) (NS_PER_SEC / (fps))
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)(ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -299,16 +300,16 @@ static void clock_sleep_ns(int64_t ns)
  */
 
 enum {
-    CP_HUD         = 1,
-    CP_HINT        = 2,
-    CP_COMPRESS_LO = 3,
-    CP_COMPRESS_HI = 4,
-    CP_TENSION_LO  = 5,
-    CP_TENSION_HI  = 6,
-    CP_NODE_REST   = 7,
-    CP_NODE_SLOW   = 8,
-    CP_NODE_FAST   = 9,
-    CP_NODE_PIN    = 10,
+  CP_HUD = 1,
+  CP_HINT = 2,
+  CP_COMPRESS_LO = 3,
+  CP_COMPRESS_HI = 4,
+  CP_TENSION_LO = 5,
+  CP_TENSION_HI = 6,
+  CP_NODE_REST = 7,
+  CP_NODE_SLOW = 8,
+  CP_NODE_FAST = 9,
+  CP_NODE_PIN = 10,
 };
 
 /*
@@ -354,88 +355,80 @@ enum {
  *   16-23 / 232-239 become invisible against default-black + A_DIM).
  */
 typedef struct {
-    /* ── 256-colour palette (preferred when COLORS >= 256) ────────── *
-     * Pairs are listed in visual order: the COOL ramp encodes
-     * compression (σ<0), the HOT ramp encodes tension (σ>0).  Each
-     * ramp goes LO → HI as |σ| crosses STRAIN_MID into STRAIN_HIGH. */
-    short compress_lo;   /* CP_COMPRESS_LO — mild compression, |σ|∈[.04,.15) */
-    short compress_hi;   /* CP_COMPRESS_HI — strong/extreme compression      */
-    short tension_lo;    /* CP_TENSION_LO  — mild tension                    */
-    short tension_hi;    /* CP_TENSION_HI  — strong/extreme tension          */
+  /* ── 256-colour palette (preferred when COLORS >= 256) ────────── *
+   * Pairs are listed in visual order: the COOL ramp encodes
+   * compression (σ<0), the HOT ramp encodes tension (σ>0).  Each
+   * ramp goes LO → HI as |σ| crosses STRAIN_MID into STRAIN_HIGH. */
+  short compress_lo; /* CP_COMPRESS_LO — mild compression, |σ|∈[.04,.15) */
+  short compress_hi; /* CP_COMPRESS_HI — strong/extreme compression      */
+  short tension_lo;  /* CP_TENSION_LO  — mild tension                    */
+  short tension_hi;  /* CP_TENSION_HI  — strong/extreme tension          */
 
-    /* Node luminance tiers — must form a monotone ramp REST → FAST so
-     * the viewer reads "this node is moving" as "this node is brighter
-     * than its neighbours" without consulting a legend. */
-    short node_rest;     /* CP_NODE_REST — speed < SPEED_REST, the dot grid */
-    short node_slow;     /* CP_NODE_SLOW — SPEED_REST ≤ speed < SPEED_FAST  */
-    short node_fast;     /* CP_NODE_FAST — speed ≥ SPEED_FAST (impact peak) */
+  /* Node luminance tiers — must form a monotone ramp REST → FAST so
+   * the viewer reads "this node is moving" as "this node is brighter
+   * than its neighbours" without consulting a legend. */
+  short node_rest; /* CP_NODE_REST — speed < SPEED_REST, the dot grid */
+  short node_slow; /* CP_NODE_SLOW — SPEED_REST ≤ speed < SPEED_FAST  */
+  short node_fast; /* CP_NODE_FAST — speed ≥ SPEED_FAST (impact peak) */
 
-    /* ── 8-colour ANSI fallback ──────────────────────────────────── *
-     * Same semantic roles, coarser granularity.  Within each ramp the
-     * fallback typically collapses LO and HI onto a single colour
-     * (sign discrimination preserved, intensity discrimination not). */
-    short compress_lo8, compress_hi8;
-    short tension_lo8,  tension_hi8;
-    short node_rest8, node_slow8, node_fast8;
+  /* ── 8-colour ANSI fallback ──────────────────────────────────── *
+   * Same semantic roles, coarser granularity.  Within each ramp the
+   * fallback typically collapses LO and HI onto a single colour
+   * (sign discrimination preserved, intensity discrimination not). */
+  short compress_lo8, compress_hi8;
+  short tension_lo8, tension_hi8;
+  short node_rest8, node_slow8, node_fast8;
 
-    const char *name;    /* shown in the HUD's `theme:` field         */
+  const char *name; /* shown in the HUD's `theme:` field         */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
     /* Classic — cyan compression, red tension */
-    { 51, 195,   220, 196,   245, 46, 207,
-      COLOR_CYAN, COLOR_WHITE, COLOR_YELLOW, COLOR_RED,
-      COLOR_WHITE, COLOR_GREEN, COLOR_MAGENTA,
-      "Classic" },
+    {51, 195, 220, 196, 245, 46, 207, COLOR_CYAN, COLOR_WHITE, COLOR_YELLOW,
+     COLOR_RED, COLOR_WHITE, COLOR_GREEN, COLOR_MAGENTA, "Classic"},
     /* Cold — blue/cyan compression, white-hot tension */
-    { 39, 87,    255, 226,   244, 51, 213,
-      COLOR_BLUE, COLOR_CYAN, COLOR_WHITE, COLOR_YELLOW,
-      COLOR_WHITE, COLOR_CYAN, COLOR_MAGENTA,
-      "Cold" },
+    {39, 87, 255, 226, 244, 51, 213, COLOR_BLUE, COLOR_CYAN, COLOR_WHITE,
+     COLOR_YELLOW, COLOR_WHITE, COLOR_CYAN, COLOR_MAGENTA, "Cold"},
     /* Plasma — magenta/violet compression, gold tension */
-    { 99, 207,   214, 196,   246, 156, 213,
-      COLOR_MAGENTA, COLOR_WHITE, COLOR_YELLOW, COLOR_RED,
-      COLOR_WHITE, COLOR_GREEN, COLOR_MAGENTA,
-      "Plasma" },
+    {99, 207, 214, 196, 246, 156, 213, COLOR_MAGENTA, COLOR_WHITE, COLOR_YELLOW,
+     COLOR_RED, COLOR_WHITE, COLOR_GREEN, COLOR_MAGENTA, "Plasma"},
 };
 
 /* Bind the canonical HUD pairs once at startup — they NEVER change
  * across theme cycling (CLAUDE.md: dim/coloured HUDs disappear). */
-static void color_init(void)
-{
-    start_color();
-    use_default_colors();
+static void color_init(void) {
+  start_color();
+  use_default_colors();
 
-    if (COLORS >= 256) {
-        init_pair(CP_HUD,  226, -1);
-        init_pair(CP_HINT,  51, -1);
-    } else {
-        init_pair(CP_HUD,  COLOR_YELLOW, -1);
-        init_pair(CP_HINT, COLOR_CYAN,   -1);
-    }
+  if (COLORS >= 256) {
+    init_pair(CP_HUD, 226, -1);
+    init_pair(CP_HINT, 51, -1);
+  } else {
+    init_pair(CP_HUD, COLOR_YELLOW, -1);
+    init_pair(CP_HINT, COLOR_CYAN, -1);
+  }
 }
 
-static void theme_apply(int t)
-{
-    const Theme *th = &k_themes[t];
-    if (COLORS >= 256) {
-        init_pair(CP_COMPRESS_LO, th->compress_lo, -1);
-        init_pair(CP_COMPRESS_HI, th->compress_hi, -1);
-        init_pair(CP_TENSION_LO,  th->tension_lo,  -1);
-        init_pair(CP_TENSION_HI,  th->tension_hi,  -1);
-        init_pair(CP_NODE_REST,   th->node_rest,   -1);
-        init_pair(CP_NODE_SLOW,   th->node_slow,   -1);
-        init_pair(CP_NODE_FAST,   th->node_fast,   -1);
-    } else {
-        init_pair(CP_COMPRESS_LO, th->compress_lo8, -1);
-        init_pair(CP_COMPRESS_HI, th->compress_hi8, -1);
-        init_pair(CP_TENSION_LO,  th->tension_lo8,  -1);
-        init_pair(CP_TENSION_HI,  th->tension_hi8,  -1);
-        init_pair(CP_NODE_REST,   th->node_rest8,   -1);
-        init_pair(CP_NODE_SLOW,   th->node_slow8,   -1);
-        init_pair(CP_NODE_FAST,   th->node_fast8,   -1);
-    }
-    init_pair(CP_NODE_PIN, COLOR_WHITE, COLOR_BLUE);
+static void theme_apply(int t) {
+  const Theme *th = &k_themes[t];
+  if (COLORS >= 256) {
+    init_pair(CP_COMPRESS_LO, th->compress_lo, -1);
+    init_pair(CP_COMPRESS_HI, th->compress_hi, -1);
+    init_pair(CP_TENSION_LO, th->tension_lo, -1);
+    init_pair(CP_TENSION_HI, th->tension_hi, -1);
+    init_pair(CP_NODE_REST, th->node_rest, -1);
+    init_pair(CP_NODE_SLOW, th->node_slow, -1);
+    init_pair(CP_NODE_FAST, th->node_fast, -1);
+  } else {
+    init_pair(CP_COMPRESS_LO, th->compress_lo8, -1);
+    init_pair(CP_COMPRESS_HI, th->compress_hi8, -1);
+    init_pair(CP_TENSION_LO, th->tension_lo8, -1);
+    init_pair(CP_TENSION_HI, th->tension_hi8, -1);
+    init_pair(CP_NODE_REST, th->node_rest8, -1);
+    init_pair(CP_NODE_SLOW, th->node_slow8, -1);
+    init_pair(CP_NODE_FAST, th->node_fast8, -1);
+  }
+  init_pair(CP_NODE_PIN, COLOR_WHITE, COLOR_BLUE);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -472,8 +465,8 @@ static void theme_apply(int t)
  *   one-line addition to springs_build().
  */
 typedef enum {
-    SPRING_H = 0,    /* horizontal: dx = NODE_DX, dy = 0  →  glyph '-' */
-    SPRING_V = 1,    /* vertical:   dx = 0, dy = NODE_DY  →  glyph '|' */
+  SPRING_H = 0, /* horizontal: dx = NODE_DX, dy = 0  →  glyph '-' */
+  SPRING_V = 1, /* vertical:   dx = 0, dy = NODE_DY  →  glyph '|' */
 } SpringKind;
 
 /*
@@ -519,19 +512,19 @@ typedef enum {
  *   one cache line and per-pass scans are prefetcher-friendly.
  */
 typedef struct {
-    float x,  y;     /* CURRENT position (cell coords).  Floats because the
-                      * integrator advances in sub-cell steps. */
-    float rx, ry;    /* REST / lattice-anchor position.  Set once in
-                      * lattice_init(); never modified after.  Used by
-                      * scenario_quiet() and rest-grid drawing. */
-    float vx, vy;    /* velocity [cells/s].  Symplectic Euler updates this
-                      * FIRST inside integrate_step() using f/m·dt. */
-    float fx, fy;    /* force accumulator [N].  Cleared at the top of every
-                      * compute_forces() call; receives spring contributions
-                      * (Hooke [ref 1]) and damping (-c·v) in two passes. */
-    bool  pinned;    /* if true: forces are still computed but integrate_step
-                      * skips this node, so it acts as a fixed anchor.
-                      * Not used in the default showcase scenarios. */
+  float x, y;   /* CURRENT position (cell coords).  Floats because the
+                 * integrator advances in sub-cell steps. */
+  float rx, ry; /* REST / lattice-anchor position.  Set once in
+                 * lattice_init(); never modified after.  Used by
+                 * scenario_quiet() and rest-grid drawing. */
+  float vx, vy; /* velocity [cells/s].  Symplectic Euler updates this
+                 * FIRST inside integrate_step() using f/m·dt. */
+  float fx, fy; /* force accumulator [N].  Cleared at the top of every
+                 * compute_forces() call; receives spring contributions
+                 * (Hooke [ref 1]) and damping (-c·v) in two passes. */
+  bool pinned;  /* if true: forces are still computed but integrate_step
+                 * skips this node, so it acts as a fixed anchor.
+                 * Not used in the default showcase scenarios. */
 } Node;
 
 /*
@@ -572,14 +565,14 @@ typedef struct {
  *   currently depends on this, but it's a convenient invariant.
  */
 typedef struct {
-    int        a, b;        /* node indices into Scene.nodes[] (a < b) */
-    float      rest_len;    /* relaxed length L₀ [cells].  H: NODE_DX,
-                             * V: NODE_DY (set in springs_build).      */
-    float      strain;      /* σ = (|d| - L₀) / L₀ — signed strain.
-                             * WRITTEN by compute_forces() each step;
-                             * READ by render_spring() each frame.
-                             * Sign convention: <0 = compressed, >0 = stretched. */
-    SpringKind kind;        /* axis tag (H/V) — picks renderer glyph    */
+  int a, b;        /* node indices into Scene.nodes[] (a < b) */
+  float rest_len;  /* relaxed length L₀ [cells].  H: NODE_DX,
+                    * V: NODE_DY (set in springs_build).      */
+  float strain;    /* σ = (|d| - L₀) / L₀ — signed strain.
+                    * WRITTEN by compute_forces() each step;
+                    * READ by render_spring() each frame.
+                    * Sign convention: <0 = compressed, >0 = stretched. */
+  SpringKind kind; /* axis tag (H/V) — picks renderer glyph    */
 } Spring;
 
 /*
@@ -646,46 +639,46 @@ typedef struct {
  *   path (CLAUDE.md Memory rule).
  */
 typedef struct {
-    /* ── (A) PHYSICS DATA — input + state for compute_forces / integrate_step ─
-     * Flat arrays.  nn / ns track how many entries are live;
-     * indices past those are uninitialised garbage. */
-    Node    nodes  [MAX_NODES];     /* point-mass states (pos, vel, force)    */
-    Spring  springs[MAX_SPRINGS];   /* Hooke connectors with cached strain    */
-    int     nn;                     /* live node   count (= nx * ny)          */
-    int     ns;                     /* live spring count (set by springs_build) */
+  /* ── (A) PHYSICS DATA — input + state for compute_forces / integrate_step ─
+   * Flat arrays.  nn / ns track how many entries are live;
+   * indices past those are uninitialised garbage. */
+  Node nodes[MAX_NODES];       /* point-mass states (pos, vel, force)    */
+  Spring springs[MAX_SPRINGS]; /* Hooke connectors with cached strain    */
+  int nn;                      /* live node   count (= nx * ny)          */
+  int ns;                      /* live spring count (set by springs_build) */
 
-    /* ── (B) GEOMETRY — lattice topology + terminal anchor ─────── *
-     * Set ONCE per (re)build by lattice_init() / fit_lattice() and
-     * frozen until the next resize.  The renderer reads these every
-     * frame to clip drawing to the visible band. */
-    int     nx, ny;                 /* nodes per row, per column           */
-    int     x0, y0;                 /* cell coords of the top-left REST node
-                                     * (the renderer's anchor for the
-                                     *  faint dot grid)                    */
-    int     term_cols, term_rows;   /* current ncurses terminal dims        */
+  /* ── (B) GEOMETRY — lattice topology + terminal anchor ─────── *
+   * Set ONCE per (re)build by lattice_init() / fit_lattice() and
+   * frozen until the next resize.  The renderer reads these every
+   * frame to clip drawing to the visible band. */
+  int nx, ny;               /* nodes per row, per column           */
+  int x0, y0;               /* cell coords of the top-left REST node
+                             * (the renderer's anchor for the
+                             *  faint dot grid)                    */
+  int term_cols, term_rows; /* current ncurses terminal dims        */
 
-    /* ── (C) SIM PARAMS — physics knobs, user-tunable at runtime ─ *
-     * compute_forces() + integrate_step() read these per substep.
-     * Mutated by the keyboard handler (k/K, d/D) in main(); also
-     * touched by scenario_apply() if a preset wants a different
-     * damping/k for its visual.  Independent of region (A): changing
-     * `k` doesn't rewrite the lattice, only the forces it generates. */
-    float   k;                      /* Hooke spring constant [N/m, scaled] */
-    float   damping;                /* linear velocity damping coefficient */
-    float   mass;                   /* per-node mass (uniform lattice)     */
-    float   dt;                     /* one physics substep duration [s]    */
-    int     sim_fps;                /* render-frame cap (Hz)                */
-    int     substeps;               /* physics substeps per render frame    */
+  /* ── (C) SIM PARAMS — physics knobs, user-tunable at runtime ─ *
+   * compute_forces() + integrate_step() read these per substep.
+   * Mutated by the keyboard handler (k/K, d/D) in main(); also
+   * touched by scenario_apply() if a preset wants a different
+   * damping/k for its visual.  Independent of region (A): changing
+   * `k` doesn't rewrite the lattice, only the forces it generates. */
+  float k;       /* Hooke spring constant [N/m, scaled] */
+  float damping; /* linear velocity damping coefficient */
+  float mass;    /* per-node mass (uniform lattice)     */
+  float dt;      /* one physics substep duration [s]    */
+  int sim_fps;   /* render-frame cap (Hz)                */
+  int substeps;  /* physics substeps per render frame    */
 
-    /* ── (D) ANIMATION + UI — showcase + HUD state ───────────────── *
-     * Mutated by main()'s input handler and the per-frame counters;
-     * read by scenario_apply, render_hud, and the auto-cycle logic.
-     * No physics function reads these — they're presentation only. */
-    int     scenario;               /* 0..SCENARIO_COUNT-1, active strike */
-    int     sc_tick;                /* frames since this scenario started */
-    int     theme;                  /* 0..N_THEMES-1, active palette       */
-    bool    paused;                 /* freeze tick() but keep rendering    */
-    int     fps_disp;               /* live FPS shown in the HUD (smoothed) */
+  /* ── (D) ANIMATION + UI — showcase + HUD state ───────────────── *
+   * Mutated by main()'s input handler and the per-frame counters;
+   * read by scenario_apply, render_hud, and the auto-cycle logic.
+   * No physics function reads these — they're presentation only. */
+  int scenario; /* 0..SCENARIO_COUNT-1, active strike */
+  int sc_tick;  /* frames since this scenario started */
+  int theme;    /* 0..N_THEMES-1, active palette       */
+  bool paused;  /* freeze tick() but keep rendering    */
+  int fps_disp; /* live FPS shown in the HUD (smoothed) */
 } Scene;
 
 /* THE single scene instance — file-scope BSS, no malloc.  Treated as
@@ -702,81 +695,79 @@ static Scene g_scene;
  * (nx-1)·DX by (ny-1)·DY bounding box of the rest grid sits in the
  * middle of the renderable band (HUD rows excluded).  Clamps to a
  * minimum margin so a tiny terminal can't push the grid off-screen. */
-static void compute_lattice_anchor(Scene *s, int nx, int ny)
-{
-    int lat_w = (nx - 1) * NODE_DX;
-    int lat_h = (ny - 1) * NODE_DY;
-    s->x0 = (s->term_cols - lat_w) / 2;
-    s->y0 = HUD_TOP_ROWS
-          + ((s->term_rows - HUD_TOP_ROWS - HUD_BOT_ROWS - lat_h) / 2);
-    if (s->x0 < 0)             s->x0 = 0;
-    if (s->y0 < HUD_TOP_ROWS)  s->y0 = HUD_TOP_ROWS;
+static void compute_lattice_anchor(Scene *s, int nx, int ny) {
+  int lat_w = (nx - 1) * NODE_DX;
+  int lat_h = (ny - 1) * NODE_DY;
+  s->x0 = (s->term_cols - lat_w) / 2;
+  s->y0 =
+      HUD_TOP_ROWS + ((s->term_rows - HUD_TOP_ROWS - HUD_BOT_ROWS - lat_h) / 2);
+  if (s->x0 < 0)
+    s->x0 = 0;
+  if (s->y0 < HUD_TOP_ROWS)
+    s->y0 = HUD_TOP_ROWS;
 }
 
 /* STAMP ONE NODE at its lattice-anchor cell (x0 + c·DX, y0 + r·DY).
  * Current position equals rest position; velocity / force / pin all
  * zero — the standard "quiescent lattice" initial condition. */
-static void stamp_rest_node(Node *n, int x0, int y0, int c, int r)
-{
-    n->rx = (float)(x0 + c * NODE_DX);
-    n->ry = (float)(y0 + r * NODE_DY);
-    n->x  = n->rx; n->y  = n->ry;
-    n->vx = 0.0f;  n->vy = 0.0f;
-    n->fx = 0.0f;  n->fy = 0.0f;
-    n->pinned = false;
+static void stamp_rest_node(Node *n, int x0, int y0, int c, int r) {
+  n->rx = (float)(x0 + c * NODE_DX);
+  n->ry = (float)(y0 + r * NODE_DY);
+  n->x = n->rx;
+  n->y = n->ry;
+  n->vx = 0.0f;
+  n->vy = 0.0f;
+  n->fx = 0.0f;
+  n->fy = 0.0f;
+  n->pinned = false;
 }
 
 /* Initialise the lattice: pick the anchor, then stamp every node at
  * its rest position.  Spring topology is built separately
  * (springs_build) so a future variant can swap H+V for H+V+shear
  * without re-touching this function. */
-static void lattice_init(Scene *s, int nx, int ny)
-{
-    s->nx = nx;
-    s->ny = ny;
-    s->nn = nx * ny;
-    s->ns = 0;
+static void lattice_init(Scene *s, int nx, int ny) {
+  s->nx = nx;
+  s->ny = ny;
+  s->nn = nx * ny;
+  s->ns = 0;
 
-    compute_lattice_anchor(s, nx, ny);
+  compute_lattice_anchor(s, nx, ny);
 
-    for (int r = 0; r < ny; r++) {
-        for (int c = 0; c < nx; c++) {
-            stamp_rest_node(&s->nodes[r * nx + c], s->x0, s->y0, c, r);
-        }
+  for (int r = 0; r < ny; r++) {
+    for (int c = 0; c < nx; c++) {
+      stamp_rest_node(&s->nodes[r * nx + c], s->x0, s->y0, c, r);
     }
+  }
 }
 
 /* Wire up the H+V structural-spring topology over the current node
  * grid.  Each interior cell contributes a right neighbour and a down
  * neighbour; boundaries contribute the ones that fit. */
-static void springs_build(Scene *s)
-{
-    s->ns = 0;
-    float h_rest = (float)NODE_DX;
-    float v_rest = (float)NODE_DY;
-    for (int r = 0; r < s->ny; r++) {
-        for (int c = 0; c < s->nx; c++) {
-            int i = r * s->nx + c;
-            if (c + 1 < s->nx) {
-                s->springs[s->ns++] =
-                    (Spring){ i, i + 1, h_rest, 0.0f, SPRING_H };
-            }
-            if (r + 1 < s->ny) {
-                s->springs[s->ns++] =
-                    (Spring){ i, i + s->nx, v_rest, 0.0f, SPRING_V };
-            }
-        }
+static void springs_build(Scene *s) {
+  s->ns = 0;
+  float h_rest = (float)NODE_DX;
+  float v_rest = (float)NODE_DY;
+  for (int r = 0; r < s->ny; r++) {
+    for (int c = 0; c < s->nx; c++) {
+      int i = r * s->nx + c;
+      if (c + 1 < s->nx) {
+        s->springs[s->ns++] = (Spring){i, i + 1, h_rest, 0.0f, SPRING_H};
+      }
+      if (r + 1 < s->ny) {
+        s->springs[s->ns++] = (Spring){i, i + s->nx, v_rest, 0.0f, SPRING_V};
+      }
     }
+  }
 }
 
 /* CLEAR ACCUMULATORS — every force pass starts from zero so the two
  * physical contributions (spring + damping) can simply += in. */
-static void clear_force_accumulators(Scene *s)
-{
-    for (int i = 0; i < s->nn; i++) {
-        s->nodes[i].fx = 0.0f;
-        s->nodes[i].fy = 0.0f;
-    }
+static void clear_force_accumulators(Scene *s) {
+  for (int i = 0; i < s->nn; i++) {
+    s->nodes[i].fx = 0.0f;
+    s->nodes[i].fy = 0.0f;
+  }
 }
 
 /* HOOKE'S LAW PAIR [ref 1] — for one spring, compute the restoring
@@ -793,84 +784,89 @@ static void clear_force_accumulators(Scene *s)
  * Degenerate-length guard: if the two nodes have coincided exactly
  * (numerical artefact at blow-up), the direction is undefined — we
  * skip the force and just record zero strain. */
-static void accumulate_hooke_pair(Scene *s, Spring *sp)
-{
-    Node *a = &s->nodes[sp->a];
-    Node *b = &s->nodes[sp->b];
-    float dx = b->x - a->x;
-    float dy = b->y - a->y;
-    float dist = sqrtf(dx*dx + dy*dy);
-    if (dist < 1e-4f) { sp->strain = 0.0f; return; }
+static void accumulate_hooke_pair(Scene *s, Spring *sp) {
+  Node *a = &s->nodes[sp->a];
+  Node *b = &s->nodes[sp->b];
+  float dx = b->x - a->x;
+  float dy = b->y - a->y;
+  float dist = sqrtf(dx * dx + dy * dy);
+  if (dist < 1e-4f) {
+    sp->strain = 0.0f;
+    return;
+  }
 
-    sp->strain = (dist - sp->rest_len) / sp->rest_len;
+  sp->strain = (dist - sp->rest_len) / sp->rest_len;
 
-    float inv_d   = 1.0f / dist;
-    float stretch = dist - sp->rest_len;
-    float fx = s->k * stretch * dx * inv_d;
-    float fy = s->k * stretch * dy * inv_d;
+  float inv_d = 1.0f / dist;
+  float stretch = dist - sp->rest_len;
+  float fx = s->k * stretch * dx * inv_d;
+  float fy = s->k * stretch * dy * inv_d;
 
-    if (!a->pinned) { a->fx += fx; a->fy += fy; }
-    if (!b->pinned) { b->fx -= fx; b->fy -= fy; }
+  if (!a->pinned) {
+    a->fx += fx;
+    a->fy += fy;
+  }
+  if (!b->pinned) {
+    b->fx -= fx;
+    b->fy -= fy;
+  }
 }
 
 /* SPRING-FORCE PASS — apply Hooke to every spring.  This is the
  * dominant cost of compute_forces (O(N_springs · constant)). */
-static void apply_hooke_spring_forces(Scene *s)
-{
-    for (int i = 0; i < s->ns; i++) {
-        accumulate_hooke_pair(s, &s->springs[i]);
-    }
+static void apply_hooke_spring_forces(Scene *s) {
+  for (int i = 0; i < s->ns; i++) {
+    accumulate_hooke_pair(s, &s->springs[i]);
+  }
 }
 
 /* VELOCITY DAMPING PASS — Stokes-style linear drag: F_damp = -c·v.
  * Drains kinetic energy each step; the reason a struck membrane
  * eventually goes quiet.  No gravity in this showcase — free
  * membrane, isotropic damping is the only sink. */
-static void apply_velocity_damping(Scene *s)
-{
-    for (int i = 0; i < s->nn; i++) {
-        if (s->nodes[i].pinned) continue;
-        s->nodes[i].fx -= s->damping * s->nodes[i].vx;
-        s->nodes[i].fy -= s->damping * s->nodes[i].vy;
-    }
+static void apply_velocity_damping(Scene *s) {
+  for (int i = 0; i < s->nn; i++) {
+    if (s->nodes[i].pinned)
+      continue;
+    s->nodes[i].fx -= s->damping * s->nodes[i].vx;
+    s->nodes[i].fy -= s->damping * s->nodes[i].vy;
+  }
 }
 
 /* Per-step force assembly.  Reads as the physical decomposition:
  *     start from zero      → add Hooke restoring forces
  *                          → add linear velocity damping.
  * The integrator then consumes node.f in the next half of the step. */
-static void compute_forces(Scene *s)
-{
-    clear_force_accumulators(s);
-    apply_hooke_spring_forces(s);
-    apply_velocity_damping(s);
+static void compute_forces(Scene *s) {
+  clear_force_accumulators(s);
+  apply_hooke_spring_forces(s);
+  apply_velocity_damping(s);
 }
 
 /* Symplectic Euler: velocity updates first using the CURRENT force,
  * then position uses the NEW velocity.  Cheap and energy-conserving. */
-static void integrate_step(Scene *s)
-{
-    float inv_m = 1.0f / s->mass;
-    float dt    = s->dt;
-    for (int i = 0; i < s->nn; i++) {
-        if (s->nodes[i].pinned) continue;
-        s->nodes[i].vx += s->nodes[i].fx * inv_m * dt;
-        s->nodes[i].vy += s->nodes[i].fy * inv_m * dt;
-        s->nodes[i].x  += s->nodes[i].vx * dt;
-        s->nodes[i].y  += s->nodes[i].vy * dt;
-    }
+static void integrate_step(Scene *s) {
+  float inv_m = 1.0f / s->mass;
+  float dt = s->dt;
+  for (int i = 0; i < s->nn; i++) {
+    if (s->nodes[i].pinned)
+      continue;
+    s->nodes[i].vx += s->nodes[i].fx * inv_m * dt;
+    s->nodes[i].vy += s->nodes[i].fy * inv_m * dt;
+    s->nodes[i].x += s->nodes[i].vx * dt;
+    s->nodes[i].y += s->nodes[i].vy * dt;
+  }
 }
 
 /* NaN/Inf detector — if a stiffness change pushed dt past the stability
  * limit and the lattice exploded, scenarios reset it; this just reports. */
-static bool lattice_blown_up(const Scene *s)
-{
-    for (int i = 0; i < s->nn; i++) {
-        if (!isfinite(s->nodes[i].x) || !isfinite(s->nodes[i].y) ||
-            !isfinite(s->nodes[i].vx)|| !isfinite(s->nodes[i].vy))
-            return true;
-    }
-    return false;
+static bool lattice_blown_up(const Scene *s) {
+  for (int i = 0; i < s->nn; i++) {
+    if (!isfinite(s->nodes[i].x) || !isfinite(s->nodes[i].y) ||
+        !isfinite(s->nodes[i].vx) || !isfinite(s->nodes[i].vy))
+      return true;
+  }
+  return false;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -891,116 +887,118 @@ static bool lattice_blown_up(const Scene *s)
  * patterns.  LINE bypasses it for a sinusoidal-velocity column.
  */
 
-static const char * const k_scenario_names[SCENARIO_COUNT] = {
-    "Center", "Corner", "TwoPoint", "Line"
-};
+static const char *const k_scenario_names[SCENARIO_COUNT] = {
+    "Center", "Corner", "TwoPoint", "Line"};
 
 /* Re-snap every node to its rest position and zero everything else.
  * Called at the start of each scenario_apply so prior energy doesn't
  * bleed in to the next strike. */
-static void scenario_quiet(Scene *s)
-{
-    for (int i = 0; i < s->nn; i++) {
-        s->nodes[i].x  = s->nodes[i].rx;
-        s->nodes[i].y  = s->nodes[i].ry;
-        s->nodes[i].vx = 0.0f;
-        s->nodes[i].vy = 0.0f;
-        s->nodes[i].fx = 0.0f;
-        s->nodes[i].fy = 0.0f;
-        s->nodes[i].pinned = false;
-    }
-    for (int idx = 0; idx < s->ns; idx++) s->springs[idx].strain = 0.0f;
+static void scenario_quiet(Scene *s) {
+  for (int i = 0; i < s->nn; i++) {
+    s->nodes[i].x = s->nodes[i].rx;
+    s->nodes[i].y = s->nodes[i].ry;
+    s->nodes[i].vx = 0.0f;
+    s->nodes[i].vy = 0.0f;
+    s->nodes[i].fx = 0.0f;
+    s->nodes[i].fy = 0.0f;
+    s->nodes[i].pinned = false;
+  }
+  for (int idx = 0; idx < s->ns; idx++)
+    s->springs[idx].strain = 0.0f;
 }
 
 /* Stamp a radial impulse on every node inside `radius` of (cr, cc).
  * Velocity magnitude falls off linearly with distance from centre,
  * pointing outward — produces the classic expanding-ring stress wave. */
-static void scenario_strike_radial(Scene *s, int cr, int cc,
-                                   float speed, int radius)
-{
-    if (cr < 0 || cr >= s->ny || cc < 0 || cc >= s->nx) return;
-    for (int r = cr - radius; r <= cr + radius; r++) {
-        for (int c = cc - radius; c <= cc + radius; c++) {
-            if (r < 0 || r >= s->ny || c < 0 || c >= s->nx) continue;
-            float dr = (float)(r - cr), dc = (float)(c - cc);
-            float d2 = dr*dr + dc*dc;
-            if (d2 > (float)(radius*radius)) continue;
-            float fall  = 1.0f - sqrtf(d2) / (float)(radius + 1);
-            float angle = (d2 < 1e-4f) ? 0.0f : atan2f(dr, dc);
-            s->nodes[r * s->nx + c].vx = speed * fall * cosf(angle);
-            s->nodes[r * s->nx + c].vy = speed * fall * sinf(angle);
-        }
+static void scenario_strike_radial(Scene *s, int cr, int cc, float speed,
+                                   int radius) {
+  if (cr < 0 || cr >= s->ny || cc < 0 || cc >= s->nx)
+    return;
+  for (int r = cr - radius; r <= cr + radius; r++) {
+    for (int c = cc - radius; c <= cc + radius; c++) {
+      if (r < 0 || r >= s->ny || c < 0 || c >= s->nx)
+        continue;
+      float dr = (float)(r - cr), dc = (float)(c - cc);
+      float d2 = dr * dr + dc * dc;
+      if (d2 > (float)(radius * radius))
+        continue;
+      float fall = 1.0f - sqrtf(d2) / (float)(radius + 1);
+      float angle = (d2 < 1e-4f) ? 0.0f : atan2f(dr, dc);
+      s->nodes[r * s->nx + c].vx = speed * fall * cosf(angle);
+      s->nodes[r * s->nx + c].vy = speed * fall * sinf(angle);
     }
+  }
 }
 
 /* The "minor axis" cell count — used to scale strike radius so each
  * scenario looks the same on any aspect ratio. */
-static int lattice_minor_axis(const Scene *s)
-{
-    return (s->nx < s->ny ? s->nx : s->ny);
+static int lattice_minor_axis(const Scene *s) {
+  return (s->nx < s->ny ? s->nx : s->ny);
 }
 
 /* STRIKE 0 — CENTER PULSE.  One radial kick at the lattice midpoint.
  * Produces a clean expanding stress ring (the closest 2-D analogue
  * to Rayleigh's circular-membrane fundamental mode [ref 5]). */
-static void strike_center_pulse(Scene *s)
-{
-    int radius = lattice_minor_axis(s) / 5;
-    scenario_strike_radial(s, s->ny / 2, s->nx / 2, HAMMER_VEL, radius);
+static void strike_center_pulse(Scene *s) {
+  int radius = lattice_minor_axis(s) / 5;
+  scenario_strike_radial(s, s->ny / 2, s->nx / 2, HAMMER_VEL, radius);
 }
 
 /* STRIKE 1 — CORNER PULSE.  Off-axis impulse near (1,1) — the wave
  * front is a quarter-circle that reflects off the two near edges
  * almost immediately, generating herringbone interference. */
-static void strike_corner_pulse(Scene *s)
-{
-    int radius = lattice_minor_axis(s) / 6;
-    scenario_strike_radial(s, 1, 1, HAMMER_VEL * 1.2f, radius);
+static void strike_corner_pulse(Scene *s) {
+  int radius = lattice_minor_axis(s) / 6;
+  scenario_strike_radial(s, 1, 1, HAMMER_VEL * 1.2f, radius);
 }
 
 /* STRIKE 2 — TWO-POINT INTERFERENCE.  Two equal pulses at the left
  * and right quarter columns.  The two expanding rings collide along
  * the midline: constructive interference fringes where they ADD,
  * cancellation gaps where they SUBTRACT (Crawford [ref 6]). */
-static void strike_twopoint_interference(Scene *s)
-{
-    int radius = lattice_minor_axis(s) / 7;
-    int mid_r  = s->ny / 2;
-    scenario_strike_radial(s, mid_r, s->nx / 4,
-                           HAMMER_VEL * 0.9f, radius);
-    scenario_strike_radial(s, mid_r, s->nx - s->nx / 4,
-                           HAMMER_VEL * 0.9f, radius);
+static void strike_twopoint_interference(Scene *s) {
+  int radius = lattice_minor_axis(s) / 7;
+  int mid_r = s->ny / 2;
+  scenario_strike_radial(s, mid_r, s->nx / 4, HAMMER_VEL * 0.9f, radius);
+  scenario_strike_radial(s, mid_r, s->nx - s->nx / 4, HAMMER_VEL * 0.9f,
+                         radius);
 }
 
 /* STRIKE 3 — LINE / PLANAR WAVE.  Sinusoidal vertical velocity along
  * a single column.  The whole column oscillates IN PHASE along its
  * length but with one full spatial period — closest thing to a
  * textbook 1-D travelling wave on this 2-D grid. */
-static void strike_line_planar(Scene *s)
-{
-    int col = s->nx / 3;
-    for (int r = 0; r < s->ny; r++) {
-        float phase = (float)r / (float)(s->ny - 1) * 2.0f * (float)M_PI;
-        s->nodes[r * s->nx + col].vy = IMPULSE_VEL * sinf(phase);
-    }
+static void strike_line_planar(Scene *s) {
+  int col = s->nx / 3;
+  for (int r = 0; r < s->ny; r++) {
+    float phase = (float)r / (float)(s->ny - 1) * 2.0f * (float)M_PI;
+    s->nodes[r * s->nx + col].vy = IMPULSE_VEL * sinf(phase);
+  }
 }
 
 /* Dispatch the scenario id to the matching strike helper.  Body reads
  * as pure SELECTION; every velocity-stamping detail lives in the
  * named helpers above.  scenario_quiet resets state so prior energy
  * doesn't bleed between scenarios. */
-static void scenario_apply(Scene *s, int id)
-{
-    scenario_quiet(s);
-    s->scenario = id;
-    s->sc_tick  = 0;
+static void scenario_apply(Scene *s, int id) {
+  scenario_quiet(s);
+  s->scenario = id;
+  s->sc_tick = 0;
 
-    switch (id) {
-    case 0: strike_center_pulse           (s); break;
-    case 1: strike_corner_pulse           (s); break;
-    case 2: strike_twopoint_interference  (s); break;
-    case 3: strike_line_planar            (s); break;
-    }
+  switch (id) {
+  case 0:
+    strike_center_pulse(s);
+    break;
+  case 1:
+    strike_corner_pulse(s);
+    break;
+  case 2:
+    strike_twopoint_interference(s);
+    break;
+  case 3:
+    strike_line_planar(s);
+    break;
+  }
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -1010,38 +1008,39 @@ static void scenario_apply(Scene *s, int id)
 /* Strain → (color pair, glyph, bold).
  * Returns false when the spring is at rest and should NOT be drawn —
  * the dropout that makes wave fronts pop against an invisible mesh. */
-static bool strain_visual(float strain, SpringKind kind,
-                          int *out_cp, char *out_glyph, bool *out_bold)
-{
-    float a = fabsf(strain);
-    if (a < STRAIN_NULL) return false;
+static bool strain_visual(float strain, SpringKind kind, int *out_cp,
+                          char *out_glyph, bool *out_bold) {
+  float a = fabsf(strain);
+  if (a < STRAIN_NULL)
+    return false;
 
-    bool compress = (strain < 0.0f);
-    if (a < STRAIN_MID) {
-        *out_cp    = compress ? CP_COMPRESS_LO : CP_TENSION_LO;
-        *out_glyph = (kind == SPRING_H) ? '-' : '|';
-        *out_bold  = false;
-    } else if (a < STRAIN_HIGH) {
-        *out_cp    = compress ? CP_COMPRESS_HI : CP_TENSION_HI;
-        *out_glyph = (kind == SPRING_H) ? '=' : 'H';
-        *out_bold  = false;
-    } else {
-        *out_cp    = compress ? CP_COMPRESS_HI : CP_TENSION_HI;
-        *out_glyph = '#';
-        *out_bold  = true;
-    }
-    return true;
+  bool compress = (strain < 0.0f);
+  if (a < STRAIN_MID) {
+    *out_cp = compress ? CP_COMPRESS_LO : CP_TENSION_LO;
+    *out_glyph = (kind == SPRING_H) ? '-' : '|';
+    *out_bold = false;
+  } else if (a < STRAIN_HIGH) {
+    *out_cp = compress ? CP_COMPRESS_HI : CP_TENSION_HI;
+    *out_glyph = (kind == SPRING_H) ? '=' : 'H';
+    *out_bold = false;
+  } else {
+    *out_cp = compress ? CP_COMPRESS_HI : CP_TENSION_HI;
+    *out_glyph = '#';
+    *out_bold = true;
+  }
+  return true;
 }
 
 /* CLIPPED PAINT — single mvaddch with bounds-check against the
  * scene's renderable band (HUD rows excluded).  Every render helper
  * funnels through this so clipping logic lives in exactly one place. */
-static void paint_cell_clipped(const Scene *s, int row, int col,
-                               char glyph, int attr)
-{
-    if (col < 0 || col >= s->term_cols) return;
-    if (row < HUD_TOP_ROWS || row >= s->term_rows - HUD_BOT_ROWS) return;
-    mvaddch(row, col, (chtype)(unsigned char)glyph | attr);
+static void paint_cell_clipped(const Scene *s, int row, int col, char glyph,
+                               int attr) {
+  if (col < 0 || col >= s->term_cols)
+    return;
+  if (row < HUD_TOP_ROWS || row >= s->term_rows - HUD_BOT_ROWS)
+    return;
+  mvaddch(row, col, (chtype)(unsigned char)glyph | attr);
 }
 
 /* PARAMETRIC LINE WALK — visit the INTERIOR cells of segment A→B
@@ -1050,16 +1049,14 @@ static void paint_cell_clipped(const Scene *s, int row, int col,
  * markers.  Using a parametric walk instead of Bresenham keeps each
  * cell at its "fair share" of the line — important for short H/V
  * spans (NODE_DX = 4 or NODE_DY = 2) where Bresenham would clump. */
-static void paint_spring_interior(const Scene *s,
-                                  int x0, int y0, int x1, int y1,
-                                  int steps, char glyph, int attr)
-{
-    for (int k = 1; k < steps; k++) {
-        float t = (float)k / (float)steps;
-        int cx = (int)(x0 + (x1 - x0) * t + 0.5f);
-        int cy = (int)(y0 + (y1 - y0) * t + 0.5f);
-        paint_cell_clipped(s, cy, cx, glyph, attr);
-    }
+static void paint_spring_interior(const Scene *s, int x0, int y0, int x1,
+                                  int y1, int steps, char glyph, int attr) {
+  for (int k = 1; k < steps; k++) {
+    float t = (float)k / (float)steps;
+    int cx = (int)(x0 + (x1 - x0) * t + 0.5f);
+    int cy = (int)(y0 + (y1 - y0) * t + 0.5f);
+    paint_cell_clipped(s, cy, cx, glyph, attr);
+  }
 }
 
 /*
@@ -1072,22 +1069,25 @@ static void paint_spring_interior(const Scene *s,
  *     guard against NaN/Inf positions (post-blow-up frames)
  *     walk the interior cells, painting each with the chosen glyph
  */
-static void render_spring(const Scene *s, const Spring *sp)
-{
-    int cp; char glyph; bool bold;
-    if (!strain_visual(sp->strain, sp->kind, &cp, &glyph, &bold)) return;
+static void render_spring(const Scene *s, const Spring *sp) {
+  int cp;
+  char glyph;
+  bool bold;
+  if (!strain_visual(sp->strain, sp->kind, &cp, &glyph, &bold))
+    return;
 
-    const Node *a = &s->nodes[sp->a];
-    const Node *b = &s->nodes[sp->b];
-    if (!isfinite(a->x) || !isfinite(b->x)) return;
+  const Node *a = &s->nodes[sp->a];
+  const Node *b = &s->nodes[sp->b];
+  if (!isfinite(a->x) || !isfinite(b->x))
+    return;
 
-    int x0 = (int)(a->x + 0.5f), y0 = (int)(a->y + 0.5f);
-    int x1 = (int)(b->x + 0.5f), y1 = (int)(b->y + 0.5f);
+  int x0 = (int)(a->x + 0.5f), y0 = (int)(a->y + 0.5f);
+  int x1 = (int)(b->x + 0.5f), y1 = (int)(b->y + 0.5f);
 
-    int steps = (sp->kind == SPRING_H) ? NODE_DX : NODE_DY;
-    int attr  = COLOR_PAIR(cp) | (bold ? A_BOLD : 0);
+  int steps = (sp->kind == SPRING_H) ? NODE_DX : NODE_DY;
+  int attr = COLOR_PAIR(cp) | (bold ? A_BOLD : 0);
 
-    paint_spring_interior(s, x0, y0, x1, y1, steps, glyph, attr);
+  paint_spring_interior(s, x0, y0, x1, y1, steps, glyph, attr);
 }
 
 /* NODE VISUAL FROM SPEED — classify a node into one of four visual
@@ -1100,22 +1100,28 @@ static void render_spring(const Scene *s, const Spring *sp)
  *   speed < SPEED_FAST         → 'o'       NODE_SLOW   oscillating
  *   speed ≥ SPEED_FAST         → 'O' bold  NODE_FAST   peak energy
  */
-static void node_visual_from_speed(const Node *n,
-                                   char *out_glyph, int *out_cp,
-                                   int *out_attr)
-{
-    if (n->pinned) {
-        *out_glyph = '@'; *out_cp = CP_NODE_PIN;  *out_attr = A_BOLD;
-        return;
-    }
-    float speed = sqrtf(n->vx * n->vx + n->vy * n->vy);
-    if (speed < SPEED_REST) {
-        *out_glyph = '.'; *out_cp = CP_NODE_REST; *out_attr = 0;
-    } else if (speed < SPEED_FAST) {
-        *out_glyph = 'o'; *out_cp = CP_NODE_SLOW; *out_attr = 0;
-    } else {
-        *out_glyph = 'O'; *out_cp = CP_NODE_FAST; *out_attr = A_BOLD;
-    }
+static void node_visual_from_speed(const Node *n, char *out_glyph, int *out_cp,
+                                   int *out_attr) {
+  if (n->pinned) {
+    *out_glyph = '@';
+    *out_cp = CP_NODE_PIN;
+    *out_attr = A_BOLD;
+    return;
+  }
+  float speed = sqrtf(n->vx * n->vx + n->vy * n->vy);
+  if (speed < SPEED_REST) {
+    *out_glyph = '.';
+    *out_cp = CP_NODE_REST;
+    *out_attr = 0;
+  } else if (speed < SPEED_FAST) {
+    *out_glyph = 'o';
+    *out_cp = CP_NODE_SLOW;
+    *out_attr = 0;
+  } else {
+    *out_glyph = 'O';
+    *out_cp = CP_NODE_FAST;
+    *out_attr = A_BOLD;
+  }
 }
 
 /*
@@ -1126,66 +1132,69 @@ static void node_visual_from_speed(const Node *n,
  *     classify visual state from speed (pinned / rest / slow / fast)
  *     paint clipped cell with chosen glyph + colour + attribute
  */
-static void render_node(const Scene *s, const Node *n)
-{
-    if (!isfinite(n->x) || !isfinite(n->y)) return;
-    int cx = (int)(n->x + 0.5f);
-    int cy = (int)(n->y + 0.5f);
+static void render_node(const Scene *s, const Node *n) {
+  if (!isfinite(n->x) || !isfinite(n->y))
+    return;
+  int cx = (int)(n->x + 0.5f);
+  int cy = (int)(n->y + 0.5f);
 
-    char glyph; int cp; int attr;
-    node_visual_from_speed(n, &glyph, &cp, &attr);
+  char glyph;
+  int cp;
+  int attr;
+  node_visual_from_speed(n, &glyph, &cp, &attr);
 
-    paint_cell_clipped(s, cy, cx, glyph, COLOR_PAIR(cp) | attr);
+  paint_cell_clipped(s, cy, cx, glyph, COLOR_PAIR(cp) | attr);
 }
 
 /* Compose: springs (background, only the stressed ones glow) then
  * nodes (foreground, always visible — the lattice's skeleton). */
-static void render_lattice(const Scene *s)
-{
-    for (int i = 0; i < s->ns; i++) render_spring(s, &s->springs[i]);
-    for (int i = 0; i < s->nn; i++) render_node  (s, &s->nodes  [i]);
+static void render_lattice(const Scene *s) {
+  for (int i = 0; i < s->ns; i++)
+    render_spring(s, &s->springs[i]);
+  for (int i = 0; i < s->nn; i++)
+    render_node(s, &s->nodes[i]);
 }
 
 /* Total kinetic + potential energy — a global "is the lattice ringing"
  * gauge surfaced in the HUD so the viewer can see decay numerically. */
-static float total_energy(const Scene *s)
-{
-    float ke = 0.0f, pe = 0.0f;
-    for (int i = 0; i < s->nn; i++) {
-        float v2 = s->nodes[i].vx * s->nodes[i].vx
-                 + s->nodes[i].vy * s->nodes[i].vy;
-        ke += 0.5f * s->mass * v2;
-    }
-    for (int i = 0; i < s->ns; i++) {
-        float stretch = s->springs[i].strain * s->springs[i].rest_len;
-        pe += 0.5f * s->k * stretch * stretch;
-    }
-    return ke + pe;
+static float total_energy(const Scene *s) {
+  float ke = 0.0f, pe = 0.0f;
+  for (int i = 0; i < s->nn; i++) {
+    float v2 =
+        s->nodes[i].vx * s->nodes[i].vx + s->nodes[i].vy * s->nodes[i].vy;
+    ke += 0.5f * s->mass * v2;
+  }
+  for (int i = 0; i < s->ns; i++) {
+    float stretch = s->springs[i].strain * s->springs[i].rest_len;
+    pe += 0.5f * s->k * stretch * stretch;
+  }
+  return ke + pe;
 }
 
-static void render_hud(const Scene *s)
-{
-    /* Top row 0 — canonical bright-yellow status, A_BOLD. */
-    char buf[160];
-    snprintf(buf, sizeof buf,
-             " MassSpring  scenario:%-8s  theme:%-7s  k=%-4.0f  damp=%-3.1f"
-             "  E=%-7.1f  %2dfps  %s",
-             k_scenario_names[s->scenario], k_themes[s->theme].name,
-             s->k, s->damping, total_energy(s), s->fps_disp,
-             s->paused ? "PAUSED " : "running");
-    move(0, 0); clrtoeol();
-    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvprintw(0, 0, "%s", buf);
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+static void render_hud(const Scene *s) {
+  /* Top row 0 — canonical bright-yellow status, A_BOLD. */
+  char buf[160];
+  snprintf(buf, sizeof buf,
+           " MassSpring  scenario:%-8s  theme:%-7s  k=%-4.0f  damp=%-3.1f"
+           "  E=%-7.1f  %2dfps  %s",
+           k_scenario_names[s->scenario], k_themes[s->theme].name, s->k,
+           s->damping, total_energy(s), s->fps_disp,
+           s->paused ? "PAUSED " : "running");
+  move(0, 0);
+  clrtoeol();
+  attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+  mvprintw(0, 0, "%s", buf);
+  attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-    /* Bottom row — canonical bright-cyan keys, A_BOLD. */
-    int bot = s->term_rows - 1;
-    move(bot, 0); clrtoeol();
-    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
-    mvprintw(bot, 0,
-             " q:quit  spc:pause  r:reset  n:next  t/T:theme"
-             "  k/K:stiff  d/D:damp ");
-    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
+  /* Bottom row — canonical bright-cyan keys, A_BOLD. */
+  int bot = s->term_rows - 1;
+  move(bot, 0);
+  clrtoeol();
+  attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+  mvprintw(bot, 0,
+           " q:quit  spc:pause  r:reset  n:next  t/T:theme"
+           "  k/K:stiff  d/D:damp ");
+  attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -1193,55 +1202,62 @@ static void render_hud(const Scene *s)
  * ════════════════════════════════════════════════════════════════════ */
 
 static volatile sig_atomic_t g_resize = 0;
-static volatile sig_atomic_t g_quit   = 0;
+static volatile sig_atomic_t g_quit = 0;
 
-static void on_sigwinch(int s) { (void)s; g_resize = 1; }
-static void on_sigterm (int s) { (void)s; g_quit   = 1; }
+static void on_sigwinch(int s) {
+  (void)s;
+  g_resize = 1;
+}
+static void on_sigterm(int s) {
+  (void)s;
+  g_quit = 1;
+}
 
 /* Fit a lattice to current terminal dims (capped to MAX_NX/NY).
  * Writes nx/ny back into Scene region (B) GEOMETRY. */
-static void fit_lattice(Scene *s)
-{
-    int avail_w = s->term_cols - 4;
-    int avail_h = s->term_rows - HUD_TOP_ROWS - HUD_BOT_ROWS - 2;
-    int nx = avail_w / NODE_DX + 1;
-    int ny = avail_h / NODE_DY + 1;
-    if (nx > MAX_NX) nx = MAX_NX;
-    if (ny > MAX_NY) ny = MAX_NY;
-    if (nx < 4) nx = 4;
-    if (ny < 3) ny = 3;
-    s->nx = nx;
-    s->ny = ny;
+static void fit_lattice(Scene *s) {
+  int avail_w = s->term_cols - 4;
+  int avail_h = s->term_rows - HUD_TOP_ROWS - HUD_BOT_ROWS - 2;
+  int nx = avail_w / NODE_DX + 1;
+  int ny = avail_h / NODE_DY + 1;
+  if (nx > MAX_NX)
+    nx = MAX_NX;
+  if (ny > MAX_NY)
+    ny = MAX_NY;
+  if (nx < 4)
+    nx = 4;
+  if (ny < 3)
+    ny = 3;
+  s->nx = nx;
+  s->ny = ny;
 }
 
 /* Full scene rebuild — call after a resize or a destructive reset.
  * Re-fits the lattice to terminal dims, re-stamps node positions,
  * re-builds spring topology, and re-applies the current scenario. */
-static void rebuild_for_terminal(Scene *s)
-{
-    fit_lattice(s);
-    lattice_init(s, s->nx, s->ny);
-    springs_build(s);
-    scenario_apply(s, s->scenario);
+static void rebuild_for_terminal(Scene *s) {
+  fit_lattice(s);
+  lattice_init(s, s->nx, s->ny);
+  springs_build(s);
+  scenario_apply(s, s->scenario);
 }
 
 /* Populate Scene's SIM PARAMS (C) and ANIMATION+UI (D) regions with
  * defaults.  Region A (physics data) + B (geometry) are filled by
  * rebuild_for_terminal afterwards. */
-static void scene_defaults(Scene *s)
-{
-    s->k         = K_DEF;
-    s->damping   = DAMPING_DEF;
-    s->mass      = MASS_DEF;
-    s->sim_fps   = TARGET_FPS;
-    s->substeps  = SUBSTEPS;
-    s->dt        = 1.0f / (float)(s->sim_fps * s->substeps);
+static void scene_defaults(Scene *s) {
+  s->k = K_DEF;
+  s->damping = DAMPING_DEF;
+  s->mass = MASS_DEF;
+  s->sim_fps = TARGET_FPS;
+  s->substeps = SUBSTEPS;
+  s->dt = 1.0f / (float)(s->sim_fps * s->substeps);
 
-    s->scenario  = 0;
-    s->sc_tick   = 0;
-    s->theme     = 0;
-    s->paused    = false;
-    s->fps_disp  = s->sim_fps;
+  s->scenario = 0;
+  s->sc_tick = 0;
+  s->theme = 0;
+  s->paused = false;
+  s->fps_disp = s->sim_fps;
 }
 
 /* ── Bootstrap helpers ──────────────────────────────────────────────── */
@@ -1249,41 +1265,39 @@ static void scene_defaults(Scene *s)
 /* SIGNAL HANDLERS — SIGINT / SIGTERM → graceful quit; SIGWINCH →
  * deferred resize.  The handlers only flip volatile flags; all real
  * work happens synchronously from the main loop. */
-static void install_signal_handlers(void)
-{
-    signal(SIGWINCH, on_sigwinch);
-    signal(SIGTERM,  on_sigterm);
-    signal(SIGINT,   on_sigterm);
+static void install_signal_handlers(void) {
+  signal(SIGWINCH, on_sigwinch);
+  signal(SIGTERM, on_sigterm);
+  signal(SIGINT, on_sigterm);
 }
 
 /* TERMINAL SETUP — ncurses raw-keys mode + no echo + no cursor +
  * non-blocking input + typeahead off so output isn't interrupted
  * (CLAUDE.md ncurses Bug Table). */
-static void terminal_setup(void)
-{
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
+static void terminal_setup(void) {
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
 }
 
 /* Modular cyclic step (+1 / −1 with wrap-around).  Makes the keybind
  * cases read as "advance by +1, wrap mod N" instead of the cryptic
  * `(x + N - 1) % N` reverse-wrap trick. */
-static void cycle_index(int *value, int step, int n)
-{
-    *value = (*value + n + step) % n;
+static void cycle_index(int *value, int step, int n) {
+  *value = (*value + n + step) % n;
 }
 
 /* Clamp a float to [lo, hi] in place — keeps the k / damping keybind
  * arithmetic short and reads as a single intent line. */
-static void clamp_float(float *v, float lo, float hi)
-{
-    if (*v < lo) *v = lo;
-    if (*v > hi) *v = hi;
+static void clamp_float(float *v, float lo, float hi) {
+  if (*v < lo)
+    *v = lo;
+  if (*v > hi)
+    *v = hi;
 }
 
 /* ── Per-frame stage helpers — one phase of the sim loop each ────── */
@@ -1291,103 +1305,103 @@ static void clamp_float(float *v, float lo, float hi)
 /* RESIZE — SIGWINCH set the flag asynchronously; we drain it here,
  * ask ncurses for fresh terminal dimensions, and rebuild the entire
  * scene (lattice topology depends on terminal size). */
-static void consume_resize_event(Scene *s)
-{
-    if (!g_resize) return;
-    g_resize = 0;
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->term_rows, s->term_cols);
-    rebuild_for_terminal(s);
+static void consume_resize_event(Scene *s) {
+  if (!g_resize)
+    return;
+  g_resize = 0;
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->term_rows, s->term_cols);
+  rebuild_for_terminal(s);
 }
 
 /* INPUT — drain every queued key and dispatch.  Mutates the
  * ANIMATION+UI region (paused, scenario, theme) and the SIM PARAMS
  * region (k, damping); sets g_quit on q/ESC. */
-static void process_input(Scene *s)
-{
-    int ch;
-    while ((ch = getch()) != ERR) {
-        switch (ch) {
-        case 'q': case 27:                /* 27 = ESC */
-            g_quit = 1;
-            break;
-        case ' ': case 'p':                /* pause toggle */
-            s->paused = !s->paused;
-            break;
-        case 'r':                          /* re-trigger current scenario */
-            scenario_apply(s, s->scenario);
-            break;
-        case 'n':                          /* next scenario */
-            cycle_index(&s->scenario, +1, SCENARIO_COUNT);
-            scenario_apply(s, s->scenario);
-            break;
-        case 't':                          /* next theme */
-            cycle_index(&s->theme, +1, N_THEMES);
-            theme_apply(s->theme);
-            break;
-        case 'T':                          /* previous theme */
-            cycle_index(&s->theme, -1, N_THEMES);
-            theme_apply(s->theme);
-            break;
-        case 'k':                          /* softer springs */
-            s->k -= K_STEP;
-            clamp_float(&s->k, K_MIN, K_MAX);
-            break;
-        case 'K':                          /* stiffer springs */
-            s->k += K_STEP;
-            clamp_float(&s->k, K_MIN, K_MAX);
-            break;
-        case 'd':                          /* less damping (rings longer) */
-            s->damping -= DAMPING_STEP;
-            clamp_float(&s->damping, DAMPING_MIN, DAMPING_MAX);
-            break;
-        case 'D':                          /* more damping (decays faster) */
-            s->damping += DAMPING_STEP;
-            clamp_float(&s->damping, DAMPING_MIN, DAMPING_MAX);
-            break;
-        }
+static void process_input(Scene *s) {
+  int ch;
+  while ((ch = getch()) != ERR) {
+    switch (ch) {
+    case 'q':
+    case 27: /* 27 = ESC */
+      g_quit = 1;
+      break;
+    case ' ':
+    case 'p': /* pause toggle */
+      s->paused = !s->paused;
+      break;
+    case 'r': /* re-trigger current scenario */
+      scenario_apply(s, s->scenario);
+      break;
+    case 'n': /* next scenario */
+      cycle_index(&s->scenario, +1, SCENARIO_COUNT);
+      scenario_apply(s, s->scenario);
+      break;
+    case 't': /* next theme */
+      cycle_index(&s->theme, +1, N_THEMES);
+      theme_apply(s->theme);
+      break;
+    case 'T': /* previous theme */
+      cycle_index(&s->theme, -1, N_THEMES);
+      theme_apply(s->theme);
+      break;
+    case 'k': /* softer springs */
+      s->k -= K_STEP;
+      clamp_float(&s->k, K_MIN, K_MAX);
+      break;
+    case 'K': /* stiffer springs */
+      s->k += K_STEP;
+      clamp_float(&s->k, K_MIN, K_MAX);
+      break;
+    case 'd': /* less damping (rings longer) */
+      s->damping -= DAMPING_STEP;
+      clamp_float(&s->damping, DAMPING_MIN, DAMPING_MAX);
+      break;
+    case 'D': /* more damping (decays faster) */
+      s->damping += DAMPING_STEP;
+      clamp_float(&s->damping, DAMPING_MIN, DAMPING_MAX);
+      break;
     }
+  }
 }
 
 /* AUTO-ADVANCE — when a scenario's hold time expires, switch to the
  * next one.  Showcase auto-cycle so a passive viewer sees variety. */
-static void auto_advance_scenario(Scene *s)
-{
-    s->sc_tick++;
-    if (s->sc_tick < SCENARIO_TICKS) return;
-    cycle_index(&s->scenario, +1, SCENARIO_COUNT);
-    scenario_apply(s, s->scenario);
+static void auto_advance_scenario(Scene *s) {
+  s->sc_tick++;
+  if (s->sc_tick < SCENARIO_TICKS)
+    return;
+  cycle_index(&s->scenario, +1, SCENARIO_COUNT);
+  scenario_apply(s, s->scenario);
 }
 
 /* STEP PHYSICS — run substeps of (compute_forces → integrate_step),
  * detect numerical blow-up, and let the scenario auto-cycle tick.
  * Skipped entirely while paused. */
-static void step_physics(Scene *s)
-{
-    if (s->paused) return;
+static void step_physics(Scene *s) {
+  if (s->paused)
+    return;
 
-    for (int sub = 0; sub < s->substeps; sub++) {
-        compute_forces(s);
-        integrate_step(s);
-    }
-    if (lattice_blown_up(s)) {
-        /* k pushed past stability — rebuild current scenario */
-        rebuild_for_terminal(s);
-    }
-    auto_advance_scenario(s);
+  for (int sub = 0; sub < s->substeps; sub++) {
+    compute_forces(s);
+    integrate_step(s);
+  }
+  if (lattice_blown_up(s)) {
+    /* k pushed past stability — rebuild current scenario */
+    rebuild_for_terminal(s);
+  }
+  auto_advance_scenario(s);
 }
 
 /* RENDER FRAME — painter's-order composite: clear → lattice → HUD →
  * flush.  `wnoutrefresh + doupdate` (single diff write) avoids
  * flicker on slow terminals (CLAUDE.md ncurses Bug Table). */
-static void render_frame(const Scene *s)
-{
-    erase();
-    render_lattice(s);
-    render_hud(s);
-    wnoutrefresh(stdscr);
-    doupdate();
+static void render_frame(const Scene *s) {
+  erase();
+  render_lattice(s);
+  render_hud(s);
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* FRAME PACING — fixed-timestep cap to sim_fps.  Sleeps the leftover
@@ -1396,32 +1410,30 @@ static void render_frame(const Scene *s)
  * Reports the measured frame-work duration via out-param so the FPS
  * counter doesn't have to re-read the clock. */
 static int64_t pace_frame_to_fps(int64_t t_last, int sim_fps,
-                                 int64_t *out_work_ns)
-{
-    int64_t t_now  = clock_ns();
-    int64_t t_work = t_now - t_last;
-    int64_t t_tick = TICK_NS(sim_fps);
-    clock_sleep_ns(t_tick - t_work);     /* clamped to 0 inside sleep */
-    *out_work_ns = t_work;
-    return clock_ns();
+                                 int64_t *out_work_ns) {
+  int64_t t_now = clock_ns();
+  int64_t t_work = t_now - t_last;
+  int64_t t_tick = TICK_NS(sim_fps);
+  clock_sleep_ns(t_tick - t_work); /* clamped to 0 inside sleep */
+  *out_work_ns = t_work;
+  return clock_ns();
 }
 
 /* FPS COUNTER — accumulate per-frame elapsed time; every half second,
  * convert (frames in window × 2) into a displayed fps value.  Uses
  * `work + max(0, tick − work) = max(work, tick)` to count both
  * budgeted and busted frames uniformly. */
-static void update_fps_counter(Scene *s, int64_t work_ns,
-                               int64_t *fps_acc, int *fps_cnt)
-{
-    int64_t t_tick = TICK_NS(s->sim_fps);
-    int64_t slack  = t_tick - work_ns;
-    *fps_acc += work_ns + (slack > 0 ? slack : 0);
-    (*fps_cnt)++;
-    if (*fps_acc >= NS_PER_SEC / 2) {
-        s->fps_disp = *fps_cnt * 2;      /* half-second window → ×2 */
-        *fps_acc    = 0;
-        *fps_cnt    = 0;
-    }
+static void update_fps_counter(Scene *s, int64_t work_ns, int64_t *fps_acc,
+                               int *fps_cnt) {
+  int64_t t_tick = TICK_NS(s->sim_fps);
+  int64_t slack = t_tick - work_ns;
+  *fps_acc += work_ns + (slack > 0 ? slack : 0);
+  (*fps_cnt)++;
+  if (*fps_acc >= NS_PER_SEC / 2) {
+    s->fps_disp = *fps_cnt * 2; /* half-second window → ×2 */
+    *fps_acc = 0;
+    *fps_cnt = 0;
+  }
 }
 
 /*
@@ -1439,35 +1451,34 @@ static void update_fps_counter(Scene *s, int64_t work_ns,
  *         update fps counter
  *     teardown ncurses
  */
-int main(void)
-{
-    install_signal_handlers();
-    terminal_setup();
-    color_init();
+int main(void) {
+  install_signal_handlers();
+  terminal_setup();
+  color_init();
 
-    Scene *s = &g_scene;
-    memset(s, 0, sizeof *s);
-    scene_defaults(s);
-    theme_apply(s->theme);
+  Scene *s = &g_scene;
+  memset(s, 0, sizeof *s);
+  scene_defaults(s);
+  theme_apply(s->theme);
 
-    getmaxyx(stdscr, s->term_rows, s->term_cols);
-    rebuild_for_terminal(s);
+  getmaxyx(stdscr, s->term_rows, s->term_cols);
+  rebuild_for_terminal(s);
 
-    int64_t t_last  = clock_ns();
-    int64_t fps_acc = 0;
-    int     fps_cnt = 0;
+  int64_t t_last = clock_ns();
+  int64_t fps_acc = 0;
+  int fps_cnt = 0;
 
-    while (!g_quit) {
-        consume_resize_event(s);
-        process_input(s);
-        step_physics(s);
-        render_frame(s);
+  while (!g_quit) {
+    consume_resize_event(s);
+    process_input(s);
+    step_physics(s);
+    render_frame(s);
 
-        int64_t work_ns;
-        t_last = pace_frame_to_fps(t_last, s->sim_fps, &work_ns);
-        update_fps_counter(s, work_ns, &fps_acc, &fps_cnt);
-    }
+    int64_t work_ns;
+    t_last = pace_frame_to_fps(t_last, s->sim_fps, &work_ns);
+    update_fps_counter(s, work_ns, &fps_acc, &fps_cnt);
+  }
 
-    endwin();
-    return 0;
+  endwin();
+  return 0;
 }

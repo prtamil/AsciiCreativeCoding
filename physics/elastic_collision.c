@@ -122,65 +122,64 @@
 /* §1  config                                                             */
 /* ===================================================================== */
 
-#define CELL_W    8
-#define CELL_H   16
-#define N_DISCS   25
+#define CELL_W 8
+#define CELL_H 16
+#define N_DISCS 25
 
 /* R_MIN/R_MAX: disc radius range in pixels.
  * R_MIN = 1.5 cells wide — large enough to be visible on screen.
  * R_MAX = 4 cells wide — at N=25 discs, max radius must not make placement
  * impossible; 4 cells keeps most random layouts placeable within 200 tries. */
-#define R_MIN    (CELL_W * 1.5f)
-#define R_MAX    (CELL_W * 4.0f)
+#define R_MIN (CELL_W * 1.5f)
+#define R_MAX (CELL_W * 4.0f)
 
 /* V_MAX: initial speed cap (px/s).  180 px/s at CELL_W=8 ≈ 22.5 cells/s.
  * At 60 fps that's 0.375 cells per frame — fast enough to look dynamic
  * but slow enough that a disc doesn't skip over another in one tick.      */
-#define V_MAX     180.f
+#define V_MAX 180.f
 
 /* FLASH_S: impact flash duration (seconds).
  * 0.4 s is just above typical human reaction time (~0.25 s), making
  * collision flashes easy to notice without looking persistent.            */
-#define FLASH_S    0.4f
+#define FLASH_S 0.4f
 
 /* SIM_FPS: physics tick rate.  120 Hz gives dt ≈ 8.3 ms — small enough
  * that at V_MAX a disc moves only 1.5 px per tick, preventing tunnelling. */
-#define SIM_FPS    120
-#define RENDER_NS  (1000000000LL / 60)   /* 60 fps render period (ns) */
+#define SIM_FPS 120
+#define RENDER_NS (1000000000LL / 60) /* 60 fps render period (ns) */
 
 /* Canonical HUD chrome — 1 row top status + 1 row bottom action bar.
  * Discs render in rows TOP_HUD_H .. rows - BOT_HUD_H - 1.            */
-#define TOP_HUD_H   1
-#define BOT_HUD_H   1
-#define HUD_ROWS    (TOP_HUD_H + BOT_HUD_H)
+#define TOP_HUD_H 1
+#define BOT_HUD_H 1
+#define HUD_ROWS (TOP_HUD_H + BOT_HUD_H)
 
-#define N_THEMES   10   /* see k_themes[] in §3 */
+#define N_THEMES 10 /* see k_themes[] in §3 */
 
 enum {
-    CP_SLOW = 1,    /* slow-speed discs   — theme ramp[0]               */
-    CP_MED,         /* mid-speed discs    — theme ramp[2]               */
-    CP_FAST,        /* fast-speed discs   — theme ramp[3] (brightest)   */
-    CP_FLASH,       /* collision flash    — theme `flash` accent        */
-    CP_HUD,         /* canonical top status — bright yellow + bold      */
-    CP_HINT,        /* canonical bottom action bar — bright cyan + bold */
+  CP_SLOW = 1, /* slow-speed discs   — theme ramp[0]               */
+  CP_MED,      /* mid-speed discs    — theme ramp[2]               */
+  CP_FAST,     /* fast-speed discs   — theme ramp[3] (brightest)   */
+  CP_FLASH,    /* collision flash    — theme `flash` accent        */
+  CP_HUD,      /* canonical top status — bright yellow + bold      */
+  CP_HINT,     /* canonical bottom action bar — bright cyan + bold */
 };
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-static long long clock_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(long long ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(long long ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -199,23 +198,23 @@ static void clock_sleep_ns(long long ns)
  * forbidden — they vanish on default-black terminals.
  */
 typedef struct {
-    const char *name;
-    short ramp[4];
-    short flash;
+  const char *name;
+  short ramp[4];
+  short flash;
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
     /*  name        ramp[0..3]                  flash               */
-    { "Matrix",   {  28,  34,  40,  46 },       226 }, /* cyber green / yellow pop */
-    { "Fire",     { 130, 208, 202, 196 },       226 }, /* warm → red  / gold pop   */
-    { "Oceanic",  {  24,  31,  39,  51 },       196 }, /* teal → cyan / red pop    */
-    { "Neon",     { 129, 165, 201, 213 },        51 }, /* purple→pink / cyan pop   */
-    { "Mono",     { 240, 247, 250, 255 },       196 }, /* grayscale   / red pop    */
-    { "Ice",      { 153, 117, 159, 195 },       196 }, /* light blues / red pop    */
-    { "Nova",     { 129, 141, 177, 213 },       226 }, /* stellar     / yellow pop */
-    { "Forest",   {  58, 100, 142, 190 },       226 }, /* leaves/bark / gold pop   */
-    { "Desert",   { 130, 178, 214, 220 },        51 }, /* sand/gold   / cyan pop   */
-    { "Eclipse",  { 240, 244, 124, 196 },       226 }, /* gray + red  / yellow pop */
+    {"Matrix", {28, 34, 40, 46}, 226},      /* cyber green / yellow pop */
+    {"Fire", {130, 208, 202, 196}, 226},    /* warm → red  / gold pop   */
+    {"Oceanic", {24, 31, 39, 51}, 196},     /* teal → cyan / red pop    */
+    {"Neon", {129, 165, 201, 213}, 51},     /* purple→pink / cyan pop   */
+    {"Mono", {240, 247, 250, 255}, 196},    /* grayscale   / red pop    */
+    {"Ice", {153, 117, 159, 195}, 196},     /* light blues / red pop    */
+    {"Nova", {129, 141, 177, 213}, 226},    /* stellar     / yellow pop */
+    {"Forest", {58, 100, 142, 190}, 226},   /* leaves/bark / gold pop   */
+    {"Desert", {130, 178, 214, 220}, 51},   /* sand/gold   / cyan pop   */
+    {"Eclipse", {240, 244, 124, 196}, 226}, /* gray + red  / yellow pop */
 };
 
 /*
@@ -231,32 +230,30 @@ static const Theme k_themes[N_THEMES] = {
  *     CP_HUD   bright yellow + bold (top status)
  *     CP_HINT  bright cyan   + bold (bottom action bar)
  */
-static void theme_apply(int t)
-{
-    const Theme *th = &k_themes[t % N_THEMES];
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(CP_SLOW,  th->ramp[0], -1);
-        init_pair(CP_MED,   th->ramp[2], -1);
-        init_pair(CP_FAST,  th->ramp[3], -1);
-        init_pair(CP_FLASH, th->flash,   -1);
-        init_pair(CP_HUD,   226,         -1);  /* canonical yellow */
-        init_pair(CP_HINT,   51,         -1);  /* canonical cyan   */
-    } else {
-        /* 8-colour fallback — theme-independent. */
-        init_pair(CP_SLOW,  COLOR_BLUE,    -1);
-        init_pair(CP_MED,   COLOR_CYAN,    -1);
-        init_pair(CP_FAST,  COLOR_WHITE,   -1);
-        init_pair(CP_FLASH, COLOR_RED,     -1);
-        init_pair(CP_HUD,   COLOR_YELLOW,  -1);
-        init_pair(CP_HINT,  COLOR_CYAN,    -1);
-    }
+static void theme_apply(int t) {
+  const Theme *th = &k_themes[t % N_THEMES];
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(CP_SLOW, th->ramp[0], -1);
+    init_pair(CP_MED, th->ramp[2], -1);
+    init_pair(CP_FAST, th->ramp[3], -1);
+    init_pair(CP_FLASH, th->flash, -1);
+    init_pair(CP_HUD, 226, -1); /* canonical yellow */
+    init_pair(CP_HINT, 51, -1); /* canonical cyan   */
+  } else {
+    /* 8-colour fallback — theme-independent. */
+    init_pair(CP_SLOW, COLOR_BLUE, -1);
+    init_pair(CP_MED, COLOR_CYAN, -1);
+    init_pair(CP_FAST, COLOR_WHITE, -1);
+    init_pair(CP_FLASH, COLOR_RED, -1);
+    init_pair(CP_HUD, COLOR_YELLOW, -1);
+    init_pair(CP_HINT, COLOR_CYAN, -1);
+  }
 }
 
-static void color_init(void)
-{
-    start_color();
-    theme_apply(0);
+static void color_init(void) {
+  start_color();
+  theme_apply(0);
 }
 
 /* ===================================================================== */
@@ -301,17 +298,17 @@ static void color_init(void)
  *     fields and the impulse formula in scene_tick.
  * ───────────────────────────────────────────────────────────────────── */
 typedef struct {
-    /* ─ kinematic state — read+written every scene_tick ─ */
-    float x,  y;    /* centre position, pixel space (origin top-left) */
-    float vx, vy;   /* velocity, px/s                                 */
+  /* ─ kinematic state — read+written every scene_tick ─ */
+  float x, y;   /* centre position, pixel space (origin top-left) */
+  float vx, vy; /* velocity, px/s                                 */
 
-    /* ─ geometry — set once at scene_init, constant after ─ */
-    float r;        /* radius, px (range R_MIN..R_MAX)                */
-    float mass;     /* m = r² (uniform 2D-disc density)               */
+  /* ─ geometry — set once at scene_init, constant after ─ */
+  float r;    /* radius, px (range R_MIN..R_MAX)                */
+  float mass; /* m = r² (uniform 2D-disc density)               */
 
-    /* ─ render hook — written by sim on collision, read by render ─ */
-    float flash;    /* seconds remaining of collision flash highlight;
-                       > 0 → paint CP_FLASH instead of speed-band tier*/
+  /* ─ render hook — written by sim on collision, read by render ─ */
+  float flash; /* seconds remaining of collision flash highlight;
+                  > 0 → paint CP_FLASH instead of speed-band tier*/
 } Disc;
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -372,21 +369,21 @@ typedef struct {
  *     in a box" that this Scene implements visually.
  * ───────────────────────────────────────────────────────────────────── */
 typedef struct {
-    /* ── SIMULATION ─────────────────────────────────────────────────
-     * Physics state + integrator controls.  Written by scene_tick (and
-     * for paused/speed by the key dispatcher); read by scene_tick and
-     * by the renderer for presentational purposes only.              */
-    Disc      discs[N_DISCS];    /* hard-sphere particle pool          */
-    float     pw, ph;            /* pixel-space wall box (px × px)     */
-    long long coll_total;        /* running pair-collision tally       */
-    bool      paused;            /* p   : scene_tick early-returns     */
-    int       speed;             /* +/- : sub-steps per frame (1..8)   */
+  /* ── SIMULATION ─────────────────────────────────────────────────
+   * Physics state + integrator controls.  Written by scene_tick (and
+   * for paused/speed by the key dispatcher); read by scene_tick and
+   * by the renderer for presentational purposes only.              */
+  Disc discs[N_DISCS];  /* hard-sphere particle pool          */
+  float pw, ph;         /* pixel-space wall box (px × px)     */
+  long long coll_total; /* running pair-collision tally       */
+  bool paused;          /* p   : scene_tick early-returns     */
+  int speed;            /* +/- : sub-steps per frame (1..8)   */
 
-    /* ── RENDERING ──────────────────────────────────────────────────
-     * Presentation-only state.  Never feeds back into the integrator;
-     * mutating these never invalidates physics.                       */
-    int       rows, cols;        /* terminal cell-space size (SIGWINCH)*/
-    int       theme;             /* t/T : index into k_themes[]        */
+  /* ── RENDERING ──────────────────────────────────────────────────
+   * Presentation-only state.  Never feeds back into the integrator;
+   * mutating these never invalidates physics.                       */
+  int rows, cols; /* terminal cell-space size (SIGWINCH)*/
+  int theme;      /* t/T : index into k_themes[]        */
 } Scene;
 
 /*
@@ -394,10 +391,9 @@ typedef struct {
  * derive mass = r² (uniform 2D-disc density).  Heavier discs deflect
  * lighter ones more in the elastic-impulse formula downstream.
  */
-static void seed_random_radius_mass(Disc *d)
-{
-    d->r    = R_MIN + (float)rand() / RAND_MAX * (R_MAX - R_MIN);
-    d->mass = d->r * d->r;
+static void seed_random_radius_mass(Disc *d) {
+  d->r = R_MIN + (float)rand() / RAND_MAX * (R_MAX - R_MIN);
+  d->mass = d->r * d->r;
 }
 
 /*
@@ -410,22 +406,23 @@ static void seed_random_radius_mass(Disc *d)
  * packing — sim will resolve any residual overlap on the first tick).
  */
 static void seed_non_overlapping_position(Disc *d, const Scene *s,
-                                          int placed_count, int max_tries)
-{
-    for (int tries = 0; tries < max_tries; tries++) {
-        d->x = d->r + (float)rand() / RAND_MAX * (s->pw - 2*d->r);
-        d->y = d->r + (float)rand() / RAND_MAX * (s->ph - 2*d->r);
-        bool ok = true;
-        for (int j = 0; j < placed_count && ok; j++) {
-            float dx  = d->x - s->discs[j].x;
-            float dy  = d->y - s->discs[j].y;
-            float sum = d->r + s->discs[j].r;
-            if (dx*dx + dy*dy < sum * sum) ok = false;
-        }
-        if (ok) return;
+                                          int placed_count, int max_tries) {
+  for (int tries = 0; tries < max_tries; tries++) {
+    d->x = d->r + (float)rand() / RAND_MAX * (s->pw - 2 * d->r);
+    d->y = d->r + (float)rand() / RAND_MAX * (s->ph - 2 * d->r);
+    bool ok = true;
+    for (int j = 0; j < placed_count && ok; j++) {
+      float dx = d->x - s->discs[j].x;
+      float dy = d->y - s->discs[j].y;
+      float sum = d->r + s->discs[j].r;
+      if (dx * dx + dy * dy < sum * sum)
+        ok = false;
     }
-    /* Fall through: keep the last sampled position even if overlapping;
-     * scene_tick's positional resolver will separate it next tick.     */
+    if (ok)
+      return;
+  }
+  /* Fall through: keep the last sampled position even if overlapping;
+   * scene_tick's positional resolver will separate it next tick.     */
 }
 
 /*
@@ -433,12 +430,11 @@ static void seed_non_overlapping_position(Disc *d, const Scene *s,
  * sampled from [60 px/s, V_MAX].  The 60 px/s lower bound prevents
  * "stuck" discs that move imperceptibly on screen.
  */
-static void seed_random_velocity(Disc *d)
-{
-    float speed = 60.f + (float)rand() / RAND_MAX * (V_MAX - 60.f);
-    float angle = (float)rand() / RAND_MAX * 6.28318f;
-    d->vx = speed * cosf(angle);
-    d->vy = speed * sinf(angle);
+static void seed_random_velocity(Disc *d) {
+  float speed = 60.f + (float)rand() / RAND_MAX * (V_MAX - 60.f);
+  float angle = (float)rand() / RAND_MAX * 6.28318f;
+  d->vx = speed * cosf(angle);
+  d->vy = speed * sinf(angle);
 }
 
 /*
@@ -451,21 +447,20 @@ static void seed_random_velocity(Disc *d)
  * Does NOT touch paused / speed / theme — UI state survives reset and
  * resize so the user's selections stick.
  */
-static void scene_init(Scene *s, int cols, int rows)
-{
-    s->rows       = rows;
-    s->cols       = cols;
-    s->pw         = (float)(cols * CELL_W);
-    s->ph         = (float)((rows - HUD_ROWS) * CELL_H);
-    s->coll_total = 0;
+static void scene_init(Scene *s, int cols, int rows) {
+  s->rows = rows;
+  s->cols = cols;
+  s->pw = (float)(cols * CELL_W);
+  s->ph = (float)((rows - HUD_ROWS) * CELL_H);
+  s->coll_total = 0;
 
-    for (int i = 0; i < N_DISCS; i++) {
-        Disc *d = &s->discs[i];
-        seed_random_radius_mass(d);
-        d->flash = 0.f;
-        seed_non_overlapping_position(d, s, i, 200);
-        seed_random_velocity(d);
-    }
+  for (int i = 0; i < N_DISCS; i++) {
+    Disc *d = &s->discs[i];
+    seed_random_radius_mass(d);
+    d->flash = 0.f;
+    seed_non_overlapping_position(d, s, i, 200);
+    seed_random_velocity(d);
+  }
 }
 
 /*
@@ -476,12 +471,12 @@ static void scene_init(Scene *s, int cols, int rows)
  * No forces are integrated here — between collisions the discs move in
  * straight lines (Galilean inertia), so a one-step Euler is exact.
  */
-static void integrate_disc(Disc *d, float dt)
-{
-    d->x += d->vx * dt;
-    d->y += d->vy * dt;
-    d->flash -= dt;
-    if (d->flash < 0.f) d->flash = 0.f;
+static void integrate_disc(Disc *d, float dt) {
+  d->x += d->vx * dt;
+  d->y += d->vy * dt;
+  d->flash -= dt;
+  if (d->flash < 0.f)
+    d->flash = 0.f;
 }
 
 /*
@@ -492,12 +487,23 @@ static void integrate_disc(Disc *d, float dt)
  * (sign-flip via fabsf).  Position-clamp + sign-flip is equivalent to
  * a perfectly elastic reflection across the wall plane.
  */
-static void reflect_off_walls(Disc *d, float pw, float ph)
-{
-    if (d->x - d->r < 0.f)  { d->x = d->r;         d->vx =  fabsf(d->vx); }
-    if (d->x + d->r > pw)   { d->x = pw - d->r;    d->vx = -fabsf(d->vx); }
-    if (d->y - d->r < 0.f)  { d->y = d->r;         d->vy =  fabsf(d->vy); }
-    if (d->y + d->r > ph)   { d->y = ph - d->r;    d->vy = -fabsf(d->vy); }
+static void reflect_off_walls(Disc *d, float pw, float ph) {
+  if (d->x - d->r < 0.f) {
+    d->x = d->r;
+    d->vx = fabsf(d->vx);
+  }
+  if (d->x + d->r > pw) {
+    d->x = pw - d->r;
+    d->vx = -fabsf(d->vx);
+  }
+  if (d->y - d->r < 0.f) {
+    d->y = d->r;
+    d->vy = fabsf(d->vy);
+  }
+  if (d->y + d->r > ph) {
+    d->y = ph - d->r;
+    d->vy = -fabsf(d->vy);
+  }
 }
 
 /*
@@ -506,18 +512,18 @@ static void reflect_off_walls(Disc *d, float pw, float ph)
  * to b and the positive penetration depth (min_d − dist).  Skips when
  * centres coincide (dist² < ε) to avoid normal-vector NaN.
  */
-static bool pair_overlaps(const Disc *a, const Disc *b,
-                          float *out_nx, float *out_ny, float *out_overlap)
-{
-    float dx = b->x - a->x, dy = b->y - a->y;
-    float dist2 = dx*dx + dy*dy;
-    float min_d = a->r + b->r;
-    if (dist2 >= min_d * min_d || dist2 < 1e-6f) return false;
-    float dist = sqrtf(dist2);
-    *out_nx      = dx / dist;
-    *out_ny      = dy / dist;
-    *out_overlap = min_d - dist;
-    return true;
+static bool pair_overlaps(const Disc *a, const Disc *b, float *out_nx,
+                          float *out_ny, float *out_overlap) {
+  float dx = b->x - a->x, dy = b->y - a->y;
+  float dist2 = dx * dx + dy * dy;
+  float min_d = a->r + b->r;
+  if (dist2 >= min_d * min_d || dist2 < 1e-6f)
+    return false;
+  float dist = sqrtf(dist2);
+  *out_nx = dx / dist;
+  *out_ny = dy / dist;
+  *out_overlap = min_d - dist;
+  return true;
 }
 
 /*
@@ -527,14 +533,13 @@ static bool pair_overlaps(const Disc *a, const Disc *b,
  *     a ← a − (m_b / (m_a+m_b)) · overlap · n̂
  *     b ← b + (m_a / (m_a+m_b)) · overlap · n̂
  */
-static void resolve_overlap_positional(Disc *a, Disc *b,
-                                       float nx, float ny, float overlap)
-{
-    float total = a->mass + b->mass;
-    a->x -= nx * overlap * b->mass / total;
-    a->y -= ny * overlap * b->mass / total;
-    b->x += nx * overlap * a->mass / total;
-    b->y += ny * overlap * a->mass / total;
+static void resolve_overlap_positional(Disc *a, Disc *b, float nx, float ny,
+                                       float overlap) {
+  float total = a->mass + b->mass;
+  a->x -= nx * overlap * b->mass / total;
+  a->y -= ny * overlap * b->mass / total;
+  b->x += nx * overlap * a->mass / total;
+  b->y += ny * overlap * a->mass / total;
 }
 
 /*
@@ -550,17 +555,17 @@ static void resolve_overlap_positional(Disc *a, Disc *b,
  * when dv ≤ 0 — the discs are already separating along n̂, which can
  * happen after positional resolution.
  */
-static bool apply_elastic_impulse(Disc *a, Disc *b, float nx, float ny)
-{
-    float dv = (a->vx - b->vx) * nx + (a->vy - b->vy) * ny;
-    if (dv <= 0.f) return false;
-    float total = a->mass + b->mass;
-    float imp   = 2.f * a->mass * b->mass / total * dv;
-    a->vx -= imp / a->mass * nx;
-    a->vy -= imp / a->mass * ny;
-    b->vx += imp / b->mass * nx;
-    b->vy += imp / b->mass * ny;
-    return true;
+static bool apply_elastic_impulse(Disc *a, Disc *b, float nx, float ny) {
+  float dv = (a->vx - b->vx) * nx + (a->vy - b->vy) * ny;
+  if (dv <= 0.f)
+    return false;
+  float total = a->mass + b->mass;
+  float imp = 2.f * a->mass * b->mass / total * dv;
+  a->vx -= imp / a->mass * nx;
+  a->vy -= imp / a->mass * ny;
+  b->vx += imp / b->mass * nx;
+  b->vy += imp / b->mass * ny;
+  return true;
 }
 
 /*
@@ -573,15 +578,16 @@ static bool apply_elastic_impulse(Disc *a, Disc *b, float nx, float ny)
  * Returns true iff an impulse was actually applied, so the caller can
  * increment the running collision counter.
  */
-static bool pair_collide(Disc *a, Disc *b)
-{
-    float nx, ny, overlap;
-    if (!pair_overlaps(a, b, &nx, &ny, &overlap))      return false;
-    resolve_overlap_positional(a, b, nx, ny, overlap);
-    if (!apply_elastic_impulse(a, b, nx, ny))          return false;
-    a->flash = FLASH_S;
-    b->flash = FLASH_S;
-    return true;
+static bool pair_collide(Disc *a, Disc *b) {
+  float nx, ny, overlap;
+  if (!pair_overlaps(a, b, &nx, &ny, &overlap))
+    return false;
+  resolve_overlap_positional(a, b, nx, ny, overlap);
+  if (!apply_elastic_impulse(a, b, nx, ny))
+    return false;
+  a->flash = FLASH_S;
+  b->flash = FLASH_S;
+  return true;
 }
 
 /*
@@ -591,23 +597,23 @@ static bool pair_collide(Disc *a, Disc *b)
  *   3. pairs  : O(N²) collision resolution
  * No-op when s->paused is true.
  */
-static void scene_tick(Scene *s, float dt)
-{
-    if (s->paused) return;
+static void scene_tick(Scene *s, float dt) {
+  if (s->paused)
+    return;
 
-    /* free flight + wall reflections */
-    for (int i = 0; i < N_DISCS; i++) {
-        integrate_disc   (&s->discs[i], dt);
-        reflect_off_walls(&s->discs[i], s->pw, s->ph);
-    }
+  /* free flight + wall reflections */
+  for (int i = 0; i < N_DISCS; i++) {
+    integrate_disc(&s->discs[i], dt);
+    reflect_off_walls(&s->discs[i], s->pw, s->ph);
+  }
 
-    /* O(N²) pair check + collision resolution */
-    for (int i = 0; i < N_DISCS - 1; i++) {
-        for (int j = i + 1; j < N_DISCS; j++) {
-            if (pair_collide(&s->discs[i], &s->discs[j]))
-                s->coll_total++;
-        }
+  /* O(N²) pair check + collision resolution */
+  for (int i = 0; i < N_DISCS - 1; i++) {
+    for (int j = i + 1; j < N_DISCS; j++) {
+      if (pair_collide(&s->discs[i], &s->discs[j]))
+        s->coll_total++;
     }
+  }
 }
 
 /* ===================================================================== */
@@ -615,7 +621,9 @@ static void scene_tick(Scene *s, float dt)
 /* ===================================================================== */
 
 static int px_to_cell_x(float px) { return (int)(px / CELL_W + .5f); }
-static int px_to_cell_y(float py) { return (int)(py / CELL_H + .5f) + TOP_HUD_H; }
+static int px_to_cell_y(float py) {
+  return (int)(py / CELL_H + .5f) + TOP_HUD_H;
+}
 
 /*
  * disc_to_cell_geometry — pixel-space disc → cell-space render geometry.
@@ -625,15 +633,16 @@ static int px_to_cell_y(float py) { return (int)(py / CELL_H + .5f) + TOP_HUD_H;
  * the same physical radius gives a wider rx than ry in cells.  Both
  * clamped to a minimum of 1 cell so the disc is always visible.
  */
-static void disc_to_cell_geometry(const Disc *d,
-                                  int *cx, int *cy, int *rx, int *ry)
-{
-    *cx = px_to_cell_x(d->x);
-    *cy = px_to_cell_y(d->y);
-    *rx = (int)(d->r / CELL_W + .5f);
-    *ry = (int)(d->r / CELL_H + .5f);
-    if (*rx < 1) *rx = 1;
-    if (*ry < 1) *ry = 1;
+static void disc_to_cell_geometry(const Disc *d, int *cx, int *cy, int *rx,
+                                  int *ry) {
+  *cx = px_to_cell_x(d->x);
+  *cy = px_to_cell_y(d->y);
+  *rx = (int)(d->r / CELL_W + .5f);
+  *ry = (int)(d->r / CELL_H + .5f);
+  if (*rx < 1)
+    *rx = 1;
+  if (*ry < 1)
+    *ry = 1;
 }
 
 /*
@@ -641,11 +650,9 @@ static void disc_to_cell_geometry(const Disc *d,
  * against both top and bottom HUD chrome so discs never paint over
  * the canonical bars.
  */
-static void draw_disc_center(int cx, int cy, int cols, int rows)
-{
-    if (cy >= TOP_HUD_H && cy < rows - BOT_HUD_H
-        && cx >= 0 && cx < cols)
-        mvaddch(cy, cx, 'O');
+static void draw_disc_center(int cx, int cy, int cols, int rows) {
+  if (cy >= TOP_HUD_H && cy < rows - BOT_HUD_H && cx >= 0 && cx < cols)
+    mvaddch(cy, cx, 'O');
 }
 
 /*
@@ -664,21 +671,23 @@ static void draw_disc_center(int cx, int cy, int cols, int rows)
  * Reference: Foley et al. *Computer Graphics: Principles & Practice*
  * §3.3 — row-by-row ellipse rasterisation.
  */
-static void draw_ellipse_rim(int cx, int cy, int rx, int ry,
-                             int cols, int rows)
-{
-    for (int dc = -rx; dc <= rx; dc++) {
-        int tc = cx + dc;
-        if (tc < 0 || tc >= cols) continue;
-        float frac = 1.f - ((float)(dc*dc)) / ((float)(rx*rx));
-        if (frac < 0.f) frac = 0.f;
-        int dy_cells = (int)(ry * sqrtf(frac));
-        for (int sign = -1; sign <= 1; sign += 2) {
-            int tr = cy + sign * dy_cells;
-            if (tr < TOP_HUD_H || tr >= rows - BOT_HUD_H) continue;
-            mvaddch(tr, tc, (dc == 0 || dc == -rx || dc == rx) ? '|' : '-');
-        }
+static void draw_ellipse_rim(int cx, int cy, int rx, int ry, int cols,
+                             int rows) {
+  for (int dc = -rx; dc <= rx; dc++) {
+    int tc = cx + dc;
+    if (tc < 0 || tc >= cols)
+      continue;
+    float frac = 1.f - ((float)(dc * dc)) / ((float)(rx * rx));
+    if (frac < 0.f)
+      frac = 0.f;
+    int dy_cells = (int)(ry * sqrtf(frac));
+    for (int sign = -1; sign <= 1; sign += 2) {
+      int tr = cy + sign * dy_cells;
+      if (tr < TOP_HUD_H || tr >= rows - BOT_HUD_H)
+        continue;
+      mvaddch(tr, tc, (dc == 0 || dc == -rx || dc == rx) ? '|' : '-');
     }
+  }
 }
 
 /*
@@ -686,15 +695,14 @@ static void draw_ellipse_rim(int cx, int cy, int rx, int ry,
  * Two passes share the same colour attribute so a single attron/attroff
  * wraps the whole disc.
  */
-static void draw_disc(const Disc *d, int cp, int cols, int rows)
-{
-    int cx, cy, rx, ry;
-    disc_to_cell_geometry(d, &cx, &cy, &rx, &ry);
+static void draw_disc(const Disc *d, int cp, int cols, int rows) {
+  int cx, cy, rx, ry;
+  disc_to_cell_geometry(d, &cx, &cy, &rx, &ry);
 
-    attron(COLOR_PAIR(cp) | A_BOLD);
-    draw_disc_center(cx, cy, cols, rows);
-    draw_ellipse_rim(cx, cy, rx, ry, cols, rows);
-    attroff(COLOR_PAIR(cp) | A_BOLD);
+  attron(COLOR_PAIR(cp) | A_BOLD);
+  draw_disc_center(cx, cy, cols, rows);
+  draw_ellipse_rim(cx, cy, rx, ry, cols, rows);
+  attroff(COLOR_PAIR(cp) | A_BOLD);
 }
 
 /*
@@ -703,13 +711,15 @@ static void draw_disc(const Disc *d, int cp, int cols, int rows)
  * the three speed bands roughly divide the visible range evenly; the
  * collision flash overrides everything for FLASH_S seconds.
  */
-static int speed_tier_pair(const Disc *d)
-{
-    if (d->flash > 0.f) return CP_FLASH;
-    float speed = sqrtf(d->vx * d->vx + d->vy * d->vy);
-    if (speed < V_MAX * 0.4f) return CP_SLOW;
-    if (speed < V_MAX * 0.8f) return CP_MED;
-    return CP_FAST;
+static int speed_tier_pair(const Disc *d) {
+  if (d->flash > 0.f)
+    return CP_FLASH;
+  float speed = sqrtf(d->vx * d->vx + d->vy * d->vy);
+  if (speed < V_MAX * 0.4f)
+    return CP_SLOW;
+  if (speed < V_MAX * 0.8f)
+    return CP_MED;
+  return CP_FAST;
 }
 
 /*
@@ -717,19 +727,18 @@ static int speed_tier_pair(const Disc *d)
  * Right-aligned: disc count, total collisions, sim speed, theme, paused.
  * CP_HUD (bright yellow + bold).
  */
-static void draw_hud_top(const Scene *s)
-{
-    char buf[160];
-    int n = snprintf(buf, sizeof buf,
-                     " N=%d  collisions:%lld  speed:%dx  theme:%s  %s ",
-                     N_DISCS, s->coll_total, s->speed,
-                     k_themes[s->theme].name,
-                     s->paused ? "PAUSED " : "running");
-    int col = s->cols - n;
-    if (col < 0) col = 0;
-    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvaddnstr(0, col, buf, s->cols);
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+static void draw_hud_top(const Scene *s) {
+  char buf[160];
+  int n = snprintf(buf, sizeof buf,
+                   " N=%d  collisions:%lld  speed:%dx  theme:%s  %s ", N_DISCS,
+                   s->coll_total, s->speed, k_themes[s->theme].name,
+                   s->paused ? "PAUSED " : "running");
+  int col = s->cols - n;
+  if (col < 0)
+    col = 0;
+  attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+  mvaddnstr(0, col, buf, s->cols);
+  attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
 /*
@@ -737,123 +746,150 @@ static void draw_hud_top(const Scene *s)
  * Left-aligned key list; short fallback if the terminal is narrow.
  * CP_HINT (bright cyan + bold).
  */
-static void draw_hud_bottom(const Scene *s)
-{
-    const char *hint_full =
-        " q:quit  p:pause  r:reset  t/T:theme  +/-:speed  spc:impulse ";
-    const char *hint_short = " q:quit  p:pause  t:theme  spc:impulse ";
-    const char *hint = hint_full;
-    if ((int)strlen(hint_full) >= s->cols - 1) hint = hint_short;
+static void draw_hud_bottom(const Scene *s) {
+  const char *hint_full =
+      " q:quit  p:pause  r:reset  t/T:theme  +/-:speed  spc:impulse ";
+  const char *hint_short = " q:quit  p:pause  t:theme  spc:impulse ";
+  const char *hint = hint_full;
+  if ((int)strlen(hint_full) >= s->cols - 1)
+    hint = hint_short;
 
-    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
-    mvaddnstr(s->rows - 1, 0, hint, s->cols);
-    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
+  attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+  mvaddnstr(s->rows - 1, 0, hint, s->cols);
+  attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
 /*
  * scene_draw — paint every disc speed-tinted, then HUD chrome on top.
  */
-static void scene_draw(const Scene *s)
-{
-    for (int i = 0; i < N_DISCS; i++) {
-        const Disc *d = &s->discs[i];
-        draw_disc(d, speed_tier_pair(d), s->cols, s->rows);
-    }
-    draw_hud_top(s);
-    draw_hud_bottom(s);
+static void scene_draw(const Scene *s) {
+  for (int i = 0; i < N_DISCS; i++) {
+    const Disc *d = &s->discs[i];
+    draw_disc(d, speed_tier_pair(d), s->cols, s->rows);
+  }
+  draw_hud_top(s);
+  draw_hud_bottom(s);
 }
 
 /* ===================================================================== */
 /* §6  app                                                                */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_quit   = 0;
+static volatile sig_atomic_t g_quit = 0;
 static volatile sig_atomic_t g_resize = 0;
 
-static void sig_h(int s)
-{
-    if (s == SIGINT || s == SIGTERM) g_quit   = 1;
-    if (s == SIGWINCH)               g_resize = 1;
+static void sig_h(int s) {
+  if (s == SIGINT || s == SIGTERM)
+    g_quit = 1;
+  if (s == SIGWINCH)
+    g_resize = 1;
 }
 
 static void cleanup(void) { endwin(); }
 
-int main(void)
-{
-    srand((unsigned)time(NULL));
-    atexit(cleanup);
-    signal(SIGINT, sig_h); signal(SIGTERM, sig_h); signal(SIGWINCH, sig_h);
+int main(void) {
+  srand((unsigned)time(NULL));
+  atexit(cleanup);
+  signal(SIGINT, sig_h);
+  signal(SIGTERM, sig_h);
+  signal(SIGWINCH, sig_h);
 
-    initscr(); cbreak(); noecho();
-    keypad(stdscr, TRUE); nodelay(stdscr, TRUE);
-    curs_set(0); typeahead(-1);
-    color_init();
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  color_init();
 
-    /* One Scene owns every piece of mutable state outside the signal flags.
-     * UI defaults are set here once; scene_init resets sim state but
-     * leaves paused/speed/theme alone, so r/reset and SIGWINCH preserve
-     * the user's UI selections.                                          */
-    Scene scene = {0};
-    scene.speed = 1;
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    scene_init(&scene, cols, rows);
+  /* One Scene owns every piece of mutable state outside the signal flags.
+   * UI defaults are set here once; scene_init resets sim state but
+   * leaves paused/speed/theme alone, so r/reset and SIGWINCH preserve
+   * the user's UI selections.                                          */
+  Scene scene = {0};
+  scene.speed = 1;
+  int rows, cols;
+  getmaxyx(stdscr, rows, cols);
+  scene_init(&scene, cols, rows);
 
-    long long frame_time = clock_ns();
+  long long frame_time = clock_ns();
 
-    while (!g_quit) {
+  while (!g_quit) {
 
-        if (g_resize) {
-            g_resize = 0;
-            endwin(); refresh();
-            getmaxyx(stdscr, rows, cols);
-            scene_init(&scene, cols, rows);
-            frame_time = clock_ns();
-        }
-
-        int ch = getch();
-        switch (ch) {
-        case 'q': case 'Q': case 27: g_quit = 1; break;
-        case 'p': case 'P': scene.paused = !scene.paused; break;
-        case 'r': case 'R': scene_init(&scene, scene.cols, scene.rows); break;
-        case '+': case '=': scene.speed++; if (scene.speed > 8) scene.speed = 8; break;
-        case '-': scene.speed--; if (scene.speed < 1) scene.speed = 1; break;
-        case 't':
-            scene.theme = (scene.theme + 1) % N_THEMES;
-            theme_apply(scene.theme);
-            break;
-        case 'T':
-            scene.theme = (scene.theme + N_THEMES - 1) % N_THEMES;
-            theme_apply(scene.theme);
-            break;
-        case ' ':
-            /* random impulse to every disc */
-            for (int i = 0; i < N_DISCS; i++) {
-                float a = (float)rand() / RAND_MAX * 6.28318f;
-                scene.discs[i].vx += V_MAX * .5f * cosf(a);
-                scene.discs[i].vy += V_MAX * .5f * sinf(a);
-            }
-            break;
-        default: break;
-        }
-
-        long long now = clock_ns();
-        long long dt_ns = now - frame_time;
-        frame_time = now;
-        if (dt_ns > 100000000LL) dt_ns = 100000000LL;
-        float dt = (float)dt_ns * 1e-9f;
-
-        /* Fixed-rate sub-stepping for stability: each frame's dt is
-         * divided into `speed` sub-steps.  scene_tick early-returns when
-         * paused, so we can call it unconditionally.                     */
-        for (int k = 0; k < scene.speed; k++)
-            scene_tick(&scene, dt / scene.speed);
-
-        erase();
-        scene_draw(&scene);
-        wnoutrefresh(stdscr);
-        doupdate();
-        clock_sleep_ns(RENDER_NS - (clock_ns() - now));
+    if (g_resize) {
+      g_resize = 0;
+      endwin();
+      refresh();
+      getmaxyx(stdscr, rows, cols);
+      scene_init(&scene, cols, rows);
+      frame_time = clock_ns();
     }
-    return 0;
+
+    int ch = getch();
+    switch (ch) {
+    case 'q':
+    case 'Q':
+    case 27:
+      g_quit = 1;
+      break;
+    case 'p':
+    case 'P':
+      scene.paused = !scene.paused;
+      break;
+    case 'r':
+    case 'R':
+      scene_init(&scene, scene.cols, scene.rows);
+      break;
+    case '+':
+    case '=':
+      scene.speed++;
+      if (scene.speed > 8)
+        scene.speed = 8;
+      break;
+    case '-':
+      scene.speed--;
+      if (scene.speed < 1)
+        scene.speed = 1;
+      break;
+    case 't':
+      scene.theme = (scene.theme + 1) % N_THEMES;
+      theme_apply(scene.theme);
+      break;
+    case 'T':
+      scene.theme = (scene.theme + N_THEMES - 1) % N_THEMES;
+      theme_apply(scene.theme);
+      break;
+    case ' ':
+      /* random impulse to every disc */
+      for (int i = 0; i < N_DISCS; i++) {
+        float a = (float)rand() / RAND_MAX * 6.28318f;
+        scene.discs[i].vx += V_MAX * .5f * cosf(a);
+        scene.discs[i].vy += V_MAX * .5f * sinf(a);
+      }
+      break;
+    default:
+      break;
+    }
+
+    long long now = clock_ns();
+    long long dt_ns = now - frame_time;
+    frame_time = now;
+    if (dt_ns > 100000000LL)
+      dt_ns = 100000000LL;
+    float dt = (float)dt_ns * 1e-9f;
+
+    /* Fixed-rate sub-stepping for stability: each frame's dt is
+     * divided into `speed` sub-steps.  scene_tick early-returns when
+     * paused, so we can call it unconditionally.                     */
+    for (int k = 0; k < scene.speed; k++)
+      scene_tick(&scene, dt / scene.speed);
+
+    erase();
+    scene_draw(&scene);
+    wnoutrefresh(stdscr);
+    doupdate();
+    clock_sleep_ns(RENDER_NS - (clock_ns() - now));
+  }
+  return 0;
 }

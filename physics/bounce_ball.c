@@ -92,28 +92,28 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdio.h>
 
 /* ===================================================================== */
 /* §1  config                                                             */
 /* ===================================================================== */
 
 enum {
-    SIM_FPS_MIN      = 10,
-    SIM_FPS_DEFAULT  = 60,
-    SIM_FPS_MAX      = 60,
-    SIM_FPS_STEP     =  5,
+  SIM_FPS_MIN = 10,
+  SIM_FPS_DEFAULT = 60,
+  SIM_FPS_MAX = 60,
+  SIM_FPS_STEP = 5,
 
-    HUD_COLS         = 40,
-    FPS_UPDATE_MS    = 500,
+  HUD_COLS = 40,
+  FPS_UPDATE_MS = 500,
 
-    BALLS_DEFAULT    =  5,
-    BALLS_MIN        =  1,
-    BALLS_MAX        = 20,
-    N_COLORS         =  7,
+  BALLS_DEFAULT = 5,
+  BALLS_MIN = 1,
+  BALLS_MAX = 20,
+  N_COLORS = 7,
 };
 
 /*
@@ -144,8 +144,8 @@ enum {
  *   So: speed >= CELL_H * sim_fps / 4
  *       speed >= 16 * 60 / 4 = 240 px/s  (minimum for vertical smoothness)
  */
-#define CELL_W   8
-#define CELL_H  16
+#define CELL_W 8
+#define CELL_H 16
 
 /*
  * Speed in pixels per second.
@@ -158,58 +158,56 @@ enum {
  * We use 300 as the minimum (comfortable margin above the threshold)
  * and 600 as maximum for fast balls.
  */
-#define SPEED_MIN  300.0f
-#define SPEED_MAX  600.0f
+#define SPEED_MIN 300.0f
+#define SPEED_MAX 600.0f
 
-#define NS_PER_SEC  1000000000LL
-#define NS_PER_MS   1000000LL
-#define TICK_NS(f)  (NS_PER_SEC / (f))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(f) (NS_PER_SEC / (f))
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec req = {
-        .tv_sec  = (time_t)(ns / NS_PER_SEC),
-        .tv_nsec = (long)  (ns % NS_PER_SEC),
-    };
-    nanosleep(&req, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec req = {
+      .tv_sec = (time_t)(ns / NS_PER_SEC),
+      .tv_nsec = (long)(ns % NS_PER_SEC),
+  };
+  nanosleep(&req, NULL);
 }
 
 /* ===================================================================== */
 /* §3  color                                                              */
 /* ===================================================================== */
 
-static void color_init(void)
-{
-    start_color();
-    if (COLORS >= 256) {
-        init_pair(1, 196, COLOR_BLACK);
-        init_pair(2, 208, COLOR_BLACK);
-        init_pair(3, 226, COLOR_BLACK);
-        init_pair(4,  46, COLOR_BLACK);
-        init_pair(5,  51, COLOR_BLACK);
-        init_pair(6, 33, COLOR_BLACK);
-        init_pair(7, 201, COLOR_BLACK);
-    } else {
-        init_pair(1, COLOR_RED,     COLOR_BLACK);
-        init_pair(2, COLOR_RED,     COLOR_BLACK);
-        init_pair(3, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(4, COLOR_GREEN,   COLOR_BLACK);
-        init_pair(5, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(6, COLOR_BLUE,    COLOR_BLACK);
-        init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
-    }
+static void color_init(void) {
+  start_color();
+  if (COLORS >= 256) {
+    init_pair(1, 196, COLOR_BLACK);
+    init_pair(2, 208, COLOR_BLACK);
+    init_pair(3, 226, COLOR_BLACK);
+    init_pair(4, 46, COLOR_BLACK);
+    init_pair(5, 51, COLOR_BLACK);
+    init_pair(6, 33, COLOR_BLACK);
+    init_pair(7, 201, COLOR_BLACK);
+  } else {
+    init_pair(1, COLOR_RED, COLOR_BLACK);
+    init_pair(2, COLOR_RED, COLOR_BLACK);
+    init_pair(3, COLOR_YELLOW, COLOR_BLACK);
+    init_pair(4, COLOR_GREEN, COLOR_BLACK);
+    init_pair(5, COLOR_CYAN, COLOR_BLACK);
+    init_pair(6, COLOR_BLUE, COLOR_BLACK);
+    init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
+  }
 }
 
 /* ===================================================================== */
@@ -259,13 +257,11 @@ static inline int ph(int rows) { return rows * CELL_H; }
  *   direction (up).  Deterministic on every call, no oscillation.
  *   Symmetric dwell time like roundf but without the tie-breaking bug.
  */
-static inline int px_to_cell_x(float px)
-{
-    return (int)floorf(px / (float)CELL_W + 0.5f);
+static inline int px_to_cell_x(float px) {
+  return (int)floorf(px / (float)CELL_W + 0.5f);
 }
-static inline int px_to_cell_y(float py)
-{
-    return (int)floorf(py / (float)CELL_H + 0.5f);
+static inline int px_to_cell_y(float py) {
+  return (int)floorf(py / (float)CELL_H + 0.5f);
 }
 
 /* ===================================================================== */
@@ -282,14 +278,14 @@ static inline int px_to_cell_y(float py)
  * That is the only conversion. Physics never touches cell coordinates.
  */
 typedef struct {
-    float px, py;
-    float vx, vy;
-    int   color;
-    char  ch;
+  float px, py;
+  float vx, vy;
+  int color;
+  char ch;
 } Ball;
 
 static const char k_chars[] = "o*O@+";
-static const int  k_nchars  = (int)(sizeof k_chars - 1);
+static const int k_nchars = (int)(sizeof k_chars - 1);
 
 /*
  * ball_spawn() — place ball at random pixel position with random velocity.
@@ -298,38 +294,36 @@ static const int  k_nchars  = (int)(sizeof k_chars - 1);
  * equally — not just axis-aligned.  Speed is uniform in pixel space,
  * so a ball moving NE covers the same physical distance as one moving E.
  */
-static void ball_spawn(Ball *b, int i, int cols, int rows)
-{
-    int pxw = pw(cols);
-    int pxh = ph(rows);
+static void ball_spawn(Ball *b, int i, int cols, int rows) {
+  int pxw = pw(cols);
+  int pxh = ph(rows);
 
-    b->px = (float)(CELL_W + rand() % (pxw - 2 * CELL_W));
-    b->py = (float)(CELL_H + rand() % (pxh - 2 * CELL_H));
+  b->px = (float)(CELL_W + rand() % (pxw - 2 * CELL_W));
+  b->py = (float)(CELL_H + rand() % (pxh - 2 * CELL_H));
 
-    /*
-     * Random angle gives isotropic direction distribution.
-     * Without this, using separate random vx/vy produces more
-     * diagonal balls than axis-aligned ones (non-uniform angle dist).
-     *
-     * We avoid math.h by using a simple rejection-sample unit vector:
-     * pick random (dx, dy) in [-1,1]², keep if inside unit circle.
-     */
-    float dx, dy, len;
-    do {
-        dx = (float)(rand() % 2001 - 1000) / 1000.0f;
-        dy = (float)(rand() % 2001 - 1000) / 1000.0f;
-        len = dx*dx + dy*dy;
-    } while (len < 0.01f || len > 1.0f);
+  /*
+   * Random angle gives isotropic direction distribution.
+   * Without this, using separate random vx/vy produces more
+   * diagonal balls than axis-aligned ones (non-uniform angle dist).
+   *
+   * We avoid math.h by using a simple rejection-sample unit vector:
+   * pick random (dx, dy) in [-1,1]², keep if inside unit circle.
+   */
+  float dx, dy, len;
+  do {
+    dx = (float)(rand() % 2001 - 1000) / 1000.0f;
+    dy = (float)(rand() % 2001 - 1000) / 1000.0f;
+    len = dx * dx + dy * dy;
+  } while (len < 0.01f || len > 1.0f);
 
-    /* Normalise to unit vector then scale to random speed */
-    float mag   = sqrtf(len);
-    float speed = SPEED_MIN
-                + (float)(rand() % (int)(SPEED_MAX - SPEED_MIN + 1));
-    b->vx = (dx / mag) * speed;
-    b->vy = (dy / mag) * speed;
+  /* Normalise to unit vector then scale to random speed */
+  float mag = sqrtf(len);
+  float speed = SPEED_MIN + (float)(rand() % (int)(SPEED_MAX - SPEED_MIN + 1));
+  b->vx = (dx / mag) * speed;
+  b->vy = (dy / mag) * speed;
 
-    b->color = (i % N_COLORS) + 1;
-    b->ch    = k_chars[i % k_nchars];
+  b->color = (i % N_COLORS) + 1;
+  b->ch = k_chars[i % k_nchars];
 }
 
 /*
@@ -343,15 +337,26 @@ static void ball_spawn(Ball *b, int i, int cols, int rows)
  *   reflect:  if wall hit, flip the relevant velocity component
  *             and clamp position back inside the boundary
  */
-static void ball_tick(Ball *b, float dt, float max_px, float max_py)
-{
-    b->px += b->vx * dt;
-    b->py += b->vy * dt;
+static void ball_tick(Ball *b, float dt, float max_px, float max_py) {
+  b->px += b->vx * dt;
+  b->py += b->vy * dt;
 
-    if (b->px < 0.0f)     { b->px = 0.0f;    b->vx = -b->vx; }
-    if (b->px > max_px)   { b->px = max_px;   b->vx = -b->vx; }
-    if (b->py < 0.0f)     { b->py = 0.0f;     b->vy = -b->vy; }
-    if (b->py > max_py)   { b->py = max_py;   b->vy = -b->vy; }
+  if (b->px < 0.0f) {
+    b->px = 0.0f;
+    b->vx = -b->vx;
+  }
+  if (b->px > max_px) {
+    b->px = max_px;
+    b->vx = -b->vx;
+  }
+  if (b->py < 0.0f) {
+    b->py = 0.0f;
+    b->vy = -b->vy;
+  }
+  if (b->py > max_py) {
+    b->py = max_py;
+    b->vy = -b->vy;
+  }
 }
 
 /* ===================================================================== */
@@ -359,18 +364,17 @@ static void ball_tick(Ball *b, float dt, float max_px, float max_py)
 /* ===================================================================== */
 
 typedef struct {
-    Ball  balls[BALLS_MAX];
-    int   n;
-    bool  paused;
+  Ball balls[BALLS_MAX];
+  int n;
+  bool paused;
 } Scene;
 
-static void scene_init(Scene *s, int cols, int rows)
-{
-    memset(s, 0, sizeof *s);
-    s->n      = BALLS_DEFAULT;
-    s->paused = false;
-    for (int i = 0; i < s->n; i++)
-        ball_spawn(&s->balls[i], i, cols, rows);
+static void scene_init(Scene *s, int cols, int rows) {
+  memset(s, 0, sizeof *s);
+  s->n = BALLS_DEFAULT;
+  s->paused = false;
+  for (int i = 0; i < s->n; i++)
+    ball_spawn(&s->balls[i], i, cols, rows);
 }
 
 /*
@@ -387,15 +391,15 @@ static void scene_init(Scene *s, int cols, int rows)
  *       ↓  ball_tick()
  *   physics (position, velocity) — knows nothing about cells
  */
-static void scene_tick(Scene *s, float dt, int cols, int rows)
-{
-    if (s->paused) return;
+static void scene_tick(Scene *s, float dt, int cols, int rows) {
+  if (s->paused)
+    return;
 
-    float max_px = (float)(pw(cols) - 1);   /* pixel space right edge  */
-    float max_py = (float)(ph(rows) - 1);   /* pixel space bottom edge */
+  float max_px = (float)(pw(cols) - 1); /* pixel space right edge  */
+  float max_py = (float)(ph(rows) - 1); /* pixel space bottom edge */
 
-    for (int i = 0; i < s->n; i++)
-        ball_tick(&s->balls[i], dt, max_px, max_py);
+  for (int i = 0; i < s->n; i++)
+    ball_tick(&s->balls[i], dt, max_px, max_py);
 }
 
 /*
@@ -427,52 +431,58 @@ static void scene_tick(Scene *s, float dt, int cols, int rows)
  * Physics above never sees cell coordinates.
  * Drawing below never sees pixel coordinates.
  */
-static void scene_draw(const Scene *s, WINDOW *w,
-                       int cols, int rows,
-                       float alpha, float dt_sec)
-{
-    float max_px = (float)(pw(cols) - 1);
-    float max_py = (float)(ph(rows) - 1);
+static void scene_draw(const Scene *s, WINDOW *w, int cols, int rows,
+                       float alpha, float dt_sec) {
+  float max_px = (float)(pw(cols) - 1);
+  float max_py = (float)(ph(rows) - 1);
 
-    for (int i = 0; i < s->n; i++) {
-        const Ball *b = &s->balls[i];
+  for (int i = 0; i < s->n; i++) {
+    const Ball *b = &s->balls[i];
 
-        /*
-         * Interpolated draw position.
-         * Project the ball forward by (alpha * dt_sec) seconds from
-         * its last ticked position using its current velocity.
-         *
-         * alpha = sim_accum / tick_ns   (computed in the main loop)
-         *
-         * Example: sim runs at 60 Hz (tick every 16.67 ms).
-         *   Render fires 10 ms after last tick → alpha ≈ 0.60
-         *   A ball at px=100 with vx=300 px/s:
-         *     draw_px = 100 + 300 * 0.60 * (1/60) = 100 + 3.0 = 103
-         *   Without interpolation it would draw at 100 — 3 px behind.
-         *   At CELL_W=8, 3px = 0.375 cells of lag, visible as stutter.
-         */
-        float draw_px = b->px + b->vx * alpha * dt_sec;
-        float draw_py = b->py + b->vy * alpha * dt_sec;
+    /*
+     * Interpolated draw position.
+     * Project the ball forward by (alpha * dt_sec) seconds from
+     * its last ticked position using its current velocity.
+     *
+     * alpha = sim_accum / tick_ns   (computed in the main loop)
+     *
+     * Example: sim runs at 60 Hz (tick every 16.67 ms).
+     *   Render fires 10 ms after last tick → alpha ≈ 0.60
+     *   A ball at px=100 with vx=300 px/s:
+     *     draw_px = 100 + 300 * 0.60 * (1/60) = 100 + 3.0 = 103
+     *   Without interpolation it would draw at 100 — 3 px behind.
+     *   At CELL_W=8, 3px = 0.375 cells of lag, visible as stutter.
+     */
+    float draw_px = b->px + b->vx * alpha * dt_sec;
+    float draw_py = b->py + b->vy * alpha * dt_sec;
 
-        /* Clamp interpolated position to pixel boundary (safety net) */
-        if (draw_px < 0.0f)    draw_px = 0.0f;
-        if (draw_px > max_px)  draw_px = max_px;
-        if (draw_py < 0.0f)    draw_py = 0.0f;
-        if (draw_py > max_py)  draw_py = max_py;
+    /* Clamp interpolated position to pixel boundary (safety net) */
+    if (draw_px < 0.0f)
+      draw_px = 0.0f;
+    if (draw_px > max_px)
+      draw_px = max_px;
+    if (draw_py < 0.0f)
+      draw_py = 0.0f;
+    if (draw_py > max_py)
+      draw_py = max_py;
 
-        int cx = px_to_cell_x(draw_px);
-        int cy = px_to_cell_y(draw_py);
+    int cx = px_to_cell_x(draw_px);
+    int cy = px_to_cell_y(draw_py);
 
-        /* Clamp to visible cell area */
-        if (cx < 0) cx = 0;
-        if (cx >= cols) cx = cols - 1;
-        if (cy < 0) cy = 0;
-        if (cy >= rows) cy = rows - 1;
+    /* Clamp to visible cell area */
+    if (cx < 0)
+      cx = 0;
+    if (cx >= cols)
+      cx = cols - 1;
+    if (cy < 0)
+      cy = 0;
+    if (cy >= rows)
+      cy = rows - 1;
 
-        wattron(w, COLOR_PAIR(b->color) | A_BOLD);
-        mvwaddch(w, cy, cx, (chtype)(unsigned char)b->ch);
-        wattroff(w, COLOR_PAIR(b->color) | A_BOLD);
-    }
+    wattron(w, COLOR_PAIR(b->color) | A_BOLD);
+    mvwaddch(w, cy, cx, (chtype)(unsigned char)b->ch);
+    wattroff(w, COLOR_PAIR(b->color) | A_BOLD);
+  }
 }
 
 /* ===================================================================== */
@@ -514,34 +524,31 @@ static void scene_draw(const Scene *s, WINDOW *w,
  * No tear:     doupdate() is one atomic write to the terminal fd.
  */
 typedef struct {
-    int cols;
-    int rows;
+  int cols;
+  int rows;
 } Screen;
 
-static void screen_init(Screen *s)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);       /* never interrupt output to check for input    */
-    color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1); /* never interrupt output to check for input    */
+  color_init();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_free(Screen *s)
-{
-    (void)s;
-    endwin();
+static void screen_free(Screen *s) {
+  (void)s;
+  endwin();
 }
 
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();                           /* re-reads LINES and COLS      */
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh(); /* re-reads LINES and COLS      */
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
 /*
@@ -558,25 +565,23 @@ static void screen_resize(Screen *s)
  *
  * Nothing reaches the terminal until screen_present() is called.
  */
-static void screen_draw(Screen *s, const Scene *sc,
-                        double fps, int sim_fps,
-                        float alpha, float dt_sec)
-{
-    erase();
+static void screen_draw(Screen *s, const Scene *sc, double fps, int sim_fps,
+                        float alpha, float dt_sec) {
+  erase();
 
-    /* balls — drawn at interpolated positions */
-    scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
+  /* balls — drawn at interpolated positions */
+  scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
 
-    /* HUD — written directly into stdscr after balls */
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf,
-             "%5.1f fps  balls:%-2d  %s  spd:%d",
-             fps, sc->n, sc->paused ? "PAUSED " : "running", sim_fps);
-    int hud_x = s->cols - HUD_COLS;
-    if (hud_x < 0) hud_x = 0;
-    attron(COLOR_PAIR(3) | A_BOLD);
-    mvprintw(0, hud_x, "%s", buf);
-    attroff(COLOR_PAIR(3) | A_BOLD);
+  /* HUD — written directly into stdscr after balls */
+  char buf[HUD_COLS + 1];
+  snprintf(buf, sizeof buf, "%5.1f fps  balls:%-2d  %s  spd:%d", fps, sc->n,
+           sc->paused ? "PAUSED " : "running", sim_fps);
+  int hud_x = s->cols - HUD_COLS;
+  if (hud_x < 0)
+    hud_x = 0;
+  attron(COLOR_PAIR(3) | A_BOLD);
+  mvprintw(0, hud_x, "%s", buf);
+  attroff(COLOR_PAIR(3) | A_BOLD);
 }
 
 /*
@@ -585,10 +590,9 @@ static void screen_draw(Screen *s, const Scene *sc,
  * wnoutrefresh(stdscr) — copy stdscr into ncurses' newscr model
  * doupdate()           — diff newscr vs curscr, one write, update curscr
  */
-static void screen_present(void)
-{
-    wnoutrefresh(stdscr);
-    doupdate();
+static void screen_present(void) {
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
@@ -596,179 +600,192 @@ static void screen_present(void)
 /* ===================================================================== */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  int sim_fps;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
 static App g_app;
 
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
+static void on_exit_signal(int sig) {
+  (void)sig;
+  g_app.running = 0;
+}
+static void on_resize_signal(int sig) {
+  (void)sig;
+  g_app.need_resize = 1;
+}
+static void cleanup(void) { endwin(); }
 
-static void app_do_resize(App *app)
-{
-    screen_resize(&app->screen);
-    int cols = app->screen.cols;
-    int rows = app->screen.rows;
-    for (int i = 0; i < app->scene.n; i++) {
-        Ball *b = &app->scene.balls[i];
-        if (b->px >= (float)pw(cols)) b->px = (float)(pw(cols) - 1);
-        if (b->py >= (float)ph(rows)) b->py = (float)(ph(rows) - 1);
-    }
-    app->need_resize = 0;
+static void app_do_resize(App *app) {
+  screen_resize(&app->screen);
+  int cols = app->screen.cols;
+  int rows = app->screen.rows;
+  for (int i = 0; i < app->scene.n; i++) {
+    Ball *b = &app->scene.balls[i];
+    if (b->px >= (float)pw(cols))
+      b->px = (float)(pw(cols) - 1);
+    if (b->py >= (float)ph(rows))
+      b->py = (float)(ph(rows) - 1);
+  }
+  app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    int cols  = app->screen.cols;
-    int rows  = app->screen.rows;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  int cols = app->screen.cols;
+  int rows = app->screen.rows;
 
-    switch (ch) {
-    case 'q': case 'Q': case 27: return false;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-    case ' ':
-        s->paused = !s->paused;
-        break;
+  case ' ':
+    s->paused = !s->paused;
+    break;
 
-    case 'r': case 'R':
-        for (int i = 0; i < s->n; i++)
-            ball_spawn(&s->balls[i], i, cols, rows);
-        break;
+  case 'r':
+  case 'R':
+    for (int i = 0; i < s->n; i++)
+      ball_spawn(&s->balls[i], i, cols, rows);
+    break;
 
-    case '=': case '+':
-        if (s->n < BALLS_MAX) {
-            ball_spawn(&s->balls[s->n], s->n, cols, rows);
-            s->n++;
-        }
-        break;
-
-    case '-':
-        if (s->n > BALLS_MIN) s->n--;
-        break;
-
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
-
-    default: break;
+  case '=':
+  case '+':
+    if (s->n < BALLS_MAX) {
+      ball_spawn(&s->balls[s->n], s->n, cols, rows);
+      s->n++;
     }
-    return true;
+    break;
+
+  case '-':
+    if (s->n > BALLS_MIN)
+      s->n--;
+    break;
+
+  case ']':
+    app->sim_fps += SIM_FPS_STEP;
+    if (app->sim_fps > SIM_FPS_MAX)
+      app->sim_fps = SIM_FPS_MAX;
+    break;
+
+  case '[':
+    app->sim_fps -= SIM_FPS_STEP;
+    if (app->sim_fps < SIM_FPS_MIN)
+      app->sim_fps = SIM_FPS_MIN;
+    break;
+
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    srand((unsigned int)clock_ns());
+int main(void) {
+  srand((unsigned int)clock_ns());
 
-    atexit(cleanup);
-    signal(SIGINT,   on_exit_signal);
-    signal(SIGTERM,  on_exit_signal);
-    signal(SIGWINCH, on_resize_signal);
+  atexit(cleanup);
+  signal(SIGINT, on_exit_signal);
+  signal(SIGTERM, on_exit_signal);
+  signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+  App *app = &g_app;
+  app->running = 1;
+  app->sim_fps = SIM_FPS_DEFAULT;
 
-    screen_init(&app->screen);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+  screen_init(&app->screen);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+  int64_t frame_time = clock_ns();
+  int64_t sim_accum = 0;
+  int64_t fps_accum = 0;
+  int frame_count = 0;
+  double fps_display = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        /* ── resize ──────────────────────────────────────────────── */
-        if (app->need_resize) {
-            app_do_resize(app);
-            frame_time = clock_ns();
-            sim_accum  = 0;
-        }
-
-        /* ── dt ──────────────────────────────────────────────────── */
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
-
-        /* ── sim accumulator ─────────────────────────────────────── */
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec,
-                       app->screen.cols, app->screen.rows);
-            sim_accum -= tick_ns;
-        }
-
-        /*
-         * ── render interpolation alpha ────────────────────────────
-         *
-         * sim_accum is the leftover nanoseconds after draining all
-         * complete ticks — i.e. how far we are into the *next* tick
-         * that has not fired yet.
-         *
-         * alpha = sim_accum / tick_ns  ∈ [0.0, 1.0)
-         *
-         * alpha = 0.0 → render fires exactly on a tick boundary
-         *               draw position == physics position  (no change)
-         * alpha = 0.9 → render fires 90% of the way through the tick
-         *               draw position is projected 90% of a tick ahead
-         *
-         * Passed to screen_draw → scene_draw, which adds
-         *   ball.vx * alpha * dt_sec  to each ball's draw_px.
-         *
-         * When paused, alpha is still computed but ball velocities
-         * are non-zero — however scene_tick is skipped, so physics
-         * positions do not change, and the projected draw position
-         * creeps slightly.  This is imperceptible (< 1 cell drift
-         * over the pause duration) and correct behaviour —
-         * extrapolation from a frozen state converges to zero effect
-         * once alpha wraps around on the next tick boundary.
-         * If you want pixel-perfect freeze, zero alpha when paused:
-         *   float alpha = app->scene.paused ? 0.0f : ...
-         */
-        float alpha = (float)sim_accum / (float)tick_ns;
-
-        /* ── FPS counter ─────────────────────────────────────────── */
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        /* ── draw + present (one doupdate flush) ─────────────────── */
-        screen_draw(&app->screen, &app->scene,
-                    fps_display, app->sim_fps,
-                    alpha, dt_sec);
-        screen_present();
-
-        /* ── input ───────────────────────────────────────────────── */
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+    /* ── resize ──────────────────────────────────────────────── */
+    if (app->need_resize) {
+      app_do_resize(app);
+      frame_time = clock_ns();
+      sim_accum = 0;
     }
 
-    screen_free(&app->screen);
-    return 0;
+    /* ── dt ──────────────────────────────────────────────────── */
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > 100 * NS_PER_MS)
+      dt = 100 * NS_PER_MS;
+
+    /* ── sim accumulator ─────────────────────────────────────── */
+    int64_t tick_ns = TICK_NS(app->sim_fps);
+    float dt_sec = (float)tick_ns / (float)NS_PER_SEC;
+
+    sim_accum += dt;
+    while (sim_accum >= tick_ns) {
+      scene_tick(&app->scene, dt_sec, app->screen.cols, app->screen.rows);
+      sim_accum -= tick_ns;
+    }
+
+    /*
+     * ── render interpolation alpha ────────────────────────────
+     *
+     * sim_accum is the leftover nanoseconds after draining all
+     * complete ticks — i.e. how far we are into the *next* tick
+     * that has not fired yet.
+     *
+     * alpha = sim_accum / tick_ns  ∈ [0.0, 1.0)
+     *
+     * alpha = 0.0 → render fires exactly on a tick boundary
+     *               draw position == physics position  (no change)
+     * alpha = 0.9 → render fires 90% of the way through the tick
+     *               draw position is projected 90% of a tick ahead
+     *
+     * Passed to screen_draw → scene_draw, which adds
+     *   ball.vx * alpha * dt_sec  to each ball's draw_px.
+     *
+     * When paused, alpha is still computed but ball velocities
+     * are non-zero — however scene_tick is skipped, so physics
+     * positions do not change, and the projected draw position
+     * creeps slightly.  This is imperceptible (< 1 cell drift
+     * over the pause duration) and correct behaviour —
+     * extrapolation from a frozen state converges to zero effect
+     * once alpha wraps around on the next tick boundary.
+     * If you want pixel-perfect freeze, zero alpha when paused:
+     *   float alpha = app->scene.paused ? 0.0f : ...
+     */
+    float alpha = (float)sim_accum / (float)tick_ns;
+
+    /* ── FPS counter ─────────────────────────────────────────── */
+    frame_count++;
+    fps_accum += dt;
+    if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
+      fps_display =
+          (double)frame_count / ((double)fps_accum / (double)NS_PER_SEC);
+      frame_count = 0;
+      fps_accum = 0;
+    }
+
+    /* ── frame cap (sleep BEFORE render so I/O doesn't drift) ── */
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
+
+    /* ── draw + present (one doupdate flush) ─────────────────── */
+    screen_draw(&app->screen, &app->scene, fps_display, app->sim_fps, alpha,
+                dt_sec);
+    screen_present();
+
+    /* ── input ───────────────────────────────────────────────── */
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch))
+      app->running = 0;
+  }
+
+  screen_free(&app->screen);
+  return 0;
 }

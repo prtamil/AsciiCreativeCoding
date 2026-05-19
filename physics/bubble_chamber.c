@@ -59,13 +59,15 @@
  *                  introduces spiral drift errors), each step applies an exact
  *                  2D rotation matrix R(ω·dt) to the velocity vector.
  *                  This preserves the orbital radius exactly (no energy drift)
- *                  — a key advantage over naive force integration for circular motion.
+ *                  — a key advantage over naive force integration for circular
+ * motion.
  *
  * Physics        : Lorentz force in a uniform B-field perpendicular to the
  *                  screen [1]:
  *                    F = q · v × B  → angular velocity ω = (q/m) · B
  *                  The cyclotron (gyro) radius r = |v| / |ω| = m·|v| / (q·B).
- *                  Higher q/m → tighter curve (electrons), lower → gentle arc (protons).
+ *                  Higher q/m → tighter curve (electrons), lower → gentle arc
+ * (protons).
  *
  *                  Ionisation energy loss: |v| multiplied by (1−DRAG) each step
  *                  approximates the Bethe-Bloch slowing of a charged particle
@@ -84,11 +86,12 @@
  * Math           : Rotation matrix application:
  *                    v_x' = v_x · cos(ω) − v_y · sin(ω)
  *                    v_y' = v_x · sin(ω) + v_y · cos(ω)
- *                  Each particle stores a ring-buffer of TRAIL_LEN=300 positions;
- *                  the head index advances each step, overwriting the oldest.
+ *                  Each particle stores a ring-buffer of TRAIL_LEN=300
+ * positions; the head index advances each step, overwriting the oldest.
  *
  * Performance    : STEPS_PER_FRAME=4 sub-steps smooth the curvature at 30fps.
- *                  Cost: O(MAX_PARTICLES × TRAIL_LEN) drawing + O(MAX_PARTICLES) physics.
+ *                  Cost: O(MAX_PARTICLES × TRAIL_LEN) drawing +
+ * O(MAX_PARTICLES) physics.
  *
  * Rendering      : 10 brightness-safe theme palettes [5] — each maps the
  *                  five particle types to distinguishable colours within
@@ -141,54 +144,57 @@
 /* §1  config                                                             */
 /* ===================================================================== */
 
-#define MAX_PARTICLES   20
-#define TRAIL_LEN      300    /* ring-buffer length per particle            */
-#define N_TYPES          5
-#define N_THEMES        10    /* MATRIX..ECLIPSE (see g_themes in §3)       */
+#define MAX_PARTICLES 20
+#define TRAIL_LEN 300 /* ring-buffer length per particle            */
+#define N_TYPES 5
+#define N_THEMES 10 /* MATRIX..ECLIPSE (see g_themes in §3)       */
 
 /* HUD: canonical CLAUDE.md two-bar — top row right = live status,
  * bottom row left = action keys.  Particles draw between them. */
-#define HUD_TOP          1
-#define HUD_BOT          1
+#define HUD_TOP 1
+#define HUD_BOT 1
 
 /* magnetic field */
-#define B_INIT        1.0f    /* default field strength                     */
-#define B_MIN         0.1f
-#define B_MAX         4.0f
-#define B_STEP        0.1f
+#define B_INIT 1.0f /* default field strength                     */
+#define B_MIN 0.1f
+#define B_MAX 4.0f
+#define B_STEP 0.1f
 
 /* particle motion */
-#define V_SPAWN       2.2f    /* initial speed in cell/step; at STEPS_PER_FRAME=4,
-                                * electron (qm=0.20, B=1.0) cyclotron radius ≈ 11 cells */
-#define V_SPREAD      0.4f    /* ±40% speed variation for visual spread of radii        */
-#define DRAG          0.003f  /* 0.3% speed loss per step (ionisation); particle covers
-                                * ~1/0.003 ≈ 333 steps before halving — trails ~1000 px */
-#define SPEED_DEAD    0.22f   /* stop when radius < 1 cell (V/ω < 1); prevents
-                                * particles spinning invisibly in a single cell         */
+#define V_SPAWN                                                                \
+  2.2f /* initial speed in cell/step; at STEPS_PER_FRAME=4,                    \
+        * electron (qm=0.20, B=1.0) cyclotron radius ≈ 11 cells */
+#define V_SPREAD                                                               \
+  0.4f /* ±40% speed variation for visual spread of radii        */
+#define DRAG                                                                   \
+  0.003f /* 0.3% speed loss per step (ionisation); particle covers             \
+          * ~1/0.003 ≈ 333 steps before halving — trails ~1000 px */
+#define SPEED_DEAD                                                             \
+  0.22f /* stop when radius < 1 cell (V/ω < 1); prevents                      \
+         * particles spinning invisibly in a single cell         */
 
 /* spawn */
-#define BURST_MIN      2      /* particles per burst                        */
-#define BURST_MAX      5
+#define BURST_MIN 2 /* particles per burst                        */
+#define BURST_MAX 5
 
 /* timing */
-#define STEPS_PER_FRAME   4
-#define RENDER_NS  (1000000000LL / 30)
+#define STEPS_PER_FRAME 4
+#define RENDER_NS (1000000000LL / 30)
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-static long long clock_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static long long clock_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
-static void clock_sleep_ns(long long ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / 1000000000LL, ns % 1000000000LL };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(long long ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / 1000000000LL, ns % 1000000000LL};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -238,17 +244,15 @@ static void clock_sleep_ns(long long ns)
  *   Lepton / hadron taxonomy, real q/m values — Griffiths Elementary [2]
  */
 typedef struct {
-    const char *name;      /* full display name ("electron")          */
-    const char *symbol;    /* 2-char HUD label ("e-", "mu", "p ")     */
-    float       qm;        /* tuned charge/mass ratio (see table)     */
+  const char *name;   /* full display name ("electron")          */
+  const char *symbol; /* 2-char HUD label ("e-", "mu", "p ")     */
+  float qm;           /* tuned charge/mass ratio (see table)     */
 } PType;
 
 static const PType k_types[N_TYPES] = {
-    { "electron", "e-", -0.200f },
-    { "positron", "e+", +0.200f },
-    { "muon",     "mu", -0.070f },
-    { "pion",     "pi", +0.045f },
-    { "proton",   "p ", +0.022f },
+    {"electron", "e-", -0.200f}, {"positron", "e+", +0.200f},
+    {"muon", "mu", -0.070f},     {"pion", "pi", +0.045f},
+    {"proton", "p ", +0.022f},
 };
 
 /*
@@ -261,53 +265,51 @@ static const PType k_types[N_TYPES] = {
  * only used as the dimmest slot.  Forbidden 16-23 / 232-239 avoided.
  */
 typedef struct {
-    const char *name;
-    short       fg[N_TYPES];
+  const char *name;
+  short fg[N_TYPES];
 } Theme;
 
 static const Theme g_themes[N_THEMES] = {
     /*  name       e-   e+   mu   pi   p    */
-    { "Matrix",   {  46,  82, 118, 154, 226 } }, /* cyber green ramp + yellow */
-    { "Fire",     { 196, 226, 220, 208, 130 } }, /* white-hot to ember        */
-    { "Oceanic",  {  51,  87, 159, 195, 117 } }, /* cyans / light blues       */
-    { "Neon",     { 196,  51, 201, 226,  46 } }, /* high-sat neon mix         */
-    { "Mono",     { 255, 252, 248, 244, 240 } }, /* grayscale ramp            */
-    { "Ice",      { 195, 159, 153, 117,  87 } }, /* light blues to cyan       */
-    { "Nova",     { 231, 213, 177, 141, 105 } }, /* stellar white→violet      */
-    { "Forest",   { 190, 154, 100, 130,  64 } }, /* leaves to bark            */
-    { "Desert",   { 226, 220, 214, 178, 130 } }, /* sand / gold / brown       */
-    { "Eclipse",  { 196, 244, 240, 124,  88 } }, /* corona red + grays        */
+    {"Matrix", {46, 82, 118, 154, 226}},   /* cyber green ramp + yellow */
+    {"Fire", {196, 226, 220, 208, 130}},   /* white-hot to ember        */
+    {"Oceanic", {51, 87, 159, 195, 117}},  /* cyans / light blues       */
+    {"Neon", {196, 51, 201, 226, 46}},     /* high-sat neon mix         */
+    {"Mono", {255, 252, 248, 244, 240}},   /* grayscale ramp            */
+    {"Ice", {195, 159, 153, 117, 87}},     /* light blues to cyan       */
+    {"Nova", {231, 213, 177, 141, 105}},   /* stellar white→violet      */
+    {"Forest", {190, 154, 100, 130, 64}},  /* leaves to bark            */
+    {"Desert", {226, 220, 214, 178, 130}}, /* sand / gold / brown       */
+    {"Eclipse", {196, 244, 240, 124, 88}}, /* corona red + grays        */
 };
 
 /* 8-colour fallback — fixed mapping (themes can't add variety here). */
-static const short g_8fg[N_TYPES] = {
-    COLOR_BLUE, COLOR_RED, COLOR_GREEN, COLOR_YELLOW, COLOR_CYAN
-};
+static const short g_8fg[N_TYPES] = {COLOR_BLUE, COLOR_RED, COLOR_GREEN,
+                                     COLOR_YELLOW, COLOR_CYAN};
 
 /* Color pair layout: 1..N_TYPES are particle types, then HUD + HINT. */
-#define CP_HUD   (N_TYPES + 1)   /* top status — bright yellow + bold */
-#define CP_HINT  (N_TYPES + 2)   /* bottom hint bar — bright cyan + bold */
+#define CP_HUD (N_TYPES + 1)  /* top status — bright yellow + bold */
+#define CP_HINT (N_TYPES + 2) /* bottom hint bar — bright cyan + bold */
 
 static bool g_256color;
 
-static void color_init(int theme_idx)
-{
-    start_color();
-    use_default_colors();
-    g_256color = (COLORS >= 256);
+static void color_init(int theme_idx) {
+  start_color();
+  use_default_colors();
+  g_256color = (COLORS >= 256);
 
-    const Theme *t = &g_themes[theme_idx % N_THEMES];
-    for (int i = 0; i < N_TYPES; i++) {
-        short fg = g_256color ? t->fg[i] : g_8fg[i];
-        init_pair(1 + i, fg, -1);
-    }
-    if (g_256color) {
-        init_pair(CP_HUD,  226, -1);   /* bright yellow */
-        init_pair(CP_HINT,  51, -1);   /* bright cyan   */
-    } else {
-        init_pair(CP_HUD,  COLOR_YELLOW, -1);
-        init_pair(CP_HINT, COLOR_CYAN,   -1);
-    }
+  const Theme *t = &g_themes[theme_idx % N_THEMES];
+  for (int i = 0; i < N_TYPES; i++) {
+    short fg = g_256color ? t->fg[i] : g_8fg[i];
+    init_pair(1 + i, fg, -1);
+  }
+  if (g_256color) {
+    init_pair(CP_HUD, 226, -1); /* bright yellow */
+    init_pair(CP_HINT, 51, -1); /* bright cyan   */
+  } else {
+    init_pair(CP_HUD, COLOR_YELLOW, -1);
+    init_pair(CP_HINT, COLOR_CYAN, -1);
+  }
 }
 
 static inline int particle_cp(int kind) { return 1 + kind; }
@@ -361,19 +363,19 @@ static inline int particle_cp(int kind) { return 1 + kind; }
  *   Bubble-chamber track imaging  — Glaser 1952 [3]
  */
 typedef struct {
-    /* ── Phase-space state (advanced each step by particle_step) ─── */
-    float x,  y;            /* current position, cell-space floats     */
-    float vx, vy;           /* current velocity, cells per sim step    */
+  /* ── Phase-space state (advanced each step by particle_step) ─── */
+  float x, y;   /* current position, cell-space floats     */
+  float vx, vy; /* current velocity, cells per sim step    */
 
-    /* ── Identity / lifecycle ─────────────────────────────────────── */
-    int   kind;             /* index into k_types[] in §3              */
-    bool  alive;            /* false → slot recyclable by find_dead_slot */
+  /* ── Identity / lifecycle ─────────────────────────────────────── */
+  int kind;   /* index into k_types[] in §3              */
+  bool alive; /* false → slot recyclable by find_dead_slot */
 
-    /* ── Trail ring buffer (read newest-to-oldest by §6) ──────────── */
-    float tx[TRAIL_LEN];    /* recorded x-positions, oldest-overwritten */
-    float ty[TRAIL_LEN];    /* recorded y-positions                     */
-    int   thead;            /* next write index ∈ [0, TRAIL_LEN)        */
-    int   tlen;             /* valid sample count, saturates at TRAIL_LEN */
+  /* ── Trail ring buffer (read newest-to-oldest by §6) ──────────── */
+  float tx[TRAIL_LEN]; /* recorded x-positions, oldest-overwritten */
+  float ty[TRAIL_LEN]; /* recorded y-positions                     */
+  int thead;           /* next write index ∈ [0, TRAIL_LEN)        */
+  int tlen;            /* valid sample count, saturates at TRAIL_LEN */
 } Particle;
 
 /* ─────────────────────────────────────────────────────────────────────── *
@@ -416,27 +418,24 @@ typedef struct {
  *                        is the main loop's concern, not the renderer's.
  * ─────────────────────────────────────────────────────────────────────── */
 typedef struct {
-    /* ── Simulation parameters ────────────────────────────────────── */
-    Particle particles[MAX_PARTICLES];
-    float    B;             /* magnetic-field strength, signed.  Space
-                             * key flips the sign (reverses every curl).
-                             * Magnitude in [B_MIN, B_MAX]; b / B step it. */
-    bool     paused;        /* true → scene_step is a no-op (p key)       */
-    int      spawn_kind;    /* species index for new bursts:
-                             *   −1       = random
-                             *   0..N_TYPES−1 = fixed species.
-                             * Cycled by k / K keys.                       */
+  /* ── Simulation parameters ────────────────────────────────────── */
+  Particle particles[MAX_PARTICLES];
+  float B;        /* magnetic-field strength, signed.  Space
+                   * key flips the sign (reverses every curl).
+                   * Magnitude in [B_MIN, B_MAX]; b / B step it. */
+  bool paused;    /* true → scene_step is a no-op (p key)       */
+  int spawn_kind; /* species index for new bursts:
+                   *   −1       = random
+                   *   0..N_TYPES−1 = fixed species.
+                   * Cycled by k / K keys.                       */
 
-    /* ── Rendering parameters ─────────────────────────────────────── */
-    int      theme;         /* index into g_themes[] (§3); cycled by t/T.
-                             * Pure cosmetic — never alters physics.       */
+  /* ── Rendering parameters ─────────────────────────────────────── */
+  int theme; /* index into g_themes[] (§3); cycled by t/T.
+              * Pure cosmetic — never alters physics.       */
 } Scene;
 
 static Scene g_scene = {
-    .B          = B_INIT,
-    .paused     = false,
-    .spawn_kind = -1,
-    .theme      = 0,
+    .B = B_INIT, .paused = false, .spawn_kind = -1, .theme = 0,
     /* .particles[] is BSS-zeroed; respawn_centre_burst fills it. */
 };
 
@@ -465,13 +464,12 @@ static int g_rows, g_cols;
  * by O(ω²dt²) each step, this preserves |v| exactly — no energy drift,
  * perfect circular orbits in the absence of drag.
  */
-static void rotate_velocity_exact(Particle *p, float omega)
-{
-    float ca  = cosf(omega), sa = sinf(omega);
-    float nvx = p->vx * ca - p->vy * sa;
-    float nvy = p->vx * sa + p->vy * ca;
-    p->vx = nvx;
-    p->vy = nvy;
+static void rotate_velocity_exact(Particle *p, float omega) {
+  float ca = cosf(omega), sa = sinf(omega);
+  float nvx = p->vx * ca - p->vy * sa;
+  float nvy = p->vx * sa + p->vy * ca;
+  p->vx = nvx;
+  p->vy = nvy;
 }
 
 /*
@@ -484,10 +482,9 @@ static void rotate_velocity_exact(Particle *p, float omega)
  * the cyclotron radius r = |v|/|ω| shrinks, and the orbit spirals
  * inward — the classic bubble-chamber signature.
  */
-static void apply_ionisation_drag(Particle *p)
-{
-    p->vx *= (1.f - DRAG);
-    p->vy *= (1.f - DRAG);
+static void apply_ionisation_drag(Particle *p) {
+  p->vx *= (1.f - DRAG);
+  p->vy *= (1.f - DRAG);
 }
 
 /*
@@ -500,10 +497,9 @@ static void apply_ionisation_drag(Particle *p)
  * pair (rotate, drift) symplectic for constant ω.  Sub-cell precision
  * keeps the curl smooth at r ≈ 10–100 cells.
  */
-static void advance_position(Particle *p)
-{
-    p->x += p->vx;
-    p->y += p->vy;
+static void advance_position(Particle *p) {
+  p->x += p->vx;
+  p->y += p->vy;
 }
 
 /*
@@ -517,12 +513,12 @@ static void advance_position(Particle *p)
  * the trail therefore has a bounded maximum age, matching the visual
  * "ionisation fades" model.
  */
-static void record_trail_sample(Particle *p)
-{
-    p->tx[p->thead] = p->x;
-    p->ty[p->thead] = p->y;
-    p->thead = (p->thead + 1) % TRAIL_LEN;
-    if (p->tlen < TRAIL_LEN) p->tlen++;
+static void record_trail_sample(Particle *p) {
+  p->tx[p->thead] = p->x;
+  p->ty[p->thead] = p->y;
+  p->thead = (p->thead + 1) % TRAIL_LEN;
+  if (p->tlen < TRAIL_LEN)
+    p->tlen++;
 }
 
 /*
@@ -534,10 +530,9 @@ static void record_trail_sample(Particle *p)
  * single character cell.  Marking it dead lets find_dead_slot recycle
  * the slot for a fresh particle.
  */
-static int is_subgyro_dead(const Particle *p)
-{
-    float spd2 = p->vx * p->vx + p->vy * p->vy;
-    return spd2 < SPEED_DEAD * SPEED_DEAD;
+static int is_subgyro_dead(const Particle *p) {
+  float spd2 = p->vx * p->vx + p->vy * p->vy;
+  return spd2 < SPEED_DEAD * SPEED_DEAD;
 }
 
 /*
@@ -552,25 +547,25 @@ static int is_subgyro_dead(const Particle *p)
  *   record_trail_sample(p)          // ring-buffer push
  *   if is_subgyro_dead(p): p->alive ← false
  */
-static void particle_step(Particle *p)
-{
-    if (!p->alive) return;
+static void particle_step(Particle *p) {
+  if (!p->alive)
+    return;
 
-    float omega = k_types[p->kind].qm * g_scene.B;
-    rotate_velocity_exact(p, omega);
-    apply_ionisation_drag(p);
-    advance_position(p);
-    record_trail_sample(p);
-    if (is_subgyro_dead(p)) p->alive = false;
+  float omega = k_types[p->kind].qm * g_scene.B;
+  rotate_velocity_exact(p, omega);
+  apply_ionisation_drag(p);
+  advance_position(p);
+  record_trail_sample(p);
+  if (is_subgyro_dead(p))
+    p->alive = false;
 }
 
 /* ===================================================================== */
 /* §5  scene                                                              */
 /* ===================================================================== */
 
-static void scene_reset(void)
-{
-    memset(g_scene.particles, 0, sizeof g_scene.particles);
+static void scene_reset(void) {
+  memset(g_scene.particles, 0, sizeof g_scene.particles);
 }
 
 /*
@@ -579,47 +574,46 @@ static void scene_reset(void)
  * angle   : initial velocity direction (radians)
  * kind    : particle type (−1 = random)
  */
-static void init_particle(Particle *p, float cx, float cy,
-                           float angle, int kind)
-{
-    memset(p, 0, sizeof *p);
-    p->x    = cx;
-    p->y    = cy;
-    p->kind = (kind < 0) ? rand() % N_TYPES : kind;
+static void init_particle(Particle *p, float cx, float cy, float angle,
+                          int kind) {
+  memset(p, 0, sizeof *p);
+  p->x = cx;
+  p->y = cy;
+  p->kind = (kind < 0) ? rand() % N_TYPES : kind;
 
-    float speed = V_SPAWN * (1.f - V_SPREAD/2.f
-                  + V_SPREAD * ((float)rand() / (float)RAND_MAX));
-    p->vx   = cosf(angle) * speed;
-    p->vy   = sinf(angle) * speed;
-    p->alive  = true;
+  float speed = V_SPAWN * (1.f - V_SPREAD / 2.f +
+                           V_SPREAD * ((float)rand() / (float)RAND_MAX));
+  p->vx = cosf(angle) * speed;
+  p->vy = sinf(angle) * speed;
+  p->alive = true;
 }
 
 /*
  * find_dead_slot() — return index of first non-alive particle, or −1 if full.
  */
-static int find_dead_slot(void)
-{
-    for (int i = 0; i < MAX_PARTICLES; i++)
-        if (!g_scene.particles[i].alive) return i;
-    return -1;
+static int find_dead_slot(void) {
+  for (int i = 0; i < MAX_PARTICLES; i++)
+    if (!g_scene.particles[i].alive)
+      return i;
+  return -1;
 }
 
 /*
  * spawn_burst_centre() — n particles from screen centre, random directions.
  * Models a head-on collision vertex.
  */
-static void spawn_burst_centre(int n)
-{
-    float cx = (float)g_cols * 0.5f;
-    float cy = (float)(g_rows - HUD_TOP - HUD_BOT) * 0.5f;
-    int   k  = (g_scene.spawn_kind < 0) ? -1 : g_scene.spawn_kind;
+static void spawn_burst_centre(int n) {
+  float cx = (float)g_cols * 0.5f;
+  float cy = (float)(g_rows - HUD_TOP - HUD_BOT) * 0.5f;
+  int k = (g_scene.spawn_kind < 0) ? -1 : g_scene.spawn_kind;
 
-    for (int i = 0; i < n; i++) {
-        int slot = find_dead_slot();
-        if (slot < 0) break;
-        float angle = ((float)rand() / (float)RAND_MAX) * 2.f * 3.14159265f;
-        init_particle(&g_scene.particles[slot], cx, cy, angle, k);
-    }
+  for (int i = 0; i < n; i++) {
+    int slot = find_dead_slot();
+    if (slot < 0)
+      break;
+    float angle = ((float)rand() / (float)RAND_MAX) * 2.f * 3.14159265f;
+    init_particle(&g_scene.particles[slot], cx, cy, angle, k);
+  }
 }
 
 /*
@@ -635,16 +629,31 @@ static void spawn_burst_centre(int n)
  * Used by spawn_burst_edge to model a beam entering the chamber from
  * an arbitrary side.
  */
-static void edge_entry_geometry(int edge, float W, float H,
-                                float *cx, float *cy, float *base_angle)
-{
-    float u = (float)rand() / (float)RAND_MAX;
-    switch (edge) {
-    case 0:  *cx = W * u; *cy = 0;       *base_angle =  0.5f * 3.14159265f; break;
-    case 1:  *cx = W * u; *cy = H - 1;   *base_angle = -0.5f * 3.14159265f; break;
-    case 2:  *cx = 0;     *cy = H * u;   *base_angle =  0.0f;                break;
-    default: *cx = W - 1; *cy = H * u;   *base_angle =  3.14159265f;         break;
-    }
+static void edge_entry_geometry(int edge, float W, float H, float *cx,
+                                float *cy, float *base_angle) {
+  float u = (float)rand() / (float)RAND_MAX;
+  switch (edge) {
+  case 0:
+    *cx = W * u;
+    *cy = 0;
+    *base_angle = 0.5f * 3.14159265f;
+    break;
+  case 1:
+    *cx = W * u;
+    *cy = H - 1;
+    *base_angle = -0.5f * 3.14159265f;
+    break;
+  case 2:
+    *cx = 0;
+    *cy = H * u;
+    *base_angle = 0.0f;
+    break;
+  default:
+    *cx = W - 1;
+    *cy = H * u;
+    *base_angle = 3.14159265f;
+    break;
+  }
 }
 
 /*
@@ -655,10 +664,9 @@ static void edge_entry_geometry(int edge, float W, float H,
  * Models a beam with finite angular dispersion: every spawned particle
  * is launched inward along the edge normal plus a small random spread.
  */
-static float inward_velocity_angle(float base_angle, float half_spread)
-{
-    float u = (float)rand() / (float)RAND_MAX;
-    return base_angle + (u - 0.5f) * 2.0f * half_spread;
+static float inward_velocity_angle(float base_angle, float half_spread) {
+  float u = (float)rand() / (float)RAND_MAX;
+  return base_angle + (u - 0.5f) * 2.0f * half_spread;
 }
 
 /*
@@ -674,28 +682,27 @@ static float inward_velocity_angle(float base_angle, float half_spread)
  *       angle ← inward_velocity_angle(base_angle, ±30°)
  *       init_particle at (cx, cy) with angle and kind k
  */
-static void spawn_burst_edge(int n)
-{
-    int   edge = rand() % 4;   /* 0=top 1=bottom 2=left 3=right */
-    float W    = (float)g_cols;
-    float H    = (float)(g_rows - HUD_TOP - HUD_BOT);
+static void spawn_burst_edge(int n) {
+  int edge = rand() % 4; /* 0=top 1=bottom 2=left 3=right */
+  float W = (float)g_cols;
+  float H = (float)(g_rows - HUD_TOP - HUD_BOT);
 
-    float cx, cy, base_angle;
-    edge_entry_geometry(edge, W, H, &cx, &cy, &base_angle);
+  float cx, cy, base_angle;
+  edge_entry_geometry(edge, W, H, &cx, &cy, &base_angle);
 
-    int k = g_scene.spawn_kind;   /* −1 propagates to init_particle as random */
-    for (int i = 0; i < n; i++) {
-        int slot = find_dead_slot();
-        if (slot < 0) break;
-        float angle = inward_velocity_angle(base_angle, 0.5235988f); /* ±30° */
-        init_particle(&g_scene.particles[slot], cx, cy, angle, k);
-    }
+  int k = g_scene.spawn_kind; /* −1 propagates to init_particle as random */
+  for (int i = 0; i < n; i++) {
+    int slot = find_dead_slot();
+    if (slot < 0)
+      break;
+    float angle = inward_velocity_angle(base_angle, 0.5235988f); /* ±30° */
+    init_particle(&g_scene.particles[slot], cx, cy, angle, k);
+  }
 }
 
-static void scene_step(void)
-{
-    for (int i = 0; i < MAX_PARTICLES; i++)
-        particle_step(&g_scene.particles[i]);
+static void scene_step(void) {
+  for (int i = 0; i < MAX_PARTICLES; i++)
+    particle_step(&g_scene.particles[i]);
 }
 
 /*
@@ -706,19 +713,18 @@ static void scene_step(void)
  * particles rather than having to wait for the existing ones (which
  * already locked in their trail/cyclotron-radius before the change).
  */
-static void respawn_centre_burst(void)
-{
-    scene_reset();
-    int n = BURST_MIN + rand() % (BURST_MAX - BURST_MIN + 1);
-    spawn_burst_centre(n);
+static void respawn_centre_burst(void) {
+  scene_reset();
+  int n = BURST_MIN + rand() % (BURST_MAX - BURST_MIN + 1);
+  spawn_burst_centre(n);
 }
 
-static int alive_count(void)
-{
-    int n = 0;
-    for (int i = 0; i < MAX_PARTICLES; i++)
-        if (g_scene.particles[i].alive) n++;
-    return n;
+static int alive_count(void) {
+  int n = 0;
+  for (int i = 0; i < MAX_PARTICLES; i++)
+    if (g_scene.particles[i].alive)
+      n++;
+  return n;
 }
 
 /* ===================================================================== */
@@ -745,13 +751,20 @@ static int alive_count(void)
  * available ASCII density and bold flag — coarse but readable on a
  * low-resolution terminal.
  */
-static int trail_age_glyph(float age, chtype *ch, attr_t *extra_attr)
-{
-    if (age >= 0.80f) return 0;
-    if      (age < 0.25f) { *ch = '*'; *extra_attr = A_BOLD;   }
-    else if (age < 0.55f) { *ch = '+'; *extra_attr = A_NORMAL; }
-    else                  { *ch = '.'; *extra_attr = A_NORMAL; }
-    return 1;
+static int trail_age_glyph(float age, chtype *ch, attr_t *extra_attr) {
+  if (age >= 0.80f)
+    return 0;
+  if (age < 0.25f) {
+    *ch = '*';
+    *extra_attr = A_BOLD;
+  } else if (age < 0.55f) {
+    *ch = '+';
+    *extra_attr = A_NORMAL;
+  } else {
+    *ch = '.';
+    *extra_attr = A_NORMAL;
+  }
+  return 1;
 }
 
 /*
@@ -766,12 +779,11 @@ static int trail_age_glyph(float age, chtype *ch, attr_t *extra_attr)
  * area (caller skips).
  */
 static int trail_sample_to_screen(const Particle *p, int i, int draw_rows,
-                                  int *col, int *row)
-{
-    int idx = (p->thead - 1 - i + TRAIL_LEN * 2) % TRAIL_LEN;
-    *col = (int)(p->tx[idx] + 0.5f);
-    *row = (int)(p->ty[idx] + 0.5f) + HUD_TOP;
-    return *col >= 0 && *col < g_cols && *row >= HUD_TOP && *row < draw_rows;
+                                  int *col, int *row) {
+  int idx = (p->thead - 1 - i + TRAIL_LEN * 2) % TRAIL_LEN;
+  *col = (int)(p->tx[idx] + 0.5f);
+  *row = (int)(p->ty[idx] + 0.5f) + HUD_TOP;
+  return *col >= 0 && *col < g_cols && *row >= HUD_TOP && *row < draw_rows;
 }
 
 /*
@@ -780,23 +792,24 @@ static int trail_sample_to_screen(const Particle *p, int i, int draw_rows,
  * as soon as trail_age_glyph rejects an age (samples are sorted by
  * age, so all remaining ones are older).
  */
-static void paint_trail_history(const Particle *p, int draw_rows, int cp)
-{
-    int denom = p->tlen > 1 ? p->tlen : 1;
-    for (int i = 0; i < p->tlen; i++) {
-        chtype ch;
-        attr_t extra;
-        float  age = (float)i / (float)denom;
-        if (!trail_age_glyph(age, &ch, &extra)) break;
+static void paint_trail_history(const Particle *p, int draw_rows, int cp) {
+  int denom = p->tlen > 1 ? p->tlen : 1;
+  for (int i = 0; i < p->tlen; i++) {
+    chtype ch;
+    attr_t extra;
+    float age = (float)i / (float)denom;
+    if (!trail_age_glyph(age, &ch, &extra))
+      break;
 
-        int col, row;
-        if (!trail_sample_to_screen(p, i, draw_rows, &col, &row)) continue;
+    int col, row;
+    if (!trail_sample_to_screen(p, i, draw_rows, &col, &row))
+      continue;
 
-        attr_t attr = (attr_t)COLOR_PAIR(cp) | extra;
-        attron(attr);
-        mvaddch(row, col, ch);
-        attroff(attr);
-    }
+    attr_t attr = (attr_t)COLOR_PAIR(cp) | extra;
+    attron(attr);
+    mvaddch(row, col, ch);
+    attroff(attr);
+  }
 }
 
 /*
@@ -804,14 +817,14 @@ static void paint_trail_history(const Particle *p, int draw_rows, int cp)
  * current sub-cell position (snapped to nearest cell), one cell ahead
  * of the freshest trail sample.
  */
-static void paint_live_head(const Particle *p, int draw_rows, int cp)
-{
-    int col = (int)(p->x + 0.5f);
-    int row = (int)(p->y + 0.5f) + HUD_TOP;
-    if (col < 0 || col >= g_cols || row < HUD_TOP || row >= draw_rows) return;
-    attron(COLOR_PAIR(cp) | A_BOLD);
-    mvaddch(row, col, 'O');
-    attroff(COLOR_PAIR(cp) | A_BOLD);
+static void paint_live_head(const Particle *p, int draw_rows, int cp) {
+  int col = (int)(p->x + 0.5f);
+  int row = (int)(p->y + 0.5f) + HUD_TOP;
+  if (col < 0 || col >= g_cols || row < HUD_TOP || row >= draw_rows)
+    return;
+  attron(COLOR_PAIR(cp) | A_BOLD);
+  mvaddch(row, col, 'O');
+  attroff(COLOR_PAIR(cp) | A_BOLD);
 }
 
 /*
@@ -823,13 +836,14 @@ static void paint_live_head(const Particle *p, int draw_rows, int cp)
  *   paint_trail_history(p, draw_rows, cp)
  *   if alive: paint_live_head(p, draw_rows, cp)
  */
-static void draw_particle(const Particle *p, int draw_rows)
-{
-    if (!p->alive && p->tlen == 0) return;
+static void draw_particle(const Particle *p, int draw_rows) {
+  if (!p->alive && p->tlen == 0)
+    return;
 
-    int cp = particle_cp(p->kind);
-    paint_trail_history(p, draw_rows, cp);
-    if (p->alive) paint_live_head(p, draw_rows, cp);
+  int cp = particle_cp(p->kind);
+  paint_trail_history(p, draw_rows, cp);
+  if (p->alive)
+    paint_live_head(p, draw_rows, cp);
 }
 
 /*
@@ -850,32 +864,27 @@ static void draw_particle(const Particle *p, int draw_rows)
 /*
  * format_hud_status_prefix — left segment: field, alive count, "spawn=".
  */
-static void format_hud_status_prefix(char *buf, size_t n)
-{
-    snprintf(buf, n, " B=%.2f%s  alive=%d/%d  spawn=",
-             (double)fabsf(g_scene.B), g_scene.B < 0 ? "(flipped)" : "",
-             alive_count(), MAX_PARTICLES);
+static void format_hud_status_prefix(char *buf, size_t n) {
+  snprintf(buf, n, " B=%.2f%s  alive=%d/%d  spawn=", (double)fabsf(g_scene.B),
+           g_scene.B < 0 ? "(flipped)" : "", alive_count(), MAX_PARTICLES);
 }
 
 /*
  * format_hud_spawn_tag — middle segment: "[rand]" or "[sym]".
  */
-static void format_hud_spawn_tag(char *buf, size_t n)
-{
-    if (g_scene.spawn_kind < 0)
-        snprintf(buf, n, "[rand]");
-    else
-        snprintf(buf, n, "[%s]", k_types[g_scene.spawn_kind].symbol);
+static void format_hud_spawn_tag(char *buf, size_t n) {
+  if (g_scene.spawn_kind < 0)
+    snprintf(buf, n, "[rand]");
+  else
+    snprintf(buf, n, "[%s]", k_types[g_scene.spawn_kind].symbol);
 }
 
 /*
  * format_hud_status_suffix — right segment: theme + pause/run state.
  */
-static void format_hud_status_suffix(char *buf, size_t n)
-{
-    snprintf(buf, n, "  theme:%s  %s ",
-             g_themes[g_scene.theme % N_THEMES].name,
-             g_scene.paused ? "PAUSED" : "running");
+static void format_hud_status_suffix(char *buf, size_t n) {
+  snprintf(buf, n, "  theme:%s  %s ", g_themes[g_scene.theme % N_THEMES].name,
+           g_scene.paused ? "PAUSED" : "running");
 }
 
 /*
@@ -887,18 +896,17 @@ static void format_hud_status_suffix(char *buf, size_t n)
  * after continue to read as a single yellow line.  Random-species
  * spawns (spawn_kind = −1) fall through to plain HUD styling.
  */
-static void paint_spawn_tag_with_particle_colour(const char *tag)
-{
-    if (g_scene.spawn_kind < 0) {
-        addstr(tag);
-        return;
-    }
-    int cp = particle_cp(g_scene.spawn_kind);
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
-    attron(COLOR_PAIR(cp) | A_BOLD);
+static void paint_spawn_tag_with_particle_colour(const char *tag) {
+  if (g_scene.spawn_kind < 0) {
     addstr(tag);
-    attroff(COLOR_PAIR(cp) | A_BOLD);
-    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+    return;
+  }
+  int cp = particle_cp(g_scene.spawn_kind);
+  attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+  attron(COLOR_PAIR(cp) | A_BOLD);
+  addstr(tag);
+  attroff(COLOR_PAIR(cp) | A_BOLD);
+  attron(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
 /*
@@ -914,170 +922,193 @@ static void paint_spawn_tag_with_particle_colour(const char *tag)
  *     write suffix
  *   attroff
  */
-static void draw_hud_top(void)
-{
-    char before[80], spawn_tag[16], after[64];
-    format_hud_status_prefix(before, sizeof before);
-    format_hud_spawn_tag    (spawn_tag, sizeof spawn_tag);
-    format_hud_status_suffix(after, sizeof after);
+static void draw_hud_top(void) {
+  char before[80], spawn_tag[16], after[64];
+  format_hud_status_prefix(before, sizeof before);
+  format_hud_spawn_tag(spawn_tag, sizeof spawn_tag);
+  format_hud_status_suffix(after, sizeof after);
 
-    int total = (int)(strlen(before) + strlen(spawn_tag) + strlen(after));
-    int col   = g_cols - total;
-    if (col < 0) col = 0;
+  int total = (int)(strlen(before) + strlen(spawn_tag) + strlen(after));
+  int col = g_cols - total;
+  if (col < 0)
+    col = 0;
 
-    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvaddstr(0, col, before);
-    paint_spawn_tag_with_particle_colour(spawn_tag);
+  attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+  mvaddstr(0, col, before);
+  paint_spawn_tag_with_particle_colour(spawn_tag);
 
-    addstr(after);
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+  addstr(after);
+  attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 }
 
 /*
- * draw_hud_bottom — row rows-1 left-aligned action keys (CP_HINT bright cyan + bold).
- * Short fallback fires when the terminal is too narrow for the full list.
+ * draw_hud_bottom — row rows-1 left-aligned action keys (CP_HINT bright cyan +
+ * bold). Short fallback fires when the terminal is too narrow for the full
+ * list.
  */
-static void draw_hud_bottom(void)
-{
-    const char *hint_full =
-        " q:quit  p:pause  r:reset  n:burst-centre  e:burst-edge  "
-        "b/B:field  spc:flip  k/K:type  t/T:theme ";
-    const char *hint_short =
-        " q:quit  p:pause  r:reset  n:burst  k:type  t:theme ";
-    const char *hint = hint_full;
-    if ((int)strlen(hint_full) >= g_cols - 1) hint = hint_short;
+static void draw_hud_bottom(void) {
+  const char *hint_full =
+      " q:quit  p:pause  r:reset  n:burst-centre  e:burst-edge  "
+      "b/B:field  spc:flip  k/K:type  t/T:theme ";
+  const char *hint_short =
+      " q:quit  p:pause  r:reset  n:burst  k:type  t:theme ";
+  const char *hint = hint_full;
+  if ((int)strlen(hint_full) >= g_cols - 1)
+    hint = hint_short;
 
-    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
-    mvaddnstr(g_rows - 1, 0, hint, g_cols);
-    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
+  attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+  mvaddnstr(g_rows - 1, 0, hint, g_cols);
+  attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
-static void scene_draw(void)
-{
-    /* Particle draw area: between top status (row 0) and bottom hint
-     * (row rows-1).  draw_rows is the exclusive upper bound. */
-    int draw_rows = g_rows - HUD_BOT;
+static void scene_draw(void) {
+  /* Particle draw area: between top status (row 0) and bottom hint
+   * (row rows-1).  draw_rows is the exclusive upper bound. */
+  int draw_rows = g_rows - HUD_BOT;
 
-    for (int i = 0; i < MAX_PARTICLES; i++)
-        draw_particle(&g_scene.particles[i], draw_rows);
+  for (int i = 0; i < MAX_PARTICLES; i++)
+    draw_particle(&g_scene.particles[i], draw_rows);
 
-    draw_hud_top();
-    draw_hud_bottom();
+  draw_hud_top();
+  draw_hud_bottom();
 }
 
 /* ===================================================================== */
 /* §7  app                                                                */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_quit   = 0;
+static volatile sig_atomic_t g_quit = 0;
 static volatile sig_atomic_t g_resize = 0;
 
-static void sig_h(int s)
-{
-    if (s == SIGINT || s == SIGTERM) g_quit   = 1;
-    if (s == SIGWINCH)               g_resize = 1;
+static void sig_h(int s) {
+  if (s == SIGINT || s == SIGTERM)
+    g_quit = 1;
+  if (s == SIGWINCH)
+    g_resize = 1;
 }
 
 static void cleanup(void) { endwin(); }
 
-int main(void)
-{
-    srand((unsigned)time(NULL));
-    atexit(cleanup);
-    signal(SIGINT, sig_h); signal(SIGTERM, sig_h); signal(SIGWINCH, sig_h);
+int main(void) {
+  srand((unsigned)time(NULL));
+  atexit(cleanup);
+  signal(SIGINT, sig_h);
+  signal(SIGTERM, sig_h);
+  signal(SIGWINCH, sig_h);
 
-    initscr(); cbreak(); noecho();
-    keypad(stdscr, TRUE); nodelay(stdscr, TRUE);
-    curs_set(0); typeahead(-1);
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
 
-    /* Theme defaults to g_scene.theme = 0 (Matrix) from the Scene initializer. */
-    color_init(g_scene.theme);
+  /* Theme defaults to g_scene.theme = 0 (Matrix) from the Scene initializer. */
+  color_init(g_scene.theme);
 
-    getmaxyx(stdscr, g_rows, g_cols);
-    /* initial event: mixed burst from centre */
-    respawn_centre_burst();
+  getmaxyx(stdscr, g_rows, g_cols);
+  /* initial event: mixed burst from centre */
+  respawn_centre_burst();
 
-    long long next_frame = clock_ns();
+  long long next_frame = clock_ns();
 
-    while (!g_quit) {
+  while (!g_quit) {
 
-        if (g_resize) {
-            g_resize = 0;
-            endwin(); refresh();
-            getmaxyx(stdscr, g_rows, g_cols);
-        }
-
-        int ch = getch();
-        switch (ch) {
-        case 'q': case 'Q': case 27: g_quit = 1; break;
-        case 'p': case 'P': g_scene.paused = !g_scene.paused; break;
-
-        case 'r': case 'R':
-            respawn_centre_burst();
-            break;
-
-        case 'n': case 'N': {
-            int n = BURST_MIN + rand() % (BURST_MAX - BURST_MIN + 1);
-            spawn_burst_centre(n);
-            break;
-        }
-        case 'e': case 'E': {
-            int n = BURST_MIN + rand() % (BURST_MAX - BURST_MIN + 1);
-            spawn_burst_edge(n);
-            break;
-        }
-
-        /* Parameter-change keys auto-respawn so the new value is
-         * visible on fresh particles, not just baked into the next
-         * tick of the existing slow / dying ones. */
-        case 'b':
-            g_scene.B += B_STEP; if (g_scene.B > B_MAX) g_scene.B = B_MAX;
-            respawn_centre_burst();
-            break;
-        case 'B':
-            g_scene.B -= B_STEP; if (fabsf(g_scene.B) < B_MIN) g_scene.B = (g_scene.B < 0) ? -B_MIN : B_MIN;
-            respawn_centre_burst();
-            break;
-
-        case ' ':
-            g_scene.B = -g_scene.B;   /* flip field direction — reverses all curls */
-            respawn_centre_burst();
-            break;
-
-        case 'k':
-            /* cycle spawn-kind forward: rand → e- → e+ → mu → pi → p → rand */
-            g_scene.spawn_kind = (g_scene.spawn_kind + 1 + 1) % (N_TYPES + 1) - 1;
-            respawn_centre_burst();
-            break;
-        case 'K':
-            g_scene.spawn_kind = (g_scene.spawn_kind + N_TYPES + 1) % (N_TYPES + 1) - 1;
-            respawn_centre_burst();
-            break;
-
-        case 't':
-            g_scene.theme = (g_scene.theme + 1) % N_THEMES;
-            color_init(g_scene.theme);
-            break;
-        case 'T':
-            g_scene.theme = (g_scene.theme + N_THEMES - 1) % N_THEMES;
-            color_init(g_scene.theme);
-            break;
-
-        default: break;
-        }
-
-        long long now = clock_ns();
-        if (!g_scene.paused && now >= next_frame) {
-            for (int s = 0; s < STEPS_PER_FRAME; s++)
-                scene_step();
-            next_frame = now + RENDER_NS;
-        }
-
-        erase();
-        scene_draw();
-        wnoutrefresh(stdscr);
-        doupdate();
-        clock_sleep_ns(next_frame - clock_ns());
+    if (g_resize) {
+      g_resize = 0;
+      endwin();
+      refresh();
+      getmaxyx(stdscr, g_rows, g_cols);
     }
-    return 0;
+
+    int ch = getch();
+    switch (ch) {
+    case 'q':
+    case 'Q':
+    case 27:
+      g_quit = 1;
+      break;
+    case 'p':
+    case 'P':
+      g_scene.paused = !g_scene.paused;
+      break;
+
+    case 'r':
+    case 'R':
+      respawn_centre_burst();
+      break;
+
+    case 'n':
+    case 'N': {
+      int n = BURST_MIN + rand() % (BURST_MAX - BURST_MIN + 1);
+      spawn_burst_centre(n);
+      break;
+    }
+    case 'e':
+    case 'E': {
+      int n = BURST_MIN + rand() % (BURST_MAX - BURST_MIN + 1);
+      spawn_burst_edge(n);
+      break;
+    }
+
+    /* Parameter-change keys auto-respawn so the new value is
+     * visible on fresh particles, not just baked into the next
+     * tick of the existing slow / dying ones. */
+    case 'b':
+      g_scene.B += B_STEP;
+      if (g_scene.B > B_MAX)
+        g_scene.B = B_MAX;
+      respawn_centre_burst();
+      break;
+    case 'B':
+      g_scene.B -= B_STEP;
+      if (fabsf(g_scene.B) < B_MIN)
+        g_scene.B = (g_scene.B < 0) ? -B_MIN : B_MIN;
+      respawn_centre_burst();
+      break;
+
+    case ' ':
+      g_scene.B = -g_scene.B; /* flip field direction — reverses all curls */
+      respawn_centre_burst();
+      break;
+
+    case 'k':
+      /* cycle spawn-kind forward: rand → e- → e+ → mu → pi → p → rand */
+      g_scene.spawn_kind = (g_scene.spawn_kind + 1 + 1) % (N_TYPES + 1) - 1;
+      respawn_centre_burst();
+      break;
+    case 'K':
+      g_scene.spawn_kind =
+          (g_scene.spawn_kind + N_TYPES + 1) % (N_TYPES + 1) - 1;
+      respawn_centre_burst();
+      break;
+
+    case 't':
+      g_scene.theme = (g_scene.theme + 1) % N_THEMES;
+      color_init(g_scene.theme);
+      break;
+    case 'T':
+      g_scene.theme = (g_scene.theme + N_THEMES - 1) % N_THEMES;
+      color_init(g_scene.theme);
+      break;
+
+    default:
+      break;
+    }
+
+    long long now = clock_ns();
+    if (!g_scene.paused && now >= next_frame) {
+      for (int s = 0; s < STEPS_PER_FRAME; s++)
+        scene_step();
+      next_frame = now + RENDER_NS;
+    }
+
+    erase();
+    scene_draw();
+    wnoutrefresh(stdscr);
+    doupdate();
+    clock_sleep_ns(next_frame - clock_ns());
+  }
+  return 0;
 }

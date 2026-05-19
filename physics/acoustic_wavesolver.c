@@ -213,9 +213,9 @@
  *   effect on ring spacing and speed without jumping past the stable range.
  */
 #define WAVE_C_DEFAULT 0.35f
-#define WAVE_C_MIN     0.10f
-#define WAVE_C_MAX     0.70f
-#define WAVE_C_STEP    0.05f
+#define WAVE_C_MIN 0.10f
+#define WAVE_C_MAX 0.70f
+#define WAVE_C_STEP 0.05f
 
 /*
  * ── Terminal cell aspect ratio correction ────────────────────────────
@@ -349,8 +349,8 @@
  *   simpler to implement and sufficient for visual purposes; it leaves
  *   a small residual reflection for waves hitting at grazing angles.
  */
-#define SPONGE_WIDTH 8     /* cells from each wall */
-#define SPONGE_DAMP  0.10f /* max damping coefficient at wall */
+#define SPONGE_WIDTH 8    /* cells from each wall */
+#define SPONGE_DAMP 0.10f /* max damping coefficient at wall */
 
 /*
  * ── Source positions and frequency multipliers ───────────────────────
@@ -379,50 +379,51 @@
  *   The irrational-ish ratios prevent the field from locking into a
  *   perfectly repeating pattern, keeping the display lively.
  */
-static const float SRC_NX[MAX_SOURCES] = { 0.25f, 0.75f, 0.50f, 0.25f };
-static const float SRC_NY[MAX_SOURCES] = { 0.50f, 0.50f, 0.25f, 0.75f };
+static const float SRC_NX[MAX_SOURCES] = {0.25f, 0.75f, 0.50f, 0.25f};
+static const float SRC_NY[MAX_SOURCES] = {0.50f, 0.50f, 0.25f, 0.75f};
 /* Frequency multipliers relative to base_freq (set in wave_init) */
-static const float SRC_FMUL[MAX_SOURCES] = { 1.00f, 1.33f, 0.75f, 1.60f };
+static const float SRC_FMUL[MAX_SOURCES] = {1.00f, 1.33f, 0.75f, 1.60f};
 
 /* Boundary mode */
 #define BC_REFLECT 0
-#define BC_ABSORB  1
+#define BC_ABSORB 1
 
 /* Visualization modes */
-#define VIS_PRESSURE  0
+#define VIS_PRESSURE 0
 #define VIS_INTENSITY 1
 #define VIS_WAVEFRONT 2
-#define VIS_COUNT     3
+#define VIS_COUNT 3
 
 /* Color pair IDs */
-#define CP_PN2   1 /* pressure: strong negative (deep blue)   */
-#define CP_PN1   2
-#define CP_PN0   3
+#define CP_PN2 1 /* pressure: strong negative (deep blue)   */
+#define CP_PN1 2
+#define CP_PN0 3
 #define CP_PZERO 4 /* near zero (dim grey)                    */
-#define CP_PP0   5
-#define CP_PP1   6
-#define CP_PP2   7 /* pressure: strong positive (deep red)    */
-#define CP_INT0  8 /* intensity: darkest                      */
-#define CP_INT1  9
-#define CP_INT2  10
-#define CP_INT3  11
-#define CP_INT4  12
-#define CP_INT5  13
-#define CP_INT6  14
-#define CP_INT7  15 /* intensity: brightest                    */
-#define CP_WF0   16 /* wavefront band 0 (lowest)               */
-#define CP_WF1   17 /* wavefront band 1                        */
-#define CP_WF2   18 /* wavefront band 2                        */
-#define CP_WF3   19 /* wavefront band 3                        */
-#define CP_WF4   20 /* wavefront band 4                        */
-#define CP_WF5   21 /* wavefront band 5 (highest)              */
-#define CP_SRC   22 /* source marker (yellow)                  */
-#define CP_HUD   23 /* top HUD status bar (bright yellow)      */
-#define CP_HINT  24 /* bottom hint bar (bright cyan)           */
+#define CP_PP0 5
+#define CP_PP1 6
+#define CP_PP2 7  /* pressure: strong positive (deep red)    */
+#define CP_INT0 8 /* intensity: darkest                      */
+#define CP_INT1 9
+#define CP_INT2 10
+#define CP_INT3 11
+#define CP_INT4 12
+#define CP_INT5 13
+#define CP_INT6 14
+#define CP_INT7 15 /* intensity: brightest                    */
+#define CP_WF0 16  /* wavefront band 0 (lowest)               */
+#define CP_WF1 17  /* wavefront band 1                        */
+#define CP_WF2 18  /* wavefront band 2                        */
+#define CP_WF3 19  /* wavefront band 3                        */
+#define CP_WF4 20  /* wavefront band 4                        */
+#define CP_WF5 21  /* wavefront band 5 (highest)              */
+#define CP_SRC 22  /* source marker (yellow)                  */
+#define CP_HUD 23  /* top HUD status bar (bright yellow)      */
+#define CP_HINT 24 /* bottom hint bar (bright cyan)           */
 
-static const char  DENS_CHARS[8]        = { ' ', '.', ':', '+', 'x', 'X', '#', '@' };
-static const char *VIS_NAMES[VIS_COUNT] = { "PRESSURE", "INTENSITY", "WAVEFRONT" };
-static const char *BC_NAMES[2]          = { "REFLECTING", "ABSORBING " };
+static const char DENS_CHARS[8] = {' ', '.', ':', '+', 'x', 'X', '#', '@'};
+static const char *VIS_NAMES[VIS_COUNT] = {"PRESSURE", "INTENSITY",
+                                           "WAVEFRONT"};
+static const char *BC_NAMES[2] = {"REFLECTING", "ABSORBING "};
 
 /*
  * Theme palette — recolors the field renderers without touching physics.
@@ -441,66 +442,65 @@ static const char *BC_NAMES[2]          = { "REFLECTING", "ABSORBING " };
  * lowest tier" ranges so nothing turns invisible against black bg.
  */
 typedef struct {
-    const char *name;
-    short       pressure[7];
-    short       intensity[8];
-    short       wavefront[6]; /* 6 distinct bands (lowest -> highest) */
+  const char *name;
+  short pressure[7];
+  short intensity[8];
+  short wavefront[6]; /* 6 distinct bands (lowest -> highest) */
 } Theme;
 
 static const Theme THEMES[] = {
-    { "AURORA",
-     { 33, 39, 117, 240, 217, 203, 196 },
-     { 24, 28, 34, 70, 76, 118, 154, 231 },
-     { 240, 31, 39, 51, 117, 159 }    },
-    { "MATRIX",
-     { 28, 34, 70, 240, 70, 118, 154 },
-     { 24, 28, 34, 40, 76, 118, 154, 231 },
-     { 240, 34, 70, 76, 118, 154 }    },
-    { "FIRE",
-     { 130, 166, 215, 240, 215, 202, 196 },
-     { 52, 88, 124, 160, 196, 202, 214, 231 },
-     { 240, 88, 124, 160, 196, 214 }  },
-    { "OCEAN",
-     { 24, 31, 87, 240, 117, 45, 51 },
-     { 24, 31, 38, 45, 51, 87, 159, 231 },
-     { 240, 31, 38, 45, 51, 159 }     },
-    { "NEON",
-     { 51, 87, 159, 240, 219, 213, 201 },
-     { 53, 89, 125, 161, 197, 199, 213, 231 },
-     { 240, 53, 87, 159, 201, 219 }   },
-    { "MONO",
-     { 252, 248, 244, 240, 244, 248, 252 },
-     { 240, 244, 246, 248, 250, 252, 254, 255 },
-     { 240, 244, 247, 250, 253, 255 } },
-    { "ICE",
-     { 39, 51, 159, 240, 195, 159, 51 },
-     { 24, 31, 38, 45, 87, 159, 195, 231 },
-     { 240, 39, 51, 87, 159, 195 }    },
-    { "ECLIPSE",
-     { 130, 166, 215, 240, 215, 208, 196 },
-     { 240, 88, 124, 160, 196, 208, 214, 231 },
-     { 240, 52, 88, 130, 208, 214 }   },
+    {"AURORA",
+     {33, 39, 117, 240, 217, 203, 196},
+     {24, 28, 34, 70, 76, 118, 154, 231},
+     {240, 31, 39, 51, 117, 159}},
+    {"MATRIX",
+     {28, 34, 70, 240, 70, 118, 154},
+     {24, 28, 34, 40, 76, 118, 154, 231},
+     {240, 34, 70, 76, 118, 154}},
+    {"FIRE",
+     {130, 166, 215, 240, 215, 202, 196},
+     {52, 88, 124, 160, 196, 202, 214, 231},
+     {240, 88, 124, 160, 196, 214}},
+    {"OCEAN",
+     {24, 31, 87, 240, 117, 45, 51},
+     {24, 31, 38, 45, 51, 87, 159, 231},
+     {240, 31, 38, 45, 51, 159}},
+    {"NEON",
+     {51, 87, 159, 240, 219, 213, 201},
+     {53, 89, 125, 161, 197, 199, 213, 231},
+     {240, 53, 87, 159, 201, 219}},
+    {"MONO",
+     {252, 248, 244, 240, 244, 248, 252},
+     {240, 244, 246, 248, 250, 252, 254, 255},
+     {240, 244, 247, 250, 253, 255}},
+    {"ICE",
+     {39, 51, 159, 240, 195, 159, 51},
+     {24, 31, 38, 45, 87, 159, 195, 231},
+     {240, 39, 51, 87, 159, 195}},
+    {"ECLIPSE",
+     {130, 166, 215, 240, 215, 208, 196},
+     {240, 88, 124, 160, 196, 208, 214, 231},
+     {240, 52, 88, 130, 208, 214}},
 };
-#define N_THEMES   ((int)(sizeof(THEMES) / sizeof(THEMES[0])))
+#define N_THEMES ((int)(sizeof(THEMES) / sizeof(THEMES[0])))
 
 #define NS_PER_SEC 1000000000LL
-#define NS_PER_MS  1000000LL
+#define NS_PER_MS 1000000LL
 
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
 
-static int64_t clock_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
+static int64_t clock_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * NS_PER_SEC + t.tv_nsec;
 }
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec r = { (time_t)(ns / NS_PER_SEC), (long)(ns % NS_PER_SEC) };
-    nanosleep(&r, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec r = {(time_t)(ns / NS_PER_SEC), (long)(ns % NS_PER_SEC)};
+  nanosleep(&r, NULL);
 }
 
 /* ===================================================================== */
@@ -509,57 +509,56 @@ static void clock_sleep_ns(int64_t ns)
 
 /* Apply only the theme-controlled pairs (pressure / intensity /
  * wavefront). Called on init and on each t / T keypress. */
-static void color_apply_theme(int idx)
-{
-    if (idx < 0 || idx >= N_THEMES) idx = 0;
-    if (COLORS >= 256) {
-        const Theme *t = &THEMES[idx];
-        init_pair(CP_PN2, t->pressure[0], COLOR_BLACK);
-        init_pair(CP_PN1, t->pressure[1], COLOR_BLACK);
-        init_pair(CP_PN0, t->pressure[2], COLOR_BLACK);
-        init_pair(CP_PZERO, t->pressure[3], COLOR_BLACK);
-        init_pair(CP_PP0, t->pressure[4], COLOR_BLACK);
-        init_pair(CP_PP1, t->pressure[5], COLOR_BLACK);
-        init_pair(CP_PP2, t->pressure[6], COLOR_BLACK);
-        for (int i = 0; i < 8; i++)
-            init_pair(CP_INT0 + i, t->intensity[i], COLOR_BLACK);
-        for (int i = 0; i < 6; i++)
-            init_pair(CP_WF0 + i, t->wavefront[i], COLOR_BLACK);
-    } else {
-        /* 8-colour fallback: theme name cycles, palette stays put. */
-        init_pair(CP_PN2, COLOR_BLUE, COLOR_BLACK);
-        init_pair(CP_PN1, COLOR_BLUE, COLOR_BLACK);
-        init_pair(CP_PN0, COLOR_CYAN, COLOR_BLACK);
-        init_pair(CP_PZERO, COLOR_BLACK, COLOR_BLACK);
-        init_pair(CP_PP0, COLOR_MAGENTA, COLOR_BLACK);
-        init_pair(CP_PP1, COLOR_RED, COLOR_BLACK);
-        init_pair(CP_PP2, COLOR_RED, COLOR_BLACK);
-        for (int i = 0; i < 8; i++)
-            init_pair(CP_INT0 + i, COLOR_GREEN, COLOR_BLACK);
-        init_pair(CP_WF0, COLOR_BLACK, COLOR_BLACK);
-        init_pair(CP_WF1, COLOR_BLUE, COLOR_BLACK);
-        init_pair(CP_WF2, COLOR_BLUE, COLOR_BLACK);
-        init_pair(CP_WF3, COLOR_CYAN, COLOR_BLACK);
-        init_pair(CP_WF4, COLOR_CYAN, COLOR_BLACK);
-        init_pair(CP_WF5, COLOR_WHITE, COLOR_BLACK);
-    }
+static void color_apply_theme(int idx) {
+  if (idx < 0 || idx >= N_THEMES)
+    idx = 0;
+  if (COLORS >= 256) {
+    const Theme *t = &THEMES[idx];
+    init_pair(CP_PN2, t->pressure[0], COLOR_BLACK);
+    init_pair(CP_PN1, t->pressure[1], COLOR_BLACK);
+    init_pair(CP_PN0, t->pressure[2], COLOR_BLACK);
+    init_pair(CP_PZERO, t->pressure[3], COLOR_BLACK);
+    init_pair(CP_PP0, t->pressure[4], COLOR_BLACK);
+    init_pair(CP_PP1, t->pressure[5], COLOR_BLACK);
+    init_pair(CP_PP2, t->pressure[6], COLOR_BLACK);
+    for (int i = 0; i < 8; i++)
+      init_pair(CP_INT0 + i, t->intensity[i], COLOR_BLACK);
+    for (int i = 0; i < 6; i++)
+      init_pair(CP_WF0 + i, t->wavefront[i], COLOR_BLACK);
+  } else {
+    /* 8-colour fallback: theme name cycles, palette stays put. */
+    init_pair(CP_PN2, COLOR_BLUE, COLOR_BLACK);
+    init_pair(CP_PN1, COLOR_BLUE, COLOR_BLACK);
+    init_pair(CP_PN0, COLOR_CYAN, COLOR_BLACK);
+    init_pair(CP_PZERO, COLOR_BLACK, COLOR_BLACK);
+    init_pair(CP_PP0, COLOR_MAGENTA, COLOR_BLACK);
+    init_pair(CP_PP1, COLOR_RED, COLOR_BLACK);
+    init_pair(CP_PP2, COLOR_RED, COLOR_BLACK);
+    for (int i = 0; i < 8; i++)
+      init_pair(CP_INT0 + i, COLOR_GREEN, COLOR_BLACK);
+    init_pair(CP_WF0, COLOR_BLACK, COLOR_BLACK);
+    init_pair(CP_WF1, COLOR_BLUE, COLOR_BLACK);
+    init_pair(CP_WF2, COLOR_BLUE, COLOR_BLACK);
+    init_pair(CP_WF3, COLOR_CYAN, COLOR_BLACK);
+    init_pair(CP_WF4, COLOR_CYAN, COLOR_BLACK);
+    init_pair(CP_WF5, COLOR_WHITE, COLOR_BLACK);
+  }
 }
 
-static void color_init(int theme_idx)
-{
-    start_color();
-    use_default_colors();
-    /* Theme-independent pairs — kept legible across every theme. */
-    if (COLORS >= 256) {
-        init_pair(CP_SRC, 226, COLOR_BLACK); /* bright yellow */
-        init_pair(CP_HUD, 226, COLOR_BLACK); /* bright yellow */
-        init_pair(CP_HINT, 51, COLOR_BLACK); /* bright cyan   */
-    } else {
-        init_pair(CP_SRC, COLOR_YELLOW, COLOR_BLACK);
-        init_pair(CP_HUD, COLOR_YELLOW, COLOR_BLACK);
-        init_pair(CP_HINT, COLOR_CYAN, COLOR_BLACK);
-    }
-    color_apply_theme(theme_idx);
+static void color_init(int theme_idx) {
+  start_color();
+  use_default_colors();
+  /* Theme-independent pairs — kept legible across every theme. */
+  if (COLORS >= 256) {
+    init_pair(CP_SRC, 226, COLOR_BLACK); /* bright yellow */
+    init_pair(CP_HUD, 226, COLOR_BLACK); /* bright yellow */
+    init_pair(CP_HINT, 51, COLOR_BLACK); /* bright cyan   */
+  } else {
+    init_pair(CP_SRC, COLOR_YELLOW, COLOR_BLACK);
+    init_pair(CP_HUD, COLOR_YELLOW, COLOR_BLACK);
+    init_pair(CP_HINT, COLOR_CYAN, COLOR_BLACK);
+  }
+  color_apply_theme(theme_idx);
 }
 
 /* ===================================================================== */
@@ -588,10 +587,10 @@ static void color_init(int theme_idx)
  *                entirely during injection so they contribute no energy.
  */
 typedef struct {
-    float nx_f, ny_f; /* normalized position of source [0,1] */
-    float freq;       /* driving frequency (simulation Hz)   */
-    float amp;        /* pressure amplitude injected per step */
-    bool  active;
+  float nx_f, ny_f; /* normalized position of source [0,1] */
+  float freq;       /* driving frequency (simulation Hz)   */
+  float amp;        /* pressure amplitude injected per step */
+  bool active;
 } Source;
 
 /*
@@ -687,58 +686,57 @@ typedef struct {
  *             Reset to 0 each time freq_est is recomputed (every 0.5 s).
  */
 typedef struct {
-    int    nx, ny; /* grid dimensions                                 */
-    float  dx;     /* physical cell spacing (same for x; dy=ASPECT*dx)*/
-    float  dt;     /* adaptive timestep                               */
-    float  c;      /* wave speed                                      */
-    float  time;   /* accumulated simulation time                     */
+  int nx, ny; /* grid dimensions                                 */
+  float dx;   /* physical cell spacing (same for x; dy=ASPECT*dx)*/
+  float dt;   /* adaptive timestep                               */
+  float c;    /* wave speed                                      */
+  float time; /* accumulated simulation time                     */
 
-    float *p;     /* current pressure  [ny*nx]                       */
-    float *p_old; /* previous pressure [ny*nx]                       */
-    float *p_new; /* scratch buffer    [ny*nx]                       */
-    float *damp;  /* per-cell sponge coefficient [ny*nx]             */
+  float *p;     /* current pressure  [ny*nx]                       */
+  float *p_old; /* previous pressure [ny*nx]                       */
+  float *p_new; /* scratch buffer    [ny*nx]                       */
+  float *damp;  /* per-cell sponge coefficient [ny*nx]             */
 
-    /* precomputed FDTD coupling coefficients */
-    float  rx2; /* (c·dt/dx)²                                      */
-    float  ry2; /* (c·dt/(ASPECT_Y·dx))²                           */
+  /* precomputed FDTD coupling coefficients */
+  float rx2; /* (c·dt/dx)²                                      */
+  float ry2; /* (c·dt/(ASPECT_Y·dx))²                           */
 
-    Source srcs[MAX_SOURCES];
+  Source srcs[MAX_SOURCES];
 
-    /* diagnostics */
-    float p_max;      /* smoothed max |p| for display normalization      */
-    float energy;     /* Σ p² (total acoustic energy, unnormalized)      */
-    float freq_est;   /* dominant frequency estimate from zero-crossings  */
-    float probe_prev; /* previous pressure at centre probe               */
-    int   zc_count;   /* zero-crossing counter in current window         */
-    float zc_timer;   /* elapsed sim time in current zero-cross window   */
+  /* diagnostics */
+  float p_max;      /* smoothed max |p| for display normalization      */
+  float energy;     /* Σ p² (total acoustic energy, unnormalized)      */
+  float freq_est;   /* dominant frequency estimate from zero-crossings  */
+  float probe_prev; /* previous pressure at centre probe               */
+  int zc_count;     /* zero-crossing counter in current window         */
+  float zc_timer;   /* elapsed sim time in current zero-cross window   */
 
-    int   vis_mode;
-    int   bc_mode;
-    int   theme_idx; /* index into THEMES[]; cycled with t / T */
-    bool  paused;
+  int vis_mode;
+  int bc_mode;
+  int theme_idx; /* index into THEMES[]; cycled with t / T */
+  bool paused;
 } Wave;
 
 #define IDX(w, x, y) ((y) * (w)->nx + (x))
 
-static int wave_alloc(Wave *w, int nx, int ny)
-{
-    w->nx    = nx;
-    w->ny    = ny;
-    int n    = nx * ny;
-    w->p     = calloc(n, sizeof(float));
-    w->p_old = calloc(n, sizeof(float));
-    w->p_new = calloc(n, sizeof(float));
-    w->damp  = calloc(n, sizeof(float));
-    if (!w->p || !w->p_old || !w->p_new || !w->damp) return -1;
-    return 0;
+static int wave_alloc(Wave *w, int nx, int ny) {
+  w->nx = nx;
+  w->ny = ny;
+  int n = nx * ny;
+  w->p = calloc(n, sizeof(float));
+  w->p_old = calloc(n, sizeof(float));
+  w->p_new = calloc(n, sizeof(float));
+  w->damp = calloc(n, sizeof(float));
+  if (!w->p || !w->p_old || !w->p_new || !w->damp)
+    return -1;
+  return 0;
 }
 
-static void wave_free(Wave *w)
-{
-    free(w->p);
-    free(w->p_old);
-    free(w->p_new);
-    free(w->damp);
+static void wave_free(Wave *w) {
+  free(w->p);
+  free(w->p_old);
+  free(w->p_new);
+  free(w->damp);
 }
 
 /*
@@ -751,11 +749,12 @@ static void wave_free(Wave *w)
  *
  * Pure function — same answer for both x-axis and y-axis sweeps.
  */
-static int sponge_depth_along_axis(int c, int n)
-{
-    if (c < SPONGE_WIDTH) return SPONGE_WIDTH - c;
-    if (c > n - 1 - SPONGE_WIDTH) return c - (n - 1 - SPONGE_WIDTH);
-    return 0;
+static int sponge_depth_along_axis(int c, int n) {
+  if (c < SPONGE_WIDTH)
+    return SPONGE_WIDTH - c;
+  if (c > n - 1 - SPONGE_WIDTH)
+    return c - (n - 1 - SPONGE_WIDTH);
+  return 0;
 }
 
 /*
@@ -764,82 +763,81 @@ static int sponge_depth_along_axis(int c, int n)
  * the impedance-step that would itself cause spurious reflection at
  * the inner edge of the sponge zone.
  */
-static float sponge_damping_at_depth(int depth)
-{
-    if (depth <= 0) return 0.0f;
-    float t = (float)depth / (float)SPONGE_WIDTH;
-    return SPONGE_DAMP * t * t;
+static float sponge_damping_at_depth(int depth) {
+  if (depth <= 0)
+    return 0.0f;
+  float t = (float)depth / (float)SPONGE_WIDTH;
+  return SPONGE_DAMP * t * t;
 }
 
-static void build_sponge(Wave *w)
-{
-    for (int y = 0; y < w->ny; y++) {
-        for (int x = 0; x < w->nx; x++) {
-            int ex = sponge_depth_along_axis(x, w->nx);
-            int ey = sponge_depth_along_axis(y, w->ny);
+static void build_sponge(Wave *w) {
+  for (int y = 0; y < w->ny; y++) {
+    for (int x = 0; x < w->nx; x++) {
+      int ex = sponge_depth_along_axis(x, w->nx);
+      int ey = sponge_depth_along_axis(y, w->ny);
 
-            /* A cell's effective sponge depth is the deeper of its two
-             * axial depths — corners absorb most, mid-walls less. */
-            int e = ex;
-            if (ey > e) e = ey;
+      /* A cell's effective sponge depth is the deeper of its two
+       * axial depths — corners absorb most, mid-walls less. */
+      int e = ex;
+      if (ey > e)
+        e = ey;
 
-            w->damp[IDX(w, x, y)] = sponge_damping_at_depth(e);
-        }
+      w->damp[IDX(w, x, y)] = sponge_damping_at_depth(e);
     }
+  }
 }
 
-static void wave_recompute_dt(Wave *w)
-{
-    /* CFL: c·dt/dx · √(1 + 1/ASPECT_Y²) ≤ CFL */
-    float r  = CFL / (w->c * sqrtf(1.0f + 1.0f / (ASPECT_Y * ASPECT_Y)));
-    w->dt    = r * w->dx;
-    float rx = w->c * w->dt / w->dx;
-    float ry = w->c * w->dt / (ASPECT_Y * w->dx);
-    w->rx2   = rx * rx;
-    w->ry2   = ry * ry;
+static void wave_recompute_dt(Wave *w) {
+  /* CFL: c·dt/dx · √(1 + 1/ASPECT_Y²) ≤ CFL */
+  float r = CFL / (w->c * sqrtf(1.0f + 1.0f / (ASPECT_Y * ASPECT_Y)));
+  w->dt = r * w->dx;
+  float rx = w->c * w->dt / w->dx;
+  float ry = w->c * w->dt / (ASPECT_Y * w->dx);
+  w->rx2 = rx * rx;
+  w->ry2 = ry * ry;
 }
 
-static void wave_init(Wave *w, int nx, int ny)
-{
-    w->c = WAVE_C_DEFAULT;
-    /* dx = smallest physical spacing; y-spacing = ASPECT_Y*dx */
-    /* Use the shorter grid dimension so it spans [0,1] in physical units. */
-    int min_dim = nx;
-    if (ny < min_dim) min_dim = ny;
-    w->dx         = 1.0f / (float)(min_dim - 1);
-    w->time       = 0.0f;
-    w->p_max      = 1e-6f;
-    w->energy     = 0.0f;
-    w->freq_est   = 0.0f;
-    w->probe_prev = 0.0f;
-    w->zc_count   = 0;
-    w->zc_timer   = 0.0f;
-    w->vis_mode   = VIS_PRESSURE;
-    w->bc_mode    = BC_ABSORB; /* clean expanding rings on first launch */
-    w->theme_idx  = 0;         /* AURORA */
-    w->paused     = false;
+static void wave_init(Wave *w, int nx, int ny) {
+  w->c = WAVE_C_DEFAULT;
+  /* dx = smallest physical spacing; y-spacing = ASPECT_Y*dx */
+  /* Use the shorter grid dimension so it spans [0,1] in physical units. */
+  int min_dim = nx;
+  if (ny < min_dim)
+    min_dim = ny;
+  w->dx = 1.0f / (float)(min_dim - 1);
+  w->time = 0.0f;
+  w->p_max = 1e-6f;
+  w->energy = 0.0f;
+  w->freq_est = 0.0f;
+  w->probe_prev = 0.0f;
+  w->zc_count = 0;
+  w->zc_timer = 0.0f;
+  w->vis_mode = VIS_PRESSURE;
+  w->bc_mode = BC_ABSORB; /* clean expanding rings on first launch */
+  w->theme_idx = 0;       /* AURORA */
+  w->paused = false;
 
-    wave_recompute_dt(w);
+  wave_recompute_dt(w);
 
-    memset(w->p, 0, nx * ny * sizeof(float));
-    memset(w->p_old, 0, nx * ny * sizeof(float));
-    memset(w->p_new, 0, nx * ny * sizeof(float));
-    build_sponge(w);
+  memset(w->p, 0, nx * ny * sizeof(float));
+  memset(w->p_old, 0, nx * ny * sizeof(float));
+  memset(w->p_new, 0, nx * ny * sizeof(float));
+  build_sponge(w);
 
-    /*
-     * Compute source frequency so wavelength ≈ LAMBDA_CELLS in x-cells.
-     *   λ_cells = c / (f · dx)  →  f = c / (LAMBDA_CELLS · dx)
-     * This ensures ring spacing is visually comparable to ~10 cells
-     * regardless of terminal size or wave speed.
-     */
-    float base_freq = w->c / (LAMBDA_CELLS * w->dx);
-    for (int i = 0; i < MAX_SOURCES; i++) {
-        w->srcs[i].nx_f   = SRC_NX[i];
-        w->srcs[i].ny_f   = SRC_NY[i];
-        w->srcs[i].freq   = base_freq * SRC_FMUL[i];
-        w->srcs[i].amp    = 1.0f;
-        w->srcs[i].active = (i == 0 || i == 1); /* sources 1+2: interference */
-    }
+  /*
+   * Compute source frequency so wavelength ≈ LAMBDA_CELLS in x-cells.
+   *   λ_cells = c / (f · dx)  →  f = c / (LAMBDA_CELLS · dx)
+   * This ensures ring spacing is visually comparable to ~10 cells
+   * regardless of terminal size or wave speed.
+   */
+  float base_freq = w->c / (LAMBDA_CELLS * w->dx);
+  for (int i = 0; i < MAX_SOURCES; i++) {
+    w->srcs[i].nx_f = SRC_NX[i];
+    w->srcs[i].ny_f = SRC_NY[i];
+    w->srcs[i].freq = base_freq * SRC_FMUL[i];
+    w->srcs[i].amp = 1.0f;
+    w->srcs[i].active = (i == 0 || i == 1); /* sources 1+2: interference */
+  }
 }
 
 /* ===================================================================== */
@@ -916,23 +914,22 @@ static void wave_init(Wave *w, int nx, int ny)
  * Interior only (skips the boundary row/column — those cells are
  * handled by apply_boundary). Reads from p and p_old, writes p_new.
  */
-static void apply_fdtd_stencil(Wave *w)
-{
-    int   nx = w->nx, ny = w->ny;
-    float rx2 = w->rx2, ry2 = w->ry2;
+static void apply_fdtd_stencil(Wave *w) {
+  int nx = w->nx, ny = w->ny;
+  float rx2 = w->rx2, ry2 = w->ry2;
 
-    for (int y = 1; y < ny - 1; y++) {
-        for (int x = 1; x < nx - 1; x++) {
-            float pc  = w->p[IDX(w, x, y)];
-            float pe  = w->p[IDX(w, x + 1, y)];
-            float pw_ = w->p[IDX(w, x - 1, y)];
-            float pn  = w->p[IDX(w, x, y + 1)];
-            float ps  = w->p[IDX(w, x, y - 1)];
-            float po  = w->p_old[IDX(w, x, y)];
-            w->p_new[IDX(w, x, y)] =
-                2.0f * pc - po + rx2 * (pe + pw_ - 2.0f * pc) + ry2 * (pn + ps - 2.0f * pc);
-        }
+  for (int y = 1; y < ny - 1; y++) {
+    for (int x = 1; x < nx - 1; x++) {
+      float pc = w->p[IDX(w, x, y)];
+      float pe = w->p[IDX(w, x + 1, y)];
+      float pw_ = w->p[IDX(w, x - 1, y)];
+      float pn = w->p[IDX(w, x, y + 1)];
+      float ps = w->p[IDX(w, x, y - 1)];
+      float po = w->p_old[IDX(w, x, y)];
+      w->p_new[IDX(w, x, y)] = 2.0f * pc - po + rx2 * (pe + pw_ - 2.0f * pc) +
+                               ry2 * (pn + ps - 2.0f * pc);
     }
+  }
 }
 
 /*
@@ -945,21 +942,25 @@ static void apply_fdtd_stencil(Wave *w)
  * are clamped one cell inside the boundary so the stencil's neighbours
  * always exist.
  */
-static void inject_monopole_sources(Wave *w)
-{
-    int nx = w->nx, ny = w->ny;
-    for (int i = 0; i < MAX_SOURCES; i++) {
-        if (!w->srcs[i].active) continue;
-        int sx = (int)(w->srcs[i].nx_f * (float)(nx - 1) + 0.5f);
-        int sy = (int)(w->srcs[i].ny_f * (float)(ny - 1) + 0.5f);
-        if (sx < 1) sx = 1;
-        if (sx > nx - 2) sx = nx - 2;
-        if (sy < 1) sy = 1;
-        if (sy > ny - 2) sy = ny - 2;
-        float drive = w->srcs[i].amp *
-                      sinf(2.0f * (float)M_PI * w->srcs[i].freq * w->time);
-        w->p_new[IDX(w, sx, sy)] += drive;
-    }
+static void inject_monopole_sources(Wave *w) {
+  int nx = w->nx, ny = w->ny;
+  for (int i = 0; i < MAX_SOURCES; i++) {
+    if (!w->srcs[i].active)
+      continue;
+    int sx = (int)(w->srcs[i].nx_f * (float)(nx - 1) + 0.5f);
+    int sy = (int)(w->srcs[i].ny_f * (float)(ny - 1) + 0.5f);
+    if (sx < 1)
+      sx = 1;
+    if (sx > nx - 2)
+      sx = nx - 2;
+    if (sy < 1)
+      sy = 1;
+    if (sy > ny - 2)
+      sy = ny - 2;
+    float drive =
+        w->srcs[i].amp * sinf(2.0f * (float)M_PI * w->srcs[i].freq * w->time);
+    w->p_new[IDX(w, sx, sy)] += drive;
+  }
 }
 
 /*
@@ -976,28 +977,26 @@ static void inject_monopole_sources(Wave *w)
  * Three pointer assignments — O(1) regardless of grid size. Compare
  * to memcpy which would be O(N) per step and dominate runtime.
  */
-static void rotate_pressure_levels(Wave *w)
-{
-    float *recycled = w->p_old;
-    w->p_old        = w->p;
-    w->p            = w->p_new;
-    w->p_new        = recycled;
+static void rotate_pressure_levels(Wave *w) {
+  float *recycled = w->p_old;
+  w->p_old = w->p;
+  w->p = w->p_new;
+  w->p_new = recycled;
 }
 
 /* Top-level: one FDTD timestep, as five named operations. */
-static void update_wave(Wave *w)
-{
-    /* 1. Apply the FDTD stencil to compute p_new from (p, p_old). */
-    apply_fdtd_stencil(w);
+static void update_wave(Wave *w) {
+  /* 1. Apply the FDTD stencil to compute p_new from (p, p_old). */
+  apply_fdtd_stencil(w);
 
-    /* 2. Drive the field — additive monopole injection into p_new. */
-    inject_monopole_sources(w);
+  /* 2. Drive the field — additive monopole injection into p_new. */
+  inject_monopole_sources(w);
 
-    /* 3. Roll the three time levels forward (O(1) pointer rotation). */
-    rotate_pressure_levels(w);
+  /* 3. Roll the three time levels forward (O(1) pointer rotation). */
+  rotate_pressure_levels(w);
 
-    /* 4. Advance the simulation clock. */
-    w->time += w->dt;
+  /* 4. Advance the simulation clock. */
+  w->time += w->dt;
 }
 
 /* ===================================================================== */
@@ -1096,23 +1095,22 @@ static void update_wave(Wave *w)
  * simultaneously. Leaving p_old non-zero at the boundary would re-
  * inject energy through the "-p_old" term of the stencil.
  */
-static void apply_dirichlet_walls(Wave *w)
-{
-    int nx = w->nx, ny = w->ny;
-    /* Top and bottom rows. */
-    for (int x = 0; x < nx; x++) {
-        w->p[IDX(w, x, 0)]          = 0.0f;
-        w->p_old[IDX(w, x, 0)]      = 0.0f;
-        w->p[IDX(w, x, ny - 1)]     = 0.0f;
-        w->p_old[IDX(w, x, ny - 1)] = 0.0f;
-    }
-    /* Left and right columns. */
-    for (int y = 0; y < ny; y++) {
-        w->p[IDX(w, 0, y)]          = 0.0f;
-        w->p_old[IDX(w, 0, y)]      = 0.0f;
-        w->p[IDX(w, nx - 1, y)]     = 0.0f;
-        w->p_old[IDX(w, nx - 1, y)] = 0.0f;
-    }
+static void apply_dirichlet_walls(Wave *w) {
+  int nx = w->nx, ny = w->ny;
+  /* Top and bottom rows. */
+  for (int x = 0; x < nx; x++) {
+    w->p[IDX(w, x, 0)] = 0.0f;
+    w->p_old[IDX(w, x, 0)] = 0.0f;
+    w->p[IDX(w, x, ny - 1)] = 0.0f;
+    w->p_old[IDX(w, x, ny - 1)] = 0.0f;
+  }
+  /* Left and right columns. */
+  for (int y = 0; y < ny; y++) {
+    w->p[IDX(w, 0, y)] = 0.0f;
+    w->p_old[IDX(w, 0, y)] = 0.0f;
+    w->p[IDX(w, nx - 1, y)] = 0.0f;
+    w->p_old[IDX(w, nx - 1, y)] = 0.0f;
+  }
 }
 
 /*
@@ -1125,16 +1123,16 @@ static void apply_dirichlet_walls(Wave *w)
  * Both p and p_old are damped — same reason as in apply_dirichlet_walls:
  * the next FDTD step reads both buffers.
  */
-static void apply_sponge_damping(Wave *w)
-{
-    int n = w->nx * w->ny;
-    for (int i = 0; i < n; i++) {
-        float d = w->damp[i];
-        if (d <= 0.0f) continue;
-        float s = 1.0f - d;
-        w->p[i] *= s;
-        w->p_old[i] *= s;
-    }
+static void apply_sponge_damping(Wave *w) {
+  int n = w->nx * w->ny;
+  for (int i = 0; i < n; i++) {
+    float d = w->damp[i];
+    if (d <= 0.0f)
+      continue;
+    float s = 1.0f - d;
+    w->p[i] *= s;
+    w->p_old[i] *= s;
+  }
 }
 
 /*
@@ -1149,19 +1147,20 @@ static void apply_sponge_damping(Wave *w)
  *            field). Grows under driven reflecting BCs, decays under
  *            absorbing BCs with no source.
  */
-static void compute_field_norms(Wave *w)
-{
-    int   n      = w->nx * w->ny;
-    float pmax   = 1e-6f;
-    float energy = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float ap = fabsf(w->p[i]);
-        if (ap > pmax) pmax = ap;
-        energy += w->p[i] * w->p[i];
-    }
-    w->p_max = w->p_max * 0.97f + pmax * 0.03f;
-    if (w->p_max < 1e-6f) w->p_max = 1e-6f;
-    w->energy = energy;
+static void compute_field_norms(Wave *w) {
+  int n = w->nx * w->ny;
+  float pmax = 1e-6f;
+  float energy = 0.0f;
+  for (int i = 0; i < n; i++) {
+    float ap = fabsf(w->p[i]);
+    if (ap > pmax)
+      pmax = ap;
+    energy += w->p[i] * w->p[i];
+  }
+  w->p_max = w->p_max * 0.97f + pmax * 0.03f;
+  if (w->p_max < 1e-6f)
+    w->p_max = 1e-6f;
+  w->energy = energy;
 }
 
 /*
@@ -1176,40 +1175,41 @@ static void compute_field_norms(Wave *w)
  * the dominant frequency at the probe location (usually the first
  * source's, since source 1 is placed close to centre).
  */
-static void track_zero_crossings(Wave *w)
-{
-    int   px                 = w->nx / 2;
-    int   py                 = w->ny / 2;
-    float pc                 = w->p[IDX(w, px, py)];
+static void track_zero_crossings(Wave *w) {
+  int px = w->nx / 2;
+  int py = w->ny / 2;
+  float pc = w->p[IDX(w, px, py)];
 
-    bool  crossed_neg_to_pos = (w->probe_prev < 0.0f && pc >= 0.0f);
-    bool  crossed_pos_to_neg = (w->probe_prev >= 0.0f && pc < 0.0f);
-    if (crossed_neg_to_pos || crossed_pos_to_neg) w->zc_count++;
+  bool crossed_neg_to_pos = (w->probe_prev < 0.0f && pc >= 0.0f);
+  bool crossed_pos_to_neg = (w->probe_prev >= 0.0f && pc < 0.0f);
+  if (crossed_neg_to_pos || crossed_pos_to_neg)
+    w->zc_count++;
 
-    w->probe_prev = pc;
-    w->zc_timer += w->dt;
+  w->probe_prev = pc;
+  w->zc_timer += w->dt;
 
-    /* Recompute estimate every 0.5 sim-time-units; reset accumulators. */
-    if (w->zc_timer >= 0.5f) {
-        w->freq_est = (float)w->zc_count / (2.0f * w->zc_timer);
-        w->zc_count = 0;
-        w->zc_timer = 0.0f;
-    }
+  /* Recompute estimate every 0.5 sim-time-units; reset accumulators. */
+  if (w->zc_timer >= 0.5f) {
+    w->freq_est = (float)w->zc_count / (2.0f * w->zc_timer);
+    w->zc_count = 0;
+    w->zc_timer = 0.0f;
+  }
 }
 
 /* Top-level: boundary handling + per-frame diagnostics. */
-static void apply_boundary(Wave *w)
-{
-    /* 1. Walls: Dirichlet (hard) or sponge (graded soft), per bc_mode. */
-    if (w->bc_mode == BC_REFLECT) apply_dirichlet_walls(w);
-    else apply_sponge_damping(w);
+static void apply_boundary(Wave *w) {
+  /* 1. Walls: Dirichlet (hard) or sponge (graded soft), per bc_mode. */
+  if (w->bc_mode == BC_REFLECT)
+    apply_dirichlet_walls(w);
+  else
+    apply_sponge_damping(w);
 
-    /* 2. Whole-field diagnostics: max-norm for colour scaling, total
-     *    energy for the HUD readout. */
-    compute_field_norms(w);
+  /* 2. Whole-field diagnostics: max-norm for colour scaling, total
+   *    energy for the HUD readout. */
+  compute_field_norms(w);
 
-    /* 3. Centre-probe zero-crossing tracker for the f_est readout. */
-    track_zero_crossings(w);
+  /* 3. Centre-probe zero-crossing tracker for the f_est readout. */
+  track_zero_crossings(w);
 }
 
 /* ===================================================================== */
@@ -1284,94 +1284,97 @@ static void apply_boundary(Wave *w)
 /* PRESSURE mode: signed diverging heatmap.
  * Shows compression (red) and rarefaction (blue) zones.
  * Best for understanding the instantaneous wave structure. */
-static void render_pressure(const Wave *w, int cols, int rows)
-{
-    int    nx = w->nx, ny = w->ny;
-    float  inv      = 1.0f / w->p_max;
-    chtype cur_attr = A_NORMAL;
-    attrset(cur_attr);
+static void render_pressure(const Wave *w, int cols, int rows) {
+  int nx = w->nx, ny = w->ny;
+  float inv = 1.0f / w->p_max;
+  chtype cur_attr = A_NORMAL;
+  attrset(cur_attr);
 
-    for (int sy = 0; sy < ny && sy < rows; sy++) {
-        int gy = ny - 1 - sy;
-        for (int x = 0; x < nx && x < cols; x++) {
-            float pn = w->p[IDX(w, x, gy)] * inv;
-            if (pn > 1.0f) pn = 1.0f;
-            if (pn < -1.0f) pn = -1.0f;
+  for (int sy = 0; sy < ny && sy < rows; sy++) {
+    int gy = ny - 1 - sy;
+    for (int x = 0; x < nx && x < cols; x++) {
+      float pn = w->p[IDX(w, x, gy)] * inv;
+      if (pn > 1.0f)
+        pn = 1.0f;
+      if (pn < -1.0f)
+        pn = -1.0f;
 
-            /* Symmetric thresholds (no +0.60 / -0.65 typo) and a wider
-             * near-zero band so quiet zones read as background.        */
-            int    cp;
-            char   ch;
-            attr_t at;
-            if (pn < -0.65f) {
-                cp = CP_PN2;
-                ch = '#';
-                at = A_BOLD;
-            } else if (pn < -0.30f) {
-                cp = CP_PN1;
-                ch = 'x';
-                at = A_NORMAL;
-            } else if (pn < -0.15f) {
-                cp = CP_PN0;
-                ch = ':';
-                at = A_NORMAL;
-            } else if (pn < 0.15f) {
-                cp = CP_PZERO;
-                ch = ' ';
-                at = A_DIM;
-            } else if (pn < 0.30f) {
-                cp = CP_PP0;
-                ch = ':';
-                at = A_NORMAL;
-            } else if (pn < 0.65f) {
-                cp = CP_PP1;
-                ch = 'x';
-                at = A_NORMAL;
-            } else {
-                cp = CP_PP2;
-                ch = '#';
-                at = A_BOLD;
-            }
+      /* Symmetric thresholds (no +0.60 / -0.65 typo) and a wider
+       * near-zero band so quiet zones read as background.        */
+      int cp;
+      char ch;
+      attr_t at;
+      if (pn < -0.65f) {
+        cp = CP_PN2;
+        ch = '#';
+        at = A_BOLD;
+      } else if (pn < -0.30f) {
+        cp = CP_PN1;
+        ch = 'x';
+        at = A_NORMAL;
+      } else if (pn < -0.15f) {
+        cp = CP_PN0;
+        ch = ':';
+        at = A_NORMAL;
+      } else if (pn < 0.15f) {
+        cp = CP_PZERO;
+        ch = ' ';
+        at = A_DIM;
+      } else if (pn < 0.30f) {
+        cp = CP_PP0;
+        ch = ':';
+        at = A_NORMAL;
+      } else if (pn < 0.65f) {
+        cp = CP_PP1;
+        ch = 'x';
+        at = A_NORMAL;
+      } else {
+        cp = CP_PP2;
+        ch = '#';
+        at = A_BOLD;
+      }
 
-            chtype a = (chtype)COLOR_PAIR(cp) | at;
-            if (a != cur_attr) {
-                attrset(a);
-                cur_attr = a;
-            }
-            mvaddch(sy + 1, x, (chtype)ch);
-        }
+      chtype a = (chtype)COLOR_PAIR(cp) | at;
+      if (a != cur_attr) {
+        attrset(a);
+        cur_attr = a;
+      }
+      mvaddch(sy + 1, x, (chtype)ch);
     }
-    attrset(A_NORMAL);
+  }
+  attrset(A_NORMAL);
 }
 
 /* INTENSITY mode: |p| magnitude ramp.
  * Dark = quiet nodes (where waves cancel), bright = antinodes (loud).
  * Standing-wave patterns are most clearly visible here. */
-static void render_intensity(const Wave *w, int cols, int rows)
-{
-    int    nx = w->nx, ny = w->ny;
-    float  inv      = 7.0f / w->p_max;
-    chtype cur_attr = A_NORMAL;
-    attrset(cur_attr);
+static void render_intensity(const Wave *w, int cols, int rows) {
+  int nx = w->nx, ny = w->ny;
+  float inv = 7.0f / w->p_max;
+  chtype cur_attr = A_NORMAL;
+  attrset(cur_attr);
 
-    for (int sy = 0; sy < ny && sy < rows; sy++) {
-        int gy = ny - 1 - sy;
-        for (int x = 0; x < nx && x < cols; x++) {
-            float ap = fabsf(w->p[IDX(w, x, gy)]) * inv;
-            int   lv = (int)ap;
-            if (lv < 0) lv = 0;
-            if (lv > 7) lv = 7;
-            attr_t at = A_NORMAL;
-            if (lv >= 5) at = A_BOLD;
-            chtype a = (chtype)COLOR_PAIR(CP_INT0 + lv) | at;
-            if (a != cur_attr) {
-                attrset(a);
-                cur_attr = a;
-            }
-            mvaddch(sy + 1, x, (chtype)DENS_CHARS[lv]);
-        }
+  for (int sy = 0; sy < ny && sy < rows; sy++) {
+    int gy = ny - 1 - sy;
+    for (int x = 0; x < nx && x < cols; x++) {
+      float ap = fabsf(w->p[IDX(w, x, gy)]) * inv;
+      int lv = (int)ap;
+      if (lv < 0)
+        lv = 0;
+      if (lv > 7)
+        lv = 7;
+      attr_t at = A_NORMAL;
+      if (lv >= 5)
+        at = A_BOLD;
+      chtype a = (chtype)COLOR_PAIR(CP_INT0 + lv) | at;
+      if (a != cur_attr) {
+        attrset(a);
+        cur_attr = a;
+      }
+      mvaddch(sy + 1, x, (chtype)DENS_CHARS[lv]);
     }
-    attrset(A_NORMAL);
+  }
+  attrset(A_NORMAL);
 }
 
 /*
@@ -1389,69 +1392,76 @@ static void render_intensity(const Wave *w, int cols, int rows)
  */
 #define N_WF_BANDS 6
 
-static void render_wavefront(const Wave *w, int cols, int rows)
-{
-    int   nx = w->nx, ny = w->ny;
-    float inv = (float)N_WF_BANDS / w->p_max;
+static void render_wavefront(const Wave *w, int cols, int rows) {
+  int nx = w->nx, ny = w->ny;
+  float inv = (float)N_WF_BANDS / w->p_max;
 
-    /* Per-band: char, color-pair, attr. Every band has its own colour
-     * pair now (CP_WF0..5), so dim vs bold is for extra punch on top
-     * of an already-distinct hue. */
-    static const char WF_CH[N_WF_BANDS] = { ' ', '.', 'o', 'O', '#', '@' };
-    static const int  WF_CP[N_WF_BANDS] = {
-        CP_WF0, CP_WF1, CP_WF2, CP_WF3, CP_WF4, CP_WF5
-    };
-    static const attr_t WF_AT[N_WF_BANDS] = {
-        A_DIM, A_NORMAL, A_NORMAL, A_NORMAL, A_BOLD, A_BOLD
-    };
+  /* Per-band: char, color-pair, attr. Every band has its own colour
+   * pair now (CP_WF0..5), so dim vs bold is for extra punch on top
+   * of an already-distinct hue. */
+  static const char WF_CH[N_WF_BANDS] = {' ', '.', 'o', 'O', '#', '@'};
+  static const int WF_CP[N_WF_BANDS] = {CP_WF0, CP_WF1, CP_WF2,
+                                        CP_WF3, CP_WF4, CP_WF5};
+  static const attr_t WF_AT[N_WF_BANDS] = {A_DIM,    A_NORMAL, A_NORMAL,
+                                           A_NORMAL, A_BOLD,   A_BOLD};
 
-    chtype cur_attr = A_NORMAL;
-    attrset(cur_attr);
+  chtype cur_attr = A_NORMAL;
+  attrset(cur_attr);
 
-    for (int sy = 0; sy < ny && sy < rows; sy++) {
-        int gy = ny - 1 - sy;
-        for (int x = 0; x < nx && x < cols; x++) {
-            float ap = fabsf(w->p[IDX(w, x, gy)]) * inv;
-            int   b  = (int)ap;
-            if (b < 0) b = 0;
-            if (b >= N_WF_BANDS) b = N_WF_BANDS - 1;
-            chtype a = (chtype)COLOR_PAIR(WF_CP[b]) | WF_AT[b];
-            if (a != cur_attr) {
-                attrset(a);
-                cur_attr = a;
-            }
-            mvaddch(sy + 1, x, (chtype)WF_CH[b]);
-        }
+  for (int sy = 0; sy < ny && sy < rows; sy++) {
+    int gy = ny - 1 - sy;
+    for (int x = 0; x < nx && x < cols; x++) {
+      float ap = fabsf(w->p[IDX(w, x, gy)]) * inv;
+      int b = (int)ap;
+      if (b < 0)
+        b = 0;
+      if (b >= N_WF_BANDS)
+        b = N_WF_BANDS - 1;
+      chtype a = (chtype)COLOR_PAIR(WF_CP[b]) | WF_AT[b];
+      if (a != cur_attr) {
+        attrset(a);
+        cur_attr = a;
+      }
+      mvaddch(sy + 1, x, (chtype)WF_CH[b]);
     }
-    attrset(A_NORMAL);
+  }
+  attrset(A_NORMAL);
 }
 
-static void render_field(const Wave *w, int cols, int rows)
-{
-    switch (w->vis_mode) {
-    case VIS_PRESSURE: render_pressure(w, cols, rows); break;
-    case VIS_INTENSITY: render_intensity(w, cols, rows); break;
-    case VIS_WAVEFRONT: render_wavefront(w, cols, rows); break;
-    }
+static void render_field(const Wave *w, int cols, int rows) {
+  switch (w->vis_mode) {
+  case VIS_PRESSURE:
+    render_pressure(w, cols, rows);
+    break;
+  case VIS_INTENSITY:
+    render_intensity(w, cols, rows);
+    break;
+  case VIS_WAVEFRONT:
+    render_wavefront(w, cols, rows);
+    break;
+  }
 
-    /* Source markers — pulse with the source's own sinusoidal drive so
-     * the marker is visibly the energy emitter. BOLD at the positive
-     * peak, DIM at the negative peak, NORMAL in between. */
-    for (int i = 0; i < MAX_SOURCES; i++) {
-        if (!w->srcs[i].active) continue;
-        int sx = (int)(w->srcs[i].nx_f * (float)(w->nx - 1) + 0.5f);
-        int sg = (int)(w->srcs[i].ny_f * (float)(w->ny - 1) + 0.5f);
-        int ss = (w->ny - 1 - sg) + 1; /* screen row (offset by HUD row) */
-        if (sx >= 0 && sx < cols && ss >= 1 && ss <= rows) {
-            float  ph = sinf(2.0f * (float)M_PI * w->srcs[i].freq * w->time);
-            attr_t at = A_NORMAL;
-            if (ph > 0.5f) at = A_BOLD;      /* positive peak */
-            else if (ph < -0.5f) at = A_DIM; /* negative peak */
-            attron(COLOR_PAIR(CP_SRC) | at);
-            mvaddch(ss, sx, (chtype)('1' + i));
-            attroff(COLOR_PAIR(CP_SRC) | at);
-        }
+  /* Source markers — pulse with the source's own sinusoidal drive so
+   * the marker is visibly the energy emitter. BOLD at the positive
+   * peak, DIM at the negative peak, NORMAL in between. */
+  for (int i = 0; i < MAX_SOURCES; i++) {
+    if (!w->srcs[i].active)
+      continue;
+    int sx = (int)(w->srcs[i].nx_f * (float)(w->nx - 1) + 0.5f);
+    int sg = (int)(w->srcs[i].ny_f * (float)(w->ny - 1) + 0.5f);
+    int ss = (w->ny - 1 - sg) + 1; /* screen row (offset by HUD row) */
+    if (sx >= 0 && sx < cols && ss >= 1 && ss <= rows) {
+      float ph = sinf(2.0f * (float)M_PI * w->srcs[i].freq * w->time);
+      attr_t at = A_NORMAL;
+      if (ph > 0.5f)
+        at = A_BOLD; /* positive peak */
+      else if (ph < -0.5f)
+        at = A_DIM; /* negative peak */
+      attron(COLOR_PAIR(CP_SRC) | at);
+      mvaddch(ss, sx, (chtype)('1' + i));
+      attroff(COLOR_PAIR(CP_SRC) | at);
     }
+  }
 }
 
 /* ===================================================================== */
@@ -1491,53 +1501,51 @@ static void render_field(const Wave *w, int cols, int rows)
  *   row rows-1   — bright cyan   + bold: interactive key hints
  *   centre (if paused) — bright red + bold PAUSED indicator
  */
-static void render_overlay(const Wave *w, int cols, int rows, double fps)
-{
-    /* Build compact source-list string e.g. "1,2" or "-" if none. */
-    char src_str[16] = { 0 };
-    int  si          = 0;
-    for (int i = 0; i < MAX_SOURCES; i++) {
-        if (w->srcs[i].active) {
-            if (si > 0) src_str[si++] = ',';
-            src_str[si++] = '1' + i;
-        }
+static void render_overlay(const Wave *w, int cols, int rows, double fps) {
+  /* Build compact source-list string e.g. "1,2" or "-" if none. */
+  char src_str[16] = {0};
+  int si = 0;
+  for (int i = 0; i < MAX_SOURCES; i++) {
+    if (w->srcs[i].active) {
+      if (si > 0)
+        src_str[si++] = ',';
+      src_str[si++] = '1' + i;
     }
-    if (si == 0) {
-        src_str[0] = '-';
-        src_str[1] = '\0';
-    } else {
-        src_str[si] = '\0';
-    }
+  }
+  if (si == 0) {
+    src_str[0] = '-';
+    src_str[1] = '\0';
+  } else {
+    src_str[si] = '\0';
+  }
 
-    /* Top status — right-aligned. Theme name first so it's eye-catching. */
-    char top[200];
-    snprintf(top, sizeof top,
-             " [%s] %s  c=%.2f  E=%.1e  f=%.2fHz  bc:%s  srcs:%s  %.0ffps ",
-             VIS_NAMES[w->vis_mode],
-             THEMES[w->theme_idx].name,
-             w->c, (double)w->energy, (double)w->freq_est,
-             BC_NAMES[w->bc_mode],
-             src_str, fps);
-    int top_len = (int)strlen(top);
-    int top_col = cols - top_len;
-    if (top_col < 0) top_col = 0;
-    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
-    mvaddnstr(0, top_col, top, cols);
-    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+  /* Top status — right-aligned. Theme name first so it's eye-catching. */
+  char top[200];
+  snprintf(top, sizeof top,
+           " [%s] %s  c=%.2f  E=%.1e  f=%.2fHz  bc:%s  srcs:%s  %.0ffps ",
+           VIS_NAMES[w->vis_mode], THEMES[w->theme_idx].name, w->c,
+           (double)w->energy, (double)w->freq_est, BC_NAMES[w->bc_mode],
+           src_str, fps);
+  int top_len = (int)strlen(top);
+  int top_col = cols - top_len;
+  if (top_col < 0)
+    top_col = 0;
+  attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+  mvaddnstr(0, top_col, top, cols);
+  attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
 
-    /* Bottom hint — left-aligned. */
-    const char *hint =
-        " q:quit  spc:pause  v/i/w:mode  1-4:src  b:BC"
-        "  +/-:speed  p:impulse  r:reset  t/T:theme ";
-    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
-    mvaddnstr(rows - 1, 0, hint, cols);
-    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
+  /* Bottom hint — left-aligned. */
+  const char *hint = " q:quit  spc:pause  v/i/w:mode  1-4:src  b:BC"
+                     "  +/-:speed  p:impulse  r:reset  t/T:theme ";
+  attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+  mvaddnstr(rows - 1, 0, hint, cols);
+  attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 
-    if (w->paused) {
-        attron(COLOR_PAIR(CP_PP2) | A_BOLD);
-        mvprintw(rows / 2, cols / 2 - 4, " PAUSED ");
-        attroff(COLOR_PAIR(CP_PP2) | A_BOLD);
-    }
+  if (w->paused) {
+    attron(COLOR_PAIR(CP_PP2) | A_BOLD);
+    mvprintw(rows / 2, cols / 2 - 4, " PAUSED ");
+    attroff(COLOR_PAIR(CP_PP2) | A_BOLD);
+  }
 }
 
 /* ===================================================================== */
@@ -1545,55 +1553,61 @@ static void render_overlay(const Wave *w, int cols, int rows, double fps)
 /* ===================================================================== */
 
 typedef struct {
-    Wave wave;
+  Wave wave;
 } Scene;
 
-static void scene_init(Scene *sc, int cols, int rows)
-{
-    Wave *w = &sc->wave;
-    /* Clamp grid to GRID_MAX_X / GRID_MAX_Y; leave 2 rows for HUD bars. */
-    int nx = cols;
-    if (nx > GRID_MAX_X) nx = GRID_MAX_X;
-    int ny = rows - 2;
-    if (ny > GRID_MAX_Y) ny = GRID_MAX_Y;
-    if (ny < 4) ny = 4;
-    if (wave_alloc(w, nx, ny) != 0) return;
-    wave_init(w, nx, ny);
+static void scene_init(Scene *sc, int cols, int rows) {
+  Wave *w = &sc->wave;
+  /* Clamp grid to GRID_MAX_X / GRID_MAX_Y; leave 2 rows for HUD bars. */
+  int nx = cols;
+  if (nx > GRID_MAX_X)
+    nx = GRID_MAX_X;
+  int ny = rows - 2;
+  if (ny > GRID_MAX_Y)
+    ny = GRID_MAX_Y;
+  if (ny < 4)
+    ny = 4;
+  if (wave_alloc(w, nx, ny) != 0)
+    return;
+  wave_init(w, nx, ny);
 }
 
 static void scene_free(Scene *sc) { wave_free(&sc->wave); }
 
-static void scene_resize(Scene *sc, int cols, int rows)
-{
-    Wave  *w  = &sc->wave;
-    int    vm = w->vis_mode, bc = w->bc_mode, th = w->theme_idx;
-    Source saved[MAX_SOURCES];
-    memcpy(saved, w->srcs, sizeof saved);
+static void scene_resize(Scene *sc, int cols, int rows) {
+  Wave *w = &sc->wave;
+  int vm = w->vis_mode, bc = w->bc_mode, th = w->theme_idx;
+  Source saved[MAX_SOURCES];
+  memcpy(saved, w->srcs, sizeof saved);
 
-    wave_free(w);
-    memset(w, 0, sizeof *w);
+  wave_free(w);
+  memset(w, 0, sizeof *w);
 
-    int nx = cols;
-    if (nx > GRID_MAX_X) nx = GRID_MAX_X;
-    int ny = rows - 2;
-    if (ny > GRID_MAX_Y) ny = GRID_MAX_Y;
-    if (ny < 4) ny = 4;
-    if (wave_alloc(w, nx, ny) != 0) return;
-    wave_init(w, nx, ny);
-    w->vis_mode  = vm;
-    w->bc_mode   = bc;
-    w->theme_idx = th;
-    /* Restore active flags (positions/freqs recomputed for new grid size) */
-    for (int i = 0; i < MAX_SOURCES; i++)
-        w->srcs[i].active = saved[i].active;
+  int nx = cols;
+  if (nx > GRID_MAX_X)
+    nx = GRID_MAX_X;
+  int ny = rows - 2;
+  if (ny > GRID_MAX_Y)
+    ny = GRID_MAX_Y;
+  if (ny < 4)
+    ny = 4;
+  if (wave_alloc(w, nx, ny) != 0)
+    return;
+  wave_init(w, nx, ny);
+  w->vis_mode = vm;
+  w->bc_mode = bc;
+  w->theme_idx = th;
+  /* Restore active flags (positions/freqs recomputed for new grid size) */
+  for (int i = 0; i < MAX_SOURCES; i++)
+    w->srcs[i].active = saved[i].active;
 }
 
-static void scene_tick(Scene *sc)
-{
-    Wave *w = &sc->wave;
-    if (w->paused || !w->p) return;
-    update_wave(w);
-    apply_boundary(w);
+static void scene_tick(Scene *sc) {
+  Wave *w = &sc->wave;
+  if (w->paused || !w->p)
+    return;
+  update_wave(w);
+  apply_boundary(w);
 }
 
 /*
@@ -1605,34 +1619,33 @@ static void scene_tick(Scene *sc)
  * frame just makes the room edges visible. Dim yellow so the frame
  * reads as chrome, not as field content.
  */
-static void render_room_frame(const Wave *w)
-{
-    int nx = w->nx, ny = w->ny;
-    int top_row   = 1;  /* one row below the HUD     */
-    int bot_row   = ny; /* last screen row of physics */
-    int left_col  = 0;
-    int right_col = nx - 1;
+static void render_room_frame(const Wave *w) {
+  int nx = w->nx, ny = w->ny;
+  int top_row = 1;  /* one row below the HUD     */
+  int bot_row = ny; /* last screen row of physics */
+  int left_col = 0;
+  int right_col = nx - 1;
 
-    attron(COLOR_PAIR(CP_HUD) | A_DIM);
-    for (int x = left_col; x <= right_col; x++) {
-        chtype ch = '-';
-        if (x == left_col || x == right_col) ch = '+';
-        mvaddch(top_row, x, ch);
-        mvaddch(bot_row, x, ch);
-    }
-    for (int y = top_row + 1; y < bot_row; y++) {
-        mvaddch(y, left_col, '|');
-        mvaddch(y, right_col, '|');
-    }
-    attroff(COLOR_PAIR(CP_HUD) | A_DIM);
+  attron(COLOR_PAIR(CP_HUD) | A_DIM);
+  for (int x = left_col; x <= right_col; x++) {
+    chtype ch = '-';
+    if (x == left_col || x == right_col)
+      ch = '+';
+    mvaddch(top_row, x, ch);
+    mvaddch(bot_row, x, ch);
+  }
+  for (int y = top_row + 1; y < bot_row; y++) {
+    mvaddch(y, left_col, '|');
+    mvaddch(y, right_col, '|');
+  }
+  attroff(COLOR_PAIR(CP_HUD) | A_DIM);
 }
 
-static void scene_draw(const Scene *sc, int cols, int rows, double fps)
-{
-    erase();
-    render_field(&sc->wave, cols, rows - 2);
-    render_room_frame(&sc->wave);
-    render_overlay(&sc->wave, cols, rows, fps);
+static void scene_draw(const Scene *sc, int cols, int rows, double fps) {
+  erase();
+  render_field(&sc->wave, cols, rows - 2);
+  render_room_frame(&sc->wave);
+  render_overlay(&sc->wave, cols, rows, fps);
 }
 
 /* ===================================================================== */
@@ -1640,31 +1653,28 @@ static void scene_draw(const Scene *sc, int cols, int rows, double fps)
 /* ===================================================================== */
 
 typedef struct {
-    int cols, rows;
+  int cols, rows;
 } Screen;
 
-static void screen_init(Screen *s)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    color_init(0); /* default theme; replaced per Wave state on t/T */
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  color_init(0); /* default theme; replaced per Wave state on t/T */
+  getmaxyx(stdscr, s->rows, s->cols);
 }
-static void screen_free(Screen *s)
-{
-    (void)s;
-    endwin();
+static void screen_free(Screen *s) {
+  (void)s;
+  endwin();
 }
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
 /* ===================================================================== */
@@ -1672,169 +1682,189 @@ static void screen_resize(Screen *s)
 /* ===================================================================== */
 
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+  Scene scene;
+  Screen screen;
+  volatile sig_atomic_t running;
+  volatile sig_atomic_t need_resize;
 } App;
 
-static App  g_app;
-static void on_exit(int s)
-{
-    (void)s;
-    g_app.running = 0;
+static App g_app;
+static void on_exit(int s) {
+  (void)s;
+  g_app.running = 0;
 }
-static void on_resize(int s)
-{
-    (void)s;
-    g_app.need_resize = 1;
+static void on_resize(int s) {
+  (void)s;
+  g_app.need_resize = 1;
 }
 static void cleanup(void) { endwin(); }
 
-static bool handle_key(App *app, int ch)
-{
-    Wave *w = &app->scene.wave;
-    switch (ch) {
-    case 'q':
-    case 'Q':
-    case 27: return false;
-    case ' ': w->paused = !w->paused; break;
-    case 'v':
-    case 'V': w->vis_mode = VIS_PRESSURE; break;
-    case 'i':
-    case 'I': w->vis_mode = VIS_INTENSITY; break;
-    case 'w':
-    case 'W': w->vis_mode = VIS_WAVEFRONT; break;
-    case '1': w->srcs[0].active = !w->srcs[0].active; break;
-    case '2': w->srcs[1].active = !w->srcs[1].active; break;
-    case '3': w->srcs[2].active = !w->srcs[2].active; break;
-    case '4': w->srcs[3].active = !w->srcs[3].active; break;
-    case 'b':
-    case 'B':
-        w->bc_mode = (w->bc_mode + 1) % 2;
-        break;
-    case '+':
-    case '=':
-        w->c += WAVE_C_STEP;
-        if (w->c > WAVE_C_MAX) w->c = WAVE_C_MAX;
-        wave_recompute_dt(w);
-        /* Recompute source frequencies for new c */
-        {
-            float bf = w->c / (LAMBDA_CELLS * w->dx);
-            for (int i = 0; i < MAX_SOURCES; i++)
-                w->srcs[i].freq = bf * SRC_FMUL[i];
-        }
-        break;
-    case '-':
-        w->c -= WAVE_C_STEP;
-        if (w->c < WAVE_C_MIN) w->c = WAVE_C_MIN;
-        wave_recompute_dt(w);
-        {
-            float bf = w->c / (LAMBDA_CELLS * w->dx);
-            for (int i = 0; i < MAX_SOURCES; i++)
-                w->srcs[i].freq = bf * SRC_FMUL[i];
-        }
-        break;
-    case 'p':
-    case 'P': {
-        /* Gaussian pressure impulse at centre — excites all room modes */
-        int cx = w->nx / 2, cy = w->ny / 2;
-        int R = (int)(LAMBDA_CELLS * 0.5f);
-        if (R < 2) R = 2;
-        for (int y = cy - R; y <= cy + R; y++) {
-            if (y < 1 || y >= w->ny - 1) continue;
-            for (int x = cx - R; x <= cx + R; x++) {
-                if (x < 1 || x >= w->nx - 1) continue;
-                float ddx = (float)(x - cx), ddy = (float)(y - cy);
-                float r2 = (ddx * ddx + ddy * ddy) / (float)(R * R);
-                w->p[IDX(w, x, y)] += 2.5f * expf(-r2 * 4.0f);
-            }
-        }
-        break;
+static bool handle_key(App *app, int ch) {
+  Wave *w = &app->scene.wave;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
+  case ' ':
+    w->paused = !w->paused;
+    break;
+  case 'v':
+  case 'V':
+    w->vis_mode = VIS_PRESSURE;
+    break;
+  case 'i':
+  case 'I':
+    w->vis_mode = VIS_INTENSITY;
+    break;
+  case 'w':
+  case 'W':
+    w->vis_mode = VIS_WAVEFRONT;
+    break;
+  case '1':
+    w->srcs[0].active = !w->srcs[0].active;
+    break;
+  case '2':
+    w->srcs[1].active = !w->srcs[1].active;
+    break;
+  case '3':
+    w->srcs[2].active = !w->srcs[2].active;
+    break;
+  case '4':
+    w->srcs[3].active = !w->srcs[3].active;
+    break;
+  case 'b':
+  case 'B':
+    w->bc_mode = (w->bc_mode + 1) % 2;
+    break;
+  case '+':
+  case '=':
+    w->c += WAVE_C_STEP;
+    if (w->c > WAVE_C_MAX)
+      w->c = WAVE_C_MAX;
+    wave_recompute_dt(w);
+    /* Recompute source frequencies for new c */
+    {
+      float bf = w->c / (LAMBDA_CELLS * w->dx);
+      for (int i = 0; i < MAX_SOURCES; i++)
+        w->srcs[i].freq = bf * SRC_FMUL[i];
     }
-    case 'r':
-    case 'R':
-        scene_resize(&app->scene, app->screen.cols, app->screen.rows);
-        break;
-    case 't':
-        w->theme_idx = (w->theme_idx + 1) % N_THEMES;
-        color_apply_theme(w->theme_idx);
-        break;
-    case 'T':
-        w->theme_idx = (w->theme_idx + N_THEMES - 1) % N_THEMES;
-        color_apply_theme(w->theme_idx);
-        break;
-    default: break;
+    break;
+  case '-':
+    w->c -= WAVE_C_STEP;
+    if (w->c < WAVE_C_MIN)
+      w->c = WAVE_C_MIN;
+    wave_recompute_dt(w);
+    {
+      float bf = w->c / (LAMBDA_CELLS * w->dx);
+      for (int i = 0; i < MAX_SOURCES; i++)
+        w->srcs[i].freq = bf * SRC_FMUL[i];
     }
-    return true;
+    break;
+  case 'p':
+  case 'P': {
+    /* Gaussian pressure impulse at centre — excites all room modes */
+    int cx = w->nx / 2, cy = w->ny / 2;
+    int R = (int)(LAMBDA_CELLS * 0.5f);
+    if (R < 2)
+      R = 2;
+    for (int y = cy - R; y <= cy + R; y++) {
+      if (y < 1 || y >= w->ny - 1)
+        continue;
+      for (int x = cx - R; x <= cx + R; x++) {
+        if (x < 1 || x >= w->nx - 1)
+          continue;
+        float ddx = (float)(x - cx), ddy = (float)(y - cy);
+        float r2 = (ddx * ddx + ddy * ddy) / (float)(R * R);
+        w->p[IDX(w, x, y)] += 2.5f * expf(-r2 * 4.0f);
+      }
+    }
+    break;
+  }
+  case 'r':
+  case 'R':
+    scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+    break;
+  case 't':
+    w->theme_idx = (w->theme_idx + 1) % N_THEMES;
+    color_apply_theme(w->theme_idx);
+    break;
+  case 'T':
+    w->theme_idx = (w->theme_idx + N_THEMES - 1) % N_THEMES;
+    color_apply_theme(w->theme_idx);
+    break;
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    atexit(cleanup);
-    signal(SIGINT, on_exit);
-    signal(SIGTERM, on_exit);
-    signal(SIGWINCH, on_resize);
+int main(void) {
+  atexit(cleanup);
+  signal(SIGINT, on_exit);
+  signal(SIGTERM, on_exit);
+  signal(SIGWINCH, on_resize);
 
-    App *app     = &g_app;
-    app->running = 1;
+  App *app = &g_app;
+  app->running = 1;
 
-    screen_init(&app->screen);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+  screen_init(&app->screen);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    int64_t frame_time = clock_ns();
-    int64_t fps_accum  = 0;
-    int     fps_count  = 0;
-    double  fps_disp   = 0.0;
+  int64_t frame_time = clock_ns();
+  int64_t fps_accum = 0;
+  int fps_count = 0;
+  double fps_disp = 0.0;
 
-    while (app->running) {
+  while (app->running) {
 
-        /* ── resize ──────────────────────────────────── */
-        if (app->need_resize) {
-            screen_resize(&app->screen);
-            scene_resize(&app->scene, app->screen.cols, app->screen.rows);
-            app->need_resize = 0;
-            frame_time       = clock_ns();
-        }
-
-        /* ── wall-clock dt ───────────────────────────── */
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 200 * NS_PER_MS) dt = 200 * NS_PER_MS;
-
-        /* ── physics steps ───────────────────────────── */
-        for (int s = 0; s < STEPS_PER_FRAME; s++)
-            scene_tick(&app->scene);
-
-        /* ── fps tracking ────────────────────────────── */
-        fps_count++;
-        fps_accum += dt;
-        if (fps_accum >= 500 * NS_PER_MS) {
-            fps_disp  = (double)fps_count / ((double)fps_accum / (double)NS_PER_SEC);
-            fps_count = 0;
-            fps_accum = 0;
-        }
-
-        /* ── sleep to target 30 fps ──────────────────── */
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 30 - elapsed);
-
-        /* ── render ──────────────────────────────────── */
-        scene_draw(&app->scene, app->screen.cols, app->screen.rows, fps_disp);
-        wnoutrefresh(stdscr);
-        doupdate();
-
-        /* ── input ───────────────────────────────────── */
-        int key;
-        while ((key = getch()) != ERR)
-            if (!handle_key(app, key)) {
-                app->running = 0;
-                break;
-            }
+    /* ── resize ──────────────────────────────────── */
+    if (app->need_resize) {
+      screen_resize(&app->screen);
+      scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+      app->need_resize = 0;
+      frame_time = clock_ns();
     }
 
-    scene_free(&app->scene);
-    screen_free(&app->screen);
-    return 0;
+    /* ── wall-clock dt ───────────────────────────── */
+    int64_t now = clock_ns();
+    int64_t dt = now - frame_time;
+    frame_time = now;
+    if (dt > 200 * NS_PER_MS)
+      dt = 200 * NS_PER_MS;
+
+    /* ── physics steps ───────────────────────────── */
+    for (int s = 0; s < STEPS_PER_FRAME; s++)
+      scene_tick(&app->scene);
+
+    /* ── fps tracking ────────────────────────────── */
+    fps_count++;
+    fps_accum += dt;
+    if (fps_accum >= 500 * NS_PER_MS) {
+      fps_disp = (double)fps_count / ((double)fps_accum / (double)NS_PER_SEC);
+      fps_count = 0;
+      fps_accum = 0;
+    }
+
+    /* ── sleep to target 30 fps ──────────────────── */
+    int64_t elapsed = clock_ns() - frame_time + dt;
+    clock_sleep_ns(NS_PER_SEC / 30 - elapsed);
+
+    /* ── render ──────────────────────────────────── */
+    scene_draw(&app->scene, app->screen.cols, app->screen.rows, fps_disp);
+    wnoutrefresh(stdscr);
+    doupdate();
+
+    /* ── input ───────────────────────────────────── */
+    int key;
+    while ((key = getch()) != ERR)
+      if (!handle_key(app, key)) {
+        app->running = 0;
+        break;
+      }
+  }
+
+  scene_free(&app->scene);
+  screen_free(&app->screen);
+  return 0;
 }

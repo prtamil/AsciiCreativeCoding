@@ -19,7 +19,8 @@
  *       Above 1: ripples GROW WITHOUT BOUND — the simulation explodes,
  *       amplitudes go to infinity, the screen fills with noise.
  *
- *       Press 1-6 to jump between presets (cfl = 0.4 .. 1.4); use +/-
+ *       Press 1-9 / 0 to jump between 10 named CFL regimes
+ *       (GLASSY through RUNAWAY, cfl = 0.20 .. 1.50); use +/-
  *       to nudge dt; c/C to change wave speed.  Watch the CFL bar
  *       cross 1.0 and the simulation visibly destabilise.  Press m
  *       for a clean eigenmode initialisation that explodes
@@ -63,7 +64,7 @@
  *   q / Q / ESC      quit
  *   space            pause / resume
  *   s                advance one tick (when paused)
- *   1-6              CFL preset jump (0.4, 0.6, 0.85, 1.0, 1.1, 1.4)
+ *   1-9, 0           CFL preset jump (10 named regimes from GLASSY to RUNAWAY)
  *   + / =            increase dt by 5 %
  *   - / _            decrease dt by 5 %
  *   c                slow wave speed by 10 %
@@ -163,8 +164,9 @@
  * Rendering     : Diverging colour map — bright red ramp for positive
  *                 amplitude, bright blue ramp for negative.  Each grid
  *                 cell maps to one terminal cell; bright extremes use
- *                 A_BOLD.  Bottom 5 lines reserved for the HUD
- *                 (parameters, CFL meter, key hints).
+ *                 A_BOLD.  HUD split CLAUDE.md-style: top 4 rows hold
+ *                 status (title / params / CFL meter / stats), bottom
+ *                 row holds the action-key hints.
  *
  * Performance   : O(rows · cols) per step.  At a typical 60 × 30 grid
  *                 (1800 cells) and 30 fps simulation rate, ~54k cell
@@ -172,19 +174,62 @@
  *
  * References
  * ──────────
- *   Courant, Friedrichs & Lewy, "Über die partiellen
- *     Differenzengleichungen der mathematischen Physik" (1928) —
- *     the original CFL paper.  The English translation appeared
- *     in IBM J. Res. Dev. 11 (1967) 215.
- *   LeVeque, "Finite Difference Methods for Ordinary and Partial
- *     Differential Equations" (SIAM, 2007) chs. 9-10 — modern
- *     treatment of stability + Von Neumann analysis.
- *   Strikwerda, "Finite Difference Schemes and Partial
- *     Differential Equations" (2nd ed., SIAM 2004) ch. 7.
- *   Wikipedia, "Courant-Friedrichs-Lewy condition":
- *     https://en.wikipedia.org/wiki/Courant%E2%80%93Friedrichs%E2%80%93Lewy_condition
- *   See also project file physics/rk_method_comparision.c — same
- *     stability story for ODE integrators (RK4, Euler, etc.).
+ *   ── The CFL condition itself ──────────────────────────────────────
+ *   [1] Courant, R., Friedrichs, K. & Lewy, H. (1928), "Über die
+ *       partiellen Differenzengleichungen der mathematischen Physik",
+ *       Math. Ann. 100, pp. 32-74 — THE original CFL paper.  English
+ *       translation: IBM J. Res. Dev. 11 (1967) 215.  Read for the
+ *       proof of the c·dt/dx ≤ 1 limit on explicit hyperbolic schemes.
+ *   [2] Strikwerda, J. C., "Finite Difference Schemes and Partial
+ *       Differential Equations", 2nd ed. (SIAM 2004) ch. 7 — modern
+ *       proof of CFL via Von Neumann amplification analysis.
+ *
+ *   ── Von Neumann / amplification-factor analysis ───────────────────
+ *   [3] Charney, J. G., Fjørtoft, R. & von Neumann, J. (1950),
+ *       "Numerical Integration of the Barotropic Vorticity Equation",
+ *       Tellus 2, pp. 237-254 — the canonical introduction of
+ *       Fourier-mode stability analysis (Von Neumann method).  The
+ *       formula μ(cfl) used by growth_per_step_theoretical() in §8 is
+ *       a direct application of this technique.
+ *   [4] LeVeque, R. J., "Finite Difference Methods for Ordinary and
+ *       Partial Differential Equations" (SIAM 2007) chs. 9-10 —
+ *       textbook treatment of stability + Von Neumann; tracks the
+ *       "discrete dispersion relation" approach used in §7.
+ *
+ *   ── The leapfrog scheme used in §7 ────────────────────────────────
+ *   [5] Yee, K. S. (1966), "Numerical solution of initial boundary
+ *       value problems involving Maxwell's equations in isotropic
+ *       media", IEEE Trans. Antennas Propag. AP-14, pp. 302-307 —
+ *       the original 2nd-order leapfrog / central-difference scheme;
+ *       our wave_step() is the scalar special case.
+ *
+ *   ── Wave-equation physics ─────────────────────────────────────────
+ *   [6] Crawford, F. S., "Waves" (Berkeley Physics Course Vol. III,
+ *       McGraw-Hill 1968) chs. 2-3 — most intuitive intro to the 2-D
+ *       scalar wave equation and standing-wave eigenmodes (preset 'm'
+ *       seeds an exact eigenmode of the discretised Laplacian).
+ *   [7] Griffiths, D. J., "Introduction to Electrodynamics", 4th ed.,
+ *       ch. 9 — derivation of ∂²u/∂t² = c²∇²u from first principles.
+ *
+ *   ── Rendering / ncurses ───────────────────────────────────────────
+ *   [8] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair(),
+ *       use_default_colors(), and the diff-buffer present pipeline
+ *       used in scene_draw() → wnoutrefresh() → doupdate().
+ *   [9] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — the design
+ *       basis for our amplitude→glyph ramp (' . : + * # @).
+ *
+ *   ── Cross-references inside this project ──────────────────────────
+ *  [10] physics/waves.c            — same wave PDE solved with TWO
+ *                                    engines (FDTD + analytic) instead
+ *                                    of focused on the stability cliff.
+ *  [11] physics/rk_method_comparision.c — same stability story for
+ *                                    ODE integrators (Euler, RK2, RK4).
+ *
+ *   ── Online quick reference ────────────────────────────────────────
+ *  [12] https://en.wikipedia.org/wiki/Courant%E2%80%93Friedrichs%E2%80%93Lewy_condition
+ *  [13] https://en.wikipedia.org/wiki/Von_Neumann_stability_analysis
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -628,7 +673,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -658,87 +703,167 @@
  */
 
 enum {
-    /* Render frame cap and simulation step rate. */
-    TARGET_FPS    = 60,
-    SIM_STEPS_PER_FRAME_MAX = 4,   /* upper bound on steps per render */
+  /* Render frame cap and simulation step rate. */
+  TARGET_FPS = 60,
+  SIM_STEPS_PER_FRAME_MAX = 4, /* upper bound on steps per render */
 
-    /* Grid bounds.  The actual size adapts to the terminal at runtime. */
-    GRID_ROWS_MAX = 80,
-    GRID_COLS_MAX = 200,
+  /* Grid bounds.  The actual size adapts to the terminal at runtime. */
+  GRID_ROWS_MAX = 80,
+  GRID_COLS_MAX = 200,
 
-    /* Dashboard layout. */
-    DASH_LINES    = 5,             /* bottom 5 rows reserved for HUD */
+  /* HUD layout — CLAUDE.md canonical split.
+   *   TOP rows 0..HUD_ROWS_TOP-1   status (title / params / CFL meter / stats)
+   *   FIELD rows HUD_ROWS_TOP..rows-1-HUD_ROWS_BOT
+   *   BOTTOM row rows-1            action key hints (bright cyan + bold)
+   * Total reserved rows = HUD_ROWS_TOP + HUD_ROWS_BOT.                 */
+  HUD_ROWS_TOP = 4,
+  HUD_ROWS_BOT = 1,
 
-    /* HUD recompute interval (don't recalculate fps every frame). */
-    FPS_UPDATE_MS = 500,
+  /* HUD recompute interval (don't recalculate fps every frame). */
+  FPS_UPDATE_MS = 500,
 
-    /* Number of distinct colour ramp levels per sign (positive / negative). */
-    RAMP_LEVELS   = 9,
+  /* Number of distinct colour ramp levels per sign (positive / negative). */
+  RAMP_LEVELS = 9,
 
-    /* Amplitude history for the explosion-detector growth ratio. */
-    GROWTH_HISTORY_LEN = 4,
+  /* Amplitude history for the explosion-detector growth ratio. */
+  GROWTH_HISTORY_LEN = 4,
 };
 
 /* PHYSICAL CONSTANTS — units called out explicitly. */
-#define WAVE_SPEED_DEFAULT      20.0f   /* cells per second */
-#define WAVE_SPEED_MIN           2.0f
-#define WAVE_SPEED_MAX         200.0f
+#define WAVE_SPEED_DEFAULT 20.0f /* cells per second */
+#define WAVE_SPEED_MIN 2.0f
+#define WAVE_SPEED_MAX 200.0f
 
-#define STEP_SECONDS_DEFAULT  0.030f    /* seconds per simulation tick */
-#define STEP_SECONDS_MIN     0.0005f
-#define STEP_SECONDS_MAX     0.5000f
+#define STEP_SECONDS_DEFAULT 0.030f /* seconds per simulation tick */
+#define STEP_SECONDS_MIN 0.0005f
+#define STEP_SECONDS_MAX 0.5000f
 
-#define EXPLOSION_THRESHOLD    1.0e6f   /* abs amplitude triggers reset */
-#define DROP_AMPLITUDE         1.0f     /* peak height of Gaussian drop */
-#define DROP_RADIUS_CELLS      4.0f     /* sigma of the Gaussian, in cells */
-#define EIGENMODE_AMPLITUDE    0.05f    /* small initial amplitude — the
-                                         * eigenmode either grows or stays */
+#define EXPLOSION_THRESHOLD 1.0e6f /* abs amplitude triggers reset */
+#define DROP_AMPLITUDE 1.0f        /* peak height of Gaussian drop */
+#define DROP_RADIUS_CELLS 4.0f     /* sigma of the Gaussian, in cells */
+#define EIGENMODE_AMPLITUDE                                                    \
+  0.05f /* small initial amplitude — the                                     \
+         * eigenmode either grows or stays */
 
-/* CFL PRESETS — six landmark values reachable with keys 1..6.  Each
- * preset sets dt = preset_cfl / (c · sqrt(2)) so the resulting cfl
- * is exactly the named value. */
-static const float cfl_presets[6] = {
-    0.40f,   /* very stable     */
-    0.60f,   /* comfortably stable */
-    0.85f,   /* margin */
-    1.00f,   /* the cliff edge  */
-    1.10f,   /* mildly unstable */
-    1.40f,   /* aggressively unstable */
+/* CFL PRESETS — ten named landmark values reachable with keys 1..9, 0.
+ * Each preset sets dt = preset_cfl / (c · sqrt(2)) so the resulting CFL
+ * is exactly the named value.  Names appear in the HUD so the user can
+ * see at a glance which regime they have selected.
+ *
+ * Ordering walks from STRONGLY STABLE through the cliff at CFL=1 into
+ * RUNAWAY blow-up, so pressing 1, 2, 3 ... is a guided tour through
+ * the stability landscape. */
+/*
+ * cfl_preset — ROW shape for one entry of cfl_presets[].
+ *
+ * Intent
+ *   The user shouldn't have to memorise "0.95 = approaching the cliff,
+ *   1.05 = mildly unstable, 1.30 = explodes in 10 seconds".  Each row
+ *   bundles a numeric CFL target with a SHORT HUMAN LABEL that the HUD
+ *   shows back at the user, so pressing 5 visibly displays "MARGIN" and
+ *   pressing 9 displays "EXPLODE".
+ *
+ * Why a struct and not parallel float[] / string[]
+ *   Two arrays of equal length is a classic source of off-by-one bugs.
+ *   Bundling name+cfl into ONE struct row makes the table
+ *   self-checking: it is mechanically impossible to associate a name
+ *   with the wrong number.
+ *
+ * Why CFL (and not dt) is the user-facing knob
+ *   dt depends on wave_speed_cps via cfl = c·dt·√2 / dx.  Storing CFL
+ *   directly lets each preset name a STABILITY REGIME independent of
+ *   the current wave speed — pressing 6 (EDGE) always lands exactly at
+ *   cfl = 1.0 no matter what 'c' the user has set.
+ *
+ * Reference [1] Courant-Friedrichs-Lewy 1928 — the original 0..1
+ *   stability scale this table tours.
+ */
+typedef struct {
+    const char *name;   /* short ASCII tag shown in HUD; ≤ 8 chars      */
+    float       cfl;    /* target CFL number; scene_set_cfl_preset()
+                         * derives dt = cfl / (c · √2) from this        */
+} cfl_preset;
+
+#define N_PRESETS 10
+
+static const cfl_preset cfl_presets[N_PRESETS] = {
+    /*  1  */ { "GLASSY",  0.20f }, /* very low CFL, heavy num. dissipation   */
+    /*  2  */ { "QUIET",   0.40f }, /* clean ripples that gently decay        */
+    /*  3  */ { "WAVES",   0.60f }, /* comfortable working point              */
+    /*  4  */ { "RIPPLES", 0.80f }, /* close to optimum, minimal dissipation  */
+    /*  5  */ { "MARGIN",  0.95f }, /* approaching the cliff, still stable    */
+    /*  6  */ { "EDGE",    1.00f }, /* exact CFL boundary — neutral stability */
+    /*  7  */ { "DRIFT",   1.05f }, /* mildly unstable, slow exponential grow */
+    /*  8  */ { "TILT",    1.15f }, /* faster growth, visible explosion ~30s  */
+    /*  9  */ { "EXPLODE", 1.30f }, /* rapid blow-up, ~10s to NaN             */
+    /*  0  */ { "RUNAWAY", 1.50f }, /* extreme, screen saturates in seconds   */
 };
 
 /* THE CFL CONSTANT — sqrt(2) for our 2-D Laplacian (see T7). */
-#define CFL_DIM_FACTOR    1.41421356237309504880f
+#define CFL_DIM_FACTOR 1.41421356237309504880f
 
 /* COLOUR PAIR IDS.  Reserved blocks for the colour ramp + HUD. */
 enum {
-    PAIR_BACKGROUND = 1,
-    PAIR_POS_BASE   = 2,                              /* +0..+RAMP_LEVELS-1 */
-    PAIR_NEG_BASE   = PAIR_POS_BASE + RAMP_LEVELS,    /* +0..+RAMP_LEVELS-1 */
-    PAIR_HUD        = PAIR_NEG_BASE + RAMP_LEVELS,
-    PAIR_HINT,
-    PAIR_STABLE,    /* CFL meter zone colours */
-    PAIR_MARGINAL,
-    PAIR_UNSTABLE,
-    PAIR_WARN,      /* white-on-red flashing alert */
+  PAIR_BACKGROUND = 1,
+  PAIR_POS_BASE = 2,                           /* +0..+RAMP_LEVELS-1 */
+  PAIR_NEG_BASE = PAIR_POS_BASE + RAMP_LEVELS, /* +0..+RAMP_LEVELS-1 */
+  PAIR_HUD = PAIR_NEG_BASE + RAMP_LEVELS,
+  PAIR_HINT,
+  PAIR_STABLE, /* CFL meter zone colours */
+  PAIR_MARGINAL,
+  PAIR_UNSTABLE,
+  PAIR_WARN, /* white-on-red flashing alert */
 };
 
-/* THEME — map the 9 ramp levels to 256-colour fg codes.  Three themes
- * provided so the user can pick the most readable one for their
- * terminal.  All themes obey the project rule "no colour code below
- * 24" so A_DIM doesn't render invisible. */
-enum { N_THEMES = 3 };
+/* THEME — map each of the 9 amplitude ramp levels to a 256-colour fg
+ * code, separately for positive and negative amplitudes (diverging
+ * palette).  Six themes provided for variety.
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness"):
+ *   16-23 cube and 232-239 gray are FORBIDDEN — they read as black
+ *   against the default background.  Every entry below is ≥ 24 in the
+ *   cube range; lowest tiers stay in 24-29 only when necessary.
+ *
+ * Earlier versions of this file had the negative ramps starting at
+ * cube 17 → invisible cells dominated the field at low amplitudes,
+ * which made the visualisation look murky.  Fixed by lifting every
+ * neg[0] to 27+ and every pos[0] to 124+ so even the faintest cells
+ * carry visible colour.                                              */
+enum { N_THEMES = 6 };
 
 static const int theme_pos256[N_THEMES][RAMP_LEVELS] = {
-    /* "wave"    — red→white  */ {  52,  88, 124, 160, 196, 202, 208, 220, 231 },
-    /* "thermal" — red→yellow */ {  52,  94, 130, 166, 202, 208, 214, 220, 231 },
-    /* "ocean"   — pale cyan  */ { 159, 195, 195, 195, 231, 231, 231, 231, 231 },
+    /* "WAVE"    — bright red ramp,  red → yellow → white  */
+    { 124, 160, 196, 202, 208, 214, 220, 226, 231 },
+    /* "FIRE"    — orange-yellow heat,  orange → yellow → white */
+    { 130, 166, 202, 208, 214, 220, 226, 230, 231 },
+    /* "NEON"    — electric pink,  magenta → pink → white  */
+    { 165, 201, 207, 213, 219, 225, 226, 230, 231 },
+    /* "OCEAN"   — bright crests,  light blue → white      */
+    { 117, 153, 189, 195, 225, 231, 231, 231, 231 },
+    /* "PLASMA"  — high-energy red→yellow                  */
+    { 196, 202, 208, 214, 220, 226, 230, 231, 231 },
+    /* "AURORA"  — green crests,  green → yellow-green     */
+    {  46,  82, 118, 154, 190, 226, 227, 228, 229 },
 };
+
 static const int theme_neg256[N_THEMES][RAMP_LEVELS] = {
-    /* "wave"    — blue→white */ {  17,  19,  21,  27,  33,  39,  45,  51, 231 },
-    /* "thermal" — magenta    */ {  53,  54,  91,  92, 129, 165, 201, 207, 231 },
-    /* "ocean"   — deep blue  */ {  17,  18,  19,  20,  21,  27,  33,  39,  45 },
+    /* "WAVE"    — bright cool ramp,  blue → cyan → light  */
+    {  27,  33,  39,  45,  51,  87, 123, 159, 195 },
+    /* "FIRE"    — purple troughs,  deep purple → pink     */
+    {  90,  91,  92, 128, 129, 165, 201, 207, 219 },
+    /* "NEON"    — cyan troughs to balance the pink crests */
+    {  33,  39,  45,  51,  87, 123, 159, 195, 231 },
+    /* "OCEAN"   — deep navy troughs,  navy → cyan         */
+    {  25,  27,  33,  39,  45,  51,  87, 123, 159 },
+    /* "PLASMA"  — purple troughs                          */
+    {  53,  54,  91, 128, 129, 165, 201, 207, 213 },
+    /* "AURORA"  — magenta troughs balancing green crests  */
+    {  90, 127, 164, 200, 207, 213, 219, 225, 231 },
 };
-static const char *theme_name[N_THEMES] = { "wave", "thermal", "ocean" };
+
+static const char *theme_name[N_THEMES] = {
+    "WAVE", "FIRE", "NEON", "OCEAN", "PLASMA", "AURORA"
+};
 
 /* ===================================================================== */
 /* §2  clock — monotonic time                                            */
@@ -755,18 +880,17 @@ static const char *theme_name[N_THEMES] = { "wave", "thermal", "ocean" };
 
 #define NS_PER_SEC 1000000000LL
 
-static int64_t clock_now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
+static int64_t clock_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / NS_PER_SEC, ns % NS_PER_SEC };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / NS_PER_SEC, ns % NS_PER_SEC};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -788,53 +912,53 @@ static void clock_sleep_ns(int64_t ns)
  * (hints) per the project's CLAUDE.md HUD spec.
  */
 
-static int wave_pair_for(float amplitude, int theme)
-{
-    /* Map amplitude in [-1, +1] (clamped) to a ramp level 0..RAMP_LEVELS-1. */
-    float clamped   = amplitude;
-    if (clamped >  1.0f) clamped =  1.0f;
-    if (clamped < -1.0f) clamped = -1.0f;
+static int wave_pair_for(float amplitude, int theme) {
+  /* Map amplitude in [-1, +1] (clamped) to a ramp level 0..RAMP_LEVELS-1. */
+  float clamped = amplitude;
+  if (clamped > 1.0f)
+    clamped = 1.0f;
+  if (clamped < -1.0f)
+    clamped = -1.0f;
 
-    int   level = (int)(fabsf(clamped) * (RAMP_LEVELS - 0.001f));
-    if (level >= RAMP_LEVELS) level = RAMP_LEVELS - 1;
-    (void)theme;   /* used by ramp tables, looked up via init_pair already */
-    return (clamped >= 0.0f) ? PAIR_POS_BASE + level
-                             : PAIR_NEG_BASE + level;
+  int level = (int)(fabsf(clamped) * (RAMP_LEVELS - 0.001f));
+  if (level >= RAMP_LEVELS)
+    level = RAMP_LEVELS - 1;
+  (void)theme; /* used by ramp tables, looked up via init_pair already */
+  return (clamped >= 0.0f) ? PAIR_POS_BASE + level : PAIR_NEG_BASE + level;
 }
 
-static void color_init(int theme)
-{
-    start_color();
-    use_default_colors();
+static void color_init(int theme) {
+  start_color();
+  use_default_colors();
 
-    /* 9 positive + 9 negative ramp colours for the active theme. */
-    for (int level = 0; level < RAMP_LEVELS; level++) {
-        if (COLORS >= 256) {
-            init_pair(PAIR_POS_BASE + level, theme_pos256[theme][level], -1);
-            init_pair(PAIR_NEG_BASE + level, theme_neg256[theme][level], -1);
-        } else {
-            init_pair(PAIR_POS_BASE + level, COLOR_RED,   -1);
-            init_pair(PAIR_NEG_BASE + level, COLOR_BLUE,  -1);
-        }
-    }
-
-    /* HUD: bright yellow (top status), bright cyan (key hints).
-     * Default background (-1) = whatever the terminal user set. */
+  /* 9 positive + 9 negative ramp colours for the active theme. */
+  for (int level = 0; level < RAMP_LEVELS; level++) {
     if (COLORS >= 256) {
-        init_pair(PAIR_HUD,      226, -1);   /* bright yellow */
-        init_pair(PAIR_HINT,      51, -1);   /* bright cyan   */
-        init_pair(PAIR_STABLE,    82, -1);   /* lime green    */
-        init_pair(PAIR_MARGINAL, 220, -1);   /* amber         */
-        init_pair(PAIR_UNSTABLE, 196, -1);   /* bright red    */
-        init_pair(PAIR_WARN,     231, COLOR_RED);   /* white on red */
+      init_pair(PAIR_POS_BASE + level, theme_pos256[theme][level], -1);
+      init_pair(PAIR_NEG_BASE + level, theme_neg256[theme][level], -1);
     } else {
-        init_pair(PAIR_HUD,      COLOR_YELLOW,  -1);
-        init_pair(PAIR_HINT,     COLOR_CYAN,    -1);
-        init_pair(PAIR_STABLE,   COLOR_GREEN,   -1);
-        init_pair(PAIR_MARGINAL, COLOR_YELLOW,  -1);
-        init_pair(PAIR_UNSTABLE, COLOR_RED,     -1);
-        init_pair(PAIR_WARN,     COLOR_WHITE,   COLOR_RED);
+      init_pair(PAIR_POS_BASE + level, COLOR_RED, -1);
+      init_pair(PAIR_NEG_BASE + level, COLOR_BLUE, -1);
     }
+  }
+
+  /* HUD: bright yellow (top status), bright cyan (key hints).
+   * Default background (-1) = whatever the terminal user set. */
+  if (COLORS >= 256) {
+    init_pair(PAIR_HUD, 226, -1);         /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1);         /* bright cyan   */
+    init_pair(PAIR_STABLE, 82, -1);       /* lime green    */
+    init_pair(PAIR_MARGINAL, 220, -1);    /* amber         */
+    init_pair(PAIR_UNSTABLE, 196, -1);    /* bright red    */
+    init_pair(PAIR_WARN, 231, COLOR_RED); /* white on red */
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+    init_pair(PAIR_STABLE, COLOR_GREEN, -1);
+    init_pair(PAIR_MARGINAL, COLOR_YELLOW, -1);
+    init_pair(PAIR_UNSTABLE, COLOR_RED, -1);
+    init_pair(PAIR_WARN, COLOR_WHITE, COLOR_RED);
+  }
 }
 
 /* ===================================================================== */
@@ -861,35 +985,73 @@ static void color_init(int theme)
  * so we avoid malloc; the active subregion is (rows × cols).
  */
 
+/*
+ * grid_state — three time-level buffers for the leapfrog FDTD scheme.
+ *
+ * Intent
+ *   The 2nd-order central-difference time step
+ *     u_new = 2·u_now − u_past + (c·dt)² · ∇²u_now
+ *   needs THREE adjacent slices (past, now, next).  We keep them as
+ *   POINTERS that rotate among three statically-allocated storage
+ *   arenas.  See [5] Yee 1966 for the original scheme.
+ *
+ * Why pointer rotation instead of memcpy
+ *   Rotating three pointers is O(1) per step vs O(W·H) for an
+ *   equivalent memcpy.  At a 200×80 active region and 60 fps that's
+ *   ~960k cell-copies/s avoided — the leapfrog scheme's traditional
+ *   efficiency trick.  See wave_step() in §7.
+ *
+ * Why static buffers (no malloc)
+ *   The hot path makes ZERO allocations per CLAUDE.md "no dynamic
+ *   allocation after init".  Resize on SIGWINCH only updates the
+ *   active subregion (rows, cols); the buffers are sized for the
+ *   worst case (GRID_*_MAX) and unused cells are simply ignored.
+ *   Trade: ~960 KB BSS for a guaranteed alloc-free hot path.
+ *
+ * Indexing
+ *   Row-major:  u[r * cols + c].  Use grid_at() / grid_set() helpers
+ *   rather than direct indexing so the convention is enforced in one
+ *   place.
+ *
+ * Reference [5] Yee 1966; [6] Crawford ch. 2 (wave equation eigenmodes
+ *   live naturally on this discretisation).
+ */
 typedef struct {
-    int    rows, cols;                       /* active subregion bounds */
-    float *wave_past;                        /* points into one of buf_a/b/c */
+    /* ── Active subregion bounds (≤ GRID_*_MAX) ─────────────────── */
+    int rows;
+    int cols;
+
+    /* ── Three time-level pointers — ROTATE each step ─────────────
+     * past = u(t-dt), now = u(t), next = u(t+dt) being written this
+     * step.  Pointers cycle: past ← now ← next, scratch becomes the
+     * new `next`.  The pointers ARE the time order — there is no
+     * separate state field that says "which buffer is current".    */
+    float *wave_past;
     float *wave_now;
     float *wave_next;
-    /* The three actual storage arenas.  Pointers above rotate among them. */
-    float  buf_a[GRID_ROWS_MAX * GRID_COLS_MAX];
-    float  buf_b[GRID_ROWS_MAX * GRID_COLS_MAX];
-    float  buf_c[GRID_ROWS_MAX * GRID_COLS_MAX];
+
+    /* ── Storage arenas (the pointers above always point at one of
+     * these three).  Static so the hot path never allocates.       */
+    float buf_a[GRID_ROWS_MAX * GRID_COLS_MAX];
+    float buf_b[GRID_ROWS_MAX * GRID_COLS_MAX];
+    float buf_c[GRID_ROWS_MAX * GRID_COLS_MAX];
 } grid_state;
 
-static inline float grid_at(const float *buf, int cols, int r, int c)
-{
-    return buf[r * cols + c];
+static inline float grid_at(const float *buf, int cols, int r, int c) {
+  return buf[r * cols + c];
 }
 
-static inline void grid_set(float *buf, int cols, int r, int c, float v)
-{
-    buf[r * cols + c] = v;
+static inline void grid_set(float *buf, int cols, int r, int c, float v) {
+  buf[r * cols + c] = v;
 }
 
-static void grid_rotate_buffers(grid_state *g)
-{
-    /* Rename the three buffers cyclically:  next becomes "now";
-     * "now" becomes "past"; "past" becomes the new scratch (next). */
-    float *was_past = g->wave_past;
-    g->wave_past = g->wave_now;
-    g->wave_now  = g->wave_next;
-    g->wave_next = was_past;
+static void grid_rotate_buffers(grid_state *g) {
+  /* Rename the three buffers cyclically:  next becomes "now";
+   * "now" becomes "past"; "past" becomes the new scratch (next). */
+  float *was_past = g->wave_past;
+  g->wave_past = g->wave_now;
+  g->wave_now = g->wave_next;
+  g->wave_next = was_past;
 }
 
 /* ===================================================================== */
@@ -917,48 +1079,44 @@ static void grid_rotate_buffers(grid_state *g)
  * REST.
  */
 
-static void init_zero(grid_state *g)
-{
-    memset(g->wave_past,  0, sizeof g->buf_a);
-    memset(g->wave_now,   0, sizeof g->buf_a);
-    memset(g->wave_next,  0, sizeof g->buf_a);
+static void init_zero(grid_state *g) {
+  memset(g->wave_past, 0, sizeof g->buf_a);
+  memset(g->wave_now, 0, sizeof g->buf_a);
+  memset(g->wave_next, 0, sizeof g->buf_a);
 }
 
 static void init_gaussian_drop(grid_state *g, float cy, float cx,
-                               float amplitude, float radius_cells)
-{
-    init_zero(g);
-    float two_sigma_sq = 2.0f * radius_cells * radius_cells;
-    for (int r = 0; r < g->rows; r++) {
-        for (int c = 0; c < g->cols; c++) {
-            float dy = (float)r - cy;
-            float dx = (float)c - cx;
-            float v  = amplitude * expf(-(dy*dy + dx*dx) / two_sigma_sq);
-            grid_set(g->wave_past, g->cols, r, c, v);
-            grid_set(g->wave_now,  g->cols, r, c, v);
-        }
+                               float amplitude, float radius_cells) {
+  init_zero(g);
+  float two_sigma_sq = 2.0f * radius_cells * radius_cells;
+  for (int r = 0; r < g->rows; r++) {
+    for (int c = 0; c < g->cols; c++) {
+      float dy = (float)r - cy;
+      float dx = (float)c - cx;
+      float v = amplitude * expf(-(dy * dy + dx * dx) / two_sigma_sq);
+      grid_set(g->wave_past, g->cols, r, c, v);
+      grid_set(g->wave_now, g->cols, r, c, v);
     }
+  }
 }
 
 static void init_eigenmode(grid_state *g, int mode_y, int mode_x,
-                           float amplitude)
-{
-    init_zero(g);
-    /* sin( π · m · r / N ) is an eigenfunction of the discrete 5-point
-     * Laplacian on a Dirichlet-boundary grid.  Its eigenvalue is
-     *   λ = − ( 4·sin²(π·m_y/(2·N_y)) + 4·sin²(π·m_x/(2·N_x)) )
-     * which the leapfrog scheme amplifies cleanly when cfl > 1. */
-    for (int r = 0; r < g->rows; r++) {
-        for (int c = 0; c < g->cols; c++) {
-            float ry = (float)(r + 1) / (float)(g->rows + 1);
-            float rx = (float)(c + 1) / (float)(g->cols + 1);
-            float v  = amplitude
-                     * sinf((float)M_PI * mode_y * ry)
-                     * sinf((float)M_PI * mode_x * rx);
-            grid_set(g->wave_past, g->cols, r, c, v);
-            grid_set(g->wave_now,  g->cols, r, c, v);
-        }
+                           float amplitude) {
+  init_zero(g);
+  /* sin( π · m · r / N ) is an eigenfunction of the discrete 5-point
+   * Laplacian on a Dirichlet-boundary grid.  Its eigenvalue is
+   *   λ = − ( 4·sin²(π·m_y/(2·N_y)) + 4·sin²(π·m_x/(2·N_x)) )
+   * which the leapfrog scheme amplifies cleanly when cfl > 1. */
+  for (int r = 0; r < g->rows; r++) {
+    for (int c = 0; c < g->cols; c++) {
+      float ry = (float)(r + 1) / (float)(g->rows + 1);
+      float rx = (float)(c + 1) / (float)(g->cols + 1);
+      float v = amplitude * sinf((float)M_PI * mode_y * ry) *
+                sinf((float)M_PI * mode_x * rx);
+      grid_set(g->wave_past, g->cols, r, c, v);
+      grid_set(g->wave_now, g->cols, r, c, v);
     }
+  }
 }
 
 /* ===================================================================== */
@@ -978,13 +1136,12 @@ static void init_eigenmode(grid_state *g, int mode_y, int mode_x,
  * ~1 cycle per cell.
  */
 
-static inline float laplacian_5pt(const float *u, int cols, int r, int c)
-{
-    return  u[(r-1)*cols + c    ]    /* north */
-         +  u[(r+1)*cols + c    ]    /* south */
-         +  u[ r   *cols + (c-1)]    /* west  */
-         +  u[ r   *cols + (c+1)]    /* east  */
-         - 4.0f * u[r*cols + c];     /* centre × 4 (subtracted) */
+static inline float laplacian_5pt(const float *u, int cols, int r, int c) {
+  return u[(r - 1) * cols + c]     /* north */
+         + u[(r + 1) * cols + c]   /* south */
+         + u[r * cols + (c - 1)]   /* west  */
+         + u[r * cols + (c + 1)]   /* east  */
+         - 4.0f * u[r * cols + c]; /* centre × 4 (subtracted) */
 }
 
 /* ===================================================================== */
@@ -1012,34 +1169,33 @@ static inline float laplacian_5pt(const float *u, int cols, int r, int c)
  * value instead of the OLD one, breaking the simulation.
  */
 
-static void wave_step(grid_state *g, float wave_speed_cps, float step_seconds)
-{
-    float beta        = wave_speed_cps * step_seconds;
-    float beta_squared = beta * beta;
-    int   cols = g->cols;
+static void wave_step(grid_state *g, float wave_speed_cps, float step_seconds) {
+  float beta = wave_speed_cps * step_seconds;
+  float beta_squared = beta * beta;
+  int cols = g->cols;
 
-    /* INTERIOR cells — apply the stencil. */
-    for (int r = 1; r < g->rows - 1; r++) {
-        for (int c = 1; c < cols - 1; c++) {
-            float lap     = laplacian_5pt(g->wave_now, cols, r, c);
-            float u_now   = g->wave_now [r * cols + c];
-            float u_past  = g->wave_past[r * cols + c];
-            float u_next  = 2.0f * u_now - u_past + beta_squared * lap;
-            g->wave_next[r * cols + c] = u_next;
-        }
+  /* INTERIOR cells — apply the stencil. */
+  for (int r = 1; r < g->rows - 1; r++) {
+    for (int c = 1; c < cols - 1; c++) {
+      float lap = laplacian_5pt(g->wave_now, cols, r, c);
+      float u_now = g->wave_now[r * cols + c];
+      float u_past = g->wave_past[r * cols + c];
+      float u_next = 2.0f * u_now - u_past + beta_squared * lap;
+      g->wave_next[r * cols + c] = u_next;
     }
+  }
 
-    /* BORDERS — forced to zero (Dirichlet). */
-    for (int c = 0; c < cols; c++) {
-        g->wave_next[0                * cols + c] = 0.0f;
-        g->wave_next[(g->rows - 1)    * cols + c] = 0.0f;
-    }
-    for (int r = 0; r < g->rows; r++) {
-        g->wave_next[r * cols + 0          ] = 0.0f;
-        g->wave_next[r * cols + (cols - 1) ] = 0.0f;
-    }
+  /* BORDERS — forced to zero (Dirichlet). */
+  for (int c = 0; c < cols; c++) {
+    g->wave_next[0 * cols + c] = 0.0f;
+    g->wave_next[(g->rows - 1) * cols + c] = 0.0f;
+  }
+  for (int r = 0; r < g->rows; r++) {
+    g->wave_next[r * cols + 0] = 0.0f;
+    g->wave_next[r * cols + (cols - 1)] = 0.0f;
+  }
 
-    grid_rotate_buffers(g);
+  grid_rotate_buffers(g);
 }
 
 /* ===================================================================== */
@@ -1066,28 +1222,26 @@ static void wave_step(grid_state *g, float wave_speed_cps, float step_seconds)
  * to be complex; the imaginary part gives the growth rate).
  */
 
-static float cfl_compute(float wave_speed_cps, float step_seconds)
-{
-    return wave_speed_cps * step_seconds * CFL_DIM_FACTOR;
+static float cfl_compute(float wave_speed_cps, float step_seconds) {
+  return wave_speed_cps * step_seconds * CFL_DIM_FACTOR;
 }
 
-static float dt_critical(float wave_speed_cps)
-{
-    return 1.0f / (wave_speed_cps * CFL_DIM_FACTOR);
+static float dt_critical(float wave_speed_cps) {
+  return 1.0f / (wave_speed_cps * CFL_DIM_FACTOR);
 }
 
-static float growth_per_step_theoretical(float cfl_number)
-{
-    if (cfl_number <= 1.0f) return 1.0f;
-    return cfl_number + sqrtf(cfl_number * cfl_number - 1.0f);
+static float growth_per_step_theoretical(float cfl_number) {
+  if (cfl_number <= 1.0f)
+    return 1.0f;
+  return cfl_number + sqrtf(cfl_number * cfl_number - 1.0f);
 }
 
-static float time_to_double(float growth_per_step, float step_seconds)
-{
-    /* Steps to double:  N = log(2) / log(μ).
-     * Time:  N · dt seconds. */
-    if (growth_per_step <= 1.0001f) return INFINITY;
-    return logf(2.0f) / logf(growth_per_step) * step_seconds;
+static float time_to_double(float growth_per_step, float step_seconds) {
+  /* Steps to double:  N = log(2) / log(μ).
+   * Time:  N · dt seconds. */
+  if (growth_per_step <= 1.0001f)
+    return INFINITY;
+  return logf(2.0f) / logf(growth_per_step) * step_seconds;
 }
 
 /* ===================================================================== */
@@ -1109,63 +1263,100 @@ static float time_to_double(float growth_per_step, float step_seconds)
  * gives a stable readout for the dashboard's "|μ|" cell.
  */
 
+/*
+ * measure_state — running statistics for the explosion detector.
+ *
+ * Intent
+ *   The "is it blowing up?" question can be answered exactly at any
+ *   instant (max|u| right now) but a single-step reading is too noisy
+ *   for a HUD readout — wave fields oscillate symmetrically around
+ *   zero, so consecutive maxes can differ wildly even in a HEALTHY
+ *   simulation.  We keep a short rolling window of recent max|u| and
+ *   compute the empirical growth ratio over it.  Once the ratio is
+ *   stably > 1 (and max|u| exceeds EXPLOSION_THRESHOLD), we declare
+ *   an explosion and the scene resets.
+ *
+ * Why a circular buffer of GROWTH_HISTORY_LEN
+ *   The reflection period at the grid boundary is a few ticks, so a
+ *   window of ≥ 4 gives a stable readout without lagging the user's
+ *   perception of "the wave is starting to grow".  Implementation:
+ *   a small circular buffer with write_index + filled count.
+ *
+ * Why empirical AND theoretical growth are both shown in HUD
+ *   The HUD displays BOTH the empirical growth ratio (computed here)
+ *   AND the theoretical one from growth_per_step_theoretical() in §8.
+ *   When they agree (especially in eigenmode init mode), the user has
+ *   VISUAL PROOF that Von Neumann analysis is correct.  See [3]
+ *   Charney/Fjørtoft/von Neumann 1950 for the technique.
+ *
+ * Why explosion_count is preserved across resets
+ *   When the simulation blows up, scene_apply_init() re-seeds the
+ *   field but PRESERVES this counter so the dashboard can tell the
+ *   user "you exploded N times so far" — useful when sweeping CFL
+ *   presets to find the cliff.
+ *
+ * References [3] Von Neumann analysis; [4] LeVeque ch. 10 for the
+ *   discrete-dispersion-relation framing.
+ */
 typedef struct {
-    float history[GROWTH_HISTORY_LEN];   /* recent max-abs samples */
-    int   write_index;                   /* circular */
-    int   filled;                        /* up to GROWTH_HISTORY_LEN */
-    float current_max_abs;
-    float empirical_growth_per_step;
-    long  tick_count;
-    int   explosion_count;
+    /* ── Rolling-window state for the empirical growth ratio ──── */
+    float history[GROWTH_HISTORY_LEN]; /* recent max|u| samples       */
+    int   write_index;                 /* circular index, mod LEN     */
+    int   filled;                      /* samples seen so far (≤ LEN) */
+
+    /* ── Latest reading (the HUD reads these directly) ─────────── */
+    float current_max_abs;             /* max|u| from the last scan   */
+    float empirical_growth_per_step;   /* geometric mean over history */
+
+    /* ── Running counters ──────────────────────────────────────── */
+    long tick_count;                   /* monotonic, never reset      */
+    int  explosion_count;              /* preserved across resets     */
 } measure_state;
 
-static void measure_init(measure_state *m)
-{
-    memset(m, 0, sizeof *m);
+static void measure_init(measure_state *m) { memset(m, 0, sizeof *m); }
+
+static float scan_max_abs(const float *u, int rows, int cols) {
+  float best = 0.0f;
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      float v = fabsf(u[r * cols + c]);
+      if (v > best)
+        best = v;
+    }
+  }
+  return best;
 }
 
-static float scan_max_abs(const float *u, int rows, int cols)
-{
-    float best = 0.0f;
-    for (int r = 0; r < rows; r++) {
-        for (int c = 0; c < cols; c++) {
-            float v = fabsf(u[r * cols + c]);
-            if (v > best) best = v;
-        }
+static bool measure_update(measure_state *m, const grid_state *g) {
+  /* 1. scan grid for max-abs amplitude */
+  float now_max = scan_max_abs(g->wave_now, g->rows, g->cols);
+  m->current_max_abs = now_max;
+
+  /* 2. push into circular history buffer */
+  m->history[m->write_index] = now_max;
+  m->write_index = (m->write_index + 1) % GROWTH_HISTORY_LEN;
+  if (m->filled < GROWTH_HISTORY_LEN)
+    m->filled++;
+
+  /* 3. average geometric growth: (current / oldest)^(1/N) */
+  if (m->filled >= 2) {
+    int oldest_index = m->write_index; /* the slot we'll overwrite next */
+    float oldest = m->history[oldest_index];
+    if (oldest > 1e-12f) {
+      float ratio = now_max / oldest;
+      float steps = (float)(m->filled - 1);
+      m->empirical_growth_per_step = powf(ratio, 1.0f / steps);
     }
-    return best;
-}
+  }
 
-static bool measure_update(measure_state *m, const grid_state *g)
-{
-    /* 1. scan grid for max-abs amplitude */
-    float now_max = scan_max_abs(g->wave_now, g->rows, g->cols);
-    m->current_max_abs = now_max;
+  m->tick_count++;
 
-    /* 2. push into circular history buffer */
-    m->history[m->write_index] = now_max;
-    m->write_index = (m->write_index + 1) % GROWTH_HISTORY_LEN;
-    if (m->filled < GROWTH_HISTORY_LEN) m->filled++;
-
-    /* 3. average geometric growth: (current / oldest)^(1/N) */
-    if (m->filled >= 2) {
-        int   oldest_index = m->write_index;        /* the slot we'll overwrite next */
-        float oldest = m->history[oldest_index];
-        if (oldest > 1e-12f) {
-            float ratio = now_max / oldest;
-            float steps = (float)(m->filled - 1);
-            m->empirical_growth_per_step = powf(ratio, 1.0f / steps);
-        }
-    }
-
-    m->tick_count++;
-
-    /* 4. explosion check */
-    if (now_max > EXPLOSION_THRESHOLD || isnan(now_max) || isinf(now_max)) {
-        m->explosion_count++;
-        return true;     /* caller should reset */
-    }
-    return false;
+  /* 4. explosion check */
+  if (now_max > EXPLOSION_THRESHOLD || isnan(now_max) || isinf(now_max)) {
+    m->explosion_count++;
+    return true; /* caller should reset */
+  }
+  return false;
 }
 
 /* ===================================================================== */
@@ -1184,146 +1375,188 @@ static bool measure_update(measure_state *m, const grid_state *g)
  * legibility tier for monochrome / contrast issues.
  */
 
-static char glyph_for_amp(float magnitude)
-{
-    if (magnitude < 0.05f) return ' ';
-    if (magnitude < 0.15f) return '.';
-    if (magnitude < 0.30f) return ':';
-    if (magnitude < 0.50f) return '+';
-    if (magnitude < 0.75f) return '*';
-    return '#';
+static char glyph_for_amp(float magnitude) {
+  if (magnitude < 0.05f)
+    return ' ';
+  if (magnitude < 0.15f)
+    return '.';
+  if (magnitude < 0.30f)
+    return ':';
+  if (magnitude < 0.50f)
+    return '+';
+  if (magnitude < 0.75f)
+    return '*';
+  return '#';
 }
 
-static void paint_field(WINDOW *win, const grid_state *g, int theme)
-{
-    /* Field occupies rows 0 .. (terminal_rows - DASH_LINES - 1).
-     * The grid_state's rows × cols already match this. */
-    for (int r = 0; r < g->rows; r++) {
-        for (int c = 0; c < g->cols; c++) {
-            float v   = grid_at(g->wave_now, g->cols, r, c);
-            float mag = fabsf(v);
-            int   pair = wave_pair_for(v, theme);
-            char  glyph = glyph_for_amp(mag);
-            attr_t a = COLOR_PAIR(pair);
-            if (mag > 0.50f) a |= A_BOLD;
-            wattron(win, a);
-            mvwaddch(win, r, c, (chtype)(unsigned char)glyph);
-            wattroff(win, a);
-        }
+static void paint_field(WINDOW *win, const grid_state *g, int theme) {
+  /* Field occupies rows HUD_ROWS_TOP .. (terminal_rows - HUD_ROWS_BOT - 1).
+   * The grid_state's rows × cols already match this; we offset every
+   * write by HUD_ROWS_TOP so the field starts BELOW the top status. */
+  for (int r = 0; r < g->rows; r++) {
+    for (int c = 0; c < g->cols; c++) {
+      float v = grid_at(g->wave_now, g->cols, r, c);
+      float mag = fabsf(v);
+      int pair = wave_pair_for(v, theme);
+      char glyph = glyph_for_amp(mag);
+      attr_t a = COLOR_PAIR(pair);
+      if (mag > 0.50f)
+        a |= A_BOLD;
+      wattron(win, a);
+      mvwaddch(win, HUD_ROWS_TOP + r, c, (chtype)(unsigned char)glyph);
+      wattroff(win, a);
     }
+  }
 }
 
 /* ===================================================================== */
 /* §11  paint_hud — title + parameters + stats                           */
 /* ===================================================================== */
 /*
- * Five-row dashboard at the bottom of the screen.  Per CLAUDE.md
- * spec: bright yellow primary, bright cyan key hints, A_BOLD on
- * primary line, no A_DIM anywhere, default background.
+ * Five-row dashboard split per CLAUDE.md canonical layout:
+ *   TOP rows 0..3 = status (title, params, CFL meter, stats)
+ *   BOTTOM row rows-1 = action hints
  *
- *   Row 0:  TITLE          [ CFL STABILITY EXPLORER ]   PAUSED
- *   Row 1:  PARAMETERS     cfl=1.057  dt=0.038s  c=20.0c/s  |μ|=1.014  t×2=49.5s
- *   Row 2:  CFL METER      [================XXX==========|·······]   ←§12
- *   Row 3:  STATS          max=24.8  ticks=1248  exploded=2  theme=wave
- *   Row 4:  KEY HINTS      q:quit  spc:pause  s:step  +/-:dt  c/C:speed  ...
+ * Colour policy: bright yellow primary (status), bright cyan hints,
+ * A_BOLD on primary line, no A_DIM anywhere, default background.
+ *
+ *   Row 0       (TOP) :  TITLE       [ CFL STABILITY EXPLORER ]   PAUSED
+ *   Row 1       (TOP) :  PARAMS      cfl=1.057  dt=0.038s  c=20.0c/s  |μ|=1.014 t×2=49.5s
+ *   Row 2       (TOP) :  CFL METER   [================XXX==========|·······]   ←§12
+ *   Row 3       (TOP) :  STATS       max=24.8  ticks=1248  exploded=2  theme=wave
+ *   Row rows-1  (BOT) :  KEY HINTS   q:quit  spc:pause  s:step  +/-:dt  c/C:speed  ...
+ *
+ * The field (§10 paint_field) lives between, rows HUD_ROWS_TOP .. rows-1-HUD_ROWS_BOT.
  */
 
+/*
+ * hud_data — flattened readout snapshot for ONE frame of HUD paint.
+ *
+ * Intent
+ *   The four paint_hud_* helpers (title / params / stats / hints)
+ *   and paint_cfl_meter all need DIFFERENT slices of the same
+ *   conceptual information.  Threading a scene_state* pointer through
+ *   each painter would couple the renderer to the simulator's
+ *   internals.  Instead scene_draw() builds this small flattened
+ *   struct ONCE per frame and passes it to each painter — painters
+ *   stay ignorant of grid_state, measure_state, wave_step, etc.
+ *
+ * Lifetime
+ *   Built once per frame in scene_draw(), passed by const pointer to
+ *   the painters, discarded at end of frame.  Never persists; not
+ *   part of the simulation state.
+ *
+ * Why floats are copies, not pointers
+ *   Each painter is read-only.  Copying ~60 bytes per frame is far
+ *   cheaper than the lifetime / locking complexity that pointer
+ *   sharing would require.
+ */
 typedef struct {
-    float cfl_number;
-    float step_seconds;
-    float dt_critical_now;     /* theoretical largest stable dt */
-    float wave_speed_cps;
-    float empirical_growth;    /* measured live by §9 */
-    float theoretical_growth;  /* Von Neumann prediction (§8) */
-    float doubling_time;
+    /* ── Physical parameters (read by params row + meter) ─────── */
+    float cfl_number;             /* live cfl = c·dt·√2 / dx        */
+    float step_seconds;           /* dt                              */
+    float dt_critical_now;        /* largest dt that keeps cfl ≤ 1   */
+    float wave_speed_cps;         /* c, in cells per second          */
+
+    /* ── Growth-rate readouts (compared side-by-side in HUD) ──── *
+     * empirical measured live by §9; theoretical predicted by §8. *
+     * Their agreement IS the visual proof of Von Neumann theory.  */
+    float empirical_growth;
+    float theoretical_growth;
+    float doubling_time;          /* time for max|u| to double (s)   */
+
+    /* ── Counters for the stats row ───────────────────────────── */
     float max_amplitude;
     long  tick_count;
     int   explosion_count;
-    int   theme;
-    bool  paused;
+
+    /* ── User-visible choices (read by stats + title rows) ────── */
+    int   theme;                  /* index into theme_name[]         */
+    int   preset_idx;             /* index into cfl_presets[]        */
+    const char *preset_name;      /* short tag shown in stats row    */
+    bool  paused;                 /* drives the PAUSED indicator     */
 } hud_data;
 
-static int cfl_zone_pair(float cfl_number)
-{
-    if (cfl_number < 0.70f) return PAIR_STABLE;
-    if (cfl_number < 1.00f) return PAIR_MARGINAL;
-    return PAIR_UNSTABLE;
+static int cfl_zone_pair(float cfl_number) {
+  if (cfl_number < 0.70f)
+    return PAIR_STABLE;
+  if (cfl_number < 1.00f)
+    return PAIR_MARGINAL;
+  return PAIR_UNSTABLE;
 }
 
-static const char *cfl_zone_label(float cfl_number)
-{
-    if (cfl_number < 0.70f) return "stable  ";
-    if (cfl_number < 1.00f) return "marginal";
-    return "UNSTABLE";
+static const char *cfl_zone_label(float cfl_number) {
+  if (cfl_number < 0.70f)
+    return "stable  ";
+  if (cfl_number < 1.00f)
+    return "marginal";
+  return "UNSTABLE";
 }
 
-static void paint_hud_title(WINDOW *win, int row, int cols, bool paused)
-{
-    wattron(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    for (int c = 0; c < cols; c++) mvwaddch(win, row, c, '-');
-    const char *title = "[ CFL STABILITY EXPLORER ]";
-    mvwprintw(win, row, (cols - (int)strlen(title)) / 2, "%s", title);
-    if (paused) {
-        wattroff(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
-        wattron(win, COLOR_PAIR(PAIR_MARGINAL) | A_BOLD);
-        mvwprintw(win, row, cols - 9, " PAUSED ");
-        wattroff(win, COLOR_PAIR(PAIR_MARGINAL) | A_BOLD);
-        wattron(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    }
+static void paint_hud_title(WINDOW *win, int row, int cols, bool paused) {
+  wattron(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  for (int c = 0; c < cols; c++)
+    mvwaddch(win, row, c, '-');
+  const char *title = "[ CFL STABILITY EXPLORER ]";
+  mvwprintw(win, row, (cols - (int)strlen(title)) / 2, "%s", title);
+  if (paused) {
     wattroff(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
+    wattron(win, COLOR_PAIR(PAIR_MARGINAL) | A_BOLD);
+    mvwprintw(win, row, cols - 9, " PAUSED ");
+    wattroff(win, COLOR_PAIR(PAIR_MARGINAL) | A_BOLD);
+    wattron(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  }
+  wattroff(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void paint_hud_params(WINDOW *win, int row, const hud_data *h)
-{
-    int cp = cfl_zone_pair(h->cfl_number);
-    /* "CFL =  1.057  marginal   dt=0.038s  c=20.0c/s   ..." */
-    wattron(win, COLOR_PAIR(PAIR_HUD));
-    mvwprintw(win, row, 1, " CFL = ");
-    wattroff(win, COLOR_PAIR(PAIR_HUD));
+static void paint_hud_params(WINDOW *win, int row, const hud_data *h) {
+  int cp = cfl_zone_pair(h->cfl_number);
+  /* "CFL =  1.057  marginal   dt=0.038s  c=20.0c/s   ..." */
+  wattron(win, COLOR_PAIR(PAIR_HUD));
+  mvwprintw(win, row, 1, " CFL = ");
+  wattroff(win, COLOR_PAIR(PAIR_HUD));
 
-    wattron(win, COLOR_PAIR(cp) | A_BOLD);
-    wprintw(win, "%6.4f  %-9s", h->cfl_number, cfl_zone_label(h->cfl_number));
-    wattroff(win, COLOR_PAIR(cp) | A_BOLD);
+  wattron(win, COLOR_PAIR(cp) | A_BOLD);
+  wprintw(win, "%6.4f  %-9s", h->cfl_number, cfl_zone_label(h->cfl_number));
+  wattroff(win, COLOR_PAIR(cp) | A_BOLD);
 
-    wattron(win, COLOR_PAIR(PAIR_HUD));
-    wprintw(win, "  dt=%7.4fs  c=%5.1fc/s  dt_crit=%7.4fs  ",
-            h->step_seconds, h->wave_speed_cps, h->dt_critical_now);
-    wattroff(win, COLOR_PAIR(PAIR_HUD));
+  wattron(win, COLOR_PAIR(PAIR_HUD));
+  wprintw(win, "  dt=%7.4fs  c=%5.1fc/s  dt_crit=%7.4fs  ", h->step_seconds,
+          h->wave_speed_cps, h->dt_critical_now);
+  wattroff(win, COLOR_PAIR(PAIR_HUD));
 
-    /* Show BOTH empirical and theoretical growth ratios.  At
-     * eigenmode init they should match closely — visual proof of
-     * the Von Neumann formula (§8 growth_per_step_theoretical). */
-    bool growing = h->empirical_growth > 1.0001f && isfinite(h->doubling_time);
-    int  pair    = growing ? PAIR_UNSTABLE : PAIR_STABLE;
-    wattron(win, COLOR_PAIR(pair) | A_BOLD);
-    wprintw(win, "|mu|=%7.5f (theory %7.5f)",
-            h->empirical_growth > 0.0f ? h->empirical_growth : 1.0f,
-            h->theoretical_growth);
-    wattroff(win, COLOR_PAIR(pair) | A_BOLD);
-    if (growing) {
-        wattron(win, COLOR_PAIR(PAIR_UNSTABLE) | A_BOLD);
-        wprintw(win, "  t*2=%5.2fs", h->doubling_time);
-        wattroff(win, COLOR_PAIR(PAIR_UNSTABLE) | A_BOLD);
-    }
+  /* Show BOTH empirical and theoretical growth ratios.  At
+   * eigenmode init they should match closely — visual proof of
+   * the Von Neumann formula (§8 growth_per_step_theoretical). */
+  bool growing = h->empirical_growth > 1.0001f && isfinite(h->doubling_time);
+  int pair = growing ? PAIR_UNSTABLE : PAIR_STABLE;
+  wattron(win, COLOR_PAIR(pair) | A_BOLD);
+  wprintw(win, "|mu|=%7.5f (theory %7.5f)",
+          h->empirical_growth > 0.0f ? h->empirical_growth : 1.0f,
+          h->theoretical_growth);
+  wattroff(win, COLOR_PAIR(pair) | A_BOLD);
+  if (growing) {
+    wattron(win, COLOR_PAIR(PAIR_UNSTABLE) | A_BOLD);
+    wprintw(win, "  t*2=%5.2fs", h->doubling_time);
+    wattroff(win, COLOR_PAIR(PAIR_UNSTABLE) | A_BOLD);
+  }
 }
 
-static void paint_hud_stats(WINDOW *win, int row, const hud_data *h)
-{
-    wattron(win, COLOR_PAIR(PAIR_HUD));
-    mvwprintw(win, row, 1,
-              " max|u|=%9.4g  ticks=%8ld  exploded=%3d  theme=%-7s",
-              (double)h->max_amplitude, h->tick_count, h->explosion_count,
-              theme_name[h->theme]);
-    wattroff(win, COLOR_PAIR(PAIR_HUD));
+static void paint_hud_stats(WINDOW *win, int row, const hud_data *h) {
+  wattron(win, COLOR_PAIR(PAIR_HUD));
+  mvwprintw(win, row, 1,
+            " preset=%-7s  max|u|=%9.4g  ticks=%8ld  exploded=%3d  theme=%-6s",
+            h->preset_name, (double)h->max_amplitude, h->tick_count,
+            h->explosion_count, theme_name[h->theme]);
+  wattroff(win, COLOR_PAIR(PAIR_HUD));
 }
 
-static void paint_hud_hints(WINDOW *win, int row)
-{
-    wattron(win, COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvwprintw(win, row, 0,
-              " q:quit  spc:pause  s:step  1-6:CFL preset  +/-:dt  "
-              "c/C:speed  m:mode  d:drop  r:reset  t:theme ");
-    wattroff(win, COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void paint_hud_hints(WINDOW *win, int row) {
+  wattron(win, COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvwprintw(win, row, 0,
+            " q:quit  spc:pause  s:step  1-9,0:CFL preset  +/-:dt  "
+            "c/C:speed  m:mode  d:drop  r:reset  t:theme ");
+  wattroff(win, COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
@@ -1348,42 +1581,50 @@ static void paint_hud_hints(WINDOW *win, int row)
 
 #define CFL_METER_MAX 1.5f
 
-static void paint_cfl_meter(WINDOW *win, int row, int width, float cfl_number)
-{
-    int bar_inner = width - 2;     /* leave 1 cell each side for brackets */
-    if (bar_inner < 10) return;
+static void paint_cfl_meter(WINDOW *win, int row, int width, float cfl_number) {
+  int bar_inner = width - 2; /* leave 1 cell each side for brackets */
+  if (bar_inner < 10)
+    return;
 
-    /* zone boundaries in cells */
-    int idx_07 = (int)(0.70f / CFL_METER_MAX * bar_inner);
-    int idx_10 = (int)(1.00f / CFL_METER_MAX * bar_inner);
-    int idx_now = (int)(cfl_number / CFL_METER_MAX * bar_inner);
-    if (idx_now < 0) idx_now = 0;
-    if (idx_now >= bar_inner) idx_now = bar_inner - 1;
+  /* zone boundaries in cells */
+  int idx_07 = (int)(0.70f / CFL_METER_MAX * bar_inner);
+  int idx_10 = (int)(1.00f / CFL_METER_MAX * bar_inner);
+  int idx_now = (int)(cfl_number / CFL_METER_MAX * bar_inner);
+  if (idx_now < 0)
+    idx_now = 0;
+  if (idx_now >= bar_inner)
+    idx_now = bar_inner - 1;
 
-    /* left bracket */
-    wattron(win, COLOR_PAIR(PAIR_HUD));
-    mvwaddch(win, row, 0, '[');
+  /* left bracket */
+  wattron(win, COLOR_PAIR(PAIR_HUD));
+  mvwaddch(win, row, 0, '[');
 
-    /* draw zone-coloured bar */
-    for (int i = 0; i < bar_inner; i++) {
-        int   pair;
-        if      (i < idx_07) pair = PAIR_STABLE;
-        else if (i < idx_10) pair = PAIR_MARGINAL;
-        else                 pair = PAIR_UNSTABLE;
-        char glyph = '=';
-        if (i == idx_10) glyph = '|';      /* cliff marker */
-        if (i == idx_now) glyph = '#';     /* cursor */
-        attr_t a = COLOR_PAIR(pair);
-        if (i == idx_now) a |= A_BOLD;
-        wattron(win, a);
-        mvwaddch(win, row, 1 + i, (chtype)(unsigned char)glyph);
-        wattroff(win, a);
-    }
+  /* draw zone-coloured bar */
+  for (int i = 0; i < bar_inner; i++) {
+    int pair;
+    if (i < idx_07)
+      pair = PAIR_STABLE;
+    else if (i < idx_10)
+      pair = PAIR_MARGINAL;
+    else
+      pair = PAIR_UNSTABLE;
+    char glyph = '=';
+    if (i == idx_10)
+      glyph = '|'; /* cliff marker */
+    if (i == idx_now)
+      glyph = '#'; /* cursor */
+    attr_t a = COLOR_PAIR(pair);
+    if (i == idx_now)
+      a |= A_BOLD;
+    wattron(win, a);
+    mvwaddch(win, row, 1 + i, (chtype)(unsigned char)glyph);
+    wattroff(win, a);
+  }
 
-    /* right bracket + numeric readout */
-    wattron(win, COLOR_PAIR(PAIR_HUD));
-    mvwaddch(win, row, 1 + bar_inner, ']');
-    wattroff(win, COLOR_PAIR(PAIR_HUD));
+  /* right bracket + numeric readout */
+  wattron(win, COLOR_PAIR(PAIR_HUD));
+  mvwaddch(win, row, 1 + bar_inner, ']');
+  wattroff(win, COLOR_PAIR(PAIR_HUD));
 }
 
 /* ===================================================================== */
@@ -1400,213 +1641,321 @@ static void paint_cfl_meter(WINDOW *win, int row, int width, float cfl_number)
  * input layer (§14) calls in response to keys.
  */
 
+/*
+ * init_kind — what to seed the wave field with on reset.
+ *
+ *   INIT_DROP       a Gaussian bump at the centre — like a droplet
+ *                   hitting still water.  Produces broadband ripples
+ *                   that contain MANY spatial frequencies, so it's
+ *                   visually rich but doesn't exhibit a clean growth
+ *                   ratio when unstable (the dominant unstable mode is
+ *                   masked by a cocktail of slower-growing modes).
+ *
+ *   INIT_EIGENMODE  sin(π·m·r/rows) · sin(π·n·c/cols) — an exact
+ *                   spatial eigenmode of the discrete Laplacian (see
+ *                   §6).  Has ONE growth rate, so when CFL > 1 it
+ *                   grows exponentially with the empirical ratio
+ *                   matching growth_per_step_theoretical() to ~4
+ *                   decimal places.  This is the VISUAL PROOF of Von
+ *                   Neumann analysis [3].
+ *
+ * Pick INIT_DROP for visual richness, INIT_EIGENMODE for measurement.
+ */
 typedef enum { INIT_DROP, INIT_EIGENMODE } init_kind;
 
+/*
+ * scene_state — the single owner of everything this demo holds.
+ *
+ * Intent
+ *   scene_state is the integration point between the SIMULATION (a
+ *   wave field that doesn't know about a terminal) and the RENDERING
+ *   (an ncurses surface that doesn't know about wave PDEs).  The two
+ *   layers never talk directly — they meet here.  Anything that
+ *   doesn't fit in grid_state, measure_state, or the file-scope
+ *   palette / preset tables lives in scene_state.
+ *
+ * Locality (sim vs render)
+ *   Fields are GROUPED EXPLICITLY so a reader can tell at a glance
+ *   which subsystem reads each one:
+ *     - scene_tick reads it           → simulation
+ *     - paint_field / paint_hud_*
+ *       / paint_cfl_meter reads it    → rendering
+ *     - both sides read it
+ *       (wave_speed_cps, step_seconds, the grid's rows/cols)
+ *                                     → shared physics-and-geometry
+ *
+ *   Mis-classifying a field is a real source of bugs: a render-only
+ *   value (e.g. theme) accidentally read by the tick would couple
+ *   physics to a user visual choice, defeating reproducibility — the
+ *   same sim with the same CFL must produce the same evolution
+ *   regardless of the colours displayed.
+ *
+ * Why these specific fields and no others
+ *   - grid             the actual field state (§4); the largest member.
+ *   - measure          running statistics for the explosion detector
+ *                       (§9).  Reset on most state changes; the
+ *                       explosion_count counter is preserved across
+ *                       internal resets.
+ *   - wave_speed_cps   c — the user adjusts via c/C; sim reads it in
+ *                       wave_step(); HUD reads it in params row.
+ *   - step_seconds     dt — the user adjusts via +/-; sim reads it in
+ *                       wave_step(); HUD reads it in params row.
+ *   - preset_idx       "which preset was last applied" — needed so the
+ *                       HUD can name the active regime; survives an
+ *                       'r' reset.
+ *   - last_init        "which IC to apply on the next reset"
+ *                       (INIT_DROP / INIT_EIGENMODE).  Read by
+ *                       scene_apply_init() only — not part of the live
+ *                       tick.
+ *   - paused           Gate for scene_tick.  When set, the tick is a
+ *                       no-op except when step_once flips it through.
+ *   - step_once        If true while paused, advance ONE tick then keep
+ *                       paused.  Powers the 's' single-step key —
+ *                       essential for studying the cliff in slow motion.
+ *   - theme            pure render — selects which row of the
+ *                       theme_pos256/theme_neg256 tables is active.
+ *
+ * Things that DO NOT live here
+ *   - Render-frame timing / FPS counter  → locals in main()
+ *   - Signal flags (SIGINT, SIGWINCH)    → file-scope volatile flags
+ *   - The 6 themes / 10 presets / glyph ramp tables → file-scope
+ *                                          constants (see §1, §3)
+ *
+ * Reference [8] ESR's NCURSES HOWTO on the sim/render separation that
+ *   the diff-buffer present pipeline depends on.
+ */
 typedef struct {
+    /* ── Simulation state (read by scene_tick) ─────────────────── *
+     * The actual field plus all derived statistics; both are reset *
+     * on 'r' via scene_apply_init().                               */
     grid_state    grid;
     measure_state measure;
-    float         wave_speed_cps;
-    float         step_seconds;
-    int           theme;
-    init_kind     last_init;
-    bool          paused;
-    bool          step_once;
+
+    /* ── Shared physics-and-geometry (sim AND render) ─────────── *
+     * Both wave_step() (§7) and the HUD (§11) read these every    *
+     * frame.  Adjusted by +/- (dt) and c/C (wave speed).          */
+    float wave_speed_cps;          /* c, cells per second           */
+    float step_seconds;            /* dt, seconds per step          */
+
+    /* ── Control state (selects what runs / what is shown) ────── *
+     * preset_idx + last_init describe what the NEXT reset will    *
+     * produce; paused/step_once gate the live tick.               */
+    int       preset_idx;          /* 0 .. N_PRESETS-1              */
+    init_kind last_init;           /* INIT_DROP or INIT_EIGENMODE   */
+    bool      paused;
+    bool      step_once;           /* advance one tick while paused */
+
+    /* ── Pure render state (read by paint_*) ──────────────────── *
+     * Changing theme MUST NOT touch the simulation — it only      *
+     * repaints colour pairs and selects which row of              *
+     * theme_pos256/theme_neg256 is consulted.                     */
+    int theme;                     /* 0 .. N_THEMES-1               */
 } scene_state;
 
-static void scene_apply_init(scene_state *s)
-{
-    if (s->last_init == INIT_EIGENMODE) {
-        init_eigenmode(&s->grid, 1, 1, EIGENMODE_AMPLITUDE);
-    } else {
-        init_gaussian_drop(&s->grid,
-                           (float)(s->grid.rows - 1) * 0.5f,
-                           (float)(s->grid.cols - 1) * 0.5f,
-                           DROP_AMPLITUDE, DROP_RADIUS_CELLS);
-    }
-    measure_init(&s->measure);
+static void scene_apply_init(scene_state *s) {
+  if (s->last_init == INIT_EIGENMODE) {
+    init_eigenmode(&s->grid, 1, 1, EIGENMODE_AMPLITUDE);
+  } else {
+    init_gaussian_drop(&s->grid, (float)(s->grid.rows - 1) * 0.5f,
+                       (float)(s->grid.cols - 1) * 0.5f, DROP_AMPLITUDE,
+                       DROP_RADIUS_CELLS);
+  }
+  measure_init(&s->measure);
 }
 
-static void scene_resize_to_terminal(scene_state *s)
-{
-    int term_rows, term_cols;
-    getmaxyx(stdscr, term_rows, term_cols);
+static void scene_resize_to_terminal(scene_state *s) {
+  int term_rows, term_cols;
+  getmaxyx(stdscr, term_rows, term_cols);
 
-    int field_rows = term_rows - DASH_LINES;
-    int field_cols = term_cols;
-    if (field_rows < 4) field_rows = 4;
-    if (field_cols < 8) field_cols = 8;
-    if (field_rows > GRID_ROWS_MAX) field_rows = GRID_ROWS_MAX;
-    if (field_cols > GRID_COLS_MAX) field_cols = GRID_COLS_MAX;
+  int field_rows = term_rows - HUD_ROWS_TOP - HUD_ROWS_BOT;
+  int field_cols = term_cols;
+  if (field_rows < 4)
+    field_rows = 4;
+  if (field_cols < 8)
+    field_cols = 8;
+  if (field_rows > GRID_ROWS_MAX)
+    field_rows = GRID_ROWS_MAX;
+  if (field_cols > GRID_COLS_MAX)
+    field_cols = GRID_COLS_MAX;
 
-    s->grid.rows = field_rows;
-    s->grid.cols = field_cols;
-    s->grid.wave_past = s->grid.buf_a;
-    s->grid.wave_now  = s->grid.buf_b;
-    s->grid.wave_next = s->grid.buf_c;
+  s->grid.rows = field_rows;
+  s->grid.cols = field_cols;
+  s->grid.wave_past = s->grid.buf_a;
+  s->grid.wave_now = s->grid.buf_b;
+  s->grid.wave_next = s->grid.buf_c;
 }
 
-static void scene_init(scene_state *s)
-{
-    memset(s, 0, sizeof *s);
-    s->wave_speed_cps = WAVE_SPEED_DEFAULT;
-    s->step_seconds   = STEP_SECONDS_DEFAULT;
-    s->theme          = 0;
-    s->last_init      = INIT_DROP;
-    s->paused         = false;
+static void scene_init(scene_state *s) {
+  memset(s, 0, sizeof *s);
+  s->wave_speed_cps = WAVE_SPEED_DEFAULT;
+  s->step_seconds = STEP_SECONDS_DEFAULT;
+  s->theme = 0;
+  s->last_init = INIT_DROP;
+  s->paused = false;
 
-    scene_resize_to_terminal(s);
+  scene_resize_to_terminal(s);
+  scene_apply_init(s);
+}
+
+static void scene_set_cfl_preset(scene_state *s, float target_cfl) {
+  /* dt = target_cfl / (c · sqrt(2))  — solves cfl_compute() = target */
+  s->step_seconds = target_cfl / (s->wave_speed_cps * CFL_DIM_FACTOR);
+  if (s->step_seconds < STEP_SECONDS_MIN)
+    s->step_seconds = STEP_SECONDS_MIN;
+  if (s->step_seconds > STEP_SECONDS_MAX)
+    s->step_seconds = STEP_SECONDS_MAX;
+}
+
+static void scene_tick(scene_state *s) {
+  if (s->paused && !s->step_once)
+    return;
+  s->step_once = false;
+
+  wave_step(&s->grid, s->wave_speed_cps, s->step_seconds);
+
+  bool exploded = measure_update(&s->measure, &s->grid);
+  if (exploded) {
     scene_apply_init(s);
+    /* Preserve explosion_count across the re-init. */
+    int saved_count = s->measure.explosion_count;
+    measure_init(&s->measure);
+    s->measure.explosion_count = saved_count;
+  }
 }
 
-static void scene_set_cfl_preset(scene_state *s, float target_cfl)
-{
-    /* dt = target_cfl / (c · sqrt(2))  — solves cfl_compute() = target */
-    s->step_seconds = target_cfl / (s->wave_speed_cps * CFL_DIM_FACTOR);
-    if (s->step_seconds < STEP_SECONDS_MIN) s->step_seconds = STEP_SECONDS_MIN;
-    if (s->step_seconds > STEP_SECONDS_MAX) s->step_seconds = STEP_SECONDS_MAX;
-}
+static void scene_draw(scene_state *s, WINDOW *win) {
+  werase(win);
+  paint_field(win, &s->grid, s->theme);
 
-static void scene_tick(scene_state *s)
-{
-    if (s->paused && !s->step_once) return;
-    s->step_once = false;
+  int term_rows, term_cols;
+  getmaxyx(win, term_rows, term_cols);
 
-    wave_step(&s->grid, s->wave_speed_cps, s->step_seconds);
+  float cfl_n = cfl_compute(s->wave_speed_cps, s->step_seconds);
+  hud_data h = {
+      .cfl_number = cfl_n,
+      .step_seconds = s->step_seconds,
+      .dt_critical_now = dt_critical(s->wave_speed_cps),
+      .wave_speed_cps = s->wave_speed_cps,
+      .empirical_growth = s->measure.empirical_growth_per_step,
+      .theoretical_growth = growth_per_step_theoretical(cfl_n),
+      .doubling_time =
+          time_to_double(s->measure.empirical_growth_per_step, s->step_seconds),
+      .max_amplitude = s->measure.current_max_abs,
+      .tick_count = s->measure.tick_count,
+      .explosion_count = s->measure.explosion_count,
+      .theme = s->theme,
+      .preset_idx = s->preset_idx,
+      .preset_name = cfl_presets[s->preset_idx].name,
+      .paused = s->paused,
+  };
 
-    bool exploded = measure_update(&s->measure, &s->grid);
-    if (exploded) {
-        scene_apply_init(s);
-        /* Preserve explosion_count across the re-init. */
-        int saved_count = s->measure.explosion_count;
-        measure_init(&s->measure);
-        s->measure.explosion_count = saved_count;
-    }
-}
+  /* TOP HUD — status block: title / params / CFL meter / stats.
+   * BOTTOM HUD — key-hints row at the last terminal row. */
+  paint_hud_title (win, 0, term_cols, h.paused);
+  paint_hud_params(win, 1, &h);
+  paint_cfl_meter (win, 2, term_cols, h.cfl_number);
+  paint_hud_stats (win, 3, &h);
+  paint_hud_hints (win, term_rows - 1);
 
-static void scene_draw(scene_state *s, WINDOW *win)
-{
-    werase(win);
-    paint_field(win, &s->grid, s->theme);
-
-    int term_rows, term_cols;
-    getmaxyx(win, term_rows, term_cols);
-    int dash_top = term_rows - DASH_LINES;
-
-    float cfl_n = cfl_compute(s->wave_speed_cps, s->step_seconds);
-    hud_data h = {
-        .cfl_number        = cfl_n,
-        .step_seconds      = s->step_seconds,
-        .dt_critical_now   = dt_critical(s->wave_speed_cps),
-        .wave_speed_cps    = s->wave_speed_cps,
-        .empirical_growth  = s->measure.empirical_growth_per_step,
-        .theoretical_growth= growth_per_step_theoretical(cfl_n),
-        .doubling_time     = time_to_double(s->measure.empirical_growth_per_step,
-                                            s->step_seconds),
-        .max_amplitude     = s->measure.current_max_abs,
-        .tick_count        = s->measure.tick_count,
-        .explosion_count   = s->measure.explosion_count,
-        .theme             = s->theme,
-        .paused            = s->paused,
-    };
-
-    paint_hud_title (win, dash_top + 0, term_cols, h.paused);
-    paint_hud_params(win, dash_top + 1, &h);
-    paint_cfl_meter (win, dash_top + 2, term_cols, h.cfl_number);
-    paint_hud_stats (win, dash_top + 3, &h);
-    paint_hud_hints (win, dash_top + 4);
-
-    wnoutrefresh(win);
-    doupdate();
+  wnoutrefresh(win);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §14  input — key handler                                              */
 /* ===================================================================== */
 
-static bool scene_handle_key(scene_state *s, int key)
-{
-    switch (key) {
-        case 'q': case 'Q': case 27:    /* 27 = ESC */
-            return false;               /* request quit */
+static bool scene_handle_key(scene_state *s, int key) {
+  switch (key) {
+  case 'q':
+  case 'Q':
+  case 27:        /* 27 = ESC */
+    return false; /* request quit */
 
-        case ' ':
-            s->paused = !s->paused;
-            break;
+  case ' ':
+    s->paused = !s->paused;
+    break;
 
-        case 's':
-            if (s->paused) s->step_once = true;
-            break;
+  case 's':
+    if (s->paused)
+      s->step_once = true;
+    break;
 
-        case '1': scene_set_cfl_preset(s, cfl_presets[0]); break;
-        case '2': scene_set_cfl_preset(s, cfl_presets[1]); break;
-        case '3': scene_set_cfl_preset(s, cfl_presets[2]); break;
-        case '4': scene_set_cfl_preset(s, cfl_presets[3]); break;
-        case '5': scene_set_cfl_preset(s, cfl_presets[4]); break;
-        case '6': scene_set_cfl_preset(s, cfl_presets[5]); break;
+  /* Keys '1'..'9' map to preset indices 0..8; '0' maps to index 9. */
+  case '1': case '2': case '3': case '4': case '5':
+  case '6': case '7': case '8': case '9':
+  case '0': {
+    int idx = (key == '0') ? 9 : (key - '1');
+    s->preset_idx = idx;
+    scene_set_cfl_preset(s, cfl_presets[idx].cfl);
+    break;
+  }
 
-        case '+': case '=':
-            s->step_seconds *= 1.05f;
-            if (s->step_seconds > STEP_SECONDS_MAX) s->step_seconds = STEP_SECONDS_MAX;
-            break;
-        case '-': case '_':
-            s->step_seconds /= 1.05f;
-            if (s->step_seconds < STEP_SECONDS_MIN) s->step_seconds = STEP_SECONDS_MIN;
-            break;
+  case '+':
+  case '=':
+    s->step_seconds *= 1.05f;
+    if (s->step_seconds > STEP_SECONDS_MAX)
+      s->step_seconds = STEP_SECONDS_MAX;
+    break;
+  case '-':
+  case '_':
+    s->step_seconds /= 1.05f;
+    if (s->step_seconds < STEP_SECONDS_MIN)
+      s->step_seconds = STEP_SECONDS_MIN;
+    break;
 
-        case 'c':
-            s->wave_speed_cps *= 0.90f;
-            if (s->wave_speed_cps < WAVE_SPEED_MIN) s->wave_speed_cps = WAVE_SPEED_MIN;
-            break;
-        case 'C':
-            s->wave_speed_cps *= 1.10f;
-            if (s->wave_speed_cps > WAVE_SPEED_MAX) s->wave_speed_cps = WAVE_SPEED_MAX;
-            break;
+  case 'c':
+    s->wave_speed_cps *= 0.90f;
+    if (s->wave_speed_cps < WAVE_SPEED_MIN)
+      s->wave_speed_cps = WAVE_SPEED_MIN;
+    break;
+  case 'C':
+    s->wave_speed_cps *= 1.10f;
+    if (s->wave_speed_cps > WAVE_SPEED_MAX)
+      s->wave_speed_cps = WAVE_SPEED_MAX;
+    break;
 
-        case 'm':
-            s->last_init = INIT_EIGENMODE;
-            scene_apply_init(s);
-            break;
-        case 'd':
-            s->last_init = INIT_DROP;
-            scene_apply_init(s);
-            break;
+  case 'm':
+    s->last_init = INIT_EIGENMODE;
+    scene_apply_init(s);
+    break;
+  case 'd':
+    s->last_init = INIT_DROP;
+    scene_apply_init(s);
+    break;
 
-        case 'r':
-            measure_init(&s->measure);
-            scene_apply_init(s);
-            break;
+  case 'r':
+    measure_init(&s->measure);
+    scene_apply_init(s);
+    break;
 
-        case 't':
-            s->theme = (s->theme + 1) % N_THEMES;
-            color_init(s->theme);
-            break;
+  case 't':
+    s->theme = (s->theme + 1) % N_THEMES;
+    color_init(s->theme);
+    break;
 
-        default:
-            break;
-    }
-    return true;   /* keep running */
+  default:
+    break;
+  }
+  return true; /* keep running */
 }
 
 /* ===================================================================== */
 /* §15  screen — ncurses init + cleanup                                  */
 /* ===================================================================== */
 
-static void screen_init(int theme)
-{
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, true);
-    nodelay(stdscr, true);
-    curs_set(0);
-    typeahead(-1);
-    color_init(theme);
+static void screen_init(int theme) {
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, true);
+  nodelay(stdscr, true);
+  curs_set(0);
+  typeahead(-1);
+  color_init(theme);
 }
 
-static void screen_cleanup(void)
-{
-    endwin();
-}
+static void screen_cleanup(void) { endwin(); }
 
 /* ===================================================================== */
 /* §16  app — main loop + signals                                        */
@@ -1615,58 +1964,60 @@ static void screen_cleanup(void)
 static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
 
-static void on_signal(int sig)
-{
-    if (sig == SIGWINCH) g_resize_pending = 1;
-    else                 g_should_quit = 1;
+static void on_signal(int sig) {
+  if (sig == SIGWINCH)
+    g_resize_pending = 1;
+  else
+    g_should_quit = 1;
 }
 
-int main(void)
-{
-    signal(SIGINT,   on_signal);
-    signal(SIGTERM,  on_signal);
-    signal(SIGWINCH, on_signal);
+int main(void) {
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGWINCH, on_signal);
 
-    static scene_state scene;
-    screen_init(0);
-    atexit(screen_cleanup);
-    scene_init(&scene);
+  static scene_state scene;
+  screen_init(0);
+  atexit(screen_cleanup);
+  scene_init(&scene);
 
-    const int64_t frame_ns = NS_PER_SEC / TARGET_FPS;
+  const int64_t frame_ns = NS_PER_SEC / TARGET_FPS;
 
-    while (!g_should_quit) {
-        int64_t frame_start = clock_now_ns();
+  while (!g_should_quit) {
+    int64_t frame_start = clock_now_ns();
 
-        /* Handle terminal resize. */
-        if (g_resize_pending) {
-            g_resize_pending = 0;
-            endwin();
-            refresh();
-            scene_resize_to_terminal(&scene);
-            scene_apply_init(&scene);
-        }
-
-        /* Drain input queue. */
-        int key;
-        while ((key = getch()) != ERR) {
-            if (!scene_handle_key(&scene, key)) {
-                g_should_quit = 1;
-                break;
-            }
-        }
-
-        /* Advance simulation.  At our default step rate each render
-         * frame may want one or two ticks; cap to avoid spiral. */
-        for (int n = 0; n < SIM_STEPS_PER_FRAME_MAX; n++) {
-            scene_tick(&scene);
-            if (scene.paused) break;
-        }
-
-        scene_draw(&scene, stdscr);
-
-        int64_t spent = clock_now_ns() - frame_start;
-        if (spent < frame_ns) clock_sleep_ns(frame_ns - spent);
+    /* Handle terminal resize. */
+    if (g_resize_pending) {
+      g_resize_pending = 0;
+      endwin();
+      refresh();
+      scene_resize_to_terminal(&scene);
+      scene_apply_init(&scene);
     }
 
-    return 0;
+    /* Drain input queue. */
+    int key;
+    while ((key = getch()) != ERR) {
+      if (!scene_handle_key(&scene, key)) {
+        g_should_quit = 1;
+        break;
+      }
+    }
+
+    /* Advance simulation.  At our default step rate each render
+     * frame may want one or two ticks; cap to avoid spiral. */
+    for (int n = 0; n < SIM_STEPS_PER_FRAME_MAX; n++) {
+      scene_tick(&scene);
+      if (scene.paused)
+        break;
+    }
+
+    scene_draw(&scene, stdscr);
+
+    int64_t spent = clock_now_ns() - frame_start;
+    if (spent < frame_ns)
+      clock_sleep_ns(frame_ns - spent);
+  }
+
+  return 0;
 }

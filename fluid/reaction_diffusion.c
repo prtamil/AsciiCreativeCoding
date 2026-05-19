@@ -194,19 +194,50 @@
  *
  * References
  * ──────────
- *   Turing, A. M. (1952), "The Chemical Basis of Morphogenesis,"
- *     Phil. Trans. R. Soc. B 237 (641): 37-72.  THE foundational
- *     paper on reaction-diffusion patterns in biology.
- *   Pearson, J. E. (1993), "Complex Patterns in a Simple System,"
- *     Science 261 (5118): 189-192.  The parameter-space map this
- *     file's preset table is taken from.
- *   Gray, P. & Scott, S. K. (1984), "Autocatalytic Reactions in the
- *     Isothermal CSTR: Oscillations and Instabilities," Chem. Eng.
- *     Sci. 39 (6): 1087-1097.  The chemistry behind Gray-Scott.
- *   Karl Sims, "Reaction-Diffusion Tutorial":
- *     https://www.karlsims.com/rd.html
- *   Munafo, R., "Stable Localized Moving Patterns in the 2-D
- *     Gray-Scott Model": https://mrob.com/pub/comp/xmorphia/
+ *   ── Foundations: pattern formation in chemistry & biology ────────
+ *   [1] Turing, A. M. (1952), "The Chemical Basis of Morphogenesis",
+ *       Phil. Trans. R. Soc. B 237(641), pp. 37-72 — THE foundational
+ *       paper on reaction-diffusion patterns.  Predicts that two
+ *       species with different diffusion rates can form stable
+ *       spatial patterns from a uniform initial state.
+ *   [2] Gray, P. & Scott, S. K. (1984), "Autocatalytic Reactions in
+ *       the Isothermal CSTR: Oscillations and Instabilities", Chem.
+ *       Eng. Sci. 39(6), pp. 1087-1097 — the specific chemistry
+ *       behind the Gray-Scott model implemented here.
+ *   [3] Pearson, J. E. (1993), "Complex Patterns in a Simple System",
+ *       Science 261(5118), pp. 189-192 — THE (F, k) parameter-space
+ *       map our preset table is taken from (α, β, γ, δ, ε, ...
+ *       regimes).
+ *
+ *   ── Numerical methods ────────────────────────────────────────────
+ *   [4] LeVeque, R. J. (2007), "Finite Difference Methods for
+ *       Ordinary and Partial Differential Equations", SIAM — explicit
+ *       Euler PDE stability + the 5-point Laplacian stencil used in
+ *       §reaction.
+ *   [5] Strikwerda, J. C. (2004), "Finite Difference Schemes and
+ *       Partial Differential Equations", SIAM ch. 7 — CFL/diffusion
+ *       stability bound D·dt/(dx)² ≤ 1/4 that constrains our
+ *       SUBSTEPS_PER_FRAME.
+ *
+ *   ── Modern overviews ─────────────────────────────────────────────
+ *   [6] Karl Sims, "Reaction-Diffusion Tutorial",
+ *       karlsims.com/rd.html — best visual intuition for the (F, k)
+ *       parameter map.
+ *   [7] Munafo, R., "Stable Localized Moving Patterns in the 2-D
+ *       Gray-Scott Model", mrob.com/pub/comp/xmorphia — extensive
+ *       catalogue of regimes (used to name our presets).
+ *
+ *   ── Rendering / ncurses ──────────────────────────────────────────
+ *   [8] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the concentration → glyph ramp.
+ *   [9] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; init_pair,
+ *       use_default_colors, newscr/curscr diff pipeline.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [10] https://en.wikipedia.org/wiki/Reaction%E2%80%93diffusion_system
+ *  [11] https://en.wikipedia.org/wiki/Turing_pattern
  *
  * ─────────────────────────────────────────────────────────────────── */
 
@@ -788,81 +819,81 @@
 /* Du: rate at which U (substrate) diffuses.  Higher = U spreads
  * faster.  Gray-Scott requires Du > Dv for Turing instability;
  * equal diffusion gives a uniform steady state, no patterns. */
-#define DIFFUSION_U                    0.20f
+#define DIFFUSION_U 0.20f
 
 /* Dv: rate at which V (catalyst) diffuses.  Half of U's, by design.
  * The asymmetry is the engine of pattern formation. */
-#define DIFFUSION_V                    0.10f
+#define DIFFUSION_V 0.10f
 
 /* §1.2 — Euler timestep + CFL margin (T6). */
 
 /* Forward Euler dt.  CFL bound: dt · max(Du, Dv) / dx² < 0.25.
  * With dx = 1 and max D = 0.20, max dt = 1.25.  We use 1.0 (80%
  * of the bound) for a comfortable safety margin. */
-#define EULER_DT                       1.00f
+#define EULER_DT 1.00f
 
 /* §1.3 — simulation timing (T9). */
 
-#define STEPS_PER_FRAME_DEFAULT        16
-#define STEPS_PER_FRAME_MIN             1
-#define STEPS_PER_FRAME_MAX            64
-#define STEPS_PER_FRAME_STEP            4
+#define STEPS_PER_FRAME_DEFAULT 16
+#define STEPS_PER_FRAME_MIN 1
+#define STEPS_PER_FRAME_MAX 64
+#define STEPS_PER_FRAME_STEP 4
 
 /* §1.4 — warmup + seeding (T10). */
 
 /* Ticks run BEFORE the first frame so the screen shows a developed
  * pattern instead of a few seed blobs in a uniform field. */
-#define WARMUP_TICK_COUNT             600
+#define WARMUP_TICK_COUNT 600
 
 /* Half-width of each square seed blob (cells).  3 → 7×7 blob. */
-#define SEED_BLOB_HALF_WIDTH            3
+#define SEED_BLOB_HALF_WIDTH 3
 
 /* §1.5 — visualisation (T9). */
 
 /* Multiplier on V before the ramp lookup.  Peak V in the self-
  * organised regime is ~0.3-0.5; multiplying by 2.2 maps that to
  * ~0.66-1.1 (clamped to 1.0) so the bright end of the ramp sees use. */
-#define CATALYST_DISPLAY_SCALE         2.2f
+#define CATALYST_DISPLAY_SCALE 2.2f
 
-/* Number of glyph slots in the ramp (must match RAMP_GLYPHS / RAMP_THRESHOLDS). */
-#define RAMP_SLOT_COUNT                  8
+/* Number of glyph slots in the ramp (must match RAMP_GLYPHS / RAMP_THRESHOLDS).
+ */
+#define RAMP_SLOT_COUNT 8
 
 /* Theme rotation interval in render frames (~26 s at 30 fps). */
-#define AUTO_THEME_CYCLE_FRAMES        800
+#define AUTO_THEME_CYCLE_FRAMES 800
 
 /* §1.6 — colour pair IDs. */
 enum {
-    PAIR_RAMP_FIRST = 1,                                 /* +0..+7 */
-    PAIR_HUD        = PAIR_RAMP_FIRST + RAMP_SLOT_COUNT, /* yellow */
-    PAIR_HINT,                                           /* cyan   */
+  PAIR_RAMP_FIRST = 1,                          /* +0..+7 */
+  PAIR_HUD = PAIR_RAMP_FIRST + RAMP_SLOT_COUNT, /* yellow */
+  PAIR_HINT,                                    /* cyan   */
 };
 
 /* §1.7 — frame timing. */
-#define NS_PER_SEC                  1000000000LL
-#define NS_PER_MS                      1000000LL
-#define RENDER_FPS_CAP                       30
-#define RENDER_TICK_NS               (NS_PER_SEC / RENDER_FPS_CAP)
-#define FPS_RECOMPUTE_MS                    500
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define RENDER_FPS_CAP 30
+#define RENDER_TICK_NS (NS_PER_SEC / RENDER_FPS_CAP)
+#define FPS_RECOMPUTE_MS 500
 
 /* §1.8 — number of presets and themes (filled below in §7 / §5). */
-#define THEME_COUNT                    4
+#define THEME_COUNT 4
 
 /* ===================================================================== */
 /* §2  clock — monotonic ns timer + sleep                                */
 /* ===================================================================== */
 
-static int64_t clock_now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
+static int64_t clock_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / NS_PER_SEC, ns % NS_PER_SEC };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / NS_PER_SEC, ns % NS_PER_SEC};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -872,10 +903,10 @@ static void clock_sleep_ns(int64_t ns)
  * Used only for seed-blob positions (T10).  Physics is otherwise
  * deterministic.  Seeded from time(NULL) in main().
  */
-static int rand_in_range(int lo, int hi_exclusive)
-{
-    if (hi_exclusive <= lo) return lo;
-    return lo + rand() % (hi_exclusive - lo);
+static int rand_in_range(int lo, int hi_exclusive) {
+  if (hi_exclusive <= lo)
+    return lo;
+  return lo + rand() % (hi_exclusive - lo);
 }
 
 /* ===================================================================== */
@@ -889,14 +920,14 @@ static int rand_in_range(int lo, int hi_exclusive)
  */
 
 static const char ramp_glyph_table[RAMP_SLOT_COUNT] = {
-    ' ',   /* slot 0 — V ≈ 0 (pure U region, no catalyst) — not drawn */
-    '.',   /* slot 1 — V barely present (reaction front edge)         */
-    ':',   /* slot 2 — weakly active zone                              */
-    '-',   /* slot 3 — transition into pattern interior                */
-    '+',   /* slot 4 — pattern body                                    */
-    '*',   /* slot 5 — dense catalyst concentration                    */
-    '#',   /* slot 6 — near-peak V                                     */
-    '@',   /* slot 7 — peak V (spot / stripe centres)                  */
+    ' ', /* slot 0 — V ≈ 0 (pure U region, no catalyst) — not drawn */
+    '.', /* slot 1 — V barely present (reaction front edge)         */
+    ':', /* slot 2 — weakly active zone                              */
+    '-', /* slot 3 — transition into pattern interior                */
+    '+', /* slot 4 — pattern body                                    */
+    '*', /* slot 5 — dense catalyst concentration                    */
+    '#', /* slot 6 — near-peak V                                     */
+    '@', /* slot 7 — peak V (spot / stripe centres)                  */
 };
 
 static const float ramp_threshold_table[RAMP_SLOT_COUNT] = {
@@ -905,11 +936,11 @@ static const float ramp_threshold_table[RAMP_SLOT_COUNT] = {
 
 /* glyph_slot_for — map a scaled V ∈ [0, 1] to the ramp slot index.
  * Returns the highest slot whose threshold v meets or exceeds. */
-static int glyph_slot_for(float scaled_v)
-{
-    for (int i = RAMP_SLOT_COUNT - 1; i >= 0; i--)
-        if (scaled_v >= ramp_threshold_table[i]) return i;
-    return 0;
+static int glyph_slot_for(float scaled_v) {
+  for (int i = RAMP_SLOT_COUNT - 1; i >= 0; i--)
+    if (scaled_v >= ramp_threshold_table[i])
+      return i;
+  return 0;
 }
 
 /* ===================================================================== */
@@ -923,16 +954,40 @@ static int glyph_slot_for(float scaled_v)
  * steps.
  */
 
+/*
+ * ColourTheme — one of 4 named palettes for the concentration ramp.
+ *
+ * Intent
+ *   Cell U-concentration (the "active" species) is bucketed into
+ *   RAMP_SLOT_COUNT (=8) tiers and the bucket index selects a colour
+ *   pair.  A theme is exactly the array of fg colour codes (one per
+ *   bucket) plus a short name shown in HUD.
+ *
+ * Why a ramp (not a diverging palette like the wave demos)
+ *   Gray-Scott concentrations are always in [0, 1] — there is no
+ *   negative sign to highlight.  Monotone-brightening ramps map
+ *   density directly to luminance, which is what the eye reads
+ *   "amount of stuff" from.  See [8] Bourke for the design rationale.
+ *
+ * Brightness note
+ *   These themes were tuned by hand against the original wave-style
+ *   ramps; ramp[0] is set to 232 (the gray-ramp dark end) when used
+ *   as the BACKGROUND of inverted-feeling themes.  All other slots
+ *   sit in the bright half so even faint patterns stay visible.
+ *
+ * Reference [9] Raymond's NCURSES HOWTO §6 — init_pair semantics
+ *   that turn these palette arrays into live colour pairs.
+ */
 typedef struct {
-    const char *display_name;
-    short       fg256[RAMP_SLOT_COUNT];
+    const char *display_name;            /* short HUD label             */
+    short       fg256[RAMP_SLOT_COUNT];  /* 8 fg indices, low→high U    */
 } ColourTheme;
 
 static const ColourTheme theme_table[THEME_COUNT] = {
-    { "ocean",  { 232,  17,  19,  21,  27,  33,  51, 231 } },
-    { "forest", { 232,  22,  28,  34,  40,  46, 118, 231 } },
-    { "magma",  { 232,  52,  88, 124, 160, 196, 214, 231 } },
-    { "violet", { 232,  54,  56,  93, 129, 165, 201, 231 } },
+    {"ocean", {232, 17, 19, 21, 27, 33, 51, 231}},
+    {"forest", {232, 22, 28, 34, 40, 46, 118, 231}},
+    {"magma", {232, 52, 88, 124, 160, 196, 214, 231}},
+    {"violet", {232, 54, 56, 93, 129, 165, 201, 231}},
 };
 
 /* ===================================================================== */
@@ -941,51 +996,49 @@ static const ColourTheme theme_table[THEME_COUNT] = {
 
 static bool terminal_has_256_colours = false;
 
-static void apply_theme(int theme_index)
-{
-    if (theme_index < 0 || theme_index >= THEME_COUNT) theme_index = 0;
-    const ColourTheme *theme = &theme_table[theme_index];
+static void apply_theme(int theme_index) {
+  if (theme_index < 0 || theme_index >= THEME_COUNT)
+    theme_index = 0;
+  const ColourTheme *theme = &theme_table[theme_index];
 
-    if (terminal_has_256_colours) {
-        for (int i = 0; i < RAMP_SLOT_COUNT; i++)
-            init_pair((short)(PAIR_RAMP_FIRST + i),
-                      theme->fg256[i], -1);
-    } else {
-        /* 8-colour fallback — coarse but works on monochrome. */
-        static const short FALLBACK[RAMP_SLOT_COUNT] = {
-            COLOR_BLACK, COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,
-            COLOR_CYAN,  COLOR_WHITE, COLOR_WHITE, COLOR_WHITE,
-        };
-        for (int i = 0; i < RAMP_SLOT_COUNT; i++)
-            init_pair((short)(PAIR_RAMP_FIRST + i), FALLBACK[i], -1);
-    }
+  if (terminal_has_256_colours) {
+    for (int i = 0; i < RAMP_SLOT_COUNT; i++)
+      init_pair((short)(PAIR_RAMP_FIRST + i), theme->fg256[i], -1);
+  } else {
+    /* 8-colour fallback — coarse but works on monochrome. */
+    static const short FALLBACK[RAMP_SLOT_COUNT] = {
+        COLOR_BLACK, COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,
+        COLOR_CYAN,  COLOR_WHITE, COLOR_WHITE, COLOR_WHITE,
+    };
+    for (int i = 0; i < RAMP_SLOT_COUNT; i++)
+      init_pair((short)(PAIR_RAMP_FIRST + i), FALLBACK[i], -1);
+  }
 }
 
-static void colors_init(int theme_index)
-{
-    start_color();
-    use_default_colors();
-    terminal_has_256_colours = (COLORS >= 256);
-    apply_theme(theme_index);
+static void colors_init(int theme_index) {
+  start_color();
+  use_default_colors();
+  terminal_has_256_colours = (COLORS >= 256);
+  apply_theme(theme_index);
 
-    /* HUD pairs per CLAUDE.md: bright + bold + default bg. */
-    if (terminal_has_256_colours) {
-        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
-        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
+  /* HUD pairs per CLAUDE.md: bright + bold + default bg. */
+  if (terminal_has_256_colours) {
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
 /* attribute_for_slot — pair + optional A_BOLD on the brightest two
  * slots (extra punch on peaks).  A_BOLD is allowed on PAIR_RAMP
  * cells; the CLAUDE.md "no A_DIM" rule applies only to the HUD. */
-static attr_t attribute_for_slot(int slot)
-{
-    attr_t a = COLOR_PAIR(PAIR_RAMP_FIRST + slot);
-    if (slot >= RAMP_SLOT_COUNT - 2) a |= A_BOLD;
-    return a;
+static attr_t attribute_for_slot(int slot) {
+  attr_t a = COLOR_PAIR(PAIR_RAMP_FIRST + slot);
+  if (slot >= RAMP_SLOT_COUNT - 2)
+    a |= A_BOLD;
+  return a;
 }
 
 /* ===================================================================== */
@@ -998,24 +1051,54 @@ static attr_t attribute_for_slot(int slot)
  * See T4.
  */
 
+/*
+ * GrayScottPreset — one row of the (F, k) parameter table.
+ *
+ * Intent
+ *   The Gray-Scott reaction-diffusion system has TWO parameters that
+ *   completely determine its asymptotic pattern: the feed rate F (rate
+ *   at which species U is replenished) and the kill rate k (rate at
+ *   which V decays).  Pearson [3] mapped the (F, k) plane and found
+ *   QUALITATIVELY DIFFERENT regimes (spots, stripes, worms, solitons,
+ *   self-replicating dots) separated by sharp phase boundaries.
+ *
+ *   Each preset is one named landmark in that (F, k) map plus an
+ *   initial blob count.  Pressing 1..N walks through the regimes.
+ *
+ * Why three fields (not just F, k)
+ *   seed_blob_count varies because different regimes nucleate at
+ *   different scales — mitosis-class spots need only a few seeds to
+ *   spawn a whole field, while soliton regimes need more seeds to
+ *   produce a visually rich population in reasonable time.
+ *
+ * Why F and k are so sensitive (third-decimal differences)
+ *   The phase boundaries in the Pearson map are VERY THIN.  Compare:
+ *     Stripes:  F = 0.0600, k = 0.0620   → labyrinth
+ *     Worms:    F = 0.0620, k = 0.0610   → winding tendrils
+ *   Two changes of 0.001 produce qualitatively different attractors.
+ *   See [3] Pearson 1993 Fig. 1.
+ *
+ * Reference [2] Gray & Scott 1984 for the underlying chemistry; [3]
+ *   Pearson 1993 for the parameter map.
+ */
 typedef struct {
-    const char *display_name;
-    float       feed_rate;       /* f */
-    float       kill_rate;       /* k */
-    int         seed_blob_count; /* number of initial V blobs */
+    const char *display_name;  /* short HUD label                       */
+    float       feed_rate;     /* F (U replenishment rate)              */
+    float       kill_rate;     /* k (V decay rate)                      */
+    int         seed_blob_count;  /* number of initial V blobs to seed  */
 } GrayScottPreset;
 
 static const GrayScottPreset preset_table[] = {
-    { "Mitosis  ",  0.0367f, 0.0649f, 4 },  /* spots that periodically divide */
-    { "Coral    ",  0.0545f, 0.0630f, 5 },  /* branching coral-like growth    */
-    { "Stripes  ",  0.0600f, 0.0620f, 3 },  /* labyrinthine stripe patterns   */
-    { "Worms    ",  0.0620f, 0.0610f, 6 },  /* winding worm tendrils          */
-    { "Maze     ",  0.0290f, 0.0570f, 8 },  /* fine-grained maze texture      */
-    { "Bubbles  ",  0.0940f, 0.0590f, 3 },  /* stable round bubble lattice    */
-    { "Solitons ",  0.0250f, 0.0500f, 4 },  /* slowly drifting soliton blobs  */
+    {"Mitosis  ", 0.0367f, 0.0649f, 4}, /* spots that periodically divide */
+    {"Coral    ", 0.0545f, 0.0630f, 5}, /* branching coral-like growth    */
+    {"Stripes  ", 0.0600f, 0.0620f, 3}, /* labyrinthine stripe patterns   */
+    {"Worms    ", 0.0620f, 0.0610f, 6}, /* winding worm tendrils          */
+    {"Maze     ", 0.0290f, 0.0570f, 8}, /* fine-grained maze texture      */
+    {"Bubbles  ", 0.0940f, 0.0590f, 3}, /* stable round bubble lattice    */
+    {"Solitons ", 0.0250f, 0.0500f, 4}, /* slowly drifting soliton blobs  */
 };
 
-#define PRESET_COUNT  ((int)(sizeof preset_table / sizeof preset_table[0]))
+#define PRESET_COUNT ((int)(sizeof preset_table / sizeof preset_table[0]))
 
 /* ===================================================================== */
 /* §8  grid_buffers — alloc / free / resize the four arrays              */
@@ -1028,47 +1111,85 @@ static const GrayScottPreset preset_table[] = {
  * Layout: row-major.  Index = row * cols + col.
  */
 
+/*
+ * Grid — the Gray-Scott two-species field state.
+ *
+ * Intent
+ *   Gray-Scott has TWO scalar fields (U = substrate, V = catalyst)
+ *   both defined over a 2-D grid.  Each tick computes Laplacians of
+ *   both fields, then applies the autocatalytic reaction
+ *
+ *       dU/dt = D_u·∇²U  −  U·V²  +  F·(1 − U)
+ *       dV/dt = D_v·∇²V  +  U·V²  −  (F + k)·V
+ *
+ *   We need DOUBLE BUFFERS so that the new U/V values don't pollute
+ *   the neighbour reads in the same pass.  After each tick the
+ *   `_next` arrays are pointer-swapped with the current arrays.
+ *
+ * Why pointer-swap (not memcpy)
+ *   Rotating pointers is O(1); memcpy would be O(W·H) per pass.  At
+ *   substrate sizes of ~80×24 × 16 substeps/frame × 30 fps the swap
+ *   saves ~92k cell-copies/s.
+ *
+ * Why heap-allocated (not BSS)
+ *   The grid size adapts to the terminal at startup; with a BSS
+ *   worst-case array we'd reserve enough for the largest possible
+ *   terminal (~300×100 = 120 KB × 4 buffers = 480 KB), which is fine
+ *   but wasteful for a typical run.  malloc once at init keeps the
+ *   working set lean.  Hot path makes ZERO allocations per CLAUDE.md.
+ *
+ * Why preset/theme/auto-theme fields live HERE
+ *   active_preset_index and active_theme_index are reset-affecting
+ *   user choices — they outlive a SIGWINCH and need to survive a
+ *   buffer re-alloc.  auto_theme_frame_counter is a cycle counter for
+ *   the demo's "slowly cycle theme" mode.  These are all "metadata
+ *   about which patterns we're computing" so they belong on Grid.
+ *
+ * Reference [4] LeVeque for the explicit-Euler stability bound; [5]
+ *   Strikwerda for the diffusion-CFL D·dt/(dx)² ≤ 1/4 constraint.
+ */
 typedef struct {
-    int    cols;
-    int    rows;
-    float *substrate_u;        /* current U field            */
-    float *catalyst_v;         /* current V field            */
-    float *substrate_u_next;   /* scratch for the new U      */
-    float *catalyst_v_next;    /* scratch for the new V      */
+    /* ── Field extent ──────────────────────────────────────────── */
+    int cols;
+    int rows;
 
-    int    active_preset_index;
-    int    active_theme_index;
-    int    auto_theme_frame_counter;
+    /* ── Two-species fields + their scratch pairs (pointer-swapped) */
+    float *substrate_u;          /* current U field                  */
+    float *catalyst_v;           /* current V field                  */
+    float *substrate_u_next;     /* scratch — becomes U after swap   */
+    float *catalyst_v_next;      /* scratch — becomes V after swap   */
+
+    /* ── Metadata that survives reseed / resize ─────────────────── */
+    int active_preset_index;     /* row of preset_table[] in use     */
+    int active_theme_index;      /* row of theme_table[]  in use     */
+    int auto_theme_frame_counter;/* used by the auto-cycle mode      */
 } Grid;
 
-static void grid_buffers_alloc(Grid *grid, int cols, int rows)
-{
-    size_t cell_count = (size_t)cols * (size_t)rows;
-    grid->cols = cols;
-    grid->rows = rows;
-    grid->substrate_u      = malloc(cell_count * sizeof(float));
-    grid->catalyst_v       = malloc(cell_count * sizeof(float));
-    grid->substrate_u_next = malloc(cell_count * sizeof(float));
-    grid->catalyst_v_next  = malloc(cell_count * sizeof(float));
+static void grid_buffers_alloc(Grid *grid, int cols, int rows) {
+  size_t cell_count = (size_t)cols * (size_t)rows;
+  grid->cols = cols;
+  grid->rows = rows;
+  grid->substrate_u = malloc(cell_count * sizeof(float));
+  grid->catalyst_v = malloc(cell_count * sizeof(float));
+  grid->substrate_u_next = malloc(cell_count * sizeof(float));
+  grid->catalyst_v_next = malloc(cell_count * sizeof(float));
 }
 
-static void grid_buffers_free(Grid *grid)
-{
-    free(grid->substrate_u);
-    free(grid->catalyst_v);
-    free(grid->substrate_u_next);
-    free(grid->catalyst_v_next);
-    memset(grid, 0, sizeof *grid);
+static void grid_buffers_free(Grid *grid) {
+  free(grid->substrate_u);
+  free(grid->catalyst_v);
+  free(grid->substrate_u_next);
+  free(grid->catalyst_v_next);
+  memset(grid, 0, sizeof *grid);
 }
 
-static void grid_buffers_resize(Grid *grid, int cols, int rows)
-{
-    int saved_preset = grid->active_preset_index;
-    int saved_theme  = grid->active_theme_index;
-    grid_buffers_free(grid);
-    grid_buffers_alloc(grid, cols, rows);
-    grid->active_preset_index = saved_preset;
-    grid->active_theme_index  = saved_theme;
+static void grid_buffers_resize(Grid *grid, int cols, int rows) {
+  int saved_preset = grid->active_preset_index;
+  int saved_theme = grid->active_theme_index;
+  grid_buffers_free(grid);
+  grid_buffers_alloc(grid, cols, rows);
+  grid->active_preset_index = saved_preset;
+  grid->active_theme_index = saved_theme;
 }
 
 /* ===================================================================== */
@@ -1087,8 +1208,8 @@ static void grid_buffers_resize(Grid *grid, int cols, int rows)
  * centre is 0 — Laplacian of a constant field is zero.
  */
 
-#define LAPLACIAN_CARDINAL_WEIGHT  0.20f
-#define LAPLACIAN_DIAGONAL_WEIGHT  0.05f
+#define LAPLACIAN_CARDINAL_WEIGHT 0.20f
+#define LAPLACIAN_DIAGONAL_WEIGHT 0.05f
 
 /* ===================================================================== */
 /* §10  reaction_step — one Euler tick of the PDE                        */
@@ -1104,83 +1225,152 @@ static void grid_buffers_resize(Grid *grid, int cols, int rows)
  * Then SWAP buffer pointers (T7).
  */
 
-static void reaction_step(Grid *grid)
-{
-    int cols = grid->cols;
-    int rows = grid->rows;
-    float feed_rate = preset_table[grid->active_preset_index].feed_rate;
-    float kill_rate = preset_table[grid->active_preset_index].kill_rate;
+/* Toroidal neighbour indices for cell (x, y) on a wrap-around grid.
+ * No boundary conditions needed — the grid is a TORUS, opposite edges
+ * are stitched together.  Refs [4] LeVeque §3.4 on periodic BCs. */
+typedef struct {
+    int x_left, x_right;     /* horizontal neighbours, wrapped         */
+    int y_above, y_below;    /* vertical   neighbours, wrapped         */
+} ToroidalNeighbours;
+
+static inline ToroidalNeighbours toroidal_neighbours_of(int x, int y,
+                                                         int cols, int rows) {
+    ToroidalNeighbours n;
+    n.x_left  = (x == 0)        ? cols - 1 : x - 1;
+    n.x_right = (x == cols - 1) ? 0        : x + 1;
+    n.y_above = (y == 0)        ? rows - 1 : y - 1;
+    n.y_below = (y == rows - 1) ? 0        : y + 1;
+    return n;
+}
+
+/* 9-point isotropic Laplacian stencil at cell (x, y).  Uses pre-
+ * computed toroidal neighbour indices so the 4 cardinal + 4 diagonal
+ * neighbours are all in-grid.
+ *
+ *   ∇²field ≈ w_card · (E + W + N + S)
+ *           + w_diag · (NE + NW + SE + SW)
+ *           − field[centre]
+ *
+ * Weights (LAPLACIAN_*_WEIGHT in §1) are chosen so 4·w_card +
+ * 4·w_diag = 1 — that's why the centre coefficient is exactly −1.
+ * The diagonal contribution is what makes this stencil ISOTROPIC
+ * (gives the same growth rate in every direction); the 5-point
+ * Laplacian is anisotropic.  Refs [4] LeVeque §10.3. */
+static inline float laplacian_9point_at(const float *field, int cols,
+                                         int x, int y,
+                                         ToroidalNeighbours n) {
+    int   idx = y * cols + x;
+    float cardinal_sum =
+        field[y         * cols + n.x_right] +
+        field[y         * cols + n.x_left ] +
+        field[n.y_below * cols + x        ] +
+        field[n.y_above * cols + x        ];
+    float diagonal_sum =
+        field[n.y_below * cols + n.x_right] +
+        field[n.y_below * cols + n.x_left ] +
+        field[n.y_above * cols + n.x_right] +
+        field[n.y_above * cols + n.x_left ];
+    return LAPLACIAN_CARDINAL_WEIGHT * cardinal_sum
+         + LAPLACIAN_DIAGONAL_WEIGHT * diagonal_sum
+         - field[idx];
+}
+
+/* Gray-Scott autocatalytic reaction term U·V².  This is the NON-LINEAR
+ * coupling that makes patterns emerge — it appears in BOTH species'
+ * equations (consumes U, produces V) which is why we compute it once
+ * and reuse.  Refs [2] Gray & Scott 1984, [3] Pearson 1993. */
+static inline float gray_scott_reaction_term(float u, float v) {
+    return u * v * v;
+}
+
+/* Forward-Euler update for the U (substrate) field:
+ *   dU/dt = D_u·∇²U − U·V² + F·(1 − U)
+ * where the third term replenishes substrate at rate F up to U=1. */
+static inline float euler_step_u(float u, float laplacian_u,
+                                  float reaction_term, float feed_rate) {
+    return u + EULER_DT * (DIFFUSION_U * laplacian_u
+                            - reaction_term
+                            + feed_rate * (1.0f - u));
+}
+
+/* Forward-Euler update for the V (catalyst) field:
+ *   dV/dt = D_v·∇²V + U·V² − (F + k)·V
+ * where the third term consumes catalyst at rate (F + k). */
+static inline float euler_step_v(float v, float laplacian_v,
+                                  float reaction_term,
+                                  float feed_rate, float kill_rate) {
+    return v + EULER_DT * (DIFFUSION_V * laplacian_v
+                            + reaction_term
+                            - (feed_rate + kill_rate) * v);
+}
+
+/* Clamp a concentration to its physical range [0, 1].  Forward Euler
+ * can overshoot the bounds by a tiny numerical amount; this keeps the
+ * visualisation in range without changing the conserved totals
+ * meaningfully. */
+static inline float clamp_unit_interval(float x) {
+    if (x < 0.0f) return 0.0f;
+    if (x > 1.0f) return 1.0f;
+    return x;
+}
+
+/* Swap (current ↔ scratch) buffer pointers for both species.  O(1)
+ * pointer rotation; the alternative would be O(W·H) memcpy.  See
+ * Grid struct doc for the "pointer rotation, not memcpy" rationale. */
+static inline void swap_in_next_buffers(Grid *grid) {
+    float *tmp;
+    tmp = grid->substrate_u;
+    grid->substrate_u      = grid->substrate_u_next;
+    grid->substrate_u_next = tmp;
+    tmp = grid->catalyst_v;
+    grid->catalyst_v       = grid->catalyst_v_next;
+    grid->catalyst_v_next  = tmp;
+}
+
+/*
+ * reaction_step — one full Gray-Scott Euler step.
+ *
+ * Pseudocode:
+ *   for each cell (x, y):
+ *     n        = toroidal_neighbours_of(x, y, cols, rows)
+ *     lap_u    = laplacian_9point_at(U, ..., n)
+ *     lap_v    = laplacian_9point_at(V, ..., n)
+ *     reaction = gray_scott_reaction_term(u, v)
+ *     u_new    = clamp_unit_interval(euler_step_u(u, lap_u, reaction, F))
+ *     v_new    = clamp_unit_interval(euler_step_v(v, lap_v, reaction, F, k))
+ *     scratch_u[idx] = u_new;  scratch_v[idx] = v_new
+ *   swap_in_next_buffers(grid)
+ *
+ * Refs [2] Gray & Scott 1984 (chemistry); [3] Pearson 1993 (regimes);
+ *   [4] LeVeque §10 (explicit Euler + 9-point Laplacian stability).
+ */
+static void reaction_step(Grid *grid) {
+    const int   cols = grid->cols, rows = grid->rows;
+    const float feed_rate = preset_table[grid->active_preset_index].feed_rate;
+    const float kill_rate = preset_table[grid->active_preset_index].kill_rate;
 
     for (int y = 0; y < rows; y++) {
-        /* Toroidal vertical neighbours (T8). */
-        int y_above = (y == 0)        ? rows - 1 : y - 1;
-        int y_below = (y == rows - 1) ? 0        : y + 1;
-
         for (int x = 0; x < cols; x++) {
-            /* Toroidal horizontal neighbours. */
-            int x_left  = (x == 0)        ? cols - 1 : x - 1;
-            int x_right = (x == cols - 1) ? 0        : x + 1;
+            ToroidalNeighbours n   = toroidal_neighbours_of(x, y, cols, rows);
+            int                idx = y * cols + x;
+            float              u   = grid->substrate_u[idx];
+            float              v   = grid->catalyst_v [idx];
 
-            int idx = y * cols + x;
-            float u = grid->substrate_u[idx];
-            float v = grid->catalyst_v [idx];
+            float lap_u    = laplacian_9point_at(grid->substrate_u, cols, x, y, n);
+            float lap_v    = laplacian_9point_at(grid->catalyst_v,  cols, x, y, n);
+            float reaction = gray_scott_reaction_term(u, v);
 
-            /* 9-point isotropic Laplacian for U (T5). */
-            float laplacian_u =
-                LAPLACIAN_CARDINAL_WEIGHT *
-                  ( grid->substrate_u[y       * cols + x_right]
-                  + grid->substrate_u[y       * cols + x_left ]
-                  + grid->substrate_u[y_below * cols + x      ]
-                  + grid->substrate_u[y_above * cols + x      ] )
-              + LAPLACIAN_DIAGONAL_WEIGHT *
-                  ( grid->substrate_u[y_below * cols + x_right]
-                  + grid->substrate_u[y_below * cols + x_left ]
-                  + grid->substrate_u[y_above * cols + x_right]
-                  + grid->substrate_u[y_above * cols + x_left ] )
-              - u;
-
-            /* Same stencil for V. */
-            float laplacian_v =
-                LAPLACIAN_CARDINAL_WEIGHT *
-                  ( grid->catalyst_v[y       * cols + x_right]
-                  + grid->catalyst_v[y       * cols + x_left ]
-                  + grid->catalyst_v[y_below * cols + x      ]
-                  + grid->catalyst_v[y_above * cols + x      ] )
-              + LAPLACIAN_DIAGONAL_WEIGHT *
-                  ( grid->catalyst_v[y_below * cols + x_right]
-                  + grid->catalyst_v[y_below * cols + x_left ]
-                  + grid->catalyst_v[y_above * cols + x_right]
-                  + grid->catalyst_v[y_above * cols + x_left ] )
-              - v;
-
-            /* Shared autocatalytic reaction term. */
-            float reaction_term = u * v * v;
-
-            /* Forward Euler update (T6). */
-            float u_new = u + EULER_DT * (DIFFUSION_U * laplacian_u
-                                        - reaction_term
-                                        + feed_rate * (1.0f - u));
-            float v_new = v + EULER_DT * (DIFFUSION_V * laplacian_v
-                                        + reaction_term
-                                        - (feed_rate + kill_rate) * v);
-
-            /* Clamp to physical range. */
-            if (u_new < 0.0f) u_new = 0.0f; else if (u_new > 1.0f) u_new = 1.0f;
-            if (v_new < 0.0f) v_new = 0.0f; else if (v_new > 1.0f) v_new = 1.0f;
+            float u_new = clamp_unit_interval(
+                            euler_step_u(u, lap_u, reaction, feed_rate));
+            float v_new = clamp_unit_interval(
+                            euler_step_v(v, lap_v, reaction, feed_rate, kill_rate));
 
             grid->substrate_u_next[idx] = u_new;
             grid->catalyst_v_next [idx] = v_new;
         }
     }
 
-    /* Swap current ↔ scratch (T7).  O(1) pointer swap. */
-    float *tmp;
-    tmp = grid->substrate_u;
-    grid->substrate_u      = grid->substrate_u_next;
-    grid->substrate_u_next = tmp;
-    tmp = grid->catalyst_v;
-    grid->catalyst_v      = grid->catalyst_v_next;
-    grid->catalyst_v_next = tmp;
+    swap_in_next_buffers(grid);
 }
 
 /* ===================================================================== */
@@ -1197,51 +1387,115 @@ static void reaction_step(Grid *grid)
  * placement also randomised.
  */
 
-static void place_seed_blob(Grid *grid, int centre_x, int centre_y)
-{
-    int cols = grid->cols;
-    int rows = grid->rows;
+/* Sign-correct toroidal modulo: ((x % n) + n) % n.  C's % returns
+ * NEGATIVE for negative left operands, so naive `x % n` doesn't wrap
+ * properly; double-mod fixes that. */
+static inline int wrap_toroidal_modulo(int x, int n) {
+    return ((x % n) + n) % n;
+}
+
+/* Set one cell to the SEED state (U=0, V=1) — the inverse of the
+ * trivial equilibrium.  Reaction-diffusion patterns nucleate from
+ * exactly this kind of local V excess. */
+static inline void seed_one_cell_to_catalyst(Grid *grid, int x, int y) {
+    grid->substrate_u[y * grid->cols + x] = 0.0f;
+    grid->catalyst_v [y * grid->cols + x] = 1.0f;
+}
+
+/*
+ * place_seed_blob — paint a small square of (U=0, V=1) centred at
+ * (centre_x, centre_y).  Block size = 2·SEED_BLOB_HALF_WIDTH + 1.
+ *
+ * Pseudocode:
+ *   for dy in [-h, h]:
+ *     for dx in [-h, h]:
+ *       (x, y) = wrap_toroidal_modulo((centre_x + dx, centre_y + dy))
+ *       seed_one_cell_to_catalyst(grid, x, y)
+ */
+static void place_seed_blob(Grid *grid, int centre_x, int centre_y) {
     for (int dy = -SEED_BLOB_HALF_WIDTH; dy <= SEED_BLOB_HALF_WIDTH; dy++) {
         for (int dx = -SEED_BLOB_HALF_WIDTH; dx <= SEED_BLOB_HALF_WIDTH; dx++) {
-            int x = ((centre_x + dx) % cols + cols) % cols;
-            int y = ((centre_y + dy) % rows + rows) % rows;
-            grid->substrate_u[y * cols + x] = 0.0f;
-            grid->catalyst_v [y * cols + x] = 1.0f;
+            int x = wrap_toroidal_modulo(centre_x + dx, grid->cols);
+            int y = wrap_toroidal_modulo(centre_y + dy, grid->rows);
+            seed_one_cell_to_catalyst(grid, x, y);
         }
     }
 }
 
-static void grid_seed_initial_conditions(Grid *grid)
-{
-    int cols = grid->cols;
-    int rows = grid->rows;
-    int cell_count = cols * rows;
-
-    /* Reset to trivial equilibrium U=1, V=0. */
+/* Reset every cell to the trivial equilibrium U=1, V=0.  This is the
+ * "no patterns" state from which all interesting Gray-Scott dynamics
+ * are perturbations.  Without the V seed below, the grid stays here
+ * forever — the reaction U·V² needs an initial V to bootstrap. */
+static inline void reset_grid_to_equilibrium(Grid *grid) {
+    int cell_count = grid->cols * grid->rows;
     for (int i = 0; i < cell_count; i++) {
         grid->substrate_u[i] = 1.0f;
         grid->catalyst_v [i] = 0.0f;
     }
+}
 
-    /* Distribute seed blobs evenly with jitter. */
+/* Compute the dimensions of one "blob slot" given a total blob count.
+ * Each slot is slot_width × rows; one blob lives near its centre with
+ * jitter.  Clamps prevent zero-jitter for grids smaller than the
+ * expected blob count.  */
+static inline void compute_blob_slot_geometry(int cols, int rows, int blob_count,
+                                               int *out_slot_width,
+                                               int *out_x_jitter_max,
+                                               int *out_y_jitter_max,
+                                               int *out_y_centre) {
+    *out_slot_width   = cols / blob_count;
+    *out_x_jitter_max = *out_slot_width / 2;
+    if (*out_x_jitter_max < 1) *out_x_jitter_max = 1;
+    *out_y_centre     = rows / 2;
+    *out_y_jitter_max = rows / 4;
+    if (*out_y_jitter_max < 1) *out_y_jitter_max = 1;
+}
+
+/* Pick the random centre position for blob `slot_index` within its
+ * horizontal slot, jittered ± in both axes around the slot centre /
+ * vertical mid-line.  Returns wrapped coords (the toroidal modulo
+ * keeps blobs in-grid even when jitter pushes them past the edge). */
+static inline void pick_jittered_blob_centre(int slot_index,
+                                              int cols, int rows,
+                                              int slot_width,
+                                              int x_jitter_max,
+                                              int y_jitter_max,
+                                              int y_centre,
+                                              int *out_cx, int *out_cy) {
+    int x_base   = slot_index * slot_width + slot_width / 2;
+    int x_jitter = rand_in_range(-x_jitter_max, x_jitter_max + 1);
+    int y_jitter = rand_in_range(-y_jitter_max, y_jitter_max + 1);
+    *out_cx = wrap_toroidal_modulo(x_base   + x_jitter, cols);
+    *out_cy = wrap_toroidal_modulo(y_centre + y_jitter, rows);
+}
+
+/*
+ * grid_seed_initial_conditions — wipe to equilibrium + scatter blobs.
+ *
+ * Pseudocode:
+ *   reset_grid_to_equilibrium(grid)             ← U=1, V=0 everywhere
+ *   blob_count = preset_table[...].seed_blob_count   (≥ 1)
+ *   compute_blob_slot_geometry(...)              ← slot widths + jitter ranges
+ *   for slot_index = 0 .. blob_count-1:
+ *     (cx, cy) = pick_jittered_blob_centre(slot_index, ...)
+ *     place_seed_blob(grid, cx, cy)
+ */
+static void grid_seed_initial_conditions(Grid *grid) {
+    reset_grid_to_equilibrium(grid);
+
     int blob_count = preset_table[grid->active_preset_index].seed_blob_count;
     if (blob_count < 1) blob_count = 1;
 
-    int slot_width   = cols / blob_count;
-    int x_jitter_max = (slot_width / 2);
-    if (x_jitter_max < 1) x_jitter_max = 1;
-    int y_centre     = rows / 2;
-    int y_jitter_max = (rows / 4);
-    if (y_jitter_max < 1) y_jitter_max = 1;
+    int slot_width, x_jitter_max, y_jitter_max, y_centre;
+    compute_blob_slot_geometry(grid->cols, grid->rows, blob_count,
+                               &slot_width, &x_jitter_max, &y_jitter_max,
+                               &y_centre);
 
     for (int s = 0; s < blob_count; s++) {
-        int x_base   = s * slot_width + slot_width / 2;
-        int x_jitter = rand_in_range(-x_jitter_max, x_jitter_max + 1);
-        int y_jitter = rand_in_range(-y_jitter_max, y_jitter_max + 1);
-        int cx = x_base + x_jitter;
-        int cy = y_centre + y_jitter;
-        cx = ((cx % cols) + cols) % cols;
-        cy = ((cy % rows) + rows) % rows;
+        int cx, cy;
+        pick_jittered_blob_centre(s, grid->cols, grid->rows,
+                                   slot_width, x_jitter_max, y_jitter_max,
+                                   y_centre, &cx, &cy);
         place_seed_blob(grid, cx, cy);
     }
 }
@@ -1254,57 +1508,89 @@ static void grid_seed_initial_conditions(Grid *grid)
  * dots.  Boring.  Run WARMUP_TICK_COUNT ticks before the first
  * render so the user immediately sees a developed pattern.
  */
-static void grid_warmup(Grid *grid)
-{
-    for (int i = 0; i < WARMUP_TICK_COUNT; i++)
-        reaction_step(grid);
+static void grid_warmup(Grid *grid) {
+  for (int i = 0; i < WARMUP_TICK_COUNT; i++)
+    reaction_step(grid);
 }
 
 /* Convenience: full reset (seed + warmup). */
-static void grid_reseed(Grid *grid)
-{
-    grid_seed_initial_conditions(grid);
-    grid_warmup(grid);
+static void grid_reseed(Grid *grid) {
+  grid_seed_initial_conditions(grid);
+  grid_warmup(grid);
 }
 
-static void grid_init(Grid *grid, int cols, int rows,
-                      int preset_index, int theme_index)
-{
-    grid_buffers_alloc(grid, cols, rows);
-    grid->active_preset_index      = preset_index;
-    grid->active_theme_index       = theme_index;
-    grid->auto_theme_frame_counter = 0;
-    grid_reseed(grid);
+static void grid_init(Grid *grid, int cols, int rows, int preset_index,
+                      int theme_index) {
+  grid_buffers_alloc(grid, cols, rows);
+  grid->active_preset_index = preset_index;
+  grid->active_theme_index = theme_index;
+  grid->auto_theme_frame_counter = 0;
+  grid_reseed(grid);
 }
 
 /* ===================================================================== */
 /* §13  glyph_picker — V → ramp slot + glyph + attribute (T9)            */
 /* ===================================================================== */
 
+/*
+ * CellRender — one cell's drawing instruction, derived from V density.
+ *
+ * Intent
+ *   pick_cell_render() maps the scalar V (catalyst) concentration to
+ *   a glyph + colour-pair attribute combo.  Bundling all three
+ *   outputs in a struct keeps the caller linear:
+ *     `r = pick_cell_render(v); if (r.skip) continue;`.
+ *
+ * Why a `skip` flag
+ *   Cells with effectively-zero V are LEFT BLANK so the terminal
+ *   background shows through and pattern boundaries pop visually.
+ *   The flag lets the caller avoid `mvaddch` for those cells (saves
+ *   diff bandwidth + makes the visualisation crisper).
+ *
+ * Reference [8] Bourke for the V → glyph design.
+ */
 typedef struct {
-    char   glyph;
-    attr_t attr;
-    bool   skip;
+    char   glyph;   /* one of the ASCII ramp glyphs              */
+    attr_t attr;    /* COLOR_PAIR(...) | A_BOLD for top tier     */
+    bool   skip;    /* if true, leave the cell at default-bg     */
 } CellRender;
 
-static CellRender pick_cell_render(float v)
-{
-    /* Contrast stretch (T9). */
+/* Contrast-stretch raw V density into the displayable range [0, 1].
+ * V values are typically tiny (~0.2 max) so multiplying by
+ * CATALYST_DISPLAY_SCALE pushes the meaningful range into the upper
+ * end of the glyph ramp.  Clamped because the multiplier overshoots
+ * for high-V cells. */
+static inline float contrast_stretch_v_to_display(float v) {
     float scaled = v * CATALYST_DISPLAY_SCALE;
-    if (scaled > 1.0f) scaled = 1.0f;
-    if (scaled < 0.0f) scaled = 0.0f;
+    if (scaled > 1.0f) return 1.0f;
+    if (scaled < 0.0f) return 0.0f;
+    return scaled;
+}
 
-    int slot = glyph_slot_for(scaled);
-
-    /* Slot 0 = blank space; leave the underlying terminal cell as-is.
-     * Saves attron/attroff thrash AND erase calls in the main loop. */
+/* Build a CellRender for a given ramp slot.  Slot 0 means "leave the
+ * background showing through" — saves attron/mvaddch thrash AND avoids
+ * the erase pass for stable patterns. */
+static inline CellRender cell_render_for_slot(int slot) {
     if (slot == 0) return (CellRender){ .skip = true };
-
     return (CellRender){
         .glyph = ramp_glyph_table[slot],
         .attr  = attribute_for_slot(slot),
         .skip  = false,
     };
+}
+
+/*
+ * pick_cell_render — V density → glyph + colour + attribute.
+ *
+ * Pseudocode:
+ *   v_display = contrast_stretch_v_to_display(v)
+ *   slot      = glyph_slot_for(v_display)
+ *   return cell_render_for_slot(slot)
+ */
+static CellRender pick_cell_render(float v) {
+    float v_display = contrast_stretch_v_to_display(v);
+    int   slot      = glyph_slot_for(v_display);
+    return cell_render_for_slot(slot);
 }
 
 /* ===================================================================== */
@@ -1318,29 +1604,56 @@ static CellRender pick_cell_render(float v)
  * Returns true if the theme was just rotated (caller should clear
  * the screen so the previous theme's cells don't linger).
  */
-static bool render_grid(Grid *grid, int term_cols, int term_rows)
-{
-    bool theme_just_changed = false;
+/* Advance the auto-theme counter; rotate the palette and re-init the
+ * colour pairs every AUTO_THEME_CYCLE_FRAMES frames.  Returns true if
+ * the theme JUST rotated this frame — caller clears the screen so the
+ * previous theme's residual cells don't leak through. */
+static inline bool maybe_advance_auto_theme(Grid *grid) {
     grid->auto_theme_frame_counter++;
-    if (grid->auto_theme_frame_counter >= AUTO_THEME_CYCLE_FRAMES) {
-        grid->auto_theme_frame_counter = 0;
-        grid->active_theme_index = (grid->active_theme_index + 1) % THEME_COUNT;
-        apply_theme(grid->active_theme_index);
-        theme_just_changed = true;
-    }
+    if (grid->auto_theme_frame_counter < AUTO_THEME_CYCLE_FRAMES)
+        return false;
+    grid->auto_theme_frame_counter = 0;
+    grid->active_theme_index = (grid->active_theme_index + 1) % THEME_COUNT;
+    apply_theme(grid->active_theme_index);
+    return true;
+}
 
-    int cols = grid->cols;
-    int rows = grid->rows;
-    for (int y = 0; y < rows && y < term_rows; y++) {
-        for (int x = 0; x < cols && x < term_cols; x++) {
-            float v = grid->catalyst_v[y * cols + x];
-            CellRender cr = pick_cell_render(v);
-            if (cr.skip) continue;
-            attron(cr.attr);
-            mvaddch(y, x, (chtype)(unsigned char)cr.glyph);
-            attroff(cr.attr);
-        }
-    }
+/* Paint ONE cell from its V density.  Skips slot-0 (background)
+ * cells without touching ncurses — those are by far the majority for
+ * stable patterns, so the early-out is a real bandwidth win. */
+static inline void paint_one_v_cell(int y, int x, float v) {
+    CellRender cr = pick_cell_render(v);
+    if (cr.skip) return;
+    attron(cr.attr);
+    mvaddch(y, x, (chtype)(unsigned char)cr.glyph);
+    attroff(cr.attr);
+}
+
+/* Walk the whole field, painting each cell's V density via
+ * paint_one_v_cell.  Bounded by both the grid extent AND the terminal
+ * extent so a smaller terminal shows a SUBSET of the field rather
+ * than overflowing. */
+static inline void paint_v_field(const Grid *grid, int term_cols, int term_rows) {
+    int cols = grid->cols, rows = grid->rows;
+    for (int y = 0; y < rows && y < term_rows; y++)
+        for (int x = 0; x < cols && x < term_cols; x++)
+            paint_one_v_cell(y, x, grid->catalyst_v[y * cols + x]);
+}
+
+/*
+ * render_grid — auto-cycle theme, then paint the V field.
+ *
+ * Pseudocode:
+ *   theme_just_changed = maybe_advance_auto_theme(grid)
+ *   paint_v_field(grid, term_cols, term_rows)
+ *   return theme_just_changed
+ *
+ * Returns true if the theme just rotated (caller must clear the
+ * screen so the previous theme's leftover cells don't linger).
+ */
+static bool render_grid(Grid *grid, int term_cols, int term_rows) {
+    bool theme_just_changed = maybe_advance_auto_theme(grid);
+    paint_v_field(grid, term_cols, term_rows);
     return theme_just_changed;
 }
 
@@ -1348,57 +1661,88 @@ static bool render_grid(Grid *grid, int term_cols, int term_rows)
 /* §15  scene — per-frame state + tick + helpers                         */
 /* ===================================================================== */
 
+/*
+ * Scene — the single owner of this demo's live state.
+ *
+ * Intent
+ *   Scene composes the Gray-Scott Grid (the simulation) with the
+ *   loop-control flags (paused, sub-step count, needs_clear).  The
+ *   grid carries its own preset/theme indices because those affect
+ *   reseed behaviour and need to survive a SIGWINCH.
+ *
+ * Locality (sim vs render)
+ *   - grid                              → simulation (the U,V fields)
+ *   - simulation_paused                 → control (gates scene_tick)
+ *   - simulation_steps_per_frame        → sim tuning (substeps; faster
+ *                                          patterns per render frame)
+ *   - needs_clear                       → pure render (forces erase()
+ *                                          before next paint after a
+ *                                          theme change or reset)
+ *
+ *   Mis-classifying needs_clear as sim — and accidentally clearing
+ *   the U/V fields when it flips — would corrupt the patterns on
+ *   theme change.  Keeping it as a render-only flag preserves the
+ *   "theme is decoupled from physics" invariant.
+ *
+ * Why these specific fields and no others
+ *   The fluid state, preset/theme indices, and ramp tables live on
+ *   Grid (or at file scope); Scene only adds the per-frame control
+ *   flags that the main loop needs to consult.
+ *
+ * Reference [9] Raymond for the erase/wnoutrefresh/doupdate pipeline
+ *   that needs_clear feeds into.
+ */
 typedef struct {
-    Grid grid;
+    /* ── Simulation state (read by scene_tick) ──────────────────── */
+    Grid grid;                          /* U/V fields + metadata     */
+
+    /* ── Control state (gates the tick + drives HUD) ───────────── */
     bool simulation_paused;
-    bool needs_clear;          /* request erase() before next render */
+
+    /* ── Simulation tuning (sub-steps per render frame) ────────── */
     int  simulation_steps_per_frame;
+
+    /* ── Pure render state (forces full erase before next paint) ─ */
+    bool needs_clear;
 } Scene;
 
-static void scene_init(Scene *scene, int cols, int rows,
-                       int preset_index, int theme_index)
-{
-    memset(scene, 0, sizeof *scene);
-    scene->simulation_steps_per_frame = STEPS_PER_FRAME_DEFAULT;
-    grid_init(&scene->grid, cols, rows, preset_index, theme_index);
+static void scene_init(Scene *scene, int cols, int rows, int preset_index,
+                       int theme_index) {
+  memset(scene, 0, sizeof *scene);
+  scene->simulation_steps_per_frame = STEPS_PER_FRAME_DEFAULT;
+  grid_init(&scene->grid, cols, rows, preset_index, theme_index);
 }
 
-static void scene_free(Scene *scene)
-{
-    grid_buffers_free(&scene->grid);
+static void scene_free(Scene *scene) { grid_buffers_free(&scene->grid); }
+
+static void scene_set_preset(Scene *scene, int new_preset_index) {
+  new_preset_index =
+      (new_preset_index % PRESET_COUNT + PRESET_COUNT) % PRESET_COUNT;
+  scene->grid.active_preset_index = new_preset_index;
+  scene->grid.auto_theme_frame_counter = 0;
+  grid_reseed(&scene->grid);
+  scene->needs_clear = true;
 }
 
-static void scene_set_preset(Scene *scene, int new_preset_index)
-{
-    new_preset_index = (new_preset_index % PRESET_COUNT + PRESET_COUNT)
-                     % PRESET_COUNT;
-    scene->grid.active_preset_index      = new_preset_index;
-    scene->grid.auto_theme_frame_counter = 0;
-    grid_reseed(&scene->grid);
-    scene->needs_clear = true;
+static void scene_cycle_theme(Scene *scene) {
+  scene->grid.active_theme_index =
+      (scene->grid.active_theme_index + 1) % THEME_COUNT;
+  scene->grid.auto_theme_frame_counter = 0;
+  apply_theme(scene->grid.active_theme_index);
+  scene->needs_clear = true;
 }
 
-static void scene_cycle_theme(Scene *scene)
-{
-    scene->grid.active_theme_index =
-        (scene->grid.active_theme_index + 1) % THEME_COUNT;
-    scene->grid.auto_theme_frame_counter = 0;
-    apply_theme(scene->grid.active_theme_index);
-    scene->needs_clear = true;
+static void scene_resize(Scene *scene, int cols, int rows) {
+  grid_buffers_resize(&scene->grid, cols, rows);
+  grid_reseed(&scene->grid);
+  scene->needs_clear = true;
 }
 
-static void scene_resize(Scene *scene, int cols, int rows)
-{
-    grid_buffers_resize(&scene->grid, cols, rows);
-    grid_reseed(&scene->grid);
-    scene->needs_clear = true;
-}
-
-static void scene_tick(Scene *scene)
-{
-    if (scene->simulation_paused) return;
-    for (int i = 0; i < scene->simulation_steps_per_frame; i++)
-        reaction_step(&scene->grid);
+static void scene_tick(Scene *scene) {
+  if (scene->simulation_paused)
+    return;
+  for (int i = 0; i < scene->simulation_steps_per_frame; i++)
+    reaction_step(&scene->grid);
 }
 
 /* ===================================================================== */
@@ -1410,207 +1754,241 @@ static void scene_tick(Scene *scene)
  *   row rows-1  — key hint (cyan + bold),  bottom
  */
 
-static void hud_paint_status(int term_cols, const Scene *scene, double fps)
-{
-    const Grid *grid = &scene->grid;
-    char buf[200];
-    snprintf(buf, sizeof buf,
-             " Reaction-Diffusion  %s  theme:%-6s  steps/frame:%2d  "
-             "%5.1f fps  %s ",
-             preset_table[grid->active_preset_index].display_name,
-             theme_table[grid->active_theme_index].display_name,
-             scene->simulation_steps_per_frame, fps,
-             scene->simulation_paused ? "PAUSED " : "running");
-    int slen = (int)strlen(buf);
-    int sx   = term_cols - slen;
-    if (sx < 0) sx = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, sx, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+static void hud_paint_status(int term_cols, const Scene *scene, double fps) {
+  const Grid *grid = &scene->grid;
+  char buf[200];
+  snprintf(buf, sizeof buf,
+           " Reaction-Diffusion  %s  theme:%-6s  steps/frame:%2d  "
+           "%5.1f fps  %s ",
+           preset_table[grid->active_preset_index].display_name,
+           theme_table[grid->active_theme_index].display_name,
+           scene->simulation_steps_per_frame, fps,
+           scene->simulation_paused ? "PAUSED " : "running");
+  int slen = (int)strlen(buf);
+  int sx = term_cols - slen;
+  if (sx < 0)
+    sx = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, sx, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void hud_paint_hint(int term_rows)
-{
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(term_rows - 1, 0,
-             " q:quit  spc:pause  r:reseed  s:seed  n/p:preset  "
-             "t:theme  +/-:speed ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void hud_paint_hint(int term_rows) {
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(term_rows - 1, 0,
+           " q:quit  spc:pause  r:reseed  s:seed  n/p:preset  "
+           "t:theme  +/-:speed ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §17  screen — ncurses init / cleanup / present                        */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal extent record.  ncurses owns the buffers; we
+ * keep only cell dimensions for HUD placement and field clipping.
+ *
+ * Render pipeline (one frame): erase → paint_field → hud_paint_*
+ *   → wnoutrefresh(stdscr) → doupdate().  Diff-only writes — no flicker.
+ *   See [9] Raymond §11.
+ */
+typedef struct {
+    int cols;   /* terminal width  in cells (getmaxyx)             */
+    int rows;   /* terminal height in cells (getmaxyx)             */
+} Screen;
 
-static void screen_init(Screen *screen, int theme_index)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    colors_init(theme_index);
-    getmaxyx(stdscr, screen->rows, screen->cols);
+static void screen_init(Screen *screen, int theme_index) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  colors_init(theme_index);
+  getmaxyx(stdscr, screen->rows, screen->cols);
 }
 
-static void screen_cleanup(void)
-{
-    endwin();
+static void screen_cleanup(void) { endwin(); }
+
+static void screen_resize(Screen *screen) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, screen->rows, screen->cols);
 }
 
-static void screen_resize(Screen *screen)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, screen->rows, screen->cols);
-}
+static void screen_present_frame(Screen *screen, Scene *scene, double fps) {
+  if (scene->needs_clear) {
+    erase();
+    scene->needs_clear = false;
+  }
 
-static void screen_present_frame(Screen *screen, Scene *scene, double fps)
-{
-    if (scene->needs_clear) {
-        erase();
-        scene->needs_clear = false;
-    }
+  bool theme_changed = render_grid(&scene->grid, screen->cols, screen->rows);
+  if (theme_changed)
+    scene->needs_clear = true;
 
-    bool theme_changed = render_grid(&scene->grid, screen->cols, screen->rows);
-    if (theme_changed) scene->needs_clear = true;
+  hud_paint_status(screen->cols, scene, fps);
+  hud_paint_hint(screen->rows);
 
-    hud_paint_status(screen->cols, scene, fps);
-    hud_paint_hint  (screen->rows);
-
-    wnoutrefresh(stdscr);
-    doupdate();
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §18  app — main loop + signals + input                                */
 /* ===================================================================== */
 
+/*
+ * App — top-level container; lives in BSS as the single app_state instance.
+ *
+ * Intent
+ *   Signal handlers need to reach state that the main loop polls.
+ *   A global App + handlers that flip its volatile sig_atomic_t flags
+ *   is the standard POSIX "wake the main loop" pattern.
+ *
+ * Why the volatile sig_atomic_t flags
+ *   POSIX permits signal handlers to write ONLY sig_atomic_t values
+ *   with simple assignments — anything wider is UB.  volatile forces
+ *   every read in the main loop to go back to memory across signal
+ *   arrival (no compiler caching).
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    Scene  scene;                          /* world + control state    */
+    Screen screen;                         /* terminal extent          */
+    volatile sig_atomic_t running;         /* SIGINT/TERM clears this  */
+    volatile sig_atomic_t need_resize;     /* SIGWINCH sets this       */
 } App;
 
 static App app_state;
 
-static void on_signal_quit  (int sig) { (void)sig; app_state.running     = 0; }
-static void on_signal_resize(int sig) { (void)sig; app_state.need_resize = 1; }
-
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *scene = &app->scene;
-    Grid  *grid  = &scene->grid;
-
-    switch (ch) {
-        case 'q': case 'Q': case 27:
-            return false;
-
-        case ' ':
-            scene->simulation_paused = !scene->simulation_paused;
-            break;
-
-        case 'n': case 'N':
-            scene_set_preset(scene, grid->active_preset_index + 1);
-            break;
-        case 'p': case 'P':
-            scene_set_preset(scene, grid->active_preset_index + PRESET_COUNT - 1);
-            break;
-
-        case 't': case 'T':
-            scene_cycle_theme(scene);
-            break;
-
-        case 'r': case 'R':
-            grid_reseed(grid);
-            scene->needs_clear = true;
-            break;
-
-        case 's': case 'S':
-            place_seed_blob(grid, grid->cols / 2, grid->rows / 2);
-            break;
-
-        case '+': case '=':
-            scene->simulation_steps_per_frame += STEPS_PER_FRAME_STEP;
-            if (scene->simulation_steps_per_frame > STEPS_PER_FRAME_MAX)
-                scene->simulation_steps_per_frame = STEPS_PER_FRAME_MAX;
-            break;
-        case '-':
-            scene->simulation_steps_per_frame -= STEPS_PER_FRAME_STEP;
-            if (scene->simulation_steps_per_frame < STEPS_PER_FRAME_MIN)
-                scene->simulation_steps_per_frame = STEPS_PER_FRAME_MIN;
-            break;
-
-        default: break;
-    }
-    return true;
+static void on_signal_quit(int sig) {
+  (void)sig;
+  app_state.running = 0;
+}
+static void on_signal_resize(int sig) {
+  (void)sig;
+  app_state.need_resize = 1;
 }
 
-int main(void)
-{
-    srand((unsigned)time(NULL));
-    atexit(screen_cleanup);
-    signal(SIGINT,   on_signal_quit);
-    signal(SIGTERM,  on_signal_quit);
-    signal(SIGWINCH, on_signal_resize);
+static bool app_handle_key(App *app, int ch) {
+  Scene *scene = &app->scene;
+  Grid *grid = &scene->grid;
 
-    App *app     = &app_state;
-    app->running = 1;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-    screen_init(&app->screen, 0);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows, 0, 0);
+  case ' ':
+    scene->simulation_paused = !scene->simulation_paused;
+    break;
 
-    int64_t prev_frame_ns       = clock_now_ns();
-    int64_t fps_window_ns       = 0;
-    int     frames_in_window    = 0;
-    double  measured_fps        = 0.0;
+  case 'n':
+  case 'N':
+    scene_set_preset(scene, grid->active_preset_index + 1);
+    break;
+  case 'p':
+  case 'P':
+    scene_set_preset(scene, grid->active_preset_index + PRESET_COUNT - 1);
+    break;
 
-    while (app->running) {
-        int64_t frame_start_ns = clock_now_ns();
+  case 't':
+  case 'T':
+    scene_cycle_theme(scene);
+    break;
 
-        /* ── input ── */
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch)) {
-            app->running = 0;
-            break;
-        }
+  case 'r':
+  case 'R':
+    grid_reseed(grid);
+    scene->needs_clear = true;
+    break;
 
-        /* ── resize ── */
-        if (app->need_resize) {
-            screen_resize(&app->screen);
-            scene_resize(&app->scene, app->screen.cols, app->screen.rows);
-            app->need_resize = 0;
-            prev_frame_ns = clock_now_ns();
-        }
+  case 's':
+  case 'S':
+    place_seed_blob(grid, grid->cols / 2, grid->rows / 2);
+    break;
 
-        /* ── dt + fps window ── */
-        int64_t dt_ns  = frame_start_ns - prev_frame_ns;
-        prev_frame_ns  = frame_start_ns;
-        if (dt_ns > 100 * NS_PER_MS) dt_ns = 100 * NS_PER_MS;
+  case '+':
+  case '=':
+    scene->simulation_steps_per_frame += STEPS_PER_FRAME_STEP;
+    if (scene->simulation_steps_per_frame > STEPS_PER_FRAME_MAX)
+      scene->simulation_steps_per_frame = STEPS_PER_FRAME_MAX;
+    break;
+  case '-':
+    scene->simulation_steps_per_frame -= STEPS_PER_FRAME_STEP;
+    if (scene->simulation_steps_per_frame < STEPS_PER_FRAME_MIN)
+      scene->simulation_steps_per_frame = STEPS_PER_FRAME_MIN;
+    break;
 
-        frames_in_window++;
-        fps_window_ns += dt_ns;
-        if (fps_window_ns >= FPS_RECOMPUTE_MS * NS_PER_MS) {
-            measured_fps = (double)frames_in_window
-                         / ((double)fps_window_ns / (double)NS_PER_SEC);
-            frames_in_window = 0;
-            fps_window_ns    = 0;
-        }
+  default:
+    break;
+  }
+  return true;
+}
 
-        /* ── physics + render ── */
-        scene_tick(&app->scene);
-        screen_present_frame(&app->screen, &app->scene, measured_fps);
+int main(void) {
+  srand((unsigned)time(NULL));
+  atexit(screen_cleanup);
+  signal(SIGINT, on_signal_quit);
+  signal(SIGTERM, on_signal_quit);
+  signal(SIGWINCH, on_signal_resize);
 
-        /* ── frame cap ── */
-        int64_t spent = clock_now_ns() - frame_start_ns;
-        if (spent < RENDER_TICK_NS) clock_sleep_ns(RENDER_TICK_NS - spent);
+  App *app = &app_state;
+  app->running = 1;
+
+  screen_init(&app->screen, 0);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows, 0, 0);
+
+  int64_t prev_frame_ns = clock_now_ns();
+  int64_t fps_window_ns = 0;
+  int frames_in_window = 0;
+  double measured_fps = 0.0;
+
+  while (app->running) {
+    int64_t frame_start_ns = clock_now_ns();
+
+    /* ── input ── */
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(app, ch)) {
+      app->running = 0;
+      break;
     }
 
-    scene_free(&app->scene);
-    return 0;
+    /* ── resize ── */
+    if (app->need_resize) {
+      screen_resize(&app->screen);
+      scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+      app->need_resize = 0;
+      prev_frame_ns = clock_now_ns();
+    }
+
+    /* ── dt + fps window ── */
+    int64_t dt_ns = frame_start_ns - prev_frame_ns;
+    prev_frame_ns = frame_start_ns;
+    if (dt_ns > 100 * NS_PER_MS)
+      dt_ns = 100 * NS_PER_MS;
+
+    frames_in_window++;
+    fps_window_ns += dt_ns;
+    if (fps_window_ns >= FPS_RECOMPUTE_MS * NS_PER_MS) {
+      measured_fps = (double)frames_in_window /
+                     ((double)fps_window_ns / (double)NS_PER_SEC);
+      frames_in_window = 0;
+      fps_window_ns = 0;
+    }
+
+    /* ── physics + render ── */
+    scene_tick(&app->scene);
+    screen_present_frame(&app->screen, &app->scene, measured_fps);
+
+    /* ── frame cap ── */
+    int64_t spent = clock_now_ns() - frame_start_ns;
+    if (spent < RENDER_TICK_NS)
+      clock_sleep_ns(RENDER_TICK_NS - spent);
+  }
+
+  scene_free(&app->scene);
+  return 0;
 }

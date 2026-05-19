@@ -6,6 +6,8 @@ raster/
 signal/
 particle_systems/
 physics/
+fluid/
+grids/
  
  completed rest start from scratch
 

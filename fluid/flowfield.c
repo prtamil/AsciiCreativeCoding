@@ -176,15 +176,51 @@
  *
  * References
  * ──────────
- *   Perlin, "An image synthesizer" (SIGGRAPH 1985) — the original
- *     Perlin-noise paper.
- *   Perlin, "Improving noise" (SIGGRAPH 2002) — the gradient hash
- *     + smoothstep⁵ refinement, which we use here in simplified form.
- *   Reynolds, "Steering Behaviors for Autonomous Characters" (1999) —
- *     same particle-following pattern; we just use noise instead of
- *     a target seek.
- *   Inigo Quilez, "Painting a 2D animation with noise":
- *     https://iquilezles.org/articles/warp/
+ *   ── Procedural noise (§4 perlin, §5 fbm) ──────────────────────────
+ *   [1] Perlin, K. (1985), "An Image Synthesizer", SIGGRAPH 1985,
+ *       pp. 287-296 — THE original gradient-noise paper.  §4 implements
+ *       his lattice-hash + smooth-interpolation scheme.
+ *   [2] Perlin, K. (2002), "Improving noise", SIGGRAPH 2002 — the
+ *       quintic-fade refresh (6t⁵−15t⁴+10t³) used as our smoothstep.
+ *   [3] Lagae, A. et al. (2010), "A Survey of Procedural Noise
+ *       Functions", Comput. Graph. Forum 29(8), pp. 2579-2600 —
+ *       comprehensive survey if you want alternatives (simplex,
+ *       wavelet, sparse-convolution noise).
+ *
+ *   ── FBM / fractal stacking (§5 fbm) ───────────────────────────────
+ *   [4] Mandelbrot, B. B. (1982), "The Fractal Geometry of Nature",
+ *       W. H. Freeman — formalises the FBM idea our §5 uses (geometric
+ *       octave summation gives a 1/f power spectrum).
+ *   [5] Voss, R. F. (1985), "Random Fractal Forgeries", in
+ *       "Fundamental Algorithms for Computer Graphics" (Springer) —
+ *       canonical FBM-for-procedural-content recipe.
+ *
+ *   ── Particle tracers (§10 tracer, §11 tracer_step) ────────────────
+ *   [6] Reynolds, C. (1999), "Steering Behaviors for Autonomous
+ *       Characters", Game Developers Conference — same particle-
+ *       following pattern; this file replaces the steering target
+ *       with a noise-field angle.
+ *   [7] Witkin, A. (1991), "Particle System Dynamics", SIGGRAPH course
+ *       notes — foundations of Lagrangian particle advection in
+ *       prescribed flow fields.
+ *
+ *   ── Visual technique ──────────────────────────────────────────────
+ *   [8] Quilez, I., "Painting a 2D animation with noise" —
+ *       iquilezles.org/articles/warp; the noise-warp aesthetic that
+ *       inspired this demo's "wind in grass" visual.
+ *
+ *   ── Rendering / ncurses ───────────────────────────────────────────
+ *   [9] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the 8-octant ASCII arrow ramp.
+ *  [10] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the newscr/curscr diff pipeline used
+ *       in scene_paint() → wnoutrefresh() → doupdate().
+ *
+ *   ── Online quick reference ────────────────────────────────────────
+ *  [11] https://en.wikipedia.org/wiki/Perlin_noise
+ *  [12] https://en.wikipedia.org/wiki/Fractional_Brownian_motion
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -687,7 +723,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -712,75 +748,75 @@
  */
 
 enum {
-    /* Render frame cap. */
-    TARGET_FPS_HZ        = 60,
+  /* Render frame cap. */
+  TARGET_FPS_HZ = 60,
 
-    /* Simulation step rate (independent of render rate). */
-    SIM_HZ_MIN           =  5,
-    SIM_HZ_DEFAULT       = 30,
-    SIM_HZ_MAX           = 60,
-    SIM_HZ_STEP          =  5,
+  /* Simulation step rate (independent of render rate). */
+  SIM_HZ_MIN = 5,
+  SIM_HZ_DEFAULT = 30,
+  SIM_HZ_MAX = 60,
+  SIM_HZ_STEP = 5,
 
-    /* HUD recompute cadence. */
-    FPS_RECOMPUTE_MS     = 500,
+  /* HUD recompute cadence. */
+  FPS_RECOMPUTE_MS = 500,
 
-    /* Tracer pool — fixed-size pre-allocated array. */
-    TRACERS_MIN          =  50,
-    TRACERS_DEFAULT      = 300,
-    TRACERS_MAX          = 800,
-    TRACERS_STEP         =  50,
+  /* Tracer pool — fixed-size pre-allocated array. */
+  TRACERS_MIN = 50,
+  TRACERS_DEFAULT = 300,
+  TRACERS_MAX = 800,
+  TRACERS_STEP = 50,
 
-    /* Trail buffer per tracer. */
-    TRAIL_LEN_MIN        =  3,
-    TRAIL_LEN_DEFAULT    = 14,
-    TRAIL_LEN_MAX        = 20,
+  /* Trail buffer per tracer. */
+  TRAIL_LEN_MIN = 3,
+  TRAIL_LEN_DEFAULT = 14,
+  TRAIL_LEN_MAX = 20,
 
-    /* FBM octaves — 3 is the sweet spot for organic-looking flow. */
-    FBM_OCTAVES          =  3,
+  /* FBM octaves — 3 is the sweet spot for organic-looking flow. */
+  FBM_OCTAVES = 3,
 
-    /* Number of distinct hue pairs around the angle wheel (T5). */
-    HUE_WHEEL_PAIRS      =  8,
+  /* Number of distinct hue pairs around the angle wheel (T5). */
+  HUE_WHEEL_PAIRS = 8,
 
-    /* Number of themes (rainbow + 3 monos). */
-    THEME_COUNT          =  4,
+  /* Number of themes (rainbow + 3 monos). */
+  THEME_COUNT = 4,
 
-    /* Maximum trail length compiled in (sized once for static arrays). */
-    TRAIL_LEN_HARD_MAX   = 20,
+  /* Maximum trail length compiled in (sized once for static arrays). */
+  TRAIL_LEN_HARD_MAX = 20,
 };
 
 /* PHYSICAL / VISUAL CONSTANTS — units in the comment. */
 
 /* Per-tracer step distance (cells per tick).  Tracers get a per-particle
  * jitter so they don't all move in lockstep. */
-#define TRACER_STEP_BASE_CPT     0.9f
-#define TRACER_STEP_JITTER_CPT   0.4f          /* uniform [-J/2, +J/2] */
+#define TRACER_STEP_BASE_CPT 0.9f
+#define TRACER_STEP_JITTER_CPT 0.4f /* uniform [-J/2, +J/2] */
 
 /* How fast the noise time-axis advances per tick.  Smaller = slower
  * field evolution = longer-lived streamlines. */
-#define FIELD_EVOLUTION_DEFAULT  0.008f
-#define FIELD_EVOLUTION_MIN      0.001f
-#define FIELD_EVOLUTION_MAX      0.080f
-#define FIELD_EVOLUTION_FACTOR   1.4f          /* multiplier per F/f keypress */
+#define FIELD_EVOLUTION_DEFAULT 0.008f
+#define FIELD_EVOLUTION_MIN 0.001f
+#define FIELD_EVOLUTION_MAX 0.080f
+#define FIELD_EVOLUTION_FACTOR 1.4f /* multiplier per F/f keypress */
 
 /* Spatial scale of the noise (smaller = larger swirls).  Different
  * x/y scales make the flow gently anisotropic — looks like wind that
  * prefers horizontal direction. */
-#define NOISE_SCALE_X            0.04f
-#define NOISE_SCALE_Y            0.07f
+#define NOISE_SCALE_X 0.04f
+#define NOISE_SCALE_Y 0.07f
 
 /* Tracer lifetime in ticks before forced respawn (with jitter). */
-#define TRACER_LIFE_BASE_TICKS   100
-#define TRACER_LIFE_JITTER_TICKS  60
+#define TRACER_LIFE_BASE_TICKS 100
+#define TRACER_LIFE_JITTER_TICKS 60
 
 /* Time helpers. */
-#define NS_PER_SEC   1000000000LL
-#define NS_PER_MS       1000000LL
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
 
 /* Color pair IDs.  Reserved blocks: */
 enum {
-    PAIR_TRAIL_BASE = 1,                              /* 1..HUE_WHEEL_PAIRS */
-    PAIR_HUD        = PAIR_TRAIL_BASE + HUE_WHEEL_PAIRS,
-    PAIR_HINT,
+  PAIR_TRAIL_BASE = 1, /* 1..HUE_WHEEL_PAIRS */
+  PAIR_HUD = PAIR_TRAIL_BASE + HUE_WHEEL_PAIRS,
+  PAIR_HINT,
 };
 
 /* ===================================================================== */
@@ -792,18 +828,17 @@ enum {
  * adjust) don't perturb monotonic time.
  */
 
-static int64_t clock_now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
+static int64_t clock_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / NS_PER_SEC, ns % NS_PER_SEC };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / NS_PER_SEC, ns % NS_PER_SEC};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -818,22 +853,49 @@ static void clock_sleep_ns(int64_t ns)
 
 static uint8_t perlin_perm_table[512];
 
-static void perlin_perm_init(void)
-{
-    uint8_t identity[256];
-    for (int i = 0; i < 256; i++) identity[i] = (uint8_t)i;
+/* Fill an array with the identity permutation [0, 1, ..., n-1].
+ * Pre-condition for the Fisher-Yates shuffle below: shuffling an
+ * identity produces a uniform random permutation. */
+static inline void fill_identity_permutation_u8(uint8_t *p, int n) {
+    for (int i = 0; i < n; i++)
+        p[i] = (uint8_t)i;
+}
 
-    /* Fisher-Yates: walk from end to start, swap with random earlier. */
-    for (int i = 255; i > 0; i--) {
-        int j = rand() % (i + 1);
-        uint8_t tmp     = identity[i];
-        identity[i]     = identity[j];
-        identity[j]     = tmp;
+/* Knuth-Fisher-Yates shuffle: walk from the END to the START, swap
+ * each element with one chosen uniformly from positions [0 .. i].
+ * Produces a uniform permutation in O(n) using O(1) extra memory.
+ * (Knuth Vol. 2 §3.4.2; Fisher-Yates 1938.) */
+static inline void fisher_yates_shuffle_u8(uint8_t *p, int n) {
+    for (int i = n - 1; i > 0; i--) {
+        int     j   = rand() % (i + 1);
+        uint8_t tmp = p[i];
+        p[i] = p[j];
+        p[j] = tmp;
     }
+}
 
-    /* Double the table so perm[a + b] is always valid for a, b ∈ [0, 255]. */
+/* Mirror the 256-byte source array into the 512-byte destination so
+ * perm[a + b] is always defined for a, b ∈ [0, 255].  Removes the need
+ * for a modulo in the inner Perlin loop ([2] Perlin 2002 §3). */
+static inline void mirror_perm_table_to_512(const uint8_t *src256,
+                                            uint8_t *dst512) {
     for (int i = 0; i < 512; i++)
-        perlin_perm_table[i] = identity[i & 255];
+        dst512[i] = src256[i & 255];
+}
+
+/*
+ * perlin_perm_init — build the 512-byte permutation table.
+ *
+ * Pseudocode:
+ *   identity ← [0, 1, ..., 255]
+ *   fisher_yates_shuffle_u8(identity, 256)        ← uniform random perm
+ *   mirror_perm_table_to_512(identity, perm)      ← doubled for wraparound
+ */
+static void perlin_perm_init(void) {
+    uint8_t identity[256];
+    fill_identity_permutation_u8(identity, 256);
+    fisher_yates_shuffle_u8     (identity, 256);
+    mirror_perm_table_to_512    (identity, perlin_perm_table);
 }
 
 /* ===================================================================== */
@@ -858,58 +920,87 @@ static void perlin_perm_init(void)
 /* Smoothstep: 3t² - 2t³.  C¹ continuous; C² has a discontinuity at
  * t=0 and t=1, which is why some implementations use the "improved"
  * 6t⁵ - 15t⁴ + 10t³.  For visualisation 3t² - 2t³ is plenty. */
-static inline float smoothstep_cubic(float t)
-{
-    return t * t * (3.0f - 2.0f * t);
+static inline float smoothstep_cubic(float t) {
+  return t * t * (3.0f - 2.0f * t);
 }
 
-static inline float lerp_scalar(float a, float b, float t)
-{
-    return a + t * (b - a);
+static inline float lerp_scalar(float a, float b, float t) {
+  return a + t * (b - a);
 }
 
 /* Gradient hash — turn an 8-bit hash into a unit-vector dot product
  * with the offset (x, y) to the corner.  Perlin's "improved" version
  * uses 4 vectors {(±1, 0), (0, ±1)} or 8 around the wheel; we use 4. */
-static inline float perlin_gradient_dot(int hash, float x, float y)
-{
-    int   bits  = hash & 3;
-    float term1 = (bits < 2) ? x : y;
-    float term2 = (bits < 2) ? y : x;
-    return ((hash & 1) ? -term1 : term1) + ((hash & 2) ? -term2 : term2);
+static inline float perlin_gradient_dot(int hash, float x, float y) {
+  int bits = hash & 3;
+  float term1 = (bits < 2) ? x : y;
+  float term2 = (bits < 2) ? y : x;
+  return ((hash & 1) ? -term1 : term1) + ((hash & 2) ? -term2 : term2);
 }
 
-/* perlin_value — smooth pseudo-random scalar in [-1, +1] at (x, y). */
-static float perlin_value(float x, float y)
-{
-    /* Integer cell containing (x, y). */
+/* Hash an integer lattice corner (xi, yi) to an 8-bit gradient index
+ * via the doubled permutation table.  Composing TWO permutation lookups
+ * ([1] Perlin 1985) is what makes the same (xi, yi) always hash to the
+ * same gradient regardless of which corner of which cell asks. */
+static inline int hash_lattice_corner(int xi, int yi) {
+    return perlin_perm_table[perlin_perm_table[xi] + yi];
+}
+
+/* Fill the four corner dot products (gradient · offset) for the unit
+ * cell at floor(x, y).  Order: NW, NE, SW, SE in fx/fy space
+ * (top-left to bottom-right with y increasing downward). */
+static inline void lattice_corner_dot_products(int xi, int yi,
+                                               float fx, float fy,
+                                               float *out_d00, float *out_d10,
+                                               float *out_d01, float *out_d11) {
+    *out_d00 = perlin_gradient_dot(hash_lattice_corner(xi,     yi    ),
+                                    fx,        fy       );
+    *out_d10 = perlin_gradient_dot(hash_lattice_corner(xi + 1, yi    ),
+                                    fx - 1.f,  fy       );
+    *out_d01 = perlin_gradient_dot(hash_lattice_corner(xi,     yi + 1),
+                                    fx,        fy - 1.f );
+    *out_d11 = perlin_gradient_dot(hash_lattice_corner(xi + 1, yi + 1),
+                                    fx - 1.f,  fy - 1.f );
+}
+
+/* Bilinear interp with SMOOTHSTEP-eased weights (ux, uy).  The eased
+ * weights (3t² − 2t³) make the field C¹-continuous across cell
+ * boundaries; raw linear weights would produce visible "creases". */
+static inline float bilinear_smooth_interp(float d00, float d10,
+                                            float d01, float d11,
+                                            float ux, float uy) {
+    float top    = lerp_scalar(d00, d10, ux);
+    float bottom = lerp_scalar(d01, d11, ux);
+    return lerp_scalar(top, bottom, uy);
+}
+
+/*
+ * perlin_value — smooth pseudo-random scalar in [−1, +1] at (x, y).
+ *
+ * Pseudocode:
+ *   (xi, yi) = (floor(x), floor(y)) mod 256           ← integer cell
+ *   (fx, fy) = (x − xi, y − yi)                       ← cell-local offset
+ *   (ux, uy) = smoothstep(fx), smoothstep(fy)         ← eased weights
+ *   (d00, d10, d01, d11) = lattice_corner_dot_products(...)
+ *   return bilinear_smooth_interp(corners, ux, uy)
+ *
+ * Refs [1] Perlin 1985 (original); [2] Perlin 2002 (the quintic-fade
+ *   refresh — we use the cubic smoothstep instead for simplicity).
+ */
+static float perlin_value(float x, float y) {
     int xi = (int)floorf(x) & 255;
     int yi = (int)floorf(y) & 255;
 
-    /* Fractional offsets within the cell. */
     float fx = x - floorf(x);
     float fy = y - floorf(y);
 
-    /* Eased fractional offsets (smoothstep). */
     float ux = smoothstep_cubic(fx);
     float uy = smoothstep_cubic(fy);
 
-    /* Hash the four corners to gradient indices. */
-    int h00 = perlin_perm_table[perlin_perm_table[xi    ] + yi    ];
-    int h10 = perlin_perm_table[perlin_perm_table[xi + 1] + yi    ];
-    int h01 = perlin_perm_table[perlin_perm_table[xi    ] + yi + 1];
-    int h11 = perlin_perm_table[perlin_perm_table[xi + 1] + yi + 1];
+    float d00, d10, d01, d11;
+    lattice_corner_dot_products(xi, yi, fx, fy, &d00, &d10, &d01, &d11);
 
-    /* Dot product at each corner of (gradient, offset-to-query). */
-    float d00 = perlin_gradient_dot(h00, fx,        fy       );
-    float d10 = perlin_gradient_dot(h10, fx - 1.0f, fy       );
-    float d01 = perlin_gradient_dot(h01, fx,        fy - 1.0f);
-    float d11 = perlin_gradient_dot(h11, fx - 1.0f, fy - 1.0f);
-
-    /* Bilinear interpolation with the smoothstepped offsets. */
-    float row_top    = lerp_scalar(d00, d10, ux);
-    float row_bottom = lerp_scalar(d01, d11, ux);
-    return lerp_scalar(row_top, row_bottom, uy);
+    return bilinear_smooth_interp(d00, d10, d01, d11, ux, uy);
 }
 
 /* ===================================================================== */
@@ -935,13 +1026,38 @@ static float perlin_value(float x, float y)
  * matter because we use atan2 to extract the angle (T5).
  */
 
-static float fbm_value(float x, float y, int octaves)
-{
+/* Add ONE Perlin octave's contribution to a running FBM sum.
+ * Perlin is evaluated at the FREQUENCY-SCALED coordinates and the
+ * result is weighted by amp.  Doubling frequency / halving amplitude
+ * each octave gives a 1/f power spectrum — the "fractal" property
+ * Mandelbrot named.  See [4] Mandelbrot §22; [5] Voss recipe.        */
+static inline void accumulate_perlin_octave(float *running_sum,
+                                            float x, float y,
+                                            float frequency, float amplitude) {
+    *running_sum += perlin_value(x * frequency, y * frequency) * amplitude;
+}
+
+/*
+ * fbm_value — Fractional Brownian Motion at (x, y).
+ *
+ * Pseudocode:
+ *   sum = 0;  freq = 1;  amp = 1
+ *   for octave in 0 .. octaves-1:
+ *     accumulate_perlin_octave(&sum, x, y, freq, amp)
+ *     amp  *= 0.5     ← geometric weight decay
+ *     freq *= 2.0     ← geometric frequency doubling
+ *   return sum
+ *
+ * Result is roughly in [−2, +2] for 3 octaves with these weights.
+ * No normalisation — atan2 in §6 only needs the DIRECTION, not
+ * magnitude.  Refs [4] Mandelbrot; [5] Voss "Random Fractal Forgeries".
+ */
+static float fbm_value(float x, float y, int octaves) {
     float result    = 0.0f;
     float amplitude = 1.0f;
     float frequency = 1.0f;
     for (int oct = 0; oct < octaves; oct++) {
-        result    += perlin_value(x * frequency, y * frequency) * amplitude;
+        accumulate_perlin_octave(&result, x, y, frequency, amplitude);
         amplitude *= 0.5f;
         frequency *= 2.0f;
     }
@@ -966,93 +1082,184 @@ static float fbm_value(float x, float y, int octaves)
  */
 
 #define FIELD_COLS_MAX 256
-#define FIELD_ROWS_MAX  80
+#define FIELD_ROWS_MAX 80
 
+/*
+ * flow_field — the invisible vector field that drives every tracer.
+ *
+ * Intent
+ *   For each grid cell we precompute an angle θ(x, y, t) by sampling
+ *   octave-summed Perlin noise.  Tracers bilinearly sample this array
+ *   and step in the resulting direction.  Storing the FIELD up front
+ *   (rather than re-evaluating noise per tracer) trades memory for
+ *   CPU — see "Why precompute on a grid" below.
+ *
+ * Why precompute on a grid (not evaluate per-tracer)
+ *   With N tracers and a W·H grid, the grid evaluation costs
+ *   O(W·H·OCTAVES) per tick, while per-tracer evaluation would cost
+ *   O(N·OCTAVES) per tick × bilinear interp wins nothing.  For our
+ *   defaults (W·H ≈ 6.4k cells, N ≈ 300, OCTAVES=3) the grid eval is
+ *   ~3× cheaper AND bilinear sampling gives sub-cell smoothness for
+ *   free.  See [3] Lagae §3 for the noise-evaluation cost model.
+ *
+ * Why static buffers (no malloc)
+ *   200×60 active cells × float = 48 KB worst case in BSS.  Per
+ *   CLAUDE.md "no dynamic allocation after init" the hot path makes
+ *   zero allocations; resize on SIGWINCH just updates the active
+ *   subregion.
+ *
+ * Why time_axis and evolution_speed are separate
+ *   evolution_speed is user-adjustable via f/F keys; time_axis is the
+ *   running clock that field_rebuild() advances by evolution_speed
+ *   each tick.  Splitting them lets the user speed up / slow down
+ *   the "wind" without restarting the noise phase.
+ *
+ * References [1][2] Perlin noise; [4] Mandelbrot FBM.
+ */
 typedef struct {
+    /* ── Active subregion (≤ FIELD_*_MAX, clamped on resize) ────── */
     int   active_cols;
     int   active_rows;
-    float time_axis;         /* seconds-ish along noise time */
-    float evolution_speed;   /* per-tick advance of time_axis */
+
+    /* ── Noise time axis ────────────────────────────────────────── *
+     * time_axis is the z-coordinate fed to 3-D noise; it advances  *
+     * by evolution_speed each tick so the field morphs smoothly    *
+     * over frames.                                                  */
+    float time_axis;
+    float evolution_speed;
+
+    /* ── Per-cell flow angle (radians), filled each tick ─────────── *
+     * Tracers read this via bilinear sampling — they never call    *
+     * the noise generators directly.                                */
     float angle[FIELD_ROWS_MAX][FIELD_COLS_MAX];
 } flow_field;
 
-static void field_init(flow_field *f, int cols, int rows)
-{
-    if (cols > FIELD_COLS_MAX) cols = FIELD_COLS_MAX;
-    if (rows > FIELD_ROWS_MAX) rows = FIELD_ROWS_MAX;
-    f->active_cols     = cols;
-    f->active_rows     = rows;
-    f->time_axis       = 0.0f;
-    f->evolution_speed = FIELD_EVOLUTION_DEFAULT;
-    memset(f->angle, 0, sizeof f->angle);
+static void field_init(flow_field *f, int cols, int rows) {
+  if (cols > FIELD_COLS_MAX)
+    cols = FIELD_COLS_MAX;
+  if (rows > FIELD_ROWS_MAX)
+    rows = FIELD_ROWS_MAX;
+  f->active_cols = cols;
+  f->active_rows = rows;
+  f->time_axis = 0.0f;
+  f->evolution_speed = FIELD_EVOLUTION_DEFAULT;
+  memset(f->angle, 0, sizeof f->angle);
 }
 
-/* field_evolve_and_rebuild — advance time, recompute every cell.
- *
- * Cost: rows × cols × OCTAVES Perlin evaluations.  At 200×60×3 =
- * 36 000 perlin_value calls per tick.  Sub-millisecond. */
-static void field_evolve_and_rebuild(flow_field *f)
-{
+/* Step the noise clock forward by evolution_speed.  Doing the
+ * increment here (not in scene_tick) keeps the "time" coupled to the
+ * field that uses it — no risk of ticking it twice or forgetting. */
+static inline void advance_noise_clock(flow_field *f) {
     f->time_axis += f->evolution_speed;
+}
+
+/* Sample TWO FBM fields at the same (x, y) but with different time
+ * offsets to produce the velocity components (vx, vy).  Using TWO
+ * decorrelated FBM evaluations — rather than one for magnitude and a
+ * separate angle — guarantees the resulting flow has BOTH spatial
+ * variety AND temporal smoothness.  The 100.3 / 200.7 / phase
+ * multipliers are arbitrary irrational-ish offsets to keep the two
+ * fields uncorrelated.                                              */
+static inline void sample_velocity_components_at(float c, float r, float t,
+                                                  float *out_vx,
+                                                  float *out_vy) {
+    *out_vx = fbm_value(c * NOISE_SCALE_X         + t,
+                        r * NOISE_SCALE_Y         + t * 0.7f,
+                        FBM_OCTAVES);
+    *out_vy = fbm_value(c * NOISE_SCALE_X + 100.3f + t * 1.1f,
+                        r * NOISE_SCALE_Y + 200.7f + t * 0.5f,
+                        FBM_OCTAVES);
+}
+
+/* Velocity components → flow angle in [−π, +π].  Standard atan2 —
+ * preferred over atan(vy/vx) because it covers all four quadrants. */
+static inline float velocity_to_angle(float vx, float vy) {
+    return atan2f(vy, vx);
+}
+
+/*
+ * field_evolve_and_rebuild — advance the noise clock, recompute every cell.
+ *
+ * Pseudocode:
+ *   advance_noise_clock(f)
+ *   for each grid cell (c, r):
+ *     (vx, vy) ← sample_velocity_components_at(c, r, time)
+ *     angle[r][c] ← velocity_to_angle(vx, vy)
+ *
+ * Cost: rows · cols · OCTAVES Perlin evaluations per tick.  At 200×60×3
+ * = 36 k perlin_value calls/tick → sub-millisecond on any modern CPU.
+ */
+static void field_evolve_and_rebuild(flow_field *f) {
+    advance_noise_clock(f);
     float t = f->time_axis;
     for (int r = 0; r < f->active_rows; r++) {
         for (int c = 0; c < f->active_cols; c++) {
-            float vx = fbm_value(c * NOISE_SCALE_X +         t,
-                                 r * NOISE_SCALE_Y + t * 0.7f,
-                                 FBM_OCTAVES);
-            float vy = fbm_value(c * NOISE_SCALE_X + 100.3f + t * 1.1f,
-                                 r * NOISE_SCALE_Y + 200.7f + t * 0.5f,
-                                 FBM_OCTAVES);
-            f->angle[r][c] = atan2f(vy, vx);
+            float vx, vy;
+            sample_velocity_components_at((float)c, (float)r, t, &vx, &vy);
+            f->angle[r][c] = velocity_to_angle(vx, vy);
         }
     }
 }
 
 /* flow_angle_at_cell — exact angle at integer cell.  Used by the
  * field-arrow background renderer. */
-static inline float flow_angle_at_cell(const flow_field *f, int c, int r)
-{
-    if (c < 0)                    c = 0;
-    if (c >= f->active_cols)      c = f->active_cols - 1;
-    if (r < 0)                    r = 0;
-    if (r >= f->active_rows)      r = f->active_rows - 1;
-    return f->angle[r][c];
+static inline float flow_angle_at_cell(const flow_field *f, int c, int r) {
+  if (c < 0)
+    c = 0;
+  if (c >= f->active_cols)
+    c = f->active_cols - 1;
+  if (r < 0)
+    r = 0;
+  if (r >= f->active_rows)
+    r = f->active_rows - 1;
+  return f->angle[r][c];
 }
 
-/* flow_angle_bilinear — interpolated angle at sub-cell position.
+/* Clamp an integer cell index to the active field bounds.  Used by
+ * the bilinear stencil so the floor+1 corner never reaches outside. */
+static inline int clamp_cell_to_active(int idx, int max_count) {
+    if (idx < 0)              return 0;
+    if (idx >= max_count)     return max_count - 1;
+    return idx;
+}
+
+/* (fx, fy) ∈ [0, 1): fractional offsets within the cell at
+ * (floor(col), floor(row)).  These are the bilinear blend weights. */
+static inline void compute_subcell_offsets_xy(float col, float row,
+                                              float *out_fx, float *out_fy) {
+    *out_fx = col - floorf(col);
+    *out_fy = row - floorf(row);
+}
+
+/*
+ * flow_angle_bilinear — sub-cell interpolated angle at (col, row).
+ *
+ * Pseudocode:
+ *   (c0, r0) = floor(col, row), clamped to [0, active-1]
+ *   (c1, r1) = (c0+1, r0+1),    clamped likewise
+ *   (fx, fy) = compute_subcell_offsets_xy(col, row)
+ *   return bilinear_smooth_interp(corners, fx, fy)   ← from §4
  *
  * NOTE: bilinearly interpolating angles across the −π↔+π wrap is
- * technically wrong (you'd want to interpolate (cos, sin) pairs and
- * re-atan2).  For visualisation the seam is invisible because Perlin
+ * technically wrong (you'd want to interpolate (cos θ, sin θ) and re-
+ * atan2).  For visualisation the seam is invisible because Perlin
  * values change slowly across cells; the wrap rarely happens between
- * neighbours. */
-static float flow_angle_bilinear(const flow_field *f, float col, float row)
-{
-    int c0 = (int)floorf(col);
-    int r0 = (int)floorf(row);
-    int c1 = c0 + 1;
-    int r1 = r0 + 1;
+ * neighbours.
+ */
+static float flow_angle_bilinear(const flow_field *f, float col, float row) {
+    int c0 = clamp_cell_to_active((int)floorf(col),     f->active_cols);
+    int c1 = clamp_cell_to_active((int)floorf(col) + 1, f->active_cols);
+    int r0 = clamp_cell_to_active((int)floorf(row),     f->active_rows);
+    int r1 = clamp_cell_to_active((int)floorf(row) + 1, f->active_rows);
 
-    if (c0 < 0)                c0 = 0;
-    if (c0 >= f->active_cols)  c0 = f->active_cols - 1;
-    if (c1 < 0)                c1 = 0;
-    if (c1 >= f->active_cols)  c1 = f->active_cols - 1;
-    if (r0 < 0)                r0 = 0;
-    if (r0 >= f->active_rows)  r0 = f->active_rows - 1;
-    if (r1 < 0)                r1 = 0;
-    if (r1 >= f->active_rows)  r1 = f->active_rows - 1;
+    float fx, fy;
+    compute_subcell_offsets_xy(col, row, &fx, &fy);
 
-    float fx = col - floorf(col);
-    float fy = row - floorf(row);
-
-    float a00 = f->angle[r0][c0];
-    float a10 = f->angle[r0][c1];
-    float a01 = f->angle[r1][c0];
-    float a11 = f->angle[r1][c1];
-
-    float row_top    = lerp_scalar(a00, a10, fx);
-    float row_bottom = lerp_scalar(a01, a11, fx);
-    return lerp_scalar(row_top, row_bottom, fy);
+    /* Reuse the eased-bilinear helper from §4 with RAW (not
+     * smoothstepped) weights — the field is already smooth. */
+    return bilinear_smooth_interp(f->angle[r0][c0], f->angle[r0][c1],
+                                   f->angle[r1][c0], f->angle[r1][c1],
+                                   fx, fy);
 }
 
 /* ===================================================================== */
@@ -1088,33 +1295,31 @@ static float flow_angle_bilinear(const flow_field *f, float col, float row)
 
 #define ARROW_TABLE_LEN 8
 static const char arrow_glyph_table[ARROW_TABLE_LEN] = {
-    '>',   /* 0  E   */
-    '/',   /* 1  NE  */
-    '^',   /* 2  N   */
-    '\\',  /* 3  NW  */
-    '<',   /* 4  W   */
-    '/',   /* 5  SW  */
-    'v',   /* 6  S   */
-    '\\',  /* 7  SE  */
+    '>',  /* 0  E   */
+    '/',  /* 1  NE  */
+    '^',  /* 2  N   */
+    '\\', /* 3  NW  */
+    '<',  /* 4  W   */
+    '/',  /* 5  SW  */
+    'v',  /* 6  S   */
+    '\\', /* 7  SE  */
 };
 
-static int angle_to_octant(float angle_radians)
-{
-    float a = angle_radians;
-    if (a < 0.0f) a += 2.0f * (float)M_PI;
-    int octant = (int)(a / (2.0f * (float)M_PI) * ARROW_TABLE_LEN + 0.5f)
-               % ARROW_TABLE_LEN;
-    return octant;
+static int angle_to_octant(float angle_radians) {
+  float a = angle_radians;
+  if (a < 0.0f)
+    a += 2.0f * (float)M_PI;
+  int octant = (int)(a / (2.0f * (float)M_PI) * ARROW_TABLE_LEN + 0.5f) %
+               ARROW_TABLE_LEN;
+  return octant;
 }
 
-static inline char arrow_glyph_for_angle(float angle_radians)
-{
-    return arrow_glyph_table[angle_to_octant(angle_radians)];
+static inline char arrow_glyph_for_angle(float angle_radians) {
+  return arrow_glyph_table[angle_to_octant(angle_radians)];
 }
 
-static inline int hue_pair_for_angle(float angle_radians)
-{
-    return PAIR_TRAIL_BASE + angle_to_octant(angle_radians);
+static inline int hue_pair_for_angle(float angle_radians) {
+  return PAIR_TRAIL_BASE + angle_to_octant(angle_radians);
 }
 
 /* ===================================================================== */
@@ -1134,30 +1339,29 @@ static inline int hue_pair_for_angle(float angle_radians)
  * Pair index 8 is DIMMEST   (oldest trail cell).
  */
 
-static const char *theme_name_table[THEME_COUNT] = {
-    "rainbow", "cyan", "green", "white"
-};
+static const char *theme_name_table[THEME_COUNT] = {"rainbow", "cyan", "green",
+                                                    "white"};
 
 static const int theme_palette_256[THEME_COUNT][HUE_WHEEL_PAIRS] = {
     /* RAINBOW — 8 hues around the wheel (matches octants in §7). */
-    { 196, 208, 226,  46,  51,  33, 129, 201 },
+    {196, 208, 226, 46, 51, 33, 129, 201},
     /* CYAN ramp — bright → dim. */
-    {  51,  45,  39,  33,  27,  26,  25,  25 },
+    {51, 45, 39, 33, 27, 26, 25, 25},
     /* GREEN ramp — bright → dim. */
-    {  82,  46,  40,  34,  28,  28,  28,  28 },
+    {82, 46, 40, 34, 28, 28, 28, 28},
     /* WHITE / GREY ramp — bright → dim. */
-    { 255, 250, 247, 245, 243, 241, 240, 240 },
+    {255, 250, 247, 245, 243, 241, 240, 240},
 };
 
 static const int theme_palette_8[THEME_COUNT][HUE_WHEEL_PAIRS] = {
-    { COLOR_RED, COLOR_YELLOW, COLOR_GREEN, COLOR_CYAN,
-      COLOR_BLUE, COLOR_MAGENTA, COLOR_WHITE, COLOR_WHITE },
-    { COLOR_CYAN, COLOR_CYAN, COLOR_CYAN, COLOR_BLUE,
-      COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_BLUE },
-    { COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
-      COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN },
-    { COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE,
-      COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE },
+    {COLOR_RED, COLOR_YELLOW, COLOR_GREEN, COLOR_CYAN, COLOR_BLUE,
+     COLOR_MAGENTA, COLOR_WHITE, COLOR_WHITE},
+    {COLOR_CYAN, COLOR_CYAN, COLOR_CYAN, COLOR_BLUE, COLOR_BLUE, COLOR_BLUE,
+     COLOR_BLUE, COLOR_BLUE},
+    {COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN,
+     COLOR_GREEN, COLOR_GREEN, COLOR_GREEN},
+    {COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE,
+     COLOR_WHITE, COLOR_WHITE, COLOR_WHITE},
 };
 
 /* ===================================================================== */
@@ -1171,26 +1375,24 @@ static const int theme_palette_8[THEME_COUNT][HUE_WHEEL_PAIRS] = {
  * background shows through.
  */
 
-static void colors_init(int theme_index)
-{
-    start_color();
-    use_default_colors();
+static void colors_init(int theme_index) {
+  start_color();
+  use_default_colors();
 
-    bool has_256 = (COLORS >= 256);
-    const int *palette = has_256
-        ? theme_palette_256[theme_index]
-        : theme_palette_8  [theme_index];
+  bool has_256 = (COLORS >= 256);
+  const int *palette =
+      has_256 ? theme_palette_256[theme_index] : theme_palette_8[theme_index];
 
-    for (int i = 0; i < HUE_WHEEL_PAIRS; i++)
-        init_pair(PAIR_TRAIL_BASE + i, palette[i], -1);
+  for (int i = 0; i < HUE_WHEEL_PAIRS; i++)
+    init_pair(PAIR_TRAIL_BASE + i, palette[i], -1);
 
-    if (has_256) {
-        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
-        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
+  if (has_256) {
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
 /* ===================================================================== */
@@ -1211,47 +1413,128 @@ static void colors_init(int theme_index)
  *   trail_active_length     current length of the trail (for s/S keys)
  */
 
+/*
+ * tracer — one particle: pose + ring-buffer trail.
+ *
+ * Intent
+ *   A tracer is a PASSIVE LAGRANGIAN PARTICLE [7] Witkin 1991: each
+ *   tick it samples the field at its current position, advances in
+ *   that direction by step_cells, and pushes its old position onto
+ *   a fixed-length ring-buffer trail.  scene_paint reads the ring
+ *   back into a fading-glow rendering (newest = brightest).
+ *
+ * Why a fixed-length ring buffer (not a linked list / dynamic array)
+ *   Trails have a maximum visible length, so static
+ *   trail_col[]/trail_row[] arrays avoid ALL allocation in the hot
+ *   path.  trail_write_index walks circularly mod trail_active_length;
+ *   trail_filled_count saturates once the buffer is full.  Static
+ *   sizing matches CLAUDE.md "no dynamic allocation after init".
+ *
+ * Why ticks_until_respawn exists
+ *   Tracers that walk off-grid don't teleport — they FADE, then wait
+ *   a small random number of ticks (per-tracer), then respawn at a
+ *   fresh random position.  Random offsets prevent all respawns from
+ *   landing on the same frame (which would cause visible "popping").
+ *
+ * Why trail_pair_base is set at respawn (not per-tick)
+ *   Each tracer keeps a stable palette base for its entire life.
+ *   Re-sampling the palette every tick would make adjacent particles
+ *   strobe.  Per-tick the rendering layer modulates the BASE pair to
+ *   produce the fading gradient along the trail.
+ *
+ * Reference [6] Reynolds 1999 — same per-particle data shape used for
+ *   "steering" agents; we just replace the steering target with a
+ *   noise-field angle.
+ */
 typedef struct {
-    bool   tracer_alive;
-    float  pos_col;
-    float  pos_row;
-    float  step_cells;
-    float  last_angle;
-    int    ticks_until_respawn;
-    int    trail_pair_base;
-    int    trail_col[TRAIL_LEN_HARD_MAX];
-    int    trail_row[TRAIL_LEN_HARD_MAX];
-    int    trail_write_index;
-    int    trail_filled_count;
-    int    trail_active_length;
+    /* ── Life cycle ────────────────────────────────────────────── */
+    bool  tracer_alive;
+    int   ticks_until_respawn;     /* counts down once tracer dies     */
+
+    /* ── Current pose (continuous; bilinear-sampled in field) ──── */
+    float pos_col;
+    float pos_row;
+    float step_cells;              /* per-tick advance (cells/tick)    */
+    float last_angle;              /* last sampled θ (drives glyph)    */
+
+    /* ── Trail ring buffer (fixed-size; no alloc in hot path) ──── */
+    int   trail_pair_base;         /* palette base SET at respawn      */
+    int   trail_col[TRAIL_LEN_HARD_MAX];
+    int   trail_row[TRAIL_LEN_HARD_MAX];
+    int   trail_write_index;       /* head index, mod active length    */
+    int   trail_filled_count;      /* up to trail_active_length        */
+    int   trail_active_length;     /* current window into the ring     */
 } tracer;
 
-/* tracer_respawn — give a tracer fresh position + speed + lifetime.
- * Called at init, when a tracer dies, and when the user presses 'r'. */
-static void tracer_respawn(tracer *t, int active_cols, int active_rows,
-                           int trail_active_length)
-{
-    t->tracer_alive        = true;
-    t->pos_col             = (float)(rand() % active_cols);
-    t->pos_row             = (float)(rand() % active_rows);
-    /* Per-tracer step in [BASE - JITTER/2, BASE + JITTER/2]. */
-    t->step_cells          = TRACER_STEP_BASE_CPT
-                           - TRACER_STEP_JITTER_CPT * 0.5f
-                           + TRACER_STEP_JITTER_CPT
-                             * ((float)rand() / (float)RAND_MAX);
-    t->last_angle          = 0.0f;
-    t->ticks_until_respawn = TRACER_LIFE_BASE_TICKS
-                           + rand() % TRACER_LIFE_JITTER_TICKS;
-    t->trail_pair_base     = 1 + rand() % HUE_WHEEL_PAIRS;
+/* Uniform random spawn point inside the active field rect. */
+static inline void pick_random_spawn_position(int active_cols, int active_rows,
+                                              float *out_col, float *out_row) {
+    *out_col = (float)(rand() % active_cols);
+    *out_row = (float)(rand() % active_rows);
+}
+
+/* Per-tracer step speed in cells/tick: BASE ± JITTER/2.  Random jitter
+ * desynchronises adjacent tracers so the visual stays textured rather
+ * than gridded. */
+static inline float pick_jittered_step_speed_cpt(void) {
+    return TRACER_STEP_BASE_CPT
+         - TRACER_STEP_JITTER_CPT * 0.5f
+         + TRACER_STEP_JITTER_CPT * ((float)rand() / (float)RAND_MAX);
+}
+
+/* Lifetime in ticks: BASE + uniform[0, JITTER).  Random offsets keep
+ * the pool's death events spread out — without jitter all respawns
+ * would land on one frame and produce visible "popping". */
+static inline int pick_random_lifetime_ticks(void) {
+    return TRACER_LIFE_BASE_TICKS + rand() % TRACER_LIFE_JITTER_TICKS;
+}
+
+/* Pick a fresh colour-pair BASE for the tracer's entire life — locked
+ * at respawn so the rainbow theme can shift it per-tick later, while
+ * mono themes keep the spawn-time base for the whole trail. */
+static inline int pick_random_palette_pair_base(void) {
+    return 1 + rand() % HUE_WHEEL_PAIRS;
+}
+
+/* Pre-fill the entire trail ring buffer with the spawn position so
+ * the first paint frame doesn't draw a GAP between the tracer head
+ * and its (still-empty) trail.  Resets the head/fill counters too. */
+static inline void reset_trail_ring_at(tracer *t,
+                                        int initial_col, int initial_row,
+                                        int trail_active_length) {
     t->trail_write_index   = 0;
     t->trail_filled_count  = 0;
     t->trail_active_length = trail_active_length;
-    /* Pre-fill trail with the spawn position so the first frame
-     * doesn't draw a gap. */
     for (int i = 0; i < TRAIL_LEN_HARD_MAX; i++) {
-        t->trail_col[i] = (int)t->pos_col;
-        t->trail_row[i] = (int)t->pos_row;
+        t->trail_col[i] = initial_col;
+        t->trail_row[i] = initial_row;
     }
+}
+
+/*
+ * tracer_respawn — give a tracer fresh position + speed + lifetime.
+ * Called at init, when a tracer dies, and when the user presses 'r'.
+ *
+ * Pseudocode:
+ *   alive ← true
+ *   (pos_col, pos_row)    ← pick_random_spawn_position
+ *   step_cells            ← pick_jittered_step_speed_cpt
+ *   last_angle            ← 0
+ *   ticks_until_respawn   ← pick_random_lifetime_ticks
+ *   trail_pair_base       ← pick_random_palette_pair_base
+ *   reset trail ring buffer with spawn position
+ */
+static void tracer_respawn(tracer *t, int active_cols, int active_rows,
+                           int trail_active_length) {
+    t->tracer_alive        = true;
+    pick_random_spawn_position(active_cols, active_rows,
+                               &t->pos_col, &t->pos_row);
+    t->step_cells          = pick_jittered_step_speed_cpt();
+    t->last_angle          = 0.0f;
+    t->ticks_until_respawn = pick_random_lifetime_ticks();
+    t->trail_pair_base     = pick_random_palette_pair_base();
+    reset_trail_ring_at(t, (int)t->pos_col, (int)t->pos_row,
+                        trail_active_length);
 }
 
 /* ===================================================================== */
@@ -1270,42 +1553,92 @@ static void tracer_respawn(tracer *t, int active_cols, int active_rows,
  * Implements forward-Euler advection (T6).
  */
 
-static void tracer_advance_one_tick(tracer *t, const flow_field *f,
-                                    int active_cols, int active_rows,
-                                    int theme_index)
-{
-    if (!t->tracer_alive) return;
-
-    /* 1. Record current position in the ring buffer. */
+/* Push the tracer's CURRENT integer position into the ring buffer.
+ * trail_write_index advances mod trail_active_length; trail_filled_
+ * count saturates.  Same shape as in §10 reset_trail_ring_at but for
+ * the running head. */
+static inline void push_position_into_trail(tracer *t) {
     t->trail_col[t->trail_write_index] = (int)t->pos_col;
     t->trail_row[t->trail_write_index] = (int)t->pos_row;
     t->trail_write_index = (t->trail_write_index + 1) % t->trail_active_length;
     if (t->trail_filled_count < t->trail_active_length)
         t->trail_filled_count++;
+}
 
-    /* 2. Sample the flow angle (bilinear). */
+/* Sample the bilinear field angle at the tracer's current position,
+ * cache it on the tracer (so the paint pass reads the SAME angle the
+ * particle just travelled along), and return it. */
+static inline float sample_field_at_tracer(tracer *t, const flow_field *f) {
     float angle = flow_angle_bilinear(f, t->pos_col, t->pos_row);
     t->last_angle = angle;
+    return angle;
+}
 
-    /* 3. Step in the flow direction. */
+/* Forward-Euler advection step.  Solves dx/dt = step_cells·(cos θ,
+ * sin θ).  Implicit assumption: step_cells is small enough that the
+ * field doesn't curve significantly within one step (CFL-like
+ * concern).  Refs [7] Witkin 1991 §3. */
+static inline void step_tracer_along_angle(tracer *t, float angle) {
     t->pos_col += cosf(angle) * t->step_cells;
     t->pos_row += sinf(angle) * t->step_cells;
+}
 
-    /* 4. Toroidal wrap. */
-    if (t->pos_col < 0.0f)                  t->pos_col += (float)active_cols;
-    if (t->pos_col >= (float)active_cols)   t->pos_col -= (float)active_cols;
-    if (t->pos_row < 0.0f)                  t->pos_row += (float)active_rows;
-    if (t->pos_row >= (float)active_rows)   t->pos_row -= (float)active_rows;
+/* Toroidal wrap-around at the field boundary.  Equivalent to a 2-D
+ * torus topology — fluid leaving the right edge enters from the left.
+ * Avoids the "tracer evaporated" failure mode of hard boundaries. */
+static inline void wrap_position_toroidally(tracer *t,
+                                            int active_cols, int active_rows) {
+    if (t->pos_col <  0.0f)              t->pos_col += (float)active_cols;
+    if (t->pos_col >= (float)active_cols) t->pos_col -= (float)active_cols;
+    if (t->pos_row <  0.0f)              t->pos_row += (float)active_rows;
+    if (t->pos_row >= (float)active_rows) t->pos_row -= (float)active_rows;
+}
 
-    /* 5. Rainbow theme: hue follows angle.  Mono themes keep
-     *    the spawn-time pair; the brightness ramp at draw time
-     *    creates the trail fade. */
+/* Rainbow theme: hue tracks the current direction so opposite-flowing
+ * particles get complementary colours.  Mono themes keep the spawn-
+ * time base unchanged (the per-frame brightness ramp in tracer_paint
+ * creates the fade for those). */
+static inline void maybe_recolour_for_rainbow_theme(tracer *t, float angle,
+                                                    int theme_index) {
     if (theme_index == 0)
         t->trail_pair_base = hue_pair_for_angle(angle);
+}
 
-    /* 6. Age. */
+/* Age the tracer by one tick; mark dead when the lifetime expires.
+ * scene_tick respawns dead tracers via tracer_respawn. */
+static inline void age_tracer_and_check_death(tracer *t) {
     t->ticks_until_respawn--;
-    if (t->ticks_until_respawn <= 0) t->tracer_alive = false;
+    if (t->ticks_until_respawn <= 0)
+        t->tracer_alive = false;
+}
+
+/*
+ * tracer_advance_one_tick — one Lagrangian-advection step.
+ *
+ * Pseudocode:
+ *   if not alive: skip
+ *   push_position_into_trail(t)                        (ring-buffer)
+ *   angle = sample_field_at_tracer(t, field)           (bilinear)
+ *   step_tracer_along_angle(t, angle)                  (forward Euler)
+ *   wrap_position_toroidally(t, cols, rows)            (torus topology)
+ *   maybe_recolour_for_rainbow_theme(t, angle, theme)  (theme-aware)
+ *   age_tracer_and_check_death(t)                      (lifetime)
+ *
+ * References [6] Reynolds 1999 and [7] Witkin 1991 for the
+ * Lagrangian particle pattern.
+ */
+static void tracer_advance_one_tick(tracer *t, const flow_field *f,
+                                    int active_cols, int active_rows,
+                                    int theme_index) {
+    if (!t->tracer_alive)
+        return;
+
+    push_position_into_trail(t);
+    float angle = sample_field_at_tracer(t, f);
+    step_tracer_along_angle(t, angle);
+    wrap_position_toroidally(t, active_cols, active_rows);
+    maybe_recolour_for_rainbow_theme(t, angle, theme_index);
+    age_tracer_and_check_death(t);
 }
 
 /* ===================================================================== */
@@ -1320,68 +1653,109 @@ static void tracer_advance_one_tick(tracer *t, const flow_field *f,
  */
 
 #define TRAIL_RAMP_LEN 5
-static const char trail_ramp_glyph[TRAIL_RAMP_LEN] = {
-    '.', ',', '+', '~', '*'
-};
+static const char trail_ramp_glyph[TRAIL_RAMP_LEN] = {'.', ',', '+', '~', '*'};
 
 /* Direction glyph for the head — picks the same 8-octant arrow as §7. */
-static char trail_head_glyph_for_angle(float angle_radians)
-{
-    static const char head_dir_glyph[ARROW_TABLE_LEN] = {
-        '-', '/', '|', '\\', '-', '/', '|', '\\'
-    };
-    return head_dir_glyph[angle_to_octant(angle_radians)];
+static char trail_head_glyph_for_angle(float angle_radians) {
+  static const char head_dir_glyph[ARROW_TABLE_LEN] = {'-', '/', '|', '\\',
+                                                       '-', '/', '|', '\\'};
+  return head_dir_glyph[angle_to_octant(angle_radians)];
 }
 
-static void tracer_paint(const tracer *t, WINDOW *win,
-                         int active_cols, int active_rows)
-{
-    if (!t->tracer_alive)            return;
-    if (t->trail_filled_count == 0)  return;
+/* Resolve ring-buffer slot index `i ∈ [0, filled)` to the actual
+ * buffer position.  i=0 is the OLDEST slot, i=filled-1 is the NEWEST
+ * (current head).  The `+ 2*len` before mod handles negative dividends
+ * — C's % returns negative for negative left operands. */
+static inline int trail_slot_index(const tracer *t, int i,
+                                   int filled, int len) {
+    return (t->trail_write_index - filled + i + 2 * len) % len;
+}
+
+/* Is this trail slot a position inside the visible field rect? */
+static inline bool position_in_field(int col, int row,
+                                     int active_cols, int active_rows) {
+    return col >= 0 && col < active_cols && row >= 0 && row < active_rows;
+}
+
+/* Glyph for trail slot i out of filled.  Head gets the direction arrow
+ * (visual proof of last_angle); body uses the age ramp '.,+~' with the
+ * brightest glyph reserved for the head. */
+static inline char pick_trail_glyph(const tracer *t, int i, int filled,
+                                    bool is_head) {
+    if (is_head)
+        return trail_head_glyph_for_angle(t->last_angle);
+    int ramp_index = (i * (TRAIL_RAMP_LEN - 1)) /
+                     (filled > 1 ? filled - 1 : 1);
+    if (ramp_index >= TRAIL_RAMP_LEN - 1)
+        ramp_index = TRAIL_RAMP_LEN - 2;   /* head's '*' reserved */
+    return trail_ramp_glyph[ramp_index];
+}
+
+/* Linear pair-index fade from `trail_pair_base` at the head down to
+ * pair 1 at the tail tip.  Used by mono themes; the rainbow theme
+ * already shifts the base each frame.  Clamped to [1, HUE_WHEEL_PAIRS]. */
+static inline int pick_trail_pair_fading(const tracer *t, int i, int filled,
+                                          bool is_head) {
+    int pair;
+    if (is_head) {
+        pair = t->trail_pair_base;
+    } else {
+        int age_from_head = filled - 1 - i;
+        int divisor       = (filled > 1 ? filled - 1 : 1);
+        pair = t->trail_pair_base -
+               (age_from_head * (t->trail_pair_base - 1)) / divisor;
+    }
+    if (pair < 1)                 pair = 1;
+    if (pair > HUE_WHEEL_PAIRS)   pair = HUE_WHEEL_PAIRS;
+    return pair;
+}
+
+/* Paint ONE trail cell with the chosen pair + bold-if-head attribute. */
+static inline void paint_trail_cell(WINDOW *win, int row, int col,
+                                    char glyph, int pair_id, bool is_head) {
+    attr_t a = COLOR_PAIR(pair_id);
+    if (is_head)
+        a |= A_BOLD;
+    wattron(win, a);
+    mvwaddch(win, row, col, (chtype)(unsigned char)glyph);
+    wattroff(win, a);
+}
+
+/*
+ * tracer_paint — fading-trail render for one tracer.
+ *
+ * Pseudocode:
+ *   if dead or no trail yet: skip
+ *   for i = 0 .. filled-1  (oldest → newest, head LAST so it wins overlap):
+ *     slot   = trail_slot_index(t, i, filled, len)
+ *     (col, row) = trail buffer[slot]
+ *     if not position_in_field(col, row, ...): skip
+ *     is_head = (i == filled - 1)
+ *     glyph   = pick_trail_glyph(t, i, filled, is_head)
+ *     pair    = pick_trail_pair_fading(t, i, filled, is_head)
+ *     paint_trail_cell(win, row, col, glyph, pair, is_head)
+ */
+static void tracer_paint(const tracer *t, WINDOW *win, int active_cols,
+                         int active_rows) {
+    if (!t->tracer_alive)             return;
+    if (t->trail_filled_count == 0)   return;
 
     int filled = t->trail_filled_count;
     int len    = t->trail_active_length;
 
     for (int i = 0; i < filled; i++) {
-        /* OLDEST entry is at (write_index - filled + i) modulo length.
-         * The "+ 2*len" before mod handles negative dividends — C's
-         * % returns negative for negative left operand. */
-        int slot = (t->trail_write_index - filled + i + 2 * len) % len;
+        int slot = trail_slot_index(t, i, filled, len);
         int col  = t->trail_col[slot];
         int row  = t->trail_row[slot];
 
-        if (col < 0 || col >= active_cols) continue;
-        if (row < 0 || row >= active_rows) continue;
+        if (!position_in_field(col, row, active_cols, active_rows))
+            continue;
 
         bool is_head = (i == filled - 1);
+        char glyph   = pick_trail_glyph     (t, i, filled, is_head);
+        int  pair    = pick_trail_pair_fading(t, i, filled, is_head);
 
-        /* Glyph: head gets a direction arrow; trail uses age ramp. */
-        char glyph;
-        if (is_head) {
-            glyph = trail_head_glyph_for_angle(t->last_angle);
-        } else {
-            int ramp_index = (i * (TRAIL_RAMP_LEN - 1))
-                           / (filled > 1 ? filled - 1 : 1);
-            if (ramp_index >= TRAIL_RAMP_LEN - 1)
-                ramp_index = TRAIL_RAMP_LEN - 2;   /* head's '*' reserved */
-            glyph = trail_ramp_glyph[ramp_index];
-        }
-
-        /* Colour: head = base; tail tip = pair 1; linear in between. */
-        int pair = is_head
-            ? t->trail_pair_base
-            : t->trail_pair_base
-              - ((filled - 1 - i) * (t->trail_pair_base - 1))
-                / (filled > 1 ? filled - 1 : 1);
-        if (pair < 1)                  pair = 1;
-        if (pair > HUE_WHEEL_PAIRS)    pair = HUE_WHEEL_PAIRS;
-
-        attr_t a = COLOR_PAIR(pair);
-        if (is_head) a |= A_BOLD;
-
-        wattron(win, a);
-        mvwaddch(win, row, col, (chtype)(unsigned char)glyph);
-        wattroff(win, a);
+        paint_trail_cell(win, row, col, glyph, pair, is_head);
     }
 }
 
@@ -1389,70 +1763,132 @@ static void tracer_paint(const tracer *t, WINDOW *win,
 /* §13  scene — pool + field + tick orchestrator                         */
 /* ===================================================================== */
 
+/*
+ * scene_state — the single owner of this demo's live state.
+ *
+ * Intent
+ *   scene_state composes the field (the WHAT — simulation) with the
+ *   tracer pool (the WITNESSES — also simulation, since they advect
+ *   in the field) and the user's visual choices (theme_index,
+ *   show_field_arrows — pure rendering).  The hot path reads from
+ *   here every tick; everything else (palette tables, glyph tables,
+ *   key bindings) lives at file scope as immutable constants.
+ *
+ * Locality (sim vs render)
+ *   Fields are GROUPED EXPLICITLY so a reader can tell at a glance
+ *   which subsystem touches each one:
+ *     - scene_tick / tracer_step / field_rebuild reads it
+ *                                          → simulation
+ *     - scene_paint / hud_draw reads it    → rendering
+ *     - both sides bound their loops by it (active_tracer_count,
+ *       trail_active_length)               → shared bounds
+ *     - paused gates the tick AND drives the HUD "PAUSED" tag
+ *                                          → control state
+ *
+ *   Mis-classifying a field is a real source of bugs: a render-only
+ *   value (theme_index, show_field_arrows) accidentally read by the
+ *   tick would couple the simulation to a visual choice, breaking
+ *   the "same noise seed ⇒ same field" reproducibility we depend on.
+ *
+ * Why these specific fields and no others
+ *   - flow                  the noise-angle grid; largest member.
+ *   - pool[]                tracer particles.  Active up to
+ *                            active_tracer_count; the rest are unused
+ *                            slots kept allocated for SIGWINCH.
+ *   - active_tracer_count   user-adjustable via +/-; both tick and
+ *                            paint iterate up to this bound.
+ *   - trail_active_length   user-adjustable via s/S; affects both
+ *                            the ring buffer's effective window (sim)
+ *                            AND the fading-trail paint (render).
+ *   - theme_index           pure render — palette selector.
+ *   - show_field_arrows     pure render — toggles the background
+ *                            arrow layer (debug-style visualisation).
+ *   - paused                gate for scene_tick + HUD "PAUSED" tag.
+ *
+ * Things that DO NOT live here
+ *   - The Perlin permutation table (§3)       → file-scope, immutable
+ *   - The 8-octant arrow glyph table          → file-scope, immutable
+ *   - Render-frame timing                     → locals in main()
+ *   - Signal flags (SIGINT, SIGWINCH)         → file-scope volatile
+ *
+ * Reference [10] Raymond, NCURSES HOWTO §11 — the scene-paint
+ *   newscr/curscr diff pipeline this struct feeds into.
+ */
 typedef struct {
+    /* ── Simulation state (read by scene_tick + tracer_step) ────── *
+     * The field plus the tracer particles that move through it.    */
     flow_field flow;
     tracer     pool[TRACERS_MAX];
-    int        active_tracer_count;
-    int        trail_active_length;
-    int        theme_index;
-    bool       show_field_arrows;
-    bool       paused;
+
+    /* ── Shared sim+render bounds (read by both subsystems) ─────── *
+     * Both the tick loop (iterating live tracers) and the paint    *
+     * loop (drawing trails) bound their for-loops by these.        *
+     * Adjusted by +/- (tracer count) and s/S (trail length).       */
+    int active_tracer_count;
+    int trail_active_length;
+
+    /* ── Pure render state (read by scene_paint only) ───────────── *
+     * Changing these MUST NOT touch simulation — they only re-pick *
+     * which palette / background layer is drawn.                   */
+    int  theme_index;            /* indexes the palette table        */
+    bool show_field_arrows;      /* draw the underlying arrows?       */
+
+    /* ── Control state ──────────────────────────────────────────── *
+     * Gates the tick AND drives the HUD "PAUSED" indicator.        */
+    bool paused;
 } scene_state;
 
-static void scene_init(scene_state *s, int cols, int rows)
-{
-    memset(s, 0, sizeof *s);
-    s->active_tracer_count = TRACERS_DEFAULT;
-    s->trail_active_length = TRAIL_LEN_DEFAULT;
-    s->theme_index         = 0;
-    s->show_field_arrows   = false;
-    s->paused              = false;
+static void scene_init(scene_state *s, int cols, int rows) {
+  memset(s, 0, sizeof *s);
+  s->active_tracer_count = TRACERS_DEFAULT;
+  s->trail_active_length = TRAIL_LEN_DEFAULT;
+  s->theme_index = 0;
+  s->show_field_arrows = false;
+  s->paused = false;
 
-    field_init(&s->flow, cols, rows);
-    field_evolve_and_rebuild(&s->flow);
+  field_init(&s->flow, cols, rows);
+  field_evolve_and_rebuild(&s->flow);
 
-    for (int i = 0; i < s->active_tracer_count; i++)
-        tracer_respawn(&s->pool[i], cols, rows, s->trail_active_length);
+  for (int i = 0; i < s->active_tracer_count; i++)
+    tracer_respawn(&s->pool[i], cols, rows, s->trail_active_length);
 }
 
-static void scene_resize(scene_state *s, int cols, int rows)
-{
-    field_init(&s->flow, cols, rows);
-    field_evolve_and_rebuild(&s->flow);
-    for (int i = 0; i < TRACERS_MAX; i++)
-        if (s->pool[i].tracer_alive)
-            tracer_respawn(&s->pool[i], cols, rows, s->trail_active_length);
+static void scene_resize(scene_state *s, int cols, int rows) {
+  field_init(&s->flow, cols, rows);
+  field_evolve_and_rebuild(&s->flow);
+  for (int i = 0; i < TRACERS_MAX; i++)
+    if (s->pool[i].tracer_alive)
+      tracer_respawn(&s->pool[i], cols, rows, s->trail_active_length);
 }
 
-static void scene_respawn_all(scene_state *s, int cols, int rows)
-{
-    for (int i = 0; i < s->active_tracer_count; i++)
-        tracer_respawn(&s->pool[i], cols, rows, s->trail_active_length);
-    for (int i = s->active_tracer_count; i < TRACERS_MAX; i++)
-        s->pool[i].tracer_alive = false;
+static void scene_respawn_all(scene_state *s, int cols, int rows) {
+  for (int i = 0; i < s->active_tracer_count; i++)
+    tracer_respawn(&s->pool[i], cols, rows, s->trail_active_length);
+  for (int i = s->active_tracer_count; i < TRACERS_MAX; i++)
+    s->pool[i].tracer_alive = false;
 }
 
-static void scene_set_trail_length(scene_state *s, int new_length)
-{
-    if (new_length < TRAIL_LEN_MIN) new_length = TRAIL_LEN_MIN;
-    if (new_length > TRAIL_LEN_MAX) new_length = TRAIL_LEN_MAX;
-    s->trail_active_length = new_length;
-    for (int i = 0; i < TRACERS_MAX; i++)
-        s->pool[i].trail_active_length = new_length;
+static void scene_set_trail_length(scene_state *s, int new_length) {
+  if (new_length < TRAIL_LEN_MIN)
+    new_length = TRAIL_LEN_MIN;
+  if (new_length > TRAIL_LEN_MAX)
+    new_length = TRAIL_LEN_MAX;
+  s->trail_active_length = new_length;
+  for (int i = 0; i < TRACERS_MAX; i++)
+    s->pool[i].trail_active_length = new_length;
 }
 
-static void scene_tick(scene_state *s, int cols, int rows)
-{
-    if (s->paused) return;
+static void scene_tick(scene_state *s, int cols, int rows) {
+  if (s->paused)
+    return;
 
-    field_evolve_and_rebuild(&s->flow);
+  field_evolve_and_rebuild(&s->flow);
 
-    for (int i = 0; i < s->active_tracer_count; i++) {
-        if (!s->pool[i].tracer_alive)
-            tracer_respawn(&s->pool[i], cols, rows, s->trail_active_length);
-        tracer_advance_one_tick(&s->pool[i], &s->flow,
-                                cols, rows, s->theme_index);
-    }
+  for (int i = 0; i < s->active_tracer_count; i++) {
+    if (!s->pool[i].tracer_alive)
+      tracer_respawn(&s->pool[i], cols, rows, s->trail_active_length);
+    tracer_advance_one_tick(&s->pool[i], &s->flow, cols, rows, s->theme_index);
+  }
 }
 
 /* Paint the field-arrow background (only when 'a' is toggled on).
@@ -1460,261 +1896,259 @@ static void scene_tick(scene_state *s, int cols, int rows)
  * dimmed (per CLAUDE.md anti-A_DIM rule).  Using a normal-weight
  * arrow keeps it visible without competing with bold tracer heads. */
 static void scene_paint_field_arrows(const scene_state *s, WINDOW *win,
-                                     int cols, int rows)
-{
-    for (int r = 0; r < rows; r++) {
-        for (int c = 0; c < cols; c++) {
-            float angle = flow_angle_at_cell(&s->flow, c, r);
-            char  glyph = arrow_glyph_for_angle(angle);
-            int   pair  = (s->theme_index == 0)
-                        ? hue_pair_for_angle(angle)
-                        : 1;
-            wattron(win, COLOR_PAIR(pair));
-            mvwaddch(win, r, c, (chtype)(unsigned char)glyph);
-            wattroff(win, COLOR_PAIR(pair));
-        }
+                                     int cols, int rows) {
+  for (int r = 0; r < rows; r++) {
+    for (int c = 0; c < cols; c++) {
+      float angle = flow_angle_at_cell(&s->flow, c, r);
+      char glyph = arrow_glyph_for_angle(angle);
+      int pair = (s->theme_index == 0) ? hue_pair_for_angle(angle) : 1;
+      wattron(win, COLOR_PAIR(pair));
+      mvwaddch(win, r, c, (chtype)(unsigned char)glyph);
+      wattroff(win, COLOR_PAIR(pair));
     }
+  }
 }
 
-static void scene_paint(const scene_state *s, WINDOW *win, int cols, int rows)
-{
-    if (s->show_field_arrows)
-        scene_paint_field_arrows(s, win, cols, rows);
+static void scene_paint(const scene_state *s, WINDOW *win, int cols, int rows) {
+  if (s->show_field_arrows)
+    scene_paint_field_arrows(s, win, cols, rows);
 
-    for (int i = 0; i < s->active_tracer_count; i++)
-        tracer_paint(&s->pool[i], win, cols, rows);
+  for (int i = 0; i < s->active_tracer_count; i++)
+    tracer_paint(&s->pool[i], win, cols, rows);
 }
 
 /* ===================================================================== */
 /* §14  hud — top status + bottom hint strip (CLAUDE.md spec)            */
 /* ===================================================================== */
 
-static void hud_paint_status(WINDOW *win, int cols,
-                             double fps, int sim_hz,
-                             const scene_state *s)
-{
-    char buf[160];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  sim:%2dHz  tracers:%3d  trail:%2d  "
-             "theme:%-7s  field-spd:%.4f  %s ",
-             fps, sim_hz, s->active_tracer_count, s->trail_active_length,
-             theme_name_table[s->theme_index],
-             (double)s->flow.evolution_speed,
-             s->paused ? "PAUSED " : "running");
-    int len = (int)strlen(buf);
-    int x   = cols - len;
-    if (x < 0) x = 0;
-    wattron(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvwprintw(win, 0, x, "%s", buf);
-    wattroff(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
+static void hud_paint_status(WINDOW *win, int cols, double fps, int sim_hz,
+                             const scene_state *s) {
+  char buf[160];
+  snprintf(buf, sizeof buf,
+           " %5.1f fps  sim:%2dHz  tracers:%3d  trail:%2d  "
+           "theme:%-7s  field-spd:%.4f  %s ",
+           fps, sim_hz, s->active_tracer_count, s->trail_active_length,
+           theme_name_table[s->theme_index], (double)s->flow.evolution_speed,
+           s->paused ? "PAUSED " : "running");
+  int len = (int)strlen(buf);
+  int x = cols - len;
+  if (x < 0)
+    x = 0;
+  wattron(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvwprintw(win, 0, x, "%s", buf);
+  wattroff(win, COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void hud_paint_hints(WINDOW *win, int rows)
-{
-    const char *hint =
-        " q:quit  spc:pause  r:respawn  a:arrows  t:theme  +/-:tracers  "
-        "s/S:trail  ]/[:simHz  f/F:field-spd ";
-    wattron(win, COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvwprintw(win, rows - 1, 0, "%s", hint);
-    wattroff(win, COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void hud_paint_hints(WINDOW *win, int rows) {
+  const char *hint =
+      " q:quit  spc:pause  r:respawn  a:arrows  t:theme  +/-:tracers  "
+      "s/S:trail  ]/[:simHz  f/F:field-spd ";
+  wattron(win, COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvwprintw(win, rows - 1, 0, "%s", hint);
+  wattroff(win, COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §15  screen — ncurses init / cleanup                                  */
 /* ===================================================================== */
 
-static void screen_init(int theme_index)
-{
-    initscr();
-    noecho();
-    cbreak();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    colors_init(theme_index);
+static void screen_init(int theme_index) {
+  initscr();
+  noecho();
+  cbreak();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  colors_init(theme_index);
 }
 
-static void screen_cleanup(void)
-{
-    endwin();
-}
+static void screen_cleanup(void) { endwin(); }
 
 /* ===================================================================== */
 /* §16  app — main loop + signals + input                                */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_should_quit    = 0;
+static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
 
-static void on_signal(int sig)
-{
-    if (sig == SIGWINCH) g_resize_pending = 1;
-    else                 g_should_quit = 1;
+static void on_signal(int sig) {
+  if (sig == SIGWINCH)
+    g_resize_pending = 1;
+  else
+    g_should_quit = 1;
 }
 
 /* Returns false if the user wants to quit. */
-static bool app_handle_key(int key, scene_state *s, int *sim_hz,
-                           int cols, int rows)
-{
-    switch (key) {
-        case 'q': case 'Q': case 27:    /* 27 = ESC */
-            return false;
+static bool app_handle_key(int key, scene_state *s, int *sim_hz, int cols,
+                           int rows) {
+  switch (key) {
+  case 'q':
+  case 'Q':
+  case 27: /* 27 = ESC */
+    return false;
 
-        case ' ':
-            s->paused = !s->paused;
-            break;
+  case ' ':
+    s->paused = !s->paused;
+    break;
 
-        case 'r': case 'R':
-            scene_respawn_all(s, cols, rows);
-            break;
+  case 'r':
+  case 'R':
+    scene_respawn_all(s, cols, rows);
+    break;
 
-        case 'a': case 'A':
-            s->show_field_arrows = !s->show_field_arrows;
-            break;
+  case 'a':
+  case 'A':
+    s->show_field_arrows = !s->show_field_arrows;
+    break;
 
-        case 't': case 'T':
-            s->theme_index = (s->theme_index + 1) % THEME_COUNT;
-            colors_init(s->theme_index);
-            break;
+  case 't':
+  case 'T':
+    s->theme_index = (s->theme_index + 1) % THEME_COUNT;
+    colors_init(s->theme_index);
+    break;
 
-        case '+': case '=':
-            if (s->active_tracer_count + TRACERS_STEP <= TRACERS_MAX) {
-                int old_count = s->active_tracer_count;
-                s->active_tracer_count += TRACERS_STEP;
-                for (int i = old_count; i < s->active_tracer_count; i++)
-                    tracer_respawn(&s->pool[i], cols, rows,
-                                   s->trail_active_length);
-            }
-            break;
-        case '-': case '_':
-            if (s->active_tracer_count - TRACERS_STEP >= TRACERS_MIN) {
-                s->active_tracer_count -= TRACERS_STEP;
-                for (int i = s->active_tracer_count;
-                     i < s->active_tracer_count + TRACERS_STEP; i++)
-                    s->pool[i].tracer_alive = false;
-            }
-            break;
-
-        case ']':
-            if (*sim_hz + SIM_HZ_STEP <= SIM_HZ_MAX) *sim_hz += SIM_HZ_STEP;
-            break;
-        case '[':
-            if (*sim_hz - SIM_HZ_STEP >= SIM_HZ_MIN) *sim_hz -= SIM_HZ_STEP;
-            break;
-
-        case 'f':
-            s->flow.evolution_speed *= FIELD_EVOLUTION_FACTOR;
-            if (s->flow.evolution_speed > FIELD_EVOLUTION_MAX)
-                s->flow.evolution_speed = FIELD_EVOLUTION_MAX;
-            break;
-        case 'F':
-            s->flow.evolution_speed /= FIELD_EVOLUTION_FACTOR;
-            if (s->flow.evolution_speed < FIELD_EVOLUTION_MIN)
-                s->flow.evolution_speed = FIELD_EVOLUTION_MIN;
-            break;
-
-        case 's':
-            scene_set_trail_length(s, s->trail_active_length + 1);
-            break;
-        case 'S':
-            scene_set_trail_length(s, s->trail_active_length - 1);
-            break;
-
-        default:
-            break;
+  case '+':
+  case '=':
+    if (s->active_tracer_count + TRACERS_STEP <= TRACERS_MAX) {
+      int old_count = s->active_tracer_count;
+      s->active_tracer_count += TRACERS_STEP;
+      for (int i = old_count; i < s->active_tracer_count; i++)
+        tracer_respawn(&s->pool[i], cols, rows, s->trail_active_length);
     }
-    return true;
+    break;
+  case '-':
+  case '_':
+    if (s->active_tracer_count - TRACERS_STEP >= TRACERS_MIN) {
+      s->active_tracer_count -= TRACERS_STEP;
+      for (int i = s->active_tracer_count;
+           i < s->active_tracer_count + TRACERS_STEP; i++)
+        s->pool[i].tracer_alive = false;
+    }
+    break;
+
+  case ']':
+    if (*sim_hz + SIM_HZ_STEP <= SIM_HZ_MAX)
+      *sim_hz += SIM_HZ_STEP;
+    break;
+  case '[':
+    if (*sim_hz - SIM_HZ_STEP >= SIM_HZ_MIN)
+      *sim_hz -= SIM_HZ_STEP;
+    break;
+
+  case 'f':
+    s->flow.evolution_speed *= FIELD_EVOLUTION_FACTOR;
+    if (s->flow.evolution_speed > FIELD_EVOLUTION_MAX)
+      s->flow.evolution_speed = FIELD_EVOLUTION_MAX;
+    break;
+  case 'F':
+    s->flow.evolution_speed /= FIELD_EVOLUTION_FACTOR;
+    if (s->flow.evolution_speed < FIELD_EVOLUTION_MIN)
+      s->flow.evolution_speed = FIELD_EVOLUTION_MIN;
+    break;
+
+  case 's':
+    scene_set_trail_length(s, s->trail_active_length + 1);
+    break;
+  case 'S':
+    scene_set_trail_length(s, s->trail_active_length - 1);
+    break;
+
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    /* Seed PRNG from monotonic time, then build the perlin permutation. */
-    srand((unsigned int)clock_now_ns());
-    perlin_perm_init();
+int main(void) {
+  /* Seed PRNG from monotonic time, then build the perlin permutation. */
+  srand((unsigned int)clock_now_ns());
+  perlin_perm_init();
 
-    signal(SIGINT,   on_signal);
-    signal(SIGTERM,  on_signal);
-    signal(SIGWINCH, on_signal);
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGWINCH, on_signal);
 
-    static scene_state scene;
-    int                sim_hz = SIM_HZ_DEFAULT;
+  static scene_state scene;
+  int sim_hz = SIM_HZ_DEFAULT;
 
-    screen_init(0);
-    atexit(screen_cleanup);
+  screen_init(0);
+  atexit(screen_cleanup);
 
-    int cols, rows;
-    getmaxyx(stdscr, rows, cols);
-    scene_init(&scene, cols, rows);
+  int cols, rows;
+  getmaxyx(stdscr, rows, cols);
+  scene_init(&scene, cols, rows);
 
-    /* Fixed-step accumulator (Glenn Fiedler "Fix Your Timestep!"). */
-    int64_t prev_ns      = clock_now_ns();
-    int64_t sim_accum_ns = 0;
+  /* Fixed-step accumulator (Glenn Fiedler "Fix Your Timestep!"). */
+  int64_t prev_ns = clock_now_ns();
+  int64_t sim_accum_ns = 0;
 
-    /* Sliding-window FPS counter. */
-    int     frames_in_window = 0;
-    int64_t window_accum_ns  = 0;
-    double  fps_display      = 0.0;
+  /* Sliding-window FPS counter. */
+  int frames_in_window = 0;
+  int64_t window_accum_ns = 0;
+  double fps_display = 0.0;
 
-    const int64_t frame_cap_ns = NS_PER_SEC / TARGET_FPS_HZ;
+  const int64_t frame_cap_ns = NS_PER_SEC / TARGET_FPS_HZ;
 
-    while (!g_should_quit) {
-        int64_t frame_start = clock_now_ns();
+  while (!g_should_quit) {
+    int64_t frame_start = clock_now_ns();
 
-        /* Resize handling (signal-driven, processed at frame top). */
-        if (g_resize_pending) {
-            g_resize_pending = 0;
-            endwin();
-            refresh();
-            getmaxyx(stdscr, rows, cols);
-            scene_resize(&scene, cols, rows);
-            sim_accum_ns = 0;
-        }
-
-        /* dt + spiral-of-death guard (cap at 100 ms). */
-        int64_t dt_ns = frame_start - prev_ns;
-        prev_ns       = frame_start;
-        if (dt_ns > 100 * NS_PER_MS) dt_ns = 100 * NS_PER_MS;
-
-        /* Drive simulation at fixed sim_hz, regardless of render rate. */
-        int64_t tick_ns = NS_PER_SEC / sim_hz;
-        sim_accum_ns += dt_ns;
-        while (sim_accum_ns >= tick_ns) {
-            scene_tick(&scene, cols, rows);
-            sim_accum_ns -= tick_ns;
-        }
-
-        /* Draw frame. */
-        erase();
-        scene_paint(&scene, stdscr, cols, rows);
-        hud_paint_status(stdscr, cols, fps_display, sim_hz, &scene);
-        hud_paint_hints (stdscr, rows);
-        wnoutrefresh(stdscr);
-        doupdate();
-
-        /* FPS readout — refresh every ~500 ms. */
-        frames_in_window++;
-        window_accum_ns += dt_ns;
-        if (window_accum_ns >= FPS_RECOMPUTE_MS * NS_PER_MS) {
-            fps_display = (double)frames_in_window
-                        / ((double)window_accum_ns / (double)NS_PER_SEC);
-            frames_in_window = 0;
-            window_accum_ns  = 0;
-        }
-
-        /* Drain input queue. */
-        int key;
-        while ((key = getch()) != ERR) {
-            if (!app_handle_key(key, &scene, &sim_hz, cols, rows)) {
-                g_should_quit = 1;
-                break;
-            }
-        }
-
-        /* Sleep to cap render rate. */
-        int64_t spent = clock_now_ns() - frame_start;
-        if (spent < frame_cap_ns) clock_sleep_ns(frame_cap_ns - spent);
+    /* Resize handling (signal-driven, processed at frame top). */
+    if (g_resize_pending) {
+      g_resize_pending = 0;
+      endwin();
+      refresh();
+      getmaxyx(stdscr, rows, cols);
+      scene_resize(&scene, cols, rows);
+      sim_accum_ns = 0;
     }
 
-    return 0;
+    /* dt + spiral-of-death guard (cap at 100 ms). */
+    int64_t dt_ns = frame_start - prev_ns;
+    prev_ns = frame_start;
+    if (dt_ns > 100 * NS_PER_MS)
+      dt_ns = 100 * NS_PER_MS;
+
+    /* Drive simulation at fixed sim_hz, regardless of render rate. */
+    int64_t tick_ns = NS_PER_SEC / sim_hz;
+    sim_accum_ns += dt_ns;
+    while (sim_accum_ns >= tick_ns) {
+      scene_tick(&scene, cols, rows);
+      sim_accum_ns -= tick_ns;
+    }
+
+    /* Draw frame. */
+    erase();
+    scene_paint(&scene, stdscr, cols, rows);
+    hud_paint_status(stdscr, cols, fps_display, sim_hz, &scene);
+    hud_paint_hints(stdscr, rows);
+    wnoutrefresh(stdscr);
+    doupdate();
+
+    /* FPS readout — refresh every ~500 ms. */
+    frames_in_window++;
+    window_accum_ns += dt_ns;
+    if (window_accum_ns >= FPS_RECOMPUTE_MS * NS_PER_MS) {
+      fps_display = (double)frames_in_window /
+                    ((double)window_accum_ns / (double)NS_PER_SEC);
+      frames_in_window = 0;
+      window_accum_ns = 0;
+    }
+
+    /* Drain input queue. */
+    int key;
+    while ((key = getch()) != ERR) {
+      if (!app_handle_key(key, &scene, &sim_hz, cols, rows)) {
+        g_should_quit = 1;
+        break;
+      }
+    }
+
+    /* Sleep to cap render rate. */
+    int64_t spent = clock_now_ns() - frame_start;
+    if (spent < frame_cap_ns)
+      clock_sleep_ns(frame_cap_ns - spent);
+  }
+
+  return 0;
 }

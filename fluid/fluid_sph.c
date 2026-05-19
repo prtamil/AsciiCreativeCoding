@@ -75,9 +75,10 @@
  *      speed.  T8 closes the loop with stability conditions.
  *   2. §6 particle + §1 config — the data structure + the knobs.
  *      Together they describe the entire simulation state.
- *   3. §12 sph_step — five lines: build_grid, density_pass,
+ *   3. §12 sph_step — four lines: grid_rebuild, density_pass,
  *      forces_pass, integrate_pass.  The whole physics is THERE; §9-§11
- *      are the bodies.
+ *      are the bodies (each now a pseudocode orchestrator over named
+ *      pair-loop / Euler helpers).
  *   4. §9 density_pass — read AFTER tutorial T3.
  *   5. §10 forces_pass — read AFTER tutorials T4 and T5.
  *   6. §11 integrate_pass — read AFTER tutorial T6.
@@ -86,8 +87,8 @@
  *
  * Variable-naming convention
  * ──────────────────────────
- *   particle_pool[]            global array of every Particle
- *   particle_count             how many slots are in use
+ *   g_world.pool[]            global array of every Particle
+ *   g_world.count             how many slots are in use
  *   p->pos_col, p->pos_row     position (in cell units)
  *   p->vel_col, p->vel_row     velocity (cells/step)
  *   p->accel_col, p->accel_row force accumulator for one step
@@ -97,8 +98,8 @@
  *   kernel_signed              w = d/H - 1 (negative inside support)
  *   kernel_squared             w² (always non-negative; used for ρ)
  *
- *   grid_head[gy][gx]          first particle index in cell (gy, gx)
- *   grid_next[i]               next particle in same cell as i, or -1
+ *   g_grid.head[gy][gx]          first particle index in cell (gy, gx)
+ *   g_grid.next[i]               next particle in same cell as i, or -1
  *
  *   scene.id                   current scene (1..SCENE_COUNT)
  *   scene.theme_index          current theme (0..THEME_COUNT-1)
@@ -175,16 +176,55 @@
  *
  * References
  * ──────────
- *   Müller, Charypar, Gross (2003), "Particle-Based Fluid Simulation
- *     for Interactive Applications" — the canonical real-time SPH
- *     paper this implementation traces back to.
- *   Monaghan (1992), "Smoothed Particle Hydrodynamics" Ann.Rev.A&A —
- *     the rigorous SPH foundation in astrophysics.
- *   Bridson, "Fluid Simulation for Computer Graphics" (CRC, 2008) —
- *     Ch. 8 covers SPH side-by-side with grid solvers.
- *   Stam (1999), "Stable Fluids" — the Eulerian counterpart;
- *     navier_stokes.c uses this approach.
- *   https://en.wikipedia.org/wiki/Smoothed-particle_hydrodynamics
+ *   ── SPH foundations (1977 — two simultaneous discoveries) ─────────
+ *   [1] Lucy, L. B. (1977), "A numerical approach to the testing of
+ *       the fission hypothesis", Astron. J. 82, pp. 1013-1024 —
+ *       ONE of the two original SPH papers, motivated by stellar
+ *       fission simulation.
+ *   [2] Gingold, R. A. & Monaghan, J. J. (1977), "Smoothed Particle
+ *       Hydrodynamics: theory and application to non-spherical
+ *       stars", Mon. Not. R. Astron. Soc. 181, pp. 375-389 — the
+ *       OTHER original SPH paper, also 1977.  Modern SPH owes both.
+ *   [3] Monaghan, J. J. (1992), "Smoothed Particle Hydrodynamics",
+ *       Annu. Rev. Astron. Astrophys. 30, pp. 543-574 — rigorous
+ *       SPH foundations and kernel theory.  Read for the proof that
+ *       ∇·v at a particle = − (1/ρ)·dρ/dt, the key continuity link.
+ *   [4] Monaghan, J. J. (2005), "Smoothed Particle Hydrodynamics",
+ *       Rep. Prog. Phys. 68, pp. 1703-1759 — modernised review;
+ *       covers tensile instability and the viscosity formulation
+ *       used in §particle_step().
+ *
+ *   ── Real-time / graphics SPH ──────────────────────────────────────
+ *   [5] Müller, M., Charypar, D. & Gross, M. (2003), "Particle-Based
+ *       Fluid Simulation for Interactive Applications", ACM SIGGRAPH/
+ *       Eurographics SCA — THE real-time SPH paper this implementation
+ *       traces back to.  Source of the three poly6 / spiky / visc
+ *       kernel choices used in §kernel.
+ *   [6] Bridson, R. (2008), "Fluid Simulation for Computer Graphics",
+ *       CRC Press — ch. 8 covers SPH side-by-side with grid solvers;
+ *       useful comparison reading with [8].
+ *
+ *   ── Neighbour search ──────────────────────────────────────────────
+ *   [7] Teschner, M. et al. (2003), "Optimized Spatial Hashing for
+ *       Collision Detection of Deformable Objects", VMV — basis of
+ *       the spatial-hash grid used in §grid_rebuild for O(N) neighbour
+ *       queries instead of naive O(N²).
+ *
+ *   ── Comparison with the Eulerian approach ─────────────────────────
+ *   [8] Stam, J. (1999), "Stable Fluids", SIGGRAPH — the Eulerian
+ *       (grid-based) counterpart; project file fluid/navier_stokes.c
+ *       uses this approach.  Same physics, different discretisation.
+ *
+ *   ── Rendering / ncurses ───────────────────────────────────────────
+ *   [9] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the density-glyph ramp used by DensityRender.
+ *  [10] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, and the newscr/curscr diff pipeline.
+ *
+ *   ── Online quick reference ────────────────────────────────────────
+ *  [11] https://en.wikipedia.org/wiki/Smoothed-particle_hydrodynamics
  *
  * ─────────────────────────────────────────────────────────────────── */
 
@@ -578,23 +618,23 @@
  *
  * Implementation (§8): linked-list-per-cell.  Two arrays:
  *
- *     grid_head[gy][gx]  = index of FIRST particle in cell (gy, gx)
- *     grid_next[i]       = index of NEXT particle in same cell as i
+ *     g_grid.head[gy][gx]  = index of FIRST particle in cell (gy, gx)
+ *     g_grid.next[i]       = index of NEXT particle in same cell as i
  *     terminator         = -1
  *
- * Build: O(N).  Iterate: walk grid_head[gy][gx], grid_next[i], ...
+ * Build: O(N).  Iterate: walk g_grid.head[gy][gx], g_grid.next[i], ...
  *
  *      ┌──────────────────────────────────────────────────┐
  *      │                                                  │
- *      │   grid_head[gy][gx] ──► p_3 ─► p_8 ─► p_42 ─► -1│
+ *      │   g_grid.head[gy][gx] ──► p_3 ─► p_8 ─► p_42 ─► -1│
  *      │                                                  │
- *      │   grid_next[3]  =  8                             │
- *      │   grid_next[8]  = 42                             │
- *      │   grid_next[42] = -1                             │
+ *      │   g_grid.next[3]  =  8                             │
+ *      │   g_grid.next[8]  = 42                             │
+ *      │   g_grid.next[42] = -1                             │
  *      │                                                  │
  *      │   walk pattern:                                  │
- *      │     for j = grid_head[gy][gx]; j != -1;          │
- *      │            j = grid_next[j]) { ... }             │
+ *      │     for j = g_grid.head[gy][gx]; j != -1;          │
+ *      │            j = g_grid.next[j]) { ... }             │
  *      │                                                  │
  *      └──────────────────────────────────────────────────┘
  *
@@ -638,7 +678,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 #include <math.h>
@@ -661,115 +701,114 @@
  */
 
 /* ── PARTICLE POOL ── */
-#define PARTICLE_POOL_CAPACITY     5000
+#define PARTICLE_POOL_CAPACITY 5000
 
 /* ── SPH PHYSICS CONSTANTS ── */
 
 /* Kernel support radius (cells).  Particles within this distance
  * contribute to each other's density and forces. */
-#define SMOOTH_RADIUS_CELLS        2.2
+#define SMOOTH_RADIUS_CELLS 2.2
 
 /* Pressure stiffness K (Tait EOS coefficient).  Higher = stiffer
  * fluid (more incompressible) but unstable at large dt.  Tuned
  * jointly with SPH_DT for stability. */
-#define PRESSURE_K                 0.04
+#define PRESSURE_K 0.04
 
 /* Viscosity coefficient.  Velocity smoothing rate. */
-#define VISCOSITY_K                0.03
+#define VISCOSITY_K 0.03
 
 /* Gravity (cells / step²).  Low value avoids tunnelling through
  * floor at SPH_DT. */
-#define GRAVITY_G                  0.08
+#define GRAVITY_G 0.08
 
 /* Wall energy retention on bounce.  0.6 = 60% kinetic energy kept;
  * 40% drained as "heat" (T8 reasoning). */
-#define WALL_DAMPING               0.6
+#define WALL_DAMPING 0.6
 
 /* Fixed physics timestep (seconds-equivalent; units of cells per
  * step).  Honours Courant: dt < H / v_max. */
-#define SPH_DT                     0.12
+#define SPH_DT 0.12
 
 /* Density target at rest equilibrium.  pressure = 0 when
  * ρᵢ + ρⱼ = REST_SUM.  Calibrated for SMOOTH_RADIUS_CELLS = 2.2. */
-#define REST_SUM                   6.0
+#define REST_SUM 6.0
 
 /* Numerical guard so we never divide by zero density. */
-#define DENSITY_DIVIDE_GUARD       0.001
+#define DENSITY_DIVIDE_GUARD 0.001
 
 /* ── SPATIAL HASH GRID ── */
 
 /* Cell side (cells).  Must be ≥ SMOOTH_RADIUS_CELLS so a 3×3
  * neighbourhood covers the kernel support. */
-#define GRID_CELL_SIZE             3
+#define GRID_CELL_SIZE 3
 
 /* Hard maximum grid dimensions (compile-time array bound). */
-#define GRID_COLS_MAX              90
-#define GRID_ROWS_MAX              22
+#define GRID_COLS_MAX 90
+#define GRID_ROWS_MAX 22
 
 /* ── DENSITY → GLYPH ZONES ── */
 
 /* Density thresholds for character / colour selection in §15. */
-#define DENSITY_THRESHOLD_CORE     3.5    /* dense interior  '#' bold */
-#define DENSITY_THRESHOLD_BODY     1.2    /* fluid body       'o'      */
-#define DENSITY_THRESHOLD_EDGE     0.1    /* sparse edge      '.'      */
+#define DENSITY_THRESHOLD_CORE 3.5 /* dense interior  '#' bold */
+#define DENSITY_THRESHOLD_BODY 1.2 /* fluid body       'o'      */
+#define DENSITY_THRESHOLD_EDGE 0.1 /* sparse edge      '.'      */
 
 /* ── HUD ── */
-#define HUD_RESERVED_ROWS          2
+#define HUD_RESERVED_ROWS 2
 
 /* ── COLOUR PAIRS ── */
 enum {
-    PAIR_DENSITY_CORE = 1,
-    PAIR_DENSITY_BODY,
-    PAIR_DENSITY_EDGE,
-    PAIR_BORDER,
-    PAIR_HUD,
-    PAIR_HINT,
+  PAIR_DENSITY_CORE = 1,
+  PAIR_DENSITY_BODY,
+  PAIR_DENSITY_EDGE,
+  PAIR_BORDER,
+  PAIR_HUD,
+  PAIR_HINT,
 };
 
 /* ── SCENE COUNT ── */
-#define SCENE_COUNT                5
+#define SCENE_COUNT 5
 
 /* ── THEMES ── */
-#define THEME_COUNT               10
+#define THEME_COUNT 10
 
 /* ── FRAMEWORK TIMING ── */
-#define SIM_HZ_MIN                10
-#define SIM_HZ_DEFAULT            60
-#define SIM_HZ_MAX               120
-#define SIM_HZ_STEP               10
-#define RENDER_FPS_CAP            60
-#define FPS_RECOMPUTE_MS         500
+#define SIM_HZ_MIN 10
+#define SIM_HZ_DEFAULT 60
+#define SIM_HZ_MAX 120
+#define SIM_HZ_STEP 10
+#define RENDER_FPS_CAP 60
+#define FPS_RECOMPUTE_MS 500
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(hz)      (NS_PER_SEC / (hz))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(hz) (NS_PER_SEC / (hz))
 
 /* ===================================================================== */
 /* §2  clock — monotonic ns timer + sleep                                */
 /* ===================================================================== */
 
-static int64_t clock_now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
+static int64_t clock_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / NS_PER_SEC, ns % NS_PER_SEC };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / NS_PER_SEC, ns % NS_PER_SEC};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
 /* §3  rng — small random helper                                         */
 /* ===================================================================== */
 
-static int rand_in_range(int lo, int hi_exclusive)
-{
-    if (hi_exclusive <= lo) return lo;
-    return lo + rand() % (hi_exclusive - lo);
+static int rand_in_range(int lo, int hi_exclusive) {
+  if (hi_exclusive <= lo)
+    return lo;
+  return lo + rand() % (hi_exclusive - lo);
 }
 
 /* ===================================================================== */
@@ -785,57 +824,81 @@ static int rand_in_range(int lo, int hi_exclusive)
  * background even at A_NORMAL weight.
  */
 
+/*
+ * ColorTheme — three-tier palette for one density-glyph theme.
+ *
+ * Intent
+ *   The density renderer paints each grid cell with a glyph chosen by
+ *   the cell's smoothed-density tier (high / mid / low ≈ liquid core
+ *   / body / edge spray).  Each tier needs a colour pair, so a theme
+ *   is exactly three 256-cube indices + a name.
+ *
+ * Why three tiers (not 8 like the wave demos)
+ *   Density has a much narrower visible range than amplitude — it's
+ *   always positive and bounded by particle count.  Three tiers map
+ *   cleanly onto the three glyphs in the density ramp ('@' '*' '.')
+ *   and don't require fine ramp colours.  Trade: lower visual
+ *   resolution, but the spatial structure (the FLUID SHAPE) is what
+ *   carries the demo, not subtle gradients within the fluid.
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness")
+ *   All values are kept ≥ 24 so even `edge` (the dimmest tier) stays
+ *   visible against the default background.  Cube indices 16–23 and
+ *   gray 232–239 are FORBIDDEN — they render as black.
+ *
+ * Reference [10] Raymond's NCURSES HOWTO §6 — init_pair semantics
+ *   that turn these triples into live colour pairs.
+ */
 typedef struct {
-    short      core;
-    short      body;
-    short      edge;
-    const char *name;
+    short       core;     /* densest cells (liquid core)              */
+    short       body;     /* medium-density cells (fluid body)         */
+    short       edge;     /* low-density cells (droplets / spray)      */
+    const char *name;     /* short ASCII label shown in HUD            */
 } ColorTheme;
 
 static const ColorTheme color_theme_table[THEME_COUNT] = {
-    {  51,  39,  27, "ocean"  },   /* cyan → blue                      */
-    { 196, 208, 220, "lava"   },   /* red → orange → yellow            */
-    { 226, 214, 196, "fire"   },   /* white-yellow → orange → red      */
-    {  46,  34,  28, "matrix" },   /* bright green → mid → dark        */
-    { 231, 141,  93, "nova"   },   /* white → violet → purple          */
-    { 231, 159, 117, "ice"    },   /* white → sky → steel              */
-    { 220, 208, 197, "sunset" },   /* yellow → orange → rose           */
-    { 196, 160, 124, "blood"  },   /* bright red → crimson → dark      */
-    { 201, 198, 165, "neon"   },   /* magenta → pink → soft purple     */
-    { 154, 118,  46, "acid"   },   /* yellow-green → green             */
+    {51, 39, 27, "ocean"},     /* cyan → blue                      */
+    {196, 208, 220, "lava"},   /* red → orange → yellow            */
+    {226, 214, 196, "fire"},   /* white-yellow → orange → red      */
+    {46, 34, 28, "matrix"},    /* bright green → mid → dark        */
+    {231, 141, 93, "nova"},    /* white → violet → purple          */
+    {231, 159, 117, "ice"},    /* white → sky → steel              */
+    {220, 208, 197, "sunset"}, /* yellow → orange → rose           */
+    {196, 160, 124, "blood"},  /* bright red → crimson → dark      */
+    {201, 198, 165, "neon"},   /* magenta → pink → soft purple     */
+    {154, 118, 46, "acid"},    /* yellow-green → green             */
 };
 
 /* ===================================================================== */
 /* §5  colors — pair init + theme apply                                  */
 /* ===================================================================== */
 
-static void colors_apply_theme(int theme_index)
-{
-    if (theme_index < 0 || theme_index >= THEME_COUNT) theme_index = 0;
-    const ColorTheme *theme = &color_theme_table[theme_index];
+static void colors_apply_theme(int theme_index) {
+  if (theme_index < 0 || theme_index >= THEME_COUNT)
+    theme_index = 0;
+  const ColorTheme *theme = &color_theme_table[theme_index];
 
-    if (COLORS >= 256) {
-        init_pair(PAIR_DENSITY_CORE, theme->core, -1);
-        init_pair(PAIR_DENSITY_BODY, theme->body, -1);
-        init_pair(PAIR_DENSITY_EDGE, theme->edge, -1);
-        init_pair(PAIR_BORDER,       244,         -1);
-        init_pair(PAIR_HUD,          226,         -1);   /* yellow */
-        init_pair(PAIR_HINT,          51,         -1);   /* cyan   */
-    } else {
-        init_pair(PAIR_DENSITY_CORE, COLOR_CYAN,    -1);
-        init_pair(PAIR_DENSITY_BODY, COLOR_CYAN,    -1);
-        init_pair(PAIR_DENSITY_EDGE, COLOR_BLUE,    -1);
-        init_pair(PAIR_BORDER,       COLOR_WHITE,   -1);
-        init_pair(PAIR_HUD,          COLOR_YELLOW,  -1);
-        init_pair(PAIR_HINT,         COLOR_CYAN,    -1);
-    }
+  if (COLORS >= 256) {
+    init_pair(PAIR_DENSITY_CORE, theme->core, -1);
+    init_pair(PAIR_DENSITY_BODY, theme->body, -1);
+    init_pair(PAIR_DENSITY_EDGE, theme->edge, -1);
+    init_pair(PAIR_BORDER, 244, -1);
+    init_pair(PAIR_HUD, 226, -1); /* yellow */
+    init_pair(PAIR_HINT, 51, -1); /* cyan   */
+  } else {
+    init_pair(PAIR_DENSITY_CORE, COLOR_CYAN, -1);
+    init_pair(PAIR_DENSITY_BODY, COLOR_CYAN, -1);
+    init_pair(PAIR_DENSITY_EDGE, COLOR_BLUE, -1);
+    init_pair(PAIR_BORDER, COLOR_WHITE, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
-static void colors_init(int theme_index)
-{
-    start_color();
-    use_default_colors();
-    colors_apply_theme(theme_index);
+static void colors_init(int theme_index) {
+  start_color();
+  use_default_colors();
+  colors_apply_theme(theme_index);
 }
 
 /* ===================================================================== */
@@ -847,63 +910,144 @@ static void colors_init(int theme_index)
  * velocities are in CELL UNITS (the screen IS the physics grid).
  */
 
+/*
+ * Particle — one fluid sample point.
+ *
+ * Intent
+ *   In SPH the fluid is represented by N samples that each carry
+ *   position, velocity, and a few local field values.  The continuous
+ *   field A(x) at any point is reconstructed by summing
+ *   contributions from nearby particles:
+ *
+ *       A(x) = Σⱼ mⱼ · (Aⱼ / ρⱼ) · W(|x − xⱼ|, h)
+ *
+ *   where W is the smoothing kernel (§4) and h is the smoothing
+ *   radius.  Each particle therefore needs (pos, vel) for its motion
+ *   plus a CACHED LOCAL DENSITY so the next pass can evaluate
+ *   pressure forces without re-summing kernel values.
+ *
+ * Why density_estimate is cached on the particle
+ *   The pressure-force pass needs ρᵢ for both itself and its
+ *   neighbours.  Computing ρ once per step (in density-pass) and
+ *   reading it back during force-pass turns a doubly-nested loop into
+ *   two single passes — see §particle_step and Müller §3.3 [5].
+ *
+ * Why explicit accel accumulators
+ *   Forces from gravity, pressure, and viscosity arrive in three
+ *   separate sub-passes.  Splitting them as accumulators (rather
+ *   than computing a∑ in one mega-loop) makes each force law
+ *   independently testable and matches the structure in [5].
+ *
+ * Why double, not float
+ *   Many SPH viscosity / pressure terms involve products of small
+ *   differences.  Single-precision can underflow into noise; the
+ *   ~50 % extra cost of doubles is invisible at our N (~few hundred
+ *   particles).
+ *
+ * Coordinate convention
+ *   pos_col / pos_row are in CELL UNITS — the terminal grid IS the
+ *   physics grid.  No separate pixel space (unlike spring_pendulum.c
+ *   et al.).  vel and accel inherit the same units (cells / step,
+ *   cells / step²).
+ *
+ * References [1][2] for the kernel-sum formalism; [5] Müller for the
+ *   real-time field structure adopted here.
+ */
 typedef struct {
-    double pos_col;            /* x position (cells)                 */
-    double pos_row;            /* y position (cells)                 */
-    double vel_col;            /* x velocity (cells / step)          */
-    double vel_row;            /* y velocity (cells / step)          */
-    double accel_col;          /* x force accumulator                */
-    double accel_row;          /* y force accumulator                */
-    double density_estimate;   /* ρᵢ = Σ kernel² at this particle    */
+    double pos_col;          /* x position (cells)                    */
+    double pos_row;          /* y position (cells)                    */
+    double vel_col;          /* x velocity (cells / step)             */
+    double vel_row;          /* y velocity (cells / step)             */
+    double accel_col;        /* x force accumulator (reset each step) */
+    double accel_row;        /* y force accumulator (reset each step) */
+    double density_estimate; /* ρᵢ = Σⱼ mⱼ·W(|xᵢ−xⱼ|, h); cached     *
+                              * by density-pass, read by force-pass.  */
 } Particle;
 
-/* Pool + count — global because every physics pass loops over all. */
-static Particle particle_pool[PARTICLE_POOL_CAPACITY];
-static int      particle_count = 0;
+/*
+ * ParticleWorld — the particle pool plus the world it lives in.
+ *
+ * Intent
+ *   Earlier versions kept the pool, count, phys-area bounds, and the
+ *   gravity/viscosity toggles as flat file-scope globals.  This struct
+ *   groups everything that describes the LAGRANGIAN PARTICLE WORLD:
+ *   the particles themselves AND the bounding rectangle they live in,
+ *   plus the per-frame force toggles that gate the §10 / §11 passes.
+ *
+ *   The struct is touched by every physics pass (density, force,
+ *   integrate, wall) and by every painter, so we keep a single
+ *   `g_world` instance and reach fields via `g_world.<field>`.  Avoids
+ *   pointer threading through the inner-loop SPH math.
+ *
+ * Locality (sim vs render)
+ *   - pool, count                         → simulation (the state)
+ *   - g_world.phys_cols, g_world.phys_rows                → shared geometry (sim AND
+ *                                            render bound their loops)
+ *   - g_world.gravity_enabled, g_world.viscosity_enabled  → control flags driven by
+ *                                            'g' / 'v' keys; read each
+ *                                            step by force pass
+ *
+ *   Mis-classifying a control flag as render would couple the
+ *   simulation to a user-visual choice, breaking reproducibility.
+ *
+ * Memory footprint
+ *   PARTICLE_POOL_CAPACITY × sizeof(Particle) ≈ several KB in BSS;
+ *   no malloc.  Matches CLAUDE.md "no dynamic allocation after init".
+ */
+typedef struct {
+    /* ── Particle state (the pool + how many are live) ──────────── */
+    Particle pool [PARTICLE_POOL_CAPACITY];
+    int      count;
 
-/* Physics-area dimensions — refreshed each tick from terminal size. */
-static int phys_cols = 80;
-static int phys_rows = 22;
+    /* ── Physics-area bounds (shared by sim AND render) ─────────── *
+     * Refreshed each tick from terminal size in scene_tick.        */
+    int phys_cols;
+    int phys_rows;
 
-/* Per-frame physics-toggle flags (driven by 'g', 'v' keys). */
-static bool gravity_enabled   = true;
-static bool viscosity_enabled = true;
+    /* ── Per-frame force toggles (driven by 'g', 'v' keys) ──────── */
+    bool gravity_enabled;
+    bool viscosity_enabled;
+} ParticleWorld;
+
+static ParticleWorld g_world = {
+    .phys_cols         = 80,
+    .phys_rows         = 22,
+    .gravity_enabled   = true,
+    .viscosity_enabled = true,
+};
 
 /* particle_spawn_at — append one particle at (col, row) if room. */
-static void particle_spawn_at(double pos_col, double pos_row)
-{
-    if (particle_count >= PARTICLE_POOL_CAPACITY) return;
-    Particle *p          = &particle_pool[particle_count];
-    p->pos_col           = pos_col;
-    p->pos_row           = pos_row;
-    p->vel_col           = 0.0;
-    p->vel_row           = 0.0;
-    p->accel_col         = 0.0;
-    p->accel_row         = 0.0;
-    p->density_estimate  = 0.0;
-    particle_count++;
+static void particle_spawn_at(double pos_col, double pos_row) {
+  if (g_world.count >= PARTICLE_POOL_CAPACITY)
+    return;
+  Particle *p = &g_world.pool[g_world.count];
+  p->pos_col = pos_col;
+  p->pos_row = pos_row;
+  p->vel_col = 0.0;
+  p->vel_row = 0.0;
+  p->accel_col = 0.0;
+  p->accel_row = 0.0;
+  p->density_estimate = 0.0;
+  g_world.count++;
 }
 
 /* Spawn a circular blob of radius r centred at (cx, cy). */
-static void particle_spawn_blob(int centre_col, int centre_row, int radius_cells)
-{
-    for (int dy = -radius_cells; dy <= radius_cells; dy++) {
-        for (int dx = -radius_cells; dx <= radius_cells; dx++) {
-            if (dx*dx + dy*dy <= radius_cells*radius_cells)
-                particle_spawn_at((double)(centre_col + dx),
-                                  (double)(centre_row + dy));
-        }
+static void particle_spawn_blob(int centre_col, int centre_row,
+                                int radius_cells) {
+  for (int dy = -radius_cells; dy <= radius_cells; dy++) {
+    for (int dx = -radius_cells; dx <= radius_cells; dx++) {
+      if (dx * dx + dy * dy <= radius_cells * radius_cells)
+        particle_spawn_at((double)(centre_col + dx), (double)(centre_row + dy));
     }
+  }
 }
 
 /* Spawn a solid rectangle. */
 static void particle_spawn_rectangle(int corner_col, int corner_row,
-                                     int width_cells, int height_cells)
-{
-    for (int dy = 0; dy < height_cells; dy++)
-        for (int dx = 0; dx < width_cells; dx++)
-            particle_spawn_at((double)(corner_col + dx),
-                              (double)(corner_row + dy));
+                                     int width_cells, int height_cells) {
+  for (int dy = 0; dy < height_cells; dy++)
+    for (int dx = 0; dx < width_cells; dx++)
+      particle_spawn_at((double)(corner_col + dx), (double)(corner_row + dy));
 }
 
 /* ===================================================================== */
@@ -919,23 +1063,21 @@ static void particle_spawn_rectangle(int corner_col, int corner_row,
  *   - For "is this neighbour in range?" callers just check
  *     w_signed < 0  (equivalent to d < H).
  */
-static double sph_kernel_signed(double distance_cells)
-{
-    double w = distance_cells / SMOOTH_RADIUS_CELLS - 1.0;
-    return (w < 0.0) ? w : 0.0;
+static double sph_kernel_signed(double distance_cells) {
+  double w = distance_cells / SMOOTH_RADIUS_CELLS - 1.0;
+  return (w < 0.0) ? w : 0.0;
 }
 
 /* sph_pair_distance — compute |pᵢ - pⱼ| and the components.  Returns
  * the scalar distance; writes (Δcol, Δrow) to *delta_col / *delta_row
  * (i minus j; the convention used by the pressure force in §10). */
 static double sph_pair_distance(const Particle *pi, const Particle *pj,
-                                double *delta_col, double *delta_row)
-{
-    double dc = pi->pos_col - pj->pos_col;
-    double dr = pi->pos_row - pj->pos_row;
-    *delta_col = dc;
-    *delta_row = dr;
-    return sqrt(dc * dc + dr * dr);
+                                double *delta_col, double *delta_row) {
+  double dc = pi->pos_col - pj->pos_col;
+  double dr = pi->pos_row - pj->pos_row;
+  *delta_col = dc;
+  *delta_row = dr;
+  return sqrt(dc * dc + dr * dr);
 }
 
 /* ===================================================================== */
@@ -946,54 +1088,120 @@ static double sph_pair_distance(const Particle *pi, const Particle *pj,
  * k = average particles in a 3×3 cell block ≈ 9 · (N / total_cells).
  *
  * Linked-list-per-cell representation (T7):
- *   grid_head[gy][gx]  = first particle index in cell, or -1
- *   grid_next[i]       = next particle index in same cell as i, or -1
+ *   g_grid.head[gy][gx]  = first particle index in cell, or -1
+ *   g_grid.next[i]       = next particle index in same cell as i, or -1
  *
  * Iteration:
- *   for (int j = grid_head[gy][gx]; j != -1; j = grid_next[j]) ...
+ *   for (int j = g_grid.head[gy][gx]; j != -1; j = g_grid.next[j]) ...
  */
 
-static int grid_head[GRID_ROWS_MAX][GRID_COLS_MAX];
-static int grid_next[PARTICLE_POOL_CAPACITY];
-static int grid_active_cols;
-static int grid_active_rows;
+/*
+ * Grid — the spatial-hash grid used for O(N·k) neighbour search.
+ *
+ * Intent
+ *   Naive SPH neighbour search is O(N²) — every particle queries every
+ *   other for "are you within smoothing radius?".  The spatial-hash
+ *   grid bins particles by cell, then each query inspects only the
+ *   3×3 cells around the query — O(N·k) where k ≈ 9·(N / total_cells)
+ *   is the average occupancy.  See [7] Teschner et al. 2003.
+ *
+ * Why linked-list-per-cell (T7)
+ *   For each grid cell we store the index of the FIRST particle in
+ *   that cell (`head[gy][gx]`).  Each particle then stores the index
+ *   of the NEXT particle in the SAME cell (`next[i]`).  Iteration:
+ *     for (int j = head[gy][gx]; j != -1; j = next[j]) { ... }
+ *   This avoids per-cell dynamic arrays — important for our "no
+ *   dynamic allocation after init" budget.  Cost: O(1) insert and
+ *   O(k) traversal where k is cell occupancy.
+ *
+ * Memory footprint
+ *   head: GRID_ROWS_MAX × GRID_COLS_MAX × sizeof(int)
+ *   next: PARTICLE_POOL_CAPACITY × sizeof(int)
+ *   Both in BSS, no malloc.
+ *
+ * Reference [7] Teschner et al. 2003 for the spatial-hashing scheme.
+ */
+typedef struct {
+    /* Head index per cell: first particle in that cell, or -1.        */
+    int head[GRID_ROWS_MAX][GRID_COLS_MAX];
 
-static inline int grid_cell_col_of(double pos_col)
-{
-    int gx = (int)(pos_col / GRID_CELL_SIZE);
-    if (gx < 0)                  gx = 0;
-    if (gx >= grid_active_cols)  gx = grid_active_cols - 1;
-    return gx;
+    /* Linked-list next-pointer per particle: next particle in the
+     * SAME cell as particle i, or -1.                                 */
+    int next[PARTICLE_POOL_CAPACITY];
+
+    /* Active subregion bounds (≤ GRID_*_MAX, clamped on resize).      */
+    int active_cols;
+    int active_rows;
+} Grid;
+
+static Grid g_grid;
+
+static inline int grid_cell_col_of(double pos_col) {
+  int gx = (int)(pos_col / GRID_CELL_SIZE);
+  if (gx < 0)
+    gx = 0;
+  if (gx >= g_grid.active_cols)
+    gx = g_grid.active_cols - 1;
+  return gx;
 }
 
-static inline int grid_cell_row_of(double pos_row)
-{
-    int gy = (int)(pos_row / GRID_CELL_SIZE);
-    if (gy < 0)                  gy = 0;
-    if (gy >= grid_active_rows)  gy = grid_active_rows - 1;
-    return gy;
+static inline int grid_cell_row_of(double pos_row) {
+  int gy = (int)(pos_row / GRID_CELL_SIZE);
+  if (gy < 0)
+    gy = 0;
+  if (gy >= g_grid.active_rows)
+    gy = g_grid.active_rows - 1;
+  return gy;
 }
 
-/* grid_rebuild — rebuild the spatial-hash from scratch.  Called once
- * at the START of every physics step (before density / forces). */
-static void grid_rebuild(void)
-{
-    grid_active_cols = phys_cols / GRID_CELL_SIZE + 2;
-    grid_active_rows = phys_rows / GRID_CELL_SIZE + 2;
-    if (grid_active_cols > GRID_COLS_MAX) grid_active_cols = GRID_COLS_MAX;
-    if (grid_active_rows > GRID_ROWS_MAX) grid_active_rows = GRID_ROWS_MAX;
+/* Compute the active spatial-grid extent from the current physics
+ * area.  +2 padding includes the ghost cells around the visible
+ * domain so the 3×3 neighbour stencil never reaches off-grid.
+ * Clamped to GRID_*_MAX. */
+static inline void compute_active_grid_bounds(void) {
+    g_grid.active_cols = g_world.phys_cols / GRID_CELL_SIZE + 2;
+    g_grid.active_rows = g_world.phys_rows / GRID_CELL_SIZE + 2;
+    if (g_grid.active_cols > GRID_COLS_MAX) g_grid.active_cols = GRID_COLS_MAX;
+    if (g_grid.active_rows > GRID_ROWS_MAX) g_grid.active_rows = GRID_ROWS_MAX;
+}
 
-    for (int gy = 0; gy < grid_active_rows; gy++)
-        for (int gx = 0; gx < grid_active_cols; gx++)
-            grid_head[gy][gx] = -1;
+/* Empty every cell's linked-list head so old particle indices from the
+ * previous step don't linger.  Done in O(cells); the next-pointer
+ * array is overwritten as particles are re-inserted (no clear needed). */
+static inline void clear_all_cell_heads(void) {
+    for (int gy = 0; gy < g_grid.active_rows; gy++)
+        for (int gx = 0; gx < g_grid.active_cols; gx++)
+            g_grid.head[gy][gx] = -1;
+}
 
-    /* Push each particle onto the head of its cell's list. */
-    for (int i = 0; i < particle_count; i++) {
-        int gx = grid_cell_col_of(particle_pool[i].pos_col);
-        int gy = grid_cell_row_of(particle_pool[i].pos_row);
-        grid_next[i]      = grid_head[gy][gx];
-        grid_head[gy][gx] = i;
-    }
+/* Insert particle i at the HEAD of its cell's linked list.
+ * O(1) operation: new_node.next = old_head; cell.head = i.
+ * Standard linked-list head-push. */
+static inline void insert_particle_into_cell(int i) {
+    int gx = grid_cell_col_of(g_world.pool[i].pos_col);
+    int gy = grid_cell_row_of(g_world.pool[i].pos_row);
+    g_grid.next[i]      = g_grid.head[gy][gx];
+    g_grid.head[gy][gx] = i;
+}
+
+/*
+ * grid_rebuild — rebuild the spatial-hash from scratch.
+ *
+ * Pseudocode:
+ *   compute_active_grid_bounds   (recompute from current phys-area)
+ *   clear_all_cell_heads          (every list starts empty)
+ *   for each particle i:
+ *     insert_particle_into_cell(i)
+ *
+ * Called once at the START of every physics step.  Order: rebuild →
+ * density → forces → integrate.  Refs [7] Teschner 2003 for the
+ * head/next spatial-hash scheme.
+ */
+static void grid_rebuild(void) {
+    compute_active_grid_bounds();
+    clear_all_cell_heads();
+    for (int i = 0; i < g_world.count; i++)
+        insert_particle_into_cell(i);
 }
 
 /* ===================================================================== */
@@ -1008,27 +1216,60 @@ static void grid_rebuild(void)
  * Total cost ≈ N · 9 · k, where k = avg particles per cell.  At
  * N=1500 in 30×8 cells, ~6 particles/cell, ~50 evals per particle.
  */
-static void density_pass(void)
-{
-    for (int i = 0; i < particle_count; i++) {
-        Particle *pi = &particle_pool[i];
+/* The 3×3 block of grid cells around particle pi, clipped to the
+ * active grid.  Returns inclusive index ranges via out-pointers; the
+ * caller iterates [gx_lo..gx_hi] × [gy_lo..gy_hi] and walks the
+ * linked list at each cell.  Shared by density_pass and forces_pass. */
+static inline void cell_block_around(const Particle *pi,
+                                     int *out_gx_lo, int *out_gx_hi,
+                                     int *out_gy_lo, int *out_gy_hi) {
+    int cx = grid_cell_col_of(pi->pos_col);
+    int cy = grid_cell_row_of(pi->pos_row);
+    *out_gx_lo = (cx - 1 < 0) ? 0 : cx - 1;
+    *out_gx_hi = (cx + 1 >= g_grid.active_cols) ? g_grid.active_cols - 1 : cx + 1;
+    *out_gy_lo = (cy - 1 < 0) ? 0 : cy - 1;
+    *out_gy_hi = (cy + 1 >= g_grid.active_rows) ? g_grid.active_rows - 1 : cy + 1;
+}
+
+/* Contribution to pi's density estimate from neighbour pj.
+ * Müller §3.3 [5] uses the SQUARED kernel for density (always ≥ 0).
+ * Self-pair (i == j) gives w(0)² = 1, so ρᵢ ≥ 1 always — a useful
+ * lower bound that simplifies the pressure-force divide guard.       */
+static inline double squared_kernel_contribution(const Particle *pi,
+                                                  const Particle *pj) {
+    double dc, dr;
+    double distance = sph_pair_distance(pi, pj, &dc, &dr);
+    double w        = sph_kernel_signed(distance);
+    return w * w;
+}
+
+/*
+ * density_pass — Müller et al. (2003) §3.3 [5] density estimation.
+ *
+ * Pseudocode:
+ *   for each particle pi:
+ *     pi.density_estimate ← 0
+ *     (gx_lo..gx_hi, gy_lo..gy_hi) = cell_block_around(pi)
+ *     for each cell in that 3×3 block:
+ *       for each particle pj in that cell:
+ *         pi.density_estimate += squared_kernel_contribution(pi, pj)
+ *
+ * Cost ≈ N · 9 · k where k = avg particles per cell.  At N=1500 in
+ * 30×8 cells (~6 particles/cell), ~50 kernel evaluations per particle.
+ */
+static void density_pass(void) {
+    for (int i = 0; i < g_world.count; i++) {
+        Particle *pi = &g_world.pool[i];
         pi->density_estimate = 0.0;
 
-        int cell_gx = grid_cell_col_of(pi->pos_col);
-        int cell_gy = grid_cell_row_of(pi->pos_row);
+        int gx_lo, gx_hi, gy_lo, gy_hi;
+        cell_block_around(pi, &gx_lo, &gx_hi, &gy_lo, &gy_hi);
 
-        for (int gy = cell_gy - 1; gy <= cell_gy + 1; gy++) {
-            if (gy < 0 || gy >= grid_active_rows) continue;
-            for (int gx = cell_gx - 1; gx <= cell_gx + 1; gx++) {
-                if (gx < 0 || gx >= grid_active_cols) continue;
-
-                for (int j = grid_head[gy][gx]; j != -1; j = grid_next[j]) {
-                    Particle *pj = &particle_pool[j];
-                    double dc, dr;
-                    double distance = sph_pair_distance(pi, pj, &dc, &dr);
-                    double w_signed = sph_kernel_signed(distance);
-                    /* Always w² ≥ 0; out-of-range w_signed = 0 → 0. */
-                    pi->density_estimate += w_signed * w_signed;
+        for (int gy = gy_lo; gy <= gy_hi; gy++) {
+            for (int gx = gx_lo; gx <= gx_hi; gx++) {
+                for (int j = g_grid.head[gy][gx]; j != -1; j = g_grid.next[j]) {
+                    pi->density_estimate +=
+                        squared_kernel_contribution(pi, &g_world.pool[j]);
                 }
             }
         }
@@ -1048,59 +1289,103 @@ static void density_pass(void)
  *                              / (ρᵢ + DENSITY_DIVIDE_GUARD)
  *   pi.accel += pressure_force_along_dx · (Δcol, Δrow)
  *
- *   if viscosity_enabled:
+ *   if g_world.viscosity_enabled:
  *     visc_weight = -w_signed   (positive inside support)
  *     pi.accel += (vⱼ - vᵢ) · K_viscosity · visc_weight
  *
  * Gravity is set as the BASELINE acceleration so we don't add it
  * inside the pair loop.
  */
-static void forces_pass(void)
-{
-    for (int i = 0; i < particle_count; i++) {
-        Particle *pi = &particle_pool[i];
+/* Set the baseline acceleration for one particle.  Gravity is the
+ * ONLY external body force in this demo; setting it as a baseline
+ * (not adding it inside the pair loop) is cleaner and avoids
+ * accidentally scaling g by neighbour count.                        */
+static inline void apply_gravity_baseline(Particle *pi) {
+    pi->accel_col = 0.0;
+    pi->accel_row = g_world.gravity_enabled ? GRAVITY_G : 0.0;
+}
 
-        /* Baseline: gravity (vertical). */
-        pi->accel_col = 0.0;
-        pi->accel_row = gravity_enabled ? GRAVITY_G : 0.0;
+/* Add the SPH pressure force from pj to pi's acceleration accumulator.
+ * Müller §3.4 [5]:
+ *
+ *     F_pressure_ij = −∇W(d) · (Pᵢ + Pⱼ) / (2 ρⱼ)
+ *
+ * Our simplified form merges the (P − P_rest) terms into one symmetric
+ * REST_SUM − ρᵢ − ρⱼ expression (Tait equation of state, T4 tutorial).
+ * The DENSITY_DIVIDE_GUARD prevents division by zero for isolated
+ * particles whose density estimate could drop to ε. */
+static inline void apply_pressure_pair_force(Particle *pi,
+                                              const Particle *pj,
+                                              double dc, double dr,
+                                              double w_signed) {
+    double pressure_term =
+        (REST_SUM - pi->density_estimate - pj->density_estimate) * PRESSURE_K;
+    double force_per_dx =
+        w_signed * pressure_term /
+        (pi->density_estimate + DENSITY_DIVIDE_GUARD);
+    pi->accel_col += dc * force_per_dx;
+    pi->accel_row += dr * force_per_dx;
+}
 
-        int cell_gx = grid_cell_col_of(pi->pos_col);
-        int cell_gy = grid_cell_row_of(pi->pos_row);
+/* Add the SPH artificial-viscosity force from pj to pi's accel.
+ * Müller §3.5 [5] / Monaghan [3] ch. 5.  Drives pi's velocity toward
+ * the LOCAL AVERAGE of its neighbours — a smoothing operator on the
+ * velocity field.  visc_weight = −w_signed is positive inside the
+ * kernel support so the sign is correct. */
+static inline void apply_viscosity_pair_force(Particle *pi,
+                                               const Particle *pj,
+                                               double w_signed) {
+    double visc_weight = -w_signed;  /* positive inside support */
+    pi->accel_col += (pj->vel_col - pi->vel_col) * VISCOSITY_K * visc_weight;
+    pi->accel_row += (pj->vel_row - pi->vel_row) * VISCOSITY_K * visc_weight;
+}
 
-        for (int gy = cell_gy - 1; gy <= cell_gy + 1; gy++) {
-            if (gy < 0 || gy >= grid_active_rows) continue;
-            for (int gx = cell_gx - 1; gx <= cell_gx + 1; gx++) {
-                if (gx < 0 || gx >= grid_active_cols) continue;
+/* Apply both pair-wise SPH forces (pressure + optional viscosity)
+ * from pj onto pi.  Skips self (i == j) and out-of-kernel pairs
+ * (w_signed == 0). */
+static inline void apply_sph_pair_forces(Particle *pi, int i,
+                                          const Particle *pj, int j) {
+    if (j == i)
+        return;
+    double dc, dr;
+    double distance = sph_pair_distance(pi, pj, &dc, &dr);
+    double w_signed = sph_kernel_signed(distance);
+    if (w_signed == 0.0)
+        return;  /* out of range */
 
-                for (int j = grid_head[gy][gx]; j != -1; j = grid_next[j]) {
-                    if (j == i) continue;
-                    Particle *pj = &particle_pool[j];
+    apply_pressure_pair_force(pi, pj, dc, dr, w_signed);
+    if (g_world.viscosity_enabled)
+        apply_viscosity_pair_force(pi, pj, w_signed);
+}
 
-                    double dc, dr;
-                    double distance = sph_pair_distance(pi, pj, &dc, &dr);
-                    double w_signed = sph_kernel_signed(distance);
-                    if (w_signed == 0.0) continue;     /* out of range */
+/*
+ * forces_pass — Müller §3 [5]: pressure + viscosity acceleration.
+ *
+ * Pseudocode:
+ *   for each particle pi:
+ *     apply_gravity_baseline(pi)                       (g·ŷ if enabled)
+ *     (gx_lo..gx_hi, gy_lo..gy_hi) = cell_block_around(pi)
+ *     for each cell in that 3×3 block:
+ *       for each particle pj in that cell:
+ *         apply_sph_pair_forces(pi, pj)                (pressure + visc)
+ *
+ * Force shape: pressure REPELS dense regions, viscosity SMOOTHS
+ * velocity disparities.  Together they reproduce incompressible
+ * fluid flow.  Refs [3] Monaghan 1992; [5] Müller 2003.
+ */
+static void forces_pass(void) {
+    for (int i = 0; i < g_world.count; i++) {
+        Particle *pi = &g_world.pool[i];
 
-                    /* PRESSURE FORCE (T4). */
-                    double pressure_term =
-                        (REST_SUM - pi->density_estimate
-                                  - pj->density_estimate) * PRESSURE_K;
-                    double pressure_force_per_dx =
-                        w_signed * pressure_term
-                        / (pi->density_estimate + DENSITY_DIVIDE_GUARD);
-                    pi->accel_col += dc * pressure_force_per_dx;
-                    pi->accel_row += dr * pressure_force_per_dx;
+        apply_gravity_baseline(pi);
 
-                    /* VISCOSITY FORCE (T5). */
-                    if (viscosity_enabled) {
-                        double visc_weight = -w_signed;   /* > 0 inside */
-                        pi->accel_col +=
-                            (pj->vel_col - pi->vel_col)
-                            * VISCOSITY_K * visc_weight;
-                        pi->accel_row +=
-                            (pj->vel_row - pi->vel_row)
-                            * VISCOSITY_K * visc_weight;
-                    }
+        int gx_lo, gx_hi, gy_lo, gy_hi;
+        cell_block_around(pi, &gx_lo, &gx_hi, &gy_lo, &gy_hi);
+
+        for (int gy = gy_lo; gy <= gy_hi; gy++) {
+            for (int gx = gx_lo; gx <= gx_hi; gx++) {
+                for (int j = g_grid.head[gy][gx]; j != -1; j = g_grid.next[j]) {
+                    apply_sph_pair_forces(pi, i, &g_world.pool[j], j);
                 }
             }
         }
@@ -1118,43 +1403,63 @@ static void forces_pass(void)
  * Then enforce hard walls.  Push back to the boundary, flip velocity
  * sign, multiply by WALL_DAMPING < 1 to bleed energy.
  */
-static void integrate_pass(void)
-{
-    double col_max = (double)(phys_cols - 2);
-    double row_max = (double)(phys_rows - 2);
-    double col_min = 1.0;
-    double row_min = 1.0;
+/* Symplectic-Euler step 1: velocity from acceleration.
+ *   v_new = v + a · dt
+ * Doing velocity FIRST and position SECOND (using the NEW velocity)
+ * is what makes the integrator symplectic — conserves a modified
+ * Hamiltonian and gives bounded energy error.  See [4] Monaghan 2005
+ * §6 and the spring_pendulum.c demo for a deeper treatment. */
+static inline void symplectic_euler_velocity_step(Particle *p, double dt) {
+    p->vel_col += p->accel_col * dt;
+    p->vel_row += p->accel_row * dt;
+}
 
-    for (int i = 0; i < particle_count; i++) {
-        Particle *p = &particle_pool[i];
+/* Symplectic-Euler step 2: position from NEW velocity.
+ *   x_new = x + v_new · dt
+ * Reading the just-updated velocity is the defining feature of
+ * semi-implicit / symplectic Euler.  */
+static inline void symplectic_euler_position_step(Particle *p, double dt) {
+    p->pos_col += p->vel_col * dt;
+    p->pos_row += p->vel_row * dt;
+}
 
-        /* velocity update FIRST (symplectic) */
-        p->vel_col += p->accel_col * SPH_DT;
-        p->vel_row += p->accel_row * SPH_DT;
+/* Hard-wall bounce on ONE axis.  If pos < lo or > hi, push back to
+ * the boundary and FLIP the velocity component, scaled by
+ * WALL_DAMPING < 1 to bleed energy out.  Energy loss is essential —
+ * a perfectly-elastic bounce would let numerical noise pump KE into
+ * the system indefinitely.                                          */
+static inline void enforce_wall_bounce_axis(double *pos, double *vel,
+                                             double lo, double hi) {
+    if (*pos < lo) { *pos = lo; *vel = -*vel * WALL_DAMPING; }
+    if (*pos > hi) { *pos = hi; *vel = -*vel * WALL_DAMPING; }
+}
 
-        /* position update using the NEW velocity */
-        p->pos_col += p->vel_col * SPH_DT;
-        p->pos_row += p->vel_row * SPH_DT;
+/*
+ * integrate_pass — symplectic Euler step + wall bounce.
+ *
+ * Pseudocode:
+ *   (col_lo, col_hi) = (1, g_world.phys_cols - 2)   ← walls 1 cell in
+ *   (row_lo, row_hi) = (1, g_world.phys_rows - 2)
+ *   for each particle p:
+ *     symplectic_euler_velocity_step(p, dt)       (v += a·dt)
+ *     symplectic_euler_position_step(p, dt)       (x += v_new·dt)
+ *     enforce_wall_bounce_axis(&p.col, &p.vel_col, col_lo, col_hi)
+ *     enforce_wall_bounce_axis(&p.row, &p.vel_row, row_lo, row_hi)
+ *
+ * Order matters: forces_pass writes accel → integrate_pass reads it.
+ * The walls are placed ONE cell inside the physics area so the
+ * particles are visible against the border drawn at the edge.
+ */
+static void integrate_pass(void) {
+    const double col_lo = 1.0,                              col_hi = (double)(g_world.phys_cols - 2);
+    const double row_lo = 1.0,                              row_hi = (double)(g_world.phys_rows - 2);
 
-        /* wall bounce — left / right */
-        if (p->pos_col < col_min) {
-            p->pos_col = col_min;
-            p->vel_col = -p->vel_col * WALL_DAMPING;
-        }
-        if (p->pos_col > col_max) {
-            p->pos_col = col_max;
-            p->vel_col = -p->vel_col * WALL_DAMPING;
-        }
-
-        /* wall bounce — top / bottom */
-        if (p->pos_row < row_min) {
-            p->pos_row = row_min;
-            p->vel_row = -p->vel_row * WALL_DAMPING;
-        }
-        if (p->pos_row > row_max) {
-            p->pos_row = row_max;
-            p->vel_row = -p->vel_row * WALL_DAMPING;
-        }
+    for (int i = 0; i < g_world.count; i++) {
+        Particle *p = &g_world.pool[i];
+        symplectic_euler_velocity_step(p, SPH_DT);
+        symplectic_euler_position_step(p, SPH_DT);
+        enforce_wall_bounce_axis(&p->pos_col, &p->vel_col, col_lo, col_hi);
+        enforce_wall_bounce_axis(&p->pos_row, &p->vel_row, row_lo, row_hi);
     }
 }
 
@@ -1169,12 +1474,11 @@ static void integrate_pass(void)
  *   3. forces_pass      — needs grid + density; produces accel
  *   4. integrate_pass   — needs accel; produces new pos / vel
  */
-static void sph_step(void)
-{
-    grid_rebuild();
-    density_pass();
-    forces_pass();
-    integrate_pass();
+static void sph_step(void) {
+  grid_rebuild();
+  density_pass();
+  forces_pass();
+  integrate_pass();
 }
 
 /* ===================================================================== */
@@ -1192,105 +1496,156 @@ static void sph_step(void)
  *   5 RAIN               curtain of particles falling from top
  */
 
-static void scene_load_blob_drop(void)
-{
-    int cx = phys_cols / 2;
-    particle_spawn_blob(cx, 6, 12);
+static void scene_load_blob_drop(void) {
+  int cx = g_world.phys_cols / 2;
+  particle_spawn_blob(cx, 6, 12);
 }
 
-static void scene_load_column_collapse(void)
-{
-    int cx = phys_cols / 2;
-    particle_spawn_rectangle(cx - 18, 2, 36, 16);
+static void scene_load_column_collapse(void) {
+  int cx = g_world.phys_cols / 2;
+  particle_spawn_rectangle(cx - 18, 2, 36, 16);
 }
 
-static void scene_load_fountain(void)
-{
-    int cx = phys_cols / 2;
-    int floor_row = phys_rows - 4;
-    for (int i = 0; i < 700; i++) {
-        int dx = rand_in_range(-4, 5);
-        particle_spawn_at((double)(cx + dx), (double)floor_row);
-    }
+static void scene_load_fountain(void) {
+  int cx = g_world.phys_cols / 2;
+  int floor_row = g_world.phys_rows - 4;
+  for (int i = 0; i < 700; i++) {
+    int dx = rand_in_range(-4, 5);
+    particle_spawn_at((double)(cx + dx), (double)floor_row);
+  }
 }
 
-static void scene_load_collision(void)
-{
-    int cx = phys_cols / 2;
-    int cy = phys_rows / 2;
-    particle_spawn_blob(cx - 20, cy, 10);
-    particle_spawn_blob(cx + 20, cy, 10);
-    /* First half of the spawn list is the LEFT blob, second half the
-     * RIGHT.  Slam them together. */
-    int half = particle_count / 2;
-    for (int i = 0; i < particle_count; i++)
-        particle_pool[i].vel_col = (i < half) ?  2.5 : -2.5;
+static void scene_load_collision(void) {
+  int cx = g_world.phys_cols / 2;
+  int cy = g_world.phys_rows / 2;
+  particle_spawn_blob(cx - 20, cy, 10);
+  particle_spawn_blob(cx + 20, cy, 10);
+  /* First half of the spawn list is the LEFT blob, second half the
+   * RIGHT.  Slam them together. */
+  int half = g_world.count / 2;
+  for (int i = 0; i < g_world.count; i++)
+    g_world.pool[i].vel_col = (i < half) ? 2.5 : -2.5;
 }
 
-static void scene_load_rain(void)
-{
-    for (int i = 0; i < 800; i++) {
-        int col = rand_in_range(2, phys_cols - 2);
-        int row = rand_in_range(1, 7);
-        particle_spawn_at((double)col, (double)row);
-    }
+static void scene_load_rain(void) {
+  for (int i = 0; i < 800; i++) {
+    int col = rand_in_range(2, g_world.phys_cols - 2);
+    int row = rand_in_range(1, 7);
+    particle_spawn_at((double)col, (double)row);
+  }
 }
 
 /* Dispatch helper. */
-static void scene_load_by_id(int id)
-{
-    particle_count = 0;
-    switch (id) {
-        case 1: scene_load_blob_drop();        break;
-        case 2: scene_load_column_collapse();  break;
-        case 3: scene_load_fountain();         break;
-        case 4: scene_load_collision();        break;
-        case 5: scene_load_rain();             break;
-        default: break;
-    }
+static void scene_load_by_id(int id) {
+  g_world.count = 0;
+  switch (id) {
+  case 1:
+    scene_load_blob_drop();
+    break;
+  case 2:
+    scene_load_column_collapse();
+    break;
+  case 3:
+    scene_load_fountain();
+    break;
+  case 4:
+    scene_load_collision();
+    break;
+  case 5:
+    scene_load_rain();
+    break;
+  default:
+    break;
+  }
 }
 
-static const char *scene_name_of(int id)
-{
-    switch (id) {
-        case 1: return "blob-drop";
-        case 2: return "column";
-        case 3: return "fountain";
-        case 4: return "collision";
-        case 5: return "rain";
-        default: return "?";
-    }
+static const char *scene_name_of(int id) {
+  switch (id) {
+  case 1:
+    return "blob-drop";
+  case 2:
+    return "column";
+  case 3:
+    return "fountain";
+  case 4:
+    return "collision";
+  case 5:
+    return "rain";
+  default:
+    return "?";
+  }
 }
 
 /* ===================================================================== */
 /* §14  scene — scene state + tick orchestrator                          */
 /* ===================================================================== */
 
+/*
+ * Scene — what the user has chosen to look at, and whether time runs.
+ *
+ * Intent
+ *   Unlike the other demos in this folder, fluid_sph.c keeps the bulk
+ *   of simulation state OUTSIDE Scene — g_world.pool[] /
+ *   g_world.count / g_world.phys_cols / g_world.phys_rows are file-scope globals
+ *   because every physics pass loops over all of them and threading
+ *   them through helpers would obscure the math.  Scene therefore
+ *   carries only the THREE pieces of state that need to survive a
+ *   reset: which preset is loaded, which theme is in effect, and
+ *   whether time is paused.
+ *
+ * Locality (sim vs render)
+ *   - active_id     → simulation (decides which scene_load_*() ran
+ *                     and therefore which particles populated the
+ *                     pool).  Read by the reset key and the HUD label.
+ *   - theme_index   → pure rendering (selects which ColorTheme is
+ *                     applied to the density pairs).  Changing it
+ *                     MUST NOT touch the particle pool — only
+ *                     repaints colour pairs via colors_apply_theme().
+ *   - paused        → control state.  Gates scene_tick() and drives
+ *                     the HUD "PAUSED" tag.
+ *
+ *   Mis-classifying theme_index as sim (and accidentally rebuilding
+ *   particles on theme change) would break the engine-toggle
+ *   invariant that "changing the look doesn't disturb the physics".
+ *
+ * Why these specific fields and no others
+ *   Particles, grid bounds, kernel parameters, and the spatial-hash
+ *   table are file-scope statics; bringing them into Scene would
+ *   bloat the struct without helping the few helpers that legitimately
+ *   need them.
+ *
+ * Reference [10] Raymond on the scene-paint pipeline that feeds off
+ *   theme_index + paused.
+ */
 typedef struct {
-    int  active_id;            /* 1..SCENE_COUNT */
-    int  theme_index;          /* 0..THEME_COUNT-1 */
+    /* ── Simulation selector (read by reset path + HUD label) ──── */
+    int  active_id;     /* 1..SCENE_COUNT — which preset is loaded   */
+
+    /* ── Pure render state (read by colors_apply_theme only) ──── */
+    int  theme_index;   /* 0..THEME_COUNT-1 — indexes ColorTheme    */
+
+    /* ── Control state (gates scene_tick + HUD "PAUSED" tag) ──── */
     bool paused;
 } Scene;
 
-static void scene_init(Scene *s, int cols, int rows)
-{
-    s->active_id   = 1;
-    s->theme_index = 0;
-    s->paused      = false;
-    gravity_enabled   = true;
-    viscosity_enabled = true;
-    phys_cols = cols;
-    phys_rows = rows - HUD_RESERVED_ROWS;
-    colors_apply_theme(s->theme_index);
-    scene_load_by_id(s->active_id);
+static void scene_init(Scene *s, int cols, int rows) {
+  s->active_id = 1;
+  s->theme_index = 0;
+  s->paused = false;
+  g_world.gravity_enabled = true;
+  g_world.viscosity_enabled = true;
+  g_world.phys_cols = cols;
+  g_world.phys_rows = rows - HUD_RESERVED_ROWS;
+  colors_apply_theme(s->theme_index);
+  scene_load_by_id(s->active_id);
 }
 
-static void scene_tick(Scene *s, int cols, int rows)
-{
-    if (s->paused) return;
-    phys_cols = cols;
-    phys_rows = rows - HUD_RESERVED_ROWS;
-    sph_step();
+static void scene_tick(Scene *s, int cols, int rows) {
+  if (s->paused)
+    return;
+  g_world.phys_cols = cols;
+  g_world.phys_rows = rows - HUD_RESERVED_ROWS;
+  sph_step();
 }
 
 /* ===================================================================== */
@@ -1309,47 +1664,126 @@ static void scene_tick(Scene *s, int cols, int rows)
  * density (fewer neighbours than interior).
  */
 
+/*
+ * DensityRender — one cell's drawing instruction, derived from local density.
+ *
+ * Intent
+ *   The renderer needs to know THREE things per cell: which glyph to
+ *   draw, which colour pair to use, and whether to apply A_BOLD.  All
+ *   three depend on the same input — the local smoothed density — so
+ *   bundling them in one struct lets density_to_render() return all
+ *   three in one shot without an output-parameter dance.
+ *
+ * Why a struct and not three parallel arrays
+ *   Per-cell density is computed once but read three ways (glyph,
+ *   colour, attribute).  Co-locating the three derived values keeps
+ *   the lookup table compact in cache and the calling code simple:
+ *   `dr = density_to_render(rho); mvaddch(... dr.glyph ...)`.
+ *
+ * Why the tier choice depends on density (not particle count)
+ *   We want SURFACE visibility — surface cells have lower density
+ *   (fewer neighbours within smoothing radius) than interior cells.
+ *   Tiering by density rather than count means droplets and spray
+ *   render as the dim edge tier even when they're locally dense.
+ */
 typedef struct {
-    char       glyph;
-    int        pair_id;
-    attr_t     extra_attr;
+    char   glyph;        /* '@' '*' '.' depending on density tier */
+    int    pair_id;      /* PAIR_DENSITY_CORE / _BODY / _EDGE     */
+    attr_t extra_attr;   /* A_BOLD for the densest tier            */
 } DensityRender;
 
-static DensityRender density_render_for(double density_estimate)
-{
-    DensityRender out = { '.', PAIR_DENSITY_EDGE, A_NORMAL };
-    if (density_estimate >= DENSITY_THRESHOLD_CORE) {
-        out.glyph      = '#';
-        out.pair_id    = PAIR_DENSITY_CORE;
-        out.extra_attr = A_BOLD;
-    } else if (density_estimate >= DENSITY_THRESHOLD_BODY) {
-        out.glyph      = 'o';
-        out.pair_id    = PAIR_DENSITY_BODY;
-        out.extra_attr = A_NORMAL;
-    } else {
-        out.glyph      = '.';
-        out.pair_id    = PAIR_DENSITY_EDGE;
-        out.extra_attr = A_NORMAL;
-    }
-    return out;
+/* Build the CORE density-tier instruction: dense liquid core glyph
+ * + colour + bold attribute.  See DensityRender doc for the three-
+ * tier rationale. */
+static inline DensityRender make_core_tier(void) {
+    return (DensityRender){ '#', PAIR_DENSITY_CORE, A_BOLD };
 }
 
-static void render_particles(WINDOW *w, int cols, int phys_area_rows)
-{
-    for (int i = 0; i < particle_count; i++) {
-        const Particle *p = &particle_pool[i];
+/* Build the BODY density-tier instruction: medium liquid body glyph
+ * + colour, no bold. */
+static inline DensityRender make_body_tier(void) {
+    return (DensityRender){ 'o', PAIR_DENSITY_BODY, A_NORMAL };
+}
 
-        int col = (int)(p->pos_col + 0.5);
-        int row = (int)(p->pos_row + 0.5);
-        if (col < 0 || col >= cols)             continue;
-        if (row < 0 || row >= phys_area_rows)   continue;
-        if (p->density_estimate < DENSITY_THRESHOLD_EDGE) continue;
+/* Build the EDGE density-tier instruction: faint droplet / spray
+ * glyph + colour, no bold.  Used for surface particles. */
+static inline DensityRender make_edge_tier(void) {
+    return (DensityRender){ '.', PAIR_DENSITY_EDGE, A_NORMAL };
+}
+
+/*
+ * density_render_for — tier dispatch by density threshold.
+ *
+ * Pseudocode:
+ *   if ρ ≥ CORE_THRESHOLD → core tier ('#' bold)
+ *   if ρ ≥ BODY_THRESHOLD → body tier ('o')
+ *   else                  → edge tier ('.')
+ *
+ * Higher density → denser interior → bolder glyph.  Lower density
+ * (surface / spray) → dim '.' so the FLUID SHAPE is what carries the
+ * visual, not subtle ramp gradients.
+ */
+static DensityRender density_render_for(double density_estimate) {
+    if (density_estimate >= DENSITY_THRESHOLD_CORE) return make_core_tier();
+    if (density_estimate >= DENSITY_THRESHOLD_BODY) return make_body_tier();
+    return make_edge_tier();
+}
+
+/* Round a particle's real-valued position to its display cell. */
+static inline void particle_to_screen_cell(const Particle *p,
+                                            int *out_col, int *out_row) {
+    *out_col = (int)(p->pos_col + 0.5);
+    *out_row = (int)(p->pos_row + 0.5);
+}
+
+/* Is the cell (col, row) inside the visible field rect? */
+static inline bool screen_cell_in_field(int col, int row,
+                                         int cols, int phys_area_rows) {
+    return col >= 0 && col < cols
+        && row >= 0 && row < phys_area_rows;
+}
+
+/* Should this particle be drawn at all?  Below DENSITY_THRESHOLD_EDGE
+ * the particle is an isolated splatter — drawing it would be visual
+ * noise.  Skipping these cells also reduces newscr/curscr diff size. */
+static inline bool particle_should_render(const Particle *p) {
+    return p->density_estimate >= DENSITY_THRESHOLD_EDGE;
+}
+
+/* Paint ONE particle cell with its density-tier glyph + colour. */
+static inline void paint_particle_cell(WINDOW *w, int row, int col,
+                                        DensityRender dr) {
+    attr_t attrs = COLOR_PAIR(dr.pair_id) | dr.extra_attr;
+    wattron(w, attrs);
+    mvwaddch(w, row, col, (chtype)(unsigned char)dr.glyph);
+    wattroff(w, attrs);
+}
+
+/*
+ * render_particles — paint every visible particle to its density tier.
+ *
+ * Pseudocode:
+ *   for each particle p:
+ *     (col, row) = particle_to_screen_cell(p)
+ *     if not screen_cell_in_field(col, row, ...): skip
+ *     if not particle_should_render(p):           skip
+ *     dr = density_render_for(p->density_estimate)
+ *     paint_particle_cell(win, row, col, dr)
+ */
+static void render_particles(WINDOW *w, int cols, int phys_area_rows) {
+    for (int i = 0; i < g_world.count; i++) {
+        const Particle *p = &g_world.pool[i];
+
+        int col, row;
+        particle_to_screen_cell(p, &col, &row);
+
+        if (!screen_cell_in_field(col, row, cols, phys_area_rows))
+            continue;
+        if (!particle_should_render(p))
+            continue;
 
         DensityRender dr = density_render_for(p->density_estimate);
-        attr_t attrs = COLOR_PAIR(dr.pair_id) | dr.extra_attr;
-        wattron(w, attrs);
-        mvwaddch(w, row, col, (chtype)(unsigned char)dr.glyph);
-        wattroff(w, attrs);
+        paint_particle_cell(w, row, col, dr);
     }
 }
 
@@ -1360,22 +1794,21 @@ static void render_particles(WINDOW *w, int cols, int phys_area_rows)
  * Drawn LAST so it always appears on top of any overflow particles.
  * Uses A_NORMAL (not A_DIM) per CLAUDE.md theme-brightness rule.
  */
-static void render_border(WINDOW *w, int cols, int phys_area_rows)
-{
-    wattron(w, COLOR_PAIR(PAIR_BORDER));
-    for (int c = 0; c < cols; c++) {
-        mvwaddch(w, 0,                  c, '-');
-        mvwaddch(w, phys_area_rows - 1, c, '-');
-    }
-    for (int r = 1; r < phys_area_rows - 1; r++) {
-        mvwaddch(w, r, 0,        '|');
-        mvwaddch(w, r, cols - 1, '|');
-    }
-    mvwaddch(w, 0,                  0,        '+');
-    mvwaddch(w, 0,                  cols - 1, '+');
-    mvwaddch(w, phys_area_rows - 1, 0,        '+');
-    mvwaddch(w, phys_area_rows - 1, cols - 1, '+');
-    wattroff(w, COLOR_PAIR(PAIR_BORDER));
+static void render_border(WINDOW *w, int cols, int phys_area_rows) {
+  wattron(w, COLOR_PAIR(PAIR_BORDER));
+  for (int c = 0; c < cols; c++) {
+    mvwaddch(w, 0, c, '-');
+    mvwaddch(w, phys_area_rows - 1, c, '-');
+  }
+  for (int r = 1; r < phys_area_rows - 1; r++) {
+    mvwaddch(w, r, 0, '|');
+    mvwaddch(w, r, cols - 1, '|');
+  }
+  mvwaddch(w, 0, 0, '+');
+  mvwaddch(w, 0, cols - 1, '+');
+  mvwaddch(w, phys_area_rows - 1, 0, '+');
+  mvwaddch(w, phys_area_rows - 1, cols - 1, '+');
+  wattroff(w, COLOR_PAIR(PAIR_BORDER));
 }
 
 /* ===================================================================== */
@@ -1390,231 +1823,269 @@ static void render_border(WINDOW *w, int cols, int phys_area_rows)
  */
 
 static void hud_paint_status(WINDOW *w, int cols, double fps_display,
-                             int sim_hz, const Scene *s)
-{
-    char buf[200];
-    snprintf(buf, sizeof buf,
-             " %5.1f fps  sim:%3dHz  scene:%-9s  n:%4d  "
-             "g:%s  v:%s  theme:%-7s  %s ",
-             fps_display, sim_hz, scene_name_of(s->active_id),
-             particle_count,
-             gravity_enabled   ? "ON"  : "off",
-             viscosity_enabled ? "ON"  : "off",
-             color_theme_table[s->theme_index].name,
-             s->paused ? "PAUSED " : "running");
-    int len = (int)strlen(buf);
-    int x   = cols - len;
-    if (x < 0) x = 0;
-    wattron(w, COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvwprintw(w, 0, x, "%s", buf);
-    wattroff(w, COLOR_PAIR(PAIR_HUD) | A_BOLD);
+                             int sim_hz, const Scene *s) {
+  char buf[200];
+  snprintf(buf, sizeof buf,
+           " %5.1f fps  sim:%3dHz  scene:%-9s  n:%4d  "
+           "g:%s  v:%s  theme:%-7s  %s ",
+           fps_display, sim_hz, scene_name_of(s->active_id), g_world.count,
+           g_world.gravity_enabled ? "ON" : "off", g_world.viscosity_enabled ? "ON" : "off",
+           color_theme_table[s->theme_index].name,
+           s->paused ? "PAUSED " : "running");
+  int len = (int)strlen(buf);
+  int x = cols - len;
+  if (x < 0)
+    x = 0;
+  wattron(w, COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvwprintw(w, 0, x, "%s", buf);
+  wattroff(w, COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void hud_paint_hint(WINDOW *w, int rows)
-{
-    const char *hint =
-        " q:quit  spc:pause  1-5:scene  g:grav  v:visc  r:reset  "
-        "b:blob  t:theme  ]/[:simHz ";
-    wattron(w, COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvwprintw(w, rows - 1, 0, "%s", hint);
-    wattroff(w, COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void hud_paint_hint(WINDOW *w, int rows) {
+  const char *hint = " q:quit  spc:pause  1-5:scene  g:grav  v:visc  r:reset  "
+                     "b:blob  t:theme  ]/[:simHz ";
+  wattron(w, COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvwprintw(w, rows - 1, 0, "%s", hint);
+  wattroff(w, COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §18  screen — ncurses init / cleanup                                  */
 /* ===================================================================== */
 
-typedef struct { int cols; int rows; } Screen;
+/*
+ * Screen — terminal extent record.  ncurses owns the buffers; we keep
+ * only cell dimensions for HUD placement and field clipping.
+ *
+ * Render pipeline (one frame): erase → scene_paint → hud_paint_*
+ *   → wnoutrefresh(stdscr) → doupdate().  Diff-only writes to the
+ *   terminal — no flicker.  See [10] Raymond §11.
+ */
+typedef struct {
+    int cols;   /* terminal width  in cells (getmaxyx)             */
+    int rows;   /* terminal height in cells (getmaxyx)             */
+} Screen;
 
-static void screen_init(Screen *s, int theme_index)
-{
-    initscr();
-    noecho();
-    cbreak();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    colors_init(theme_index);
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s, int theme_index) {
+  initscr();
+  noecho();
+  cbreak();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  colors_init(theme_index);
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_cleanup(void)
-{
-    endwin();
-}
+static void screen_cleanup(void) { endwin(); }
 
-static void screen_present_frame(Screen *s, const Scene *sc,
-                                 double fps_display, int sim_hz)
-{
-    erase();
-    int phys_area_rows = s->rows - HUD_RESERVED_ROWS;
-    render_particles(stdscr, s->cols, phys_area_rows);
-    render_border   (stdscr, s->cols, phys_area_rows);
-    hud_paint_status(stdscr, s->cols, fps_display, sim_hz, sc);
-    hud_paint_hint  (stdscr, s->rows);
-    wnoutrefresh(stdscr);
-    doupdate();
+static void screen_present_frame(Screen *s, const Scene *sc, double fps_display,
+                                 int sim_hz) {
+  erase();
+  int phys_area_rows = s->rows - HUD_RESERVED_ROWS;
+  render_particles(stdscr, s->cols, phys_area_rows);
+  render_border(stdscr, s->cols, phys_area_rows);
+  hud_paint_status(stdscr, s->cols, fps_display, sim_hz, sc);
+  hud_paint_hint(stdscr, s->rows);
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §19  app — main loop + signals + input                                */
 /* ===================================================================== */
 
+/*
+ * App — top-level container; lives in BSS as the single app_state instance.
+ *
+ * Intent
+ *   Signal handlers (on_signal_*) need to reach state that the main
+ *   loop polls.  A global App + handlers that flip its sig_atomic_t
+ *   flags is the standard POSIX "wake the main loop" pattern.
+ *
+ * Why the volatile sig_atomic_t flags
+ *   POSIX permits signal handlers to write ONLY sig_atomic_t values
+ *   with simple assignments — anything wider is UB.  volatile forces
+ *   the main loop to re-read from memory across signal arrival
+ *   (no compiler caching into a register).
+ *
+ * Why sim_hz lives here (not in Scene)
+ *   sim_hz is a frame-loop concern — it picks the inner-loop tick
+ *   period TICK_NS(sim_hz) — and has no meaning inside scene_tick
+ *   which receives the resulting dt as a parameter.  Putting it in
+ *   App keeps Scene free of timing detail.
+ */
 typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_hz;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
+    Scene  scene;                          /* world + control state    */
+    Screen screen;                         /* terminal extent          */
+    int    sim_hz;                         /* sim tick rate, Hz        */
+    volatile sig_atomic_t running;         /* SIGINT/TERM clears this  */
+    volatile sig_atomic_t need_resize;     /* SIGWINCH sets this       */
 } App;
 
 static App app_state;
 
-static void on_signal_quit  (int sig) { (void)sig; app_state.running     = 0; }
-static void on_signal_resize(int sig) { (void)sig; app_state.need_resize = 1; }
+static void on_signal_quit(int sig) {
+  (void)sig;
+  app_state.running = 0;
+}
+static void on_signal_resize(int sig) {
+  (void)sig;
+  app_state.need_resize = 1;
+}
 
 /* Input handler.  Returns false if the user pressed quit. */
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *s = &app->scene;
-    switch (ch) {
-        case 'q': case 'Q': case 27:
-            return false;
+static bool app_handle_key(App *app, int ch) {
+  Scene *s = &app->scene;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-        case ' ':
-            s->paused = !s->paused;
-            break;
+  case ' ':
+    s->paused = !s->paused;
+    break;
 
-        case '1': case '2': case '3': case '4': case '5':
-            s->active_id = ch - '0';
-            scene_load_by_id(s->active_id);
-            break;
+  case '1':
+  case '2':
+  case '3':
+  case '4':
+  case '5':
+    s->active_id = ch - '0';
+    scene_load_by_id(s->active_id);
+    break;
 
-        case 'g': case 'G':
-            gravity_enabled = !gravity_enabled;
-            break;
+  case 'g':
+  case 'G':
+    g_world.gravity_enabled = !g_world.gravity_enabled;
+    break;
 
-        case 'v': case 'V':
-            viscosity_enabled = !viscosity_enabled;
-            break;
+  case 'v':
+  case 'V':
+    g_world.viscosity_enabled = !g_world.viscosity_enabled;
+    break;
 
-        case 'r': case 'R':
-            scene_load_by_id(s->active_id);
-            break;
+  case 'r':
+  case 'R':
+    scene_load_by_id(s->active_id);
+    break;
 
-        case 'b': case 'B':
-            particle_spawn_blob(rand_in_range(3, phys_cols - 3), 3, 3);
-            break;
+  case 'b':
+  case 'B':
+    particle_spawn_blob(rand_in_range(3, g_world.phys_cols - 3), 3, 3);
+    break;
 
-        case 't': case 'T':
-            s->theme_index = (s->theme_index + 1) % THEME_COUNT;
-            colors_apply_theme(s->theme_index);
-            break;
+  case 't':
+  case 'T':
+    s->theme_index = (s->theme_index + 1) % THEME_COUNT;
+    colors_apply_theme(s->theme_index);
+    break;
 
-        case ']':
-            if (app->sim_hz + SIM_HZ_STEP <= SIM_HZ_MAX)
-                app->sim_hz += SIM_HZ_STEP;
-            break;
-        case '[':
-            if (app->sim_hz - SIM_HZ_STEP >= SIM_HZ_MIN)
-                app->sim_hz -= SIM_HZ_STEP;
-            break;
+  case ']':
+    if (app->sim_hz + SIM_HZ_STEP <= SIM_HZ_MAX)
+      app->sim_hz += SIM_HZ_STEP;
+    break;
+  case '[':
+    if (app->sim_hz - SIM_HZ_STEP >= SIM_HZ_MIN)
+      app->sim_hz -= SIM_HZ_STEP;
+    break;
 
-        default: break;
-    }
-    return true;
+  default:
+    break;
+  }
+  return true;
 }
 
 /* ===================================================================== */
 /* §20  main — entry point                                               */
 /* ===================================================================== */
 
-int main(void)
-{
-    srand((unsigned int)(clock_now_ns() & 0xFFFFFFFF));
-    atexit(screen_cleanup);
-    signal(SIGINT,   on_signal_quit);
-    signal(SIGTERM,  on_signal_quit);
-    signal(SIGWINCH, on_signal_resize);
+int main(void) {
+  srand((unsigned int)(clock_now_ns() & 0xFFFFFFFF));
+  atexit(screen_cleanup);
+  signal(SIGINT, on_signal_quit);
+  signal(SIGTERM, on_signal_quit);
+  signal(SIGWINCH, on_signal_resize);
 
-    App *app     = &app_state;
-    app->running = 1;
-    app->sim_hz  = SIM_HZ_DEFAULT;
+  App *app = &app_state;
+  app->running = 1;
+  app->sim_hz = SIM_HZ_DEFAULT;
 
-    screen_init(&app->screen, 0);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+  screen_init(&app->screen, 0);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows);
 
-    /* Fixed-step accumulator (Glenn Fiedler "Fix Your Timestep!"). */
-    int64_t prev_ns      = clock_now_ns();
-    int64_t sim_accum_ns = 0;
+  /* Fixed-step accumulator (Glenn Fiedler "Fix Your Timestep!"). */
+  int64_t prev_ns = clock_now_ns();
+  int64_t sim_accum_ns = 0;
 
-    /* Sliding-window FPS counter. */
-    int     frames_in_window = 0;
-    int64_t window_accum_ns  = 0;
-    double  fps_display      = 0.0;
+  /* Sliding-window FPS counter. */
+  int frames_in_window = 0;
+  int64_t window_accum_ns = 0;
+  double fps_display = 0.0;
 
-    const int64_t frame_cap_ns = NS_PER_SEC / RENDER_FPS_CAP;
+  const int64_t frame_cap_ns = NS_PER_SEC / RENDER_FPS_CAP;
 
-    while (app->running) {
-        int64_t frame_start = clock_now_ns();
+  while (app->running) {
+    int64_t frame_start = clock_now_ns();
 
-        /* ── resize ── */
-        if (app->need_resize) {
-            screen_resize(&app->screen);
-            phys_cols        = app->screen.cols;
-            phys_rows        = app->screen.rows - HUD_RESERVED_ROWS;
-            sim_accum_ns     = 0;
-            app->need_resize = 0;
-        }
-
-        /* ── dt ── */
-        int64_t dt_ns = frame_start - prev_ns;
-        prev_ns       = frame_start;
-        if (dt_ns > 100 * NS_PER_MS) dt_ns = 100 * NS_PER_MS;
-
-        /* ── fixed-step physics accumulator ── */
-        int64_t tick_ns = TICK_NS(app->sim_hz);
-        sim_accum_ns += dt_ns;
-        while (sim_accum_ns >= tick_ns) {
-            scene_tick(&app->scene, app->screen.cols, app->screen.rows);
-            sim_accum_ns -= tick_ns;
-        }
-
-        /* ── render + present ── */
-        screen_present_frame(&app->screen, &app->scene,
-                             fps_display, app->sim_hz);
-
-        /* ── fps window ── */
-        frames_in_window++;
-        window_accum_ns += dt_ns;
-        if (window_accum_ns >= FPS_RECOMPUTE_MS * NS_PER_MS) {
-            fps_display = (double)frames_in_window
-                        / ((double)window_accum_ns / (double)NS_PER_SEC);
-            frames_in_window = 0;
-            window_accum_ns  = 0;
-        }
-
-        /* ── input ── */
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (!app_handle_key(app, ch)) {
-                app->running = 0;
-                break;
-            }
-        }
-
-        /* ── frame cap ── */
-        int64_t spent = clock_now_ns() - frame_start;
-        if (spent < frame_cap_ns) clock_sleep_ns(frame_cap_ns - spent);
+    /* ── resize ── */
+    if (app->need_resize) {
+      screen_resize(&app->screen);
+      g_world.phys_cols = app->screen.cols;
+      g_world.phys_rows = app->screen.rows - HUD_RESERVED_ROWS;
+      sim_accum_ns = 0;
+      app->need_resize = 0;
     }
 
-    return 0;
+    /* ── dt ── */
+    int64_t dt_ns = frame_start - prev_ns;
+    prev_ns = frame_start;
+    if (dt_ns > 100 * NS_PER_MS)
+      dt_ns = 100 * NS_PER_MS;
+
+    /* ── fixed-step physics accumulator ── */
+    int64_t tick_ns = TICK_NS(app->sim_hz);
+    sim_accum_ns += dt_ns;
+    while (sim_accum_ns >= tick_ns) {
+      scene_tick(&app->scene, app->screen.cols, app->screen.rows);
+      sim_accum_ns -= tick_ns;
+    }
+
+    /* ── render + present ── */
+    screen_present_frame(&app->screen, &app->scene, fps_display, app->sim_hz);
+
+    /* ── fps window ── */
+    frames_in_window++;
+    window_accum_ns += dt_ns;
+    if (window_accum_ns >= FPS_RECOMPUTE_MS * NS_PER_MS) {
+      fps_display = (double)frames_in_window /
+                    ((double)window_accum_ns / (double)NS_PER_SEC);
+      frames_in_window = 0;
+      window_accum_ns = 0;
+    }
+
+    /* ── input ── */
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (!app_handle_key(app, ch)) {
+        app->running = 0;
+        break;
+      }
+    }
+
+    /* ── frame cap ── */
+    int64_t spent = clock_now_ns() - frame_start;
+    if (spent < frame_cap_ns)
+      clock_sleep_ns(frame_cap_ns - spent);
+  }
+
+  return 0;
 }

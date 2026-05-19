@@ -102,12 +102,12 @@
  *
  * Variable-naming convention
  * ──────────────────────────
- *   activator_voltage[r][c]      u — fast variable (membrane voltage
+ *   g_scene.activator_voltage[r][c]      u — fast variable (membrane voltage
  *                                     analogue).  Drives the wave.
- *   inhibitor_recovery[r][c]     v — slow variable (recovery).
+ *   g_scene.inhibitor_recovery[r][c]     v — slow variable (recovery).
  *                                     Pulls u back to rest.
- *   activator_voltage_next[][]   scratch for the new u after a step
- *   inhibitor_recovery_next[][]  scratch for the new v
+ *   g_scene.activator_voltage_next[][]   scratch for the new u after a step
+ *   g_scene.inhibitor_recovery_next[][]  scratch for the new v
  *
  *   ACTIVATOR_REST,              fixed-point values (u*, v*) at the
  *   INHIBITOR_REST                quiescent state
@@ -119,9 +119,9 @@
  *   ACTIVATOR_DIFFUSION          D — diffusion coefficient for u
  *   EULER_DT                     dt for forward-Euler integration
  *
- *   active_preset_index          which row of preset_table is live
- *   simulation_paused            run/pause toggle
- *   substeps_per_frame           Euler ticks between renders
+ *   g_scene.active_preset_index          which row of preset_table is live
+ *   g_scene.simulation_paused            run/pause toggle
+ *   g_scene.substeps_per_frame           Euler ticks between renders
  *
  * Background you need
  * ───────────────────
@@ -179,19 +179,48 @@
  *
  * References
  * ──────────
- *   FitzHugh, R. (1961), "Impulses and Physiological States in
- *     Theoretical Models of Nerve Membrane," Biophysical Journal 1
- *     (6): 445-466.  THE foundational paper.
- *   Nagumo, J., Arimoto, S., Yoshizawa, S. (1962), "An Active Pulse
- *     Transmission Line Simulating Nerve Axon," Proc. IRE 50 (10):
- *     2061-2070.  Independent re-derivation in electrical-circuit form.
- *   Murray, J. D. (2003), "Mathematical Biology II: Spatial Models
- *     and Biomedical Applications" (Springer).  Ch. 1 covers FN in
- *     biological context.
- *   https://en.wikipedia.org/wiki/FitzHugh%E2%80%93Nagumo_model
- *   Munafo, R., "Reaction-Diffusion by the Gray-Scott Model" —
- *     the parameter-space exploration approach is similar, with FN
- *     simpler (only 2 PDE parameters drive the dynamics).
+ *   ── FitzHugh-Nagumo model foundations ────────────────────────────
+ *   [1] FitzHugh, R. (1961), "Impulses and Physiological States in
+ *       Theoretical Models of Nerve Membrane", Biophys. J. 1(6),
+ *       pp. 445-466 — THE foundational paper introducing the two-
+ *       variable simplification of Hodgkin-Huxley.
+ *   [2] Nagumo, J., Arimoto, S. & Yoshizawa, S. (1962), "An Active
+ *       Pulse Transmission Line Simulating Nerve Axon", Proc. IRE
+ *       50(10), pp. 2061-2070 — independent re-derivation in
+ *       electrical-circuit form.  Together with [1] this defines the
+ *       FitzHugh-Nagumo (FN) model.
+ *   [3] Hodgkin, A. L. & Huxley, A. F. (1952), "A quantitative
+ *       description of membrane current and its application to
+ *       conduction and excitation in nerve", J. Physiol. 117 —
+ *       the FULL biophysical model that FN simplifies.  Useful for
+ *       context on what's being abstracted.
+ *
+ *   ── Spatial / pattern-formation theory ────────────────────────────
+ *   [4] Murray, J. D. (2003), "Mathematical Biology II: Spatial
+ *       Models and Biomedical Applications", Springer — ch. 1
+ *       covers FN in biological context; ch. 5-7 cover spiral waves
+ *       and excitable media generally.
+ *   [5] Tyson, J. J. & Keener, J. P. (1988), "Singular Perturbation
+ *       Theory of Travelling Waves in Excitable Media", Physica D
+ *       32 — analytical treatment of the wave-front and -back
+ *       structure visible in the spiral-wave preset.
+ *
+ *   ── Numerical methods ─────────────────────────────────────────────
+ *   [6] LeVeque, R. J. (2007), "Finite Difference Methods for ODEs
+ *       and PDEs", SIAM — explicit Euler + 5-point Laplacian theory
+ *       behind §reaction's per-step update.
+ *
+ *   ── Rendering / ncurses ──────────────────────────────────────────
+ *   [7] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the membrane-potential glyph ramp.
+ *   [8] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, newscr/curscr diff pipeline.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *   [9] https://en.wikipedia.org/wiki/FitzHugh%E2%80%93Nagumo_model
+ *  [10] https://en.wikipedia.org/wiki/Spiral_wave
  *
  * ─────────────────────────────────────────────────────────────────── */
 
@@ -774,156 +803,217 @@
 
 /* a — threshold-shift parameter.  Sets the position of the resting
  * fixed point u*.  Higher a → more negative u*.  We use 0.7. */
-#define FN_THRESHOLD_SHIFT       0.70f
+#define FN_THRESHOLD_SHIFT 0.70f
 
 /* b — inhibitor feedback strength.  b < 1 gives oscillatory
  * regime; b ≥ 1 gives excitable.  We use 0.8 for excitability with
  * a clean refractory period. */
-#define FN_INHIBITOR_FEEDBACK    0.80f
+#define FN_INHIBITOR_FEEDBACK 0.80f
 
 /* ε — v/u time-scale ratio.  ε ≪ 1 = slow inhibitor.  We use
  * 0.08, so v evolves ~12× slower than u (gives a clear action-
  * potential plateau). */
-#define FN_TIMESCALE_RATIO       0.08f
+#define FN_TIMESCALE_RATIO 0.08f
 
 /* D — activator diffusion coefficient.  Only u diffuses; v is
  * local.  Higher D → faster, broader waves. */
-#define ACTIVATOR_DIFFUSION      0.10f
+#define ACTIVATOR_DIFFUSION 0.10f
 
 /* dt — explicit Euler step (T8).  CFL linear bound: dt · D < 0.25
  * with dx = 1.  We use 0.04 (way below) for cubic stability. */
-#define EULER_DT                 0.04f
+#define EULER_DT 0.04f
 
 /* §1.2 — Resting-state fixed point + suprathreshold kick. */
 
 /* (u*, v*) — analytical resting state at our (a, b) parameters. */
-#define ACTIVATOR_REST          (-1.20f)
-#define INHIBITOR_REST          (-0.625f)
+#define ACTIVATOR_REST (-1.20f)
+#define INHIBITOR_REST (-0.625f)
 
 /* Suprathreshold kick value injected by the SPACE key.  Must be
  * well above the cubic threshold (~0) — we use 2.0 (well above). */
-#define SUPRATHRESHOLD_KICK_VALUE   2.00f
+#define SUPRATHRESHOLD_KICK_VALUE 2.00f
 
 /* §1.3 — Sub-stepping (T8). */
 
-#define SUBSTEPS_PER_FRAME_DEFAULT   8
-#define SUBSTEPS_PER_FRAME_MIN       1
-#define SUBSTEPS_PER_FRAME_MAX      20
+#define SUBSTEPS_PER_FRAME_DEFAULT 8
+#define SUBSTEPS_PER_FRAME_MIN 1
+#define SUBSTEPS_PER_FRAME_MAX 20
 
 /* §1.4 — Render frame rate. */
 
-#define RENDER_FPS_CAP             30
-#define NS_PER_SEC          1000000000LL
-#define NS_PER_MS              1000000LL
-#define RENDER_TICK_NS      (NS_PER_SEC / RENDER_FPS_CAP)
+#define RENDER_FPS_CAP 30
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define RENDER_TICK_NS (NS_PER_SEC / RENDER_FPS_CAP)
 
 /* §1.5 — Grid size limits + HUD reservation. */
 
-#define GRID_COLS_MAX             320
-#define GRID_ROWS_MAX             100
-#define HUD_RESERVED_ROWS_TOP       1   /* row 0 — status              */
-#define HUD_RESERVED_ROWS_BOTTOM    1   /* row rows-1 — hint           */
+#define GRID_COLS_MAX 320
+#define GRID_ROWS_MAX 100
+#define HUD_RESERVED_ROWS_TOP 1    /* row 0 — status              */
+#define HUD_RESERVED_ROWS_BOTTOM 1 /* row rows-1 — hint           */
 
 /* §1.6 — Activator-band glyph thresholds (T9). */
 
-#define U_BAND_REST_HIGH         (-0.80f)
-#define U_BAND_RECOVERY_HIGH     (-0.20f)
-#define U_BAND_RISING_HIGH         0.50f
-#define U_BAND_WAVE_HIGH           1.20f
+#define U_BAND_REST_HIGH (-0.80f)
+#define U_BAND_RECOVERY_HIGH (-0.20f)
+#define U_BAND_RISING_HIGH 0.50f
+#define U_BAND_WAVE_HIGH 1.20f
 
 /* §1.7 — Impulse geometry. */
 
-#define IMPULSE_RADIUS_CELLS         4
-#define SPIRAL_PRIMER_RADIUS         5
+#define IMPULSE_RADIUS_CELLS 4
+#define SPIRAL_PRIMER_RADIUS 5
 
 /* §1.8 — Colour pair IDs. */
 
 enum {
-    PAIR_BAND_REST       = 1,    /* u < -0.80 — dark blue            */
-    PAIR_BAND_RECOVERY,          /* u < -0.20 — medium blue           */
-    PAIR_BAND_RISING,            /* u <  0.50 — cyan                 */
-    PAIR_BAND_WAVE,              /* u <  1.20 — pale cyan-white      */
-    PAIR_BAND_FRONT,             /* u ≥  1.20 — bright white + bold  */
-    PAIR_HUD,                    /* bright yellow + bold (top)        */
-    PAIR_HINT,                   /* bright cyan   + bold (bottom)     */
+  PAIR_BAND_REST = 1, /* u < -0.80 — dark blue            */
+  PAIR_BAND_RECOVERY, /* u < -0.20 — medium blue           */
+  PAIR_BAND_RISING,   /* u <  0.50 — cyan                 */
+  PAIR_BAND_WAVE,     /* u <  1.20 — pale cyan-white      */
+  PAIR_BAND_FRONT,    /* u ≥  1.20 — bright white + bold  */
+  PAIR_HUD,           /* bright yellow + bold (top)        */
+  PAIR_HINT,          /* bright cyan   + bold (bottom)     */
 };
 
 /* §1.9 — Preset count (table in §10). */
 
-#define PRESET_COUNT  4
+#define PRESET_COUNT 4
 
 /* ===================================================================== */
 /* §2  clock — monotonic ns timer + sleep                                */
 /* ===================================================================== */
 
-static int64_t clock_now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
+static int64_t clock_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / NS_PER_SEC, ns % NS_PER_SEC };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / NS_PER_SEC, ns % NS_PER_SEC};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
 /* §3  colors — 5-band activator ramp + HUD pairs                        */
 /* ===================================================================== */
 
-static void colors_init(void)
-{
-    start_color();
-    use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(PAIR_BAND_REST,      25, -1);   /* dark blue        */
-        init_pair(PAIR_BAND_RECOVERY,  27, -1);   /* medium blue      */
-        init_pair(PAIR_BAND_RISING,    51, -1);   /* cyan             */
-        init_pair(PAIR_BAND_WAVE,     195, -1);   /* pale cyan-white  */
-        init_pair(PAIR_BAND_FRONT,    231, -1);   /* bright white     */
-        init_pair(PAIR_HUD,           226, -1);   /* bright yellow    */
-        init_pair(PAIR_HINT,           51, -1);   /* bright cyan      */
-    } else {
-        init_pair(PAIR_BAND_REST,      COLOR_BLUE,   -1);
-        init_pair(PAIR_BAND_RECOVERY,  COLOR_BLUE,   -1);
-        init_pair(PAIR_BAND_RISING,    COLOR_CYAN,   -1);
-        init_pair(PAIR_BAND_WAVE,      COLOR_CYAN,   -1);
-        init_pair(PAIR_BAND_FRONT,     COLOR_WHITE,  -1);
-        init_pair(PAIR_HUD,            COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT,           COLOR_CYAN,   -1);
-    }
+static void colors_init(void) {
+  start_color();
+  use_default_colors();
+  if (COLORS >= 256) {
+    init_pair(PAIR_BAND_REST, 25, -1);     /* dark blue        */
+    init_pair(PAIR_BAND_RECOVERY, 27, -1); /* medium blue      */
+    init_pair(PAIR_BAND_RISING, 51, -1);   /* cyan             */
+    init_pair(PAIR_BAND_WAVE, 195, -1);    /* pale cyan-white  */
+    init_pair(PAIR_BAND_FRONT, 231, -1);   /* bright white     */
+    init_pair(PAIR_HUD, 226, -1);          /* bright yellow    */
+    init_pair(PAIR_HINT, 51, -1);          /* bright cyan      */
+  } else {
+    init_pair(PAIR_BAND_REST, COLOR_BLUE, -1);
+    init_pair(PAIR_BAND_RECOVERY, COLOR_BLUE, -1);
+    init_pair(PAIR_BAND_RISING, COLOR_CYAN, -1);
+    init_pair(PAIR_BAND_WAVE, COLOR_CYAN, -1);
+    init_pair(PAIR_BAND_FRONT, COLOR_WHITE, -1);
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
 /* ===================================================================== */
-/* §4  grid_state — the four 2-D fields + global instance                */
+/* §4  scene — the single owner of all simulation + render state         */
 /* ===================================================================== */
 /*
- * Four 2-D arrays in BSS, no malloc.  Two for the activator (u +
- * scratch), two for the inhibitor (v + scratch).  After each Euler
- * tick, the *_next scratches hold new values; we COPY them back
- * into the live arrays.  (Static 2-D arrays don't lend themselves
- * to a clean pointer-swap; the copy is O(N²) but trivial at our
- * grid size — same order as the step loop's neighbour reads.)
+ * Scene — the single owner of this demo's live state.
+ *
+ * Intent
+ *   Earlier versions kept scene state as flat file-scope globals.
+ *   This Scene struct groups the same fields together so the sim /
+ *   tuning / control split is enforced by the STRUCT LAYOUT, not just
+ *   by convention.  Helpers continue to reach the state through
+ *   `g_scene.<field>` so the inner-loop FitzHugh-Nagumo stencil math
+ *   stays free of pointer threading.
+ *
+ *   The two-species FN model needs four 2-D arrays: the activator V
+ *   ("voltage", the EXCITABLE variable) + scratch, and the inhibitor
+ *   W ("recovery") + scratch.  After each Euler tick the *_next
+ *   scratches hold the new values; we COPY them back into the live
+ *   arrays.
+ *
+ * Why copy instead of pointer-swap
+ *   Static 2-D arrays (`float arr[ROWS][COLS]`) cannot share an
+ *   address with a pointer-rotation, so a clean swap would require
+ *   heap allocation.  Per CLAUDE.md "no dynamic allocation after
+ *   init" we stick with BSS + memcpy; the O(N²) copy cost is the
+ *   same order as the neighbour-read loop so it's invisible.
+ *
+ * Locality (sim vs render)
+ *   Fields are GROUPED EXPLICITLY by subsystem:
+ *     - reaction / diffuse passes read it    → simulation
+ *     - paint_field / hud_paint_* reads it   → rendering
+ *     - both sides bound their loops by
+ *       g_scene.grid_active_rows / _cols             → shared geometry
+ *     - g_scene.simulation_paused gates the tick     → control state
+ *
+ *   Mis-classifying a field — e.g. letting a render helper bump
+ *   g_scene.substeps_per_frame — would couple visuals to physics and break
+ *   the engine-toggle invariant (same preset must evolve identically
+ *   regardless of how it's drawn).
+ *
+ * Why one big struct (not split across Scene + App + Field)
+ *   Every reaction-diffusion pass needs the whole field set.
+ *   Splitting would force pointer chains in the inner loop — the
+ *   loop already runs ~12 multiplies + 12 adds per cell and the
+ *   extra indirection would noticeably slow it.  Keeping one Scene
+ *   + one g_scene instance matches CLAUDE.md's "no dynamic
+ *   allocation after init": 4 × ROWS_MAX × COLS_MAX floats in BSS.
+ *
+ * Why these specific fields and no others
+ *   - g_scene.activator_voltage           V field (the EXCITABLE variable).
+ *   - g_scene.inhibitor_recovery          W field (the RECOVERY variable).
+ *   - g_scene.activator_voltage_next      V scratch (Euler-step buffer).
+ *   - g_scene.inhibitor_recovery_next     W scratch (Euler-step buffer).
+ *   - g_scene.grid_active_rows / _cols    active subregion bounds.
+ *   - g_scene.active_preset_index         reset-time IC choice; HUD reads name.
+ *   - g_scene.simulation_paused           gate for the per-frame step pipeline.
+ *   - g_scene.substeps_per_frame          Euler sub-steps per render frame
+ *                                   (visual speed knob; doesn't change
+ *                                   the per-step PDE stability bound).
+ *
+ * Things that DO NOT live here
+ *   - The 4 preset loaders + name table → file-scope constants
+ *   - Render-frame timing / FPS         → locals in main()
+ *   - Signal flags                      → file-scope volatile
+ *
+ * Reference [1] FitzHugh for the two-variable formulation that this
+ *   layout implements directly (V = membrane potential, W = recovery).
  */
+typedef struct {
+    /* ── Simulation state (read by reaction/diffuse passes) ────── */
+    float activator_voltage      [GRID_ROWS_MAX][GRID_COLS_MAX]; /* V  */
+    float inhibitor_recovery     [GRID_ROWS_MAX][GRID_COLS_MAX]; /* W  */
+    float activator_voltage_next [GRID_ROWS_MAX][GRID_COLS_MAX]; /* V' */
+    float inhibitor_recovery_next[GRID_ROWS_MAX][GRID_COLS_MAX]; /* W' */
 
-static float activator_voltage      [GRID_ROWS_MAX][GRID_COLS_MAX];
-static float inhibitor_recovery     [GRID_ROWS_MAX][GRID_COLS_MAX];
-static float activator_voltage_next [GRID_ROWS_MAX][GRID_COLS_MAX];
-static float inhibitor_recovery_next[GRID_ROWS_MAX][GRID_COLS_MAX];
+    /* ── Shared geometry (sim AND render) ──────────────────────── */
+    int grid_active_rows;
+    int grid_active_cols;
 
-/* Active grid dimensions (clamped to MAX in main() at startup
- * and on resize). */
-static int grid_active_rows = 0;
-static int grid_active_cols = 0;
+    /* ── Control state (gates the tick + drives HUD) ──────────── */
+    int  active_preset_index;
+    bool simulation_paused;
 
-/* Scene-level state.  Lives here next to the grid because every
- * physics function reads them. */
-static int   active_preset_index    = 0;
-static bool  simulation_paused      = false;
-static int   substeps_per_frame     = SUBSTEPS_PER_FRAME_DEFAULT;
+    /* ── Simulation tuning ───────────────────────────────────── */
+    int substeps_per_frame;
+} Scene;
+
+static Scene g_scene = {
+    .substeps_per_frame = SUBSTEPS_PER_FRAME_DEFAULT,
+};
 
 /* ===================================================================== */
 /* §5  neighbours — boundary-clamped index helpers (T6)                  */
@@ -933,24 +1023,16 @@ static int   substeps_per_frame     = SUBSTEPS_PER_FRAME_DEFAULT;
  * the boundary cell itself.  Effect: waves reflect at edges.
  */
 
-static inline int row_above_clamped(int row)
-{
-    return (row > 0) ? row - 1 : 0;
+static inline int row_above_clamped(int row) { return (row > 0) ? row - 1 : 0; }
+
+static inline int row_below_clamped(int row) {
+  return (row < g_scene.grid_active_rows - 1) ? row + 1 : g_scene.grid_active_rows - 1;
 }
 
-static inline int row_below_clamped(int row)
-{
-    return (row < grid_active_rows - 1) ? row + 1 : grid_active_rows - 1;
-}
+static inline int col_left_clamped(int col) { return (col > 0) ? col - 1 : 0; }
 
-static inline int col_left_clamped(int col)
-{
-    return (col > 0) ? col - 1 : 0;
-}
-
-static inline int col_right_clamped(int col)
-{
-    return (col < grid_active_cols - 1) ? col + 1 : grid_active_cols - 1;
+static inline int col_right_clamped(int col) {
+  return (col < g_scene.grid_active_cols - 1) ? col + 1 : g_scene.grid_active_cols - 1;
 }
 
 /* ===================================================================== */
@@ -967,7 +1049,7 @@ static inline int col_right_clamped(int col)
  * documentation.
  */
 
-#define LAPLACIAN_5POINT_CENTRE_WEIGHT  4.0f
+#define LAPLACIAN_5POINT_CENTRE_WEIGHT 4.0f
 
 /* ===================================================================== */
 /* §7  reaction_step — one Euler tick of the FN PDE                      */
@@ -984,52 +1066,108 @@ static inline int col_right_clamped(int col)
  * Then COPY scratches back to the live arrays.
  */
 
-static void reaction_step(void)
-{
-    for (int r = 0; r < grid_active_rows; r++) {
-        int r_above = row_above_clamped(r);
-        int r_below = row_below_clamped(r);
+/* Clamped neighbour indices for cell (r, c) under Neumann (zero-flux)
+ * boundary conditions: out-of-grid neighbour reads return the boundary
+ * cell itself.  Effect: waves REFLECT at edges rather than passing
+ * through or being absorbed.  Compare to reaction_diffusion's TOROIDAL
+ * wrap which makes the grid a torus. */
+typedef struct {
+    int row_above, row_below;
+    int col_left,  col_right;
+} ClampedNeighbours;
 
-        for (int c = 0; c < grid_active_cols; c++) {
-            int c_left  = col_left_clamped(c);
-            int c_right = col_right_clamped(c);
+static inline ClampedNeighbours clamped_neighbours_of(int r, int c) {
+    ClampedNeighbours n;
+    n.row_above = row_above_clamped(r);
+    n.row_below = row_below_clamped(r);
+    n.col_left  = col_left_clamped (c);
+    n.col_right = col_right_clamped(c);
+    return n;
+}
 
-            float u = activator_voltage [r][c];
-            float v = inhibitor_recovery[r][c];
+/* 5-point Laplacian stencil at cell (r, c):
+ *   ∇²u ≈ u_N + u_S + u_E + u_W − 4·u_C
+ * (LAPLACIAN_5POINT_CENTRE_WEIGHT is 4.0f.)  Anisotropic — the
+ * preferred 9-point form in reaction_diffusion.c would give the
+ * same spirals more symmetrically, but the 5-point is fine for
+ * the FN regime because gradients are gentle.  Refs [6] LeVeque §10. */
+static inline float laplacian_5point_at(const float field[GRID_ROWS_MAX][GRID_COLS_MAX],
+                                         int r, int c, ClampedNeighbours n) {
+    return field[n.row_above][c           ]
+         + field[n.row_below][c           ]
+         + field[r           ][n.col_left ]
+         + field[r           ][n.col_right]
+         - LAPLACIAN_5POINT_CENTRE_WEIGHT * field[r][c];
+}
 
-            /* 5-point Laplacian of u. */
-            float laplacian_activator =
-                  activator_voltage[r_above][c]
-                + activator_voltage[r_below][c]
-                + activator_voltage[r][c_left]
-                + activator_voltage[r][c_right]
-                - LAPLACIAN_5POINT_CENTRE_WEIGHT * u;
+/* FitzHugh-Nagumo activator equation [1] FitzHugh 1961:
+ *   du/dt = u − u³/3 − v + D·∇²u
+ * The cubic term u³/3 is what gives the system its excitable
+ * threshold; below it the activator decays, above it it RUNS AWAY
+ * until the inhibitor v catches up.  Refs [1] FitzHugh 1961. */
+static inline float fitzhugh_nagumo_du_dt(float u, float v, float laplacian_u) {
+    return u - (u * u * u) / 3.0f - v + ACTIVATOR_DIFFUSION * laplacian_u;
+}
 
-            /* Reaction terms. */
-            float d_activator_dt =
-                  u - (u * u * u) / 3.0f
-                - v
-                + ACTIVATOR_DIFFUSION * laplacian_activator;
+/* FitzHugh-Nagumo inhibitor equation:
+ *   dv/dt = ε · (u + a − b·v)
+ * The recovery variable that chases u with a slow ε timescale.
+ * Refs [1] FitzHugh 1961, [2] Nagumo et al. 1962. */
+static inline float fitzhugh_nagumo_dv_dt(float u, float v) {
+    return FN_TIMESCALE_RATIO * (u + FN_THRESHOLD_SHIFT
+                                   - FN_INHIBITOR_FEEDBACK * v);
+}
 
-            float d_inhibitor_dt =
-                FN_TIMESCALE_RATIO *
-                  (u + FN_THRESHOLD_SHIFT
-                     - FN_INHIBITOR_FEEDBACK * v);
+/* Forward-Euler integration step: value + Δt · derivative.  First-
+ * order accurate.  Stability bound D·Δt/(Δx)² ≤ 1/2 (heat eqn rule)
+ * is satisfied by EULER_DT in §1. */
+static inline float forward_euler_step(float value, float derivative) {
+    return value + EULER_DT * derivative;
+}
 
-            /* Forward Euler update. */
-            activator_voltage_next [r][c] = u + EULER_DT * d_activator_dt;
-            inhibitor_recovery_next[r][c] = v + EULER_DT * d_inhibitor_dt;
+/* Copy the *_next scratches back to the live U/V arrays.  No pointer
+ * swap because the arrays are STATIC 2-D (not pointers — see Scene
+ * struct doc for the "static + memcpy vs pointer-swap" rationale). */
+static inline void copy_scratches_to_live_fields(void) {
+    memcpy(g_scene.activator_voltage,    g_scene.activator_voltage_next,
+           sizeof g_scene.activator_voltage);
+    memcpy(g_scene.inhibitor_recovery,   g_scene.inhibitor_recovery_next,
+           sizeof g_scene.inhibitor_recovery);
+}
+
+/*
+ * reaction_step — one full FitzHugh-Nagumo Euler step.
+ *
+ * Pseudocode:
+ *   for each cell (r, c):
+ *     n        = clamped_neighbours_of(r, c)                ← Neumann BC
+ *     lap_u    = laplacian_5point_at(U, r, c, n)
+ *     du_dt    = fitzhugh_nagumo_du_dt(u, v, lap_u)
+ *     dv_dt    = fitzhugh_nagumo_dv_dt(u, v)
+ *     U_next[r, c] = forward_euler_step(u, du_dt)
+ *     V_next[r, c] = forward_euler_step(v, dv_dt)
+ *   copy_scratches_to_live_fields()
+ *
+ * Refs [1] FitzHugh 1961 (excitable dynamics); [6] LeVeque (Euler).
+ */
+static void reaction_step(void) {
+    for (int r = 0; r < g_scene.grid_active_rows; r++) {
+        for (int c = 0; c < g_scene.grid_active_cols; c++) {
+            ClampedNeighbours n = clamped_neighbours_of(r, c);
+            float u             = g_scene.activator_voltage  [r][c];
+            float v             = g_scene.inhibitor_recovery [r][c];
+
+            float lap_u         = laplacian_5point_at(g_scene.activator_voltage,
+                                                      r, c, n);
+            float du_dt         = fitzhugh_nagumo_du_dt(u, v, lap_u);
+            float dv_dt         = fitzhugh_nagumo_dv_dt(u, v);
+
+            g_scene.activator_voltage_next [r][c] = forward_euler_step(u, du_dt);
+            g_scene.inhibitor_recovery_next[r][c] = forward_euler_step(v, dv_dt);
         }
     }
 
-    /* Copy scratches back.  No pointer swap because the arrays are
-     * static 2-D (not pointers).  See §4 comment. */
-    memcpy(activator_voltage,
-           activator_voltage_next,
-           sizeof activator_voltage);
-    memcpy(inhibitor_recovery,
-           inhibitor_recovery_next,
-           sizeof inhibitor_recovery);
+    copy_scratches_to_live_fields();
 }
 
 /* ===================================================================== */
@@ -1041,14 +1179,13 @@ static void reaction_step(void)
  * happens after reset until an impulse or preset injects energy.
  */
 
-static void grid_reset_to_rest(void)
-{
-    for (int r = 0; r < grid_active_rows; r++) {
-        for (int c = 0; c < grid_active_cols; c++) {
-            activator_voltage [r][c] = ACTIVATOR_REST;
-            inhibitor_recovery[r][c] = INHIBITOR_REST;
-        }
+static void grid_reset_to_rest(void) {
+  for (int r = 0; r < g_scene.grid_active_rows; r++) {
+    for (int c = 0; c < g_scene.grid_active_cols; c++) {
+      g_scene.activator_voltage[r][c] = ACTIVATOR_REST;
+      g_scene.inhibitor_recovery[r][c] = INHIBITOR_REST;
     }
+  }
 }
 
 /* ===================================================================== */
@@ -1065,17 +1202,50 @@ static void grid_reset_to_rest(void)
  * trajectory.
  */
 
-static void inject_circular_impulse(int rc, int cc, int radius)
-{
-    int r_squared = radius * radius;
+/* Is cell (r, c) inside the active simulation grid? */
+static inline bool cell_in_active_grid(int r, int c) {
+    return r >= 0 && r < g_scene.grid_active_rows
+        && c >= 0 && c < g_scene.grid_active_cols;
+}
+
+/* Is cell (r, c) inside the disc of radius √radius_squared centred
+ * at (rc, cc)?  Uses squared distance — avoids the sqrt that
+ * |Δr| + |Δc| < r would only approximate. */
+static inline bool cell_inside_disc(int r, int c, int rc, int cc,
+                                     int radius_squared) {
+    int dr = r - rc;
+    int dc = c - cc;
+    return dr * dr + dc * dc <= radius_squared;
+}
+
+/* Fire one cell: set the activator to the suprathreshold kick value.
+ * The inhibitor v is intentionally LEFT AT REST so the cell starts
+ * its action-potential cycle from the rest point — the natural
+ * spontaneous-firing trajectory of the FN excitable medium. */
+static inline void fire_one_cell(int r, int c) {
+    g_scene.activator_voltage[r][c] = SUPRATHRESHOLD_KICK_VALUE;
+}
+
+/*
+ * inject_circular_impulse — drop a disc of suprathreshold activator.
+ *
+ * Pseudocode:
+ *   r² = radius²
+ *   for each cell (r, c) in the bounding square [rc±radius, cc±radius]:
+ *     if not cell_in_active_grid(r, c)            : skip (out of grid)
+ *     if not cell_inside_disc(r, c, rc, cc, r²)   : skip (out of disc)
+ *     fire_one_cell(r, c)
+ *
+ * The disc fires immediately and propagates outward as a ring — the
+ * canonical "ripple from a stone" demonstration of excitable media.
+ */
+static void inject_circular_impulse(int rc, int cc, int radius) {
+    int radius_squared = radius * radius;
     for (int r = rc - radius; r <= rc + radius; r++) {
-        if (r < 0 || r >= grid_active_rows) continue;
         for (int c = cc - radius; c <= cc + radius; c++) {
-            if (c < 0 || c >= grid_active_cols) continue;
-            int dr = r - rc;
-            int dc = c - cc;
-            if (dr * dr + dc * dc > r_squared) continue;
-            activator_voltage[r][c] = SUPRATHRESHOLD_KICK_VALUE;
+            if (!cell_in_active_grid (r, c))                          continue;
+            if (!cell_inside_disc    (r, c, rc, cc, radius_squared))  continue;
+            fire_one_cell(r, c);
         }
     }
 }
@@ -1084,9 +1254,31 @@ static void inject_circular_impulse(int rc, int cc, int radius)
 /* §10  presets — 4 scene loaders + table                                */
 /* ===================================================================== */
 
+/*
+ * Preset — one named initial-condition scene the user can flip to.
+ *
+ * Intent
+ *   Each preset is a SCENARIO that highlights a different aspect of
+ *   FN excitable-media dynamics: target rings (point-like trigger
+ *   produces concentric circles), double source (interfering targets),
+ *   spiral wave (the canonical excitable-media spiral), etc.  Pressing
+ *   a number key calls the preset's loader, which writes initial
+ *   activator / inhibitor values into the field.
+ *
+ * Why a function-pointer loader (not a parameter table)
+ *   Unlike Gray-Scott where presets differ in (F, k) NUMERIC
+ *   parameters, FN presets differ in INITIAL-CONDITION GEOMETRY
+ *   (ring vs spiral vs two sources).  A function pointer per preset
+ *   lets each loader write whatever spatial pattern it needs without
+ *   trying to encode "ring centre + radius + offset + ..." into a
+ *   shared parameter struct.
+ *
+ * References [4] Murray ch. 5-7 for spiral waves; [5] Tyson & Keener
+ *   1988 for wave-front / wave-back structure these presets exhibit.
+ */
 typedef struct {
-    const char *display_name;
-    void (*loader)(void);          /* writes initial conditions */
+    const char *display_name;        /* short HUD label                 */
+    void      (*loader)(void);       /* writes initial conditions       */
 } Preset;
 
 static void preset_target_rings(void);
@@ -1095,107 +1287,148 @@ static void preset_spiral_wave(void);
 static void preset_plane_wave(void);
 
 static const Preset preset_table[PRESET_COUNT] = {
-    { "TARGET RINGS  ", preset_target_rings  },
-    { "DOUBLE SOURCE ", preset_double_source },
-    { "SPIRAL WAVE   ", preset_spiral_wave   },
-    { "PLANE WAVE    ", preset_plane_wave    },
+    {"TARGET RINGS  ", preset_target_rings},
+    {"DOUBLE SOURCE ", preset_double_source},
+    {"SPIRAL WAVE   ", preset_spiral_wave},
+    {"PLANE WAVE    ", preset_plane_wave},
 };
 
 /* Single point source at the centre. */
-static void preset_target_rings(void)
-{
-    grid_reset_to_rest();
-    inject_circular_impulse(grid_active_rows / 2,
-                            grid_active_cols / 2,
-                            IMPULSE_RADIUS_CELLS);
+static void preset_target_rings(void) {
+  grid_reset_to_rest();
+  inject_circular_impulse(g_scene.grid_active_rows / 2, g_scene.grid_active_cols / 2,
+                          IMPULSE_RADIUS_CELLS);
 }
 
 /* Two sources at thirds.  Their wavefronts will meet in the
  * middle and annihilate (both refractory just behind their
  * leading edges). */
-static void preset_double_source(void)
-{
-    grid_reset_to_rest();
-    int row = grid_active_rows / 2;
-    inject_circular_impulse(row, grid_active_cols / 3,
-                            IMPULSE_RADIUS_CELLS);
-    inject_circular_impulse(row, grid_active_cols * 2 / 3,
-                            IMPULSE_RADIUS_CELLS);
+static void preset_double_source(void) {
+  grid_reset_to_rest();
+  int row = g_scene.grid_active_rows / 2;
+  inject_circular_impulse(row, g_scene.grid_active_cols / 3, IMPULSE_RADIUS_CELLS);
+  inject_circular_impulse(row, g_scene.grid_active_cols * 2 / 3, IMPULSE_RADIUS_CELLS);
 }
 
 /* Broken ring → rotating spiral (T7).  Place a full ring, then
  * erase the LEFT HALF.  The two free tips at top and bottom curl
  * back into the rest of the medium and form a stable rotor. */
-static void preset_spiral_wave(void)
-{
-    grid_reset_to_rest();
-    inject_circular_impulse(grid_active_rows / 2,
-                            grid_active_cols / 2,
-                            SPIRAL_PRIMER_RADIUS);
-    /* Erase the left half so the ring is broken. */
-    for (int r = 0; r < grid_active_rows; r++) {
-        for (int c = 0; c < grid_active_cols / 2; c++) {
-            if (activator_voltage[r][c] > ACTIVATOR_REST + 0.5f)
-                activator_voltage[r][c] = ACTIVATOR_REST;
-        }
+static void preset_spiral_wave(void) {
+  grid_reset_to_rest();
+  inject_circular_impulse(g_scene.grid_active_rows / 2, g_scene.grid_active_cols / 2,
+                          SPIRAL_PRIMER_RADIUS);
+  /* Erase the left half so the ring is broken. */
+  for (int r = 0; r < g_scene.grid_active_rows; r++) {
+    for (int c = 0; c < g_scene.grid_active_cols / 2; c++) {
+      if (g_scene.activator_voltage[r][c] > ACTIVATOR_REST + 0.5f)
+        g_scene.activator_voltage[r][c] = ACTIVATOR_REST;
     }
+  }
 }
 
 /* Two columns at the left edge fire — produces a flat wavefront
  * that sweeps across the grid. */
-static void preset_plane_wave(void)
-{
-    grid_reset_to_rest();
-    for (int r = 0; r < grid_active_rows; r++) {
-        activator_voltage[r][0] = SUPRATHRESHOLD_KICK_VALUE;
-        activator_voltage[r][1] = SUPRATHRESHOLD_KICK_VALUE;
-    }
+static void preset_plane_wave(void) {
+  grid_reset_to_rest();
+  for (int r = 0; r < g_scene.grid_active_rows; r++) {
+    g_scene.activator_voltage[r][0] = SUPRATHRESHOLD_KICK_VALUE;
+    g_scene.activator_voltage[r][1] = SUPRATHRESHOLD_KICK_VALUE;
+  }
 }
 
-static void preset_load(int preset_index)
-{
-    if (preset_index < 0 || preset_index >= PRESET_COUNT) preset_index = 0;
-    active_preset_index = preset_index;
-    preset_table[preset_index].loader();
+static void preset_load(int preset_index) {
+  if (preset_index < 0 || preset_index >= PRESET_COUNT)
+    preset_index = 0;
+  g_scene.active_preset_index = preset_index;
+  preset_table[preset_index].loader();
 }
 
 /* ===================================================================== */
 /* §11  glyph_picker — activator value → glyph + colour (T9)             */
 /* ===================================================================== */
 
+/*
+ * CellRender — one cell's drawing instruction, derived from membrane V.
+ *
+ * Intent
+ *   The activator V is the "voltage" of the excitable medium.  Each
+ *   cell's V is mapped to a glyph + colour pair + attribute combo
+ *   so the renderer paints rising fronts (excited) bright and
+ *   trailing recovery (refractory) dim.  Bundling all three outputs
+ *   in a struct keeps the per-cell loop linear:
+ *     `r = pick_cell(v); if (r.skip) continue;`
+ *
+ * Why a skip flag
+ *   Cells with V near rest are LEFT BLANK so the terminal background
+ *   shows through and wave fronts pop visually.  Skipping the
+ *   `mvaddch` for those cells also reduces newscr/curscr diff
+ *   bandwidth.
+ *
+ * Reference [7] Bourke for the V → glyph ramp design.
+ */
 typedef struct {
-    chtype glyph;
-    int    pair;
-    attr_t extra_attr;
-    bool   skip;
+    chtype glyph;        /* '.' ':' '*' '#' or similar ramp glyph    */
+    int    pair;         /* colour-pair index (theme ramp tier)      */
+    attr_t extra_attr;   /* A_BOLD for hottest tier                  */
+    bool   skip;         /* if true, leave the cell blank             */
 } CellRender;
 
-static CellRender pick_cell_render(float u_value)
-{
-    CellRender out = { 0 };
-    if (u_value < U_BAND_REST_HIGH) {
-        /* Band 0: resting.  Leave the cell as terminal background. */
-        out.skip = true;
-        return out;
-    }
-    if (u_value < U_BAND_RECOVERY_HIGH) {
-        out.glyph      = '.';
-        out.pair       = PAIR_BAND_RECOVERY;
-        out.extra_attr = A_NORMAL;
-    } else if (u_value < U_BAND_RISING_HIGH) {
-        out.glyph      = ':';
-        out.pair       = PAIR_BAND_RISING;
-        out.extra_attr = A_NORMAL;
-    } else if (u_value < U_BAND_WAVE_HIGH) {
-        out.glyph      = '+';
-        out.pair       = PAIR_BAND_WAVE;
-        out.extra_attr = A_NORMAL;
-    } else {
-        out.glyph      = '#';
-        out.pair       = PAIR_BAND_FRONT;
-        out.extra_attr = A_BOLD;
-    }
-    return out;
+/* Construct a "skip this cell" render (leave terminal background
+ * showing through).  Used for cells at rest — saves attron/mvaddch
+ * and lets the field's RESTING REGIONS read as the bg colour. */
+static inline CellRender cell_render_rest_tier(void) {
+    return (CellRender){ .skip = true };
+}
+
+/* Recovery tier: '.' on the cool-colour pair.  Cells just relaxed
+ * back from a firing event — they're below threshold but their
+ * inhibitor v is still high (refractory period). */
+static inline CellRender cell_render_recovery_tier(void) {
+    return (CellRender){ .glyph = '.', .pair = PAIR_BAND_RECOVERY,
+                         .extra_attr = A_NORMAL, .skip = false };
+}
+
+/* Rising tier: ':' on an intermediate-colour pair.  The activator is
+ * climbing above rest but hasn't reached the wavefront yet. */
+static inline CellRender cell_render_rising_tier(void) {
+    return (CellRender){ .glyph = ':', .pair = PAIR_BAND_RISING,
+                         .extra_attr = A_NORMAL, .skip = false };
+}
+
+/* Wave tier: '+' on a warm-colour pair.  The bulk of the propagating
+ * wave; activator near its plateau value. */
+static inline CellRender cell_render_wave_tier(void) {
+    return (CellRender){ .glyph = '+', .pair = PAIR_BAND_WAVE,
+                         .extra_attr = A_NORMAL, .skip = false };
+}
+
+/* Front tier: '#' bold.  The leading edge of the wave — activator at
+ * peak.  A_BOLD draws extra eye attention to where the action is. */
+static inline CellRender cell_render_front_tier(void) {
+    return (CellRender){ .glyph = '#', .pair = PAIR_BAND_FRONT,
+                         .extra_attr = A_BOLD,   .skip = false };
+}
+
+/*
+ * pick_cell_render — activator value → glyph + colour + attribute.
+ *
+ * Pseudocode (cascade-by-threshold):
+ *   if u < U_BAND_REST_HIGH      : rest tier      (skip — bg shows)
+ *   if u < U_BAND_RECOVERY_HIGH  : recovery tier  ('.')
+ *   if u < U_BAND_RISING_HIGH    : rising tier    (':')
+ *   if u < U_BAND_WAVE_HIGH      : wave tier      ('+')
+ *   else                         : front tier     ('#' bold)
+ *
+ * Each tier corresponds to one phase of the FN action-potential
+ * cycle.  Refs [1] FitzHugh 1961 fig. 2 for the phase-portrait
+ * trajectory these bands sample.
+ */
+static CellRender pick_cell_render(float u_value) {
+    if (u_value < U_BAND_REST_HIGH    ) return cell_render_rest_tier();
+    if (u_value < U_BAND_RECOVERY_HIGH) return cell_render_recovery_tier();
+    if (u_value < U_BAND_RISING_HIGH  ) return cell_render_rising_tier();
+    if (u_value < U_BAND_WAVE_HIGH    ) return cell_render_wave_tier();
+    return                                     cell_render_front_tier();
 }
 
 /* ===================================================================== */
@@ -1207,24 +1440,63 @@ static CellRender pick_cell_render(float u_value)
  * thrash AND erase cost in the main loop).  Reserves rows for HUD.
  */
 
-static void render_activator_field(int term_rows, int term_cols)
-{
+/* Compute the visible drawing rectangle for the activator field,
+ * given the terminal extent and the HUD-reserved rows.  Returns the
+ * top-row offset plus per-axis cell counts, all clipped to BOTH the
+ * terminal extent AND the active grid extent so the smaller of the
+ * two wins.
+ *
+ *   draw_top              first display row used by the field
+ *   *out_max_rows / cols  inclusive iteration bounds                */
+static inline void compute_activator_draw_rect(int term_rows, int term_cols,
+                                                int *out_draw_top,
+                                                int *out_max_rows,
+                                                int *out_max_cols) {
     int draw_top    = HUD_RESERVED_ROWS_TOP;
     int draw_bottom = term_rows - HUD_RESERVED_ROWS_BOTTOM;
+    int avail_rows  = draw_bottom - draw_top;
 
-    int max_rows = (grid_active_rows < draw_bottom - draw_top)
-                 ? grid_active_rows : draw_bottom - draw_top;
-    int max_cols = (grid_active_cols < term_cols)
-                 ? grid_active_cols : term_cols;
+    *out_draw_top = draw_top;
+    *out_max_rows = (g_scene.grid_active_rows < avail_rows)
+                  ?  g_scene.grid_active_rows
+                  :  avail_rows;
+    *out_max_cols = (g_scene.grid_active_cols < term_cols)
+                  ?  g_scene.grid_active_cols
+                  :  term_cols;
+}
+
+/* Paint ONE activator cell: pick the render tier, skip-or-draw.
+ * Caller supplies the (already-offset) display row + column. */
+static inline void paint_one_activator_cell(int display_row, int display_col,
+                                             float u_value) {
+    CellRender cr = pick_cell_render(u_value);
+    if (cr.skip) return;
+    attr_t a = COLOR_PAIR(cr.pair) | cr.extra_attr;
+    attron(a);
+    mvaddch(display_row, display_col, cr.glyph);
+    attroff(a);
+}
+
+/*
+ * render_activator_field — paint the activator U as a fading-front
+ * heatmap.  Resting cells are LEFT BLANK (background shows through).
+ *
+ * Pseudocode:
+ *   compute_activator_draw_rect(term, ..., &draw_top, &max_r, &max_c)
+ *   for each cell (r, c) in [0..max_r) × [0..max_c):
+ *     paint_one_activator_cell(draw_top + r, c, U[r][c])
+ *
+ * Refs [7] Bourke for the V → glyph ramp (here U, but same idea).
+ */
+static void render_activator_field(int term_rows, int term_cols) {
+    int draw_top, max_rows, max_cols;
+    compute_activator_draw_rect(term_rows, term_cols,
+                                 &draw_top, &max_rows, &max_cols);
 
     for (int r = 0; r < max_rows; r++) {
         for (int c = 0; c < max_cols; c++) {
-            CellRender cr = pick_cell_render(activator_voltage[r][c]);
-            if (cr.skip) continue;
-            attr_t a = COLOR_PAIR(cr.pair) | cr.extra_attr;
-            attron(a);
-            mvaddch(draw_top + r, c, cr.glyph);
-            attroff(a);
+            paint_one_activator_cell(draw_top + r, c,
+                                      g_scene.activator_voltage[r][c]);
         }
     }
 }
@@ -1237,31 +1509,33 @@ static void render_activator_field(int term_rows, int term_cols)
  * Keep the per-frame logic small and named.
  */
 
-static void scene_init(int term_rows, int term_cols)
-{
-    grid_active_rows = (term_rows < GRID_ROWS_MAX) ? term_rows : GRID_ROWS_MAX;
-    grid_active_cols = (term_cols < GRID_COLS_MAX) ? term_cols : GRID_COLS_MAX;
-    if (grid_active_rows < 4) grid_active_rows = 4;
-    if (grid_active_cols < 4) grid_active_cols = 4;
-    simulation_paused   = false;
-    substeps_per_frame  = SUBSTEPS_PER_FRAME_DEFAULT;
-    preset_load(0);
+static void scene_init(int term_rows, int term_cols) {
+  g_scene.grid_active_rows = (term_rows < GRID_ROWS_MAX) ? term_rows : GRID_ROWS_MAX;
+  g_scene.grid_active_cols = (term_cols < GRID_COLS_MAX) ? term_cols : GRID_COLS_MAX;
+  if (g_scene.grid_active_rows < 4)
+    g_scene.grid_active_rows = 4;
+  if (g_scene.grid_active_cols < 4)
+    g_scene.grid_active_cols = 4;
+  g_scene.simulation_paused = false;
+  g_scene.substeps_per_frame = SUBSTEPS_PER_FRAME_DEFAULT;
+  preset_load(0);
 }
 
-static void scene_resize(int term_rows, int term_cols)
-{
-    grid_active_rows = (term_rows < GRID_ROWS_MAX) ? term_rows : GRID_ROWS_MAX;
-    grid_active_cols = (term_cols < GRID_COLS_MAX) ? term_cols : GRID_COLS_MAX;
-    if (grid_active_rows < 4) grid_active_rows = 4;
-    if (grid_active_cols < 4) grid_active_cols = 4;
-    preset_load(active_preset_index);
+static void scene_resize(int term_rows, int term_cols) {
+  g_scene.grid_active_rows = (term_rows < GRID_ROWS_MAX) ? term_rows : GRID_ROWS_MAX;
+  g_scene.grid_active_cols = (term_cols < GRID_COLS_MAX) ? term_cols : GRID_COLS_MAX;
+  if (g_scene.grid_active_rows < 4)
+    g_scene.grid_active_rows = 4;
+  if (g_scene.grid_active_cols < 4)
+    g_scene.grid_active_cols = 4;
+  preset_load(g_scene.active_preset_index);
 }
 
-static void scene_tick(void)
-{
-    if (simulation_paused) return;
-    for (int s = 0; s < substeps_per_frame; s++)
-        reaction_step();
+static void scene_tick(void) {
+  if (g_scene.simulation_paused)
+    return;
+  for (int s = 0; s < g_scene.substeps_per_frame; s++)
+    reaction_step();
 }
 
 /* ===================================================================== */
@@ -1273,189 +1547,203 @@ static void scene_tick(void)
  *   row rows-1  — key hint (cyan + bold),  bottom
  */
 
-static void hud_paint_status(int term_cols, double measured_fps)
-{
-    char buf[200];
-    snprintf(buf, sizeof buf,
-             " FitzHugh-Nagumo  preset:%s  speed:%dx  "
-             "a=%.2f b=%.2f e=%.2f D=%.2f dt=%.3f  %5.1f fps  %s ",
-             preset_table[active_preset_index].display_name,
-             substeps_per_frame,
-             (double)FN_THRESHOLD_SHIFT,
-             (double)FN_INHIBITOR_FEEDBACK,
-             (double)FN_TIMESCALE_RATIO,
-             (double)ACTIVATOR_DIFFUSION,
-             (double)EULER_DT,
-             measured_fps,
-             simulation_paused ? "PAUSED " : "running");
-    int slen = (int)strlen(buf);
-    int sx   = term_cols - slen;
-    if (sx < 0) sx = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, sx, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+static void hud_paint_status(int term_cols, double measured_fps) {
+  char buf[200];
+  snprintf(buf, sizeof buf,
+           " FitzHugh-Nagumo  preset:%s  speed:%dx  "
+           "a=%.2f b=%.2f e=%.2f D=%.2f dt=%.3f  %5.1f fps  %s ",
+           preset_table[g_scene.active_preset_index].display_name, g_scene.substeps_per_frame,
+           (double)FN_THRESHOLD_SHIFT, (double)FN_INHIBITOR_FEEDBACK,
+           (double)FN_TIMESCALE_RATIO, (double)ACTIVATOR_DIFFUSION,
+           (double)EULER_DT, measured_fps,
+           g_scene.simulation_paused ? "PAUSED " : "running");
+  int slen = (int)strlen(buf);
+  int sx = term_cols - slen;
+  if (sx < 0)
+    sx = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, sx, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void hud_paint_hint(int term_rows)
-{
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(term_rows - 1, 0,
-             " q:quit  spc:impulse  p:pause  r:reset  "
-             "1:rings  2:double  3:spiral  4:plane  +/-:speed ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void hud_paint_hint(int term_rows) {
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(term_rows - 1, 0,
+           " q:quit  spc:impulse  p:pause  r:reset  "
+           "1:rings  2:double  3:spiral  4:plane  +/-:speed ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §15  screen — ncurses init / cleanup / present                        */
 /* ===================================================================== */
 
-typedef struct { int rows, cols; } Screen;
+/*
+ * Screen — terminal extent record.  ncurses owns the buffers; we
+ * keep only cell dimensions for HUD placement and field clipping.
+ *
+ * Render pipeline (one frame): erase → paint_field → hud_paint_*
+ *   → wnoutrefresh(stdscr) → doupdate().  Diff-only writes — no flicker.
+ *   See [8] Raymond §11.
+ */
+typedef struct {
+    int rows;   /* terminal height in cells (getmaxyx)             */
+    int cols;   /* terminal width  in cells (getmaxyx)             */
+} Screen;
 
-static void screen_init(Screen *screen)
-{
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    colors_init();
-    getmaxyx(stdscr, screen->rows, screen->cols);
+static void screen_init(Screen *screen) {
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  colors_init();
+  getmaxyx(stdscr, screen->rows, screen->cols);
 }
 
-static void screen_cleanup(void)
-{
-    endwin();
+static void screen_cleanup(void) { endwin(); }
+
+static void screen_resize(Screen *screen) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, screen->rows, screen->cols);
 }
 
-static void screen_resize(Screen *screen)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, screen->rows, screen->cols);
-}
-
-static void screen_present_frame(Screen *screen, double measured_fps)
-{
-    erase();
-    render_activator_field(screen->rows, screen->cols);
-    hud_paint_status(screen->cols, measured_fps);
-    hud_paint_hint  (screen->rows);
-    wnoutrefresh(stdscr);
-    doupdate();
+static void screen_present_frame(Screen *screen, double measured_fps) {
+  erase();
+  render_activator_field(screen->rows, screen->cols);
+  hud_paint_status(screen->cols, measured_fps);
+  hud_paint_hint(screen->rows);
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §16  app — main loop + signals + input                                */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_should_quit    = 0;
+static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
 
-static void on_signal(int sig)
-{
-    if (sig == SIGWINCH) g_resize_pending = 1;
-    else                 g_should_quit    = 1;
+static void on_signal(int sig) {
+  if (sig == SIGWINCH)
+    g_resize_pending = 1;
+  else
+    g_should_quit = 1;
 }
 
-static bool app_handle_key(int ch)
-{
-    switch (ch) {
-        case 'q': case 'Q': case 27:
-            return false;
+static bool app_handle_key(int ch) {
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-        case 'p': case 'P':
-            simulation_paused = !simulation_paused;
-            break;
+  case 'p':
+  case 'P':
+    g_scene.simulation_paused = !g_scene.simulation_paused;
+    break;
 
-        case ' ':
-            inject_circular_impulse(grid_active_rows / 2,
-                                    grid_active_cols / 2,
-                                    IMPULSE_RADIUS_CELLS);
-            break;
+  case ' ':
+    inject_circular_impulse(g_scene.grid_active_rows / 2, g_scene.grid_active_cols / 2,
+                            IMPULSE_RADIUS_CELLS);
+    break;
 
-        case 'r': case 'R':
-            grid_reset_to_rest();
-            break;
+  case 'r':
+  case 'R':
+    grid_reset_to_rest();
+    break;
 
-        case '1': preset_load(0); break;
-        case '2': preset_load(1); break;
-        case '3': preset_load(2); break;
-        case '4': preset_load(3); break;
+  case '1':
+    preset_load(0);
+    break;
+  case '2':
+    preset_load(1);
+    break;
+  case '3':
+    preset_load(2);
+    break;
+  case '4':
+    preset_load(3);
+    break;
 
-        case '+': case '=':
-            substeps_per_frame++;
-            if (substeps_per_frame > SUBSTEPS_PER_FRAME_MAX)
-                substeps_per_frame = SUBSTEPS_PER_FRAME_MAX;
-            break;
-        case '-':
-            substeps_per_frame--;
-            if (substeps_per_frame < SUBSTEPS_PER_FRAME_MIN)
-                substeps_per_frame = SUBSTEPS_PER_FRAME_MIN;
-            break;
+  case '+':
+  case '=':
+    g_scene.substeps_per_frame++;
+    if (g_scene.substeps_per_frame > SUBSTEPS_PER_FRAME_MAX)
+      g_scene.substeps_per_frame = SUBSTEPS_PER_FRAME_MAX;
+    break;
+  case '-':
+    g_scene.substeps_per_frame--;
+    if (g_scene.substeps_per_frame < SUBSTEPS_PER_FRAME_MIN)
+      g_scene.substeps_per_frame = SUBSTEPS_PER_FRAME_MIN;
+    break;
 
-        default: break;
-    }
-    return true;
+  default:
+    break;
+  }
+  return true;
 }
 
-int main(void)
-{
-    atexit(screen_cleanup);
-    signal(SIGINT,   on_signal);
-    signal(SIGTERM,  on_signal);
-    signal(SIGWINCH, on_signal);
+int main(void) {
+  atexit(screen_cleanup);
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGWINCH, on_signal);
 
-    Screen screen;
-    screen_init(&screen);
-    scene_init(screen.rows, screen.cols);
+  Screen screen;
+  screen_init(&screen);
+  scene_init(screen.rows, screen.cols);
 
-    int64_t prev_frame_ns       = clock_now_ns();
-    int64_t fps_window_ns       = 0;
-    int     frames_in_window    = 0;
-    double  measured_fps        = 0.0;
+  int64_t prev_frame_ns = clock_now_ns();
+  int64_t fps_window_ns = 0;
+  int frames_in_window = 0;
+  double measured_fps = 0.0;
 
-    while (!g_should_quit) {
-        int64_t frame_start_ns = clock_now_ns();
+  while (!g_should_quit) {
+    int64_t frame_start_ns = clock_now_ns();
 
-        /* ── input ── */
-        int ch = getch();
-        if (ch != ERR && !app_handle_key(ch)) {
-            g_should_quit = 1;
-            break;
-        }
-
-        /* ── resize ── */
-        if (g_resize_pending) {
-            g_resize_pending = 0;
-            screen_resize(&screen);
-            scene_resize(screen.rows, screen.cols);
-            prev_frame_ns = clock_now_ns();
-        }
-
-        /* ── dt + fps window ── */
-        int64_t dt_ns  = frame_start_ns - prev_frame_ns;
-        prev_frame_ns  = frame_start_ns;
-        if (dt_ns > 100 * NS_PER_MS) dt_ns = 100 * NS_PER_MS;
-
-        frames_in_window++;
-        fps_window_ns += dt_ns;
-        if (fps_window_ns >= 500 * NS_PER_MS) {
-            measured_fps = (double)frames_in_window
-                         / ((double)fps_window_ns / (double)NS_PER_SEC);
-            frames_in_window = 0;
-            fps_window_ns    = 0;
-        }
-
-        /* ── physics + render ── */
-        scene_tick();
-        screen_present_frame(&screen, measured_fps);
-
-        /* ── frame cap ── */
-        int64_t spent = clock_now_ns() - frame_start_ns;
-        if (spent < RENDER_TICK_NS) clock_sleep_ns(RENDER_TICK_NS - spent);
+    /* ── input ── */
+    int ch = getch();
+    if (ch != ERR && !app_handle_key(ch)) {
+      g_should_quit = 1;
+      break;
     }
 
-    return 0;
+    /* ── resize ── */
+    if (g_resize_pending) {
+      g_resize_pending = 0;
+      screen_resize(&screen);
+      scene_resize(screen.rows, screen.cols);
+      prev_frame_ns = clock_now_ns();
+    }
+
+    /* ── dt + fps window ── */
+    int64_t dt_ns = frame_start_ns - prev_frame_ns;
+    prev_frame_ns = frame_start_ns;
+    if (dt_ns > 100 * NS_PER_MS)
+      dt_ns = 100 * NS_PER_MS;
+
+    frames_in_window++;
+    fps_window_ns += dt_ns;
+    if (fps_window_ns >= 500 * NS_PER_MS) {
+      measured_fps = (double)frames_in_window /
+                     ((double)fps_window_ns / (double)NS_PER_SEC);
+      frames_in_window = 0;
+      fps_window_ns = 0;
+    }
+
+    /* ── physics + render ── */
+    scene_tick();
+    screen_present_frame(&screen, measured_fps);
+
+    /* ── frame cap ── */
+    int64_t spent = clock_now_ns() - frame_start_ns;
+    if (spent < RENDER_TICK_NS)
+      clock_sleep_ns(RENDER_TICK_NS - spent);
+  }
+
+  return 0;
 }

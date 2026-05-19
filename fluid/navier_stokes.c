@@ -107,27 +107,27 @@
  *
  * Variable-naming convention
  * ──────────────────────────
- *   velocity_x, velocity_y                u, v — current velocity
- *   velocity_x_prev, velocity_y_prev      scratch buffers
+ *   g_scene.velocity_x, g_scene.velocity_y                u, v — current velocity
+ *   g_scene.velocity_x_prev, g_scene.velocity_y_prev      scratch buffers
  *
  *   pressure_correction                   Φ from the Poisson solve
- *                                          (lives in velocity_x_prev
+ *                                          (lives in g_scene.velocity_x_prev
  *                                           during project_step)
  *   divergence_field                      ∇·u, RHS of Poisson
- *                                          (lives in velocity_y_prev)
+ *                                          (lives in g_scene.velocity_y_prev)
  *
- *   dye_density, dye_density_prev         ρ (passive scalar) + scratch
+ *   g_scene.dye_density, g_scene.dye_density_prev         ρ (passive scalar) + scratch
  *
  *   cell_index(i, j)                       1-D offset (macro)
  *   GRID_SIDE_INNER                        physics interior side (= N)
  *   GRID_SIDE_TOTAL                        N + 2 (interior + ghost halo)
  *
- *   active_dye_channel                     0 = blue, 1 = green, 2 = red
- *   viscosity_kinematic                    ν (the Navier-Stokes ν)
+ *   g_scene.active_dye_channel                     0 = blue, 1 = green, 2 = red
+ *   g_scene.viscosity_kinematic                    ν (the Navier-Stokes ν)
  *   diffusion_dye                          κ for the passive scalar
- *   simulation_paused                      run/pause toggle
- *   emitter_swirl_phase                    rotation phase ∈ ℝ
- *   dye_max_smoothed                       EMA-tracked renormaliser
+ *   g_scene.simulation_paused                      run/pause toggle
+ *   g_scene.emitter_swirl_phase                    rotation phase ∈ ℝ
+ *   g_scene.dye_max_smoothed                       EMA-tracked renormaliser
  *
  * Background you need
  * ───────────────────
@@ -205,15 +205,48 @@
  *
  * References
  * ──────────
- *   Stam, J. (1999), "Stable Fluids," SIGGRAPH '99 Proc. — the
- *     foundational paper.  Five pages, mostly diagrams.
- *   Stam, J. (2003), "Real-Time Fluid Dynamics for Games," GDC.  The
- *     classroom version, with a 100-line C reference implementation.
- *   Bridson, R. (2008), "Fluid Simulation for Computer Graphics" —
- *     standard textbook; chapters 1-4 cover everything in this file.
- *   Foster, N. & Metaxas, D. (1996), "Realistic Animation of
- *     Liquids."  Pre-Stam grid solver — useful historical contrast.
- *   https://en.wikipedia.org/wiki/Navier%E2%80%93Stokes_equations
+ *   ── Stable Fluids algorithm (the core method) ─────────────────────
+ *   [1] Stam, J. (1999), "Stable Fluids", SIGGRAPH '99 Proc., pp.
+ *       121-128 — THE foundational paper.  Five pages, mostly
+ *       diagrams.  Introduces the unconditionally-stable composition
+ *       of advection + diffusion + projection used by this file.
+ *   [2] Stam, J. (2003), "Real-Time Fluid Dynamics for Games", GDC —
+ *       the classroom version, includes a 100-line C reference
+ *       implementation that mirrors §advect / §diffuse / §project.
+ *
+ *   ── Underlying numerical methods ──────────────────────────────────
+ *   [3] Bridson, R. (2008), "Fluid Simulation for Computer Graphics",
+ *       CRC Press — standard textbook; chs. 1-4 cover everything in
+ *       this file (semi-Lagrangian advection, Gauss-Seidel diffusion,
+ *       Hodge-decomposition projection).
+ *   [4] Foster, N. & Metaxas, D. (1996), "Realistic Animation of
+ *       Liquids", GMIP 58 — pre-Stam grid solver with CFL-limited
+ *       explicit time-stepping; useful historical contrast.
+ *   [5] Saad, Y. (2003), "Iterative Methods for Sparse Linear
+ *       Systems", 2nd ed., SIAM — Gauss-Seidel convergence theory
+ *       behind our linear_solve in §diffuse / §project.
+ *
+ *   ── Physical theory ──────────────────────────────────────────────
+ *   [6] Batchelor, G. K. (1967), "An Introduction to Fluid Dynamics",
+ *       Cambridge UP — derivation of incompressible Navier-Stokes
+ *       and the Hodge decomposition that motivates the project step.
+ *
+ *   ── Comparison with the Lagrangian approach ──────────────────────
+ *   [7] Müller, M., Charypar, D. & Gross, M. (2003), "Particle-Based
+ *       Fluid Simulation for Interactive Applications" — the SPH
+ *       (particle) counterpart; project file fluid/fluid_sph.c.
+ *
+ *   ── Rendering / ncurses ──────────────────────────────────────────
+ *   [8] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the dye-density glyph ramp.
+ *   [9] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; init_pair,
+ *       use_default_colors, newscr/curscr diff pipeline.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [10] https://en.wikipedia.org/wiki/Navier%E2%80%93Stokes_equations
+ *  [11] https://en.wikipedia.org/wiki/Stable_fluids
  *
  * ─────────────────────────────────────────────────────────────────── */
 
@@ -299,10 +332,10 @@
  *     scalar (mirror):         ghost = +interior  (zero-gradient)
  *
  *   DYE VISUALISATION (T9):
- *     normalise:  d_norm[i,j] = dye_density[i,j] / dye_max_smoothed
+ *     normalise:  d_norm[i,j] = g_scene.dye_density[i,j] / g_scene.dye_max_smoothed
  *     glyph:      ramp = " .,+#" indexed by which threshold band
  *     colour:     palette[active_channel][shade_index]
- *     EMA:        dye_max_smoothed = 0.95·old + 0.05·frame_max
+ *     EMA:        g_scene.dye_max_smoothed = 0.95·old + 0.05·frame_max
  *                  prevents whole-field shade flicker as emitters pulse
  *
  * EDGE CASES TO WATCH
@@ -676,7 +709,7 @@
  * In real research codes you'd track multiple scalars (heat,
  * salinity, chemical species, smoke).  We track ONE field with
  * THREE COLOUR CHANNELS so the user can see it as blue / green /
- * red — a single bit in the active_dye_channel variable.
+ * red — a single bit in the g_scene.active_dye_channel variable.
  *
  * T8  WHY "STABLE FLUIDS" — UNCONDITIONAL STABILITY
  * ─────────────────────────────────────────────────
@@ -734,9 +767,9 @@
  *
  * NAÏVE APPROACH:  per-frame max:
  *
- *     frame_max = max(dye_density)
+ *     frame_max = max(g_scene.dye_density)
  *     for each cell:
- *       d_norm = dye_density[cell] / frame_max
+ *       d_norm = g_scene.dye_density[cell] / frame_max
  *       glyph  = ramp[band(d_norm)]
  *
  * FLICKER PROBLEM:  emitter pulses cause frame_max to swing 5-10×
@@ -751,7 +784,7 @@
  * max.  The renormaliser changes SLOWLY, so individual cells'
  * normalised values are stable frame-to-frame:
  *
- *     dye_max_smoothed = α · dye_max_smoothed_old + (1-α) · frame_max
+ *     g_scene.dye_max_smoothed = α · g_scene.dye_max_smoothed_old + (1-α) · frame_max
  *
  * with α ≈ 0.95.  The smoothed max FOLLOWS the true max with a
  * lag of ~20 frames.  Pulses get smeared out; sustained changes
@@ -799,105 +832,104 @@
 /* ===================================================================== */
 
 /* ── GRID SIZE ── */
-#define GRID_SIDE_INNER          80       /* "N" — physics interior side */
-#define GRID_SIDE_TOTAL          (GRID_SIDE_INNER + 2)
-#define GRID_TOTAL_CELLS         (GRID_SIDE_TOTAL * GRID_SIDE_TOTAL)
+#define GRID_SIDE_INNER 80 /* "N" — physics interior side */
+#define GRID_SIDE_TOTAL (GRID_SIDE_INNER + 2)
+#define GRID_TOTAL_CELLS (GRID_SIDE_TOTAL * GRID_SIDE_TOTAL)
 
 /* ── PHYSICS ── */
-#define DT_DEFAULT               0.05f       /* simulation time step    */
-#define DIFFUSION_DYE            0.0001f     /* passive-scalar diffusion */
-#define VISCOSITY_INITIAL        0.00001f    /* kinematic viscosity ν   */
-#define VISCOSITY_MIN            1e-7f
-#define VISCOSITY_MAX            0.1f
-#define VISCOSITY_FACTOR         2.0f        /* '+' / '-' multiplier    */
+#define DT_DEFAULT 0.05f           /* simulation time step    */
+#define DIFFUSION_DYE 0.0001f      /* passive-scalar diffusion */
+#define VISCOSITY_INITIAL 0.00001f /* kinematic viscosity ν   */
+#define VISCOSITY_MIN 1e-7f
+#define VISCOSITY_MAX 0.1f
+#define VISCOSITY_FACTOR 2.0f /* '+' / '-' multiplier    */
 
-#define GAUSS_SEIDEL_ITERATIONS  16          /* sweeps per linear solve */
+#define GAUSS_SEIDEL_ITERATIONS 16 /* sweeps per linear solve */
 
 /* Forces and dye scales applied inside add_source_at(). */
-#define INJECT_FORCE_SCALE       50.0f       /* arrows + emitters       */
-#define INJECT_DYE_SCALE         50.0f       /* dye keys + emitters     */
+#define INJECT_FORCE_SCALE 50.0f /* arrows + emitters       */
+#define INJECT_DYE_SCALE 50.0f   /* dye keys + emitters     */
 
 /* Auto-emitter parameters. */
-#define EMITTER_SWIRL_INCREMENT  0.04f       /* radians per tick        */
-#define EMITTER_FORCE_AMPLITUDE  1.5f
-#define EMITTER_DYE_AMPLITUDE    3.0f
+#define EMITTER_SWIRL_INCREMENT 0.04f /* radians per tick        */
+#define EMITTER_FORCE_AMPLITUDE 1.5f
+#define EMITTER_DYE_AMPLITUDE 3.0f
 
 /* Pre-warm so the first frame has visible dye. */
-#define PREWARM_TICK_COUNT       80
+#define PREWARM_TICK_COUNT 80
 
 /* ── BOUNDARY-CONDITION TAGS (T6) ── */
 enum {
-    BOUNDARY_SCALAR     = 0,    /* dye, pressure, divergence — mirror   */
-    BOUNDARY_VELOCITY_X = 1,    /* normal flips at L/R walls            */
-    BOUNDARY_VELOCITY_Y = 2,    /* normal flips at T/B walls            */
+  BOUNDARY_SCALAR = 0,     /* dye, pressure, divergence — mirror   */
+  BOUNDARY_VELOCITY_X = 1, /* normal flips at L/R walls            */
+  BOUNDARY_VELOCITY_Y = 2, /* normal flips at T/B walls            */
 };
 
 /* ── DYE CHANNELS ── */
 enum {
-    DYE_CHANNEL_BLUE  = 0,
-    DYE_CHANNEL_GREEN = 1,
-    DYE_CHANNEL_RED   = 2,
-    DYE_CHANNEL_COUNT,
+  DYE_CHANNEL_BLUE = 0,
+  DYE_CHANNEL_GREEN = 1,
+  DYE_CHANNEL_RED = 2,
+  DYE_CHANNEL_COUNT,
 };
 
-#define DYE_SHADE_COUNT          4   /* 4 brightness steps per channel  */
+#define DYE_SHADE_COUNT 4 /* 4 brightness steps per channel  */
 
 /* ── COLOUR PAIRS ── */
 enum {
-    PAIR_DYE_FIRST = 1,                      /* +0..+(3*4-1)            */
-    PAIR_HUD       = PAIR_DYE_FIRST + DYE_CHANNEL_COUNT * DYE_SHADE_COUNT,
-    PAIR_HINT,
+  PAIR_DYE_FIRST = 1, /* +0..+(3*4-1)            */
+  PAIR_HUD = PAIR_DYE_FIRST + DYE_CHANNEL_COUNT * DYE_SHADE_COUNT,
+  PAIR_HINT,
 };
 
 /* ── HUD ── */
-#define HUD_RESERVED_ROWS_TOP    1
+#define HUD_RESERVED_ROWS_TOP 1
 #define HUD_RESERVED_ROWS_BOTTOM 2
 
 /* ── RENDER FRAME RATE ── */
-#define RENDER_FPS               30
-#define NS_PER_SEC               1000000000LL
-#define NS_PER_MS                1000000LL
-#define RENDER_TICK_NS           (NS_PER_SEC / RENDER_FPS)
+#define RENDER_FPS 30
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define RENDER_TICK_NS (NS_PER_SEC / RENDER_FPS)
 
 /* ── GLYPH RAMP THRESHOLDS (in normalised dye space) ── */
-#define DENSITY_GLYPH_BLANK      0.02f
-#define DENSITY_GLYPH_LOW        0.20f
-#define DENSITY_GLYPH_MID        0.50f
-#define DENSITY_GLYPH_HIGH       0.80f
+#define DENSITY_GLYPH_BLANK 0.02f
+#define DENSITY_GLYPH_LOW 0.20f
+#define DENSITY_GLYPH_MID 0.50f
+#define DENSITY_GLYPH_HIGH 0.80f
 
 /* ── BILINEAR-INTERP CLAMP MARGIN ── */
-#define INTERP_CLAMP_MARGIN      0.5f
+#define INTERP_CLAMP_MARGIN 0.5f
 
 /* ── DYE NORMALISER (T9) ──
  * Per-frame max swings sharply with emitter pulses.  EMA smooths it. */
-#define DYE_MAX_EMA_OLD          0.95f
-#define DYE_MAX_EMA_NEW          0.05f
-#define DYE_MAX_FLOOR            0.001f
-#define DYE_MAX_INITIAL          1.0f
+#define DYE_MAX_EMA_OLD 0.95f
+#define DYE_MAX_EMA_NEW 0.05f
+#define DYE_MAX_FLOOR 0.001f
+#define DYE_MAX_INITIAL 1.0f
 
 /* ── INDEX MACRO ──
  * Flatten (i, j) into 1-D field offset.  Ghost halo:
  *   real:   i, j ∈ [1, N]
  *   ghost:  i, j ∈ {0, N+1}
  */
-#define cell_index(i, j)  ((i) + GRID_SIDE_TOTAL * (j))
+#define cell_index(i, j) ((i) + GRID_SIDE_TOTAL * (j))
 
 /* ===================================================================== */
 /* §2  clock — monotonic ns timer + sleep                                */
 /* ===================================================================== */
 
-static int64_t clock_now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
+static int64_t clock_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / NS_PER_SEC, ns % NS_PER_SEC };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / NS_PER_SEC, ns % NS_PER_SEC};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -907,10 +939,7 @@ static void clock_sleep_ns(int64_t ns)
  * Used only by the 'd' / SPACE key to drop a dye blob at a random
  * interior cell.  Physics is otherwise deterministic.
  */
-static int rand_inner_cell(void)
-{
-    return 1 + rand() % GRID_SIDE_INNER;
-}
+static int rand_inner_cell(void) { return 1 + rand() % GRID_SIDE_INNER; }
 
 /* ===================================================================== */
 /* §4  themes — bright dye palettes                                      */
@@ -926,27 +955,62 @@ static int rand_inner_cell(void)
  * Brightness" rule.
  */
 
+/*
+ * DyePalette — one of three dye channels (blue / red / green) as a
+ * 4-shade ramp.
+ *
+ * Intent
+ *   The Stable Fluids algorithm advects an arbitrary number of scalar
+ *   "dye" fields through the velocity field.  We carry THREE such
+ *   fields (one per channel) and visualise their independent
+ *   densities at each cell.  Each channel has its own monotone-
+ *   brightening 4-shade colour ramp:
+ *
+ *       shade 0  →  '.'  (dimmest, sparse dye)
+ *       shade 1  →  ':'  (light)
+ *       shade 2  →  '*'  (medium)
+ *       shade 3  →  '#'  (densest)
+ *
+ *   Three channels × four shades = 12 colour pairs; mixing channels
+ *   per cell would explode this to 4³ = 64.  We pick the DOMINANT
+ *   channel per cell instead — see GlyphChoice doc.
+ *
+ * Why two palette tracks (colour_256 + colour_8)
+ *   colour_256 holds 256-cube indices for COLORS >= 256.  colour_8 is
+ *   the fallback for low-COLORS terminals; on those we lose tier
+ *   resolution but keep channel identity.  Picking by terminal
+ *   capability at init keeps the renderer hot path identical.
+ *
+ * Brightness rule (CLAUDE.md "Theme Palette Brightness")
+ *   Every shade-0 colour is kept in the bright half of the cube
+ *   (≥ 30) so even sparsely-dyed cells stay visible against the
+ *   default-black background.  Cube 16-23 and gray 232-239 are
+ *   FORBIDDEN.
+ *
+ * Reference [9] Raymond's NCURSES HOWTO §6 — init_pair semantics
+ *   that turn these palette arrays into live colour pairs.
+ */
 typedef struct {
-    short       colour_256[DYE_SHADE_COUNT];
-    short       colour_8  [DYE_SHADE_COUNT];
-    const char *name;
+    short       colour_256[DYE_SHADE_COUNT];  /* preferred 256-cube indices */
+    short       colour_8  [DYE_SHADE_COUNT];  /* 8-colour fallback          */
+    const char *name;                         /* "BLUE" / "RED" / "GREEN"   */
 } DyePalette;
 
 static const DyePalette dye_palette_table[DYE_CHANNEL_COUNT] = {
     /* BLUE — mid blue → bright cyan.  All four shades clearly visible. */
-    { {  33,  39,  51,  87 },
-      { COLOR_BLUE,  COLOR_CYAN,  COLOR_CYAN,  COLOR_WHITE },
-      "blue"  },
+    {{33, 39, 51, 87},
+     {COLOR_BLUE, COLOR_CYAN, COLOR_CYAN, COLOR_WHITE},
+     "blue"},
 
     /* GREEN — green → bright lime. */
-    { {  34,  40,  82, 118 },
-      { COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_WHITE },
-      "green" },
+    {{34, 40, 82, 118},
+     {COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_WHITE},
+     "green"},
 
     /* RED — bright red → orange. */
-    { { 124, 160, 196, 208 },
-      { COLOR_RED,   COLOR_RED,   COLOR_YELLOW, COLOR_YELLOW },
-      "red"   },
+    {{124, 160, 196, 208},
+     {COLOR_RED, COLOR_RED, COLOR_YELLOW, COLOR_YELLOW},
+     "red"},
 };
 
 /* ===================================================================== */
@@ -956,73 +1020,133 @@ static const DyePalette dye_palette_table[DYE_CHANNEL_COUNT] = {
 static bool terminal_has_256_colours = false;
 
 /* The pair number for (channel, shade).  Depends on enum layout in §1. */
-static int dye_pair_id(int channel, int shade)
-{
-    return PAIR_DYE_FIRST + channel * DYE_SHADE_COUNT + shade;
+static int dye_pair_id(int channel, int shade) {
+  return PAIR_DYE_FIRST + channel * DYE_SHADE_COUNT + shade;
 }
 
-static void colors_init(void)
-{
-    start_color();
-    use_default_colors();
-    terminal_has_256_colours = (COLORS >= 256);
+static void colors_init(void) {
+  start_color();
+  use_default_colors();
+  terminal_has_256_colours = (COLORS >= 256);
 
-    for (int ch = 0; ch < DYE_CHANNEL_COUNT; ch++) {
-        const DyePalette *pal = &dye_palette_table[ch];
-        for (int sh = 0; sh < DYE_SHADE_COUNT; sh++) {
-            short fg = terminal_has_256_colours
-                     ? pal->colour_256[sh]
-                     : pal->colour_8[sh];
-            init_pair((short)dye_pair_id(ch, sh), fg, -1);
-        }
+  for (int ch = 0; ch < DYE_CHANNEL_COUNT; ch++) {
+    const DyePalette *pal = &dye_palette_table[ch];
+    for (int sh = 0; sh < DYE_SHADE_COUNT; sh++) {
+      short fg =
+          terminal_has_256_colours ? pal->colour_256[sh] : pal->colour_8[sh];
+      init_pair((short)dye_pair_id(ch, sh), fg, -1);
     }
+  }
 
-    if (terminal_has_256_colours) {
-        init_pair(PAIR_HUD,  226, -1);   /* bright yellow */
-        init_pair(PAIR_HINT,  51, -1);   /* bright cyan   */
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
+  if (terminal_has_256_colours) {
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
 /* ===================================================================== */
-/* §6  grid_state — fields, scratch buffers, all simulation state        */
+/* §6  scene — the single owner of all simulation + render state         */
 /* ===================================================================== */
 /*
- * Six 1-D arrays of GRID_TOTAL_CELLS floats hold the entire physics
- * state.  Indexed by cell_index(i, j).  The 1-cell ghost halo around
- * the physics interior is included in the array.
+ * Scene — the single owner of this demo's live state.
  *
- * Two SCRATCH FIELDS exist for each velocity component because Stam's
- * scheme reads the OLD field while writing into the NEW one.  After
- * each phase, role-swap (or memcpy if the same buffer is reused).
+ * Intent
+ *   Earlier versions kept the scene state as flat file-scope globals
+ *   (every grid pass needs all of it).  This Scene struct groups the
+ *   same fields together so the sim/render/control split is enforced
+ *   by the STRUCT LAYOUT, not just by convention.  Helpers continue
+ *   to reach the state through `g_scene.<field>` so the inner-loop
+ *   math stays free of pointer threading.
  *
- * Awkward but standard: "_prev" doesn't mean "previous tick".  It
- * means "the OTHER buffer in the current pair".  During project_step,
- * the same _prev buffers double as pressure_correction and
- * divergence_field.  See §11 comments.
+ *   Six 1-D arrays of GRID_TOTAL_CELLS floats hold the entire physics
+ *   state.  Indexed by cell_index(i, j).  The 1-cell ghost halo around
+ *   the physics interior is included in the array.
  *
- *   velocity_x, velocity_y                    u, v
- *   velocity_x_prev, velocity_y_prev          scratch
- *   dye_density, dye_density_prev             ρ + scratch
+ *   Two SCRATCH FIELDS exist for each velocity component because
+ *   Stam's scheme reads the OLD field while writing into the NEW one.
+ *   After each phase, role-swap (or memcpy if the same buffer is
+ *   reused).
  *
- * Plus the run-time tunables (viscosity, theme, paused, etc.) and
- * the EMA smoothed dye max (T9).
+ *   Awkward but standard: "_prev" doesn't mean "previous tick".  It
+ *   means "the OTHER buffer in the current pair".  During project_step,
+ *   the same _prev buffers double as pressure_correction and
+ *   divergence_field.  See §11 comments.
+ *
+ * Locality (sim vs render)
+ *   Fields are GROUPED EXPLICITLY so a reader can tell which
+ *   subsystem touches each one:
+ *     - advect / diffuse / project passes read it    → simulation
+ *     - paint_field / hud_paint_* / dye normalisation→ rendering
+ *     - g_scene.simulation_paused gates the tick + HUD tag   → control state
+ *
+ *   Mis-classifying a field — e.g. accidentally letting a render
+ *   helper write to g_scene.velocity_x — would couple visuals to physics and
+ *   break reproducibility.  The "engine-toggle invariant" version of
+ *   this warning is in the other fluid demos' Scene docs.
+ *
+ * Why one big struct (not split across Scene + App + Field)
+ *   Every grid pass needs the whole field set.  Splitting would force
+ *   pointer chains in the inner loop — the loop already runs ~15-20
+ *   floating-point ops per cell, and the extra indirection would
+ *   double that.  Keeping one Scene + one g_scene instance matches
+ *   CLAUDE.md's "no dynamic allocation after init": ~6 × GRID_TOTAL
+ *   floats in BSS, no malloc anywhere.
+ *
+ * Why these specific fields and no others
+ *   - g_scene.velocity_x / g_scene.velocity_y          u, v fields — the CORE state.
+ *   - g_scene.velocity_x_prev / g_scene.velocity_y_prev scratch; role-swapped each step
+ *                                       (also used as pressure /
+ *                                       divergence in project_step).
+ *   - g_scene.dye_density / g_scene.dye_density_prev   ρ field + its scratch.
+ *   - g_scene.viscosity_kinematic              ν; user-adjustable via +/-.
+ *   - g_scene.emitter_swirl_phase              advances each tick to spin the
+ *                                       emitter pattern.
+ *   - g_scene.simulation_paused                gate for the full step pipeline.
+ *   - g_scene.active_dye_channel               pure render — which channel
+ *                                       palette colours the dye field
+ *                                       (BLUE/RED/GREEN).  Must NOT
+ *                                       touch any sim state.
+ *   - g_scene.dye_max_smoothed                 EMA of max dye density used to
+ *                                       normalise the colour ramp;
+ *                                       pure visualisation.
+ *
+ * Things that DO NOT live here
+ *   - The 3 dye palettes / glyph ramp        → file-scope constants
+ *   - Render-frame timing / FPS              → locals in main()
+ *   - Signal flags (SIGINT, SIGWINCH)        → file-scope volatile
+ *
+ * Reference [9] Raymond NCURSES HOWTO on the scene-paint pipeline
+ *   that the render fields below feed into.
  */
+typedef struct {
+    /* ── Simulation state (read by advect / diffuse / project) ───── */
+    float velocity_x       [GRID_TOTAL_CELLS];  /* u                  */
+    float velocity_y       [GRID_TOTAL_CELLS];  /* v                  */
+    float velocity_x_prev  [GRID_TOTAL_CELLS];  /* u scratch / press  */
+    float velocity_y_prev  [GRID_TOTAL_CELLS];  /* v scratch / diverg */
+    float dye_density      [GRID_TOTAL_CELLS];  /* ρ                  */
+    float dye_density_prev [GRID_TOTAL_CELLS];  /* ρ scratch          */
 
-static float velocity_x       [GRID_TOTAL_CELLS];
-static float velocity_y       [GRID_TOTAL_CELLS];
-static float velocity_x_prev  [GRID_TOTAL_CELLS];
-static float velocity_y_prev  [GRID_TOTAL_CELLS];
-static float dye_density      [GRID_TOTAL_CELLS];
-static float dye_density_prev [GRID_TOTAL_CELLS];
+    /* ── Simulation tuning (user-adjustable) ─────────────────────── */
+    float viscosity_kinematic;        /* ν, viscosity                 */
+    float emitter_swirl_phase;        /* spins the inflow pattern     */
 
-static float viscosity_kinematic  = VISCOSITY_INITIAL;
-static int   active_dye_channel   = DYE_CHANNEL_BLUE;
-static bool  simulation_paused    = false;
-static float emitter_swirl_phase  = 0.0f;
-static float dye_max_smoothed     = DYE_MAX_INITIAL;   /* T9 — EMA */
+    /* ── Control state ──────────────────────────────────────────── */
+    bool  simulation_paused;          /* gate for step pipeline       */
+
+    /* ── Pure render state (must not touch sim fields) ──────────── */
+    int   active_dye_channel;         /* BLUE / RED / GREEN palette   */
+    float dye_max_smoothed;           /* EMA for ramp normalisation   */
+} Scene;
+
+static Scene g_scene = {
+    .viscosity_kinematic = VISCOSITY_INITIAL,
+    .active_dye_channel  = DYE_CHANNEL_BLUE,
+    .dye_max_smoothed    = DYE_MAX_INITIAL,
+};
 
 /* ===================================================================== */
 /* §7  boundary_apply — fill the 1-cell ghost halo                       */
@@ -1040,39 +1164,78 @@ static float dye_max_smoothed     = DYE_MAX_INITIAL;   /* T9 — EMA */
  *
  * Corners get the average of the two adjacent edge ghost cells.
  */
-static void boundary_apply(int boundary_kind, float *field)
-{
-    int N = GRID_SIDE_INNER;
+/* Pick the right ghost-cell value for one wall axis:
+ *   - SCALAR  / mirroring axis : copy the inner value verbatim
+ *                                 (Neumann zero-flux BC).
+ *   - NO-SLIP axis             : negate the inner value so the
+ *                                 ghost+inner midpoint averages to 0
+ *                                 (Dirichlet zero-velocity BC).
+ * Caller passes `is_normal_velocity` true only when (axis_kind) matches
+ * the wall's NORMAL component (VELOCITY_X at L/R, VELOCITY_Y at T/B). */
+static inline float ghost_value_for_wall(float inner, bool is_normal_velocity) {
+    return is_normal_velocity ? -inner : inner;
+}
 
-    /* Left + right walls. */
+/* Left and right walls: fill columns 0 and N+1 from columns 1 and N.
+ * Negate when this is the normal-velocity field (VELOCITY_X), so the
+ * no-slip Dirichlet condition u_wall = 0 holds in the limit. */
+static inline void fill_left_right_wall_ghosts(int boundary_kind,
+                                                float *field, int N) {
+    bool is_normal = (boundary_kind == BOUNDARY_VELOCITY_X);
     for (int j = 1; j <= N; j++) {
-        float left_inner  = field[cell_index(1, j)];
-        float right_inner = field[cell_index(N, j)];
-        field[cell_index(0,     j)] =
-            (boundary_kind == BOUNDARY_VELOCITY_X) ? -left_inner  : left_inner;
-        field[cell_index(N + 1, j)] =
-            (boundary_kind == BOUNDARY_VELOCITY_X) ? -right_inner : right_inner;
+        float left_inner  = field[cell_index(1,     j)];
+        float right_inner = field[cell_index(N,     j)];
+        field[cell_index(0,     j)] = ghost_value_for_wall(left_inner,  is_normal);
+        field[cell_index(N + 1, j)] = ghost_value_for_wall(right_inner, is_normal);
     }
+}
 
-    /* Top + bottom walls. */
+/* Top and bottom walls: fill rows 0 and N+1 from rows 1 and N.
+ * Negate when this is the normal-velocity field (VELOCITY_Y). */
+static inline void fill_top_bottom_wall_ghosts(int boundary_kind,
+                                                float *field, int N) {
+    bool is_normal = (boundary_kind == BOUNDARY_VELOCITY_Y);
     for (int i = 1; i <= N; i++) {
-        float top_inner    = field[cell_index(i, 1)];
-        float bottom_inner = field[cell_index(i, N)];
-        field[cell_index(i, 0    )] =
-            (boundary_kind == BOUNDARY_VELOCITY_Y) ? -top_inner    : top_inner;
-        field[cell_index(i, N + 1)] =
-            (boundary_kind == BOUNDARY_VELOCITY_Y) ? -bottom_inner : bottom_inner;
+        float top_inner    = field[cell_index(i, 1    )];
+        float bottom_inner = field[cell_index(i, N    )];
+        field[cell_index(i, 0    )] = ghost_value_for_wall(top_inner,    is_normal);
+        field[cell_index(i, N + 1)] = ghost_value_for_wall(bottom_inner, is_normal);
     }
+}
 
-    /* Corners — average of the two adjacent edge ghosts. */
-    field[cell_index(0,     0)] =
-        0.5f * (field[cell_index(1,     0)] + field[cell_index(0,     1)]);
-    field[cell_index(0,     N + 1)] =
-        0.5f * (field[cell_index(1,     N + 1)] + field[cell_index(0,     N)]);
-    field[cell_index(N + 1, 0)] =
-        0.5f * (field[cell_index(N,     0)] + field[cell_index(N + 1, 1)]);
-    field[cell_index(N + 1, N + 1)] =
-        0.5f * (field[cell_index(N,     N + 1)] + field[cell_index(N + 1, N)]);
+/* Average the two adjacent edge ghosts to fill each of the four
+ * corner ghost cells.  Corners are reached by both the L/R loop and
+ * the T/B loop; the average is the simplest consistent reconciliation. */
+static inline void fill_corner_ghosts_by_averaging(float *field, int N) {
+    field[cell_index(0,     0    )] = 0.5f * (field[cell_index(1,     0    )]
+                                           +  field[cell_index(0,     1    )]);
+    field[cell_index(0,     N + 1)] = 0.5f * (field[cell_index(1,     N + 1)]
+                                           +  field[cell_index(0,     N    )]);
+    field[cell_index(N + 1, 0    )] = 0.5f * (field[cell_index(N,     0    )]
+                                           +  field[cell_index(N + 1, 1    )]);
+    field[cell_index(N + 1, N + 1)] = 0.5f * (field[cell_index(N,     N + 1)]
+                                           +  field[cell_index(N + 1, N    )]);
+}
+
+/*
+ * boundary_apply — fill the 1-cell ghost halo so neighbour reads at
+ * interior cells automatically satisfy the desired wall condition.
+ *
+ * Pseudocode:
+ *   fill_left_right_wall_ghosts(kind, field, N)
+ *   fill_top_bottom_wall_ghosts(kind, field, N)
+ *   fill_corner_ghosts_by_averaging(field, N)
+ *
+ * boundary_kind:
+ *   BOUNDARY_SCALAR     → mirror everywhere (Neumann zero-flux)
+ *   BOUNDARY_VELOCITY_X → flip sign on L/R, mirror T/B   (no-slip in u)
+ *   BOUNDARY_VELOCITY_Y → flip sign on T/B, mirror L/R   (no-slip in v)
+ */
+static void boundary_apply(int boundary_kind, float *field) {
+    int N = GRID_SIDE_INNER;
+    fill_left_right_wall_ghosts(boundary_kind, field, N);
+    fill_top_bottom_wall_ghosts(boundary_kind, field, N);
+    fill_corner_ghosts_by_averaging(field, N);
 }
 
 /* ===================================================================== */
@@ -1089,24 +1252,21 @@ static void boundary_apply(int boundary_kind, float *field)
  * edges remain valid.  Convergence is geometric — residual halves
  * roughly per sweep on a 5-point stencil.
  */
-static void gauss_seidel_solve(int boundary_kind,
-                               float *x, const float *b,
-                               float a, float c)
-{
-    float inv_c = 1.0f / c;
-    int N = GRID_SIDE_INNER;
-    for (int sweep = 0; sweep < GAUSS_SEIDEL_ITERATIONS; sweep++) {
-        for (int j = 1; j <= N; j++) {
-            for (int i = 1; i <= N; i++) {
-                float neighbour_sum =
-                    x[cell_index(i - 1, j)] + x[cell_index(i + 1, j)] +
-                    x[cell_index(i, j - 1)] + x[cell_index(i, j + 1)];
-                x[cell_index(i, j)] =
-                    (b[cell_index(i, j)] + a * neighbour_sum) * inv_c;
-            }
-        }
-        boundary_apply(boundary_kind, x);
+static void gauss_seidel_solve(int boundary_kind, float *x, const float *b,
+                               float a, float c) {
+  float inv_c = 1.0f / c;
+  int N = GRID_SIDE_INNER;
+  for (int sweep = 0; sweep < GAUSS_SEIDEL_ITERATIONS; sweep++) {
+    for (int j = 1; j <= N; j++) {
+      for (int i = 1; i <= N; i++) {
+        float neighbour_sum = x[cell_index(i - 1, j)] +
+                              x[cell_index(i + 1, j)] +
+                              x[cell_index(i, j - 1)] + x[cell_index(i, j + 1)];
+        x[cell_index(i, j)] = (b[cell_index(i, j)] + a * neighbour_sum) * inv_c;
+      }
     }
+    boundary_apply(boundary_kind, x);
+  }
 }
 
 /* ===================================================================== */
@@ -1123,70 +1283,95 @@ static void gauss_seidel_solve(int boundary_kind,
  * pressure work, so the iterate starts as garbage otherwise.  We
  * memcpy the old field into the iterate before kicking off GS.
  */
-static void diffuse(int boundary_kind, float *field_new,
-                    const float *field_old,
-                    float diffusion_coefficient, float dt)
-{
-    float a = dt * diffusion_coefficient
-            * (float)(GRID_SIDE_INNER * GRID_SIDE_INNER);
+static void diffuse(int boundary_kind, float *field_new, const float *field_old,
+                    float diffusion_coefficient, float dt) {
+  float a =
+      dt * diffusion_coefficient * (float)(GRID_SIDE_INNER * GRID_SIDE_INNER);
 
-    memcpy(field_new, field_old, sizeof(float) * GRID_TOTAL_CELLS);
-    gauss_seidel_solve(boundary_kind, field_new, field_old, a, 1.0f + 4.0f * a);
+  memcpy(field_new, field_old, sizeof(float) * GRID_TOTAL_CELLS);
+  gauss_seidel_solve(boundary_kind, field_new, field_old, a, 1.0f + 4.0f * a);
 }
 
 /* ===================================================================== */
 /* §10  advect — semi-Lagrangian back-trace + bilinear lerp              */
 /* ===================================================================== */
+
 /*
- * For each cell (i, j):
- *   1. Trace BACKWARD by dt · N · velocity:
- *        x_back = i - dt · N · vx[i, j]
- *        y_back = j - dt · N · vy[i, j]
- *   2. Clamp (x_back, y_back) to [0.5, N + 0.5] so we stay in-grid.
- *   3. Bilinear-interp the OLD field at (x_back, y_back).
- *   4. Store into the NEW field at (i, j).
- *
- * Bilinear lerp is unconditionally stable: output is a weighted
- * average of four corner values, hence between min and max of those
- * corners.  Values can shrink, never explode.
+ * DeparturePoint — where in the OLD field did the fluid currently at
+ * (i, j) come from?  Stam's semi-Lagrangian step "looks backward"
+ * along the velocity: a fluid parcel sitting at (i, j) at time t
+ * was at (i - dt·u, j - dt·v) at time t-dt.  Sampling the old field
+ * there and copying the value forward is the entire idea behind
+ * unconditional stability — no values are CREATED, only relocated.
+ * Reference [1] Stam §3.
  */
-static void advect(int boundary_kind,
-                   float *new_field, const float *old_field,
-                   const float *vx, const float *vy, float dt)
-{
+typedef struct { float x; float y; } DeparturePoint;
+
+/* Back-trace one cell's velocity by dt cells (in cell units, not
+ * world units — dt_cells = dt·N already incorporates the grid scaling). */
+static inline DeparturePoint trace_velocity_backward(int i, int j,
+                                                    const float *vx,
+                                                    const float *vy,
+                                                    float dt_cells) {
+    DeparturePoint dp;
+    dp.x = (float)i - dt_cells * vx[cell_index(i, j)];
+    dp.y = (float)j - dt_cells * vy[cell_index(i, j)];
+    return dp;
+}
+
+/* Clamp the departure point into [INTERP_CLAMP_MARGIN, N + margin]
+ * so the four-corner bilinear stencil at (i0..i1, j0..j1) never
+ * reaches outside the allocated grid.  Without this, fast-moving
+ * fluid would back-trace off the edge and segfault on bilinear_sample. */
+static inline void clamp_departure_to_interp_bounds(DeparturePoint *dp, int N) {
+    float lo = INTERP_CLAMP_MARGIN;
+    float hi = (float)N + INTERP_CLAMP_MARGIN;
+    if (dp->x < lo) dp->x = lo;
+    if (dp->x > hi) dp->x = hi;
+    if (dp->y < lo) dp->y = lo;
+    if (dp->y > hi) dp->y = hi;
+}
+
+/* Bilinear interpolation at the real-valued sample point (x, y):
+ *   sample = s0·(t0·NW + t1·SW) + s1·(t0·NE + t1·SE)
+ * where (s0, s1) and (t0, t1) are the (1-α, α) fractional weights in
+ * x and y respectively.  Output is a weighted average of the FOUR
+ * surrounding corner values, hence always between their min and max
+ * — values can shrink but NEVER GROW.  This is what makes Stam's
+ * scheme unconditionally stable (no CFL constraint).  [3] Bridson §3. */
+static inline float bilinear_sample(const float *field, float x, float y) {
+    int   i0 = (int)x;
+    int   j0 = (int)y;
+    int   i1 = i0 + 1;
+    int   j1 = j0 + 1;
+    float s1 = x - (float)i0,  s0 = 1.0f - s1;
+    float t1 = y - (float)j0,  t0 = 1.0f - t1;
+    return s0 * (t0 * field[cell_index(i0, j0)]
+              +  t1 * field[cell_index(i0, j1)])
+         + s1 * (t0 * field[cell_index(i1, j0)]
+              +  t1 * field[cell_index(i1, j1)]);
+}
+
+/*
+ * advect — semi-Lagrangian advection [1] Stam 1999 §3.
+ *
+ * Pseudocode:
+ *   for each interior cell (i, j):
+ *     dp     = trace_velocity_backward(i, j, v, dt)
+ *              clamp_departure_to_interp_bounds(&dp, N)
+ *     new[i,j] = bilinear_sample(old, dp.x, dp.y)
+ *   apply boundary conditions to the new field
+ */
+static void advect(int boundary_kind, float *new_field, const float *old_field,
+                   const float *vx, const float *vy, float dt) {
     int   N        = GRID_SIDE_INNER;
     float dt_cells = dt * (float)N;
 
     for (int j = 1; j <= N; j++) {
         for (int i = 1; i <= N; i++) {
-
-            /* 1. Backward trace. */
-            float x_back = (float)i - dt_cells * vx[cell_index(i, j)];
-            float y_back = (float)j - dt_cells * vy[cell_index(i, j)];
-
-            /* 2. Clamp. */
-            float lo = INTERP_CLAMP_MARGIN;
-            float hi = (float)N + INTERP_CLAMP_MARGIN;
-            if (x_back < lo) x_back = lo;
-            if (x_back > hi) x_back = hi;
-            if (y_back < lo) y_back = lo;
-            if (y_back > hi) y_back = hi;
-
-            /* 3. Bilinear interp at (x_back, y_back). */
-            int   i0 = (int)x_back;
-            int   j0 = (int)y_back;
-            int   i1 = i0 + 1;
-            int   j1 = j0 + 1;
-            float s1 = x_back - (float)i0;
-            float s0 = 1.0f - s1;
-            float t1 = y_back - (float)j0;
-            float t0 = 1.0f - t1;
-
-            new_field[cell_index(i, j)] =
-                  s0 * (t0 * old_field[cell_index(i0, j0)]
-                      + t1 * old_field[cell_index(i0, j1)])
-                + s1 * (t0 * old_field[cell_index(i1, j0)]
-                      + t1 * old_field[cell_index(i1, j1)]);
+            DeparturePoint dp = trace_velocity_backward(i, j, vx, vy, dt_cells);
+            clamp_departure_to_interp_bounds(&dp, N);
+            new_field[cell_index(i, j)] = bilinear_sample(old_field, dp.x, dp.y);
         }
     }
 
@@ -1219,42 +1404,113 @@ static void advect(int boundary_kind,
  *
  * After phase 3, ∇·u ≈ 0 — incompressibility enforced.
  */
-static void project(float *vx, float *vy,
-                    float *pressure_correction,
-                    float *divergence_field)
-{
+/* Compute the discrete divergence ∇·u of the velocity field into
+ * `divergence_field` using central differences:
+ *
+ *   ∇·u ≈ ½·h · ( (vx[i+1, j] − vx[i−1, j]) + (vy[i, j+1] − vy[i, j−1]) )
+ *
+ * The −½·h scaling (rather than +½·h) folds the sign needed for the
+ * Poisson equation ∇²p = ∇·u into the divergence field itself, so the
+ * Gauss-Seidel step that solves it doesn't need a separate sign flip.
+ * See [1] Stam 1999 §3.5 and [3] Bridson §4.4. */
+static inline void compute_divergence_field(const float *vx, const float *vy,
+                                            float *divergence_field) {
     int   N = GRID_SIDE_INNER;
     float h = 1.0f / (float)N;
-
-    /* Phase 1: divergence + zero pressure. */
     for (int j = 1; j <= N; j++) {
         for (int i = 1; i <= N; i++) {
-            divergence_field[cell_index(i, j)] =
-                -0.5f * h *
-                ( vx[cell_index(i + 1, j)] - vx[cell_index(i - 1, j)]
-                + vy[cell_index(i, j + 1)] - vy[cell_index(i, j - 1)] );
-            pressure_correction[cell_index(i, j)] = 0.0f;
+            divergence_field[cell_index(i, j)] = -0.5f * h *
+                (vx[cell_index(i + 1, j)] - vx[cell_index(i - 1, j)] +
+                 vy[cell_index(i, j + 1)] - vy[cell_index(i, j - 1)]);
         }
     }
-    boundary_apply(BOUNDARY_SCALAR, divergence_field);
-    boundary_apply(BOUNDARY_SCALAR, pressure_correction);
+}
 
-    /* Phase 2: solve ∇²p = div. */
-    gauss_seidel_solve(BOUNDARY_SCALAR, pressure_correction,
-                       divergence_field, 1.0f, 4.0f);
+/* Zero the pressure-correction field.  Gauss-Seidel iterates AGAINST
+ * the existing values, so this is the standard "warm-start with zero"
+ * — gives a clean convergence from a known initial residual. */
+static inline void zero_pressure_field(float *pressure_correction) {
+    int N = GRID_SIDE_INNER;
+    for (int j = 1; j <= N; j++)
+        for (int i = 1; i <= N; i++)
+            pressure_correction[cell_index(i, j)] = 0.0f;
+}
 
-    /* Phase 3: subtract gradient of pressure_correction from velocity. */
+/* Solve the Poisson equation ∇²p = ∇·u for the pressure correction p,
+ * via the generic Gauss-Seidel iterator (§8).  Coefficients a=1, c=4
+ * are the 2-D 5-point Laplacian stencil:
+ *
+ *   p[i, j] = (div[i, j] + p[i±1, j] + p[i, j±1]) / 4
+ *
+ * Converges in O(N) iterations for our grid size; warmer iteration
+ * counts produce smoother pressure fields at the cost of one frame's
+ * accuracy.  Ref [5] Saad §4.1 on Gauss-Seidel convergence. */
+static inline void solve_pressure_poisson(float *pressure_correction,
+                                          const float *divergence_field) {
+    gauss_seidel_solve(BOUNDARY_SCALAR, pressure_correction, divergence_field,
+                       1.0f, 4.0f);
+}
+
+/* Subtract ∇p from the velocity field, making it divergence-free:
+ *
+ *   u_new = u − ∇p
+ *
+ * where ∇p is computed via central differences, scaled by ½·N (the
+ * inverse of the grid spacing h = 1/N used in the divergence step).
+ * This is the Helmholtz-Hodge projection step that makes Stam's
+ * Stable Fluids method unconditionally divergence-free.  [6] Batchelor
+ * §2.7 for the Hodge decomposition theorem.                        */
+static inline void subtract_pressure_gradient(float *vx, float *vy,
+                                              const float *pressure_correction) {
+    int   N        = GRID_SIDE_INNER;
     float n_factor = 0.5f * (float)N;
     for (int j = 1; j <= N; j++) {
         for (int i = 1; i <= N; i++) {
-            vx[cell_index(i, j)] -= n_factor
-                * (pressure_correction[cell_index(i + 1, j)]
-                 - pressure_correction[cell_index(i - 1, j)]);
-            vy[cell_index(i, j)] -= n_factor
-                * (pressure_correction[cell_index(i, j + 1)]
-                 - pressure_correction[cell_index(i, j - 1)]);
+            vx[cell_index(i, j)] -= n_factor *
+                (pressure_correction[cell_index(i + 1, j)] -
+                 pressure_correction[cell_index(i - 1, j)]);
+            vy[cell_index(i, j)] -= n_factor *
+                (pressure_correction[cell_index(i, j + 1)] -
+                 pressure_correction[cell_index(i, j - 1)]);
         }
     }
+}
+
+/*
+ * project — Helmholtz-Hodge projection onto the divergence-free subspace.
+ *
+ * Pseudocode (3 named phases):
+ *   PHASE 1 — measure and prepare
+ *     compute_divergence_field(vx, vy, divergence_field)
+ *     zero_pressure_field    (pressure_correction)
+ *     boundary_apply(SCALAR, divergence_field)
+ *     boundary_apply(SCALAR, pressure_correction)
+ *
+ *   PHASE 2 — solve the Poisson system
+ *     solve_pressure_poisson(pressure_correction, divergence_field)
+ *
+ *   PHASE 3 — correct the velocity
+ *     subtract_pressure_gradient(vx, vy, pressure_correction)
+ *     boundary_apply(VELOCITY_X, vx)
+ *     boundary_apply(VELOCITY_Y, vy)
+ *
+ * After phase 3, ∇·u ≈ 0 — incompressibility enforced.  This is THE
+ * step that makes Stable Fluids stable.  Refs [1] Stam 1999 §3.5
+ * "Hodge decomposition"; [3] Bridson §4.4; [6] Batchelor §2.7.
+ */
+static void project(float *vx, float *vy, float *pressure_correction,
+                    float *divergence_field) {
+    /* PHASE 1 — measure: build the right-hand side, zero the unknown. */
+    compute_divergence_field(vx, vy, divergence_field);
+    zero_pressure_field    (pressure_correction);
+    boundary_apply(BOUNDARY_SCALAR, divergence_field);
+    boundary_apply(BOUNDARY_SCALAR, pressure_correction);
+
+    /* PHASE 2 — solve: Gauss-Seidel relaxation of ∇²p = ∇·u. */
+    solve_pressure_poisson(pressure_correction, divergence_field);
+
+    /* PHASE 3 — correct: subtract ∇p from u, re-apply velocity BCs. */
+    subtract_pressure_gradient(vx, vy, pressure_correction);
     boundary_apply(BOUNDARY_VELOCITY_X, vx);
     boundary_apply(BOUNDARY_VELOCITY_Y, vy);
 }
@@ -1266,43 +1522,39 @@ static void project(float *vx, float *vy,
  * The whole physics in eight calls.
  *
  * VELOCITY phases:
- *   diffuse vx → velocity_x_prev   (using velocity_x as old)
- *   diffuse vy → velocity_y_prev
+ *   diffuse vx → g_scene.velocity_x_prev   (using g_scene.velocity_x as old)
+ *   diffuse vy → g_scene.velocity_y_prev
  *   project    velocity_*_prev     (pressure correction lives in vx, vy)
- *   advect vx  → velocity_x        (advect by velocity_*_prev)
- *   advect vy  → velocity_y
+ *   advect vx  → g_scene.velocity_x        (advect by velocity_*_prev)
+ *   advect vy  → g_scene.velocity_y
  *   project    velocity_*          (clean residual divergence)
  *
  * DYE phases:
- *   diffuse dye → dye_density_prev
- *   advect  dye → dye_density       (using clean velocity_*)
+ *   diffuse dye → g_scene.dye_density_prev
+ *   advect  dye → g_scene.dye_density       (using clean velocity_*)
  *
  * The buffer juggling is awkward but correct.  Stam's reference
  * implementation uses exactly this convention — we keep it.
  */
-static void fluid_step(float dt)
-{
-    /* Velocity diffuse + project. */
-    diffuse(BOUNDARY_VELOCITY_X, velocity_x_prev, velocity_x,
-            viscosity_kinematic, dt);
-    diffuse(BOUNDARY_VELOCITY_Y, velocity_y_prev, velocity_y,
-            viscosity_kinematic, dt);
-    project(velocity_x_prev, velocity_y_prev,
-            velocity_x, velocity_y);
+static void fluid_step(float dt) {
+  /* Velocity diffuse + project. */
+  diffuse(BOUNDARY_VELOCITY_X, g_scene.velocity_x_prev, g_scene.velocity_x, g_scene.viscosity_kinematic,
+          dt);
+  diffuse(BOUNDARY_VELOCITY_Y, g_scene.velocity_y_prev, g_scene.velocity_y, g_scene.viscosity_kinematic,
+          dt);
+  project(g_scene.velocity_x_prev, g_scene.velocity_y_prev, g_scene.velocity_x, g_scene.velocity_y);
 
-    /* Velocity advect + project. */
-    advect(BOUNDARY_VELOCITY_X, velocity_x, velocity_x_prev,
-           velocity_x_prev, velocity_y_prev, dt);
-    advect(BOUNDARY_VELOCITY_Y, velocity_y, velocity_y_prev,
-           velocity_x_prev, velocity_y_prev, dt);
-    project(velocity_x, velocity_y,
-            velocity_x_prev, velocity_y_prev);
+  /* Velocity advect + project. */
+  advect(BOUNDARY_VELOCITY_X, g_scene.velocity_x, g_scene.velocity_x_prev, g_scene.velocity_x_prev,
+         g_scene.velocity_y_prev, dt);
+  advect(BOUNDARY_VELOCITY_Y, g_scene.velocity_y, g_scene.velocity_y_prev, g_scene.velocity_x_prev,
+         g_scene.velocity_y_prev, dt);
+  project(g_scene.velocity_x, g_scene.velocity_y, g_scene.velocity_x_prev, g_scene.velocity_y_prev);
 
-    /* Dye diffuse + advect. */
-    diffuse(BOUNDARY_SCALAR, dye_density_prev, dye_density,
-            DIFFUSION_DYE, dt);
-    advect(BOUNDARY_SCALAR, dye_density, dye_density_prev,
-           velocity_x, velocity_y, dt);
+  /* Dye diffuse + advect. */
+  diffuse(BOUNDARY_SCALAR, g_scene.dye_density_prev, g_scene.dye_density, DIFFUSION_DYE, dt);
+  advect(BOUNDARY_SCALAR, g_scene.dye_density, g_scene.dye_density_prev, g_scene.velocity_x, g_scene.velocity_y,
+         dt);
 }
 
 /* ===================================================================== */
@@ -1317,14 +1569,15 @@ static void fluid_step(float dt)
  * The DT factor is included here so callers specify "force units"
  * and "dye units" rather than "force-per-tick."
  */
-static void add_source_at(int i, int j,
-                          float force_x, float force_y, float dye_value)
-{
-    if (i < 1 || i > GRID_SIDE_INNER) return;
-    if (j < 1 || j > GRID_SIDE_INNER) return;
-    velocity_x [cell_index(i, j)] += DT_DEFAULT * force_x   * INJECT_FORCE_SCALE;
-    velocity_y [cell_index(i, j)] += DT_DEFAULT * force_y   * INJECT_FORCE_SCALE;
-    dye_density[cell_index(i, j)] += DT_DEFAULT * dye_value * INJECT_DYE_SCALE;
+static void add_source_at(int i, int j, float force_x, float force_y,
+                          float dye_value) {
+  if (i < 1 || i > GRID_SIDE_INNER)
+    return;
+  if (j < 1 || j > GRID_SIDE_INNER)
+    return;
+  g_scene.velocity_x[cell_index(i, j)] += DT_DEFAULT * force_x * INJECT_FORCE_SCALE;
+  g_scene.velocity_y[cell_index(i, j)] += DT_DEFAULT * force_y * INJECT_FORCE_SCALE;
+  g_scene.dye_density[cell_index(i, j)] += DT_DEFAULT * dye_value * INJECT_DYE_SCALE;
 }
 
 /* ===================================================================== */
@@ -1333,31 +1586,29 @@ static void add_source_at(int i, int j,
 /*
  * Two emitters at 1/3 and 2/3 from the left, both at vertical centre.
  * Each injects dye + a swirling velocity that rotates with
- * emitter_swirl_phase.  The two are 180° out of phase so their
+ * g_scene.emitter_swirl_phase.  The two are 180° out of phase so their
  * resulting flows COUNTER-ROTATE — visually striking, immediately
  * shows off the projection step (without it, the swirls would just
  * bleed into source/sink artefacts).
  */
-static void emitters_inject(void)
-{
-    emitter_swirl_phase += EMITTER_SWIRL_INCREMENT;
+static void emitters_inject(void) {
+  g_scene.emitter_swirl_phase += EMITTER_SWIRL_INCREMENT;
 
-    int N = GRID_SIDE_INNER;
+  int N = GRID_SIDE_INNER;
 
-    /* Left emitter — clockwise swirl. */
-    int   i_left  = N / 3;
-    int   j_left  = N / 2;
-    float fx_left =  cosf(emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
-    float fy_left =  sinf(emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
-    add_source_at(i_left, j_left, fx_left, fy_left, EMITTER_DYE_AMPLITUDE);
+  /* Left emitter — clockwise swirl. */
+  int i_left = N / 3;
+  int j_left = N / 2;
+  float fx_left = cosf(g_scene.emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
+  float fy_left = sinf(g_scene.emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
+  add_source_at(i_left, j_left, fx_left, fy_left, EMITTER_DYE_AMPLITUDE);
 
-    /* Right emitter — counter-rotating. */
-    int   i_right  = 2 * N / 3;
-    int   j_right  = N / 2;
-    float fx_right = -cosf(emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
-    float fy_right = -sinf(emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
-    add_source_at(i_right, j_right, fx_right, fy_right,
-                  EMITTER_DYE_AMPLITUDE);
+  /* Right emitter — counter-rotating. */
+  int i_right = 2 * N / 3;
+  int j_right = N / 2;
+  float fx_right = -cosf(g_scene.emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
+  float fy_right = -sinf(g_scene.emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
+  add_source_at(i_right, j_right, fx_right, fy_right, EMITTER_DYE_AMPLITUDE);
 }
 
 /* ===================================================================== */
@@ -1369,16 +1620,15 @@ static void emitters_inject(void)
  * ticks.  Reset the EMA tracker so post-reset normalisation starts
  * fresh.
  */
-static void fluid_reset(void)
-{
-    memset(velocity_x,        0, sizeof velocity_x);
-    memset(velocity_y,        0, sizeof velocity_y);
-    memset(velocity_x_prev,   0, sizeof velocity_x_prev);
-    memset(velocity_y_prev,   0, sizeof velocity_y_prev);
-    memset(dye_density,       0, sizeof dye_density);
-    memset(dye_density_prev,  0, sizeof dye_density_prev);
-    emitter_swirl_phase = 0.0f;
-    dye_max_smoothed    = DYE_MAX_INITIAL;
+static void fluid_reset(void) {
+  memset(g_scene.velocity_x, 0, sizeof g_scene.velocity_x);
+  memset(g_scene.velocity_y, 0, sizeof g_scene.velocity_y);
+  memset(g_scene.velocity_x_prev, 0, sizeof g_scene.velocity_x_prev);
+  memset(g_scene.velocity_y_prev, 0, sizeof g_scene.velocity_y_prev);
+  memset(g_scene.dye_density, 0, sizeof g_scene.dye_density);
+  memset(g_scene.dye_density_prev, 0, sizeof g_scene.dye_density_prev);
+  g_scene.emitter_swirl_phase = 0.0f;
+  g_scene.dye_max_smoothed = DYE_MAX_INITIAL;
 }
 
 /* ===================================================================== */
@@ -1391,31 +1641,30 @@ static void fluid_reset(void)
  * renormaliser changes slowly.
  *
  * Two functions:
- *   dye_max_per_frame() — scan dye_density[] for the actual max.
+ *   dye_max_per_frame() — scan g_scene.dye_density[] for the actual max.
  *   dye_normaliser_advance() — fold per-frame max into the EMA.
  *
- * The EMA state lives in dye_max_smoothed (declared in §6).
+ * The EMA state lives in g_scene.dye_max_smoothed (declared in §6).
  */
 
-static float dye_max_per_frame(void)
-{
-    float frame_max = 0.0f;
-    for (int j = 1; j <= GRID_SIDE_INNER; j++) {
-        for (int i = 1; i <= GRID_SIDE_INNER; i++) {
-            float v = dye_density[cell_index(i, j)];
-            if (v > frame_max) frame_max = v;
-        }
+static float dye_max_per_frame(void) {
+  float frame_max = 0.0f;
+  for (int j = 1; j <= GRID_SIDE_INNER; j++) {
+    for (int i = 1; i <= GRID_SIDE_INNER; i++) {
+      float v = g_scene.dye_density[cell_index(i, j)];
+      if (v > frame_max)
+        frame_max = v;
     }
-    return frame_max;
+  }
+  return frame_max;
 }
 
-static void dye_normaliser_advance(void)
-{
-    float frame_max = dye_max_per_frame();
-    dye_max_smoothed = DYE_MAX_EMA_OLD * dye_max_smoothed
-                     + DYE_MAX_EMA_NEW * frame_max;
-    if (dye_max_smoothed < DYE_MAX_FLOOR)
-        dye_max_smoothed = DYE_MAX_FLOOR;
+static void dye_normaliser_advance(void) {
+  float frame_max = dye_max_per_frame();
+  g_scene.dye_max_smoothed =
+      DYE_MAX_EMA_OLD * g_scene.dye_max_smoothed + DYE_MAX_EMA_NEW * frame_max;
+  if (g_scene.dye_max_smoothed < DYE_MAX_FLOOR)
+    g_scene.dye_max_smoothed = DYE_MAX_FLOOR;
 }
 
 /* ===================================================================== */
@@ -1432,19 +1681,47 @@ static void dye_normaliser_advance(void)
  *   else      →  '#'  shade 3  (dense plume)
  */
 
+/*
+ * GlyphChoice — one cell's drawing instruction, derived from dye density.
+ *
+ * Intent
+ *   The renderer needs to know TWO things per cell: which glyph to
+ *   draw, and which shade in the active dye channel's palette to
+ *   colour it.  density_to_glyph() computes both in one shot.
+ *
+ * Why a struct and not two return values
+ *   C functions return one value; returning two via output pointers
+ *   makes call sites read backwards ("look up output_pair, then
+ *   output_glyph").  A small return-by-value struct keeps callers
+ *   linear: `gc = density_to_glyph(d); mvaddch(... gc.glyph, ...);`.
+ *
+ * Why glyph + shade_index (not glyph + colour_pair_id)
+ *   The CHANNEL of dye in this cell (blue / red / green — picked by
+ *   the dominant-channel rule earlier) varies, but the shade WITHIN
+ *   that channel is what density_to_glyph computes.  Decoupling lets
+ *   the caller combine the two: pair = channel_base[chan] + shade.
+ */
 typedef struct {
-    char glyph;
-    int  shade_index;
+    char glyph;          /* '.' ':' '+' '#' or 0 for "do not draw"  */
+    int  shade_index;    /* 0..DYE_SHADE_COUNT-1 within channel ramp */
 } GlyphChoice;
 
-static GlyphChoice glyph_for_density(float density_normalised)
-{
-    GlyphChoice out = { '#', 3 };
-    if      (density_normalised < DENSITY_GLYPH_LOW ) { out.glyph = '.'; out.shade_index = 0; }
-    else if (density_normalised < DENSITY_GLYPH_MID ) { out.glyph = ':'; out.shade_index = 1; }
-    else if (density_normalised < DENSITY_GLYPH_HIGH) { out.glyph = '+'; out.shade_index = 2; }
-    else                                              { out.glyph = '#'; out.shade_index = 3; }
-    return out;
+static GlyphChoice glyph_for_density(float density_normalised) {
+  GlyphChoice out = {'#', 3};
+  if (density_normalised < DENSITY_GLYPH_LOW) {
+    out.glyph = '.';
+    out.shade_index = 0;
+  } else if (density_normalised < DENSITY_GLYPH_MID) {
+    out.glyph = ':';
+    out.shade_index = 1;
+  } else if (density_normalised < DENSITY_GLYPH_HIGH) {
+    out.glyph = '+';
+    out.shade_index = 2;
+  } else {
+    out.glyph = '#';
+    out.shade_index = 3;
+  }
+  return out;
 }
 
 /* ===================================================================== */
@@ -1458,18 +1735,16 @@ static GlyphChoice glyph_for_density(float density_normalised)
  * mathematical convention.
  */
 
-static int grid_i_to_term_col(int i, int term_cols)
-{
-    return (i - 1) * term_cols / GRID_SIDE_INNER;
+static int grid_i_to_term_col(int i, int term_cols) {
+  return (i - 1) * term_cols / GRID_SIDE_INNER;
 }
 
-static int grid_j_to_term_row(int j, int term_rows)
-{
-    int draw_rows = term_rows - HUD_RESERVED_ROWS_TOP
-                              - HUD_RESERVED_ROWS_BOTTOM;
-    if (draw_rows < 1) draw_rows = 1;
-    return (GRID_SIDE_INNER - j) * draw_rows / GRID_SIDE_INNER
-         + HUD_RESERVED_ROWS_TOP;
+static int grid_j_to_term_row(int j, int term_rows) {
+  int draw_rows = term_rows - HUD_RESERVED_ROWS_TOP - HUD_RESERVED_ROWS_BOTTOM;
+  if (draw_rows < 1)
+    draw_rows = 1;
+  return (GRID_SIDE_INNER - j) * draw_rows / GRID_SIDE_INNER +
+         HUD_RESERVED_ROWS_TOP;
 }
 
 /* ===================================================================== */
@@ -1482,30 +1757,76 @@ static int grid_j_to_term_row(int j, int term_rows)
  *   - Otherwise pick glyph + shade (§17) and draw with the channel's
  *     colour pair (§4-§5).
  *
- * Keep render free of any state-mutation: it READS dye_density and
- * dye_max_smoothed, WRITES only ncurses cells.  Side effects belong
+ * Keep render free of any state-mutation: it READS g_scene.dye_density and
+ * g_scene.dye_max_smoothed, WRITES only ncurses cells.  Side effects belong
  * upstream in dye_normaliser_advance().
  */
-static void render_dye_field(int term_rows, int term_cols)
-{
+/* Normalise the raw dye density at grid cell (i, j) by the EMA-
+ * smoothed max so the colour ramp tracks the field's CURRENT dynamic
+ * range.  Without this, a single bright plume at startup would peg
+ * every later frame's ramp to "barely visible" — see [1] Stam §6
+ * "tone mapping" for the same trick in real-time fluid graphics. */
+static inline float normalise_dye_at(int i, int j) {
+    return g_scene.dye_density[cell_index(i, j)] / g_scene.dye_max_smoothed;
+}
+
+/* Project grid cell (i, j) onto the terminal screen, return false if
+ * the result would fall outside the visible field rect (HUD rows
+ * reserved at top and bottom).  Clipping HERE keeps the inner-loop
+ * paint helper free of bounds checks. */
+static inline bool grid_cell_to_screen(int i, int j,
+                                       int term_rows, int term_cols,
+                                       int *out_col, int *out_row) {
+    int col = grid_i_to_term_col(i, term_cols);
+    int row = grid_j_to_term_row(j, term_rows);
+    if (col < 0 || col >= term_cols)                          return false;
+    if (row < HUD_RESERVED_ROWS_TOP)                          return false;
+    if (row >= term_rows - HUD_RESERVED_ROWS_BOTTOM)          return false;
+    *out_col = col;
+    *out_row = row;
+    return true;
+}
+
+/* Paint ONE dye cell.  Maps normalised density → glyph+shade via
+ * glyph_for_density() (§17); picks the channel-specific colour pair
+ * via dye_pair_id() (§4); single mvaddch().  Reference [8] Bourke for
+ * the density-to-glyph ramp design. */
+static inline void paint_dye_cell(int screen_row, int screen_col,
+                                  float density_normalised) {
+    GlyphChoice gc      = glyph_for_density(density_normalised);
+    int         pair_id = dye_pair_id(g_scene.active_dye_channel,
+                                       gc.shade_index);
+    attron(COLOR_PAIR(pair_id));
+    mvaddch(screen_row, screen_col, (chtype)(unsigned char)gc.glyph);
+    attroff(COLOR_PAIR(pair_id));
+}
+
+/*
+ * render_dye_field — paint the live dye density field to ncurses.
+ *
+ * Pseudocode:
+ *   for each interior grid cell (i, j):
+ *     rho_norm = normalise_dye_at(i, j)                 (EMA-divided)
+ *     if rho_norm < BLANK_THRESHOLD → skip               (let bg show)
+ *     (col, row) ← grid_cell_to_screen(i, j, ...)
+ *     if out of visible field rect → skip
+ *     paint_dye_cell(row, col, rho_norm)
+ *
+ * READS g_scene.dye_density and g_scene.dye_max_smoothed only.
+ * WRITES only ncurses cells — no side effects on the simulation.
+ */
+static void render_dye_field(int term_rows, int term_cols) {
     for (int j = 1; j <= GRID_SIDE_INNER; j++) {
         for (int i = 1; i <= GRID_SIDE_INNER; i++) {
-            float density_normalised =
-                dye_density[cell_index(i, j)] / dye_max_smoothed;
-            if (density_normalised < DENSITY_GLYPH_BLANK) continue;
+            float rho_norm = normalise_dye_at(i, j);
+            if (rho_norm < DENSITY_GLYPH_BLANK)
+                continue;
 
-            int col = grid_i_to_term_col(i, term_cols);
-            int row = grid_j_to_term_row(j, term_rows);
-            if (col < 0 || col >= term_cols)              continue;
-            if (row < HUD_RESERVED_ROWS_TOP)              continue;
-            if (row >= term_rows - HUD_RESERVED_ROWS_BOTTOM) continue;
+            int col, row;
+            if (!grid_cell_to_screen(i, j, term_rows, term_cols, &col, &row))
+                continue;
 
-            GlyphChoice gc = glyph_for_density(density_normalised);
-            int pair_id = dye_pair_id(active_dye_channel, gc.shade_index);
-
-            attron(COLOR_PAIR(pair_id));
-            mvaddch(row, col, (chtype)(unsigned char)gc.glyph);
-            attroff(COLOR_PAIR(pair_id));
+            paint_dye_cell(row, col, rho_norm);
         }
     }
 }
@@ -1523,200 +1844,222 @@ static void render_dye_field(int term_rows, int term_cols)
  * Hint shows: the keyboard shortcuts.
  */
 
-static void hud_paint_status(int term_cols)
-{
-    char buf[160];
-    snprintf(buf, sizeof buf,
-             " StableFluids  grid:%dx%d  visc:%.2e  dye:%-5s  %s ",
-             GRID_SIDE_INNER, GRID_SIDE_INNER,
-             (double)viscosity_kinematic,
-             dye_palette_table[active_dye_channel].name,
-             simulation_paused ? "PAUSED " : "running");
-    int len = (int)strlen(buf);
-    int x   = term_cols - len;
-    if (x < 0) x = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, x, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+static void hud_paint_status(int term_cols) {
+  char buf[160];
+  snprintf(buf, sizeof buf,
+           " StableFluids  grid:%dx%d  visc:%.2e  dye:%-5s  %s ",
+           GRID_SIDE_INNER, GRID_SIDE_INNER, (double)g_scene.viscosity_kinematic,
+           dye_palette_table[g_scene.active_dye_channel].name,
+           g_scene.simulation_paused ? "PAUSED " : "running");
+  int len = (int)strlen(buf);
+  int x = term_cols - len;
+  if (x < 0)
+    x = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, x, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void hud_paint_hint(int term_rows)
-{
-    const char *hint =
-        " q:quit  p:pause  r:reset  arrows:wind  d/spc:dye  "
-        "1/2/3:colour  +/-:visc ";
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(term_rows - 1, 0, "%s", hint);
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void hud_paint_hint(int term_rows) {
+  const char *hint = " q:quit  p:pause  r:reset  arrows:wind  d/spc:dye  "
+                     "1/2/3:colour  +/-:visc ";
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(term_rows - 1, 0, "%s", hint);
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §21  screen — ncurses init / cleanup / present                        */
 /* ===================================================================== */
 
-typedef struct { int rows; int cols; } Screen;
+/*
+ * Screen — terminal extent record.  ncurses owns the buffers; we
+ * keep only cell dimensions for HUD placement and field clipping.
+ *
+ * Render pipeline (one frame): erase → paint_field → hud_paint_*
+ *   → wnoutrefresh(stdscr) → doupdate().  Diff-only writes to the
+ *   terminal — no flicker.  See [9] Raymond §11.
+ */
+typedef struct {
+    int rows;   /* terminal height in cells (getmaxyx)             */
+    int cols;   /* terminal width  in cells (getmaxyx)             */
+} Screen;
 
-static void screen_init(Screen *s)
-{
-    initscr();
-    cbreak();
-    noecho();
-    keypad(stdscr, TRUE);
-    nodelay(stdscr, TRUE);
-    curs_set(0);
-    typeahead(-1);
-    colors_init();
-    getmaxyx(stdscr, s->rows, s->cols);
+static void screen_init(Screen *s) {
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  typeahead(-1);
+  colors_init();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_cleanup(void)
-{
-    endwin();
+static void screen_cleanup(void) { endwin(); }
+
+static void screen_resize(Screen *s) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, s->rows, s->cols);
 }
 
-static void screen_resize(Screen *s)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, s->rows, s->cols);
-}
-
-static void screen_present_frame(Screen *s)
-{
-    erase();
-    render_dye_field(s->rows, s->cols);
-    hud_paint_status(s->cols);
-    hud_paint_hint  (s->rows);
-    wnoutrefresh(stdscr);
-    doupdate();
+static void screen_present_frame(Screen *s) {
+  erase();
+  render_dye_field(s->rows, s->cols);
+  hud_paint_status(s->cols);
+  hud_paint_hint(s->rows);
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §22  app — main loop + signals + input                                */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_should_quit    = 0;
+static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_resize_pending = 0;
 
-static void on_signal(int sig)
-{
-    if (sig == SIGWINCH) g_resize_pending = 1;
-    else                 g_should_quit    = 1;
+static void on_signal(int sig) {
+  if (sig == SIGWINCH)
+    g_resize_pending = 1;
+  else
+    g_should_quit = 1;
 }
 
 /* Input helpers. */
-static void drop_random_dye_blob(void)
-{
-    int i = rand_inner_cell();
-    int j = rand_inner_cell();
-    add_source_at(i, j, 0.0f, 0.0f, 5.0f);
+static void drop_random_dye_blob(void) {
+  int i = rand_inner_cell();
+  int j = rand_inner_cell();
+  add_source_at(i, j, 0.0f, 0.0f, 5.0f);
 }
 
-static void apply_arrow_force(float force_x, float force_y)
-{
-    int centre = GRID_SIDE_INNER / 2;
-    add_source_at(centre, centre, force_x, force_y, 1.0f);
+static void apply_arrow_force(float force_x, float force_y) {
+  int centre = GRID_SIDE_INNER / 2;
+  add_source_at(centre, centre, force_x, force_y, 1.0f);
 }
 
-static bool app_handle_key(int ch)
-{
-    switch (ch) {
-        case 'q': case 'Q': case 27:
-            return false;
+static bool app_handle_key(int ch) {
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-        case 'p': case 'P':
-            simulation_paused = !simulation_paused;
-            break;
+  case 'p':
+  case 'P':
+    g_scene.simulation_paused = !g_scene.simulation_paused;
+    break;
 
-        case 'r': case 'R':
-            fluid_reset();
-            break;
-
-        case ' ':
-        case 'd': case 'D':
-            drop_random_dye_blob();
-            break;
-
-        case KEY_LEFT:  apply_arrow_force(-1.0f,  0.0f); break;
-        case KEY_RIGHT: apply_arrow_force( 1.0f,  0.0f); break;
-        case KEY_UP:    apply_arrow_force( 0.0f, -1.0f); break;
-        case KEY_DOWN:  apply_arrow_force( 0.0f,  1.0f); break;
-
-        case '+': case '=':
-            viscosity_kinematic *= VISCOSITY_FACTOR;
-            if (viscosity_kinematic > VISCOSITY_MAX)
-                viscosity_kinematic = VISCOSITY_MAX;
-            break;
-        case '-':
-            viscosity_kinematic /= VISCOSITY_FACTOR;
-            if (viscosity_kinematic < VISCOSITY_MIN)
-                viscosity_kinematic = VISCOSITY_MIN;
-            break;
-
-        case '1': active_dye_channel = DYE_CHANNEL_BLUE;  break;
-        case '2': active_dye_channel = DYE_CHANNEL_GREEN; break;
-        case '3': active_dye_channel = DYE_CHANNEL_RED;   break;
-
-        default: break;
-    }
-    return true;
-}
-
-int main(void)
-{
-    srand((unsigned)time(NULL));
-    atexit(screen_cleanup);
-    signal(SIGINT,   on_signal);
-    signal(SIGTERM,  on_signal);
-    signal(SIGWINCH, on_signal);
-
-    Screen screen;
-    screen_init(&screen);
+  case 'r':
+  case 'R':
     fluid_reset();
+    break;
 
-    /* Pre-warm: emitters + physics for N ticks so the first frame
-     * has visible dye instead of a blank screen. */
-    for (int i = 0; i < PREWARM_TICK_COUNT; i++) {
-        emitters_inject();
-        fluid_step(DT_DEFAULT);
+  case ' ':
+  case 'd':
+  case 'D':
+    drop_random_dye_blob();
+    break;
+
+  case KEY_LEFT:
+    apply_arrow_force(-1.0f, 0.0f);
+    break;
+  case KEY_RIGHT:
+    apply_arrow_force(1.0f, 0.0f);
+    break;
+  case KEY_UP:
+    apply_arrow_force(0.0f, -1.0f);
+    break;
+  case KEY_DOWN:
+    apply_arrow_force(0.0f, 1.0f);
+    break;
+
+  case '+':
+  case '=':
+    g_scene.viscosity_kinematic *= VISCOSITY_FACTOR;
+    if (g_scene.viscosity_kinematic > VISCOSITY_MAX)
+      g_scene.viscosity_kinematic = VISCOSITY_MAX;
+    break;
+  case '-':
+    g_scene.viscosity_kinematic /= VISCOSITY_FACTOR;
+    if (g_scene.viscosity_kinematic < VISCOSITY_MIN)
+      g_scene.viscosity_kinematic = VISCOSITY_MIN;
+    break;
+
+  case '1':
+    g_scene.active_dye_channel = DYE_CHANNEL_BLUE;
+    break;
+  case '2':
+    g_scene.active_dye_channel = DYE_CHANNEL_GREEN;
+    break;
+  case '3':
+    g_scene.active_dye_channel = DYE_CHANNEL_RED;
+    break;
+
+  default:
+    break;
+  }
+  return true;
+}
+
+int main(void) {
+  srand((unsigned)time(NULL));
+  atexit(screen_cleanup);
+  signal(SIGINT, on_signal);
+  signal(SIGTERM, on_signal);
+  signal(SIGWINCH, on_signal);
+
+  Screen screen;
+  screen_init(&screen);
+  fluid_reset();
+
+  /* Pre-warm: emitters + physics for N ticks so the first frame
+   * has visible dye instead of a blank screen. */
+  for (int i = 0; i < PREWARM_TICK_COUNT; i++) {
+    emitters_inject();
+    fluid_step(DT_DEFAULT);
+  }
+  /* Seed the EMA from the prewarmed state so the first rendered
+   * frame doesn't blow out shades. */
+  g_scene.dye_max_smoothed = dye_max_per_frame();
+  if (g_scene.dye_max_smoothed < DYE_MAX_FLOOR)
+    g_scene.dye_max_smoothed = DYE_MAX_INITIAL;
+
+  while (!g_should_quit) {
+    int64_t frame_start_ns = clock_now_ns();
+
+    /* ── input ── */
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (!app_handle_key(ch)) {
+        g_should_quit = 1;
+        break;
+      }
     }
-    /* Seed the EMA from the prewarmed state so the first rendered
-     * frame doesn't blow out shades. */
-    dye_max_smoothed = dye_max_per_frame();
-    if (dye_max_smoothed < DYE_MAX_FLOOR) dye_max_smoothed = DYE_MAX_INITIAL;
 
-    while (!g_should_quit) {
-        int64_t frame_start_ns = clock_now_ns();
-
-        /* ── input ── */
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (!app_handle_key(ch)) {
-                g_should_quit = 1;
-                break;
-            }
-        }
-
-        /* ── resize ── */
-        if (g_resize_pending) {
-            g_resize_pending = 0;
-            screen_resize(&screen);
-        }
-
-        /* ── physics ── */
-        if (!simulation_paused) {
-            emitters_inject();
-            fluid_step(DT_DEFAULT);
-        }
-
-        /* ── visualisation prep + render ── */
-        dye_normaliser_advance();
-        screen_present_frame(&screen);
-
-        /* ── frame cap ── */
-        int64_t spent = clock_now_ns() - frame_start_ns;
-        if (spent < RENDER_TICK_NS) clock_sleep_ns(RENDER_TICK_NS - spent);
+    /* ── resize ── */
+    if (g_resize_pending) {
+      g_resize_pending = 0;
+      screen_resize(&screen);
     }
 
-    return 0;
+    /* ── physics ── */
+    if (!g_scene.simulation_paused) {
+      emitters_inject();
+      fluid_step(DT_DEFAULT);
+    }
+
+    /* ── visualisation prep + render ── */
+    dye_normaliser_advance();
+    screen_present_frame(&screen);
+
+    /* ── frame cap ── */
+    int64_t spent = clock_now_ns() - frame_start_ns;
+    if (spent < RENDER_TICK_NS)
+      clock_sleep_ns(RENDER_TICK_NS - spent);
+  }
+
+  return 0;
 }

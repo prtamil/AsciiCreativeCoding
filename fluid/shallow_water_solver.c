@@ -190,15 +190,47 @@
  *
  * References
  * ──────────
- *   Vreugdenhil, C. B. (1994), "Numerical Methods for Shallow-Water
- *     Flow" (Kluwer).  Standard textbook on the SWE.
- *   Stoker, J. J. (1957), "Water Waves: The Mathematical Theory
- *     with Applications" (Wiley).  The classic reference.
- *   LeVeque, R. J. (2002), "Finite Volume Methods for Hyperbolic
- *     Problems" (Cambridge).  Modern numerical treatment.
- *   https://en.wikipedia.org/wiki/Shallow_water_equations
- *   Foster, N. & Metaxas, D. (1996), "Realistic Animation of
- *     Liquids."  Pre-Stam grid solver, includes SWE for surface waves.
+ *   ── Shallow-water foundations ─────────────────────────────────────
+ *   [1] Stoker, J. J. (1957), "Water Waves: The Mathematical Theory
+ *       with Applications", Wiley — the classic reference for the
+ *       depth-averaged SWE derivation and analytical solutions.
+ *   [2] Vreugdenhil, C. B. (1994), "Numerical Methods for Shallow-
+ *       Water Flow", Kluwer — standard textbook covering the SWE
+ *       discretisations used here.
+ *   [3] Saint-Venant, A. J. C. B. de (1871), "Théorie du mouvement
+ *       non permanent des eaux", C. R. Acad. Sci. Paris 73 — the
+ *       ORIGINAL 1D shallow-water equations.  The 2D version we
+ *       solve is the direct generalisation.
+ *
+ *   ── Numerical methods (finite-volume / staggered grids) ──────────
+ *   [4] LeVeque, R. J. (2002), "Finite Volume Methods for Hyperbolic
+ *       Problems", CUP — modern numerical treatment; chs. 4-5 cover
+ *       the CFL bound (c·dt/dx ≤ 1) that constrains our DT_DEFAULT.
+ *   [5] Arakawa, A. & Lamb, V. R. (1977), "Computational Design of
+ *       the Basic Dynamical Processes of the UCLA General Circulation
+ *       Model", Methods Comput. Phys. 17, pp. 173-265 — the staggered
+ *       C-grid layout that places h at cell centres and (u, v) at
+ *       cell edges.
+ *
+ *   ── Graphics applications ────────────────────────────────────────
+ *   [6] Foster, N. & Metaxas, D. (1996), "Realistic Animation of
+ *       Liquids", GMIP 58 — pre-Stam grid solver, includes SWE for
+ *       free-surface waves.
+ *   [7] Kass, M. & Miller, G. (1990), "Rapid, Stable Fluid Dynamics
+ *       for Computer Graphics", SIGGRAPH '90 — height-field water
+ *       surface using a 1D SWE-like scheme; nice intuition for
+ *       wave propagation.
+ *
+ *   ── Rendering / ncurses ──────────────────────────────────────────
+ *   [8] Bourke, P. (1997), "Character representation of grayscale
+ *       images", paulbourke.net/dataformats/asciiart — design basis
+ *       for the height → glyph ramp.
+ *   [9] Raymond, E. S., "NCURSES Programming HOWTO" —
+ *       tldp.org/HOWTO/NCURSES-Programming-HOWTO; covers init_pair,
+ *       use_default_colors, newscr/curscr diff pipeline.
+ *
+ *   ── Online quick reference ───────────────────────────────────────
+ *  [10] https://en.wikipedia.org/wiki/Shallow_water_equations
  *
  * ─────────────────────────────────────────────────────────────────── */
 
@@ -753,7 +785,7 @@
 #include <time.h>
 
 #ifndef M_PI
-#  define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846
 #endif
 
 /* ===================================================================== */
@@ -762,121 +794,118 @@
 
 /* §1.1 — frame timing. */
 
-#define SIM_HZ_DEFAULT      60
-#define SIM_HZ_MIN           5
-#define SIM_HZ_MAX         120
-#define SIM_HZ_STEP          5
+#define SIM_HZ_DEFAULT 60
+#define SIM_HZ_MIN 5
+#define SIM_HZ_MAX 120
+#define SIM_HZ_STEP 5
 
-#define RENDER_FPS_CAP      60
-#define FPS_RECOMPUTE_MS   500
+#define RENDER_FPS_CAP 60
+#define FPS_RECOMPUTE_MS 500
 
-#define NS_PER_SEC      1000000000LL
-#define NS_PER_MS          1000000LL
-#define TICK_NS(hz)     (NS_PER_SEC / (hz))
+#define NS_PER_SEC 1000000000LL
+#define NS_PER_MS 1000000LL
+#define TICK_NS(hz) (NS_PER_SEC / (hz))
 
 /* §1.2 — grid size limits. */
 
-#define GRID_COLS_MAX      300
-#define GRID_ROWS_MAX      100
+#define GRID_COLS_MAX 300
+#define GRID_ROWS_MAX 100
 
 /* §1.3 — physics. */
 
 /* Rest depth H₀ (normalised; wave speed driven by gravity only). */
-#define REST_DEPTH               1.0f
+#define REST_DEPTH 1.0f
 
 /* Gravity — sets wave speed: c = √(g · H₀) = √g (with H₀ = 1).
  * Default 400 → c = 20 cells/sec, CFL ≈ 0.33 at 60 Hz. */
-#define GRAVITY_DEFAULT        400.0f
-#define GRAVITY_MIN             25.0f
-#define GRAVITY_MAX           1600.0f
-#define GRAVITY_STEP           100.0f
+#define GRAVITY_DEFAULT 400.0f
+#define GRAVITY_MIN 25.0f
+#define GRAVITY_MAX 1600.0f
+#define GRAVITY_STEP 100.0f
 
 /* Velocity damping (mimics bottom friction). */
-#define BOTTOM_FRICTION_DEFAULT  0.004f
-#define BOTTOM_FRICTION_MIN      0.000f
-#define BOTTOM_FRICTION_MAX      0.060f
+#define BOTTOM_FRICTION_DEFAULT 0.004f
+#define BOTTOM_FRICTION_MIN 0.000f
+#define BOTTOM_FRICTION_MAX 0.060f
 
 /* §1.4 — excitation parameters. */
 
-#define DROP_HEIGHT_AMPLITUDE    1.4f
-#define DROP_GAUSSIAN_RADIUS     3.0f
-#define DAM_BREAK_AMPLITUDE      1.2f
+#define DROP_HEIGHT_AMPLITUDE 1.4f
+#define DROP_GAUSSIAN_RADIUS 3.0f
+#define DAM_BREAK_AMPLITUDE 1.2f
 
 /* §1.5 — visualisation thresholds. */
 
 /* Display |h| > this is clipped to full ramp. */
-#define DISPLAY_HEIGHT_RANGE     1.8f
+#define DISPLAY_HEIGHT_RANGE 1.8f
 
 /* Velocity speed below this skips arrow drawing. */
-#define ARROW_SPEED_THRESHOLD    0.05f
+#define ARROW_SPEED_THRESHOLD 0.05f
 
 /* |h| below this is "near zero" — used by shoreline detection. */
 #define SHORELINE_HEIGHT_THRESHOLD 0.04f
 
 /* CFL band thresholds for stability colour-coding (T7). */
-#define CFL_STABLE_LIMIT         0.50f
-#define CFL_MARGINAL_LIMIT       0.70f
+#define CFL_STABLE_LIMIT 0.50f
+#define CFL_MARGINAL_LIMIT 0.70f
 
 /* §1.6 — boundary condition tags. */
 
 enum {
-    BC_WALL     = 0,    /* reflecting walls (no normal flow)       */
-    BC_OPEN     = 1,    /* Neumann copy (waves slide out)          */
-    BC_PERIODIC = 2,    /* toroidal wrap                           */
-    BC_COUNT,
+  BC_WALL = 0,     /* reflecting walls (no normal flow)       */
+  BC_OPEN = 1,     /* Neumann copy (waves slide out)          */
+  BC_PERIODIC = 2, /* toroidal wrap                           */
+  BC_COUNT,
 };
 
-static const char *bc_name_table[BC_COUNT] = {
-    "wall    ", "open    ", "periodic"
-};
+static const char *bc_name_table[BC_COUNT] = {"wall    ", "open    ",
+                                              "periodic"};
 
 /* §1.7 — preset IDs. */
 
 enum {
-    PRESET_DAM_BREAK    = 0,
-    PRESET_RADIAL_DROP  = 1,
-    PRESET_CHANNEL      = 2,
-    PRESET_OBSTACLE     = 3,
-    PRESET_COUNT,
+  PRESET_DAM_BREAK = 0,
+  PRESET_RADIAL_DROP = 1,
+  PRESET_CHANNEL = 2,
+  PRESET_OBSTACLE = 3,
+  PRESET_COUNT,
 };
 
 static const char *preset_name_table[PRESET_COUNT] = {
-    "dam_break  ", "radial_drop", "channel    ", "obstacle   "
-};
+    "dam_break  ", "radial_drop", "channel    ", "obstacle   "};
 
 /* §1.8 — ramp slot count + theme count. */
 
-#define RAMP_SLOT_COUNT       9     /* must match arrays in §3 + §5 */
-#define THEME_COUNT           3
+#define RAMP_SLOT_COUNT 9 /* must match arrays in §3 + §5 */
+#define THEME_COUNT 3
 
 /* §1.9 — colour pair IDs.
  *   POS(t, i) and NEG(t, i) span the full 3 × 9 grid for crest/trough
  *   per theme.  Then SHORELINE / OBSTACLE / HUD / HINT trail. */
 
-#define PAIR_POS(theme, slot)  (1 + (theme) * (RAMP_SLOT_COUNT * 2) + (slot))
-#define PAIR_NEG(theme, slot)  (1 + (theme) * (RAMP_SLOT_COUNT * 2) \
-                                  + RAMP_SLOT_COUNT + (slot))
-#define PAIR_SHORELINE         (1 + THEME_COUNT * (RAMP_SLOT_COUNT * 2))
-#define PAIR_OBSTACLE          (PAIR_SHORELINE + 1)
-#define PAIR_HUD               (PAIR_OBSTACLE  + 1)
-#define PAIR_HINT              (PAIR_HUD       + 1)
+#define PAIR_POS(theme, slot) (1 + (theme) * (RAMP_SLOT_COUNT * 2) + (slot))
+#define PAIR_NEG(theme, slot)                                                  \
+  (1 + (theme) * (RAMP_SLOT_COUNT * 2) + RAMP_SLOT_COUNT + (slot))
+#define PAIR_SHORELINE (1 + THEME_COUNT * (RAMP_SLOT_COUNT * 2))
+#define PAIR_OBSTACLE (PAIR_SHORELINE + 1)
+#define PAIR_HUD (PAIR_OBSTACLE + 1)
+#define PAIR_HINT (PAIR_HUD + 1)
 
 /* ===================================================================== */
 /* §2  clock — monotonic ns timer + sleep                                */
 /* ===================================================================== */
 
-static int64_t clock_now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
+static int64_t clock_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
 
-static void clock_sleep_ns(int64_t ns)
-{
-    if (ns <= 0) return;
-    struct timespec ts = { ns / NS_PER_SEC, ns % NS_PER_SEC };
-    nanosleep(&ts, NULL);
+static void clock_sleep_ns(int64_t ns) {
+  if (ns <= 0)
+    return;
+  struct timespec ts = {ns / NS_PER_SEC, ns % NS_PER_SEC};
+  nanosleep(&ts, NULL);
 }
 
 /* ===================================================================== */
@@ -892,50 +921,77 @@ static void clock_sleep_ns(int64_t ns)
  * Slot 0 = sparsest, slot RAMP_SLOT_COUNT-1 = densest.
  */
 
+/*
+ * Theme — diverging palette for one of N named looks.
+ *
+ * Intent
+ *   Surface displacement η = h − h₀ is signed: crests (η > 0) lift
+ *   above mean depth, troughs (η < 0) sink below.  A theme is a
+ *   DIVERGING palette: two parallel ramps (positive / negative) so
+ *   the eye reads crests and troughs as opposed hues at a glance.
+ *
+ *   Each ramp has RAMP_SLOT_COUNT tiers; slot 0 = sparsest (faint
+ *   surface ripple), slot N-1 = densest (largest crest/trough).
+ *
+ * Why FOUR ramps (pos + neg, each with 256 and 8 variants)
+ *   pos_256 / neg_256 are the preferred 256-cube indices used when
+ *   COLORS >= 256.  pos_8 / neg_8 are the 8-colour fallbacks.
+ *   Picking by terminal capability at init keeps the renderer hot
+ *   path identical regardless.
+ *
+ * Why "diverging" rather than "monotone"
+ *   Monotone ramps lose sign — they'd colour crests and troughs the
+ *   same, which destroys the visual asymmetry that makes wave
+ *   propagation legible.  Diverging palettes are the standard
+ *   choice for signed scalar fields; see [8] Bourke and any
+ *   ColorBrewer reference.
+ *
+ * Reference [9] Raymond NCURSES HOWTO §6 — init_pair semantics.
+ */
 typedef struct {
-    const char *display_name;
-    short pos_256[RAMP_SLOT_COUNT];
-    short neg_256[RAMP_SLOT_COUNT];
-    short pos_8  [RAMP_SLOT_COUNT];
-    short neg_8  [RAMP_SLOT_COUNT];
+    const char *display_name;          /* short HUD label              */
+    short       pos_256[RAMP_SLOT_COUNT];   /* crest ramp, 256-cube    */
+    short       neg_256[RAMP_SLOT_COUNT];   /* trough ramp, 256-cube   */
+    short       pos_8  [RAMP_SLOT_COUNT];   /* crest ramp, 8-colour    */
+    short       neg_8  [RAMP_SLOT_COUNT];   /* trough ramp, 8-colour   */
 } Theme;
 
 static const Theme theme_table[THEME_COUNT] = {
     /* 0  WATER — cyan / white crests, navy troughs. */
     {
-      "water  ",
-      /* pos: dark teal → cyan → white */
-      {  31,  37,  44,  51,  87, 123, 159, 195, 231 },
-      /* neg: navy → indigo */
-      {  18,  19,  20,  21,  25,  26,  27,  31,  39 },
-      { COLOR_CYAN,  COLOR_CYAN,  COLOR_CYAN,  COLOR_CYAN,
-        COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE },
-      { COLOR_BLUE,  COLOR_BLUE,  COLOR_BLUE,  COLOR_BLUE,
-        COLOR_BLUE,  COLOR_BLUE,  COLOR_BLUE,  COLOR_CYAN,  COLOR_CYAN },
+        "water  ",
+        /* pos: dark teal → cyan → white */
+        {31, 37, 44, 51, 87, 123, 159, 195, 231},
+        /* neg: navy → indigo */
+        {18, 19, 20, 21, 25, 26, 27, 31, 39},
+        {COLOR_CYAN, COLOR_CYAN, COLOR_CYAN, COLOR_CYAN, COLOR_WHITE,
+         COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE},
+        {COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_BLUE,
+         COLOR_BLUE, COLOR_CYAN, COLOR_CYAN},
     },
     /* 1  MAGMA — red / yellow crests, dark violet troughs. */
     {
-      "magma  ",
-      /* pos: dark orange → amber → yellow → white */
-      {  88, 130, 166, 202, 208, 214, 220, 226, 231 },
-      /* neg: dark violet → indigo → blue */
-      {  53,  54,  55,  56,  57,  93,  99, 135, 141 },
-      { COLOR_RED,    COLOR_RED,    COLOR_RED,    COLOR_YELLOW,
-        COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE,  COLOR_WHITE, COLOR_WHITE },
-      { COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA,
-        COLOR_BLUE,    COLOR_BLUE,    COLOR_BLUE,    COLOR_BLUE,  COLOR_CYAN },
+        "magma  ",
+        /* pos: dark orange → amber → yellow → white */
+        {88, 130, 166, 202, 208, 214, 220, 226, 231},
+        /* neg: dark violet → indigo → blue */
+        {53, 54, 55, 56, 57, 93, 99, 135, 141},
+        {COLOR_RED, COLOR_RED, COLOR_RED, COLOR_YELLOW, COLOR_YELLOW,
+         COLOR_YELLOW, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE},
+        {COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_BLUE,
+         COLOR_BLUE, COLOR_BLUE, COLOR_BLUE, COLOR_CYAN},
     },
     /* 2  CURRENT — green / white crests, dark teal troughs. */
     {
-      "current",
-      /* pos: dark green → lime → white */
-      {  28,  34,  40,  46,  82, 118, 154, 191, 231 },
-      /* neg: dark teal */
-      {  22,  23,  29,  30,  36,  37,  44,  45,  51 },
-      { COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN,
-        COLOR_WHITE,  COLOR_WHITE,  COLOR_WHITE,  COLOR_WHITE, COLOR_WHITE },
-      { COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN,  COLOR_GREEN,
-        COLOR_CYAN,   COLOR_CYAN,   COLOR_CYAN,   COLOR_CYAN,  COLOR_CYAN },
+        "current",
+        /* pos: dark green → lime → white */
+        {28, 34, 40, 46, 82, 118, 154, 191, 231},
+        /* neg: dark teal */
+        {22, 23, 29, 30, 36, 37, 44, 45, 51},
+        {COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_WHITE,
+         COLOR_WHITE, COLOR_WHITE, COLOR_WHITE, COLOR_WHITE},
+        {COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_CYAN,
+         COLOR_CYAN, COLOR_CYAN, COLOR_CYAN, COLOR_CYAN},
     },
 };
 
@@ -945,51 +1001,48 @@ static const Theme theme_table[THEME_COUNT] = {
 
 static bool terminal_has_256_colours = false;
 
-static void colors_init(void)
-{
-    start_color();
-    use_default_colors();
-    terminal_has_256_colours = (COLORS >= 256);
+static void colors_init(void) {
+  start_color();
+  use_default_colors();
+  terminal_has_256_colours = (COLORS >= 256);
 
-    for (int t = 0; t < THEME_COUNT; t++) {
-        for (int s = 0; s < RAMP_SLOT_COUNT; s++) {
-            short pos = terminal_has_256_colours
-                      ? theme_table[t].pos_256[s]
-                      : theme_table[t].pos_8[s];
-            short neg = terminal_has_256_colours
-                      ? theme_table[t].neg_256[s]
-                      : theme_table[t].neg_8[s];
-            init_pair((short)PAIR_POS(t, s), pos, -1);
-            init_pair((short)PAIR_NEG(t, s), neg, -1);
-        }
+  for (int t = 0; t < THEME_COUNT; t++) {
+    for (int s = 0; s < RAMP_SLOT_COUNT; s++) {
+      short pos = terminal_has_256_colours ? theme_table[t].pos_256[s]
+                                           : theme_table[t].pos_8[s];
+      short neg = terminal_has_256_colours ? theme_table[t].neg_256[s]
+                                           : theme_table[t].neg_8[s];
+      init_pair((short)PAIR_POS(t, s), pos, -1);
+      init_pair((short)PAIR_NEG(t, s), neg, -1);
     }
+  }
 
-    /* Shoreline + obstacle. */
-    if (terminal_has_256_colours) {
-        init_pair(PAIR_SHORELINE,  51, -1);   /* bright cyan  */
-        init_pair(PAIR_OBSTACLE,  244, -1);   /* mid grey     */
-    } else {
-        init_pair(PAIR_SHORELINE, COLOR_CYAN,  -1);
-        init_pair(PAIR_OBSTACLE,  COLOR_WHITE, -1);
-    }
+  /* Shoreline + obstacle. */
+  if (terminal_has_256_colours) {
+    init_pair(PAIR_SHORELINE, 51, -1); /* bright cyan  */
+    init_pair(PAIR_OBSTACLE, 244, -1); /* mid grey     */
+  } else {
+    init_pair(PAIR_SHORELINE, COLOR_CYAN, -1);
+    init_pair(PAIR_OBSTACLE, COLOR_WHITE, -1);
+  }
 
-    /* HUD pairs — bright + bold per CLAUDE.md. */
-    if (terminal_has_256_colours) {
-        init_pair(PAIR_HUD,  226, -1);    /* bright yellow */
-        init_pair(PAIR_HINT,  51, -1);    /* bright cyan   */
-    } else {
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
+  /* HUD pairs — bright + bold per CLAUDE.md. */
+  if (terminal_has_256_colours) {
+    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
+    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
+  } else {
+    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN, -1);
+  }
 }
 
-static attr_t height_pair_attr(int theme_index, bool positive, int slot)
-{
-    int pair = positive ? PAIR_POS(theme_index, slot)
-                        : PAIR_NEG(theme_index, slot);
-    attr_t a = COLOR_PAIR(pair);
-    if (slot >= RAMP_SLOT_COUNT - 2) a |= A_BOLD;   /* extra punch on peaks */
-    return a;
+static attr_t height_pair_attr(int theme_index, bool positive, int slot) {
+  int pair =
+      positive ? PAIR_POS(theme_index, slot) : PAIR_NEG(theme_index, slot);
+  attr_t a = COLOR_PAIR(pair);
+  if (slot >= RAMP_SLOT_COUNT - 2)
+    a |= A_BOLD; /* extra punch on peaks */
+  return a;
 }
 
 /* ===================================================================== */
@@ -1003,32 +1056,33 @@ static attr_t height_pair_attr(int theme_index, bool positive, int slot)
  */
 
 static const char ramp_glyph_table[RAMP_SLOT_COUNT] = {
-    ' ',   /* 0 — at rest                        */
-    '.',   /* 1 — tiny ripple                    */
-    ':',   /* 2 — gentle swell                   */
-    '+',   /* 3 — moderate wave                  */
-    'x',   /* 4 — strong wave                    */
-    '*',   /* 5 — intense surge                  */
-    'X',   /* 6 — near-crest                     */
-    '#',   /* 7 — high crest / deep trough       */
-    '@',   /* 8 — peak (clipped at DISPLAY_RANGE) */
+    ' ', /* 0 — at rest                        */
+    '.', /* 1 — tiny ripple                    */
+    ':', /* 2 — gentle swell                   */
+    '+', /* 3 — moderate wave                  */
+    'x', /* 4 — strong wave                    */
+    '*', /* 5 — intense surge                  */
+    'X', /* 6 — near-crest                     */
+    '#', /* 7 — high crest / deep trough       */
+    '@', /* 8 — peak (clipped at DISPLAY_RANGE) */
 };
 
 static const float ramp_threshold_table[RAMP_SLOT_COUNT] = {
-    0.000f, 0.030f, 0.090f, 0.200f, 0.340f,
-    0.500f, 0.660f, 0.820f, 0.940f,
+    0.000f, 0.030f, 0.090f, 0.200f, 0.340f, 0.500f, 0.660f, 0.820f, 0.940f,
 };
 
 /* normalised_to_slot — map normalised |h|/range ∈ [0, 1] (gamma 2.2)
  * to a ramp slot index 0..RAMP_SLOT_COUNT-1. */
-static int normalised_height_to_slot(float normalised)
-{
-    if (normalised <= 0.0f) return 0;
-    if (normalised >= 1.0f) return RAMP_SLOT_COUNT - 1;
-    float gamma_corrected = powf(normalised, 1.0f / 2.2f);
-    for (int i = RAMP_SLOT_COUNT - 1; i >= 0; i--)
-        if (gamma_corrected >= ramp_threshold_table[i]) return i;
+static int normalised_height_to_slot(float normalised) {
+  if (normalised <= 0.0f)
     return 0;
+  if (normalised >= 1.0f)
+    return RAMP_SLOT_COUNT - 1;
+  float gamma_corrected = powf(normalised, 1.0f / 2.2f);
+  for (int i = RAMP_SLOT_COUNT - 1; i >= 0; i--)
+    if (gamma_corrected >= ramp_threshold_table[i])
+      return i;
+  return 0;
 }
 
 /* ===================================================================== */
@@ -1041,31 +1095,26 @@ static int normalised_height_to_slot(float normalised)
  * Index convention: [row][col].  row 0 = top of screen.
  */
 
-static float height_perturbation [GRID_ROWS_MAX][GRID_COLS_MAX];
-static float velocity_x          [GRID_ROWS_MAX][GRID_COLS_MAX];
-static float velocity_y          [GRID_ROWS_MAX][GRID_COLS_MAX];
-static bool  wall_mask           [GRID_ROWS_MAX][GRID_COLS_MAX];
+static float height_perturbation[GRID_ROWS_MAX][GRID_COLS_MAX];
+static float velocity_x[GRID_ROWS_MAX][GRID_COLS_MAX];
+static float velocity_y[GRID_ROWS_MAX][GRID_COLS_MAX];
+static bool wall_mask[GRID_ROWS_MAX][GRID_COLS_MAX];
 
-static int   grid_active_rows = 0;
-static int   grid_active_cols = 0;
+static int grid_active_rows = 0;
+static int grid_active_cols = 0;
 
 /* Zero ALL three fluid fields (does NOT touch wall_mask). */
-static void grid_zero_fluid_fields(void)
-{
-    for (int r = 0; r < grid_active_rows; r++) {
-        memset(height_perturbation[r], 0,
-               (size_t)grid_active_cols * sizeof(float));
-        memset(velocity_x[r], 0,
-               (size_t)grid_active_cols * sizeof(float));
-        memset(velocity_y[r], 0,
-               (size_t)grid_active_cols * sizeof(float));
-    }
+static void grid_zero_fluid_fields(void) {
+  for (int r = 0; r < grid_active_rows; r++) {
+    memset(height_perturbation[r], 0, (size_t)grid_active_cols * sizeof(float));
+    memset(velocity_x[r], 0, (size_t)grid_active_cols * sizeof(float));
+    memset(velocity_y[r], 0, (size_t)grid_active_cols * sizeof(float));
+  }
 }
 
-static void grid_clear_walls(void)
-{
-    for (int r = 0; r < grid_active_rows; r++)
-        memset(wall_mask[r], 0, (size_t)grid_active_cols * sizeof(bool));
+static void grid_clear_walls(void) {
+  for (int r = 0; r < grid_active_rows; r++)
+    memset(wall_mask[r], 0, (size_t)grid_active_cols * sizeof(bool));
 }
 
 /* ===================================================================== */
@@ -1081,73 +1130,111 @@ static void grid_clear_walls(void)
  *   BC_PERIODIC  All fields copy from the OPPOSITE side.  Torus.
  */
 
-static void apply_boundary(int boundary_kind)
-{
+/* Energy-conserving REFLECTION BC on the top/bottom walls:
+ * normal velocity (v_y) is forced to ZERO, tangential velocity (v_x)
+ * and surface height MIRROR the inner cells.  Mathematically equivalent
+ * to placing a phantom cell across the wall with opposite-sign normal
+ * velocity — gives a perfect bounce.  [1] Stoker §6.  */
+static inline void bc_wall_top_bottom(int rows, int cols) {
+    for (int c = 0; c < cols; c++) {
+        velocity_y         [0       ][c] = 0.0f;
+        velocity_y         [rows - 1][c] = 0.0f;
+        velocity_x         [0       ][c] = velocity_x         [1       ][c];
+        velocity_x         [rows - 1][c] = velocity_x         [rows - 2][c];
+        height_perturbation[0       ][c] = height_perturbation[1       ][c];
+        height_perturbation[rows - 1][c] = height_perturbation[rows - 2][c];
+    }
+}
+
+/* Energy-conserving REFLECTION BC on the left/right walls: same idea
+ * as the top/bottom helper but with v_x as the normal component. */
+static inline void bc_wall_left_right(int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        velocity_x         [r][0       ] = 0.0f;
+        velocity_x         [r][cols - 1] = 0.0f;
+        velocity_y         [r][0       ] = velocity_y         [r][1       ];
+        velocity_y         [r][cols - 1] = velocity_y         [r][cols - 2];
+        height_perturbation[r][0       ] = height_perturbation[r][1       ];
+        height_perturbation[r][cols - 1] = height_perturbation[r][cols - 2];
+    }
+}
+
+/* OPEN (Neumann zero-gradient) BC on top/bottom: every field copied
+ * from the nearest interior cell.  Crude radiation BC — some energy
+ * leaks out, some still reflects.  Good enough for the visual demo. */
+static inline void bc_open_top_bottom(int rows, int cols) {
+    for (int c = 0; c < cols; c++) {
+        height_perturbation[0       ][c] = height_perturbation[1       ][c];
+        velocity_x         [0       ][c] = velocity_x         [1       ][c];
+        velocity_y         [0       ][c] = velocity_y         [1       ][c];
+        height_perturbation[rows - 1][c] = height_perturbation[rows - 2][c];
+        velocity_x         [rows - 1][c] = velocity_x         [rows - 2][c];
+        velocity_y         [rows - 1][c] = velocity_y         [rows - 2][c];
+    }
+}
+
+/* OPEN BC on left/right — symmetric to top/bottom. */
+static inline void bc_open_left_right(int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        height_perturbation[r][0       ] = height_perturbation[r][1       ];
+        velocity_x         [r][0       ] = velocity_x         [r][1       ];
+        velocity_y         [r][0       ] = velocity_y         [r][1       ];
+        height_perturbation[r][cols - 1] = height_perturbation[r][cols - 2];
+        velocity_x         [r][cols - 1] = velocity_x         [r][cols - 2];
+        velocity_y         [r][cols - 1] = velocity_y         [r][cols - 2];
+    }
+}
+
+/* PERIODIC (wrap-around) BC on top/bottom: each border row copies
+ * from the OPPOSITE side's interior row, making the grid a torus
+ * vertically.  No reflection, no energy loss. */
+static inline void bc_periodic_top_bottom(int rows, int cols) {
+    for (int c = 0; c < cols; c++) {
+        height_perturbation[0       ][c] = height_perturbation[rows - 2][c];
+        velocity_x         [0       ][c] = velocity_x         [rows - 2][c];
+        velocity_y         [0       ][c] = velocity_y         [rows - 2][c];
+        height_perturbation[rows - 1][c] = height_perturbation[1       ][c];
+        velocity_x         [rows - 1][c] = velocity_x         [1       ][c];
+        velocity_y         [rows - 1][c] = velocity_y         [1       ][c];
+    }
+}
+
+/* PERIODIC BC on left/right — symmetric to top/bottom. */
+static inline void bc_periodic_left_right(int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        height_perturbation[r][0       ] = height_perturbation[r][cols - 2];
+        velocity_x         [r][0       ] = velocity_x         [r][cols - 2];
+        velocity_y         [r][0       ] = velocity_y         [r][cols - 2];
+        height_perturbation[r][cols - 1] = height_perturbation[r][1       ];
+        velocity_x         [r][cols - 1] = velocity_x         [r][1       ];
+        velocity_y         [r][cols - 1] = velocity_y         [r][1       ];
+    }
+}
+
+/*
+ * apply_boundary — dispatch the right BC helper for the active kind.
+ *
+ * Pseudocode:
+ *   switch boundary_kind:
+ *     BC_WALL     : bc_wall_top_bottom     + bc_wall_left_right
+ *     BC_OPEN     : bc_open_top_bottom     + bc_open_left_right
+ *     BC_PERIODIC : bc_periodic_top_bottom + bc_periodic_left_right
+ *
+ * Called after every velocity AND height update so the next pass's
+ * neighbour reads automatically satisfy the chosen condition.
+ */
+static void apply_boundary(int boundary_kind) {
     int rows = grid_active_rows;
     int cols = grid_active_cols;
 
     switch (boundary_kind) {
-
-        case BC_WALL:
-            for (int c = 0; c < cols; c++) {
-                /* Top/bottom: vertical velocity zero, others mirror. */
-                velocity_y[0][c]                  = 0.0f;
-                velocity_y[rows - 1][c]           = 0.0f;
-                velocity_x[0][c]                  = velocity_x[1][c];
-                velocity_x[rows - 1][c]           = velocity_x[rows - 2][c];
-                height_perturbation[0][c]         = height_perturbation[1][c];
-                height_perturbation[rows - 1][c]  = height_perturbation[rows - 2][c];
-            }
-            for (int r = 0; r < rows; r++) {
-                /* Left/right: horizontal velocity zero, others mirror. */
-                velocity_x[r][0]                  = 0.0f;
-                velocity_x[r][cols - 1]           = 0.0f;
-                velocity_y[r][0]                  = velocity_y[r][1];
-                velocity_y[r][cols - 1]           = velocity_y[r][cols - 2];
-                height_perturbation[r][0]         = height_perturbation[r][1];
-                height_perturbation[r][cols - 1]  = height_perturbation[r][cols - 2];
-            }
-            break;
-
-        case BC_OPEN:
-            for (int c = 0; c < cols; c++) {
-                height_perturbation[0][c]        = height_perturbation[1][c];
-                velocity_x[0][c]                 = velocity_x[1][c];
-                velocity_y[0][c]                 = velocity_y[1][c];
-                height_perturbation[rows - 1][c] = height_perturbation[rows - 2][c];
-                velocity_x[rows - 1][c]          = velocity_x[rows - 2][c];
-                velocity_y[rows - 1][c]          = velocity_y[rows - 2][c];
-            }
-            for (int r = 0; r < rows; r++) {
-                height_perturbation[r][0]        = height_perturbation[r][1];
-                velocity_x[r][0]                 = velocity_x[r][1];
-                velocity_y[r][0]                 = velocity_y[r][1];
-                height_perturbation[r][cols - 1] = height_perturbation[r][cols - 2];
-                velocity_x[r][cols - 1]          = velocity_x[r][cols - 2];
-                velocity_y[r][cols - 1]          = velocity_y[r][cols - 2];
-            }
-            break;
-
-        case BC_PERIODIC:
-            for (int c = 0; c < cols; c++) {
-                height_perturbation[0][c]        = height_perturbation[rows - 2][c];
-                velocity_x[0][c]                 = velocity_x[rows - 2][c];
-                velocity_y[0][c]                 = velocity_y[rows - 2][c];
-                height_perturbation[rows - 1][c] = height_perturbation[1][c];
-                velocity_x[rows - 1][c]          = velocity_x[1][c];
-                velocity_y[rows - 1][c]          = velocity_y[1][c];
-            }
-            for (int r = 0; r < rows; r++) {
-                height_perturbation[r][0]        = height_perturbation[r][cols - 2];
-                velocity_x[r][0]                 = velocity_x[r][cols - 2];
-                velocity_y[r][0]                 = velocity_y[r][cols - 2];
-                height_perturbation[r][cols - 1] = height_perturbation[r][1];
-                velocity_x[r][cols - 1]          = velocity_x[r][1];
-                velocity_y[r][cols - 1]          = velocity_y[r][1];
-            }
-            break;
-
-        default: break;
+        case BC_WALL:     bc_wall_top_bottom    (rows, cols);
+                          bc_wall_left_right    (rows, cols); break;
+        case BC_OPEN:     bc_open_top_bottom    (rows, cols);
+                          bc_open_left_right    (rows, cols); break;
+        case BC_PERIODIC: bc_periodic_top_bottom(rows, cols);
+                          bc_periodic_left_right(rows, cols); break;
+        default:          break;
     }
 }
 
@@ -1157,52 +1244,50 @@ static void apply_boundary(int boundary_kind)
 
 /* zero all three fields inside obstacle cells.  Called after every
  * velocity/height update so obstacles act as fixed reflectors. */
-static void zero_fields_in_walls(void)
-{
-    for (int r = 0; r < grid_active_rows; r++)
-        for (int c = 0; c < grid_active_cols; c++)
-            if (wall_mask[r][c]) {
-                height_perturbation[r][c] = 0.0f;
-                velocity_x[r][c]          = 0.0f;
-                velocity_y[r][c]          = 0.0f;
-            }
+static void zero_fields_in_walls(void) {
+  for (int r = 0; r < grid_active_rows; r++)
+    for (int c = 0; c < grid_active_cols; c++)
+      if (wall_mask[r][c]) {
+        height_perturbation[r][c] = 0.0f;
+        velocity_x[r][c] = 0.0f;
+        velocity_y[r][c] = 0.0f;
+      }
 }
 
 /* obstacle_build_channel — two horizontal walls forming a narrow
  * east-west channel (gap in the centre).  Used by PRESET_CHANNEL. */
-static void obstacle_build_channel(void)
-{
-    int wall_top    = grid_active_rows / 3;
-    int wall_bottom = (grid_active_rows * 2) / 3;
-    int left_col    = grid_active_cols / 4;
-    int right_col   = (grid_active_cols * 3) / 4;
+static void obstacle_build_channel(void) {
+  int wall_top = grid_active_rows / 3;
+  int wall_bottom = (grid_active_rows * 2) / 3;
+  int left_col = grid_active_cols / 4;
+  int right_col = (grid_active_cols * 3) / 4;
 
-    for (int r = 0; r < grid_active_rows; r++) {
-        if (r < wall_top || r > wall_bottom) {
-            for (int c = left_col; c <= right_col; c++)
-                wall_mask[r][c] = true;
-        }
+  for (int r = 0; r < grid_active_rows; r++) {
+    if (r < wall_top || r > wall_bottom) {
+      for (int c = left_col; c <= right_col; c++)
+        wall_mask[r][c] = true;
     }
+  }
 }
 
 /* obstacle_build_circle — solid circular disc at domain centre.
  * Used by PRESET_OBSTACLE.  Radius = 12% of smaller dimension. */
-static void obstacle_build_circle(void)
-{
-    float cx = (float)(grid_active_cols - 1) * 0.5f;
-    float cy = (float)(grid_active_rows - 1) * 0.5f;
-    float radius = (grid_active_rows < grid_active_cols
-                  ? grid_active_rows : grid_active_cols) * 0.12f;
-    float radius_squared = radius * radius;
+static void obstacle_build_circle(void) {
+  float cx = (float)(grid_active_cols - 1) * 0.5f;
+  float cy = (float)(grid_active_rows - 1) * 0.5f;
+  float radius = (grid_active_rows < grid_active_cols ? grid_active_rows
+                                                      : grid_active_cols) *
+                 0.12f;
+  float radius_squared = radius * radius;
 
-    for (int r = 0; r < grid_active_rows; r++) {
-        for (int c = 0; c < grid_active_cols; c++) {
-            float dx = (float)c - cx;
-            float dy = (float)r - cy;
-            if (dx * dx + dy * dy < radius_squared)
-                wall_mask[r][c] = true;
-        }
+  for (int r = 0; r < grid_active_rows; r++) {
+    for (int c = 0; c < grid_active_cols; c++) {
+      float dx = (float)c - cx;
+      float dy = (float)r - cy;
+      if (dx * dx + dy * dy < radius_squared)
+        wall_mask[r][c] = true;
     }
+  }
 }
 
 /* ===================================================================== */
@@ -1216,29 +1301,73 @@ static void obstacle_build_circle(void)
  * (unchanged this tick), writes u and v in place.  Skips obstacle
  * cells.
  */
+/* Forward-difference height gradient at cell (r, c):
+ *   ∂h/∂x ≈ h[r, c+1] − h[r, c]
+ *   ∂h/∂y ≈ h[r+1, c] − h[r, c]
+ *
+ * "Forward" because the next cell minus this cell; in the SAINT-VENANT
+ * SWE [3] the momentum equation reads ∂u/∂t = −g·∇h, so the gradient
+ * points UPHILL and the minus sign in update_velocity turns it into a
+ * DOWNHILL push.  Refs [4] LeVeque §4. */
+static inline void forward_height_gradient_at(int r, int c,
+                                               float *out_dh_dx,
+                                               float *out_dh_dy) {
+    *out_dh_dx = height_perturbation[r    ][c + 1] - height_perturbation[r][c];
+    *out_dh_dy = height_perturbation[r + 1][c    ] - height_perturbation[r][c];
+}
+
+/* Per-step damping factor for bottom friction.  Implements
+ *   v_new = v · (1 − c_f · Δt)
+ * which is the explicit-Euler form of the linearised Manning drag.
+ * Clamped to [0, 1] so a too-large c_f·dt doesn't flip velocities. */
+static inline float bottom_friction_damping_factor(float bottom_friction_coeff,
+                                                    float dt_seconds) {
+    float damping = 1.0f - bottom_friction_coeff * dt_seconds;
+    return damping < 0.0f ? 0.0f : damping;
+}
+
+/* One cell's full velocity update: subtract g·dt·∇h (momentum
+ * equation), then multiply by the friction damping factor.  Reads h
+ * (unchanged this tick), writes (u, v) in place.  Skips obstacle
+ * cells — they stay at zero velocity via zero_fields_in_walls. */
+static inline void update_velocity_at_cell(int r, int c,
+                                            float gravity_acceleration,
+                                            float dt_seconds,
+                                            float damping_factor) {
+    if (wall_mask[r][c]) return;
+    float dh_dx, dh_dy;
+    forward_height_gradient_at(r, c, &dh_dx, &dh_dy);
+    velocity_x[r][c] -= gravity_acceleration * dt_seconds * dh_dx;
+    velocity_y[r][c] -= gravity_acceleration * dt_seconds * dh_dy;
+    velocity_x[r][c] *= damping_factor;
+    velocity_y[r][c] *= damping_factor;
+}
+
+/*
+ * update_velocity — Saint-Venant momentum equation:
+ *
+ *   ∂u/∂t = −g·∂h/∂x  −  c_f·u
+ *   ∂v/∂t = −g·∂h/∂y  −  c_f·v
+ *
+ * Pseudocode:
+ *   damping = bottom_friction_damping_factor(c_f, dt)
+ *   for each interior cell (r, c):
+ *     update_velocity_at_cell(r, c, g, dt, damping)
+ *
+ * Reads h (unchanged), writes (u, v).  Refs [3] Saint-Venant 1871;
+ * [4] LeVeque ch. 4 for the CFL bound c·dt/dx ≤ 1.
+ */
 static void update_velocity(float gravity_acceleration,
-                            float bottom_friction_coeff,
-                            float dt_seconds)
-{
-    float damping_factor = 1.0f - bottom_friction_coeff * dt_seconds;
-    if (damping_factor < 0.0f) damping_factor = 0.0f;
+                             float bottom_friction_coeff, float dt_seconds) {
+    float damping_factor = bottom_friction_damping_factor(bottom_friction_coeff,
+                                                          dt_seconds);
+    int   rows = grid_active_rows;
+    int   cols = grid_active_cols;
 
-    int rows = grid_active_rows;
-    int cols = grid_active_cols;
-
-    for (int r = 1; r < rows - 1; r++) {
-        for (int c = 1; c < cols - 1; c++) {
-            if (wall_mask[r][c]) continue;
-            velocity_x[r][c] -= gravity_acceleration * dt_seconds *
-                (height_perturbation[r][c + 1]
-               - height_perturbation[r][c]);
-            velocity_y[r][c] -= gravity_acceleration * dt_seconds *
-                (height_perturbation[r + 1][c]
-               - height_perturbation[r][c]);
-            velocity_x[r][c] *= damping_factor;
-            velocity_y[r][c] *= damping_factor;
-        }
-    }
+    for (int r = 1; r < rows - 1; r++)
+        for (int c = 1; c < cols - 1; c++)
+            update_velocity_at_cell(r, c, gravity_acceleration, dt_seconds,
+                                     damping_factor);
 }
 
 /* ===================================================================== */
@@ -1253,61 +1382,152 @@ static void update_velocity(float gravity_acceleration,
  *
  * MUST be a separate loop from update_velocity — see T6.
  */
-static void update_height(float dt_seconds)
-{
+/* Backward-difference velocity divergence at cell (r, c):
+ *   ∇·v ≈ (u[r, c] − u[r, c-1]) + (v[r, c] − v[r-1, c])
+ *
+ * "Backward" because this cell minus the previous cell — pairs with
+ * the FORWARD differences in update_velocity to form a STAGGERED
+ * grid that gives second-order accuracy [5] Arakawa & Lamb 1977. */
+static inline float backward_velocity_divergence_at(int r, int c) {
+    float divergence_x = velocity_x[r    ][c] - velocity_x[r    ][c - 1];
+    float divergence_y = velocity_y[r    ][c] - velocity_y[r - 1][c    ];
+    return divergence_x + divergence_y;
+}
+
+/* One cell's height update from the SWE continuity equation:
+ *
+ *   ∂h/∂t = −H₀ · ∇·v
+ *
+ * H₀ is the REST depth (the linearised form assumes |h| ≪ H₀).
+ * Reads (u, v) just updated by update_velocity, writes h in place. */
+static inline void update_height_at_cell(int r, int c, float dt_seconds) {
+    if (wall_mask[r][c]) return;
+    float divergence = backward_velocity_divergence_at(r, c);
+    height_perturbation[r][c] -= REST_DEPTH * divergence * dt_seconds;
+}
+
+/*
+ * update_height — Saint-Venant continuity (mass conservation):
+ *
+ *   ∂h/∂t = −H₀ · ∇·v
+ *
+ * Pseudocode:
+ *   for each interior cell (r, c):
+ *     update_height_at_cell(r, c, dt)
+ *
+ * MUST be a SEPARATE LOOP after update_velocity — the forward/backward
+ * staggered scheme requires velocity to be fully updated before h is
+ * read for the next velocity step.  Refs [3] Saint-Venant 1871; [5]
+ * Arakawa & Lamb 1977 for the C-grid staggering.
+ */
+static void update_height(float dt_seconds) {
     int rows = grid_active_rows;
     int cols = grid_active_cols;
 
-    for (int r = 1; r < rows - 1; r++) {
-        for (int c = 1; c < cols - 1; c++) {
-            if (wall_mask[r][c]) continue;
-            float divergence_x = velocity_x[r][c] - velocity_x[r][c - 1];
-            float divergence_y = velocity_y[r][c] - velocity_y[r - 1][c];
-            height_perturbation[r][c] -=
-                REST_DEPTH * (divergence_x + divergence_y) * dt_seconds;
-        }
-    }
+    for (int r = 1; r < rows - 1; r++)
+        for (int c = 1; c < cols - 1; c++)
+            update_height_at_cell(r, c, dt_seconds);
 }
 
 /* ===================================================================== */
 /* §11  stats — max-h, avg-vel, wave speed, CFL                          */
 /* ===================================================================== */
 
+/*
+ * SimStats — per-frame snapshot of physical-state diagnostics.
+ *
+ * Intent
+ *   The HUD shows live numbers for the wave's energy + speed + stability
+ *   margin.  scan_stats() computes all four in ONE pass over the field
+ *   so the HUD reads a flattened snapshot rather than re-scanning the
+ *   grid in each paint helper.
+ *
+ * Why these four metrics
+ *   - max_abs_height  → "how big are the waves" (most useful visual)
+ *   - average_speed   → "how much energy is flowing right now"
+ *   - wave_speed      → √(g·h) — the SWE characteristic speed; sets
+ *                       the upper bound on dt via CFL.  [4] LeVeque §4.
+ *   - cfl_number      → c·dt/dx — when this approaches 1 the scheme is
+ *                       at its stability limit; the HUD colours it
+ *                       red so the user knows when to back off dt.
+ *
+ * Lifetime
+ *   Built once per frame in the stats scan, passed by const pointer to
+ *   the HUD painters.  Not part of the simulation state itself —
+ *   discarded at end of frame.
+ *
+ * Reference [4] LeVeque ch. 4 for the CFL bound on hyperbolic schemes.
+ */
 typedef struct {
-    float max_abs_height;
-    float average_speed;
-    float wave_speed;
-    float cfl_number;
+    float max_abs_height;   /* max |η| over the grid this frame      */
+    float average_speed;    /* mean |v| over the grid                 */
+    float wave_speed;       /* c = √(g·h_mean)                        */
+    float cfl_number;       /* c·dt/dx — stability indicator          */
 } SimStats;
 
-static void compute_sim_stats(float gravity_acceleration,
-                              float dt_seconds,
-                              SimStats *out_stats)
-{
-    float max_h = 0.0f;
+/* |v| at one cell.  Used by the stats scan to accumulate average
+ * flow speed and by the HUD for the "energy is moving" readout. */
+static inline float velocity_magnitude_at(int r, int c) {
+    return sqrtf(velocity_x[r][c] * velocity_x[r][c] +
+                 velocity_y[r][c] * velocity_y[r][c]);
+}
+
+/* Single-pass scan of the interior cells for max |η| and average |v|.
+ * Output parameters are filled with the running totals; wall cells
+ * are skipped (they're forced to zero by zero_fields_in_walls and
+ * would bias the average toward zero). */
+static inline void scan_max_height_and_average_speed(float *out_max_h,
+                                                      float *out_avg_speed) {
+    float  max_h     = 0.0f;
     double speed_sum = 0.0;
     int    counted   = 0;
 
     int rows = grid_active_rows;
     int cols = grid_active_cols;
-
     for (int r = 1; r < rows - 1; r++) {
         for (int c = 1; c < cols - 1; c++) {
             if (wall_mask[r][c]) continue;
             float ah = fabsf(height_perturbation[r][c]);
             if (ah > max_h) max_h = ah;
-            float speed = sqrtf(velocity_x[r][c] * velocity_x[r][c]
-                              + velocity_y[r][c] * velocity_y[r][c]);
-            speed_sum += (double)speed;
+            speed_sum += (double)velocity_magnitude_at(r, c);
             counted++;
         }
     }
 
-    out_stats->max_abs_height = max_h;
-    out_stats->average_speed  = (counted > 0)
-                              ? (float)(speed_sum / counted) : 0.0f;
-    out_stats->wave_speed     = sqrtf(gravity_acceleration * REST_DEPTH);
-    out_stats->cfl_number     = out_stats->wave_speed * dt_seconds;
+    *out_max_h     = max_h;
+    *out_avg_speed = (counted > 0) ? (float)(speed_sum / counted) : 0.0f;
+}
+
+/* The SWE CHARACTERISTIC SPEED c = √(g·H₀) — the speed at which
+ * small surface perturbations propagate.  Sets the upper bound on
+ * the stable timestep via CFL.  Refs [1] Stoker §2.4, [4] LeVeque §3. */
+static inline float swe_wave_speed(float gravity_acceleration) {
+    return sqrtf(gravity_acceleration * REST_DEPTH);
+}
+
+/* CFL number = c · dt / dx (here dx = 1 cell, so c · dt).  When this
+ * approaches 1 the scheme is at its stability cliff; the HUD colours
+ * it red so the user knows when to back off dt.  Refs [4] LeVeque
+ * ch. 4 — the canonical Courant condition for hyperbolic schemes. */
+static inline float swe_cfl_number(float wave_speed, float dt_seconds) {
+    return wave_speed * dt_seconds;
+}
+
+/*
+ * compute_sim_stats — fill the SimStats snapshot in ONE grid pass.
+ *
+ * Pseudocode:
+ *   scan_max_height_and_average_speed(&max_h, &avg_speed)
+ *   wave_speed = swe_wave_speed(g)
+ *   cfl        = swe_cfl_number(wave_speed, dt)
+ *   write all four into *out_stats
+ */
+static void compute_sim_stats(float gravity_acceleration, float dt_seconds,
+                              SimStats *out_stats) {
+    scan_max_height_and_average_speed(&out_stats->max_abs_height,
+                                       &out_stats->average_speed);
+    out_stats->wave_speed = swe_wave_speed(gravity_acceleration);
+    out_stats->cfl_number = swe_cfl_number(out_stats->wave_speed, dt_seconds);
 }
 
 /* ===================================================================== */
@@ -1322,18 +1542,14 @@ static void compute_sim_stats(float gravity_acceleration,
  *   5. compute live stats (§11)
  */
 
-static void swe_step(int boundary_kind,
-                     float gravity_acceleration,
-                     float bottom_friction_coeff,
-                     float dt_seconds,
-                     SimStats *out_stats)
-{
-    update_velocity(gravity_acceleration, bottom_friction_coeff,
-                    dt_seconds);
-    update_height(dt_seconds);
-    zero_fields_in_walls();
-    apply_boundary(boundary_kind);
-    compute_sim_stats(gravity_acceleration, dt_seconds, out_stats);
+static void swe_step(int boundary_kind, float gravity_acceleration,
+                     float bottom_friction_coeff, float dt_seconds,
+                     SimStats *out_stats) {
+  update_velocity(gravity_acceleration, bottom_friction_coeff, dt_seconds);
+  update_height(dt_seconds);
+  zero_fields_in_walls();
+  apply_boundary(boundary_kind);
+  compute_sim_stats(gravity_acceleration, dt_seconds, out_stats);
 }
 
 /* ===================================================================== */
@@ -1345,46 +1561,104 @@ static void swe_step(int boundary_kind,
  * u, v left untouched (impulsive vertical displacement, no
  * initial momentum).  The next tick's velocity update launches
  * a ring outward. */
-static void apply_gaussian_drop(float cx, float cy,
-                                float amplitude, float sigma)
-{
+/* Evaluate a 2-D Gaussian at squared distance d² from its centre:
+ *   amplitude · exp(−d² / 2σ²)
+ * Pre-multiplying 1/(2σ²) lets the caller avoid recomputing it per
+ * cell — useful because this function is called inside an inner
+ * loop with thousands of cells. */
+static inline float gaussian_value(float dx_sq, float dy_sq, float amplitude,
+                                    float inv_two_sigma_sq) {
+    return amplitude * expf(-(dx_sq + dy_sq) * inv_two_sigma_sq);
+}
+
+/* Add a Gaussian pulse to cell (r, c)'s height.  Skips obstacle cells
+ * (their height is forced to zero — incrementing them would create
+ * spurious wave fronts at the wall edge next tick). */
+static inline void add_gaussian_pulse_to_cell(int r, int c,
+                                               float cx, float cy,
+                                               float amplitude,
+                                               float inv_two_sigma_sq) {
+    if (wall_mask[r][c]) return;
+    float dx    = (float)c - cx;
+    float dy    = (float)r - cy;
+    height_perturbation[r][c] +=
+        gaussian_value(dx * dx, dy * dy, amplitude, inv_two_sigma_sq);
+}
+
+/*
+ * apply_gaussian_drop — additive Gaussian PULSE in the height field
+ * at (cx, cy).  Velocity is left untouched (impulsive vertical
+ * displacement, no initial momentum); the next tick's update_velocity
+ * call launches a propagating ring.
+ *
+ *   h[r, c] += A · exp(−((c − cx)² + (r − cy)²) / 2σ²)
+ *
+ * Pseudocode:
+ *   inv_two_sigma_sq = 1 / (2σ²)
+ *   for each cell (r, c):
+ *     add_gaussian_pulse_to_cell(r, c, cx, cy, A, inv_two_sigma_sq)
+ */
+static void apply_gaussian_drop(float cx, float cy, float amplitude,
+                                 float sigma) {
     float inv_two_sigma_sq = 1.0f / (2.0f * sigma * sigma);
-    for (int r = 0; r < grid_active_rows; r++) {
-        float dy = (float)r - cy;
-        float dy_sq = dy * dy;
-        for (int c = 0; c < grid_active_cols; c++) {
-            if (wall_mask[r][c]) continue;
-            float dx = (float)c - cx;
-            height_perturbation[r][c] += amplitude
-                * expf(-(dx * dx + dy_sq) * inv_two_sigma_sq);
-        }
-    }
+    for (int r = 0; r < grid_active_rows; r++)
+        for (int c = 0; c < grid_active_cols; c++)
+            add_gaussian_pulse_to_cell(r, c, cx, cy, amplitude,
+                                        inv_two_sigma_sq);
 }
 
 /* apply_dam_break_initial_state — ±DAM_AMP step at the vertical
  * midline.  Used by PRESET_DAM_BREAK and the 'b' key. */
-static void apply_dam_break_initial_state(void)
-{
-    int half_col = grid_active_cols / 2;
-    for (int r = 0; r < grid_active_rows; r++) {
-        for (int c = 0; c < grid_active_cols; c++) {
-            if (wall_mask[r][c]) continue;
-            height_perturbation[r][c] = (c < half_col)
-                ?  DAM_BREAK_AMPLITUDE
-                : -DAM_BREAK_AMPLITUDE;
-        }
+static void apply_dam_break_initial_state(void) {
+  int half_col = grid_active_cols / 2;
+  for (int r = 0; r < grid_active_rows; r++) {
+    for (int c = 0; c < grid_active_cols; c++) {
+      if (wall_mask[r][c])
+        continue;
+      height_perturbation[r][c] =
+          (c < half_col) ? DAM_BREAK_AMPLITUDE : -DAM_BREAK_AMPLITUDE;
     }
+  }
 }
 
 /* ===================================================================== */
 /* §14  presets — 4 scene loaders + table                                */
 /* ===================================================================== */
 
+/*
+ * Preset — one named scenario for the shallow-water demo.
+ *
+ * Intent
+ *   Each preset demonstrates a different fundamental SWE phenomenon:
+ *     - dam_break    : classical Riemann problem (Stoker §6) — water
+ *                      column on one side, dry on the other; wavefront
+ *                      propagates at √(g·h).
+ *     - radial_drop  : single Gaussian impulse → expanding ring.
+ *     - channel      : narrow inlet feeds a basin; wave + shoaling.
+ *     - obstacle     : flow around a solid; wakes + reflections.
+ *
+ *   Pressing 1..N calls the preset's loader, which writes initial h
+ *   and (u, v) fields directly.
+ *
+ * Why a function-pointer loader (not a parameter table)
+ *   Each scenario differs in INITIAL-CONDITION GEOMETRY rather than
+ *   in a few numeric parameters — different spatial patterns, some
+ *   with obstacles, some without.  Function pointers let each loader
+ *   write whatever pattern it needs without trying to encode every
+ *   scene's geometry into a shared parameter struct.
+ *
+ * Why the loader takes a boundary_kind argument
+ *   After loading initial conditions, the preset has to RE-APPLY the
+ *   boundary condition (reflecting / periodic / absorbing) to the
+ *   newly-written cells.  Passing it explicitly avoids tight coupling
+ *   to a global "current boundary kind" variable.
+ *
+ * Reference [1] Stoker §6 for the dam-break Riemann problem.
+ */
 typedef struct {
-    const char *display_name;
-    /* Loader takes the active boundary_kind so it can re-apply BC
-     * after writing initial conditions. */
-    void (*loader)(int boundary_kind);
+    const char *display_name;                  /* short HUD label      */
+    void      (*loader)(int boundary_kind);    /* writes ICs + reapplies
+                                                * BC after writing      */
 } Preset;
 
 static void preset_dam_break(int boundary_kind);
@@ -1393,57 +1667,52 @@ static void preset_channel(int boundary_kind);
 static void preset_obstacle(int boundary_kind);
 
 static const Preset preset_table[PRESET_COUNT] = {
-    { "dam_break  ", preset_dam_break   },
-    { "radial_drop", preset_radial_drop },
-    { "channel    ", preset_channel    },
-    { "obstacle   ", preset_obstacle   },
+    {"dam_break  ", preset_dam_break},
+    {"radial_drop", preset_radial_drop},
+    {"channel    ", preset_channel},
+    {"obstacle   ", preset_obstacle},
 };
 
-static void preset_dam_break(int boundary_kind)
-{
-    grid_clear_walls();
-    grid_zero_fluid_fields();
-    apply_dam_break_initial_state();
-    apply_boundary(boundary_kind);
+static void preset_dam_break(int boundary_kind) {
+  grid_clear_walls();
+  grid_zero_fluid_fields();
+  apply_dam_break_initial_state();
+  apply_boundary(boundary_kind);
 }
 
-static void preset_radial_drop(int boundary_kind)
-{
-    grid_clear_walls();
-    grid_zero_fluid_fields();
-    float cx = (float)(grid_active_cols - 1) * 0.5f;
-    float cy = (float)(grid_active_rows - 1) * 0.5f;
-    apply_gaussian_drop(cx, cy,
-                        DROP_HEIGHT_AMPLITUDE, DROP_GAUSSIAN_RADIUS);
-    apply_boundary(boundary_kind);
+static void preset_radial_drop(int boundary_kind) {
+  grid_clear_walls();
+  grid_zero_fluid_fields();
+  float cx = (float)(grid_active_cols - 1) * 0.5f;
+  float cy = (float)(grid_active_rows - 1) * 0.5f;
+  apply_gaussian_drop(cx, cy, DROP_HEIGHT_AMPLITUDE, DROP_GAUSSIAN_RADIUS);
+  apply_boundary(boundary_kind);
 }
 
-static void preset_channel(int boundary_kind)
-{
-    grid_clear_walls();
-    grid_zero_fluid_fields();
-    obstacle_build_channel();
-    /* Drop the source on the LEFT side so the wave is funnelled
-     * through the gap. */
-    float cy = (float)(grid_active_rows - 1) * 0.5f;
-    float cx_source = (float)(grid_active_cols - 1) * 0.20f;
-    apply_gaussian_drop(cx_source, cy,
-                        DROP_HEIGHT_AMPLITUDE, DROP_GAUSSIAN_RADIUS);
-    zero_fields_in_walls();
-    apply_boundary(boundary_kind);
+static void preset_channel(int boundary_kind) {
+  grid_clear_walls();
+  grid_zero_fluid_fields();
+  obstacle_build_channel();
+  /* Drop the source on the LEFT side so the wave is funnelled
+   * through the gap. */
+  float cy = (float)(grid_active_rows - 1) * 0.5f;
+  float cx_source = (float)(grid_active_cols - 1) * 0.20f;
+  apply_gaussian_drop(cx_source, cy, DROP_HEIGHT_AMPLITUDE,
+                      DROP_GAUSSIAN_RADIUS);
+  zero_fields_in_walls();
+  apply_boundary(boundary_kind);
 }
 
-static void preset_obstacle(int boundary_kind)
-{
-    grid_clear_walls();
-    grid_zero_fluid_fields();
-    obstacle_build_circle();
-    float cy = (float)(grid_active_rows - 1) * 0.5f;
-    float cx_source = (float)(grid_active_cols - 1) * 0.15f;
-    apply_gaussian_drop(cx_source, cy,
-                        DROP_HEIGHT_AMPLITUDE, DROP_GAUSSIAN_RADIUS);
-    zero_fields_in_walls();
-    apply_boundary(boundary_kind);
+static void preset_obstacle(int boundary_kind) {
+  grid_clear_walls();
+  grid_zero_fluid_fields();
+  obstacle_build_circle();
+  float cy = (float)(grid_active_rows - 1) * 0.5f;
+  float cx_source = (float)(grid_active_cols - 1) * 0.15f;
+  apply_gaussian_drop(cx_source, cy, DROP_HEIGHT_AMPLITUDE,
+                      DROP_GAUSSIAN_RADIUS);
+  zero_fields_in_walls();
+  apply_boundary(boundary_kind);
 }
 
 /* ===================================================================== */
@@ -1461,64 +1730,175 @@ static void preset_obstacle(int boundary_kind)
  * look like shorelines).
  */
 
-static bool is_shoreline_cell(int r, int c)
-{
-    int rows = grid_active_rows;
-    int cols = grid_active_cols;
+/* Is (r, c) a valid, NON-WALL grid cell?  Wall cells are excluded
+ * because their h is forced to zero by zero_fields_in_walls — without
+ * the exclusion every cell adjacent to an obstacle would look like a
+ * shoreline.  Off-grid coords also return false. */
+static inline bool neighbour_is_water_cell(int r, int c) {
+    return r >= 0 && r < grid_active_rows
+        && c >= 0 && c < grid_active_cols
+        && !wall_mask[r][c];
+}
 
-    bool any_above_pos = false;
-    bool any_below_neg = false;
+/* Inspect one neighbour cell for evidence of opposite polarities.
+ * Updates the seen-positive / seen-negative flags in place rather
+ * than returning, so the caller can pass the same pair through four
+ * neighbour checks.  Cells below the SHORELINE_HEIGHT_THRESHOLD are
+ * treated as "near zero" and contribute neither flag. */
+static inline void inspect_neighbour_for_polarities(int r, int c,
+                                                     bool *seen_positive,
+                                                     bool *seen_negative) {
+    if (!neighbour_is_water_cell(r, c)) return;
+    float h = height_perturbation[r][c];
+    if (h >  SHORELINE_HEIGHT_THRESHOLD) *seen_positive = true;
+    if (h < -SHORELINE_HEIGHT_THRESHOLD) *seen_negative = true;
+}
 
-    if (r > 0 && !wall_mask[r - 1][c]) {
-        if (height_perturbation[r - 1][c] >  SHORELINE_HEIGHT_THRESHOLD)
-            any_above_pos = true;
-        if (height_perturbation[r - 1][c] < -SHORELINE_HEIGHT_THRESHOLD)
-            any_below_neg = true;
-    }
-    if (r < rows - 1 && !wall_mask[r + 1][c]) {
-        if (height_perturbation[r + 1][c] >  SHORELINE_HEIGHT_THRESHOLD)
-            any_above_pos = true;
-        if (height_perturbation[r + 1][c] < -SHORELINE_HEIGHT_THRESHOLD)
-            any_below_neg = true;
-    }
-    if (c > 0 && !wall_mask[r][c - 1]) {
-        if (height_perturbation[r][c - 1] >  SHORELINE_HEIGHT_THRESHOLD)
-            any_above_pos = true;
-        if (height_perturbation[r][c - 1] < -SHORELINE_HEIGHT_THRESHOLD)
-            any_below_neg = true;
-    }
-    if (c < cols - 1 && !wall_mask[r][c + 1]) {
-        if (height_perturbation[r][c + 1] >  SHORELINE_HEIGHT_THRESHOLD)
-            any_above_pos = true;
-        if (height_perturbation[r][c + 1] < -SHORELINE_HEIGHT_THRESHOLD)
-            any_below_neg = true;
-    }
+/*
+ * is_shoreline_cell — does cell (r, c) sit on the ZERO CROSSING
+ * between positive and negative surface displacement?
+ *
+ * Pseudocode:
+ *   seen_pos = seen_neg = false
+ *   inspect the four cardinal neighbours via
+ *     inspect_neighbour_for_polarities(r±1, c) and (r, c±1)
+ *   return seen_pos && seen_neg
+ *
+ * The opposite-sign-neighbour check filters out RESTING cells (also
+ * small |h|) and obstacle-adjacent cells (h forced to zero) — without
+ * the polarity check those would all look like shorelines.  See §15
+ * comment for the visual intuition.
+ */
+static bool is_shoreline_cell(int r, int c) {
+    bool seen_positive = false;
+    bool seen_negative = false;
 
-    return any_above_pos && any_below_neg;
+    inspect_neighbour_for_polarities(r - 1, c    , &seen_positive, &seen_negative);
+    inspect_neighbour_for_polarities(r + 1, c    , &seen_positive, &seen_negative);
+    inspect_neighbour_for_polarities(r    , c - 1, &seen_positive, &seen_negative);
+    inspect_neighbour_for_polarities(r    , c + 1, &seen_positive, &seen_negative);
+
+    return seen_positive && seen_negative;
 }
 
 /* ===================================================================== */
 /* §16  render_field — glyph + colour + arrows + shoreline (T10)         */
 /* ===================================================================== */
 
-static const char arrow_glyph_table[8] = {
-    '>', '/', 'v', '\\', '<', '/', '^', '\\'
-};
+static const char arrow_glyph_table[8] = {'>', '/', 'v', '\\',
+                                          '<', '/', '^', '\\'};
 
-static int velocity_to_arrow_octant(float vx, float vy)
-{
-    float angle = atan2f(vy, vx);
-    if (angle < 0.0f) angle += 2.0f * (float)M_PI;
-    return (int)(angle / ((float)M_PI * 0.25f)) % 8;
+static int velocity_to_arrow_octant(float vx, float vy) {
+  float angle = atan2f(vy, vx);
+  if (angle < 0.0f)
+    angle += 2.0f * (float)M_PI;
+  return (int)(angle / ((float)M_PI * 0.25f)) % 8;
 }
 
-static void render_field(WINDOW *w,
-                         int active_theme_index,
-                         bool show_arrows,
-                         bool show_shoreline,
-                         bool show_obstacles)
-{
-    float display_max = DISPLAY_HEIGHT_RANGE;
+/* Layer 1 — paint an OBSTACLE cell ('#' in PAIR_OBSTACLE).  Called
+ * for every wall_mask cell; show_obstacles gates whether it's drawn
+ * at all (toggleable so users can see the field underneath). */
+static inline void paint_obstacle_layer(WINDOW *w, int r, int c) {
+    attr_t attr = COLOR_PAIR(PAIR_OBSTACLE);
+    wattron(w, attr);
+    mvwaddch(w, r, c, '#');
+    wattroff(w, attr);
+}
+
+/* Layer 2 — paint a SHORELINE cell ('~' bold in PAIR_SHORELINE).
+ * Caller already verified |h| < threshold AND is_shoreline_cell(). */
+static inline void paint_shoreline_layer(WINDOW *w, int r, int c) {
+    attr_t attr = COLOR_PAIR(PAIR_SHORELINE) | A_BOLD;
+    wattron(w, attr);
+    mvwaddch(w, r, c, '~');
+    wattroff(w, attr);
+}
+
+/* Map a signed height value to (positive, normalised_slot).
+ *   - positive   → true if h ≥ 0 (crest), false if trough.
+ *   - normalised → |h| / display_max ∈ [0, 1] clamped.
+ *   - slot       → tier index for the glyph ramp.
+ * Slot 0 means "below the visible threshold" — caller should skip
+ * the cell.  Refs [8] Bourke on the intensity ramp design. */
+static inline int height_to_polarity_and_slot(float h, float inv_display_max,
+                                                bool *out_positive) {
+    *out_positive = (h >= 0.0f);
+    float normalised = fabsf(h) * inv_display_max;
+    if (normalised > 1.0f) normalised = 1.0f;
+    return normalised_height_to_slot(normalised);
+}
+
+/* Layer 4 — paint a velocity ARROW at a fast cell.  Returns true if
+ * the arrow was drawn (cell speed > threshold) so the caller skips
+ * the height-glyph layer.  Uses the height layer's COLOUR pair —
+ * arrows REPLACE the glyph but keep the height information. */
+static inline bool paint_arrow_layer_if_fast(WINDOW *w, int r, int c,
+                                              attr_t height_attr) {
+    float speed = velocity_magnitude_at(r, c);
+    if (speed <= ARROW_SPEED_THRESHOLD) return false;
+    int octant = velocity_to_arrow_octant(velocity_x[r][c], velocity_y[r][c]);
+    wattron(w, height_attr);
+    mvwaddch(w, r, c, (chtype)(unsigned char)arrow_glyph_table[octant]);
+    wattroff(w, height_attr);
+    return true;
+}
+
+/* Layer 3 — paint the HEIGHT SHADING glyph at slot tier. */
+static inline void paint_height_layer(WINDOW *w, int r, int c, int slot,
+                                       attr_t height_attr) {
+    wattron(w, height_attr);
+    mvwaddch(w, r, c, (chtype)(unsigned char)ramp_glyph_table[slot]);
+    wattroff(w, height_attr);
+}
+
+/* Paint ONE non-obstacle cell.  Walks the rendering layers in
+ * priority order: shoreline (if requested & near-zero) → arrow (if
+ * requested & fast) → height shading.  Returns immediately at each
+ * matched layer — only one glyph per cell.                          */
+static inline void paint_one_cell_layered(WINDOW *w, int r, int c,
+                                           int active_theme_index,
+                                           bool show_arrows,
+                                           bool show_shoreline,
+                                           float inv_display_max) {
+    float h = height_perturbation[r][c];
+
+    /* Layer 2 — Shoreline.  Only consider it when |h| is small. */
+    if (show_shoreline && fabsf(h) < SHORELINE_HEIGHT_THRESHOLD) {
+        if (is_shoreline_cell(r, c)) paint_shoreline_layer(w, r, c);
+        return;
+    }
+
+    /* Layer 3+4 — Height shading + optional arrow override. */
+    bool positive;
+    int  slot = height_to_polarity_and_slot(h, inv_display_max, &positive);
+    if (slot == 0) return;
+    attr_t height_attr = height_pair_attr(active_theme_index, positive, slot);
+
+    if (show_arrows && paint_arrow_layer_if_fast(w, r, c, height_attr)) return;
+    paint_height_layer(w, r, c, slot, height_attr);
+}
+
+/*
+ * render_field — paint the SWE field as a layered visual.
+ *
+ * Pseudocode:
+ *   inv_display_max = 1 / max(DISPLAY_HEIGHT_RANGE, 0.05)
+ *   for each cell (r, c):
+ *     if wall_mask[r][c]:
+ *       if show_obstacles: paint_obstacle_layer
+ *       continue
+ *     paint_one_cell_layered(w, r, c, theme, show_arrows, show_shoreline,
+ *                            inv_display_max)
+ *
+ * Layer priority (highest to lowest):
+ *   1. Obstacle (always wins if show_obstacles)
+ *   2. Shoreline (zero-crossing near walls)
+ *   3. Height shading (the main visual)
+ *   4. Arrow overlay (replaces glyph at fast cells; keeps height colour)
+ */
+static void render_field(WINDOW *w, int active_theme_index, bool show_arrows,
+                          bool show_shoreline, bool show_obstacles) {
+    float display_max     = DISPLAY_HEIGHT_RANGE;
     if (display_max < 0.05f) display_max = 0.05f;
     float inv_display_max = 1.0f / display_max;
 
@@ -1527,62 +1907,14 @@ static void render_field(WINDOW *w,
 
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
-
-            /* Layer 1 — Obstacle (highest priority).  Always drawn
-             * if visible, so wall outlines are clear. */
+            /* Layer 1 — Obstacle (highest priority). */
             if (wall_mask[r][c]) {
-                if (show_obstacles) {
-                    attr_t attr = COLOR_PAIR(PAIR_OBSTACLE);
-                    wattron(w, attr);
-                    mvwaddch(w, r, c, '#');
-                    wattroff(w, attr);
-                }
+                if (show_obstacles) paint_obstacle_layer(w, r, c);
                 continue;
             }
-
-            float h = height_perturbation[r][c];
-
-            /* Layer 2 — Shoreline (zero-crossing). */
-            if (show_shoreline
-             && fabsf(h) < SHORELINE_HEIGHT_THRESHOLD) {
-                if (is_shoreline_cell(r, c)) {
-                    attr_t attr = COLOR_PAIR(PAIR_SHORELINE) | A_BOLD;
-                    wattron(w, attr);
-                    mvwaddch(w, r, c, '~');
-                    wattroff(w, attr);
-                }
-                continue;
-            }
-
-            /* Layer 3 — Height shading. */
-            bool  positive = (h >= 0.0f);
-            float normalised = fabsf(h) * inv_display_max;
-            if (normalised > 1.0f) normalised = 1.0f;
-            int slot = normalised_height_to_slot(normalised);
-            if (slot == 0) continue;
-            attr_t height_attr =
-                height_pair_attr(active_theme_index, positive, slot);
-
-            /* Layer 4 — Flow arrows (replaces height glyph at fast
-             * cells; height colour preserved). */
-            if (show_arrows) {
-                float speed = sqrtf(velocity_x[r][c] * velocity_x[r][c]
-                                  + velocity_y[r][c] * velocity_y[r][c]);
-                if (speed > ARROW_SPEED_THRESHOLD) {
-                    int octant = velocity_to_arrow_octant(velocity_x[r][c],
-                                                          velocity_y[r][c]);
-                    wattron(w, height_attr);
-                    mvwaddch(w, r, c,
-                             (chtype)(unsigned char)arrow_glyph_table[octant]);
-                    wattroff(w, height_attr);
-                    continue;
-                }
-            }
-
-            wattron(w, height_attr);
-            mvwaddch(w, r, c,
-                     (chtype)(unsigned char)ramp_glyph_table[slot]);
-            wattroff(w, height_attr);
+            paint_one_cell_layered(w, r, c, active_theme_index,
+                                    show_arrows, show_shoreline,
+                                    inv_display_max);
         }
     }
 }
@@ -1596,98 +1928,114 @@ static void render_field(WINDOW *w,
  * colour-coded by stability band (green / yellow / red).
  */
 
+/*
+ * OverlayBox — rectangular footprint for a HUD overlay panel.
+ *
+ * Intent
+ *   The stats panel is a small box of live numbers drawn over the
+ *   field.  Its position (ox, oy) and extent (pw, ph) are computed
+ *   once per frame by stats_panel_layout(); paint helpers then read
+ *   the box back to know where to draw each row.
+ *
+ * Why a struct (not four parameters threaded through helpers)
+ *   The panel has ~10 rows, each painted by its own helper.  Passing
+ *   four ints through every helper would be repetitive and easy to
+ *   mis-order; one OverlayBox passed by const pointer is cleaner.
+ *
+ * Lifetime
+ *   Built per frame in stats_panel_layout(), passed by const pointer
+ *   to paint helpers, discarded at end of frame.
+ */
 typedef struct {
-    int   ox;
-    int   oy;
-    int   pw;
-    int   ph;
+    int ox;   /* left edge in cells                       */
+    int oy;   /* top edge in cells                        */
+    int pw;   /* panel width in cells                     */
+    int ph;   /* panel height in cells                    */
 } OverlayBox;
 
-static OverlayBox stats_panel_layout(int term_rows, int term_cols)
-{
-    OverlayBox box = { 1, 0, 30, 13 };
-    box.oy = term_rows - box.ph - 1;
-    if (box.oy < 0) box.oy = 0;
-    if (box.ox + box.pw > term_cols) box.pw = term_cols - box.ox;
-    return box;
+static OverlayBox stats_panel_layout(int term_rows, int term_cols) {
+  OverlayBox box = {1, 0, 30, 13};
+  box.oy = term_rows - box.ph - 1;
+  if (box.oy < 0)
+    box.oy = 0;
+  if (box.ox + box.pw > term_cols)
+    box.pw = term_cols - box.ox;
+  return box;
 }
 
 /* CFL-stability colour bands.  Returned pair tags are picked from
  * the THEME 0 palette so they're available at startup. */
-static int stats_cfl_pair(float cfl)
-{
-    if (cfl < CFL_STABLE_LIMIT)   return PAIR_NEG(0, 5);  /* dim blue (green-ish) */
-    if (cfl < CFL_MARGINAL_LIMIT) return PAIR_HUD;        /* yellow */
-    return PAIR_POS(1, 7);                                /* magma red */
+static int stats_cfl_pair(float cfl) {
+  if (cfl < CFL_STABLE_LIMIT)
+    return PAIR_NEG(0, 5); /* dim blue (green-ish) */
+  if (cfl < CFL_MARGINAL_LIMIT)
+    return PAIR_HUD;     /* yellow */
+  return PAIR_POS(1, 7); /* magma red */
 }
 
-static const char *stats_cfl_label(float cfl)
-{
-    if (cfl < CFL_STABLE_LIMIT)   return "STABLE  ";
-    if (cfl < CFL_MARGINAL_LIMIT) return "MARGINAL";
-    return "UNSTABLE";
+static const char *stats_cfl_label(float cfl) {
+  if (cfl < CFL_STABLE_LIMIT)
+    return "STABLE  ";
+  if (cfl < CFL_MARGINAL_LIMIT)
+    return "MARGINAL";
+  return "UNSTABLE";
 }
 
-static void render_stats_panel(WINDOW *w,
-                               int term_rows, int term_cols,
+static void render_stats_panel(WINDOW *w, int term_rows, int term_cols,
                                const SimStats *stats,
                                float gravity_acceleration,
                                float bottom_friction_coeff,
                                int active_boundary_kind,
                                float simulation_time_seconds,
-                               bool simulation_paused,
-                               bool show_arrows,
-                               bool show_shoreline,
-                               int active_preset_index)
-{
-    OverlayBox box = stats_panel_layout(term_rows, term_cols);
-    if (box.pw < 20 || box.ph < 6) return;   /* terminal too small */
+                               bool simulation_paused, bool show_arrows,
+                               bool show_shoreline, int active_preset_index) {
+  OverlayBox box = stats_panel_layout(term_rows, term_cols);
+  if (box.pw < 20 || box.ph < 6)
+    return; /* terminal too small */
 
-    int ox = box.ox;
-    int oy = box.oy;
+  int ox = box.ox;
+  int oy = box.oy;
 
-    /* Box border — use the HUD pair (yellow + bold) so the panel
-     * is clearly an overlay, not part of the simulation. */
-    attr_t border_attr = COLOR_PAIR(PAIR_HUD) | A_BOLD;
-    wattron(w, border_attr);
-    mvwprintw(w, oy +  0, ox, "+--- SHALLOW WATER --------+");
-    mvwprintw(w, oy +  1, ox, "| max_h   %8.4f           |",
-              (double)stats->max_abs_height);
-    mvwprintw(w, oy +  2, ox, "| avg_vel %8.4f           |",
-              (double)stats->average_speed);
-    mvwprintw(w, oy +  3, ox, "| wavespd %7.2f cells/s    |",
-              (double)stats->wave_speed);
+  /* Box border — use the HUD pair (yellow + bold) so the panel
+   * is clearly an overlay, not part of the simulation. */
+  attr_t border_attr = COLOR_PAIR(PAIR_HUD) | A_BOLD;
+  wattron(w, border_attr);
+  mvwprintw(w, oy + 0, ox, "+--- SHALLOW WATER --------+");
+  mvwprintw(w, oy + 1, ox, "| max_h   %8.4f           |",
+            (double)stats->max_abs_height);
+  mvwprintw(w, oy + 2, ox, "| avg_vel %8.4f           |",
+            (double)stats->average_speed);
+  mvwprintw(w, oy + 3, ox, "| wavespd %7.2f cells/s    |",
+            (double)stats->wave_speed);
 
-    mvwprintw(w, oy +  4, ox, "| CFL     ");
-    wattroff(w, border_attr);
-    {
-        attr_t cfl_attr = COLOR_PAIR(stats_cfl_pair(stats->cfl_number)) | A_BOLD;
-        wattron(w, cfl_attr);
-        wprintw(w, "%5.3f %-8s",
-                (double)stats->cfl_number,
-                stats_cfl_label(stats->cfl_number));
-        wattroff(w, cfl_attr);
-    }
-    wattron(w, border_attr);
-    wprintw(w, "|");
+  mvwprintw(w, oy + 4, ox, "| CFL     ");
+  wattroff(w, border_attr);
+  {
+    attr_t cfl_attr = COLOR_PAIR(stats_cfl_pair(stats->cfl_number)) | A_BOLD;
+    wattron(w, cfl_attr);
+    wprintw(w, "%5.3f %-8s", (double)stats->cfl_number,
+            stats_cfl_label(stats->cfl_number));
+    wattroff(w, cfl_attr);
+  }
+  wattron(w, border_attr);
+  wprintw(w, "|");
 
-    mvwprintw(w, oy +  5, ox, "| gravity %7.1f            |",
-              (double)gravity_acceleration);
-    mvwprintw(w, oy +  6, ox, "| damping %8.4f           |",
-              (double)bottom_friction_coeff);
-    mvwprintw(w, oy +  7, ox, "| BC      %s         |",
-              bc_name_table[active_boundary_kind]);
-    mvwprintw(w, oy +  8, ox, "| sim_t   %8.2f s          |",
-              (double)simulation_time_seconds);
-    mvwprintw(w, oy +  9, ox, "| preset  %s         |",
-              preset_name_table[active_preset_index]);
-    mvwprintw(w, oy + 10, ox, "| arrows  %-3s shore %-3s      |",
-              show_arrows    ? "ON " : "OFF",
-              show_shoreline ? "ON " : "OFF");
-    mvwprintw(w, oy + 11, ox, "| %s                       |",
-              simulation_paused ? "PAUSED        " : "running       ");
-    mvwprintw(w, oy + 12, ox, "+---------------------------+");
-    wattroff(w, border_attr);
+  mvwprintw(w, oy + 5, ox, "| gravity %7.1f            |",
+            (double)gravity_acceleration);
+  mvwprintw(w, oy + 6, ox, "| damping %8.4f           |",
+            (double)bottom_friction_coeff);
+  mvwprintw(w, oy + 7, ox, "| BC      %s         |",
+            bc_name_table[active_boundary_kind]);
+  mvwprintw(w, oy + 8, ox, "| sim_t   %8.2f s          |",
+            (double)simulation_time_seconds);
+  mvwprintw(w, oy + 9, ox, "| preset  %s         |",
+            preset_name_table[active_preset_index]);
+  mvwprintw(w, oy + 10, ox, "| arrows  %-3s shore %-3s      |",
+            show_arrows ? "ON " : "OFF", show_shoreline ? "ON " : "OFF");
+  mvwprintw(w, oy + 11, ox, "| %s                       |",
+            simulation_paused ? "PAUSED        " : "running       ");
+  mvwprintw(w, oy + 12, ox, "+---------------------------+");
+  wattroff(w, border_attr);
 }
 
 /* ===================================================================== */
@@ -1698,377 +2046,452 @@ static void hud_paint_status(int term_cols, double measured_fps,
                              int sim_steps_per_second,
                              float gravity_acceleration,
                              float wave_speed_cells_per_sec,
-                             int active_boundary_kind,
-                             int active_theme_index)
-{
-    char buf[200];
-    snprintf(buf, sizeof buf,
-             " ShallowWater  %5.1f fps  sim:%3dHz  g=%.0f  c=%.1f  "
-             "BC=%s  theme:%s ",
-             measured_fps, sim_steps_per_second,
-             (double)gravity_acceleration,
-             (double)wave_speed_cells_per_sec,
-             bc_name_table[active_boundary_kind],
-             theme_table[active_theme_index].display_name);
-    int slen = (int)strlen(buf);
-    int sx   = term_cols - slen;
-    if (sx < 0) sx = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, sx, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+                             int active_boundary_kind, int active_theme_index) {
+  char buf[200];
+  snprintf(buf, sizeof buf,
+           " ShallowWater  %5.1f fps  sim:%3dHz  g=%.0f  c=%.1f  "
+           "BC=%s  theme:%s ",
+           measured_fps, sim_steps_per_second, (double)gravity_acceleration,
+           (double)wave_speed_cells_per_sec,
+           bc_name_table[active_boundary_kind],
+           theme_table[active_theme_index].display_name);
+  int slen = (int)strlen(buf);
+  int sx = term_cols - slen;
+  if (sx < 0)
+    sx = 0;
+  attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
+  mvprintw(0, sx, "%s", buf);
+  attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
 }
 
-static void hud_paint_hint(int term_rows)
-{
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(term_rows - 1, 0,
-             " q:quit  spc:pause  s:step  r:reset  d:drop  b:dam  "
-             "g/G:gravity  a:arrows  l:shore  n:BC  o:obs  "
-             "p/P:preset  t:theme  ]/[:Hz ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+static void hud_paint_hint(int term_rows) {
+  attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
+  mvprintw(term_rows - 1, 0,
+           " q:quit  spc:pause  s:step  r:reset  d:drop  b:dam  "
+           "g/G:gravity  a:arrows  l:shore  n:BC  o:obs  "
+           "p/P:preset  t:theme  ]/[:Hz ");
+  attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §19  scene — per-frame state + tick wrapper                           */
 /* ===================================================================== */
 
+/*
+ * Scene — the single owner of this demo's live state.
+ *
+ * Intent
+ *   Scene composes the user's physics tunables (gravity, friction,
+ *   boundary kind), the control flags (paused, step-request,
+ *   preset), the visual toggles (theme, overlay layers), and the
+ *   per-frame stats snapshot.  The actual h / u / v fields live as
+ *   file-scope arrays since every solver pass loops over them and
+ *   threading a struct pointer through would obscure the math.
+ *
+ * Locality (sim vs render)
+ *   The fields below are GROUPED EXPLICITLY by subsystem.  This file
+ *   already had nice section comments — we keep them and document
+ *   what each group is for:
+ *
+ *     - PHYSICS                → simulation (read by step / boundary)
+ *     - CONTROL                → gates the tick + signals next-frame
+ *                                 behaviour
+ *     - VISUAL                 → pure rendering (theme + overlays)
+ *     - STATS / TIME           → derived; HUD-only, but written every
+ *                                 tick by the stats scan
+ *
+ *   Mis-classifying a VISUAL field (e.g. show_arrows) as sim would
+ *   couple physics to a render toggle, breaking the "look is decoupled
+ *   from physics" invariant.
+ *
+ * Why these specific fields and no others
+ *   - gravity_acceleration  / bottom_friction_coeff      physics
+ *     constants tunable via keys; sim reads them every step.
+ *   - active_boundary_kind   selects reflecting / periodic / absorbing
+ *     BC; both sim (next-step ghost cells) and preset-load read it.
+ *   - simulation_paused / step_request_pending   gate the tick;
+ *     step_request_pending lets the user advance ONE frame while
+ *     paused (powers single-stepping).
+ *   - active_preset_index    survives reset; HUD reads its name.
+ *   - active_theme_index / show_arrows / show_shoreline / show_obstacles
+ *     pure render toggles; must not touch sim state.
+ *   - stats                  scratch snapshot, rebuilt every frame by
+ *     the stats scan.  Lives here so the HUD can read it via Scene*.
+ *   - simulation_time_seconds   monotonic clock for HUD readout.
+ *
+ * Things that DO NOT live here
+ *   - h / u / v field arrays           → file-scope (large; touched
+ *                                         by every loop)
+ *   - The boundary lookup tables       → file-scope constants
+ *   - Render-frame timing / FPS        → locals in main()
+ *   - Signal flags                     → App
+ *
+ * Reference [4] LeVeque on the conceptual sim/render separation that
+ *   makes this layout reproducible.
+ */
 typedef struct {
-    /* physics */
-    float gravity_acceleration;
-    float bottom_friction_coeff;
-    int   active_boundary_kind;
+    /* ── Simulation tunables (read by step + boundary passes) ───── */
+    float gravity_acceleration;     /* g, gravity (m/s² equivalent)  */
+    float bottom_friction_coeff;    /* Manning-like drag             */
+    int   active_boundary_kind;     /* REFLECTING / PERIODIC / ABSORB*/
 
-    /* control */
-    bool  simulation_paused;
-    bool  step_request_pending;
-    int   active_preset_index;
+    /* ── Control state (gates tick / preset / single-step) ──────── */
+    bool  simulation_paused;        /* if true tick is a no-op       */
+    bool  step_request_pending;     /* advance one frame then re-pause*/
+    int   active_preset_index;      /* row of preset_table[] in use  */
 
-    /* visual */
-    int   active_theme_index;
-    bool  show_arrows;
-    bool  show_shoreline;
-    bool  show_obstacles;
+    /* ── Pure render state (read by paint_field / paint_overlays) ─ *
+     * Changing these MUST NOT touch the h / u / v arrays.          */
+    int   active_theme_index;       /* row of theme_table[]          */
+    bool  show_arrows;              /* draw velocity arrows overlay  */
+    bool  show_shoreline;           /* highlight wet/dry boundary    */
+    bool  show_obstacles;           /* show solid obstacles overlay  */
 
-    /* live stats */
-    SimStats stats;
-    float    simulation_time_seconds;
+    /* ── Per-frame diagnostics + clock (HUD-only consumers) ─────── */
+    SimStats stats;                 /* rebuilt by stats scan         */
+    float    simulation_time_seconds; /* monotonic clock for HUD     */
 } Scene;
 
-static void scene_init(Scene *scene, int cols, int rows)
-{
-    memset(scene, 0, sizeof *scene);
-    scene->gravity_acceleration   = GRAVITY_DEFAULT;
-    scene->bottom_friction_coeff  = BOTTOM_FRICTION_DEFAULT;
-    scene->active_boundary_kind   = BC_WALL;
-    scene->active_theme_index     = 0;
-    scene->show_arrows            = true;
-    scene->show_shoreline         = true;
-    scene->show_obstacles         = true;
+static void scene_init(Scene *scene, int cols, int rows) {
+  memset(scene, 0, sizeof *scene);
+  scene->gravity_acceleration = GRAVITY_DEFAULT;
+  scene->bottom_friction_coeff = BOTTOM_FRICTION_DEFAULT;
+  scene->active_boundary_kind = BC_WALL;
+  scene->active_theme_index = 0;
+  scene->show_arrows = true;
+  scene->show_shoreline = true;
+  scene->show_obstacles = true;
 
-    grid_active_cols = (cols < GRID_COLS_MAX) ? cols : GRID_COLS_MAX;
-    grid_active_rows = (rows < GRID_ROWS_MAX) ? rows : GRID_ROWS_MAX;
-    if (grid_active_rows < 4) grid_active_rows = 4;
-    if (grid_active_cols < 4) grid_active_cols = 4;
+  grid_active_cols = (cols < GRID_COLS_MAX) ? cols : GRID_COLS_MAX;
+  grid_active_rows = (rows < GRID_ROWS_MAX) ? rows : GRID_ROWS_MAX;
+  if (grid_active_rows < 4)
+    grid_active_rows = 4;
+  if (grid_active_cols < 4)
+    grid_active_cols = 4;
 
-    grid_clear_walls();
-    grid_zero_fluid_fields();
-    preset_table[PRESET_DAM_BREAK].loader(scene->active_boundary_kind);
-    scene->active_preset_index = PRESET_DAM_BREAK;
+  grid_clear_walls();
+  grid_zero_fluid_fields();
+  preset_table[PRESET_DAM_BREAK].loader(scene->active_boundary_kind);
+  scene->active_preset_index = PRESET_DAM_BREAK;
 }
 
-static void scene_resize(Scene *scene, int cols, int rows)
-{
-    grid_active_cols = (cols < GRID_COLS_MAX) ? cols : GRID_COLS_MAX;
-    grid_active_rows = (rows < GRID_ROWS_MAX) ? rows : GRID_ROWS_MAX;
-    if (grid_active_rows < 4) grid_active_rows = 4;
-    if (grid_active_cols < 4) grid_active_cols = 4;
-    /* Reload the current preset so walls + initial conditions
-     * adapt to the new domain size. */
-    preset_table[scene->active_preset_index].loader(scene->active_boundary_kind);
-    scene->simulation_time_seconds = 0.0f;
+static void scene_resize(Scene *scene, int cols, int rows) {
+  grid_active_cols = (cols < GRID_COLS_MAX) ? cols : GRID_COLS_MAX;
+  grid_active_rows = (rows < GRID_ROWS_MAX) ? rows : GRID_ROWS_MAX;
+  if (grid_active_rows < 4)
+    grid_active_rows = 4;
+  if (grid_active_cols < 4)
+    grid_active_cols = 4;
+  /* Reload the current preset so walls + initial conditions
+   * adapt to the new domain size. */
+  preset_table[scene->active_preset_index].loader(scene->active_boundary_kind);
+  scene->simulation_time_seconds = 0.0f;
 }
 
-static void scene_load_preset(Scene *scene, int preset_index)
-{
-    if (preset_index < 0 || preset_index >= PRESET_COUNT) preset_index = 0;
-    scene->active_preset_index = preset_index;
-    preset_table[preset_index].loader(scene->active_boundary_kind);
-    scene->simulation_time_seconds = 0.0f;
+static void scene_load_preset(Scene *scene, int preset_index) {
+  if (preset_index < 0 || preset_index >= PRESET_COUNT)
+    preset_index = 0;
+  scene->active_preset_index = preset_index;
+  preset_table[preset_index].loader(scene->active_boundary_kind);
+  scene->simulation_time_seconds = 0.0f;
 }
 
-static void scene_tick(Scene *scene, float dt_seconds)
-{
-    if (scene->simulation_paused && !scene->step_request_pending) return;
-    scene->step_request_pending = false;
-    scene->simulation_time_seconds += dt_seconds;
-    swe_step(scene->active_boundary_kind,
-             scene->gravity_acceleration,
-             scene->bottom_friction_coeff,
-             dt_seconds,
-             &scene->stats);
+static void scene_tick(Scene *scene, float dt_seconds) {
+  if (scene->simulation_paused && !scene->step_request_pending)
+    return;
+  scene->step_request_pending = false;
+  scene->simulation_time_seconds += dt_seconds;
+  swe_step(scene->active_boundary_kind, scene->gravity_acceleration,
+           scene->bottom_friction_coeff, dt_seconds, &scene->stats);
 }
 
 /* ===================================================================== */
 /* §20  screen — ncurses init / cleanup / present                        */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * Screen — terminal extent record.  ncurses owns the buffers; we
+ * keep only cell dimensions for HUD placement + field clipping.
+ *
+ * Render pipeline (one frame): erase → paint_field → paint_overlays
+ *   → hud_paint_* → wnoutrefresh(stdscr) → doupdate().  Diff-only
+ *   writes — no flicker.  See [9] Raymond §11.
+ */
+typedef struct {
+    int cols;   /* terminal width  in cells (getmaxyx)             */
+    int rows;   /* terminal height in cells (getmaxyx)             */
+} Screen;
 
-static void screen_init(Screen *screen)
-{
-    initscr();
-    noecho();
-    cbreak();
-    curs_set(0);
-    nodelay(stdscr, TRUE);
-    keypad(stdscr, TRUE);
-    typeahead(-1);
-    colors_init();
-    getmaxyx(stdscr, screen->rows, screen->cols);
+static void screen_init(Screen *screen) {
+  initscr();
+  noecho();
+  cbreak();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE);
+  typeahead(-1);
+  colors_init();
+  getmaxyx(stdscr, screen->rows, screen->cols);
 }
 
-static void screen_cleanup(void)
-{
-    endwin();
+static void screen_cleanup(void) { endwin(); }
+
+static void screen_resize(Screen *screen) {
+  endwin();
+  refresh();
+  getmaxyx(stdscr, screen->rows, screen->cols);
 }
 
-static void screen_resize(Screen *screen)
-{
-    endwin();
-    refresh();
-    getmaxyx(stdscr, screen->rows, screen->cols);
-}
-
-static void screen_present_frame(Screen *screen,
-                                 const Scene *scene,
+static void screen_present_frame(Screen *screen, const Scene *scene,
                                  double measured_fps,
-                                 int sim_steps_per_second)
-{
-    erase();
+                                 int sim_steps_per_second) {
+  erase();
 
-    render_field(stdscr,
-                 scene->active_theme_index,
-                 scene->show_arrows,
-                 scene->show_shoreline,
-                 scene->show_obstacles);
+  render_field(stdscr, scene->active_theme_index, scene->show_arrows,
+               scene->show_shoreline, scene->show_obstacles);
 
-    render_stats_panel(stdscr,
-                       screen->rows, screen->cols,
-                       &scene->stats,
-                       scene->gravity_acceleration,
-                       scene->bottom_friction_coeff,
-                       scene->active_boundary_kind,
-                       scene->simulation_time_seconds,
-                       scene->simulation_paused,
-                       scene->show_arrows,
-                       scene->show_shoreline,
-                       scene->active_preset_index);
-
-    hud_paint_status(screen->cols,
-                     measured_fps, sim_steps_per_second,
-                     scene->gravity_acceleration,
-                     scene->stats.wave_speed,
+  render_stats_panel(stdscr, screen->rows, screen->cols, &scene->stats,
+                     scene->gravity_acceleration, scene->bottom_friction_coeff,
                      scene->active_boundary_kind,
-                     scene->active_theme_index);
-    hud_paint_hint(screen->rows);
+                     scene->simulation_time_seconds, scene->simulation_paused,
+                     scene->show_arrows, scene->show_shoreline,
+                     scene->active_preset_index);
 
-    wnoutrefresh(stdscr);
-    doupdate();
+  hud_paint_status(screen->cols, measured_fps, sim_steps_per_second,
+                   scene->gravity_acceleration, scene->stats.wave_speed,
+                   scene->active_boundary_kind, scene->active_theme_index);
+  hud_paint_hint(screen->rows);
+
+  wnoutrefresh(stdscr);
+  doupdate();
 }
 
 /* ===================================================================== */
 /* §21  app — main loop + signals + input                                */
 /* ===================================================================== */
 
+/*
+ * App — top-level container; lives in BSS as the single app_state instance.
+ *
+ * Intent
+ *   Signal handlers need to reach state the main loop polls.  A
+ *   global App + handlers that flip its volatile sig_atomic_t flags
+ *   is the standard POSIX "wake the main loop" pattern.
+ *
+ * Why the volatile sig_atomic_t flags
+ *   POSIX permits signal handlers to write ONLY sig_atomic_t values
+ *   with simple assignments — anything wider is UB.  volatile forces
+ *   every read in the main loop to go back to memory across signal
+ *   arrival (no compiler caching).
+ *
+ * Why sim_steps_per_second lives here (not in Scene)
+ *   sim_steps_per_second is a frame-loop concern — it picks the
+ *   inner-loop tick period TICK_NS(rate) — and has no meaning inside
+ *   scene_tick which receives the resulting dt as a parameter.
+ *   Keeping it on App keeps Scene free of timing detail.
+ */
 typedef struct {
-    Scene                  scene;
-    Screen                 screen;
-    int                    sim_steps_per_second;
-    volatile sig_atomic_t  running;
-    volatile sig_atomic_t  need_resize;
+    Scene  scene;                          /* world + control state    */
+    Screen screen;                         /* terminal extent          */
+    int    sim_steps_per_second;           /* sim tick rate, Hz        */
+    volatile sig_atomic_t running;         /* SIGINT/TERM clears this  */
+    volatile sig_atomic_t need_resize;     /* SIGWINCH sets this       */
 } App;
 
 static App app_state;
 
-static void on_signal_quit  (int sig) { (void)sig; app_state.running     = 0; }
-static void on_signal_resize(int sig) { (void)sig; app_state.need_resize = 1; }
-
-static bool app_handle_key(App *app, int ch)
-{
-    Scene *scene = &app->scene;
-
-    switch (ch) {
-        case 'q': case 'Q': case 27:
-            return false;
-
-        case ' ':
-            scene->simulation_paused = !scene->simulation_paused;
-            break;
-
-        case 's': case 'S':
-            scene->simulation_paused    = true;
-            scene->step_request_pending = true;
-            break;
-
-        case 'r': case 'R':
-            scene_load_preset(scene, scene->active_preset_index);
-            break;
-
-        case 'd': case 'D': {
-            float cx = (float)(grid_active_cols - 1) * 0.5f;
-            float cy = (float)(grid_active_rows - 1) * 0.5f;
-            apply_gaussian_drop(cx, cy,
-                                DROP_HEIGHT_AMPLITUDE, DROP_GAUSSIAN_RADIUS);
-            zero_fields_in_walls();
-            apply_boundary(scene->active_boundary_kind);
-            break;
-        }
-
-        case 'b': case 'B':
-            grid_zero_fluid_fields();
-            apply_dam_break_initial_state();
-            zero_fields_in_walls();
-            apply_boundary(scene->active_boundary_kind);
-            scene->simulation_time_seconds = 0.0f;
-            break;
-
-        case 'g':
-            scene->gravity_acceleration += GRAVITY_STEP;
-            if (scene->gravity_acceleration > GRAVITY_MAX)
-                scene->gravity_acceleration = GRAVITY_MAX;
-            break;
-        case 'G':
-            scene->gravity_acceleration -= GRAVITY_STEP;
-            if (scene->gravity_acceleration < GRAVITY_MIN)
-                scene->gravity_acceleration = GRAVITY_MIN;
-            break;
-
-        case 'n': case 'N':
-            scene->active_boundary_kind =
-                (scene->active_boundary_kind + 1) % BC_COUNT;
-            scene_load_preset(scene, scene->active_preset_index);
-            break;
-
-        case 'p':
-            scene_load_preset(scene,
-                              (scene->active_preset_index + 1)
-                              % PRESET_COUNT);
-            break;
-        case 'P':
-            scene_load_preset(scene,
-                              (scene->active_preset_index + PRESET_COUNT - 1)
-                              % PRESET_COUNT);
-            break;
-
-        case 'o': case 'O':
-            scene->show_obstacles = !scene->show_obstacles;
-            break;
-
-        case 'a': case 'A':
-            scene->show_arrows = !scene->show_arrows;
-            break;
-
-        case 'l': case 'L':
-            scene->show_shoreline = !scene->show_shoreline;
-            break;
-
-        case 't': case 'T':
-            scene->active_theme_index =
-                (scene->active_theme_index + 1) % THEME_COUNT;
-            break;
-
-        case ']':
-            app->sim_steps_per_second += SIM_HZ_STEP;
-            if (app->sim_steps_per_second > SIM_HZ_MAX)
-                app->sim_steps_per_second = SIM_HZ_MAX;
-            break;
-        case '[':
-            app->sim_steps_per_second -= SIM_HZ_STEP;
-            if (app->sim_steps_per_second < SIM_HZ_MIN)
-                app->sim_steps_per_second = SIM_HZ_MIN;
-            break;
-
-        default: break;
-    }
-    return true;
+static void on_signal_quit(int sig) {
+  (void)sig;
+  app_state.running = 0;
+}
+static void on_signal_resize(int sig) {
+  (void)sig;
+  app_state.need_resize = 1;
 }
 
-int main(void)
-{
-    srand((unsigned)(clock_now_ns() & 0xFFFFFFFF));
-    atexit(screen_cleanup);
-    signal(SIGINT,   on_signal_quit);
-    signal(SIGTERM,  on_signal_quit);
-    signal(SIGWINCH, on_signal_resize);
+static bool app_handle_key(App *app, int ch) {
+  Scene *scene = &app->scene;
 
-    App *app                       = &app_state;
-    app->running                   = 1;
-    app->sim_steps_per_second      = SIM_HZ_DEFAULT;
+  switch (ch) {
+  case 'q':
+  case 'Q':
+  case 27:
+    return false;
 
-    screen_init(&app->screen);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+  case ' ':
+    scene->simulation_paused = !scene->simulation_paused;
+    break;
 
-    int64_t prev_frame_ns          = clock_now_ns();
-    int64_t fps_window_ns          = 0;
-    int     frames_in_window       = 0;
-    double  measured_fps           = 0.0;
-    int64_t sim_accumulator_ns     = 0;
+  case 's':
+  case 'S':
+    scene->simulation_paused = true;
+    scene->step_request_pending = true;
+    break;
 
-    const int64_t render_cap_ns    = NS_PER_SEC / RENDER_FPS_CAP;
+  case 'r':
+  case 'R':
+    scene_load_preset(scene, scene->active_preset_index);
+    break;
 
-    while (app->running) {
-        int64_t frame_start_ns = clock_now_ns();
+  case 'd':
+  case 'D': {
+    float cx = (float)(grid_active_cols - 1) * 0.5f;
+    float cy = (float)(grid_active_rows - 1) * 0.5f;
+    apply_gaussian_drop(cx, cy, DROP_HEIGHT_AMPLITUDE, DROP_GAUSSIAN_RADIUS);
+    zero_fields_in_walls();
+    apply_boundary(scene->active_boundary_kind);
+    break;
+  }
 
-        /* ── input ── */
-        int ch;
-        while ((ch = getch()) != ERR) {
-            if (!app_handle_key(app, ch)) {
-                app->running = 0;
-                break;
-            }
-        }
-        if (!app->running) break;
+  case 'b':
+  case 'B':
+    grid_zero_fluid_fields();
+    apply_dam_break_initial_state();
+    zero_fields_in_walls();
+    apply_boundary(scene->active_boundary_kind);
+    scene->simulation_time_seconds = 0.0f;
+    break;
 
-        /* ── resize ── */
-        if (app->need_resize) {
-            app->need_resize = 0;
-            screen_resize(&app->screen);
-            scene_resize(&app->scene, app->screen.cols, app->screen.rows);
-            prev_frame_ns      = clock_now_ns();
-            sim_accumulator_ns = 0;
-        }
+  case 'g':
+    scene->gravity_acceleration += GRAVITY_STEP;
+    if (scene->gravity_acceleration > GRAVITY_MAX)
+      scene->gravity_acceleration = GRAVITY_MAX;
+    break;
+  case 'G':
+    scene->gravity_acceleration -= GRAVITY_STEP;
+    if (scene->gravity_acceleration < GRAVITY_MIN)
+      scene->gravity_acceleration = GRAVITY_MIN;
+    break;
 
-        /* ── dt + fps window ── */
-        int64_t dt_ns  = frame_start_ns - prev_frame_ns;
-        prev_frame_ns  = frame_start_ns;
-        if (dt_ns > 100 * NS_PER_MS) dt_ns = 100 * NS_PER_MS;
+  case 'n':
+  case 'N':
+    scene->active_boundary_kind = (scene->active_boundary_kind + 1) % BC_COUNT;
+    scene_load_preset(scene, scene->active_preset_index);
+    break;
 
-        frames_in_window++;
-        fps_window_ns += dt_ns;
-        if (fps_window_ns >= FPS_RECOMPUTE_MS * NS_PER_MS) {
-            measured_fps = (double)frames_in_window
-                         / ((double)fps_window_ns / (double)NS_PER_SEC);
-            frames_in_window = 0;
-            fps_window_ns    = 0;
-        }
+  case 'p':
+    scene_load_preset(scene, (scene->active_preset_index + 1) % PRESET_COUNT);
+    break;
+  case 'P':
+    scene_load_preset(scene, (scene->active_preset_index + PRESET_COUNT - 1) %
+                                 PRESET_COUNT);
+    break;
 
-        /* ── physics — fixed-dt accumulator ── */
-        int64_t tick_ns = TICK_NS(app->sim_steps_per_second);
-        float   dt_sec  = 1.0f / (float)app->sim_steps_per_second;
-        sim_accumulator_ns += dt_ns;
-        while (sim_accumulator_ns >= tick_ns) {
-            scene_tick(&app->scene, dt_sec);
-            sim_accumulator_ns -= tick_ns;
-        }
+  case 'o':
+  case 'O':
+    scene->show_obstacles = !scene->show_obstacles;
+    break;
 
-        /* ── render ── */
-        screen_present_frame(&app->screen, &app->scene,
-                             measured_fps, app->sim_steps_per_second);
+  case 'a':
+  case 'A':
+    scene->show_arrows = !scene->show_arrows;
+    break;
 
-        /* ── frame cap ── */
-        int64_t spent = clock_now_ns() - frame_start_ns;
-        if (spent < render_cap_ns) clock_sleep_ns(render_cap_ns - spent);
+  case 'l':
+  case 'L':
+    scene->show_shoreline = !scene->show_shoreline;
+    break;
+
+  case 't':
+  case 'T':
+    scene->active_theme_index = (scene->active_theme_index + 1) % THEME_COUNT;
+    break;
+
+  case ']':
+    app->sim_steps_per_second += SIM_HZ_STEP;
+    if (app->sim_steps_per_second > SIM_HZ_MAX)
+      app->sim_steps_per_second = SIM_HZ_MAX;
+    break;
+  case '[':
+    app->sim_steps_per_second -= SIM_HZ_STEP;
+    if (app->sim_steps_per_second < SIM_HZ_MIN)
+      app->sim_steps_per_second = SIM_HZ_MIN;
+    break;
+
+  default:
+    break;
+  }
+  return true;
+}
+
+int main(void) {
+  srand((unsigned)(clock_now_ns() & 0xFFFFFFFF));
+  atexit(screen_cleanup);
+  signal(SIGINT, on_signal_quit);
+  signal(SIGTERM, on_signal_quit);
+  signal(SIGWINCH, on_signal_resize);
+
+  App *app = &app_state;
+  app->running = 1;
+  app->sim_steps_per_second = SIM_HZ_DEFAULT;
+
+  screen_init(&app->screen);
+  scene_init(&app->scene, app->screen.cols, app->screen.rows);
+
+  int64_t prev_frame_ns = clock_now_ns();
+  int64_t fps_window_ns = 0;
+  int frames_in_window = 0;
+  double measured_fps = 0.0;
+  int64_t sim_accumulator_ns = 0;
+
+  const int64_t render_cap_ns = NS_PER_SEC / RENDER_FPS_CAP;
+
+  while (app->running) {
+    int64_t frame_start_ns = clock_now_ns();
+
+    /* ── input ── */
+    int ch;
+    while ((ch = getch()) != ERR) {
+      if (!app_handle_key(app, ch)) {
+        app->running = 0;
+        break;
+      }
+    }
+    if (!app->running)
+      break;
+
+    /* ── resize ── */
+    if (app->need_resize) {
+      app->need_resize = 0;
+      screen_resize(&app->screen);
+      scene_resize(&app->scene, app->screen.cols, app->screen.rows);
+      prev_frame_ns = clock_now_ns();
+      sim_accumulator_ns = 0;
     }
 
-    return 0;
+    /* ── dt + fps window ── */
+    int64_t dt_ns = frame_start_ns - prev_frame_ns;
+    prev_frame_ns = frame_start_ns;
+    if (dt_ns > 100 * NS_PER_MS)
+      dt_ns = 100 * NS_PER_MS;
+
+    frames_in_window++;
+    fps_window_ns += dt_ns;
+    if (fps_window_ns >= FPS_RECOMPUTE_MS * NS_PER_MS) {
+      measured_fps = (double)frames_in_window /
+                     ((double)fps_window_ns / (double)NS_PER_SEC);
+      frames_in_window = 0;
+      fps_window_ns = 0;
+    }
+
+    /* ── physics — fixed-dt accumulator ── */
+    int64_t tick_ns = TICK_NS(app->sim_steps_per_second);
+    float dt_sec = 1.0f / (float)app->sim_steps_per_second;
+    sim_accumulator_ns += dt_ns;
+    while (sim_accumulator_ns >= tick_ns) {
+      scene_tick(&app->scene, dt_sec);
+      sim_accumulator_ns -= tick_ns;
+    }
+
+    /* ── render ── */
+    screen_present_frame(&app->screen, &app->scene, measured_fps,
+                         app->sim_steps_per_second);
+
+    /* ── frame cap ── */
+    int64_t spent = clock_now_ns() - frame_start_ns;
+    if (spent < render_cap_ns)
+      clock_sleep_ns(render_cap_ns - spent);
+  }
+
+  return 0;
 }

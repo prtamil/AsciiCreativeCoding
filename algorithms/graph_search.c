@@ -52,6 +52,69 @@
  *                  A* heuristic h(n) = Euclidean distance: admissible since
  *                  it never overestimates straight-line distance.
  *
+ * References
+ * ──────────
+ *   ── Search algorithms (BFS / DFS / A* — §6) ─────────────────────
+ *   [1] Hart, P. E., Nilsson, N. J. & Raphael, B. (1968), "A Formal
+ *       Basis for the Heuristic Determination of Minimum Cost Paths",
+ *       IEEE Trans. Systems Science and Cybernetics 4(2), pp. 100-107
+ *       — the ORIGINAL A* paper.  Formalises admissibility and proves
+ *       optimality.  Surprisingly readable for a 1968 paper.
+ *   [2] Dijkstra, E. W. (1959), "A Note on Two Problems in Connexion
+ *       with Graphs", Numerische Mathematik 1(1), pp. 269-271 — the
+ *       3-page paper that defined shortest-path search.  A* with
+ *       h ≡ 0 IS Dijkstra; read this to see what A* generalises.
+ *   [3] Cormen, T. H., Leiserson, C. E., Rivest, R. L. & Stein, C.
+ *       (2009), "Introduction to Algorithms" (3rd ed.), MIT Press —
+ *       Ch. 22 (Elementary Graph Algorithms: BFS, DFS) and Ch. 24
+ *       (Single-Source Shortest Paths: Dijkstra, Bellman-Ford).  The
+ *       standard reference; rigorous proofs of correctness + complexity.
+ *   [4] Russell, S. & Norvig, P. (2020), "Artificial Intelligence: A
+ *       Modern Approach" (4th ed.), Pearson — Ch. 3 covers BFS, DFS,
+ *       Dijkstra and A* in one unified "search" framework.  The
+ *       clearest treatment of "the algorithm IS the frontier rule".
+ *   [5] Sedgewick, R. & Wayne, K. (2011), "Algorithms" (4th ed.),
+ *       Addison-Wesley — Ch. 4 "Graphs" walks through BFS/DFS/Dijkstra
+ *       with full Java implementations and complexity analysis.  Most
+ *       practical of the three textbooks if you want working code.
+ *
+ *   ── Force-directed graph layout (§5) ────────────────────────────
+ *   [6] Fruchterman, T. M. J. & Reingold, E. M. (1991), "Graph drawing
+ *       by force-directed placement", Software: Practice and Experience
+ *       21(11), pp. 1129-1164 — the LAYOUT used in §5.  Defines the
+ *       k = √(area/N) ideal edge length and the cooling schedule we
+ *       omit.  ~12 readable pages.
+ *   [7] Eades, P. (1984), "A Heuristic for Graph Drawing", Congressus
+ *       Numerantium 42, pp. 149-160 — the spring-model predecessor
+ *       to F&R.  Useful for the historical motivation: graphs as
+ *       physical systems.
+ *   [8] Di Battista, G., Eades, P., Tamassia, R. & Tollis, I. G. (1999),
+ *       "Graph Drawing: Algorithms for the Visualization of Graphs",
+ *       Prentice Hall — the canonical graph-drawing textbook.  Ch. 10
+ *       surveys force-directed methods including barycentric, simulated
+ *       annealing, and magnetic-field variants.
+ *   [9] Barnes, J. & Hut, P. (1986), "A hierarchical O(N log N) force-
+ *       calculation algorithm", Nature 324, pp. 446-449 — how to scale
+ *       the all-pairs repulsion in F&R from O(N²) to O(N log N) for
+ *       large N.  Not needed at N=40 but the standard speed-up.
+ *
+ *   ── Rendering (§7) ──────────────────────────────────────────────
+ *  [10] Bresenham, J. E. (1965), "Algorithm for computer control of a
+ *       digital plotter", IBM Systems Journal 4(1), pp. 25-30 — the
+ *       integer-only line rasterisation used by draw_edge_segment.
+ *       The directional-glyph trick (`/\|-`) is a small extension.
+ *  [11] Foley, J. D., van Dam, A., Feiner, S. K. & Hughes, J. F. (1995),
+ *       "Computer Graphics: Principles and Practice" (2nd ed.),
+ *       Addison-Wesley — §3.2 covers DDA, Bresenham, and run-length
+ *       line rasterisation with clear pseudocode and figures.
+ *
+ *   ── Online quick reference ─────────────────────────────────────
+ *  [12] Patel, A. (Red Blob Games), "Introduction to A*" —
+ *       https://www.redblobgames.com/pathfinding/a-star/introduction.html
+ *       — the best interactive online explanation of A*.  Read after
+ *       [1] to see the algorithm animated in your browser.  Pairs
+ *       well with this file's step-by-step terminal animation.
+ *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── MENTAL MODEL ─────────────────────────────────────────────────────── *
@@ -62,23 +125,11 @@
  * whose neighbours are next in line to expand, pop one node off the
  * frontier each tick, mark it VISITED, push every fresh neighbour onto
  * the frontier, and record which neighbour discovered which (the
- * g_prev[] back-pointer).  The ONLY thing the three algorithms differ
+ * prev[] back-pointer).  The ONLY thing the three algorithms differ
  * on is the rule for which frontier node to pop next: BFS pops the
  * oldest (FIFO queue), DFS pops the newest (LIFO stack), A* pops the
  * one with the smallest f = g + h.  When the popped node is the goal,
- * walk g_prev[] backwards to paint the final path.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture flooding ink across a road map starting at source S.  BFS is
- * wet ink spreading evenly outward in concentric rings — every node
- * 1 hop away gets soaked before anything 2 hops away.  DFS is one
- * obsessive person walking, taking the first unvisited side road every
- * time, only backtracking when stuck — it draws a single long worm
- * through the graph.  A* is a guided drone that prefers nodes pointing
- * toward G — it bends the BFS ring into an oval stretched toward the
- * goal.  Same map, three different exploration orders, three different
- * stories told by the colour wave.
+ * walk prev[] backwards to paint the final path.
  *
  * ALGORITHM IN STEPS
  * ──────────────────
@@ -92,14 +143,15 @@
  *     DFS stack; A* uses no container — it scans the FRONTIER array.
  *  4. Each STEP_NS=125 ms tick, call search_step():
  *       BFS:  u = queue.pop_front(); mark VISITED; for each neighbour
- *             still UNVIS, set g_prev[v]=u, mark FRONTIER, queue.push.
+ *             still UNVIS, set prev[v]=u, mark FRONTIER, queue.push.
  *       DFS:  u = stack.pop_top(); same expansion but stack-ordered.
- *       A*:   scan FRONTIER, pick u minimising f = g_dist[u] + h(u→G);
- *             relax g_dist[v] = g_dist[u] + edge_len if smaller.
+ *       A*:   scan FRONTIER, pick u minimising f = cost[u] + h(u→G);
+ *             relax cost[v] = cost[u] + edge_len if smaller.
+ *             (cost[] is g(n) in A* literature.)
  *  5. Whenever a neighbour equals goal, call reconstruct_path():
- *     walk g_prev[] from goal back to src, flag g_on_path[i] = true,
- *     re-paint those nodes PATH_NODE/yellow and set g_phase = DONE.
- *  6. scene_draw() reads g_ns[] each frame and pushes glyph + colour
+ *     walk prev[] from goal back to src, flag on_path[i] = true,
+ *     re-paint those nodes PATH_NODE/yellow and set phase = DONE.
+ *  6. scene_draw() reads state[] each frame and pushes glyph + colour
  *     per node, plus a Bresenham line per edge with bold yellow if
  *     both endpoints are on the final path.
  *
@@ -116,75 +168,34 @@
  *  Path reconstruction  n := goal; while n != −1: on_path[n]=true; n := prev[n]
  *  Pixel→cell           cx = round(px / CELL_W), cy = round(py / CELL_H)
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *  • DFS uses a "lazy" pop: the same node can sit multiple times on
- *    the stack — the `if (g_ns[u] == VISITED) return;` guard at the
- *    top of dfs_step() catches the stale copies.
- *  • The A* implementation has NO closed set per se: VISITED nodes
- *    are skipped in the relaxation loop, but the FRONTIER scan is
- *    O(N) per pop — fine at N_NODES=40, would be O(N²) total at scale.
- *  • g_prev[] is never reset between algorithms when only `a` is
- *    pressed — search_reset() handles it; pressing `a` alone clears
- *    g_ns[] but not g_prev[].  Press `s` to start a clean search.
- *  • Random graphs can be disconnected — if goal is unreachable, the
- *    queue/stack drains and g_phase becomes DONE with no path drawn.
- *  • The K_CONNECT=3 mutual-adding step double-connects pairs (i→j and
- *    j→i are both set), but the symmetry is intentional — adjacency
- *    is undirected.
- *  • Layout uses fixed DT_SETTLE=0.3 with no damping — explosions are
- *    avoided only because forces stabilise within 250 iterations and
- *    bounds clamp keeps strays in.
- *
- * HOW TO VERIFY
- * ─────────────
- *  • Run BFS on a freshly generated graph: count rings of cyan
- *    flashing outward — every node at hop k turns FRONTIER on tick k
- *    after src.  A bright concentric pattern means BFS is correct.
- *  • Run A* and BFS on the same graph (`s` then `a` then `s`): A*
- *    should expand fewer or equal VISITED nodes than BFS, and the
- *    final yellow path length should be identical for both (both
- *    optimal under unit-weight... actually A* optimal under
- *    Euclidean-weighted, BFS optimal under hop count; on this random
- *    layout they may differ slightly).
- *  • DFS frontier should look like a thin tendril, not a ring; its
- *    final path is usually longer than BFS's.
- *  • g_steps in the HUD: typical BFS ≈ 15-25 expansions on N=40,
- *    A* ≈ 8-15.  If A* exceeds BFS, the heuristic computation is
- *    broken.
- *  • Press `r` repeatedly: nodes should redistribute and arms should
- *    not overlap heavily — if they do, SETTLE_ITERS is too low.
- *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
  *
  * Reading order
  * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
- *      Read algorithms/sort_vis.c first if state-machine algorithm
- *      animation is new — that file's T1-T2 explain how to turn an
- *      iterative algorithm into a per-tick coroutine.  Same pattern
- *      here, on graphs instead of arrays.
+ *   1. CONCEPTS + MENTAL MODEL above — read first.
  *   2. §6 algorithms — bfs_step, dfs_step, astar_step.  THE HEART
- *      of this file.  Read AFTER tutorials T1-T6.
+ *      of this file.  Each step function carries its own pseudocode
+ *      docblock; read those before the bodies.
  *   3. §5 layout — Fruchterman-Reingold force-directed layout.
  *      Independent of the search; read as a self-contained sub-
- *      lesson on graph drawing (T6 below).
- *   4. §4 graph — adjacency-list generation.
+ *      lesson on graph drawing.
+ *   4. §4 graph — Scene struct + adjacency-list generation.
  *   5. §1-§3, §7-§8 — config / clock / colour / scene / app loop.
  *
  * Variable-naming convention
  * ──────────────────────────
  *   N_NODES                    40 — fixed graph size.
- *   g_ns[i]                    NodeState of node i (UNVIS, FRONTIER,
+ *   sc->state[i]               NodeState of node i (UNVIS, FRONTIER,
  *                              VISITED, PATH_NODE, SRC, GOAL).
- *   g_prev[i]                  back-pointer for path reconstruction:
+ *   sc->prev[i]                back-pointer for path reconstruction:
  *                              "which node DISCOVERED node i?"
- *   g_dist[i]                  cumulative path length src → i (A*
+ *   sc->cost[i]                cumulative path length src → i (A*
  *                              only).  AKA `g(n)` in A* literature.
- *   g_queue / g_stack          BFS FIFO / DFS LIFO containers.
- *   src, goal                  source + goal node indices.  Picked
+ *   sc->queue / sc->stack      BFS FIFO / DFS LIFO containers
+ *                              (NodeQueue / NodeStack from §4).
+ *   sc->src, sc->goal          source + goal node indices.  Picked
  *                              as farthest-apart pair.
  *
  * Background you need
@@ -197,260 +208,9 @@
  * Background you DON'T need
  * ─────────────────────────
  *   - Dijkstra's algorithm in detail.  A* with h ≡ 0 IS Dijkstra;
- *     the heuristic is what makes it A*.  Implicit in T4.
+ *     the heuristic is what makes it A* (see References [1], [2]).
  *   - Big-O proofs.  Mentioned in CONCEPTS but not derived.
  *   - Graph theory beyond adjacency-list connectivity.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Six tutorials that build BFS / DFS / A* from one shared skeleton.
- *
- *   T1  The unified search skeleton — all three are the same loop
- *   T2  BFS — FIFO queue, expands by hops
- *   T3  DFS — LIFO stack, expands by depth
- *   T4  A* — heuristic-guided priority pop
- *   T5  Path reconstruction — back-pointers tell the story
- *   T6  Force-directed graph layout (independent sub-lesson)
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  THE UNIFIED SEARCH SKELETON — ALL THREE ARE THE SAME LOOP
- * ─────────────────────────────────────────────────────────────
- * BFS, DFS, and A* LOOK like three different algorithms.  They're
- * really one algorithm with one variable swap:
- *
- *     mark src FRONTIER, push it on the container
- *     while container not empty:
- *       u = container.POP()           ← the only line that varies
- *       if u == goal: reconstruct path, done
- *       mark u VISITED
- *       for each neighbour v of u:
- *         if v is UNVIS:
- *           mark v FRONTIER
- *           prev[v] = u
- *           container.PUSH(v)
- *
- * The container choice IS the algorithm:
- *
- *     BFS: container = QUEUE, POP = pop_front (oldest)
- *     DFS: container = STACK, POP = pop_top   (newest)
- *     A* : container = priority FRONTIER set, POP = min by f
- *
- * That's it.  Identical bookkeeping (mark, push neighbours,
- * remember prev), different choice of "which node to visit
- * NEXT."  The algorithms differ in BEHAVIOUR because the order
- * of expansion differs, but the loop body is the same.
- *
- * §6 algorithms has three step functions — bfs_step, dfs_step,
- * astar_step — with this skeleton each.  Reading them
- * side-by-side reveals the structural identity hidden under
- * different vocabulary.
- *
- * T2  BFS — FIFO QUEUE, EXPANDS BY HOPS
- * ─────────────────────────────────────
- * BFS uses a FIFO QUEUE: pop the OLDEST node added to the
- * frontier.  Behaviour:
- *
- *     tick 0: pop src; queue its 3 neighbours.
- *     tick 1: pop neighbour 1; queue ITS 3 neighbours.
- *     tick 2: pop neighbour 2; queue ITS new neighbours.
- *     tick 3: pop neighbour 3; queue.
- *     tick 4: pop the FIRST grandchild of src.  ← was queued at tick 0
- *
- * Notice the pattern: all 1-hop neighbours of src are popped
- * BEFORE any 2-hop neighbour.  All 2-hop before any 3-hop.
- * BFS expands in CONCENTRIC RINGS by hop count.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │              ●                                   │
- *      │         ●         ●                              │
- *      │     ●     ●     ●     ●                          │
- *      │  ●     ●     S     ●     ●                       │
- *      │     ●     ●     ●     ●                          │
- *      │         ●         ●                              │
- *      │              ●                                   │
- *      │                                                  │
- *      │  ring 0 = src; ring 1 = 1-hop; ring 2 = 2-hop;  │
- *      │  visualised as "ink spreading evenly outward"    │
- *      └──────────────────────────────────────────────────┘
- *
- * GUARANTEE: BFS finds the path with the FEWEST HOPS from src
- * to goal.  Proof: ring k is processed entirely before ring
- * k+1 starts; if goal is in ring k, no path of < k hops exists
- * to it.
- *
- * COMPLEXITY: O(V + E) — every vertex popped once, every edge
- * inspected (at most twice).
- *
- * T3  DFS — LIFO STACK, EXPANDS BY DEPTH
- * ──────────────────────────────────────
- * DFS uses a LIFO STACK: pop the NEWEST node added.
- *
- *     tick 0: pop src; push neighbours [N1, N2, N3].
- *     tick 1: pop N3 (newest); push its neighbours [M1, M2].
- *     tick 2: pop M2; push its neighbours.
- *     ...
- *
- * The OLDEST nodes (N1, N2) sit at the BOTTOM of the stack and
- * don't get popped until the entire subtree below N3 has been
- * fully explored.  DFS goes DEEP into one branch first, only
- * backing up when stuck.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │   S ─────●─────●─────●─────●                     │
- *      │                              \                   │
- *      │                               ●                  │
- *      │                                \                 │
- *      │                                 ●                │
- *      │                                                  │
- *      │  one obsessive worm walks the graph              │
- *      └──────────────────────────────────────────────────┘
- *
- * NO OPTIMALITY GUARANTEE.  The path DFS finds may be much
- * longer than the BFS optimum.  But DFS is useful for cycle
- * detection, topological sort, articulation point search, and
- * many other graph problems where finding "any path" beats
- * finding "the shortest path."
- *
- * COMPLEXITY: O(V + E) same as BFS.  The container choice
- * doesn't change asymptotic cost.
- *
- * T4  A* — HEURISTIC-GUIDED PRIORITY POP
- * ──────────────────────────────────────
- * A* uses a PRIORITY FRONTIER: pop the node with the smallest
- * f(n) value, where:
- *
- *     f(n) = g(n) + h(n)
- *     g(n) = cost of the BEST KNOWN PATH from src to n
- *     h(n) = HEURISTIC estimate of cost from n to goal
- *
- * For grid/Euclidean problems, h is straight-line distance to
- * goal.  This heuristic is ADMISSIBLE — it never
- * overestimates the actual cost (no path can be shorter than
- * the straight line).
- *
- * BEHAVIOUR: A* combines BFS's optimality with directed search.
- * It expands nodes that look most promising to reach the goal
- * cheaply, NOT just nodes nearest to src.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │              ●                                   │
- *      │         ●        ●●●●                            │
- >      │      ●     ●        ●●●● ─→ G                    │
- *      │   ●     ●     S        ●●                        │
- *      │      ●           ●                               │
- *      │         ●                                        │
- *      │                                                  │
- *      │  expansion is BFS-like near src,                 │
- *      │  STRETCHED toward G                              │
- *      └──────────────────────────────────────────────────┘
- *
- * GUARANTEE: with admissible heuristic, A* finds the OPTIMAL
- * path AND visits no more nodes than necessary (consistent
- * heuristic gives the strongest bound).
- *
- * Special cases:
- *   h(n) = 0 always           → A* becomes Dijkstra's algorithm
- *   h(n) = g(n) = 0           → A* becomes BFS (unit-weight)
- *   h(n) overestimates       → A* can return non-optimal paths
- *
- * EDGE RELAXATION (the A*-specific bookkeeping):
- *   when expanding u, if g[u] + edge_len(u, v) < g[v]:
- *     g[v] = g[u] + edge_len(u, v)
- *     prev[v] = u
- *
- * This lets A* find a SHORTER path to v if one exists through
- * u, even after v has been added to the frontier under a
- * different prev.
- *
- * COMPLEXITY: O((V + E) log V) with a binary heap, where the
- * log V comes from heap operations.  Our implementation does
- * a linear scan over the FRONTIER (O(V) per pop), so it's
- * O(V² + E) — fine at N=40, slow at N=10000+.
- *
- * T5  PATH RECONSTRUCTION — BACK-POINTERS TELL THE STORY
- * ──────────────────────────────────────────────────────
- * All three algorithms FIND the goal eventually.  But finding
- * is half the job — you also need to TRACE THE PATH.
- *
- * The trick: every time you mark a neighbour FRONTIER (T1
- * skeleton, line 4), record WHICH NODE DISCOVERED IT:
- *
- *     prev[v] = u
- *
- * After the search reaches goal, walk prev backward:
- *
- *     n = goal
- *     while n != src:
- *       on_path[n] = true
- *       n = prev[n]
- *
- * This produces the path in REVERSE order.  Since we just
- * mark nodes, reverse order doesn't matter — the renderer
- * paints all marked nodes the same.
- *
- * For each algorithm, prev[v] gets ONE value: whichever node
- * was the FIRST to expand to v (because we only set prev[v]
- * when v transitions UNVIS → FRONTIER).  That gives:
- *   BFS: prev = a shortest-by-hops path
- *   DFS: prev = the path DFS happened to take
- *   A* : (with the relaxation in T4) the optimal-cost path
- *
- * Same machinery (one int per node), three different paths
- * because the search ORDER was different.
- *
- * T6  FORCE-DIRECTED GRAPH LAYOUT (INDEPENDENT SUB-LESSON)
- * ────────────────────────────────────────────────────────
- * The graph nodes are placed by FORCE-DIRECTED LAYOUT
- * (Fruchterman & Reingold 1991): pretend the nodes are charged
- * particles + the edges are springs.  Run for many iterations;
- * watch the system settle into a low-energy configuration where
- * connected nodes are close and unconnected ones are spread out.
- *
- * Forces:
- *
- *     REPULSION — between EVERY pair of nodes:
- *       F_rep = K_REP / d²        (Coulomb-like, falls off with
- *                                  distance squared)
- *       direction: from j toward i (push apart)
- *
- *     ATTRACTION — only along EDGES:
- *       F_att = K_ATT · (d - REST_LEN)
- *                                  (Hooke spring; positive when
- *                                   stretched, negative when
- *                                   compressed)
- *       direction: from i toward j (pull together)
- *
- * Per iteration:
- *   1. for each node, sum repulsion forces from all others
- *   2. for each edge, add attraction forces to both endpoints
- *   3. update positions: pos_i += F_i · DT_SETTLE
- *   4. clamp positions to screen bounds
- *
- * After ~250 iterations, the system is near-equilibrium —
- * nodes spread out enough to be legible, connected nodes close
- * enough to read as a graph.
- *
- * No formal convergence guarantee (the energy landscape has
- * local minima), but in practice random graphs of N ≈ 40
- * settle quickly.  At larger N, you'd add cooling (gradually
- * shrink DT_SETTLE) and possibly Barnes-Hut acceleration for
- * the all-pairs repulsion (O(N log N) instead of O(N²)).
- *
- * Same trick is used in:
- *   - software dependency visualisers
- *   - social network diagrams
- *   - molecular structure layouts
- *   - the d3.js force-directed graph component
- *
- * Force-directed layout is INDEPENDENT of the search; it just
- * makes the graph readable.  You could paste any (V, E)
- * adjacency list in and the same code would lay it out.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -544,358 +304,806 @@ static void color_init(void)
 }
 
 /* ===================================================================== */
-/* §4  graph                                                              */
+/* §4  graph — data structures, generation                                */
 /* ===================================================================== */
 
-static float  g_px[N_NODES], g_py[N_NODES];   /* pixel-space positions  */
-static bool   g_adj[N_NODES][N_NODES];
-static int    g_n_nodes;
-static int    g_src, g_goal;
-static int    g_rows, g_cols;
+/*
+ * Vec2 — 2-D pixel-space position. (See CELL_W / CELL_H in §1 for the
+ *   pixel-to-cell conversion.) Y axis points DOWN (terminal convention).
+ *   Used for node positions and layout forces alike — the integrator
+ *   adds a force vector to a position vector each tick, so storing both
+ *   as Vec2 keeps the math symmetric.
+ */
+typedef struct { float x, y; } Vec2;
 
+/*
+ * NodeQueue — FIFO container for BFS.
+ *
+ *   buf[head .. tail)   queued node indices in arrival order.
+ *   push    appends at tail, pop removes from head; both O(1).
+ *   empty   when head >= tail.
+ *
+ *   Sized 4×N_NODES of slack (BFS never reinserts, but the over-allocation
+ *   costs nothing and matches the stack's lazy-push budget).
+ */
+typedef struct {
+    int buf[N_NODES * 4];
+    int head, tail;
+} NodeQueue;
+
+/*
+ * NodeStack — LIFO container for DFS.
+ *
+ *   buf[0 .. top)   stacked node indices in push order.
+ *   push    appends at top, pop removes from top; both O(1).
+ *   empty   when top == 0.
+ *
+ *   Sized 4×N_NODES so DFS can LAZILY push neighbours without checking
+ *   for duplicates — the pop-time VISITED guard skips stale entries.
+ *   Lazy push keeps the inner loop branchless.
+ */
+typedef struct {
+    int buf[N_NODES * 4];
+    int top;
+} NodeStack;
+
+/*
+ * Scene — owns ALL simulation, search, and render state for one run.
+ *
+ *   ── Graph topology + geometry ──
+ *      pos[N_NODES]     pixel-space positions (Vec2)
+ *      adj[N][N]        undirected adjacency matrix
+ *      src, goal        endpoint indices (farthest-apart pair)
+ *      rows, cols       terminal extent in CHARACTER CELLS
+ *
+ *   ── Per-node search state ──
+ *      state[]          NodeState (UNVIS, FRONTIER, VISITED, PATH_NODE, SRC, GOAL)
+ *      prev[]           predecessor for path reconstruction (-1 if none)
+ *      cost[]           g(n) — best known path cost from src; used by A*
+ *      on_path[]        marked by reconstruct_path() once goal is reached
+ *
+ *   ── Algorithm containers ──
+ *      queue            BFS FIFO
+ *      stack            DFS LIFO
+ *      (A* uses no container — it scans state[] for the min-f FRONTIER)
+ *
+ *   ── Mode / progress ──
+ *      alg              ALG_BFS / ALG_DFS / ALG_ASTAR
+ *      phase            IDLE / RUNNING / DONE
+ *      steps            expansion counter shown in the HUD
+ *      paused           pause flag (toggled by 'p')
+ *
+ * One instance lives in main(), passed by pointer to every algorithm /
+ * layout / draw / init function. The signal-handler flags (g_quit,
+ * g_resize) in §8 stay as file-scope globals because POSIX signal
+ * handlers can't be passed a pointer.
+ */
+typedef struct {
+    /* Topology + geometry */
+    Vec2        pos[N_NODES];
+    bool        adj[N_NODES][N_NODES];
+    int         src, goal;
+    int         rows, cols;
+
+    /* Per-node search state */
+    NodeState   state[N_NODES];
+    int         prev[N_NODES];
+    float       cost[N_NODES];
+    bool        on_path[N_NODES];
+
+    /* Containers */
+    NodeQueue   queue;
+    NodeStack   stack;
+
+    /* Mode */
+    Algorithm   alg;
+    SearchPhase phase;
+    int         steps;
+    bool        paused;
+} Scene;
+
+/*
+ * px_cx / px_cy — pixel-space → cell-space rounding.
+ *   The renderer needs (row, col) cell indices; the simulation stores
+ *   pixel positions. The +0.5f rounds to nearest cell.
+ */
 static int px_cx(float px) { return (int)(px / (float)CELL_W + 0.5f); }
 static int px_cy(float py) { return (int)(py / (float)CELL_H + 0.5f); }
 
-static float node_dist(int i, int j)
+/*
+ * node_dist — Euclidean distance between two nodes in pixel space.
+ *   Used as edge weight in A* (true geometric cost) and as the
+ *   reference length in the layout's spring force.
+ */
+static float node_dist(const Scene *sc, int i, int j)
 {
-    float dx = g_px[i]-g_px[j], dy = g_py[i]-g_py[j];
+    float dx = sc->pos[i].x - sc->pos[j].x;
+    float dy = sc->pos[i].y - sc->pos[j].y;
     return sqrtf(dx*dx + dy*dy);
 }
 
-static void graph_generate(int rows, int cols)
+/*
+ * scatter_nodes_random — uniform random placement in the play area.
+ *
+ *   Play area = terminal pixel-rect MINUS:
+ *     - top HUD strip (HUD_ROWS rows)
+ *     - 1/8 inset on each side (keeps nodes off the screen edge so the
+ *       layout integrator has room to spread them out before clamping)
+ */
+static void scatter_nodes_random(Scene *sc)
 {
-    g_n_nodes = N_NODES;
-    /* random placement in the animation area below HUD */
-    int pw = cols * CELL_W, ph = rows * CELL_H;
+    int pw = sc->cols * CELL_W, ph = sc->rows * CELL_H;
     int margin_x = pw / 8, margin_y = ph / 8;
     int area_w = pw - 2*margin_x, area_h = ph - 2*margin_y;
-    int hud_py  = HUD_ROWS * CELL_H;
+    int hud_py = HUD_ROWS * CELL_H;
+    if (area_w < 1) area_w = 1;
+    if (area_h < 1) area_h = 1;
 
     for (int i = 0; i < N_NODES; i++) {
-        g_px[i] = (float)margin_x + (float)(rand() % area_w);
-        g_py[i] = (float)(hud_py + margin_y) + (float)(rand() % area_h);
+        sc->pos[i].x = (float)margin_x + (float)(rand() % area_w);
+        sc->pos[i].y = (float)(hud_py + margin_y) + (float)(rand() % area_h);
     }
+}
 
-    /* clear adjacency */
-    memset(g_adj, 0, sizeof(g_adj));
-
-    /* connect each node to its K nearest neighbours */
-    for (int i = 0; i < N_NODES; i++) {
-        /* sort by distance to i (simple insertion-sort of K entries) */
-        float best_d[K_CONNECT]; int best_j[K_CONNECT];
-        for (int k = 0; k < K_CONNECT; k++) { best_d[k]=1e30f; best_j[k]=-1; }
-
-        for (int j = 0; j < N_NODES; j++) {
-            if (j == i) continue;
-            float d = node_dist(i, j);
-            /* insert into best-K if d < worst */
-            for (int k = 0; k < K_CONNECT; k++) {
-                if (d < best_d[k]) {
-                    /* shift down */
-                    for (int m = K_CONNECT-1; m > k; m--) {
-                        best_d[m] = best_d[m-1]; best_j[m] = best_j[m-1];
-                    }
-                    best_d[k] = d; best_j[k] = j; break;
-                }
+/*
+ * insert_into_k_nearest — maintain a sorted "K smallest values" buffer.
+ *
+ *   Pseudocode:
+ *     for k in 0..K−1:
+ *       if d < best_d[k]:
+ *         shift best_d[k..K−2] right one slot
+ *         best_d[k] := d;  best_j[k] := j
+ *         return
+ *
+ *   Used by connect_to_k_nearest. O(K) per insert, O(N · K) per node.
+ *   At K_CONNECT=3 this is much cheaper than sorting all N candidates.
+ */
+static void insert_into_k_nearest(float *best_d, int *best_j, int K,
+                                  float d, int j)
+{
+    for (int k = 0; k < K; k++) {
+        if (d < best_d[k]) {
+            for (int m = K - 1; m > k; m--) {
+                best_d[m] = best_d[m-1];
+                best_j[m] = best_j[m-1];
             }
-        }
-        for (int k = 0; k < K_CONNECT; k++) {
-            if (best_j[k] >= 0) {
-                g_adj[i][best_j[k]] = true;
-                g_adj[best_j[k]][i] = true;
-            }
+            best_d[k] = d;
+            best_j[k] = j;
+            return;
         }
     }
+}
 
-    /* pick source and goal: the two nodes farthest apart */
-    g_src = 0; g_goal = 1;
+/*
+ * connect_to_k_nearest — add undirected edges from node i to its K closest.
+ *
+ *   Pseudocode:
+ *     init best_d[0..K−1] := +inf;  best_j[0..K−1] := −1
+ *     for every other node j:
+ *       insert_into_k_nearest(node_dist(i, j), j)
+ *     for k in 0..K−1:
+ *       adj[i][best_j[k]] := adj[best_j[k]][i] := true   ← undirected
+ *
+ *   K=3 keeps the graph sparse and planar-ish; higher K makes a denser
+ *   web that's harder to read but easier for search to traverse.
+ */
+static void connect_to_k_nearest(Scene *sc, int i, int K)
+{
+    float best_d[K_CONNECT];
+    int   best_j[K_CONNECT];
+    for (int k = 0; k < K; k++) { best_d[k] = 1e30f; best_j[k] = -1; }
+
+    for (int j = 0; j < N_NODES; j++) {
+        if (j == i) continue;
+        insert_into_k_nearest(best_d, best_j, K, node_dist(sc, i, j), j);
+    }
+    for (int k = 0; k < K; k++) {
+        if (best_j[k] >= 0) {
+            sc->adj[i][best_j[k]] = true;
+            sc->adj[best_j[k]][i] = true;
+        }
+    }
+}
+
+/*
+ * pick_farthest_pair_as_endpoints — choose (src, goal) = graph's diameter.
+ *
+ *   All-pairs O(N²) scan; the pair with the largest Euclidean distance
+ *   becomes (src, goal). Why FARTHEST: forces the search to traverse
+ *   most of the graph before reaching goal, making the algorithm's
+ *   BEHAVIOUR visible — a 2-hop search is too short to tell BFS from DFS.
+ *
+ *   Note: this is geometric diameter, not graph diameter (max shortest-path
+ *   over all pairs). On random K-nearest graphs they usually agree.
+ */
+static void pick_farthest_pair_as_endpoints(Scene *sc)
+{
+    sc->src = 0; sc->goal = 1;
     float max_d = 0.f;
-    for (int i = 0; i < N_NODES; i++)
-        for (int j = i+1; j < N_NODES; j++) {
-            float d = node_dist(i, j);
-            if (d > max_d) { max_d = d; g_src = i; g_goal = j; }
+    for (int i = 0; i < N_NODES; i++) {
+        for (int j = i + 1; j < N_NODES; j++) {
+            float d = node_dist(sc, i, j);
+            if (d > max_d) { max_d = d; sc->src = i; sc->goal = j; }
         }
+    }
+}
+
+/*
+ * graph_generate — orchestrator.
+ *
+ *   Pseudocode:
+ *     1. scatter_nodes_random                ← random placement
+ *     2. clear adjacency matrix
+ *     3. for each i: connect_to_k_nearest(i, K_CONNECT)
+ *     4. pick_farthest_pair_as_endpoints     ← sets sc->src, sc->goal
+ *
+ *   The layout pass (§5) then settles random positions into a legible
+ *   drawing; the search (§6) runs against the resulting graph.
+ */
+static void graph_generate(Scene *sc)
+{
+    scatter_nodes_random(sc);
+    memset(sc->adj, 0, sizeof(sc->adj));
+    for (int i = 0; i < N_NODES; i++) connect_to_k_nearest(sc, i, K_CONNECT);
+    pick_farthest_pair_as_endpoints(sc);
 }
 
 /* ===================================================================== */
-/* §5  force-directed layout                                              */
+/* §5  force-directed layout (Fruchterman & Reingold 1991)                */
 /* ===================================================================== */
 
-static void layout_settle(void)
+/*
+ * accumulate_repulsion_forces — Coulomb-like all-pairs push.
+ *
+ *   For every UNORDERED pair (i, j):
+ *     d² := ‖pos_i − pos_j‖²            (clamped to ≥ 1 to avoid /0)
+ *     F  := K_REP / d²                  (Coulomb-like, ∝ 1/d²)
+ *     direction: from j toward i — push apart
+ *     fx[i] += F · dx/d;  fy[i] += F · dy/d
+ *     fx[j] −= F · dx/d;  fy[j] −= F · dy/d    (Newton's 3rd law)
+ *
+ *   O(N²) per call. The d² ≥ 1 clamp prevents NaNs when two nodes
+ *   coincide; without it the force explodes and ejects one node.
+ */
+static void accumulate_repulsion_forces(const Scene *sc, float *fx, float *fy)
+{
+    for (int i = 0; i < N_NODES; i++) {
+        for (int j = i + 1; j < N_NODES; j++) {
+            float dx = sc->pos[i].x - sc->pos[j].x;
+            float dy = sc->pos[i].y - sc->pos[j].y;
+            float d2 = dx*dx + dy*dy;
+            if (d2 < 1.f) d2 = 1.f;
+            float f = K_REP / d2;
+            float d = sqrtf(d2);
+            fx[i] += f * dx / d;  fy[i] += f * dy / d;
+            fx[j] -= f * dx / d;  fy[j] -= f * dy / d;
+        }
+    }
+}
+
+/*
+ * accumulate_spring_forces — Hooke-like pull along edges.
+ *
+ *   For every undirected edge (i, j) in adj:
+ *     d := ‖pos_j − pos_i‖              (clamped to ≥ 1)
+ *     F := K_ATT · (d − REST_LEN)        (positive when stretched,
+ *                                         negative when compressed)
+ *     direction: along (i → j) — pull together when stretched
+ *
+ *   Repulsion (everywhere) + attraction (along edges) has a low-energy
+ *   equilibrium where connected nodes sit ≈ REST_LEN apart and
+ *   unconnected ones drift apart. That equilibrium IS the legible
+ *   drawing the search will animate against.
+ */
+static void accumulate_spring_forces(const Scene *sc, float *fx, float *fy)
+{
+    for (int i = 0; i < N_NODES; i++) {
+        for (int j = i + 1; j < N_NODES; j++) {
+            if (!sc->adj[i][j]) continue;
+            float dx = sc->pos[j].x - sc->pos[i].x;
+            float dy = sc->pos[j].y - sc->pos[i].y;
+            float d  = sqrtf(dx*dx + dy*dy);
+            if (d < 1.f) d = 1.f;
+            float f = K_ATT * (d - REST_LEN);
+            fx[i] += f * dx / d;  fy[i] += f * dy / d;
+            fx[j] -= f * dx / d;  fy[j] -= f * dy / d;
+        }
+    }
+}
+
+/*
+ * integrate_and_clamp — Euler step + bounds clamp to play area.
+ *
+ *   pos[i] += F[i] · DT_SETTLE
+ *   then clamp each axis into the play rect (HUD-aware top, MARGIN inset).
+ *
+ *   No damping: F&R 1991 omits it; the force balance reaches equilibrium
+ *   on its own within SETTLE_ITERS ≈ 250 rounds. The bounds clamp keeps
+ *   transient overshoot from ejecting nodes off-screen.
+ */
+static void integrate_and_clamp(Scene *sc, const float *fx, const float *fy)
+{
+    int pw = sc->cols * CELL_W, ph = sc->rows * CELL_H;
+    int hud_py = HUD_ROWS * CELL_H;
+    const int margin = 40;
+
+    for (int i = 0; i < N_NODES; i++) {
+        sc->pos[i].x += fx[i] * DT_SETTLE;
+        sc->pos[i].y += fy[i] * DT_SETTLE;
+        if (sc->pos[i].x < (float)margin)            sc->pos[i].x = (float)margin;
+        if (sc->pos[i].x > (float)(pw - margin))     sc->pos[i].x = (float)(pw - margin);
+        if (sc->pos[i].y < (float)(hud_py + margin)) sc->pos[i].y = (float)(hud_py + margin);
+        if (sc->pos[i].y > (float)(ph - margin))     sc->pos[i].y = (float)(ph - margin);
+    }
+}
+
+/*
+ * layout_settle — Fruchterman & Reingold force-directed layout driver.
+ *
+ *   Pseudocode (SETTLE_ITERS iterations):
+ *     zero force accumulators
+ *     accumulate_repulsion_forces    ← all-pairs Coulomb push
+ *     accumulate_spring_forces       ← edge Hooke pull
+ *     integrate_and_clamp            ← Euler step, then bounds clamp
+ *
+ *   No formal convergence proof; in practice N≈40 settles visibly well
+ *   under 250 iterations. Larger N would warrant COOLING (gradually
+ *   shrink DT_SETTLE — see [6]) and Barnes-Hut O(N log N) repulsion
+ *   (see [9]).
+ *
+ *   References [6] for the original algorithm, [7] for the spring-model
+ *   predecessor, [8] for a survey of layout methods.
+ */
+static void layout_settle(Scene *sc)
 {
     float fx[N_NODES], fy[N_NODES];
-    int   pw = g_cols * CELL_W, ph = g_rows * CELL_H;
-    int   hud_py = HUD_ROWS * CELL_H;
-    int   margin = 40;
-
     for (int iter = 0; iter < SETTLE_ITERS; iter++) {
         memset(fx, 0, sizeof(fx));
         memset(fy, 0, sizeof(fy));
-
-        /* repulsion between all pairs */
-        for (int i = 0; i < N_NODES; i++) {
-            for (int j = i+1; j < N_NODES; j++) {
-                float dx = g_px[i]-g_px[j], dy = g_py[i]-g_py[j];
-                float d2 = dx*dx + dy*dy;
-                if (d2 < 1.f) d2 = 1.f;
-                float f = K_REP / d2;
-                float d = sqrtf(d2);
-                fx[i] += f*dx/d; fy[i] += f*dy/d;
-                fx[j] -= f*dx/d; fy[j] -= f*dy/d;
-            }
-        }
-
-        /* spring attraction along edges */
-        for (int i = 0; i < N_NODES; i++) {
-            for (int j = i+1; j < N_NODES; j++) {
-                if (!g_adj[i][j]) continue;
-                float dx = g_px[j]-g_px[i], dy = g_py[j]-g_py[i];
-                float d = sqrtf(dx*dx+dy*dy);
-                if (d < 1.f) d = 1.f;
-                float f = K_ATT * (d - REST_LEN);
-                fx[i] += f*dx/d; fy[i] += f*dy/d;
-                fx[j] -= f*dx/d; fy[j] -= f*dy/d;
-            }
-        }
-
-        /* integrate and clamp to bounds */
-        for (int i = 0; i < N_NODES; i++) {
-            g_px[i] += fx[i] * DT_SETTLE;
-            g_py[i] += fy[i] * DT_SETTLE;
-            if (g_px[i] < (float)margin)     g_px[i] = (float)margin;
-            if (g_px[i] > (float)(pw-margin)) g_px[i] = (float)(pw-margin);
-            if (g_py[i] < (float)(hud_py+margin)) g_py[i] = (float)(hud_py+margin);
-            if (g_py[i] > (float)(ph-margin))     g_py[i] = (float)(ph-margin);
-        }
+        accumulate_repulsion_forces(sc, fx, fy);
+        accumulate_spring_forces   (sc, fx, fy);
+        integrate_and_clamp        (sc, fx, fy);
     }
 }
 
 /* ===================================================================== */
-/* §6  algorithms                                                         */
+/* §6  algorithms — BFS, DFS, A* on a shared expansion skeleton           */
 /* ===================================================================== */
 
-static NodeState g_ns[N_NODES];    /* node state array           */
-static int       g_prev[N_NODES];  /* predecessor for path recon */
-static float     g_dist[N_NODES];  /* distance from source        */
-static bool      g_on_path[N_NODES];
+/* ── Container primitives ──────────────────────────────────────────── */
 
-/* BFS queue */
-static int g_queue[N_NODES * 4], g_q_head, g_q_tail;
-/* DFS stack */
-static int g_stack[N_NODES * 4], g_s_top;
+/*
+ * NodeQueue / NodeStack ops — push/pop/empty on the FIFO and LIFO buffers.
+ *
+ *   Splitting the container API into named primitives makes bfs_step
+ *   and dfs_step read as pseudocode against one unified skeleton:
+ *   "pop u from container; for each neighbour, push v on container".
+ *   The CONTAINER CHOICE is the algorithm (see References [3], [4]).
+ */
+static inline void queue_push (NodeQueue *q, int v) { q->buf[q->tail++] = v; }
+static inline int  queue_pop  (NodeQueue *q)        { return q->buf[q->head++]; }
+static inline bool queue_empty(const NodeQueue *q)  { return q->head >= q->tail; }
 
-static Algorithm g_alg   = ALG_BFS;
-static SearchPhase g_phase = IDLE;
-static int       g_steps  = 0;
+static inline void stack_push (NodeStack *s, int v) { s->buf[s->top++] = v; }
+static inline int  stack_pop  (NodeStack *s)        { return s->buf[--s->top]; }
+static inline bool stack_empty(const NodeStack *s)  { return s->top == 0; }
 
-static const char *alg_name(void)
+/* ── Display helper ────────────────────────────────────────────────── */
+
+static const char *alg_name(const Scene *sc)
 {
-    return g_alg == ALG_BFS ? "BFS" : g_alg == ALG_DFS ? "DFS" : "A*";
+    return sc->alg == ALG_BFS ? "BFS" : sc->alg == ALG_DFS ? "DFS" : "A*";
 }
 
-static void search_reset(void)
-{
-    for (int i = 0; i < N_NODES; i++) {
-        g_ns[i]   = (i == g_src) ? SRC : (i == g_goal) ? GOAL : UNVIS;
-        g_prev[i] = -1;
-        g_dist[i] = 1e30f;
-        g_on_path[i] = false;
-    }
-    g_dist[g_src] = 0.f;
-    g_q_head = g_q_tail = 0;
-    g_s_top  = 0;
-    g_steps  = 0;
-    g_phase  = RUNNING;
+/* ── Search bookkeeping shared across BFS / DFS / A* ───────────────── */
 
-    if (g_alg == ALG_BFS) {
-        g_queue[g_q_tail++] = g_src;
-        g_ns[g_src] = FRONTIER;
-    } else if (g_alg == ALG_DFS) {
-        g_stack[g_s_top++] = g_src;
-        g_ns[g_src] = FRONTIER;
-    } else { /* A* */
-        g_ns[g_src] = FRONTIER;
-    }
-}
-
-static void reconstruct_path(void)
+/*
+ * mark_visited_if_neutral — colour-state transition for an expanded node.
+ *
+ *   Preserves SRC and GOAL (they have their own colours); any other
+ *   node transitions to VISITED on expansion. Used by all three step
+ *   functions to avoid clobbering the endpoint glyphs.
+ */
+static inline void mark_visited_if_neutral(Scene *sc, int u)
 {
-    int n = g_goal;
-    while (n != -1) { g_on_path[n] = true; n = g_prev[n]; }
-    for (int i = 0; i < N_NODES; i++) {
-        if (!g_on_path[i]) continue;
-        if (i == g_src)  g_ns[i] = SRC;
-        else if (i == g_goal) g_ns[i] = GOAL;
-        else g_ns[i] = PATH_NODE;
-    }
-    g_phase = DONE;
+    if (sc->state[u] != SRC && sc->state[u] != GOAL) sc->state[u] = VISITED;
 }
 
 /*
- * One BFS expansion step: dequeue the front node, expand its unvisited
- * neighbours, enqueue them.
+ * search_reset — initialise per-node state and seed the active container.
+ *
+ *   Pseudocode:
+ *     for each node i:
+ *       state[i] := SRC if i==src, GOAL if i==goal, else UNVIS
+ *       prev[i]  := −1
+ *       cost[i]  := +inf       (A* g-score; unused by BFS/DFS)
+ *       on_path[i] := false
+ *     cost[src] := 0
+ *     clear queue and stack
+ *     phase := RUNNING
+ *     state[src] := FRONTIER
+ *     seed the algorithm's container with src (A* uses no container)
  */
-static void bfs_step(void)
+static void search_reset(Scene *sc)
 {
-    if (g_q_head >= g_q_tail) { g_phase = DONE; return; }
-    int u = g_queue[g_q_head++];
-    if (g_ns[u] != SRC && g_ns[u] != GOAL) g_ns[u] = VISITED;
-    g_steps++;
-
-    for (int v = 0; v < N_NODES; v++) {
-        if (!g_adj[u][v]) continue;
-        if (g_ns[v] != UNVIS && g_ns[v] != GOAL) continue;
-        g_prev[v] = u;
-        if (v == g_goal) { reconstruct_path(); return; }
-        g_ns[v] = FRONTIER;
-        g_queue[g_q_tail++] = v;
+    for (int i = 0; i < N_NODES; i++) {
+        sc->state[i]   = (i == sc->src) ? SRC : (i == sc->goal) ? GOAL : UNVIS;
+        sc->prev[i]    = -1;
+        sc->cost[i]    = 1e30f;
+        sc->on_path[i] = false;
     }
-}
+    sc->cost[sc->src] = 0.f;
+    sc->queue.head = sc->queue.tail = 0;
+    sc->stack.top  = 0;
+    sc->steps      = 0;
+    sc->phase      = RUNNING;
 
-/* One DFS step: pop the stack, expand one unvisited neighbour. */
-static void dfs_step(void)
-{
-    if (g_s_top == 0) { g_phase = DONE; return; }
-    int u = g_stack[--g_s_top];
-    if (g_ns[u] == VISITED) { return; } /* already expanded */
-    if (g_ns[u] != SRC && g_ns[u] != GOAL) g_ns[u] = VISITED;
-    g_steps++;
-
-    for (int v = 0; v < N_NODES; v++) {
-        if (!g_adj[u][v]) continue;
-        if (g_ns[v] == VISITED) continue;
-        if (g_prev[v] == -1) g_prev[v] = u;
-        if (v == g_goal) { reconstruct_path(); return; }
-        if (g_ns[v] == UNVIS) {
-            g_ns[v] = FRONTIER;
-            g_stack[g_s_top++] = v;
-        }
-    }
+    sc->state[sc->src] = FRONTIER;
+    if      (sc->alg == ALG_BFS) queue_push(&sc->queue, sc->src);
+    else if (sc->alg == ALG_DFS) stack_push(&sc->stack, sc->src);
+    /* A*: no container — frontier_pick_min_f scans state[] each tick */
 }
 
 /*
- * One A* step: scan FRONTIER for minimum f = g + h, expand it.
- * O(N) scan is acceptable for N=40.
+ * reconstruct_path — back-walk prev[] from goal to source, mark on_path[].
+ *
+ *   Pseudocode:
+ *     n := goal
+ *     while n != −1:
+ *       on_path[n] := true
+ *       n := prev[n]
+ *     for each marked node: bump state[] to PATH_NODE (SRC/GOAL preserved)
+ *     phase := DONE
+ *
+ *   prev[i] is set when i transitions UNVIS → FRONTIER (or for A*, when
+ *   relax_edge finds a cheaper path through some u). Walking it backward
+ *   from goal yields the path in reverse — we just MARK, order doesn't
+ *   matter to the renderer.
  */
-static void astar_step(void)
+static void reconstruct_path(Scene *sc)
 {
-    int   best = -1;
+    int n = sc->goal;
+    while (n != -1) { sc->on_path[n] = true; n = sc->prev[n]; }
+    for (int i = 0; i < N_NODES; i++) {
+        if (!sc->on_path[i]) continue;
+        if      (i == sc->src)  sc->state[i] = SRC;
+        else if (i == sc->goal) sc->state[i] = GOAL;
+        else                    sc->state[i] = PATH_NODE;
+    }
+    sc->phase = DONE;
+}
+
+/* ── A* helpers ────────────────────────────────────────────────────── */
+
+/*
+ * heuristic_to_goal — h(n) = Euclidean distance from node n to the goal.
+ *
+ *   ADMISSIBLE: never overestimates the true cost (no path can be
+ *   shorter than the straight line). With an admissible heuristic, A*
+ *   is OPTIMAL — the first path returned is the cheapest by edge-weight
+ *   sum. References [1] proves it; [4] gives a more accessible treatment.
+ */
+static float heuristic_to_goal(const Scene *sc, int n)
+{
+    float dx = sc->pos[n].x - sc->pos[sc->goal].x;
+    float dy = sc->pos[n].y - sc->pos[sc->goal].y;
+    return sqrtf(dx*dx + dy*dy);
+}
+
+/*
+ * frontier_pick_min_f — scan state[] for the FRONTIER node minimising
+ * f = g + h. Returns −1 when the frontier is empty (search exhausted).
+ *
+ *   O(N) per call — fine at N_NODES=40. A binary heap would give
+ *   O(log N) at the cost of an explicit priority queue.
+ */
+static int frontier_pick_min_f(const Scene *sc)
+{
+    int   best   = -1;
     float best_f = 1e30f;
-    float hx = g_px[g_goal], hy = g_py[g_goal];
-
     for (int i = 0; i < N_NODES; i++) {
-        if (g_ns[i] != FRONTIER) continue;
-        float dx = g_px[i]-hx, dy = g_py[i]-hy;
-        float h = sqrtf(dx*dx + dy*dy);
-        float f = g_dist[i] + h;
+        if (sc->state[i] != FRONTIER) continue;
+        float f = sc->cost[i] + heuristic_to_goal(sc, i);
         if (f < best_f) { best_f = f; best = i; }
     }
-    if (best == -1) { g_phase = DONE; return; }
-
-    int u = best;
-    if (u == g_goal) { reconstruct_path(); return; }
-    if (g_ns[u] != SRC) g_ns[u] = VISITED;
-    g_steps++;
-
-    for (int v = 0; v < N_NODES; v++) {
-        if (!g_adj[u][v]) continue;
-        if (g_ns[v] == VISITED) continue;
-        float ng = g_dist[u] + node_dist(u, v);
-        if (ng < g_dist[v]) {
-            g_dist[v] = ng;
-            g_prev[v] = u;
-            if (v == g_goal) { reconstruct_path(); return; }
-            g_ns[v] = FRONTIER;
-        }
-    }
+    return best;
 }
-
-static void search_step(void)
-{
-    if (g_phase != RUNNING) return;
-    switch (g_alg) {
-    case ALG_BFS:   bfs_step();   break;
-    case ALG_DFS:   dfs_step();   break;
-    case ALG_ASTAR: astar_step(); break;
-    }
-}
-
-/* ===================================================================== */
-/* §7  scene                                                              */
-/* ===================================================================== */
-
-static bool g_paused = false;
 
 /*
- * draw_line() — Bresenham line with directional char selection.
- * attr is applied to every character written.
+ * relax_edge — A* edge relaxation.
+ *
+ *   if cost[u] + len(u,v) < cost[v]:
+ *     cost[v] := cost[u] + len(u,v)
+ *     prev[v] := u
+ *     state[v] := FRONTIER             (re-add; the next scan picks it up)
+ *
+ *   Skips v if it's already VISITED (closed-set assumption — admissible
+ *   heuristic means the first pop of v is its optimal cost).
+ *
+ *   Returns true if v == goal so the caller can call reconstruct_path
+ *   without descending into the state[v] := FRONTIER assignment.
  */
-static void draw_line(int x0, int y0, int x1, int y1, attr_t attr,
-                      int cols, int rows)
+static bool relax_edge(Scene *sc, int u, int v)
 {
-    int dx = abs(x1-x0), dy = abs(y1-y0);
-    int sx = x0<x1?1:-1, sy = y0<y1?1:-1;
-    int err = dx-dy;
-    for (;;) {
-        if (x0>=0&&x0<cols&&y0>=0&&y0<rows) {
-            int  e2 = 2*err;
-            bool bx = e2 > -dy, by = e2 < dx;
-            chtype ch = (bx&&by) ? (sx==sy?'\\':'/') : bx?'-':'|';
-            attron(attr); mvaddch(y0,x0,ch); attroff(attr);
-        }
-        if (x0==x1&&y0==y1) break;
-        int e2=2*err;
-        if (e2>-dy){err-=dy;x0+=sx;}
-        if (e2< dx){err+=dx;y0+=sy;}
+    if (sc->state[v] == VISITED) return false;
+    float ng = sc->cost[u] + node_dist(sc, u, v);
+    if (ng >= sc->cost[v]) return false;
+    sc->cost[v] = ng;
+    sc->prev[v] = u;
+    if (v == sc->goal) return true;
+    sc->state[v] = FRONTIER;
+    return false;
+}
+
+/* ── Step functions — one expansion per call ──────────────────────── */
+
+/*
+ * bfs_step — one BFS expansion: queue.pop_front, mark visited, enqueue
+ * fresh neighbours.
+ *
+ *   Pseudocode (matches T1 unified skeleton):
+ *     if queue empty: phase := DONE; return
+ *     u := queue.pop_front()
+ *     mark u VISITED (if neutral)
+ *     for each neighbour v of u:
+ *       if v ∉ {UNVIS, GOAL}: skip
+ *       prev[v] := u
+ *       if v == goal: reconstruct_path(); return
+ *       state[v] := FRONTIER
+ *       queue.push(v)
+ *
+ *   GUARANTEE: expansion in concentric rings by hop count — the first
+ *   path BFS finds is the one with the FEWEST hops from src to goal.
+ */
+static void bfs_step(Scene *sc)
+{
+    if (queue_empty(&sc->queue)) { sc->phase = DONE; return; }
+    int u = queue_pop(&sc->queue);
+    mark_visited_if_neutral(sc, u);
+    sc->steps++;
+
+    for (int v = 0; v < N_NODES; v++) {
+        if (!sc->adj[u][v]) continue;
+        if (sc->state[v] != UNVIS && sc->state[v] != GOAL) continue;
+        sc->prev[v] = u;
+        if (v == sc->goal) { reconstruct_path(sc); return; }
+        sc->state[v] = FRONTIER;
+        queue_push(&sc->queue, v);
     }
 }
 
-static void scene_draw(int rows, int cols)
+/*
+ * dfs_step — one DFS expansion: stack.pop_top, mark visited, push fresh
+ * neighbours.
+ *
+ *   Pseudocode:
+ *     if stack empty: phase := DONE; return
+ *     u := stack.pop_top()
+ *     if u already VISITED: return            ← lazy-pop dedup
+ *     mark u VISITED (if neutral)
+ *     for each neighbour v of u:
+ *       if v already VISITED: skip
+ *       if prev[v] == −1: prev[v] := u        ← keep FIRST discoverer
+ *       if v == goal: reconstruct_path(); return
+ *       if v is UNVIS: state[v] := FRONTIER; stack.push(v)
+ *
+ *   The lazy-pop dedup (the VISITED check after pop) lets the push loop
+ *   stay branchless — duplicates surface at pop time and are dropped.
+ *
+ *   NO OPTIMALITY GUARANTEE: DFS finds a path, not necessarily the
+ *   shortest. Useful as a contrast against BFS on the same graph.
+ */
+static void dfs_step(Scene *sc)
 {
-    /* ── edges ───────────────────────────────────────────────────── */
+    if (stack_empty(&sc->stack)) { sc->phase = DONE; return; }
+    int u = stack_pop(&sc->stack);
+    if (sc->state[u] == VISITED) return;
+    mark_visited_if_neutral(sc, u);
+    sc->steps++;
+
+    for (int v = 0; v < N_NODES; v++) {
+        if (!sc->adj[u][v]) continue;
+        if (sc->state[v] == VISITED) continue;
+        if (sc->prev[v] == -1) sc->prev[v] = u;
+        if (v == sc->goal) { reconstruct_path(sc); return; }
+        if (sc->state[v] == UNVIS) {
+            sc->state[v] = FRONTIER;
+            stack_push(&sc->stack, v);
+        }
+    }
+}
+
+/*
+ * astar_step — one A* expansion: pick FRONTIER node with min f, relax edges.
+ *
+ *   Pseudocode:
+ *     u := frontier_pick_min_f()
+ *     if u == −1:    phase := DONE; return              ← frontier exhausted
+ *     if u == goal:  reconstruct_path(); return         ← popped goal: optimal
+ *     mark u VISITED (if neutral)
+ *     for each neighbour v of u:
+ *       if relax_edge(u, v): reconstruct_path(); return ← reached goal
+ *
+ *   OPTIMALITY: with admissible heuristic (Euclidean distance), the
+ *   first time the goal is POPPED its cost equals the true shortest-path
+ *   cost. With h ≡ 0, A* degenerates to Dijkstra; with h = g = 0 and
+ *   unit weights it degenerates to BFS.
+ */
+static void astar_step(Scene *sc)
+{
+    int u = frontier_pick_min_f(sc);
+    if (u == -1)       { sc->phase = DONE; return; }
+    if (u == sc->goal) { reconstruct_path(sc); return; }
+    mark_visited_if_neutral(sc, u);
+    sc->steps++;
+
+    for (int v = 0; v < N_NODES; v++) {
+        if (!sc->adj[u][v]) continue;
+        if (relax_edge(sc, u, v)) { reconstruct_path(sc); return; }
+    }
+}
+
+/*
+ * search_step — dispatch one tick to the currently selected algorithm.
+ *   The ONLY function that needs to know which algorithm is active.
+ */
+static void search_step(Scene *sc)
+{
+    if (sc->phase != RUNNING) return;
+    switch (sc->alg) {
+    case ALG_BFS:   bfs_step  (sc); break;
+    case ALG_DFS:   dfs_step  (sc); break;
+    case ALG_ASTAR: astar_step(sc); break;
+    }
+}
+
+/* ===================================================================== */
+/* §7  scene — rendering pipeline                                         */
+/* ===================================================================== */
+
+/*
+ * NodeGlyph — visual representation of one node state.
+ *   Decouples "what does this state look like" from the drawing loop.
+ *   The legend in the HUD (S=src, G=goal, O=frontier, *=path) maps
+ *   directly to entries in node_glyph_for below.
+ */
+typedef struct {
+    int    cp;       /* colour pair                       */
+    chtype ch;       /* glyph character                   */
+    attr_t extra;    /* extra attributes (e.g. A_BOLD)    */
+} NodeGlyph;
+
+/*
+ * node_glyph_for — translate a NodeState to its visual representation.
+ *   Read this as the LEGEND for the demo. Adding a new NodeState only
+ *   requires a new case here — the drawing loop stays unchanged.
+ */
+static NodeGlyph node_glyph_for(NodeState s)
+{
+    switch (s) {
+    case UNVIS:     return (NodeGlyph){CP_UNVIS, 'o', 0};
+    case FRONTIER:  return (NodeGlyph){CP_FRONT, 'O', A_BOLD};
+    case VISITED:   return (NodeGlyph){CP_VIS,   'o', 0};
+    case PATH_NODE: return (NodeGlyph){CP_PATH,  '*', A_BOLD};
+    case SRC:       return (NodeGlyph){CP_SRC,   'S', A_BOLD};
+    case GOAL:      return (NodeGlyph){CP_GOAL,  'G', A_BOLD};
+    default:        return (NodeGlyph){CP_UNVIS, 'o', 0};
+    }
+}
+
+/*
+ * draw_edge_segment — Bresenham line between two CELL points with
+ * directional ASCII glyph selection.
+ *
+ *   At each plot, the major-step axis decides the glyph:
+ *     horizontal step only → '-'
+ *     vertical step only   → '|'
+ *     both axes step       → '\' (same sign) or '/' (opposite)
+ *
+ *   Renders the edge as a continuous ASCII line that visibly slopes in
+ *   the right direction — much more readable than uniform '-' fill.
+ *
+ *   Reference: Bresenham (1965), "Algorithm for computer control of a
+ *   digital plotter", IBM Systems Journal 4(1). The directional-glyph
+ *   trick is common in ASCII graph libraries (e.g. graph-easy).
+ */
+static void draw_edge_segment(const Scene *sc,
+                              int x0, int y0, int x1, int y1, attr_t attr)
+{
+    int dx = abs(x1 - x0), dy = abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = dx - dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < sc->cols && y0 >= 0 && y0 < sc->rows) {
+            int  e2 = 2 * err;
+            bool bx = e2 > -dy, by = e2 < dx;
+            chtype ch = (bx && by) ? (sx == sy ? '\\' : '/') : bx ? '-' : '|';
+            attron(attr); mvaddch(y0, x0, ch); attroff(attr);
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+}
+
+/*
+ * draw_graph_edges — render every adjacency as an ASCII line segment.
+ *
+ *   Edges where BOTH endpoints are on the final path are drawn in bold
+ *   yellow (CP_PATH_EDGE); others are dim grey (CP_EDGE). This makes
+ *   the solution stand out against the underlying graph.
+ */
+static void draw_graph_edges(const Scene *sc)
+{
     for (int i = 0; i < N_NODES; i++) {
-        for (int j = i+1; j < N_NODES; j++) {
-            if (!g_adj[i][j]) continue;
-            bool path_e = g_on_path[i] && g_on_path[j];
-            int  cp = path_e ? CP_PATH_EDGE : CP_EDGE;
+        for (int j = i + 1; j < N_NODES; j++) {
+            if (!sc->adj[i][j]) continue;
+            bool path_e = sc->on_path[i] && sc->on_path[j];
+            int  cp     = path_e ? CP_PATH_EDGE : CP_EDGE;
             attr_t attr = COLOR_PAIR(cp) | (path_e ? (attr_t)A_BOLD : (attr_t)0);
-            draw_line(px_cx(g_px[i]), px_cy(g_py[i]),
-                      px_cx(g_px[j]), px_cy(g_py[j]),
-                      attr, cols, rows);
+            draw_edge_segment(sc,
+                              px_cx(sc->pos[i].x), px_cy(sc->pos[i].y),
+                              px_cx(sc->pos[j].x), px_cy(sc->pos[j].y),
+                              attr);
         }
     }
+}
 
-    /* ── nodes ───────────────────────────────────────────────────── */
+/*
+ * draw_graph_nodes — render every node's glyph at its cell position.
+ *
+ *   The visual state (glyph + colour + bold) comes from node_glyph_for,
+ *   so this function is pure layout: pixel → cell, bounds check, plot.
+ */
+static void draw_graph_nodes(const Scene *sc)
+{
     for (int i = 0; i < N_NODES; i++) {
-        int cx = px_cx(g_px[i]), cy = px_cy(g_py[i]);
-        if (cx<0||cx>=cols||cy<0||cy>=rows) continue;
-        int   cp;
-        chtype ch;
-        attr_t extra = 0;
-        switch (g_ns[i]) {
-        case UNVIS:     cp=CP_UNVIS; ch='o'; break;
-        case FRONTIER:  cp=CP_FRONT; ch='O'; extra=A_BOLD; break;
-        case VISITED:   cp=CP_VIS;   ch='o'; break;
-        case PATH_NODE: cp=CP_PATH;  ch='*'; extra=A_BOLD; break;
-        case SRC:       cp=CP_SRC;   ch='S'; extra=A_BOLD; break;
-        case GOAL:      cp=CP_GOAL;  ch='G'; extra=A_BOLD; break;
-        default:        cp=CP_UNVIS; ch='o'; break;
-        }
-        attron(COLOR_PAIR(cp)|extra);
-        mvaddch(cy, cx, ch);
-        attroff(COLOR_PAIR(cp)|extra);
+        int cx = px_cx(sc->pos[i].x), cy = px_cy(sc->pos[i].y);
+        if (cx < 0 || cx >= sc->cols || cy < 0 || cy >= sc->rows) continue;
+        NodeGlyph g = node_glyph_for(sc->state[i]);
+        attron(COLOR_PAIR(g.cp) | g.extra);
+        mvaddch(cy, cx, g.ch);
+        attroff(COLOR_PAIR(g.cp) | g.extra);
     }
+}
 
-    /* ── HUD ─────────────────────────────────────────────────────── */
-    const char *phase_s = g_phase==IDLE?"IDLE":g_phase==RUNNING?"RUNNING":"DONE";
+/*
+ * draw_hud — top two status lines: controls + algorithm progress.
+ *   Row 0: title + key hints.
+ *   Row 1: algorithm + phase + step count + legend + pause indicator.
+ */
+static void draw_hud(const Scene *sc)
+{
+    const char *phase_s =
+        sc->phase == IDLE    ? "IDLE"    :
+        sc->phase == RUNNING ? "RUNNING" : "DONE";
     attron(COLOR_PAIR(CP_HUD));
-    mvprintw(0,0,
+    mvprintw(0, 0,
         " GraphSearch  q:quit  s:start  a:alg  r:new-graph  p:pause  spc:step");
-    mvprintw(1,0,
+    mvprintw(1, 0,
         " alg:%-4s  phase:%-7s  steps:%3d  nodes:%d  S=src G=goal O=frontier *=path  %s",
-        alg_name(), phase_s, g_steps, N_NODES,
-        g_paused ? "PAUSED" : "");
+        alg_name(sc), phase_s, sc->steps, N_NODES,
+        sc->paused ? "PAUSED" : "");
     attroff(COLOR_PAIR(CP_HUD));
+}
+
+/*
+ * scene_draw — render one frame.
+ *
+ *   Pseudocode (layered draw, painter's algorithm):
+ *     1. graph edges  ─ background lattice; path edges bright
+ *     2. graph nodes  ─ glyph + colour from NodeState
+ *     3. HUD          ─ top two lines: keys + progress
+ *
+ *   Edges first so nodes paint over their endpoints; HUD last so its
+ *   glyphs sit on top of any node intruding into the top rows.
+ */
+static void scene_draw(const Scene *sc)
+{
+    draw_graph_edges(sc);
+    draw_graph_nodes(sc);
+    draw_hud        (sc);
 }
 
 /* ===================================================================== */
@@ -913,17 +1121,39 @@ static void sig_h(int s)
 
 static void cleanup(void) { endwin(); }
 
-static void new_graph(int rows, int cols)
+/*
+ * scene_reset_visuals — wipe state[] and on_path[] back to the IDLE baseline.
+ *
+ *   Keeps the topology (pos, adj, src, goal). Called when the user
+ *   switches algorithm or generates a new graph: drop any in-progress
+ *   or finished search visuals without rebuilding the graph.
+ */
+static void scene_reset_visuals(Scene *sc)
 {
-    g_rows = rows; g_cols = cols;
-    graph_generate(rows, cols);
-    layout_settle();
-    g_phase  = IDLE;
-    g_paused = false;
     for (int i = 0; i < N_NODES; i++) {
-        g_ns[i] = (i==g_src) ? SRC : (i==g_goal) ? GOAL : UNVIS;
-        g_on_path[i] = false;
+        sc->state[i]   = (i == sc->src) ? SRC : (i == sc->goal) ? GOAL : UNVIS;
+        sc->on_path[i] = false;
     }
+}
+
+/*
+ * new_graph — orchestrator: generate topology, lay it out, reset visuals.
+ *
+ *   Pseudocode:
+ *     1. graph_generate(sc)         ← scatter + connect + endpoints
+ *     2. layout_settle(sc)          ← Fruchterman & Reingold force-directed
+ *     3. scene_reset_visuals(sc)    ← state[] / on_path[] back to baseline
+ *     4. phase := IDLE; paused := false
+ *
+ *   Bound to 'r' and also called on initial start + resize.
+ */
+static void new_graph(Scene *sc)
+{
+    graph_generate(sc);
+    layout_settle(sc);
+    scene_reset_visuals(sc);
+    sc->phase  = IDLE;
+    sc->paused = false;
 }
 
 int main(void)
@@ -943,11 +1173,12 @@ int main(void)
     typeahead(-1);
     color_init();
 
-    int rows, cols;
-    getmaxyx(stdscr, rows, cols);
-    new_graph(rows, cols);
+    Scene scene = {0};
+    scene.alg = ALG_BFS;
+    getmaxyx(stdscr, scene.rows, scene.cols);
+    new_graph(&scene);
 
-    long long last_step = clock_ns();
+    long long last_step  = clock_ns();
     long long last_frame = clock_ns();
 
     while (!g_quit) {
@@ -955,29 +1186,26 @@ int main(void)
         if (g_resize) {
             g_resize = 0;
             endwin(); refresh();
-            getmaxyx(stdscr, rows, cols);
-            new_graph(rows, cols);
+            getmaxyx(stdscr, scene.rows, scene.cols);
+            new_graph(&scene);
             last_step = last_frame = clock_ns();
             continue;
         }
 
         int ch = getch();
         switch (ch) {
-        case 'q': case 'Q': case 27: g_quit = 1;                          break;
-        case 's': case 'S':          search_reset();                       break;
+        case 'q': case 'Q': case 27: g_quit = 1;                       break;
+        case 's': case 'S':          search_reset(&scene);             break;
         case 'a': case 'A':
-            g_alg = (Algorithm)((g_alg + 1) % 3);
-            g_phase = IDLE;
-            for (int i=0;i<N_NODES;i++){
-                g_ns[i]=(i==g_src)?SRC:(i==g_goal)?GOAL:UNVIS;
-                g_on_path[i]=false;
-            }
+            scene.alg   = (Algorithm)((scene.alg + 1) % 3);
+            scene.phase = IDLE;
+            scene_reset_visuals(&scene);
             break;
-        case 'r': case 'R':          new_graph(rows, cols);                break;
-        case 'p': case 'P':          g_paused = !g_paused;                 break;
+        case 'r': case 'R':          new_graph(&scene);                break;
+        case 'p': case 'P':          scene.paused = !scene.paused;     break;
         case ' ':
-            if (g_phase == IDLE) search_reset();
-            else search_step();
+            if (scene.phase == IDLE) search_reset(&scene);
+            else                     search_step (&scene);
             break;
         default: break;
         }
@@ -985,8 +1213,8 @@ int main(void)
         long long now = clock_ns();
 
         /* advance one step every STEP_NS if running and not paused */
-        if (g_phase == RUNNING && !g_paused && now - last_step >= STEP_NS) {
-            search_step();
+        if (scene.phase == RUNNING && !scene.paused && now - last_step >= STEP_NS) {
+            search_step(&scene);
             last_step = now;
         }
 
@@ -994,7 +1222,7 @@ int main(void)
         if (now - last_frame >= RENDER_NS) {
             last_frame = now;
             erase();
-            scene_draw(rows, cols);
+            scene_draw(&scene);
             wnoutrefresh(stdscr);
             doupdate();
         }

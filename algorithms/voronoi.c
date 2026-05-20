@@ -27,6 +27,20 @@
  * Keys:
  *   q/ESC quit   space pause   r reset seeds   ] / [  sim Hz up / down
  *
+ * Section map:
+ *   §1 config  — sim/render fps, cell pixel size, Langevin params, magic
+ *                literals named with context (SEED_SPAWN_*, BOUNCE_*, …)
+ *   §2 clock   — monotonic ns clock + nanosleep
+ *   §3 color   — seed palette (1..N_COLORS) + CP_HUD / CP_HINT pairs
+ *   §4 coords  — pixel ↔ cell conversion helpers (pw, ph)
+ *   §5 entity  — Seed + Voronoi structs; spawn / colour shuffle;
+ *                Langevin step + wall bounce; the brute-force renderer
+ *   §6 scene   — SimControls + Scene structs; scene_init / tick / draw
+ *   §7 screen  — ncurses init/teardown + canonical HUD (top status,
+ *                bottom action hints)
+ *   §8 app     — POSIX signal flags, input handler, fixed-timestep
+ *                main loop with FPS meter + frame-rate cap
+ *
  * Build:
  *   gcc -std=c11 -O2 -Wall -Wextra voronoi.c -o voronoi -lncurses -lm
  */
@@ -52,16 +66,70 @@
  *                  This is Ornstein-Uhlenbeck process — Brownian motion with
  *                  mean-reverting velocity (terminal speed = NOISE/DAMP).
  *
- * References     :
- *   Aurenhammer, "Voronoi diagrams" (ACM Comp. Surv. 23, 1991) —
- *     comprehensive survey of algorithms + applications.
- *   Fortune, "A sweepline algorithm for Voronoi diagrams"
- *     (Algorithmica 2, 1987) — the O(N log N) classical algorithm
- *     not used here.
- *   de Berg et al., "Computational Geometry" (3rd ed., 2008) ch. 7.
- *   See also: procedural/generational/voronoi_region_map.c (static
- *     Voronoi for region mapping) and the Voronoi-Delaunay duality
- *     in procedural/generational/delaunay_triangulation.c.
+ * References
+ * ──────────
+ *   ── Original algorithm papers (Voronoi diagrams) ───────────────
+ *   [1] Voronoi, G. (1908), "Nouvelles applications des paramètres
+ *       continus à la théorie des formes quadratiques", J. reine
+ *       angew. Math. 134, pp. 198-287 — the FOUNDATIONAL paper that
+ *       gives the diagram its name; defines V(i) as the locus of
+ *       points closer to seed i than any other seed.
+ *   [2] Delaunay, B. (1934), "Sur la sphère vide", Bull. Acad. Sci.
+ *       URSS, Class. Sci. Mat. 7, pp. 793-800 — introduces the
+ *       Delaunay triangulation, the dual graph of the Voronoi
+ *       diagram (every Voronoi vertex is a Delaunay circumcentre).
+ *   [3] Shamos, M. I. & Hoey, D. (1975), "Closest-point problems",
+ *       16th FOCS, pp. 151-162 — earliest O(N log N) divide-and-
+ *       conquer construction; the first computational-geometry
+ *       paper to give Voronoi a polynomial bound.
+ *   [4] Fortune, S. (1987), "A sweepline algorithm for Voronoi
+ *       diagrams", Algorithmica 2, pp. 153-174 — the modern O(N log N)
+ *       sweep-line algorithm (NOT used here; this file uses naive
+ *       O(cells × N) per frame because N ≤ 30).
+ *   [5] Lloyd, S. P. (1982), "Least squares quantization in PCM",
+ *       IEEE Trans. Inf. Theory 28(2), pp. 129-137 — the iterative
+ *       "Lloyd's algorithm" for centroidal Voronoi tessellations
+ *       (k-means).  Relevant if you want to relax seed positions
+ *       toward their cell centroids.
+ *
+ *   ── Canonical textbooks ────────────────────────────────────────
+ *   [6] Aurenhammer, F. (1991), "Voronoi diagrams — A survey of a
+ *       fundamental geometric data structure", ACM Computing Surveys
+ *       23(3), pp. 345-405 — the comprehensive survey: algorithms,
+ *       applications, generalisations.  Read this first if approaching
+ *       Voronoi seriously.
+ *   [7] Preparata, F. P. & Shamos, M. I. (1985), "Computational
+ *       Geometry: An Introduction", Springer — Ch. 5 covers Voronoi
+ *       diagrams in the first textbook treatment of the field.
+ *   [8] de Berg, M., Cheong, O., van Kreveld, M. & Overmars, M.
+ *       (2008), "Computational Geometry: Algorithms and Applications"
+ *       (3rd ed.), Springer — Ch. 7 (Voronoi) + Ch. 9 (Delaunay).
+ *       The standard graduate text.
+ *   [9] Okabe, A., Boots, B., Sugihara, K. & Chiu, S. N. (2000),
+ *       "Spatial Tessellations: Concepts and Applications of Voronoi
+ *       Diagrams" (2nd ed.), Wiley — the encyclopaedic monograph;
+ *       every variant and application surveyed in depth.
+ *
+ *   ── Langevin / Brownian-motion physics (§5 seed dynamics) ──────
+ *  [10] Langevin, P. (1908), "Sur la théorie du mouvement brownien",
+ *       C. R. Acad. Sci. Paris 146, pp. 530-533 — the original
+ *       Langevin equation: dv/dt = −γv + σξ.
+ *  [11] Uhlenbeck, G. E. & Ornstein, L. S. (1930), "On the theory of
+ *       the Brownian motion", Phys. Rev. 36(5), pp. 823-841 — the
+ *       OU process: mean-reverting velocity with terminal speed
+ *       σ/γ.  Exactly the dynamics §5 implements.
+ *
+ *   ── Algorithm visualisation / map generation ───────────────────
+ *  [12] Patel, A., "Polygonal Map Generation for Games", Red Blob
+ *       Games — https://www.redblobgames.com/maps/mapgen2/ —
+ *       walkthrough of Voronoi diagrams as a procedural-generation
+ *       primitive; visual presentation of cells, edges, and the
+ *       Voronoi-Delaunay duality.
+ *
+ *   ── Companion files in this project ────────────────────────────
+ *   See also:  procedural/generational/voronoi_region_map.c (static
+ *     Voronoi for region mapping); procedural/generational/
+ *     delaunay_triangulation.c (the dual triangulation).
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -75,29 +143,6 @@
  * The cell boundaries are the locus of points equidistant from
  * two seeds (perpendicular bisectors).  Brute-force compute by
  * asking the question per terminal cell.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Picture N post offices.  For every house in town, the closest
- * post office is the one that delivers your mail.  The map of
- * "which post office serves where" partitions the town into
- * convex polygonal districts — Voronoi cells.  Move a post
- * office and the boundaries shift.  Add a new one and a fresh
- * district carves out of the existing ones.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │   ●·························                    │
- *      │   ····●··················                       │
- *      │   ··········.....●·····                          │
- *      │   ···········.....·····●·                        │
- *      │   ···············......                          │
- *      │   ●··············●····                           │
- *      │                                                  │
- *      │   '●' = seeds (post offices)                     │
- *      │   '·' = filled-in district                       │
- *      │   borders detected by "second-nearest is close"  │
- *      └──────────────────────────────────────────────────┘
  *
  * ALGORITHM IN STEPS  (per frame)
  * ───────────────────────────────
@@ -126,51 +171,47 @@
  *     p += v · dt
  *     terminal speed ≈ NOISE / DAMP
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • Brute-force O(W · H · N) per frame.  At 80 × 24 × 24 =
- *     46k distance comparisons per frame.  Fine.  Fortune's
- *     sweep-line gives O(N log N) but is much harder to write
- *     and unnecessary at N ≤ 30.
- *   • Border detection is APPROXIMATE — wider near vertices
- *     where 3 seeds are nearly equidistant.  For exact lines
- *     you'd compute perpendicular bisectors analytically.
- *   • Bouncing seeds: when a seed hits the screen edge, both
- *     position is clamped AND velocity flipped.  Without the
- *     clamp, seeds drift slowly through the wall.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • Default 24 seeds: 24 distinct coloured regions visible.
- *     Each seed has a single 'O' at its centre + a halo of '.'
- *     in its colour.
- *   • Watch borders: as two seeds approach, the border between
- *     them flexes; if seeds collide, one cell may briefly
- *     shrink to nothing and re-emerge as the seeds separate.
- *   • Pause + step through frames: seed positions update
- *     smoothly under Langevin; never teleport.
- *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
  *
  * Reading order
  * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
- *   2. §4 voronoi — render loop with brute-force nearest-seed
- *      lookup.  Read AFTER tutorials T1-T4.
- *   3. §5 langevin — seed motion (Ornstein-Uhlenbeck).
- *      Independent of voronoi; read as a self-contained
- *      sub-lesson on noise-driven motion.
+ *   1. CONCEPTS + MENTAL MODEL above — read first as prose.
+ *   2. §5 entity — THE HEART of this file.  Three named pipelines:
+ *        • voronoi_reset / voronoi_init — random-spawn + colour shuffle.
+ *        • voronoi_tick                 — Langevin velocity step,
+ *                                         integrate, bounce-off-walls.
+ *        • voronoi_draw                 — per-cell brute-force nearest-
+ *                                         seed scan + classify + paint.
+ *      Helpers above each pipeline read top-to-bottom in algorithm order.
+ *   3. §6 scene — SimControls + Scene structs, scene_init / tick / draw.
+ *      Trivial wrappers around §5 once you understand the data flow.
+ *   4. §7 screen — canonical project HUD (top=data, bottom=actions).
+ *   5. §8 app   — main loop with handle_resize / fixed-timestep sim /
+ *                 fps meter / frame-rate cap.  Each step is one helper.
  *
  * Variable-naming convention
  * ──────────────────────────
- *   seeds[N_SEEDS]             seed positions + velocities.
- *   d1, d2                     nearest + second-nearest seed
- *                              distances at a point.
- *   BORDER_PX = 15             border detection threshold.
- *   SEED_PX = 12               seed-centre detection radius.
- *   DAMP, NOISE                Langevin coefficients.
+ *   Almost everything lives in `Scene scene` on main()'s stack and
+ *   threads through every function as `Scene *s` (mutators) or
+ *   `const Scene *s` (observers).  Only the POSIX signal flags
+ *   (g_running, g_need_resize) remain global; signal handlers can
+ *   only touch sig_atomic_t globals safely.
+ *
+ *   s->voronoi.seeds[N_SEEDS]   moving generator points (px, py, vx, vy, pair).
+ *   s->sim.paused / s->sim.fps  user-controlled playback knobs.
+ *   s->scene_cols / scene_rows  terminal extent (cells); voronoi_draw
+ *                               iterates rows in [HUD_TOP_ROWS,
+ *                               scene_rows − HUD_BOTTOM_ROWS).
+ *
+ *   d1_sq, d2_sq                squared distances from a cell to its
+ *                               nearest / second-nearest seed (kept
+ *                               squared inside find_two_nearest_seeds
+ *                               to skip per-seed sqrt; one sqrt at end).
+ *   BORDER_PX = 15              border detection threshold (in pixels).
+ *   SEED_PX   = 12              seed-centre detection radius (in pixels).
+ *   DAMP, NOISE                 Langevin coefficients γ and σ.
  *
  * Background you need
  * ───────────────────
@@ -186,161 +227,6 @@
  *   - Voronoi-Delaunay duality.  Mentioned in CONCEPTS; see
  *     procedural/generational/delaunay_triangulation.c for the
  *     dual structure.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Four tutorials that build a brute-force animated Voronoi
- * diagram.
- *
- *   T1  What IS a Voronoi diagram?
- *   T2  Brute-force vs. Fortune's algorithm — when each wins
- *   T3  The "second-nearest distance" border-detection trick
- *   T4  Langevin motion — drifting seeds without escape velocity
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  WHAT IS A VORONOI DIAGRAM?
- * ──────────────────────────────
- * Given N "seed" points in a plane, the VORONOI DIAGRAM
- * partitions the rest of the plane into N regions, one per
- * seed, where each region V(i) is the locus of points closer
- * to seed i than to any other seed:
- *
- *     V(i) = { p : dist(p, seed_i) ≤ dist(p, seed_j)  ∀j ≠ i }
- *
- * Properties:
- *   - Every Voronoi region is CONVEX (intersection of half-
- *     planes from perpendicular bisectors).
- *   - Region boundaries are LINE SEGMENTS — the perpendicular
- *     bisectors of segments joining adjacent seeds.
- *   - Vertex points (where 3+ regions meet) are equidistant
- *     from 3+ seeds — the circumcentre of those seeds'
- *     Delaunay triangle.
- *
- * Use cases (this is one of the most-used structures in CS):
- *   - Nearest-neighbour search: which seed is closest to query
- *     point p?  Lookup the cell.
- *   - Region growing: bacterial colony spread, crystal grain
- *     boundaries, cell biology.
- *   - Resource partitioning: schools, fire stations, cell
- *     towers.
- *   - Mesh generation, computational fluid dynamics, image
- *     stippling.
- *   - Procedural generation: organic-looking region maps in
- *     games (see procedural/generational/voronoi_region_map.c).
- *
- * T2  BRUTE-FORCE VS. FORTUNE'S ALGORITHM
- * ───────────────────────────────────────
- * Two ways to compute Voronoi:
- *
- *   BRUTE-FORCE (this file)
- *     For each query point, scan all N seeds.
- *     Cost: O(N) per query.
- *     Animation: O(N · W · H) per frame for full diagram.
- *     At W=80, H=24, N=24: 46K compares per frame.  Trivial.
- *
- *   FORTUNE'S SWEEP-LINE (Fortune 1987)
- *     Sweep a line top-to-bottom; maintain a "beach line" of
- *     parabolas (each seed's region of influence).  Process
- *     seed events (new parabola appears) and circle events
- *     (parabola disappears, vertex created).
- *     Cost: O(N log N) total — independent of grid resolution.
- *     Output: explicit list of edges + vertices.
- *
- * When to use which:
- *   - VISUALISATION (every pixel is a query, like this demo):
- *     brute-force is simpler and competitive when the grid is
- *     small.  GPU-accelerated brute-force is the standard
- *     approach for animated diagrams.
- *
- *   - TOPOLOGY (you need vertex coordinates and edge lists):
- *     Fortune's gives you the structure directly without
- *     pixel-resolution loss.  Required for mesh generation,
- *     CFD, etc.
- *
- *   - SCIENTIFIC SCALE (millions of points): Fortune or even
- *     more advanced (incremental, divide-and-conquer).
- *
- * For terminal-resolution animation with N ≤ 30, brute-force
- * is the right call.
- *
- * T3  "SECOND-NEAREST DISTANCE" BORDER-DETECTION TRICK
- * ────────────────────────────────────────────────────
- * The Voronoi BORDERS are the perpendicular bisectors between
- * seeds.  Computing them analytically (intersecting half-
- * planes) is involved.
- *
- * Cheap trick: a query point sits ON a border if its FIRST and
- * SECOND nearest seeds are at NEARLY EQUAL distance:
- *
- *     border_test(p):
- *       d1 = min over seeds of |p - seed|
- *       d2 = second-min
- *       return (d2 - d1) < BORDER_PX
- *
- * Reasoning: at a border between seed i and seed j, by
- * definition |p - seed_i| = |p - seed_j|, so d1 = d2.  Just
- * off the border, d2 - d1 grows linearly with distance from
- * the border.  Threshold this difference and you get a thick
- * "approximate border" band.
- *
- * Cost: ONE extra distance comparison per query (track top-2
- * instead of just top-1).
- *
- * Approximation quality:
- *   - Borders away from vertices: clean ~BORDER_PX-wide bands.
- *   - Near vertices (3+ seeds nearly equidistant): the band
- *     widens, sometimes filling small triangles.  Visually
- *     fine for a animated demo; not ok for surveying.
- *
- * Same trick generalises to "find the K-nearest-neighbour
- * boundary" by tracking K candidates instead of 2.
- *
- * T4  LANGEVIN MOTION — DRIFTING SEEDS WITHOUT ESCAPE VELOCITY
- * ────────────────────────────────────────────────────────────
- * To animate the diagram, seeds need to MOVE.  Naïve random
- * walks have a problem: variance grows linearly with time, so
- * after N steps the seed drifts ~√N pixels away.  In the
- * limit, all seeds escape any bounded box.
- *
- * The LANGEVIN EQUATION (Ornstein-Uhlenbeck process) is a
- * BOUNDED random walk:
- *
- *     dv/dt = -γ · v + σ · ξ(t)
- *
- *     -γ · v       drag — pulls velocity back toward zero
- *     σ · ξ(t)     random kick (Gaussian or uniform white noise)
- *
- * Discretised:
- *
- *     v += (-DAMP · v + NOISE · ξ) · dt    where ξ ∈ [-1, 1]
- *     p += v · dt
- *
- * Properties:
- *   - Velocity has a STATIONARY DISTRIBUTION centred at 0.
- *     Terminal RMS speed ≈ NOISE / DAMP.
- *   - Position drift IS still unbounded — Langevin is just
- *     bounded VELOCITY, not bounded POSITION.  We add walls
- *     that bounce seeds back at the screen edges.
- *   - At small noise: seeds barely move (low-temperature limit).
- *   - At high noise: seeds fly fast but slow down quickly.
- *
- * Compared with simpler "constant random velocity" motion:
- *   - Pure random velocity: seeds wander chaotically, no
- *     correlation in time.
- *   - Langevin: seeds have MOMENTUM — they keep moving in
- *     the same direction for a few ticks, giving smooth
- *     curves rather than zigzags.
- *
- * Same equation underlies:
- *   - Brownian motion of dust in a fluid (Einstein 1905)
- *   - Stock price models (geometric Brownian motion)
- *   - Particle filtering (in robotics, sensor fusion)
- *   - Reinforcement learning exploration noise
- *
- * It's a versatile "smooth random motion" primitive.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -381,13 +267,57 @@ enum {
 #define CELL_W  8
 #define CELL_H  16
 
-/* Langevin motion parameters */
-#define DAMP     2.0f    /* velocity damping coefficient (s⁻¹)             */
-#define NOISE   60.0f    /* random force amplitude (px/s per √s)           */
+/* Langevin motion parameters (Ornstein-Uhlenbeck terminal speed = NOISE/DAMP). */
+#define DAMP     2.0f    /* velocity damping coefficient γ (s⁻¹)            */
+#define NOISE   60.0f    /* random force amplitude σ (px/s per √s)           */
 
-/* Drawing thresholds in pixels */
-#define BORDER_PX  15.0f  /* d2−d1 threshold for border cell              */
-#define SEED_PX    12.0f  /* d1 threshold for seed-centre cell             */
+/* Drawing thresholds in pixels. */
+#define BORDER_PX  15.0f  /* d2−d1 threshold for border cell ('+')         */
+#define SEED_PX    12.0f  /* d1 threshold for seed-centre cell ('O')       */
+
+/*
+ * Seed spawn / bounce geometry: margins are expressed as a multiple of
+ * the pixel cell size, so they scale with terminal text dimensions.
+ *   SEED_SPAWN_MARGIN_*  : a Voronoi reset draws each seed uniformly in
+ *                          the rectangle inset by this many cells.
+ *   BOUNCE_MARGIN_*      : voronoi_tick clamps + reflects positions that
+ *                          drift past this many cells from the edge.
+ *   SEED_INIT_VEL_SCALE  : initial velocity spread (px/s).  The Langevin
+ *                          step drags |v| toward NOISE/DAMP within a few
+ *                          frames regardless of this value.
+ */
+#define SEED_SPAWN_MARGIN_COLS   3
+#define SEED_SPAWN_MARGIN_ROWS   2
+#define BOUNCE_MARGIN_COLS       2
+#define BOUNCE_MARGIN_ROWS       2
+#define SEED_INIT_VEL_SCALE     20.0f
+
+/* Voronoi-draw sentinel: any real squared distance is far below this. */
+#define DIST_SQ_INFINITY  1e18f
+
+/* Cell-center sub-pixel offset: ray tests use the centre of the cell,
+ * not its top-left corner, so visibility decisions match what the user
+ * sees painted in the middle of the glyph. */
+#define CELL_CENTER_OFFSET_FRAC  0.5f
+
+/* HUD rows reserved at top (status) and bottom (action hints). */
+#define HUD_TOP_ROWS     1
+#define HUD_BOTTOM_ROWS  1
+
+/* Render-loop frame budget: cap the loop at 60 Hz regardless of sim fps. */
+#define RENDER_TARGET_FPS  60
+#define RENDER_FRAME_NS    (NS_PER_SEC / RENDER_TARGET_FPS)
+
+/* FPS-meter sampling window: how often the HUD's displayed fps refreshes. */
+#define FPS_UPDATE_PERIOD_NS  ((int64_t)FPS_UPDATE_MS * NS_PER_MS)
+
+/* Spiral-of-death guard: if a single frame measures longer than this,
+ * clamp dt so the fixed-timestep accumulator can never run away. */
+#define MAX_FRAME_DT_NS  (100 * NS_PER_MS)
+
+/* ESC key code — POSIX terminals send 27 for both ESC and the start of
+ * many escape sequences; treated as quit here. */
+#define KEY_ESC   27
 
 /* ===================================================================== */
 /* §2  clock                                                              */
@@ -414,26 +344,41 @@ static void clock_sleep_ns(int64_t ns)
 /* §3  color                                                              */
 /* ===================================================================== */
 
+/*
+ * Colour pair IDs.
+ *   1..N_COLORS are the SEED palette (each Voronoi cell paints in one of
+ *   these); the bottom of CP_HUD / CP_HINT are RESERVED across every
+ *   demo in the project so the top/bottom HUD strips have stable IDs.
+ */
+enum {
+    CP_HUD  = 8,    /* top status row:  bright yellow + A_BOLD */
+    CP_HINT = 9,    /* bottom action row: bright cyan + A_BOLD */
+};
+
 static void color_init(void)
 {
     start_color();
     use_default_colors();
     if (COLORS >= 256) {
-        init_pair(1, 196, COLOR_BLACK);
-        init_pair(2, 208, COLOR_BLACK);
-        init_pair(3, 226, COLOR_BLACK);
-        init_pair(4,  46, COLOR_BLACK);
-        init_pair(5,  51, COLOR_BLACK);
-        init_pair(6,  75, COLOR_BLACK);
-        init_pair(7, 201, COLOR_BLACK);
+        init_pair(1,       196, COLOR_BLACK);     /* seed palette */
+        init_pair(2,       208, COLOR_BLACK);
+        init_pair(3,       226, COLOR_BLACK);
+        init_pair(4,        46, COLOR_BLACK);
+        init_pair(5,        51, COLOR_BLACK);
+        init_pair(6,        75, COLOR_BLACK);
+        init_pair(7,       201, COLOR_BLACK);
+        init_pair(CP_HUD,  226, -1);              /* bright yellow */
+        init_pair(CP_HINT,  51, -1);              /* bright cyan   */
     } else {
-        init_pair(1, COLOR_RED,     COLOR_BLACK);
-        init_pair(2, COLOR_RED,     COLOR_BLACK);
-        init_pair(3, COLOR_YELLOW,  COLOR_BLACK);
-        init_pair(4, COLOR_GREEN,   COLOR_BLACK);
-        init_pair(5, COLOR_CYAN,    COLOR_BLACK);
-        init_pair(6, COLOR_BLUE,    COLOR_BLACK);
-        init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
+        init_pair(1,       COLOR_RED,     COLOR_BLACK);
+        init_pair(2,       COLOR_RED,     COLOR_BLACK);
+        init_pair(3,       COLOR_YELLOW,  COLOR_BLACK);
+        init_pair(4,       COLOR_GREEN,   COLOR_BLACK);
+        init_pair(5,       COLOR_CYAN,    COLOR_BLACK);
+        init_pair(6,       COLOR_BLUE,    COLOR_BLACK);
+        init_pair(7,       COLOR_MAGENTA, COLOR_BLACK);
+        init_pair(CP_HUD,  COLOR_YELLOW,  -1);
+        init_pair(CP_HINT, COLOR_CYAN,    -1);
     }
 }
 
@@ -448,36 +393,161 @@ static inline float ph(int rows) { return (float)rows * CELL_H; }
 /* §5  entity — Seed, Voronoi                                             */
 /* ===================================================================== */
 
+/*
+ * Seed — one generator point of the Voronoi diagram.
+ *
+ * Intent
+ *   The atomic unit of the simulation.  Every cell in the terminal
+ *   asks "which Seed am I closest to?" each frame; the answers
+ *   partition the plane into Voronoi regions, one per Seed.
+ *
+ * Why position + velocity (not just position)
+ *   Static seeds would give a fixed diagram.  Velocity lets the
+ *   Langevin tick (see §5 voronoi_tick) integrate motion smoothly:
+ *     v_{t+1} = v_t + (−γ·v + σ·ξ) · dt    (Ornstein-Uhlenbeck)
+ *     p_{t+1} = p_t + v · dt
+ *   The diagram then RE-PARTITIONS itself each frame as seeds drift,
+ *   which is what gives the running file its life.
+ *
+ * Why pair (the colour) lives on the Seed
+ *   Each Voronoi region is painted in its seed's colour.  Storing the
+ *   palette index on the Seed avoids a per-frame lookup by seed-index
+ *   in the inner cell loop (which is already O(cells × N_SEEDS)).
+ *   The palette index is fixed for the seed's lifetime (assigned by
+ *   voronoi_reset + Fisher-Yates shuffled so adjacent indices don't
+ *   share a colour).
+ *
+ * Members
+ *   px, py     position in PIXEL space (sub-cell precision).  Cell
+ *              coordinates are recovered as col = px / CELL_W,
+ *              row = py / CELL_H.  Distances are computed in pixel
+ *              space so that Voronoi regions have CORRECT geometric
+ *              proportions, undistorted by the 8×16 terminal cell
+ *              aspect ratio.
+ *   vx, vy     velocity in px/s, evolved by the Langevin step.
+ *   pair       palette index in [1, N_COLORS].  Shuffled at reset to
+ *              minimise the chance of two adjacent seeds sharing a
+ *              colour (which would make their shared border invisible).
+ *
+ * Invariants
+ *   px ∈ [margin_l, W − margin_l]    after voronoi_tick wall-bounce.
+ *   py ∈ [margin_t, H − margin_t]    after voronoi_tick wall-bounce.
+ *   |v| converges to NOISE / DAMP    (Ornstein-Uhlenbeck terminal speed).
+ *   pair ∈ [1, N_COLORS]             never reassigned after voronoi_reset.
+ *
+ * References
+ *   [1] Voronoi 1908 — the seed point is the original "centre" of a
+ *       Voronoi region.
+ *   [10] Langevin 1908 / [11] Uhlenbeck-Ornstein 1930 — the dynamics
+ *       used to evolve (px, py, vx, vy) each tick.
+ */
 typedef struct {
     float px, py;   /* position in pixel space                            */
     float vx, vy;   /* velocity (px/s)                                    */
     int   pair;     /* colour pair 1–7                                    */
 } Seed;
 
+/*
+ * Voronoi — the population of N_SEEDS Brownian-drifting seeds whose
+ * per-frame nearest-neighbour partition IS the rendered diagram.
+ *
+ * Intent
+ *   Owns the seeds, nothing else.  The diagram itself is NOT stored
+ *   here — it is re-computed by voronoi_draw() every frame as a
+ *   brute-force scan over all seeds for each cell.  This struct is
+ *   the INPUT to that computation; its output is the painted screen.
+ *
+ * Why a fixed-size array (not a dynamic list)
+ *   Project rule: no allocation after init.  N_SEEDS is a compile-time
+ *   constant chosen so that the per-frame cost
+ *      O(scene_cols × scene_rows × N_SEEDS)
+ *   stays under a millisecond on commodity terminals (e.g. 80×24×24
+ *   ≈ 46k distance comparisons / frame).  Anything beyond a few
+ *   dozen seeds wants Fortune 1987's sweep-line algorithm.
+ *
+ * Why UI state (paused/fps) is NOT here
+ *   The earlier shape carried `bool paused` inside Voronoi, mixing
+ *   "the simulation's data model" with "user toggles".  After the
+ *   prompt-3 refactor those knobs live in SimControls (§6) and the
+ *   pause-gate decision is made in scene_tick before voronoi_tick is
+ *   called.  Voronoi is now pure: nothing but seeds.
+ *
+ * Members
+ *   seeds[N_SEEDS]   the moving generator points.  Index in this array
+ *                    is meaningless to the user (seeds are
+ *                    indistinguishable except by `pair`); only their
+ *                    spatial arrangement matters.
+ *
+ * Invariants
+ *   Every entry's (px, py) is kept inside the scene by the wall-bounce
+ *   step in voronoi_tick.  This guarantees the nearest-seed search in
+ *   voronoi_draw always finds at least one in-bounds candidate.
+ *
+ * References
+ *   [1] Voronoi 1908 — the diagram these seeds generate.
+ *   [4] Fortune 1987 — the O(N log N) alternative we explicitly
+ *       chose NOT to implement because N is small.
+ *   [6] Aurenhammer 1991 §1 — definition of the Voronoi diagram as
+ *       the partition induced by a discrete set of generator points.
+ *   [9] Okabe et al. 2000 Ch. 2 — moving-seed (kinematic) Voronoi
+ *       diagrams; the regime this file animates.
+ */
 typedef struct {
-    Seed  seeds[N_SEEDS];
-    bool  paused;
+    Seed seeds[N_SEEDS];
 } Voronoi;
 
-/* randf — uniform float in [−1, 1] */
-static float randf(void) { return (float)rand() / (float)RAND_MAX * 2.0f - 1.0f; }
+/* ── §5 RNG helpers ──────────────────────────────────────────────────── */
 
-static void voronoi_reset(Voronoi *v, int cols, int rows)
+/* Uniform float in [0, 1] — wrapper around rand() / RAND_MAX. */
+static float rand_unit(void) { return (float)rand() / (float)RAND_MAX; }
+
+/* Uniform float in [−1, 1] — the symmetric noise ξ used by Langevin. */
+static float rand_signed(void) { return rand_unit() * 2.0f - 1.0f; }
+
+/* Uniform float in [lo, hi]. */
+static float rand_in_range(float lo, float hi)
 {
-    float W = pw(cols);
-    float H = ph(rows);
-    float mx = (float)CELL_W * 3;
-    float my = (float)CELL_H * 2;
+    return lo + rand_unit() * (hi - lo);
+}
 
-    for (int i = 0; i < N_SEEDS; i++) {
-        Seed *s  = &v->seeds[i];
-        s->px    = mx + (float)rand() / RAND_MAX * (W - 2*mx);
-        s->py    = my + (float)rand() / RAND_MAX * (H - 2*my);
-        s->vx    = randf() * 20.0f;
-        s->vy    = randf() * 20.0f;
-        s->pair  = (i % N_COLORS) + 1;
-    }
-    /* Shuffle colour assignments */
+/* ── §5 seed spawn / colour assignment ────────────────────────────────── */
+
+/*
+ * spawn_seed_uniform — place ONE seed at a random position inside the
+ * scene rectangle (with margins kept clear), with a small random
+ * starting velocity that the Langevin step will dominate within a
+ * couple of frames.
+ *
+ *   Pseudocode:
+ *     px := uniform in [margin_x, W − margin_x]
+ *     py := uniform in [margin_y, H − margin_y]
+ *     vx := signed-uniform × initial velocity scale
+ *     vy := signed-uniform × initial velocity scale
+ */
+static void spawn_seed_uniform(
+    Seed *s, float W, float H, float margin_x, float margin_y
+) {
+    s->px = rand_in_range(margin_x, W - margin_x);
+    s->py = rand_in_range(margin_y, H - margin_y);
+    s->vx = rand_signed() * SEED_INIT_VEL_SCALE;
+    s->vy = rand_signed() * SEED_INIT_VEL_SCALE;
+}
+
+/* Round-robin colour assignment so the first N_COLORS slots get one
+ * each, then the cycle repeats.  Followed by Fisher-Yates shuffle so
+ * adjacent indices don't share a colour by construction. */
+static void assign_round_robin_colors(Voronoi *v)
+{
+    for (int i = 0; i < N_SEEDS; i++)
+        v->seeds[i].pair = (i % N_COLORS) + 1;
+}
+
+/* Fisher-Yates shuffle of colour assignments only (Knuth TAOCP Vol. 2
+ * §3.4.2 Algorithm P).  Each Seed's spatial position stays fixed; only
+ * its `pair` field is permuted, breaking the round-robin correlation
+ * between seed index and palette index. */
+static void shuffle_seed_colors(Voronoi *v)
+{
     for (int i = N_SEEDS - 1; i > 0; i--) {
         int j = rand() % (i + 1);
         int t = v->seeds[i].pair;
@@ -486,100 +556,237 @@ static void voronoi_reset(Voronoi *v, int cols, int rows)
     }
 }
 
+/*
+ * voronoi_reset — re-roll seed positions, velocities, and colours at
+ * the current terminal extent.
+ *
+ *   Pseudocode:
+ *     (W, H)        := scene extent in PIXEL space
+ *     (mx, my)      := spawn margins (cells × cell size)
+ *     for each seed: spawn_seed_uniform(scene rect, margins)
+ *     assign_round_robin_colors(v)
+ *     shuffle_seed_colors(v)
+ */
+static void voronoi_reset(Voronoi *v, int cols, int rows)
+{
+    float W  = pw(cols);
+    float H  = ph(rows);
+    float mx = (float)CELL_W * SEED_SPAWN_MARGIN_COLS;
+    float my = (float)CELL_H * SEED_SPAWN_MARGIN_ROWS;
+
+    for (int i = 0; i < N_SEEDS; i++)
+        spawn_seed_uniform(&v->seeds[i], W, H, mx, my);
+
+    assign_round_robin_colors(v);
+    shuffle_seed_colors(v);
+}
+
+/* voronoi_init — zero the struct, then delegate to reset. */
 static void voronoi_init(Voronoi *v, int cols, int rows)
 {
     memset(v, 0, sizeof *v);
     voronoi_reset(v, cols, rows);
 }
 
+/* ── §5 Langevin integrator + wall bounce ─────────────────────────────── */
+
 /*
- * voronoi_tick — Langevin motion + wall bounce.
+ * langevin_velocity_step — one Euler-Maruyama step of
+ *   dv/dt = −γ·v + σ·ξ      (Ornstein-Uhlenbeck, ξ ∈ [−1, 1])
  *
- * Each seed undergoes over-damped Brownian motion:
- *   v += (−DAMP·v + NOISE·ξ) · dt
- * A soft inward force near walls prevents escape:
- *   if px < margin: vx += WALL_PUSH · dt
+ * Discretised as
+ *   v_{t+1} = v_t + (−γ·v_t + σ·ξ) · dt
+ *
+ * Drives |v| toward terminal speed NOISE / DAMP regardless of starting
+ * velocity.  Each component (vx, vy) is updated independently with its
+ * own random noise sample.
+ */
+static void langevin_velocity_step(Seed *s, float dt)
+{
+    s->vx += (-DAMP * s->vx + NOISE * rand_signed()) * dt;
+    s->vy += (-DAMP * s->vy + NOISE * rand_signed()) * dt;
+}
+
+/* integrate_position — first-order Euler: p_{t+1} = p_t + v · dt. */
+static void integrate_position(Seed *s, float dt)
+{
+    s->px += s->vx * dt;
+    s->py += s->vy * dt;
+}
+
+/*
+ * bounce_seed_off_walls — reflective collision with the scene rectangle.
+ *
+ *   For each side:
+ *     if seed strayed past the wall:
+ *       clamp its position to the wall, AND
+ *       flip its velocity component so it moves AWAY from the wall.
+ *
+ *   The fabsf() form is robust: it doesn't matter if the seed was
+ *   already moving outward when we caught it — the next velocity is
+ *   guaranteed to push it back into the interior.
+ */
+static void bounce_seed_off_walls(
+    Seed *s, float mxL, float mxR, float myT, float myB
+) {
+    if (s->px < mxL) { s->px = mxL; s->vx =  fabsf(s->vx); }
+    if (s->px > mxR) { s->px = mxR; s->vx = -fabsf(s->vx); }
+    if (s->py < myT) { s->py = myT; s->vy =  fabsf(s->vy); }
+    if (s->py > myB) { s->py = myB; s->vy = -fabsf(s->vy); }
+}
+
+/*
+ * voronoi_tick — advance every seed one Langevin step.
+ *
+ *   Pseudocode:
+ *     compute wall-bounce rectangle (margins inset from scene)
+ *     for each seed:
+ *       langevin_velocity_step(s, dt)        ← v += (−γv + σξ) dt
+ *       integrate_position(s, dt)            ← p += v dt
+ *       bounce_seed_off_walls(s, rect)       ← clamp + reflect
  */
 static void voronoi_tick(Voronoi *v, float dt, int cols, int rows)
 {
-    if (v->paused) return;
-
     float W   = pw(cols);
     float H   = ph(rows);
-    float mxL = (float)CELL_W * 2;
-    float myT = (float)CELL_H * 2;
+    float mxL = (float)CELL_W * BOUNCE_MARGIN_COLS;
+    float myT = (float)CELL_H * BOUNCE_MARGIN_ROWS;
     float mxR = W - mxL;
     float myB = H - myT;
 
     for (int i = 0; i < N_SEEDS; i++) {
         Seed *s = &v->seeds[i];
-
-        /* Langevin: damp + random kick */
-        s->vx += (-DAMP * s->vx + NOISE * randf()) * dt;
-        s->vy += (-DAMP * s->vy + NOISE * randf()) * dt;
-
-        /* Integrate */
-        s->px += s->vx * dt;
-        s->py += s->vy * dt;
-
-        /* Bounce off walls */
-        if (s->px < mxL) { s->px = mxL; s->vx =  fabsf(s->vx); }
-        if (s->px > mxR) { s->px = mxR; s->vx = -fabsf(s->vx); }
-        if (s->py < myT) { s->py = myT; s->vy =  fabsf(s->vy); }
-        if (s->py > myB) { s->py = myB; s->vy = -fabsf(s->vy); }
+        langevin_velocity_step(s, dt);
+        integrate_position   (s, dt);
+        bounce_seed_off_walls(s, mxL, mxR, myT, myB);
     }
 }
 
+/* ── §5 Voronoi diagram rendering ────────────────────────────────────── */
+
 /*
- * voronoi_draw — per-cell nearest-seed search and rendering.
+ * cell_center_in_pixel_space — convert cell coords (col, row) to the
+ * sub-pixel CENTRE of the cell, so distance tests probe the middle of
+ * the glyph rather than its top-left corner.
+ *   cx = (col + ½) · CELL_W
+ *   cy = (row + ½) · CELL_H
+ */
+static void cell_center_in_pixel_space(
+    int col, int row, float *out_cx, float *out_cy
+) {
+    *out_cx = ((float)col + CELL_CENTER_OFFSET_FRAC) * (float)CELL_W;
+    *out_cy = ((float)row + CELL_CENTER_OFFSET_FRAC) * (float)CELL_H;
+}
+
+/*
+ * find_two_nearest_seeds — brute-force scan of all N_SEEDS, returning
+ * the index of the nearest seed plus the squared distances to the
+ * nearest and second-nearest.
  *
- * Cell centre pixel: (col·CELL_W + CELL_W/2, row·CELL_H + CELL_H/2).
- * Distance uses pixel-space Euclidean metric so Voronoi regions have
- * correct proportions (not distorted by terminal aspect ratio).
+ *   Pseudocode:
+ *     d1, d2 := +∞
+ *     best   := 0
+ *     for each seed k:
+ *       d := |cell − seed[k]|²                  (squared distance — no sqrt)
+ *       if d < d1: d2 := d1; d1 := d; best := k
+ *       else if d < d2: d2 := d
+ *     return (best, d1, d2)
+ *
+ *   Both distances kept in SQUARED form throughout the comparison so
+ *   we save N_SEEDS × W × H square-root operations per frame.  The
+ *   caller takes one sqrtf at the end for the classifier thresholds.
+ */
+static void find_two_nearest_seeds(
+    const Voronoi *v, float cx, float cy,
+    int *out_best, float *out_d1_sq, float *out_d2_sq
+) {
+    float d1_sq = DIST_SQ_INFINITY;
+    float d2_sq = DIST_SQ_INFINITY;
+    int   best  = 0;
+    for (int k = 0; k < N_SEEDS; k++) {
+        float dx  = cx - v->seeds[k].px;
+        float dy  = cy - v->seeds[k].py;
+        float dsq = dx * dx + dy * dy;
+        if (dsq < d1_sq) {
+            d2_sq = d1_sq;
+            d1_sq = dsq;
+            best  = k;
+        } else if (dsq < d2_sq) {
+            d2_sq = dsq;
+        }
+    }
+    *out_best  = best;
+    *out_d1_sq = d1_sq;
+    *out_d2_sq = d2_sq;
+}
+
+/*
+ * classify_voronoi_cell — three-way triage on the cell's distances.
+ *
+ *   d1 < SEED_PX                  → SEED-CENTRE   'O' bold
+ *   d2 − d1 < BORDER_PX           → BORDER        '+' normal
+ *   otherwise                     → INTERIOR      '.' dim
+ *
+ *   The border test "second-nearest is close to the nearest" is the
+ *   approximate-Voronoi-edge trick from Patel/Red Blob — much simpler
+ *   than computing analytical perpendicular bisectors, and adequate
+ *   for visualisation since the eye smooths the result.
+ */
+static void classify_voronoi_cell(
+    float d1, float d2, char *out_ch, chtype *out_attr
+) {
+    if (d1 < SEED_PX) {
+        *out_ch   = 'O';
+        *out_attr = A_BOLD;
+    } else if (d2 - d1 < BORDER_PX) {
+        *out_ch   = '+';
+        *out_attr = 0;
+    } else {
+        *out_ch   = '.';
+        *out_attr = A_DIM;
+    }
+}
+
+/* Paint ONE cell at (row, col) with the chosen glyph + colour pair. */
+static void paint_voronoi_cell(
+    WINDOW *w, int row, int col, int pair, char ch, chtype attr
+) {
+    wattron(w, COLOR_PAIR(pair) | attr);
+    mvwaddch(w, row, col, (chtype)(unsigned char)ch);
+    wattroff(w, COLOR_PAIR(pair) | attr);
+}
+
+/*
+ * voronoi_draw — paint the Voronoi diagram for the current seed pool.
+ *
+ *   Pseudocode (per terminal cell, skipping HUD rows):
+ *     (cx, cy)  := cell_center_in_pixel_space(col, row)
+ *     (best, d1_sq, d2_sq) := find_two_nearest_seeds(seeds, cx, cy)
+ *     classify cell (seed centre / border / interior) → (glyph, attr)
+ *     paint_voronoi_cell with the nearest seed's colour
+ *
+ *   Cost per frame: O(scene_cells × N_SEEDS) for the nearest-seed scan;
+ *   the inner work uses squared distances to avoid N_SEEDS × W × H
+ *   sqrtf calls.  Each visited cell takes ONE final sqrtf for the
+ *   classifier — orders of magnitude cheaper than the previous shape.
  */
 static void voronoi_draw(const Voronoi *v, WINDOW *w, int cols, int rows)
 {
-    float half_cw = (float)CELL_W * 0.5f;
-    float half_ch = (float)CELL_H * 0.5f;
-
-    for (int row = 1; row < rows - 1; row++) {
-        float cy = (float)row * CELL_H + half_ch;
-
+    for (int row = HUD_TOP_ROWS; row < rows - HUD_BOTTOM_ROWS; row++) {
         for (int col = 0; col < cols; col++) {
-            float cx = (float)col * CELL_W + half_cw;
+            float cx, cy;
+            cell_center_in_pixel_space(col, row, &cx, &cy);
 
-            float d1 = 1e18f, d2 = 1e18f;
-            int   best = 0;
+            int   best;
+            float d1_sq, d2_sq;
+            find_two_nearest_seeds(v, cx, cy, &best, &d1_sq, &d2_sq);
+            float d1 = sqrtf(d1_sq);
+            float d2 = sqrtf(d2_sq);
 
-            for (int k = 0; k < N_SEEDS; k++) {
-                float dx = cx - v->seeds[k].px;
-                float dy = cy - v->seeds[k].py;
-                float d  = dx*dx + dy*dy;   /* compare squared distances */
-                if (d < d1) { d2 = d1; d1 = d; best = k; }
-                else if (d < d2) { d2 = d; }
-            }
-
-            d1 = sqrtf(d1);
-            d2 = sqrtf(d2);
-
-            int   pair = v->seeds[best].pair;
-            chtype attr;
             char   ch;
-
-            if (d1 < SEED_PX) {
-                ch   = 'O';
-                attr = A_BOLD;
-            } else if (d2 - d1 < BORDER_PX) {
-                ch   = '+';
-                attr = 0;
-            } else {
-                ch   = '.';
-                attr = A_DIM;
-            }
-
-            wattron(w, COLOR_PAIR(pair) | attr);
-            mvwaddch(w, row, col, (chtype)(unsigned char)ch);
-            wattroff(w, COLOR_PAIR(pair) | attr);
+            chtype attr;
+            classify_voronoi_cell(d1, d2, &ch, &attr);
+            paint_voronoi_cell(w, row, col, v->seeds[best].pair, ch, attr);
         }
     }
 }
@@ -588,181 +795,429 @@ static void voronoi_draw(const Voronoi *v, WINDOW *w, int cols, int rows)
 /* §6  scene                                                              */
 /* ===================================================================== */
 
-typedef struct { Voronoi voronoi; } Scene;
+/*
+ * SimControls — playback knobs the user adjusts at runtime.
+ *
+ * Intent
+ *   Two scalars the input handler writes and the main loop / HUD read.
+ *   Kept together so input handlers + HUD touch ONE bundle instead of
+ *   scattered fields.  Decouples the fixed-timestep accumulator in
+ *   main() from the underlying simulation rate.
+ *
+ * Why a sub-struct for just two scalars
+ *   The boundary "user-controlled run parameters" is conceptually
+ *   distinct from "simulation state" — `paused` and `fps` are written
+ *   by handle_input and read by main()'s tick loop and the HUD;
+ *   everything else in Scene is simulation output.  Naming them as a
+ *   bundle signals that distinction to the reader and makes future
+ *   extensions (target_fps, speed_multiplier, time_scale) churn-free
+ *   at Scene's top level.
+ *
+ * Members
+ *   paused      true → scene_tick is a no-op; HUD shows "PAUSED".
+ *               The user toggles via SPACE; programs that pause on
+ *               focus-loss could set it from a UI hook.
+ *   fps         simulation tick rate (Hz).  '[' / ']' adjust by
+ *               SIM_FPS_STEP, clamped to [SIM_FPS_MIN, SIM_FPS_MAX].
+ *               Drives the fixed-timestep accumulator's TICK_NS(fps)
+ *               period — smaller fps = larger dt per tick = faster
+ *               but jerkier seed motion.
+ *
+ * Invariants
+ *   SIM_FPS_MIN ≤ fps ≤ SIM_FPS_MAX  (handle_input clamps).
+ *
+ * References
+ *   Fiedler, G., "Fix Your Timestep!" — gafferongames.com/post/
+ *       fix_your_timestep — the canonical "accumulator-driven discrete
+ *       ticks" pattern that main()'s loop implements using SimControls.
+ *   Nystrom, R. (2014), "Game Programming Patterns", Ch. 9 (Game Loop) —
+ *       same pattern presented as a classic loop architecture.
+ */
+typedef struct {
+    bool paused;
+    int  fps;
+} SimControls;
+
+/*
+ * Scene — owns ALL simulation + render state for one run.
+ *
+ * Layered ownership
+ *
+ *     Scene
+ *       ├── voronoi  : Voronoi              ← N moving seeds (§5 entity)
+ *       │     └── seeds[N_SEEDS] : Seed[]   (px, py, vx, vy, pair)
+ *       │
+ *       ├── sim      : SimControls          ← paused + fps
+ *       │
+ *       └── scene_cols, scene_rows          ← terminal extent (cells)
+ *
+ *   Every persistent value the program needs is reachable from a
+ *   single Scene*.  No file-scope simulation state exists; only the
+ *   two POSIX signal flags (g_running, g_need_resize) remain global
+ *   in §8 because signal handlers cannot receive a context pointer.
+ *
+ * Intent
+ *   One instance lives on main()'s stack and is passed by pointer to
+ *   every tick, renderer, and input handler.  Pure observers take
+ *   `const Scene *`; mutators take `Scene *`.  The signature alone
+ *   communicates which kind of access each callee performs.
+ *
+ * Why a SCENE struct (not file-scope globals)
+ *   • Replaceability: future variants (split-screen, recorded replay)
+ *     can allocate multiple Scenes — impossible with globals.
+ *   • Testability: scene_tick becomes a pure transformation s → s';
+ *     no hidden inputs.
+ *   • Reading aid: every helper begins with `Scene *s` (or const),
+ *     giving the reader ONE place to look for "what state exists".
+ *
+ * Why terminal extent (scene_cols, scene_rows) is a Scene field
+ *   The earlier shape carried these in a separate `Screen` struct.
+ *   Folding them into Scene gives a single argument signature
+ *   `scene_tick(Scene*, dt)` instead of `scene_tick(Scene*, dt, cols,
+ *   rows)`, and the resize handler updates ONE bundle.
+ *
+ * Members
+ *   voronoi           Voronoi — the N moving seeds (pure data + dynamics).
+ *   sim               SimControls — paused + fps.
+ *   scene_cols        drawable columns (= terminal cols).
+ *   scene_rows        drawable rows   (= terminal rows).  Row 0 is the
+ *                     HUD status; row R−1 is the action hint strip;
+ *                     voronoi_draw() paints rows 1..R−2.
+ *
+ * Invariants
+ *   scene_cols > 0  AND  scene_rows > 0       (set by screen_init).
+ *   Every seed in voronoi.seeds[] lies inside the scene rectangle
+ *   (enforced by the wall-bounce step in voronoi_tick).
+ *   g_running / g_need_resize are NOT here — POSIX signal handlers
+ *   need sig_atomic_t globals, so they live in §8.
+ *
+ * References
+ *   [9] Okabe et al. 2000 — "spatial tessellation" framing; the Scene
+ *       holds the generator set, the tick advances them, the draw
+ *       step partitions space.
+ *   Nystrom 2014, "Game Programming Patterns" — single-Scene + fixed-
+ *       timestep accumulator design that main() implements.
+ */
+typedef struct {
+    Voronoi     voronoi;
+    SimControls sim;
+    int         scene_cols;
+    int         scene_rows;
+} Scene;
 
 static void scene_init(Scene *s, int cols, int rows)
 {
     memset(s, 0, sizeof *s);
+    s->scene_cols = cols;
+    s->scene_rows = rows;
+    s->sim.paused = false;
+    s->sim.fps    = SIM_FPS_DEFAULT;
     voronoi_init(&s->voronoi, cols, rows);
 }
 
-static void scene_tick(Scene *s, float dt, int cols, int rows)
+/* Re-roll seed positions / velocities at the current terminal extent.
+ * Called by the 'r' key handler and after a SIGWINCH resize. */
+static void scene_reset_seeds(Scene *s)
 {
-    voronoi_tick(&s->voronoi, dt, cols, rows);
+    voronoi_reset(&s->voronoi, s->scene_cols, s->scene_rows);
 }
 
-static void scene_draw(const Scene *s, WINDOW *w,
-                       int cols, int rows, float alpha, float dt_sec)
+/* Advance simulation by one fixed-timestep tick.  paused = no-op. */
+static void scene_tick(Scene *s, float dt)
 {
-    (void)alpha; (void)dt_sec;
-    voronoi_draw(&s->voronoi, w, cols, rows);
+    if (s->sim.paused) return;
+    voronoi_tick(&s->voronoi, dt, s->scene_cols, s->scene_rows);
+}
+
+/* Render the Voronoi diagram for the current seed positions. */
+static void scene_draw(const Scene *s, WINDOW *w)
+{
+    voronoi_draw(&s->voronoi, w, s->scene_cols, s->scene_rows);
 }
 
 /* ===================================================================== */
 /* §7  screen                                                             */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
-
-static void screen_init(Screen *s)
+/* Bring up ncurses, then read the terminal extent into the Scene. */
+static void screen_init(Scene *s)
 {
     initscr(); noecho(); cbreak(); curs_set(0);
     nodelay(stdscr, TRUE); keypad(stdscr, TRUE); typeahead(-1);
     color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
+    getmaxyx(stdscr, s->scene_rows, s->scene_cols);
 }
 
-static void screen_free(Screen *s) { (void)s; endwin(); }
+static void screen_free(void) { endwin(); }
 
-static void screen_draw(Screen *s, const Scene *sc,
-                        double fps, int sim_fps, float alpha, float dt_sec)
+/* One-word run-state indicator used in the top status string. */
+static const char *run_state_label(const Scene *s)
+{
+    return s->sim.paused ? "PAUSED " : "running";
+}
+
+/* Format the right-aligned top status line into `buf`. */
+static void format_hud_status(
+    const Scene *s, double fps, char *buf, size_t bufsz
+) {
+    snprintf(buf, bufsz,
+        " %5.1f fps  sim:%3d Hz  seeds:%d  %s ",
+        fps, s->sim.fps, N_SEEDS, run_state_label(s));
+}
+
+/* Paint the right-aligned status line on row 0 (CP_HUD + A_BOLD). */
+static void draw_top_status(const char *status, int term_cols)
+{
+    int pad = term_cols - (int)strlen(status);
+    if (pad < 0) pad = 0;
+    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+    mvprintw(0, pad, "%s", status);
+    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+}
+
+/* Paint the bottom action-hint strip listing every interactive key. */
+static void draw_bottom_hint(int term_rows)
+{
+    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+    mvprintw(term_rows - 1, 0,
+             " q:quit  spc:pause  r:reset  [/]:Hz ");
+    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
+}
+
+/*
+ * draw_hud — canonical project HUD.
+ *
+ *   Pseudocode:
+ *     format right-aligned status line
+ *     draw_top_status                (row 0,         CP_HUD,  A_BOLD)
+ *     draw_bottom_hint               (row R−1,       CP_HINT, A_BOLD)
+ */
+static void draw_hud(const Scene *s, double fps)
+{
+    char status[80];
+    format_hud_status(s, fps, status, sizeof status);
+    draw_top_status(status, s->scene_cols);
+    draw_bottom_hint(s->scene_rows);
+}
+
+/* frame_render — erase, paint scene, paint HUD, flush via one doupdate. */
+static void frame_render(const Scene *s, double fps)
 {
     erase();
-    scene_draw(sc, stdscr, s->cols, s->rows, alpha, dt_sec);
-
-    char buf[80];
-    snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  seeds:%d  %s ",
-             fps, sim_fps, N_SEEDS,
-             sc->voronoi.paused ? "PAUSED" : "");
-    int hx = s->cols - (int)strlen(buf);
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(3) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(3) | A_BOLD);
-
-    attron(COLOR_PAIR(5) | A_BOLD);
-    mvprintw(0, 1, " VORONOI ");
-    attroff(COLOR_PAIR(5) | A_BOLD);
-
-    attron(COLOR_PAIR(6) | A_DIM);
-    mvprintw(s->rows - 1, 0,
-             " q:quit  spc:pause  r:reset  [/]:Hz ");
-    attroff(COLOR_PAIR(6) | A_DIM);
+    scene_draw(s, stdscr);
+    draw_hud(s, fps);
+    wnoutrefresh(stdscr);
+    doupdate();
 }
-
-static void screen_present(void) { wnoutrefresh(stdscr); doupdate(); }
 
 /* ===================================================================== */
 /* §8  app                                                                */
 /* ===================================================================== */
 
-typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
-} App;
+/*
+ * POSIX signal flags — must be file-scope `volatile sig_atomic_t` so
+ * the async signal handlers can touch them safely.  Set here, polled
+ * by the main loop, cleared by main once acted on.
+ */
+static volatile sig_atomic_t g_running     = 1;
+static volatile sig_atomic_t g_need_resize = 0;
 
-static App g_app;
-
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
+static void on_exit_signal(int sig)   { (void)sig; g_running     = 0; }
+static void on_resize_signal(int sig) { (void)sig; g_need_resize = 1; }
 static void cleanup(void)             { endwin(); }
 
-static bool app_handle_key(App *app, int ch)
+/* Toggle the paused flag. */
+static void sim_toggle_pause(Scene *s) { s->sim.paused = !s->sim.paused; }
+
+/* Bump simulation fps up by SIM_FPS_STEP, capped at SIM_FPS_MAX. */
+static void sim_fps_increase(Scene *s)
 {
-    Voronoi *v = &app->scene.voronoi;
-    Screen  *s = &app->screen;
-    switch (ch) {
-    case 'q': case 'Q': case 27: return false;
-    case ' ': v->paused = !v->paused; break;
-    case 'r': case 'R':
-        voronoi_reset(v, s->cols, s->rows);
-        break;
-    case ']':
-        app->sim_fps += SIM_FPS_STEP;
-        if (app->sim_fps > SIM_FPS_MAX) app->sim_fps = SIM_FPS_MAX;
-        break;
-    case '[':
-        app->sim_fps -= SIM_FPS_STEP;
-        if (app->sim_fps < SIM_FPS_MIN) app->sim_fps = SIM_FPS_MIN;
-        break;
-    default: break;
-    }
-    return true;
+    s->sim.fps += SIM_FPS_STEP;
+    if (s->sim.fps > SIM_FPS_MAX) s->sim.fps = SIM_FPS_MAX;
 }
 
-int main(void)
+/* Bump simulation fps down by SIM_FPS_STEP, floored at SIM_FPS_MIN. */
+static void sim_fps_decrease(Scene *s)
 {
-    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+    s->sim.fps -= SIM_FPS_STEP;
+    if (s->sim.fps < SIM_FPS_MIN) s->sim.fps = SIM_FPS_MIN;
+}
+
+/*
+ * handle_input — translate one key code into a Scene mutation.
+ *
+ *   q / Q / ESC  → request quit (clear g_running)
+ *   SPACE        → toggle pause
+ *   r / R        → re-roll seed positions at current extent
+ *   ]            → faster simulation tempo (+SIM_FPS_STEP)
+ *   [            → slower simulation tempo (−SIM_FPS_STEP)
+ */
+static void handle_input(Scene *s, int ch)
+{
+    switch (ch) {
+    case 'q': case 'Q': case KEY_ESC: g_running = 0;            break;
+    case ' ':                         sim_toggle_pause(s);      break;
+    case 'r': case 'R':               scene_reset_seeds(s);     break;
+    case ']':                         sim_fps_increase(s);      break;
+    case '[':                         sim_fps_decrease(s);      break;
+    default: break;
+    }
+}
+
+/* On SIGWINCH, tear ncurses down + back up so stdscr matches the new
+ * terminal extent, then re-seed the scene at the new size. */
+static void handle_resize_if_pending(Scene *s)
+{
+    if (!g_need_resize) return;
+    g_need_resize = 0;
+    endwin(); refresh();
+    getmaxyx(stdscr, s->scene_rows, s->scene_cols);
+    scene_reset_seeds(s);
+}
+
+/* ── §8 main-loop helpers ────────────────────────────────────────────── */
+
+/* Install POSIX signal handlers + atexit teardown. */
+static void signals_install(void)
+{
     atexit(cleanup);
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
+}
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+/* Seed the RNG from the monotonic clock (low 32 bits give enough entropy
+ * for a visualisation; no cryptographic claim here). */
+static void rng_seed_from_clock(void)
+{
+    srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
+}
 
-    screen_init(&app->screen);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+/*
+ * clamp_dt_to_prevent_spiral — spiral-of-death guard.
+ *
+ *   If a single frame measures longer than MAX_FRAME_DT_NS (program
+ *   suspended, slow terminal, debugger break), cap dt so the
+ *   fixed-timestep accumulator never tries to run hundreds of ticks
+ *   back-to-back trying to "catch up".  Beyond this cap the simulation
+ *   slows down rather than freezing the UI.
+ */
+static int64_t clamp_dt_to_prevent_spiral(int64_t dt_ns)
+{
+    return (dt_ns > MAX_FRAME_DT_NS) ? MAX_FRAME_DT_NS : dt_ns;
+}
 
-    int64_t frame_time  = clock_ns();
+/*
+ * advance_fixed_timestep_sim — Fiedler's accumulator pattern.
+ *
+ *   Pseudocode:
+ *     accum += dt
+ *     while accum ≥ tick_period:
+ *       scene_tick(s, dt_sec)
+ *       accum -= tick_period
+ *
+ *   Keeps physics deterministic regardless of render frame rate.
+ *   tick_period is recomputed every frame from sim.fps so the user can
+ *   change the tempo mid-run with '[' / ']'.
+ */
+static void advance_fixed_timestep_sim(
+    Scene *s, int64_t *sim_accum_ns, int64_t dt_ns
+) {
+    int64_t tick_ns = TICK_NS(s->sim.fps);
+    float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+    *sim_accum_ns += dt_ns;
+    while (*sim_accum_ns >= tick_ns) {
+        scene_tick(s, dt_sec);
+        *sim_accum_ns -= tick_ns;
+    }
+}
+
+/*
+ * sample_fps — running average of recent frame rate, refreshed every
+ * FPS_UPDATE_PERIOD_NS so the HUD doesn't flicker.
+ *
+ *   Pseudocode:
+ *     frame_count += 1
+ *     accum_ns    += dt_ns
+ *     if accum_ns ≥ FPS_UPDATE_PERIOD_NS:
+ *       display := frame_count / (accum_ns / 1 s)
+ *       reset frame_count + accum_ns
+ */
+static void sample_fps(
+    int64_t dt_ns, int *frame_count, int64_t *accum_ns, double *display
+) {
+    (*frame_count)++;
+    *accum_ns += dt_ns;
+    if (*accum_ns >= FPS_UPDATE_PERIOD_NS) {
+        *display = (double)(*frame_count)
+                 / ((double)(*accum_ns) / (double)NS_PER_SEC);
+        *frame_count = 0;
+        *accum_ns    = 0;
+    }
+}
+
+/* Sleep just long enough to keep the render loop at RENDER_TARGET_FPS. */
+static void wait_until_next_frame(int64_t frame_start_ns)
+{
+    int64_t elapsed = clock_ns() - frame_start_ns;
+    clock_sleep_ns(RENDER_FRAME_NS - elapsed);
+}
+
+/*
+ * main — wire signals + ncurses + Scene, then run the canonical loop:
+ *
+ *   Pseudocode:
+ *     seed RNG from clock
+ *     install signal handlers + atexit cleanup
+ *     bring up terminal (ncurses + colour)
+ *     allocate Scene on stack, seed at current terminal extent
+ *
+ *     while running:
+ *       handle resize if pending
+ *       dt := clock_ns() − last_frame_start, clamped to MAX_FRAME_DT_NS
+ *       advance_fixed_timestep_sim(scene, &sim_accum, dt)
+ *       sample_fps(dt, &meter)
+ *       frame_render(scene, fps_display)
+ *       drain input
+ *       wait_until_next_frame(frame_start)
+ */
+int main(void)
+{
+    rng_seed_from_clock();
+    signals_install();
+
+    Scene scene;
+    screen_init(&scene);
+    scene_init(&scene, scene.scene_cols, scene.scene_rows);
+
+    int64_t frame_start = clock_ns();
     int64_t sim_accum   = 0;
     int64_t fps_accum   = 0;
     int     frame_count = 0;
     double  fps_display = 0.0;
 
-    while (app->running) {
-        if (app->need_resize) {
-            endwin(); refresh();
-            getmaxyx(stdscr, app->screen.rows, app->screen.cols);
-            voronoi_reset(&app->scene.voronoi,
-                          app->screen.cols, app->screen.rows);
-            app->need_resize = 0;
-            frame_time = clock_ns();
-            sim_accum  = 0;
+    while (g_running) {
+        if (g_need_resize) {
+            handle_resize_if_pending(&scene);
+            frame_start = clock_ns();
+            sim_accum   = 0;
         }
 
-        int64_t now = clock_ns();
-        int64_t dt  = now - frame_time;
-        frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+        int64_t now      = clock_ns();
+        int64_t dt_raw   = now - frame_start;
+        int64_t dt       = clamp_dt_to_prevent_spiral(dt_raw);
+        frame_start      = now;
 
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
-
-        sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec,
-                       app->screen.cols, app->screen.rows);
-            sim_accum -= tick_ns;
-        }
-
-        float alpha = (float)sim_accum / (float)tick_ns;
-
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
-
-        int64_t elapsed = clock_ns() - frame_time + dt;
-        clock_sleep_ns(NS_PER_SEC / 60 - elapsed);
-
-        screen_draw(&app->screen, &app->scene,
-                    fps_display, app->sim_fps, alpha, dt_sec);
-        screen_present();
+        advance_fixed_timestep_sim(&scene, &sim_accum, dt);
+        sample_fps(dt, &frame_count, &fps_accum, &fps_display);
+        frame_render(&scene, fps_display);
 
         int ch = getch();
-        if (ch != ERR && !app_handle_key(app, ch))
-            app->running = 0;
+        if (ch != ERR) handle_input(&scene, ch);
+
+        wait_until_next_frame(now);
     }
 
-    screen_free(&app->screen);
+    screen_free();
     return 0;
 }

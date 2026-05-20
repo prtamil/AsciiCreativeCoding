@@ -45,13 +45,55 @@
  *                  The stack sweep is O(N) — each point is pushed/popped ≤ once.
  *                  Jarvis march O(N·h): at worst O(N²) but optimal for small h.
  *
- * References     :
- *   Graham, "An efficient algorithm for determining the convex hull
- *     of a finite planar set," Inf. Proc. Lett. 1 (1972).
- *   Jarvis, "On the identification of the convex hull of a finite
- *     set of points in the plane," Inf. Proc. Lett. 2 (1973).
- *   de Berg et al., "Computational Geometry: Algorithms and
- *     Applications" (3rd ed., 2008) ch. 1.
+ * References
+ * ──────────
+ *   ── The two original algorithms ──────────────────────────────────
+ *   [1] Graham, R. L. (1972), "An efficient algorithm for determining
+ *       the convex hull of a finite planar set", Information
+ *       Processing Letters 1(4), pp. 132-133 — the polar-sort + stack-
+ *       sweep algorithm implemented by graham_init/graham_step.
+ *   [2] Jarvis, R. A. (1973), "On the identification of the convex
+ *       hull of a finite set of points in the plane", Information
+ *       Processing Letters 2(1), pp. 18-21 — the gift-wrap algorithm
+ *       implemented by jarvis_init/jarvis_step.
+ *   [3] Chand, D. R. & Kapur, S. S. (1970), "An algorithm for convex
+ *       polytopes", J. ACM 17(1) — the n-dimensional gift-wrap that
+ *       Jarvis specialised to 2-D three years later.
+ *
+ *   ── Output-sensitive + asymptotically better hulls ──────────────
+ *   [4] Chan, T. M. (1996), "Optimal output-sensitive convex hull
+ *       algorithms in two and three dimensions", Discrete & Comput.
+ *       Geom. 16(4), pp. 361-368 — O(N log h) hybrid that combines
+ *       Graham and gift-wrap; the modern state-of-the-art. Worth
+ *       reading once you know both algorithms in this file.
+ *   [5] Kirkpatrick, D. G. & Seidel, R. (1986), "The ultimate planar
+ *       convex hull algorithm?", SIAM J. Computing 15(1), pp. 287-299
+ *       — earlier O(N log h) algorithm; explains why output-sensitive
+ *       bounds matter.
+ *
+ *   ── Canonical computational-geometry textbooks ──────────────────
+ *   [6] de Berg, M., Cheong, O., van Kreveld, M. & Overmars, M.
+ *       (2008), "Computational Geometry: Algorithms and Applications"
+ *       (3rd ed.), Springer — Ch. 1 introduces convex hulls;
+ *       Theorem 1.1 proves Graham's correctness.
+ *   [7] O'Rourke, J. (1998), "Computational Geometry in C" (2nd ed.),
+ *       Cambridge — §3.5 Graham scan with full C implementation;
+ *       §1.5 the signed-area / orientation predicate cross2 uses.
+ *   [8] Preparata, F. P. & Shamos, M. I. (1985), "Computational
+ *       Geometry: An Introduction", Springer — the field's
+ *       foundational textbook; §3.3 surveys hull algorithms.
+ *
+ *   ── Numerical robustness (the FP gotcha behind cross2) ──────────
+ *   [9] Shewchuk, J. R. (1997), "Adaptive precision floating-point
+ *       arithmetic and fast robust geometric predicates", Discrete
+ *       & Comput. Geom. 18(3), pp. 305-363 — why naive cross2 can
+ *       MISCLASSIFY near-collinear points and how to fix it. This
+ *       demo uses naive float; production code should not.
+ *
+ *   ── Online quick reference ──────────────────────────────────────
+ *  [10] https://en.wikipedia.org/wiki/Convex_hull_algorithms
+ *  [11] https://en.wikipedia.org/wiki/Graham_scan
+ *  [12] https://en.wikipedia.org/wiki/Gift_wrapping_algorithm
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -385,162 +427,648 @@ static void color_init(void)
 /* §4  algorithms                                                         */
 /* ===================================================================== */
 
-typedef struct { float x, y; } Point;
+/*
+ * Point — a 2-D input point in screen-pixel coordinates.
+ *
+ * Intent
+ *   The convex-hull algorithms operate on an INDEXED ARRAY of these.
+ *   Both Graham and Jarvis store INDICES into Scene.pts[] (not Point
+ *   values) in their working arrays — copying a Point is cheap (8
+ *   bytes) but indices stay smaller and let multiple algorithms
+ *   share one canonical point list without aliasing problems.
+ *
+ * Convention
+ *   x : EASTWARD pixel coordinate (positive → right).
+ *   y : SOUTHWARD pixel coordinate (positive → DOWN the screen).
+ *
+ *   The y-down convention matters for ORIENTATION semantics:
+ *   cross2(O, A, B) > 0 is mathematically a CCW turn (positive
+ *   angular sweep around O), but on screen it APPEARS CW because
+ *   y is flipped. graham_step + jarvis_step still produce a hull
+ *   that LOOKS correct because the comparison is symmetric — what
+ *   matters is the SIGN consistency, not the absolute orientation
+ *   convention.
+ *
+ * Why float (not int)
+ *   new_points() places points with floating-point arithmetic
+ *   (jittered grid). Storing them as floats avoids a quantisation
+ *   pass between generation and the algorithm — cross2's near-
+ *   collinear test stays as accurate as the generator allowed.
+ *   Float also matches O'Rourke's reference C implementation [7].
+ *
+ *   Caveat: naive float cross-products can MISCLASSIFY near-collinear
+ *   points (the FP rounding can flip the sign of a true-zero
+ *   determinant). Production code uses exact arithmetic or robust
+ *   predicates — see [9] Shewchuk. This demo accepts the risk.
+ *
+ * Why a value type
+ *   8 bytes; passes in registers. cross2 takes three Point pointers
+ *   not values, but only because cross2 was written for the pointer
+ *   convention used in O'Rourke's reference code; by-value would
+ *   work equivalently.
+ *
+ * References [7] O'Rourke §1.5 for the orientation primitive that
+ *   makes Point useful; [9] Shewchuk for the FP-robustness caveat.
+ */
+typedef struct {
+    float x;   /* eastward  pixel coordinate */
+    float y;   /* southward pixel coordinate */
+} Point;
 
-static Point g_pts[N_POINTS];
-static int g_rows, g_cols;
+/*
+ * ─────────────────────────────────────────────────────────────────────
+ *  Scene — owns all simulation + render state for one run.
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * One instance lives in main() and is passed by pointer to every
+ * algorithm / draw / init function. The fields group by concern:
+ *
+ *   ── Shared simulation state ── read by BOTH algorithms
+ *      pts[]            input point cloud (the algorithms' input)
+ *      rows, cols       terminal extent in CHARACTER CELLS
+ *                       (needed by new_points + the rasteriser)
+ *
+ *   ── Graham scan state (§4 graham_init / graham_step) ──
+ *      gs_sorted[]      input indices ordered by polar angle around
+ *                       pivot — the scan visits them in this order.
+ *      gs_stack[]       hull-vertex stack; final hull = stack[0..sp-1].
+ *      gs_sp            stack pointer (number of valid entries).
+ *      gs_idx           next sorted-index to process.
+ *      gs_done          true once the scan has consumed all points.
+ *      gs_steps         visualiser counter (push events).
+ *      pivot            lowest-leftmost point — Graham's anchor.
+ *
+ *   ── Jarvis march state (§4 jarvis_init / jarvis_step) ──
+ *      jv_hull[]        hull vertices in emission order; +1 slot
+ *                       for the closing wrap-back.
+ *      jv_n             hull size so far (vertices emitted).
+ *      jv_cur           current hull tip — last emitted vertex.
+ *      jv_cand          candidate index this comparison.
+ *      jv_best          best (most-CCW) candidate found so far.
+ *      jv_done          true once wrapping returns to start.
+ *      jv_steps         visualiser counter (comparisons).
+ *      jv_start         first hull vertex (leftmost point).
+ *
+ *   ── Render / app state ──
+ *      paused           pause flag (toggled by 'p')
+ *      step_accum       fixed-step accumulator (ns)
+ *      step_ns          per-step interval (ns), adjusted by +/-
+ *
+ * Why a STRUCT (not file-scope globals)
+ *   Keeps the algorithm/render concerns from leaking into module
+ *   scope, makes the "what does this function read/write" question
+ *   answerable from the signature, and leaves the door open to e.g.
+ *   two side-by-side runs without aliasing.
+ *
+ * The signal-handler flags (g_quit, g_resize) below §6 stay as
+ * globals because POSIX signal handlers can't be passed a pointer.
+ * ───────────────────────────────────────────────────────────────────── */
 
-/* Graham scan state */
-static int   g_gs_sorted[N_POINTS];   /* sorted point indices */
-static int   g_gs_stack[N_POINTS];    /* convex hull stack    */
-static int   g_gs_sp;                  /* stack pointer        */
-static int   g_gs_idx;                 /* current scan index   */
-static bool  g_gs_done;
-static long long g_gs_steps;
+typedef struct {
+    /* Shared simulation state */
+    Point     pts[N_POINTS];
+    int       rows;
+    int       cols;
 
-/* Jarvis march state */
-static int   g_jv_hull[N_POINTS+1];   /* hull point indices   */
-static int   g_jv_n;                   /* hull size            */
-static int   g_jv_cur;                 /* current hull tip     */
-static int   g_jv_cand;                /* current candidate being tested */
-static int   g_jv_best;                /* best (most CCW) candidate so far */
-static bool  g_jv_done;
-static long long g_jv_steps;
+    /* Graham scan state */
+    int       gs_sorted[N_POINTS];
+    int       gs_stack [N_POINTS];
+    int       gs_sp;
+    int       gs_idx;
+    bool      gs_done;
+    long long gs_steps;
+    int       pivot;
 
+    /* Jarvis march state */
+    int       jv_hull[N_POINTS + 1];
+    int       jv_n;
+    int       jv_cur;
+    int       jv_cand;
+    int       jv_best;
+    bool      jv_done;
+    long long jv_steps;
+    int       jv_start;
+
+    /* Render / app state */
+    bool      paused;
+    long long step_accum;
+    long long step_ns;
+} Scene;
+
+/*
+ * cross2 — the 2-D cross product of vectors OA and OB.
+ *
+ *     cross2(O, A, B) = (A − O) × (B − O)
+ *                     = (Aₓ − Oₓ)(Bᵧ − Oᵧ) − (Aᵧ − Oᵧ)(Bₓ − Oₓ)
+ *
+ *   Geometric interpretation: this scalar EQUALS TWICE THE SIGNED
+ *   AREA of the triangle OAB. The SIGN encodes the orientation of
+ *   the triple (O, A, B):
+ *
+ *       cross2 > 0   →  CCW (left turn) — A→B sweeps counter-clockwise around O
+ *       cross2 < 0   →  CW  (right turn) — A→B sweeps clockwise around O
+ *       cross2 = 0   →  COLLINEAR — O, A, B lie on one line
+ *
+ *   This is the most-used primitive in computational geometry; both
+ *   Graham scan and Jarvis march reduce to "is this a left turn?"
+ *   tests against cross2.
+ *
+ *   Reference: O'Rourke (1998) "Computational Geometry in C" §1.5
+ *   for the signed-area derivation; de Berg et al. (2008)
+ *   "Computational Geometry: Algorithms and Applications" §1.1 for
+ *   the orientation predicate.
+ */
 static float cross2(const Point *O, const Point *A, const Point *B)
 {
     return (A->x - O->x)*(B->y - O->y) - (A->y - O->y)*(B->x - O->x);
 }
 
+/*
+ * is_strict_left_turn — true iff (O, A, B) is a STRICT CCW turn.
+ *
+ *   Used to validate hull invariants: a point B is on the upper hull
+ *   relative to the previous edge OA if and only if the turn is
+ *   strictly counter-clockwise. Collinear points (cross2 == 0) FAIL
+ *   this test — that's intentional: a hull edge should not pass
+ *   through an interior collinear point.
+ */
+static inline bool is_strict_left_turn(const Point *O, const Point *A,
+                                       const Point *B)
+{
+    return cross2(O, A, B) > 0.0f;
+}
+
+/*
+ * is_not_strict_left_turn — Graham scan's pop predicate.
+ *
+ *   The Graham inner loop pops the top of the stack while the top
+ *   two points + the next candidate fail to make a strict left turn.
+ *   "Fail" means right turn OR collinear (cross2 ≤ 0), so we use the
+ *   non-strict negation rather than is_right_turn.
+ *
+ *   Why include COLLINEAR in the pop set? Because a collinear vertex
+ *   is REDUNDANT — three collinear points contribute only two hull
+ *   edges; keeping the middle one would clutter the hull without
+ *   changing its shape.
+ */
+static inline bool is_not_strict_left_turn(const Point *O, const Point *A,
+                                           const Point *B)
+{
+    return cross2(O, A, B) <= 0.0f;
+}
+
+/*
+ * polar_angle — atan2 of (p − ref), in (−π, π].
+ *
+ *   Used as the SORT KEY in Graham scan after the pivot is found.
+ *   atan2 unambiguously assigns an angle to every (Δx, Δy) ≠ 0,
+ *   handles all four quadrants, and is monotonic with rotation
+ *   direction — properties qsort needs to produce a clean CCW order.
+ *
+ *   Reference: O'Rourke (1998) §3.5 for the polar-sort step of
+ *   Graham scan.
+ */
 static float polar_angle(const Point *ref, const Point *p)
 {
     return atan2f(p->y - ref->y, p->x - ref->x);
 }
 
-static int g_pivot;   /* lowest-leftmost point for Graham */
+/*
+ * squared_distance — Euclidean distance² from a to b (no sqrt).
+ *
+ *   For ORDERING by distance we don't need the actual distance —
+ *   only its order, which sqrt preserves monotonically. Skipping
+ *   sqrt saves one transcendental per comparison without changing
+ *   the sort result. This is the standard CG trick (ref O'Rourke
+ *   §3 "Avoid square roots in comparisons").
+ */
+static inline float squared_distance(const Point *a, const Point *b)
+{
+    float dx = a->x - b->x;
+    float dy = a->y - b->y;
+    return dx*dx + dy*dy;
+}
 
+/*
+ * cmp_angle_ctx — transient context for cmp_angle.
+ *
+ *   ISO C qsort has no user-data parameter, so the comparator can't
+ *   reach the Scene through its arguments. We set this pointer just
+ *   before the qsort call (see sort_indices_by_polar_angle_around_pivot)
+ *   and clear it after. Not thread-safe, doesn't need to be — the
+ *   demo is single-threaded and qsort runs to completion.
+ */
+static const Scene *cmp_angle_ctx;
+
+/*
+ * cmp_angle — qsort comparator: orders points by polar angle around
+ * the pivot, breaking ties by SQUARED DISTANCE.
+ *
+ *   PRIMARY KEY:    polar_angle(pivot, P)    (ascending → CCW order)
+ *   TIE BREAKER:    squared_distance(pivot, P)  (ascending — NEAR first)
+ *
+ *   Why NEAR-first on ties: collinear points at equal angle from the
+ *   pivot are all on the same RAY. Graham scan will discard the
+ *   inner ones when the pop loop runs anyway, but ordering them
+ *   near-first keeps the stack walk predictable.
+ *
+ *   (Some Graham variants order COLLINEAR ties FAR-first on the
+ *   final edge to handle the wrap-around correctly. We don't here
+ *   because the demo's random points rarely produce exact ties.)
+ */
 static int cmp_angle(const void *a, const void *b)
 {
+    const Scene *sc = cmp_angle_ctx;
     int ia = *(const int*)a, ib = *(const int*)b;
-    float da = polar_angle(&g_pts[g_pivot], &g_pts[ia]);
-    float db = polar_angle(&g_pts[g_pivot], &g_pts[ib]);
+    const Point *pivot = &sc->pts[sc->pivot];
+
+    float da = polar_angle(pivot, &sc->pts[ia]);
+    float db = polar_angle(pivot, &sc->pts[ib]);
     if (da < db) return -1;
     if (da > db) return  1;
-    /* tie: sort by distance */
-    float la = (g_pts[ia].x-g_pts[g_pivot].x)*(g_pts[ia].x-g_pts[g_pivot].x)
-             + (g_pts[ia].y-g_pts[g_pivot].y)*(g_pts[ia].y-g_pts[g_pivot].y);
-    float lb = (g_pts[ib].x-g_pts[g_pivot].x)*(g_pts[ib].x-g_pts[g_pivot].x)
-             + (g_pts[ib].y-g_pts[g_pivot].y)*(g_pts[ib].y-g_pts[g_pivot].y);
+
+    /* TIE: same polar angle — order by distance from pivot */
+    float la = squared_distance(pivot, &sc->pts[ia]);
+    float lb = squared_distance(pivot, &sc->pts[ib]);
     return (la < lb) ? -1 : (la > lb) ? 1 : 0;
 }
 
-static void graham_init(void)
+/*
+ * find_lowest_leftmost_point — Graham scan's pivot.
+ *
+ *   The pivot is the point with MINIMUM y, breaking ties with
+ *   MINIMUM x. Geometrically: the bottom-most, then leftmost
+ *   point of the set.
+ *
+ *   Why this point: it is GUARANTEED to be on the convex hull (a
+ *   bottom-most point of any set is always extreme in the −y
+ *   direction). Polar-sorting the remaining points AROUND this
+ *   pivot then gives a CCW traversal of the hull boundary starting
+ *   at a known hull vertex.
+ *
+ *   Reference: Graham (1972) "An efficient algorithm for determining
+ *   the convex hull of a finite planar set", Information Processing
+ *   Letters 1(4) — original paper specifies this exact pivot rule.
+ */
+static int find_lowest_leftmost_point(const Point *pts, int n)
 {
-    /* find lowest (then leftmost) point */
-    g_pivot = 0;
-    for (int i = 1; i < N_POINTS; i++) {
-        if (g_pts[i].y < g_pts[g_pivot].y ||
-            (g_pts[i].y == g_pts[g_pivot].y && g_pts[i].x < g_pts[g_pivot].x))
-            g_pivot = i;
+    int idx = 0;
+    for (int i = 1; i < n; i++) {
+        bool lower      = pts[i].y < pts[idx].y;
+        bool same_y_lft = pts[i].y == pts[idx].y && pts[i].x < pts[idx].x;
+        if (lower || same_y_lft) idx = i;
     }
-    for (int i = 0; i < N_POINTS; i++) g_gs_sorted[i] = i;
-    qsort(g_gs_sorted, N_POINTS, sizeof(int), cmp_angle);
-
-    g_gs_stack[0] = g_gs_sorted[0];
-    g_gs_stack[1] = g_gs_sorted[1];
-    g_gs_sp  = 2;
-    g_gs_idx = 2;
-    g_gs_done  = false;
-    g_gs_steps = 0;
+    return idx;
 }
 
-/* One Graham scan step: process g_gs_idx */
-static void graham_step(void)
+/*
+ * sort_indices_by_polar_angle_around_pivot — Graham's polar sort.
+ *
+ *   Fills idx_out[] with 0..n−1 then qsorts it so that walking
+ *   idx_out[] visits the points in CCW polar order around sc->pivot.
+ *   cmp_angle is the comparator (defined above); it reads the scene
+ *   through cmp_angle_ctx, set here for the duration of the qsort.
+ *
+ *   Complexity: O(n log n) — the qsort dominates Graham's total
+ *   complexity. Once sorted, the scan is O(n).
+ */
+static void sort_indices_by_polar_angle_around_pivot(const Scene *sc,
+                                                     int *idx_out, int n)
 {
-    if (g_gs_done) return;
-    if (g_gs_idx >= N_POINTS) { g_gs_done = true; return; }
-
-    while (g_gs_sp >= 2 &&
-           cross2(&g_pts[g_gs_stack[g_gs_sp-2]],
-                  &g_pts[g_gs_stack[g_gs_sp-1]],
-                  &g_pts[g_gs_sorted[g_gs_idx]]) <= 0.f)
-        g_gs_sp--;
-
-    g_gs_stack[g_gs_sp++] = g_gs_sorted[g_gs_idx++];
-    g_gs_steps++;
+    for (int i = 0; i < n; i++) idx_out[i] = i;
+    cmp_angle_ctx = sc;
+    qsort(idx_out, (size_t)n, sizeof(int), cmp_angle);
+    cmp_angle_ctx = NULL;
 }
 
-/* Jarvis march init */
-static int g_jv_start;
-
-static void jarvis_init(void)
+/*
+ * graham_init — set up the Graham scan state for a step-driven run.
+ *
+ *   Pseudocode:
+ *     1. PIVOT      = find_lowest_leftmost_point(pts)
+ *                     — guaranteed-extreme point that anchors the sort.
+ *     2. SORT       sc->gs_sorted ← polar-angle order around pivot
+ *                     — visiting order for the scan.
+ *     3. SEED STACK with the first TWO sorted points.
+ *                     The scan keeps a stack of "hull candidates"; we
+ *                     start with the pivot (sorted[0]) and the next
+ *                     point in CCW order (sorted[1]). These two are
+ *                     trivially CCW and form the first hull edge.
+ *     4. SCAN INDEX = 2  — graham_step will process sorted[2..n−1].
+ *     5. Reset done flag + step counter for the visualiser.
+ *
+ *   Reference: Graham (1972); de Berg et al. (2008) §1.1.
+ */
+static void graham_init(Scene *sc)
 {
-    /* start from leftmost point */
-    g_jv_start = 0;
-    for (int i = 1; i < N_POINTS; i++)
-        if (g_pts[i].x < g_pts[g_jv_start].x) g_jv_start = i;
+    /* (1) anchor pivot */
+    sc->pivot = find_lowest_leftmost_point(sc->pts, N_POINTS);
 
-    g_jv_hull[0] = g_jv_start;
-    g_jv_n    = 1;
-    g_jv_cur  = g_jv_start;
-    g_jv_cand = 0;
-    g_jv_best = (g_jv_start == 0) ? 1 : 0;  /* initial best: first point != cur */
-    g_jv_done = false;
-    g_jv_steps = 0;
+    /* (2) polar-angle CCW order */
+    sort_indices_by_polar_angle_around_pivot(sc, sc->gs_sorted, N_POINTS);
+
+    /* (3) seed stack with first two sorted points */
+    sc->gs_stack[0] = sc->gs_sorted[0];
+    sc->gs_stack[1] = sc->gs_sorted[1];
+    sc->gs_sp       = 2;
+
+    /* (4) scan starts at index 2 (third point in CCW order) */
+    sc->gs_idx = 2;
+
+    /* (5) reset run-state */
+    sc->gs_done  = false;
+    sc->gs_steps = 0;
 }
 
-/* One Jarvis step: compare one candidate against current best */
-static void jarvis_step(void)
+/*
+ * pop_while_not_strict_left_turn — Graham's hull-maintenance loop.
+ *
+ *   While the top of the stack and the incoming candidate fail to
+ *   form a strict CCW turn together with the second-from-top point,
+ *   POP the top.
+ *
+ *   Geometrically: the top of the stack would lie ON or INSIDE the
+ *   edge from second-top → candidate, so it's not a hull vertex.
+ *   Discarding it lets the candidate become the new top.
+ *
+ *   The loop body is the key insight of Graham: by polar-sorting
+ *   first, we know the candidate is FURTHER CCW than anything on
+ *   the stack, so the only way to keep convexity is to pop interior
+ *   points until the remaining stack top forms a strict left turn
+ *   with (second-top → candidate).
+ *
+ *   Each point can be pushed at most once and popped at most once,
+ *   so the AMORTISED cost is O(1) per point even though a single
+ *   call can pop many in a row. Total scan is O(n).
+ */
+static void pop_while_not_strict_left_turn(const Point *pts,
+                                           int *stack, int *sp,
+                                           int candidate_idx)
 {
-    if (g_jv_done) return;
+    while (*sp >= 2 &&
+           is_not_strict_left_turn(&pts[stack[*sp - 2]],
+                                   &pts[stack[*sp - 1]],
+                                   &pts[candidate_idx]))
+        (*sp)--;
+}
 
-    /* Skip self */
-    if (g_jv_cand == g_jv_cur) { g_jv_cand++; return; }
+/*
+ * graham_step — process ONE candidate point per call (animation step).
+ *
+ *   Pseudocode:
+ *     1. early-out if done or no more candidates.
+ *     2. pop_while_not_strict_left_turn — discard hull-interior
+ *        points from the stack until the top forms a strict CCW
+ *        turn with the candidate.
+ *     3. push the candidate onto the stack.
+ *     4. advance to the next candidate.
+ *
+ *   When all candidates have been processed the stack holds the
+ *   hull in CCW order (pivot first, then bottom→right→top→left).
+ *
+ *   This function is called once per frame by the visualiser so
+ *   the user can watch the scan advance one point at a time.
+ */
+static void graham_step(Scene *sc)
+{
+    if (sc->gs_done) return;
+    if (sc->gs_idx >= N_POINTS) { sc->gs_done = true; return; }
 
-    /* All candidates tested — confirm best as next hull vertex */
-    if (g_jv_cand >= N_POINTS) {
-        if (g_jv_best == g_jv_start && g_jv_n > 1) {
-            g_jv_done = true;
+    int candidate = sc->gs_sorted[sc->gs_idx];
+    pop_while_not_strict_left_turn(sc->pts, sc->gs_stack, &sc->gs_sp,
+                                   candidate);
+    sc->gs_stack[sc->gs_sp++] = candidate;
+    sc->gs_idx++;
+    sc->gs_steps++;
+}
+
+/*
+ * find_leftmost_point — Jarvis march's start vertex.
+ *
+ *   The leftmost point has minimum x; it is GUARANTEED to be on the
+ *   convex hull (extreme in the −x direction). Like Graham's
+ *   lowest-leftmost pivot, this is the standard anchor that lets
+ *   the algorithm produce a deterministic starting point and a
+ *   well-defined termination condition (wrap back to start).
+ *
+ *   Reference: Jarvis (1973) "On the identification of the convex
+ *   hull of a finite set of points in the plane", Information
+ *   Processing Letters 2(1) — original paper.
+ */
+static int find_leftmost_point(const Point *pts, int n)
+{
+    int idx = 0;
+    for (int i = 1; i < n; i++)
+        if (pts[i].x < pts[idx].x) idx = i;
+    return idx;
+}
+
+/*
+ * first_index_not_equal_to — pick a "best so far" candidate that
+ * isn't the current hull tip.
+ *
+ *   Jarvis needs a non-self initial guess for `best` so the
+ *   subsequent loop has something to compare against. Picking the
+ *   first index ≠ cur works for any input (cur ∈ {0, 1, …, n−1}
+ *   always has a valid neighbour with a different index).
+ */
+static inline int first_index_not_equal_to(int cur)
+{
+    return (cur == 0) ? 1 : 0;
+}
+
+/*
+ * is_more_counterclockwise — Jarvis's candidate-selection predicate.
+ *
+ *   "Is `cand` more CCW from `cur` than `best`?"
+ *
+ *   Geometrically: standing at cur, looking toward best, is cand
+ *   to the RIGHT of that ray? If yes, the ray to cand sweeps
+ *   FARTHER CLOCKWISE in screen space — but the hull is traced
+ *   CW in screen-y-down terms, so this is in fact the CCW direction
+ *   we want for the gift-wrap step.
+ *
+ *   Implementation: cross2(cur, best, cand) < 0 means cand sits on
+ *   the CW side of the line cur→best (in math convention; CCW on
+ *   screen because y is inverted). Either way, that's the side
+ *   that moves the wrapping "string" further around the hull.
+ */
+static inline bool is_more_counterclockwise(const Point *pts,
+                                            int cur, int best, int cand)
+{
+    return cross2(&pts[cur], &pts[best], &pts[cand]) < 0.0f;
+}
+
+/*
+ * jarvis_init — gift-wrap start state.
+ *
+ *   1. start = find_leftmost_point   — anchor on a known hull vertex.
+ *   2. hull[0] = start; n = 1         — emit the first hull point.
+ *   3. cur = start                    — current "tip" of the partial hull.
+ *   4. cand, best                     — reset to scan candidates from 0.
+ *   5. done, steps                    — visualiser counters.
+ *
+ *   After init, repeatedly calling jarvis_step() will sweep one
+ *   candidate per call until the wrapping string returns to `start`.
+ */
+static void jarvis_init(Scene *sc)
+{
+    sc->jv_start = find_leftmost_point(sc->pts, N_POINTS);
+
+    sc->jv_hull[0] = sc->jv_start;
+    sc->jv_n       = 1;
+    sc->jv_cur     = sc->jv_start;
+    sc->jv_cand    = 0;
+    sc->jv_best    = first_index_not_equal_to(sc->jv_cur);
+
+    sc->jv_done  = false;
+    sc->jv_steps = 0;
+}
+
+/*
+ * commit_best_as_next_hull_vertex — advance the gift-wrap one tip.
+ *
+ *   Called after every candidate has been compared against `best`.
+ *   `best` is now the next CCW-most point from `cur`; append it
+ *   to the hull, slide the tip forward, and reset the candidate
+ *   scanner for the next pass.
+ */
+static inline void commit_best_as_next_hull_vertex(Scene *sc)
+{
+    sc->jv_hull[sc->jv_n++] = sc->jv_best;
+    sc->jv_cur              = sc->jv_best;
+    sc->jv_cand             = 0;
+    sc->jv_best             = first_index_not_equal_to(sc->jv_cur);
+}
+
+/*
+ * wraps_back_to_start — Jarvis termination check.
+ *
+ *   The gift-wrap terminates when the next-chosen vertex equals the
+ *   start vertex AND we've already accumulated at least one edge
+ *   (n > 1). The n > 1 guard prevents an immediate termination on
+ *   the first vertex (where best could spuriously match start
+ *   before any wrapping has happened).
+ */
+static inline bool wraps_back_to_start(const Scene *sc)
+{
+    return sc->jv_best == sc->jv_start && sc->jv_n > 1;
+}
+
+/*
+ * jarvis_step — one comparison or one vertex-commit per call.
+ *
+ *   This is Jarvis march's gift-wrapping algorithm broken into the
+ *   smallest visible step: each call advances the state by EITHER
+ *   one candidate comparison OR one hull-vertex commit. The
+ *   visualiser drives it at one step per frame so the user can
+ *   watch the wrapping ray sweep around the point set.
+ *
+ *   Pseudocode:
+ *     1. early-out if done.
+ *     2. if cand == cur: skip self, advance cand.
+ *     3. if all candidates compared (cand >= N_POINTS):
+ *          a. if wraps_back_to_start → terminate.
+ *          b. else commit_best_as_next_hull_vertex.
+ *     4. otherwise compare:
+ *          if is_more_counterclockwise(cur, best, cand): best ← cand
+ *          advance cand.
+ *
+ *   Complexity per hull vertex: O(N) comparisons (one full sweep
+ *   over the input). Total: O(h·N) where h is the hull size.
+ *   Worse than Graham's O(N log N) when h ≈ N, but BETTER when
+ *   h is small (the hull is "output-sensitive"). For h ≪ N this is
+ *   actually the asymptotically optimal output-sensitive algorithm.
+ *
+ *   Reference: Jarvis (1973); Chand & Kapur (1970) gift-wrap in nD.
+ */
+static void jarvis_step(Scene *sc)
+{
+    if (sc->jv_done) return;
+
+    /* (2) skip self */
+    if (sc->jv_cand == sc->jv_cur) { sc->jv_cand++; return; }
+
+    /* (3) all candidates tested — either terminate or commit */
+    if (sc->jv_cand >= N_POINTS) {
+        if (wraps_back_to_start(sc)) {
+            sc->jv_done = true;
             return;
         }
-        g_jv_hull[g_jv_n++] = g_jv_best;
-        g_jv_cur  = g_jv_best;
-        g_jv_cand = 0;
-        g_jv_best = (g_jv_cur == 0) ? 1 : 0;  /* reset best to first point != new cur */
+        commit_best_as_next_hull_vertex(sc);
         return;
     }
 
-    /* Compare candidate vs current best: is cand more CCW from cur? */
-    float c = cross2(&g_pts[g_jv_cur], &g_pts[g_jv_best], &g_pts[g_jv_cand]);
-    if (c < 0.f)
-        g_jv_best = g_jv_cand;
+    /* (4) compare candidate vs current best */
+    if (is_more_counterclockwise(sc->pts, sc->jv_cur, sc->jv_best, sc->jv_cand))
+        sc->jv_best = sc->jv_cand;
 
-    g_jv_cand++;
-    g_jv_steps++;
+    sc->jv_cand++;
+    sc->jv_steps++;
 }
 
-static void new_points(int rows, int cols)
+/*
+ * new_points — generate a fresh random input set and reset BOTH algorithms.
+ *
+ *   Pseudocode:
+ *     pw, ph := LEFT-panel pixel extent (cols/2 − 4 by rows − HUD − 2)
+ *     for i in 0..N_POINTS−1:
+ *         pts[i] := uniform random point in [(2, 1), (2 + pw, 1 + ph))
+ *     graham_init(sc)
+ *     jarvis_init(sc)
+ *
+ *   Why LEFT-panel coordinates only: scene_draw renders the same point
+ *   set TWICE — once at its native x, once mirrored at x + half — so
+ *   both panels show identical inputs. Storing in left-panel coords
+ *   keeps the data canonical; the rasteriser adds the offset.
+ *
+ *   The (2, 1) leading margin and the (−4, −2) trailing slack in pw/ph
+ *   keep points clear of the central divider and the HUD rows.
+ *
+ *   Bound to SPACE in the input handler; also called on resize so the
+ *   point cloud rescales to the new terminal extent.
+ */
+static void new_points(Scene *sc)
 {
-    int pw = cols / 2 - 4;
-    int ph = rows - HUD_ROWS - 2;
+    int pw = sc->cols / 2 - 4;
+    int ph = sc->rows - HUD_ROWS - 2;
     for (int i = 0; i < N_POINTS; i++) {
-        g_pts[i].x = 2 + (float)rand() / RAND_MAX * pw;
-        g_pts[i].y = 1 + (float)rand() / RAND_MAX * ph;
+        sc->pts[i].x = 2 + (float)rand() / RAND_MAX * pw;
+        sc->pts[i].y = 1 + (float)rand() / RAND_MAX * ph;
     }
-    graham_init();
-    jarvis_init();
+    graham_init(sc);
+    jarvis_init(sc);
 }
 
 /* ===================================================================== */
 /* §5  draw                                                               */
 /* ===================================================================== */
 
-static bool g_paused;
-static long long g_step_accum;
-static long long g_step_ns = STEP_NS;
-
-/* Draw a line between two points using mvaddch (Bresenham) */
-static void draw_line(float x0, float y0, float x1, float y1, int cp, int col_offset)
+/*
+ * draw_hull_edge — rasterise one line segment between two pixel points.
+ *
+ *   Pseudocode (DDA — Digital Differential Analyser):
+ *     steps := max(|dx|, |dy|)              ← cells on the long axis
+ *     for s in 0..steps:
+ *         t := s / steps                    ∈ [0, 1]
+ *         (x, y) := lerp((x0, y0), (x1, y1), t)
+ *         plot '-' at (x + col_offset, y + HUD_ROWS)
+ *
+ *   DDA samples `steps + 1` points along the segment, picking the axis
+ *   with the larger delta so every cell on the long axis is visited
+ *   exactly once. Bresenham is the integer-only variant; we use float
+ *   lerp because the endpoints are already floats and the savings don't
+ *   matter at ~30 edges per frame.
+ *
+ *   col_offset shifts the segment into the right panel (= sc->cols/2)
+ *   when drawing Jarvis's hull; it's 0 for Graham (left panel).
+ *
+ *   Reference: Foley et al. (1995) "Computer Graphics: Principles and
+ *   Practice" §3.2 — DDA and Bresenham line rasterisation.
+ */
+static void draw_hull_edge(const Scene *sc,
+                           float x0, float y0, float x1, float y1,
+                           int cp, int col_offset)
 {
     int dx = (int)fabsf(x1 - x0), dy = (int)fabsf(y1 - y0);
     int steps = dx > dy ? dx : dy;
@@ -550,77 +1078,171 @@ static void draw_line(float x0, float y0, float x1, float y1, int cp, int col_of
         float t = (float)s / (float)steps;
         int col = (int)(x0 + t*(x1-x0)) + col_offset;
         int row = (int)(y0 + t*(y1-y0)) + HUD_ROWS;
-        if (row >= HUD_ROWS && row < g_rows && col >= 0 && col < g_cols)
+        if (row >= HUD_ROWS && row < sc->rows && col >= 0 && col < sc->cols)
             mvaddch(row, col, '-');
     }
     attroff(COLOR_PAIR(cp) | A_BOLD);
 }
 
-static void scene_draw(void)
+/*
+ * draw_hull_polyline — render a chain of hull edges, optionally closed.
+ *
+ *   Pseudocode:
+ *     for i in 0..n−2:
+ *         draw_hull_edge(pts[indices[i]] → pts[indices[i+1]])
+ *     if closed and n ≥ 3:
+ *         draw_hull_edge(pts[indices[n−1]] → pts[indices[0]])   ← wrap
+ *
+ *   Both algorithms store their partial/complete hull as an ordered
+ *   index list:
+ *     Graham → sc->gs_stack[0 .. gs_sp−1]   (close when gs_done)
+ *     Jarvis → sc->jv_hull [0 .. jv_n−1]    (close when jv_done)
+ *
+ *   While the algorithm is still running, the chain is an OPEN POLYLINE
+ *   (the edge from the last vertex back to the first hasn't been
+ *   emitted yet). Once done, the closing edge promotes the polyline
+ *   to a closed POLYGON — the finished convex hull.
+ */
+static void draw_hull_polyline(const Scene *sc, const int *indices, int n,
+                               bool closed, int cp, int col_offset)
 {
-    int half = g_cols / 2;
+    for (int i = 0; i < n - 1; i++) {
+        draw_hull_edge(sc,
+                       sc->pts[indices[i]].x,   sc->pts[indices[i]].y,
+                       sc->pts[indices[i+1]].x, sc->pts[indices[i+1]].y,
+                       cp, col_offset);
+    }
+    if (closed && n >= 3) {
+        draw_hull_edge(sc,
+                       sc->pts[indices[n-1]].x, sc->pts[indices[n-1]].y,
+                       sc->pts[indices[0]].x,   sc->pts[indices[0]].y,
+                       cp, col_offset);
+    }
+}
 
-    /* draw divider */
+/*
+ * draw_active_wrapping_ray — the moving "gift-wrap string" in Jarvis.
+ *
+ *   While Jarvis sweeps candidates, sc->jv_best holds the most-CCW
+ *   candidate found SO FAR for the next hull vertex. Drawing the
+ *   edge (cur → best) shows the wrapping string pivoting between
+ *   competitors; when a more counter-clockwise candidate is found,
+ *   jv_best updates and this ray visibly snaps to it.
+ *
+ *   Only meaningful while the algorithm is still running; the caller
+ *   guards with !sc->jv_done.
+ */
+static void draw_active_wrapping_ray(const Scene *sc, int half)
+{
+    draw_hull_edge(sc,
+                   sc->pts[sc->jv_cur ].x, sc->pts[sc->jv_cur ].y,
+                   sc->pts[sc->jv_best].x, sc->pts[sc->jv_best].y,
+                   CP_CUR, half);
+}
+
+/*
+ * draw_panel_divider — vertical '|' rule between the two algorithm panels.
+ *   Marks the visual symmetry: same point cloud either side, different
+ *   algorithm. Drawn DIM so it never competes with the hull edges.
+ */
+static void draw_panel_divider(const Scene *sc, int half)
+{
     attron(COLOR_PAIR(CP_HUD) | A_DIM);
-    for (int r = HUD_ROWS; r < g_rows; r++) mvaddch(r, half, '|');
+    for (int r = HUD_ROWS; r < sc->rows; r++) mvaddch(r, half, '|');
     attroff(COLOR_PAIR(CP_HUD) | A_DIM);
+}
 
-    /* draw points in both panels */
+/*
+ * draw_point_cloud — render every input point as '*' in BOTH panels.
+ *
+ *   Each point is plotted twice — once at its canonical x (left panel),
+ *   once mirrored at x + half (right panel) — so the two algorithms
+ *   are visibly working on the same input. Per-axis bounds checks gate
+ *   the writes so an off-screen point can't corrupt the terminal.
+ */
+static void draw_point_cloud(const Scene *sc, int half)
+{
+    attron(COLOR_PAIR(CP_PTS));
     for (int i = 0; i < N_POINTS; i++) {
-        int col = (int)g_pts[i].x;
-        int row = (int)g_pts[i].y + HUD_ROWS;
-        if (row < HUD_ROWS || row >= g_rows) continue;
-        attron(COLOR_PAIR(CP_PTS));
-        if (col >= 0 && col < g_cols)          mvaddch(row, col, '*');
-        if (col+half >= 0 && col+half < g_cols) mvaddch(row, col+half, '*');
-        attroff(COLOR_PAIR(CP_PTS));
+        int col = (int)sc->pts[i].x;
+        int row = (int)sc->pts[i].y + HUD_ROWS;
+        if (row < HUD_ROWS || row >= sc->rows) continue;
+        if (col >= 0      && col      < sc->cols) mvaddch(row, col,      '*');
+        if (col+half >= 0 && col+half < sc->cols) mvaddch(row, col+half, '*');
     }
+    attroff(COLOR_PAIR(CP_PTS));
+}
 
-    /* Graham scan hull edges */
-    for (int i = 0; i < g_gs_sp - 1; i++) {
-        draw_line(g_pts[g_gs_stack[i]].x,   g_pts[g_gs_stack[i]].y,
-                  g_pts[g_gs_stack[i+1]].x, g_pts[g_gs_stack[i+1]].y,
-                  CP_GR, 0);
-    }
-    /* closing edge when done */
-    if (g_gs_done && g_gs_sp >= 3)
-        draw_line(g_pts[g_gs_stack[g_gs_sp-1]].x, g_pts[g_gs_stack[g_gs_sp-1]].y,
-                  g_pts[g_gs_stack[0]].x,          g_pts[g_gs_stack[0]].y,
-                  CP_GR, 0);
-
-    /* Jarvis march hull edges (confirmed) */
-    for (int i = 0; i < g_jv_n - 1; i++) {
-        draw_line(g_pts[g_jv_hull[i]].x,   g_pts[g_jv_hull[i]].y,
-                  g_pts[g_jv_hull[i+1]].x, g_pts[g_jv_hull[i+1]].y,
-                  CP_JA, half);
-    }
-    if (g_jv_done && g_jv_n >= 3)
-        draw_line(g_pts[g_jv_hull[g_jv_n-1]].x, g_pts[g_jv_hull[g_jv_n-1]].y,
-                  g_pts[g_jv_hull[0]].x,          g_pts[g_jv_hull[0]].y,
-                  CP_JA, half);
-
-    /* Jarvis in-progress edge: show current best candidate */
-    if (!g_jv_done)
-        draw_line(g_pts[g_jv_cur].x,  g_pts[g_jv_cur].y,
-                  g_pts[g_jv_best].x, g_pts[g_jv_best].y,
-                  CP_CUR, half);
-
-    /* labels */
+/*
+ * draw_panel_labels — algorithm name + complexity above each panel.
+ *   "Graham scan O(n log n)" (left, cyan) and "Jarvis march O(n*h)"
+ *   (right, green). Colours match the hull edges so the eye can map
+ *   label → algorithm at a glance.
+ */
+static void draw_panel_labels(int half)
+{
     attron(COLOR_PAIR(CP_GR) | A_BOLD);
     mvprintw(HUD_ROWS, 1, "Graham scan O(n log n)");
     attroff(COLOR_PAIR(CP_GR) | A_BOLD);
     attron(COLOR_PAIR(CP_JA) | A_BOLD);
     mvprintw(HUD_ROWS, half + 1, "Jarvis march O(n*h)");
     attroff(COLOR_PAIR(CP_JA) | A_BOLD);
+}
 
+/*
+ * draw_hud — top two status lines: controls + per-algorithm progress.
+ *
+ *   Row 0: title, key hints, N.
+ *   Row 1: live step / hull-size counters for both algorithms, with
+ *          [DONE] markers once each finishes. Reading both counters
+ *          side-by-side is the whole point of the demo: you can watch
+ *          Graham's O(N log N) versus Jarvis's O(N · h) play out in
+ *          step counts as the hulls converge.
+ */
+static void draw_hud(const Scene *sc)
+{
     attron(COLOR_PAIR(CP_HUD));
     mvprintw(0, 0,
-        " ConvexHull  q:quit  spc:new points  p:pause  +/-:speed  N=%d", N_POINTS);
+        " ConvexHull  q:quit  spc:new points  p:pause  +/-:speed  N=%d",
+        N_POINTS);
     mvprintw(1, 0,
         " Graham: steps=%lld hull=%d %s   Jarvis: steps=%lld hull=%d %s",
-        g_gs_steps, g_gs_sp, g_gs_done ? "[DONE]" : "",
-        g_jv_steps, g_jv_n,  g_jv_done ? "[DONE]" : "");
+        sc->gs_steps, sc->gs_sp, sc->gs_done ? "[DONE]" : "",
+        sc->jv_steps, sc->jv_n,  sc->jv_done ? "[DONE]" : "");
     attroff(COLOR_PAIR(CP_HUD));
+}
+
+/*
+ * scene_draw — render one frame.
+ *
+ *   Pseudocode (layered draw, painter's algorithm — later layers cover
+ *   earlier ones at any overlap):
+ *     1. panel divider           ─ vertical rule between the two panels
+ *     2. point cloud             ─ '*' at every input point, both sides
+ *     3. Graham polyline         ─ left panel; closed once gs_done
+ *     4. Jarvis polyline         ─ right panel; closed once jv_done
+ *     5. Jarvis active wrapping  ─ pivoting cur→best edge, while running
+ *     6. panel labels            ─ algorithm names above each panel
+ *     7. HUD                     ─ top two lines: keys + step counters
+ *
+ *   Order matters: HUD goes LAST so its glyphs overlay any hull edges
+ *   that might have intruded into the top rows.
+ */
+static void scene_draw(const Scene *sc)
+{
+    int half = sc->cols / 2;
+
+    draw_panel_divider(sc, half);
+    draw_point_cloud  (sc, half);
+
+    /* Graham hull on the LEFT (offset 0); Jarvis hull on the RIGHT (offset half) */
+    draw_hull_polyline(sc, sc->gs_stack, sc->gs_sp, sc->gs_done, CP_GR, 0);
+    draw_hull_polyline(sc, sc->jv_hull,  sc->jv_n,  sc->jv_done, CP_JA, half);
+
+    if (!sc->jv_done) draw_active_wrapping_ray(sc, half);
+
+    draw_panel_labels(half);
+    draw_hud         (sc);
 }
 
 /* ===================================================================== */
@@ -648,8 +1270,11 @@ int main(void)
     keypad(stdscr, TRUE); nodelay(stdscr, TRUE);
     curs_set(0); typeahead(-1);
     color_init();
-    getmaxyx(stdscr, g_rows, g_cols);
-    new_points(g_rows, g_cols);
+
+    Scene scene = {0};
+    scene.step_ns = STEP_NS;
+    getmaxyx(stdscr, scene.rows, scene.cols);
+    new_points(&scene);
 
     long long last = clock_ns();
 
@@ -658,18 +1283,18 @@ int main(void)
         if (g_resize) {
             g_resize = 0;
             endwin(); refresh();
-            getmaxyx(stdscr, g_rows, g_cols);
-            new_points(g_rows, g_cols);
+            getmaxyx(stdscr, scene.rows, scene.cols);
+            new_points(&scene);
             last = clock_ns();
         }
 
         int ch = getch();
         switch (ch) {
         case 'q': case 'Q': case 27: g_quit = 1; break;
-        case ' ': new_points(g_rows, g_cols); break;
-        case 'p': case 'P': g_paused = !g_paused; break;
-        case '+': case '=': g_step_ns /= 2; if (g_step_ns < 10000000LL) g_step_ns = 10000000LL; break;
-        case '-': g_step_ns *= 2; if (g_step_ns > 2000000000LL) g_step_ns = 2000000000LL; break;
+        case ' ': new_points(&scene); break;
+        case 'p': case 'P': scene.paused = !scene.paused; break;
+        case '+': case '=': scene.step_ns /= 2; if (scene.step_ns < 10000000LL) scene.step_ns = 10000000LL; break;
+        case '-': scene.step_ns *= 2; if (scene.step_ns > 2000000000LL) scene.step_ns = 2000000000LL; break;
         default: break;
         }
 
@@ -677,17 +1302,17 @@ int main(void)
         long long dt  = now - last;
         last = now;
 
-        if (!g_paused) {
-            g_step_accum += dt;
-            while (g_step_accum >= g_step_ns) {
-                g_step_accum -= g_step_ns;
-                if (!g_gs_done) graham_step();
-                if (!g_jv_done) jarvis_step();
+        if (!scene.paused) {
+            scene.step_accum += dt;
+            while (scene.step_accum >= scene.step_ns) {
+                scene.step_accum -= scene.step_ns;
+                if (!scene.gs_done) graham_step(&scene);
+                if (!scene.jv_done) jarvis_step(&scene);
             }
         }
 
         erase();
-        scene_draw();
+        scene_draw(&scene);
         wnoutrefresh(stdscr);
         doupdate();
         clock_sleep_ns(RENDER_NS - (clock_ns() - now));

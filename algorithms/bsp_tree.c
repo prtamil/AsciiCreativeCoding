@@ -66,14 +66,52 @@
  *   The bounding-box pruning in bsp_query skips whole subtrees in O(1),
  *   same mechanism as kd_query — check overlap before recursing.
  *
- * References    :
- *   Fuchs, Kedem & Naylor, "On Visible Surface Generation by A
- *     Priori Tree Structures" (SIGGRAPH 1980) — the original BSP
- *     paper.
- *   Carmack, "Doom rendering" interviews (1993) — game-engine
- *     application that popularised BSP trees.
- *   de Berg et al., "Computational Geometry" (3rd ed., 2008)
- *     ch. 12 — formal treatment.
+ * References
+ * ──────────
+ *   ── The foundational BSP paper ──────────────────────────────────
+ *   [1] Fuchs, H., Kedem, Z. M. & Naylor, B. F. (1980), "On Visible
+ *       Surface Generation by A Priori Tree Structures", SIGGRAPH
+ *       '80 — the original BSP paper. Introduced the front-to-back
+ *       traversal idea that this file's bsp_query inherits.
+ *
+ *   ── Multi-dimensional spatial indexes (the family) ──────────────
+ *   [2] Bentley, J. L. (1975), "Multidimensional binary search trees
+ *       used for associative searching", CACM 18(9), pp. 509-517 —
+ *       k-d tree paper. The alternating-axis split in subdivide()
+ *       comes directly from this work.
+ *   [3] Finkel, R. A. & Bentley, J. L. (1974), "Quad trees: a data
+ *       structure for retrieval on composite keys", Acta Informatica
+ *       4(1) — the quadtree alternative; cited in the
+ *       BSP-vs-Quadtree-vs-K-D contrast in CONCEPTS.
+ *   [4] Samet, H. (2006), "Foundations of Multidimensional and
+ *       Metric Data Structures", Morgan Kaufmann — encyclopaedic
+ *       reference for the whole family of spatial indexes.
+ *
+ *   ── Computational geometry (formal treatment) ───────────────────
+ *   [5] de Berg, M., Cheong, O., van Kreveld, M. & Overmars, M.
+ *       (2008), "Computational Geometry: Algorithms and Applications"
+ *       (3rd ed.), Springer — Ch. 12 BSP trees; Ch. 5 k-d trees;
+ *       formal treatment of range queries and the O(√N + k) bound.
+ *
+ *   ── Game-engine applications ────────────────────────────────────
+ *   [6] Abrash, M. (1997), "Graphics Programming Black Book", Coriolis
+ *       — chapters on the Doom + Quake BSP renderers. Practical
+ *       account of how Carmack applied Fuchs/Kedem/Naylor at game
+ *       frame rates on 1990s hardware.
+ *   [7] van Waveren, J. M. P. (2001), "The Quake III Arena Bot",
+ *       Master's thesis, TU Delft — modern BSP usage for collision
+ *       and visibility queries; cites the same Fuchs paper as ref.
+ *
+ *   ── Range searching (the bsp_query analysis) ────────────────────
+ *   [8] Lee, D. T. & Wong, C. K. (1977), "Worst-case analysis for
+ *       region and partial region searches in multidimensional
+ *       binary search trees and balanced quad trees", Acta
+ *       Informatica 9(1) — the O(√N + k) range-query bound.
+ *
+ *   ── Online quick reference ──────────────────────────────────────
+ *   [9] https://en.wikipedia.org/wiki/Binary_space_partitioning
+ *  [10] https://en.wikipedia.org/wiki/K-d_tree
+ *  [11] https://en.wikipedia.org/wiki/Range_searching
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -449,70 +487,202 @@
 /* ── data types ─────────────────────────────────────────────────── */
 
 /*
- * Point — a data point stored inside the BSP tree.
- *   x, y   — integer coordinates in [0, SPACE_W) × [0, SPACE_H)
- *   label  — single uppercase letter for display (e.g. 'A')
+ * Point — one indexed data point stored at a BSP leaf.
+ *
+ * Intent
+ *   The BSP tree's payload type. A Point is what the user INSERTS
+ *   into the tree (bsp_insert) and what the range query EMITS
+ *   (bsp_query). Each leaf owns up to LEAF_CAPACITY of them in its
+ *   data[] array; internal nodes own none.
+ *
+ *   The label field is purely RENDERING — the ASCII visualiser and
+ *   tree_dump print it so the human can match insertion order to
+ *   spatial position on the grid. The tree algorithm itself never
+ *   reads label.
+ *
+ * Why integer coordinates (not float)
+ *   This is a CLI teaching demo on a fixed-resolution character
+ *   grid (SPACE_W × SPACE_H). Float would add precision headaches
+ *   (e.g. point ON the splitting line, FP equality) without any
+ *   visual benefit at 1 pixel = 1 cell. Integer half-open
+ *   intervals give an exact partition.
+ *
+ *   Real game-engine BSP trees (Doom, Quake) use float coordinates
+ *   because the geometry isn't grid-aligned — see ref [6] Abrash.
+ *
+ * Field semantics
+ *   x, y  — coordinates in [0, SPACE_W) × [0, SPACE_H)
+ *           (sim-only; consumed by rect_contains_point + queries)
+ *   label — single ASCII letter for visualisation; ignored by algo
+ *
+ * References [1] Fuchs/Kedem/Naylor §2 for the "data point as
+ *   tree leaf payload" pattern; [5] de Berg §12.1.
  */
 typedef struct {
-    int  x, y;
-    char label;
+    int  x;       /* horizontal grid coordinate (algorithmic)   */
+    int  y;       /* vertical   grid coordinate (algorithmic)   */
+    char label;   /* display character; render-only, not read by algorithm */
 } Point;
 
 /*
- * Rect — an axis-aligned rectangle using half-open intervals.
- *   x, y   — top-left corner (inclusive)
- *   w, h   — width and height
- *   Region covered: x in [x, x+w)  and  y in [y, y+h)
+ * Rect — an axis-aligned rectangle covering a HALF-OPEN region.
  *
- * Half-open makes subdivision exact: the two halves [x, x+w/2) and
- * [x+w/2, x+w) share no pixels and together cover the whole region.
+ * Intent
+ *   The "world region" a BSPNode is responsible for. Every BSPNode
+ *   stores a Rect (its `boundary`); bsp_insert checks point
+ *   membership against it (rect_contains_point), and bsp_query
+ *   prunes whole subtrees against it (rect_overlaps_range).
+ *
+ *   Internal nodes' boundaries TILE EXACTLY: front.boundary ∪
+ *   back.boundary = parent.boundary, with empty intersection. This
+ *   tile-exactly invariant is what makes the BSP partition a true
+ *   PARTITION of space (every point belongs to exactly one leaf).
+ *
+ * Half-open interval convention
+ *   Region = [x, x+w) × [y, y+h)
+ *   • LEFT/TOP edges are INCLUDED.
+ *   • RIGHT/BOTTOM edges are EXCLUDED.
+ *
+ *   Why half-open: subdivision becomes EXACT with no overlap and no
+ *   gap. Splitting [x, x+w) at midpoint x+w/2 yields:
+ *
+ *       front = [x,       x + w/2)
+ *       back  = [x + w/2, x + w  )
+ *
+ *   Adjacent at x + w/2; no pixel is in both halves; no pixel is
+ *   missed. Closed intervals would force tie-break logic at the
+ *   boundary; half-open is the standard CG convention for that
+ *   exact reason. Ref [5] de Berg §12.2.
+ *
+ * Field semantics
+ *   x, y — top-left corner (INCLUSIVE end of half-open interval).
+ *   w, h — extent; the region's right edge is x+w (EXCLUSIVE).
+ *
+ * References [1] Fuchs/Kedem/Naylor §3 for BSP-tile invariant;
+ *   [5] de Berg §12.2 for half-open partition convention.
  */
 typedef struct {
-    int x, y;
-    int w, h;
+    int x;    /* top-left x, INCLUSIVE  */
+    int y;    /* top-left y, INCLUSIVE  */
+    int w;    /* width;  right edge = x+w EXCLUSIVE */
+    int h;    /* height; bottom edge = y+h EXCLUSIVE*/
 } Rect;
 
 /*
- * SplitAxis — which axis an internal node split along.
+ * SplitAxis — which axis an internal node's dividing line runs along.
  *
- *   SPLIT_VERTICAL   — a vertical line at x = split_pos divides the
- *                      region into front (left,  x < split_pos) and
- *                      back  (right, x >= split_pos).
+ * Intent
+ *   Tags an internal node with the orientation of its split. The
+ *   §5b subdivide() chooses the axis from the node's depth:
  *
- *   SPLIT_HORIZONTAL — a horizontal line at y = split_pos divides the
- *                      region into front (top,    y < split_pos) and
- *                      back  (bottom, y >= split_pos).
+ *       even depth → SPLIT_VERTICAL    (cut along x = split_pos)
+ *       odd  depth → SPLIT_HORIZONTAL  (cut along y = split_pos)
  *
- * The axis is chosen by depth: even depth → VERTICAL, odd → HORIZONTAL.
- * This keeps the tree balanced along both dimensions.
+ *   This depth-alternating pattern is the k-d tree axis cycling
+ *   (ref [2] Bentley 1975); it keeps the tree balanced in BOTH
+ *   spatial dimensions even if the input data is biased along one
+ *   axis. Without alternation, all points clustered in a thin
+ *   horizontal strip would force only-x cuts forever, giving an
+ *   unbalanced tree.
+ *
+ *   The enum is consumed by:
+ *     - the visualiser (paints the splitting line on the grid)
+ *     - tree_dump (prints "VERTICAL split at x=…" labels)
+ *     - bsp_query (no — query uses rect_overlaps_range, not the axis)
+ *
+ * Per-value semantics
+ *   SPLIT_VERTICAL   — vertical line at x = split_pos:
+ *                       front = LEFT  half (x < split_pos)
+ *                       back  = RIGHT half (x ≥ split_pos)
+ *   SPLIT_HORIZONTAL — horizontal line at y = split_pos:
+ *                       front = TOP    half (y < split_pos)
+ *                       back  = BOTTOM half (y ≥ split_pos)
+ *
+ * References [1] Fuchs/Kedem/Naylor for the BSP partition idea;
+ *   [2] Bentley 1975 for the alternating-axis k-d strategy.
  */
-typedef enum { SPLIT_VERTICAL, SPLIT_HORIZONTAL } SplitAxis;
+typedef enum {
+    SPLIT_VERTICAL,    /* dividing line is vertical:   x = split_pos */
+    SPLIT_HORIZONTAL,  /* dividing line is horizontal: y = split_pos */
+} SplitAxis;
 
 /*
  * BSPNode — one node in the BSP tree.
  *
- * A node is either a LEAF or an INTERNAL node:
+ * Intent
+ *   A node is either a LEAF or an INTERNAL node, distinguished by
+ *   whether front/back are non-NULL. The two states use DIFFERENT
+ *   subsets of the fields:
  *
- *   Leaf node     — front and back are both NULL.
- *                   Holds up to LEAF_CAPACITY points in data[].
+ *     Leaf node     — front == NULL, back == NULL.
+ *                     data[0..count-1] holds the points; count ≤
+ *                     LEAF_CAPACITY. split_pos + split_axis unused.
  *
- *   Internal node — front and back are non-NULL children.
- *                   data[] and count are unused (always 0).
- *                   Records the split axis and position.
+ *     Internal node — front, back both non-NULL.
+ *                     count = 0; data[] logically empty.
+ *                     split_axis + split_pos describe the cut.
  *
- *   front = left  half (VERTICAL)   or top    half (HORIZONTAL)
- *   back  = right half (VERTICAL)   or bottom half (HORIZONTAL)
+ *   front/back semantics (set in subdivide → vertical/horizontal_bisect):
+ *     SPLIT_VERTICAL   → front = LEFT half,  back = RIGHT  half
+ *     SPLIT_HORIZONTAL → front = TOP  half,  back = BOTTOM half
+ *
+ *   The CHILDREN TILE the PARENT exactly:
+ *     front.boundary ∪ back.boundary = node.boundary
+ *     front.boundary ∩ back.boundary = ∅
+ *   (This is the key invariant that makes route_into_children safe —
+ *   any point in the parent's region falls in exactly one child.)
+ *
+ * Why ONE struct for both states (instead of a tagged union)
+ *   The two states share `boundary` and `depth`, which dominate the
+ *   memory cost. The state-specific fields (data[] vs split_*) fit
+ *   together comfortably — a 5-point LEAF_CAPACITY × Point is about
+ *   60 bytes; the split scalars are 8 bytes. The wasted bytes per
+ *   internal node aren't worth the API complexity of a tagged union
+ *   or two separate types.
+ *
+ *   This is the SAME pattern as the quadtree in algorithms/quadtree.c
+ *   — leaf vs internal distinguished by a null-child predicate, not
+ *   by a discriminant.
+ *
+ * Field locality
+ *   ── Shared (used in both states) ──
+ *      boundary, depth
+ *
+ *   ── Leaf-only (count > 0 iff this is a leaf) ──
+ *      data[], count
+ *
+ *   ── Internal-only (set when front/back become non-NULL) ──
+ *      split_axis, split_pos, front, back
+ *
+ *   You can detect the state with EITHER predicate:
+ *     • front == NULL   (used by node_is_leaf — canonical)
+ *     • count > 0       (true only for non-empty leaves;
+ *                        EMPTY leaves and INTERNAL nodes both have
+ *                        count == 0, so this is NOT a leaf predicate.)
+ *
+ * References [1] Fuchs/Kedem/Naylor §3 — BSP tree node model;
+ *   [5] de Berg §12.2 — formal partition invariants.
  */
 typedef struct BSPNode BSPNode;
 struct BSPNode {
-    Rect       boundary;             /* region this node is responsible for   */
-    Point      data[LEAF_CAPACITY];  /* points stored here (leaf only)        */
-    int        count;                /* number of points currently stored     */
-    int        depth;                /* 0 = root; determines split axis       */
-    int        split_pos;            /* coordinate of the dividing line       */
-    SplitAxis  split_axis;           /* VERTICAL or HORIZONTAL (internal only)*/
-    BSPNode   *front;                /* left (V) or top (H);  NULL = leaf     */
-    BSPNode   *back;                 /* right (V) or bottom (H); NULL = leaf  */
+    /* ── Shared state (used by leaf and internal alike) ───────── */
+    Rect      boundary;             /* region this node is responsible for   */
+    int       depth;                /* 0 = root; determines split axis        */
+
+    /* ── Leaf-only state ──────────────────────────────────────── *
+     * Used while front == NULL. When the node is promoted to     *
+     * internal by subdivide(), count is reset to 0 and the       *
+     * points are redistributed to children.                      */
+    Point     data[LEAF_CAPACITY];  /* points stored at this leaf            */
+    int       count;                /* valid entries in data[]; 0 = empty    */
+
+    /* ── Internal-only state ──────────────────────────────────── *
+     * Set by subdivide() when this node is promoted. Front +    *
+     * back tile `boundary` exactly along (split_axis, split_pos).*/
+    SplitAxis split_axis;           /* orientation of the dividing line       */
+    int       split_pos;            /* coordinate of the dividing line        */
+    BSPNode  *front;                /* LEFT (V) or TOP    (H); NULL = leaf    */
+    BSPNode  *back;                 /* RIGHT(V) or BOTTOM (H); NULL = leaf    */
 };
 
 /* ── memory management ──────────────────────────────────────────── */
@@ -571,58 +741,76 @@ static bool rect_overlaps_range(Rect boundary,
 static bool bsp_insert(BSPNode *node, Point p);
 
 /*
- * subdivide — split a full leaf node into two children with one line.
+ * vertical_bisect — cut rect b in two halves along a VERTICAL line.
  *
- * The split axis alternates with depth:
- *   Even depth → VERTICAL   split: left/right halves at x = boundary.x + w/2
- *   Odd  depth → HORIZONTAL split: top/bottom halves at y = boundary.y + h/2
+ *   Splitting line:   x = b.x + b.w/2     (the returned `split_pos`)
  *
- * After subdivide(), 'node' becomes an internal node: count = 0,
- * front and back are both non-NULL.
+ *     before:                          after:
+ *     ┌───────────────────┐            ┌─────────┬─────────┐
+ *     │                   │            │  front  │   back  │
+ *     │         b         │     →      │  (LEFT) │  (RIGHT)│
+ *     │                   │            │         │         │
+ *     └───────────────────┘            └─────────┴─────────┘
  *
- *   Before:  [node: LEAF_CAPACITY pts]
+ *   The two halves TILE b exactly: front ∪ back = b, front ∩ back = ∅.
+ *   When b.w is odd, the back half is one pixel wider (b.w − w/2 vs
+ *   w/2) — the integer-floor convention keeps the partition exact.
  *
- *   After (VERTICAL):
- *     [node: internal, 0 pts, split_pos = x + w/2]
- *        /                     \
- *     [front: left half]    [back: right half]
- *     (pts redistributed)
+ *   Used by subdivide when the parent depth is EVEN (alternating
+ *   vertical/horizontal cuts give a k-d tree on x,y axes).
  */
-static void subdivide(BSPNode *node)
+static int vertical_bisect(Rect b, Rect *front, Rect *back)
 {
-    Rect b       = node->boundary;
-    int  next_d  = node->depth + 1;
+    int half_w = b.w / 2;
+    *front = (Rect){ b.x,             b.y, half_w,       b.h };
+    *back  = (Rect){ b.x + half_w,    b.y, b.w - half_w, b.h };
+    return b.x + half_w;                  /* x-coordinate of the cut */
+}
 
-    if (node->depth % 2 == 0) {
-        /* ── Vertical split: divide left / right ─────────────────── */
-        int half_w       = b.w / 2;
-        node->split_axis = SPLIT_VERTICAL;
-        node->split_pos  = b.x + half_w;
+/*
+ * horizontal_bisect — cut rect b in two halves along a HORIZONTAL line.
+ *
+ *   Splitting line:   y = b.y + b.h/2     (the returned `split_pos`)
+ *
+ *     before:                          after:
+ *     ┌───────────┐                    ┌───────────┐
+ *     │           │                    │   front   │ (TOP)
+ *     │     b     │             →      ├───────────┤
+ *     │           │                    │   back    │ (BOTTOM)
+ *     └───────────┘                    └───────────┘
+ *
+ *   Used by subdivide when the parent depth is ODD.
+ */
+static int horizontal_bisect(Rect b, Rect *front, Rect *back)
+{
+    int half_h = b.h / 2;
+    *front = (Rect){ b.x, b.y,          b.w, half_h       };
+    *back  = (Rect){ b.x, b.y + half_h, b.w, b.h - half_h };
+    return b.y + half_h;                  /* y-coordinate of the cut */
+}
 
-        Rect front_rect = { b.x,             b.y, half_w,      b.h };
-        Rect back_rect  = { b.x + half_w,    b.y, b.w - half_w, b.h };
-        node->front = node_new(front_rect, next_d);
-        node->back  = node_new(back_rect,  next_d);
-    } else {
-        /* ── Horizontal split: divide top / bottom ────────────────── */
-        int half_h       = b.h / 2;
-        node->split_axis = SPLIT_HORIZONTAL;
-        node->split_pos  = b.y + half_h;
-
-        Rect front_rect = { b.x, b.y,          b.w, half_h      };
-        Rect back_rect  = { b.x, b.y + half_h, b.w, b.h - half_h };
-        node->front = node_new(front_rect, next_d);
-        node->back  = node_new(back_rect,  next_d);
-    }
-
-    /*
-     * Redistribute this leaf's points into the two children.
-     * Snapshot them first because bsp_insert() modifies node->count.
-     */
-    int   old_count             = node->count;
+/*
+ * redistribute_points_into_children — move all points from a freshly
+ * split node into its two children via bsp_insert().
+ *
+ *   After bisection, the parent node is no longer a leaf: it owns
+ *   front + back children, and its own data[] is logically empty
+ *   (count = 0). The points that USED to live in data[] must be
+ *   re-routed into whichever child contains them.
+ *
+ *   Snapshot first: bsp_insert() will mutate node->count when it
+ *   recurses, so we copy data[] to a local buffer before zeroing the
+ *   count. Then we feed each point through bsp_insert(node->front);
+ *   if that rejects (point is on the other side of the splitting
+ *   line), bsp_insert(node->back) takes it. Exactly one accepts,
+ *   because front + back tile the parent exactly.
+ */
+static void redistribute_points_into_children(BSPNode *node)
+{
+    int   old_count = node->count;
     Point displaced[LEAF_CAPACITY];
     memcpy(displaced, node->data, (size_t)old_count * sizeof(Point));
-    node->count = 0;
+    node->count = 0;                      /* this node is now internal */
 
     for (int i = 0; i < old_count; i++) {
         if (!bsp_insert(node->front, displaced[i]))
@@ -631,66 +819,203 @@ static void subdivide(BSPNode *node)
 }
 
 /*
+ * subdivide — promote a full leaf into an internal node with two
+ * children and re-route its points.
+ *
+ *   Pseudocode:
+ *     1. Choose the cut axis from this node's depth:
+ *          even depth → vertical_bisect   (cut along an x = const line)
+ *          odd  depth → horizontal_bisect (cut along a y = const line)
+ *        Alternating x / y at successive depths is the k-d tree axis
+ *        cycling pattern; cycling gives balanced partitioning when the
+ *        point distribution is unknown.
+ *     2. Create child nodes for front + back halves.
+ *     3. redistribute_points_into_children — re-insert the leaf's
+ *        former points into whichever child now owns each point.
+ *
+ *   After this, node->front and node->back are non-NULL and node->
+ *   count is 0 — it is now strictly an INTERNAL node in the BSP tree.
+ *
+ *   Reference: Bentley (1975), "Multidimensional binary search trees
+ *   used for associative searching", CACM 18(9) — original k-d tree
+ *   paper that motivates the alternating-axis split.
+ */
+static void subdivide(BSPNode *node)
+{
+    Rect b      = node->boundary;
+    int  next_d = node->depth + 1;
+
+    /* (1) choose axis from depth + cut into two halves */
+    Rect front_rect, back_rect;
+    if (node->depth % 2 == 0) {
+        node->split_axis = SPLIT_VERTICAL;
+        node->split_pos  = vertical_bisect  (b, &front_rect, &back_rect);
+    } else {
+        node->split_axis = SPLIT_HORIZONTAL;
+        node->split_pos  = horizontal_bisect(b, &front_rect, &back_rect);
+    }
+
+    /* (2) instantiate children */
+    node->front = node_new(front_rect, next_d);
+    node->back  = node_new(back_rect,  next_d);
+
+    /* (3) re-route the leaf's old points into the children */
+    redistribute_points_into_children(node);
+}
+
+/*
+ * node_is_leaf — true if this node has no children.
+ *
+ *   In a BSP tree, "leaf" and "internal" are mutually exclusive:
+ *   a leaf has data[] but no children; an internal node has both
+ *   children but logically empty data[] (count = 0). The presence
+ *   of node->front is the canonical leaf/internal predicate.
+ */
+static inline bool node_is_leaf(const BSPNode *node)
+{
+    return node->front == NULL;
+}
+
+/* leaf_has_room — true if a leaf node can accept one more point. */
+static inline bool leaf_has_room(const BSPNode *node)
+{
+    return node->count < LEAF_CAPACITY;
+}
+
+/* store_in_leaf — append p to the node's data array (precondition: room). */
+static inline void store_in_leaf(BSPNode *node, Point p)
+{
+    node->data[node->count++] = p;
+}
+
+/*
+ * route_into_children — send p into whichever child owns its region.
+ *
+ *   front + back tile the parent boundary exactly, so EXACTLY ONE
+ *   child contains p — but we don't know which side of the splitting
+ *   line p falls on without recomputing it. Easiest: try front first;
+ *   if it rejects (because rect_contains_point returns false), try
+ *   back. One of the two MUST accept (assuming p was inside the
+ *   parent's boundary, which the caller has already verified).
+ */
+static inline bool route_into_children(BSPNode *node, Point p)
+{
+    if (bsp_insert(node->front, p)) return true;
+    return bsp_insert(node->back, p);
+}
+
+/*
  * bsp_insert — add point p into the subtree rooted at 'node'.
  *
- * Returns true if the point was accepted.
- * Returns false if it lies outside this node's boundary (used
- * internally during redistribution after subdivision).
+ *   Pseudocode:
+ *     1. if p OUTSIDE this node's boundary → reject (caller will
+ *        try the sibling subtree, which holds the other half).
+ *     2. if this is a LEAF with room → store_in_leaf and accept.
+ *     3. if this is a LEAF without room → subdivide (now internal),
+ *        then fall through.
+ *     4. route_into_children → recurse into front or back.
+ *
+ *   Step 3 is the key invariant: a leaf NEVER stays above LEAF_CAPACITY.
+ *   When it would overflow, the leaf is promoted to an internal node
+ *   before any insertion proceeds. This bounds the worst-case node
+ *   data[] size and keeps the average leaf occupancy near LEAF_CAPACITY/2.
+ *
+ *   Returns:
+ *     true  — point was accepted somewhere in this subtree.
+ *     false — point was outside this node's boundary (caller routes
+ *             to sibling). False should never propagate up to the
+ *             root for a point inside the world bounds.
  */
 bool bsp_insert(BSPNode *node, Point p)
 {
+    /* (1) boundary test — reject if outside */
     if (!rect_contains_point(node->boundary, p.x, p.y))
-        return false;   /* point is outside this node's region            */
+        return false;
 
-    if (!node->front) {
-        /* ── Leaf node ─────────────────────────────────────────── */
-        if (node->count < LEAF_CAPACITY) {
-            /* Room available: store the point here */
-            node->data[node->count++] = p;
-            return true;
-        }
-        /* Leaf is full: split into two children, then re-route */
-        subdivide(node);
-        /* node->front is now non-NULL; fall through to internal path */
+    /* (2) leaf with room — store and done */
+    if (node_is_leaf(node) && leaf_has_room(node)) {
+        store_in_leaf(node, p);
+        return true;
     }
 
-    /* ── Internal node ──────────────────────────────────────────── */
-    /* Try front first; if it rejects (point is on the other side), try back */
-    if (bsp_insert(node->front, p)) return true;
-    if (bsp_insert(node->back,  p)) return true;
+    /* (3) leaf without room — promote to internal, then fall through */
+    if (node_is_leaf(node))
+        subdivide(node);
 
-    return false;   /* should not happen if boundary covers the point    */
+    /* (4) internal — route into the child that owns p's region */
+    return route_into_children(node, p);
+}
+
+/*
+ * point_in_query_range — inclusive AABB containment test.
+ *
+ *   true iff (p.x, p.y) lies in [x1, x2] × [y1, y2] (closed interval).
+ *
+ *   This is the per-point filter inside the query — we already know
+ *   the LEAF's boundary overlaps the query range (otherwise the
+ *   subtree would have been pruned), but individual points within
+ *   that leaf may still be outside the search rectangle.
+ */
+static inline bool point_in_query_range(Point p,
+                                        int x1, int y1, int x2, int y2)
+{
+    return p.x >= x1 && p.x <= x2 && p.y >= y1 && p.y <= y2;
+}
+
+/*
+ * collect_points_at_node — emit this node's data[] points that fall
+ * within the query rectangle, stopping if results[] fills up.
+ *
+ *   Internal nodes have count = 0, so this loop is a no-op for them
+ *   — the cost is paid only at leaf nodes. The capacity guard inside
+ *   the loop lets the caller cap result count without needing a
+ *   separate post-filter pass.
+ */
+static inline void collect_points_at_node(const BSPNode *node,
+                                          int x1, int y1, int x2, int y2,
+                                          Point *results, int *count,
+                                          int capacity)
+{
+    for (int i = 0; i < node->count && *count < capacity; i++) {
+        if (point_in_query_range(node->data[i], x1, y1, x2, y2))
+            results[(*count)++] = node->data[i];
+    }
 }
 
 /*
  * bsp_query — find all points inside the inclusive rectangle
  *             [x1, x2] × [y1, y2] and append them to results[].
  *
- * The same AABB pruning used in the quadtree applies here:
- * if the search range does NOT overlap a node's boundary, the
- * entire subtree (both children) is skipped.
+ *   Pseudocode:
+ *     1. EARLY OUT if node is null or results[] is full.
+ *     2. AABB PRUNING: if this node's boundary doesn't overlap the
+ *        query range, the entire subtree can't contain a match —
+ *        skip both children.
+ *     3. collect_points_at_node  (no-op on internal nodes)
+ *     4. recurse into front, then back.
  *
- * Because the tree has only two children instead of four, fewer
- * subtrees are visited per level — the constant factor is smaller,
- * though the asymptotic complexity is the same O(log N + k).
+ *   AABB pruning is the algorithmic core. Without it the query would
+ *   visit every node — O(N). With it, expected complexity is
+ *   O(log N + k) where k is the number of points reported, the same
+ *   asymptotic guarantee as a quadtree. The CONSTANT FACTOR here is
+ *   smaller than a quadtree's because each node has only TWO children
+ *   instead of four, so fewer subtree pointers are dereferenced per
+ *   level of descent. Refs: Bentley 1975 §2 (k-d tree analysis).
  */
 void bsp_query(BSPNode *node,
                int x1, int y1, int x2, int y2,
                Point *results, int *count, int capacity)
 {
+    /* (1) early-out gates */
     if (!node || *count >= capacity) return;
 
-    /* ── Pruning step ────────────────────────────────────────────── */
+    /* (2) AABB pruning: skip entire subtree if no overlap */
     if (!rect_overlaps_range(node->boundary, x1, y1, x2, y2)) return;
 
-    /* ── Point check ─────────────────────────────────────────────── */
-    for (int i = 0; i < node->count && *count < capacity; i++) {
-        int px = node->data[i].x, py = node->data[i].y;
-        if (px >= x1 && px <= x2 && py >= y1 && py <= y2)
-            results[(*count)++] = node->data[i];
-    }
+    /* (3) emit this node's matching points (no-op on internals) */
+    collect_points_at_node(node, x1, y1, x2, y2, results, count, capacity);
 
-    /* ── Recurse into both children ─────────────────────────────── */
+    /* (4) recurse into both children */
     bsp_query(node->front, x1, y1, x2, y2, results, count, capacity);
     bsp_query(node->back,  x1, y1, x2, y2, results, count, capacity);
 }

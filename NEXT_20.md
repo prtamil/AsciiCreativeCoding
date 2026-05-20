@@ -6,9 +6,10 @@ raster/
 signal/
 particle_systems/
 physics/
-animation/
 fluid/
 grids/
+algorithms/
+animation/
  
  completed rest start from scratch
 

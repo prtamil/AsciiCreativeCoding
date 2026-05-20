@@ -36,7 +36,8 @@
  *   gcc -std=c11 -O2 -Wall -Wextra algorithms/marching_squares.c \
  *       -o marching_squares -lncurses -lm
  *
- * Sections: §1 config  §2 clock  §3 field  §4 marching  §5 draw  §6 app
+ * Sections: §1 config  §2 clock  §3 types  §4 field  §5 marching
+ *           §6 draw    §7 app
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -415,6 +416,21 @@
  * making circular blobs appear circular on screen despite the non-square cells. */
 #define ASPECT        0.5f
 
+/* FieldGrid size cap — bounds the per-frame scratch sample buffer.
+ * Covers any reasonable terminal up to 256 cols × 128 rows.  The field
+ * is sampled at (cols+1) × (rows+1) corners, so the actual storage is
+ * (FIELD_W_MAX+1) × (FIELD_H_MAX+1) floats ≈ 128 KB.                */
+#define FIELD_W_MAX   255
+#define FIELD_H_MAX   127
+
+/* HUD layout — rows reserved at top/bottom of the screen for status bars.
+ * Top bar holds DATA (parameter readout); bottom bar holds ACTIONS (key
+ * hints).  field_sample_grid subtracts these from sc->rows; march_cells
+ * offsets every drawn cell by HUD_TOP_ROWS so the field sits between
+ * the two bars. */
+#define HUD_TOP_ROWS  1
+#define HUD_BOT_ROWS  1
+
 /* ===================================================================== */
 /* §2  clock                                                              */
 /* ===================================================================== */
@@ -433,264 +449,731 @@ static void clock_sleep_ns(long long ns)
 }
 
 /* ===================================================================== */
-/* §3  scalar field                                                       */
+/* §3  data types                                                         */
 /* ===================================================================== */
 
-typedef struct { float x, y, vx, vy, str; } Blob;
+/*
+ * Blob — one moving metaball source.
+ *
+ * Intent
+ *   The N_BLOBS sources are the INPUT to the scalar field.  Each blob
+ *   contributes a Wyvill-kernel bump centred at (x, y); their sum at
+ *   every grid corner is the field f(nx, ny) the marching squares
+ *   algorithm then iso-extracts.
+ *
+ * Coordinate convention
+ *   x, y are NORMALISED to [0, 1] — independent of terminal size.
+ *   field_eval_at converts back to screen-aspect-corrected pixel
+ *   distance by multiplying dy by ASPECT (=0.5), so circular blobs
+ *   read circular on the ~2:1 terminal cell.
+ *
+ * Why normalised coords (not pixel)
+ *   The field is sampled at corners (nx, ny) = (gx/W, gy/H); using
+ *   normalised blob positions means resizing the terminal just
+ *   re-buckets the same field — blob motion looks identical at any
+ *   window size.
+ *
+ * Members
+ *   x, y       position in normalised [0, 1]²
+ *   vx, vy     per-frame velocity (also normalised; ~0.005)
+ *   strength   currently unused — the Wyvill kernel is hard-coded
+ *              to peak at 1; left as a hook for per-blob weighting
+ */
+typedef struct {
+    float x, y;        /* position in normalised [0, 1] coords  */
+    float vx, vy;      /* per-frame velocity (normalised units) */
+    float strength;    /* reserved for per-blob weight (unused) */
+} Blob;
 
-static Blob g_blobs[N_BLOBS];
+/*
+ * FieldGrid — scratch buffer of scalar-field samples at the corner lattice.
+ *
+ * Intent
+ *   Cache of f(nx, ny) at every grid corner, computed ONCE per frame
+ *   by field_sample_grid.  The marching loop then reads sample[gy][gx]
+ *   in tight inner loops; in multi-level mode, ALL N_LEVELS contours
+ *   read from the same sample[] without re-evaluating the field.
+ *   Saves ~N_LEVELS× field evaluations per frame.
+ *
+ * Storage layout
+ *   sample[row][col] — row-major.  Used region is sample[0..rows][0..cols];
+ *   rows/cols track the per-frame window (clamped to FIELD_*_MAX).
+ *
+ * Why a SEPARATE struct (not embedded in Scene)
+ *   FieldGrid is per-frame SCRATCH STORAGE — its contents have no
+ *   meaning between frames.  Keeping it out of Scene clarifies the
+ *   data-flow: main owns one FieldGrid in BSS, scene_draw fills it
+ *   then immediately reads from it within a single call.  No
+ *   cross-frame state lives here.
+ *
+ * Why a 128 KB static, not a malloc
+ *   The maximum size is bounded by FIELD_*_MAX, so a single BSS
+ *   allocation is exactly right — zero allocator overhead, no
+ *   per-frame churn.  128 KB is too big for the stack but trivial
+ *   for BSS on any modern system.
+ *
+ * Members
+ *   cols     number of CELL columns this frame (corners are cols+1 wide)
+ *   rows     number of CELL rows    this frame (corners are rows+1 tall)
+ *   sample   per-corner f values; sample[0..rows][0..cols] valid
+ *
+ * Invariants
+ *   0 ≤ cols ≤ FIELD_W_MAX   and   0 ≤ rows ≤ FIELD_H_MAX
+ *   After field_sample_grid returns, sample[gy][gx] for gy ∈ [0,rows]
+ *   and gx ∈ [0,cols] holds f(gx/cols, gy/rows).  Other entries are
+ *   stale and must not be read.
+ */
+typedef struct {
+    int   cols;
+    int   rows;
+    float sample[FIELD_H_MAX + 1][FIELD_W_MAX + 1];
+} FieldGrid;
 
-static void blobs_init(int rows, int cols)
+/*
+ * Scene — owns all PERSISTENT simulation + UI state for one run.
+ *
+ * Intent
+ *   One instance lives in main() and is passed by pointer to every
+ *   simulation, draw, and input function.  No file-scope mutables
+ *   for the simulation; signal-handler flags (g_quit, g_resize) in §7
+ *   stay as globals because POSIX signal handlers can't be passed a
+ *   pointer.
+ *
+ *   Scratch buffers (FieldGrid above) live OUTSIDE Scene — they
+ *   are not persistent state, just per-frame intermediate.
+ *
+ * What lives here vs in FieldGrid
+ *   Scene    = data that survives between frames (blob positions,
+ *              threshold, paused flag, theme choice)
+ *   FieldGrid = data that is fully recomputed every frame
+ *
+ * Members
+ *   blobs[N_BLOBS]   moving metaball sources (the simulation state)
+ *   rows, cols       terminal extent in cells (refreshed each frame
+ *                    from ncurses' LINES/COLS so resize is picked up)
+ *   threshold        current iso-value being extracted from the field
+ *   paused           true → freeze blob motion (toggle: SPACE)
+ *   multi            true → draw N_LEVELS contours at once (toggle: 'm')
+ *   theme            colour theme index ∈ [0, N_THEMES) (cycle: 't')
+ */
+typedef struct {
+    Blob   blobs[N_BLOBS];
+    int    rows, cols;
+    float  threshold;
+    bool   paused;
+    bool   multi;
+    int    theme;
+} Scene;
+
+/* ===================================================================== */
+/* §4  scalar field — blob motion + field sampling                        */
+/* ===================================================================== */
+
+/*
+ * blobs_init — scatter N_BLOBS sources at random positions with
+ * random velocities.  Called at startup and on 'r' (reset).
+ *
+ *   Positions:  uniform in [0.2, 0.8]² (margin keeps blobs visible
+ *               on first frame, away from the bounce walls)
+ *   Velocities: uniform magnitude in [0.003, 0.007], random sign per axis
+ */
+static void blobs_init(Scene *sc)
 {
     for (int i = 0; i < N_BLOBS; i++) {
-        g_blobs[i].x   = 0.2f + 0.6f * ((float)rand() / RAND_MAX);
-        g_blobs[i].y   = 0.2f + 0.6f * ((float)rand() / RAND_MAX);
-        g_blobs[i].vx  = 0.003f + 0.004f * ((float)rand() / RAND_MAX);
-        g_blobs[i].vy  = 0.003f + 0.004f * ((float)rand() / RAND_MAX);
-        g_blobs[i].str = 1.0f;   /* strength unused — kernel is normalised */
-        if (rand() & 1) g_blobs[i].vx = -g_blobs[i].vx;
-        if (rand() & 1) g_blobs[i].vy = -g_blobs[i].vy;
-    }
-    (void)rows; (void)cols;
-}
-
-static void blobs_step(void)
-{
-    for (int i = 0; i < N_BLOBS; i++) {
-        g_blobs[i].x += g_blobs[i].vx;
-        g_blobs[i].y += g_blobs[i].vy;
-        if (g_blobs[i].x < 0.05f || g_blobs[i].x > 0.95f) g_blobs[i].vx = -g_blobs[i].vx;
-        if (g_blobs[i].y < 0.05f || g_blobs[i].y > 0.95f) g_blobs[i].vy = -g_blobs[i].vy;
+        sc->blobs[i].x        = 0.2f + 0.6f * ((float)rand() / RAND_MAX);
+        sc->blobs[i].y        = 0.2f + 0.6f * ((float)rand() / RAND_MAX);
+        sc->blobs[i].vx       = 0.003f + 0.004f * ((float)rand() / RAND_MAX);
+        sc->blobs[i].vy       = 0.003f + 0.004f * ((float)rand() / RAND_MAX);
+        sc->blobs[i].strength = 1.0f;
+        if (rand() & 1) sc->blobs[i].vx = -sc->blobs[i].vx;
+        if (rand() & 1) sc->blobs[i].vy = -sc->blobs[i].vy;
     }
 }
 
 /*
- * Evaluate metaball field at normalised coordinates (nx, ny) ∈ [0,1]²
+ * integrate_blob_euler — advance position by velocity for one tick.
  *
- * Uses the Wyvill compact-support kernel:
- *   W(r) = (1 − r²/R²)³   for r < R,  else 0
+ *   Explicit Euler integration of a point mass:
+ *       x_{t+1} := x_t + v · Δt           (Δt = 1 frame, implicit)
  *
- * This kernel is exactly 0 outside radius R, peaks at 1 in the centre,
- * and has continuous first derivative at r=R (no discontinuity).
- * The field sums to [0, N_BLOBS], so a threshold of ~0.2 draws a contour
- * well outside each blob while ~0.8 draws only their dense cores.
+ *   The kinematic primitive — every motion-of-mass-points solver
+ *   reduces to this assignment.  No acceleration term: the blobs
+ *   travel at constant velocity between wall reflections.
  */
-static float field_eval(float nx, float ny)
+static inline void integrate_blob_euler(Blob *b)
+{
+    b->x += b->vx;
+    b->y += b->vy;
+}
+
+/*
+ * bounce_blob_off_walls — elastic reflection against the unit box
+ * [0.05, 0.95]² in normalised coords.
+ *
+ *   When a position component crosses a wall, the corresponding
+ *   velocity component flips sign:
+ *       if x ∉ [0.05, 0.95]:  vx ← −vx     (perfectly elastic)
+ *       if y ∉ [0.05, 0.95]:  vy ← −vy
+ *
+ *   Simplest possible boundary condition for a particle in a box —
+ *   no restitution coefficient, no friction, no position correction.
+ *   Sufficient because the per-tick step (~0.005) is small relative
+ *   to the box, so the position never overshoots the wall by much.
+ */
+static inline void bounce_blob_off_walls(Blob *b)
+{
+    if (b->x < 0.05f || b->x > 0.95f) b->vx = -b->vx;
+    if (b->y < 0.05f || b->y > 0.95f) b->vy = -b->vy;
+}
+
+/*
+ * blobs_step — advance the entire blob system by one frame.
+ *
+ *   Pseudocode:
+ *     for each blob b:
+ *       integrate_blob_euler(b)        ─ kinematic step (x += v)
+ *       bounce_blob_off_walls(b)       ─ elastic reflection at the box
+ */
+static void blobs_step(Scene *sc)
+{
+    for (int i = 0; i < N_BLOBS; i++) {
+        integrate_blob_euler(&sc->blobs[i]);
+        bounce_blob_off_walls(&sc->blobs[i]);
+    }
+}
+
+/*
+ * wyvill_kernel — compact-support potential kernel.
+ *
+ *   W(r²) = (1 − r²/R²)³    for r² < R²,    else 0
+ *
+ *   Why this kernel:
+ *     - EXACTLY zero outside R: clean cutoff, no faint tails on the
+ *       contour, no need for "ignore values below ε" hacks.
+ *     - Peaks at 1 when r = 0: bounded field sum ∈ [0, N_BLOBS],
+ *       so threshold values fall into an easy [0, 1]-ish range.
+ *     - C¹ at r = R: smooth contour at the kernel edge (no kink).
+ *
+ *   Takes r² (already squared) so the caller can skip a sqrt — the
+ *   kernel never needs r itself, only r² compared against R².
+ *
+ *   Reference: Wyvill, McPheeters & Wyvill (1986), "Data structure
+ *   for soft objects", The Visual Computer 2(4), pp. 227-234.
+ */
+static inline float wyvill_kernel(float r2, float R2)
+{
+    if (r2 >= R2) return 0.0f;
+    float t = 1.0f - r2 / R2;
+    return t * t * t;
+}
+
+/*
+ * blob_contribution_at — ONE blob's contribution to the field at (nx, ny).
+ *
+ *   Pseudocode:
+ *     dx   := nx − b.x
+ *     dy   := (ny − b.y) · ASPECT          ← aspect-corrected so circles
+ *                                            look circular on a 2:1 cell
+ *     r²   := dx² + dy²                    ← squared distance, no sqrt
+ *     return wyvill_kernel(r², BLOB_R²)
+ *
+ *   This is the only place where SCREEN ASPECT leaks into the field
+ *   math.  Blobs live in normalised [0,1]² where pixel cells are 2:1
+ *   tall; multiplying dy by ASPECT (=0.5) compresses the field
+ *   vertically so a Euclidean "circle" of constant r in the (dx, dy/2)
+ *   space looks circular on screen.
+ */
+static inline float blob_contribution_at(const Blob *b, float nx, float ny)
+{
+    float dx = nx - b->x;
+    float dy = (ny - b->y) * ASPECT;
+    float r2 = dx*dx + dy*dy;
+    return wyvill_kernel(r2, BLOB_R * BLOB_R);
+}
+
+/*
+ * field_eval_at — superpose all blob contributions at (nx, ny).
+ *
+ *   f(nx, ny) = Σ_i  blob_contribution_at(blob_i, nx, ny)
+ *
+ *   The scalar field IS a sum of per-source contributions; this
+ *   function is one for-loop expressing that sum.  PURE — depends
+ *   only on its arguments.
+ *
+ *   Called once per grid corner per frame (~ W·H times); the inner
+ *   helpers are marked inline so the loop body collapses to roughly
+ *   the same assembly the original open-coded version produced.
+ */
+static float field_eval_at(const Blob *blobs, int n, float nx, float ny)
 {
     float v = 0.0f;
-    float R2 = BLOB_R * BLOB_R;
-    for (int i = 0; i < N_BLOBS; i++) {
-        float dx = nx - g_blobs[i].x;
-        float dy = (ny - g_blobs[i].y) * ASPECT;
-        float r2 = dx*dx + dy*dy;
-        if (r2 >= R2) continue;
-        float t = 1.0f - r2 / R2;
-        v += t * t * t;
-    }
+    for (int i = 0; i < n; i++)
+        v += blob_contribution_at(&blobs[i], nx, ny);
     return v;
 }
 
+/*
+ * init_field_extent — decide the per-frame field dimensions.
+ *
+ *   Pseudocode:
+ *     cols := sc->cols                                ← terminal width
+ *     rows := sc->rows − HUD_TOP_ROWS − HUD_BOT_ROWS  ← reserve HUD bars
+ *     clamp cols to FIELD_W_MAX                       ← scratch buf cap
+ *     clamp rows to FIELD_H_MAX
+ *     if too small to march: zero the extent and bail
+ *     else: write back into field->{cols, rows}
+ *
+ *   Two clamps in one place: HUD reservation is the ALGORITHM side
+ *   (we need space for the status bars); FIELD_*_MAX is the STORAGE
+ *   side (the scratch sample buffer is fixed-size).  Returning
+ *   zero-extent makes downstream march_cells trivially skip.
+ */
+static void init_field_extent(const Scene *sc, FieldGrid *field)
+{
+    int cols = sc->cols;
+    int rows = sc->rows - HUD_TOP_ROWS - HUD_BOT_ROWS;
+    if (cols > FIELD_W_MAX) cols = FIELD_W_MAX;
+    if (rows > FIELD_H_MAX) rows = FIELD_H_MAX;
+    if (cols < 2 || rows < 2) { field->cols = 0; field->rows = 0; return; }
+    field->cols = cols;
+    field->rows = rows;
+}
+
+/*
+ * sample_all_corners — walk the (rows+1) × (cols+1) corner lattice,
+ * storing f at each corner into field->sample[][].
+ *
+ *   Pseudocode:
+ *     for gy in 0..rows:
+ *       ny := gy / rows                        ← normalise to [0, 1]
+ *       for gx in 0..cols:
+ *         nx := gx / cols
+ *         field->sample[gy][gx] := field_eval_at(blobs, nx, ny)
+ *
+ *   Normalised coords mean the grid spans the full unit box no matter
+ *   the terminal size — resizing the window just re-buckets the same
+ *   field.  Blob motion looks identical at any resolution.
+ *
+ *   This is the EXPENSIVE step of the frame — O(W·H·N_BLOBS) kernel
+ *   evaluations.  Everything downstream (march_cells, draw_cell_*)
+ *   reads field->sample[][] in O(1) per access.
+ */
+static void sample_all_corners(const Scene *sc, FieldGrid *field)
+{
+    for (int gy = 0; gy <= field->rows; gy++) {
+        float ny = (float)gy / (float)field->rows;
+        for (int gx = 0; gx <= field->cols; gx++) {
+            float nx = (float)gx / (float)field->cols;
+            field->sample[gy][gx] = field_eval_at(sc->blobs, N_BLOBS, nx, ny);
+        }
+    }
+}
+
+/*
+ * field_sample_grid — orchestrator: pick dimensions, then sample.
+ *
+ *   Pseudocode:
+ *     1. init_field_extent     ─ HUD-aware + storage-cap clamp
+ *     2. early-exit if extent is zero (window too small)
+ *     3. sample_all_corners    ─ the expensive O(W·H·N) lattice pass
+ */
+static void field_sample_grid(const Scene *sc, FieldGrid *field)
+{
+    init_field_extent(sc, field);
+    if (field->cols == 0 || field->rows == 0) return;
+    sample_all_corners(sc, field);
+}
+
 /* ===================================================================== */
-/* §4  marching squares                                                   */
+/* §5  marching squares — 4-bit case classification + glyph lookup table  */
 /* ===================================================================== */
 
 /*
- * Edge table: for each 4-bit case, which of the 4 edges are crossed?
- * Edges: 0=top  1=right  2=bottom  3=left
- * Each entry is a bitmask of crossed edges.
- * Corner bit assignment: bit3=TL bit2=TR bit1=BR bit0=BL
+ * Corner-state encoding (the 4-bit cell case index)
+ * ─────────────────────────────────────────────────
+ *
+ *   TL ─────── TR        bit 3 = (TL > threshold) ? 1 : 0
+ *    │          │        bit 2 = (TR > threshold) ? 1 : 0
+ *    │          │        bit 1 = (BR > threshold) ? 1 : 0
+ *   BL ─────── BR        bit 0 = (BL > threshold) ? 1 : 0
+ *
+ *   "Inside" means corner_value > threshold.  The 4 bits pack into a
+ *   single index ∈ [0, 15] — naming one of the 16 algorithm cases.
+ *
+ *   Trivial cases:  0 (0000, all outside)  and  15 (1111, all inside)
+ *                   — no contour passes through the cell.
+ *   Saddle cases:   5 (0101)  and  10 (1010) — diagonal in/out admits
+ *                   TWO topologies; we pick one consistently below.
+ *
+ *   This encoding is the 2-D reduction of Lorensen & Cline's 8-bit
+ *   cube-corner encoding (Marching Cubes, SIGGRAPH 1987).
  */
-static const uint8_t edge_table[16] __attribute__((unused)) = {
-    0x0,  /* 0000 — all outside        */
-    0x9,  /* 0001 — BL: left+bottom    */
-    0x3,  /* 0010 — BR: bottom+right   */
-    0xa,  /* 0011 — BL+BR: left+right  */
-    0x6,  /* 0100 — TR: right+top      */
-    0xf,  /* 0101 — BL+TR: all 4 (saddle — rare) */
-    0x5,  /* 0110 — BR+TR: top+bottom  */
-    0xc,  /* 0111 — all but TL: top+left */
-    0xc,  /* 1000 — TL: top+left       */
-    0x5,  /* 1001 — TL+BL: top+bottom  */
-    0xf,  /* 1010 — TL+BR: all 4 (saddle) */
-    0x6,  /* 1011 — all but TR: right+top → corrected */
-    0xa,  /* 1100 — TL+TR: left+right  */
-    0x3,  /* 1101 — all but BR: bottom+right */
-    0x9,  /* 1110 — all but BL: left+bottom */
-    0x0,  /* 1111 — all inside         */
+
+/*
+ * case_glyph[16] — the algorithm's OUTPUT TABLE.
+ *
+ *   For each cell case index, the single ASCII glyph that best suggests
+ *   the contour crossing through the cell.  This file draws ONE GLYPH
+ *   PER CROSSED CELL rather than interpolating line endpoints — the
+ *   glyph SHAPE encodes the edge-pair direction implicitly:
+ *
+ *     '-'   cuts left ↔ right          (horizontal stripe)
+ *     '|'   cuts top  ↔ bottom         (vertical stripe)
+ *     '/'   cuts top  ↔ left   OR  bottom ↔ right
+ *     '\'   cuts top  ↔ right  OR  bottom ↔ left
+ *     'X'   saddle (two crossings — single glyph for legibility)
+ *     ' '   no crossing (cases 0, 15)
+ *
+ *   This is the "algorithm IS a table" formulation — every cell of
+ *   the marching loop reduces to ONE indexed read into case_glyph[].
+ *   A higher-fidelity renderer would instead store an EDGE-PAIR list
+ *   per case and interpolate the crossing points along those edges
+ *   (see raster/marching_cubes.c for the line-segment form).
+ */
+static const char case_glyph[16] = {
+    ' ',    /* 0000 — all outside              — no contour              */
+    '/',    /* 0001  BL inside                  — left + bottom edges    */
+    '\\',   /* 0010  BR inside                  — bottom + right edges   */
+    '-',    /* 0011  BL + BR inside             — left + right edges     */
+    '\\',   /* 0100  TR inside                  — right + top edges      */
+    'X',    /* 0101  BL + TR (saddle)           — two crossings          */
+    '|',    /* 0110  TR + BR inside             — top + bottom edges     */
+    '/',    /* 0111  all but TL                 — top + left edges       */
+    '/',    /* 1000  TL inside                  — top + left edges       */
+    '|',    /* 1001  TL + BL inside             — top + bottom edges     */
+    'X',    /* 1010  TL + BR (saddle)           — two crossings          */
+    '\\',   /* 1011  all but TR                 — right + top edges      */
+    '-',    /* 1100  TL + TR inside             — left + right edges     */
+    '\\',   /* 1101  all but BR                 — bottom + right edges   */
+    '/',    /* 1110  all but BL                 — left + bottom edges    */
+    ' ',    /* 1111 — all inside                — no contour             */
 };
 
 /*
- * Character table: pick an ASCII char that visually suggests the crossing.
- * Two edges are always crossed (except saddle cases). We pick the char
- * based on which pair of edges.
+ * CellCorners — the four scalar samples that classify ONE 2×2 cell.
  *
- * edge pairs → char:
- *   top+bottom    → |
- *   left+right    → -
- *   top+right     → /  (or ╮)
- *   top+left      → \  (or ╭)
- *   bottom+right  → \
- *   bottom+left   → /
- *   saddle        → X
+ *   The atomic input to the marching-squares case lookup: four field
+ *   values at the cell's corners, in a fixed naming order that the
+ *   case-index encoding (cell_case_index) depends on.
+ *
+ *     TL ─────── TR        bit 3 of the case index → TL inside?
+ *      │          │        bit 2 of the case index → TR inside?
+ *      │          │        bit 1 of the case index → BR inside?
+ *     BL ─────── BR        bit 0 of the case index → BL inside?
+ *
+ *   Naming this group as a struct makes the per-cell data flow
+ *   explicit:  read_cell_corners → cell_case_index → case_glyph[idx].
+ *   Three named steps instead of one anonymous 4-float bundle.
  */
-static char case_char(int idx)
+typedef struct { float tl, tr, br, bl; } CellCorners;
+
+/*
+ * read_cell_corners — extract the 2×2 sample window at cell (gx, gy).
+ *
+ *   Pseudocode:
+ *     return ( sample[gy  ][gx  ],   ← TL
+ *              sample[gy  ][gx+1],   ← TR
+ *              sample[gy+1][gx+1],   ← BR
+ *              sample[gy+1][gx  ] )  ← BL
+ *
+ *   Pure pointer-shuffle on the cached field grid.  The whole purpose
+ *   is to LABEL the four reads with their geometric role (TL/TR/BR/BL)
+ *   so the downstream classifier doesn't have to repeat the unpacking.
+ */
+static inline CellCorners read_cell_corners(const FieldGrid *field,
+                                            int gx, int gy)
 {
-    static const char tbl[16] = {
-        ' ',  /* 0000 */
-        '/',  /* 0001 BL: left+bottom  → / */
-        '\\', /* 0010 BR: bottom+right → \ */
-        '-',  /* 0011 left+right       → - */
-        '\\', /* 0100 TR: right+top    → \ */
-        'X',  /* 0101 saddle            → X */
-        '|',  /* 0110 top+bottom       → | */
-        '/',  /* 0111 top+left         → / */
-        '/',  /* 1000 TL: top+left     → / */
-        '|',  /* 1001 top+bottom       → | */
-        'X',  /* 1010 saddle           → X */
-        '\\', /* 1011 right+top        → \ */
-        '-',  /* 1100 left+right       → - */
-        '\\', /* 1101 bottom+right     → \ */
-        '/',  /* 1110 left+bottom      → / */
-        ' ',  /* 1111 */
+    return (CellCorners){
+        .tl = field->sample[gy  ][gx  ],
+        .tr = field->sample[gy  ][gx+1],
+        .br = field->sample[gy+1][gx+1],
+        .bl = field->sample[gy+1][gx  ],
     };
-    return tbl[idx & 0xf];
+}
+
+/*
+ * cell_case_index — pack the 4 corner samples into the 4-bit case index.
+ *
+ *   Pseudocode:
+ *     return ((tl > t) << 3) | ((tr > t) << 2) | ((br > t) << 1) | (bl > t)
+ *
+ *   The whole marching-squares algorithm flows through this one line:
+ *   four comparisons, one bitwise OR, one table lookup.  Result ∈ [0, 15]
+ *   indexes case_glyph[] (or any other 16-entry table you want to drive
+ *   from the same classification — e.g. an edge-pair list for an
+ *   interpolated-line renderer).
+ */
+static inline int cell_case_index(CellCorners c, float thresh)
+{
+    return ((c.tl > thresh) ? 8 : 0)
+         | ((c.tr > thresh) ? 4 : 0)
+         | ((c.br > thresh) ? 2 : 0)
+         | ((c.bl > thresh) ? 1 : 0);
 }
 
 /* ===================================================================== */
-/* §5  drawing                                                            */
+/* §6  drawing — colour init + per-frame render pipeline                  */
 /* ===================================================================== */
 
-/* colour pairs: CP_BASE + level*2 + 0/1 for outside/inside fill */
-#define CP_LABEL   1
-#define CP_CONTOUR 2
-#define CP_INSIDE  3
-#define CP_OUTSIDE 4
+/*
+ * Color-pair allocation
+ * ─────────────────────
+ *   CP_HUD / CP_HINT      fixed HUD pairs — bright yellow / bright cyan
+ *                         per the project "HUD Standard" in CLAUDE.md.
+ *                         Both are used with A_BOLD so the bars remain
+ *                         legible against any field cell that intrudes.
+ *   CP_CONTOUR / _INSIDE  primary theme colours for the contour line and
+ *                         the "inside" fill in single-level mode.
+ *   CP_OUTSIDE            unused background-grey pair, kept for symmetry.
+ *   CP_LEVEL_BASE .. +N   the multi-mode contour colours, derived from
+ *                         the active theme by hue shift.
+ *   ALL pairs are initialised once per theme change in init_theme_colors —
+ *   never inside the per-frame draw loop.
+ *
+ *   (The previous implementation re-init'd the multi-level pairs from
+ *   inside the cell loop, doing thousands of redundant init_pair() calls
+ *   per frame; the precompute here removes that hot-path overhead.)
+ */
+enum {
+    CP_HUD        = 1,     /* top data bar       — bright yellow + A_BOLD */
+    CP_HINT       = 2,     /* bottom action bar  — bright cyan   + A_BOLD */
+    CP_CONTOUR    = 3,
+    CP_INSIDE     = 4,
+    CP_OUTSIDE    = 5,
+    CP_LEVEL_BASE = 10,    /* CP_LEVEL_BASE + i  for i ∈ [0, N_LEVELS)    */
+};
 
+/*
+ * Theme tables — one row per theme; columns are colour-cube indices
+ *   theme_contour[t]   primary contour line colour for theme t
+ *   theme_inside [t]   "inside" fill / accent colour for theme t
+ *   Multi-mode hue shift: theme_contour[t] + lv * 6 for level lv.
+ */
 static const short theme_contour[N_THEMES] = { 51, 196, 46, 201 };
 static const short theme_inside [N_THEMES] = { 87, 202, 82, 171 };
 
-static void init_colors(int theme)
+/*
+ * init_theme_colors — set every colour pair for the chosen theme in
+ * ONE call.  Includes the two HUD pairs (fixed across themes) and the
+ * N_LEVELS multi-mode pairs.  Called at startup and on every 't'
+ * (theme cycle); never inside the cell loop.
+ */
+static void init_theme_colors(int theme)
 {
-    init_pair(CP_LABEL,   231,                  16);
+    init_pair(CP_HUD,     226,                  16);  /* bright yellow */
+    init_pair(CP_HINT,     51,                  16);  /* bright cyan   */
     init_pair(CP_CONTOUR, theme_contour[theme], 16);
-    init_pair(CP_INSIDE,  theme_inside[theme],  16);
+    init_pair(CP_INSIDE,  theme_inside [theme], 16);
     init_pair(CP_OUTSIDE, 244,                  16);
+    for (int lv = 0; lv < N_LEVELS; lv++) {
+        short col = (short)(theme_contour[theme] + lv * 6);
+        init_pair((short)(CP_LEVEL_BASE + lv), col, 16);
+    }
 }
 
-static volatile sig_atomic_t g_quit   = 0;
-static volatile sig_atomic_t g_resize = 0;
-static void on_signal(int s) { (void)s; g_quit = 1; }
-static void on_resize(int s) { (void)s; g_resize = 1; }
-
-/* ===================================================================== */
-/* §6  app                                                                */
-/* ===================================================================== */
-
-typedef struct {
-    float thresh;
-    bool  paused;
-    bool  multi;
-    int   theme;
-} App;
-
-static void app_draw(const App *a)
+/*
+ * draw_cell_single — paint one cell against a SINGLE iso-threshold.
+ *
+ *   Pseudocode:
+ *     idx := cell_case_index(tl, tr, br, bl, threshold)
+ *     if idx == 0:   blank (no contour, all outside)
+ *     if idx == 15:  paint '.' in INSIDE colour (all inside fill)
+ *     else:          paint case_glyph[idx] in CONTOUR colour, bold
+ *
+ *   This is the body of the marching-squares loop in single-level mode.
+ */
+static void draw_cell_single(int gx, int gy, CellCorners c, float threshold)
 {
-    int rows = LINES - 2;   /* leave 2 rows for HUD */
-    int cols = COLS;
-    if (rows < 2 || cols < 2) return;
+    int idx = cell_case_index(c, threshold);
+    if (idx == 0)  return;                       /* fully outside — blank */
+    if (idx == 15) {                             /* fully inside — fill   */
+        attron(COLOR_PAIR(CP_INSIDE));
+        mvaddch(gy, gx, '.');
+        attroff(COLOR_PAIR(CP_INSIDE));
+    } else {                                     /* contour crossing      */
+        attron(COLOR_PAIR(CP_CONTOUR) | A_BOLD);
+        mvaddch(gy, gx, case_glyph[idx]);
+        attroff(COLOR_PAIR(CP_CONTOUR) | A_BOLD);
+    }
+}
 
-    /* pre-allocate field values at cell corners */
-    static float fld[256][128];
-    int fw = cols < 255 ? cols : 255;
-    int fh = rows < 127 ? rows : 127;
-
-    /* sample field at each corner */
-    for (int gy = 0; gy <= fh; gy++) {
-        float ny = (float)gy / (float)fh;
-        for (int gx = 0; gx <= fw; gx++) {
-            float nx = (float)gx / (float)fw;
-            fld[gy][gx] = field_eval(nx, ny);
+/*
+ * draw_cell_multi — paint one cell against N_LEVELS evenly-spaced
+ * iso-thresholds, each rendered in its own colour.
+ *
+ *   Pseudocode:
+ *     for lv in 0..N_LEVELS−1:
+ *       t := base_threshold × (0.3 + lv × 0.15)
+ *       idx := cell_case_index(tl, tr, br, bl, t)
+ *       if idx ∉ {0, 15}:
+ *         paint case_glyph[idx] in CP_LEVEL_BASE + lv
+ *         return       ← first hit wins; deeper levels masked
+ *     if no level produced a contour AND centre sample is inside:
+ *       paint '`' in CP_INSIDE   (faint interior fill)
+ *
+ *   First-hit-wins lets the OUTERMOST contour (lowest threshold) take
+ *   priority — same visual effect as back-to-front draw without
+ *   overdrawing.
+ */
+static void draw_cell_multi(int gx, int gy, CellCorners c, float base_threshold)
+{
+    for (int lv = 0; lv < N_LEVELS; lv++) {
+        float t = base_threshold * (0.3f + lv * 0.15f);
+        int idx = cell_case_index(c, t);
+        if (idx != 0 && idx != 15) {
+            short cp = (short)(CP_LEVEL_BASE + lv);
+            attron(COLOR_PAIR(cp));
+            mvaddch(gy, gx, case_glyph[idx]);
+            attroff(COLOR_PAIR(cp));
+            return;
         }
     }
+    /* No level produced a contour here — faint fill if it's inside the
+       OUTERMOST contour.  Use the TL corner as a representative sample;
+       all four corners straddle the threshold the same way when the
+       cell didn't trigger any level. */
+    if (c.tl > base_threshold) {
+        attron(COLOR_PAIR(CP_INSIDE));
+        mvaddch(gy, gx, '`');
+        attroff(COLOR_PAIR(CP_INSIDE));
+    }
+}
 
-    /* march each cell */
-    for (int gy = 0; gy < fh; gy++) {
-        for (int gx = 0; gx < fw; gx++) {
-            float tl = fld[gy  ][gx  ];
-            float tr = fld[gy  ][gx+1];
-            float br = fld[gy+1][gx+1];
-            float bl = fld[gy+1][gx  ];
-
-            if (a->multi) {
-                /* draw multiple contour levels */
-                bool drew = false;
-                for (int lv = 0; lv < N_LEVELS && !drew; lv++) {
-                    /* evenly spaced levels from thresh*0.3 up to thresh*0.95 */
-                    float t = a->thresh * (0.3f + lv * 0.15f);
-                    int idx = ((tl > t) ? 8 : 0)
-                            | ((tr > t) ? 4 : 0)
-                            | ((br > t) ? 2 : 0)
-                            | ((bl > t) ? 1 : 0);
-                    if (idx != 0 && idx != 15) {
-                        char c = case_char(idx);
-                        /* hue shifts per level */
-                        short col = (short)(theme_contour[a->theme] + lv * 6);
-                        init_pair(10 + (short)lv, col, 16);
-                        attron(COLOR_PAIR(10 + lv));
-                        mvaddch(gy, gx, c);
-                        attroff(COLOR_PAIR(10 + lv));
-                        drew = true;
-                    }
-                }
-                if (!drew) {
-                    /* fill inside regions faintly */
-                    if (fld[gy][gx] > a->thresh) {
-                        attron(COLOR_PAIR(CP_INSIDE));
-                        mvaddch(gy, gx, '`');
-                        attroff(COLOR_PAIR(CP_INSIDE));
-                    }
-                }
-            } else {
-                float t = a->thresh;
-                int idx = ((tl > t) ? 8 : 0)
-                        | ((tr > t) ? 4 : 0)
-                        | ((br > t) ? 2 : 0)
-                        | ((bl > t) ? 1 : 0);
-
-                if (idx == 0) {
-                    /* all outside — blank */
-                } else if (idx == 15) {
-                    /* all inside — fill char */
-                    attron(COLOR_PAIR(CP_INSIDE));
-                    mvaddch(gy, gx, '.');
-                    attroff(COLOR_PAIR(CP_INSIDE));
-                } else {
-                    /* contour crossing */
-                    char c = case_char(idx);
-                    attron(COLOR_PAIR(CP_CONTOUR) | A_BOLD);
-                    mvaddch(gy, gx, c);
-                    attroff(COLOR_PAIR(CP_CONTOUR) | A_BOLD);
-                }
-            }
+/*
+ * march_cells — visit every cell, dispatch to draw_cell_{single,multi}.
+ *
+ *   The "marching" is just two nested for-loops over the field grid;
+ *   the per-cell work is delegated.  Single-level vs multi-level mode
+ *   is selected once per cell (and could be hoisted out of the loop if
+ *   the branch ever shows up in a profile — currently negligible).
+ */
+static void march_cells(const Scene *sc, const FieldGrid *field)
+{
+    for (int gy = 0; gy < field->rows; gy++) {
+        for (int gx = 0; gx < field->cols; gx++) {
+            CellCorners c   = read_cell_corners(field, gx, gy);
+            int  screen_row = gy + HUD_TOP_ROWS;       /* slip below top HUD */
+            if (sc->multi)
+                draw_cell_multi (gx, screen_row, c, sc->threshold);
+            else
+                draw_cell_single(gx, screen_row, c, sc->threshold);
         }
     }
+}
 
-    /* HUD */
-    attron(COLOR_PAIR(CP_LABEL));
-    mvprintw(rows,     0, "Marching Squares  threshold=%.2f  [+/-] adjust  [m] multi  [t] theme  [r] random  [q] quit",
-             a->thresh);
-    mvprintw(rows + 1, 0, "16-case lookup: each 2x2 cell → 4-bit index → contour edge character");
-    attroff(COLOR_PAIR(CP_LABEL));
+/*
+ * draw_hud_top — row 0: DATA readout for the current frame.
+ *
+ *   Layout (left-aligned):
+ *     " Marching Squares  thresh=0.20  mode:single  theme:0/4  running "
+ *
+ *   Bright yellow + A_BOLD per the project HUD standard (CLAUDE.md
+ *   "HUD Standard").  Shows every value the user can change via the
+ *   bottom action bar, so they can confirm key presses had effect.
+ *   The paused state is shown HERE (was a separate top-right badge in
+ *   the previous version).
+ */
+static void draw_hud_top(const Scene *sc)
+{
+    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+    mvprintw(0, 0,
+             " Marching Squares  thresh=%.2f  mode:%-6s  theme:%d/%d  %s ",
+             sc->threshold,
+             sc->multi ? "multi" : "single",
+             sc->theme, N_THEMES,
+             sc->paused ? "PAUSED" : "running");
+    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+}
 
-    if (a->paused) {
-        attron(A_REVERSE | A_BOLD);
-        mvprintw(0, COLS - 8, " PAUSED ");
-        attroff(A_REVERSE | A_BOLD);
-    }
+/*
+ * draw_hud_bottom — last row: ACTION key hints.
+ *
+ *   Bright cyan + A_BOLD.  Lists every key bound in handle_input; each
+ *   key here changes a value visible in the top HUD.  The "spc" mnemonic
+ *   for space matches the project convention (CLAUDE.md HUD Standard).
+ */
+static void draw_hud_bottom(const Scene *sc)
+{
+    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+    mvprintw(sc->rows - 1, 0,
+             " q:quit  spc:pause  +/-:thresh  m:multi  t:theme  r:random ");
+    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
+}
 
+/*
+ * scene_draw — render one frame.
+ *
+ *   Pseudocode (the entire frame pipeline):
+ *     1. field_sample_grid     ─ sample f at every grid corner (one pass)
+ *     2. march_cells           ─ classify + paint each 2x2 cell (offset
+ *                                by HUD_TOP_ROWS so it lands BELOW the
+ *                                top HUD bar)
+ *     3. draw_hud_top          ─ row 0: data readout (yellow)
+ *     4. draw_hud_bottom       ─ last row: action hints (cyan)
+ *     5. refresh               ─ flush ncurses output
+ *
+ *   Steps 1-2 are the marching algorithm proper; 3-4 are UI chrome;
+ *   5 is the I/O boundary.
+ */
+static void scene_draw(const Scene *sc, FieldGrid *field)
+{
+    field_sample_grid(sc, field);
+    march_cells(sc, field);
+    draw_hud_top(sc);
+    draw_hud_bottom(sc);
     refresh();
 }
 
+/* ===================================================================== */
+/* §7  app — signal handlers, input dispatch, main loop                   */
+/* ===================================================================== */
+
+static volatile sig_atomic_t g_quit   = 0;
+static volatile sig_atomic_t g_resize = 0;
+static void on_signal(int s) { (void)s; g_quit   = 1; }
+static void on_resize(int s) { (void)s; g_resize = 1; }
+
+/*
+ * handle_input — dispatch one keypress against the scene.
+ *
+ *   Pure delegation: every key maps to a small mutation of sc plus
+ *   (for theme cycling) one re-initialisation of the colour pairs.
+ *   Quit signals go through g_quit so SIGINT/SIGTERM take the same
+ *   exit path as the 'q' key.
+ */
+static void handle_input(Scene *sc, int ch)
+{
+    switch (ch) {
+        case 'q': case 27: g_quit = 1; break;
+        case ' ': sc->paused = !sc->paused; break;
+        case '+': case '=':
+            sc->threshold += THRESH_STEP;
+            if (sc->threshold > THRESH_MAX) sc->threshold = THRESH_MAX;
+            break;
+        case '-':
+            sc->threshold -= THRESH_STEP;
+            if (sc->threshold < THRESH_MIN) sc->threshold = THRESH_MIN;
+            break;
+        case 'm': sc->multi = !sc->multi; break;
+        case 't':
+            sc->theme = (sc->theme + 1) % N_THEMES;
+            init_theme_colors(sc->theme);
+            break;
+        case 'r': blobs_init(sc); break;
+    }
+}
+
+/*
+ * main — own the Scene + FieldGrid scratch, drive the fixed-rate loop.
+ *
+ *   The render loop runs at RENDER_FPS (~20 fps).  When woken early, we
+ *   sleep until the next frame deadline rather than busy-poll keypresses.
+ *
+ *   Why a STATIC FieldGrid in main (rather than embedded in Scene)
+ *     - It's per-frame scratch (~128 KB), not persistent state.
+ *     - BSS allocation: zero alloc cost, never touches the stack.
+ *     - main is the canonical owner; the loop passes a pointer.
+ */
 int main(void)
 {
     srand((unsigned)time(NULL));
@@ -705,40 +1188,35 @@ int main(void)
     start_color();
     use_default_colors();
 
-    App a = { .thresh = THRESH_DEF, .paused = false, .multi = false, .theme = 0 };
-    init_colors(a.theme);
-    blobs_init(LINES, COLS);
+    Scene scene = {
+        .threshold = THRESH_DEF,
+        .paused    = false,
+        .multi     = false,
+        .theme     = 0,
+        .rows      = LINES,
+        .cols      = COLS,
+    };
+    static FieldGrid field;          /* BSS — ~128 KB per-frame scratch */
+
+    init_theme_colors(scene.theme);
+    blobs_init(&scene);
 
     long long next = clock_ns();
 
     while (!g_quit) {
         if (g_resize) { g_resize = 0; endwin(); refresh(); }
 
+        scene.rows = LINES;
+        scene.cols = COLS;
+
         int ch = getch();
-        switch (ch) {
-            case 'q': case 27: g_quit = 1; break;
-            case ' ': a.paused = !a.paused; break;
-            case '+': case '=':
-                a.thresh += THRESH_STEP;
-                if (a.thresh > THRESH_MAX) a.thresh = THRESH_MAX;
-                break;
-            case '-':
-                a.thresh -= THRESH_STEP;
-                if (a.thresh < THRESH_MIN) a.thresh = THRESH_MIN;
-                break;
-            case 'm': a.multi = !a.multi; break;
-            case 't':
-                a.theme = (a.theme + 1) % N_THEMES;
-                init_colors(a.theme);
-                break;
-            case 'r': blobs_init(LINES, COLS); break;
-        }
+        handle_input(&scene, ch);
 
         long long now = clock_ns();
         if (now >= next) {
-            if (!a.paused) blobs_step();
+            if (!scene.paused) blobs_step(&scene);
             erase();
-            app_draw(&a);
+            scene_draw(&scene, &field);
             next += RENDER_NS;
         } else {
             clock_sleep_ns(next - now);

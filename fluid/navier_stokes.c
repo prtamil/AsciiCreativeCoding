@@ -52,24 +52,36 @@
  *   §2   clock            — monotonic ns timer + sleep
  *   §3   rng              — small wrapper for the dye-drop key
  *   §4   themes           — bright dye palettes (blue / green / red)
- *   §5   colors           — pair init + dye_pair_id helper
- *   §6   grid_state       — fields, scratch buffers, all simulation state
+ *   §5   colors           — dye_pair_id helper + colors_init split into
+ *                            apply_dye_palettes (register_one_dye_channel)
+ *                            + apply_chrome_palette
+ *   §6   grid_state       — Fluid + Emitter + SimControls + DyeRenderer
+ *                            sub-structs; Scene root; file-scope g_scene
  *   §7   boundary_apply   — fill the 1-cell ghost halo
  *   §8   gauss_seidel     — generic linear-system solver (16 sweeps)
  *   §9   diffuse          — implicit diffusion via §8
  *   §10  advect           — semi-Lagrangian back-trace + bilinear lerp
  *   §11  project          — pressure Poisson + gradient subtraction
- *   §12  fluid_step       — one full physics tick (4 vel + 2 dye phases)
+ *   §12  fluid_step       — one full physics tick (3 named half-steps:
+ *                            step_velocity_diffuse_and_project /
+ *                            _advect_and_project /
+ *                            step_dye_diffuse_and_advect)
  *   §13  sources          — point-source injection helper
  *   §14  emitters         — counter-rotating auto-emitter pair
+ *                            (reads g_scene.emitter.swirl_phase)
  *   §15  fluid_reset      — wipe all fields to zero
  *   §16  dye_normaliser   — EMA-smoothed renormaliser (T9 anti-flicker)
+ *                            (reads/writes g_scene.render.dye_max_smoothed)
  *   §17  glyph_picker     — density → glyph + shade
  *   §18  grid_to_terminal — coordinate map for rendering
- *   §19  render           — paint the dye field
+ *   §19  render           — paint the dye field (uses g_scene.render.active_channel)
  *   §20  hud              — top status + bottom hint
  *   §21  screen           — ncurses init / cleanup / present
- *   §22  app              — main loop + signals + input
+ *   §22  app              — FpsCounter + App (signals + screen + fps);
+ *                            named action helpers (toggle_paused,
+ *                            adjust_viscosity, set_dye_channel,
+ *                            push_velocity_at_centre, drop_random_dye_blob);
+ *                            main loop (numbered phases)
  *
  * Keys:
  *   q / Q / ESC      quit
@@ -107,27 +119,27 @@
  *
  * Variable-naming convention
  * ──────────────────────────
- *   g_scene.velocity_x, g_scene.velocity_y                u, v — current velocity
- *   g_scene.velocity_x_prev, g_scene.velocity_y_prev      scratch buffers
+ *   g_scene.fluid.velocity_x, g_scene.fluid.velocity_y                u, v — current velocity
+ *   g_scene.fluid.velocity_x_prev, g_scene.fluid.velocity_y_prev      scratch buffers
  *
  *   pressure_correction                   Φ from the Poisson solve
- *                                          (lives in g_scene.velocity_x_prev
+ *                                          (lives in g_scene.fluid.velocity_x_prev
  *                                           during project_step)
  *   divergence_field                      ∇·u, RHS of Poisson
- *                                          (lives in g_scene.velocity_y_prev)
+ *                                          (lives in g_scene.fluid.velocity_y_prev)
  *
- *   g_scene.dye_density, g_scene.dye_density_prev         ρ (passive scalar) + scratch
+ *   g_scene.fluid.dye_density, g_scene.fluid.dye_density_prev         ρ (passive scalar) + scratch
  *
  *   cell_index(i, j)                       1-D offset (macro)
  *   GRID_SIDE_INNER                        physics interior side (= N)
  *   GRID_SIDE_TOTAL                        N + 2 (interior + ghost halo)
  *
- *   g_scene.active_dye_channel                     0 = blue, 1 = green, 2 = red
- *   g_scene.viscosity_kinematic                    ν (the Navier-Stokes ν)
+ *   g_scene.render.active_channel                     0 = blue, 1 = green, 2 = red
+ *   g_scene.fluid.viscosity_kinematic                    ν (the Navier-Stokes ν)
  *   diffusion_dye                          κ for the passive scalar
- *   g_scene.simulation_paused                      run/pause toggle
- *   g_scene.emitter_swirl_phase                    rotation phase ∈ ℝ
- *   g_scene.dye_max_smoothed                       EMA-tracked renormaliser
+ *   g_scene.sim.paused                      run/pause toggle
+ *   g_scene.emitter.swirl_phase                    rotation phase ∈ ℝ
+ *   g_scene.render.dye_max_smoothed                       EMA-tracked renormaliser
  *
  * Background you need
  * ───────────────────
@@ -332,10 +344,10 @@
  *     scalar (mirror):         ghost = +interior  (zero-gradient)
  *
  *   DYE VISUALISATION (T9):
- *     normalise:  d_norm[i,j] = g_scene.dye_density[i,j] / g_scene.dye_max_smoothed
+ *     normalise:  d_norm[i,j] = g_scene.fluid.dye_density[i,j] / g_scene.render.dye_max_smoothed
  *     glyph:      ramp = " .,+#" indexed by which threshold band
  *     colour:     palette[active_channel][shade_index]
- *     EMA:        g_scene.dye_max_smoothed = 0.95·old + 0.05·frame_max
+ *     EMA:        g_scene.render.dye_max_smoothed = 0.95·old + 0.05·frame_max
  *                  prevents whole-field shade flicker as emitters pulse
  *
  * EDGE CASES TO WATCH
@@ -709,7 +721,7 @@
  * In real research codes you'd track multiple scalars (heat,
  * salinity, chemical species, smoke).  We track ONE field with
  * THREE COLOUR CHANNELS so the user can see it as blue / green /
- * red — a single bit in the g_scene.active_dye_channel variable.
+ * red — a single bit in the g_scene.render.active_channel variable.
  *
  * T8  WHY "STABLE FLUIDS" — UNCONDITIONAL STABILITY
  * ─────────────────────────────────────────────────
@@ -767,9 +779,9 @@
  *
  * NAÏVE APPROACH:  per-frame max:
  *
- *     frame_max = max(g_scene.dye_density)
+ *     frame_max = max(g_scene.fluid.dye_density)
  *     for each cell:
- *       d_norm = g_scene.dye_density[cell] / frame_max
+ *       d_norm = g_scene.fluid.dye_density[cell] / frame_max
  *       glyph  = ramp[band(d_norm)]
  *
  * FLICKER PROBLEM:  emitter pulses cause frame_max to swing 5-10×
@@ -784,7 +796,7 @@
  * max.  The renormaliser changes SLOWLY, so individual cells'
  * normalised values are stable frame-to-frame:
  *
- *     g_scene.dye_max_smoothed = α · g_scene.dye_max_smoothed_old + (1-α) · frame_max
+ *     g_scene.render.dye_max_smoothed = α · g_scene.render.dye_max_smoothed_old + (1-α) · frame_max
  *
  * with α ≈ 0.95.  The smoothed max FOLLOWS the true max with a
  * lag of ~20 frames.  Pulses get smeared out; sustained changes
@@ -990,6 +1002,31 @@ static int rand_inner_cell(void) { return 1 + rand() % GRID_SIDE_INNER; }
  * Reference [9] Raymond's NCURSES HOWTO §6 — init_pair semantics
  *   that turn these palette arrays into live colour pairs.
  */
+/*
+ * Members
+ *   colour_256[]   DYE_SHADE_COUNT xterm-256 indices, dim → bright.
+ *                  Used when COLORS ≥ 256.  Shade index 0 is the dimmest
+ *                  cell ('.'); the last index is the brightest ('#').
+ *   colour_8[]     Same length, but ANSI-8 fallback indices for
+ *                  terminals without the 256-colour cube.  The gradient
+ *                  collapses (multiple shade buckets map to the same
+ *                  ANSI colour) but stays monotonically brighter.
+ *   name           HUD label ("BLUE", "RED", "GREEN").  Cycled by the
+ *                  1 / 2 / 3 keys, surfaced in the HUD status line.
+ *
+ * Invariants
+ *   All colour_256[i] ∈ [30, 255] per CLAUDE.md "Theme Palette
+ *   Brightness" — cube 16–23 and gray 232–239 render as black on the
+ *   default background and are forbidden.
+ *   colour_256[i] ≤ colour_256[i+1] in perceived brightness so the
+ *   density-to-shade mapping is monotone.
+ *   name != NULL.
+ *
+ * References
+ *   [9] Raymond's NCURSES-HOWTO §6 — init_pair semantics that turn
+ *       these palette arrays into live colour pairs.
+ *   CLAUDE.md §"Theme Palette Brightness" for the cube-floor rule.
+ */
 typedef struct {
     short       colour_256[DYE_SHADE_COUNT];  /* preferred 256-cube indices */
     short       colour_8  [DYE_SHADE_COUNT];  /* 8-colour fallback          */
@@ -1024,27 +1061,50 @@ static int dye_pair_id(int channel, int shade) {
   return PAIR_DYE_FIRST + channel * DYE_SHADE_COUNT + shade;
 }
 
-static void colors_init(void) {
-  start_color();
-  use_default_colors();
-  terminal_has_256_colours = (COLORS >= 256);
+/* Canonical bright xterm-256 indices for the project-standard HUD pairs
+ * (CLAUDE.md §"HUD Standard"). */
+enum {
+    HUD_YELLOW_256 = 226,
+    HUD_CYAN_256   = 51,
+};
 
-  for (int ch = 0; ch < DYE_CHANNEL_COUNT; ch++) {
-    const DyePalette *pal = &dye_palette_table[ch];
+/* register_one_dye_channel — install DYE_SHADE_COUNT pairs for one
+ * channel (blue / red / green), picking 256-cube or ANSI-8 fg per
+ * the terminal's capability. */
+static inline void register_one_dye_channel(int channel,
+                                             const DyePalette *pal,
+                                             bool have_256_colors) {
     for (int sh = 0; sh < DYE_SHADE_COUNT; sh++) {
-      short fg =
-          terminal_has_256_colours ? pal->colour_256[sh] : pal->colour_8[sh];
-      init_pair((short)dye_pair_id(ch, sh), fg, -1);
+        short fg = have_256_colors ? pal->colour_256[sh] : pal->colour_8[sh];
+        init_pair((short)dye_pair_id(channel, sh), fg, -1);
     }
-  }
+}
 
-  if (terminal_has_256_colours) {
-    init_pair(PAIR_HUD, 226, -1); /* bright yellow */
-    init_pair(PAIR_HINT, 51, -1); /* bright cyan   */
-  } else {
-    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
-    init_pair(PAIR_HINT, COLOR_CYAN, -1);
-  }
+/* apply_dye_palettes — register all 3 × DYE_SHADE_COUNT density pairs. */
+static inline void apply_dye_palettes(bool have_256_colors) {
+    for (int ch = 0; ch < DYE_CHANNEL_COUNT; ch++)
+        register_one_dye_channel(ch, &dye_palette_table[ch], have_256_colors);
+}
+
+/* apply_chrome_palette — theme-INDEPENDENT HUD pairs (bright yellow
+ * status + bright cyan hint, per CLAUDE.md §"HUD Standard"). */
+static inline void apply_chrome_palette(bool have_256_colors) {
+    if (have_256_colors) {
+        init_pair(PAIR_HUD,  HUD_YELLOW_256, -1);
+        init_pair(PAIR_HINT, HUD_CYAN_256,   -1);
+    } else {
+        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
+    }
+}
+
+static void colors_init(void) {
+    start_color();
+    use_default_colors();
+    terminal_has_256_colours = (COLORS >= 256);
+
+    apply_dye_palettes(terminal_has_256_colours);
+    apply_chrome_palette(terminal_has_256_colours);
 }
 
 /* ===================================================================== */
@@ -1080,10 +1140,10 @@ static void colors_init(void) {
  *   subsystem touches each one:
  *     - advect / diffuse / project passes read it    → simulation
  *     - paint_field / hud_paint_* / dye normalisation→ rendering
- *     - g_scene.simulation_paused gates the tick + HUD tag   → control state
+ *     - g_scene.sim.paused gates the tick + HUD tag   → control state
  *
  *   Mis-classifying a field — e.g. accidentally letting a render
- *   helper write to g_scene.velocity_x — would couple visuals to physics and
+ *   helper write to g_scene.fluid.velocity_x — would couple visuals to physics and
  *   break reproducibility.  The "engine-toggle invariant" version of
  *   this warning is in the other fluid demos' Scene docs.
  *
@@ -1096,56 +1156,261 @@ static void colors_init(void) {
  *   floats in BSS, no malloc anywhere.
  *
  * Why these specific fields and no others
- *   - g_scene.velocity_x / g_scene.velocity_y          u, v fields — the CORE state.
- *   - g_scene.velocity_x_prev / g_scene.velocity_y_prev scratch; role-swapped each step
+ *   - g_scene.fluid.velocity_x / g_scene.fluid.velocity_y          u, v fields — the CORE state.
+ *   - g_scene.fluid.velocity_x_prev / g_scene.fluid.velocity_y_prev scratch; role-swapped each step
  *                                       (also used as pressure /
  *                                       divergence in project_step).
- *   - g_scene.dye_density / g_scene.dye_density_prev   ρ field + its scratch.
- *   - g_scene.viscosity_kinematic              ν; user-adjustable via +/-.
- *   - g_scene.emitter_swirl_phase              advances each tick to spin the
+ *   - g_scene.fluid.dye_density / g_scene.fluid.dye_density_prev   ρ field + its scratch.
+ *   - g_scene.fluid.viscosity_kinematic              ν; user-adjustable via +/-.
+ *   - g_scene.emitter.swirl_phase              advances each tick to spin the
  *                                       emitter pattern.
- *   - g_scene.simulation_paused                gate for the full step pipeline.
- *   - g_scene.active_dye_channel               pure render — which channel
+ *   - g_scene.sim.paused                gate for the full step pipeline.
+ *   - g_scene.render.active_channel               pure render — which channel
  *                                       palette colours the dye field
  *                                       (BLUE/RED/GREEN).  Must NOT
  *                                       touch any sim state.
- *   - g_scene.dye_max_smoothed                 EMA of max dye density used to
+ *   - g_scene.render.dye_max_smoothed                 EMA of max dye density used to
  *                                       normalise the colour ramp;
  *                                       pure visualisation.
  *
  * Things that DO NOT live here
- *   - The 3 dye palettes / glyph ramp        → file-scope constants
- *   - Render-frame timing / FPS              → locals in main()
- *   - Signal flags (SIGINT, SIGWINCH)        → file-scope volatile
+ *   - The 3 dye palettes / glyph ramp     → file-scope constants in §4
+ *   - Render-frame timing / FPS counter   → §22 App.fps (FpsCounter struct)
+ *   - Signal flags (SIGINT, SIGWINCH)     → §22 App.quit / .need_resize
+ *   - Terminal extent (cols/rows)         → §22 App.screen (Screen struct)
  *
  * Reference [9] Raymond NCURSES HOWTO on the scene-paint pipeline
  *   that the render fields below feed into.
  */
+/*
+ * Fluid — the six grid fields + the viscosity coefficient that drive
+ * the Stam [1] solver.  This is the AUTHORITATIVE SIMULATION STATE.
+ *
+ * Intent
+ *   advect / diffuse / project all read and write these fields.  The
+ *   _prev arrays serve double duty: scratch for the next sub-step AND
+ *   the source-of-truth between sub-steps (Stam's ping-pong pattern —
+ *   each sub-pass reads from one buffer and writes into the other,
+ *   so the previous tick's output is the next tick's input).
+ *
+ * Why six arrays (and not three pairs)
+ *   Velocity has two components; dye is one scalar.  Each needs its
+ *   own scratch — 2 × 2 + 1 × 2 = 6.  The naming makes the role
+ *   explicit: `*_prev` is always the scratch / previous buffer the
+ *   solver reads from when populating the matching live array.
+ *
+ * Why double-duty for the velocity_*_prev arrays
+ *   During the PROJECT pass, velocity_x_prev becomes the PRESSURE
+ *   field and velocity_y_prev becomes the DIVERGENCE field.  Naming
+ *   them by purpose ("pressure", "divergence") would be clearer per
+ *   pass but break the abstraction "this is scratch for velocity_x".
+ *   Stam [1] §4 uses the same dual-role naming.
+ *
+ * Members
+ *   velocity_x          u-component of velocity at each cell (cells / step).
+ *                       The grid is column-major flattened; access via
+ *                       cell_index(i, j) where (i, j) are 1-indexed
+ *                       interior coords and 0 / N+1 are the ghost halo.
+ *   velocity_y          v-component.  Same layout as velocity_x.
+ *   velocity_x_prev     Scratch for the diffuse + advect sub-passes;
+ *                       reinterpreted as PRESSURE during project.
+ *   velocity_y_prev     Scratch for diffuse + advect; reinterpreted
+ *                       as DIVERGENCE during project (§11 sets it to
+ *                       ∇·v then solves ∇²p = ∇·v).
+ *   dye_density         ρ — the visualisable scalar field that the
+ *                       renderer paints (cells with ρ above
+ *                       DYE_VISIBLE_FLOOR become a glyph).
+ *   dye_density_prev    Scratch for the dye_density advect pass.
+ *   viscosity_kinematic ν — kinematic viscosity (T3 tutorial).  Larger
+ *                       ν → smoother motion.  User-tunable with + / −
+ *                       keys; clamped to [VISCOSITY_MIN, VISCOSITY_MAX].
+ *
+ * Invariants
+ *   All six fields include a 1-cell ghost halo at indices 0 and
+ *   GRID_SIDE-1 along each axis; boundary_apply refills them after
+ *   every sub-pass that mutates the field.
+ *   viscosity_kinematic > 0 (clamped by app_handle_key).
+ *   dye_density[idx] ≥ 0 after every step (semi-Lagrangian advect
+ *   preserves non-negativity by construction; project doesn't touch
+ *   the dye field).
+ *
+ * Memory footprint
+ *   6 × GRID_TOTAL_CELLS × sizeof(float) — sits in BSS via the parent
+ *   Scene's file-scope instance.  No malloc.  At GRID_SIDE_INNER = N
+ *   that's 6 · (N+2)² · 4 bytes; typical N = 100 → ~250 KB.
+ *
+ * References
+ *   [1] Stam, J. (1999), "Stable Fluids", SIGGRAPH '99 — the
+ *       field layout (velocity + scratch + dye + scratch) used here.
+ *   [2] Stam, J. (2003), "Real-Time Fluid Dynamics for Games", GDC —
+ *       cleaner pedagogical exposition of the same algorithm.
+ */
 typedef struct {
-    /* ── Simulation state (read by advect / diffuse / project) ───── */
     float velocity_x       [GRID_TOTAL_CELLS];  /* u                  */
     float velocity_y       [GRID_TOTAL_CELLS];  /* v                  */
     float velocity_x_prev  [GRID_TOTAL_CELLS];  /* u scratch / press  */
     float velocity_y_prev  [GRID_TOTAL_CELLS];  /* v scratch / diverg */
     float dye_density      [GRID_TOTAL_CELLS];  /* ρ                  */
     float dye_density_prev [GRID_TOTAL_CELLS];  /* ρ scratch          */
+    float viscosity_kinematic;                  /* ν, kinematic visc  */
+} Fluid;
 
-    /* ── Simulation tuning (user-adjustable) ─────────────────────── */
-    float viscosity_kinematic;        /* ν, viscosity                 */
-    float emitter_swirl_phase;        /* spins the inflow pattern     */
+/*
+ * Emitter — state that drives the inflow pattern.
+ *
+ * Intent
+ *   The auto-emitter (§14 emitters_inject) injects dye + velocity at
+ *   two counter-rotating sources every tick.  The two sources spin
+ *   in opposite directions, parameterised by ONE angular accumulator
+ *   so they stay phase-locked.  Currently just one float, but the
+ *   named type leaves room for future emitter modes (point sources,
+ *   curl noise, mouse drag, etc.) without churning Scene.
+ *
+ * Members
+ *   swirl_phase   Accumulator in RADIANS; advanced by emitters_inject
+ *                 each tick to rotate the inflow direction.  No wrap
+ *                 needed — cos/sin are 2π-periodic so the value can
+ *                 grow unboundedly without losing precision over the
+ *                 typical session length.
+ *
+ * Invariants
+ *   No range constraint; cos/sin handle any real value.
+ *
+ * References
+ *   None directly — the counter-rotating swirl is a project-specific
+ *   visual choice.  The underlying "inject velocity + dye each tick"
+ *   pattern is Stam [1] §5 (the "interactive sources" section).
+ */
+typedef struct {
+    float swirl_phase;
+} Emitter;
 
-    /* ── Control state ──────────────────────────────────────────── */
-    bool  simulation_paused;          /* gate for step pipeline       */
+/*
+ * SimControls — user-facing toggles that gate the physics pipeline.
+ *
+ * Intent
+ *   The input handler writes these; main reads them to skip
+ *   emitters_inject + fluid_step on paused frames.  Bundled into a
+ *   named struct for symmetry with the rest of the project — every
+ *   demo's Scene has a SimControls sub-struct now, so a reader who
+ *   knows one Scene knows them all.
+ *
+ * Members
+ *   paused   true → fluid_step + emitters_inject skipped; HUD shows
+ *            "PAUSED".  Toggled by SPACE / 'p' key.  Rendering
+ *            continues so the user can study the frozen field.
+ *
+ * Invariants
+ *   None — pure bool.
+ */
+typedef struct {
+    bool paused;
+} SimControls;
 
-    /* ── Pure render state (must not touch sim fields) ──────────── */
-    int   active_dye_channel;         /* BLUE / RED / GREEN palette   */
-    float dye_max_smoothed;           /* EMA for ramp normalisation   */
+/*
+ * DyeRenderer — PURE RENDER STATE; must NOT touch sim fields.
+ *
+ * Intent
+ *   The renderer needs two pieces of state that the SIMULATION must
+ *   ignore: which colour channel is active (BLUE / RED / GREEN — the
+ *   1 / 2 / 3 keys cycle), and the smoothed maximum dye density used
+ *   to normalise the brightness ramp.  Mis-classifying these as sim
+ *   would break the engine-toggle invariant that "changing the look
+ *   doesn't disturb the physics".
+ *
+ * Why an EMA (not the raw per-frame max)
+ *   The frame-max dye density jumps abruptly when a new dye blob is
+ *   added or an emitter pulse hits.  Using the raw max as the
+ *   normaliser would FLASH the entire field every time the max
+ *   changed (because dim cells would suddenly be rescaled).  An EMA
+ *   (with DYE_EMA_ALPHA per-frame mix weight) smooths the
+ *   denominator so the ramp re-tunes gradually over ~10 frames
+ *   instead of one.  T9 anti-flicker in the tutorial.
+ *
+ * Members
+ *   active_channel     DYE_CHANNEL_BLUE / _RED / _GREEN — selects
+ *                      which palette in DYE_PALETTES is used.
+ *   dye_max_smoothed   EMA of frame-max dye density.  The ramp uses
+ *                      this as its top-end so saturated cells don't
+ *                      blow out.  Updated each frame by
+ *                      dye_normaliser_advance:
+ *                        smoothed = α · max_this_frame
+ *                                 + (1−α) · smoothed
+ *                      where α = DYE_EMA_ALPHA.
+ *
+ * Invariants
+ *   active_channel ∈ {DYE_CHANNEL_BLUE, DYE_CHANNEL_RED, DYE_CHANNEL_GREEN}.
+ *   dye_max_smoothed ≥ DYE_MAX_FLOOR (clamped in
+ *   dye_normaliser_advance so the divider never approaches 0).
+ *
+ * References
+ *   [9] Raymond — render-side state convention.
+ *   T9 tutorial — EMA anti-flicker rationale.
+ */
+typedef struct {
+    int   active_channel;
+    float dye_max_smoothed;
+} DyeRenderer;
+
+/*
+ * Scene — owns ALL simulation state for one run.
+ *
+ * Layered ownership
+ *
+ *     Scene
+ *       ├── fluid    : Fluid        ← 6 grid fields + viscosity
+ *       ├── emitter  : Emitter      ← swirl_phase
+ *       ├── sim      : SimControls  ← paused
+ *       └── render   : DyeRenderer  ← active_channel + dye_max_smoothed
+ *
+ *   Each sub-struct names its responsibility, so a reader scrolling
+ *   the body of any pass can answer "is this touching sim or render?"
+ *   from the field path alone.
+ *
+ * Why one file-scope `g_scene` (and not a pointer threaded everywhere)
+ *   The grid arrays sum to several MB; the Stam advection / project
+ *   inner loops touch all 6 arrays per cell.  Threading a Scene *
+ *   through ~30 helpers would add no clarity and a tiny perf cost.
+ *   Keeping ONE global with clearly-named sub-structs gives the
+ *   same conceptual partition without signature churn.
+ *
+ * Members
+ *   fluid     The 6 grid fields + ν (see Fluid docblock).  Touched
+ *             by every advect / diffuse / project sub-pass.
+ *   emitter   Auto-emitter angular state (see Emitter docblock).
+ *             Touched only by emitters_inject in §14.
+ *   sim       paused flag — user-facing toggle.
+ *   render    active_channel + dye_max_smoothed — pure render state;
+ *             the SIMULATION passes never touch these fields.
+ *
+ * Invariants
+ *   All four sub-struct invariants hold simultaneously (see each
+ *   sub-struct's docblock for its own constraints).
+ *   The CRITICAL cross-cutting invariant: SIMULATION passes (advect,
+ *   diffuse, project, fluid_step) MUST only touch `fluid` and
+ *   `emitter`; RENDER (paint_field, hud_paint_*, dye_normaliser)
+ *   must only READ `fluid` (not write) and may freely write `render`.
+ *   This "engine ≠ render" separation lets the user toggle theme /
+ *   pause without disturbing the physics state.
+ *
+ * References
+ *   [1] Stam 1999 — the simulation-state schema in `fluid`.
+ *   [9] Raymond NCURSES HOWTO — the scene-paint pipeline that the
+ *       `render` fields feed into.
+ */
+typedef struct {
+    Fluid       fluid;
+    Emitter     emitter;
+    SimControls sim;
+    DyeRenderer render;
 } Scene;
 
 static Scene g_scene = {
-    .viscosity_kinematic = VISCOSITY_INITIAL,
-    .active_dye_channel  = DYE_CHANNEL_BLUE,
-    .dye_max_smoothed    = DYE_MAX_INITIAL,
+    .fluid   = { .viscosity_kinematic = VISCOSITY_INITIAL },
+    .emitter = { .swirl_phase         = 0.0f },
+    .sim     = { .paused              = false },
+    .render  = { .active_channel      = DYE_CHANNEL_BLUE,
+                 .dye_max_smoothed    = DYE_MAX_INITIAL },
 };
 
 /* ===================================================================== */
@@ -1297,13 +1562,44 @@ static void diffuse(int boundary_kind, float *field_new, const float *field_old,
 /* ===================================================================== */
 
 /*
- * DeparturePoint — where in the OLD field did the fluid currently at
- * (i, j) come from?  Stam's semi-Lagrangian step "looks backward"
- * along the velocity: a fluid parcel sitting at (i, j) at time t
- * was at (i - dt·u, j - dt·v) at time t-dt.  Sampling the old field
- * there and copying the value forward is the entire idea behind
- * unconditional stability — no values are CREATED, only relocated.
- * Reference [1] Stam §3.
+ * DeparturePoint — Stam's semi-Lagrangian back-trace result.
+ *
+ * Intent
+ *   "Where in the OLD field did the fluid currently at (i, j) come
+ *   from?"  Stam's [1] advection looks BACKWARD along the velocity:
+ *   a fluid parcel sitting at (i, j) at time t was at
+ *
+ *      (i − dt·u(i,j),  j − dt·v(i,j))
+ *
+ *   at time t-dt.  Sampling the OLD field at that location and
+ *   copying the value forward is the entire idea behind Stam's
+ *   UNCONDITIONAL STABILITY — no values are CREATED, only RELOCATED.
+ *
+ * Why a struct (vs two floats or two output pointers)
+ *   trace_velocity_backward needs to return TWO floats together.
+ *   Returning a tiny struct by value (8 bytes = one register pair on
+ *   x86-64 / ARM ABIs) gives a clean call-site:
+ *
+ *      DeparturePoint d = trace_velocity_backward(i, j, vx, vy, dt);
+ *      float sample = bilinear_interp_at(field, d.x, d.y);
+ *
+ *   Versus an out-parameter idiom which would force two separate
+ *   reads at the call site.
+ *
+ * Members
+ *   x, y   Departure-point coordinates in CELL UNITS (the same units
+ *          as the grid indices).  Float because the back-trace
+ *          lands BETWEEN cells — bilinear_interp_at then samples
+ *          the four surrounding cells weighted by fractional offset.
+ *
+ * Invariants
+ *   x, y are clamped to the interior [0.5, GRID_SIDE_INNER + 0.5]
+ *   by trace_velocity_backward so bilinear sampling never reads off
+ *   the boundary ghost cells without their boundary-condition fill.
+ *
+ * Reference
+ *   [1] Stam 1999 §3 — the "Linear backwards solver" that this
+ *       struct's two floats parameterise.
  */
 typedef struct { float x; float y; } DeparturePoint;
 
@@ -1522,39 +1818,75 @@ static void project(float *vx, float *vy, float *pressure_correction,
  * The whole physics in eight calls.
  *
  * VELOCITY phases:
- *   diffuse vx → g_scene.velocity_x_prev   (using g_scene.velocity_x as old)
- *   diffuse vy → g_scene.velocity_y_prev
+ *   diffuse vx → g_scene.fluid.velocity_x_prev   (using g_scene.fluid.velocity_x as old)
+ *   diffuse vy → g_scene.fluid.velocity_y_prev
  *   project    velocity_*_prev     (pressure correction lives in vx, vy)
- *   advect vx  → g_scene.velocity_x        (advect by velocity_*_prev)
- *   advect vy  → g_scene.velocity_y
+ *   advect vx  → g_scene.fluid.velocity_x        (advect by velocity_*_prev)
+ *   advect vy  → g_scene.fluid.velocity_y
  *   project    velocity_*          (clean residual divergence)
  *
  * DYE phases:
- *   diffuse dye → g_scene.dye_density_prev
- *   advect  dye → g_scene.dye_density       (using clean velocity_*)
+ *   diffuse dye → g_scene.fluid.dye_density_prev
+ *   advect  dye → g_scene.fluid.dye_density       (using clean velocity_*)
  *
  * The buffer juggling is awkward but correct.  Stam's reference
  * implementation uses exactly this convention — we keep it.
  */
+/*
+ * step_velocity_diffuse_and_project — Stam [1] half-step:
+ *   (1) implicit diffuse u, v into the _prev buffers
+ *   (2) project (Hodge decompose) the diffused field back to
+ *       divergence-free; result lands in u, v.
+ *
+ * After this returns: (velocity_x, velocity_y) is the diffused +
+ * projected field; the _prev arrays hold scratch from the projector.
+ */
+static inline void step_velocity_diffuse_and_project(Fluid *f, float dt) {
+  diffuse(BOUNDARY_VELOCITY_X, f->velocity_x_prev, f->velocity_x,
+          f->viscosity_kinematic, dt);
+  diffuse(BOUNDARY_VELOCITY_Y, f->velocity_y_prev, f->velocity_y,
+          f->viscosity_kinematic, dt);
+  project(f->velocity_x_prev, f->velocity_y_prev,
+          f->velocity_x,      f->velocity_y);
+}
+
+/*
+ * step_velocity_advect_and_project — Stam [1] half-step:
+ *   (1) semi-Lagrangian advect u and v through the (now-diffused)
+ *       velocity field stored in _prev
+ *   (2) project again — advection can re-introduce divergence
+ *       (T7 tutorial), so a second Hodge decomposition is required.
+ */
+static inline void step_velocity_advect_and_project(Fluid *f, float dt) {
+  advect(BOUNDARY_VELOCITY_X, f->velocity_x, f->velocity_x_prev,
+         f->velocity_x_prev, f->velocity_y_prev, dt);
+  advect(BOUNDARY_VELOCITY_Y, f->velocity_y, f->velocity_y_prev,
+         f->velocity_x_prev, f->velocity_y_prev, dt);
+  project(f->velocity_x,      f->velocity_y,
+          f->velocity_x_prev, f->velocity_y_prev);
+}
+
+/*
+ * step_dye_diffuse_and_advect — diffuse + advect the dye scalar
+ * field (no projection needed; dye is a passive tracer, not a
+ * velocity).  Reads the FINAL (project-cleaned) velocity from
+ * (velocity_x, velocity_y).
+ */
+static inline void step_dye_diffuse_and_advect(Fluid *f, float dt) {
+  diffuse(BOUNDARY_SCALAR, f->dye_density_prev, f->dye_density,
+          DIFFUSION_DYE, dt);
+  advect(BOUNDARY_SCALAR, f->dye_density, f->dye_density_prev,
+         f->velocity_x, f->velocity_y, dt);
+}
+
 static void fluid_step(float dt) {
-  /* Velocity diffuse + project. */
-  diffuse(BOUNDARY_VELOCITY_X, g_scene.velocity_x_prev, g_scene.velocity_x, g_scene.viscosity_kinematic,
-          dt);
-  diffuse(BOUNDARY_VELOCITY_Y, g_scene.velocity_y_prev, g_scene.velocity_y, g_scene.viscosity_kinematic,
-          dt);
-  project(g_scene.velocity_x_prev, g_scene.velocity_y_prev, g_scene.velocity_x, g_scene.velocity_y);
-
-  /* Velocity advect + project. */
-  advect(BOUNDARY_VELOCITY_X, g_scene.velocity_x, g_scene.velocity_x_prev, g_scene.velocity_x_prev,
-         g_scene.velocity_y_prev, dt);
-  advect(BOUNDARY_VELOCITY_Y, g_scene.velocity_y, g_scene.velocity_y_prev, g_scene.velocity_x_prev,
-         g_scene.velocity_y_prev, dt);
-  project(g_scene.velocity_x, g_scene.velocity_y, g_scene.velocity_x_prev, g_scene.velocity_y_prev);
-
-  /* Dye diffuse + advect. */
-  diffuse(BOUNDARY_SCALAR, g_scene.dye_density_prev, g_scene.dye_density, DIFFUSION_DYE, dt);
-  advect(BOUNDARY_SCALAR, g_scene.dye_density, g_scene.dye_density_prev, g_scene.velocity_x, g_scene.velocity_y,
-         dt);
+  Fluid *f = &g_scene.fluid;
+  /* (1) velocity half-step: diffuse → project */
+  step_velocity_diffuse_and_project(f, dt);
+  /* (2) velocity half-step: advect → project */
+  step_velocity_advect_and_project(f, dt);
+  /* (3) dye half-step: diffuse → advect (no projection — passive tracer) */
+  step_dye_diffuse_and_advect(f, dt);
 }
 
 /* ===================================================================== */
@@ -1575,9 +1907,9 @@ static void add_source_at(int i, int j, float force_x, float force_y,
     return;
   if (j < 1 || j > GRID_SIDE_INNER)
     return;
-  g_scene.velocity_x[cell_index(i, j)] += DT_DEFAULT * force_x * INJECT_FORCE_SCALE;
-  g_scene.velocity_y[cell_index(i, j)] += DT_DEFAULT * force_y * INJECT_FORCE_SCALE;
-  g_scene.dye_density[cell_index(i, j)] += DT_DEFAULT * dye_value * INJECT_DYE_SCALE;
+  g_scene.fluid.velocity_x[cell_index(i, j)] += DT_DEFAULT * force_x * INJECT_FORCE_SCALE;
+  g_scene.fluid.velocity_y[cell_index(i, j)] += DT_DEFAULT * force_y * INJECT_FORCE_SCALE;
+  g_scene.fluid.dye_density[cell_index(i, j)] += DT_DEFAULT * dye_value * INJECT_DYE_SCALE;
 }
 
 /* ===================================================================== */
@@ -1586,28 +1918,28 @@ static void add_source_at(int i, int j, float force_x, float force_y,
 /*
  * Two emitters at 1/3 and 2/3 from the left, both at vertical centre.
  * Each injects dye + a swirling velocity that rotates with
- * g_scene.emitter_swirl_phase.  The two are 180° out of phase so their
+ * g_scene.emitter.swirl_phase.  The two are 180° out of phase so their
  * resulting flows COUNTER-ROTATE — visually striking, immediately
  * shows off the projection step (without it, the swirls would just
  * bleed into source/sink artefacts).
  */
 static void emitters_inject(void) {
-  g_scene.emitter_swirl_phase += EMITTER_SWIRL_INCREMENT;
+  g_scene.emitter.swirl_phase += EMITTER_SWIRL_INCREMENT;
 
   int N = GRID_SIDE_INNER;
 
   /* Left emitter — clockwise swirl. */
   int i_left = N / 3;
   int j_left = N / 2;
-  float fx_left = cosf(g_scene.emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
-  float fy_left = sinf(g_scene.emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
+  float fx_left = cosf(g_scene.emitter.swirl_phase) * EMITTER_FORCE_AMPLITUDE;
+  float fy_left = sinf(g_scene.emitter.swirl_phase) * EMITTER_FORCE_AMPLITUDE;
   add_source_at(i_left, j_left, fx_left, fy_left, EMITTER_DYE_AMPLITUDE);
 
   /* Right emitter — counter-rotating. */
   int i_right = 2 * N / 3;
   int j_right = N / 2;
-  float fx_right = -cosf(g_scene.emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
-  float fy_right = -sinf(g_scene.emitter_swirl_phase) * EMITTER_FORCE_AMPLITUDE;
+  float fx_right = -cosf(g_scene.emitter.swirl_phase) * EMITTER_FORCE_AMPLITUDE;
+  float fy_right = -sinf(g_scene.emitter.swirl_phase) * EMITTER_FORCE_AMPLITUDE;
   add_source_at(i_right, j_right, fx_right, fy_right, EMITTER_DYE_AMPLITUDE);
 }
 
@@ -1621,14 +1953,14 @@ static void emitters_inject(void) {
  * fresh.
  */
 static void fluid_reset(void) {
-  memset(g_scene.velocity_x, 0, sizeof g_scene.velocity_x);
-  memset(g_scene.velocity_y, 0, sizeof g_scene.velocity_y);
-  memset(g_scene.velocity_x_prev, 0, sizeof g_scene.velocity_x_prev);
-  memset(g_scene.velocity_y_prev, 0, sizeof g_scene.velocity_y_prev);
-  memset(g_scene.dye_density, 0, sizeof g_scene.dye_density);
-  memset(g_scene.dye_density_prev, 0, sizeof g_scene.dye_density_prev);
-  g_scene.emitter_swirl_phase = 0.0f;
-  g_scene.dye_max_smoothed = DYE_MAX_INITIAL;
+  memset(g_scene.fluid.velocity_x, 0, sizeof g_scene.fluid.velocity_x);
+  memset(g_scene.fluid.velocity_y, 0, sizeof g_scene.fluid.velocity_y);
+  memset(g_scene.fluid.velocity_x_prev, 0, sizeof g_scene.fluid.velocity_x_prev);
+  memset(g_scene.fluid.velocity_y_prev, 0, sizeof g_scene.fluid.velocity_y_prev);
+  memset(g_scene.fluid.dye_density, 0, sizeof g_scene.fluid.dye_density);
+  memset(g_scene.fluid.dye_density_prev, 0, sizeof g_scene.fluid.dye_density_prev);
+  g_scene.emitter.swirl_phase = 0.0f;
+  g_scene.render.dye_max_smoothed = DYE_MAX_INITIAL;
 }
 
 /* ===================================================================== */
@@ -1641,17 +1973,17 @@ static void fluid_reset(void) {
  * renormaliser changes slowly.
  *
  * Two functions:
- *   dye_max_per_frame() — scan g_scene.dye_density[] for the actual max.
+ *   dye_max_per_frame() — scan g_scene.fluid.dye_density[] for the actual max.
  *   dye_normaliser_advance() — fold per-frame max into the EMA.
  *
- * The EMA state lives in g_scene.dye_max_smoothed (declared in §6).
+ * The EMA state lives in g_scene.render.dye_max_smoothed (declared in §6).
  */
 
 static float dye_max_per_frame(void) {
   float frame_max = 0.0f;
   for (int j = 1; j <= GRID_SIDE_INNER; j++) {
     for (int i = 1; i <= GRID_SIDE_INNER; i++) {
-      float v = g_scene.dye_density[cell_index(i, j)];
+      float v = g_scene.fluid.dye_density[cell_index(i, j)];
       if (v > frame_max)
         frame_max = v;
     }
@@ -1661,10 +1993,10 @@ static float dye_max_per_frame(void) {
 
 static void dye_normaliser_advance(void) {
   float frame_max = dye_max_per_frame();
-  g_scene.dye_max_smoothed =
-      DYE_MAX_EMA_OLD * g_scene.dye_max_smoothed + DYE_MAX_EMA_NEW * frame_max;
-  if (g_scene.dye_max_smoothed < DYE_MAX_FLOOR)
-    g_scene.dye_max_smoothed = DYE_MAX_FLOOR;
+  g_scene.render.dye_max_smoothed =
+      DYE_MAX_EMA_OLD * g_scene.render.dye_max_smoothed + DYE_MAX_EMA_NEW * frame_max;
+  if (g_scene.render.dye_max_smoothed < DYE_MAX_FLOOR)
+    g_scene.render.dye_max_smoothed = DYE_MAX_FLOOR;
 }
 
 /* ===================================================================== */
@@ -1700,6 +2032,24 @@ static void dye_normaliser_advance(void) {
  *   the dominant-channel rule earlier) varies, but the shade WITHIN
  *   that channel is what density_to_glyph computes.  Decoupling lets
  *   the caller combine the two: pair = channel_base[chan] + shade.
+ */
+/*
+ * Members
+ *   glyph         ASCII glyph for this cell, from the brightness ramp
+ *                 '.' (sparsest) → ':' → '+' → '#' (densest), or
+ *                 0  meaning "below DYE_VISIBLE_FLOOR, do not draw".
+ *   shade_index   Index 0..DYE_SHADE_COUNT-1 into the active palette's
+ *                 colour_256[] / colour_8[] arrays.  The caller
+ *                 combines this with the channel base pair-id:
+ *                 `pair = channel_base[active_channel] + shade_index`.
+ *
+ * Invariants
+ *   glyph ∈ {0, '.', ':', '+', '#'}.
+ *   0 ≤ shade_index < DYE_SHADE_COUNT.
+ *   glyph == 0  ⇔  density was below DYE_VISIBLE_FLOOR.
+ *
+ * Reference
+ *   [9] Raymond NCURSES-HOWTO §6 — pair lookup + character output.
  */
 typedef struct {
     char glyph;          /* '.' ':' '+' '#' or 0 for "do not draw"  */
@@ -1757,8 +2107,8 @@ static int grid_j_to_term_row(int j, int term_rows) {
  *   - Otherwise pick glyph + shade (§17) and draw with the channel's
  *     colour pair (§4-§5).
  *
- * Keep render free of any state-mutation: it READS g_scene.dye_density and
- * g_scene.dye_max_smoothed, WRITES only ncurses cells.  Side effects belong
+ * Keep render free of any state-mutation: it READS g_scene.fluid.dye_density and
+ * g_scene.render.dye_max_smoothed, WRITES only ncurses cells.  Side effects belong
  * upstream in dye_normaliser_advance().
  */
 /* Normalise the raw dye density at grid cell (i, j) by the EMA-
@@ -1767,7 +2117,7 @@ static int grid_j_to_term_row(int j, int term_rows) {
  * every later frame's ramp to "barely visible" — see [1] Stam §6
  * "tone mapping" for the same trick in real-time fluid graphics. */
 static inline float normalise_dye_at(int i, int j) {
-    return g_scene.dye_density[cell_index(i, j)] / g_scene.dye_max_smoothed;
+    return g_scene.fluid.dye_density[cell_index(i, j)] / g_scene.render.dye_max_smoothed;
 }
 
 /* Project grid cell (i, j) onto the terminal screen, return false if
@@ -1794,7 +2144,7 @@ static inline bool grid_cell_to_screen(int i, int j,
 static inline void paint_dye_cell(int screen_row, int screen_col,
                                   float density_normalised) {
     GlyphChoice gc      = glyph_for_density(density_normalised);
-    int         pair_id = dye_pair_id(g_scene.active_dye_channel,
+    int         pair_id = dye_pair_id(g_scene.render.active_channel,
                                        gc.shade_index);
     attron(COLOR_PAIR(pair_id));
     mvaddch(screen_row, screen_col, (chtype)(unsigned char)gc.glyph);
@@ -1812,7 +2162,7 @@ static inline void paint_dye_cell(int screen_row, int screen_col,
  *     if out of visible field rect → skip
  *     paint_dye_cell(row, col, rho_norm)
  *
- * READS g_scene.dye_density and g_scene.dye_max_smoothed only.
+ * READS g_scene.fluid.dye_density and g_scene.render.dye_max_smoothed only.
  * WRITES only ncurses cells — no side effects on the simulation.
  */
 static void render_dye_field(int term_rows, int term_cols) {
@@ -1848,9 +2198,9 @@ static void hud_paint_status(int term_cols) {
   char buf[160];
   snprintf(buf, sizeof buf,
            " StableFluids  grid:%dx%d  visc:%.2e  dye:%-5s  %s ",
-           GRID_SIDE_INNER, GRID_SIDE_INNER, (double)g_scene.viscosity_kinematic,
-           dye_palette_table[g_scene.active_dye_channel].name,
-           g_scene.simulation_paused ? "PAUSED " : "running");
+           GRID_SIDE_INNER, GRID_SIDE_INNER, (double)g_scene.fluid.viscosity_kinematic,
+           dye_palette_table[g_scene.render.active_channel].name,
+           g_scene.sim.paused ? "PAUSED " : "running");
   int len = (int)strlen(buf);
   int x = term_cols - len;
   if (x < 0)
@@ -1873,12 +2223,38 @@ static void hud_paint_hint(int term_rows) {
 /* ===================================================================== */
 
 /*
- * Screen — terminal extent record.  ncurses owns the buffers; we
- * keep only cell dimensions for HUD placement and field clipping.
+ * Screen — terminal cell extent + ncurses lifecycle wrapper.
  *
- * Render pipeline (one frame): erase → paint_field → hud_paint_*
- *   → wnoutrefresh(stdscr) → doupdate().  Diff-only writes to the
- *   terminal — no flicker.  See [9] Raymond §11.
+ * Intent
+ *   Owns the TERMINAL side of the demo: cell dimensions for HUD
+ *   placement and field clipping.  ncurses owns the actual back
+ *   buffer; this struct is the SOURCE-OF-TRUTH for cell-space
+ *   dimensions, refreshed via getmaxyx in screen_init / screen_resize.
+ *
+ * Why a tiny 2-field struct (not flat ints on App)
+ *   • Lifecycle isolation: only screen_init / screen_resize /
+ *     screen_cleanup / screen_present_frame touch ncurses' initscr
+ *     / endwin / mvprintw.  Every screen-touching function takes
+ *     `Screen *` to make the boundary explicit at the type level.
+ *   • Symmetry with the rest of the project — every demo's Screen
+ *     uses the same {cols, rows} shape.
+ *
+ * Render pipeline (one frame)
+ *   erase → render_dye_field → hud_paint_status → hud_paint_hint →
+ *   wnoutrefresh(stdscr) → doupdate().  Diff-only writes to the
+ *   terminal — no flicker.
+ *
+ * Members
+ *   rows   Terminal height in CELLS (getmaxyx).
+ *   cols   Terminal width  in CELLS (getmaxyx).
+ *
+ * Invariants
+ *   cols > 0, rows > 0 after screen_init.
+ *   Both refreshed on every SIGWINCH via screen_resize.
+ *
+ * Reference
+ *   [9] Raymond NCURSES-HOWTO §11 — diff-only render with
+ *       wnoutrefresh + doupdate.
  */
 typedef struct {
     int rows;   /* terminal height in cells (getmaxyx)             */
@@ -1918,101 +2294,217 @@ static void screen_present_frame(Screen *s) {
 /* §22  app — main loop + signals + input                                */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_should_quit = 0;
-static volatile sig_atomic_t g_resize_pending = 0;
+/*
+ * FpsCounter — rolling-window frame-rate estimator.
+ *
+ * Intent
+ *   Per-frame fps would jitter (a 1 ms scheduler hiccup swings the
+ *   instantaneous reading by ~6 fps at 60 Hz).  This accumulates
+ *   frame_count + elapsed nanoseconds over a 500 ms window and emits
+ *   a smoothed `display` value each time the window fills.
+ *
+ *   Currently NOT shown in the HUD (this demo's HUD reports viscosity
+ *   + channel + paused state, not fps).  Kept for symmetry with the
+ *   rest of the project — every other file's App has one and a future
+ *   HUD tweak can surface it without code churn.
+ *
+ * Lifecycle
+ *   fps_counter_init — zero at startup.
+ *   fps_counter_tick — call once per frame with the frame's dt (ns);
+ *                      emits a fresh `display` only when the window
+ *                      fills (≥ 500 ms accumulated).
+ *
+ * Members
+ *   frame_count   Frames seen in the current window.
+ *   window_ns     Nanoseconds accumulated in the current window.
+ *   display       Smoothed FPS value (frames per second).
+ *
+ * Invariants
+ *   frame_count ≥ 0, window_ns ≥ 0 between resets.
+ *   display ≥ 0 (zero until the first 500 ms window completes).
+ *
+ * References
+ *   Same FpsCounter pattern as flocking.c / slime_mold.c / shepherd.c
+ *   / war.c / fluid_sph.c in this project.
+ */
+typedef struct {
+  int     frame_count;
+  int64_t window_ns;
+  double  display;
+} FpsCounter;
+
+static void fps_counter_init(FpsCounter *f) {
+  f->frame_count = 0;
+  f->window_ns   = 0;
+  f->display     = 0.0;
+}
+
+static void fps_counter_tick(FpsCounter *f, int64_t dt) {
+  const int64_t FPS_WINDOW_NS = (int64_t)NS_PER_SEC / 2;
+  f->frame_count++;
+  f->window_ns += dt;
+  if (f->window_ns < FPS_WINDOW_NS) return;
+  f->display     = (double)f->frame_count
+                 * (double)NS_PER_SEC / (double)f->window_ns;
+  f->frame_count = 0;
+  f->window_ns   = 0;
+}
+
+/*
+ * App — top-level container; lives in BSS as the single g_app instance.
+ *
+ * Intent
+ *   Signal handlers (on_signal) write to App's sig_atomic_t flags;
+ *   the main loop polls them.  This is the standard POSIX "wake the
+ *   main loop" pattern.
+ *
+ * Members
+ *   screen        terminal extent + ncurses lifecycle
+ *   fps           rolling-window fps estimator (currently unused in HUD)
+ *   quit          sig_atomic_t flag cleared by SIGINT / SIGTERM
+ *   need_resize   sig_atomic_t flag set by SIGWINCH; main reacts at
+ *                 the top of the next iteration
+ *
+ * Note: Scene is NOT embedded in App.  Scene's grid arrays are large
+ *   (~6 MB at typical GRID_SIDE) and live in their own file-scope
+ *   `g_scene` instance.  The two globals are independent: App holds
+ *   the OS-side state (terminal + signals), Scene holds the
+ *   simulation state.
+ */
+typedef struct {
+    Screen     screen;
+    FpsCounter fps;
+    volatile sig_atomic_t quit;
+    volatile sig_atomic_t need_resize;
+} App;
+
+static App g_app;
 
 static void on_signal(int sig) {
-  if (sig == SIGWINCH)
-    g_resize_pending = 1;
-  else
-    g_should_quit = 1;
+  if (sig == SIGWINCH) g_app.need_resize = 1;
+  else                 g_app.quit        = 1;
 }
 
-/* Input helpers. */
+/* Named action helpers — one per key family.  app_handle_key below
+ * becomes a flat "key → named action" dispatcher matching the docblock. */
+
+/* drop_random_dye_blob — inject DYE_BLOB_AMOUNT density at a random
+ * interior cell with no initial velocity (the user gets to watch the
+ * blob diffuse + advect from rest). */
 static void drop_random_dye_blob(void) {
+  enum { DYE_BLOB_AMOUNT = 5 };
   int i = rand_inner_cell();
   int j = rand_inner_cell();
-  add_source_at(i, j, 0.0f, 0.0f, 5.0f);
+  add_source_at(i, j, 0.0f, 0.0f, (float)DYE_BLOB_AMOUNT);
 }
 
-static void apply_arrow_force(float force_x, float force_y) {
+/* push_velocity_at_centre — arrow keys inject a unit-magnitude force
+ * pulse at the grid centre.  The user "drags" the fluid by repeatedly
+ * pressing the arrow they want it to flow in. */
+static void push_velocity_at_centre(float force_x, float force_y) {
+  enum { ARROW_DYE_PULSE = 1 };
   int centre = GRID_SIDE_INNER / 2;
-  add_source_at(centre, centre, force_x, force_y, 1.0f);
+  add_source_at(centre, centre, force_x, force_y, (float)ARROW_DYE_PULSE);
 }
 
+/* toggle_paused — SPACE / p key: flip the gate that
+ * emitters_inject + fluid_step check in the main loop. */
+static inline void toggle_paused(void) {
+  g_scene.sim.paused = !g_scene.sim.paused;
+}
+
+/*
+ * adjust_viscosity — + / − keys scale ν by VISCOSITY_FACTOR, clamped
+ * to [VISCOSITY_MIN, VISCOSITY_MAX].  Multiplicative (not additive)
+ * because viscosity spans orders of magnitude — a factor-of-1.5 step
+ * gives the same visible change at both ν = 0.001 and ν = 0.1.
+ *
+ *   dir == +1 → ν ← min(ν · F, MAX)
+ *   dir == -1 → ν ← max(ν / F, MIN)
+ */
+static void adjust_viscosity(int dir) {
+  if (dir > 0) {
+    g_scene.fluid.viscosity_kinematic *= VISCOSITY_FACTOR;
+    if (g_scene.fluid.viscosity_kinematic > VISCOSITY_MAX)
+      g_scene.fluid.viscosity_kinematic = VISCOSITY_MAX;
+  } else {
+    g_scene.fluid.viscosity_kinematic /= VISCOSITY_FACTOR;
+    if (g_scene.fluid.viscosity_kinematic < VISCOSITY_MIN)
+      g_scene.fluid.viscosity_kinematic = VISCOSITY_MIN;
+  }
+}
+
+/* set_dye_channel — 1 / 2 / 3 keys pick which palette colours the
+ * dye field is rendered with.  Pure render mutation; does not touch
+ * sim state. */
+static inline void set_dye_channel(int channel) {
+  g_scene.render.active_channel = channel;
+}
+
+/*
+ * app_handle_key — dispatch one keypress.  Returns false on quit.
+ *
+ *   q / Q / ESC   quit
+ *   p / P / SPACE toggle paused
+ *   r / R         reset all fields (fluid_reset)
+ *   d / D         drop_random_dye_blob (uses ' ' as alias too)
+ *   ← → ↑ ↓       push_velocity_at_centre with unit force
+ *   + / =         adjust_viscosity ×VISCOSITY_FACTOR (cap MAX)
+ *   -             adjust_viscosity ÷VISCOSITY_FACTOR (floor MIN)
+ *   1 / 2 / 3     set_dye_channel BLUE / GREEN / RED
+ */
 static bool app_handle_key(int ch) {
   switch (ch) {
-  case 'q':
-  case 'Q':
-  case 27:
-    return false;
+  case 'q': case 'Q': case 27 /* ESC */: return false;
 
-  case 'p':
-  case 'P':
-    g_scene.simulation_paused = !g_scene.simulation_paused;
-    break;
+  case 'p': case 'P':           toggle_paused();                  break;
+  case 'r': case 'R':           fluid_reset();                    break;
 
-  case 'r':
-  case 'R':
-    fluid_reset();
-    break;
+  case ' ': case 'd': case 'D': drop_random_dye_blob();           break;
 
-  case ' ':
-  case 'd':
-  case 'D':
-    drop_random_dye_blob();
-    break;
+  case KEY_LEFT:                push_velocity_at_centre(-1, 0);   break;
+  case KEY_RIGHT:               push_velocity_at_centre(+1, 0);   break;
+  case KEY_UP:                  push_velocity_at_centre(0, -1);   break;
+  case KEY_DOWN:                push_velocity_at_centre(0, +1);   break;
 
-  case KEY_LEFT:
-    apply_arrow_force(-1.0f, 0.0f);
-    break;
-  case KEY_RIGHT:
-    apply_arrow_force(1.0f, 0.0f);
-    break;
-  case KEY_UP:
-    apply_arrow_force(0.0f, -1.0f);
-    break;
-  case KEY_DOWN:
-    apply_arrow_force(0.0f, 1.0f);
-    break;
+  case '+': case '=':           adjust_viscosity(+1);             break;
+  case '-':                     adjust_viscosity(-1);             break;
 
-  case '+':
-  case '=':
-    g_scene.viscosity_kinematic *= VISCOSITY_FACTOR;
-    if (g_scene.viscosity_kinematic > VISCOSITY_MAX)
-      g_scene.viscosity_kinematic = VISCOSITY_MAX;
-    break;
-  case '-':
-    g_scene.viscosity_kinematic /= VISCOSITY_FACTOR;
-    if (g_scene.viscosity_kinematic < VISCOSITY_MIN)
-      g_scene.viscosity_kinematic = VISCOSITY_MIN;
-    break;
+  case '1':                     set_dye_channel(DYE_CHANNEL_BLUE);  break;
+  case '2':                     set_dye_channel(DYE_CHANNEL_GREEN); break;
+  case '3':                     set_dye_channel(DYE_CHANNEL_RED);   break;
 
-  case '1':
-    g_scene.active_dye_channel = DYE_CHANNEL_BLUE;
-    break;
-  case '2':
-    g_scene.active_dye_channel = DYE_CHANNEL_GREEN;
-    break;
-  case '3':
-    g_scene.active_dye_channel = DYE_CHANNEL_RED;
-    break;
-
-  default:
-    break;
+  default: break;
   }
   return true;
 }
 
+/*
+ * main — fixed-step render loop.
+ *
+ *   (1) RNG + atexit + signal handlers
+ *   (2) bring up Screen + App; prewarm fluid so first frame has dye
+ *   (3) seed dye-EMA from the prewarmed state
+ *   (4) loop:
+ *       (a) drain non-blocking input via app_handle_key
+ *       (b) handle pending SIGWINCH
+ *       (c) physics tick (skipped if paused)
+ *       (d) advance dye-normaliser EMA; render + present
+ *       (e) rolling-window fps counter
+ *       (f) frame cap: sleep so we don't burn budget
+ */
 int main(void) {
+  /* (1) RNG + atexit + signal handlers */
   srand((unsigned)time(NULL));
   atexit(screen_cleanup);
-  signal(SIGINT, on_signal);
-  signal(SIGTERM, on_signal);
+  signal(SIGINT,   on_signal);
+  signal(SIGTERM,  on_signal);
   signal(SIGWINCH, on_signal);
 
-  Screen screen;
-  screen_init(&screen);
+  /* (2) Bring up Screen + App; pre-warm fluid */
+  App *app = &g_app;
+  fps_counter_init(&app->fps);
+  screen_init(&app->screen);
   fluid_reset();
 
   /* Pre-warm: emitters + physics for N ticks so the first frame
@@ -2021,41 +2513,49 @@ int main(void) {
     emitters_inject();
     fluid_step(DT_DEFAULT);
   }
-  /* Seed the EMA from the prewarmed state so the first rendered
-   * frame doesn't blow out shades. */
-  g_scene.dye_max_smoothed = dye_max_per_frame();
-  if (g_scene.dye_max_smoothed < DYE_MAX_FLOOR)
-    g_scene.dye_max_smoothed = DYE_MAX_INITIAL;
 
-  while (!g_should_quit) {
+  /* (3) Seed the EMA from the prewarmed state so the first rendered
+   * frame doesn't blow out shades. */
+  g_scene.render.dye_max_smoothed = dye_max_per_frame();
+  if (g_scene.render.dye_max_smoothed < DYE_MAX_FLOOR)
+    g_scene.render.dye_max_smoothed = DYE_MAX_INITIAL;
+
+  /* (4) Loop */
+  int64_t prev_ns = clock_now_ns();
+  while (!app->quit) {
     int64_t frame_start_ns = clock_now_ns();
 
-    /* ── input ── */
+    /* (4a) drain input */
     int ch;
     while ((ch = getch()) != ERR) {
       if (!app_handle_key(ch)) {
-        g_should_quit = 1;
+        app->quit = 1;
         break;
       }
     }
 
-    /* ── resize ── */
-    if (g_resize_pending) {
-      g_resize_pending = 0;
-      screen_resize(&screen);
+    /* (4b) handle pending SIGWINCH */
+    if (app->need_resize) {
+      app->need_resize = 0;
+      screen_resize(&app->screen);
     }
 
-    /* ── physics ── */
-    if (!g_scene.simulation_paused) {
+    /* (4c) physics tick (skipped if paused) */
+    if (!g_scene.sim.paused) {
       emitters_inject();
       fluid_step(DT_DEFAULT);
     }
 
-    /* ── visualisation prep + render ── */
+    /* (4d) visualisation prep + render */
     dye_normaliser_advance();
-    screen_present_frame(&screen);
+    screen_present_frame(&app->screen);
 
-    /* ── frame cap ── */
+    /* (4e) rolling-window fps counter */
+    int64_t now_ns = clock_now_ns();
+    fps_counter_tick(&app->fps, now_ns - prev_ns);
+    prev_ns = now_ns;
+
+    /* (4f) frame cap */
     int64_t spent = clock_now_ns() - frame_start_ns;
     if (spent < RENDER_TICK_NS)
       clock_sleep_ns(RENDER_TICK_NS - spent);

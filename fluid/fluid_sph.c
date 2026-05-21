@@ -31,22 +31,36 @@
  *   §2  clock           — monotonic ns timer + sleep
  *   §3  rng             — small random helper
  *   §4  themes          — 10 palette triples + names
- *   §5  colors          — pair init + theme apply
- *   §6  particle        — Particle struct + global pool + spawn helpers
+ *   §5  colors          — colors_apply_theme split into
+ *                          apply_density_palette_xterm256 / _ansi8 +
+ *                          apply_chrome_palette helpers
+ *   §6  particle        — Particle struct + ParticlePool (file-scope
+ *                          g_particle_pool) + spawn helpers
  *   §7  kernel          — SPH smoothing kernel (compact-support tent²)
- *   §8  grid            — spatial-hash linked-list grid
+ *   §8  grid            — spatial-hash linked-list grid (file-scope
+ *                          g_spatial_grid)
+ *   §8.5 scene types    — World + SimControls + Scene typedefs hoisted
+ *                          here so §9–§12 SPH passes can take
+ *                          `const Scene *s` (Scene contains Grid *)
  *   §9  density_pass    — neighbour density estimation
  *   §10 forces_pass     — pressure + viscosity acceleration
+ *                          (reads s->sim.gravity_enabled / .viscosity_enabled)
  *   §11 integrate_pass  — symplectic Euler + wall bounce
- *   §12 sph_step        — full physics tick (4 passes)
- *   §13 scenes          — 5 scene loaders
- *   §14 scene           — scene state + tick orchestrator
- *   §15 render_particles— density → glyph + colour
- *   §16 render_border   — frame around the simulation area
+ *                          (reads s->world.width / .height)
+ *   §12 sph_step        — full physics tick (4 passes), takes Scene *
+ *   §13 scenes          — 5 scene loaders, each takes Scene *
+ *   §14 scene           — scene_init / scene_tick (scene type lives in §8.5)
+ *   §15 render_particles— density → glyph + colour (DensityRender)
+ *   §16 render_border   — frame around the simulation area; split into
+ *                          draw_horizontal_edges / _vertical_edges /
+ *                          _corners helpers
  *   §17 hud             — top status + bottom hint strip
  *   §18 screen          — ncurses init / cleanup
- *   §19 app             — main loop + signals + input
- *   §20 main            — entry point
+ *   §19 app             — FpsCounter + App; key dispatch decomposed
+ *                          into named action helpers (cycle_theme,
+ *                          adjust_sim_hz, spawn_random_top_blob,
+ *                          select_scene_preset); main loop + signals
+ *   §20 main            — entry point (8 numbered phases)
  *
  * Keys:
  *   q / Q / ESC   quit
@@ -87,8 +101,8 @@
  *
  * Variable-naming convention
  * ──────────────────────────
- *   g_world.pool[]            global array of every Particle
- *   g_world.count             how many slots are in use
+ *   g_particle_pool.pool[]            global array of every Particle
+ *   g_particle_pool.count             how many slots are in use
  *   p->pos_col, p->pos_row     position (in cell units)
  *   p->vel_col, p->vel_row     velocity (cells/step)
  *   p->accel_col, p->accel_row force accumulator for one step
@@ -98,14 +112,18 @@
  *   kernel_signed              w = d/H - 1 (negative inside support)
  *   kernel_squared             w² (always non-negative; used for ρ)
  *
- *   g_grid.head[gy][gx]          first particle index in cell (gy, gx)
- *   g_grid.next[i]               next particle in same cell as i, or -1
+ *   g_spatial_grid.head[gy][gx]          first particle index in cell (gy, gx)
+ *   g_spatial_grid.next[i]               next particle in same cell as i, or -1
  *
- *   scene.id                   current scene (1..SCENE_COUNT)
+ *   scene.active_id            current scene preset (1..SCENE_COUNT)
  *   scene.theme_index          current theme (0..THEME_COUNT-1)
- *   scene.paused               run/pause toggle
+ *   scene.sim.paused           run/pause toggle
+ *   scene.sim.gravity_enabled  gravity force toggle ('g' key)
+ *   scene.sim.viscosity_enabled viscosity force toggle ('v' key)
+ *   scene.world.width / .height physics-area extent (cells)
  *
- *   sim_steps_per_second       physics tick rate (Hz)
+ *   app.sim_hz                 physics tick rate (Hz; '[' / ']' keys)
+ *   app.fps.display            smoothed fps shown in HUD
  *
  * Background you need
  * ───────────────────
@@ -618,23 +636,23 @@
  *
  * Implementation (§8): linked-list-per-cell.  Two arrays:
  *
- *     g_grid.head[gy][gx]  = index of FIRST particle in cell (gy, gx)
- *     g_grid.next[i]       = index of NEXT particle in same cell as i
+ *     g_spatial_grid.head[gy][gx]  = index of FIRST particle in cell (gy, gx)
+ *     g_spatial_grid.next[i]       = index of NEXT particle in same cell as i
  *     terminator         = -1
  *
- * Build: O(N).  Iterate: walk g_grid.head[gy][gx], g_grid.next[i], ...
+ * Build: O(N).  Iterate: walk g_spatial_grid.head[gy][gx], g_spatial_grid.next[i], ...
  *
  *      ┌──────────────────────────────────────────────────┐
  *      │                                                  │
- *      │   g_grid.head[gy][gx] ──► p_3 ─► p_8 ─► p_42 ─► -1│
+ *      │   g_spatial_grid.head[gy][gx] ──► p_3 ─► p_8 ─► p_42 ─► -1│
  *      │                                                  │
- *      │   g_grid.next[3]  =  8                             │
- *      │   g_grid.next[8]  = 42                             │
- *      │   g_grid.next[42] = -1                             │
+ *      │   g_spatial_grid.next[3]  =  8                             │
+ *      │   g_spatial_grid.next[8]  = 42                             │
+ *      │   g_spatial_grid.next[42] = -1                             │
  *      │                                                  │
  *      │   walk pattern:                                  │
- *      │     for j = g_grid.head[gy][gx]; j != -1;          │
- *      │            j = g_grid.next[j]) { ... }             │
+ *      │     for j = g_spatial_grid.head[gy][gx]; j != -1;          │
+ *      │            j = g_spatial_grid.next[j]) { ... }             │
  *      │                                                  │
  *      └──────────────────────────────────────────────────┘
  *
@@ -849,6 +867,23 @@ static int rand_in_range(int lo, int hi_exclusive) {
  * Reference [10] Raymond's NCURSES HOWTO §6 — init_pair semantics
  *   that turn these triples into live colour pairs.
  */
+/*
+ * Members
+ *   core   xterm-256 foreground index for the densest tier
+ *          (T_CORE threshold).  Glyph '#'.
+ *   body   medium-density tier (T_BODY threshold).  Glyph 'o'.
+ *   edge   low-density tier (T_EDGE threshold).  Glyph '.'.
+ *          Surface particles render in this colour — makes the
+ *          fluid's FREE SURFACE visually distinct from the bulk.
+ *   name   short ASCII label shown in the HUD ("ocean", "lava",
+ *          "fire", …).  Cycled by the 't' key.
+ *
+ * Invariants
+ *   All three foreground indices ∈ [24, 255] per the project
+ *   palette-brightness rule (CLAUDE.md §"Theme Palette Brightness").
+ *   Cube 16–23 and gray 232–239 render as black on default-black
+ *   terminals and are forbidden — A_DIM there is invisible.
+ */
 typedef struct {
     short       core;     /* densest cells (liquid core)              */
     short       body;     /* medium-density cells (fluid body)         */
@@ -873,26 +908,55 @@ static const ColorTheme color_theme_table[THEME_COUNT] = {
 /* §5  colors — pair init + theme apply                                  */
 /* ===================================================================== */
 
-static void colors_apply_theme(int theme_index) {
-  if (theme_index < 0 || theme_index >= THEME_COUNT)
-    theme_index = 0;
-  const ColorTheme *theme = &color_theme_table[theme_index];
+/* Canonical bright xterm-256 indices for the project-standard HUD pairs
+ * (CLAUDE.md §"HUD Standard"). */
+enum {
+    HUD_YELLOW_256 = 226,
+    HUD_CYAN_256   = 51,
+    BORDER_GRAY_256 = 244,
+};
 
-  if (COLORS >= 256) {
+/* apply_density_palette_xterm256 — register the three theme-driven
+ * density pairs (core/body/edge) on terminals with the 256-colour
+ * cube available. */
+static inline void apply_density_palette_xterm256(const ColorTheme *theme) {
     init_pair(PAIR_DENSITY_CORE, theme->core, -1);
     init_pair(PAIR_DENSITY_BODY, theme->body, -1);
     init_pair(PAIR_DENSITY_EDGE, theme->edge, -1);
-    init_pair(PAIR_BORDER, 244, -1);
-    init_pair(PAIR_HUD, 226, -1); /* yellow */
-    init_pair(PAIR_HINT, 51, -1); /* cyan   */
-  } else {
+}
+
+/* apply_density_palette_ansi8 — closest-equivalent ANSI-8 fallback
+ * (used when COLORS < 256). */
+static inline void apply_density_palette_ansi8(void) {
     init_pair(PAIR_DENSITY_CORE, COLOR_CYAN, -1);
     init_pair(PAIR_DENSITY_BODY, COLOR_CYAN, -1);
     init_pair(PAIR_DENSITY_EDGE, COLOR_BLUE, -1);
-    init_pair(PAIR_BORDER, COLOR_WHITE, -1);
-    init_pair(PAIR_HUD, COLOR_YELLOW, -1);
-    init_pair(PAIR_HINT, COLOR_CYAN, -1);
-  }
+}
+
+/* apply_chrome_palette — theme-INDEPENDENT pairs (border + HUD + hint).
+ * Set on every theme switch so a future per-theme tweak can override,
+ * but currently all themes share the same chrome. */
+static inline void apply_chrome_palette(bool have_256_colors) {
+    if (have_256_colors) {
+        init_pair(PAIR_BORDER, BORDER_GRAY_256, -1);
+        init_pair(PAIR_HUD,    HUD_YELLOW_256,  -1);
+        init_pair(PAIR_HINT,   HUD_CYAN_256,    -1);
+    } else {
+        init_pair(PAIR_BORDER, COLOR_WHITE,  -1);
+        init_pair(PAIR_HUD,    COLOR_YELLOW, -1);
+        init_pair(PAIR_HINT,   COLOR_CYAN,   -1);
+    }
+}
+
+static void colors_apply_theme(int theme_index) {
+    if (theme_index < 0 || theme_index >= THEME_COUNT)
+        theme_index = 0;
+    const ColorTheme *theme = &color_theme_table[theme_index];
+
+    bool have_256_colors = (COLORS >= 256);
+    if (have_256_colors) apply_density_palette_xterm256(theme);
+    else                 apply_density_palette_ansi8();
+    apply_chrome_palette(have_256_colors);
 }
 
 static void colors_init(int theme_index) {
@@ -953,6 +1017,36 @@ static void colors_init(int theme_index) {
  * References [1][2] for the kernel-sum formalism; [5] Müller for the
  *   real-time field structure adopted here.
  */
+/*
+ * Members
+ *   ── kinematic state (rewritten every SPH step) ──────────────────
+ *   pos_col, pos_row   Position in CELL UNITS — the terminal grid IS
+ *                      the physics grid.  No separate pixel space.
+ *   vel_col, vel_row   Velocity in cells / step.
+ *   accel_col,         Force accumulator in cells / step².  RESET at
+ *   accel_row          the top of every forces_pass — sub-passes
+ *                      (gravity → pressure → viscosity) add into
+ *                      this slot.
+ *
+ *   ── cached field quantity (computed once, read many times) ─────
+ *   density_estimate   ρᵢ = Σⱼ mⱼ · W(|xᵢ − xⱼ|, h).  Written by
+ *                      density_pass; read by forces_pass (pressure
+ *                      term needs the SUM of i's + j's density) and
+ *                      by render_particles (density → glyph tier).
+ *                      Müller eq. (3) [5].
+ *
+ * Invariants
+ *   density_estimate ≥ 0 after density_pass.
+ *   accel_col, accel_row written every step BEFORE being read.
+ *   pos_*, vel_* clamped by integrate_pass's bounce loop into
+ *   [1, world.width−2] × [1, world.height−2] (walls 1 cell in).
+ *
+ * References
+ *   [1][2] Monaghan / Lucy for the kernel-sum formalism that the
+ *          density_estimate field caches.
+ *   [5]    Müller et al. 2003 — the real-time field structure
+ *          (pos / vel / accel / ρ-cache) adopted here.
+ */
 typedef struct {
     double pos_col;          /* x position (cells)                    */
     double pos_row;          /* y position (cells)                    */
@@ -965,62 +1059,51 @@ typedef struct {
 } Particle;
 
 /*
- * ParticleWorld — the particle pool plus the world it lives in.
+ * ParticlePool — the Lagrangian particle pool used by the SPH passes.
  *
  * Intent
- *   Earlier versions kept the pool, count, phys-area bounds, and the
- *   gravity/viscosity toggles as flat file-scope globals.  This struct
- *   groups everything that describes the LAGRANGIAN PARTICLE WORLD:
- *   the particles themselves AND the bounding rectangle they live in,
- *   plus the per-frame force toggles that gate the §10 / §11 passes.
+ *   The PURE STORAGE half of the simulation: a contiguous fixed-size
+ *   array of Particle plus the active count.  Earlier versions also
+ *   carried phys-area bounds and the gravity/viscosity flags on this
+ *   struct, but those are SCENE-level concerns (user-tuneable; live
+ *   on Scene.sim / Scene.world now).  Keeping the pool struct to
+ *   "just storage" makes its life cycle obvious — only spawn_at,
+ *   spawn_blob, and the SPH passes touch it; user controls don't.
  *
  *   The struct is touched by every physics pass (density, force,
  *   integrate, wall) and by every painter, so we keep a single
- *   `g_world` instance and reach fields via `g_world.<field>`.  Avoids
- *   pointer threading through the inner-loop SPH math.
+ *   file-scope `g_particle_pool` instance and helpers reach fields
+ *   via `g_particle_pool.pool[i]`.  Avoids pointer threading through
+ *   the inner-loop SPH math.
  *
- * Locality (sim vs render)
- *   - pool, count                         → simulation (the state)
- *   - g_world.phys_cols, g_world.phys_rows                → shared geometry (sim AND
- *                                            render bound their loops)
- *   - g_world.gravity_enabled, g_world.viscosity_enabled  → control flags driven by
- *                                            'g' / 'v' keys; read each
- *                                            step by force pass
- *
- *   Mis-classifying a control flag as render would couple the
- *   simulation to a user-visual choice, breaking reproducibility.
+ * Members
+ *   pool[]   contiguous array of Particle records; first `count`
+ *            slots are live, the rest are uninitialised garbage and
+ *            must not be read.
+ *   count    number of live particles ∈ [0, PARTICLE_POOL_CAPACITY].
+ *            Monotonic during a scene preset; reset to 0 on r/R or
+ *            scene change.
  *
  * Memory footprint
- *   PARTICLE_POOL_CAPACITY × sizeof(Particle) ≈ several KB in BSS;
+ *   PARTICLE_POOL_CAPACITY × sizeof(Particle) ≈ 280 KB in BSS;
  *   no malloc.  Matches CLAUDE.md "no dynamic allocation after init".
+ *
+ * References
+ *   [5] Müller et al. 2003 — the standard Lagrangian particle pool
+ *       storage layout for real-time SPH.
  */
 typedef struct {
-    /* ── Particle state (the pool + how many are live) ──────────── */
     Particle pool [PARTICLE_POOL_CAPACITY];
     int      count;
+} ParticlePool;
 
-    /* ── Physics-area bounds (shared by sim AND render) ─────────── *
-     * Refreshed each tick from terminal size in scene_tick.        */
-    int phys_cols;
-    int phys_rows;
-
-    /* ── Per-frame force toggles (driven by 'g', 'v' keys) ──────── */
-    bool gravity_enabled;
-    bool viscosity_enabled;
-} ParticleWorld;
-
-static ParticleWorld g_world = {
-    .phys_cols         = 80,
-    .phys_rows         = 22,
-    .gravity_enabled   = true,
-    .viscosity_enabled = true,
-};
+static ParticlePool g_particle_pool;
 
 /* particle_spawn_at — append one particle at (col, row) if room. */
 static void particle_spawn_at(double pos_col, double pos_row) {
-  if (g_world.count >= PARTICLE_POOL_CAPACITY)
+  if (g_particle_pool.count >= PARTICLE_POOL_CAPACITY)
     return;
-  Particle *p = &g_world.pool[g_world.count];
+  Particle *p = &g_particle_pool.pool[g_particle_pool.count];
   p->pos_col = pos_col;
   p->pos_row = pos_row;
   p->vel_col = 0.0;
@@ -1028,7 +1111,7 @@ static void particle_spawn_at(double pos_col, double pos_row) {
   p->accel_col = 0.0;
   p->accel_row = 0.0;
   p->density_estimate = 0.0;
-  g_world.count++;
+  g_particle_pool.count++;
 }
 
 /* Spawn a circular blob of radius r centred at (cx, cy). */
@@ -1088,11 +1171,11 @@ static double sph_pair_distance(const Particle *pi, const Particle *pj,
  * k = average particles in a 3×3 cell block ≈ 9 · (N / total_cells).
  *
  * Linked-list-per-cell representation (T7):
- *   g_grid.head[gy][gx]  = first particle index in cell, or -1
- *   g_grid.next[i]       = next particle index in same cell as i, or -1
+ *   g_spatial_grid.head[gy][gx]  = first particle index in cell, or -1
+ *   g_spatial_grid.next[i]       = next particle index in same cell as i, or -1
  *
  * Iteration:
- *   for (int j = g_grid.head[gy][gx]; j != -1; j = g_grid.next[j]) ...
+ *   for (int j = g_spatial_grid.head[gy][gx]; j != -1; j = g_spatial_grid.next[j]) ...
  */
 
 /*
@@ -1121,6 +1204,34 @@ static double sph_pair_distance(const Particle *pi, const Particle *pj,
  *
  * Reference [7] Teschner et al. 2003 for the spatial-hashing scheme.
  */
+/*
+ * Members
+ *   head[gy][gx]   First particle index in cell (gy, gx), or −1 if
+ *                  the cell is empty.  Cleared to −1 each tick by
+ *                  clear_all_cell_heads.
+ *   next[i]        Next particle index in the SAME cell as particle
+ *                  i, or −1 if i is the last in its cell.  Re-built
+ *                  each tick by insert_particle_into_cell — no need
+ *                  to clear; the head[] reset is enough.
+ *   active_cols    Active grid width  (= world.width  / GRID_CELL_SIZE + 2),
+ *                  clamped to GRID_COLS_MAX.  The +2 padding gives
+ *                  ghost cells around the visible area so the 3×3
+ *                  neighbour stencil never reaches off-grid.
+ *   active_rows    Active grid height (= world.height / GRID_CELL_SIZE + 2),
+ *                  clamped to GRID_ROWS_MAX.
+ *
+ * Invariants
+ *   2 ≤ active_cols ≤ GRID_COLS_MAX, 2 ≤ active_rows ≤ GRID_ROWS_MAX
+ *   after compute_active_grid_bounds.
+ *   head[gy][gx] == −1  OR  head[gy][gx] ∈ [0, particle_count).
+ *   next[i] == −1  OR  next[i] ∈ [0, particle_count) for i < particle_count.
+ *   No cycles in the per-cell linked lists (enforced by head-push insert).
+ *
+ * Memory footprint
+ *   head: GRID_ROWS_MAX × GRID_COLS_MAX × sizeof(int)
+ *   next: PARTICLE_POOL_CAPACITY × sizeof(int)
+ *   Both in BSS, no malloc.  Together ≈ 28 KB.
+ */
 typedef struct {
     /* Head index per cell: first particle in that cell, or -1.        */
     int head[GRID_ROWS_MAX][GRID_COLS_MAX];
@@ -1134,14 +1245,116 @@ typedef struct {
     int active_rows;
 } Grid;
 
-static Grid g_grid;
+static Grid g_spatial_grid;
+
+/* ===================================================================== */
+/* §8.5  scene sub-structs — World, SimControls, Scene (hoisted before   */
+/* the §10–§12 SPH passes so they can take `const Scene *s`)             */
+/* ===================================================================== */
+
+/*
+ * World — pixel-space simulation extent (refreshed each tick / resize).
+ *
+ * Intent
+ *   The phys-area dimensions used to bound every loop (boundary
+ *   clamping in integrate_pass, grid bounds in grid_rebuild, scene
+ *   layout in preset loaders).  Refreshed at the top of scene_tick
+ *   from the live Screen extent minus HUD_RESERVED_ROWS.
+ *
+ * Members
+ *   width   physics-area width in CELLS (= terminal cols).
+ *   height  physics-area height in CELLS (= terminal rows − HUD_RESERVED_ROWS).
+ *
+ * Invariants
+ *   width > 0, height > 0.  Bottom HUD_RESERVED_ROWS terminal rows
+ *   are reserved for the status + key-hint strip; the simulation
+ *   never paints into them.
+ */
+typedef struct {
+    int width;
+    int height;
+} World;
+
+/*
+ * SimControls — user-facing toggles that gate the physics passes.
+ *
+ * Intent
+ *   Bundles the three boolean knobs that the input handler writes
+ *   and scene_tick / forces_pass read.  Earlier versions kept these
+ *   as flat fields on ParticleWorld + Scene; consolidating them in
+ *   one struct gives an explicit "user controls" surface that the
+ *   HUD can label and the key handler can target.
+ *
+ * Members
+ *   paused             true → scene_tick early-returns; HUD shows "PAUSED".
+ *                      Toggled by SPACE.
+ *   gravity_enabled    true → forces_pass adds (0, GRAVITY_G) to accel.
+ *                      Toggled by 'g'.
+ *   viscosity_enabled  true → forces_pass adds the Müller [5] viscosity
+ *                      term.  Toggled by 'v'.  Watching the simulation
+ *                      with this OFF shows the system as an inviscid
+ *                      pressure-only fluid (collapses faster, more splashy).
+ */
+typedef struct {
+    bool paused;
+    bool gravity_enabled;
+    bool viscosity_enabled;
+} SimControls;
+
+/*
+ * Scene — owns ALL simulation state for one run.
+ *
+ * Layered ownership
+ *
+ *     Scene
+ *       ├── active_id      : int             ← 1..SCENE_COUNT preset selector
+ *       ├── theme_index    : int             ← colour palette selector
+ *       ├── sim            : SimControls     ← paused / gravity / viscosity
+ *       ├── world          : World           ← phys-area extent (cells)
+ *       ├── particles      : ParticlePool *  ← points at g_particle_pool
+ *       └── grid           : Grid *          ← points at g_spatial_grid
+ *
+ * Why pointers to particle pool + grid (not embedded)
+ *   sizeof(ParticlePool) ≈ 280 KB and sizeof(Grid) ≈ 28 KB.  Embedding
+ *   them on Scene would make every Scene * copy / stack-local Scene
+ *   impractical.  The pointers are set ONCE in scene_init to point
+ *   at the file-scope BSS instances.
+ *
+ * Why Scene-rooted (not file-scope globals)
+ *   • Every persistent simulation value is reachable from one
+ *     `Scene *s`.
+ *   • Helpers that touch scene state take `Scene *s`, so there is
+ *     ONE place to look for "what state exists".
+ *   • A future "two simulations side-by-side" demo would allocate
+ *     two Scene instances pointing at separate pool / grid backing.
+ *
+ * Reference [10] Raymond on the scene-paint pipeline that reads
+ *   theme_index + sim.paused + world to size and decorate its loops.
+ */
+typedef struct {
+    /* simulation selector (preset + HUD label) */
+    int           active_id;    /* 1..SCENE_COUNT */
+
+    /* pure render state (theme selector for colors_apply_theme) */
+    int           theme_index;
+
+    /* user-facing controls (paused + gravity + viscosity) */
+    SimControls   sim;
+
+    /* pixel-space simulation extent (refreshed each tick) */
+    World         world;
+
+    /* large BSS arrays — pointers set to file-scope statics */
+    ParticlePool *particles;
+    Grid         *grid;
+} Scene;
 
 static inline int grid_cell_col_of(double pos_col) {
   int gx = (int)(pos_col / GRID_CELL_SIZE);
   if (gx < 0)
     gx = 0;
-  if (gx >= g_grid.active_cols)
-    gx = g_grid.active_cols - 1;
+  if (gx >= g_spatial_grid.active_cols)
+    gx = g_spatial_grid.active_cols - 1;
   return gx;
 }
 
@@ -1149,8 +1362,8 @@ static inline int grid_cell_row_of(double pos_row) {
   int gy = (int)(pos_row / GRID_CELL_SIZE);
   if (gy < 0)
     gy = 0;
-  if (gy >= g_grid.active_rows)
-    gy = g_grid.active_rows - 1;
+  if (gy >= g_spatial_grid.active_rows)
+    gy = g_spatial_grid.active_rows - 1;
   return gy;
 }
 
@@ -1158,30 +1371,30 @@ static inline int grid_cell_row_of(double pos_row) {
  * area.  +2 padding includes the ghost cells around the visible
  * domain so the 3×3 neighbour stencil never reaches off-grid.
  * Clamped to GRID_*_MAX. */
-static inline void compute_active_grid_bounds(void) {
-    g_grid.active_cols = g_world.phys_cols / GRID_CELL_SIZE + 2;
-    g_grid.active_rows = g_world.phys_rows / GRID_CELL_SIZE + 2;
-    if (g_grid.active_cols > GRID_COLS_MAX) g_grid.active_cols = GRID_COLS_MAX;
-    if (g_grid.active_rows > GRID_ROWS_MAX) g_grid.active_rows = GRID_ROWS_MAX;
+static inline void compute_active_grid_bounds(const Scene *s) {
+    g_spatial_grid.active_cols = s->world.width  / GRID_CELL_SIZE + 2;
+    g_spatial_grid.active_rows = s->world.height / GRID_CELL_SIZE + 2;
+    if (g_spatial_grid.active_cols > GRID_COLS_MAX) g_spatial_grid.active_cols = GRID_COLS_MAX;
+    if (g_spatial_grid.active_rows > GRID_ROWS_MAX) g_spatial_grid.active_rows = GRID_ROWS_MAX;
 }
 
 /* Empty every cell's linked-list head so old particle indices from the
  * previous step don't linger.  Done in O(cells); the next-pointer
  * array is overwritten as particles are re-inserted (no clear needed). */
 static inline void clear_all_cell_heads(void) {
-    for (int gy = 0; gy < g_grid.active_rows; gy++)
-        for (int gx = 0; gx < g_grid.active_cols; gx++)
-            g_grid.head[gy][gx] = -1;
+    for (int gy = 0; gy < g_spatial_grid.active_rows; gy++)
+        for (int gx = 0; gx < g_spatial_grid.active_cols; gx++)
+            g_spatial_grid.head[gy][gx] = -1;
 }
 
 /* Insert particle i at the HEAD of its cell's linked list.
  * O(1) operation: new_node.next = old_head; cell.head = i.
  * Standard linked-list head-push. */
 static inline void insert_particle_into_cell(int i) {
-    int gx = grid_cell_col_of(g_world.pool[i].pos_col);
-    int gy = grid_cell_row_of(g_world.pool[i].pos_row);
-    g_grid.next[i]      = g_grid.head[gy][gx];
-    g_grid.head[gy][gx] = i;
+    int gx = grid_cell_col_of(g_particle_pool.pool[i].pos_col);
+    int gy = grid_cell_row_of(g_particle_pool.pool[i].pos_row);
+    g_spatial_grid.next[i]      = g_spatial_grid.head[gy][gx];
+    g_spatial_grid.head[gy][gx] = i;
 }
 
 /*
@@ -1197,10 +1410,10 @@ static inline void insert_particle_into_cell(int i) {
  * density → forces → integrate.  Refs [7] Teschner 2003 for the
  * head/next spatial-hash scheme.
  */
-static void grid_rebuild(void) {
-    compute_active_grid_bounds();
+static void grid_rebuild(const Scene *s) {
+    compute_active_grid_bounds(s);
     clear_all_cell_heads();
-    for (int i = 0; i < g_world.count; i++)
+    for (int i = 0; i < g_particle_pool.count; i++)
         insert_particle_into_cell(i);
 }
 
@@ -1226,9 +1439,9 @@ static inline void cell_block_around(const Particle *pi,
     int cx = grid_cell_col_of(pi->pos_col);
     int cy = grid_cell_row_of(pi->pos_row);
     *out_gx_lo = (cx - 1 < 0) ? 0 : cx - 1;
-    *out_gx_hi = (cx + 1 >= g_grid.active_cols) ? g_grid.active_cols - 1 : cx + 1;
+    *out_gx_hi = (cx + 1 >= g_spatial_grid.active_cols) ? g_spatial_grid.active_cols - 1 : cx + 1;
     *out_gy_lo = (cy - 1 < 0) ? 0 : cy - 1;
-    *out_gy_hi = (cy + 1 >= g_grid.active_rows) ? g_grid.active_rows - 1 : cy + 1;
+    *out_gy_hi = (cy + 1 >= g_spatial_grid.active_rows) ? g_spatial_grid.active_rows - 1 : cy + 1;
 }
 
 /* Contribution to pi's density estimate from neighbour pj.
@@ -1258,8 +1471,8 @@ static inline double squared_kernel_contribution(const Particle *pi,
  * 30×8 cells (~6 particles/cell), ~50 kernel evaluations per particle.
  */
 static void density_pass(void) {
-    for (int i = 0; i < g_world.count; i++) {
-        Particle *pi = &g_world.pool[i];
+    for (int i = 0; i < g_particle_pool.count; i++) {
+        Particle *pi = &g_particle_pool.pool[i];
         pi->density_estimate = 0.0;
 
         int gx_lo, gx_hi, gy_lo, gy_hi;
@@ -1267,9 +1480,9 @@ static void density_pass(void) {
 
         for (int gy = gy_lo; gy <= gy_hi; gy++) {
             for (int gx = gx_lo; gx <= gx_hi; gx++) {
-                for (int j = g_grid.head[gy][gx]; j != -1; j = g_grid.next[j]) {
+                for (int j = g_spatial_grid.head[gy][gx]; j != -1; j = g_spatial_grid.next[j]) {
                     pi->density_estimate +=
-                        squared_kernel_contribution(pi, &g_world.pool[j]);
+                        squared_kernel_contribution(pi, &g_particle_pool.pool[j]);
                 }
             }
         }
@@ -1289,7 +1502,7 @@ static void density_pass(void) {
  *                              / (ρᵢ + DENSITY_DIVIDE_GUARD)
  *   pi.accel += pressure_force_along_dx · (Δcol, Δrow)
  *
- *   if g_world.viscosity_enabled:
+ *   if s->sim.viscosity_enabled:
  *     visc_weight = -w_signed   (positive inside support)
  *     pi.accel += (vⱼ - vᵢ) · K_viscosity · visc_weight
  *
@@ -1300,9 +1513,9 @@ static void density_pass(void) {
  * ONLY external body force in this demo; setting it as a baseline
  * (not adding it inside the pair loop) is cleaner and avoids
  * accidentally scaling g by neighbour count.                        */
-static inline void apply_gravity_baseline(Particle *pi) {
+static inline void apply_gravity_baseline(Particle *pi, const Scene *s) {
     pi->accel_col = 0.0;
-    pi->accel_row = g_world.gravity_enabled ? GRAVITY_G : 0.0;
+    pi->accel_row = s->sim.gravity_enabled ? GRAVITY_G : 0.0;
 }
 
 /* Add the SPH pressure force from pj to pi's acceleration accumulator.
@@ -1344,7 +1557,8 @@ static inline void apply_viscosity_pair_force(Particle *pi,
  * from pj onto pi.  Skips self (i == j) and out-of-kernel pairs
  * (w_signed == 0). */
 static inline void apply_sph_pair_forces(Particle *pi, int i,
-                                          const Particle *pj, int j) {
+                                          const Particle *pj, int j,
+                                          const Scene *s) {
     if (j == i)
         return;
     double dc, dr;
@@ -1354,7 +1568,7 @@ static inline void apply_sph_pair_forces(Particle *pi, int i,
         return;  /* out of range */
 
     apply_pressure_pair_force(pi, pj, dc, dr, w_signed);
-    if (g_world.viscosity_enabled)
+    if (s->sim.viscosity_enabled)
         apply_viscosity_pair_force(pi, pj, w_signed);
 }
 
@@ -1373,19 +1587,19 @@ static inline void apply_sph_pair_forces(Particle *pi, int i,
  * velocity disparities.  Together they reproduce incompressible
  * fluid flow.  Refs [3] Monaghan 1992; [5] Müller 2003.
  */
-static void forces_pass(void) {
-    for (int i = 0; i < g_world.count; i++) {
-        Particle *pi = &g_world.pool[i];
+static void forces_pass(const Scene *s) {
+    for (int i = 0; i < g_particle_pool.count; i++) {
+        Particle *pi = &g_particle_pool.pool[i];
 
-        apply_gravity_baseline(pi);
+        apply_gravity_baseline(pi, s);
 
         int gx_lo, gx_hi, gy_lo, gy_hi;
         cell_block_around(pi, &gx_lo, &gx_hi, &gy_lo, &gy_hi);
 
         for (int gy = gy_lo; gy <= gy_hi; gy++) {
             for (int gx = gx_lo; gx <= gx_hi; gx++) {
-                for (int j = g_grid.head[gy][gx]; j != -1; j = g_grid.next[j]) {
-                    apply_sph_pair_forces(pi, i, &g_world.pool[j], j);
+                for (int j = g_spatial_grid.head[gy][gx]; j != -1; j = g_spatial_grid.next[j]) {
+                    apply_sph_pair_forces(pi, i, &g_particle_pool.pool[j], j, s);
                 }
             }
         }
@@ -1438,8 +1652,8 @@ static inline void enforce_wall_bounce_axis(double *pos, double *vel,
  * integrate_pass — symplectic Euler step + wall bounce.
  *
  * Pseudocode:
- *   (col_lo, col_hi) = (1, g_world.phys_cols - 2)   ← walls 1 cell in
- *   (row_lo, row_hi) = (1, g_world.phys_rows - 2)
+ *   (col_lo, col_hi) = (1, s->world.width - 2)   ← walls 1 cell in
+ *   (row_lo, row_hi) = (1, s->world.height - 2)
  *   for each particle p:
  *     symplectic_euler_velocity_step(p, dt)       (v += a·dt)
  *     symplectic_euler_position_step(p, dt)       (x += v_new·dt)
@@ -1450,12 +1664,14 @@ static inline void enforce_wall_bounce_axis(double *pos, double *vel,
  * The walls are placed ONE cell inside the physics area so the
  * particles are visible against the border drawn at the edge.
  */
-static void integrate_pass(void) {
-    const double col_lo = 1.0,                              col_hi = (double)(g_world.phys_cols - 2);
-    const double row_lo = 1.0,                              row_hi = (double)(g_world.phys_rows - 2);
+static void integrate_pass(const Scene *s) {
+    /* Walls one cell inside the phys-area so particles render INSIDE
+     * the drawn border (drawn at the very edge). */
+    const double col_lo = 1.0, col_hi = (double)(s->world.width  - 2);
+    const double row_lo = 1.0, row_hi = (double)(s->world.height - 2);
 
-    for (int i = 0; i < g_world.count; i++) {
-        Particle *p = &g_world.pool[i];
+    for (int i = 0; i < g_particle_pool.count; i++) {
+        Particle *p = &g_particle_pool.pool[i];
         symplectic_euler_velocity_step(p, SPH_DT);
         symplectic_euler_position_step(p, SPH_DT);
         enforce_wall_bounce_axis(&p->pos_col, &p->vel_col, col_lo, col_hi);
@@ -1474,11 +1690,11 @@ static void integrate_pass(void) {
  *   3. forces_pass      — needs grid + density; produces accel
  *   4. integrate_pass   — needs accel; produces new pos / vel
  */
-static void sph_step(void) {
-  grid_rebuild();
-  density_pass();
-  forces_pass();
-  integrate_pass();
+static void sph_step(const Scene *s) {
+  grid_rebuild  (s);
+  density_pass  ();
+  forces_pass   (s);
+  integrate_pass(s);
 }
 
 /* ===================================================================== */
@@ -1496,64 +1712,54 @@ static void sph_step(void) {
  *   5 RAIN               curtain of particles falling from top
  */
 
-static void scene_load_blob_drop(void) {
-  int cx = g_world.phys_cols / 2;
+static void scene_load_blob_drop(const Scene *s) {
+  int cx = s->world.width / 2;
   particle_spawn_blob(cx, 6, 12);
 }
 
-static void scene_load_column_collapse(void) {
-  int cx = g_world.phys_cols / 2;
+static void scene_load_column_collapse(const Scene *s) {
+  int cx = s->world.width / 2;
   particle_spawn_rectangle(cx - 18, 2, 36, 16);
 }
 
-static void scene_load_fountain(void) {
-  int cx = g_world.phys_cols / 2;
-  int floor_row = g_world.phys_rows - 4;
+static void scene_load_fountain(const Scene *s) {
+  int cx        = s->world.width  / 2;
+  int floor_row = s->world.height - 4;
   for (int i = 0; i < 700; i++) {
     int dx = rand_in_range(-4, 5);
     particle_spawn_at((double)(cx + dx), (double)floor_row);
   }
 }
 
-static void scene_load_collision(void) {
-  int cx = g_world.phys_cols / 2;
-  int cy = g_world.phys_rows / 2;
+static void scene_load_collision(const Scene *s) {
+  int cx = s->world.width  / 2;
+  int cy = s->world.height / 2;
   particle_spawn_blob(cx - 20, cy, 10);
   particle_spawn_blob(cx + 20, cy, 10);
   /* First half of the spawn list is the LEFT blob, second half the
    * RIGHT.  Slam them together. */
-  int half = g_world.count / 2;
-  for (int i = 0; i < g_world.count; i++)
-    g_world.pool[i].vel_col = (i < half) ? 2.5 : -2.5;
+  int half = g_particle_pool.count / 2;
+  for (int i = 0; i < g_particle_pool.count; i++)
+    g_particle_pool.pool[i].vel_col = (i < half) ? 2.5 : -2.5;
 }
 
-static void scene_load_rain(void) {
+static void scene_load_rain(const Scene *s) {
   for (int i = 0; i < 800; i++) {
-    int col = rand_in_range(2, g_world.phys_cols - 2);
+    int col = rand_in_range(2, s->world.width - 2);
     int row = rand_in_range(1, 7);
     particle_spawn_at((double)col, (double)row);
   }
 }
 
-/* Dispatch helper. */
-static void scene_load_by_id(int id) {
-  g_world.count = 0;
+/* Dispatch helper — clear pool, then fill via the active preset. */
+static void scene_load_by_id(Scene *s, int id) {
+  g_particle_pool.count = 0;
   switch (id) {
-  case 1:
-    scene_load_blob_drop();
-    break;
-  case 2:
-    scene_load_column_collapse();
-    break;
-  case 3:
-    scene_load_fountain();
-    break;
-  case 4:
-    scene_load_collision();
-    break;
-  case 5:
-    scene_load_rain();
-    break;
+  case 1: scene_load_blob_drop      (s); break;
+  case 2: scene_load_column_collapse(s); break;
+  case 3: scene_load_fountain       (s); break;
+  case 4: scene_load_collision      (s); break;
+  case 5: scene_load_rain           (s); break;
   default:
     break;
   }
@@ -1579,73 +1785,38 @@ static const char *scene_name_of(int id) {
 /* ===================================================================== */
 /* §14  scene — scene state + tick orchestrator                          */
 /* ===================================================================== */
-
-/*
- * Scene — what the user has chosen to look at, and whether time runs.
- *
- * Intent
- *   Unlike the other demos in this folder, fluid_sph.c keeps the bulk
- *   of simulation state OUTSIDE Scene — g_world.pool[] /
- *   g_world.count / g_world.phys_cols / g_world.phys_rows are file-scope globals
- *   because every physics pass loops over all of them and threading
- *   them through helpers would obscure the math.  Scene therefore
- *   carries only the THREE pieces of state that need to survive a
- *   reset: which preset is loaded, which theme is in effect, and
- *   whether time is paused.
- *
- * Locality (sim vs render)
- *   - active_id     → simulation (decides which scene_load_*() ran
- *                     and therefore which particles populated the
- *                     pool).  Read by the reset key and the HUD label.
- *   - theme_index   → pure rendering (selects which ColorTheme is
- *                     applied to the density pairs).  Changing it
- *                     MUST NOT touch the particle pool — only
- *                     repaints colour pairs via colors_apply_theme().
- *   - paused        → control state.  Gates scene_tick() and drives
- *                     the HUD "PAUSED" tag.
- *
- *   Mis-classifying theme_index as sim (and accidentally rebuilding
- *   particles on theme change) would break the engine-toggle
- *   invariant that "changing the look doesn't disturb the physics".
- *
- * Why these specific fields and no others
- *   Particles, grid bounds, kernel parameters, and the spatial-hash
- *   table are file-scope statics; bringing them into Scene would
- *   bloat the struct without helping the few helpers that legitimately
- *   need them.
- *
- * Reference [10] Raymond on the scene-paint pipeline that feeds off
- *   theme_index + paused.
- */
-typedef struct {
-    /* ── Simulation selector (read by reset path + HUD label) ──── */
-    int  active_id;     /* 1..SCENE_COUNT — which preset is loaded   */
-
-    /* ── Pure render state (read by colors_apply_theme only) ──── */
-    int  theme_index;   /* 0..THEME_COUNT-1 — indexes ColorTheme    */
-
-    /* ── Control state (gates scene_tick + HUD "PAUSED" tag) ──── */
-    bool paused;
-} Scene;
+/* (Scene + World + SimControls typedefs hoisted to §7.5 — see above,
+ *  before the SPH passes that take `const Scene *s`.)                   */
 
 static void scene_init(Scene *s, int cols, int rows) {
-  s->active_id = 1;
-  s->theme_index = 0;
-  s->paused = false;
-  g_world.gravity_enabled = true;
-  g_world.viscosity_enabled = true;
-  g_world.phys_cols = cols;
-  g_world.phys_rows = rows - HUD_RESERVED_ROWS;
+  /* (1) reset selectors + control flags */
+  s->active_id              = 1;
+  s->theme_index            = 0;
+  s->sim.paused             = false;
+  s->sim.gravity_enabled    = true;
+  s->sim.viscosity_enabled  = true;
+
+  /* (2) physics-area extent from current terminal (reserve HUD strip) */
+  s->world.width  = cols;
+  s->world.height = rows - HUD_RESERVED_ROWS;
+
+  /* (3) wire pointers to the file-scope BSS pool + grid */
+  s->particles    = &g_particle_pool;
+  s->grid         = &g_spatial_grid;
+
+  /* (4) apply colour theme + load initial preset */
   colors_apply_theme(s->theme_index);
-  scene_load_by_id(s->active_id);
+  scene_load_by_id(s, s->active_id);
 }
 
 static void scene_tick(Scene *s, int cols, int rows) {
-  if (s->paused)
-    return;
-  g_world.phys_cols = cols;
-  g_world.phys_rows = rows - HUD_RESERVED_ROWS;
-  sph_step();
+  if (s->sim.paused) return;
+
+  /* refresh world extent each tick so SIGWINCH propagates cleanly */
+  s->world.width  = cols;
+  s->world.height = rows - HUD_RESERVED_ROWS;
+
+  sph_step(s);
 }
 
 /* ===================================================================== */
@@ -1685,6 +1856,26 @@ static void scene_tick(Scene *s, int cols, int rows) {
  *   (fewer neighbours within smoothing radius) than interior cells.
  *   Tiering by density rather than count means droplets and spray
  *   render as the dim edge tier even when they're locally dense.
+ */
+/*
+ * Members
+ *   glyph        ASCII character drawn at the cell.  '#' for CORE
+ *                tier, 'o' for BODY, '.' for EDGE.  Tier choice in
+ *                density_to_render().
+ *   pair_id      ncurses colour pair number — PAIR_DENSITY_CORE /
+ *                _BODY / _EDGE.  Pair foreground is set by the
+ *                active ColorTheme.
+ *   extra_attr   A_BOLD for the CORE tier (bumps brightness so the
+ *                densest cells stand out); A_NORMAL otherwise.
+ *
+ * Invariants
+ *   glyph is a printable ASCII character (0x20–0x7E).
+ *   pair_id ∈ {PAIR_DENSITY_CORE, PAIR_DENSITY_BODY, PAIR_DENSITY_EDGE}.
+ *
+ * References
+ *   [5] Müller et al. 2003 §5 — density-based surface visualisation,
+ *       inspiration for the tiering-by-ρ rendering choice.
+ *  [10] Raymond NCURSES-HOWTO §6 — colour pair / attribute combination.
  */
 typedef struct {
     char   glyph;        /* '@' '*' '.' depending on density tier */
@@ -1771,8 +1962,8 @@ static inline void paint_particle_cell(WINDOW *w, int row, int col,
  *     paint_particle_cell(win, row, col, dr)
  */
 static void render_particles(WINDOW *w, int cols, int phys_area_rows) {
-    for (int i = 0; i < g_world.count; i++) {
-        const Particle *p = &g_world.pool[i];
+    for (int i = 0; i < g_particle_pool.count; i++) {
+        const Particle *p = &g_particle_pool.pool[i];
 
         int col, row;
         particle_to_screen_cell(p, &col, &row);
@@ -1790,25 +1981,65 @@ static void render_particles(WINDOW *w, int cols, int phys_area_rows) {
 /* ===================================================================== */
 /* §16  render_border — frame around the simulation area                 */
 /* ===================================================================== */
+
+/* ASCII box-drawing glyphs (CLAUDE.md ASCII-Only Rendering rule: no
+ * Unicode box characters). */
+enum {
+    BORDER_GLYPH_HORIZONTAL = '-',
+    BORDER_GLYPH_VERTICAL   = '|',
+    BORDER_GLYPH_CORNER     = '+',
+};
+
+/* Draw the top + bottom edges (horizontal rules) of the simulation box. */
+static inline void draw_horizontal_edges(WINDOW *w, int cols,
+                                          int top_row, int bottom_row) {
+    for (int c = 0; c < cols; c++) {
+        mvwaddch(w, top_row,    c, BORDER_GLYPH_HORIZONTAL);
+        mvwaddch(w, bottom_row, c, BORDER_GLYPH_HORIZONTAL);
+    }
+}
+
+/* Draw the left + right edges (vertical rules), skipping the corner
+ * rows so draw_corners can stamp '+' there without contention. */
+static inline void draw_vertical_edges(WINDOW *w, int cols,
+                                        int top_row, int bottom_row) {
+    int right_col = cols - 1;
+    for (int r = top_row + 1; r < bottom_row; r++) {
+        mvwaddch(w, r, 0,         BORDER_GLYPH_VERTICAL);
+        mvwaddch(w, r, right_col, BORDER_GLYPH_VERTICAL);
+    }
+}
+
+/* Stamp the four corner '+' glyphs.  Done last so they over-write any
+ * horizontal/vertical glyph that landed at the corner cells. */
+static inline void draw_corners(WINDOW *w, int cols,
+                                 int top_row, int bottom_row) {
+    int right_col = cols - 1;
+    mvwaddch(w, top_row,    0,         BORDER_GLYPH_CORNER);
+    mvwaddch(w, top_row,    right_col, BORDER_GLYPH_CORNER);
+    mvwaddch(w, bottom_row, 0,         BORDER_GLYPH_CORNER);
+    mvwaddch(w, bottom_row, right_col, BORDER_GLYPH_CORNER);
+}
+
 /*
+ * render_border — paint the ASCII frame around the simulation area.
+ *
  * Drawn LAST so it always appears on top of any overflow particles.
  * Uses A_NORMAL (not A_DIM) per CLAUDE.md theme-brightness rule.
+ *
+ *   (1) horizontal edges (top + bottom)
+ *   (2) vertical edges (left + right, skipping corners)
+ *   (3) four corner '+' glyphs (over-stamp the corner cells)
  */
 static void render_border(WINDOW *w, int cols, int phys_area_rows) {
-  wattron(w, COLOR_PAIR(PAIR_BORDER));
-  for (int c = 0; c < cols; c++) {
-    mvwaddch(w, 0, c, '-');
-    mvwaddch(w, phys_area_rows - 1, c, '-');
-  }
-  for (int r = 1; r < phys_area_rows - 1; r++) {
-    mvwaddch(w, r, 0, '|');
-    mvwaddch(w, r, cols - 1, '|');
-  }
-  mvwaddch(w, 0, 0, '+');
-  mvwaddch(w, 0, cols - 1, '+');
-  mvwaddch(w, phys_area_rows - 1, 0, '+');
-  mvwaddch(w, phys_area_rows - 1, cols - 1, '+');
-  wattroff(w, COLOR_PAIR(PAIR_BORDER));
+    enum { TOP_ROW = 0 };
+    int bottom_row = phys_area_rows - 1;
+
+    wattron(w, COLOR_PAIR(PAIR_BORDER));
+    draw_horizontal_edges(w, cols, TOP_ROW, bottom_row);
+    draw_vertical_edges  (w, cols, TOP_ROW, bottom_row);
+    draw_corners         (w, cols, TOP_ROW, bottom_row);
+    wattroff(w, COLOR_PAIR(PAIR_BORDER));
 }
 
 /* ===================================================================== */
@@ -1828,10 +2059,10 @@ static void hud_paint_status(WINDOW *w, int cols, double fps_display,
   snprintf(buf, sizeof buf,
            " %5.1f fps  sim:%3dHz  scene:%-9s  n:%4d  "
            "g:%s  v:%s  theme:%-7s  %s ",
-           fps_display, sim_hz, scene_name_of(s->active_id), g_world.count,
-           g_world.gravity_enabled ? "ON" : "off", g_world.viscosity_enabled ? "ON" : "off",
+           fps_display, sim_hz, scene_name_of(s->active_id), g_particle_pool.count,
+           s->sim.gravity_enabled ? "ON" : "off", s->sim.viscosity_enabled ? "ON" : "off",
            color_theme_table[s->theme_index].name,
-           s->paused ? "PAUSED " : "running");
+           s->sim.paused ? "PAUSED " : "running");
   int len = (int)strlen(buf);
   int x = cols - len;
   if (x < 0)
@@ -1854,12 +2085,50 @@ static void hud_paint_hint(WINDOW *w, int rows) {
 /* ===================================================================== */
 
 /*
- * Screen — terminal extent record.  ncurses owns the buffers; we keep
- * only cell dimensions for HUD placement and field clipping.
+ * Screen — terminal cell extent + ncurses lifecycle wrapper.
  *
- * Render pipeline (one frame): erase → scene_paint → hud_paint_*
- *   → wnoutrefresh(stdscr) → doupdate().  Diff-only writes to the
- *   terminal — no flicker.  See [10] Raymond §11.
+ * Intent
+ *   Owns the TERMINAL side of the world.  Where Scene.world tracks
+ *   the physics-area extent in cells, this struct tracks the FULL
+ *   terminal grid that ncurses paints onto.  The two are linked:
+ *
+ *      Scene.world.width  = Screen.cols
+ *      Scene.world.height = Screen.rows − HUD_RESERVED_ROWS
+ *
+ *   Reserving the bottom HUD_RESERVED_ROWS rows for the HUD strip
+ *   means the simulation never paints into them; the HUD always
+ *   has clean canvas regardless of fluid activity.
+ *
+ *   Keeping Screen and World in SEPARATE structs lets a future
+ *   resize update Screen.cols/rows first (from getmaxyx) and then
+ *   propagate the truncated extent into Scene.world in scene_tick
+ *   — a single point of contact between rendering and simulation.
+ *
+ * Why a tiny 2-field struct (not flat ints on App)
+ *   • Lifecycle isolation: only screen_init / screen_resize /
+ *     screen_cleanup / screen_present_frame touch ncurses' initscr
+ *     / endwin / mvprintw.  They all take `Screen *` to make this
+ *     layer explicit at the type level.
+ *   • Symmetry with World: simulation and rendering each get one
+ *     struct named for the space they live in.
+ *
+ * Render pipeline (one frame)
+ *   erase → render_particles → render_border → hud_paint_status →
+ *   hud_paint_hint → wnoutrefresh(stdscr) → doupdate().  Diff-only
+ *   writes to the terminal — no flicker.
+ *
+ * Members
+ *   cols   Terminal width in CELLS (from getmaxyx).
+ *   rows   Terminal height in CELLS.  Bottom row index is rows − 1
+ *          (where the key hint paints).
+ *
+ * Invariants
+ *   cols > 0, rows > HUD_RESERVED_ROWS (otherwise no room for
+ *   simulation; assumed throughout the codebase, not enforced).
+ *
+ * References
+ *   [10] Raymond *Art of UNIX Programming* §11 / NCURSES-HOWTO §6 —
+ *        diff-only render pipeline with wnoutrefresh + doupdate.
  */
 typedef struct {
     int cols;   /* terminal width  in cells (getmaxyx)             */
@@ -1903,7 +2172,65 @@ static void screen_present_frame(Screen *s, const Scene *sc, double fps_display,
 /* ===================================================================== */
 
 /*
- * App — top-level container; lives in BSS as the single app_state instance.
+ * FpsCounter — rolling-window frame-rate estimator.
+ *
+ * Intent
+ *   Per-frame fps would jitter wildly (a single 1 ms scheduler hiccup
+ *   swings the instantaneous reading by ~6 fps at 60 Hz).  This struct
+ *   accumulates frame_count + elapsed nanoseconds over a fixed window
+ *   (500 ms) and emits a smoothed `display` figure each time the
+ *   window fills, so the HUD reads a stable number.
+ *
+ *   Same shape as the FpsCounter on every other file in this project
+ *   (flocking.c, slime_mold.c, war.c, etc.) — adopting the shared
+ *   pattern means a reader who knows one knows them all.
+ *
+ * Lifecycle
+ *   fps_counter_init  — zero everything at startup.
+ *   fps_counter_tick  — call once per frame with the frame's dt (ns).
+ *                       Emits a fresh `display` only when the window
+ *                       fills.
+ *
+ * Members
+ *   frame_count   Frames seen in the current window.
+ *   window_ns     Nanoseconds accumulated in the current window.
+ *   display       Smoothed FPS shown in the HUD top row.
+ *
+ * Invariants
+ *   frame_count ≥ 0, window_ns ≥ 0 between resets.
+ *   display ≥ 0 (zero until the first 500 ms window completes).
+ *
+ * References
+ *   [11] Fiedler 2014 — recommends a fixed smoothing window for any
+ *        in-game fps display, on the same reasoning: per-frame
+ *        readings are unstable, fixed-window averaging is the
+ *        simplest robust answer.
+ */
+typedef struct {
+  int     frame_count;
+  int64_t window_ns;
+  double  display;
+} FpsCounter;
+
+static void fps_counter_init(FpsCounter *f) {
+  f->frame_count = 0;
+  f->window_ns   = 0;
+  f->display     = 0.0;
+}
+
+static void fps_counter_tick(FpsCounter *f, int64_t dt) {
+  const int64_t FPS_WINDOW_NS = (int64_t)NS_PER_SEC / 2;     /* 500 ms */
+  f->frame_count++;
+  f->window_ns += dt;
+  if (f->window_ns < FPS_WINDOW_NS) return;
+  f->display     = (double)f->frame_count
+                 * (double)NS_PER_SEC / (double)f->window_ns;
+  f->frame_count = 0;
+  f->window_ns   = 0;
+}
+
+/*
+ * App — top-level container; lives in BSS as the single g_app instance.
  *
  * Intent
  *   Signal handlers (on_signal_*) need to reach state that the main
@@ -1923,83 +2250,95 @@ static void screen_present_frame(Screen *s, const Scene *sc, double fps_display,
  *   App keeps Scene free of timing detail.
  */
 typedef struct {
-    Scene  scene;                          /* world + control state    */
-    Screen screen;                         /* terminal extent          */
-    int    sim_hz;                         /* sim tick rate, Hz        */
+    Scene      scene;                      /* world + control state    */
+    Screen     screen;                     /* terminal extent          */
+    FpsCounter fps;                        /* rolling-window fps       */
+    int        sim_hz;                     /* sim tick rate, Hz        */
     volatile sig_atomic_t running;         /* SIGINT/TERM clears this  */
     volatile sig_atomic_t need_resize;     /* SIGWINCH sets this       */
 } App;
 
-static App app_state;
+static App g_app;
 
 static void on_signal_quit(int sig) {
   (void)sig;
-  app_state.running = 0;
+  g_app.running = 0;
 }
 static void on_signal_resize(int sig) {
   (void)sig;
-  app_state.need_resize = 1;
+  g_app.need_resize = 1;
 }
 
-/* Input handler.  Returns false if the user pressed quit. */
+/* Named action helpers — each maps to one key in the dispatcher
+ * below.  Centralising them keeps app_handle_key as a flat switch
+ * that reads as "key → named action" rather than inline mutations. */
+
+/* spawn_random_top_blob — drop a small random blob near the top
+ * row.  The 3-cell inset prevents spawn at the wall. */
+static void spawn_random_top_blob(const Scene *s) {
+  enum { TOP_BLOB_RADIUS = 3, EDGE_INSET = 3, TOP_ROW = 3 };
+  particle_spawn_blob(rand_in_range(EDGE_INSET, s->world.width - EDGE_INSET),
+                      TOP_ROW, TOP_BLOB_RADIUS);
+}
+
+/* cycle_theme — t/T → next palette index, wrap at THEME_COUNT,
+ * re-register the density colour pairs.  Pure render mutation —
+ * does not disturb the particle pool. */
+static void cycle_theme(Scene *s) {
+  s->theme_index = (s->theme_index + 1) % THEME_COUNT;
+  colors_apply_theme(s->theme_index);
+}
+
+/* adjust_sim_hz — ] / [ keys bump physics tick rate by ±SIM_HZ_STEP,
+ * clamped to [SIM_HZ_MIN, SIM_HZ_MAX].  Live change — the main loop
+ * picks up the new TICK_NS(sim_hz) on the very next iteration. */
+static void adjust_sim_hz(App *app, int delta) {
+  int next = app->sim_hz + delta;
+  if (next < SIM_HZ_MIN) next = SIM_HZ_MIN;
+  if (next > SIM_HZ_MAX) next = SIM_HZ_MAX;
+  app->sim_hz = next;
+}
+
+/* select_scene_preset — 1..5 keys load that scene preset; updates
+ * Scene.active_id (HUD reads it) and reseeds the particle pool. */
+static void select_scene_preset(Scene *s, int new_id) {
+  s->active_id = new_id;
+  scene_load_by_id(s, new_id);
+}
+
+/*
+ * app_handle_key — process one keystroke.  Returns false to quit.
+ *
+ *   q / Q / ESC   quit
+ *   space         toggle paused
+ *   1..5          select_scene_preset
+ *   g / G         toggle gravity (forces_pass reads s->sim.gravity_enabled)
+ *   v / V         toggle viscosity (forces_pass reads s->sim.viscosity_enabled)
+ *   r / R         reload current scene (re-runs scene_load_by_id)
+ *   b / B         spawn_random_top_blob
+ *   t / T         cycle_theme
+ *   [ / ]         adjust_sim_hz by ∓SIM_HZ_STEP
+ */
 static bool app_handle_key(App *app, int ch) {
   Scene *s = &app->scene;
   switch (ch) {
-  case 'q':
-  case 'Q':
-  case 27:
-    return false;
+  case 'q': case 'Q': case 27 /* ESC */: return false;
+  case ' ':           s->sim.paused = !s->sim.paused;                break;
 
-  case ' ':
-    s->paused = !s->paused;
-    break;
+  case '1': case '2': case '3': case '4': case '5':
+                      select_scene_preset(s, ch - '0');              break;
 
-  case '1':
-  case '2':
-  case '3':
-  case '4':
-  case '5':
-    s->active_id = ch - '0';
-    scene_load_by_id(s->active_id);
-    break;
+  case 'g': case 'G': s->sim.gravity_enabled   = !s->sim.gravity_enabled;   break;
+  case 'v': case 'V': s->sim.viscosity_enabled = !s->sim.viscosity_enabled; break;
 
-  case 'g':
-  case 'G':
-    g_world.gravity_enabled = !g_world.gravity_enabled;
-    break;
+  case 'r': case 'R': scene_load_by_id(s, s->active_id);             break;
+  case 'b': case 'B': spawn_random_top_blob(s);                      break;
+  case 't': case 'T': cycle_theme(s);                                break;
 
-  case 'v':
-  case 'V':
-    g_world.viscosity_enabled = !g_world.viscosity_enabled;
-    break;
+  case ']':           adjust_sim_hz(app, +SIM_HZ_STEP);              break;
+  case '[':           adjust_sim_hz(app, -SIM_HZ_STEP);              break;
 
-  case 'r':
-  case 'R':
-    scene_load_by_id(s->active_id);
-    break;
-
-  case 'b':
-  case 'B':
-    particle_spawn_blob(rand_in_range(3, g_world.phys_cols - 3), 3, 3);
-    break;
-
-  case 't':
-  case 'T':
-    s->theme_index = (s->theme_index + 1) % THEME_COUNT;
-    colors_apply_theme(s->theme_index);
-    break;
-
-  case ']':
-    if (app->sim_hz + SIM_HZ_STEP <= SIM_HZ_MAX)
-      app->sim_hz += SIM_HZ_STEP;
-    break;
-  case '[':
-    if (app->sim_hz - SIM_HZ_STEP >= SIM_HZ_MIN)
-      app->sim_hz -= SIM_HZ_STEP;
-    break;
-
-  default:
-    break;
+  default: break;
   }
   return true;
 }
@@ -2008,71 +2347,71 @@ static bool app_handle_key(App *app, int ch) {
 /* §20  main — entry point                                               */
 /* ===================================================================== */
 
+/*
+ * main — fixed-step accumulator game loop (Fiedler "Fix Your Timestep!").
+ *
+ *   (1) handle pending SIGWINCH; refresh Scene.world from new extent
+ *   (2) measure dt since last frame, capped at DT_CAP_NS
+ *   (3) drain sim_accum: scene_tick at fixed TICK_LEN_NS until caught up
+ *   (4) render + present
+ *   (5) rolling-window fps counter
+ *   (6) drain non-blocking input via app_handle_key
+ *   (7) sleep until FRAME_BUDGET_NS exhausted (frame cap)
+ */
 int main(void) {
   srand((unsigned int)(clock_now_ns() & 0xFFFFFFFF));
   atexit(screen_cleanup);
-  signal(SIGINT, on_signal_quit);
-  signal(SIGTERM, on_signal_quit);
+  signal(SIGINT,   on_signal_quit);
+  signal(SIGTERM,  on_signal_quit);
   signal(SIGWINCH, on_signal_resize);
 
-  App *app = &app_state;
+  App *app     = &g_app;
   app->running = 1;
-  app->sim_hz = SIM_HZ_DEFAULT;
+  app->sim_hz  = SIM_HZ_DEFAULT;
+  fps_counter_init(&app->fps);
 
   screen_init(&app->screen, 0);
-  scene_init(&app->scene, app->screen.cols, app->screen.rows);
+  scene_init (&app->scene, app->screen.cols, app->screen.rows);
 
-  /* Fixed-step accumulator (Glenn Fiedler "Fix Your Timestep!"). */
-  int64_t prev_ns = clock_now_ns();
+  const int64_t DT_CAP_NS       = 100 * NS_PER_MS;          /* avalanche guard */
+  const int64_t FRAME_BUDGET_NS = NS_PER_SEC / RENDER_FPS_CAP;
+
+  int64_t prev_ns      = clock_now_ns();
   int64_t sim_accum_ns = 0;
-
-  /* Sliding-window FPS counter. */
-  int frames_in_window = 0;
-  int64_t window_accum_ns = 0;
-  double fps_display = 0.0;
-
-  const int64_t frame_cap_ns = NS_PER_SEC / RENDER_FPS_CAP;
 
   while (app->running) {
     int64_t frame_start = clock_now_ns();
 
-    /* ── resize ── */
+    /* (1) handle pending SIGWINCH; refresh world from new extent */
     if (app->need_resize) {
       screen_resize(&app->screen);
-      g_world.phys_cols = app->screen.cols;
-      g_world.phys_rows = app->screen.rows - HUD_RESERVED_ROWS;
-      sim_accum_ns = 0;
+      app->scene.world.width  = app->screen.cols;
+      app->scene.world.height = app->screen.rows - HUD_RESERVED_ROWS;
+      sim_accum_ns     = 0;
       app->need_resize = 0;
     }
 
-    /* ── dt ── */
+    /* (2) measure dt, cap to prevent avalanche */
     int64_t dt_ns = frame_start - prev_ns;
-    prev_ns = frame_start;
-    if (dt_ns > 100 * NS_PER_MS)
-      dt_ns = 100 * NS_PER_MS;
+    prev_ns       = frame_start;
+    if (dt_ns > DT_CAP_NS) dt_ns = DT_CAP_NS;
 
-    /* ── fixed-step physics accumulator ── */
-    int64_t tick_ns = TICK_NS(app->sim_hz);
+    /* (3) drain accumulator: fixed-step physics until caught up */
+    const int64_t TICK_LEN_NS = TICK_NS(app->sim_hz);
     sim_accum_ns += dt_ns;
-    while (sim_accum_ns >= tick_ns) {
+    while (sim_accum_ns >= TICK_LEN_NS) {
       scene_tick(&app->scene, app->screen.cols, app->screen.rows);
-      sim_accum_ns -= tick_ns;
+      sim_accum_ns -= TICK_LEN_NS;
     }
 
-    /* ── render + present ── */
-    screen_present_frame(&app->screen, &app->scene, fps_display, app->sim_hz);
+    /* (4) render + present */
+    screen_present_frame(&app->screen, &app->scene,
+                         app->fps.display, app->sim_hz);
 
-    /* ── fps window ── */
-    frames_in_window++;
-    window_accum_ns += dt_ns;
-    if (window_accum_ns >= FPS_RECOMPUTE_MS * NS_PER_MS) {
-      fps_display = (double)frames_in_window /
-                    ((double)window_accum_ns / (double)NS_PER_SEC);
-      frames_in_window = 0;
-      window_accum_ns = 0;
-    }
+    /* (5) rolling-window fps counter */
+    fps_counter_tick(&app->fps, dt_ns);
 
-    /* ── input ── */
+    /* (6) drain input */
     int ch;
     while ((ch = getch()) != ERR) {
       if (!app_handle_key(app, ch)) {
@@ -2081,10 +2420,10 @@ int main(void) {
       }
     }
 
-    /* ── frame cap ── */
+    /* (7) frame cap: sleep so we don't burn the next slot's budget */
     int64_t spent = clock_now_ns() - frame_start;
-    if (spent < frame_cap_ns)
-      clock_sleep_ns(frame_cap_ns - spent);
+    if (spent < FRAME_BUDGET_NS)
+      clock_sleep_ns(FRAME_BUDGET_NS - spent);
   }
 
   return 0;

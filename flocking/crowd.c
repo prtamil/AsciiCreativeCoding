@@ -13,12 +13,23 @@
  * Section map:
  *   §1 config   — tunables: counts, speeds, radii, weights, queue layout
  *   §2 clock    — monotonic timer + sleep
- *   §3 color    — 7 colour pairs + PAIR_HUD/PAIR_HINT
- *   §4 coords   — pixel↔cell aspect-ratio bridge + Vec2 helpers
- *   §5 entity   — Person struct, person_spawn, person_step
- *   §6 steering — seek / flee / separate / align / cohere force generators
- *   §7 scene    — Scene state, six tick_* behaviours, scene_draw + mark_cell
- *   §8 app      — signals, resize, screen, main game loop
+ *   §3 color    — palette_xterm256 / palette_ansi8 + PAIR_HUD/PAIR_HINT
+ *   §4 coords   — pixel↔cell aspect-ratio bridge + Vec2 helpers + wrap /
+ *                 bounce / clamp boundary primitives
+ *   §5 entity   — Person struct, person_spawn, person_step (3-stage Euler),
+ *                 person_at_target / person_pick_random_target
+ *   §6 steering — steer_seek / steer_flee / steer_separate / steer_align /
+ *                 steer_cohere force generators (named-intermediate math)
+ *   §6.5        — blend2_forces / blend3_forces weighted-sum composer
+ *   §7 scene    — Scene + sub-structs (Crowd, Threat, SimControls); shared
+ *                 helpers (lerp_render_pos, gather/queue_approach_speed,
+ *                 queue_slot_for_index, threat_advance); six tick_*
+ *                 behaviours; scene_draw + draw_threat_marker /
+ *                 draw_queue_counter / draw_follow_leader / draw_person
+ *   §8 app      — POSIX signal flags, screen_init, draw_hud (hud_paint_text),
+ *                 clamp_all_active_people + handle_resize_if_pending,
+ *                 adjust_person_count + handle_input, FpsCounter
+ *                 (init+tick), drain_sim_accumulator, main game loop
  *
  * Keys:
  *   q / ESC    quit                     space      pause / resume
@@ -66,16 +77,75 @@
  *                  distance checks per tick, trivial at 60 Hz. A spatial
  *                  hash would scale to thousands; not needed here.
  *
- * References     : Reynolds, "Flocks, Herds, and Schools: A Distributed
- *                    Behavioral Model," SIGGRAPH 1987 — the original
- *                    boids paper.
- *                  Reynolds, "Steering Behaviors for Autonomous
- *                    Characters," 1999 (red3d.com/cwr/steer/) — the
- *                    canonical steering-behaviour primer.
- *                  Wikipedia: "Boids" — concise summary of the three
- *                    rules and the emergent flocking property.
- *                  Shiffman, *The Nature of Code*, ch. 6 — reading-level
- *                    walkthrough of the same forces used here.
+ * References
+ * ──────────
+ *   ── Original behavioural-steering papers ───────────────────────
+ *   [1] Reynolds, C. W. (1987), "Flocks, Herds, and Schools: A
+ *       Distributed Behavioral Model", SIGGRAPH '87 Computer Graphics
+ *       21(4), pp. 25-34 — the ORIGINAL boids paper.  Introduces
+ *       separation + alignment + cohesion as the three local rules
+ *       sufficient to generate flocking; coins "boid" (bird-oid).
+ *   [2] Reynolds, C. W. (1999), "Steering Behaviors for Autonomous
+ *       Characters", Game Developers Conference 1999.  Online at
+ *       https://www.red3d.com/cwr/steer/ — the canonical steering
+ *       primer: seek, flee, arrive, pursue, evade, wander, separate,
+ *       align, cohere, path-follow, obstacle-avoid.  This file's §6
+ *       is a direct subset.
+ *
+ *   ── Statistical-physics flocking models ────────────────────────
+ *   [3] Vicsek, T., Czirók, A., Ben-Jacob, E., Cohen, I. & Shochet, O.
+ *       (1995), "Novel type of phase transition in a system of self-
+ *       driven particles", Phys. Rev. Lett. 75(6), pp. 1226-1229 —
+ *       the canonical Vicsek model: align-with-neighbours + noise.
+ *       Establishes flocking as a continuous phase transition.
+ *   [4] Toner, J. & Tu, Y. (1995, 1998), "Long-Range Order in a
+ *       Two-Dimensional Dynamical XY Model: How Birds Fly Together"
+ *       (PRL 75, pp. 4326-4329) + "Flocks, herds, and schools"
+ *       (Phys. Rev. E 58, pp. 4828-4858) — hydrodynamic continuum
+ *       theory of flocking; the macroscopic field theory behind the
+ *       Vicsek microscopic model.
+ *
+ *   ── Crowd / pedestrian-dynamics models ─────────────────────────
+ *   [5] Helbing, D. & Molnár, P. (1995), "Social force model for
+ *       pedestrian dynamics", Phys. Rev. E 51(5), pp. 4282-4286 —
+ *       the social-force model: desired velocity + repulsion from
+ *       walls and neighbours.  More physically realistic than
+ *       Reynolds steering for human crowds; this file's PANIC + QUEUE
+ *       modes are simplifications of the same idea.
+ *   [6] Helbing, D., Farkas, I. & Vicsek, T. (2000), "Simulating
+ *       dynamical features of escape panic", Nature 407(6803),
+ *       pp. 487-490 — applies the social-force model to evacuation;
+ *       directly relevant to this file's PANIC behaviour.
+ *
+ *   ── Collective-behaviour biology ───────────────────────────────
+ *   [7] Couzin, I. D., Krause, J., James, R., Ruxton, G. D. & Franks,
+ *       N. R. (2002), "Collective memory and spatial sorting in
+ *       animal groups", J. Theor. Biol. 218(1), pp. 1-11 — extends
+ *       boids with radius-based zones of repulsion / alignment /
+ *       attraction; explains how leadership and structure emerge.
+ *
+ *   ── Implementation-oriented textbooks ──────────────────────────
+ *   [8] Shiffman, D., "The Nature of Code", Ch. 6 — reading-level
+ *       walkthrough of Reynolds steering with Processing examples.
+ *       The single most accessible introduction; pair with [2].
+ *   [9] Millington, I. & Funge, J. (2019), "Artificial Intelligence
+ *       for Games" (3rd ed.), CRC Press — Ch. 3 covers every steering
+ *       primitive with pseudocode + integration math, alongside
+ *       higher-level decision systems.
+ *  [10] Buckland, M. (2004), "Programming Game AI by Example",
+ *       Wordware — Ch. 3 implements the Reynolds steering library in
+ *       C++ with the same five forces this file's §6 exposes.
+ *
+ *   ── Online quick reference ─────────────────────────────────────
+ *  [11] Wikipedia "Boids" — https://en.wikipedia.org/wiki/Boids —
+ *       concise statement of the three rules, history, and links to
+ *       implementations in every major language.
+ *
+ *   ── Companion file in this project ─────────────────────────────
+ *   See also: flocking/flocking.c — the same Reynolds rules in
+ *     isolation (boids only, no behaviour switching).  Read it first
+ *     if you want the three-rule story before the six-behaviour
+ *     toolbox below.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -89,16 +159,6 @@
  * "go toward neighbour centre". Add force×dt to velocity, cap velocity,
  * add velocity×dt to position. There is no global goal, no top-down
  * scheduling — every behaviour is just a different recipe of weights.
- *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine each person carries a backpack of springs pulling them toward
- * a few different targets at once: a "go where I want" spring, a "stay
- * away from each neighbour" spring per neighbour, sometimes an "align
- * with the herd" spring. The steering force is the resultant pull. The
- * velocity cap is a top speed; nobody can sprint faster than SPEED_MAX
- * regardless of how many springs are tugging. Switching behaviours
- * (1-6) just swaps which springs are active.
  *
  * ALGORITHM IN STEPS  (per tick, per person)
  * ──────────────────────────────────────────
@@ -151,56 +211,20 @@
  *     bounces (vel.x flips sign at the wall) so the threat
  *     traps the crowd; QUEUE clamps so people stop at the line.
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   - Coincident agents → divide by zero in v2norm. Guarded by
- *     `if (l > 0.001f)` in v2norm — returns zero vector below threshold.
- *   - Very small `count` in FOLLOW: if count==1 there are no followers,
- *     just a wandering leader. The loop `for i in 1..count` empties
- *     naturally. count==0 cannot happen because CROWD_MIN=5.
- *   - QUEUE slots fall off the left edge at high count: `slot_x` is
- *     clamped to one cell from the left so the trailing line stays
- *     visible rather than vanishing.
- *   - Resize: world_w/h is recomputed every tick from cols/rows, so
- *     scale-up is automatic. Scale-down clamps people into the new box
- *     in app_do_resize.
- *   - Frame cap: do NOT add dt back into elapsed (`elapsed = clock_ns() −
- *     frame_start`, no `+ dt`) — adding dt cancels the cap, sleep is 0,
- *     CPU pegs at 100 %.
- *
- * HOW TO VERIFY
- * ─────────────
- *   - Press 2 (FLOCK), wait 5 seconds: a clear flock or two should form,
- *     all agents pointing roughly the same direction. Lower W_ALIGN
- *     (recompile) and the flock dissolves into chaos — confirms
- *     alignment is what knits the flock.
- *   - Press 3 (PANIC): the cloud of agents flees away from '!' radially.
- *     The '!' moves slower than agents (THREAT_SPEED < SPEED_PANIC), so
- *     the cloud always escapes; if you crank W_FLEE down they get caught.
- *   - Press 4 (GATHER): all agents converge to centre, mill around at
- *     reduced speed within GATHER_SLOW_RADIUS. They never overshoot.
- *   - Press 5 (FOLLOW): the '@' leader wanders; a snake of agents
- *     trails behind. Each agent seeks the one immediately ahead, so the
- *     line bends as the leader turns.
- *   - Press 6 (QUEUE): agents converge to staggered slots in a 3-row
- *     line ending at the right-edge counter '>>|'.
- *
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
  *
  * Reading order
  * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order
- *      as prose. Read flocking.c first; that file's tutorials T1-T3
- *      cover the boid + three Reynolds rules. This file builds a
- *      LIBRARY of steering primitives (T1 below) and shows how to
- *      compose them into different behaviours (T2-T6).
+ *   1. CONCEPTS + MENTAL MODEL above — read first as prose.
+ *      Read flocking.c first for the three-rule story (separation +
+ *      alignment + cohesion).  This file extends that into a LIBRARY
+ *      of steering primitives composed by mode into six behaviours.
  *   2. §6 steering — a TOOLBOX of pure functions: seek, flee,
- *      separate, align, cohere. Read AFTER tutorials T1-T2.
- *   3. §7 scene — six tick_* functions, one per behaviour. Each
- *      composes 2-4 steering primitives with mode-specific
- *      weights. Read AFTER tutorials T3-T6.
+ *      separate, align, cohere.  Each is documented inline.
+ *   3. §7 scene — six tick_* functions, one per behaviour.  Each
+ *      composes 2-4 steering primitives with mode-specific weights.
  *   4. §5 entity — Person struct, integration step.
  *   5. §1-§4, §8 — config / clock / colour / coords / app loop.
  *      Skim if you've seen the framework.
@@ -236,204 +260,6 @@
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Six tutorials that build six behaviours from one steering
- * library.
- *
- *   T1  Steering as a LIBRARY of primitives, not a fixed algorithm
- *   T2  seek + flee — moving toward / away from a single target
- *   T3  Behaviour composition — six modes from five primitives
- *   T4  PANIC — bouncing topology + threat-avoidance
- *   T5  FOLLOW — chain-of-command pattern via per-Person target
- *   T6  QUEUE — slot-assignment as a goal-driven force
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  STEERING AS A LIBRARY OF PRIMITIVES, NOT A FIXED ALGORITHM
- * ──────────────────────────────────────────────────────────────
- * flocking.c hard-codes one steering function per mode. This
- * file factors out the common forces into REUSABLE PRIMITIVES:
- *
- *     seek    (pos, vel, target, speed) → force toward target
- *     flee    (pos, vel, threat, speed) → force away from threat
- *     separate(pos, neighbours, radius) → force away from crowd
- *     align   (vel, neighbours, radius) → force toward avg vel
- *     cohere  (pos, neighbours, radius) → force toward centre
- *
- * Each is a PURE FUNCTION returning a Vec2. They compose by
- * weighted sum:
- *
- *     force = W1·prim1 + W2·prim2 + W3·prim3 + ...
- *     vel  += force · dt
- *     pos  += vel · dt
- *
- * The library lives in §6 steering. Behaviour code in §7 scene
- * just CHOOSES WHICH PRIMITIVES TO COMBINE for its mode.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │   PRIMITIVES (§6)              BEHAVIOURS (§7)   │
- *      │                                                  │
- *      │   seek                         WANDER (1)        │
- *      │   flee                ──→      FLOCK  (2)        │
- *      │   separate            ──→      PANIC  (3)        │
- *      │   align                        GATHER (4)        │
- *      │   cohere              ──→      FOLLOW (5)        │
- *      │                                QUEUE  (6)        │
- *      │                                                  │
- *      │   pure functions               weighted sums     │
- *      └──────────────────────────────────────────────────┘
- *
- * That's the whole pattern: build the library once, call it
- * differently per behaviour. Same machinery scales to ANY
- * agent-based system.
- *
- * T2  seek + flee — MOVING TOWARD / AWAY FROM A SINGLE TARGET
- * ───────────────────────────────────────────────────────────
- * The most basic primitives are SEEK (toward) and FLEE (away).
- * Both work the same way with opposite signs:
- *
- *     SEEK(pos, vel, target, speed):
- *       desired = normalize(target - pos) · speed
- *       force   = desired - vel
- *
- * "What velocity would I LIKE to have? The one pointing AT the
- * target at full speed. Subtract my current velocity to get
- * the FORCE I need to apply."
- *
- *     FLEE = SEEK with target replaced by the threat, sign flipped:
- *       force = -SEEK(pos, vel, threat, speed)
- *
- * This kind of "desired velocity minus current velocity" gives
- * SMOOTH steering — the closer you are to the desired heading,
- * the smaller the corrective force. As distance to target
- * shrinks, the correction becomes proportionally smaller; the
- * agent decelerates naturally on arrival.
- *
- * (Reynolds 1999 calls this PROPORTIONAL STEERING. It's the
- * cheapest realistic-feeling steering law.)
- *
- * Examples in this file:
- *   - WANDER mode (1):  each Person has a random target;
- *                       seek pulls them there, then a new
- *                       random target.
- *   - PANIC mode (3):   flee from the '!' threat.
- *   - GATHER mode (4):  seek toward screen centre.
- *
- * T3  BEHAVIOUR COMPOSITION — SIX MODES FROM FIVE PRIMITIVES
- * ──────────────────────────────────────────────────────────
- * Each mode is a different SUM of primitives. Below is the
- * weight-table for this file (relative magnitudes; exact
- * numbers are in §1 config):
- *
- *           seek  flee  separ  align  cohere
- *   WANDER   1     -      -      -      -
- *   FLOCK    -     -      1      1      1
- *   PANIC    -     1      1      -      -
- *   GATHER   1     -      0.5    -      -
- *   FOLLOW   1     -      0.7    -      -
- *   QUEUE    1     -      0.3    -      -
- *
- * Notice the patterns:
- *
- *   - WANDER is JUST seek with random targets. Simplest mode.
- *   - FLOCK is the classic Reynolds combination — no per-agent
- *     target, just inter-agent forces.
- *   - PANIC and GATHER add SEPARATION to the basic seek/flee so
- *     people don't pile up at the goal.
- *   - FOLLOW and QUEUE are seek-based with custom per-person
- *     targets (T5, T6).
- *
- * Adding a NEW behaviour is therefore: pick weights, optionally
- * provide a per-person target. No new physics code needed.
- *
- * T4  PANIC — BOUNCING TOPOLOGY + THREAT-AVOIDANCE
- * ────────────────────────────────────────────────
- * Most modes use TOROIDAL (wrapping) topology — agents fall off
- * the right edge and reappear on the left. Good for flocking,
- * not for PANIC: the threat would never trap the crowd because
- * the crowd would just wrap to the other side of the threat.
- *
- * PANIC uses BOUNCING boundary instead:
- *
- *     if pos.x < 0:           pos.x = 0;       vel.x = -vel.x
- *     if pos.x > world_w - 1: pos.x = w-1;     vel.x = -vel.x
- *     same for y
- *
- * Now the threat HUNTS — agents flee, hit the wall, get
- * trapped, find a way around. Visually like real panic.
- *
- * The threat moves SLOWER than the panicking crowd
- * (THREAT_SPEED < SPEED_PANIC), so the crowd always (just
- * barely) escapes. Crank W_FLEE down and you'll watch them
- * get caught — useful for tuning.
- *
- * Decision: BOUNDARY topology is per-MODE, not per-file. Same
- * agents in WANDER wrap; in PANIC they bounce; in QUEUE they
- * clamp to the line. This is encoded in the per-tick mode
- * function in §7.
- *
- * T5  FOLLOW — CHAIN-OF-COMMAND PATTERN VIA PER-PERSON TARGET
- * ───────────────────────────────────────────────────────────
- * In FOLLOW mode, every person except the leader has its
- * target set to "the person AHEAD of me in the chain":
- *
- *     leader (index 0):     wanders (random target)
- *     person[1].target  =   leader.pos
- *     person[2].target  =   person[1].pos
- *     person[3].target  =   person[2].pos
- *     ...
- *
- * Each person seeks the one immediately ahead. As the leader
- * turns, person[1] turns to follow, person[2] turns to follow
- * person[1] (after a delay), and so on. The chain bends like
- * a snake.
- *
- * Same pattern reused in animation/snake_*.c (trail-buffer
- * body following the head). Here the chain is ASCII people
- * instead of body segments, but the geometry is identical:
- * each follower lags its leader by a fixed delay.
- *
- * The chain doesn't tear because every link's target is
- * UPDATED every tick (just before the steering computation).
- * As long as `person[i].target = person[i-1].pos` runs every
- * tick, the chain stays connected.
- *
- * T6  QUEUE — SLOT-ASSIGNMENT AS A GOAL-DRIVEN FORCE
- * ──────────────────────────────────────────────────
- * QUEUE mode pre-computes a SLOT POSITION for each person:
- *
- *     for i in 0 .. count-1:
- *       row = COUNTER_TOP + (i % 3)            ← three queue rows
- *       col = world_w - 4 - (i / 3)            ← receding from counter
- *       person[i].slot = (col · CELL_W, row · CELL_H)
- *
- * Then the per-person target IS that slot. Seek pulls each
- * person to their assigned slot; separation prevents
- * stacking when slots are tight.
- *
- * Properties:
- *   - The line is STAGGERED 3-wide so 30 people fit in only
- *     10 columns of horizontal space.
- *   - As `count` grows, slots extend leftward (clamped to
- *     1 cell from the screen edge so they stay visible).
- *   - Boundary is CLAMP — a person at slot near the edge
- *     simply stops there; no wrap, no bounce.
- *
- * This is a GENERAL pattern: REPLACE FREE-FORM TARGETS WITH
- * ASSIGNED SLOTS. Same idea is used in:
- *
- *   - flocking ORBIT mode (positions on a rotating ring)
- *   - parade/marching-band formations
- *   - team-sport positioning
- *
- * Whenever you want agents to fall into a SPECIFIC SHAPE,
- * give each agent its own target slot and let seek do the
- * rest. The shape is parameterised by the slot-assignment
- * code, not by global flock dynamics.
- *
- * ─────────────────────────────────────────────────────────────────────── */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -610,31 +436,41 @@ static void clock_sleep_ns(int64_t ns)
  *     PAIR_HUD  (8)  bright yellow 226 — top status bar, A_BOLD
  *     PAIR_HINT (9)  bright cyan   51  — bottom key hint, A_BOLD
  */
+/* palette_xterm256 — bright agent + HUD pairs picked from the 256-colour
+ * cube.  Every index sits in the BRIGHT half (≥ 33) so A_DIM stays legible. */
+static void palette_xterm256(void)
+{
+    init_pair(1, 196, -1);   /* red     */
+    init_pair(2, 208, -1);   /* orange  */
+    init_pair(3, 226, -1);   /* yellow  */
+    init_pair(4,  46, -1);   /* green   */
+    init_pair(5,  51, -1);   /* cyan    */
+    init_pair(6,  33, -1);   /* blue    */
+    init_pair(7, 201, -1);   /* magenta */
+    init_pair(PAIR_HUD,  226, -1);   /* bright yellow — top status bar  */
+    init_pair(PAIR_HINT,  51, -1);   /* bright cyan   — bottom key hint */
+}
+
+/* palette_ansi8 — fallback for 8-colour terminals; closest equivalents. */
+static void palette_ansi8(void)
+{
+    init_pair(1, COLOR_RED,     -1);
+    init_pair(2, COLOR_RED,     -1);
+    init_pair(3, COLOR_YELLOW,  -1);
+    init_pair(4, COLOR_GREEN,   -1);
+    init_pair(5, COLOR_CYAN,    -1);
+    init_pair(6, COLOR_BLUE,    -1);
+    init_pair(7, COLOR_MAGENTA, -1);
+    init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
+    init_pair(PAIR_HINT, COLOR_CYAN,   -1);
+}
+
 static void color_init(void)
 {
     start_color();
     use_default_colors();
-    if (COLORS >= 256) {
-        init_pair(1, 196, -1);   /* red     */
-        init_pair(2, 208, -1);   /* orange  */
-        init_pair(3, 226, -1);   /* yellow  */
-        init_pair(4,  46, -1);   /* green   */
-        init_pair(5,  51, -1);   /* cyan    */
-        init_pair(6,  33, -1);   /* blue    */
-        init_pair(7, 201, -1);   /* magenta */
-        init_pair(PAIR_HUD,  226, -1);
-        init_pair(PAIR_HINT,  51, -1);
-    } else {
-        init_pair(1, COLOR_RED,     -1);
-        init_pair(2, COLOR_RED,     -1);
-        init_pair(3, COLOR_YELLOW,  -1);
-        init_pair(4, COLOR_GREEN,   -1);
-        init_pair(5, COLOR_CYAN,    -1);
-        init_pair(6, COLOR_BLUE,    -1);
-        init_pair(7, COLOR_MAGENTA, -1);
-        init_pair(PAIR_HUD,  COLOR_YELLOW, -1);
-        init_pair(PAIR_HINT, COLOR_CYAN,   -1);
-    }
+    if (COLORS >= 256) palette_xterm256();
+    else               palette_ansi8();
 }
 
 /* ===================================================================== */
@@ -662,9 +498,32 @@ static inline int px_to_cell_y(float py)
 
 /* ── Vec2 — lightweight 2-D vector type ───────────────────────────── */
 /*
- * All physics quantities (position, velocity, force) are Vec2.
- * Using a named type instead of bare float pairs makes function
- * signatures read clearly and eliminates double-pointer output params.
+ * Vec2 — a 2-D vector used everywhere physics or geometry shows up.
+ *
+ * Intent
+ *   Position, velocity, acceleration, force, target offset — every
+ *   quantity that has an x and a y is one of these.  Functions return
+ *   Vec2 by value (no out-params), and the helpers v2add / v2sub /
+ *   v2scale / v2norm / v2clamp_len read like the math notation they
+ *   implement.
+ *
+ * Why a struct (not float[2] or two parameters)
+ *   • Named type makes function signatures read in the algorithm's
+ *     own vocabulary: `steer_seek(pos, vel, target, speed)` rather
+ *     than `steer_seek(px, py, vx, vy, tx, ty, speed)`.
+ *   • Return by value works on x86-64 + ARM ABIs without spilling
+ *     to memory; no perf penalty over passing two floats.
+ *   • Eliminates two-out-parameter idioms in the steering helpers.
+ *
+ * Members
+ *   x, y    Cartesian components in PIXEL space (px).  Cell space is
+ *           recovered via px_to_cell_x/y when rendering.
+ *
+ * References
+ *   [2] Reynolds 1999 — every steering primitive (seek, flee, separate,
+ *       align, cohere) returns a Vec2 force; this file mirrors that API.
+ *   [8] Shiffman, *The Nature of Code*, Ch. 1 — PVector pedagogy that
+ *       this type is the C analogue of.
  */
 typedef struct { float x, y; } Vec2;
 
@@ -755,12 +614,80 @@ static const char GLYPHS[] = "oO0abcdefghijklmnpqrstuvwxyz";
 #define N_GLYPHS ((int)(sizeof(GLYPHS) - 1))
 
 /*
- * Person — all per-entity state.
+ * Person — one agent in the steering simulation (Reynolds "boid").
  *
- * Grouped so a reader can scan the struct and see at a glance what
- * changes every tick (kinematic state) versus what was set once at
- * spawn (render identity). The two groups never cross — the renderer
- * never reads vel; the physics never reads glyph.
+ * Intent
+ *   The atomic unit of the crowd.  Each tick every Person computes a
+ *   weighted sum of steering forces (seek / flee / separate / align /
+ *   cohere), integrates the force into velocity (capped at SPEED_MAX),
+ *   and integrates velocity into position.  Six different behaviours
+ *   share the same Person — they differ only in which steering forces
+ *   their tick_* function applies.
+ *
+ * Why kinematic + render identity in ONE struct
+ *   The struct is split into two cleanly-disjoint groups:
+ *     • kinematic state — written by physics every tick;
+ *     • render identity — written ONCE at spawn, read only by the
+ *       renderer.
+ *   The two groups NEVER cross: physics never reads glyph/color, the
+ *   renderer never reads vel.  Keeping them in one struct lets the
+ *   crowd pool live in a single flat array (good for cache locality
+ *   across the O(N²) inner loop) without forcing parallel arrays.
+ *
+ * Why prev_pos
+ *   At any frame the simulation has done one or more fixed-timestep
+ *   ticks and may be PART-WAY into the next one.  Drawing always at
+ *   `pos` causes a stutter when render rate ≠ sim rate.  Snapshotting
+ *   the previous tick's position into `prev_pos` lets the renderer
+ *   draw at `lerp(prev_pos, pos, alpha)` — smooth motion at any
+ *   render-rate / sim-rate combination.  Same trick as Fiedler's
+ *   "Fix Your Timestep!" article.
+ *
+ * Why per-Person target
+ *   Most behaviours (WANDER, FOLLOW, QUEUE) give each Person an
+ *   INDIVIDUAL destination instead of a shared global target.  Storing
+ *   the target on the Person lets the steering primitive `steer_seek`
+ *   stay pure (no global lookup); the tick_* function decides what
+ *   the target IS for that mode.
+ *
+ * Members
+ *   ── kinematic state (mutated every tick) ────────────────────────
+ *   pos        current position in PIXEL space.  Cell-space rendering
+ *              recovers (col, row) via px_to_cell_x/y.
+ *   prev_pos   position at start of this tick.  Snapshotted by
+ *              person_step BEFORE pos is integrated, so the renderer
+ *              can lerp between the two for sub-tick smoothness.
+ *   vel        velocity in px/s, capped at SPEED_MAX (or SPEED_PANIC
+ *              in BEH_PANIC).  Mass implicitly = 1, so force·dt is
+ *              added directly to vel.
+ *   target     personal destination.  Read by steer_seek; written by
+ *              the active behaviour's tick_* (random wander point,
+ *              the person ahead in FOLLOW, the queue slot in QUEUE).
+ *
+ *   ── render identity (immutable after spawn) ──────────────────────
+ *   glyph      ASCII character (one of GLYPHS[]) drawn for this person.
+ *              Picked at spawn from a fixed glyph palette so the eye
+ *              can track individual agents through the crowd.
+ *   color      ncurses colour pair index in [1, N_COLORS].  Round-robin
+ *              + shuffle at spawn so adjacent indices don't share a
+ *              colour by construction.
+ *
+ * Invariants
+ *   pos ∈ world box (enforced by wrap_pos / bounce_pos / clamp_pos
+ *   in the active tick_* — choice depends on behaviour).
+ *   |vel| ≤ SPEED_MAX after person_step (or SPEED_PANIC in PANIC mode).
+ *   glyph + color set once at spawn; never mutated thereafter.
+ *
+ * References
+ *   [1] Reynolds 1987 — Person ≈ "boid": a point particle with a
+ *       desired velocity and a steering force budget.
+ *   [2] Reynolds 1999 §2 — the same kinematic model used here: force →
+ *       velocity → position, with velocity capped to max_speed.
+ *   Fiedler, "Fix Your Timestep!" — gafferongames.com/post/
+ *       fix_your_timestep — the prev_pos + alpha-lerp interpolation
+ *       pattern used by scene_draw.
+ *   [8] Shiffman *Nature of Code* Ch. 6 — same Person/Vehicle data
+ *       layout in Processing pseudocode.
  */
 typedef struct {
     /* kinematic state — written by physics every tick */
@@ -800,9 +727,35 @@ static void person_spawn(Person *p, int id, float ww, float wh)
  */
 static void person_step(Person *p, Vec2 accel, float dt)
 {
-    p->vel      = v2clamp_len(v2add(p->vel, v2scale(accel, dt)), SPEED_MAX);
+    /* (1) symplectic-Euler velocity update: v += a·dt, then cap at SPEED_MAX */
+    Vec2 vel_delta = v2scale(accel, dt);
+    Vec2 new_vel   = v2add(p->vel, vel_delta);
+    p->vel = v2clamp_len(new_vel, SPEED_MAX);
+
+    /* (2) snapshot prev_pos BEFORE moving — renderer lerps prev→pos by alpha */
     p->prev_pos = p->pos;
-    p->pos      = v2add(p->pos, v2scale(p->vel, dt));
+
+    /* (3) position update: x += v·dt */
+    Vec2 pos_delta = v2scale(p->vel, dt);
+    p->pos = v2add(p->pos, pos_delta);
+}
+
+/*
+ * person_at_target — arrival test used by WANDER / FOLLOW / threat:
+ *   true once |target − pos| drops below ARRIVE_DIST (~3 cells).
+ */
+static inline bool person_at_target(const Person *p)
+{
+    return v2len(v2sub(p->target, p->pos)) < ARRIVE_DIST;
+}
+
+/*
+ * person_pick_random_target — uniform-random destination across the
+ * world box.  Called after arrival so each person keeps wandering.
+ */
+static inline void person_pick_random_target(Person *p, float ww, float wh)
+{
+    p->target = v2(randf()*ww, randf()*wh);
 }
 
 /* ===================================================================== */
@@ -821,8 +774,14 @@ static void person_step(Person *p, Vec2 accel, float dt)
  */
 static Vec2 steer_seek(Vec2 pos, Vec2 vel, Vec2 target, float speed)
 {
-    Vec2 desired = v2scale(v2norm(v2sub(target, pos)), speed);
-    return v2sub(desired, vel);
+    /* offset       : displacement vector self → target
+     * toward_dir   : unit vector in that direction
+     * desired_vel  : full-speed velocity we WISH we had right now
+     * force        : how much we must add to vel to BECOME desired_vel */
+    Vec2 offset      = v2sub(target, pos);
+    Vec2 toward_dir  = v2norm(offset);
+    Vec2 desired_vel = v2scale(toward_dir, speed);
+    return v2sub(desired_vel, vel);
 }
 
 /*
@@ -838,9 +797,9 @@ static Vec2 steer_flee(Vec2 pos, Vec2 vel, Vec2 threat, float speed)
  * steer_separate — push away from all neighbours within SEP_RADIUS.
  *
  * For each neighbour closer than SEP_RADIUS:
- *   direction = normalise(my_pos − neighbour_pos)   ← point away
- *   strength  = (SEP_RADIUS − distance) / SEP_RADIUS ← closer = stronger
- *   force    += direction × strength × SPEED_BASE
+ *   push_dir                 = normalise(my_pos − neighbour_pos)   ← unit AWAY
+ *   personal_space_intrusion = (SEP_RADIUS − distance) / SEP_RADIUS ← closer = stronger
+ *   force += push_dir · personal_space_intrusion · SPEED_BASE
  *
  * The linear falloff means neighbours at the edge of the radius
  * contribute almost nothing; only very close ones produce strong pushes.
@@ -848,16 +807,28 @@ static Vec2 steer_flee(Vec2 pos, Vec2 vel, Vec2 threat, float speed)
  */
 static Vec2 steer_separate(const Person *people, int count, int self)
 {
+    const float DIST_EPSILON = 0.001f;       /* zero-distance guard */
     Vec2 force = v2(0, 0);
     Vec2 pos   = people[self].pos;
+
     for (int i = 0; i < count; i++) {
         if (i == self) continue;
-        Vec2  away = v2sub(pos, people[i].pos);
-        float d    = v2len(away);
-        if (d < SEP_RADIUS && d > 0.001f) {
-            float strength = (SEP_RADIUS - d) / SEP_RADIUS;
-            force = v2add(force, v2scale(v2norm(away), strength * SPEED_BASE));
-        }
+
+        /* away_offset : neighbour → self displacement (we push that way)
+         * distance    : how far the neighbour is right now */
+        Vec2  away_offset = v2sub(pos, people[i].pos);
+        float distance    = v2len(away_offset);
+
+        bool inside_personal_space = distance < SEP_RADIUS;
+        bool well_separated        = distance > DIST_EPSILON;
+        if (!inside_personal_space || !well_separated) continue;
+
+        /* personal_space_intrusion ∈ (0,1] — linear falloff, 1 at d=0.
+         * push_dir is a unit vector AWAY from the neighbour. */
+        float personal_space_intrusion = (SEP_RADIUS - distance) / SEP_RADIUS;
+        Vec2  push_dir = v2norm(away_offset);
+        Vec2  contribution = v2scale(push_dir, personal_space_intrusion * SPEED_BASE);
+        force = v2add(force, contribution);
     }
     return force;
 }
@@ -872,19 +843,24 @@ static Vec2 steer_separate(const Person *people, int count, int self)
  */
 static Vec2 steer_align(const Person *people, int count, int self)
 {
-    Vec2 sum = v2(0, 0);
-    int  n   = 0;
-    Vec2 pos = people[self].pos;
+    /* (1) sum velocity vectors of every neighbour inside ALIGN_RADIUS */
+    Vec2 velocity_sum     = v2(0, 0);
+    int  n_neighbours     = 0;
+    Vec2 pos              = people[self].pos;
     for (int i = 0; i < count; i++) {
         if (i == self) continue;
-        if (v2len(v2sub(people[i].pos, pos)) < ALIGN_RADIUS) {
-            sum = v2add(sum, people[i].vel);
-            n++;
+        bool inside_align_radius = v2len(v2sub(people[i].pos, pos)) < ALIGN_RADIUS;
+        if (inside_align_radius) {
+            velocity_sum = v2add(velocity_sum, people[i].vel);
+            n_neighbours++;
         }
     }
-    if (!n) return v2(0, 0);
-    /* steer toward (mean_velocity − own_velocity) */
-    return v2sub(v2scale(sum, 1.0f/n), people[self].vel);
+    if (n_neighbours == 0) return v2(0, 0);
+
+    /* (2) mean velocity vector = "the direction the crowd is heading"
+     *     force = mean_velocity − own_velocity  (Reynolds rule 2) */
+    Vec2 mean_velocity = v2scale(velocity_sum, 1.0f / (float)n_neighbours);
+    return v2sub(mean_velocity, people[self].vel);
 }
 
 /*
@@ -897,19 +873,44 @@ static Vec2 steer_align(const Person *people, int count, int self)
  */
 static Vec2 steer_cohere(const Person *people, int count, int self)
 {
-    Vec2 sum = v2(0, 0);
-    int  n   = 0;
-    Vec2 pos = people[self].pos;
+    /* (1) sum positions of every neighbour inside COHESION_RADIUS */
+    Vec2 position_sum = v2(0, 0);
+    int  n_neighbours = 0;
+    Vec2 pos          = people[self].pos;
     for (int i = 0; i < count; i++) {
         if (i == self) continue;
-        if (v2len(v2sub(people[i].pos, pos)) < COHESION_RADIUS) {
-            sum = v2add(sum, people[i].pos);
-            n++;
+        bool inside_cohesion_radius = v2len(v2sub(people[i].pos, pos)) < COHESION_RADIUS;
+        if (inside_cohesion_radius) {
+            position_sum = v2add(position_sum, people[i].pos);
+            n_neighbours++;
         }
     }
-    if (!n) return v2(0, 0);
-    Vec2 centre = v2scale(sum, 1.0f/n);
-    return steer_seek(pos, people[self].vel, centre, SPEED_BASE);
+    if (n_neighbours == 0) return v2(0, 0);
+
+    /* (2) centre of mass = average neighbour position
+     *     force = steer_seek(centre_of_mass)  — reuses arrival behaviour */
+    Vec2 centre_of_mass = v2scale(position_sum, 1.0f / (float)n_neighbours);
+    return steer_seek(pos, people[self].vel, centre_of_mass, SPEED_BASE);
+}
+
+/* ── §6.5 force composition — blend weighted steering vectors ──────── */
+/*
+ * blend2_forces / blend3_forces — pseudocode-shape helpers used by every
+ * tick_* function.  The body is just a v2add chain of weighted vectors,
+ * but writing it inline drowns each tick in nested calls.  Naming the
+ * blend lets each tick body read as one line:
+ *     force = blend2_forces(seek_force, W_SEEK, sep_force, W_SEP);
+ * which is exactly the algorithm Reynolds [2] describes.
+ */
+static inline Vec2 blend2_forces(Vec2 a, float wa, Vec2 b, float wb)
+{
+    return v2add(v2scale(a, wa), v2scale(b, wb));
+}
+static inline Vec2 blend3_forces(Vec2 a, float wa,
+                                  Vec2 b, float wb,
+                                  Vec2 c, float wc)
+{
+    return v2add(v2add(v2scale(a, wa), v2scale(b, wb)), v2scale(c, wc));
 }
 
 /* ===================================================================== */
@@ -917,58 +918,404 @@ static Vec2 steer_cohere(const Person *people, int count, int self)
 /* ===================================================================== */
 
 /*
- * Scene — all simulation state in one struct.
+ * Crowd — the agent pool.
  *
- * Three groups, each with a different lifetime and ownership:
- *   - the agent pool (touched every tick by every steering rule)
- *   - the user-facing mode flags (touched once per keypress)
- *   - the PANIC-only threat (touched only by tick_panic)
- *   - the world dimensions (refreshed once per tick from ncurses)
- * Joining them in one struct keeps `scene_*` function signatures short
- * (one Scene * argument); separating the groups inside makes the data
- * flow obvious — a reader can tell which fields each tick_* function
- * will touch just from this header.
+ * Intent
+ *   Owns the active population of Person.  Every steering primitive
+ *   (separate / align / cohere) needs the full neighbour list as
+ *   input, so the pool lives as ONE flat array indexed by integer.
+ *
+ * Why fixed-size [CROWD_MAX] + active prefix `count`
+ *   • Project rule: no allocation after init.  A compile-time
+ *     CROWD_MAX cap lets the entire scene live in BSS / on main()'s
+ *     stack.
+ *   • The "pre-spawned, active prefix" idiom lets '+'/'−' grow and
+ *     shrink the visible crowd by changing `count` alone — no
+ *     re-randomise on every keypress.  Even agents currently OUTSIDE
+ *     the active prefix were placed at scene_init so they appear at
+ *     plausible positions the moment the user adds them.
+ *
+ * Why bundle (people[] + count) instead of two Scene fields
+ *   Every loop that reads `people[]` needs `count` to bound it; they
+ *   always move together.  Bundling makes every loop body read
+ *   `for (int i = 0; i < s->crowd.count; i++) … s->crowd.people[i] …`
+ *   — one sub-struct accessed twice — instead of two scattered Scene
+ *   fields the reader must keep in mind separately.
+ *
+ * Members
+ *   people[CROWD_MAX]   the entire pool, pre-spawned at scene_init.
+ *                       Index in this array is meaningless to the user
+ *                       (Persons are indistinguishable except by their
+ *                       glyph + colour); only spatial arrangement matters.
+ *   count               number of CURRENTLY ACTIVE persons; first
+ *                       `count` slots are simulated and drawn, the
+ *                       rest lie dormant.  Range: [CROWD_MIN, CROWD_MAX].
+ *
+ * Invariants
+ *   CROWD_MIN ≤ count ≤ CROWD_MAX  (handle_input clamps).
+ *   Every people[i] in [0, count) has pos inside the world box
+ *   (enforced by the boundary helpers in §4).
+ *   people[CROWD_MAX − 1] was spawned at scene_init even if
+ *   count < CROWD_MAX; its pos is valid but it is not drawn / ticked.
+ *
+ * References
+ *   [1] Reynolds 1987 — flocking on a fixed pool of N boids; this
+ *       file's pool layout matches that O(N²) reference implementation.
+ *   [10] Buckland *Programming Game AI by Example* Ch. 3 — same
+ *       "world owns the agent vector" data layout for steering.
  */
 typedef struct {
-    /* agent pool — first `count` Person slots are active; the rest are
-     * pre-spawned so '+' reveals already-placed people without a fresh
-     * randomise pass. */
-    Person    people[CROWD_MAX];
-    int       count;
+    Person people[CROWD_MAX];
+    int    count;
+} Crowd;
 
-    /* user mode flags — written by app_handle_key, read by scene_tick */
+/*
+ * Threat — the PANIC-only roaming '!' marker.
+ *
+ * Intent
+ *   The repulsor that gives BEH_PANIC its drama.  Every Person flees
+ *   away from `threat.pos` via steer_flee.  The threat itself wanders
+ *   (slowly) toward random targets via the same steer_seek primitive
+ *   the crowd uses, so it explores the room rather than sitting still.
+ *
+ * Why a small kinematic struct (not just a Vec2 pos)
+ *   The threat itself needs to move smoothly: it accelerates toward
+ *   its current target, bounces off walls, picks a new target on
+ *   arrival.  That's the same (pos, vel, target) trio that a Person
+ *   has — so the threat is a tiny "Person without rendering identity".
+ *   Bundling makes tick_panic touch one sub-struct instead of three
+ *   scattered Scene fields.
+ *
+ * Why pos / vel / target (not just pos)
+ *   A teleporting threat would look fake.  A constant-velocity threat
+ *   would clip walls.  Giving it the same kinematic model as the
+ *   crowd (and capping its speed BELOW the crowd's panic speed) means
+ *   the cloud always escapes — which is what makes the visual work.
+ *
+ * Members
+ *   pos      pixel-space position; flee target for every Person.
+ *   vel      px/s, capped at THREAT_SPEED.  See tick_panic for how
+ *            it's integrated (steer_seek toward target + v2clamp_len).
+ *   target   random wander point the threat is currently seeking.
+ *            Reseeded to a new uniform-random point when |target−pos|
+ *            < ARRIVE_DIST in tick_panic.
+ *
+ * Invariants
+ *   pos lies inside the world box (clamped + bounced by tick_panic).
+ *   |vel| ≤ THREAT_SPEED (enforced by v2clamp_len in tick_panic).
+ *   THREAT_SPEED < SPEED_PANIC by design — the crowd always escapes.
+ *
+ * References
+ *   [6] Helbing, Farkas & Vicsek 2000 (*Nature*) — "Simulating
+ *       dynamical features of escape panic" — models a crowd fleeing
+ *       a hazard with a desired velocity AWAY from the hazard centre,
+ *       which is exactly what BEH_PANIC implements with steer_flee.
+ *   [5] Helbing & Molnár 1995 — social-force model; the threat acts
+ *       as the strong repulsive source in that framework.
+ */
+typedef struct {
+    Vec2 pos;
+    Vec2 vel;
+    Vec2 target;
+} Threat;
+
+/*
+ * SimControls — user-facing playback knobs.
+ *
+ * Intent
+ *   Three scalars the input handler writes and scene_tick + HUD read.
+ *   Bundling them keeps handle_input's switch readable and the HUD's
+ *   read paths short.
+ *
+ * Why a sub-struct (three small fields could be flat Scene members)
+ *   The boundary "user-controlled run parameters" is conceptually
+ *   distinct from "simulation state": behaviour, paused, fps are all
+ *   written by ONE function (handle_input) and read by TWO consumers
+ *   (scene_tick + draw_hud).  Bundling makes their shared role
+ *   explicit at the type level and leaves Scene's top level free for
+ *   future additions (time_scale, debug overlays) without churn.
+ *
+ * Why behaviour lives here (not on Scene directly)
+ *   The behaviour selector is the single most user-facing piece of
+ *   state in the file — keys 1..6 swap it, the HUD displays its name,
+ *   scene_tick dispatches on it.  Placing it inside SimControls
+ *   groups it with the other knobs the user controls, separating it
+ *   from "data the simulation HAS" (crowd, threat).
+ *
+ * Members
+ *   behaviour   one of BEH_WANDER / BEH_FLOCK / BEH_PANIC / BEH_GATHER /
+ *               BEH_FOLLOW / BEH_QUEUE — chosen by keys 1..6.  Drives
+ *               the switch in scene_tick that selects tick_wander /
+ *               tick_flock / ... and conditional decorations in
+ *               scene_draw (the '!' threat, '@' leader, '|' counter).
+ *   paused      true → scene_tick is a no-op; HUD shows "PAUSED".
+ *               Toggled by SPACE.
+ *   fps         simulation tick rate (Hz).  Set at scene_init to
+ *               SIM_FPS_DEFAULT; not directly user-adjustable in this
+ *               file (the +/- keys grow / shrink the crowd, not fps).
+ *               Exposed as a field so future extensions (time
+ *               scrubbing, slowmo) plug in without restructuring.
+ *
+ * Invariants
+ *   0 ≤ behaviour < BEH_COUNT.
+ *   fps > 0 (used as divisor in TICK_NS).
+ *
+ * References
+ *   [1] Reynolds 1987 — the "behaviour selection" pattern: same
+ *       low-level mechanics, different high-level rule set per agent.
+ *   Fiedler "Fix Your Timestep!" — sim.fps drives the fixed-timestep
+ *       accumulator in main(); decoupling sim rate from render rate.
+ */
+typedef struct {
     Behaviour behaviour;
     bool      paused;
+    int       fps;
+} SimControls;
 
-    /* PANIC threat — only tick_panic and the '!' renderer touch these */
-    Vec2      threat_pos;
-    Vec2      threat_vel;
-    Vec2      threat_target;
-
-    /* world dimensions in pixels — refreshed each tick from cols/rows */
-    float     world_w, world_h;
+/*
+ * Scene — owns ALL simulation + render state for one run.
+ *
+ * Layered ownership
+ *
+ *     Scene
+ *       ├── crowd  : Crowd                ← agent pool (§5 Person + count)
+ *       │     ├── people[CROWD_MAX]: Person[]
+ *       │     └── count
+ *       │
+ *       ├── threat : Threat               ← PANIC roaming '!' marker
+ *       │     ├── pos, vel, target  : Vec2[]
+ *       │
+ *       ├── sim    : SimControls          ← user-facing knobs
+ *       │     ├── behaviour : Behaviour
+ *       │     ├── paused    : bool
+ *       │     └── fps       : int
+ *       │
+ *       ├── world_w, world_h              ← world extent in PIXEL space
+ *       │                                   (pw(scene_cols), ph(scene_rows))
+ *       │
+ *       └── scene_cols, scene_rows        ← terminal extent in CELL space
+ *
+ *   Every persistent value the program needs is reachable from a
+ *   single Scene*.  No file-scope simulation state exists; only the
+ *   two POSIX signal flags (g_running, g_need_resize) remain global
+ *   in §8 because signal handlers cannot receive a context pointer.
+ *
+ * Intent
+ *   One instance lives on main()'s stack and is passed by pointer to
+ *   every tick, renderer, and input handler.  Pure observers take
+ *   `const Scene *`; mutators take `Scene *`.  The signature alone
+ *   communicates which kind of access each callee performs.
+ *
+ * Why a SCENE struct (not file-scope globals)
+ *   • Replaceability: future variants (split-screen demo, recorded
+ *     replay) allocate multiple Scenes — impossible with globals.
+ *   • Testability: scene_tick becomes a pure transformation s → s';
+ *     no hidden inputs.
+ *   • Reading aid: every helper begins with `Scene *s` (or const),
+ *     giving the reader ONE place to look for "what state exists".
+ *
+ * Why TWO extents (world_w/h AND scene_cols/rows)
+ *   They live in DIFFERENT spaces:
+ *     • scene_cols × scene_rows is the TERMINAL grid (cells), used
+ *       by the renderer + HUD layout.
+ *     • world_w × world_h is the SIMULATION space (pixels), used by
+ *       every physics quantity.  Computed as pw(scene_cols),
+ *       ph(scene_rows) so the world scales with terminal resize.
+ *   Keeping both pre-computed avoids re-multiplying CELL_W / CELL_H
+ *   inside every steering force evaluation.
+ *
+ * Members
+ *   crowd           Crowd — the active agent pool.
+ *   threat          Threat — PANIC-only roaming repulsor.
+ *   sim             SimControls — behaviour + paused + fps.
+ *   world_w/h       pixel-space world extent; scales with resize.
+ *   scene_cols/rows cell-space terminal extent; updated by SIGWINCH
+ *                   handler via handle_resize_if_pending.
+ *
+ * Invariants
+ *   scene_cols > 0 AND scene_rows > 0 (set by screen_init).
+ *   world_w == pw(scene_cols) AND world_h == ph(scene_rows).
+ *   All sub-struct invariants hold (Crowd.count clamp, Threat speed
+ *   cap, SimControls behaviour range).
+ *   g_running / g_need_resize are NOT here — POSIX signal handlers
+ *   need sig_atomic_t globals; they live in §8.
+ *
+ * References
+ *   [10] Buckland *Programming Game AI by Example* — single "World"
+ *       object owns the agent vector and the simulation parameters,
+ *       same pattern as Scene here.
+ *   Nystrom, "Game Programming Patterns" Ch. 9 (Game Loop) — the
+ *       single-Scene + fixed-timestep accumulator design that main()
+ *       implements.
+ */
+typedef struct {
+    Crowd       crowd;
+    Threat      threat;
+    SimControls sim;
+    float       world_w, world_h;        /* pixel-space world extent     */
+    int         scene_cols, scene_rows;  /* cell-space terminal extent   */
 } Scene;
 
 static void scene_init(Scene *s, int cols, int rows)
 {
     memset(s, 0, sizeof *s);
+
+    /* (1) extents — terminal in cells, simulation in pixels */
+    s->scene_cols = cols;
+    s->scene_rows = rows;
     s->world_w    = pw(cols);
     s->world_h    = ph(rows);
-    s->count      = CROWD_DEFAULT;
-    s->behaviour  = BEH_WANDER;
+
+    /* (2) user-facing knobs (active behaviour, pause flag, sim rate) */
+    s->crowd.count   = CROWD_DEFAULT;
+    s->sim.behaviour = BEH_WANDER;
+    s->sim.paused    = false;
+    s->sim.fps       = SIM_FPS_DEFAULT;
+
+    /* (3) pre-spawn the FULL pool — '+' just grows `count`, no re-randomise */
     for (int i = 0; i < CROWD_MAX; i++)
-        person_spawn(&s->people[i], i, s->world_w, s->world_h);
-    s->threat_pos    = v2(s->world_w * 0.5f, s->world_h * 0.5f);
-    s->threat_target = v2(randf()*s->world_w, randf()*s->world_h);
+        person_spawn(&s->crowd.people[i], i, s->world_w, s->world_h);
+
+    /* (4) PANIC threat seeded at world centre, heading for a random target */
+    const float WORLD_CENTRE_FRAC = 0.5f;
+    s->threat.pos    = v2(s->world_w * WORLD_CENTRE_FRAC,
+                          s->world_h * WORLD_CENTRE_FRAC);
+    s->threat.target = v2(randf()*s->world_w, randf()*s->world_h);
+}
+
+/* ── behaviour helpers — shared by tick_* and scene_draw ──────────── */
+
+/*
+ * lerp_render_pos — sub-tick interpolation between two physics snapshots.
+ *
+ *   draw_pos = prev + (cur − prev) × alpha          (alpha ∈ [0,1))
+ *
+ * Used by scene_draw so an agent moves smoothly between ticks even when
+ * render rate ≠ sim rate (Fiedler, "Fix Your Timestep!").
+ */
+static inline Vec2 lerp_render_pos(Vec2 prev, Vec2 cur, float alpha)
+{
+    /* tick_delta : how far the agent moved during the last physics tick
+     * partial_step: the alpha-fraction of that motion we draw THIS frame */
+    Vec2 tick_delta   = v2sub(cur, prev);
+    Vec2 partial_step = v2scale(tick_delta, alpha);
+    return v2add(prev, partial_step);
+}
+
+/*
+ * gather_approach_speed — linear ramp from 0 at the centre to SPEED_BASE
+ * at the edge of the slow ring.  Outside the ring people cruise at full
+ * speed; inside they decelerate so the crowd mills rather than oscillates.
+ *
+ *   speed(dist) = { SPEED_BASE · dist / SLOW_RADIUS   if dist < SLOW_RADIUS
+ *                 { SPEED_BASE                         otherwise
+ */
+static inline float gather_approach_speed(float dist_to_centre)
+{
+    if (dist_to_centre >= GATHER_SLOW_RADIUS) return SPEED_BASE;
+    /* slow_ramp_fraction ∈ [0, 1): 0 at centre, 1 at edge of slow ring */
+    float slow_ramp_fraction = dist_to_centre / GATHER_SLOW_RADIUS;
+    return SPEED_BASE * slow_ramp_fraction;
+}
+
+/*
+ * queue_approach_speed — binary step: shuffle near the slot, cruise else.
+ * The hard step (rather than a ramp) is what makes the line feel patient:
+ * people walk briskly until they're nearly there, then noticeably slow.
+ */
+static inline float queue_approach_speed(float dist_to_slot)
+{
+    return (dist_to_slot < QUEUE_SLOW_RADIUS) ? QUEUE_IDLE_SPEED : SPEED_BASE;
+}
+
+/*
+ * queue_slot_for_index — geometry of the staggered queue line.
+ *
+ *   counter  : sits COUNTER_INSET_CELLS cells inside the right edge,
+ *              on the vertical mid-line of the world.
+ *   slot[N]  : N gaps to the left of the counter, on row (N mod 3) − 1
+ *              of a STAGGER_ROWS=3 vertical pattern so the line isn't
+ *              a dead-straight column.
+ *   clamp    : slots that would fall off the left edge get pinned one
+ *              cell inside.
+ */
+static Vec2 queue_slot_for_index(int i, float ww, float wh)
+{
+    enum { COUNTER_INSET_CELLS = 2 };
+    enum { STAGGER_ROWS        = 3 };
+    const float WORLD_VERTICAL_CENTRE_FRAC = 0.5f;
+    const float LEFT_EDGE_INSET_PX         = (float)CELL_W;
+
+    /* counter position: a few cells inside the right edge, vertically centred */
+    const float counter_x = ww - (float)CELL_W * (float)COUNTER_INSET_CELLS;
+    const float counter_y = wh * WORLD_VERTICAL_CENTRE_FRAC;
+
+    /* slot N: N gaps left of counter, on stagger row (N mod 3) − 1 ∈ {−1,0,+1}
+     * so successive people land on top / middle / bottom of the 3-row line. */
+    int   stagger_row_offset = (i % STAGGER_ROWS) - 1;       /* {-1, 0, +1} */
+    float slot_x             = counter_x - (float)i * QUEUE_SLOT_W;
+    float slot_y             = counter_y + (float)stagger_row_offset * QUEUE_SLOT_H;
+
+    /* clamp: very far-back slots would otherwise fall off the left edge */
+    if (slot_x < LEFT_EDGE_INSET_PX) slot_x = LEFT_EDGE_INSET_PX;
+    return v2(slot_x, slot_y);
+}
+
+/*
+ * threat_advance — PANIC's roaming '!' marker integrates like a slow Person.
+ *
+ *   1. on arrival within THREAT_ARRIVE_RADIUS, pick a fresh wander target
+ *   2. otherwise accelerate toward target, velocity capped at THREAT_SPEED
+ *   3. integrate position by velocity·dt and clamp inside the world box
+ *
+ * THREAT_SPEED < SPEED_PANIC by design so the crowd can always escape —
+ * the threat is a pressure source, not a chaser.
+ */
+static void threat_advance(Threat *t, float dt, float ww, float wh)
+{
+    /* threat re-picks a target once it gets within 2× the arrival ring */
+    const float THREAT_ARRIVE_RADIUS = ARRIVE_DIST * 2.0f;
+
+    /* (1) on arrival, re-roll a fresh random wander target */
+    Vec2  offset_to_target   = v2sub(t->target, t->pos);
+    float distance_to_target = v2len(offset_to_target);
+    if (distance_to_target < THREAT_ARRIVE_RADIUS) {
+        t->target = v2(randf()*ww, randf()*wh);
+    } else {
+        /* (2) otherwise accelerate toward target, velocity capped at top speed
+         *     toward_dir : unit vector pointing at the target
+         *     accel_v    : "desired-velocity" vector at THREAT_SPEED */
+        Vec2 toward_dir = v2norm(offset_to_target);
+        Vec2 accel_v    = v2scale(toward_dir, THREAT_SPEED);
+        Vec2 new_vel    = v2add(t->vel, v2scale(accel_v, dt));
+        t->vel          = v2clamp_len(new_vel, THREAT_SPEED);
+    }
+
+    /* (3) Euler integrate position, then clamp inside the world walls */
+    Vec2 step = v2scale(t->vel, dt);
+    t->pos    = v2add(t->pos, step);
+    clamp_pos(&t->pos, ww, wh);
 }
 
 /* ── behaviour tick functions ──────────────────────────────────────── */
 /*
  * Each tick_* function applies one behaviour to all active people.
- * Pattern inside every loop body:
- *   1. Compute force  = weighted sum of relevant steering forces.
- *   2. Call person_step(p, force, dt)  → update vel + pos.
- *   3. Apply boundary condition.
+ * Every body follows the same pseudocode shape:
+ *
+ *   for each Person p in crowd:
+ *       1. (optional) re-pick target on arrival
+ *            → person_at_target + person_pick_random_target
+ *       2. compute named force components from §6 steering primitives
+ *            seek_force / sep_force / flee_force / align_force / ...
+ *       3. blend them with mode-specific weights
+ *            → blend2_forces or blend3_forces                (§6.5)
+ *       4. integrate force into vel + pos
+ *            → person_step(p, force, dt)                     (§5)
+ *       5. enforce boundary (wrap / bounce / clamp)          (§4)
+ *
+ * The behaviour-specific helpers (gather_approach_speed,
+ * queue_approach_speed, queue_slot_for_index, threat_advance) are
+ * defined just above and named by what they DO algorithmically.
  */
 
 /*
@@ -978,16 +1325,20 @@ static void scene_init(Scene *s, int cols, int rows)
  */
 static void tick_wander(Scene *s, float dt)
 {
-    for (int i = 0; i < s->count; i++) {
-        Person *p = &s->people[i];
+    Crowd *crowd = &s->crowd;
+    for (int i = 0; i < crowd->count; i++) {
+        Person *p = &crowd->people[i];
 
-        if (v2len(v2sub(p->target, p->pos)) < ARRIVE_DIST)
-            p->target = v2(randf()*s->world_w, randf()*s->world_h);
+        /* (1) on arrival, re-roll a random destination */
+        if (person_at_target(p))
+            person_pick_random_target(p, s->world_w, s->world_h);
 
-        Vec2 force = v2add(
-            v2scale(steer_seek    (p->pos, p->vel, p->target, SPEED_BASE), W_SEEK),
-            v2scale(steer_separate(s->people, s->count, i),                W_SEP)
-        );
+        /* (2) force = W_SEEK · seek_target + W_SEP · separate_from_neighbours */
+        Vec2 seek_force = steer_seek    (p->pos, p->vel, p->target, SPEED_BASE);
+        Vec2 sep_force  = steer_separate(crowd->people, crowd->count, i);
+        Vec2 force      = blend2_forces(seek_force, W_SEEK, sep_force, W_SEP);
+
+        /* (3) integrate, then torus-wrap at the world edges */
         person_step(p, force, dt);
         wrap_pos(&p->pos, s->world_w, s->world_h);
     }
@@ -1000,14 +1351,21 @@ static void tick_wander(Scene *s, float dt)
  */
 static void tick_flock(Scene *s, float dt)
 {
-    for (int i = 0; i < s->count; i++) {
-        Person *p = &s->people[i];
+    Crowd *crowd = &s->crowd;
+    for (int i = 0; i < crowd->count; i++) {
+        Person *p = &crowd->people[i];
 
-        Vec2 force = v2(0, 0);
-        force = v2add(force, v2scale(steer_separate(s->people, s->count, i), W_SEP));
-        force = v2add(force, v2scale(steer_align   (s->people, s->count, i), W_ALIGN));
-        force = v2add(force, v2scale(steer_cohere  (s->people, s->count, i), W_COHERE));
+        /* (1) Reynolds' three local rules, all O(N²) over the crowd */
+        Vec2 sep_force    = steer_separate(crowd->people, crowd->count, i);
+        Vec2 align_force  = steer_align   (crowd->people, crowd->count, i);
+        Vec2 cohere_force = steer_cohere  (crowd->people, crowd->count, i);
 
+        /* (2) weighted sum — SEP dominates so flockmates never overlap */
+        Vec2 force = blend3_forces(sep_force,    W_SEP,
+                                   align_force,  W_ALIGN,
+                                   cohere_force, W_COHERE);
+
+        /* (3) integrate and wrap */
         person_step(p, force, dt);
         wrap_pos(&p->pos, s->world_w, s->world_h);
     }
@@ -1021,25 +1379,18 @@ static void tick_flock(Scene *s, float dt)
  */
 static void tick_panic(Scene *s, float dt)
 {
-    /* advance threat toward its own wander target */
-    Vec2  tdiff = v2sub(s->threat_target, s->threat_pos);
-    float tdist = v2len(tdiff);
-    if (tdist < ARRIVE_DIST * 2.0f) {
-        s->threat_target = v2(randf()*s->world_w, randf()*s->world_h);
-    } else {
-        Vec2 t_accel = v2scale(v2norm(tdiff), THREAT_SPEED);
-        s->threat_vel = v2clamp_len(v2add(s->threat_vel, v2scale(t_accel, dt)),
-                                    THREAT_SPEED);
-    }
-    s->threat_pos = v2add(s->threat_pos, v2scale(s->threat_vel, dt));
-    clamp_pos(&s->threat_pos, s->world_w, s->world_h);
+    /* (1) advance the roaming threat first — crowd flees its CURRENT pos */
+    threat_advance(&s->threat, dt, s->world_w, s->world_h);
 
-    for (int i = 0; i < s->count; i++) {
-        Person *p = &s->people[i];
-        Vec2 force = v2add(
-            v2scale(steer_flee    (p->pos, p->vel, s->threat_pos, SPEED_PANIC), W_FLEE),
-            v2scale(steer_separate(s->people, s->count, i),                     W_SEP)
-        );
+    /* (2) each person: flee threat + keep personal space; walls bounce */
+    Crowd *crowd = &s->crowd;
+    for (int i = 0; i < crowd->count; i++) {
+        Person *p = &crowd->people[i];
+
+        Vec2 flee_force = steer_flee    (p->pos, p->vel, s->threat.pos, SPEED_PANIC);
+        Vec2 sep_force  = steer_separate(crowd->people, crowd->count, i);
+        Vec2 force      = blend2_forces(flee_force, W_FLEE, sep_force, W_SEP);
+
         person_step(p, force, dt);
         bounce_pos(&p->pos, &p->vel, s->world_w, s->world_h);
     }
@@ -1052,18 +1403,23 @@ static void tick_panic(Scene *s, float dt)
  */
 static void tick_gather(Scene *s, float dt)
 {
-    Vec2 centre = v2(s->world_w * 0.5f, s->world_h * 0.5f);
-    for (int i = 0; i < s->count; i++) {
-        Person *p = &s->people[i];
-        float dist = v2len(v2sub(centre, p->pos));
-        /* approach speed ramps from 0 at centre to SPEED_BASE at slow radius */
-        float spd  = (dist < GATHER_SLOW_RADIUS)
-                   ? SPEED_BASE * (dist / GATHER_SLOW_RADIUS)
-                   : SPEED_BASE;
-        Vec2 force = v2add(
-            v2scale(steer_seek    (p->pos, p->vel, centre, spd), W_SEEK),
-            v2scale(steer_separate(s->people, s->count, i),      W_SEP)
-        );
+    const float WORLD_CENTRE_FRAC = 0.5f;
+    const Vec2  centre = v2(s->world_w * WORLD_CENTRE_FRAC,
+                            s->world_h * WORLD_CENTRE_FRAC);
+    Crowd *crowd = &s->crowd;
+
+    for (int i = 0; i < crowd->count; i++) {
+        Person *p = &crowd->people[i];
+
+        /* (1) ramp approach speed so people slow as they reach the centre */
+        float dist_to_centre = v2len(v2sub(centre, p->pos));
+        float approach_speed = gather_approach_speed(dist_to_centre);
+
+        /* (2) force = seek_centre (eased) + separate */
+        Vec2 seek_force = steer_seek    (p->pos, p->vel, centre, approach_speed);
+        Vec2 sep_force  = steer_separate(crowd->people, crowd->count, i);
+        Vec2 force      = blend2_forces(seek_force, W_SEEK, sep_force, W_SEP);
+
         person_step(p, force, dt);
         wrap_pos(&p->pos, s->world_w, s->world_h);
     }
@@ -1077,24 +1433,28 @@ static void tick_gather(Scene *s, float dt)
  */
 static void tick_follow(Scene *s, float dt)
 {
-    /* leader wanders independently */
-    Person *leader = &s->people[0];
-    if (v2len(v2sub(leader->target, leader->pos)) < ARRIVE_DIST)
-        leader->target = v2(randf()*s->world_w, randf()*s->world_h);
+    enum { LEADER_INDEX = 0 };
+    Crowd *crowd = &s->crowd;
+
+    /* (1) leader wanders freely — same rule as WANDER but no separation */
+    Person *leader = &crowd->people[LEADER_INDEX];
+    if (person_at_target(leader))
+        person_pick_random_target(leader, s->world_w, s->world_h);
 
     Vec2 lead_force = steer_seek(leader->pos, leader->vel,
-                                 leader->target, SPEED_BASE);
+                                  leader->target, SPEED_BASE);
     person_step(leader, lead_force, dt);
     wrap_pos(&leader->pos, s->world_w, s->world_h);
 
-    /* each follower seeks the person directly ahead */
-    for (int i = 1; i < s->count; i++) {
-        Person *p    = &s->people[i];
-        Person *prev = &s->people[i-1];
-        Vec2 force = v2add(
-            steer_seek    (p->pos, p->vel, prev->pos, SPEED_BASE),
-            v2scale(steer_separate(s->people, s->count, i), W_SEP)
-        );
+    /* (2) each follower chases person ahead in the chain, with separation */
+    for (int i = LEADER_INDEX + 1; i < crowd->count; i++) {
+        Person *p    = &crowd->people[i];
+        Person *prev = &crowd->people[i - 1];
+
+        Vec2 chase_force = steer_seek    (p->pos, p->vel, prev->pos, SPEED_BASE);
+        Vec2 sep_force   = steer_separate(crowd->people, crowd->count, i);
+        Vec2 force       = blend2_forces(chase_force, W_SEEK, sep_force, W_SEP);
+
         person_step(p, force, dt);
         wrap_pos(&p->pos, s->world_w, s->world_h);
     }
@@ -1109,27 +1469,24 @@ static void tick_follow(Scene *s, float dt)
  */
 static void tick_queue(Scene *s, float dt)
 {
-    /* service point: rightmost column, vertically centred */
-    float sx = s->world_w - (float)CELL_W * 2.0f;
-    float sy = s->world_h * 0.5f;
+    /* halved separation weight: people tolerate close packing in a line */
+    const float W_SEP_PACKED = W_SEP * 0.5f;
+    Crowd *crowd = &s->crowd;
 
-    for (int i = 0; i < s->count; i++) {
-        Person *p = &s->people[i];
+    for (int i = 0; i < crowd->count; i++) {
+        Person *p = &crowd->people[i];
 
-        /* slot position for this person */
-        float slot_x = sx - (float)i * QUEUE_SLOT_W;
-        float slot_y = sy + (float)((i % 3) - 1) * QUEUE_SLOT_H;
-        /* clamp so distant slots don't fall off the left edge */
-        if (slot_x < (float)CELL_W) slot_x = (float)CELL_W;
+        /* (1) reserved slot for this person on the 3-row staggered line */
+        Vec2  slot           = queue_slot_for_index(i, s->world_w, s->world_h);
+        float dist_to_slot   = v2len(v2sub(slot, p->pos));
+        float approach_speed = queue_approach_speed(dist_to_slot);
 
-        Vec2  slot = v2(slot_x, slot_y);
-        float dist = v2len(v2sub(slot, p->pos));
-        float spd  = (dist < QUEUE_SLOW_RADIUS) ? QUEUE_IDLE_SPEED : SPEED_BASE;
+        /* (2) force = seek_slot + relaxed_separation */
+        Vec2 seek_force = steer_seek    (p->pos, p->vel, slot, approach_speed);
+        Vec2 sep_force  = steer_separate(crowd->people, crowd->count, i);
+        Vec2 force      = blend2_forces(seek_force, W_SEEK, sep_force, W_SEP_PACKED);
 
-        Vec2 force = v2add(
-            v2scale(steer_seek    (p->pos, p->vel, slot, spd),  W_SEEK),
-            v2scale(steer_separate(s->people, s->count, i),     W_SEP * 0.5f)
-        );
+        /* (3) integrate, hard-clip to walls (queue stops at the counter) */
         person_step(p, force, dt);
         clamp_pos(&p->pos, s->world_w, s->world_h);
     }
@@ -1155,12 +1512,13 @@ static void mark_cell(WINDOW *w, int cx, int cy, char ch,
     wattroff(w, COLOR_PAIR(pair) | attr);
 }
 
-static void scene_tick(Scene *s, float dt, int cols, int rows)
+static void scene_tick(Scene *s, float dt)
 {
-    s->world_w = pw(cols);
-    s->world_h = ph(rows);
-    if (s->paused) return;
-    switch (s->behaviour) {
+    /* Refresh world extent in case a resize has just landed.  Cheap. */
+    s->world_w = pw(s->scene_cols);
+    s->world_h = ph(s->scene_rows);
+    if (s->sim.paused) return;
+    switch (s->sim.behaviour) {
     case BEH_WANDER: tick_wander(s, dt); break;
     case BEH_FLOCK:  tick_flock (s, dt); break;
     case BEH_PANIC:  tick_panic (s, dt); break;
@@ -1171,64 +1529,115 @@ static void scene_tick(Scene *s, float dt, int cols, int rows)
     }
 }
 
+/* draw_threat_marker — PANIC's roaming '!' painted at the threat position. */
+static void draw_threat_marker(WINDOW *w, const Threat *t, int cols, int rows)
+{
+    enum { THREAT_COLOR = 1 };       /* red pair */
+    int tx = px_to_cell_x(t->pos.x);
+    int ty = px_to_cell_y(t->pos.y);
+    mark_cell(w, tx, ty, '!', THREAT_COLOR, A_BOLD | A_BLINK, cols, rows);
+}
+
+/*
+ * draw_queue_counter — QUEUE's service counter ('|' bar) and arrow tip
+ * ('>>|') painted on the right edge.  The arrow points INTO the counter,
+ * cueing the queue's direction of motion.
+ */
+static void draw_queue_counter(WINDOW *w, int cols, int rows)
+{
+    enum { COUNTER_COLOR        = 3 };       /* yellow */
+    enum { COUNTER_INSET_CELLS  = 2 };       /* from right edge */
+    enum { COUNTER_HALF_HEIGHT  = 3 };       /* cells above/below mid-row */
+    enum { ARROW_TIP_OFFSET     = 1 };       /* '|' one cell left of counter */
+    enum { ARROW_BODY_OFFSET    = 2 };       /* first '>' two cells left  */
+    enum { ARROW_TAIL_OFFSET    = 3 };       /* second '>' three cells left */
+
+    const int counter_col = cols - COUNTER_INSET_CELLS;
+    const int counter_row = rows / 2;
+
+    /* vertical bar — the counter itself */
+    for (int dy = -COUNTER_HALF_HEIGHT; dy <= COUNTER_HALF_HEIGHT; dy++)
+        mark_cell(w, counter_col, counter_row + dy, '|',
+                  COUNTER_COLOR, A_BOLD, cols, rows);
+
+    /* arrow leading into the counter: '>' '>' '|' */
+    mark_cell(w, counter_col - ARROW_TAIL_OFFSET, counter_row, '>',
+              COUNTER_COLOR, A_BOLD, cols, rows);
+    mark_cell(w, counter_col - ARROW_BODY_OFFSET, counter_row, '>',
+              COUNTER_COLOR, A_BOLD, cols, rows);
+    mark_cell(w, counter_col - ARROW_TIP_OFFSET,  counter_row, '|',
+              COUNTER_COLOR, A_BOLD, cols, rows);
+}
+
+/* draw_follow_leader — FOLLOW's '@', bold + underline so it stands out. */
+static void draw_follow_leader(WINDOW *w, const Person *ldr, float alpha,
+                                int cols, int rows)
+{
+    enum { LEADER_COLOR = 3 };       /* yellow */
+    Vec2 dp = lerp_render_pos(ldr->prev_pos, ldr->pos, alpha);
+    mark_cell(w, px_to_cell_x(dp.x), px_to_cell_y(dp.y),
+              '@', LEADER_COLOR, A_BOLD | A_UNDERLINE, cols, rows);
+}
+
+/* draw_person — alpha-lerped position, person's own glyph and colour. */
+static void draw_person(WINDOW *w, const Person *p, float alpha,
+                         int cols, int rows)
+{
+    Vec2 dp = lerp_render_pos(p->prev_pos, p->pos, alpha);
+    mark_cell(w, px_to_cell_x(dp.x), px_to_cell_y(dp.y),
+              p->glyph, p->color, A_NORMAL, cols, rows);
+}
+
 /*
  * scene_draw — render the current scene into WINDOW *w.
  *
- * alpha ∈ [0, 1) is the sub-tick interpolation factor from §8.
- * Each person's drawn position lerps between prev_pos and pos by alpha,
- * eliminating the micro-stutter that would appear if we always drew at
- * the last physics tick position.
+ * Algorithm:
+ *   (1) per-behaviour decoration FIRST so the crowd lays on top of it
+ *       (PANIC '!' threat, QUEUE counter + arrow, FOLLOW leader '@')
+ *   (2) every active person at alpha-lerped position; in FOLLOW skip
+ *       slot 0 because the leader was already drawn at step (1).
  *
- *   draw_pos = prev_pos + (pos − prev_pos) × alpha
+ *   draw_pos = prev_pos + (pos − prev_pos) × alpha       (lerp_render_pos)
  */
 static void scene_draw(const Scene *s, WINDOW *w,
                        int cols, int rows, float alpha)
 {
-    /* ── PANIC: roaming threat marker ── */
-    if (s->behaviour == BEH_PANIC) {
-        int tx = px_to_cell_x(s->threat_pos.x);
-        int ty = px_to_cell_y(s->threat_pos.y);
-        mark_cell(w, tx, ty, '!', 1, A_BOLD | A_BLINK, cols, rows);
-    }
+    enum { LEADER_INDEX = 0 };
 
-    /* ── QUEUE: service counter '|' bar + '>>|' arrow on the right edge ── */
-    if (s->behaviour == BEH_QUEUE) {
-        int qcol = cols - 2;
-        int qrow = rows / 2;
-        for (int r = qrow - 3; r <= qrow + 3; r++)
-            mark_cell(w, qcol, r, '|', 3, A_BOLD, cols, rows);
-        mark_cell(w, qcol - 3, qrow, '>', 3, A_BOLD, cols, rows);
-        mark_cell(w, qcol - 2, qrow, '>', 3, A_BOLD, cols, rows);
-        mark_cell(w, qcol - 1, qrow, '|', 3, A_BOLD, cols, rows);
-    }
+    /* (1) per-behaviour decorations */
+    if (s->sim.behaviour == BEH_PANIC)
+        draw_threat_marker(w, &s->threat, cols, rows);
 
-    /* ── FOLLOW: leader '@' drawn with underline to stand out ── */
-    if (s->behaviour == BEH_FOLLOW && s->count > 0) {
-        const Person *ldr = &s->people[0];
-        Vec2 dp = v2add(ldr->prev_pos,
-                        v2scale(v2sub(ldr->pos, ldr->prev_pos), alpha));
-        mark_cell(w, px_to_cell_x(dp.x), px_to_cell_y(dp.y),
-                  '@', 3, A_BOLD | A_UNDERLINE, cols, rows);
-    }
+    if (s->sim.behaviour == BEH_QUEUE)
+        draw_queue_counter(w, cols, rows);
 
-    /* ── all active people ── */
-    int start = (s->behaviour == BEH_FOLLOW) ? 1 : 0; /* leader already drawn */
-    for (int i = start; i < s->count; i++) {
-        const Person *p = &s->people[i];
-        Vec2 dp = v2add(p->prev_pos,
-                        v2scale(v2sub(p->pos, p->prev_pos), alpha));
-        mark_cell(w, px_to_cell_x(dp.x), px_to_cell_y(dp.y),
-                  p->glyph, p->color, A_NORMAL, cols, rows);
-    }
+    if (s->sim.behaviour == BEH_FOLLOW && s->crowd.count > 0)
+        draw_follow_leader(w, &s->crowd.people[LEADER_INDEX], alpha, cols, rows);
+
+    /* (2) every active person — skip slot 0 in FOLLOW (leader already drawn) */
+    int start = (s->sim.behaviour == BEH_FOLLOW) ? LEADER_INDEX + 1 : 0;
+    for (int i = start; i < s->crowd.count; i++)
+        draw_person(w, &s->crowd.people[i], alpha, cols, rows);
 }
 
 /* ===================================================================== */
 /* §8  app — screen, signals, input, main loop                          */
 /* ===================================================================== */
 
-typedef struct { int cols, rows; } Screen;
+/*
+ * POSIX signal flags — must be file-scope `volatile sig_atomic_t` so
+ * async signal handlers can touch them safely.  Set by handlers,
+ * polled by main(), cleared by main() once acted on.
+ */
+static volatile sig_atomic_t g_running     = 1;
+static volatile sig_atomic_t g_need_resize = 0;
 
-static void screen_init(Screen *s)
+static void on_exit_signal(int sig)   { (void)sig; g_running     = 0; }
+static void on_resize_signal(int sig) { (void)sig; g_need_resize = 1; }
+static void cleanup(void)             { endwin(); }
+
+/* Bring up ncurses, then read the terminal extent into the Scene. */
+static void screen_init(Scene *s)
 {
     initscr();
     noecho();
@@ -1238,219 +1647,283 @@ static void screen_init(Screen *s)
     keypad(stdscr, TRUE);
     typeahead(-1);            /* don't let ncurses interrupt output to read ahead */
     color_init();
-    getmaxyx(stdscr, s->rows, s->cols);
+    getmaxyx(stdscr, s->scene_rows, s->scene_cols);
+    s->world_w = pw(s->scene_cols);
+    s->world_h = ph(s->scene_rows);
 }
 
-static void screen_free(Screen *s) { (void)s; endwin(); }
-
-static void screen_resize(Screen *s)
+/* hud_paint_text — stamp text at (row, col) with a pair + bold attribute.
+ * Centralises the attron / mvprintw / attroff sandwich for the two HUD rows. */
+static void hud_paint_text(int row, int col, int pair, const char *text)
 {
-    endwin(); refresh();     /* forces ncurses to re-read LINES/COLS from kernel */
-    getmaxyx(stdscr, s->rows, s->cols);
+    attron(COLOR_PAIR(pair) | A_BOLD);
+    mvprintw(row, col, "%s", text);
+    attroff(COLOR_PAIR(pair) | A_BOLD);
 }
 
 /*
- * screen_draw — build a complete frame into stdscr (ncurses newscr buffer).
+ * draw_hud — canonical top status (data) + bottom hint (actions).
  *
- * Order matters:
- *   erase()      — blank the frame (stale content becomes spaces)
- *   scene_draw() — animation content
- *   HUD          — drawn last so it always appears on top of the scene
- *
- * Nothing reaches the terminal until screen_present() calls doupdate().
+ * Algorithm:
+ *   (1) format status string into a local buffer
+ *   (2) paint right-aligned on row 0  (PAIR_HUD  + A_BOLD)
+ *   (3) paint key bindings on last row (PAIR_HINT + A_BOLD)
  */
-static void screen_draw(Screen *s, const Scene *sc,
-                        double fps, int sim_fps, float alpha)
+static void draw_hud(const Scene *s, double fps)
+{
+    enum { HUD_TOP_ROW = 0 };
+    static const char *KEY_HINT =
+        " q:quit  spc:pause  1:wander 2:flock 3:panic 4:gather 5:follow 6:queue  +/-:people  r:reset ";
+
+    /* (1) status text — fps, sim rate, crowd size, active behaviour, pause */
+    char status[HUD_COLS + 1];
+    snprintf(status, sizeof status,
+             " %5.1f fps  sim:%3d Hz  n:%3d  [%s]%s ",
+             fps, s->sim.fps, s->crowd.count,
+             BEH_NAMES[s->sim.behaviour],
+             s->sim.paused ? "  PAUSED" : "");
+
+    /* (2) right-align status on row 0 */
+    int right_col = s->scene_cols - (int)strlen(status);
+    if (right_col < 0) right_col = 0;
+    hud_paint_text(HUD_TOP_ROW, right_col, PAIR_HUD, status);
+
+    /* (3) key bindings on the last row */
+    hud_paint_text(s->scene_rows - 1, 0, PAIR_HINT, KEY_HINT);
+}
+
+/*
+ * frame_render — erase, paint scene, paint HUD, flush via one doupdate.
+ *
+ * Order matters: scene_draw first, HUD second, so the HUD lays on top.
+ * Nothing reaches the terminal until doupdate() at the end.
+ */
+static void frame_render(const Scene *s, double fps, float alpha)
 {
     erase();
-    scene_draw(sc, stdscr, s->cols, s->rows, alpha);
-
-    /* Top-right status — PAIR_HUD bright yellow, A_BOLD */
-    char buf[HUD_COLS + 1];
-    snprintf(buf, sizeof buf, " %5.1f fps  sim:%3d Hz  n:%3d  [%s]%s ",
-             fps, sim_fps, sc->count,
-             BEH_NAMES[sc->behaviour],
-             sc->paused ? "  PAUSED" : "");
-    int hx = s->cols - (int)strlen(buf);
-    if (hx < 0) hx = 0;
-    attron(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-    mvprintw(0, hx, "%s", buf);
-    attroff(COLOR_PAIR(PAIR_HUD) | A_BOLD);
-
-    /* Bottom-left key hint — PAIR_HINT bright cyan, A_BOLD */
-    attron(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-    mvprintw(s->rows - 1, 0,
-             " q:quit  spc:pause  1:wander 2:flock 3:panic 4:gather 5:follow 6:queue  +/-:people  r:reset ");
-    attroff(COLOR_PAIR(PAIR_HINT) | A_BOLD);
-}
-
-/*
- * screen_present — send only the changed cells to the terminal (one write).
- *
- * wnoutrefresh(stdscr) — copy stdscr content into ncurses' newscr model.
- * doupdate()           — diff newscr vs curscr, send only deltas to fd.
- * Never call refresh() instead: it flushes immediately and can produce
- * torn partial frames visible as flicker.
- */
-static void screen_present(void)
-{
+    scene_draw(s, stdscr, s->scene_cols, s->scene_rows, alpha);
+    draw_hud(s, fps);
     wnoutrefresh(stdscr);
     doupdate();
 }
 
-/* ── App — top-level state ─────────────────────────────────────────── */
-
-typedef struct {
-    Scene                 scene;
-    Screen                screen;
-    int                   sim_fps;
-    volatile sig_atomic_t running;
-    volatile sig_atomic_t need_resize;
-} App;
-
-static App g_app;
-
-static void on_exit_signal(int sig)   { (void)sig; g_app.running = 0;     }
-static void on_resize_signal(int sig) { (void)sig; g_app.need_resize = 1; }
-static void cleanup(void)             { endwin(); }
-
-static void app_do_resize(App *app)
+/*
+ * clamp_all_active_people — after a terminal shrink, pin any person who
+ * was sitting past the new edge back inside the (smaller) world box and
+ * reset prev_pos so the renderer doesn't lerp a giant snap-back.
+ */
+static void clamp_all_active_people(Scene *s)
 {
-    screen_resize(&app->screen);
-    float ww = pw(app->screen.cols), wh = ph(app->screen.rows);
-    /* clamp all people into the new (possibly smaller) world */
-    for (int i = 0; i < app->scene.count; i++) {
-        Person *p = &app->scene.people[i];
-        clamp_pos(&p->pos, ww, wh);
+    for (int i = 0; i < s->crowd.count; i++) {
+        Person *p = &s->crowd.people[i];
+        clamp_pos(&p->pos, s->world_w, s->world_h);
         p->prev_pos = p->pos;
     }
-    app->need_resize = 0;
 }
 
-static bool app_handle_key(App *app, int ch)
+/*
+ * handle_resize_if_pending — SIGWINCH dance.
+ *
+ *   (1) tear ncurses down + up so stdscr matches the new terminal extent
+ *   (2) recompute pixel-space world extent from the new cell extent
+ *   (3) clamp_all_active_people pulls anyone past the new edge back in
+ *
+ * Cheap no-op when g_need_resize is unset.
+ */
+static void handle_resize_if_pending(Scene *s)
 {
-    Scene *sc = &app->scene;
+    if (!g_need_resize) return;
+    g_need_resize = 0;
+
+    /* (1) tear ncurses down + up so stdscr matches new terminal size */
+    endwin(); refresh();
+    getmaxyx(stdscr, s->scene_rows, s->scene_cols);
+
+    /* (2) recompute pixel-space world extent from new cell extent */
+    s->world_w = pw(s->scene_cols);
+    s->world_h = ph(s->scene_rows);
+
+    /* (3) pull any out-of-bounds people back inside the new world box */
+    clamp_all_active_people(s);
+}
+
+/*
+ * handle_input — translate one keystroke into a Scene mutation.
+ *
+ *   q / Q / ESC  → request quit (clear g_running)
+ *   SPACE        → toggle pause
+ *   1..6         → select behaviour (WANDER..QUEUE)
+ *   + / =        → adjust_person_count(+CROWD_STEP)   (capped at CROWD_MAX)
+ *   -            → adjust_person_count(−CROWD_STEP)   (floored at CROWD_MIN)
+ *   r / R        → re-init scene at current extent (re-randomise)
+ */
+/*
+ * adjust_person_count — move crowd.count by `delta`, clamped to
+ * [CROWD_MIN, CROWD_MAX].  Pool is pre-spawned so this just slides the
+ * active prefix; positive delta reveals already-placed people instantly.
+ */
+static void adjust_person_count(Crowd *crowd, int delta)
+{
+    int next = crowd->count + delta;
+    if (next < CROWD_MIN) next = CROWD_MIN;
+    if (next > CROWD_MAX) next = CROWD_MAX;
+    crowd->count = next;
+}
+
+static void handle_input(Scene *s, int ch)
+{
     switch (ch) {
-    case 'q': case 'Q': case 27: return false;
-    case ' ':  sc->paused    = !sc->paused;    break;
-    case '1':  sc->behaviour = BEH_WANDER;     break;
-    case '2':  sc->behaviour = BEH_FLOCK;      break;
-    case '3':  sc->behaviour = BEH_PANIC;      break;
-    case '4':  sc->behaviour = BEH_GATHER;     break;
-    case '5':  sc->behaviour = BEH_FOLLOW;     break;
-    case '6':  sc->behaviour = BEH_QUEUE;      break;
+    case 'q': case 'Q': case 27 /* ESC */:
+        g_running = 0;                                       break;
+
+    case ' ':  s->sim.paused    = !s->sim.paused;            break;
+
+    /* behaviour select — keys 1..6 pick a mode */
+    case '1':  s->sim.behaviour = BEH_WANDER;                break;
+    case '2':  s->sim.behaviour = BEH_FLOCK;                 break;
+    case '3':  s->sim.behaviour = BEH_PANIC;                 break;
+    case '4':  s->sim.behaviour = BEH_GATHER;                break;
+    case '5':  s->sim.behaviour = BEH_FOLLOW;                break;
+    case '6':  s->sim.behaviour = BEH_QUEUE;                 break;
+
+    /* crowd-size adjust — slides the active prefix in pre-spawned pool */
     case '+': case '=':
-        sc->count += CROWD_STEP;
-        if (sc->count > CROWD_MAX) sc->count = CROWD_MAX;
-        break;
+        adjust_person_count(&s->crowd, +CROWD_STEP);         break;
     case '-':
-        sc->count -= CROWD_STEP;
-        if (sc->count < CROWD_MIN) sc->count = CROWD_MIN;
-        break;
+        adjust_person_count(&s->crowd, -CROWD_STEP);         break;
+
+    /* reset: re-init the whole scene at current terminal extent */
     case 'r': case 'R':
-        scene_init(sc, app->screen.cols, app->screen.rows);
-        break;
+        scene_init(s, s->scene_cols, s->scene_rows);         break;
+
     default: break;
     }
-    return true;
+}
+
+/*
+ * FpsCounter — rolling-window frame-rate estimator.
+ *
+ * Each frame the loop tallies one count and dt nanoseconds.  Once the
+ * window fills (FPS_UPDATE_MS), `display` updates to count / seconds and
+ * the accumulators reset.  Keeps the HUD readable instead of flickering.
+ */
+typedef struct {
+    int     frame_count;     /* frames seen this window */
+    int64_t window_ns;       /* time accumulated this window, ns */
+    double  display;         /* smoothed fps shown in HUD */
+} FpsCounter;
+
+static void fps_counter_init(FpsCounter *f)
+{
+    f->frame_count = 0;
+    f->window_ns   = 0;
+    f->display     = 0.0;
+}
+
+/* Tally one frame; emit a fresh smoothed reading once the window fills. */
+static void fps_counter_tick(FpsCounter *f, int64_t dt)
+{
+    const int64_t FPS_WINDOW_NS = (int64_t)FPS_UPDATE_MS * NS_PER_MS;
+
+    f->frame_count++;
+    f->window_ns += dt;
+    if (f->window_ns < FPS_WINDOW_NS) return;
+
+    f->display     = (double)f->frame_count
+                   / ((double)f->window_ns / (double)NS_PER_SEC);
+    f->frame_count = 0;
+    f->window_ns   = 0;
+}
+
+/*
+ * drain_sim_accumulator — fixed-step physics: replay scene_tick(dt_sec)
+ * once per pending tick_ns slot in the accumulator (Fiedler "Fix Your
+ * Timestep!" — decouples sim rate from render rate).
+ */
+static void drain_sim_accumulator(Scene *s, int64_t *sim_accum,
+                                   int64_t tick_ns, float dt_sec)
+{
+    while (*sim_accum >= tick_ns) {
+        scene_tick(s, dt_sec);
+        *sim_accum -= tick_ns;
+    }
 }
 
 /*
  * main — the game loop (identical structure to framework.c).
  *
- * Every iteration:
- *   ① measure dt since last frame (capped at 100 ms to guard against
- *     physics avalanche after a debugger pause or Ctrl-Z)
- *   ② drain sim accumulator: add dt, fire fixed-step ticks until empty
- *   ③ compute alpha = leftover ns / tick_ns  ∈ [0, 1)
- *   ④ sleep to cap at TARGET_FPS BEFORE rendering (not after)
- *   ⑤ erase → draw scene → draw HUD → wnoutrefresh → doupdate
- *   ⑥ poll input (non-blocking getch)
- *
- * The fixed-step accumulator in ② decouples physics rate from render
- * rate.  Physics always advances at exactly sim_fps Hz regardless of
- * how fast or slow the terminal can render.
+ * Each iteration:
+ *   (1) honour pending SIGWINCH resize (reload extent, reset timers)
+ *   (2) measure dt, capped at DT_CAP_NS to prevent physics avalanche
+ *   (3) drain accumulator: run scene_tick once per pending fixed step
+ *   (4) compute sub-tick alpha = leftover / tick_ns  ∈ [0, 1)
+ *   (5) tally rolling-window fps counter
+ *   (6) sleep BEFORE render so terminal I/O stays inside the budget
+ *   (7) frame_render — erase → scene → HUD → doupdate
+ *   (8) poll input (non-blocking)
  */
 int main(void)
 {
+    /* (a) RNG + atexit + POSIX signal handlers */
     srand((unsigned int)(clock_ns() & 0xFFFFFFFF));
     atexit(cleanup);
     signal(SIGINT,   on_exit_signal);
     signal(SIGTERM,  on_exit_signal);
     signal(SIGWINCH, on_resize_signal);
 
-    App *app     = &g_app;
-    app->running = 1;
-    app->sim_fps = SIM_FPS_DEFAULT;
+    /* (b) ncurses bring-up and Scene initial state */
+    Scene scene;
+    screen_init(&scene);
+    scene_init(&scene, scene.scene_cols, scene.scene_rows);
 
-    screen_init(&app->screen);
-    scene_init(&app->scene, app->screen.cols, app->screen.rows);
+    /* (c) loop-local constants and time accumulators */
+    const int64_t DT_CAP_NS       = 100 * NS_PER_MS;             /* avalanche guard */
+    const int64_t FRAME_BUDGET_NS = NS_PER_SEC / TARGET_FPS;     /* render cadence  */
 
-    int64_t frame_time  = clock_ns();
-    int64_t sim_accum   = 0;
-    int64_t fps_accum   = 0;
-    int     frame_count = 0;
-    double  fps_display = 0.0;
+    int64_t    frame_time = clock_ns();
+    int64_t    sim_accum  = 0;
+    FpsCounter fps;
+    fps_counter_init(&fps);
 
-    while (app->running) {
-
+    while (g_running) {
         int64_t frame_start = clock_ns();
 
-        /* ① resize */
-        if (app->need_resize) {
-            app_do_resize(app);
+        /* (1) handle pending resize: reload extent, reset timers */
+        if (g_need_resize) {
+            handle_resize_if_pending(&scene);
             frame_time = clock_ns();
             sim_accum  = 0;
         }
 
-        /* ② dt */
+        /* (2) measure dt since last frame, capped to avoid physics avalanche */
         int64_t now = clock_ns();
         int64_t dt  = now - frame_time;
         frame_time  = now;
-        if (dt > 100 * NS_PER_MS) dt = 100 * NS_PER_MS;
+        if (dt > DT_CAP_NS) dt = DT_CAP_NS;
 
-        /* ③ fixed-step accumulator */
-        int64_t tick_ns = TICK_NS(app->sim_fps);
-        float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
+        /* (3) drain accumulator: fixed-step physics until caught up */
+        const int64_t tick_ns = TICK_NS(scene.sim.fps);
+        const float   dt_sec  = (float)tick_ns / (float)NS_PER_SEC;
         sim_accum += dt;
-        while (sim_accum >= tick_ns) {
-            scene_tick(&app->scene, dt_sec,
-                       app->screen.cols, app->screen.rows);
-            sim_accum -= tick_ns;
-        }
+        drain_sim_accumulator(&scene, &sim_accum, tick_ns, dt_sec);
 
-        /* ④ alpha: how far into the next tick we are */
+        /* (4) sub-tick interpolation factor for renderer */
         float alpha = (float)sim_accum / (float)tick_ns;
 
-        /* smoothed fps counter (500 ms window) */
-        frame_count++;
-        fps_accum += dt;
-        if (fps_accum >= FPS_UPDATE_MS * NS_PER_MS) {
-            fps_display = (double)frame_count
-                        / ((double)fps_accum / (double)NS_PER_SEC);
-            frame_count = 0;
-            fps_accum   = 0;
-        }
+        /* (5) rolling-window fps counter */
+        fps_counter_tick(&fps, dt);
 
-        /* ⑤ sleep before render to keep the budget honest.
-         * Budget = 1/TARGET_FPS s.  elapsed is wall time spent on physics
-         * + accounting since frame_start; sleep the remainder.  Do NOT
-         * add dt back into elapsed — that cancels the cap, sleep is 0,
-         * CPU pegs at 100 %.                                            */
-        int64_t elapsed = clock_ns() - frame_start;
-        clock_sleep_ns(NS_PER_SEC / TARGET_FPS - elapsed);
+        /* (6) sleep before render so I/O time doesn't eat the budget */
+        int64_t budget_left = FRAME_BUDGET_NS - (clock_ns() - frame_start);
+        clock_sleep_ns(budget_left);
 
-        /* ⑥ render */
-        screen_draw(&app->screen, &app->scene,
-                    fps_display, app->sim_fps, alpha);
-        screen_present();
+        /* (7) render: scene + HUD, flushed in one diff */
+        frame_render(&scene, fps.display, alpha);
 
-        /* ⑦ input */
+        /* (8) input (non-blocking getch) */
         int key = getch();
-        if (key != ERR && !app_handle_key(app, key))
-            app->running = 0;
+        if (key != ERR) handle_input(&scene, key);
     }
 
-    screen_free(&app->screen);
     return 0;
 }

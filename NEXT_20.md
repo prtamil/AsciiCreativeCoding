@@ -6,10 +6,10 @@ raster/
 signal/
 particle_systems/
 physics/
-fluid/
 grids/
 algorithms/
 animation/
+flocking/
  
  completed rest start from scratch
 

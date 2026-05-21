@@ -50,8 +50,31 @@
  *   gcc -std=c11 -O2 -Wall -Wextra flocking/slime_mold.c \
  *       -o slime_mold -lncurses -lm
  *
- * Sections: §1 config  §2 clock  §3 color  §4 trail grid  §5 agents
- *           §6 scene   §7 screen §8 app
+ * Section map:
+ *   §1 config       — tunables (grid sizes, agent counts, sim/decay/diffuse,
+ *                      preset/theme constants)
+ *   §2 clock        — monotonic timer + sleep
+ *   §3 color/theme  — Theme struct + 5 palettes; theme-independent
+ *                      HUD pairs (canonical bright yellow + cyan)
+ *   §4 trail grid   — TrailField (current + diffusion buffer + active
+ *                      dims); trail_sample / _deposit / _update / _clear
+ *                      / _resize / _draw, plus the inner kernel helper
+ *                      box_average_3x3_wrapped (3×3 Laplacian)
+ *   §5 agents       — Agent + FoodSrc + Crowd + SimControls + Screen +
+ *                      Scene types; agent_step pipeline split into
+ *                      agent_sense_three_sensors → agent_rotate_toward_
+ *                      brightest → agent_move_and_wrap → agent_food_
+ *                      bonus_multiplier; agents_step_all + food_draw
+ *   §6 scene        — presets (Scatter / Ring / Clusters / Mesh) +
+ *                      scene_init dispatcher; crowd_alloc;
+ *                      agent_spawn_random
+ *   §7 screen/HUD   — screen_init; canonical two-row hud_draw
+ *                      (top=data, bottom=actions)
+ *   §8 app          — FpsCounter, App; clampi/clampf; signals + resize;
+ *                      key dispatch (cycle_preset / cycle_theme /
+ *                      adjust_agent_count / adjust_diffuse /
+ *                      adjust_decay / adjust_sim_fps + clamp ranges);
+ *                      main game loop
  */
 
 /* ── CONCEPTS ─────────────────────────────────────────────────────────── *
@@ -80,20 +103,101 @@
  *                  bottleneck: 512×128 ≈ 65K cells × 9-neighbour sum per cell
  *                  ≈ 590K ops per tick.  Agents cost N_AGENTS × ~15 ops each.
  *
- * Data-structure : Two float arrays (g_trail / g_buf) for double-buffering.
- *                  Agents read and deposit into g_trail; the grid update reads
- *                  g_trail → writes g_buf → copies back.  This prevents mid-tick
- *                  positional feedback (a grain reading its own fresh deposit).
+ * Data-structure : TrailField struct (§4) wraps two float arrays —
+ *                  TrailField.current (live) and TrailField.buffer
+ *                  (Jacobi workspace) — plus active_rows/cols tracking
+ *                  the in-use portion.  Agents read and deposit into
+ *                  `current`; trail_update reads `current` → writes
+ *                  `buffer` → copies back.  This Jacobi pattern (vs
+ *                  in-place Gauss-Seidel) keeps the update READ-ONLY
+ *                  on `current` so the result is iteration-order
+ *                  independent and free of asymmetric scan artefacts.
  *
- * References     :
- *   Jones, "Characteristics of pattern formation and evolution in
- *     approximations of Physarum transport networks" (Artificial
- *     Life 16, 2010) — the canonical Physarum agent model.
- *   Tero, Kobayashi & Nakagaki, "A mathematical model for adaptive
- *     transport network in path finding by true slime mold"
- *     (J. Theor. Biol. 244, 2007).
- *   Adamatzky, "Physarum Machines" (World Scientific, 2010) —
- *     book-length treatment of slime-mold computing.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ── REFERENCES ───────────────────────────────────────────────────────── *
+ *
+ *   ── Canonical Physarum agent model ─────────────────────────────
+ *   [1] Jones, J. (2010), "Characteristics of pattern formation and
+ *       evolution in approximations of Physarum transport networks",
+ *       Artificial Life 16(2), pp. 127-153 — THE source for this
+ *       file's algorithm.  Specifies the 3-sensor agent (front-left
+ *       / front / front-right), the abrupt ±ROTATE_ANGLE turning,
+ *       and the per-tick 3×3 diffuse + exponential decay of the
+ *       pheromone field.  §5 agent_step + §4 trail_update are
+ *       direct implementations.
+ *
+ *   ── Real Physarum biology + optimal-transport experiments ──────
+ *   [2] Nakagaki, T., Yamada, H. & Tóth, Á. (2000), "Maze-solving by
+ *       an amoeboid organism", Nature 407(6803), p. 470 — the original
+ *       experiment showing Physarum solves shortest-path mazes.
+ *       Showed the world that this organism does graph algorithms
+ *       on petri-dish substrate.
+ *   [3] Tero, A., Takagi, S., Saigusa, T., Ito, K., Bebber, D. P.,
+ *       Fricker, M. D., Yumiki, K., Kobayashi, R. & Nakagaki, T.
+ *       (2010), "Rules for biologically inspired adaptive network
+ *       design", Science 327(5964), pp. 439-442 — Physarum solving
+ *       the Tokyo rail network problem.  Demonstrates the network
+ *       topology this file's agents are reproducing in miniature.
+ *   [4] Tero, A., Kobayashi, R. & Nakagaki, T. (2007), "A
+ *       mathematical model for adaptive transport network in path
+ *       finding by true slime mold", J. Theor. Biol. 244(4),
+ *       pp. 553-564 — the continuous-PDE model of the same
+ *       phenomenon (parallel to [1]'s agent-based formulation).
+ *
+ *   ── Mathematical foundation: reaction-diffusion ────────────────
+ *   [5] Turing, A. M. (1952), "The chemical basis of morphogenesis",
+ *       Phil. Trans. R. Soc. B 237(641), pp. 37-72 — the seminal
+ *       paper on reaction-diffusion pattern formation.  §4
+ *       trail_update is a discrete reaction-diffusion update: agent
+ *       deposit = source, diffuse + decay = the standard
+ *       Laplacian + sink, on a coarse grid.
+ *
+ *   ── Stigmergy: indirect communication via environment ──────────
+ *   [6] Grassé, P.-P. (1959), "La reconstruction du nid et les
+ *       coordinations interindividuelles chez Bellicositermes
+ *       natalensis et Cubitermes sp.", Insectes Sociaux 6, pp. 41-83
+ *       — coined "stigmergy".  Termites coordinate nest-building
+ *       solely through pheromone traces in the environment — exactly
+ *       the mechanism this file's agents use.  No central planner,
+ *       no agent-to-agent messaging.
+ *
+ *   ── Book-length treatments ─────────────────────────────────────
+ *   [7] Adamatzky, A. (2010), "Physarum Machines: Computers from
+ *       Slime Mould", World Scientific — the canonical reference
+ *       book on slime-mould unconventional computing.  Covers
+ *       biology, the agent model in [1], wet-lab experiments, and
+ *       sensor / actuator designs that turn Physarum into a
+ *       general-purpose substrate.
+ *
+ *   ── Game-loop / fixed-step physics ─────────────────────────────
+ *   [8] Fiedler, G. (2004, updated 2014), "Fix Your Timestep!",
+ *       https://gafferongames.com/post/fix_your_timestep/ — the
+ *       fixed-step accumulator + dt-cap pattern in §8 main().
+ *       Slime mold uses a single fixed sim_fps without sub-tick
+ *       interpolation (the trail field is already smooth), but the
+ *       same dt-cap-at-100 ms avalanche guard is from Fiedler.
+ *
+ *   ── Implementation-oriented references ─────────────────────────
+ *   [9] Shiffman, D., "The Nature of Code", Ch. 5 (Autonomous Agents)
+ *       — reading-level introduction to sense-decide-act agent loops
+ *       in Processing.  Pair with [1] for the slime-mould specifics.
+ *
+ *   ── Online quick reference ─────────────────────────────────────
+ *  [10] Sage Jenson's "Physarum" interactive — https://sagejenson.com/physarum
+ *       — interactive web demo of the same Jones [1] model with live
+ *       parameter sliders.  The canonical "see the algorithm move"
+ *       reference; pair with [1] for the math and this file for the
+ *       C-on-ncurses implementation.
+ *
+ *   ── Companion files in this project ────────────────────────────
+ *   See also:
+ *     flocking/flocking.c    — Reynolds-style boids; agent-based but
+ *       with PEER interactions (alignment, cohesion) rather than
+ *       SUBSTRATE-mediated stigmergy.
+ *     flocking/murmuration.c — large-N (1500) flock with density-
+ *       field rendering and spatial hashing.  Similar
+ *       "render-the-field-not-the-agents" rendering philosophy.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -108,17 +212,6 @@
  * produces self-organising tube networks that connect food
  * sources — without ANY central planner.
  *
- * HOW TO THINK ABOUT IT
- * ─────────────────────
- * Imagine 2000 ants in a flat dish, each leaving an evaporating
- * pheromone trail.  Each ant looks slightly LEFT, FORWARD, and
- * RIGHT — turns toward whichever direction has the most
- * pheromone — walks one step — drops more pheromone.
- * Pheromones diffuse outward and fade away.  Initially the
- * dish has no pattern.  After a minute, dense ANT-HIGHWAYS
- * appear connecting food sources, while empty regions stay
- * dark.  No one CHOSE the highways; they EMERGED from local
- * follow-the-strongest-trail decisions amplified by stigmergy.
  *
  * STIGMERGY
  * ─────────
@@ -137,26 +230,32 @@
  *
  * ALGORITHM IN STEPS  (per tick)
  * ──────────────────────────────
- *  AGENT LOOP (N times):
- *    1. SENSE — sample trail at 3 sensor positions:
- *         FL = (pos + dir(heading - SENSOR_ANGLE) · SENSOR_DIST)
- *         F  = (pos + dir(heading                 ) · SENSOR_DIST)
- *         FR = (pos + dir(heading + SENSOR_ANGLE) · SENSOR_DIST)
- *    2. ROTATE — based on which sensor sees strongest trail:
- *         F greatest      → no turn
- *         FL > FR         → turn LEFT by ROTATE_ANGLE
- *         FR > FL         → turn RIGHT by ROTATE_ANGLE
- *         FL == FR > F    → random turn (tie-break)
- *    3. MOVE — pos += STEP_SIZE · (cos heading, sin heading)
- *              wrap toroidally
- *    4. DEPOSIT — trail[pos] += DEPOSIT_AMT
- *                  (× FOOD_BONUS if near food source)
+ *  AGENT LOOP — agents_step_all calls agent_step for each agent:
+ *    1. SENSE   — agent_sense_three_sensors → SensorReadings
+ *                 sample trail at 3 sensor positions:
+ *                   FL = pos + dir(heading − SENSOR_ANGLE) · SENSOR_DIST
+ *                   F  = pos + dir(heading                ) · SENSOR_DIST
+ *                   FR = pos + dir(heading + SENSOR_ANGLE) · SENSOR_DIST
+ *    2. ROTATE  — agent_rotate_toward_brightest
+ *                 F greatest      → no turn
+ *                 FL > FR         → turn LEFT by ROTATE_ANGLE
+ *                 FR > FL         → turn RIGHT by ROTATE_ANGLE
+ *                 FL == FR > F    → random turn (tie-break)
+ *    3. MOVE    — agent_move_and_wrap
+ *                 pos += STEP_SIZE · (cos heading, sin heading)
+ *                 toroidal wrap to trail->active_rows/cols
+ *    4. DEPOSIT — bonus = agent_food_bonus_multiplier (FOOD_BONUS
+ *                          if within FOOD_RADIUS of any food source,
+ *                          else 1.0)
+ *                 trail_deposit(trail, pos, sim.deposit · bonus)
  *
- *  GRID LOOP (once over W × H):
- *    For each cell:
- *      avg = mean of 3×3 neighbourhood (in trail[])
- *      buf[cell] = lerp(trail[cell], avg, DIFFUSE_W) × (1 - DECAY)
- *    Swap trail and buf.
+ *  GRID LOOP — trail_update over active_rows × active_cols:
+ *    For each (r, c):
+ *      neighbour_avg     = box_average_3x3_wrapped(trail, r, c)
+ *      after_diffusion   = lerp(current[r][c], neighbour_avg, diffuse_w)
+ *      after_decay       = after_diffusion · (1 − decay)
+ *      buffer[r][c]      = max(after_decay, 0)
+ *    Jacobi swap: current ← buffer (whole-grid memcpy)
  *
  * KEY FORMULAS
  * ────────────
@@ -171,72 +270,6 @@
  *   Steady-state trail strength at deposit point ≈
  *      DEPOSIT_AMT / DECAY    (deposit rate / decay rate)
  *
- * EDGE CASES TO WATCH
- * ───────────────────
- *   • DOUBLE BUFFERING: agents read g_trail and deposit into
- *     g_trail.  Grid update reads g_trail → writes g_buf →
- *     swaps.  Without buffering, the diffusion step would
- *     read the just-deposited values and amplify them
- *     instantly (numerical instability).
- *   • TOROIDAL WRAP: agents that walk off one edge reappear
- *     on the opposite edge.  Sensor reads also wrap.  This
- *     prevents edge-clustering artifacts.
- *   • FOOD SOURCES: cells within FOOD_RADIUS deposit
- *     FOOD_BONUS × the normal amount.  This creates strong
- *     attractors that the trail network grows toward.
- *   • Resize: ROWS_MAX × COLS_MAX = 128 × 512 static buffers.
- *     Resize re-derives row/col bounds without reallocation.
- *
- * HOW TO VERIFY
- * ─────────────
- *   • At default 2000 agents + 3 food sources: tube network
- *     converges in ~30-60 ticks.  Tubes connect all 3 food
- *     sources via shortest-network paths.
- *   • Toggle food off (f): no attractors, agents diffuse to
- *     random uniform pattern.  Toggle food back on: tubes
- *     re-form within ~20 ticks.
- *   • Reduce diffusion (D): tubes get THINNER and SHARPER.
- *     Increase: tubes BLEND and lose definition.
- *   • Reduce decay (E): trail accumulates everywhere; tubes
- *     drown in background.  Increase: tubes fade too fast,
- *     network never forms.
- *   • Steiner-tree behaviour: try preset 3 (4 corner food
- *     sources).  The network should approximate a Steiner
- *     tree (Y-shaped meeting point in the middle, not
- *     direct edges between every pair).
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── HOW TO READ THIS FILE ───────────────────────────────────────────── *
- *
- * Reading order
- * ─────────────
- *   1. CONCEPTS, MENTAL MODEL, GUIDED TUTORIAL — read in that order.
- *      flocking/flocking.c teaches the simpler "agents with
- *      direct sensing of other agents" pattern.  This file is
- *      the STIGMERGY variant — agents communicate through the
- *      ENVIRONMENT instead of directly.  Read flocking.c first.
- *      flocking/shepherd.c shows another emergent-behaviour
- *      example (dog herding sheep through positioning, not
- *      direct commands).
- *   2. §5 agents — sense + rotate + move + deposit.  THE HEART
- *      of this file.  Read AFTER tutorials T1-T5.
- *   3. §4 trail grid — diffusion + decay (the "environment").
- *   4. §6 scene — preset configurations + food sources.
- *
- * Variable-naming convention
- * ──────────────────────────
- *   g_trail[r][c]              float trail intensity at cell (r,c).
- *   g_buf[r][c]                double-buffer for diffusion update.
- *   agent.x, .y, .heading      pose in cell coordinates + radians.
- *   N_AGENTS                   2000-6000 typical.
- *   SENSOR_ANGLE = π/4         ±45° from heading (Jones default).
- *   SENSOR_DIST = 4 cells      look-ahead distance.
- *   ROTATE_ANGLE = π/4         turn step when sensor decides.
- *   DEPOSIT_AMT                trail strength dropped per visit.
- *   DIFFUSE_W                  blend toward 3×3 average; 0 = no
- *                              diffusion, 1 = total replacement.
- *   DECAY_RATE                 fraction of trail lost per tick.
  *
  * Background you need
  * ───────────────────
@@ -251,229 +284,6 @@
  *     APPROXIMATES Steiner; we don't compute it analytically.
  *   - PDE solvers.  The diffusion is a 3×3 box-blur, not a
  *     proper diffusion solver.
- *
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ── GUIDED TUTORIAL ─────────────────────────────────────────────────── *
- *
- * Five tutorials that build a Physarum slime-mold simulation
- * from first principles.
- *
- *   T1  Stigmergy — communication through the environment
- *   T2  Three sensors → one local turn decision
- *   T3  Trail grid — diffusion + decay = positive + negative feedback
- *   T4  Food sources — attractors that anchor the network
- *   T5  Why this approximates Steiner trees (and what it doesn't)
- *
- * ─────────────────────────────────────────────────────────────────────── *
- *
- * T1  STIGMERGY — COMMUNICATION THROUGH THE ENVIRONMENT
- * ─────────────────────────────────────────────────────
- * Most flocking simulations have agents READ each other's
- * state directly: "what's my neighbour's velocity?"  See
- * flocking/flocking.c (Reynolds boids — agents inspect each
- * neighbour's pos + vel within a perception radius).
- *
- * STIGMERGY is different: agents only see and modify the
- * ENVIRONMENT.  They never read another agent's state.
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │  DIRECT (Reynolds)         STIGMERGIC (Physarum) │
- *      │                                                  │
- *      │   agent → agent             agent → ENV → agent  │
- *      │   reads neighbour           reads/writes trail   │
- *      │   pos, vel directly         no agent-to-agent    │
- *      │                                                  │
- *      │   "what's around me?"       "what marks did      │
- *      │                              someone leave here?"│
- *      └──────────────────────────────────────────────────┘
- *
- * Stigmergic agents are SIMPLER (no neighbour search) and
- * SCALE BETTER (no per-pair lookup).  But they require a
- * persistent environment to communicate through — here, the
- * trail grid.  That grid IS the swarm's collective memory.
- *
- * Real-world examples:
- *   - Ant colonies (pheromone trails)
- *   - Termite mound construction (humidity gradients)
- *   - Slime mold (Physarum, this file's inspiration)
- *   - Human road networks (paths formed by repeated foot
- *     travel)
- *
- * The principle: SIMPLE LOCAL RULES + PERSISTENT MEDIUM =
- * GLOBAL OPTIMISATION.
- *
- * T2  THREE SENSORS → ONE LOCAL TURN DECISION
- * ───────────────────────────────────────────
- * Each agent has THREE virtual sensors: front-left (FL),
- * front (F), front-right (FR), each at SENSOR_DIST cells
- * ahead, at angles (heading - SENSOR_ANGLE), heading,
- * (heading + SENSOR_ANGLE).
- *
- *      ┌──────────────────────────────────────────────────┐
- *      │                                                  │
- *      │              FL              FR                  │
- *      │                ●           ●                     │
- *      │                  ╲       ╱                       │
- *      │                    ●  F                          │
- *      │                    │                             │
- *      │                    │ ← heading                   │
- *      │                  agent                           │
- *      │                                                  │
- *      │  Three samples of trail intensity at points       │
- *      │  ahead determine the next turn direction.        │
- *      └──────────────────────────────────────────────────┘
- *
- * Decision rule (Jones 2010):
- *
- *     if F > FL and F > FR:  no turn         (forward looks best)
- *     elif FL > FR:          turn LEFT       (left looks better)
- *     elif FR > FL:          turn RIGHT      (right looks better)
- *     else:                  random ±turn    (FL == FR, tie-break)
- *
- * That's the entire control logic per agent: read 3 numbers,
- * compare them, turn or not.  Plus a fixed-step move and a
- * trail deposit.  Six lines of code.
- *
- * Why does this WORK?  An agent walking on a strong-trail
- * cell is likely to keep walking on strong-trail cells
- * (because nearby cells are also likely strong — diffusion
- * smooths the trail gradient).  This positive feedback
- * AMPLIFIES existing trails.  Combined with the decay (T3),
- * it produces self-organising tubes.
- *
- * Sensor parameters from Jones 2010:
- *   SENSOR_ANGLE = 45°  — sweet spot for crisp tubes
- *   SENSOR_DIST = 4 cells — local enough to track curves
- *   ROTATE_ANGLE = 45°  — turn step
- *
- * Tweaking these visibly changes the network style:
- *   smaller SENSOR_DIST → thinner, twistier tubes
- *   larger ANGLE        → wider tubes, more straightening
- *
- * T3  TRAIL GRID — DIFFUSION + DECAY = POSITIVE + NEGATIVE FEEDBACK
- * ─────────────────────────────────────────────────────────────────
- * Each tick, the trail grid is updated:
- *
- *     for each cell (r, c):
- *       neighbours_avg = mean of trail[r±1][c±1]   (3×3 box)
- *       new_trail[r][c] = lerp(trail[r][c], neighbours_avg, DIFFUSE_W)
- *                         × (1 - DECAY_RATE)
- *
- * Two physical effects, opposite sign:
- *
- *   DIFFUSION (positive feedback):
- *     A high-trail cell SPREADS its strength to neighbours.
- *     Nearby cells become attractive too.  This smooths the
- *     gradient an agent senses, allowing tubes to maintain
- *     coherence as agents drift along them.
- *
- *   DECAY (negative feedback):
- *     Every cell loses a small fraction each tick.  Without
- *     decay, every cell ever visited would stay marked
- *     forever — the grid would saturate and lose
- *     discrimination.  With decay, only cells visited
- *     RECENTLY by agents stay strong.
- *
- * The BALANCE between diffusion and decay determines the
- * tube width.  Tunable live with d/D + e/E keys.
- *
- *   high diffusion, low decay  → thick blurry connections
- *   low diffusion, high decay  → sharp thin tubes
- *   balanced (default)         → physarum-like tubes
- *
- * Same yin-yang of "spread + fade" appears in:
- *   - Reaction-diffusion patterns (Gray-Scott, Turing)
- *   - Pheromone-based ant routing
- *   - Self-organising maps
- *   - Activator-inhibitor neural models
- *
- * The general lesson: positive + negative feedback at
- * different SPATIAL or TEMPORAL scales produces patterns.
- *
- * T4  FOOD SOURCES — ATTRACTORS THAT ANCHOR THE NETWORK
- * ─────────────────────────────────────────────────────
- * Without food, agents form random "noise" tubes.  With
- * food at fixed positions, agents that pass near food
- * deposit FOOD_BONUS × the normal amount of trail.  These
- * super-bright cells become permanent attractors.
- *
- * The network "grows" toward food sources because:
- *   - Agents passing near food leave extra-strong trail.
- *   - That trail amplifies further passing through nearby
- *     cells.
- *   - Eventually a stable highway forms between food
- *     sources, sustained by traffic.
- *   - Empty regions decay back to background.
- *
- * The connection to Physarum biology: real slime molds in
- * Petri dishes with oat-flake food spread tubes preferentially
- * to oat positions.  The chemistry of nutrient absorption +
- * cytoplasmic flow plays the role of our DEPOSIT + DIFFUSION.
- *
- * Demo presets vary the food layout:
- *   0 Scatter   — 3 food in triangle
- *   1 Ring      — agents on ring, 1 central food
- *   2 Clusters  — 2 distant food sources
- *   3 Mesh      — 4 corner food sources
- *
- * Press 'f' to toggle food off mid-simulation: tubes
- * COLLAPSE (decay wins, no replenishment).  Toggle back on:
- * tubes RE-FORM in ~20 ticks.
- *
- * T5  WHY THIS APPROXIMATES STEINER TREES (AND WHAT IT DOESN'T)
- * ──────────────────────────────────────────────────────────────
- * The MINIMUM STEINER TREE for N points is the shortest-
- * total-edge-length tree connecting them, where the tree
- * may include EXTRA "Steiner points" not in the input.
- *
- * For 4 corner food sources arranged as a square:
- *   - Direct edges:  4 sides + 1 diagonal = ~4.41 units
- *   - Steiner tree:  Y-Y meeting at 2 internal points = ~2.73
- *
- * Real Physarum builds approximations of the Steiner tree.
- * Tero et al. (2007) experimentally placed oat flakes in
- * a Tokyo subway map; the resulting Physarum tubes
- * matched the actual subway lines (≈ optimal transport
- * network).
- *
- * Why does this happen?  Simple intuition:
- *   - Tubes that connect food via ≈ Steiner topology
- *     have HIGH TRAFFIC (agents flowing between sources).
- *   - High traffic = strong trail = positive feedback.
- *   - Sub-optimal paths have less traffic, so their trail
- *     decays faster.
- *   - The network self-prunes toward the optimum.
- *
- * What this DOESN'T do:
- *   - It's NOT GUARANTEED to find the optimum — it's an
- *     APPROXIMATION via local optimisation.  Stuck in
- *     local minima possible.
- *   - It doesn't compute the Steiner tree analytically;
- *     classical algorithms (Kou-Markowsky-Berman, etc.)
- *     do that with combinatorial search.
- *   - It's SLOW compared to algorithms (seconds of agent
- *     simulation vs. milliseconds of MST + Steiner).
- *
- * What it DOES do:
- *   - PARALLEL: each agent independent; scales to 1000s
- *     of agents.
- *   - ROBUST: agents can be added/removed mid-simulation;
- *     the network adapts.
- *   - BIOLOGICALLY PLAUSIBLE: real Physarum uses this
- *     mechanism.
- *
- * Slime-mold "computing" is one of the most beautiful
- * results in biological computation.  Adamatzky (2010)
- * built mazes solved by Physarum, found shortest paths,
- * computed planar minimum spanning trees, even
- * implemented logic gates with chemical-resistance
- * variations.
- *
- * This file gives you the simulation; the Steiner-tree
- * application is a pedagogical demonstration of one of
- * its applications.
  *
  * ─────────────────────────────────────────────────────────────────────── */
 
@@ -569,8 +379,16 @@ static void clock_sleep_ns(int64_t ns)
 /* ===================================================================== */
 
 /*
- * 6 trail intensity color pairs (1=dimmest .. 5=brightest) + 6=food + 7=HUD
- * The trail is rendered with 5 characters × 5 colors.
+ * Colour pairs:
+ *   1..5  trail intensity ramp (dim → bright), theme-controlled
+ *   6     food, theme-controlled
+ *   7     HUD top row    — canonical bright yellow, theme-INDEPENDENT
+ *   8     HUD hint row   — canonical bright cyan,   theme-INDEPENDENT
+ *
+ * The trail is rendered with 5 characters × 5 colours.  The two HUD
+ * pairs are set ONCE in color_init() to the project-standard bright
+ * yellow / bright cyan from CLAUDE.md §"HUD Standard" so the status
+ * row stays legible against any theme's background.
  */
 enum {
     CP_T1 = 1,  /* dimmest trail  */
@@ -580,40 +398,82 @@ enum {
     CP_T5 = 5,  /* brightest trail */
     CP_FOOD = 6,
     CP_HUD  = 7,
+    CP_HINT = 8,
 };
 
+/*
+ * Theme — one named colour palette for the trail intensity ramp + food.
+ *
+ * Intent
+ *   The visual character of the simulation is dominated by the FIVE
+ *   trail intensity colours plus the food marker.  Different themes
+ *   make the same algorithm read as a yellow slime-mold network, a
+ *   cool cyan one, a fiery red one, etc.  Bundling all theme-dependent
+ *   colours into one struct lets `theme_apply()` re-register six ncurses
+ *   pairs in one call when the user cycles themes with t / T.
+ *
+ * Why two parallel palettes (t[] vs t8[])
+ *   xterm-256 terminals get fine-grained gradients (5 distinct steps
+ *   of a single hue band).  8-colour terminals can't; t8[] picks the
+ *   closest ANSI primary, accepting that the dim→bright gradient
+ *   collapses into a smaller set of equivalence classes.
+ *
+ * Why NOT include HUD / hint colours
+ *   PAIR_HUD and PAIR_HINT are theme-INDEPENDENT (canonical bright
+ *   yellow + bright cyan per CLAUDE.md §"HUD Standard") so the status
+ *   row stays legible regardless of which theme is active.  Those
+ *   pairs are set ONCE in color_init() and survive every theme cycle.
+ *
+ * Members
+ *   t[5]    five xterm-256 foreground indices, dim → bright.
+ *           Bird-cell intensity bucket maps directly: density 1 → t[0],
+ *           density 2 → t[1], ..., density 5+ → t[4].
+ *   t8[5]   five ANSI primary fallbacks for 8-colour terminals.
+ *   food    food-marker foreground (xterm-256).
+ *   food8   food-marker foreground (ANSI 8).
+ *   name    HUD label ("Physarum", "Cyan", "Neon", "Forest", "Lava").
+ *
+ * Invariants
+ *   All indices in [0, 255] (256-colour) or in COLOR_BLACK..COLOR_WHITE
+ *   (8-colour).  name != NULL.
+ *
+ * References
+ *   None directly — colour palette design is project-specific.  The
+ *   five-step intensity gradient mirrors the glyph ramp ".+x#@" used
+ *   in §4 trail_char_pair; both encode "how strong is the pheromone
+ *   here" via parallel character + colour channels.  See CLAUDE.md
+ *   §"Theme Palette Brightness" for the brightness-floor rule.
+ */
 typedef struct {
-    short t[5];       /* trail pair fg colors, dim→bright (256-color)    */
-    short t8[5];      /* 8-color fallbacks                                */
-    short food, hud;
-    short food8, hud8;
-    const char *name;
+    short t[5];        /* trail pair fg colours, dim→bright (256-color) */
+    short t8[5];       /* 8-color fallbacks                             */
+    short food;        /* food-marker fg, xterm-256                     */
+    short food8;       /* food-marker fg, ANSI 8                        */
+    const char *name;  /* HUD label                                     */
 } Theme;
 
 static const Theme k_themes[N_THEMES] = {
     /* 0 Physarum — yellow/amber network on black, like real slime mold */
     { {22, 58, 100, 136, 220},
       {COLOR_GREEN, COLOR_GREEN, COLOR_YELLOW, COLOR_YELLOW, COLOR_WHITE},
-      196, 244,   COLOR_RED, COLOR_WHITE,   "Physarum" },
+      196, COLOR_RED, "Physarum" },
     /* 1 Cyan — cold network */
     { {17, 19, 27, 39, 87},
       {COLOR_BLUE, COLOR_BLUE, COLOR_CYAN, COLOR_CYAN, COLOR_WHITE},
-      226, 244,   COLOR_YELLOW, COLOR_WHITE,   "Cyan" },
+      226, COLOR_YELLOW, "Cyan" },
     /* 2 Neon — magenta/violet */
     { {53, 91, 129, 165, 207},
       {COLOR_MAGENTA, COLOR_MAGENTA, COLOR_MAGENTA, COLOR_WHITE, COLOR_WHITE},
-      226, 244,   COLOR_YELLOW, COLOR_WHITE,   "Neon" },
+      226, COLOR_YELLOW, "Neon" },
     /* 3 Forest — organic green */
     { {22, 28, 34, 40, 118},
       {COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_GREEN, COLOR_WHITE},
-      196, 244,   COLOR_RED, COLOR_WHITE,   "Forest" },
+      196, COLOR_RED, "Forest" },
     /* 4 Lava — red/orange */
     { {52, 88, 124, 166, 226},
       {COLOR_RED, COLOR_RED, COLOR_RED, COLOR_YELLOW, COLOR_WHITE},
-      231, 244,   COLOR_WHITE, COLOR_WHITE,   "Lava" },
+      231, COLOR_WHITE, "Lava" },
 };
-
-static int g_theme = 0;
 
 static void theme_apply(int t)
 {
@@ -624,19 +484,31 @@ static void theme_apply(int t)
         else
             init_pair(i + 1, th->t8[i], -1);
     }
-    if (COLORS >= 256) {
-        init_pair(CP_FOOD, th->food,  -1);
-        init_pair(CP_HUD,  th->hud,   -1);
-    } else {
-        init_pair(CP_FOOD, th->food8, -1);
-        init_pair(CP_HUD,  th->hud8,  -1);
-    }
+    if (COLORS >= 256) init_pair(CP_FOOD, th->food,  -1);
+    else               init_pair(CP_FOOD, th->food8, -1);
+
+    /* CP_HUD + CP_HINT are theme-INDEPENDENT — see color_init. */
 }
 
 static void color_init(void)
 {
+    enum { HUD_YELLOW_256 = 226, HUD_CYAN_256 = 51 };
+
     start_color();
     use_default_colors();
+
+    /* Theme-independent HUD pairs (CLAUDE.md §"HUD Standard"):
+     *   PAIR_HUD  — bright yellow on default bg, used for top status row
+     *   PAIR_HINT — bright cyan   on default bg, used for bottom key hint
+     * Set ONCE here so they survive every theme cycle. */
+    if (COLORS >= 256) {
+        init_pair(CP_HUD,  HUD_YELLOW_256, -1);
+        init_pair(CP_HINT, HUD_CYAN_256,   -1);
+    } else {
+        init_pair(CP_HUD,  COLOR_YELLOW,   -1);
+        init_pair(CP_HINT, COLOR_CYAN,     -1);
+    }
+
     theme_apply(0);
 }
 
@@ -645,70 +517,173 @@ static void color_init(void)
 /* ===================================================================== */
 
 /*
- * Two float arrays: g_trail (current) and g_buf (diffusion workspace).
- * After diffusion+decay writes into g_buf, we swap the pointers.
+ * TrailField — the pheromone scalar field that the slime mold lives in.
  *
- * Agents sample and deposit into g_trail.
- * The grid update (diffuse + decay) reads g_trail → writes g_buf, then swap.
+ * Intent
+ *   Physarum's macroscopic behaviour emerges from a tiny rule: every
+ *   agent SENSES the field at three points ahead, ROTATES toward the
+ *   brightest, MOVES one step, then DEPOSITS pheromone at its new
+ *   position.  The field itself DIFFUSES (3×3 box average, weighted)
+ *   and DECAYS each tick.  This struct owns both halves of that field
+ *   evolution — the live grid and the diffusion workspace.
+ *
+ * Why TWO grids (current + buffer)
+ *   The diffusion convolution reads every cell's 8 neighbours.  If we
+ *   wrote results back into the same array, cells later in the scan
+ *   would see ALREADY-updated values from earlier cells — a Gauss-
+ *   Seidel style update that depends on iteration order and produces
+ *   asymmetric artefacts.  Writing into a separate buffer + copying
+ *   back (Jacobi) keeps the update READ-ONLY on the current state
+ *   and gives an order-independent result.
+ *
+ * Why fixed-size arrays (not malloc'd)
+ *   ROWS_MAX × COLS_MAX × 4 bytes × 2 buffers ≈ 512 KB.  Static BSS
+ *   allocation means no per-resize malloc, and the cache hierarchy
+ *   sees a stable address for the hot inner loop.  active_rows /
+ *   active_cols track the in-use portion (terminal-sized) so we don't
+ *   waste cycles updating cells that won't be rendered.
+ *
+ * Members
+ *   current[r][c]   live pheromone concentration in cell (r, c).
+ *                   Read by agent sensors + the renderer; written by
+ *                   agent deposits + the diffuse/decay step.
+ *   buffer [r][c]   diffusion workspace — never observed by agents
+ *                   or renderer.  Populated by trail_update, then
+ *                   copied back to `current`.
+ *   active_rows     number of rows actually in use (terminal rows − 1,
+ *                   reserving the bottom row for the HUD).  Cells
+ *                   beyond this are unused and left as zeros.
+ *   active_cols     number of columns actually in use (= terminal cols).
+ *
+ * Invariants
+ *   0 ≤ active_rows ≤ ROWS_MAX,  0 ≤ active_cols ≤ COLS_MAX.
+ *   current[r][c] ∈ [0, MAX_TRAIL] after trail_deposit clamps.
+ *   buffer[r][c]  ≥ 0 after trail_update clamps.
+ *
+ * References
+ *   [1] Jones, J. (2010), "Characteristics of pattern formation and
+ *       evolution in approximations of Physarum transport networks",
+ *       Artificial Life 16(2), pp. 127-153 — the diffuse + decay rule
+ *       used here, with the same 3×3 box average.
  */
-static float g_trail[ROWS_MAX][COLS_MAX];
-static float g_buf  [ROWS_MAX][COLS_MAX];
-static int   g_grid_rows, g_grid_cols;  /* active grid size = terminal size */
+typedef struct {
+    float current[ROWS_MAX][COLS_MAX];
+    float buffer [ROWS_MAX][COLS_MAX];
+    int   active_rows;
+    int   active_cols;
+} TrailField;
 
-static inline int wrap_r(int r) {
-    return (r % g_grid_rows + g_grid_rows) % g_grid_rows;
+/* Single file-scope instance — 512 KB of BSS, allocated once at
+ * startup.  Scene.trail points at this so a future split-screen
+ * variant could allocate per-Scene fields. */
+static TrailField g_trail_field;
+
+/* Toroidal wrap helpers on the field's active dimensions. */
+static inline int wrap_r_on(const TrailField *t, int r) {
+    return (r % t->active_rows + t->active_rows) % t->active_rows;
 }
-static inline int wrap_c(int c) {
-    return (c % g_grid_cols + g_grid_cols) % g_grid_cols;
+static inline int wrap_c_on(const TrailField *t, int c) {
+    return (c % t->active_cols + t->active_cols) % t->active_cols;
 }
 
-/* Sample trail at float position (wrapping) */
-static float trail_sample(float fc, float fr)
+/* trail_sample — read concentration at a float (column, row) position,
+ * toroidally wrapped.  Used by agent sensors. */
+static float trail_sample(const TrailField *t, float fc, float fr)
 {
-    int c = wrap_c((int)(fc + 0.5f));
-    int r = wrap_r((int)(fr + 0.5f));
-    return g_trail[r][c];
+    int c = wrap_c_on(t, (int)(fc + 0.5f));
+    int r = wrap_r_on(t, (int)(fr + 0.5f));
+    return t->current[r][c];
 }
 
-/* Deposit to trail at float position */
-static void trail_deposit(float fc, float fr, float amount)
+/* trail_deposit — add `amount` of pheromone at a float (column, row),
+ * clamped to MAX_TRAIL.  Used by agents after their move step. */
+static void trail_deposit(TrailField *t, float fc, float fr, float amount)
 {
-    int c = wrap_c((int)(fc + 0.5f));
-    int r = wrap_r((int)(fr + 0.5f));
-    g_trail[r][c] += amount;
-    if (g_trail[r][c] > MAX_TRAIL) g_trail[r][c] = MAX_TRAIL;
+    int c = wrap_c_on(t, (int)(fc + 0.5f));
+    int r = wrap_r_on(t, (int)(fr + 0.5f));
+    t->current[r][c] += amount;
+    if (t->current[r][c] > MAX_TRAIL) t->current[r][c] = MAX_TRAIL;
 }
 
-/* Diffuse + decay: reads g_trail, writes g_buf, then swap */
-static void trail_update(float diffuse_w, float decay)
+/*
+ * box_average_3x3_wrapped — mean of a cell's nine-neighbour 3×3
+ * patch (including itself), with toroidal wrap on the field's
+ * active extent.  This is the spatial half of the diffusion update:
+ * the standard discrete Laplacian + identity kernel divided by 9.
+ *
+ *   kernel = (1/9) · | 1 1 1 |
+ *                    | 1 1 1 |
+ *                    | 1 1 1 |
+ */
+static float box_average_3x3_wrapped(const TrailField *t, int r, int c)
 {
-    float retain = 1.0f - decay;
-    int R = g_grid_rows, C = g_grid_cols;
+    enum { KERNEL_HALF = 1 };                /* 3×3 has radius 1 cell */
+    const float KERNEL_CELL_COUNT = 9.0f;    /* (2·HALF+1)^2          */
+
+    float sum = 0.0f;
+    for (int dr = -KERNEL_HALF; dr <= KERNEL_HALF; dr++)
+        for (int dc = -KERNEL_HALF; dc <= KERNEL_HALF; dc++)
+            sum += t->current[wrap_r_on(t, r+dr)][wrap_c_on(t, c+dc)];
+    return sum / KERNEL_CELL_COUNT;
+}
+
+/*
+ * trail_update — diffuse + decay one tick.
+ *
+ *   for each (r, c):
+ *     neighbour_avg     = mean of 3×3 neighbours (toroidal)
+ *     after_diffusion   = lerp(current, neighbour_avg, diffuse_w)
+ *     after_decay       = after_diffusion · (1 − decay)
+ *     buffer[r][c]      = max(after_decay, 0)
+ *   current ← buffer    (Jacobi swap: order-independent)
+ *
+ * The lerp + scalar decay is the discretised reaction-diffusion PDE
+ * (Turing [5]):  ∂u/∂t = D·∇²u − k·u, with D ∝ diffuse_w and k ∝
+ * decay.  Jacobi writes guarantee every cell sees the SAME source
+ * state, so the result doesn't depend on iteration order.
+ */
+static void trail_update(TrailField *t, float diffuse_w, float decay)
+{
+    const float retain = 1.0f - decay;
+    int   R = t->active_rows;
+    int   C = t->active_cols;
 
     for (int r = 0; r < R; r++) {
         for (int c = 0; c < C; c++) {
-            /* 3×3 box average (wrap) */
-            float sum = 0.0f;
-            for (int dr = -1; dr <= 1; dr++)
-                for (int dc = -1; dc <= 1; dc++)
-                    sum += g_trail[wrap_r(r+dr)][wrap_c(c+dc)];
-            float avg = sum / 9.0f;
+            float neighbour_avg   = box_average_3x3_wrapped(t, r, c);
+            float self            = t->current[r][c];
 
-            /* lerp toward neighbour average, then decay */
-            float v = g_trail[r][c] * (1.0f - diffuse_w) + avg * diffuse_w;
-            g_buf[r][c] = v * retain;
-            if (g_buf[r][c] < 0.0f) g_buf[r][c] = 0.0f;
+            /* spatial step: lerp self → neighbour_avg by diffuse_w */
+            float after_diffusion = self * (1.0f - diffuse_w)
+                                  + neighbour_avg * diffuse_w;
+
+            /* temporal step: exponential decay (one tick) */
+            float after_decay     = after_diffusion * retain;
+
+            /* clamp negative floats (rounding-safety; should not occur) */
+            t->buffer[r][c] = (after_decay > 0.0f) ? after_decay : 0.0f;
         }
     }
 
-    /* swap: copy buf → trail */
-    memcpy(g_trail, g_buf, sizeof g_trail);
+    /* Jacobi swap: copy buffer → current */
+    memcpy(t->current, t->buffer, sizeof t->current);
 }
 
-static void trail_clear(void)
+/* trail_clear — zero both grids and reset the active extent. */
+static void trail_clear(TrailField *t)
 {
-    memset(g_trail, 0, sizeof g_trail);
-    memset(g_buf,   0, sizeof g_buf);
+    memset(t->current, 0, sizeof t->current);
+    memset(t->buffer,  0, sizeof t->buffer);
+}
+
+/* trail_resize — set the active grid extent (called from scene_init
+ * after the terminal size is known).  The actual buffers are static. */
+static void trail_resize(TrailField *t, int rows, int cols)
+{
+    if (rows > ROWS_MAX) rows = ROWS_MAX;
+    if (cols > COLS_MAX) cols = COLS_MAX;
+    t->active_rows = rows;
+    t->active_cols = cols;
 }
 
 /*
@@ -732,12 +707,15 @@ static void trail_char_pair(float v, chtype *ch_out, int *cp_out)
     else                { *ch_out = '@'; *cp_out = CP_T5; }
 }
 
-static void trail_draw(int rows, int cols)
+static void trail_draw(const TrailField *t, int rows, int cols)
 {
-    for (int r = 0; r < rows && r < g_grid_rows; r++) {
-        for (int c = 0; c < cols && c < g_grid_cols; c++) {
+    int max_r = (rows < t->active_rows) ? rows : t->active_rows;
+    int max_c = (cols < t->active_cols) ? cols : t->active_cols;
+
+    for (int r = 0; r < max_r; r++) {
+        for (int c = 0; c < max_c; c++) {
             chtype ch; int cp;
-            trail_char_pair(g_trail[r][c], &ch, &cp);
+            trail_char_pair(t->current[r][c], &ch, &cp);
             if (ch == ' ') continue;  /* skip background cells */
             attron(COLOR_PAIR(cp));
             mvaddch(r, c, ch);
@@ -750,106 +728,457 @@ static void trail_draw(int rows, int cols)
 /* §5  agents                                                             */
 /* ===================================================================== */
 
+/*
+ * Agent — one Physarum-style particle (Jones [1]).
+ *
+ * Intent
+ *   The atomic unit of the simulation.  Each tick every agent performs
+ *   the sense-rotate-move-deposit cycle from Jones 2010 [1]:
+ *
+ *     1. SENSE   — sample the trail field at three forward points
+ *                  (front-left, front, front-right) using cos/sin of
+ *                  the current angle and SENSOR_DIST / SENSOR_ANGLE.
+ *     2. ROTATE  — pick the brightest sensor; rotate the heading by
+ *                  ±ROTATE_ANGLE toward that side, or keep heading if
+ *                  the centre sensor wins.
+ *     3. MOVE    — advance pos by STEP_SIZE in the new heading
+ *                  direction; toroidal wrap to the grid extent.
+ *     4. DEPOSIT — add `deposit` pheromone at the new pos (multiplied
+ *                  by FOOD_BONUS if within FOOD_RADIUS of any source).
+ *
+ *   The agent has NO peer interactions — neighbour agents are not
+ *   sampled directly.  All communication happens through the trail
+ *   field: agents read the field, deposit into the field, and the
+ *   field diffuses + decays.  This is STIGMERGY (Grassé [6]) — same
+ *   mechanism real termites use to coordinate nest building.
+ *
+ * Why no mass / no velocity / no acceleration
+ *   Physarum agents are kinematic, not dynamic.  Speed is a hard
+ *   constant STEP_SIZE; turning is an INSTANT ±ROTATE_ANGLE snap.
+ *   This produces the CRISP tube morphology characteristic of real
+ *   slime-mould networks — adding smoothing forces would dampen the
+ *   sharp branches into a fuzzy blob.
+ *
+ * Why FLOAT (x, y) on a cell grid
+ *   The trail field is a discrete grid (rows × cols of float), but
+ *   agents move in CONTINUOUS cell coords.  Float positions let the
+ *   deposit step land between cells (via wrap_*_on's round-to-nearest)
+ *   so the trail receives fractional contributions — which smooths
+ *   the diffusion at low agent counts and avoids cell-quantisation
+ *   "checkerboard" artefacts.
+ *
+ * Members
+ *   x, y       Position in cell coordinates (float; range [0,
+ *              active_cols) × [0, active_rows)).  Toroidally wrapped
+ *              by agent_step at the end of the move step.
+ *   angle      Heading in RADIANS.  Sensor positions are
+ *              (cos angle, sin angle) × SENSOR_DIST; rotation snaps
+ *              by ±ROTATE_ANGLE (no smoothing).  Range unbounded
+ *              (atan2/cos/sin handle the wrap).
+ *
+ * Invariants
+ *   0 ≤ x < trail->active_cols, 0 ≤ y < trail->active_rows after
+ *   agent_step's wrap loop.
+ *   angle has no enforced range — cos/sin are 2π-periodic so any
+ *   real value is well-defined.
+ *
+ * References
+ *   [1] Jones 2010 — the canonical agent model implemented here.
+ *   [6] Grassé 1959 — the stigmergy mechanism that gives agents their
+ *       "intelligence" without peer communication.
+ *   [9] Shiffman, *Nature of Code* Ch. 5 — same sense-decide-act
+ *       agent loop in Processing.
+ */
 typedef struct {
-    float x, y;     /* position in cell space (float for sub-cell precision) */
-    float angle;    /* heading in radians */
+    float x, y;     /* cell-space position (float for sub-cell deposit) */
+    float angle;    /* heading in radians                                */
 } Agent;
 
-/* Food source positions */
+/*
+ * FoodSrc — one fixed food source.
+ *
+ * Intent
+ *   A static gradient sink that the slime-mould network LEARNS to
+ *   connect.  Two roles:
+ *
+ *     1. agent_step reads food positions to apply a FOOD_BONUS
+ *        multiplier on `deposit` when the agent is within
+ *        FOOD_RADIUS of a source — this creates a stronger trail
+ *        near food, which feeds back via the sensors to attract more
+ *        agents (positive-feedback loop = the "exploit" half of the
+ *        explore/exploit dynamic).
+ *
+ *     2. agents_step_all keeps the trail cells AT food positions
+ *        above FOOD_MIN_TRAIL — without this floor, decay eventually
+ *        drains the source's pheromone to ~0 and agents lose the
+ *        gradient they should be following.
+ *
+ *     3. food_draw paints '@' markers in PAIR_FOOD so the user can
+ *        SEE which points the network is connecting.
+ *
+ * Why a separate struct (not just Vec2-style)
+ *   Future food sources might gain attributes — strength multiplier,
+ *   activation time, food-type identity for typed-trail experiments.
+ *   The named type leaves room without churn.  Currently has only
+ *   (x, y) but the type lives on its own line for that future-
+ *   proofing.
+ *
+ * Members
+ *   x, y   Cell-coordinate position; set by the active preset
+ *          (preset_scatter / _ring / _clusters / _mesh).
+ *
+ * References
+ *   [3] Tero et al. 2010 — Physarum solving the Tokyo rail problem;
+ *       the food sources here are this file's analogue of the rail
+ *       stations the slime mould must connect.
+ *   [4] Tero, Kobayashi & Nakagaki 2007 — continuous-PDE model where
+ *       food sources are boundary conditions for the flow PDE.
+ */
 typedef struct { float x, y; } FoodSrc;
 
-static Agent   *g_agents   = NULL;
-static int      g_n_agents = N_AGENTS_DEF;
-static FoodSrc  g_food[N_FOOD];
-static bool     g_food_on  = true;
-
-static float g_deposit  = DEPOSIT_DEF;
-static float g_decay    = DECAY_DEF;
-static float g_diffuse  = DIFFUSE_DEF;
+/*
+ * Crowd — the agent pool: a heap-allocated Agent array plus its
+ * active count.
+ *
+ * Intent
+ *   Bundles the count with the pointer so every helper that operates
+ *   on agents takes ONE struct pointer instead of two scalars.
+ *   `count` matches the user-tunable agent total (adjusted by +/-
+ *   keys via adjust_agent_count, which clamps to [N_AGENTS_MIN,
+ *   N_AGENTS_MAX] and reallocs via crowd_alloc).
+ *
+ * Why heap-allocated (not a fixed-size array)
+ *   N_AGENTS_MAX is 6000 → 6000 × sizeof(Agent) = 72 KB.  Static
+ *   allocation would tie the binary's BSS footprint to the maximum,
+ *   even at the default N_AGENTS_DEF = 2000.  malloc'ing at the
+ *   actual size keeps the working set tight.  The pool is
+ *   reallocated only when the user adjusts count or the scene resets.
+ *
+ * Members
+ *   agents  Pointer to malloc'd Agent array of `count` elements.
+ *           Freed by do_cleanup at exit.
+ *   count   Number of active agents in [N_AGENTS_MIN, N_AGENTS_MAX];
+ *           adjust_agent_count clamps the range.
+ *
+ * Invariants
+ *   agents != NULL after scene_init.
+ *   N_AGENTS_MIN ≤ count ≤ N_AGENTS_MAX.
+ *   agents[i] for i ∈ [0, count) is valid.
+ *
+ * References
+ *   None directly — the agent-pool data layout is standard ABM
+ *   practice (every Jones-style implementation uses an array of
+ *   agent records).
+ */
+typedef struct {
+    Agent *agents;     /* malloc'd; sized by `count`              */
+    int    count;      /* active count; user-tunable via +/- keys */
+} Crowd;
 
 /*
- * agent_step — one Physarum agent tick (sense → rotate → move → deposit).
+ * SimControls — every user-tunable knob in one struct.
  *
- * Sensor positions are sampled in float space (wrap at grid boundary).
- * Rotation amounts to ±ROTATE_ANGLE per tick — turning is abrupt, not gradual.
- * This produces the crisp tube morphology characteristic of Physarum models.
+ * Intent
+ *   The HUD reads these for display; app_handle_key writes them on
+ *   keypress; the tick reads `paused` + `deposit`/`decay`/`diffuse`
+ *   + `food_on`.  Bundling them keeps the Scene's top level free for
+ *   actual simulation state and the key handler from reaching into
+ *   many scattered globals.
+ *
+ * Members
+ *   preset    initial-condition layout: 0=Scatter, 1=Ring, 2=Clusters,
+ *             3=Mesh (n / N keys cycle).
+ *   theme     active colour palette index in [0, N_THEMES); t / T cycle.
+ *   sim_fps   target physics rate; live-adjustable with [ / ].
+ *   paused    true → skip tick; HUD shows "PAUSED".
+ *   food_on   true → food-proximity bonus deposit + food markers on
+ *             screen.  f / F toggles.
+ *   deposit   trail amount left by each agent step (default DEPOSIT_DEF).
+ *   decay     per-tick exponential decay of every trail cell.
+ *   diffuse   per-tick weight of the 3×3 box average.
+ *
+ * Invariants
+ *   0 ≤ preset < N_PRESETS, 0 ≤ theme < N_THEMES.
+ *   sim_fps ∈ [SIM_FPS_MIN, SIM_FPS_MAX].
+ *   deposit > 0, decay ∈ [0.01, 0.30], diffuse ∈ [0.05, 0.90]
+ *   (clamped in app_handle_key on every adjustment).
+ *
+ * References
+ *   [1] Jones 2010 — defines the three knobs that drive Physarum
+ *       morphology: deposit amount per step, exponential decay rate,
+ *       and diffusion weight.  Jones shows that varying ONLY these
+ *       three (holding sensor + step constants fixed) sweeps the
+ *       network through fragmented / branching / mesh / flooded
+ *       regimes.  The d/D/e/E/D/D keys let the user explore that
+ *       parameter space LIVE.
  */
-static void agent_step(Agent *a)
+typedef struct {
+    int   preset;
+    int   theme;
+    int   sim_fps;
+    bool  paused;
+    bool  food_on;
+    float deposit;
+    float decay;
+    float diffuse;
+} SimControls;
+
+/*
+ * Screen — terminal cell extent.
+ *
+ * Intent
+ *   Owns the TERMINAL side of the simulation.  Where TrailField tracks
+ *   the active GRID extent (= cols × rows-1, reserving the bottom for
+ *   the HUD), Screen tracks the FULL terminal extent — used by:
+ *     - the renderer's bounds checks (cell-space)
+ *     - the HUD layout (top row = 0; bottom row = rows - 1)
+ *     - SIGWINCH handling (which re-reads getmaxyx into these fields)
+ *
+ *   The TWO extents are deliberately separate: trail.active_rows =
+ *   screen.rows − 1 (HUD reserves the bottom row).  scene_init's
+ *   trail_resize() bridges the two.
+ *
+ * Why a tiny 2-field struct (not flat ints on App)
+ *   • Resize is a CLEAR state change: app_do_resize reads new
+ *     dimensions into Scene.screen, then re-inits the scene.
+ *     Bundling makes that one assignment (`scene.screen = ...`)
+ *     rather than two scattered field writes.
+ *   • Consistent with the project's other files (flocking.c, crowd.c,
+ *     murmuration.c, shepherd.c), which all use a Screen sub-struct.
+ *
+ * Members
+ *   cols   Terminal width in CELLS (= getmaxyx columns).  Active grid
+ *          spans columns [0, cols).
+ *   rows   Terminal height in CELLS.  Active grid spans rows [0,
+ *          rows−1); the bottom row (rows−1) is the HUD action strip.
+ *
+ * Invariants
+ *   cols > 0 AND rows ≥ 2 (need at least one grid row plus the HUD).
+ *   trail.active_cols == cols  AND  trail.active_rows == rows − 1
+ *   after scene_init.
+ *
+ * References
+ *   None directly — terminal extent is a rendering substrate concern.
+ */
+typedef struct {
+    int cols;
+    int rows;
+} Screen;
+
+/*
+ * Scene — owns ALL simulation state for one run.
+ *
+ * Layered ownership
+ *
+ *     Scene
+ *       ├── sim        : SimControls   ← preset/theme/paused/food/...
+ *       ├── crowd      : Crowd         ← Agent pool + active count
+ *       ├── food[]     : FoodSrc[]     ← N_FOOD sources placed by preset
+ *       ├── trail      : TrailField *  ← points at g_trail_field
+ *       └── screen     : Screen        ← terminal cell extent
+ *
+ *   Every persistent simulation value is reachable from one Scene*.
+ *   Signal flags live on App in §8 because handlers can't take ctx.
+ *
+ * Why TrailField as a pointer (not embedded)
+ *   sizeof(TrailField) ≈ 512 KB.  Embedding it on Scene would make
+ *   every Scene-by-value copy and stack-local Scene impractical.
+ *   The pointer is set once at startup to &g_trail_field.
+ *
+ * Why a Scene-rooted hierarchy (not file-scope globals)
+ *   • Replaceability: a future split-screen or A/B-comparison demo
+ *     allocates multiple Scenes — impossible with globals.
+ *   • Testability: scene_tick becomes a pure transformation Scene*→
+ *     Scene* with no hidden inputs.
+ *   • Reading aid: every helper begins with `Scene *s` (or const),
+ *     so there's ONE place to look for "what state exists".
+ *
+ * References
+ *   [1] Jones 2010 — the simulation owns the agent vector + the
+ *       pheromone field; this Scene layout mirrors that reference
+ *       design.
+ *   [9] Shiffman, *Nature of Code* — same single-World pattern in
+ *       Processing pseudocode for autonomous-agent demos.
+ */
+typedef struct {
+    SimControls  sim;
+    Crowd        crowd;
+    FoodSrc      food[N_FOOD];
+    TrailField  *trail;
+    Screen       screen;
+} Scene;
+
+/*
+ * SensorReadings — the three forward trail samples one agent observes.
+ *
+ *   front_left  : sensor at heading − SENSOR_ANGLE
+ *   front       : sensor straight ahead
+ *   front_right : sensor at heading + SENSOR_ANGLE
+ *
+ * Bundling lets agent_sense_three_sensors return all three by value
+ * and agent_rotate_toward_brightest take them as one struct.
+ */
+typedef struct {
+    float front_left;
+    float front;
+    float front_right;
+} SensorReadings;
+
+/*
+ * agent_sense_three_sensors — SENSE step.
+ *
+ * Sample the trail at the agent's three forward sensor offsets.
+ * Sensors sit on a circle of radius SENSOR_DIST in front of the
+ * agent, at angles ±SENSOR_ANGLE from the heading (cone half-width
+ * = SENSOR_ANGLE).  Jones [1] §III.
+ */
+static SensorReadings agent_sense_three_sensors(const Agent *a,
+                                                const TrailField *trail)
 {
-    float ca = cosf(a->angle), sa = sinf(a->angle);
+    float left_x  = a->x + cosf(a->angle - SENSOR_ANGLE) * SENSOR_DIST;
+    float left_y  = a->y + sinf(a->angle - SENSOR_ANGLE) * SENSOR_DIST;
+    float fwd_x   = a->x + cosf(a->angle               ) * SENSOR_DIST;
+    float fwd_y   = a->y + sinf(a->angle               ) * SENSOR_DIST;
+    float right_x = a->x + cosf(a->angle + SENSOR_ANGLE) * SENSOR_DIST;
+    float right_y = a->y + sinf(a->angle + SENSOR_ANGLE) * SENSOR_DIST;
 
-    /* sensor positions */
-    float fl_x = a->x + cosf(a->angle - SENSOR_ANGLE) * SENSOR_DIST;
-    float fl_y = a->y + sinf(a->angle - SENSOR_ANGLE) * SENSOR_DIST;
-    float  f_x = a->x + ca * SENSOR_DIST;
-    float  f_y = a->y + sa * SENSOR_DIST;
-    float fr_x = a->x + cosf(a->angle + SENSOR_ANGLE) * SENSOR_DIST;
-    float fr_y = a->y + sinf(a->angle + SENSOR_ANGLE) * SENSOR_DIST;
+    return (SensorReadings){
+        .front_left  = trail_sample(trail, left_x,  left_y ),
+        .front       = trail_sample(trail, fwd_x,   fwd_y  ),
+        .front_right = trail_sample(trail, right_x, right_y),
+    };
+}
 
-    float vFL = trail_sample(fl_x, fl_y);
-    float vF  = trail_sample( f_x,  f_y);
-    float vFR = trail_sample(fr_x, fr_y);
+/*
+ * agent_rotate_toward_brightest — ROTATE step.
+ *
+ *     centre wins → keep heading
+ *     left   wins → turn −ROTATE_ANGLE
+ *     right  wins → turn +ROTATE_ANGLE
+ *     tie    → random ±ROTATE_ANGLE jitter
+ *
+ * Note the asymmetric "≥" on the centre check: the agent keeps
+ * heading ONLY if centre is tied-or-better than BOTH sides.  This
+ * biases the network toward straight tubes when no gradient is
+ * present.  Jones [1] §III, equation (4).
+ */
+static void agent_rotate_toward_brightest(Agent *a, SensorReadings r)
+{
+    bool centre_wins = (r.front >= r.front_left) && (r.front >= r.front_right);
+    if (centre_wins) return;                                /* keep heading */
 
-    /* rotate */
-    if (vF >= vFL && vF >= vFR) {
-        /* keep heading */
-    } else if (vFL > vFR) {
-        a->angle -= ROTATE_ANGLE;
-    } else if (vFR > vFL) {
-        a->angle += ROTATE_ANGLE;
-    } else {
-        /* equal sides, both > front: random jitter */
-        a->angle += (rand() & 1) ? ROTATE_ANGLE : -ROTATE_ANGLE;
+    if      (r.front_left  > r.front_right) a->angle -= ROTATE_ANGLE;
+    else if (r.front_right > r.front_left ) a->angle += ROTATE_ANGLE;
+    else {                                  /* equal sides, both > centre */
+        bool flip_to_right = (rand() & 1) != 0;
+        a->angle += flip_to_right ? ROTATE_ANGLE : -ROTATE_ANGLE;
     }
+}
 
-    /* move */
+/*
+ * agent_move_and_wrap — MOVE step.
+ *
+ * Advance by STEP_SIZE in the heading direction, then toroidally
+ * wrap to the trail's active grid extent.  Wrap uses `while` (not
+ * modulo) so the agent's x/y stay floats throughout — fractional
+ * positions are preserved for the deposit step.
+ */
+static void agent_move_and_wrap(Agent *a, const TrailField *trail)
+{
     a->x += cosf(a->angle) * STEP_SIZE;
     a->y += sinf(a->angle) * STEP_SIZE;
 
-    /* wrap */
-    float R = (float)g_grid_rows, C = (float)g_grid_cols;
-    while (a->x < 0.0f) a->x += C;
-    while (a->x >= C)   a->x -= C;
-    while (a->y < 0.0f) a->y += R;
-    while (a->y >= R)   a->y -= R;
-
-    /* deposit — more if near a food source */
-    float dep = g_deposit;
-    if (g_food_on) {
-        for (int f = 0; f < N_FOOD; f++) {
-            float dx = a->x - g_food[f].x;
-            float dy = a->y - g_food[f].y;
-            if (sqrtf(dx*dx + dy*dy) < FOOD_RADIUS) {
-                dep *= FOOD_BONUS;
-                break;
-            }
-        }
-    }
-    trail_deposit(a->x, a->y, dep);
+    float grid_w = (float)trail->active_cols;
+    float grid_h = (float)trail->active_rows;
+    while (a->x <  0.0f  ) a->x += grid_w;
+    while (a->x >= grid_w) a->x -= grid_w;
+    while (a->y <  0.0f  ) a->y += grid_h;
+    while (a->y >= grid_h) a->y -= grid_h;
 }
 
-static void agents_step_all(void)
+/*
+ * agent_food_bonus_multiplier — return FOOD_BONUS if the agent is
+ * within FOOD_RADIUS of ANY food source, or 1.0 otherwise.  Returns
+ * 1.0 unconditionally when food is OFF.
+ *
+ * Why this is the "exploit" half of explore/exploit
+ *   Boosted deposit near food → stronger trail near food → stronger
+ *   sensor reading for the NEXT agent passing through → more agents
+ *   converge.  Without this multiplier the food sources have no
+ *   gradient and the network never finds them.
+ */
+static float agent_food_bonus_multiplier(const Agent *a,
+                                          const FoodSrc *food,
+                                          bool food_on)
 {
-    for (int i = 0; i < g_n_agents; i++)
-        agent_step(&g_agents[i]);
+    if (!food_on) return 1.0f;
 
-    /* keep food source cells above their floor */
-    if (g_food_on) {
-        for (int f = 0; f < N_FOOD; f++) {
-            int c = wrap_c((int)(g_food[f].x + 0.5f));
-            int r = wrap_r((int)(g_food[f].y + 0.5f));
-            if (g_trail[r][c] < FOOD_MIN_TRAIL)
-                g_trail[r][c] = FOOD_MIN_TRAIL;
-        }
-    }
-}
-
-static void food_draw(int rows, int cols)
-{
-    if (!g_food_on) return;
     for (int f = 0; f < N_FOOD; f++) {
-        int c = (int)(g_food[f].x + 0.5f);
-        int r = (int)(g_food[f].y + 0.5f);
+        float dx = a->x - food[f].x;
+        float dy = a->y - food[f].y;
+        float distance_to_food = sqrtf(dx*dx + dy*dy);
+        if (distance_to_food < FOOD_RADIUS) return FOOD_BONUS;
+    }
+    return 1.0f;
+}
+
+/*
+ * agent_step — one Physarum agent tick.
+ *
+ *   (1) SENSE   — read three forward trail samples
+ *   (2) ROTATE  — turn toward the brightest sensor
+ *   (3) MOVE    — advance STEP_SIZE + wrap to grid
+ *   (4) DEPOSIT — drop pheromone (boosted near food)
+ *
+ * The crisp tube morphology characteristic of Physarum [1] comes
+ * from the abrupt ±ROTATE_ANGLE rotation (no smoothing) — small
+ * changes to SENSOR_ANGLE, SENSOR_DIST, or ROTATE_ANGLE sweep the
+ * network through distinctly different topologies (Jones [1] §IV).
+ */
+static void agent_step(Agent *a, Scene *s)
+{
+    TrailField *trail = s->trail;
+
+    /* (1) SENSE */
+    SensorReadings sensors = agent_sense_three_sensors(a, trail);
+
+    /* (2) ROTATE */
+    agent_rotate_toward_brightest(a, sensors);
+
+    /* (3) MOVE + WRAP */
+    agent_move_and_wrap(a, trail);
+
+    /* (4) DEPOSIT — base deposit × food-proximity bonus */
+    float bonus  = agent_food_bonus_multiplier(a, s->food, s->sim.food_on);
+    float amount = s->sim.deposit * bonus;
+    trail_deposit(trail, a->x, a->y, amount);
+}
+
+static void agents_step_all(Scene *s)
+{
+    for (int i = 0; i < s->crowd.count; i++)
+        agent_step(&s->crowd.agents[i], s);
+
+    /* Keep food-source cells above their floor — without this, decay
+     * eventually drains the source's pheromone to ~0 and agents lose
+     * the gradient they should be following toward food. */
+    if (s->sim.food_on) {
+        TrailField *trail = s->trail;
+        for (int f = 0; f < N_FOOD; f++) {
+            int c = wrap_c_on(trail, (int)(s->food[f].x + 0.5f));
+            int r = wrap_r_on(trail, (int)(s->food[f].y + 0.5f));
+            if (trail->current[r][c] < FOOD_MIN_TRAIL)
+                trail->current[r][c] = FOOD_MIN_TRAIL;
+        }
+    }
+}
+
+static void food_draw(const Scene *s, int rows, int cols)
+{
+    if (!s->sim.food_on) return;
+    for (int f = 0; f < N_FOOD; f++) {
+        int c = (int)(s->food[f].x + 0.5f);
+        int r = (int)(s->food[f].y + 0.5f);
         if (r >= 0 && r < rows-1 && c >= 0 && c < cols) {
             attron(COLOR_PAIR(CP_FOOD) | A_BOLD);
             mvaddch(r, c, '@');
@@ -862,11 +1191,6 @@ static void food_draw(int rows, int cols)
 /* §6  scene — presets & lifecycle                                        */
 /* ===================================================================== */
 
-static int g_preset  = 0;
-static int g_sim_fps = SIM_FPS_DEF;
-static bool g_paused = false;
-static int g_rows, g_cols;
-
 static const char *k_preset_names[N_PRESETS] = {
     "Scatter", "Ring", "Clusters", "Mesh"
 };
@@ -875,131 +1199,154 @@ static const char *k_preset_names[N_PRESETS] = {
 static float randf(void) { return (float)rand() / (float)RAND_MAX; }
 static float randf_range(float lo, float hi) { return lo + randf() * (hi - lo); }
 
-static void agents_alloc(int n)
+/* crowd_alloc — (re)allocate the agent array to hold `count` agents.
+ * Frees any previous allocation and writes the new count into the
+ * Crowd struct; safe on first call (free(NULL) is a no-op). */
+static void crowd_alloc(Crowd *crowd, int count)
 {
-    free(g_agents);
-    g_agents   = malloc((size_t)n * sizeof(Agent));
-    g_n_agents = n;
+    free(crowd->agents);
+    crowd->agents = malloc((size_t)count * sizeof(Agent));
+    crowd->count  = count;
 }
 
-static void agent_spawn_random(Agent *a)
+static void agent_spawn_random(Agent *a, const TrailField *t)
 {
-    a->x     = randf() * (float)g_grid_cols;
-    a->y     = randf() * (float)g_grid_rows;
+    a->x     = randf() * (float)t->active_cols;
+    a->y     = randf() * (float)t->active_rows;
     a->angle = randf() * 2.0f * (float)M_PI;
 }
 
 /* ── Preset 0: Scatter ────────────────────────────────────────────── */
 /* Random positions + 3 food sources in a triangle */
-static void preset_scatter(void)
+static void preset_scatter(Scene *s)
 {
-    float cx = (float)g_grid_cols * 0.5f;
-    float cy = (float)g_grid_rows * 0.5f;
-    float rx = (float)g_grid_cols * 0.30f;
-    float ry = (float)g_grid_rows * 0.28f;
+    const TrailField *t = s->trail;
+    float cx = (float)t->active_cols * 0.5f;
+    float cy = (float)t->active_rows * 0.5f;
+    float rx = (float)t->active_cols * 0.30f;
+    float ry = (float)t->active_rows * 0.28f;
 
     /* triangle food sources */
-    g_food[0] = (FoodSrc){ cx,            cy - ry       };
-    g_food[1] = (FoodSrc){ cx - rx,       cy + ry * 0.6f};
-    g_food[2] = (FoodSrc){ cx + rx,       cy + ry * 0.6f};
+    s->food[0] = (FoodSrc){ cx,            cy - ry       };
+    s->food[1] = (FoodSrc){ cx - rx,       cy + ry * 0.6f};
+    s->food[2] = (FoodSrc){ cx + rx,       cy + ry * 0.6f};
 
-    for (int i = 0; i < g_n_agents; i++)
-        agent_spawn_random(&g_agents[i]);
+    for (int i = 0; i < s->crowd.count; i++)
+        agent_spawn_random(&s->crowd.agents[i], t);
 }
 
 /* ── Preset 1: Ring ───────────────────────────────────────────────── */
 /* Agents on a circle pointing inward; single food source at centre */
-static void preset_ring(void)
+static void preset_ring(Scene *s)
 {
-    float cx = (float)g_grid_cols * 0.5f;
-    float cy = (float)g_grid_rows * 0.5f;
-    float r  = fminf((float)g_grid_cols, (float)g_grid_rows * 2.0f) * 0.38f;
+    const TrailField *t = s->trail;
+    float cx = (float)t->active_cols * 0.5f;
+    float cy = (float)t->active_rows * 0.5f;
+    float r  = fminf((float)t->active_cols, (float)t->active_rows * 2.0f) * 0.38f;
 
-    g_food[0] = (FoodSrc){ cx, cy };
-    g_food[1] = (FoodSrc){ cx - r * 0.5f, cy };
-    g_food[2] = (FoodSrc){ cx + r * 0.5f, cy };
+    s->food[0] = (FoodSrc){ cx, cy };
+    s->food[1] = (FoodSrc){ cx - r * 0.5f, cy };
+    s->food[2] = (FoodSrc){ cx + r * 0.5f, cy };
 
-    for (int i = 0; i < g_n_agents; i++) {
-        float angle = (float)i / (float)g_n_agents * 2.0f * (float)M_PI;
+    for (int i = 0; i < s->crowd.count; i++) {
+        float angle  = (float)i / (float)s->crowd.count * 2.0f * (float)M_PI;
         float jitter = randf_range(-0.03f, 0.03f) * 2.0f * (float)M_PI;
-        g_agents[i].x = cx + cosf(angle) * r;
-        g_agents[i].y = cy + sinf(angle) * r * 0.5f; /* aspect correction */
-        /* point inward + jitter */
-        g_agents[i].angle = angle + (float)M_PI + jitter;
+        s->crowd.agents[i].x = cx + cosf(angle) * r;
+        s->crowd.agents[i].y = cy + sinf(angle) * r * 0.5f; /* aspect correction */
+        s->crowd.agents[i].angle = angle + (float)M_PI + jitter;  /* inward + jitter */
     }
 }
 
 /* ── Preset 2: Clusters ───────────────────────────────────────────── */
 /* Two dense clusters on left and right; food at screen corners */
-static void preset_clusters(void)
+static void preset_clusters(Scene *s)
 {
-    float lx = (float)g_grid_cols * 0.22f;
-    float rx = (float)g_grid_cols * 0.78f;
-    float cy = (float)g_grid_rows * 0.50f;
-    float spread_c = (float)g_grid_cols * 0.08f;
-    float spread_r = (float)g_grid_rows * 0.15f;
+    const TrailField *t = s->trail;
+    float lx = (float)t->active_cols * 0.22f;
+    float rx = (float)t->active_cols * 0.78f;
+    float cy = (float)t->active_rows * 0.50f;
+    float spread_c = (float)t->active_cols * 0.08f;
+    float spread_r = (float)t->active_rows * 0.15f;
 
-    g_food[0] = (FoodSrc){ (float)g_grid_cols * 0.05f, cy };
-    g_food[1] = (FoodSrc){ (float)g_grid_cols * 0.95f, cy };
-    g_food[2] = (FoodSrc){ (float)g_grid_cols * 0.50f,
-                           (float)g_grid_rows * 0.20f };
+    s->food[0] = (FoodSrc){ (float)t->active_cols * 0.05f, cy };
+    s->food[1] = (FoodSrc){ (float)t->active_cols * 0.95f, cy };
+    s->food[2] = (FoodSrc){ (float)t->active_cols * 0.50f,
+                            (float)t->active_rows * 0.20f };
 
-    for (int i = 0; i < g_n_agents; i++) {
-        bool left = (i < g_n_agents / 2);
+    for (int i = 0; i < s->crowd.count; i++) {
+        bool left = (i < s->crowd.count / 2);
         float cx  = left ? lx : rx;
-        g_agents[i].x = cx + randf_range(-spread_c, spread_c);
-        g_agents[i].y = cy + randf_range(-spread_r, spread_r);
-        g_agents[i].angle = randf() * 2.0f * (float)M_PI;
+        s->crowd.agents[i].x = cx + randf_range(-spread_c, spread_c);
+        s->crowd.agents[i].y = cy + randf_range(-spread_r, spread_r);
+        s->crowd.agents[i].angle = randf() * 2.0f * (float)M_PI;
     }
 }
 
 /* ── Preset 3: Mesh ───────────────────────────────────────────────── */
 /* Agents on a regular grid; food at 4 corners */
-static void preset_mesh(void)
+static void preset_mesh(Scene *s)
 {
-    float mx = (float)g_grid_cols * 0.12f;
-    float my = (float)g_grid_rows * 0.12f;
+    const TrailField *t = s->trail;
+    float mx = (float)t->active_cols * 0.12f;
+    float my = (float)t->active_rows * 0.12f;
 
-    g_food[0] = (FoodSrc){ mx,                              my                             };
-    g_food[1] = (FoodSrc){ (float)g_grid_cols - mx,         my                             };
-    g_food[2] = (FoodSrc){ mx,                              (float)g_grid_rows - my        };
-    g_food[3 % N_FOOD] = (FoodSrc){ (float)g_grid_cols - mx, (float)g_grid_rows - my };
+    s->food[0] = (FoodSrc){ mx,                             my                            };
+    s->food[1] = (FoodSrc){ (float)t->active_cols - mx,     my                            };
+    s->food[2] = (FoodSrc){ mx,                             (float)t->active_rows - my    };
+    s->food[3 % N_FOOD] = (FoodSrc){ (float)t->active_cols - mx,
+                                     (float)t->active_rows - my };
 
-    int grid_side = (int)sqrtf((float)g_n_agents);
+    int grid_side = (int)sqrtf((float)s->crowd.count);
     int placed = 0;
-    for (int gi = 0; gi < grid_side && placed < g_n_agents; gi++) {
-        for (int gj = 0; gj < grid_side && placed < g_n_agents; gj++, placed++) {
-            g_agents[placed].x = ((float)gj + 0.5f) / (float)grid_side
-                                  * (float)g_grid_cols;
-            g_agents[placed].y = ((float)gi + 0.5f) / (float)grid_side
-                                  * (float)g_grid_rows;
-            g_agents[placed].angle = randf() * 2.0f * (float)M_PI;
+    for (int gi = 0; gi < grid_side && placed < s->crowd.count; gi++) {
+        for (int gj = 0; gj < grid_side && placed < s->crowd.count; gj++, placed++) {
+            s->crowd.agents[placed].x = ((float)gj + 0.5f) / (float)grid_side
+                                         * (float)t->active_cols;
+            s->crowd.agents[placed].y = ((float)gi + 0.5f) / (float)grid_side
+                                         * (float)t->active_rows;
+            s->crowd.agents[placed].angle = randf() * 2.0f * (float)M_PI;
         }
     }
-    for (; placed < g_n_agents; placed++)
-        agent_spawn_random(&g_agents[placed]);
+    for (; placed < s->crowd.count; placed++)
+        agent_spawn_random(&s->crowd.agents[placed], t);
 }
 
-static void scene_init(int preset)
+/*
+ * scene_init — bring a Scene to a fresh start.
+ *
+ *   (1) update the active grid extent from the current Screen size
+ *   (2) (re)allocate the agent pool to crowd.count
+ *   (3) clear both trail buffers
+ *   (4) zero food positions, then dispatch to the active preset
+ *
+ * Preserves: sim.* (all user knobs), screen.*, crowd.count (the
+ * caller has already set it for +/- adjustments).
+ */
+static void scene_init(Scene *s, int preset)
 {
-    g_preset = preset;
-    g_grid_rows = g_rows - 1;   /* bottom row reserved for HUD */
-    g_grid_cols = g_cols;
+    s->sim.preset = preset;
 
-    agents_alloc(g_n_agents);
-    trail_clear();
+    /* (1) active grid extent: full terminal width × (rows − 1)
+     *     (bottom row reserved for the HUD).  The TrailField's
+     *     active_rows/cols are the source of truth for sim wrapping. */
+    trail_resize(s->trail, s->screen.rows - 1, s->screen.cols);
 
-    /* seed RNG with time */
-    srand((unsigned)time(NULL));
+    /* (2) agent pool — size kept in sync with crowd.count */
+    crowd_alloc(&s->crowd, s->crowd.count);
 
-    /* zero food sources before preset fills them */
-    memset(g_food, 0, sizeof g_food);
+    /* (3) zero trail buffers */
+    trail_clear(s->trail);
+
+    /* (4) wipe food positions and let the preset fill them */
+    memset(s->food, 0, sizeof s->food);
+
+    srand((unsigned)time(NULL));  /* fresh RNG so each reset is unique */
 
     switch (preset) {
-    case 0: preset_scatter (); break;
-    case 1: preset_ring    (); break;
-    case 2: preset_clusters(); break;
-    case 3: preset_mesh    (); break;
+        case 0: preset_scatter (s); break;
+        case 1: preset_ring    (s); break;
+        case 2: preset_clusters(s); break;
+        case 3: preset_mesh    (s); break;
     }
 }
 
@@ -1018,160 +1365,405 @@ static void screen_init(void)
     color_init();
 }
 
-static void hud_draw(int fps)
+/*
+ * hud_draw — paint the two canonical HUD rows.
+ *
+ *   Row 0 (top, right-aligned, PAIR_HUD bright yellow A_BOLD):
+ *     DATA — fps, preset name, theme name, agent count, diffuse/decay
+ *            parameters, food state, paused state.
+ *
+ *   Row rows-1 (bottom, left-aligned, PAIR_HINT bright cyan A_BOLD):
+ *     ACTIONS — every interactive key, in the order the user reads
+ *               left-to-right.
+ *
+ * Both rows are over-stamped LAST in the frame so the HUD always reads
+ * above any trail or food glyph below it.
+ */
+static void hud_draw(const Scene *s, int fps)
 {
-    move(g_rows - 1, 0); clrtoeol();
-    attron(COLOR_PAIR(CP_HUD));
-    printw(" SlimeMold  q:quit  n:%s  t:%s  +/-:agents(%d)"
-           "  d/D:diffuse(%.2f)  e/E:decay(%.2f)  f:food(%s)"
-           "  p:pause  %dfps",
-           k_preset_names[g_preset],
-           k_themes[g_theme].name,
-           g_n_agents,
-           g_diffuse, g_decay,
-           g_food_on ? "ON" : "OFF",
-           fps);
-    attroff(COLOR_PAIR(CP_HUD));
+    /* ── (1) top row: data, right-aligned ─────────────────────────── */
+    char status[160];
+    snprintf(status, sizeof status,
+             " %3d fps  preset:%s  theme:%s  agents:%d  diffuse:%.2f"
+             "  decay:%.2f  food:%s%s ",
+             fps,
+             k_preset_names[s->sim.preset],
+             k_themes[s->sim.theme].name,
+             s->crowd.count,
+             s->sim.diffuse, s->sim.decay,
+             s->sim.food_on ? "ON" : "OFF",
+             s->sim.paused  ? "  PAUSED" : "");
+
+    int right_col = s->screen.cols - (int)strlen(status);
+    if (right_col < 0) right_col = 0;
+
+    move(0, 0); clrtoeol();
+    attron(COLOR_PAIR(CP_HUD) | A_BOLD);
+    mvprintw(0, right_col, "%s", status);
+    attroff(COLOR_PAIR(CP_HUD) | A_BOLD);
+
+    /* ── (2) bottom row: actions ──────────────────────────────────── */
+    move(s->screen.rows - 1, 0); clrtoeol();
+    attron(COLOR_PAIR(CP_HINT) | A_BOLD);
+    mvprintw(s->screen.rows - 1, 0,
+             " q:quit  spc/p:pause  r:reset  n/N:preset  t/T:theme  "
+             "+/-:agents  d/D:diffuse  e/E:decay  f:food  [/]:sim-fps ");
+    attroff(COLOR_PAIR(CP_HINT) | A_BOLD);
 }
 
 /* ===================================================================== */
 /* §8  app                                                                */
 /* ===================================================================== */
 
-static volatile sig_atomic_t g_quit_flag   = 0;
-static volatile sig_atomic_t g_resize_flag = 0;
+/*
+ * FpsCounter — rolling-window frame-rate estimator.
+ *
+ * Intent
+ *   Per-frame fps would jitter wildly (a single 1 ms variance swings
+ *   the instantaneous reading by ~6 fps at 60 Hz, ~2 fps at 30 Hz).
+ *   This struct accumulates frame_count + elapsed nanoseconds over a
+ *   fixed window (500 ms) and emits a smoothed `display` value each
+ *   time the window fills, so the HUD reads a stable number.
+ *
+ *   Same shape as the FpsCounter on every other file in this project
+ *   (flocking.c, crowd.c, murmuration.c, shepherd.c) — adopting the
+ *   shared pattern means a reader who knows one knows them all.
+ *
+ * Lifecycle
+ *   fps_counter_init  — zero everything at startup.
+ *   fps_counter_tick  — call once per frame with the frame's dt (ns).
+ *                       Emits a fresh `display` only when the window
+ *                       fills.
+ *
+ * Why an INT display (not double)
+ *   The slime-mould HUD format is " %3d fps " — three integer digits.
+ *   Other files use `double display` because their HUD shows tenths
+ *   ("%5.1f fps"); this file's stripped-down format saves the divide
+ *   and just stores frames-per-second as an integer.
+ *
+ * Members
+ *   frame_count   Frames seen in the current window.
+ *   window_ns     Nanoseconds accumulated in the current window.
+ *   display       Smoothed FPS shown in the HUD top row.
+ *
+ * Invariants
+ *   frame_count ≥ 0  AND  window_ns ≥ 0 between resets.
+ *   display ≥ 0 (zero until the first window completes).
+ *
+ * References
+ *   [8] Fiedler 2014 — recommends a fixed smoothing window for any
+ *       in-game fps display, on the same reasoning: per-frame
+ *       readings are unstable, fixed-window averaging is the
+ *       simplest robust answer.
+ */
+typedef struct {
+    int     frame_count;
+    int64_t window_ns;
+    int     display;       /* whole-fps int (HUD shows as " %3d fps ") */
+} FpsCounter;
+
+static void fps_counter_init(FpsCounter *f)
+{
+    f->frame_count = 0;
+    f->window_ns   = 0;
+    f->display     = 0;
+}
+
+static void fps_counter_tick(FpsCounter *f, int64_t dt)
+{
+    const int64_t FPS_WINDOW_NS = NS_PER_SEC / 2;     /* 500 ms */
+    f->frame_count++;
+    f->window_ns += dt;
+    if (f->window_ns < FPS_WINDOW_NS) return;
+
+    /* frames per (window_ns / NS_PER_SEC) seconds → frames per second */
+    f->display     = (int)(f->frame_count
+                         * (double)NS_PER_SEC / (double)f->window_ns);
+    f->frame_count = 0;
+    f->window_ns   = 0;
+}
+
+/*
+ * App — top-level container for every persistent value.
+ *
+ * Layered ownership
+ *
+ *     App
+ *       ├── scene   : Scene        ← simulation state (sim+crowd+food
+ *       │                             +trail+screen)
+ *       ├── fps     : FpsCounter   ← rolling-window fps for HUD
+ *       ├── quit    : sig_atomic_t ← cleared by SIGINT/TERM + 'q' key
+ *       └── resize  : sig_atomic_t ← set by SIGWINCH; main reacts on next tick
+ *
+ * Intent
+ *   The static `g_app` is the program's ONLY file-scope state pointer.
+ *   Signal handlers reach `quit` and `resize` through `g_app` directly
+ *   (POSIX handlers can't receive context); everything else flows
+ *   through an `App *` argument.
+ *
+ * Why `volatile sig_atomic_t` for the flags
+ *   sig_atomic_t (C11 §5.1.2.3) is guaranteed to be readable/writable
+ *   in a single uninterruptible operation from a signal handler; any
+ *   wider type risks a torn read.  `volatile` prevents the compiler
+ *   from caching the flag's value in a register inside the main loop
+ *   — the loop must re-read on every iteration in case a signal
+ *   fired between iterations.  Together these are the canonical
+ *   "flag set by signal, polled by main" pattern.
+ *
+ * References
+ *   None directly — this is a project-structure pattern.  Stevens,
+ *   APUE §10.3 describes the volatile sig_atomic_t signal-flag idiom
+ *   that POSIX programs use.  Nystrom, "Game Programming Patterns"
+ *   Ch. 9 (Game Loop) describes the same "one root, signal flags via
+ *   globals, everything else via pointer" arrangement used here and
+ *   in every other file in this project.
+ */
+typedef struct {
+    Scene                 scene;
+    FpsCounter            fps;
+    volatile sig_atomic_t quit;
+    volatile sig_atomic_t resize;
+} App;
+
+static App g_app;
 
 static void sig_h(int s)
 {
-    if (s == SIGINT || s == SIGTERM) g_quit_flag   = 1;
-    if (s == SIGWINCH)               g_resize_flag = 1;
+    if (s == SIGINT || s == SIGTERM) g_app.quit   = 1;
+    if (s == SIGWINCH)               g_app.resize = 1;
 }
-static void do_cleanup(void) { endwin(); free(g_agents); }
+
+static void do_cleanup(void)
+{
+    endwin();
+    free(g_app.scene.crowd.agents);
+}
+
+/* clamp_inclusive — keep `*v` inside [lo, hi] (used by every parameter
+ * adjustment in app_handle_key so the bounds aren't re-typed each case). */
+static void clampf(float *v, float lo, float hi)
+{
+    if (*v < lo) *v = lo;
+    if (*v > hi) *v = hi;
+}
+static void clampi(int *v, int lo, int hi)
+{
+    if (*v < lo) *v = lo;
+    if (*v > hi) *v = hi;
+}
+
+/*
+ * adjust_agent_count — change crowd.count by `delta`, clamp to
+ * [N_AGENTS_MIN, N_AGENTS_MAX], then re-init the scene so the
+ * crowd is reallocated to the new size and the preset re-runs.
+ */
+static void adjust_agent_count(Scene *s, int delta)
+{
+    int next = s->crowd.count + delta;
+    clampi(&next, N_AGENTS_MIN, N_AGENTS_MAX);
+    if (next == s->crowd.count) return;
+    s->crowd.count = next;
+    scene_init(s, s->sim.preset);
+}
+
+/* cycle_preset — n=+1 / N=-1 through presets, then re-init scene. */
+static void cycle_preset(Scene *s, int dir)
+{
+    int next = (s->sim.preset + dir + N_PRESETS) % N_PRESETS;
+    scene_init(s, next);
+}
+
+/* cycle_theme — t=+1 / T=-1 through colour themes; immediate effect. */
+static void cycle_theme(Scene *s, int dir)
+{
+    s->sim.theme = (s->sim.theme + dir + N_THEMES) % N_THEMES;
+    theme_apply(s->sim.theme);
+}
+
+/*
+ * Parameter-range bounds for the live-tunable knobs.  Centralised so
+ * the HUD's parameter regime + the key handler's clamp share a single
+ * source of truth.  See Jones [1] §IV for why these ranges matter:
+ * diffuse outside [0.05, 0.90] either fragments the network (too low)
+ * or floods it into uniform haze (too high); decay outside [0.01,
+ * 0.30] either preserves stale tubes forever or kills new growth
+ * before it can self-reinforce.
+ */
+#define DIFFUSE_MIN  0.05f
+#define DIFFUSE_MAX  0.90f
+#define DIFFUSE_STEP 0.05f
+#define DECAY_MIN    0.01f
+#define DECAY_MAX    0.30f
+#define DECAY_STEP   0.01f
+
+/* adjust_diffuse — bump diffusion weight by ±DIFFUSE_STEP, clamped. */
+static void adjust_diffuse(Scene *s, int dir)
+{
+    s->sim.diffuse += (float)dir * DIFFUSE_STEP;
+    clampf(&s->sim.diffuse, DIFFUSE_MIN, DIFFUSE_MAX);
+}
+
+/* adjust_decay — bump decay rate by ±DECAY_STEP, clamped. */
+static void adjust_decay(Scene *s, int dir)
+{
+    s->sim.decay += (float)dir * DECAY_STEP;
+    clampf(&s->sim.decay, DECAY_MIN, DECAY_MAX);
+}
+
+/* adjust_sim_fps — bump physics rate by ±SIM_FPS_STEP, clamped. */
+static void adjust_sim_fps(Scene *s, int dir)
+{
+    s->sim.sim_fps += dir * SIM_FPS_STEP;
+    clampi(&s->sim.sim_fps, SIM_FPS_MIN, SIM_FPS_MAX);
+}
+
+/*
+ * app_handle_key — dispatch a single keypress; return false to quit.
+ *
+ *   q / Q / ESC    quit
+ *   space / p / P  pause / resume
+ *   r / R          re-init the current preset
+ *   n / N          cycle preset forward / backward
+ *   t / T          cycle theme forward / backward
+ *   + / =          add N_AGENTS_STEP agents (cap N_AGENTS_MAX)
+ *   -              remove N_AGENTS_STEP agents (floor N_AGENTS_MIN)
+ *   d / D          increase / decrease diffusion weight
+ *   e / E          increase / decrease decay rate
+ *   f / F          toggle food sources
+ *   ] / [          increase / decrease sim fps
+ */
+static bool app_handle_key(App *app, int ch)
+{
+    Scene *s = &app->scene;
+    switch (ch) {
+    case 'q': case 'Q': case 27 /* ESC */: return false;
+    case ' ': case 'p': case 'P': s->sim.paused = !s->sim.paused;       break;
+
+    case 'r': case 'R': scene_init(s, s->sim.preset);                   break;
+
+    case 'n':           cycle_preset(s, +1);                            break;
+    case 'N':           cycle_preset(s, -1);                            break;
+
+    case 't':           cycle_theme(s, +1);                             break;
+    case 'T':           cycle_theme(s, -1);                             break;
+
+    case '+': case '=': adjust_agent_count(s, +N_AGENTS_STEP);          break;
+    case '-':           adjust_agent_count(s, -N_AGENTS_STEP);          break;
+
+    case 'd':           adjust_diffuse(s, +1);                          break;
+    case 'D':           adjust_diffuse(s, -1);                          break;
+
+    case 'e':           adjust_decay(s, +1);                            break;
+    case 'E':           adjust_decay(s, -1);                            break;
+
+    case 'f': case 'F': s->sim.food_on = !s->sim.food_on;               break;
+
+    case ']':           adjust_sim_fps(s, +1);                          break;
+    case '[':           adjust_sim_fps(s, -1);                          break;
+
+    default: break;
+    }
+    return true;
+}
+
+/*
+ * app_do_resize — handle a pending SIGWINCH.
+ *
+ *   (1) tear ncurses down + up so getmaxyx returns the new dims
+ *   (2) read new cols/rows into Scene.screen
+ *   (3) re-init the active preset so the trail field, agent pool, and
+ *       food positions all match the new extent
+ */
+static void app_do_resize(App *app)
+{
+    Scene *s = &app->scene;
+    endwin();
+    refresh();
+    getmaxyx(stdscr, s->screen.rows, s->screen.cols);
+    scene_init(s, s->sim.preset);
+    app->resize = 0;
+}
 
 int main(void)
 {
+    /* (a) RNG seed, atexit cleanup, signal handlers */
     atexit(do_cleanup);
     signal(SIGINT,   sig_h);
     signal(SIGTERM,  sig_h);
     signal(SIGWINCH, sig_h);
 
-    screen_init();
-    getmaxyx(stdscr, g_rows, g_cols);
-    scene_init(0);
+    /* (b) Bring up the App: ncurses + initial scene config */
+    App   *app   = &g_app;
+    Scene *scene = &app->scene;
 
+    /* Initial sim defaults */
+    scene->sim.preset    = 0;
+    scene->sim.theme     = 0;
+    scene->sim.sim_fps   = SIM_FPS_DEF;
+    scene->sim.paused    = false;
+    scene->sim.food_on   = true;
+    scene->sim.deposit   = DEPOSIT_DEF;
+    scene->sim.decay     = DECAY_DEF;
+    scene->sim.diffuse   = DIFFUSE_DEF;
+    scene->crowd.count   = N_AGENTS_DEF;
+    scene->trail         = &g_trail_field;
+
+    fps_counter_init(&app->fps);
+
+    screen_init();
+    getmaxyx(stdscr, scene->screen.rows, scene->screen.cols);
+    scene_init(scene, scene->sim.preset);
+
+    /* (c) Game loop */
     int64_t t_last = clock_ns();
 
-    int64_t fps_acc  = 0;
-    int     fps_cnt  = 0;
-    int     fps_disp = 0;
+    while (!app->quit) {
 
-    while (!g_quit_flag) {
-
-        /* ── resize ── */
-        if (g_resize_flag) {
-            g_resize_flag = 0;
-            endwin(); refresh();
-            getmaxyx(stdscr, g_rows, g_cols);
-            scene_init(g_preset);
+        /* (1) handle SIGWINCH */
+        if (app->resize) {
+            app_do_resize(app);
             t_last = clock_ns();
             continue;
         }
 
-        /* ── input ── */
+        /* (2) drain input */
         int ch;
         while ((ch = getch()) != ERR) {
-            switch (ch) {
-            case 'q': case 'Q': case 27: g_quit_flag = 1; break;
-
-            case ' ': case 'p': case 'P':
-                g_paused = !g_paused; break;
-
-            case 'r': case 'R':
-                scene_init(g_preset); break;
-
-            case 'n':
-                scene_init((g_preset + 1) % N_PRESETS); break;
-            case 'N':
-                scene_init((g_preset + N_PRESETS - 1) % N_PRESETS); break;
-
-            case 't':
-                g_theme = (g_theme + 1) % N_THEMES;
-                theme_apply(g_theme); break;
-            case 'T':
-                g_theme = (g_theme + N_THEMES - 1) % N_THEMES;
-                theme_apply(g_theme); break;
-
-            case '+': case '=':
-                if (g_n_agents < N_AGENTS_MAX) {
-                    g_n_agents += N_AGENTS_STEP;
-                    scene_init(g_preset);
-                }
-                break;
-            case '-':
-                if (g_n_agents > N_AGENTS_MIN) {
-                    g_n_agents -= N_AGENTS_STEP;
-                    scene_init(g_preset);
-                }
-                break;
-
-            case 'd':
-                if (g_diffuse < 0.90f) g_diffuse += 0.05f;
-                break;
-            case 'D':
-                if (g_diffuse > 0.05f) g_diffuse -= 0.05f;
-                break;
-
-            case 'e':
-                if (g_decay < 0.30f) g_decay += 0.01f;
-                break;
-            case 'E':
-                if (g_decay > 0.01f) g_decay -= 0.01f;
-                break;
-
-            case 'f': case 'F':
-                g_food_on = !g_food_on;
-                break;
-
-            case ']':
-                if (g_sim_fps < SIM_FPS_MAX) g_sim_fps += SIM_FPS_STEP;
-                break;
-            case '[':
-                if (g_sim_fps > SIM_FPS_MIN) g_sim_fps -= SIM_FPS_STEP;
+            if (!app_handle_key(app, ch)) {
+                app->quit = 1;
                 break;
             }
         }
 
-        /* ── tick ── */
-        if (!g_paused) {
-            agents_step_all();
-            trail_update(g_diffuse, g_decay);
+        /* (3) tick — physics if not paused */
+        if (!scene->sim.paused) {
+            agents_step_all(scene);
+            trail_update(scene->trail, scene->sim.diffuse, scene->sim.decay);
         }
 
-        /* ── draw ── */
+        /* (4) draw */
         erase();
-        trail_draw(g_rows, g_cols);
-        food_draw (g_rows, g_cols);
-        hud_draw(fps_disp);
+        trail_draw(scene->trail, scene->screen.rows, scene->screen.cols);
+        food_draw (scene, scene->screen.rows, scene->screen.cols);
+        hud_draw  (scene, app->fps.display);
         wnoutrefresh(stdscr);
         doupdate();
 
-        /* ── FPS cap ── */
+        /* (5) Frame cap: sleep BEFORE measuring next frame's dt so terminal
+         *     I/O doesn't eat into the budget.  dt cap at 100 ms prevents
+         *     a physics avalanche if the process was suspended. */
+        const int64_t DT_CAP_NS = 100000000LL;        /* 100 ms */
+
         int64_t t_now  = clock_ns();
         int64_t t_used = t_now - t_last;
-        t_last = t_now;
-        if (t_used > 100000000LL) t_used = 100000000LL;
+        t_last         = t_now;
+        if (t_used > DT_CAP_NS) t_used = DT_CAP_NS;
 
-        int64_t t_sleep = TICK_NS(g_sim_fps) - (clock_ns() - t_now);
+        int64_t t_sleep = TICK_NS(scene->sim.sim_fps) - (clock_ns() - t_now);
         clock_sleep_ns(t_sleep);
 
-        /* ── FPS counter ── */
-        fps_acc += t_used;
-        fps_cnt++;
-        if (fps_acc >= NS_PER_SEC / 2) {
-            fps_disp = fps_cnt * 2;
-            fps_acc  = 0;
-            fps_cnt  = 0;
-        }
+        /* (6) rolling-window fps counter */
+        fps_counter_tick(&app->fps, t_used);
     }
     return 0;
 }
